@@ -518,3 +518,14 @@ arithmetic, byte-identical (contacts identical at 600). **A simulated T4 now fol
 30 s, CA-CA median 3.793, none out of band). At 2,400 the trunk finishes and the diffusion conditioning's own
 256-channel pair (5.9 GB, `dc.pair`) is the next holder - it would want AF3's streamed conditioning, which was
 not ported; at 2,800 the triangle's fixed operand (4 GB) no longer fits.
+
+**On several GPUs (`--gpus=N`, mgtrunk.cuh) 16,549 tokens fold on 8 x 40 GB** - AlphaFold 3's length there (simulated:
+one rank of 8, `LOCALFOLD_MG_SIMULATE=1`; trunk 417 s, the confidence head 53 s). Each rank holds two 17.65 GB shares of
+the 256-channel bf16 pair (its rows of z, and the triangle's product), so everything else had to come out of 6.8 GB:
+`token_bonds` stays on the host (`Model::hostOnly`; the kernels read each row's bonded columns, `Bonds` - its dense
+[T, T] was 1.1 GB a GPU, and a fold reading it so is byte-identical), the triangle's mask of ones is never made
+(1.1 GB), the ESM-C tower's matrices leave the device once the language model has run (1.15 GB), the sharded
+triangle's windows and gate chunks go to C / 32 where every rank is short at C / 16 (`LOCALFOLD_MG_TRI_NARROW=1`
+forces it; the 1TIM dimer on 2 ranks 0.000 A either way), and the sampler's gathered attention rows are given back
+before the head (alone, they held a 1 GB shared segment). It was 14,820 before. Splitting the product share by rows
+does not work: a pass's output updates its rows of z, and every later pass's operands are read from all of z.

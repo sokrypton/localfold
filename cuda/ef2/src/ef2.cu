@@ -113,6 +113,7 @@ static int foldInput(const Opts& o, bool warm) {
   };
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   int T = (int)M.meta("meta/tokens");
+  buildBonds(T);
   const bool residentTower = M.has("c/blocks/0/fc2/weightsT");      // (ESM-C 6B: [out, in], resident int8)
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"),
          residentTower ? (int)dimOf("c/blocks/0/fc2/weightsT", 1) : (int)dimOf("c/blocks/0/fc2/weights", 0),
@@ -158,6 +159,21 @@ static int foldInput(const Opts& o, bool warm) {
   // with it held: 6.4 GB of codes beside four 2.3 GB pairs)
   // (never in the warm-up: it runs while the tower is still being copied up, and freeing the copy under the upload
   // killed the process - "cannot put a model.bin on the device" - whenever room was short and the upload slow)
+  // several GPUs fold once, and the sharded trunk's triangle wants the room: the tower's matrices leave the device -
+  // its f16 mirror, and its f32 copies where --fast did not drop them (1.15 GB a GPU at 16,549 tokens)
+  if (mg::WORLD > 1 && !residentTower && !check && M.has("c/blocks/0/qkv/weights")) {
+    size_t f0, f1, t; deviceMemInfo(&f0, &t);
+    const int seg = M.at("c/blocks/0/qkv/weights").seg;
+    CK(cudaDeviceSynchronize());
+    auto& mirrors = M.segs[seg].halfMirrors;
+    for (auto& [g, h] : mirrors) CK(cudaFree(h));
+    mirrors.clear();
+    for (auto w = WH_AT.begin(); w != WH_AT.end();)
+      if (!w->first.rfind("c/", 0)) { WH.erase(w->first); WH_MIRROR.erase(w->first); w = WH_AT.erase(w); } else ++w;
+    if (M.segs[seg].device) compactWeights(seg, [](const std::string& k) { return !k.rfind("c/blocks/", 0) && towerHalf(k); });
+    deviceMemInfo(&f1, &t);
+    say("tower's matrices off the device: %.2f GB\n", (f1 - f0) / 1e9);
+  }
   if (residentTower && !warm && !roomFor(3 * (size_t)T * T * e.pair * 4, { "tower.w16" })) {
     releaseScratch({ "tower.", "esmc." });
     if (!streamZ) releaseScratch({ "shim." });     // (a streamed z_init reads shim.tokens later)
@@ -381,6 +397,9 @@ static int foldInput(const Opts& o, bool warm) {
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
   mem("sampler");
   freeDenoiser(dn); if (tight) releaseScratch();
+  // (the sampler's gathered attention rows given back: a small buffer that alone held a 1 GB shared segment through
+  // the sharded confidence head, which was 0.6 GB short at 16,549 tokens on 8 x 40 GB)
+  if (mg::WORLD > 1) mg::release({ "ef2.tok.oh" }, mg::FREE);
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
     fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see cuda/ef2/README.md)\n");
@@ -470,6 +489,7 @@ static int foldMain(int argc, char** argv) {
   }
   auto tStart = std::chrono::steady_clock::now();
   // the weights: one exported file, or the two bundles read as they are (decoded on the device)
+  M.hostOnly.insert("token_bonds");                   // (BONDS: its rows' bonded columns, built per fold)
   if (!weights.empty()) M.load(weights);
   else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/"); }   // (int8 tower blocks stay resident)
   const int weightSegs = (int)M.segs.size();

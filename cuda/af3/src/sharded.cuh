@@ -241,12 +241,27 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   const bool rounds = !F8 && !x8 && (R_SET >= 0 ? R_SET > 0 : shortPair((size_t)n * n, C));
   // (a 256-channel pair - ESMFold2's - in windows of C / 16: the windows, their slots and the gate's chunk at C / 8 left a
   // simulated rank of 8 0.6 GB short at 14,820 tokens beside its two 14 GB shares)
-  const int K = std::max(8, C / (C >= 256 ? 16 : 8)), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
+  // ...and on a card shorter still (every rank asked, once a shape), windows and gate chunks of half that: C / 32 - at
+  // 16,549 tokens on 8 x 40 GB the two 17.5 GB shares left 5 GB, where C / 16's windows, slots, product and gate are 5.5
+  static std::map<std::pair<int, int>, int> narrowOf;
+  int div = C >= 256 ? 16 : 8;
+  if (rounds && C >= 256) {
+    auto it = narrowOf.find({ n, C });
+    if (it == narrowOf.end()) {
+      const size_t k16 = C / 16, wins = 2 * (size_t)std::max(rows, 1) * np * k16 * sizeof(TQ) + 3 * ((k16 + mg::WORLD - 1) / mg::WORLD) * plane * 2
+                       + (size_t)((rows + 15) / 16) * np * C * 2 + ((size_t)1 << 30);
+      static const bool forced = getenv("LOCALFOLD_MG_TRI_NARROW") && atoi(getenv("LOCALFOLD_MG_TRI_NARROW"));   // (=1: always)
+      it = narrowOf.emplace(std::make_pair(n, C), !forced && mg::everyRankHas(wins) ? 16 : 32).first;
+      if (it->second == 32 && mg::RANK == 0 && getenv("LOCALFOLD_MEM")) fprintf(stderr, "  sharded triangle at %d tokens: windows of C / 32\n", n);
+    }
+    div = it->second;
+  }
+  const int K = std::max(8, C / div), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
   // (the gate: made in the input pass for every row and held to the output - a slab of it; in ROUNDS, a card short of
   // room, made a chunk of rows at a time just before the output pass instead: a slab less, 7.6 GB a rank at 10,868
   // tokens on 4, for one more read of the rows and the gating linear again)
-  const int gateRows = rounds ? std::max(16, (rows + (C >= 256 ? 15 : 7)) / (C >= 256 ? 16 : 8)) : std::max(rows, 1);
+  const int gateRows = rounds ? std::max(16, (rows + div - 1) / div) : std::max(rows, 1);
   half* t2 = scratch<half>("trib.t2", (size_t)gateRows * np * C);
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
   // every rank's channels (the plain form: a share of C each, a group at a time)

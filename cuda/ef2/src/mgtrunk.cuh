@@ -26,8 +26,7 @@ inline float* shardedTrunkEf2(int T, int C, int loops) {
   B16* zl = (B16*)zS.local;
   B16* base = zl - (size_t)lo * T * C;                           // (indexed by the global pair)
   CK(cudaMemsetAsync(zl, 0, std::max<size_t>(held * C * 2, 1), STREAM));
-  float* mask = scratch<float>("trunk.mask", P);
-  fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
+  const float* mask = nullptr;                                   // (every pair real: the triangle reads null as ones)
   const size_t chunk = std::min<size_t>(std::max<size_t>(held, 1), ((size_t)64 << 20) / (4 * (size_t)C));
   float* xn = scratch<float>("trunk.xn", chunk * C); float* zc = scratch<float>("trunk.zc", chunk * C);
   const ZInitStream& zs = ZINIT_STREAM;
@@ -47,7 +46,7 @@ inline float* shardedTrunkEf2(int T, int C, int loops) {
     for (int i0 = lo; i0 < lo + rows; i0 += bi) {
       int b = std::min(bi, lo + rows - i0); size_t cells = (size_t)b * T;
       lmPairRows(zs.s, T, zs.P, i0, b, lm);
-      zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(base, zs.rows, zs.cols, relIdx(), W("token_bonds"),
+      zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(base, zs.rows, zs.cols, relIdx(), BONDS,
                                                            F("featuriser/tokenBonds"), lm, T, C, (size_t)i0 * T, cells);
     }
     PAIR16 = true;
@@ -218,7 +217,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, q0 = (size_t)i0 * T, ql = (size_t)(i0 - lo) * T;
       ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zl + ql * C, xn, n * C);
       layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, q0, n, T, C);
+      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, q0, n, T, C);
       outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, q0, n, T, C);
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
@@ -228,8 +227,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
     }
     releaseScratch({ "cf.zc", "cf.xn", "cf.prodc" });
   }
-  float* mask = scratch<float>("trunk.mask", P);
-  fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
+  const float* mask = nullptr;                                   // (every pair real)
   PAIR16 = true;
   for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b) {
     const std::string B = "confidence/blocks/" + std::to_string(b) + "/";
@@ -239,7 +237,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
     if (held) transition256(reinterpret_cast<float*>(zl), held, C, B + "pairTransition/");
   }
   PAIR16 = false;
-  releaseScratch({ "ftri.", "ftr.", "trib.", "trunk.mask" });
+  releaseScratch({ "ftri.", "ftr.", "trib." });
   // the head's outputs off this rank's rows: the pooling's rows, the PAE and pTM rows - all-gathered
   const int pb = (int)dimOf("f/confidence/pae", 1), Tp = (T + 3) / 4 * 4;
   mg::Shared& pooledS = mg::shared("ef2.cf.pooled", (size_t)T * C * 4);

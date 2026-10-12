@@ -14,6 +14,28 @@
 // relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed;
 // computed where it is read (z_init, the diffusion's conditioning, the confidence head), never stored
 struct RelIdx { const int *ri, *asym, *sym, *ent, *ti; const float* Wt; };
+// token_bonds as each row's bonded columns: the input's [T, T] is nearly all zeros and stays on the host (Model::hostOnly)
+// - 1.1 GB a GPU at 16,549 tokens. Built per fold (buildBonds), read through bondAt
+struct Bonds { const int* start; const int* col; const float* val; };
+inline Bonds BONDS{};
+__device__ __forceinline__ float bondAt(const Bonds& b, int i, int j) {
+  for (int k = b.start[i]; k < b.start[i + 1]; ++k) if (b.col[k] == j) return b.val[k];
+  return 0.f;
+}
+inline void buildBonds(int T) {
+  static int* start = nullptr; static int* col = nullptr; static float* val = nullptr;
+  for (void* p : { (void*)start, (void*)col, (void*)val }) if (p) CK(cudaFree(p));
+  const float* d = M.f("token_bonds");
+  std::vector<int> s(T + 1, 0), c; std::vector<float> v;
+  for (int i = 0; i < T; ++i) {
+    for (int j = 0; j < T; ++j) if (d[(size_t)i * T + j] != 0.f) { c.push_back(j); v.push_back(d[(size_t)i * T + j]); }
+    s[i + 1] = (int)c.size();
+  }
+  CK(cudaMalloc(&start, s.size() * 4)); CK(cudaMalloc(&col, std::max<size_t>(c.size(), 1) * 4)); CK(cudaMalloc(&val, std::max<size_t>(v.size(), 1) * 4));
+  CK(cudaMemcpy(start, s.data(), s.size() * 4, cudaMemcpyHostToDevice));
+  if (!c.empty()) { CK(cudaMemcpy(col, c.data(), c.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(val, v.data(), v.size() * 4, cudaMemcpyHostToDevice)); }
+  BONDS = { start, col, val };
+}
 inline RelIdx relIdx() {
   return {Idev("residue_index"), Idev("asym_id"), Idev("sym_id"), Idev("entity_id"), Idev("token_index"), F("featuriser/relPos")};
 }
@@ -36,12 +58,12 @@ __global__ void relPosK(RelIdx r, float* out, int T, int C) {
   out[t] = relPosAt(r, (int)(ij / T), (int)(ij % T), c, C);
 }
 // z_init = rows[i] + cols[j] + relpos + bonds * w_bond + lm_z
-__global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+__global__ void zInitK(const float* rows, const float* cols, RelIdx rel, Bonds bonds, const float* wBond,
                        const float* lmZ, float* z, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + (lmZ ? lmZ[t] : 0.f);
+  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + (lmZ ? lmZ[t] : 0.f);
 }
 
 // a STREAMED z_init (a card short of room): neither it nor the language model's pair is kept - each loop
@@ -49,12 +71,12 @@ __global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const f
 struct ZInitStream { const float* rows; const float* cols; const float* s; int P; };
 inline ZInitStream ZINIT_STREAM{};
 template <class TZ>
-__global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+__global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelIdx rel, Bonds bonds, const float* wBond,
                               const float* lm, int T, int C, size_t r0, size_t cnt) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lm[t];
+  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + lm[t];
   if constexpr (std::is_same_v<TZ, float>) z[r0 * C + t] += add;
   else z[r0 * C + t] = __float2bfloat16(__bfloat162float(z[r0 * C + t]) + add);
 }
@@ -70,8 +92,8 @@ inline void zInitAddStreamed(float* z, int T, int C) {
     int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
     lmPairRows(zs.s, T, zs.P, i0, b, lm);
     if (EF2_Z16) zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(z), zs.rows, zs.cols, relIdx(),
-                   W("token_bonds"), F("featuriser/tokenBonds"), lm, T, C, (size_t)i0 * T, cells);
-    else zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"),
+                   BONDS, F("featuriser/tokenBonds"), lm, T, C, (size_t)i0 * T, cells);
+    else zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), BONDS, F("featuriser/tokenBonds"),
                                                               lm, T, C, (size_t)i0 * T, cells);
   }
 }
@@ -87,7 +109,7 @@ inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, 
     relPosK<<<blocks(P * C), 256, 0, STREAM>>>(relIdx(), rel, T, C);
     checkOracle("rel_pos", rel, P * C, "o/rel_pos");
   }
-  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), lmZ, z, T, C);
+  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, relIdx(), BONDS, F("featuriser/tokenBonds"), lmZ, z, T, C);
 }
 
 // ---------------------------------------------------------------- the trunk, float32

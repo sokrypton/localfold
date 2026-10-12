@@ -393,6 +393,7 @@ inline size_t residentScaleBytes(const BRec& b) {
 }
 struct Model {
   std::map<std::string, Entry> index;
+  std::set<std::string> hostOnly;         // entries a file's device copy leaves out (read with f() alone)
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
   std::deque<Segment> segs;          // (a deque: an upload thread holds a reference while another file loads)
   void load(const std::string& dir) {
@@ -415,7 +416,10 @@ struct Model {
     Segment sg{nullptr, bytes, nullptr};
     sg.fd = fd;
     std::vector<Entry*> ts;
-    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') ts.push_back(&e);
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') {
+      if (hostOnly.count(name)) { e.devOffset = DROPPED; continue; }      // (read on the host alone: no device copy)
+      ts.push_back(&e);
+    }
     std::sort(ts.begin(), ts.end(), [](const Entry* a, const Entry* b) { return a->offset < b->offset; });
     size_t at = 0, end = 0;          // a tensor sharing (or overlapping) the last one's range keeps its place in it
     for (Entry* e : ts) {

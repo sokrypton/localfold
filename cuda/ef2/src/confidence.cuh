@@ -10,12 +10,12 @@
 #pragma once
 #include "trunk.cuh"
 
-__global__ void confZK(float* z, RelIdx rel, const float* bonds, const float* wBond, const float* rows,
+__global__ void confZK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
                        const float* cols, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] += relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
+  z[t] += relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
 }
 __global__ void outerProductK(const float* a, const float* b, float* out, size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -41,12 +41,12 @@ __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const f
   for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
 }
 // ...a chunk of pair positions [p0, p0 + n) of z (EF2_Z16's head, which builds its pair a chunk of rows at a time)
-__global__ void confZRowsK(float* z, RelIdx rel, const float* bonds, const float* wBond, const float* rows,
+__global__ void confZRowsK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
                            const float* cols, size_t p0, size_t n, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n * C) return;
   int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] += relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
+  z[t] += relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
 }
 __global__ void distanceEmbedRowsK(float* z, const float* x, const int* rep, const float* edges, int nEdges,
                                    const float* table, size_t p0, size_t n, int T, int C) {
@@ -184,7 +184,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
       CK(cudaMemcpyAsync(stage, reinterpret_cast<const B16*>(PARK_HOST) + p0 * C, n * C * 2, cudaMemcpyHostToDevice, STREAM));
       ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(stage, xn, n * C);
       layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, p0, n, T, C);
+      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
       outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
@@ -222,7 +222,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   float* z = !zTrunk ? nullptr : inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
   if (zTrunk) {
   layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, T, C);
+  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, T, C);
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   float* prod = scratch<float>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {

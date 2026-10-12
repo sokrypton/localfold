@@ -416,6 +416,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     const float* __restrict__ bias = nullptr, RectMap rm = {}) {
   // [rm.ab0, rm.ab1): the a/b steps (8 channels each) this launch makes - a and b written at their channels' places, so
   // a caller holding a few channels hands planes based that many channels back (sharded.cuh's rounds); -1, all of them
+  // mask: null for every pair real (ESMFold2's sharded trunk: a whole pair of ones is 1.1 GB a rank at 16,549 tokens)
   // rm: a rectangle's rows (RectMap), its planes `size` long; a null a, b or t2 is not written (the blocks' passes each
   // want one operand)
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
@@ -505,7 +506,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   for (int mt = 0; mt < MT; ++mt) {
     lr0[mt] = (warp * MT + mt) * 16 + g; lr1[mt] = lr0[mt] + 8;
     size_t pr0 = pairOf(row0 + lr0[mt]), pr1 = pairOf(row0 + lr1[mt]);
-    m0[mt] = pr0 != SIZE_MAX ? mask[pr0] : 0.f; m1[mt] = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
+    m0[mt] = pr0 != SIZE_MAX ? (mask ? mask[pr0] : 1.f) : 0.f; m1[mt] = pr1 != SIZE_MAX ? (mask ? mask[pr1] : 1.f) : 0.f;
   }
   for (int it = 0; it < steps; ++it) {
     const int j = stepOf(it), st = it & 1;
