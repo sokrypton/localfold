@@ -13,8 +13,7 @@
  * with its switch off. Then these files replace webgpu/af2/evoformer/, and this notice
  * goes with them.
  *
- * Everything not listed below is import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
-imported from webgpu/af2/evoformer/ unchanged - the
+ * Everything not listed below is imported from webgpu/af2/evoformer/ unchanged - the
  * two graphs genuinely share their attention, triangle, transition and
  * outer-product-mean kernels.
  *
@@ -88,6 +87,7 @@ import {
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
 import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
 import {
