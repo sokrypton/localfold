@@ -394,8 +394,16 @@ static int foldMain(int argc, char** argv) {
   // each, 24 a step - hence not below 512). (LOCALFOLD_MG_SHARD_DIFFUSION=1 or 0 forces either.)
   const char* shardDiff = getenv("LOCALFOLD_MG_SHARD_DIFFUSION");
   const bool oneSample = seedList.size() * samples == 1;
+  // ...and the diffusion's own floor with the pair whole beside it - the bf16 pair, its f16 LayerNorm'd copy, the
+  // encoder's projection and a super block's biases: 1.5x the f32 pair, measured. foldFits's trunk floor (1.15x) said a
+  // 10,344-token fold fit an 80 GB A100 and its whole diffusion wanted ~85 GB; sharded, several samples batch as well
+  const auto wholeDiffusionFits = [](int n, int C) {
+    size_t f, t; deviceMemInfo(&f, &t);
+    return (double)n * n * C * 4 * 1.5 + (double)t / 20 <= (double)f;
+  };
   const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
-    foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true);
+    foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true) &&
+    (shardDiff || wholeDiffusionFits(tokens, (int)M.meta("trunk.embedder.pairChannels")));
   // (a confidence head with no sharded form - boltz2's, rf3's - runs on rank 0 with the pair gathered: refused up front
   // where that pair would not fit one GPU)
   const bool confOnRank0 = mg::WORLD > 1 && sh::ON && doFold && !confidenceShardable();

@@ -116,13 +116,20 @@ inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   float* ctx = scratch<float>("esmc.ctx", R * C);
   // v stays in the packed buffer (row stride 3C); q and k were normalised out to stride C
   {
-    float* S = scratch<float>("esmc.scores", (size_t)e.heads * R * R);
+    // the heads a group at a time where every head's scores would not fit with room to spare - each head its own, so the
+    // same arithmetic (ESM-C 6B's 40 heads at 16,683 rows were 44.5 GB of scores at once)
+    int hg = e.heads;
+    while (hg > 1 && !roomFor((size_t)hg * R * R * 4, { "esmc.scores" })) hg = (hg + 1) / 2;
+    float* S = scratch<float>("esmc.scores", (size_t)hg * R * R);
     const float one = 1.f, zero = 0.f;
-    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)R, (int)R, 64, &one, k, C, 64, q, C, 64, &zero,
-                                 S, (int)R, (long long)R * R, e.heads));
-    softmaxSeqK<<<(unsigned)(e.heads * R), 256, 0, STREAM>>>(S, seq, (int)R, 0.125f);
-    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, (int)R, (int)R, &one, qkv + 2 * C, 3 * C, 64, S,
-                                 (int)R, (long long)R * R, &zero, ctx, C, 64, e.heads));
+    for (int h0 = 0; h0 < e.heads; h0 += hg) {
+      const int g = std::min(hg, e.heads - h0);
+      CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)R, (int)R, 64, &one, k + h0 * 64, C, 64, q + h0 * 64, C, 64, &zero,
+                                   S, (int)R, (long long)R * R, g));
+      softmaxSeqK<<<(unsigned)(g * R), 256, 0, STREAM>>>(S, seq, (int)R, 0.125f);
+      CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, (int)R, (int)R, &one, qkv + 2 * C + h0 * 64, 3 * C, 64, S,
+                                   (int)R, (long long)R * R, &zero, ctx + h0 * 64, C, 64, g));
+    }
   }
   towerGemm(ctx, B + "attn_out/weights", x, R, C, C, 1.f, 1.f / e.residualScale);   // x + f(x) / sqrt(layers / 36)
   layerNorm(x, xn, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));

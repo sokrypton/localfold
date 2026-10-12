@@ -12,10 +12,107 @@
 // this rank's rows of the trunk's pair (the shared buffer the trunk leaves them in)
 inline mg::Shared* EF2_ZS = nullptr;
 struct B16Host { void* p = nullptr; size_t have = 0, bytes = 0; };
+// this rank's share in pinned host memory: through the sampler (parkShareEf2), and through the released models'
+// language-model blocks on a card short of room (shardedParcaeEf2)
+inline B16Host EF2_SHARE_HOST{};
+inline void* shareHost(size_t bytes) {
+  if (EF2_SHARE_HOST.have < bytes) {
+    if (EF2_SHARE_HOST.p) CK(cudaFreeHost(EF2_SHARE_HOST.p));
+    if (cudaMallocHost(&EF2_SHARE_HOST.p, std::max<size_t>(bytes, 1)) != cudaSuccess) {
+      fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair\n", bytes / 1e9); exit(1);
+    }
+    EF2_SHARE_HOST.have = bytes;
+  }
+  return EF2_SHARE_HOST.p;
+}
 inline std::string ef2WeightName(const std::string& pre, const char* leaf) { return "f/" + pre + "/" + leaf; }
 
+// a run of trunk blocks (two triangles and a transition each) on a sharded pair: S's rows, `held` of them on this rank
+inline void shardedBlocksEf2(mg::Shared& S, size_t held, int T, int C, const std::string& prefix, int from, int to) {
+  PAIR16 = true;
+  for (int b = from; b < to; ++b) {
+    const std::string B = prefix + "/" + std::to_string(b) + "/";
+    sh::triangleSharded<half>(S, nullptr, T, C, B + "triangleMultiplicationOutgoing", false, false);
+    sh::triangleSharded<half>(S, nullptr, T, C, B + "triangleMultiplicationIncoming", false, true);
+    if (held) transition256(reinterpret_cast<float*>(S.local), held, C, B + "pairTransition/");
+    mg::fence();                                     // (the next block's triangle reads every rank's rows)
+  }
+  PAIR16 = false;
+}
+
+// The released models' recycle (trunk.cuh's foldingTrunk, its parcae branch) on this rank's rows: z starts as the same
+// truncated noise one GPU draws there; each pass the language model's pair - made a block of rows at a time from the
+// per-token states, as the streamed z_init makes it - is dropped out (the same draws) into a second share, the
+// injection, refined by the language model's own pair blocks, given z_init, LayerNorm'd, projected and folded into a
+// per-channel decay of z, and the trunk's blocks run; after the last pass the readout and the coda. The injection is a
+// share of its own beside z (17.5 GB a rank at 16,549 tokens on 8): z and the injection bf16, their arithmetic f32
+// (the injection a share only from a pass's start to its decay update - the trunk's blocks run beside z alone - and, where
+// every rank cannot hold the triangle's whole form beside the two, z in pinned host memory while the language model's
+// blocks run on the injection: three shares a rank, 30.6 GB each at 21,874 tokens on 8, do not fit 80 GB)
+inline void shardedParcaeEf2(int T, int C, int loops, uint64_t seed) {
+  using B16 = __nv_bfloat16;
+  int lo, hi; sh::rowsOf(T, mg::RANK, lo, hi);
+  const int rows = sh::storedRows(T, mg::RANK);
+  const size_t held = (size_t)rows * T, off = (size_t)lo * T * C;
+  const ZInitStream& zs = ZINIT_STREAM;
+  if (zs.P != C) { fprintf(stderr, "the parcae recycle injects the language model's pair: %d channels, the trunk's %d\n", zs.P, C); exit(1); }
+  const float p = (float)M.meta("meta/lmDropout");
+  const int blocksN = (int)M.meta("meta/blocks"), lmBlocks = (int)M.meta("meta/lmEncoderBlocks"),
+            codaBlocks = (int)M.meta("meta/codaBlocks");
+  const size_t shareBytes = mg::sharedBuffers().at("sh.z").bytes, heldBytes = held * C * 2;
+  B16* zl = (B16*)mg::sharedBuffers().at("sh.z").local;
+  if (held) truncNormalK<B16><<<blocks(held * C), 256, 0, STREAM>>>(zl, held * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull, off);
+  const int bi = lmPairBlock(T, C);
+  float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * C);
+  const size_t chunk = std::min<size_t>(std::max<size_t>(held, 1), ((size_t)64 << 20) / (4 * (size_t)C));
+  float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
+  for (int loop = 0; loop < loops; ++loop) {
+    mg::Shared& iS = mg::shared("sh.inj", shareBytes);
+    B16* il = (B16*)iS.local;
+    for (int i0 = lo; i0 < lo + rows; i0 += bi) {      // the injection's rows: the language model's pair, dropped out
+      const int b = std::min(bi, lo + rows - i0); const size_t cells = (size_t)b * T, at = (size_t)(i0 - lo) * T * C;
+      lmPairRows(zs.s, T, C, i0, b, lm);
+      dropoutK<B16><<<blocks(cells * C), 256, 0, STREAM>>>(lm, il + at, cells * C, p, seed, 1000 + loop, (size_t)i0 * T * C);
+    }
+    size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
+    const bool park = !mg::everyRankHas(sh::wholeFormBytes(T, C, 2) + t / 16);
+    if (park) {                                        // z waits in host memory through the language model's blocks
+      if (heldBytes) CK(cudaMemcpyAsync(shareHost(heldBytes), zl, heldBytes, cudaMemcpyDeviceToHost, STREAM));
+      mg::release({ "sh.z" }, mg::FREE);
+    }
+    shardedBlocksEf2(iS, held, T, C, "lmEncoder/blocks", 0, lmBlocks);
+    if (park) {
+      zl = (B16*)mg::shared("sh.z", shareBytes).local;
+      if (heldBytes) CK(cudaMemcpyAsync(zl, EF2_SHARE_HOST.p, heldBytes, cudaMemcpyHostToDevice, STREAM));
+    }
+    for (int i0 = lo; i0 < lo + rows; i0 += bi) {      // + z_init (its language-model term is the injection's own)
+      const int b = std::min(bi, lo + rows - i0); const size_t cells = (size_t)b * T;
+      zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(il - off, zs.rows, zs.cols, relIdx(), BONDS,
+                                                           F("featuriser/tokenBonds"), (const float*)nullptr, T, C, (size_t)i0 * T, cells);
+    }
+    for (size_t r0 = 0; r0 < held; r0 += chunk) {     // z = decay * z + projection(LN(injection))
+      const size_t r = std::min(chunk, held - r0);
+      ef2FromBf16K<<<blocks(r * C), 256, 0, STREAM>>>(il + r0 * C, y, r * C);
+      layerNorm(y, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+      gemm(xn, F("recycle/projection"), y, r, C, C);
+      decayUpdate16K<<<blocks(r * C), 256, 0, STREAM>>>(zl + r0 * C, y, F("recycle/decay"), r, C);
+    }
+    mg::release({ "sh.inj" }, mg::FREE);
+    shardedBlocksEf2(mg::sharedBuffers().at("sh.z"), held, T, C, "blocks", 0, blocksN);
+    mg::tick("trunk pass");
+  }
+  for (size_t r0 = 0; r0 < held; r0 += chunk) {       // the readout, in place
+    const size_t r = std::min(chunk, held - r0);
+    ef2FromBf16K<<<blocks(r * C), 256, 0, STREAM>>>(zl + r0 * C, xn, r * C);
+    gemm(xn, F("readout"), y, r, C, C);
+    ef2ToBf16K<<<blocks(r * C), 256, 0, STREAM>>>(y, zl + r0 * C, r * C);
+  }
+  mg::fence();
+  shardedBlocksEf2(mg::sharedBuffers().at("sh.z"), held, T, C, "coda/blocks", 0, codaBlocks);
+}
+
 // the trunk on this rank's rows: returns them bf16, indexed by the global pair (EF2_ZS the buffer)
-inline float* shardedTrunkEf2(int T, int C, int loops) {
+inline float* shardedTrunkEf2(int T, int C, int loops, uint64_t seed = 0) {
   using B16 = __nv_bfloat16;
   sh::WNAME = ef2WeightName;
   const size_t P = (size_t)T * T;
@@ -33,6 +130,13 @@ inline float* shardedTrunkEf2(int T, int C, int loops) {
   const int bi = lmPairBlock(T, zs.P);
   float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * zs.P);
   const int blocksN = (int)M.meta("meta/blocks");
+  if (parcaeRecycle()) {                       // (the released models' own loop: sh.z may be made anew in it)
+    shardedParcaeEf2(T, C, loops, seed);
+    mg::release({ "sh.tp", "sh.tsa", "sh.tsb", "sh.bias", "sh.bg", "sh.zTc" }, mg::FREE);
+    releaseScratch(); trimPool();
+    EF2_ZS = &mg::sharedBuffers().at("sh.z");
+    return reinterpret_cast<float*>((B16*)EF2_ZS->local - (size_t)lo * T * C);
+  }
   for (int loop = 0; loop < loops; ++loop) {
     // the recycle, f32 a chunk of this rank's rows at a time
     for (size_t r0 = 0; r0 < held; r0 += chunk) {
@@ -98,19 +202,12 @@ inline void pairOntoRank0HostEf2(int T, int C) {
 // device where every rank has the room for it to stay through the sampler and the confidence head beside it: the head's
 // residual (a share's size) and the sharded triangle's whole form (its own estimate) past an eighth of the card. Parking was
 // pinning alone: 1.1 s for a 1.58 GB share at 4,940 tokens on 8, where a rank holds under 7 GB
-inline B16Host EF2_SHARE_HOST{};
 // (returns whether it was kept: unparkShareEf2 and confidenceHeadSharded take it)
 inline bool parkShareEf2(int T, int C) {
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
   size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
   if (!BIG_FORCED && mg::everyRankHas(bytes + sh::wholeFormBytes(T, C, 2) + t / 8)) return true;
-  if (EF2_SHARE_HOST.have < bytes) {
-    if (EF2_SHARE_HOST.p) CK(cudaFreeHost(EF2_SHARE_HOST.p));
-    if (cudaMallocHost(&EF2_SHARE_HOST.p, std::max<size_t>(bytes, 1)) != cudaSuccess) {
-      fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair\n", bytes / 1e9); exit(1);
-    }
-    EF2_SHARE_HOST.have = bytes;
-  }
+  shareHost(bytes);
   EF2_SHARE_HOST.bytes = EF2_ZS->bytes;
   if (bytes) CK(cudaMemcpyAsync(EF2_SHARE_HOST.p, EF2_ZS->local, bytes, cudaMemcpyDeviceToHost, STREAM));
   mg::release({ "sh.z" }, mg::FREE);

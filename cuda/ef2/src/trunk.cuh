@@ -76,7 +76,8 @@ __global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelId
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + lm[t];
+  // (lm null: z_init without the language model's term - the released models' recycle, which injects that pair itself)
+  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + (lm ? lm[t] : 0.f);
   if constexpr (std::is_same_v<TZ, float>) z[r0 * C + t] += add;
   else z[r0 * C + t] = __float2bfloat16(__bfloat162float(z[r0 * C + t]) + add);
 }
@@ -428,22 +429,32 @@ __device__ __forceinline__ float uniform01(uint64_t seed, uint64_t stream, uint6
 }
 // the initial pair state: a normal of std sqrt(2 / (5 C)) truncated at 3 std (biohub's _init_pair_state -
 // trunc_normal_, which redraws past the bounds; here a Box-Muller draw redrawn the same way)
-__global__ void truncNormalK(float* z, size_t n, float std, uint64_t seed) {
+// (off: the element's place in the whole pair - a sharded rank's rows draw what one GPU's draw there; TZ bf16 for its share)
+template <class TZ = float>
+__global__ void truncNormalK(TZ* z, size_t n, float std, uint64_t seed, size_t off = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
+  const size_t g = off + t;
   float v = 0.f;
   for (int k = 0; k < 64; ++k) {
-    float u1 = fmaxf(uniform01(seed, 2 * k, t), 1e-7f), u2 = uniform01(seed, 2 * k + 1, t);
+    float u1 = fmaxf(uniform01(seed, 2 * k, g), 1e-7f), u2 = uniform01(seed, 2 * k + 1, g);
     v = sqrtf(-2.f * logf(u1)) * cospif(2.f * u2);
     if (fabsf(v) <= 3.f) break;
   }
-  z[t] = fminf(fmaxf(v, -3.f), 3.f) * std;
+  z[t] = (TZ)(fminf(fmaxf(v, -3.f), 3.f) * std);
 }
 // out = dropout(in, p): zeroed with probability p, else scaled by 1 / (1 - p) (F.dropout, training=True)
-__global__ void dropoutK(const float* in, float* out, size_t n, float p, uint64_t seed, uint64_t stream) {
+template <class TO = float>
+__global__ void dropoutK(const float* in, TO* out, size_t n, float p, uint64_t seed, uint64_t stream, size_t off = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
-  out[t] = uniform01(seed, stream, t) < p ? 0.f : in[t] / (1.f - p);
+  out[t] = (TO)(uniform01(seed, stream, off + t) < p ? 0.f : in[t] / (1.f - p));
+}
+// z = a * z + y, a per channel, z bf16 (a sharded rank's share)
+__global__ void decayUpdate16K(__nv_bfloat16* z, const float* y, const float* a, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C) return;
+  z[t] = __float2bfloat16(a[t % C] * __bfloat162float(z[t]) + y[t]);
 }
 // z = a * z + y, a per channel
 __global__ void decayUpdateK(float* z, const float* y, const float* a, size_t rows, int C) {

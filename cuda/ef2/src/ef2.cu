@@ -129,14 +129,16 @@ static int foldInput(const Opts& o, bool warm) {
     // several GPUs: the trunk sharded by rows (mgtrunk.cuh) - with the streamed z_init, and one room for every rank's
     // short-of-room choices (cuda/af3's, common.cuh); the sampler's steps uncaptured (a fence cannot be in a graph)
     SAMPLER_GRAPH = false;
-    if (parcae || hasMsaEncoder() || check) {
-      fprintf(stderr, "several GPUs fold ESMFold2's single-sequence models (not the recycling or alignment ones, not an oracle check) yet\n");
+    if (hasMsaEncoder() || check) {
+      fprintf(stderr, "several GPUs fold ESMFold2's single-sequence models and ESMFold2-Fast (not the alignment encoder's ESMFold2, not an oracle check) yet\n");
       return 1;
     }
     SHORT_PAIR_ROOM = std::max<size_t>(1, mg::minOverRanks(shortPairRoomHere()));
     SHORT_PAIR_SHARE = mg::WORLD;
   }
-  const bool streamZ = !check && !parcae && (mg::WORLD > 1 || shortPair((size_t)T * T, e.pair));
+  // (several GPUs: streamed for every model - the released models' recycle makes the language model's pair a block of
+  // rows at a time there too)
+  const bool streamZ = !check && (mg::WORLD > 1 || (!parcae && shortPair((size_t)T * T, e.pair)));
   float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
   if (residentTower && M.residentParked()) {      // (the last fold parked the tower: back from its shards)
@@ -272,7 +274,7 @@ static int foldInput(const Opts& o, bool warm) {
     // sat idle in the scratch pool where the trunk's shared buffers could not have them)
     releaseScratch(); trimPool();
     mem("before the sharded trunk"); mg::segmentReport("before the sharded trunk");
-    z = shardedTrunkEf2(T, C, passes);         // (this rank's rows, bf16, indexed by the global pair: EF2_ZS)
+    z = shardedTrunkEf2(T, C, passes, seed);         // (this rank's rows, bf16, indexed by the global pair: EF2_ZS)
     say("trunk across %d GPUs\n", world);
   } else foldingTrunk(T, C, zi, z, passes, check, lmZ, seed, lmHost);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
