@@ -1,5 +1,5 @@
 """The native Metal AF2 gate: cuda/af2/gate.py itself - its cases, tolerances and scoring - with its fold command and
-its baseline pointed at metal/af2 (metal/af2/fold runs metal/af2/localfold-af2; metal/af2/gate-baseline.json is this
+its baseline pointed at metal/af2 (metal/af2/fold runs metal/af2/localfold-af2; metal/af2/gate-baseline.<chip>.json is this
 Mac's). The A100's baseline (cuda/af2/gate-baseline.json) is printed beside it for reference.
 
     python3 metal/af2/gate.py [--write] [--only=6mrr,...]
@@ -15,7 +15,9 @@ import gate  # noqa: E402
 
 a100 = json.load(open(gate.BASELINE)) if os.path.exists(gate.BASELINE) else {}
 gate.HERE = os.path.join(REPO, "metal", "af2")
-gate.BASELINE = os.path.join(gate.HERE, "gate-baseline.json")
+sys.path.insert(0, os.path.join(REPO, "metal"))
+import gate_baseline  # noqa: E402
+gate.BASELINE = gate_baseline.baseline(gate.HERE, write="--write" in sys.argv)   # (this chip's: metal/gate_baseline.py)
 gate.TMP = os.environ.get("GATE_TMP", "/tmp/metal-native-af2-gate")
 # an unconfident fold (baseline pLDDT under 50: 1BRS from its sequences alone, 16 A from the crystal) is chaotic in the
 # rounding - the same port moved 15.86 -> 16.71 -> 15.97 A between kernel changes that leave every confident fold

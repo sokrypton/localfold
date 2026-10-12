@@ -15,7 +15,9 @@ import gate  # noqa: E402
 
 a100 = json.load(open(gate.BASELINE)) if os.path.exists(gate.BASELINE) else {}
 gate.HERE = os.path.join(REPO, "metal", "ef2")
-gate.BASELINE = os.path.join(gate.HERE, "gate-baseline.json")
+sys.path.insert(0, os.path.join(REPO, "metal"))
+import gate_baseline  # noqa: E402
+gate.BASELINE = gate_baseline.baseline(gate.HERE, write="--write" in sys.argv)   # (this chip's: metal/gate_baseline.py)
 gate.TMP = os.environ.get("GATE_TMP", "/tmp/metal-native-ef2-gate")
 gate.oracle_cases = lambda: []
 cases = gate.fold_cases

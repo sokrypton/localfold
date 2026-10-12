@@ -32,7 +32,7 @@ metal/
                    cuda/featurise's weight walks (af2_weights.h, af3_weights.h), delta bundles, featurised inputs
     host.h/.cpp    the drivers' shared host pieces: --serve, frame superposition, whole-file writes
   af3/ af2/ ef2/ one per port, flat: the port's kernels (kernels.h, <port>.metal), its stages (*.mm), main.mm,
-                 fold, gate.py, gate-baseline.json
+                 fold, gate.py, gate-baseline.<chip>.json
   selftest/      the GEMM, attention and LayerNorm against host references
   bench/         GEMM and attention arms, interleaved, each checked against the first
 ```
@@ -55,7 +55,7 @@ number (protenix2 6MRR, 1.6 A). A warm fold on the page: AF2 6MRR 2.0 s click to
 
 ## Is it right? The gates
 
-The CUDA gates' cases, scored against crystals, with this Mac's baseline in `metal/<port>/gate-baseline.json`
+The CUDA gates' cases, scored against crystals, with this Mac's baseline in `metal/<port>/gate-baseline.<chip>.json`
 (0.05 A and 0.5 pLDDT) and the A100's printed beside each case:
 
 ```

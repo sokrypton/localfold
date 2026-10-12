@@ -34,7 +34,7 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 NATIVE = "metal" if sys.platform == "darwin" else "cuda"
 NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
 # a case's bar on Metal where it differs from the A100's: Metal's sampling lands elsewhere on these targets, at the
-# Metal gate's own numbers (metal/af3/gate-baseline.json) and the CUDA-translated port's before it
+# Metal gate's own numbers (metal/af3/gate-baseline.m2.json) and the CUDA-translated port's before it
 METAL_BARS = {"protenix2 6mrr": 1.6}      # (1.561 in metal/af3/gate.py; the A100 0.499)
 FIX = os.path.join(REPO, "tools", "fixtures")
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"

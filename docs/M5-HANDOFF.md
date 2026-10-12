@@ -68,7 +68,7 @@ python3 tools/check-native-bridge.py                         # npm run test:brid
 npm test                                                     # the CPU suite; 1337/1338 on the M2 (see below)
 ```
 
-`metal/<port>/gate-baseline.json` is **the M2's**, held to 0.05 A RMSD and 0.5 pLDDT, and the A100's is printed
+`metal/<port>/gate-baseline.<chip>.json` is **the M2's**, held to 0.05 A RMSD and 0.5 pLDDT, and the A100's is printed
 beside each case. A different GPU rounds differently, so small moves are expected. **Do not re-record (`--write`)
 until each moved case is explained**: compare it with the A100 column and the M2 baseline, and fold it at another seed
 if it is an unconfident fold (pLDDT under 50 is chaotic in the rounding). The M2's AF3 values, for reference:

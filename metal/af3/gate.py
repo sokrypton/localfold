@@ -2,7 +2,7 @@
 ligand and an atomised modified residue, DNA and modified bases, AF3's kitchen sink, a glycan, 5CAJ and
 barnase-barstar with their crystals as templates - folded by metal/af3/localfold-af3 and scored the same way.
 
-    python3 metal/af3/gate.py                   # against metal/af3/gate-baseline.json (this Mac's)
+    python3 metal/af3/gate.py                   # against metal/af3/gate-baseline.<chip>.json (this chip's: metal/gate_baseline.py)
     python3 metal/af3/gate.py --write           # re-record it
     python3 metal/af3/gate.py --only=boltz2,af3-6mrr
 
@@ -29,7 +29,9 @@ import gate as cuda_gate   # noqa: E402  (its cases and its scoring)
 
 BIN = os.path.join(REPO, "metal", "af3", "localfold-af3")
 FEATURISE = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
-BASELINE = os.path.join(HERE, "gate-baseline.json")
+sys.path.insert(0, os.path.dirname(HERE))
+import gate_baseline  # noqa: E402
+BASELINE = gate_baseline.baseline(HERE, write="--write" in sys.argv)   # (this chip's: metal/gate_baseline.py)
 A100 = cuda_gate.BASELINE
 TMP = os.environ.get("GATE_TMP", os.path.join(tempfile.gettempdir(), "metal-af3-gate"))
 AF3_BUNDLE = os.path.join(REPO, "model-af3-int5")
