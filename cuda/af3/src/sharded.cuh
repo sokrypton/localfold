@@ -68,6 +68,16 @@ __global__ void pushTransposeChunkK(PeerSlabs ps, const uint4* __restrict__ src,
     ((uint4*)ps.p[p])[((size_t)(slot ? jj : jl) * n + lo + i) * vecs + v] = src[((size_t)i * n + j) * vecs + v];
   }
 }
+// ...and the same moves by COPY ENGINES, packed first: a transpose's pieces are 16-byte runs at one end or the other, so a
+// local pass (HBM, ~10x a link) lays each destination's out as one run a row and cudaMemcpy2DAsync takes it with no SM
+// held for as long as the link takes. dst[a][b] = src[b * stride + a], a < A, b < B, `vecs` 16 bytes an element
+__global__ void packTransposeK(uint4* __restrict__ dst, const uint4* __restrict__ src, int A, int B, size_t stride, int vecs) {
+  const size_t total_ = (size_t)A * B * vecs;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
+    const int v = (int)(t % vecs); const size_t rest = t / vecs; const int b = (int)(rest % B), a = (int)(rest / B);
+    dst[t] = src[((size_t)b * stride + a) * vecs + v];
+  }
+}
 // A push BESIDE work (on a side stream, overlapping a GEMM or an attention): a few SMs' worth of blocks striding over it,
 // so the work it overlaps keeps the rest of the card - with a block a 16-byte piece every SM held a slot for as long as
 // the transfer took, which over a real link is ~10x a simulated rank's local writes (NVLink fills from ~16 SMs: NCCL's
@@ -660,13 +670,11 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
   // a fence between, all 313 GB a pass a rank exposed at 10,344 tokens on 8. A slot is refilled only after every rank
   // passed the fence that follows its last push home (each rank waits its chunk k - 1's pushes before chunk k's fence);
   // the pushes home and the fills touch disjoint columns of z
-  // (on 8 blocks: a ring's pushes have the attention's whole length to fill - 313 GB in ~44 s of a simulated rank's pass
-  // at 10,344 tokens, ~7 GB/s - and on 64 the attention beside them was 22% slower)
-  constexpr unsigned RING_PUSH_BLOCKS = 8;
+  // (by copy engines, each packed locally first: as SM pushes on 8 blocks the attention beside them ran 3% slower in a
+  // simulated rank, and on 64 22% - a push holds its SMs for as long as the link takes)
   const int XC = 8, Pmax = (maxStored(n) + XC - 1) / XC, P = (rowsHere + XC - 1) / XC;
   mg::Shared* slot[3];
   for (int k = 0; k < 3; ++k) slot[k] = &mg::shared("sh.zTc" + std::to_string(k), std::max<size_t>((size_t)Pmax * n * C * elem(), 1));
-  const PeerSlabs back = peerSlabs(z, n);
   static cudaStream_t fillS = nullptr, homeS = nullptr;
   static cudaEvent_t fenced, filled, homed[XC], piece;
   if (!fillS) {
@@ -674,11 +682,38 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
     for (cudaEvent_t* e : { &fenced, &filled, &piece }) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
     for (auto& e : homed) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   }
+  // chunk k of every rank's columns: packed [rank][column][this rank's rows], then a 2-D copy a rank into its slot
+  const size_t row16 = (size_t)rowsHere * vecs * 16;
+  uint4* packF = scratch<uint4>("ring.packF", std::max<size_t>((size_t)mg::WORLD * Pmax * rowsHere * vecs, 1));
   auto fill = [&](int k, cudaStream_t st) {
-    if (rowsHere) pushTransposeChunkK<<<st == STREAM ? blocks((size_t)mg::WORLD * Pmax * rowsHere * vecs)
-                                                     : sideBlocks((size_t)mg::WORLD * Pmax * rowsHere * vecs, RING_PUSH_BLOCKS), 256, 0, st>>>(
-      peerSlabs(*slot[k % 3], n), (const uint4*)z.local, n, lo, rowsHere, vecs, k, XC, Pmax, mg::RANK, true);
-    if (rowsHere) mg::sent("transposes, column ring", (size_t)(mg::WORLD - 1) * Pmax * rowsHere * vecs * 16, st != STREAM);
+    if (!rowsHere) return;
+    const mg::Shared& to = *slot[k % 3];
+    for (int q = 0; q < mg::WORLD; ++q) {
+      const int r = (mg::RANK + q) % mg::WORLD, rr = storedRows(n, r), Pr = (rr + XC - 1) / XC, cnt = std::min(Pr, rr - k * Pr);
+      if (cnt <= 0) continue;
+      int rlo, rhi; rowsOf(n, r, rlo, rhi);
+      uint4* pk = packF + (size_t)r * Pmax * rowsHere * vecs;
+      const size_t th = (size_t)cnt * rowsHere * vecs;
+      packTransposeK<<<st == STREAM ? blocks(th) : sideBlocks(th), 256, 0, st>>>(pk, (const uint4*)z.local + (size_t)(rlo + k * Pr) * vecs,
+                                                                               cnt, rowsHere, n, vecs);
+      CK(cudaMemcpy2DAsync((char*)to.peer[r] + (size_t)lo * vecs * 16, (size_t)n * vecs * 16, pk, row16, row16, cnt,
+                           cudaMemcpyDefault, st));
+      if (r != mg::RANK) mg::sent("transposes, column ring", (size_t)cnt * row16, st != STREAM);
+    }
+  };
+  // chunk rows [c0, c0 + rows) of a slot home: packed [i][row] over every i, then a 2-D copy a rank into z's columns
+  uint4* packH = scratch<uint4>("ring.packH", (size_t)n * std::max<size_t>(1, std::min<size_t>(std::max(P, 1), CHUNK / ((size_t)n * 4 * Wd))) * vecs);
+  auto home = [&](const mg::Shared& sl, int c0, size_t r0, int rows, cudaStream_t st) {
+    const size_t th = (size_t)n * rows * vecs, w = (size_t)rows * vecs * 16;
+    packTransposeK<<<sideBlocks(th), 256, 0, st>>>(packH, (const uint4*)sl.local + (size_t)c0 * n * vecs, n, rows, n, vecs);
+    for (int q = 0; q < mg::WORLD; ++q) {
+      const int r = (mg::RANK + q) % mg::WORLD, rr = storedRows(n, r);
+      if (rr <= 0) continue;
+      int rlo, rhi; rowsOf(n, r, rlo, rhi);
+      CK(cudaMemcpy2DAsync((char*)z.peer[r] + r0 * vecs * 16, (size_t)n * vecs * 16, (const char*)packH + (size_t)rlo * w, w, w, rr,
+                           cudaMemcpyDefault, st));
+      if (r != mg::RANK) mg::sent("transposes, column ring", (size_t)rr * w, true);
+    }
   };
   size_t R = std::max<size_t>(1, std::min<size_t>(std::max(P, 1), CHUNK / ((size_t)n * 4 * Wd)));
   mg::fence();                                    // (every rank's bias pushed)
@@ -700,9 +735,7 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
       gridOut128(gathered, pre + ".outputProjection", into(sbase), n, r0 * n, prs, false);
       transition<half>(pairRow((float*)sl.local, (size_t)c0 * n, C), prs, C, transitionFactor, transitionPre);
       CK(cudaEventRecord(piece, STREAM)); CK(cudaStreamWaitEvent(homeS, piece, 0));
-      pushTransposeK<<<sideBlocks((size_t)n * rows * vecs, RING_PUSH_BLOCKS), 256, 0, homeS>>>(back, (const uint4*)sl.local + (size_t)c0 * n * vecs, n,
-                                                                          (int)r0, (int)rows, vecs);
-      mg::sent("transposes, column ring", (size_t)n * rows * vecs * 16 * (mg::WORLD - 1) / mg::WORLD, true);
+      home(sl, c0, r0, (int)rows, homeS);
     }
     CK(cudaEventRecord(homed[k], homeS));
     if (k + 1 < XC) CK(cudaStreamWaitEvent(STREAM, filled, 0));      // (chunk k + 1's columns here, from this rank)
