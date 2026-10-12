@@ -18,6 +18,7 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -445,7 +446,23 @@ inline void fenceByStage(const char* name) {
   auto& e = FENCE_BY_STAGE[name]; e.first += tot; e.second += (int)FENCE_EV.size();
   FENCE_EV.clear();
 }
+// what this rank sent its peers, by kind: [0] on its own stream (the stream waits for it), [1] on a side stream beside
+// the work it overlaps - in bytes; reported with the fences under LOCALFOLD_MG_TIMES. The same in a simulated rank as on
+// a box, so a box's exposed time can be read off a simulation: bytes over the link's rate
+inline std::map<std::string, std::array<double, 2>> SENT;
+inline void sent(const char* kind, size_t bytes, bool side) { SENT[kind][side ? 1 : 0] += (double)bytes; }
+inline void sentReport(const char* what) {
+  if (RANK != 0 || SENT.empty()) return;
+  double own = 0, side = 0;
+  for (auto& [k, v] : SENT) {
+    fprintf(stderr, "  sent %-22s %9.2f GB on the stream, %9.2f GB beside it\n", k.c_str(), v[0] / 1e9, v[1] / 1e9);
+    own += v[0]; side += v[1];
+  }
+  fprintf(stderr, "  sent to %-19s %9.2f GB on the stream, %9.2f GB beside it\n", what, own / 1e9, side / 1e9);
+  SENT.clear();
+}
 inline void fenceTimes(const char* what) {
+  sentReport(what);
   for (auto& [k, v] : FENCE_BY_STAGE)
     fprintf(stderr, "  rank %d stage %-22s %5d fences %8.1f ms waiting of %8.1f -> working %8.1f\n", RANK, k.c_str(), v.second, v.first,
             STAGE_MS[k], STAGE_MS[k] - v.first);
@@ -497,6 +514,7 @@ inline void allGather(const Shared& s, size_t off, size_t bytes) {
   for (int r = 0; r < WORLD; ++r) pp.p[r] = (uint4*)s.peer[r];
   const size_t n16 = bytes / 16;
   if (n16 && WORLD > 1) pushPartK<<<(unsigned)((n16 * (WORLD - 1) + 255) / 256), 256, 0, STREAM>>>(pp, off / 16, n16);
+  sent("all-gathers", bytes * (WORLD - 1), false);
   fence();
 }
 // The rate a GPU pushes into its peers, bytes/s - every rank's 32 MB part into every other's at once, three times (the

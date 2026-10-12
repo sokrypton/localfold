@@ -43,12 +43,13 @@ inline PeerSlabs peerSlabs(const mg::Shared& z, int n) {
 // of the other slab, in the part of the rank holding row i (the writes contiguous along j) - z^T home into z, or z out
 // into z^T (src z's rows, ps z^T's slabs, j0 this rank's first row)
 __global__ void pushTransposeK(PeerSlabs ps, const uint4* __restrict__ zT, int n, int j0, int cols, int vecs) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * cols * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)((rest / cols + ps.rot) % n);
-  int p = 0;
-  while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
-  ((uint4*)ps.p[p])[((size_t)(i - ps.lo[p]) * n + j0 + j) * vecs + v] = zT[((size_t)j * n + i) * vecs + v];
+  const size_t total_ = (size_t)n * cols * vecs;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
+    const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)((rest / cols + ps.rot) % n);
+    int p = 0;
+    while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
+    ((uint4*)ps.p[p])[((size_t)(i - ps.lo[p]) * n + j0 + j) * vecs + v] = zT[((size_t)j * n + i) * vecs + v];
+  }
 }
 
 // ...a chunk at a time: this rank's rows [lo, lo + rows) of z (src) at every rank's chunk k of its columns, into that
@@ -56,16 +57,24 @@ __global__ void pushTransposeK(PeerSlabs ps, const uint4* __restrict__ zT, int n
 // (slot: each destination's chunk written from its slot's row 0 - a buffer of one chunk, not the share)
 __global__ void pushTransposeChunkK(PeerSlabs ps, const uint4* __restrict__ src, int n, int lo, int rows, int vecs, int k,
                                     int chunks, int Pmax, int rank, bool slot = false) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)ps.world * Pmax * rows * vecs) return;
-  const int v = (int)(t % vecs); size_t rest = t / vecs;
-  const int i = (int)(rest % rows); rest /= rows;
-  const int jj = (int)(rest % Pmax), p = (int)((rest / Pmax + rank) % ps.world);
-  const int P = (ps.rows[p] + chunks - 1) / chunks, jl = k * P + jj;
-  if (jj >= P || jl >= ps.rows[p]) return;
-  const int j = ps.lo[p] + jl;
-  ((uint4*)ps.p[p])[((size_t)(slot ? jj : jl) * n + lo + i) * vecs + v] = src[((size_t)i * n + j) * vecs + v];
+  const size_t total_ = (size_t)ps.world * Pmax * rows * vecs;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
+    const int v = (int)(t % vecs); size_t rest = t / vecs;
+    const int i = (int)(rest % rows); rest /= rows;
+    const int jj = (int)(rest % Pmax), p = (int)((rest / Pmax + rank) % ps.world);
+    const int P = (ps.rows[p] + chunks - 1) / chunks, jl = k * P + jj;
+    if (jj >= P || jl >= ps.rows[p]) continue;
+    const int j = ps.lo[p] + jl;
+    ((uint4*)ps.p[p])[((size_t)(slot ? jj : jl) * n + lo + i) * vecs + v] = src[((size_t)i * n + j) * vecs + v];
+  }
 }
+// A push BESIDE work (on a side stream, overlapping a GEMM or an attention): a few SMs' worth of blocks striding over it,
+// so the work it overlaps keeps the rest of the card - with a block a 16-byte piece every SM held a slot for as long as
+// the transfer took, which over a real link is ~10x a simulated rank's local writes (NVLink fills from ~16 SMs: NCCL's
+// channels). 64 blocks of 256 copy 381 GB/s locally (32: 214, the whole card 684), over the ~250-300 GB/s an A100's links
+// take outbound; the exposed pushes, on the stream, keep the whole card
+constexpr unsigned SIDE_PUSH_BLOCKS = 64;
+inline unsigned sideBlocks(size_t threads) { return std::min<unsigned>(SIDE_PUSH_BLOCKS, (unsigned)blocks(threads)); }
 // zT (this rank's rows of z^T: z's columns [lo, hi)) from every rank's slab of z
 inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
   const size_t pb = (size_t)C * elem(); const int vecs = (int)(pb / 16);
@@ -74,6 +83,7 @@ inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
   // memory through a PCIe host bridge ran at a thirtieth of a write)
   mg::fence();                                    // (every rank's z written; its z^T free)
   if (cols) pushTransposeK<<<blocks((size_t)n * cols * vecs), 256, 0, STREAM>>>(peerSlabs(zT, n), (const uint4*)z.local, n, lo, cols, vecs);
+  mg::sent("transposes", (size_t)n * cols * pb * (mg::WORLD - 1) / mg::WORLD, false);
   mg::fence();                                    // (every rank's columns here)
 }
 
@@ -99,6 +109,7 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int c0, int cw, T* 
     CK(cudaStreamWaitEvent(cs, used[slot], 0));
     CK(cudaMemcpyAsync(stages[slot], (const T*)bmine.peer[r] + (size_t)c0 * (b - a) * np, (size_t)(b - a) * np * cw * sizeof(T),
                        cudaMemcpyDefault, cs));
+    mg::sent("triangle ring", (size_t)(b - a) * np * cw * sizeof(T), true);
     CK(cudaEventRecord(ready[slot], cs));
   };
   issue(0);
@@ -143,15 +154,16 @@ __device__ __forceinline__ uint4 widen8(uint2 s) {
 struct PushSlots { uint4* a[mg::MAX_RANKS]; uint4* b[mg::MAX_RANKS]; int ch[mg::MAX_RANKS], cnt[mg::MAX_RANKS]; int world, rank; };
 __global__ void pushPlanesK(PushSlots ps, const void* __restrict__ srcA, const void* __restrict__ srcB, int rows, int lo, int np,
                             int vecs, int g) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)ps.world * g * rows * vecs) return;
-  const int v = (int)(t % vecs); size_t rest = t / vecs;
-  const int i = (int)(rest % rows); rest /= rows;
-  const int c = (int)(rest % g), r = (int)((rest / g + ps.rank) % ps.world);
-  if (c >= ps.cnt[r]) return;
-  const size_t src = ((size_t)(ps.ch[r] + c) * rows + i) * vecs + v, dst = ((size_t)c * np + lo + i) * vecs + v;
-  ps.a[r][dst] = reinterpret_cast<const uint4*>(srcA)[src];
-  ps.b[r][dst] = reinterpret_cast<const uint4*>(srcB)[src];
+  const size_t total_ = (size_t)ps.world * g * rows * vecs;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
+    const int v = (int)(t % vecs); size_t rest = t / vecs;
+    const int i = (int)(rest % rows); rest /= rows;
+    const int c = (int)(rest % g), r = (int)((rest / g + ps.rank) % ps.world);
+    if (c >= ps.cnt[r]) continue;
+    const size_t src = ((size_t)(ps.ch[r] + c) * rows + i) * vecs + v, dst = ((size_t)c * np + lo + i) * vecs + v;
+    ps.a[r][dst] = reinterpret_cast<const uint4*>(srcA)[src];
+    ps.b[r][dst] = reinterpret_cast<const uint4*>(srcB)[src];
+  }
 }
 // e4m3 planes widened to bf16, 8 values a thread
 __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ out, size_t n8) {
@@ -161,13 +173,14 @@ __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ o
 // (ONE DESTINATION AT A TIME, each rank starting at its own: through a PCIe host bridge 4 ranks' writes ran at 17 GB/s
 // a GPU so, at 6 where each GPU's consecutive writes went to every owner in turn - row by row within each channel)
 __global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)pp.world * gc * pp.maxRows * vecs) return;
-  const int v = (int)(t % vecs); size_t rest = t / vecs;
-  const int il = (int)(rest % pp.maxRows); rest /= pp.maxRows;
-  const int c = (int)(rest % gc), r = (int)((rest / gc + pp.rank) % pp.world);
-  if (il >= pp.rows[r]) return;
-  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + il) * vecs + v] = prod[((size_t)c * np + pp.lo[r] + il) * vecs + v];
+  const size_t total_ = (size_t)pp.world * gc * pp.maxRows * vecs;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
+    const int v = (int)(t % vecs); size_t rest = t / vecs;
+    const int il = (int)(rest % pp.maxRows); rest /= pp.maxRows;
+    const int c = (int)(rest % gc), r = (int)((rest / gc + pp.rank) % pp.world);
+    if (il >= pp.rows[r]) continue;
+    pp.p[r][((size_t)(q0 + c) * pp.rows[r] + il) * vecs + v] = prod[((size_t)c * np + pp.lo[r] + il) * vecs + v];
+  }
 }
 
 // this rank's rows of the attention's bias (columns where swapped: the rows of z^T) written into every other rank's -
@@ -399,7 +412,9 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             int f, t; range(q, r, f, t);
             ps.a[r] = (uint4*)slotA[sl]->peer[r]; ps.b[r] = (uint4*)slotB[sl]->peer[r]; ps.ch[r] = f - k0; ps.cnt[r] = t - f;
           }
-          if (rows > 0) pushPlanesK<<<blocks((size_t)mg::WORLD * g * rows * vecsW), 256, 0, st>>>(ps, aL, bL, rows, lo, np, vecsW, g);
+          if (rows > 0) pushPlanesK<<<st != STREAM ? sideBlocks((size_t)mg::WORLD * g * rows * vecsW) : blocks((size_t)mg::WORLD * g * rows * vecsW),
+                                      256, 0, st>>>(ps, aL, bL, rows, lo, np, vecsW, g);
+          if (rows > 0) mg::sent("triangle operands", (size_t)2 * (mg::WORLD - 1) * g * rows * vecsW * 16, st != STREAM);
         };
         // OVERLAPPED (not in rounds): step q + 1's slots pushed on a side stream while step q's GEMM runs - its slots were
         // last read by step q - 1's GEMM, which every rank finished before passing step q's fence. Through a PCIe host
@@ -425,7 +440,8 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             gemmAll(gc, A, Bm, pAll[sp]);
             CK(cudaEventRecord(gemmed[sp], STREAM));
             CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
-            pushRowsK<<<blocks((size_t)mg::WORLD * gc * pPlanes.maxRows * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            pushRowsK<<<sideBlocks((size_t)mg::WORLD * gc * pPlanes.maxRows * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            mg::sent("triangle products", (size_t)(mg::WORLD - 1) * gc * pPlanes.maxRows * vecsP * 16, true);
             CK(cudaEventRecord(pushed[sp], pushS));
             used[sp] = true;
           }
@@ -525,8 +541,10 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   }
   const int XC = (int)std::clamp<size_t>((size_t)maxStored(n) * n / 262144, 1, 4), Pmax = (maxStored(n) + XC - 1) / XC;
   auto zTChunk = [&](int k, cudaStream_t st) {
-    if (rowsHere) pushTransposeChunkK<<<blocks((size_t)mg::WORLD * Pmax * rowsHere * vecs), 256, 0, st>>>(
+    if (rowsHere) pushTransposeChunkK<<<st != STREAM ? sideBlocks((size_t)mg::WORLD * Pmax * rowsHere * vecs)
+                                                     : blocks((size_t)mg::WORLD * Pmax * rowsHere * vecs), 256, 0, st>>>(
       peerSlabs(z, n), (const uint4*)from->local, n, lo, rowsHere, vecs, k, XC, Pmax, mg::RANK);
+    if (rowsHere) mg::sent("transposes", (size_t)(mg::WORLD - 1) * Pmax * rowsHere * vecs * 16, st != STREAM);
   };
   if (from) mg::fence();                          // (every rank's z written; its z^T free)
   if (from && !folded)       // (the same fences as the folded form: a rank's choice is its own)
@@ -559,6 +577,7 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   mg::fence();                                    // (every rank's own written and zeroed)
   const PeerPlanes bp = peerPlanes(biasS, nullptr, n);
   const size_t bw = (size_t)heads * std::max((size_t)bp.maxRows * (stride / 8), (size_t)n * (bp.maxRows / 8 + 2));   // (one destination's)
+  if (mg::WORLD > 1) mg::sent("attention bias", bw * (mg::WORLD - 1) * 16, false);
   if (mg::WORLD > 1) pushBiasK<<<blocks(bw * (mg::WORLD - 1)), 256, 0, STREAM>>>(bp, (const uint4*)bias, heads, n,
                                                                         stride, swap, mg::RANK);
   mg::fence();
@@ -585,8 +604,9 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
       transition<half>(pairRow((float*)z.local, (r0 - lo) * n, C), prs, C, transitionFactor, transitionPre);
       cudaEvent_t e = ev(64 + pushes++);
       CK(cudaEventRecord(e, STREAM)); CK(cudaStreamWaitEvent(pushS, e, 0));
-      pushTransposeK<<<blocks((size_t)n * rows * vecs), 256, 0, pushS>>>(back, (const uint4*)z.local + (r0 - lo) * n * vecs, n,
+      pushTransposeK<<<sideBlocks((size_t)n * rows * vecs), 256, 0, pushS>>>(back, (const uint4*)z.local + (r0 - lo) * n * vecs, n,
                                                                        (int)r0, (int)rows, vecs);
+      mg::sent("transposes", (size_t)n * rows * vecs * 16 * (mg::WORLD - 1) / mg::WORLD, true);
     }
   }
   if (folded) {
@@ -596,6 +616,7 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
     if (rowsHere) {
       transition<half>((float*)z.local, (size_t)rowsHere * n, C, transitionFactor, transitionPre);
       pushTransposeK<<<blocks((size_t)n * rowsHere * vecs), 256, 0, STREAM>>>(peerSlabs(*from, n), (const uint4*)z.local, n, lo, rowsHere, vecs);
+      mg::sent("transposes", (size_t)n * rowsHere * vecs * 16 * (mg::WORLD - 1) / mg::WORLD, false);
     }
     mg::fence();
   }
@@ -635,6 +656,7 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
   mg::fence();                                    // (every rank's own written and zeroed)
   const PeerPlanes bp = peerPlanes(biasS, nullptr, n);
   const size_t bw = (size_t)heads * std::max((size_t)bp.maxRows * (stride / 8), (size_t)n * (bp.maxRows / 8 + 2));
+  if (mg::WORLD > 1) mg::sent("attention bias", bw * (mg::WORLD - 1) * 16, false);
   if (mg::WORLD > 1) pushBiasK<<<blocks(bw * (mg::WORLD - 1)), 256, 0, STREAM>>>(bp, (const uint4*)bias, heads, n, stride, !swap,
                                                                         mg::RANK);
   const int vecs = (int)((size_t)C * elem() / 16);
@@ -648,6 +670,7 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
     mg::fence();     // (k = 0: every rank's bias pushed; then every rank done with this slot's last chunk, k - 2)
     if (rowsHere) pushTransposeChunkK<<<blocks((size_t)mg::WORLD * Pmax * rowsHere * vecs), 256, 0, STREAM>>>(
       peerSlabs(sl, n), (const uint4*)z.local, n, lo, rowsHere, vecs, k, XC, Pmax, mg::RANK, true);
+    if (rowsHere) mg::sent("transposes", (size_t)(mg::WORLD - 1) * Pmax * rowsHere * vecs * 16, false);
     mg::fence();                                  // (every rank's columns of chunk k in this rank's slot)
     const int j0 = k * P, cols = std::min(P, rowsHere - j0);
     float* sbase = baseOf(sl.local, lo + j0, n, C);  // (indexed by the global pair, z^T's rows)
@@ -663,6 +686,7 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
       transition<half>(pairRow((float*)sl.local, (size_t)c0 * n, C), prs, C, transitionFactor, transitionPre);
       pushTransposeK<<<blocks((size_t)n * rows * vecs), 256, 0, STREAM>>>(back, (const uint4*)sl.local + (size_t)c0 * n * vecs, n,
                                                                         (int)r0, (int)rows, vecs);
+      mg::sent("transposes", (size_t)n * rows * vecs * 16 * (mg::WORLD - 1) / mg::WORLD, false);
     }
   }
   mg::fence();                                    // (every rank's columns home)
@@ -779,6 +803,7 @@ inline void rowAttentionGeneric(const mg::Shared& z, const float* mask, int n, i
     if (rhi <= rlo) continue;
     for (int h = 0; h < heads; ++h) {
       const size_t plane = (size_t)h * n * stride * e;
+      mg::sent("attention bias", (size_t)(rhi - rlo) * stride * e, false);
       if (!swap) CK(cudaMemcpyAsync((char*)bias + plane + (size_t)rlo * stride * e, (const char*)biasS.peer[r] + plane +
                                     (size_t)rlo * stride * e, (size_t)(rhi - rlo) * stride * e, cudaMemcpyDefault, STREAM));
       else CK(cudaMemcpy2DAsync((char*)bias + plane + (size_t)rlo * e, (size_t)stride * e, (const char*)biasS.peer[r] + plane +

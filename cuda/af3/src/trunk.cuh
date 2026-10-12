@@ -1009,6 +1009,7 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
     const int r = (mg::RANK + k) % mg::WORLD;
     int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const int rn = sh::storedRows(n, r);
     if (!rn) continue;
+    mg::sent("msa columns", (size_t)rn * Cm * 4 * S, false);
     CK(cudaMemcpy2DAsync(t.msa + (size_t)rlo * Cm, (size_t)n * Cm * 4,
                          (const char*)mg::sharedBuffers().at("trunk.msa").peer[r] + (size_t)rlo * Cm * 4, (size_t)n * Cm * 4,
                          (size_t)rn * Cm * 4, S, cudaMemcpyDefault, STREAM));
