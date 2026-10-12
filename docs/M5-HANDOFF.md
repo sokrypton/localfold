@@ -853,3 +853,8 @@ outliers. What remains, all bandwidth or scalar work:
   lever, and a stock Chrome has none.
 - **Lost: the softmax's exponential in half on Metal's attention v3**: 1.28 -> 1.26 ms at 255 tokens and 4.53 -> 4.44
   at 1020 (2-3%), a precision change for under 1% of a trunk. Not committed.
+- **Lost: AF3's chunked pair transition emitting its norms chunk by chunk** (from 510 tokens the transition runs in row
+  chunks, so its input norm and its output's next norms fall back to passes - 483 LayerNorm dispatches a pass against
+  215 at 255). Emitted per chunk: the norms 222 -> 84 ms a profiled pass and transition2 ~333 -> 316, but the trunk's
+  wall time level (10.2 / 10.7 / 11.0 against 10.4 / 10.6 / 11.1 s, two passes at 510 tokens, alternated). Not
+  committed - the third time this session an emitted norm cost what the pass it replaced did.
