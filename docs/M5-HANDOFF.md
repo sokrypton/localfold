@@ -838,3 +838,18 @@ outliers. What remains, all bandwidth or scalar work:
   Apple: skipped there, a cold first 6MRR fold 2.8 / 2.8 / 2.7 -> 2.7 s in three rounds.
   - **For the M2:** the tile at 200 and 255 tokens (`bench-head.js --tokens=255 --tile=4` against `--tile=8`). The M2
     measured 4 ahead at 150, which is why the crossover is 200; if 8 loses there too, the crossover wants a race.
+- **Lost: AF2's 256-wide MSA norms emitted by the GEMMs before them** (the row attention's output -> the column
+  attention's norm, the column's -> the transition's, transition2 -> the outer product mean's; 32 x 256 tiles). 5CAJ
+  with 512 rows, a profiled pass: the standalone norms 233 -> 137 ms, and those GEMMs 490 -> 592 - level (3747 either
+  way). Unlike ESMFold2's gated add, these outputs are cheap K-256 / K-1024 products whose 64 x 128 tiles the 32 x 256
+  emit tile is slower than. Not committed.
+- **Level on WebGPU's diffusion**: split-K on the two output projections only (`splits: 1` with out/attn splits 2 or 4)
+  - 68 tokens 33 -> 32 ms, 255 97 -> 99.
+- **The other two families under the metal-3 prior's runtimeLoopBounds change**, cold cache, two rounds alternated
+  (bundles fetched from the registry's remotes into model-esmfold2-int5/ and model-esmc-600m-int3/): ESMFold2 5CAJ
+  first fold 15.2 / 15.2 -> 14.3 / 14.3 s, the same checksum; AF2 monomer 5CAJ 6.9 / 7.4 against 7.0 / 7.3 s,
+  level. WebGPU's ESMFold2 trunk is 3.0 s a pass of the 14 s (4 passes): 154 ms a block in f32 and 133 with f16
+  storage (bench-esmfold2-trunk.js), the WGSL f32 GEMM ceiling for a 256-wide pair - the matrix units would be the
+  lever, and a stock Chrome has none.
+- **Lost: the softmax's exponential in half on Metal's attention v3**: 1.28 -> 1.26 ms at 255 tokens and 4.53 -> 4.44
+  at 1020 (2-3%), a precision change for under 1% of a trunk. Not committed.
