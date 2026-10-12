@@ -178,20 +178,30 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
       if (extras) std::memcpy(extraWords.data(), rows.data(), rows.size());
     }
     std::vector<int> assignments(extras);
-    for (int e = 0; e < extras; ++e) {
-      const uint64_t* row = &extraWords[(size_t)e * words];
-      int best = 0, bestScore = -1;
-      for (int c = 0; c < centres; ++c) {
-        const uint64_t* centre = &centreWords[(size_t)c * words];
-        int score = 0;
-        for (int w = 0; w < words; ++w) {
-          uint64_t d = centre[w] ^ row[w];
-          uint64_t zeros = ~(((d & 0x7f7f7f7f7f7f7f7fULL) + 0x7f7f7f7f7f7f7f7fULL) | d) & 0x8080808080808080ULL;
-          score += __builtin_popcountll(zeros);
+    auto assign = [&](int e0, int e1) {
+      for (int e = e0; e < e1; ++e) {
+        const uint64_t* row = &extraWords[(size_t)e * words];
+        int best = 0, bestScore = -1;
+        for (int c = 0; c < centres; ++c) {
+          const uint64_t* centre = &centreWords[(size_t)c * words];
+          int score = 0;
+          for (int w = 0; w < words; ++w) {
+            uint64_t d = centre[w] ^ row[w];
+            uint64_t zeros = ~(((d & 0x7f7f7f7f7f7f7f7fULL) + 0x7f7f7f7f7f7f7f7fULL) | d) & 0x8080808080808080ULL;
+            score += __builtin_popcountll(zeros);
+          }
+          if (score > bestScore) { bestScore = score; best = c; }
         }
-        if (score > bestScore) { bestScore = score; best = c; }
+        assignments[e] = best;
       }
-      assignments[e] = best;
+    };
+    // (each row's centre its own: the rows split over this pass's share of the cores - 5,120 extra rows against 508
+    // centres was most of a pass's 0.55 s at 394 residues, the passes four threads on a 30-core box)
+    {
+      const int parts = std::max(1, std::min(extras / 256, (int)std::thread::hardware_concurrency() / (int)plans.size()));
+      std::vector<std::thread> ts;
+      for (int q = 0; q < parts; ++q) ts.emplace_back(assign, (int)((long long)extras * q / parts), (int)((long long)extras * (q + 1) / parts));
+      for (auto& t : ts) t.join();
     }
     std::vector<float> profile((size_t)centres * length * 23, 0.0f), deletionSums((size_t)centres * length, 0.0f);
     std::vector<float> counts((size_t)centres * length, (float)(1 + 1e-6));
@@ -338,16 +348,15 @@ inline Af2Export exportAf2(const Args& args) {
   E.i("asym_id", F.chainAware ? F.asymId : std::vector<int>(L, 0));
   E.i("entity_id", F.chainAware ? F.entityId : std::vector<int>(L, 0));
   E.i("sym_id", F.chainAware ? F.symId : std::vector<int>(L, 0));
-  for (size_t k = 0; k < F.passes.size(); ++k) {
-    const Af2Pass& p = F.passes[k];
+  for (size_t k = 0; k < F.passes.size(); ++k) {          // (each pass's arrays moved in: F is not read after)
+    Af2Pass& p = F.passes[k];
     std::string f = "f" + std::to_string(k) + "/";
-    E.t(f + "msa_feat", p.msaFeat);
-    E.t(f + "msa_mask", p.msaMask);
-    std::vector<int> extra(p.extraMsa.begin(), p.extraMsa.end());
-    E.i(f + "extra_msa", extra);
-    E.t(f + "extra_has_deletion", p.extraHasDeletion);
-    E.t(f + "extra_deletion_value", p.extraDeletionValue);
-    E.t(f + "extra_msa_mask", p.extraMsaMask);
+    E.t(f + "msa_feat", std::move(p.msaFeat));
+    E.t(f + "msa_mask", std::move(p.msaMask));
+    E.i(f + "extra_msa", std::vector<int>(p.extraMsa.begin(), p.extraMsa.end()));
+    E.t(f + "extra_has_deletion", std::move(p.extraHasDeletion));
+    E.t(f + "extra_deletion_value", std::move(p.extraDeletionValue));
+    E.t(f + "extra_msa_mask", std::move(p.extraMsaMask));
   }
   // --template: one slot, its parts aligned to their chains in the atom37 layout; --template-search-chains: the search's
   // best hit for each listed chain, in the same slot
