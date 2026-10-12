@@ -7,6 +7,7 @@
 //                 [--a3m=<one or one a chain> [--paired-a3m=...] | --search] [--recycles=3] [--max-msa=512]
 //                 [--max-extra=1024] [--seed=0] [--template=<file>:<chain>[@<chain>][+...]] [--template-search-chains=]
 #pragma once
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -71,14 +72,16 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
   static const std::string RESTYPES = "ARNDCQEGHILKMFPSTWYV";
   std::vector<uint8_t> encoded((size_t)depth * length);
   std::vector<float> deletions((size_t)depth * length);
+  static const std::array<uint8_t, 256> CODE = [] {     // (a residue's code: '-' 21, the twenty theirs, anything else 20)
+    std::array<uint8_t, 256> t; t.fill(20);
+    for (size_t i = 0; i < RESTYPES.size(); ++i) t[(unsigned char)RESTYPES[i]] = (uint8_t)i;
+    t['-'] = 21; return t;
+  }();
   for (int row = 0; row < depth; ++row) {
     const std::string& seq = parsed.sequences[keep[row]];
-    for (int r = 0; r < length; ++r) {
-      char c = seq[r];
-      size_t at = RESTYPES.find(c);
-      encoded[(size_t)row * length + r] = c == '-' ? 21 : (at != std::string::npos && c != 0 ? (uint8_t)at : 20);
-      deletions[(size_t)row * length + r] = (float)parsed.deletions[keep[row]][r];
-    }
+    const std::vector<int>& del = parsed.deletions[keep[row]];
+    uint8_t* e = &encoded[(size_t)row * length]; float* d = &deletions[(size_t)row * length];
+    for (int r = 0; r < length; ++r) { e[r] = CODE[(unsigned char)seq[r]]; d[r] = (float)del[r]; }
   }
   Af2Features F;
   F.length = length;
