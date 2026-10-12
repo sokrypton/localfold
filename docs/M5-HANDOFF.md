@@ -974,3 +974,29 @@ ran at 3.0.
     A100's except ESMFold2, as before); test:ligand af3 0.061, boltz2 0.052, protenix2 0.043, intellifold2 0.054-0.055,
     rosettafold3 0.069 A; test:template every model with its template at 0.136-0.839 A (AF2 monomer 2.49, its own
     bar) against 16.7-22.2 without. openbind0's arms want `model-openbind0-f32`, which is not published.
+- **Smaller AF3 bundles, priced (not built for shipping).** Bytes are a first visit's cost (CLAUDE.md: 39 s at 8 MB/s,
+  2 s of it the fold), and the packed codes do not compress (gzip / zstd: 94% of a shard). With no float32 source on
+  this machine, the shipped int5 was decoded to float32 and re-quantized with tools/quantize_af3.py - rounding twice,
+  so these are upper bounds on the harm (an int5 g32 re-quantization reproduced the shipped folds exactly). AF3,
+  fold-opendde.js, 3 recycles, 50 steps, one seed: 6MRR pLDDT / crystal RMSD and 5CAJ self-templated crystal RMSD:
+  | bundle | MiB | 6MRR | 5CAJ templated |
+  |---|---|---|---|
+  | int5 g32 (shipped) | 265 | 86.59 / 0.672 | 0.249 |
+  | int4 g32 | 221 | 77.95 / 1.257 | 2.508 |
+  | int4 g64 | 199 | 79.37 / 1.198 | 0.503 |
+  | int5 g64, diffusion head int4 | 218 | 81.46 / 1.215 | 0.525 |
+  | int5 g32, diffusion head int4 | 240 | 79.70 / 1.622 | 2.395 |
+  | int4 g64, diffusion head int5 | 223 | 86.21 / 1.506 | 0.345 |
+  | int5 g64 | 243 | 86.99 / 1.517 | 0.379 |
+  The diffusion head (55% of the parameters) is what four bits cannot take; the pairformer (40%) can at g64. The most
+  a bundle saves at a plausible cost is 8-16% (20-40 MiB, a few seconds of a first visit). A shippable version wants
+  the float32 export (the A100 box), several seeds, test:ligand's bonds, and a re-publish.
+- **The AF3-lineage denoiser stages its token tiles in f16** where the device has it (`stage16`,
+  webgpu/af3/diffusion/diffusion-transformer.js; `diffusionStagePrecision=f32` the control): every workgroup array a
+  kernel stages activations into holds halves, read back into f32 before the arithmetic. Bigger tiles were the idea -
+  `fits` capped 768 channels at 8 tokens in 32 KiB, which is why tile 16 measured identical to 8 (it never ran) - but
+  16 is slower (96.6 against 86.8 ms a 255-token call); the win is at the same tile. fold.js, AF3 int5, 5CAJ at 20
+  steps, alternated: the sampler 4615 / 4767 -> 4066 / 4157 ms, the fold 5.7 / 5.9 -> 5.3 / 5.5 s. fold-opendde.js
+  (3 recycles, 50 steps): CA RMSD between arms 0.006 A on 6MRR (seed change 0.476), 0.002 A templated (0.151).
+  test:ligand stock: af3 0.061, boltz2 0.049, protenix2 0.043, intellifold2 0.053, rosettafold3 0.069 A; test:stock all
+  eight models fold.

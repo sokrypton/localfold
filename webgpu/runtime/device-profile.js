@@ -446,6 +446,9 @@ export const DEFAULT_TUNING = Object.freeze({
   opmVectorArithmetic: null,
   // ...and AF3's vector grid projection: null is f16 where the pair track stages in f16, "f32" the control.
   gridProjectArithmetic: null,
+  // ...and the AF3 denoiser's staged token tiles: null is f16 where the device has it, "f32" the control. See
+  // `stage16` in webgpu/af3/diffusion/diffusion-transformer.js.
+  diffusionStagePrecision: null,
   // 🔴 AND THE TRIANGLE PROJECTION ON THE SAME UNITS, which with the transition
   // split is the LARGEST kernel left in an ESMFold2 trunk - 130.6 ms of 494.
   // Unlike the transition it needs no new memory: its source and both its
