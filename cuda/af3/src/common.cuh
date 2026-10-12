@@ -893,7 +893,7 @@ struct Model {
     Segment& s = segs[seg];
     if (s.device || pending.count(seg)) return;
     if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
-      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
     }
     // ...and its resident codes HERE, on this thread, not in the upload's: a warm-up running meanwhile must neither see
     // them as parked (it would unpark them - a second allocation racing the upload's) nor measure free memory without
@@ -901,8 +901,13 @@ struct Model {
     if (s.residentBytes && !s.resident && devMalloc(&s.resident, s.residentBytes) != cudaSuccess) {
       fprintf(stderr, "cannot put a model.bin's resident weights (%zu bytes) on the device\n", s.residentBytes); exit(1);
     }
-    pending[seg] = std::thread([&s] {
-      if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1); }
+    // (on this thread's device: a new thread's current device is device 0, so on a rank of several GPUs the decode
+    // kernels ran on GPU 0 against another GPU's buffers - an illegal access on 4 and 8 real A100s, hidden on 2, where
+    // the IPC mapping had enabled peer access between 0 and 1)
+    int device = 0; CK(cudaGetDevice(&device));
+    pending[seg] = std::thread([&s, device] {
+      CK(cudaSetDevice(device));
+      if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1); }
     });
   }
   void waitUploads() { for (auto& [seg, th] : pending) th.join(); pending.clear(); }
@@ -999,7 +1004,7 @@ struct Model {
     Segment& s = segs[e.seg];
     if (!s.device) {
       if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
-        fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+        fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
       }
     }
     if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
@@ -1048,7 +1053,7 @@ struct Model {
     { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
     if (!s.device && (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
-      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
     }
     const auto& r = s.residentRecs[e.rec];
     if (r.b.kind == 6)
