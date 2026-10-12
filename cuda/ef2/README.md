@@ -525,8 +525,8 @@ the 256-channel bf16 pair (its rows of z, and the triangle's product), so everyt
 `token_bonds` stays on the host (`Model::hostOnly`; the kernels read each row's bonded columns, `Bonds` - its dense
 [T, T] was 1.1 GB a GPU, and a fold reading it so is byte-identical), the triangle's mask of ones is never made
 (1.1 GB), the ESM-C tower's matrices leave the device once the language model has run (1.15 GB), the sharded
-triangle's windows and gate chunks go to C / 32 where every rank is short at C / 16 (`LOCALFOLD_MG_TRI_NARROW=1`
-forces it; the 1TIM dimer on 2 ranks 0.000 A either way), and the sampler's gathered attention rows are given back
+triangle's windows and gate chunks go to C / 32 where every rank is short at C / 16 (the 1TIM dimer on 2 ranks
+0.000 A either way), and the sampler's gathered attention rows are given back
 before the head (alone, they held a 1 GB shared segment). It was 14,820 before. Splitting the product share by rows
 does not work: a pass's output updates its rows of z, and every later pass's operands are read from all of z. The
 triangle's rounds (its operands a window of channels at a time, the input pass repeated each window) are taken only

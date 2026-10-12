@@ -279,8 +279,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     if (it == narrowOf.end()) {
       const size_t k16 = C / 16, wins = 2 * (size_t)std::max(rows, 1) * np * k16 * sizeof(TQ) + 3 * ((k16 + mg::WORLD - 1) / mg::WORLD) * plane * 2
                        + (size_t)((rows + 15) / 16) * np * C * 2 + ((size_t)1 << 30);
-      static const bool forced = getenv("LOCALFOLD_MG_TRI_NARROW") && atoi(getenv("LOCALFOLD_MG_TRI_NARROW"));   // (=1: always)
-      it = narrowOf.emplace(std::make_pair(n, C), !forced && mg::everyRankHas(wins) ? 16 : 32).first;
+      it = narrowOf.emplace(std::make_pair(n, C), mg::everyRankHas(wins) ? 16 : 32).first;
       if (it->second == 32 && mg::RANK == 0 && getenv("LOCALFOLD_MEM")) fprintf(stderr, "  sharded triangle at %d tokens: windows of C / 32\n", n);
     }
     div = it->second;

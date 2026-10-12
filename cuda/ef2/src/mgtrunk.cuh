@@ -99,14 +99,11 @@ inline void pairOntoRank0HostEf2(int T, int C) {
 // residual (a share's size) and the sharded triangle's whole form (its own estimate) past an eighth of the card. Parking was
 // pinning alone: 1.1 s for a 1.58 GB share at 4,940 tokens on 8, where a rank holds under 7 GB
 inline B16Host EF2_SHARE_HOST{};
-inline bool EF2_SHARE_KEPT = false;
-inline void parkShareEf2(int T, int C) {
+// (returns whether it was kept: unparkShareEf2 and confidenceHeadSharded take it)
+inline bool parkShareEf2(int T, int C) {
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
   size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
-  EF2_SHARE_KEPT = !BIG_FORCED && mg::everyRankHas(bytes + sh::wholeFormBytes(T, C, 2) + t / 8);
-  if (mg::RANK == 0 && getenv("LOCALFOLD_MEM"))
-    fprintf(stderr, "  the trunk's share (%.2f GB a rank) %s through the sampler\n", bytes / 1e9, EF2_SHARE_KEPT ? "kept on the device" : "parked in host memory");
-  if (EF2_SHARE_KEPT) return;
+  if (!BIG_FORCED && mg::everyRankHas(bytes + sh::wholeFormBytes(T, C, 2) + t / 8)) return true;
   if (EF2_SHARE_HOST.have < bytes) {
     if (EF2_SHARE_HOST.p) CK(cudaFreeHost(EF2_SHARE_HOST.p));
     if (cudaMallocHost(&EF2_SHARE_HOST.p, std::max<size_t>(bytes, 1)) != cudaSuccess) {
@@ -118,10 +115,11 @@ inline void parkShareEf2(int T, int C) {
   if (bytes) CK(cudaMemcpyAsync(EF2_SHARE_HOST.p, EF2_ZS->local, bytes, cudaMemcpyDeviceToHost, STREAM));
   mg::release({ "sh.z" }, mg::FREE);
   EF2_ZS = nullptr;
+  return false;
 }
-inline void unparkShareEf2(int T, int C) {
+inline void unparkShareEf2(int T, int C, bool kept) {
   releaseScratch(); trimPool();
-  if (EF2_SHARE_KEPT) return;
+  if (kept) return;
   EF2_ZS = &mg::shared("sh.z", EF2_SHARE_HOST.bytes);
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
   if (bytes) CK(cudaMemcpyAsync(EF2_ZS->local, EF2_SHARE_HOST.p, bytes, cudaMemcpyHostToDevice, STREAM));
@@ -194,7 +192,8 @@ __global__ void tmRowsAtK(const float* tm, const int* asym, double* rows, int T,
 // trunk's share waited through the sampler) - the head's blocks run as the trunk's do (the sharded triangle, the transition on own rows), and the
 // pooling, the PAE and the pTM rows come off each rank's rows and are all-gathered. Every rank returns the same
 // Confidence; rank 0's is written.
-inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int Si, const float* xDevice) {
+// shareKept: the trunk's share stayed on the device through the sampler (parkShareEf2's answer)
+inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int Si, const float* xDevice, bool shareKept) {
   using B16 = __nv_bfloat16;
   const int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
   const size_t P = (size_t)T * T;
@@ -215,7 +214,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   // the residual: the head's pair rows as its blocks take them (bf16) - on the device where the trunk's share stayed
   // through the sampler, else in the share's pinned host buffer, free again once the share is back (an f32 copy pinned
   // of its own was 2.1 s of a 3.3 s head at 4,940 tokens on 8, and 35 GB of host memory a rank at 16,549)
-  B16* resid = EF2_SHARE_KEPT ? dallocT<B16>(std::max<size_t>(held * C, 1)) : (B16*)EF2_SHARE_HOST.p;
+  B16* resid = shareKept ? dallocT<B16>(std::max<size_t>(held * C, 1)) : (B16*)EF2_SHARE_HOST.p;
   {
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* prodc = scratch<float>("cf.prodc", per * C);
@@ -255,7 +254,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* score = scratch<float>("cf.scoreRows", per); float* paeL = scratch<float>("cf.paeRows", per * pb);
     float* paeD = scratch<float>("cf.paeOutRows", per); float* tmD = scratch<float>("cf.tmRows1", per);
-    B16* rh = EF2_SHARE_KEPT ? nullptr : scratch<B16>("cf.residRows", per * C);
+    B16* rh = shareKept ? nullptr : scratch<B16>("cf.residRows", per * C);
     for (int i0 = lo; i0 < lo + rows; i0 += rb) {
       const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, ql = (size_t)(i0 - lo) * T;
       const B16* rs = resid + ql * C;
@@ -274,7 +273,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       CK(cudaMemcpy2DAsync(paeAll + (size_t)i0 * Tp, (size_t)Tp * 4, paeD, (size_t)T * 4, (size_t)T * 4, b, cudaMemcpyDeviceToDevice, STREAM));
     }
     releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1", "cf.residRows" });
-    if (EF2_SHARE_KEPT) CK(cudaFree(resid));
+    if (shareKept) CK(cudaFree(resid));
   }
   mg::allGather(pooledS, (size_t)lo * C * 4, (size_t)rows * C * 4);
   mg::allGather(tmS, (size_t)lo * 16, (size_t)rows * 16);

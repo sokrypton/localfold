@@ -139,7 +139,9 @@ struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, i
 
 // consume: the trunk's z is read by nothing after this call - on a card short of room the head then works in it
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
-                                 bool check, bool consume = false) {
+                                 bool check, bool consume = false, __nv_bfloat16* z16Kept = nullptr) {
+  // z16Kept: EF2_Z16's trunk pair, kept on the device through the sampler (ef2.cu, where there was the room) - the
+  // head builds its own pair over it in place; null where it is parked in PARK_HOST
   int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
   size_t P = (size_t)T * T;
   float* s = scratch<float>("cf.s", (size_t)T * Si);
@@ -168,12 +170,12 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     using B16 = __nv_bfloat16;
     const int rb = (int)std::max<size_t>(1, ((size_t)64 << 20) / ((size_t)T * C * 4));   // token rows a chunk
     const size_t per = (size_t)rb * T;
-    // the trunk's pair on the device (EF2_Z16_DEV) - the stack built over it in place, a chunk read before it is
+    // the trunk's pair on the device (z16Kept) - the stack built over it in place, a chunk read before it is
     // written - or parked; the residual is the stack as its blocks take it (bf16), kept on the device beside a kept
     // pair, else in the parked pair's own pinned buffer once read (an f32 residual pinned of its own was 6.3 s of a
     // 2,964-token fold on 40 GB, 9 GB of pinning)
-    const bool kept = EF2_Z16_DEV != nullptr;
-    B16* stack = kept ? EF2_Z16_DEV : dallocT<B16>(P * C);
+    const bool kept = z16Kept != nullptr;
+    B16* stack = kept ? z16Kept : dallocT<B16>(P * C);
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* prodc = scratch<float>("cf.prodc", per * C); B16* stage = scratch<B16>("cf.z16", per * C);
     for (size_t p0 = 0; p0 < P; p0 += per) {

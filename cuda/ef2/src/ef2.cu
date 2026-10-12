@@ -344,12 +344,12 @@ static int foldInput(const Opts& o, bool warm) {
   Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
   // (a bf16 trunk pair waits in host memory through the sampler, which never reads it: the confidence head takes it
   // back, widened)
-  if (EF2_ZS) { parkShareEf2(T, C); z = nullptr; }      // (each rank its share, in its own host memory)
+  bool shareKept = false; __nv_bfloat16* z16Kept = nullptr;
+  if (EF2_ZS) { shareKept = parkShareEf2(T, C); z = nullptr; }      // (each rank its share, in its own host memory, or kept)
   else if (EF2_Z16) {
     // (kept on the device where there is the room for it and five pairs more beside it - the head's residual and its
     // triangle's operands, gate and product - else parked: pinning 4.5 GB was 3.1 s of a 2,964-token fold on 40 GB)
-    EF2_Z16_DEV = nullptr;
-    if (!BIG_FORCED && roomFor(5 * (size_t)T * T * C * 2)) EF2_Z16_DEV = reinterpret_cast<__nv_bfloat16*>(z);
+    if (!BIG_FORCED && roomFor(5 * (size_t)T * T * C * 2)) z16Kept = reinterpret_cast<__nv_bfloat16*>(z);
     else parkToHost(z, (size_t)T * T * C * 2);
   }
   mem("denoiser built");
@@ -421,16 +421,15 @@ static int foldInput(const Opts& o, bool warm) {
   if (profConf) { prof::init(); prof::start(); }
   Confidence conf;
   if (mg::WORLD > 1) {                          // (several GPUs: the head sharded as the trunk is - mgtrunk.cuh - then the others leave)
-    unparkShareEf2(T, C);
-    conf = confidenceHeadSharded(T, A, sInputs, Si, xd);
+    unparkShareEf2(T, C, shareKept);
+    conf = confidenceHeadSharded(T, A, sInputs, Si, xd, shareKept);
     mg::release({ "" }, mg::FINAL);
     if (mg::RANK != 0) mg::leave();
     mg::finish();
     mg::WORLD = 1; SHORT_PAIR_SHARE = 1; EF2_QLO = EF2_QROWS = 0; EF2_ZS = nullptr;
   } else {
     if (EF2_Z16) releaseScratch();              // (the head reads the parked bf16 pair itself: zTrunk null)
-    conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
-    EF2_Z16_DEV = nullptr;
+    conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true, z16Kept);   // (z is read by nothing after)
   }
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
