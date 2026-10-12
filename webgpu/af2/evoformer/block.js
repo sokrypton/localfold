@@ -1,3 +1,4 @@
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
 import {
   ATTENTION_NORMALIZE_SHADER,
   createAttentionNormalizeShader,
@@ -906,9 +907,13 @@ async function encodeOuterProductMean(
   // createOuterProductMeanVectorContractShader.
   const vectorContract = matrixContract === null && outerFirst
     && deviceTuning(execution.device).opmVectorContract !== false;
+  // ...on the device's vector GEMM block where it names one (webgpu/kernels/vector-gemm-block.js): f32, the same sums
+  // in the same order. The output tiles C_Z by its columns and c_outer^2 by its depth, with no tail.
+  const opmBlock = vectorGemmBlock(execution.device, "f32",
+    ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
   const vectorOutput = matrixOutput === null && outerFirst
     && deviceTuning(execution.device).opmVectorOutput !== false
-    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
+    && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     scalePipeline, contractPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -921,8 +926,8 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER),
     vectorContract
-      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}`,
-        () => createOuterProductMeanVectorContractShader(input.cOuter))
+      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}`,
+        () => createOuterProductMeanVectorContractShader(input.cOuter, opmBlock))
       : matrixContract === null
       ? execution.shaderPipeline(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         () => createOuterProductMeanContractShader(input.cOuter, contractPrecision))
@@ -932,8 +937,8 @@ async function encodeOuterProductMean(
         () => createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
     vectorOutput
       ? execution.shaderPipeline(
-        `block:opm:project-output-vector:${residualTarget !== undefined}`,
-        () => createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}`,
+        () => createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock))
       : matrixOutput === null
       ? execution.shaderPipeline(
         outerFirst && residualTarget !== undefined
@@ -1030,7 +1035,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
       } else if (matrixContract === null) {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -1059,8 +1064,8 @@ async function encodeOuterProductMean(
             packedOffsets[6], packedOffsets[7], 0, offset, 0]));
         execution.dispatch(encoder, projectOutputPipeline,
           [intermediate, weights, vectorOutputParams, output, scale],
-          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
-          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+          input.cZ / opmBlock.columns,
+          Math.ceil(count / opmBlock.rows), 1, "opm.project-output");
       } else if (matrixOutput === null) {
         // ...its OWN grid, because it carries several pairs a workgroup where
         // the contraction carries one; they shared `pairGrid` when both were one.

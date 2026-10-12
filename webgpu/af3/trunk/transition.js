@@ -32,6 +32,7 @@ import {
   createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
 } from "../../kernels/matrix-linear.js";
 import { deviceMatrixConfig, deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
+import { vectorGemmBlock } from "../../kernels/vector-gemm-block.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 
@@ -671,29 +672,11 @@ export class Af3TransitionGpu {
  */
 export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 16 });
 /**
- * 🔴 THE A100'S BLOCK IS NOT AN APPLE PART'S, AND f16 ARITHMETIC IS WORTH 1.66x THERE. Measured on an M5 under stock
- * flags (bench-transition.js, ESMFold2's 256 channels at 255 tokens, the whole split, arms interleaved): the shipped
- * 64 x 64 x 16 is 69.5-70.9 ms; in f32, 128 x 128 x 16 59.96, 128 x 128 x 8 60.56, 64 x 128 x 16 64.3, 128 x 64 x 16
- * 69.1 - a lane's 8 x 8 tile issues two workgroup reads a multiply-add where 4 x 4 issued five. In f16 (VECTOR_GEMM_F16
- * below) 64 x 128 x 32 42.66, 128 x 128 x 32 43.8, 64 x 128 x 16 44.4-45.5, 64 x 256 x 16 45.2. A device names its
- * block per arithmetic in `vectorGemmBlock`; one whose workgroup storage cannot hold it keeps the default.
- *
  * VECTOR_GEMM_F16: the panels staged in f16 and each k step's BK products summed in f16 (`fma` on vec4<f16>), the
  * step's sums then added into f32 accumulators - so no f16 partial sum runs past BK products. check-transition-split.js
- * `--vector=1 --arithmetic=f16`: relRMS 1.22e-3 against 4.38e-4 for the f32 arithmetic over the same f16 scratch.
+ * `--vector=1 --arithmetic=f16`: relRMS 1.22e-3 against 4.38e-4 for the f32 arithmetic over the same f16 scratch. The
+ * block, per arithmetic, is the device's: see webgpu/kernels/vector-gemm-block.js.
  */
-export function vectorGemmBlockStorage({ rows, columns, inner }, arithmetic = "f32") {
-  return ((rows + 4) * inner + inner * columns) * (arithmetic === "f16" ? 2 : 4);
-}
-function vectorGemmBlockFor(device, spec, arithmetic) {
-  if (!spec) return undefined;
-  const [rows, columns, inner] = String(spec).split("x").map(Number);
-  const block = { rows, columns, inner };
-  if (![rows, columns, inner].every((v) => Number.isInteger(v) && v > 0) || rows % 16 || columns % 64 || inner % 4) {
-    throw new RangeError(`vectorGemmBlock: no block ${spec}`);
-  }
-  return vectorGemmBlockStorage(block, arithmetic) <= device.limits.maxComputeWorkgroupStorageSize ? block : undefined;
-}
 /**
  * Where the VECTOR split starts to pay, which is not where the matrix one does.
  * Measured on an A100 under stock flags, pair-transition GPU ms per trunk pass,
@@ -1222,9 +1205,9 @@ export function splitTransitionConfig(device, channels, { f32Only = false, arith
     // `vectorTransitionArithmetic` overrides it - the control arm.
     const asked = tuning.vectorTransitionArithmetic ?? arithmetic;
     const math = asked === "f16" && storage === "f16" ? "f16" : "f32";
-    const named = vectorGemmBlockFor(device, tuning.vectorGemmBlock?.[math], math);
     // (the two extents it contracts and produces are `channels` and four times it)
-    const block = named && channels % named.columns === 0 && channels % named.inner === 0 ? named : undefined;
+    const block = vectorGemmBlock(device, math,
+      ({ columns, inner }) => channels % columns === 0 && channels % inner === 0);
     return { vector: true, storage, ...rows,
              ...(math === "f16" ? { arithmetic: "f16" } : {}), ...(block ? { block } : {}) };
   }

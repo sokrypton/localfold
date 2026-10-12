@@ -13,7 +13,8 @@
  * with its switch off. Then these files replace webgpu/af2/evoformer/, and this notice
  * goes with them.
  *
- * Everything not listed below is imported from webgpu/af2/evoformer/ unchanged - the
+ * Everything not listed below is import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
+imported from webgpu/af2/evoformer/ unchanged - the
  * two graphs genuinely share their attention, triangle, transition and
  * outer-product-mean kernels.
  *
@@ -536,8 +537,12 @@ async function encodeOuterProductMean(
   // ...the output projection as a vector GEMM where the device asks for one;
   // see the same choice in webgpu/af2/evoformer/block.js.
   const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract !== false;
+  // ...on the device's vector GEMM block where it names one (webgpu/kernels/vector-gemm-block.js): f32, the same sums
+  // in the same order. The output tiles C_Z by its columns and c_outer^2 by its depth, with no tail.
+  const opmBlock = vectorGemmBlock(execution.device, "f32",
+    ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
   const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput !== false
-    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
+    && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     contractPipeline, projectOutputPipeline, scalePipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -546,14 +551,14 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     vectorContract
-      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}`,
-        createOuterProductMeanVectorContractShader(input.cOuter))
+      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}`,
+        createOuterProductMeanVectorContractShader(input.cOuter, opmBlock))
       : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
     vectorOutput
       ? execution.pipelines.get(
-        `block:opm:project-output-vector:${residualTarget !== undefined}`,
-        createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}`,
+        createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock))
       : execution.pipelines.get(
         outerFirst && residualTarget !== undefined
           ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
@@ -623,7 +628,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
       } else {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -636,8 +641,8 @@ async function encodeOuterProductMean(
             packedOffsets[6], packedOffsets[7], 0, offset, 0]));
         execution.dispatch(encoder, projectOutputPipeline,
           [intermediate, weights, vectorOutputParams, output, scale],
-          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
-          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+          input.cZ / opmBlock.columns,
+          Math.ceil(count / opmBlock.rows), 1, "opm.project-output");
         continue;
       }
       // ...its OWN grid, because it carries several pairs a workgroup where the

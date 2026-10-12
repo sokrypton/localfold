@@ -911,3 +911,10 @@ ran at 3.0.
   tiles are all slower.
 - **Int8-resident diffusion weights**: still not worth building; the 68-token step's skinny GEMMs are short of
   threadgroups, not bandwidth (768 x 80 x 1536 at 19 GB/s with its weights cache-hot).
+- **AF2's outer product mean on the same block** (its two vector GEMMs are the transition's layout): the block now
+  comes from `webgpu/kernels/vector-gemm-block.js` for both. f32 and the same sums in order - fold-af2.js -1303709 /
+  62.915 either way. profile-af2-block.js at 255 residues, two rounds alternated: the main block (128 rows) 116.9 /
+  116.8 -> 115.2 / 115.1 ms (opm.contract 10.3 -> 9.6, opm.project-output 10.2 -> 9.7), the extra block (256 rows)
+  100.4 / 99.4 -> 97.3 / 98.3. Of the blocks swept for it, 128 x 128 x 8 and x16 are level, 64 x 128 and 128 x 64
+  worse. The page's AF2 at 255 residues is ~6 s a recycle in the browser; the rest of a block is attention and
+  projections at 1.4-1.8 TFLOP/s (f32 by AF2's policy).
