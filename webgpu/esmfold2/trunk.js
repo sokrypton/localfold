@@ -46,7 +46,7 @@ import {
   TRANSITION_SPLIT_MIN_CHANNELS,
   TRANSITION_ORDER,
 } from "../af3/trunk/transition.js";
-import {
+import { matrixContractionOverflows,
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
 } from "../kernels/triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../kernels/triangle/weights.js";
@@ -224,6 +224,7 @@ export class Esmfold2TrunkGpu {
       && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes);
     const triangleProjectMatrix = !leanPair
       && tuning.triangleProjectMatrix === true && splitConfig !== null
+      && !matrixContractionOverflows(this.device)
       && channels >= (tuning.triangleProjectMatrixMinChannels
         ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)
       ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,

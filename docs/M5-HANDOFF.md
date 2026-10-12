@@ -959,3 +959,18 @@ ran at 3.0.
   pairformer wall 2024 / 2119 -> 1928 / 1989. Fold level (fold-opendde.js, AF3 int5, 3 recycles, 50 steps): 0.002 A
   between arms on 6MRR (seed 0.463), 0.001 A on 5CAJ templated (seed 0.151), crystal 0.250 / 0.251. test:ligand bond
   rms 0.061; test:stock AF3 85.8982 -> 85.8936.
+- **The other models' bundles, fetched (2026-10-12, the user's go-ahead; registry-pinned commits into the registry's
+  directories, `model/` a link to `model-af2-monomer-int5/`).** With them every gate runs here, and two things turned
+  up:
+  - **ceb1f017**: 605d7528 had put the AF2 multimer's new import inside a comment; the multimer threw
+    `vectorGemmBlock is not defined`. Fixed; test:template's multimer arm 0.782 A / 16.733 A, as recorded.
+  - **The triangle off f16-only matrix units.** Under `--enable-unsafe-webgpu` (the gates' default flags) Apple's units
+    offer f16 x f16 -> f16 only, and the triangle's matrix path carries its contraction, K the protein's length:
+    protenix2, OpenDDE and IntelliFold-2 folded NaN at 5CAJ single sequence, on e0d67b7a too (pre-existing; a stock
+    visitor never reaches it). `matrixContractionOverflows` (webgpu/kernels/triangle/project-matrix.js) refuses the
+    path in AF3's pairformer, AF2 and ESMFold2 wherever the f16 config accumulates only in f16; a device with an f32
+    result (the A100) is unchanged, deviceMatrixConfig preferring it.
+  - Gates on the M5, developer flags and stock alike: test:stock all eight models fold (pLDDT within 0.06 of the
+    A100's except ESMFold2, as before); test:ligand af3 0.061, boltz2 0.052, protenix2 0.043, intellifold2 0.054-0.055,
+    rosettafold3 0.069 A; test:template every model with its template at 0.136-0.839 A (AF2 monomer 2.49, its own
+    bar) against 16.7-22.2 without. openbind0's arms want `model-openbind0-f32`, which is not published.

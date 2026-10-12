@@ -349,9 +349,22 @@ export function triangleContractMatrixDispatch(shape, matrix = {}) {
  * TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS. `triangleProjectMatrixMinChannels` is
  * what a device that has re-measured it says instead.
  */
+/**
+ * 🔴 WHETHER THIS DEVICE'S f16 MATRIX UNITS CAN ONLY ACCUMULATE IN f16, which rules the triangle off them: the matrix
+ * path carries its CONTRACTION too, whose K is the protein's length, and an f16 accumulator over that overflows - the
+ * same NaN esmfold2/trunk.js records for `stagedMatrixResult: "f16"` on the contraction. Apple's units under
+ * `--enable-unsafe-webgpu` offer f16 x f16 -> f16 and nothing wider: protenix2, OpenDDE and IntelliFold-2 folded NaN
+ * there (5CAJ, single sequence; finite with `triangleProjectMatrix=false`, 18.976 A), on every commit since the path
+ * existed. AF3 escaped only because 128 channels is under the width rule.
+ */
+export function matrixContractionOverflows(device) {
+  return deviceMatrixConfig(device, { element: "f16" })?.resultComponentType === "f16";
+}
+
 export function triangleProjectMatrixConfig(device, channels) {
   const tuning = deviceTuning(device);
   if (tuning.triangleProjectMatrix !== true) return false;
+  if (matrixContractionOverflows(device)) return false;
   if (channels < (tuning.triangleProjectMatrixMinChannels
     ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   const config = deviceMatrixConfig(device, { element: "f16" });

@@ -34,7 +34,7 @@ import {
 } from "../../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { settleGridAttendTiling } from "./grid-attend-race.js";
-import {
+import { matrixContractionOverflows,
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
   TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS, triangleProjectMatrixFits,
 } from "../../kernels/triangle/project-matrix.js";
@@ -83,6 +83,7 @@ function projectMatrixConfig(device, channels) {
   // A prior decides; with none, the width rule below does (see
   // gridProjectMatrixConfig).
   if (deviceTuning(device).triangleProjectMatrix === false) return false;
+  if (matrixContractionOverflows(device)) return false;   // (see project-matrix.js)
   if (channels < (deviceTuning(device).triangleProjectMatrixMinChannels
     ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   const tile = matrixTile(device) ?? false;
