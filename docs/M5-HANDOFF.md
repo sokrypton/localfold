@@ -828,3 +828,13 @@ outliers. What remains, all bandwidth or scalar work:
     but any benchmark that submits one dispatch at a time measures the slow clock (the race uses one submit for this).
   - **For the M2:** the same cold-cache pair (`--tune=runtimeLoopBounds=false` against the default, `--folds=2`). The
     M2's CPU compiles more slowly, so if its first fold loses with the change, the knob wants a race or a split there.
+- **WebGPU, the diffusion transformer's token tile at 8 from 200 tokens (metal-3 prior)**, and the occupancy probe
+  skipped where nothing reads it. A sweep of every diffusion knob on the M5 (bench-head.js, stock): the derived and
+  default answers already win everywhere (split-K off: 107 against 150-183 ms at 255 tokens; ampere's whole prior
+  172; batched gates, norm split, attend subgroups or staged keys, flash attend, transition threads all level) -
+  except the token tile, still improving at its cap of 4: 100 tokens 44 -> 44 ms, 150 63 -> 60, 200 83 -> 79, 255
+  107 -> 97 (16 level with 8; 68 tokens loses, 33 -> 36). 5CAJ through fold.js: 9.3 / 9.5 -> 8.6 / 8.8 s, pLDDT
+  identical. The occupancy probe (~0.3 s of GPU at device creation) feeds only the derivations, which are off on
+  Apple: skipped there, a cold first 6MRR fold 2.8 / 2.8 / 2.7 -> 2.7 s in three rounds.
+  - **For the M2:** the tile at 200 and 255 tokens (`bench-head.js --tokens=255 --tile=4` against `--tile=8`). The M2
+    measured 4 ahead at 150, which is why the crossover is 200; if 8 loses there too, the crossover wants a race.

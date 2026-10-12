@@ -1260,6 +1260,13 @@ const PRIORS = new Map([
     // against 1179 ms, the same checksum). Measured on the M5; the M2 compiles on a slower CPU, so it wants re-checking
     // there (docs/M5-HANDOFF.md).
     runtimeLoopBounds: false,
+    // 🔴 THE DIFFUSION TRANSFORMER'S TOKEN TILE AT 8 FROM 200 TOKENS, MEASURED ON AN M5 UNDER STOCK FLAGS. Below this
+    // the default (4, the M2's: 8 lost there at 150 tokens, 103 / 105 against 106 / 113 ms) holds; above, the tile's
+    // weight traffic is what binds. bench-head.js, a denoiser call, two rounds alternated, tile 4 against 8:
+    //   100 tokens 44 / 44 -> 44 / 44 ms, 150 63 / 63 -> 60 / 61, 200 83 / 82 -> 79 / 79, 255 107 / 107 -> 97 / 98
+    // (16 is level with 8 at 255; 68 tokens loses with 8, 33 -> 36). A schedule, not arithmetic: the same fold.
+    // Not measured on an M2 at 200 and above.
+    diffusionTokenTile: { below: 4, atOrAbove: 8, crossover: 200 },
   }],
 ], );
 

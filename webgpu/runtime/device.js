@@ -12,7 +12,7 @@
  * adapter's, not one equal to it.
  */
 import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
-import { recordAdapter, deviceTuning } from "./device-profile.js";
+import { recordAdapter, deviceTuning, deviceDerivationsAllowed } from "./device-profile.js";
 import { measureDeviceOccupancy } from "./occupancy.js";
 
 const RAISED_LIMITS = [
@@ -153,7 +153,12 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
   // nothing a user sees; in front of one it would cost more than it sets. Every
   // consumer reads "not measured yet" as "use the default", so a fold that
   // starts before it finishes is simply the fold that would have run anyway.
-  if (deviceTuning(device).diffusionSplitK === null && options.measureOccupancy !== false) {
+  //
+  // 🔴 AND NOT WHERE NOTHING WOULD READ IT. On an Apple GPU the derivations are off (DEFAULTS_ARE_MEASUREMENTS in
+  // device-profile.js), so every consumer takes its default whatever this finds - and the probe is ~0.3 s of GPU work
+  // (8192 workgroups of a 65536-step chain, twice) that a visitor whose weights are cached ran beside the first fold.
+  if (deviceTuning(device).diffusionSplitK === null && deviceDerivationsAllowed(device)
+      && options.measureOccupancy !== false) {
     void measureDeviceOccupancy(device).catch(() => {});
   }
   return device;
