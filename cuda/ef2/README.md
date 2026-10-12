@@ -528,4 +528,8 @@ the 256-channel bf16 pair (its rows of z, and the triangle's product), so everyt
 triangle's windows and gate chunks go to C / 32 where every rank is short at C / 16 (`LOCALFOLD_MG_TRI_NARROW=1`
 forces it; the 1TIM dimer on 2 ranks 0.000 A either way), and the sampler's gathered attention rows are given back
 before the head (alone, they held a 1 GB shared segment). It was 14,820 before. Splitting the product share by rows
-does not work: a pass's output updates its rows of z, and every later pass's operands are read from all of z.
+does not work: a pass's output updates its rows of z, and every later pass's operands are read from all of z. The
+triangle's rounds (its operands a window of channels at a time, the input pass repeated each window) are taken only
+where the whole form's own buffers do not fit on every rank - asked of the ranks, once a shape; `shortPair`'s rule
+had them on with 30 GB to spare, where the repeated input pass was 41% of a rank's GPU time: a simulated rank of 8's
+trunk at 4,940 tokens 19.65 -> 13.33 s (the one-GPU fold's is 114.6 s), at 9,880 97.0 -> 72.9 s.

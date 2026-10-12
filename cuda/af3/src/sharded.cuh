@@ -238,7 +238,28 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // (K/C of a slab each) where they were two whole slabs: 9.4 -> 2.4 GB a rank at 12,103 tokens on 8. The input
   // pass's LayerNorm repeated a window
   static const int R_SET = getenv("LOCALFOLD_MG_TRI_ROUNDS") ? atoi(getenv("LOCALFOLD_MG_TRI_ROUNDS")) : -1;
-  const bool rounds = !F8 && !x8 && (R_SET >= 0 ? R_SET > 0 : shortPair((size_t)n * n, C));
+  // (asked of every rank, once a shape: the whole form's own buffers - a, b and the gate a slab each, two steps' slots,
+  // two products, the product share - against what each has free. shortPair's rule, 18x an f32 pair a GPU, put a
+  // simulated rank of 8 in rounds at 4,940 tokens with 30 GB to spare, where the input pass run a window at a time was
+  // 41% of its GPU time)
+  static std::map<std::pair<int, int>, bool> roundsOf;
+  bool rounds = false;
+  if (!F8 && !x8) {
+    if (R_SET >= 0) rounds = R_SET > 0;
+    else if (BIG_FORCED) rounds = true;
+    else {
+      auto it = roundsOf.find({ n, C });
+      if (it == roundsOf.end()) {
+        const int gs = getenv("LOCALFOLD_MG_TRI_GROUPS") ? atoi(getenv("LOCALFOLD_MG_TRI_GROUPS")) : 0;
+        const int grp = gs > 0 ? gs : np >= 4096 ? 8 : np >= 2048 ? 4 : 1, cg = (C + mg::WORLD - 1) / mg::WORLD;
+        const size_t gw = (size_t)((cg + grp - 1) / grp), slab = (size_t)std::max(rows, 1) * np * C;
+        const size_t whole = 2 * slab * sizeof(TQ) + slab * 2 + 4 * gw * plane * sizeof(TQ) + 2 * gw * plane * 2 + mine * 2
+                           + ((size_t)1 << 30);
+        it = roundsOf.emplace(std::make_pair(n, C), !mg::everyRankHas(whole)).first;
+      }
+      rounds = it->second;
+    }
+  }
   // (a 256-channel pair - ESMFold2's - in windows of C / 16: the windows, their slots and the gate's chunk at C / 8 left a
   // simulated rank of 8 0.6 GB short at 14,820 tokens beside its two 14 GB shares)
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
