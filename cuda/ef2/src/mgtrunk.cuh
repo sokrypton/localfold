@@ -94,10 +94,19 @@ inline void pairOntoRank0HostEf2(int T, int C) {
   mg::WORLD = 1; SHORT_PAIR_SHARE = 1; EF2_QLO = EF2_QROWS = 0; EF2_ZS = nullptr;
 }
 
-// this rank's share in its own pinned host buffer through the sampler (which never reads it), and back
+// this rank's share in its own pinned host buffer through the sampler (which never reads it), and back - or kept on the
+// device where every rank has the room for it to stay through the sampler and the confidence head beside it: the head's
+// residual (a share's size) and the sharded triangle's whole form (~4 shares) past an eighth of the card. Parking was
+// pinning alone: 1.1 s for a 1.58 GB share at 4,940 tokens on 8, where a rank holds under 7 GB
 inline B16Host EF2_SHARE_HOST{};
+inline bool EF2_SHARE_KEPT = false;
 inline void parkShareEf2(int T, int C) {
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
+  size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
+  EF2_SHARE_KEPT = !BIG_FORCED && mg::everyRankHas(5 * bytes + t / 8);
+  if (mg::RANK == 0 && getenv("LOCALFOLD_MEM"))
+    fprintf(stderr, "  the trunk's share (%.2f GB a rank) %s through the sampler\n", bytes / 1e9, EF2_SHARE_KEPT ? "kept on the device" : "parked in host memory");
+  if (EF2_SHARE_KEPT) return;
   if (EF2_SHARE_HOST.have < bytes) {
     if (EF2_SHARE_HOST.p) CK(cudaFreeHost(EF2_SHARE_HOST.p));
     if (cudaMallocHost(&EF2_SHARE_HOST.p, std::max<size_t>(bytes, 1)) != cudaSuccess) {
@@ -112,6 +121,7 @@ inline void parkShareEf2(int T, int C) {
 }
 inline void unparkShareEf2(int T, int C) {
   releaseScratch(); trimPool();
+  if (EF2_SHARE_KEPT) return;
   EF2_ZS = &mg::shared("sh.z", EF2_SHARE_HOST.bytes);
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
   if (bytes) CK(cudaMemcpyAsync(EF2_ZS->local, EF2_SHARE_HOST.p, bytes, cudaMemcpyHostToDevice, STREAM));
@@ -180,8 +190,8 @@ __global__ void tmRowsAtK(const float* tm, const int* asym, double* rows, int T,
 }
 
 // The confidence head across the ranks (confidence.cuh's, its EF2_Z16 form sharded): each rank builds the head's pair
-// on its rows of the trunk's - in place, a chunk of token rows at a time, the f32 sum kept in its own pinned host memory
-// as the residual - the head's blocks run as the trunk's do (the sharded triangle, the transition on own rows), and the
+// on its rows of the trunk's - in place, a chunk of token rows at a time, the result kept as the residual (bf16, where the
+// trunk's share waited through the sampler) - the head's blocks run as the trunk's do (the sharded triangle, the transition on own rows), and the
 // pooling, the PAE and the pTM rows come off each rank's rows and are all-gathered. Every rank returns the same
 // Confidence; rank 0's is written.
 inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int Si, const float* xDevice) {
@@ -202,14 +212,10 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   gemm(s, F("confidence/sToZProdIn2"), rr, T, Si, C);
   const int rb = (int)std::max<size_t>(1, ((size_t)64 << 20) / ((size_t)T * C * 4));   // token rows a chunk
   const size_t per = (size_t)rb * T;
-  static float* resid = nullptr; static size_t residHave = 0;
-  if (residHave < std::max<size_t>(held * C, 1)) {
-    if (resid) CK(cudaFreeHost(resid));
-    if (cudaMallocHost(&resid, std::max<size_t>(held * C, 1) * 4) != cudaSuccess) {
-      fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", held * C * 4 / 1e9); exit(1);
-    }
-    residHave = std::max<size_t>(held * C, 1);
-  }
+  // the residual: the head's pair rows as its blocks take them (bf16) - on the device where the trunk's share stayed
+  // through the sampler, else in the share's pinned host buffer, free again once the share is back (an f32 copy pinned
+  // of its own was 2.1 s of a 3.3 s head at 4,940 tokens on 8, and 35 GB of host memory a rank at 16,549)
+  B16* resid = EF2_SHARE_KEPT ? dallocT<B16>(std::max<size_t>(held * C, 1)) : (B16*)EF2_SHARE_HOST.p;
   {
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* prodc = scratch<float>("cf.prodc", per * C);
@@ -222,10 +228,10 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
         (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), q0, n, T, C);
-      CK(cudaMemcpyAsync(resid + ql * C, zc, n * C * 4, cudaMemcpyDeviceToHost, STREAM));
       ef2ToBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zc, zl + ql * C, n * C);
     }
     releaseScratch({ "cf.zc", "cf.xn", "cf.prodc" });
+    if (held) CK(cudaMemcpyAsync(resid, zl, held * C * 2, cudaMemcpyDefault, STREAM));
   }
   const float* mask = nullptr;                                   // (every pair real)
   PAIR16 = true;
@@ -249,9 +255,12 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* score = scratch<float>("cf.scoreRows", per); float* paeL = scratch<float>("cf.paeRows", per * pb);
     float* paeD = scratch<float>("cf.paeOutRows", per); float* tmD = scratch<float>("cf.tmRows1", per);
+    B16* rh = EF2_SHARE_KEPT ? nullptr : scratch<B16>("cf.residRows", per * C);
     for (int i0 = lo; i0 < lo + rows; i0 += rb) {
       const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, ql = (size_t)(i0 - lo) * T;
-      CK(cudaMemcpyAsync(xn, resid + ql * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
+      const B16* rs = resid + ql * C;
+      if (rh) { CK(cudaMemcpyAsync(rh, rs, n * C * 2, cudaMemcpyHostToDevice, STREAM)); rs = rh; }
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(rs, xn, n * C);
       ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zl + ql * C, zc, n * C);
       addK<<<blocks(n * C), 256, 0, STREAM>>>(zc, xn, n * C);
       gemm(zc, F("confidence/poolingAttention"), score, n, C, 1);
@@ -264,7 +273,8 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       tmRowsAtK<<<(unsigned)b, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T, i0);
       CK(cudaMemcpy2DAsync(paeAll + (size_t)i0 * Tp, (size_t)Tp * 4, paeD, (size_t)T * 4, (size_t)T * 4, b, cudaMemcpyDeviceToDevice, STREAM));
     }
-    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1" });
+    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1", "cf.residRows" });
+    if (EF2_SHARE_KEPT) CK(cudaFree(resid));
   }
   mg::allGather(pooledS, (size_t)lo * C * 4, (size_t)rows * C * 4);
   mg::allGather(tmS, (size_t)lo * 16, (size_t)rows * 16);
