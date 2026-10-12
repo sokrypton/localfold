@@ -152,17 +152,29 @@ __device__ __forceinline__ uint4 widen8(uint2 s) {
 // ([C][rows][np] from channel 0, as sent: bf16, or e4m3 under LOCALFOLD_MG_FP8_EXCHANGE), written into its planes
 // [g][np][np]; the ranks walked from this one (rot)
 struct PushSlots { uint4* a[mg::MAX_RANKS]; uint4* b[mg::MAX_RANKS]; int ch[mg::MAX_RANKS], cnt[mg::MAX_RANKS]; int world, rank; };
-__global__ void pushPlanesK(PushSlots ps, const void* __restrict__ srcA, const void* __restrict__ srcB, int rows, int lo, int np,
-                            int vecs, int g) {
-  const size_t total_ = (size_t)ps.world * g * rows * vecs;
-  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
-    const int v = (int)(t % vecs); size_t rest = t / vecs;
-    const int i = (int)(rest % rows); rest /= rows;
-    const int c = (int)(rest % g), r = (int)((rest / g + ps.rank) % ps.world);
-    if (c >= ps.cnt[r]) continue;
-    const size_t src = ((size_t)(ps.ch[r] + c) * rows + i) * vecs + v, dst = ((size_t)c * np + lo + i) * vecs + v;
-    ps.a[r][dst] = reinterpret_cast<const uint4*>(srcA)[src];
-    ps.b[r][dst] = reinterpret_cast<const uint4*>(srcB)[src];
+// ...and the same moves by COPY ENGINES: each (rank, channel) piece is one run at both ends - a channel's plane's rows
+// [lo, lo + rows), np wide - so cudaMemcpyAsync between devices takes it with no SM held, where the push kernels held
+// theirs for as long as the link took (a simulated rank's local writes hide that; a box's NVLink is ~10x slower). The
+// destinations from the next rank on, as the kernels go
+inline void copyPlanes(const PushSlots& ps, const void* srcA, const void* srcB, int rows, int lo, int np, int vecs, int g, cudaStream_t st) {
+  const size_t piece = (size_t)rows * vecs * 16;
+  for (int k = 0; k < ps.world; ++k) {
+    const int r = (ps.rank + k) % ps.world;
+    for (int c = 0; c < ps.cnt[r] && c < g; ++c) {
+      const size_t src = (size_t)(ps.ch[r] + c) * piece, dst = ((size_t)c * np + lo) * vecs * 16;
+      CK(cudaMemcpyAsync((char*)ps.a[r] + dst, (const char*)srcA + src, piece, cudaMemcpyDefault, st));
+      CK(cudaMemcpyAsync((char*)ps.b[r] + dst, (const char*)srcB + src, piece, cudaMemcpyDefault, st));
+    }
+  }
+}
+inline void copyRows(const PeerPlanes& pp, const void* prod, int q0, int gc, int np, int vecs, cudaStream_t st) {
+  for (int k = 0; k < pp.world; ++k) {
+    const int r = (pp.rank + k) % pp.world;
+    if (pp.rows[r] <= 0) continue;
+    const size_t piece = (size_t)pp.rows[r] * vecs * 16;
+    for (int c = 0; c < gc; ++c)
+      CK(cudaMemcpyAsync((char*)pp.p[r] + (size_t)(q0 + c) * piece, (const char*)prod + ((size_t)c * np + pp.lo[r]) * vecs * 16,
+                         piece, cudaMemcpyDefault, st));
   }
 }
 // e4m3 planes widened to bf16, 8 values a thread
@@ -172,16 +184,6 @@ __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ o
 }
 // (ONE DESTINATION AT A TIME, each rank starting at its own: through a PCIe host bridge 4 ranks' writes ran at 17 GB/s
 // a GPU so, at 6 where each GPU's consecutive writes went to every owner in turn - row by row within each channel)
-__global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
-  const size_t total_ = (size_t)pp.world * gc * pp.maxRows * vecs;
-  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total_; t += (size_t)gridDim.x * blockDim.x) {
-    const int v = (int)(t % vecs); size_t rest = t / vecs;
-    const int il = (int)(rest % pp.maxRows); rest /= pp.maxRows;
-    const int c = (int)(rest % gc), r = (int)((rest / gc + pp.rank) % pp.world);
-    if (il >= pp.rows[r]) continue;
-    pp.p[r][((size_t)(q0 + c) * pp.rows[r] + il) * vecs + v] = prod[((size_t)c * np + pp.lo[r] + il) * vecs + v];
-  }
-}
 
 // this rank's rows of the attention's bias (columns where swapped: the rows of z^T) written into every other rank's -
 // the planes [heads][n][stride] f16; ownership turns on 16-row boundaries, so no 16-byte piece straddles two ranks
@@ -412,8 +414,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             int f, t; range(q, r, f, t);
             ps.a[r] = (uint4*)slotA[sl]->peer[r]; ps.b[r] = (uint4*)slotB[sl]->peer[r]; ps.ch[r] = f - k0; ps.cnt[r] = t - f;
           }
-          if (rows > 0) pushPlanesK<<<st != STREAM ? sideBlocks((size_t)mg::WORLD * g * rows * vecsW) : blocks((size_t)mg::WORLD * g * rows * vecsW),
-                                      256, 0, st>>>(ps, aL, bL, rows, lo, np, vecsW, g);
+          if (rows > 0) copyPlanes(ps, aL, bL, rows, lo, np, vecsW, g, st);
           if (rows > 0) mg::sent("triangle operands", (size_t)2 * (mg::WORLD - 1) * g * rows * vecsW * 16, st != STREAM);
         };
         // OVERLAPPED (not in rounds): step q + 1's slots pushed on a side stream while step q's GEMM runs - its slots were
@@ -440,7 +441,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             gemmAll(gc, A, Bm, pAll[sp]);
             CK(cudaEventRecord(gemmed[sp], STREAM));
             CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
-            pushRowsK<<<sideBlocks((size_t)mg::WORLD * gc * pPlanes.maxRows * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            copyRows(pPlanes, pAll[sp], m0, gc, np, vecsP, pushS);
             mg::sent("triangle products", (size_t)(mg::WORLD - 1) * gc * pPlanes.maxRows * vecsP * 16, true);
             CK(cudaEventRecord(pushed[sp], pushS));
             used[sp] = true;
