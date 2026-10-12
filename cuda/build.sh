@@ -67,7 +67,7 @@ if [ "${ports[*]}" = featurise ]; then
 fi
 if [ -z "$cc" ]; then for pid in "${pids[@]}"; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
-  case "$port" in af3|af2) fast=--use_fast_math ;; ef2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
+  case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
   # Colab VM has two cores and three compiles, and the first fold waits only on its own port's binary
   prio=""; [ "$port" = af3 ] || prio="nice -n 10"

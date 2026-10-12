@@ -35,6 +35,9 @@ inline std::string apiUrl() {
   return u;
 }
 
+// every request's User-Agent (as curl flags): AlphaFold DB answers curl's own with a 403 on its files and a
+// bare name with a 403 on its API (measured 2026-10-12); a compatible-style name gets through to every host this calls
+inline const std::string CURL_AGENT = " -A 'Mozilla/5.0 (compatible; localfold)'";
 inline std::string shellQuote(const std::string& s) {
   std::string out = "'";
   for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
@@ -60,7 +63,7 @@ inline Response httpOnce(const std::string& url, const std::vector<std::pair<std
   int fd = mkstemp(tmpl);
   if (fd < 0) throw std::runtime_error("cannot make a temporary file");
   close(fd);
-  std::string command = "curl -s -L --max-time 600 -o " + shellQuote(tmpl) + " -w '%{http_code}'";
+  std::string command = "curl -s -L" + CURL_AGENT + " --max-time 600 -o " + shellQuote(tmpl) + " -w '%{http_code}'";
   if (form) {
     command += " -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8'";
     for (auto& [k, v] : *form) command += " --data-urlencode " + shellQuote(k + "=" + v);

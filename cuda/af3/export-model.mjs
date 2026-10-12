@@ -206,6 +206,7 @@ if (sequence !== "") {
     const proteins = allChains.filter((_, i) => allKinds[i] === "protein");
     if (proteins.length === 0) throw new Error("--search: no protein chain to search for");
     const t0 = performance.now();
+    let searchedA3m;
     if (proteins.length === 1) {
       const searched = await generateMmseqs2Msa(proteins[0], {});
       alignment = searched.a3m;
@@ -214,10 +215,12 @@ if (sequence !== "") {
       const searched = await generateMmseqs2ComplexMsa(proteins, { model: "af3" });
       alignment = searched.blocks;
       searchedHits = searched.templateHits;
+      searchedA3m = searched.a3m;
     }
     searchedProteinAt = allKinds.flatMap((kind, i) => (kind === "protein" ? [i] : []));
-    // (one chain's alignment as the search returned it, for whoever shows the alignment)
-    if (typeof alignment === "string") writeFileSync(`${out}/search.a3m`, alignment);
+    // (the alignment as the search returned it, for whoever shows the alignment: a complex's merged, paired
+    // block first, as the page keeps it)
+    writeFileSync(`${out}/search.a3m`, typeof alignment === "string" ? alignment : searchedA3m);
     console.log(`search: ${proteins.length} protein chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   }
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna

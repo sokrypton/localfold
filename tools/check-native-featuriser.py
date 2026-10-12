@@ -232,7 +232,7 @@ def read_idx(path):
 
 def compare(js_dir, native_dir):
     """None when identical, else a sentence naming the first difference."""
-    for name in ("template.pdb", "pdb.template"):
+    for name in ("template.pdb", "pdb.template", "search.a3m"):
         a, b = os.path.join(js_dir, name), os.path.join(native_dir, name)
         if os.path.exists(a) != os.path.exists(b):
             return f"{name}: present on one side only"

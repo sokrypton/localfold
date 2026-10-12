@@ -467,6 +467,7 @@ inline Af3Export exportAf3(const Args& args) {
       alignment.hasUnpaired = true; alignment.unpaired = many.merged.unpaired;
       alignment.hasUnpairedProfile = true; alignment.unpairedProfile = many.merged.unpairedProfile;
       found.hits = many.hits;
+      out.searchA3m = many.merged.a3m;      // (a complex's merged alignment, paired block first, as the page keeps it)
     }
     found.searched = true;
     char took[64];
