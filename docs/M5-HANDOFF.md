@@ -1000,3 +1000,22 @@ ran at 3.0.
   (3 recycles, 50 steps): CA RMSD between arms 0.006 A on 6MRR (seed change 0.476), 0.002 A templated (0.151).
   test:ligand stock: af3 0.061, boltz2 0.049, protenix2 0.043, intellifold2 0.053, rosettafold3 0.069 A; test:stock all
   eight models fold.
+
+## For the M2: this round's checks, in one place (2026-10-12, through 65d1ce5d)
+
+Everything below reached the M2 through the metal-3 prior or a device rule, and none of it was measured there - the
+browser cannot tell an M2 from an M5, and grid.attend's f16 tiles are the standing proof that a win on one can lose on
+the other. Stock Chrome, `LOCALFOLD_STOCK_FLAGS=1`, arms alternated. If an arm loses on the M2, its prior entry comes out
+(or becomes a race like grid-attend-race.js); if a fold moves past its seed spread, that is the bug report.
+
+1. `bench-transition.js --channels=256 --tokens=255 --arms=vsplit@f16,vsplit@f16@f32@128x128x8,vsplit@f16@f16@64x128x32`
+   and `--channels=128 --arms=8:128,vsplit@f16@f16@64x128x32` - the vector split's block (`vectorGemmBlock`) and its
+   f16 arithmetic (ESMFold2's and the AF3 lineage's pair transitions).
+2. `bench-msa-attention.js --shape=row --sequences=128 --length=255 --arms=auto/c,auto/cg4` - `attentionGroup: 4`.
+3. `profile-af2-block.js --bundle=/model-af2-monomer-int5 --length=255 --sequences=128` against
+   `--tune=triangleAccumulatePrecision=f32,opmVectorArithmetic=f32` - AF2's f16 triangle projections and OPM.
+4. `bench-grid-project.js --tokens=255 --arms=8,8h` - AF3's f16 grid projection (`gridProjectArithmetic`).
+5. `fold.js --model=/model-af3-int5/manifest.json --sequence=<5CAJ> --folds=2 --steps=20` against
+   `--tune=diffusionStagePrecision=f32` - the denoiser's f16 staging.
+6. The gates, now that every bundle is fetchable: `npm run test:stock`, `test:template`, `test:ligand` (with and
+   without stock flags - the f16-only matrix units are what `matrixContractionOverflows` refuses).
