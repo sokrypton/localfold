@@ -1382,8 +1382,11 @@ inline bool fp8Attn() {
   return on;
 }
 inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOLD_FP8_SWIZZLE")) : -1;
-// LOCALFOLD_FP8_SPEC=1: flash8's speculative softmax (being measured on an FP8 card)
-inline bool FP8_SPEC = getenv("LOCALFOLD_FP8_SPEC") && atoi(getenv("LOCALFOLD_FP8_SPEC"));
+// flash8's speculative softmax (flashGrid2R's SPEC) from 1,024 tokens: on a Colab L4 (--bench-grid, 256 rows) 20% slower
+// at 512 (3.47 against 2.88 ms), 2.6% faster at 1,024 (20.70 / 21.26) and 3.2% at 2,048 (126.2 / 130.5); 6MRR, 5CAJ
+// and 1TIM self-templated 0.014 A from the folds without it, every crystal RMSD within 0.006 A of its own.
+// LOCALFOLD_FP8_SPEC=0 or 1 forces it off or on
+inline int FP8_SPEC = getenv("LOCALFOLD_FP8_SPEC") ? atoi(getenv("LOCALFOLD_FP8_SPEC")) : -1;
 // the attention from qkvg's q and gate (f16, [row][pos][4W]) and K8, V8 (e4m3, [row][pos][W] - gridInK's kv8)
 inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
                       int heads, size_t rows, float scale, const float* qBias) {
@@ -1397,7 +1400,7 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
   static bool attr = false;
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
   const int sw = FP8_SWIZZLE >= 0 ? FP8_SWIZZLE : n >= 3500 ? 4 : 0;
-  if (FP8_SPEC) {
+  if (FP8_SPEC > 0 || (FP8_SPEC < 0 && n >= 1024)) {
     static bool attrS = false;
     if (!attrS) { smemAttr((flash8<WARPS, BK, MT, RR, true>), bytes); attrS = true; }
     flash8<WARPS, BK, MT, RR, true><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias, sw);
