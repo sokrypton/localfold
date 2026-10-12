@@ -108,7 +108,7 @@ import { storageBytes } from "../../runtime/storage.js";
 import { releaseWeights } from "../../../shared/af3/weights/weights.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../../runtime/device-memory.js";
-import { splitTransitionConfig, transitionRowTile } from "./transition.js";
+import { splitTransitionConfig, pairTransitionArithmetic, transitionRowTile } from "./transition.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
@@ -470,7 +470,7 @@ export class Af3PairformerStackGpu {
       // the fused kernel's row tile halves as the widened row grows. See
       // webgpu/af3/trunk/transition.js.
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
-        { f32Only: !pairMatrixKernels }),
+        { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See webgpu/kernels/triangle/project-matrix.js.

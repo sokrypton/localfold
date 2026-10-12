@@ -692,6 +692,19 @@ export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 1
  * measured on matrix units; without them the fused kernel still wins at 128.
  */
 export const VECTOR_SPLIT_MIN_CHANNELS = 192;
+/**
+ * ...and where the f16 arithmetic does (VECTOR_GEMM_F16), which is lower: measured on an M5 under stock flags
+ * (bench-transition.js, 128 channels at 255 tokens, the whole transition) the fused kernel is 15.12 ms, the vector
+ * split in f32 at the Apple block 14.84, and in f16 10.60 at 64 x 128 x 32 - 1.43x at AF3's width.
+ */
+export const VECTOR_F16_SPLIT_MIN_CHANNELS = 128;
+/**
+ * The vector split's arithmetic an AF3-lineage pair track asks for: f16 at AF3's 128 channels, where it is what makes
+ * the split pay at all (VECTOR_F16_SPLIT_MIN_CHANNELS) and where it was checked against the fold; f32 on the wider
+ * tracks (protenix2, OpenDDE, IntelliFold-2), which split in f32 already and were not measured in f16.
+ * `vectorTransitionArithmetic` overrides either - the control arm.
+ */
+export const pairTransitionArithmetic = (channels) => (channels < VECTOR_SPLIT_MIN_CHANNELS ? "f16" : "f32");
 
 /**
  * The workgroup storage the split's NORMALIZE kernel stages: `rows` whole rows
@@ -1174,14 +1187,19 @@ export function splitTransitionConfig(device, channels, { f32Only = false, arith
   // up the vector split is the default unless a device says `false`. The
   // matrix split is still the prior's to choose: it was measured per device.
   if (tuning.pairTransitionSplit === false) return false;
-  if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
-    return false;
-  }
   // ...and the MATRIX split too, now, unless a prior refused it: past the
-  // width rule above it was the ampere prior's alone, so a T4 with matrix
+  // width rule below it was the ampere prior's alone, so a T4 with matrix
   // units ran IntelliFold-2's transition on the vector split.
   const config = f32Only || tuning.pairTransitionSplit === false ? null
     : deviceMatrixConfig(device, { element: "f16" });
+  // 🔴 THE VECTOR SPLIT IN f16 ARITHMETIC PAYS FROM AF3's 128 CHANNELS, where the f32 one starts at 192 - see
+  // VECTOR_F16_SPLIT_MIN_CHANNELS. The width rule below is every other path's.
+  const vectorF16 = config === null && !f32Only && halfPrecisionAvailable(device)
+    && (tuning.vectorTransitionArithmetic ?? arithmetic) === "f16"
+    && channels >= VECTOR_F16_SPLIT_MIN_CHANNELS;
+  if (!vectorF16 && channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
+    return false;
+  }
   // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
   // none of which exposes subgroup matrices - ran the fused kernel at every
   // width. The vector GEMM above takes the split's two projections instead,
@@ -1190,7 +1208,7 @@ export function splitTransitionConfig(device, channels, { f32Only = false, arith
   if (normalizeRows === undefined) return false;
   const rows = normalizeRows === 8 ? {} : { normalizeRows };
   if (config === null) {
-    if (channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
+    if (!vectorF16 && channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
     if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
     // 🔴 THE f16 SWITCH, NOT THE FEATURE BIT. Asked as `features.has`, --f16=off
     // could not reach this scratch, so an "f32" trunk on a 256-channel model

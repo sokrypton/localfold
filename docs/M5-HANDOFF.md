@@ -927,3 +927,14 @@ ran at 3.0.
 - **test:stock's AF2 entry cannot run on this machine**: it folds `fold-af2.js` with no `--bundle`, i.e. `/model/`, and
   only `model-af2-monomer-int5/` is here. `fold-af2.js --bundle=/model-af2-monomer-int5` is how AF2 was checked above;
   `--ca` (new) returns the alpha carbons so two arms superpose.
+- **AF3's pair transition in f16 arithmetic (the user's call, 2026-10-12)**: at 128 channels the vector split only pays
+  in f16 - bench-transition.js, 255 tokens: fused 15.12 ms, the split in f32 14.84, in f16 10.60. AF3-lineage pair
+  tracks of 128 channels now take the split with VECTOR_GEMM_F16 on a device with f16 and no matrix units
+  (`pairTransitionArithmetic`; the wider tracks keep f32 arithmetic, unmeasured in f16); `vectorTransitionArithmetic=f32`
+  is the control (the fused kernel). The trunk at 255 tokens, alternated: pair-transition 666 / 684 -> 539 / 543 ms a
+  pass, GPU 3072 / 3149 -> 2951 / 2951, wall 2116 / 2166 -> 2027 / 2028; 5CAJ at the page's 20 steps 5.9 / 6.0-6.1 ->
+  5.6 / 5.9 s. Kernel relRMS 1.60e-3 (f32 arithmetic over the same f16 scratch 4.3e-4; the fused kernel's own 3.55e-4).
+  Fold level (fold-opendde.js, AF3 int5, 3 recycles, 50 steps): CA RMSD between the arms 0.002 A on 6MRR (a seed change:
+  0.464) and 0.001 A on 5CAJ self-templated (0.151); crystal RMSD 0.673 / 0.673 and 0.251 / 0.251; pLDDT 86.571 ->
+  86.591 and 95.535 -> 95.534. test:ligand alphafold3 bond rms 0.061 A (as recorded); test:stock AF3 85.8278 -> 85.8982.
+  For the M2: the same bench at `--channels=128 --arms=8:128,vsplit@f16@f16@64x128x32`.

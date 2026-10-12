@@ -38,7 +38,7 @@ import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
   allocateTransitionSplit, createTransitionShader, packTransitionWeights,
-  splitTransitionConfig, transitionRowTile, TRANSITION_ORDER,
+  splitTransitionConfig, pairTransitionArithmetic, transitionRowTile, TRANSITION_ORDER,
 } from "./transition.js";
 import { settleGridAttendTiling } from "./grid-attend-race.js";
 
@@ -165,7 +165,7 @@ export class Af3MsaStackGpu {
       // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
       // the whole reason the pairformer takes it. Same width rule, same knob.
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
-        { f32Only: !pairMatrixKernels }),
+        { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
