@@ -286,6 +286,31 @@ static std::vector<size_t> windowsOf(size_t len) {
   return starts;
 }
 
+// ...and the paired search, every chain's first window at once, takes no more than PAIRED_RESIDUES in all: the server
+// paired 8,607 (bacitracin's three) and ended 11,273 (gramicidin's four) with ERROR - each chain's window cut to one
+// length where the sum would pass it
+constexpr size_t PAIRED_RESIDUES = 8000;
+static size_t pairedCut(const std::vector<std::string>& unique) {
+  auto total = [&](size_t cut) { size_t t = 0; for (auto& q : unique) t += std::min(q.size(), cut); return t; };
+  size_t lo = 1, hi = WINDOW;
+  if (total(hi) <= PAIRED_RESIDUES) return hi;
+  while (lo < hi) { const size_t mid = (lo + hi + 1) / 2; if (total(mid) <= PAIRED_RESIDUES) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+// every search's answer kept in <out>.searches/, named by its query (FNV-1a), so a rerun after a failure - an hour of
+// windows lost to the last step, once - takes what is already there
+static std::string keptSearch(const std::string& dir, const std::string& key, const std::function<std::string()>& run) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : key) { h ^= c; h *= 1099511628211ull; }
+  char name[32]; snprintf(name, sizeof name, "/%016llx.a3m", (unsigned long long)h);
+  const std::string path = dir + name;
+  if (lf::fetch::exists(path)) return lf::readFile(path);
+  std::string text = run();
+  lf::writeText(path + ".part", text);
+  if (rename((path + ".part").c_str(), path.c_str())) throw std::runtime_error("cannot write " + path);
+  return text;
+}
+
 static int msaMain(int argc, char** argv) {
   std::vector<std::string> list(argv + 1, argv + argc);
   lf::Args args(list);
@@ -299,12 +324,17 @@ static int msaMain(int argc, char** argv) {
     std::vector<std::string> unique;
     for (auto& c : chains) if (std::find(unique.begin(), unique.end(), c) == unique.end()) unique.push_back(c);
     auto say = [](const std::string& m) { fprintf(stderr, "%s\n", m.c_str()); fflush(stderr); };
+    const std::string kept = args.positional + ".searches";
+    lf::fetch::makeDirs(kept);
+    auto one = [&](const std::string& q, const std::string& tag) {
+      return keptSearch(kept, "unpaired:" + q, [&] { return lf::search::searchOne(q, [&](const std::string& m) { say(tag + ": " + m); }).a3m; });
+    };
     std::vector<std::string> unpaired, paired(unique.size());
     for (size_t i = 0; i < unique.size(); ++i) {
       const std::string& q = unique[i];
       const std::string tag = "chain " + std::to_string(i + 1) + " of " + std::to_string(unique.size()) + " (" + std::to_string(q.size()) + " residues)";
       if (q.size() <= WINDOW) {
-        unpaired.push_back(lf::search::searchOne(q, [&](const std::string& m) { say(tag + ": " + m); }).a3m);
+        unpaired.push_back(one(q, tag));
         continue;
       }
       std::string a = ">101\n" + q + "\n";
@@ -312,18 +342,29 @@ static int msaMain(int argc, char** argv) {
       for (size_t w = 0; w < starts.size(); ++w) {
         const std::string seg = q.substr(starts[w], std::min(WINDOW, q.size() - starts[w]));
         const std::string wtag = tag + ", window " + std::to_string(w + 1) + " of " + std::to_string(starts.size());
-        a += widenA3m(lf::search::searchOne(seg, [&](const std::string& m) { say(wtag + ": " + m); }).a3m, seg, q, starts[w], true);
+        a += widenA3m(one(seg, wtag), seg, q, starts[w], true);
       }
       unpaired.push_back(a);
     }
     // the paired search on each chain's first window (pairing is by organism, and the organisms' full-length proteins
     // carry the window), its rows widened back over the chains
     if (unique.size() > 1) {
+      const size_t cut = pairedCut(unique);
       std::vector<std::string> heads;
-      for (auto& q : unique) heads.push_back(q.substr(0, std::min(WINDOW, q.size())));
-      paired = lf::search::searchPaired(heads, [&](const std::string& m) { say("paired: " + m); });
-      for (size_t i = 0; i < unique.size(); ++i)
-        if (unique[i].size() > WINDOW) paired[i] = widenA3m(paired[i], heads[i], unique[i], 0, false);
+      std::string key = "paired";
+      for (auto& q : unique) { heads.push_back(q.substr(0, std::min(cut, q.size()))); key += ":" + heads.back(); }
+      if (cut < WINDOW) say("paired: each chain's first " + std::to_string(cut) + " residues (" + std::to_string(PAIRED_RESIDUES) + " in all at most)");
+      const std::string joined = keptSearch(kept, key, [&] {
+        std::string j;
+        for (auto& t : lf::search::searchPaired(heads, [&](const std::string& m) { say("paired: " + m); })) j += t + '\x01';
+        return j;
+      });
+      for (size_t i = 0, at = 0; i < unique.size(); ++i) {
+        const size_t end = joined.find('\x01', at);
+        if (end == std::string::npos) throw std::runtime_error("a kept paired search has too few chains: " + kept);
+        paired[i] = joined.substr(at, end - at); at = end + 1;
+        if (unique[i].size() > heads[i].size()) paired[i] = widenA3m(paired[i], heads[i], unique[i], 0, false);
+      }
     }
     // chain ids in input order, mmCIF's way: A..Z, AA, AB, ...
     auto chainId = [](int a) { std::string id; for (a = a; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; } return id; };
