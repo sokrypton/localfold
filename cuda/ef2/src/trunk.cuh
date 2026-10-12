@@ -84,6 +84,9 @@ __global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelId
 // forms): half the bytes of the f32 z the trunk and every reader after it held - 25 GB at 4,940 tokens, where ESMFold2
 // ran out in the trunk's triangle. The recycle's arithmetic stays f32 a chunk of rows at a time; set by ef2.cu
 inline bool EF2_Z16 = false;
+// ...and that pair kept on the device through the sampler (ef2.cu, where there is the room), the confidence head then
+// building its own pair over it in place; null where it is parked in PARK_HOST
+inline __nv_bfloat16* EF2_Z16_DEV = nullptr;
 inline void zInitAddStreamed(float* z, int T, int C) {
   const ZInitStream& zs = ZINIT_STREAM;
   int bi = lmPairBlock(T, zs.P);

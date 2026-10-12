@@ -157,7 +157,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   gemm(s, F("confidence/sToZProdIn1"), l, T, Si, C);
   gemm(s, F("confidence/sToZProdIn2"), rr, T, Si, C);
   // EF2_Z16 (zTrunk null: the trunk's bf16 pair parked in PARK_HOST): the head's pair built a chunk of token rows at
-  // a time - normalised, its single and distance terms added, the f32 sum kept in pinned host memory as the residual -
+  // a time - normalised, its single and distance terms added, the sum kept (bf16) as the residual -
   // into a bf16 stack its blocks run on in place; then a chunk at a time again, the residual added back, the pooling
   // score, the row pooling and the PAE logits taken off the f32 rows. One bf16 pair on the card where the f32 head
   // held one f32 pair beside the blocks' (the head was the next limit: 30 GB at 5,434 tokens)
@@ -168,31 +168,30 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     using B16 = __nv_bfloat16;
     const int rb = (int)std::max<size_t>(1, ((size_t)64 << 20) / ((size_t)T * C * 4));   // token rows a chunk
     const size_t per = (size_t)rb * T;
-    static float* resid = nullptr; static size_t residHave = 0;
-    if (residHave < P * C) {
-      if (resid) CK(cudaFreeHost(resid));
-      if (cudaMallocHost(&resid, P * C * 4) != cudaSuccess) {
-        fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", P * C * 4 / 1e9); exit(1);
-      }
-      residHave = P * C;
-    }
-    B16* stack = dallocT<B16>(P * C);
+    // the trunk's pair on the device (EF2_Z16_DEV) - the stack built over it in place, a chunk read before it is
+    // written - or parked; the residual is the stack as its blocks take it (bf16), kept on the device beside a kept
+    // pair, else in the parked pair's own pinned buffer once read (an f32 residual pinned of its own was 6.3 s of a
+    // 2,964-token fold on 40 GB, 9 GB of pinning)
+    const bool kept = EF2_Z16_DEV != nullptr;
+    B16* stack = kept ? EF2_Z16_DEV : dallocT<B16>(P * C);
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* prodc = scratch<float>("cf.prodc", per * C); B16* stage = scratch<B16>("cf.z16", per * C);
     for (size_t p0 = 0; p0 < P; p0 += per) {
       size_t n = std::min(per, P - p0);
-      CK(cudaMemcpyAsync(stage, reinterpret_cast<const B16*>(PARK_HOST) + p0 * C, n * C * 2, cudaMemcpyHostToDevice, STREAM));
-      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(stage, xn, n * C);
+      const B16* src = stack + p0 * C;
+      if (!kept) { CK(cudaMemcpyAsync(stage, reinterpret_cast<const B16*>(PARK_HOST) + p0 * C, n * C * 2, cudaMemcpyHostToDevice, STREAM)); src = stage; }
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(src, xn, n * C);
       layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
       confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
       outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
         (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), p0, n, T, C);
-      CK(cudaMemcpyAsync(resid + p0 * C, zc, n * C * 4, cudaMemcpyDeviceToHost, STREAM));
       ef2ToBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zc, stack + p0 * C, n * C);
     }
     releaseScratch({ "cf.zc", "cf.xn", "cf.prodc", "cf.z16" });
+    B16* resid = kept ? dallocT<B16>(P * C) : reinterpret_cast<B16*>(PARK_HOST);
+    CK(cudaMemcpyAsync(resid, stack, P * C * 2, cudaMemcpyDefault, STREAM));
     float* mask = scratch<float>("trunk.mask", P);
     fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
     PAIR16 = true;
@@ -204,9 +203,12 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     paeL16 = scratch<float>("cf.pae", P * pb);
     zc = scratch<float>("cf.zc", per * C); xn = scratch<float>("cf.xn", per * C);
     float* score = scratch<float>("cf.scoreRows", per);
+    B16* rh = kept ? nullptr : scratch<B16>("cf.residRows", per * C);
     for (size_t p0 = 0; p0 < P; p0 += per) {
       size_t n = std::min(per, P - p0);
-      CK(cudaMemcpyAsync(xn, resid + p0 * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
+      const B16* rs = resid + p0 * C;
+      if (rh) { CK(cudaMemcpyAsync(rh, rs, n * C * 2, cudaMemcpyHostToDevice, STREAM)); rs = rh; }
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(rs, xn, n * C);
       ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(stack + p0 * C, zc, n * C);
       addK<<<blocks(n * C), 256, 0, STREAM>>>(zc, xn, n * C);
       gemm(zc, F("confidence/poolingAttention"), score, n, C, 1);
@@ -216,8 +218,10 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
         gemm(xn, F("confidence/pae"), paeL16 + p0 * pb, n, C, pb);
       } else gemm(zc, F("confidence/pae"), paeL16 + p0 * pb, n, C, pb);
     }
-    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(stack));
-    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows" });
+    CK(cudaStreamSynchronize(STREAM));
+    if (kept) CK(cudaFree(resid));              // (a kept pair is the caller's, freed with z)
+    else CK(cudaFree(stack));
+    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.residRows" });
   }
   float* z = !zTrunk ? nullptr : inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
   if (zTrunk) {

@@ -345,7 +345,13 @@ static int foldInput(const Opts& o, bool warm) {
   // (a bf16 trunk pair waits in host memory through the sampler, which never reads it: the confidence head takes it
   // back, widened)
   if (EF2_ZS) { parkShareEf2(T, C); z = nullptr; }      // (each rank its share, in its own host memory)
-  else if (EF2_Z16) { parkToHost(z, (size_t)T * T * C * 2); }
+  else if (EF2_Z16) {
+    // (kept on the device where there is the room for it and five pairs more beside it - the head's residual and its
+    // triangle's operands, gate and product - else parked: pinning 4.5 GB was 3.1 s of a 2,964-token fold on 40 GB)
+    EF2_Z16_DEV = nullptr;
+    if (!BIG_FORCED && roomFor(5 * (size_t)T * T * C * 2)) EF2_Z16_DEV = reinterpret_cast<__nv_bfloat16*>(z);
+    else parkToHost(z, (size_t)T * T * C * 2);
+  }
   mem("denoiser built");
   if (check && M.has("o/step0/x_noisy")) {
     float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
@@ -424,6 +430,7 @@ static int foldInput(const Opts& o, bool warm) {
   } else {
     if (EF2_Z16) releaseScratch();              // (the head reads the parked bf16 pair itself: zTrunk null)
     conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
+    EF2_Z16_DEV = nullptr;
   }
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
