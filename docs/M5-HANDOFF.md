@@ -858,3 +858,18 @@ outliers. What remains, all bandwidth or scalar work:
   215 at 255). Emitted per chunk: the norms 222 -> 84 ms a profiled pass and transition2 ~333 -> 316, but the trunk's
   wall time level (10.2 / 10.7 / 11.0 against 10.4 / 10.6 / 11.1 s, two passes at 510 tokens, alternated). Not
   committed - the third time this session an emitted norm cost what the pass it replaced did.
+
+## From the M2, on e0d67b7a (half product, no tiered bounds, token tile)
+
+- **Gate baselines are one file a chip now** (`metal/gate_baseline.py`: `metal/<port>/gate-baseline.<chip>.json`).
+  3f4ab2c0 re-recorded the kitchen sink at the M5's 74.50 / 0.7347 in the shared file, and the M2's gate read MOVED
+  on a fold it had not changed (75.37 / 0.7527, as on every M2 run). The M5's numbers are in
+  `metal/af3/gate-baseline.m5.json`; AF2 and ESMFold2 have no M5 file yet, so the M5 is held to the M2's there and
+  told so - `--write` on the M5 records its own.
+- **3f4ab2c0 does not reach the M2**: the half product is on only where `matrixUnits()` is. All 29 gates pass on the
+  M2 against its own baselines; native times level.
+- **f06bace9 (no tiered loop bounds on Apple) holds on the M2, and more**: first folds in stock Chrome, a fresh
+  profile each, alternated with 063c28d9's tree: AF3 6MRR 4.13 / 3.97 -> 1.89 / 1.97 s, 5CAJ 18.80 / 19.32 -> 11.45 /
+  11.46 s (25 steps). pLDDT 85.755 -> 85.769 on 6MRR.
+- **a72f2da9's token tile is level on the M2** (5CAJ, two folds a run, two rounds: 11.41 / 11.47 and 13.00 / 13.12
+  with it against 13.03 / 11.52 and 12.59 / 13.56 derived): kept.
