@@ -57,13 +57,16 @@ inline std::string runCapture(const std::string& command, int& status) {
 
 struct Response { int status = 0; std::string body; };
 
-// one HTTP request through curl: the body, and the status it came back with (0 when it never connected)
+// one HTTP request through curl: the body, and the status it came back with (0 when it never connected, or when curl
+// did not finish: a truncated body is not a body). No overall time cap: a long chain's result is ~100 MB and the server
+// sends it slowly enough that a 600 s cap cut bacillaene's chain 5 short twice (2026-10-13); a stall (under 1 KB/s for
+// two minutes) is what ends a request instead
 inline Response httpOnce(const std::string& url, const std::vector<std::pair<std::string, std::string>>* form) {
   char tmpl[] = "/tmp/localfold-http-XXXXXX";
   int fd = mkstemp(tmpl);
   if (fd < 0) throw std::runtime_error("cannot make a temporary file");
   close(fd);
-  std::string command = "curl -s -L" + CURL_AGENT + " --max-time 600 -o " + shellQuote(tmpl) + " -w '%{http_code}'";
+  std::string command = "curl -s -L" + CURL_AGENT + " --connect-timeout 60 --speed-limit 1024 --speed-time 120 -o " + shellQuote(tmpl) + " -w '%{http_code}'";
   if (form) {
     command += " -H 'Content-Type: application/x-www-form-urlencoded;charset=UTF-8'";
     for (auto& [k, v] : *form) command += " --data-urlencode " + shellQuote(k + "=" + v);
@@ -72,7 +75,7 @@ inline Response httpOnce(const std::string& url, const std::vector<std::pair<std
   int status = 0;
   std::string code = runCapture(command, status);
   Response r;
-  r.status = std::atoi(code.c_str());
+  r.status = status == 0 ? std::atoi(code.c_str()) : 0;
   r.body = readFile(tmpl);
   std::remove(tmpl);
   return r;
