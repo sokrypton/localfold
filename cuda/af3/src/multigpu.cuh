@@ -216,8 +216,13 @@ inline void segmentReport(const char* at) {
   size_t pooled = 0; for (auto& s : sharedPool()) pooled += s.bytes;
   size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
   size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
-  fprintf(stderr, "  segments %-24s %d holding named buffers %.2f GB, %d idle %.2f GB; the pool %.2f GB | device in use %.2f, scratch %.2f\n",
-          at, nl, live / 1e9, ni, idle / 1e9, pooled / 1e9, (t - f) / 1e9, held / 1e9);
+  std::string named;       // (the named buffers themselves, largest first: what a rank short of room holds)
+  std::vector<std::pair<size_t, std::string>> by;
+  for (auto& [k, v] : sharedBuffers()) by.push_back({v.bytes, k});
+  std::sort(by.rbegin(), by.rend());
+  for (auto& [b, k] : by) if (b >= 100000000) { char x[96]; snprintf(x, sizeof x, " %s %.2f", k.c_str(), b / 1e9); named += x; }
+  fprintf(stderr, "  segments %-24s %d holding named buffers %.2f GB, %d idle %.2f GB; the pool %.2f GB | device in use %.2f, scratch %.2f |%s\n",
+          at, nl, live / 1e9, ni, idle / 1e9, pooled / 1e9, (t - f) / 1e9, held / 1e9, named.c_str());
 }
 // Host memory every rank maps (collective): a /dev/shm file the size of `bytes`, for results only rank 0 reads (several
 // samples' confidence heads, each on its own rank) - through host memory, not the GPUs' links
