@@ -59,6 +59,10 @@ static int foldMain(int argc, char** argv) {
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
   // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
   SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
+  // the trunk's modules' large scratch shared between them (common.cuh, SHARED SCRATCH): every family below proved by a
+  // scribbled fold bit-identical to the unshared one - one GPU and sharded, the big-input paths, boltz2, MSA, template
+  SHARED_FAMILIES = { "tri.", "grid.", "tr.", "msaatt.", "opm.", "st.", "emb.", "p16.", "tmpl." };
+  SHARED_NESTED = { { "tmpl.", "tri." }, { "tmpl.", "grid." }, { "tmpl.", "tr." }, { "tmpl.", "p16." }, { "emb.", "p16." } };
   // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
   // measure the two on a device - the fused ones are each a block's worth of shared memory)
   if (const char* u = getenv("LOCALFOLD_UNFUSED")) {
