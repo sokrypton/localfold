@@ -135,14 +135,7 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
   ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  // the pad, written once for a buffer and a padded size (nothing else writes it - but a buffer reused at
-  // another size has data where this layout's pad is)
-  // (and a buffer given back and asked for again can return at the same address with another stage's data in it)
-  static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
-  if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
-    CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-    zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
-  }
+  zeroPlanePad(a, L, Lp, C); zeroPlanePad(b, L, Lp, C);   // (the pad: at every use, common.cuh)
   triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
   float* prod = scratch<float>("ftri.prod", plane * C);
   const float one = 1.f, zero = 0.f;

@@ -676,6 +676,23 @@ static int foldMain(int argc, char** argv) {
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;
+  // --fast (every fold the standalone and the worker run): the modules' large scratch shared between them (af3/src/
+  // common.cuh, SHARED SCRATCH), proved by scribbled folds bit-identical to the unshared build - 2,000 residues, a
+  // 1,000:1,000 multimer, a 1,462-residue monomer and a 1,762-residue multimer with templates, and the shorter arms.
+  // A family live around another's turns never shares with it, each pair a fold that moved: the template stacks (tmpl.,
+  // mtmpl.) around everything their blocks run, the heads around the structure module's, row and column attention and
+  // the attention bias around the attention kernel's. (The MSA masks, written once at the embedding and read by every
+  // block, are mask.* and not shared.) The reference path (no --fast) shares nothing: unproved
+  if (FAST) {
+    SHARED_FAMILIES = { "sm.", "ftri.", "emb.", "tri.", "head.", "fatt.", "opm.", "gcol.", "fopm.", "tmpl.", "tatt.", "row.", "att.",
+                        "fbias.", "col.", "mtmpl.", "tr.", "trib.", "ftatt.", "trow.", "fcol.", "fa.", "ftr.", "frow.", "p16." };
+    for (const char* outer : { "tmpl.", "mtmpl." })
+      for (const char* inner : { "tatt.", "p16.", "fatt.", "ftri.", "fbias.", "ftatt.", "ftr." }) SHARED_NESTED.push_back({ outer, inner });
+    for (auto& p : std::vector<std::pair<std::string, std::string>>{ { "head.", "sm." }, { "fcol.", "fatt." }, { "frow.", "fatt." },
+                                                                       { "fbias.", "fatt." }, { "frow.", "fbias." }, { "ftatt.", "fatt." },
+                                                                       { "tatt.", "ftatt." }, { "ftatt.", "fbias." } })
+      SHARED_NESTED.push_back(p);
+  }
   CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
   M.upload(0);
   if (const char* dump = getenv("AF2_DUMP_WEIGHT")) {      // name:path - one weight as the device holds it

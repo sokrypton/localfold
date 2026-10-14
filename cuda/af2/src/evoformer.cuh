@@ -215,7 +215,7 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
   // the masks into fixed buffers: the stacks after this are replayed as one CUDA graph from pass 1 on,
   // and a graph's pointers do not change between passes
-  float* mm = scratch<float>("emb.msaMask", (size_t)(N + t.T) * L); float* em = scratch<float>("emb.extraMask", erows);
+  float* mm = scratch<float>("mask.msa", (size_t)(N + t.T) * L); float* em = scratch<float>("mask.extra", erows);
   CK(cudaMemcpyAsync(mm, W(f + "msa_mask"), (size_t)N * L * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
   t.msaMask = mm; t.extraMask = em;
@@ -915,16 +915,10 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriW w = triWeights(T, blk, C);
     half* xn = scratch<half>("ftri.xn", pairs * C);
     layerNormH(pair, xn, pairs, C, T + "/left_norm_input", blk);
-    // planes [Lp][Lp], the pad rows and columns zero (written once: nothing else writes them)
+    // planes [Lp][Lp], the pad rows and columns zero (zeroPlanePad: at every use, the buffers' bytes being shared)
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-    // (again whenever the layout, either buffer or a scratch give-back changes: one returned at the same address can
-    // hold another stage's data where this layout's pad is)
-    static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
-    if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
-      CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-      zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
-    }
+    zeroPlanePad(a, L, Lp, C); zeroPlanePad(b, L, Lp, C);
     // the five projections in row chunks of ~128 MB (whole, [pairs, 5C] was 0.78 GB at 783 residues):
     // a and b gated into their planes, the output gate kept [pairs, C] for the end
     size_t chunk = std::min(pairs, std::max<size_t>(32768, ((size_t)128 << 20) / (10 * (size_t)C)));

@@ -1173,8 +1173,9 @@ inline bool shortPair(size_t pairs, int C) {
 }
 // the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a
 // prefix ("tmpl."), any other is exact ("tri.a", which must not take "tri.abf" with it)
-// (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>": naming it names its slot, which a
-// release then frees whole; its other families' turns are over, and a family enclosing this one never shares it)
+// (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>": a slot is freed when the release names
+// EVERY buffer it holds - one buffer named of several, the others may still be in a CUDA graph a later pass replays,
+// AF2's stacks from pass 1 on: an illegal address)
 inline std::map<std::string, int> SHARED_SLOT;                 // a buffer's name -> its slot
 inline bool scratchNameMatches(const std::string& name, std::initializer_list<const char*> names) {
   for (const char* p : names) {
@@ -1189,8 +1190,9 @@ inline std::string heldAs(const std::string& name) {
 }
 inline void releaseScratch(std::initializer_list<const char*> names) {
   bool synced = false;
-  std::set<std::string> slots;
-  for (auto& [name, k] : SHARED_SLOT) if (scratchNameMatches(name, names)) slots.insert("slot." + std::to_string(k));
+  std::set<std::string> slots, kept;
+  for (auto& [name, k] : SHARED_SLOT) (scratchNameMatches(name, names) ? slots : kept).insert("slot." + std::to_string(k));
+  for (auto& k : kept) slots.erase(k);
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
     if (!scratchNameMatches(name, names) && !slots.count(name)) continue;
@@ -1322,7 +1324,7 @@ inline bool nested(const std::string& a, const std::string& b) {
   for (auto& [o, i] : SHARED_NESTED) if ((a == o && b == i) || (a == i && b == o)) return true;
   return false;
 }
-inline const size_t SHARED_MIN = (size_t)32 << 20;
+inline const size_t SHARED_MIN = getenv("LOCALFOLD_SHARED_MIN") ? (size_t)atoll(getenv("LOCALFOLD_SHARED_MIN")) : (size_t)32 << 20;   // (PROTOTYPE: a low floor proves what a long fold will share)
 inline std::vector<std::vector<std::string>> SLOT_FAMILIES;   // the families holding each slot
 inline std::vector<size_t> SLOT_MOST;                         // the most each slot has been asked for
 inline const char* sharedFamily(const std::string& name, size_t bytes) {
@@ -1358,6 +1360,15 @@ inline std::string sharedSlot(const std::string& name, const char* family, size_
   SLOT_MOST[k] = std::max(SLOT_MOST[k], bytes);
   return "slot." + std::to_string(k);
 }
+// the pad of C planes [Lp][Lp] past their L x L corner, zeroed at every use: a pad "written once" is another family's
+// data as soon as its bytes are shared (AF2's 700-residue multimer folded wrong on one), and two strided memsets cost
+// nothing beside the products they pad
+inline void zeroPlanePad(half* x, int L, int Lp, int C) {
+  if (Lp == L) return;
+  const size_t e = sizeof(half);
+  CK(cudaMemset2DAsync(x + L, (size_t)Lp * e, 0, (size_t)(Lp - L) * e, (size_t)C * Lp, STREAM));                // columns
+  CK(cudaMemset2DAsync(x + (size_t)L * Lp, (size_t)Lp * Lp * e, 0, (size_t)(Lp - L) * Lp * e, (size_t)C, STREAM)); // rows
+}
 inline const char* SCRIBBLE_LAST = nullptr;   // (one for every T: a static in the template was one per type)
 template <class T> T* scratch(const std::string& name, size_t n) {
   const char* family = sharedFamily(name, n * sizeof(T));
@@ -1368,7 +1379,10 @@ template <class T> T* scratch(const std::string& name, size_t n) {
   if (scribbling && family != last)
     for (auto& [k, v] : SCRATCH) {
       if (k.compare(0, 5, "slot.") || !v.first) continue;
-      bool open = false; for (auto& f : SLOT_FAMILIES[atoi(k.c_str() + 5)]) if (nested(f, family)) open = true;
+      // (a slot of a family nested with either side is live across this switch: nested families interleave - AF2's
+      // multimer template and template attention each survive the other's turns)
+      bool open = false;
+      for (auto& f : SLOT_FAMILIES[atoi(k.c_str() + 5)]) if (nested(f, family) || (last && nested(f, last))) open = true;
       if (!open) CK(cudaMemsetAsync(v.first, pattern, v.second, STREAM));
     }
   if (scribbling && getenv("LOCALFOLD_SCRIBBLE_LOG") && family != last) fprintf(stderr, "switch %s -> %s at %s (%s)\n", last ? last : "-", family, name.c_str(), sharedSlot(name, family, n * sizeof(T)).c_str());
