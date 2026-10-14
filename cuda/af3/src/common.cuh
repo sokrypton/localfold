@@ -1173,10 +1173,11 @@ inline bool shortPair(size_t pairs, int C) {
 }
 // the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a
 // prefix ("tmpl."), any other is exact ("tri.a", which must not take "tri.abf" with it)
-// (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>": a slot is freed when the release names
-// EVERY buffer it holds - one buffer named of several, the others may still be in a CUDA graph a later pass replays,
-// AF2's stacks from pass 1 on: an illegal address)
+// (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>", and naming it frees its slot; but a
+// slot handed out inside a graph capture is freed only when the release names EVERY buffer it holds: the others may be
+// in the graph a later pass replays - AF2's stacks from pass 1 on, an illegal address)
 inline std::map<std::string, int> SHARED_SLOT;                 // a buffer's name -> its slot
+inline std::set<int> SLOT_CAPTURED;                           // slots handed out while a stream captured
 inline bool scratchNameMatches(const std::string& name, std::initializer_list<const char*> names) {
   for (const char* p : names) {
     size_t len = strlen(p);
@@ -1191,7 +1192,10 @@ inline std::string heldAs(const std::string& name) {
 inline void releaseScratch(std::initializer_list<const char*> names) {
   bool synced = false;
   std::set<std::string> slots, kept;
-  for (auto& [name, k] : SHARED_SLOT) (scratchNameMatches(name, names) ? slots : kept).insert("slot." + std::to_string(k));
+  for (auto& [name, k] : SHARED_SLOT) {
+    if (scratchNameMatches(name, names)) slots.insert("slot." + std::to_string(k));
+    else if (SLOT_CAPTURED.count(k)) kept.insert("slot." + std::to_string(k));
+  }
   for (auto& k : kept) slots.erase(k);
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
@@ -1387,7 +1391,10 @@ template <class T> T* scratch(const std::string& name, size_t n) {
     }
   if (scribbling && getenv("LOCALFOLD_SCRIBBLE_LOG") && family != last) fprintf(stderr, "switch %s -> %s at %s (%s)\n", last ? last : "-", family, name.c_str(), sharedSlot(name, family, n * sizeof(T)).c_str());
   last = family;
-  return scratchNamed<T>(sharedSlot(name, family, n * sizeof(T)), n);
+  const std::string slot = sharedSlot(name, family, n * sizeof(T));
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) SLOT_CAPTURED.insert(SHARED_SLOT[name]);
+  return scratchNamed<T>(slot, n);
 }
 
 // The process's end once its outputs are written: flushed first. (std::exit, not _exit: _exit measured no
