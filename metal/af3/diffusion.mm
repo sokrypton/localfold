@@ -229,6 +229,10 @@ static void prepareTransformer(int n) {
   D.stride = round8(n);
   half* pn = scratch<half>("dt.pn", pairs * Cz);
   ln(D.pairCond, pn, pairs, Cz, T + ".pairInputLayerNormScale", "");
+  // (the pair conditioning's last reader: the encoder's and decoder's preparations ran before - given back before the
+  // biases are made, the diffusion's top stage: 1044 tokens 4.06 -> 3.50 GB)
+  releaseScratch({"dc.pair"});
+  D.pairCond = nullptr;
   float* flat = scratch<float>("dt.flat", pairs * D.perSuper * heads);
   D.bias.assign(D.nblocks, nullptr);
   for (int b = 0; b < D.nblocks; ++b) {

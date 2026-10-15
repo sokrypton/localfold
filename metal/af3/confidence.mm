@@ -51,7 +51,7 @@ static void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C,
   run1d("af3_apply_norm", rows * C, ApplyNormArgs{x, stat, rows * C});
 }
 
-ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
+ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   const std::string P = "confidence";
   int n = t.n, C = metaI(P + ".pairChannels"), Cs = metaI(P + ".singleChannels"), F = metaI(P + ".targetFeatWidth");
   int dense = metaI("batch.dense");
@@ -91,8 +91,41 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   }
   }
   int nb = 0; while (M.has(P + ".blocks." + num(nb) + ".singleChannels")) ++nb;
-  for (int k = 0; k < nb; ++k)
-    pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
+  // The blocks over a half pair, as the trunk's stack (trunk.mm runTrunk; LOCALFOLD_HALF_PAIR=0 the control): the f32
+  // pair given back while the pair track holds its scratch - the fold's top stage (1044 tokens 4.76 -> 4.48 GB).
+  // LOCALFOLD_CONF_HALF_PAIR=0: this head's control alone
+  static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
+                                 (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
+  if (halfWanted && matrixUnits() && C % 8 == 0) {
+    half* zh = scratch<half>("conf.zh", pairs * C);
+    toHalf(pair, zh, pairs * C);
+    releaseScratch({"conf.pair"});
+    // the trunk's pair, read no more here, parked in half where that is exact (it came out of the half stack) and
+    // made again for the next sample's head: 1044 tokens 4.48 -> 4.20 GB
+    half* parked = nullptr;
+    if (t.pairHalfExact) {
+      parked = scratch<half>("confTrunk.pair", pairs * t.C);
+      toHalf(t.pair, parked, pairs * t.C);
+      release(t.pair);
+      t.pair = nullptr;
+    }
+    for (int k = 0; k < nb; ++k)
+      pairformerBlock(zh, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
+    releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
+    pair = scratch<float>("conf.pair", pairs * C);
+    toFloat(zh, pair, pairs * C);
+    releaseScratch({"conf.zh"});
+    if (parked) {
+      t.pair = allocT<float>(pairs * t.C);
+      toFloat(parked, t.pair, pairs * t.C);
+      releaseScratch({"confTrunk."});
+    }
+  } else
+    for (int k = 0; k < nb; ++k)
+      pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
+  // the pair track's scratch given back before the heads' (it was the fold's peak: 1044 tokens 5.33 GB, its 2.5 beside
+  // the heads' norm and logits)
+  releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
   // the error bins: 64 up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);

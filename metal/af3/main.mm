@@ -124,11 +124,22 @@ ConfidenceOut structuralConfidence(const Structural& st, const float* coords, st
   return ck;
 }
 
+// the fit check's factors (bytes at the peak per byte of the f32 pair and of the f32 MSA), measured on the M5 at 522 and
+// 1044 tokens with four templates and with a 1024-row alignment: 6.15 and 2.7 where the stacks run half (matrix units),
+// 6.5 where they run float (an M2's path, measured with LOCALFOLD_GEMM_TENSOR=0) - each rounded up
+static const double AF3_MSA_FACTOR = 2.8, AF3_PAIR_SLOW = 6.7;
+static double af3PairFactor() { return matrixUnits() ? 6.3 : AF3_PAIR_SLOW; }
 int foldInput(const std::string& dir, Options o) {
   double t0 = now();
   M.loadInput(dir);
   setOutputInput(dir);
   int n = (int)M.meta("batch.tokens"), dense = metaI("batch.dense");
+  {   // the fit check (core.h foldFits): what is held now - the weights and the input - and the trunk's f32 pair and MSA,
+      // times factors measured at 522 and 1044 tokens (metal/README.md)
+    double pair = (double)n * n * metaI("trunk.embedder.pairChannels") * 4;
+    double msa = (double)std::min((int)M.meta("batch.sequences"), o.msaCap) * n * metaI("trunk.embedder.msaChannels") * 4;
+    if (!foldFits("af3", (double)allocated() + af3PairFactor() * pair + AF3_MSA_FACTOR * msa)) { M.unloadInput(); return 1; }
+  }
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");
   // the seeds: --seeds, else the job's modelSeeds, else the one seed
   std::vector<uint64_t> seeds;
@@ -343,6 +354,13 @@ int foldMain(int argc, char** argv) {
   if (!esmBundle.empty()) M.loadBlobResident(esmBundle, "e", "esm2/blocks/");   // (its matrices resident as int8 codes)
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");      // (chai-1's adaptive LayerNorm: its folded weights are built now)
   prepareWeights();
+  // the trunk's and the confidence head's families of scratch (core.h shareScratch): the MSA stack's attention and outer
+  // product are dead while the pair track runs, and the distogram's after it; the template stack and the confidence
+  // head hold theirs around the pair track's turns
+  shareScratch({{"pr.", "pair"}, {"grid.", "pair"}, {"tr.", "pair"}, {"st.", "pair"}, {"par.", "pair"}, {"msaatt.", "msa"},
+                {"opm.", "msa"}, {"gopm.", "msa"}, {"tmpl.", "tmpl"}, {"conf.", "conf"}, {"disto.", "disto"},
+                {"contact.", "disto"}, {"emb.", "emb"}},
+               {{"tmpl", "pair"}, {"conf", "pair"}});
   printf("weights: %.0f ms\n", ms(t0));
   if (getenv("AF3_MEM")) { mt::sync(); printf("memory: weights %.0f MB, allocated %.0f MB, live peak %.0f MB\n", M.weightBytes() / 1e6, allocated() / 1e6, peakLive() / 1e6); }
   if (waitInput) {      // the featuriser writes model.idx last (by a rename), or model.failed
@@ -376,6 +394,7 @@ int foldMain(int argc, char** argv) {
     return 0;
   }
   int code = foldInput(argv[1], o);
+  if (getenv("LOCALFOLD_METAL_STATS") || getenv("LOCALFOLD_PEAK")) printStats();
   if (detach) { printf("af3: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   return code;
 }

@@ -56,10 +56,17 @@ static void templateEmbedding(Trunk& t) {
   int passes = metaI("template.passes"), templates = metaI("template.templates");
   int width = (int)M.meta("template.featureWidth", 0);
   bool outer = flag("template.outerResidual");
-  half* qn = scratch<half>("tmpl.qn", pairs * Cq);
-  ln(t.pair, qn, pairs, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
+  // The stage's room, the trunk's highest after the MSA stack's (1044 tokens: 4.19 GB, five pair-sized tensors): the
+  // query's normalised input given back once it is projected, each pass's output normalised in place - 1.4 -> 0.84 GB
+  // of the stage's own (docs/CUDA-TO-METAL.md, 2). (The query held in half saved 0.14 GB more and moved AF3's kitchen
+  // sink 74.50 -> 75.24 pLDDT, past the gate's bar: float.)
   float* query = scratch<float>("tmpl.query", pairs * Ct);
-  lin(qn, P + (fused ? "zProjection" : "templatePairEmbedding8"), query, pairs, Cq, Ct);
+  {
+    half* qn = scratch<half>("tmpl.qn", pairs * Cq);
+    ln(t.pair, qn, pairs, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
+    lin(qn, P + (fused ? "zProjection" : "templatePairEmbedding8"), query, pairs, Cq, Ct);
+    releaseScratch({"tmpl.qn"});
+  }
   float* act = scratch<float>("tmpl.act", pairs * Ct);
   float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
   float* summed = scratch<float>("tmpl.summed", pairs * Ct);
@@ -98,11 +105,10 @@ static void templateEmbedding(Trunk& t) {
     if (outer) copy(before, act, pairs * Ct * 4);
     for (int b = 0; b < nb; ++b) pairUpdates(act, t.masks, n, Ct, P + "blocks." + num(b));
     if (outer) add(act, before, pairs * Ct);
-    float* actn = scratch<float>("tmpl.actn", pairs * Ct);
-    ln(act, actn, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
+    ln(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");     // (a row read whole before it is written)
     if (flag("trunk.dialect.chaiTemplates") && M.has(S + "pseudoBetaMask2d"))      // chai: masked by its own coverage
-      scaleRows(actn, M.f(S + "pseudoBetaMask2d"), pairs, Ct, pairs);
-    add(summed, actn, pairs * Ct, repeat);
+      scaleRows(act, M.f(S + "pseudoBetaMask2d"), pairs, Ct, pairs);
+    add(summed, act, pairs * Ct, repeat);
   }
   scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);     // divided by every slot (not the real ones), relu
   lin(summed, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
@@ -352,7 +358,8 @@ void runTrunk(Trunk& t) {
   for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k);
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
-  releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa"});
+  // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
+  releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
   // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Where the matrix units run (their
@@ -360,13 +367,22 @@ void runTrunk(Trunk& t) {
   // values. LOCALFOLD_HALF_PAIR=0 the control.
   // (Pair values seen: up to ~13000 - openbind0 - against half's 65504; the stores saturate rather than overflow.)
   static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  // (the f32 pair given back while the stack runs on the half one, and made again once the pair track's scratch is:
+  // the trunk's top stage, 1044 tokens 4.30 -> 3.74 GB)
+  t.pairHalfExact = false;
   if (halfWanted && matrixUnits() && t.C % 8 == 0) {
-    half* zh = scratch<half>("pr.zh", pairs * t.C);
+    half* zh = scratch<half>("trunk.zh", pairs * t.C);
     toHalf(t.pair, zh, pairs * t.C);
+    release(t.pair);
+    t.pair = nullptr;
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(zh, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
+    releaseScratch({"pr.", "grid.", "tr.", "st."});
+    t.pair = allocT<float>(pairs * t.C);
     toFloat(zh, t.pair, pairs * t.C);
+    releaseScratch({"trunk.zh"});
+    t.pairHalfExact = true;
   } else
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,

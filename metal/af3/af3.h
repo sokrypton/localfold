@@ -107,6 +107,7 @@ struct Trunk {
   float *pair, *single, *msa, *targetFeat, *pairMask, *seqMask, *msaMask, *deletion;
   int* msaRows;
   float* prevSingle;                      // (the pair recycles in place)
+  bool pairHalfExact = false;             // the last pass's pair came out of the half stack: exact in half
   Masks masks;
   int pass = 0;
 };
@@ -176,7 +177,7 @@ void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync b
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
-ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta);
+ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta);
 
 // ---------------------------------------------------------------- OpenDDE's structural tokens (structural.mm)
 struct Structural { int n; float *single, *pair, *targetFeat, *bias, *seqMask, *pairMask; Masks masks; };
