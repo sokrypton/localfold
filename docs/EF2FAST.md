@@ -4081,3 +4081,38 @@ cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-to
 from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
 upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
 `biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
+
+## The sampler's exponential update and geometric schedule (2026-10-15)
+
+ESMFold2's sampler takes the options AlphaFold 3's does (docs/AF3.md, "The diffusion's discretisation after Blitz"):
+`--update=exponential`, `--schedule=geometric` and `--no-churn` on cuda/ef2 and `tools/gpu/fold-esmfold2.js`, and
+`schedule` / `update` / `churn` in `foldEsmfold2`'s `samplerOverrides` (cpu/esmfold2/sampler.js, pinned by
+test/diffusion-update.test.js). Default folds are byte-identical. 🔴 **The geometric schedule changes the number of
+steps run**: max_sigma's cap drops two of its levels where it drops four of Karras's, so 15 scheduled run 13, not 11.
+Compare arms by the steps RUN (the binary's `(N steps)`), never by `--steps`.
+
+Measured over the 600M and 300M models by seven systems (protein, +GOL, +ATP, +SEP, RNA, DNA, protein+DNA), two seeds,
+bond RMS against the CCD (ligand = GOL, ATP, SEP; six cells):
+
+| arm (scheduled, run) | ligand median / mean | ligand cells > 0.15 A | protein + nucleic median (max) |
+|---|---:|---:|---:|
+| 8 Euler (6) | 60 / 62 (not a chain) | 6/6 | 65 A |
+| 8 geometric + exponential (7) | 0.42 / 0.46 | 6/6 | 0.067 (0.096) |
+| 15 Euler (11) - the default | 0.154 / 0.171 | 5/6 | 0.066 (0.076) |
+| 15 geometric + exponential (13) | 0.110 / 0.124 | 2/6 | 0.061 (0.080) |
+| 25 Euler (18) | 0.103 / 0.107 | 1/6 | 0.057 (0.066) |
+| 25 geometric + exponential (21) | 0.068 / 0.085 | 1/6 | 0.058 (0.068) |
+| 45 Euler (32) - ligand jobs on the page | 0.058 / 0.067 | 0/6 | 0.058 (0.063) |
+| 45 geometric + exponential (38) | 0.056 / 0.067 | 0/6 | 0.057 (0.062) |
+| 138 Euler (96) | 0.052 / 0.048 | 0/6 | 0.057 (0.061) |
+
+Crystals (CA RMSD, five seeds): 15 Euler (11 run) is already level with 138 (96) on all ten model/target cells - 6MRR,
+1QYS, 5K9P, 5CAJ and 1TIM on both models, e.g. 600M 1TIM 1.216 against 1.222 - and so are 15 geometric + exponential
+and 8 with either option (6-7 run): 600M 1TIM 1.183, 300M 1QYS 1.213.
+
+**No default changes, and why.** Unlike AlphaFold 3, ESMFold2's default is not in Euler's broken range: max_sigma's cap
+removes the four largest jumps, so 11 steps already fold at 96 steps' accuracy. What the options buy is ligand
+geometry at a given scheduled count, at the price of two to six more steps run, and per denoiser call that is level
+with Euler at more steps (15 geometric + exponential at 13 run, 0.110; 25 Euler at 18 run, 0.103). They do not let a
+ligand job run fewer steps: at 25 scheduled 300M's glycerol is 0.199 A. And 7 steps fold the backbone but leave
+side-chain bonds at 0.09-0.13 A against 0.06 at 11, to save four of a fold's ~1 s of denoiser calls.

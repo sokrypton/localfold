@@ -25,7 +25,10 @@
  * sixteen. A port that runs the requested count is running a different
  * schedule; the number of steps is an OUTPUT of this function, not an input.
  */
-export function noiseSchedule({ steps, sMax, sMin, p, sigmaData, maxSigma }) {
+export function noiseSchedule({ steps, sMax, sMin, p, sigmaData, maxSigma, schedule = "karras" }) {
+  // `schedule: "geometric"` spaces the levels evenly in log sigma (Blitz's; cuda/ef2/src/sampler.cuh has the same),
+  // the zero and the max_sigma cap kept - which drops a different number of levels, so 15 scheduled run 13, not 11
+  if (schedule !== "karras" && schedule !== "geometric") throw new Error(`schedule ${schedule}: karras or geometric`);
   const values = [];
   if (steps === 1) {
     values.push(sMax * sigmaData, 0);
@@ -34,7 +37,9 @@ export function noiseSchedule({ steps, sMax, sMin, p, sigmaData, maxSigma }) {
     const high = Math.pow(sMax, inverse);
     const low = Math.pow(sMin, inverse);
     for (let k = 0; k < steps; k += 1) {
-      values.push(sigmaData * Math.pow(high + (k / (steps - 1)) * (low - high), p));
+      values.push(schedule === "geometric"
+        ? sigmaData * Math.exp(Math.log(sMax) + (k / (steps - 1)) * (Math.log(sMin) - Math.log(sMax)))
+        : sigmaData * Math.pow(high + (k / (steps - 1)) * (low - high), p));
     }
     values.push(0);
   }
@@ -270,10 +275,13 @@ export function weightedRigidAlign(x, target, weights, atoms) {
  * other way round is the same Kabsch call with its arguments swapped and it
  * walks the structure away from the answer.
  */
-export function samplerStep(noisy, denoised, weights, atoms, tHat, sigmaT, stepScale) {
+export function samplerStep(noisy, denoised, weights, atoms, tHat, sigmaT, stepScale, update = "euler") {
+  if (update !== "euler" && update !== "exponential") throw new Error(`update ${update}: euler or exponential`);
   const aligned = weightedRigidAlign(noisy, denoised, weights, atoms);
   const out = new Float32Array(aligned.length);
-  const factor = stepScale * (sigmaT - tHat) / tHat;
+  // `update: "exponential"`: x = r^S x_noisy + (1 - r^S) d with r = sigma_t / t_hat, which is this same line at
+  // factor r^S - 1 (cpu/af3/diffusion/diffusion-sampler.js says why Euler's overshoots at a large step)
+  const factor = update === "exponential" ? Math.pow(sigmaT / tHat, stepScale) - 1 : stepScale * (sigmaT - tHat) / tHat;
   for (let i = 0; i < out.length; i += 1) {
     out[i] = aligned[i] + factor * (aligned[i] - denoised[i]);
   }

@@ -484,6 +484,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-fused256")) FUSED256 = false;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--steps=", 8)) { sampler.steps = atoi(argv[i] + 8); stepsGiven = true; }
+    else if (samplerFlag(argv[i], sampler)) {}                         // --schedule=, --update=, --no-churn (sampler.cuh)
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
     else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
       int w = atoi(argv[i] + 16);
@@ -568,6 +569,7 @@ static int foldMain(int argc, char** argv) {
         if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
         else if (!f.compare(0, 7, "--seed=")) j.seed = strtoull(f.c_str() + 7, nullptr, 10);
         else if (!f.compare(0, 8, "--steps=")) { j.sampler.steps = atoi(f.c_str() + 8); j.stepsGiven = true; }
+        else if (samplerFlag(f.c_str(), j.sampler)) {}
         else if (!f.compare(0, 9, "--frames=")) FRAMES_DIR = f.substr(9);
       }
       int seg = (int)M.segs.size();

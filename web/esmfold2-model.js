@@ -126,6 +126,7 @@ export function actualSteps(preset) {
   const schedule = noiseSchedule({
     steps: settings.steps, sMax: settings.sMax, sMin: settings.sMin,
     p: settings.p, sigmaData: settings.sigmaData, maxSigma: settings.maxSigma,
+    schedule: settings.schedule,
   });
   return noiseLevels(schedule,
     churnFactors(schedule, settings.gammaMin, settings.gamma0)).length;
