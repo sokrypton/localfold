@@ -1039,6 +1039,12 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
 - **Grid attention without bounds checks** (inputs padded so loads past n read finite values):
   7.22 against 6.89 ms - at 125 registers the kernel is one register from losing a block an SM.
 
+- **The denoiser's 48-wide attention on `flashGrid2R`** (2026-10-15, `--bench-ops`, one transformer block, no mask as a
+  fold runs it): slower at every size - 68 tokens 9.5-11.2 against the split kernel's 5.2 us, 261 16.6 against 11.0, 600
+  36.8 against 25.9, 1,000 110 against 54, 261 x 5 samples 35.3 against 22.9 - its two query tiles a warp hold twice
+  the 48-wide accumulators (the 16- and 32-wide heads are why it exists). And the shipped warps/key-tile rule is within
+  10% of the best arm at one sample (600: 27.5 against 8 warps' 25.9; 1,000: 59.5 against 4 warps' 53.8) - the
+  attention is ~17% of a step, so a sharper rule is 1-2% of the diffusion and not taken.
 - **Five more forms of the grid attention's flash kernel** (`flashGrid2K`-`6K`, 2026-10-03, against the
   shipped `flashGridHalf<32, 4>` on random grids of 4 heads of 32, arms interleaved): QT query subtiles
   a warp over a ring of K/V/bias stages with one barrier a tile; rows of warps sharing one bias tile;
