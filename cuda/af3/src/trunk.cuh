@@ -222,11 +222,18 @@ inline float* pairBase(const Trunk& t) {
 // the fold's floor is the trunk's bf16 pair beside the blocked triangle's f16 operand: PAIR16_FIT_TIMES of the f32
 // pair, measured (below)
 constexpr double PAIR16_FIT_TIMES = 1.15;
+// ...and where the blocked triangle runs fused in bf16 (triangleBlockedFused - not the FP8 TN form of an Ada or Blackwell
+// card, nor the unfused one of a T4): its b in bands at the limit, the diffusion's biases a block at a time and the
+// template stack's pair parked before its activation, the floor is the diffusion preparation's: the f16 pair, the atom
+// encoder's pair conditioning and a block's biases, ~430 bytes a pair - 0.86 of the f32 pair, measured on a 40 GB A100:
+// 9,200 tokens fold (~7,900 before), 9,550 ran out there by 0.2 GB (at 0.80 the check had admitted it)
+constexpr double PAIR16_BANDED_FIT_TIMES = 0.86;
 inline bool foldFits(int n, int C, bool stays16 = false, bool quiet = false) {
   if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
-  double perPair = C * 4 * (stays16 ? PAIR16_FIT_TIMES : 1.8);
+  const bool banded = blockedFused(n, C) && !(C <= 256 && fp8Tensor());
+  double perPair = C * 4 * (stays16 ? (banded ? PAIR16_BANDED_FIT_TIMES : PAIR16_FIT_TIMES) : 1.8);
   size_t need = (size_t)((double)n * n * perPair) + t / 20;
   if (need <= f) return true;
   int most = f > t / 20 ? (int)std::sqrt((double)(f - t / 20) / perPair) : 0;
@@ -560,6 +567,9 @@ __global__ void templateGeometryK(float* act, const int* bin, const float* pb, c
 // (protenix2, boltz2, rf3) - its feature columns projected; then the stack's blocks (wrapped in a
 // residual under boltz2), the output LayerNorm, summed with the pass's repeat weight; the sum
 // divided by every slot, relu, projected.
+__global__ void tmplToHalfK(const float* x, half* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]);
+}
 __global__ void scaleK(float* x, float s, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = s * x[i];
 }
@@ -609,10 +619,20 @@ void templateEmbedding(Trunk& t, float* out) {
   bool tight = shortPair(allPairs, Cq);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / Cq)) : pairs;
   T* ln = scratch<T>("tmpl.ln", per * Cq);
+  // one pass that counts (no templates, or one): its normalised activation IS the sum, scaled in place by
+  // its repeat - the same products in the same order as adding it to a zeroed sum, without the sum
+  int live = 0; for (int k = 0; k < passes; ++k) live += M.meta("template." + std::to_string(k) + ".repeat") != 0.;
+  // with one pass the trunk's pair is read before the stack (the query) and after it (the output) and not in between: on
+  // a card short of room it waits in host memory while the stack runs - parked BEFORE the activation is made, the query
+  // read from the parked copy (pinned, a kernel reads it over the bus, once): made beside the pair, the f32 activation
+  // was the card's limit (9,200 tokens on 40 GB: 21.7 GB of it beside the 21.7 GB pair)
+  const bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt(pairs * (size_t)(Cq + Ct) * 4);
+  if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
+  const float* pairSrc = parked ? PARK_HOST : t.pair;
   auto queryInto = [&](float* dst) {
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
+      layerNormPairRows<T>(pairSrc, t.p16, r0, ln, r, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
       linear<T, float>(ln, dst + r0 * Ct, r, Cq, Ct, P + (fused ? "zProjection" : "templatePairEmbedding8"));
     }
   };
@@ -627,10 +647,8 @@ void templateEmbedding(Trunk& t, float* out) {
   float* act = sharded(t) ? (float*)actS->local : scratch<float>("tmpl.act", pairs * Ct);
   float* actBase = act - hf * Ct;                 // (indexed by global pair)
   float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
-  // one pass that counts (no templates, or one): its normalised activation IS the sum, scaled in place by
-  // its repeat - the same products in the same order as adding it to a zeroed sum, without the sum
-  int live = 0; for (int k = 0; k < passes; ++k) live += M.meta("template." + std::to_string(k) + ".repeat") != 0.;
   float* summed = live == 1 ? act : scratch<float>("tmpl.summed", pairs * Ct);
+  half* summed16 = nullptr;          // (parked: the sum in f16, made before the pair comes home)
   if (live != 1) CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
   float* row = scratch<float>("tmpl.row", (size_t)n * Ct); float* col = scratch<float>("tmpl.col", (size_t)n * Ct);
@@ -672,10 +690,6 @@ void templateEmbedding(Trunk& t, float* out) {
     // chai-1's fused projection's bias, once on the stack's input (af3-any-model FUSED_TEMPLATE_FEATURE_BIAS)
     if (hasW(P + "templateFeatureBias")) addBiasK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, W(P + "templateFeatureBias"), pairs, Ct);
     if (outer) CK(cudaMemcpyAsync(before, act, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
-    // with one pass the trunk's pair is read before the stack (the query) and after it (the output) and
-    // not in between: on a card short of room it waits in host memory while the stack runs
-    bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt(pairs * Cq * 4);
-    if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
     // (and a sharded rank's share: the stack holds three 64-channel f32 shares and the triangle's operand share beside
     // it - 12,350 tokens on 4 ran out here)
     const bool shareParked = live == 1 && tight && out == t.pair && sharded(t);
@@ -698,7 +712,16 @@ void templateEmbedding(Trunk& t, float* out) {
       scaleRowsK<float><<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "pseudoBetaMask2d") + hf, pairs, Ct);
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
-    if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair; }
+    if (parked) {
+      releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
+      // the activation (one pass: the sum itself) relu'd, divided and taken to f16 before the pair comes home - beside the
+      // pair the f32 activation was the card's limit (512 bytes a pair at 7,800 tokens), the f16 one 384
+      reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
+      summed16 = scratch<half>("tmpl.sum16", pairs * Ct);
+      tmplToHalfK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, summed16, pairs * Ct);
+      releaseScratch({ "tmpl.act" }); act = summed = nullptr;
+      unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair;
+    }
     if (shareParked) {    // (the stack's z^T and triangle shares first - only its activation is read from here: 16 GB of
                           //  them beside the share coming home was 0.1 GB too many a rank at 12,350 tokens on 4)
       releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
@@ -706,9 +729,12 @@ void templateEmbedding(Trunk& t, float* out) {
       unparkShare(t); out = t.pair;
     }
   }
-  // divided by every slot (not the real ones), relu, projected
-  reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
-  linearIntoPair<float>(summed, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
+  // divided by every slot (not the real ones), relu, projected (parked: already, and from f16)
+  if (summed16) linearIntoPair<half>(summed16, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
+  else {
+    reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
+    linearIntoPair<float>(summed, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
+  }
   if (tight) releaseScratch({ "p16." });     // (not held into the next pass's template stack, which binds there)
   if (giveBack) { mg::release({ "sh.tz", "sh.bg", "sh.biasg" }); if (zTBytes) t.zTS = &mg::shared("sh.zT", zTBytes); }
 }

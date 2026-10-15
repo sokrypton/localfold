@@ -533,6 +533,9 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
   releaseScratch({ "trib." });
   if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 16);
 }
+__global__ void bandsToBf16K(const float* x, __nv_bfloat16* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2bfloat16(x[i]);
+}
 inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                                  bool divideByLength, int np) {
   static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
@@ -544,17 +547,43 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   std::string pg = projectionGate(pre, C);
   half* wt = scratch<half>("trib.wt", triInTileHalves(C));
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
-  B16* b = scratch<B16>("trib.bbf", cs * C);
+  // b whole where it fits beside the pair - or, at the card's limit (b is the pair's size: 8,600 tokens on 40 GB missed by
+  // 50 MB), in BANDS of the contracted index k, every band of every block made afresh from the pair and its product added
+  // into the block's (a band's b is all of j and kb of k; the pair is read once a block more, a 1/n share of the GEMM's
+  // arithmetic a band - the bands' sums rounded into the bf16 product one at a time)
+  int bands = 1;
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    auto it = SCRATCH.find("trib.bbf"); if (it != SCRATCH.end()) f += it->second.second;
+    const size_t block = (size_t)64 * np * C * 6;               // (beside b: a block of 64 rows, the least worth running)
+    while (bands < 64 && cs * C * 2 / bands + block + t / 16 > f) bands *= 2;
+    // ...and banded, as many bands as make the fewest blocks: every block makes every band - all of b - whatever their
+    // size, so a narrower band only leaves more room for wider blocks (9,200 tokens: 2 bands left 280-row blocks, 33 of
+    // them a triangle; the trunk 1,014 s)
+    if (bands > 1) {
+      auto blocksFor = [&](int bd) {
+        const size_t band = (size_t)np * ((np / bd + 7) / 8 * 8) * C * 2, spare = f > band + t / 16 ? f - band - t / 16 : 0;
+        const size_t w = std::max<size_t>(8, std::min<size_t>(1024, spare / ((size_t)np * C * 10)) / 8 * 8);
+        return ((size_t)n + w - 1) / w;
+      };
+      for (int bd = bands * 2; bd <= 32; bd *= 2) if (blocksFor(bd) < blocksFor(bands)) bands = bd;
+    }
+  }
+  const int kb = bands == 1 ? np : (np / bands + 7) / 8 * 8;
+  B16* b = scratch<B16>("trib.bbf", (size_t)np * kb * C);
   // as wide a block as fits beside b (a, its gating rows and the product, 6 bytes a channel a pair; up to 1024 rows):
   // every block re-reads the whole of b
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
     size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * 6, spare = f > t / 16 ? f - t / 16 : 0;
+    size_t perRow = (size_t)np * C * (bands == 1 ? 6 : 10), spare = f > t / 16 ? f - t / 16 : 0;
     width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
   }
   B16* a = scratch<B16>("trib.abf", (size_t)width * np * C);
   B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
+  // (bands: their sums added in f32, the product rounded to bf16 once, as the whole contraction's is - added into the
+  // bf16 product a band at a time, 5CAJ's fold moved 0.26 A)
+  float* p32 = bands == 1 ? nullptr : scratch<float>("trib.p32", (size_t)width * np * C);
   half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
   wideWidth(C, [&](auto cw) {
@@ -569,14 +598,30 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
           kern<<<(unsigned)((rows + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
             pair, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
         };
-        in(RectMap{}, cs, nullptr, b, nullptr);
+        if (bands == 1) in(RectMap{}, cs, nullptr, b, nullptr);
         int lo, hi; mg::myShare(pair, np, 8, lo, hi);        // (multi-GPU: this rank's blocks)
         for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
           int w = std::min(width, hi - k0);
           RectMap rm = outgoing ? RectMap{k0, np, 0, (size_t)w * np} : RectMap{0, w, k0, (size_t)np * w};
           in(rm, rm.size, a, nullptr, t2);
-          if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, alpha, b, np, cs, a, np, rm.size, prod, np, rm.size, C);
-          else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, np, np, alpha, a, w, rm.size, b, np, cs, prod, w, rm.size, C);
+          if (bands == 1) {
+            if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, alpha, b, np, cs, a, np, rm.size, prod, np, rm.size, C);
+            else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, np, np, alpha, a, w, rm.size, b, np, cs, prod, w, rm.size, C);
+          } else {
+            for (int q0 = 0; q0 < np; q0 += kb) {   // b's bands: outgoing b[j][k], incoming b[k][j], k in [q0, q0 + q)
+              const int q = std::min(kb, np - q0);
+              const size_t bs = (size_t)np * q;
+              const float beta = q0 ? 1.f : 0.f;
+              in(outgoing ? RectMap{0, q, q0, bs} : RectMap{q0, np, 0, bs}, bs, nullptr, b, nullptr);
+              if (outgoing)
+                CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, w, q, &alpha, b, CUDA_R_16BF, q, bs, a + q0, CUDA_R_16BF,
+                  np, rm.size, &beta, p32, CUDA_R_32F, np, rm.size, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+              else
+                CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, w, np, q, &alpha, a + (size_t)q0 * w, CUDA_R_16BF, w, rm.size,
+                  b, CUDA_R_16BF, np, bs, &beta, p32, CUDA_R_32F, w, rm.size, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+            bandsToBf16K<<<blocks(rm.size * C), 256, 0, STREAM>>>(p32, prod, rm.size * C);
+          }
           triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, rm);
         }

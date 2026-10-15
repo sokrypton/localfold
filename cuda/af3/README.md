@@ -1349,6 +1349,30 @@ the blocked triangle's f16 operand being its floor), so it admits ~7,700 tokens 
 a pass was 9 minutes at 7,904 tokens (the grid attention's flash kernel half of it, at ~40% of the tensor cores' peak
 with heads 32 wide: its exponentials cost as much as its matrix work) - see the next section for what it is now.
 
+### 🔴 9,200 tokens on a 40 GB A100: the stages past the trunk's floor brought down to it (2026-10-15)
+
+**9,200 tokens folds on this 40 GB card, admitted by the fit check (~9,225), where ~7,900 was the line.** Found by
+folding past the check (`LOCALFOLD_NO_FOLD_FITS=1`) and reading what ran out, three stages in turn - each held about
+twice the pairformer's floor (~274 bytes a token pair beside the weights):
+
+| ran out at | what | now |
+|---|---|---|
+| 8,600 (by 50 MB) | the blocked triangle's `b`, a second pair-sized operand (18.9 GB) | made in **bands of the contracted index k** where it does not fit whole, every block making every band, the bands' sums added in f32 and rounded to the bf16 product once; as many bands as make the fewest blocks (more bands only free room for wider blocks) |
+| 9,200 | the template stack's f32 activation (21.7 GB) made beside the bf16 pair (21.7 GB) | the pair **parked before** the activation is made, its query read from the parked (pinned) copy; the stage's end relu'd, scaled and taken to f16 before the pair comes home |
+| (at the limit) | the diffusion's biases, a super block's four planes rebuilt each step | **one block's** plane, rebuilt at each block, where even a super block's set does not fit beside the f16 pair - bit-identical to the super block's |
+
+The floor is now the diffusion preparation's - the f16 LayerNorm'd pair, the atom encoder's pair conditioning and one
+block's biases, ~430 bytes a pair: `PAIR16_BANDED_FIT_TIMES` 0.86 of the f32 pair, where the triangle runs fused in bf16
+(not an FP8 card's TN form nor a T4's unfused one, which keep 1.15 until measured). 9,550 ran out in that preparation by
+0.2 GB, which is what set 0.86 (0.80 had admitted it).
+
+**Nothing changes below the old line**: every new path engages only where the old one would not fit. 1,850 tokens 6.55
+against 6.61 s, bit-identical; 7,800 tokens 352.5 against 353.4 s (its template stage takes the parked path, so its end
+in f16 moves the fold). **Past it the trunk pays for the bands**: 9,200 tokens 739 s against ~530 by the old paths'
+cubic, and 1,014 s before the band count was chosen for the fewest blocks. The bands move a fold: 5CAJ with its template
+on the big-input paths, 8 bands forced against the whole `b`, 0.19 A rms between them - and 2.098 / 2.113 A from the
+crystal, so the fold is no worse, it is sensitive.
+
 ### 🔴 A big fold's speed: 1.9x at 7,657 tokens (2026-10-09)
 
 The same 7,657-token fold (31 chains of 1TIM, one pass, 100 steps, this 40 GB A100), against the commit before:
@@ -1632,7 +1656,7 @@ one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappi
 
 | GPUs | before | then | now (later 2026-10-11) | first refused |
 |---:|---:|---:|---:|---:|
-| 1 | ~7,900 | ~7,900 | ~7,900 | |
+| 1 | ~7,900 | ~7,900 | ~7,900 (**9,200** from 2026-10-15, below) | |
 | 2 | 4,940 | **6,916** | | |
 | 4 | 8,645 | **9,633** | **12,350** | 13,338 (0.7 GB short, the MSA attention's) |
 | 8 | 12,103 | **13,091** | **17,290** (peak 34.9 GB a rank, 7.6 min a pass simulated) | |

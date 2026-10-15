@@ -20,8 +20,8 @@ inline bool TRI_LT_TILE = true;
 // cuBLASLt's own list, never a timing
 inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn, int k, float alpha,
                       const __nv_bfloat16* A, int lda, long long sA, const __nv_bfloat16* B, int ldb, long long sB,
-                      __nv_bfloat16* Cm, int ldc, long long sC, int batch) {
-  const float zero = 0.f;
+                      __nv_bfloat16* Cm, int ldc, long long sC, int batch, float beta = 0.f) {
+  const float zero = beta;     // (beta 1: added into C - the blocked triangle's bands of k)
   if ((double)m * nn * k >= 1e10) {
     struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; bool ok; };
     static cublasLtHandle_t lt = nullptr;
