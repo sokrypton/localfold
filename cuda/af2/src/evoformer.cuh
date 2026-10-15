@@ -887,7 +887,7 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
   releaseScratch({ "trib." });
 }
 // the triangle's whole-form buffers (both precisions'): what a pass already holds counts toward its room
-#define TRI_FAST_HELD { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
+#define TRI_FAST_HELD { "ftri.a8", "ftri.b8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
                                    bool outgoing) {
   size_t pairs = (size_t)L * L;
@@ -919,6 +919,28 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriFused w = triFusedWeights(T, blk, C);
     half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
     tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    // FP8 operands where the card has FP8 tensor instructions (fp8Tensor), as cuda/af3's triangle: both directions in the
+    // outgoing layout (the incoming input kernel reading the pair transposed, RectMap's T), through an e4m3 GEMM into
+    // the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
+    if (fp8Tensor()) {
+      using F8 = __nv_fp8_e4m3;
+      const int np8 = (L + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
+      F8* a8 = scratch<F8>("ftri.a8", cs8 * C); F8* b8 = scratch<F8>("ftri.b8", cs8 * C);
+      half* t2 = scratch<half>("ftri.t2", cs8 * C);
+      __nv_bfloat16* pb = scratch<__nv_bfloat16>("ftri.pbf", cs8 * C);
+      RectMap rm; rm.T = !outgoing;
+      const size_t smem = triIn256Smem<F8>(128, 8);
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triIn256K<128, 4, F8, 1, true, PT, 2>), (int)smem); attr = true; }
+        triIn256K<128, 4, F8, 1, true, PT, 2><<<(unsigned)((cs8 + 127) / 128), 128, smem, STREAM>>>(
+          pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a8, b8, t2, L, np8, cs8, w.bias, rm));
+      if (outgoing) triContractTN(np8, cs8, C, 1.f, a8, b8, pb, true);
+      else triContractTN(np8, cs8, C, 1.f, b8, a8, pb, true);
+      triangleOutRun<128, 4, __nv_bfloat16>(pb, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                            PH(T + "/output_projection/weights", blk), t2, pair, L, np8, P(T + "/output_projection/bias", blk));
+      return;
+    }
     __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
     const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);

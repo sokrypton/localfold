@@ -351,6 +351,27 @@ interleaved, two rounds each:
 579; with SPEC, four rows a block 816 (two warps) and 634 (one), eight rows 928, four warps two rows 808. Those forms
 are past the launch bound's four warps, so they lose their register cap and their occupancy.
 
+### The triangle multiplication's contraction in FP8 (2026-10-15)
+
+On a card with FP8 tensor instructions, the fused triangle multiplication contracts in e4m3, as cuda/af3's does. The
+input kernel writes a and b as e4m3 in the outgoing layout for both directions (the incoming one reads the pair
+transposed, RectMap's T), on a plane padded to 16, and `triContractTN` writes the bf16 product. The same form in bf16
+reproduces the shipped fold exactly on the A100 (0.000 A on 1QYS, 5CAJ and 1TIM), which checks the transposed layout
+on a card with no FP8.
+
+| | 600 res | 1,000 res | 2,500 res |
+|---|---:|---:|---:|
+| RTX PRO 6000, bf16 contraction | 3.02 s | 6.87 s | 46.72 s |
+| RTX PRO 6000, FP8 | **2.96 s** | **6.74 s** | **43.32 s** |
+| L4, bf16 contraction | 20.7 s | 58.8 s | |
+| L4, FP8 | **20.6 s** | **56.1 s** | |
+
+Drift against the bf16 contraction: 5CAJ and 1TIM with their alignments 0.016-0.023 A, 1QYS from a single sequence
+0.018 (G4) and 0.027 A (L4), with pLDDT and pTM within 0.2 and 0.002. Single-sequence 5CAJ, which is undetermined
+(pLDDT 31), moves 0.43 A (G4) and 0.72 A (L4), against 0.36 for TF32 off on the A100. Emulated on the A100 (a and b
+rounded through e4m3), 1QYS moves 0.032 A against TF32's 0.015 and its RMSD to the crystal is unchanged (1.229 ->
+1.222 A).
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
