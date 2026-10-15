@@ -1019,3 +1019,94 @@ the other. Stock Chrome, `LOCALFOLD_STOCK_FLAGS=1`, arms alternated. If an arm l
    `--tune=diffusionStagePrecision=f32` - the denoiser's f16 staging.
 6. The gates, now that every bundle is fetchable: `npm run test:stock`, `test:template`, `test:ligand` (with and
    without stock flags - the f16-only matrix units are what `matrixContractionOverflows` refuses).
+
+## 2026-10-15: memory - the CUDA ports' notes (docs/CUDA-TO-METAL.md on `opus-55-opt`), applied here
+
+The CUDA side's three memory items, done for Metal: the template stage, scratch shared between modules (with the
+scribble that proves it), and a fit check measured past the line. Traced with a new instrument first, because the
+peaks were not where the notes guessed: `LOCALFOLD_PEAK=1` prints, at every `releaseScratch` (a stage's end), the
+stage's peak, the allocation that set it and the scratch held beside it, and the fold's peak at the end
+(`core.mm`, `tracePeak`). Inputs: 5CAJ chain A four times (1,044 tokens, each copy templated by the crystal), twice
+(522), and one 1,044-residue chain with a synthetic 3,001-row alignment.
+
+| peak, 1,044 tokens | before | after | where it was |
+|---|---:|---:|---|
+| AF3, four templates | 5.33 GB | **4.20** | the confidence head: the pair track's 2.5 GB beside its heads |
+| AF2 multimer, four templates | 8.88 GB | **4.08** | the template stage, beside the last pass's evoformer and structure module |
+| ESMFold2 | 8.67 GB | **5.32** | the confidence head: the trunk's pair, its own and a third f32 copy |
+
+What moved each, in order (every step byte-identical unless it says otherwise):
+
+- **AF3.** The template stage gives its query's norm back once projected and normalises each pass in place (4.19 ->
+  3.63 GB). 🔴 Holding the query in half saved 0.14 GB more and moved the kitchen sink 74.50 -> 75.24 pLDDT, past the
+  gate's 0.5 - found by folding the case under three arms (the old binary, the new one, the new one with the
+  confidence head's half pair off, `LOCALFOLD_CONF_HALF_PAIR=0`), which put it on the template stage and not where it
+  looked likely. The query stays float. The confidence head
+  gives the pair track's scratch back before its heads (5.33 -> 2.85 at the heads). The diffusion gives its pair
+  conditioning back once the biases' LayerNorm has read it (4.06 -> 3.50). The trunk's stack gives the f32 pair back
+  while it runs on the half one, and the MSA stack's pair-track scratch before the half copy is made (4.30 -> 3.72).
+  The confidence head's blocks run over a half pair as the trunk's do (`LOCALFOLD_HALF_PAIR=0` the control; pLDDT,
+  pTM, ipTM unchanged at the digits printed) and park the trunk's pair in half while they run - exact, because it
+  came out of the half stack (`Trunk::pairHalfExact`) - 4.76 -> 4.20.
+- **AF2.** The recycled pair is t.pair itself, normalised in place (a copy and its norm were two f32 pairs, 1.1 GB);
+  the f32 MSA, extra MSA and pair are given back while the evoformer runs on its half copies; the PAE logits are
+  scratch. pLDDT 90.62 -> 90.63, pTM 0.5023 -> 0.5030 (the recycle term is added in another order). Then the shared
+  scratch (below) and the triangle's centre norm and gated value written over its planes, which are dead after the
+  contraction: 8.88 -> 7.66 -> 6.24 -> 4.64 -> 4.08.
+- **ESMFold2.** The trunk holds no float pair at all where its blocks run half: the recycle reads the half copy (what
+  the float one held - it was the half one widened) and writes it back a chunk at a time, byte-identical, z made once
+  at the end (a first version gave z back and made it again every loop: +1% a trunk; this one is level, -0.4% over six
+  ABBA pairs at 522 residues). The confidence head gives the trunk's pair back
+  once normalised and runs its blocks over a half copy (ipTM 0.3365 -> 0.3364, pLDDT and pTM unchanged); the
+  triangle's product buffer is sized for the half it stores; the centre norm and gated value go over the planes;
+  `eln.b`, an emitted norm, was held through the whole sampler (558 MB). 8.67 -> 6.43 -> 5.32.
+
+**Shared scratch** (`shareScratch` in `core.h`): a port names its families (name prefixes) and which are nested (live
+around another's turn); a buffer of 32 MB or more aliases a slot no buffer of its family or a nested one holds. AF3:
+the MSA stack's attention and outer product share the pair track's slots (the MSA stack 4.54 -> 3.95 GB). AF2: a
+block's modules are families of their own (attentions, triangle multiplications, outer product, transitions), the
+emitted norms and the half copies nested around them all - the evoformer's scratch is the largest module's, not the
+sum. ESMFold2 has none: its stages already give theirs back and its triangle's buffers are one family. Timing, ABBA at 522
+tokens once warm: AF3 level (within 0.7%, the 3.2x-drift machine's noise), AF2 -0.2 / +0.7 / +0.4%, ESMFold2's trunk
+-0.4% and its confidence head -3% (its blocks run half now).
+
+🔴 **THE SCRIBBLE FOUND TWO BUGS, EXACTLY THE ONES THE CUDA NOTES WARN OF.** `LOCALFOLD_SCRIBBLE=1` fills every slot
+with NaN bytes at each change of family (but a family's nested with either side), and the fold must be byte-identical
+to `LOCALFOLD_SHARED_SCRATCH=0`'s - at 32 MB and at `LOCALFOLD_SHARED_MIN=65536`, which stands in for a long fold. AF2's
+first module split folded pLDDT 57 where 90.6 was right; `LOCALFOLD_SHARED_SKIP=<family>` bisected it to:
+- **the outer product mean's mask norm**, computed once a stack a pass and read by every block after (`t.normOf`):
+  a buffer written once and read later. It is `mnorm.*` now, in no family. It is 4.4 MB at 1,044 residues, under the
+  32 MB line - and over it past 2,900, where it would have moved a long fold and nothing short.
+- **the triangle's planes' padding, zeroed once and remembered by pointer** (a `static` in the function, in AF2's and
+  ESMFold2's alike): another module's bytes land there once the slot is shared. `padZero` every call now, as AF3's
+  pair track already did. ESMFold2's is fixed too, where nothing shares - its centre norm is now written over the
+  planes, which the old cache would have broken.
+
+After both: every AF3 gate case (16, every model and special case) and four AF2 inputs (multimer with templates,
+monomer with a template, 512 + 1,024 rows, 6MRR; two passes each) byte-identical under the scribble at both thresholds.
+
+**The fit check** (`foldFits` in `core.h`): a fold whose estimated peak passes `recommendedMaxWorkingSetSize` (12.71
+GB on this 16 GB M5) is refused up front, with a sentence - past it unified memory pages and the fold runs many times
+slower rather than failing. The estimate is the bytes held once the input is loaded plus factors times the f32 pair
+and MSA, measured by folding (`LOCALFOLD_PEAK=1` prints it; `LOCALFOLD_NO_FOLD_FITS=1` folds anyway). A `--serve`
+process answers the job with its error and stays up.
+
+| bytes at the peak per f32 byte | half stacks (M5) | float stacks (`LOCALFOLD_GEMM_TENSOR=0`) |
+|---|---:|---:|
+| AF3 pair / MSA | 6.15 / 2.7 (6.3 / 2.8 used) | 6.5 (6.7 used) |
+| AF2 pair / MSA and extra | 7.0 / 1.5 (7.1 / 1.6 used) | 5.3 over one pass (7.1 used) |
+| ESMFold2 pair (the trunk's stage; the tower given back) | 4.5 (4.6 used) | 5.5 (5.6 used) |
+
+Estimates against peaks at 1,044 tokens: AF3 4.28 / 4.20 (four templates), 5.04 / 4.92 (1,024 rows); AF2 4.16 / 4.08,
+5.96 / 5.84; ESMFold2 5.50 / 5.32 - each 2-4% over, at 522 4-8% under (the per-token terms, which a long fold
+outgrows). On this M5 that puts the longest fold at about AF3 1,900 tokens (1,690 before this round), AF2 1,850
+residues (1,250), ESMFold2 1,620 (1,270).
+
+### For the M2 (this round)
+
+The M2 takes the float paths throughout (no matrix units), which this M5 imitated with `LOCALFOLD_GEMM_TENSOR=0` for
+the fit check's factors only. What only an M2 can answer:
+1. `recommendedMaxWorkingSetSize` there (the check's limit): `LOCALFOLD_PEAK=1` prints it beside each estimate.
+2. The scribble on its own paths: `LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=65536` against `LOCALFOLD_SHARED_SCRATCH=0`,
+   byte for byte, over the AF3 gate's cases and AF2's (the float evoformer runs other buffers than the half one).
+3. Each port's estimate against its peak (`LOCALFOLD_PEAK=1` prints both) at a length near the M2's limit.

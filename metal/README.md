@@ -172,8 +172,8 @@ pairformer stack, AF2's whole evoformer (the MSA, the extra MSA and the pair) an
 half copy on entry and hand float back on exit, so every stage outside them is unchanged. Every residual is summed in
 float and rounded once on its store (saturating at 65504; the largest values seen are ~13000, openbind0's pair); every
 norm reads the stored half values. The updates' last GEMMs are bandwidth-bound on the residual, so it is speed - AF3
--5 to -6% a trunk pass, AF2 -4.5 to -8%, ESMFold2 -2.5 to -3.6% - not memory: the stack holds the half copy beside the
-float one, inside peaks set elsewhere (the MSA stack, the confidence head). bf16 was 3-15 A off on the low-confidence
+-5 to -6% a trunk pass, AF2 -4.5 to -8%, ESMFold2 -2.5 to -3.6% - and, since 2026-10-15, memory too: the float copy is
+given back while a stack runs on the half one (below). bf16 was 3-15 A off on the low-confidence
 folds where half sat at the f32 noise floor; docs/M5-HANDOFF.md has the numbers.
 
 **The triangle's contraction is stored in half too, scaled by 2^-10** (`halfProductScale`, `LOCALFOLD_HALF_PROD=0` the
@@ -196,6 +196,36 @@ peaks and the scratch by name.
 | AF3, 522 tokens, one pass: footprint | 2.96 GB | 2.00 GB |
 | AF3, 1044 tokens, one pass: allocation / footprint | 9.0 / 11.3 GB | 5.2 / 5.3 GB |
 | AF3, 1044 tokens, two passes: footprint | | 4.7 GB |
+
+**Scratch shared between modules, and the scribble that proves it** (`shareScratch`, core.h; cuda's version and its
+lessons are docs/CUDA-TO-METAL.md on `opus-55-opt`). A port names its scratch FAMILIES (name prefixes) and which are
+nested - live around another's turn; a buffer of 32 MB or more aliases a slot no buffer of its own family, or of a
+nested one, holds. AF3's MSA stack shares the pair track's slots; AF2's block modules (attentions, triangle
+multiplications, outer product, transitions) are families of their own, so its evoformer holds its largest module's
+scratch rather than the sum. `LOCALFOLD_SCRIBBLE=1` fills every slot with NaN bytes at each change of family, and a fold
+must stay byte-identical to `LOCALFOLD_SHARED_SCRATCH=0`'s, at 32 MB and at `LOCALFOLD_SHARED_MIN=65536` (a long fold's
+sizes); `LOCALFOLD_SHARED_SKIP=<family>` bisects a failure. It found two, both cuda's: AF2's outer-product mask norm,
+written once a stack and read by every block after (in no family now), and the triangle's planes' padding zeroed once
+and remembered by pointer, in AF2 and ESMFold2 (`padZero` every call, as AF3's pair track did). Every AF3 gate case and
+four AF2 inputs pass it. **Where the stacks run half, the float pair is given back while they run** (AF3's pairformer
+and confidence head, AF2's evoformer with its MSAs, ESMFold2's trunk), AF2's recycled pair is normalised in place, the
+triangles' centre norm and gated value are written over their planes, and each confidence head gives the pair track's
+scratch back before its heads. `LOCALFOLD_PEAK=1` prints each stage's peak and what was held at it.
+
+| peak at 1,044 tokens (5CAJ x4, each templated; ESMFold2 untemplated) | before | now |
+|---|---:|---:|
+| AF3 | 5.33 GB | 4.20 GB |
+| AF2 multimer | 8.88 GB | 4.08 GB |
+| ESMFold2 | 8.67 GB | 5.32 GB |
+
+**A fold that will not fit is refused up front** (`foldFits`, core.h): its peak estimated from the bytes held once the
+input is loaded plus measured factors times the f32 pair and MSA, against `recommendedMaxWorkingSetSize` (12.71 GB on a
+16 GB M5). Past that, unified memory pages and the fold runs many times slower instead of failing. The factors (bytes
+at the peak per f32 pair byte) were measured by folding at 522 and 1,044 tokens on both paths: AF3 6.3 (6.7 where its
+stacks run float, as on an M2), AF2 7.1, ESMFold2 4.6 (5.6) for its trunk's stage with its tower given back; the MSA's
+2.8 (AF3) and 1.6 (AF2). The estimates sit 2-4% over the peaks they were fitted to. On this M5 the longest folds are
+about AF3 1,900 tokens, AF2 1,850 residues, ESMFold2 1,620. `LOCALFOLD_NO_FOLD_FITS=1` folds anyway; a `--serve` process
+answers the job with the refusal and stays up.
 
 ## Traps, each paid for
 
