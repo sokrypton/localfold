@@ -343,6 +343,10 @@ export class AlphaFoldUnifiedGpu {
         }
         await capturePair("extra-stack", embedding.pairWithoutTemplates);
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
+        // 🔴 AND THE EXTRA STACK'S POOLED SCRATCH GOES BEFORE THE MAIN ONE (see the monomer's model.js): its last
+        // block was awaited above, and nothing in the main stack asks for the extra MSA's sizes.
+        execution.allocator.destroyPooled();
+        await settleReleasedMemory(this.device);
 
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);

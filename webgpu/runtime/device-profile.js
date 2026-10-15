@@ -369,6 +369,10 @@ export const DEFAULT_TUNING = Object.freeze({
   // transitions are 263 of an 825-residue block's 339 dispatches, which is a
   // different question. null takes the constant.
   transitionChunkBytes: null,
+  // 🔴 HOW MANY BYTES OF q, k, v AND THE GATE AN AF2 ATTENTION HOLDS AT ONCE: it projects and attends a block of
+  // batch rows at a time where the four tensors would be larger (webgpu/af2/evoformer/block.js). null takes 128
+  // MiB; 0 is one block, the whole tensor - the control.
+  attentionBlockBytes: null,
   // 🔴 HOW MANY BYTES OF CACHED PAIR ATTENTION BIAS A SCHEDULE MAY HOLD,
   // overriding PAIR_LOGITS_CACHE_BYTES. That constant's 64 MiB was measured at
   // 200 TOKENS, where it covers all twenty-four blocks; the cache is

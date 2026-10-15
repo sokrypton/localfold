@@ -364,6 +364,11 @@ export class AlphaFoldMonomerGpu {
         stageMilliseconds.extraStack += performance.now() - phaseStart;
         phaseStart = performance.now();
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
+        // 🔴 AND THE EXTRA STACK'S POOLED SCRATCH GOES BEFORE THE MAIN ONE: its last block was awaited above, and its
+        // buffers are the extra MSA's sizes, which nothing in the main stack asks for - with 1024 extra rows at 522
+        // residues ~590 MiB sitting in the pool through all 48 main blocks.
+        execution.allocator.destroyPooled();
+        await settleReleasedMemory(this.device);
 
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);

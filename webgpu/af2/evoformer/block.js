@@ -69,6 +69,7 @@ import {
 import { SOURCES } from "../../../shared/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { halfPrecisionAvailable, deviceTuning } from "../../runtime/device-profile.js";
+import { storageBytes } from "../../runtime/storage.js";
 import { createTriangleShaders, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
@@ -699,12 +700,27 @@ async function encodeAttention(
   const reuse = { reuseLarger: options.reuseLarger !== false };
   const normalized = execution.allocate(
     `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage, reuse);
+  // 🔴 q, k, v AND THE GATE FOR A BLOCK OF BATCH ROWS AT A TIME, where all four would pass attentionBlockBytes
+  // (128 MiB): a batch row attends over its own positions only, so each block is projected and attended on its own
+  // and the four tensors are one block's. At 522 residues with 512 MSA rows the row attention's four were 522 MiB;
+  // at 1044 residues a triangle attention's 1064. Blocks of a multiple of 64 rows (every view lands on 256 bytes) and
+  // balanced; below the budget one block, the old dispatches exactly.
+  const blockBytes = deviceTuning(execution.device).attentionBlockBytes ?? 128 * 1024 * 1024;
+  const perRow = options.queries * (3 * storageBytes(options.channels, projectedStorage)
+    + storageBytes(options.channels, valueStorage));
+  let blockRows = options.batch;
+  if (blockBytes > 0 && perRow * options.batch > blockBytes && options.batch > 64) {
+    const most = Math.max(64, Math.floor(blockBytes / perRow / 64) * 64);
+    const blocks = Math.ceil(options.batch / most);
+    blockRows = Math.min(options.batch, Math.ceil(options.batch / blocks / 64) * 64);
+  }
+  const blockElements = blockRows * options.queries * options.channels;
   const projected = (name) => execution.allocate(
-    `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage, reuse);
+    `${options.label}.${name}`, blockElements, GPUBufferUsage.STORAGE, projectedStorage, reuse);
   const query = projected("query");
   const key = projected("key");
   const value = execution.allocate(
-    `${options.label}.value`, elements, GPUBufferUsage.STORAGE, valueStorage, reuse);
+    `${options.label}.value`, blockElements, GPUBufferUsage.STORAGE, valueStorage, reuse);
   const gate = projected("gate");
   // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. Read the dispatches below:
   // the projection is the last pass that reads it - the pair bias, when it
@@ -765,21 +781,43 @@ async function encodeAttention(
         grid[0], grid[1], 1, `${options.label}.pair-bias`);
     }
   }
-  if (projectMatrixFits) {
-    const dispatch = attentionProjectMatrixDispatch(
-      { rows, channels: options.channels }, projectMatrix);
-    execution.dispatch(encoder, project,
-      [normalized, weights, projectMatrixParams, query, key, value, gate],
-      dispatch.x, dispatch.y, 1, `${options.label}.project`);
-  } else {
-    execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-      Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
-      Math.ceil(rows / attentionProjectTileRows(projectKernel.tile)), 1,
-      `${options.label}.project`);
+  for (let first = 0; first < options.batch; first += blockRows) {
+    const count = Math.min(blockRows, options.batch - first);
+    const whole = count === options.batch;
+    const block = count * options.queries;
+    const part = (tensor) => (whole ? tensor : execution.view(tensor, 0, block * options.channels));
+    const [q, k, v, g] = [query, key, value, gate].map(part);
+    // the block's rows of `normalized` (read by the projection, written by the attention) and of the key mask
+    // ([batch][keys], or [keys][batch] transposed - there the flash kernel keeps the whole batch as the mask's stride)
+    const rowsIn = whole ? normalized : execution.view(normalized, first * options.queries * options.channels,
+      block * options.channels);
+    const out = weighted === normalized ? rowsIn
+      : whole ? weighted : execution.view(weighted, first * options.queries * options.channels, block * options.channels);
+    const maskOffset = options.transpose === true ? first : first * options.queries;
+    const mask = whole ? options.mask : execution.view(options.mask, maskOffset, options.mask.elements - maskOffset);
+    const blockParams = whole ? params : uniform(execution, `${options.label}.block-parameters`,
+      createAttentionParameters({ ...descriptor, batch: count }, packedOffsets));
+    if (projectMatrixFits) {
+      const dispatch = attentionProjectMatrixDispatch(
+        { rows: block, channels: options.channels }, projectMatrix);
+      const matrixParams = whole ? projectMatrixParams
+        : uniform(execution, `${options.label}.block-project-matrix-parameters`, new Uint32Array([
+          block, options.channels, 4 * options.channels, packedOffsets[2], packedOffsets[6], 0, 0, 0,
+        ]));
+      execution.dispatch(encoder, project,
+        [rowsIn, weights, matrixParams, q, k, v, g],
+        dispatch.x, dispatch.y, 1, `${options.label}.project`);
+    } else {
+      execution.dispatch(encoder, project, [rowsIn, weights, blockParams, q, k, v, g],
+        Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
+        Math.ceil(block / attentionProjectTileRows(projectKernel.tile)), 1,
+        `${options.label}.project`);
+    }
+    execution.dispatch(encoder, flash,
+      [q, k, v, g, mask, pairBias, options.transpose === true ? params : blockParams, out],
+      Math.ceil(options.queries / flashKernel.queryTile),
+      count, options.heads, `${options.label}.flash`);
   }
-  execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-    Math.ceil(options.queries / flashKernel.queryTile),
-    options.batch, options.heads, `${options.label}.flash`);
   if (outputMatrixFits) {
     const dispatch = attentionOutputMatrixDispatch(
       { rows, channels: options.channels }, outputMatrix);
