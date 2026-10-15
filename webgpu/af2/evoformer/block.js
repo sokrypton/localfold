@@ -693,14 +693,18 @@ async function encodeAttention(
     rows, options.channels, packedOffsets[0], packedOffsets[1], options.transpose,
     options.batch, options.queries, 1e-5,
   ));
+  // 🔴 EACH OF THESE IS BOUND BY ITS OWN RANGE, so each may take an idle pooled buffer up to twice its size: packed,
+  // they are half a pair-sized f32 tensor, and five of them were a set of buffers the pool held beside the
+  // triangle's (333 MiB at 522 residues). `reuseLarger: false` in the options is the control.
+  const reuse = { reuseLarger: options.reuseLarger !== false };
   const normalized = execution.allocate(
-    `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage);
+    `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage, reuse);
   const projected = (name) => execution.allocate(
-    `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage);
+    `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage, reuse);
   const query = projected("query");
   const key = projected("key");
   const value = execution.allocate(
-    `${options.label}.value`, elements, GPUBufferUsage.STORAGE, valueStorage);
+    `${options.label}.value`, elements, GPUBufferUsage.STORAGE, valueStorage, reuse);
   const gate = projected("gate");
   // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. Read the dispatches below:
   // the projection is the last pass that reads it - the pair bias, when it
@@ -1241,7 +1245,9 @@ async function encodeTriangleMultiplication(
   const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
   const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
+  // 🔴 THE CENTRE NORM IS WRITTEN OVER `a`, and the matrix path's gate over `b`: the contraction is the last reader
+  // of both, and each is the hidden width. A fifth pair-sized buffer for nothing - 532 MiB at 1044 residues.
+  const hiddenNormalized = a;
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
   const projectParams = !matrixFits ? undefined
     : uniform(execution, `triangle.${direction}.project-parameters`, new Uint32Array([
@@ -1322,19 +1328,19 @@ async function encodeTriangleMultiplication(
   if (matrixFits) {
     // 🔴 THE GATE IS ITS OWN PASS AND THE PROJECTION READS IT, because
     // `logistic(z . Wg) * (x . Wz)` is two contractions over two DIFFERENT
-    // sources and no column trick makes it one GEMM. `a` is dead by here - the
-    // contraction was its last reader - so the gate's target costs nothing,
-    // exactly as it does in AF3's pair track.
+    // sources and no column trick makes it one GEMM. `b` is dead by here - the
+    // contraction was its last reader, and `a` holds the centre norm - so the
+    // gate's target costs nothing, as it does in AF3's pair track.
     //
     // 🔴 AND THE PROJECTION ALWAYS ADDS INTO ITS TARGET, so a caller with no
     // residual gets a cleared one. That is 82 MB of clear at 400 residues
     // against a second shader, and every AF2 caller passes a residual.
     if (residualTarget === undefined) encoder.clearBuffer(output);
     const out = triangleProjectOutMatrixDispatch({ rows: pairs, cZ: input.cZ }, triangleMatrix);
-    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, a],
+    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, b],
       out.x, out.y, 1, `triangle.${direction}.output.gate`);
     execution.dispatch(encoder, projectOutput,
-      [hiddenNormalized, weights, outProjectParams, output, a],
+      [hiddenNormalized, weights, outProjectParams, output, b],
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],

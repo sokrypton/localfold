@@ -245,8 +245,9 @@ export class WebGpuExecution {
    *   caller's arithmetic is unchanged and only the allocation shrinks.
    * @param {"f32"|"f16"} [storage] see webgpu/runtime/storage.js
    */
-  allocate(label, elements, usage = GPUBufferUsage.STORAGE, storage = "f32") {
-    const allocation = this.allocator.allocate(label, storageBytes(elements, storage), usage);
+  allocate(label, elements, usage = GPUBufferUsage.STORAGE, storage = "f32", options = {}) {
+    // (`options.reuseLarger`: bound only by its own range - see GpuBufferAllocator.allocate)
+    const allocation = this.allocator.allocate(label, storageBytes(elements, storage), usage, options);
     this.#allocations.push(allocation);
     return { allocation, elements, storage };
   }

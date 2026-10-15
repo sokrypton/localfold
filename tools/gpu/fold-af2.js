@@ -597,8 +597,8 @@ export async function main(device, args) {
       .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),
     packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
-    // say which tensor to attack. See webgpu/runtime/device-memory.js.
-    deviceMemory: trimMemory(memorySnapshot(device)),
+    // say which tensor to attack. See webgpu/runtime/device-memory.js. `--memory-rows=` for more than twelve.
+    deviceMemory: trimMemory(memorySnapshot(device), Number(option(args, "memory-rows", "12"))),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),

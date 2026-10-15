@@ -428,6 +428,13 @@ export class AlphaFoldMonomerGpu {
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (pairReadback !== undefined) releaseTensor(pairReadback);
         if (contactReadback !== undefined) { releaseTensor(contactReadback); releaseTensor(contactTensor); }
+        // 🔴 THE EVOFORMER'S POOLED SCRATCH IS DONE WITH ONCE ITS READBACK IS IN, SO IT GOES NOW. The pool kept the
+        // triangle's and the attentions' pair-sized buffers beside the structure module and the heads, which build
+        // their own (IPA's normalised pair among them): 2216 MiB at 522 residues, the peak, inside IPA. The readback
+        // above was awaited, so nothing in flight names them; the next pass allocates afresh. AF3's trunk does the same
+        // after its pairformer (webgpu/af3/trunk/trunk.js).
+        execution.allocator.destroyPooled();
+        await settleReleasedMemory(this.device);
 
         stageMilliseconds.trunkReadback += performance.now() - phaseStart;
         phaseStart = performance.now();

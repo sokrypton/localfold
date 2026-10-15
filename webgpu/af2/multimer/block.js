@@ -377,7 +377,10 @@ async function encodeAttention(
   const key = execution.allocate(`${options.label}.key`, elements);
   const value = execution.allocate(`${options.label}.value`, elements);
   const gate = execution.allocate(`${options.label}.gate`, elements);
-  const weighted = execution.allocate(`${options.label}.weighted`, elements);
+  // 🔴 THE ATTENTION WRITES BACK INTO `normalized`, as the monomer's does (webgpu/af2/evoformer/block.js): the pair
+  // bias and the projection are its last readers and the flash kernel the next pass to write. Both are f32 here.
+  // A sixth pair-sized tensor in a triangle attention - 532 MiB at 1044 residues.
+  const weighted = normalized;
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   const attentionNormGrid = execution.rowGrid(rows);
   execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
@@ -791,7 +794,9 @@ async function encodeTriangleMultiplication(
   const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
   const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
+  // 🔴 THE CENTRE NORM IS WRITTEN OVER `a`, and the matrix path's gate over `b`: the contraction is the last reader
+  // of both, and each is the hidden width. A fifth pair-sized buffer for nothing - 532 MiB at 1044 residues.
+  const hiddenNormalized = a;
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
   const projectParams = !matrixFits ? undefined
     : uniform(execution, `triangle.${direction}.project-parameters`, new Uint32Array([
@@ -855,15 +860,15 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
     normalizeGrid[0], normalizeGrid[1], 1, `triangle.${direction}.normalize-hidden`);
   if (matrixFits) {
-    // The gate is its own pass and the projection reads it; `a` is dead by here
-    // - the contraction was its last reader. The projection always adds into
+    // The gate is its own pass and the projection reads it; `b` is dead by here
+    // - the contraction was its last reader, and `a` holds the centre norm. The projection always adds into
     // its target, so a caller with no residual gets a cleared one.
     if (residualTarget === undefined) encoder.clearBuffer(output.allocation.buffer);
     const out = triangleProjectOutMatrixDispatch({ rows: pairs, cZ: input.cZ }, triangleMatrix);
-    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, a],
+    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, b],
       out.x, out.y, 1, `triangle.${direction}.output.gate`);
     execution.dispatch(encoder, projectOutput,
-      [hiddenNormalized, weights, outProjectParams, output, a],
+      [hiddenNormalized, weights, outProjectParams, output, b],
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],

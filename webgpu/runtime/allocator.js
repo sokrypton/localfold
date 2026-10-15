@@ -66,11 +66,16 @@ export class GpuBufferAllocator {
     this.#pooling = pooling;
   }
 
-  allocate(label, requestedBytes, usage) {
+  /**
+   * @param {{reuseLarger?: boolean}} [options] `reuseLarger`: the caller binds this tensor by its own byte range
+   *   everywhere (never the whole buffer, never `arrayLength`), so a pooled buffer up to twice its size will do
+   *   where none fits exactly. See execution.allocate.
+   */
+  allocate(label, requestedBytes, usage, options = {}) {
     if (!Number.isSafeInteger(requestedBytes) || requestedBytes <= 0) {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
-    const byteLength = Math.ceil(requestedBytes / 4) * 4;
+    let byteLength = Math.ceil(requestedBytes / 4) * 4;
     // 🔴 A POOLED STORAGE BUFFER CARRIES BOTH COPY FLAGS, so one size is one
     // key. The key is size AND usage, and AlphaFold 2's graph asks for the
     // same pair size as STORAGE, STORAGE|COPY_SRC and STORAGE|COPY_DST in
@@ -82,7 +87,22 @@ export class GpuBufferAllocator {
     if (this.#pooling && (usage & GPUBufferUsage.STORAGE) !== 0 && (usage & mapped) === 0) {
       usage |= GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
     }
-    const key = `${byteLength}:${usage}`;
+    let key = `${byteLength}:${usage}`;
+    // 🔴 THE POOL KEYS BY EXACT SIZE, so a tensor of a size nothing else asks for brings its own buffers to the pool
+    // and they sit there beside everyone else's. A range-bound caller may take the smallest pooled buffer of the
+    // same usage up to twice its size instead: AF2's packed attention tensors are half a pair-sized f32 tensor, and
+    // took five buffers of their own beside the triangle's idle ones.
+    if (options.reuseLarger === true && !poolingDisabled && !this.#pool.has(key)) {
+      let best;
+      for (const [candidate, buffers] of this.#pool) {
+        if (buffers.length === 0) continue;
+        const [size, use] = candidate.split(":").map(Number);
+        if (use === usage && size > byteLength && size <= 2 * byteLength && (best === undefined || size < best.size)) {
+          best = { key: candidate, size };
+        }
+      }
+      if (best !== undefined) { key = best.key; byteLength = best.size; }
+    }
     const pooled = poolingDisabled ? undefined : this.#pool.get(key);
     let buffer = pooled?.pop();
     if (buffer === undefined) {
