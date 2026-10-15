@@ -273,11 +273,12 @@ export async function foldEsmfold2(device, options) {
   const settings = { ...SAMPLER_DEFAULTS,
                      ...(SAMPLER_PRESETS[options.sampler ?? "diffusion-15"] ?? {}),
                      ...(options.samplerOverrides ?? {}) };
+  // (schedule, update and churn: cpu/esmfold2/sampler.js's options; biohub's own sampler without them)
   const schedule = noiseSchedule({ steps: settings.steps, sMax: settings.sMax,
                                    sMin: settings.sMin, p: settings.p,
                                    sigmaData: settings.sigmaData,
-                                   maxSigma: settings.maxSigma });
-  const gammas = churnFactors(schedule, settings.gammaMin, settings.gamma0);
+                                   maxSigma: settings.maxSigma, schedule: settings.schedule });
+  const gammas = churnFactors(schedule, settings.gammaMin, settings.churn === false ? 0 : settings.gamma0);
   const levels = noiseLevels(schedule, gammas);
 
   // ...and the denoiser's shape, which needs `settings.sigmaData` and nothing
@@ -954,7 +955,7 @@ export async function foldEsmfold2(device, options) {
       const denoised = await denoiser.denoise(noisy, tHat);
       options.onDenoise?.(step, noisy, denoised, tHat);     // (a comparison aid: one denoiser call's input and output)
       x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
-                      schedule[step + 1], settings.stepScale);
+                      schedule[step + 1], settings.stepScale, settings.update);
       // 🔴 SCORED ON THE DENOISED PREDICTION, WHICH IS WHAT IS DRAWN. The
       // sampler's own state is Gaussian noise at the top of the schedule and is
       // not what a viewer shows; colouring the state while drawing the

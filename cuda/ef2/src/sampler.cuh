@@ -12,15 +12,36 @@
 #include <random>
 #include "diffusion.cuh"
 
+// geometric, exponential, churn: the discretisation options cuda/af3/src/sampler.cuh's DiffusionOptions has (after
+// Blitz) - the levels evenly spaced in log sigma (the zero and max_sigma's cap kept), the step
+// x = r^S x_noisy + (1 - r^S) d with r = sigma' / t in place of Euler's, and the noise injection off. The defaults
+// are biohub's own sampler
 struct SamplerSettings { int steps = 15; double sMax = 160, sMin = 4e-4, p = 8, maxSigma = 256, gamma0 = 0.605,
-                         gammaMin = 1.107, noiseScale = 0.901, stepScale = 1.638; };
+                         gammaMin = 1.107, noiseScale = 0.901, stepScale = 1.638;
+                         bool geometric = false, exponential = false, churn = true; };
+// a discretisation flag read into s (--schedule=karras|geometric, --update=euler|exponential, --no-churn); false
+// for any other flag, and an unknown value refused by name
+inline bool samplerFlag(const char* f, SamplerSettings& s) {
+  auto value = [&](const char* name, const char* a, const char* b, bool& set) {
+    const size_t n = strlen(name);
+    if (strncmp(f, name, n)) return false;
+    if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    return true;
+  };
+  if (value("--schedule=", "karras", "geometric", s.geometric) || value("--update=", "euler", "exponential", s.exponential)) return true;
+  if (!strcmp(f, "--no-churn")) { s.churn = false; return true; }
+  return false;
+}
 
 inline std::vector<double> noiseSchedule(const SamplerSettings& s, double sigmaData) {
   std::vector<double> v;
   if (s.steps == 1) v = {s.sMax * sigmaData, 0};
   else {
     double hi = pow(s.sMax, 1 / s.p), lo = pow(s.sMin, 1 / s.p);
-    for (int k = 0; k < s.steps; ++k) v.push_back(sigmaData * pow(hi + (double)k / (s.steps - 1) * (lo - hi), s.p));
+    for (int k = 0; k < s.steps; ++k)
+      v.push_back(s.geometric ? sigmaData * exp(log(s.sMax) + (double)k / (s.steps - 1) * (log(s.sMin) - log(s.sMax)))
+                              : sigmaData * pow(hi + (double)k / (s.steps - 1) * (lo - hi), s.p));
     v.push_back(0);
   }
   if (s.maxSigma <= 0) return v;
@@ -114,7 +135,7 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
   int steps = (int)sched.size() - 1;
   cudaGraphExec_t graph = nullptr;
   for (int i = 0; i < steps; ++i) {
-    double sigma = sched[i], next = sched[i + 1], gamma = next > s.gammaMin ? s.gamma0 : 0;
+    double sigma = sched[i], next = sched[i + 1], gamma = s.churn && next > s.gammaMin ? s.gamma0 : 0;
     // centre, a uniform random rotation (a normalised Gaussian quaternion), a N(0, 1) translation
     double tot = 0, c[3] = {0, 0, 0};
     for (int a = 0; a < A; ++a) { tot += mask[a]; for (int k = 0; k < 3; ++k) c[k] += mask[a] * x[a * 3 + k]; }
@@ -153,7 +174,8 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
     CK(cudaMemcpyAsync(xd.data(), dd, (size_t)A * 12, cudaMemcpyDeviceToHost, STREAM));
     CK(cudaStreamSynchronize(STREAM));
     rigidAlign(x, xd, mask, A);
-    double f = s.stepScale * (next - t) / t;
+    // (Euler's x + f (x - d) is the exponential step's r^S x + (1 - r^S) d at f = r^S - 1)
+    double f = s.exponential ? pow(next / t, s.stepScale) - 1 : s.stepScale * (next - t) / t;
     for (int k = 0; k < A * 3; ++k) x[k] = (float)(x[k] + f * (x[k] - xd[k]));
   }
   if (graph) CK(cudaGraphExecDestroy(graph));

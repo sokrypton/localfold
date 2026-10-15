@@ -190,6 +190,14 @@ export async function main(device, args = []) {
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
   const sampler = option(args, "sampler", "diffusion-15");
+  // the discretisation (cpu/esmfold2/sampler.js), the native port's flags: --schedule=geometric,
+  // --update=exponential, --no-churn, and --steps= over the preset's count
+  const samplerOverrides = {
+    ...(option(args, "schedule", undefined) ? { schedule: option(args, "schedule", undefined) } : {}),
+    ...(option(args, "update", undefined) ? { update: option(args, "update", undefined) } : {}),
+    ...(args.includes("--no-churn") ? { churn: false } : {}),
+    ...(option(args, "steps", undefined) ? { steps: Number(option(args, "steps", undefined)) } : {}),
+  };
   const seed = Number(option(args, "seed", "0"));
   // 🔴 THE REFERENCE IS A DIFFERENT SAMPLE, NOT A DIFFERENT ANSWER. The sampler
   // draws a rotation, a translation and a noise vector per step; this uses its
@@ -396,7 +404,7 @@ export async function main(device, args = []) {
       console.log(`language pair against ${compareLm}: relRMS ${Math.sqrt(err / nrm).toExponential(3)}`
         + ` (${pair.length} against ${nativeLm.length} values)`);
     } }),
-    sequence, allocator, seed, sampler,
+    sequence, allocator, seed, sampler, samplerOverrides,
     ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
     entities: entitiesFor(),
     shape: { ...M, loops: recycles + 1 },
@@ -469,7 +477,7 @@ export async function main(device, args = []) {
   let second;
   if (twice) {
     second = await foldEsmfold2(device, {
-      sequence, allocator, seed, sampler,
+      sequence, allocator, seed, sampler, samplerOverrides,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
       entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },
@@ -488,7 +496,7 @@ export async function main(device, args = []) {
     if (profile !== null && again === repeat - 1) profile.reset();
     const started = performance.now();
     const other = await foldEsmfold2(device, {
-      sequence, allocator, seed, sampler,
+      sequence, allocator, seed, sampler, samplerOverrides,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
       entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },

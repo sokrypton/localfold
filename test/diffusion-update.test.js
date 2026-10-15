@@ -32,3 +32,26 @@ test("an unknown schedule or update is refused by name", () => {
   assert.throws(() => noiseSchedule(0.5, { schedule: "fast" }), /karras or geometric/);
   assert.throws(() => samplerStep(new Float32Array(1), new Float32Array(1), 2, 1, { update: "heun" }), /euler or exponential/);
 });
+
+// ESMFold2's own sampler (cpu/esmfold2/sampler.js; cuda/ef2/src/sampler.cuh): the same two options
+import { noiseSchedule as ef2Schedule, samplerStep as ef2Step } from "../cpu/esmfold2/sampler.js";
+const EF2 = { steps: 15, sMax: 160, sMin: 4e-4, p: 8, sigmaData: 16, maxSigma: 256 };
+
+test("ESMFold2's geometric schedule: even in log sigma under the cap, the zero kept, 13 steps where Karras runs 11", () => {
+  const karras = ef2Schedule(EF2), geo = ef2Schedule({ ...EF2, schedule: "geometric" });
+  assert.equal(karras.length - 1, 11);
+  assert.equal(geo.length - 1, 13);
+  assert.equal(geo[0], 256);
+  assert.equal(geo[geo.length - 1], 0);
+  const r = geo.slice(1, -1).map((v, i, a) => (i ? v / a[i - 1] : null)).slice(1);
+  for (const x of r) assert.ok(Math.abs(x - r[0]) < 1e-5);
+});
+
+test("ESMFold2's exponential step lands at the denoised answer at sigma 0 and between the two before it", () => {
+  const atoms = 3, w = Float32Array.from([1, 1, 1]);
+  const d = Float32Array.from([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  const noisy = Float32Array.from([0, 0, 0, 2, 0, 0, 0, 2, 0]);          // aligned onto d already (same centroid line)
+  const last = ef2Step(noisy, d, w, atoms, 4, 0, 1.638, "exponential");
+  for (let i = 0; i < d.length; ++i) assert.ok(Math.abs(last[i] - d[i]) < 1e-4);
+  assert.throws(() => ef2Step(noisy, d, w, atoms, 4, 1, 1.638, "heun"), /euler or exponential/);
+});

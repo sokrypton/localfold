@@ -185,6 +185,9 @@ FOLD
   --seed=N                 the sampler's noise (0)
   --steps=N                scheduled sampler steps: 15 (11 run), raised to 64 when the input has a ligand,
                            ion or modified residue, which fewer steps tear apart
+  --update=exponential     the sampler's step x = r^S x + (1 - r^S) d (Blitz's) rather than Euler's;
+                           --schedule=geometric spaces the levels evenly in log sigma (15 scheduled then run 13);
+                           --no-churn drops the noise injection. Measured in docs/EF2FAST.md: no default changes
   --frames=<dir>           intermediate results as they land: contacts-00-of-01.u8 after the trunk,
                            frame-SSSS-NNNN.pdb every sampler step
 
