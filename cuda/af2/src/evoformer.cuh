@@ -722,7 +722,12 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       return;
     }
     size_t per = (size_t)L * O * O;
-    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
+    // i-blocks of 2^26 product elements, 2^28 where the output projection reads the product in place (no permuted copy,
+    // no f32 Y beside it) and the card has the room (what the product holds counted, so each pass decides alike):
+    // A100 1,000 / 1,500 residues 11.86 -> 11.78 / 23.19 -> 22.95 s; 2^27 and 2^29 level or slower
+    const bool directOut = ccOf() >= 80;
+    const size_t budget = directOut && roomFor(((size_t)256 << 20) * 2, {"fopm.P"}) ? (size_t)256 << 20 : (size_t)64 << 20;
+    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, budget / per));
     // the sum over the rows scaled by 2^-k - exact, as a power of two is - so it fits float16, and opmAddK scales it back:
     // unscaled, 7GYV's alignment at 1,945 extra rows overflowed it and NaN'd the fold (ColabFold's 512:5120 asks 5,120).
     // 2^k the row count / 64: the largest entry there was ~34 a row, so ~2,200 scaled, and the small ones stay clear of
@@ -733,7 +738,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     // FP8 where the card has FP8 tensor instructions (fp8Tensor): both operands e4m3 over the rows padded to 16. From
     // Ampere on the output projection reads the product in place (opmOutK). RTX PRO 6000, 1,000 residues at 508 + 5,120
     // rows: 8.00 -> 7.60 s (FP8) -> 7.05 s (in place); A100 12.91 -> 12.23 s (README, "The deep outer product mean")
-    const bool f8 = fp8Tensor(), direct = ccOf() >= 80;
+    const bool f8 = fp8Tensor(), direct = directOut;
     const int Sp = (rowsN + 15) / 16 * 16, LO = L * O;
     __nv_fp8_e4m3 *l8 = nullptr, *r8 = nullptr;
     if (f8) {
