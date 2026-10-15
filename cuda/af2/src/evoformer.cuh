@@ -722,11 +722,15 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       return;
     }
     size_t per = (size_t)L * O * O;
-    // i-blocks of 2^26 product elements, 2^28 where the output projection reads the product in place (no permuted copy,
-    // no f32 Y beside it) and the card has the room (what the product holds counted, so each pass decides alike):
-    // A100 1,000 / 1,500 residues 11.86 -> 11.78 / 23.19 -> 22.95 s; 2^27 and 2^29 level or slower
+    // i-blocks of 2^26 product elements (128 MB), 2^28 where the output projection reads the product in place (no
+    // permuted copy, no f32 Y beside it), the card has the room (what the product holds counted, so each pass decides
+    // alike), and its L2 does not hold a 2^26 block between the contraction writing it and opmOutK reading it. A100
+    // (40 MB of L2) 600 / 1,000 / 1,500 residues 4.91 / 11.95 / 23.19 -> 4.84 / 11.83 / 22.95 s at 2^28, 2^27 and 2^29
+    // level or slower, 2^23-2^25 slower; RTX PRO 6000 (128 MB of L2) 3.02 / 6.93 / 46.94 s (2,500) at 2^26 against
+    // 3.05 / 6.98 / 47.14 at 2^28, opmOutK 104 -> 138 ms at 600, and 2^24-2^25 level or slower
     const bool directOut = ccOf() >= 80;
-    const size_t budget = directOut && roomFor(((size_t)256 << 20) * 2, {"fopm.P"}) ? (size_t)256 << 20 : (size_t)64 << 20;
+    static const bool l2HoldsBlock = [] { int d, l2; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, d)); return l2 >= (96 << 20); }();
+    const size_t budget = directOut && !l2HoldsBlock && roomFor(((size_t)256 << 20) * 2, {"fopm.P"}) ? (size_t)256 << 20 : (size_t)64 << 20;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, budget / per));
     // the sum over the rows scaled by 2^-k - exact, as a power of two is - so it fits float16, and opmAddK scales it back:
     // unscaled, 7GYV's alignment at 1,945 extra rows overflowed it and NaN'd the fold (ColabFold's 512:5120 asks 5,120).
