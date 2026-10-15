@@ -58,16 +58,13 @@ static void triangle(T* pair, const float* mask, int L, int C, const std::string
     layerNorm(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
   }
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  // the pad is written by nothing: zeroed once for a buffer and a size
-  static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0;
-  if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp)) {
-    fill(a, 0, plane * C * 2); fill(b, 0, plane * C * 2);
-    zeroedA = a; zeroedB = b; zeroedLp = Lp;
-  }
+  // the pad, written by nothing here, zeroed every call: zeroed once and remembered by its pointer, another buffer's bytes
+  // there once its memory is reused were a moved fold on CUDA (docs/CUDA-TO-METAL.md, 1)
+  if (Lp != L) { padZero(a, C, L, Lp); padZero(b, C, L, Lp); }
   gemmTriGate(xn, triGate(Tn, C), mask, a, b, 0, P, C, plane, L, Lp, nullptr, triQuartersApply(C));
   // per channel: outgoing prod[j][i] = sum_k a[j][k] b[i][k]; incoming sum_k b[k][j] a[k][i]
-  float* prod = scratch<float>("ftri.prod", plane * C);
-  const float hs = halfProductScale();      // (the product in half, scaled: core.mm)
+  const float hs = halfProductScale();      // (the product in half, scaled: core.mm - and its buffer half-sized)
+  void* prod = scratchBytes("ftri.prod", plane * C * (hs ? 2 : 4));
   {
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
     g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.label = outgoing ? "triangle out contraction" : "triangle in contraction";
@@ -76,10 +73,12 @@ static void triangle(T* pair, const float* mask, int L, int C, const std::string
     else { g.X = b; g.transX = true; g.W = a; }
     gemm(g);
   }
-  half* cn = scratch<half>("ftri.cn", P * C);
+  // (the planes are read by nothing after the contraction: the centre norm is written over a, the gated add's value
+  // over b - two pair-sized buffers fewer, 1.1 GB at 1044 residues)
+  half* cn = a;
   if (hs) centerNorm((const half*)prod, hs, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
-  else centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
-  half* outH = scratch<half>("ftri.outh", P * C);
+  else centerNorm((const float*)prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
+  half* outH = b;
   half* lnOut = next.empty() ? nullptr : lnTarget(P, C, xn);
   if (gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,
                        "triangle output and gated add", lnOut, lnOut ? F(next + "Scale") : nullptr, lnOut ? F(next + "Offset") : nullptr))
@@ -122,16 +121,51 @@ static void trunkBlockT(T* pair, const float* mask, int L, int C, const std::str
 void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
   trunkBlockT(pair, mask, L, C, prefix, b, nextFollows);
 }
+void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
+  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows);
+}
+bool halfPairBlocks(int C) {
+  static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  return halfWanted && matrixUnits() && C % 8 == 0;
+}
 
-void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
+void foldingTrunk(int T, int C, const float* zi, float*& z, int loops) {
   size_t P = (size_t)T * T;
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});          // every token is real
   if (M.has("f/recycle/decay")) die("this model's recycle (the released ESMFold2's parcae loop) is not in the native port yet");
-  fill(z, 0, P * C * 4);
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   half* xn = scratch<half>("trunk.xn", chunk * C);
   int blocks = (int)M.meta("meta/blocks");
+  // The blocks over a half pair: their updates end in bandwidth-bound GEMMs that read and write it, and half moves half
+  // the bytes. Where the matrix units run (their kernels take a half residual); every residual is summed in float and
+  // rounded once, every norm reads the half values. LOCALFOLD_HALF_PAIR=0 the control. And no float pair while they do:
+  // the recycle (z = LN(z) @ projection + z_init) reads the half one, which is what the float one held (it was the half
+  // one widened), and writes it back a chunk at a time - bit-identical, and z given back for the whole trunk (1.1 GB at
+  // 1044 residues, without a reallocation a loop)
+  if (halfPairBlocks(C)) {
+    release(z);
+    z = nullptr;
+    half* zh = scratch<half>("trunk.zh", P * C);
+    fill(zh, 0, P * C * 2);
+    float* y = scratch<float>("trunk.y", chunk * C);
+    for (int loop = 0; loop < loops; ++loop) {
+      for (size_t r0 = 0; r0 < P; r0 += chunk) {
+        size_t r = std::min(chunk, P - r0);
+        layerNorm(zh + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        Gemm g{}; g.X = xn; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16; g.Y = y; g.Yin = zi + r0 * C;
+        g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
+        gemm(g);
+        toHalf(y, zh + r0 * C, r * C);
+      }
+      for (int b = 0; b < blocks; ++b) trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks);
+    }
+    releaseScratch({"ftri.", "ftr.", "eln."});
+    z = allocT<float>(P * C);
+    toFloat(zh, z, P * C);
+    return;
+  }
+  fill(z, 0, P * C * 4);
   for (int loop = 0; loop < loops; ++loop) {
     // z = LN(z) @ projection + z_init, a chunk of rows at a time
     for (size_t r0 = 0; r0 < P; r0 += chunk) {
@@ -141,18 +175,7 @@ void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
       g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
       gemm(g);
     }
-    // The blocks over a half pair: their updates end in bandwidth-bound GEMMs that read and write it, and half moves half
-    // the bytes. Where the matrix units run (their kernels take a half residual); every residual is summed in float and
-    // rounded once, every norm reads the half values; the recycle and everything after read z back in float.
-    // LOCALFOLD_HALF_PAIR=0 the control
-    static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
-    if (halfWanted && matrixUnits() && C % 8 == 0) {
-      half* zh = scratch<half>("trunk.zh", P * C);
-      toHalf(z, zh, P * C);
-      for (int b = 0; b < blocks; ++b) trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks);
-      toFloat(zh, z, P * C);
-    } else
-      for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
+    for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
   }
 }
 

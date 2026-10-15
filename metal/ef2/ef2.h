@@ -44,7 +44,10 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
 void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z);
 // nextFollows: block b + 1 runs next on this pair, nothing between (its first norm is emitted by this block)
 void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
-void foldingTrunk(int T, int C, const float* zInit, float* z, int loops);
+void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
+bool halfPairBlocks(int C);     // the blocks over a half pair here (matrix units; LOCALFOLD_HALF_PAIR=0 the control)
+// (z is given back and made again while the blocks run on a half copy: a new pointer)
+void foldingTrunk(int T, int C, const float* zInit, float*& z, int loops);
 // the page's contact map: the softmax mass under each pair's threshold - [T * T] on the host
 std::vector<float> contactMap(const float* z, int T, int C);
 
@@ -81,7 +84,8 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
 struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
-Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice);
+// (the trunk's pair is read once, then given back: zTrunk is null after)
+Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, int Si, const float* xDevice);
 
 // ---------------------------------------------------------------- output (output.mm)
 void writePdb(const std::string& templatePath, const std::string& out, const std::vector<float>& x,

@@ -9,7 +9,7 @@
 #include "ef2.h"
 #include <cmath>
 
-Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice) {
+Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, int Si, const float* xDevice) {
   struct Restore { bool was = HALF_GEMM; ~Restore() { HALF_GEMM = was; } } restore;
   HALF_GEMM = false;
   int C = dimOf("f/confidence/sToZ", 1), Cs = dimOf("f/confidence/poolingOutput", 1);
@@ -18,6 +18,8 @@ Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInput
   layerNorm(sInputs, s, T, Si, F("confidence/sInputsNorm/scale"), F("confidence/sInputsNorm/offset"));
   float* z = allocT<float>(P * C);
   layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+  release(zTrunk);      // (read no more: 1.1 GB at 1044 residues)
+  zTrunk = nullptr;
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
   lin(s, "f/confidence/sToZ", r, T, Si, C);
@@ -40,13 +42,26 @@ Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInput
   // z + trunk(z)
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});
-  float* stack = allocT<float>(P * C);
-  copy(stack, z, P * C * 4);
-  for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
-    trunkBlock(stack, mask, T, C, "confidence/blocks", b);
-  add(z, stack, P * C);
-  release(stack);
-  releaseScratch({"ftri.", "ftr."});
+  // (over a half copy where the trunk's blocks run half: the stack's own pair 0.56 GB, not 1.1, beside the blocks' scratch)
+  if (halfPairBlocks(C)) {
+    half* stackH = scratch<half>("cf.stackH", P * C);
+    toHalf(z, stackH, P * C);
+    for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
+      trunkBlock(stackH, mask, T, C, "confidence/blocks", b);
+    releaseScratch({"ftri.", "ftr.", "eln."});
+    float* stack = scratch<float>("cf.stack", P * C);
+    toFloat(stackH, stack, P * C);
+    add(z, stack, P * C);
+    releaseScratch({"cf.stack"});
+  } else {
+    float* stack = allocT<float>(P * C);
+    copy(stack, z, P * C * 4);
+    for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
+      trunkBlock(stack, mask, T, C, "confidence/blocks", b);
+    add(z, stack, P * C);
+    release(stack);
+  }
+  releaseScratch({"ftri.", "ftr.", "eln."});
   // single by row-attention pooling
   float* score = scratch<float>("cf.score", P);
   lin(z, "f/confidence/poolingAttention", score, P, C, 1);

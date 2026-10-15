@@ -26,6 +26,13 @@ void mem(const char* at) {
   printf("  memory %-22s %6.2f GB held (scratch %.2f, weights %.2f)\n", at, allocated() / 1e9, scratchHeld() / 1e9, M.weightBytes() / 1e9);
 }
 
+// the fit check's factors, measured on the M5 at 522 and 1044 residues: the language model's stage holds the tower and
+// its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (4.5 a pair byte where its blocks run
+// half on the matrix units, 5.5 where they run float: LOCALFOLD_GEMM_TENSOR=0) - the larger stage is the peak
+static const double EF2_PAIR_SLOW = 5.6;
+static double ef2Peak(double held, double tower, double pair) {
+  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (matrixUnits() ? 4.6 : EF2_PAIR_SLOW) * pair);
+}
 bool KEEP_TOWER = false;      // (--serve: the next job reads it again)
 int foldInput(const Opts& o) {
   SamplerSettings sampler = o.sampler;
@@ -42,6 +49,9 @@ int foldInput(const Opts& o) {
          (int)M.meta("meta/layers"), (int)M.meta("meta/pairChannels"), (float)M.meta("meta/residualScale", 1.0)};
   printf("ESMFold2: %d tokens, %d atoms, %d tower rows\n", T, (int)M.meta("meta/atoms"), e.rows);
   int C = e.pair;
+  // the fit check (core.h foldFits): what is held now - the weights and the input - and the f32 pair times a factor
+  // measured at 522 and 1044 residues (metal/README.md)
+  if (!foldFits("ef2", ef2Peak((double)allocated(), KEEP_TOWER ? 0. : (double)M.bundleWeightBytes("c"), (double)T * T * C * 4))) return 1;
   // the language model
   float* lmZ = allocT<float>((size_t)T * T * C);
   double t0 = now();
@@ -80,7 +90,7 @@ int foldInput(const Opts& o) {
   printf("trunk %.1f ms\n", ms(t0));
   mem("trunk");
   release(zi);
-  releaseScratch({"ftri.", "ftr.", "trunk.", "zi."});
+  releaseScratch({"ftri.", "ftr.", "eln.", "trunk.", "zi."});     // (eln.: the emitted norm, held through the sampler before)
   if (getenv("EF2_SAVE_PAIR")) {
     auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
   }
@@ -218,7 +228,7 @@ int foldMain(int argc, char** argv) {
   M.loadInput(o.dir);
   printf("loaded in %.2f s\n", now() - tStart);
   int rc = foldInput(o);
-  if (getenv("LOCALFOLD_METAL_STATS")) printStats();
+  if (getenv("LOCALFOLD_METAL_STATS") || getenv("LOCALFOLD_PEAK")) printStats();
   if (DETACH && rc == 0) { printf("ef2: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   fflush(stdout);
   exit(rc);
