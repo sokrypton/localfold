@@ -314,6 +314,14 @@ bf16 one 128 x 128, which is 708 -> 652 ms of the contraction at 1,000 residues 
 3.02 / 6.85 / 14.78 / 47.24 s (bf16) at 600 / 1,000 / 1,500 / 2,500 residues, so 0.6% at best and slower at 2,500. The
 fold moves 0.016-0.027 A (5CAJ, 1TIM) where the f16 product reproduces the shipped build exactly.
 
+**Emulated and not taken: the MSA stack's GEMMs in FP8.** The main MSA's q/k/v/gate projections (~527 ms of a
+1,000-residue fold on the G4) and its transition's first layer (~388 ms) could take e4m3 operands (the LayerNorm
+writing e4m3, the weights at a power-of-two scale, the output f16/bf16). Emulated on the A100 by rounding exactly those
+operands through e4m3: 5CAJ and 1TIM with their alignments move 0.025 / 0.015 A, but from a single sequence 6MRR moves
+0.044 A and 1QYS 0.039 against 0.014 for TF32 off (`AF2_NO_TF32`), and 5CAJ (pLDDT 31, undetermined) 2.44 A against
+0.36. Each half alone is already past TF32: the transition 0.021-0.026 A, the projections 0.020-0.036 A. The OPM's FP8
+never reaches a single-sequence fold (one row takes the shallow form); these GEMMs would.
+
 **Tried and lost:** an FP8 GEMM batched over i with m = 32, writing `[i][j][b][a]` straight into the output GEMM's
 input with the output weights' rows swapped once. It took 3.43 / 8.24 / 20.10 s on the G4, against 3.30 / 7.59 / 16.27 s
 for the permute, at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core.
