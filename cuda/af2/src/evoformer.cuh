@@ -263,6 +263,20 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
   }
   return z;
 }
+// the MSA16 stack's row (NB false: the pair bias) and column (NB: none) attention, bf16 out, with the pair track's
+// speculative softmax (FLASH_SPEC), and the row attention its 64-key tiles where an SM holds two blocks of them
+// (flash2RWideKeys). A100, 1,000 residues, 508 rows: the row attention 914 -> 862 ms, the column 524 -> 511 (64 keys
+// there 545: no bias tile for the wider tile to amortise)
+template <bool NB>
+inline void msaFlash(const half* qkvg, const half* bias, int stride, __nv_bfloat16* o, int n, int heads, size_t rows, float scale,
+                     size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
+  using B16 = __nv_bfloat16;
+  if (FLASH_SPEC && !NB && flash2RWideKeys())
+    flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  else if (FLASH_SPEC)
+    flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  else flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+}
 // --fast: from the normalised input xn (f16): one q/k/v/gate GEMM straight into the flash kernel's
 // layout -> flash attention -> the output projection with its bias, added into `residual` (transposed
 // back first when `transposedBack`, xn being [n, Bt] of the residual's [Bt, n])
@@ -407,7 +421,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
-      flashGrid2RRun<32, 2, 48, 2, 2, false, false, B16>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D), nullptr);
+      msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
       ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, true);
       return;
     }
@@ -446,7 +460,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
     ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
     B16* o = scratch<B16>("fatt.o16", rows * Wp);
-    flashGrid2RRun<32, 2, 48, 2, 2, true, false, B16>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D), nullptr,
+    msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
     ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, true);
     return;
