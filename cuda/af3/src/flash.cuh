@@ -1420,6 +1420,9 @@ inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOL
 // and 1TIM self-templated 0.014 A from the folds without it, every crystal RMSD within 0.006 A of its own.
 // spec: 0 or 1 takes it off or on (--bench-grid's arms), -1 by the length
 // the attention from qkvg's q and gate (f16, [row][pos][4W]) and K8, V8 (e4m3, [row][pos][W] - gridInK's kv8)
+// (its geometry swept on Colab's RTX PRO 6000, --bench-grid at 1,000 / 2,000 tokens: 4 warps, one query tile, 3 rows
+// 2.04 / 14.65 ms; 2 warps two tiles 3 rows 2.24 / 14.20, 4 warps 2 rows 2.18 / 15.74, 8 warps 2.33 / 19.44, 6 rows
+// 7.62 / 67.6 - every geometry byte-identical. Kept)
 inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
                       int heads, size_t rows, float scale, const float* qBias, int spec = -1) {
   constexpr int WARPS = 4, BK = 64, MT = 1, RR = 3, BQ = 16 * MT * WARPS;
