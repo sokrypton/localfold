@@ -73,6 +73,7 @@ static int foldMain(int argc, char** argv) {
   }
   bool noGraphs = false;     // (--no-graphs: GRAPHS stays off where several GPUs turn it back on)
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
+  DiffusionOptions diffusion;     // --schedule=geometric, --update=exponential, --no-churn (sampler.cuh)
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
   bool af3Defaults = false, saveEmbeddings = false, saveDistogram = false;
@@ -102,6 +103,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
     else if (!strcmp(argv[i], "--flow")) SAMPLER_FLOW = true;     // the page's Flow sampler (sampler.cuh)
+    else if (diffusionFlag(argv[i], diffusion)) {}                 // --schedule=, --update=, --no-churn (sampler.cuh)
     else if (!strncmp(argv[i], "--sigma-max=", 12)) SAMPLER_SIGMA_MAX = atof(argv[i] + 12);   // where diffusion starts
     else if (!strncmp(argv[i], "--frames=", 9)) framesDir = argv[i] + 9;   // each step's prediction, streamed (FrameStreamer)
     else if (!strcmp(argv[i], "--save-embeddings")) saveEmbeddings = true;
@@ -721,6 +723,11 @@ static int foldMain(int argc, char** argv) {
     NS = (int)cn;
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
+    if ((diffusion.geometric || diffusion.exponential || !diffusion.churn) && (SAMPLER_FLOW || M.flag("trunk.dialect.chaiSampler"))) {
+      fprintf(stderr, "--schedule, --update and --no-churn are the diffusion sampler's: %s does not take them\n",
+              SAMPLER_FLOW ? "the Flow sampler" : "chai-1's sampler");
+      return 1;
+    }
     if (SAMPLER_FLOW && M.flag("trunk.dialect.noFlowSampler")) {
       // the page's own rule (noFlowSampler, shared/af3/dialect.js): this checkpoint's walk collapses the
       // backbone while its pLDDT reads as if nothing were wrong
@@ -739,7 +746,7 @@ static int foldMain(int argc, char** argv) {
     NS = (int)mySeeds.size();
     std::vector<float> xs = NS ? sample(steps, mySeeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }) : std::vector<float>();
+    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }, diffusion) : std::vector<float>();
     if (dealt) {
       const size_t per = mask.size() * 3;
       mg::Shared& xS = mg::shared("sh.xs", perBatch * per * 4);
@@ -1070,9 +1077,10 @@ static int foldMain(int argc, char** argv) {
   if (!serveDir.empty()) {
     // the job's flags: --out, --samples, --steps, --flow, --sigma-max, --frames, --recycles, --seed, --seeds
     const int steps0 = steps, recycles0 = recycles, samples0 = samples, folds0 = folds;
-    const bool flow0 = SAMPLER_FLOW; const double sigmaMax0 = SAMPLER_SIGMA_MAX;
+    const bool flow0 = SAMPLER_FLOW; const double sigmaMax0 = SAMPLER_SIGMA_MAX; const DiffusionOptions diffusion0 = diffusion;
     serveJobs(serveDir, "af3", [&](const std::string& input, const std::vector<std::string>& flags) {
       steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0; SAMPLER_SIGMA_MAX = sigmaMax0;
+      diffusion = diffusion0;
       framesDir.clear();
       bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
       for (auto& f : flags) {
@@ -1080,6 +1088,7 @@ static int foldMain(int argc, char** argv) {
         else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
         else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
         else if (f == "--flow") SAMPLER_FLOW = true;
+        else if (diffusionFlag(f.c_str(), diffusion)) {}
         else if (!f.compare(0, 12, "--sigma-max=")) SAMPLER_SIGMA_MAX = atof(f.c_str() + 12);
         else if (!f.compare(0, 9, "--frames=")) framesDir = f.substr(9);
         else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);

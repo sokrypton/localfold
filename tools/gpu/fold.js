@@ -89,9 +89,10 @@ export async function main(device, args) {
   // structure in eight because it is a different walk - see
   // webgpu/af3/diffusion/diffusion-sampler.js - so say so rather than let the
   // geometry report take the blame.
-  if (samplerMode === "diffusion" && steps < 50) {
+  // (with Euler's step: --update=exponential folds 6MRR at 8 steps, cpu/af3/diffusion/diffusion-sampler.js)
+  if (samplerMode === "diffusion" && steps < 50 && option(args, "update", "euler") !== "exponential") {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
-      + " it wants about 200. Add --mode=flow to get a structure in this many,"
+      + " it wants about 200. Add --update=exponential or --mode=flow to get a structure in this many,"
       + " or raise --steps. What follows is expected to look like noise.");
   }
 
@@ -611,6 +612,13 @@ export async function main(device, args) {
     pairWeightPrecision: option(args, "pair-weights", undefined),
     accumulatePrecision: option(args, "accumulate", undefined),
     mode: samplerMode,
+    // the diffusion's discretisation (cpu/af3/diffusion/diffusion-sampler.js): --schedule=geometric,
+    // --update=exponential, --no-churn - the native port's flags
+    diffusion: {
+      ...(option(args, "schedule", undefined) ? { schedule: option(args, "schedule", undefined) } : {}),
+      ...(option(args, "update", undefined) ? { update: option(args, "update", undefined) } : {}),
+      ...(args.includes("--no-churn") ? { churn: false } : {}),
+    },
     recycles: Number(option(args, "recycles", "0")),
     // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE, in ANGSTROMS, on
     // the distances the distogram predicts - the same quantity and unit as

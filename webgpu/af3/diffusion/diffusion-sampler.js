@@ -20,7 +20,8 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  * @param {object} weights the diffusion head's
  * @param {{steps: number, normal: () => number, onStep?: Function,
  *          stopAfter?: number, gamma0?: number, gammaMin?: number,
- *          noiseScale?: number, stepScale?: number}} options
+ *          noiseScale?: number, stepScale?: number, schedule?: "karras"|"geometric",
+ *          update?: "euler"|"exponential", churn?: boolean}} options
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -40,7 +41,8 @@ export async function sampleOnGpu(device, input, weights, options) {
   // AF3's constants boltz2's backbone bonds come out at 9.6 A against an ideal
   // 1.46.
   const model = input.dialect?.sampler ?? {};
-  const gamma0 = options.gamma0 ?? model.gamma0 ?? 0.8;
+  // (schedule, update and churn: cpu/af3/diffusion/diffusion-sampler.js's, read through noiseLevels and samplerStep)
+  const gamma0 = options.churn === false ? 0 : options.gamma0 ?? model.gamma0 ?? 0.8;
   const gammaMin = options.gammaMin ?? model.gammaMin ?? 1.0;
   const noiseScale = options.noiseScale ?? model.noiseScale ?? 1.003;
   const stepScale = options.stepScale ?? model.stepScale ?? 1.5;
@@ -74,7 +76,7 @@ export async function sampleOnGpu(device, input, weights, options) {
 
     const denoised = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
                                     weights);
-    positions = samplerStep(noisy, denoised.positions, tHat, level, { stepScale });
+    positions = samplerStep(noisy, denoised.positions, tHat, level, { stepScale, update: options.update });
     previous = level;
 
     // 🔴 `denoised` IS THE FRAME WORTH WATCHING and neither is in a stable

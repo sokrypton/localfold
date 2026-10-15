@@ -6578,3 +6578,65 @@ Measured on the A100 (developer flags, int5 bundle), 5CAJ chain A (262 tokens) u
   + 0.60 (combine), 600 8.18 -> 4.94 + 0.58; warm folds 1.44 -> 1.38 s at 262. The combine is a fixed
   ~0.45 ms a call, which is why the old per-(query, head) kernel still wins below 80 tokens (68: 1.12
   against 1.46) and the threshold is 80.
+
+## The diffusion's discretisation after Blitz: the exponential update and the geometric schedule (2026-10-15)
+
+Blitz (an ICLR 2027 submission: AlphaFold 3 and Boltz-2 distilled to eight diffusion steps) replaces the sampler's
+Euler step with `x' = r^S x + (1 - r^S) D`, `r = sigma' / sigma`, and Karras's rho-7 schedule with one evenly spaced in
+log sigma. Neither needs training. Both are options here now, inert by default (byte-identical folds):
+`--update=exponential`, `--schedule=geometric` and `--no-churn` on cuda/af3 and `tools/gpu/fold.js`, and
+`{ update, schedule, churn }` in `foldBatch`'s `diffusion` option (cpu/af3/diffusion/diffusion-sampler.js holds the
+arithmetic; test/diffusion-update.test.js its closed forms). A Flow, or chai-1's sampler, refuses them.
+
+**Why Euler fails below ~25 steps.** Its coefficient on x is `1 + S (r - 1)`, which goes negative once `r < 1/3` at
+AF3's step scale of 1.5. At 8 steps every model's fold is not a chain (consecutive CA ~25 A) - on the WebGPU page path
+too. The exponential step's coefficient is `r^S`, always between 0 and 1.
+
+**The grid** (cuda/af3, seven models - af3, boltz2, protenix2, intellifold2, rosettafold3, openbind0, opendde - by
+bench-sampler-geometry.js's seven systems, two seeds; bond RMS by class against the CCD; ligand = GOL, ATP and SEP):
+
+| arm | ligand bonds median / mean | ligand cells > 0.15 A | protein + nucleic median (max) |
+|---|---:|---:|---:|
+| 8 Euler | 32 / 31 (not a chain) | 21/21 | 25 A |
+| 8 exponential | 0.59 / 0.62 | 20/21 | 0.061 (0.158) |
+| 8 geometric + exponential | 0.46 / 0.44 | 19/21 | 0.049 (0.093) |
+| 8 geometric + exponential, no churn | 0.46 / 0.48 | 18/21 | 0.044 (0.115) |
+| 16 Euler | 0.109 / 0.139 | 8/21 | 0.038 (0.057) |
+| 16 geometric + exponential | 0.092 / 0.113 | 5/21 | 0.038 (0.065) |
+| 16 geometric + exponential, no churn | 0.241 / 0.236 | 13/21 | 0.039 (0.056) |
+| 25 Euler (the page's default) | 0.070 / 0.124 | 5/21 | 0.038 (0.056) |
+| 25 exponential | 0.078 / 0.087 | 2/21 | 0.038 (0.071) |
+| **25 geometric + exponential** | **0.057 / 0.066** | **0/21** | 0.039 (0.057) |
+| 200 Euler | 0.053 / 0.057 | 0/21 | 0.037 (0.056) |
+
+**Crystals** (CA RMSD, five seeds, mean and range):
+
+| | 25 Euler | 25 geometric + exp | 8 geometric + exp | 200 Euler |
+|---|---|---|---|---|
+| af3 6MRR | 0.595 (0.52-0.68) | 0.694 (0.65-0.83) | 0.581 (0.49-0.70) | 0.614 (0.58-0.67) |
+| af3 1QYS | 1.152 | 1.141 | 1.127 | 1.214 |
+| af3 5K9P | 12.04 | 10.74 | 11.31 | 10.65 |
+| af3 5CAJ (alignment) | 1.921 | 1.981 | 1.901 | 1.948 |
+| af3 1TIM (alignment) | 1.099 | 1.122 | 1.101 | 1.103 |
+| boltz2 6MRR | 0.545 | 0.591 | 0.595 | 0.525 |
+| boltz2 1QYS | 1.851 (1.21-2.82) | 2.608 (1.14-3.34) | 2.477 | 2.467 |
+| boltz2 5K9P | 2.075 | 2.196 | 1.964 | 2.094 |
+| boltz2 5CAJ (alignment) | 1.943 | 1.875 | 1.789 | 1.876 |
+| boltz2 1TIM (alignment) | 1.198 | 1.163 | 1.170 | 1.163 |
+
+What it says:
+- **Eight steps fold a protein or a nucleic acid as well as 200**, with geometric + exponential, on every crystal above
+  and on the grid's protein and nucleic bonds. Ligands and modified residues are not there at 8 (0.46 against 0.053):
+  an 8-step setting is for jobs without them.
+- **At 25 steps geometric + exponential brings ligand bonds to the 200-step level** (0/21 cells past 0.15 A against
+  Euler's 5/21), with the crystals level on nine of ten cells and af3's 6MRR 0.1 A worse.
+- **Churn stays.** Blitz deploys its students deterministically; the undistilled teachers lose ligand geometry without
+  churn at 16 and 25 steps.
+- **The exponential update alone is not the gain at 16-25.** Without the geometric schedule it is mixed there.
+
+🔴 **AND THE GRID FOUND A STANDING DEFECT: OpenDDE's protein + DNA.** Its nucleic bonds are 1.3-2.3 A RMS in EVERY arm
+including 200 Euler steps, where its DNA alone is 0.037 and every other model's protein + DNA is 0.036-0.041. Not
+investigated here; the sampler options do not cause it.
+
+Raw rows: `/tmp/claude-1000/sch/grid*.txt` and `acc-*.txt` on the A100 box (not kept). The defaults are not changed by
+this commit.

@@ -35,9 +35,18 @@
  * tools/oracle/check_af3_sampler.js.
  */
 
-/** AF3's EDM noise schedule, in angstroms. */
+/**
+ * AF3's EDM noise schedule, in angstroms - or, with `schedule: "geometric"`, the
+ * same endpoints evenly spaced in log sigma (Karras's rho taken to infinity),
+ * which Blitz (an ICLR 2027 submission on few-step AF3 and Boltz-2) finds
+ * spends a short budget better. cuda/af3/src/sampler.cuh has the same two.
+ */
 export function noiseSchedule(t, { sigmaData = 16, sigmaMin = 0.0004,
-                                   sigmaMax = 160, rho = 7 } = {}) {
+                                   sigmaMax = 160, rho = 7, schedule = "karras" } = {}) {
+  if (schedule === "geometric") {
+    return sigmaData * Math.exp(Math.log(sigmaMax) + t * (Math.log(sigmaMin) - Math.log(sigmaMax)));
+  }
+  if (schedule !== "karras") throw new Error(`schedule ${schedule}: karras or geometric`);
   const low = Math.pow(sigmaMin, 1 / rho);
   const high = Math.pow(sigmaMax, 1 / rho);
   return sigmaData * Math.pow(high + t * (low - high), rho);
@@ -116,8 +125,21 @@ export function randomAugmentation(positions, mask, atoms, normal) {
  * must reproduce AF3's next positions.
  */
 export function samplerStep(positionsNoisy, denoised, tHat, noiseLevel,
-                            { stepScale = 1.5 } = {}) {
+                            { stepScale = 1.5, update = "euler" } = {}) {
   const output = new Float32Array(positionsNoisy.length);
+  // `update: "exponential"` (Blitz's): x' = r^S x + (1 - r^S) D with r = level / tHat,
+  // where Euler is x' = x + S (r - 1) (x - D) - whose coefficient on x goes
+  // NEGATIVE once a step is large (r < 1/3 at S 1.5), so below ~25 steps the
+  // walk overshoots: at 8 steps AlphaFold 3's 6MRR is 20.9 A and not a chain,
+  // and 0.55 A with this update.
+  if (update === "exponential") {
+    const keep = Math.pow(noiseLevel / tHat, stepScale);
+    for (let index = 0; index < output.length; index += 1) {
+      output[index] = keep * positionsNoisy[index] + (1 - keep) * denoised[index];
+    }
+    return output;
+  }
+  if (update !== "euler") throw new Error(`update ${update}: euler or exponential`);
   const delta = noiseLevel - tHat;
   for (let index = 0; index < output.length; index += 1) {
     const gradient = (positionsNoisy[index] - denoised[index]) / tHat;
@@ -137,7 +159,8 @@ export function samplerStep(positionsNoisy, denoised, tHat, noiseLevel,
  */
 export function sample(denoise, options) {
   const { atoms, mask, steps, normal } = options;
-  const gamma0 = options.gamma0 ?? 0.8;
+  // `churn: false` drops AF3's noise injection, so the walk is deterministic past its first draw
+  const gamma0 = options.churn === false ? 0 : options.gamma0 ?? 0.8;
   const gammaMin = options.gammaMin ?? 1.0;
   const noiseScale = options.noiseScale ?? 1.003;
   const stepScale = options.stepScale ?? 1.5;
@@ -163,7 +186,7 @@ export function sample(denoise, options) {
     }
 
     const denoised = denoise(noisy, tHat);
-    positions = samplerStep(noisy, denoised, tHat, level, { stepScale });
+    positions = samplerStep(noisy, denoised, tHat, level, { stepScale, update: options.update });
     previous = level;
 
     // 🔴 `denoised` IS THE ONE WORTH WATCHING, NOT `positions`. It is the
