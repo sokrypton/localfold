@@ -276,7 +276,7 @@ __global__ void swapAddRowsK(float* y, const float* x, int A, int B, int C, size
 inline void attentionCore(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const float* keyMask,
                           const half* bias, float* residual, bool transposedBack) {
   size_t rows = (size_t)Bt * n;
-  AttnW w = attnWeights(A, blk, C);
+  AttnW w = attnWeights(A, blk, C, flashNarrow(keyMask));
   int Wp = w.H * w.Dp, stride = (n + 7) / 8 * 8;
   if (!bias) bias = zeroBias(w.H, n, stride);
   // where the q/k/v/gate and the output of every row would not fit with room to spare, a chunk of rows at

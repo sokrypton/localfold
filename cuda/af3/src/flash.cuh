@@ -76,6 +76,15 @@ __device__ __forceinline__ void mma16816h(uint32_t* d, const uint32_t* a, uint32
                : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(a[3]), "r"(b1));
 #endif
 }
+// m16n8k8 with an f16 accumulator (an 8-wide head's Q K^T)
+__device__ __forceinline__ void mma1688h(uint32_t* d, uint32_t a0, uint32_t a1, uint32_t b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  mma1688hEmu(d, a0, a1, b);
+#else
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};"
+               : "+r"(d[0]), "+r"(d[1]) : "r"(a0), "r"(a1), "r"(b));
+#endif
+}
 __device__ __forceinline__ __half2 asH2(uint32_t u) { return *reinterpret_cast<__half2*>(&u); }
 __device__ __forceinline__ uint32_t asU32(__half2 h) { return *reinterpret_cast<uint32_t*>(&h); }
 __device__ __forceinline__ uint32_t pack2(float lo, float hi) {
@@ -675,9 +684,11 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // padded 80-byte rows were conflict-free to read and conflicting to write: --bench-grid 5.65 -> 5.24 ms at
 // 1,044 tokens, 0.204 -> 0.191 at 300, bit-identical. Otherwise D + 8 as before. (The same swizzle on the
 // bias tile - 128-byte rows, chunk ^ row & 7 - was measured 3.6% slower: wider rows, more address math.)
-template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 ? D : D + 8; }
+// At D 8 (AF2's extra stack) a row is one 16-byte chunk, unpadded: eight rows are 128 contiguous bytes, conflict-free
+template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 || D == 8 ? D : D + 8; }
 template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
   if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
+  else if constexpr (D == 8) return r * 8 + c;
   else return r * (D + 8) + c;
 }
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
@@ -836,7 +847,12 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
   int ib[MT];                                                        // each tile's row g (and g + 8)
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) ib[mt] = q0 + warp * 16 * MT + mt * 16 + g;
-  uint32_t qa[MT][D / 16][4];
+  // D 8: one m16n8k8 A fragment a tile (rows g and g + 8, k 2 tig and one more) in qa[mt][0][0..1]
+  static_assert(D != 8 || BK % 32 == 0, "an 8-wide head's K and V are read four key tiles an ldmatrix");
+  uint32_t qa[MT][(D + 15) / 16][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+    if constexpr (D == 8) { qa[mt][0][0] = q2(ib[mt], tig * 2); qa[mt][0][1] = q2(ib[mt] + 8, tig * 2); }
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
@@ -893,8 +909,19 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
         }
       }
     }
+    if constexpr (D == 8) {
 #pragma unroll
-    for (int nt = 0; nt < BK / 8; ++nt)
+      for (int nt = 0; nt < BK / 8; nt += 4) {
+        uint32_t kb[4];                                   // four key tiles' B fragments (k 2 tig, key g)
+        ldsm4(kb, K + fa2Kv<D>((nt + (lane >> 3)) * 8 + (lane & 7), 0));
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+#pragma unroll
+          for (int mt = 0; mt < MT; ++mt) mma1688h(sh[mt][nt + q], qa[mt][0][0], qa[mt][0][1], kb[q]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < (D == 8 ? 0 : BK / 8); ++nt)
 #pragma unroll
       for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
         uint32_t kb[4];
@@ -948,6 +975,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
         hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
       }
     }
+    uint32_t v8[4];                                       // D 8: two 16-key steps' V fragments an ldmatrix
 #pragma unroll
     for (int t = 0; t < BK / 16; ++t) {
       uint32_t pa[MT][4];
@@ -963,8 +991,13 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
         pa[mt][3] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][1]), hn[mt][1])));
         mma16816(lsum[mt], pa[mt], ONES_H2, ONES_H2);
       }
+      if constexpr (D == 8) {
+        if (t % 2 == 0) ldsm4t(v8, V + fa2Kv<D>((t + (lane >> 4)) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), 0));
 #pragma unroll
-      for (int et = 0; et < D / 8; et += 2) {
+        for (int mt = 0; mt < MT; ++mt) mma16816(o[mt][0], pa[mt], v8[(t % 2) * 2], v8[(t % 2) * 2 + 1]);
+      }
+#pragma unroll
+      for (int et = 0; et < (D == 8 ? 0 : D / 8); et += 2) {
         uint32_t vb[4];
         ldsm4t(vb, V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + (lane >> 4)) * 8));
 #pragma unroll
@@ -1520,6 +1553,7 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
           flashGrid2RRun<16, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias); break;
         }
       }
+
       if constexpr (D == 32) {
         if (!flashRegStaged()) { flashGridHalfAt<D, 4, 48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break; }
         if (!mask && flash2R1Strided(qkvg, bias, stride, out, n, heads, rows, scale, qBias)) break;
@@ -1529,6 +1563,9 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
     default: flashGridHalfAt<D, 1>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
   }
 }
+// an 8-wide head unpadded (AF2's extra stack): flashGrid2R's D 8 form, where it takes the call - unmasked, cp.async
+// (anywhere else the heads are padded to 16)
+inline bool flashNarrow(const float* mask) { return !mask && !flashRegStaged(); }
 template <class T>
 void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* out, int n, int heads,
                int D, size_t r0, size_t rows, bool tr, float scale, const float* qBias = nullptr) {
@@ -1536,6 +1573,12 @@ void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* o
     if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    else if (D == 8 && flashNarrow(mask)) {
+      // (the 32-wide form's geometry and its speculative softmax: at 1,000 residues and 5,120 rows 704 ms padded to 16,
+      // 577 unpadded, 532 with SPEC; 32- 96- and 128-key tiles, four warps a block or four rows were level or slower)
+      if (FLASH_SPEC) flashGrid2RRun<8, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+      else flashGrid2RRun<8, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    }
     else if (D == 64) flashGridHalfLaunch<64>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else { fprintf(stderr, "flashGrid: no f16 kernel for head width %d\n", D); exit(1); }
   } else {

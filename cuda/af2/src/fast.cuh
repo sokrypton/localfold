@@ -157,12 +157,13 @@ __global__ void packOutputWeightK(const float* o, half* out, int C, int H, int D
   out[t] = __float2half(d < D ? o[((size_t)h * D + d) * C + c] : 0.f);
 }
 struct AttnW { const half* qkvg; const float* qkvgBias; const half* out; int H, D, Dp; };
-inline AttnW attnWeights(const std::string& A, int blk, int C) {
-  static std::map<std::pair<std::string, int>, AttnW> cache;
-  auto it = cache.find({A, blk});
+// narrow: an 8-wide head left unpadded, for the flash kernel's D 8 form (flashNarrow); otherwise padded to 16
+inline AttnW attnWeights(const std::string& A, int blk, int C, bool narrow = false) {
+  static std::map<std::tuple<std::string, int, bool>, AttnW> cache;
+  auto it = cache.find({A, blk, narrow});
   if (it != cache.end()) return it->second;
   int H = (int)dimW(A + "/query_w", blk < 0 ? 1 : 2), D = (int)dimW(A + "/query_w", blk < 0 ? 2 : 3);
-  int Dp = D < 16 ? 16 : D;
+  int Dp = D < 16 && !(narrow && D == 8) ? 16 : D;
   AttnW w{}; w.H = H; w.D = D; w.Dp = Dp;
   half* qk = wpool<half>((size_t)C * 4 * H * Dp);
   packQkvgWeightK<<<blocks((size_t)C * 4 * H * Dp), 256, 0, STREAM>>>(P(A + "/query_w", blk), P(A + "/key_w", blk),
@@ -172,7 +173,7 @@ inline AttnW attnWeights(const std::string& A, int blk, int C) {
   half* ow = wpool<half>((size_t)H * Dp * C);
   packOutputWeightK<<<blocks((size_t)H * Dp * C), 256, 0, STREAM>>>(P(A + "/output_w", blk), ow, C, H, D, Dp);
   w.qkvg = qk; w.qkvgBias = gb; w.out = ow;
-  return cache[{A, blk}] = w;
+  return cache[{A, blk, narrow}] = w;
 }
 
 // ---------------------------------------------------------------- f16 elementwise

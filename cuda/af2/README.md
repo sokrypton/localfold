@@ -210,8 +210,8 @@ Every intermediate seam is 1e-8 to 5e-7 in float32 (the monomer template's torsi
 
 - f16 tensor-core GEMMs through cuBLASLt, with bias and ReLU in the epilogue and residual adds as
   beta.
-- cuda/af3's flash attention for every 16- and 32-wide head; the extra stack's 8-wide heads are
-  padded to 16.
+- cuda/af3's flash attention for every 16- and 32-wide head. The extra stack's 8-wide heads run unpadded on
+  the kernel's D 8 form where it applies (unmasked, from Ampere on), and are padded to 16 elsewhere.
 - q/k/v/gate as one GEMM straight into the flash layout.
 - A strided copy of the kernel, so column attention and the ending node read their tensor where it
   lies and write into the residual's layout, with no transposes.
@@ -311,6 +311,31 @@ not run.
 **Tried and lost:** an FP8 GEMM batched over i with m = 32, writing `[i][j][b][a]` straight into the output GEMM's
 input with the output weights' rows swapped once. It took 3.43 / 8.24 / 20.10 s on the G4, against 3.30 / 7.59 / 16.27 s
 for the permute, at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core.
+
+### The extra stack's 8-wide heads, unpadded (2026-10-15)
+
+The extra MSA stack's row attention has 8 heads 8 wide, and was padded to 16: the q/k/v/gate projection wrote 512
+columns where 256 carry anything, and the flash kernel ran 16-wide MMAs over zeros. `flashGrid2R` now has a D 8 form:
+m16n8k8 MMAs for Q K^T, one n8 tile for P V, unpadded 16-byte K and V rows (eight to a conflict-free 128 bytes), and
+the 32-wide form's geometry and speculative softmax. It takes the call where the attention is unmasked and cp.async
+double-buffers (`flashNarrow`), so `attnWeights` leaves those heads unpadded there. A masked extra stack and a T4 keep
+the padded heads.
+
+At 1,000 residues and 5,120 extra rows the kernel is 704 -> 532 ms on the A100 and 393 -> 291 on the G4. The q/k/v/gate
+GEMM saves another ~50 ms. The kernel does not halve because at D 8 it is bound by the softmax, not the MMAs. Fold time,
+interleaved, two rounds each:
+
+| | 600 res | 1,000 res | 1,500 res | 2,500 res |
+|---|---:|---:|---:|---:|
+| A100, padded | 5.00 s | 12.22 s | 23.47 s | |
+| A100, unpadded | **4.93 s** | **12.00 s** | **23.38 s** | |
+| RTX PRO 6000, padded | 3.09 s | 7.03 s | 15.03 s | 47.71 s |
+| RTX PRO 6000, unpadded | **3.02 s** | **6.90 s** | **14.78 s** | **46.98 s** |
+
+5CAJ moves 0.011-0.014 A and 1TIM 0.021 A. Geometries measured at 1,000 residues on the A100 (kernel ms): 64-key tiles
+577 and with SPEC 532 (taken), 32 keys 579, 96 keys 573, 128 keys 602, four warps one row 578, four query tiles a warp
+579; with SPEC, four rows a block 816 (two warps) and 634 (one), eight rows 928, four warps two rows 808. Those forms
+are past the launch bound's four warps, so they lose their register cap and their occupancy.
 
 ## A deep alignment's featurisation (2026-10-08)
 
