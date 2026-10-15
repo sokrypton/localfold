@@ -8,8 +8,9 @@
 
 static int round8(int n) { return (n + 7) / 8 * 8; }
 // The pair track's working tensors are shared by name across its stages, which run one after another: a pair-sized half
-// buffer for each stage's normalised input (pr.x) and two for its intermediates (pr.h1, pr.h2), and one large buffer
-// that is the grid attention's q|k|v|g or the triangle's two planes and their product (pr.big). Held per stage they
+// buffer for each stage's normalised input (pr.x, and pr.x2 for a norm emitted beside it), one for the grid attention's
+// output (pr.h1; the triangle's centre norm too where its product is float), and one large buffer that is a block of
+// the grid attention's q|k|v|g or the triangle's planes, product, centre norm and value (pr.big). Held per stage they
 // were twice the room: 4.0 against 2.0 GB at 1044 tokens.
 static void* bigBuffer(size_t bytes) { return scratchBytes("pr.big", bytes); }
 
@@ -92,24 +93,16 @@ static void triangleT(T* pair, const Masks& m, int n, int C, const std::string& 
     tg = foldNorm("tg:" + pre, triGateWeight(pre, C), C, 4 * C, pre + ".leftNormInput", nullptr);
     gl = foldNorm("gl:" + pre, Wh(pre + ".gatingLinear"), C, C, pre + ".leftNormInput", nullptr);
   }
-  char* big = (char*)bigBuffer(plane * C * 8);         // a and b (half) and their product (float)
-  half* a = (half*)big; half* b = a + plane * C;
-  padZero(a, 2 * (size_t)C, n, np);                   // (the padding is written by nothing here, and pr.big is shared)
-  gemmTriGate(xn, xs ? tg.w : triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np, xs ? tg.b : nullptr, triQuartersApply(C));
-  float* prod = (float*)(big + plane * C * 4);
-  const float hs = halfProductScale();      // (the product in half, scaled: core.mm)
-  {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
-    g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.alpha = (divide ? 1.f / n : 1.f) * (hs ? hs : 1.f); g.accFloat = hs != 0.f;
-    g.label = outgoing ? "triangle out contraction" : "triangle in contraction";
-    if (outgoing) { g.X = a; g.W = b; g.transW = true; }
-    else { g.X = b; g.transX = true; g.W = a; }
-    gemm(g);
-  }
-  half* cn = scratch<half>("pr.h1", P * C);
-  if (hs) centerNorm((const half*)prod, hs, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
-  else centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
-  half* outH = scratch<half>("pr.h2", P * C);
+  // the planes, their contraction, the centre norm and the gated add's value in pr.big (core's triContract: 0.63 GB at
+  // 1044 tokens, where the planes with a float-sized product and pr.h1, pr.h2 beside them were 1.7)
+  void* big = bigBuffer(triBytes(C, np));
+  half* a = triPlanes(big, n, C, np);
+  gemmTriGate(xn, xs ? tg.w : triGateWeight(pre, C), m.pair, a, a + plane, 0, P, C, 2 * plane, n, np, xs ? tg.b : nullptr,
+              triQuartersApply(C));
+  TriMid mid = triContract(big, n, C, outgoing, divide ? 1.f / n : 1.f, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                           halfProductScale() ? nullptr : scratch<half>("pr.h1", P * C),
+                           outgoing ? "triangle out contraction" : "triangle in contraction");
+  half* cn = mid.cn; half* outH = mid.outH;
   half* lnOut = !nextNorm.empty() && !into && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
   if (gemmGatedAddDual(xn, xs ? gl.w : Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C,
                        xs ? gl.b : nullptr, nullptr, outH,
@@ -145,16 +138,36 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
   } else lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
   int stride = round8(n);
   half* bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
-  half* qkvg = (half*)bigBuffer(P * 4 * Wd * 2);
-  linW(xn, xs ? fq.w : qkvgWeight(pre, C, Wd, true), qkvg, P, C, 4 * Wd, xs ? fq.b : qkvgBias(pre, Wd), "grid qkvg");
+  // q|k|v|g a block of rows at a time (tr: of columns), 256 MB of them: the whole pair's was 1.1 GB at 1044 tokens, the
+  // largest buffer of a fold. A row's attention reads its own n positions and nothing else, so the blocks are the
+  // same arithmetic; below ~500 tokens one block is the whole pair
+  const size_t perRow = (size_t)n * 4 * Wd * 2;
+  const int rb = qkvgBlockRows(perRow, n);
+  half* qkvg = (half*)bigBuffer((size_t)rb * perRow);
+  const half* wq = xs ? fq.w : qkvgWeight(pre, C, Wd, true);
+  const float* bq = xs ? fq.b : qkvgBias(pre, Wd);
   half* o = scratch<half>("pr.h1", P * Wd);
-  Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = D; at.rows = n; at.scale = 1.f / sqrtf((float)D);
-  at.bias = bias; at.biasStride = stride;
-  if (!m.ones) { at.mask = m.pair; at.maskB = tr ? 1 : n; at.maskK = tr ? n : 1; }
-  if (tr) { at.rowStride = 4 * Wd; at.posStride = (int64_t)n * 4 * Wd; at.outRowStride = Wd; at.outPosStride = (int64_t)n * Wd; }
-  // (untransposed: the column direction's output kept at (r, j), chai's - its ending-node update at (i, j) is AF3's at (j, i))
-  if (tr && untransposed) { at.outRowStride = 0; at.outPosStride = 0; }
-  attention(at);
+  for (int r0 = 0; r0 < n; r0 += rb) {
+    const int r = std::min(rb, n - r0);
+    // rows r0.. of xn are contiguous (and every column, the whole pair); columns r0.. are r rows at each of the n
+    // positions, a GEMM batched over them
+    Gemm g{}; g.tx = F16; g.W = wq; g.tw = F16; g.Y = qkvg; g.ty = F16; g.in = C; g.out = 4 * Wd; g.bias = bq; g.accFloat = true;
+    g.label = "grid qkvg";
+    if (!tr || r == n) { g.X = xn + (size_t)r0 * n * C; g.rows = (size_t)r * n; }
+    else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)n * C; g.sy = (int64_t)r * 4 * Wd; g.batch = n; }
+    gemm(g);
+    Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = heads; at.D = D; at.rows = r; at.scale = 1.f / sqrtf((float)D);
+    at.bias = bias; at.biasStride = stride; at.r0 = r0;
+    if (!m.ones) { at.mask = m.pair; at.maskB = tr ? 1 : n; at.maskK = tr ? n : 1; }
+    if (!tr) at.out = o + (size_t)r0 * n * Wd;
+    else {
+      at.rowStride = 4 * Wd; at.posStride = (int64_t)r * 4 * Wd;
+      // (untransposed: the column direction's output kept at (r, j), chai's - its ending-node update at (i, j) is AF3's at (j, i))
+      if (untransposed) at.out = o + (size_t)r0 * n * Wd;
+      else { at.out = o + (size_t)r0 * Wd; at.outRowStride = Wd; at.outPosStride = (int64_t)n * Wd; }
+    }
+    attention(at);
+  }
   // chai-1's confidence blocks: each direction's output projection plus its transposed twin, summed once (their two
   // applications cancel to one at inference - af3-any-model's dual_output)
   if (!pre.compare(0, 11, "confidence.") && hasW(pre + ".outputProjectionTransposed")) {

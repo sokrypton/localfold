@@ -102,10 +102,11 @@ std::string pdbText(const std::vector<float>& pos, const std::vector<float>& pld
 }
 
 // the fit check's factors (bytes at the peak per byte of the f32 pair, and of the f32 MSA and extra MSA together), measured
-// on the M5 at 522 and 1044 residues - the multimer with four templates, the monomer with 512 + 1024 rows: 7.0 and 1.5
-// where the evoformer runs half (matrix units), PAIR_SLOW where it runs float (LOCALFOLD_GEMM_TENSOR=0) - rounded up
-static const double AF2_MSA_FACTOR = 1.6, AF2_PAIR_SLOW = 7.1;   // (the float path measured 5.3 over one pass)
-static double af2PairFactor() { return matrixUnits() ? 7.1 : AF2_PAIR_SLOW; }
+// on the M5 at 1044 residues - the multimer with four templates, the monomer with 512 + 1024 rows: 4.59 and 2.16 where the
+// evoformer runs half (matrix units), PAIR_SLOW where it runs float (LOCALFOLD_GEMM_TENSOR=0) - rounded up. (Below ~600
+// residues the fold's fixed costs dominate and the estimate reads up to 10% under; it is the long folds it decides.)
+static const double AF2_MSA_FACTOR = 2.2, AF2_PAIR_SLOW = 4.7;   // (the float path measured 4.14 over one pass)
+static double af2PairFactor() { return matrixUnits() ? 4.7 : AF2_PAIR_SLOW; }
 int foldInput(const std::string& dir, const std::string& out, int recycles) {
   double t0 = now();
   Trunk t{};
@@ -151,6 +152,9 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
   for (int pass = 0; pass < passes; ++pass) {
     const double passStart = now();
     if (pass == 0 && profiling()) profileStart();
+    // the last pass's structure module and heads given back (the recycled state is copied out of them): kept, their
+    // slots stayed grown to their sizes and the next evoformer's buffers landed in them - 1044 residues 3.31 -> 2.76 GB
+    if (pass > 0) releaseScratch({"sm.", "head."});
     embed(t, pass, prevRow, prevPos);
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
     else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);

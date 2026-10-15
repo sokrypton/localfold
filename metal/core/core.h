@@ -178,6 +178,21 @@ void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float*
 // ...from the product in half, stored times prodScale (the triangle's contraction scaled to fit half: the norm is
 // scale-free but for its epsilon, scaled here to match)
 void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int C, const float* scale, const float* offset);
+// The triangle multiplication's middle in one buffer of triBytes: gemmTriGate's planes a and b interleaved by channel
+// (triPlanes: a, its padding zeroed; b = a + Lp * Lp; a channel stride of 2 Lp * Lp), and ahead of them room for one
+// block of the contraction's channels. triContract contracts a block of channels at a time, each block written over
+// the planes the block before read - the product ends up contiguous at the buffer's start - then the centre norm: into
+// the buffer past the product where the product is half (halfProductScale), else into spare ([L * L][C], the caller's).
+// Its outH, room for the gated add's value [L * L][C], is over the product. At 1044 tokens and 128 channels 0.63 GB,
+// against 1.7 GB for the planes, a float-sized product, the norm and the value apart
+size_t triBytes(int C, int Lp);
+half* triPlanes(void* big, int L, int C, int Lp);
+struct TriMid { half* cn; half* outH; };
+// an attention's q|k|v|g built a block of batch rows at a time: the rows a block (of `rows`, each perRow bytes) that
+// keeps it to 256 MB, the blocks balanced (LOCALFOLD_QKVG_MB: the budget, 0 - one block, the control)
+int qkvgBlockRows(size_t perRow, int rows);
+TriMid triContract(void* big, int L, int C, bool outgoing, float alpha, const float* scale, const float* offset, half* spare,
+                   const char* label);
 void toHalf(const float* x, half* y, size_t n);
 void toFloat(const half* x, float* y, size_t n);
 void add(float* y, const float* x, size_t n, float a = 1.f);      // y += a x

@@ -1078,6 +1078,54 @@ void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int
   run(k, grid1d((P + per - 1) / per, 1), 256,
       CenterNormArgs{nullptr, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset, prod, 1e-5f * prodScale * prodScale, 0});
 }
+// (a block of a quarter of the channels: the room ahead of the planes is a quarter of them, and the contraction four
+// batched GEMMs where it was one - the same products, each channel's its own)
+// (LOCALFOLD_TRI_BLOCKS: the number of blocks, 1 the control - one GEMM, the planes' room ahead of them all of them)
+static int triBlock(int C) {
+  static const int blocks = getenv("LOCALFOLD_TRI_BLOCKS") ? std::max(1, atoi(getenv("LOCALFOLD_TRI_BLOCKS"))) : 4;
+  return (C + blocks - 1) / blocks;
+}
+int qkvgBlockRows(size_t perRow, int rows) {
+  static const size_t budget = (getenv("LOCALFOLD_QKVG_MB") ? (size_t)atol(getenv("LOCALFOLD_QKVG_MB")) : 256) << 20;
+  if (!budget || !perRow || (size_t)rows * perRow <= budget) return std::max(rows, 1);
+  const int most = (int)std::max<size_t>(1, budget / perRow), blocks = (rows + most - 1) / most;
+  return (rows + blocks - 1) / blocks;
+}
+size_t triBytes(int C, int Lp) {
+  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C);
+  return plane * 2 * (2 * (size_t)C + (halfProductScale() ? cc : 2 * cc));
+}
+half* triPlanes(void* big, int L, int C, int Lp) {
+  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C);
+  half* a = (half*)big + plane * (halfProductScale() ? cc : 2 * cc);
+  padZero(a, 2 * (size_t)C, L, Lp);       // (the planes' padding, written by nothing else, and the buffer shared)
+  return a;
+}
+TriMid triContract(void* big, int L, int C, bool outgoing, float alpha, const float* scale, const float* offset, half* spare,
+                   const char* label) {
+  const int Lp = (L + 7) / 8 * 8, cc = triBlock(C);
+  const size_t plane = (size_t)Lp * Lp;
+  const float hs = halfProductScale();
+  const size_t pw = hs ? 1 : 2;           // half planes a channel's product takes
+  const half* a = (half*)big + plane * pw * cc;
+  // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]. Block k's product ends
+  // at pw (k + 1) cc planes, where the planes it reads begin (pw cc + 2 k cc): a block never writes what it reads
+  for (int c0 = 0; c0 < C; c0 += cc) {
+    const half* ak = a + 2 * plane * c0; const half* bk = ak + plane;
+    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
+    g.sx = g.sw = (int64_t)(2 * plane); g.sy = (int64_t)plane; g.batch = std::min(cc, C - c0);
+    g.Y = (half*)big + plane * pw * c0; g.alpha = alpha * (hs ? hs : 1.f); g.accFloat = hs != 0.f; g.label = label;
+    if (outgoing) { g.X = ak; g.W = bk; g.transW = true; }
+    else { g.X = bk; g.transX = true; g.W = ak; }
+    gemm(g);
+  }
+  TriMid t;
+  t.cn = hs ? (half*)big + plane * C : spare;    // (past the half product: C + cc planes there)
+  if (hs) centerNorm((const half*)big, hs, t.cn, L, Lp, C, scale, offset);
+  else centerNorm((const float*)big, t.cn, L, Lp, C, scale, offset);
+  t.outH = (half*)big;                            // (the product is read by nothing after the norm)
+  return t;
+}
 void toHalf(const float* x, half* y, size_t n) { run1d("lf_to_half", (n + 3) / 4, ConvArgs{x, y, n}); }
 void toFloat(const half* x, float* y, size_t n) { run1d("lf_to_float", (n + 3) / 4, ConvBackArgs{x, y, n}); }
 void add(float* y, const float* x, size_t n, float a) { run1d("lf_add", (n + 3) / 4, AddArgs{y, x, n, a, 0}); }

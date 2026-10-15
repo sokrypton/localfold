@@ -57,28 +57,15 @@ static void triangle(T* pair, const float* mask, int L, int C, const std::string
     xn = scratch<half>("ftri.xn", P * C);
     layerNorm(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
   }
-  half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  // the pad, written by nothing here, zeroed every call: zeroed once and remembered by its pointer, another buffer's bytes
-  // there once its memory is reused were a moved fold on CUDA (docs/CUDA-TO-METAL.md, 1)
-  if (Lp != L) { padZero(a, C, L, Lp); padZero(b, C, L, Lp); }
-  gemmTriGate(xn, triGate(Tn, C), mask, a, b, 0, P, C, plane, L, Lp, nullptr, triQuartersApply(C));
-  // per channel: outgoing prod[j][i] = sum_k a[j][k] b[i][k]; incoming sum_k b[k][j] a[k][i]
-  const float hs = halfProductScale();      // (the product in half, scaled: core.mm - and its buffer half-sized)
-  void* prod = scratchBytes("ftri.prod", plane * C * (hs ? 2 : 4));
-  {
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
-    g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.label = outgoing ? "triangle out contraction" : "triangle in contraction";
-    if (hs) { g.alpha = hs; g.accFloat = true; }
-    if (outgoing) { g.X = a; g.W = b; g.transW = true; }
-    else { g.X = b; g.transX = true; g.W = a; }
-    gemm(g);
-  }
-  // (the planes are read by nothing after the contraction: the centre norm is written over a, the gated add's value
-  // over b - two pair-sized buffers fewer, 1.1 GB at 1044 residues)
-  half* cn = a;
-  if (hs) centerNorm((const half*)prod, hs, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
-  else centerNorm((const float*)prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
-  half* outH = b;
+  // the planes, their contraction, the centre norm and the gated add's value in one buffer (core's triContract: 1.26 GB
+  // at 1044 residues, against 1.69 for the planes and the product apart)
+  void* big = scratchBytes("ftri.big", triBytes(C, Lp));
+  half* a = triPlanes(big, L, C, Lp);
+  gemmTriGate(xn, triGate(Tn, C), mask, a, a + plane, 0, P, C, 2 * plane, L, Lp, nullptr, triQuartersApply(C));
+  TriMid mid = triContract(big, L, C, outgoing, 1.f, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"),
+                           halfProductScale() ? nullptr : scratch<half>("ftri.cn", P * C),
+                           outgoing ? "triangle out contraction" : "triangle in contraction");
+  half* cn = mid.cn; half* outH = mid.outH;
   half* lnOut = next.empty() ? nullptr : lnTarget(P, C, xn);
   if (gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,
                        "triangle output and gated add", lnOut, lnOut ? F(next + "Scale") : nullptr, lnOut ? F(next + "Offset") : nullptr))

@@ -139,15 +139,30 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
                    int64_t maskB, int64_t maskK, T* residual, bool across, const std::string& nextNorm = "", int nextBlk = 0) {
   AttnW w = attnWeights(A, blk, C);
   size_t rows = (size_t)Bt * n; int W = w.H * w.D;
-  half* qkvg = scratch<half>("att.qkvg", rows * 4 * W);
-  Gemm g{}; g.X = xn; g.tx = F16; g.W = w.qkvg; g.tw = F16; g.Y = qkvg; g.ty = F16; g.rows = rows; g.in = C; g.out = 4 * W;
-  g.bias = w.bias; g.label = "attention qkvg";
-  gemm(g);
+  // q|k|v|g a block of batch rows at a time, 256 MB of them: a triangle attention's whole pair's was 1.1 GB at 1044
+  // residues, and an alignment's as much. A batch row attends over its own n positions only, so the blocks are the same
+  // arithmetic; below ~500 residues (and most alignments) one block is everything
+  const size_t perRow = (size_t)n * 4 * W * 2;
+  const int rb = qkvgBlockRows(perRow, Bt);
+  half* qkvg = scratch<half>("att.qkvg", (size_t)rb * perRow / 2);
   half* o = scratch<half>("att.o", rows * W);
-  Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = w.H; at.D = w.D; at.rows = Bt; at.scale = 1.f / sqrtf((float)w.D);
-  at.bias = bias; at.biasStride = n; at.mask = mask; at.maskB = maskB; at.maskK = maskK;
-  if (across) { at.rowStride = 4 * W; at.posStride = (int64_t)Bt * 4 * W; at.outRowStride = W; at.outPosStride = (int64_t)Bt * W; }
-  attention(at);
+  for (int r0 = 0; r0 < Bt; r0 += rb) {
+    const int r = std::min(rb, Bt - r0);
+    // (across: batch rows r0.. are r rows at each of the n positions, a GEMM batched over them)
+    Gemm g{}; g.W = w.qkvg; g.tw = F16; g.tx = F16; g.Y = qkvg; g.ty = F16; g.in = C; g.out = 4 * W; g.bias = w.bias;
+    g.label = "attention qkvg";
+    if (!across || r == Bt) { g.X = xn + (size_t)r0 * n * C; g.rows = (size_t)r * n; }
+    else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)Bt * C; g.sy = (int64_t)r * 4 * W; g.batch = n; }
+    gemm(g);
+    Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = w.H; at.D = w.D; at.rows = r; at.scale = 1.f / sqrtf((float)w.D);
+    at.bias = bias; at.biasStride = n; at.mask = mask; at.maskB = maskB; at.maskK = maskK; at.r0 = r0;
+    if (!across) at.out = o + (size_t)r0 * n * W;
+    else {
+      at.rowStride = 4 * W; at.posStride = (int64_t)r * 4 * W;
+      at.out = o + (size_t)r0 * W; at.outRowStride = W; at.outPosStride = (int64_t)Bt * W;
+    }
+    attention(at);
+  }
   if (!nextNorm.empty() && C == 128) {     // (the residual's next norm emitted by the output projection)
     half* lnOut = lnTarget(rows, C, xn);
     Gemm g{}; g.X = o; g.tx = F16; g.W = PH(A + "/output_w", blk); g.tw = F16; g.Y = residual; g.ty = dtOf<T>(); g.rows = rows; g.in = W; g.out = C;
@@ -359,27 +374,15 @@ static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C
   std::string T = S + (outgoing ? "triangle_multiplication_outgoing" : "triangle_multiplication_incoming");
   half* xn = pairLn(pair, pairs, C, T + "/left_norm_input", blk, "tri.xn");
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-  half* a = scratch<half>("tri.a", plane * C); half* b = scratch<half>("tri.b", plane * C);
-  // the padding zeroed every call, not once and remembered: the planes' slots are shared with other modules' buffers
-  // (main.mm's families), whose bytes land there between calls (docs/CUDA-TO-METAL.md, 1)
-  if (Lp != L) { padZero(a, C, L, Lp); padZero(b, C, L, Lp); }
+  // the planes, their contraction, the centre norm and the gated add's value in one buffer (core's triContract: 0.63 GB
+  // at 1044 residues, against 0.84 for the planes and the product apart)
+  void* big = scratchBytes("tri.big", triBytes(C, Lp));
+  half* a = triPlanes(big, L, C, Lp);
   TriW w = triWeights(T, blk, C);
-  gemmTriGate(xn, w.w4, pairMask, a, b, 0, pairs, C, plane, L, Lp, w.b4, triQuartersApply(C));
-  const float hs = halfProductScale();      // (the product in half, scaled: core.mm - and its buffer half-sized)
-  void* prod = scratchBytes("tri.prod", plane * C * (hs ? 2 : 4));
-  {
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
-    g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.label = "triangle contraction";
-    if (hs) { g.alpha = hs; g.accFloat = true; }
-    if (outgoing) { g.X = a; g.W = b; g.transW = true; }
-    else { g.X = b; g.transX = true; g.W = a; }
-    gemm(g);
-  }
-  // (the planes are read by nothing after the contraction: the centre norm is written over a, the gated add's value over b)
-  half* cn = a;
-  if (hs) centerNorm((const half*)prod, hs, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
-  else centerNorm((const float*)prod, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
-  half* outH = b;
+  gemmTriGate(xn, w.w4, pairMask, a, a + plane, 0, pairs, C, 2 * plane, L, Lp, w.b4, triQuartersApply(C));
+  TriMid mid = triContract(big, L, C, outgoing, 1.f, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                           halfProductScale() ? nullptr : scratch<half>("tri.cn", pairs * C), "triangle contraction");
+  half* cn = mid.cn; half* outH = mid.outH;
   half* lnOut = nextNorm.empty() ? nullptr : lnTarget(pairs, C, xn);
   if (gemmGatedAddDual(xn, PH(T + "/gating_linear/weights", blk), cn, PH(T + "/output_projection/weights", blk), pair, pairs, C, C,
                        P(T + "/gating_linear/bias", blk), P(T + "/output_projection/bias", blk), outH, "triangle output and gated add",
