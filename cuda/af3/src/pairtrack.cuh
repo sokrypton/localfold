@@ -546,11 +546,13 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
   B16* b = scratch<B16>("trib.bbf", cs * C);
   // as wide a block as fits beside b (a, its gating rows and the product, 6 bytes a channel a pair; up to 1024 rows):
-  // every block re-reads the whole of b
+  // every block re-reads the whole of b. (Beside b, a 64th of the card kept - b is made and nothing else is asked for
+  // before the blocks' buffers are given back: with a 16th kept, 8,300 tokens on 40 GB ran 100-row blocks, the GEMMs on
+  // cuBLAS's small tiles, 238.7 s of them a pass against 60.5 at 7,800)
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
     size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * 6, spare = f > t / 16 ? f - t / 16 : 0;
+    size_t perRow = (size_t)np * C * 6, spare = f > t / 64 ? f - t / 64 : 0;
     width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
   }
   B16* a = scratch<B16>("trib.abf", (size_t)width * np * C);
@@ -1227,6 +1229,13 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
   size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
+  // as many rows a chunk (up to 256) as what is free allows, as the fused form's: 64M elements is 31 rows at 8,300 tokens,
+  // the template stack's attention 1,072 launches a pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks)
+  if (!BIG_FORCED) {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8)), spare = f > t / 16 ? f - t / 16 : 0;
+    R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
+  }
   float scale = 1.f / sqrtf((float)D);
   int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)
   for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {

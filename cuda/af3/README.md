@@ -1372,6 +1372,12 @@ last block - a second pair-sized buffer, the memory being saved, or the host (~2
 **Nothing changes below the old line**: 1,850 tokens 6.55 against 6.61 s, bit-identical; 7,800 tokens 352.5 against
 353.4 s (its template stage takes the parked path, so its end in f16 moves the fold).
 
+**And a fold near the line was 40% slow, which was the triangle's blocks**: with a 16th of the card kept spare beside
+`b`, 8,300 tokens ran 100-row blocks, cuBLAS took its small tiles, and the triangle's GEMMs were 238.7 s a pass against
+60.5 at 7,800 (nsys, one pass). A 64th kept: trunk **545.7 -> 398.8 s**, the fold 592.6 -> 434.0, the confidence head
+42.4 -> 30.8 - the cubic's ~390 - and 7,800 323.6 -> 318.3. The unfused grid attention (the template stack's) now takes
+chunks as wide as what is free, as the fused one does: 1,072 launches a pass at 8,300, ~2 s.
+
 ### 🔴 A big fold's speed: 1.9x at 7,657 tokens (2026-10-09)
 
 The same 7,657-token fold (31 chains of 1TIM, one pass, 100 steps, this 40 GB A100), against the commit before:
