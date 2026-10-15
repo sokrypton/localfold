@@ -308,6 +308,12 @@ operands rounded through e4m3 on the A100 (which has no FP8) move it 0.010-0.012
 not the GEMM. The L4 (sm_89) takes the same path and the same cuBLASLt kernels (`sm89_xmma_gemm_e4m3...`), but it was
 not run.
 
+**Tried and not taken: the FP8 GEMM into bf16.** Asked for an f16 product, cuBLASLt picks a 64 x 128 tile, and for a
+bf16 one 128 x 128, which is 708 -> 652 ms of the contraction at 1,000 residues on the G4. `opmOutK` then reads bf16
+(a bf16 MMA in `tgMain`, the output weights rounded to bf16). The folds: 3.02 / 6.89 / 14.85 / 47.14 s (f16) against
+3.02 / 6.85 / 14.78 / 47.24 s (bf16) at 600 / 1,000 / 1,500 / 2,500 residues, so 0.6% at best and slower at 2,500. The
+fold moves 0.016-0.027 A (5CAJ, 1TIM) where the f16 product reproduces the shipped build exactly.
+
 **Tried and lost:** an FP8 GEMM batched over i with m = 32, writing `[i][j][b][a]` straight into the output GEMM's
 input with the output weights' rows swapped once. It took 3.43 / 8.24 / 20.10 s on the G4, against 3.30 / 7.59 / 16.27 s
 for the permute, at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core.
