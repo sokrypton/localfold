@@ -195,12 +195,36 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
   CK(cudaFree(dSeeds));
   return out;
 }
+// The diffusion's discretisation, after Blitz (Blitz: accelerating the diffusion modules of AlphaFold3 and Boltz-2,
+// under review at ICLR 2027) - none of it trained, all of it the teacher's own denoiser:
+//   geometric:   the noise levels evenly spaced in log sigma (rho -> infinity in Karras's schedule), the same endpoints
+//   exponential: x' = r^S x + (1 - r^S) D, r = sigma' / sigma, where the Euler step is x' = x + S (r - 1) (x - D) -
+//                at a large step (r < 1/3 with S 1.5) Euler's coefficient on x goes negative and the walk overshoots
+//   churn:       AlphaFold 3's noise injection (gamma0); off, the walk is deterministic past its first draw
+// The defaults are AlphaFold 3's own.
+struct DiffusionOptions {
+  bool geometric = false, exponential = false, churn = true;
+};
+// a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
+inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
+  auto value = [&](const char* name, const char* a, const char* b, bool& set) {
+    const size_t n = strlen(name);
+    if (strncmp(f, name, n)) return false;
+    if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    return true;
+  };
+  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) return true;
+  if (!strcmp(f, "--no-churn")) { o.churn = false; return true; }
+  return false;
+}
 // Returns every sample's positions, sample-major [ns][atoms][3].
 inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                  const std::function<const float*(const float*, float, const float*)>& denoiseFn,
                                  double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
                                  double stepScale = 1.5,
-                                 const std::function<void(const std::vector<float>&)>& onLevels = {}) {
+                                 const std::function<void(const std::vector<float>&)>& onLevels = {},
+                                 const DiffusionOptions& opt = {}) {
   int ns = (int)seeds.size();
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   // a model's own EDM constants where its dialect carries them (boltz2)
@@ -233,7 +257,10 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   }
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
   if (M.flag("trunk.dialect.chaiSampler")) return sampleChai(steps, seeds, mask, denoiseFn, onLevels);
-  for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+  for (int k = 0; k <= steps; ++k)
+    levels[k] = opt.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
+                              : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+  if (!opt.churn) gamma0 = 0;
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {
     Normal normal(seeds[k]);
@@ -273,7 +300,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
-    eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)(stepScale * (level - tHat) / tHat), all3);
+    const double coef = opt.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
+    eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
   }
   std::vector<float> out = download(dX, all3);
   for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));

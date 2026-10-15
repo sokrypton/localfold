@@ -1220,6 +1220,12 @@ async function foldHolding(device, batch, weights, options, held) {
       + " 81.47 as if nothing were wrong. Pass mode: \"diffusion\"."
       + " See `noFlowSampler` in shared/af3/dialect.js.");
   }
+  // the diffusion's discretisation - { schedule, update, churn }, cpu/af3/diffusion/diffusion-sampler.js - is the
+  // diffusion sampler's alone: a flow handed one would ignore it and fold under the label it was asked for
+  const diffusion = options.diffusion ?? {};
+  if (options.mode !== "diffusion" && Object.keys(diffusion).length > 0) {
+    throw new Error(`schedule, update and churn are the diffusion sampler's; mode ${options.mode} does not take them`);
+  }
   stage("sample-start", { steps: options.steps });
   const sampled = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
@@ -1227,6 +1233,7 @@ async function foldHolding(device, batch, weights, options, held) {
         normal: normalFrom(options.seed ?? 20260831),
         onStep,
         ...(options.schedule ?? {}),
+        ...diffusion,
       })
     : await flowOnGpu(device, headInput, weights.diffusion, {
         cycles: steps, head, normal: normalFrom(options.seed ?? 20260831),
