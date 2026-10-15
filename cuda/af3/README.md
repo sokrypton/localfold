@@ -1039,6 +1039,17 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
 - **Grid attention without bounds checks** (inputs padded so loads past n read finite values):
   7.22 against 6.89 ms - at 125 registers the kernel is one register from losing a block an SM.
 
+- **A short-M GEMM for the denoiser's projections** (2026-10-15; standalone, in CUDA graphs, real weights in a 64 MB
+  ring so none is L2-resident). At 68 tokens cuBLAS takes ~9 us for every one of the block's four shapes (768x3072
+  9.9, 768x768 8.4, 1536x768 11.7) against weight-read floors of 3.2 / 0.8 / 1.6 us - a grid of a few dozen 64x64
+  tiles each walking the whole K, latency-bound; cuBLASLt's heuristic offers no split-K, and forcing split-K over every
+  algo, tile and split count of 2-32 is slower (11.9 / 13.9 / 16.0 us: its reduction is a second kernel). Three
+  hand-written forms, every one right to 2e-5: split-K over blocks reduced by the last block of a slab **30-54 us**
+  (the reduction a serial chain of L2 reads in one block - ncu: 1.7% compute, 9% L2); K over a block's eight warps
+  reduced in shared memory 16-29 us (no pipelining: each warp's 16-wide step waits on its own loads); split-K with
+  f32 atomics plus a conversion 13-21 us (a graph node is ~2-3 us here before it computes). So cuBLAS is near what a
+  separate kernel can do at this shape; the lever left is fewer nodes a step (a block's GEMMs and elementwise work in
+  one persistent kernel), not a better GEMM.
 - **The denoiser's 48-wide attention on `flashGrid2R`** (2026-10-15, `--bench-ops`, one transformer block, no mask as a
   fold runs it): slower at every size - 68 tokens 9.5-11.2 against the split kernel's 5.2 us, 261 16.6 against 11.0, 600
   36.8 against 25.9, 1,000 110 against 54, 261 x 5 samples 35.3 against 22.9 - its two query tiles a warp hold twice
