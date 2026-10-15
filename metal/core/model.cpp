@@ -125,6 +125,13 @@ const int* Model::i(const std::string& name) {
 }
 const float* Model::hostF(const std::string& name) { const float* p = f(name); sync(); return (const float*)host(p); }
 const int* Model::hostI(const std::string& name) { const int* p = i(name); sync(); return (const int*)host(p); }
+size_t Model::bundleWeightBytes(const std::string& prefix) const {
+  const std::string p = prefix + "/";
+  size_t bytes = 0;
+  for (auto& [name, v] : t)
+    if (!name.compare(0, p.size(), p)) bytes += v.n * (v.madeF32 || !v.f32 ? 2 : 4);
+  return bytes;
+}
 void Model::unloadBundle(const std::string& prefix) {
   auto it = bundleAllocs.find(prefix);
   if (it == bundleAllocs.end()) die("no bundle %s to unload", prefix.c_str());

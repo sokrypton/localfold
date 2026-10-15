@@ -77,6 +77,40 @@ struct Device {
   Stats stats;
   // scratch
   std::map<std::string, std::pair<void*, size_t>> scratch;
+  // SHARED SCRATCH (shareScratch): the large buffers of a port's named families alias slots no buffer of their own
+  // family, or of one nested with it, holds
+  struct Slot { void* p = nullptr; size_t bytes = 0; std::set<std::string> holders; };
+  std::vector<Slot> slots;
+  std::map<std::string, std::pair<int, size_t>> sharedName;     // a shared buffer's slot and the bytes it asked
+  std::vector<std::pair<std::string, std::string>> families;     // prefix, family
+  std::set<std::pair<std::string, std::string>> nests;           // (both orders)
+  size_t sharedMin = 32u << 20;
+  bool scribble = false;
+  std::string lastFamily;
+  std::string familyOf(const std::string& name) const {
+    size_t best = 0; std::string f;
+    for (auto& [prefix, fam] : families)
+      if (prefix.size() > best && name.rfind(prefix, 0) == 0) { best = prefix.size(); f = fam; }
+    return f;
+  }
+  bool nested(const std::string& a, const std::string& b) const { return a == b || nests.count({a, b}); }
+  // every slot held by a scratch list's entry: "slot<k>(names)" and its bytes
+  std::vector<std::pair<std::string, size_t>> scratchEntries() {
+    std::vector<std::pair<std::string, size_t>> v;
+    for (auto& [k, e] : scratch) v.push_back({k, e.second});
+    for (size_t k = 0; k < slots.size(); ++k) {
+      if (!slots[k].p) continue;
+      std::string names;
+      for (auto& h : slots[k].holders) names += (names.empty() ? "" : ",") + h;
+      v.push_back({"slot" + std::to_string(k) + "(" + names + ")", slots[k].bytes});
+    }
+    return v;
+  }
+  // LOCALFOLD_PEAK: what was held at the peak - the allocation that set it and the largest scratch beside it
+  bool peakTrace = getenv("LOCALFOLD_PEAK") != nullptr;
+  const char* allocName = nullptr;
+  std::string peakReport, stageReport;
+  size_t stagePeak = 0;          // (since the last releaseScratch, which ends a stage: each stage's peak is printed there)
 
   Device() {
     @autoreleasepool {
@@ -110,9 +144,23 @@ struct Device {
     ++stats.allocs;
     uint64_t addr = b.gpuAddress;
     allocs[addr] = {b, addr, n};
-    held += n; peak = std::max(peak, held); peakLive = std::max(peakLive, held + buried);
+    held += n; peakLive = std::max(peakLive, held + buried);
+    if (peakTrace && held > stagePeak) { stagePeak = held; stageReport = tracePeak(n); if (held > peak) peakReport = stageReport; }
+    peak = std::max(peak, held);
     if (enc) [enc useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     return (void*)addr;
+  }
+  std::string tracePeak(size_t n) {
+    std::vector<std::pair<std::string, size_t>> v = scratchEntries();
+    size_t named = 0;
+    for (auto& e : v) named += e.second;
+    std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second > y.second; });
+    char line[256];
+    snprintf(line, sizeof line, "peak %.0f MB at %s (%.0f MB): scratch %.0f MB -", held / 1e6, allocName ? allocName : "(unnamed)",
+             n / 1e6, named / 1e6);
+    std::string r = line;
+    for (size_t k = 0; k < v.size() && k < 14; ++k) { snprintf(line, sizeof line, " %s %.0f", v[k].first.c_str(), v[k].second / 1e6); r += line; }
+    return r;
   }
   void release(const void* p) {
     if (!p) return;
@@ -386,35 +434,130 @@ size_t allocated() { return D().held; }
 size_t peakAllocated() { return D().peak; }
 size_t peakLive() { return D().peakLive; }
 void resetPeak() { D().peak = D().held; }
+// SHARED SCRATCH. A fold's modules run one after another, so the large buffers of one are dead while another runs: a
+// port names its families (name prefixes) and which of them are NESTED - live around each other's turn - and every
+// buffer of a family of LOCALFOLD_SHARED_MIN bytes or more (32 MB) aliases a slot that no buffer of its own family, or
+// of one nested with it, holds. A slot grows to its largest holder (the others' bytes are lost, which their families'
+// deadness allows) and is freed with its last holder. LOCALFOLD_SHARED_SCRATCH=0 the control: every buffer its own.
+// The proof is LOCALFOLD_SCRIBBLE=1: at every change of family every slot but those of a family nested with either side
+// is filled with NaN bytes, and the fold must stay bit-identical to the control's (docs/CUDA-TO-METAL.md, 1) - with
+// LOCALFOLD_SHARED_MIN=65536 too, which stands in for a long fold's sizes.
+void shareScratch(std::initializer_list<std::pair<const char*, const char*>> families,
+                  std::initializer_list<std::pair<const char*, const char*>> nested) {
+  Device& d = D();
+  std::lock_guard<std::recursive_mutex> l(d.mu);
+  static const bool off = getenv("LOCALFOLD_SHARED_SCRATCH") && !atoi(getenv("LOCALFOLD_SHARED_SCRATCH"));
+  if (off) return;
+  d.families.clear(); d.nests.clear();
+  // LOCALFOLD_SHARED_SKIP=fam,fam: those families' buffers their own (bisecting a family the scribble finds unsafe)
+  std::string skip = getenv("LOCALFOLD_SHARED_SKIP") ? std::string(",") + getenv("LOCALFOLD_SHARED_SKIP") + "," : "";
+  for (auto& [prefix, fam] : families)
+    if (skip.find("," + std::string(fam) + ",") == std::string::npos) d.families.push_back({prefix, fam});
+  for (auto& [a, b] : nested) { d.nests.insert({a, b}); d.nests.insert({b, a}); }
+  if (const char* m = getenv("LOCALFOLD_SHARED_MIN")) d.sharedMin = (size_t)atoll(m);
+  d.scribble = getenv("LOCALFOLD_SCRIBBLE") && atoi(getenv("LOCALFOLD_SCRIBBLE"));
+}
 void* scratchBytes(const std::string& name, size_t bytes) {
   Device& d = D();
   std::lock_guard<std::recursive_mutex> l(d.mu);
+  const std::string fam = d.families.empty() ? std::string() : d.familyOf(name);
+  if (!fam.empty() && fam != d.lastFamily) {
+    if (d.scribble && !d.lastFamily.empty())
+      for (auto& slot : d.slots) {
+        bool live = false;
+        for (auto& h : slot.holders) {     // (a family's own bytes are not kept across another's turn: scribbled too)
+          std::string hf = d.familyOf(h);
+          live |= (hf != fam && d.nested(hf, fam)) || (hf != d.lastFamily && d.nested(hf, d.lastFamily));
+        }
+        if (slot.p && !live) fill(slot.p, 0xff, slot.bytes);
+      }
+    d.lastFamily = fam;
+  }
+  auto sh = d.sharedName.find(name);
+  if (sh != d.sharedName.end()) {
+    Device::Slot& slot = d.slots[sh->second.first];
+    if (slot.bytes < bytes) {     // grown: every holder's pointer is the new buffer's
+      d.release(slot.p);
+      d.allocName = name.c_str();
+      slot.p = d.alloc(bytes);
+      d.allocName = nullptr;
+      slot.bytes = bytes;
+    }
+    sh->second.second = std::max(sh->second.second, bytes);
+    return slot.p;
+  }
   auto it = d.scratch.find(name);
   if (it != d.scratch.end()) {
     if (it->second.second >= bytes) return it->second.first;
     d.release(it->second.first);
     d.scratch.erase(it);
   }
+  if (!fam.empty() && bytes >= d.sharedMin) {
+    // the slot: one no buffer of this family or a nested one holds - the smallest that fits, else the largest (grown)
+    int pick = -1, empty = -1;
+    for (int k = 0; k < (int)d.slots.size(); ++k) {
+      Device::Slot& s = d.slots[k];
+      if (!s.p) { if (empty < 0) empty = k; continue; }
+      bool ok = true;
+      for (auto& h : s.holders) ok &= !d.nested(d.familyOf(h), fam);
+      if (!ok) continue;
+      if (pick < 0) { pick = k; continue; }
+      const Device::Slot& b = d.slots[pick];
+      bool fits = s.bytes >= bytes, bestFits = b.bytes >= bytes;
+      if (fits != bestFits ? fits : fits ? s.bytes < b.bytes : s.bytes > b.bytes) pick = k;
+    }
+    if (pick < 0) {
+      if (empty < 0) { empty = (int)d.slots.size(); d.slots.emplace_back(); }
+      pick = empty;
+    }
+    Device::Slot& slot = d.slots[pick];
+    if (slot.bytes < bytes) {
+      if (slot.p) d.release(slot.p);
+      d.allocName = name.c_str();
+      slot.p = d.alloc(bytes);
+      d.allocName = nullptr;
+      slot.bytes = bytes;
+    }
+    slot.holders.insert(name);
+    d.sharedName[name] = {pick, bytes};
+    return slot.p;
+  }
+  d.allocName = name.c_str();
   void* p = d.alloc(std::max<size_t>(bytes, 16));
+  d.allocName = nullptr;
   d.scratch[name] = {p, bytes};
   return p;
 }
 void releaseScratch(std::initializer_list<const char*> prefixes) {
   Device& d = D();
   std::lock_guard<std::recursive_mutex> l(d.mu);
-  for (auto it = d.scratch.begin(); it != d.scratch.end();) {
+  if (d.peakTrace && !d.stageReport.empty()) {
+    std::string names;
+    for (const char* p : prefixes) names += std::string(names.empty() ? "" : " ") + p;
+    fprintf(stderr, "metal: stage ending [%s] %s\n", names.empty() ? "all" : names.c_str(), d.stageReport.c_str());
+    d.stageReport.clear();
+  }
+  auto matches = [&](const std::string& name) {
     bool match = prefixes.size() == 0;
-    for (const char* p : prefixes) match |= it->first.rfind(p, 0) == 0;
-    if (match) { d.release(it->second.first); it = d.scratch.erase(it); }
+    for (const char* p : prefixes) match |= name.rfind(p, 0) == 0;
+    return match;
+  };
+  for (auto it = d.scratch.begin(); it != d.scratch.end();) {
+    if (matches(it->first)) { d.release(it->second.first); it = d.scratch.erase(it); }
     else ++it;
   }
+  for (auto it = d.sharedName.begin(); it != d.sharedName.end();) {
+    if (!matches(it->first)) { ++it; continue; }
+    Device::Slot& slot = d.slots[it->second.first];
+    slot.holders.erase(it->first);
+    if (slot.holders.empty()) { d.release(slot.p); slot = Device::Slot{}; }
+    it = d.sharedName.erase(it);
+  }
+  if (prefixes.size() == 0) d.lastFamily.clear();
+  d.stagePeak = d.held;
 }
-size_t scratchHeld() { size_t s = 0; for (auto& [k, v] : D().scratch) s += v.second; return s; }
-std::vector<std::pair<std::string, size_t>> scratchList() {
-  std::vector<std::pair<std::string, size_t>> v;
-  for (auto& [k, s] : D().scratch) v.push_back({k, s.second});
-  return v;
-}
+size_t scratchHeld() { size_t s = 0; for (auto& e : D().scratchEntries()) s += e.second; return s; }
+std::vector<std::pair<std::string, size_t>> scratchList() { return D().scratchEntries(); }
 // a file mapped without a copy: the GPU reads the page cache (the shard decode), and nothing counts against the device
 void* mapFile(const std::string& path, size_t* bytes) {
   Device& d = D();
@@ -975,11 +1118,23 @@ void profileReport(const char* stage, int top) {
            rows[i].second.second, rows[i].first.c_str());
   d.profiled.clear();
 }
+size_t workingSetBytes() { return (size_t)D().dev.recommendedMaxWorkingSetSize; }
+bool foldFits(const char* port, double peakBytes) {
+  const double limit = (double)workingSetBytes();
+  if (getenv("LOCALFOLD_PEAK")) fprintf(stderr, "metal: %s fit check: estimated peak %.2f GB of %.2f GB\n", port, peakBytes / 1e9, limit / 1e9);
+  if (peakBytes <= limit || getenv("LOCALFOLD_NO_FOLD_FITS")) return true;
+  fprintf(stderr, "localfold-metal: %s: this fold needs about %.1f GB of GPU memory at its peak, past the %.1f GB this Mac's "
+          "GPU can keep resident - fold fewer tokens or a shallower alignment (LOCALFOLD_NO_FOLD_FITS=1 folds anyway: it "
+          "pages, many times slower)\n", port, peakBytes / 1e9, limit / 1e9);
+  fflush(stderr);
+  return false;
+}
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 void printStats() {
   Device& d = D(); auto& s = d.stats;
   fprintf(stderr, "metal: peak %.2f GB, %ld dispatches (%ld GEMMs), %ld commits, %ld syncs %.0f ms waiting, %ld allocations, "
           "%ld staged uploads, compiling %.0f ms\n", d.peak / 1e9, s.dispatches, s.gemms, s.commits, s.syncs, s.syncMs,
           s.allocs, s.staged, s.compileMs);
+  if (d.peakTrace) fprintf(stderr, "metal: %s\n", d.peakReport.c_str());
 }
 }  // namespace mt

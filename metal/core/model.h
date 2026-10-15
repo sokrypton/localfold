@@ -82,6 +82,7 @@ class Model {
   // the float32 copies of half tensors made on demand: dropped (a stage that read them is done)
   void dropFloatCopies(const std::string& prefix);
   size_t weightBytes() const { return weightHeld; }
+  size_t bundleWeightBytes(const std::string& prefix) const;     // one loaded bundle's share of it (unloadBundle's count)
 
  private:
   const Tensor& at(const std::string& name) const;

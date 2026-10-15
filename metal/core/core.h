@@ -34,6 +34,10 @@ void resetPeak();
 void* scratchBytes(const std::string& name, size_t bytes);
 template <class T> T* scratch(const std::string& name, size_t n) { return (T*)scratchBytes(name, n * sizeof(T)); }
 void releaseScratch(std::initializer_list<const char*> prefixes = {});
+// the port's families of scratch (name prefix, family) and the pairs of them live around each other's turn: their large
+// buffers share slots (core.mm, SHARED SCRATCH)
+void shareScratch(std::initializer_list<std::pair<const char*, const char*>> families,
+                  std::initializer_list<std::pair<const char*, const char*>> nested);
 size_t scratchHeld();
 std::vector<std::pair<std::string, size_t>> scratchList();
 
@@ -186,6 +190,15 @@ bool matrixUnits();      // the matrix units' kernels run here (an Apple10 GPU o
 float halfProductScale();   // the triangle product's scale in half (core.mm), 0 where it stays float
 void profileStart();
 void profileReport(const char* stage, int top = 20);
+
+// ---------------------------------------------------------------- the fit check
+// A fold is refused up front when its estimated peak passes what this GPU can keep resident (MTLDevice's
+// recommendedMaxWorkingSetSize: 12.7 GB on a 16 GB M5): past it unified memory pages and the fold runs many times slower
+// rather than failing. A port estimates its peak from the bytes held once its input is loaded and its shapes (factors
+// measured by folding: metal/README.md). LOCALFOLD_NO_FOLD_FITS=1 folds anyway; LOCALFOLD_PEAK=1 prints the estimate.
+// false: the refusal said on stderr, the caller returns its error (a --serve process stays up for the next job)
+size_t workingSetBytes();
+bool foldFits(const char* port, double peakBytes);
 
 // ---------------------------------------------------------------- the clock
 double now();                               // seconds, monotonic
