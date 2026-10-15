@@ -223,17 +223,17 @@ inline float* pairBase(const Trunk& t) {
 // pair, measured (below)
 constexpr double PAIR16_FIT_TIMES = 1.15;
 // ...and where the blocked triangle runs fused in bf16 (triangleBlockedFused - not the FP8 TN form of an Ada or Blackwell
-// card, nor the unfused one of a T4): its b in bands at the limit, the diffusion's biases a block at a time and the
-// template stack's pair parked before its activation, the floor is the diffusion preparation's: the f16 pair, the atom
-// encoder's pair conditioning and a block's biases, ~430 bytes a pair - 0.86 of the f32 pair, measured on a 40 GB A100:
-// 9,200 tokens fold (~7,900 before), 9,550 ran out there by 0.2 GB (at 0.80 the check had admitted it)
-constexpr double PAIR16_BANDED_FIT_TIMES = 0.86;
+// card, nor the unfused one of a T4), with the template stack's pair parked before its activation and the diffusion's
+// biases a block at a time: the floor is the triangle's - the bf16 pair beside its whole b - 1.06 of the f32 pair,
+// measured on a 40 GB A100 (8,600 tokens ran out there by 50 MB). b cannot be made in bands of k: a block's output is
+// added into the pair before the next block's b is read from it (4632f67 did, and folded the wrong model)
+constexpr double PAIR16_FUSED_FIT_TIMES = 1.06;
 inline bool foldFits(int n, int C, bool stays16 = false, bool quiet = false) {
   if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
-  const bool banded = blockedFused(n, C) && !(C <= 256 && fp8Tensor());
-  double perPair = C * 4 * (stays16 ? (banded ? PAIR16_BANDED_FIT_TIMES : PAIR16_FIT_TIMES) : 1.8);
+  const bool fusedTri = blockedFused(n, C) && !(C <= 256 && fp8Tensor());
+  double perPair = C * 4 * (stays16 ? (fusedTri ? PAIR16_FUSED_FIT_TIMES : PAIR16_FIT_TIMES) : 1.8);
   size_t need = (size_t)((double)n * n * perPair) + t / 20;
   if (need <= f) return true;
   int most = f > t / 20 ? (int)std::sqrt((double)(f - t / 20) / perPair) : 0;
