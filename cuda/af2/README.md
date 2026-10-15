@@ -277,30 +277,40 @@ its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: don
 so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
 rather than mapped (cuda/af3's loader).
 
-### FP8 on Ada and Blackwell: the outer product mean's contraction (2026-10-15)
+### The deep outer product mean: FP8, and its output read in place (2026-10-15)
 
-On a card with FP8 tensor instructions (`fp8Tensor`: compute capability 8.9 on; `LOCALFOLD_FP8=0` keeps f16), the deep
-outer product mean (more rows than `OPM_SHALLOW`) contracts the rows in e4m3. Both projections are transposed to
-`[L*32][rows]` and padded to 16 rows (`opmToF8K`), cuBLASLt's TN FP8 GEMM writes a bf16 product, and the permute
-converts it to the f16 the output GEMM reads (`opmPermuteBHK`). On Colab's RTX PRO 6000 (sm_120) at 508 clusters,
-5,120 extra rows and 4 passes, interleaved, two rounds each:
+The deep form (more rows than `OPM_SHALLOW`) contracts the rows into a product laid out `[i][a][j][b]` (f16, scaled by
+2^-k), and used to permute it to `[i][j][a][b]`, project it to an f32 Y and add Y into the pair (`opmAddK`). From Ampere
+on, `opmOutK` reads the product where it lies instead: cuda/af3's 128 x 128 tensor-core main loop (`tgMain`, given a row
+stride of 32 and a chunk stride of L * 32, so that each 32-wide k chunk is one `a`) and an epilogue that adds
+(bias + 2^k y) / (1e-3 + norm) into the pair. No permuted copy, no f32 Y, no `opmAddK`. A T4 keeps cuBLAS and the permute.
+
+On a card with FP8 tensor instructions (`fp8Tensor`: compute capability 8.9 on; `LOCALFOLD_FP8=0` keeps f16) the
+contraction itself is e4m3. Both projections are transposed to `[L*32][rows]` and padded to 16 rows (`opmToF8K`), and
+cuBLASLt's TN FP8 GEMM writes the f16 product.
+
+At 508 clusters, 5,120 extra rows and 4 passes, interleaved, two rounds each (fold time):
 
 | | 600 res | 1,000 res | 1,500 res | 2,500 res |
 |---|---:|---:|---:|---:|
-| f16 contraction | 3.47 s | 8.00 s | 17.16 s | 54.14 s |
-| FP8 contraction | **3.30 s** | **7.60 s** | **16.31 s** | **51.63 s** |
+| RTX PRO 6000 (Colab G4), f16 + permute | 3.47 s | 8.00 s | 17.16 s | 54.14 s |
+| RTX PRO 6000, FP8 + permute | 3.30 s | 7.60 s | 16.31 s | 51.63 s |
+| RTX PRO 6000, FP8 + read in place | **3.08 s** | **7.05 s** | **15.16 s** | **47.85 s** |
+| A100, permute | 5.26 s | 12.91 s | 25.15 s | |
+| A100, read in place | **5.01 s** | **12.23 s** | **23.50 s** | |
 
-At 1,000 residues the contraction goes from 1,077 to 656 ms of a fold. Folds move 0.018 A (5CAJ, its 7,907-row
-alignment, seeds 0 and 1) and 0.013-0.014 A (1TIM, 16,469 rows), with pLDDT and pTM unchanged to 0.02 and 0.0002. Run
-on the A100 with the operands rounded through e4m3 (no FP8 there), the drift is 0.010-0.012 A, so it is the e4m3
-rounding and not the GEMM. The L4 (sm_89) takes the same path and the same cuBLASLt kernels (`sm89_xmma_gemm_e4m3...`)
-but was not run.
+At 1,000 residues on the A100, `opmOutK` is 549 ms of the fold where the permute alone was 605. On the G4 it is 296 ms,
+and the FP8 contraction is 710 ms where the f16 one was 1,077.
 
-**Tried and lost: no permute at all.** A GEMM batched over i with m = 32 writes `[i][j][b][a]` straight into the
-output GEMM's input, with the output weights' rows swapped once. It is 3.43 / 8.24 / 20.10 s against the permute's
-3.30 / 7.59 / 16.27 s at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core. The permute
-(435 ms at 1,000 residues) runs at memory bandwidth, so only a custom output GEMM that reads the product where it lies
-would remove it.
+Drift against the f16 + permute build: 5CAJ (7,907-row alignment) 0.016-0.018 A, 1TIM (16,469 rows) 0.013-0.014 A, pLDDT
+and pTM unchanged to 0.02 and 0.0002. On the A100 the kernel alone moves 5CAJ 0.011 A (a different summation order). The
+operands rounded through e4m3 on the A100 (which has no FP8) move it 0.010-0.012 A, so that is the e4m3 rounding and
+not the GEMM. The L4 (sm_89) takes the same path and the same cuBLASLt kernels (`sm89_xmma_gemm_e4m3...`), but it was
+not run.
+
+**Tried and lost:** an FP8 GEMM batched over i with m = 32, writing `[i][j][b][a]` straight into the output GEMM's
+input with the output weights' rows swapped once. It took 3.43 / 8.24 / 20.10 s on the G4, against 3.30 / 7.59 / 16.27 s
+for the permute, at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core.
 
 ## A deep alignment's featurisation (2026-10-08)
 

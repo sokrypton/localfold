@@ -74,15 +74,15 @@ inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn,
 // T): p[c][i][j] = sum_k a[c][i][k] b[c][j][k], the contracted index contiguous in both - the only layout an FP8 GEMM
 // takes. fp8: a and b e4m3 (unscaled: the operands sit well inside its range - folds within 0.03 A of bf16's, emulated),
 // through cuBLASLt into a bf16 product; else bf16 (bf16Gemms)
-// C (m x n, bf16, column-major, ld ldc) = A^T B, A k x m (ld lda) and B k x n (ld ldb) e4m3 - the one layout (TN) an
-// FP8 GEMM takes, batched over `batch` at the given strides; f32 accumulation. A plan a shape, cached
+// C (m x n, bf16 or `ct`, column-major, ld ldc) = A^T B, A k x m (ld lda) and B k x n (ld ldb) e4m3 - the one layout
+// (TN) an FP8 GEMM takes, batched over `batch` at the given strides; f32 accumulation. A plan a shape, cached
 inline void fp8GemmTN(int m, int n, int k, float alpha, const void* A, int lda, long long sA, const void* B, int ldb,
-                      long long sB, __nv_bfloat16* Cm, int ldc, long long sC, int batch) {
+                      long long sB, void* Cm, int ldc, long long sC, int batch, cudaDataType ct = CUDA_R_16BF) {
   struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; size_t ws; };
   static cublasLtHandle_t lt = nullptr;
-  static std::map<std::tuple<int, int, int, int, long long, int, long long, int, long long, int>, Plan> plans;
+  static std::map<std::tuple<int, int, int, int, long long, int, long long, int, long long, int, int>, Plan> plans;
   if (!lt) CB(cublasLtCreate(&lt));
-  auto key = std::make_tuple(m, n, k, lda, sA, ldb, sB, ldc, sC, batch);
+  auto key = std::make_tuple(m, n, k, lda, sA, ldb, sB, ldc, sC, batch, (int)ct);
   auto it = plans.find(key);
   if (it == plans.end()) {
     Plan pl{};
@@ -97,7 +97,7 @@ inline void fp8GemmTN(int m, int n, int k, float alpha, const void* A, int lda, 
       return l;
     };
     pl.la = layout(CUDA_R_8F_E4M3, k, m, lda, sA); pl.lb = layout(CUDA_R_8F_E4M3, k, n, ldb, sB);
-    pl.lc = layout(CUDA_R_16BF, m, n, ldc, sC);
+    pl.lc = layout(ct, m, n, ldc, sC);
     cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
     cublasLtMatmulHeuristicResult_t res[4]; int got = 0;
     for (size_t ws : { (size_t)0, (size_t)32 << 20 }) {      // (no workspace where one suffices: a CUDA graph captures it as it is)
