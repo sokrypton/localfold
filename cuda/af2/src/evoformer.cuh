@@ -582,6 +582,34 @@ __global__ void tileBiasK(const float* bias, float* out, int L, int C, float sca
 // 3063): the standard form's permute and its O^2-wide product are memory, not arithmetic. LOCALFOLD_OPM_SHALLOW
 // sets the deepest alignment it takes (0: never).
 inline const int OPM_SHALLOW = getenv("LOCALFOLD_OPM_SHALLOW") ? atoi(getenv("LOCALFOLD_OPM_SHALLOW")) : 128;
+#include "../../af3/src/tricontract.cuh"   // (bf16Gemms: past 1e10 multiply-adds a channel, the one-channel pick; fp8GemmTN)
+// the deep contraction's operands transposed to [L*O][Sp], the rows contiguous (the one layout an FP8 GEMM takes), e4m3,
+// the rows past rowsN zero
+__global__ void opmToF8K(const half* in, __nv_fp8_e4m3* out, int rowsN, int Sp, int LO) {
+  __shared__ float tile[32][33];
+  int c0 = blockIdx.x * 32, s0 = blockIdx.y * 32;
+  for (int y = threadIdx.y; y < 32; y += 8) {
+    int s = s0 + y, c = c0 + threadIdx.x;
+    tile[y][threadIdx.x] = s < rowsN && c < LO ? __half2float(in[(size_t)s * LO + c]) : 0.f;
+  }
+  __syncthreads();
+  for (int y = threadIdx.y; y < 32; y += 8) {
+    int c = c0 + y, s = s0 + threadIdx.x;
+    if (c < LO && s < Sp) out[(size_t)c * Sp + s] = __nv_fp8_e4m3(tile[threadIdx.x][y]);
+  }
+}
+// opmPermuteHK from the FP8 GEMM's bf16 product
+__global__ void opmPermuteBHK(const __nv_bfloat16* Pm, half* X, int bi, int L, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int O8 = O / 8;
+  if (t >= (size_t)bi * L * O * O8) return;
+  int e8 = (int)(t % O8); size_t r = t / O8; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
+  uint4 v = reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
+  const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&v);
+  uint4 o; half2* h = reinterpret_cast<half2*>(&o);
+  for (int q = 0; q < 4; ++q) h[q] = __float22half2_rn(__bfloat1622float2(b[q]));
+  reinterpret_cast<uint4*>(X)[t] = o;
+}
 inline void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C,
                              const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
@@ -669,8 +697,28 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     half* Pm = scratch<half>("fopm.P", (size_t)Bi * per);
     half* X = scratch<half>("fopm.X", (size_t)Bi * per);
     float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+    // FP8 where the card has FP8 tensor instructions (fp8Tensor): both operands e4m3 over the rows padded to 16, the
+    // product bf16 (in Pm's bytes). RTX PRO 6000, 1,000 residues at 508 + 5,120 rows: the fold 8.00 -> 7.60 s, folds
+    // within 0.02 A (README, "FP8 on Ada and Blackwell")
+    const bool f8 = fp8Tensor();
+    const int Sp = (rowsN + 15) / 16 * 16, LO = L * O;
+    __nv_fp8_e4m3 *l8 = nullptr, *r8 = nullptr;
+    if (f8) {
+      l8 = scratch<__nv_fp8_e4m3>("fopm.l8", (size_t)LO * Sp); r8 = scratch<__nv_fp8_e4m3>("fopm.r8", (size_t)LO * Sp);
+      dim3 g((LO + 31) / 32, Sp / 32 + (Sp % 32 != 0)), b(32, 8);
+      opmToF8K<<<g, b, 0, STREAM>>>(lt, l8, rowsN, Sp, LO);
+      opmToF8K<<<g, b, 0, STREAM>>>(rt, r8, rowsN, Sp, LO);
+    }
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
+      if (f8) {
+        __nv_bfloat16* Pb = reinterpret_cast<__nv_bfloat16*>(Pm);
+        fp8GemmTN(LO, bi * O, Sp, down, r8, Sp, 0, l8 + (size_t)i0 * O * Sp, Sp, 0, Pb, LO, 0, 1);
+        opmPermuteBHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pb, X, bi, L, O);
+        ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
+        WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false, up));
+        continue;
+      }
       CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &down, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
                       CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
@@ -715,7 +763,6 @@ __global__ void triSplitK(const float* proj, const float* gate, const float* mas
   if (c2 < C) a[(size_t)c2 * L * L + ij] = v; else b[(size_t)(c2 - C) * L * L + ij] = v;
 }
 #include "../../af3/src/triblocked.cuh"
-#include "../../af3/src/tricontract.cuh"   // (bf16Gemms: past 1e10 multiply-adds a channel, the one-channel pick)
 // one operand's [projection | gate] (C, 2C) f16 and its 2C bias, side 0 = a (the first C columns), 1 = b
 __global__ void operand2K(const float* proj, const float* gate, const float* pb, const float* gb, half* w, float* bias,
                           int C, int side) {

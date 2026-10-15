@@ -277,6 +277,31 @@ its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: don
 so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
 rather than mapped (cuda/af3's loader).
 
+### FP8 on Ada and Blackwell: the outer product mean's contraction (2026-10-15)
+
+On a card with FP8 tensor instructions (`fp8Tensor`: compute capability 8.9 on; `LOCALFOLD_FP8=0` keeps f16), the deep
+outer product mean (more rows than `OPM_SHALLOW`) contracts the rows in e4m3. Both projections are transposed to
+`[L*32][rows]` and padded to 16 rows (`opmToF8K`), cuBLASLt's TN FP8 GEMM writes a bf16 product, and the permute
+converts it to the f16 the output GEMM reads (`opmPermuteBHK`). On Colab's RTX PRO 6000 (sm_120) at 508 clusters,
+5,120 extra rows and 4 passes, interleaved, two rounds each:
+
+| | 600 res | 1,000 res | 1,500 res | 2,500 res |
+|---|---:|---:|---:|---:|
+| f16 contraction | 3.47 s | 8.00 s | 17.16 s | 54.14 s |
+| FP8 contraction | **3.30 s** | **7.60 s** | **16.31 s** | **51.63 s** |
+
+At 1,000 residues the contraction goes from 1,077 to 656 ms of a fold. Folds move 0.018 A (5CAJ, its 7,907-row
+alignment, seeds 0 and 1) and 0.013-0.014 A (1TIM, 16,469 rows), with pLDDT and pTM unchanged to 0.02 and 0.0002. Run
+on the A100 with the operands rounded through e4m3 (no FP8 there), the drift is 0.010-0.012 A, so it is the e4m3
+rounding and not the GEMM. The L4 (sm_89) takes the same path and the same cuBLASLt kernels (`sm89_xmma_gemm_e4m3...`)
+but was not run.
+
+**Tried and lost: no permute at all.** A GEMM batched over i with m = 32 writes `[i][j][b][a]` straight into the
+output GEMM's input, with the output weights' rows swapped once. It is 3.43 / 8.24 / 20.10 s against the permute's
+3.30 / 7.59 / 16.27 s at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core. The permute
+(435 ms at 1,000 residues) runs at memory bandwidth, so only a custom output GEMM that reads the product where it lies
+would remove it.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
