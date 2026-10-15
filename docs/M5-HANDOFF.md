@@ -1156,3 +1156,30 @@ changes. ESMFold2's confidence head holds the triangle buffer (1.27 GB) beside t
 
 For the M2: the same three checks as the first pass's, with `LOCALFOLD_TRI_BLOCKS=1` / `LOCALFOLD_QKVG_MB=0` as the arms
 if anything moves - the float path's product layout (2 half planes a channel) is the one this M5 ran only imitated.
+
+## 2026-10-15: WebGPU's AF2 memory (dd763ea0, b7f4c5a5)
+
+What a stock Chrome runs here was measured first: **AF3 and ESMFold2 already take the lean pair-track layout**
+(three f32 pair tensors and a quarter-channel a/b buffer; the grid attention in row chunks). Only the matrix-unit
+layouts hold the whole-pair q/k/v/g, and they need `--enable-unsafe-webgpu`, which no visitor has - so nothing there
+was changed. ESMFold2's confidence head holds its initial pair beside the f32 copy its blocks run on; dropping one
+is a precision change (Metal runs those blocks in half), not taken here. AF2 had no lean layout at all:
+
+- The evoformer's pooled scratch destroyed before the structure module (its readback awaited), and the extra stack's
+  before the main stack: the pool keyed by exact size kept every module's set beside every other's.
+- The triangle's centre norm over `a`, the matrix gate over `b`; the multimer's attention output over `normalized`.
+- `reuseLarger` (GpuBufferAllocator): a range-bound tensor may take an idle pooled buffer up to twice its size -
+  the packed attention tensors could not reuse the triangle's f32 buffers otherwise. Pairing them two to a buffer
+  is NOT possible: WebGPU's usage scope is the buffer, and the projection writes all four while reading the norm.
+- The attention a block of batch rows at a time (`attentionBlockBytes`, 128 MiB; 0 the control).
+
+| AF2 peak (stock Chrome, M5) | before | now |
+|---|---:|---:|
+| monomer 522, single sequence | 2216 MiB | 1584 |
+| multimer 522 (261 + 261) | 2763 | 2303 |
+| monomer 522, 512 + 1024 rows | 3178 | 2289 |
+| monomer 1044, single sequence | 4645 (after dd763ea0) | 4146 |
+
+Every checksum unchanged, the time level interleaved. What is left at 1044: six f32 pair tensors - the pair, the
+triangle's four, and the template stage's update, computed once and held all fold (532 MiB) to be added each recycle.
+Recomputing it per recycle, or noticing that with no template it is the embedder's bias alone, is the next thing.
