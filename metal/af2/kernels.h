@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------- the embedder
 struct TargetFeatArgs { CP(int) aatype; DP(float) tf; uint L, pad; };
 struct BroadcastRowsArgs { DP(float) msa; CP(float) row; u64 rows; uint L, C; };
-struct OuterSumArgs { DP(float) pair; CP(float) left; CP(float) right; uint L, C; };
+struct OuterSumArgs { DP(float) pair; CP(float) left; CP(float) right; uint L, C; uint add, pad; };   // add: pair += rather than =
 struct PrevDgramArgs { CP(float) pos37; CP(int) aatype; DP(float) out; uint L, pad; };
 struct RelposArgs { CP(int) ri; CP(int) asym; CP(int) entity; CP(int) sym; DP(float) out; uint L, pad; };
 struct ExtraFeatArgs { CP(int) codes; CP(float) hasDel; CP(float) delVal; DP(float) out; u64 rows; };

@@ -15,11 +15,12 @@ kernel void af2_broadcast_rows(LF_ARGS(BroadcastRowsArgs)) {   // msa[s, i] += r
   uint r = lf_udiv((uint)t, a.C), c = (uint)t - r * a.C, i = r - lf_udiv(r, a.L) * a.L;
   a.msa[t] += a.row[i * a.C + c];
 }
-kernel void af2_outer_sum(LF_ARGS(OuterSumArgs)) {      // pair = left[i] + right[j]
+kernel void af2_outer_sum(LF_ARGS(OuterSumArgs)) {      // pair = left[i] + right[j] (+ pair, where add)
   ulong t = LF_INDEX;
   if (t >= (ulong)a.L * a.L * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.L), j = ij - i * a.L;
-  a.pair[t] = a.left[i * a.C + c] + a.right[j * a.C + c];
+  float v = a.left[i * a.C + c] + a.right[j * a.C + c];
+  a.pair[t] = a.add ? v + a.pair[t] : v;
 }
 // pseudo-beta (CB; CA for glycine) from atom37 positions, then the 15-bin distogram AF2 recycles
 kernel void af2_prev_dgram(LF_ARGS(PrevDgramArgs)) {

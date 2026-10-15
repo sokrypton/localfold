@@ -28,7 +28,6 @@ void templateEmbedding(float* pair, const float* pairMask, int L) {
   float* sum = scratch<float>("tmpl.sum", pairs * C);
   fill(sum, 0, pairs * C * 4);
   float* act = scratch<float>("tmpl.act", pairs * C);
-  float* actn = scratch<float>("tmpl.actn", pairs * C);
   auto w = [&](int k) { return P(S + "template_pair_embedding_" + std::to_string(k) + "/weights"); };
   int nb = (int)dimW(IT + "pair_transition/transition1/weights", 0);
   for (int k = 0; k < T; ++k) {
@@ -45,8 +44,8 @@ void templateEmbedding(float* pair, const float* pairMask, int L) {
       triangleAttention(act, pairMask, L, C, IT, b, false, false);
       transition(act, pairs, C, IT + "pair_transition", b);
     }
-    layerNormW(act, actn, pairs, C, S + "output_layer_norm");
-    add(sum, actn, pairs * C);
+    layerNormW(act, act, pairs, C, S + "output_layer_norm");     // (in place: a row is read whole before it is written)
+    add(sum, act, pairs * C);
   }
   run1d("af2_relu_scale", pairs * C, ReluScaleArgs{sum, pairs * C, 1.f / T, 0});
   linearB(sum, TE + "output_linear", -1, pair, pairs, C, Cz, false, 1.f);
@@ -73,9 +72,7 @@ void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T) 
       triangleMultiplication(act, pairMask, L, C, PS, b, false);
       transition(act, pairs, C, PS + "pair_transition", b);
     }
-    float* tmp = scratch<float>("mtmpl.ln", pairs * C);
-    layerNormW(act, tmp, pairs, C, S + "output_layer_norm");
-    copy(act, tmp, pairs * C * 4);
+    layerNormW(act, act, pairs, C, S + "output_layer_norm");     // (in place: a row is read whole before it is written)
   }
   const std::string A = TE + "attention/";
   int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), W = Hh * D;

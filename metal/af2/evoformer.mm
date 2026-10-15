@@ -72,8 +72,8 @@ static bool allOnes(const float* d, size_t n) {
 }
 
 // ---------------------------------------------------------------- the embedder
-// prev: prevMsaRow [L, 256], prevPair [L, L, 128], prevPos [L, 37, 3]
-void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos) {
+// prev: prevMsaRow [L, 256], prevPos [L, 37, 3]; the previous pair is t.pair itself (zero before the first pass)
+void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
   const std::string E = "evoformer/";
   int L = t.L, N = t.N;
   std::string f = "f" + std::to_string(pass) + "/";
@@ -94,19 +94,17 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, c
   linearB(tf, E + "left_single", -1, left, L, 21, 128);
   linearB(tf, E + "right_single", -1, right, L, 21, 128);
   size_t pairs = (size_t)L * L;
-  run1d("af2_outer_sum", pairs * 128, OuterSumArgs{t.pair, left, right, (uint)L, 128});
+  // (the recycled pair normalised in place - a row is read whole before it is written - and the outer sum added to it:
+  // a copy of the last pass's pair and its norm were two f32 pairs more, 1.1 GB at 1044 residues)
+  layerNormW(t.pair, t.pair, pairs, 128, E + "prev_pair_norm");
+  run1d("af2_outer_sum", pairs * 128, OuterSumArgs{t.pair, left, right, (uint)L, 128, 1, 0});
   float* dgram = scratch<float>("emb.dgram", pairs * 15);
   run1d("af2_prev_dgram", pairs, PrevDgramArgs{prevPos, aatype, dgram, (uint)L, 0});
   linearB(dgram, E + "prev_pos_linear", -1, t.pair, pairs, 15, 128, false, 1.f);
-  {   // + LN(prev pair)
-    float* tmp = scratch<float>("emb.tmp", pairs * 128);
-    layerNormW(prevPair, tmp, pairs, 128, E + "prev_pair_norm");
-    add(t.pair, tmp, pairs * 128);
-  }
   float* rel = scratch<float>("emb.rel", pairs * 73);
   run1d("af2_relpos", pairs, RelposArgs{Ii("residue_index"), Ii("asym_id"), Ii("entity_id"), Ii("sym_id"), rel, (uint)L, 0});
   linearB(rel, E + "~_relative_encoding/position_activations", -1, t.pair, pairs, 73, 128, false, 1.f);
-  releaseScratch({"emb.rel", "emb.dgram", "emb.tmp"});
+  releaseScratch({"emb.rel", "emb.dgram"});
   // the extra MSA's activations
   size_t erows = (size_t)t.E * L;
   float* ef = scratch<float>("emb.extraFeat", erows * 25);
@@ -268,7 +266,9 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
   static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
   const int slot = msaMask == t.extraMask;
-  float* norm = scratch<float>(slot ? "opm.norm.extra" : "opm.norm", (size_t)L * L);
+  // (written once and read by every block after: never in a slot another module's buffers share - main.mm's families
+  // leave "mnorm." out; at 2,900 residues it is past the 32 MB a shared buffer starts at)
+  float* norm = scratch<float>(slot ? "mnorm.extra" : "mnorm.main", (size_t)L * L);
   if (!once || t.normOf[slot] != msaMask) {
     run1d("af2_mask_norm", (size_t)L * L, MaskNormArgs{msaMask, norm, (uint)rowsN, (uint)L});
     t.normOf[slot] = msaMask;
@@ -360,15 +360,13 @@ static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C
   half* xn = pairLn(pair, pairs, C, T + "/left_norm_input", blk, "tri.xn");
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("tri.a", plane * C); half* b = scratch<half>("tri.b", plane * C);
-  static half *zeroedA = nullptr, *zeroedB = nullptr; static size_t zeroedPlane = 0;
-  if (Lp != L && (a != zeroedA || b != zeroedB || plane * C != zeroedPlane)) {
-    fill(a, 0, plane * C * 2); fill(b, 0, plane * C * 2);
-    zeroedA = a; zeroedB = b; zeroedPlane = plane * C;
-  }
+  // the padding zeroed every call, not once and remembered: the planes' slots are shared with other modules' buffers
+  // (main.mm's families), whose bytes land there between calls (docs/CUDA-TO-METAL.md, 1)
+  if (Lp != L) { padZero(a, C, L, Lp); padZero(b, C, L, Lp); }
   TriW w = triWeights(T, blk, C);
   gemmTriGate(xn, w.w4, pairMask, a, b, 0, pairs, C, plane, L, Lp, w.b4, triQuartersApply(C));
-  float* prod = scratch<float>("tri.prod", plane * C);
-  const float hs = halfProductScale();      // (the product in half, scaled: core.mm)
+  const float hs = halfProductScale();      // (the product in half, scaled: core.mm - and its buffer half-sized)
+  void* prod = scratchBytes("tri.prod", plane * C * (hs ? 2 : 4));
   {
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
     g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.label = "triangle contraction";
@@ -377,10 +375,11 @@ static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C
     else { g.X = b; g.transX = true; g.W = a; }
     gemm(g);
   }
-  half* cn = scratch<half>("tri.cn", pairs * C);
+  // (the planes are read by nothing after the contraction: the centre norm is written over a, the gated add's value over b)
+  half* cn = a;
   if (hs) centerNorm((const half*)prod, hs, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
-  else centerNorm(prod, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
-  half* outH = scratch<half>("tri.outh", pairs * C);
+  else centerNorm((const float*)prod, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
+  half* outH = b;
   half* lnOut = nextNorm.empty() ? nullptr : lnTarget(pairs, C, xn);
   if (gemmGatedAddDual(xn, PH(T + "/gating_linear/weights", blk), cn, PH(T + "/output_projection/weights", blk), pair, pairs, C, C,
                        P(T + "/gating_linear/bias", blk), P(T + "/output_projection/bias", blk), outH, "triangle output and gated add",
