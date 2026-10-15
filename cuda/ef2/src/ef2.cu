@@ -533,6 +533,17 @@ static int foldMain(int argc, char** argv) {
     M.waitUploads();
     forgetDerivedWeights();
   }
+  // --fast (every fold the standalone and the worker run): the modules' large scratch shared between them (af3/src/
+  // common.cuh, SHARED SCRATCH), proved by scribbled folds bit-identical to the unshared build; a family live around
+  // another's turns never shares with it, each pair a fold that moved: the diffusion conditioning around its
+  // transition's. Not shared: the f16 pair (ef2.), the language model's buffers, the trunk's own (trunk.: live across
+  // its blocks - shared, a crash) and the shim's (shim.tokens, read by the streamed z_init in the trunk - shared, an
+  // illegal address across 2 GPUs). The reference path (no --fast) shares nothing: unproved
+  if (FAST) {
+    SHARED_FAMILIES = { "ftr.", "ftri.", "cf.", "tri.", "trib.", "tr.", "dtr.", "msa.", "dc.", "dn.", "dg.", "zi.",
+                        "embed.", "atom.", "tb." };
+    SHARED_NESTED = { { "dc.", "dtr." } };
+  }
   // --fast: the f16 mirrors made now (the ESM-C tower's, the folding bundle's), and the tower's matrices'
   // f32 copy dropped from the device - 2.2 GB, read only through the mirror on this path
   size_t dropped = 0;
