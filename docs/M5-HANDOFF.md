@@ -1110,3 +1110,49 @@ the fit check's factors only. What only an M2 can answer:
 2. The scribble on its own paths: `LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=65536` against `LOCALFOLD_SHARED_SCRATCH=0`,
    byte for byte, over the AF3 gate's cases and AF2's (the float evoformer runs other buffers than the half one).
 3. Each port's estimate against its peak (`LOCALFOLD_PEAK=1` prints both) at a length near the M2's limit.
+
+## 2026-10-15, second pass: the triangle's middle in one buffer, q|k|v|g a block at a time
+
+`LOCALFOLD_PEAK=1` put every port's peak in the pair track after the first pass: AF3's and AF2's at one 1.1 GB buffer
+(the grid / triangle attention's q|k|v|g for the whole pair, the triangle's planes and float-sized product sharing its
+slot), ESMFold2's at its triangle's three plane-sized buffers. Three changes, every one bit-identical to before:
+
+- **`triContract` (core), all three ports.** The gate GEMM writes a and b interleaved by channel (its epilogue's channel
+  stride is just `tgPairs = 2 planes`); the contraction runs a quarter of the channels a GEMM, each quarter's product
+  written over the planes the quarter before read - quarter k ends at pw (k + 1) cc planes, where the planes it reads
+  begin (pw cc + 2 k cc), so nothing is written that is still to be read, and the product ends up contiguous at the
+  buffer's start. Where the product is half (the matrix units) the centre norm goes after it and the gated value over
+  it: 2.25 plane-sized buffers for the planes, product, norm and value - 0.63 GB at 1044 tokens and 128 channels against
+  1.7 (AF3's 4 planes' worth plus pr.h1 and pr.h2). On the float path (an M2's) 2.5 plus the norm's own buffer.
+  `LOCALFOLD_TRI_BLOCKS=1` is the control (one GEMM, room for all of it ahead).
+- **q|k|v|g a block of batch rows at a time** (`qkvgBlockRows`, 256 MB, balanced; `LOCALFOLD_QKVG_MB=0` the control): AF3's
+  grid attention and AF2's `attend` (triangle and MSA attentions). A row attends over its own positions only; the column
+  direction's block is a GEMM batched over the positions, the attention given the block's strides and `r0` for the mask.
+  Below ~500 tokens one block, the old dispatch exactly.
+- **AF2 gives its structure module and heads back at the start of each next pass.** Kept, their slots stayed grown to
+  their sizes and the next evoformer's buffers landed in them (`ln.a` in `sm.act2d`'s 558 MB slot): 3.31 -> 2.76 GB.
+
+| peak at 1,044 tokens | first pass | now |
+|---|---:|---:|
+| AF3 (5CAJ x4, templated) | 4.20 GB | 3.54 GB (now the sampler's stage) |
+| AF2 multimer (templated) | 4.08 GB | 2.76 GB |
+| AF2 monomer, 512 + 1024 rows | 5.84 GB | 5.08 GB |
+| ESMFold2 | 5.32 GB | 4.90 GB (its confidence head's blocks) |
+
+Bit-identical PDBs and confidence files against the first pass's binaries: AF3 at 522 and 1044, AF2 at 522 and 1044,
+ESMFold2 at 1044. Time, interleaved: AF2 522 22.24 / 22.41 s (both controls 22.44 / 22.46), 1044 127.9 / 128.2 s warm;
+ESMFold2 1044 67.85 / 67.80 s. Gates: AF3 16/16, AF2 5/5, ESMFold2 8/8, every number as before. The scribble
+(`LOCALFOLD_SCRIBBLE=1`, at 32 MB and 64 KB): AF3's sixteen cases, AF2's four inputs and ESMFold2 at 261 and 523
+residues byte-identical.
+
+The fit check refitted at 1044: AF3 5.1 (5.4 float), MSA 3.2; AF2 4.7 (4.14 measured float over one pass), MSA 2.2 -
+both MSA factors rose because a deep alignment's peak is now in the MSA work, which the pair track's used to hide;
+ESMFold2 4.2 (5.3). Estimates against peaks: AF3 3.61 / 3.54, 4.48 / 4.42 (1,024 rows); AF2 2.82 / 2.76, 5.11 / 5.08;
+ESMFold2 5.05 / 4.90. Longest folds on this M5: about AF3 2,100 tokens, AF2 2,250 residues, ESMFold2 1,690.
+
+What is left, by stage: AF3's are now within 4% of one another (the sampler 3.54 - its 24 blocks' pair biases and
+conditioning, 1.3 GB; the bias preparation 3.50; the confidence head 3.43; templates 3.25), so the next 3% is three
+changes. ESMFold2's confidence head holds the triangle buffer (1.27 GB) beside two emitted norms and the half pair.
+
+For the M2: the same three checks as the first pass's, with `LOCALFOLD_TRI_BLOCKS=1` / `LOCALFOLD_QKVG_MB=0` as the arms
+if anything moves - the float path's product layout (2 half planes a channel) is the one this M5 ran only imitated.

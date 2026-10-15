@@ -212,19 +212,32 @@ and confidence head, AF2's evoformer with its MSAs, ESMFold2's trunk), AF2's rec
 triangles' centre norm and gated value are written over their planes, and each confidence head gives the pair track's
 scratch back before its heads. `LOCALFOLD_PEAK=1` prints each stage's peak and what was held at it.
 
+**The triangle's middle in one buffer, and attention's q|k|v|g a block at a time** (the second round, same day). Core's
+`triContract`: the gate GEMM writes a and b interleaved by channel, and the contraction runs a quarter of the channels
+at a time, each quarter's product written over the planes the quarter before read - so the product ends up contiguous
+at the buffer's start, with room for one quarter ahead of the planes; where the product is half, the centre norm fits
+after it and the gated value over it. 2.25 pair-sized planes where there were 4 plus two pair buffers: 0.63 GB at 1044
+tokens and 128 channels against 1.7. AF3's grid attention and AF2's every attention build q|k|v|g for at most 256 MB of
+batch rows at a time, the blocks balanced (1.1 GB for the whole pair at 1044; below ~500 tokens one block). And AF2 gives
+its structure module and heads back at the start of each next pass: kept, the next evoformer's buffers landed in the
+slots they had grown. All bit-identical to before on every input compared (AF3 and AF2 at 522 and 1044 tokens, ESMFold2
+at 1044), and level in time (interleaved: AF2 522 22.24 / 22.41 s, 1044 127.9 / 128.2 s warm; ESMFold2 1044 67.85 / 67.80
+s). `LOCALFOLD_TRI_BLOCKS=1` and `LOCALFOLD_QKVG_MB=0` are the controls.
+
 | peak at 1,044 tokens (5CAJ x4, each templated; ESMFold2 untemplated) | before | now |
 |---|---:|---:|
-| AF3 | 5.33 GB | 4.20 GB |
-| AF2 multimer | 8.88 GB | 4.08 GB |
-| ESMFold2 | 8.67 GB | 5.32 GB |
+| AF3 | 5.33 GB | 4.20 GB, then 3.54 GB |
+| AF2 multimer | 8.88 GB | 4.08 GB, then 2.76 GB |
+| ESMFold2 | 8.67 GB | 5.32 GB, then 4.90 GB |
 
 **A fold that will not fit is refused up front** (`foldFits`, core.h): its peak estimated from the bytes held once the
 input is loaded plus measured factors times the f32 pair and MSA, against `recommendedMaxWorkingSetSize` (12.71 GB on a
 16 GB M5). Past that, unified memory pages and the fold runs many times slower instead of failing. The factors (bytes
-at the peak per f32 pair byte) were measured by folding at 522 and 1,044 tokens on both paths: AF3 6.3 (6.7 where its
-stacks run float, as on an M2), AF2 7.1, ESMFold2 4.6 (5.6) for its trunk's stage with its tower given back; the MSA's
-2.8 (AF3) and 1.6 (AF2). The estimates sit 2-4% over the peaks they were fitted to. On this M5 the longest folds are
-about AF3 1,900 tokens, AF2 1,850 residues, ESMFold2 1,620. `LOCALFOLD_NO_FOLD_FITS=1` folds anyway; a `--serve` process
+at the peak per f32 pair byte) were measured by folding at 1,044 tokens on both paths: AF3 5.1 (5.4 where its stacks run
+float, as on an M2), AF2 4.7, ESMFold2 4.2 (5.3) for its trunk's stage with its tower given back; the MSA's 3.2 (AF3) and
+2.2 (AF2). The estimates sit 1-3% over the peaks they were fitted to; below ~600 tokens a fold's fixed costs dominate and
+they can read 5-10% under, which decides nothing there. On this M5 the longest folds are about AF3 2,100 tokens, AF2
+2,250 residues, ESMFold2 1,690 (before this round 1,900, 1,850 and 1,620). `LOCALFOLD_NO_FOLD_FITS=1` folds anyway; a `--serve` process
 answers the job with the refusal and stays up.
 
 ## Traps, each paid for
