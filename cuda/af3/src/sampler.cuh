@@ -90,10 +90,25 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
-// --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160) - the page's
-// short schedule (web/af3-model.js diffusionScheduleFor: 80 for a plain protein, 40 for a ligand job, on
-// the families its measurements favour), handed to a CUDA fold so it samples what the page samples. 0 is
-// the model's own.
+// the multistep update: the previous prediction moved into this step's frame (the rotation and shift augmentNoiseK
+// gave x, about x's centroid), extrapolated with this one, x' = noisy + scale (noisy - D) for
+// D = (1 + w) d - w previous; then this prediction kept as the next step's previous
+__global__ void multistepK(float* x, const float* noisy, const float* denoised, float* previous, const float* mask,
+                           const float* c, const float* rot, float scale, float w, size_t atoms, size_t total) {
+  size_t a = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (a >= total) return;
+  size_t k = a / atoms; const float* r = rot + k * 12; const float* ck = c + k * 3;
+  float p[3] = {previous[a * 3] - ck[0], previous[a * 3 + 1] - ck[1], previous[a * 3 + 2] - ck[2]};
+  bool live = mask[a % atoms] != 0;
+  for (int d = 0; d < 3; ++d) {
+    float moved = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
+    float now = denoised[a * 3 + d], blend = (1 + w) * now - w * moved;
+    x[a * 3 + d] = noisy[a * 3 + d] + scale * (noisy[a * 3 + d] - blend);
+    previous[a * 3 + d] = now;
+  }
+}
+// --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160); 0 is the model's
+// own. A probe's knob - the page's short schedule that used it is gone (docs/AF3.md, "The default sampler").
 inline double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
@@ -196,11 +211,17 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
 //   exponential: x' = r^S x + (1 - r^S) D, r = sigma' / sigma, where the Euler step is x' = x + S (r - 1) (x - D) -
 //                at a large step (r < 1/3 with S 1.5) Euler's coefficient on x goes negative and the walk overshoots
 //   churn:       AlphaFold 3's noise injection (gamma0); off, the walk is deterministic past its first draw
+//   multistep:   the exponential step on DPM-Solver++ 2M's extrapolation from the previous prediction; with
+//                --multistep-below=<A> only at steps under that noise level. Measured, NOT a default: everywhere it
+//                moves chains (af3's crystals 1.106 -> 1.344 A at 12 steps), below 4 A it keeps them and helps
+//                ligands a little (docs/AF3.md, "A multistep update")
 // The defaults are the exponential update on the geometric schedule with churn - every fold's, the page's too
 // (webgpu/af3/fold.js DIFFUSION_DEFAULTS): 200 Euler steps' ligand geometry at 25, level elsewhere (docs/AF3.md).
 // --update=euler --schedule=karras is AlphaFold 3's own sampler, for an oracle comparison.
 struct DiffusionOptions {
   bool geometric = true, exponential = true, churn = true;
+  bool multistep = false;      // exponential with DPM-Solver++ 2M's extrapolation from the previous prediction
+  double multistepBelow = 1e30;  // ...only at steps whose noise level (A) is below this; plain exponential above
   bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
@@ -212,10 +233,12 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
     return true;
   };
+  if (!strcmp(f, "--update=multistep")) { o.exponential = o.multistep = true; o.given = true; return true; }
   if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
-    o.given = true; return true;
+    o.multistep = false; o.given = true; return true;
   }
   if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  if (!strncmp(f, "--multistep-below=", 18)) { o.multistepBelow = atof(f + 18); o.given = true; return true; }
   return false;
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
@@ -265,6 +288,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
   float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
   float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+  float* dPrev = nullptr;
+  if (opt.multistep) { CK(devMalloc(&dPrev, all3 * 4)); CK(cudaMemsetAsync(dPrev, 0, all3 * 4, STREAM)); }
   for (int s = 0; s < steps; ++s) {
     double previous = levels[s], level = levels[s + 1];
     tHats[s] = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
@@ -281,8 +306,21 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
     const double coef = opt.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
-    eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
+    // the multistep weight w = 1 / (2 rho), rho the previous gap between evaluated levels over this step's, both in
+    // log sigma; the first step, and any whose levels do not fall, is the plain exponential step (w 0)
+    double w = 0;
+    if (opt.multistep && step > 1 && tHat < opt.multistepBelow) {
+      const double h = std::log(tHat / level), hPrev = std::log(tHats[step - 2] / tHat);
+      if (h > 0 && hPrev > 0) w = h / (2 * hPrev);
+    }
+    if (opt.multistep)
+      multistepK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, d, dPrev, dMask, dC,
+                                                          dRot + (size_t)(step - 1) * ns * 12, (float)coef, (float)w,
+                                                          atoms, atoms * ns);
+    else
+      eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
   }
+  if (dPrev) CK(cudaFree(dPrev));
   std::vector<float> out = download(dX, all3);
   for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
   CK(cudaFree(dSeeds));

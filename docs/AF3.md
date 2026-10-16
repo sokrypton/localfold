@@ -6725,3 +6725,39 @@ exp 25 minus the old default is -0.16 to +0.05 A per model (mean of per-target m
   on an answer the template already pins, against ligands that stop tearing.
 
 Raw rows: `/tmp/claude-1000/sch/finalA.txt`, `finalB.txt` and `fsum.py` on the A100 box (not kept).
+
+## A multistep update: measured, kept as an option, not taken (2026-10-16)
+
+`--update=multistep` on cuda/af3 is the exponential step on DPM-Solver++ 2M's extrapolation: the denoiser's previous
+prediction, moved into this step's frame by the same rotation and shift the augmentation gave the coordinates, blended
+as `D = (1 + w) d - w d_prev`, `w = h / (2 h_prev)` with `h` this step's log-sigma drop and `h_prev` the gap between the
+two levels the denoiser was evaluated at (churn makes those the raised levels, not the schedule's).
+`--multistep-below=<A>` applies it only at steps under that noise level and the plain exponential step above. Native
+only; the page does not have it.
+
+Seven models, the decision run's systems (7 x 2 seeds of bonds) and crystals (6 targets x 3 seeds). Ligand bond
+median / mean (A) and folds past 0.15 A of 6, then the crystals' mean CA RMSD:
+
+| model | exp 25 (default) | multistep 12 | hybrid 12, below 4 A | hybrid 12, below 8 A | hybrid 25, below 4 A |
+|---|---|---|---|---|---|
+| af3 | 0.042 / 0.062, 1 · 1.106 | 0.046 / 0.086 · **1.344** | 0.035 / 0.087, 1 · 1.105 | - | 0.037 / 0.034, 0 · 1.129 |
+| boltz2 | 0.071 / 0.073 · 1.439 | 0.103 / 0.124 · 1.181 | 0.066 / 0.110, 2 · 1.395 | 0.093 / 0.089, 1 · 1.437 | 0.070 / 0.061 · 1.458 |
+| intellifold2 | 0.049 / 0.052 · 1.592 | 0.044 / 0.043 · 1.660 | 0.035 / 0.068, 1 · 1.588 | 0.036 / 0.033 · 1.608 | 0.036 / 0.036 · 1.609 |
+| openbind0 | 0.059 / 0.065 · 1.375 | 0.038 / 0.043 · 1.414 | 0.055 / 0.091, 1 · 1.289 | 0.042 / 0.042 · 1.343 | 0.046 / 0.053 · 1.401 |
+| opendde | 0.053 / 0.082, 1 · 1.123 | 0.046 / 0.051 · 1.321 | 0.041 / 0.037 · 1.248 | 0.039 / 0.043 · 1.277 | 0.040 / 0.042 · 1.140 |
+| protenix2 | 0.047 / 0.049 · 1.565 | 0.042 / 0.038 · 1.624 | 0.042 / 0.035 · 1.462 | 0.042 / 0.033 · 1.510 | 0.043 / 0.037 · 1.585 |
+| rosettafold3 | 0.067 / 0.082 · 1.299 | 0.066 / 0.117, 2 · 1.331 | 0.079 / 0.097, 1 · 1.292 | 0.051 / 0.081, 1 · 1.326 | 0.066 / 0.070 · 1.388 |
+
+- **Everywhere, it moves chains.** Extrapolating at high noise, where the steps PLACE the chain, costs af3 0.24 A and
+  opendde 0.20 A of crystal RMSD at 12 steps. On af3 + ATP alone it looked like a clean win (12 steps 0.042-0.049 A
+  against the exponential's 0.16-0.29) - the ligand bench cannot see placement.
+- **Below 4 A it keeps them**: those steps are exactly the exponential ones above the threshold, so the crystals equal
+  the exponential's at the same count. Below 16 A af3's 6MRR slips (0.62 -> 0.98).
+- **At 25 steps below 4 A the ligand mean improves on all seven models** and no fold tears (exp 25 tore two), against
+  crystals 0.02-0.09 A worse - the same sign on all seven, each inside three seeds' spread. Not taken: the default's
+  ligands are already at the 200-step level.
+- **Twelve steps place the chain** (exp 12's crystals match exp 25's on six of seven; opendde's 6MRR is the one) - the
+  steps past twelve are spent settling small molecules. Hybrid 12 still loses ligand tails on boltz2, rosettafold3 and
+  openbind0, so the open question is the ALLOCATION: fewer steps above ~4 A and more below.
+
+Raw rows: `/tmp/claude-1000/sch/ms*.txt`, `hy*.txt` on the A100 box (not kept).

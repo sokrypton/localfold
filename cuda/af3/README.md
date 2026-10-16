@@ -92,7 +92,7 @@ example jobs fold (`tools/fixtures/af3-jobs/`).
 | `--recycles=N` | 3 | trunk recycles (N+1 passes) |
 | `--recycle-tolerance=<A>` | off | stop recycling once the prediction moves less than this |
 | `--steps=N` | 200 | diffusion steps |
-| `--update=`, `--schedule=`, `--no-churn` | `exponential`, `geometric` | the diffusion step and noise schedule; `--update=euler --schedule=karras` is AlphaFold 3's own walk (docs/AF3.md, "The default sampler"; not `chai1`, which keeps its own) |
+| `--update=`, `--schedule=`, `--no-churn` | `exponential`, `geometric` | the diffusion step and noise schedule; `--update=euler --schedule=karras` is AlphaFold 3's own walk, `--update=multistep` (with `--multistep-below=<A>`) an experiment measured and not taken (docs/AF3.md, "The default sampler", "A multistep update"; not `chai1`, which keeps its own) |
 | `--af3-defaults` | | AlphaFold 3's own run settings: 10 recycles, 5 samples |
 | `--frames=<dir>` | | every intermediate result as it lands (below) |
 | `--save-embeddings`, `--save-distogram` | | what AlphaFold 3's flags of the same names write |
