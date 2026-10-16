@@ -68,7 +68,7 @@ export async function main(device, args) {
   const sequence = option(args, "sequence",
     // one of everything that has a ring, with a few plain residues between
     "GFAYAWAHAPGFYWHPAGLKESTNQDRIVMC");
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const steps = Number(option(args, "steps", "8"));
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));

@@ -121,7 +121,7 @@ export function ligandBondError(batch, positions, components) {
  */
 export async function sweepLigandFlow(options) {
   const { device, weights, components, stepCounts } = options;
-  const mode = options.mode ?? "flow";
+  const mode = options.mode ?? "diffusion";
   const startSigmas = mode === "flow" ? options.startSigmas : [null];
   const sequence = options.sequence ?? "";
   const batch = featuriseProtein(sequence, { ligands: components });
@@ -178,7 +178,7 @@ export async function main(device, args) {
     // question here that generalises: did the component come out as itself?
     // Under any other mode the sigma column is the sampler's own schedule and
     // `startSigmas` is ignored, so it is collapsed to one cell.
-    mode: option(args, "mode", "flow"),
+    mode: option(args, "mode", "diffusion"),
     startSigmas: option(args, "sigmas", "2560,640,160,56,16").split(",").map(Number),
     stepCounts: option(args, "steps", "2,4,6,8,16").split(",").map(Number),
     seed: Number(option(args, "seed", "20260831")),

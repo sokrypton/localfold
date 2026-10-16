@@ -19,7 +19,7 @@
  * failure mode of recycling is a CONFIDENT wrong answer rather than an
  * uncertain one.
  *
- * 🔴 IT MUST RUN AT A CONVERGED STEP COUNT. probe-flow-sigma-by-size.js found
+ * 🔴 IT MUST RUN AT A CONVERGED STEP COUNT. probe-flow-sigma-by-size.js (removed with Flow) found
  * AF3's sampler badly under-stepped at the page's 20, so a recycle sweep there
  * would be measuring the sampler's noise floor and calling it recycling. The
  * default here is 80, which is where that sweep found the sampler landing.

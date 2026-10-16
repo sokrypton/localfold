@@ -123,8 +123,6 @@ def main():
                         help="the designed chain's length")
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--runs", type=int, default=1)
-    parser.add_argument("--mode", default="flow", choices=["flow", "diffusion"],
-                        help="which sampler the fold runs")
     # 🔴 THE PAGE'S #steps IS A SELECT, so a value it has no option for leaves
     # it EMPTY - which is how this tool once ran the sampler for ZERO steps and
     # got a PDB of NaNs that read as a missing chain. The choices here are
@@ -223,7 +221,6 @@ def main():
             ("runs", args.runs),
             ("cycles", args.cycles),
             ("percent-x", args.percent_x),
-            ("af3-mode", args.mode),
             ("steps", args.steps),
             ("recycles", args.recycles),
             ("seed", args.seed),

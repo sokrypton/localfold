@@ -49,8 +49,6 @@ def atomised_job(text):
     return False
 WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-cuda")
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
-# ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
-NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
 FEATURISE = os.path.join(CUDA, "featurise")
 OUT = sys.stdout
 
@@ -394,13 +392,9 @@ class Worker:
         else:
             raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
                           " and ESMFold2)")
-        sampler = controls.get("af3-mode", "diffusion")
-        if port == "af3" and sampler not in ("diffusion", "flow"):
-            raise Refused(f"the CUDA backend does not know the sampler {sampler!r}")
-        if port == "af3" and sampler == "flow" and family in NO_FLOW_FAMILIES:
-            # ...the page's own rule: rf3's walk collapses the backbone while pLDDT reads as if nothing were
-            # wrong, and chai-1 samples with its own second-order step (noFlowSampler, shared/af3/dialect.js)
-            raise Refused(f"{family} has no working flow sampler - set the sampler to Diffusion")
+        # one sampler: a job from an older page that still asks for Flow is refused by name, not folded otherwise
+        if controls.get("af3-mode", "diffusion") != "diffusion":
+            raise Refused("Flow was removed - every fold samples with diffusion now (docs/AF3.md, \"Flow removed\")")
         emit("status", f"{family} on CUDA ({self.device}) · reading the job")
         emit("progress", 0.02)
         started = time.time()
@@ -495,11 +489,6 @@ class Worker:
                        f"--max-msa={requested}", *flags, *local_ccd()], "featurising", log, live)
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]
-            if sampler == "flow":
-                fold.append("--flow")                    # (the page's Flow: cuda/af3/src/sampler.cuh)
-            elif (job.get("schedule") or {}).get("sigmaMax"):
-                # the page's short schedule, resolved there (diffusionScheduleFor), started where it starts
-                fold.append(f"--sigma-max={float(job['schedule']['sigmaMax'])}")
             if steps:
                 # ...the page's floor: a modified residue's atoms stay compressed below sixteen steps (app.js)
                 spec = json.loads(job["job"])

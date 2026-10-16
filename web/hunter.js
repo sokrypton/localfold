@@ -469,7 +469,7 @@ function setRunning(running) {
   button.querySelector("span").textContent = running ? "Stop" : "Hunt";
   for (const id of ["start-sequence", "runs", "cycles", "percent-x", "add-entity",
                     "temperature", "seed", "steps", "alanine-bias", "omit",
-                    "length", "designer", "diffusion-frames", "af3-mode",
+                    "length", "designer", "diffusion-frames",
                     "recycles", "model-family"]) {
     element(id).disabled = running;
   }
@@ -552,11 +552,10 @@ async function hunt() {
 
   const runs = Math.max(1, number("runs", 1));
   const cycles = Math.max(0, number("cycles", 5));
-  const mode = element("af3-mode").value;
-  // ...and a step count below the mode's smallest is not a fast fold, it is a
+  // ...and a step count below the dial's smallest is not a fast fold, it is a
   // structure that has not been denoised. Clamped rather than trusted, because
-  // the value comes from a control whose options change with the mode.
-  const counts = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
+  // the value comes from a control a reader can edit.
+  const counts = AF3_COUNTS.diffusion;
   const calls = Math.max(number("steps", counts.preferred), Math.min(...counts.values));
   const recycles = number("recycles", 0);
   // 🔴 DRAWN ONCE PER HUNT AND REPORTED, NOT DRAWN PER RUN AND LOST. Exploring
@@ -622,7 +621,7 @@ async function hunt() {
         fold: async (sequence, context) => {
           const done = context.run * (cycles + 1) + context.cycle;
           const folded = await foldAf3({
-            sequence, mode, calls, recycles, weights, device, signal, seed: seed + run,
+            sequence, calls, recycles, weights, device, signal, seed: seed + run,
             // A ligand and a nucleic chain change the FOLD as well as the
             // designer: featurise gives each ligand a chain of its own and
             // reads a nucleic chain one token per base.
@@ -763,30 +762,17 @@ window.__hunterInput = () => {
   return { ...input, templates: input.templates.map((t) => ({ ...t, origin: undefined })) };
 };
 
-/**
- * Rebuild the step dial for the sampler that is selected.
- *
- * 🔴 THE TWO MODES DO NOT SHARE A RANGE. A flow step walks the whole noise
- * schedule and a diffusion step discretises it, so the counts differ by an
- * order of magnitude - 16 against 20 to 320 - and one `<input type=number>`
- * spanning both would offer a flow value that is pointlessly slow and a
- * diffusion value that does not resolve. index.html rebuilds this control on a
- * mode change for the same reason; AF3_COUNTS carries the values and the
- * measurements behind them.
- */
+/** Build the step dial from AF3_COUNTS, which carries the values and the measurements behind them. */
 function syncSteps() {
-  const mode = element("af3-mode").value;
-  const counts = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
+  const counts = AF3_COUNTS.diffusion;
   const select = element("steps");
   const wanted = Number(select.value);
   select.replaceChildren(...counts.values.map((value) => Object.assign(
     document.createElement("option"), { value: String(value), textContent: String(value) })));
-  // Keep the reader's choice when the new mode also offers it; otherwise take
-  // that mode's own preferred count rather than the first thing in the list.
+  // Keep the reader's choice when the dial offers it; otherwise its preferred count.
   select.value = String(counts.values.includes(wanted) ? wanted : counts.preferred);
   element("steps-label").textContent = counts.label;
 }
-element("af3-mode").addEventListener("change", syncSteps);
 syncSteps();
 
 // The entity list notifies through its own onChange; this is the picker.

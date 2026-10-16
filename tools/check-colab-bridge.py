@@ -293,7 +293,7 @@ try:
     chosen = cdp.evaluate(reader_ws, """(() => {
       const g = (id) => document.getElementById(id);
       window.__entityList.set([{ type: 'protein', value: %s, copies: 1, modifications: [] }]);
-      for (const [id, value] of [['msa-mode', 'none'], ['af3-mode', 'flow']]) {
+      for (const [id, value] of [['msa-mode', 'none']]) {
         g(id).value = value;
         g(id).dispatchEvent(new Event('change', { bubbles: true }));
       }
@@ -301,7 +301,7 @@ try:
       const count = counts.find((v) => v !== g('af3-count').value) ?? counts[0];
       const want = { 'af3-count': count, 'recycles': '1', 'random-seed': '7' };
       for (const [id, value] of Object.entries(want)) g(id).value = value;
-      return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
+      return { ...want, 'msa-mode': 'none' };
     })()""" % json.dumps(SEQUENCE))
     before = len(jobs())
     cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60, "the reader's fold button")

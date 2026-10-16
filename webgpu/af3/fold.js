@@ -56,7 +56,7 @@ import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../../shared/heads/tm-score.js";
-import { sampleOnGpu, flowOnGpu } from "./diffusion/diffusion-sampler.js";
+import { sampleOnGpu } from "./diffusion/diffusion-sampler.js";
 import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head.js";
 
 /**
@@ -231,7 +231,7 @@ export { uniformFrom, normalFrom } from "../../shared/af3/random.js";
 /**
  * @param {object} batch from featuriseProtein or an AF3 dump
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
- * @param {{mode: "flow"|"ode"|"diffusion", steps?: number, recycles?: number,
+ * @param {{mode?: "diffusion", steps?: number, recycles?: number,
  *          seed?: number, blocks?: number,
  *          schedule?: {sigmaData?: number, sigmaMin?: number, sigmaMax?: number,
  *                      rho?: number},
@@ -503,6 +503,15 @@ function heldBuffers() {
     },
   };
 }
+
+/**
+ * The diffusion's discretisation every fold takes unless it asks otherwise: the exponential update on the geometric
+ * schedule, churn kept (cpu/af3/diffusion/diffusion-sampler.js; cuda/af3/src/sampler.cuh's defaults are the same).
+ * Over seven models it reaches 200 Euler steps' ligand geometry at 25 calls (0 of 21 ligand cells past 0.15 A against
+ * Euler's 5), level on proteins, nucleic acids and crystals, and Euler overshoots below ~25 steps where it does not -
+ * docs/AF3.md, "The diffusion's discretisation after Blitz". `{ update: "euler", schedule: "karras" }` is AF3's own.
+ */
+export const DIFFUSION_DEFAULTS = Object.freeze({ update: "exponential", schedule: "geometric" });
 
 export async function foldBatch(device, batch, weights, options = {}) {
   const held = heldBuffers();
@@ -822,8 +831,8 @@ async function foldHolding(device, batch, weights, options, held) {
   // recycles are watched through the heatmap panel instead, and the viewer
   // shows nothing until the sampler produces the first real frame.
   //
-  // 🔴 ONE HEAD, BUILT ABOVE THE RECYCLE LOOP, so both samplers borrow it
-  // rather than building their own.
+  // 🔴 ONE HEAD, BUILT ABOVE THE RECYCLE LOOP, so the sampler borrows it
+  // rather than building its own.
   const head = steps > 0 ? new Af3DiffusionHeadGpu(device, precision) : undefined;
   // 🔴 AND WARMED HERE, WHICH THE COMMENT ABOVE THIS ONE USED TO CLAIM THE
   // CONSTRUCTOR DID. It said "building one compiles its pipelines - 730 ms -
@@ -1148,13 +1157,6 @@ async function foldHolding(device, batch, weights, options, held) {
         ...(finalPair === undefined ? {} : { trunkPairBuffer: finalPair.buffer }) }
     : structural.headInput;
 
-  // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
-  // KIND OF THING. "diffusion" is AF3's own stochastic sampler: noise is
-  // injected at every step. "flow" draws once at the top of the schedule and
-  // then walks it deterministically - about 25x fewer calls for the same
-  // accuracy on the two proteins it has been measured on. Both take a seed;
-  // the flow's spread across seeds is the narrower of the two, because one
-  // draw is not the same as noise at every step.
   // 🔴 EVERY FRAME THE SAMPLER EMITS IS IN THE TOKEN SPACE IT RUNS ON, AND FOR
   // OpenDDE THAT IS NOT THE ONE A VIEWER DRAWS. The final coordinates are
   // scattered back after the loop; the per-step ones were not, so a caller
@@ -1184,67 +1186,23 @@ async function foldHolding(device, batch, weights, options, held) {
   // OpenDDE fold at 6MRR is 23.5 s and its named stages sum to 7.2. Measured by
   // dropping the step count, only 2.9 s of the rest is the sampler - 200 steps
   // at 14.5 ms - and the other ten seconds had no name at all.
-  // 🔴 A CHECKPOINT WITH NO FLOW WALK MUST REFUSE, NOT PRODUCE A WRECK.
-  // rosettafold3 in flow mode gives N-CA 6.94 A against 1.46 and consecutive CA
-  // collapsing to 0.23 A - and pLDDT 81.47, four tenths from the good fold's
-  // 81.53, so the number a page shows says nothing is wrong. The PAGE's sampler
-  // select defaults to Flow, so this was what a visitor would have got.
-  //
-  // It throws rather than quietly switching: a fold that silently ran a
-  // different sampler than it was asked for is the kind of thing that gets
-  // measured for a week. The caller chooses - `web/app.js` picks Diffusion for
-  // these checkpoints and says so in the UI.
-  // 🔴 `weights.trunk.dialect`, WHICH IS WHERE IT LIVES IN THIS FUNCTION. The
-  // first version of this read `weights.dialect` - the name `buildTargetFeat`
-  // uses, on a different object - so it was `undefined`, the check quietly did
-  // nothing, and the broken fold reached the geometry gate exactly as before.
-  // A guard that reads the wrong field is a guard that is not there.
-  // 🔴 AN UNRECOGNISED MODE MUST NOT FALL INTO THE FLOW BRANCH. The two tests
-  // below are `=== "diffusion"` and `=== "ode"`, so ANY other string - a typo, a
-  // stale select value, a mode a future checkpoint names - ran the flow walk
-  // with the replacement step and reported itself as whatever it was asked for.
-  // That is the shape of bug this repository keeps paying for: a fold that
-  // silently ran a different sampler than the one on its label.
-  const MODES = ["diffusion", "flow", "ode"];
-  if (!MODES.includes(options.mode)) {
-    throw new Error(`unknown sampler mode ${JSON.stringify(options.mode)};`
-      + ` this fold takes one of ${MODES.join(", ")}`);
-  }
-  const foldDialect = weights.trunk?.dialect ?? weights.dialect;
-  // 🔴 "ode" AND "flow" ARE THE SAME WALK WITH DIFFERENT STEPS, and a
-  // checkpoint with no working walk refuses BOTH - rosettafold3 collapses at
-  // CA 3.07 under flow and explodes to 5.88 under the ODE step.
-  if (options.mode !== "diffusion" && foldDialect?.noFlowSampler === true) {
-    throw new Error("this checkpoint has no working flow sampler: its walk gives"
-      + " N-CA 6.94 A against 1.46 and a collapsed backbone, while pLDDT reads"
-      + " 81.47 as if nothing were wrong. Pass mode: \"diffusion\"."
-      + " See `noFlowSampler` in shared/af3/dialect.js.");
-  }
-  // the diffusion's discretisation - { schedule, update, churn }, cpu/af3/diffusion/diffusion-sampler.js - is the
-  // diffusion sampler's alone: a flow handed one would ignore it and fold under the label it was asked for
-  const diffusion = options.diffusion ?? {};
-  if (options.mode !== "diffusion" && Object.keys(diffusion).length > 0) {
-    throw new Error(`schedule, update and churn are the diffusion sampler's; mode ${options.mode} does not take them`);
+  // 🔴 ONE SAMPLER. The Flow walk ("flow", and "ode", its integration step) is gone: measured over seven models it
+  // breaks large inputs and some complexes where diffusion does not - OpenBind-0's and OpenDDE's 1TIM dimer at 8-17 A,
+  // the 1,023-residue 1JZ7 at 9-28 A on three models - and RoseTTAFold3 never had a working one (docs/AF3.md, "Flow
+  // removed"). A mode other than "diffusion" is refused rather than folded under another sampler's label.
+  if (options.mode !== undefined && options.mode !== "diffusion") {
+    throw new Error(`sampler mode ${JSON.stringify(options.mode)}: the only sampler is "diffusion" - Flow was removed`
+      + " (docs/AF3.md, \"Flow removed\")");
   }
   stage("sample-start", { steps: options.steps });
-  const sampled = options.mode === "diffusion"
-    ? await sampleOnGpu(device, headInput, weights.diffusion, {
-        steps, stopAfter: options.stopAfter, head,
-        normal: normalFrom(options.seed ?? 20260831),
-        onStep,
-        ...(options.schedule ?? {}),
-        ...diffusion,
-      })
-    : await flowOnGpu(device, headInput, weights.diffusion, {
-        cycles: steps, head, normal: normalFrom(options.seed ?? 20260831),
-        // "flow" keeps the original straight replacement; "ode" takes the step
-        // that made AlphaFold 3's 1QYS a chain again. See the sampler.
-        step: options.mode === "ode" ? "ode" : "replace",
-        onStep,
-        // The schedule reaches noiseLevels through here, and both samplers
-        // already forward their options to it.
-        ...(options.schedule ?? {}),
-      });
+  const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
+    steps, stopAfter: options.stopAfter, head,
+    normal: normalFrom(options.seed ?? 20260831),
+    onStep,
+    ...(options.schedule ?? {}),
+    ...DIFFUSION_DEFAULTS,
+    ...(options.diffusion ?? {}),
+  });
 
   // 🔴 THE BORROWED HEAD IS RELEASED HERE, because the samplers no longer do
   // it for one they did not build. Without this a fold leaks the diffusion

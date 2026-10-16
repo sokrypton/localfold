@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-360 tools. `tools/fixtures/` is data and is not listed.
+359 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (195)
+## `tools/gpu/` - the WebGPU lane (193)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -155,7 +155,6 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-esmfold2-confidence.js`** - Can the distogram score the structure the sampler drew, per residue?
 - **`probe-esmfold2-msa-profile.js`** - Can EF2-fast use an MSA?
 - **`probe-esmfold2-trajectory.js`** - What a trajectory frame should BE: the sampler's state, or the model's guess?
-- **`probe-flow-sigma-by-size.js`** - Does the flow's starting sigma need to grow with the complex?
 - **`probe-gpu-gaussian.js`** - Can the sampler's Gaussian draws move to the GPU, what do they cost, and what does it cost to move them?
 - **`probe-grid-overdispatch.js`** - What does THIS backend do with an invocation that indexes past the buffer?
 - **`probe-head-cpu-vs-gpu.js`** - One denoising step, GPU against the CPU reference, on a REAL molecule.
@@ -173,7 +172,6 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-msa-depth-on-complexes.js`** - With a REAL alignment: does capping its depth help a complex, and do recycles hurt one?
 - **`probe-nucleic.js`** - Does a folded DNA or RNA chain have the right chemistry, and is it a chain?
 - **`probe-occupancy.js`** - How many workgroups this device runs at once, measured.
-- **`probe-one-step-sigma.js`** - ONE denoiser call at each starting sigma: where does the backbone land?
 - **`probe-opendde-kernels.js`** - Which pair-track kernel stops computing its reference at OpenDDE's widths.
 - **`probe-opendde-target-feat.js`** - WHICH COLUMNS of OpenDDE's `target_feat` disagree with af3-any-model?
 - **`probe-opendde-template.js`** - OpenDDE's TEMPLATE EMBEDDER against af3-any-model, on a query with NO template.
@@ -294,7 +292,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (97)
+## `tools/` - everything else (98)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -332,6 +330,7 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
+- **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
 - **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?

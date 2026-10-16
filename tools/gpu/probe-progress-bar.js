@@ -109,7 +109,7 @@ async function timeOne(device, weights, { sequence, calls, recycles, mode }) {
 export async function main(device, args) {
   const calls = Number(option(args, "steps", "16"));
   const recycles = Number(option(args, "recycles", "3"));
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const lengths = option(args, "lengths", "58,128,192").split(",").map(Number);
   const weights = await loadAf3Weights(() => {});
   const runs = [];

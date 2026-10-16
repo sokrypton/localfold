@@ -46,8 +46,7 @@ def cases():
     crystal_1brs = os.path.join(FIX, "1brs-crystal.pdb")
     out = []
     for model in ["af3", "protenix2", "boltz2", "intellifold2", "rosettafold3", "openbind0", "opendde"]:
-        fold = ["--steps=16"] if model == "opendde" else []
-        out.append((f"{model}-6mrr", model, [f"--sequence={SEQ_6MRR}"], fold,
+        out.append((f"{model}-6mrr", model, [f"--sequence={SEQ_6MRR}"], [],
                     [os.path.join(FIX, "6mrr-crystal.pdb")]))
     # the paths a plain protein never reaches: a ligand and an atomised modified residue, and a DNA
     # duplex - scored on bond geometry too (bonds.mjs: rms against CCD ideals, A)

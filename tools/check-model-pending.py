@@ -543,8 +543,7 @@ try:
     #      the model row was the loud one, and the rest are the same shape.
     #      What may change the picture is pressing Fold.
     before_edits = page_of(reader_ws)
-    edits = [("recycles", "3"), ("random-seed", "7"), ("msa-mode", "none"),
-             ("af3-mode", "diffusion")]
+    edits = [("recycles", "3"), ("random-seed", "7"), ("msa-mode", "none")]
     for row_id, value in edits:
         # ...a SELECT takes only a value it has; a number box takes any.
         kind = cdp.evaluate(reader_ws,

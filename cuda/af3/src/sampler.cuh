@@ -90,15 +90,10 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
-// --flow: the page's Flow (webgpu/af3/diffusion/diffusion-sampler.js flowOnGpu, step "replace") in
-// place of AF3's diffusion - one draw at the top of a schedule that starts at 160 A (sigmaMax 10 sigma_data,
-// AF3's own sigmaMin and rho, whatever the model's dialect), then the state REPLACED by each prediction:
-// no centring, no rotation, no injected noise
-inline bool SAMPLER_FLOW = false;
 // --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160) - the page's
 // short schedule (web/af3-model.js diffusionScheduleFor: 80 for a plain protein, 40 for a ligand job, on
 // the families its measurements favour), handed to a CUDA fold so it samples what the page samples. 0 is
-// the model's own. Flow keeps its own start.
+// the model's own.
 inline double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
@@ -201,9 +196,12 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
 //   exponential: x' = r^S x + (1 - r^S) D, r = sigma' / sigma, where the Euler step is x' = x + S (r - 1) (x - D) -
 //                at a large step (r < 1/3 with S 1.5) Euler's coefficient on x goes negative and the walk overshoots
 //   churn:       AlphaFold 3's noise injection (gamma0); off, the walk is deterministic past its first draw
-// The defaults are AlphaFold 3's own.
+// The defaults are the exponential update on the geometric schedule with churn - every fold's, the page's too
+// (webgpu/af3/fold.js DIFFUSION_DEFAULTS): 200 Euler steps' ligand geometry at 25, level elsewhere (docs/AF3.md).
+// --update=euler --schedule=karras is AlphaFold 3's own sampler, for an oracle comparison.
 struct DiffusionOptions {
-  bool geometric = false, exponential = false, churn = true;
+  bool geometric = true, exponential = true, churn = true;
+  bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
 inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
@@ -214,8 +212,10 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
     return true;
   };
-  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) return true;
-  if (!strcmp(f, "--no-churn")) { o.churn = false; return true; }
+  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
+    o.given = true; return true;
+  }
+  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
   return false;
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
@@ -235,26 +235,6 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sigmaMin = M.meta(S + "sigmaMin"); sigmaMax = M.meta(S + "sigmaMax");
   }
   std::vector<double> levels(steps + 1);
-  if (SAMPLER_FLOW) {
-    for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, 0.0004, 10, 7);
-    std::vector<float> at(levels.begin(), levels.begin() + steps);
-    if (onLevels) onLevels(at);
-    float* dX; CK(devMalloc(&dX, all3 * 4));
-    uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
-    CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
-    initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
-    float* dLevels = upload(at.data(), steps);
-    for (int step = 1; step <= steps; ++step) {
-      const float* d = denoiseFn(dX, (float)levels[step - 1], dLevels + step - 1);
-      if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
-      if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
-      CK(cudaMemcpyAsync(dX, d, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
-    }
-    std::vector<float> out = download(dX, all3);
-    for (float* p : {dX, dLevels}) CK(cudaFree(p));
-    CK(cudaFree(dSeeds));
-    return out;
-  }
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
   if (M.flag("trunk.dialect.chaiSampler")) return sampleChai(steps, seeds, mask, denoiseFn, onLevels);
   for (int k = 0; k <= steps; ++k)
