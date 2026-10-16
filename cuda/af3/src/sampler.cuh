@@ -215,6 +215,9 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
 //                --multistep-below=<A> only at steps under that noise level. Measured, NOT a default: everywhere it
 //                moves chains (af3's crystals 1.106 -> 1.344 A at 12 steps), below 4 A it keeps them and helps
 //                ligands a little (docs/AF3.md, "A multistep update")
+//   --schedule-split=<A>:<K>: the geometric schedule in two segments, K steps down to that level and the rest
+//                below - measured, NOT a default: steps above ~4 A place assemblies and steps below settle ligands,
+//                and every reallocation of the default's 25 cost one or the other (docs/AF3.md)
 // The defaults are the exponential update on the geometric schedule with churn - every fold's, the page's too
 // (webgpu/af3/fold.js DIFFUSION_DEFAULTS): 200 Euler steps' ligand geometry at 25, level elsewhere (docs/AF3.md).
 // --update=euler --schedule=karras is AlphaFold 3's own sampler, for an oracle comparison.
@@ -222,6 +225,7 @@ struct DiffusionOptions {
   bool geometric = true, exponential = true, churn = true;
   bool multistep = false;      // exponential with DPM-Solver++ 2M's extrapolation from the previous prediction
   double multistepBelow = 1e30;  // ...only at steps whose noise level (A) is below this; plain exponential above
+  double splitAt = 0; int splitAbove = 0;  // geometric in two segments: splitAbove steps down to splitAt (A), the rest below
   bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
@@ -239,6 +243,12 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
   }
   if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
   if (!strncmp(f, "--multistep-below=", 18)) { o.multistepBelow = atof(f + 18); o.given = true; return true; }
+  if (!strncmp(f, "--schedule-split=", 17)) {
+    if (sscanf(f + 17, "%lf:%d", &o.splitAt, &o.splitAbove) != 2 || o.splitAt <= 0 || o.splitAbove < 1) {
+      fprintf(stderr, "--schedule-split=<A>:<steps above>, not %s\n", f + 17); exit(1);
+    }
+    o.geometric = true; o.given = true; return true;
+  }
   return false;
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
@@ -263,6 +273,13 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   for (int k = 0; k <= steps; ++k)
     levels[k] = opt.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
                               : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+  if (opt.splitAt > 0) {      // two geometric segments, in A: 16 sigmaMax -> splitAt in splitAbove steps, then -> 16 sigmaMin
+    if (opt.splitAbove >= steps) { fprintf(stderr, "--schedule-split: %d steps above, of %d\n", opt.splitAbove, steps); exit(1); }
+    const double top = std::log(16 * sigmaMax), mid = std::log(opt.splitAt), bottom = std::log(16 * sigmaMin);
+    for (int k = 0; k <= steps; ++k)
+      levels[k] = std::exp(k <= opt.splitAbove ? top + (double)k / opt.splitAbove * (mid - top)
+                                               : mid + (double)(k - opt.splitAbove) / (steps - opt.splitAbove) * (bottom - mid));
+  }
   if (!opt.churn) gamma0 = 0;
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {

@@ -6761,3 +6761,20 @@ median / mean (A) and folds past 0.15 A of 6, then the crystals' mean CA RMSD:
   openbind0, so the open question is the ALLOCATION: fewer steps above ~4 A and more below.
 
 Raw rows: `/tmp/claude-1000/sch/ms*.txt`, `hy*.txt` on the A100 box (not kept).
+
+### 🔴 ...and the steps cannot be reallocated for free: above 4 A places complexes, below settles ligands
+
+`--schedule-split=<A>:<K>` (cuda/af3) runs the geometric schedule as two segments, K steps from the top down to that
+level and the rest below it. With multistep below 4 A, against the exponential 25 (which spends ~12.5 steps above
+4 A):
+
+- **Four steps above place a 68-494 residue chain** (16 calls, 4 above: ligands and six crystals level on all seven
+  models) **and do NOT place an assembly**: a Boltz-2 GroEL ring sample broke to 23.6 A (every chain 12.5 A) where
+  exp 25's two were 2.9 / 3.4, and AF3's ring went 1.41 -> 2.28 on one sample. The small crystals cannot see it.
+- **Eight above hold the assemblies** (rings, 1JZ7 A:B, ring + GroES within a sample's spread of exp 25), but at 16
+  calls (8 below) ligand tails come back - two of twelve past 0.15 A on boltz2, opendde and rosettafold3 against 0, 1
+  and 0 - and at 20 calls (12 below) the ligands are level while the 1TIM dimer is ~0.1 A worse on four models
+  (af3 1.11 -> 1.25, boltz2 1.38 -> 1.45, protenix2 1.16 -> 1.31, opendde 1.18 -> 1.27).
+- So the default stays: 20% fewer calls is not worth a consistent 0.1 A on a dimer, and the exponential 25 is close
+  to the balance of the two halves. The flags stay for measuring; `/tmp/claude-1000/sch/sp*.txt` and
+  `/tmp/claude-1000/big/big2.txt`, `big3.txt` on the A100 box (not kept).
