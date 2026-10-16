@@ -33,7 +33,7 @@
  * at `probe-modified.js`'s default eight steps in DIFFUSION mode, every model
  * reads a ratio between 11 and 21 and so does its CONTROL - the fold has not
  * condensed at all. See docs/AF3.md: diffusion at eight calls is 19-37 A on a
- * ligand. flow 16 is converged and is what this uses.
+ * ligand. Diffusion at 200 is converged and is what this uses (Flow, which this used at 16, was removed).
  */
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -49,11 +49,7 @@ const MODELS = [
   { name: "intellifold2", bundle: "model-intellifold2-int5" },
   { name: "openbind0", bundle: "model-openbind0-f32" },
   { name: "opendde", bundle: "model-opendde-int5" },
-  // 🔴 rosettafold3 HAS NO FLOW SAMPLER - `noFlowSampler` - so it is the one
-  // model here that must be folded with diffusion, and at a count that has
-  // converged rather than the page's 25.
-  { name: "rosettafold3", bundle: "model-rosettafold3-int5",
-    arm: ["--mode=diffusion", "--steps=200"] },
+  { name: "rosettafold3", bundle: "model-rosettafold3-int5" },
   { name: "boltz2", bundle: "model-boltz2-int5" },
   // 🔴 ESMFold2 DRIVES ITS OWN TOOL, AND ITS ABSENCE HERE IS WHY A USER FOUND
   // THE BUG. `probe-modified.js` opens an AF3 store and calls `foldBatch`, so
@@ -75,7 +71,7 @@ const MODELS = [
            "--sequence=GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"] },
 ];
 
-const FLOW = ["--mode=flow", "--steps=16"];
+const CONVERGED = ["--mode=diffusion", "--steps=200"];
 let failed = 0, skipped = 0;
 for (const model of MODELS) {
   if (!existsSync(model.bundle)) {
@@ -88,7 +84,7 @@ for (const model of MODELS) {
   const run = spawnSync("node", ["tools/gpu-chrome.mjs",
     model.tool ?? "tools/gpu/probe-modified.js",
     ...(model.args ?? [`--model=/${model.bundle}/manifest.json`, "--code=SEP",
-                       "--at=3", ...(model.arm ?? FLOW)])],
+                       "--at=3", ...(model.arm ?? CONVERGED)])],
     { encoding: "utf8", maxBuffer: 1 << 28 });
   const text = (run.stdout ?? "").split("\n").filter((l) => !l.startsWith("[gpu-chrome]")).join("\n");
   const at = text.indexOf("{");

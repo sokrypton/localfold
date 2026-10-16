@@ -52,7 +52,7 @@ export async function main(device, args) {
   const dna = option(args, "dna", "");
   const rna = option(args, "rna", "");
   const protein = option(args, "sequence", "");
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const steps = Number(option(args, "steps", "16"));
   // Protein first, because featuriseProtein numbers asym straight through and
   // the polymers come before the ligands; the order here is the order of the

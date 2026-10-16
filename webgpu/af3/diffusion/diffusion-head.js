@@ -593,8 +593,8 @@ export class Af3DiffusionHeadGpu {
     // 🔴 THE PAIR CONDITIONING IS COMPUTED ONCE PER TRUNK, NOT ONCE PER CALL.
     // Nothing in it reads the noise level, so a 200-step sampler was building
     // the same tokens x tokens x 128 tensor two hundred times. The cache is on
-    // the head instance and keyed by the trunk pair OBJECT: sampleOnGpu and
-    // flowOnGpu construct one head and spread the same input through every
+    // the head instance and keyed by the trunk pair OBJECT: sampleOnGpu
+    // constructs one head and spreads the same input through every
     // step, so identity is exactly the question "is this the same fold", and a
     // new fold brings a new array. Nothing here could tell a MUTATED array
     // apart, which is why the key is identity rather than a hash - the callers

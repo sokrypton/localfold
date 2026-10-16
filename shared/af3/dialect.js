@@ -232,8 +232,6 @@ export const ALPHAFOLD3 = Object.freeze({
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: false,
   paddedAtomKeys: false,
   diffusionNoResidual: false,
@@ -347,8 +345,6 @@ export const OPENBIND0 = Object.freeze({
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: false,
   paddedAtomKeys: false,
   diffusionNoResidual: false,
@@ -525,8 +521,6 @@ export const OPENDDE = Object.freeze({
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: false,
   paddedAtomKeys: true,
   diffusionNoResidual: false,
@@ -649,8 +643,6 @@ export const PROTENIX2 = Object.freeze({
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: false,
   paddedAtomKeys: true,
   diffusionNoResidual: false,
@@ -810,8 +802,6 @@ export const BOLTZ2 = Object.freeze({
   // entries, one ref_space_uid, 6.924 A across the residue - so the token
   // count is the whole of it. See docs/BOLTZ2_PTM.md.
   modifiedAsOneToken: true,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: false,
   paddedAtomKeys: true,
   // ...and boltz2 CLIPS AND PADS, which reaches the same window: upstream
@@ -1001,8 +991,6 @@ export const INTELLIFOLD2 = Object.freeze({
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
-  noFlowSampler: false,
   qblockAtomKeys: true,
   paddedAtomKeys: false,
   diffusionNoResidual: false,
@@ -1189,19 +1177,6 @@ export const ROSETTAFOLD3 = Object.freeze({
   atomizedUnknownMsa: true,
   atomizedBackboneBonds: true,
   modifiedAsOneToken: false,
-  // 🔴 THIS CHECKPOINT HAS NO WORKING FLOW WALK, AND THE PAGE DEFAULTED TO ONE.
-  // Measured on 6MRR: `--mode=flow` gives N-CA **6.94 A** against 1.46 and
-  // consecutive CA collapsing to 0.23 A at worst - the geometry gate refuses it
-  // outright - while `--mode=diffusion` gives 1.693 A and a clean backbone.
-  // AlphaFold 3 and intellifold2 fold fine in flow (CA-CA 3.58 and 3.88), so it
-  // is this checkpoint and not the sampler.
-  //
-  // 🔴 AND pLDDT SAID 81.47 ON THE BROKEN ONE, four tenths from the good fold's
-  // 81.53. Nothing but the chain-geometry check can see this.
-  //
-  // Inverse polarity, like `dedupeSelfMsa`: the flag names the DIVERGENCE so
-  // stock AlphaFold 3 stays all-false, which test/af3-dialect.test.js asserts.
-  noFlowSampler: true,
   qblockAtomKeys: false,
   paddedAtomKeys: true,
   diffusionNoResidual: true,
@@ -1282,7 +1257,6 @@ export const CHAI1 = Object.freeze({
   atomizedUnknownMsa: true,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
-  noFlowSampler: true,
   qblockAtomKeys: false,
   paddedAtomKeys: true,
   diffusionNoResidual: true,

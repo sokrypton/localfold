@@ -6443,6 +6443,9 @@ rosettafold3 0 is none. The pooled row is the one to quote.
 
 ## 🔴 AlphaFold 3 takes twenty steps from sigma 80, not twenty-five from 160
 
+🔴 **SUPERSEDED 2026-10-16**: every family now folds twenty-five steps of the exponential update on the geometric
+schedule, and the short schedules below are gone - see "The default sampler". Kept as the record.
+
 Measured on the M2 (2026-09-26), AF3 int5, stock flags. The schedule starts at
 160 x sigmaData, where the denoiser's skip weight is ~4e-5 and its output all
 but ignores its input, and rho 7 still spends several of twenty-five calls up
@@ -6583,7 +6586,8 @@ Measured on the A100 (developer flags, int5 bundle), 5CAJ chain A (262 tokens) u
 
 Blitz (an ICLR 2027 submission: AlphaFold 3 and Boltz-2 distilled to eight diffusion steps) replaces the sampler's
 Euler step with `x' = r^S x + (1 - r^S) D`, `r = sigma' / sigma`, and Karras's rho-7 schedule with one evenly spaced in
-log sigma. Neither needs training. Both are options here now, inert by default (byte-identical folds):
+log sigma. Neither needs training. Both were added as options, inert by default (byte-identical folds), and are
+the DEFAULT since 2026-10-16 - see "The default sampler" below; `--update=euler --schedule=karras` is the old walk:
 `--update=exponential`, `--schedule=geometric` and `--no-churn` on cuda/af3 and `tools/gpu/fold.js`, and
 `{ update, schedule, churn }` in `foldBatch`'s `diffusion` option (cpu/af3/diffusion/diffusion-sampler.js holds the
 arithmetic; test/diffusion-update.test.js its closed forms). A Flow, or chai-1's sampler, refuses them.
@@ -6638,5 +6642,86 @@ What it says:
 including 200 Euler steps, where its DNA alone is 0.037 and every other model's protein + DNA is 0.036-0.041. Not
 investigated here; the sampler options do not cause it.
 
-Raw rows: `/tmp/claude-1000/sch/grid*.txt` and `acc-*.txt` on the A100 box (not kept). The defaults are not changed by
-this commit.
+Raw rows: `/tmp/claude-1000/sch/grid*.txt` and `acc-*.txt` on the A100 box (not kept). The defaults were not changed by
+that commit; "The default sampler" below is what changed them.
+
+## Flow removed (2026-10-16)
+
+The Flow walk - one draw at sigma 160 A, then the state replaced by each denoiser prediction - is gone from the page
+(the sampler select), `foldBatch` (`mode: "flow"` and `"ode"`; anything but `"diffusion"` is refused by name), the
+CUDA port (`--flow`, refused by name), the worker (a job still asking for it is refused) and the dialect
+(`noFlowSampler`). It was the page's cheap option and the evidence no longer supports keeping it:
+
+- **It breaks large inputs and complexes, on every model tested.** cuda/af3, CA RMSD over the best chain assignment:
+
+  | target | Flow 16 (+ geometric + per-step pose) | diffusion (Euler 25 / 100, exponential 25) |
+  |---|---:|---:|
+  | 1JZ7 A, 1,023 residues: boltz2 / openbind0 / rosettafold3 | 8.6 / 27.6 / 2.0 | 0.57-0.72 / 1.09-1.12 / 0.78-0.86 |
+  | 1JZ7 A:B, 2,046: af3 / boltz2 | 15.6 / 35.7 | 0.98-1.13 / 0.80-0.87 |
+  | GroEL ring alone, 3,829 (against 1AON's apo trans ring): af3 / boltz2 | 25.9 / 49.2 | 1.44-2.22 / 3.14-3.62 |
+  | GroEL ring + GroES, 4,508: af3 | 40.0 (single chains 15-19 A) | 1.88-3.43 |
+  | 1TIM A:B, 494: openbind0 / opendde | 16.9 / 8.2 (seeds to 25 / 15 A) | 1.14-1.17 / 1.20-1.24 |
+
+  (Scored over the OPTIMAL assignment of identical chains, and for 1JZ7 - a tetramer - against whichever of its
+  three chain pairs the prediction is: a greedy nearest-centroid assignment first scored a correct GroEL ring at 44 A,
+  and AF3 and Boltz-2 legitimately choose different 1JZ7 interfaces, A:B and A:D.)
+
+  On OpenBind-0's 1TIM dimer each chain is right (1.07 / 1.28 A) and their placement is not (24 A) - a deterministic
+  walk from one draw does not break the symmetry of two identical chains. That Boltz-2 failure on the templated dimer
+  (2 seeds in 5, recorded under AF3_COUNTS) was the same thing.
+- **RoseTTAFold3 never had a working one** (its walk collapses: N-CA 6.94 A). It was traced here: a per-step random
+  pose (the augmentation diffusion applies, which the checkpoint was trained with) fixes it - 6MRR 16 A -> 1.67 - but
+  that does not rescue the large-input failures above.
+- **Where it was good it is not needed.** At 16 calls on small systems Flow + geometric had the best ligand bonds
+  measured (median 0.046 A against diffusion 25's 0.070, AF3 / Boltz-2 / Protenix2), and crystals level - but the
+  exponential diffusion (`update: "exponential"`, `schedule: "geometric"`) reaches 200 steps' ligand geometry at 25
+  calls without Flow's failure modes, and at 8 calls folds proteins as well as 200.
+
+Removed with it: `flowOnGpu`, the `#af3-mode` select and `samplerModeFor` / `NO_FLOW_SAMPLER_FAMILIES` /
+`OPENDDE_SAMPLER_MODE` (web/af3-model.js), the CUDA gate's Flow fold and its rf3 / chai1 refusals (one refusal of
+Flow itself remains), `probe-flow-sigma-by-size.js` and `probe-one-step-sigma.js` (both questions about Flow).
+`test:modified` folds at diffusion 200 where it used Flow 16. `--mode=` on the fold tools takes only "diffusion".
+
+## The default sampler: twenty-five exponential steps on the geometric schedule, every family (2026-10-16)
+
+`foldBatch` (webgpu/af3/fold.js `DIFFUSION_DEFAULTS`) and cuda/af3 (`DiffusionOptions` in sampler.cuh) both default to
+the exponential update on the geometric schedule with churn, and the page's one dial (`AF3_COUNTS` in web/af3-model.js)
+prefers 25 for every AF3-lineage family. Gone with it: `ALPHAFOLD3_COUNTS`, `OPENDDE_COUNTS`, `SHORT_SCHEDULES` and
+`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 keeps its own sampler (the flags are refused
+only when given). `--update=euler --schedule=karras` folds the old way.
+
+**The decision run** (cuda/af3, seven models; each model's OLD page default against the exponential sampler at
+16 / 20 / 25 and both samplers at 200). Bonds over bench-sampler-geometry.js's seven systems x two seeds; ligand =
+GOL, ATP, SEP, median bond RMS and how many of six folds went past 0.15 A:
+
+| model (old default) | old default | exp 16 | exp 20 | **exp 25** | exp 200 | Euler 200 |
+|---|---|---|---|---|---|---|
+| rosettafold3 (Euler 25) | **0.340, 4/6** | 0.168, 3/6 | 0.067 | **0.067, 0/6** | 0.052 | 0.062 |
+| boltz2 (Euler 25) | 0.086 | 0.097, 2/6 | 0.084, 1/6 | **0.071** | 0.075 | 0.077 |
+| intellifold2 (Euler 20 from 80) | 0.069, 1/6 | 0.059, 1/6 | 0.053 | **0.049** | 0.047 | 0.049 |
+| opendde (Euler 16) | 0.069, 1/6 | 0.091, 2/6 | 0.063 | **0.053, 1/6** | 0.044 | 0.048 |
+| af3 (Euler 20 from 80 / 40) | 0.048 | 0.071 | 0.060 | **0.042, 1/6** | 0.041 | 0.045 |
+| openbind0 (Euler 20 from 80 / 40) | 0.060 | 0.106, 1/6 | 0.074 | **0.059** | 0.054 | 0.065 |
+| protenix2 (Euler 20 from 80 / 40) | 0.045 | 0.050 | 0.050 | **0.047** | 0.043 | 0.045 |
+
+Nucleic and side-chain bonds are the same in every arm. Crystals (6MRR, 1QYS, 5CAJ and 1TIM A with their alignments,
+1TIM A:B, 1BRS A:D; three seeds, CA RMSD over the best chain assignment) do not separate the arms: with 1QYS left out,
+exp 25 minus the old default is -0.16 to +0.05 A per model (mean of per-target medians), inside the seed spread.
+
+- **25 exponential steps is best or level on ligands for every family, and rosettafold3's ligands stop tearing**
+  (4/6 past 0.15 A at its old Euler 25).
+- **Fewer exponential steps is not a cheaper option**: 16 and 20 are worse on ligands than most of the old defaults.
+  So the short schedules (20 from a lower start) and OpenDDE's 16 went rather than being carried over.
+- 🔴 **1QYS IS BIMODAL ON EVERY ARM**: each seed lands at ~1.2 A or ~2.8 A for boltz2, protenix2 and intellifold2,
+  at 25 steps and at 200, Euler and exponential alike - a three-seed median there is a coin. Leave it out of any
+  sampler comparison or give it ten seeds.
+- **Cost**: 25 denoiser calls where af3, protenix2, openbind0 and intellifold2 took 20 and opendde 16. The diffusion is
+  ~46 ms of a 189 ms 68-token af3 fold here.
+- OpenDDE's protein + DNA defect (above) is unchanged by the sampler (nucleic mean 0.74-0.79 A in every arm).
+- 🔴 **A PERFECT TEMPLATE IS THE ONE PLACE IT IS A LITTLE WORSE.** AlphaFold 3 on 5CAJ with its own crystal as the
+  template (cuda/af3/gate.py's case, seeds 42 / 1 / 2 / 3): Euler 25 0.136 / 0.171 / 0.153 / 0.138 A, exponential 25
+  0.182 / 0.188 / 0.237 / 0.252, Euler 200 0.142-0.209, exponential 200 0.158-0.225 with seed 42 at 0.488 (the gate's
+  recorded figure). rosettafold3 is 0.085-0.103 on every arm and boltz2 is spread 1.7-3.4 on every arm. Taken: ~0.06 A
+  on an answer the template already pins, against ligands that stop tearing.
+
+Raw rows: `/tmp/claude-1000/sch/finalA.txt`, `finalB.txt` and `fsum.py` on the A100 box (not kept).

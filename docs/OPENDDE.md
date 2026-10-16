@@ -514,6 +514,10 @@ and on 6MRR the whole ladder, one seed: 16 -> 0.9146, 25 -> 0.8925,
 carries 16 as the preferred value; the AlphaFold 3 settings stay on the ladder
 so they remain selectable and comparable.
 
+🔴 **SUPERSEDED 2026-10-16**: those were Euler steps. On the exponential update OpenDDE folds 25 like every
+family and `OPENDDE_COUNTS` is gone - docs/AF3.md, "The default sampler" (its ligands 0.069 -> 0.053 A, crystals
+level).
+
 🔴 **AND THE SEED SPREAD IS WHAT MAKES THAT A RESULT.** Three seeds at 16 steps
 and two at 100: every 16-step fold has a better TM than every 100-step fold and
 the ranges do not overlap, on a quantity whose seed-to-seed spread within an arm

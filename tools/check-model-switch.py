@@ -69,7 +69,7 @@ def main():
           'accepted'); return 1; })()""")
         rows = json.dumps([{"type": "protein", "value": SEQUENCE, "copies": 1}])
         for model in MODELS:
-            controls = {"model-family": model, "af3-mode": "diffusion", "msa-mode": "none",
+            controls = {"model-family": model, "msa-mode": "none",
                         "af2Model": "1", "plm-mode": "esmc-600m"}
             cdp.evaluate(ws, f"""(() => {{ window.__entityList.set({rows});
               window.__foldInputs.apply({{ entities: {rows}, controls: {json.dumps(controls)} }});

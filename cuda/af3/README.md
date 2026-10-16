@@ -92,7 +92,7 @@ example jobs fold (`tools/fixtures/af3-jobs/`).
 | `--recycles=N` | 3 | trunk recycles (N+1 passes) |
 | `--recycle-tolerance=<A>` | off | stop recycling once the prediction moves less than this |
 | `--steps=N` | 200 | diffusion steps |
-| `--flow` | | the page's Flow sampler instead of diffusion (not `rosettafold3`, `chai1`) |
+| `--update=`, `--schedule=`, `--no-churn` | `exponential`, `geometric` | the diffusion step and noise schedule; `--update=euler --schedule=karras` is AlphaFold 3's own walk (docs/AF3.md, "The default sampler"; not `chai1`, which keeps its own) |
 | `--af3-defaults` | | AlphaFold 3's own run settings: 10 recycles, 5 samples |
 | `--frames=<dir>` | | every intermediate result as it lands (below) |
 | `--save-embeddings`, `--save-distogram` | | what AlphaFold 3's flags of the same names write |
@@ -144,7 +144,7 @@ the RCSB, on every case of `npm run test:featurise` (`--ccd=ccd/components.cif`)
 - Up to ~6,000 tokens on a 40 GB A100 and ~3,200 on a 16 GB T4; past what the card holds it refuses up front and
   says the longest it takes (see "How large a fold fits" below).
 - A refusal is one sentence, `Error: ...`, and a nonzero exit: an unknown model, a job the reader cannot take,
-  Flow on a model without it, a flag the input cannot use.
+  the removed Flow sampler (`--flow`), a flag the input cannot use.
 
 ### On Colab and the website
 

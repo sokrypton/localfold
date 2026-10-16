@@ -1,84 +1,84 @@
 {
  "af3-1brs-template": {
-  "plddt": 95.47,
-  "ptm": "0.9418",
-  "rmsd": 0.515
+  "plddt": 94.66,
+  "ptm": "0.9374",
+  "rmsd": 0.545
  },
  "af3-5caj-msa": {
-  "plddt": 95.45,
-  "ptm": "0.9493",
-  "rmsd": 1.91
+  "plddt": 95.23,
+  "ptm": "0.9460",
+  "rmsd": 2.018
  },
  "af3-5caj-template": {
-  "plddt": 95.54,
-  "ptm": "0.9551",
-  "rmsd": 0.182
+  "plddt": 94.92,
+  "ptm": "0.9501",
+  "rmsd": 0.488
  },
  "af3-6mrr": {
-  "plddt": 87.39,
-  "ptm": "0.7682",
-  "rmsd": 0.55
+  "plddt": 87.75,
+  "ptm": "0.7650",
+  "rmsd": 0.611
  },
  "af3-6mrr-gol-sep3": {
-  "ligand": 0.044,
+  "ligand": 0.038,
   "plddt": 90.09,
-  "ptm": "0.8332",
-  "rmsd": 1.573
+  "ptm": "0.8493",
+  "rmsd": 1.507
  },
  "af3-dna-5cm": {
-  "ligand": 0.043,
-  "nucleic": 0.048,
-  "plddt": 93.18,
-  "ptm": "0.8122",
+  "ligand": 0.045,
+  "nucleic": 0.041,
+  "plddt": 94.08,
+  "ptm": "0.8179",
   "rmsd": null
  },
  "af3-dna-duplex": {
-  "nucleic": 0.047,
-  "plddt": 91.22,
-  "ptm": "0.1941",
+  "nucleic": 0.038,
+  "plddt": 93.3,
+  "ptm": "0.2054",
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.021,
-  "plddt": 47.42,
-  "ptm": "0.4337",
+  "ligand": 0.023,
+  "plddt": 45.77,
+  "ptm": "0.3997",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.042,
-  "nucleic": 0.048,
-  "plddt": 73.47,
-  "ptm": "0.7521",
+  "ligand": 0.044,
+  "nucleic": 0.035,
+  "plddt": 74.48,
+  "ptm": "0.7705",
   "rmsd": null
  },
  "boltz2-6mrr": {
-  "plddt": 96.82,
-  "ptm": "0.8101",
-  "rmsd": 0.461
+  "plddt": 96.77,
+  "ptm": "0.8122",
+  "rmsd": 0.562
  },
  "intellifold2-6mrr": {
-  "plddt": 84.82,
-  "ptm": "0.6955",
-  "rmsd": 1.551
+  "plddt": 85.4,
+  "ptm": "0.7017",
+  "rmsd": 1.581
  },
  "openbind0-6mrr": {
-  "plddt": 82.31,
-  "ptm": "0.7535",
-  "rmsd": 1.771
+  "plddt": 83.72,
+  "ptm": "0.7936",
+  "rmsd": 1.706
  },
  "opendde-6mrr": {
-  "plddt": 91.63,
-  "ptm": "0.7793",
-  "rmsd": 1.504
+  "plddt": 91.77,
+  "ptm": "0.7778",
+  "rmsd": 0.815
  },
  "protenix2-6mrr": {
-  "plddt": 85.64,
-  "ptm": "0.8634",
-  "rmsd": 0.499
+  "plddt": 87.56,
+  "ptm": "0.8808",
+  "rmsd": 1.507
  },
  "rosettafold3-6mrr": {
-  "plddt": 82.3,
-  "ptm": "0.8169",
-  "rmsd": 1.622
+  "plddt": 81.44,
+  "ptm": "0.8047",
+  "rmsd": 1.015
  }
 }

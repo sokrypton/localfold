@@ -54,7 +54,7 @@ export async function main(device, args) {
     const started = performance.now();
     try {
       await foldBatch(device, batch, weights, {
-        mode: "flow", steps, recycles, seed: 5, reuse,
+        mode: "diffusion", steps, recycles, seed: 5, reuse,
         onStage: (name, detail) => {
           if (name === "recycle") recycleStages += 1;
           if (name === "trunk-done") {

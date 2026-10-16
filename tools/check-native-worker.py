@@ -79,7 +79,7 @@ def ligand_bonds(pdb):
 
 def controls(**over):
     return {"model-family": "af3", "msa-mode": "none", "max-msa": "128:256", "recycles": "3", "tolerance": "0.1",
-            "af3-mode": "diffusion", "af3-count": "25", "random-seed": "1", **over}
+            "af3-count": "25", "random-seed": "1", **over}
 
 
 def protein(sequence, template=None):
@@ -101,13 +101,15 @@ def cases(offline):
         ("af3 5caj, its crystal uploaded", {"family": "af3", "controls": controls(),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
+        # (protenix2's 6MRR is bimodal on every sampler - a seed lands at ~0.6-0.9 A or ~1.5-1.7, Euler 200 included,
+        # docs/AF3.md "The default sampler" - so its bar is a chain's, not one mode's)
         ("protenix2 6mrr", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
-         "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
+         "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         # (past 80 tokens: protenix2's 256-channel pair track on its fused kernels, cuda/af3/src/fused256.cuh)
         ("protenix2 5caj, its crystal uploaded", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
-        ("opendde 6mrr", {"family": "opendde", "controls": controls(**{"model-family": "opendde", "af3-count": "16"}),
+        ("opendde 6mrr", {"family": "opendde", "controls": controls(**{"model-family": "opendde"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         ("af3 6mrr + GOL + SEP3", {"family": "af3", "controls": controls(),
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}],
@@ -151,13 +153,11 @@ def cases(offline):
          "job": job([S6], ["GOL"]), "ligandBonds": 5}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 6, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
-        # the page's short schedule (web/af3-model.js diffusionScheduleFor), which the page resolves and sends:
-        # an empty step dial is the family's preferred count there and the model's own 200 here
-        ("af3 6mrr, the page's short schedule", {"family": "af3", "controls": controls(**{"af3-count": ""}),
-         "schedule": {"steps": 20, "sigmaMax": 80}, "entities": [protein(S6)], "job": job([S6])},
+        # the page's steps (web/app.js samplerPlan), which the page resolves and sends: an empty step dial is
+        # the dial's preferred count there and the model's own 200 here
+        ("af3 6mrr, the page's steps", {"family": "af3", "controls": controls(**{"af3-count": ""}),
+         "schedule": {"steps": 25}, "entities": [protein(S6)], "job": job([S6])},
          (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
-        ("af3 6mrr, the Flow sampler", {"family": "af3", "controls": controls(**{"af3-mode": "flow", "af3-count": "16"}),
-         "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.2, 68, None),
         ("chai1 6mrr", {"family": "chai1", "controls": controls(**{"model-family": "chai1"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("chai1 5caj, its crystal uploaded", {"family": "chai1", "controls": controls(**{"model-family": "chai1"}),
@@ -170,12 +170,10 @@ def cases(offline):
         *[(f"{m} 6mrr", {"family": m, "controls": controls(**{"model-family": m}), "entities": [protein(S6)],
            "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None)
           for m in ("boltz2", "intellifold2", "rosettafold3")],
-        ("refused: flow on chai1", {"family": "chai1",
-         "controls": controls(**{"model-family": "chai1", "af3-mode": "flow"}), "entities": [protein(S6)],
-         "job": job([S6])}, None, None, None, "Diffusion"),
-        ("refused: flow on rosettafold3", {"family": "rosettafold3",
-         "controls": controls(**{"model-family": "rosettafold3", "af3-mode": "flow"}), "entities": [protein(S6)],
-         "job": job([S6])}, None, None, None, "Diffusion"),
+        # (Flow was removed: a job from an older page that still asks for it is refused by name)
+        ("refused: the removed Flow sampler", {"family": "af3",
+         "controls": controls(**{"af3-mode": "flow"}), "entities": [protein(S6)],
+         "job": job([S6])}, None, None, None, "Flow was removed"),
         ("af2 monomer model 3 (a delta on model 1) 6mrr", {"family": "monomer-3",
          "controls": controls(**{"model-family": "monomer"}), "entities": [protein(S6)], "job": job([S6])},
          (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
@@ -273,7 +271,6 @@ def page_arm(bad):
               g('model-family').dispatchEvent(new Event('change', {{ bubbles: true }}));
               window.__entityList.set([{{ type: 'protein', value: '{S6}', copies: 1, modifications: [] }}]);
               if (g('msa-mode')) {{ g('msa-mode').value = 'none'; g('msa-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
-              const a = g('af3-mode'); if (a) {{ a.value = 'diffusion'; a.dispatchEvent(new Event('change', {{ bubbles: true }})); }}
               return true;
             }})()""")
             cdp.wait_for(ws, "!document.getElementById('predict').disabled", 60, "the fold button")

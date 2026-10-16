@@ -69,10 +69,11 @@ FOLD
   --recycles=N             trunk recycles, N+1 passes (3)
   --recycle-tolerance=<A>  stop recycling once the prediction moves less than this
   --steps=N                diffusion steps (200)
-  --flow                   the Flow sampler instead of diffusion
-  --update=exponential     the diffusion's step x' = r^S x + (1 - r^S) D (Blitz's) rather than Euler's, which
-                           overshoots below ~25 steps; --schedule=geometric spaces the noise levels evenly in
-                           log sigma; --no-churn drops AlphaFold 3's noise injection
+  --update=euler --schedule=karras
+                           AlphaFold 3's own sampler: Euler's step on its rho-7 schedule. The default is the
+                           exponential step x' = r^S x + (1 - r^S) D on noise levels even in log sigma, which
+                           reaches 200 Euler steps' geometry at 25 (docs/AF3.md); --no-churn drops the noise
+                           injection
   --af3-defaults           AlphaFold 3's own run settings: 10 recycles, 5 samples
   --frames=<dir>           each intermediate result as it lands: contacts-PP-of-NN.u8 after every trunk
                            pass, frame-SSSS.pdb every diffusion step

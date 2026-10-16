@@ -132,9 +132,7 @@ async function foldPass(device, model, sequence, steps) {
       : { confidence: await confidenceWeights(store) }),
   };
   const sample = trunk.msaBlocks[0];
-  // 🔴 DIFFUSION, NOT FLOW: rosettafold3 REFUSES flow outright - see
-  // `noFlowSampler` - and this gate must run every checkpoint. Four steps
-  // will not converge and does not need to: a pipeline is compiled on the
+  // Four steps will not converge and do not need to: a pipeline is compiled on the
   // first one, and nothing here reads the structure.
   const result = await foldBatch(device, batch, weights,
                                  { steps, mode: "diffusion", recycles: 0 });

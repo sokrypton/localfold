@@ -38,9 +38,7 @@ import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
 import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../webgpu/runtime/device-memory.js";
-import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
-  countsForFamily, diffusionScheduleFor,
-  samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
@@ -918,7 +916,7 @@ let lastFoldedFamily;
 
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
-                       "af3-mode", "af3-count", "random-seed"];
+                       "af3-count", "random-seed"];
 
 /** What the form says now, in one object the session can carry. */
 function formInputs() {
@@ -2530,34 +2528,13 @@ function syncModelControls() {
   if (toleranceNode !== null) {
     toleranceNode.hidden = af2Row !== "monomer" && af2Row !== "multimer";
   }
-  // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
-  // structure head is an EDM sampler with a churn factor, exactly as AF3's is,
-  // so "flow or diffusion, and how many steps" means the same thing under both
-  // - what differs is the numbers, which is why the count dial is rebuilt from
-  // a per-model table rather than shared.
+  // 🔴 THE STEP DIAL IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's structure head is an EDM sampler with a
+  // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
+  // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
+  // removed, docs/AF3.md "Flow removed".)
   const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
-  // 🔴 THE STEP COUNT IS SHARED AND THE MODE IS NOT. ESMFold2's own sampler is
-  // eleven steps, so a flow arm has nothing to escape from and runs MORE of
-  // them than the shipped one - see ESMFOLD2_COUNTS. Offering a choice whose
-  // every option is equivalent-or-worse is the same fault as offering one that
-  // is ignored, so the mode row is hidden for it.
-  // 🔴 AND OpenDDE HIDES IT FOR THE SAME REASON, MEASURED ON ITS OWN SAMPLER.
-  // Flow and diffusion cost it the SAME 16.1 s at sixteen steps and flow is
-  // plainly worse - TM 0.8307 and 0.8601 against 0.9044 and 0.9169 on 6MRR,
-  // two seeds each and no overlap. Its sampler re-noises every step, which is
-  // what a flow arm exists to escape, and escaping it here loses the structure
-  // rather than buying time. See OPENDDE_SAMPLER_MODE.
-  // 🔴 AND rosettafold3 HIDES IT BECAUSE FLOW BREAKS THE STRUCTURE, which is a
-  // different reason from OpenDDE's "measurably worse": N-CA 6.94 A against
-  // 1.46 and a collapsed backbone, with pLDDT reading 81.47 as if fine. See
-  // NO_FLOW_SAMPLER_FAMILIES.
-  const modeNode = document.getElementById("af3ModeGroup");
-  if (modeNode !== null) {
-    modeNode.hidden = !af3 || family === "opendde"
-      || NO_FLOW_SAMPLER_FAMILIES.includes(family);
-  }
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
   // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
   // screen would run, take a minute of somebody else's server, and be
@@ -2625,17 +2602,9 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const mode = samplerModeFor(chosenFamily(),
-    document.getElementById("af3-mode")?.value ?? "diffusion");
-  // ...and ESMFold2's table has one mode, so the shared select cannot pick a
-  // row that is not there.
   const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
-  // ...and OpenDDE's own, because more steps make its fold worse; see
-  // OPENDDE_COUNTS for the two targets and nine folds that say so.
-  // ...and AlphaFold 3's, whose short schedule is its own; see ALPHAFOLD3_COUNTS.
-  const table = ef2 ? ESMFOLD2_COUNTS : countsForFamily(chosenFamily());
-  const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
-    ?? table.flow ?? table.diffusion;
+  const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
@@ -2766,31 +2735,11 @@ const cheapHash = (text) => {
 };
 
 /**
- * The sampler a fold of `family` runs: its mode, its step count and its
- * schedule, resolved from the controls once - for this page's own fold AND for
- * one handed to a runtime, which would otherwise fall back to the model's own
- * defaults (200 steps from AF3's start) where this page folds 20 from 80.
+ * The diffusion steps a fold runs, resolved from the controls once - for this page's own fold AND for one handed
+ * to a runtime, which would otherwise fall back to the model's own default (200).
  */
-function samplerPlan(family, ligandCodes, modifications) {
-  // 🔴 FORCED IN CODE, NOT ONLY HIDDEN. Hiding a control does not change its
-  // value: the shared `#af3-mode` select still reads "flow" behind a hidden
-  // row, which is the trap docs/EF2FAST.md records for that model an hour
-  // after hiding its own.
-  // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
-  // `samplerModeFor`. Hiding the row does not change the select's value, which
-  // is the trap the comment above records.
-  const mode = samplerModeFor(family,
-    document.getElementById("af3-mode")?.value ?? "diffusion");
-  const counts = countsForFamily(family);
-  // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
-  // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
-  // subscripted the table and took `.preferred` off whatever came back, so a
-  // mode with no row - a stale select value, a removed option, a family whose
-  // table is narrower than AF3's - threw "cannot read properties of undefined"
-  // in the middle of starting a fold rather than falling back. Two readings of
-  // one table, one of them guarded, is this file's own stale-allow-list trap.
-  // `test/sampler-options.test.js` gates the two lists against each other.
-  const row = counts[mode] ?? counts.diffusion ?? counts.flow;
+function samplerPlan(modifications) {
+  const row = AF3_COUNTS.diffusion;
   const asked = Number(document.getElementById("af3-count")?.value)
     || row.preferred;
   // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
@@ -2800,15 +2749,7 @@ function samplerPlan(family, ligandCodes, modifications) {
   // own token and eight steps leaves them compressed (0.835 against a control
   // of 1.003) while sixteen does not (0.974).
   const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
-  return {
-    mode, asked, calls,
-    // AlphaFold 3's short schedule below its own twenty-five steps; see
-    // ALPHAFOLD3_COUNTS in web/af3-model.js.
-    // ...and lower where the job carries a ligand or a modified residue,
-    // which the low-noise calls settle; see SHORT_SCHEDULES.
-    schedule: diffusionScheduleFor(family, mode, calls,
-      { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
-  };
+  return { asked, calls };
 }
 
 /**
@@ -2885,7 +2826,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     if (problem !== null) throw new Error(problem);
   }
 
-  const { mode, asked, calls, schedule } = samplerPlan(chosenFamily(), ligandCodes, modifications);
+  const { asked, calls } = samplerPlan(modifications);
   const recycles = recycleCount();
   const { requested: maxMsaSequences } = maxMsaConfig();
   // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
@@ -3028,8 +2969,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerKeep;
   let viewerModified = [];
   const result = await foldAf3({
-    sequence, mode, calls, recycles, weights, device, signal,
-    schedule,
+    sequence, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
     ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
@@ -3100,7 +3040,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // final load, so that the score-card poll cannot refill from a fold in
     // progress. drawLiveFrame reaches the renderer the same way openBlankFold
     // does.
-    onFrame: (pdb) => { drawLiveFrame(pdb, mode); },
+    onFrame: (pdb) => { drawLiveFrame(pdb, "diffusion"); },
   });
   await pending;
   throwIfAborted(signal);
@@ -3139,8 +3079,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // structure below still carries the real pLDDT.
   if (viewer !== undefined && viewerObject !== undefined && result.framePdbs.length > 0) {
     // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, it is not
-    // appended after it. The last frame IS that call's output - in flow mode
-    // they agree to a fraction of an angstrom - so appending made a redundant
+    // appended after it. The last frame IS that call's output - they agree to a
+    // fraction of an angstrom - so appending made a redundant
     // extra frame and a play bar that ended on the same picture twice. The
     // returned structure is the authoritative one, so it takes that slot.
     // 🔴 THE TRAJECTORY IS THE SAMPLER'S, AND ONLY THE SAMPLER'S. The trunk
@@ -3149,7 +3089,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // through the contact map instead, which moves per pass and costs nothing.
     const timeline = [...result.framePdbs.slice(0, -1), result.pdb];
     /** What a frame is called: the sampler's calls, then the answer. */
-    const frameName = (index, last) => (last ? "final" : `${mode}_${index}`);
+    const frameName = (index, last) => (last ? "final" : `diffusion_${index}`);
     const camera = { ...(viewer?.viewerState ?? {}) };
     // ...and the live frames are dropped first. They are the same structures,
     // drawn with the uncalibrated colour and named by their position in a list
@@ -3947,15 +3887,14 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // request - so the entity conversion is this page's and not re-implemented
   // in Python. See python/localfold/worker.py.
   request.backend = remoteBackendChoice();
-  // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
+  // ...and the steps this page would fold with (samplerPlan), because an
   // empty dial is the family's preferred count here and would be the model's own default there
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
   if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
   } else {
-    const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
-    request.schedule = { steps: calls, ...schedule };
+    request.schedule = { steps: samplerPlan(modifications ?? []).calls };
   }
   // ...and whether it streams its intermediate results here (the badge's Live preview)
   request.frames = remoteLiveChoice();
@@ -5497,7 +5436,6 @@ if (familySelect !== null) {
     syncModelControls(); syncMode();
   });
 }
-document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 // 🔴 AND THE MODEL NUMBER CHANGES THE FAMILY TOO, exactly as the PLM row does -
 // `chosenFamily` folds it into the name, so everything keyed on a family (the
 // weight cache, the download stem, the status line) has to be refreshed here or

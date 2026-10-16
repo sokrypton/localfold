@@ -14,7 +14,7 @@
  * WHAT IT IS FOR. A report from a real two-chain target said the recipe that
  * made it work was 0 recycles, diffusion at 160 steps, and an MSA capped at
  * 128 rows. The step count is confirmed elsewhere - see
- * probe-flow-sigma-by-size.js, where 20 scores less than half of 80. The other
+ * probe-flow-sigma-by-size.js (removed with Flow), where 20 scores less than half of 80. The other
  * two are what this measures, and the depth cap cannot be measured at all
  * without a real alignment: every other probe here folds single-sequence,
  * where there is no depth to cap.
@@ -55,7 +55,7 @@
  *
  * 🔴 AND IT RUNS AT A CONVERGED STEP COUNT. At the page's 20 the sampler has
  * not landed, so an MSA sweep there would be measuring sampler noise. 80 is
- * where probe-flow-sigma-by-size.js found it landing.
+ * where probe-flow-sigma-by-size.js (removed with Flow) found it landing.
  */
 import { generateMmseqs2ComplexMsa } from "../../shared/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";

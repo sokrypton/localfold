@@ -20,10 +20,6 @@
  * states bonds rather than inferring them from a distance cutoff, and it is the
  * same source the featuriser reads - not the prediction, so a fold is not
  * scored against itself.
- *
- * 🔴 AND rosettafold3 HAS NO FLOW SAMPLER. `noFlowSampler` makes `foldBatch`
- * throw rather than switch silently, so its flow arms are SKIPPED and said to
- * be skipped - a blank cell is not a pass.
  */
 import { confidenceWeights, openAf3Store, trunkWeights }
   from "../../shared/af3/weights/weights.js";
@@ -54,24 +50,18 @@ const SET = [
   { name: "protein+dna", chains: [PROTEIN, "ACGTACGTACGT"], kinds: ["protein", "dna"] },
 ];
 
-// mode and its count. The page prefers diffusion 25 and flow 16, and those are
-// the two a visitor actually gets; the others say how much of any difference is
-// the sampler and how much is the truncation.
-const ARMS = [["diffusion", 25], ["diffusion", 200], ["flow", 16], ["flow", 32]];
+// [mode, steps, schedule, name, diffusion options]: Euler at the page's 25 and the converged 200, and the exponential
+// update on the geometric schedule (cpu/af3/diffusion/diffusion-sampler.js) at 25. (Flow's arms went with it -
+// docs/AF3.md, "Flow removed".)
+const EXPONENTIAL = { update: "exponential", schedule: "geometric" };
+const ARMS = [["diffusion", 25], ["diffusion", 200], ["diffusion", 25, undefined, "exponential25", EXPONENTIAL]];
 
 /**
- * Matched budgets: the same number of denoiser calls to each sampler.
- *
- * 🔴 THE PAGE'S TWO SETTINGS ARE NOT A FAIR COMPARISON AND CANNOT TEST THE
- * CLAIM FLOW WAS ADDED FOR. Flow is offered at 16 cycles and diffusion at 25
- * steps, so "flow16 beats diffusion25" confounds the sampler with a 1.6x
- * budget - and the hope was that flow needs FEWER calls than diffusion to get a
- * small molecule right, which is a statement about the CURVE and not about one
- * pair of points. A denoiser call costs the same either way, so equal calls is
- * the honest axis and `--budgets=8,16,32,64` is how to ask.
+ * Matched budgets: the same number of denoiser calls to each update rule - Euler's and the exponential one -
+ * `--budgets=8,16,32,64`. A denoiser call costs the same either way, so equal calls is the honest axis.
  */
 const matchedBudgets = (counts) =>
-  counts.flatMap((n) => [["diffusion", n], ["flow", n]]);
+  counts.flatMap((n) => [["diffusion", n], ["diffusion", n, undefined, `exponential${n}`, EXPONENTIAL]]);
 
 const option = (args, name, fallback) => {
   const hit = args.find((a) => a.startsWith(`--${name}=`));
@@ -125,7 +115,6 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
   const dialect = weights.trunk?.dialect ?? dialectFor(weights);
-  const noFlow = dialect.noFlowSampler === true;
 
   // Every component the set needs, fetched once: the ligands, and the four
   // bases of whichever nucleic chains are in it.
@@ -160,16 +149,12 @@ export async function main(device, args) {
       ...(target.ptms ? { modifications: target.ptms.map(([code, at]) =>
         ({ chain: 0, position: at, ...components.get(code) })) } : {}),
     });
-    for (const [mode, steps, schedule, armName] of ARMS) {
+    for (const [mode, steps, schedule, armName, diffusion] of ARMS) {
       const arm = armName ?? `${mode}${steps}`;
       if (armsWanted.length > 0 && !armsWanted.includes(arm)) continue;
-      if (mode === "flow" && noFlow) {
-        rows.push({ target: target.name, arm, skipped: "noFlowSampler" });
-        continue;
-      }
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights,
-          { mode, steps, recycles: 0, seed, ...(schedule ? { schedule } : {}) });
+          { mode, steps, recycles: 0, seed, ...(schedule ? { schedule } : {}), ...(diffusion ? { diffusion } : {}) });
         const pdb = toPdb(batch, result.positions);
         const scored = bondGeometry(pdb, conformers, { components });
         // 🔴 `chainGeometryOf` TAKES SPACINGS, NOT A PDB - it is the shared rule
@@ -195,5 +180,5 @@ export async function main(device, args) {
       }
     }
   }
-  return { model: option(args, "model", ""), noFlow, rows };
+  return { model: option(args, "model", ""), rows };
 }

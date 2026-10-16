@@ -36,250 +36,32 @@ import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 
 /**
- * What the count dial offers per mode, and what it is called.
+ * What the step dial offers, and what it is called. One sampler: Flow was removed (docs/AF3.md, "Flow removed").
  *
- * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A flow CYCLE walks the whole
- * schedule; a diffusion STEP discretises it, and below twenty the sampler does
- * not land - ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A, a chain that is
- * not connected. So the dial is rebuilt on a mode change rather than carrying a
- * number across.
+ * One dial for every AF3-lineage family; twenty-five is the lowest it offers.
  *
- * 🔴 AND SIXTEEN IS THE LOWEST EITHER OFFERS, WHICH IT WAS NOT. Flow used to
- * start at two and prefer eight, and eight IS a finished structure for a chain
- * of standard residues - but not for a modified one, whose atoms are each their
- * own token rather than coming from a shared residue conformer and so have to
- * be placed individually. Measured with tools/gpu/probe-modified.js on a
- * phosphoserine, as the median predicted-to-ideal bond ratio against the
- * unmodified residues of the same chain:
- *
- *     flow-8    0.835   (control 1.003)
- *     flow-16   0.974   (control 1.007)
- *     flow-32   0.996   (control 1.010)
- *
- * A dial whose lowest setting is wrong for a supported input is a trap, and one
- * number that is always good enough beats two and a rule about when to use
- * which. The cost is a few seconds. AF3 itself scores 0.956 against this port's
- * 0.953 at matched settings, so what is left at sixteen is the architecture's
- * price for an atom-tokenised residue and not something more steps will fix.
+ * 🔴 SIXTEEN IS THE FLOOR UNDER ANY DIAL. A modified residue's atoms are each their own token and have to be placed
+ * individually; below sixteen calls they come out compressed (tools/gpu/probe-modified.js, a phosphoserine's median
+ * predicted-to-ideal bond ratio 0.835 at eight against a control of 1.003, 0.974 at sixteen).
  */
 export const AF3_COUNTS = {
-  // 🔴 THE DIAL IS NAMED FOR THE SAMPLER IT DISCRETISES, NOT FOR ITS UNIT. Both
-  // arms used to read "Steps", which says nothing: the numbers differ by an
-  // order of magnitude precisely BECAUSE a flow step walks the whole schedule
-  // and a diffusion step discretises it, and a reader seeing 16 in one mode and
-  // 200 in the other has no way to know that from the word. "Cycles" beside
-  // "Recycles" was the earlier objection and these avoid it too.
-  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
-  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
-  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
-  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
-  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
-  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
-  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
-  //
-  // The two failing seeds fail under every template configuration - merged,
-  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
-  // Flow takes one and walks down deterministically, so it never escapes a bad
-  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
-  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
-  // a good fold's 93.
-  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
-  // 🔴 THERE IS NO "ODE" ROW, AND THERE WAS. The flow walk's step can be an
-  // integration step - `x <- D + (sigma_next/sigma)(x - D)` rather than
-  // `x <- D` - and it shipped here as a third named sampler on the strength of
-  // "the only step that folds 1QYS for AlphaFold 3". That measurement was taken
-  // on a hand-reverted tree and does not reproduce; see the retraction in
-  // docs/AF3.md.
-  //
-  // Measured against DIFFUSION rather than against a Flow that was never
-  // broken, it wins **1 of 12** model/target pairs - intellifold2 on 6MRR,
-  // 0.769 against 1.549 - and loses the other eleven, by 2.3x on af3's own
-  // 6MRR. Its one win does not survive length either: the same model at 494
-  // residues is 1.665 against 1.058 and 1.065. And it breaks outright past ~400
-  // (494 residues: 6.62 mean against 0.958, the interface collapsing from fnat
-  // 0.87 to 0.26).
-  //
-  // A third option that is never the right pick is a way for a visitor to get a
-  // worse fold, so the page does not offer it. The STEP is still there and
-  // still reachable - `--mode=ode` on any fold tool - because the intellifold2
-  // square is real and worth understanding. See webgpu/af3/fold.js.
   // 🔴 AND 200 IS ON THE DIAL BECAUSE IT IS WHAT AF3 WAS TRAINED WITH. The
   // powers-of-two ladder (20, 40, 80, 160, 320) never landed on it, so the
-  // model's own setting was the one number the page could not select. 25 keeps
-  // the floor the note above measured - below twenty the sampler does not land,
-  // and ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A.
-  // 🔴 THAT FLOOR IS FOR THE MODEL'S OWN SCHEDULE. Started at sigma 80 rather
-  // than 160, twenty steps match twenty-five - see ALPHAFOLD3_COUNTS below,
-  // which is what AlphaFold 3 itself now takes; this row is every other family's.
+  // model's own setting was the one number the page could not select.
+  // 🔴 ONE DIAL FOR EVERY FAMILY, 25 ON THE EXPONENTIAL UPDATE (2026-10-16). The
+  // fold takes webgpu/af3/fold.js's DIFFUSION_DEFAULTS, the exponential update on
+  // the geometric schedule, and twenty-five of those against each family's old
+  // default (Euler at 20 from sigma 80 or 40 for af3/protenix2/openbind0/
+  // intellifold2, 16 for opendde, 25 for boltz2 and rosettafold3), seven models,
+  // seven systems x two seeds of bonds and six crystal targets x three seeds:
+  // ligand bond median 0.042-0.071 A against 0.045-0.340, rosettafold3's ligands
+  // 4/6 torn -> 0/6, and CA-RMSD level on every model (within 0.05-0.1 A; 1QYS
+  // is bimodal at ~1.2/~2.8 A on every arm, even 200 steps). Sixteen or twenty
+  // exponential steps were WORSE on ligands than the old defaults, so the short
+  // schedules, the per-family starts and OpenDDE's sixteen went. docs/AF3.md,
+  // "The default sampler".
   diffusion: { label: "Diffusion", values: [25, 50, 100, 200], preferred: 25 },
 };
-
-/**
- * OpenDDE's own step counts, because more steps make its fold WORSE.
- *
- * 🔴 MEASURED ON TWO TARGETS AND NINE FOLDS, AGAINST THE SEED SPREAD. TM
- * against the deposition, seeds within an arm:
- *
- *   6MRR   16 steps  0.9044 0.9169 0.9039   100 steps  0.8884 0.8828
- *   1QYS   16        0.9449 0.9394          100        0.9285 0.9319
- *
- * The ranges do not overlap on either target, and 16 is 32-40% faster. This is
- * the second model here to say it - docs/EF2FAST.md records "more steps than
- * the schedule buy nothing" for that one - and the mechanism is the same:
- * OpenDDE's sampler re-noises at every step, so a longer schedule is more
- * chances to wander, not a finer approach.
- *
- * The ladder keeps 25 and up so the AlphaFold 3 settings remain selectable and
- * comparable; what moves is which one a fold takes when nobody chooses.
- */
-/**
- * 🔴 OpenDDE TAKES THE DIFFUSION SAMPLER, AND THE FLOW ARM IS A LOSS AT THE
- * SAME PRICE. On 6MRR at sixteen steps, two seeds each: diffusion TM 0.9044
- * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s.
- * 🔴 THE SENTENCE THAT USED TO FOLLOW - "AlphaFold 3 prefers flow because its
- * diffusion default is 200 steps and flow-16 reaches it in a twelfth of the
- * calls" - was stale twice over. The page's diffusion preset is **25**, not
- * 200 (see AF3_COUNTS), so the ratio was 16 against 25 rather than a twelfth;
- * and AlphaFold 3 does not prefer flow any more, because flow returned a fold
- * that is NOT A CHAIN on 1QYS across four seeds while diffusion gave 1.072 A.
- * Diffusion is the page default now. OpenDDE's sampler is already best at
- * sixteen,
- * so there is nothing for a flow arm to escape and escaping it loses the
- * structure. The mode row is hidden for this family AND the value forced, so a
- * stale select cannot reintroduce it.
- */
-export const OPENDDE_SAMPLER_MODE = "diffusion";
-
-/**
- * Families whose CHECKPOINT has no working flow walk, so the page must not
- * offer one.
- *
- * 🔴 THIS IS NOT A PREFERENCE LIKE OpenDDE'S, IT IS A BROKEN STRUCTURE. OpenDDE
- * hides the row because flow is measurably WORSE for it; rosettafold3 hides it
- * because flow gives N-CA **6.94 A** against 1.46 and consecutive CA collapsing
- * to 0.23 A - a fold the geometry gate refuses - while pLDDT reads 81.47
- * against the good fold's 81.53. The page defaulted to Flow, so this was what a
- * visitor picking rosettafold3 would have got, with a confidence number saying
- * nothing was wrong.
- *
- * `foldBatch` throws for these rather than switching silently; the page's job
- * is to not ask. See `noFlowSampler` in shared/af3/dialect.js.
- */
-export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3", "chai1"];
-export const samplerModeFor = (family, asked) =>
-  (family === "opendde" || NO_FLOW_SAMPLER_FAMILIES.includes(family)
-    ? OPENDDE_SAMPLER_MODE : asked);
-
-export const OPENDDE_COUNTS = {
-  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
-  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
-  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
-  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
-  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
-  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
-  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
-  //
-  // The two failing seeds fail under every template configuration - merged,
-  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
-  // Flow takes one and walks down deterministically, so it never escapes a bad
-  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
-  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
-  // a good fold's 93.
-  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
-  diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },
-};
-
-/**
- * AlphaFold 3's own dial: twenty diffusion steps on a schedule that starts
- * lower, where every other family keeps twenty-five on the model's.
- *
- * 🔴 THE TOP OF THE SCHEDULE IS MOSTLY WASTED CALLS, SO THE FIX IS WHERE THE
- * STEPS GO, NOT HOW MANY. AF3's schedule starts at sigma 160 x sigmaData, where
- * the denoiser's skip weight is ~4e-5 and its output all but ignores its input -
- * and a rho of 7 still spends several of twenty-five calls up there. Starting at
- * 80 puts those calls lower. Measured on the M2, AF3 int5, stock flags:
- * tools/gpu/bench-sampler-geometry.js over seven systems (protein, +GOL, +ATP,
- * +SEP, RNA, DNA, protein+DNA) and eight seeds, bond rms, and
- * fold-opendde.js against the crystal, four seeds, mean CA-RMSD:
- *
- *   arm                  calls  bond median  mean    >0.15 A   6MRR   1QYS
- *   diffusion 25           25     0.0576    0.0841    6/56    0.640  0.906
- *   sigmaMax 80, 20        20     0.0561    0.0777    5/56    0.593  0.896
- *   sigmaMax 80, 16        16     0.0588    0.0653    3/56    0.690  0.843
- *   sigmaMax 40, 16        16     0.0592    0.0610    1/56    0.721  0.938
- *   diffusion 16           16     0.0625    0.0760    4/56      -      -
- *
- * Twenty at 80 is no worse than twenty-five on anything measured and 20% fewer
- * denoiser calls. Truncating alone (16 at 160) is what the older note under
- * AF3_COUNTS warns against; moving the start is what makes fewer calls land.
- * A lower start trades the fold for bonds - 40 is the best bond geometry here
- * and 0.08 A worse on 6MRR - because the high-noise calls place the chain.
- *
- * 🔴 PER CHECKPOINT, BECAUSE IT DOES NOT TRANSFER. The same study against each
- * family's own twenty-five (eight seeds of bonds, four of CA-RMSD):
- *
- *   intellifold2  1QYS 1.223 -> 1.027, 6MRR level; bad folds 14 -> 9, glycerol
- *                 0.120 -> 0.052, SEP 0.202 -> 0.094.                 TAKEN
- *   protenix2     6MRR 1.236 -> 0.846, 1QYS 0.936 -> 0.892; glycerol 0.097 ->
- *                 0.118.                     held for a ligand sweep
- *   openbind0     6MRR 1.706 -> 1.546, 1QYS 0.957 -> 0.876; glycerol 0.117 ->
- *                 0.174.                     held for a ligand sweep
- *   boltz2        level on folds, glycerol 0.032 -> 0.051. NOT TAKEN: its own
- *                 schedule (rho 8) already puts its calls low.
- *   rosettafold3  level on folds, glycerol 0.095 -> 0.409, and 1QYS seed 3 is NOT
- *                 A CHAIN (a CA-CA of 8.29 A at pLDDT 80.15).         NOT TAKEN
- *   opendde       its own sixteen already; twelve from 80 is level on RMSD and
- *                 the bond bench cannot run it.                        NOT TAKEN
- */
-/**
- * 🔴 AND WHERE THE TWENTY CALLS START DEPENDS ON WHAT IS BEING FOLDED. The
- * high-noise calls PLACE a chain and the low-noise ones SETTLE a small
- * molecule, so a job with a ligand or a modified residue wants the start lower.
- * Mean ligand bond rms over ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM
- * NAD FAD) x four seeds, bench-sampler-geometry.js --ligands=:
- *
- *   family         own 25   sigma 80/20   sigma 40/20
- *   af3            0.064      0.061         0.051
- *   protenix2      0.084      0.086         0.075
- *   openbind0      0.100      0.117         0.080
- *   intellifold2   0.153      0.139         0.167
- *
- * and on plain proteins sigma 80 places the chain best (6MRR, protenix2 1.236
- * -> 0.846, openbind0 1.706 -> 1.546) where sigma 40 costs it (af3 0.640 ->
- * 0.707). So each family names two starts. A family not listed keeps its own
- * schedule and its own twenty-five - see the table above for why boltz2,
- * rosettafold3 and opendde are not here.
- */
-export const SHORT_SCHEDULES = Object.freeze({
-  af3: Object.freeze({ protein: 80, ligand: 40 }),
-  intellifold2: Object.freeze({ protein: 80, ligand: 80 }),
-  protenix2: Object.freeze({ protein: 80, ligand: 40 }),
-  openbind0: Object.freeze({ protein: 80, ligand: 40 }),
-});
-export const SHORT_SCHEDULE_FAMILIES = Object.freeze(Object.keys(SHORT_SCHEDULES));
-export const ALPHAFOLD3_COUNTS = Object.freeze({
-  ...AF3_COUNTS,
-  diffusion: { label: "Diffusion", values: [20, 25, 50, 100, 200], preferred: 20 },
-});
-/** Below this many steps a listed family takes its short schedule. */
-export const ALPHAFOLD3_SHORT_SCHEDULE = Object.freeze({ below: 25, sigmaMax: 80 });
-
-/** The step dial for a family - one reading, for the dial and the fold alike. */
-export function countsForFamily(family) {
-  return family === "opendde" ? OPENDDE_COUNTS
-    : SHORT_SCHEDULE_FAMILIES.includes(family) ? ALPHAFOLD3_COUNTS : AF3_COUNTS;
-}
-
-/**
- * The sampler schedule a page fold passes, or undefined for the model's own.
- * See ALPHAFOLD3_COUNTS.
- */
-export function diffusionScheduleFor(family, mode, steps, { hasLigand = false } = {}) {
-  const starts = SHORT_SCHEDULES[family];
-  if (starts === undefined || mode !== "diffusion") return undefined;
-  if (!(steps < ALPHAFOLD3_SHORT_SCHEDULE.below)) return undefined;
-  return { sigmaMax: hasLigand ? starts.ligand : starts.protein };
-}
 
 /**
  * 🔴 ONLY THE 20 AMINO ACIDS AND X. featurise.js maps anything else to UNK,
@@ -487,8 +269,7 @@ export const toPoints = (positions, count) => Array.from(
  * FITTED. AF3's sampler calls randomAugmentation at the top of every step - a
  * fresh rotation and translation of the whole system - so consecutive frames
  * differ by a rigid motion far larger than anything the denoiser did, and
- * unfitted playback is a protein tumbling. Flow mode rotates nothing, so there
- * the fit is a no-op that costs one superposition a frame.
+ * unfitted playback is a protein tumbling.
  *
  * 🔴 FITTED TO THE FIRST FRAME, NOT THE LAST, because the frames are shown as
  * they are computed and there is no last one yet.
@@ -564,7 +345,7 @@ const TRUNK_SPANS = af3TrunkStageSpans();
 /**
  * Fold one chain with AlphaFold 3.
  *
- * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
+ * @param {{sequence: string, calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
  *          maxMsaSequences?: number,
@@ -579,7 +360,7 @@ const TRUNK_SPANS = af3TrunkStageSpans();
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
 export async function foldAf3(options) {
-  const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
+  const { sequence, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
   // 🔴 THE SLOTS ARE BUILT HERE, AFTER FEATURISATION, AND NOT BY THE CALLER.
   // They are indexed by TOKEN, and a caller has no way to know the token
   // layout: a modified residue is one token PER ATOM and a ligand is a chain of
@@ -717,8 +498,7 @@ export async function foldAf3(options) {
    *
    * 🔴 THREE WORDS FOR THE WHOLE FOLD: Preparing, Trunk, Folding. What went was
    * the SAMPLER's name - the line used to read "Refining" or "Diffusing"
-   * depending on the mode, which is a distinction the mode dial already makes
-   * and a reader watching a bar has no reason to care about.
+   * depending on the sampler, which a reader watching a bar has no reason to care about.
    *
    * 🔴 TWO FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
    * block 23 of 48", which is a number that changes forty-eight times a pass
@@ -828,9 +608,8 @@ export async function foldAf3(options) {
   options.onBatch?.(batch);
 
   const result = await foldBatch(device, batch, options.weights, {
-    mode, steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
-    // ...forwarded for probes that move the noise schedule. Unset for a page
-    // fold, which is AF3's own for the sampler and 160 A for the flow.
+    steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
+    // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
     onStage: async (name, detail) => {
       throwIfAborted(signal);

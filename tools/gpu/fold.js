@@ -92,7 +92,7 @@ export async function main(device, args) {
   // (with Euler's step: --update=exponential folds 6MRR at 8 steps, cpu/af3/diffusion/diffusion-sampler.js)
   if (samplerMode === "diffusion" && steps < 50 && option(args, "update", "euler") !== "exponential") {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
-      + " it wants about 200. Add --update=exponential or --mode=flow to get a structure in this many,"
+      + " it wants about 200. Add --update=exponential to get a structure in this many,"
       + " or raise --steps. What follows is expected to look like noise.");
   }
 

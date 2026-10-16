@@ -176,7 +176,7 @@ export function rmsdAndTm(a, b) {
 export async function main(device, args) {
   const sigmas = option(args, "sigmas", "2560,160").split(",").map(Number);
   const steps = Number(option(args, "steps", "8"));
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const msa = args.includes("--msa");
   const maxMsa = Number(option(args, "max-msa", "512"));
   // One search per TARGET, memoised, because the sweep folds each target

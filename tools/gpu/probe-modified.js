@@ -53,7 +53,7 @@ export async function main(device, args) {
   const code = option(args, "code", "SEP").toUpperCase();
   const at = Number(option(args, "at", "3"));
   const sequence = option(args, "sequence", "ACSEFGHIKLWY");
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const steps = Number(option(args, "steps", "8"));
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));

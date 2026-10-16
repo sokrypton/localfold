@@ -341,39 +341,3 @@ it("featuriserDialect carries every featuriser convention", () => {
   }
   assert.deepEqual(featuriserDialect(undefined), {});
 });
-
-// 🔴 THE SAMPLER A CHECKPOINT ACTUALLY HAS, which the page was not asking
-// about. rosettafold3 has no working flow walk - `--mode=flow` gives N-CA
-// 6.94 A against 1.46 and consecutive CA collapsing to 0.23 A, a fold the
-// geometry gate refuses - while pLDDT reads 81.47 against the good fold's
-// 81.53. The page's sampler select defaults to Flow, so that is what a visitor
-// picking this model would have got, with a confidence number saying nothing
-// was wrong. Every other family folds in flow (af3 CA-CA 3.58, if2 3.88).
-// chai1 too, for a different reason: its sampler is its own second-order walk (chaiSampler), so a flow walk
-// is not a mode it has at all.
-it("only rosettafold3 and chai1 declare that they have no flow sampler", () => {
-  for (const [model, dialect] of Object.entries(DIALECTS)) {
-    assert.equal(dialect.noFlowSampler, model === "rosettafold3" || model === "chai1",
-      `${model}'s noFlowSampler`);
-  }
-});
-
-// ...and the PAGE must agree with the table, or the guard in `foldBatch` throws
-// at a visitor instead of the page never asking.
-it("the page forces diffusion for exactly those families", async () => {
-  const { NO_FLOW_SAMPLER_FAMILIES, samplerModeFor } =
-    await import("../web/af3-model.js");
-  const declared = Object.entries(DIALECTS)
-    .filter(([, dialect]) => dialect.noFlowSampler === true).map(([model]) => model);
-  for (const model of declared) {
-    assert.ok(NO_FLOW_SAMPLER_FAMILIES.includes(model),
-      `${model} has no flow sampler and the page still offers one`);
-    assert.equal(samplerModeFor(model, "flow"), "diffusion");
-  }
-  // ...and it does not force it on a model that is fine, which would silently
-  // make every other fold slower and different.
-  assert.equal(samplerModeFor("alphafold3", "flow"), "flow");
-  assert.equal(samplerModeFor("intellifold2", "flow"), "flow");
-  // OpenDDE is forced for its own, measured, different reason.
-  assert.equal(samplerModeFor("opendde", "flow"), "diffusion");
-});
