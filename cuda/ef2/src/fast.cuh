@@ -78,12 +78,27 @@ inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t ro
 }
 
 // (the same at a width known at compile time: layerNormVK, elementwise.cuh)
+// any width, a warp a row (MSA Pairformer's 464-wide MSA track, which no vector width divides)
+__global__ void layerNormAnyHK(const float* x, half* y, size_t rows, int C, const float* sc, const float* of) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / C + 1e-5f);
+  for (int c = lane; c < C; c += 32) y[row * C + c] = __float2half((xr[c] - mean) * inv * sc[c] + of[c]);
+}
 // LayerNorm f32 -> f16, by pointers (scale/offset f32)
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const float* sc, const float* of) {
   unsigned grid = (unsigned)((rows + 7) / 8);
   if (C == 128) layerNormVK<128><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
-  else { fprintf(stderr, "layerNormH: no %d-wide kernel\n", C); exit(1); }
+  else layerNormAnyHK<<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 // a folding-bundle tensor's f16 copy (the file's half mirror)
 inline const half* Fh(const std::string& name) { return Wh("f/" + name); }
