@@ -6733,7 +6733,8 @@ the N midpoints), its churn, and its step - by default one denoiser call a step,
 a scale of 2 (cuda/af3/src/sampler.cuh, `sampleChai`). It now takes the lineage's flags, and its default step is the
 exponential one, `x' = r^S noisy + (1 - r^S) D` with `r = sigma / tHat` and S its own 2, on ITS schedule.
 `--update=euler` is the sampler before (byte-identical), `--schedule=geometric` the lineage's schedule at its endpoints,
-`--step-scale=` another S, `--chai-second-order` chai-lab's two-call step as written.
+`--step-scale=` another S, `--chai-second-order` two calls a step (the exponential Heun step, or with
+`--update=euler` chai-lab's two-call step as written).
 
 **Measured** with the lineage's decision run (cuda/af3: bench-sampler-geometry's seven systems x two seeds of bonds; 6MRR,
 1QYS, 5CAJ, 1TIM A, 1TIM A:B and 1BRS A:D x three seeds of CA RMSD), all at the page's 25 steps but the 200 rows. Medians;
@@ -6755,7 +6756,24 @@ ligand = GOL, ATP and SEP, its mean and how many of six folds went past 0.15 A; 
   exponential step gets on chai-1's own schedule. The lineage's decision run did not score clashes, so whether its own
   geometric default pays the same is not known - its clash column is the thing to add.
 
-Raw rows: `/tmp/claude-1000/chai/run.txt` and `chai.sh` on the A100 box (not kept).
+**And two calls a step buys nothing - on either update.** `--chai-second-order` now takes the exponential update too, as
+the exponential Heun step: `x' = r noisy + (1 - r) D1` (a point at the step's own level, where the second call evaluates
+it), `D2 = D(x', sigma)`, then `x = r^S noisy + (1 - r^S) (D1 + D2) / 2` - the one-call default exactly when D2 = D1, as
+chai-lab's two-call step reduces to its one-call form. `--update=euler --chai-second-order` is chai-lab's as written.
+At matched denoiser calls (the same protocol):
+
+| arm | calls | mainchain | peptide | side chain | nucleic | ligand (mean) | crystals | clashes (mean) |
+|---|---|---|---|---|---|---|---|---|
+| exponential, one call (the default), 25 steps | 25 | 0.034 | 0.019 | 0.052 | 0.048 | 0.055 (0.058) | 1.285 | 1.00 |
+| exponential, one call, 50 steps | 50 | 0.033 | 0.015 | 0.052 | 0.049 | 0.050 (0.044) | 1.290 | 1.62 |
+| exponential Heun, 25 steps | 50 | 0.034 | 0.018 | 0.052 | 0.048 | 0.053 (0.066) | 1.288 | 1.12 |
+| chai-lab's two-call step, 25 steps | 50 | 0.055 | 0.042 | 0.065 | 0.059 | 0.049 (0.052) | 1.292 | 0.87 |
+
+The exponential Heun step at twice the cost is the one-call step's fold; spent on 50 one-call steps the same calls do a
+little better on ligands and peptides. The second call is close to the first (D2 ~ D1), which is why the one-call
+form was chai-1's default already. Not taken; the flag keeps it.
+
+Raw rows: `/tmp/claude-1000/chai/run.txt`, `run2.txt`, `chai.sh` and `chai2.sh` on the A100 box (not kept).
 
 ## A multistep update: measured, kept as an option, not taken (2026-10-16)
 

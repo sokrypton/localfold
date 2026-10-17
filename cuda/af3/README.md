@@ -237,7 +237,7 @@ confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (
 cases); the page does not offer it, having no WebGPU forward for it yet.
 
 Where this port leaves af3-any-model for chai-lab, measured each time:
-- **One denoiser call a step** (sampler.cuh; `--chai-second-order` is chai-lab's two). Same seed and steps,
+- **One denoiser call a step** (sampler.cuh; `--chai-second-order` takes two - the exponential Heun step, or with `--update=euler` chai-lab's own - and buys nothing at matched calls: docs/AF3.md, "chai-1's sampler"). Same seed and steps,
   the two land 0.02-0.07 A apart at 200 steps with the same bonds on protein, glycerol, ATP, a
   phosphoserine and DNA, for half the diffusion (5CAJ, 5 x 200: 2.82 -> 1.93 s a fold).
 - **Atom attention within one reference space, not one token** - chai-lab ANDs its block mask with the

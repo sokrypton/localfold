@@ -125,6 +125,18 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] += dt * ((x[i] - d2[i]) / level + g1[i]) * 0.5f;
 }
+// the exponential Heun step (chai-1's --chai-second-order on its default update): x' = noisy + (r - 1) (noisy - D1) - a point
+// at the step's own level, where the second call evaluates it (S 1, as chai-lab's first stage is plain Euler) - D1 kept, and
+// after the second call x = noisy + c (noisy - (D1 + D2) / 2), c = r^S - 1: with D2 = D1 the one-call exponential step
+__global__ void expHeun1K(float* x, float* keep, const float* noisy, const float* d1, float c, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n3) return;
+  keep[i] = d1[i]; x[i] = noisy[i] + c * (noisy[i] - d1[i]);
+}
+__global__ void expHeun2K(float* x, const float* noisy, const float* d1, const float* d2, float c, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n3) x[i] = noisy[i] + c * (noisy[i] - 0.5f * (d1[i] + d2[i]));
+}
 // chai-1's sampler (af3-any-model diffusion_head.py, chai1.py's): its schedule (sigma_max 80, rho 7, sigma_min 4e-4)
 // at the N MIDPOINTS t = (2k + 1) / 2N; per transition the augmentation, churn min(80 / N, sqrt 2 - 1) only
 // where 4e-4 <= sigma_prev <= 80 (the scaled sigma against chai's raw thresholds - the weights were sampled so),
@@ -148,7 +160,8 @@ inline bool CHAI_SECOND_ORDER = false;
 //   --update=euler         its own step (the sampler before), --step-scale= another S
 //   --schedule=geometric   its endpoints (80, 4e-4) at the same midpoints, evenly spaced in log sigma
 //   --no-churn             its churn off
-// (the one-call form only: --chai-second-order is chai-lab's sampler as written, and refuses them)
+//   --chai-second-order    two calls a step: on the exponential update the exponential Heun step (expHeun1K/2K), with
+//                          --update=euler chai-lab's sampler as written
 inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                      const std::function<const float*(const float*, float, const float*)>& denoiseFn,
                                      const std::function<void(const std::vector<float>&)>& onLevels,
@@ -211,6 +224,14 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     if (!CHAI_SECOND_ORDER) {                    // one call: the correction's D taken as this step's (see above)
       if (exponential) eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d1, (float)(std::pow(level / tHat, S) - 1), all3);
       else chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(S * dt), all3);
+      continue;
+    }
+    if (exponential) {                         // the exponential Heun step (dG keeps D1 across the second call)
+      const float c = (float)(std::pow(level / tHat, S) - 1);
+      expHeun1K<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)(level / tHat - 1), all3);
+      CK(cudaMemcpyAsync(dIn, dX, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+      const float* d2 = denoiseFn(dIn, (float)level, dLevels + 2 * (s - 1) + 1);
+      expHeun2K<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, dG, d2, c, all3);
       continue;
     }
     chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)dt, all3);
@@ -294,8 +315,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   std::vector<double> levels(steps + 1);
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
   if (M.flag("trunk.dialect.chaiSampler")) {
-    if (opt.multistep || opt.splitAt > 0 || (opt.given && CHAI_SECOND_ORDER)) {
-      fprintf(stderr, "chai-1's sampler takes --schedule, --update, --no-churn and --step-scale on its one-call step only\n"); exit(1);
+    if (opt.multistep || opt.splitAt > 0) {
+      fprintf(stderr, "chai-1's sampler takes --schedule, --update, --no-churn and --step-scale, not --update=multistep or --schedule-split\n"); exit(1);
     }
     // (its own schedule unless --schedule said otherwise - DiffusionOptions' default schedule is the AF3 lineage's)
     return sampleChai(steps, seeds, mask, denoiseFn, onLevels, opt.scheduleGiven && opt.geometric, opt.exponential, opt.churn,
