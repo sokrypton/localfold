@@ -173,7 +173,9 @@ struct SamplerOptions {
 };
 // a SamplerOptions flag (--schedule=karras|geometric, --update=euler|exponential, --no-churn, --step-scale=S) read into
 // `o`; false for any other flag, and an unknown value refused by name
-bool samplerFlag(const char* f, SamplerOptions& o);
+// (bad: where an unknown value is said and recorded rather than ending the process - a resident server's job fails, not
+// the server)
+bool samplerFlag(const char* f, SamplerOptions& o, bool* bad = nullptr);
 extern SamplerOptions SAMPLER;
 void prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat, const Masks& masks, int n);
 // every sample's final positions [ns][atoms][3]; onStep(the denoised positions on the device, step, steps)

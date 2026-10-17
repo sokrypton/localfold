@@ -382,14 +382,14 @@ int foldMain(int argc, char** argv) {
     // the job's flags: --out, --samples, --steps, --update, --schedule, --no-churn, --sigma-max, --frames, --recycles, --seed, --seeds
     const Options o0 = o; const SamplerOptions s0 = SAMPLER;
     serveJobs("af3", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
-      Options j = o0; SAMPLER = s0; j.out = "fold.pdb"; j.frames.clear();
+      Options j = o0; SAMPLER = s0; bool badFlag = false; j.out = "fold.pdb"; j.frames.clear();
       for (auto& f : flags) {
         const char* a = f.c_str();
         if (!strncmp(a, "--out=", 6)) j.out = a + 6;
         else if (!strncmp(a, "--samples=", 10)) j.samples = atoi(a + 10);
         else if (!strncmp(a, "--steps=", 8)) j.steps = atoi(a + 8);
         else if (!strcmp(a, "--flow")) { fprintf(stderr, "--flow: Flow was removed (docs/AF3.md, \"Flow removed\")\n"); return 1; }
-        else if (samplerFlag(a, SAMPLER)) {}
+        else if (samplerFlag(a, SAMPLER, &badFlag)) {}
         else if (!strncmp(a, "--sigma-max=", 12)) SAMPLER.sigmaMax = atof(a + 12);
         else if (!strncmp(a, "--frames=", 9)) j.frames = a + 9;
         else if (!strncmp(a, "--recycles=", 11)) j.recycles = atoi(a + 11);
@@ -397,6 +397,7 @@ int foldMain(int argc, char** argv) {
         else if (!strncmp(a, "--seed=", 7)) { j.seed = strtoull(a + 7, nullptr, 10); j.seedGiven = true; }
         else if (!strncmp(a, "--seeds=", 8)) j.seedsArg = a + 8;
       }
+      if (badFlag) return 1;               // (the job fails; the server stays up)
       return foldInput(input, j);
     });
     return 0;

@@ -704,7 +704,9 @@ export class EsmcBlockGpu {
    */
   async run(input, shape, weights, options = {}) {
     const { rows, model, heads, ffn } = shape;
-    const residualScale = shape.residualScale ?? 1;
+    // (derived where the depth is given, as webgpu/esmc/tower.js: sqrt(layers / 36) - 0.9129 at 300M's 30)
+    const residualScale = Number.isInteger(shape.layers) && shape.layers > 0
+      ? Math.sqrt(shape.layers / 36) : (shape.residualScale ?? 1);
     const epsilon = (options.epsilon ?? 1e-5).toExponential();
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
     // 🔴 f16 WEIGHTS BY DEFAULT: 1.26x FASTER AND EXACTLY FREE, because the

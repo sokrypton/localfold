@@ -469,12 +469,13 @@ static double noiseSchedule(double t, double sigmaData, double sigmaMin, double 
   return sigmaData * std::pow(hi + t * (lo - hi), rho);
 }
 SamplerOptions SAMPLER;
-bool samplerFlag(const char* f, SamplerOptions& o) {
+bool samplerFlag(const char* f, SamplerOptions& o, bool* bad) {
+  auto refuse = [&]() { if (!bad) exit(1); *bad = true; };
   auto value = [&](const char* name, const char* a, const char* b, bool& set) {
     const size_t n = strlen(name);
     if (strncmp(f, name, n)) return false;
     if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
-    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); refuse(); }
     return true;
   };
   if (value("--schedule=", "karras", "geometric", o.geometric)) { o.scheduleGiven = o.given = true; return true; }
@@ -482,7 +483,7 @@ bool samplerFlag(const char* f, SamplerOptions& o) {
   if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
   if (!strncmp(f, "--step-scale=", 13)) {
     o.stepScale = atof(f + 13);
-    if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); exit(1); }
+    if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); refuse(); }
     o.given = true; return true;
   }
   return false;

@@ -74,7 +74,7 @@ struct SamplerSettings { int steps = 15; double sMax = 160, sMin = 4e-4, p = 8, 
                          bool geometric = false, exponential = false, churn = true; };
 // a discretisation flag read into s (--schedule=karras|geometric, --update=euler|exponential, --no-churn); false for
 // any other flag, and an unknown value refused by name
-bool samplerFlag(const char* f, SamplerSettings& s);
+bool samplerFlag(const char* f, SamplerSettings& s, bool* bad = nullptr);   // (bad: said and recorded, not exit - a serve job)
 struct Denoiser {
   int T, A, Cz, Ct, heads, tokenBlocks, Si, atomBlocks;
   float sigma;

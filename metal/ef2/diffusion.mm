@@ -224,12 +224,12 @@ void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised) 
 }
 
 // ---------------------------------------------------------------- the sampler
-bool samplerFlag(const char* f, SamplerSettings& s) {
+bool samplerFlag(const char* f, SamplerSettings& s, bool* bad) {
   auto value = [&](const char* name, const char* a, const char* b, bool& set) {
     const size_t n = strlen(name);
     if (strncmp(f, name, n)) return false;
     if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
-    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); if (!bad) exit(1); *bad = true; }
     return true;
   };
   if (value("--schedule=", "karras", "geometric", s.geometric) || value("--update=", "euler", "exponential", s.exponential)) return true;

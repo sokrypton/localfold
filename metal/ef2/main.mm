@@ -247,13 +247,15 @@ int foldMain(int argc, char** argv) {
     KEEP_TOWER = true;
     serveJobs("ef2", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
       Opts j = o; j.dir = input; j.out = "fold.pdb"; j.frames.clear();
+      bool badFlag = false;
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
         else if (!f.compare(0, 7, "--seed=")) j.seed = strtoull(f.c_str() + 7, nullptr, 10);
         else if (!f.compare(0, 8, "--steps=")) { j.sampler.steps = atoi(f.c_str() + 8); j.stepsGiven = true; }
-        else if (samplerFlag(f.c_str(), j.sampler)) {}
+        else if (samplerFlag(f.c_str(), j.sampler, &badFlag)) {}
         else if (!f.compare(0, 9, "--frames=")) j.frames = f.substr(9);
       }
+      if (badFlag) return 1;               // (the job fails; the server stays up)
       M.loadInput(input);
       int code = foldInput(j);
       M.unloadInput();
