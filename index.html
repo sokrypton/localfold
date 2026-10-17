@@ -359,18 +359,20 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    The two 6B ones are biohub's released models and fold on a
                    native backend only (`localfold serve`), shown when it says
                    it has them (web/native-bridge.js). The MSA row stays beside
-                   it: greyed for the 600M and 300M checkpoints, which read no
-                   alignment; the released Fast reads its profile and Full
-                   encodes it. The select keeps its id and values (plm-mode,
+                   it for the 6B two, which can read an alignment beside ESM-C (the
+                   released Fast as profile features, Full through its encoder):
+                   it starts at "ESM-C only" and a search or an upload is the
+                   reader's opt-in. The 600M and 300M checkpoints read ESM-C
+                   alone and have no MSA row. Every ESMFold2 folds from its
+                   language model, so "no language model" is not offered. The select keeps its id and values (plm-mode,
                    esmc-*), which saved sessions and links carry. -->
               <div class="fetch-option-group" id="plmGroup" hidden>
                 <span class="fetch-option-title">Variant</span>
-                <select id="plm-mode" title="Which ESMFold2: Fast or Full, and the protein language model it folds from. 300M is 94 MiB smaller than 600M for a median 0.03 A. The ESM-C 6B variants are biohub's released models (Fast reads an alignment's profile, Full encodes the alignment) and fold on a local native server. Without a language model the fold has no evolutionary information at all.">
+                <select id="plm-mode" title="Which ESMFold2: Fast or Full, and the protein language model it folds from. 300M is 94 MiB smaller than 600M for a median 0.03 A. The ESM-C 6B variants are biohub's released models (Fast reads an alignment's profile, Full encodes the alignment) and fold on a local native server. Every variant folds from its language model; the 6B two can also read an alignment, off by default.">
                   <option value="esmc-600m" data-language-model="ESM-C 600M" selected>Fast · ESM-C 600M</option>
                   <option value="esmc-300m" data-language-model="ESM-C 300M">Fast · ESM-C 300M</option>
                   <option value="esmc-6b" data-language-model="ESM-C 6B" data-native-model="ef2-fast" hidden>Fast · ESM-C 6B (local)</option>
                   <option value="esmc-6b-full" data-language-model="ESM-C 6B" data-native-model="ef2" hidden>Full · ESM-C 6B (local)</option>
-                  <option value="none" data-language-model="none">Fast · 600M, no language model</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="msaModeGroup">

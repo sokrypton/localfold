@@ -304,24 +304,33 @@ def page_arm(bad):
             # (ESMFold2 is one entry on the model row and the variant row picks the checkpoint, as a reader does it)
             row, plm = {"ef2-fast": ("ef2-fast-600m", "esmc-6b"), "ef2": ("ef2-fast-600m", "esmc-6b-full")}.get(
                 family, (family, "esmc-600m"))
+            # (a search chosen FIRST, as a reader's row might read for another model, then the model: ESMFold2 starts at
+            # "ESM-C only" whatever the row read - which the rows check below sees)
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);
-              g('model-family').value = '{row}';
-              g('model-family').dispatchEvent(new Event('change', {{ bubbles: true }}));
-              if (g('plm-mode')) {{ g('plm-mode').value = '{plm}'; g('plm-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
+              const set = (id, v) => {{ g(id).value = v; g(id).dispatchEvent(new Event('change', {{ bubbles: true }})); }};
+              set('model-family', 'af3');
+              if (g('msa-mode')) set('msa-mode', 'search');
               window.__entityList.set([{{ type: 'protein', value: '{S6}', copies: 1, modifications: [] }}]);
-              if (g('msa-mode')) {{ g('msa-mode').value = 'none'; g('msa-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
+              set('model-family', '{row}');
+              if (g('plm-mode')) set('plm-mode', '{plm}');
               return true;
             }})()""")
             if family in ("ef2-fast-600m", "ef2-fast", "ef2"):
-                # the rows a reader sees for ESMFold2: the variant row, its step dial, and the MSA row beside them -
-                # greyed for the experimental checkpoint, which reads no alignment, live for the released two
+                # the rows a reader sees for ESMFold2, which folds from its language model with an alignment as an
+                # opt-in: the variant row and its step dial; no MSA row for the experimental checkpoint (ESM-C alone);
+                # for the 6B two an MSA row starting at "ESM-C only" - though the reader's row read a search before
                 rows = cdp.evaluate(ws, """(() => { const g = (id) => document.getElementById(id);
+                  const m = g('msa-mode');
                   return { variant: g('plmGroup')?.hidden, msa: g('msaModeGroup')?.hidden, steps: g('af3CountGroup')?.hidden,
-                           greyed: g('msa-mode')?.disabled }; })()""")
-                want = {"variant": False, "msa": False, "steps": False, "greyed": family == "ef2-fast-600m"}
+                           mode: m?.value, label: m?.selectedOptions?.[0]?.textContent?.trim() }; })()""")
+                released = family != "ef2-fast-600m"
+                want = {"variant": False, "msa": not released, "steps": False, "mode": "none", "label": "ESM-C only"}
                 if rows != want:
                     bad.append(f"page: {family}'s rows read {rows} - want {want}")
+            # (the gate stays offline: every arm folds without a search - ESMFold2's by its own default, the others set)
+            cdp.evaluate(ws, """(() => { const m = document.getElementById('msa-mode'); if (!m) return true;
+              m.value = 'none'; m.dispatchEvent(new Event('change', { bubbles: true })); return true; })()""")
             cdp.wait_for(ws, "!document.getElementById('predict').disabled", 60, "the fold button")
             started = time.time()
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")

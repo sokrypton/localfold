@@ -365,7 +365,7 @@ function applyModelFromUrl() {
   // silently-ignored parameter this function exists to prevent, wearing a
   // complaint that names a family the page really does have.
   const viaPlm = Object.entries(PLM_FAMILIES)
-    .find(([, family]) => family === wanted && wanted !== PLM_FAMILIES.none);
+    .find(([, family]) => family === wanted);
   const plm = document.getElementById("plm-mode");
   if (viaPlm !== undefined && plm !== null) {
     const host = [...select.options].map((option) => option.value)
@@ -1173,11 +1173,13 @@ function modelProgress(fraction, detail = "") {
  * because none of them has a language model to run.
  */
 function usesLanguageModel(family = chosenFamily()) {
-  if (!isEsmfold2(family)) return false;
-  return plmChoice() !== "none";
+  // (every ESMFold2 variant folds from its language model: "no language model" is not offered - it was the
+  // sequence alone, which no ESMFold2 is)
+  return isEsmfold2(family);
 }
 
-const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m";
+// (|| : a saved session or link naming a variant the row no longer has - "none" - comes back as the default, not blank)
+const plmChoice = () => document.getElementById("plm-mode")?.value || "esmc-600m";
 
 /**
  * What to call the language model in a record of the fold.
@@ -1205,10 +1207,8 @@ function plmLabel() {
  * would let a page ask for a pairing that has never existed. The model row
  * therefore shows ONE "EF2-fast" and this row says which.
  *
- * 🔴 AND "None" KEEPS WHICHEVER FOLDING MODEL IS ALREADY THERE, because it is
- * the folding model that folds: with no tower every token takes
- * `shimSingleForZeroState`, which each bundle has its own version of. 600M's is
- * the default and the one the measurements above were made against.
+ * (A "None" variant - the 600M folding model with no tower, every token taking `shimSingleForZeroState` - was offered
+ * here and is not: no ESMFold2 folds from the sequence alone. A session that saved it reads as the 600M default.)
  */
 const PLM_FAMILIES = {
   "esmc-600m": "ef2-fast-600m",
@@ -1217,7 +1217,6 @@ const PLM_FAMILIES = {
   "esmc-6b": "ef2-fast",
   // ...and biohub's released ESMFold2 itself, the same tower with an MSA encoder and twice the trunk (native only)
   "esmc-6b-full": "ef2",
-  none: "ef2-fast-600m",
 };
 
 function startModelPreload(family, signal) {
@@ -2562,28 +2561,31 @@ function syncModelControls() {
   const sampled = af3 || isEsmfold2(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
-  // 🔴 AND A CHECKPOINT WITH NO ALIGNMENT GREYS THE MSA ROW RATHER THAN IGNORING IT.
-  // `disable_msa_features` is true in ESMFold2's experimental tier; a search
-  // left live would run, take a minute of somebody else's server, and be
-  // discarded - the "quietly ignored control" this function exists to prevent.
-  // The row stays where it is beside the variant row (the released 6B variants
-  // read an alignment), reading Single Sequence and greyed, and gives back the
-  // reader's own choice when a variant that reads one is chosen again.
+  // 🔴 ESMFold2 FOLDS FROM ITS LANGUAGE MODEL, AND AN ALIGNMENT IS AN OPT-IN.
+  // Its experimental tier reads ESM-C alone (`disable_msa_features` in its
+  // checkpoint), so it has no MSA row: a search left live would run, take a
+  // minute of somebody else's server and be discarded. The released 6B two CAN
+  // read one beside ESM-C (Fast as profile features, Full through its encoder),
+  // so their row is shown, starts at "ESM-C only" - what "Single Sequence" means
+  // for a model whose evolutionary information is a language model - and offers
+  // the search and an upload as the reader's choice. The reader's own setting
+  // for the other models is kept and given back when one is chosen again.
   const noAlignment = readsNoAlignment(family);
+  const esmfold2 = isEsmfold2(family);
   const msaSelect = document.getElementById("msa-mode");
   const msaNode = document.getElementById("msaModeGroup");
-  if (msaNode !== null) msaNode.hidden = false;
-  if (msaSelect !== null && noAlignment !== msaSelect.disabled) {
-    if (noAlignment) {
-      msaSelect.dataset.kept = msaSelect.value;
+  if (msaNode !== null) msaNode.hidden = noAlignment;
+  const single = msaSelect?.querySelector('option[value="none"]');
+  if (msaSelect !== null && single !== null && single !== undefined) {
+    single.dataset.label ??= single.textContent;
+    single.textContent = esmfold2 ? "ESM-C only" : single.dataset.label;
+    if (esmfold2 && msaSelect.dataset.kept === undefined) {
+      msaSelect.dataset.kept = msaSelect.value;           // (into ESMFold2: its default, the reader's kept)
       msaSelect.value = "none";
-    } else if (msaSelect.dataset.kept !== undefined) {
-      msaSelect.value = msaSelect.dataset.kept;
+    } else if (!esmfold2 && msaSelect.dataset.kept !== undefined) {
+      msaSelect.value = msaSelect.dataset.kept;            // (out of it: given back)
       delete msaSelect.dataset.kept;
     }
-    msaSelect.disabled = noAlignment;
-    msaSelect.title = noAlignment ? "This ESMFold2 checkpoint reads no alignment - its language model is"
-      + " its evolutionary information. Fast and Full on ESM-C 6B read one." : "";
   }
   // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
   const maxNode = document.getElementById("maxMsaGroup");
