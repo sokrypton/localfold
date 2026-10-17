@@ -485,7 +485,9 @@ if (dialect.chiralCentres === true) {
   } else {
     for (const { slot, mask } of slots) passes.push({ repeat: 1, slot, mask });
     const empty = TEMPLATES - slots.length, gap = dialect.emptyTemplateAatype ?? null;
-    if (empty > 0 && gap !== null) {
+    // (openbind0: every empty slot GAP, not the first alone - templateGapWhereNoAtoms)
+    if (empty > 0 && dialect.templateGapWhereNoAtoms === true) passes.push({ repeat: empty, emptyAatype: 21 });
+    else if (empty > 0 && gap !== null) {
       passes.push({ repeat: 1, emptyAatype: gap });
       if (empty > 1) passes.push({ repeat: empty - 1, emptyAatype: 0 });
     } else if (empty > 0) passes.push({ repeat: empty, emptyAatype: 0 });
@@ -503,7 +505,7 @@ if (dialect.chiralCentres === true) {
       return false;
     };
     add(`template.${k}.aatype`, real ? Int32Array.from(pass.slot.aatype, (v, token) =>
-      (dialect.chaiTemplates === true && !residueCovered(token) ? 21 : v))
+      ((dialect.chaiTemplates === true || dialect.templateGapWhereNoAtoms === true) && !residueCovered(token) ? 21 : v))
       : (pass.aatype ?? new Int32Array(batch.tokens).fill(pass.emptyAatype ?? 0)));
     if (fused) {
       // the feature columns sparse - a row's nonzero (column, value) pairs, K the most any row has, the rest -1 - and

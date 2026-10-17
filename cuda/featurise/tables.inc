@@ -51,6 +51,9 @@ inline const std::vector<ConformerEntry>& rnaConformers() {
   return table;
 }
 
+// shared/af3/featurise/reference-conformers-unk.js: the CCD's UNK, [internal, C-terminal]
+inline const ConformerEntry& unkCcdConformer() { static const ConformerEntry e = {'X', 20, {{0, "N", 7, 0, 1.827, -0.498, -1.278}, {1, "CA", 6, 0, 2.145, -1.162, -2.517}, {2, "C", 6, 0, 1.576, -0.429, -3.719}, {3, "O", 8, 0, 0.85, 0.554, -3.635}, {4, "CB", 6, 0, 1.719, -2.634, -2.491}, {5, "CG", 6, 0, 0.211, -2.855, -2.469}}, {{0, "N", 7, 0, 1.827, -0.498, -1.278}, {1, "CA", 6, 0, 2.145, -1.162, -2.517}, {2, "C", 6, 0, 1.576, -0.429, -3.719}, {3, "O", 8, 0, 0.85, 0.554, -3.635}, {4, "CB", 6, 0, 1.719, -2.634, -2.491}, {5, "CG", 6, 0, 0.211, -2.855, -2.469}, {6, "OXT", 8, 0, 1.959, -0.964, -4.903}}}; return e; }
+
 // shared/af3/featurise/ccd-component.js ELEMENT_SYMBOLS (atomic number - 1)
 inline const std::vector<std::string>& elementSymbols() { static const std::vector<std::string> s = {"H", "HE", "LI", "BE", "B", "C", "N", "O", "F", "NE", "NA", "MG", "AL", "SI", "P", "S", "CL", "AR", "K", "CA", "SC", "TI", "V", "CR", "MN", "FE", "CO", "NI", "CU", "ZN", "GA", "GE", "AS", "SE", "BR", "KR", "RB", "SR", "Y", "ZR", "NB", "MO", "TC", "RU", "RH", "PD", "AG", "CD", "IN", "SN", "SB", "TE", "I", "XE", "CS", "BA", "LA", "CE", "PR", "ND", "PM", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "HF", "TA", "W", "RE", "OS", "IR", "PT", "AU", "HG", "TL", "PB", "BI", "PO", "AT", "RN"}; return s; }
 
@@ -60,14 +63,14 @@ inline int af3MsaCode(char c) { switch (c) { case 'A': return 0; case 'R': retur
 // shared/af3/dialect.js: each family's featuriser conventions (featuriserDialect) and the export's own
 inline const std::vector<FamilyFlags>& familyFlags() {
   static const std::vector<FamilyFlags> table = {
-    {"protenix2", true, true, true, false, 0, 1, false, false, false, false, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2},
-    {"boltz2", true, true, true, false, 1, 1, false, true, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1},
-    {"alphafold3", false, false, false, false, 0, 0, false, false, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0},
-    {"openbind0", true, true, false, false, 1, 0, false, false, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0},
-    {"opendde", true, true, true, false, 0, 0, false, false, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2},
-    {"intellifold2", false, false, false, true, 1, 1, false, false, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0},
-    {"rosettafold3", true, false, true, false, 1, 1, true, true, true, true, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3},
-    {"chai1", false, false, true, false, 2, 0, false, true, true, false, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0},
+    {"protenix2", true, true, true, false, 0, 1, false, 0, false, false, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0},
+    {"boltz2", true, true, true, false, 1, 1, false, 1, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0},
+    {"alphafold3", false, false, false, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0},
+    {"openbind0", true, true, false, false, 1, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384},
+    {"opendde", true, true, true, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0},
+    {"intellifold2", false, false, false, true, 1, 1, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0},
+    {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, true, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0},
+    {"chai1", false, false, true, false, 2, 0, false, 1, true, false, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0},
   };
   return table;
 }

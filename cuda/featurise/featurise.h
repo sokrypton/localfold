@@ -38,10 +38,12 @@ struct FeaturiseOptions {
   std::vector<std::string> chainKinds;
   bool symmetriseBonds = false, centreRefConformers = false, paddedAtomKeys = false, qblockAtomKeys = false;
   bool rawLastConformer = false;
-  int declaredPolymerBonds = 0;                   // 0 AlphaFold 3's own alone, 1 "all", 2 "discontinuous", 3 "ligand"
+  int declaredPolymerBonds = 0;
+  bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK                   // 0 AlphaFold 3's own alone, 1 "all", 2 "discontinuous", 3 "ligand"
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
-  bool atomizedElementNames = false, atomizedUnknownRestype = false, atomizedUnknownMsa = false;
+  bool atomizedElementNames = false, atomizedUnknownMsa = false;
+  int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too)
   bool atomizedBackboneBonds = false, modifiedAsOneToken = false;
   // the alignment's rows (msa-features.js)
   std::vector<std::vector<int>> msa;
@@ -92,7 +94,7 @@ inline void atomGathers(Batch& b, const std::vector<int>& realAtoms, const std::
   std::vector<int> tokenOfQuery(atomCount);
   for (int q = 0; q < atomCount; ++q) tokenOfQuery[q] = realAtoms[q] / dense;
   int edge = qblockKeys ? ((atomCount + QUERIES - 1) / QUERIES) * QUERIES : atomCount;
-  int lastStart = std::max(0, edge - keys);
+  int lastStart = std::max(0, edge - (qblockKeys ? KEYS : keys));   // (the full 128-key window: featurise.js)
   for (int s = 0; s < subsets; ++s) {
     // (keys - QUERIES) / 2 in JavaScript is a double: with keys < 32 it can be fractional, and min/max keep it
     double startD = paddedKeys ? (double)(s * QUERIES + (QUERIES >> 1) - (keys >> 1))
@@ -222,7 +224,12 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       int aatype = R.kind == "protein" ? aatypeFor(R.code) : parentAatype(R.kind, R.code);
       setToken(token, aatype, number, asym, entity, sym, residue);
       const std::vector<ConformerAtom>* atoms;
-      if (R.kind == "protein") atoms = &conformerFor(R.code, R.terminal);
+      if (R.kind == "protein") {
+        bool standard = R.code != 'X';
+        if (standard) { standard = false; for (auto& e : proteinConformers()) if (e.code == R.code) standard = true; }
+        atoms = o.ccdUnknownResidue && !standard ? (R.terminal ? &unkCcdConformer().terminal : &unkCcdConformer().internal)
+                                                 : &conformerFor(R.code, R.terminal);
+      }
       else {
         const ConformerEntry* e = nucleicEntry(R.kind, R.code);
         atoms = e ? (R.terminal ? &e->terminal : &e->internal) : &conformerFor('X', false);
@@ -252,7 +259,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     if (o.modifiedAsOneToken) {
       ModifiedSpan span{token, 1, M.code, residue, M.atoms, M.bonds, true};
       b.modifiedSpans.push_back(span);
-      setToken(token, o.atomizedUnknownRestype ? UNK_AATYPE : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
+      setToken(token, o.atomizedUnknownRestype != 0 ? UNK_AATYPE : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
       for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
         const CompAtom& s = M.atoms[atom];
         int slotHere = s.componentSlot >= 0 ? s.componentSlot : (int)atom;
@@ -286,7 +293,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     b.modifiedSpans.push_back({token, (int)M.atoms.size(), M.code, residue, M.atoms, M.bonds, false});
     for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
       const CompAtom& s = M.atoms[atom];
-      setToken(token, o.atomizedUnknownRestype && R.kind == "protein" ? UNK_AATYPE : parentAatype(R.kind, R.code),
+      setToken(token, o.atomizedUnknownRestype == 2 || (o.atomizedUnknownRestype == 1 && R.kind == "protein") ? UNK_AATYPE
+                                                                                                    : parentAatype(R.kind, R.code),
                number, asym, entity, sym, residue);
       int flat = token * DENSE;
       setAtom(flat, s.element, s.charge, s.x, s.y, s.z);
@@ -471,7 +479,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   b.msaMask.assign((size_t)sequences * tokens, 1);
   b.deletionMatrix.assign((size_t)sequences * tokens, 0);
   std::vector<int> queryRow = b.aatype;
-  if (o.atomizedUnknownRestype && !o.atomizedUnknownMsa)
+  if (o.atomizedUnknownRestype == 1 && !o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) {
       int parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (int at = 0; at < span.count; ++at) queryRow[span.from + at] = parent;

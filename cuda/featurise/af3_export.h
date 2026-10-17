@@ -280,7 +280,8 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
   } else {
     for (size_t k = 0; k < slots.size(); ++k) passes.push_back({1, true, k, 0, false});
     int empty = TEMPLATES - (int)slots.size();
-    if (empty > 0 && D.emptyTemplateAatype >= 0) {
+    if (empty > 0 && D.templateGapWhereNoAtoms) passes.push_back({empty, false, 0, 21, false});   // (openbind0: every empty slot GAP)
+    else if (empty > 0 && D.emptyTemplateAatype >= 0) {
       passes.push_back({1, false, 0, D.emptyTemplateAatype, false});
       if (empty > 1) passes.push_back({empty - 1, false, 0, 0, false});
     } else if (empty > 0) passes.push_back({empty, false, 0, 0, false});
@@ -293,7 +294,7 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
     if (p.real) {
       const TemplateSlot& slot = slots[p.slot].slot;
       std::vector<int> aatype = slot.aatype;
-      if (D.chaiTemplates)
+      if (D.chaiTemplates || D.templateGapWhereNoAtoms)
         for (int t = 0; t < tokens; ++t) {
           bool any = false;
           for (int a = 0; a < batch.dense; ++a) if (slot.atomMask[(size_t)t * batch.dense + a] > 0) { any = true; break; }
@@ -515,8 +516,10 @@ inline Af3Export exportAf3(const Args& args) {
   // af3BatchFromA3m: the rows (seeded from --seed), then featuriseProtein with the dialect's conventions
   if (alignment.present) {
     Uniform random(jsParseFloat(args.option("seed", "20260831")));
+    std::vector<int> chainOfColumn;                // (each column's polymer chain: openbind0's main-MSA cap)
+    { int chain = 0; for (char c : sequence) { if (c == ':') ++chain; else chainOfColumn.push_back(chain); } }
     MsaRows rows = af3MsaFromA3m(alignment, (int)jsParseFloat(args.option("max-msa", "1024")),
-                                 msaColumnKinds.empty() ? nullptr : &msaColumnKinds, &random);
+                                 msaColumnKinds.empty() ? nullptr : &msaColumnKinds, &random, D.mainMsaCap, &chainOfColumn);
     o.msa = rows.msa; o.deletionMatrix = rows.deletionMatrix;
     o.profileMsa = rows.profileMsa; o.profileDeletionMatrix = rows.profileDeletionMatrix;
     o.hasUnpairedFrom = true; o.unpairedFrom = rows.unpairedFrom;
@@ -525,6 +528,7 @@ inline Af3Export exportAf3(const Args& args) {
   }
   o.symmetriseBonds = D.symmetriseBonds; o.centreRefConformers = D.centreRefConformers;
   o.rawLastConformer = D.rawLastConformer; o.declaredPolymerBonds = D.declaredPolymerBonds;
+  o.ccdUnknownResidue = D.ccdUnknownResidue;
   o.paddedAtomKeys = D.paddedAtomKeys; o.qblockAtomKeys = D.qblockAtomKeys;
   o.atomizedElementNames = D.atomizedElementNames; o.atomizedUnknownRestype = D.atomizedUnknownRestype;
   o.atomizedUnknownMsa = D.atomizedUnknownMsa; o.atomizedBackboneBonds = D.atomizedBackboneBonds;

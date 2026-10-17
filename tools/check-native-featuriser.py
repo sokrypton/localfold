@@ -91,6 +91,8 @@ def cases():
                                           {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF3_FAMILIES),
         ("sep-end", "af3", job("t", [protein("A", "MKTAYIAKQRS", modifications=[{"ptmType": "SEP", "ptmPosition": 11}])]),
          [], AF3_FAMILIES),
+        # an unknown amino acid mid-chain and at the C-terminus (openbind0: the CCD's UNK, N CA C O CB CG)
+        ("unknown-residues", "af3", job("t", [protein("A", "MKTXAYIAKQRX")]), [], AF3_FAMILIES),
         # every family's rule for declared bonds (featurise.js declaredPolymerBonds): a disulfide within a chain, an
         # adjacent pair (left to the chain by protenix), a cross-chain one, and a modified residue's bond to a ligand
         ("bond-rules", "af3", job("t", [protein("A", "CKTCYSAKC", modifications=[{"ptmType": "SEP", "ptmPosition": 6}]),

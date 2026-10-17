@@ -15,6 +15,7 @@ const { REFERENCE_CONFORMERS, RESIDUE_TYPES } = await import(`${repo}shared/af3/
 const { DNA_CONFORMERS, RNA_CONFORMERS } = await import(`${repo}shared/af3/featurise/reference-conformers-nucleic.js`);
 const { DIALECTS, DIALECT_ALIASES, featuriserDialect } = await import(`${repo}shared/af3/dialect.js`);
 const { BOLTZ2_RAW_CONFORMERS } = await import(`${repo}shared/af3/featurise/boltz2-conformers.js`);
+const { UNK_CCD_CONFORMER } = await import(`${repo}shared/af3/featurise/reference-conformers-unk.js`);
 const { ELEMENT_SYMBOLS } = await import(`${repo}shared/af3/featurise/ccd-component.js`);
 const { AF3_MSA_CODES } = await import(`${repo}shared/af3/featurise/msa-features.js`);
 const { MODEL_BUNDLES } = await import(`${repo}shared/bundles/manifests/index.js`);
@@ -46,6 +47,9 @@ for (const [kind, table] of [["dna", DNA_CONFORMERS], ["rna", RNA_CONFORMERS]]) 
   }
   lines.push("  };", "  return table;", "}", "");
 }
+lines.push("// shared/af3/featurise/reference-conformers-unk.js: the CCD's UNK, [internal, C-terminal]");
+lines.push(`inline const ConformerEntry& unkCcdConformer() { static const ConformerEntry e = {'X', ${UNK_CCD_CONFORMER.aatype}, ${atoms(UNK_CCD_CONFORMER.internal)}, ${atoms(UNK_CCD_CONFORMER.cTerminal)}}; return e; }`);
+lines.push("");
 lines.push("// shared/af3/featurise/ccd-component.js ELEMENT_SYMBOLS (atomic number - 1)");
 lines.push(`inline const std::vector<std::string>& elementSymbols() { static const std::vector<std::string> s = {${ELEMENT_SYMBOLS.map(str).join(", ")}}; return s; }`);
 lines.push("");
@@ -62,7 +66,7 @@ for (const [name, d] of Object.entries(DIALECTS)) {
   const dedupe = f.dedupeSelfMsa === undefined ? -1 : f.dedupeSelfMsa ? 1 : 0;
   const fused = d.fusedTemplateLayout ?? null;
   lines.push(`    {${str(name)}, ${bool(f.symmetriseBonds)}, ${bool(f.centreRefConformers)}, ${bool(f.paddedAtomKeys)},`
-    + ` ${bool(f.qblockAtomKeys)}, ${drop}, ${dedupe}, ${bool(f.atomizedElementNames)}, ${bool(f.atomizedUnknownRestype)},`
+    + ` ${bool(f.qblockAtomKeys)}, ${drop}, ${dedupe}, ${bool(f.atomizedElementNames)}, ${f.atomizedUnknownRestype === "nucleic" ? 2 : f.atomizedUnknownRestype === true ? 1 : 0},`
     + ` ${bool(f.atomizedUnknownMsa)}, ${bool(f.atomizedBackboneBonds)}, ${bool(f.modifiedAsOneToken)}, ${bool(f.chaiMsaFeatures)},`
     + ` ${fused ? fused.distogramBins : 0}, ${fused ? fused.restypes : 0}, ${bool(d.boltz2TemplateFeatures)},`
     + ` ${bool(d.rosettafold3TemplateFeatures)}, ${bool(d.templateFeatureMeanOnePass)}, ${d.emptyTemplateAatype ?? -1},`
@@ -70,7 +74,8 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${bool(d.chaiTokenEmbedding)}, ${bool(d.structuralTokens)}, ${bool(d.chiralCentres)},`
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
     + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
-    + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}},`);
+    + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}, ${bool(d.templateGapWhereNoAtoms)},`
+    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");

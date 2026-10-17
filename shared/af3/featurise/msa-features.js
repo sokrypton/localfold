@@ -105,6 +105,35 @@ const CODES_OF_KIND = { protein: AF3_MSA_CODES, rna: AF3_RNA_MSA_CODES, dna: AF3
  *   `profileMsa` is the unpaired block the PROFILE is computed over: before
  *   deduplication and before the crop, which is where AF3 computes it.
  */
+/**
+ * A block's rows as OpenFold3 reads its main MSA: per chain, the first `cap` rows (the chain's query first), deduplicated
+ * on the aligned (insertion-free) row. `chainOfColumn` names each column's chain; absent, every column is one chain.
+ */
+export function capMainMsa(parsed, cap, chainOfColumn) {
+  const chainOf = (row) => {
+    const aligned = parsed.sequences[row];
+    for (let column = 0; column < aligned.length; column += 1) {
+      if (aligned[column] !== "-") return chainOfColumn === undefined ? 0 : chainOfColumn[column];
+    }
+    return chainOfColumn === undefined ? 0 : chainOfColumn[0];
+  };
+  const counted = new Map(), seen = new Map();
+  const keep = [0];
+  for (let row = 1; row < parsed.depth; row += 1) {
+    const chain = chainOf(row);
+    if (!seen.has(chain)) { seen.set(chain, new Set([parsed.sequences[0]])); counted.set(chain, 1); }
+    const n = counted.get(chain);
+    counted.set(chain, n + 1);
+    if (n >= cap || seen.get(chain).has(parsed.sequences[row])) continue;
+    seen.get(chain).add(parsed.sequences[row]);
+    keep.push(row);
+  }
+  if (keep.length === parsed.depth) return parsed;
+  return { ...parsed, descriptions: keep.map((r) => parsed.descriptions[r]),
+           rawSequences: keep.map((r) => parsed.rawSequences[r]), sequences: keep.map((r) => parsed.sequences[r]),
+           deletionMatrix: keep.map((r) => parsed.deletionMatrix[r]), depth: keep.length };
+}
+
 export function af3MsaFromA3m(alignment, options = {}) {
   const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
   const maxSequences = options.maxSequences ?? 512;
@@ -132,7 +161,14 @@ export function af3MsaFromA3m(alignment, options = {}) {
     return parsed;
   };
   const paired = parse(texts.paired);
-  const unpaired = parse(texts.unpaired);
+  // 🔴 OPENFOLD3's MAIN MSA (openbind0's `mainMsaCap`): each chain's first N rows of its unpaired alignment,
+  // deduplicated ignoring insertions, are all it reads - its profile and deletion mean included - where AlphaFold 3
+  // keeps every row (af3-any-model b84aa69: on msa_gappy 6530 of 21577 rows, profile max|d| 0.18 without). The block
+  // here is block-diagonal - each chain's rows fill its own columns under one full-length query - so a row's chain is
+  // the chain of its first filled column, and a chain's own query (row zero) counts as its first row.
+  const capped = (parsed) => (parsed === null || !(options.mainMsaCap > 0) ? parsed
+    : capMainMsa(parsed, options.mainMsaCap, options.chainOfColumn));
+  const unpaired = capped(parse(texts.unpaired));
   // 🔴 THE PROFILE IS COMPUTED BEFORE DEDUPLICATION, over the chain's FULL
   // unpaired alignment. AF3's features.py calls get_profile_features on every
   // chain and only then runs msa_pairing.deduplicate_unpaired_sequences, so the
@@ -140,7 +176,7 @@ export function af3MsaFromA3m(alignment, options = {}) {
   // what survives is the natural reading and it is a different feature - on a
   // target with good pairing most of the unpaired block is removed, so most of
   // the profile would be missing from it.
-  const unpairedProfile = parse(texts.unpairedProfile) ?? unpaired;
+  const unpairedProfile = capped(parse(texts.unpairedProfile)) ?? unpaired;
 
   // 🔴 THE PAIRED BLOCK GETS AT MOST HALF THE BUDGET, and the unpaired block
   // gets what is left - `max_paired_sequences = msa_size // 2` in AF3's

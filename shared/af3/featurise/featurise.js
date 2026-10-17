@@ -40,7 +40,8 @@
  * between chains, and templates. Each is a token type this tokeniser does not
  * create, and each would need its own CCD entries.
  */
-import { conformerFor, aatypeFor } from "./reference-conformers.js";
+import { conformerFor, aatypeFor, RESIDUE_TYPES } from "./reference-conformers.js";
+import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
 import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
@@ -180,7 +181,11 @@ export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot,
   // 6MRR where the plain slide gives 446. Its last two subsets therefore take
   // keys 448..575 and reach past the last real atom, which the mask handles.
   const edge = qblockKeys ? Math.ceil(atomCount / QUERIES) * QUERIES : atomCount;
-  const lastStart = Math.max(0, edge - keys);
+  // 🔴 AND ITS WINDOW IS THE FULL 128 KEYS WHEREVER IT SITS: the reference clamps a block's start to
+  // `max(edge - 128, 0)`, so below 128 atoms every block starts at 0 and sees every atom. Shifting by the shrunken
+  // window here (keys = the atom count) started the last block at `edge - atoms` - 3 at 93 atoms, dropping atoms 0..2
+  // from its keys - and an odd count made that shift fractional, which the two featurisers truncated differently.
+  const lastStart = Math.max(0, edge - (qblockKeys ? KEYS : keys));
   for (let subset = 0; subset < subsets; subset += 1) {
     const start = paddedKeys
       ? subset * QUERIES + (QUERIES >> 1) - (keys >> 1)
@@ -430,7 +435,10 @@ export function featuriseProtein(sequence, options = {}) {
       residueOfToken[token] = residue;
 
       const atoms = kind === "protein"
-        ? conformerFor(code, isCTerminal)
+        // (an unknown amino acid as the CCD's UNK where the dialect says - openbind0)
+        ? (options.ccdUnknownResidue === true && (code === "X" || !RESIDUE_TYPES.includes(code))
+          ? (isCTerminal ? UNK_CCD_CONFORMER.cTerminal : UNK_CCD_CONFORMER.internal)
+          : conformerFor(code, isCTerminal))
         : (nucleicConformerFor(kind, code, isCTerminal) ?? conformerFor("X", false));
       for (const [slot, name, element, charge, x, y, z] of atoms) {
         const flat = token * DENSE + slot;
@@ -490,7 +498,7 @@ export function featuriseProtein(sequence, options = {}) {
       modifiedSpans.push({ from: token, count: 1, code: modification.code,
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
-      aatype[token] = options.atomizedUnknownRestype === true
+      aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
         ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
@@ -563,9 +571,10 @@ export function featuriseProtein(sequence, options = {}) {
       // against both references on 6MRR + GOL + SEP@3: all ten of the
       // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
       // is a one-hot over the same alphabet.
-      // (rf3's unknown restype is for an atomised AMINO ACID: its reference keeps a modified base's
-      // atom tokens at the parent nucleotide - a 5CM's twenty read DC, 28)
-      aatype[token] = options.atomizedUnknownRestype === true && kind === "protein"
+      // (true is for an atomised AMINO ACID alone; rf3's "nucleic" takes a modified base's atom tokens
+      // too - native atomworks reads a 5CM's twenty as 20, where af3-any-model once kept DC, 28: 0464f71)
+      aatype[token] = options.atomizedUnknownRestype === "nucleic"
+        || (options.atomizedUnknownRestype === true && kind === "protein")
         ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;

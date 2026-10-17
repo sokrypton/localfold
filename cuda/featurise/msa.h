@@ -2,6 +2,8 @@
 // shared/af3/featurise/msa-features.js af3MsaFromA3m (the seeded row choice and the profile's rows) and the
 // seeded generator it draws from (shared/af3/random.js uniformFrom).
 #pragma once
+#include <set>
+#include <map>
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -136,8 +138,34 @@ inline int nucleicMsaCode(const std::string& kind, char c) {
   return (c >= 'A' && c <= 'Z') ? 30 : -1;
 }
 
+// msa-features.js capMainMsa: per chain, the first `cap` rows (the chain's query first), deduplicated on the aligned row
+inline A3m capMainMsa(const A3m& parsed, int cap, const std::vector<int>* chainOfColumn) {
+  auto chainOf = [&](int row) {
+    const std::string& aligned = parsed.sequences[row];
+    for (size_t c = 0; c < aligned.size(); ++c) if (aligned[c] != '-') return chainOfColumn ? (*chainOfColumn)[c] : 0;
+    return chainOfColumn ? (*chainOfColumn)[0] : 0;
+  };
+  std::map<int, int> counted; std::map<int, std::set<std::string>> seen;
+  std::vector<int> keep{0};
+  for (int row = 1; row < parsed.depth; ++row) {
+    int chain = chainOf(row);
+    if (!seen.count(chain)) { seen[chain].insert(parsed.sequences[0]); counted[chain] = 1; }
+    int n = counted[chain]++;
+    if (n >= cap || seen[chain].count(parsed.sequences[row])) continue;
+    seen[chain].insert(parsed.sequences[row]);
+    keep.push_back(row);
+  }
+  if ((int)keep.size() == parsed.depth) return parsed;
+  A3m out; out.length = parsed.length; out.depth = (int)keep.size();
+  for (int r : keep) {
+    out.descriptions.push_back(parsed.descriptions[r]); out.raw.push_back(parsed.raw[r]);
+    out.sequences.push_back(parsed.sequences[r]); out.deletions.push_back(parsed.deletions[r]);
+  }
+  return out;
+}
+
 inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const std::vector<std::string>* columnKinds,
-                             Uniform* random) {
+                             Uniform* random, int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr) {
   auto codeOf = [&](const std::string& aligned, int column) {
     char ch = aligned[column];
     if (columnKinds == nullptr || (*columnKinds)[column] == "protein" ||
@@ -161,6 +189,10 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
   Parsed paired = alignment.blocks ? parse(alignment.hasPaired, alignment.paired) : Parsed{};
   Parsed unpaired = alignment.blocks ? parse(alignment.hasUnpaired, alignment.unpaired) : parse(true, alignment.single);
   Parsed profileBlock = alignment.blocks ? parse(alignment.hasUnpairedProfile, alignment.unpairedProfile) : Parsed{};
+  if (mainMsaCap > 0) {                           // (openbind0's main MSA: the unpaired block and the profile's rows)
+    if (unpaired.ok) unpaired.a = capMainMsa(unpaired.a, mainMsaCap, chainOfColumn);
+    if (profileBlock.ok) profileBlock.a = capMainMsa(profileBlock.a, mainMsaCap, chainOfColumn);
+  }
   const Parsed& unpairedProfile = profileBlock.ok ? profileBlock : unpaired;
   int pairedBlock = !paired.ok ? 1 : paired.a.depth + 1;
   int pairedCrop = std::min(pairedBlock, std::max(1, maxSequences / 2));

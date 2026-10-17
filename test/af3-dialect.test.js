@@ -53,6 +53,10 @@ describe("the dialect table", () => {
   it("turns on exactly the branches OpenBind-0 needs", () => {
     assert.deepEqual(on(OPENBIND0),
       [
+      // 🔴 OPENFOLD3's FEATURISER, three ways AlphaFold 3's is not (af3-any-model b84aa69): an unknown amino acid is
+      // the CCD's UNK, the main MSA each chain's first 16384 rows deduplicated, and every (slot, token) without
+      // template atoms the GAP restype.
+      "ccdUnknownResidue",
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
@@ -65,7 +69,7 @@ describe("the dialect table", () => {
       // window's edge is the atom COUNT. `tools/check-atom-windows.js` is the
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
-      "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
+      "mainMsaCap", "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
   });
 
   /**
@@ -311,7 +315,7 @@ it("the atomised-token conventions are the four the references show", () => {
     // ALIGNMENT holding the parent residue; rf3 moves both.
     boltz2:       [false, true,  false, false],
     intellifold2: [false, false, false, false],
-    rosettafold3: [true,  true,  true,  true],
+    rosettafold3: [true,  "nucleic", true, true],
   };
   for (const [model, want] of Object.entries(expected)) {
     const dialect = dialectFor(model);
