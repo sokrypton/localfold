@@ -11,11 +11,19 @@
 // embeddings and the heads is cuda/ef2's (ESMFold2's MSA encoder is the same module set): its kernels read the
 // weights tools/export_msap.py writes in ESMFold2's names and layouts.
 //
-//   msap --weights=<dir> --oracle=<dir>           the oracle's own subsampled alignment (tools/oracle/dump_msap.py),
-//                                                 every stage compared with it
+//   localfold-msap --a3m=<alignment> --out=<dir> [--fast] ...   contacts, logits, embeddings (USAGE below)
+//   localfold-msap --oracle=<dir> --check                       tools/oracle/dump_msap.py's own subsample, every stage
+//                                                               compared with the reference's
+//
+// --fast (f16 activations into tensor-core GEMMs, f32 accumulation and residuals) is 7.8e-4 from the float32
+// reference on 5CAJ's contacts, where the reference's own bfloat16 is 5.3e-3 from it (1B70); without it every
+// stage is within 2.6e-6.
 #include "../../ef2/src/shim.cuh"   // (trunk.cuh's streamed z_init reads it; unused here)
 #include "../../ef2/src/msa.cuh"
 #include <chrono>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "select.cuh"
 
 // m[s][l][:] = W[token][:]: the one-hot's projection is a row gather
 __global__ void msaEmbedK(const int* tok, const float* W, float* m, size_t rows, int C) {
@@ -116,15 +124,58 @@ __global__ void opmGateAddK(const float* h, const float* bias, float* pair, size
   float g = h[r * 512 + c] + bias[c], x = h[r * 512 + 256 + c] + bias[256 + c];
   pair[t] += g / (1.f + expf(-g)) * x;
 }
+// --fast: the same in f16 - the scaled operands, the contraction's product (f32 accumulation), the permuted outer
+// product and the projection's 512 columns (its bias in cuBLASLt's epilogue)
+__global__ void opmScaleHK(const float* x, const float* w, half* out, int S, int L) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * L * 16) return;
+  int c = (int)(t % 16); size_t r = t / 16; int l = (int)(r % L), s = (int)(r / L);
+  out[((size_t)l * 16 + c) * S + s] = __float2half(x[t] * sqrtf(w[s] + 1e-32f));
+}
+// a thread a (i, j, c): the 16 e of one product row, 32 contiguous bytes in and out
+__global__ void opmPermuteHK(const half* prod, half* out, int L, const float* denom) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)L * L * 16) return;
+  int c = (int)(t % 16); size_t ij = t / 16; int i = (int)(ij / L), j = (int)(ij % L);
+  const float inv = 1.f / (*denom + 1e-32f);
+  const uint4* src = reinterpret_cast<const uint4*>(prod + ((size_t)i * 16 + c) * ((size_t)L * 16) + (size_t)j * 16);
+  uint4* dst = reinterpret_cast<uint4*>(out + ij * 256 + c * 16);
+#pragma unroll
+  for (int v = 0; v < 2; ++v) {
+    uint4 q = src[v]; half2* h = reinterpret_cast<half2*>(&q);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { float2 f = __half22float2(h[e]); h[e] = __floats2half2_rn(f.x * inv, f.y * inv); }
+    dst[v] = q;
+  }
+}
+__global__ void opmGateAddHK(const half* h, float* pair, size_t rows) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * 256) return;
+  size_t r = t / 256; int c = (int)(t % 256);
+  float g = __half2float(h[r * 512 + c]), x = __half2float(h[r * 512 + 256 + c]);
+  pair[t] += g / (1.f + expf(-g)) * x;
+}
 // one layer's query-biased outer product: pair += SwiGLU(Linear(outer(a sqrt w, b sqrt w) / sum w))
 inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) {
   const std::string O = "msap/blocks/" + std::to_string(l) + "/opm/";
   const int Cm = 464; size_t R = (size_t)S * L, P = (size_t)L * L;
-  float* nm = scratch<float>("opm.nm", R * Cm);
-  layerNorm(m, nm, R, Cm, F(O + "normScale"), F(O + "normOffset"));
   float* q = scratch<float>("opm.q", (size_t)L * 256); float* k = scratch<float>("opm.k", R * 256);
-  gemm(nm, F(O + "q"), q, L, Cm, 256);                     // (the query is row 0: its L rows lead nm)
-  gemm(nm, F(O + "k"), k, R, Cm, 256);
+  float* a = scratch<float>("opm.a", R * 16); float* b = scratch<float>("opm.b", R * 16);
+  // (the query is row 0: its L rows lead the normed rows)
+  if (FAST) {
+    half* nm = scratch<half>("opm.nmh", R * Cm);
+    layerNormH(m, nm, R, Cm, F(O + "normScale"), F(O + "normOffset"));
+    ltGemm(nm, Fh(O + "q"), q, false, L, Cm, 256, nullptr, false, 0.f);
+    ltGemm(nm, Fh(O + "k"), k, false, R, Cm, 256, nullptr, false, 0.f);
+    ltGemm(nm, Fh(O + "left"), a, false, R, Cm, 16, nullptr, false, 0.f);
+    ltGemm(nm, Fh(O + "right"), b, false, R, Cm, 16, nullptr, false, 0.f);
+  } else {
+    float* nm = scratch<float>("opm.nm", R * Cm);
+    layerNorm(m, nm, R, Cm, F(O + "normScale"), F(O + "normOffset"));
+    gemm(nm, F(O + "q"), q, L, Cm, 256);
+    gemm(nm, F(O + "k"), k, R, Cm, 256);
+    gemm(nm, F(O + "left"), a, R, Cm, 16); gemm(nm, F(O + "right"), b, R, Cm, 16);
+  }
   halvesNormK<<<(unsigned)(L * 2), 128, 0, STREAM>>>(q, L, F(O + "qNormScale"), F(O + "qNormOffset"));
   halvesNormK<<<(unsigned)(R * 2), 128, 0, STREAM>>>(k, R, F(O + "kNormScale"), F(O + "kNormOffset"));
   float* raw = scratch<float>("opm.raw", (size_t)2 * S);
@@ -137,15 +188,31 @@ inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) 
   const float lambda = expf(dot("lambdaQ1", "lambdaK1")) - expf(dot("lambdaQ2", "lambdaK2")) + (float)M.meta("meta/opmLambdaInit/" + std::to_string(l));
   float* w = wOut; float* wsum = scratch<float>("opm.wsum", 1);
   seqWeightsK<<<1, 1024, 0, STREAM>>>(raw, lambda, w, wsum, S);
-  float* a = scratch<float>("opm.a", R * 16); float* b = scratch<float>("opm.b", R * 16);
-  gemm(nm, F(O + "left"), a, R, Cm, 16); gemm(nm, F(O + "right"), b, R, Cm, 16);
+  const size_t LC = (size_t)L * 16;
+  const float one = 1.f, zero = 0.f;
+  if (FAST) {
+    half* as = scratch<half>("opm.ash", R * 16); half* bs = scratch<half>("opm.bsh", R * 16);
+    opmScaleHK<<<blocks(R * 16), 256, 0, STREAM>>>(a, w, as, S, L);
+    opmScaleHK<<<blocks(R * 16), 256, 0, STREAM>>>(b, w, bs, S, L);
+    half* prod = scratch<half>("opm.prodh", LC * LC);
+    CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)LC, (int)LC, S, &one, bs, CUDA_R_16F, S, as, CUDA_R_16F, S, &zero, prod,
+                    CUDA_R_16F, (int)LC, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    half* outer = scratch<half>("opm.outerh", P * 256);
+    opmPermuteHK<<<blocks(P * 16), 256, 0, STREAM>>>(prod, outer, L, wsum);
+    const size_t chunk = std::min<size_t>(P, (size_t)64 << 20 >> 9);       // (the projection's rows: 64 M halves)
+    half* h = scratch<half>("opm.hh", chunk * 512);
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      ltGemm(outer + r0 * 256, Fh(O + "toPair"), h, true, r, 256, 512, F(O + "toPairBias"), false, 0.f);
+      opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + r0 * 256, r);
+    }
+    return;
+  }
   float* as = scratch<float>("opm.as", R * 16); float* bs = scratch<float>("opm.bs", R * 16);
   opmScaleK<<<blocks(R * 16), 256, 0, STREAM>>>(a, w, as, S, L);
   opmScaleK<<<blocks(R * 16), 256, 0, STREAM>>>(b, w, bs, S, L);
   // prod (col-major [(j, e)][(i, c)], i.e. row-major [(i, c)][(j, e)]) = sum_s a[s][(i, c)] b[s][(j, e)]
-  const size_t LC = (size_t)L * 16;
   float* prod = scratch<float>("opm.prod", LC * LC);
-  const float one = 1.f, zero = 0.f;
   CB(cublasSgemm(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)LC, (int)LC, S, &one, bs, S, as, S, &zero, prod, (int)LC));
   float* outer = scratch<float>("opm.outer", P * 256);
   opmPermuteK<<<blocks(P * 256), 256, 0, STREAM>>>(prod, outer, L, wsum);
@@ -205,49 +272,135 @@ inline void lmHead(const float* mq, int L, float* logits) {
   addRowBiasK<<<blocks((size_t)L * 26), 256, 0, STREAM>>>(logits, F("msap/lm/logitsBias"), L, 26);
 }
 
+// ---------------------------------------------------------------- the subsample
+// the reference's greedy_select on the device: from the query, repeatedly the row with the largest mean Hamming
+// distance (every column, a gap a token like any other) to the rows chosen so far - summed here as integers, so a
+// tie is a tie (the first row wins, numpy's argmax) - over rows [n][L] of tokens
+__global__ void hammingAddK(const unsigned char* tok, int n, int L, const int* last, int* sum, const char* chosen) {
+  int k = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (k >= n || chosen[k]) return;
+  const unsigned char *a = tok + (size_t)k * L, *b = tok + (size_t)*last * L;
+  int d = 0;
+  for (int i = lane; i < L; i += 32) d += a[i] != b[i];
+  for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(~0u, d, o);
+  if (lane == 0) sum[k] += d;
+}
+__global__ void argmaxPickK(const int* sum, int n, char* chosen, int* last, int* picks, int step) {
+  __shared__ int bv[1024], bi[1024];
+  int v = -1, at = n;
+  for (int k = threadIdx.x; k < n; k += blockDim.x) if (!chosen[k] && sum[k] > v) { v = sum[k]; at = k; }
+  bv[threadIdx.x] = v; bi[threadIdx.x] = at; __syncthreads();
+  for (int o = blockDim.x / 2; o; o >>= 1) {
+    if ((int)threadIdx.x < o) {
+      int ov = bv[threadIdx.x + o], oi = bi[threadIdx.x + o];
+      if (ov > bv[threadIdx.x] || (ov == bv[threadIdx.x] && oi < bi[threadIdx.x])) { bv[threadIdx.x] = ov; bi[threadIdx.x] = oi; }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { chosen[bi[0]] = 1; *last = bi[0]; picks[step] = bi[0]; }
+}
+inline std::vector<int> greedyRows(const std::vector<std::string>& rows, const std::vector<int>& from, int depth) {
+  const int n = (int)from.size(), L = (int)rows[0].size();
+  if (n <= depth) return from;
+  std::vector<unsigned char> h((size_t)n * L);
+  for (int k = 0; k < n; ++k) for (int i = 0; i < L; ++i) h[(size_t)k * L + i] = (unsigned char)msapToken(rows[from[k]][i]);
+  unsigned char* tok = upload(h.data(), h.size());
+  int* sum = dallocT<int>(n); char* chosen = dallocT<char>(n); int* last = dallocT<int>(1); int* picks = dallocT<int>(depth);
+  CK(cudaMemsetAsync(sum, 0, n * 4, STREAM)); CK(cudaMemsetAsync(chosen, 0, n, STREAM)); CK(cudaMemsetAsync(last, 0, 4, STREAM));
+  CK(cudaMemsetAsync(chosen, 1, 1, STREAM)); CK(cudaMemsetAsync(picks, 0, 4, STREAM));
+  for (int step = 1; step < depth; ++step) {
+    hammingAddK<<<(n + 7) / 8, 256, 0, STREAM>>>(tok, n, L, last, sum, chosen);
+    argmaxPickK<<<1, 1024, 0, STREAM>>>(sum, n, chosen, last, picks, step);
+  }
+  std::vector<int> p(depth);
+  CK(cudaMemcpyAsync(p.data(), picks, depth * 4, cudaMemcpyDeviceToHost, STREAM)); CK(cudaStreamSynchronize(STREAM));
+  for (void* x : { (void*)tok, (void*)sum, (void*)chosen, (void*)last, (void*)picks }) CK(cudaFree(x));
+  std::sort(p.begin(), p.end());
+  std::vector<int> out; for (int k : p) out.push_back(from[k]);
+  return out;
+}
+
 // every stage against the oracle's (--check), or none - a comparison downloads the whole tensor
 inline bool checking = false;
 #define CHECK(...) do { if (checking) check(__VA_ARGS__); } while (0)
 
+static const char* USAGE =
+  "localfold-msap --a3m=<alignment> --out=<dir> [--fast] [--depth=512] [--chain-breaks=i,j] [--weights=<dir>]\n"
+  "               [--embeddings]\n"
+  "  writes <dir>/cb_contacts.npy and confind_contacts.npy [L][L], logits.npy [L][26] (the query's 26 tokens,\n"
+  "  ARNDCEQGHILKMFPSTWYVXBZUO-), subsample.a3m (the rows the model read), and with --embeddings query.npy [L][464]\n"
+  "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer)\n"
+  "  --chain-breaks: the residue each chain after the first starts at (a ColabFold '#' header gives them)\n"
+  "localfold-msap --oracle=<dump dir> [--check] [--repeat=N]    tools/oracle/dump_msap.py's subsample, its stages compared\n";
+
 int main(int argc, char** argv) {
-  std::string weights, oracle; int repeats = 1;
+  std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
+    else if (!strncmp(argv[i], "--a3m=", 6)) a3m = argv[i] + 6;
+    else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
+    else if (!strncmp(argv[i], "--depth=", 8)) maxDepth = atoi(argv[i] + 8);
+    else if (!strncmp(argv[i], "--chain-breaks=", 15)) breaksArg = argv[i] + 15;
+    else if (!strcmp(argv[i], "--embeddings")) embeddings = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--check")) checking = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeats = atoi(argv[i] + 9);
-    else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
+    else { fprintf(stderr, "unknown flag %s\n%s", argv[i], USAGE); return 1; }
   }
-  if (weights.empty() || oracle.empty()) { fprintf(stderr, "msap --weights=<dir> --oracle=<dir> [--fast]\n"); return 1; }
-  M.load(weights); M.load(oracle);
+  if (a3m.empty() == oracle.empty() || (!a3m.empty() && out.empty()) || maxDepth < 1) { fputs(USAGE, stderr); return 1; }
+  if (weights.empty()) {              // beside the binary, as cuda/<port>/weights
+    char self[4096]; ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    std::string dir = n > 0 ? std::string(self, n) : "."; dir = dir.substr(0, dir.rfind('/'));
+    weights = dir + "/weights";
+  }
+  M.load(weights);
+  if (!oracle.empty()) M.load(oracle);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   M.upload(0);
-  const int S = (int)M.meta("o/meta/depth"), L = (int)M.meta("o/meta/length"), C = 256, Cm = 464;
+  // the alignment: the oracle's subsample as it is, or an A3M filtered and subsampled here
+  std::vector<int> tokens, breaks; std::vector<std::string> subsample; int S, L;
+  auto t0 = std::chrono::steady_clock::now();
+  if (!oracle.empty()) {
+    S = (int)M.meta("o/meta/depth"); L = (int)M.meta("o/meta/length");
+    tokens.assign(M.i("o/tokens"), M.i("o/tokens") + (size_t)S * L);
+    for (size_t k = 0; k < M.len("o/chainBreaks"); ++k) if (M.i("o/chainBreaks")[k] >= 0) breaks.push_back(M.i("o/chainBreaks")[k]);
+  } else {
+    Alignment al = readA3m(a3m);
+    breaks = al.chainBreaks;
+    if (!breaksArg.empty()) { breaks.clear(); for (const char* p = breaksArg.c_str(); *p;) { breaks.push_back((int)strtol(p, (char**)&p, 10)); if (*p == ',') ++p; else break; } }
+    L = (int)al.rows[0].size();
+    std::vector<int> kept = filterRows(al.rows, 0.7f, 0.3f);
+    std::vector<int> rows = greedyRows(al.rows, kept, maxDepth);
+    S = (int)rows.size();
+    for (int k : rows) { subsample.push_back(al.rows[k]); for (char c : al.rows[k]) tokens.push_back(msapToken(c)); }
+    printf("msap: %zu rows, %zu past coverage 70%% and query identity 30%%, %d chosen\n", al.rows.size(), kept.size(), S);
+  }
+  for (int b : breaks) if (b <= 0 || b >= L) { fprintf(stderr, "a chain break at %d is outside 1..%d\n", b, L - 1); return 1; }
+  const int C = 256, Cm = 464;
   const int depth = (int)M.meta("meta/depth"), cbLayer = (int)M.meta("meta/contactLayer"), cfLayer = (int)M.meta("meta/confindContactLayer");
   size_t R = (size_t)S * L, P = (size_t)L * L;
-  printf("msap: %d rows x %d columns, %d layers%s\n", S, L, depth, FAST ? " (fast)" : "");
+  printf("msap: %d rows x %d columns, %zu chains, %d layers%s (input %.0f ms)\n", S, L, breaks.size() + 1, depth, FAST ? " (fast)" : "",
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   // the token index, shifted 100 past each chain break
   std::vector<int> shifted(L);
-  const int* br = M.i("o/chainBreaks");
-  for (int l = 0; l < L; ++l) { shifted[l] = l; for (size_t k = 0; k < M.len("o/chainBreaks"); ++k) if (br[k] >= 0 && l >= br[k]) shifted[l] += 100; }
+  for (int l = 0; l < L; ++l) { shifted[l] = l; for (int b : breaks) if (l >= b) shifted[l] += 100; }
   int* shiftedD = upload(shifted.data(), L);
-  int* tokD = scratch<int>("in.tok", R);
-  CK(cudaMemcpyAsync(tokD, M.i("o/tokens"), R * 4, cudaMemcpyHostToDevice, STREAM));
+  int* tokD = upload(tokens.data(), R);
   float* m = dalloc(R * Cm); float* z = dalloc(P * C);
   float* pmask = dalloc(P); fillK<<<blocks(P), 256, 0, STREAM>>>(pmask, 1.f, P);
   float* w = dalloc(S); float* cb = dalloc(P); float* cf = dalloc(P); float* logits = dalloc((size_t)L * 26);
   for (int rep = 0; rep < repeats; ++rep) {
   CK(cudaStreamSynchronize(STREAM));
-  auto t0 = std::chrono::steady_clock::now();
+  t0 = std::chrono::steady_clock::now();
   msaEmbedK<<<blocks(R * Cm), 256, 0, STREAM>>>(tokD, F("msap/msaInit"), m, R, Cm);
   pairInitK<<<blocks(P * C), 256, 0, STREAM>>>(shiftedD, F("msap/relpos"), F("msap/bond"), z, L, C);
   CHECK("msa init", m, R * Cm, "o/msaInit");
   CHECK("pair init", z, P * C, "o/pairInit");
   for (int l = 0; l < depth; ++l) {
     const std::string B = "msap/blocks/" + std::to_string(l) + "/", Lo = "o/layer" + std::to_string(l) + "/";
-    msaPairWeightedAveraging(m, z, S, L, Cm, C, B + "pwa/");
+    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, B + "pwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, B + "pwa/");
     if (l == 0) CHECK("l0 after pwa", m, R * Cm, "o/layer0/afterPwa");
     rowsTransition(m, R, Cm, B + "msaTransition/");
     if (l == 0) CHECK("l0 after msa transition", m, R * Cm, "o/layer0/afterMsaTransition");
@@ -270,13 +423,30 @@ int main(int argc, char** argv) {
     if (l == cbLayer) { contacts(z, L, "msap/cbContact/", cb); CHECK("cb contacts", cb, P, "o/cbContacts"); }
     if (l == cfLayer) { contacts(z, L, "msap/confindContact/", cf); CHECK("confind contacts", cf, P, "o/confindContacts"); }
   }
-  msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
+  if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, "msap/finalPwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
   rowsTransition(m, R, Cm, "msap/finalMsaTransition/");
   CHECK("final msa query", m, (size_t)L * Cm, "o/final/msaQuery");
   lmHead(m, L, logits);
   CHECK("logits", logits, (size_t)L * 26, "o/logits");
   CK(cudaStreamSynchronize(STREAM));
   printf("msap: %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+  if (!out.empty()) {
+    mkdir(out.c_str(), 0755);
+    writeNpy(out + "/cb_contacts.npy", download(cb, P), { (size_t)L, (size_t)L });
+    writeNpy(out + "/confind_contacts.npy", download(cf, P), { (size_t)L, (size_t)L });
+    writeNpy(out + "/logits.npy", download(logits, (size_t)L * 26), { (size_t)L, 26 });
+    if (embeddings) {
+      writeNpy(out + "/query.npy", download(m, (size_t)L * Cm), { (size_t)L, (size_t)Cm });
+      writeNpy(out + "/pair.npy", download(z, P * C), { (size_t)L, (size_t)L, (size_t)C });
+    }
+    if (!subsample.empty()) {
+      FILE* f = fopen((out + "/subsample.a3m").c_str(), "w");
+      if (!f) { fprintf(stderr, "cannot write %s/subsample.a3m\n", out.c_str()); return 1; }
+      for (size_t k = 0; k < subsample.size(); ++k) fprintf(f, ">%zu\n%s\n", k, subsample[k].c_str());
+      fclose(f);
+    }
+    printf("msap: wrote %s\n", out.c_str());
   }
   return 0;
 }

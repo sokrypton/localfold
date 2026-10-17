@@ -2,6 +2,7 @@
 # Build the native ports for this machine's GPU, and the native featurisers beside them:
 #
 #   bash cuda/build.sh [af3] [af2] [ef2]           (all three when none is named: cuda/<port>/localfold-<port>)
+#   bash cuda/build.sh msap                         (MSA Pairformer: contacts from an alignment, built only when named)
 #   bash cuda/build.sh featurise                    (the featurisers alone: no GPU, no nvcc)
 #
 # The featurisers (cuda/featurise: one binary linked as af3-featurise, af2-featurise, ef2-featurise and
@@ -21,7 +22,7 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 ef2)
 for port in "${ports[@]}"; do      # (named before anything is forked: a typo must not leave half a build running)
-  case "$port" in af3|af2|ef2|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, featurise)" >&2; exit 1 ;; esac
+  case "$port" in af3|af2|ef2|msap|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, msap, featurise)" >&2; exit 1 ;; esac
 done
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
 arch="sm_$cc"; archflags="-arch=$arch"
@@ -67,7 +68,7 @@ if [ "${ports[*]}" = featurise ]; then
 fi
 if [ -z "$cc" ]; then for pid in "${pids[@]}"; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
-  case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
+  case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2|msap) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
   # Colab VM has two cores and three compiles, and the first fold waits only on its own port's binary
   prio=""; [ "$port" = af3 ] || prio="nice -n 10"
@@ -75,16 +76,18 @@ for port in "${ports[@]}"; do
   # (the stamp is the card AND the sources - every port includes cuda/af3/src's shared headers - so a
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   # (and the weight walks in cuda/featurise, which af3 and af2 include)
-  stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
+  # (msap is built on cuda/ef2's kernels, so their headers are its sources too; it links no featuriser)
+  extra=(); link=("$sobj"); [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
   # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
   # (compiled to an object while standalone.o builds, then linked once it has)
   ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --default-stream per-thread $fast -c src/$port.cu \
       -o "$out.o" >> "$log" 2>&1 \
-    && until [ "$(cat "$sobj.stamp" 2>/dev/null)" = "$fstamp" ]; do
+    && until [ ${#link[@]} = 0 ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" = "$fstamp" ]; do
          [ "$(cat "$sobj.stamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no standalone object" >> "$log"; exit 1; }; sleep 1; done \
-    && nvcc $archflags "$out.o" "$sobj" -lcublas -lcublasLt -ldl "${rpath[@]}" -o "$out.building" >> "$log" 2>&1 \
+    && nvcc $archflags "$out.o" "${link[@]}" -lcublas -lcublasLt -ldl "${rpath[@]}" -o "$out.building" >> "$log" 2>&1 \
     && rm -f "$out.o" && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
     || { echo "FAILED $port for $arch" >> "$log"; exit 1; } ) &
   pids+=($!)

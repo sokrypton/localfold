@@ -174,6 +174,26 @@ __global__ void swigluHK(const half* h, half* g, size_t rows, int I) {
   float x = __half2float(h[r * 2 * I + c]);
   g[t] = __float2half(x / (1.f + __expf(-x)) * __half2float(h[r * 2 * I + I + c]));
 }
+// the same, eight elements a thread in 16-byte loads and stores (I a multiple of 8), a row's index from a 32-bit
+// division: the one above runs at half the memory's bandwidth (MSA Pairformer's 464-wide MSA, 1,040 columns:
+// 211 ms of a 1.97 s pass). Each element's arithmetic is the one above's, so the output is the same bytes
+__global__ void swigluH8K(const half* __restrict__ h, half* __restrict__ g, unsigned rows, unsigned I8) {
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * I8) return;
+  unsigned r = t / I8, c = t - r * I8;
+  uint4 xv = reinterpret_cast<const uint4*>(h)[(size_t)r * 2 * I8 + c];
+  uint4 yv = reinterpret_cast<const uint4*>(h)[(size_t)r * 2 * I8 + I8 + c];
+  const half *xs = reinterpret_cast<const half*>(&xv), *ys = reinterpret_cast<const half*>(&yv);
+  uint4 ov; half* os = reinterpret_cast<half*>(&ov);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) { float x = __half2float(xs[e]); os[e] = __float2half(x / (1.f + __expf(-x)) * __half2float(ys[e])); }
+  reinterpret_cast<uint4*>(g)[t] = ov;
+}
+inline void swigluH(const half* h, half* g, size_t rows, int I) {
+  if (I % 8 == 0 && rows * (I / 8) < (1ull << 31))
+    swigluH8K<<<blocks(rows * (I / 8)), 256, 0, STREAM>>>(h, g, (unsigned)rows, (unsigned)(I / 8));
+  else swigluHK<<<blocks(rows * I), 256, 0, STREAM>>>(h, g, rows, I);
+}
 inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
   size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (3 * (size_t)I));
@@ -188,7 +208,7 @@ inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) 
     size_t r = std::min(chunk, P - r0);
     if (chunked) layerNormH(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
     ltGemm(xn + (chunked ? 0 : r0 * C), Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
-    swigluHK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
+    swigluH(h, g, r, I);
     ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }
 }

@@ -105,19 +105,25 @@ __global__ void pwaSoftmaxK(const float* flat, float* w, int T, int heads) {
   for (int j = threadIdx.x; j < T; j += blockDim.x) out[j] *= inv;
 }
 // v [s][j][h d + e] -> [h][j][s][e]
-__global__ void pwaToHeadsK(const float* v, float* out, int S, int T, int heads, int d) {
+template <class TI, class TO>
+__global__ void pwaToHeadsK(const TI* v, TO* out, int S, int T, int heads, int d) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * T * heads * d) return;
   int e = (int)(t % d); size_t r = t / d; int s = (int)(r % S); r /= S; int j = (int)(r % T); int h = (int)(r / T);
   out[t] = v[((size_t)s * T + j) * heads * d + h * d + e];
 }
 // o [h][i][s][e] -> [s][i][h d + e], times sigmoid(gate)
-__global__ void pwaFromHeadsK(const float* o, const float* gate, float* out, int S, int T, int heads, int d) {
+__device__ __forceinline__ float pwaF(float x) { return x; }
+__device__ __forceinline__ float pwaF(half x) { return __half2float(x); }
+__device__ __forceinline__ void pwaPut(float* p, float v) { *p = v; }
+__device__ __forceinline__ void pwaPut(half* p, float v) { *p = __float2half(v); }
+template <class TV>
+__global__ void pwaFromHeadsK(const TV* o, const TV* gate, TV* out, int S, int T, int heads, int d) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * T * heads * d) return;
   int c = (int)(t % (heads * d)); size_t si = t / (heads * d); int i = (int)(si % T), s = (int)(si / T);
   int h = c / d, e = c % d;
-  out[t] = o[(((size_t)h * T + i) * S + s) * d + e] / (1.f + expf(-gate[t]));
+  pwaPut(out + t, pwaF(o[(((size_t)h * T + i) * S + s) * d + e]) / (1.f + expf(-pwaF(gate[t]))));
 }
 inline void msaPairWeightedAveraging(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn) {
   const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
@@ -150,6 +156,48 @@ inline void msaPairWeightedAveraging(float* m, const float* pair, int S, int T, 
     gemm(lnc, F(Bn + "gate"), g, cr, Cm, Wd);
     pwaFromHeadsK<<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, g, v, sc, T, heads, d);
     gemm(v, F(Bn + "output"), m + (size_t)s0 * T * Cm, cr, Wd, Cm, 1.f);
+  }
+}
+
+// The same in f16 (MSA Pairformer's --fast; ESMFold2's encoder keeps the f32 form above): the LN'd rows, the values,
+// gates and weighted sums f16 into tensor-core GEMMs with f32 accumulation (cuBLASLt), the softmax f32 and its weights
+// rounded to f16 for the per-head GEMM, the output projection accumulated straight into the f32 rows
+__global__ void pwaWeightsHK(const float* w, half* wh, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) wh[t] = __float2half(w[t]);
+}
+inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn) {
+  const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
+  size_t rows = (size_t)S * T, P = (size_t)T * T;
+  half* ln = scratch<half>("msah.ln", rows * Cm);
+  layerNormH(m, ln, rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
+  float* flat = scratch<float>("msa.flat", P * heads);
+  size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (2 * (size_t)C));
+  half* pln = scratch<half>("msah.pln", chunk * C);
+  for (size_t r0 = 0; r0 < P; r0 += chunk) {
+    size_t r = std::min(chunk, P - r0);
+    layerNormH(pair + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+    ltGemm(pln, Fh(Bn + "pairLogits"), flat + r0 * heads, false, r, C, heads, nullptr, false, 0.f);
+  }
+  float* w = scratch<float>("msa.w", (size_t)heads * P);
+  pwaSoftmaxK<<<(unsigned)(heads * T), 128, 0, STREAM>>>(flat, w, T, heads);
+  half* wh = scratch<half>("msah.w", (size_t)heads * P);
+  pwaWeightsHK<<<blocks((size_t)heads * P), 256, 0, STREAM>>>(w, wh, (size_t)heads * P);
+  int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, ((size_t)128 << 20) / ((size_t)T * Wd * 2)));
+  half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd); half* vh = scratch<half>("msah.vh", (size_t)Sc * T * Wd);
+  half* oh = scratch<half>("msah.oh", (size_t)Sc * T * Wd); half* g = scratch<half>("msah.g", (size_t)Sc * T * Wd);
+  const float one = 1.f, zero = 0.f;
+  for (int s0 = 0; s0 < S; s0 += Sc) {
+    int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
+    const half* lnc = ln + (size_t)s0 * T * Cm;
+    ltGemm(lnc, Fh(Bn + "value"), v, true, cr, Cm, Wd, nullptr, false, 0.f);
+    pwaToHeadsK<<<blocks(cr * Wd), 256, 0, STREAM>>>(v, vh, sc, T, heads, d);
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, T, T, &one, vh, CUDA_R_16F, sc * d, (long long)T * sc * d,
+                                  wh, CUDA_R_16F, T, (long long)P, &zero, oh, CUDA_R_16F, sc * d, (long long)T * sc * d, heads,
+                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    ltGemm(lnc, Fh(Bn + "gate"), g, true, cr, Cm, Wd, nullptr, false, 0.f);
+    pwaFromHeadsK<<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, g, v, sc, T, heads, d);
+    ltGemm(v, Fh(Bn + "output"), m + (size_t)s0 * T * Cm, false, cr, Wd, Cm, nullptr, false, 1.f);
   }
 }
 
