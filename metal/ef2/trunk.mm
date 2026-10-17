@@ -9,6 +9,8 @@
 // adding into the pair. The pair is float32 (a half copy through the blocks where the matrix units run); everything
 // between is float16.
 #include "ef2.h"
+#include <algorithm>
+#include <random>
 #include <type_traits>
 
 void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z) {
@@ -201,6 +203,129 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
     }
     for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
   }
+}
+
+// ---------------------------------------------------------------- the full ESMFold2's MSA encoder (cuda/ef2's msa.cuh)
+// biohub's MSAEncoder: m = embed([one-hot(33) * mask | has_deletion | deletion_value]) + project_inputs(s_inputs)[token];
+// per block pair += OPM(m), then (not the last) m += PWA(m, pair) and a SwiGLU transition, then the pair-only block. Its
+// answer replaces z_init (msa_encoder_overwrite), and neither the alignment nor z_init changes between passes, so it runs
+// once a fold, in place over z_init. Float throughout; the GEMMs as the rest of the port's (lin).
+static void msaOuterProductMean(float* pair, const float* m, const float* mask, int S, int T, int Cm, int C, const std::string& Bn) {
+  const int Hh = (int)M.meta("meta/opmHidden");
+  size_t rows = (size_t)S * T;
+  float* ln = scratch<float>("msa.ln", rows * Cm);
+  layerNorm(m, ln, rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
+  float* x = scratch<float>("msa.opmx", rows * 2 * Hh);
+  lin(ln, "f/" + Bn + "projection", x, rows, Cm, 2 * Hh);
+  float* a = scratch<float>("msa.opma", rows * Hh); float* b = scratch<float>("msa.opmb", rows * Hh);
+  run1d("ef2_opm_split", rows * Hh, OpmSplitArgs{x, mask, a, b, rows, (uint)Hh, 0});
+  float* count = scratch<float>("msa.count", (size_t)T * T);      // count[i][j] = sum_s mask[s][i] mask[s][j]
+  { Gemm g{}; g.X = mask; g.transX = true; g.W = mask; g.Y = count; g.rows = T; g.in = S; g.out = T; g.label = "msa.count"; gemm(g); }
+  size_t per = (size_t)T * (2 * Hh * Hh + C) * 4;                  // a query row's outer products and its update
+  int Bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)256 << 20) / per));
+  float* P = scratch<float>("msa.opmP", (size_t)Bi * T * Hh * Hh);
+  float* Pp = scratch<float>("msa.opmPp", (size_t)Bi * T * Hh * Hh);
+  float* X = scratch<float>("msa.opmX", (size_t)Bi * T * C);
+  for (int i0 = 0; i0 < T; i0 += Bi) {
+    int bi = std::min(Bi, T - i0);
+    // P [(i, c)][(j, e)] = sum_s a[s, i, c] b[s, j, e]: a's block of rows read transposed, [S][T H]
+    Gemm g{}; g.X = a + (size_t)i0 * Hh; g.transX = true; g.ldx = T * Hh; g.W = b; g.Y = P;
+    g.rows = (size_t)bi * Hh; g.in = S; g.out = T * Hh; g.label = "msa.opm";
+    gemm(g);
+    run1d("ef2_opm_permute", (size_t)bi * T * Hh * Hh, OpmPermuteArgs{P, Pp, (uint)bi, (uint)T, (uint)Hh, 0});
+    // (float operands: the outer products are sums over every row of the alignment - 1,024 of them - and pass half's
+    // 65504, which lin's half rounding of X turned inf at 59 tokens)
+    Gemm go{}; go.X = Pp; go.W = M.f("f/" + Bn + "output"); go.Y = X; go.rows = (size_t)bi * T; go.in = Hh * Hh; go.out = C;
+    go.label = "msa.opm.output";
+    gemm(go);
+    run1d("ef2_opm_add", (size_t)bi * T * C, OpmAddArgs{pair, X, F(Bn + "outputBias"), count, (uint)i0, (uint)bi, (uint)T, (uint)C});
+  }
+}
+static void msaPairWeightedAveraging(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn) {
+  const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
+  size_t rows = (size_t)S * T, P = (size_t)T * T;
+  float* ln = scratch<float>("msa.ln", rows * Cm);
+  layerNorm(m, ln, rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
+  float* flat = scratch<float>("msa.flat", P * heads);
+  size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
+  float* pln = scratch<float>("msa.pln", chunk * C);
+  for (size_t r0 = 0; r0 < P; r0 += chunk) {
+    size_t r = std::min(chunk, P - r0);
+    layerNorm(pair + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+    lin(pln, "f/" + Bn + "pairLogits", flat + r0 * heads, r, C, heads);
+  }
+  float* w = scratch<float>("msa.w", (size_t)heads * P);
+  run("ef2_pwa_softmax", grid1d((size_t)heads * T, 1), 256, PwaSoftmaxArgs{flat, w, (uint)T, (uint)heads});
+  // each row's own values, weighted sums, gate and output: a block of rows at a time
+  int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, ((size_t)128 << 20) / ((size_t)T * Wd * 4)));
+  float* v = scratch<float>("msa.v", (size_t)Sc * T * Wd); float* vh = scratch<float>("msa.vh", (size_t)Sc * T * Wd);
+  float* oh = scratch<float>("msa.oh", (size_t)Sc * T * Wd); float* g = scratch<float>("msa.g", (size_t)Sc * T * Wd);
+  for (int s0 = 0; s0 < S; s0 += Sc) {
+    int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
+    const float* lnc = ln + (size_t)s0 * T * Cm;
+    lin(lnc, "f/" + Bn + "value", v, cr, Cm, Wd);
+    run1d("ef2_pwa_to_heads", cr * Wd, PwaHeadsArgs{v, vh, nullptr, (uint)sc, (uint)T, (uint)heads, (uint)d});
+    // per head: O_h [i][(s, e)] = sum_j w_h[i][j] V_h[j][(s, e)]
+    Gemm gm{}; gm.X = w; gm.W = vh; gm.Y = oh; gm.rows = T; gm.in = T; gm.out = sc * d;
+    gm.batch = heads; gm.sx = (int64_t)P; gm.sw = (int64_t)T * sc * d; gm.sy = (int64_t)T * sc * d; gm.label = "msa.pwa";
+    gemm(gm);
+    lin(lnc, "f/" + Bn + "gate", g, cr, Cm, Wd);
+    run1d("ef2_pwa_from_heads", cr * Wd, PwaHeadsArgs{oh, v, g, (uint)sc, (uint)T, (uint)heads, (uint)d});
+    lin(v, "f/" + Bn + "output", m + (size_t)s0 * T * Cm, cr, Wd, Cm, 1.f);
+  }
+}
+// z_init (in, out): the encoder's pair. The alignment's rows past msaMaxDepth (1024) subsampled keeping the query and the
+// a3m's order, and 10% of the columns masked below the query - both drawn from the seed, as biohub's processor does at
+// inference; EF2_DETERMINISTIC=1 takes the first rows and masks nothing
+void msaEncode(float* zi, const float* sInputs, int T, int C, int Si, uint64_t seed) {
+  static const bool deterministic = getenv("EF2_DETERMINISTIC") != nullptr;
+  const int depth = (int)M.meta("meta/msa_depth"), Cm = (int)M.meta("meta/msaChannels");
+  const int maxDepth = (int)M.meta("meta/msaMaxDepth");
+  const float rate = deterministic ? 0.f : (float)M.meta("meta/msaColumnMaskRate");
+  std::mt19937_64 rng(seed ^ 0x4d5341ull);
+  std::vector<int> keep(depth);
+  for (int s = 0; s < depth; ++s) keep[s] = s;
+  if (depth > maxDepth) {
+    if (!deterministic) std::shuffle(keep.begin() + 1, keep.end(), rng);
+    keep.resize(maxDepth);
+    std::sort(keep.begin(), keep.end());
+  }
+  const int S = (int)keep.size();
+  const int* rowsH = M.hostI("msa/rows"); const float* delH = M.hostF("msa/deletion");
+  std::vector<int> rows((size_t)S * T); std::vector<float> del((size_t)S * T), mask((size_t)S * T, 1.f);
+  for (int s = 0; s < S; ++s)
+    for (int t = 0; t < T; ++t) { rows[(size_t)s * T + t] = rowsH[(size_t)keep[s] * T + t]; del[(size_t)s * T + t] = delH[(size_t)keep[s] * T + t]; }
+  if (S > 1 && rate > 0.f) {
+    std::uniform_real_distribution<float> u(0.f, 1.f);
+    for (int t = 0; t < T; ++t)
+      if (u(rng) < rate) for (int s = 1; s < S; ++s) mask[(size_t)s * T + t] = 0.f;
+  }
+  if (getenv("EF2_SAVE_MSA")) {                 // (a comparison aid: the rows, deletions and mask the encoder reads)
+    FILE* f = fopen(getenv("EF2_SAVE_MSA"), "wb");
+    int dims[2] = {S, T}; fwrite(dims, 4, 2, f);
+    fwrite(rows.data(), 4, rows.size(), f); fwrite(del.data(), 4, del.size(), f); fwrite(mask.data(), 4, mask.size(), f);
+    fclose(f);
+  }
+  size_t R = (size_t)S * T, P = (size_t)T * T;
+  int* rowsD = scratch<int>("msa.rows", R); float* delD = scratch<float>("msa.del", R); float* maskD = scratch<float>("msa.mask", R);
+  upload(rowsD, rows.data(), R * 4); upload(delD, del.data(), R * 4); upload(maskD, mask.data(), R * 4);
+  float* fromInputs = scratch<float>("msa.fromInputs", (size_t)T * Cm);
+  lin(sInputs, "f/msaEncoder/projectInputs", fromInputs, T, Si, Cm);
+  float* m = scratch<float>("msa.m", R * Cm);
+  run1d("ef2_msa_embed", R * Cm, MsaEmbedArgs{rowsD, delD, maskD, F("msaEncoder/embed"), fromInputs, m, R, (uint)T, (uint)Cm});
+  float* pmask = scratch<float>("msa.pmask", P);
+  run1d("ef2_fill", P, FillFArgs{pmask, P, 1.f, 0});
+  const int blocksN = (int)M.meta("meta/msaBlocks");
+  for (int b = 0; b < blocksN; ++b) {
+    std::string Bn = "msaEncoder/blocks/" + std::to_string(b) + "/";
+    msaOuterProductMean(zi, m, maskD, S, T, Cm, C, Bn + "outerProductMean/");
+    if (M.has("f/" + Bn + "pairWeightedAveraging/value")) {
+      msaPairWeightedAveraging(m, zi, S, T, Cm, C, Bn + "pairWeightedAveraging/");
+      transition(m, R, Cm, Bn + "msaTransition/", "");
+    }
+    trunkBlock(zi, pmask, T, C, "msaEncoder/blocks", b, false);
+  }
+  releaseScratch({"msa."});
 }
 
 std::vector<float> contactMap(const float* z, int T, int C) {

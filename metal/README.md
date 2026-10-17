@@ -128,9 +128,18 @@ A:D 0.608 / 0.631. int3 is the only arm that moves anything: 5CAJ ~0.1 A worse o
 (90.0 -> 93.9) at the same RMSD - a confidence it has not earned. int4 g32 is as good as int7 at two thirds of its
 size. On an M2: the language model 1.5-2.7 s (6.2 B weights expanded a GEMM at a time), the trunk 0.9 s at 68 tokens.
 
-Open: ESMFold2 itself (the MSA encoder, `meta/msaBlocks`) still refuses by name; neither model is in the worker or on
-the page; a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in,
-an int5 one of the same model loads - not chased).
+**And ESMFold2 itself, with its MSA encoder** (`msaEncode` in trunk.mm, cuda/ef2's msa.cuh): biohub/ESMFold2 at
+8fc3ff4710, its own adapter on the same 6B tower (`model-esmc-6b-full-int3`, exported with `--esmfold2` pointing at it),
+folded with `--model=ef2 --a3m=<a3m per chain>` and `<dir>/model-esmfold2-f32` linked to its bundle. Against biohub's
+own `MSAEncoder` (`tools/esmc/probe-esmfold2-msa-encoder.py`: esm 3.4.1's module on the port's z_init, s_inputs and
+rows, float32 on the CPU), 1,024 rows x 59 tokens: **8.7e-4**, the pair blocks' half floor, with the encoder held float32
+in the bundle (`quantize_af3.py --prefix-bits msaEncoder/=32`: 194 MiB against 169); at int5 it reads 5.9e-2 and the
+fold moves 0.02 A. Its outer product mean is a float GEMM, because a sum over 1,024 rows passes half's range (inf at 59
+tokens through lin's half rounding). 6MRR from its sequence: 1.563 A, pLDDT 71.4; the encoder 0.2 s, the 48-block trunk
+1.7 s at 68 tokens.
+
+Open: a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in; an
+int5 one of the same model loads, and a float32 TOWER loads - not chased).
 
 **The 300M tower's residual scale was wrong everywhere, and is derived now.** `tools/export_esmc_model.py` wrote
 residualScale 1.0 for every tower; ESM-C scales by sqrt(layers / 36), and biohub's own 300M runs 0.912871. Held against

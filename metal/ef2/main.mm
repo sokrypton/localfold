@@ -45,7 +45,6 @@ int foldInput(const Opts& o) {
     sampler.p = M.meta("meta/samplerRho"); sampler.sMin = M.meta("meta/samplerSigmaMin");
     sampler.sMax = M.meta("meta/samplerSigmaMax"); sampler.maxSigma = M.meta("meta/samplerMaxSigma");
   }
-  if (M.meta("meta/msaBlocks", 0) > 0) die("this model's MSA encoder (the released ESMFold2) is not in the native port yet");
   int T = (int)M.meta("meta/tokens");
   // the residual scale is the architecture's, sqrt(layers / 36) (esm's EsmcTransformerStack; biohub's 300M runs 0.912871):
   // derived, not read - tools/export_esmc_model.py wrote 1.0 for every tower, and the 300M bundle the registry pins
@@ -90,8 +89,19 @@ int foldInput(const Opts& o) {
   // z_init and the trunk
   float* zi = allocT<float>((size_t)T * T * C);
   zInit(T, C, sInputs, Si, parcae ? nullptr : lmZ, zi);
-  if (getenv("EF2_SAVE_ZINIT")) {
-    auto h = download(zi, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_ZINIT"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
+  auto save = [](const char* path, const float* x, size_t n) {      // (comparison aids: raw float32)
+    auto h = download(x, n); FILE* f = fopen(path, "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
+  };
+  if (getenv("EF2_SAVE_ZINIT")) {               // z_init, and beside it (".s") s_inputs - the MSA encoder's two inputs
+    save(getenv("EF2_SAVE_ZINIT"), zi, (size_t)T * T * C);
+    save((std::string(getenv("EF2_SAVE_ZINIT")) + ".s").c_str(), sInputs, (size_t)T * Si);
+  }
+  if (M.meta("meta/msaBlocks", 0) > 0) {        // the full ESMFold2: the alignment's encoder over z_init, which it replaces
+    double m0 = now();
+    msaEncode(zi, sInputs, T, C, Si, o.seed);
+    mt::sync();
+    printf("msa encoder %.1f ms (%d rows)\n", ms(m0), std::min((int)M.meta("meta/msa_depth"), (int)M.meta("meta/msaMaxDepth")));
+    if (getenv("EF2_SAVE_INJECT")) save(getenv("EF2_SAVE_INJECT"), zi, (size_t)T * T * C);
   }
   if (!parcae) { release(lmZ); lmZ = nullptr; }
   float* z = allocT<float>((size_t)T * T * C);

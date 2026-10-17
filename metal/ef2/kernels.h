@@ -25,6 +25,13 @@ struct FillFArgs { DP(float) out; u64 n; float v; uint pad; };
 struct TruncNormalArgs { DP(float) z; u64 n; u64 seed; float std; uint pad; };
 struct DropoutArgs { CP(float) in; DP(float) out; u64 n; u64 seed; u64 stream; float p; uint pad; };
 struct DecayArgs { DP(float) z; CP(float) y; CP(float) decay; u64 n; uint C, pad; };
+// the full ESMFold2's MSA encoder (trunk.mm msaEncode; cuda/ef2's msa.cuh)
+struct MsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) mask; CP(float) E; CP(float) fromInputs; DP(float) m; u64 count; uint T, C; };
+struct OpmSplitArgs { CP(float) x; CP(float) mask; DP(float) a; DP(float) b; u64 rows; uint H, pad; };
+struct OpmPermuteArgs { CP(float) P; DP(float) Pp; uint bi, T, H, pad; };
+struct OpmAddArgs { DP(float) pair; CP(float) X; CP(float) bias; CP(float) count; uint i0, bi, T, C; };
+struct PwaSoftmaxArgs { CP(float) flat; DP(float) w; uint T, heads; };
+struct PwaHeadsArgs { CP(float) in; DP(float) out; CP(float) gate; uint S, T, heads, d; };
 struct SymRowsArgs { CP(float) z; DP(float) out; u64 p0, cnt; uint T, C; };
 struct ContactsArgs { CP(float) logits; CP(int) contactBins; DP(float) out; u64 pairs; uint bins, pad; };
 struct QuantiseArgs { CP(float) x; DP(uchar) out; u64 n; float scale; uint pad; };

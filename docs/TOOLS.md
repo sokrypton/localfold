@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-361 tools. `tools/fixtures/` is data and is not listed.
+362 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -268,7 +268,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
 - **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
 
-## `tools/esmc/` - ESM-C and ESMFold2 export (21)
+## `tools/esmc/` - ESM-C and ESMFold2 export (22)
 
 The PyTorch side of the ESMFold2 port: fetching the checkpoint, probing it,
 and turning it into a bundle.
@@ -290,6 +290,7 @@ and turning it into a bundle.
 - **`probe-esmfold2-atom-attention.py`** - Inside ONE atom attention, so a 2.4e-3 residual can be localised.
 - **`probe-esmfold2-lm-pair.py`** - biohub's own language-model pair for a sequence - ESM-C's 37 (or 31, or 81) hidden states through ESMFold2's shim - written as raw float32 [T, T, P], to hold a port's (EF2_SAVE_LMZ) against it.
 - **`probe-esmfold2-modified.py`** - Does NATIVE ESMFold2 place a modified residue, where this port does not?
+- **`probe-esmfold2-msa-encoder.py`** - The full ESMFold2's MSA encoder: biohub's own module against a port's, on the port's own inputs.
 - **`probe-esmfold2-structure.py`** - What a compressed ESM-C costs the STRUCTURE, not the pair representation.
 - **`quantisation.py`** - The quantisation schemes, applied to a flat array of weights.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.

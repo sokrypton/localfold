@@ -145,6 +145,79 @@ kernel void ef2_dropout(LF_ARGS(DropoutArgs)) {
   ulong t = LF_INDEX;
   if (t < a.n) a.out[t] = ef2_uniform01(a.seed, a.stream, t) < a.p ? 0.f : a.in[t] / (1.f - a.p);
 }
+// ---------------------------------------------------------------- the full ESMFold2's MSA encoder (cuda/ef2's msa.cuh)
+// a row's one-hot where its column is live, the two deletion features always, plus the projected s_inputs
+kernel void ef2_msa_embed(LF_ARGS(MsaEmbedArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.count * a.C) return;
+  uint c = (uint)(t % a.C); ulong row = t / a.C; uint token = (uint)(row % a.T);
+  float d = a.del[row];
+  float v = a.mask[row] > 0.f ? a.E[(ulong)a.rows[row] * a.C + c] : 0.f;
+  if (d > 0.f) v += a.E[33ul * a.C + c];
+  v += 1.57079632679489662f * atan(d / 3.f) * a.E[34ul * a.C + c];
+  a.m[t] = v + a.fromInputs[(ulong)token * a.C + c];
+}
+// x [rows][a | b] times the row's mask, split into a [rows][H] and b [rows][H]
+kernel void ef2_opm_split(LF_ARGS(OpmSplitArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.rows * a.H) return;
+  ulong r = t / a.H; uint c = (uint)(t % a.H); float k = a.mask[r];
+  a.a[t] = a.x[r * 2 * a.H + c] * k; a.b[t] = a.x[r * 2 * a.H + a.H + c] * k;
+}
+// P [(i, c)][(j, e)] -> Pp [(i, j)][(c, e)]
+kernel void ef2_opm_permute(LF_ARGS(OpmPermuteArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.bi * a.T * a.H * a.H) return;
+  uint e = (uint)(t % a.H); ulong r = t / a.H; uint c = (uint)(r % a.H); r /= a.H; uint j = (uint)(r % a.T); uint i = (uint)(r / a.T);
+  a.Pp[t] = a.P[(((ulong)i * a.H + c) * a.T + j) * a.H + e];
+}
+// pair[(i0 + i) j] += (X + b) / max(count, 1)
+kernel void ef2_opm_add(LF_ARGS(OpmAddArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.bi * a.T * a.C) return;
+  uint c = (uint)(t % a.C); ulong at = (ulong)a.i0 * a.T + t / a.C;
+  a.pair[at * a.C + c] += (a.X[t] + a.bias[c]) / max(a.count[at], 1.f);
+}
+// w[h][i][j] = softmax over j of flat[(i j)][h], a threadgroup a (h, i) (every token is real: no mask)
+kernel void ef2_pwa_softmax(constant PwaSoftmaxArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  uint row = tg.y * ng.x + tg.x;
+  if (row >= a.heads * a.T) return;
+  uint h = row / a.T, i = row - h * a.T;
+  device float* out = a.w + (ulong)row * a.T;
+  threadgroup float red[8];
+  float m = -INFINITY;
+  for (uint j = tid; j < a.T; j += 256) { float v = a.flat[((ulong)i * a.T + j) * a.heads + h]; out[j] = v; m = max(m, v); }
+  m = simd_max(m);
+  if (lane == 0) red[sg] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  m = red[0]; for (int k = 1; k < 8; ++k) m = max(m, red[k]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float sum = 0;
+  for (uint j = tid; j < a.T; j += 256) { float e = exp(out[j] - m); out[j] = e; sum += e; }
+  sum = simd_sum(sum);
+  if (lane == 0) red[sg] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float tot = 0; for (int k = 0; k < 8; ++k) tot += red[k];
+  float inv = 1.f / tot;
+  for (uint j = tid; j < a.T; j += 256) out[j] *= inv;
+}
+// v [s][j][h d + e] -> [h][j][s][e]
+kernel void ef2_pwa_to_heads(LF_ARGS(PwaHeadsArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.S * a.T * a.heads * a.d) return;
+  uint e = (uint)(t % a.d); ulong r = t / a.d; uint s = (uint)(r % a.S); r /= a.S; uint j = (uint)(r % a.T); uint h = (uint)(r / a.T);
+  a.out[t] = a.in[((ulong)s * a.T + j) * a.heads * a.d + h * a.d + e];
+}
+// o [h][i][s][e] -> [s][i][h d + e], times sigmoid(gate)
+kernel void ef2_pwa_from_heads(LF_ARGS(PwaHeadsArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.S * a.T * a.heads * a.d) return;
+  uint c = (uint)(t % (a.heads * a.d)); ulong si = t / (a.heads * a.d); uint i = (uint)(si % a.T), s = (uint)(si / a.T);
+  uint h = c / a.d, e = c - h * a.d;
+  a.out[t] = a.in[(((ulong)h * a.T + i) * a.S + s) * a.d + e] / (1.f + exp(-a.gate[t]));
+}
 // z = decay * z + y, the decay per channel
 kernel void ef2_decay_update(LF_ARGS(DecayArgs)) {
   ulong t = LF_INDEX;
