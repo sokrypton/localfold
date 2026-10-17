@@ -125,6 +125,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // boundary, is what stops a caller getting it backwards.
     ...(options.dedupeSelfMsa === undefined
       ? {} : { duplicateQueryRow: options.dedupeSelfMsa === false }),
+    // ...and OpenDDE's and protenix's MSA on a ligand and on a nucleic chain's all-gap rows; see featurise.js
+    ...(options.nativeNonproteinMsa === true ? { nativeNonproteinMsa: true } : {}),
     // ...and the featuriser told its columns cover every polymer residue, not the protein ones alone
     ...(options.msaColumnKinds?.some((kind) => kind !== "protein") ? { msaCoversNucleic: true } : {}),
     msa: rows.msa,

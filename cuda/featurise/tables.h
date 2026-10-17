@@ -32,6 +32,7 @@ struct FamilyFlags {
   bool templateGapWhereNoAtoms;     // openbind0: every (slot, token) without template atoms reads GAP
   bool ccdUnknownResidue;           // openbind0: an unknown amino acid as the CCD's UNK (unkCcdConformer)
   int mainMsaCap;                   // openbind0: each chain's first N unpaired rows, deduplicated (0 none)
+  bool nativeNonproteinMsa;         // opendde, protenix: a ligand UNK in the MSA, a nucleic chain's gap rows its query
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

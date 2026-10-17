@@ -934,8 +934,8 @@ export function featuriseProtein(sequence, options = {}) {
   // own sequence to each and the model sees depth 2; boltz's featuriser - which
   // protenix, IntelliFold-2 and RoseTTAFold3 all fork or match - emits a
   // depth-1 `dummy_msa` and finds nothing to pair. Counted in the reference's
-  // own batches on 6MRR: alphafold3, openbind0 and opendde have TWO live rows
-  // and boltz2, protenix2, intellifold2 and rosettafold3 have ONE.
+  // own batches on 6MRR: alphafold3 and openbind0 have TWO live rows and
+  // boltz2, protenix2, intellifold2, rosettafold3 and opendde have ONE.
   //
   // 🔴 AND IT IS NOT COSMETIC. The outer product mean over two identical rows
   // is unchanged, but the pair-weighted averaging and the row transition are
@@ -945,10 +945,10 @@ export function featuriseProtein(sequence, options = {}) {
   // with homologs the query's second copy is what
   // `deduplicateUnpairedAgainstPaired` already removes.
   const duplicateQuery = extra.length === 0 && options.duplicateQueryRow === true;
-  const sequences = 1 + extra.length + (duplicateQuery ? 1 : 0);
-  const msa = new Int32Array(sequences * tokens);
-  const msaMask = new Float32Array(sequences * tokens).fill(1);
-  const deletionMatrix = new Float32Array(sequences * tokens);
+  let sequences = 1 + extra.length + (duplicateQuery ? 1 : 0);
+  let msa = new Int32Array(sequences * tokens);
+  let msaMask = new Float32Array(sequences * tokens).fill(1);
+  let deletionMatrix = new Float32Array(sequences * tokens);
   // 🔴 A LIGAND TOKEN IS A GAP IN THE MSA, NOT AN UNKNOWN RESIDUE. Its aatype
   // is UNK (20) but AF3 writes MSA_GAP (21) in the alignment and in the
   // profile - an alignment has nothing to say about an atom. Copying aatype
@@ -1114,6 +1114,47 @@ export function featuriseProtein(sequence, options = {}) {
   // base, whose profile the reference puts at the parent nucleotide: 28 for a 5CM, not 20)
   for (let token = 0; token < tokens; token += 1) {
     if (ownProfile(token)) profile[token * RESTYPES + queryRow[token]] = 1;
+  }
+
+  // 🔴 A SELF-MSA IS THE QUERY ONCE, for the families whose featurisers emit depth 1 (`dedupeSelfMsa`, which reaches
+  // here as `duplicateQueryRow: false`) - and not only with no alignment: an A3M of the query alone gave the query and
+  // its own copy, two identical rows, where af3-any-model's _dedupe_self_msa (and OpenDDE's and protenix's own
+  // featurisers) leave one. Only where EVERY row is the query - beside real homologs the paired block's query is the
+  // vendors' too (protenix's own 4-row A3M batch carries five rows). After the profile, which it does not change.
+  if (options.duplicateQueryRow === false && sequences > 1) {
+    let self = true;
+    for (let at = tokens; at < sequences * tokens && self; at += 1) self = msa[at] === msa[at % tokens];
+    if (self) {
+      sequences = 1;
+      msa = msa.slice(0, tokens); msaMask = msaMask.slice(0, tokens); deletionMatrix = deletionMatrix.slice(0, tokens);
+    }
+  }
+  // 🔴 OpenDDE's AND PROTENIX'S MSA ON A NON-PROTEIN TOKEN (`nativeNonproteinMsa`, af3-any-model's
+  // _native_nonprotein_msa): their featuriser fills a ligand's columns with the unknown restype in every row, the query's
+  // included, and its profile with UNK, where AlphaFold 3 writes the gap; and a nucleic chain's rows that are all gap -
+  // every row but its own beside a protein's alignment - repeat its query rather than reading as the chain absent.
+  if (options.nativeNonproteinMsa === true) {
+    for (let row = 0; row < sequences; row += 1) msa.fill(UNK_AATYPE, row * tokens + polymerTokens, (row + 1) * tokens);
+    for (let token = polymerTokens; token < tokens; token += 1) {
+      profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+      profile[token * RESTYPES + UNK_AATYPE] = 1;
+    }
+    const nucleicChains = new Map();
+    for (let token = 0; token < polymerTokens; token += 1) {
+      const residue = residueOfToken[token];
+      if (residue < 0 || residues[residue].kind === "protein") continue;
+      const chain = chainOfResidue[residue];
+      if (!nucleicChains.has(chain)) nucleicChains.set(chain, []);
+      nucleicChains.get(chain).push(token);
+    }
+    for (const chainTokens of nucleicChains.values()) {
+      for (let row = 1; row < sequences; row += 1) {
+        const base = row * tokens;
+        if (chainTokens.every((token) => msa[base + token] === MSA_GAP)) {
+          for (const token of chainTokens) msa[base + token] = msa[token];
+        }
+      }
+    }
   }
 
   // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME

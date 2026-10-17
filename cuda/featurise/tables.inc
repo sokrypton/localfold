@@ -63,14 +63,14 @@ inline int af3MsaCode(char c) { switch (c) { case 'A': return 0; case 'R': retur
 // shared/af3/dialect.js: each family's featuriser conventions (featuriserDialect) and the export's own
 inline const std::vector<FamilyFlags>& familyFlags() {
   static const std::vector<FamilyFlags> table = {
-    {"protenix2", true, true, true, false, 0, 1, false, 0, false, false, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0},
-    {"boltz2", true, true, true, false, 1, 1, false, 1, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0},
-    {"alphafold3", false, false, false, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0},
-    {"openbind0", true, true, false, false, 1, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384},
-    {"opendde", true, true, true, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0},
-    {"intellifold2", false, false, false, true, 1, 1, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0},
-    {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, true, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0},
-    {"chai1", false, false, true, false, 2, 0, false, 1, true, false, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0},
+    {"protenix2", true, true, true, false, 0, 1, false, 0, false, false, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0, true},
+    {"boltz2", true, true, true, false, 1, 1, false, 1, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0, false},
+    {"alphafold3", false, false, false, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false},
+    {"openbind0", true, true, false, false, 1, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384, false},
+    {"opendde", true, true, true, false, 0, 1, false, 0, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0, true},
+    {"intellifold2", false, false, false, true, 1, 1, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false},
+    {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, true, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0, false},
+    {"chai1", false, false, true, false, 2, 0, false, 1, true, false, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0, false},
   };
   return table;
 }

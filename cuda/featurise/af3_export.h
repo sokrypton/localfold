@@ -534,7 +534,8 @@ inline Af3Export exportAf3(const Args& args) {
   o.atomizedUnknownMsa = D.atomizedUnknownMsa; o.atomizedBackboneBonds = D.atomizedBackboneBonds;
   o.modifiedAsOneToken = D.modifiedAsOneToken;
   o.terminalAtoms = D.dropTerminalAtoms == 1 ? 1 : D.dropTerminalAtoms == 2 ? 2 : 0;
-  o.duplicateQueryRow = D.dedupeSelfMsa == 0;
+  o.duplicateQueryRow = D.dedupeSelfMsa == 0; o.queryOnce = D.dedupeSelfMsa == 1;
+  o.nativeNonproteinMsa = D.nativeNonproteinMsa;
   for (auto& k : msaColumnKinds) if (k != "protein") o.msaCoversNucleic = true;
   Batch batch = featuriseProtein(sequence, o);
   if (D.chaiMsaFeatures && !alignment.present) {

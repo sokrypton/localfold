@@ -61,6 +61,7 @@ export const ALPHAFOLD3 = Object.freeze({
   centreRefConformers: false,
   rawLastConformer: false,
   declaredPolymerBonds: null,
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -214,8 +215,9 @@ export const ALPHAFOLD3 = Object.freeze({
   // nothing to pair.
   //
   // 🔴 COUNTED IN THE REFERENCE'S OWN BATCHES, NOT INFERRED: on 6MRR,
-  // alphafold3, openbind0 and opendde carry TWO live MSA rows and boltz2,
-  // protenix2, intellifold2 and rosettafold3 carry ONE. This port gave all
+  // alphafold3 and openbind0 carry TWO live MSA rows and boltz2, protenix2,
+  // intellifold2, rosettafold3 and (since af3-any-model's dedupe_self_msa for
+  // it) opendde carry ONE. This port gave all
   // seven ONE, so the three that want two were folding a single sequence a row
   // short - and the pair-weighted averaging and the row transition are DEPTH
   // -sensitive where the outer product mean is not. Upstream measured the same
@@ -301,6 +303,7 @@ export const OPENBIND0 = Object.freeze({
   centreRefConformers: true,
   rawLastConformer: false,
   declaredPolymerBonds: null,
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   // 🔴 EVERY (SLOT, TOKEN) WITHOUT TEMPLATE ATOMS READS THE GAP RESTYPE (21): OpenFold3's
   // create_template_feature_precursor_of3 starts every slot and token as GAP and writes only what a template covers, so
@@ -452,6 +455,9 @@ export const OPENDDE = Object.freeze({
   rawLastConformer: false,
   // 🔴 DECLARED BONDS AS PROTENIX'S (a protenix fork): include_discont_poly_poly_bonds (af3-any-model 964990e)
   declaredPolymerBonds: "discontinuous",
+  // 🔴 A LIGAND READS UNK IN EVERY MSA ROW AND IN ITS PROFILE, AND A NUCLEIC CHAIN'S ALL-GAP ROWS REPEAT ITS QUERY:
+  // protenix's msa_featurizer (af3-any-model's native_nonprotein_msa), where AlphaFold 3 writes the gap. featurise.js
+  nativeNonproteinMsa: true,
   emptyTemplateAatype: 21,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -538,7 +544,11 @@ export const OPENDDE = Object.freeze({
   confidenceGlobalNorm: false,
   chiralCentres: false,
   confidenceCaDgram: false,
-  dedupeSelfMsa: false,
+  // 🔴 A SELF-MSA IS THE QUERY ONCE: OpenDDE takes protenix's featuriser, which emits a depth-1 MSA for a chain with
+  // no alignment (af3-any-model's dedupe_self_msa for opendde; the duplicate query row moved a single-sequence
+  // protein+RNA trunk to another basin, u1a pair rel 0.35 -> 0.06 against native). It was counted at two rows in
+  // the reference's batches of 2026-09; the reference has since moved. featurise.js
+  dedupeSelfMsa: true,
   dropTerminalAtoms: false,
   atomizedElementNames: false,
   atomizedUnknownRestype: false,
@@ -706,6 +716,9 @@ export const PROTENIX2 = Object.freeze({
   // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds: polymer-polymer between residues more than one
   // apart or in different chains, and a modified residue's bond to a ligand (af3-any-model 964990e). featurise.js
   declaredPolymerBonds: "discontinuous",
+  // 🔴 A LIGAND READS UNK IN EVERY MSA ROW AND IN ITS PROFILE, AND A NUCLEIC CHAIN'S ALL-GAP ROWS REPEAT ITS QUERY:
+  // protenix's msa_featurizer (af3-any-model's native_nonprotein_msa), where AlphaFold 3 writes the gap. featurise.js
+  nativeNonproteinMsa: true,
   emptyTemplateAatype: 21,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -899,6 +912,7 @@ export const BOLTZ2 = Object.freeze({
   // 🔴 EVERY DECLARED BOND BETWEEN TWO TOKENS, polymer-polymer included: Boltz-2's `bond` constraint is a token bond
   // (af3-any-model 964990e; a disulfide to a D-Cys folded 21.7 A apart without it, native 2.4). featurise.js
   declaredPolymerBonds: "all",
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -989,6 +1003,7 @@ export const INTELLIFOLD2 = Object.freeze({
   centreRefConformers: false,
   rawLastConformer: false,
   declaredPolymerBonds: null,
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -1165,6 +1180,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   // 🔴 DECLARED BONDS AS ATOMWORKS: a modified (atomised) residue's bond to a ligand kept, polymer-polymer dropped
   // (af3-any-model 964990e). featurise.js
   declaredPolymerBonds: "ligand",
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -1275,6 +1291,7 @@ export const CHAI1 = Object.freeze({
   centreRefConformers: false,
   rawLastConformer: false,
   declaredPolymerBonds: null,
+  nativeNonproteinMsa: false,
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
@@ -1418,6 +1435,7 @@ export function featuriserDialect(dialect) {
     qblockAtomKeys: dialect.qblockAtomKeys,
     dropTerminalAtoms: dialect.dropTerminalAtoms,
     dedupeSelfMsa: dialect.dedupeSelfMsa,
+    nativeNonproteinMsa: dialect.nativeNonproteinMsa,
     atomizedElementNames: dialect.atomizedElementNames,
     atomizedUnknownRestype: dialect.atomizedUnknownRestype,
     atomizedUnknownMsa: dialect.atomizedUnknownMsa,

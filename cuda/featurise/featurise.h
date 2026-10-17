@@ -42,6 +42,8 @@ struct FeaturiseOptions {
   bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK                   // 0 AlphaFold 3's own alone, 1 "all", 2 "discontinuous", 3 "ligand"
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
+  bool queryOnce = false;                         // dedupeSelfMsa true: an MSA that is all the query, one row (featurise.js)
+  bool nativeNonproteinMsa = false;               // opendde, protenix: a ligand UNK in the MSA and profile, a nucleic chain's gap rows its query
   bool atomizedElementNames = false, atomizedUnknownMsa = false;
   int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too)
   bool atomizedBackboneBonds = false, modifiedAsOneToken = false;
@@ -560,6 +562,42 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     }
   }
   for (int t = 0; t < tokens; ++t) if (ownProfile(t)) b.profile[(size_t)t * RESTYPES + queryRow[t]] = 1;
+  // a self-MSA is the query once, for the dedupeSelfMsa families: every row the query, one row (featurise.js)
+  if (o.queryOnce && sequences > 1) {
+    bool self = true;
+    for (size_t at = tokens; at < (size_t)sequences * tokens && self; ++at) self = b.msa[at] == b.msa[at % tokens];
+    if (self) {
+      sequences = 1; b.sequences = 1;
+      b.msa.resize(tokens); b.msaMask.resize(tokens); b.deletionMatrix.resize(tokens);
+    }
+  }
+  // opendde's and protenix's MSA on a non-protein token: a ligand UNK in every row and its profile, a nucleic chain's
+  // all-gap rows its query (featurise.js, af3-any-model's _native_nonprotein_msa)
+  if (o.nativeNonproteinMsa) {
+    for (int row = 0; row < sequences; ++row)
+      std::fill(b.msa.begin() + (size_t)row * tokens + polymerTokens, b.msa.begin() + (size_t)(row + 1) * tokens, UNK_AATYPE);
+    for (int t = polymerTokens; t < tokens; ++t) {
+      std::fill(b.profile.begin() + (size_t)t * RESTYPES, b.profile.begin() + (size_t)(t + 1) * RESTYPES, 0.f);
+      b.profile[(size_t)t * RESTYPES + UNK_AATYPE] = 1;
+    }
+    std::vector<int> chainOrder; std::map<int, std::vector<int>> nucleicChains;
+    for (int t = 0; t < polymerTokens; ++t) {
+      int r = b.residueOfToken[t];
+      if (r < 0 || residues[r].kind == "protein") continue;
+      int chain = chainOfResidue[r];
+      if (!nucleicChains.count(chain)) chainOrder.push_back(chain);
+      nucleicChains[chain].push_back(t);
+    }
+    for (int chain : chainOrder) {
+      const auto& ts = nucleicChains[chain];
+      for (int row = 1; row < sequences; ++row) {
+        size_t base = (size_t)row * tokens;
+        bool gap = true;
+        for (int t : ts) if (b.msa[base + t] != MSA_GAP) { gap = false; break; }
+        if (gap) for (int t : ts) b.msa[base + t] = b.msa[t];
+      }
+    }
+  }
 
   b.displayAtomNameChars = b.refAtomNameChars;
   if (o.atomizedElementNames) {

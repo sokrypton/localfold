@@ -146,6 +146,18 @@ def cases():
     pa, pd = synthetic_a3m("brs-pa", brs_a, 60, 3), synthetic_a3m("brs-pd", brs_d, 60, 4)
     m6 = synthetic_a3m("6mrr", SEQ_6MRR, 900, 5)
     deep = synthetic_a3m("deep-5caj", caj, 8000, 9)      # (past 1 MiB: the JavaScript exporter's worker-thread path)
+    # the self-MSA rule and the non-protein MSA (featurise.js dedupeSelfMsa, nativeNonproteinMsa): an alignment of the
+    # query alone - one row for the families that dedupe, two for AlphaFold 3 and OpenBind-0 - and a protein's
+    # alignment beside an RNA chain and a ligand (opendde and protenix2: the ligand UNK in every row and its profile,
+    # the RNA's all-gap rows its query)
+    query_only = os.path.join(WORK, "6mrr-query-only.a3m")
+    with open(query_only, "w") as f:
+        f.write(f">query\n{SEQ_6MRR}\n")
+    out += [
+        ("self-msa", "af3", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={query_only}"], AF3_FAMILIES),
+        ("nonprotein-msa", "af3", job("t", [protein("A", SEQ_6MRR), {"rna": {"id": "B", "sequence": "GGACUUCGGUCC"}},
+                                            {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}]), [f"--a3m={m6}"], AF3_FAMILIES),
+    ]
     AF2 = ["monomer", "multimer"]
     out += [
         ("af2-6mrr", "af2", job("t", [protein("A", SEQ_6MRR)]), [], AF2),
