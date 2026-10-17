@@ -30,8 +30,10 @@ void mem(const char* at) {
 // its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (4.06 a pair byte where its blocks run
 // half on the matrix units, 5.14 where they run float: LOCALFOLD_GEMM_TENSOR=0) - the larger stage is the peak
 static const double EF2_PAIR_SLOW = 5.3;
-static double ef2Peak(double held, double tower, double pair) {
-  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (matrixUnits() ? 4.2 : EF2_PAIR_SLOW) * pair);
+static double ef2Peak(double held, double tower, double pair, bool parcae) {
+  // (the released models' recycle: the float pair's blocks, and two pairs more - the language model's, kept for every
+  // pass, and its injection - not measured, counted)
+  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (parcae ? EF2_PAIR_SLOW + 2 : matrixUnits() ? 4.2 : EF2_PAIR_SLOW) * pair);
 }
 bool KEEP_TOWER = false;      // (--serve: the next job reads it again)
 int foldInput(const Opts& o) {
@@ -51,7 +53,8 @@ int foldInput(const Opts& o) {
   int C = e.pair;
   // the fit check (core.h foldFits): what is held now - the weights and the input - and the f32 pair times a factor
   // measured at 522 and 1044 residues (metal/README.md)
-  if (!foldFits("ef2", ef2Peak((double)allocated(), KEEP_TOWER ? 0. : (double)M.bundleWeightBytes("c"), (double)T * T * C * 4))) return 1;
+  const bool parcae = M.has("f/recycle/decay");      // (the released models: the language model's pair read every pass)
+  if (!foldFits("ef2", ef2Peak((double)allocated(), KEEP_TOWER ? 0. : (double)M.bundleWeightBytes("c"), (double)T * T * C * 4, parcae))) return 1;
   // the language model
   float* lmZ = allocT<float>((size_t)T * T * C);
   double t0 = now();
@@ -75,16 +78,17 @@ int foldInput(const Opts& o) {
   mem("language model");
   // z_init and the trunk
   float* zi = allocT<float>((size_t)T * T * C);
-  zInit(T, C, sInputs, Si, lmZ, zi);
+  zInit(T, C, sInputs, Si, parcae ? nullptr : lmZ, zi);
   if (getenv("EF2_SAVE_ZINIT")) {
     auto h = download(zi, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_ZINIT"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
   }
-  release(lmZ);
+  if (!parcae) { release(lmZ); lmZ = nullptr; }
   float* z = allocT<float>((size_t)T * T * C);
   t0 = now();
   if (o.profile) profileStart();
   int loops = getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4;
-  foldingTrunk(T, C, zi, z, loops);
+  foldingTrunk(T, C, zi, z, loops, lmZ, o.seed);
+  if (lmZ) { release(lmZ); lmZ = nullptr; }
   mt::sync();
   if (o.profile) profileReport("trunk", 25);
   printf("trunk %.1f ms\n", ms(t0));
@@ -200,7 +204,18 @@ int foldMain(int argc, char** argv) {
     return elements >= 65536;
   };
   M.loadBundle(foldBundle, "f", asHalf);
-  M.loadBundle(esmcBundle, "c", asHalf);
+  // the tower's block matrices kept as their codes and expanded a GEMM at a time where the tower as float16 would pass
+  // 4 GB (ESM-C 6B: 12.3 GB; 600M is 1.2) - LOCALFOLD_TOWER_RESIDENT=1 forces it, =0 refuses it
+  auto residentTower = [](const std::string& n, size_t) {
+    static const int forced = getenv("LOCALFOLD_TOWER_RESIDENT") ? atoi(getenv("LOCALFOLD_TOWER_RESIDENT")) : -1;
+    if (n.rfind("c/blocks/", 0) != 0) return false;
+    if (forced >= 0) return forced > 0;
+    double width = M.meta("meta/width", 0), layers = M.meta("meta/layers", 0);
+    return layers * 12 * width * width * 2 > 4e9;      // (qkv 3, attn_out 1, fc1 ~5.3, fc2 ~2.7: ~12 C^2 a block)
+  };
+  if (getenv("EF2_STARTUP")) { mt::sync(); printf("folding model up %.0f ms (%.2f GB)\n", ms(tStart), M.weightBytes() / 1e9); }
+  M.loadBundle(esmcBundle, "c", asHalf, residentTower);
+  if (getenv("EF2_STARTUP") && M.residentBytes()) printf("tower: %.2f GB resident as codes\n", M.residentBytes() / 1e9);
   if (getenv("EF2_STARTUP")) { mt::sync(); printf("weights up %.0f ms\n", ms(tStart)); }
   if (!serveDir.empty()) {
     KEEP_TOWER = true;

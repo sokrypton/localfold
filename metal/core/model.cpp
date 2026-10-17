@@ -128,16 +128,32 @@ const int* Model::hostI(const std::string& name) { const int* p = i(name); sync(
 size_t Model::bundleWeightBytes(const std::string& prefix) const {
   const std::string p = prefix + "/";
   size_t bytes = 0;
-  for (auto& [name, v] : t)
-    if (!name.compare(0, p.size(), p)) bytes += v.n * (v.madeF32 || !v.f32 ? 2 : 4);
+  for (auto& [name, v] : t) {
+    if (name.compare(0, p.size(), p)) continue;
+    auto c = codes.find(name);
+    bytes += c != codes.end() ? c->second.bytes : v.n * (v.madeF32 || !v.f32 ? 2 : 4);
+  }
   return bytes;
+}
+void Model::expand(const std::string& name, half* out) {
+  auto c = codes.find(name);
+  if (c == codes.end()) die("%s is not a resident tensor", name.c_str());
+  DecodeEntry e = c->second.e;
+  e.dst = (u64)out; e.out16 = 1; e.first = 0; e.flags = 0;
+  DecodeEntry* table = uploadNew(&e, 1);
+  DecodeArgs a{c->second.raw, table};
+  dispatch("lf_decode", &a, sizeof a, Grid{(uint32_t)std::min<size_t>(4096, (e.n + 2047) / 2048), 1, 1}, 256, 0, "resident expand");
+  release(table);
 }
 void Model::unloadBundle(const std::string& prefix) {
   auto it = bundleAllocs.find(prefix);
-  if (it == bundleAllocs.end()) die("no bundle %s to unload", prefix.c_str());
+  auto mp = bundleMaps.find(prefix);
+  if (it == bundleAllocs.end() && mp == bundleMaps.end()) die("no bundle %s to unload", prefix.c_str());
   const std::string p = prefix + "/";
   for (auto x = t.begin(); x != t.end();) {
     if (x->first.compare(0, p.size(), p)) { ++x; continue; }
+    auto rc = codes.find(x->first);
+    if (rc != codes.end()) { residentHeld -= rc->second.bytes; codes.erase(rc); x = t.erase(x); continue; }
     Tensor& v = x->second;
     // a tensor holding both forms holds one conversion made on demand: the float32 one where madeF32 says so, else
     // the float16 one
@@ -145,8 +161,8 @@ void Model::unloadBundle(const std::string& prefix) {
     weightHeld -= v.n * (v.madeF32 || !v.f32 ? 2 : 4);
     x = t.erase(x);
   }
-  for (void* b : it->second) release(b);
-  bundleAllocs.erase(it);
+  if (it != bundleAllocs.end()) { for (void* b : it->second) release(b); bundleAllocs.erase(it); }
+  if (mp != bundleMaps.end()) { sync(); for (void* m : mp->second) unmapFile(m); bundleMaps.erase(mp); }
   for (auto d = derivedW.begin(); d != derivedW.end();) {
     size_t colon = d->first.find(':');      // (a derived weight's key is "<what>:<the tensor it was made from>")
     if (colon != std::string::npos && !d->first.compare(colon + 1, p.size(), p)) { release(d->second); d = derivedW.erase(d); }
@@ -171,7 +187,8 @@ void Model::dropFloatCopies(const std::string& prefix) {
 }
 
 void Model::loadBundle(const std::string& dir, const std::string& prefix,
-                       const std::function<bool(const std::string&, size_t)>& asHalf) {
+                       const std::function<bool(const std::string&, size_t)>& asHalf,
+                       const std::function<bool(const std::string&, size_t)>& resident) {
   std::ifstream in(dir + "/manifest.json");
   if (!in) die("no %s/manifest.json", dir.c_str());
   Json m = Json::parse(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
@@ -181,7 +198,7 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
   const Json* tensors = m.get("tensors");
   if (!tensors) die("%s/manifest.json has no tensors", dir.c_str());
   // every tensor's destination: one float32 and one float16 allocation for the bundle, each tensor 16-byte aligned
-  struct Rec { std::string name; DecodeEntry e; std::string file; bool out16; };
+  struct Rec { std::string name; DecodeEntry e; std::string file; bool out16, resident = false; };
   std::vector<Rec> recs;
   size_t bytes32 = 0, bytes16 = 0;
   for (auto& [name, r] : tensors->obj) {
@@ -207,6 +224,14 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
     } else die("%s: unsupported dtype %s", rec.name.c_str(), dtype.c_str());
     rec.out16 = asHalf && asHalf(rec.name, n);
     rec.e.out16 = rec.out16;
+    rec.resident = resident && rec.e.kind >= 2 && resident(rec.name, n);   // (codes only: a float tensor is decoded)
+    if (rec.resident) {
+      Tensor x; x.shape = shape; x.n = n; x.segment = -1;
+      if (t.count(rec.name)) die("%s is in two bundles", rec.name.c_str());
+      t[rec.name] = x;
+      recs.push_back(rec);
+      continue;
+    }
     size_t& at = rec.out16 ? bytes16 : bytes32;
     at = (at + 15) / 16 * 16;
     rec.e.dst = at;
@@ -221,18 +246,33 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
   weightHeld += bytes32 + bytes16;
   for (char* b : {base32, base16}) if (b) bundleAllocs[prefix].push_back(b);
   for (auto& rec : recs) {
+    if (rec.resident) continue;
     Tensor& x = t[rec.name];
     if (rec.out16) { x.f16 = (half*)(base16 + rec.e.dst); rec.e.dst = (u64)x.f16; }
     else { x.f32 = (float*)(base32 + rec.e.dst); rec.e.dst = (u64)x.f32; }
   }
   // each shard mapped (no copy: the GPU reads it where the file is) and its tensors decoded in one dispatch
   std::map<std::string, std::vector<DecodeEntry>> byFile;
-  for (auto& rec : recs) byFile[rec.file].push_back(rec.e);
+  std::map<std::string, std::vector<const Rec*>> residentByFile;
+  for (auto& rec : recs) if (rec.resident) residentByFile[rec.file].push_back(&rec); else byFile[rec.file].push_back(rec.e);
+  for (auto& [file, list] : residentByFile) byFile[file];      // (a shard of resident tensors alone is mapped too)
   std::vector<void*> maps;
   for (auto& [file, entries] : byFile) {
     size_t n;
     void* raw = mapFile(dir + "/" + file, &n);
-    maps.push_back(raw);
+    auto rl = residentByFile.find(file);
+    if (rl != residentByFile.end()) {          // its resident tensors read where they lie: the shard stays mapped
+      bundleMaps[prefix].push_back(raw);
+      for (const Rec* r : rl->second) {
+        const DecodeEntry& e = r->e;
+        size_t codeBytes = e.kind == 2 ? e.n : (e.n * e.bits + 7) / 8, groups = (e.n + e.block - 1) / e.block;
+        size_t end = std::max<size_t>(e.src + codeBytes, std::max<size_t>(e.scale, e.zero) + 2 * groups);
+        if (end > n) die("%s/%s is shorter than its manifest says", dir.c_str(), file.c_str());
+        size_t bytes = codeBytes + groups * (e.kind == 2 ? 2 : 4);
+        codes[r->name] = Codes{(const uchar*)raw, e, bytes};
+        residentHeld += bytes;
+      }
+    } else maps.push_back(raw);
     for (auto& e : entries) {
       size_t end = e.kind == 0 ? e.src + 4 * e.n : e.kind == 1 ? e.src + 2 * e.n : e.src + (e.n * e.bits + 7) / 8;
       if (end > n) die("%s/%s is shorter than its manifest says", dir.c_str(), file.c_str());

@@ -79,16 +79,61 @@ On an M2 (10-core GPU), 2026-10-09: every case passes. Against the CUDA-translat
 🔴 **THAT TABLE IS THE EULER SAMPLER'S.** Since 2026-10-17 every AF3-lineage fold samples as the page and cuda/af3
 do (opus-55-opt's d6a37b64, docs/AF3.md "The default sampler"): the exponential update `x' = r^S x + (1 - r^S) D` on
 noise levels even in log sigma, with churn - `SamplerOptions` in af3.h. `--update=euler --schedule=karras` is
-AlphaFold 3's own and reproduces the table; `--no-churn` drops the injection; `--flow` is refused by name; chai-1
-keeps its own sampler and refuses the flags. The baselines are re-recorded on it (AF3 6MRR 0.850 A at the gate's 200
+AlphaFold 3's own and reproduces the table; `--no-churn` drops the injection; `--flow` is refused by name. chai-1
+keeps its own schedule and step, now the exponential one at its scale of 2 (opus-55-opt's 8469ca1: its 200 steps' bonds
+at 25), and takes the flags; `--update=euler` is its sampler before. The baselines are re-recorded on it (AF3 6MRR 0.850 A at the gate's 200
 steps). metal/ef2 takes the same three flags; its default stays biohub's Euler.
 
 The AF3 trunk's pair after one pass agreed with the translated port's at relRMS 8.5e-4 (single 5.6e-4) on the first
 build. `LOCALFOLD_SAVE_SEAMS=<dir>` writes AF3's stage outputs as `.f32` files for exactly that kind of comparison.
 
 chai-1's ESM2 3B tower (`metal/af3/esm2.mm`) keeps its int8 matrices resident as their codes, read where they lie in
-the mapped blob and expanded to half a GEMM at a time: the whole chai-1 fold peaks at 1.4 GB. Not ported: ESMFold2's
-released-model extras (the parcae recycle and the MSA encoder), which nothing serves; each refuses by name.
+the mapped blob and expanded to half a GEMM at a time: the whole chai-1 fold peaks at 1.4 GB.
+
+### biohub's released ESMFold2-Fast, on ESM-C 6B (2026-10-17)
+
+It folds here: the parcae recycle (`trunk.mm`, cuda/ef2's), ESM-C 6B kept RESIDENT as the page's own quantised codes
+and expanded a matrix at a time (`Model::loadBundle`'s `resident`, `Model::expand`; any tower whose float16 would pass
+4 GB, `LOCALFOLD_TOWER_RESIDENT=1` forces it), and the language model's pair in float where the tower's states are
+large (`tower.mm`: 6B's reach |a| 160-190, and a * a passed half's range - a NaN pair; 600M's and 300M's reach 29-50 and
+keep their half path byte for byte). Built from biohub's own MIT checkpoints, nothing else:
+
+```
+hf download biohub/ESMC-6B --local-dir ESMC-6B                                   # 25.4 GB, float32
+hf download biohub/ESMFold2-Fast --revision c6c7958d63 --local-dir ESMFold2-Fast  # the parcae_* layout cuda/ef2 reads
+python3 tools/export_esmc_model.py --esmc <abs>/ESMC-6B --esmfold2 <abs>/ESMFold2-Fast --out <abs>/model-esmc-6b-fast-f32
+python3 tools/quantize_af3.py --source <abs>/model-esmc-6b-fast-f32 --out <abs>/model-esmc-6b-fast-int3 --bits 3 --group 128
+python3 tools/export_esmfold2_trunk.py --esmfold2 <abs>/ESMFold2-Fast --confidence <abs>/ESMFold2-Fast/model.safetensors \
+    --out <abs>/model-esmfold2-fast-f32 && python3 tools/quantize_af3.py --source <abs>/model-esmfold2-fast-f32 --out <abs>/model-esmfold2-fast-int5
+metal/ef2/fold out.pdb --model=ef2-fast --sequence=... --weights-dir=<dir>
+```
+
+`--model=ef2-fast` (cuda/featurise/fetch.h) reads `<dir>/model-esmfold2-fast-f32` and `<dir>/model-esmc-6b-int8` by
+those names, whatever they hold: link the int5 folding bundle and the tower you want there. The exporter now reads the
+published sharded layout (q|k|v and gate|up concatenated by rows, as `esm`'s checkpoint_layout.py does) and derives the
+residual scale, sqrt(layers / 36): 1.4907 at 80 layers.
+
+**The tower at 3 bits loses almost nothing.** Six crystals x two seeds, the folding model int5 g32 in every arm, CA RMSD
+against the int7 tower (the quantiser's widest, 5.5 GB):
+
+| tower | bundle | mean abs dRMSD | worst | mean dRMSD |
+|---|---:|---:|---:|---:|
+| int7 g128 | 5.49 GB | - | - | - |
+| int5 g32 | 4.44 GB | 0.008 A | 0.043 | -0.004 |
+| int4 g32 | 3.70 GB | 0.007 A | 0.016 | -0.004 |
+| **int3 g128** (the 600M tower's recipe) | **2.46 GB** | 0.028 A | 0.117 (5CAJ) | +0.024 |
+
+int7: 6MRR 1.620 / 1.681 A, 1QYS 0.931 / 0.936, 5K9P 1.732 / 1.302, 5CAJ 1.710 / 1.779, 1TIM A 1.114 / 1.099, 1BRS
+A:D 0.608 / 0.631. int3 is the only arm that moves anything: 5CAJ ~0.1 A worse on both seeds, and 1TIM's pLDDT up 3.7
+(90.0 -> 93.9) at the same RMSD - a confidence it has not earned. int4 g32 is as good as int7 at two thirds of its
+size. On an M2: the language model 1.5-2.7 s (6.2 B weights expanded a GEMM at a time), the trunk 0.9 s at 68 tokens.
+
+Open: ESMFold2 itself (the MSA encoder, `meta/msaBlocks`) still refuses by name; neither model is in the worker or on
+the page; a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in,
+an int5 one of the same model loads - not chased); and `tools/export_esmc_model.py` had written residualScale 1.0 for
+every tower, where 300M's 30 layers make it 0.9129 - re-exported with it, 300M's folds move by 0.01 A on four crystals
+and 0.5-1.0 A on 5CAJ (which it fails either way at 7-8 A), so the shipped 300M bundle is likely off by that and
+unproven either way without biohub's forward to compare against.
 
 ## How fast
 

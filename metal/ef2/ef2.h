@@ -47,7 +47,8 @@ void trunkBlock(float* pair, const float* mask, int L, int C, const std::string&
 void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
 bool halfPairBlocks(int C);     // the blocks over a half pair here (matrix units; LOCALFOLD_HALF_PAIR=0 the control)
 // (z is given back and made again while the blocks run on a half copy: a new pointer)
-void foldingTrunk(int T, int C, const float* zInit, float*& z, int loops);
+// lmZ, seed: the released models' recycle (parcae: f/recycle/decay) reads the language model's pair every pass
+void foldingTrunk(int T, int C, const float* zInit, float*& z, int loops, const float* lmZ = nullptr, uint64_t seed = 0);
 // the page's contact map: the softmax mass under each pair's threshold - [T * T] on the host
 std::vector<float> contactMap(const float* z, int T, int C);
 

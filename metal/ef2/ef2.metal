@@ -84,6 +84,15 @@ kernel void ef2_pair_join(LF_ARGS(PairJoinArgs)) {
   a.out[(ulong)ij * 2 * a.C + c] = (half)(x * y);
   a.out[(ulong)ij * 2 * a.C + a.C + c] = (half)(x - y);
 }
+kernel void ef2_pair_join_f(LF_ARGS(PairJoinFArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.bi * a.T * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C;
+  uint ii = lf_udiv(ij, a.T), j = ij - ii * a.T, i = a.i0 + ii;
+  float x = a.s[i * a.C + c], y = a.s[j * a.C + c];
+  a.out[(ulong)ij * 2 * a.C + c] = x * y;
+  a.out[(ulong)ij * 2 * a.C + a.C + c] = x - y;
+}
 
 // ---------------------------------------------------------------- the trunk
 // z_init = rows[i] + cols[j] + relpos + bonds * w_bond + lm_z: a threadgroup a pair, a thread a channel
@@ -108,6 +117,38 @@ kernel void ef2_trigate_weight(LF_ARGS(TriGateWArgs)) {
 kernel void ef2_fill(LF_ARGS(FillFArgs)) {
   ulong t = LF_INDEX;
   if (t < a.n) a.out[t] = a.v;
+}
+// ---------------------------------------------------------------- the released models' recycle (parcae)
+// counter-based randoms, cuda/ef2's (trunk.cuh): a uniform in [0, 1) from (seed, stream, index), splitmix64 twice
+inline ulong ef2_mix64(ulong z) {
+  z += 0x9E3779B97F4A7C15ul; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul; z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+  return z ^ (z >> 31);
+}
+inline float ef2_uniform01(ulong seed, ulong stream, ulong i) {
+  return (float)(ef2_mix64(seed ^ ef2_mix64(stream * 0x100000001B3ul + i)) >> 40) * (1.f / 16777216.f);
+}
+// the initial pair state: a normal of std sqrt(2 / (5 C)) truncated at 3 std (biohub's trunc_normal_, which redraws
+// past the bounds; a Box-Muller draw redrawn the same way)
+kernel void ef2_trunc_normal(LF_ARGS(TruncNormalArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  float v = 0.f;
+  for (uint k = 0; k < 64; ++k) {
+    float u1 = max(ef2_uniform01(a.seed, 2 * k, t), 1e-7f), u2 = ef2_uniform01(a.seed, 2 * k + 1, t);
+    v = sqrt(-2.f * log(u1)) * cospi(2.f * u2);
+    if (fabs(v) <= 3.f) break;
+  }
+  a.z[t] = clamp(v, -3.f, 3.f) * a.std;
+}
+// out = dropout(in, p): zeroed with probability p, else scaled by 1 / (1 - p) (F.dropout, training=True)
+kernel void ef2_dropout(LF_ARGS(DropoutArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.out[t] = ef2_uniform01(a.seed, a.stream, t) < a.p ? 0.f : a.in[t] / (1.f - a.p);
+}
+// z = decay * z + y, the decay per channel
+kernel void ef2_decay_update(LF_ARGS(DecayArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.z[t] = a.decay[t % a.C] * a.z[t] + a.y[t];
 }
 // pair positions [p0, p0 + cnt) of z + z^T
 kernel void ef2_sym_rows(LF_ARGS(SymRowsArgs)) {

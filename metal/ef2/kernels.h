@@ -14,12 +14,17 @@ struct RopeArgs { DP(float) x; uint rows, heads, ld, pad; };
 struct SoftmaxSeqArgs { DP(float) S; CP(int) seq; uint rows; float scale; };
 struct ScatterRowsArgs { CP(float) rows; CP(int) tokenToRow; CP(float) zero; DP(float) out; uint T, C; };
 struct PairJoinArgs { CP(float) s; DP(half) out; uint T, i0, bi, C; };
+struct PairJoinFArgs { CP(float) s; DP(float) out; uint T, i0, bi, C; };   // (float: a tower whose a * a passes half's range)
 
 // ---------------------------------------------------------------- the trunk
 struct ZInitArgs { CP(float) rows; CP(float) cols; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) lmZ; DP(float) z; uint T, C; };
 // the triangle's projection and gate as gemmTriGate's one weight: channel c's (pa ga pb gb) in blocks of 8
 struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
 struct FillFArgs { DP(float) out; u64 n; float v; uint pad; };
+// the released models' recycle (parcae): the initial state, the language model's pair dropped out, the decay update
+struct TruncNormalArgs { DP(float) z; u64 n; u64 seed; float std; uint pad; };
+struct DropoutArgs { CP(float) in; DP(float) out; u64 n; u64 seed; u64 stream; float p; uint pad; };
+struct DecayArgs { DP(float) z; CP(float) y; CP(float) decay; u64 n; uint C, pad; };
 struct SymRowsArgs { CP(float) z; DP(float) out; u64 p0, cnt; uint T, C; };
 struct ContactsArgs { CP(float) logits; CP(int) contactBins; DP(float) out; u64 pairs; uint bins, pad; };
 struct QuantiseArgs { CP(float) x; DP(uchar) out; u64 n; float scale; uint pad; };

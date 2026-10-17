@@ -22,8 +22,15 @@ class Model {
  public:
   // a bundle under `prefix/`: every tensor decoded on the device, as float16 where asHalf(name, elements) says (no
   // float32 copy is made of it), float32 otherwise; the manifest's trunk / languageModel numbers as meta/<key>
+  // resident(name, elements): that tensor stays as its CODES where they lie in the mapped shard, never decoded whole -
+  // expand() decodes it to float16 for one use (ESM-C 6B: 2.5-6.4 GB of codes, 12.3 GB as float16)
   void loadBundle(const std::string& dir, const std::string& prefix,
-                  const std::function<bool(const std::string&, size_t)>& asHalf = nullptr);
+                  const std::function<bool(const std::string&, size_t)>& asHalf = nullptr,
+                  const std::function<bool(const std::string&, size_t)>& resident = nullptr);
+  bool isResident(const std::string& name) const { return codes.count(name) > 0; }
+  // a resident tensor decoded to float16 into `out` (its n elements, in the bundle's own layout)
+  void expand(const std::string& name, half* out);
+  size_t residentBytes() const { return residentHeld; }
   // a bundle through a WEIGHT WALK (cuda/featurise's af2_weights.h / af3_weights.h): the port's own tensors as `lines`
   // describe them - `b` a slice of a bundle tensor, `z` zeros, `c` literal values, `p` gathered parts (a strided view,
   // a product, integers, ones), `m` metadata - and with `deltaDir` the bundle read as a delta model's base (its
@@ -91,6 +98,10 @@ class Model {
   std::vector<Block> blocks;            // a weight walk's allocations, which compact() rebuilds without retired tensors
   std::map<std::string, std::vector<void*>> bundleAllocs;     // loadBundle's allocations by prefix (unloadBundle)
   std::map<std::string, Int8Matrix> int8s;
+  struct Codes { const uchar* raw; DecodeEntry e; size_t bytes; };
+  std::map<std::string, Codes> codes;   // a bundle's resident tensors (loadBundle's `resident`)
+  std::map<std::string, std::vector<void*>> bundleMaps;    // the shards they are read from, mapped while the bundle is
+  size_t residentHeld = 0;
   std::vector<void*> residentMaps;      // (the shards the resident matrices are read from, mapped for the process)
   std::set<std::string> retired;
   std::map<std::string, double> metaV;

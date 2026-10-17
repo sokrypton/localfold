@@ -116,13 +116,50 @@ bool halfPairBlocks(int C) {
   return halfWanted && matrixUnits() && C % 8 == 0;
 }
 
-void foldingTrunk(int T, int C, const float* zi, float*& z, int loops) {
+void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const float* lmZ, uint64_t seed) {
   size_t P = (size_t)T * T;
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});          // every token is real
-  if (M.has("f/recycle/decay")) die("this model's recycle (the released ESMFold2's parcae loop) is not in the native port yet");
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   half* xn = scratch<half>("trunk.xn", chunk * C);
+  if (M.has("f/recycle/decay")) {
+    // the released models (ESMFold2, ESMFold2-Fast), cuda/ef2's trunk.cuh: z starts as noise; each pass refines a
+    // dropped-out copy of the language model's pair through its own pair-only blocks, injects z_init plus that,
+    // LayerNorm'd and projected, into a per-channel decay of z, and runs the trunk; after the last pass the readout and
+    // the coda (biohub's modeling_esmfold2.py _run_one_loop and forward). The float pair throughout.
+    // EF2_DETERMINISTIC=1: no dropout and a zero initial state (af3-any-model's reading, for a tensor comparison)
+    if (!lmZ) die("the parcae recycle needs the language model's pair");
+    static const bool deterministic = getenv("EF2_DETERMINISTIC") != nullptr;
+    const float p = deterministic ? 0.f : (float)M.meta("meta/lmDropout");
+    const int blocksN = (int)M.meta("meta/blocks"), lmBlocks = (int)M.meta("meta/lmEncoderBlocks"),
+              codaBlocks = (int)M.meta("meta/codaBlocks");
+    if (deterministic) fill(z, 0, P * C * 4);
+    else run1d("ef2_trunc_normal", P * C, TruncNormalArgs{z, P * C, seed ^ 0x5eedull, sqrtf(2.f / (5.f * C)), 0});
+    float* inject = scratch<float>("trunk.inject", P * C);
+    float* y = scratch<float>("trunk.y", chunk * C);
+    for (int loop = 0; loop < loops; ++loop) {
+      if (p > 0.f) run1d("ef2_dropout", P * C, DropoutArgs{lmZ, inject, P * C, seed, (uint64_t)(1000 + loop), p, 0});
+      else copy(inject, lmZ, P * C * 4);
+      for (int b = 0; b < lmBlocks; ++b) trunkBlock(inject, mask, T, C, "lmEncoder/blocks", b, b + 1 < lmBlocks);
+      add(inject, zi, P * C);
+      for (size_t r0 = 0; r0 < P; r0 += chunk) {
+        size_t r = std::min(chunk, P - r0);
+        layerNorm(inject + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        Gemm g{}; g.X = xn; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16; g.Y = y; g.rows = r; g.in = C; g.out = C;
+        g.label = "recycle";
+        gemm(g);
+        run1d("ef2_decay_update", r * C, DecayArgs{z + r0 * C, y, F("recycle/decay"), r * C, (uint)C, 0});
+      }
+      for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocksN);
+    }
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {          // the readout, a chunk of rows at a time, in place
+      size_t r = std::min(chunk, P - r0);
+      lin(z + r0 * C, "f/readout", y, r, C, C);
+      copy(z + r0 * C, y, r * C * 4);
+    }
+    for (int b = 0; b < codaBlocks; ++b) trunkBlock(z, mask, T, C, "coda/blocks", b, b + 1 < codaBlocks);
+    return;
+  }
   int blocks = (int)M.meta("meta/blocks");
   // The blocks over a half pair: their updates end in bandwidth-bound GEMMs that read and write it, and half moves half
   // the bytes. Where the matrix units run (their kernels take a half residual); every residual is summed in float and
