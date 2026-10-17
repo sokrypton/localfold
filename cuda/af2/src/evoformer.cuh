@@ -589,6 +589,22 @@ __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, flo
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
   out[t] = scale == 1.f ? lt[((size_t)s * L + i) * O + c] : __float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale);
 }
+// (the bias-augmented shallow OPM, sm_12x) Lt [L][K] -> [L][K+8], ones at columns K and K+1 and zeros after; and the GEMM's
+// weight grown by 8 rows - the tiled bias as two f16 rows at K and K+1, zeros after - so the bias rides the GEMM itself
+__global__ void opmAugLeftK(const half* Lt, half* La, int L, int K) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)L * (K + 8)) return;
+  size_t j = t / (K + 8); int k = (int)(t % (K + 8));
+  La[t] = k < K ? Lt[j * K + k] : __float2half(k == K || k == K + 1 ? 1.f : 0.f);
+}
+// (two rows: the bias's f16 rounding and what that rounding left, so their f32 sum is the bias to ~2^-22)
+__global__ void opmAugBiasRowsK(const float* bt, half* tail, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= 8 * n) return;
+  if (t < n) tail[t] = __float2half(bt[t]);
+  else if (t < 2 * n) { float b = bt[t - n]; tail[t] = __float2half(b - __half2float(__float2half(b))); }
+  else tail[t] = __float2half(0.f);
+}
 // the output bias over a pair row's L positions, scaled: [L][C] of bias[c] * scale
 __global__ void tileBiasK(const float* bias, float* out, int L, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -690,7 +706,10 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
     if (rowsN <= OPM_SHALLOW) {
       const half* W = PH(Op + "/output_w", blk);           // [O*O][128] f16
-      half* T = scratch<half>("fopm.T", (size_t)O * rows * 128);
+      // (sm_12x, an f32 pair: 8 more rows, the bias rows' - see below. The bf16 pair's f32 staging rows keep the epilogue,
+      // which cuBLASLt fuses there: the augmented form was 0.1-0.6% slower at 600 and 1,000 residues)
+      const bool aug = ones && ccMajor() == 12 && !PAIR16;
+      half* T = scratch<half>("fopm.T", (size_t)O * rows * 128 + (aug ? (size_t)8 * L * 128 : 0));
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, CUDA_R_16F, 128, (long long)O * 128,
                                     rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -704,14 +723,25 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       if (ones) {
         float* bt = scratch<float>("fopm.btile", (size_t)L * 128);
         tileBiasK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(P(Op + "/output_b", blk), bt, L, 128, inv);
+        // aug (sm_12x): the bias as the GEMM's K-th row against a column of ones, where the epilogue's L * 128-long bias
+        // vector ran there as a second kernel over every chunk's output (cuBLASLt's globalKernel - on Colab's RTX PRO 6000
+        // 887 ms, 12% of a 2,500-residue pass from 8 rows); the bias two f16 rows (opmAugBiasRowsK), the product relRMS
+        // 1-4e-7 from the epilogue's (sm_120 emulated on an A100)
+        const half* La = Lt; int Ka = K; const float* gb = bt;
+        if (aug) {
+          half* la = scratch<half>("fopm.La", (size_t)L * (K + 8));
+          opmAugLeftK<<<blocks((size_t)L * (K + 8)), 256, 0, STREAM>>>(Lt, la, L, K);
+          opmAugBiasRowsK<<<blocks((size_t)8 * L * 128), 256, 0, STREAM>>>(bt, T + (size_t)K * L * 128, (size_t)L * 128);
+          La = la; Ka = K + 8; gb = nullptr;
+        }
         int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
         for (int i0 = 0; i0 < L; i0 += Bi) {
           int bi = std::min(Bi, L - i0);
-          if (!PAIR16) ltGemm(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * 128, false, bi, K, L * 128, bt, false, 1.f);
+          if (!PAIR16) ltGemm(La + (size_t)i0 * Ka, T, t.pair + (size_t)i0 * L * 128, false, bi, Ka, L * 128, gb, false, 1.f);
           else {        // (into an f32 block of rows, then added into the bf16 pair: an f16 product there moved 6MRR
                         // from a single sequence 1.898 -> 2.001 A, pLDDT 84.6 -> 81.1)
             float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
-            ltGemm(Lt + (size_t)i0 * K, T, Yb, false, bi, K, L * 128, bt, false, 0.f);
+            ltGemm(La + (size_t)i0 * Ka, T, Yb, false, bi, Ka, L * 128, gb, false, 0.f);
             addIntoPairK<__nv_bfloat16, float><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(
               reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 128);
           }
