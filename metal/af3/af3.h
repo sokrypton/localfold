@@ -159,7 +159,17 @@ void adaLn(const float* x, const float* scale, const float* shift, half* out, fl
            int ld = 0);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
-struct SamplerOptions { bool flow = false; double sigmaMax = 0; };
+// the diffusion's discretisation (cuda/af3 sampler.cuh DiffusionOptions, after Blitz): the default is the exponential
+// update x' = r^S x + (1 - r^S) D on noise levels even in log sigma, with churn - 200 Euler steps' ligand geometry at 25
+// (docs/AF3.md, "The default sampler"); --update=euler --schedule=karras is AlphaFold 3's own, for an oracle comparison
+struct SamplerOptions {
+  double sigmaMax = 0;
+  bool geometric = true, exponential = true, churn = true;
+  bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
+};
+// a SamplerOptions flag (--schedule=karras|geometric, --update=euler|exponential, --no-churn) read into `o`; false for
+// any other flag, and an unknown value refused by name
+bool samplerFlag(const char* f, SamplerOptions& o);
 extern SamplerOptions SAMPLER;
 void prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat, const Masks& masks, int n);
 // every sample's final positions [ns][atoms][3]; onStep(the denoised positions on the device, step, steps)

@@ -469,6 +469,20 @@ static double noiseSchedule(double t, double sigmaData, double sigmaMin, double 
   return sigmaData * std::pow(hi + t * (lo - hi), rho);
 }
 SamplerOptions SAMPLER;
+bool samplerFlag(const char* f, SamplerOptions& o) {
+  auto value = [&](const char* name, const char* a, const char* b, bool& set) {
+    const size_t n = strlen(name);
+    if (strncmp(f, name, n)) return false;
+    if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    return true;
+  };
+  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
+    o.given = true; return true;
+  }
+  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  return false;
+}
 // the augmentation's rotation and translation for every (step, sample), from each sample's seeded stream
 static std::vector<float> rotations(int steps, const std::vector<uint64_t>& seeds) {
   int ns = (int)seeds.size();
@@ -554,22 +568,14 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
   uint64_t* dSeeds = uploadNew(seeds.data(), ns);
   float* dMask = uploadNew(mask.data(), atoms);
   std::vector<double> levels(steps + 1);
-  if (SAMPLER.flow) {
-    // the page's Flow: one draw at the top of a schedule from 160 A, then the state REPLACED by each prediction
-    for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, 0.0004, 10, 7);
-    run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, n3, all3, (float)levels[0], 0});
-    D.plan.clear(); D.planAt = 0;
-    for (int step = 1; step <= steps; ++step) D.plan.push_back((float)levels[step - 1]);
-    for (int step = 1; step <= steps; ++step) {
-      const float* d = denoise(dX, (float)levels[step - 1]);
-      if (onStep) onStep(d, step, steps);
-      copy(dX, d, all3 * 4);
-    }
-  } else if (flag("trunk.dialect.chaiSampler")) {
+  if (flag("trunk.dialect.chaiSampler")) {
     sampleChai(steps, ns, atoms, dX, dSeeds, dMask, seeds, onStep);
   } else {
     if (SAMPLER.sigmaMax > 0) sigmaMax = SAMPLER.sigmaMax;
-    for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+    for (int k = 0; k <= steps; ++k)
+      levels[k] = SAMPLER.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
+                                    : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+    if (!SAMPLER.churn) gamma0 = 0;
     std::vector<float> rot = rotations(steps, seeds);
     float* dRot = uploadNew(rot.data(), rot.size());
     float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
@@ -586,7 +592,10 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
                                                    (uint)step, (float)injected});
       const float* d = denoise(dNoisy, tHat);
       if (onStep) onStep(d, step, steps);
-      run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)(stepScale * (level - tHat) / tHat), 0});
+      // Euler's x' = x + S (r - 1)(x - D), or the exponential x' = r^S x + (1 - r^S) D (r = level / tHat) - the
+      // same kernel, x + coef (x - D), coef r^S - 1
+      const double coef = SAMPLER.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
+      run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)coef, 0});
     }
     release(dRot);
   }

@@ -76,6 +76,13 @@ On an M2 (10-core GPU), 2026-10-09: every case passes. Against the CUDA-translat
 | ESMFold2 6MRR / 1QYS / 5CAJ / 1BRS | 1.353 / 0.865 / 2.105 / 0.912 A | 1.362 / 0.865 / 2.104 / 0.911 |
 | chai-1 6MRR / + GOL and SEP@3 (ligand bonds) | 0.976 / 1.744 A (0.075) | 1.020 / 1.733 (0.077) |
 
+🔴 **THAT TABLE IS THE EULER SAMPLER'S.** Since 2026-10-17 every AF3-lineage fold samples as the page and cuda/af3
+do (opus-55-opt's d6a37b64, docs/AF3.md "The default sampler"): the exponential update `x' = r^S x + (1 - r^S) D` on
+noise levels even in log sigma, with churn - `SamplerOptions` in af3.h. `--update=euler --schedule=karras` is
+AlphaFold 3's own and reproduces the table; `--no-churn` drops the injection; `--flow` is refused by name; chai-1
+keeps its own sampler and refuses the flags. The baselines are re-recorded on it (AF3 6MRR 0.850 A at the gate's 200
+steps). metal/ef2 takes the same three flags; its default stays biohub's Euler.
+
 The AF3 trunk's pair after one pass agreed with the translated port's at relRMS 8.5e-4 (single 5.6e-4) on the first
 build. `LOCALFOLD_SAVE_SEAMS=<dir>` writes AF3's stage outputs as `.f32` files for exactly that kind of comparison.
 

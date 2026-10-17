@@ -224,12 +224,26 @@ void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised) 
 }
 
 // ---------------------------------------------------------------- the sampler
+bool samplerFlag(const char* f, SamplerSettings& s) {
+  auto value = [&](const char* name, const char* a, const char* b, bool& set) {
+    const size_t n = strlen(name);
+    if (strncmp(f, name, n)) return false;
+    if (!strcmp(f + n, a)) set = false; else if (!strcmp(f + n, b)) set = true;
+    else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
+    return true;
+  };
+  if (value("--schedule=", "karras", "geometric", s.geometric) || value("--update=", "euler", "exponential", s.exponential)) return true;
+  if (!strcmp(f, "--no-churn")) { s.churn = false; return true; }
+  return false;
+}
 static std::vector<double> noiseSchedule(const SamplerSettings& s, double sigmaData) {
   std::vector<double> v;
   if (s.steps == 1) v = {s.sMax * sigmaData, 0};
   else {
     double hi = pow(s.sMax, 1 / s.p), lo = pow(s.sMin, 1 / s.p);
-    for (int k = 0; k < s.steps; ++k) v.push_back(sigmaData * pow(hi + (double)k / (s.steps - 1) * (lo - hi), s.p));
+    for (int k = 0; k < s.steps; ++k)
+      v.push_back(s.geometric ? sigmaData * exp(log(s.sMax) + (double)k / (s.steps - 1) * (log(s.sMin) - log(s.sMax)))
+                              : sigmaData * pow(hi + (double)k / (s.steps - 1) * (lo - hi), s.p));
     v.push_back(0);
   }
   if (s.maxSigma <= 0) return v;
@@ -316,7 +330,7 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
   float* dx = allocT<float>((size_t)A * 3); float* dd = allocT<float>((size_t)A * 3);
   int steps = (int)sched.size() - 1;
   for (int i = 0; i < steps; ++i) {
-    double sigma = sched[i], next = sched[i + 1], gamma = next > s.gammaMin ? s.gamma0 : 0;
+    double sigma = sched[i], next = sched[i + 1], gamma = s.churn && next > s.gammaMin ? s.gamma0 : 0;
     double tot = 0, c[3] = {0, 0, 0};
     for (int a = 0; a < A; ++a) { tot += mask[a]; for (int k = 0; k < 3; ++k) c[k] += mask[a] * x[a * 3 + k]; }
     for (int k = 0; k < 3; ++k) c[k] /= std::max(tot, 1.0);
@@ -339,7 +353,8 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
     if (onStep) onStep(dd, i + 1, steps);
     download(xd.data(), dd, (size_t)A * 12);
     rigidAlign(x, xd, mask, A);
-    double f = s.stepScale * (next - t) / t;
+    // (Euler's x + f (x - d) is the exponential step's r^S x + (1 - r^S) d at f = r^S - 1)
+    double f = s.exponential ? pow(next / t, s.stepScale) - 1 : s.stepScale * (next - t) / t;
     for (int k = 0; k < A * 3; ++k) x[k] = (float)(x[k] + f * (x[k] - xd[k]));
   }
   release(dx); release(dd);

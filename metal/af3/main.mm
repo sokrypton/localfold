@@ -2,7 +2,8 @@
 // weight walk (cuda/featurise/af3_weights.h).
 //
 //   localfold-af3 <input dir> --bundle=<dir> --family=<model> [--out=fold.pdb] [--steps=200] [--recycles=3]
-//                 [--samples=1] [--seed=N | --seeds=a,b] [--flow] [--sigma-max=X] [--af3-defaults]
+//                 [--samples=1] [--seed=N | --seeds=a,b] [--update=euler|exponential]
+//                 [--schedule=karras|geometric] [--no-churn] [--sigma-max=X] [--af3-defaults]
 //   localfold-af3 --job=<job.json> --out=<pdb> [--model=boltz2] ...      (featurised in this process)
 #include "af3.h"
 #include "af3_weights.h"
@@ -222,7 +223,8 @@ int foldInput(const std::string& dir, Options o) {
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
-  if (SAMPLER.flow && flag("trunk.dialect.noFlowSampler")) die("this checkpoint has no working flow sampler - fold it with diffusion");
+  if (SAMPLER.given && flag("trunk.dialect.chaiSampler"))
+    die("--schedule, --update and --no-churn are the diffusion sampler's: chai-1's sampler does not take them");
   std::vector<std::pair<uint64_t, int>> runs;
   for (uint64_t s : seeds) for (int k = 0; k < o.samples; ++k) runs.push_back({s, k});
   const size_t perBatch = std::max<size_t>(o.samples, 10);
@@ -332,7 +334,8 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--frames=", 9)) o.frames = a + 9;
     else if (!strncmp(a, "--recycle-tolerance=", 20)) o.recycleTolerance = atof(a + 20);
     else if (!strncmp(a, "--serve=", 8)) serveDir = a + 8;
-    else if (!strcmp(a, "--flow")) SAMPLER.flow = true;
+    else if (!strcmp(a, "--flow")) { fprintf(stderr, "--flow: Flow was removed - every fold samples with diffusion (docs/AF3.md, \"Flow removed\")\n"); return 1; }
+    else if (samplerFlag(a, SAMPLER)) {}
     else if (!strncmp(a, "--sigma-max=", 12)) SAMPLER.sigmaMax = atof(a + 12);
     else if (!strcmp(a, "--af3-defaults")) af3Defaults = true;
     else if (!strncmp(a, "--score-pdb=", 12)) return scorePdbMain(a + 12);
@@ -373,7 +376,7 @@ int foldMain(int argc, char** argv) {
   }
   if (getenv("LOCALFOLD_SAVE_SEAMS")) SEAM = saveSeam;
   if (!serveDir.empty()) {
-    // the job's flags: --out, --samples, --steps, --flow, --sigma-max, --frames, --recycles, --seed, --seeds
+    // the job's flags: --out, --samples, --steps, --update, --schedule, --no-churn, --sigma-max, --frames, --recycles, --seed, --seeds
     const Options o0 = o; const SamplerOptions s0 = SAMPLER;
     serveJobs("af3", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
       Options j = o0; SAMPLER = s0; j.out = "fold.pdb"; j.frames.clear();
@@ -382,7 +385,8 @@ int foldMain(int argc, char** argv) {
         if (!strncmp(a, "--out=", 6)) j.out = a + 6;
         else if (!strncmp(a, "--samples=", 10)) j.samples = atoi(a + 10);
         else if (!strncmp(a, "--steps=", 8)) j.steps = atoi(a + 8);
-        else if (!strcmp(a, "--flow")) SAMPLER.flow = true;
+        else if (!strcmp(a, "--flow")) { fprintf(stderr, "--flow: Flow was removed (docs/AF3.md, \"Flow removed\")\n"); return 1; }
+        else if (samplerFlag(a, SAMPLER)) {}
         else if (!strncmp(a, "--sigma-max=", 12)) SAMPLER.sigmaMax = atof(a + 12);
         else if (!strncmp(a, "--frames=", 9)) j.frames = a + 9;
         else if (!strncmp(a, "--recycles=", 11)) j.recycles = atoi(a + 11);

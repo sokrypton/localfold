@@ -177,6 +177,7 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--out=", 6)) o.out = a + 6;
     else if (!strncmp(a, "--seed=", 7)) o.seed = strtoull(a + 7, nullptr, 10);
     else if (!strncmp(a, "--steps=", 8)) { o.sampler.steps = atoi(a + 8); o.stepsGiven = true; }
+    else if (samplerFlag(a, o.sampler)) {}                       // --schedule=, --update=, --no-churn (diffusion.mm)
     else if (!strncmp(a, "--frames=", 9)) o.frames = a + 9;
     else if (!strncmp(a, "--serve=", 8)) serveDir = a + 8;
     else if (!strncmp(a, "--wait-input", 12)) waitInput = true;
@@ -209,6 +210,7 @@ int foldMain(int argc, char** argv) {
         if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
         else if (!f.compare(0, 7, "--seed=")) j.seed = strtoull(f.c_str() + 7, nullptr, 10);
         else if (!f.compare(0, 8, "--steps=")) { j.sampler.steps = atoi(f.c_str() + 8); j.stepsGiven = true; }
+        else if (samplerFlag(f.c_str(), j.sampler)) {}
         else if (!f.compare(0, 9, "--frames=")) j.frames = f.substr(9);
       }
       M.loadInput(input);

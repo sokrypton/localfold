@@ -1,90 +1,90 @@
 {
  "af3-1brs-template": {
-  "plddt": 95.16,
-  "ptm": "0.9393",
-  "rmsd": 0.457
+  "plddt": 95.2,
+  "ptm": "0.9403",
+  "rmsd": 0.447
  },
  "af3-5caj-template": {
-  "plddt": 95.58,
-  "ptm": "0.9560",
-  "rmsd": 0.205
+  "plddt": 95.41,
+  "ptm": "0.9553",
+  "rmsd": 0.258
  },
  "af3-6mrr": {
-  "plddt": 86.16,
-  "ptm": "0.7509",
-  "rmsd": 0.771
+  "plddt": 86.19,
+  "ptm": "0.7602",
+  "rmsd": 0.85
  },
  "af3-6mrr-gol-sep3": {
-  "ligand": 0.047,
-  "plddt": 89.86,
-  "ptm": "0.8268",
-  "rmsd": 1.492
+  "ligand": 0.048,
+  "plddt": 89.46,
+  "ptm": "0.8205",
+  "rmsd": 1.538
  },
  "af3-dna-5cm": {
   "ligand": 0.043,
-  "nucleic": 0.045,
-  "plddt": 92.72,
-  "ptm": "0.8297",
+  "nucleic": 0.044,
+  "plddt": 92.09,
+  "ptm": "0.8094",
   "rmsd": null
  },
  "af3-dna-duplex": {
-  "nucleic": 0.048,
-  "plddt": 91.66,
-  "ptm": "0.1855",
+  "nucleic": 0.053,
+  "plddt": 93.0,
+  "ptm": "0.1987",
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.023,
-  "plddt": 44.41,
-  "ptm": "0.4214",
+  "ligand": 0.02,
+  "plddt": 48.67,
+  "ptm": "0.4225",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.046,
-  "nucleic": 0.057,
-  "plddt": 75.37,
-  "ptm": "0.7527",
+  "ligand": 0.048,
+  "nucleic": 0.046,
+  "plddt": 70.19,
+  "ptm": "0.6830",
   "rmsd": null
  },
  "boltz2-6mrr": {
-  "plddt": 97.02,
-  "ptm": "0.8084",
-  "rmsd": 0.578
+  "plddt": 96.89,
+  "ptm": "0.8240",
+  "rmsd": 0.612
  },
  "chai1-6mrr": {
-  "plddt": 82.72,
-  "ptm": "0.7514",
-  "rmsd": 0.976
+  "plddt": 82.73,
+  "ptm": "0.7515",
+  "rmsd": 0.98
  },
  "chai1-6mrr-gol-sep3": {
-  "ligand": 0.075,
-  "plddt": 83.24,
-  "ptm": "0.7782",
-  "rmsd": 1.744
+  "ligand": 0.074,
+  "plddt": 83.3,
+  "ptm": "0.7786",
+  "rmsd": 1.743
  },
  "intellifold2-6mrr": {
-  "plddt": 85.19,
-  "ptm": "0.7007",
-  "rmsd": 1.539
+  "plddt": 85.22,
+  "ptm": "0.7010",
+  "rmsd": 1.709
  },
  "openbind0-6mrr": {
-  "plddt": 84.69,
-  "ptm": "0.8125",
-  "rmsd": 1.759
+  "plddt": 82.86,
+  "ptm": "0.7700",
+  "rmsd": 1.876
  },
  "opendde-6mrr": {
   "plddt": 91.82,
   "ptm": "0.7784",
-  "rmsd": 1.457
+  "rmsd": 1.644
  },
  "protenix2-6mrr": {
-  "plddt": 87.56,
-  "ptm": "0.8801",
-  "rmsd": 1.561
+  "plddt": 87.57,
+  "ptm": "0.8803",
+  "rmsd": 1.771
  },
  "rosettafold3-6mrr": {
   "plddt": 81.4,
   "ptm": "0.8037",
-  "rmsd": 1.699
+  "rmsd": 1.866
  }
 }

@@ -63,8 +63,15 @@ void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& 
 void inputsEmbedder(int T, int A, float* sInputs, int sWidth);
 
 // ---------------------------------------------------------------- the diffusion module and its sampler (diffusion.mm)
+// geometric, exponential, churn: the discretisation options metal/af3's SamplerOptions has (after Blitz) - the levels
+// evenly spaced in log sigma (the zero and max_sigma's cap kept), the step x = r^S x_noisy + (1 - r^S) d with
+// r = sigma' / t in place of Euler's, and the noise injection off. The defaults are biohub's own sampler (cuda/ef2's)
 struct SamplerSettings { int steps = 15; double sMax = 160, sMin = 4e-4, p = 8, maxSigma = 256, gamma0 = 0.605,
-                         gammaMin = 1.107, noiseScale = 0.901, stepScale = 1.638; };
+                         gammaMin = 1.107, noiseScale = 0.901, stepScale = 1.638;
+                         bool geometric = false, exponential = false, churn = true; };
+// a discretisation flag read into s (--schedule=karras|geometric, --update=euler|exponential, --no-churn); false for
+// any other flag, and an unknown value refused by name
+bool samplerFlag(const char* f, SamplerSettings& s);
 struct Denoiser {
   int T, A, Cz, Ct, heads, tokenBlocks, Si, atomBlocks;
   float sigma;

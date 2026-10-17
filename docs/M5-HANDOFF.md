@@ -1222,3 +1222,24 @@ Recomputing it per recycle, or noticing that with no template it is the embedder
 With 5a5d85e1 the M2's defaults run AF2's block in 177.4 ms (flash 30.2) and AF3's grid.project in 698 ms. Both lost
 settings are the grid.attend pattern again: a race (as `grid-attend-race.js`, remembered once a browser) would give
 the M5 back its 2.5% and 5% without costing the M2.
+
+
+## From the M2: the diffusion default from opus-55-opt (2026-10-17)
+
+`metal` now carries opus-55-opt's sampler commits (1c345cf7, f0f68f76, d6a37b64, cherry-picked): Flow is removed, and
+every AF3-lineage fold samples with **the exponential update on the geometric schedule, with churn** - the WebGPU page
+at its one dial (25 steps), cuda/af3, and now metal/af3 (`SamplerOptions` in af3.h, `samplerFlag` in diffusion.mm;
+`--update=euler --schedule=karras` is AlphaFold 3's own, `--no-churn`, `--flow` refused by name, chai-1 refuses the
+flags and keeps its own sampler). metal/ef2 takes the same three flags as options; its default is unchanged (biohub's).
+docs/AF3.md "The default sampler" has the A100's grid that decided it.
+
+**Re-record the M5's AF3 baseline** (`python3 metal/af3/gate.py --write`): `gate-baseline.m5.json` was taken on the
+Euler sampler, so every case but chai-1's will read MOVED. The M2's is re-recorded and reproduces to the digit on a
+second run. ESMFold2's gate is unchanged (8/8 ok); AF2 is untouched.
+
+On the M2 at the gate's 200 steps, against the Euler baseline (the A100's own gate moved by as much when it changed):
+af3-6mrr 0.771 -> 0.850 A, protenix2 1.561 -> 1.771, opendde 1.457 -> 1.644, rosettafold3 1.699 -> 1.866, boltz2 and af3-1brs-template ok, af3-5caj-template 0.205 -> 0.258, ligand and nucleic bonds 0.020-0.053 A everywhere (kitchen sink ligand 0.048, nucleic 0.046), kitchen-sink pLDDT 75.37 -> 70.19 (the A100 73.47 -> 74.48: one seed). At the page's 25 steps, 6MRR + GOL + SEP@3, three seeds, new against Euler/Karras: ligand bond rms boltz2 0.097/0.072/0.149 against 0.134/0.164/0.268, rosettafold3 0.062/0.082/0.198 against 0.080/0.111/0.085, openbind0 0.106/0.073/0.081 against 0.072/0.087/0.069; rosettafold3's CA RMSD 1.55-1.68 against 0.86-1.66. One target and three seeds is too few to move a default the A100 chose on 7 x 7 systems; worth a second look if the M5 sees rosettafold3 on 6MRR the same way.
+
+`test:native --offline --no-af3` passes on it (twice), but one full run lost the ef2 server once ("the ef2 server
+exited: weights up 2463 ms", nothing else in its log) on 5CAJ right after the AF2 multimer cases; that case alone and
+the full gate again both pass. Not chased yet - if the M5 sees a server exit with no error, it is this.

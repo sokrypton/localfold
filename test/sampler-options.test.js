@@ -29,7 +29,7 @@ test("one dial for every family, preferring twenty-five", () => {
 
 test("the page and the worker send steps, never a schedule start", () => {
   assert.ok(!/sigmaMax/.test(app), "web/app.js still resolves a schedule start");
-  assert.ok(!/sigma-max|sigmaMax/.test(read("../cuda/worker.py")), "cuda/worker.py still passes a schedule start");
+  assert.ok(!/sigma-max|sigmaMax/.test(read("../python/localfold/worker.py")), "python/localfold/worker.py still passes a schedule start");
 });
 
 test("the fold's default is the exponential update on the geometric schedule", () => {
