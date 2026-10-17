@@ -1239,7 +1239,10 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
     // (the row direction's GEMM accumulates into an f32 pair; a bf16 pair takes gridOutK in both directions -
     // an f16 product and an add pass were 6-10 ms slower a 494-residue fold)
-    if (!tr && !PAIR16) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
+    // (an f32 pair on sm_12x too: there cuBLASLt runs that GEMM's bias-and-accumulate epilogue as a second kernel over the
+    // pair - on Colab's RTX PRO 6000 54 calls of cublasLt's globalKernel a 2,500-residue pass, and timing its other
+    // candidates found none without it)
+    if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
     else gridOutRaw(o, w.out, ob, pair, L, 0, pairs, tr);
     return;
   }
@@ -1262,7 +1265,7 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr, nullptr, nullptr, 0, 0, false, kv8, ccMajor() == 12);
     if (f8) flash8Run(qkvg, kv8, kv8 + rows * Wp, bias, stride, o, L, H, bc, scale, nullptr);
     else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
-    if (!tr && !PAIR16) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
+    if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
     else gridOutRaw(o, w.out, ob, pair, L, b0 * L, rows, tr);
   }
 }
