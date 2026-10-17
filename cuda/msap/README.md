@@ -33,6 +33,9 @@ Options:
 - `--embeddings` adds `query.npy` [L][464] (the final MSA's query row) and `pair.npy` [L][L][256].
 - `--contacts-only` stops after layer 18: the same contacts, about 15% faster.
 - `--depth=N` sets the subsample's depth (default 512, the reference's).
+- `--cov=70 --qid=15` set the rows kept before the greedy subsample: % coverage of the query and % identity to it, counted as hhfilter counts them. The defaults are the authors' notebook's; its README example uses qid 30, which reads the same on 5CAJ, 1TIM and 5K9P.
+- `--no-query-bias` uses uniform sequence weights in the outer product (the reference's `turn_off_query_biasing`).
+- `seq_weights.npy` [layers][S] holds the outer product's sequence weights, rows in `subsample.a3m`'s order.
 - `--f32` runs every activation float32: the reference arm the oracle checks the port with, ~4x slower. The default is the fast path - f16 activations into tensor-core GEMMs with f32 accumulation, the pair bf16 (`--pair-f32` keeps only the pair f32) - called `--fast` below.
 
 ## The subsample
@@ -41,7 +44,7 @@ The reference (`MSA_Pairformer.dataset.MSA`) does two things:
 1. It runs hhfilter (`-id 90 -diff N -cov 70 -qid 30 -qsc -20`).
 2. It then greedily adds the row with the largest mean Hamming distance to the rows already chosen, until it has N rows.
 
-Here, step 1 is coverage ≥ 70% and identity to the query ≥ 30% (msa-tools' `filter`, [sokrypton/msa-tools](https://github.com/sokrypton/msa-tools)). Step 2 is the reference's own greedy, on the device with integer sums. It takes 40-72 ms for up to 21,008 rows.
+Here, step 1 is coverage ≥ 70% and identity to the query ≥ 15% (`--cov`, `--qid`; the authors' notebook's defaults) (msa-tools' `filter`, [sokrypton/msa-tools](https://github.com/sokrypton/msa-tools)). Step 2 is the reference's own greedy, on the device with integer sums. It takes 40-72 ms for up to 21,008 rows.
 
 hhfilter's `-id 90 -diff` is left out. The table is the reference model's top-L long-range Cβ contacts (|i-j| ≥ 24, Cβ < 8 Å against the crystal), with top-L/2 in brackets:
 

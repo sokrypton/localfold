@@ -178,6 +178,12 @@ __global__ void opmGateAddHK(const half* h, PT* pair, size_t rows) {
   pair[t] = fromF<PT>(toF(pair[t]) + g / (1.f + expf(-g)) * x);
 }
 // one layer's query-biased outer product: pair += SwiGLU(Linear(outer(a sqrt w, b sqrt w) / sum w))
+// The sequence weights with the query biasing off (--no-query-bias; the reference's turn_off_query_biasing): uniform
+__global__ void seqWeightsUniformK(float* w, float* sumOut, int S) {
+  for (int s = threadIdx.x; s < S; s += blockDim.x) w[s] = 1.f / S;
+  if (threadIdx.x == 0) *sumOut = S * (1.f / S);
+}
+inline bool QUERY_BIAS = true;
 // lambda = exp(sum lq1 lk1) - exp(sum lq2 lk2) + lambda_init (the host's: four 128-vectors)
 inline float opmLambda(const std::string& O, int l) {
   auto dot = [&](const char* a, const char* b) {
@@ -200,9 +206,10 @@ inline void qOpmF32(float* pair, const float* m, int S, int L, int l, float* w) 
   halvesNormK<<<(unsigned)(L * 2), 128, 0, STREAM>>>(q, L, F(O + "qNormScale"), F(O + "qNormOffset"));
   halvesNormK<<<(unsigned)(R * 2), 128, 0, STREAM>>>(k, R, F(O + "kNormScale"), F(O + "kNormOffset"));
   float* raw = scratch<float>("opm.raw", (size_t)2 * S);
-  seqScoresK<<<dim3(S, 2), dim3(32, 16), 0, STREAM>>>(q, k, raw, S, L, 1.f / sqrtf(128.f));
+  if (QUERY_BIAS) seqScoresK<<<dim3(S, 2), dim3(32, 16), 0, STREAM>>>(q, k, raw, S, L, 1.f / sqrtf(128.f));
   float* wsum = scratch<float>("opm.wsum", 1);
-  seqWeightsK<<<1, 1024, 0, STREAM>>>(raw, opmLambda(O, l), w, wsum, S);
+  if (QUERY_BIAS) seqWeightsK<<<1, 1024, 0, STREAM>>>(raw, opmLambda(O, l), w, wsum, S);
+  else seqWeightsUniformK<<<1, 256, 0, STREAM>>>(w, wsum, S);
   const size_t LC = (size_t)L * 16;
   const float one = 1.f, zero = 0.f;
   float* as = scratch<float>("opm.as", R * 16); float* bs = scratch<float>("opm.bs", R * 16);
@@ -408,9 +415,10 @@ inline void qOpmFast(float* pair, const float* m, int S, int L, int l, float* w)
   half* kab = scratch<half>("opm.kab", R * KAB);
   ltGemm(nm, Fh(O + "kab"), kab, true, R, Cm, KAB, nullptr, false, 0.f);
   float* raw = scratch<float>("opm.raw", (size_t)2 * S);
-  seqScoresHK<<<S, 256, 0, STREAM>>>(q, kab, KAB, F(O + "kNormScale"), F(O + "kNormOffset"), raw, S, L, 1.f / sqrtf(128.f));
+  if (QUERY_BIAS) seqScoresHK<<<S, 256, 0, STREAM>>>(q, kab, KAB, F(O + "kNormScale"), F(O + "kNormOffset"), raw, S, L, 1.f / sqrtf(128.f));
   float* wsum = scratch<float>("opm.wsum", 1);
-  seqWeightsK<<<1, 1024, 0, STREAM>>>(raw, opmLambda(O, l), w, wsum, S);
+  if (QUERY_BIAS) seqWeightsK<<<1, 1024, 0, STREAM>>>(raw, opmLambda(O, l), w, wsum, S);
+  else seqWeightsUniformK<<<1, 256, 0, STREAM>>>(w, wsum, S);
   const size_t LC = (size_t)L * 16;
   const float one = 1.f, zero = 0.f;
   half* as = scratch<half>("opm.ash", R * 16); half* bs = scratch<half>("opm.bsh", R * 16);
@@ -592,10 +600,13 @@ inline bool checking = false;
 
 static const char* USAGE =
   "localfold-msap --a3m=<alignment> --out=<dir> [--f32] [--depth=512] [--chain-breaks=i,j] [--weights=<dir>]\n"
-  "               [--embeddings | --contacts-only]\n"
+  "               [--embeddings | --contacts-only] [--cov=70] [--qid=15] [--no-query-bias]\n"
   "  writes <dir>/cb_contacts.npy and confind_contacts.npy [L][L], logits.npy [L][26] (the query's 26 tokens,\n"
   "  ARNDCEQGHILKMFPSTWYVXBZUO-), subsample.a3m (the rows the model read), and with --embeddings query.npy [L][464]\n"
-  "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer)\n"
+  "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer); seq_weights.npy [layers][S] the\n"
+  "  outer product's sequence weights, rows in subsample.a3m's order\n"
+  "  --cov, --qid: the rows kept before the greedy subsample, % coverage of the query and % identity to it (hhfilter's)\n"
+  "  --no-query-bias: uniform sequence weights in the outer product (the reference's turn_off_query_biasing)\n"
   "  --chain-breaks: the residue each chain after the first starts at (a ColabFold '#' header gives them)\n"
   "  --f32: every activation float32 (the reference arm, ~4x slower); --pair-f32: only the pair f32 (it is bf16 otherwise)\n"
   "  --contacts-only: stop at the last contact head's layer (19 of 22) - no logits, no embeddings\n"
@@ -604,6 +615,7 @@ static const char* USAGE =
 int main(int argc, char** argv) {
   FAST = true;                    // (the f16 path is the port; --f32 is the reference arm)
   std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false, contactsOnly = false, pairF32Flag = false;
+  float cov = 0.7f, qid = 0.15f;       // (the authors' notebook's defaults: coverage 70%, query identity 15%)
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
@@ -615,6 +627,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--contacts-only")) contactsOnly = true;
     else if (!strcmp(argv[i], "--pair-f32")) pairF32Flag = true;
     else if (!strcmp(argv[i], "--stages")) STAGE.on = true;
+    else if (!strncmp(argv[i], "--cov=", 6)) cov = (float)atof(argv[i] + 6) / 100.f;
+    else if (!strncmp(argv[i], "--qid=", 6)) qid = (float)atof(argv[i] + 6) / 100.f;
+    else if (!strcmp(argv[i], "--no-query-bias")) QUERY_BIAS = false;
     else if (!strcmp(argv[i], "--f32")) FAST = false;
     else if (!strcmp(argv[i], "--check")) checking = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeats = atoi(argv[i] + 9);
@@ -661,11 +676,12 @@ int main(int argc, char** argv) {
     breaks = al.chainBreaks;
     if (!breaksArg.empty()) { breaks.clear(); for (const char* p = breaksArg.c_str(); *p;) { breaks.push_back((int)strtol(p, (char**)&p, 10)); if (*p == ',') ++p; else break; } }
     L = (int)al.rows[0].size();
-    std::vector<int> kept = filterRows(al.rows, 0.7f, 0.3f);
+    std::vector<int> kept = filterRows(al.rows, cov, qid);
     std::vector<int> rows = greedyRows(al.rows, kept, maxDepth);
     S = (int)rows.size();
     for (int k : rows) { subsample.push_back(al.rows[k]); for (char c : al.rows[k]) tokens.push_back(msapToken(c)); }
-    printf("msap: %zu rows, %zu past coverage 70%% and query identity 30%%, %d chosen\n", al.rows.size(), kept.size(), S);
+    printf("msap: %zu rows, %zu past coverage %.0f%% and query identity %.0f%%, %d chosen\n", al.rows.size(), kept.size(), cov * 100,
+           qid * 100, S);
   }
   for (int b : breaks) if (b <= 0 || b >= L) { fprintf(stderr, "a chain break at %d is outside 1..%d\n", b, L - 1); return 1; }
   const int C = 256, Cm = 464;
@@ -684,7 +700,7 @@ int main(int argc, char** argv) {
   float* m = dalloc(R * Cm);
   float* z = PAIR_BF16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(P * C)) : dalloc(P * C);
   float* pmask = dalloc(P); fillK<<<blocks(P), 256, 0, STREAM>>>(pmask, 1.f, P);
-  float* w = dalloc(S); float* cb = dalloc(P); float* cf = dalloc(P); float* logits = dalloc((size_t)L * 26);
+  float* wAll = dalloc((size_t)depth * S); float* cb = dalloc(P); float* cf = dalloc(P); float* logits = dalloc((size_t)L * 26);
   for (int rep = 0; rep < repeats; ++rep) {
   CK(cudaStreamSynchronize(STREAM));
   t0 = std::chrono::steady_clock::now();
@@ -704,6 +720,7 @@ int main(int argc, char** argv) {
     if (FAST) msaTransitionFast(m, R, Cm, B + "msaTransition/"); else rowsTransition(m, R, Cm, B + "msaTransition/");
     STAGE.end();
     if (l == 0) CHECK("l0 after msa transition", m, R * Cm, "o/layer0/afterMsaTransition");
+    float* w = wAll + (size_t)l * S;            // (each layer's sequence weights kept: seq_weights.npy)
     STAGE.begin("query-biased opm"); qOpm(z, m, S, L, l, w); STAGE.end();
     CHECK(("l" + std::to_string(l) + " seq weights").c_str(), w, S, Lo + "seqWeights");
     if (l == 0 && checking && !PAIR_BF16) {
@@ -745,6 +762,8 @@ int main(int argc, char** argv) {
     mkdir(out.c_str(), 0755);
     writeNpy(out + "/cb_contacts.npy", download(cb, P), { (size_t)L, (size_t)L });
     writeNpy(out + "/confind_contacts.npy", download(cf, P), { (size_t)L, (size_t)L });
+    const int wl = contactsOnly ? std::max(cbLayer, cfLayer) + 1 : depth;
+    writeNpy(out + "/seq_weights.npy", download(wAll, (size_t)wl * S), { (size_t)wl, (size_t)S });
     if (!contactsOnly) writeNpy(out + "/logits.npy", download(logits, (size_t)L * 26), { (size_t)L, 26 });
     if (embeddings) {
       writeNpy(out + "/query.npy", download(m, (size_t)L * Cm), { (size_t)L, (size_t)Cm });

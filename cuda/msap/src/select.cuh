@@ -3,7 +3,7 @@
 // The reference (MSA_Pairformer.dataset.MSA) removes insertions (lowercase, '.', '*'), keeps the query first, then
 // subsamples with hhfilter -id 90 -diff N -cov 70 -qid 30 -qsc -20 and greedily to N by the mean Hamming distance
 // to the rows already chosen. Here the hhfilter stage is msa-tools' (github.com/sokrypton/msa-tools) filter -
-// coverage and identity to the query (filterRows) - and the greedy stage is the reference's own (msap.cu:
+// coverage and identity to the query (filterRows, hhfilter's -cov -qid) - and the greedy stage is the reference's own (msap.cu:
 // greedyRows, on the device).
 #pragma once
 #include <algorithm>
@@ -60,26 +60,27 @@ inline Alignment readA3m(const std::string& path) {
   return a;
 }
 
-// The rows the greedy stage chooses from: coverage of the query's columns and identity to the query over the columns
-// both cover - hhfilter's -cov 70 -qid 30 (msa-tools' filter -cov -qid), the query always first. hhfilter's -id 90
-// and -diff are left out: measured with the reference model on 5CAJ, 1TIM and 5K9P (Cb contacts, top-L long range
-// against the crystal) the reference's subsample reads 0.885 / 0.891 / 0.853 and this one with the greedy stage
-// after it 0.854 / 0.895 / 0.813 (top-L/2: 0.946 / 0.959 / 0.892 against 0.954 / 0.943 / 0.919), where the
-// alignment's first 512 rows read 0.724 / 0.781 / 0.240 - the greedy stage does the selecting, and a redundancy cut
-// before it is quadratic in the depth (10,836 rows of 1TIM's 16,469 kept, 134 s in numpy)
+// The rows the greedy stage chooses from: coverage of the query's columns and identity to the query over the row's own
+// residues (a query gap a difference) - hhfilter's -cov and -qid, the query always first. The authors' notebook
+// (MSA_Pairformer_with_MMseqs2.ipynb) defaults to 70 and 15, the README's example to 70 and 30. hhfilter's -id 90 and
+// -diff are left out: measured with the reference model on 5CAJ, 1TIM and 5K9P (Cb contacts, top-L long range against
+// the crystal) the reference's subsample reads 0.885 / 0.891 / 0.853 and this one with the greedy stage after it
+// 0.858 / 0.895 / 0.813 at qid 15 and 30 alike, where the alignment's first 512 rows read 0.724 / 0.781 / 0.240 - the
+// greedy stage does the selecting, and a redundancy cut before it is quadratic in the depth (10,836 rows of 1TIM's
+// 16,469 kept, 134 s in numpy)
 inline std::vector<int> filterRows(const std::vector<std::string>& rows, float cov, float qid) {
   const int n = (int)rows.size(), L = (int)rows[0].size();
   const std::string& q = rows[0];
   std::vector<int> keep{0};
   for (int k = 1; k < n; ++k) {
     const std::string& s = rows[k];
-    int nongap = 0, both = 0, same = 0;
+    int nongap = 0, same = 0;
     for (int i = 0; i < L; ++i) {
       if (s[i] == '-') continue;
-      ++nongap;
-      if (q[i] != '-') { ++both; same += s[i] == q[i]; }
+      ++nongap; same += s[i] == q[i];
     }
-    if (nongap < cov * L || same < qid * std::max(both, 1)) continue;
+    // (identity over the row's own residues, a query gap counting as a difference: hhfilter's -qid)
+    if (nongap < cov * L || same < qid * std::max(nongap, 1)) continue;
     keep.push_back(k);
   }
   return keep;
