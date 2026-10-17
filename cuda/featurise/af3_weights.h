@@ -179,6 +179,9 @@ inline void embedderWeights(Walk& w, const std::string& p) {
     T(".positionActivationsBias", "~_relative_encoding/position_activations/bias");
     T(".msaActivationsBias", "msa_activations/bias");
   }
+  // chai1's blob revision 3: RelativeChain/RelativeEntity rows and the trunk half of the declared-bond projection
+  w.wholeIfPresent(p + ".chaiChainEntity", EVO + "/chai1_chain_entity");
+  w.wholeIfPresent(p + ".chaiBondTrunk", EVO + "/chai1_bond_trunk/weights");
   if (w.S.has(EVO + "/token_bonds_type_embed/weights")) {
     T(".tokenBondsTypeEmbed", "token_bonds_type_embed/weights");
     T(".contactEncodingUnspecified", "contact_encoding_unspecified");
@@ -684,6 +687,7 @@ inline void targetFeatureWeights(Walk& w, const std::string& p, const Dialect& d
            {"msaProfileWeights", "msa_profile_embedding/weights"}, {"esmWeights", "esm_embedding/weights"},
            {"singleProjInTrunk", "single_proj_in_trunk/weights"}, {"singleProjInStructure", "single_proj_in_structure/weights"}})
       w.whole(e + ".chaiToken." + path, "diffuser/chai1_" + name);
+    w.wholeIfPresent(e + ".chaiToken.dx", "diffuser/chai1_token_dx");
   }
   w.num(e + ".trunkSingleChannels", 384); w.num(e + ".trunkPairChannels", 128);
   w.zeros(e + ".lnormTrunkSingleCondScale", 384); w.zeros(e + ".embedTrunkSingleCond", 384 * 128);

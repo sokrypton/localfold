@@ -213,6 +213,9 @@ const FIELDS = {
   ref_space_uid: (b) => b.refSpaceUid,
   ref_pos: (b) => b.refPos,
   pred_dense_atom_mask: (b) => b.predDenseAtomMask,
+  // chai1's declared-bond feature (absent on our side with no bond declared: all zeros) - compared as a DIRECTED
+  // edge set below, the reference's matrix being padded to its token bucket
+  declared_bonds: (b) => b.declaredBondMatrix ?? new Float32Array(b.tokens * b.tokens),
 };
 const GATHERS = {
   "queries_to_keys": (b) => b.queriesToKeys,
@@ -386,6 +389,12 @@ for (const target of Object.keys(TARGETS)) {
       }
       if (other !== 0) bad.push(`aatype: ${other} tokens differ that are not an atomised residue's`);
       if (atomised !== 0) floor.push(`aatype: ${atomised} atomised-residue tokens unknown (chai-lab's gemmi X) where the reference has the parent`);
+      continue;
+    }
+    if (name === "declared_bonds") {
+      const edges = (m, n) => { const e = []; for (let k = 0; k < m.length; k += 1) if (Number(m[k]) !== 0) e.push(`${Math.floor(k / n)}>${k % n}`); return e.sort(); };
+      const a = edges(ours, batch.tokens).join(" "), b = edges(theirs, Math.round(Math.sqrt(theirs.length))).join(" ");
+      if (a !== b) bad.push(`declared_bonds: ours [${a}] theirs [${b}]`);
       continue;
     }
     // 🔴 COMPARE THE OVERLAP AND SAY SO. Their atom axis is the dense grid and

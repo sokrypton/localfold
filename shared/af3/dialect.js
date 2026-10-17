@@ -64,6 +64,10 @@ export const ALPHAFOLD3 = Object.freeze({
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  // chai-1's TokenBondRestraint (af3-any-model 1f9b3cf `_declared_bond_feature`): a directed token x token 0/1
+  // matrix, [from][to] for every declared bond of every kind and nothing else, read by the trunk and the
+  // diffusion pair through the two halves of its bond projection. The featuriser's `declaredBondMatrix`.
+  declaredBondFeature: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -310,6 +314,7 @@ export const OPENBIND0 = Object.freeze({
   // 🔴 AN UNKNOWN AMINO ACID IS THE CCD's UNK (N CA C O CB CG), where AlphaFold 3 builds GLY (OpenFold3's featuriser;
   // af3-any-model b84aa69: unk_residues 10.6 -> 1.2 A). reference-conformers-unk.js
   ccdUnknownResidue: true,
+  declaredBondFeature: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
   // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
   mainMsaCap: 16384,
@@ -455,6 +460,7 @@ export const OPENDDE = Object.freeze({
   emptyTemplateAatype: 21,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -709,6 +715,7 @@ export const PROTENIX2 = Object.freeze({
   emptyTemplateAatype: 21,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -902,6 +909,7 @@ export const BOLTZ2 = Object.freeze({
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -992,6 +1000,7 @@ export const INTELLIFOLD2 = Object.freeze({
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1168,6 +1177,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1278,6 +1288,7 @@ export const CHAI1 = Object.freeze({
   emptyTemplateAatype: null,
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
+  declaredBondFeature: true,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1311,9 +1322,12 @@ export const CHAI1 = Object.freeze({
   chiralCentres: false,
   confidenceCaDgram: false,
   dedupeSelfMsa: false,
-  dropTerminalAtoms: "protein",
+  // (no OXT and, since af3-any-model 1f9b3cf, no 5' OP3 either: chai-lab's conformers carry neither)
+  dropTerminalAtoms: true,
   atomizedElementNames: false,
-  atomizedUnknownRestype: true,
+  // (chai-lab's DX/RX: a modified NUCLEOTIDE's atomised tokens read the unknown nucleotide, 30, which the r3 blob's
+  // DX row tells apart on DNA - af3-any-model 1f9b3cf; an amino acid's read 20, as `true`)
+  atomizedUnknownRestype: "chai",
   atomizedUnknownMsa: true,
   atomizedBackboneBonds: false,
   modifiedAsOneToken: false,
@@ -1413,6 +1427,7 @@ export function featuriserDialect(dialect) {
     rawLastConformer: dialect.rawLastConformer,
     declaredPolymerBonds: dialect.declaredPolymerBonds,
     ccdUnknownResidue: dialect.ccdUnknownResidue,
+    declaredBondFeature: dialect.declaredBondFeature,
     mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,

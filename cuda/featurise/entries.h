@@ -103,6 +103,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
     if (withBondMatrix) e.t(p + "bondMatrix", b.bondMatrix);
     e.t(p + "bondOrderMatrix", b.bondOrderMatrix);
   }
+  if (!b.declaredBondMatrix.empty()) e.t(p + "declaredBondMatrix", b.declaredBondMatrix);
   if (b.ligandSpans.empty()) e.empty(p + "ligandSpans");
   for (size_t k = 0; k < b.ligandSpans.size(); ++k) {
     const auto& s = b.ligandSpans[k];

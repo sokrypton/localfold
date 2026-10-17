@@ -479,6 +479,11 @@ export async function embedderWeights(store) {
       positionActivationsBias: await T("~_relative_encoding/position_activations/bias"),
       msaActivationsBias: await T("msa_activations/bias"),
     }),
+    // chai1's blob revision 3 (af3-any-model 1f9b3cf): its RelativeChain and RelativeEntity rows [9, pair] - the bias
+    // above holds them at their single-chain classes only - and the trunk half of its declared-bond projection [1, pair].
+    // Absent from revision 2, where they read as zero (as af3-any-model's loader zero-fills them)
+    ...(hasTensor(store, `${EVO}/chai1_chain_entity`) ? { chaiChainEntity: await T("chai1_chain_entity") } : {}),
+    ...(hasTensor(store, `${EVO}/chai1_bond_trunk/weights`) ? { chaiBondTrunk: await T("chai1_bond_trunk/weights") } : {}),
     // 🔴 boltz2's z-INIT CARRIES TWO MORE TERMS AND BOTH CONTRIBUTE ON EVERY
     // INPUT. `token_bonds_type_embed` is an nn.Embedding over bond ORDER whose
     // row 0 - "no bond" - is a learned NONZERO vector, and

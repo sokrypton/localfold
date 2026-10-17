@@ -104,7 +104,7 @@ inline std::function<void(const float*, size_t, size_t)> PAIR_CHUNK_SINK;
 // (chai-lab chai1.py, token_pair_structure_input_feats), the 163 generator columns through the structure half of
 // its projection - docking (class 5: none), relative chain (the dense sym-id rank, 2 +- 2, or 5 across entities),
 // relative entity (the dense entity rank, 1 +- 1), the residue and token separations (as the trunk's), the two
-// restraints at their masked column - plus a bond term from the token bond matrix
+// restraints at their masked column - plus a bond term from the declared-bond matrix (declaredBondMatrix)
 __global__ void chaiStructurePairK(const float* trunkPair, int Czt, const int* residueIndex, const int* tokenIndex,
                                    const int* asymId, const int* entityRank, const int* symRank, const float* Wp,
                                    const float* bias, const float* bonds, const float* Wb, float* out, int n, int Cz,
@@ -223,7 +223,7 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
         chaiStructurePairK<<<blocks(r * width), 256, 0, STREAM>>>(trunkPair, Czt, Idev("batch.features.residueIndex"),
           Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), denseRank("batch.features.entityId"),
           denseRank("batch.features.symId"), W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
-          M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, n, Cz, p0, r);
+          M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, n, Cz, p0, r);
       } else if (!split && !relpe) features(f2, Czt);
       else {
         float* relRows = scratch<float>("dc.rel", per * rel);

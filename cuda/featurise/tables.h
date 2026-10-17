@@ -17,7 +17,7 @@ struct FamilyFlags {
   bool symmetriseBonds, centreRefConformers, paddedAtomKeys, qblockAtomKeys;
   int dropTerminalAtoms;            // 0 keep, 1 drop (terminalAtoms: false), 2 the protein's only ("nucleic")
   int dedupeSelfMsa;                // -1 undefined, 0 false (duplicate the query row), 1 true
-  bool atomizedElementNames; int atomizedUnknownRestype;   // 0 false, 1 true (an amino acid's), 2 "nucleic" (a base's too)
+  bool atomizedElementNames; int atomizedUnknownRestype;   // 0 false, 1 true (an amino acid's), 2 "nucleic" (a base's too), 3 "chai" (a base's 30)
   bool atomizedUnknownMsa, atomizedBackboneBonds;
   bool modifiedAsOneToken, chaiMsaFeatures;
   int fusedDistogramBins, fusedRestypes;   // fusedTemplateLayout, 0 when absent
@@ -32,6 +32,7 @@ struct FamilyFlags {
   bool templateGapWhereNoAtoms;     // openbind0: every (slot, token) without template atoms reads GAP
   bool ccdUnknownResidue;           // openbind0: an unknown amino acid as the CCD's UNK (unkCcdConformer)
   int mainMsaCap;                   // openbind0: each chain's first N unpaired rows, deduplicated (0 none)
+  bool declaredBondFeature;         // chai1: every declared bond as its own directed token matrix (declaredBondMatrix)
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

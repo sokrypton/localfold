@@ -244,10 +244,23 @@ Where this port leaves af3-any-model for chai-lab, measured each time:
   same-ref-space mask in place before attending. The two agree wherever a token is a residue (6MRR, a
   nucleic acid) and the token rule blinds a ligand's atoms to each other: glycerol 0.29 -> 0.053 A bond
   rms, ATP 0.27 -> 0.058.
-- **An atomised residue's tokens are unknown** (gemmi's fasta code, X for SEP): a phosphoserine
+- **An atomised residue's tokens are unknown** (gemmi's fasta code, X for SEP; a modified base's the unknown nucleotide): a phosphoserine
   0.21 -> 0.074 A from the int8 blob, inside chai-lab's 0.054-0.089.
 - **No token-bond term**: chai-lab's carries declared covalent bonds alone, so an ordinary ligand's is
-  zero, and a declared one (`bondedAtomPairs`, a glycan) is refused until its trunk weights are exported.
+  zero. A declared one (`bondedAtomPairs`, a glycan) is the featuriser's `declaredBondMatrix` - every declared
+  bond, [from][to] in the job's direction - through both halves of chai's bond projection (blob revision 3's
+  `chai1_bond_trunk` into the trunk pair, `chai1_structure_bond` into the diffusion's).
+
+**Blob revision 3** (af3-any-model 1f9b3cf; Hugging Face e9da26e6, `cuda/featurise/fetch.h` - a cached blob
+remembers its commit in `.source`, and r2's is refetched) adds three rows revision 2 left out, read as zero
+where absent: chai's RelativeChain/RelativeEntity (`chai1_chain_entity`, which revision 2's bias held at the
+single-chain classes only), its DX restype (`chai1_token_dx`, on a DNA token reading the unknown nucleotide, 30,
+which an atomised base now is: `atomizedUnknownRestype: "chai"`) and the bond-trunk row. With them, single
+sequence and ESM2, against af3-any-model's own r3 fold: TetR dimer + tetO DNA **15.6 -> 1.5-1.7 A**
+(pLDDT 85.2 -> 87.2, the reference's 87.3); methylated DNA pLDDT 75.7 -> 80.6 (the reference's 80.0); KRAS +
+sotorasib, covalently bonded, inside the reference's own five-sample spread (SG-C25 1.65 A). Its batch is
+exact against 3.1.16 on 6MRR, GOL+SEP, 5CM DNA and the kitchen sink but for the conformer floor (no 5' OP3
+now either, `dropTerminalAtoms: true`).
 - The diffusion's pair input (chai's structure token-pair features) and the confidence head's single. The
   first is fixed in af3-any-model as well (its c38fec3); the attention mask and the unknown restype in its
   4ec4850.

@@ -39,11 +39,12 @@ struct FeaturiseOptions {
   bool symmetriseBonds = false, centreRefConformers = false, paddedAtomKeys = false, qblockAtomKeys = false;
   bool rawLastConformer = false;
   int declaredPolymerBonds = 0;
-  bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK                   // 0 AlphaFold 3's own alone, 1 "all", 2 "discontinuous", 3 "ligand"
+  bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK
+  bool declaredBondFeature = false;               // chai1: every declared bond, [from][to], in declaredBondMatrix
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool atomizedElementNames = false, atomizedUnknownMsa = false;
-  int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too)
+  int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too), 3 "chai" (a base's 30)
   bool atomizedBackboneBonds = false, modifiedAsOneToken = false;
   // the alignment's rows (msa-features.js)
   std::vector<std::vector<int>> msa;
@@ -64,6 +65,7 @@ struct Batch {
   std::vector<float> refPos, refMask; std::vector<int> refElement; std::vector<float> refCharge;
   std::vector<int> refAtomNameChars, refSpaceUid, displayAtomNameChars;
   bool hasBonds = false; std::vector<float> bondMatrix, bondOrderMatrix;
+  std::vector<float> declaredBondMatrix;           // chai1's declared-bond feature, empty when there is none
   std::vector<LigandSpan> ligandSpans; std::vector<ModifiedSpan> modifiedSpans;
   std::vector<int> residueOfToken; std::vector<float> chainOfResidue;
   std::vector<int> isDna, isRna, isLigand, isModified;
@@ -293,8 +295,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     b.modifiedSpans.push_back({token, (int)M.atoms.size(), M.code, residue, M.atoms, M.bonds, false});
     for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
       const CompAtom& s = M.atoms[atom];
-      setToken(token, o.atomizedUnknownRestype == 2 || (o.atomizedUnknownRestype == 1 && R.kind == "protein") ? UNK_AATYPE
-                                                                                                    : parentAatype(R.kind, R.code),
+      setToken(token, o.atomizedUnknownRestype == 2 || ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && R.kind == "protein") ? UNK_AATYPE
+                      : o.atomizedUnknownRestype == 3 ? 30 : parentAatype(R.kind, R.code),
                number, asym, entity, sym, residue);
       int flat = token * DENSE;
       setAtom(flat, s.element, s.charge, s.x, s.y, s.z);
@@ -405,6 +407,10 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     std::string where = "bond " + std::to_string(i + 1);
     const BondEnd &f = o.bonds[i].from, &t = o.bonds[i].to;
     const int from = tokenOfEndpoint(f, where + " from"), to = tokenOfEndpoint(t, where + " to");
+    if (o.declaredBondFeature) {
+      if (b.declaredBondMatrix.empty()) b.declaredBondMatrix.assign((size_t)tokens * tokens, 0);
+      b.declaredBondMatrix[(size_t)from * tokens + to] = 1;
+    }
     const bool fl = isLigandEnd(f), tl = isLigandEnd(t);
     bool added;
     if (fl && tl) added = false;
@@ -479,7 +485,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   b.msaMask.assign((size_t)sequences * tokens, 1);
   b.deletionMatrix.assign((size_t)sequences * tokens, 0);
   std::vector<int> queryRow = b.aatype;
-  if (o.atomizedUnknownRestype == 1 && !o.atomizedUnknownMsa)
+  if ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && !o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) {
       int parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (int at = 0; at < span.count; ++at) queryRow[span.from + at] = parent;

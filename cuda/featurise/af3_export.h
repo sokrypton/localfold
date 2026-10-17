@@ -528,7 +528,7 @@ inline Af3Export exportAf3(const Args& args) {
   }
   o.symmetriseBonds = D.symmetriseBonds; o.centreRefConformers = D.centreRefConformers;
   o.rawLastConformer = D.rawLastConformer; o.declaredPolymerBonds = D.declaredPolymerBonds;
-  o.ccdUnknownResidue = D.ccdUnknownResidue;
+  o.ccdUnknownResidue = D.ccdUnknownResidue; o.declaredBondFeature = D.declaredBondFeature;
   o.paddedAtomKeys = D.paddedAtomKeys; o.qblockAtomKeys = D.qblockAtomKeys;
   o.atomizedElementNames = D.atomizedElementNames; o.atomizedUnknownRestype = D.atomizedUnknownRestype;
   o.atomizedUnknownMsa = D.atomizedUnknownMsa; o.atomizedBackboneBonds = D.atomizedBackboneBonds;
@@ -542,9 +542,6 @@ inline Af3Export exportAf3(const Args& args) {
     std::fill(batch.profile.begin(), batch.profile.end(), 0.0f);
     std::fill(batch.deletionMean.begin(), batch.deletionMean.end(), 0.0f);
   }
-  if (D.chaiTokenEmbedding && !o.bonds.empty())
-    throw std::runtime_error("Chai-1 does not take declared covalent bonds yet (bondedAtomPairs, a glycan's links): the"
-                             " trunk half of its bond projection is not in the bundle");
   addBatch(E, batch, !D.chaiTokenEmbedding);
   if (D.chaiTokenEmbedding) addEsm2Inputs(E, batch);
   E.i("batch.contactClasses", af3ContactClasses(batch));

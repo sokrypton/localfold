@@ -58,6 +58,8 @@ const KEYS = 128;
 const RESTYPES = 31;
 /** Every ligand token carries UNK, whatever the atom is. */
 const UNK_AATYPE = 20;
+// AF3's unknown DNA nucleotide (DN), the class chai-1 reads for any atomised base (its DX/RX)
+const UNKNOWN_NUCLEOTIDE = 30;
 
 /**
  * The four characters of an ATOMISED atom's name, as AF3 stores them - the code
@@ -499,7 +501,7 @@ export function featuriseProtein(sequence, options = {}) {
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
       aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
-        ? UNK_AATYPE : parentAatype(kind, code);
+        || options.atomizedUnknownRestype === "chai" ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -573,9 +575,10 @@ export function featuriseProtein(sequence, options = {}) {
       // is a one-hot over the same alphabet.
       // (true is for an atomised AMINO ACID alone; rf3's "nucleic" takes a modified base's atom tokens
       // too - native atomworks reads a 5CM's twenty as 20, where af3-any-model once kept DC, 28: 0464f71)
+      // ("chai": an amino acid's 20, a nucleotide's the unknown nucleotide, 30 - chai-lab's DX/RX)
       aatype[token] = options.atomizedUnknownRestype === "nucleic"
-        || (options.atomizedUnknownRestype === true && kind === "protein")
-        ? UNK_AATYPE : parentAatype(kind, code);
+        || ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai") && kind === "protein")
+        ? UNK_AATYPE : options.atomizedUnknownRestype === "chai" ? UNKNOWN_NUCLEOTIDE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -813,10 +816,15 @@ export function featuriseProtein(sequence, options = {}) {
     return modifiedSpans.some((one) => one.residue === global);
   };
   const declaredBonds = [];
+  // chai-1's declared-bond feature (dialect `declaredBondFeature`): every declared bond, whatever the rule above
+  // keeps, [from][to] in the job's direction - its own matrix, separate from the token bonds
+  const declaredBondMatrix = options.declaredBondFeature === true && (options.bonds ?? []).length > 0
+    ? new Float32Array(tokens * tokens) : undefined;
   for (const [index, bond] of (options.bonds ?? []).entries()) {
     const where = `bond ${index + 1}`;
     // (resolved first, whichever way the rule goes: an endpoint this batch does not have is refused by name)
     const from = tokenOfEndpoint(bond.from, `${where} from`), to = tokenOfEndpoint(bond.to, `${where} to`);
+    if (declaredBondMatrix !== undefined) declaredBondMatrix[from * tokens + to] = 1;
     const fromLigand = isLigandEnd(bond.from), toLigand = isLigandEnd(bond.to);
     let added;
     if (fromLigand && toLigand) added = false;
@@ -966,7 +974,7 @@ export function featuriseProtein(sequence, options = {}) {
   //     rosettafold3 20 20 20 ...   aatype 20
   // So the alignment keeps the PARENT residue for everyone but rf3, whose
   // atomised token is unknown wherever it appears.
-  if (options.atomizedUnknownRestype === true
+  if ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai")
       && options.atomizedUnknownMsa !== true) {
     for (const span of modifiedSpans) {
       const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
@@ -1253,7 +1261,7 @@ export function featuriseProtein(sequence, options = {}) {
     // AF3 keeps these separate and they are equal for a protein-only chain:
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
-    bondMatrix, bondOrderMatrix, ligandSpans, modifiedSpans, residueOfToken,
+    bondMatrix, bondOrderMatrix, declaredBondMatrix, ligandSpans, modifiedSpans, residueOfToken,
     chainKinds, chainOfResidue, isDna, isRna, isLigand, isModified,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,

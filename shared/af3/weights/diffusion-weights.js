@@ -383,6 +383,9 @@ export async function targetFeatureWeights(store) {
     esmWeights: await C("esm_embedding/weights"),
     singleProjInTrunk: await C("single_proj_in_trunk/weights"),
     singleProjInStructure: await C("single_proj_in_structure/weights"),
+    // chai's DX restype, on a DNA token whose aatype is the unknown nucleotide (a modified base's atomised tokens):
+    // blob revision 3, zero (absent) before it
+    ...(store.manifest?.tensors?.["diffuser/chai1_token_dx"] === undefined ? {} : { dx: await C("token_dx") }),
   };
   return {
     dialect,

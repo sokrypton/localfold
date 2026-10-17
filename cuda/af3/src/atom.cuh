@@ -1139,13 +1139,15 @@ __global__ void targetFeatSumK(float* tf, const int* aatype, const float* profil
 inline const int* flagDev(const std::string& k) { return M.has(k) ? Idev(k) : nullptr; }
 // chai-1's token features (af3-any-model model.py, create_target_feat_embedding): one_hot(aatype, 31) W + b
 // + [profile (31) | deletion_mean] W' (the ESM2 term is added after, as a GEMM)
+// + chai's DX restype (blob revision 3, absent before it) on a DNA token reading the unknown nucleotide (30)
 __global__ void chaiTokenFeatK(const int* aatype, const float* profile, const float* delMean, const float* Wt,
-                               const float* bt, const float* Wp, float* out, int tokens, int C) {
+                               const float* bt, const float* Wp, const float* dx, const int* isDna, float* out, int tokens, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)tokens * C) return;
   int token = (int)(t / C), c = (int)(t % C);
   int a = aatype[token];
   float v = bt[c] + (a >= 0 && a < 31 ? Wt[(size_t)a * C + c] : 0.f);
+  if (dx && isDna && isDna[token] && a == 30) v += dx[c];
   for (int k = 0; k < 31; ++k) v += profile[(size_t)token * 31 + k] * Wp[(size_t)k * C + c];
   v += delMean[token] * Wp[(size_t)31 * C + c];
   out[t] = v;
@@ -1194,7 +1196,8 @@ inline float* buildTargetFeat() {
     int Cp = e.perToken, C = (int)(lenW(P + "tokenFeatureBias"));
     float* feat = scratch<float>("tf.token", (size_t)tokens * C);
     chaiTokenFeatK<<<blocks((size_t)tokens * C), 256, 0, STREAM>>>(Idev("batch.aatype"), Fdev("batch.profile"),
-      Fdev("batch.deletionMean"), W(P + "tokenFeatureWeights"), W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), feat,
+      Fdev("batch.deletionMean"), W(P + "tokenFeatureWeights"), W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"),
+      hasW(P + "dx") ? W(P + "dx") : nullptr, flagDev("batch.isDna"), feat,
       tokens, C);
     const float* esm = nullptr; int E = 0;
     if (M.has("batch.esmEmbeddings")) {                       // (a dump's, computed by the reference)

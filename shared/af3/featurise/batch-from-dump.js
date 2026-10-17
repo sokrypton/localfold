@@ -79,6 +79,8 @@ export function batchFromDump(dump) {
     // chai1's tokens read ESM2 3B's last hidden state ([tokens, 2560], zeros on non-protein tokens): a batch
     // field only for that family, which a batch dumped for it carries
     ...(dump.inputs.esm_embeddings === undefined ? {} : { esmEmbeddings: floats(raw("esm_embeddings")) }),
+    // ...and its declared-bond feature ([tokens, tokens], [from][to] = 1), which a chai1 dump with a declared bond carries
+    ...(dump.inputs.declared_bonds === undefined ? {} : { declaredBondMatrix: floats(raw("declared_bonds")) }),
     refPos: floats(raw("ref_pos")), refMask,
     refElement: ints(raw("ref_element")), refCharge: floats(raw("ref_charge")),
     refAtomNameChars: ints(raw("ref_atom_name_chars")),

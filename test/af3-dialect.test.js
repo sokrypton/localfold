@@ -316,6 +316,8 @@ it("the atomised-token conventions are the four the references show", () => {
     boltz2:       [false, true,  false, false],
     intellifold2: [false, false, false, false],
     rosettafold3: [true,  "nucleic", true, true],
+    // chai-1: an atomised amino acid 20 and an atomised nucleotide 30 (its DX/RX), in every alignment row
+    chai1:        [false, "chai", true, false],
   };
   for (const [model, want] of Object.entries(expected)) {
     const dialect = dialectFor(model);
@@ -336,7 +338,7 @@ it("featuriserDialect carries every featuriser convention", () => {
   for (const field of ["symmetriseBonds", "centreRefConformers", "paddedAtomKeys",
                        "qblockAtomKeys", "dropTerminalAtoms", "dedupeSelfMsa",
                        "atomizedElementNames", "atomizedUnknownRestype",
-                       "atomizedUnknownMsa", "atomizedBackboneBonds"]) {
+                       "atomizedUnknownMsa", "atomizedBackboneBonds", "declaredBondFeature"]) {
     assert.ok(carried.includes(field), `featuriserDialect drops ${field}`);
   }
   // ...and NOT the graph conventions: a featuriser has no business with a

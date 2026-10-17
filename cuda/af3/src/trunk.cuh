@@ -107,10 +107,14 @@ __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex
 // chai-1's relative encoding (af3-any-model evoformer.py): two 67-class one-hots, the residue separation (same
 // chain: clip(ri_i - ri_j + 33, 0, 65), else 66) and the token separation (same residue of the same chain:
 // clip(ti_i - ti_j + 32, 0, 65), else 66), through a BIASED linear - its frozen single-chain token-pair columns
-// are in the bias
+// are in the bias. Blob revision 3 adds what that bias holds only at its single-chain classes: RelativeChain and
+// RelativeEntity, rows ce[rchain] + ce[6 + rent] of a [9, C] table (rel_e = entity_i - entity_j; rchain 5 across
+// entities, else clip(sym_i - sym_j + 2, 0, 4); rent clip(rel_e + 1, 0, 2)) - and the trunk half of the declared-bond
+// projection, bond[i][j] * Wbond (chai1_bond_trunk). Either absent (revision 2, or no bond declared) adds nothing.
 template <class PT = float>
-__global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenIndex, const int* asymId, const float* Wpos,
-                                      const float* bias, float* pair, int n, int C) {
+__global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenIndex, const int* asymId, const int* entityId,
+                                      const int* symId, const float* Wpos, const float* bias, const float* ce,
+                                      const float* bond, const float* Wbond, float* pair, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
@@ -118,7 +122,15 @@ __global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenI
   bool sameChain = asymId[i] == asymId[j];
   int rss = sameChain ? clip(residueIndex[i] - residueIndex[j] + 33) : 66;
   int rts = sameChain && residueIndex[i] == residueIndex[j] ? clip(tokenIndex[i] - tokenIndex[j] + 32) : 66;
-  pairSt<PT>(pair, t, pairLd<PT>(pair, t) + bias[c] + Wpos[(size_t)rss * C + c] + Wpos[(size_t)(67 + rts) * C + c]);
+  float v = bias[c] + Wpos[(size_t)rss * C + c] + Wpos[(size_t)(67 + rts) * C + c];
+  if (ce) {
+    int relE = entityId[i] - entityId[j], relS = symId[i] - symId[j] + 2;
+    int rchain = relE != 0 ? 5 : (relS < 0 ? 0 : relS > 4 ? 4 : relS);
+    int rent = relE + 1 < 0 ? 0 : relE + 1 > 2 ? 2 : relE + 1;
+    v += ce[(size_t)rchain * C + c] + ce[(size_t)(6 + rent) * C + c];
+  }
+  if (bond && Wbond) v += bond[ij] * Wbond[c];
+  pairSt<PT>(pair, t, pairLd<PT>(pair, t) + v);
 }
 // chai-1's MSA features (af3-any-model featurization.py create_msa_feat, chai1): 41 columns per row and token,
 // [is_paired | source one-hot (6; row 0 class 4, else 2) | deletion value | has deletion | one_hot(msa, 32)],
@@ -426,8 +438,11 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   if (sharded(t) && (chai || !t.inPlaceRecycle)) { fprintf(stderr, "a sharded pair recycles in place, and not chai-1\n"); exit(1); }
   auto chaiRelEnc = [&]() {
     WITH_PT(t.p16, chaiRelativeEncodingK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(Idev("batch.features.residueIndex"),
-      Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), W(E + "positionActivations"),
-      W(E + "positionActivationsBias"), t.pair, n, C));
+      Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
+      Idev("batch.features.symId"), W(E + "positionActivations"), W(E + "positionActivationsBias"),
+      hasW(E + "chaiChainEntity") ? W(E + "chaiChainEntity") : nullptr,
+      M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr,
+      hasW(E + "chaiBondTrunk") ? W(E + "chaiBondTrunk") : nullptr, t.pair, n, C));
   };
   if (chai && t.pass == 0) {
     // chai's first pass recycles z_init itself (chai1.py seeds the carry with the initial representation):
