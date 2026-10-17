@@ -170,7 +170,7 @@ function residentBlocks(device, key) {
  *
  * @param {{record: object, buffer: ArrayBuffer, byteOffset: number}} source
  */
-async function decodeIntoOnDevice(device, source, elements, destination) {
+async function decodeIntoOnDevice(device, source, elements, destination, multiplier = 1) {
   if (source === undefined || source === null) return false;
   // A thunk in the shape planBlockUpload reads: it never calls it, it only
   // wants the store, the name and the range. See shared/af3/weights/weights.js.
@@ -179,7 +179,7 @@ async function decodeIntoOnDevice(device, source, elements, destination) {
   thunk.tensorName = "tower";
   thunk.first = 0;
   thunk.count = elements;
-  const planned = planBlockUpload([{ name: "tower", thunk, offset: 0, length: elements }]);
+  const planned = planBlockUpload([{ name: "tower", thunk, offset: 0, length: elements }], "f16", { multiplier });
   if (planned === undefined || planned.gpu.params.length === 0) return false;
   const release = await runBlockUpload(device, planned.gpu, destination);
   // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here would
@@ -187,6 +187,18 @@ async function decodeIntoOnDevice(device, source, elements, destination) {
   // thing this loop is written to avoid. See webgpu/af3/weights/device-weights.js.
   void device.queue.onSubmittedWorkDone().then(release);
   return true;
+}
+
+/** A Uint16Array of half BITS as float32 values (subnormals, infinities and NaN included). */
+function halvesToFloat32(bits) {
+  const out = new Float32Array(bits.length);
+  for (let i = 0; i < bits.length; i += 1) {
+    const h = bits[i], sign = h & 0x8000 ? -1 : 1, exponent = (h >>> 10) & 0x1f, mantissa = h & 0x3ff;
+    out[i] = exponent === 0 ? sign * mantissa * 2 ** -24
+      : exponent === 0x1f ? (mantissa === 0 ? sign * Infinity : NaN)
+      : sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
+  }
+  return out;
 }
 
 const REPLAY_TARGETS = new WeakMap();
@@ -226,7 +238,15 @@ export class EsmcTowerGpu {
    */
   async run(ids, shape, blockWeights, shared, options = {}) {
     const { rows, model, heads, ffn, layers, pair } = shape;
-    const residualScale = shape.residualScale ?? 1;
+    // 🔴 THE RESIDUAL SCALE IS THE ARCHITECTURE'S, sqrt(layers / 36) - esm's
+    // EsmcTransformerStack, and biohub's 300M runs 0.912871 - so it is derived
+    // where the depth is known and `shape.residualScale` only stands in where
+    // it is not. tools/export_esmc_model.py wrote 1.0 for every tower, and the
+    // 300M bundle the registry pins carries it: its language-model pair read
+    // 8.1e-3 from biohub's with 1.0 and 2.2e-3 derived, on Metal
+    // (tools/esmc/probe-esmfold2-lm-pair.py). 1 at 600M's 36 layers.
+    const residualScale = Number.isInteger(layers) && layers > 0
+      ? Math.sqrt(layers / 36) : (shape.residualScale ?? 1);
     const epsilon = (options.epsilon ?? 1e-5).toExponential();
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
     const capture = new Set(options.capture ?? []);
@@ -518,16 +538,14 @@ export class EsmcTowerGpu {
         };
         const scaled = (values) => {
           if (residualScale === 1) return values;
-          // 🔴 A SCALED WEIGHT CANNOT ARRIVE ALREADY NARROW. This divides
-          // element by element and a Uint16Array holds BITS, so the arithmetic
-          // would be on the encoding. No checkpoint here scales its residual,
-          // which is exactly why this would go unnoticed.
-          if (isNarrow(values)) {
-            throw new Error(`this tower scales its residual by ${residualScale} and was`
-              + " handed half-precision weights, which cannot be scaled elementwise");
-          }
-          const out = new Float32Array(values.length);
-          for (let i = 0; i < values.length; i += 1) out[i] = values[i] / residualScale;
+          // 🔴 A NARROW WEIGHT IS WIDENED FIRST: a Uint16Array holds BITS, and
+          // dividing it elementwise would do arithmetic on the encoding. This
+          // refused one until 300M's scale was derived (0.9129) - a tool that
+          // asks its store for halves hands them here.
+          const wide = values instanceof Uint16Array ? halvesToFloat32(values)
+            : isNarrow(values) ? Float32Array.from(values) : values;
+          const out = new Float32Array(wide.length);
+          for (let i = 0; i < wide.length; i += 1) out[i] = wide[i] / residualScale;
           return out;
         };
 
@@ -551,12 +569,13 @@ export class EsmcTowerGpu {
         // Measured: the tower's block reads were 5482 ms of a 7990 ms first
         // ESMFold2 fold, and this is 99.6% of them.
         //
-        // 🔴 AND A SCALED RESIDUAL CANNOT TAKE IT, for the reason `scaled`
-        // already gives: the division is elementwise over floats and these
-        // never become floats here. No checkpoint in this repository scales,
-        // so the branch is a guard rather than a path.
-        const sources = residualScale === 1 ? weights?.sources : undefined;
-        const uploadNarrow = async (name, leaf, make) => {
+        // 🔴 AND A SCALED RESIDUAL TAKES IT TOO: the two matrices a residual
+        // adds are decoded with the division folded into each group's scale
+        // and zero (planBlockUpload's `multiplier`), where it was refused here -
+        // which sent ESM-C 300M (30 layers, 1 / 0.9129) to the host path, or
+        // would have, had its manifest not said 1.0 (web/esmfold2-model.js).
+        const sources = weights?.sources;
+        const uploadNarrow = async (name, leaf, make, multiplier = 1) => {
           // 🔴 RESIDENT MEANS THE CODES, NOT THE HALVES. A kept block holds its
           // recorded decode - int3 codes on the device - and replays it into a
           // pooled buffer each fold: ~170 MiB held across 36 blocks where the
@@ -584,7 +603,7 @@ export class EsmcTowerGpu {
               let recordings;
               try {
                 decoded = await decodeIntoOnDevice(this.device, source, elements,
-                                                   allocation.buffer);
+                                                   allocation.buffer, multiplier);
               } finally {
                 recordings = stop();
               }
@@ -614,7 +633,7 @@ export class EsmcTowerGpu {
             }
             const allocation = this.allocator.allocate(
               `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);
-            if (await decodeIntoOnDevice(this.device, source, elements, allocation.buffer)) {
+            if (await decodeIntoOnDevice(this.device, source, elements, allocation.buffer, multiplier)) {
               perBlock.push(allocation);
               return allocation;
             }
@@ -630,13 +649,13 @@ export class EsmcTowerGpu {
         const qScale = upload("q_norm", () => weights["q_norm/scale"]);
         const kScale = upload("k_norm", () => weights["k_norm/scale"]);
         const attnOut = await uploadNarrow("attn_out", "attn_out/weights",
-          () => narrow(scaled(weights["attn_out/weights"])));
+          () => narrow(scaled(weights["attn_out/weights"])), 1 / residualScale);
         const ffnScale = upload("ffn_norm/scale", () => weights["ffn_norm/scale"]);
         const ffnOffset = upload("ffn_norm/offset", () => weights["ffn_norm/offset"]);
         const fc1 = await uploadNarrow("fc1", "fc1/weights",
           () => narrow(weights["fc1/weights"]));
         const fc2 = await uploadNarrow("fc2", "fc2/weights",
-          () => narrow(scaled(weights["fc2/weights"])));
+          () => narrow(scaled(weights["fc2/weights"])), 1 / residualScale);
 
         const encoder = this.device.createCommandEncoder({ label: `esmc-block-${layer}` });
         const pass = encoder.beginComputePass({ label: `esmc-block-${layer}` });

@@ -1,7 +1,8 @@
 # localfold
 
-AlphaFold 3 and its lineage, AlphaFold 2 and ESMFold2, as native CUDA programs: an AlphaFold 3 job file (or a
-sequence) in, a structure and its confidences out. Prebuilt for every current NVIDIA GPU - no compiler, no Python
+AlphaFold 3 and its lineage, AlphaFold 2 and ESMFold2, as native GPU programs: an AlphaFold 3 job file (or a
+sequence) in, a structure and its confidences out. Prebuilt for every current NVIDIA GPU (CUDA, on Linux) and for
+Apple silicon (Metal, on macOS) - one `pip install`, which picks the build for the machine; no compiler, no Python
 deep-learning stack, no Node.
 
 ```
@@ -11,6 +12,17 @@ localfold-af3 --job=kras.json --out=kras.pdb                  # AlphaFold 3 (or 
 localfold-af2 --sequence=MKV...:GSH... --search --out=dimer.pdb
 localfold-ef2 --sequence=MKV... --out=fold.pdb                # ESMFold2: no alignment needed
 ```
+
+Or the whole website, on this machine, folding with its GPU:
+
+```
+localfold serve                      # opens http://127.0.0.1:8710 - the LocalFold page, every fold native
+```
+
+`localfold serve` serves the [LocalFold website](https://localfold.org)'s own page on 127.0.0.1 and sends every fold
+it asks for to these native ports instead of the browser's WebGPU: about twice as fast on an Apple M2, every model
+(chai-1 and OpenDDE included), folds past the browser's buffer limits, and no weights loaded into a browser tab. The
+page's Stop ends a fold, and Ctrl-C stops the server. `--port`, `--no-open` and `--weights-dir` are its options.
 
 Each command fetches its model's weights the first time (into `~/.cache/localfold`, or `--weights-dir=<dir>`),
 featurises the input exactly as the [LocalFold website](https://localfold.org) does, and folds. `--help` lists every
@@ -33,12 +45,24 @@ machine but the first weight download.
 
 ## Requirements
 
+On Linux (the CUDA build):
+
 - Linux x86_64 with glibc 2.28 or newer (RHEL/Alma/Rocky 8, Ubuntu 20.04, Debian 11 and later)
 - an NVIDIA GPU from the T4 on (Turing, Ampere, Ada, Hopper, Blackwell) and its driver; Blackwell GPUs need a
   driver of the CUDA 12.8 era (570 or newer)
 - `curl` and `gzip` (the weight download and the MMseqs2 search)
 
 cuBLAS comes from NVIDIA's `nvidia-cublas-cu12` wheel, installed as a dependency.
+
+On a Mac (the Metal build):
+
+- Apple silicon (M1 or later) and macOS 13 or newer
+- nothing else: the binaries use only the system's frameworks. Their GPU kernels are compiled for your Mac the first
+  time each is used (cached in `~/.cache/localfold/metal`), so a first fold takes a few seconds longer than the next.
+
+The Metal build is the CUDA programs translated (the repository's `metal/`) and folds the same structures: run on the
+NVIDIA build's regression cases, AlphaFold 2 and ESMFold2 agree with an A100's figures to within a few hundredths of
+an angstrom, and the AlphaFold 3 lineage to within a seed's spread. `chai1` has not been run on it.
 
 ## Weights and licences
 

@@ -1,19 +1,22 @@
 /**
- * THE READER'S PAGE, FOLDING ON A COLAB RUNTIME'S GPU.
+ * THE READER'S PAGE, FOLDING ON A NATIVE PORT - THIS MACHINE'S GPU, OR A RUNTIME'S.
  *
- * `notebooks/localfold.ipynb` runs tools/colab_backend.py on the runtime, which
- * serves this checkout and keeps one worker process - cuda/worker.py, LocalFold's
- * native CUDA ports on the page's own weights and inputs. The notebook's link
- * opens `index.html?backend=colab&t=…` on that server; this page then sends each
- * fold there and draws what the worker says as it says it: every status line,
- * bar fraction, sampler frame and contact map, then the finished fold.
+ * python/localfold/server.py serves this page and keeps one worker process -
+ * python/localfold/worker.py, LocalFold's native ports (metal/ on a Mac, cuda/ on
+ * an NVIDIA card) on the page's own weights and inputs. It runs on the reader's
+ * own machine (`localfold serve`, from the wheel) or on a Colab runtime
+ * (`notebooks/localfold.ipynb`). Its link opens `index.html?backend=native&t=…`;
+ * this page then sends each fold there and draws what the worker says as it says
+ * it: every status line, bar fraction, sampler frame and contact map, then the
+ * finished fold.
  *
  * 🔴 THERE WAS A SECOND HALF, AND IT IS GONE. The runtime used to run this same
  * page headlessly (`?role=runtime`) and fold with its WebGPU code on commands
  * relayed through the broker; once every fold went to CUDA nothing reached it,
  * and it was removed (docs/WEB.md, 2026-10-08).
  *
- * Absent `?backend=colab`, every function here is inert and index.html is what
+ * Absent `?backend=native` (or the older `?backend=colab`) - the page folding on the native backend, wherever its
+ * server runs - every function here is inert and index.html is what
  * it was: the website folds in the reader's own browser.
  */
 
@@ -30,8 +33,9 @@ import { devSourceIs } from "./dev-log.js";
  * it is not where it lives.
  */
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
+// (no token on the reader's own machine: `localfold serve` asks for none)
 const door = (route, extra = "") =>
-  `${route}?t=${encodeURIComponent(TOKEN)}${extra}`;
+  `${route}?t=${encodeURIComponent(TOKEN)}${extra}`.replace("?t=&", "?").replace(/\?t=$/, "");
 
 const ask = async (route, body) => {
   const answer = await fetch(door(route), {
@@ -49,19 +53,25 @@ const ask = async (route, body) => {
   return said;
 };
 
-export const colabRole = () =>
-  new URLSearchParams(location.search).get("backend") === "colab" ? "reader" : null;
+export const nativeRole = () =>
+  ["native", "colab"].includes(new URLSearchParams(location.search).get("backend")) ? "reader" : null;
 
 /**
  * Where a reader's fold runs: LocalFold's native CUDA ports on the runtime
- * (cuda/worker.py), always. There is no choice on the page - a runtime the
+ * (python/localfold/worker.py), always. There is no choice on the page - a runtime the
  * notebook could not build CUDA on refuses the fold by saying so (see
- * tools/colab_backend.py), rather than folding somewhere slower in silence.
+ * python/localfold/server.py), rather than folding somewhere slower in silence.
  */
-export const remoteBackendChoice = () => "cuda";
+export const remoteBackendChoice = () => "native";
+/**
+ * ...and which native port that is, as /health says: cuda/ on an NVIDIA card, metal/ on a Mac - the same broker and
+ * worker serve a reader's own machine (`localfold serve`).
+ */
+let nativeName = "CUDA";
+export const remoteBackendName = () => nativeName;
 // ...and whether a CUDA fold streams its intermediate results to this page while it runs (each trunk pass's
 // contact map, the sampler's frames, AF2's passes with their scores) - the reader's choice, on the badge,
-// because it is this page that draws them. Measured at under 1% of a fold (cuda/worker.py).
+// because it is this page that draws them. Measured at under 1% of a fold (python/localfold/worker.py).
 let liveChoice = true;
 export const remoteLiveChoice = () => liveChoice;
 
@@ -92,7 +102,7 @@ export async function remoteHead(signal) {
 /**
  * SAY THAT THIS PAGE IS FOLDING SOMEWHERE ELSE, AND OFFER THE WAY BACK.
  *
- * 🔴 NOTHING ON THE PAGE SAID SO. `?backend=colab` is in the URL and the fold
+ * 🔴 NOTHING ON THE PAGE SAID SO. `?backend=native` is in the URL and the fold
  * happens on a machine the reader cannot see - so a tab left open after the
  * notebook was closed looks exactly like a tab that folds here, and the first
  * news of the difference is a fold that goes nowhere. The badge is the one
@@ -107,17 +117,17 @@ export async function remoteHead(signal) {
  * server with it, and three unanswered asks in a row say so. `/health` is
  * asked until it answers once, for the card's name and what it offers.
  */
-function installColabStatus() {
-  devSourceIs("the Colab runtime");
+function installNativeStatus() {
+  devSourceIs("the remote runtime");
   const head = document.querySelector(".page-head-fold") ?? document.body;
   const badge = document.createElement("div");
-  badge.id = "colab-status";
-  badge.className = "colab-status";
+  badge.id = "native-status";
+  badge.className = "native-status";
   const dot = document.createElement("span");
-  dot.className = "colab-dot";
+  dot.className = "native-dot";
   const said = document.createElement("span");
-  said.className = "colab-said";
-  said.textContent = "Colab runtime";
+  said.className = "native-said";
+  said.textContent = "Remote runtime";
   const leave = document.createElement("button");
   leave.type = "button";
   leave.className = "btn btn-grey btn-small";
@@ -132,6 +142,9 @@ function installColabStatus() {
   leave.title = "Stop the fold service on the runtime and free its GPU. This"
     + " page then folds in your browser. The notebook itself stays open -"
     + " Runtime > Disconnect and delete runtime releases the machine.";
+  // (hidden until /health says where the server is: on the reader's own machine it is not offered - the page's
+  // own Stop ends a fold there, and the server is stopped where it was started, with Ctrl-C)
+  leave.hidden = true;
   badge.append(dot, said, leave);
   // 🔴 IN THE MIDDLE, IN ITS OWN SLOT, rather than appended to the head. The
   // head is `space-between` with a title and the actions, so a third child
@@ -139,7 +152,7 @@ function installColabStatus() {
   // A stretching slot between them takes the leftover width and centres the
   // badge in it; the buttons do not move.
   const slot = document.createElement("div");
-  slot.className = "colab-status-slot";
+  slot.className = "native-status-slot";
   slot.append(badge);
   const actions = head.querySelector(".fold-actions");
   if (actions === null) head.append(slot);
@@ -150,7 +163,8 @@ function installColabStatus() {
   // that the badge read "Colab runtime" with no card.
   let card = "";
   let releases = false;
-  let cudaOffered = null;
+  let place = "Remote runtime";
+  let nativeOffered = null;
   const nameTheCard = async () => {
     if (card !== "") return;
     try {
@@ -162,27 +176,48 @@ function installColabStatus() {
       // by hand there is no machine to hand back, and a button that promises
       // one either way is wrong half the time.
       releases = health.colabRuntime === true;
+      // ...and WHERE it is: Colab, this reader's own machine (`localfold serve`, which says so), or a runtime
+      // somebody hosts
+      place = releases ? "Colab runtime" : health.local === true ? "Local server" : "Remote runtime";
+      leave.hidden = place === "Local server";
+      if (health.native === "metal") nativeName = "Metal";
       // 🔴 NO CUDA, NO FOLD - AND THE BADGE SAYS SO BEFORE THE READER TRIES. The
       // notebook builds the CUDA ports on every runtime it starts; one with no
       // NVIDIA card (a TPU, a CPU runtime) offers none, and the broker refuses
       // the fold with the same sentence.
-      cudaOffered = (health.backends ?? []).includes("cuda");
-      if (cudaOffered && !badge.querySelector(".colab-live")) {
+      // (an older server says "cuda" for what this one calls "native")
+      nativeOffered = (health.backends ?? []).some((b) => b === "native" || b === "cuda");
+      // ...and the models only a native port folds - biohub's released ESMFold2-Fast and ESMFold2, on ESM-C 6B,
+      // from local exports (metal/README.md): their options are in the page, hidden, and shown where this server
+      // says it has them (/health's `models`)
+      const offered = new Set(nativeOffered ? health.models ?? [] : []);
+      for (const option of document.querySelectorAll("option[data-native-model]")) {
+        option.hidden = !offered.has(option.dataset.nativeModel);
+        // ...and one chosen (a link, a restored session) that this server does not have goes back to its select's
+        // default, with the change it would have fired - not left selected and invisible
+        const select = option.closest("select");
+        if (option.hidden && select?.value === option.value) {
+          select.value = select.querySelector("option[selected]")?.value ?? select.options[0].value;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      if (nativeOffered && !badge.querySelector(".native-live")) {
         // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it
         // is set here, per fold, by whoever is watching
         const live = document.createElement("label");
-        live.className = "colab-live";
+        live.className = "native-live";
         live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
           + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
           + " page shows the finished fold only. Measured at under 1% of a fold.";
         const box = document.createElement("input");
         box.type = "checkbox";
-        try { box.checked = localStorage.getItem("localfold.colabLive") !== "off"; }
+        try { box.checked = (localStorage.getItem("localfold.nativeLive")
+          ?? localStorage.getItem("localfold.colabLive")) !== "off"; }
         catch (cause) { box.checked = true; }
         liveChoice = box.checked;
         box.addEventListener("change", () => {
           liveChoice = box.checked;
-          try { localStorage.setItem("localfold.colabLive", box.checked ? "on" : "off"); }
+          try { localStorage.setItem("localfold.nativeLive", box.checked ? "on" : "off"); }
           catch (cause) { /* remembered for this page only */ }
         });
         live.append(box, document.createTextNode(" Live"));
@@ -196,7 +231,7 @@ function installColabStatus() {
           + " keeps what it has already folded.";
       // ...and the timing report is headed with it, because the rows in it
       // were recorded on that card and not on this one.
-      if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
+      if (card !== "") devSourceIs(`the ${place.toLowerCase()} · ${card} · ${nativeName}`);
     } catch (cause) { /* the pulse below is what matters; this is its name */ }
   };
 
@@ -215,18 +250,19 @@ function installColabStatus() {
     // badge was visibly updating - so what a gate (or a reader in the
     // console) can read is the pulse's own count, which cannot be wrong
     // about whether the pulse is running.
-    window.__colabBeats = (window.__colabBeats ?? 0) + 1;
+    window.__nativeBeats = (window.__nativeBeats ?? 0) + 1;
     try {
       await nameTheCard();
       const head2 = await remoteHead();
       folding = !!head2.folding;
       misses = 0;
       badge.dataset.state = "live";
-      said.textContent = `Colab runtime${card ? ` · ${card}` : ""}${cudaOffered === false ? " · no CUDA backend" : ""}`;
+      said.textContent = `${place}${card ? ` · ${card}` : ""}`
+        + (nativeOffered === false ? " · no native backend" : ` · ${nativeName}`);
       leave.textContent = folding ? "Stop & disconnect" : "Disconnect";
     } catch (cause) {
       badge.dataset.state = "gone";
-      said.textContent = "Colab runtime · unreachable";
+      said.textContent = `${place} · unreachable`;
       misses += 1;
       if (misses >= 3) stopBeating();
     }
@@ -262,17 +298,19 @@ function installColabStatus() {
     // they were using. What is left is what they still want: the structure,
     // the plots and the downloads of what was already folded.
     document.dispatchEvent(new CustomEvent("localfold-runtime-stopped", {
-      detail: { why: "the Colab runtime was stopped from this page - open the"
-        + " notebook's link again to fold" },
+      detail: { why: place === "Local server"
+        ? "the local server was stopped from this page - run `localfold serve` again to fold natively"
+        : place === "Colab runtime"
+          ? "the Colab runtime was stopped from this page - open the notebook's link again to fold"
+          : `the ${place.toLowerCase()} was stopped from this page - open its link again to fold` },
     }));
     badge.dataset.state = "gone";
     badge.textContent = "";
     const dot2 = document.createElement("span");
-    dot2.className = "colab-dot";
+    dot2.className = "native-dot";
     const gone = document.createElement("span");
-    gone.className = "colab-said";
-    gone.textContent = releases ? "Colab runtime · released"
-    : "Colab runtime · stopped";
+    gone.className = "native-said";
+    gone.textContent = releases ? "Colab runtime · released" : `${place} · stopped`;
     badge.append(dot2, gone);
     const line = document.getElementById("status-message");
     if (line !== null) {
@@ -290,11 +328,16 @@ function installColabStatus() {
           + " Disconnect and delete runtime.")
         + " This page is now showing what it already has; the notebook's link"
         + " starts a new one.";
+      // ...and on the reader's own machine there is no notebook: the command is what starts it again
+      if (place === "Local server") {
+        line.textContent = "The local fold server has been stopped and its GPU freed. This page is"
+          + " now showing what it already has; run `localfold serve` again to fold natively.";
+      }
     }
   });
 }
 
 /** The badge, on a reader's page. Called once, by web/app.js. */
-export function installColabBridge() {
-  if (colabRole() === "reader") installColabStatus();
+export function installNativeBridge() {
+  if (nativeRole() === "reader") installNativeStatus();
 }

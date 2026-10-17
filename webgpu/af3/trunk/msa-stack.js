@@ -15,7 +15,7 @@
  * The five pair updates are shared with the pairformer stack; see
  * webgpu/af3/trunk/pair-track.js.
  */
-import { deviceTuning, shapedKnob } from "../../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable, shapedKnob } from "../../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
@@ -38,8 +38,9 @@ import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
   allocateTransitionSplit, createTransitionShader, packTransitionWeights,
-  splitTransitionConfig, transitionRowTile, TRANSITION_ORDER,
+  splitTransitionConfig, pairTransitionArithmetic, transitionRowTile, TRANSITION_ORDER,
 } from "./transition.js";
+import { settleGridAttendTiling } from "./grid-attend-race.js";
 
 // The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
 const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
@@ -136,11 +137,15 @@ export class Af3MsaStackGpu {
     // 1.12e-4, because this stack and the template embedder kept theirs.
     const pairMatrixKernels =
       (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false;
+    // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
+    await settleGridAttendTiling(this.device);
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
+      attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
+        && halfPrecisionAvailable(this.device),
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,
@@ -160,8 +165,9 @@ export class Af3MsaStackGpu {
       // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
       // the whole reason the pairformer takes it. Same width rule, same knob.
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
-        { f32Only: !pairMatrixKernels }),
+        { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,

@@ -1,4 +1,5 @@
-"""LocalFold's native CUDA ports: localfold-af3, localfold-af2 and localfold-ef2 (see `localfold-af3 --help`)."""
+"""LocalFold's native ports - CUDA on Linux, Metal on Apple silicon: localfold-af3, localfold-af2 and localfold-ef2
+(see `localfold-af3 --help`)."""
 import os
 
 __version__ = "0.1.0"

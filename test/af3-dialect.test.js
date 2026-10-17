@@ -109,6 +109,9 @@ describe("the dialect table", () => {
       "chainedAtomLayerNorm",
       // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds ("discontinuous": af3-any-model 964990e)
       "declaredPolymerBonds",
+      // 🔴 THE QUERY ONCE IN A SELF-MSA, and a ligand UNK in the MSA: protenix's featuriser (af3-any-model's
+      // dedupe_self_msa and native_nonprotein_msa for opendde)
+      "dedupeSelfMsa",
       "distogramBias",
       // 🔴 THE GAP RESTYPE IN ITS ONE EMPTY TEMPLATE SLOT, which is a VALUE
       // (21) and not a boolean. OpenDDE takes protenix's featuriser, so a query
@@ -119,6 +122,7 @@ describe("the dialect table", () => {
       "keyMaskedAtomAttention",
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",
+      "nativeNonproteinMsa",
       "padSingleCondUnknownDna",
       // 🔴 WHERE THE ATOM KEY WINDOW SITS, WHICH IS NOT WHETHER ITS PADDED
       // SLOTS ARE MASKED - `maskPaddedKeys` above is the second question. This

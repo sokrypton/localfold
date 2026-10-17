@@ -369,6 +369,10 @@ export const DEFAULT_TUNING = Object.freeze({
   // transitions are 263 of an 825-residue block's 339 dispatches, which is a
   // different question. null takes the constant.
   transitionChunkBytes: null,
+  // 🔴 HOW MANY BYTES OF q, k, v AND THE GATE AN AF2 ATTENTION HOLDS AT ONCE: it projects and attends a block of
+  // batch rows at a time where the four tensors would be larger (webgpu/af2/evoformer/block.js). null takes 128
+  // MiB; 0 is one block, the whole tensor - the control.
+  attentionBlockBytes: null,
   // 🔴 HOW MANY BYTES OF CACHED PAIR ATTENTION BIAS A SCHEDULE MAY HOLD,
   // overriding PAIR_LOGITS_CACHE_BYTES. That constant's 64 MiB was measured at
   // 200 TOKENS, where it covers all twenty-four blocks; the cache is
@@ -397,6 +401,8 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendMatrix: null,
   // grid.attend's register-tiled vector form (a 4x4 score block a lane) where the matrix form is off.
   gridAttendTiled: null,
+  // ...its tiles and q.k products in f16, on a device with shader-f16 and a stack not pinned to f32 (true is on)
+  gridAttendTiledHalf: null,
   // AF2's flash attention in the same register-tiled form (webgpu/kernels/attention.js), on the f32 path.
   attentionTiled: null,
   esmfold2TokenRowTile: null,
@@ -431,6 +437,22 @@ export const DEFAULT_TUNING = Object.freeze({
   // dispatch, and one that does not fill the device leaves it idle - so a card
   // with room should raise it. See transitionSplitChunkRows.
   pairTransitionChunkBytes: null,
+  // 🔴 THE VECTOR SPLIT'S GEMM BLOCK, PER ARITHMETIC: { f32: "RxCxK", f16: "RxCxK" }; null (or a block the device
+  // cannot stage) is VECTOR_GEMM_BLOCK. See vectorGemmBlockStorage in webgpu/af3/trunk/transition.js.
+  vectorGemmBlock: null,
+  // ...and its arithmetic, "f16" or "f32"; null is the stack's own policy (f16 where ESMFold2's trunk stages and
+  // accumulates in f16, f32 everywhere else). The control arm for the f16 GEMM.
+  vectorTransitionArithmetic: null,
+  // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the
+  // control. See webgpu/af2/evoformer/block.js.
+  triangleAccumulatePrecision: null,
+  // ...and AF2's outer-product-mean vector GEMMs' arithmetic: null is f16 where the device has it, "f32" the control.
+  opmVectorArithmetic: null,
+  // ...and AF3's vector grid projection: null is f16 where the pair track stages in f16, "f32" the control.
+  gridProjectArithmetic: null,
+  // ...and the AF3 denoiser's staged token tiles: null is f16 where the device has it, "f32" the control. See
+  // `stage16` in webgpu/af3/diffusion/diffusion-transformer.js.
+  diffusionStagePrecision: null,
   // 🔴 AND THE TRIANGLE PROJECTION ON THE SAME UNITS, which with the transition
   // split is the LARGEST kernel left in an ESMFold2 trunk - 130.6 ms of 494.
   // Unlike the transition it needs no new memory: its source and both its
@@ -1211,6 +1233,85 @@ const PRIORS = new Map([
     // GEMM with the model's deepest K onto units that exist) rather than a
     // tuned constant, but re-sweep before trusting it on another Apple part.
     opmMatrixContract: true,
+    // 🔴 THE MSA ROW ATTENTION'S PAIR BIAS WITH ITS LAYER NORM, WHICH THE A100 DECLINED AT 0.2-0.9% OF A BLOCK
+    // (docs/AF2.md). Here the separate `pair-normalize` - a workgroup a pair row, twelve barriers for 128 channels -
+    // is slow AND erratic: profile-af2-block.js, two rounds a shape, pair-normalize + pair-bias against the fused
+    // kernel, and the block:
+    //
+    //   length x rows   unfused ms      fused ms      block, unfused -> fused
+    //   59  x 128       0.23 / 0.51     0.12 / 0.17   20.25 / 20.59 -> 20.50 / 20.18
+    //   150 x 256       6.79 / 9.45     0.39 / 0.37   130.8 / 136.8 -> 125.9 / 123.3
+    //   255 x 512       2.06 / 3.52     0.75 / 0.85   547.4 / 470.5 -> 543.1 / 470.0
+    //
+    // (and 25.8 ms of a 498 ms block once at 255 x 512). The fused arm never loses. It regroups the statistics, so it
+    // is not bit-identical: 6MRR RMSD and pLDDT below, in the commit that set this.
+    fusedPairBias: true,
+    // 🔴 THE TILED grid.attend WITH ITS TILES IN f16, MEASURED ON AN M5 UNDER STOCK FLAGS - no Apple part had run the
+    // tiled form (it was ampere's). AF3 int5, 255 tokens, a trunk pass, two rounds interleaved: grid.attend 668 / 690
+    // ms untiled -> 491 / 505 tiled in f16 (the f32 tiled form is level with the untiled one, 635 / 660), the whole
+    // pass's GPU time 3443 / 3554 -> 3323 / 3413. Tiles of 8x4 are 2.5x WORSE (1616). The f16 arm stages q, k, v and P
+    // in halves and takes the q.k dot four products at a time in f16; the softmax statistics and the output stay f32.
+    // 🔴 AND NOT SET, BECAUSE THE M2 LOSES WHAT THE M5 GAINS AND THE BROWSER CANNOT TELL THEM APART: both report
+    // `apple / metal-3`, nothing more (adapter.info's device and description are empty). On the M2 (10-core GPU,
+    // macOS 13.2, Chrome 154, stock flags), the same pass, two rounds alternated: grid.attend 995 / 1073 ms untiled ->
+    // 1444 / 1502 tiled in f16, the pass's GPU 5455 / 5805 -> 5675 / 6028 (+4%) - against the M5's -3.5%. Most Apple
+    // visitors are not on an M5, so the prior leaves both knobs unset and the DEVICE answers: an Apple GPU with f16
+    // races the two forms once, before its first pair track compiles (webgpu/af3/trunk/grid-attend-race.js, GPU
+    // timestamps in one submit, 256 tokens; probe-grid-attend-race.js prints it). On the M5: 5.95 ms untiled against
+    // 4.18 tiled, the same five runs of five, ~0.4 s once a page; the trunk pass 3248 / 3263 -> 3071 / 3081 ms GPU.
+    // `--tune=gridAttendTiled=false,gridAttendTiledHalf=false` (or true) answers instead and skips the race.
+    // 🔴 THE TRIANGLE'S PROJECTION TILE AT 32x32, AMPERE'S, MEASURED ON AN M5 UNDER STOCK FLAGS. bench-triangle-project
+    // at 255 tokens: project 5.06 -> 4.79 ms, project-out 3.26 -> 2.91, contract untouched, relRMS 0 (the tile
+    // reorders no sum). AF3 int5's 255-token trunk pass, three rounds interleaved: tri.project-out 278 / 292 / 295 ->
+    // 234 / 239 / 239 ms, tri.project 342 / 359 / 364 -> 335 / 342 / 344, the pass's GPU 3179 / 3305 / 3344 -> 3197 /
+    // 3259 / 3301. A wider output tile (outColumns 64) took project-out 10-18 ms further and the pass did not follow.
+    // ...and on the M2, the same pass alternated: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project 635 / 1003
+    // -> 599 / 1004 - so it holds on both parts.
+    trianglePairProjectTile: { rows: 32, columns: 32 },
+    // 🔴 NOT TIERED ON APPLE: THE FIRST FOLD RAN EVERY KERNEL WITH OPAQUE LOOP BOUNDS AND PAID MORE THAN THE COMPILE IT
+    // SAVED. "tiered" (DEFAULT_TUNING) was measured on NVIDIA, whose driver compile dominates a fresh VM's first fold;
+    // Apple's compiles these kernels in a fraction of that, and an opaque bound costs the M5 its unrolling for the whole
+    // first fold: AF3 6MRR's denoiser 74 ms a step against 39 with constant bounds, the step time flat from the first
+    // step - not a clock ramp (a 10 s pause between folds leaves the second fast). Measured with Chrome's Metal shader
+    // cache emptied before each arm (a visitor's first visit), stock Chrome 154, AF3 int5, two rounds alternated:
+    //   6MRR (68 tokens)   first fold 4.5 / 4.6 s tiered -> 2.8 / 2.9 off, the second 2.3 either way
+    //   5CAJ (255 tokens)  first fold 14.4 / 14.5 s      -> 9.7 / 9.7,      the second 9.4-9.6
+    // The same pLDDT to the last digit (the arithmetic is untouched); AF2's monomer at 59 residues level (1186 / 1191
+    // against 1179 ms, the same checksum). Measured on the M5; the M2 compiles on a slower CPU, so it wants re-checking
+    // there (docs/M5-HANDOFF.md).
+    runtimeLoopBounds: false,
+    // 🔴 THE DIFFUSION TRANSFORMER'S TOKEN TILE AT 8 FROM 200 TOKENS, MEASURED ON AN M5 UNDER STOCK FLAGS. Below this
+    // the default (4, the M2's: 8 lost there at 150 tokens, 103 / 105 against 106 / 113 ms) holds; above, the tile's
+    // weight traffic is what binds. bench-head.js, a denoiser call, two rounds alternated, tile 4 against 8:
+    //   100 tokens 44 / 44 -> 44 / 44 ms, 150 63 / 63 -> 60 / 61, 200 83 / 82 -> 79 / 79, 255 107 / 107 -> 97 / 98
+    // (16 is level with 8 at 255; 68 tokens loses with 8, 33 -> 36). A schedule, not arithmetic: the same fold.
+    // Not measured on an M2 at 200 and above.
+    diffusionTokenTile: { below: 4, atOrAbove: 8, crossover: 200 },
+    // 🔴 THE VECTOR SPLIT TRANSITION'S BLOCK, MEASURED ON AN M5 UNDER STOCK FLAGS - the GEMM every Apple visitor runs on
+    // a pair track of 192 channels and up (ESMFold2, protenix2, OpenDDE, IntelliFold-2). The A100's 64 x 64 x 16 gives a
+    // lane a 4 x 4 tile, five workgroup reads for four vec4 multiply-adds; bench-transition.js, 256 channels at 255
+    // tokens, the whole split: 69.5-70.9 ms -> 60.6 at 128 x 128 x 8 in f32 (the same sums in the same k order:
+    // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
+    // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
+    vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
+    // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
+    // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
+    // row 128 x 255 6.13 -> 5.05 ms, column 128 x 255 3.18 -> 2.55, column 512 x 255 48.4 -> 38.9, triangle 255 x 255
+    // 6.10 -> 5.05 (8 is between, 16 level with 4; the vec4 score and two queries a lane slower). In the block
+    // (profile-af2-block.js, 255 residues x 128 rows, two rounds alternated): 115.0 / 118.7 -> 112.6 / 111.8 ms, the
+    // four flash kernels 17% faster. It reassociates the online softmax (relRMS ~1e-7): fold-af2.js, 3 recycles, CA RMSD
+    // between the arms 0.006 A (59 residues, against 0.103 for a seed change) and 0.016 A (5CAJ templated, against
+    // 0.652), pLDDT 96.562 -> 96.581 and 81.777 -> 81.793. AF3's denoiser level (90.2 / 90.1 against 89.9 / 90.8 ms).
+    // 🔴 AND NOT SET: THE M2 LOSES MORE THAN THE M5 GAINS, AND THE BROWSER CANNOT TELL THEM APART (both report
+    // `apple / metal-3`). On the M2 (stock Chrome 154), profile-af2-block.js at 255 residues x 128 rows, two rounds
+    // alternated: the block 196.0 / 194.7 ms with group 4 against 178.8 / 179.5 with 1 (+9%), the four flash kernels
+    // 46.5 / 46.4 against 30.2 / 32.1; bench-msa-attention.js row 128 x 255: 19.4-20.9 against 9.6-10.3 ms. Group 1
+    // stays the default; `--tune=attentionGroup=4` is the M5's arm (a race, as grid-attend-race.js, would win both).
+    // 🔴 AND THE GRID PROJECTION STAYS IN f32 HERE FOR THE SAME REASON. f752a185 made it f16 wherever the pair track
+    // stages in f16 - grid.project 475 / 500 -> 328 / 344 ms a pass on the M5 - and on the M2 it is the other way:
+    // bench-grid-project.js 255 tokens 12.2-14.9 ms in f32 against 15.1-18.7 in f16 (three runs), in the trunk
+    // grid.project 707 / 719 against 870 / 898. Only Apple's entry pins it; other f16 devices keep the rule.
+    gridProjectArithmetic: "f32",
   }],
 ], );
 

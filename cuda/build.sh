@@ -11,7 +11,7 @@
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
 # in parallel, each to a temporary file moved into place only when whole - so cuda/<port>/localfold-<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
-# /tmp/localfold-cuda-build holds this script's pid (cuda/worker.py waits on it rather than
+# /tmp/localfold-cuda-build holds this script's pid (python/localfold/worker.py waits on it rather than
 # refusing a fold that arrives mid-build); the log is /tmp/localfold-cuda-build.log. A port already
 # built for this card from these sources is left alone.
 #
@@ -62,11 +62,11 @@ for name in af3-featurise af2-featurise ef2-featurise resolve-templates chem-pro
 done
 # (no GPU: the featurisers still build, the ports cannot)
 if [ "${ports[*]}" = featurise ]; then
-  status=0; for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+  status=0; for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || status=1; done
   [ $status = 0 ] || { echo "featuriser build failed - $log:" >&2; tail -20 "$log" >&2; }
   exit $status
 fi
-if [ -z "$cc" ]; then for pid in "${pids[@]}"; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
+if [ -z "$cc" ]; then for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
   case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2|msap) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
@@ -93,6 +93,6 @@ for port in "${ports[@]}"; do
   pids+=($!)
 done
 status=0
-for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || status=1; done
 [ $status = 0 ] || { echo "native build failed - $log:" >&2; tail -20 "$log" >&2; }
 exit $status

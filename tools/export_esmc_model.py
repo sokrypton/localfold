@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import sys
 
@@ -88,6 +89,70 @@ SHIM_TENSORS = (
 )
 
 
+class PublishedEsmc:
+    """biohub's PUBLISHED layout (ESMC-6B, and any `esm` >= 3.4 save) read under the fused names below.
+
+    A sharded checkpoint (`model.safetensors.index.json`) naming each projection on its own - `esmc.layers.N.self_attn.
+    q_proj.weight`, `mlp.gate_proj.weight` - where this exporter reads TransformerEngine's fused ones. `esm`'s
+    checkpoint_layout.py is the conversion, and it is exact: a fused weight is the ROW-WISE concatenation of its parts,
+    q|k|v and gate|up in that order (EsmcLayerNormMLP splits fc1 as `x1, x2 = chunk(2)`, `silu(x1) * x2`).
+    """
+
+    ROOT = {'esmc.embed.weight': 'esmc.embed_tokens.weight', 'esmc.transformer.norm.weight': 'esmc.norm.weight'}
+    BLOCK = {'attn.layernorm_qkv.layer_norm_weight': 'input_layernorm.weight',
+             'attn.layernorm_qkv.layer_norm_bias': 'input_layernorm.bias',
+             'attn.q_ln.weight': 'self_attn.q_norm.weight', 'attn.k_ln.weight': 'self_attn.k_norm.weight',
+             'attn.out_proj.weight': 'self_attn.o_proj.weight',
+             'ffn.layer_norm_weight': 'post_attention_layernorm.weight',
+             'ffn.layer_norm_bias': 'post_attention_layernorm.bias', 'ffn.fc2_weight': 'mlp.down_proj.weight'}
+    FUSED = {'attn.layernorm_qkv.weight': ('self_attn.q_proj.weight', 'self_attn.k_proj.weight', 'self_attn.v_proj.weight'),
+             'ffn.fc1_weight': ('mlp.gate_proj.weight', 'mlp.up_proj.weight')}
+
+    def __init__(self, directory):
+        sharded = directory / 'model.safetensors.index.json'
+        if sharded.exists():
+            index = json.loads(sharded.read_text())['weight_map']
+        else:                                   # (one file: ESMC-300M-1500000's, for instance)
+            with SafeTensors(directory / 'model.safetensors') as one:
+                index = {k: 'model.safetensors' for k in one.keys()}
+        self.files = {f: SafeTensors(directory / f) for f in sorted(set(index.values()))}
+        self.where = index
+        self.layers = len({k.split('.')[2] for k in index if k.startswith('esmc.layers.')})
+
+    def _raw(self, name):
+        return self.files[self.where[name]][name]
+
+    def _published(self, name):
+        if name in self.ROOT:
+            return [self.ROOT[name]]
+        parts = name.split('.')
+        if name.startswith('esmc.transformer.blocks.'):
+            leaf, base = '.'.join(parts[4:]), 'esmc.layers.%s.' % parts[3]
+            if leaf in self.FUSED:
+                return [base + x for x in self.FUSED[leaf]]
+            if leaf in self.BLOCK:
+                return [base + self.BLOCK[leaf]]
+        raise KeyError(name)
+
+    def keys(self):
+        names = list(self.ROOT)
+        for layer in range(self.layers):
+            names += ['esmc.transformer.blocks.%d.%s' % (layer, leaf) for leaf in list(self.BLOCK) + list(self.FUSED)]
+        return names
+
+    def shape(self, name):
+        shapes = [self.files[self.where[p]].shape(p) for p in self._published(name)]
+        return (sum(x[0] for x in shapes),) + tuple(shapes[0][1:])
+
+    def __getitem__(self, name):
+        parts = [self._raw(p) for p in self._published(name)]
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+
+    def close(self):
+        for f in self.files.values():
+            f.close()
+
+
 class ShardWriter:
     """Lay tensors into float32 shards, four-byte aligned, none over the limit."""
 
@@ -130,16 +195,22 @@ def main():
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
     parser.add_argument('--out', default='model-esmc-600m-f32')
     parser.add_argument('--include-lm-head', action='store_true')
+    parser.add_argument('--residual-scale', type=float, default=None,
+                        help='the blocks\' residual divisor (default sqrt(layers / 36), as the model computes it)')
     arguments = parser.parse_args()
 
-    tower_dir = ROOT / arguments.esmc
+    tower_dir = ROOT / arguments.esmc          # (an absolute path stays itself)
     fold_dir = ROOT / arguments.esmfold2
     out_dir = ROOT / arguments.out
     out_dir.mkdir(parents=True, exist_ok=True)
     for stale in out_dir.glob('*.f32.bin'):
         stale.unlink()
 
-    tower = SafeTensors(tower_dir / 'model.safetensors')
+    def single_file_published():
+        with SafeTensors(tower_dir / 'model.safetensors') as probe:
+            return 'esmc.embed_tokens.weight' in probe
+    published = (tower_dir / 'model.safetensors.index.json').exists() or single_file_published()
+    tower = PublishedEsmc(tower_dir) if published else SafeTensors(tower_dir / 'model.safetensors')
     fold = SafeTensors(fold_dir / 'model.safetensors')
     writer = ShardWriter(out_dir)
 
@@ -150,10 +221,14 @@ def main():
     # the head count is derivable: no tensor's shape carries it, and 1152
     # channels reads just as well as 16 heads of 72.
     heads = d_model // 64
-    # 🔴 AND THE RESIDUAL SCALE IS A CONFIG FIELD, NOT A TENSOR. It is 1 in the
-    # 300M and 600M checkpoints this exports; a checkpoint that scales its
-    # residual would need this read from its config rather than assumed.
-    residual_scale = 1.0
+    # 🔴 AND THE RESIDUAL SCALE IS NOT A TENSOR: every ESM-C block divides both
+    # branches by sqrt(n_layers / 36) (esm's EsmcTransformerStack, scale_residue
+    # always on; tools/esmc/esmc_forward.py derives it the same way) - 1 at 600M
+    # (36 layers), 1.4907 at 6B (80). 🔴 This said 1.0 for every checkpoint, so the
+    # 300M bundle (30 layers, where the rule gives 0.9129) was exported with 1.0;
+    # --residual-scale=1 reproduces that export.
+    residual_scale = (arguments.residual_scale if arguments.residual_scale is not None
+                      else math.sqrt(layers / 36))
 
     def add(name, values):
         """Transposed where the GPU wants (inner, columns); verbatim otherwise."""

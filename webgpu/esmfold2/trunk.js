@@ -46,7 +46,7 @@ import {
   TRANSITION_SPLIT_MIN_CHANNELS,
   TRANSITION_ORDER,
 } from "../af3/trunk/transition.js";
-import {
+import { matrixContractionOverflows,
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
 } from "../kernels/triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../kernels/triangle/weights.js";
@@ -224,6 +224,7 @@ export class Esmfold2TrunkGpu {
       && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes);
     const triangleProjectMatrix = !leanPair
       && tuning.triangleProjectMatrix === true && splitConfig !== null
+      && !matrixContractionOverflows(this.device)
       && channels >= (tuning.triangleProjectMatrixMinChannels
         ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)
       ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
@@ -234,7 +235,10 @@ export class Esmfold2TrunkGpu {
     // pair track takes from splitTransitionConfig, and the reason: no stock
     // browser has matrix units, so this was the fused kernel for every visitor.
     const pairTransitionSplit = splitConfig === null
-      ? splitTransitionConfig(this.device, channels)
+      // ...multiplying in f16 where this trunk stages and accumulates in f16 (the table above): 1.66x on the GEMM
+      // that is half this trunk on an Apple part - see vectorGemmBlockStorage in webgpu/af3/trunk/transition.js
+      ? splitTransitionConfig(this.device, channels, {
+          arithmetic: stagedPrecision === "f16" && accumulatePrecision === "f16" ? "f16" : "f32" })
       : tuning.pairTransitionSplit === true
         && channels >= (tuning.pairTransitionSplitMinChannels
           ?? TRANSITION_SPLIT_MIN_CHANNELS)

@@ -92,10 +92,14 @@ describe("the AlphaFold 3 families", () => {
   // direction: a dropdown offering a family with no bundle fails at load.
   it("names no family it does not have", () => {
     const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    // ...a family a NATIVE port folds counts, where the page declares it so: biohub's released ESMFold2-Fast is the
+    // ESM-C 6B choice on this row, and no WebGPU bundle exists for it (web/native-bridge.js shows it from /health)
+    const nativeOnly = [...(app.match(/const NATIVE_ONLY_FAMILIES = \[([^\]]*)\]/)?.[1] ?? "")
+      .matchAll(/"([\w-]+)"/g)].map((m) => m[1]);
     const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));
     for (const [, family] of variants.slice(0, variants.indexOf("};"))
         .matchAll(/"(ef2-[\w-]+)"/g)) {
-      assert.ok(FOLDING_FAMILIES.includes(family),
+      assert.ok(FOLDING_FAMILIES.includes(family) || nativeOnly.includes(family),
         `PLM_FAMILIES names ${family}, which is not a folding family`);
     }
   });

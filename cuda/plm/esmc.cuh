@@ -96,9 +96,9 @@ inline void towerGemm(const float* X, const std::string& w, float* Y, size_t row
                     Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     return;
   }
-  if (alpha != 1.f) { fprintf(stderr, "towerGemm: a residual scale needs the resident path\n"); exit(1); }
-  if (FAST && TOWER16) gemmH(X, Wh("c/" + w), Y, rows, in, out, beta);
-  else gemm(X, Cw(w), Y, rows, in, out, beta);
+  // (alpha: the residual scale, on every path - it was the resident one's alone, and 300M's 0.9129 then exited here)
+  if (FAST && TOWER16) gemmH(X, Wh("c/" + w), Y, rows, in, out, beta, alpha);
+  else gemm(X, Cw(w), Y, rows, in, out, beta, 0, 0, alpha);
 }
 
 inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {

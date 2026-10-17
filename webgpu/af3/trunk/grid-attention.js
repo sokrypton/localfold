@@ -516,7 +516,12 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
   // lane-strided loop strides by it. At 256 or below the two are equal and this
   // is the kernel it was.
   const projectWorkgroup = Math.min(projectLanes, 256);
-  const project = `${common}
+  // 🔴 f16 ARITHMETIC ON REQUEST (`shape.projectArithmetic`, unpacked q/k/v/gate only): the activation tile in f16 and
+  // 32 channels' products summed in f16 before they join an f32 accumulator - which halves the tile and the registers
+  // a row costs, so a taller row tile serves each weight read. See PROJECT_ROWS_F16.
+  const project16 = shape.projectArithmetic === "f16" && !packQkvg;
+  const AT = project16 ? "f16" : "f32";
+  const project = `${project16 ? "enable f16;\n" : ""}${common}
 const ROWS: u32 = ${ROWS}u;
 const LANES: u32 = ${projectLanes}u;
 const WG: u32 = ${projectWorkgroup}u;
@@ -548,7 +553,7 @@ ${chunkBinding(6)}
 // unmoved at 2324 ms. So this kernel is not waiting on its workgroup reads,
 // and the instruction count does not govern it - the one global weight read a
 // channel does. Do not transpose the activation tile.
-var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
+var<workgroup> act: array<${AT}, ${channels} * ${ROWS}>;
 ${offsets.gatingQueryBias === undefined ? "" : `
 // 🔴 ONE SCALAR OUT OF A vec4-BOUND ARRAY, WITHOUT A DYNAMIC SUBSCRIPT. This
 // kernel binds the weights as vec4 - it is the only one that does - so
@@ -579,8 +584,8 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
     let source = select(0u, ${chunked
       ? sourceRow.replace(/row/g, "(chunk.x * N + row)") : sourceRow}, row < ${LIVE});
     for (var c = local; c < CHANNELS; c += WG) {
-      act[r * CHANNELS + c] = select(
-        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < ${LIVE});
+      act[r * CHANNELS + c] = ${AT}(select(
+        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < ${LIVE}));
     }
   }
   workgroupBarrier();
@@ -622,14 +627,23 @@ ${[["q", "x"], ["k", "y"], ["v", "z"], ["gate", "w"]].map(emit).join("\n")}
   // One iteration where WG == WIDTH, which is every model but OpenDDE.
   for (var out = local; out < WIDTH; out += WG) {
 ${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
-
+${project16 ? `
+  for (var c0 = 0u; c0 < CHANNELS; c0 += 32u) {
+${overRows((r) => `    var part${r} = vec4<f16>(0.0);`)}
+    for (var c = c0; c < min(c0 + 32u, CHANNELS); c += 1u) {
+      let w = vec4<f16>(weights[W_QKVG + c * WIDTH + out]);
+${overRows((r) => `      part${r} = fma(vec4<f16>(act[${r}u * CHANNELS + c]), w, part${r});`)}
+    }
+${overRows((r) => `    acc${r} += vec4<f32>(part${r});`)}
+  }
+` : `
   for (var c = 0u; c < CHANNELS; c += 1u) {
     // (channels, out, 4) - see packGridAttentionWeights - so consecutive
     // threads read consecutive vec4s, and this one load is used ROWS times.
     let w = weights[W_QKVG + c * WIDTH + out];
 ${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
   }
-
+`}
 ${overRows((r) => `  if (first + ${r}u < ${LIVE}) {
     let index${r} = (first + ${r}u) * WIDTH + out;
     q[index${r}] = acc${r}.x;
@@ -939,8 +953,16 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
     const eachAB = (f) => AQ.flatMap((a) => BKs.map((b) => f(a, b))).join("\n");
     const T = [0, 1, 2, 3, 4, 5, 6, 7];
     const rowOf = chunked ? "local_row" : "row";
+    // 🔴 HALF TILES (`gridAttendTiledHalf`, a device with shader-f16): q, k, v and P staged in f16 and the q.k dot
+    // products taken four at a time in f16 - the running max, the sums and the output stay f32. On an M5 under stock
+    // flags grid.attend 668 -> 491 ms a 255-token trunk pass: workgroup traffic halves, and the key tile no longer
+    // shares P's array (P's own is f16 too). Off on a stack pinned to f32 (the confidence heads).
+    const H = shape.attendTiledHalf === true;
+    const TE = H ? "f16" : "f32";
+    const toT = (e) => (H ? `vec4<f16>(${e})` : e);
+    const fromT = (e) => (H ? `vec4<f32>(${e})` : e);
     const maxOf = (a) => BKs.map((b) => `logit${a}_${b}`).reduce((x, y) => `max(${x}, ${y})`);
-    return `${common}
+    return `${H ? "enable f16;\n" : ""}${common}
 @group(0) @binding(0) var<storage, read> q: array<${store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(1) var<storage, read> k: array<${store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(2) var<storage, read> v: array<${store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
@@ -962,12 +984,14 @@ const HD4: u32 = 8u;
 // A staged row is nine vec4 rather than eight, so eight lanes reading eight different rows land in
 // eight different banks.
 const STRIDE: u32 = 9u;
-var<workgroup> q_tile: array<vec4<f32>, ${BQ * 9}>;
+var<workgroup> q_tile: array<vec4<${TE}>, ${BQ * 9}>;
 // The key tile and P share one array: P is written after the barrier that follows the last read of
 // the keys, and the next tile's keys are staged after the barrier that follows the last read of P.
 // That is what keeps this inside WebGPU's guaranteed 16 KiB (14.6 KiB at 4x4).
-var<workgroup> kp_tile: array<vec4<f32>, ${BK * Math.max(9, PSTRIDE)}>;
-var<workgroup> v_tile: array<vec4<f32>, ${BK * 8}>;
+${H ? `var<workgroup> kp_tile: array<vec4<f16>, ${BK * PSTRIDE}>;
+var<workgroup> k_tile: array<vec4<f16>, ${BK * 9}>;`
+    : `var<workgroup> kp_tile: array<vec4<f32>, ${BK * Math.max(9, PSTRIDE)}>;`}
+var<workgroup> v_tile: array<vec4<${TE}>, ${BK * 8}>;
 var<workgroup> red: array<f32, ${BQ * 8}>;
 
 @compute @workgroup_size(64)
@@ -988,7 +1012,7 @@ ${chunked ? `  let local_row = group.y;
   for (var index = local; index < ${BQ * 8}u; index += 64u) {
     let slot = index / HD4;
     let i = min(q0 + slot, N - 1u);
-    q_tile[slot * STRIDE + index % HD4] = ${vec4Of("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`)};
+    q_tile[slot * STRIDE + index % HD4] = ${toT(vec4Of("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`))};
   }
 ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
   let bias_row${a} = head * PAIRS + min(i${a}, N - 1u) * N;
@@ -1002,16 +1026,16 @@ ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
       let slot = index / HD4;
       let j = min(j0 + slot, N - 1u);
       let source = ((${rowOf} * N + j) * HEADS + head) * HD4 + index % HD4;
-      kp_tile[slot * STRIDE + index % HD4] = ${vec4Of("k", "source")};
-      v_tile[index] = ${vec4Of("v", "source")};
+      ${H ? "k_tile" : "kp_tile"}[slot * STRIDE + index % HD4] = ${toT(vec4Of("k", "source"))};
+      v_tile[index] = ${toT(vec4Of("v", "source"))};
     }
     workgroupBarrier();
 
 ${eachAB((a, b) => `    var s${a}_${b} = 0.0;`)}
 ${T.map((t) => `    {
 ${eachA((a) => `      let qv${a} = q_tile[(${a * 8}u + qg) * STRIDE + ${t}u];`)}
-${eachB((b) => `      let kv${b} = kp_tile[(${b * 8}u + kg) * STRIDE + ${t}u];`)}
-${eachAB((a, b) => `      s${a}_${b} += dot(qv${a}, kv${b});`)}
+${eachB((b) => `      let kv${b} = ${H ? "k_tile" : "kp_tile"}[(${b * 8}u + kg) * STRIDE + ${t}u];`)}
+${eachAB((a, b) => `      s${a}_${b} += ${H ? `f32(dot(qv${a}, kv${b}))` : `dot(qv${a}, kv${b})`};`)}
     }`).join("\n")}
 
 ${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
@@ -1031,11 +1055,11 @@ ${BKs.map((b) => `    let p${a}_${b} = exp(logit${a}_${b} - new_m${a});`).join("
     l${a} = l${a} * alpha${a} + (${BKs.map((b) => `p${a}_${b}`).join(" + ")});
     o${a} = o${a} * alpha${a};`)}
 ${eachB((b) => Array.from({ length: PV }, (_, part) =>
-    `    kp_tile[(${b * 8}u + kg) * ${PSTRIDE}u + qg * ${PV}u + ${part}u] = vec4<f32>(${[0, 1, 2, 3].map((c) => `p${part * 4 + c}_${b}`).join(", ")});`).join("\n"))}
+    `    kp_tile[(${b * 8}u + kg) * ${PSTRIDE}u + qg * ${PV}u + ${part}u] = ${toT(`vec4<f32>(${[0, 1, 2, 3].map((c) => `p${part * 4 + c}_${b}`).join(", ")})`)};`).join("\n"))}
     workgroupBarrier();
     for (var key = 0u; key < ${BK}u; key += 1u) {
-      let vv = v_tile[key * HD4 + kg];
-${Array.from({ length: PV }, (_, part) => `      let p${part} = kp_tile[key * ${PSTRIDE}u + qg * ${PV}u + ${part}u];
+      let vv = ${fromT("v_tile[key * HD4 + kg]")};
+${Array.from({ length: PV }, (_, part) => `      let p${part} = ${fromT(`kp_tile[key * ${PSTRIDE}u + qg * ${PV}u + ${part}u]`)};
 ${[0, 1, 2, 3].map((c) => `      o${part * 4 + c} += p${part}[${c}] * vv;`).join("\n")}`).join("\n")}
     }
   }
@@ -1107,14 +1131,14 @@ export class Af3GridSelfAttentionGpu {
     const attendMatrix = options.attendMatrix ?? false;
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
-        attendMatrix, attendTiled: options.attendTiled ?? false,
+        attendMatrix, attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
       + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
       + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`
-      + `:t${options.attendTiled ?? 0}`;
+      + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),

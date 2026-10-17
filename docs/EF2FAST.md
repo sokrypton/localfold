@@ -3879,7 +3879,7 @@ ratio 0.949/0.985 -> 1.007/0.986, control 1.00).
 `ESMFOLD2_ATOMISED_STEPS` (web/esmfold2-model.js) is the floor: a job with a
 ligand or a modified residue samples at least 64 scheduled steps. The page
 applies it in `samplerPreset`, sends ESMFold2's own count to a runtime (it sent
-AlphaFold 3's table's, which the worker ignored), and cuda/worker.py now passes
+AlphaFold 3's table's, which the worker ignored), and python/localfold/worker.py now passes
 `--steps` to the ESMFold2 binary and mirrors the floor for a job no page sent.
 Cost: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
 
@@ -3889,7 +3889,7 @@ same input through the tool were torn. And a "vendor torn too" first number read
 `coords[-n:]`, which on the vendor's PADDED atom axis is padding: glycerol at
 "13 bonds". The ligand is selected by `atom_attention_mask` and its chain.
 
-Gated: `npm run test:cuda` folds a SMILES biotin through AF3 and ESMFold2 and a
+Gated: `npm run test:native` folds a SMILES biotin through AF3 and ESMFold2 and a
 CCD glycerol through ESMFold2, asserting the ligand's bond count and that no two
 atoms sit closer than 1 A (watched failing with the floor at 15: "18 bonds, closest
 atoms 0.258 A"); test/esmfold2-atomised-steps.test.js holds the page's floor and

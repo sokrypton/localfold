@@ -33,7 +33,8 @@ import {
   deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
 } from "../../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
-import {
+import { settleGridAttendTiling } from "./grid-attend-race.js";
+import { matrixContractionOverflows,
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
   TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS, triangleProjectMatrixFits,
 } from "../../kernels/triangle/project-matrix.js";
@@ -82,6 +83,7 @@ function projectMatrixConfig(device, channels) {
   // A prior decides; with none, the width rule below does (see
   // gridProjectMatrixConfig).
   if (deviceTuning(device).triangleProjectMatrix === false) return false;
+  if (matrixContractionOverflows(device)) return false;   // (see project-matrix.js)
   if (channels < (deviceTuning(device).triangleProjectMatrixMinChannels
     ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   const tile = matrixTile(device) ?? false;
@@ -107,7 +109,7 @@ import { storageBytes } from "../../runtime/storage.js";
 import { releaseWeights } from "../../../shared/af3/weights/weights.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../../runtime/device-memory.js";
-import { splitTransitionConfig, transitionRowTile } from "./transition.js";
+import { splitTransitionConfig, pairTransitionArithmetic, transitionRowTile } from "./transition.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
@@ -449,6 +451,8 @@ export class Af3PairformerStackGpu {
     // knobs: fifteen single-knob arms all read 84.4x before the dump named it.
     // See docs/AF3.md. The trunk leaves this alone and keeps the speed.
     const pairMatrixKernels = this.options?.pairMatrixKernels !== false;
+    // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
+    await settleGridAttendTiling(this.device);
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
@@ -457,6 +461,9 @@ export class Af3PairformerStackGpu {
       // pairformer at its own widths, and a geometry the device cannot hold at
       // one of them resolves to false rather than throwing.
       attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
+      // ...in f16 where the device has it and this stack is not pinned to f32 (the confidence heads are)
+      attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
+        && halfPrecisionAvailable(this.device),
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
@@ -464,8 +471,9 @@ export class Af3PairformerStackGpu {
       // the fused kernel's row tile halves as the widened row grows. See
       // webgpu/af3/trunk/transition.js.
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
-        { f32Only: !pairMatrixKernels }),
+        { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See webgpu/kernels/triangle/project-matrix.js.
       triangleProjectMatrix: pairMatrixKernels

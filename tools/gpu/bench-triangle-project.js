@@ -107,14 +107,17 @@ export async function main(device, args) {
     if (accumulatePrecision !== "f32" && !device.features.has("shader-f16")) continue;
     // "32x16" sets both tiles; "32x16@32x32" sets the projection's and the
     // contraction's separately, since they do not peak at the same shape.
+    // ...and "32x32+64" gives the output projection its own column tile (`outColumns`).
     const [projectSpec, contractSpec] = shapeSpec.split("@");
-    const [rows, columns] = projectSpec.split("x").map(Number);
+    const [tileSpec, outSpec] = projectSpec.split("+");
+    const [rows, columns] = tileSpec.split("x").map(Number);
+    const outColumns = outSpec ? Number(outSpec) : undefined;
     const [contractRows, contractColumns] =
-      (contractSpec ?? projectSpec).split("x").map(Number);
+      (contractSpec ?? tileSpec).split("x").map(Number);
     // The contraction takes the same tile shape, so one arm prices both.
     const shaders = createTriangleShaders({ ...shape, accumulatePrecision },
                                           "f32", offsets, 1e-5, "outgoing",
-                                          "fast", { rows, columns }, false,
+                                          "fast", { rows, columns, ...(outColumns ? { outColumns } : {}) }, false,
                                           { rows: contractRows, columns: contractColumns });
     if (drop) {
       const [pattern, replacement] = surgery[drop];
@@ -126,7 +129,7 @@ export async function main(device, args) {
       }
       if (matched !== 2) throw new Error(`arm ${spec} patched ${matched} of the two kernels`);
     }
-    const build = async (source, buffers) => {
+    const build = async (source, buffers, tileColumns = columns) => {
       const pipeline = await device.createComputePipelineAsync({
         layout: "auto",
         compute: { module: device.createShaderModule({ code: source }), entryPoint: "main" },
@@ -137,7 +140,7 @@ export async function main(device, args) {
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
         }),
-        x: Math.ceil(cZ / columns), y: Math.ceil(pairs / rows),
+        x: Math.ceil(cZ / tileColumns), y: Math.ceil(pairs / rows),
       };
     };
     const contract = await device.createComputePipelineAsync({
@@ -148,7 +151,7 @@ export async function main(device, args) {
     arms.push({
       spec,
       project: await build(shaders.projectAB, [z, mask, weights, a, b]),
-      projectOut: await build(shaders.projectOutput, [z, x, weights, output]),
+      projectOut: await build(shaders.projectOutput, [z, x, weights, output], outColumns ?? columns),
       contract: {
         pipeline: contract,
         bindGroup: device.createBindGroup({

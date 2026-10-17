@@ -1,15 +1,20 @@
-"""The CUDA backend's worker, folding for real: npm run test:cuda.
+"""The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 
-    python3 tools/check-cuda-worker.py             # every case (two go to api.colabfold.com)
-    python3 tools/check-cuda-worker.py --offline   # without the search cases
-    python3 tools/check-cuda-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
-    python3 tools/check-cuda-worker.py --only=6mrr  # just the cases whose name contains it
+    python3 tools/check-native-worker.py             # every case (two go to api.colabfold.com)
+    python3 tools/check-native-worker.py --offline   # without the search cases
+    python3 tools/check-native-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
+    python3 tools/check-native-worker.py --only=6mrr  # just the cases whose name contains it
+    python3 tools/check-native-worker.py --no-af3     # without AlphaFold 3 itself (whose weights need DeepMind's terms)
 
-cuda/worker.py over its own stdin protocol, one process for every case as the broker runs it,
+🔴 AND ON A MAC IT HOLDS THE METAL PORTS: python/localfold/worker.py drives metal/<port> there (NATIVE), the page names the
+backend Metal, and a case may carry a Metal bar of its own (METAL_BARS) where Metal's sampling lands elsewhere on a
+target - each one the Metal gate's own number (metal/af3/gate.py), never a widening for convenience.
+
+python/localfold/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
 form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
 bar, and every result held to the fields the page ingests (web/app.js, cudaPrediction): a PDB, a pLDDT a
-token, a PAE of tokens^2, the token layout, the chains. test:colab's CUDA arm is a stub and proves the
+token, a PAE of tokens^2, the token layout, the chains. test:bridge's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
 
 Needs the native ports built (cuda/colab_setup.sh, or each port's nvcc line) and the bundles on disk
@@ -26,6 +31,11 @@ import sys
 import time
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+NATIVE = "metal" if sys.platform == "darwin" else "cuda"
+NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
+# a case's bar on Metal where it differs from the A100's: Metal's sampling lands elsewhere on these targets, at the
+# Metal gate's own numbers (metal/af3/gate-baseline.m2.json) and the CUDA-translated port's before it
+METAL_BARS = {"protenix2 6mrr": 1.6}      # (1.561 in metal/af3/gate.py; the A100 0.499)
 FIX = os.path.join(REPO, "tools", "fixtures")
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 THREE = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L",
@@ -182,6 +192,31 @@ def cases(offline):
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}], "job": job([S6], ["GOL"])},
          None, None, None, "protein chains only"),
     ]
+    # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/README.md) where their bundles
+    # are on disk under the names fetch-weights gives them - nothing downloads them, so absent is a skip, not a failure
+    weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (     # (fetch.h's home(): no /proc/self/exe on a Mac)
+        os.path.expanduser("~/.cache/localfold") if sys.platform == "darwin" else REPO)
+    released = lambda *dirs: all(os.path.exists(os.path.join(weights, d, "manifest.json")) for d in dirs)
+    if released("model-esmfold2-fast-f32", "model-esmc-6b-int8"):
+        out.append(("esmfold2-fast released (ESM-C 6B) 6mrr", {"family": "ef2-fast",
+                    "controls": controls(**{"model-family": "ef2-fast-600m", "plm-mode": "esmc-6b"}),
+                    "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None))
+    if released("model-esmfold2-f32", "model-esmc-6b-int8"):
+        out.append(("esmfold2 released 6mrr, single sequence", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2-fast-600m", "plm-mode": "esmc-6b-full", "msa-mode": "none"}),
+                    "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None))
+        # what ESMFold2 cannot read is refused by name: its search over a complex, and one merged alignment over two
+        # chains (it reads one alignment a protein chain)
+        out.append(("refused: ESMFold2's search over two protein chains", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2", "msa-mode": "search"}),
+                    "entities": [protein(S6), protein(S6)], "job": job([S6, S6])}, None, None, None, "takes one protein chain"))
+        out.append(("refused: ESMFold2 and one merged alignment over two chains", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2", "msa-mode": "paste", "msa-text": f">101\n{S6}\n"}),
+                    "entities": [protein(S6), protein(S6)], "job": job([S6, S6])}, None, None, None, "one merged alignment"))
+        if not offline:
+            out.append(("esmfold2 released 5caj, MSA searched", {"family": "ef2",
+                        "controls": controls(**{"model-family": "ef2", "msa-mode": "search"}),
+                        "entities": [protein(s5)], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 3.0, None, None))
     if not offline:
         out += [
             ("af3 1brs, MSA searched", {"family": "af3", "controls": controls(**{"msa-mode": "search"}),
@@ -206,7 +241,7 @@ def score(pdb_text, reference, chains):
 
 
 def page_arm(bad):
-    """The website's half: a real broker (tools/colab_backend.py --cuda), a reader's page on it - no
+    """The website's half: a real broker (python/localfold/server.py --native), a reader's page on it - no
     backend picker, CUDA is where its folds go - a sequence and Fold - and what the page made of the answer: the status
     line the worker wrote, a prediction in the page's own shape (its PAE a typed array of tokens^2, the
     model labelled CUDA), and no WebGPU device asked for in the reader's browser."""
@@ -214,8 +249,8 @@ def page_arm(bad):
     import cdp
     import urllib.request
     port, reader_port, token = 8893, 9396, "cuda-check"
-    broker = subprocess.Popen([sys.executable, "tools/colab_backend.py", "--port", str(port),
-                               "--token", token, "--cuda"],
+    broker = subprocess.Popen([sys.executable, "python/localfold/server.py", "--port", str(port),
+                               "--token", token, "--native"],
                               cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     reader = None
     try:
@@ -224,8 +259,8 @@ def page_arm(bad):
             if line.startswith("BACKEND ") or time.time() > deadline:
                 break
         health = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/health?t={token}"))
-        if "cuda" not in health.get("backends", []):
-            bad.append(f"page: /health offers {health.get('backends')} with --cuda")
+        if "native" not in health.get("backends", []) or health.get("native") != NATIVE:
+            bad.append(f"page: /health offers {health.get('backends')} / {health.get('native')} with --native")
             return
         reader, ws = cdp.launch(reader_port, "/tmp/localfold-cuda-page-reader")
         ws.call("Page.enable")
@@ -236,36 +271,75 @@ def page_arm(bad):
             const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
             navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
           }""")
-        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=colab&t={token}")
-        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-live')", 120, "the reader's page")
+        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=native&t={token}")
+        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.native-live')", 120, "the reader's page")
         cdp.evaluate(ws, """(() => {
           for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
             try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
           return true;
         })()""")
         # ...and nothing to choose: the page offers no backend control at all
-        if cdp.evaluate(ws, "!!document.querySelector('#colab-status select')"):
+        if cdp.evaluate(ws, "!!document.querySelector('#native-status select')"):
             bad.append("page: the badge offers a backend select - CUDA is not a choice")
         # the badge's Live preview: present for CUDA, and off means the finished fold only
-        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.colab-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
+        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.native-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
         if not live or not live["shown"] or not live["on"]:
             bad.append(f"page: the Live preview box is {live} - want it shown and on for CUDA")
-        for family, tokens, streamed in (("af3", 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), ("af3", 68, False)):
-            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.colab-live input');
+        lineage = "protenix2" if "--no-af3" in sys.argv else "af3"
+        # the native-only models' options (ESM-C 6B on the PLM row, ESMFold2 on the model row): shown exactly where the
+        # server says it has them, and ESMFold2 folded through the page when it does
+        served = health.get("models", [])
+        shown = cdp.evaluate(ws, """[...document.querySelectorAll('option[data-native-model]')]
+          .filter((o) => !o.hidden).map((o) => o.dataset.nativeModel).sort()""")
+        if shown != sorted(served):
+            bad.append(f"page: the native-only options shown are {shown}, where /health has {sorted(served)}")
+        arms = [(lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), (lineage, 68, False)]
+        if "ef2" in served:
+            arms.insert(3, ("ef2", 68, True))
+        if "ef2-fast" in served:          # (chosen as a reader does: EF2-fast on the model row, ESM-C 6B on the PLM row)
+            arms.insert(3, ("ef2-fast", 68, True))
+        # ...and the lineage again, streamed, after other folds: a later fold's trunk must draw its contact maps (the
+        # first fold's frames used to hold the panel and drop every one)
+        arms.insert(len(arms) - 1, (lineage, 68, True))
+        for family, tokens, streamed in arms:
+            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.native-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
+            # (ESMFold2 is one entry on the model row and the variant row picks the checkpoint, as a reader does it)
+            row, plm = {"ef2-fast": ("ef2-fast-600m", "esmc-6b"), "ef2": ("ef2-fast-600m", "esmc-6b-full")}.get(
+                family, (family, "esmc-600m"))
+            # (a search chosen FIRST, as a reader's row might read for another model, then the model: ESMFold2 starts at
+            # "ESM-C only" whatever the row read - which the rows check below sees)
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);
-              g('model-family').value = '{family}';
-              g('model-family').dispatchEvent(new Event('change', {{ bubbles: true }}));
+              const set = (id, v) => {{ g(id).value = v; g(id).dispatchEvent(new Event('change', {{ bubbles: true }})); }};
+              set('model-family', 'af3');
+              if (g('msa-mode')) set('msa-mode', 'search');
               window.__entityList.set([{{ type: 'protein', value: '{S6}', copies: 1, modifications: [] }}]);
-              if (g('msa-mode')) {{ g('msa-mode').value = 'none'; g('msa-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
+              set('model-family', '{row}');
+              if (g('plm-mode')) set('plm-mode', '{plm}');
               return true;
             }})()""")
+            if family in ("ef2-fast-600m", "ef2-fast", "ef2"):
+                # the rows a reader sees for ESMFold2, which folds from its language model with an alignment as an
+                # opt-in: the variant row and its step dial; no MSA row for the experimental checkpoint (ESM-C alone);
+                # for the 6B two an MSA row starting at "ESM-C only" - though the reader's row read a search before
+                rows = cdp.evaluate(ws, """(() => { const g = (id) => document.getElementById(id);
+                  const m = g('msa-mode');
+                  return { variant: g('plmGroup')?.hidden, msa: g('msaModeGroup')?.hidden, steps: g('af3CountGroup')?.hidden,
+                           mode: m?.value, label: m?.selectedOptions?.[0]?.textContent?.trim() }; })()""")
+                released = family != "ef2-fast-600m"
+                want = {"variant": False, "msa": not released, "steps": False, "mode": "none", "label": "ESM-C only"}
+                if rows != want:
+                    bad.append(f"page: {family}'s rows read {rows} - want {want}")
+            # (the gate stays offline: every arm folds without a search - ESMFold2's by its own default, the others set)
+            cdp.evaluate(ws, """(() => { const m = document.getElementById('msa-mode'); if (!m) return true;
+              m.value = 'none'; m.dispatchEvent(new Event('change', { bubbles: true })); return true; })()""")
             cdp.wait_for(ws, "!document.getElementById('predict').disabled", 60, "the fold button")
+            shownBefore = cdp.evaluate(ws, "window.__trunkContactsShown ?? 0")
             started = time.time()
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")
             cdp.wait_for(ws, """(() => { const t = document.getElementById('status-message').textContent;
-              return / on CUDA .* done in |failed|refused|Error|error/.test(t); })()""", 300, f"a CUDA fold of {family}")
+              return / on (CUDA|Metal) .* done in |failed|refused|Error|error/.test(t); })()""", 300, f"a native fold of {family}")
             seconds = time.time() - started           # (click to the result's status line, as a reader waits)
             time.sleep(1.0)
             got = cdp.evaluate(ws, """(() => {
@@ -282,13 +356,31 @@ def page_arm(bad):
                                         const fs = v?.objectsData?.[v?.currentObjectName]?.frames ?? [];
                                         return { contact: fs.filter((f) => f.maps?.contact).length,
                                                  pae: fs.filter((f) => f.pae).length }; })(),
-                       gpu: window.__readerGpu };
+                       gpu: window.__readerGpu,
+                       // the last frame against the one before it, as drawn (raw: no fitting) - the result lands where
+                       // the frames are, or the picture jumps (web/pdb-superpose.js)
+                       jump: (() => { const v = Object.values(window.py2dmol_viewers ?? {})[0]?.renderer;
+                                      const fs = v?.objectsData?.[v?.currentObjectName]?.frames ?? [];
+                                      if (fs.length < 2) return null;
+                                      const a = fs[fs.length - 2].coords, b = fs[fs.length - 1].coords;
+                                      if (!a || !b || a.length !== b.length) return 'no coords';
+                                      let s = 0; for (let i = 0; i < a.length; i += 1)
+                                        s += (a[i][0] - b[i][0]) ** 2 + (a[i][1] - b[i][1]) ** 2 + (a[i][2] - b[i][2]) ** 2;
+                                      return Math.sqrt(s / a.length); })() };
             })()""")
-            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
+            jump = f"{got['jump']:.2f} A" if isinstance(got["jump"], (int, float)) else str(got["jump"])
+            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  last step {jump:>7s}  {got['status'][:60]}")
             problems = []
-            if " on CUDA " not in got["status"] or "done in" not in got["status"]:
+            # every streamed fold of the AF3 lineage draws its trunk's contact maps before its first frame - the second
+            # fold in a page too, where the first fold's frames used to hold the panel and drop them all
+            shown = cdp.evaluate(ws, "window.__trunkContactsShown ?? 0") - shownBefore
+            if streamed and family in ("af3", "protenix2", "intellifold2", "boltz2", "rosettafold3", "opendde") and shown < 1:
+                problems.append("no trunk contact map was drawn")
+            if got["jump"] is not None and (not isinstance(got["jump"], (int, float)) or got["jump"] > 2.0):
+                problems.append(f"the result's frame lands {got['jump']} A from the last streamed one, as drawn")
+            if f" on {NATIVE_NAME} " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
-            if not (got["model"] or "").endswith("(CUDA)"):
+            if not (got["model"] or "").endswith(f"({NATIVE_NAME})"):
                 problems.append(f"model {got['model']!r}")
             if got["pae"] != tokens * tokens or not got["paeTyped"] or got["plddt"] != tokens:
                 problems.append(f"PAE {got['pae']} (typed {got['paeTyped']}), pLDDT {got['plddt']}")
@@ -297,7 +389,7 @@ def page_arm(bad):
             if not streamed:
                 if got["frames"] > 1:
                     problems.append(f"Live preview off and the viewer still holds {got['frames']} frames")
-            elif family in ("af3", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
+            elif family in ("af3", "protenix2", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
                 problems.append(f"the viewer holds {got['frames']} frames, {got['mapped']['contact']} with a contact map")
             if streamed and family == "monomer" and (got["mapped"]["pae"] < 1 or got["mapped"]["contact"] < 1):
                 problems.append(f"the viewer's AF2 passes carry {got['mapped']} - no streamed PAE or contacts")
@@ -322,11 +414,15 @@ def main():
     only = next((a[7:] for a in sys.argv if a.startswith("--only=")), None)   # (a substring of the case names)
     if only is not None:
         plan = [case for case in plan if only in case[0]]
-    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "cuda", "worker.py")], cwd=REPO,
+    if "--no-af3" in sys.argv:
+        plan = [case for case in plan if case[1]["family"] != "af3"]
+    plan = [(name, payload, reference, METAL_BARS.get(name, bar) if NATIVE == "metal" else bar, tokens, refusal)
+            for name, payload, reference, bar, tokens, refusal in plan]
+    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "python", "localfold", "worker.py")], cwd=REPO,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-cuda-check.log", "w"),
                               text=True, bufsize=1)
     first = json.loads(worker.stdout.readline())
-    bad = [] if first.get("kind") == "cuda-ready" else [f"the worker's first line was {first}, not cuda-ready"]
+    bad = [] if first.get("kind") == "ready" else [f"the worker's first line was {first}, not ready"]
     for name, payload, reference, bar, tokens, refusal in plan:
         payload = dict(payload)
         expected_bonds = payload.pop("ligandBonds", None)
@@ -360,8 +456,8 @@ def main():
         c = result.get("confidence") or {}
         n = len(c.get("plddt") or [])
         problems = []
-        if result.get("cuda") is not True:
-            problems.append("not marked cuda")
+        if result.get("native") != NATIVE:
+            problems.append(f"marked native {result.get('native')!r}, not {NATIVE!r}")
         if len(c.get("predictedAlignedError") or []) != n * n:
             problems.append(f"PAE {len(c.get('predictedAlignedError') or [])} for {n} tokens")
         if len((result.get("tokens") or {}).get("chainIds") or []) != n:
@@ -401,9 +497,9 @@ def main():
     if "--no-page" not in sys.argv:
         page_arm(bad)
     if bad:
-        print("\n" + "\n".join(bad) + "\n\ncuda worker: FAILED (its log: /tmp/localfold-cuda-check.log)")
+        print("\n" + "\n".join(bad) + "\n\nnative worker: FAILED (its log: /tmp/localfold-cuda-check.log)")
         sys.exit(1)
-    print("\ncuda worker: ok")
+    print("\nnative worker: ok")
 
 
 if __name__ == "__main__":

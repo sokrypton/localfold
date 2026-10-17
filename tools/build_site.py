@@ -480,7 +480,7 @@ def drop_unreferenced_vendor() -> None:
               " no page in this site loads it")
 
 
-def build(include_model: bool) -> int:
+def build(include_model: bool, local_bundles: bool = True) -> int:
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir(parents=True)
@@ -540,7 +540,9 @@ def build(include_model: bool) -> int:
     unpublished = unpublished_families()
     for family, bundle in sorted(BUNDLES.items()):
         model = ROOT / bundle["export"]
-        if not model.is_dir():
+        # (the wheel's build skips this: its site carries no weights and folds natively, and the page's own weights
+        # come from each bundle's remote - so a developer's local export, current or not, is not what it ships)
+        if not model.is_dir() or not local_bundles:
             continue
         # 🔴 A REMOTE BUNDLE IS CHECKED TOO, BECAUSE ITS MODULE STILL SHIPS.
         # Only its SHARDS live elsewhere. The publish path skipped these before
@@ -714,7 +716,12 @@ if __name__ == "__main__":
     # Exits 0 when the family is hosted remotely, which is what `if` wants.
     parser.add_argument("--is-remote", metavar="FAMILY", default=None,
                         help="exit 0 if FAMILY's shards are fetched from elsewhere")
+    parser.add_argument("--skip-local-bundles", action="store_true",
+                        help="do not compare the checkout's local model exports with the registry (the localfold"
+                             " wheel's site, which ships none of them)")
     arguments = parser.parse_args()
     if arguments.is_remote is not None:
         raise SystemExit(0 if arguments.is_remote in remote_families() else 1)
-    raise SystemExit(build(arguments.model))
+    if arguments.model and arguments.skip_local_bundles:
+        parser.error("--model publishes the local exports, so it cannot skip checking them")
+    raise SystemExit(build(arguments.model, local_bundles=not arguments.skip_local_bundles))

@@ -727,7 +727,7 @@ static int foldMain(int argc, char** argv) {
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
     if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
-      frames.start(framesDir, mask.size() * 3, steps);
+      frames.start(framesDir, mask.size() * 3, steps, structural ? M.i("structural.residueAtomGather") : nullptr);
     }
     // several GPUs with the diffusion whole on every rank and several samples a batch: the samples DEALT, sample k on
     // rank k % N (each its own seed, so the same walk as in the batch), the coordinates gathered after - every rank

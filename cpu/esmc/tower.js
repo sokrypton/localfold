@@ -160,7 +160,11 @@ const silu = (x) => x / (1 + Math.exp(-x));
 
 /** One ESM-C block. `x` is (rows, model) and is not modified. */
 export function esmcBlock(x, rows, weights, dims, layer) {
-  const { model, heads, residualScale } = dims;
+  const { model, heads } = dims;
+  // the residual scale is the architecture's, sqrt(layers / 36), derived where the depth is given - as
+  // webgpu/esmc/tower.js and metal/ef2 do: a manifest's figure was 1.0 for every tower, and 300M's is 0.9129
+  const residualScale = Number.isInteger(dims.layers) && dims.layers > 0
+    ? Math.sqrt(dims.layers / 36) : (dims.residualScale ?? 1);
   const headDim = model / heads;
   const at = (leaf) => weights[`blocks/${layer}/${leaf}`];
 

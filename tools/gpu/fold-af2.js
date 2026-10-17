@@ -597,12 +597,15 @@ export async function main(device, args) {
       .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),
     packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
-    // say which tensor to attack. See webgpu/runtime/device-memory.js.
-    deviceMemory: trimMemory(memorySnapshot(device)),
+    // say which tensor to attack. See webgpu/runtime/device-memory.js. `--memory-rows=` for more than twelve.
+    deviceMemory: trimMemory(memorySnapshot(device), Number(option(args, "memory-rows", "12"))),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),
     caca: { median: round(median, 3), worst: round(worst, 3), ok: chainOk },
+    // `--ca`: every residue's alpha carbon, so two arms' structures can be superposed rather than checksummed
+    ...(args.includes("--ca") ? { alphaCarbons: Array.from({ length: atom37.length / 111 }, (_, r) =>
+      [0, 1, 2].map((d) => round(atom37[(r * 37 + 1) * 3 + d], 3))) } : {}),
     stages: summariseStages(stageMarks, started),
     phases: prediction.stageMilliseconds === undefined ? undefined
       : Object.fromEntries(Object.entries(prediction.stageMilliseconds)

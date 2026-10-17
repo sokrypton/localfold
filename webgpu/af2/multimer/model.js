@@ -343,6 +343,10 @@ export class AlphaFoldUnifiedGpu {
         }
         await capturePair("extra-stack", embedding.pairWithoutTemplates);
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
+        // 🔴 AND THE EXTRA STACK'S POOLED SCRATCH GOES BEFORE THE MAIN ONE (see the monomer's model.js): its last
+        // block was awaited above, and nothing in the main stack asks for the extra MSA's sizes.
+        execution.allocator.destroyPooled();
+        await settleReleasedMemory(this.device);
 
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);
@@ -397,6 +401,13 @@ export class AlphaFoldUnifiedGpu {
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (pairReadback !== undefined) releaseTensor(pairReadback);
         if (contactReadback !== undefined) { releaseTensor(contactReadback); releaseTensor(contactTensor); }
+        // 🔴 THE EVOFORMER'S POOLED SCRATCH IS DONE WITH ONCE ITS READBACK IS IN, SO IT GOES NOW. The pool kept the
+        // triangle's and the attentions' pair-sized buffers beside the structure module and the heads, which build
+        // their own (IPA's normalised pair among them): 2216 MiB at 522 residues, the peak, inside IPA. The readback
+        // above was awaited, so nothing in flight names them; the next pass allocates afresh. AF3's trunk does the same
+        // after its pairformer (webgpu/af3/trunk/trunk.js).
+        execution.allocator.destroyPooled();
+        await settleReleasedMemory(this.device);
 
         const structure = await withAbort(new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: embedding.pairWithoutTemplates, mask: features.seqMask, aatype: features.aatype,

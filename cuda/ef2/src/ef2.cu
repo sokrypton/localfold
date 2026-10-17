@@ -115,9 +115,13 @@ static int foldInput(const Opts& o, bool warm) {
   int T = (int)M.meta("meta/tokens");
   buildBonds(T);
   const bool residentTower = M.has("c/blocks/0/fc2/weightsT");      // (ESM-C 6B: [out, in], resident int8)
+  // the residual scale is the architecture's, sqrt(layers / 36) (esm's EsmcTransformerStack; biohub's 300M runs
+  // 0.912871): derived, not read - tools/export_esmc_model.py wrote 1.0 for every tower and the published 300M bundle
+  // carries it (its language-model pair 8.1e-3 from biohub's with 1.0, 2.2e-3 derived, on Metal: metal/README.md)
+  const int layers = (int)M.meta("meta/layers");
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"),
          residentTower ? (int)dimOf("c/blocks/0/fc2/weightsT", 1) : (int)dimOf("c/blocks/0/fc2/weights", 0),
-         (int)M.meta("meta/layers"), (int)M.meta("meta/pairChannels"), (float)M.meta("meta/residualScale", 1.0)};
+         layers, (int)M.meta("meta/pairChannels"), (float)sqrt(layers / 36.0)};
   say("ESMFold2: %d tokens, %d atoms, %d tower rows\n", T, (int)M.meta("meta/atoms"), e.rows);
   bool check = !oracle.empty() && !warm;
   int states = e.layers + 1;

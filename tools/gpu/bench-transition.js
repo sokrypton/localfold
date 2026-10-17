@@ -177,15 +177,20 @@ export async function main(device, args) {
   // GEMM that splitTransitionConfig answers with where there are no matrix
   // units, which is every visitor. `split` needs the units and skips without
   // them, so without this arm the bench could not price the default at all.
+  // `vsplit@<storage>@<arithmetic>@<rows>x<columns>x<inner>`: the vector GEMM's
+  // arithmetic (f32, or f16 a k step at a time) and its block, as
+  // createTransitionSplitShaders takes them
   for (const spec of arms_spec.filter((a) => ["split", "vsplit"].includes(a.split("@")[0]))) {
-    const [kind, precision = "f16"] = spec.split("@");
+    const [kind, precision = "f16", arithmetic = "f32", blockSpec] = spec.split("@");
     const vector = kind === "vsplit";
     const config = vector ? null : deviceMatrixConfig(device, { element: "f16" });
     if (!vector && config === null) continue;
+    const [blockRows, blockColumns, blockInner] = (blockSpec ?? "").split("x").map(Number);
+    const block = blockSpec ? { rows: blockRows, columns: blockColumns, inner: blockInner } : undefined;
     const split = createTransitionSplitShaders(
       { rows, channels, factor }, packed.offsets, 1e-5, "fast",
       { normalizedStorage: precision, wideStorage: precision,
-        matrix: vector ? { vector: true, storage: precision }
+        matrix: vector ? { vector: true, storage: precision, arithmetic, block }
           : { result: config.resultComponentType, matrixElement: config.componentType,
               tile: { M: config.M, N: config.N, K: config.K } } });
     const bytes = vector ? 0 : stagedMatrixStorage({

@@ -4,6 +4,7 @@ import { memoryTotals } from "../runtime/device-memory.js";
 import { deviceTuning, halfPrecisionAvailable, deviceMatrixConfig } from "../runtime/device-profile.js";
 import { createStagedMatrixShader, stagedMatrixStorage } from "./matrix-linear.js";
 import { shapedKnob } from "../runtime/device-profile.js";
+import { DEFAULT_VECTOR_GEMM_BLOCK } from "./vector-gemm-block.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -1103,24 +1104,48 @@ export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
  * a lane, the source panel padded to a stride of 68 - the layout of the split
  * transition's vector GEMM in webgpu/af3/trunk/transition.js.
  */
-export function createOuterProductMeanVectorOutputShader(residual) {
-  const BM = 64, BN = 64, BK = 16, AS = BM + 4;
-  const acc = [], reads = [], mul = [], stores = [];
-  for (let i = 0; i < 4; i += 1) {
-    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * 4u + ${i}u];`);
-    acc.push(`  var acc_${i} = bias;`);
-    mul.push(`      acc_${i} += a_${i} * b;`);
+export function createOuterProductMeanVectorOutputShader(residual, block = DEFAULT_VECTOR_GEMM_BLOCK, arithmetic = "f32") {
+  // 🔴 f16 ARITHMETIC (VECTOR_GEMM_F16's: f16 panels, a k step's products summed in f16 and then added into f32) needs
+  // the source SCALED AS IT IS STAGED: the intermediate is a sum over the sequences, not yet a mean, and at depth it
+  // passes what f16 holds. So the f16 form computes scale * bias + sum((scale * a) w) where the f32 one computes
+  // scale * (bias + sum(a w)) - the same value, rounded differently.
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  // (a lane owns TM adjacent rows and TN adjacent columns of the block - 4 x 4 at the default; see
+  // webgpu/kernels/vector-gemm-block.js)
+  const { rows: BM, columns: BN, inner: BK } = block;
+  const AS = BM + 4, TM = BM / 16, TN = BN / 16, TV = TN / 4;
+  const acc = [], reads = [], mul = [], stores = [], biases = [], bs = [], flush = [];
+  for (let j = 0; j < TV; j += 1) {
+    bs.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TV}u + ${j}u];`);
+    biases.push(`  let bias_${j} = vec4<f32>(weights[b0 + ${4 * j}u], weights[b0 + ${4 * j + 1}u], `
+      + `weights[b0 + ${4 * j + 2}u], weights[b0 + ${4 * j + 3}u]);`);
+  }
+  for (let i = 0; i < TM; i += 1) {
+    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * ${TM}u + ${i}u];`);
+    for (let j = 0; j < TV; j += 1) {
+      acc.push(`  var acc_${i}_${j} = ${f16 ? "vec4<f32>(0.0)" : `bias_${j}`};`);
+      if (f16) {
+        acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
+        mul.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+      } else {
+        mul.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+      }
+    }
     stores.push(`  {
-    let row = row_origin + ty * 4u + ${i}u;
+    let row = row_origin + ty * ${TM}u + ${i}u;
     if (row < parameters.rows) {
       let pair = parameters.padding.x + row;
-      let scaled = acc_${i} * scale[pair];
-      let at = pair * parameters.columns + column;
-${[0, 1, 2, 3].map((c) => `      output[at + ${c}u] ${residual ? "+=" : "="} scaled.${"xyzw"[c]};`).join("\n")}
+${Array.from({ length: TV }, (_, j) => `      {
+        let scaled = ${f16 ? `acc_${i}_${j} + bias_${j} * scale[pair]` : `acc_${i}_${j} * scale[pair]`};
+        let at = pair * parameters.columns + column + ${4 * j}u;
+${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} scaled.${"xyzw"[c]};`).join("\n")}
+      }`).join("\n")}
     }
   }`);
   }
-  return `struct MatmulParameters {
+  return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
@@ -1129,8 +1154,8 @@ ${[0, 1, 2, 3].map((c) => `      output[at + ${c}u] ${residual ? "+=" : "="} sca
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<storage, read> scale: array<f32>;
-var<workgroup> a_tile: array<f32, ${AS * BK}>;
-var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
+var<workgroup> a_tile: array<${T}, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
@@ -1138,30 +1163,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let column_origin = group.x * ${BN}u;
   let tx = li % 16u;
   let ty = li / 16u;
-  let column = column_origin + tx * 4u;
+  let column = column_origin + tx * ${TN}u;
   let b0 = parameters.bias_offset + column;
-  let bias = vec4<f32>(weights[b0], weights[b0 + 1u], weights[b0 + 2u], weights[b0 + 3u]);
+${biases.join("\n")}
 ${acc.join("\n")}
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
     for (var e = li; e < ${BM * BK}u; e += 256u) {
       let m = e / ${BK}u;
       let row = row_origin + m;
       var value = 0.0;
-      if (row < parameters.rows) { value = source[row * parameters.inner + k0 + e % ${BK}u]; }
-      a_tile[(e % ${BK}u) * ${AS}u + m] = value;
+      if (row < parameters.rows) {
+        value = source[row * parameters.inner + k0 + e % ${BK}u]${f16 ? " * scale[parameters.padding.x + row]" : ""};
+      }
+      a_tile[(e % ${BK}u) * ${AS}u + m] = ${T}(value);
     }
     for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
       let base = parameters.weight_offset + (k0 + e / ${BN / 4}u) * parameters.columns
         + column_origin + (e % ${BN / 4}u) * 4u;
-      b_tile[e] = vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u],
-                            weights[base + 3u]);
+      b_tile[e] = vec4<${T}>(vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u],
+                            weights[base + 3u]));
     }
     workgroupBarrier();
     for (var k = 0u; k < ${BK}u; k += 1u) {
-      let b = b_tile[k * ${BN / 4}u + tx];
+${bs.join("\n")}
 ${reads.join("\n")}
 ${mul.join("\n")}
     }
+${flush.join("\n")}
     workgroupBarrier();
   }
 ${stores.join("\n")}
@@ -1188,24 +1216,38 @@ export const OPM_VECTOR_OUTPUT_BLOCK = Object.freeze({ rows: 64, columns: 64 });
  * `weight_offset` = the block's first residue x C, `padding.x` = L. The store
  * writes the pair-major intermediate the output projection reads.
  */
-export function createOuterProductMeanVectorContractShader(cOuter) {
-  const BM = 64, BN = 64, BK = 16, AS = BM + 4;
-  const acc = [], reads = [], mul = [], stores = [];
-  for (let i = 0; i < 4; i += 1) {
-    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * 4u + ${i}u];`);
-    acc.push(`  var acc_${i} = vec4<f32>(0.0);`);
-    mul.push(`      acc_${i} += a_${i} * b;`);
-    stores.push(`  {
-    let row = row_origin + ty * 4u + ${i}u;
-    if (row < parameters.rows && column < parameters.columns) {
-      let local_pair = (row / ${cOuter}u) * parameters.padding.x + column / ${cOuter}u;
+export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAULT_VECTOR_GEMM_BLOCK, arithmetic = "f32") {
+  // (f16 arithmetic: VECTOR_GEMM_F16's - each k step's products, k the sequences, summed in f16, then into f32)
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  const { rows: BM, columns: BN, inner: BK } = block;
+  const AS = BM + 4, TM = BM / 16, TN = BN / 16, TV = TN / 4;
+  const acc = [], reads = [], mul = [], stores = [], bs = [], flush = [];
+  for (let j = 0; j < TV; j += 1) bs.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TV}u + ${j}u];`);
+  for (let i = 0; i < TM; i += 1) {
+    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * ${TM}u + ${i}u];`);
+    for (let j = 0; j < TV; j += 1) {
+      acc.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
+      if (f16) {
+        acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
+        mul.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+      } else {
+        mul.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+      }
+      stores.push(`  {
+    let row = row_origin + ty * ${TM}u + ${i}u;
+    let c0 = column + ${4 * j}u;
+    if (row < parameters.rows && c0 < parameters.columns) {
+      let local_pair = (row / ${cOuter}u) * parameters.padding.x + c0 / ${cOuter}u;
       let at = local_pair * ${cOuter * cOuter}u + (row % ${cOuter}u) * ${cOuter}u
-        + column % ${cOuter}u;
-${[0, 1, 2, 3].map((c) => `      outer[at + ${c}u] = acc_${i}.${"xyzw"[c]};`).join("\n")}
+        + c0 % ${cOuter}u;
+${[0, 1, 2, 3].map((c) => `      outer[at + ${c}u] = acc_${i}_${j}.${"xyzw"[c]};`).join("\n")}
     }
   }`);
+    }
   }
-  return `struct MatmulParameters {
+  return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
@@ -1213,8 +1255,8 @@ ${[0, 1, 2, 3].map((c) => `      outer[at + ${c}u] = acc_${i}.${"xyzw"[c]};`).jo
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> outer: array<f32>;
-var<workgroup> a_tile: array<f32, ${AS * BK}>;
-var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
+var<workgroup> a_tile: array<${T}, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
@@ -1222,7 +1264,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let column_origin = group.x * ${BN}u;
   let tx = li % 16u;
   let ty = li / 16u;
-  let column = column_origin + tx * 4u;
+  let column = column_origin + tx * ${TN}u;
   // Both operands are [sequence][residue * C + channel]; a row of the GEMM is
   // one of the block's residues' channels, a column one of any residue's.
   let stride = parameters.columns;
@@ -1236,7 +1278,7 @@ ${acc.join("\n")}
       if (row < parameters.rows && k < parameters.inner) {
         value = left[k * stride + parameters.weight_offset + row];
       }
-      a_tile[(e / ${BM}u) * ${AS}u + m] = value;
+      a_tile[(e / ${BM}u) * ${AS}u + m] = ${T}(value);
     }
     for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
       let k = k0 + e / ${BN / 4}u;
@@ -1246,14 +1288,15 @@ ${acc.join("\n")}
         let base = k * stride + c;
         value = vec4<f32>(right[base], right[base + 1u], right[base + 2u], right[base + 3u]);
       }
-      b_tile[e] = value;
+      b_tile[e] = vec4<${T}>(value);
     }
     workgroupBarrier();
     for (var k = 0u; k < ${BK}u; k += 1u) {
-      let b = b_tile[k * ${BN / 4}u + tx];
+${bs.join("\n")}
 ${reads.join("\n")}
 ${mul.join("\n")}
     }
+${flush.join("\n")}
     workgroupBarrier();
   }
 ${stores.join("\n")}

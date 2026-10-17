@@ -376,12 +376,16 @@ export async function compilePairTrack(cache, options) {
                     { length: n, channels }, direction, { ab: "f32" }, projectMatrix));
     }
   }
+  const gridProjectArithmetic = stagedPrecision === "f16" && options.gridProjectArithmetic !== "f32" ? "f16" : "f32";
   for (const [key, attention, transpose] of (gridAttention
        ? [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]
        : [])) {
     const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision,
+        // ...the vector projection in f16 arithmetic where this stack stages in f16: 1.5x on an M5 (bench-grid-project.js,
+        // 255 tokens, 8 rows: 4.51 -> 3.01 ms). `gridProjectArithmetic: "f32"` (a device knob) is the control.
+        projectArithmetic: gridProjectArithmetic,
         // 🔴 `grid.attend` IS THE LARGEST KERNEL IN THE TRUNK AND THE ONLY
         // CUBIC ONE, which is why the matrix units are pointed at this one
         // first. Off unless the caller asks; the device profile decides, and
@@ -389,7 +393,7 @@ export async function compilePairTrack(cache, options) {
         // webgpu/af3/trunk/grid-attention-matrix.js.
         attendMatrix: options.attendMatrix ?? false,
         // ...and the register-tiled vector attend where there are no matrix units (gridAttendTiled).
-        attendTiled: options.attendTiled ?? false,
+        attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
         chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
@@ -470,8 +474,9 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
-                  + `:t${options.attendTiled ?? 0}`
+                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`
                   + `:ch${gridChunked}`
+                  + `:pa${gridProjectArithmetic}`
                   // ...and every row tile, which the device's storage limit
                   // now chooses. They are baked into the source AND divide the
                   // dispatch, which is the collision this file records twice.

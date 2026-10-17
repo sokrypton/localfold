@@ -83,10 +83,11 @@ import { SOURCES } from "../../../shared/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { shapedKnob } from "../../runtime/device-profile.js";
 import {
-  GLOBAL_ATTENTION_FLASH_SHADER, GLOBAL_ATTENTION_KV_SHADER,
+  createGlobalAttentionFlashShader, GLOBAL_ATTENTION_KV_SHADER,
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
-import { deviceTuning } from "../../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
 import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
 import {
@@ -376,7 +377,10 @@ async function encodeAttention(
   const key = execution.allocate(`${options.label}.key`, elements);
   const value = execution.allocate(`${options.label}.value`, elements);
   const gate = execution.allocate(`${options.label}.gate`, elements);
-  const weighted = execution.allocate(`${options.label}.weighted`, elements);
+  // 🔴 THE ATTENTION WRITES BACK INTO `normalized`, as the monomer's does (webgpu/af2/evoformer/block.js): the pair
+  // bias and the projection are its last readers and the flash kernel the next pass to write. Both are f32 here.
+  // A sixth pair-sized tensor in a triangle attention - 532 MiB at 1044 residues.
+  const weighted = normalized;
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   const attentionNormGrid = execution.rowGrid(rows);
   execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
@@ -463,7 +467,7 @@ async function encodeGlobalAttention(
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
     execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
       createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
-    execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    execution.pipelines.get(`block:global-attention:flash:${headDim}`, createGlobalAttentionFlashShader(headDim)),
     execution.pipelines.get(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}`
         + `:${shape.cM}:${w.heads}:${headDim}`,
@@ -536,8 +540,15 @@ async function encodeOuterProductMean(
   // ...the output projection as a vector GEMM where the device asks for one;
   // see the same choice in webgpu/af2/evoformer/block.js.
   const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract !== false;
+  // ...on the device's vector GEMM block where it names one (webgpu/kernels/vector-gemm-block.js): f32, the same sums
+  // in the same order. The output tiles C_Z by its columns and c_outer^2 by its depth, with no tail.
+  // ...in f16 arithmetic where the device has it (`opmVectorArithmetic: "f32"` the control; docs/M5-HANDOFF.md)
+  const opmArithmetic = halfPrecisionAvailable(execution.device)
+    && deviceTuning(execution.device).opmVectorArithmetic !== "f32" ? "f16" : "f32";
+  const opmBlock = vectorGemmBlock(execution.device, opmArithmetic,
+    ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
   const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput !== false
-    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
+    && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     contractPipeline, projectOutputPipeline, scalePipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -546,14 +557,14 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     vectorContract
-      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}`,
-        createOuterProductMeanVectorContractShader(input.cOuter))
+      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
       : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
     vectorOutput
       ? execution.pipelines.get(
-        `block:opm:project-output-vector:${residualTarget !== undefined}`,
-        createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock, opmArithmetic))
       : execution.pipelines.get(
         outerFirst && residualTarget !== undefined
           ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
@@ -623,7 +634,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
       } else {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -636,8 +647,8 @@ async function encodeOuterProductMean(
             packedOffsets[6], packedOffsets[7], 0, offset, 0]));
         execution.dispatch(encoder, projectOutputPipeline,
           [intermediate, weights, vectorOutputParams, output, scale],
-          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
-          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+          input.cZ / opmBlock.columns,
+          Math.ceil(count / opmBlock.rows), 1, "opm.project-output");
         continue;
       }
       // ...its OWN grid, because it carries several pairs a workgroup where the
@@ -710,6 +721,13 @@ async function encodeTriangleMultiplication(
   // ...and the output kernel's own column tile, where the device sets one -
   // this triangle always accumulates in f32, where it is bit-identical. See
   // webgpu/kernels/triangle/shaders.js.
+  // 🔴 THE VECTOR PROJECTIONS' ACCUMULATORS IN f16 WHERE THE DEVICE HAS IT - the triangle's two projections only, not
+  // its contraction (whose K is the protein's length). ESMFold2's trunk took the same for 1.55x; on AF2 it was measured
+  // at fold level (docs/M5-HANDOFF.md). `triangleAccumulatePrecision: "f32"` is the control.
+  if (!matrixFits && halfPrecisionAvailable(execution.device)
+      && deviceTuning(execution.device).triangleAccumulatePrecision !== "f32") {
+    shape.accumulatePrecision = "f16";
+  }
   const requestedTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
   const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
   const projectTile = outColumns === null ? requestedTile
@@ -727,6 +745,7 @@ async function encodeTriangleMultiplication(
     () => createTriangleShaders(
       shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
+    + `:${shape.accumulatePrecision ?? "f32"}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
     + `x${shaders.projectTile.outColumns ?? "-"}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
@@ -775,7 +794,9 @@ async function encodeTriangleMultiplication(
   const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
   const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
+  // 🔴 THE CENTRE NORM IS WRITTEN OVER `a`, and the matrix path's gate over `b`: the contraction is the last reader
+  // of both, and each is the hidden width. A fifth pair-sized buffer for nothing - 532 MiB at 1044 residues.
+  const hiddenNormalized = a;
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
   const projectParams = !matrixFits ? undefined
     : uniform(execution, `triangle.${direction}.project-parameters`, new Uint32Array([
@@ -839,15 +860,15 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
     normalizeGrid[0], normalizeGrid[1], 1, `triangle.${direction}.normalize-hidden`);
   if (matrixFits) {
-    // The gate is its own pass and the projection reads it; `a` is dead by here
-    // - the contraction was its last reader. The projection always adds into
+    // The gate is its own pass and the projection reads it; `b` is dead by here
+    // - the contraction was its last reader, and `a` holds the centre norm. The projection always adds into
     // its target, so a caller with no residual gets a cleared one.
     if (residualTarget === undefined) encoder.clearBuffer(output.allocation.buffer);
     const out = triangleProjectOutMatrixDispatch({ rows: pairs, cZ: input.cZ }, triangleMatrix);
-    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, a],
+    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, b],
       out.x, out.y, 1, `triangle.${direction}.output.gate`);
     execution.dispatch(encoder, projectOutput,
-      [hiddenNormalized, weights, outProjectParams, output, a],
+      [hiddenNormalized, weights, outProjectParams, output, b],
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],

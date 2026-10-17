@@ -1,0 +1,90 @@
+{
+ "af3-1brs-template": {
+  "plddt": 95.18,
+  "ptm": "0.9402",
+  "rmsd": 0.447
+ },
+ "af3-5caj-template": {
+  "plddt": 95.4,
+  "ptm": "0.9550",
+  "rmsd": 0.261
+ },
+ "af3-6mrr": {
+  "plddt": 86.18,
+  "ptm": "0.7603",
+  "rmsd": 0.849
+ },
+ "af3-6mrr-gol-sep3": {
+  "ligand": 0.048,
+  "plddt": 89.42,
+  "ptm": "0.8189",
+  "rmsd": 1.541
+ },
+ "af3-dna-5cm": {
+  "ligand": 0.043,
+  "nucleic": 0.044,
+  "plddt": 92.08,
+  "ptm": "0.8092",
+  "rmsd": null
+ },
+ "af3-dna-duplex": {
+  "nucleic": 0.053,
+  "plddt": 93.01,
+  "ptm": "0.1989",
+  "rmsd": null
+ },
+ "af3-glycan": {
+  "ligand": 0.02,
+  "plddt": 48.98,
+  "ptm": "0.4251",
+  "rmsd": null
+ },
+ "af3-kitchen-sink": {
+  "ligand": 0.046,
+  "nucleic": 0.046,
+  "plddt": 70.05,
+  "ptm": "0.6838",
+  "rmsd": null
+ },
+ "boltz2-6mrr": {
+  "plddt": 96.9,
+  "ptm": "0.8234",
+  "rmsd": 0.614
+ },
+ "chai1-6mrr": {
+  "plddt": 82.7,
+  "ptm": "0.7513",
+  "rmsd": 0.993
+ },
+ "chai1-6mrr-gol-sep3": {
+  "ligand": 0.062,
+  "plddt": 83.26,
+  "ptm": "0.7783",
+  "rmsd": 1.738
+ },
+ "intellifold2-6mrr": {
+  "plddt": 85.21,
+  "ptm": "0.7010",
+  "rmsd": 1.71
+ },
+ "openbind0-6mrr": {
+  "plddt": 82.85,
+  "ptm": "0.7701",
+  "rmsd": 1.877
+ },
+ "opendde-6mrr": {
+  "plddt": 91.82,
+  "ptm": "0.7784",
+  "rmsd": 1.645
+ },
+ "protenix2-6mrr": {
+  "plddt": 87.56,
+  "ptm": "0.8802",
+  "rmsd": 1.771
+ },
+ "rosettafold3-6mrr": {
+  "plddt": 81.41,
+  "ptm": "0.8037",
+  "rmsd": 1.865
+ }
+}

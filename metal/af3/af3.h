@@ -1,0 +1,203 @@
+// Native AlphaFold 3 lineage on Metal: the stages' declarations (metal/af3/*.mm). cuda/af3 is the reading - the same
+// stages and arithmetic, its --fast path, on metal/core: GEMMs in half with float accumulation, attention on the core's
+// flash kernel, residual streams float32. One code path for every family; the bundle's dialect (trunk.dialect.*)
+// and its weights' presence choose the branches, as cuda/af3's do.
+#pragma once
+#include "core.h"
+#include "kernels.h"
+#include "host.h"
+#include "model.h"
+#include <functional>
+#include <string>
+#include <vector>
+
+using namespace mt;
+
+// ---------------------------------------------------------------- names
+inline bool hasW(const std::string& k) { return M.has(k); }
+inline const float* W(const std::string& k) { return M.f(k); }
+inline const float* Wopt(const std::string& k) { return M.has(k) ? M.f(k) : nullptr; }
+inline const half* Wh(const std::string& k) { return M.h(k); }
+inline size_t lenW(const std::string& k) { return M.len(k); }
+inline bool flag(const std::string& k) { return M.meta(k, 0) != 0; }
+inline int metaI(const std::string& k) { return (int)M.meta(k); }
+inline std::string num(long long k) { return std::to_string(k); }
+
+// a stage's output handed to a checker (main.mm: LOCALFOLD_SAVE_SEAMS=<dir> writes each as <name>.f32), or nothing
+extern void (*SEAM)(const char* name, const float* d, size_t n);
+inline void seam(const char* name, const float* d, size_t n) { if (SEAM) SEAM(name, d, n); }
+
+// ---------------------------------------------------------------- operations (ops.mm)
+// Y = alpha X W (+ beta Y) (+ bias) for a named weight [in][out], its size checked; operands multiplied in half
+void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+         const float* bias = nullptr, float alpha = 1.f);
+void lin(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+         const float* bias = nullptr, float alpha = 1.f);
+void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias = nullptr);
+void linH(const float* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias = nullptr);
+// a weight already on the device ([in][out] half)
+void linW(const half* X, const half* w, float* Y, size_t rows, int in, int out, float beta = 0.f, const float* bias = nullptr,
+          float alpha = 1.f, const char* label = nullptr);
+void linW(const half* X, const half* w, half* Y, size_t rows, int in, int out, const float* bias = nullptr, const char* label = nullptr);
+// LayerNorm by weight names (an empty or absent offset: none)
+void ln(const float* x, float* y, size_t rows, int C, const std::string& scale, const std::string& offset);
+void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
+void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
+void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period);
+void scale(float* x, size_t n, float s, bool relu = false);
+
+// derived weights: columns concatenated (a part [C][width], or stored [width][C] if transposed; no name: zeros)
+struct Part { std::string name; int width; bool transposed; };
+const half* concatColumns(const std::string& key, int C, const std::vector<Part>& parts);
+// a named [rows][2I] = [a | b] weight -> gemmSwiglu's interleaving (the source read only when it is built)
+const half* swigluPairs(const std::string& name, int rows, int I);
+// an attention's q | k | v | gate as one [C][4W] weight (the grid attention stores q, k and the gate transposed),
+// and its GEMM bias where the gate has one (zeros elsewhere)
+const half* qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg);
+// a LayerNorm's affine (norm + "Scale", norm + "Offset") folded into the [in][out] weight w that reads its output - in w's
+// own column order, so a derived (interleaved, quartered) weight folds as it is: LN(x) w = xhat (diag(scale) w) +
+// offset w. extra: a bias w already had (or null). Derived once, under key
+struct Folded { const half* w = nullptr; const float* b = nullptr; };
+Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra);
+const float* qkvgBias(const std::string& pre, int Wd);
+
+// ---------------------------------------------------------------- the pair track (pairtrack.mm)
+// pairMask [n * n] (a real buffer; every update reads it), seqMask [n], `ones` every token real (no attention mask)
+struct Masks { const float* pair; const float* seq; bool ones; };
+// (into: where the residual goes, when not the input itself - chai-1's parallel block)
+void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
+              const std::string& nextNorm = "");
+const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight
+void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into = nullptr,
+                   bool untransposed = false, const std::string& nextNorm = "");
+// next1, next2: the pair's next norms, emitted by the second GEMM (pairtrack.mm's pairLn takes them)
+void transition(float* x, size_t rows, int C, const std::string& pre, float* into = nullptr, const std::string& next1 = "",
+                const std::string& next2 = "");
+void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
+                 const std::string& next2 = "");
+// chai-1's parallel pair track: every update reads the stage's input and adds into the pair (z = z0 + f1(z0) + ...);
+// `which` a string of updates in order - o, i (the triangles), r, c (the grid attentions), t (the transition)
+void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
+void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
+                 const float* extraBias = nullptr);
+// nextB: the block that follows directly, nothing touching the pair between (its first norm emitted by this one)
+void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
+                     const float* extraBias = nullptr, const std::string& nextB = "");
+// the same over a half pair (the trunk's pairformer stack where halfPair(): every residual summed in float and rounded
+// once on its store, every norm read from the half values)
+void triangle(half* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, half* into = nullptr,
+              const std::string& nextNorm = "");
+void gridAttention(half* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, half* into = nullptr,
+                   bool untransposed = false, const std::string& nextNorm = "");
+void transition(half* x, size_t rows, int C, const std::string& pre, half* into = nullptr, const std::string& next1 = "",
+                const std::string& next2 = "");
+void pairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
+                 const std::string& next2 = "");
+void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
+void singleTrack(float* single, const half* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
+                 const float* extraBias = nullptr);
+void pairformerBlock(half* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
+                     const float* extraBias = nullptr, const std::string& nextB = "");
+// raw [pairs][heads] -> [heads][n][stride] half, log2-scaled (swap: (i, j) read at (j, i))
+half* biasLayout(const float* raw, const std::string& name, int n, int heads, int stride, bool swap);
+
+// ---------------------------------------------------------------- the trunk (trunk.mm)
+struct Trunk {
+  int n, S, C, Cs, Cm, F;                 // tokens, MSA rows, pair, single, msa channels, target_feat width
+  float *pair, *single, *msa, *targetFeat, *pairMask, *seqMask, *msaMask, *deletion;
+  int* msaRows;
+  float* prevSingle;                      // (the pair recycles in place)
+  bool pairHalfExact = false;             // the last pass's pair came out of the half stack: exact in half
+  Masks masks;
+  int pass = 0;
+};
+Trunk makeTrunk(const float* targetFeat, int msaCap);
+void freeTrunk(Trunk& t);
+void runTrunk(Trunk& t);
+// the distogram's logits [n * n * bins] (symmetrised), and the page's contact map [n * n] on the host
+void distogram(Trunk& t, float* logits);
+std::vector<float> contactProbabilities(Trunk& t);
+std::vector<float> expectedDistances(Trunk& t);      // each pair's predicted distance (the early stop's measure)
+
+// ---------------------------------------------------------------- target_feat (atom.mm)
+float* buildTargetFeat();
+extern float* TARGET_FEAT_STRUCTURE;     // chai-1: the diffusion module's own projection of the token features
+float* esmEmbeddings(int tokens, int& E);   // esm2.mm: ESM2 3B over each protein chain, gathered onto the tokens
+
+// ---------------------------------------------------------------- the atoms (atom.mm)
+// Diffusion samples in flight through the denoiser's per-step path: every per-sample tensor is NS copies,
+// sample-major; what the samples share (conditioning, masks, biases) is read at row % one sample's rows
+extern int NS;
+extern bool ADA_RAW;                       // chai-1's adaptive LayerNorm form
+struct Gather { const int* idx; const float* mask; int count; };
+Gather gatherOf(const std::string& name);
+struct AtomShape { int tokens, dense, subsets, queries, keys; };
+AtomShape atomShape();
+void convert(const Gather& g, const float* src, float* out, int C, size_t srcRows = 0, int ns = 1);
+// everything a cross-attention block derives from the conditioning, the same at every denoiser step
+struct AtomBlockCache { float *qScale, *qShift, *kScale, *kShift, *zg, *ffwScale, *ffwShift, *tg, *pairLogits; bool chained; };
+struct EncoderOut {
+  float* tokenAct;        // [NS tokens][perToken]
+  float* skip;            // [NS queryRows][C]
+  float *qMask, *kMask, *qCond, *kCond, *pair, *qUid, *kUid, *qStart;
+  std::vector<AtomBlockCache> blocks;
+  int C, heads, D, perToken;
+  bool keyMasked, noResidual;
+};
+EncoderOut prepareEncoder(const std::string& E, const std::string& ref, const float* trunkSingle, const float* trunkPair);
+void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions);
+std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
+                                   const AtomShape& sh);
+AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);
+struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMasked, noResidual; };
+// chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space
+void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
+void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
+                         const std::string& B);
+// the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
+void adaLn(const float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
+           int ld = 0);
+
+// ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
+// the diffusion's discretisation (cuda/af3 sampler.cuh DiffusionOptions, after Blitz): the default is the exponential
+// update x' = r^S x + (1 - r^S) D on noise levels even in log sigma, with churn - 200 Euler steps' ligand geometry at 25
+// (docs/AF3.md, "The default sampler"); --update=euler --schedule=karras is AlphaFold 3's own, for an oracle comparison
+// chai-1 takes them too, on its own schedule and step (diffusion.mm sampleChai: its default the exponential step at its
+// scale of 2, on its rho-7 midpoints - --schedule=geometric only when said)
+struct SamplerOptions {
+  double sigmaMax = 0;
+  bool geometric = true, exponential = true, churn = true;
+  double stepScale = 0;        // --step-scale=S (0: the model's own - AF3's 1.5, chai-1's 2)
+  bool scheduleGiven = false;  // --schedule= said (chai-1's default schedule is its own, not the geometric one)
+  bool given = false;          // a flag set one
+};
+// a SamplerOptions flag (--schedule=karras|geometric, --update=euler|exponential, --no-churn, --step-scale=S) read into
+// `o`; false for any other flag, and an unknown value refused by name
+// (bad: where an unknown value is said and recorded rather than ending the process - a resident server's job fails, not
+// the server)
+bool samplerFlag(const char* f, SamplerOptions& o, bool* bad = nullptr);
+extern SamplerOptions SAMPLER;
+void prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat, const Masks& masks, int n);
+// every sample's final positions [ns][atoms][3]; onStep(the denoised positions on the device, step, steps)
+std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
+                          const std::function<void(const float*, int, int)>& onStep = nullptr);
+void freeDiffusion();
+void transformerWeights();     // the token transformer's folded conditioning weights (built once; prepareWeights)
+
+// ---------------------------------------------------------------- derived weights up front (weights.mm)
+// every weight a port reads through a derived form built now, at load, and its source retired and the allocations
+// compacted - the sources and their derived copies were both held otherwise (~0.6 GB of AF3's)
+void prepareWeights();
+bool derivedSource(const std::string& name);     // a weight read only through a derived form: its own allocation at load
+void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync between them)
+
+// ---------------------------------------------------------------- the confidence head (confidence.mm)
+struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
+ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta);
+
+// ---------------------------------------------------------------- OpenDDE's structural tokens (structural.mm)
+struct Structural { int n; float *single, *pair, *targetFeat, *bias, *seqMask, *pairMask; Masks masks; };
+Structural expandStructural(const Trunk& t);     // reads the residue batch: before sbatch.* is swapped in
+void freeStructural(Structural& s);
+struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
+DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense, int tmTokens);

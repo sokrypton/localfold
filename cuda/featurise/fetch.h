@@ -1,14 +1,14 @@
 // The published weights, fetched natively - what cuda/fetch_bundles.py did, so a fold needs no Python either.
 //
 //   lf::fetch::model(root, "boltz2")    what a model's binary reads, by the --model name: the one table of them
-//                                       (below), every port and cuda/worker.py going through it
+//                                       (below), every port and python/localfold/worker.py going through it
 //   lf::fetch::bundle(root, "af3")      a registry bundle (shared/bundles/manifests/index.js, generated into
 //                                       bundles.inc): its manifest.json and every shard it names, into root/<directory>
 //   lf::fetch::blob(root, "boltz2")     af3-any-model's own int8 blob (huggingface.co/sokrypton/af3-any-model, pinned
 //                                       below) into root/af3am-<name>/ - the weights cuda/af3 folds the AF3 lineage with
 //
 // `root` is the weights directory: a command's --weights-dir, else home() below.
-// Each prints "  <name>: <file> (k/n)" as a piece lands and "<name> -> <dir>" when whole (cuda/worker.py turns the
+// Each prints "  <name>: <file> (k/n)" as a piece lands and "<name> -> <dir>" when whole (python/localfold/worker.py turns the
 // first into the page's download status). 🔴 THE MANIFEST LAST: a bundle is "here" when its manifest.json is, so
 // it is written only once every shard it names is, and every file lands through a `.part` renamed when whole - an
 // interrupted download leaves nothing that reads as finished. One fetch a bundle at a time (flock), since the

@@ -54,10 +54,11 @@ import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
-import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
+import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
+import { superposePdbOnto } from "./pdb-superpose.js";
 import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
   paeMatrix, predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
@@ -77,8 +78,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteLiveChoice,
-  remoteEvents, remoteHead } from "./colab-bridge.js";
+import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
+  remoteLiveChoice, remoteEvents, remoteHead } from "./native-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -124,7 +125,7 @@ function foldStem(fallback) {
 window.__entityList = entityList;
 
 // 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON: a gate driving this page
-// (tools/check-cuda-worker.py, tools/check-model-pending.py) reads what the page
+// (tools/check-native-worker.py, tools/check-model-pending.py) reads what the page
 // holds rather than what its download button writes. `lastPrediction` is a
 // module binding; a function rather than the value because it is REASSIGNED on
 // every fold and a captured reference would hand back the one before.
@@ -364,7 +365,7 @@ function applyModelFromUrl() {
   // silently-ignored parameter this function exists to prevent, wearing a
   // complaint that names a family the page really does have.
   const viaPlm = Object.entries(PLM_FAMILIES)
-    .find(([, family]) => family === wanted && wanted !== PLM_FAMILIES.none);
+    .find(([, family]) => family === wanted);
   const plm = document.getElementById("plm-mode");
   if (viaPlm !== undefined && plm !== null) {
     const host = [...select.options].map((option) => option.value)
@@ -588,7 +589,24 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
  * a capability it has. That is the mistake recorded in CLAUDE.md for the
  * AF3/OpenBind split, one model later, and this is the name that prevents it.
  */
-const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family);
+/**
+ * The models only a native port folds: biohub's released ESMFold2-Fast and ESMFold2, on ESM-C 6B (2.5 GB as 3-bit
+ * codes, more than a page holds), from local exports - offered when `localfold serve` says it has them
+ * (web/native-bridge.js), refused by name on this page's own WebGPU. Both take ligands, modified residues and nucleic
+ * chains as the single-sequence tier does; ESMFold2 also reads an alignment, so it keeps the MSA row.
+ */
+const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
+/**
+ * 🔴 TWO QUESTIONS ABOUT ESMFold2, AND THEY ARE NOT ONE. The model row has one ESMFold2 entry and the variant row picks
+ * the checkpoint: Fast on ESM-C 600M or 300M (biohub's experimental tier - SINGLE_SEQUENCE_FAMILIES, the WebGPU
+ * registry's), Fast on ESM-C 6B, Full on ESM-C 6B (the released two, native only). `isEsmfold2` is "show the variant
+ * row and ESMFold2's step dial"; `readsNoAlignment` is the experimental tier alone, whose checkpoint disables its
+ * alignment features - the released Fast reads an alignment's profile and Full encodes it. Asked as one question
+ * ("the single-sequence tier"), choosing the 6B Fast hid the row it was chosen on and sent AlphaFold 3's step count.
+ */
+const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family);
+const isEsmfold2 = (family) => readsNoAlignment(family) || NATIVE_ONLY_FAMILIES.includes(family);
+const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 
 /**
  * What a fold's viewer object and downloaded files are called, per model.
@@ -626,6 +644,8 @@ const MODEL_STEMS = {
   "multimer-5": "af2_multimer_model5",
   "ef2-fast-600m": "ef2_fast_600m",
   "ef2-fast-300m": "ef2_fast_300m",
+  "ef2-fast": "esmfold2_fast",
+  ef2: "esmfold2",
 };
 
 /** What to call each model while its weights download. */
@@ -678,6 +698,8 @@ const MODEL_LABELS = {
   // ...the same folding model against the smaller tower, and its own
   // checkpoint. The label names the tower because that is what differs.
   "ef2-fast-300m": "EF2-fast (300M)",
+  "ef2-fast": "ESMFold2-Fast (ESM-C 6B)",
+  ef2: "ESMFold2",
   // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
   // TYPED. A delta downloads its BASE as well as itself, so the dial reading
   // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
@@ -804,7 +826,7 @@ const msaMode = () => {
   // family - "unknown model ef2-fast-600m: expected monomer, multimer, af3,
   // openbind0". The control was ignored everywhere except the one place it
   // could still throw.
-  if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
+  if (readsNoAlignment(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
   // 🔴 `job` IS AN ACTION AND NOT A MODE, SO IT NEVER REACHES A FOLD. Selecting
   // it opens a file picker; it answers here with the mode it replaced, because
@@ -1021,7 +1043,7 @@ function status(text, isError = false) {
   // the runtime's phases against this browser's clock and file them under this
   // browser's (empty) device - the rows that arrive as `dev` events are the
   // real ones, taken where the work happened.
-  if (colabRole() !== "reader") devStatus(text);
+  if (nativeRole() !== "reader") devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -1151,11 +1173,13 @@ function modelProgress(fraction, detail = "") {
  * because none of them has a language model to run.
  */
 function usesLanguageModel(family = chosenFamily()) {
-  if (!SINGLE_SEQUENCE_FAMILIES.includes(family)) return false;
-  return plmChoice() !== "none";
+  // (every ESMFold2 variant folds from its language model: "no language model" is not offered - it was the
+  // sequence alone, which no ESMFold2 is)
+  return isEsmfold2(family);
 }
 
-const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m";
+// (|| : a saved session or link naming a variant the row no longer has - "none" - comes back as the default, not blank)
+const plmChoice = () => document.getElementById("plm-mode")?.value || "esmc-600m";
 
 /**
  * What to call the language model in a record of the fold.
@@ -1168,8 +1192,9 @@ const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m
  */
 function plmLabel() {
   if (!usesLanguageModel()) return "none";
+  // (the option's own record of its tower: its text names the variant, Fast or Full, beside it)
   const select = document.getElementById("plm-mode");
-  return select?.selectedOptions?.[0]?.textContent?.trim() ?? plmChoice();
+  return select?.selectedOptions?.[0]?.dataset?.languageModel ?? plmChoice();
 }
 
 /**
@@ -1182,15 +1207,16 @@ function plmLabel() {
  * would let a page ask for a pairing that has never existed. The model row
  * therefore shows ONE "EF2-fast" and this row says which.
  *
- * 🔴 AND "None" KEEPS WHICHEVER FOLDING MODEL IS ALREADY THERE, because it is
- * the folding model that folds: with no tower every token takes
- * `shimSingleForZeroState`, which each bundle has its own version of. 600M's is
- * the default and the one the measurements above were made against.
+ * (A "None" variant - the 600M folding model with no tower, every token taking `shimSingleForZeroState` - was offered
+ * here and is not: no ESMFold2 folds from the sequence alone. A session that saved it reads as the 600M default.)
  */
 const PLM_FAMILIES = {
   "esmc-600m": "ef2-fast-600m",
   "esmc-300m": "ef2-fast-300m",
-  none: "ef2-fast-600m",
+  // ...and biohub's RELEASED ESMFold2-Fast, which folds from ESM-C 6B on a native port only (NATIVE_ONLY_FAMILIES)
+  "esmc-6b": "ef2-fast",
+  // ...and biohub's released ESMFold2 itself, the same tower with an MSA encoder and twice the trunk (native only)
+  "esmc-6b-full": "ef2",
 };
 
 function startModelPreload(family, signal) {
@@ -1949,6 +1975,8 @@ function showTrunkContacts(liveContacts, chains) {
     });
     window.Heatmap?.updateVisibility?.(renderer);
     renderer.render("trunk-contacts");
+    // (counted, for a gate: tools/check-native-worker.py reads that a later fold's trunk drew its maps)
+    window.__trunkContactsShown = (window.__trunkContactsShown ?? 0) + 1;
   } catch (cause) {
     console.warn("could not show the trunk's contact map", cause);
   }
@@ -2541,24 +2569,41 @@ function syncModelControls() {
   // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
   // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
   // removed, docs/AF3.md "Flow removed".)
-  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family);
+  const sampled = af3 || isEsmfold2(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
-  // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
-  // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
-  // screen would run, take a minute of somebody else's server, and be
-  // discarded - which is the "quietly ignored control" this function exists to
-  // prevent, one step worse.
-  const singleSequence = SINGLE_SEQUENCE_FAMILIES.includes(family);
-  for (const id of ["msaModeGroup", "maxMsaGroup"]) {
-    const node = document.getElementById(id);
-    if (node !== null) node.hidden = singleSequence;
+  // 🔴 ESMFold2 FOLDS FROM ITS LANGUAGE MODEL, AND AN ALIGNMENT IS AN OPT-IN.
+  // Its experimental tier reads ESM-C alone (`disable_msa_features` in its
+  // checkpoint), so it has no MSA row: a search left live would run, take a
+  // minute of somebody else's server and be discarded. The released 6B two CAN
+  // read one beside ESM-C (Fast as profile features, Full through its encoder),
+  // so their row is shown, starts at "ESM-C only" - what "Single Sequence" means
+  // for a model whose evolutionary information is a language model - and offers
+  // the search and an upload as the reader's choice. The reader's own setting
+  // for the other models is kept and given back when one is chosen again.
+  const noAlignment = readsNoAlignment(family);
+  const esmfold2 = isEsmfold2(family);
+  const msaSelect = document.getElementById("msa-mode");
+  const msaNode = document.getElementById("msaModeGroup");
+  if (msaNode !== null) msaNode.hidden = noAlignment;
+  const single = msaSelect?.querySelector('option[value="none"]');
+  if (msaSelect !== null && single !== null && single !== undefined) {
+    single.dataset.label ??= single.textContent;
+    single.textContent = esmfold2 ? "ESM-C only" : single.dataset.label;
+    if (esmfold2 && msaSelect.dataset.kept === undefined) {
+      msaSelect.dataset.kept = msaSelect.value;           // (into ESMFold2: its default, the reader's kept)
+      msaSelect.value = "none";
+    } else if (!esmfold2 && msaSelect.dataset.kept !== undefined) {
+      msaSelect.value = msaSelect.dataset.kept;            // (out of it: given back)
+      delete msaSelect.dataset.kept;
+    }
   }
-  // ...and the row that replaces them, which is the same question for a model
-  // whose evolutionary information comes from a language model rather than an
-  // alignment. Shown exactly where the MSA row is not.
+  // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
+  const maxNode = document.getElementById("maxMsaGroup");
+  if (maxNode !== null) maxNode.hidden = isEsmfold2(family);
+  // ...and the variant row, for every ESMFold2
   const plmNode = document.getElementById("plmGroup");
-  if (plmNode !== null) plmNode.hidden = !singleSequence;
+  if (plmNode !== null) plmNode.hidden = !isEsmfold2(family);
   // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
   // hidden, so choosing AF3 and going back to AF2 left the page with no
   // Recycles until it was reloaded.
@@ -2611,7 +2656,7 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
+  const ef2 = isEsmfold2(chosenFamily());
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
@@ -3840,22 +3885,22 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
- * there is no CORS question at all: `notebooks/localfold.ipynb` runs
- * tools/colab_backend.py on the runtime, that server serves this checkout,
- * and the link that cell prints opens index.html on it. `?backend=colab` is
- * the cell saying which of the two machines should do the work, and `t` is
+ * there is no CORS question at all: python/localfold/server.py - `localfold serve`
+ * on the reader's own machine, or the Colab notebook's cell on a runtime - serves
+ * this page, and the link it prints opens index.html on it. `?backend=native` is
+ * the server saying which of the two should do the work, and `t` is
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
- * THE SAME SERVER KEEPS ONE WORKER, cuda/worker.py, and that is what folds:
- * this page posts the job, the worker's events come back through
- * web/colab-bridge.js, and this page draws them.
+ * THE SAME SERVER KEEPS ONE WORKER, python/localfold/worker.py, and that is what
+ * folds - with metal/ on a Mac, cuda/ on an NVIDIA card: this page posts the job,
+ * the worker's events come back through web/native-bridge.js, and this page draws them.
  *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
  */
 function remoteBackend() {
-  return colabRole() === "reader" ? {} : null;
+  return nativeRole() === "reader" ? {} : null;
 }
 
 /**
@@ -3894,12 +3939,12 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // 🔴 EVERY REMOTE FOLD IS A CUDA FOLD (remoteBackendChoice), HANDED THE JOB AS
   // AlphaFold 3 JSON, written by the same module that writes the archive's
   // request - so the entity conversion is this page's and not re-implemented
-  // in Python. See cuda/worker.py.
+  // in Python. See python/localfold/worker.py.
   request.backend = remoteBackendChoice();
   // ...and the steps this page would fold with (samplerPlan), because an
   // empty dial is the family's preferred count here and would be the model's own default there
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
-  if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
+  if (isEsmfold2(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
   } else {
@@ -3926,7 +3971,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
           paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
       : { merged: uploadedMsas?.merged ?? uploadedA3m };
   }
-  status(`${label} · folding on the runtime with CUDA…`);
+  status(`${label} · folding on the runtime with ${remoteBackendName()}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -3960,7 +4005,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
   // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
-  // each trunk pass's map (cuda/worker.py, `contacts`: a byte a pair); before the sampler has a
+  // each trunk pass's map (python/localfold/worker.py, `contacts`: a byte a pair); before the sampler has a
   // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
   let liveContact;
   const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
@@ -3994,6 +4039,7 @@ async function followRemoteFold({ since, label, signal }) {
       for (let i = 0; i < bytes.length; i += 1) probs[i] = bytes[i] / 255;
       liveContact = contactMapFor(probs, undefined);
       if (liveContact === undefined) return;
+      draw.open();
       showTrunkContacts(liveContact, expandEntities(formInputs().entities).chains);
     } catch (cause) { console.warn("streamed contact map skipped:", cause); }
   };
@@ -4041,6 +4087,9 @@ async function followRemoteFold({ since, label, signal }) {
       }
       else if (said.kind === "contacts") showContacts(said.payload);
       else if (said.kind === "scores") showScores(said.payload);
+      // ...and the worker's own timing of each step, as it ends, into the timing report (web/dev-log.js)
+      else if (said.kind === "dev") devPhase(said.payload?.phase, said.payload?.ms, said.payload?.sub === true,
+        said.payload?.at);
       // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
       // carries the worker's own clock and the broker's arrival stamp,
       // so "the fold was slow" and "the feed was slow" are two numbers. It is
@@ -4064,14 +4113,17 @@ async function followRemoteFold({ since, label, signal }) {
       && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
   }
 
-  // 🔴 A CUDA FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // 🔴 A NATIVE FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
   // PREDICTION - there is no copy of this page on the other side to build one.
   // So it is built here, in the shape the AF3 path records (typed arrays, a
   // token layout, the context the archive and the session read), and it goes
   // through the same doors: loadIntoViewer for the picture, recordPrediction
   // for the downloads, the scores card and the saved session.
-  if (result.cuda !== true) throw new Error("the runtime answered with something that is not a CUDA fold");
-  const cuda = cudaPrediction(result, stem, label);
+  // (an older worker marked it `cuda: true`; this one says which native port folded it)
+  if (result.native === undefined && result.cuda !== true) {
+    throw new Error("the runtime answered with something that is not a native fold");
+  }
+  const cuda = nativePrediction(result, stem, label);
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4094,16 +4146,27 @@ async function followRemoteFold({ since, label, signal }) {
     confidence: cuda.confidence,
     length: result.length,
   });
-  if (viewer !== undefined && Object.keys(camera).length > 0) {
+  // 🔴 THE CAMERA IS KEPT ONLY WHERE THE FOLD WAS WATCHED. It is the streamed trajectory's, oriented on its first
+  // frame, and keeping it holds the picture steady as the result replaces the frames. With Live preview off nothing
+  // was streamed: the camera held is the PREVIOUS fold's, and the result - in the model's own coordinates, tens of
+  // angstroms from anywhere - was drawn off-centre or out of view. It gets the best view of itself instead.
+  if (viewer !== undefined && framePdbs.length > 0 && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
+  } else if (viewer !== undefined && framePdbs.length === 0) {
+    orientBestView(viewer);
   }
   const api = window.py2Dmol;
   if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
     carry(first, liveFrames[0]);
-    for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
+    // 🔴 THE RESULT DRAWN WHERE THE FRAMES ARE. The native ports superpose each streamed frame onto the first and
+    // return the structure in the model's own frame - the same atoms as the last frame once fitted, 4-60 A away as
+    // drawn - so the trajectory jumped on its last frame. The final frame is the result moved onto the last streamed
+    // one (web/pdb-superpose.js); the downloads keep the result as the model wrote it.
+    const settled = superposePdbOnto(result.pdb, framePdbs[framePdbs.length - 1]);
+    for (const [index, text] of [...framePdbs.slice(1, -1), settled].entries()) {
       try {
         const frame = api.frameFromText(text);
         const last = index === framePdbs.length - 2;
@@ -4129,15 +4192,15 @@ async function followRemoteFold({ since, label, signal }) {
 }
 
 /**
- * A CUDA fold's result as this page's own prediction.
+ * A native fold's result as this page's own prediction.
  *
- * The worker (cuda/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * The worker (python/localfold/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
  * contact probabilities, its token layout and the alignment it used; the rest
  * - the entities, the settings, the form - is this page's, taken now, because
  * the reader's form is what asked for this fold.
  */
-function cudaPrediction(result, stem, label) {
-  const backend = "CUDA";
+function nativePrediction(result, stem, label) {
+  const backend = result.native === "metal" ? "Metal" : "CUDA";
   const floats = (values) => (values == null ? undefined : Float32Array.from(values));
   const given = result.confidence ?? {};
   const confidence = {
@@ -4204,7 +4267,7 @@ function cudaPrediction(result, stem, label) {
  * one runs is refused by the broker with its own words.
  */
 async function attachToRunningFold() {
-  if (colabRole() !== "reader") return;
+  if (nativeRole() !== "reader") return;
   try {
     const head = await remoteHead();
     if (!head.folding) return;
@@ -4233,7 +4296,7 @@ function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   let lastFrame;
   let opened = false;
   let colouring = false;
-  return (pdb) => {
+  const drawer = (pdb) => {
     const api = window.py2Dmol;
     if (api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
@@ -4261,6 +4324,13 @@ function remoteFrameDrawer(stem, liveMaps = () => undefined) {
     }
     return lastFrame;
   };
+  // 🔴 THIS FOLD'S OBJECT, OPENED BY ITS FIRST CONTACT MAP AND NOT ONLY BY ITS FIRST FRAME. The trunk's maps are drawn
+  // only while the current object has no frames (showTrunkContacts), and the object was opened here on the sampler's
+  // first frame - so on every fold after the first, the previous fold's frames held the panel and each trunk pass's
+  // map was dropped: a second fold showed none (found on IntelliFold-2, true of every model). The WebGPU paths open
+  // theirs as the fold starts.
+  drawer.open = () => { if (!opened) { openBlankFold(stem); opened = true; } };
+  return drawer;
 }
 
 async function fold(event) {
@@ -4288,7 +4358,7 @@ async function fold(event) {
   // will actually do rather than what a hidden control still says.
   devBeginRun(`fold · ${element("model-family").value}`
     + ` · alignment ${msaMode()}`
-    + ` · ${element("recycles").value} recycles`);
+    + ` · ${element("recycles").value} recycles`, MODEL_LABELS[element("model-family").value]);
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
   // for as long as the new fold took - which is worse than an empty panel,
@@ -4352,6 +4422,10 @@ async function fold(event) {
     // watch. Everything above still runs - the entities are validated, the
     // model is resolved, the terms are asked - because those are questions
     // about the JOB, and the job is the same wherever it runs.
+    if (NATIVE_ONLY_FAMILIES.includes(family) && remoteBackend() === null) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} folds on a native backend only - run \`localfold serve\``
+        + " with its export on disk (metal/README.md)");
+    }
     if (remoteBackend() !== null) {
       await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                             templates: request.templates ?? [], family, signal });
@@ -5454,6 +5528,7 @@ document.getElementById("af2Model")?.addEventListener("change", () => {
 document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncModelControls();
   syncAf3Count();
+  syncMode();             // (the variant can grey the MSA row or give it back: what hangs off that row follows)
 });
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
@@ -6412,11 +6487,11 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A READER'S PAGE (`?backend=colab`) THE BADGE that says where Fold
- * runs and offers the way back. Off Colab `installColabBridge` returns
- * immediately and nothing here runs. See web/colab-bridge.js.
+ * 🔴 AND ON A READER'S PAGE (`?backend=native`) THE BADGE that says where Fold
+ * runs and offers the way back. Otherwise `installNativeBridge` returns
+ * immediately and nothing here runs. See web/native-bridge.js.
  */
-installColabBridge();
+installNativeBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
 
@@ -6429,7 +6504,7 @@ syncDownloads();
 document.addEventListener("py2dmol-frame-change", syncDownloads);
 
 // 🔴 THE BRIDGE SAYS WHEN THE RUNTIME HAS BEEN STOPPED, on an event rather
-// than by calling in: web/colab-bridge.js is imported BY this file, so a call
+// than by calling in: web/native-bridge.js is imported BY this file, so a call
 // the other way would be a cycle. One listener, and the page is a viewer.
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");

@@ -23,8 +23,8 @@ inline const float* Cw(const std::string& name) { return W(shimKey(name)); }
 // ---------------------------------------------------------------- GEMM, row-major
 // Y[rows, out] = X[rows, in] Wt[in, out] (+ beta Y); f32 accumulate (TF32 only under --fast)
 inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
-                 int ldx = 0, int ldy = 0) {
-  const float one = 1.f;
+                 int ldx = 0, int ldy = 0, float alpha = 1.f) {
+  const float one = alpha;      // (alpha: ESM-C's residual scale, esmc.cuh towerGemm; 1 everywhere else)
   if (GEMM16) {
     CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_32F, out, X, CUDA_R_32F,
                     ldx ? ldx : in, &beta, Y, CUDA_R_32F, ldy ? ldy : out, CUBLAS_COMPUTE_32F_FAST_16F,
@@ -36,10 +36,11 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
 }
 
 // the same with an f16 weight (W's mirror) and f32 X and Y: X narrowed to f16, tensor cores, f32 accumulation
-inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f) {
+inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
+                  float alpha = 1.f) {
   half* xh = scratch<half>("gemmh.x", rows * in);
   toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
-  const float one = 1.f;
+  const float one = alpha;
   CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta,
                   Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }

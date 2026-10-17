@@ -31,7 +31,8 @@ import { packNamedWeights } from "../../../shared/weights/weight-pack.js";
 import {
   createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
 } from "../../kernels/matrix-linear.js";
-import { deviceMatrixConfig, deviceTuning } from "../../runtime/device-profile.js";
+import { deviceMatrixConfig, deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
+import { vectorGemmBlock } from "../../kernels/vector-gemm-block.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 
@@ -671,6 +672,12 @@ export class Af3TransitionGpu {
  */
 export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 16 });
 /**
+ * VECTOR_GEMM_F16: the panels staged in f16 and each k step's BK products summed in f16 (`fma` on vec4<f16>), the
+ * step's sums then added into f32 accumulators - so no f16 partial sum runs past BK products. check-transition-split.js
+ * `--vector=1 --arithmetic=f16`: relRMS 1.22e-3 against 4.38e-4 for the f32 arithmetic over the same f16 scratch. The
+ * block, per arithmetic, is the device's: see webgpu/kernels/vector-gemm-block.js.
+ */
+/**
  * Where the VECTOR split starts to pay, which is not where the matrix one does.
  * Measured on an A100 under stock flags, pair-transition GPU ms per trunk pass,
  * fused against vector split:
@@ -685,6 +692,19 @@ export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 1
  * measured on matrix units; without them the fused kernel still wins at 128.
  */
 export const VECTOR_SPLIT_MIN_CHANNELS = 192;
+/**
+ * ...and where the f16 arithmetic does (VECTOR_GEMM_F16), which is lower: measured on an M5 under stock flags
+ * (bench-transition.js, 128 channels at 255 tokens, the whole transition) the fused kernel is 15.12 ms, the vector
+ * split in f32 at the Apple block 14.84, and in f16 10.60 at 64 x 128 x 32 - 1.43x at AF3's width.
+ */
+export const VECTOR_F16_SPLIT_MIN_CHANNELS = 128;
+/**
+ * The vector split's arithmetic an AF3-lineage pair track asks for: f16 at every width. At AF3's 128 channels it is
+ * what makes the split pay at all (VECTOR_F16_SPLIT_MIN_CHANNELS, checked against the fold); at 256 it is 1.66x on the
+ * GEMM (ESMFold2's, the same kernel). Approximations are acceptable here (the user's call, 2026-10-12) and only AF3's
+ * bundle was folded both ways. `vectorTransitionArithmetic` overrides it - the control arm.
+ */
+export const pairTransitionArithmetic = () => "f16";
 
 /**
  * The workgroup storage the split's NORMALIZE kernel stages: `rows` whole rows
@@ -704,8 +724,9 @@ function splitNormalizeRows(device, channels) {
   return [8, 4, 2].find((rows) => splitNormalizeBytes(channels, rows) <= limit);
 }
 function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
-                                  residual = false, sourceGate = null }) {
-  const { rows: BM, columns: BN, inner: BK } = VECTOR_GEMM_BLOCK;
+                                  residual = false, sourceGate = null,
+                                  block = VECTOR_GEMM_BLOCK, arithmetic = "f32" }) {
+  const { rows: BM, columns: BN, inner: BK } = block;
   // 🔴 NO GUARD ON k OR ON THE COLUMNS, ONLY ON THE ROWS. The inner extent must
   // divide by BK and the columns by BN; `createTransitionSplitShaders` refuses a
   // width that does not (`channels % 64`), and the transition's two extents are
@@ -715,20 +736,32 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const TN = BN / 16;
   // The source panel's stride: four words past the block, see above.
   const AS = BM + 4;
-  const half = [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
+  // 🔴 f16 ARITHMETIC: the panels staged in f16 and a k step's products summed
+  // in f16, each step's sums then added into f32 accumulators - so no partial
+  // sum in f16 runs past BK products. See VECTOR_GEMM_F16.
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  const half = f16 || [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
   const load = sourceGate === null
-    ? "f32(source[row * parameters.inner + k])"
-    : `gated(row * ${sourceGate.stride}u + k)`;
+    ? `${T}(source[row * parameters.inner + k])`
+    : `${T}(gated(row * ${sourceGate.stride}u + k))`;
   const accumulators = [];
   const multiply = [];
   const stores = [];
   const reads = [];
+  const flush = [];
   for (let i = 0; i < TM; i += 1) reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * ${TM}u + ${i}u];`);
   for (let j = 0; j < TN / 4; j += 1) reads.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TN / 4}u + ${j}u];`);
   for (let i = 0; i < TM; i += 1) {
     for (let j = 0; j < TN / 4; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
-      multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+      if (f16) {
+        accumulators.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
+        multiply.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+      } else {
+        multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+      }
       for (let c = 0; c < 4; c += 1) {
         const value = `acc_${i}_${j}.${"xyzw"[c]}`;
         stores.push(`  {
@@ -742,7 +775,7 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
       }
     }
   }
-  const weight = (offset) => `f32(weights[base${offset}])`;
+  const weight = (offset) => `${T}(weights[base${offset}])`;
   return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -754,8 +787,8 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
 const BM: u32 = ${BM}u;
 const BN: u32 = ${BN}u;
 const BK: u32 = ${BK}u;
-var<workgroup> a_tile: array<f32, ${AS * BK}>;
-var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
+var<workgroup> a_tile: array<${T}, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 ${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
 fn gated(at: u32) -> f32 {
   return swish(f32(source[at])) * f32(source[at + ${sourceGate.offset}u]);
@@ -775,7 +808,7 @@ ${accumulators.join("\n")}
       let m = e / BK;
       let k = k0 + e % BK;
       let row = row_origin + m;
-      var value = 0.0;
+      var value = ${T}(0.0);
       if (row < parameters.rows) { value = ${load}; }
       a_tile[(e % BK) * ${AS}u + m] = value;
     }
@@ -783,13 +816,14 @@ ${accumulators.join("\n")}
       let k = k0 + e / ${BN / 4}u;
       let base = parameters.weight_offset + k * parameters.columns + column_origin
         + (e % ${BN / 4}u) * 4u;
-      b_tile[e] = vec4<f32>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
+      b_tile[e] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
     }
     workgroupBarrier();
     for (var k = 0u; k < BK; k += 1u) {
 ${reads.join("\n")}
 ${multiply.join("\n")}
     }
+${flush.join("\n")}
     workgroupBarrier();
   }
 ${stores.join("\n")}
@@ -945,22 +979,25 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 
   if (vector) {
-    if (channels % VECTOR_GEMM_BLOCK.columns !== 0 || channels % VECTOR_GEMM_BLOCK.inner !== 0) {
+    const block = matrix.block ?? VECTOR_GEMM_BLOCK;
+    const arithmetic = matrix.arithmetic ?? "f32";
+    if (channels % block.columns !== 0 || channels % block.inner !== 0) {
       throw new RangeError(`the vector split transition wants channels divisible by `
-        + `${VECTOR_GEMM_BLOCK.columns}; got ${channels}`);
+        + `${block.columns}; got ${channels}`);
     }
     return {
       normalize,
       wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
-                                     outputPrecision: wideStorage }),
+                                     outputPrecision: wideStorage, block, arithmetic }),
       down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
                                      outputPrecision: "f32", residual: true,
-                                     sourceGate: { stride: wide, offset: intermediate } }),
+                                     sourceGate: { stride: wide, offset: intermediate },
+                                     block, arithmetic }),
       shape: { rows, channels, intermediate, wide },
       geometry: null,
       storage: normalizedStorage,
-      tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: VECTOR_GEMM_BLOCK.rows,
-               blockColumns: VECTOR_GEMM_BLOCK.columns },
+      tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: block.rows,
+               blockColumns: block.columns },
     };
   }
   const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };
@@ -1138,7 +1175,7 @@ export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
 // off, so a 384- or 512-channel head ran the fused kernel the split beats 3.7x.
 // The vector split with f32 scratch is f32 arithmetic throughout - the same
 // class as the fused kernel, only reordered - so a pinned stack takes it.
-export function splitTransitionConfig(device, channels, { f32Only = false } = {}) {
+export function splitTransitionConfig(device, channels, { f32Only = false, arithmetic = "f32" } = {}) {
   const tuning = deviceTuning(device);
   // 🔴 THE WIDTH DECIDES BOTH SPLITS; A PRIOR MAY ONLY REFUSE. (It read "the
   // prior decides the matrix split", which left a T4 on the vector one.)
@@ -1150,14 +1187,19 @@ export function splitTransitionConfig(device, channels, { f32Only = false } = {}
   // up the vector split is the default unless a device says `false`. The
   // matrix split is still the prior's to choose: it was measured per device.
   if (tuning.pairTransitionSplit === false) return false;
-  if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
-    return false;
-  }
   // ...and the MATRIX split too, now, unless a prior refused it: past the
-  // width rule above it was the ampere prior's alone, so a T4 with matrix
+  // width rule below it was the ampere prior's alone, so a T4 with matrix
   // units ran IntelliFold-2's transition on the vector split.
   const config = f32Only || tuning.pairTransitionSplit === false ? null
     : deviceMatrixConfig(device, { element: "f16" });
+  // 🔴 THE VECTOR SPLIT IN f16 ARITHMETIC PAYS FROM AF3's 128 CHANNELS, where the f32 one starts at 192 - see
+  // VECTOR_F16_SPLIT_MIN_CHANNELS. The width rule below is every other path's.
+  const vectorF16 = config === null && !f32Only && halfPrecisionAvailable(device)
+    && (tuning.vectorTransitionArithmetic ?? arithmetic) === "f16"
+    && channels >= VECTOR_F16_SPLIT_MIN_CHANNELS;
+  if (!vectorF16 && channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
+    return false;
+  }
   // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
   // none of which exposes subgroup matrices - ran the fused kernel at every
   // width. The vector GEMM above takes the split's two projections instead,
@@ -1166,10 +1208,26 @@ export function splitTransitionConfig(device, channels, { f32Only = false } = {}
   if (normalizeRows === undefined) return false;
   const rows = normalizeRows === 8 ? {} : { normalizeRows };
   if (config === null) {
-    if (channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
+    if (!vectorF16 && channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
     if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
-    return { vector: true,
-             storage: !f32Only && device.features.has("shader-f16") ? "f16" : "f32", ...rows };
+    // 🔴 THE f16 SWITCH, NOT THE FEATURE BIT. Asked as `features.has`, --f16=off
+    // could not reach this scratch, so an "f32" trunk on a 256-channel model
+    // rounded its widened transition to f16: protenix2's pair transition alone,
+    // one MSA block, stock flags, against the native f32 port (metal/) - 3.13e-5
+    // asked that way, 1.31e-7 now. (With matrix units the MATRIX split runs,
+    // which is f16 by construction and which no switch reaches: 5.25e-4 there.)
+    const storage = !f32Only && halfPrecisionAvailable(device) ? "f16" : "f32";
+    // 🔴 THE GEMM'S ARITHMETIC IS THE CALLER'S PRECISION POLICY, NOT THIS
+    // FUNCTION'S: f16 only where the stack already multiplies and accumulates
+    // in f16 (ESMFold2's trunk, see its trunk.js) and the device has it.
+    // `vectorTransitionArithmetic` overrides it - the control arm.
+    const asked = tuning.vectorTransitionArithmetic ?? arithmetic;
+    const math = asked === "f16" && storage === "f16" ? "f16" : "f32";
+    // (the two extents it contracts and produces are `channels` and four times it)
+    const block = vectorGemmBlock(device, math,
+      ({ columns, inner }) => channels % columns === 0 && channels % inner === 0);
+    return { vector: true, storage, ...rows,
+             ...(math === "f16" ? { arithmetic: "f16" } : {}), ...(block ? { block } : {}) };
   }
   const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,

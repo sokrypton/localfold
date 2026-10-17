@@ -1,3 +1,4 @@
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
 import {
   ATTENTION_NORMALIZE_SHADER,
   createAttentionNormalizeShader,
@@ -67,7 +68,8 @@ import {
 } from "../../kernels/transition.js";
 import { SOURCES } from "../../../shared/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
-import { deviceTuning } from "../../runtime/device-profile.js";
+import { halfPrecisionAvailable, deviceTuning } from "../../runtime/device-profile.js";
+import { storageBytes } from "../../runtime/storage.js";
 import { createTriangleShaders, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
@@ -203,41 +205,79 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
-export const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
+/**
+ * The global column attention's softmax over the sequences, a workgroup a (column, head).
+ *
+ * 🔴 IT RAN ONE THREAD A WORKGROUP. `@workgroup_size(1)` over (length, heads) is 2,040 threads at 255 residues -
+ * each walking all 1,024 extra sequences in turn - and its accumulator was `array<f32, 32>` indexed by a RUNTIME
+ * head width, which the compiler cannot keep in registers. 19.1 ms of a 326 ms extra-MSA block on an M2 at 255
+ * residues and 1,024 rows (tools/gpu/profile-af2-block.js --stack=extra). Now 64 lanes take the sequences in a
+ * stride, each with its own online softmax, and combine through workgroup memory; the head width is a constant of
+ * the shader (and of its pipeline key). The sum is regrouped, so it is a reordering and not bit-identical.
+ */
+export const GLOBAL_ATTENTION_FLASH_LANES = 64;
+export function createGlobalAttentionFlashShader(headDim) {
+  if (!Number.isInteger(headDim) || headDim < 1) throw new RangeError(`global attention head width ${headDim}`);
+  // (every loop bound a LITERAL: a bound naming a constant is made opaque for a device's first fold
+  // (runtimeLoopBounds "tiered", pipeline-cache.js), and the opaque and unrolled kernels round differently - the
+  // first fold and the next disagreed, which fold-af2.js --repeat refuses)
+  return `${GLOBAL_ATTENTION_COMMON}
+const LANES: u32 = ${GLOBAL_ATTENTION_FLASH_LANES}u;
+const HEAD_DIM: u32 = ${headDim}u;
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> keys: array<f32>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
 @group(0) @binding(3) var<storage, read> mask: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x; let head = id.y;
-  if (column >= p.length || head >= p.heads) { return; }
-  var maximum = -1e30; var denominator = 0.0;
-  var accumulated: array<f32, 32>;
-  for (var d = 0u; d < p.head_dim; d += 1u) { accumulated[d] = 0.0; }
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    var logit = 0.0;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      logit += query[(column * p.heads + head) * p.head_dim + d]
-        * keys[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
-    let next_maximum = max(maximum, logit);
-    let previous_scale = exp(maximum - next_maximum);
-    let weight = exp(logit - next_maximum);
-    denominator = denominator * previous_scale + weight;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      accumulated[d] = accumulated[d] * previous_scale
-        + weight * values[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    maximum = next_maximum;
+var<workgroup> part_max: array<f32, LANES>;
+var<workgroup> part_den: array<f32, LANES>;
+var<workgroup> part_acc: array<f32, ${GLOBAL_ATTENTION_FLASH_LANES * headDim}>;
+@compute @workgroup_size(${GLOBAL_ATTENTION_FLASH_LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) local: u32) {
+  let column = group.x; let head = group.y;
+  // (no return before the barrier: the guard below is uniform across the workgroup, and the dispatch is exact)
+  let live = column < p.length && head < p.heads;
+  var q: array<f32, HEAD_DIM>;
+  var accumulated: array<f32, HEAD_DIM>;
+  for (var d = 0u; d < ${headDim}u; d += 1u) {
+    q[d] = select(0.0, query[(column * p.heads + head) * HEAD_DIM + d], live);
+    accumulated[d] = 0.0;
   }
-  for (var d = 0u; d < p.head_dim; d += 1u) {
-    output[(column * p.heads + head) * p.head_dim + d] = accumulated[d] / denominator;
+  var maximum = -1e30; var denominator = 0.0;
+  if (live) {
+    for (var sequence = local; sequence < p.sequences; sequence += LANES) {
+      let row = (column * p.sequences + sequence) * HEAD_DIM;
+      var logit = 0.0;
+      for (var d = 0u; d < ${headDim}u; d += 1u) { logit += q[d] * keys[row + d]; }
+      if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
+      let next_maximum = max(maximum, logit);
+      let previous_scale = exp(maximum - next_maximum);
+      let weight = exp(logit - next_maximum);
+      denominator = denominator * previous_scale + weight;
+      for (var d = 0u; d < ${headDim}u; d += 1u) {
+        accumulated[d] = accumulated[d] * previous_scale + weight * values[row + d];
+      }
+      maximum = next_maximum;
+    }
+  }
+  part_max[local] = maximum;
+  part_den[local] = denominator;
+  for (var d = 0u; d < ${headDim}u; d += 1u) { part_acc[local * HEAD_DIM + d] = accumulated[d]; }
+  workgroupBarrier();
+  if (live && local < HEAD_DIM) {
+    var top = -1e30;
+    for (var t = 0u; t < ${GLOBAL_ATTENTION_FLASH_LANES}u; t += 1u) { top = max(top, part_max[t]); }
+    var den = 0.0; var num = 0.0;
+    for (var t = 0u; t < ${GLOBAL_ATTENTION_FLASH_LANES}u; t += 1u) {
+      let w = exp(part_max[t] - top);
+      den += part_den[t] * w;
+      num += part_acc[t * HEAD_DIM + local] * w;
+    }
+    output[(column * p.heads + head) * HEAD_DIM + local] = num / den;
   }
 }`;
+}
 
 /**
  * The global column attention's gated output projection.
@@ -654,14 +694,33 @@ async function encodeAttention(
     rows, options.channels, packedOffsets[0], packedOffsets[1], options.transpose,
     options.batch, options.queries, 1e-5,
   ));
+  // 🔴 EACH OF THESE IS BOUND BY ITS OWN RANGE, so each may take an idle pooled buffer up to twice its size: packed,
+  // they are half a pair-sized f32 tensor, and five of them were a set of buffers the pool held beside the
+  // triangle's (333 MiB at 522 residues). `reuseLarger: false` in the options is the control.
+  const reuse = { reuseLarger: options.reuseLarger !== false };
   const normalized = execution.allocate(
-    `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage);
+    `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage, reuse);
+  // 🔴 q, k, v AND THE GATE FOR A BLOCK OF BATCH ROWS AT A TIME, where all four would pass attentionBlockBytes
+  // (128 MiB): a batch row attends over its own positions only, so each block is projected and attended on its own
+  // and the four tensors are one block's. At 522 residues with 512 MSA rows the row attention's four were 522 MiB;
+  // at 1044 residues a triangle attention's 1064. Blocks of a multiple of 64 rows (every view lands on 256 bytes) and
+  // balanced; below the budget one block, the old dispatches exactly.
+  const blockBytes = deviceTuning(execution.device).attentionBlockBytes ?? 128 * 1024 * 1024;
+  const perRow = options.queries * (3 * storageBytes(options.channels, projectedStorage)
+    + storageBytes(options.channels, valueStorage));
+  let blockRows = options.batch;
+  if (blockBytes > 0 && perRow * options.batch > blockBytes && options.batch > 64) {
+    const most = Math.max(64, Math.floor(blockBytes / perRow / 64) * 64);
+    const blocks = Math.ceil(options.batch / most);
+    blockRows = Math.min(options.batch, Math.ceil(options.batch / blocks / 64) * 64);
+  }
+  const blockElements = blockRows * options.queries * options.channels;
   const projected = (name) => execution.allocate(
-    `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage);
+    `${options.label}.${name}`, blockElements, GPUBufferUsage.STORAGE, projectedStorage, reuse);
   const query = projected("query");
   const key = projected("key");
   const value = execution.allocate(
-    `${options.label}.value`, elements, GPUBufferUsage.STORAGE, valueStorage);
+    `${options.label}.value`, blockElements, GPUBufferUsage.STORAGE, valueStorage, reuse);
   const gate = projected("gate");
   // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. Read the dispatches below:
   // the projection is the last pass that reads it - the pair bias, when it
@@ -722,21 +781,43 @@ async function encodeAttention(
         grid[0], grid[1], 1, `${options.label}.pair-bias`);
     }
   }
-  if (projectMatrixFits) {
-    const dispatch = attentionProjectMatrixDispatch(
-      { rows, channels: options.channels }, projectMatrix);
-    execution.dispatch(encoder, project,
-      [normalized, weights, projectMatrixParams, query, key, value, gate],
-      dispatch.x, dispatch.y, 1, `${options.label}.project`);
-  } else {
-    execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-      Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
-      Math.ceil(rows / attentionProjectTileRows(projectKernel.tile)), 1,
-      `${options.label}.project`);
+  for (let first = 0; first < options.batch; first += blockRows) {
+    const count = Math.min(blockRows, options.batch - first);
+    const whole = count === options.batch;
+    const block = count * options.queries;
+    const part = (tensor) => (whole ? tensor : execution.view(tensor, 0, block * options.channels));
+    const [q, k, v, g] = [query, key, value, gate].map(part);
+    // the block's rows of `normalized` (read by the projection, written by the attention) and of the key mask
+    // ([batch][keys], or [keys][batch] transposed - there the flash kernel keeps the whole batch as the mask's stride)
+    const rowsIn = whole ? normalized : execution.view(normalized, first * options.queries * options.channels,
+      block * options.channels);
+    const out = weighted === normalized ? rowsIn
+      : whole ? weighted : execution.view(weighted, first * options.queries * options.channels, block * options.channels);
+    const maskOffset = options.transpose === true ? first : first * options.queries;
+    const mask = whole ? options.mask : execution.view(options.mask, maskOffset, options.mask.elements - maskOffset);
+    const blockParams = whole ? params : uniform(execution, `${options.label}.block-parameters`,
+      createAttentionParameters({ ...descriptor, batch: count }, packedOffsets));
+    if (projectMatrixFits) {
+      const dispatch = attentionProjectMatrixDispatch(
+        { rows: block, channels: options.channels }, projectMatrix);
+      const matrixParams = whole ? projectMatrixParams
+        : uniform(execution, `${options.label}.block-project-matrix-parameters`, new Uint32Array([
+          block, options.channels, 4 * options.channels, packedOffsets[2], packedOffsets[6], 0, 0, 0,
+        ]));
+      execution.dispatch(encoder, project,
+        [rowsIn, weights, matrixParams, q, k, v, g],
+        dispatch.x, dispatch.y, 1, `${options.label}.project`);
+    } else {
+      execution.dispatch(encoder, project, [rowsIn, weights, blockParams, q, k, v, g],
+        Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
+        Math.ceil(block / attentionProjectTileRows(projectKernel.tile)), 1,
+        `${options.label}.project`);
+    }
+    execution.dispatch(encoder, flash,
+      [q, k, v, g, mask, pairBias, options.transpose === true ? params : blockParams, out],
+      Math.ceil(options.queries / flashKernel.queryTile),
+      count, options.heads, `${options.label}.flash`);
   }
-  execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-    Math.ceil(options.queries / flashKernel.queryTile),
-    options.batch, options.heads, `${options.label}.flash`);
   if (outputMatrixFits) {
     const dispatch = attentionOutputMatrixDispatch(
       { rows, channels: options.channels }, outputMatrix);
@@ -780,7 +861,7 @@ async function encodeGlobalAttention(
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
     execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
       createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
-    execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    execution.pipelines.get(`block:global-attention:flash:${headDim}`, createGlobalAttentionFlashShader(headDim)),
     // ...the SHAPE is in the key because the kernel is generated for it; see
     // createGlobalAttentionOutputShader.
     execution.pipelines.get(
@@ -868,9 +949,16 @@ async function encodeOuterProductMean(
   // createOuterProductMeanVectorContractShader.
   const vectorContract = matrixContract === null && outerFirst
     && deviceTuning(execution.device).opmVectorContract !== false;
+  // ...on the device's vector GEMM block where it names one (webgpu/kernels/vector-gemm-block.js): f32, the same sums
+  // in the same order. The output tiles C_Z by its columns and c_outer^2 by its depth, with no tail.
+  // ...in f16 arithmetic where the device has it (`opmVectorArithmetic: "f32"` the control; docs/M5-HANDOFF.md)
+  const opmArithmetic = halfPrecisionAvailable(execution.device)
+    && deviceTuning(execution.device).opmVectorArithmetic !== "f32" ? "f16" : "f32";
+  const opmBlock = vectorGemmBlock(execution.device, opmArithmetic,
+    ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
   const vectorOutput = matrixOutput === null && outerFirst
     && deviceTuning(execution.device).opmVectorOutput !== false
-    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
+    && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     scalePipeline, contractPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -883,8 +971,8 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER),
     vectorContract
-      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}`,
-        () => createOuterProductMeanVectorContractShader(input.cOuter))
+      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        () => createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
       : matrixContract === null
       ? execution.shaderPipeline(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         () => createOuterProductMeanContractShader(input.cOuter, contractPrecision))
@@ -894,8 +982,8 @@ async function encodeOuterProductMean(
         () => createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
     vectorOutput
       ? execution.shaderPipeline(
-        `block:opm:project-output-vector:${residualTarget !== undefined}`,
-        () => createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        () => createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock, opmArithmetic))
       : matrixOutput === null
       ? execution.shaderPipeline(
         outerFirst && residualTarget !== undefined
@@ -992,7 +1080,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
       } else if (matrixContract === null) {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -1021,8 +1109,8 @@ async function encodeOuterProductMean(
             packedOffsets[6], packedOffsets[7], 0, offset, 0]));
         execution.dispatch(encoder, projectOutputPipeline,
           [intermediate, weights, vectorOutputParams, output, scale],
-          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
-          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+          input.cZ / opmBlock.columns,
+          Math.ceil(count / opmBlock.rows), 1, "opm.project-output");
       } else if (matrixOutput === null) {
         // ...its OWN grid, because it carries several pairs a workgroup where
         // the contraction carries one; they shared `pairGrid` when both were one.
@@ -1116,6 +1204,13 @@ async function encodeTriangleMultiplication(
   // ...and the output kernel's own column tile, where the device sets one -
   // this triangle always accumulates in f32, where it is bit-identical. See
   // webgpu/kernels/triangle/shaders.js.
+  // 🔴 THE VECTOR PROJECTIONS' ACCUMULATORS IN f16 WHERE THE DEVICE HAS IT - the triangle's two projections only, not
+  // its contraction (whose K is the protein's length). ESMFold2's trunk took the same for 1.55x; on AF2 it was measured
+  // at fold level (docs/M5-HANDOFF.md). `triangleAccumulatePrecision: "f32"` is the control.
+  if (!matrixFits && halfPrecisionAvailable(execution.device)
+      && deviceTuning(execution.device).triangleAccumulatePrecision !== "f32") {
+    shape.accumulatePrecision = "f16";
+  }
   const requestedTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
   const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
   const projectTile = outColumns === null ? requestedTile
@@ -1139,6 +1234,7 @@ async function encodeTriangleMultiplication(
     () => createTriangleShaders(
       shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
+    + `:${shape.accumulatePrecision ?? "f32"}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
     + `x${shaders.projectTile.outColumns ?? "-"}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
@@ -1187,7 +1283,9 @@ async function encodeTriangleMultiplication(
   const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
   const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
+  // 🔴 THE CENTRE NORM IS WRITTEN OVER `a`, and the matrix path's gate over `b`: the contraction is the last reader
+  // of both, and each is the hidden width. A fifth pair-sized buffer for nothing - 532 MiB at 1044 residues.
+  const hiddenNormalized = a;
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
   const projectParams = !matrixFits ? undefined
     : uniform(execution, `triangle.${direction}.project-parameters`, new Uint32Array([
@@ -1268,19 +1366,19 @@ async function encodeTriangleMultiplication(
   if (matrixFits) {
     // 🔴 THE GATE IS ITS OWN PASS AND THE PROJECTION READS IT, because
     // `logistic(z . Wg) * (x . Wz)` is two contractions over two DIFFERENT
-    // sources and no column trick makes it one GEMM. `a` is dead by here - the
-    // contraction was its last reader - so the gate's target costs nothing,
-    // exactly as it does in AF3's pair track.
+    // sources and no column trick makes it one GEMM. `b` is dead by here - the
+    // contraction was its last reader, and `a` holds the centre norm - so the
+    // gate's target costs nothing, as it does in AF3's pair track.
     //
     // 🔴 AND THE PROJECTION ALWAYS ADDS INTO ITS TARGET, so a caller with no
     // residual gets a cleared one. That is 82 MB of clear at 400 residues
     // against a second shader, and every AF2 caller passes a residual.
     if (residualTarget === undefined) encoder.clearBuffer(output);
     const out = triangleProjectOutMatrixDispatch({ rows: pairs, cZ: input.cZ }, triangleMatrix);
-    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, a],
+    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, b],
       out.x, out.y, 1, `triangle.${direction}.output.gate`);
     execution.dispatch(encoder, projectOutput,
-      [hiddenNormalized, weights, outProjectParams, output, a],
+      [hiddenNormalized, weights, outProjectParams, output, b],
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
