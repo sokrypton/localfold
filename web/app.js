@@ -597,14 +597,15 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
  */
 const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
 /**
- * 🔴 THE SINGLE-SEQUENCE TIER IS A CAPABILITY, AND ONE OF ITS FAMILIES IS NOT IN THE REGISTRY. The released
- * ESMFold2-Fast is the PLM row's "ESM-C 6B", so it is chosen exactly as EF2-fast's two are - and SINGLE_SEQUENCE_FAMILIES
- * (the WebGPU registry's) does not list it: asked of that list, choosing it hid the PLM row it was chosen on, put the
- * MSA row back, and sent AlphaFold 3's step count. `singleSequenceTier` is the question; `esmfold2Sampler` adds the
- * full ESMFold2, which reads an alignment and samples as ESMFold2 does.
+ * 🔴 TWO QUESTIONS ABOUT ESMFold2, AND THEY ARE NOT ONE. The model row has one ESMFold2 entry and the variant row picks
+ * the checkpoint: Fast on ESM-C 600M or 300M (biohub's experimental tier - SINGLE_SEQUENCE_FAMILIES, the WebGPU
+ * registry's), Fast on ESM-C 6B, Full on ESM-C 6B (the released two, native only). `isEsmfold2` is "show the variant
+ * row and ESMFold2's step dial"; `readsNoAlignment` is the experimental tier alone, whose checkpoint disables its
+ * alignment features - the released Fast reads an alignment's profile and Full encodes it. Asked as one question
+ * ("the single-sequence tier"), choosing the 6B Fast hid the row it was chosen on and sent AlphaFold 3's step count.
  */
-const singleSequenceTier = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2-fast";
-const esmfold2Sampler = (family) => singleSequenceTier(family) || family === "ef2";
+const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family);
+const isEsmfold2 = (family) => readsNoAlignment(family) || NATIVE_ONLY_FAMILIES.includes(family);
 const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 
 /**
@@ -825,7 +826,7 @@ const msaMode = () => {
   // family - "unknown model ef2-fast-600m: expected monomer, multimer, af3,
   // openbind0". The control was ignored everywhere except the one place it
   // could still throw.
-  if (singleSequenceTier(chosenFamily())) return "single";
+  if (readsNoAlignment(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
   // 🔴 `job` IS AN ACTION AND NOT A MODE, SO IT NEVER REACHES A FOLD. Selecting
   // it opens a file picker; it answers here with the mode it replaced, because
@@ -1172,7 +1173,7 @@ function modelProgress(fraction, detail = "") {
  * because none of them has a language model to run.
  */
 function usesLanguageModel(family = chosenFamily()) {
-  if (!singleSequenceTier(family)) return false;
+  if (!isEsmfold2(family)) return false;
   return plmChoice() !== "none";
 }
 
@@ -1189,8 +1190,9 @@ const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m
  */
 function plmLabel() {
   if (!usesLanguageModel()) return "none";
+  // (the option's own record of its tower: its text names the variant, Fast or Full, beside it)
   const select = document.getElementById("plm-mode");
-  return select?.selectedOptions?.[0]?.textContent?.trim() ?? plmChoice();
+  return select?.selectedOptions?.[0]?.dataset?.languageModel ?? plmChoice();
 }
 
 /**
@@ -1213,6 +1215,8 @@ const PLM_FAMILIES = {
   "esmc-300m": "ef2-fast-300m",
   // ...and biohub's RELEASED ESMFold2-Fast, which folds from ESM-C 6B on a native port only (NATIVE_ONLY_FAMILIES)
   "esmc-6b": "ef2-fast",
+  // ...and biohub's released ESMFold2 itself, the same tower with an MSA encoder and twice the trunk (native only)
+  "esmc-6b-full": "ef2",
   none: "ef2-fast-600m",
 };
 
@@ -2555,24 +2559,38 @@ function syncModelControls() {
   // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
   // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
   // removed, docs/AF3.md "Flow removed".)
-  const sampled = af3 || esmfold2Sampler(family);
+  const sampled = af3 || isEsmfold2(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
-  // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
-  // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
-  // screen would run, take a minute of somebody else's server, and be
-  // discarded - which is the "quietly ignored control" this function exists to
-  // prevent, one step worse.
-  const singleSequence = singleSequenceTier(family);
-  for (const id of ["msaModeGroup", "maxMsaGroup"]) {
-    const node = document.getElementById(id);
-    if (node !== null) node.hidden = singleSequence;
+  // 🔴 AND A CHECKPOINT WITH NO ALIGNMENT GREYS THE MSA ROW RATHER THAN IGNORING IT.
+  // `disable_msa_features` is true in ESMFold2's experimental tier; a search
+  // left live would run, take a minute of somebody else's server, and be
+  // discarded - the "quietly ignored control" this function exists to prevent.
+  // The row stays where it is beside the variant row (the released 6B variants
+  // read an alignment), reading Single Sequence and greyed, and gives back the
+  // reader's own choice when a variant that reads one is chosen again.
+  const noAlignment = readsNoAlignment(family);
+  const msaSelect = document.getElementById("msa-mode");
+  const msaNode = document.getElementById("msaModeGroup");
+  if (msaNode !== null) msaNode.hidden = false;
+  if (msaSelect !== null && noAlignment !== msaSelect.disabled) {
+    if (noAlignment) {
+      msaSelect.dataset.kept = msaSelect.value;
+      msaSelect.value = "none";
+    } else if (msaSelect.dataset.kept !== undefined) {
+      msaSelect.value = msaSelect.dataset.kept;
+      delete msaSelect.dataset.kept;
+    }
+    msaSelect.disabled = noAlignment;
+    msaSelect.title = noAlignment ? "This ESMFold2 checkpoint reads no alignment - its language model is"
+      + " its evolutionary information. Fast and Full on ESM-C 6B read one." : "";
   }
-  // ...and the row that replaces them, which is the same question for a model
-  // whose evolutionary information comes from a language model rather than an
-  // alignment. Shown exactly where the MSA row is not.
+  // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
+  const maxNode = document.getElementById("maxMsaGroup");
+  if (maxNode !== null) maxNode.hidden = isEsmfold2(family);
+  // ...and the variant row, for every ESMFold2
   const plmNode = document.getElementById("plmGroup");
-  if (plmNode !== null) plmNode.hidden = !singleSequence;
+  if (plmNode !== null) plmNode.hidden = !isEsmfold2(family);
   // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
   // hidden, so choosing AF3 and going back to AF2 left the page with no
   // Recycles until it was reloaded.
@@ -2625,7 +2643,7 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const ef2 = esmfold2Sampler(chosenFamily());
+  const ef2 = isEsmfold2(chosenFamily());
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
@@ -3913,7 +3931,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // ...and the steps this page would fold with (samplerPlan), because an
   // empty dial is the family's preferred count here and would be the model's own default there
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
-  if (esmfold2Sampler(family)) {
+  if (isEsmfold2(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
   } else {
@@ -5483,6 +5501,7 @@ document.getElementById("af2Model")?.addEventListener("change", () => {
 document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncModelControls();
   syncAf3Count();
+  syncMode();             // (the variant can grey the MSA row or give it back: what hangs off that row follows)
 });
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be

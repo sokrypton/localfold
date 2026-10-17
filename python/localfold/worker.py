@@ -522,8 +522,8 @@ class Worker:
 
         residues = sum(len(chain) for chain in polymer_chains(job["job"]))
         # the alignment, as the page's MSA row asked for it
-        # (ESMFold2's single-sequence tier reads no alignment; the full ESMFold2 encodes one)
-        mode = controls.get("msa-mode", "none") if port != "ef2" or family == "ef2" else "none"
+        # (ESMFold2's experimental tier reads no alignment; the released Fast reads its profile, Full encodes it)
+        mode = controls.get("msa-mode", "none") if port != "ef2" or family in ("ef2", "ef2-fast") else "none"
         flags, a3m = [], None
         if mode == "search":
             flags.append("--search")

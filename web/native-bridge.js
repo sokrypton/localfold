@@ -193,6 +193,13 @@ function installNativeStatus() {
       const offered = new Set(nativeOffered ? health.models ?? [] : []);
       for (const option of document.querySelectorAll("option[data-native-model]")) {
         option.hidden = !offered.has(option.dataset.nativeModel);
+        // ...and one chosen (a link, a restored session) that this server does not have goes back to its select's
+        // default, with the change it would have fired - not left selected and invisible
+        const select = option.closest("select");
+        if (option.hidden && select?.value === option.value) {
+          select.value = select.querySelector("option[selected]")?.value ?? select.options[0].value;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
       }
       if (nativeOffered && !badge.querySelector(".native-live")) {
         // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it
