@@ -149,8 +149,9 @@ the tower's, so one tower serves both). `tools/check-native-worker.py` folds the
 3.4 s, ESMFold2 6MRR 1.564 A, and 5CAJ with a searched alignment 1.963 A at pLDDT 97.3 (the CUDA port: 1.97 / 97.4),
 and through the page in 8-10 s.
 
-Open: a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in; an
-int5 one of the same model loads, and a float32 TOWER loads - not chased).
+Fixed: a float32 folding bundle died on loading here ("Insufficient Memory" at its first command): 4 of its 16 shards
+are a whole number of pages, and `mapFile`'s two bytes past the end needed a page past the file, which a file mapping
+cannot back. The span is anonymous memory with the file over its front (core.mm); it folds 6MRR at 1.608 A.
 
 **The 300M tower's residual scale was wrong everywhere, and is derived now.** `tools/export_esmc_model.py` wrote
 residualScale 1.0 for every tower; ESM-C scales by sqrt(layers / 36), and biohub's own 300M runs 0.912871. Held against
