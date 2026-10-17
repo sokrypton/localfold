@@ -184,7 +184,8 @@ inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int
   if (pair16 && C != 256) { fprintf(stderr, "a bf16 pair's pair-weighted averaging is 256 channels\n"); exit(1); }
   const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
   size_t rows = (size_t)S * T, P = (size_t)T * T;
-  half* ln = scratch<half>("msah.ln", rows * Cm);
+  // (msa.lnh: one f16 copy of the normed MSA rows - MSA Pairformer's outer product normalises into the same buffer)
+  half* ln = scratch<half>("msa.lnh", rows * Cm);
   layerNormH(m, ln, rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
   float* flat = scratch<float>("msa.flat", P * heads);
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (2 * (size_t)C));

@@ -254,7 +254,7 @@ __global__ void opmScaleRowsHK(const half* kab, int ld, int off, const float* w,
 inline void qOpmFast(float* pair, const float* m, int S, int L, int l, float* w) {
   const std::string O = "msap/blocks/" + std::to_string(l) + "/opm/";
   const int Cm = 464, KAB = 288; size_t R = (size_t)S * L;
-  half* nm = scratch<half>("opm.nmh", R * Cm);
+  half* nm = scratch<half>("msa.lnh", R * Cm);       // (the pair-weighted averaging's buffer: never both alive)
   layerNormH(m, nm, R, Cm, F(O + "normScale"), F(O + "normOffset"));
   float* q = scratch<float>("opm.q", (size_t)L * 256);
   ltGemm(nm, Fh(O + "q"), q, false, L, Cm, 256, nullptr, false, 0.f);     // (the query is row 0: its L rows lead)
@@ -491,6 +491,23 @@ int main(int argc, char** argv) {
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   M.upload(0);
+  if (FAST) {
+    // the MSA side's matrices are read through their f16 mirror alone under --fast: built now (the first f16 read mirrors
+    // the whole file), their f32 copies dropped - read again, one fails by name. The pair block's stay: cuda/ef2's
+    // blocked triangle builds its operands from the f32 copies
+    Fh("msap/msaInit");
+    auto drop = [](const std::string& name) {
+      size_t b = name.rfind('/'); if (b == std::string::npos || name.rfind("f/msap/", 0)) return false;
+      size_t a = name.rfind('/', b - 1);
+      const std::string parent = name.substr(a + 1, b - a - 1), leaf = name.substr(b + 1);
+      if (parent == "pwa" || parent == "finalPwa") return leaf == "valueGate" || leaf == "value" || leaf == "gate" || leaf == "output";
+      if (parent == "msaTransition" || parent == "finalMsaTransition") return leaf == "transition1" || leaf == "transition2";
+      if (parent == "opm") return leaf == "q" || leaf == "k" || leaf == "left" || leaf == "right" || leaf == "kab" || leaf == "toPair";
+      return false;
+    };
+    const size_t freed = compactWeights(0, drop);
+    printf("msap: %.0f MB of f32 weights dropped (read through their f16 copies)\n", freed / 1e6);
+  }
   // the alignment: the oracle's subsample as it is, or an A3M filtered and subsampled here
   std::vector<int> tokens, breaks; std::vector<std::string> subsample; int S, L;
   auto t0 = std::chrono::steady_clock::now();
