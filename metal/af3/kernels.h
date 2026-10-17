@@ -181,12 +181,16 @@ struct EsmPackArgs { CP(float) qkv; CP(float) cosT; CP(float) sinT; DP(half) qkv
 struct GatherEsmArgs { CP(float) rows; CP(int) tokenRow; DP(float) out; uint tokens, E; };
 
 // ---------------------------------------------------------------- chai-1
-// its relative encoding: two 67-class one-hots (residue and token separation) through a BIASED linear, added
-struct ChaiRelEncArgs { RelIdx r; CP(float) W; CP(float) bias; DP(float) pair; uint n, C; };
+// its relative encoding: two 67-class one-hots (residue and token separation) through a BIASED linear, added; blob
+// revision 3's RelativeChain/RelativeEntity rows ce [9][C] and the trunk half of its declared-bond projection (either null)
+struct ChaiRelEncArgs { RelIdx r; CP(float) W; CP(float) bias; CP(float) ce; CP(float) bond; CP(float) Wbond; DP(float) pair; uint n, C; };
 // its MSA features (41 columns: is_paired, source one-hot 6, deletion value, has deletion, one-hot 32) through a biased
 // linear, plus the single's projection
-struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int) asym; CP(int) isLigand; CP(float) W; CP(float) bias;
-                          CP(float) fromSingle; DP(float) msa; u64 count; uint n, C; };
+// (is_paired: a homolog row of the paired block, on a live token whose chain and whose row's first token's chain both
+// have a hit there - chainHit [S][chains], af3_chai_chain_hit)
+struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int) asym; CP(int) isLigand; CP(int) chainHit; CP(float) W;
+                          CP(float) bias; CP(float) fromSingle; DP(float) msa; u64 count; uint n, C, chains, pairedRows; };
+struct ChaiChainHitArgs { CP(int) rows; CP(float) msaMask; CP(int) asym; DP(int) hit; u64 count; uint n, chains; };
 // the grouped outer product: [S][n][G K] -> [G][S][n][K]; P_g [(i, k)][(j, l)] (bi rows i) -> [(i, j)][(g, k, l)]
 struct GroupMajorArgs { CP(float) x; DP(float) out; uint S, n, G, K; };
 struct GroupedPermuteArgs { CP(float) P; DP(float) out; uint bi, n, G, K; };
@@ -200,7 +204,9 @@ struct ChaiAtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float
 struct SameRefMaskArgs { DP(float) pl; CP(float) qUid; CP(float) tqMask; CP(float) kUid; CP(float) tkMask; uint subsets, heads, queries, keys; };
 struct AddConstArgs { DP(float) x; u64 n; float v; uint pad; };
 // chai-1's token features: one_hot(aatype, 31) W + b + [profile 31 | deletion mean] W'
-struct ChaiTokenFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) Wt; CP(float) bt; CP(float) Wp; DP(float) out; uint tokens, C; };
+// + blob revision 3's DX restype on a DNA token reading the unknown nucleotide (30); dx null before it
+struct ChaiTokenFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) Wt; CP(float) bt; CP(float) Wp; CP(float) dx;
+                           CP(int) isDna; DP(float) out; uint tokens, C; };
 // chai-1's diffusion pair input beside the trunk pair: its structure token-pair features through their projection's
 // structure half, plus a bond term (rows [p0, p0 + rows))
 struct ChaiStructPairArgs { CP(float) trunkPair; CP(int) ri; CP(int) ti; CP(int) asym; CP(int) entityRank; CP(int) symRank; CP(float) Wp;

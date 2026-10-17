@@ -365,7 +365,7 @@ int foldMain(int argc, char** argv) {
   // product are dead while the pair track runs, and the distogram's after it; the template stack and the confidence
   // head hold theirs around the pair track's turns
   shareScratch({{"pr.", "pair"}, {"grid.", "pair"}, {"tr.", "pair"}, {"st.", "pair"}, {"par.", "pair"}, {"msaatt.", "msa"},
-                {"opm.", "msa"}, {"gopm.", "msa"}, {"tmpl.", "tmpl"}, {"conf.", "conf"}, {"disto.", "disto"},
+                {"msatr.", "msa"}, {"opm.", "msa"}, {"gopm.", "msa"}, {"tmpl.", "tmpl"}, {"conf.", "conf"}, {"disto.", "disto"},
                 {"contact.", "disto"}, {"emb.", "emb"}},
                {{"tmpl", "pair"}, {"conf", "pair"}});
   printf("weights: %.0f ms\n", ms(t0));

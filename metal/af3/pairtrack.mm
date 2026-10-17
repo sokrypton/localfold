@@ -206,13 +206,13 @@ static bool foldTransition() {
 // LN -> SwiGLU in the first GEMM's epilogue -> the second GEMM adding into x; in row chunks
 template <class T>
 static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* into, const std::string& next1,
-                        const std::string& next2) {
+                        const std::string& next2, const char* scratchPrefix) {
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) die("%s.transition1 has %zu elements, not %d x 2I", pre.c_str(), w1, C);
   int I = (int)(w1 / (2 * (size_t)C));
   size_t chunk = std::min(rows, std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I)));
-  half* xn = scratch<half>("tr.xn", chunk * C);
-  half* g = scratch<half>("tr.g", chunk * I);
+  half* xn = scratch<half>(std::string(scratchPrefix) + "xn", chunk * C);
+  half* g = scratch<half>(std::string(scratchPrefix) + "g", chunk * I);
   const half* wp = swigluPairs(pre + ".transition1", C, I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -244,12 +244,12 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   }
 }
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
-                const std::string& next2) {
-  transitionT(x, rows, C, pre, into, next1, next2);
+                const std::string& next2, const char* scratchPrefix) {
+  transitionT(x, rows, C, pre, into, next1, next2, scratchPrefix);
 }
 void transition(half* x, size_t rows, int C, const std::string& pre, half* into, const std::string& next1,
-                const std::string& next2) {
-  transitionT(x, rows, C, pre, into, next1, next2);
+                const std::string& next2, const char* scratchPrefix) {
+  transitionT(x, rows, C, pre, into, next1, next2, scratchPrefix);
 }
 
 // the five pair updates of a pairformer / MSA / template block, in AF3's order

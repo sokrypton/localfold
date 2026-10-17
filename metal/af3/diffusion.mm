@@ -82,7 +82,7 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
       run1d("af3_chai_struct_pair", r * width,
             ChaiStructPairArgs{trunkPair, M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
                                entityRank, symRank, W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
-                               M.has("batch.bondMatrix") ? M.f("batch.bondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, p0, r,
+                               M.has("batch.declaredBondMatrix") ? M.f("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, p0, r,
                                (uint)n, (uint)Czt, (uint)Cz, 0});
     } else if (!split && !relpe) {
       run1d("af3_pair_features", r * width, PairFeatArgs{trunkPair, relIdx(), f2, p0, r, (uint)n, (uint)Czt});

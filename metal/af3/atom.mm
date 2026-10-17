@@ -347,7 +347,8 @@ float* buildTargetFeat() {
     float* feat = scratch<float>("tf.token", (size_t)tokens * C);
     run1d("af3_chai_token_feat", (size_t)tokens * C,
           ChaiTokenFeatArgs{M.i("batch.aatype"), M.f("batch.profile"), M.f("batch.deletionMean"), W(P + "tokenFeatureWeights"),
-                            W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), feat, (uint)tokens, (uint)C});
+                            W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), hasW(P + "dx") ? W(P + "dx") : nullptr,
+                            M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, feat, (uint)tokens, (uint)C});
     int E = 0;
     const float* esm;
     if (M.has("batch.esmEmbeddings")) { esm = M.f("batch.esmEmbeddings"); E = (int)(M.len("batch.esmEmbeddings") / tokens); }

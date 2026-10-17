@@ -988,15 +988,27 @@ kernel void af3_chai_relenc(LF_ARGS(ChaiRelEncArgs)) {
   bool sameChain = a.r.asym[i] == a.r.asym[j];
   int rss = sameChain ? clamp(a.r.ri[i] - a.r.ri[j] + 33, 0, 65) : 66;
   int rts = sameChain && a.r.ri[i] == a.r.ri[j] ? clamp(a.r.ti[i] - a.r.ti[j] + 32, 0, 65) : 66;
-  a.pair[t] += a.bias[c] + a.W[rss * a.C + c] + a.W[(67 + rts) * a.C + c];
+  float v = a.bias[c] + a.W[rss * a.C + c] + a.W[(67 + rts) * a.C + c];
+  if (a.ce) {
+    int relE = a.r.ent[i] - a.r.ent[j];
+    int rchain = relE != 0 ? 5 : clamp(a.r.sym[i] - a.r.sym[j] + 2, 0, 4), rent = clamp(relE + 1, 0, 2);
+    v += a.ce[rchain * a.C + c] + a.ce[(6 + rent) * a.C + c];
+  }
+  if (a.bond && a.Wbond) v += a.bond[ij] * a.Wbond[c];
+  a.pair[t] += v;
+}
+kernel void af3_chai_chain_hit(LF_ARGS(ChaiChainHitArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.count) return;
+  uint s = lf_udiv((uint)t, a.n), k = (uint)t - s * a.n;
+  if (a.msaMask[t] != 0.f && a.rows[t] != 21) a.hit[s * a.chains + a.asym[k]] = 1;
 }
 kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.count * a.C) return;
   uint row = lf_udiv((uint)t, a.C), c = (uint)t - row * a.C, s = lf_udiv(row, a.n), token = row - s * a.n;
-  int first = -1; bool paired = false;           // (the row covers tokens of more than one chain)
-  for (uint k = 0; k < a.n && !paired; ++k)
-    if (a.msaMask[s * a.n + k] != 0.f) { if (first < 0) first = a.asym[k]; else if (a.asym[k] != first) paired = true; }
+  bool paired = s > 0 && s < a.pairedRows && a.msaMask[row] != 0.f && a.chainHit[s * a.chains + a.asym[token]] != 0
+             && a.chainHit[s * a.chains + a.asym[0]] != 0;
   float d = a.del[row];
   int code = a.rows[row];
   if (a.isLigand && a.isLigand[token]) code = s == 0 ? 20 : 31;      // (chai's query row: unknown, the rest: its mask class)
@@ -1071,6 +1083,7 @@ kernel void af3_chai_token_feat(LF_ARGS(ChaiTokenFeatArgs)) {
   uint token = lf_udiv((uint)t, a.C), c = (uint)t - token * a.C;
   int aa = a.aatype[token];
   float v = a.bt[c] + (aa >= 0 && aa < 31 ? a.Wt[aa * a.C + c] : 0.f);
+  if (a.dx && a.isDna && a.isDna[token] != 0 && aa == 30) v += a.dx[c];
   for (int k = 0; k < 31; ++k) v += a.profile[token * 31 + k] * a.Wp[k * a.C + c];
   v += a.delMean[token] * a.Wp[31 * a.C + c];
   a.out[t] = v;

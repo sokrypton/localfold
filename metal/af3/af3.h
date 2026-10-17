@@ -70,9 +70,10 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
 const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight
 void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into = nullptr,
                    bool untransposed = false, const std::string& nextNorm = "");
-// next1, next2: the pair's next norms, emitted by the second GEMM (pairtrack.mm's pairLn takes them)
+// next1, next2: the pair's next norms, emitted by the second GEMM (pairtrack.mm's pairLn takes them); `scratchPrefix`
+// names its working buffers' family (tr., the pair's; chai-1's MSA transition takes msatr., the msa's)
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into = nullptr, const std::string& next1 = "",
-                const std::string& next2 = "");
+                const std::string& next2 = "", const char* scratchPrefix = "tr.");
 void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
                  const std::string& next2 = "");
 // chai-1's parallel pair track: every update reads the stage's input and adds into the pair (z = z0 + f1(z0) + ...);
@@ -90,7 +91,7 @@ void triangle(half* pair, const Masks& m, int n, int C, const std::string& pre, 
 void gridAttention(half* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, half* into = nullptr,
                    bool untransposed = false, const std::string& nextNorm = "");
 void transition(half* x, size_t rows, int C, const std::string& pre, half* into = nullptr, const std::string& next1 = "",
-                const std::string& next2 = "");
+                const std::string& next2 = "", const char* scratchPrefix = "tr.");
 void pairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
                  const std::string& next2 = "");
 void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);

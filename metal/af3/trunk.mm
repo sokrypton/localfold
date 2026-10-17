@@ -132,8 +132,11 @@ static void embed(Trunk& t) {
   // z_init itself (left + right + its relative encoding)
   const bool chai = flag("trunk.dialect.recycleFromInit");
   auto chaiRelEnc = [&]() {
-    run1d("af3_chai_relenc", pairs * C, ChaiRelEncArgs{relIdx(), W(E + "positionActivations"), W(E + "positionActivationsBias"), t.pair,
-                                                       (uint)n, (uint)C});
+    run1d("af3_chai_relenc", pairs * C,
+          ChaiRelEncArgs{relIdx(), W(E + "positionActivations"), W(E + "positionActivationsBias"),
+                         hasW(E + "chaiChainEntity") ? W(E + "chaiChainEntity") : nullptr,
+                         M.has("batch.declaredBondMatrix") ? M.f("batch.declaredBondMatrix") : nullptr,
+                         hasW(E + "chaiBondTrunk") ? W(E + "chaiBondTrunk") : nullptr, t.pair, (uint)n, (uint)C});
   };
   half* pn = scratch<half>("emb.prevln", pairs * C);
   if (chai && t.pass == 0) {
@@ -174,9 +177,17 @@ static void embed(Trunk& t) {
     lin(t.single, E + "extraMsaTargetFeat", fromSingle, n, t.Cs, t.Cm);
     size_t rows = (size_t)t.S * n;
     if (lenW(E + "msaActivations") != (size_t)41 * t.Cm) die("chai's msa features are not 41 wide");
+    int chains = 1;
+    { const int* asym = M.hostI("batch.features.asymId"); for (int k = 0; k < n; ++k) chains = std::max(chains, asym[k] + 1); }
+    int* chainHit = scratch<int>("emb.chainHit", (size_t)t.S * chains);
+    fill(chainHit, 0, (size_t)t.S * chains * sizeof(int));
+    run1d("af3_chai_chain_hit", rows, ChaiChainHitArgs{t.msaRows, t.msaMask, M.i("batch.features.asymId"), chainHit, rows, (uint)n, (uint)chains});
+    // (the paired block's row count: a batch without it - a dump's - has none)
+    const uint pairedRows = M.has("batch.pairedRows") ? (uint)M.meta("batch.pairedRows") : 0u;
     run1d("af3_chai_msa_embed", rows * t.Cm,
           ChaiMsaEmbedArgs{t.msaRows, t.deletion, t.msaMask, M.i("batch.features.asymId"), M.has("batch.isLigand") ? M.i("batch.isLigand") : nullptr,
-                           W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, (uint)n, (uint)t.Cm});
+                           chainHit, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, (uint)n, (uint)t.Cm,
+                           (uint)chains, pairedRows});
     ++t.pass;
     return;
   }
@@ -249,12 +260,16 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
 }
 // AF3's MSA "attention": per head, weights softmax_j over LN(pair) projected (no queries or keys), averaging every
 // row's values; gated and projected back into the MSA
-static void msaAttention(Trunk& t, const std::string& pre) {
+// `parallelTransition`: chai-1's MSA transition, which reads the same MSA as the weighted averaging (chai-lab's
+// msa + transition(msa) + pwa(msa); af3-any-model 7cc3165) - in place once the whole MSA's norm is taken, before any of
+// the averaging is added. Its scratch is msatr.*, the msa family's (main.mm), so it never shares a slot with msaatt.ln.
+static void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelTransition = "") {
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int heads = metaI(pre + ".heads"), d = metaI(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
   half* xn = scratch<half>("msaatt.ln", rows * Cm);
   ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  if (!parallelTransition.empty()) transition(t.msa, rows, Cm, parallelTransition, nullptr, "", "", "msatr.");
   half* pln = scratch<half>("msaatt.pln", pairs * C);
   ln(t.pair, pln, pairs, C, pre + ".pairNormScale", pre + ".pairNormOffset");
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
@@ -326,10 +341,10 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
 static void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + num(k);
   if (flag("trunk.dialect.groupedOuterProduct")) {
-    // chai-1: z += grouped OPM(m); m += attention(m, z); m += transition(m); then the pair track in two parallel stages
+    // chai-1: z += grouped OPM(m); m += attention(m, z) + transition(m), both off the same m; then the pair track in two
+    // parallel stages
     groupedOuterProduct(t, B + ".outerProductMean");
-    msaAttention(t, B + ".msaAttention1");
-    transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition");
+    msaAttention(t, B + ".msaAttention1", B + ".msaTransition");
     parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "oit");
     parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "rc");
     return;
