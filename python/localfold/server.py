@@ -61,6 +61,19 @@ SITE = os.environ.get("LOCALFOLD_SITE_DIR") or REPO
 
 
 NATIVE = "metal" if sys.platform == "darwin" else "cuda"
+# the native-only models, by the page's family name, and the exported bundles each one folds from - by the names
+# cuda/featurise/fetch.h gives them under the weights directory: LOCALFOLD_WEIGHTS_DIR, else fetch.h's home() - the
+# checkout on Linux, ~/.cache/localfold on a Mac (no /proc/self/exe to find the checkout by). Offered only where they
+# are on disk, since nothing downloads them
+NATIVE_ONLY = {"ef2-fast": ("model-esmfold2-fast-f32", "model-esmc-6b-int8"),
+               "ef2": ("model-esmfold2-f32", "model-esmc-6b-int8")}
+
+
+def native_models():
+    root = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (
+        os.path.expanduser("~/.cache/localfold") if NATIVE == "metal" else REPO)
+    return [family for family, dirs in NATIVE_ONLY.items()
+            if all(os.path.exists(os.path.join(root, d, "manifest.json")) for d in dirs)]
 
 
 def gpu_info():
@@ -346,6 +359,9 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None, local=False):
                                         "backends": ["native"] if worker is not None else [],
                                         # (which native port folds: cuda/ or metal/)
                                         "native": NATIVE if worker is not None else None,
+                                        # ...and the models it folds that the page's own WebGPU does not: biohub's
+                                        # released ESMFold2-Fast and ESMFold2, from local exports (metal/README.md)
+                                        "models": native_models() if worker is not None else [],
                                         "gpu": gpu})
             return super().do_GET()
 

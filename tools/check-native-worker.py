@@ -192,6 +192,23 @@ def cases(offline):
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}], "job": job([S6], ["GOL"])},
          None, None, None, "protein chains only"),
     ]
+    # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/README.md) where their bundles
+    # are on disk under the names fetch-weights gives them - nothing downloads them, so absent is a skip, not a failure
+    weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (     # (fetch.h's home(): no /proc/self/exe on a Mac)
+        os.path.expanduser("~/.cache/localfold") if sys.platform == "darwin" else REPO)
+    released = lambda *dirs: all(os.path.exists(os.path.join(weights, d, "manifest.json")) for d in dirs)
+    if released("model-esmfold2-fast-f32", "model-esmc-6b-int8"):
+        out.append(("esmfold2-fast released (ESM-C 6B) 6mrr", {"family": "ef2-fast",
+                    "controls": controls(**{"model-family": "ef2-fast-600m", "plm-mode": "esmc-6b"}),
+                    "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None))
+    if released("model-esmfold2-f32", "model-esmc-6b-int8"):
+        out.append(("esmfold2 released 6mrr, single sequence", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2", "msa-mode": "none"}),
+                    "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None))
+        if not offline:
+            out.append(("esmfold2 released 5caj, MSA searched", {"family": "ef2",
+                        "controls": controls(**{"model-family": "ef2", "msa-mode": "search"}),
+                        "entities": [protein(s5)], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 3.0, None, None))
     if not offline:
         out += [
             ("af3 1brs, MSA searched", {"family": "af3", "controls": controls(**{"msa-mode": "search"}),
@@ -261,8 +278,17 @@ def page_arm(bad):
         if not live or not live["shown"] or not live["on"]:
             bad.append(f"page: the Live preview box is {live} - want it shown and on for CUDA")
         lineage = "protenix2" if "--no-af3" in sys.argv else "af3"
-        for family, tokens, streamed in ((lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True),
-                                         (lineage, 68, False)):
+        # the native-only models' options (ESM-C 6B on the PLM row, ESMFold2 on the model row): shown exactly where the
+        # server says it has them, and ESMFold2 folded through the page when it does
+        served = health.get("models", [])
+        shown = cdp.evaluate(ws, """[...document.querySelectorAll('option[data-native-model]')]
+          .filter((o) => !o.hidden).map((o) => o.dataset.nativeModel).sort()""")
+        if shown != sorted(served):
+            bad.append(f"page: the native-only options shown are {shown}, where /health has {sorted(served)}")
+        arms = [(lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), (lineage, 68, False)]
+        if "ef2" in served:
+            arms.insert(3, ("ef2", 68, True))
+        for family, tokens, streamed in arms:
             cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.native-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
             cdp.evaluate(ws, f"""(() => {{

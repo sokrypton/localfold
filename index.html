@@ -212,6 +212,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        same frozen trunk biohub published, so its pLDDT, PAE
                        and pTM are predicted rather than estimated. -->
                   <option value="ef2-fast-600m">EF2-fast</option>
+                  <!-- 🔴 NATIVE ONLY, AND HIDDEN UNTIL A SERVER SAYS SO. biohub's
+                       released ESMFold2 reads an alignment through its MSA
+                       encoder and folds from ESM-C 6B, which no browser holds -
+                       shown when `localfold serve` has its export on disk
+                       (web/native-bridge.js; metal/README.md). -->
+                  <option value="ef2" data-native-model="ef2" hidden>ESMFold2 (local)</option>
                 </select>
               </div>
 
@@ -354,6 +360,8 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 <select id="plm-mode" title="The protein language model, and with it the folding checkpoint trained against it. 300M is 94 MiB smaller for a median 0.03 A - inside the sampler's own seed spread. Without one, this model has no evolutionary information at all: on a 76-mer the fold moves 11 A and the distogram predicts no long-range contact, though a designed protein like 6MRR folds without it.">
                   <option value="esmc-600m" selected>ESM-C 600M</option>
                   <option value="esmc-300m">ESM-C 300M</option>
+                  <!-- biohub's released ESMFold2-Fast, on ESM-C 6B: native only, shown when the local server has it -->
+                  <option value="esmc-6b" data-native-model="ef2-fast" hidden>ESM-C 6B (local)</option>
                   <option value="none">None</option>
                 </select>
               </div>

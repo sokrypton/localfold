@@ -187,6 +187,13 @@ function installNativeStatus() {
       // the fold with the same sentence.
       // (an older server says "cuda" for what this one calls "native")
       nativeOffered = (health.backends ?? []).some((b) => b === "native" || b === "cuda");
+      // ...and the models only a native port folds - biohub's released ESMFold2-Fast and ESMFold2, on ESM-C 6B,
+      // from local exports (metal/README.md): their options are in the page, hidden, and shown where this server
+      // says it has them (/health's `models`)
+      const offered = new Set(nativeOffered ? health.models ?? [] : []);
+      for (const option of document.querySelectorAll("option[data-native-model]")) {
+        option.hidden = !offered.has(option.dataset.nativeModel);
+      }
       if (nativeOffered && !badge.querySelector(".native-live")) {
         // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it
         // is set here, per fold, by whoever is watching

@@ -588,7 +588,14 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
  * a capability it has. That is the mistake recorded in CLAUDE.md for the
  * AF3/OpenBind split, one model later, and this is the name that prevents it.
  */
-const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family);
+/**
+ * The models only a native port folds: biohub's released ESMFold2-Fast and ESMFold2, on ESM-C 6B (2.5 GB as 3-bit
+ * codes, more than a page holds), from local exports - offered when `localfold serve` says it has them
+ * (web/native-bridge.js), refused by name on this page's own WebGPU. Both take ligands, modified residues and nucleic
+ * chains as the single-sequence tier does; ESMFold2 also reads an alignment, so it keeps the MSA row.
+ */
+const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
+const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 
 /**
  * What a fold's viewer object and downloaded files are called, per model.
@@ -626,6 +633,8 @@ const MODEL_STEMS = {
   "multimer-5": "af2_multimer_model5",
   "ef2-fast-600m": "ef2_fast_600m",
   "ef2-fast-300m": "ef2_fast_300m",
+  "ef2-fast": "esmfold2_fast",
+  ef2: "esmfold2",
 };
 
 /** What to call each model while its weights download. */
@@ -678,6 +687,8 @@ const MODEL_LABELS = {
   // ...the same folding model against the smaller tower, and its own
   // checkpoint. The label names the tower because that is what differs.
   "ef2-fast-300m": "EF2-fast (300M)",
+  "ef2-fast": "ESMFold2-Fast (ESM-C 6B)",
+  ef2: "ESMFold2",
   // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
   // TYPED. A delta downloads its BASE as well as itself, so the dial reading
   // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
@@ -1190,6 +1201,8 @@ function plmLabel() {
 const PLM_FAMILIES = {
   "esmc-600m": "ef2-fast-600m",
   "esmc-300m": "ef2-fast-300m",
+  // ...and biohub's RELEASED ESMFold2-Fast, which folds from ESM-C 6B on a native port only (NATIVE_ONLY_FAMILIES)
+  "esmc-6b": "ef2-fast",
   none: "ef2-fast-600m",
 };
 
@@ -2532,7 +2545,7 @@ function syncModelControls() {
   // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
   // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
   // removed, docs/AF3.md "Flow removed".)
-  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family);
+  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2";
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
@@ -2602,7 +2615,7 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
+  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily()) || chosenFamily() === "ef2";
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
@@ -3890,7 +3903,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // ...and the steps this page would fold with (samplerPlan), because an
   // empty dial is the family's preferred count here and would be the model's own default there
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
-  if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
+  if (SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2") {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
   } else {
@@ -4349,6 +4362,10 @@ async function fold(event) {
     // watch. Everything above still runs - the entities are validated, the
     // model is resolved, the terms are asked - because those are questions
     // about the JOB, and the job is the same wherever it runs.
+    if (NATIVE_ONLY_FAMILIES.includes(family) && remoteBackend() === null) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} folds on a native backend only - run \`localfold serve\``
+        + " with its export on disk (metal/README.md)");
+    }
     if (remoteBackend() !== null) {
       await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                             templates: request.templates ?? [], family, signal });

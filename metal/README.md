@@ -138,6 +138,17 @@ fold moves 0.02 A. Its outer product mean is a float GEMM, because a sum over 1,
 tokens through lin's half rounding). 6MRR from its sequence: 1.563 A, pLDDT 71.4; the encoder 0.2 s, the 48-block trunk
 1.7 s at 68 tokens.
 
+**On the page, through `localfold serve`.** The server's `/health` lists the native-only models whose exports are on
+disk (`models`: `ef2-fast`, `ef2`), and the page shows their options only then - "ESM-C 6B (local)" on the PLM row, which
+is the released ESMFold2-Fast, and "ESMFold2 (local)" on the model row, which keeps the MSA row (single sequence, an
+upload, or an MMseqs2 search the worker runs through AlphaFold 3's featuriser). The worker reads them where
+`fetch-weights` does - `LOCALFOLD_WEIGHTS_DIR`, else `~/.cache/localfold` on a Mac - by fetch.h's names, whatever they
+hold: `model-esmfold2-fast-f32` (Fast's folding bundle), `model-esmfold2-f32` (ESMFold2's, its encoder float32) and one
+`model-esmc-6b-int8` (the 6B tower: each folding bundle carries its own adapter, `lm/*`, which `tower.mm` prefers over
+the tower's, so one tower serves both). `tools/check-native-worker.py` folds them where present: Fast 6MRR 1.606 A in
+3.4 s, ESMFold2 6MRR 1.564 A, and 5CAJ with a searched alignment 1.963 A at pLDDT 97.3 (the CUDA port: 1.97 / 97.4),
+and through the page in 8-10 s.
+
 Open: a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in; an
 int5 one of the same model loads, and a float32 TOWER loads - not chased).
 

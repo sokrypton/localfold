@@ -469,8 +469,8 @@ class Worker:
             port = "af3"
         elif family in ("monomer", "multimer"):
             port = "af2"
-        elif family in ("ef2-fast-600m", "ef2-fast-300m"):
-            port = "ef2"
+        elif family in ("ef2-fast-600m", "ef2-fast-300m", "ef2-fast", "ef2"):
+            port = "ef2"          # (ef2-fast and ef2: biohub's released two, on ESM-C 6B, from local exports)
         else:
             raise Refused(f"the {NATIVE_NAME} backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
                           " and ESMFold2)")
@@ -494,7 +494,8 @@ class Worker:
 
         residues = sum(len(chain) for chain in polymer_chains(job["job"]))
         # the alignment, as the page's MSA row asked for it
-        mode = "none" if port == "ef2" else controls.get("msa-mode", "none")
+        # (ESMFold2's single-sequence tier reads no alignment; the full ESMFold2 encodes one)
+        mode = controls.get("msa-mode", "none") if port != "ef2" or family == "ef2" else "none"
         flags, a3m = [], None
         if mode == "search":
             flags.append("--search")
@@ -613,15 +614,26 @@ class Worker:
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
         else:
-            small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
+            # (the same port for all four: it reads its widths, its recycle and its MSA encoder off the bundles)
             at = time.time()
-            trunk, tower = model_weights("ef2-fast-300m" if small else "ef2-fast-600m", log)
+            trunk, tower = model_weights(family if family in ("ef2-fast", "ef2", "ef2-fast-300m") else "ef2-fast-600m", log)
             dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
             key = ("ef2", family)
             server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
             at = time.time()
-            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", *local_ccd()], "featurising", log, live)
+            if "--search" in flags:
+                # ESMFold2's featuriser searches nothing: the alignment comes from AlphaFold 3's, which writes the
+                # merged search beside its input (search.a3m), kept where the page's archive reads it
+                searched = os.path.join(WORK, "ef2-search")
+                shutil.rmtree(searched, ignore_errors=True)
+                featurise([featuriser("af3-featurise"), searched, "--no-weights", "--family=af3", f"--job={job_path}",
+                           "--search", *local_ccd()], "searching", log, live)
+                flags = [f"--a3m={os.path.join(searched, 'search.a3m')}"]
+            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", f"--fold-bundle={trunk}", *flags,
+                       *local_ccd()], "featurising", log, live)
+            if mode == "search" and os.path.exists(os.path.join(WORK, "ef2-search", "search.a3m")):
+                shutil.copy(os.path.join(WORK, "ef2-search", "search.a3m"), os.path.join(inputs, "search.a3m"))
             dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's

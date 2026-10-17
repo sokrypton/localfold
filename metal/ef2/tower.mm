@@ -8,6 +8,12 @@
 #include "ef2.h"
 #include <cmath>
 
+// the language-model shim's tensor: the FOLDING bundle's own where it carries one (the released models' exports do -
+// tools/export_esmfold2_trunk.py - and the shim is per model, so one ESM-C 6B tower serves ESMFold2-Fast and ESMFold2),
+// else the tower bundle's (the 600M and 300M towers ship the shim beside the tower and their folding bundles have none)
+static std::string shim(const std::string& leaf) {
+  return (M.has("f/lm/combine") ? "f/lm/" : "c/lm/") + leaf;
+}
 // a block matrix as float16: its own copy, or - a RESIDENT tower (ESM-C 6B, its codes kept in the mapped shards:
 // Model::loadBundle's `resident`) - expanded into scratch for this one GEMM
 static const half* towerW(const std::string& name) {
@@ -74,8 +80,8 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
   float* single = scratch<float>("shim.single", std::max<size_t>(R, 1) * P);
   if (R > 0) {
     // the mix weights, a softmax of a constant
-    std::vector<float> mix(M.len("c/lm/combine"));
-    { const float* cmb = M.hostF("c/lm/combine"); float mx = -INFINITY, s = 0;
+    std::vector<float> mix(M.len(shim("combine")));
+    { const float* cmb = M.hostF(shim("combine")); float mx = -INFINITY, s = 0;
       for (size_t i = 0; i < mix.size(); ++i) mx = std::max(mx, cmb[i]);
       for (size_t i = 0; i < mix.size(); ++i) { mix[i] = expf(cmb[i] - mx); s += mix[i]; }
       for (auto& m : mix) m /= s; }
@@ -83,8 +89,8 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
     half* xn = scratch<half>("shim.xn", R * C);
     // each hidden state's LayerNorm and projection, added into the mix by the GEMM itself (alpha mix_k, beta 1)
     auto mixIn = [&](int k, const float* state) {
-      layerNorm(state, xn, R, C, M.f("c/lm/norm/scale"), M.f("c/lm/norm/offset"));
-      lin(xn, "c/lm/projection/weights", acc, R, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
+      layerNorm(state, xn, R, C, M.f(shim("norm/scale")), M.f(shim("norm/offset")));
+      lin(xn, shim("projection/weights"), acc, R, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
     };
     float* x = scratch<float>("esmc.x", R * C);
     run1d("ef2_embed", R * C, EmbedArgs{ids, M.f("c/embed/weights"), x, (uint)R, (uint)C});
@@ -96,13 +102,13 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
     float* last = scratch<float>("esmc.last", R * C);
     layerNorm(x, last, R, C, M.f("c/final_norm/scale"), nullptr);
     mixIn(e.layers, last);
-    lin(acc, "c/lm/downproject/weights", single, R, P, P, 0.f, M.f("c/lm/downproject/bias"));
+    lin(acc, shim("downproject/weights"), single, R, P, P, 0.f, M.f(shim("downproject/bias")));
   }
   // a non-protein token's state is zero: LN(0) is the offset, the mix sums to one
   float* zero = scratch<float>("shim.zero", P);
   float* z1 = scratch<float>("shim.z1", P);
-  lin(M.f("c/lm/norm/offset"), "c/lm/projection/weights", z1, 1, C, P);
-  lin(z1, "c/lm/downproject/weights", zero, 1, P, P, 0.f, M.f("c/lm/downproject/bias"));
+  lin(M.f(shim("norm/offset")), shim("projection/weights"), z1, 1, C, P);
+  lin(z1, shim("downproject/weights"), zero, 1, P, P, 0.f, M.f(shim("downproject/bias")));
   float* s = scratch<float>("shim.tokens", (size_t)T * P);
   run1d("ef2_scatter_rows", (size_t)T * P, ScatterRowsArgs{single, tokenToRow, zero, s, (uint)T, (uint)P});
   if (!lmZ) return;
@@ -127,17 +133,17 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
     float* o = lmZ + (size_t)i0 * T * P;
     if (wide) {
       run1d("ef2_pair_join_f", cells * P, PairJoinFArgs{s, joinF, (uint)T, (uint)i0, (uint)b, (uint)P});
-      Gemm g{}; g.X = joinF; g.tx = F32; g.W = M.f("c/lm/pair_mlp_1/weights"); g.tw = F32; g.Y = hidF; g.ty = F32;
-      g.rows = cells; g.in = 2 * P; g.out = P; g.bias = M.f("c/lm/pair_mlp_1/bias"); g.gelu = true; g.label = "lm.pair_mlp_1";
+      Gemm g{}; g.X = joinF; g.tx = F32; g.W = M.f(shim("pair_mlp_1/weights")); g.tw = F32; g.Y = hidF; g.ty = F32;
+      g.rows = cells; g.in = 2 * P; g.out = P; g.bias = M.f(shim("pair_mlp_1/bias")); g.gelu = true; g.label = "lm.pair_mlp_1";
       gemm(g);
-      Gemm g2{}; g2.X = hidF; g2.tx = F32; g2.W = M.f("c/lm/pair_mlp_2/weights"); g2.tw = F32; g2.Y = o; g2.ty = F32;
-      g2.rows = cells; g2.in = P; g2.out = P; g2.bias = M.f("c/lm/pair_mlp_2/bias"); g2.label = "lm.pair_mlp_2";
+      Gemm g2{}; g2.X = hidF; g2.tx = F32; g2.W = M.f(shim("pair_mlp_2/weights")); g2.tw = F32; g2.Y = o; g2.ty = F32;
+      g2.rows = cells; g2.in = P; g2.out = P; g2.bias = M.f(shim("pair_mlp_2/bias")); g2.label = "lm.pair_mlp_2";
       gemm(g2);
     } else {
       run1d("ef2_pair_join", cells * P, PairJoinArgs{s, join, (uint)T, (uint)i0, (uint)b, (uint)P});
-      linH(join, "c/lm/pair_mlp_1/weights", hid, cells, 2 * P, P, M.f("c/lm/pair_mlp_1/bias"), true);
-      lin(hid, "c/lm/pair_mlp_2/weights", o, cells, P, P, 0.f, M.f("c/lm/pair_mlp_2/bias"));
+      linH(join, shim("pair_mlp_1/weights"), hid, cells, 2 * P, P, M.f(shim("pair_mlp_1/bias")), true);
+      lin(hid, shim("pair_mlp_2/weights"), o, cells, P, P, 0.f, M.f(shim("pair_mlp_2/bias")));
     }
-    layerNorm(o, o, cells, P, M.f("c/lm/pair_norm/scale"), M.f("c/lm/pair_norm/offset"));
+    layerNorm(o, o, cells, P, M.f(shim("pair_norm/scale")), M.f(shim("pair_norm/offset")));
   }
 }
