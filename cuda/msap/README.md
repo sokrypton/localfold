@@ -38,6 +38,39 @@ Options:
 - `seq_weights.npy` [layers][S] holds the outer product's sequence weights, rows in `subsample.a3m`'s order.
 - `--f32` runs every activation float32: the reference arm the oracle checks the port with, ~4x slower. The default is the fast path - f16 activations into tensor-core GEMMs with f32 accumulation, the pair bf16 (`--pair-f32` keeps only the pair f32) - called `--fast` below.
 
+## Conservation and the categorical Jacobian
+
+`--conservation` and `--jacobian[=AAs]` follow the authors' notebook ([MSA_Pairformer_with_MMseqs2.ipynb](https://colab.research.google.com/github/yoakiyama/MSA_Pairformer/blob/main/MSA_Pairformer_with_MMseqs2.ipynb), `run_msa_analysis`):
+1. A first pass, with the query biasing on, gives the per-layer sequence weights.
+2. Every variant then runs with those weights fixed (the notebook's `fix_weights`) and reads the query row's logits over the 20 amino acids. Conservation masks each query position in turn (L variants). The Jacobian mutates each position to each amino acid: up to 20·L variants, or the ones named, where the notebook's approximation is `--jacobian=CERN`.
+
+Outputs are `conservation.npy` [L][20], `jacobian_contacts.npy` [L][L] (the notebook's `jac_to_con`), and with `--jacobian-full` `jacobian.npy` [L][K][L][20].
+
+The variants run up to 16 a pass (`--batch=N`; by default as many as the free memory takes):
+- the rows' modules run over every variant at once;
+- the outer product skips the query scores and the k projection;
+- the pair side runs a variant at a time;
+- the final MSA update touches only the query rows.
+
+Against `tools/oracle/dump_msap_variants.py` (the reference on the same `subsample.a3m`, the notebook's procedure):
+
+| 5K9P, 512 × 75, all 20 amino acids (1,501 variants) | this port | reference float32 | reference bf16 (the notebook's) |
+|---|---|---|---|
+| time | **73 s** (48.5 ms a variant; one pass alone is 184 ms) | 614 s | 214 s |
+| conservation, from float32 | 1.8e-4 | | 3.7e-3 |
+| Jacobian, from float32 | 3.9e-3 | | 9.0e-2 |
+| Jacobian contacts, top-L long-range precision | 0.600 | 0.600 | 0.613 |
+
+At 261 residues (5CAJ) one pass fills the card, so batching buys nothing: 180 ms a variant at 1, 4 or 16, against the reference's 480 ms. Conservation takes 47 s; conservation plus the CERN Jacobian (1,306 variants) takes 3.9 minutes.
+On 5CAJ against the float32 reference (conservation and the CERN Jacobian), with the pair bf16 at this length: conservation 2.4e-4 (the same argmax at 260 of 261 positions), the Jacobian's contacts 1.3e-2, top-L long-range precision 0.590 both sides.
+
+No cheaper way to the categorical Jacobian survived measurement (5K9P, against all 20 amino acids at depth 512: correlation of the contact maps, and top-L long-range precision, 0.600 for the full Jacobian):
+- **The exact one cannot be shortcut.** One pass already gives a whole slice J[n, a, :, :], so 20·L passes is the floor. A changed query token alters the layer-0 outer product only in pair row and column n, but the triangle multiplications spread it to every pair entry within the same layer, and the nonlinearities admit no superposition. A gradient Jacobian is not the categorical one, and costs as many passes either way.
+- **Pruning rows by their fixed sequence weights does not work.** A row whose weights are negligible in every layer could be dropped exactly up to that mass, but the query-biased weights are diffuse: the 128 heaviest of 512 rows leave 65-75% of the mass behind.
+- **A shallower MSA for the variants hurts.** 256 rows: correlation 0.80, precision 0.507. 128: 0.70, 0.387. 64: 0.52, 0.307.
+- **Masking instead of mutating** (L passes, not 20·L) is poor: 0.47 and 0.240; a gap, 0.24 and 0.107.
+- **Fewer amino acids** is the lever that works. `CERN` (the notebook's): 0.854 and 0.507. `AILKEDRS`: 0.945 and 0.587. `CEKLDRSA`: 0.935 and 0.560. `WGPY`: 0.736 and 0.360. One target, so the choice of eight wants more than one before it is a default.
+
 ## The subsample
 
 The reference (`MSA_Pairformer.dataset.MSA`) does two things:
