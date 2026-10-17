@@ -1424,13 +1424,18 @@ inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOL
 // 2.04 / 14.65 ms; 2 warps two tiles 3 rows 2.24 / 14.20, 4 warps 2 rows 2.18 / 15.74, 8 warps 2.33 / 19.44, 6 rows
 // 7.62 / 67.6 - every geometry byte-identical. Kept)
 inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
-                      int heads, size_t rows, float scale, const float* qBias, int spec = -1) {
+                      int heads, size_t rows, float scale, const float* qBias, int spec = -1, bool vtDone = false) {
+  // vtDone: V8 is flash8's transposed V already (gridInK's vt8), and fp8VtK is skipped
   constexpr int WARPS = 4, BK = 64, MT = 1, RR = 3, BQ = 16 * MT * WARPS;
   const int W = heads * 32, NK = (n + 63) / 64 * 64;
-  uint8_t* Vt8 = scratch<uint8_t>("attn.vt8", rows * (size_t)W * NK);
-  static int vtAttr = 0;
-  if (65 * W > vtAttr) { smemAttr(fp8VtK, 65 * W); vtAttr = 65 * W; }
-  fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, Vt8, n, NK, W);
+  const uint8_t* Vt8 = V8;
+  if (!vtDone) {
+    uint8_t* vt = scratch<uint8_t>("attn.vt8", rows * (size_t)W * NK);
+    static int vtAttr = 0;
+    if (65 * W > vtAttr) { smemAttr(fp8VtK, 65 * W); vtAttr = 65 * W; }
+    fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, vt, n, NK, W);
+    Vt8 = vt;
+  }
   const int bytes = 2 * (RR * (BK * 32 + 32 * BK) + BQ * (BK + 8) * 2);
   static bool attr = false;
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));

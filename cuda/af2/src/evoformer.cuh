@@ -1201,9 +1201,11 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
               {"fatt.qkvg", "fatt.o", "fatt.kv8", "attn.vt8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
     half* qkvg = scratch<half>("fatt.qkvg", (pairs + 128) * 4 * Wp);
     uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", pairs * 2 * Wp) : nullptr;
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8, ccMajor() == 12);
+    // (sm_12x: V written straight into flash8's transposed form, no fp8VtK pass - the same bytes)
+    uint8_t* vt8 = f8 && ccMajor() == 12 ? scratch<uint8_t>("attn.vt8", (size_t)L * Wp * ((L + 63) / 64 * 64)) : nullptr;
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8, ccMajor() == 12, vt8);
     half* o = scratch<half>("fatt.o", pairs * Wp);
-    if (f8) flash8Run(qkvg, kv8, kv8 + pairs * Wp, bias, stride, o, L, H, L, scale, nullptr);
+    if (f8) flash8Run(qkvg, kv8, vt8 ? vt8 : kv8 + pairs * Wp, bias, stride, o, L, H, L, scale, nullptr, -1, vt8 != nullptr);
     else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
     // (the row direction's GEMM accumulates into an f32 pair; a bf16 pair takes gridOutK in both directions -
     // an f16 product and an add pass were 6-10 ms slower a 494-residue fold)
