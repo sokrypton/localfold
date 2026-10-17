@@ -112,14 +112,6 @@ __global__ void pwaToHeadsK(const TI* v, TO* out, int S, int T, int heads, int d
   int e = (int)(t % d); size_t r = t / d; int s = (int)(r % S); r /= S; int j = (int)(r % T); int h = (int)(r / T);
   out[t] = v[((size_t)s * T + j) * heads * d + h * d + e];
 }
-// out[r][c] = o[r][c] sigmoid(gate[r][c]), the gate's rows ldg apart (msaPairWeightedAveragingFast: the per-head GEMM
-// writes o in the MSA's own layout)
-__global__ void pwaGateHK(const half* o, const half* gate, int ldg, half* out, size_t rows, int Wd) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * Wd) return;
-  size_t r = t / Wd; int c = (int)(t % Wd);
-  out[t] = __float2half(__half2float(o[t]) / (1.f + expf(-__half2float(gate[r * ldg + c]))));
-}
 // o [h][i][s][e] -> [s][i][h d + e], times sigmoid(gate)
 __device__ __forceinline__ float pwaF(float x) { return x; }
 __device__ __forceinline__ float pwaF(half x) { return __half2float(x); }
@@ -179,6 +171,136 @@ __global__ void pwaWeightsHK(const float* w, half* wh, int T, int Tp, size_t row
   wh[t] = j < T ? __float2half(w[r * T + j]) : __float2half(0.f);
 }
 // pair16: the pair's buffer holds bf16 (MSA Pairformer's PAIR_BF16; 256 channels)
+// The per-head weighted sum and its gate in one kernel (msaPairWeightedAveragingFast): for each head h,
+//   v[s][i][h d + e] = sigmoid(gate[s][i][h d + e]) sum_j w_h[i][j] vals[s][j][h d + e]
+// as ONE GEMM a head - M the (sequence, channel) pairs, N the residues i, K the residues j - reading the values where the
+// value-gate GEMM wrote them (rows ldv apart: [s][j][values | gates]) and writing the MSA's own layout, the gate applied
+// on the way out. cuBLAS's form of it was a 32-column GEMM a (sequence, head) - 35 TFLOPS - and a gate pass after it.
+// A block: 4 sequences x 32 channels (128 rows of M) by 64 residues, 4 warps of 64 x 32, K in steps of 32 through 4
+// cp.async stages; the values [j][(s, e)] reach the tensor cores through ldmatrix.trans, w_h [i][j] directly.
+// wh: [heads][T][Tp] f16 (Tp a multiple of 8, zero past T); d 32
+constexpr int PH_SQ = 4, PH_BM = PH_SQ * 32, PH_BN = 64, PH_KT = 32, PH_STAGES = 4, PH_NTH = 128;
+constexpr size_t PH_STAGE = (size_t)(PH_KT * PH_BM + PH_BN * PH_KT) * 2;
+constexpr int PH_LDO = PH_BM + 8;
+constexpr size_t PH_SMEM = std::max(PH_STAGES * PH_STAGE, (size_t)PH_BN * PH_LDO * 2);
+__device__ __forceinline__ int phA(int r, int c) { return r * PH_BM + ((((c >> 3) ^ r) & 7) | ((c >> 3) & 8)) * 8 + (c & 7); }   // [32][128]
+__device__ __forceinline__ int phB(int r, int c) { return r * PH_KT + ((((c >> 3) ^ (r >> 1)) & 3) << 3) + (c & 7); }          // [64][32]
+__global__ void __launch_bounds__(PH_NTH) pwaHeadK(const half* __restrict__ vg, int ldv, const half* __restrict__ wh,
+                                                   half* __restrict__ out, int S, int T, int Tp, int Wd) {
+  constexpr int d = 32;
+  extern __shared__ __align__(16) unsigned char smem[];
+  auto As = [&](int st) { return (half*)(smem + st * PH_STAGE); };
+  auto Bs = [&](int st) { return As(st) + PH_KT * PH_BM; };
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, wm = warp & 1, wn = warp >> 1;
+  const int i0 = blockIdx.x * PH_BN, s0 = blockIdx.y * PH_SQ, h = blockIdx.z;
+  const int tiles = (T + PH_KT - 1) / PH_KT;
+  const half* W = wh + (size_t)h * T * Tp;
+  // the copies: A 512 chunks (j 32 x 4 sequences x 4), B 256 (i 64 x 4), every offset once
+  constexpr int AIT = PH_KT * PH_BM / 8 / PH_NTH, BIT = PH_BN * PH_KT / 8 / PH_NTH;
+  int aDst[AIT], aJ[AIT], bDst[BIT], bK[BIT]; const half* aSrc[AIT]; const half* bSrc[BIT]; bool aOk[AIT], bOk[BIT];
+#pragma unroll
+  for (int it = 0; it < AIT; ++it) {
+    const int q = it * PH_NTH + threadIdx.x, jr = q / 16, rem = q % 16, sl = rem / 4, ec = (rem % 4) * 8;
+    aDst[it] = phA(jr, sl * 32 + ec); aJ[it] = jr; aOk[it] = s0 + sl < S;
+    aSrc[it] = vg + ((size_t)(aOk[it] ? s0 + sl : 0) * T + jr) * ldv + h * d + ec;
+  }
+#pragma unroll
+  for (int it = 0; it < BIT; ++it) {
+    const int q = it * PH_NTH + threadIdx.x, ir = q / 4, kc = (q % 4) * 8;
+    bDst[it] = phB(ir, kc); bK[it] = kc; bOk[it] = i0 + ir < T;
+    bSrc[it] = W + (size_t)(bOk[it] ? i0 + ir : 0) * Tp + kc;
+  }
+  auto issue = [&](int t, int st) {
+    const int j0 = t * PH_KT;
+    half *a = As(st), *b = Bs(st);
+#pragma unroll
+    for (int it = 0; it < AIT; ++it) {
+      const bool ok = aOk[it] && j0 + aJ[it] < T;
+      cpAsync16(a + aDst[it], ok ? aSrc[it] + (size_t)j0 * ldv : vg, ok);
+    }
+#pragma unroll
+    for (int it = 0; it < BIT; ++it) {
+      const bool ok = bOk[it] && j0 + bK[it] < Tp;
+      cpAsync16(b + bDst[it], ok ? bSrc[it] + j0 : wh, ok);
+    }
+    cpCommit();
+  };
+  float acc[4][4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
+#pragma unroll
+  for (int t = 0; t < PH_STAGES - 1; ++t) { if (t < tiles) issue(t, t); else cpCommit(); }
+  int aFr[2][4], bFr[2][2];
+#pragma unroll
+  for (int ks = 0; ks < 2; ++ks) {
+    const int q = lane >> 3;
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) aFr[ks][mt] = phA(ks * 16 + (q >> 1) * 8 + (lane & 7), wm * 64 + mt * 16 + (q & 1) * 8);
+#pragma unroll
+    for (int n2 = 0; n2 < 2; ++n2) bFr[ks][n2] = PH_KT * PH_BM + phB(wn * 32 + n2 * 16 + (q >> 1) * 8 + (lane & 7), ks * 16 + (q & 1) * 8);
+  }
+  uint32_t fa[2][4][4], fb[2][2][4];
+  auto load = [&](const half* stage, int ks, int buf) {
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) ldsm4t(fa[buf][mt], stage + aFr[ks][mt]);
+#pragma unroll
+    for (int n2 = 0; n2 < 2; ++n2) ldsm4(fb[buf][n2], stage + bFr[ks][n2]);
+  };
+  int st = 0, nst = PH_STAGES - 1;
+  for (int t = 0; t < tiles; ++t) {
+    cpWait<PH_STAGES - 2>();
+    __syncthreads();
+    if (t + PH_STAGES - 1 < tiles) issue(t + PH_STAGES - 1, nst); else cpCommit();
+    nst = nst + 1 == PH_STAGES ? 0 : nst + 1;
+    const half* stage = As(st);
+    st = st + 1 == PH_STAGES ? 0 : st + 1;
+    load(stage, 0, 0);
+#pragma unroll
+    for (int ks = 0; ks < PH_KT / 16; ++ks) {
+      const int cur = ks & 1;
+      if (ks + 1 < PH_KT / 16) load(stage, ks + 1, cur ^ 1);
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int n2 = 0; n2 < 2; ++n2) {
+          mma16816(acc[mt][2 * n2], fa[cur][mt], fb[cur][n2][0], fb[cur][n2][1]);
+          mma16816(acc[mt][2 * n2 + 1], fa[cur][mt], fb[cur][n2][2], fb[cur][n2][3]);
+        }
+    }
+  }
+  cpWait<0>();
+  __syncthreads();
+  // the tile [i][(s, e)] through shared memory, then each (s, i)'s 32 channels gated and stored as 64 contiguous bytes
+  half* o = (half*)smem;
+  const int g = lane >> 2, tig = lane & 3;
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int m = wm * 64 + mt * 16 + g, n = wn * 32 + nt * 8 + tig * 2;
+      o[n * PH_LDO + m] = __float2half(acc[mt][nt][0]); o[(n + 1) * PH_LDO + m] = __float2half(acc[mt][nt][1]);
+      o[n * PH_LDO + m + 8] = __float2half(acc[mt][nt][2]); o[(n + 1) * PH_LDO + m + 8] = __float2half(acc[mt][nt][3]);
+    }
+  __syncthreads();
+#pragma unroll
+  for (int it = 0; it < PH_BN * PH_SQ * 4 / PH_NTH; ++it) {
+    const int q = it * PH_NTH + threadIdx.x, il = q / 16, rem = q % 16, sl = rem / 4, ec = (rem % 4) * 8;
+    const int s = s0 + sl, i = i0 + il;
+    if (s >= S || i >= T) continue;
+    uint4 ov = *reinterpret_cast<const uint4*>(o + il * PH_LDO + sl * 32 + ec);
+    const size_t row = (size_t)s * T + i;
+    uint4 gv = *reinterpret_cast<const uint4*>(vg + row * ldv + Wd + h * d + ec);
+    const half *op = reinterpret_cast<const half*>(&ov), *gp = reinterpret_cast<const half*>(&gv);
+    uint4 rv; half* rp = reinterpret_cast<half*>(&rv);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) rp[e] = __float2half(__half2float(op[e]) * sigmH(__half2float(gp[e])));
+    *reinterpret_cast<uint4*>(out + row * Wd + h * d + ec) = rv;
+  }
+}
 inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn,
                                          bool pair16 = false) {
   if (pair16 && C != 256) { fprintf(stderr, "a bf16 pair's pair-weighted averaging is 256 channels\n"); exit(1); }
@@ -204,25 +326,17 @@ inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int
   half* wh = scratch<half>("msah.w", (size_t)heads * T * Tp);
   pwaWeightsHK<<<blocks((size_t)heads * T * Tp), 256, 0, STREAM>>>(w, wh, T, Tp, (size_t)heads * T);
   int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, ((size_t)128 << 20) / ((size_t)T * Wd * 2)));
-  // the values and gates in one GEMM (valueGate: [Cm][2 Wd]), rows 2 Wd wide, then Tp - T zero rows (below)
-  const size_t pad = (size_t)(Tp - T) * 2 * Wd;
-  half* vg = scratch<half>("msah.vg", (size_t)Sc * T * 2 * Wd + pad);
-  half* oh = scratch<half>("msah.oh", (size_t)Sc * T * Wd); half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd);
-  const float one = 1.f, zero = 0.f;
+  // the values and gates in one GEMM (valueGate: [Cm][2 Wd]), rows 2 Wd wide
+  if (d != 32) { fprintf(stderr, "the fused per-head kernel is 32 channels a head (%d)\n", d); exit(1); }
+  half* vg = scratch<half>("msah.vg", (size_t)Sc * T * 2 * Wd);
+  half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd);
+  static bool attr = false;
+  if (!attr) { smemAttr(pwaHeadK, (int)PH_SMEM); attr = true; }
   for (int s0 = 0; s0 < S; s0 += Sc) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
     const half* lnc = ln + (size_t)s0 * T * Cm;
     ltGemm(lnc, Fh(Bn + "valueGate"), vg, true, cr, Cm, 2 * Wd, nullptr, false, 0.f);
-    if (pad) CK(cudaMemsetAsync(vg + cr * 2 * Wd, 0, pad * 2, STREAM));
-    // per head, every sequence of the chunk: O[s][i][h d + e] = sum_j w_h[i][j] v[s][j][h d + e], in the MSA's own layout
-    // (no permute either way). Col-major per sequence: O^T (d x T, ld Wd) = V^T (d x Tp, ld 2 Wd) W_h^T (Tp x T, ld Tp) -
-    // the contraction over Tp, a multiple of 8 (at an odd T cuBLAS took an unaligned kernel): a column j >= T of V^T is
-    // the next sequence's row (finite, times the weights' zero columns) or the zero rows past the chunk
-    for (int h = 0; h < heads; ++h)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, T, Tp, &one, vg + h * d, CUDA_R_16F, 2 * Wd, (long long)T * 2 * Wd,
-                                    wh + (size_t)h * T * Tp, CUDA_R_16F, Tp, 0, &zero, oh + h * d, CUDA_R_16F, Wd, (long long)T * Wd,
-                                    sc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    pwaGateHK<<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, vg + Wd, 2 * Wd, v, cr, Wd);
+    pwaHeadK<<<dim3((T + PH_BN - 1) / PH_BN, (sc + PH_SQ - 1) / PH_SQ, heads), PH_NTH, PH_SMEM, STREAM>>>(vg, 2 * Wd, wh, v, sc, T, Tp, Wd);
     ltGemm(v, Fh(Bn + "output"), m + (size_t)s0 * T * Cm, false, cr, Wd, Cm, nullptr, false, 1.f);
   }
 }

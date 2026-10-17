@@ -403,7 +403,7 @@ inline std::vector<int> greedyRows(const std::vector<std::string>& rows, const s
 
 // ---------------------------------------------------------------- the MSA's transition under --fast
 // LN -> the up-projection and SwiGLU in one kernel (swiglu.cuh: the [rows][2I] widening never reaches memory) -> the
-// down-projection accumulated into the f32 rows by cuBLASLt. ~64 K rows a chunk: past that the GEMMs gain nothing.
+// down-projection accumulated into the f32 rows by cuBLASLt.
 // The fused kernel against cuBLASLt's GEMM and the SwiGLU pass, 133,632 rows (5CAJ at 512): 2.61 ms against 3.61
 inline const half* swigluWeight(const std::string& name, int C, int I) {      // W1 re-laid for swigluUpK, once a tensor
   static std::map<std::string, half*> made;
@@ -416,6 +416,8 @@ inline const half* swigluWeight(const std::string& name, int C, int I) {      //
 inline void msaTransitionFast(float* x, size_t P, int C, const std::string& Tn) {
   const int I = (int)dimOf("f/" + Tn + "transition2", 0);
   if (I % SG_BN || C % 8) { fprintf(stderr, "the fused SwiGLU wants I a multiple of %d and C of 8 (%d, %d)\n", SG_BN, I, C); exit(1); }
+  // (64 K rows a call: in a fold the fused kernel runs as fast at 64 K as whole - 2.49 ms a layer either way at 5CAJ -
+  // where larger calls held 1.7 GB more at 512 x 1,023)
   const size_t chunk = std::min<size_t>(P, 65536);
   half* xn = scratch<half>("ftr.xn", chunk * C); half* g = scratch<half>("ftr.g", chunk * I);
   const half* w1 = swigluWeight(Tn + "transition1", C, I);
