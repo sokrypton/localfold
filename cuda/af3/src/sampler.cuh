@@ -139,16 +139,20 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
 // (5CAJ, 5 x 200: 1805 -> 917 ms) - and at equal calls one-call 50 beats two-call 25 (backbone bonds 0.042
 // against 0.054 A). --chai-second-order is chai-lab's sampler as written.
 inline bool CHAI_SECOND_ORDER = false;
-// With the AF3 lineage's options (opt.given - otherwise chai-1's sampler exactly as above):
-//   --schedule=geometric   chai-1's endpoints (80, 4e-4) at the same midpoints, evenly spaced in log sigma
-//   --update=exponential   x' = r^S noisy + (1 - r^S) D, r = sigma / tHat - S chai-1's own 2 (its one-call step is
-//                          Euler at a scale of 2, x = noisy + 2 dt g1), or --step-scale's
-//   --no-churn             chai-1's churn off
-// (the one-call form only: with --chai-second-order they are refused)
+// 🔴 AND ITS DEFAULT STEP IS THE EXPONENTIAL ONE (2026-10-17): x' = r^S noisy + (1 - r^S) D, r = sigma / tHat, S = 2 - its
+// one-call step above is Euler at that scale (x = noisy + 2 dt g1) - on its own schedule. Measured with the AF3 lineage's
+// decision run (seven systems x two seeds of bonds, six crystal targets x three seeds) at the page's 25 steps: mainchain
+// 0.063 -> 0.034 A, peptide 0.052 -> 0.019, side chain 0.075 -> 0.052, nucleic 0.075 -> 0.048, ligand mean 0.092 -> 0.058
+// (1/6 torn -> 0/6) - its own 200 steps' bonds - crystals level (1.294 -> 1.285 A), clashes as before. The geometric
+// schedule bought the same bonds and one to three more clashes a fold (docs/AF3.md, "chai-1's sampler").
+//   --update=euler         its own step (the sampler before), --step-scale= another S
+//   --schedule=geometric   its endpoints (80, 4e-4) at the same midpoints, evenly spaced in log sigma
+//   --no-churn             its churn off
+// (the one-call form only: --chai-second-order is chai-lab's sampler as written, and refuses them)
 inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                      const std::function<const float*(const float*, float, const float*)>& denoiseFn,
                                      const std::function<void(const std::vector<float>&)>& onLevels,
-                                     bool geometric = false, bool exponential = false, bool churnOn = true,
+                                     bool geometric = false, bool exponential = true, bool churnOn = true,
                                      double stepScale = 0) {
   int ns = (int)seeds.size(), N = steps;
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
@@ -241,6 +245,7 @@ struct DiffusionOptions {
   double multistepBelow = 1e30;  // ...only at steps whose noise level (A) is below this; plain exponential above
   double splitAt = 0; int splitAbove = 0;  // geometric in two segments: splitAbove steps down to splitAt (A), the rest below
   double stepScale = 0;        // --step-scale=S: the step's scale (0: the model's own - AF3's 1.5, chai-1's 2)
+  bool scheduleGiven = false;  // --schedule= said (chai-1's default schedule is its own, not the geometric one)
   bool given = false;          // a flag set one
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
@@ -253,9 +258,8 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     return true;
   };
   if (!strcmp(f, "--update=multistep")) { o.exponential = o.multistep = true; o.given = true; return true; }
-  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
-    o.multistep = false; o.given = true; return true;
-  }
+  if (value("--schedule=", "karras", "geometric", o.geometric)) { o.multistep = false; o.scheduleGiven = o.given = true; return true; }
+  if (value("--update=", "euler", "exponential", o.exponential)) { o.multistep = false; o.given = true; return true; }
   if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
   if (!strncmp(f, "--step-scale=", 13)) {
     o.stepScale = atof(f + 13);
@@ -293,9 +297,9 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     if (opt.multistep || opt.splitAt > 0 || (opt.given && CHAI_SECOND_ORDER)) {
       fprintf(stderr, "chai-1's sampler takes --schedule, --update, --no-churn and --step-scale on its one-call step only\n"); exit(1);
     }
-    // (its own unless a flag asked otherwise: DiffusionOptions' defaults are the AF3 lineage's)
-    return opt.given ? sampleChai(steps, seeds, mask, denoiseFn, onLevels, opt.geometric, opt.exponential, opt.churn, opt.stepScale)
-                     : sampleChai(steps, seeds, mask, denoiseFn, onLevels);
+    // (its own schedule unless --schedule said otherwise - DiffusionOptions' default schedule is the AF3 lineage's)
+    return sampleChai(steps, seeds, mask, denoiseFn, onLevels, opt.scheduleGiven && opt.geometric, opt.exponential, opt.churn,
+                      opt.stepScale);
   }
   if (opt.stepScale > 0) stepScale = opt.stepScale;
   for (int k = 0; k <= steps; ++k)

@@ -6687,8 +6687,8 @@ Flow itself remains), `probe-flow-sigma-by-size.js` and `probe-one-step-sigma.js
 `foldBatch` (webgpu/af3/fold.js `DIFFUSION_DEFAULTS`) and cuda/af3 (`DiffusionOptions` in sampler.cuh) both default to
 the exponential update on the geometric schedule with churn, and the page's one dial (`AF3_COUNTS` in web/af3-model.js)
 prefers 25 for every AF3-lineage family. Gone with it: `ALPHAFOLD3_COUNTS`, `OPENDDE_COUNTS`, `SHORT_SCHEDULES` and
-`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 keeps its own sampler (the flags are refused
-only when given). `--update=euler --schedule=karras` folds the old way.
+`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 kept its own sampler here, and
+took the exponential step on its own schedule a day later - "chai-1's sampler", below. `--update=euler --schedule=karras` folds the old way.
 
 **The decision run** (cuda/af3, seven models; each model's OLD page default against the exponential sampler at
 16 / 20 / 25 and both samplers at 200). Bonds over bench-sampler-geometry.js's seven systems x two seeds; ligand =
@@ -6725,6 +6725,37 @@ exp 25 minus the old default is -0.16 to +0.05 A per model (mean of per-target m
   on an answer the template already pins, against ligands that stop tearing.
 
 Raw rows: `/tmp/claude-1000/sch/finalA.txt`, `finalB.txt` and `fsum.py` on the A100 box (not kept).
+
+## chai-1's sampler: the exponential step on its own schedule (2026-10-17)
+
+chai-1 kept its own sampler when the lineage moved (above): chai-lab's schedule (sigma_max 80, rho 7, sigma_min 4e-4 at
+the N midpoints), its churn, and its step - by default one denoiser call a step, `x = noisy + 2 dt g1`, an Euler step at
+a scale of 2 (cuda/af3/src/sampler.cuh, `sampleChai`). It now takes the lineage's flags, and its default step is the
+exponential one, `x' = r^S noisy + (1 - r^S) D` with `r = sigma / tHat` and S its own 2, on ITS schedule.
+`--update=euler` is the sampler before (byte-identical), `--schedule=geometric` the lineage's schedule at its endpoints,
+`--step-scale=` another S, `--chai-second-order` chai-lab's two-call step as written.
+
+**Measured** with the lineage's decision run (cuda/af3: bench-sampler-geometry's seven systems x two seeds of bonds; 6MRR,
+1QYS, 5CAJ, 1TIM A, 1TIM A:B and 1BRS A:D x three seeds of CA RMSD), all at the page's 25 steps but the 200 rows. Medians;
+ligand = GOL, ATP and SEP, its mean and how many of six folds went past 0.15 A; clashes MolProbity's clashscore:
+
+| arm | mainchain | peptide | side chain | nucleic | ligand (mean, torn) | crystals | clashes |
+|---|---|---|---|---|---|---|---|
+| its own step (the default before) | 0.063 | 0.052 | 0.075 | 0.075 | 0.058 (0.092, 1/6) | 1.294 | 0.00 |
+| **exponential, its own schedule (the default)** | **0.034** | **0.019** | **0.052** | **0.048** | **0.055 (0.058, 0/6)** | **1.285** | **0.00** |
+| exponential, geometric schedule | 0.034 | 0.017 | 0.052 | 0.051 | 0.052 (0.055, 0/6) | 1.263 | 3.49 |
+| exponential, geometric, S 1.5 | 0.034 | 0.017 | 0.052 | 0.053 | 0.049 (0.053, 0/6) | 1.270 | 2.62 |
+| its own step, 200 | 0.033 | 0.017 | 0.052 | 0.049 | 0.043 (0.038, 0/6) | 1.296 | 0.00 |
+| exponential, geometric, 200 | 0.034 | 0.019 | 0.053 | 0.050 | 0.046 (0.065, 0/6) | 1.321 | 5.24 |
+
+- **The exponential step gives 25 steps its 200 steps' bonds** - mainchain and peptide halved and more, side chains
+  and nucleic acids to 200's - at the same cost, and no ligand tears; crystals level (inside the seed spread).
+- 🔴 **THE GEOMETRIC SCHEDULE ADDS ONE TO THREE CLASHES A FOLD, AND THAT IS WHY IT IS NOT chai-1's**: every protein
+  and ligand system on both seeds (one clash is 1.75 at these sizes), at 25 and at 200, for the same bonds the
+  exponential step gets on chai-1's own schedule. The lineage's decision run did not score clashes, so whether its own
+  geometric default pays the same is not known - its clash column is the thing to add.
+
+Raw rows: `/tmp/claude-1000/chai/run.txt` and `chai.sh` on the A100 box (not kept).
 
 ## A multistep update: measured, kept as an option, not taken (2026-10-16)
 
