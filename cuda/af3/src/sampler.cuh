@@ -139,14 +139,27 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
 // (5CAJ, 5 x 200: 1805 -> 917 ms) - and at equal calls one-call 50 beats two-call 25 (backbone bonds 0.042
 // against 0.054 A). --chai-second-order is chai-lab's sampler as written.
 inline bool CHAI_SECOND_ORDER = false;
+// With the AF3 lineage's options (opt.given - otherwise chai-1's sampler exactly as above):
+//   --schedule=geometric   chai-1's endpoints (80, 4e-4) at the same midpoints, evenly spaced in log sigma
+//   --update=exponential   x' = r^S noisy + (1 - r^S) D, r = sigma / tHat - S chai-1's own 2 (its one-call step is
+//                          Euler at a scale of 2, x = noisy + 2 dt g1), or --step-scale's
+//   --no-churn             chai-1's churn off
+// (the one-call form only: with --chai-second-order they are refused)
 inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                      const std::function<const float*(const float*, float, const float*)>& denoiseFn,
-                                     const std::function<void(const std::vector<float>&)>& onLevels) {
+                                     const std::function<void(const std::vector<float>&)>& onLevels,
+                                     bool geometric = false, bool exponential = false, bool churnOn = true,
+                                     double stepScale = 0) {
   int ns = (int)seeds.size(), N = steps;
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   std::vector<double> levels(N);
-  for (int k = 0; k < N; ++k) levels[k] = noiseSchedule((2.0 * k + 1) / (2.0 * N), 16, 0.0004, 80, 7);
-  const double churn = std::min(80.0 / N, std::sqrt(2.0) - 1.0);
+  for (int k = 0; k < N; ++k) {
+    const double t = (2.0 * k + 1) / (2.0 * N);
+    levels[k] = geometric ? 16 * std::exp(std::log(80.0) + t * (std::log(0.0004) - std::log(80.0)))
+                          : noiseSchedule(t, 16, 0.0004, 80, 7);
+  }
+  const double churn = churnOn ? std::min(80.0 / N, std::sqrt(2.0) - 1.0) : 0.0;
+  const double S = stepScale > 0 ? stepScale : 2.0;
   int T = N - 1;                       // transitions
   std::vector<float> rot((size_t)std::max(T, 1) * ns * 12), at;     // [tHat, sigma] a transition
   for (int k = 0; k < ns; ++k) {
@@ -192,7 +205,8 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     if (s == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
     if (!CHAI_SECOND_ORDER) {                    // one call: the correction's D taken as this step's (see above)
-      chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(2 * dt), all3);
+      if (exponential) eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d1, (float)(std::pow(level / tHat, S) - 1), all3);
+      else chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(S * dt), all3);
       continue;
     }
     chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)dt, all3);
@@ -226,7 +240,8 @@ struct DiffusionOptions {
   bool multistep = false;      // exponential with DPM-Solver++ 2M's extrapolation from the previous prediction
   double multistepBelow = 1e30;  // ...only at steps whose noise level (A) is below this; plain exponential above
   double splitAt = 0; int splitAbove = 0;  // geometric in two segments: splitAbove steps down to splitAt (A), the rest below
-  bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
+  double stepScale = 0;        // --step-scale=S: the step's scale (0: the model's own - AF3's 1.5, chai-1's 2)
+  bool given = false;          // a flag set one
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
 inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
@@ -242,6 +257,11 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     o.multistep = false; o.given = true; return true;
   }
   if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  if (!strncmp(f, "--step-scale=", 13)) {
+    o.stepScale = atof(f + 13);
+    if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); exit(1); }
+    o.given = true; return true;
+  }
   if (!strncmp(f, "--multistep-below=", 18)) { o.multistepBelow = atof(f + 18); o.given = true; return true; }
   if (!strncmp(f, "--schedule-split=", 17)) {
     if (sscanf(f + 17, "%lf:%d", &o.splitAt, &o.splitAbove) != 2 || o.splitAt <= 0 || o.splitAbove < 1) {
@@ -269,7 +289,15 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   }
   std::vector<double> levels(steps + 1);
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
-  if (M.flag("trunk.dialect.chaiSampler")) return sampleChai(steps, seeds, mask, denoiseFn, onLevels);
+  if (M.flag("trunk.dialect.chaiSampler")) {
+    if (opt.multistep || opt.splitAt > 0 || (opt.given && CHAI_SECOND_ORDER)) {
+      fprintf(stderr, "chai-1's sampler takes --schedule, --update, --no-churn and --step-scale on its one-call step only\n"); exit(1);
+    }
+    // (its own unless a flag asked otherwise: DiffusionOptions' defaults are the AF3 lineage's)
+    return opt.given ? sampleChai(steps, seeds, mask, denoiseFn, onLevels, opt.geometric, opt.exponential, opt.churn, opt.stepScale)
+                     : sampleChai(steps, seeds, mask, denoiseFn, onLevels);
+  }
+  if (opt.stepScale > 0) stepScale = opt.stepScale;
   for (int k = 0; k <= steps; ++k)
     levels[k] = opt.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
                               : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);

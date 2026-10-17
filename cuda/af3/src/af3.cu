@@ -723,10 +723,6 @@ static int foldMain(int argc, char** argv) {
     NS = (int)cn;
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
-    if (diffusion.given && M.flag("trunk.dialect.chaiSampler")) {
-      fprintf(stderr, "--schedule, --update and --no-churn are the diffusion sampler's: chai-1's sampler does not take them\n");
-      return 1;
-    }
     if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
       frames.start(framesDir, mask.size() * 3, steps);
