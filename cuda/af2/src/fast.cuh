@@ -116,7 +116,12 @@ inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t ro
     }
     cudaEventCreate(&ea); cudaEventCreate(&eb); cudaEventRecord(ea, STREAM);
   }
-  CB(cublasLtMatmul(LT, p.op, &one, Wt, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, nullptr, 0, STREAM));
+  if (cublasStatus_t st = cublasLtMatmul(LT, p.op, &one, Wt, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, nullptr, 0, STREAM);
+      st != CUBLAS_STATUS_SUCCESS) {      // (the shape named: a cuBLASLt pick that fails at run time is a property of its shape)
+    fprintf(stderr, "cuBLASLt %d: %zu x %d x %d (ldx %d, ldy %d), %s out, epilogue %d, beta %g\n", (int)st, rows, in, out, ldx, ldy,
+            bf16 ? "bf16" : yHalf ? "f16" : "f32", epi, beta);
+    exit(1);
+  }
   if (timing) { cudaEventRecord(eb, STREAM); timed->push_back({std::make_tuple(rows, in, out, yHalf, epi), ea, eb}); }
 }
 // a weight slice's f16 copy: haiku name, stacked block (or -1)

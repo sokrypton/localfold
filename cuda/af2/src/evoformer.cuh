@@ -24,6 +24,12 @@ struct Trunk {
 // blocks and out after them (af2.cu). Set where every block's MSA path has a bf16 form: --fast, every MSA row live,
 // no template rows, 8 heads of 32 on an Ampere part
 inline bool MSA16 = false;
+// a pair pointer `elems` elements on, in the pair's own storage: t.pair is a float* that holds bf16 under PAIR16, so a bare
+// `pair + n` lands 2n bf16 elements on - past 2,048 residues (a second chunk of the row attention's bias, 4M pairs a chunk)
+// that read past the pair and into whatever lay there, a crash or a silently wrong bias
+inline const float* pairAdvance(const float* p, size_t elems) {
+  return PAIR16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(p) + elems) : p + elems;
+}
 
 // ---------------------------------------------------------------- the embedder
 // relpos [L, L, 73] one-hot, as _relative_encoding builds it
@@ -404,7 +410,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       const float *sc = P(R + "/feat_2d_norm/scale", blk), *of = P(R + "/feat_2d_norm/offset", blk);
       for (size_t r0 = 0; r0 < pairs; r0 += per) {
         size_t r = std::min(per, pairs - r0);
-        lnHeadsRaw<16>(t.pair + r0 * 128, sc, of, it->second, raw, r);
+        lnHeadsRaw<16>(pairAdvance(t.pair, r0 * 128), sc, of, it->second, raw, r);
         biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, b, L, H, stride, false, r0, r,
                                                              t.pairOnes ? nullptr : t.pairMask, true);
       }
@@ -706,9 +712,11 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
     if (rowsN <= OPM_SHALLOW) {
       const half* W = PH(Op + "/output_w", blk);           // [O*O][128] f16
-      // (sm_12x, an f32 pair: 8 more rows, the bias rows' - see below. The bf16 pair's f32 staging rows keep the epilogue,
-      // which cuBLASLt fuses there: the augmented form was 0.1-0.6% slower at 600 and 1,000 residues)
-      const bool aug = ones && ccMajor() == 12 && !PAIR16;
+      // (8 more rows, the bias rows' - see below - on sm_12x with an f32 pair, and wherever the bias vector is past 2^17
+      // elements: on Colab's RTX PRO 6000 a bf16 pair's fold from 8 rows at 1,500 residues 7.48 -> 7.07 s with it. A shorter
+      // bias keeps the epilogue, which cuBLASLt fuses for a bf16 pair's f32 staging rows: there the augmented form was
+      // 0.1-0.6% slower at 600 and 1,000 residues)
+      const bool aug = ones && ((ccMajor() == 12 && !PAIR16) || (size_t)L * 128 > ((size_t)1 << 17));
       half* T = scratch<half>("fopm.T", (size_t)O * rows * 128 + (aug ? (size_t)8 * L * 128 : 0));
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, CUDA_R_16F, 128, (long long)O * 128,
                                     rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
@@ -1252,7 +1260,7 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     float* raw = scratch<float>("fbias.raw16", per * 16);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      lnHeadsRaw<16>(pair + r0 * C, lnS, lnO, Wb, raw, r);
+      lnHeadsRaw<16>(pairAdvance(pair, r0 * C), lnS, lnO, Wb, raw, r);
       biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, bias, L, H, stride, tr, r0, r, nullptr, true);   // lnHeadsK writes head-major
     }
   }
