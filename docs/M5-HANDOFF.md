@@ -1243,3 +1243,18 @@ af3-6mrr 0.771 -> 0.850 A, protenix2 1.561 -> 1.771, opendde 1.457 -> 1.644, ros
 `test:native --offline --no-af3` passes on it (twice), but one full run lost the ef2 server once ("the ef2 server
 exited: weights up 2463 ms", nothing else in its log) on 5CAJ right after the AF2 multimer cases; that case alone and
 the full gate again both pass. Not chased yet - if the M5 sees a server exit with no error, it is this.
+
+## From the M5, on f022a988 (2026-10-17): the pulled branch verified
+
+- Metal gates: AF2 5/5, ESMFold2 8/8 unchanged. AF3 on the new sampler lands on the M2's re-recorded values to the
+  gate's tolerance in every case (af3-6mrr 0.849 / M2 0.850 A, protenix2 1.771 / 1.771, rosettafold3 1.865 / 1.866,
+  opendde 1.645 / 1.644, 5CAJ template 0.261 / 0.258, kitchen sink pLDDT 70.05 / 70.19, glycan 48.98 / 48.67; ligand
+  0.020-0.062, nucleic 0.044-0.053 A), so the moves are the sampler's, not a chip's. **`gate-baseline.m5.json`
+  re-recorded** with `--write`; two further runs 16/16 ok. npm test 1338/1340 (the mpnn-bridge case, failing before
+  this pull too). The ESM-C 6B paths were not run: their bundles (~25 GB) are not on this M5.
+- **rosettafold3 on 6MRR + GOL + SEP@3 at 25 steps: the M5 sees it as the M2 did**, to the digit on seed 1. CA RMSD /
+  ligand bond rms, seeds 1-3, new against Euler/Karras: rosettafold3 1.55/0.062, 1.68/0.081, 1.62/0.191 against
+  0.95/0.080, 0.86/0.135, 1.66/0.084; boltz2 1.75/0.097, 1.62/0.072, 1.56/0.148 against 1.49/0.134, 1.59/0.181,
+  1.47/0.257; openbind0 1.86/0.104, 1.82/0.072, 1.91/0.081 against 1.87/0.072, 1.82/0.085, 1.87/0.069. So the new
+  default places boltz2's ligand better and rosettafold3's backbone worse on this target (boltz2's slightly worse
+  too); still one target and three seeds - the call on rosettafold3's default is not made here.
