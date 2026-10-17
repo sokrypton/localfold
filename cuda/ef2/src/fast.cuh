@@ -93,11 +93,48 @@ __global__ void layerNormAnyHK(const float* x, half* y, size_t rows, int C, cons
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) y[row * C + c] = __float2half((xr[c] - mean) * inv * sc[c] + of[c]);
 }
+// any width that is a multiple of 4 up to 512, a warp a row held in registers (float4s, read once): the generic form
+// above reads the row three times, 335 ms at MSA Pairformer's 464 channels and 2,048 x 1,023 rows
+template <int C>
+__global__ void layerNormRegHK(const float* __restrict__ x, half* __restrict__ y, size_t rows, const float* __restrict__ sc,
+                               const float* __restrict__ of) {
+  constexpr int V = C / 4, STEPS = (V + 31) / 32;
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float4* xr = reinterpret_cast<const float4*>(x + row * C);
+  float4 v[STEPS]; float s = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int q = k * 32 + lane;
+    v[k] = q < V ? xr[q] : make_float4(0, 0, 0, 0);
+    s += v[k].x + v[k].y + v[k].z + v[k].w;
+  }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  const float mean = s / C; float q2 = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) if (k * 32 + lane < V) {
+    float a = v[k].x - mean, b = v[k].y - mean, c = v[k].z - mean, d = v[k].w - mean; q2 += a * a + b * b + c * c + d * d;
+  }
+  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
+  const float inv = rsqrtf(q2 / C + 1e-5f);
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int q = k * 32 + lane;
+    if (q >= V) continue;
+    float4 g = reinterpret_cast<const float4*>(sc)[q], o = reinterpret_cast<const float4*>(of)[q];
+    __half2 lo = __floats2half2_rn((v[k].x - mean) * inv * g.x + o.x, (v[k].y - mean) * inv * g.y + o.y);
+    __half2 hi = __floats2half2_rn((v[k].z - mean) * inv * g.z + o.z, (v[k].w - mean) * inv * g.w + o.w);
+    uint2 out; out.x = *reinterpret_cast<uint32_t*>(&lo); out.y = *reinterpret_cast<uint32_t*>(&hi);
+    reinterpret_cast<uint2*>(y + row * C)[q] = out;
+  }
+}
 // LayerNorm f32 -> f16, by pointers (scale/offset f32)
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const float* sc, const float* of) {
   unsigned grid = (unsigned)((rows + 7) / 8);
   if (C == 128) layerNormVK<128><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 464) layerNormRegHK<464><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else layerNormAnyHK<<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 // a folding-bundle tensor's f16 copy (the file's half mirror)

@@ -14,10 +14,12 @@ conversions happen here and nowhere else:
     the incoming one's a and b swapped (its contraction is the transpose of cuda/ef2's).
 Entries (f/ prefix, as cuda/ef2's F() reads them):
   msap/relpos [139][256], msap/bond [256], msap/msaInit [28][464]
-  msap/blocks/<l>/pwa/...             normScale, normOffset, value, gate, pairNormScale, pairNormOffset, pairLogits, output
+  msap/blocks/<l>/pwa/...             normScale, normOffset, value, gate, valueGate (the two side by side), pairNormScale,
+                                      pairNormOffset, pairLogits, output
   msap/blocks/<l>/msaTransition/...   inputLayerNormScale, inputLayerNormOffset, transition1, transition2
   msap/blocks/<l>/opm/...             the query-biased outer product (normScale/Offset, q, k, qNormScale/Offset,
-                                      kNormScale/Offset, lambdaQ1/K1/Q2/K2, left, right, toPair, toPairBias)
+                                      kNormScale/Offset, lambdaQ1/K1/Q2/K2, left, right, kab (k | left | right), toPair,
+                                      toPairBias)
   msap/blocks/<l>/triangleMultiplicationOutgoing|Incoming/..., msap/blocks/<l>/pairTransition/...   (cuda/ef2's trunkBlock)
   msap/finalPwa/..., msap/finalMsaTransition/..., msap/lm/..., msap/cbContact/..., msap/confindContact/...
   meta: msaHeads 8, msaHeadWidth 32, depth 22, contactLayer 15, confindContactLayer 18, opmLambdaInit/<l>
@@ -58,6 +60,7 @@ def pwa(prefix, out):
     put(out + "normScale", t(prefix + "msa_to_values_and_gates.0.weight"))
     put(out + "normOffset", t(prefix + "msa_to_values_and_gates.0.bias"))
     put(out + "value", w[: HEADS * HW].T); put(out + "gate", w[HEADS * HW:].T)
+    put(out + "valueGate", w.T)                                  # (both in one GEMM: the f16 path's)
     put(out + "pairNormScale", t(prefix + "pairwise_repr_to_attn.0.weight"))
     put(out + "pairNormOffset", t(prefix + "pairwise_repr_to_attn.0.bias"))
     put(out + "pairLogits", lin(prefix + "pairwise_repr_to_attn.1.weight"))
@@ -89,6 +92,8 @@ for l in range(depth):
         put(O + f"opm/{nm}NormScale", t(q + f"{nm}_norm.weight")); put(O + f"opm/{nm}NormOffset", t(q + f"{nm}_norm.bias"))
     for nm in ("q1", "k1", "q2", "k2"): put(O + f"opm/lambda{nm.upper()}", t(q + f"lambda_{nm}"))
     put(O + "opm/left", lin(q + "to_left_hidden.weight")); put(O + "opm/right", lin(q + "to_right_hidden.weight"))
+    # k, left and right in one GEMM (the f16 path's): [464][256 + 16 + 16]
+    put(O + "opm/kab", np.concatenate([lin(q + "k_proj.weight"), lin(q + "to_left_hidden.weight"), lin(q + "to_right_hidden.weight")], 1))
     put(O + "opm/toPair", swap(lin(q + "to_pairwise_repr.weight"))); put(O + "opm/toPairBias", swap(t(q + "to_pairwise_repr.bias")))
     # lambda_init: CoreModule's 0.8 - 0.6 exp(-0.3 l), made a bfloat16 tensor there - so rounded as bfloat16 here
     meta[f"opmLambdaInit/{l}"] = float(torch.tensor(0.8 - 0.6 * math.exp(-0.3 * l), dtype=torch.bfloat16).float())

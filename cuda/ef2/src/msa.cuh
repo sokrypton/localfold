@@ -112,6 +112,14 @@ __global__ void pwaToHeadsK(const TI* v, TO* out, int S, int T, int heads, int d
   int e = (int)(t % d); size_t r = t / d; int s = (int)(r % S); r /= S; int j = (int)(r % T); int h = (int)(r / T);
   out[t] = v[((size_t)s * T + j) * heads * d + h * d + e];
 }
+// out[r][c] = o[r][c] sigmoid(gate[r][c]), the gate's rows ldg apart (msaPairWeightedAveragingFast: the per-head GEMM
+// writes o in the MSA's own layout)
+__global__ void pwaGateHK(const half* o, const half* gate, int ldg, half* out, size_t rows, int Wd) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * Wd) return;
+  size_t r = t / Wd; int c = (int)(t % Wd);
+  out[t] = __float2half(__half2float(o[t]) / (1.f + expf(-__half2float(gate[r * ldg + c]))));
+}
 // o [h][i][s][e] -> [s][i][h d + e], times sigmoid(gate)
 __device__ __forceinline__ float pwaF(float x) { return x; }
 __device__ __forceinline__ float pwaF(half x) { return __half2float(x); }
@@ -162,9 +170,13 @@ inline void msaPairWeightedAveraging(float* m, const float* pair, int S, int T, 
 // The same in f16 (MSA Pairformer's --fast; ESMFold2's encoder keeps the f32 form above): the LN'd rows, the values,
 // gates and weighted sums f16 into tensor-core GEMMs with f32 accumulation (cuBLASLt), the softmax f32 and its weights
 // rounded to f16 for the per-head GEMM, the output projection accumulated straight into the f32 rows
-__global__ void pwaWeightsHK(const float* w, half* wh, size_t n) {
+// [heads][T][T] f32 -> [heads][T][Tp] f16, the rows padded to a multiple of 8 with zeros: at an odd T (1,023) the
+// per-head GEMM's leading dimension took cuBLAS onto an unaligned sm_75 kernel, 571 of 1,175 ms (2,048 x 1,023)
+__global__ void pwaWeightsHK(const float* w, half* wh, int T, int Tp, size_t rowsN) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) wh[t] = __float2half(w[t]);
+  if (t >= rowsN * Tp) return;
+  size_t r = t / Tp; int j = (int)(t % Tp);
+  wh[t] = j < T ? __float2half(w[r * T + j]) : __float2half(0.f);
 }
 // pair16: the pair's buffer holds bf16 (MSA Pairformer's PAIR_BF16; 256 channels)
 inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn,
@@ -187,22 +199,29 @@ inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int
   }
   float* w = scratch<float>("msa.w", (size_t)heads * P);
   pwaSoftmaxK<<<(unsigned)(heads * T), 128, 0, STREAM>>>(flat, w, T, heads);
-  half* wh = scratch<half>("msah.w", (size_t)heads * P);
-  pwaWeightsHK<<<blocks((size_t)heads * P), 256, 0, STREAM>>>(w, wh, (size_t)heads * P);
+  const int Tp = (T + 7) / 8 * 8;
+  half* wh = scratch<half>("msah.w", (size_t)heads * T * Tp);
+  pwaWeightsHK<<<blocks((size_t)heads * T * Tp), 256, 0, STREAM>>>(w, wh, T, Tp, (size_t)heads * T);
   int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, ((size_t)128 << 20) / ((size_t)T * Wd * 2)));
-  half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd); half* vh = scratch<half>("msah.vh", (size_t)Sc * T * Wd);
-  half* oh = scratch<half>("msah.oh", (size_t)Sc * T * Wd); half* g = scratch<half>("msah.g", (size_t)Sc * T * Wd);
+  // the values and gates in one GEMM (valueGate: [Cm][2 Wd]), rows 2 Wd wide, then Tp - T zero rows (below)
+  const size_t pad = (size_t)(Tp - T) * 2 * Wd;
+  half* vg = scratch<half>("msah.vg", (size_t)Sc * T * 2 * Wd + pad);
+  half* oh = scratch<half>("msah.oh", (size_t)Sc * T * Wd); half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd);
   const float one = 1.f, zero = 0.f;
   for (int s0 = 0; s0 < S; s0 += Sc) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
     const half* lnc = ln + (size_t)s0 * T * Cm;
-    ltGemm(lnc, Fh(Bn + "value"), v, true, cr, Cm, Wd, nullptr, false, 0.f);
-    pwaToHeadsK<<<blocks(cr * Wd), 256, 0, STREAM>>>(v, vh, sc, T, heads, d);
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, T, T, &one, vh, CUDA_R_16F, sc * d, (long long)T * sc * d,
-                                  wh, CUDA_R_16F, T, (long long)P, &zero, oh, CUDA_R_16F, sc * d, (long long)T * sc * d, heads,
-                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    ltGemm(lnc, Fh(Bn + "gate"), g, true, cr, Cm, Wd, nullptr, false, 0.f);
-    pwaFromHeadsK<<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, g, v, sc, T, heads, d);
+    ltGemm(lnc, Fh(Bn + "valueGate"), vg, true, cr, Cm, 2 * Wd, nullptr, false, 0.f);
+    if (pad) CK(cudaMemsetAsync(vg + cr * 2 * Wd, 0, pad * 2, STREAM));
+    // per head, every sequence of the chunk: O[s][i][h d + e] = sum_j w_h[i][j] v[s][j][h d + e], in the MSA's own layout
+    // (no permute either way). Col-major per sequence: O^T (d x T, ld Wd) = V^T (d x Tp, ld 2 Wd) W_h^T (Tp x T, ld Tp) -
+    // the contraction over Tp, a multiple of 8 (at an odd T cuBLAS took an unaligned kernel): a column j >= T of V^T is
+    // the next sequence's row (finite, times the weights' zero columns) or the zero rows past the chunk
+    for (int h = 0; h < heads; ++h)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, T, Tp, &one, vg + h * d, CUDA_R_16F, 2 * Wd, (long long)T * 2 * Wd,
+                                    wh + (size_t)h * T * Tp, CUDA_R_16F, Tp, 0, &zero, oh + h * d, CUDA_R_16F, Wd, (long long)T * Wd,
+                                    sc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    pwaGateHK<<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, vg + Wd, 2 * Wd, v, cr, Wd);
     ltGemm(v, Fh(Bn + "output"), m + (size_t)s0 * T * Cm, false, cr, Wd, Cm, nullptr, false, 1.f);
   }
 }
