@@ -286,6 +286,14 @@ def polymer_chains(job_json):
     return out
 
 
+def protein_chain_count(job_json):
+    """How many of the job's chains are protein, one per copy."""
+    spec = json.loads(job_json)
+    spec = spec[0] if isinstance(spec, list) else spec
+    return sum((len(e["protein"]["id"]) if isinstance(e["protein"].get("id"), list) else 1)
+               for e in spec.get("sequences", []) if "protein" in e)
+
+
 def pdb_atoms(pdb):
     atoms = []
     for line in pdb.splitlines():
@@ -642,6 +650,18 @@ class Worker:
             server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
             at = time.time()
+            # ESMFold2 reads one alignment a protein chain and pairs none (cuda/ef2/README.md: the vendor's taxonomy
+            # pairing is not done) - so what it cannot read is said, not dropped
+            proteins = protein_chain_count(job["job"])
+            if "--search" in flags and proteins > 1:
+                raise Refused(f"ESMFold2's MMseqs2 search here takes one protein chain, and this job has {proteins} -"
+                              " upload an alignment a chain, or fold it single sequence")
+            if a3m is not None and proteins > 1:
+                raise Refused("ESMFold2 reads one alignment a protein chain, and this is one merged alignment over"
+                              f" {proteins} - upload an alignment a chain")
+            if any(f.startswith("--paired-a3m=") for f in flags):
+                flags = [f for f in flags if not f.startswith("--paired-a3m=")]
+                emit("status", f"{family}: the paired rows are not read (ESMFold2 stacks each chain's alignment unpaired)")
             if "--search" in flags:
                 # ESMFold2's featuriser searches nothing: the alignment comes from AlphaFold 3's, which writes the
                 # merged search beside its input (search.a3m), kept where the page's archive reads it

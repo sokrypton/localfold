@@ -595,6 +595,15 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
  * chains as the single-sequence tier does; ESMFold2 also reads an alignment, so it keeps the MSA row.
  */
 const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
+/**
+ * 🔴 THE SINGLE-SEQUENCE TIER IS A CAPABILITY, AND ONE OF ITS FAMILIES IS NOT IN THE REGISTRY. The released
+ * ESMFold2-Fast is the PLM row's "ESM-C 6B", so it is chosen exactly as EF2-fast's two are - and SINGLE_SEQUENCE_FAMILIES
+ * (the WebGPU registry's) does not list it: asked of that list, choosing it hid the PLM row it was chosen on, put the
+ * MSA row back, and sent AlphaFold 3's step count. `singleSequenceTier` is the question; `esmfold2Sampler` adds the
+ * full ESMFold2, which reads an alignment and samples as ESMFold2 does.
+ */
+const singleSequenceTier = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2-fast";
+const esmfold2Sampler = (family) => singleSequenceTier(family) || family === "ef2";
 const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 
 /**
@@ -815,7 +824,7 @@ const msaMode = () => {
   // family - "unknown model ef2-fast-600m: expected monomer, multimer, af3,
   // openbind0". The control was ignored everywhere except the one place it
   // could still throw.
-  if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
+  if (singleSequenceTier(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
   // 🔴 `job` IS AN ACTION AND NOT A MODE, SO IT NEVER REACHES A FOLD. Selecting
   // it opens a file picker; it answers here with the mode it replaced, because
@@ -1162,7 +1171,7 @@ function modelProgress(fraction, detail = "") {
  * because none of them has a language model to run.
  */
 function usesLanguageModel(family = chosenFamily()) {
-  if (!SINGLE_SEQUENCE_FAMILIES.includes(family)) return false;
+  if (!singleSequenceTier(family)) return false;
   return plmChoice() !== "none";
 }
 
@@ -2545,7 +2554,7 @@ function syncModelControls() {
   // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
   // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
   // removed, docs/AF3.md "Flow removed".)
-  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2";
+  const sampled = af3 || esmfold2Sampler(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
@@ -2553,7 +2562,7 @@ function syncModelControls() {
   // screen would run, take a minute of somebody else's server, and be
   // discarded - which is the "quietly ignored control" this function exists to
   // prevent, one step worse.
-  const singleSequence = SINGLE_SEQUENCE_FAMILIES.includes(family);
+  const singleSequence = singleSequenceTier(family);
   for (const id of ["msaModeGroup", "maxMsaGroup"]) {
     const node = document.getElementById(id);
     if (node !== null) node.hidden = singleSequence;
@@ -2615,7 +2624,7 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily()) || chosenFamily() === "ef2";
+  const ef2 = esmfold2Sampler(chosenFamily());
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
@@ -3903,7 +3912,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // ...and the steps this page would fold with (samplerPlan), because an
   // empty dial is the family's preferred count here and would be the model's own default there
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
-  if (SINGLE_SEQUENCE_FAMILIES.includes(family) || family === "ef2") {
+  if (esmfold2Sampler(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
   } else {

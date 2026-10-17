@@ -205,6 +205,14 @@ def cases(offline):
         out.append(("esmfold2 released 6mrr, single sequence", {"family": "ef2",
                     "controls": controls(**{"model-family": "ef2", "msa-mode": "none"}),
                     "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None))
+        # what ESMFold2 cannot read is refused by name: its search over a complex, and one merged alignment over two
+        # chains (it reads one alignment a protein chain)
+        out.append(("refused: ESMFold2's search over two protein chains", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2", "msa-mode": "search"}),
+                    "entities": [protein(S6), protein(S6)], "job": job([S6, S6])}, None, None, None, "takes one protein chain"))
+        out.append(("refused: ESMFold2 and one merged alignment over two chains", {"family": "ef2",
+                    "controls": controls(**{"model-family": "ef2", "msa-mode": "paste", "msa-text": f">101\n{S6}\n"}),
+                    "entities": [protein(S6), protein(S6)], "job": job([S6, S6])}, None, None, None, "one merged alignment"))
         if not offline:
             out.append(("esmfold2 released 5caj, MSA searched", {"family": "ef2",
                         "controls": controls(**{"model-family": "ef2", "msa-mode": "search"}),
@@ -288,17 +296,30 @@ def page_arm(bad):
         arms = [(lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), (lineage, 68, False)]
         if "ef2" in served:
             arms.insert(3, ("ef2", 68, True))
+        if "ef2-fast" in served:          # (chosen as a reader does: EF2-fast on the model row, ESM-C 6B on the PLM row)
+            arms.insert(3, ("ef2-fast", 68, True))
         for family, tokens, streamed in arms:
             cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.native-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
+            row, plm = ("ef2-fast-600m", "esmc-6b") if family == "ef2-fast" else (family, "esmc-600m")
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);
-              g('model-family').value = '{family}';
+              g('model-family').value = '{row}';
               g('model-family').dispatchEvent(new Event('change', {{ bubbles: true }}));
+              if (g('plm-mode')) {{ g('plm-mode').value = '{plm}'; g('plm-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
               window.__entityList.set([{{ type: 'protein', value: '{S6}', copies: 1, modifications: [] }}]);
               if (g('msa-mode')) {{ g('msa-mode').value = 'none'; g('msa-mode').dispatchEvent(new Event('change', {{ bubbles: true }})); }}
               return true;
             }})()""")
+            if family in ("ef2-fast", "ef2"):
+                # the rows a reader sees for it: ESMFold2's step dial, and the PLM row for the single-sequence tier where
+                # the full ESMFold2 keeps the MSA row
+                rows = cdp.evaluate(ws, """(() => { const h = (id) => document.getElementById(id)?.hidden;
+                  return { plm: h('plmGroup'), msa: h('msaModeGroup'), steps: h('af3CountGroup'),
+                           dial: document.getElementById('af3-count-label')?.textContent }; })()""")
+                want = {"plm": family == "ef2", "msa": family == "ef2-fast", "steps": False}
+                if any(rows[k] != v for k, v in want.items()):
+                    bad.append(f"page: {family}'s rows read {rows} - want hidden {want}")
             cdp.wait_for(ws, "!document.getElementById('predict').disabled", 60, "the fold button")
             started = time.time()
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")

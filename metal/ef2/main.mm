@@ -64,7 +64,10 @@ int foldInput(const Opts& o) {
   // the fit check (core.h foldFits): what is held now - the weights and the input - and the f32 pair times a factor
   // measured at 522 and 1044 residues (metal/README.md)
   const bool parcae = M.has("f/recycle/decay");      // (the released models: the language model's pair read every pass)
-  if (!foldFits("ef2", ef2Peak((double)allocated(), KEEP_TOWER ? 0. : (double)M.bundleWeightBytes("c"), (double)T * T * C * 4, parcae))) return 1;
+  // (held: the allocations and a resident tower's mapped codes, which are no allocation - 2.46 GB at 6B int3 - and
+  // which bundleWeightBytes counts, so the trunk's stage subtracts what was counted here)
+  if (!foldFits("ef2", ef2Peak((double)allocated() + (double)M.residentBytes(), KEEP_TOWER ? 0. : (double)M.bundleWeightBytes("c"),
+                               (double)T * T * C * 4, parcae))) return 1;
   // the language model
   float* lmZ = allocT<float>((size_t)T * T * C);
   double t0 = now();
@@ -73,7 +76,7 @@ int foldInput(const Opts& o) {
   mt::sync();
   if (o.profile) profileReport("language model");
   printf("language model %.1f ms\n", ms(t0));
-  releaseScratch({"esmc.", "shim."});
+  releaseScratch({"esmc.", "shim.", "tower."});      // (tower.: a resident tower's expanded matrices, ~140 MB at 6B)
   if (!KEEP_TOWER) M.unloadBundle("c");      // (read once: a process that folds once gives it back - 1.2 GB of ESM-C 600M)
   if (getenv("EF2_SAVE_LMZ")) {
     auto h = download(lmZ, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_LMZ"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
