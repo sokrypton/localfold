@@ -34,6 +34,7 @@
 const PIPELINES = new WeakMap();
 
 import { packedBits } from "../../shared/weights/dtype.js";
+import { numberToFloat16 } from "../../shared/weights/float16.js";
 
 /** One tensor's row in the parameter table, in bytes. */
 const PARAM_STRIDE = 256;
@@ -281,6 +282,11 @@ export function planBlockUpload(entries, destination = "f16", options = {}) {
       + " third; a delta wants planBlockUpload(entries, \"f16\", { accumulate: true })");
   }
   const accumulate = options.accumulate === true;
+  // `{ multiplier: m }`: every decoded value times m, exactly - a group's value is code * scale + zero, so m goes into the
+  // group's scale and zero (rounded once to half each), copied out of the store rather than written into it. ESM-C's
+  // residual scale, 1 / sqrt(layers / 36), folded into the two matrices a residual adds (webgpu/esmc/tower.js).
+  const multiplier = options.multiplier ?? 1;
+  if (!(multiplier > 0) || !Number.isFinite(multiplier)) throw new RangeError(`multiplier ${multiplier}`);
   const codeChunks = [];
   const scaleChunks = [];
   const zeroChunks = [];
@@ -384,8 +390,32 @@ export function planBlockUpload(entries, destination = "f16", options = {}) {
   }
   // The shader addresses codes by BIT in a u32; see value_at.
   if (codeBytes >= 2 ** 29) throw new RangeError(`${codeBytes} bytes of codes in one plan`);
+  if (multiplier !== 1) {
+    for (const chunks of [scaleChunks, zeroChunks]) {
+      for (let k = 0; k < chunks.length; k += 1) chunks[k] = scaledHalves(chunks[k], multiplier);
+    }
+  }
   return { gpu: { codeChunks, scaleChunks, zeroChunks, params, codec, destination,
                   codeBytes, halfBytes: halfCount * 2, accumulate }, host };
+}
+
+// a half's bits as a number (subnormals, infinities and NaN included)
+function halfValue(bits) {
+  const sign = bits & 0x8000 ? -1 : 1;
+  const exponent = (bits >>> 10) & 0x1f;
+  const mantissa = bits & 0x3ff;
+  if (exponent === 0) return sign * mantissa * 2 ** -24;
+  if (exponent === 0x1f) return mantissa === 0 ? sign * Infinity : NaN;
+  return sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
+}
+// a chunk of halves copied out and multiplied: { buffer, byteOffset: 0, byteLength, at } over the copy
+function scaledHalves(chunk, multiplier) {
+  const source = new DataView(chunk.buffer);       // (an ArrayBuffer, as runBlockUpload reads every chunk)
+  const out = new Uint16Array(Math.ceil(chunk.byteLength / 2));
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = numberToFloat16(halfValue(source.getUint16(chunk.byteOffset + 2 * i, true)) * multiplier);
+  }
+  return { ...chunk, buffer: out.buffer, byteOffset: 0 };
 }
 
 /**

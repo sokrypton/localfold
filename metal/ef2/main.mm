@@ -47,8 +47,19 @@ int foldInput(const Opts& o) {
   }
   if (M.meta("meta/msaBlocks", 0) > 0) die("this model's MSA encoder (the released ESMFold2) is not in the native port yet");
   int T = (int)M.meta("meta/tokens");
+  // the residual scale is the architecture's, sqrt(layers / 36) (esm's EsmcTransformerStack; biohub's 300M runs 0.912871):
+  // derived, not read - tools/export_esmc_model.py wrote 1.0 for every tower, and the 300M bundle the registry pins
+  // carries it (its language-model pair 8.1e-3 from biohub's with 1.0, 2.2e-3 derived: tools/esmc/probe-esmfold2-lm-pair.py)
+  const int layers = (int)M.meta("meta/layers");
+  const float residualScale = (float)std::sqrt(layers / 36.0);
+  if (std::fabs(M.meta("meta/residualScale", residualScale) - residualScale) > 1e-4) {
+    static bool said = false;
+    if (!said) fprintf(stderr, "ef2: the tower's manifest says residualScale %g; %d layers make it %.6f, which is used\n",
+                       M.meta("meta/residualScale"), layers, residualScale);
+    said = true;
+  }
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"), dimOf("c/blocks/0/fc2/weights", 0),
-         (int)M.meta("meta/layers"), (int)M.meta("meta/pairChannels"), (float)M.meta("meta/residualScale", 1.0)};
+         layers, (int)M.meta("meta/pairChannels"), residualScale};
   printf("ESMFold2: %d tokens, %d atoms, %d tower rows\n", T, (int)M.meta("meta/atoms"), e.rows);
   int C = e.pair;
   // the fit check (core.h foldFits): what is held now - the weights and the input - and the f32 pair times a factor

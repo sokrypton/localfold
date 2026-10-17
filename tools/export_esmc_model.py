@@ -109,7 +109,11 @@ class PublishedEsmc:
              'ffn.fc1_weight': ('mlp.gate_proj.weight', 'mlp.up_proj.weight')}
 
     def __init__(self, directory):
-        index = json.loads((directory / 'model.safetensors.index.json').read_text())['weight_map']
+        sharded = directory / 'model.safetensors.index.json'
+        if sharded.exists():
+            index = json.loads(sharded.read_text())['weight_map']
+        else:                                   # (one file: ESMC-300M-1500000's, for instance)
+            index = {k: 'model.safetensors' for k in SafeTensors(directory / 'model.safetensors').keys()}
         self.files = {f: SafeTensors(directory / f) for f in sorted(set(index.values()))}
         self.where = index
         self.layers = len({k.split('.')[2] for k in index if k.startswith('esmc.layers.')})
@@ -201,8 +205,9 @@ def main():
     for stale in out_dir.glob('*.f32.bin'):
         stale.unlink()
 
-    tower = (PublishedEsmc(tower_dir) if (tower_dir / 'model.safetensors.index.json').exists()
-             else SafeTensors(tower_dir / 'model.safetensors'))
+    published = ((tower_dir / 'model.safetensors.index.json').exists()
+                 or 'esmc.embed_tokens.weight' in SafeTensors(tower_dir / 'model.safetensors'))
+    tower = PublishedEsmc(tower_dir) if published else SafeTensors(tower_dir / 'model.safetensors')
     fold = SafeTensors(fold_dir / 'model.safetensors')
     writer = ShardWriter(out_dir)
 

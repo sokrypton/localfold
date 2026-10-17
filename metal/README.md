@@ -130,10 +130,16 @@ size. On an M2: the language model 1.5-2.7 s (6.2 B weights expanded a GEMM at a
 
 Open: ESMFold2 itself (the MSA encoder, `meta/msaBlocks`) still refuses by name; neither model is in the worker or on
 the page; a float32 folding bundle dies on loading here ("Insufficient Memory" at its first shard's decode, 0.3 s in,
-an int5 one of the same model loads - not chased); and `tools/export_esmc_model.py` had written residualScale 1.0 for
-every tower, where 300M's 30 layers make it 0.9129 - re-exported with it, 300M's folds move by 0.01 A on four crystals
-and 0.5-1.0 A on 5CAJ (which it fails either way at 7-8 A), so the shipped 300M bundle is likely off by that and
-unproven either way without biohub's forward to compare against.
+an int5 one of the same model loads - not chased).
+
+**The 300M tower's residual scale was wrong everywhere, and is derived now.** `tools/export_esmc_model.py` wrote
+residualScale 1.0 for every tower; ESM-C scales by sqrt(layers / 36), and biohub's own 300M runs 0.912871. Held against
+biohub's language-model pair (`tools/esmc/probe-esmfold2-lm-pair.py`, `esm` 3.4.1 in float32, 6MRR), the float32 300M
+tower reads 8.1e-3 with 1.0 and 2.2e-3 with 0.9129 on Metal (half GEMMs), and **7.97e-5** on WebGPU's float32 path.
+metal/ef2/main.mm and webgpu/esmc/tower.js derive it from the depth (1 at 600M, 1.4907 at 6B), so the published 300M
+bundle folds right unchanged; WebGPU folds the division into the device decode's group scales
+(planBlockUpload's `multiplier`), where a scale other than 1 used to send the tower to the host. The CUDA port still
+reads the manifest's 1.0 (cuda/ef2/src/ef2.cu:116).
 
 ## How fast
 
