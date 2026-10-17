@@ -326,15 +326,16 @@ inline bool checking = false;
 
 static const char* USAGE =
   "localfold-msap --a3m=<alignment> --out=<dir> [--fast] [--depth=512] [--chain-breaks=i,j] [--weights=<dir>]\n"
-  "               [--embeddings]\n"
+  "               [--embeddings | --contacts-only]\n"
   "  writes <dir>/cb_contacts.npy and confind_contacts.npy [L][L], logits.npy [L][26] (the query's 26 tokens,\n"
   "  ARNDCEQGHILKMFPSTWYVXBZUO-), subsample.a3m (the rows the model read), and with --embeddings query.npy [L][464]\n"
   "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer)\n"
   "  --chain-breaks: the residue each chain after the first starts at (a ColabFold '#' header gives them)\n"
+  "  --contacts-only: stop at the last contact head's layer (19 of 22) - no logits, no embeddings\n"
   "localfold-msap --oracle=<dump dir> [--check] [--repeat=N]    tools/oracle/dump_msap.py's subsample, its stages compared\n";
 
 int main(int argc, char** argv) {
-  std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false;
+  std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false, contactsOnly = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
@@ -343,11 +344,13 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--depth=", 8)) maxDepth = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--chain-breaks=", 15)) breaksArg = argv[i] + 15;
     else if (!strcmp(argv[i], "--embeddings")) embeddings = true;
+    else if (!strcmp(argv[i], "--contacts-only")) contactsOnly = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--check")) checking = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeats = atoi(argv[i] + 9);
     else { fprintf(stderr, "unknown flag %s\n%s", argv[i], USAGE); return 1; }
   }
+  if (contactsOnly && (embeddings || checking)) { fprintf(stderr, "--contacts-only writes neither embeddings nor every stage\n"); return 1; }
   if (a3m.empty() == oracle.empty() || (!a3m.empty() && out.empty()) || maxDepth < 1) { fputs(USAGE, stderr); return 1; }
   if (weights.empty()) {              // beside the binary, as cuda/<port>/weights
     char self[4096]; ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
@@ -398,7 +401,8 @@ int main(int argc, char** argv) {
   pairInitK<<<blocks(P * C), 256, 0, STREAM>>>(shiftedD, F("msap/relpos"), F("msap/bond"), z, L, C);
   CHECK("msa init", m, R * Cm, "o/msaInit");
   CHECK("pair init", z, P * C, "o/pairInit");
-  for (int l = 0; l < depth; ++l) {
+  const int layers = contactsOnly ? std::max(cbLayer, cfLayer) + 1 : depth;
+  for (int l = 0; l < layers; ++l) {
     const std::string B = "msap/blocks/" + std::to_string(l) + "/", Lo = "o/layer" + std::to_string(l) + "/";
     if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, B + "pwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, B + "pwa/");
     if (l == 0) CHECK("l0 after pwa", m, R * Cm, "o/layer0/afterPwa");
@@ -423,11 +427,13 @@ int main(int argc, char** argv) {
     if (l == cbLayer) { contacts(z, L, "msap/cbContact/", cb); CHECK("cb contacts", cb, P, "o/cbContacts"); }
     if (l == cfLayer) { contacts(z, L, "msap/confindContact/", cf); CHECK("confind contacts", cf, P, "o/confindContacts"); }
   }
-  if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, "msap/finalPwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
-  rowsTransition(m, R, Cm, "msap/finalMsaTransition/");
-  CHECK("final msa query", m, (size_t)L * Cm, "o/final/msaQuery");
-  lmHead(m, L, logits);
-  CHECK("logits", logits, (size_t)L * 26, "o/logits");
+  if (!contactsOnly) {
+    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, "msap/finalPwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
+    rowsTransition(m, R, Cm, "msap/finalMsaTransition/");
+    CHECK("final msa query", m, (size_t)L * Cm, "o/final/msaQuery");
+    lmHead(m, L, logits);
+    CHECK("logits", logits, (size_t)L * 26, "o/logits");
+  }
   CK(cudaStreamSynchronize(STREAM));
   printf("msap: %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   }
@@ -435,7 +441,7 @@ int main(int argc, char** argv) {
     mkdir(out.c_str(), 0755);
     writeNpy(out + "/cb_contacts.npy", download(cb, P), { (size_t)L, (size_t)L });
     writeNpy(out + "/confind_contacts.npy", download(cf, P), { (size_t)L, (size_t)L });
-    writeNpy(out + "/logits.npy", download(logits, (size_t)L * 26), { (size_t)L, 26 });
+    if (!contactsOnly) writeNpy(out + "/logits.npy", download(logits, (size_t)L * 26), { (size_t)L, 26 });
     if (embeddings) {
       writeNpy(out + "/query.npy", download(m, (size_t)L * Cm), { (size_t)L, (size_t)Cm });
       writeNpy(out + "/pair.npy", download(z, P * C), { (size_t)L, (size_t)L, (size_t)C });
