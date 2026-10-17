@@ -666,20 +666,20 @@ export function jobFromJson(text) {
     };
     bonds.push({ from: end(pair[0], "from"), to: end(pair[1], "to") });
   }
-  // 🔴 A POLYMER-TO-POLYMER BOND REACHES NO MODEL, AND SAYING SO IS THE POINT.
-  // AlphaFold 3 extracts token bonds only where one side is a LIGAND -
-  // `get_polymer_ligand_and_ligand_ligand_bonds` - so a disulfide between two
-  // cysteines is simply absent from `token_bonds` there too. Keeping it would
-  // be inventing a feature the reference does not have; dropping it silently
-  // would be the failure this file exists to avoid.
+  // 🔴 A POLYMER-TO-POLYMER BOND IS EACH MODEL'S OWN RULE, AND SAYING SO IS THE POINT. AlphaFold 3 extracts token
+  // bonds only where one side is a ligand (`get_polymer_ligand_and_ligand_ligand_bonds`), so a disulfide between two
+  // cysteines is absent from its `token_bonds`; Boltz-2 reads every declared bond, Protenix and OpenDDE those between
+  // residues not adjacent (af3-any-model 964990e). So every bond becomes a contact row, the featuriser applies the
+  // family's rule (`declaredPolymerBonds`), and the load says which models will not read a polymer-polymer one.
   const ligandAsyms = new Set([...asymOfId.entries()]
     .filter(([, asym]) => asym >= polymerChains).map(([, asym]) => asym));
-  const reaching = bonds.filter((bond) =>
-    ligandAsyms.has(bond.from.asym) || ligandAsyms.has(bond.to.asym));
-  if (reaching.length !== bonds.length) {
-    notes.push(`${bonds.length - reaching.length} of ${bonds.length} bonded pairs`
-      + " join two polymer residues, which AlphaFold 3 does not put in"
-      + " `token_bonds` either - they are not sent to the model");
+  const reaching = bonds;
+  const polymerPolymer = bonds.filter((bond) =>
+    !ligandAsyms.has(bond.from.asym) && !ligandAsyms.has(bond.to.asym)).length;
+  if (polymerPolymer > 0) {
+    notes.push(`${polymerPolymer} of ${bonds.length} bonded pairs join two polymer residues:`
+      + " Boltz-2 reads them, Protenix and OpenDDE where the residues are not adjacent,"
+      + " and the other models do not (as their own featurisers)");
   }
 
   const seeds = job.modelSeeds ?? [];

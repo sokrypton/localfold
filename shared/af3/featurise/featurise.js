@@ -788,17 +788,40 @@ export function featuriseProtein(sequence, options = {}) {
     if (slot < 0) throw new Error(`${where}: ${span.code} has no atom ${atom}`);
     return span.from + slot;
   };
+  // 🔴 WHICH DECLARED BONDS A MODEL READS IS EACH VENDOR'S OWN RULE (af3-any-model 964990e). AlphaFold 3 featurises a
+  // declared bond only where one side is a ligand: a bond between two polymer residues never reaches its token bonds -
+  // and this featuriser placed every bond it was handed, so a disulfide typed as a contact reached AlphaFold 3. The
+  // dialect's `declaredPolymerBonds` adds what the others read on top: "all" (Boltz-2: every bond between two tokens),
+  // "discontinuous" (Protenix, OpenDDE: polymer-polymer between residues more than one apart or in different chains,
+  // and a modified residue's bond to a ligand), "ligand" (RoseTTAFold3: the modified residue's bond to a ligand alone).
+  // AlphaFold 3's own go one way (the job's) and covalent; the added ones both ways and covalent, as af3-any-model's
+  // _add_token_bonds; a bond within one token is none.
+  const rule = options.declaredPolymerBonds ?? null;
+  const isLigandEnd = (end) => end.asym >= chainLengths.length;
+  const isModifiedEnd = (end) => {
+    let global = end.residue - 1;
+    for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
+    return modifiedSpans.some((one) => one.residue === global);
+  };
   const declaredBonds = [];
   for (const [index, bond] of (options.bonds ?? []).entries()) {
     const where = `bond ${index + 1}`;
+    // (resolved first, whichever way the rule goes: an endpoint this batch does not have is refused by name)
+    const from = tokenOfEndpoint(bond.from, `${where} from`), to = tokenOfEndpoint(bond.to, `${where} to`);
+    const fromLigand = isLigandEnd(bond.from), toLigand = isLigandEnd(bond.to);
+    let added;
+    if (fromLigand && toLigand) added = false;
+    // (a polymer residue's bond to a ligand is AlphaFold 3's own, a modified residue's too - its tokens are atoms, and
+    // AF3 3.1.16 featurises the kitchen sink's HY3 CA - HEM CHA one way; a family with a rule also adds it the other way)
+    else if (fromLigand || toLigand) added = rule !== null && isModifiedEnd(fromLigand ? bond.to : bond.from); else if (rule === "all") added = true;
+    else if (rule === "discontinuous"
+             && !(bond.from.asym === bond.to.asym && Math.abs(bond.from.residue - bond.to.residue) <= 1)) added = true;
+    else continue;
     // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
     // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
     // covalent inhibitor's alike - and boltz2's bond-type plane reads it
-    declaredBonds.push({
-      from: tokenOfEndpoint(bond.from, `${where} from`),
-      to: tokenOfEndpoint(bond.to, `${where} to`),
-      order: bond.order ?? 5,
-    });
+    if (added && from === to) continue;
+    declaredBonds.push({ from, to, order: added ? 5 : bond.order ?? 5, bothWays: added });
   }
 
   let bondMatrix;
@@ -826,7 +849,7 @@ export function featuriseProtein(sequence, options = {}) {
     for (const bond of declaredBonds) {
       bondMatrix[bond.from * tokens + bond.to] = 1;
       bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
-      if (options.symmetriseBonds) {
+      if (options.symmetriseBonds || bond.bothWays) {
         bondMatrix[bond.to * tokens + bond.from] = 1;
         bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
       }

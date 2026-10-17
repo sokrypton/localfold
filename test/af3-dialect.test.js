@@ -103,6 +103,8 @@ describe("the dialect table", () => {
       // `target_feat` against af3-any-model. See shared/af3/featurise/featurise.js.
       "centreRefConformers",
       "chainedAtomLayerNorm",
+      // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds ("discontinuous": af3-any-model 964990e)
+      "declaredPolymerBonds",
       "distogramBias",
       // 🔴 THE GAP RESTYPE IN ITS ONE EMPTY TEMPLATE SLOT, which is a VALUE
       // (21) and not a boolean. OpenDDE takes protenix's featuriser, so a query

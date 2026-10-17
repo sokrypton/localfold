@@ -70,6 +70,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       ? {} : { centreRefConformers: options.centreRefConformers }),
     ...(options.rawLastConformer === undefined
       ? {} : { rawLastConformer: options.rawLastConformer }),
+    ...(options.declaredPolymerBonds === undefined
+      ? {} : { declaredPolymerBonds: options.declaredPolymerBonds }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

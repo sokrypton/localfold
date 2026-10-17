@@ -95,7 +95,7 @@ const EXPECTED = {
     // (the SMILES ligand last, as the file lists it and AF3 orders it)
     loads: ["protein:10x1", "protein:7x1", "dna:7x1", "dna:7x1", "rna:4x1",
             "ligand:ATPx1", "ligand:HEMx2", "ligand:MGx2", "ligand:NAG,FUCx1", "ligand:NAx3", "smiles:1x1",
-            "contact:A1:CA - G1:CHAx1", "contact:K1:O6 - K2:C1x1"],
+            "contact:A1:CA - B1:CAx1", "contact:A1:CA - G1:CHAx1", "contact:K1:O6 - K2:C1x1"],
     seed: 10, alignedChains: 2,
   },
 };

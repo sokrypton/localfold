@@ -625,11 +625,14 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
   }
   std::set<int> ligandAsyms;
   for (auto& [k, v] : asymOfId) if (v >= polymerChains) ligandAsyms.insert(v);
-  std::vector<Pair> reaching;
-  for (auto& b : bonds) if (ligandAsyms.count(b.fromAsym) || ligandAsyms.count(b.toAsym)) reaching.push_back(b);
-  if (reaching.size() != bonds.size())
-    out.notes.push_back(std::to_string(bonds.size() - reaching.size()) + " of " + std::to_string(bonds.size())
-                        + " bonded pairs join two polymer residues, which AlphaFold 3 does not put in `token_bonds` either - they are not sent to the model");
+  // every bond a contact row: the featuriser applies the family's rule for a polymer-polymer one (web/job-json.js)
+  std::vector<Pair> reaching = bonds;
+  size_t polymerPolymer = 0;
+  for (auto& b : bonds) if (!ligandAsyms.count(b.fromAsym) && !ligandAsyms.count(b.toAsym)) ++polymerPolymer;
+  if (polymerPolymer > 0)
+    out.notes.push_back(std::to_string(polymerPolymer) + " of " + std::to_string(bonds.size())
+                        + " bonded pairs join two polymer residues: Boltz-2 reads them, Protenix and OpenDDE where the residues"
+                          " are not adjacent, and the other models do not (as their own featurisers)");
   if (const Json* seeds = job.get("modelSeeds"); seeds != nullptr) {
     std::vector<const Json*> list;
     if (seeds->isArray()) for (auto& s : seeds->a) list.push_back(&s);

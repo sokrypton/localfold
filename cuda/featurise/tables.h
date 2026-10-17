@@ -27,6 +27,7 @@ struct FamilyFlags {
   int emptyColumnsState;            // emptyTemplateRestypeColumns: 0 undefined, 1 null, 2 the list below
   std::vector<int> emptyColumns;
   bool rawLastConformer;            // boltz2: the last conformer group in its stored raw frame (boltz2Raw...)
+  int declaredPolymerBonds;         // 0 null, 1 "all", 2 "discontinuous", 3 "ligand"
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

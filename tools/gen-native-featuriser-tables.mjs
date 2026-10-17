@@ -69,7 +69,8 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${bool(d.templateVisibilityByCoverage)}, ${bool(d.chaiTemplates)}, ${bool(d.templateStackOuterResidual)},`
     + ` ${bool(d.chaiTokenEmbedding)}, ${bool(d.structuralTokens)}, ${bool(d.chiralCentres)},`
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
-    + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)}},`);
+    + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
+    + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");

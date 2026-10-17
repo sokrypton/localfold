@@ -60,6 +60,7 @@ export const ALPHAFOLD3 = Object.freeze({
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: false,
   rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -296,6 +297,7 @@ export const OPENBIND0 = Object.freeze({
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
   rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -434,6 +436,8 @@ export const OPENDDE = Object.freeze({
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
   rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS PROTENIX'S (a protenix fork): include_discont_poly_poly_bonds (af3-any-model 964990e)
+  declaredPolymerBonds: "discontinuous",
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -682,6 +686,9 @@ export const PROTENIX2 = Object.freeze({
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
   rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds: polymer-polymer between residues more than one
+  // apart or in different chains, and a modified residue's bond to a ligand (af3-any-model 964990e). featurise.js
+  declaredPolymerBonds: "discontinuous",
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -869,6 +876,9 @@ export const BOLTZ2 = Object.freeze({
   // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME: Boltz-2 centres `range(max(ref_space_uid))`, which skips
   // the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 -> 85)
   rawLastConformer: true,
+  // 🔴 EVERY DECLARED BOND BETWEEN TWO TOKENS, polymer-polymer included: Boltz-2's `bond` constraint is a token bond
+  // (af3-any-model 964990e; a disulfide to a D-Cys folded 21.7 A apart without it, native 2.4). featurise.js
+  declaredPolymerBonds: "all",
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -955,6 +965,7 @@ export const INTELLIFOLD2 = Object.freeze({
   targetFeatAtomOnly: false,
   centreRefConformers: false,
   rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1125,6 +1136,9 @@ export const ROSETTAFOLD3 = Object.freeze({
   // NOT in CENTRE_REF_CONFORMERS.
   centreRefConformers: false,
   rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS ATOMWORKS: a modified (atomised) residue's bond to a ligand kept, polymer-polymer dropped
+  // (af3-any-model 964990e). featurise.js
+  declaredPolymerBonds: "ligand",
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1228,6 +1242,7 @@ export const CHAI1 = Object.freeze({
   targetFeatAtomOnly: false,
   centreRefConformers: false,
   rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1361,6 +1376,7 @@ export function featuriserDialect(dialect) {
     symmetriseBonds: dialect.symmetriseBonds,
     centreRefConformers: dialect.centreRefConformers,
     rawLastConformer: dialect.rawLastConformer,
+    declaredPolymerBonds: dialect.declaredPolymerBonds,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,
     dropTerminalAtoms: dialect.dropTerminalAtoms,

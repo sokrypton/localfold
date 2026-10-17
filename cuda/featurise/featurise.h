@@ -38,6 +38,7 @@ struct FeaturiseOptions {
   std::vector<std::string> chainKinds;
   bool symmetriseBonds = false, centreRefConformers = false, paddedAtomKeys = false, qblockAtomKeys = false;
   bool rawLastConformer = false;
+  int declaredPolymerBonds = 0;                   // 0 AlphaFold 3's own alone, 1 "all", 2 "discontinuous", 3 "ligand"
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool atomizedElementNames = false, atomizedUnknownRestype = false, atomizedUnknownMsa = false;
@@ -382,11 +383,29 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     for (size_t k = 0; k < span->atoms.size(); ++k) if (e.hasAtom && span->atoms[k].name == e.atom) return span->from + (int)k;
     throw std::runtime_error(where + ": " + span->code + " has no atom " + (e.hasAtom ? e.atom : "undefined"));
   };
-  struct Resolved { int from, to, order; };
+  // each family's rule for the declared bonds (featurise.js, af3-any-model 964990e)
+  struct Resolved { int from, to, order; bool bothWays; };
   std::vector<Resolved> declared;
+  auto isLigandEnd = [&](const BondEnd& e) { return e.asym >= chainCount; };
+  auto isModifiedEnd = [&](const BondEnd& e) {
+    int global = e.residue - 1;
+    for (int before = 0; before < e.asym; ++before) global += (int)chains[before].size();
+    for (auto& s : b.modifiedSpans) if (s.residue == global) return true;
+    return false;
+  };
   for (size_t i = 0; i < o.bonds.size(); ++i) {
     std::string where = "bond " + std::to_string(i + 1);
-    declared.push_back({tokenOfEndpoint(o.bonds[i].from, where + " from"), tokenOfEndpoint(o.bonds[i].to, where + " to"), 5});
+    const BondEnd &f = o.bonds[i].from, &t = o.bonds[i].to;
+    const int from = tokenOfEndpoint(f, where + " from"), to = tokenOfEndpoint(t, where + " to");
+    const bool fl = isLigandEnd(f), tl = isLigandEnd(t);
+    bool added;
+    if (fl && tl) added = false;
+    else if (fl || tl) added = o.declaredPolymerBonds != 0 && isModifiedEnd(fl ? t : f);   // (AF3's own; a rule adds it both ways)
+    else if (o.declaredPolymerBonds == 1) added = true;
+    else if (o.declaredPolymerBonds == 2 && !(f.asym == t.asym && std::abs(f.residue - t.residue) <= 1)) added = true;
+    else continue;
+    if (added && from == to) continue;
+    declared.push_back({from, to, 5, added});
   }
   bool anyBond = !declared.empty();
   for (auto& g : bondedGroups) if (!g.bonds->empty()) anyBond = true;
@@ -405,7 +424,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       }
     for (auto& d : declared) {
       set(d.from, d.to, d.order);
-      if (o.symmetriseBonds) set(d.to, d.from, d.order);
+      if (o.symmetriseBonds || d.bothWays) set(d.to, d.from, d.order);
     }
     if (o.atomizedBackboneBonds) {
       for (auto& span : b.modifiedSpans) {
