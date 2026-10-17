@@ -17,11 +17,11 @@ template <int C, int NC = FT_NC>
 __host__ __device__ constexpr size_t ftStage() {   // W1 a and b chunks [C][NC] (stageSw), W2 chunk [NC][C] (w2Sw)
   return (size_t)2 * C * NC * 2 + (size_t)NC * C * 2;
 }
-// a W2 stage row is C = 128 halves unpadded, its sixteen 16-byte chunks XOR-swizzled by the row's low three
-// bits: ldmatrix.trans reads eight consecutive rows at one chunk
+// a W2 stage row is C halves unpadded (128 or 256: 16 or 32 16-byte chunks), the chunk index XOR-swizzled by
+// the row's low three bits: ldmatrix.trans reads eight consecutive rows at one chunk
 template <int C>
 __device__ __forceinline__ int w2Sw(int k, int c) {
-  static_assert(C == 128, "sixteen chunks a row");
+  static_assert(C == 128 || C == 256, "16 or 32 chunks a row");
   return k * C + (c ^ ((k & 7) << 3));
 }
 // W1 as fusedTransitionK streams it: NC-column tiles [C][NC] contiguous (tileColumns), a's then b's
@@ -186,6 +186,137 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
   }
 }
 
+// AlphaFold 2's transition at C 256 (its MSA, bf16 rows - the MSA16 stack's) in one kernel. fusedTransitionK holds a
+// warp's whole 16 x C output, which at C 256 is 128 accumulators a lane beside the 64 of its LayerNorm'd rows (255
+// registers). Here a PAIR of warps shares 16 rows and splits the output's columns: each computes half of a 32-column
+// chunk of the intermediate (ReLU'd, into shared memory), the pair meets at a named barrier, and each takes the whole
+// chunk against its half of W2 - 64 accumulators a lane. WM row tiles (2 * WM warps). The LayerNorm'd rows go to
+// registers once; their shared memory then holds the chunk's intermediate, and all of it the residual's staging.
+// On an RTX PRO 6000 (sm_120) at WM 4, 1,000 residues x 508 rows: 2.41 -> 2.00 ms a call against the LayerNorm and two
+// cuBLASLt GEMMs it replaces; on an A100 3.78 against 3.57, so it is sm_12x's (af2 evoformer.cuh)
+constexpr int FTS_NC = 32;
+template <int C, int WM>
+__host__ __device__ constexpr size_t ftSplitSmem() {
+  constexpr size_t xs = (size_t)16 * WM * (C + 8) * 2, hs = (size_t)2 * 16 * WM * (FTS_NC + 8) * 2;
+  return (xs > hs ? xs : hs) + 2 * (size_t)2 * C * FTS_NC * 2;
+}
+template <int C, int WM, class PT>
+__global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restrict__ x, const float* __restrict__ lnScale,
+    const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
+    const float* __restrict__ b1, const float* __restrict__ b2) {
+  constexpr int NC = FTS_NC, WARPS = 2 * WM, NTH = 32 * WARPS, R = 16 * WM, LDX = C + 8, KS = C / 16, NTO = C / 16, LDH = NC + 8;
+  constexpr size_t XS = (size_t)R * LDX * 2 > (size_t)2 * R * LDH * 2 ? (size_t)R * LDX * 2 : (size_t)2 * R * LDH * 2;
+  constexpr size_t STAGE = (size_t)2 * C * NC * 2;
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* Xs = (half*)smem;                                    // [R][LDX], then the intermediate [2][R][LDH]
+  unsigned char* stages = smem + XS;
+  auto W1s = [&](int s) { return (half*)(stages + s * STAGE); };
+  auto W2s = [&](int s) { return W1s(s) + C * NC; };
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, wm = warp >> 1, wn = warp & 1;
+  size_t row0 = (size_t)blockIdx.x * R;
+  int chunks = I / NC;
+  constexpr int IT1 = C * (NC / 8) / NTH, IT2 = NC * (C / 8) / NTH;
+  static_assert(C * (NC / 8) % NTH == 0 && NC * (C / 8) % NTH == 0, "whole stage loads");
+  auto issue = [&](int j, int st) {
+    half *a = W1s(st), *w2 = W2s(st);
+#pragma unroll
+    for (int it = 0; it < IT1; ++it) {
+      const int t = it * NTH + (int)threadIdx.x, k = t / (NC / 8), c = (t % (NC / 8)) * 8;
+      cpAsync16(a + stageSw<NC>(k, c), W1t + ((size_t)j * C + k) * NC + c, true);
+    }
+#pragma unroll
+    for (int it = 0; it < IT2; ++it) {
+      const int t = it * NTH + (int)threadIdx.x, k = t / (C / 8), c = (t % (C / 8)) * 8;
+      cpAsync16(w2 + w2Sw<C>(k, c), W2 + (size_t)(j * NC + k) * C + c, true);
+    }
+    cpCommit();
+  };
+  issue(0, 0);
+  lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                  lnScale, lnOffset, Xs, LDX, warp, lane);
+  __syncthreads();
+  uint32_t xa[KS][4];
+#pragma unroll
+  for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (wm * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+  float acc[NTO][4] = {};
+  for (int j = 0; j < chunks; ++j) {
+    int st = j & 1;
+    // chunk j's weights have landed, every warp has its rows (j 0) and is done with chunk j - 1's stage and the
+    // intermediate buffer the chunk after next writes
+    cpWait<0>();
+    __syncthreads();
+    if (j + 1 < chunks) issue(j + 1, st ^ 1);
+    const half *a = W1s(st), *w2 = W2s(st);
+    half* Hs = Xs + st * R * LDH;
+    float ha[2][4] = {};
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {           // this warp's 16 of the chunk's 32 columns
+      uint32_t fa[4];
+      ldsm4t(fa, a + stageSw<NC>(ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), wn * 16 + (lane >> 4) * 8));
+      mma16816(ha[0], xa[ks], fa[0], fa[1]); mma16816(ha[1], xa[ks], fa[2], fa[3]);
+    }
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      int c = wn * 16 + nt * 8 + tig * 2;
+      float bb0 = b1[j * NC + c], bb1 = b1[j * NC + c + 1];
+      *reinterpret_cast<half2*>(Hs + (wm * 16 + g) * LDH + c) = __floats2half2_rn(fmaxf(ha[nt][0] + bb0, 0.f), fmaxf(ha[nt][1] + bb1, 0.f));
+      *reinterpret_cast<half2*>(Hs + (wm * 16 + g + 8) * LDH + c) = __floats2half2_rn(fmaxf(ha[nt][2] + bb0, 0.f), fmaxf(ha[nt][3] + bb1, 0.f));
+    }
+    asm volatile("bar.sync %0, 64;" ::"r"(1 + wm) : "memory");     // the pair's two halves
+#pragma unroll
+    for (int t = 0; t < NC / 16; ++t) {
+      uint32_t pa[4];
+      ldsm4(pa, Hs + (wm * 16 + (lane & 15)) * LDH + t * 16 + (lane >> 4) * 8);
+#pragma unroll
+      for (int et = 0; et < NTO; et += 2) {
+        uint32_t vb[4];
+        ldsm4t(vb, w2 + w2Sw<C>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), wn * (C / 2) + (et + (lane >> 4)) * 8));
+        mma16816(acc[et], pa, vb[0], vb[1]); mma16816(acc[et + 1], pa, vb[2], vb[3]);
+      }
+    }
+  }
+  // the residual, 64 columns a pass through the shared memory (free once every warp is past its last chunk)
+  __syncthreads();
+  constexpr int LDY = 64 + 4;
+  float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
+  static_assert((size_t)WARPS * 16 * LDY * 4 <= XS + 2 * STAGE, "the staging fits");
+#pragma unroll
+  for (int q = 0; q < C / 128; ++q) {
+#pragma unroll
+    for (int e8 = 0; e8 < 8; ++e8) {
+      int c = e8 * 8 + tig * 2;
+      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[q * 8 + e8][0], acc[q * 8 + e8][1]);
+      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[q * 8 + e8][2], acc[q * 8 + e8][3]);
+    }
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = wn * (C / 2) + q * 64 + cl;
+      size_t row = row0 + wm * 16 + rl;
+      if (row >= rows) continue;
+      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+      float4 v = pairLd4<PT>(x, row * C + c);
+      v.x += a4.x + b2[c]; v.y += a4.y + b2[c + 1]; v.z += a4.z + b2[c + 2]; v.w += a4.w + b2[c + 3];
+      pairSt4<PT>(x, row * C + c, v);
+    }
+    __syncwarp();
+  }
+}
+// x += ReLU(LN(x) W1 + b1) W2 + b2 at C 256 on bf16 rows, the split form above at WM 4; false where the device cannot
+// hold its block (99 KB)
+inline bool fusedTransitionSplit256(float* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
+                                    const half* W2, const float* b1, const float* b2) {
+  constexpr int C = 256, WM = 4, R = 16 * WM;
+  constexpr size_t smem = ftSplitSmem<C, WM>();
+  if (I % FTS_NC || !fitsSmem(smem)) return false;
+  using PT = __nv_bfloat16;
+  const half* w1t = transitionW1Tiles<true>(W1, C, I, FTS_NC);
+  static bool attr = false;
+  if (!attr) { smemAttr((fusedTransitionSplitK<C, WM, PT>), (int)smem); attr = true; }
+  fusedTransitionSplitK<C, WM, PT><<<(unsigned)((rows + R - 1) / R), 64 * WM, smem, STREAM>>>(x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2);
+  return true;
+}
+
 // one launch of a given form (the bench's arms; fusedTransitionRaw picks the form)
 template <int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC>
 void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
@@ -216,6 +347,13 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   if (!fusedTransitionFits(rows, C, I)) return false;
   // two 16-row tiles a warp on 4 warps (128-row blocks, 68 KB): 1.14x the 8-warp one-tile form at 1,044
   // tokens (--bench-trans), bit-identical; where it does not fit (a T4) or the input is small, the one-tile forms
+  // AF2's (ReLU) on sm_12x: one tile a warp on SIXTEEN warps, 256 rows a block (94 KB), each weight stage spread over
+  // twice the rows - an RTX PRO 6000's 1,000-residue pair transition 1.20 -> 0.94 ms a call (--bench-pair: two tiles
+  // on 4 warps 1.19, one tile on 8 1.03), bit-identical. AF3's SwiGLU form there is unmeasured and keeps the rule below
+  if (RELU && ccMajor() == 12 && (rows + 255) / 256 >= MIN_BLOCKS && fitsSmem((size_t)256 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {
+    fusedTransitionAt<16, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    return true;
+  }
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {
     // one 16-row tile a warp (42 KB a 64-row block) where an SM holds three of those blocks: on an A100 1.6% of the
     // trunk at 261 tokens and ~0.4% at 1,000 over two tiles a warp (59 KB, 255 registers), bit-identical. A T4 holds one
