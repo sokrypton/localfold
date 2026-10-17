@@ -59,7 +59,27 @@ def atomised_job(text):
             if kind == "ligand" or (isinstance(body, dict) and body.get("modifications")):
                 return True
     return False
-WORK = os.environ.get("LOCALFOLD_WORK") or os.environ.get("LOCALFOLD_CUDA_WORK") or f"/tmp/localfold-{NATIVE}"
+# 🔴 ONE WORKER'S OWN: two workers on one machine - a reader's `localfold serve` and a gate's, or a gate's own two - shared
+# /tmp/localfold-<port>, and each job's rmtree(WORK) and each new server's rmtree of its serving directory deleted the
+# other's input and frames directory under it: the other's ESMFold2 server then fopen'd a contact map into a directory
+# that was gone and died in fwrite on a null FILE (a crash report, 2026-10-17; "the ef2 server exited" with nothing in
+# its log). So the default carries the process id, and a worker starting clears the ones whose process is gone.
+WORK = (os.environ.get("LOCALFOLD_WORK") or os.environ.get("LOCALFOLD_CUDA_WORK")
+        or f"/tmp/localfold-{NATIVE}-{os.getpid()}")
+
+
+def clear_stale_work():
+    import glob
+    for path in glob.glob(f"/tmp/localfold-{NATIVE}-[0-9]*"):
+        pid = path[len(f"/tmp/localfold-{NATIVE}-"):].split("-")[0]
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            os.kill(int(pid), 0)               # (alive: someone else's, left alone)
+        except ProcessLookupError:
+            shutil.rmtree(path, ignore_errors=True)
+        except PermissionError:
+            pass
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
 FEATURISE = os.environ.get("LOCALFOLD_FEATURISE_DIR") or os.path.join(CUDA, "featurise")
 OUT = sys.stdout
@@ -759,6 +779,9 @@ class Worker:
 
 
 def main():
+    clear_stale_work()
+    import atexit                                  # (this worker's own directories, as it leaves)
+    atexit.register(lambda: [shutil.rmtree(p, ignore_errors=True) for p in (WORK, WORK + "-serve")])
     emit("ready", {"at": int(time.time() * 1000), "native": NATIVE})
     worker = Worker()
     for line in sys.stdin:

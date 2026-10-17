@@ -126,7 +126,9 @@ int foldInput(const Opts& o) {
     std::vector<unsigned char> bytes(contacts.size());
     for (size_t k = 0; k < contacts.size(); ++k) bytes[k] = (unsigned char)std::min(255.f, std::max(0.f, std::round(contacts[k] * 255.f)));
     std::string path = o.frames + "/contacts-00-of-01.u8";
-    FILE* f = fopen((path + ".tmp").c_str(), "wb"); fwrite(bytes.data(), 1, bytes.size(), f); fclose(f);
+    FILE* f = fopen((path + ".tmp").c_str(), "wb");      // (its directory is the worker's: gone, it is said, not a crash)
+    if (!f) fprintf(stderr, "ef2: cannot write %s - its directory is gone\n", path.c_str());
+    else { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
     rename((path + ".tmp").c_str(), path.c_str());
   }
   t0 = now();

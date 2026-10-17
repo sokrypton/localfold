@@ -564,8 +564,18 @@ void* mapFile(const std::string& path, size_t* bytes) {
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) die("cannot read %s", path.c_str());
   struct stat st; fstat(fd, &st);
+  // (2 bytes past the end readable: an af3-any-model blob's unaligned reads.) 🔴 A FILE WHOSE SIZE IS A WHOLE NUMBER OF
+  // PAGES then needs a page PAST its end, which a file mapping cannot back - the GPU refused the whole buffer with
+  // "Insufficient Memory" on its first command (a 49,364,992-byte shard, 3,013 pages exactly: every float32 folding
+  // bundle of the released ESMFold2 died loading). So the span is anonymous zeroed memory with the file mapped over
+  // its front: the tail page is ordinary memory, and nothing changes for a file that ends mid-page.
   size_t page = (size_t)getpagesize(), n = ((size_t)st.st_size + 2 + page - 1) / page * page;
-  void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  size_t filePages = ((size_t)st.st_size + page - 1) / page * page;
+  void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (p != MAP_FAILED && filePages > 0 &&
+      mmap(p, filePages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
+    munmap(p, n); p = MAP_FAILED;
+  }
   close(fd);
   if (p == MAP_FAILED) die("cannot map %s", path.c_str());
   std::lock_guard<std::recursive_mutex> l(d.mu);

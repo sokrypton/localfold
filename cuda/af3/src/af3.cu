@@ -532,7 +532,7 @@ static int foldMain(int argc, char** argv) {
     }
     if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
-      frames.start(framesDir, mask.size() * 3, steps);
+      frames.start(framesDir, mask.size() * 3, steps, structural ? M.i("structural.residueAtomGather") : nullptr);
     }
     std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);

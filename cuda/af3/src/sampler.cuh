@@ -356,10 +356,14 @@ struct FrameStreamer {
   static constexpr int MAX = 25;
   std::string dir; size_t n3 = 0; int stride = 1, steps = 0, written = 0;
   std::vector<std::string> lines; std::vector<size_t> slots;     // the input's template.pdb, read once
+  // OpenDDE: a residue slot's structural atom (residueAtomGather, host; -1 none) - its sampler walks the structural atoms
+  // and its PDB gathers the residues' from them, so each frame must too, or every frame is scrambled (metal/af3's 4d26277)
+  const int* gather = nullptr;
   std::vector<double> reference; double refCentre[3] = {};
   static bool isAtom(const std::string& l) { return l.size() >= 66 && (!l.compare(0, 4, "ATOM") || !l.compare(0, 6, "HETATM")); }
   static int planned(int steps) { return std::min(steps, MAX) + 1; }
-  bool start(const std::string& d, size_t atoms3, int totalSteps) {
+  bool start(const std::string& d, size_t atoms3, int totalSteps, const int* residueAtomGather = nullptr) {
+    gather = residueAtomGather;
     std::ifstream tf(DATA_DIR + "/template.pdb");
     if (!tf) { fprintf(stderr, "frames: no %s/template.pdb, none written\n", DATA_DIR.c_str()); return false; }
     for (std::string l; std::getline(tf, l);) {
@@ -379,8 +383,10 @@ struct FrameStreamer {
   void write(const float* x, int step) {
     std::vector<double> pts(slots.size() * 3);
     double c[3] = {};
-    for (size_t a = 0; a < slots.size(); ++a)
-      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = x[slots[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
+    for (size_t a = 0; a < slots.size(); ++a) {
+      const long at = gather ? gather[slots[a]] : (long)slots[a];
+      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = at < 0 ? 0 : x[(size_t)at * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
+    }
     for (size_t a = 0; a < slots.size(); ++a) for (int d = 0; d < 3; ++d) pts[a * 3 + d] -= c[d];
     if (reference.empty()) { reference = pts; for (int d = 0; d < 3; ++d) refCentre[d] = c[d]; }
     double R[9]; bestRotation(pts, reference, R);
