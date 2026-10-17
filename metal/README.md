@@ -141,7 +141,7 @@ tokens through lin's half rounding). 6MRR from its sequence: 1.563 A, pLDDT 71.4
 **On the page, through `localfold serve`.** The server's `/health` lists the native-only models whose exports are on
 disk (`models`: `ef2-fast`, `ef2`), and the page shows their options only then. ESMFold2 is one entry on the model row
 and the variant row picks the checkpoint: Fast on ESM-C 600M or 300M (the page's own, WebGPU), Fast on ESM-C 6B and
-Full on ESM-C 6B (local). Every variant folds from its language model, and an alignment is an opt-in: the 600M and
+Full on ESM-C 6B (native only: shown when the server has them). Every variant folds from its language model, and an alignment is an opt-in: the 600M and
 300M checkpoints read none and have no MSA row; for the 6B two the row starts at "ESM-C only" and offers a search or an
 upload (the worker runs the search through AlphaFold 3's featuriser). The released Fast reads an alignment only as two
 profile features, and on the 59-residue gate protein its 8,076 rows move pLDDT 83.18 -> 83.12; Full's encoder takes the
