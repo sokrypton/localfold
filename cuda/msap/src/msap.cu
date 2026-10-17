@@ -26,6 +26,15 @@
 #include "select.cuh"
 #include "swiglu.cuh"
 
+// a weight [C][2I] re-laid for swiglu.cuh's kernels (64-column blocks of the gate, each followed by the value's), once
+inline const half* swigluWeight(const std::string& name, int C, int I) {
+  static std::map<std::string, half*> made;
+  auto it = made.find(name);
+  if (it != made.end()) return it->second;
+  half* w = dallocT<half>((size_t)C * 2 * I);
+  swigluInterleaveK<<<blocks((size_t)C * 2 * I), 256, 0, STREAM>>>(Fh(name), w, C, I);
+  return made[name] = w;
+}
 // m[s][l][:] = W[token][:]: the one-hot's projection is a row gather
 __global__ void msaEmbedK(const int* tok, const float* W, float* m, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -251,6 +260,141 @@ __global__ void opmScaleRowsHK(const half* kab, int ld, int off, const float* w,
   size_t r = t / 16; int c = (int)(t % 16); int s = (int)(r / L);
   out[t] = __float2half(__half2float(kab[r * ld + off + c]) * sqrtf(w[s] + 1e-32f));
 }
+// The outer product's projection in one kernel (--fast): for a block of rows i,
+//   pair[i][j][c] += SwiGLU(prod_ij W / (sum w + eps) + bias)[c]
+// where prod_ij [(c', e)] is the contraction's product read where it lies - [(i, c')][(j, e)], so a row block's 128 j by
+// 16 e of one c' is a contiguous 4 KB - and W the projection re-laid as swiglu.cuh's (64-column blocks of the gate, each
+// followed by the value's). It replaces a permute pass writing the outer product, the 512-wide projection's output
+// and a gate pass reading it back. A block: 128 j of one i by 64 output channels; 4 warps of 64 x (32 + 32); K 256 in
+// steps of 32 through 5 swizzled cp.async stages (swiglu.cuh's tiles); the sum through shared memory, then each row's
+// 64 channels added to the pair in 16-byte pieces
+template <class PT>
+__global__ void __launch_bounds__(SG_NTH, 2) opmProjectK(const half* __restrict__ prod, int ib, int L, const half* __restrict__ Wi,
+                                                         const float* __restrict__ bias, const float* __restrict__ denom,
+                                                         PT* __restrict__ pair, int i0) {
+  constexpr int K = 256, I = 256;                    // (the outer product's 16 x 16, the pair's channels)
+  extern __shared__ __align__(16) unsigned char smem[];
+  auto As = [&](int st) { return (half*)(smem + st * SG_STAGE); };
+  auto Bs = [&](int st) { return As(st) + SG_BM * SG_KT; };
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, wm = warp & 1, wn = warp >> 1;
+  const int n0 = blockIdx.x * SG_BN, j0 = blockIdx.y * SG_BM, il = blockIdx.z;   // il: the row i - i0 in this block of rows
+  const size_t LC = (size_t)L * 16;
+  // A [128 j][32 k]: k = (c' - c0) 16 + e over two c', a chunk 8 e of one (j, c'); B as swiglu.cuh's
+  constexpr int AIT = SG_BM * SG_ACH / SG_NTH, BIT = SG_KT * SG_BCH / SG_NTH;
+  int aDst[AIT], aOff[AIT], bDst[BIT], bOff[BIT]; bool aOk[AIT];
+#pragma unroll
+  for (int it = 0; it < AIT; ++it) {
+    const int q = it * SG_NTH + threadIdx.x, r = q / SG_ACH, c = (q % SG_ACH) * 8;
+    aDst[it] = sgA(r, c); aOk[it] = j0 + r < L;
+    aOff[it] = (c >> 4) * (int)LC + (aOk[it] ? j0 + r : 0) * 16 + (c & 15);     // (+ c0 LC a tile)
+  }
+#pragma unroll
+  for (int it = 0; it < BIT; ++it) {
+    const int q = it * SG_NTH + threadIdx.x, r = q / SG_BCH, c = (q % SG_BCH) * 8;
+    bDst[it] = sgB(r, c); bOff[it] = r * 2 * I + c;
+  }
+  const half* A0 = prod + (size_t)il * 16 * LC;
+  const half* B0 = Wi + (size_t)2 * n0;
+  auto issue = [&](int t, int st) {
+    half *a = As(st), *b = Bs(st);
+    const half* at = A0 + (size_t)(t * 2) * LC;             // (k0 = 32 t: c' = 2 t, 2 t + 1)
+#pragma unroll
+    for (int it = 0; it < AIT; ++it) cpAsync16(a + aDst[it], aOk[it] ? at + aOff[it] : prod, aOk[it]);
+    const half* bt = B0 + (size_t)t * SG_KT * 2 * I;
+#pragma unroll
+    for (int it = 0; it < BIT; ++it) cpAsync16(b + bDst[it], bt + bOff[it], true);
+    cpCommit();
+  };
+  float acc[4][4][2][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int v = 0; v < 2; ++v)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[i][j][v][e] = 0.f;
+  constexpr int tiles = K / SG_KT;
+#pragma unroll
+  for (int t = 0; t < SG_STAGES - 1; ++t) issue(t, t);
+  int aFr[2][4], bFr[2][2][2];
+#pragma unroll
+  for (int ks = 0; ks < 2; ++ks) {
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) aFr[ks][mt] = sgA(wm * 64 + mt * 16 + (lane & 15), ks * 16 + (lane >> 4) * 8);
+    const int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+#pragma unroll
+    for (int v = 0; v < 2; ++v)
+#pragma unroll
+      for (int n2 = 0; n2 < 2; ++n2) bFr[ks][v][n2] = SG_BM * SG_KT + sgB(k, v * SG_BN + wn * 32 + n2 * 16 + (lane >> 4) * 8);
+  }
+  uint32_t fa[2][4][4], fb[2][2][2][4];
+  auto load = [&](const half* stage, int ks, int buf) {
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) ldsm4(fa[buf][mt], stage + aFr[ks][mt]);
+#pragma unroll
+    for (int v = 0; v < 2; ++v)
+#pragma unroll
+      for (int n2 = 0; n2 < 2; ++n2) ldsm4t(fb[buf][v][n2], stage + bFr[ks][v][n2]);
+  };
+#pragma unroll 1
+  for (int t = 0; t < tiles; ++t) {
+    cpWait<SG_STAGES - 2>();
+    __syncthreads();
+    if (t + SG_STAGES - 1 < tiles) issue(t + SG_STAGES - 1, (t + SG_STAGES - 1) % SG_STAGES); else cpCommit();
+    const half* stage = As(t % SG_STAGES);
+    load(stage, 0, 0);
+#pragma unroll
+    for (int ks = 0; ks < SG_KT / 16; ++ks) {
+      const int cur = ks & 1;
+      if (ks + 1 < SG_KT / 16) load(stage, ks + 1, cur ^ 1);
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int v = 0; v < 2; ++v)
+#pragma unroll
+          for (int n2 = 0; n2 < 2; ++n2) {
+            mma16816(acc[mt][2 * n2][v], fa[cur][mt], fb[cur][v][n2][0], fb[cur][v][n2][1]);
+            mma16816(acc[mt][2 * n2 + 1][v], fa[cur][mt], fb[cur][v][n2][2], fb[cur][v][n2][3]);
+          }
+    }
+  }
+  cpWait<0>();
+  __syncthreads();
+  constexpr int LDO = SG_BN + 4;                      // (f32: the update before it meets the pair's precision)
+  float* out = (float*)smem;
+  const float inv = 1.f / (*denom + 1e-32f);
+  const int g = lane >> 2, tig = lane & 3;
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int r = wm * 64 + mt * 16 + g, c = wn * 32 + nt * 8 + tig * 2;
+      const float bg0 = bias[n0 + c], bg1 = bias[n0 + c + 1], bv0 = bias[I + n0 + c], bv1 = bias[I + n0 + c + 1];
+      auto gate = [&](int e, float bg, float bv) {
+        float x = acc[mt][nt][0][e] * inv + bg; return x * sigmH(x) * (acc[mt][nt][1][e] * inv + bv);
+      };
+      out[r * LDO + c] = gate(0, bg0, bv0); out[r * LDO + c + 1] = gate(1, bg1, bv1);
+      out[(r + 8) * LDO + c] = gate(2, bg0, bv0); out[(r + 8) * LDO + c + 1] = gate(3, bg1, bv1);
+    }
+  __syncthreads();
+  // each row's 64 channels added into the pair, 4 at a time
+  for (int q = threadIdx.x; q < SG_BM * SG_BN / 4; q += SG_NTH) {
+    const int r = q / (SG_BN / 4), c = (q % (SG_BN / 4)) * 4;
+    if (j0 + r >= L) continue;
+    PT* p = pair + ((size_t)(i0 + il) * L + j0 + r) * I + n0 + c;
+    const float4 u = *reinterpret_cast<const float4*>(out + r * LDO + c);
+    if constexpr (std::is_same_v<PT, float>) {
+      float4 v = *reinterpret_cast<float4*>(p); v.x += u.x; v.y += u.y; v.z += u.z; v.w += u.w; *reinterpret_cast<float4*>(p) = v;
+    } else {
+      uint2 raw = *reinterpret_cast<uint2*>(p);
+      __nv_bfloat162 *lo = reinterpret_cast<__nv_bfloat162*>(&raw.x), *hi = reinterpret_cast<__nv_bfloat162*>(&raw.y);
+      float2 a = __bfloat1622float2(*lo), b = __bfloat1622float2(*hi);
+      *lo = __floats2bfloat162_rn(a.x + u.x, a.y + u.y); *hi = __floats2bfloat162_rn(b.x + u.z, b.y + u.w);
+      *reinterpret_cast<uint2*>(p) = raw;
+    }
+  }
+}
 // one layer's query-biased outer product under --fast: pair += SwiGLU(Linear(outer(a sqrt w, b sqrt w) / sum w))
 inline void qOpmFast(float* pair, const float* m, int S, int L, int l, float* w) {
   const std::string O = "msap/blocks/" + std::to_string(l) + "/opm/";
@@ -272,27 +416,22 @@ inline void qOpmFast(float* pair, const float* m, int S, int L, int l, float* w)
   half* as = scratch<half>("opm.ash", R * 16); half* bs = scratch<half>("opm.bsh", R * 16);
   opmScaleRowsHK<<<blocks(R * 16), 256, 0, STREAM>>>(kab, KAB, 256, w, as, S, L);
   opmScaleRowsHK<<<blocks(R * 16), 256, 0, STREAM>>>(kab, KAB, 272, w, bs, S, L);
-  // a block of Ib rows i at a time - the product [Ib 16][L 16] and the permuted outer product [Ib L][256], the same
-  // count each, held to 64 M halves: whole, they were 9.6 GB of 38 at 3,069 residues
+  // a block of Ib rows i at a time, its product [Ib 16][L 16] held to 64 M halves; the projection reads it in place
   const int Ib = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 256)));
   half* prod = scratch<half>("opm.prodh", (size_t)Ib * 16 * LC);
-  half* outer = scratch<half>("opm.outerh", (size_t)Ib * L * 256);
-  const size_t chunk = std::min<size_t>((size_t)Ib * L, (size_t)64 << 20 >> 9);    // (the projection's rows: 64 M halves)
-  half* h = scratch<half>("opm.hh", chunk * 512);
+  const half* Wi = swigluWeight(O + "toPair", 256, 256);
+  static bool attr = false;
+  if (!attr) { smemAttr(opmProjectK<float>, (int)SG_SMEM); smemAttr(opmProjectK<__nv_bfloat16>, (int)SG_SMEM); attr = true; }
   for (int i0 = 0; i0 < L; i0 += Ib) {
-    const int ib = std::min(Ib, L - i0); const size_t rows = (size_t)ib * L;
+    const int ib = std::min(Ib, L - i0);
     // prod (col-major [(i, c)][(j, e)] = row-major [(i, c)][(j, e)]) = sum_s b[s][(j, e)] a[s][(i, c)]: both operands as
     // the rows [s][(l, c)] lie, a transposed
     CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, (int)LC, ib * 16, S, &one, bs, CUDA_R_16F, (int)LC, as + (size_t)i0 * 16,
                     CUDA_R_16F, (int)LC, &zero, prod, CUDA_R_16F, (int)LC, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    opmPermuteHK<<<blocks(rows * 16), 256, 0, STREAM>>>(prod, outer, ib, L, wsum);
-    for (size_t r0 = 0; r0 < rows; r0 += chunk) {
-      size_t r = std::min(chunk, rows - r0);
-      ltGemm(outer + r0 * 256, Fh(O + "toPair"), h, true, r, 256, 512, F(O + "toPairBias"), false, 0.f);
-      const size_t at = ((size_t)i0 * L + r0) * 256;
-      if (PAIR_BF16) opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, reinterpret_cast<__nv_bfloat16*>(pair) + at, r);
-      else opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + at, r);
-    }
+    const dim3 grid(256 / SG_BN, (L + SG_BM - 1) / SG_BM, ib);
+    if (PAIR_BF16) opmProjectK<<<grid, SG_NTH, SG_SMEM, STREAM>>>(prod, ib, L, Wi, F(O + "toPairBias"), wsum,
+                                                                    reinterpret_cast<__nv_bfloat16*>(pair), i0);
+    else opmProjectK<<<grid, SG_NTH, SG_SMEM, STREAM>>>(prod, ib, L, Wi, F(O + "toPairBias"), wsum, pair, i0);
   }
 }
 inline void qOpm(float* pair, const float* m, int S, int L, int l, float* w) {
@@ -405,14 +544,6 @@ inline std::vector<int> greedyRows(const std::vector<std::string>& rows, const s
 // LN -> the up-projection and SwiGLU in one kernel (swiglu.cuh: the [rows][2I] widening never reaches memory) -> the
 // down-projection accumulated into the f32 rows by cuBLASLt.
 // The fused kernel against cuBLASLt's GEMM and the SwiGLU pass, 133,632 rows (5CAJ at 512): 2.61 ms against 3.61
-inline const half* swigluWeight(const std::string& name, int C, int I) {      // W1 re-laid for swigluUpK, once a tensor
-  static std::map<std::string, half*> made;
-  auto it = made.find(name);
-  if (it != made.end()) return it->second;
-  half* w = dallocT<half>((size_t)C * 2 * I);
-  swigluInterleaveK<<<blocks((size_t)C * 2 * I), 256, 0, STREAM>>>(Fh(name), w, C, I);
-  return made[name] = w;
-}
 inline void msaTransitionFast(float* x, size_t P, int C, const std::string& Tn) {
   const int I = (int)dimOf("f/" + Tn + "transition2", 0);
   if (I % SG_BN || C % 8) { fprintf(stderr, "the fused SwiGLU wants I a multiple of %d and C of 8 (%d, %d)\n", SG_BN, I, C); exit(1); }
