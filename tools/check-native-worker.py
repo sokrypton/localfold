@@ -341,10 +341,23 @@ def page_arm(bad):
                                         const fs = v?.objectsData?.[v?.currentObjectName]?.frames ?? [];
                                         return { contact: fs.filter((f) => f.maps?.contact).length,
                                                  pae: fs.filter((f) => f.pae).length }; })(),
-                       gpu: window.__readerGpu };
+                       gpu: window.__readerGpu,
+                       // the last frame against the one before it, as drawn (raw: no fitting) - the result lands where
+                       // the frames are, or the picture jumps (web/pdb-superpose.js)
+                       jump: (() => { const v = Object.values(window.py2dmol_viewers ?? {})[0]?.renderer;
+                                      const fs = v?.objectsData?.[v?.currentObjectName]?.frames ?? [];
+                                      if (fs.length < 2) return null;
+                                      const a = fs[fs.length - 2].coords, b = fs[fs.length - 1].coords;
+                                      if (!a || !b || a.length !== b.length) return 'no coords';
+                                      let s = 0; for (let i = 0; i < a.length; i += 1)
+                                        s += (a[i][0] - b[i][0]) ** 2 + (a[i][1] - b[i][1]) ** 2 + (a[i][2] - b[i][2]) ** 2;
+                                      return Math.sqrt(s / a.length); })() };
             })()""")
-            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
+            jump = f"{got['jump']:.2f} A" if isinstance(got["jump"], (int, float)) else str(got["jump"])
+            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  last step {jump:>7s}  {got['status'][:60]}")
             problems = []
+            if got["jump"] is not None and (not isinstance(got["jump"], (int, float)) or got["jump"] > 2.0):
+                problems.append(f"the result's frame lands {got['jump']} A from the last streamed one, as drawn")
             if f" on {NATIVE_NAME} " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
             if not (got["model"] or "").endswith(f"({NATIVE_NAME})"):

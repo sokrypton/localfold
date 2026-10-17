@@ -58,6 +58,7 @@ import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } fr
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
+import { superposePdbOnto } from "./pdb-superpose.js";
 import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
   paeMatrix, predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
@@ -4122,7 +4123,12 @@ async function followRemoteFold({ since, label, signal }) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
     carry(first, liveFrames[0]);
-    for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
+    // 🔴 THE RESULT DRAWN WHERE THE FRAMES ARE. The native ports superpose each streamed frame onto the first and
+    // return the structure in the model's own frame - the same atoms as the last frame once fitted, 4-60 A away as
+    // drawn - so the trajectory jumped on its last frame. The final frame is the result moved onto the last streamed
+    // one (web/pdb-superpose.js); the downloads keep the result as the model wrote it.
+    const settled = superposePdbOnto(result.pdb, framePdbs[framePdbs.length - 1]);
+    for (const [index, text] of [...framePdbs.slice(1, -1), settled].entries()) {
       try {
         const frame = api.frameFromText(text);
         const last = index === framePdbs.length - 2;
