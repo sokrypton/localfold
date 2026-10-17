@@ -122,6 +122,18 @@ def cases():
         ("tmpl-four", "af3", job("t", [protein("A", caj)]),
          ["--template=" + ",".join(["@F/5caj-crystal.pdb:A@0"] * 4)], AF3_FAMILIES),
     ]
+    # chai-1's own MSA inputs (shared/af3/featurise/chai-msa.js): a chain's uint8 profile over its deduplicated rows (600
+    # rows: a column's count passes 256 and wraps), the single-sequence context of a modified protein and a DNA chain
+    # with none, the duplicate rows masked - and an alignment of nothing but the query, which is none (ColabFold ebbd90d)
+    wrap = open(synthetic_a3m("chai-wrap", SEQ_6MRR, 600, 3)).read()
+    out += [
+        ("chai-msa-complex", "af3", job("t", [protein("A", SEQ_6MRR, unpairedMsa=wrap, pairedMsa=""),
+                                              protein("B", "MKTSYIAKQRQISFVK", modifications=[{"ptmType": "SEP", "ptmPosition": 4}],
+                                                      unpairedMsa="", pairedMsa=""),
+                                              {"dna": {"id": "C", "sequence": "ACGTTGCA"}}]), [], ["chai1"]),
+        ("chai-query-only", "af3", job("t", [protein("A", SEQ_6MRR, unpairedMsa=f">q\n{SEQ_6MRR}\n", pairedMsa="")]), [],
+         ["chai1"]),
+    ]
     # 🔴 THE NETWORK ARM (--network): both exporters search api.colabfold.com for the same queries - the server
     # answers one query the same way twice, so the alignments, the pairing, the merge and the template hits must agree
     out += [

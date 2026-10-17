@@ -59,6 +59,7 @@ struct Batch {
   std::vector<std::string> chains, chainKinds;
   std::vector<float> chainLengths;
   int tokens = 0, dense = DENSE, subsets = 0, atomCount = 0, sequences = 0, keys = 0;
+  int pairedRows = 0;                              // the paired block's row count (chai-1's IsPairedMSA)
   std::vector<int> aatype; std::vector<float> profile, deletionMean;
   std::vector<int> msa; std::vector<float> msaMask, deletionMatrix;
   std::vector<int> residueIndex, tokenIndex, asymId, entityId, symId; std::vector<float> seqMask;
@@ -502,6 +503,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     if (residues[r].kind != "protein") nucleicToken[t] = 1;
   }
   int unpairedFrom = o.hasUnpairedFrom ? o.unpairedFrom : (extra.empty() ? 0 : 1);
+  b.pairedRows = unpairedFrom;
   std::vector<char> unknownEverywhere(tokens, 0);
   if (o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) std::fill(unknownEverywhere.begin() + span.from, unknownEverywhere.begin() + span.from + span.count, 1);

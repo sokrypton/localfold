@@ -2,6 +2,7 @@
 // re-exports it), so the CUDA port's exporter reads a dump without the WebGPU fold tool behind it.
 const floats = (source) => Float32Array.from(source, (v) => Number(v));
 const ints = (source) => Int32Array.from(source, (v) => Number(v));
+const flatFirst = (v) => (Array.isArray(v) ? flatFirst(v[0]) : v);
 
 /**
  * AF3's own batch, in the shape shared/af3/featurise/featurise.js produces, so the fold reads
@@ -44,6 +45,8 @@ export function batchFromDump(dump) {
     // `const SEQUENCES: u32 = undefinedu;` and the fold died in WGSL parsing -
     // which is a shape bug wearing a compiler error.
     sequences: dump.numMsa ?? 1,
+    // (the paired block's rows, where the dump records them: chai-1's IsPairedMSA)
+    ...(dump.inputs.num_paired_alignments === undefined ? {} : { pairedRows: Number(flatFirst(raw("num_paired_alignments"))) }),
     // ...and the chain identity, which the confidence head's ipTM reduction
     // indexes directly. Absent, it threw inside reduceTmScore AFTER the whole
     // fold had run, which is the most expensive place to discover a missing

@@ -80,6 +80,9 @@ def main():
     # an AlphaFold 3 job file, featurised as AF3 reads it (folding_input.Input.from_json): its chains,
     # their inline alignments and templates, its bonds and its first seed - replaces every chain flag
     parser.add_argument("--job", default=None)
+    # fold_check featurises with has_msa=False, so a model that zeroes a missing alignment (chai1's _zero_msa) zeroes
+    # one that is there; --has-msa featurises as run_alphafold.py does with an alignment (chai1's _chai_msa)
+    parser.add_argument("--has-msa", action="store_true")
     parser.add_argument("--user-ccd", default=None, action="append",
                         help="a component's CCD mmCIF file to add to the dictionary (repeatable)")
     arguments = parser.parse_args()
@@ -200,6 +203,9 @@ def main():
                                          templates=[])]
     chains = list(model_features.prepare_input(
         _fi.Input(name=arguments.model, chains=chains, rng_seeds=[job_seed]), model_registry.get(arguments.model)).chains)
+    if arguments.has_msa:
+        _apply = model_features.apply
+        model_features.apply = lambda *a, **k: _apply(*a, **{**k, "has_msa": True})
     batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains,
                                     bonded_atom_pairs=bonds, seed=job_seed)
     features = feat_batch.Batch.from_data_dict(batch)
@@ -245,6 +251,7 @@ def main():
                    "tokens": tokens,
                    "numMsa": int(np.asarray(batch["msa"]).shape[0]),
                    "source": "sokrypton/alphafold3 @ af3-any-model, _fold_setup",
+                   **({"hasMsa": True} if arguments.has_msa else {}),
                    "inputs": inputs, "outputs": {}}, handle)
     print("wrote %s  tokens=%d  msa=%d  %.1f MB"
           % (out, tokens, np.asarray(batch["msa"]).shape[0],

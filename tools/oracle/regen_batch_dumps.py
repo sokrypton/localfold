@@ -67,8 +67,10 @@ def main():
         if args is None:
             print(f"skip {os.path.basename(path)}: no recorded target {target!r}")
             continue
+        # (chai1 with an alignment: featurised as run_alphafold.py does with one, which fold_check's has_msa=False is not)
+        msa = ["--has-msa"] if model == "chai1" and target == "kitchen-sink" else []
         work.append((path, [a.python, os.path.join(REPO, "tools", "oracle", "dump_af3_batch.py"), model,
-                            "--reference", a.reference, *args, *ccd, "--out", path + ".new"]))
+                            "--reference", a.reference, *args, *msa, *ccd, "--out", path + ".new"]))
     env = dict(os.environ, AF3_WEIGHTS_DIR=os.environ.get("AF3_WEIGHTS_DIR", os.path.expanduser("~/lfjax/weights")))
 
     def run(item):

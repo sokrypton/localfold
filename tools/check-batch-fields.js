@@ -367,7 +367,8 @@ for (const target of Object.keys(TARGETS)) {
     // 🔴 chai1's reference batch is dumped through fold_check, which featurises with has_msa=False, so its
     // no-alignment zeroing (model_features.py _zero_msa) fires even on a target that HAS one - while this port,
     // handed that alignment, rightly keeps it. Those two fields are reported, not asserted, there.
-    if (model === "chai1" && TARGETS[target].alignment && (name === "profile" || name === "deletion_mean")) {
+    // (a dump made with --has-msa featurised the alignment as run_alphafold.py does, and is compared)
+    if (model === "chai1" && TARGETS[target].alignment && dump.hasMsa !== true && (name === "profile" || name === "deletion_mean")) {
       floor.push(`${name}: the reference dumped with no alignment (fold_check has_msa=False), this port with one`);
       continue;
     }

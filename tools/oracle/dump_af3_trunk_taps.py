@@ -71,6 +71,15 @@ if os.environ.get("SEP"):
     from alphafold3.common import folding_input
     chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[("SEP", int(os.environ["SEP"]))],
                                          unpaired_msa="", paired_msa="", templates=[])]
+# A3M=<file>: the chain's unpaired alignment, featurised as run_alphafold.py does with one (has_msa=True: fold_check's
+# has_msa=False zeroes chai1's alignment, so no chai1 trunk oracle had seen one)
+if os.environ.get("A3M"):
+    from alphafold3.common import folding_input
+    from alphafold3.model.pipeline import model_features as _mf
+    chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[], unpaired_msa=open(os.environ["A3M"]).read(),
+                                         paired_msa="", templates=[])]
+    _apply = _mf.apply
+    _mf.apply = lambda *a, **k: _apply(*a, **{**k, "has_msa": True})
 if os.environ.get("USER_CCD"):
     import functools
     from alphafold3.constants import decoded_ccd

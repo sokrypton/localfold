@@ -7,6 +7,7 @@
  */
 import { af3MsaFromA3m } from "./msa-features.js";
 import { featuriseProtein } from "./featurise.js";
+import { applyChaiMsa } from "./chai-msa.js";
 import { uniformFrom } from "../random.js";
 
 /**
@@ -141,8 +142,20 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
   // 🔴 CHAI-1 WITH NO ALIGNMENT FOLDS FROM AN ALL-GAP ONE (af3-any-model model_features.py _zero_msa, checked there
   // against chai's own captured features): the MSA mask, the profile and the mean deletion all zero, where AF3's
   // featuriser keeps the query's row and profile live. Only with no alignment at all.
-  if (options.chaiMsaFeatures === true && (alignment === null || alignment === undefined)) {
-    batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
+  // ...and with one, chai's own profile, single-sequence context and row deduplication (chai-msa.js), unless every row
+  // is a chain's own query, which is no alignment either (ColabFold ebbd90d)
+  if (options.chaiMsaFeatures === true) {
+    const texts = alignment === null || alignment === undefined ? null
+      : typeof alignment === "string" ? { unpaired: alignment }
+        : { paired: alignment.paired ?? null, unpaired: alignment.unpairedProfile ?? alignment.unpaired ?? null };
+    const chains = sequence.split(":").map((one, index) => ({
+      sequence: one, kind: options.chainKinds?.[index] ?? "protein",
+      modifications: (options.modifications ?? []).filter((mod) => mod.chain === index)
+        .map((mod) => ({ position: mod.position, code: mod.code })),
+    }));
+    if (texts === null || !applyChaiMsa(batch, chains, texts, options.msaColumnKinds?.some((kind) => kind !== "protein") === true)) {
+      batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
+    }
   }
   return { batch, rows };
 }

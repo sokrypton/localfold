@@ -89,6 +89,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
   e.t(p + "chainLengths", b.chainLengths);
   e.m(p + "tokens", b.tokens); e.m(p + "dense", b.dense); e.m(p + "subsets", b.subsets);
   e.m(p + "atomCount", b.atomCount); e.m(p + "sequences", b.sequences);
+  e.m(p + "pairedRows", b.pairedRows);
   e.m(p + "shape.tokens", b.tokens); e.m(p + "shape.dense", b.dense); e.m(p + "shape.subsets", b.subsets);
   e.m(p + "shape.queries", QUERIES); e.m(p + "shape.keys", b.keys);
   e.i(p + "aatype", b.aatype); e.t(p + "profile", b.profile); e.t(p + "deletionMean", b.deletionMean);

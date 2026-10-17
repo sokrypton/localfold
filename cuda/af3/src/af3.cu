@@ -62,7 +62,9 @@ static int foldMain(int argc, char** argv) {
   // the trunk's modules' large scratch shared between them (common.cuh, SHARED SCRATCH): every family below proved by a
   // scribbled fold bit-identical to the unshared one - one GPU and sharded, the big-input paths, boltz2, MSA, template
   SHARED_FAMILIES = { "tri.", "grid.", "tr.", "msaatt.", "opm.", "st.", "emb.", "p16.", "tmpl." };
-  SHARED_NESTED = { { "tmpl.", "tri." }, { "tmpl.", "grid." }, { "tmpl.", "tr." }, { "tmpl.", "p16." }, { "emb.", "p16." } };
+  // (chai-1's MSA transition runs inside its weighted averaging, which holds msaatt.ln across it: trunk.cuh msaAttention)
+  SHARED_NESTED = { { "tmpl.", "tri." }, { "tmpl.", "grid." }, { "tmpl.", "tr." }, { "tmpl.", "p16." }, { "emb.", "p16." },
+                    { "msaatt.", "tr." } };
   // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
   // measure the two on a device - the fused ones are each a block's worth of shared memory)
   if (const char* u = getenv("LOCALFOLD_UNFUSED")) {

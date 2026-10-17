@@ -134,17 +134,25 @@ __global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenI
 }
 // chai-1's MSA features (af3-any-model featurization.py create_msa_feat, chai1): 41 columns per row and token,
 // [is_paired | source one-hot (6; row 0 class 4, else 2) | deletion value | has deletion | one_hot(msa, 32)],
-// through a BIASED linear, plus the recycled single's projection. is_paired: the row covers tokens of more
-// than one chain.
+// through a BIASED linear, plus the recycled single's projection. is_paired (af3-any-model 7cc3165): a homolog row of
+// the PAIRED block (0 < s < pairedRows), on a live token whose chain has a hit in that row (a live non-gap entry) and
+// whose row's first token's chain has one too - `chainHit` below; "covers more than one chain" marked every row of a
+// complex, since AF3 lays the unpaired rows side by side.
+__global__ void chaiChainHitK(const int* rows, const float* msaMask, const int* asymId, int* chainHit, size_t count, int n,
+                              int chains) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= count) return;
+  size_t s = t / n; int k = (int)(t % n);
+  if (msaMask[t] != 0 && rows[t] != 21) chainHit[s * chains + asymId[k]] = 1;
+}
 __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const float* msaMask, const int* asymId,
-                              const int* isLigand, const float* Wmsa, const float* bias, const float* fromSingle, float* msa,
-                              size_t count, int n, int C) {
+                              const int* chainHit, int chains, int pairedRows, const int* isLigand, const float* Wmsa,
+                              const float* bias, const float* fromSingle, float* msa, size_t count, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n); size_t s = row / n;
-  int first = -1; bool paired = false;
-  for (int k = 0; k < n && !paired; ++k)
-    if (msaMask[s * n + k] != 0) { if (first < 0) first = asymId[k]; else if (asymId[k] != first) paired = true; }
+  bool paired = s > 0 && s < (size_t)pairedRows && msaMask[row] != 0
+             && chainHit[s * chains + asymId[token]] && chainHit[s * chains + asymId[0]];
   float d = deletion[row];
   int code = rows[row];
   // a non-polymer token: chai's query row carries the unknown residue (20) and every other row its mask class
@@ -524,9 +532,16 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     linear<float, float>(t.single, fromSingle, n, t.Cs, t.Cm, E + "extraMsaTargetFeat");
     size_t rows = (size_t)t.S * n;
     if (lenW(E + "msaActivations") != (size_t)41 * t.Cm) { fprintf(stderr, "chai's msa features are not 41 wide\n"); exit(1); }
+    int chains = 1;
+    { const int* asym = M.i("batch.features.asymId"); for (int k = 0; k < n; ++k) chains = std::max(chains, asym[k] + 1); }
+    int* chainHit = scratch<int>("emb.chainHit", (size_t)t.S * chains);
+    CK(cudaMemsetAsync(chainHit, 0, (size_t)t.S * chains * sizeof(int), STREAM));
+    chaiChainHitK<<<blocks(rows), 256, 0, STREAM>>>(t.msaRows, t.msaMask, Idev("batch.features.asymId"), chainHit, rows, n, chains);
+    // (the paired block's row count: a batch without it - a dump's - has none, as af3-any-model's num_paired None)
+    int pairedRows = M.has("batch.pairedRows") ? (int)M.meta("batch.pairedRows") : 0;
     chaiMsaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, t.msaMask, Idev("batch.features.asymId"),
-      M.has("batch.isLigand") ? Idev("batch.isLigand") : nullptr, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle,
-      t.msa, rows, n, t.Cm);
+      chainHit, chains, pairedRows, M.has("batch.isLigand") ? Idev("batch.isLigand") : nullptr, W(E + "msaActivations"),
+      W(E + "msaActivationsBias"), fromSingle, t.msa, rows, n, t.Cm);
     ++t.pass;
     return;
   }
@@ -1058,14 +1073,21 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
   mg::fence();
 }
 // T: the activations and the weighted sum's inputs (f16 on the fast path); the softmax in f32.
+// `parallelTransition`: chai-1's MSA transition, which reads the same MSA as the weighted averaging (chai-lab's
+// msa + transition(msa) + pwa(msa); af3-any-model 7cc3165) - run in place once the whole MSA's LayerNorm is taken,
+// before any of the averaging is added
 template <class T>
-void msaAttention(Trunk& t, const std::string& pre) {
-  if (sharded(t)) { msaAttentionSharded<T>(t, pre); return; }
+void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelTransition = "") {
+  if (sharded(t)) {
+    if (!parallelTransition.empty()) { fprintf(stderr, "a sharded pair: not chai-1's MSA update\n"); exit(1); }
+    msaAttentionSharded<T>(t, pre); return;
+  }
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int heads = (int)M.meta(pre + ".heads"), d = (int)M.meta(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
   T* ln = scratch<T>("msaatt.ln", rows * Cm);
   layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  if (!parallelTransition.empty()) transition<T>(t.msa, rows, Cm, 4, parallelTransition);
   // the pair's LayerNorm feeds only the bias projection: on a card short of room it is taken in row chunks
   size_t per = shortPair(pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   T* pln = scratch<T>("msaatt.pln", per * C);
@@ -1127,11 +1149,10 @@ template <class T>
 void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + std::to_string(k);
   if (M.flag("trunk.dialect.groupedOuterProduct")) {
-    // chai-1 (modules.py): z += grouped OPM(m); m += attention(m, z); m += transition(m); then the pair track in two
+    // chai-1 (modules.py): z += grouped OPM(m); m += attention(m, z) + transition(m), both off the same m; then the pair track in two
     // parallel stages - z += triOut(z) + triIn(z) + transition(z), then z += attnStart(z) + attnEnd(z)
     groupedOuterProduct(t, B + ".outerProductMean"); stage("msa.opm");
-    msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
-    transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
+    msaAttention<T>(t, B + ".msaAttention1", B + ".msaTransition"); stage("msa.attention+transition");
     PAIR16 = t.p16;
     parallelPairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4,
                            { PairUpdate::TriOut, PairUpdate::TriIn, PairUpdate::Transition });

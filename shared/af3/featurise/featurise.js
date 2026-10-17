@@ -1252,6 +1252,8 @@ export function featuriseProtein(sequence, options = {}) {
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
+    // the paired block's row count, the query's included (chai-1's IsPairedMSA reads it: af3-any-model num_paired)
+    pairedRows: unpairedFrom,
     shape: { tokens, dense: DENSE, subsets, queries: QUERIES, keys },
     aatype, profile, deletionMean,
     msa, msaMask, deletionMatrix,

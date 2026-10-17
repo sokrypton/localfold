@@ -16,6 +16,7 @@
 #include "ccd.h"
 #include "entries.h"
 #include "featurise.h"
+#include "chai_msa.h"
 #include "job.h"
 #include "msa.h"
 #include "pdb.h"
@@ -537,10 +538,28 @@ inline Af3Export exportAf3(const Args& args) {
   o.duplicateQueryRow = D.dedupeSelfMsa == 0;
   for (auto& k : msaColumnKinds) if (k != "protein") o.msaCoversNucleic = true;
   Batch batch = featuriseProtein(sequence, o);
-  if (D.chaiMsaFeatures && !alignment.present) {
-    std::fill(batch.msaMask.begin(), batch.msaMask.end(), 0.0f);
-    std::fill(batch.profile.begin(), batch.profile.end(), 0.0f);
-    std::fill(batch.deletionMean.begin(), batch.deletionMean.end(), 0.0f);
+  // chai-1: with no alignment, or one holding nothing but each chain's query (ColabFold ebbd90d), an all-gap one; with
+  // one, its own profile, single-sequence context and row deduplication (chai_msa.h)
+  if (D.chaiMsaFeatures) {
+    bool applied = false;
+    if (alignment.present) {
+      std::vector<ChaiChain> chains;
+      auto seqs = splitOn(sequence, ':');
+      for (size_t c = 0; c < seqs.size(); ++c) {
+        ChaiChain one{seqs[c], c < o.chainKinds.size() ? o.chainKinds[c] : "protein", {}};
+        for (auto& m : o.modifications) if (m.chain == (int)c) one.modifications.push_back({m.position, m.component.code});
+        chains.push_back(one);
+      }
+      const std::string paired = alignment.blocks && alignment.hasPaired ? alignment.paired : "";
+      const std::string unpaired = !alignment.blocks ? alignment.single
+        : alignment.hasUnpairedProfile ? alignment.unpairedProfile : alignment.hasUnpaired ? alignment.unpaired : "";
+      applied = applyChaiMsa(batch, chains, paired, unpaired, o.msaCoversNucleic);
+    }
+    if (!applied) {
+      std::fill(batch.msaMask.begin(), batch.msaMask.end(), 0.0f);
+      std::fill(batch.profile.begin(), batch.profile.end(), 0.0f);
+      std::fill(batch.deletionMean.begin(), batch.deletionMean.end(), 0.0f);
+    }
   }
   addBatch(E, batch, !D.chaiTokenEmbedding);
   if (D.chaiTokenEmbedding) addEsm2Inputs(E, batch);
