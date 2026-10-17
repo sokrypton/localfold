@@ -35,14 +35,31 @@ __global__ void msaEmbedK(const int* tok, const float* W, float* m, size_t rows,
 // d_chain (6)] times its weight, plus the bond feature. Only d_token varies (d_res is r_max everywhere, d_chain 2 s_max
 // + 1 and same entity 1 - the release's single-chain form), the token index shifted 100 past each chain break so a
 // cross-chain pair clips to the edge bin; the bond (|i - j| = 1) is over the UNSHIFTED index, so it spans a chain break
-__global__ void pairInitK(const int* shifted, const float* W, const float* bondW, float* z, int L, int C) {
+template <class PT>
+__global__ void pairInitK(const int* shifted, const float* W, const float* bondW, PT* z, int L, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / L), j = (int)(ij % L);
   int d = min(max(shifted[i] - shifted[j] + 32, 0), 64);
   float v = W[32 * C + c] + W[(66 + d) * C + c] + W[132 * C + c] + W[138 * C + c];
   if (abs(i - j) == 1) v += bondW[c];
-  z[t] = v;
+  z[t] = fromF<PT>(v);
+}
+
+// The pair held in bf16 from its first value to the last layer (--fast, where cuda/ef2 keeps ESMFold2's pair bf16:
+// trunk.cuh's EF2_Z16 - every pair-block path then has a bf16 form) - half the pair's bytes, and its stores at AF3's
+// activation precision. The modules here read and write it through PT; cuda/ef2's run under PAIR16
+inline bool PAIR_BF16 = false;
+// a copy of the pair in f32, for a comparison or the embeddings
+__global__ void pairWidenK(const __nv_bfloat16* in, float* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __bfloat162float(in[i]);
+}
+inline const float* pairF32(const float* z, size_t n) {
+  if (!PAIR_BF16) return z;
+  float* w = scratch<float>("pair.f32", n);
+  pairWidenK<<<blocks(n), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(z), w, n);
+  return w;
 }
 
 // ---------------------------------------------------------------- the query-biased outer product
@@ -148,12 +165,13 @@ __global__ void opmPermuteHK(const half* prod, half* out, int Ib, int L, const f
     dst[v] = q;
   }
 }
-__global__ void opmGateAddHK(const half* h, float* pair, size_t rows) {
+template <class PT>
+__global__ void opmGateAddHK(const half* h, PT* pair, size_t rows) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * 256) return;
   size_t r = t / 256; int c = (int)(t % 256);
   float g = __half2float(h[r * 512 + c]), x = __half2float(h[r * 512 + 256 + c]);
-  pair[t] += g / (1.f + expf(-g)) * x;
+  pair[t] = fromF<PT>(toF(pair[t]) + g / (1.f + expf(-g)) * x);
 }
 // one layer's query-biased outer product: pair += SwiGLU(Linear(outer(a sqrt w, b sqrt w) / sum w))
 inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) {
@@ -209,7 +227,9 @@ inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) 
       for (size_t r0 = 0; r0 < rows; r0 += chunk) {
         size_t r = std::min(chunk, rows - r0);
         ltGemm(outer + r0 * 256, Fh(O + "toPair"), h, true, r, 256, 512, F(O + "toPairBias"), false, 0.f);
-        opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + ((size_t)i0 * L + r0) * 256, r);
+        const size_t at = ((size_t)i0 * L + r0) * 256;
+        if (PAIR_BF16) opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, reinterpret_cast<__nv_bfloat16*>(pair) + at, r);
+        else opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + at, r);
       }
     }
     return;
@@ -229,12 +249,13 @@ inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) 
 
 // ---------------------------------------------------------------- the heads
 // contacts[i][j] = (sigmoid(LN(z_ij) . w + b) + sigmoid(LN(z_ji) . w + b)) / 2: one warp a pair
-__global__ void contactK(const float* z, const float* sc, const float* of, const float* w, const float* b, float* logit, size_t P) {
+template <class PT>
+__global__ void contactK(const PT* z, const float* sc, const float* of, const float* w, const float* b, float* logit, size_t P) {
   size_t warp = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32; int lane = threadIdx.x & 31;
   if (warp >= P) return;
-  const float* v = z + warp * 256;
+  const PT* v = z + warp * 256;
   float x[8], s = 0.f;
-  for (int k = 0; k < 8; ++k) { x[k] = v[lane + 32 * k]; s += x[k]; }
+  for (int k = 0; k < 8; ++k) { x[k] = toF(v[lane + 32 * k]); s += x[k]; }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / 256.f, q = 0.f;
   for (int k = 0; k < 8; ++k) { float d = x[k] - mean; q += d * d; }
@@ -253,7 +274,9 @@ __global__ void symmetriseK(const float* p, float* out, int L) {
 inline void contacts(const float* z, int L, const std::string& head, float* out) {
   size_t P = (size_t)L * L;
   float* p = scratch<float>("head.p", P);
-  contactK<<<blocks(P * 32), 256, 0, STREAM>>>(z, F(head + "normScale"), F(head + "normOffset"), F(head + "weight"), F(head + "bias"), p, P);
+  if (PAIR_BF16) contactK<<<blocks(P * 32), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(z), F(head + "normScale"),
+                                                             F(head + "normOffset"), F(head + "weight"), F(head + "bias"), p, P);
+  else contactK<<<blocks(P * 32), 256, 0, STREAM>>>(z, F(head + "normScale"), F(head + "normOffset"), F(head + "weight"), F(head + "bias"), p, P);
   symmetriseK<<<blocks(P), 256, 0, STREAM>>>(p, out, L);
 }
 __global__ void lmGateK(const float* h, const float* bias, float* out, int L) {
@@ -337,11 +360,12 @@ static const char* USAGE =
   "  ARNDCEQGHILKMFPSTWYVXBZUO-), subsample.a3m (the rows the model read), and with --embeddings query.npy [L][464]\n"
   "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer)\n"
   "  --chain-breaks: the residue each chain after the first starts at (a ColabFold '#' header gives them)\n"
+  "  --pair-f32: keep the pair f32 under --fast (it is bf16 there otherwise: half its bytes)\n"
   "  --contacts-only: stop at the last contact head's layer (19 of 22) - no logits, no embeddings\n"
   "localfold-msap --oracle=<dump dir> [--check] [--repeat=N]    tools/oracle/dump_msap.py's subsample, its stages compared\n";
 
 int main(int argc, char** argv) {
-  std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false, contactsOnly = false;
+  std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false, contactsOnly = false, pairF32Flag = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
@@ -351,6 +375,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--chain-breaks=", 15)) breaksArg = argv[i] + 15;
     else if (!strcmp(argv[i], "--embeddings")) embeddings = true;
     else if (!strcmp(argv[i], "--contacts-only")) contactsOnly = true;
+    else if (!strcmp(argv[i], "--pair-f32")) pairF32Flag = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--check")) checking = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeats = atoi(argv[i] + 9);
@@ -388,36 +413,41 @@ int main(int argc, char** argv) {
   }
   for (int b : breaks) if (b <= 0 || b >= L) { fprintf(stderr, "a chain break at %d is outside 1..%d\n", b, L - 1); return 1; }
   const int C = 256, Cm = 464;
+  // (the conditions cuda/ef2 keeps ESMFold2's pair bf16 under; --pair-f32 keeps it f32)
+  PAIR_BF16 = !pairF32Flag && FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma();
   const int depth = (int)M.meta("meta/depth"), cbLayer = (int)M.meta("meta/contactLayer"), cfLayer = (int)M.meta("meta/confindContactLayer");
   size_t R = (size_t)S * L, P = (size_t)L * L;
-  printf("msap: %d rows x %d columns, %zu chains, %d layers%s (input %.0f ms)\n", S, L, breaks.size() + 1, depth, FAST ? " (fast)" : "",
+  printf("msap: %d rows x %d columns, %zu chains, %d layers%s (input %.0f ms)\n", S, L, breaks.size() + 1, depth,
+         FAST ? (PAIR_BF16 ? " (fast, bf16 pair)" : " (fast)") : "",
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   // the token index, shifted 100 past each chain break
   std::vector<int> shifted(L);
   for (int l = 0; l < L; ++l) { shifted[l] = l; for (int b : breaks) if (l >= b) shifted[l] += 100; }
   int* shiftedD = upload(shifted.data(), L);
   int* tokD = upload(tokens.data(), R);
-  float* m = dalloc(R * Cm); float* z = dalloc(P * C);
+  float* m = dalloc(R * Cm);
+  float* z = PAIR_BF16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(P * C)) : dalloc(P * C);
   float* pmask = dalloc(P); fillK<<<blocks(P), 256, 0, STREAM>>>(pmask, 1.f, P);
   float* w = dalloc(S); float* cb = dalloc(P); float* cf = dalloc(P); float* logits = dalloc((size_t)L * 26);
   for (int rep = 0; rep < repeats; ++rep) {
   CK(cudaStreamSynchronize(STREAM));
   t0 = std::chrono::steady_clock::now();
   msaEmbedK<<<blocks(R * Cm), 256, 0, STREAM>>>(tokD, F("msap/msaInit"), m, R, Cm);
-  pairInitK<<<blocks(P * C), 256, 0, STREAM>>>(shiftedD, F("msap/relpos"), F("msap/bond"), z, L, C);
+  if (PAIR_BF16) pairInitK<<<blocks(P * C), 256, 0, STREAM>>>(shiftedD, F("msap/relpos"), F("msap/bond"), reinterpret_cast<__nv_bfloat16*>(z), L, C);
+  else pairInitK<<<blocks(P * C), 256, 0, STREAM>>>(shiftedD, F("msap/relpos"), F("msap/bond"), z, L, C);
   CHECK("msa init", m, R * Cm, "o/msaInit");
-  CHECK("pair init", z, P * C, "o/pairInit");
+  CHECK("pair init", pairF32(z, P * C), P * C, "o/pairInit");
   const int layers = contactsOnly ? std::max(cbLayer, cfLayer) + 1 : depth;
   for (int l = 0; l < layers; ++l) {
     const std::string B = "msap/blocks/" + std::to_string(l) + "/", Lo = "o/layer" + std::to_string(l) + "/";
-    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, B + "pwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, B + "pwa/");
+    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, B + "pwa/", PAIR_BF16); else msaPairWeightedAveraging(m, z, S, L, Cm, C, B + "pwa/");
     if (l == 0) CHECK("l0 after pwa", m, R * Cm, "o/layer0/afterPwa");
     rowsTransition(m, R, Cm, B + "msaTransition/");
     if (l == 0) CHECK("l0 after msa transition", m, R * Cm, "o/layer0/afterMsaTransition");
     qOpm(z, m, S, L, l, w);
     CHECK(("l" + std::to_string(l) + " seq weights").c_str(), w, S, Lo + "seqWeights");
-    if (l == 0 && checking) {
-      CHECK("l0 after opm", z, P * C, "o/layer0/afterOpm");
+    if (l == 0 && checking && !PAIR_BF16) {
+      CHECK("l0 after opm", pairF32(z, P * C), P * C, "o/layer0/afterOpm");
       // the pair block's three modules one at a time, as trunkBlock runs them
       const std::string T = "msap/blocks/0/";
       if (FAST) triangleFast(z, pmask, L, C, T + "triangleMultiplicationOutgoing/", true);
@@ -428,13 +458,18 @@ int main(int argc, char** argv) {
       CHECK("l0 after tri in", z, P * C, "o/layer0/afterTriIn");
       if (FAST) transitionFast(z, P, C, T + "pairTransition/"); else pairTransition(z, L, C, T + "pairTransition/");
       CHECK("l0 after pair transition", z, P * C, "o/layer0/afterPairTransition");
-    } else trunkBlock(z, pmask, L, C, "msap/blocks", l);
-    if (M.has(Lo + "pair")) { CHECK(("l" + std::to_string(l) + " pair").c_str(), z, P * C, Lo + "pair"); CHECK(("l" + std::to_string(l) + " msa").c_str(), m, R * Cm, Lo + "msa"); }
+    } else {
+      // on a card short of room the MSA side's scratch goes back before the pair block, whose blocked triangle wants
+      // a whole operand plane (13.4 GB at 5,115 residues, where 11.4 GB of MSA scratch was still held)
+      if (shortPair(P, C)) releaseScratch({ "msah.", "msa.", "opm.", "ftr.", "tr.", "gemmh." });
+      PAIR16 = PAIR_BF16; trunkBlock(z, pmask, L, C, "msap/blocks", l); PAIR16 = false;
+    }
+    if (M.has(Lo + "pair")) { CHECK(("l" + std::to_string(l) + " pair").c_str(), pairF32(z, P * C), P * C, Lo + "pair"); CHECK(("l" + std::to_string(l) + " msa").c_str(), m, R * Cm, Lo + "msa"); }
     if (l == cbLayer) { contacts(z, L, "msap/cbContact/", cb); CHECK("cb contacts", cb, P, "o/cbContacts"); }
     if (l == cfLayer) { contacts(z, L, "msap/confindContact/", cf); CHECK("confind contacts", cf, P, "o/confindContacts"); }
   }
   if (!contactsOnly) {
-    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, "msap/finalPwa/"); else msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
+    if (FAST) msaPairWeightedAveragingFast(m, z, S, L, Cm, C, "msap/finalPwa/", PAIR_BF16); else msaPairWeightedAveraging(m, z, S, L, Cm, C, "msap/finalPwa/");
     rowsTransition(m, R, Cm, "msap/finalMsaTransition/");
     CHECK("final msa query", m, (size_t)L * Cm, "o/final/msaQuery");
     lmHead(m, L, logits);
@@ -450,7 +485,7 @@ int main(int argc, char** argv) {
     if (!contactsOnly) writeNpy(out + "/logits.npy", download(logits, (size_t)L * 26), { (size_t)L, 26 });
     if (embeddings) {
       writeNpy(out + "/query.npy", download(m, (size_t)L * Cm), { (size_t)L, (size_t)Cm });
-      writeNpy(out + "/pair.npy", download(z, P * C), { (size_t)L, (size_t)L, (size_t)C });
+      writeNpy(out + "/pair.npy", download(pairF32(z, P * C), P * C), { (size_t)L, (size_t)L, (size_t)C });
     }
     if (!subsample.empty()) {
       FILE* f = fopen((out + "/subsample.a3m").c_str(), "w");

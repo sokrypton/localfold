@@ -166,7 +166,10 @@ __global__ void pwaWeightsHK(const float* w, half* wh, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) wh[t] = __float2half(w[t]);
 }
-inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn) {
+// pair16: the pair's buffer holds bf16 (MSA Pairformer's PAIR_BF16; 256 channels)
+inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn,
+                                         bool pair16 = false) {
+  if (pair16 && C != 256) { fprintf(stderr, "a bf16 pair's pair-weighted averaging is 256 channels\n"); exit(1); }
   const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
   size_t rows = (size_t)S * T, P = (size_t)T * T;
   half* ln = scratch<half>("msah.ln", rows * Cm);
@@ -176,7 +179,10 @@ inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int
   half* pln = scratch<half>("msah.pln", chunk * C);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
-    layerNormH(pair + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+    if (pair16)
+      layerNormVK<256, __nv_bfloat16, half><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(
+          reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, pln, r, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+    else layerNormH(pair + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
     ltGemm(pln, Fh(Bn + "pairLogits"), flat + r0 * heads, false, r, C, heads, nullptr, false, 0.f);
   }
   float* w = scratch<float>("msa.w", (size_t)heads * P);

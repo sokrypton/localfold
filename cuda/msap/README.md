@@ -90,9 +90,12 @@ The reference is run in bf16 with cuEquivariance, its README's settings. The tim
 | 2,048 × 1,023 | 4.25 s, 17.2 GB | out of memory | |
 | 512 × 2,046 (1JZ7 twice, two chains) | 5.17 s, 24.8 GB | out of memory | |
 | 1,024 × 2,046 | 6.85 s, 29.7 GB | out of memory | |
-| 512 × 3,069 (three chains) | 13.1 s, 30.1 GB | out of memory | |
+| 512 × 3,069 (three chains) | 12.4 s, 25.6 GB | out of memory | |
+| 512 × 4,092 | 22.2 s, 37.4 GB | out of memory | |
+| 512 × 5,115 | 41.8 s, 38.0 GB | out of memory | |
 
-The query-biased outer product is computed a block of rows i at a time. Whole, its product and permuted outer product were 9.6 GB of 38 at 3,069 residues. What grows with length now is the f32 pair (L² × 1 KB) and the triangles' scratch. On a short card the triangles take cuda/ef2's blocked forms.
+Under `--fast` the pair is bf16 from its first value to the last layer, as cuda/ef2 keeps ESMFold2's (`--pair-f32` keeps it f32: 30.1 GB at 3,069). It costs contacts 7.8e-4 -> 3.1e-3 from the float32 reference on 5CAJ, still inside the reference's own bf16 (5.3e-3).
+The query-biased outer product is computed a block of rows i at a time. Whole, its product and permuted outer product were 9.6 GB of 38 at 3,069 residues. On a card short of room the MSA side's scratch is given back before each pair block, whose blocked triangle wants a whole operand plane (13.4 GB at 5,115).
 
 ## License
 
