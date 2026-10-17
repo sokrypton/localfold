@@ -524,6 +524,7 @@ inline Af3Export exportAf3(const Args& args) {
     o.hasUnpairedFrom = true; o.unpairedFrom = 0;
   }
   o.symmetriseBonds = D.symmetriseBonds; o.centreRefConformers = D.centreRefConformers;
+  o.rawLastConformer = D.rawLastConformer;
   o.paddedAtomKeys = D.paddedAtomKeys; o.qblockAtomKeys = D.qblockAtomKeys;
   o.atomizedElementNames = D.atomizedElementNames; o.atomizedUnknownRestype = D.atomizedUnknownRestype;
   o.atomizedUnknownMsa = D.atomizedUnknownMsa; o.atomizedBackboneBonds = D.atomizedBackboneBonds;

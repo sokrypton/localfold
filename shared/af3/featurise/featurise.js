@@ -41,12 +41,16 @@
  * create, and each would need its own CCD entries.
  */
 import { conformerFor, aatypeFor } from "./reference-conformers.js";
+import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
 
 const DENSE = 24;
+// AF3's residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP: a token's restype, named
+const POLYMER_TYPE_NAMES = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE",
+  "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "-", "A", "G", "C", "U", "DA", "DG", "DC", "DT", "N"];
 const QUERIES = 32;
 const KEYS = 128;
 /** AF3's restype alphabet is 31 wide: 20 amino acids, UNK, and the nucleic acids. */
@@ -1146,6 +1150,45 @@ export function featuriseProtein(sequence, options = {}) {
       refPos[slot * 3] -= entry[0] / entry[3];
       refPos[slot * 3 + 1] -= entry[1] / entry[3];
       refPos[slot * 3 + 2] -= entry[2] / entry[3];
+    }
+  }
+
+  // 🔴 boltz2's LAST CONFORMER GROUP KEEPS BOLTZ-2's STORED CONFORMER, RAW. Boltz-2 centres and rotates each group in
+  // `range(max(ref_space_uid))` - an off-by-one that skips the last - so native feeds its final group the stored
+  // conformer in its own frame (boltz2-conformers.js). af3-any-model 79edb5e matched it: polyQ200 pLDDT 53 -> 85, native
+  // 83. As there: after the centring, the last group's tokens that are not atomised take the stored position of every
+  // atom whose name the residue's entry has (the rest keep the centred value); the restype names the entry
+  // (AF3's POLYMER_TYPES_WITH_UNKNOWN_AND_GAP), and an atomised residue - more than one token on one (asym, residue) -
+  // is left alone.
+  if (options.rawLastConformer === true) {
+    let last = -Infinity;
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) last = Math.max(last, refSpaceUid[slot]);
+    const share = new Map();
+    for (let token = 0; token < tokens; token += 1) {
+      const key = `${asymId[token]}:${residueIndex[token]}`;
+      share.set(key, (share.get(key) ?? 0) + 1);
+    }
+    for (let token = 0; token < tokens; token += 1) {
+      let inLast = false;
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] !== 0 && refSpaceUid[flat] === last) { inLast = true; break; }
+      }
+      if (!inLast || share.get(`${asymId[token]}:${residueIndex[token]}`) > 1) continue;
+      const entry = BOLTZ2_RAW_CONFORMERS[POLYMER_TYPE_NAMES[aatype[token]]];
+      if (entry === undefined) continue;
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] === 0) continue;
+        let name = "";
+        for (let c = 0; c < 4; c += 1) {
+          const v = refAtomNameChars[flat * 4 + c];
+          if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+        }
+        const xyz = entry[name.trim()];
+        if (xyz === undefined) continue;
+        refPos[flat * 3] = xyz[0]; refPos[flat * 3 + 1] = xyz[1]; refPos[flat * 3 + 2] = xyz[2];
+      }
     }
   }
 

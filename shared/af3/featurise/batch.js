@@ -68,6 +68,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // reference conformers centred per ref_space_uid. See featurise.js.
     ...(options.centreRefConformers === undefined
       ? {} : { centreRefConformers: options.centreRefConformers }),
+    ...(options.rawLastConformer === undefined
+      ? {} : { rawLastConformer: options.rawLastConformer }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

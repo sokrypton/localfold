@@ -59,6 +59,7 @@ export const ALPHAFOLD3 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: false,
+  rawLastConformer: false,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -294,6 +295,7 @@ export const OPENBIND0 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -431,6 +433,7 @@ export const OPENDDE = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -678,6 +681,7 @@ export const PROTENIX2 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -862,6 +866,9 @@ export const BOLTZ2 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME: Boltz-2 centres `range(max(ref_space_uid))`, which skips
+  // the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 -> 85)
+  rawLastConformer: true,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -947,6 +954,7 @@ export const INTELLIFOLD2 = Object.freeze({
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
+  rawLastConformer: false,
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1116,6 +1124,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   targetFeatAtomOnly: false,
   // NOT in CENTRE_REF_CONFORMERS.
   centreRefConformers: false,
+  rawLastConformer: false,
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1218,6 +1227,7 @@ export const CHAI1 = Object.freeze({
   msaDoubleAddPair: true,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
+  rawLastConformer: false,
   emptyTemplateAatype: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1350,6 +1360,7 @@ export function featuriserDialect(dialect) {
   return {
     symmetriseBonds: dialect.symmetriseBonds,
     centreRefConformers: dialect.centreRefConformers,
+    rawLastConformer: dialect.rawLastConformer,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,
     dropTerminalAtoms: dialect.dropTerminalAtoms,
