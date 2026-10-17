@@ -36,9 +36,11 @@ struct FrameWriter {
   static constexpr int MAX = 25;
   std::string dir; int stride = 1, steps = 0, written = 0;
   std::vector<std::string> lines; std::vector<size_t> slots;
+  const int* gather = nullptr;     // OpenDDE: a residue slot's structural atom (residueAtomGather; -1 none), as the PDB's
   std::vector<double> reference; double refCentre[3] = {};
   static bool isAtom(const std::string& l) { return l.size() >= 66 && (!l.compare(0, 4, "ATOM") || !l.compare(0, 6, "HETATM")); }
-  bool start(const std::string& inputDir, const std::string& d, int totalSteps) {
+  bool start(const std::string& inputDir, const std::string& d, int totalSteps, const int* residueAtomGather = nullptr) {
+    gather = residueAtomGather;
     std::ifstream tf(inputDir + "/template.pdb");
     if (!tf) { fprintf(stderr, "frames: no %s/template.pdb, none written\n", inputDir.c_str()); return false; }
     for (std::string l; std::getline(tf, l);) {
@@ -50,12 +52,15 @@ struct FrameWriter {
   }
   void offer(const float* device, int step) {
     if (dir.empty() || !(step % stride == 0 || step == steps)) return;
-    size_t top = 0; for (size_t s : slots) top = std::max(top, s + 1);
-    std::vector<float> x = download(device, top * 3);
+    // (the sampler's atoms: the residues' dense slots, or OpenDDE's structural atoms the PDB gathers them from)
+    std::vector<long> at(slots.size());
+    long top = 0;
+    for (size_t a = 0; a < slots.size(); ++a) { at[a] = gather ? gather[slots[a]] : (long)slots[a]; top = std::max(top, at[a] + 1); }
+    std::vector<float> x = download(device, (size_t)top * 3);
     std::vector<double> pts(slots.size() * 3);
     double c[3] = {};
     for (size_t a = 0; a < slots.size(); ++a)
-      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = x[slots[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
+      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = at[a] < 0 ? 0 : x[(size_t)at[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
     for (size_t a = 0; a < slots.size(); ++a) for (int d = 0; d < 3; ++d) pts[a * 3 + d] -= c[d];
     if (reference.empty()) { reference = pts; for (int d = 0; d < 3; ++d) refCentre[d] = c[d]; }
     double R[9]; bestRotation(pts, reference, R);
@@ -243,7 +248,7 @@ int foldInput(const std::string& dir, Options o) {
     if (profiling()) profileStart();
     if (structural && c0 > 0) M.swapPrefix("batch.", "sbatch.");      // (the structural tokens again, for this batch)
     FrameWriter frames;
-    if (!o.frames.empty() && c0 == 0) frames.start(dir, o.frames, o.steps);     // (the first batch's first sample)
+    if (!o.frames.empty() && c0 == 0) frames.start(dir, o.frames, o.steps, structural ? M.hostI("structural.residueAtomGather") : nullptr);     // (the first batch's first sample)
     std::vector<float> xs = sample(o.steps, batch, mask, [&](const float* d, int step, int) { frames.offer(d, step); });
     if (structural) M.swapPrefix("batch.", "sbatch.");                 // (back to the residues, for the files)
     if (profiling()) profileReport("diffusion", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
