@@ -3972,6 +3972,78 @@ tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s 
 | 5CAJ + alignment | 1.96 / 1.96 | 1.91 / 1.95 |
 | 1TIM + alignment | 1.24 / 1.13 | 1.29 / 1.23 |
 
+### ESMFold2-fast 600M on Colab's RTX PRO 6000 (2026-10-09)
+
+The same tool on a G4 session (RTX PRO 6000 Blackwell, sm_120, CUDA 13.0), upstream installed by
+`pip install "esm[fused,cueq] @ git+https://github.com/evolutionaryscale/esm"` - torch 2.11.0+cu130, triton 3.6,
+cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`localfold-ef2 warm`: its
+resident server folds each case three times and the third is read; see below why the one-shot column is not that):
+
+| target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours, warm** | ours, one-shot |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 169 ms | 175 | 178 | **46** (3.9x fused) | 198 |
+| 1BRS | 195 | 427 | 259 | 228 | **104** (2.2x) | 246 |
+| 5CAJ | 261 | 772 | 371 | 312 | **165** (1.9x) | 309 |
+| 1TIM | 494 | 3,335 | 1,365 | 784 | **501** (1.6x) | 642 |
+| 1TIM x4 | 988 | 19,249 | (fails) | 2,829 | **1,876** (1.5x) | 2,002 |
+
+Against upstream's plain PyTorch 3.7-10x, against its cuEquivariance backend 2.2-3.8x (which still dies at 988
+tokens, now on 0.12.0 - "unexpected keyword argument 's'"), against its fused backend 1.5-3.9x. CA RMSD as on the
+A100 (ours 1.47 / 0.91 / 2.10 / 1.52 A, upstream 1.51 / 0.52 / 2.22 / 1.30). 🔴 **On this card upstream is far
+closer than on the A100** (6MRR 178 ms against the A100's 456; its torch, triton and CUDA are two years newer
+there), and the port's lead is now the small inputs and the 988-token one. 🔴 **AND THE ONE-SHOT COLUMN IS COLD**:
+since b7118c9 a standalone fold skips its warm-up when the input is already written (it saves wall time, command to
+structure), so its stage times carry every kernel's first launch - 6MRR's 198 ms against 46 warm; the A100 table
+above was taken before that commit, warm. The full model was not run there: its bundle is a local export.
+
+### ESMFold2-Fast (the released one, ESM-C 6B) on Colab's RTX PRO 6000 (2026-10-09)
+
+Its bundles exported on the VM from the same sources as this box's (biohub/ESMFold2-Fast at `c6c7958d63`, its
+safetensors' SHA-256 equal to ours; af3-any-model's `lm/esmc.bin.zst`, unpacked by its own loader's steps) -
+`--model=ef2-fast`, both sides warm, one sample, 3 loops (the port's bundle) and 20 (the checkpoint's config):
+
+| target | tokens | loops | upstream PyTorch | cuEquivariance | fused | **ours, warm** |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 3 / 20 | 190 / 425 ms | 198 / 475 | 199 / 482 | **95 / 192** |
+| 1BRS | 195 | 3 / 20 | 512 / 1,826 | 311 / 914 | 272 / 680 | **175 / 505** |
+| 5CAJ | 261 | 3 / 20 | 934 / 3,765 | 451 / 1,507 | 362 / 1,058 | **252 / 850** |
+| 1TIM | 494 | 3 / 20 | 4,017 / 18,763 | 1,666 / 6,952 | 954 / 3,434 | **667 / 2,778** |
+| 1TIM x4 | 988 | 3 / 20 | 23,592 / 115,255 | (fails) | 3,457 / 13,883 | **2,313 / 10,818** |
+
+Against the fused backend 1.4-2.1x at 3 loops and 1.24-2.5x at 20; against cuEquivariance 1.8-2.5x; against plain
+PyTorch 2.0-10.7x. CA RMSD level (ours 1.66 / 0.56 / 1.91 / 1.05 A at 3 loops, upstream 1.67 / 0.62 / 1.82 / 1.21).
+Process memory: upstream 14.0 / 14.4 / 14.6 / 17.8 / 30.1 GB (fused), ours one-shot 8.2 / 8.8 / 9.3 / 10.0 / 15.1.
+🔴 **Here the port's lead is smallest**: at 20 loops a fold is the trunk, where upstream's Triton kernels on this
+card come within 1.25-1.4x of ours. Our trunk on it (988 tokens, 4 passes, 1,977 ms of GPU): triIn256K 28%,
+triangleOutK 22%, transitionUpK 20%, the contraction and the transition's second GEMM 31% - the three fused kernels
+run at one block an SM on its ~100 KB of shared memory (triIn256K's two-tile form needs two), unmeasured otherwise.
+
+### FP8 for the triangle's contraction on Ada and Blackwell (2026-10-09)
+
+Where the card has FP8 tensor instructions (compute capability 8.9 on: an L4, the RTX PRO 6000; an A100 has none),
+the triangle multiplication's two operands are written e4m3 and contracted by cuBLASLt's FP8 GEMM into the bf16
+product (`fp8Tensor`, `triContractTN`; `LOCALFOLD_FP8=0` keeps bf16). An FP8 GEMM takes only the layout with the
+contracted index contiguous in both operands, which the outgoing triangle has and the incoming one does not, so the
+incoming triangle's input kernel reads the pair TRANSPOSED (`RectMap::T`) and both run as the outgoing GEMM; the plane
+is padded to 16 (an FP8 GEMM's leading dimensions). No scale: the operands sit well inside e4m3's range.
+
+On the RTX PRO 6000 the GEMM is 1.7-1.9x bf16's (0.84 against 1.42 ms at np 992, 18.1 against 33.9 at 2,976):
+ESMFold2-fast 600M's trunk **-7% at 988 tokens and -17.6% at 2,964** (21.0 -> 17.3 s of GPU), AlphaFold 3's trunk -4%
+and -8.5% (its contraction is a smaller share beside the grid attention). Accuracy, emulated on the A100 first (the
+operands rounded through e4m3 into the bf16 GEMM) and then measured there: ESMFold2 within 0.02 A on 1BRS / 5CAJ /
+1TIM (0.903 / 2.091 / 1.535 against 0.906 / 2.104 / 1.517), AlphaFold 3 0.009-0.022 A between the forms on 5CAJ with
+its alignment, 1BRS templated and 1TIM with alignments, 5CAJ self-templated 0.171 A both ways on the 6000.
+**And on the big-input (blocked) path too** (`triangleBlockedTN`, `triangleBlockedTNEf2`): b and each block's a e4m3,
+the incoming triangle's block a block of z^T's rows (RectMap::T on a rectangle). In bf16 (`LOCALFOLD_TRI_TN=1`) it is
+byte-identical to the old blocks on the A100 (5CAJ and 988 tokens, both ports). On the 6000 forced big: AlphaFold 3's
+2,964-token trunk 13.03 -> 12.04 s, 5CAJ self-templated 0.171 -> 0.170 A; ESMFold2 988 tokens 2,108 -> 2,002 ms of
+GPU. **AlphaFold 3 at 10,127 tokens with FP8: trunk pass 389 -> 362 s, the whole fold (one pass, 100 steps) 443 ->
+414 s.**
+🔴 **NOT THE WEIGHTS**: the same rounding of the transition's second weight (one e4m3 scale for the tensor) put
+1BRS / 5CAJ / 1TIM at 12.8 / 14.7 / 22.6 A - the operands' errors average out over a contraction of ~1,000 terms, a
+weight's repeat in every row. The transition's hidden rows alone were harmless (within 0.02 A), but its GEMM's FP8
+form needs FP8 weights too, so it stays bf16.
+
 ### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
 
 The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later
@@ -4006,7 +4078,8 @@ device-weight cache in cuda/ef2's include graph to register a forget hook. See c
 To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
 then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
 cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
-from the cu128 index; the fast checkpoint is biohub's `esmfold2-fast-600m` (`--fast-checkpoint=`), the full one
+from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
+upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
 `biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
 
 ## The sampler's exponential update and geometric schedule (2026-10-15)

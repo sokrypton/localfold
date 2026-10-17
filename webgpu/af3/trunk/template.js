@@ -686,7 +686,10 @@ export class Af3TemplateEmbedderGpu {
       // needed no template to appear. Where there is no gap the split does not
       // happen and this is the one pass it always was.
       const gap = dialect.emptyTemplateAatype ?? null;
-      if (emptySlots > 0 && gap !== null) {
+      // (openbind0: every empty slot GAP, not the first alone - templateGapWhereNoAtoms)
+      if (emptySlots > 0 && dialect.templateGapWhereNoAtoms === true) {
+        passes.push({ template: undefined, repeat: emptySlots, emptyAatype: 21 });
+      } else if (emptySlots > 0 && gap !== null) {
         passes.push({ template: undefined, repeat: 1, emptyAatype: gap });
         if (emptySlots > 1) {
           passes.push({ template: undefined, repeat: emptySlots - 1, emptyAatype: 0 });
@@ -704,7 +707,15 @@ export class Af3TemplateEmbedderGpu {
         // WHICH row is the dialect's. See the note on `gap` above.
         const aatypeData = new Int32Array(tokens).fill(emptyAatype ?? 0);
         if (template !== undefined && template !== null) {
-          for (let t = 0; t < tokens; t += 1) aatypeData[t] = template.aatype[t];
+          // (openbind0: a token the template has no atoms for reads GAP - templateGapWhereNoAtoms)
+          const dense = template.atomMask.length / tokens;
+          const uncovered = (t) => {
+            for (let a = 0; a < dense; a += 1) if (template.atomMask[t * dense + a] > 0) return false;
+            return true;
+          };
+          for (let t = 0; t < tokens; t += 1) {
+            aatypeData[t] = dialect.templateGapWhereNoAtoms === true && uncovered(t) ? 21 : template.aatype[t];
+          }
         }
         // 🔴 AN EMPTY SLOT'S WEIGHT IS ZERO UNDER TEMPLATE_VISIBILITY_BY_COVERAGE.
         // `repeat` already scales a slot's contribution into the sum, so the

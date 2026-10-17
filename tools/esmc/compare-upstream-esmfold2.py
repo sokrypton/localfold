@@ -1,7 +1,10 @@
 """How does cuda/ef2 compare with upstream ESMFold2 (biohub's `esm` package) - time, memory and accuracy, same settings.
 
-    <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=fast          # ESMFold2-fast 600M
-    <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=full --loops=3,20
+    <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=ef2-fast-600m             # the site's
+    <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=ef2 --loops=3,20           # ESMFold2
+    <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=ef2-fast --loops=3,20      # ESMFold2-Fast
+
+--model takes localfold-ef2's own names; --checkpoint overrides the upstream checkpoint each one defaults to.
 
 Upstream runs in this process (its fastest kernel backend, `fused`, unless --backends says otherwise) and
 `cuda/ef2/localfold-ef2` as a subprocess, on the same targets (the crystals in tools/fixtures) and settings: ONE
@@ -34,6 +37,17 @@ THREE = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY=
              MET="M", PHE="F", PRO="P", SER="S", THR="T", TRP="W", TYR="Y", VAL="V", MSE="M")
 TARGETS = [("6mrr", ["A"]), ("1brs", ["A", "D"]), ("5caj", ["A"]), ("1tim", ["A", "B"])]
 A3M = {"5caj": ["oracle-dumps/5caj-a.a3m"], "1tim": ["oracle-dumps/1tim-a.a3m"] * 2}
+
+
+# localfold-ef2's --model names -> upstream's checkpoint, and (the released two) the local exports the port reads
+UPSTREAM = {"ef2-fast-600m": "biohub/ESMFold2-Experimental-Fast-base600M-step1500k",
+            "ef2-fast-300m": "biohub/ESMFold2-Experimental-Fast-base300M-step1500k",
+            "ef2-fast": "biohub/ESMFold2-Fast", "ef2": "biohub/ESMFold2"}
+RELEASED = {"ef2": "model-esmfold2-f32", "ef2-fast": "model-esmfold2-fast-f32"}
+
+
+def experimental(model):
+    return model not in RELEASED
 
 
 def chain_seq(pdb, chain):
@@ -95,11 +109,11 @@ def upstream(args, cases, work):
     from esm.utils.msa.msa import MSA
     from esm.utils.structure.input_builder import ProteinInput, StructurePredictionInput
     peak = GpuPeak()
-    if args.model == "fast":
-        model = EsmFold2ExperimentalModel.from_pretrained(args.fast_checkpoint, load_esmc=True, device="cuda").eval()
+    if experimental(args.model):
+        model = EsmFold2ExperimentalModel.from_pretrained(args.checkpoint, load_esmc=True, device="cuda").eval()
         model.configure_lm_dropout(0.0, force_lm_dropout_during_inference=False)
     else:
-        model = EsmFold2Model.from_pretrained(args.full_checkpoint, device="cuda").eval()
+        model = EsmFold2Model.from_pretrained(args.checkpoint, device="cuda").eval()
     builder = ESMFold2InputBuilder()
     accepted = set(inspect.signature(model.forward).parameters)
     rows = []
@@ -112,7 +126,7 @@ def upstream(args, cases, work):
                     for k, s in enumerate(seqs)])
 
                 def fold():
-                    if args.model == "full":
+                    if not experimental(args.model):
                         return builder.fold(model, spi, num_loops=loops, num_sampling_steps=args.steps,
                                             num_diffusion_samples=1, seed=1, lm_dropout=0.0)
                     feats, out_chains = builder.prepare_input(spi, seed=1, device="cuda")
@@ -125,7 +139,7 @@ def upstream(args, cases, work):
                     fold(); torch.cuda.synchronize()
                     t = time.time(); res = fold(); torch.cuda.synchronize(); ms = (time.time() - t) * 1000
                     pdb = os.path.join(work, f"up-{name}-{backend}-L{loops}.pdb")
-                    if args.model == "full":
+                    if not experimental(args.model):
                         import gemmi
                         cif = pdb[:-4] + ".cif"; open(cif, "w").write(res.complex.to_mmcif())
                         st = gemmi.read_structure(cif); st.setup_entities(); st.write_pdb(pdb)
@@ -142,13 +156,72 @@ def upstream(args, cases, work):
     return rows
 
 
+def ours_warm(args, cases, work):
+    """the port timed WARM, as upstream is: its resident server (--serve, the Colab worker's mode) folds each case
+    three times and the third fold's stage times are read - a one-shot binary since b7118c9 skips its warm-up when the
+    input is already written, so its stage times carry every kernel's first launch (6MRR's trunk 128 ms cold, 39 warm)"""
+    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    model = args.model
+    if experimental(model):
+        r = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "fetch-weights"), model], capture_output=True, text=True)
+        dirs = re.findall(re.escape(model) + r": (/\S+)", r.stdout + r.stderr)
+    else:                       # (the released models' bundles are local exports: cuda/ef2/README.md, "The released models")
+        r = subprocess.CompletedProcess([], 1, "", "no local export")
+        dirs = [os.path.join(ROOT, RELEASED[model]), os.path.join(ROOT, "model-esmc-6b-int8")]
+        dirs = dirs if all(os.path.isdir(d) for d in dirs) else []
+    if len(dirs) != 2:
+        return [dict(side="localfold-ef2 warm", target=n, loops=l, error="fetch-weights: " + (r.stdout + r.stderr)[-160:])
+                for l in args.loop_list for n, *_ in cases]
+    serve = os.path.join(work, "serve"); os.makedirs(serve, exist_ok=True)
+    log = open(os.path.join(serve, "server.log"), "w")
+    proc = subprocess.Popen([binary, "-", f"--fold-bundle={dirs[0]}", f"--esmc-bundle={dirs[1]}", "--fast", "--warm=96,800",
+                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, EF2_PASSES=str(args.loop_list[0] + 1)))
+    if len(args.loop_list) > 1:
+        print("(the warm server takes the first --loops only)", flush=True)
+    rows, count = [], 0
+    def job(inputs, flags):
+        nonlocal count
+        count += 1
+        base = os.path.join(serve, f"{count:06d}")
+        open(base + ".tmp", "w").write("\n".join([inputs, *flags]) + "\n"); os.rename(base + ".tmp", base + ".job")
+        while not os.path.exists(base + ".done"):
+            if proc.poll() is not None: raise RuntimeError(open(log.name).read()[-300:])
+            time.sleep(0.005)
+        return int(open(base + ".done").read().strip() or 1), open(base + ".log").read()
+    try:
+        for loops in args.loop_list:
+            for name, chains, seqs, a3ms in cases:
+                inputs = os.path.join(work, f"in-{name}")
+                f = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs),
+                                    f"--fold-bundle={dirs[0]}"], capture_output=True, text=True)
+                if f.returncode != 0 or a3ms:
+                    rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, error=(f.stdout + f.stderr)[-160:] or "alignment"))
+                    continue
+                pdb = os.path.join(work, f"lfw-{name}-L{loops}.pdb")
+                peak = GpuPeak()
+                for k in range(3):
+                    code, said = job(inputs, [f"--out={pdb}", "--seed=1"])
+                peak.stop = True
+                stages = {m.group(1): float(m.group(2)) for m in re.finditer(r"^([a-z][a-z ]+?) ([0-9.]+) ms", said, re.M)}
+                rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
+                                 rmsd=rmsd(pdb, name, chains) if code == 0 else None,
+                                 **({} if code == 0 else {"error": said.strip()[-160:]})))
+                print(json.dumps(rows[-1]), flush=True)
+        open(os.path.join(serve, "zzzzzz.tmp"), "w").write("quit\n"); os.rename(os.path.join(serve, "zzzzzz.tmp"), os.path.join(serve, "zzzzzz.job"))
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None: proc.kill()
+    return rows
+
+
 def ours(args, cases, work):
     binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
     rows = []
     for loops in args.loop_list:
         for name, chains, seqs, a3ms in cases:
             pdb = os.path.join(work, f"lf-{name}-L{loops}.pdb")
-            cmd = [binary, f"--model={'ef2-fast-600m' if args.model == 'fast' else 'ef2'}", "--sequence=" + ":".join(seqs),
+            cmd = [binary, f"--model={args.model}", "--sequence=" + ":".join(seqs),
                    "--seed=1", f"--out={pdb}"] + ([f"--a3m={','.join(os.path.join(ROOT, a) for a in a3ms)}"] if a3ms else [])
             peak = GpuPeak()
             t = time.time()
@@ -166,23 +239,25 @@ def ours(args, cases, work):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["fast", "full"], default="fast")
+    p.add_argument("--model", choices=list(UPSTREAM), default="ef2-fast-600m", help="localfold-ef2's --model")
+    p.add_argument("--checkpoint", default="", help="upstream's checkpoint (default: the model's own, UPSTREAM)")
     p.add_argument("--loops", default="", help="comma-separated; default 3")
     p.add_argument("--backends", default="fused", help="upstream kernel backends: none, fused, cuequivariance")
-    p.add_argument("--fast-checkpoint", default=os.path.join(os.path.dirname(ROOT), "ef2", "esmfold2-fast-600m"))
-    p.add_argument("--full-checkpoint", default="biohub/ESMFold2")
     p.add_argument("--no-msa", action="store_true", help="skip the alignment cases (the full model only reads them)")
     p.add_argument("--only", default="", help="targets whose name contains this")
+    p.add_argument("--ours-only", action="store_true", help="skip upstream (no esm package needed)")
     args = p.parse_args()
     args.loop_list = [int(x) for x in (args.loops or "3").split(",")]
-    args.steps = 15 if args.model == "fast" else 14
+    args.steps = 15 if experimental(args.model) else 14
+    args.checkpoint = args.checkpoint or UPSTREAM[args.model]
     cases = [(n, cs, [chain_seq(n, c) for c in cs], None) for n, cs in TARGETS]
     cases.append(("1tim-x4", ["A"] * 4, [chain_seq("1tim", "A")] * 4, None))       # ~1000 tokens, speed only
-    if args.model == "full" and not args.no_msa:
+    if args.model == "ef2" and not args.no_msa:
         cases += [(n + "+msa", dict(TARGETS)[n], [chain_seq(n, c) for c in dict(TARGETS)[n]], A3M[n]) for n in A3M]
     cases = [c for c in cases if args.only in c[0]]
     work = tempfile.mkdtemp(prefix="compare-ef2-")
-    rows = upstream(args, cases, work) + ours(args, cases, work)
+    rows = (upstream(args, cases, work) if not args.ours_only else []) + ours(args, cases, work)
+    rows += ours_warm(args, cases, work)
     print(f"\n{'target':10s} {'loops':>5s}  " + "  ".join(f"{s:>28s}" for s in sorted({r['side'] for r in rows})))
     for name, *_ in cases:
         for loops in args.loop_list:

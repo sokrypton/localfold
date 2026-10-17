@@ -6687,8 +6687,8 @@ Flow itself remains), `probe-flow-sigma-by-size.js` and `probe-one-step-sigma.js
 `foldBatch` (webgpu/af3/fold.js `DIFFUSION_DEFAULTS`) and cuda/af3 (`DiffusionOptions` in sampler.cuh) both default to
 the exponential update on the geometric schedule with churn, and the page's one dial (`AF3_COUNTS` in web/af3-model.js)
 prefers 25 for every AF3-lineage family. Gone with it: `ALPHAFOLD3_COUNTS`, `OPENDDE_COUNTS`, `SHORT_SCHEDULES` and
-`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 keeps its own sampler (the flags are refused
-only when given). `--update=euler --schedule=karras` folds the old way.
+`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 kept its own sampler here, and
+took the exponential step on its own schedule a day later - "chai-1's sampler", below. `--update=euler --schedule=karras` folds the old way.
 
 **The decision run** (cuda/af3, seven models; each model's OLD page default against the exponential sampler at
 16 / 20 / 25 and both samplers at 200). Bonds over bench-sampler-geometry.js's seven systems x two seeds; ligand =
@@ -6725,3 +6725,105 @@ exp 25 minus the old default is -0.16 to +0.05 A per model (mean of per-target m
   on an answer the template already pins, against ligands that stop tearing.
 
 Raw rows: `/tmp/claude-1000/sch/finalA.txt`, `finalB.txt` and `fsum.py` on the A100 box (not kept).
+
+## chai-1's sampler: the exponential step on its own schedule (2026-10-17)
+
+chai-1 kept its own sampler when the lineage moved (above): chai-lab's schedule (sigma_max 80, rho 7, sigma_min 4e-4 at
+the N midpoints), its churn, and its step - by default one denoiser call a step, `x = noisy + 2 dt g1`, an Euler step at
+a scale of 2 (cuda/af3/src/sampler.cuh, `sampleChai`). It now takes the lineage's flags, and its default step is the
+exponential one, `x' = r^S noisy + (1 - r^S) D` with `r = sigma / tHat` and S its own 2, on ITS schedule.
+`--update=euler` is the sampler before (byte-identical), `--schedule=geometric` the lineage's schedule at its endpoints,
+`--step-scale=` another S, `--chai-second-order` two calls a step (the exponential Heun step, or with
+`--update=euler` chai-lab's two-call step as written).
+
+**Measured** with the lineage's decision run (cuda/af3: bench-sampler-geometry's seven systems x two seeds of bonds; 6MRR,
+1QYS, 5CAJ, 1TIM A, 1TIM A:B and 1BRS A:D x three seeds of CA RMSD), all at the page's 25 steps but the 200 rows. Medians;
+ligand = GOL, ATP and SEP, its mean and how many of six folds went past 0.15 A; clashes MolProbity's clashscore:
+
+| arm | mainchain | peptide | side chain | nucleic | ligand (mean, torn) | crystals | clashes |
+|---|---|---|---|---|---|---|---|
+| its own step (the default before) | 0.063 | 0.052 | 0.075 | 0.075 | 0.058 (0.092, 1/6) | 1.294 | 0.00 |
+| **exponential, its own schedule (the default)** | **0.034** | **0.019** | **0.052** | **0.048** | **0.055 (0.058, 0/6)** | **1.285** | **0.00** |
+| exponential, geometric schedule | 0.034 | 0.017 | 0.052 | 0.051 | 0.052 (0.055, 0/6) | 1.263 | 3.49 |
+| exponential, geometric, S 1.5 | 0.034 | 0.017 | 0.052 | 0.053 | 0.049 (0.053, 0/6) | 1.270 | 2.62 |
+| its own step, 200 | 0.033 | 0.017 | 0.052 | 0.049 | 0.043 (0.038, 0/6) | 1.296 | 0.00 |
+| exponential, geometric, 200 | 0.034 | 0.019 | 0.053 | 0.050 | 0.046 (0.065, 0/6) | 1.321 | 5.24 |
+
+- **The exponential step gives 25 steps its 200 steps' bonds** - mainchain and peptide halved and more, side chains
+  and nucleic acids to 200's - at the same cost, and no ligand tears; crystals level (inside the seed spread).
+- 🔴 **THE GEOMETRIC SCHEDULE ADDS ONE TO THREE CLASHES A FOLD, AND THAT IS WHY IT IS NOT chai-1's**: every protein
+  and ligand system on both seeds (one clash is 1.75 at these sizes), at 25 and at 200, for the same bonds the
+  exponential step gets on chai-1's own schedule. The lineage's decision run did not score clashes, so whether its own
+  geometric default pays the same is not known - its clash column is the thing to add.
+
+**And two calls a step buys nothing - on either update.** `--chai-second-order` now takes the exponential update too, as
+the exponential Heun step: `x' = r noisy + (1 - r) D1` (a point at the step's own level, where the second call evaluates
+it), `D2 = D(x', sigma)`, then `x = r^S noisy + (1 - r^S) (D1 + D2) / 2` - the one-call default exactly when D2 = D1, as
+chai-lab's two-call step reduces to its one-call form. `--update=euler --chai-second-order` is chai-lab's as written.
+At matched denoiser calls (the same protocol):
+
+| arm | calls | mainchain | peptide | side chain | nucleic | ligand (mean) | crystals | clashes (mean) |
+|---|---|---|---|---|---|---|---|---|
+| exponential, one call (the default), 25 steps | 25 | 0.034 | 0.019 | 0.052 | 0.048 | 0.055 (0.058) | 1.285 | 1.00 |
+| exponential, one call, 50 steps | 50 | 0.033 | 0.015 | 0.052 | 0.049 | 0.050 (0.044) | 1.290 | 1.62 |
+| exponential Heun, 25 steps | 50 | 0.034 | 0.018 | 0.052 | 0.048 | 0.053 (0.066) | 1.288 | 1.12 |
+| chai-lab's two-call step, 25 steps | 50 | 0.055 | 0.042 | 0.065 | 0.059 | 0.049 (0.052) | 1.292 | 0.87 |
+
+The exponential Heun step at twice the cost is the one-call step's fold; spent on 50 one-call steps the same calls do a
+little better on ligands and peptides. The second call is close to the first (D2 ~ D1), which is why the one-call
+form was chai-1's default already. Not taken; the flag keeps it.
+
+Raw rows: `/tmp/claude-1000/chai/run.txt`, `run2.txt`, `chai.sh` and `chai2.sh` on the A100 box (not kept).
+
+## A multistep update: measured, kept as an option, not taken (2026-10-16)
+
+`--update=multistep` on cuda/af3 is the exponential step on DPM-Solver++ 2M's extrapolation: the denoiser's previous
+prediction, moved into this step's frame by the same rotation and shift the augmentation gave the coordinates, blended
+as `D = (1 + w) d - w d_prev`, `w = h / (2 h_prev)` with `h` this step's log-sigma drop and `h_prev` the gap between the
+two levels the denoiser was evaluated at (churn makes those the raised levels, not the schedule's).
+`--multistep-below=<A>` applies it only at steps under that noise level and the plain exponential step above. Native
+only; the page does not have it.
+
+Seven models, the decision run's systems (7 x 2 seeds of bonds) and crystals (6 targets x 3 seeds). Ligand bond
+median / mean (A) and folds past 0.15 A of 6, then the crystals' mean CA RMSD:
+
+| model | exp 25 (default) | multistep 12 | hybrid 12, below 4 A | hybrid 12, below 8 A | hybrid 25, below 4 A |
+|---|---|---|---|---|---|
+| af3 | 0.042 / 0.062, 1 · 1.106 | 0.046 / 0.086 · **1.344** | 0.035 / 0.087, 1 · 1.105 | - | 0.037 / 0.034, 0 · 1.129 |
+| boltz2 | 0.071 / 0.073 · 1.439 | 0.103 / 0.124 · 1.181 | 0.066 / 0.110, 2 · 1.395 | 0.093 / 0.089, 1 · 1.437 | 0.070 / 0.061 · 1.458 |
+| intellifold2 | 0.049 / 0.052 · 1.592 | 0.044 / 0.043 · 1.660 | 0.035 / 0.068, 1 · 1.588 | 0.036 / 0.033 · 1.608 | 0.036 / 0.036 · 1.609 |
+| openbind0 | 0.059 / 0.065 · 1.375 | 0.038 / 0.043 · 1.414 | 0.055 / 0.091, 1 · 1.289 | 0.042 / 0.042 · 1.343 | 0.046 / 0.053 · 1.401 |
+| opendde | 0.053 / 0.082, 1 · 1.123 | 0.046 / 0.051 · 1.321 | 0.041 / 0.037 · 1.248 | 0.039 / 0.043 · 1.277 | 0.040 / 0.042 · 1.140 |
+| protenix2 | 0.047 / 0.049 · 1.565 | 0.042 / 0.038 · 1.624 | 0.042 / 0.035 · 1.462 | 0.042 / 0.033 · 1.510 | 0.043 / 0.037 · 1.585 |
+| rosettafold3 | 0.067 / 0.082 · 1.299 | 0.066 / 0.117, 2 · 1.331 | 0.079 / 0.097, 1 · 1.292 | 0.051 / 0.081, 1 · 1.326 | 0.066 / 0.070 · 1.388 |
+
+- **Everywhere, it moves chains.** Extrapolating at high noise, where the steps PLACE the chain, costs af3 0.24 A and
+  opendde 0.20 A of crystal RMSD at 12 steps. On af3 + ATP alone it looked like a clean win (12 steps 0.042-0.049 A
+  against the exponential's 0.16-0.29) - the ligand bench cannot see placement.
+- **Below 4 A it keeps them**: those steps are exactly the exponential ones above the threshold, so the crystals equal
+  the exponential's at the same count. Below 16 A af3's 6MRR slips (0.62 -> 0.98).
+- **At 25 steps below 4 A the ligand mean improves on all seven models** and no fold tears (exp 25 tore two), against
+  crystals 0.02-0.09 A worse - the same sign on all seven, each inside three seeds' spread. Not taken: the default's
+  ligands are already at the 200-step level.
+- **Twelve steps place the chain** (exp 12's crystals match exp 25's on six of seven; opendde's 6MRR is the one) - the
+  steps past twelve are spent settling small molecules. Hybrid 12 still loses ligand tails on boltz2, rosettafold3 and
+  openbind0, so the open question is the ALLOCATION: fewer steps above ~4 A and more below.
+
+Raw rows: `/tmp/claude-1000/sch/ms*.txt`, `hy*.txt` on the A100 box (not kept).
+
+### 🔴 ...and the steps cannot be reallocated for free: above 4 A places complexes, below settles ligands
+
+`--schedule-split=<A>:<K>` (cuda/af3) runs the geometric schedule as two segments, K steps from the top down to that
+level and the rest below it. With multistep below 4 A, against the exponential 25 (which spends ~12.5 steps above
+4 A):
+
+- **Four steps above place a 68-494 residue chain** (16 calls, 4 above: ligands and six crystals level on all seven
+  models) **and do NOT place an assembly**: a Boltz-2 GroEL ring sample broke to 23.6 A (every chain 12.5 A) where
+  exp 25's two were 2.9 / 3.4, and AF3's ring went 1.41 -> 2.28 on one sample. The small crystals cannot see it.
+- **Eight above hold the assemblies** (rings, 1JZ7 A:B, ring + GroES within a sample's spread of exp 25), but at 16
+  calls (8 below) ligand tails come back - two of twelve past 0.15 A on boltz2, opendde and rosettafold3 against 0, 1
+  and 0 - and at 20 calls (12 below) the ligands are level while the 1TIM dimer is ~0.1 A worse on four models
+  (af3 1.11 -> 1.25, boltz2 1.38 -> 1.45, protenix2 1.16 -> 1.31, opendde 1.18 -> 1.27).
+- So the default stays: 20% fewer calls is not worth a consistent 0.1 A on a dimer, and the exponential 25 is close
+  to the balance of the two halves. The flags stay for measuring; `/tmp/claude-1000/sch/sp*.txt` and
+  `/tmp/claude-1000/big/big2.txt`, `big3.txt` on the A100 box (not kept).

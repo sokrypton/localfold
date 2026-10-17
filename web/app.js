@@ -1696,7 +1696,16 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
     // both this and the PDB are written from `sequence`.
     files.push(file(`${stem}.a3m`, a3m));
   }
-  const stats = await load(files, true);
+  // 🔴 A LIGAND THE READER ASKED FOR IS NOT A CRYSTALLISATION ADDITIVE. py2Dmol drops HETATM groups named in its
+  // CRYSTAL_ADDITIVES (sulfate, glycerol, the PEGs - P6G among them - buffers, salts and ions) from a loaded structure
+  // unless viewerConfig.ui.filterAdditives is false, and its default is true: right for a crystal off the PDB, wrong
+  // for a prediction, where every ligand is one the reader folded. Reported by a user - a P6G folded, in the PDB and the
+  // archive, and absent from the picture while E0H beside it drew. Off for our own loads, the default put back after.
+  const ui = window.viewerConfig?.ui;
+  const filtered = ui?.filterAdditives;
+  if (ui) ui.filterAdditives = false;
+  let stats;
+  try { stats = await load(files, true); } finally { if (ui) ui.filterAdditives = filtered; }
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;

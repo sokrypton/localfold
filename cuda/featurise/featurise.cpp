@@ -232,6 +232,160 @@ static int fetchMain(int argc, char** argv) {
   return 0;
 }
 
+// `msa-search <out.json> --sequence=<A>:<B>:... [--name=<name>]`: the ColabFold MMseqs2 search alone - each distinct
+// chain searched once, the distinct chains paired - written as an AlphaFold 3 job (the alphafold3 dialect) carrying
+// every protein's unpairedMsa and pairedMsa inline, identical chains one entity with several ids. Any port folds it with
+// --job=, so a search runs once, ahead of the GPUs, and the job is the input as published. SENDS THE SEQUENCES TO
+// api.colabfold.com
+static std::string jsonQuoted(const std::string& s) {
+  std::string o = "\"";
+  o.reserve(s.size() + 2);
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "\\r";
+    else if (c == '\t') o += "\\t";
+    else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+    else o += (char)c;
+  }
+  return o + "\"";
+}
+// a window's A3M - its query the residues [off, off + seg.size()) of a chain of `len` - re-written over the whole chain:
+// every row padded with gaps outside the window (its insertions kept), in its order; a row that is the window's query
+// becomes the whole query (dropQuery: dropped - an unpaired block opens with its query, which the chain's own first row
+// already is; a paired block keeps it, its rows being row-aligned across the chains)
+static std::string widenA3m(const std::string& a3m, const std::string& seg, const std::string& full, size_t off, bool dropQuery) {
+  std::string out, header, row;
+  auto flush = [&] {
+    if (header.empty()) return;
+    size_t aligned = 0; std::string upper;
+    for (char c : row) if (!(c >= 'a' && c <= 'z')) { ++aligned; upper += c; }
+    if (aligned != seg.size()) throw std::runtime_error("a window's A3M row is " + std::to_string(aligned) + " columns, the window " + std::to_string(seg.size()));
+    if (upper == seg) { if (!dropQuery) out += header + "\n" + full + "\n"; }
+    else out += header + "\n" + std::string(off, '-') + row + std::string(full.size() - off - seg.size(), '-') + "\n";
+    header.clear(); row.clear();
+  };
+  size_t at = 0;
+  while (at < a3m.size()) {
+    size_t end = a3m.find('\n', at); if (end == std::string::npos) end = a3m.size();
+    std::string line = a3m.substr(at, end - at);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty() && line[0] == '>') { flush(); header = line; }
+    else row += line;
+    at = end + 1;
+  }
+  flush();
+  return out;
+}
+// a chain longer than the server searches whole (it ended TycC's 6,486 residues and BacA's 5,255 with ERROR): windows of
+// WINDOW residues overlapping by OVERLAP, each searched alone and widened back over the chain
+constexpr size_t WINDOW = 3000, OVERLAP = 300;
+static std::vector<size_t> windowsOf(size_t len) {
+  std::vector<size_t> starts;
+  for (size_t s = 0; ; s += WINDOW - OVERLAP) { starts.push_back(s); if (s + WINDOW >= len) break; }
+  return starts;
+}
+
+// ...and the paired search, every chain's first window at once, takes no more than PAIRED_RESIDUES in all: the server
+// paired 8,607 (bacitracin's three) and ended 11,273 (gramicidin's four) with ERROR - each chain's window cut to one
+// length where the sum would pass it
+constexpr size_t PAIRED_RESIDUES = 8000;
+static size_t pairedCut(const std::vector<std::string>& unique) {
+  auto total = [&](size_t cut) { size_t t = 0; for (auto& q : unique) t += std::min(q.size(), cut); return t; };
+  size_t lo = 1, hi = WINDOW;
+  if (total(hi) <= PAIRED_RESIDUES) return hi;
+  while (lo < hi) { const size_t mid = (lo + hi + 1) / 2; if (total(mid) <= PAIRED_RESIDUES) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+// every search's answer kept in <out>.searches/, named by its query (FNV-1a), so a rerun after a failure - an hour of
+// windows lost to the last step, once - takes what is already there
+static std::string keptSearch(const std::string& dir, const std::string& key, const std::function<std::string()>& run) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : key) { h ^= c; h *= 1099511628211ull; }
+  char name[32]; snprintf(name, sizeof name, "/%016llx.a3m", (unsigned long long)h);
+  const std::string path = dir + name;
+  if (lf::fetch::exists(path)) return lf::readFile(path);
+  std::string text = run();
+  lf::writeText(path + ".part", text);
+  if (rename((path + ".part").c_str(), path.c_str())) throw std::runtime_error("cannot write " + path);
+  return text;
+}
+
+static int msaMain(int argc, char** argv) {
+  std::vector<std::string> list(argv + 1, argv + argc);
+  lf::Args args(list);
+  if (args.positional.empty() || args.option("sequence").empty()) {
+    fprintf(stderr, "usage: msa-search <out.json> --sequence=<A>:<B>:... [--name=<name>]\n");
+    return 1;
+  }
+  try {
+    std::vector<std::string> chains;
+    for (auto& c : lf::splitNonEmpty(args.option("sequence"), ':')) chains.push_back(lf::search::normalizedSequence(c));
+    std::vector<std::string> unique;
+    for (auto& c : chains) if (std::find(unique.begin(), unique.end(), c) == unique.end()) unique.push_back(c);
+    auto say = [](const std::string& m) { fprintf(stderr, "%s\n", m.c_str()); fflush(stderr); };
+    const std::string kept = args.positional + ".searches";
+    lf::fetch::makeDirs(kept);
+    auto one = [&](const std::string& q, const std::string& tag) {
+      return keptSearch(kept, "unpaired:" + q, [&] { return lf::search::searchOne(q, [&](const std::string& m) { say(tag + ": " + m); }).a3m; });
+    };
+    std::vector<std::string> unpaired, paired(unique.size());
+    for (size_t i = 0; i < unique.size(); ++i) {
+      const std::string& q = unique[i];
+      const std::string tag = "chain " + std::to_string(i + 1) + " of " + std::to_string(unique.size()) + " (" + std::to_string(q.size()) + " residues)";
+      if (q.size() <= WINDOW) {
+        unpaired.push_back(one(q, tag));
+        continue;
+      }
+      std::string a = ">101\n" + q + "\n";
+      const auto starts = windowsOf(q.size());
+      for (size_t w = 0; w < starts.size(); ++w) {
+        const std::string seg = q.substr(starts[w], std::min(WINDOW, q.size() - starts[w]));
+        const std::string wtag = tag + ", window " + std::to_string(w + 1) + " of " + std::to_string(starts.size());
+        a += widenA3m(one(seg, wtag), seg, q, starts[w], true);
+      }
+      unpaired.push_back(a);
+    }
+    // the paired search on each chain's first window (pairing is by organism, and the organisms' full-length proteins
+    // carry the window), its rows widened back over the chains
+    if (unique.size() > 1) {
+      const size_t cut = pairedCut(unique);
+      std::vector<std::string> heads;
+      std::string key = "paired";
+      for (auto& q : unique) { heads.push_back(q.substr(0, std::min(cut, q.size()))); key += ":" + heads.back(); }
+      if (cut < WINDOW) say("paired: each chain's first " + std::to_string(cut) + " residues (" + std::to_string(PAIRED_RESIDUES) + " in all at most)");
+      const std::string joined = keptSearch(kept, key, [&] {
+        std::string j;
+        for (auto& t : lf::search::searchPaired(heads, [&](const std::string& m) { say("paired: " + m); })) j += t + '\x01';
+        return j;
+      });
+      for (size_t i = 0, at = 0; i < unique.size(); ++i) {
+        const size_t end = joined.find('\x01', at);
+        if (end == std::string::npos) throw std::runtime_error("a kept paired search has too few chains: " + kept);
+        paired[i] = joined.substr(at, end - at); at = end + 1;
+        if (unique[i].size() > heads[i].size()) paired[i] = widenA3m(paired[i], heads[i], unique[i], 0, false);
+      }
+    }
+    // chain ids in input order, mmCIF's way: A..Z, AA, AB, ...
+    auto chainId = [](int a) { std::string id; for (a = a; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; } return id; };
+    std::string j = "{\n \"name\": " + jsonQuoted(args.option("name", "complex")) + ",\n \"modelSeeds\": [1],\n \"dialect\": \"alphafold3\",\n \"version\": 2,\n \"sequences\": [";
+    for (size_t u = 0; u < unique.size(); ++u) {
+      std::string ids;
+      for (size_t c = 0; c < chains.size(); ++c) if (chains[c] == unique[u]) ids += std::string(ids.empty() ? "" : ", ") + jsonQuoted(chainId((int)c));
+      j += std::string(u ? "," : "") + "\n  {\"protein\": {\"id\": [" + ids + "], \"sequence\": " + jsonQuoted(unique[u])
+         + ", \"unpairedMsa\": " + jsonQuoted(unpaired[u]) + ", \"pairedMsa\": " + jsonQuoted(paired[u]) + ", \"templates\": []}}";
+    }
+    j += "\n ]\n}\n";
+    lf::writeText(args.positional, j);
+    fprintf(stderr, "%zu chains (%zu distinct), %zu residues -> %s (%.1f MB)\n", chains.size(), unique.size(),
+            [&] { size_t n = 0; for (auto& c : chains) n += c.size(); return n; }(), args.positional.c_str(), j.size() / 1e6);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "Error: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   std::string self = argv[0];
   self = self.substr(self.rfind('/') == std::string::npos ? 0 : self.rfind('/') + 1);
@@ -243,6 +397,7 @@ int main(int argc, char** argv) {
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
   if (self == "fetch-weights" || self == "localfold-fetch") return fetchMain(argc, argv);   // (the wheel's name for it)
-  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
+  if (self == "msa-search") return msaMain(argc, argv);
+  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates, fetch-weights or msa-search (not %s)\n", self.c_str());
   return 2;
 }

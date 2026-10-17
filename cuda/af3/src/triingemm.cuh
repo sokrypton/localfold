@@ -52,8 +52,10 @@ constexpr size_t triInGemmSmem() { return TG_STAGES * TG_STAGE; }      // (the e
 // The GEMM's main loop: acc (a warp's 64 x 64) = X[row0 .. row0 + 128][0 .. C] Wt[0 .. C][0 .. 128], X row-major with
 // rows past pp read as zero, Wt one packed [C][128] tile. Leaves every cp.async group drained.
 template <int C>
+// rs, ks: X's row stride and its 32-wide k chunks' stride (C and 32: row-major; AF2's outer product mean reads its
+// product [a][j][b] where it lies, rows j at 32 and chunks a at L * 32)
 __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* __restrict__ Wt, size_t row0, size_t pp,
-                                       unsigned char* smem, float (&acc)[4][8][4]) {
+                                       unsigned char* smem, float (&acc)[4][8][4], size_t rs = C, size_t ks = 32) {
   constexpr int KC = C / 32;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int wm = warp & 1, wn = warp >> 1;
@@ -71,14 +73,14 @@ __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* _
   for (int i = 0; i < 4; ++i) {
     size_t q = row0 + (tid >> 2) + 32 * i;
     okA[i] = q < pp;
-    sA[i] = X + (okA[i] ? q : 0) * C + (tid & 3) * 8;
+    sA[i] = X + (okA[i] ? q : 0) * rs + (tid & 3) * 8;
   }
   const half* sB = Wt + (size_t)(tid >> 4) * 128 + (tid & 15) * 8;
   auto issue = [&](int kc) {
     if (kc < KC) {
       half *A = As(kc % TG_STAGES), *B = Bs(kc % TG_STAGES);
 #pragma unroll
-      for (int i = 0; i < 4; ++i) cpAsync16(A + dA + i * 1024, sA[i] + kc * 32, okA[i]);
+      for (int i = 0; i < 4; ++i) cpAsync16(A + dA + i * 1024, sA[i] + kc * ks, okA[i]);
 #pragma unroll
       for (int i = 0; i < 4; ++i) cpAsync16(B + dB + i * 1024, sB + (size_t)kc * 4096 + i * 1024, true);
     }

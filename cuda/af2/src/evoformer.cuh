@@ -16,7 +16,20 @@ struct Trunk {
   bool opmFirst;
   // all ones (no padding, no absent row): the flash kernel then skips the mask altogether
   bool msaOnes = false, extraOnes = false, pairOnes = false;
+  float* msa16 = nullptr;       // the main stack's MSA in bf16 while its blocks run (MSA16), else null
 };
+// MSA16: the main stack's MSA held in bf16 through its blocks (AlphaFold 2's own precision, global_config.bfloat16):
+// its LayerNorms read half the bytes and its three residual adds - the row and column attention's output projections
+// and the transition's second layer, bf16 GEMMs accumulating in place - read and write half; converted in before the
+// blocks and out after them (af2.cu). Set where every block's MSA path has a bf16 form: --fast, every MSA row live,
+// no template rows, 8 heads of 32 on an Ampere part
+inline bool MSA16 = false;
+// a pair pointer `elems` elements on, in the pair's own storage: t.pair is a float* that holds bf16 under PAIR16, so a bare
+// `pair + n` lands 2n bf16 elements on - past 2,048 residues (a second chunk of the row attention's bias, 4M pairs a chunk)
+// that read past the pair and into whatever lay there, a crash or a silently wrong bias
+inline const float* pairAdvance(const float* p, size_t elems) {
+  return PAIR16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(p) + elems) : p + elems;
+}
 
 // ---------------------------------------------------------------- the embedder
 // relpos [L, L, 73] one-hot, as _relative_encoding builds it
@@ -208,7 +221,7 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
   // the masks into fixed buffers: the stacks after this are replayed as one CUDA graph from pass 1 on,
   // and a graph's pointers do not change between passes
-  float* mm = scratch<float>("emb.msaMask", (size_t)(N + t.T) * L); float* em = scratch<float>("emb.extraMask", erows);
+  float* mm = scratch<float>("mask.msa", (size_t)(N + t.T) * L); float* em = scratch<float>("mask.extra", erows);
   CK(cudaMemcpyAsync(mm, W(f + "msa_mask"), (size_t)N * L * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
   t.msaMask = mm; t.extraMask = em;
@@ -256,6 +269,20 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
   }
   return z;
 }
+// the MSA16 stack's row (NB false: the pair bias) and column (NB: none) attention, bf16 out, with the pair track's
+// speculative softmax (FLASH_SPEC), and the row attention its 64-key tiles where an SM holds two blocks of them
+// (flash2RWideKeys). A100, 1,000 residues, 508 rows: the row attention 914 -> 862 ms, the column 524 -> 511 (64 keys
+// there 545: no bias tile for the wider tile to amortise)
+template <bool NB>
+inline void msaFlash(const half* qkvg, const half* bias, int stride, __nv_bfloat16* o, int n, int heads, size_t rows, float scale,
+                     size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
+  using B16 = __nv_bfloat16;
+  if (FLASH_SPEC && !NB && flash2RWideKeys())
+    flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  else if (FLASH_SPEC)
+    flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  else flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+}
 // --fast: from the normalised input xn (f16): one q/k/v/gate GEMM straight into the flash kernel's
 // layout -> flash attention -> the output projection with its bias, added into `residual` (transposed
 // back first when `transposedBack`, xn being [n, Bt] of the residual's [Bt, n])
@@ -269,7 +296,7 @@ __global__ void swapAddRowsK(float* y, const float* x, int A, int B, int C, size
 inline void attentionCore(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const float* keyMask,
                           const half* bias, float* residual, bool transposedBack) {
   size_t rows = (size_t)Bt * n;
-  AttnW w = attnWeights(A, blk, C);
+  AttnW w = attnWeights(A, blk, C, flashNarrow(keyMask));
   int Wp = w.H * w.Dp, stride = (n + 7) / 8 * 8;
   if (!bias) bias = zeroBias(w.H, n, stride);
   // where the q/k/v/gate and the output of every row would not fit with room to spare, a chunk of rows at
@@ -383,15 +410,30 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       const float *sc = P(R + "/feat_2d_norm/scale", blk), *of = P(R + "/feat_2d_norm/offset", blk);
       for (size_t r0 = 0; r0 < pairs; r0 += per) {
         size_t r = std::min(per, pairs - r0);
-        lnHeadsRaw<16>(t.pair + r0 * 128, sc, of, it->second, raw, r);
+        lnHeadsRaw<16>(pairAdvance(t.pair, r0 * 128), sc, of, it->second, raw, r);
         biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, b, L, H, stride, false, r0, r,
                                                              t.pairOnes ? nullptr : t.pairMask, true);
       }
       bias = b;
     }
+    if (MSA16 && msa == t.msa16) {
+      using B16 = __nv_bfloat16;
+      B16* m16 = reinterpret_cast<B16*>(msa);
+      AttnW w = attnWeights(R + "/attention", blk, C);
+      int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
+      half* xn = scratch<half>("frow.xn", rows * C);
+      layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
+                                                                                P(R + "/query_norm/offset", blk));
+      half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+      ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+      B16* o = scratch<B16>("fatt.o16", rows * Wp);
+      msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
+      ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+      return;
+    }
+    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
-    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     attentionCore(xn, rowsN, L, C, R + "/attention", blk, ones ? nullptr : msaMask, bias, msa, false);
     return;
   }
@@ -412,6 +454,23 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
                                const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_attention";
+  if (MSA16 && msa == t.msa16) {
+    // (as attentionCoreAcross, its MSA, output and output projection bf16)
+    using B16 = __nv_bfloat16;
+    B16* m16 = reinterpret_cast<B16*>(msa);
+    AttnW w = attnWeights(A + "/attention", blk, C);
+    int Wp = w.H * w.Dp, stride = (rowsN + 7) / 8 * 8;
+    half* xn = scratch<half>("fcol.xn", rows * C);
+    layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
+                                                                              P(A + "/query_norm/offset", blk));
+    half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+    ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+    B16* o = scratch<B16>("fatt.o16", rows * Wp);
+    msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
+                                                     (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
+    ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+    return;
+  }
   if (FAST && t.msaOnes) {
     half* xn = scratch<half>("fcol.xn", rows * C);
     layerNormH(msa, xn, rows, C, A + "/query_norm", blk);
@@ -485,6 +544,29 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
     // over 5CAJ's 576 calls against 117.8 for the LN plus this GEMM it replaced, and 181.6 at two tiles a
     // warp. At 256 channels its m16-a-warp MMAs read each weight fragment for one MMA; cuBLAS does better.)
     size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
+    // (on sm_12x the MSA16 stack's MSA transition in one kernel, cuda/af3's fusedTransitionSplit256: 2.41 -> 2.00 ms a
+    // call at 1,000 residues x 508 rows on an RTX PRO 6000; slower on an A100, which keeps the two GEMMs below)
+    if (MSA16 && C == 256 && I == 4 * C && ccMajor() == 12 &&
+        fusedTransitionSplit256(x, rows, I, P(T + "/input_layer_norm/scale", blk), P(T + "/input_layer_norm/offset", blk),
+                                PH(T + "/transition1/weights", blk), PH(T + "/transition2/weights", blk),
+                                P(T + "/transition1/bias", blk), P(T + "/transition2/bias", blk)))
+      return;
+    if (MSA16 && C == 256 && I == 4 * C) {     // (the MSA16 stack's MSA: every GEMM bf16, the residual in place)
+      using B16 = __nv_bfloat16;
+      B16* x16 = reinterpret_cast<B16*>(x);
+      B16* xh = scratch<B16>("ftr.xn16", chunk * C);
+      B16* mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
+      const B16* w1 = bf16Of(PH(T + "/transition1/weights", blk), (size_t)C * I);
+      const B16* w2 = bf16Of(augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), (size_t)(I + 8) * C);
+      for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+        size_t r = std::min(chunk, rows - r0);
+        layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
+                                                                              P(T + "/input_layer_norm/offset", blk));
+        ltGemm(xh, w1, mh, false, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, true);
+        ltGemm(mh, w2, x16 + r0 * C, false, r, I + 8, C, nullptr, false, 1.f, 0, 0, true);
+      }
+      return;
+    }
     half* xh = scratch<half>("ftr.xn", chunk * C);
     half* mh = augmentedInput("ftr.mid" + std::to_string(I), chunk, I);     // [rows, I+8], a 1 at column I
     const half* w2 = augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C);
@@ -513,6 +595,22 @@ __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, flo
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
   out[t] = scale == 1.f ? lt[((size_t)s * L + i) * O + c] : __float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale);
 }
+// (the bias-augmented shallow OPM, sm_12x) Lt [L][K] -> [L][K+8], ones at columns K and K+1 and zeros after; and the GEMM's
+// weight grown by 8 rows - the tiled bias as two f16 rows at K and K+1, zeros after - so the bias rides the GEMM itself
+__global__ void opmAugLeftK(const half* Lt, half* La, int L, int K) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)L * (K + 8)) return;
+  size_t j = t / (K + 8); int k = (int)(t % (K + 8));
+  La[t] = k < K ? Lt[j * K + k] : __float2half(k == K || k == K + 1 ? 1.f : 0.f);
+}
+// (two rows: the bias's f16 rounding and what that rounding left, so their f32 sum is the bias to ~2^-22)
+__global__ void opmAugBiasRowsK(const float* bt, half* tail, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= 8 * n) return;
+  if (t < n) tail[t] = __float2half(bt[t]);
+  else if (t < 2 * n) { float b = bt[t - n]; tail[t] = __float2half(b - __half2float(__float2half(b))); }
+  else tail[t] = __float2half(0.f);
+}
 // the output bias over a pair row's L positions, scaled: [L][C] of bias[c] * scale
 __global__ void tileBiasK(const float* bias, float* out, int L, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -527,17 +625,84 @@ __global__ void tileBiasK(const float* bias, float* out, int L, int C, float sca
 // 3063): the standard form's permute and its O^2-wide product are memory, not arithmetic. LOCALFOLD_OPM_SHALLOW
 // sets the deepest alignment it takes (0: never).
 inline const int OPM_SHALLOW = getenv("LOCALFOLD_OPM_SHALLOW") ? atoi(getenv("LOCALFOLD_OPM_SHALLOW")) : 128;
+#include "../../af3/src/tricontract.cuh"   // (bf16Gemms: past 1e10 multiply-adds a channel, the one-channel pick; fp8GemmTN)
+// the deep contraction's operands transposed to [L*O][Sp], the rows contiguous (the one layout an FP8 GEMM takes), e4m3,
+// the rows past rowsN zero
+__global__ void opmToF8K(const half* in, __nv_fp8_e4m3* out, int rowsN, int Sp, int LO) {
+  __shared__ float tile[32][33];
+  int c0 = blockIdx.x * 32, s0 = blockIdx.y * 32;
+  for (int y = threadIdx.y; y < 32; y += 8) {
+    int s = s0 + y, c = c0 + threadIdx.x;
+    tile[y][threadIdx.x] = s < rowsN && c < LO ? __half2float(in[(size_t)s * LO + c]) : 0.f;
+  }
+  __syncthreads();
+  for (int y = threadIdx.y; y < 32; y += 8) {
+    int c = c0 + y, s = s0 + threadIdx.x;
+    if (c < LO && s < Sp) out[(size_t)c * Sp + s] = __nv_fp8_e4m3(tile[threadIdx.x][y]);
+  }
+}
+#include "../../af3/src/triingemm.cuh"
+// The deep form's output projection read from the contraction's product where it lies, [i][a][j][b] (f16, scaled by
+// 2^-k): a block is 128 rows j of one i, the k = (a, b) chunks a apart (tgMain's strides), and the epilogue adds
+// (bias + 2^k y) / (1e-3 + norm) into the pair - no permuted copy, no f32 product, no opmAddK
+template <class PT>
+__global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, const half* __restrict__ W, const float* __restrict__ bias,
+    const float* __restrict__ norm, float* __restrict__ pair, int i0, int L, float up) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, wm = warp & 1, wn = warp >> 1;
+  const size_t i = (size_t)i0 + blockIdx.y, row0 = (size_t)blockIdx.x * 128;
+  float acc[4][8][4] = {};
+  tgMain<1024>(Pm + (size_t)blockIdx.y * 32 * L * 32, W, row0, (size_t)L, smem, acc, 32, (size_t)L * 32);
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      size_t j = row0 + wm * 64 + mi * 16 + g + h * 8;
+      if (j >= (size_t)L) continue;
+      const size_t ij = i * L + j;
+      const float d = 1.f / (1e-3f + norm[ij]);
+#pragma unroll
+      for (int t = 0; t < 8; ++t) {
+        int f = wn * 64 + t * 8 + 2 * tig;
+        float v0 = (bias[f] + up * acc[mi][t][2 * h]) * d, v1 = (bias[f + 1] + up * acc[mi][t][2 * h + 1]) * d;
+        size_t at = ij * 128 + f;
+        if constexpr (std::is_same_v<PT, float>) { pair[at] += v0; pair[at + 1] += v1; }
+        else {
+          PT* p = reinterpret_cast<PT*>(pair) + at;
+          p[0] = fromF<PT>(toF(p[0]) + v0); p[1] = fromF<PT>(toF(p[1]) + v1);
+        }
+      }
+    }
+}
 inline void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C,
                              const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   if (FAST) {
-    half* xn = scratch<half>("fopm.xn", rows * C);
-    layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
     half* lt = scratch<half>("fopm.left", rows * O); half* rt = scratch<half>("fopm.right", rows * O);
-    ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
-    ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
-    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
+    static const bool lnFused = !getenv("LOCALFOLD_LNGEMM") || atoi(getenv("LOCALFOLD_LNGEMM"));
+    if ((lnFused || (MSA16 && msa == t.msa16)) && (C == 256 || C == 64)) {
+      // the LayerNorm and both projections in one pass over the MSA (lnGemm): the LN'd MSA never written, read twice -
+      // 5CAJ with its 7,907-row alignment 1382 -> 1354 ms of GPU a fold, 0.014 A. (The same kernel for the row
+      // attention's q/k/v/gate, 1024 columns, loses - 130 ms against the LN's 31 and cuBLAS's 80: its two-tile warps
+      // reach ~100 TFLOP/s where cuBLAS reaches 167, the transition's note below found the same)
+      half* wt = scratch<half>("fopm.wt", (size_t)C * 2 * O);
+      tileColumns(PH(Op + "/left_projection/weights", blk), C, O, 0, O, 16, wt);
+      tileColumns(PH(Op + "/right_projection/weights", blk), C, O, 0, O, 16, wt + (size_t)C * O);
+      float* bb = scratch<float>("fopm.bias", 2 * O);
+      CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+      const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
+      if (MSA16 && msa == t.msa16) lnGemm<256, __nv_bfloat16>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      else if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      else lnGemm<64>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+    } else {
+      half* xn = scratch<half>("fopm.xn", rows * C);
+      layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
+      ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
+      ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
+    }
+    bool ones = msa == t.msa || msa == t.msa16 ? t.msaOnes : t.extraOnes;
     if (!ones) {
       scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
       scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
@@ -547,7 +712,12 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
     if (rowsN <= OPM_SHALLOW) {
       const half* W = PH(Op + "/output_w", blk);           // [O*O][128] f16
-      half* T = scratch<half>("fopm.T", (size_t)O * rows * 128);
+      // (8 more rows, the bias rows' - see below - on sm_12x with an f32 pair, and wherever the bias vector is past 2^17
+      // elements: on Colab's RTX PRO 6000 a bf16 pair's fold from 8 rows at 1,500 residues 7.48 -> 7.07 s with it. A shorter
+      // bias keeps the epilogue, which cuBLASLt fuses for a bf16 pair's f32 staging rows: there the augmented form was
+      // 0.1-0.6% slower at 600 and 1,000 residues)
+      const bool aug = ones && ((ccMajor() == 12 && !PAIR16) || (size_t)L * 128 > ((size_t)1 << 17));
+      half* T = scratch<half>("fopm.T", (size_t)O * rows * 128 + (aug ? (size_t)8 * L * 128 : 0));
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, CUDA_R_16F, 128, (long long)O * 128,
                                     rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -561,14 +731,25 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       if (ones) {
         float* bt = scratch<float>("fopm.btile", (size_t)L * 128);
         tileBiasK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(P(Op + "/output_b", blk), bt, L, 128, inv);
+        // aug (sm_12x): the bias as the GEMM's K-th row against a column of ones, where the epilogue's L * 128-long bias
+        // vector ran there as a second kernel over every chunk's output (cuBLASLt's globalKernel - on Colab's RTX PRO 6000
+        // 887 ms, 12% of a 2,500-residue pass from 8 rows); the bias two f16 rows (opmAugBiasRowsK), the product relRMS
+        // 1-4e-7 from the epilogue's (sm_120 emulated on an A100)
+        const half* La = Lt; int Ka = K; const float* gb = bt;
+        if (aug) {
+          half* la = scratch<half>("fopm.La", (size_t)L * (K + 8));
+          opmAugLeftK<<<blocks((size_t)L * (K + 8)), 256, 0, STREAM>>>(Lt, la, L, K);
+          opmAugBiasRowsK<<<blocks((size_t)8 * L * 128), 256, 0, STREAM>>>(bt, T + (size_t)K * L * 128, (size_t)L * 128);
+          La = la; Ka = K + 8; gb = nullptr;
+        }
         int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
         for (int i0 = 0; i0 < L; i0 += Bi) {
           int bi = std::min(Bi, L - i0);
-          if (!PAIR16) ltGemm(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * 128, false, bi, K, L * 128, bt, false, 1.f);
+          if (!PAIR16) ltGemm(La + (size_t)i0 * Ka, T, t.pair + (size_t)i0 * L * 128, false, bi, Ka, L * 128, gb, false, 1.f);
           else {        // (into an f32 block of rows, then added into the bf16 pair: an f16 product there moved 6MRR
                         // from a single sequence 1.898 -> 2.001 A, pLDDT 84.6 -> 81.1)
             float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
-            ltGemm(Lt + (size_t)i0 * K, T, Yb, false, bi, K, L * 128, bt, false, 0.f);
+            ltGemm(La + (size_t)i0 * Ka, T, Yb, false, bi, Ka, L * 128, gb, false, 0.f);
             addIntoPairK<__nv_bfloat16, float><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(
               reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 128);
           }
@@ -586,17 +767,50 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       return;
     }
     size_t per = (size_t)L * O * O;
-    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
+    // i-blocks of 2^26 product elements (128 MB), 2^28 where the output projection reads the product in place (no
+    // permuted copy, no f32 Y beside it), the card has the room (what the product holds counted, so each pass decides
+    // alike), and its L2 does not hold a 2^26 block between the contraction writing it and opmOutK reading it. A100
+    // (40 MB of L2) 600 / 1,000 / 1,500 residues 4.91 / 11.95 / 23.19 -> 4.84 / 11.83 / 22.95 s at 2^28, 2^27 and 2^29
+    // level or slower, 2^23-2^25 slower; RTX PRO 6000 (128 MB of L2) 3.02 / 6.93 / 46.94 s (2,500) at 2^26 against
+    // 3.05 / 6.98 / 47.14 at 2^28, opmOutK 104 -> 138 ms at 600, and 2^24-2^25 level or slower
+    const bool directOut = ccOf() >= 80;
+    static const bool l2HoldsBlock = [] { int d, l2; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, d)); return l2 >= (96 << 20); }();
+    const size_t budget = directOut && !l2HoldsBlock && roomFor(((size_t)256 << 20) * 2, {"fopm.P"}) ? (size_t)256 << 20 : (size_t)64 << 20;
+    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, budget / per));
+    // the sum over the rows scaled by 2^-k - exact, as a power of two is - so it fits float16, and opmAddK scales it back:
+    // unscaled, 7GYV's alignment at 1,945 extra rows overflowed it and NaN'd the fold (ColabFold's 512:5120 asks 5,120).
+    // 2^k the row count / 64: the largest entry there was ~34 a row, so ~2,200 scaled, and the small ones stay clear of
+    // float16's subnormals, which scaling to the mean (2^k >= the row count) reached - 7GYV's fold moved by it
+    int k = 0; while ((64 << k) < rowsN) ++k;
+    const float down = ldexpf(1.f, -k), up = ldexpf(1.f, k);
     half* Pm = scratch<half>("fopm.P", (size_t)Bi * per);
-    half* X = scratch<half>("fopm.X", (size_t)Bi * per);
-    float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+    // FP8 where the card has FP8 tensor instructions (fp8Tensor): both operands e4m3 over the rows padded to 16. From
+    // Ampere on the output projection reads the product in place (opmOutK). RTX PRO 6000, 1,000 residues at 508 + 5,120
+    // rows: 8.00 -> 7.60 s (FP8) -> 7.05 s (in place); A100 12.91 -> 12.23 s (README, "The deep outer product mean")
+    const bool f8 = fp8Tensor(), direct = directOut;
+    const int Sp = (rowsN + 15) / 16 * 16, LO = L * O;
+    __nv_fp8_e4m3 *l8 = nullptr, *r8 = nullptr;
+    if (f8) {
+      l8 = scratch<__nv_fp8_e4m3>("fopm.l8", (size_t)LO * Sp); r8 = scratch<__nv_fp8_e4m3>("fopm.r8", (size_t)LO * Sp);
+      dim3 g((LO + 31) / 32, (Sp + 31) / 32), b(32, 8);
+      opmToF8K<<<g, b, 0, STREAM>>>(lt, l8, rowsN, Sp, LO);
+      opmToF8K<<<g, b, 0, STREAM>>>(rt, r8, rowsN, Sp, LO);
+    }
+    half* X = direct ? nullptr : scratch<half>("fopm.X", (size_t)Bi * per);
+    float* Y = direct ? nullptr : scratch<float>("fopm.Y", (size_t)Bi * L * 128);
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
-      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
-                      CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      if (f8) fp8GemmTN(LO, bi * O, Sp, down, r8, Sp, 0, l8 + (size_t)i0 * O * Sp, Sp, 0, Pm, LO, 0, 1, CUDA_R_16F);
+      else CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &down, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
+                           CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      if (direct) {
+        WITH_PAIR_T(opmOutK<PT><<<dim3((L + 127) / 128, bi), 128, triInGemmSmem(), STREAM>>>(
+          Pm, PH(Op + "/output_w", blk), P(Op + "/output_b", blk), norm, t.pair, i0, L, up));
+        continue;
+      }
       opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
       ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
-      WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false));
+      WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false, up));
     }
     return;
   }
@@ -665,8 +879,60 @@ inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const
                  PH(T + "/gating_linear/weights", blk), P(T + "/gating_linear/bias", blk) };
   triangleBlockedHalf(pair, mask, L, C, w, outgoing, AF2_CHUNK);
 }
+// 🔴 ON AN SM WITH AN A100's SHARED MEMORY, cuda/af3's streaming kernels as AF3 runs them at 128 channels (below)
+inline bool af2Wide128() {
+  static const bool wide128 = [] {
+    if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    return perSm >= 96 * 1024 && ccMajor() >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
+  }();
+  return wide128;
+}
+// the blocks on those streaming kernels (cuda/af3's triangleBlockedFused): the biased input kernel over the whole plane
+// for b alone, then over each block's rectangle for a and its gating rows, a bf16 contraction, and the output kernel
+// (its bias in the epilogue) over the rectangle - where triangleBlockedHalf ran an LN, a GEMM and a transposing gate a
+// chunk and five passes on the way out, its f16 contraction on cuBLAS's 64-wide batched tiles
+inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, const std::string& T, int blk, bool outgoing) {
+  using B16 = __nv_bfloat16;
+  const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
+  TriFused tw = triFusedWeights(T, blk, C);
+  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
+  tileTriIn(tw.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+  B16* b = scratch<B16>("trib.bbf", plane * C);
+  int width = (int)std::max<size_t>(8, std::min<size_t>(Lp, AF2_CHUNK / C / Lp / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * 6, spare = f > t / 16 ? f - t / 16 : 0;       // a, its gating rows, the product
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  B16* a = scratch<B16>("trib.abf", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  const size_t smem = triIn256Smem<B16>(128, 8);
+  WITH_PAIR_T(
+    static bool attr = false;
+    if (!attr) { smemAttr((triIn256K<128, 4, B16, 1, true, PT, 2>), (int)smem); attr = true; }
+    auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
+      triIn256K<128, 4, B16, 1, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
+        pair, mask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, ao, bo, t2o, L, Lp, plane,
+        tw.bias, rm);
+    };
+    in(RectMap{}, plane, nullptr, b, nullptr);
+    for (int k0 = 0; k0 < L; k0 += width) {
+      int w = std::min(width, Lp - k0);
+      RectMap rm = outgoing ? RectMap{k0, Lp, 0, (size_t)w * Lp} : RectMap{0, w, k0, (size_t)Lp * w};
+      in(rm, rm.size, a, nullptr, t2);
+      if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, w, Lp, 1.f, b, Lp, plane, a, Lp, rm.size, prod, Lp, rm.size, C);
+      else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, Lp, Lp, 1.f, a, w, rm.size, b, Lp, plane, prod, w, rm.size, C);
+      triangleOutRun<128, 4, B16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), rm);
+    }
+  );
+  releaseScratch({ "trib." });
+}
 // the triangle's whole-form buffers (both precisions'): what a pass already holds counts toward its room
-#define TRI_FAST_HELD { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
+#define TRI_FAST_HELD { "ftri.a8", "ftri.b8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
                                    bool outgoing) {
   size_t pairs = (size_t)L * L;
@@ -677,7 +943,11 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     if (!roomFor(5 * plane * C * 2, TRI_FAST_HELD)) {
       releaseScratch({ "ftri." });
       needF32Pair("af2 blocked triangle");
-      triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
+      static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+      if (fusedBlocks && FUSED_TRIANGLE && C == 128 && !getenv("AF2_TRI_F32") && af2Wide128() && L >= 80 &&
+          fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8)))
+        triangleBlockedFused2(pair, pairMask, L, C, T, blk, outgoing);
+      else triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
       return;
     }
   }
@@ -685,6 +955,52 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // as cuda/af3 has them and as AlphaFold 2's own trunk runs (global_config.bfloat16): the output kernel then
   // stages half the product and takes its persistent form. AF2_TRI_F32=1 keeps the f32 product.
   static const bool triBf16 = !getenv("AF2_TRI_F32");
+  // 🔴 ON AN SM WITH AN A100's SHARED MEMORY, cuda/af3's streaming kernels as AF3 runs them at 128 channels: the input
+  // kernel at two row tiles a warp (biased), a bf16 contraction, and the output kernel streaming its weight 16 columns
+  // a stage with the bias in its epilogue - where the narrow output kernel holds the whole weight at one block an SM.
+  // LOCALFOLD_TRI128=narrow|wide forces either (as cuda/af3's pairtrack.cuh)
+  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && af2Wide128() && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    TriFused w = triFusedWeights(T, blk, C);
+    half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
+    tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    // FP8 operands where the card has FP8 tensor instructions (fp8Tensor), as cuda/af3's triangle: both directions in the
+    // outgoing layout (the incoming input kernel reading the pair transposed, RectMap's T), through an e4m3 GEMM into
+    // the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
+    if (fp8Tensor()) {
+      using F8 = __nv_fp8_e4m3;
+      const int np8 = (L + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
+      F8* a8 = scratch<F8>("ftri.a8", cs8 * C); F8* b8 = scratch<F8>("ftri.b8", cs8 * C);
+      half* t2 = scratch<half>("ftri.t2", cs8 * C);
+      __nv_bfloat16* pb = scratch<__nv_bfloat16>("ftri.pbf", cs8 * C);
+      RectMap rm; rm.T = !outgoing;
+      const size_t smem = triIn256Smem<F8>(128, 8);
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triIn256K<128, 4, F8, 1, true, PT, 2>), (int)smem); attr = true; }
+        triIn256K<128, 4, F8, 1, true, PT, 2><<<(unsigned)((cs8 + 127) / 128), 128, smem, STREAM>>>(
+          pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a8, b8, t2, L, np8, cs8, w.bias, rm));
+      if (outgoing) triContractTN(np8, cs8, C, 1.f, a8, b8, pb, true);
+      else triContractTN(np8, cs8, C, 1.f, b8, a8, pb, true);
+      triangleOutRun<128, 4, __nv_bfloat16>(pb, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                            PH(T + "/output_projection/weights", blk), t2, pair, L, np8, P(T + "/output_projection/bias", blk));
+      return;
+    }
+    __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
+    half* t2 = scratch<half>("ftri.t2", plane * C);
+    const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
+      triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+        pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+    __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
+    triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                          PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
+    return;
+  }
   if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && triFusedFits<__nv_bfloat16>()) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
@@ -693,13 +1009,8 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     triInRaw<__nv_bfloat16, true>(pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
                                   w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
-    const float one = 1.f, zero = 0.f;
-    if (outgoing)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16BF, Lp, plane, a, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    else
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16BF, Lp, plane, b, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
     triOutRaw<__nv_bfloat16, true>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
                                    PH(T + "/output_projection/weights", blk), P(T + "/output_projection/bias", blk), t2, pair, L, Lp,
                                    plane);
@@ -760,16 +1071,10 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriW w = triWeights(T, blk, C);
     half* xn = scratch<half>("ftri.xn", pairs * C);
     layerNormH(pair, xn, pairs, C, T + "/left_norm_input", blk);
-    // planes [Lp][Lp], the pad rows and columns zero (written once: nothing else writes them)
+    // planes [Lp][Lp], the pad rows and columns zero (zeroPlanePad: at every use, the buffers' bytes being shared)
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-    // (again whenever the layout, either buffer or a scratch give-back changes: one returned at the same address can
-    // hold another stage's data where this layout's pad is)
-    static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
-    if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
-      CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-      zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
-    }
+    zeroPlanePad(a, L, Lp, C); zeroPlanePad(b, L, Lp, C);
     // the five projections in row chunks of ~128 MB (whole, [pairs, 5C] was 0.78 GB at 783 residues):
     // a and b gated into their planes, the output gate kept [pairs, C] for the end
     size_t chunk = std::min(pairs, std::max<size_t>(32768, ((size_t)128 << 20) / (10 * (size_t)C)));
@@ -919,6 +1224,9 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));                // the padding columns
   const float* mask = pairOnes ? nullptr : pairMask;
   float scale = 1.f / sqrtf((float)w.D);
+  // FP8 attention where the card has it (cuda/af3's flash8Run): k and v written e4m3 by the projection
+  const bool f8 = w.Dp == 32 && !mask && fp8Attn();
+  const size_t f8Row = f8 ? (size_t)3 * Wp : 0;            // (k8, v8 and the transposed v: bytes an element)
   // every row in one pass whenever the card has the room for its q/k/v/gate and output (what they already
   // hold counted, so each pass decides alike) - not below a fixed 32nd of the card: at 1,566 residues
   // 17.43 -> 16.43 s, at 2,088 35.80 -> 34.19 s (peak 7.9 -> 10.7 and 12.0 -> 17.1 GB on 40 GB); the
@@ -927,15 +1235,22 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   // stay held while it runs, and starved of them it blocks - at 2,610 residues the one-pass grid took the
   // memory and the fold went 63.7 -> 104.4 s
   size_t triPlane = (size_t)((L + 7) / 8 * 8) * ((L + 7) / 8 * 8);
-  if (roomFor(((pairs + 128) * 4 * Wp + pairs * Wp) * 2 + 5 * triPlane * C * 2,
-              {"fatt.qkvg", "fatt.o", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
+  if (roomFor(((pairs + 128) * 4 * Wp + pairs * Wp) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+              {"fatt.qkvg", "fatt.o", "fatt.kv8", "attn.vt8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
     half* qkvg = scratch<half>("fatt.qkvg", (pairs + 128) * 4 * Wp);
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr);
+    uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", pairs * 2 * Wp) : nullptr;
+    // (sm_12x: V written straight into flash8's transposed form, no fp8VtK pass - the same bytes)
+    uint8_t* vt8 = f8 && ccMajor() == 12 ? scratch<uint8_t>("attn.vt8", (size_t)L * Wp * ((L + 63) / 64 * 64)) : nullptr;
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8, ccMajor() == 12, vt8);
     half* o = scratch<half>("fatt.o", pairs * Wp);
-    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
+    if (f8) flash8Run(qkvg, kv8, vt8 ? vt8 : kv8 + pairs * Wp, bias, stride, o, L, H, L, scale, nullptr, -1, vt8 != nullptr);
+    else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
     // (the row direction's GEMM accumulates into an f32 pair; a bf16 pair takes gridOutK in both directions -
     // an f16 product and an add pass were 6-10 ms slower a 494-residue fold)
-    if (!tr && !PAIR16) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
+    // (an f32 pair on sm_12x too: there cuBLASLt runs that GEMM's bias-and-accumulate epilogue as a second kernel over the
+    // pair - on Colab's RTX PRO 6000 54 calls of cublasLt's globalKernel a 2,500-residue pass, and timing its other
+    // candidates found none without it)
+    if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
     else gridOutRaw(o, w.out, ob, pair, L, 0, pairs, tr);
     return;
   }
@@ -945,18 +1260,20 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     float* raw = scratch<float>("fbias.raw16", per * 16);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      lnHeadsRaw<16>(pair + r0 * C, lnS, lnO, Wb, raw, r);
+      lnHeadsRaw<16>(pairAdvance(pair, r0 * C), lnS, lnO, Wb, raw, r);
       biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, bias, L, H, stride, tr, r0, r, nullptr, true);   // lnHeadsK writes head-major
     }
   }
   size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 4 * Wp)));
   half* qkvg = scratch<half>("fatt.qkvg", (R * L + 128) * 4 * Wp);
   half* o = scratch<half>("fatt.o", R * L * Wp);
+  uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", R * L * 2 * Wp) : nullptr;
   for (size_t b0 = 0; b0 < (size_t)L; b0 += R) {
     size_t bc = std::min(R, (size_t)L - b0), rows = bc * L;
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr);
-    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
-    if (!tr && !PAIR16) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr, nullptr, nullptr, 0, 0, false, kv8, ccMajor() == 12);
+    if (f8) flash8Run(qkvg, kv8, kv8 + rows * Wp, bias, stride, o, L, H, bc, scale, nullptr);
+    else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
+    if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
     else gridOutRaw(o, w.out, ob, pair, L, b0 * L, rows, tr);
   }
 }
@@ -1004,7 +1321,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
 // one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"
 inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
-  float* msa = extraStack ? t.extra : t.msa;
+  float* msa = extraStack ? t.extra : MSA16 ? t.msa16 : t.msa;
   int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   std::string R = S + "msa_row_attention_with_pair_bias/attention/query_w";
@@ -1029,7 +1346,7 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
 inline bool af2Pair16Ok(int L) {
   // (Ampere on: a T4 has no f32 -> bf16 conversion instruction, and there the bf16 pair was 1-3% SLOWER - its
   // biased float-tile triangle output 1237 -> 1520 ms a 494-residue fold, gridOutK in both directions 563 -> 780)
-  static const int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static const int major = ccMajor();
   if (major < 8 || !FAST || getenv("LOCALFOLD_PAIR_F32") || shortPair((size_t)L * L, 128) || !FUSED_TRIANGLE || !FUSED_GRID_AF2) return false;
   bool tri = triFusedFits<__nv_bfloat16>() || triFusedFits<float>() ||
              (L >= 80 && fitsSmem(std::max(triIn256Smem<half>(128, 8), triangleOutSmem<128, 4, float, 32, float>())));

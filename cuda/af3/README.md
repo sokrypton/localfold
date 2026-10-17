@@ -92,7 +92,8 @@ example jobs fold (`tools/fixtures/af3-jobs/`).
 | `--recycles=N` | 3 | trunk recycles (N+1 passes) |
 | `--recycle-tolerance=<A>` | off | stop recycling once the prediction moves less than this |
 | `--steps=N` | 200 | diffusion steps |
-| `--update=`, `--schedule=`, `--no-churn` | `exponential`, `geometric` | the diffusion step and noise schedule; `--update=euler --schedule=karras` is AlphaFold 3's own walk (docs/AF3.md, "The default sampler"; not `chai1`, which keeps its own) |
+| `--update=`, `--schedule=`, `--no-churn` | `exponential`, `geometric` | the diffusion step and noise schedule; `--update=euler --schedule=karras` is AlphaFold 3's own walk, `--update=multistep` (with `--multistep-below=<A>`) an experiment measured and not taken (docs/AF3.md, "The default sampler", "A multistep update"). `chai1` takes them on its own sampler: its default is the exponential step on ITS schedule (`--update=euler` its old step, `--schedule=geometric` the lineage's schedule; docs/AF3.md, "chai-1's sampler") |
+| `--step-scale=<S>` | the model's own (AF3 1.5, chai-1 2) | the update's scale, the exponent of the exponential step - an experiment's knob |
 | `--af3-defaults` | | AlphaFold 3's own run settings: 10 recycles, 5 samples |
 | `--frames=<dir>` | | every intermediate result as it lands (below) |
 | `--save-embeddings`, `--save-distogram` | | what AlphaFold 3's flags of the same names write |
@@ -236,7 +237,7 @@ confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (
 cases); the page does not offer it, having no WebGPU forward for it yet.
 
 Where this port leaves af3-any-model for chai-lab, measured each time:
-- **One denoiser call a step** (sampler.cuh; `--chai-second-order` is chai-lab's two). Same seed and steps,
+- **One denoiser call a step** (sampler.cuh; `--chai-second-order` takes two - the exponential Heun step, or with `--update=euler` chai-lab's own - and buys nothing at matched calls: docs/AF3.md, "chai-1's sampler"). Same seed and steps,
   the two land 0.02-0.07 A apart at 200 steps with the same bonds on protein, glycerol, ATP, a
   phosphoserine and DNA, for half the diffusion (5CAJ, 5 x 200: 2.82 -> 1.93 s a fold).
 - **Atom attention within one reference space, not one token** - chai-lab ANDs its block mask with the
@@ -1039,6 +1040,23 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
 - **Grid attention without bounds checks** (inputs padded so loads past n read finite values):
   7.22 against 6.89 ms - at 125 registers the kernel is one register from losing a block an SM.
 
+- **A short-M GEMM for the denoiser's projections** (2026-10-15; standalone, in CUDA graphs, real weights in a 64 MB
+  ring so none is L2-resident). At 68 tokens cuBLAS takes ~9 us for every one of the block's four shapes (768x3072
+  9.9, 768x768 8.4, 1536x768 11.7) against weight-read floors of 3.2 / 0.8 / 1.6 us - a grid of a few dozen 64x64
+  tiles each walking the whole K, latency-bound; cuBLASLt's heuristic offers no split-K, and forcing split-K over every
+  algo, tile and split count of 2-32 is slower (11.9 / 13.9 / 16.0 us: its reduction is a second kernel). Three
+  hand-written forms, every one right to 2e-5: split-K over blocks reduced by the last block of a slab **30-54 us**
+  (the reduction a serial chain of L2 reads in one block - ncu: 1.7% compute, 9% L2); K over a block's eight warps
+  reduced in shared memory 16-29 us (no pipelining: each warp's 16-wide step waits on its own loads); split-K with
+  f32 atomics plus a conversion 13-21 us (a graph node is ~2-3 us here before it computes). So cuBLAS is near what a
+  separate kernel can do at this shape; the lever left is fewer nodes a step (a block's GEMMs and elementwise work in
+  one persistent kernel), not a better GEMM.
+- **The denoiser's 48-wide attention on `flashGrid2R`** (2026-10-15, `--bench-ops`, one transformer block, no mask as a
+  fold runs it): slower at every size - 68 tokens 9.5-11.2 against the split kernel's 5.2 us, 261 16.6 against 11.0, 600
+  36.8 against 25.9, 1,000 110 against 54, 261 x 5 samples 35.3 against 22.9 - its two query tiles a warp hold twice
+  the 48-wide accumulators (the 16- and 32-wide heads are why it exists). And the shipped warps/key-tile rule is within
+  10% of the best arm at one sample (600: 27.5 against 8 warps' 25.9; 1,000: 59.5 against 4 warps' 53.8) - the
+  attention is ~17% of a step, so a sharper rule is 1-2% of the diffusion and not taken.
 - **Five more forms of the grid attention's flash kernel** (`flashGrid2K`-`6K`, 2026-10-03, against the
   shipped `flashGridHalf<32, 4>` on random grids of 4 heads of 32, arms interleaved): QT query subtiles
   a warp over a ring of K/V/bias stages with one barrier a tile; rows of warps sharing one bias tile;
@@ -1306,6 +1324,442 @@ Past 2^32 elements in one pair tensor (4.6e9 here) nothing overflowed: the indic
 per-channel ones stay under 2^32 to 65,536 tokens. The fixed cost at this size is the trunk's pair
 itself (18.4 GB in f32) and the blocked triangle's fixed operand (9.2 GB), which must be whole: a
 2-D tiling would read pair entries earlier tiles had written.
+
+### 🔴 7,900 tokens on a 40 GB A100: the pair stays bf16 past the trunk (2026-10-09)
+
+**7,904 tokens folds on this 40 GB card** (one pass and 4 steps for the measurement: 41.2 GB peak in the trunk, 36.1 in
+the diffusion, 23.3 in the confidence head; a trunk pass 9.0 minutes), where 6,000 was the ceiling. The trunk's pair
+was already bf16; past the trunk it was widened to f32 (`pairToF32`) for the distogram, the diffusion and the
+confidence head - 18.4 GB at 6,000 tokens, 51 GB at 10,000, and the widening held both copies at once. On a card
+short of room (`pairStays16`) it stays bf16 and every reader takes bf16 rows: the distogram's contacts (a gathered
+bf16 transpose), the streamed diffusion preparation (each chunk widened as it is copied, from the device or from the
+parked pair), and the confidence head (its pair bf16, its blocks under `PAIR16`, its heads widening a chunk of rows).
+**The structure is byte-identical** (the diffusion reads exactly the values the widening made); the confidence head
+storing its pair in bf16 moves PAE by at most 0.12 A and pLDDT by 0.06 on 6MRR under `LOCALFOLD_BIG=1`. Every fold
+off the big-input path is byte-identical. Not for OpenDDE (its expander reads f32), which widens as before.
+**boltz2 takes it too**: its confidence head re-embeds the trunk's pair, whose one read is a row-wise LayerNorm, so on
+the last confidence call the re-embedding works in the trunk's own bf16 pair in place, and a bf16 copy for earlier
+samples (6MRR under `LOCALFOLD_BIG=1`: coordinates identical, PAE within 0.20 A, pLDDT 0.03). **rf3 takes it too, and its trunk is bf16 now at every size**: its grid attention's biases
+(gating query, output projection) kept it on an f32 pair, though the unfused kernels its biased heads run take a bf16
+pair (the output bias added in f32, the sum laid in by `addGridK<PT>`); its global norm takes one as well. 6MRR 1.767
+-> 1.780 A at pLDDT 81.42 -> 81.43, 5CAJ self-templated 0.075 A both ways, the trunk 1507 -> 1430 ms at 494 tokens -
+and the norm's live-row count, a single GPU thread looping over every pair, moved into its parallel pass. What it took beside that, each found by folding past the old line:
+
+- **the confidence heads' logits a chunk at a time**: `[pairs, 64]` f32 is TWICE a 128-channel f32 pair (25.6 GB at
+  10,000), held whole only to be reduced to the PAE, the PDE and the pTM term - now each chunk's logits are reduced
+  as they are made. Exact for the PAE and pTM and the pre-symmetrised PDE; AF3's PDE symmetrises after the projection
+  (l_ij + l_ji), taken chunked through linearity as W (LN(z_ij) + LN(z_ji)) - 0.0008 A of rounding, and the PDE
+  reaches no output file.
+- **the trunk's pair allocated bf16 from the start** (`makeTrunk`): it was allocated f32, zeroed, then swapped -
+  a 24.5 GB transient at 6,916 tokens, and 51 GB at 10,000, which does not allocate at all.
+- **the pair parked before the diffusion when the PREPARATION does not fit beside it** (`diffusionPrepBytes`: the
+  f16 LayerNorm'd pair, the encoder's projection, a super block of biases), not when the pair alone does not: asked
+  for the pair alone, 6,916 tokens kept its 12.2 GB pair on the device and ran out in the preparation.
+- **the bias cache counting only what its need includes**: a streamed preparation's handed-in f16 pair (12.2 GB) was
+  counted as room toward the biases and admitted ones that did not fit.
+- **the summary file in one pass over the pairs**: every chain's and chain pair's pTM/ipTM rescanned all n^2 pairs
+  through a `std::function` - minutes at 6,916 tokens in 28 chains. Now each anchor's row is summed per chain once;
+  every summary checked byte-identical (calmodulin's five chains, TetR+DNA's four, RNase B's two, 1BRS, 1TIM).
+
+`foldFits` sizes a fold on this path at **1.15x the f32 pair** (measured 1.16 at the edge, the trunk's bf16 pair and
+the blocked triangle's f16 operand being its floor), so it admits ~7,700 tokens on 40 GB and, by the same rule,
+**~10,900 on an 80 GB card and ~12,000 on Colab's 96 GB RTX PRO 6000** - not measured there. The trunk is the time:
+a pass was 9 minutes at 7,904 tokens (the grid attention's flash kernel half of it, at ~40% of the tensor cores' peak
+with heads 32 wide: its exponentials cost as much as its matrix work) - see the next section for what it is now.
+
+### 🔴 8,300 tokens on a 40 GB A100, and why not 9,200 (2026-10-15)
+
+**8,300 tokens folds on this 40 GB card, admitted by the fit check (~8,309), where ~7,900 was the line.** Found by
+folding past the check (`LOCALFOLD_NO_FOLD_FITS=1`) and reading what ran out:
+
+| ran out at | what | now |
+|---|---|---|
+| 8,600 (by 50 MB) | the blocked triangle's whole `b` beside the bf16 pair - two pair-sized tensors | **the limit**: `PAIR16_FUSED_FIT_TIMES` 1.06 of the f32 pair where the triangle runs fused in bf16 (an FP8 card's TN form and a T4's unfused one keep 1.15 until measured) |
+| 9,200 (with `b` banded) | the template stack's f32 activation made beside the bf16 pair | the pair **parked before** the activation is made, its query read from the parked (pinned) copy; the stage's end relu'd, scaled and taken to f16 before the pair comes home |
+| (at the limit) | the diffusion's biases, a super block's four planes rebuilt each step | **one block's** plane, rebuilt at each block, where a super block's set does not fit beside the f16 pair - bit-identical |
+
+🔴 **`b` CANNOT BE MADE IN BANDS OF k, AND 4632f67 DID - IT FOLDED THE WRONG MODEL.** Banded, `b` is made afresh for every
+block of output rows, and each block's output is added into the pair before the next block reads `b` from it: every block
+after the first contracted against a partly updated pair. Whole, `b` is made once before any write, which is the model.
+It took 9,200 tokens through the trunk (739 s) and nothing in a fold showed it: 5CAJ moved 0.19-0.29 A, and the block
+width ALONE (whole `b`, 64 rows against 1,024: a different GEMM shape) moves that fold 0.27 A, so the error sat inside the
+fold's own sensitivity - and the crystal RMSD (2.098 / 2.113 A) could not see it either. **A blocking that reads what it
+writes is caught by reading the code, not by a fold.** Banding correctly needs the update kept out of the pair until the
+last block - a second pair-sized buffer, the memory being saved, or the host (~2 x 21.7 GB over PCIe a triangle at 9,200).
+
+**Nothing changes below the old line**: 1,850 tokens 6.55 against 6.61 s, bit-identical; 7,800 tokens 352.5 against
+353.4 s (its template stage takes the parked path, so its end in f16 moves the fold).
+
+**And a fold near the line was 40% slow, which was the triangle's blocks**: with a 16th of the card kept spare beside
+`b`, 8,300 tokens ran 100-row blocks, cuBLAS took its small tiles, and the triangle's GEMMs were 238.7 s a pass against
+60.5 at 7,800 (nsys, one pass). A 64th kept: trunk **545.7 -> 398.8 s**, the fold 592.6 -> 434.0, the confidence head
+42.4 -> 30.8 - the cubic's ~390 - and 7,800 323.6 -> 318.3. The unfused grid attention (the template stack's) now takes
+chunks as wide as what is free, as the fused one does: 1,072 launches a pass at 8,300, ~2 s.
+
+### 🔴 A big fold's speed: 1.9x at 7,657 tokens (2026-10-09)
+
+The same 7,657-token fold (31 chains of 1TIM, one pass, 100 steps, this 40 GB A100), against the commit before:
+
+| | before (e03ca8e) | now |
+|---|---:|---:|
+| trunk pass | 524.7 s | **325.9 s** |
+| diffusion, 100 steps | 136.5 s | **21.2 s** |
+| confidence | 36.8 s | **25.8 s** |
+| whole fold | 701 s | **376 s** |
+
+pLDDT 32.76 against 32.79, CA-CA median 3.682 both, the structures 0.549 A apart over 7,657 alpha carbons (a
+single-sequence complex at pLDDT 33). Every big-input path checked against the ordinary one at 5CAJ under
+`LOCALFOLD_BIG=1` (0.003-0.005 A) and at 2,964 tokens (0.111 A, CA-CA identical). What moved:
+
+- **the blocked triangle on the whole form's kernels** (`triangleBlockedFused`, `RectMap`): triIn256K over the whole
+  plane for b alone and over each block's rectangle for a and its gating rows, a bf16 contraction, triangleOutK over
+  the rectangle - where the blocks ran an LN, a GEMM and a transposing gate a chunk and five passes on the way out.
+- **the contraction past 1e10 multiply-adds a channel on cuBLASLt's single-matrix pick** (`bf16Gemms`): cuBLAS 12's
+  batched heuristic turns to 64x64 tiles there, 80-150 TFLOP/s against 260-277 - 92 s of a 6,916-token pass.
+- **the chunked grid attention's chunks as wide as what is free** (to 256 rows), and a block order that shares the
+  bias tile past 3,500 tokens (byte-identical).
+- **the streamed diffusion's biases in one tensor-core kernel** (`pairBiasSuperK`): projected and laid out together,
+  the f32 flat chunk never made - the layout alone was 173 ms of a 213 ms step at 2,964 tokens.
+- **the template stack's 16-wide attention on flashGrid2R** (1.35-1.75x).
+
+The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 tokens) and did not move: three warps a
+block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
+latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
+
+### Several GPUs on one fold (in progress, 2026-10-10)
+
+`cuda/af3/localfold-af3 --gpus=N|all ...` (or `LOCALFOLD_GPUS=N`) folds one job across N GPUs: one process a GPU (multigpu.cuh - CUDA IPC
+buffers, a host barrier under /dev/shm, explicit peer copies, so NVLink and plain PCIe boxes both work), each with
+the port's single-device state unchanged. **Phase 1 (this):** every rank holds the whole trunk pair; each pair
+update - both triangle multiplications (their blocked forms), row and column grid attention (their chunked forms)
+and the transition - computes this rank's share of its output rows or columns and the others' shares are copied in.
+The rest of the trunk runs whole on every rank (deterministic, so the copies stay identical); diffusion and confidence
+run on rank 0 after the trunk. CUDA graphs are off (a capture cannot hold a host barrier); chai-1, OpenDDE, `--serve`
+and repeated folds are refused by name. Rank 0 alone featurises and fetches (the others wait on a lock and fold from its
+input directory), so a search runs once. **Phase 2 - the default with several GPUs (`LOCALFOLD_MG_SHARDED=0` keeps
+phase 1): the trunk on a sharded pair** - each rank
+holds only its rows (shares of the 16-padded length), through the embedding (in-place recycle), the template stack
+(its own 64-channel tensor sharded too), the MSA stack (outer product mean on held rows; the pair-weighted MSA
+attention for held tokens, then the MSA's columns all-gathered) and every pairformer block (sharded.cuh: the triangle
+outgoing against an all-gathered `b`, the incoming as the outgoing form on z^T, row attention with an all-gathered
+bias, column attention as row attention on z^T with the bias flipped, all-to-all transposes between; the single track
+on held query rows, its output all-gathered) - and **the diffusion**: the conditioning streamed over held rows off the
+bf16 slab, the encoder's pair projection all-gathered (its atom windows read arbitrary token pairs), every block's
+token-attention bias made for held query rows only (the largest tensor of a big fold: 768 bytes a pair), and the token
+attention over held queries (flashGridHalf's query range), its output all-gathered each block; the sampler itself
+runs on every rank. After the sampler rank 0 gathers the pair for the contacts, the confidence head (not sharded yet:
+~34 GB at 10K tokens) and the files. Refused by name for now: chai-1, OpenDDE, `--frames`, `--recycle-tolerance`,
+`--save-embeddings`/`--save-distogram`, more than ten seed x sample runs, a padded (masked) token set in diffusion.
+
+Checked with the ranks sharing this one A100 (`LOCALFOLD_GPU_MAP=0,0`): phase 1 - 5CAJ self-templated 0.003 A from
+the single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipTM identical; 6MRR boltz2 0.022 A,
+intellifold2 0.007, protenix2 0.062. Phase 2 - 5CAJ self-templated 0.009 A on 2 and 3 ranks (boltz2 0.026, protenix2
+0.002, rf3 0.004); a 59-residue query with 1,024 MSA rows 0.007 A on 2 and 3; with the diffusion sharded too the
+same: 5CAJ 0.009 A on 2 and 3 ranks, boltz2 0.022, protenix2 0.002, rf3 0.009, the MSA fold 0.007. Speed is not measurable here (the ranks share one card and meet at every
+exchange); that waits on a real multi-GPU box - `python3 tools/check-multigpu.py` there builds, checks 5CAJ and the
+1TIM dimer on one GPU against every GPU, and times complexes of 4/12/24 1TIM chains on 1, 2, 4, 8 GPUs with every GPU's
+peak memory (`--big=41` adds a 10,127-token fold on all of them), writing a markdown report.
+
+**Measured on a rented 8 x A100-SXM4-40GB (NVLink), 2026-10-10, at `f408f48`** (25 steps, no recycles; the confidence
+head sharded by then, its time still counted in the diffusion's): 2,964 tokens - trunk 20.56 s on one GPU, 13.38 on 2,
+8.39 on 4, 6.17 on 8 (3.3x); 5,928 tokens - trunk 152.8 s against 30.5 on 8 (**5.0x**), the whole fold 169.4 against
+65.4 (2.6x); 2 GPUs ran out of memory at that size. What kept the fold at 2.6x was after
+the trunk: diffusion and confidence 14.8 s on one GPU and **23.9 on eight**, plus 11 s between them against 1.9.
+Two causes, both found here with the ranks sharing this card (`LOCALFOLD_MG_TIMES=1` makes every rank meet at named
+points after the trunk and rank 0 print each phase): rank 0 **waited for the other ranks to exit** - their CUDA
+teardown, one after another, 0.17 s on 2 ranks and 0.42 on 4 at 741 tokens, in the fold's time - and they now leave at
+once (`mg::leave`, `_exit`) and are reaped as rank 0 itself exits; and every rank parked its **gathered whole pair** in
+pinned host memory where the card was short (9 GB each at 5,928 tokens, eight at once), when nothing reads it past the
+diffusion's preparation - it is freed there now. At 741 tokens the diffusion goes 429 -> 267 ms on 2 ranks and 932 ->
+530 on 4, every structure identical to the digit. The 10,127-token fold on all eight was not run to the end.
+
+#### Toward N times faster on N GPUs, measured on ONE (2026-10-10)
+
+`LOCALFOLD_MG_SIMULATE=1` with `--gpus=N` runs rank 0 of N alone on this one GPU - every peer's buffer its own, a
+peer copy a copy on the card, a fence nothing - so the fold is wrong and its TIMES are one rank's compute at the real
+shapes in the real memory (one rank of 8 on this 40 GB A100 is one rank of the rented 8 x A100 exactly). What it cannot
+see is the interconnect. Against the box: at 2,964 tokens a simulated rank of 8 computed the trunk in 3.44 s where the
+box took 6.17, so ~2.7 s of that were exchanges and their synchronisation - and the per-rank compute itself was 6.0x.
+What came of measuring that way, each change gated against the one-GPU fold on 2 and 3 ranks sharing this A100
+(5CAJ self-templated 0.003-0.009 A, the 1TIM dimer 0.014-0.015, boltz2 0.026, protenix2 0.002, rf3 0.006-0.009, if2 0.014):
+
+- **The triangle split by CHANNEL, not row.** Its contraction is independent per channel, so a rank pulls its
+  channels' whole a and b planes from every rank, runs the one-GPU GEMM shape, and pushes each rank its rows of the
+  product. The row ring received (W-1)/W of the whole b a triangle (1.97 GB at 2,964 tokens on 8; 0.74 now) and its
+  371-row stages filled cuBLAS's 256-row tiles to 72%. The incoming form then runs on z itself (the GEMM's operands
+  turned): two of a block's four transposes gone. Channel groups pipeline - a group's pulls and the last's pushes,
+  both kernels reading or writing peers directly, beside its GEMM on two more streams.
+- **Fences on the device** (`arriveAndWaitK`): a stream writes its arrival into every rank's flags and waits for
+  theirs - no drain, no host round trip, their generation counted on the device so CUDA graphs can hold them. A
+  watchdog thread a rank ends the process when a peer dies (a fence waits in a kernel, where no host loop would see).
+- **Fewer, larger things**: the attention's bias fused into its input pass where a rank's rows fit; every exchange
+  that was a copy a peer a kernel reading them all (the triangle's were ~9,700 copies a 2,964-token pass, the bias's
+  ~2,700, each ~17 us of launch the GPU waited through); a sharded op's scratch held across blocks (giving it back
+  synchronised the device four times a block).
+- **The diffusion split by TOKEN** (one sample, from 512 tokens - `LOCALFOLD_MG_SHARD_DIFFUSION=0/1` forces):
+  every per-token step on a rank's own rows, k and v gathered a block; the atom encoder and decoder on a rank's own
+  subsets and a halo of one key window's reach a block (nothing exchanged inside them); the steps as CUDA graphs.
+  Before, every rank ran the per-token GEMMs - as much time as the attention - for every token.
+- **10,127 tokens fit eight 40 GB ranks** (the trunk peaks at 31.9 GB a rank, a pass 86.6 s); boltz2 and rf3 fold
+  again - their confidence heads have no sharded form, so their pair is gathered to rank 0 for it (refused up front
+  where it would not fit one GPU).
+
+Whole folds, one GPU against a simulated rank of 4 and of 8 (this A100; `quick` is the check's 25 steps and no
+recycles, `default` the binary's 200 steps and 3 recycles; 5,928 tokens' one-GPU time the box's):
+
+| tokens | settings | one GPU | rank of 4 | x | rank of 8 | x |
+|---:|---|---:|---:|---:|---:|---:|
+| 988 | quick | 1.61 s | 0.58 s | 2.8 | 0.38 s | 4.2 |
+| 988 | default | 6.28 s | 2.18 s | 2.9 | 1.41 s | 4.4 |
+| 2,964 | quick | 23.36 s | 6.47 s | 3.6 | 3.46 s | 6.8 |
+| 2,964 | default | 89.65 s | 24.37 s | 3.7 | 12.88 s | 7.0 |
+| 5,928 | quick | 169.4 s (box) | 41.57 s | 4.1 | 20.73 s | 8.2 |
+| 10,127 | quick | does not fit | - | - | trunk pass 86.6 s | - |
+
+Small folds stay short of N x: at 988 tokens a rank holds 124 rows and the diffusion's 24 blocks a step are launch-bound
+(200 steps 1.12 s on one GPU, 0.55 on a rank of 8); from ~3,000 tokens the trunk is 7-8x on 8 and the diffusion
+the remainder.
+
+Not seen here, and what the next box should measure: NVLink's share - the two transposes a block (2 x 7/8 of a slab,
+~2.5 ms a block at 2,964 tokens), the triangle's pulls and pushes (overlapped with its GEMMs, which may or may not hide
+them), the fences' latency (~25 a diffusion step).
+
+Both exchanges now hide behind compute where there is compute to hide them behind (2026-10-10, before the box):
+- **the transposes are folded into the column attention**: z^T is pulled a chunk at a time on a copy stream while the
+  fused input pass runs over the chunk before, and each attended chunk goes through the pair transition (pointwise,
+  so on z^T as well as z) and is PUSHED back into its owners' rows while the next chunk attends - a rank pulls and
+  pushes only its own columns, so the fence between the two transposes goes (6 fences a column attention to 4).
+  Chunks of a quarter-million pairs, up to four (988 tokens on 8: one, where four cost a simulated rank 14 ms of 218;
+  2,964: four, at no cost). Bit-identical to the plain transposes (0.000 A) on 2 and 3 ranks, host and device
+  fences, AF3, boltz2, protenix2 (rf3's biased attention and IntelliFold-2's 512 channels keep the generic form and
+  its plain transposes). `LOCALFOLD_MG_FOLD_TRANSPOSES=0` is the plain arm.
+- **the triangle's channel groups**: 1 / 4 / 8 below 2,048 / to 4,096 / past it (was 1 / 2 / 4). In simulation the
+  exchange is a local copy, so the group count was chosen as though it were free; over NVLink at ~250 GB/s a 2,964-
+  token triangle on 8 moves ~0.74 GB a rank (~3 ms) beside a ~3.4 ms GEMM, and the unhidden first pull and last push
+  shrink as 1/groups. Simulated cost: none at 2,964 (1, 2, 4 within 0.3%), 0.26% at 5,928 for 8 against 4; at 988 two
+  groups cost 2.8% and the exchange outlasts the GEMM, so it stays one. `LOCALFOLD_MG_TRI_GROUPS=k` sweeps it.
+On the box, after the run below: the 2,964-token fold with `LOCALFOLD_MG_FOLD_TRANSPOSES=0` against the default, and
+`LOCALFOLD_MG_TRI_GROUPS=1,2,4,8` - each a minute.
+
+On the box: `sudo nvidia-smi -pm 1` first (persistence mode - run5's
+start-up, outside the fold's own clock, grew 6.0 -> 10.0 s from one GPU to eight, the likeliest cause each GPU's cold
+initialisation), then `python3 tools/check-multigpu.py --sizes=4,12,24 --big=41 --sim --times` (correctness on 1 vs 8, scaling
+over 1/2/4/8, the 10,127-token fold; `--sim` adds each size as one simulated rank of N on one of the box's GPUs, so the
+measured fold minus it IS the interconnect's cost, size by size; `--times` the phases past the trunk), and `--full` for
+the default 3 recycles and 200 steps. (Ranks SHARING one GPU - `--gpu-map=0,0`, how this box checks correctness - fence on the
+host: a fence waiting in a kernel would hold the card while the peer it waits for needs it, and two contexts on one
+card take turns by time slice - a 3-rank trunk was 14.4 s against 0.4. `LOCALFOLD_MG_DEVICE_FENCES=1` keeps them on
+the device there, to check them.) `LOCALFOLD_MG_TIMES=1` prints
+each phase past the trunk; `--profile` with `LOCALFOLD_PROF_GAPS=20` the kernels, the copies and the idle by what ended it.
+
+#### Measured on a second rented 8 x A100-SXM4-40GB (NVLink, NVSwitch), 2026-10-10 evening
+
+Total fold time, one trunk pass and 25 steps (10,127 tokens: 100); 1 GPU from the start of the evening, the rest at
+`ebb6653` (the 2- and 4-GPU lanes ran side by side on disjoint GPUs):
+
+| tokens | 1 GPU | 2 | 4 | 8 | best |
+|---:|---:|---:|---:|---:|---:|
+| 988 | 1.66 s | 1.78 | **1.13** | 1.23 | 1.5x on 4 |
+| 2,964 | 23.2 s | 14.1 | 7.87 | **4.91** | 4.7x on 8 |
+| 5,928 | 169 s | out of memory | 47.2 | **25.6** | 6.6x on 8 |
+| 10,127 | does not fit | | | **114.8** (trunk 97.0, 86.9 simulated) | |
+| 12,103 | | | | out of memory (rank 0, a 1.17 GB buffer in the trunk) | |
+
+The evening began at 2.10 / 6.13 / 32.1 s on 8 and the 10,127-token fold out of memory. Self-templated 5CAJ and the
+1TIM dimer stay 0.009 / 0.006 A from one GPU (boltz2 0.008 / 0.009). What the box showed that one card cannot:
+
+- **Every exchange walked the peers from rank 0**, so all eight GPUs read one peer at once: an all-to-all of 268 MB a
+  rank ran at 56-64 GB/s a GPU, against 233 for copy-engine copies and 120-147 for kernels with each rank starting at
+  its own rows (`rot` in sharded.cuh; copy loops start at the next rank). Worth 2-10% of a trunk pass: past ~2,000
+  tokens the trunk was not bandwidth-bound - `LOCALFOLD_MG_FOLD_TRANSPOSES=0`, `LOCALFOLD_MG_TRI_GROUPS=1/2/4/8` and
+  `LOCALFOLD_MG_FP8_EXCHANGE=1` all landed within 3,856-3,936 ms of each other at 2,964 tokens.
+- **Opening a peer's buffer (`cudaIpcOpenMemHandle`) costs ~3 ms of driver time with 8 ranks at once** (1 with 2, 1.7
+  with 4) whatever its size, closing ~1.5: ~35 ms of GPU idle a shared buffer on every rank, ~1.6 s a 2,964-token fold
+  (Nsight Systems: 790 ms of rank 0's idle inside them). Simulation opens nothing, so never saw it. Shared buffers now
+  live in 1 GB segments (one open for several), a buffer given back is kept mapped for the next of about its size, and
+  the pool is freed only where some rank is short (collectively: multigpu.cuh, `release`, `freeIdle`).
+- **Rank skew at small sizes**: at 988 tokens ~45% of a trunk pass is ranks waiting at fences (no rank consistently
+  last); at 2,964, 3%. `LOCALFOLD_MG_FENCE_TIMES=1` reports every rank's fence waits by `--stages` stage.
+- boltz2's confidence head is sharded now (it ran on rank 0 with the pair gathered: 24 s of a 5,928-token fold, 4.5 now),
+  the encoder's trunk-pair projection is read from the rank holding each row (the 6.6 GB a rank all-gather at 10,127
+  tokens is gone), and on a card short of room the template stack's buffers are given back after it (the MSA stack
+  37.4 -> 28.3 GB a rank at 10,127). Every rank's short-of-room choices now take one room, the least of theirs.
+
+boltz2 at its defaults (200 steps, 3 recycles), ours: 988 tokens 7.9 / 7.1 / 3.9 / **3.4 s** on 1/2/4/8 GPUs; 2,964
+112 / 63.6 / 35.0 / **19.6 s**; 5,928 out of memory on 1 and 2, 212.5 / **111.6 s** on 4/8. Against the
+`anthropics/uplifting-biomolecular-modeling` boltz2 kit (`--mode big --n_gpu P`, warm, the confidence head not in its
+times) on the same box: 988 tokens 16.2 s on one GPU (`fast`), 59.5 s on 8; 2,964 out of memory on one 40 GB GPU in
+both modes, 99.1 s on 8; 5,928 251.6 s on 8. Its row-sharded pair is ours; its triangle is a ring (each rank receives
+the whole projected b whatever P, for results independent of P), NCCL rather than IPC, and no device-side fences.
+
+#### 4 x RTX A6000 over PCIe: every exchange a push, and why a PCIe box needs a large fold (2026-10-11)
+
+On a box whose four GPUs reach each other only through a PCIe host bridge (`nvidia-smi topo -m`: PHB), reading another
+GPU's memory ran at **0.4-0.9 GB/s** a GPU (a copy engine's peer copy too) where writing it ran at **15-20 GB/s** - a
+write is posted, a read waits for its answer. Every exchange here pulled, and a 988-token fold took **52.7 s on the four
+against 3.0 on one** (39 of its trunk's 47 s the triangle's pulls). Now every exchange is a PUSH - the rank holding the
+data writes it into the rank that wants it: the triangle's operands into each consumer's slots, z out into z^T, the
+biases, the single track's rows, the diffusion's k and v into per-parity inboxes (pushed straight into a peer's qkvg the
+fold came out 0.2-0.33 A apart run to run; the inbox copied in after the fence is deterministic and 0.000 A from the
+pull version). Over NVLink a push and a pull are alike (118 GB/s against 120-147 on 8 x A100). 988 tokens on the four:
+52.7 -> 8.8 s.
+
+Measured then (one pass, 25 steps; before the share fix and the overlaps below):
+
+| tokens | 1 GPU | 2 | 4 |
+|---:|---:|---:|---:|
+| 988 | **2.96 s** | 3.29 | 8.82 |
+| 2,964 | 44.5 | **38.1** | 43.0 |
+| 5,928 | 347 | 220 | **205** (1.7x) |
+
+Why: at 2,964 tokens a pairformer block moves ~3.4 GB a GPU (two triangles' operands and products, the column
+attention's transposes) through the one bridge, ~15 GB/s a GPU with all four pushing - ~0.2-0.4 s, against ~0.2 s of a
+block's compute a GPU (0.82 s on one). A triangle on the four: 58 ms pushing its operands, 49 waiting for the others',
+16 pushing the product, **12 computing**. Communication grows as n^2 and the work as n^3, so the box pays only past a few
+thousand tokens, and 2 GPUs (one pair's traffic through the bridge a triangle) beat 4 (1.5 pairs') at 2,964. Since:
+
+- **short of room judged on a rank's share** (`SHORT_PAIR_SHARE`): asked of the whole pair, every multi-GPU fold past
+  ~2,000 tokens took the short-of-room paths (the triangle in rounds, the stacks' buffers given back each pass, no
+  graph) - 43.0 -> 40.5 s at 2,964 on the four, and the NVLink boxes the same;
+- **the triangle's next step pushed beside this step's GEMM**, and **z^T pushed a chunk at a time beside the input pass
+  over the chunk before** (both deterministic, 0.000 A from the unoverlapped forms);
+- **`LOCALFOLD_MG_FP8_EXCHANGE=1` sends e4m3** (it widened before sending: no bytes saved, so it measured nothing).
+
+Not yet measured on a box. Even overlapped the bridge caps such a box near 2x at 3,000 tokens and ~3x at 6,000.
+`LOCALFOLD_MG_TRI_TIMES=1` prints the triangle's phases (input pass, exchange + GEMMs, product tail, output) on rank 0.
+
+#### Exchanges by copy engines, and what holds SMs (2026-10-12, before a box)
+
+The EA1 S-layer fold on 8 x A100 80 GB (10,344 tokens) ran its trunk at 473 s a pass against 383 s for a simulated rank:
+~22 s a pass that is the interconnect's. `LOCALFOLD_MG_TIMES=1` now prints the bytes each rank sends, by kind, on the
+stream (waited on) and beside it (overlapped). One pass of EA1, simulated: **480 GB waited on** (the short-of-room
+column ring's transposes 313, the attentions' bias 79, the triangle's first operand step 78, the MSA's columns 9) and
+**859 GB beside** (the triangle's operands 547 and products 313). The exposed bytes at ~118 GB/s explain ~4 s of the
+22; the rest fits the overlap's own cost - a push kernel holds its SMs for as long as the link takes (~10x a simulated
+rank's local writes), so the compute it overlaps runs on fewer SMs: the column ring's transposes pushed beside the
+attention made it 3% slower on 8 blocks and **22% on 64**, simulated.
+
+So the exchanges go by COPY ENGINES (`cudaMemcpyAsync`/`cudaMemcpy2DAsync` from the sending GPU into the peer: a push,
+no SM held):
+- **the triangle's operands and products** (`copyPlanes`, `copyRows`): each piece one run at both ends;
+- **the attention bias** (`copyBias`): a rank's piece one rectangle in either layout, one 2-D copy a destination;
+- on branch **`mg-ring-ce`**, every **pair transpose** - packed first on the device (`packTransposeK`, local, ~10x a link)
+  so each destination's piece is one run a row, then one 2-D copy a rank - with the column ring pipelined over three
+  slots (branch `mg-ring-ab`) so they overlap. Simulated rank of 8 at 5,928 tokens: on the stream 157 -> 59 GB a pass
+  and +1.5% (the ordinary path), 339 -> 241 GB and +0.9% (the ring); a simulated rank's copies are local and contend
+  with the attention for HBM.
+All byte-identical to the push kernels on 2 and 3 ranks sharing one card. On 8 x A100 an all-to-all ran at 233 GB/s a
+GPU by copy engines against 120 by kernels (both rotated), so the waited-on bytes should also move faster.
+
+Unmeasured, and the next box's question: `~/megacomplexes/box-scripts/ab.sh` builds commits side by side on an 8-GPU
+box and folds one pass of a job with each, twice interleaved (`BOX=ubuntu@<ip> ab.sh abd4088 opus-55-opt mg-ring-ce`).
+🔴 **AND A PCIe BOX TOO**: over the 4 x A6000's host bridge a peer READ by copy engine ran at 0.4-0.9 GB/s; these are
+writes from the sender, which kernels did at 15-20 GB/s there, but a copy engine's posted write through that bridge has
+not been timed - check it before trusting copy engines on PCIe.
+
+**Several samples: dealt, and a small fold's trunk replicated.** With several samples each rank samples k % N and runs
+those samples' confidence heads itself (the one-GPU head on the whole pair; results to rank 0 through `/dev/shm`),
+where every rank had run every sample. And for a fold that fits one GPU, under ~1,700 tokens on a link pushing under 30
+GB/s (`mg::pushRate`, measured at start: ~17 on these four, ~60 over NVLink), every rank runs the whole trunk alone and
+nothing is exchanged before the samples are dealt (`LOCALFOLD_MG_REPLICATE=1/0` forces either; sample k is then the
+one-GPU fold of that sample alone, bit for bit). AF3's defaults (200 steps, 3 recycles), 5 samples, on the four:
+
+| tokens | 1 GPU | 4, sharded | 4, replicated |
+|---:|---:|---:|---:|
+| 988 | 18.8 s | 17.1 s | **13.7 s** (trunk 9.2, diffusion 3.5, confidence 0.5) |
+| 2,964 | 211.9 s | **139.7 s** (trunk 116.0) | 186.8 s (trunk 163.4) |
+
+Five samples on four ranks is two on rank 0, so the diffusion and confidence fall 2.3x, not 4x. The 1,700 crossover is
+not measured.
+
+#### How large a fold fits 40 GB a GPU (2026-10-11, simulated ranks)
+
+The largest single-sequence AF3 fold on N x 40 GB, found on a simulated rank of N on this A100 (`LOCALFOLD_MG_SIMULATE`:
+one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappings take, so confirm there):
+
+| GPUs | before | then | now (later 2026-10-11) | first refused |
+|---:|---:|---:|---:|---:|
+| 1 | ~7,900 | ~7,900 | ~7,900 (**8,300** from 2026-10-15, above) | |
+| 2 | 4,940 | **6,916** | | |
+| 4 | 8,645 | **9,633** | **12,350** | 13,338 (0.7 GB short, the MSA attention's) |
+| 8 | 12,103 | **13,091** | **17,290** (peak 34.9 GB a rank, 7.6 min a pass simulated) | |
+
+🔴 **ON A REAL 8 x A100-SXM4-40GB (NVLink, 2026-10-11): 12,350 tokens fold on 4 of its GPUs (6.4 min, one pass and 25
+steps) and 16,549 on all 8 (8.3 min), where 17,290 ran out in a pairformer triangle** - a real rank starts with ~2.2 GB
+less room than a simulated one (34.2 against 36.5 GB: its peers' contexts and mappings), so read the simulated column as
+~1,000 tokens optimistic at 8. 15,808 tokens: trunk 355.6 s, diffusion 5.8, confidence 31.2; GPU peaks 39.5-39.9 GB
+(nvidia-smi, the scratch pool's idle pages included), host 61 GB (the parked shares). The same box, AF3's defaults, 5
+samples: **988 tokens 9.8 -> 3.6 s on 8 (2.7x); 2,964 tokens 110.6 -> 24.4 s (4.5x; the trunk 83.1 -> 13.7, 6.1x)**,
+`mg::pushRate` 142 GB/s and the pair sharded. 5CAJ and 1TIM self-templated 0.009 / 0.006 A from one GPU.
+
+The "now" column, a rank short of room (each change byte-identical on 5CAJ with the short-of-room paths forced unless
+said): the column attention holds no z^T share (its bias off the rank's own rows of z, written at the transposed place;
+z^T a chunk of every rank's columns at a time into two eighth-share slots, attended and pushed home - z^T is made only
+where a form still wants it); the triangle's gate made a chunk of rows at a time before its output (`RectMap.stride`),
+not held a whole share; the rank's share of the trunk pair PARKED in pinned host memory through a single template pass
+and from the diffusion's preparation (which streams its rows from there) to the confidence head (`parkShare` - a share's
+worth of host RAM a rank); target_feat's encoder scratch, the MSA side's and the sampler's precomputed conditioning given
+back where they were held across a stage; the generic triangle's peer share staged an eighth of its channels at a time
+(0.009 A: cuBLAS's pick at a smaller batch); the triangle in rounds holding one step's exchange slots, not two; the
+confidence head's and the contacts' whole-pair tables (bins, distances) given back once read. And one bug: the sharded template stack asked `shortPair` of its held rows,
+which divides by the share again - never short of room, it kept its query and LayerNorm whole (12.4 GB a rank at 13,832
+on 8). 🔴 A failing segment allocation prints every shared buffer and the scratch now - that listing found it. Past
+99,999 atoms a PDB's serial wraps (it ran a digit wide and the score reader threw); write such a fold as `--out=*.cif`.
+
+A rank held some 5.25 slabs (its rows of the pair, z^T, the triangle's a, b and product, a bias) where one GPU holds one
+pair, so 2 GPUs took fewer tokens than 1. On a card short of room now: the channel-split triangle in ROUNDS (a and b made
+a 16-channel window at a time into four buffers of 1/8 slab, `LOCALFOLD_MG_TRI_ROUNDS=1/0` forces either; 18.19 ->
+18.28 s for a simulated rank of 8 at 5,928 tokens), the template stack borrowing the trunk's z^T slab (its 64-channel f32
+slabs are the 128-channel bf16 one's size), and one product buffer where two do not fit. Each limit now falls on the
+next sub-GB buffer. With everything forced (`LOCALFOLD_BIG=1`), 5CAJ self-templated is 0.000 A from one GPU on 2 and 3
+ranks. (`--out=/dev/null` for such runs: a 13K fold's `_confidences.json` is 2.2 GB.)
+
+### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
+
+Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is
+written on. Below `__CUDA_ARCH__` 750 flash.cuh computes the MMA from the fragments by warp shuffles and loads
+`ldmatrix`'s registers by shuffled addresses (both `__noinline__`: inlined into the unrolled kernels, cicc ran past
+35 minutes; called, the build is 5.4). Checked on the A100 by building `LOCALFOLD_CUDA_ARCHS=70` (the compute_70 PTX
+the driver compiles here - a V100 itself runs its own SASS, no JIT) and running with `LOCALFOLD_EMULATE_CC=70
+LOCALFOLD_SMEM_LIMIT=98304`, which makes every host-side choice a V100's (`ccOf` in common.cuh): 5CAJ self-templated
+0.171 A against the crystal, 0.009 A from the native fold; 6MRR 0.165 A from it. 🔴 It is SLOW: that trunk is 10.7 s
+against 0.47 on the same card, 80% in flashGrid2R, fusedTransitionK, triInK and gridInK - a V100 would want m8n8k4
+helpers (its own tensor-core instruction) or cuBLAS paths in place of those four. AF2 and ESMFold2 share the helpers
+and have not been built for sm_70.
+
+### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes, 6.9 with FP8 (2026-10-09)
+
+(With the triangle's contraction in FP8 - docs/EF2FAST.md, "FP8 for the triangle's contraction" - the same fold's
+trunk pass is 362 s and the whole fold 414 s. The grid attention in FP8 as well - flash.cuh's flash8, e4m3 MMAs with
+k and v written e4m3 by the projection - takes a 2,964-token trunk pass 11.18 -> 9.82 s and a 988-token one 750 -> 707
+ms on the same card, 5CAJ, 1BRS and 1TIM self-templated within 0.001 A of the f16 folds - and, with flashGrid2R's block
+order (a head's bias is 205 MB there, past the L2), the 10,127-token fold's trunk pass 362 -> **296 s** and the fold 414 ->
+**343 s**, CA-CA median 3.665 A. AlphaFold 2's triangle attention takes the same kernel: a 988-residue multimer's attention
+967 -> 773 ms (+65 of the transpose), 5CAJ self-templated 0.206 A either way.)
+
+
+**Measured**, not by the rule: 41 chains of 1TIM, 10,127 tokens, on a G4 session's RTX PRO 6000 Blackwell Server
+Edition (sm_120, 96 GB, CUDA 13.0 building this branch at 7d5682c in 106 s) - one pass and 100 steps:
+
+| | 10,127 tokens, RTX PRO 6000 | 7,657 tokens, this A100 |
+|---|---:|---:|
+| trunk pass | 388.8 s | 325.9 s |
+| diffusion, 100 steps | 20.3 s | 21.2 s |
+| confidence | 30.3 s | 25.8 s |
+| whole fold | **442.8 s** | 376.1 s |
+| device peak | **83.7 GB** (sampled) | - |
+
+The stages' own peaks: 61.8 GB with the template stack's f32 activation (26.3 GB) beside the pair, 78.9 GB in the
+diffusion (its f16 LayerNorm'd pair 26.3 GB and the biases), 33.6 GB in the confidence head. CA-CA median 3.661 A,
+pLDDT 33.3 - the same picture as 7,657 tokens on the A100 (3.682, 32.8) for a single-sequence complex.
+
+**The card is ~1.6x an A100 on this code**: the grid attention's flash kernel runs at **234 TFLOP/s** there against
+117 here (--bench-grid at 4,000 tokens; 209 at 1,000), and its every arm keeps its A100 ranking (2 warps, 48-key
+tiles, two rows a block); a 988-token fold's trunk is 3.06 s against 4.99, a 2,964-token pass 12.1 s against 21.0.
+6MRR folds to 1.227 / 0.610 / 0.620 A at seeds 1-3 (the A100: 1.233 / 0.609). Its SM has ~100 KB of shared memory,
+so two choices tuned at 164 KB were measured there: the 128-channel triangle's streaming kernels win on it too
+(trunk -3.8% at 988 tokens, now taken from 96 KB an SM), and the 4-warp grid output kernel LOSES (252 -> 320 ms at 988
+tokens: one block an SM either way), so it keeps 8 warps there as its rule says.
 
 ### 🔴 Past the card: refused up front (folding there is on a branch)
 

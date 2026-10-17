@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-362 tools. `tools/fixtures/` is data and is not listed.
+367 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -214,7 +214,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (48)
+## `tools/oracle/` - the reference side (51)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -254,6 +254,8 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_chai1_denoise.py`** - af3-any-model's diffusion head for Chai-1, one denoise step on the REAL trunk, with chai's own pair input.
 - **`dump_esmfold2_confidence.py`** - Synthyra's ESMFold2 ConfidenceHead, inputs and outputs, from THEIR code.
 - **`dump_monomer_template.py`** - Capture AF2-MONOMER's template embedder by running AF2's own module.
+- **`dump_msap.py`** - MSA Pairformer's reference tensors for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
+- **`dump_msap_variants.py`** - MSA Pairformer's conservation and categorical Jacobian from the reference, for cuda/msap's --conservation and --jacobian.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.
 - **`dump_rdkit_smiles.py`** - RDKit's own answer for a corpus of SMILES, as the reference this port is held to.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
@@ -262,6 +264,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`embedder_reference.py`** - The embedder's pair init, computed straight from the inputs and weights.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
+- **`regen_batch_dumps.py`** - Re-dump every reference batch tools/check-batch-fields.js reads, from the af3-any-model installed in ~/.venv-lfjax.
 - **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
 - **`run_chai_lab.py`** - Genuine chai-lab 0.6.1 on one sequence, every exported module's inputs and outputs recorded - Chai-1's oracle.
 - **`score_modified_cif.py`** - Score a modified residue's own bonds in a predicted mmCIF.
@@ -296,7 +299,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (97)
+## `tools/` - everything else (99)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -332,6 +335,7 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
+- **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
 - **`check-native-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:bridge.
 - **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
 - **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
@@ -366,6 +370,7 @@ go through CDP, and the deploy.
 - **`export_esmc_model.py`** - ESM-C's tower and ESMFold2's shim -> the bundle format the browser reads.
 - **`export_esmfold2_trunk.py`** - ESMFold2's folding trunk -> a LocalFold bundle, in AF3's pairformer layout.
 - **`export_monomer_model.py`** - Write a LocalFold float32 monomer directory from AF2 params_model_N_ptm.npz.
+- **`export_msap.py`** - MSA Pairformer's weights for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.

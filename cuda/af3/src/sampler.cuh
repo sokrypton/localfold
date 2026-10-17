@@ -90,10 +90,25 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
-// --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160) - the page's
-// short schedule (web/af3-model.js diffusionScheduleFor: 80 for a plain protein, 40 for a ligand job, on
-// the families its measurements favour), handed to a CUDA fold so it samples what the page samples. 0 is
-// the model's own.
+// the multistep update: the previous prediction moved into this step's frame (the rotation and shift augmentNoiseK
+// gave x, about x's centroid), extrapolated with this one, x' = noisy + scale (noisy - D) for
+// D = (1 + w) d - w previous; then this prediction kept as the next step's previous
+__global__ void multistepK(float* x, const float* noisy, const float* denoised, float* previous, const float* mask,
+                           const float* c, const float* rot, float scale, float w, size_t atoms, size_t total) {
+  size_t a = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (a >= total) return;
+  size_t k = a / atoms; const float* r = rot + k * 12; const float* ck = c + k * 3;
+  float p[3] = {previous[a * 3] - ck[0], previous[a * 3 + 1] - ck[1], previous[a * 3 + 2] - ck[2]};
+  bool live = mask[a % atoms] != 0;
+  for (int d = 0; d < 3; ++d) {
+    float moved = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
+    float now = denoised[a * 3 + d], blend = (1 + w) * now - w * moved;
+    x[a * 3 + d] = noisy[a * 3 + d] + scale * (noisy[a * 3 + d] - blend);
+    previous[a * 3 + d] = now;
+  }
+}
+// --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160); 0 is the model's
+// own. A probe's knob - the page's short schedule that used it is gone (docs/AF3.md, "The default sampler").
 inline double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
@@ -110,6 +125,18 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] += dt * ((x[i] - d2[i]) / level + g1[i]) * 0.5f;
 }
+// the exponential Heun step (chai-1's --chai-second-order on its default update): x' = noisy + (r - 1) (noisy - D1) - a point
+// at the step's own level, where the second call evaluates it (S 1, as chai-lab's first stage is plain Euler) - D1 kept, and
+// after the second call x = noisy + c (noisy - (D1 + D2) / 2), c = r^S - 1: with D2 = D1 the one-call exponential step
+__global__ void expHeun1K(float* x, float* keep, const float* noisy, const float* d1, float c, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n3) return;
+  keep[i] = d1[i]; x[i] = noisy[i] + c * (noisy[i] - d1[i]);
+}
+__global__ void expHeun2K(float* x, const float* noisy, const float* d1, const float* d2, float c, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n3) x[i] = noisy[i] + c * (noisy[i] - 0.5f * (d1[i] + d2[i]));
+}
 // chai-1's sampler (af3-any-model diffusion_head.py, chai1.py's): its schedule (sigma_max 80, rho 7, sigma_min 4e-4)
 // at the N MIDPOINTS t = (2k + 1) / 2N; per transition the augmentation, churn min(80 / N, sqrt 2 - 1) only
 // where 4e-4 <= sigma_prev <= 80 (the scaled sigma against chai's raw thresholds - the weights were sampled so),
@@ -124,14 +151,32 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
 // (5CAJ, 5 x 200: 1805 -> 917 ms) - and at equal calls one-call 50 beats two-call 25 (backbone bonds 0.042
 // against 0.054 A). --chai-second-order is chai-lab's sampler as written.
 inline bool CHAI_SECOND_ORDER = false;
+// 🔴 AND ITS DEFAULT STEP IS THE EXPONENTIAL ONE (2026-10-17): x' = r^S noisy + (1 - r^S) D, r = sigma / tHat, S = 2 - its
+// one-call step above is Euler at that scale (x = noisy + 2 dt g1) - on its own schedule. Measured with the AF3 lineage's
+// decision run (seven systems x two seeds of bonds, six crystal targets x three seeds) at the page's 25 steps: mainchain
+// 0.063 -> 0.034 A, peptide 0.052 -> 0.019, side chain 0.075 -> 0.052, nucleic 0.075 -> 0.048, ligand mean 0.092 -> 0.058
+// (1/6 torn -> 0/6) - its own 200 steps' bonds - crystals level (1.294 -> 1.285 A), clashes as before. The geometric
+// schedule bought the same bonds and one to three more clashes a fold (docs/AF3.md, "chai-1's sampler").
+//   --update=euler         its own step (the sampler before), --step-scale= another S
+//   --schedule=geometric   its endpoints (80, 4e-4) at the same midpoints, evenly spaced in log sigma
+//   --no-churn             its churn off
+//   --chai-second-order    two calls a step: on the exponential update the exponential Heun step (expHeun1K/2K), with
+//                          --update=euler chai-lab's sampler as written
 inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                      const std::function<const float*(const float*, float, const float*)>& denoiseFn,
-                                     const std::function<void(const std::vector<float>&)>& onLevels) {
+                                     const std::function<void(const std::vector<float>&)>& onLevels,
+                                     bool geometric = false, bool exponential = true, bool churnOn = true,
+                                     double stepScale = 0) {
   int ns = (int)seeds.size(), N = steps;
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   std::vector<double> levels(N);
-  for (int k = 0; k < N; ++k) levels[k] = noiseSchedule((2.0 * k + 1) / (2.0 * N), 16, 0.0004, 80, 7);
-  const double churn = std::min(80.0 / N, std::sqrt(2.0) - 1.0);
+  for (int k = 0; k < N; ++k) {
+    const double t = (2.0 * k + 1) / (2.0 * N);
+    levels[k] = geometric ? 16 * std::exp(std::log(80.0) + t * (std::log(0.0004) - std::log(80.0)))
+                          : noiseSchedule(t, 16, 0.0004, 80, 7);
+  }
+  const double churn = churnOn ? std::min(80.0 / N, std::sqrt(2.0) - 1.0) : 0.0;
+  const double S = stepScale > 0 ? stepScale : 2.0;
   int T = N - 1;                       // transitions
   std::vector<float> rot((size_t)std::max(T, 1) * ns * 12), at;     // [tHat, sigma] a transition
   for (int k = 0; k < ns; ++k) {
@@ -177,7 +222,16 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     if (s == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
     if (!CHAI_SECOND_ORDER) {                    // one call: the correction's D taken as this step's (see above)
-      chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(2 * dt), all3);
+      if (exponential) eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d1, (float)(std::pow(level / tHat, S) - 1), all3);
+      else chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(S * dt), all3);
+      continue;
+    }
+    if (exponential) {                         // the exponential Heun step (dG keeps D1 across the second call)
+      const float c = (float)(std::pow(level / tHat, S) - 1);
+      expHeun1K<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)(level / tHat - 1), all3);
+      CK(cudaMemcpyAsync(dIn, dX, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+      const float* d2 = denoiseFn(dIn, (float)level, dLevels + 2 * (s - 1) + 1);
+      expHeun2K<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, dG, d2, c, all3);
       continue;
     }
     chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)dt, all3);
@@ -196,12 +250,24 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
 //   exponential: x' = r^S x + (1 - r^S) D, r = sigma' / sigma, where the Euler step is x' = x + S (r - 1) (x - D) -
 //                at a large step (r < 1/3 with S 1.5) Euler's coefficient on x goes negative and the walk overshoots
 //   churn:       AlphaFold 3's noise injection (gamma0); off, the walk is deterministic past its first draw
+//   multistep:   the exponential step on DPM-Solver++ 2M's extrapolation from the previous prediction; with
+//                --multistep-below=<A> only at steps under that noise level. Measured, NOT a default: everywhere it
+//                moves chains (af3's crystals 1.106 -> 1.344 A at 12 steps), below 4 A it keeps them and helps
+//                ligands a little (docs/AF3.md, "A multistep update")
+//   --schedule-split=<A>:<K>: the geometric schedule in two segments, K steps down to that level and the rest
+//                below - measured, NOT a default: steps above ~4 A place assemblies and steps below settle ligands,
+//                and every reallocation of the default's 25 cost one or the other (docs/AF3.md)
 // The defaults are the exponential update on the geometric schedule with churn - every fold's, the page's too
 // (webgpu/af3/fold.js DIFFUSION_DEFAULTS): 200 Euler steps' ligand geometry at 25, level elsewhere (docs/AF3.md).
 // --update=euler --schedule=karras is AlphaFold 3's own sampler, for an oracle comparison.
 struct DiffusionOptions {
   bool geometric = true, exponential = true, churn = true;
-  bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
+  bool multistep = false;      // exponential with DPM-Solver++ 2M's extrapolation from the previous prediction
+  double multistepBelow = 1e30;  // ...only at steps whose noise level (A) is below this; plain exponential above
+  double splitAt = 0; int splitAbove = 0;  // geometric in two segments: splitAbove steps down to splitAt (A), the rest below
+  double stepScale = 0;        // --step-scale=S: the step's scale (0: the model's own - AF3's 1.5, chai-1's 2)
+  bool scheduleGiven = false;  // --schedule= said (chai-1's default schedule is its own, not the geometric one)
+  bool given = false;          // a flag set one
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
 inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
@@ -212,10 +278,22 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
     return true;
   };
-  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
+  if (!strcmp(f, "--update=multistep")) { o.exponential = o.multistep = true; o.given = true; return true; }
+  if (value("--schedule=", "karras", "geometric", o.geometric)) { o.multistep = false; o.scheduleGiven = o.given = true; return true; }
+  if (value("--update=", "euler", "exponential", o.exponential)) { o.multistep = false; o.given = true; return true; }
+  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  if (!strncmp(f, "--step-scale=", 13)) {
+    o.stepScale = atof(f + 13);
+    if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); exit(1); }
     o.given = true; return true;
   }
-  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  if (!strncmp(f, "--multistep-below=", 18)) { o.multistepBelow = atof(f + 18); o.given = true; return true; }
+  if (!strncmp(f, "--schedule-split=", 17)) {
+    if (sscanf(f + 17, "%lf:%d", &o.splitAt, &o.splitAbove) != 2 || o.splitAt <= 0 || o.splitAbove < 1) {
+      fprintf(stderr, "--schedule-split=<A>:<steps above>, not %s\n", f + 17); exit(1);
+    }
+    o.geometric = true; o.given = true; return true;
+  }
   return false;
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
@@ -236,10 +314,25 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   }
   std::vector<double> levels(steps + 1);
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
-  if (M.flag("trunk.dialect.chaiSampler")) return sampleChai(steps, seeds, mask, denoiseFn, onLevels);
+  if (M.flag("trunk.dialect.chaiSampler")) {
+    if (opt.multistep || opt.splitAt > 0) {
+      fprintf(stderr, "chai-1's sampler takes --schedule, --update, --no-churn and --step-scale, not --update=multistep or --schedule-split\n"); exit(1);
+    }
+    // (its own schedule unless --schedule said otherwise - DiffusionOptions' default schedule is the AF3 lineage's)
+    return sampleChai(steps, seeds, mask, denoiseFn, onLevels, opt.scheduleGiven && opt.geometric, opt.exponential, opt.churn,
+                      opt.stepScale);
+  }
+  if (opt.stepScale > 0) stepScale = opt.stepScale;
   for (int k = 0; k <= steps; ++k)
     levels[k] = opt.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
                               : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+  if (opt.splitAt > 0) {      // two geometric segments, in A: 16 sigmaMax -> splitAt in splitAbove steps, then -> 16 sigmaMin
+    if (opt.splitAbove >= steps) { fprintf(stderr, "--schedule-split: %d steps above, of %d\n", opt.splitAbove, steps); exit(1); }
+    const double top = std::log(16 * sigmaMax), mid = std::log(opt.splitAt), bottom = std::log(16 * sigmaMin);
+    for (int k = 0; k <= steps; ++k)
+      levels[k] = std::exp(k <= opt.splitAbove ? top + (double)k / opt.splitAbove * (mid - top)
+                                               : mid + (double)(k - opt.splitAbove) / (steps - opt.splitAbove) * (bottom - mid));
+  }
   if (!opt.churn) gamma0 = 0;
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {
@@ -265,6 +358,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
   float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
   float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+  float* dPrev = nullptr;
+  if (opt.multistep) { CK(devMalloc(&dPrev, all3 * 4)); CK(cudaMemsetAsync(dPrev, 0, all3 * 4, STREAM)); }
   for (int s = 0; s < steps; ++s) {
     double previous = levels[s], level = levels[s + 1];
     tHats[s] = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
@@ -281,8 +376,21 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
     const double coef = opt.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
-    eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
+    // the multistep weight w = 1 / (2 rho), rho the previous gap between evaluated levels over this step's, both in
+    // log sigma; the first step, and any whose levels do not fall, is the plain exponential step (w 0)
+    double w = 0;
+    if (opt.multistep && step > 1 && tHat < opt.multistepBelow) {
+      const double h = std::log(tHat / level), hPrev = std::log(tHats[step - 2] / tHat);
+      if (h > 0 && hPrev > 0) w = h / (2 * hPrev);
+    }
+    if (opt.multistep)
+      multistepK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, d, dPrev, dMask, dC,
+                                                          dRot + (size_t)(step - 1) * ns * 12, (float)coef, (float)w,
+                                                          atoms, atoms * ns);
+    else
+      eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
   }
+  if (dPrev) CK(cudaFree(dPrev));
   std::vector<float> out = download(dX, all3);
   for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
   CK(cudaFree(dSeeds));
@@ -293,6 +401,13 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
 // The PDB: through the exporter's template.pdb when there is one (the page's own records, the
 // slot in the x column), else one residue per token named here. `bfactors` per atom slot.
 inline std::string DATA_DIR;
+// how far a template record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at
+// 24 slots a token - the slot is wider and pushes the rest of the record right, so its tail is read that far along
+inline size_t templateSpill(const std::string& line) {
+  size_t at = 30; while (at < line.size() && line[at] == ' ') ++at;
+  while (at < line.size() && (isdigit((unsigned char)line[at]) || line[at] == '.')) ++at;
+  return at > 38 ? at - 38 : 0;
+}
 // Returns the dense slot of every ATOM/HETATM record, in file order.
 inline std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors = nullptr) {
   std::vector<size_t> order;
@@ -302,12 +417,13 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
     std::string line;
     while (std::getline(tf, line)) {
       if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
-        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8)));
+        const size_t spill = templateSpill(line);
+        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8 + spill)));
         order.push_back(slot);
         char coords[64];
         snprintf(coords, sizeof coords, "%8.3f%8.3f%8.3f%6.2f%6.2f", x[slot * 3], x[slot * 3 + 1], x[slot * 3 + 2],
                  1.0, bfactors ? bfactors[slot] : 0.0);
-        line = line.substr(0, 30) + coords + line.substr(66);
+        line = line.substr(0, 30) + coords + (line.size() > 66 + spill ? line.substr(66 + spill) : std::string());
       }
       fprintf(f, "%s\n", line.c_str());
     }
@@ -324,6 +440,14 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
   const int* chain = M.i("batch.asymId"); const int* resIdx = M.i("batch.residueIndex");
   FILE* f = fopen(path.c_str(), "w");
   int serial = 1;
+  // (PDB's fields: a serial of five digits and a chain of one letter - past 99,999 atoms the serial wraps, as the
+  // chain letter already does past 26 chains, so the columns stay where every reader looks; mmCIF holds either)
+  size_t live = 0; int chains = 0;
+  for (size_t i = 0; i < (size_t)n * dense; ++i) live += mask[i] != 0;
+  for (int t = 0; t < n; ++t) chains = std::max(chains, chain[t]);
+  if (live > 99999 || chains > 26)
+    fprintf(stderr, "%s: %zu atoms in %d chains is past PDB's serials or chain letters (they wrap) - --out=<name>.cif keeps them\n",
+            path.c_str(), live, chains);
   for (int t = 0; t < n; ++t) for (int a = 0; a < dense; ++a) {
     size_t i = (size_t)t * dense + a;
     if (!mask[i]) continue;
@@ -332,7 +456,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
     for (int k = 0; k < 4; ++k) { int c = names[i * 4 + k]; name[k] = c > 0 ? (char)(c + 32) : 0; }
     int z = elem[i]; const char* el = z >= 0 && z < 18 ? ELEM[z] : "X";
     const char* res = aatype[t] >= 0 && aatype[t] < 20 ? RES[aatype[t]] : "UNK";
-    fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++,
+    fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++ % 100000,
             strlen(name) < 4 ? (std::string(" ") + name).c_str() : name, res, 'A' + (chain[t] - 1) % 26,
             resIdx[t], x[i * 3], x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[i] : 0.0, el);
   }
@@ -400,7 +524,7 @@ struct FrameStreamer {
           snprintf(buf, sizeof buf, "%8.3f", R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d]);
           out += buf;
         }
-        out += line.substr(54); out += '\n'; ++a;
+        out += line.substr(54 + templateSpill(line)); out += '\n'; ++a;
       } else { out += line; out += '\n'; }
     }
     char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", step);
@@ -466,25 +590,41 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   for (int i = 0; i < n; ++i) if (seq[i] > 0 && std::find(chains.begin(), chains.end(), asym[i]) == chains.end()) chains.push_back(asym[i]);
   std::sort(chains.begin(), chains.end());
   int nc = (int)chains.size();
-  // max over anchors of the mean over the selected pairs (NaN when nothing is selected)
-  auto reduce = [&](const std::function<bool(int, int)>& selects) {
-    double best = -1e30; bool any = false;
+  // 🔴 ONE PASS OVER THE PAIRS, NOT ONE A CHAIN PAIR: every chain's pTM and ipTM and every chain pair's ipTM is a max over
+  // anchors i of the mean of tmTerm[i][j] over the j it selects, and each selection is "j in chain b" or its complement -
+  // so each anchor's row summed per chain once (in j order) answers them all. It rescanned the n^2 pairs through a
+  // std::function for each of the nc^2 chain pairs: minutes past ~5,000 tokens in tens of chains
+  std::vector<int> chainOf(n, -1);
+  for (int i = 0; i < n; ++i) chainOf[i] = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
+  std::vector<double> rowSum((size_t)n * nc, 0.0); std::vector<int> chainCount(nc, 0);
+  for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) chainCount[chainOf[j]]++;
+  if (!tmTerm.empty())
     for (int i = 0; i < n; ++i) {
-      double total = 0; int count = 0;
-      for (int j = 0; j < n; ++j) {
-        if (!(seq[i] > 0 && seq[j] > 0) || !selects(i, j)) continue;
-        total += tmTerm[(size_t)i * n + j]; ++count;
-      }
-      if (count) { any = true; best = std::max(best, total / count); }
+      if (!(seq[i] > 0)) continue;
+      double* r = rowSum.data() + (size_t)i * nc;
+      for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) r[chainOf[j]] += tmTerm[(size_t)i * n + j];
     }
-    return any ? best : NAN;
+  // max over the anchors of chain `from` (or every chain but it, `others`) of their mean over chain `to`'s pairs (or
+  // over every chain but `to`'s, `notTo`); NaN when nothing is selected
+  auto best = [&](int from, bool others, int to, bool notTo) {
+    double top = -1e30; bool any = false;
+    for (int i = 0; i < n; ++i) {
+      if (!(seq[i] > 0) || chainOf[i] >= nc || (others ? chainOf[i] == from : chainOf[i] != from)) continue;
+      const double* r = rowSum.data() + (size_t)i * nc;
+      double total = 0; int count = 0;
+      if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
+      else { total = r[to]; count = chainCount[to]; }
+      if (count) { any = true; top = std::max(top, total / count); }
+    }
+    return any ? top : NAN;
   };
+  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
   auto num = [](FILE* f, double v) { if (std::isfinite(v)) fprintf(f, "%.2f", v); else fprintf(f, "null"); };
   std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN);
-  for (int a = 0; a < nc; ++a) {
-    int c = chains[a];
-    chainPtm[a] = reduce([&](int i, int j) { return asym[i] == c && asym[j] == c; });
-    chainIptm[a] = reduce([&](int i, int j) { return (asym[i] == c) != (asym[j] == c); });
+  for (int a = 0; a < nc && !tmTerm.empty(); ++a) {
+    chainPtm[a] = best(a, false, a, false);
+    // (asym[i] == c) != (asym[j] == c): anchors in c over the other chains, and anchors elsewhere over c
+    chainIptm[a] = maxNan(best(a, false, a, true), best(a, true, a, false));
   }
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{\n  \"chain_ids\": [");
@@ -497,8 +637,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
       for (int b = 0; b < nc; ++b) {
         if (b) fprintf(f, ", ");
         if (a == b) { num(f, chainPtm[a]); continue; }        // the diagonal is the chain's own pTM
-        int ca = chains[a], cb = chains[b];
-        num(f, reduce([&](int i, int j) { return (asym[i] == ca && asym[j] == cb) || (asym[i] == cb && asym[j] == ca); }));
+        num(f, maxNan(best(a, false, b, false), best(b, false, a, false)));
       }
       fprintf(f, "]");
     }
@@ -507,8 +646,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   if (!contact.empty()) {      // the strongest predicted contact within and between chains, sequence neighbours out
     std::vector<double> mx((size_t)nc * nc, -1);
     for (int i = 0; i < n; ++i) for (int j = i + 1; j < n; ++j) {
-      int a = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
-      int b = (int)(std::find(chains.begin(), chains.end(), asym[j]) - chains.begin());
+      int a = chainOf[i], b = chainOf[j];
       if (a >= nc || b >= nc || (a == b && std::abs(res[i] - res[j]) <= 6)) continue;
       double v = contact[(size_t)i * n + j];
       if (v > mx[(size_t)a * nc + b]) mx[(size_t)a * nc + b] = mx[(size_t)b * nc + a] = v;

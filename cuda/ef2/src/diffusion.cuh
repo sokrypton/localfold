@@ -12,15 +12,17 @@
 //   x_denoised = sigma^2 / (sigma^2 + t^2) x_noisy + sigma t / sqrt(sigma^2 + t^2) * (LN(q) @ outputLinear)
 #pragma once
 #include "atoms.cuh"
+#include "../../af3/src/multigpu.cuh"      // (several GPUs: the token attention's query rows, EF2_QLO)
 
 constexpr int DIFFUSION_HALF_WINDOW = 64;     // the diffusion's atom stacks are windowed (128) in both references
 
 // rows [p0, p0 + n) of [z | rel_pos]
-__global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, size_t n, int T, int C) {
+__global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, size_t n, int T, int C, bool z16 = false) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n * 2 * C) return;
   size_t p = p0 + t / (2 * C); int c = (int)(t % (2 * C));
-  out[t] = c < C ? z[p * C + c] : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
+  out[t] = c < C ? (z16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(z)[p * C + c]) : z[p * C + c])   // (EF2_Z16)
+                 : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
 }
 __global__ void siluMulK(const float* a, const float* b, float* out, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -72,6 +74,38 @@ __global__ void adaCombineK(const float* an, const float* g, const float* gb, co
   size_t gi = (t / C) * ld + t % C;
   out[t] = an[t] / (1.f + expf(-(g[gi] + gb[t % C]))) + sh[gi];
 }
+// ...the LayerNorm (affine-free) and that combine in one pass: a block a row, its first warp taking the statistics
+// with layerNormK's arithmetic exactly, then all of the block writing the row (a warp a row put the whole combine on
+// T warps - 9 blocks at 68 tokens - and was slower than the two kernels)
+__global__ void adaLNK(const float* a, const float* g, const float* gb, const float* sh, float* out, size_t T, int C, int ld) {
+  __shared__ float stats[2];
+  size_t row = blockIdx.x;
+  const float* xr = a + row * C;
+  if (threadIdx.x < 32) {
+    int lane = threadIdx.x;
+    float s = 0;
+    for (int c = lane; c < C; c += 32) s += xr[c];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / C, v = 0;
+    for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    if (lane == 0) { stats[0] = mean; stats[1] = rsqrtf(v / C + 1e-5f); }
+  }
+  __syncthreads();
+  float mean = stats[0], inv = stats[1];
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float n = __fmul_rn(xr[c] - mean, inv);
+    size_t gi = row * ld + c;
+    out[row * C + c] = __fadd_rn(n / (1.f + expf(-(g[gi] + gb[c]))), sh[gi]);
+  }
+}
+// a[t] += x[t] * sigmoid(g + gb): sigmoidMulK then addK in one pass, with their two roundings (no contraction)
+__global__ void gateAddK(float* a, const float* x, const float* g, const float* gb, size_t T, int C, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T * C) return;
+  float o = __fmul_rn(x[t], 1.f / (1.f + expf(-(g[(t / C) * ld + t % C] + gb[t % C]))));
+  a[t] = __fadd_rn(a[t], o);
+}
 __global__ void sigmoidMulK(float* x, const float* g, const float* gb, size_t T, int C, int ld) {   // x *= sigmoid(g (+ gb))
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T * C) return;
@@ -122,6 +156,24 @@ __global__ void pairToHeadsK(const float* pb, B* out, size_t P, int Hh) {   // [
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < P * Hh) out[(t % Hh) * P + t / Hh] = (B)pb[t];
 }
+// a chunk of pairs [p0, p0 + n) of [P, H] laid into a block's bias: the flash layout's rows, or [H, P]
+template <class B>
+__global__ void pairRowsToHeadsK(const float* pb, B* out, size_t p0, size_t n, size_t P, int Hh) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n * Hh) out[(t % Hh) * P + p0 + t / Hh] = (B)pb[t];
+}
+// (rlo, rows: a bias holding query rows [rlo, rlo + rows) alone - several GPUs, EF2_QLO)
+__global__ void pairRowsToFlashBiasK(const float* pb, half* out, size_t p0, size_t n, int T, int Hh, int stride,
+                                     int rlo = 0, int rows = -1) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n * Hh) return;
+  int h = (int)(t % Hh); size_t p = p0 + t / Hh; int i = (int)(p / T), j = (int)(p % T);
+  out[((size_t)h * (rows < 0 ? T : rows) + (i - rlo)) * stride + j] = __float2half(pb[t] * 1.4426950408889634f);
+}
+// several GPUs (cuda/ef2/src/mgtrunk.cuh): this rank's query rows of the token attention [EF2_QLO, EF2_QLO + EF2_QROWS) -
+// its biases those rows alone, made from its rows of the pair; the attention's output rows all-gathered after each
+// block. 0: every query (one GPU)
+inline int EF2_QLO = 0, EF2_QROWS = 0;
 // [T * T, H] -> the flash kernel's [H, T, stride] f16, log2(e)-scaled (the padding columns stay as cleared)
 __global__ void pairToFlashBiasK(const float* pb, half* out, int T, int Hh, int stride) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -180,19 +232,61 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   // row chunks of 64 MB: neither [z | rel_pos] nor a normalised copy of the pair is ever whole
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (8 * (size_t)Cz));
   float* joined = scratch<float>("dc.joined", chunk * 2 * Cz);
+  d.biasHalf = FAST;
+  int D = d.Ct / d.heads;
+  d.flashBias = FAST && TOKEN_FLASH && (D == 16 || D == 32 || D == 48 || D == 64);
+  d.stride = (T + 7) / 8 * 8;
+  // 🔴 STREAMED where the conditioning pair does not fit: every step below is row-wise - [z | rel_pos], its norm, the
+  // projection, the two transitions, each block's norm and bias projection - so each chunk of rows goes through all of
+  // them and into every block's bias at once, and the f32 pair [P, Cz] (16 GB at 3,952 tokens, where ESMFold2 ran out)
+  // never exists. Elsewhere the whole-pair path below, unchanged (its GEMMs chunked as before: the streamed one's
+  // transitions see other chunk boundaries, so it rounds differently)
+  // (the question includes every block's bias, which both paths allocate: asked without them, 3,952 tokens took the
+  // whole-pair path and ran out allocating the biases beside the 16 GB pair)
+  const size_t biasBytes = (size_t)d.tokenBlocks * d.heads * (d.flashBias ? (size_t)T * d.stride : P) * (d.biasHalf ? 2 : 4);
+  const bool shardedQ = EF2_QROWS > 0;
+  if (shardedQ && !d.flashBias) { fprintf(stderr, "several GPUs: the token attention wants the flash form (--fast)\n"); exit(1); }
+  const int biasRows = shardedQ ? EF2_QROWS : T;
+  if (shardedQ || BIG_FORCED || !roomFor(P * Cz * 4 + P * d.heads * 4 + biasBytes)) {
+    if (check) { fprintf(stderr, "the oracle check wants the whole conditioning pair\n"); exit(1); }
+    for (int b = 0; b < d.tokenBlocks; ++b) {
+      if (d.flashBias) {
+        half* h = dallocT<half>((size_t)d.heads * biasRows * d.stride);
+        CK(cudaMemsetAsync(h, 0, (size_t)d.heads * biasRows * d.stride * 2, STREAM));
+        d.biases.push_back(h);
+      } else if (d.biasHalf) d.biases.push_back(dallocT<half>(P * d.heads));
+      else d.biases.push_back(dalloc(P * d.heads));
+    }
+    float* rows = scratch<float>("dc.rows", chunk * Cz);
+    float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pbRows", chunk * d.heads);
+    const size_t pBeg = shardedQ ? (size_t)EF2_QLO * T : 0, pEnd = shardedQ ? (size_t)(EF2_QLO + EF2_QROWS) * T : P;
+    for (size_t p0 = pBeg; p0 < pEnd; p0 += chunk) {
+      size_t n = std::min(chunk, pEnd - p0);
+      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
+      layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+      gemm(joined, F("diffusion/zProjection"), rows, n, 2 * Cz, Cz);
+      for (int l = 0; l < 2; ++l) transitionLayer(rows, n, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
+      for (int b = 0; b < d.tokenBlocks; ++b) {
+        std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
+        layerNorm(rows, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
+        gemm(pn, F(B + "pairBiasWeights"), pb, n, Cz, d.heads);
+        if (d.flashBias) pairRowsToFlashBiasK<<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (half*)d.biases[b], p0, n, T, d.heads, d.stride,
+                                                                                    shardedQ ? EF2_QLO : 0, biasRows);
+        else if (d.biasHalf) pairRowsToHeadsK<half><<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (half*)d.biases[b], p0, n, P, d.heads);
+        else pairRowsToHeadsK<float><<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (float*)d.biases[b], p0, n, P, d.heads);
+      }
+    }
+    releaseScratch({ "dc.joined", "dc.rows", "dc.pn", "dc.pbRows", "dtr." });
+  } else {
   float* pair = scratch<float>("dc.pair", P * Cz);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz);
+    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
     layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
     gemm(joined, F("diffusion/zProjection"), pair + p0 * Cz, n, 2 * Cz, Cz);
   }
   for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
   if (check) checkOracle("diffusion conditioning pair", pair, P * Cz, "o/cond/pair");
-  d.biasHalf = FAST;
-  int D = d.Ct / d.heads;
-  d.flashBias = FAST && TOKEN_FLASH && (D == 16 || D == 32 || D == 48 || D == 64);
-  d.stride = (T + 7) / 8 * 8;
   float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
   for (int b = 0; b < d.tokenBlocks; ++b) {
     std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
@@ -212,6 +306,7 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
     d.biases.push_back(bias);
   }
   if ((size_t)P * Cz * 4 > ((size_t)128 << 20)) releaseScratch();     // the joined and projected pairs (a large input)
+  }
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
@@ -267,10 +362,8 @@ inline void singleProjections(const Denoiser& d) {
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift, the projections from G
 inline void adaLN(const Denoiser& d, const float* a, float* out, int e, const std::string& B) {
   int T = d.T, C = d.Ct, ld = d.entries * C;
-  float* an = scratch<float>("ada.an", (size_t)T * C);
-  layerNorm(a, an, T, C, nullptr, nullptr);
-  adaCombineK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(an, d.G + (size_t)e * C, F(B + "gateBias"),
-                                                        d.G + (size_t)(e + 1) * C, out, T, C, ld);
+  adaLNK<<<(unsigned)T, 256, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
+                                                      out, T, C, ld);
 }
 
 inline void tokenBlock(const Denoiser& d, float* a, int b) {
@@ -290,9 +383,13 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
     gemm(x, W(wq), qkvg, T, C, 4 * C);
     half* qh = scratch<half>("tb.qkvgh", (size_t)(T + 128) * 4 * C);    // (padding: the last query block's rows)
     toHalfRowsK<<<blocks((size_t)T * 4 * C), 256, 0, STREAM>>>(qkvg, qh, (size_t)T * 4 * C);
-    half* oh = scratch<half>("tb.oh", (size_t)T * C);
+    mg::Shared* ohS = EF2_QROWS ? &mg::shared("ef2.tok.oh", (size_t)T * C * 2) : nullptr;
+    half* oh = ohS ? (half*)ohS->local : scratch<half>("tb.oh", (size_t)T * C);
+    if (EF2_QROWS) { FLASH_QLO = EF2_QLO; FLASH_QHI = EF2_QLO + EF2_QROWS; FLASH_BIAS_ROWS = EF2_QROWS; }
     flashGrid<half>(qh, (const half*)d.biases[b], d.stride, nullptr, oh, T, Hh, D, 0, 1, false, 1.f / sqrtf((float)D),
                     F(B + "attention/queryBias"));
+    FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
+    if (ohS) mg::allGather(*ohS, (size_t)EF2_QLO * C * 2, (size_t)EF2_QROWS * C * 2);   // (every rank's query rows)
     float* ctx = scratch<float>("tb.ctx", (size_t)T * C);
     halfToFloatK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(oh, ctx, (size_t)T * C);
     gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
@@ -314,8 +411,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
   }
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
-  addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
+  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
   // the conditioned transition
   adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/");
   int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
@@ -323,8 +419,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   gemm(x, F(B + "transition/swishWeights"), w, T, C, 2 * Hd);
   swigluK<<<blocks((size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
   gemm(g, F(B + "transition/outWeights"), o, T, Hd, C);
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
-  addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
+  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
 }
 
 // one denoiser call: x_noisy [A, 3] at the noise level in d.level -> x_denoised [A, 3]; nothing here

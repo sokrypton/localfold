@@ -52,16 +52,25 @@ function compare(sequence, dump, options) {
   const theirIdx = flat(dump.inputs["queries_to_keys:gather_idxs"]);
   const theirMask = flat(dump.inputs["queries_to_keys:gather_mask"]);
   const keys = ours.indices.length / batch.shape.subsets;
+  // 🔴 BLOCK BY BLOCK, NOT FLAT: below 128 atoms this port's window is the atom count wide where the reference's is
+  // always 128 (its padding masked), so a flat comparison shears one against the other from the second block on - it
+  // read IntelliFold-2 at 93 atoms as 70 mask and 116 index differences on windows that were identical. A reference
+  // slot past our width must be masked, and is counted as a mask difference if it is not.
+  const theirShape = dump.inputs["queries_to_keys:gather_idxs"].shape;
+  const theirKeys = theirShape ? theirShape[theirShape.length - 1] : keys;
   let maskDiff = 0;
   let indexDiff = 0;
   let live = 0;
-  for (let at = 0; at < ours.indices.length; at += 1) {
-    const mine = ours.mask[at] > 0.5;
-    const theirs = theirMask[at] > 0.5;
-    if (mine !== theirs) { maskDiff += 1; continue; }
-    if (!mine) continue;
-    live += 1;
-    if (ours.indices[at] !== theirIdx[at]) indexDiff += 1;
+  for (let subset = 0; subset < batch.shape.subsets; subset += 1) {
+    for (let k = 0; k < theirKeys; k += 1) {
+      const at = subset * keys + k, there = subset * theirKeys + k;
+      const mine = k < keys && ours.mask[at] > 0.5;
+      const theirs = theirMask[there] > 0.5;
+      if (mine !== theirs) { maskDiff += 1; continue; }
+      if (!mine) continue;
+      live += 1;
+      if (ours.indices[at] !== theirIdx[there]) indexDiff += 1;
+    }
   }
   return { keys, subsets: batch.shape.subsets, maskDiff, indexDiff, live };
 }

@@ -18,11 +18,51 @@
 #include "../../featurise/af3_weights.h"   // the weight walk: the bundle read as published, no map
 #include "profile.cuh"
 
+// Whether the fold's pair stays bf16 PAST the trunk too (af3.cu's TRUNK_PAIR16): on a card short of room, where
+// every reader after the trunk takes bf16 rows - the distogram's contacts, the streamed diffusion preparation and the
+// confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32). foldFits sizes a
+// fold by it.
+// LOCALFOLD_WIDEN_PAIR=1: widened as before (the control arm: the structure must not move - tools/check-standalone.py)
+inline bool pairStays16(int n, int C, bool fast) {
+  static const bool widen = getenv("LOCALFOLD_WIDEN_PAIR") != nullptr;
+  if (widen) return false;
+  size_t pairs = (size_t)n * n;
+  Trunk probe{}; probe.n = n; probe.C = C;
+  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&
+         !M.flag("trunk.dialect.structuralTokens") &&
+         hasW("diffusion.encoder.embedTrunkPairCond") &&
+         shortPair(pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
+}
+
+// several GPUs on a sharded pair, at the trunk's or the sampler's end: every rank's rows onto rank 0 into a whole bf16
+// pair, every shared buffer given back (collectively), the other ranks gone; rank 0 folds on alone
+static void pairOntoRank0(Trunk& t) {
+  const size_t row = (size_t)t.n * t.C * 2;
+  releaseScratch();                  // (what the trunk or the sampler held: the whole pair is rank 0's largest tensor)
+  float* whole = mg::RANK == 0 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C)) : nullptr;
+  mg::fence();
+  if (mg::RANK == 0)
+    for (int r = 0; r < mg::WORLD; ++r) {
+      int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
+      if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
+    }
+  mg::fence();
+  mg::release({ "" }, mg::FINAL);   // (every shared buffer: rank 0's pair is whole and its own now, the others leave)
+  if (mg::RANK != 0) mg::leave();
+  mg::finish();
+  mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
+  t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr; t.inPlaceRecycle = true;
+  sh::DLO = -1; sh::DROWS = 0;
+}
 static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
   // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
   SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
+  // the trunk's modules' large scratch shared between them (common.cuh, SHARED SCRATCH): every family below proved by a
+  // scribbled fold bit-identical to the unshared one - one GPU and sharded, the big-input paths, boltz2, MSA, template
+  SHARED_FAMILIES = { "tri.", "grid.", "tr.", "msaatt.", "opm.", "st.", "emb.", "p16.", "tmpl." };
+  SHARED_NESTED = { { "tmpl.", "tri." }, { "tmpl.", "grid." }, { "tmpl.", "tr." }, { "tmpl.", "p16." }, { "emb.", "p16." } };
   // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
   // measure the two on a device - the fused ones are each a block's worth of shared memory)
   if (const char* u = getenv("LOCALFOLD_UNFUSED")) {
@@ -31,6 +71,7 @@ static int foldMain(int argc, char** argv) {
     if (un.find(",triangle,") != std::string::npos) FUSED_TRIANGLE = false;
     if (un.find(",transition,") != std::string::npos) FUSED_TRANSITION = false;
   }
+  bool noGraphs = false;     // (--no-graphs: GRAPHS stays off where several GPUs turn it back on)
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
   DiffusionOptions diffusion;     // --schedule=geometric, --update=exponential, --no-churn (sampler.cuh)
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
@@ -51,7 +92,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
     else if (!strcmp(argv[i], "--fold")) doFold = true;
-    else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
+    else if (!strcmp(argv[i], "--no-graphs")) { GRAPHS = false; noGraphs = true; }
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--chai-second-order")) CHAI_SECOND_ORDER = true;     // chai-lab's two calls a step
     else if (!strcmp(argv[i], "--no-flash-split")) FLASH_SPLIT = false;
@@ -163,8 +204,7 @@ static int foldMain(int argc, char** argv) {
                  b + (2 << 20), CUDA_R_32F, 256, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 512, 256, 128, &one, b, CUDA_R_32F, 512, b + (1 << 20), CUDA_R_32F, 128, &zero,
                  b + (2 << 20), CUDA_R_32F, 512, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    int cc = 0; cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, 0);
-    if (cc >= 8)      // (bf16: the fused triangle's contraction, Ampere on - a T4 runs the unfused path)
+    if (ccMajor() >= 8)      // (bf16: the fused triangle's contraction, Ampere on - a T4 runs the unfused path)
       cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, 96, 96, 96, &one, b, CUDA_R_16BF, 96, 9216, b + (1 << 20),
                                  CUDA_R_16BF, 96, 9216, &zero, b + (2 << 20), CUDA_R_16BF, 96, 9216, 8, CUBLAS_COMPUTE_32F,
                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -212,6 +252,7 @@ static int foldMain(int argc, char** argv) {
 
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-ops=", 12)) { const char* a = argv[i] + 12; const char* x = strchr(a, 'x'); benchOps(atoi(a), x ? atoi(x + 1) : 1); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-grid=", 13)) { benchGrid(atoi(argv[i] + 13)); return 0; }
+  for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-grid16=", 15)) { benchGrid16(atoi(argv[i] + 15)); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-tri=", 12)) { benchTri(atoi(argv[i] + 12)); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-trans=", 14)) { benchTrans(atoi(argv[i] + 14)); return 0; }
   // One denoiser call on AF3's own inputs, against AF3's own output.
@@ -316,12 +357,93 @@ static int foldMain(int argc, char** argv) {
   F32_TF32 = tf32;
   check("target_feat", tfDev, (size_t)tokens * tfWidth, "oracle.trunk.stages.target_feat");
   std::vector<float> targetFeat = download(tfDev, (size_t)tokens * tfWidth);
+  // (its atom encoder's scratch given back at once where the pair is large - nothing reads it once target_feat is
+  // built, and held into the template stack it was 3.4 GB of a simulated rank of 4's out-of-memory at 10,868 tokens)
+  if (tightPair((size_t)tokens * tokens, (int)M.meta("trunk.embedder.pairChannels")))
+    releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
   bool oracleTargetFeat = false;
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
-  if (!foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"))) return 1;
-  t = makeTrunk(targetFeat.data(), msaCap);
+  if (mg::WORLD > 1 && SHORT_PAIR_TIMES > 0) {    // (one room for every rank's short-of-room choices: common.cuh)
+    SHORT_PAIR_ROOM = std::max<size_t>(1, mg::minOverRanks(shortPairRoomHere()));
+    if (getenv("LOCALFOLD_MEM") && mg::RANK == 0)
+      fprintf(stderr, "  memory room for the ordinary paths %.2f GB, every rank's least\n", SHORT_PAIR_ROOM / 1e9);
+  }
+  // several GPUs, REPLICATED: every rank runs the whole trunk alone - nothing exchanged - then the samples and their
+  // confidence heads are dealt as on a sharded pair. Chosen for a fold that fits one GPU with several samples, short,
+  // on a slow link, where the split trunk's exchanges cost more than they save: on 4 x A6000 (PCIe, pushes ~17 GB/s)
+  // 988 tokens x 5 samples took 13.7 s so against 17.1 sharded (18.8 on one GPU), 2,964 took 186.8 against 139.7 - the
+  // crossover not measured, ~1,700 (their geometric middle); over NVLink (~60 GB/s) the split trunk wins at 988 already.
+  // LOCALFOLD_MG_REPLICATE=1/0 forces either
+  const char* replEnv = getenv("LOCALFOLD_MG_REPLICATE");
+  const size_t nRuns = seedList.size() * samples;
+  bool repl = false;
+  if (mg::WORLD > 1 && nRuns > 1 && nRuns <= std::max<size_t>(samples, 10)) {
+    const int Cp = (int)M.meta("trunk.embedder.pairChannels");
+    if (replEnv) repl = atoi(replEnv);
+    else if (tokens < 1700 && mg::minOverRanks(foldFits(tokens, Cp, doFold && pairStays16(tokens, Cp, fast), true))) {
+      const double rate = mg::pushRate();
+      repl = rate < 30e9;
+      if (mg::RANK == 0) printf("several GPUs: pushes at %.1f GB/s a GPU - %s\n", rate / 1e9,
+                                repl ? "the trunk whole on each, the samples dealt" : "the pair sharded");
+    }
+  }
+  if (repl) sh::ON = false;
+  if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
+                doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
+  // several GPUs on a sharded pair: the diffusion runs whole on every rank (oneCardPast) where the fold would fit one
+  // of them (asked before anything is allocated, so every rank answers alike) AND it is short or batches several
+  // samples; else sharded - its tokens split over the ranks with one sample (diffusionTransformer), which on fences
+  // that stay on the device costs a block one exchange of k and v: a simulated rank of 8 runs 2,964 tokens' 25 steps
+  // in 207 ms against 525 whole, and 988 tokens' 200 steps in 555 against 1,116 (on a box the fences add a few us
+  // each, 24 a step - hence not below 512). (LOCALFOLD_MG_SHARD_DIFFUSION=1 or 0 forces either.)
+  const char* shardDiff = getenv("LOCALFOLD_MG_SHARD_DIFFUSION");
+  const bool oneSample = seedList.size() * samples == 1;
+  // ...and the diffusion's own floor with the pair whole beside it - the bf16 pair, its f16 LayerNorm'd copy, the
+  // encoder's projection and a super block's biases: 1.5x the f32 pair, measured. foldFits's trunk floor (1.15x) said a
+  // 10,344-token fold fit an 80 GB A100 and its whole diffusion wanted ~85 GB; sharded, several samples batch as well
+  const auto wholeDiffusionFits = [](int n, int C) {
+    size_t f, t; deviceMemInfo(&f, &t);
+    return (double)n * n * C * 4 * 1.5 + (double)t / 20 <= (double)f;
+  };
+  const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
+    foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true) &&
+    (shardDiff || wholeDiffusionFits(tokens, (int)M.meta("trunk.embedder.pairChannels")));
+  // (a confidence head with no sharded form - boltz2's, rf3's - runs on rank 0 with the pair gathered: refused up front
+  // where that pair would not fit one GPU)
+  const bool confOnRank0 = mg::WORLD > 1 && sh::ON && doFold && !confidenceShardable();
+  if (confOnRank0 && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
+                               pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true)) {
+    fprintf(stderr, "this model's confidence head has no sharded form yet, and a %d-token pair does not fit one GPU\n", tokens);
+    return 1;
+  }
+  if (mg::WORLD > 1 && sh::ON) SHORT_PAIR_SHARE = mg::WORLD;      // (a rank holds its rows of the pair from here)
+  t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
+  if (mg::WORLD > 1) {
+    // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
+    // work split between them; the rest of the fold on rank 0
+    if (M.flag("trunk.dialect.parallelPairformer") || M.flag("trunk.dialect.structuralTokens") || !serveDir.empty() ||
+        folds != 1 || repeat != 1 || !doFold) {
+      fprintf(stderr, "several GPUs fold one job at a time, and not chai-1 or OpenDDE yet\n"); return 1;
+    }
+    if (repl) printf("trunk: whole on each of %d GPUs, the samples dealt\n", mg::WORLD);
+    else GRAPHS = false;                                        // (a capture cannot hold a host barrier)
+    if (repl) { if (!framesDir.empty()) { fprintf(stderr, "a replicated trunk: no --frames yet\n"); return 1; } }
+    else if (sh::ON) {
+      // phase 2: the pair sharded by rows (makeTrunk gave each rank its slab); the trunk on slabs, its pair gathered
+      // onto rank 0 after the last pass
+      if (!framesDir.empty() || recycleTolerance > 0) { fprintf(stderr, "a sharded pair: no --frames or --recycle-tolerance yet\n"); return 1; }
+      printf("trunk: the pair sharded over %d GPUs, %d rows here\n", mg::WORLD, t.shardRows);
+    } else {
+    const size_t pc = (size_t)t.n * t.n * t.C;
+    mg::Shared& sp = mg::shared("trunk.pair", pc * 4);          // (f32's room: the pair may be held either way)
+    CK(cudaFree(t.pair)); t.pair = (float*)sp.local;
+    CK(cudaMemset(t.pair, 0, pc * 4));
+    mg::SPLIT = &sp;
+    printf("trunk: the pair updates over %d GPUs\n", mg::WORLD);
+    }
+  }
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
@@ -400,7 +522,10 @@ static int foldMain(int argc, char** argv) {
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
       // ...and not where a pass gives its stages' scratch back (runTrunk, shortPair), which a capture
       // cannot do
-      if (!GRAPHS || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
+      // (several GPUs on a sharded pair: the pass captured too - its fences count their generations on the device - where
+      // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
+      const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
         recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {
@@ -416,7 +541,53 @@ static int foldMain(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
-    pairToF32(t);                     // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
+    if (mg::WORLD > 1 && !sharded(t) && !repl) {   // the trunk done on every rank: the others leave, rank 0 folds on alone
+      mg::SPLIT = nullptr;
+      mg::barrier();
+      if (mg::RANK != 0) mg::leave();
+      mg::finish();
+      mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
+    }
+    memReport("trunk: passes done");
+    // 🔴 THE PAIR STAYS bf16 PAST THE TRUNK on a card short of room, where every reader after it takes bf16 rows
+    // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
+    // into was the fold's largest tensor past the trunk - 18.4 GB at 6,000 tokens, 51 at 10,000 - and the widening
+    // held both at once. Not for OpenDDE (its expander reads f32), nor --save-embeddings
+    if (sharded(t)) {     // what only the trunk read, given back before the diffusion: z^T, the template stack's slabs, the
+                          // exchange buffers, the MSA (the slab itself the diffusion reads, and rank 0 gathers after it)
+      mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa",
+                    "sh.ta", "sh.tb", "sh.tp" });     // (the channel-split triangle's: 9.9 GB a rank at 10,127 tokens on 8)
+      t.zTS = nullptr; t.msa = nullptr;
+      mg::tick("trunk");
+    }
+    // ...and where the whole fold fits one GPU, every rank gathers the whole pair and runs the diffusion alone - the same
+    // fold on each, nothing exchanged, its steps' graphs on - then frees it and takes its rows of the confidence head
+    // (the sharded diffusion meets at every block of every step: at 988 tokens on 8 x A100 158 ms became 2.0 s)
+    int keptLo = -1, keptRows = 0;
+    // (the whole pair on every rank, PUSHED: each rank its rows into every other's - pulled, a peer's memory read
+    // through a PCIe host bridge, 2.25 GB a rank at 2,964 tokens ran at under a GB/s)
+    auto gatherWhole = [&]() -> float* {
+      const size_t row = (size_t)t.n * t.C * 2;
+      mg::Shared& wS = mg::shared("sh.whole", (size_t)t.n * row);
+      const int lo = t.shardLo >= 0 ? t.shardLo : keptLo, rows = t.shardLo >= 0 ? t.shardRows : keptRows;
+      if (rows) CK(cudaMemcpyAsync((char*)wS.local + (size_t)lo * row, t.zS->local, (size_t)rows * row, cudaMemcpyDeviceToDevice, STREAM));
+      mg::allGather(wS, (size_t)lo * row, (size_t)rows * row);
+      return (float*)wS.local;
+    };
+    if (sharded(t) && oneCardPast) {
+      // (copied out of the shared buffer, which goes at once: the pair is widened and freed as a one-GPU pair is)
+      float* whole = reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C));
+      CK(cudaMemcpyAsync(whole, gatherWhole(), (size_t)t.n * t.n * t.C * 2, cudaMemcpyDeviceToDevice, STREAM));
+      mg::release({ "sh.whole" });
+      keptLo = t.shardLo; keptRows = t.shardRows;
+      t.pair = whole; t.shardLo = -1; t.shardRows = 0;        // (the whole pair's view; the slab stays in t.zS)
+      GRAPHS = !noGraphs;
+      mg::tick("whole pair gathered");
+    }
+    TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast) || sharded(t));
+    if (sharded(t) && (saveEmbeddings || saveDistogram)) { fprintf(stderr, "a sharded pair: no --save-embeddings or --save-distogram yet\n"); return 1; }
+    if (!TRUNK_PAIR16) pairToF32(t);  // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
+    else if (t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }   // (pairToF32's other half)
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
@@ -426,7 +597,8 @@ static int foldMain(int argc, char** argv) {
       STAGE_MS.clear();
     }
     // the distogram's contact probabilities, for the confidences file (off the residue batch)
-    std::vector<float> contact = contactProbabilities(t);
+    // (a sharded pair: after the diffusion, once rank 0 holds the whole pair)
+    std::vector<float> contact = sharded(t) ? std::vector<float>() : contactProbabilities(t);
     // --save-embeddings / --save-distogram: what AF3's --save_embeddings and --save_distogram write -
     // the trunk's final single (tokens x 384) and pair (tokens x tokens x 128) representations, and
     // the distogram head's probabilities (tokens x tokens x bins) - as .npy files beside the structure
@@ -478,9 +650,31 @@ static int foldMain(int argc, char** argv) {
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
-    if (!structural && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
+    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
+        parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
+      // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
+      // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
+      parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
+    }
+    if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
+      if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
+      sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
+      GRAPHS = !noGraphs && !mg::SHARED_DEVICE;   // (the steps' graphs: their fences count generations on the device)
+      if (DIFF_HALF && oneSample && !M.flag("diffusion.transformer.noResidual")) diffusionSharedBuffers(nD);
+      // ...and short of room, this rank's share of the trunk pair waits in host memory from here: the streamed
+      // preparation reads it a chunk of rows at a time from there and the sampler not at all (the one-GPU park's twin;
+      // 9 GB a rank at 11,856 tokens on 4) - back for the contacts and the confidence head
+      if (keptLo < 0 && shortPair(pairs, t.C)) {
+        parkShare(t); dP = nullptr;
+      }
+    }
+    mg::tick("to the diffusion");
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
+    mg::tick("diffusion prepared");
+    // (several GPUs, the diffusion run whole on each: the gathered pair is read by nothing past its preparation - the
+    // confidence head reads this rank's slab - so it goes now, not parked to the host where the card is short: on 8
+    // ranks that was 8 x 9 GB pinned at once at 5928 tokens)
+    if (keptLo >= 0) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(t.pair)); t.pair = nullptr; df.trunkPair = nullptr; }
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
     // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
@@ -497,7 +691,9 @@ static int foldMain(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && t.pair && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
+      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
+        parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); df.trunkPair = nullptr;
+      }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
@@ -518,6 +714,7 @@ static int foldMain(int argc, char** argv) {
     std::vector<std::pair<uint64_t, int>> runs;
     for (uint64_t s : seedList) for (int k = 0; k < samples; ++k) runs.push_back({ s, k });
     const size_t perBatch = std::max<size_t>(samples, 10);
+    if (sharded(t) && runs.size() > 10) { fprintf(stderr, "a sharded pair: ten seed x sample runs at most yet\n"); return 1; }
     FrameStreamer frames;
     for (size_t c0 = 0; c0 < runs.size(); c0 += perBatch) {
     const size_t cn = std::min(perBatch, runs.size() - c0);
@@ -526,22 +723,167 @@ static int foldMain(int argc, char** argv) {
     NS = (int)cn;
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
-    if (diffusion.given && M.flag("trunk.dialect.chaiSampler")) {
-      fprintf(stderr, "--schedule, --update and --no-churn are the diffusion sampler's: chai-1's sampler does not take them\n");
-      return 1;
-    }
     if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
       frames.start(framesDir, mask.size() * 3, steps, structural ? M.i("structural.residueAtomGather") : nullptr);
     }
-    std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+    // several GPUs with the diffusion whole on every rank and several samples a batch: the samples DEALT, sample k on
+    // rank k % N (each its own seed, so the same walk as in the batch), the coordinates gathered after - every rank
+    // ran every sample before, the whole batch's diffusion on each
+    const bool dealt = (keptLo >= 0 || repl) && mg::WORLD > 1 && cn > 1;
+    std::vector<uint64_t> mySeeds;
+    for (size_t k = 0; k < cn; ++k) if (!dealt || (int)(k % mg::WORLD) == mg::RANK) mySeeds.push_back(seeds[k]);
+    NS = (int)mySeeds.size();
+    std::vector<float> xs = NS ? sample(steps, mySeeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }, diffusion);
-    FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
+    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }, diffusion) : std::vector<float>();
+    if (dealt) {
+      const size_t per = mask.size() * 3;
+      mg::Shared& xS = mg::shared("sh.xs", perBatch * per * 4);
+      for (size_t k = 0, j = 0; k < cn; ++k)
+        if ((int)(k % mg::WORLD) == mg::RANK)
+          CK(cudaMemcpyAsync((float*)xS.local + k * per, xs.data() + (j++) * per, per * 4, cudaMemcpyHostToDevice, STREAM));
+      mg::fence(); mg::hostFence();
+      xs.assign(cn * per, 0.f);
+      for (size_t k = 0; k < cn; ++k)
+        CK(cudaMemcpy(xs.data() + k * per, (const float*)xS.peer[k % mg::WORLD] + k * per, per * 4, cudaMemcpyDefault));
+      mg::hostFence();           // (no rank writes its slots again before every rank has read them)
+      NS = (int)cn;
+    }
+    mg::tick("sampler");
     // the steps' precomputed conditioning (steps x tokens rows, 5 GB at 100 steps and 10761 tokens) is read by
     // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
-    // head short of room
+    // head short of room (freed here, before the sharded head too, not after it)
     if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); df.preSingle = df.preSnProj = nullptr; }
+    if (SHARE_PARKED) { releaseScratch(); unparkShare(t); }     // (the share home, for the heads)
+    FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
+    // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
+    // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
+    // held anywhere
+    // DEALT confidence (several GPUs, the diffusion whole on every rank, several samples): sample k's head on rank
+    // k % N - the one-GPU head on the whole pair (head, bf16 where TRUNK_PAIR16) - its results to rank 0 through host
+    // memory, into shardedConf
+    std::vector<ConfidenceOut> shardedConf;
+    auto dealConfidence = [&](const float* head) {
+      const size_t nn = (size_t)t.n * t.n, nd = (size_t)t.n * dense;
+      const int W = mg::WORLD;
+      std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
+      std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
+      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      const size_t slot = 64 + 4 * (nd + 3 * nn);
+      mg::HostSlots hs = mg::hostSlots("conf", cn * slot);
+      for (size_t k = 0; k < cn; ++k) {
+        if ((int)(k % W) != mg::RANK) continue;
+        const float* xk = xs.data() + k * mask.size() * 3;
+        std::vector<float> beta((size_t)nD * 3);
+        for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
+          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+        float* dBeta = upload(beta.data(), beta.size());
+        ConfidenceOut ck = confidenceHead(const_cast<float*>(head), t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n, false);
+        CK(cudaFree(dBeta));
+        if (ck.plddt.size() != nd || ck.pae.size() != nn || ck.pde.size() != nn || ck.tmTerm.size() != nn) {
+          fprintf(stderr, "dealt confidence: sample %zu's outputs are not %zu / %zu long\n", k, nd, nn); exit(1);
+        }
+        char* b = hs.base + k * slot;
+        double hdr[3] = { ck.meanPlddt, ck.ptm, ck.iptm }; memcpy(b, hdr, sizeof hdr);
+        float* f = (float*)(b + 64);
+        memcpy(f, ck.plddt.data(), nd * 4); memcpy(f + nd, ck.pae.data(), nn * 4);
+        memcpy(f + nd + nn, ck.pde.data(), nn * 4); memcpy(f + nd + 2 * nn, ck.tmTerm.data(), nn * 4);
+      }
+      mg::barrier();                        // (every rank's samples in the slots)
+      if (mg::RANK == 0)
+        for (size_t k = 0; k < cn; ++k) {
+          const char* b = hs.base + k * slot; const float* f = (const float*)(b + 64);
+          ConfidenceOut ck; double hdr[3]; memcpy(hdr, b, sizeof hdr);
+          ck.meanPlddt = hdr[0]; ck.ptm = hdr[1]; ck.iptm = hdr[2];
+          ck.plddt.assign(f, f + nd); ck.pae.assign(f + nd, f + nd + nn);
+          ck.pde.assign(f + nd + nn, f + nd + 2 * nn); ck.tmTerm.assign(f + nd + 2 * nn, f + nd + 3 * nn);
+          shardedConf.push_back(std::move(ck));
+        }
+      mg::barrier();                        // (rank 0 has read them)
+      mg::freeHostSlots(hs);
+    };
+    if (keptLo >= 0) {                 // (the diffusion ran whole on every rank: its pair given back, the slab's view again)
+      t.pair = (float*)t.zS->local; t.shardLo = keptLo; t.shardRows = keptRows; t.p16 = true;
+      GRAPHS = false;
+      mg::tick("whole pair freed");
+    }
+    // (a confidence head with no sharded form: the pair onto rank 0, which runs the one-GPU head - where it fits)
+    if (sharded(t) && confOnRank0) {
+      GRAPHS = false;
+      df.trunkPair = nullptr;
+      pairOntoRank0(t);
+      // (then the one-GPU rule for the pair's width: boltz2's and rf3's heads read it f32)
+      TRUNK_PAIR16 = t.p16 && pairStays16(t.n, t.C, fast);
+      if (!TRUNK_PAIR16) pairToF32(t);
+      if (contact.empty()) contact = contactProbabilities(t);
+    }
+    if (repl && mg::WORLD > 1) {
+      auto sc0 = clock();
+      if (cn > 1) {
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * (TRUNK_PAIR16 ? 2 : 4));    // (parked for the sampler)
+        dealConfidence(t.pair);
+        releaseConcatCopies();
+      }
+      confMs += ms(sc0, clock()); s0 += clock() - sc0;
+      mg::release({ "" }, mg::FINAL);
+      if (mg::RANK != 0) mg::leave();
+      mg::finish();
+      mg::WORLD = 1;
+      mg::tick("the other ranks exited");
+    }
+    if (sharded(t)) {
+      GRAPHS = false;
+      releaseScratch();                // (the sampler's: the heads allocate theirs beside the slab)
+      mg::tick("scratch released");
+      df.trunkPair = nullptr;
+      std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
+      std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
+      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      auto sc0 = clock();
+      // (the contacts first, off the trunk's slab: the last sample's head then works in that slab, as the one-GPU
+      // head does in the trunk's pair - a slab a rank, 4.7 GB at 12,103 tokens on 8)
+      if (contact.empty()) contact = contactProbabilitiesSharded(t);
+      releaseScratch({ "contact.", "disto." });    // (its whole-pair bin table and logits: 1.2 GB and more at 17,290 on 8)
+      mg::tick("contacts");
+      // DEALT (the diffusion whole on every rank and several samples): sample k's confidence head on rank k % N - the
+      // one-GPU head on the whole pair, gathered again - its results to rank 0 through host memory; the sharded head
+      // met at every block of every sample (on 4 x A6000 a 2,964-token sample's head was 2.2 s split, 1.7 on one GPU)
+      const bool dealtConf = keptLo >= 0 && mg::WORLD > 1 && cn > 1;
+      if (dealtConf) {
+        float* whole = gatherWhole();
+        const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n;
+        const int W = mg::WORLD;
+        SHORT_PAIR_SHARE = 1;                 // (the one-GPU head, the whole pair: bf16 only where it is short of room)
+        const bool p16 = shortPair(nn, t.C);
+        float* head = whole;
+        if (!p16) { head = dalloc(pc); fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(whole), head, pc); }
+        const bool was16 = TRUNK_PAIR16; TRUNK_PAIR16 = p16;
+        dealConfidence(head);
+        TRUNK_PAIR16 = was16; SHORT_PAIR_SHARE = W;
+        if (!p16) CK(cudaFree(head));
+        mg::release({ "sh.whole" });
+      }
+      for (size_t k = 0; k < cn && !dealtConf; ++k) {
+        const float* xk = xs.data() + k * mask.size() * 3;
+        std::vector<float> beta((size_t)nD * 3);
+        for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
+          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+        float* dBeta = upload(beta.data(), beta.size());
+        shardedConf.push_back(confidenceSharded(*t.zS, t.shardLo, t.shardRows, t.single, t.targetFeat, dBeta, t.seqMask,
+                                                t.pairMask, t.n, k + 1 == cn));
+        CK(cudaFree(dBeta));
+      }
+      confMs += ms(sc0, clock()); s0 += clock() - sc0;   // (the confidence head's time its own, not the sampler's)
+      mg::release({ "" }, mg::FINAL);   // (the others leave: nothing closed, rank 0's own freed)
+      mg::tick("shared buffers released");
+      if (mg::RANK != 0) mg::leave();
+      mg::finish();
+      mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
+      mg::tick("the other ranks exited");
+      t.pair = nullptr; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr;
+      sh::DLO = -1; sh::DROWS = 0;
+    }
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
@@ -600,6 +942,7 @@ static int foldMain(int argc, char** argv) {
               if (interOnly && resAsym[i] == resAsym[j]) continue;
               tot += term[(size_t)i * t.n + j]; ++cnt;
             }
+            if (cnt && std::isnan(tot / cnt)) return (double)NAN;
             if (cnt) { any = true; bestTm = std::max(bestTm, tot / cnt); }
           }
           return any ? bestTm : NAN;
@@ -611,12 +954,15 @@ static int foldMain(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
-        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
+        if (!shardedConf.empty()) { ck = std::move(shardedConf[k]); }      // (made on every GPU above)
+        else {
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * (TRUNK_PAIR16 ? 2 : 4));    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
                             last && shortPair((size_t)t.n * t.n, t.C));
         releaseConcatCopies(); memReport("confidence");
+        }
       }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());
@@ -645,8 +991,9 @@ static int foldMain(int argc, char** argv) {
         char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)dp->sd, dp->sk, dp->score);
         ranking.push_back(row);
       }
-      if (!std::isfinite(dp->score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
-      if (dp->score > bestScore) {
+      // (a simulated rank's fold is wrong by design - LOCALFOLD_MG_SIMULATE - and its scores may be too: it is timed, not scored)
+      if (!std::isfinite(dp->score) && !mg::SIM) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
+      if (dp->score > bestScore || x.empty()) {
         bestScore = dp->score; best = dp->sk; bestSeed = dp->sd; conf = std::move(dp->ck); x = std::move(dp->xk); bestSS = dp->ss;
       }
     }
@@ -770,6 +1117,16 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
 int main(int argc, char** argv) {
+  {
+    const int world = mg::gpusArg(argc, argv);   // --gpus=N|all: one fold across several GPUs (before any CUDA call: multigpu.cuh)
+    if (world > 1)
+      for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--serve", 7) || !strncmp(argv[i], "--folds=", 8) || !strncmp(argv[i], "--repeat=", 9) ||
+            !strncmp(argv[i], "--save-", 7) || !strncmp(argv[i], "--frames", 8) || !strncmp(argv[i], "--recycle-tolerance", 19)) {
+          fprintf(stderr, "several GPUs fold one job at a time: no %s\n", argv[i]); return 1;
+        }
+    mg::launch(world);
+  }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

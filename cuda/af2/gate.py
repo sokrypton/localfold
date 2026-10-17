@@ -105,7 +105,7 @@ def oracle_cases():
 
 
 def run_oracle(data, passes, weights, fast):
-    cmd = [os.path.join(HERE, "af2"), data, f"--weights={weights}", f"--oracle={data}/oracle",
+    cmd = [os.path.join(HERE, "localfold-af2"), data, f"--weights={weights}", f"--oracle={data}/oracle",
            f"--recycles={passes - 1}", f"--out={TMP}/oracle.pdb"] + (["--fast"] if fast else [])
     p = subprocess.run(cmd, capture_output=True, text=True)
     text = p.stdout + p.stderr

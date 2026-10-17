@@ -554,93 +554,112 @@ __global__ void castScaleK(const T* x, float* y, float a, size_t n) {
 }
 // One block of the cross-attention transformer, in place on act [queryRows][C], from the block's cache.
 // T is the GEMM inputs' type (f16 on the fast path); the residual stream stays f32.
+// several GPUs, the diffusion's tokens split (one sample): the atom blocks on subsets [ATOM_S0, ATOM_S1) only - a
+// rank's own atoms and a halo (atomRangeFor); ATOM_S1 0: every subset
+inline int ATOM_S0 = 0, ATOM_S1 = 0;
 template <class T>
-void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
+void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
                           int C, int heads, int D, const std::string& B) {
   size_t q1 = (size_t)sh.subsets * sh.queries;                  // one sample's query rows
   size_t qRows = q1 * NS, kRows = (size_t)sh.subsets * sh.keys * NS;
   int Wd = heads * D;
+  // the subsets this call computes: their query rows r0.. (R of them) and key rows k0.. (KR); every per-row tensor
+  // below is addressed from there, its period (q1) unchanged
+  const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+  const int nS = part ? ATOM_S1 - ATOM_S0 : sh.subsets * NS, subs = part ? nS : sh.subsets;
+  const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, k0 = part ? (size_t)ATOM_S0 * sh.keys : 0;
+  const size_t R = part ? (size_t)nS * sh.queries : qRows, KR = part ? (size_t)nS * sh.keys : kRows;
+  auto at = [](const float* p, size_t k) { return p ? p + k : p; };      // (a null tensor stays null)
+  float* act = actAll + r0 * C;
+  const float *qScale = at(bc.qScale, r0 * C), *qShift = at(bc.qShift, r0 * C), *kScale = at(bc.kScale, r0 * C), *kShift = at(bc.kShift, r0 * C);
+  const float *zg = at(bc.zg, r0 * C), *ffwScale = at(bc.ffwScale, r0 * C), *ffwShift = at(bc.ffwShift, r0 * C), *tg = at(bc.tg, r0 * C);
+  const float* pairLogits = at(bc.pairLogits, (size_t)(part ? ATOM_S0 : 0) * heads * sh.queries * sh.keys);
+  const float *qMask = at(st.qMask, r0), *kMask = at(st.kMask, k0);
   // rf3's wiring: the transition reads the block's INPUT, both terms added to act
   float* pre = nullptr;
   if (st.noResidual) {
-    pre = scratch<float>("ab.pre", qRows * C);
-    CK(cudaMemcpyAsync(pre, act, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    pre = scratch<float>("ab.pre", qRows * C) + r0 * C;
+    CK(cudaMemcpyAsync(pre, act, R * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
-  T* xq = scratch<T>("ab.xqk", 2 * qRows * C);
-  T* xk = xq + qRows * C;
+  T* xqBase = scratch<T>("ab.xqk", 2 * qRows * C);
+  T* xq = xqBase + r0 * C;
+  T* xk = xqBase + qRows * C + r0 * C;
   if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
-    float* xqF = scratch<float>("ab.xqF", qRows * C);
-    adaLn<float>(act, bc.qScale, bc.qShift, xqF, qRows, C, q1);
-    if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(qRows * C), 256, 0, STREAM>>>(xqF, xq, qRows * C);
-    else CK(cudaMemcpyAsync(xq, xqF, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    adaLn<T>(xqF, bc.kScale, bc.kShift, xk, qRows, C, q1);
+    float* xqF = scratch<float>("ab.xqF", qRows * C) + r0 * C;
+    adaLn<float>(act, qScale, qShift, xqF, R, C, q1);
+    if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(R * C), 256, 0, STREAM>>>(xqF, xq, R * C);
+    else CK(cudaMemcpyAsync(xq, xqF, R * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    adaLn<T>(xqF, kScale, kShift, xk, R, C, q1);
   } else {
-    if (ADA_RAW) adaLn2K<T, true><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale,
-                                                                                bc.kShift, xq, xk, qRows, C, q1);
-    else adaLn2K<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale, bc.kShift, xq, xk,
-                                                                    qRows, C, q1);
+    if (ADA_RAW) adaLn2K<T, true><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale,
+                                                                            kShift, xq, xk, R, C, q1);
+    else adaLn2K<T><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk,
+                                                                R, C, q1);
   }
-  T* qg = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd); T* kvAtom = qg + qRows * 2 * Wd;
-  T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
+  T* qgBase = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd);
+  T* qg = qgBase + r0 * 2 * Wd;
+  T* kvAtomAll = qgBase + qRows * 2 * Wd;        // (the key gather reads it by absolute row)
+  T* kvAtom = kvAtomAll + r0 * 2 * Wd;
+  T* kv = scratch<T>("ab.kv", kRows * 2 * Wd) + k0 * 2 * Wd;
   {
     std::string w = concatColumns(B + ".qgkv~stack", 1, {{pairedWeight(B + ".qProjection", B + ".gatingQuery", C, Wd), C * 2 * Wd, false},
                                                          {pairedWeight(B + ".kProjection", B + ".vProjection", C, Wd), C * 2 * Wd, false}});
     const void* Wp; if constexpr (std::is_same_v<T, float>) Wp = W(w); else Wp = Wh(w);
     const float one = 1.f, zero = 0.f;
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 2 * Wd, (int)qRows, C, &one, Wp, cudaType<T>(), 2 * Wd,
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 2 * Wd, (int)R, C, &one, Wp, cudaType<T>(), 2 * Wd,
        (long long)C * 2 * Wd, xq, cudaType<T>(), C, (long long)qRows * C, &zero, qg, cudaType<T>(), 2 * Wd,
        (long long)qRows * 2 * Wd, 2, CUBLAS_COMPUTE_32F,
        std::is_same_v<T, float> && !F32_TF32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   }
   const float* qBias = W(B + ".qBias");
   if (hasW(B + ".queryLayerNormScale")) {       // rf3: normalised per atom row, the q bias inside
-    atomKqNormK<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(qg, kvAtom, qBias, W(B + ".queryLayerNormScale"),
-      W(B + ".queryLayerNormOffset"), W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), qRows, Wd);
+    atomKqNormK<T><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(qg, kvAtom, qBias, W(B + ".queryLayerNormScale"),
+      W(B + ".queryLayerNormOffset"), W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), R, Wd);
     qBias = zeros(Wd);
   }
   int chunks = (int)(2 * Wd * sizeof(T) / 16);
-  gatherRowsK<T><<<blocks(kRows * chunks), 256, 0, STREAM>>>(kvAtom, st.queriesToKeys.idx, st.queriesToKeys.mask, kv,
-    kRows, chunks, (size_t)st.queriesToKeys.count, q1);
-  T* gathered = scratch<T>("ab.gathered", qRows * Wd);
+  gatherRowsK<T><<<blocks(KR * chunks), 256, 0, STREAM>>>(kvAtomAll, st.queriesToKeys.idx + k0, st.queriesToKeys.mask + k0, kv,
+    KR, chunks, (size_t)st.queriesToKeys.count, q1);
+  T* gathered = scratch<T>("ab.gathered", qRows * Wd) + r0 * Wd;
   int warps = 8;
   size_t smem = ((size_t)sh.keys * (D + 1) * 2 + (size_t)warps * sh.keys + (size_t)warps * D) * 4;
-  dim3 grid((unsigned)(sh.subsets * NS), heads);
+  dim3 grid((unsigned)nS, heads);
   if constexpr (std::is_same_v<T, half>) {
     if (D == 32 && sh.keys == 128 && sh.queries == 32)
       atomAttentionMMA<32, 128><<<grid, 64, 0, STREAM>>>(
-        qg, qBias, kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, heads, st.keyMasked,
-        1.f / sqrtf((float)D), sh.subsets);
+        qg, qBias, kv, qMask, kMask, pairLogits, gathered, sh.queries, heads, st.keyMasked,
+        1.f / sqrtf((float)D), subs);
     else
       atomAttentionFusedK<T><<<grid, warps * 32, smem, STREAM>>>(
-        qg, qBias, kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, sh.keys, heads, D,
-        st.keyMasked, sh.subsets);
+        qg, qBias, kv, qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D,
+        st.keyMasked, subs);
   } else {
     atomAttentionFusedK<T><<<grid, warps * 32, smem, STREAM>>>(
-      qg, qBias, kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, sh.keys, heads, D,
-      st.keyMasked, sh.subsets);
+      qg, qBias, kv, qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D,
+      st.keyMasked, subs);
   }
-  float* attention = scratch<float>("ab.attention", qRows * C);
-  if (hasW(B + ".Transition2")) linear<T, float>(gathered, attention, qRows, Wd, C, B + ".Transition2");
-  else castScaleK<T><<<blocks(qRows * C), 256, 0, STREAM>>>(gathered, attention, 2.f, qRows * C);   // chai
-  T* tn = scratch<T>("ab.tn", qRows * C);
+  float* attention = scratch<float>("ab.attention", qRows * C) + r0 * C;
+  if (hasW(B + ".Transition2")) linear<T, float>(gathered, attention, R, Wd, C, B + ".Transition2");
+  else castScaleK<T><<<blocks(R * C), 256, 0, STREAM>>>(gathered, attention, 2.f, R * C);   // chai
+  T* tn = scratch<T>("ab.tn", qRows * C) + r0 * C;
   if (st.noResidual) {
-    addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, attention, bc.zg, qRows * C, q1 * C);
-    adaLn<T>(pre, bc.ffwScale, bc.ffwShift, tn, qRows, C, q1);
+    addSigmoidGatedK<<<blocks(R * C), 256, 0, STREAM>>>(act, attention, zg, R * C, q1 * C);
+    adaLn<T>(pre, ffwScale, ffwShift, tn, R, C, q1);
   } else {
-if (ADA_RAW) gatedAddAdaLnRowsK<T, true><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, attention, bc.zg, bc.ffwScale, bc.ffwShift,
-                                                                          tn, qRows, C, q1);
-    else gatedAddAdaLnRowsK<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, attention, bc.zg, bc.ffwScale, bc.ffwShift,
-                                                                          tn, qRows, C, q1);
+if (ADA_RAW) gatedAddAdaLnRowsK<T, true><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
+                                                                          tn, R, C, q1);
+    else gatedAddAdaLnRowsK<T><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
+                                                                          tn, R, C, q1);
   }
   int I = C * 2;
-  T* wide = scratch<T>("ab.wide", qRows * 3 * I);
-  T* gated = scratch<T>("ab.gated", qRows * I);
   bool up; std::string w1 = upGatedTransition1(B, C, I, up);
-  linear<T, T>(tn, wide, qRows, C, up ? 3 * I : 2 * I, w1);
-  swiglu<T>(wide, gated, qRows, I, up);
-  float* projected = scratch<float>("ab.projected", qRows * C);
-  linear<T, float>(gated, projected, qRows, I, C, B + ".ffwTransition2");
-  addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, projected, bc.tg, qRows * C, q1 * C);
+  T* wide = scratch<T>("ab.wide", qRows * 3 * I) + r0 * (up ? 3 : 2) * I;
+  T* gated = scratch<T>("ab.gated", qRows * I) + r0 * I;
+  linear<T, T>(tn, wide, R, C, up ? 3 * I : 2 * I, w1);
+  swiglu<T>(wide, gated, R, I, up);
+  float* projected = scratch<float>("ab.projected", qRows * C) + r0 * C;
+  linear<T, float>(gated, projected, R, I, C, B + ".ffwTransition2");
+  addSigmoidGatedK<<<blocks(R * C), 256, 0, STREAM>>>(act, projected, tg, R * C, q1 * C);
 }
 inline bool ATOM_HALF = false;        // the atom blocks' GEMMs in f16 (set by --fast)
 inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
@@ -651,9 +670,20 @@ inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockC
 
 // pair[q][k] = row[q] + col[k] + valid * (offsets W + dist / (1 + |d|^2) + Wvalid)
 //              (+ the trunk pair, gathered per token pair)
+// the trunk pair's projection the encoder adds, by token row: whole on one GPU (world 1); with several, each rank's rows in
+// its own buffer, read straight from the rank holding them (the atom windows reach a band of token pairs, not all N^2 -
+// gathering the whole of it was 6.6 GB a rank at 10,127 tokens on 8, the fold's largest buffer past the trunk)
+struct TokenPairRows {
+  const float* p[16] = {}; int lo[16] = {}; int world = 0;
+  __device__ __forceinline__ const float* at(int i, int j, int tokens, int Cp) const {
+    int r = 0; while (r + 1 < world && i >= lo[r + 1]) ++r;
+    return p[r] + ((size_t)(i - lo[r]) * tokens + j) * Cp;
+  }
+};
+inline TokenPairRows wholeTokenPair(const float* tp) { TokenPairRows t; t.p[0] = tp; t.world = tp ? 1 : 0; return t; }
 __global__ void atomPairK(const float* row, const float* col, const float* qPos, const float* kPos,
                           const float* qUid, const float* kUid, const float* kMask, const float* Woff,
-                          const float* Wdist, const float* Wvalid, const float* trunkPair,
+                          const float* Wdist, const float* Wvalid, TokenPairRows trunkPair,
                           const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
                           float* pair, int subsets, int queries, int keys, int Cp, int tokens, bool maskPadded) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -668,8 +698,7 @@ __global__ void atomPairK(const float* row, const float* col, const float* qPos,
   float sq = d0 * d0 + d1 * d1 + d2 * d2;
   float off = d0 * Woff[c] + d1 * Woff[Cp + c] + d2 * Woff[2 * Cp + c];
   if (valid) v += (off + Wdist[c] / (1.f + sq)) + Wvalid[c];
-  if (trunkPair && tqMask[qi] != 0 && tkMask[ki] != 0)
-    v += trunkPair[((size_t)tqIdx[qi] * tokens + tkIdx[ki]) * Cp + c];
+  if (trunkPair.world && tqMask[qi] != 0 && tkMask[ki] != 0) v += trunkPair.at(tqIdx[qi], tkIdx[ki], tokens, Cp)[c];
   pair[t] = v;
 }
 // chai-1's atom-pair term in place of AF3's offset/distance/valid one (af3-any-model atom_cross_attention.py):
@@ -816,6 +845,7 @@ struct EncoderOut {
 
 // trunkSingle [tokens][Cs] and trunkPair [tokens^2][Cz] may be null (target_feat).
 inline float* ENC_TP_GIVEN = nullptr;
+inline TokenPairRows ENC_TP_ROWS;       // (several GPUs: every rank's rows of it, prepareDiffusion's)
 inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                                  const float* trunkPair) {
   AtomShape sh = atomShape();
@@ -913,7 +943,8 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
       sh.tokens);
   else
     atomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, o.kMask,
-      W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"), tp,
+      W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"),
+      ENC_TP_ROWS.world ? ENC_TP_ROWS : wholeTokenPair(tp),
       tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp, sh.tokens,
       M.flag("trunk.dialect.maskPaddedKeys"));
   float* h1 = scratch<float>("enc.h1", pairRows * Cp); float* h2 = scratch<float>("enc.h2", pairRows * Cp);
@@ -1015,8 +1046,11 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
     // the start, the positions gathered to queries, their three-row projection, the query mask and
     // the add, in one pass (a K = 3 GEMM wrote its whole output at a fraction of the bandwidth)
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) { fprintf(stderr, "encoder: positions projection is not 3 x C\n"); exit(1); }
-    encoderStartK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qStart, atomPositions, t2q.idx, t2q.mask,
-      W(E + ".atomPositionsToFeatures"), o.qMask, act, qRows, C, q1, atoms);
+    // (the diffusion's tokens split: this rank's subsets and their halo only - ATOM_S0/S1)
+    const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+    const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
+    encoderStartK<<<blocks(R * C), 256, 0, STREAM>>>(o.qStart + r0 * C, atomPositions, t2q.idx + r0, t2q.mask + r0,
+      W(E + ".atomPositionsToFeatures"), o.qMask + r0, act + r0 * C, R, C, q1, atoms);
   } else {
     for (int k = 0; k < NS; ++k)
       CK(cudaMemcpyAsync(act + k * q1 * C, o.qStart, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -1048,7 +1082,11 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, o.qMask, qRows, C, q1);
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
-  linear<float, float>(act, projected, qRows, C, o.perToken, E + ".projectAtomFeaturesForAggr");
+  {
+    const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+    const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
+    linear<float, float>(act + r0 * C, projected + r0 * o.perToken, R, C, o.perToken, E + ".projectAtomFeaturesForAggr");
+  }
   // the gather back to token atoms fused into the mean: the gathered tensor was atoms x 768 floats
   // a sample, written and read again every step (96 MB at 261 tokens and five samples)
   o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);

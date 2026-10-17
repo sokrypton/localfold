@@ -393,6 +393,7 @@ inline size_t residentScaleBytes(const BRec& b) {
 }
 struct Model {
   std::map<std::string, Entry> index;
+  std::set<std::string> hostOnly;         // entries a file's device copy leaves out (read with f() alone)
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
   std::deque<Segment> segs;          // (a deque: an upload thread holds a reference while another file loads)
   void load(const std::string& dir) {
@@ -415,7 +416,10 @@ struct Model {
     Segment sg{nullptr, bytes, nullptr};
     sg.fd = fd;
     std::vector<Entry*> ts;
-    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') ts.push_back(&e);
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') {
+      if (hostOnly.count(name)) { e.devOffset = DROPPED; continue; }      // (read on the host alone: no device copy)
+      ts.push_back(&e);
+    }
     std::sort(ts.begin(), ts.end(), [](const Entry* a, const Entry* b) { return a->offset < b->offset; });
     size_t at = 0, end = 0;          // a tensor sharing (or overlapping) the last one's range keeps its place in it
     for (Entry* e : ts) {
@@ -889,7 +893,7 @@ struct Model {
     Segment& s = segs[seg];
     if (s.device || pending.count(seg)) return;
     if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
-      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
     }
     // ...and its resident codes HERE, on this thread, not in the upload's: a warm-up running meanwhile must neither see
     // them as parked (it would unpark them - a second allocation racing the upload's) nor measure free memory without
@@ -897,8 +901,13 @@ struct Model {
     if (s.residentBytes && !s.resident && devMalloc(&s.resident, s.residentBytes) != cudaSuccess) {
       fprintf(stderr, "cannot put a model.bin's resident weights (%zu bytes) on the device\n", s.residentBytes); exit(1);
     }
-    pending[seg] = std::thread([&s] {
-      if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1); }
+    // (on this thread's device: a new thread's current device is device 0, so on a rank of several GPUs the decode
+    // kernels ran on GPU 0 against another GPU's buffers - an illegal access on 4 and 8 real A100s, hidden on 2, where
+    // the IPC mapping had enabled peer access between 0 and 1)
+    int device = 0; CK(cudaGetDevice(&device));
+    pending[seg] = std::thread([&s, device] {
+      CK(cudaSetDevice(device));
+      if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1); }
     });
   }
   void waitUploads() { for (auto& [seg, th] : pending) th.join(); pending.clear(); }
@@ -995,7 +1004,7 @@ struct Model {
     Segment& s = segs[e.seg];
     if (!s.device) {
       if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
-        fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+        fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
       }
     }
     if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
@@ -1044,7 +1053,7 @@ struct Model {
     { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
     if (!s.device && (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
-      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device: %s (errno %s)\n", s.bytes, cudaGetErrorString(cudaGetLastError()), strerror(errno)); exit(1);
     }
     const auto& r = s.residentRecs[e.rec];
     if (r.b.kind == 6)
@@ -1133,34 +1142,64 @@ inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128
 // 12.8 s at 765. AF2 and ESMFold2 (0) keep the 64th until measured. Under it the trunk gives each stage's scratch
 // back between stages, which costs the recycles their graph and a reallocation a pass.
 inline double SHORT_PAIR_TIMES = 0;
+// several GPUs: the room every rank decides by, the least of theirs taken at one point of the fold (af3.cu) - each
+// measuring its own at its own first ask, 10,127 tokens on 8 x A100 had rank 0 at 26.1 GB and the rest at 29.3, and a
+// rank that alone takes the short-of-room paths (the trunk not captured, its exchange buffers given back - collective)
+// leaves the others waiting at a meeting it never comes to
+inline size_t SHORT_PAIR_ROOM = 0;
+// ...and the share of the pair a rank holds (af3.cu: the GPU count while the pair is sharded, 1 otherwise): a rank's
+// working set is its share's, so asked of the whole pair a 2,964-token fold on 4 x 48 GB took every short-of-room path
+// (the triangle in rounds, the stacks' buffers given back each pass, no graph): 43.0 against 40.5 s
+inline int SHORT_PAIR_SHARE = 1;
+inline size_t shortPairRoomHere() {
+  size_t f, t; deviceMemInfo(&f, &t);
+  for (auto& [name, slot] : SCRATCH) f += slot.second;
+  return f > t / 20 ? f - t / 20 : 0;
+}
 inline bool shortPair(size_t pairs, int C) {
   if (BIG_FORCED) return true;
   if (SHORT_PAIR_TIMES > 0) {
-    static const size_t room = [] {
-      size_t f, t; deviceMemInfo(&f, &t);
-      for (auto& [name, slot] : SCRATCH) f += slot.second;
-      size_t r = f > t / 20 ? f - t / 20 : 0;
+    static size_t own = 0;
+    if (!SHORT_PAIR_ROOM && !own) {
+      own = shortPairRoomHere();
       if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory room for the ordinary paths %.2f GB (a pair up to %.2f GB)\n",
-                                           r / 1e9, r / 1e9 / SHORT_PAIR_TIMES);
-      return r;
-    }();
-    return (double)pairs * C * 4 * SHORT_PAIR_TIMES > (double)room;
+                                           own / 1e9, own / 1e9 / SHORT_PAIR_TIMES);
+    }
+    const size_t room = SHORT_PAIR_ROOM ? SHORT_PAIR_ROOM : own;
+    return (double)pairs / SHORT_PAIR_SHARE * C * 4 * SHORT_PAIR_TIMES > (double)room;
   }
   static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
   return pairs * C * 4 > card / 64;
 }
 // the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a
 // prefix ("tmpl."), any other is exact ("tri.a", which must not take "tri.abf" with it)
+// (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>", and naming it frees its slot; but a
+// slot handed out inside a graph capture is freed only when the release names EVERY buffer it holds: the others may be
+// in the graph a later pass replays - AF2's stacks from pass 1 on, an illegal address)
+inline std::map<std::string, int> SHARED_SLOT;                 // a buffer's name -> its slot
+inline std::set<int> SLOT_CAPTURED;                           // slots handed out while a stream captured
+inline bool scratchNameMatches(const std::string& name, std::initializer_list<const char*> names) {
+  for (const char* p : names) {
+    size_t len = strlen(p);
+    if (len && p[len - 1] == '.' ? !name.compare(0, len, p) : name == p) return true;
+  }
+  return false;
+}
+inline std::string heldAs(const std::string& name) {
+  auto it = SHARED_SLOT.find(name);
+  return it == SHARED_SLOT.end() ? name : "slot." + std::to_string(it->second);
+}
 inline void releaseScratch(std::initializer_list<const char*> names) {
   bool synced = false;
+  std::set<std::string> slots, kept;
+  for (auto& [name, k] : SHARED_SLOT) {
+    if (scratchNameMatches(name, names)) slots.insert("slot." + std::to_string(k));
+    else if (SLOT_CAPTURED.count(k)) kept.insert("slot." + std::to_string(k));
+  }
+  for (auto& k : kept) slots.erase(k);
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
-    bool match = false;
-    for (const char* p : names) {
-      size_t len = strlen(p);
-      if (len && p[len - 1] == '.' ? !name.compare(0, len, p) : name == p) match = true;
-    }
-    if (!match) continue;
+    if (!scratchNameMatches(name, names) && !slots.count(name)) continue;
     if (!synced) { CK(cudaDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; }
     CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
   }
@@ -1170,8 +1209,11 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
 // under any of `held` already counts toward it, since the whole form would reuse it.
 inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) {
   if (BIG_FORCED) return false;
-  for (auto& [name, slot] : SCRATCH)
-    for (const char* p : held) if (name == p) bytes -= std::min(bytes, slot.second);
+  std::set<std::string> counted;
+  for (const char* p : held) {
+    auto it = SCRATCH.find(heldAs(p));
+    if (it != SCRATCH.end() && counted.insert(it->first).second) bytes -= std::min(bytes, it->second.second);
+  }
   size_t f, t; deviceMemInfo(&f, &t);
   return f > bytes + t / 8;
 }
@@ -1192,6 +1234,9 @@ inline void scratchReportOOM(const char* what, size_t bytes) {
 // pinned buffer for the process, grown as needed; parking frees the device copy and unparking makes a new
 // one (callers take the new pointer).
 inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
+// the trunk's pair kept in bf16 past the trunk (af3.cu, a card short of room): wherever it is - on the device or
+// parked - its readers take bf16 rows, so the f32 pair (51 GB at 10,000 tokens) never exists
+inline bool TRUNK_PAIR16 = false;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
 inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
@@ -1210,7 +1255,29 @@ inline void unparkFromHost(float*& dev, size_t bytes) {
   dev = dallocT<float>(bytes / 4);
   CK(cudaMemcpyAsync(dev, PARK_HOST, bytes, cudaMemcpyHostToDevice, STREAM));
 }
-template <class T> T* scratch(const std::string& name, size_t n) {
+#include <cuda_fp8.h>
+// The device's compute capability (major * 10 + minor), which every host-side choice of kernel family reads -
+// LOCALFOLD_EMULATE_CC=<cc> answers as an older card, to rehearse its paths on this one (=70: a V100's, with the
+// binary built for compute_70 so the driver runs the sm_70 device code here; pair it with LOCALFOLD_SMEM_LIMIT)
+inline int ccOf() {
+  static const int cc = [] {
+    if (const char* e = getenv("LOCALFOLD_EMULATE_CC")) return atoi(e);
+    int d, ma, mi; CK(cudaGetDevice(&d));
+    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
+    return ma * 10 + mi;
+  }();
+  return cc;
+}
+inline int ccMajor() { return ccOf() / 10; }
+// FP8 tensor instructions (Ada and Blackwell: compute capability 8.9 on; an A100 has none). LOCALFOLD_FP8=0 keeps bf16
+inline bool fp8Tensor() {
+  static const bool on = [] {
+    if (getenv("LOCALFOLD_FP8") && !atoi(getenv("LOCALFOLD_FP8"))) return false;
+    return ccOf() >= 89;
+  }();
+  return on;
+}
+template <class T> T* scratchNamed(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
     // (from the pool, stream-ordered - and freed only after the device is idle, as cudaFree was: the frame tap's
@@ -1218,6 +1285,11 @@ template <class T> T* scratch(const std::string& name, size_t n) {
     // the graph's own; a recycle pass is captured once every buffer is sized)
     size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
     cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+    if (p && capturing != cudaStreamCaptureStatusNone) {     // (the pass before the capture should have sized it)
+      fprintf(stderr, "scratch %s grows inside a graph capture (%zu -> %zu bytes): the pass before it did not size it\n",
+              name.c_str(), have, bytes);
+      fflush(stderr); _exit(1);
+    }
     if (p) { CK(cudaDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
     cudaError_t e = capturing != cudaStreamCaptureStatusNone ? cudaMalloc(&p, bytes)
                                                              : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
@@ -1238,6 +1310,73 @@ template <class T> T* scratch(const std::string& name, size_t n) {
     have = n * sizeof(T);
   }
   return (T*)p;
+}
+// SHARED SCRATCH (bindcraft2's "donation", native/common.cuh there): the trunk's modules run one after another, so the
+// large buffers of one (the triangle multiplication's) are dead while another (the triangle attention's) runs - yet each
+// held its own, 14.7 GB of scratch at 1,500 tokens where the largest module wants ~5. A large buffer of a FAMILY below
+// is aliased, once and for the process, to a shared slot ("slot.<k>", ordinary named scratch) that no other buffer of
+// its family holds: buffers of one family never meet, buffers of two may share bytes. Small buffers stay private (the
+// ones written once and relied on).
+// 🔴 A NEW LARGE BUFFER IN A FAMILY IS A CLAIM ABOUT ITS LIFETIME, AND THE PROOF IS A SCRIBBLE: fill every slot at each
+// change of family (but those of a family nested with either side) and require a fold bit-identical to the unshared
+// build - also with every buffer over 64 KB shared, which stands in for a long fold. That instrument, and the bisection
+// of the family list that found every rule below and in each port's main, is 872a136's common.cuh (git show 872a136:
+// cuda/af3/src/common.cuh); it was taken out with its env knobs, so put it back to prove a change.
+// The families are each PORT's (its main sets them, none by default): AF2 and ESMFold2 compile this file and use the
+// same prefixes with other lifetimes, so a port shares only what its own scribbled folds have proved.
+inline std::vector<std::string> SHARED_FAMILIES;
+// ...and (outer, inner): a family whose buffers stay live AROUND another's turns never shares a slot with it - AF3's
+// template stack holds tmpl.* while its blocks run the triangle, attention and transition modules (a fold that moved)
+inline std::vector<std::pair<std::string, std::string>> SHARED_NESTED;
+inline bool nested(const std::string& a, const std::string& b) {
+  for (auto& [o, i] : SHARED_NESTED) if ((a == o && b == i) || (a == i && b == o)) return true;
+  return false;
+}
+inline const size_t SHARED_MIN = (size_t)32 << 20;
+inline std::vector<std::vector<std::string>> SLOT_FAMILIES;   // the families holding each slot
+inline std::vector<size_t> SLOT_MOST;                         // the most each slot has been asked for
+inline const char* sharedFamily(const std::string& name, size_t bytes) {
+  for (const std::string& f : SHARED_FAMILIES)
+    if (!name.compare(0, f.size(), f)) return SHARED_SLOT.count(name) || bytes >= SHARED_MIN ? f.c_str() : nullptr;
+  return nullptr;
+}
+inline std::string sharedSlot(const std::string& name, const char* family, size_t bytes) {
+  auto it = SHARED_SLOT.find(name);
+  int k = -1;
+  if (it != SHARED_SLOT.end()) k = it->second;
+  else {
+    if (SCRATCH.count(name)) releaseScratch({ name.c_str() });     // (private while it was small)
+    // best fit: the smallest slot that holds it already, else the largest (grown the least), else a new one
+    for (int j = 0; j < (int)SLOT_MOST.size(); ++j) {
+      bool mine = false; for (auto& f : SLOT_FAMILIES[j]) if (f == family || nested(f, family)) mine = true;
+      if (mine) continue;
+      if (k < 0) { k = j; continue; }
+      const bool fitsJ = SLOT_MOST[j] >= bytes, fitsK = SLOT_MOST[k] >= bytes;
+      if (fitsJ != fitsK ? fitsJ : fitsJ ? SLOT_MOST[j] < SLOT_MOST[k] : SLOT_MOST[j] > SLOT_MOST[k]) k = j;
+    }
+    if (k < 0) { k = (int)SLOT_MOST.size(); SLOT_MOST.push_back(0); SLOT_FAMILIES.push_back({}); }
+    SLOT_FAMILIES[k].push_back(family);
+    SHARED_SLOT[name] = k;
+  }
+  SLOT_MOST[k] = std::max(SLOT_MOST[k], bytes);
+  return "slot." + std::to_string(k);
+}
+// the pad of C planes [Lp][Lp] past their L x L corner, zeroed at every use: a pad "written once" is another family's
+// data as soon as its bytes are shared (AF2's 700-residue multimer folded wrong on one), and two strided memsets cost
+// nothing beside the products they pad
+inline void zeroPlanePad(half* x, int L, int Lp, int C) {
+  if (Lp == L) return;
+  const size_t e = sizeof(half);
+  CK(cudaMemset2DAsync(x + L, (size_t)Lp * e, 0, (size_t)(Lp - L) * e, (size_t)C * Lp, STREAM));                // columns
+  CK(cudaMemset2DAsync(x + (size_t)L * Lp, (size_t)Lp * Lp * e, 0, (size_t)(Lp - L) * Lp * e, (size_t)C, STREAM)); // rows
+}
+template <class T> T* scratch(const std::string& name, size_t n) {
+  const char* family = sharedFamily(name, n * sizeof(T));
+  if (!family) return scratchNamed<T>(name, n);
+  const std::string slot = sharedSlot(name, family, n * sizeof(T));
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) SLOT_CAPTURED.insert(SHARED_SLOT[name]);
+  return scratchNamed<T>(slot, n);
 }
 
 // The process's end once its outputs are written: flushed first. (std::exit, not _exit: _exit measured no
@@ -1538,7 +1677,11 @@ __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x))
 // (~4e-3 relative). The transition, triangle-input and triangle-output kernels' sigmoids (ncu: 11-18% of
 // their stall samples); a 5CAJ fold moves 0.006 A rms
 __device__ __forceinline__ float sigmH(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750                     // (Volta: no tanh.approx)
+  return 1.f / (1.f + __expf(-x));
+#else
   float t; asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x)); return fmaf(0.5f, t, 0.5f);
+#endif
 }
 
 // The fast path's remaining f32 GEMMs (the conditioning, the atom blocks' aggregation and
@@ -1776,6 +1919,7 @@ inline void check(const char* label, const float* d, size_t n, const std::string
 }
 inline bool STAGES = false;
 inline std::map<std::string, double> STAGE_MS;
+inline void (*STAGE_HOOK)(const char*) = nullptr;   // (DIAG: multigpu.cuh's fence waits by stage)
 inline void stage(const char* name) {
   static auto last = std::chrono::steady_clock::now();
   // a launch that never ran (too much shared memory, a bad grid) reports nothing by itself: ask at
@@ -1787,6 +1931,7 @@ inline void stage(const char* name) {
   CK(cudaStreamSynchronize(STREAM));
   auto now = std::chrono::steady_clock::now();
   if (name) STAGE_MS[name] += std::chrono::duration<double, std::milli>(now - last).count();
+  if (name && STAGE_HOOK) STAGE_HOOK(name);
   last = now;
 }
 #include "elementwise.cuh"    // the element-wise kernels every port shares

@@ -40,13 +40,18 @@
  * between chains, and templates. Each is a token type this tokeniser does not
  * create, and each would need its own CCD entries.
  */
-import { conformerFor, aatypeFor } from "./reference-conformers.js";
+import { conformerFor, aatypeFor, RESIDUE_TYPES } from "./reference-conformers.js";
+import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
+import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
 
 const DENSE = 24;
+// AF3's residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP: a token's restype, named
+const POLYMER_TYPE_NAMES = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE",
+  "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "-", "A", "G", "C", "U", "DA", "DG", "DC", "DT", "N"];
 const QUERIES = 32;
 const KEYS = 128;
 /** AF3's restype alphabet is 31 wide: 20 amino acids, UNK, and the nucleic acids. */
@@ -176,7 +181,11 @@ export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot,
   // 6MRR where the plain slide gives 446. Its last two subsets therefore take
   // keys 448..575 and reach past the last real atom, which the mask handles.
   const edge = qblockKeys ? Math.ceil(atomCount / QUERIES) * QUERIES : atomCount;
-  const lastStart = Math.max(0, edge - keys);
+  // 🔴 AND ITS WINDOW IS THE FULL 128 KEYS WHEREVER IT SITS: the reference clamps a block's start to
+  // `max(edge - 128, 0)`, so below 128 atoms every block starts at 0 and sees every atom. Shifting by the shrunken
+  // window here (keys = the atom count) started the last block at `edge - atoms` - 3 at 93 atoms, dropping atoms 0..2
+  // from its keys - and an odd count made that shift fractional, which the two featurisers truncated differently.
+  const lastStart = Math.max(0, edge - (qblockKeys ? KEYS : keys));
   for (let subset = 0; subset < subsets; subset += 1) {
     const start = paddedKeys
       ? subset * QUERIES + (QUERIES >> 1) - (keys >> 1)
@@ -426,7 +435,10 @@ export function featuriseProtein(sequence, options = {}) {
       residueOfToken[token] = residue;
 
       const atoms = kind === "protein"
-        ? conformerFor(code, isCTerminal)
+        // (an unknown amino acid as the CCD's UNK where the dialect says - openbind0)
+        ? (options.ccdUnknownResidue === true && (code === "X" || !RESIDUE_TYPES.includes(code))
+          ? (isCTerminal ? UNK_CCD_CONFORMER.cTerminal : UNK_CCD_CONFORMER.internal)
+          : conformerFor(code, isCTerminal))
         : (nucleicConformerFor(kind, code, isCTerminal) ?? conformerFor("X", false));
       for (const [slot, name, element, charge, x, y, z] of atoms) {
         const flat = token * DENSE + slot;
@@ -486,7 +498,7 @@ export function featuriseProtein(sequence, options = {}) {
       modifiedSpans.push({ from: token, count: 1, code: modification.code,
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
-      aatype[token] = options.atomizedUnknownRestype === true
+      aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
         ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
@@ -559,9 +571,10 @@ export function featuriseProtein(sequence, options = {}) {
       // against both references on 6MRR + GOL + SEP@3: all ten of the
       // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
       // is a one-hot over the same alphabet.
-      // (rf3's unknown restype is for an atomised AMINO ACID: its reference keeps a modified base's
-      // atom tokens at the parent nucleotide - a 5CM's twenty read DC, 28)
-      aatype[token] = options.atomizedUnknownRestype === true && kind === "protein"
+      // (true is for an atomised AMINO ACID alone; rf3's "nucleic" takes a modified base's atom tokens
+      // too - native atomworks reads a 5CM's twenty as 20, where af3-any-model once kept DC, 28: 0464f71)
+      aatype[token] = options.atomizedUnknownRestype === "nucleic"
+        || (options.atomizedUnknownRestype === true && kind === "protein")
         ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
@@ -784,17 +797,40 @@ export function featuriseProtein(sequence, options = {}) {
     if (slot < 0) throw new Error(`${where}: ${span.code} has no atom ${atom}`);
     return span.from + slot;
   };
+  // 🔴 WHICH DECLARED BONDS A MODEL READS IS EACH VENDOR'S OWN RULE (af3-any-model 964990e). AlphaFold 3 featurises a
+  // declared bond only where one side is a ligand: a bond between two polymer residues never reaches its token bonds -
+  // and this featuriser placed every bond it was handed, so a disulfide typed as a contact reached AlphaFold 3. The
+  // dialect's `declaredPolymerBonds` adds what the others read on top: "all" (Boltz-2: every bond between two tokens),
+  // "discontinuous" (Protenix, OpenDDE: polymer-polymer between residues more than one apart or in different chains,
+  // and a modified residue's bond to a ligand), "ligand" (RoseTTAFold3: the modified residue's bond to a ligand alone).
+  // AlphaFold 3's own go one way (the job's) and covalent; the added ones both ways and covalent, as af3-any-model's
+  // _add_token_bonds; a bond within one token is none.
+  const rule = options.declaredPolymerBonds ?? null;
+  const isLigandEnd = (end) => end.asym >= chainLengths.length;
+  const isModifiedEnd = (end) => {
+    let global = end.residue - 1;
+    for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
+    return modifiedSpans.some((one) => one.residue === global);
+  };
   const declaredBonds = [];
   for (const [index, bond] of (options.bonds ?? []).entries()) {
     const where = `bond ${index + 1}`;
+    // (resolved first, whichever way the rule goes: an endpoint this batch does not have is refused by name)
+    const from = tokenOfEndpoint(bond.from, `${where} from`), to = tokenOfEndpoint(bond.to, `${where} to`);
+    const fromLigand = isLigandEnd(bond.from), toLigand = isLigandEnd(bond.to);
+    let added;
+    if (fromLigand && toLigand) added = false;
+    // (a polymer residue's bond to a ligand is AlphaFold 3's own, a modified residue's too - its tokens are atoms, and
+    // AF3 3.1.16 featurises the kitchen sink's HY3 CA - HEM CHA one way; a family with a rule also adds it the other way)
+    else if (fromLigand || toLigand) added = rule !== null && isModifiedEnd(fromLigand ? bond.to : bond.from); else if (rule === "all") added = true;
+    else if (rule === "discontinuous"
+             && !(bond.from.asym === bond.to.asym && Math.abs(bond.from.residue - bond.to.residue) <= 1)) added = true;
+    else continue;
     // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
     // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
     // covalent inhibitor's alike - and boltz2's bond-type plane reads it
-    declaredBonds.push({
-      from: tokenOfEndpoint(bond.from, `${where} from`),
-      to: tokenOfEndpoint(bond.to, `${where} to`),
-      order: bond.order ?? 5,
-    });
+    if (added && from === to) continue;
+    declaredBonds.push({ from, to, order: added ? 5 : bond.order ?? 5, bothWays: added });
   }
 
   let bondMatrix;
@@ -822,7 +858,7 @@ export function featuriseProtein(sequence, options = {}) {
     for (const bond of declaredBonds) {
       bondMatrix[bond.from * tokens + bond.to] = 1;
       bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
-      if (options.symmetriseBonds) {
+      if (options.symmetriseBonds || bond.bothWays) {
         bondMatrix[bond.to * tokens + bond.from] = 1;
         bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
       }
@@ -1146,6 +1182,45 @@ export function featuriseProtein(sequence, options = {}) {
       refPos[slot * 3] -= entry[0] / entry[3];
       refPos[slot * 3 + 1] -= entry[1] / entry[3];
       refPos[slot * 3 + 2] -= entry[2] / entry[3];
+    }
+  }
+
+  // 🔴 boltz2's LAST CONFORMER GROUP KEEPS BOLTZ-2's STORED CONFORMER, RAW. Boltz-2 centres and rotates each group in
+  // `range(max(ref_space_uid))` - an off-by-one that skips the last - so native feeds its final group the stored
+  // conformer in its own frame (boltz2-conformers.js). af3-any-model 79edb5e matched it: polyQ200 pLDDT 53 -> 85, native
+  // 83. As there: after the centring, the last group's tokens that are not atomised take the stored position of every
+  // atom whose name the residue's entry has (the rest keep the centred value); the restype names the entry
+  // (AF3's POLYMER_TYPES_WITH_UNKNOWN_AND_GAP), and an atomised residue - more than one token on one (asym, residue) -
+  // is left alone.
+  if (options.rawLastConformer === true) {
+    let last = -Infinity;
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) last = Math.max(last, refSpaceUid[slot]);
+    const share = new Map();
+    for (let token = 0; token < tokens; token += 1) {
+      const key = `${asymId[token]}:${residueIndex[token]}`;
+      share.set(key, (share.get(key) ?? 0) + 1);
+    }
+    for (let token = 0; token < tokens; token += 1) {
+      let inLast = false;
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] !== 0 && refSpaceUid[flat] === last) { inLast = true; break; }
+      }
+      if (!inLast || share.get(`${asymId[token]}:${residueIndex[token]}`) > 1) continue;
+      const entry = BOLTZ2_RAW_CONFORMERS[POLYMER_TYPE_NAMES[aatype[token]]];
+      if (entry === undefined) continue;
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] === 0) continue;
+        let name = "";
+        for (let c = 0; c < 4; c += 1) {
+          const v = refAtomNameChars[flat * 4 + c];
+          if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+        }
+        const xyz = entry[name.trim()];
+        if (xyz === undefined) continue;
+        refPos[flat * 3] = xyz[0]; refPos[flat * 3 + 1] = xyz[1]; refPos[flat * 3 + 2] = xyz[2];
+      }
     }
   }
 

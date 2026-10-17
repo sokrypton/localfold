@@ -73,7 +73,7 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
       }
       int element = b.refElement[slot];
       std::string symbol = element >= 1 && element <= (int)symbols.size() ? symbols[element - 1] : "C";
-      std::string head = std::string(ligand == componentOf.end() ? "ATOM  " : "HETATM") + padStart(std::to_string(serial), 5) + " "
+      std::string head = std::string(ligand == componentOf.end() ? "ATOM  " : "HETATM") + padStart(std::to_string(serial % 100000), 5) + " "
         + (name.size() < 4 ? padEnd(" " + name, 4) : name.substr(0, 4)) + " " + padEnd(resName, 3) + " "
         + CHAINS[(b.asymId[token] - 1) % (int)CHAINS.size()] + padStart(std::to_string(b.residueIndex[token]), 4) + "    ";
       lines.push_back(head + padStart(toFixed(positions[slot * 3], 3), 8) + padStart(toFixed(positions[slot * 3 + 1], 3), 8)
@@ -96,8 +96,10 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
   for (auto& s : b.modifiedSpans) bondsOf(s.from, s.bonds);
   for (auto& [atom, bonded] : partners)
     for (size_t start = 0; start < bonded.size(); start += 4) {
-      std::string line = "CONECT" + padStart(std::to_string(atom), 5);
-      for (size_t k = start; k < std::min(bonded.size(), start + 4); ++k) line += padStart(std::to_string(bonded[k]), 5);
+      // (a serial is five digits: past 99,999 atoms it wraps - as every serial field here - so the columns stay where
+      // readers look; mmCIF holds such a fold whole)
+      std::string line = "CONECT" + padStart(std::to_string(atom % 100000), 5);
+      for (size_t k = start; k < std::min(bonded.size(), start + 4); ++k) line += padStart(std::to_string(bonded[k] % 100000), 5);
       lines.push_back(line);
     }
   lines.push_back("END");

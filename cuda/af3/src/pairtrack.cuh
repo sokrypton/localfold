@@ -3,6 +3,7 @@
 // cpu/af3/trunk/pairformer.js; generic in channels, heads and head width.
 #pragma once
 #include "common.cuh"
+#include "multigpu.cuh"
 
 // Where a pair update adds its residual: its own input (nullptr, every model) or, for chai-1's parallel
 // block (trunk.cuh's parallelPairUpdates), the block's running sum - so an update reads the pair ENTERING the
@@ -274,9 +275,15 @@ inline bool wideFits(int C) {
 // the input kernel's forms: 8 warps holding all their rows, else 16 warps norming their rows 32 at a time
 // (TRIIN_ROUNDED: a T4 at 256 channels, where 8 warps' rows are 67.6 KB), else 4 warps. A row's
 // arithmetic does not depend on the form, so all three are byte-identical.
-constexpr int TRIIN_ROUNDED = 16, TRIIN_XROUNDS = 8;
+// TRIIN_TWO_TILES (a form's tag, not a warp count): 4 warps of two 16-row tiles each - 8 warps' 128 rows, shared
+// memory and grid, each weight fragment feeding two MMAs (the kernel is shared-memory bound: cuda/ef2/README.md,
+// 742 -> 714 ms of ESMFold2's 988-token fold). Where an SM holds two of its blocks, at 256 channels
+constexpr int TRIIN_ROUNDED = 16, TRIIN_XROUNDS = 8, TRIIN_TWO_TILES = 2;
+constexpr int triInWarpsOf(int form) { return form == TRIIN_TWO_TILES ? 4 : form; }
+constexpr int triInRowsOf(int form) { return form == TRIIN_TWO_TILES ? 128 : 16 * form; }
 constexpr size_t wideTriInSmemW(int C, int warps) {
-  return warps == TRIIN_ROUNDED ? triIn256Smem<__nv_bfloat16>(C, warps, TRIIN_XROUNDS) : triIn256Smem<__nv_bfloat16>(C, warps);
+  return warps == TRIIN_ROUNDED ? triIn256Smem<__nv_bfloat16>(C, warps, TRIIN_XROUNDS)
+       : warps == TRIIN_TWO_TILES ? triIn256Smem<__nv_bfloat16>(C, 8) : triIn256Smem<__nv_bfloat16>(C, warps);
 }
 inline int wideTriInWarps(int C) {
   static const int forced = getenv("LOCALFOLD_TRIIN_WARPS") ? atoi(getenv("LOCALFOLD_TRIIN_WARPS")) : 0;
@@ -287,7 +294,15 @@ inline int wideTriInWarps(int C) {
   // (past 256 channels 8 warps' rows are one block an SM - ~100 KB at 384, 133 at 512 - and 4 are faster on an A100:
   // OpenDDE's trunk 1476 -> 1449 ms at 261 tokens, IntelliFold-2's 2323 -> 2301; level at 256)
   if (C > 256) return 4;
-  if (fitsSmem(wideTriInSmemW(C, 8))) return 8;
+  if (fitsSmem(wideTriInSmemW(C, 8))) {
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    if ((size_t)perSm >= 2 * (wideTriInSmemW(C, 8) + 1024)) return TRIIN_TWO_TILES;
+    // one 8-warp block an SM (~100 KB at 256 channels: an RTX PRO 6000): the rounded form fits two - measured there
+    // through ESMFold2's same kernel, 457 -> 428 ms at 988 tokens and 4490 -> 3882 at 2,964 (cuda/ef2/src/fused256.cuh)
+    if (C == 256 && fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED))) return TRIIN_ROUNDED;
+    return 8;
+  }
   return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
 }
 // (the output kernel as triangleOutRun launches it: the bf16 tile at 16-column stages, either product type)
@@ -315,15 +330,18 @@ template <class F> void wideWidth(int C, F f) {
 template <class F> void wideWarps(int C, F f) {
   int w = wideTriInWarps(C);
   if (w == 8) f(std::integral_constant<int, 8>{});
+  else if (w == TRIIN_TWO_TILES) f(std::integral_constant<int, TRIIN_TWO_TILES>{});
   else if (w == TRIIN_ROUNDED) f(std::integral_constant<int, TRIIN_ROUNDED>{});
   else f(std::integral_constant<int, 4>{});
 }
 // triIn256K's template for a warp count (the rounded form at TRIIN_ROUNDED)
 template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For() {
-  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS, false, PT>; else return triIn256K<CC, WI, TA, 1, false, PT>;
+  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS, false, PT>;
+  else if constexpr (WI == TRIIN_TWO_TILES) return triIn256K<CC, 4, TA, 1, false, PT, 2>;
+  else return triIn256K<CC, WI, TA, 1, false, PT>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
-  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static int major = ccMajor();
   return major >= 8;
 }
 
@@ -435,9 +453,146 @@ inline std::string operandWeight(const std::string& pre, int C, int side) {
 // product. Outgoing P[i, j] = sum_k a[i, k] b[j, k]: a row block reads pair rows the earlier blocks did
 // not write. Incoming P[i, j] = sum_k a[k, j] b[k, i]: a COLUMN block reads pair columns the earlier
 // blocks did not write - a row block would read rows they had. The reduction over k is never split.
+// triangleBlocked on the whole form's streaming kernels: the input kernel (LN, projection, gate, gating linear) over
+// the whole plane for b alone, then over each block's rectangle for a and its gating rows (RectMap); the contraction
+// into a bf16 product; the output kernel (centre norm, output projection, gate, residual) over the rectangle - where
+// the blocks ran an LN, a GEMM and a transposing gate pass a chunk, and the centre norm, two GEMMs, a second LN and a
+// gated add on the way out. a, b and the product bf16 as the whole form's (TRI_BF16)
+inline bool blockedFused(int n, int C) {
+  static const bool off = getenv("LOCALFOLD_TRIB_FUSED") && !atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+  return !off && FUSED_WIDE && FUSED_TRIANGLE && TRI_BF16 && bf16Tensor() && n >= FUSED_WIDE_MIN_TOKENS &&
+         (C == 128 || C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(wideTriFitsSmem(C)) &&
+         !(C == 128 && skipFused("triangle"));
+}
+// ...and FP8 where the card has FP8 tensor instructions (fp8Tensor): b and each block's a e4m3, both directions in the
+// outgoing GEMM's layout (TN) - the incoming one's operands read transposed (RectMap::T: b' whole, a' a block of
+// z^T's rows, which are z's columns), its t2 rows landing at their own pair's place in the block - on a plane and blocks
+// padded to 16 (an FP8 GEMM's leading dimensions). LOCALFOLD_TRI_TN=1 runs the same layouts in bf16 (bf16Gemms)
+template <class TQ>
+inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+                              bool divideByLength) {
+  using B16 = __nv_bfloat16;
+  constexpr bool F8 = sizeof(TQ) == 1;
+  const int np = (n + 15) / 16 * 16; const size_t cs = (size_t)np * np;
+  const float alpha = divideByLength ? 1.f / n : 1.f;
+  std::string pg = projectionGate(pre, C);
+  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
+  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  TQ* b = scratch<TQ>("trib.bq", cs * C);
+  int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)np * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;   // a, the product, t2
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
+  }
+  TQ* a = scratch<TQ>("trib.aq", (size_t)width * np * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
+  const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
+  auto gemm = [&](int m, int nn, const TQ* A, int lda, long long sA, const TQ* B, long long sB, int ldc, long long sC) {
+    if constexpr (F8) fp8GemmTN(m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
+  };
+  wideWidth(C, [&](auto cw) {
+    constexpr int CC = decltype(cw)::value, WO = 4;
+    wideWarps(C, [&](auto warps) {
+      constexpr int WI = decltype(warps)::value;
+      WITH_PAIR_T(
+        static bool attr = false;
+        constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
+        if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+        auto in = [&](RectMap rm, size_t rows, TQ* ao, TQ* bo, half* t2o) {
+          kern<<<(unsigned)((rows + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            pair, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
+        };
+        RectMap whole; whole.T = !outgoing;
+        in(whole, cs, nullptr, b, nullptr);
+        int lo, hi; mg::myShare(pair, np, 16, lo, hi);       // (multi-GPU: this rank's blocks)
+        for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+          int w = std::min(width, hi - k0);
+          const size_t rs = (size_t)w * np;
+          if (outgoing) {
+            // p[i][j] (i in the block) = sum_k a[i][k] b[j][k]
+            RectMap rm{k0, np, 0, rs};
+            in(rm, rs, a, nullptr, t2);
+            gemm(np, w, b, np, (long long)cs, a, (long long)rs, np, (long long)rs);
+            triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                        Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, rm);
+          } else {
+            // p[i][j] (j in the block) = sum_k a[k][j] b[k][i] = sum_k a'[j][k] b'[i][k], a' z^T's rows j (z's columns)
+            RectMap rin{k0, np, 0, rs}; rin.T = true;
+            in(rin, rs, a, nullptr, t2);
+            gemm(w, np, a, np, (long long)rs, b, (long long)cs, w, (long long)rs);
+            triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                        Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, RectMap{0, w, k0, rs});
+          }
+        }
+      );
+    });
+  });
+  releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 16);
+}
+inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+                                 bool divideByLength, int np) {
+  static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+  if (C <= 256 && fp8Tensor()) { triangleBlockedTN<__nv_fp8_e4m3>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
+  if (C <= 256 && tnBf16) { triangleBlockedTN<__nv_bfloat16>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
+  using B16 = __nv_bfloat16;
+  const size_t cs = (size_t)np * np;
+  const float alpha = divideByLength ? 1.f / n : 1.f;
+  std::string pg = projectionGate(pre, C);
+  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
+  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  B16* b = scratch<B16>("trib.bbf", cs * C);
+  // as wide a block as fits beside b (a, its gating rows and the product, 6 bytes a channel a pair; up to 1024 rows):
+  // every block re-reads the whole of b. (Beside b, a 64th of the card kept - b is made and nothing else is asked for
+  // before the blocks' buffers are given back: with a 16th kept, 8,300 tokens on 40 GB ran 100-row blocks, the GEMMs on
+  // cuBLAS's small tiles, 238.7 s of them a pass against 60.5 at 7,800)
+  int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)np * C * 6, spare = f > t / 64 ? f - t / 64 : 0;
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  B16* a = scratch<B16>("trib.abf", (size_t)width * np * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
+  const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
+  wideWidth(C, [&](auto cw) {
+    constexpr int CC = decltype(cw)::value, WO = 4;
+    wideWarps(C, [&](auto warps) {
+      constexpr int WI = decltype(warps)::value;
+      WITH_PAIR_T(
+        static bool attr = false;
+        constexpr auto kern = triIn256For<CC, WI, B16, PT>();
+        if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+        auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
+          kern<<<(unsigned)((rows + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            pair, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
+        };
+        in(RectMap{}, cs, nullptr, b, nullptr);
+        int lo, hi; mg::myShare(pair, np, 8, lo, hi);        // (multi-GPU: this rank's blocks)
+        for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+          int w = std::min(width, hi - k0);
+          RectMap rm = outgoing ? RectMap{k0, np, 0, (size_t)w * np} : RectMap{0, w, k0, (size_t)np * w};
+          in(rm, rm.size, a, nullptr, t2);
+          if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, alpha, b, np, cs, a, np, rm.size, prod, np, rm.size, C);
+          else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, np, np, alpha, a, w, rm.size, b, np, cs, prod, w, rm.size, C);
+          triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                      Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, rm);
+        }
+      );
+    });
+  });
+  releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 8);
+}
 template <class T>
 void triangleBlocked(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                      bool divideByLength, int np) {
+  if constexpr (std::is_same_v<T, half>)
+    if (blockedFused(n, C)) { triangleBlockedFused(pair, mask, n, C, pre, outgoing, divideByLength, np); return; }
   size_t cs = (size_t)np * np;
   // each operand's own half of [projection | gate], so the two passes together project once
   std::string pgOf[2] = { operandWeight(pre, C, 0), operandWeight(pre, C, 1) };
@@ -471,8 +626,9 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   T* a = scratch<T>("trib.a", (size_t)width * np * C);
   float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
   T* t1 = scratch<T>("trib.t1", per * C); T* t2 = scratch<T>("trib.t2", per * C);
-  for (int k0 = 0; k0 < n; k0 += width) {
-    int w = std::min(width, np - k0);
+  int lo, hi; mg::myShare(pair, np, 8, lo, hi);              // (multi-GPU: this rank's blocks)
+  for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+    int w = std::min(width, hi - k0);
     TriRect r = outgoing ? TriRect{k0, w, 0, np} : TriRect{0, np, k0, w};
     operands(r, a, 0);
     if (outgoing)          // (as the whole contraction, with w output rows)
@@ -495,6 +651,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
   // attention) peaks beside the pair too - at these sizes a reallocation a call is nothing
   releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 8);
 }
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
@@ -513,10 +670,11 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // product and gate, five planes, would not fit with room to spare)
   // (whichever form runs gives back the other's buffers first: scratch outlives the call, so a whole form
   // taken while there was room would otherwise sit beside the blocks of the next call, which had none)
-  if (shortPair(pairs, C) || TIGHT_STACK) {
+  if (shortPair(pairs, C) || TIGHT_STACK || mg::splitting(pair)) {
     // (TIGHT_STACK: a narrower stack - the template's 64 channels - on a trunk short of room, where its own pair is
     // under the threshold but the card is not: its whole form, 1.5 GB at 1530 tokens, was what ran out)
-    if (TIGHT_STACK || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
+    // (multi-GPU: the blocked form, whose blocks the ranks share)
+    if (TIGHT_STACK || mg::splitting(pair) || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
@@ -543,16 +701,64 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
-    bool narrowFused = C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
+    // 🔴 AT 128 CHANNELS THE STREAMING KERNELS BEAT THE NARROW ONES on an SM with an A100's shared memory: the input
+    // kernel at two row tiles a warp, and the output kernel streaming its weight 16 columns a stage (four blocks an SM)
+    // where triOutPK holds the whole 128 x 128 weight (one block an SM, 255 registers, the tensor pipe at 10%). The
+    // triangle's kernels 339 -> 313 ms at 494 tokens, the trunk -1.6% there and -1% at 261; 5CAJ with its alignment
+    // 1.970 -> 1.967 A, self-templated 0.206 -> 0.207, boltz2/rf3/openbind0 within rounding. ...and on a part with
+    // ~100 KB an SM too, measured on Colab's RTX PRO 6000 (sm_120): the triangle's two kernels 742 -> 615 ms of a
+    // 988-token fold, the trunk 3185 -> 3063 ms, and -1% of a 2,964-token pass. A T4 (64 KB) keeps the narrow ones; an
+    // L4 (100 KB) takes the streaming ones, unmeasured. LOCALFOLD_TRI128=narrow|wide forces either
+    static const bool wide128 = [] {
+      if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
+      int dev, perSm = 0; CK(cudaGetDevice(&dev));
+      CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+      return perSm >= 96 * 1024 && bf16Tensor();
+    }();
+    bool narrowFused = C == 128 && !wide128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
     // (384 and 512 channels - OpenDDE, IntelliFold-2 - too: their unfused triangle was the LN, a [C, 4C] GEMM, the gate,
     // the centre norm, two GEMMs and a gated add; LOCALFOLD_NO_WIDER=1 keeps it)
     bool wide = (C == 256 || (FUSED_WIDER && (C == 384 || C == 512)) || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide && !(C == 128 && skipFused("triangle"))) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
-      half* t2 = scratch<half>("tri.t2whole", cs * C);
+      // FP8 operands where the card has FP8 tensor instructions (fp8Tensor, at 128 and 256 channels): both directions in
+      // the outgoing layout - the incoming one's input kernel reading the pair transposed (RectMap's T) - through an e4m3
+      // GEMM into the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
+      // (LOCALFOLD_TRI_TN=1: the same layouts in bf16 - the check of the transposed form on a card without FP8)
+      static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+      const bool f8 = TRI_BF16 && bf16Tensor() && fp8Tensor() && C <= 256, tn = f8 || (TRI_BF16 && bf16Tensor() && tnBf16 && C <= 256);
+      const int np8 = (n + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
+      half* t2 = scratch<half>("tri.t2whole", (tn ? cs8 : cs) * C);
       half* wt = scratch<half>("tri.wt256", triInTileHalves(C));
       tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+      if (tn) {
+        auto run = [&](auto tag) {
+        using F8 = decltype(tag);
+        F8* a8 = scratch<F8>("tri.a8", cs8 * C); F8* b8 = scratch<F8>("tri.b8", cs8 * C);
+        __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs8 * C);
+        RectMap rm; rm.T = !outgoing;
+        wideWidth(C, [&](auto width) {
+          constexpr int CC = decltype(width)::value, WO = 4;
+          wideWarps(C, [&](auto warps) {
+            constexpr int WI = decltype(warps)::value;
+            WITH_PAIR_T(
+              static bool attr = false;
+              constexpr auto kern = triIn256For<CC, WI, F8, PT>();
+              if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+              kern<<<(unsigned)((cs8 + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a8, b8, t2, n, np8, cs8, nullptr, rm));
+          });
+          // (incoming P[i][j] = sum_k a[k][j] b[k][i]: with the transposed operands, sum_k b'[i][k] a'[j][k])
+          if (outgoing) triContractTN(np8, cs8, C, alpha, a8, b8, pb, f8);
+          else triContractTN(np8, cs8, C, alpha, b8, a8, pb, f8);
+          triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                                Wh(pre + ".outputProjection"), t2, into(pair), n, np8);
+        });
+        };
+        if (f8) run(__nv_fp8_e4m3{}); else run(__nv_bfloat16{});
+        return;
+      }
       if (TRI_BF16 && bf16Tensor()) {
         // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
@@ -569,8 +775,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
               static bool attr = false;
               constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
               if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-              kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
-                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr));
+              kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr, RectMap{}));
           });
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
@@ -587,8 +793,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
             static bool attr = false;
             constexpr auto kern = triIn256For<CC, WI, half, PT>();
             if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-            kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
-              pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr));
+            kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+              pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr, RectMap{}));
         });
         contract();
         triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, into(pair), n, np);
@@ -908,6 +1114,10 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       std::string qkvg = qkvgWeight(pre, C, Wd, true);
       std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
       float scale = 1.f / sqrtf((float)D);
+      // FP8 attention where the card has it (flash8Run): k and v written e4m3 by the projection, the f16 kernel's
+      // k and v never written
+      const bool f8 = D == 32 && (MASK_ALL_ONES || !mask) && fp8Attn();
+      const size_t f8Row = f8 ? (size_t)3 * Wd : 0;          // (k8, v8 and the transposed v: bytes an element)
       // 🔴 every row in one pass whenever the card has the room for it (what its buffers already hold
       // counted, so every pass decides alike): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at
       // 1048 (465 against 481 ms, 7.82 against 8.20 s on an A100) for 1.13 GB the chunks do not hold - it
@@ -916,17 +1126,21 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // (the room asked for includes the triangle multiplication's whole form, five planes, which these
       // buffers would otherwise starve into its blocked form - see cuda/af2's twin)
       size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
-      if (roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + 5 * triPlane * C * 2,
-                  {"grid.qkvg", "grid.gathered", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole"})) {
+      if (!mg::splitting(pair) && roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+                  {"grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
+                   "tri.pbf", "tri.t2whole"})) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
-        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
+        uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", pairs * 2 * Wd) : nullptr;
+        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        // (a bf16 pair: cuBLAS takes no f16-in, bf16-out GEMM, so the projection goes to f16 and one pass adds it)
-        if (!tr && PAIR16) rowOut16(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection");
-        else if (!tr) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        if (f8) flash8Run(qkvgOut, kv8, kv8 + pairs * Wd, bias, stride, gathered, n, heads, n, scale, nullptr);
+        else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
+        // (a bf16 pair takes the output kernel in both directions, adding its f32 accumulators into the pair: the
+        // GEMM into f16 and an add pass - cuBLAS takes no f16-in, bf16-out GEMM - were 0.8% more of a 988-token trunk,
+        // and an f16 rounding more; 5CAJ with its alignment 0.009 A, 1BRS templated 0.008 A from that form)
+        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr);
         return;
       }
@@ -948,16 +1162,28 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         raw, bias, n, stride, heads, tr && swapBias, LOG2E);
       }
       size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
-      for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
-        size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
-        half* qkvgOut = scratch<half>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
-        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
-        half* gathered = scratch<half>("grid.gathered", prs * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr && PAIR16) rowOut16(gathered, pairRow(into(pair), r0 * n, C), prs, Wd, C, pre + ".outputProjection");
-        else if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      // as many rows a chunk (up to 256) as what is free allows, where 64M elements is ~18 rows at 6,916 tokens: 43,120
+      // flash launches a trunk pass become 3,136, the grid attention 166.2 -> 163.2 s and gridInK 7.2 -> 6.3 of a 6,916-
+      // token pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks, so a small input still crosses chunk boundaries)
+      if (!BIG_FORCED) {
+        size_t f, t; deviceMemInfo(&f, &t);
+        size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
+        R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
+      }
+      int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
+      for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
+        size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
+        half* qkvgOut = scratch<half>("grid.qkvg", (std::min(R, (size_t)n) * n + 128) * 4 * Wd);   // padding: the last query block
+        uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min(R, (size_t)n) * n * 2 * Wd) : nullptr;
+        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8);
+        half* gathered = scratch<half>("grid.gathered", std::min(R, (size_t)n) * n * Wd);
+        if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
+        else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
+        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
+      releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });   // (the next triangle's blocks size themselves by what is free)
+      if (mg::splitting(pair)) mg::exchange(tr, n, C, PAIR16 ? 2 : 4, n, 1);
       return;
     }
   }
@@ -1003,9 +1229,17 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
   size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
+  // as many rows a chunk (up to 256) as what is free allows, as the fused form's: 64M elements is 31 rows at 8,300 tokens,
+  // the template stack's attention 1,072 launches a pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks)
+  if (!BIG_FORCED) {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8)), spare = f > t / 16 ? f - t / 16 : 0;
+    R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
+  }
   float scale = 1.f / sqrtf((float)D);
-  for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
-    size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
+  int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)
+  for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
+    size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
     const T* act = streamNorm ? nullptr : norm + r0 * n * C;
     if (streamNorm) {
       T* g = scratch<T>("grid.act", prs * C);
@@ -1068,6 +1302,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
     WITH_PAIR_T(addGridK<PT, float><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, tr && !RESIDUAL_UNTRANSPOSED));
   }
+  if (mg::splitting(pair)) mg::exchange(tr && !RESIDUAL_UNTRANSPOSED, n, C, PAIR16 ? 2 : 4, n, 1);
 }
 
 // Whether a pairformer stack can hold its pair in bf16 (PAIR16): every update it would run has a bf16 form - the
@@ -1088,8 +1323,11 @@ inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
   bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
   std::string A = B0 + ".pairAttention1";
-  bool grid = FUSED_GRID && gridFusedFits() && !hasW(A + ".gatingQueryBias") && !hasW(A + ".outputProjectionBias") &&
-              (int)M.meta(A + ".heads") * (int)M.meta(A + ".dimension") == 128 && (int)M.meta(A + ".heads") <= 16;
+  // (a grid attention with biases - rf3's gating query and output projection - runs the unfused kernels, which take a
+  // bf16 pair as the wide tracks' do: the output bias is added in f32 and the sum laid into the pair by addGridK<PT>)
+  const bool biased = hasW(A + ".gatingQueryBias") || hasW(A + ".outputProjectionBias");
+  bool grid = biased || (FUSED_GRID && gridFusedFits() &&
+              (int)M.meta(A + ".heads") * (int)M.meta(A + ".dimension") == 128 && (int)M.meta(A + ".heads") <= 16);
   int I = (int)(lenW(B0 + ".pairTransition.transition1") / (2 * (size_t)C));
   bool tr = FUSED_TRANSITION && fitsSmem((size_t)16 * 4 * 2 * (128 + 8) * 2 + 2 * ftStage<128, 16>()) && I % 16 == 0;
   return (narrow || wide) && grid && tr;
@@ -1108,6 +1346,11 @@ void pairUpdates(float* pair, const float* mask, int n, int C, const std::string
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
   if (releaseBetween) releaseScratch({ "grid." });
-  transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); stage("transition");
+  if (mg::splitting(pair)) {       // (multi-GPU: this rank's rows, then the others')
+    int lo, hi; mg::myShare(pair, n, 1, lo, hi);
+    transition<T>(pairRow(pair, (size_t)lo * n, C), (size_t)(hi - lo) * n, C, transitionFactor, pre + ".pairTransition");
+    mg::exchange(false, n, C, PAIR16 ? 2 : 4, n, 1);
+  } else transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition");
+  stage("transition");
   if (releaseBetween) releaseScratch({ "tr." });
 }

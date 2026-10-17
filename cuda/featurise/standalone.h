@@ -112,9 +112,14 @@ struct Run {
   }
 };
 
+// several GPUs on one fold (cuda/af3's multigpu.cuh forks a process a GPU before this runs, LOCALFOLD_RANK and
+// LOCALFOLD_MG_ID in each one's environment): rank 0 alone featurises - one search, not one a rank - into a directory
+// named by the run, and the others fold from it, waiting for it as --wait-input waits for any featuriser
+inline int mgRank() { const char* r = getenv("LOCALFOLD_RANK"); return r ? atoi(r) : -1; }
 inline std::string tempDir() {
   struct stat st;
   std::string base = stat("/dev/shm", &st) == 0 && access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp";
+  if (mgRank() >= 0 && getenv("LOCALFOLD_MG_ID")) return base + "/localfold-in-mg-" + getenv("LOCALFOLD_MG_ID") + "/in";
   std::string tmpl = base + "/localfold-in-XXXXXX";
   std::vector<char> buf(tmpl.begin(), tmpl.end()); buf.push_back(0);
   if (!mkdtemp(buf.data())) throw std::runtime_error("cannot make a temporary directory under " + base);
@@ -142,12 +147,15 @@ inline void cleanUp() {
 inline int featuriseAndFold(Run& run, const std::function<void(const std::string&)>& featurise,
                             std::vector<std::string> foldArgs, int (*fold)(int, char**), const char* argv0) {
   run.dir = tempDir();
+  std::string dir = run.dir;
+  if (mgRank() > 0) {             // (another rank's featuriser: this one only reads what it writes)
+    FEATURISED = true;
+  } else {
   CLEAN_DIR = run.dir;
   std::string o = run.out;
   bool structure = o.size() > 4 && (o.substr(o.size() - 4) == ".pdb" || o.substr(o.size() - 4) == ".cif");
   KEEP_A3M = (structure ? o.substr(0, o.size() - 4) : o) + ".a3m";
   std::atexit(cleanUp);
-  std::string dir = run.dir;
   std::thread([featurise, dir] {
     try {
       featurise(dir);
@@ -157,6 +165,7 @@ inline int featuriseAndFold(Run& run, const std::function<void(const std::string
     }
     FEATURISED = true;
   }).detach();
+  }
   std::vector<std::string> a = {argv0, run.dir};
   for (auto& f : foldArgs) a.push_back(f);
   a.push_back("--wait-input=0");       // (no timeout: the featuriser is this process's, and a search may queue for long)

@@ -189,6 +189,17 @@ def main():
             bonds.append(tuple(ends))
     if job_bonds:
         bonds = (bonds or []) + [tuple(tuple(end) for end in pair) for pair in job_bonds]
+    # 🔴 run_alphafold.py's prepare_input, which _fold_setup skips: the conventions a model applies to its INPUT before
+    # featurising - OpenFold3's main-MSA cap and dedupe, protenix's unpaired dedupe, the CCD UNK in place of GLY (a
+    # process-wide switch prepare_input sets). Without it a dump showed none of them (an X in an openbind0 batch read
+    # GLY's four atoms where the fold reads UNK's six), so a featuriser held to the dump was held to the wrong batch.
+    from alphafold3.common import folding_input as _fi
+    from alphafold3.model import model_registry
+    from alphafold3.model.pipeline import model_features
+    chains = chains or [_fi.ProteinChain(id="A", sequence=arguments.sequence, ptms=[], unpaired_msa="", paired_msa="",
+                                         templates=[])]
+    chains = list(model_features.prepare_input(
+        _fi.Input(name=arguments.model, chains=chains, rng_seeds=[job_seed]), model_registry.get(arguments.model)).chains)
     batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains,
                                     bonded_atom_pairs=bonds, seed=job_seed)
     features = feat_batch.Batch.from_data_dict(batch)

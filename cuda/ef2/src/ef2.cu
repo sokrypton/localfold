@@ -12,6 +12,7 @@
 #include "sampler.cuh"
 #include "confidence.cuh"
 #include "../../af3/src/profile.cuh"
+#include "mgtrunk.cuh"      // (--gpus=N: the trunk across several GPUs)
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,10 +72,12 @@ struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampl
 static std::string FRAMES_DIR;
 // the softmax mass of each pair's first contact_bins bins (the bias is already in the logits: distogram())
 // pair positions [p0, p0 + cnt) of z + z^T (symmetriseK's arithmetic, a block at a time)
-__global__ void symmetriseRowsK(const float* z, float* out, size_t p0, size_t cnt, int T, int C) {
+__global__ void symmetriseRowsK(const float* z, float* out, size_t p0, size_t cnt, int T, int C, bool z16 = false) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = p0 + t / C, i = ij / T, j = ij % T;
+  if (z16) { const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(z);   // (a bf16 trunk pair: EF2_Z16)
+             out[t] = __bfloat162float(h[ij * C + c]) + __bfloat162float(h[(j * T + i) * C + c]); return; }
   out[t] = z[ij * C + c] + z[(j * T + i) * C + c];
 }
 __global__ void contactsK(const float* logits, const int* contactBins, float* out, size_t pairs, int bins) {
@@ -99,7 +102,7 @@ static int foldInput(const Opts& o, bool warm) {
     sampler.sMax = M.meta("meta/samplerSigmaMax"); sampler.maxSigma = M.meta("meta/samplerMaxSigma");
   }
   bool profile = o.profile && !warm;
-  auto say = [&](const char* fmt, auto... v) { if (!warm) printf(fmt, v...); };
+  auto say = [&](const char* fmt, auto... v) { if (!warm && mg::RANK == 0) printf(fmt, v...); };
   // EF2_MEM: device memory in use at each phase boundary
   auto mem = [&](const char* at) {
     if (!warm && getenv("LOCALFOLD_MEM")) { memReport(at); return; }   // (common.cuh's, with the largest holders)
@@ -110,6 +113,7 @@ static int foldInput(const Opts& o, bool warm) {
   };
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   int T = (int)M.meta("meta/tokens");
+  buildBonds(T);
   const bool residentTower = M.has("c/blocks/0/fc2/weightsT");      // (ESM-C 6B: [out, in], resident int8)
   // the residual scale is the architecture's, sqrt(layers / 36) (esm's EsmcTransformerStack; biohub's 300M runs
   // 0.912871): derived, not read - tools/export_esmc_model.py wrote 1.0 for every tower and the published 300M bundle
@@ -124,7 +128,21 @@ static int foldInput(const Opts& o, bool warm) {
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
   // on a card short of room z_init is streamed (ZINIT_STREAM): the language model's pair is never made whole
   const bool parcae = parcaeRecycle();           // (the released models keep the language model's pair: their loop reads it)
-  const bool streamZ = !check && !parcae && shortPair((size_t)T * T, e.pair);
+  if (mg::WORLD > 1 && warm) return 0;          // (no warm-up fold: the ranks meet at every collective of the real one)
+  if (mg::WORLD > 1) {
+    // several GPUs: the trunk sharded by rows (mgtrunk.cuh) - with the streamed z_init, and one room for every rank's
+    // short-of-room choices (cuda/af3's, common.cuh); the sampler's steps uncaptured (a fence cannot be in a graph)
+    SAMPLER_GRAPH = false;
+    if (hasMsaEncoder() || check) {
+      fprintf(stderr, "several GPUs fold ESMFold2's single-sequence models and ESMFold2-Fast (not the alignment encoder's ESMFold2, not an oracle check) yet\n");
+      return 1;
+    }
+    SHORT_PAIR_ROOM = std::max<size_t>(1, mg::minOverRanks(shortPairRoomHere()));
+    SHORT_PAIR_SHARE = mg::WORLD;
+  }
+  // (several GPUs: streamed for every model - the released models' recycle makes the language model's pair a block of
+  // rows at a time there too)
+  const bool streamZ = !check && (mg::WORLD > 1 || (!parcae && shortPair((size_t)T * T, e.pair)));
   float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
   if (residentTower && M.residentParked()) {      // (the last fold parked the tower: back from its shards)
@@ -147,6 +165,21 @@ static int foldInput(const Opts& o, bool warm) {
   // with it held: 6.4 GB of codes beside four 2.3 GB pairs)
   // (never in the warm-up: it runs while the tower is still being copied up, and freeing the copy under the upload
   // killed the process - "cannot put a model.bin on the device" - whenever room was short and the upload slow)
+  // several GPUs fold once, and the sharded trunk's triangle wants the room: the tower's matrices leave the device -
+  // its f16 mirror, and its f32 copies where --fast did not drop them (1.15 GB a GPU at 16,549 tokens)
+  if (mg::WORLD > 1 && !residentTower && !check && M.has("c/blocks/0/qkv/weights")) {
+    size_t f0, f1, t; deviceMemInfo(&f0, &t);
+    const int seg = M.at("c/blocks/0/qkv/weights").seg;
+    CK(cudaDeviceSynchronize());
+    auto& mirrors = M.segs[seg].halfMirrors;
+    for (auto& [g, h] : mirrors) CK(cudaFree(h));
+    mirrors.clear();
+    for (auto w = WH_AT.begin(); w != WH_AT.end();)
+      if (!w->first.rfind("c/", 0)) { WH.erase(w->first); WH_MIRROR.erase(w->first); w = WH_AT.erase(w); } else ++w;
+    if (M.segs[seg].device) compactWeights(seg, [](const std::string& k) { return !k.rfind("c/blocks/", 0) && towerHalf(k); });
+    deviceMemInfo(&f1, &t);
+    say("tower's matrices off the device: %.2f GB\n", (f1 - f0) / 1e9);
+  }
   if (residentTower && !warm && !roomFor(3 * (size_t)T * T * e.pair * 4, { "tower.w16" })) {
     releaseScratch({ "tower.", "esmc." });
     if (!streamZ) releaseScratch({ "shim." });     // (a streamed z_init reads shim.tokens later)
@@ -225,7 +258,12 @@ static int foldInput(const Opts& o, bool warm) {
   }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
   // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
-  z = dalloc((size_t)T * T * C);
+  // (the trunk's pair bf16 where z_init streams and every block takes the fused bf16 forms: trunk.cuh's EF2_Z16;
+  // LOCALFOLD_PAIR_F32=1 keeps it f32)
+  EF2_Z16 = streamZ && !getenv("LOCALFOLD_PAIR_F32") && !getenv("EF2_SAVE_PAIR") && FAST && FUSED256 && C == 256 &&
+            T >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma();
+  if (mg::WORLD > 1) EF2_Z16 = true;            // (the sharded trunk's pair is bf16, and rank 0's whole one after it)
+  z = mg::WORLD > 1 ? nullptr : EF2_Z16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)T * T * C)) : dalloc((size_t)T * T * C);
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
   if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
@@ -233,7 +271,16 @@ static int foldInput(const Opts& o, bool warm) {
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
-  foldingTrunk(T, C, zi, z, getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed, lmHost);
+  const int passes = getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4;
+  if (mg::WORLD > 1) {
+    const int world = mg::WORLD;
+    // (the language model's freed scratch handed back to the device first: its attention scores, 20 GB at 16,549 tokens,
+    // sat idle in the scratch pool where the trunk's shared buffers could not have them)
+    releaseScratch(); trimPool();
+    mem("before the sharded trunk"); mg::segmentReport("before the sharded trunk");
+    z = shardedTrunkEf2(T, C, passes, seed);         // (this rank's rows, bf16, indexed by the global pair: EF2_ZS)
+    say("trunk across %d GPUs\n", world);
+  } else foldingTrunk(T, C, zi, z, passes, check, lmZ, seed, lmHost);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   if (getenv("EF2_SAVE_PAIR") && !warm) {         // the trunk's final pair, raw float32 [T, T, C] (a comparison aid)
     auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb");
@@ -258,8 +305,13 @@ static int foldInput(const Opts& o, bool warm) {
       return 1;
     }
     size_t P = (size_t)T * T;
+    if (EF2_ZS) {                                 // (several GPUs: each rank's rows, all-gathered - mgtrunk.cuh)
+      contacts = shardedContactsEf2(T, C, bins, [&](const float* dg, size_t p0, size_t n, float* out) {
+        contactsK<<<blocks(n), 256, 0, STREAM>>>(dg, Idev("contact_bins") + p0, out, n, bins);
+      });
+    } else {
     float* probs = scratch<float>("dg.contacts", P);
-    if (tight) {
+    if (tight || EF2_Z16) {
       // on a card short of room a block of pair positions at a time: z + z^T, the projection, the contact mass -
       // never the symmetrised pair (5.9 GB at 2400 tokens) or the logits (2.95 GB) whole; the same arithmetic
       int Bn = (int)dimOf("f/distogram/weights", 1);
@@ -267,7 +319,7 @@ static int foldInput(const Opts& o, bool warm) {
       float* zs = scratch<float>("dg.symRows", per * C); float* dg = scratch<float>("dg.logitRows", per * bins);
       for (size_t p0 = 0; p0 < P; p0 += per) {
         size_t n = std::min(per, P - p0);
-        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, p0, n, T, C);
+        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, p0, n, T, C, EF2_Z16);
         gemm(zs, F("distogram/weights"), dg, n, C, Bn);
         addBias(dg, F("distogram/bias"), n, Bn);
         contactsK<<<blocks(n), 256, 0, STREAM>>>(dg, Idev("contact_bins") + p0, probs + p0, n, bins);
@@ -285,6 +337,7 @@ static int foldInput(const Opts& o, bool warm) {
       TAP().offer({{bytes, P}}, [path, P](const char* host, const std::vector<size_t>&) { writeWhole(path, host, P); });
     }
     contacts = download(probs, P);
+    }
     if (tight) releaseScratch();
   }
   if (check) {                                   // (nothing else reads the distogram)
@@ -293,7 +346,18 @@ static int foldInput(const Opts& o, bool warm) {
     checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
     CK(cudaFree(dg)); if (tight) releaseScratch();
   }
+  if (EF2_ZS) { int lo, hi; sh::rowsOf(T, mg::RANK, lo, hi); EF2_QLO = lo; EF2_QROWS = sh::storedRows(T, mg::RANK); }
   Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
+  // (a bf16 trunk pair waits in host memory through the sampler, which never reads it: the confidence head takes it
+  // back, widened)
+  bool shareKept = false; __nv_bfloat16* z16Kept = nullptr;
+  if (EF2_ZS) { shareKept = parkShareEf2(T, C); z = nullptr; }      // (each rank its share, in its own host memory, or kept)
+  else if (EF2_Z16) {
+    // (kept on the device where there is the room for it and five pairs more beside it - the head's residual and its
+    // triangle's operands, gate and product - else parked: pinning 4.5 GB was 3.1 s of a 2,964-token fold on 40 GB)
+    if (!BIG_FORCED && roomFor(5 * (size_t)T * T * C * 2)) z16Kept = reinterpret_cast<__nv_bfloat16*>(z);
+    else parkToHost(z, (size_t)T * T * C * 2);
+  }
   mem("denoiser built");
   if (check && M.has("o/step0/x_noisy")) {
     float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
@@ -345,6 +409,9 @@ static int foldInput(const Opts& o, bool warm) {
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
   mem("sampler");
   freeDenoiser(dn); if (tight) releaseScratch();
+  // (the sampler's gathered attention rows given back: a small buffer that alone held a 1 GB shared segment through
+  // the sharded confidence head, which was 0.6 GB short at 16,549 tokens on 8 x 40 GB)
+  if (mg::WORLD > 1) mg::release({ "ef2.tok.oh" }, mg::FREE);
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
     fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see cuda/ef2/README.md)\n");
@@ -358,7 +425,18 @@ static int foldInput(const Opts& o, bool warm) {
   float* xd = upload(coords.data(), (size_t)A * 3);
   bool profConf = profile && profStage == "confidence";
   if (profConf) { prof::init(); prof::start(); }
-  Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
+  Confidence conf;
+  if (mg::WORLD > 1) {                          // (several GPUs: the head sharded as the trunk is - mgtrunk.cuh - then the others leave)
+    unparkShareEf2(T, C, shareKept);
+    conf = confidenceHeadSharded(T, A, sInputs, Si, xd, shareKept);
+    mg::release({ "" }, mg::FINAL);
+    if (mg::RANK != 0) mg::leave();
+    mg::finish();
+    mg::WORLD = 1; SHORT_PAIR_SHARE = 1; EF2_QLO = EF2_QROWS = 0; EF2_ZS = nullptr;
+  } else {
+    if (EF2_Z16) releaseScratch();              // (the head reads the parked bf16 pair itself: zTrunk null)
+    conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true, z16Kept);   // (z is read by nothing after)
+  }
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -424,6 +502,7 @@ static int foldMain(int argc, char** argv) {
   }
   auto tStart = std::chrono::steady_clock::now();
   // the weights: one exported file, or the two bundles read as they are (decoded on the device)
+  M.hostOnly.insert("token_bonds");                   // (BONDS: its rows' bonded columns, built per fold)
   if (!weights.empty()) M.load(weights);
   else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/"); }   // (int8 tower blocks stay resident)
   const int weightSegs = (int)M.segs.size();
@@ -436,6 +515,11 @@ static int foldMain(int argc, char** argv) {
   // is forgotten after it. The warm fold needs only the shapes - it loads every kernel module and
   // cuBLAS plan. 6MRR's cold trunk is 128 ms against 39 warm.
   bool warming = !warmShape.empty();
+  // ...and only while there is something to hide behind: an input already written (a sequence featurises in
+  // milliseconds, beside ~200 ms of CUDA context) folds now, its own first fold doing what the warm-up would - the
+  // warm-up's ~175 ms cost more than the cold kernels it saves (6MRR 0.78 -> 0.74 s command to structure, 5CAJ
+  // 1.08 -> 1.01, 1TIM 1.56 -> 1.52, byte-identical). A search or a dictionary fetch still in flight keeps it
+  if (warming && waitInput && serveDir.empty() && access((std::string(argv[1]) + "/model.idx").c_str(), R_OK) == 0) warming = false;
   for (int sgi = 0; sgi < weightSegs; ++sgi) { if (warming) M.uploadAsync(sgi); else M.upload(sgi); }
   if (warming) {
     int wt = 0, wa = 0;
@@ -453,6 +537,17 @@ static int foldMain(int argc, char** argv) {
     std::string rm = "rm -rf '" + dir + "'"; if (system(rm.c_str())) {}
     M.waitUploads();
     forgetDerivedWeights();
+  }
+  // --fast (every fold the standalone and the worker run): the modules' large scratch shared between them (af3/src/
+  // common.cuh, SHARED SCRATCH), proved by scribbled folds bit-identical to the unshared build; a family live around
+  // another's turns never shares with it, each pair a fold that moved: the diffusion conditioning around its
+  // transition's. Not shared: the f16 pair (ef2.), the language model's buffers, the trunk's own (trunk.: live across
+  // its blocks - shared, a crash) and the shim's (shim.tokens, read by the streamed z_init in the trunk - shared, an
+  // illegal address across 2 GPUs). The reference path (no --fast) shares nothing: unproved
+  if (FAST) {
+    SHARED_FAMILIES = { "ftr.", "ftri.", "cf.", "tri.", "trib.", "tr.", "dtr.", "msa.", "dc.", "dn.", "dg.", "zi.",
+                        "embed.", "atom.", "tb." };
+    SHARED_NESTED = { { "dc.", "dtr." } };
   }
   // --fast: the f16 mirrors made now (the ESM-C tower's, the folding bundle's), and the tower's matrices'
   // f32 copy dropped from the device - 2.2 GB, read only through the mirror on this path
@@ -510,6 +605,15 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `esmfold2 <featurised dir> ...` and `esmfold2 - --serve=<dir>` as before
 int main(int argc, char** argv) {
+  {
+    const int world = mg::gpusArg(argc, argv);   // --gpus=N|all: the trunk across several GPUs (before any CUDA call)
+    if (world > 1)
+      for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--serve", 7) || !strncmp(argv[i], "--warm", 6) || !strncmp(argv[i], "--frames", 8)) {
+          fprintf(stderr, "several GPUs fold one job at a time: no %s\n", argv[i]); return 1;
+        }
+    mg::launch(world);
+  }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("ef2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

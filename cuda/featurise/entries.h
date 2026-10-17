@@ -18,7 +18,11 @@
 namespace lf {
 
 struct Entries {
-  struct E { char kind; std::string name; std::string value; std::vector<uint32_t> words; };
+  // (words, or a float32 / int32 vector handed over whole - an exporter's large arrays moved in, not copied: AF2's four
+  // passes at 5,120 extra rows were 289 MB copied, 0.24 s of a 394-residue featurisation)
+  struct E { char kind; std::string name; std::string value; std::vector<uint32_t> words; std::vector<float> f = {}; std::vector<int> n = {};
+             const void* data() const { return !f.empty() ? (const void*)f.data() : !n.empty() ? (const void*)n.data() : (const void*)words.data(); }
+             size_t size() const { return !f.empty() ? f.size() : !n.empty() ? n.size() : words.size(); } };
   std::vector<E> list;
   void m(const std::string& name, double v) { list.push_back({'m', name, jsNumber(v), {}}); }
   void flag(const std::string& name, bool v) { list.push_back({'m', name, v ? "1" : "0", {}}); }
@@ -28,6 +32,8 @@ struct Entries {
     if (!v.empty()) std::memcpy(e.words.data(), v.data(), v.size() * 4);
     list.push_back(std::move(e));
   }
+  void t(const std::string& name, std::vector<float>&& v) { list.push_back({'t', name, "", {}, std::move(v)}); }
+  void i(const std::string& name, std::vector<int>&& v) { list.push_back({'i', name, "", {}, {}, std::move(v)}); }
   void t(const std::string& name, const std::vector<double>& v) {   // a JS number array: Float32Array.from
     std::vector<float> f(v.begin(), v.end());
     t(name, f);
@@ -47,10 +53,10 @@ struct Entries {
     size_t offset = 0;
     for (auto& e : list) {
       if (e.kind == 'm') { idx += "m " + e.name + " " + e.value + "\n"; continue; }
-      idx += std::string(1, e.kind) + " " + e.name + " " + std::to_string(offset) + " " + std::to_string(e.words.size()) + "\n";
-      if (!e.words.empty() && fwrite(e.words.data(), 4, e.words.size(), bin) != e.words.size())
+      idx += std::string(1, e.kind) + " " + e.name + " " + std::to_string(offset) + " " + std::to_string(e.size()) + "\n";
+      if (e.size() && fwrite(e.data(), 4, e.size(), bin) != e.size())
         throw std::runtime_error("short write to " + dir + "/model.bin");
-      offset += e.words.size();
+      offset += e.size();
     }
     fclose(bin);
     std::string tmp = dir + "/model.idx.tmp";
@@ -60,7 +66,7 @@ struct Entries {
     fclose(f);
     if (rename(tmp.c_str(), (dir + "/model.idx").c_str()) != 0) throw std::runtime_error("cannot rename " + tmp);
   }
-  size_t words() const { size_t n = 0; for (auto& e : list) n += e.words.size(); return n; }
+  size_t words() const { size_t n = 0; for (auto& e : list) n += e.size(); return n; }
 };
 
 inline void addGather(Entries& e, const std::string& name, const Gather& g) {

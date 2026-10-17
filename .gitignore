@@ -134,6 +134,7 @@ cuda/featurise/*-featurise
 cuda/featurise/chem-probe
 cuda/featurise/resolve-templates
 cuda/featurise/fetch-weights
+cuda/featurise/msa-search
 cuda/featurise/standalone.o
 cuda/featurise/*.stamp
 cuda/featurise/*.building
@@ -151,5 +152,4 @@ python/*.egg-info/
 metal/build/
 metal/*/localfold-*
 metal/**/*.combined
-metal/build/
-metal/*/localfold-*
+.localfold-fetch.lock

@@ -10,12 +10,12 @@
 #pragma once
 #include "trunk.cuh"
 
-__global__ void confZK(float* z, RelIdx rel, const float* bonds, const float* wBond, const float* rows,
+__global__ void confZK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
                        const float* cols, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] += relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
+  z[t] += relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
 }
 __global__ void outerProductK(const float* a, const float* b, float* out, size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,6 +37,28 @@ __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const f
   int bucket = 0;
   for (int e0 = 0; e0 < nEdges; e0 += 32) bucket += __popc(__ballot_sync(~0u, e0 + lane < nEdges && d > edges[e0 + lane]));
   float4* row = reinterpret_cast<float4*>(z + ij * C);
+  const float4* tb = reinterpret_cast<const float4*>(table + (size_t)bucket * C);
+  for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
+}
+// ...a chunk of pair positions [p0, p0 + n) of z (EF2_Z16's head, which builds its pair a chunk of rows at a time)
+__global__ void confZRowsK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
+                           const float* cols, size_t p0, size_t n, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n * C) return;
+  int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  z[t] += relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
+}
+__global__ void distanceEmbedRowsK(float* z, const float* x, const int* rep, const float* edges, int nEdges,
+                                   const float* table, size_t p0, size_t n, int T, int C) {
+  size_t q = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5; int lane = threadIdx.x & 31;
+  if (q >= n) return;
+  size_t ij = p0 + q; int i = (int)(ij / T), j = (int)(ij % T);
+  const float* a = x + (size_t)rep[i] * 3; const float* b = x + (size_t)rep[j] * 3;
+  float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+  float d = sqrtf(dx * dx + dy * dy + dz * dz);
+  int bucket = 0;
+  for (int e0 = 0; e0 < nEdges; e0 += 32) bucket += __popc(__ballot_sync(~0u, e0 + lane < nEdges && d > edges[e0 + lane]));
+  float4* row = reinterpret_cast<float4*>(z + q * C);
   const float4* tb = reinterpret_cast<const float4*>(table + (size_t)bucket * C);
   for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
 }
@@ -117,7 +139,9 @@ struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, i
 
 // consume: the trunk's z is read by nothing after this call - on a card short of room the head then works in it
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
-                                 bool check, bool consume = false) {
+                                 bool check, bool consume = false, __nv_bfloat16* z16Kept = nullptr) {
+  // z16Kept: EF2_Z16's trunk pair, kept on the device through the sampler (ef2.cu, where there was the room) - the
+  // head builds its own pair over it in place; null where it is parked in PARK_HOST
   int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
   size_t P = (size_t)T * T;
   float* s = scratch<float>("cf.s", (size_t)T * Si);
@@ -128,15 +152,83 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   // the residual on the host was 1.17 s of a 1,044-token fold on a 40 GB A100 - a 1.1 GB pinned allocation
   // and a copy each way - with 30 GB free; LOCALFOLD_BIG=1 still takes the parked form)
   bool tight = shortPair(P, C) && !roomFor(2 * P * C * 4), inPlace = consume && tight;
-  float* z = inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
-  layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
   gemm(s, F("confidence/sToZ"), r, T, Si, C);
   gemm(s, F("confidence/sToZTranspose"), c, T, Si, C);
   gemm(s, F("confidence/sToZProdIn1"), l, T, Si, C);
   gemm(s, F("confidence/sToZProdIn2"), rr, T, Si, C);
-  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, T, C);
+  // EF2_Z16 (zTrunk null: the trunk's bf16 pair parked in PARK_HOST): the head's pair built a chunk of token rows at
+  // a time - normalised, its single and distance terms added, the sum kept (bf16) as the residual -
+  // into a bf16 stack its blocks run on in place; then a chunk at a time again, the residual added back, the pooling
+  // score, the row pooling and the PAE logits taken off the f32 rows. One bf16 pair on the card where the f32 head
+  // held one f32 pair beside the blocks' (the head was the next limit: 30 GB at 5,434 tokens)
+  float* pooled16 = nullptr; float* paeL16 = nullptr;
+  int pb = (int)dimOf("f/confidence/pae", 1);
+  if (!zTrunk) {
+    if (!consume) { fprintf(stderr, "a parked bf16 trunk pair is read by the last confidence call only\n"); exit(1); }
+    using B16 = __nv_bfloat16;
+    const int rb = (int)std::max<size_t>(1, ((size_t)64 << 20) / ((size_t)T * C * 4));   // token rows a chunk
+    const size_t per = (size_t)rb * T;
+    // the trunk's pair on the device (z16Kept) - the stack built over it in place, a chunk read before it is
+    // written - or parked; the residual is the stack as its blocks take it (bf16), kept on the device beside a kept
+    // pair, else in the parked pair's own pinned buffer once read (an f32 residual pinned of its own was 6.3 s of a
+    // 2,964-token fold on 40 GB, 9 GB of pinning)
+    const bool kept = z16Kept != nullptr;
+    B16* stack = kept ? z16Kept : dallocT<B16>(P * C);
+    float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
+    float* prodc = scratch<float>("cf.prodc", per * C); B16* stage = scratch<B16>("cf.z16", per * C);
+    for (size_t p0 = 0; p0 < P; p0 += per) {
+      size_t n = std::min(per, P - p0);
+      const B16* src = stack + p0 * C;
+      if (!kept) { CK(cudaMemcpyAsync(stage, reinterpret_cast<const B16*>(PARK_HOST) + p0 * C, n * C * 2, cudaMemcpyHostToDevice, STREAM)); src = stage; }
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(src, xn, n * C);
+      layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
+      outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
+      gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
+      distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
+        (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), p0, n, T, C);
+      ef2ToBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zc, stack + p0 * C, n * C);
+    }
+    releaseScratch({ "cf.zc", "cf.xn", "cf.prodc", "cf.z16" });
+    B16* resid = kept ? dallocT<B16>(P * C) : reinterpret_cast<B16*>(PARK_HOST);
+    CK(cudaMemcpyAsync(resid, stack, P * C * 2, cudaMemcpyDefault, STREAM));
+    float* mask = scratch<float>("trunk.mask", P);
+    fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
+    PAIR16 = true;
+    for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
+      trunkBlock(reinterpret_cast<float*>(stack), mask, T, C, "confidence/blocks", b);
+    PAIR16 = false;
+    releaseScratch({ "ftri.", "ftr.", "trib." });
+    pooled16 = scratch<float>("cf.pooled", (size_t)T * C);
+    paeL16 = scratch<float>("cf.pae", P * pb);
+    zc = scratch<float>("cf.zc", per * C); xn = scratch<float>("cf.xn", per * C);
+    float* score = scratch<float>("cf.scoreRows", per);
+    B16* rh = kept ? nullptr : scratch<B16>("cf.residRows", per * C);
+    for (size_t p0 = 0; p0 < P; p0 += per) {
+      size_t n = std::min(per, P - p0);
+      const B16* rs = resid + p0 * C;
+      if (rh) { CK(cudaMemcpyAsync(rh, rs, n * C * 2, cudaMemcpyHostToDevice, STREAM)); rs = rh; }
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(rs, xn, n * C);
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(stack + p0 * C, zc, n * C);
+      addK<<<blocks(n * C), 256, 0, STREAM>>>(zc, xn, n * C);
+      gemm(zc, F("confidence/poolingAttention"), score, n, C, 1);
+      rowPoolK<<<(unsigned)(n / T), 256, 0, STREAM>>>(zc, score, pooled16 + (p0 / T) * C, T, C);
+      if (M.has("f/confidence/paeNorm/scale")) {
+        layerNorm(zc, xn, n, C, F("confidence/paeNorm/scale"), F("confidence/paeNorm/offset"));
+        gemm(xn, F("confidence/pae"), paeL16 + p0 * pb, n, C, pb);
+      } else gemm(zc, F("confidence/pae"), paeL16 + p0 * pb, n, C, pb);
+    }
+    CK(cudaStreamSynchronize(STREAM));
+    if (kept) CK(cudaFree(resid));              // (a kept pair is the caller's, freed with z)
+    else CK(cudaFree(stack));
+    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.residRows" });
+  }
+  float* z = !zTrunk ? nullptr : inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
+  if (zTrunk) {
+  layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, T, C);
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   float* prod = scratch<float>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
@@ -176,11 +268,15 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     addK<<<blocks(P * C), 256, 0, STREAM>>>(z, stack, P * C);
     CK(cudaFree(stack));
   }
+  }
   // single by row-attention pooling
-  float* score = scratch<float>("cf.score", P);
-  gemm(z, F("confidence/poolingAttention"), score, P, C, 1);
-  float* pooled = scratch<float>("cf.pooled", (size_t)T * C); float* single = scratch<float>("cf.single", (size_t)T * Cs);
-  rowPoolK<<<T, 256, 0, STREAM>>>(z, score, pooled, T, C);
+  float* pooled = pooled16 ? pooled16 : scratch<float>("cf.pooled", (size_t)T * C);
+  float* single = scratch<float>("cf.single", (size_t)T * Cs);
+  if (!pooled16) {
+    float* score = scratch<float>("cf.score", P);
+    gemm(z, F("confidence/poolingAttention"), score, P, C, 1);
+    rowPoolK<<<T, 256, 0, STREAM>>>(z, score, pooled, T, C);
+  }
   gemm(pooled, F("confidence/poolingOutput"), single, T, C, Cs);
   // pLDDT per atom (a table a slot: the atom's position within its token, clamped)
   int bins = (int)dimOf("f/confidence/plddtWeight", 2), slots = (int)dimOf("f/confidence/plddtWeight", 0);
@@ -193,9 +289,9 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   layerNorm(sa, sa, A, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
   plddtAtomK<<<A, 64, 0, STREAM>>>(sa, dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
   // PAE logits
-  int pb = (int)dimOf("f/confidence/pae", 1);
-  float* paeL = scratch<float>("cf.pae", P * pb);
-  if (M.has("f/confidence/paeNorm/scale")) {
+  float* paeL = paeL16 ? paeL16 : scratch<float>("cf.pae", P * pb);
+  if (paeL16) {}
+  else if (M.has("f/confidence/paeNorm/scale")) {
     // the released heads LayerNorm the pair in front of the PAE projection (pae_ln); a chunk of rows at a time
     size_t per = std::max<size_t>(1, std::min(P, ((size_t)64 << 20) / (4 * (size_t)C)));
     float* zn = scratch<float>("cf.paeIn", per * C);
@@ -238,7 +334,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     checkOracle("confidence PAE logits", paeL, P * pb, "o/conf/pae_logits");
     if (M.has("o/conf/ptm")) printf("  pTM %.6f against the oracle's %.6f\n", out.ptm, M.f("o/conf/ptm")[0]);
   }
-  if (!inPlace) CK(cudaFree(z));
+  if (z && !inPlace) CK(cudaFree(z));
   CK(cudaFree(dSlot));
   return out;
 }

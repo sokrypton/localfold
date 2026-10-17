@@ -1,0 +1,6 @@
+weights*/
+data*/
+*.o
+/localfold-msap
+localfold-msap.arch
+localfold-msap.building

@@ -47,6 +47,11 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       maxSequences: options.maxSequences,
       // an alignment over nucleic chains too: each column's alphabet (see af3MsaFromA3m)
       ...(options.msaColumnKinds === undefined ? {} : { columnKinds: options.msaColumnKinds }),
+      // openbind0's main-MSA cap (msa-features.js capMainMsa), each column's chain from the polymer chains' lengths
+      ...(options.mainMsaCap === undefined || options.mainMsaCap === null ? {} : {
+        mainMsaCap: options.mainMsaCap,
+        chainOfColumn: sequence.split(":").flatMap((chain, index) => Array(chain.length).fill(index)),
+      }),
       // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
       // seed names. AF3 draws its shuffle from the same key that drives the
       // rest of the model; here two seeds are two alignments as well as two
@@ -68,6 +73,12 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // reference conformers centred per ref_space_uid. See featurise.js.
     ...(options.centreRefConformers === undefined
       ? {} : { centreRefConformers: options.centreRefConformers }),
+    ...(options.rawLastConformer === undefined
+      ? {} : { rawLastConformer: options.rawLastConformer }),
+    ...(options.declaredPolymerBonds === undefined
+      ? {} : { declaredPolymerBonds: options.declaredPolymerBonds }),
+    ...(options.ccdUnknownResidue === undefined
+      ? {} : { ccdUnknownResidue: options.ccdUnknownResidue }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

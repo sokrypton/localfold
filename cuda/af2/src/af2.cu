@@ -34,32 +34,9 @@ static std::vector<float> expectation(const std::vector<float>& logits, size_t r
   }
   return out;
 }
-// AF2's predicted TM-score from the PAE logits (confidence.compute_tm over every residue)
-static float predictedTm(const std::vector<float>& logits, int L, int bins, const std::vector<int>* asym, bool interface) {
-  float maxBin = 31.f, step = maxBin / (bins - 2);
-  std::vector<float> centres(bins);
-  for (int b = 0; b < bins - 1; ++b) centres[b] = b * step + step / 2;
-  centres[bins - 1] = centres[bins - 2] + step;
-  float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
-  float best = 0;
-  for (int i = 0; i < L; ++i) {
-    double sum = 0; double count = 0;
-    for (int j = 0; j < L; ++j) {
-      if (interface && asym && (*asym)[i] == (*asym)[j]) continue;
-      const float* l = logits.data() + ((size_t)i * L + j) * bins;
-      float mx = -INFINITY; for (int b = 0; b < bins; ++b) mx = std::max(mx, l[b]);
-      double s = 0, e = 0;
-      for (int b = 0; b < bins; ++b) { double p = std::exp(l[b] - mx); s += p; e += p / (1 + (centres[b] / d0) * (centres[b] / d0)); }
-      sum += e / s; count += 1;
-    }
-    if (count > 0) best = std::max(best, (float)(sum / (count + 1e-8)));
-  }
-  return best;
-}
-
-// The same three reductions on the device, one thread a pair (each was a host pass over pairs x 64 logits with an exp
+// AF2's three per-pair reductions on the device, one thread a pair (each was a host pass over pairs x 64 logits with an exp
 // per bin - with the logits' two 17 MB downloads, most of the 218 ms between a 261-residue fold's last pass and its
-// result): the PAE expectation and the pair's TM term (predictedTm's, before its row means), and the distogram's
+// result): the PAE expectation and the pair's TM term (confidence.compute_tm's, before its row means), and the distogram's
 // P(< 8 A). Double accumulation in the host's bin order; the exp is the device's.
 __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
   size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,7 +60,7 @@ __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
   for (int b = 0; b < 64; ++b) { double e = expf(l[b] - mx); s += e; if (b <= 18) near += e; }
   out[r] = (float)(near / s);
 }
-// predictedTm from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
+// the predicted TM-score from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
 static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
   float best = 0;
   for (int i = 0; i < L; ++i) {
@@ -135,7 +112,7 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
 }
 // AlphaFold 3's confidence files beside the PDB, as cuda/af3 writes them (sampler.cuh) and the page's
 // archive reads them: <stem>_confidences.json - atom_plddts in the PDB's atom order, the expected PAE
-// (AF2's 64 bins, centres as predictedTm's), contact_probs = P(Cb distance < 8 A) from the distogram
+// (AF2's 64 bins, centres as paeTmPairsK's), contact_probs = P(Cb distance < 8 A) from the distogram
 // where the weights carry its head (the page's multimer bundle does not), the token layout - and
 // <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT)
 static inline std::vector<float> contactsChunked(const float* pair, int L);   // (below)
@@ -351,6 +328,19 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
     if (check) checkOracle("extra stack pair", t.pair, pairs * 128, "o/extra/pair");
     mark("extra stack"); memReport("extra stack");
+    // the main stack's MSA in bf16 through its blocks (MSA16, evoformer.cuh)
+    {
+      static const int major = ccMajor();
+      std::string q = "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w";
+      std::string qc = "evoformer/evoformer_iteration/msa_column_attention/attention/query_w";
+      MSA16 = FAST && !check && t.msaOnes && major >= 8 && !flashRegStaged() && !getenv("LOCALFOLD_MSA_F32") &&
+              dimW(q, 2) * dimW(q, 3) == 256 && dimW(q, 3) == 32 && dimW(qc, 3) == 32;
+      if (MSA16) {
+        size_t n16 = (size_t)(t.N + t.T) * L * 256;
+        t.msa16 = reinterpret_cast<float*>(scratch<__nv_bfloat16>("msa16", n16));
+        toBf16FK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
+      }
+    }
     for (int b = 0; b < mainBlocks; ++b) {
       if (b == 1) mark("evoformer 0");
       if (b == 2) mark("evoformer 1");
@@ -359,6 +349,11 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         checkOracle("evoformer block 0 msa", t.msa, (size_t)t.N * L * 256, "o/evo1/msa");
         checkOracle("evoformer block 0 pair", t.pair, pairs * 128, "o/evo1/pair");
       }
+    }
+    if (MSA16) {
+      size_t n16 = (size_t)(t.N + t.T) * L * 256;
+      pairBf16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
+      MSA16 = false; t.msa16 = nullptr;
     }
     // a bf16 pair converted once into the recycled pair, which every reader after the stacks takes
     if (AF2_P16) pairBf16ToF32K<<<blocks(pairs * 128), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), prevPair, pairs * 128);
@@ -591,21 +586,15 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   bool chains = false; for (int i = 1; i < L; ++i) chains |= asym[i] != asym[0];
   std::vector<float> pae;          // the expected PAE a pair
   float ptm, iptm;
-  if (AF2_TIGHT) {                 // (the last pass's pair, its logits a chunk at a time to the host)
-    std::vector<float> lg(pairs * 64);
-    paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
-      CK(cudaMemcpy(lg.data() + r0 * 64, chunk, r * 64 * 4, cudaMemcpyDeviceToHost));
-    });
-    ptm = predictedTm(lg, L, 64, &asym, false);
-    iptm = chains ? predictedTm(lg, L, 64, &asym, true) : NAN;
-    std::vector<float> centres(64);
-    for (int b = 0; b < 63; ++b) centres[b] = b * (31.f / 62) + 31.f / 124;
-    centres[63] = centres[62] + 31.f / 62;
-    pae = expectation(lg, pairs, 64, centres);
-  } else {
+  {
     float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
     float* pe = scratch<float>("head.paeE", pairs); double* tt = scratch<double>("head.tmT", pairs);
-    paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+    // (on a card short of room the last pass's logits a chunk at a time, each chunk's terms on the device too: they went
+    // to the host whole and were softmaxed there, 4.9 s of 9GOC's 1,702-residue fold)
+    if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
+      paeTmPairsK<<<blocks(r), 256, 0, STREAM>>>(chunk, r, d0, pe + r0, tt + r0);
+    });
+    else paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
     pae = download(pe, pairs);
     std::vector<double> tm(pairs);
     CK(cudaMemcpy(tm.data(), tt, pairs * 8, cudaMemcpyDeviceToHost));
@@ -685,8 +674,32 @@ static int foldMain(int argc, char** argv) {
       return lf::weights::af2WeightLines(manifest, S, deltaModel);
     }, deltaDir);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
+  // short of room (shortPair) as AF3 decides it from Ampere on: when 18x the f32 pair does not fit the room this process
+  // had at its first ask, where a 64th of the card sent a fold to the f32 pair and its blocked forms from ~1,700 residues
+  // with the RTX PRO 6000 two-thirds empty - there 2,000 / 2,500 residues at 508 + 5,120 rows 25.8 / 41.6 -> 24.7 / 39.8 s
+  // (peak 25.8 -> 26.4 and 32.5 -> 33.8 GB); on the A100 1,500 / 1,800 26.70 / 39.95 -> 26.19 / 39.09 s, 2,000 level (18x
+  // past its room either way). The ordinary paths' peak measured 13.7x the f32 pair (22.8 GB at 1,800 with 5,120 extra
+  // rows). A T4 keeps the 64th: its unfused kernels hold more, unmeasured under this rule
+  if (ccMajor() >= 8) SHORT_PAIR_TIMES = 18;
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;
+  // --fast (every fold the standalone and the worker run): the modules' large scratch shared between them (af3/src/
+  // common.cuh, SHARED SCRATCH), proved by scribbled folds bit-identical to the unshared build - 2,000 residues, a
+  // 1,000:1,000 multimer, a 1,462-residue monomer and a 1,762-residue multimer with templates, and the shorter arms.
+  // A family live around another's turns never shares with it, each pair a fold that moved: the template stacks (tmpl.,
+  // mtmpl.) around everything their blocks run, the heads around the structure module's, row and column attention and
+  // the attention bias around the attention kernel's. (The MSA masks, written once at the embedding and read by every
+  // block, are mask.* and not shared.) The reference path (no --fast) shares nothing: unproved
+  if (FAST) {
+    SHARED_FAMILIES = { "sm.", "ftri.", "emb.", "tri.", "head.", "fatt.", "opm.", "gcol.", "fopm.", "tmpl.", "tatt.", "row.", "att.",
+                        "fbias.", "col.", "mtmpl.", "tr.", "trib.", "ftatt.", "trow.", "fcol.", "fa.", "ftr.", "frow.", "p16." };
+    for (const char* outer : { "tmpl.", "mtmpl." })
+      for (const char* inner : { "tatt.", "p16.", "fatt.", "ftri.", "fbias.", "ftatt.", "ftr." }) SHARED_NESTED.push_back({ outer, inner });
+    for (auto& p : std::vector<std::pair<std::string, std::string>>{ { "head.", "sm." }, { "fcol.", "fatt." }, { "frow.", "fatt." },
+                                                                       { "fbias.", "fatt." }, { "frow.", "fbias." }, { "ftatt.", "fatt." },
+                                                                       { "tatt.", "ftatt." }, { "ftatt.", "fbias." } })
+      SHARED_NESTED.push_back(p);
+  }
   CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
   M.upload(0);
   if (const char* dump = getenv("AF2_DUMP_WEIGHT")) {      // name:path - one weight as the device holds it

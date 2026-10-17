@@ -307,6 +307,31 @@ What made them pay, each measured:
   channel-major product tile and normalises them on the way, so there is no f16 row buffer.
 - **Shared memory recycled.** The weight stages reuse the memory of rows already loaded into
   registers, so two blocks fit an SM: `triIn256K` 110 → 89 ms.
+- **The diffusion conditioning streamed past the card (2026-10-09).** 3,952 tokens folded its trunk (153 s) and ran
+  out preparing the diffusion: the conditioning pair was built whole in f32 (16 GB at that size) before each token
+  block's bias was projected from it. Every step there is row-wise - [z | rel_pos], its norm, the projection, the
+  two transitions, each block's norm and bias projection - so where the pair and the biases do not fit (`roomFor`,
+  or `LOCALFOLD_BIG=1`) each chunk of rows goes through all of them and into every block's bias at once. **3,952
+  tokens folds** (183 s, pLDDT 64.5, 27.3 GB at the preparation); every input that fitted before takes the old path,
+  byte-identical (and at 6MRR and 5CAJ the streamed one is too: one chunk). The next limit is the recycle's own
+  state - `z`, the injection and the language model's pair are 256-channel f32 pairs (25 GB each at 4,940) - so
+  ESMFold2 stops near 4,000 tokens on 40 GB, where the AlphaFold 3 lineage now folds 7,900.
+- 🔴 **The trunk's pair bf16 on a card short of room (2026-10-11, `EF2_Z16`): 5,434 tokens fold on 40 GB (4,446
+  before; 4,940 ran out in the trunk's triangle).** Where z_init streams and every block takes the fused bf16 forms, z
+  is held bf16 from the recycle on - the recycle's arithmetic f32 a chunk of rows at a time, the blocks in place
+  (the roomy path already ran them on a bf16 copy) - read bf16 by the chunked distogram and the denoiser's
+  conditioning, parked in host memory through the sampler, and taken by the confidence head a chunk of token rows at
+  a time into a bf16 stack its blocks run on (the f32 residual in pinned host memory, the pooling and the PAE logits
+  off f32 rows). 4,940 tokens: trunk 114 s, the stages 18.2 / 15.1 / 16.2 / 11.0 GB; 5,434: trunk 155 s, 20.9 GB at
+  the trunk's end. 5CAJ with the short-of-room paths forced is 0.016 A from the f32 short path and 0.015 from the
+  roomy one (those two are 0.023 apart); the bf16 head alone moves PAE 0.09 and pLDDT 0.04 at most. Next: 5,928 runs
+  out in the trunk's triangle, its fixed operand (18 GB, bf16) beside the pair; `LOCALFOLD_PAIR_F32=1` keeps f32.
+- **Two blocks an SM again (2026-10-08).** `transitionUpK` was written for two 67.6 KB blocks an SM, and the
+  wave-sized chunking assumes it - but it had grown to 160 registers, so the REGISTERS held it to one
+  (Nsight Compute: occupancy 12.5%, the tensor pipe 48%), and nothing said so. `__launch_bounds__(256, 2)`
+  holds it to 128 with no spills: **680 → 603 ms of a 988-token fold**, 168 → 148 at 494, 46.0 → 41.9 at
+  261, byte-identical - and protenix2's (the same kernel through cuda/af3) 1,510 → 1,318, 373 → 323 and
+  99.5 → 90.5. The 16-column form, which needs fewer registers, was slower either way (712-724).
 - **Two row tiles a warp (2026-10-08).** Nsight Compute had `triIn256K` bound on shared memory at 988
   tokens (the shared wavefronts 68% of peak, the tensor pipe 57%), because each weight fragment it reads
   fed one warp's 16 rows. Four warps of two 16-row tiles - the same 128 rows, shared memory and grid -
@@ -493,3 +518,26 @@ arithmetic, byte-identical (contacts identical at 600). **A simulated T4 now fol
 30 s, CA-CA median 3.793, none out of band). At 2,400 the trunk finishes and the diffusion conditioning's own
 256-channel pair (5.9 GB, `dc.pair`) is the next holder - it would want AF3's streamed conditioning, which was
 not ported; at 2,800 the triangle's fixed operand (4 GB) no longer fits.
+
+**On several GPUs (`--gpus=N`, mgtrunk.cuh) 16,549 tokens fold on 8 x 40 GB** - AlphaFold 3's length there (simulated:
+one rank of 8, `LOCALFOLD_MG_SIMULATE=1`; trunk 372 s, the confidence head 26 s). Each rank holds two 17.65 GB shares of
+the 256-channel bf16 pair (its rows of z, and the triangle's product), so everything else had to come out of 6.8 GB:
+`token_bonds` stays on the host (`Model::hostOnly`; the kernels read each row's bonded columns, `Bonds` - its dense
+[T, T] was 1.1 GB a GPU, and a fold reading it so is byte-identical), the triangle's mask of ones is never made
+(1.1 GB), the ESM-C tower's matrices leave the device once the language model has run (1.15 GB), the sharded
+triangle's windows and gate chunks go to C / 32 where every rank is short at C / 16 (the 1TIM dimer on 2 ranks
+0.000 A either way), and the sampler's gathered attention rows are given back
+before the head (alone, they held a 1 GB shared segment). It was 14,820 before. Splitting the product share by rows
+does not work: a pass's output updates its rows of z, and every later pass's operands are read from all of z. The
+triangle's rounds (its operands a window of channels at a time, the input pass repeated each window) are taken only
+where the whole form's own buffers do not fit on every rank - asked of the ranks, once a shape; `shortPair`'s rule
+had them on with 30 GB to spare, where the repeated input pass was 41% of a rank's GPU time: a simulated rank of 8's
+trunk at 4,940 tokens 19.65 -> 13.33 s (the one-GPU fold's is 114.6 s), at 9,880 97.0 -> 72.9 s. Where rounds are taken, their
+input pass is a window's rows read whole for 8 of 256 channels - 32 times a triangle at C / 32, 160 of the 417 s
+trunk at 16,549 tokens (nsys) at 0.71 TB/s: a window takes the plain 8-warp form where the whole pass takes the
+two-tile one, and `lnRowsToShared` reads a bf16 row 16 bytes a lane - 24.9 -> ~18 ms a window there, the trunk
+417 -> 372 s (the LayerNorm's sums in another order: the 1TIM dimer on 2 ranks 1.520 -> 1.526 A from its crystal,
+rounds and the whole form alike). The confidence head pins nothing of its own: its residual is the bf16 rows its
+blocks take, kept on the device where the trunk's share stayed through the sampler (every rank with 5 shares and an
+eighth of the card spare), else in the share's pinned host buffer - the head 3.3 -> 0.9 s at 4,940 tokens, 14.4 ->
+5.6 at 9,880, 52.7 -> 26 at 16,549, and 35 GB less pinned host memory a rank there.

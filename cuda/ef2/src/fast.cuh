@@ -78,12 +78,64 @@ inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t ro
 }
 
 // (the same at a width known at compile time: layerNormVK, elementwise.cuh)
+// any width, a warp a row (MSA Pairformer's 464-wide MSA track, which no vector width divides)
+__global__ void layerNormAnyHK(const float* x, half* y, size_t rows, int C, const float* sc, const float* of) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / C + 1e-5f);
+  for (int c = lane; c < C; c += 32) y[row * C + c] = __float2half((xr[c] - mean) * inv * sc[c] + of[c]);
+}
+// any width that is a multiple of 4 up to 512, a warp a row held in registers (float4s, read once): the generic form
+// above reads the row three times, 335 ms at MSA Pairformer's 464 channels and 2,048 x 1,023 rows
+template <int C>
+__global__ void layerNormRegHK(const float* __restrict__ x, half* __restrict__ y, size_t rows, const float* __restrict__ sc,
+                               const float* __restrict__ of) {
+  constexpr int V = C / 4, STEPS = (V + 31) / 32;
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float4* xr = reinterpret_cast<const float4*>(x + row * C);
+  float4 v[STEPS]; float s = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int q = k * 32 + lane;
+    v[k] = q < V ? xr[q] : make_float4(0, 0, 0, 0);
+    s += v[k].x + v[k].y + v[k].z + v[k].w;
+  }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  const float mean = s / C; float q2 = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) if (k * 32 + lane < V) {
+    float a = v[k].x - mean, b = v[k].y - mean, c = v[k].z - mean, d = v[k].w - mean; q2 += a * a + b * b + c * c + d * d;
+  }
+  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
+  const float inv = rsqrtf(q2 / C + 1e-5f);
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int q = k * 32 + lane;
+    if (q >= V) continue;
+    float4 g = reinterpret_cast<const float4*>(sc)[q], o = reinterpret_cast<const float4*>(of)[q];
+    __half2 lo = __floats2half2_rn((v[k].x - mean) * inv * g.x + o.x, (v[k].y - mean) * inv * g.y + o.y);
+    __half2 hi = __floats2half2_rn((v[k].z - mean) * inv * g.z + o.z, (v[k].w - mean) * inv * g.w + o.w);
+    uint2 out; out.x = *reinterpret_cast<uint32_t*>(&lo); out.y = *reinterpret_cast<uint32_t*>(&hi);
+    reinterpret_cast<uint2*>(y + row * C)[q] = out;
+  }
+}
 // LayerNorm f32 -> f16, by pointers (scale/offset f32)
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const float* sc, const float* of) {
   unsigned grid = (unsigned)((rows + 7) / 8);
   if (C == 128) layerNormVK<128><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
-  else { fprintf(stderr, "layerNormH: no %d-wide kernel\n", C); exit(1); }
+  else if (C == 464) layerNormRegHK<464><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else layerNormAnyHK<<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 // a folding-bundle tensor's f16 copy (the file's half mirror)
 inline const half* Fh(const std::string& name) { return Wh("f/" + name); }
@@ -135,14 +187,7 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
   ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  // the pad, written once for a buffer and a padded size (nothing else writes it - but a buffer reused at
-  // another size has data where this layout's pad is)
-  // (and a buffer given back and asked for again can return at the same address with another stage's data in it)
-  static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
-  if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
-    CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-    zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
-  }
+  zeroPlanePad(a, L, Lp, C); zeroPlanePad(b, L, Lp, C);   // (the pad: at every use, common.cuh)
   triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
   float* prod = scratch<float>("ftri.prod", plane * C);
   const float one = 1.f, zero = 0.f;
@@ -166,6 +211,26 @@ __global__ void swigluHK(const half* h, half* g, size_t rows, int I) {
   float x = __half2float(h[r * 2 * I + c]);
   g[t] = __float2half(x / (1.f + __expf(-x)) * __half2float(h[r * 2 * I + I + c]));
 }
+// the same, eight elements a thread in 16-byte loads and stores (I a multiple of 8), a row's index from a 32-bit
+// division: the one above runs at half the memory's bandwidth (MSA Pairformer's 464-wide MSA, 1,040 columns:
+// 211 ms of a 1.97 s pass). Each element's arithmetic is the one above's, so the output is the same bytes
+__global__ void swigluH8K(const half* __restrict__ h, half* __restrict__ g, unsigned rows, unsigned I8) {
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * I8) return;
+  unsigned r = t / I8, c = t - r * I8;
+  uint4 xv = reinterpret_cast<const uint4*>(h)[(size_t)r * 2 * I8 + c];
+  uint4 yv = reinterpret_cast<const uint4*>(h)[(size_t)r * 2 * I8 + I8 + c];
+  const half *xs = reinterpret_cast<const half*>(&xv), *ys = reinterpret_cast<const half*>(&yv);
+  uint4 ov; half* os = reinterpret_cast<half*>(&ov);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) { float x = __half2float(xs[e]); os[e] = __float2half(x / (1.f + __expf(-x)) * __half2float(ys[e])); }
+  reinterpret_cast<uint4*>(g)[t] = ov;
+}
+inline void swigluH(const half* h, half* g, size_t rows, int I) {
+  if (I % 8 == 0 && rows * (I / 8) < (1ull << 31))
+    swigluH8K<<<blocks(rows * (I / 8)), 256, 0, STREAM>>>(h, g, (unsigned)rows, (unsigned)(I / 8));
+  else swigluHK<<<blocks(rows * I), 256, 0, STREAM>>>(h, g, rows, I);
+}
 inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
   size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (3 * (size_t)I));
@@ -180,7 +245,7 @@ inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) 
     size_t r = std::min(chunk, P - r0);
     if (chunked) layerNormH(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
     ltGemm(xn + (chunked ? 0 : r0 * C), Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
-    swigluHK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
+    swigluH(h, g, r, I);
     ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }
 }

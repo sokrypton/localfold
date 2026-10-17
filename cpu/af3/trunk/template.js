@@ -289,10 +289,17 @@ export function templateEmbedding(input, weights, dialect) {
     // The first EMPTY slot, not slot zero: with a real template in slot 0 the
     // featuriser's "one empty template" is the first unoccupied one.
     const firstEmpty = slots.filter(Boolean).length;
-    const emptyCode = gap !== null && slot === firstEmpty ? gap : 0;
+    // (openbind0: every empty slot GAP, and a real template's tokens without atoms - templateGapWhereNoAtoms)
+    const gapWhereNoAtoms = dialect?.templateGapWhereNoAtoms === true;
+    const emptyCode = gapWhereNoAtoms ? 21 : gap !== null && slot === firstEmpty ? gap : 0;
+    const dense = template ? template.atomMask.length / tokens : 0;
+    const uncovered = (token) => {
+      for (let a = 0; a < dense; a += 1) if (template.atomMask[token * dense + a] > 0) return false;
+      return true;
+    };
     const oneHot = new Float32Array(tokens * RESTYPES);
     for (let token = 0; token < tokens; token += 1) {
-      const code = template ? template.aatype[token] : emptyCode;
+      const code = template ? (gapWhereNoAtoms && uncovered(token) ? 21 : template.aatype[token]) : emptyCode;
       if (code >= 0 && code < RESTYPES) oneHot[token * RESTYPES + code] = 1;
     }
     const row = linear(oneHot, tokens, RESTYPES, CHANNELS,

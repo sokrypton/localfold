@@ -210,8 +210,8 @@ Every intermediate seam is 1e-8 to 5e-7 in float32 (the monomer template's torsi
 
 - f16 tensor-core GEMMs through cuBLASLt, with bias and ReLU in the epilogue and residual adds as
   beta.
-- cuda/af3's flash attention for every 16- and 32-wide head; the extra stack's 8-wide heads are
-  padded to 16.
+- cuda/af3's flash attention for every 16- and 32-wide head. The extra stack's 8-wide heads run unpadded on
+  the kernel's D 8 form where it applies (unmasked, from Ampere on), and are padded to 16 elsewhere.
 - q/k/v/gate as one GEMM straight into the flash layout.
 - A strided copy of the kernel, so column attention and the ending node read their tensor where it
   lies and write into the residual's layout, with no transposes.
@@ -276,6 +276,101 @@ both fold 6MRR and 5CAJ to within 0.02 A of each other against the crystal.
 its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: done` and closes stdout,
 so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
 rather than mapped (cuda/af3's loader).
+
+### The deep outer product mean: FP8, and its output read in place (2026-10-15)
+
+The deep form (more rows than `OPM_SHALLOW`) contracts the rows into a product laid out `[i][a][j][b]` (f16, scaled by
+2^-k), and used to permute it to `[i][j][a][b]`, project it to an f32 Y and add Y into the pair (`opmAddK`). From Ampere
+on, `opmOutK` reads the product where it lies instead: cuda/af3's 128 x 128 tensor-core main loop (`tgMain`, given a row
+stride of 32 and a chunk stride of L * 32, so that each 32-wide k chunk is one `a`) and an epilogue that adds
+(bias + 2^k y) / (1e-3 + norm) into the pair. No permuted copy, no f32 Y, no `opmAddK`. A T4 keeps cuBLAS and the permute.
+
+On a card with FP8 tensor instructions (`fp8Tensor`: compute capability 8.9 on; `LOCALFOLD_FP8=0` keeps f16) the
+contraction itself is e4m3. Both projections are transposed to `[L*32][rows]` and padded to 16 rows (`opmToF8K`), and
+cuBLASLt's TN FP8 GEMM writes the f16 product.
+
+At 508 clusters, 5,120 extra rows and 4 passes, interleaved, two rounds each (fold time):
+
+| | 600 res | 1,000 res | 1,500 res | 2,500 res |
+|---|---:|---:|---:|---:|
+| RTX PRO 6000 (Colab G4), f16 + permute | 3.47 s | 8.00 s | 17.16 s | 54.14 s |
+| RTX PRO 6000, FP8 + permute | 3.30 s | 7.60 s | 16.31 s | 51.63 s |
+| RTX PRO 6000, FP8 + read in place | **3.08 s** | **7.05 s** | **15.16 s** | **47.85 s** |
+| A100, permute | 5.26 s | 12.91 s | 25.15 s | |
+| A100, read in place | **5.01 s** | **12.23 s** | **23.50 s** | |
+
+At 1,000 residues on the A100, `opmOutK` is 549 ms of the fold where the permute alone was 605. On the G4 it is 296 ms,
+and the FP8 contraction is 710 ms where the f16 one was 1,077.
+
+Drift against the f16 + permute build: 5CAJ (7,907-row alignment) 0.016-0.018 A, 1TIM (16,469 rows) 0.013-0.014 A, pLDDT
+and pTM unchanged to 0.02 and 0.0002. On the A100 the kernel alone moves 5CAJ 0.011 A (a different summation order). The
+operands rounded through e4m3 on the A100 (which has no FP8) move it 0.010-0.012 A, so that is the e4m3 rounding and
+not the GEMM. The L4 (sm_89) takes the same path and the same cuBLASLt kernels (`sm89_xmma_gemm_e4m3...`), but it was
+not run.
+
+**Tried and not taken: the FP8 GEMM into bf16.** Asked for an f16 product, cuBLASLt picks a 64 x 128 tile, and for a
+bf16 one 128 x 128, which is 708 -> 652 ms of the contraction at 1,000 residues on the G4. `opmOutK` then reads bf16
+(a bf16 MMA in `tgMain`, the output weights rounded to bf16). The folds: 3.02 / 6.89 / 14.85 / 47.14 s (f16) against
+3.02 / 6.85 / 14.78 / 47.24 s (bf16) at 600 / 1,000 / 1,500 / 2,500 residues, so 0.6% at best and slower at 2,500. The
+fold moves 0.016-0.027 A (5CAJ, 1TIM) where the f16 product reproduces the shipped build exactly.
+
+**Emulated and not taken: the MSA stack's GEMMs in FP8.** The main MSA's q/k/v/gate projections (~527 ms of a
+1,000-residue fold on the G4) and its transition's first layer (~388 ms) could take e4m3 operands (the LayerNorm
+writing e4m3, the weights at a power-of-two scale, the output f16/bf16). Emulated on the A100 by rounding exactly those
+operands through e4m3: 5CAJ and 1TIM with their alignments move 0.025 / 0.015 A, but from a single sequence 6MRR moves
+0.044 A and 1QYS 0.039 against 0.014 for TF32 off (`AF2_NO_TF32`), and 5CAJ (pLDDT 31, undetermined) 2.44 A against
+0.36. Each half alone is already past TF32: the transition 0.021-0.026 A, the projections 0.020-0.036 A. The OPM's FP8
+never reaches a single-sequence fold (one row takes the shallow form); these GEMMs would.
+
+**Tried and lost:** an FP8 GEMM batched over i with m = 32, writing `[i][j][b][a]` straight into the output GEMM's
+input with the output weights' rows swapped once. It took 3.43 / 8.24 / 20.10 s on the G4, against 3.30 / 7.59 / 16.27 s
+for the permute, at 600 / 1,000 / 1,500 residues: the 32-wide tile wastes most of the tensor core.
+
+### The extra stack's 8-wide heads, unpadded (2026-10-15)
+
+The extra MSA stack's row attention has 8 heads 8 wide, and was padded to 16: the q/k/v/gate projection wrote 512
+columns where 256 carry anything, and the flash kernel ran 16-wide MMAs over zeros. `flashGrid2R` now has a D 8 form:
+m16n8k8 MMAs for Q K^T, one n8 tile for P V, unpadded 16-byte K and V rows (eight to a conflict-free 128 bytes), and
+the 32-wide form's geometry and speculative softmax. It takes the call where the attention is unmasked and cp.async
+double-buffers (`flashNarrow`), so `attnWeights` leaves those heads unpadded there. A masked extra stack and a T4 keep
+the padded heads.
+
+At 1,000 residues and 5,120 extra rows the kernel is 704 -> 532 ms on the A100 and 393 -> 291 on the G4. The q/k/v/gate
+GEMM saves another ~50 ms. The kernel does not halve because at D 8 it is bound by the softmax, not the MMAs. Fold time,
+interleaved, two rounds each:
+
+| | 600 res | 1,000 res | 1,500 res | 2,500 res |
+|---|---:|---:|---:|---:|
+| A100, padded | 5.00 s | 12.22 s | 23.47 s | |
+| A100, unpadded | **4.93 s** | **12.00 s** | **23.38 s** | |
+| RTX PRO 6000, padded | 3.09 s | 7.03 s | 15.03 s | 47.71 s |
+| RTX PRO 6000, unpadded | **3.02 s** | **6.90 s** | **14.78 s** | **46.98 s** |
+
+5CAJ moves 0.011-0.014 A and 1TIM 0.021 A. Geometries measured at 1,000 residues on the A100 (kernel ms): 64-key tiles
+577 and with SPEC 532 (taken), 32 keys 579, 96 keys 573, 128 keys 602, four warps one row 578, four query tiles a warp
+579; with SPEC, four rows a block 816 (two warps) and 634 (one), eight rows 928, four warps two rows 808. Those forms
+are past the launch bound's four warps, so they lose their register cap and their occupancy.
+
+### The triangle multiplication's contraction in FP8 (2026-10-15)
+
+On a card with FP8 tensor instructions, the fused triangle multiplication contracts in e4m3, as cuda/af3's does. The
+input kernel writes a and b as e4m3 in the outgoing layout for both directions (the incoming one reads the pair
+transposed, RectMap's T), on a plane padded to 16, and `triContractTN` writes the bf16 product. The same form in bf16
+reproduces the shipped fold exactly on the A100 (0.000 A on 1QYS, 5CAJ and 1TIM), which checks the transposed layout
+on a card with no FP8.
+
+| | 600 res | 1,000 res | 2,500 res |
+|---|---:|---:|---:|
+| RTX PRO 6000, bf16 contraction | 3.02 s | 6.87 s | 46.72 s |
+| RTX PRO 6000, FP8 | **2.96 s** | **6.74 s** | **43.32 s** |
+| L4, bf16 contraction | 20.7 s | 58.8 s | |
+| L4, FP8 | **20.6 s** | **56.1 s** | |
+
+Drift against the bf16 contraction: 5CAJ and 1TIM with their alignments 0.016-0.023 A, 1QYS from a single sequence
+0.018 (G4) and 0.027 A (L4), with pLDDT and pTM within 0.2 and 0.002. Single-sequence 5CAJ, which is undetermined
+(pLDDT 31), moves 0.43 A (G4) and 0.72 A (L4), against 0.36 for TF32 off on the A100. Emulated on the A100 (a and b
+rounded through e4m3), 1QYS moves 0.032 A against TF32's 0.015 and its RMSD to the crystal is unchanged (1.229 ->
+1.222 A).
 
 ## A deep alignment's featurisation (2026-10-08)
 

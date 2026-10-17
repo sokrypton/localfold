@@ -72,11 +72,22 @@ inline void benchOps(int nTok, int S = 1) {
   time("ffw2 GEMM 1536->768", [&] { linear<half, float>(gated, att, n, I, C, B + ".ffwTransition2"); });
   time("empty kernel", [&] { addK<<<1, 32, 0, STREAM>>>(att, att, 0); });
 }
+__global__ void halfToFloatScaledK(const half* in, float* out, size_t n, float sc) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __half2float(in[i]) * sc;
+}
 // --bench-grid=N: the pair track's grid attention alone at N tokens (4 heads of 32, every row,
 // no mask), the arms interleaved and each the median of several rounds of 10 launches
+// (the bench's K8 and V8: qkvg's k and v rounded to e4m3, as gridInK's kv8 writes them)
+__global__ void benchKv8K(const half* qkvg, uint8_t* kv8, size_t prs, int W) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= prs * 2 * W) return;
+  size_t which = t / (prs * W), e = t % (prs * W), row = e / W; int c = (int)(e % W);
+  kv8[t] = __nv_cvt_halfraw_to_fp8(*reinterpret_cast<const __half_raw*>(qkvg + row * 4 * W + (1 + which) * W + c), __NV_SATFINITE, __NV_E4M3);
+}
 inline void benchGrid(int n) {
   const int heads = 4, D = 32, Wd = heads * D, stride = (n + 7) / 8 * 8;
-  size_t rows = n;
+  size_t rows = getenv("LOCALFOLD_BENCH_ROWS") ? atoi(getenv("LOCALFOLD_BENCH_ROWS")) : n;   // fewer grid rows: a long n
   half* qkvg = dallocT<half>(rows * n * 4 * Wd); half* out = dallocT<half>(rows * n * Wd);
   half* bias = dallocT<half>((size_t)heads * n * stride);
   { std::vector<half> h(std::max(rows * n * 4 * Wd, (size_t)heads * n * stride));
@@ -121,6 +132,50 @@ inline void benchGrid(int n) {
     printf("  2R no-bias against zero bias: %zu of %zu outputs differ\n", differ, a.size());
     CK(cudaFree(zb));
   }
+  {   // the 2R kernel's output against the f32-score reference's (scores, softmax and sums all f32)
+    float* outF = dalloc(rows * n * Wd);
+    float* qF = dalloc(rows * n * 4 * Wd); float* bF = dalloc((size_t)heads * n * stride);
+    halfToFloatScaledK<<<blocks(rows * n * 4 * Wd), 256, 0, STREAM>>>(qkvg, qF, rows * n * 4 * Wd, 1.f);
+    halfToFloatScaledK<<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(bias, bF, (size_t)heads * n * stride, 1.f / LOG2E);
+    dim3 g((n + 63) / 64, (unsigned)(rows * heads));
+    float* ones = dalloc((size_t)n * n);
+    { std::vector<float> h((size_t)n * n, 1.f); CK(cudaMemcpy(ones, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); }
+    flashGridF32<32><<<g, 64, 0, STREAM>>>(qF, bF, stride, ones, outF, n, heads, 0, false, 0.17f);
+    CK(cudaFree(qF)); CK(cudaFree(bF)); CK(cudaFree(ones));
+    std::vector<float> ref(rows * n * Wd); CK(cudaMemcpy(ref.data(), outF, ref.size() * 4, cudaMemcpyDeviceToHost));
+    auto rel = [&](const char* name, auto run) {
+      run(); std::vector<half> b2(rows * n * Wd); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+      double num = 0, den = 0; for (size_t i = 0; i < b2.size(); ++i) { double y = __half2float(b2[i]); num += (y - ref[i]) * (y - ref[i]); den += (double)ref[i] * ref[i]; }
+      printf("  %-14s relRMS %.3e from the f32-score reference\n", name, std::sqrt(num / std::max(den, 1e-30)));
+    };
+    rel("2R", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+    if (fp8Attn()) {
+      uint8_t* kv8 = dallocT<uint8_t>(rows * n * 2 * Wd);
+      benchKv8K<<<blocks(rows * n * 2 * Wd), 256, 0, STREAM>>>(qkvg, kv8, rows * n, Wd);
+      rel("fp8", [&] { flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+      {   // the block order: the same blocks in another order, so the same bytes
+        int was = FP8_SWIZZLE; FP8_SWIZZLE = 4;
+        flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr);
+        FP8_SWIZZLE = was;
+        std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+        CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+        size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
+        printf("  fp8 swizzled against in order: %zu of %zu outputs differ\n", differ, a.size());
+      }
+      CK(cudaFree(kv8));
+    }
+    CK(cudaFree(outF));
+  }
+  {   // the block order (GRID_SWIZZLE): the same blocks in another order, so the same bytes
+    int was = GRID_SWIZZLE;
+    GRID_SWIZZLE = 0; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr);
+    GRID_SWIZZLE = 4; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
+    GRID_SWIZZLE = was;
+    std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+    CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
+    printf("  2R swizzled against in order: %zu of %zu outputs differ\n", differ, a.size());
+  }
   for (int rr : {2, 3}) {   // RR rows a block share one bias tile: the same arithmetic, so the same bytes
     flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr);
     if (rr == 2) flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
@@ -131,6 +186,8 @@ inline void benchGrid(int n) {
     printf("  2R rr%d against rr1: %zu of %zu outputs differ\n", rr, differ, a.size());
   }
   }
+  uint8_t* kv8 = nullptr;
+  if (fp8Attn()) { kv8 = dallocT<uint8_t>(rows * n * 2 * Wd); benchKv8K<<<blocks(rows * n * 2 * Wd), 256, 0, STREAM>>>(qkvg, kv8, rows * n, Wd); }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
@@ -140,9 +197,27 @@ inline void benchGrid(int n) {
     {"2R w4 bk48 mt2", [&] { flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr2", [&] { flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr3", [&] { flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"fp8 (when the card has it)", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 0); }},
+    {"fp8 spec", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 1); }},
+    {"fp8 sw0", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 0; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
+    {"fp8 sw2", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 2; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
+    {"fp8 sw4", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 4; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
+    {"fp8 sw8", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 8; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
+    {"fp8 sw16", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 16; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
     {"2R w4 bk32 rr2", [&] { flashGrid2RRun<32, 4, 32, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk64 rr2", [&] { flashGrid2RRun<32, 4, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w2 bk48 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk64 rr2", [&] { flashGrid2RRun<32, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk64 rr2 spec", [&] { flashGrid2RRun<32, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk64 rr1 spec", [&] { flashGrid2RRun<32, 4, 64, 2, 1, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk64 rr1 spec", [&] { flashGrid2RRun<32, 2, 64, 2, 1, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk64 mt1 rr2 spec", [&] { flashGrid2RRun<32, 4, 64, 1, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk48 rr2 spec", [&] { flashGrid2RRun<32, 2, 48, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk32 rr2 spec", [&] { flashGrid2RRun<32, 2, 32, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk80 rr2 spec", [&] { flashGrid2RRun<32, 2, 80, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk48 rr2 sw4", [&] { int was = GRID_SWIZZLE; GRID_SWIZZLE = 4; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); GRID_SWIZZLE = was; }},
+    {"2R w2 bk48 rr2 sw2", [&] { int was = GRID_SWIZZLE; GRID_SWIZZLE = 2; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); GRID_SWIZZLE = was; }},
+    {"2R w2 bk48 rr2 sw3", [&] { int was = GRID_SWIZZLE; GRID_SWIZZLE = 3; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); GRID_SWIZZLE = was; }},
     {"2R w2 bk48 rr3", [&] { flashGrid2RRun<32, 2, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w8 bk48 mt1", [&] { flashGrid2RRun<32, 8, 48, 1>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     // the register-staged (ONE) forms - what a T4 runs, which has no cp.async
@@ -156,6 +231,8 @@ inline void benchGrid(int n) {
     {"ONE w4 bk32 mt1 rr2", [&] { flashGrid2RRun<32, 4, 32, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"ONE w2 bk64 mt1 rr2", [&] { flashGrid2RRun<32, 2, 64, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
   };
+  if (const char* only = getenv("LOCALFOLD_BENCH_ARMS"))   // arms whose name holds this
+    arms.erase(std::remove_if(arms.begin(), arms.end(), [&](auto& a) { return a.first.find(only) == std::string::npos; }), arms.end());
   if (getenv("LOCALFOLD_BENCH_ONE"))           // (a T4: only the register-staged forms, the rest wanting cp.async's room)
     arms.erase(std::remove_if(arms.begin(), arms.end(), [](auto& a) { return a.first.rfind("ONE", 0) != 0; }), arms.end());
   std::vector<std::vector<float>> t(arms.size());
@@ -168,7 +245,49 @@ inline void benchGrid(int n) {
       cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
       float ms; cudaEventElapsedTime(&ms, a, b); t[k].push_back(ms / 10);
     }
-  double flops = (double)n * n * n * heads * D * 4;
+  double flops = (double)rows * n * n * heads * D * 4;
+  for (size_t k = 0; k < arms.size(); ++k) {
+    std::sort(t[k].begin(), t[k].end());
+    printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
+  }
+}
+// --bench-grid16=N: the template stack's grid attention (4 heads of 16, every row, no mask) - the shipped kernel against
+// flashGrid2R's forms at D 16, each output's relRMS from the shipped one's, then the arms timed interleaved
+inline void benchGrid16(int n) {
+  const int heads = 4, D = 16, Wd = heads * D, stride = (n + 7) / 8 * 8;
+  size_t rows = getenv("LOCALFOLD_BENCH_ROWS") ? atoi(getenv("LOCALFOLD_BENCH_ROWS")) : n;
+  half* qkvg = dallocT<half>(rows * n * 4 * Wd); half* out = dallocT<half>(rows * n * Wd); half* out2 = dallocT<half>(rows * n * Wd);
+  half* bias = dallocT<half>((size_t)heads * n * stride);
+  { std::vector<half> h(std::max(rows * n * 4 * Wd, (size_t)heads * n * stride));
+    uint64_t s = 1; for (auto& v : h) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = __float2half(((s >> 40) / 16777216.f - 0.5f)); }
+    CK(cudaMemcpy(qkvg, h.data(), rows * n * 4 * Wd * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bias, h.data(), (size_t)heads * n * stride * 2, cudaMemcpyHostToDevice)); }
+  std::vector<std::pair<std::string, std::function<void(half*)>>> arms = {
+    {"shipped", [&](half* o) { flashGridHalfLaunch<16>(qkvg, bias, stride, nullptr, o, n, heads, 0, rows, false, 0.25f); }},
+    {"2R w2 bk48 rr2", [&](half* o) { flashGrid2RRun<16, 2, 48, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w2 bk64 rr2", [&](half* o) { flashGrid2RRun<16, 2, 64, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w4 bk64 rr1", [&](half* o) { flashGrid2RRun<16, 4, 64, 2, 1>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w2 bk96 rr2", [&](half* o) { flashGrid2RRun<16, 2, 96, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+  };
+  arms[0].second(out);
+  std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+  CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost));
+  for (size_t k = 1; k < arms.size(); ++k) {
+    arms[k].second(out2); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    double num = 0, den = 0; for (size_t i = 0; i < a.size(); ++i) { double x = __half2float(a[i]), y = __half2float(b2[i]); num += (x - y) * (x - y); den += x * x; }
+    printf("  %-16s relRMS %.3e from the shipped kernel\n", arms[k].first.c_str(), std::sqrt(num / std::max(den, 1e-30)));
+  }
+  std::vector<std::vector<float>> t(arms.size());
+  cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+  for (int round = 0; round < 7; ++round)
+    for (size_t k = 0; k < arms.size(); ++k) {
+      arms[k].second(out2); cudaEventRecord(e0, STREAM);
+      for (int i = 0; i < 10; ++i) arms[k].second(out2);
+      cudaEventRecord(e1, STREAM); cudaEventSynchronize(e1);
+      float ms; cudaEventElapsedTime(&ms, e0, e1); t[k].push_back(ms / 10);
+    }
+  double flops = (double)rows * n * n * heads * D * 4;
   for (size_t k = 0; k < arms.size(); ++k) {
     std::sort(t[k].begin(), t[k].end());
     printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);

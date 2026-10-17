@@ -19,8 +19,14 @@
 // stages, ~49 KB where the 8-warp form is 67.6 KB. Every output's sum over k runs in the same order in all
 // forms, so they are byte-identical.
 // TG: the gated rows' type (bf16 for a second GEMM that accumulates straight into a bf16 pair)
-template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half>
-__global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
+// MINB: blocks an SM the registers are held to. The 8-warp form at 256 channels is 67.6 KB of shared memory, two
+// blocks an SM on an A100 - as transitionUpWaveRows and the launchers were written for - but it had grown to 160
+// registers, so the registers held it to ONE (Nsight Compute at 988 tokens: occupancy 12.5%, the tensor pipe 48%).
+// Held to 128 (no spills: LOCAL 0) it runs two: ESMFold2's 676 -> 601 ms of a 988-token fold, byte-identical.
+// Not past 256 channels (the rows' fragments alone are 96-128 registers there, and two blocks do not fit anyway).
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half,
+          int MINB = (C <= 256 && WARPS == 8 && XROUNDS == 1) ? 2 : 1>
+__global__ void __launch_bounds__(WARPS * 32, MINB) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, TG* __restrict__ gated, size_t rows, int I) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
   constexpr size_t STAGE = (size_t)2 * C * NC * 2;
@@ -160,6 +166,16 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 }
 
 // ---------------------------------------------------------------- the triangle's output side
+// RectMap: the kernels' rows as a RECTANGLE of the padded pair space (triangleBlocked's blocks) - rows [i0, i0 + size / J),
+// columns [j0, j0 + J), q = (i - i0) J + (j - j0) a row's own index, and every operand and output plane `size` long; J 0:
+// the whole padded plane, as before
+// T (the input kernel): its rows read the pair TRANSPOSED - row (u, v) takes pair (v, u) - so the
+// incoming triangle's operands come out with the contraction's index contiguous, as the outgoing one's do (an FP8 GEMM
+// takes only that layout); its t2 rows still land at their own pair's place, where the output kernel reads them
+// ab0, ab1: the input kernel's a/b steps [ab0, ab1) alone (triIn256K; -1 all of them)
+// stride: the output kernel's product planes' length where it is not `size` (a chunk of a rectangle's rows, its product
+// handed from the chunk's first row: sharded.cuh's gate made a chunk at a time)
+struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; int ab0 = 0, ab1 = -1; size_t stride = 0; };
 // prod: channel-major [C][Lp][Lp] f32 (the padded contraction's output); t2: the gating linear's raw
 // output, [Lp * Lp][C] f16 (triInK's); pair: [L * L][C] f32. A block is 16 WARPS pairs: the product
 // tile is staged channel-major (stride R + 1: the per-row reductions read a column, conflict-free), the
@@ -180,7 +196,7 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
 template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
-    float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr) {   // ob: AF2's output bias
+    float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr, RectMap rm = {}) {   // ob: AF2's output bias
   // Woutt: Wout's NC-column tiles (tileColumns), the stages unpadded and swizzled (stageSw)
   // VEC (a 16-bit product into a 16-bit tile - ESMFold2's and protenix2's bf16): the block's rows are the
   // PADDED pair space, so eight consecutive rows are 16 contiguous, aligned bytes of a channel and the tile
@@ -199,14 +215,15 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   for (int c = threadIdx.x; c < C; c += NTH) { nsc[c] = cnScale[c]; nsc[C + c] = cnOffset[c]; }
   auto Ws = [&](int s) { return (half*)(smem + s * STAGE); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  const size_t P = (size_t)L * L, plane = (size_t)Lp * Lp;
+  const size_t P = (size_t)L * L, plane = rm.J ? rm.size : (size_t)Lp * Lp, stride = rm.J && rm.stride ? rm.stride : plane;
+  const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)Lp;
   size_t row0 = (size_t)blockIdx.x * R;
   auto padded = [&](size_t r) { unsigned u = (unsigned)r, i = u / (unsigned)L; return (size_t)i * Lp + (u - i * L); };
   // a row's pair (the unpadded index) and its padded index, in whichever space the rows are
   auto pairAt = [&](size_t row) -> size_t {
     if constexpr (VEC) {
       if (row >= plane) return SIZE_MAX;
-      unsigned u = (unsigned)row, i = u / (unsigned)Lp, j = u - i * (unsigned)Lp;
+      unsigned u = (unsigned)row, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
       return i < (unsigned)L && j < (unsigned)L ? (size_t)i * L + j : SIZE_MAX;
     } else return row < P ? row : SIZE_MAX;
   };
@@ -216,7 +233,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     for (int t0_ = 0; t0_ < C * (R / 8); t0_ += NTH) {
       int t = t0_ + (int)threadIdx.x, c = t / (R / 8), r = (t % (R / 8)) * 8;
       size_t row = row0 + r;
-      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * plane + (row < plane ? row : 0), row < plane);
+      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * stride + (row < plane ? row : 0), row < plane);
     }
     cpCommit(); cpWait<0>();
   } else {
@@ -226,7 +243,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     bool live = row < P;
     const TP* src = prod + (live ? padded(row) : 0);
 #pragma unroll 32
-    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * plane] : 0.f);
+    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * stride] : 0.f);
   }
   __syncthreads();
   // the centre norm's mean and 1/sd, a warp a row; at VEC's LDP (R + 8) a warp's reads across one row
@@ -264,6 +281,12 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   }
   __syncthreads();
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
+  // (the gate computed here instead of read - sigmoid(LN(pair row) Wg) on a second set of A fragments, the input kernel
+  // writing no t2 - was measured on the A100: the input kernel -1% (256 channels) / -17% (128), this one +31% / +41%,
+  // the folds +4.7% / +1.4%; not taken)
+  // (the centre norm's scale folded into Wout's rows and its offset into an output bias, the tile then read by
+  // ldmatrix.trans - four 8x8 matrices an instruction for these 2-byte loads and the scale/offset reads - was measured:
+  // -1% of this kernel at 988 tokens in AF3, +3.7% in ESMFold2's 256-channel one; not taken)
   int ra = warp * 16 + g, rb = ra + 8;
   float ma = stat[ra], ia = stat[R + ra], mb = stat[rb], ib = stat[R + rb];
   auto nrm = [&](int r, float m, float inv, int k) { return ((float)Ps[k * LDP + r] - m) * inv * nsc[k] + nsc[C + k]; };
@@ -390,7 +413,12 @@ template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false,
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
-    const float* __restrict__ bias = nullptr) {
+    const float* __restrict__ bias = nullptr, RectMap rm = {}) {
+  // [rm.ab0, rm.ab1): the a/b steps (8 channels each) this launch makes - a and b written at their channels' places, so
+  // a caller holding a few channels hands planes based that many channels back (sharded.cuh's rounds); -1, all of them
+  // mask: null for every pair real (ESMFold2's sharded trunk: a whole pair of ones is 1.1 GB a rank at 16,549 tokens)
+  // rm: a rectangle's rows (RectMap), its planes `size` long; a null a, b or t2 is not written (the blocks' passes each
+  // want one operand)
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
   // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
@@ -401,11 +429,19 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
   // (the stages and the a/b staging take the rows' memory once the rows are fragments: the launch gives the
   // larger of the two - at 8 warps the rows, at 4 the stages, triIn256Smem)
-  const size_t pp = (size_t)np * np;
+  const size_t pp = rm.J ? rm.size : (size_t)np * np;
+  if (rm.J) cs = rm.size;
+  const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)np;
   auto pairOf = [&](size_t q) -> size_t {
     if (q >= pp) return SIZE_MAX;
-    unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
+    unsigned u = (unsigned)q, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
+    if (rm.T) { unsigned x = i; i = j; j = x; }
     return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+  };
+  // (a t2 row's place: its own pair's padded row - transposed under rm.T)
+  auto t2Row = [&](size_t q) -> size_t {
+    if (!rm.T) return q;
+    unsigned u = (unsigned)q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE + (size_t)2 * CH * LDT * sizeof(TA));
@@ -417,7 +453,10 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   size_t row0 = (size_t)blockIdx.x * R;
   // the gating linear's steps take TWO of its tiles, one a stage (w1 idles there otherwise): four accumulator
   // chains a step where they had two, and half the steps (ncu had the kernel waiting on its MMA chains)
-  const int abSteps = C / CH, steps = abSteps + C / NC / 2;
+  const int abSteps = C / CH;
+  const int ab0 = rm.ab0, nAb = (rm.ab1 < 0 ? abSteps : rm.ab1) - rm.ab0;
+  const int steps = nAb + (t2 ? C / NC / 2 : 0);                          // (no t2: the gating linear skipped)
+  auto stepOf = [&](int i) { return i < nAb ? ab0 + i : abSteps + (i - nAb); };   // (the weight tiles' step)
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
   // step j's two weight tiles, each 16-byte piece handed to op(index, its place in stage st, its source)
   auto stage = [&](int j, int st, auto&& op) {
@@ -446,11 +485,11 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #pragma unroll
       for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + ((warp * MT + mt) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
     __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
-    issue(0, 0);
+    issue(stepOf(0), 0);
   } else {
     static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
     constexpr int XR = R / XROUNDS;
-    issue(0, 0);                        // (the stages have memory of their own here)
+    issue(stepOf(0), 0);                // (the stages have memory of their own here)
 #pragma unroll 1
     for (int rd = 0; rd < XROUNDS; ++rd) {
       lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
@@ -467,14 +506,14 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   for (int mt = 0; mt < MT; ++mt) {
     lr0[mt] = (warp * MT + mt) * 16 + g; lr1[mt] = lr0[mt] + 8;
     size_t pr0 = pairOf(row0 + lr0[mt]), pr1 = pairOf(row0 + lr1[mt]);
-    m0[mt] = pr0 != SIZE_MAX ? mask[pr0] : 0.f; m1[mt] = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
+    m0[mt] = pr0 != SIZE_MAX ? (mask ? mask[pr0] : 1.f) : 0.f; m1[mt] = pr1 != SIZE_MAX ? (mask ? mask[pr1] : 1.f) : 0.f;
   }
-  for (int j = 0; j < steps; ++j) {
-    int st = j & 1;
+  for (int it = 0; it < steps; ++it) {
+    const int j = stepOf(it), st = it & 1;
 #if LF_REG_STAGES
-    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
+    if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
 #else
-    if (j + 1 < steps) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    if (it + 1 < steps) { issue(stepOf(it + 1), st ^ 1); cpWait<1>(); }
     else cpWait<0>();
 #endif
     __syncthreads();
@@ -512,11 +551,13 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int c = c0 + nt * 8 + tig * 2;
-        size_t ra = row0 + lr0[mt], rb = row0 + lr1[mt];
-        if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c) = __floats2half2_rn(p[mt][nt][0], p[mt][nt][1]);
-        if (rb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c) = __floats2half2_rn(p[mt][nt][2], p[mt][nt][3]);
-        if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c + NC) = __floats2half2_rn(q[mt][nt][0], q[mt][nt][1]);
-        if (rb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c + NC) = __floats2half2_rn(q[mt][nt][2], q[mt][nt][3]);
+        size_t qa = row0 + lr0[mt], qb = row0 + lr1[mt];
+        if (!t2) continue;
+        size_t ra = t2Row(qa), rb = t2Row(qb);
+        if (qa < pp) *reinterpret_cast<half2*>(t2 + ra * C + c) = __floats2half2_rn(p[mt][nt][0], p[mt][nt][1]);
+        if (qb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c) = __floats2half2_rn(p[mt][nt][2], p[mt][nt][3]);
+        if (qa < pp) *reinterpret_cast<half2*>(t2 + ra * C + c + NC) = __floats2half2_rn(q[mt][nt][0], q[mt][nt][1]);
+        if (qb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c + NC) = __floats2half2_rn(q[mt][nt][2], q[mt][nt][3]);
       }
     } else {
       // column 2ch is a's channel ch, 2ch+1 b's: the thread's columns nt*8 + 2 tig are channel nt*4 + tig
@@ -539,13 +580,15 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
         size_t row = row0 + r;
         if (row < cs) {
           size_t at = (size_t)(j * CH + ch) * cs + row;
-          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + ch * LDT + r);
-          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + ch * LDT + r);
+          // (8 rows: 16 bytes of a 16-bit operand, 8 of an FP8 one)
+          using V8 = std::conditional_t<sizeof(TA) == 1, uint2, uint4>;
+          if (a) *reinterpret_cast<V8*>(a + at) = *reinterpret_cast<const V8*>(Ta + ch * LDT + r);
+          if (b) *reinterpret_cast<V8*>(b + at) = *reinterpret_cast<const V8*>(Tb + ch * LDT + r);
         }
       }
     }
 #if LF_REG_STAGES
-    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });   // (stage st^1 was
+    if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });   // (stage st^1 was
 #endif                                                                         // last read before this step's barrier)
     __syncthreads();
   }
@@ -554,12 +597,13 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 // the triangle's output side, launched: the bf16 tile at 16-column stages (LOCALFOLD_TRIOUT_F32=1: the float tile)
 template <int C, int WARPS, class TP = float>
 void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
-                    int L, int Lp, const float* ob = nullptr) {
+                    int L, int Lp, const float* ob = nullptr, RectMap rm = {}) {
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
+  if (rm.J && (sizeof(TP) != 2 || f32)) { fprintf(stderr, "triangleOutRun: a rectangle wants the bf16 product and tile\n"); exit(1); }
   constexpr int R = 16 * WARPS;
   size_t P = (size_t)L * L;
   half* wt = scratch<half>("triout.wt", (size_t)C * C);
-  tileColumns(Wout, C, C, 0, C, f32 || ob ? 32 : 16, wt);
+  tileColumns(Wout, C, C, 0, C, f32 || (ob && sizeof(TP) == 4) ? 32 : 16, wt);
   if (f32 && !ob) {
     constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
     WITH_PAIR_T(
@@ -576,15 +620,26 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
         if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true, PT>), (int)smem); attr = true; }
         triangleOutK<C, WARPS, float, 32, TP, true, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
           prod, sc, of, wt, t2, pair, L, Lp, ob));
-    } else { fprintf(stderr, "triangleOutRun: an output bias takes an f32 product (AF2's)\n"); exit(1); }
+    } else {
+      // ...or a bf16 product (AF2's streaming triangle on an A100, as AF3's: its narrow path's product is bf16 too) - the
+      // bf16 tile at 16-column stages, the bias in the same epilogue
+      constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
+      constexpr bool vec = sizeof(TP) == 2;
+      size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT>), (int)smem); attr = true; }
+        triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+          prod, sc, of, wt, t2, pair, L, Lp, ob, rm));
+    }
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)
-    size_t rows = vec ? (size_t)Lp * Lp : P;
+    size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
     WITH_PAIR_T(
       static bool attr = false;
       if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT>), (int)smem); attr = true; }
-      triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp));
+      triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp, nullptr, rm));
   }
 }
 

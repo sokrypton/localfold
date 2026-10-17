@@ -14,6 +14,28 @@
 // relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed;
 // computed where it is read (z_init, the diffusion's conditioning, the confidence head), never stored
 struct RelIdx { const int *ri, *asym, *sym, *ent, *ti; const float* Wt; };
+// token_bonds as each row's bonded columns: the input's [T, T] is nearly all zeros and stays on the host (Model::hostOnly)
+// - 1.1 GB a GPU at 16,549 tokens. Built per fold (buildBonds), read through bondAt
+struct Bonds { const int* start; const int* col; const float* val; };
+inline Bonds BONDS{};
+__device__ __forceinline__ float bondAt(const Bonds& b, int i, int j) {
+  for (int k = b.start[i]; k < b.start[i + 1]; ++k) if (b.col[k] == j) return b.val[k];
+  return 0.f;
+}
+inline void buildBonds(int T) {
+  static int* start = nullptr; static int* col = nullptr; static float* val = nullptr;
+  for (void* p : { (void*)start, (void*)col, (void*)val }) if (p) CK(cudaFree(p));
+  const float* d = M.f("token_bonds");
+  std::vector<int> s(T + 1, 0), c; std::vector<float> v;
+  for (int i = 0; i < T; ++i) {
+    for (int j = 0; j < T; ++j) if (d[(size_t)i * T + j] != 0.f) { c.push_back(j); v.push_back(d[(size_t)i * T + j]); }
+    s[i + 1] = (int)c.size();
+  }
+  CK(cudaMalloc(&start, s.size() * 4)); CK(cudaMalloc(&col, std::max<size_t>(c.size(), 1) * 4)); CK(cudaMalloc(&val, std::max<size_t>(v.size(), 1) * 4));
+  CK(cudaMemcpy(start, s.data(), s.size() * 4, cudaMemcpyHostToDevice));
+  if (!c.empty()) { CK(cudaMemcpy(col, c.data(), c.size() * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(val, v.data(), v.size() * 4, cudaMemcpyHostToDevice)); }
+  BONDS = { start, col, val };
+}
 inline RelIdx relIdx() {
   return {Idev("residue_index"), Idev("asym_id"), Idev("sym_id"), Idev("entity_id"), Idev("token_index"), F("featuriser/relPos")};
 }
@@ -36,25 +58,33 @@ __global__ void relPosK(RelIdx r, float* out, int T, int C) {
   out[t] = relPosAt(r, (int)(ij / T), (int)(ij % T), c, C);
 }
 // z_init = rows[i] + cols[j] + relpos + bonds * w_bond + lm_z
-__global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+__global__ void zInitK(const float* rows, const float* cols, RelIdx rel, Bonds bonds, const float* wBond,
                        const float* lmZ, float* z, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + (lmZ ? lmZ[t] : 0.f);
+  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + (lmZ ? lmZ[t] : 0.f);
 }
 
 // a STREAMED z_init (a card short of room): neither it nor the language model's pair is kept - each loop
 // makes its rows a block at a time from the per-token states and adds them in (zInitK's sum, in its order)
 struct ZInitStream { const float* rows; const float* cols; const float* s; int P; };
 inline ZInitStream ZINIT_STREAM{};
-__global__ void zInitAddRowsK(float* z, const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+template <class TZ>
+__global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelIdx rel, Bonds bonds, const float* wBond,
                               const float* lm, int T, int C, size_t r0, size_t cnt) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[r0 * C + t] += rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lm[t];
+  // (lm null: z_init without the language model's term - the released models' recycle, which injects that pair itself)
+  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + (lm ? lm[t] : 0.f);
+  if constexpr (std::is_same_v<TZ, float>) z[r0 * C + t] += add;
+  else z[r0 * C + t] = __float2bfloat16(__bfloat162float(z[r0 * C + t]) + add);
 }
+// the trunk's pair held in bf16 from the recycle on (a card short of room, where every block takes the fused bf16
+// forms): half the bytes of the f32 z the trunk and every reader after it held - 25 GB at 4,940 tokens, where ESMFold2
+// ran out in the trunk's triangle. The recycle's arithmetic stays f32 a chunk of rows at a time; set by ef2.cu
+inline bool EF2_Z16 = false;
 inline void zInitAddStreamed(float* z, int T, int C) {
   const ZInitStream& zs = ZINIT_STREAM;
   int bi = lmPairBlock(T, zs.P);
@@ -62,8 +92,10 @@ inline void zInitAddStreamed(float* z, int T, int C) {
   for (int i0 = 0; i0 < T; i0 += bi) {
     int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
     lmPairRows(zs.s, T, zs.P, i0, b, lm);
-    zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"),
-                                                         lm, T, C, (size_t)i0 * T, cells);
+    if (EF2_Z16) zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(z), zs.rows, zs.cols, relIdx(),
+                   BONDS, F("featuriser/tokenBonds"), lm, T, C, (size_t)i0 * T, cells);
+    else zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), BONDS, F("featuriser/tokenBonds"),
+                                                              lm, T, C, (size_t)i0 * T, cells);
   }
 }
 inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z, bool check) {
@@ -78,7 +110,7 @@ inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, 
     relPosK<<<blocks(P * C), 256, 0, STREAM>>>(relIdx(), rel, T, C);
     checkOracle("rel_pos", rel, P * C, "o/rel_pos");
   }
-  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), lmZ, z, T, C);
+  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, relIdx(), BONDS, F("featuriser/tokenBonds"), lmZ, z, T, C);
 }
 
 // ---------------------------------------------------------------- the trunk, float32
@@ -147,8 +179,31 @@ template <class TA, class TP>
 inline void triangle256As(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing,
                           cudaDataType ta, cudaDataType tp) {
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-  TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   half* t2 = scratch<half>("ftri.t2", plane * C);
+  if constexpr (std::is_same_v<TA, __nv_bfloat16> && std::is_same_v<TP, __nv_bfloat16>) {
+    // FP8 operands where the card has FP8 tensor instructions (fp8Tensor): both directions in the outgoing layout - the
+    // incoming one's input kernel reading the pair transposed (RectMap's T) - through an e4m3 GEMM into the bf16 product.
+    // LOCALFOLD_TRI_TN=1 takes the same layouts in bf16 (the check of the transposed form on a card without FP8)
+    static const bool tn = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+    if (fp8Tensor() || tn) {
+      const bool f8 = fp8Tensor();
+      // (an FP8 GEMM's leading dimensions are whole multiples of 16 elements: the padded plane to 16, not 8)
+      Lp = (L + 15) / 16 * 16; plane = (size_t)Lp * Lp;
+      t2 = scratch<half>("ftri.t2", plane * C);
+      void* a = f8 ? (void*)scratch<__nv_fp8_e4m3>("ftri.a8", plane * C) : (void*)scratch<TA>("ftri.a", plane * C);
+      void* b = f8 ? (void*)scratch<__nv_fp8_e4m3>("ftri.b8", plane * C) : (void*)scratch<TA>("ftri.b", plane * C);
+      RectMap rm; rm.T = !outgoing;
+      if (f8) triIn256<__nv_fp8_e4m3>(pair, mask, Tn, (__nv_fp8_e4m3*)a, (__nv_fp8_e4m3*)b, t2, L, Lp, plane, rm);
+      else triIn256<TA>(pair, mask, Tn, (TA*)a, (TA*)b, t2, L, Lp, plane, rm);
+      TP* prod = scratch<TP>("ftri.prod", plane * C);
+      // (incoming P[i][j] = sum_k a[k][j] b[k][i]: with a', b' the transposed operands, sum_k b'[i][k] a'[j][k])
+      if (outgoing) triContractTN(Lp, plane, C, 1.f, a, b, prod, f8);
+      else triContractTN(Lp, plane, C, 1.f, b, a, prod, f8);
+      triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
+      return;
+    }
+  }
+  TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   triIn256<TA>(pair, mask, Tn, a, b, t2, L, Lp, plane);
   TP* prod = scratch<TP>("ftri.prod", plane * C);
   if constexpr (std::is_same_v<TA, __nv_bfloat16>) {   // cuda/af3's contraction, a cached plan at every size
@@ -165,7 +220,7 @@ inline void triangle256As(float* pair, const float* mask, int L, int C, const st
   triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
 }
 inline bool bf16Mma() {          // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
-  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static int major = ccMajor();
   return major >= 8;
 }
 inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
@@ -191,8 +246,11 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
     }
     return;
   }
-  // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
-  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), ((size_t)64 << 20) / (2 * (size_t)I));
+  // whole waves of transitionUpK within ~64 MB of widened rows (see transitionUpWaveRows) - or 1 GB where the card
+  // has the room: fewer, larger down-projection GEMMs, which cuBLAS runs on a faster kernel past ~100k rows. The
+  // trunk at 988 tokens 2556 -> 2485 ms (-2.8%), at 494 601 -> 598, at 261 194 -> 193, byte-identical on all three
+  const size_t budget = roomFor((size_t)1 << 30, {"ftr.g", "ftr.gbf"}) ? (size_t)1 << 30 : (size_t)64 << 20;
+  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), budget / (2 * (size_t)I));
   half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
   tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
   if (PAIR16) {
@@ -209,7 +267,8 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
       B16* rows = reinterpret_cast<B16*>(pair) + r0 * C;
       transitionUpK<256, WU, 32, 1, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
         reinterpret_cast<float*>(rows), F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
-      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)r, I, &one, Wbf("f/" + Tn + "transition2"), CUDA_R_16BF, C, g,
+      const __nv_bfloat16* w2 = Wbf("f/" + Tn + "transition2");
+      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)r, I, &one, w2, CUDA_R_16BF, C, g,
                       CUDA_R_16BF, I, &one, rows, CUDA_R_16BF, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
     return;
@@ -248,6 +307,74 @@ inline void triangleBlockedEf2(float* pair, const float* mask, int L, int C, con
                  Fh(Tn + "gatingLinear"), nullptr };
   triangleBlockedHalf(pair, mask, L, C, w, outgoing, (size_t)64 << 20);
 }
+// the blocks on the whole form's streaming kernels (cuda/af3's triangleBlockedFused): the input kernel over the whole
+// plane for b alone, then over each block's rectangle for a and its gating rows, a bf16 contraction, and the output
+// kernel over the rectangle - where triangleBlockedHalf ran an LN, a GEMM and a transposing gate a chunk and five passes
+// on the way out. 2,470 tokens forced big: the fold's GPU time 43.3 -> 24.3 s (the whole form 20.3); 5CAJ forced big
+// 0.023 A from the whole form (the old blocks 0.025)
+// ...in FP8 where the card has FP8 tensor instructions, both directions in the outgoing GEMM's layout (as cuda/af3's
+// triangleBlockedTN: the incoming operands read transposed, the plane and blocks padded to 16); LOCALFOLD_TRI_TN=1 the
+// same layouts in bf16
+template <class TQ>
+inline void triangleBlockedTNEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  using B16 = __nv_bfloat16;
+  constexpr bool F8 = sizeof(TQ) == 1;
+  const int Lp = (L + 15) / 16 * 16; const size_t plane = (size_t)Lp * Lp;
+  TQ* b = scratch<TQ>("trib.bq", plane * C);
+  int width = (int)std::max<size_t>(16, std::min<size_t>(Lp, ((size_t)64 << 20) / C / Lp / 16 * 16));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
+  }
+  TQ* a = scratch<TQ>("trib.aq", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  auto gemm = [&](int m, int nn, const TQ* A, int lda, long long sA, const TQ* B, long long sB, int ldc, long long sC) {
+    if constexpr (F8) fp8GemmTN(m, nn, Lp, 1.f, A, lda, sA, B, Lp, sB, prod, ldc, sC, C);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, Lp, 1.f, A, lda, sA, B, Lp, sB, prod, ldc, sC, C);
+  };
+  RectMap whole; whole.T = !outgoing;
+  triIn256<TQ>(pair, mask, Tn, nullptr, b, nullptr, L, Lp, plane, whole);
+  for (int k0 = 0; k0 < L; k0 += width) {
+    int w = std::min(width, Lp - k0);
+    const size_t rs = (size_t)w * Lp;
+    RectMap rin{k0, Lp, 0, rs}; rin.T = !outgoing;
+    triIn256<TQ>(pair, mask, Tn, a, nullptr, t2, L, Lp, plane, rin);
+    if (outgoing) gemm(Lp, w, b, Lp, (long long)plane, a, (long long)rs, Lp, (long long)rs);
+    else gemm(w, Lp, a, Lp, (long long)rs, b, (long long)plane, w, (long long)rs);
+    triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp,
+                   outgoing ? rin : RectMap{0, w, k0, rs});
+  }
+  releaseScratch({ "trib." });
+}
+inline void triangleBlockedFusedEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+  if (fp8Tensor()) { triangleBlockedTNEf2<__nv_fp8_e4m3>(pair, mask, L, C, Tn, outgoing); return; }
+  if (tnBf16) { triangleBlockedTNEf2<__nv_bfloat16>(pair, mask, L, C, Tn, outgoing); return; }
+  using B16 = __nv_bfloat16;
+  const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
+  B16* b = scratch<B16>("trib.bbf", plane * C);
+  int width = (int)std::max<size_t>(8, std::min<size_t>(Lp, ((size_t)64 << 20) / C / Lp / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * 6, spare = f > t / 16 ? f - t / 16 : 0;       // a, its gating rows, the product
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  B16* a = scratch<B16>("trib.abf", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  triIn256<B16>(pair, mask, Tn, nullptr, b, nullptr, L, Lp, plane);
+  for (int k0 = 0; k0 < L; k0 += width) {
+    int w = std::min(width, Lp - k0);
+    RectMap rm = outgoing ? RectMap{k0, Lp, 0, (size_t)w * Lp} : RectMap{0, w, k0, (size_t)Lp * w};
+    triIn256<B16>(pair, mask, Tn, a, nullptr, t2, L, Lp, plane, rm);
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, w, Lp, 1.f, b, Lp, plane, a, Lp, rm.size, prod, Lp, rm.size, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, Lp, Lp, 1.f, a, w, rm.size, b, Lp, plane, prod, w, rm.size, C);
+    triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp, rm);
+  }
+  releaseScratch({ "trib." });
+}
 inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
   // on a card short of room, the triangles in output blocks where the whole forms would not fit with room
@@ -256,8 +383,14 @@ inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     if (!roomFor(5 * plane * C * 2, { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.pg", "ftri.cn", "ftri.out" })) {
       releaseScratch({ "ftri." });
-      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
-      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+      if (fusedBlocks && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma()) {
+        triangleBlockedFusedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+        triangleBlockedFusedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      } else {
+        triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+        triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      }
       if (FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits()) transition256(pair, (size_t)L * L, C, B + "pairTransition/");
       else transitionFast(pair, (size_t)L * L, C, B + "pairTransition/");
       return;
@@ -296,22 +429,32 @@ __device__ __forceinline__ float uniform01(uint64_t seed, uint64_t stream, uint6
 }
 // the initial pair state: a normal of std sqrt(2 / (5 C)) truncated at 3 std (biohub's _init_pair_state -
 // trunc_normal_, which redraws past the bounds; here a Box-Muller draw redrawn the same way)
-__global__ void truncNormalK(float* z, size_t n, float std, uint64_t seed) {
+// (off: the element's place in the whole pair - a sharded rank's rows draw what one GPU's draw there; TZ bf16 for its share)
+template <class TZ = float>
+__global__ void truncNormalK(TZ* z, size_t n, float std, uint64_t seed, size_t off = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
+  const size_t g = off + t;
   float v = 0.f;
   for (int k = 0; k < 64; ++k) {
-    float u1 = fmaxf(uniform01(seed, 2 * k, t), 1e-7f), u2 = uniform01(seed, 2 * k + 1, t);
+    float u1 = fmaxf(uniform01(seed, 2 * k, g), 1e-7f), u2 = uniform01(seed, 2 * k + 1, g);
     v = sqrtf(-2.f * logf(u1)) * cospif(2.f * u2);
     if (fabsf(v) <= 3.f) break;
   }
-  z[t] = fminf(fmaxf(v, -3.f), 3.f) * std;
+  z[t] = (TZ)(fminf(fmaxf(v, -3.f), 3.f) * std);
 }
 // out = dropout(in, p): zeroed with probability p, else scaled by 1 / (1 - p) (F.dropout, training=True)
-__global__ void dropoutK(const float* in, float* out, size_t n, float p, uint64_t seed, uint64_t stream) {
+template <class TO = float>
+__global__ void dropoutK(const float* in, TO* out, size_t n, float p, uint64_t seed, uint64_t stream, size_t off = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
-  out[t] = uniform01(seed, stream, t) < p ? 0.f : in[t] / (1.f - p);
+  out[t] = (TO)(uniform01(seed, stream, off + t) < p ? 0.f : in[t] / (1.f - p));
+}
+// z = a * z + y, a per channel, z bf16 (a sharded rank's share)
+__global__ void decayUpdate16K(__nv_bfloat16* z, const float* y, const float* a, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C) return;
+  z[t] = __float2bfloat16(a[t % C] * __bfloat162float(z[t]) + y[t]);
 }
 // z = a * z + y, a per channel
 __global__ void decayUpdateK(float* z, const float* y, const float* a, size_t rows, int C) {
@@ -340,6 +483,12 @@ inline bool ef2Pair16(int L, int C) {
 }
 inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std::string& prefix, int from, int to) {
   if (from >= to) return;
+  if (EF2_Z16) {                 // (the pair already bf16: the blocks in place)
+    PAIR16 = true;
+    for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b);
+    PAIR16 = false;
+    return;
+  }
   if (!ef2Pair16(L, C)) { for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b); return; }
   size_t n = (size_t)L * L * C;
   __nv_bfloat16* p16 = scratch<__nv_bfloat16>("ef2.p16", n);
@@ -403,16 +552,26 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     trunkBlocks(z, mask, T, C, "coda/blocks", 0, codaBlocks);
     return;
   }
-  CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
+  CK(cudaMemsetAsync(z, 0, P * C * (EF2_Z16 ? 2 : 4), STREAM));
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));   // the recycle row by row, 64 MB at a time
   float* xn = scratch<float>("trunk.xn", chunk * C);
+  float* zc = EF2_Z16 ? scratch<float>("trunk.zc", chunk * C) : nullptr;      // (a bf16 z's rows, widened)
+  __nv_bfloat16* z16 = reinterpret_cast<__nv_bfloat16*>(z);
   int blocksN = (int)M.meta("meta/blocks");
   for (int loop = 0; loop < loops; ++loop) {
     for (size_t r0 = 0; r0 < P; r0 += chunk) {
       size_t r = std::min(chunk, P - r0);
+      if (EF2_Z16) {
+        ef2FromBf16K<<<blocks(r * C), 256, 0, STREAM>>>(z16 + r0 * C, zc, r * C);
+        layerNorm(zc, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        gemm(xn, F("recycle/projection"), zc, r, C, C);
+        ef2ToBf16K<<<blocks(r * C), 256, 0, STREAM>>>(zc, z16 + r0 * C, r * C);
+        continue;
+      }
       layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
       gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
     }
+    if (zInitP && EF2_Z16) { fprintf(stderr, "a bf16 trunk pair takes the streamed z_init\n"); exit(1); }
     if (zInitP) addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
     else zInitAddStreamed(z, T, C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");

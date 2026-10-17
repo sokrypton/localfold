@@ -106,7 +106,7 @@ struct Lock {          // one fetch of a directory at a time
 // one URL to one file through a `.part` (a byte range of it when `range` is given)
 inline void download(const std::string& url, const std::string& path, const std::string& range = "") {
   std::string part = path + ".part";
-  std::string command = "curl -s -f -L --retry 3 --max-time 3600" + (range.empty() ? "" : " -r " + range) +
+  std::string command = "curl -s -f -L" + search::CURL_AGENT + " --retry 3 --max-time 3600" + (range.empty() ? "" : " -r " + range) +
                         " -o " + search::shellQuote(part) + " " + search::shellQuote(url);
   if (system(command.c_str()) != 0) { std::remove(part.c_str()); throw std::runtime_error("could not download " + url); }
   if (rename(part.c_str(), path.c_str()) != 0) throw std::runtime_error("cannot rename " + part);
@@ -115,7 +115,7 @@ inline void download(const std::string& url, const std::string& path, const std:
 // a file's size from its headers, after any redirect (the last Content-Length curl saw)
 inline long long remoteSize(const std::string& url) {
   int status = 0;
-  std::string headers = search::runCapture("curl -s -f -L -I --retry 3 " + search::shellQuote(url), status);
+  std::string headers = search::runCapture("curl -s -f -L -I" + search::CURL_AGENT + " --retry 3 " + search::shellQuote(url), status);
   if (status != 0) throw std::runtime_error("could not reach " + url);
   long long size = -1;
   size_t at = 0;

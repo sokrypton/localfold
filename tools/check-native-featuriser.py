@@ -91,6 +91,15 @@ def cases():
                                           {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF3_FAMILIES),
         ("sep-end", "af3", job("t", [protein("A", "MKTAYIAKQRS", modifications=[{"ptmType": "SEP", "ptmPosition": 11}])]),
          [], AF3_FAMILIES),
+        # an unknown amino acid mid-chain and at the C-terminus (openbind0: the CCD's UNK, N CA C O CB CG)
+        ("unknown-residues", "af3", job("t", [protein("A", "MKTXAYIAKQRX")]), [], AF3_FAMILIES),
+        # every family's rule for declared bonds (featurise.js declaredPolymerBonds): a disulfide within a chain, an
+        # adjacent pair (left to the chain by protenix), a cross-chain one, and a modified residue's bond to a ligand
+        ("bond-rules", "af3", job("t", [protein("A", "CKTCYSAKC", modifications=[{"ptmType": "SEP", "ptmPosition": 6}]),
+                                        protein("B", "CRSC"), {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}],
+                                  bondedAtomPairs=[[["A", 1, "SG"], ["A", 4, "SG"]], [["A", 1, "C"], ["A", 2, "N"]],
+                                                   [["A", 9, "SG"], ["B", 1, "SG"]], [["A", 6, "OG"], ["C", 1, "C1"]]]),
+         [], AF3_FAMILIES),
         ("dimer-dna", "af3", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),
@@ -232,7 +241,7 @@ def read_idx(path):
 
 def compare(js_dir, native_dir):
     """None when identical, else a sentence naming the first difference."""
-    for name in ("template.pdb", "pdb.template"):
+    for name in ("template.pdb", "pdb.template", "search.a3m"):
         a, b = os.path.join(js_dir, name), os.path.join(native_dir, name)
         if os.path.exists(a) != os.path.exists(b):
             return f"{name}: present on one side only"

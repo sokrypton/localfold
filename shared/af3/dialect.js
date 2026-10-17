@@ -59,7 +59,12 @@ export const ALPHAFOLD3 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: false,
+  rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
   // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
@@ -294,7 +299,20 @@ export const OPENBIND0 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
+  // 🔴 EVERY (SLOT, TOKEN) WITHOUT TEMPLATE ATOMS READS THE GAP RESTYPE (21): OpenFold3's
+  // create_template_feature_precursor_of3 starts every slot and token as GAP and writes only what a template covers, so
+  // all four empty slots - and a real template's uncovered tokens - read GAP where AlphaFold 3 pads with 0
+  // (af3-any-model b84aa69: msa_gappy 2.2 -> 0.3 A with the main-MSA cap)
+  templateGapWhereNoAtoms: true,
+  // 🔴 AN UNKNOWN AMINO ACID IS THE CCD's UNK (N CA C O CB CG), where AlphaFold 3 builds GLY (OpenFold3's featuriser;
+  // af3-any-model b84aa69: unk_residues 10.6 -> 1.2 A). reference-conformers-unk.js
+  ccdUnknownResidue: true,
+  // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
+  // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
+  mainMsaCap: 16384,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
   // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
@@ -431,7 +449,13 @@ export const OPENDDE = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS PROTENIX'S (a protenix fork): include_discont_poly_poly_bonds (af3-any-model 964990e)
+  declaredPolymerBonds: "discontinuous",
   emptyTemplateAatype: 21,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
   // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
@@ -678,7 +702,14 @@ export const PROTENIX2 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds: polymer-polymer between residues more than one
+  // apart or in different chains, and a modified residue's bond to a ligand (af3-any-model 964990e). featurise.js
+  declaredPolymerBonds: "discontinuous",
   emptyTemplateAatype: 21,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
   // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
@@ -862,7 +893,16 @@ export const BOLTZ2 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
+  // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME: Boltz-2 centres `range(max(ref_space_uid))`, which skips
+  // the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 -> 85)
+  rawLastConformer: true,
+  // 🔴 EVERY DECLARED BOND BETWEEN TWO TOKENS, polymer-polymer included: Boltz-2's `bond` constraint is a token bond
+  // (af3-any-model 964990e; a disulfide to a D-Cys folded 21.7 A apart without it, native 2.4). featurise.js
+  declaredPolymerBonds: "all",
   emptyTemplateAatype: null,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
   // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
@@ -947,7 +987,12 @@ export const INTELLIFOLD2 = Object.freeze({
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
+  rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
   boltz2TemplateFeatures: false,
@@ -1116,7 +1161,14 @@ export const ROSETTAFOLD3 = Object.freeze({
   targetFeatAtomOnly: false,
   // NOT in CENTRE_REF_CONFORMERS.
   centreRefConformers: false,
+  rawLastConformer: false,
+  // 🔴 DECLARED BONDS AS ATOMWORKS: a modified (atomised) residue's bond to a ligand kept, polymer-polymer dropped
+  // (af3-any-model 964990e). featurise.js
+  declaredPolymerBonds: "ligand",
   emptyTemplateAatype: null,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
   // every other family runs a forward per SLOT and averages the outputs.
@@ -1173,7 +1225,10 @@ export const ROSETTAFOLD3 = Object.freeze({
   dedupeSelfMsa: true,
   dropTerminalAtoms: true,
   atomizedElementNames: true,
-  atomizedUnknownRestype: true,
+  // 🔴 "nucleic": a modified NUCLEOTIDE's atomised tokens are unknown (20) too, not the parent base - native atomworks
+  // puts restype and profile 20 on all 160 atomised 5CM tokens of methylated_dna (af3-any-model 0464f71: the parent base
+  // read pLDDT 84.2 against native's 78.5). true is an atomised amino acid's alone (boltz2's one token, chai-1)
+  atomizedUnknownRestype: "nucleic",
   atomizedUnknownMsa: true,
   atomizedBackboneBonds: true,
   modifiedAsOneToken: false,
@@ -1218,7 +1273,12 @@ export const CHAI1 = Object.freeze({
   msaDoubleAddPair: true,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
+  rawLastConformer: false,
+  declaredPolymerBonds: null,
   emptyTemplateAatype: null,
+  templateGapWhereNoAtoms: false,
+  ccdUnknownResidue: false,
+  mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
   boltz2TemplateFeatures: false,
@@ -1350,6 +1410,10 @@ export function featuriserDialect(dialect) {
   return {
     symmetriseBonds: dialect.symmetriseBonds,
     centreRefConformers: dialect.centreRefConformers,
+    rawLastConformer: dialect.rawLastConformer,
+    declaredPolymerBonds: dialect.declaredPolymerBonds,
+    ccdUnknownResidue: dialect.ccdUnknownResidue,
+    mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,
     dropTerminalAtoms: dialect.dropTerminalAtoms,

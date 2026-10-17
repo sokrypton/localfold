@@ -48,16 +48,43 @@ __global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, c
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
   float mx = -INFINITY;
   float w = pw[h];
+  // the query's scalars and points held in registers, read once (they were read again for every key); the
+  // keys' scalars as float4s where 16-byte aligned - the same products in the same order
+  constexpr int CS_MAX = 32, PQ_MAX = 8;
+  const bool fast = Cs <= CS_MAX && Pq <= PQ_MAX && Cs % 4 == 0;
+  float qv[CS_MAX], qpt[PQ_MAX * 3];
+  if (fast) {
+#pragma unroll
+    for (int c = 0; c < CS_MAX; ++c) qv[c] = c < Cs ? qs[((size_t)q * Hh + h) * Cs + c] : 0.f;
+#pragma unroll
+    for (int e = 0; e < PQ_MAX * 3; ++e) qpt[e] = e < Pq * 3 ? qp[((size_t)q * Hh + h) * Pq * 3 + e] : 0.f;
+  }
   for (int k = lane; k < L; k += 32) {
     float d2 = 0;
-    for (int p = 0; p < Pq; ++p)
-      for (int a = 0; a < 3; ++a) {
-        float d = qp[(((size_t)q * Hh + h) * Pq + p) * 3 + a] - kp[(((size_t)k * Hh + h) * Pq + p) * 3 + a];
-        d2 += d * d;
-      }
-    float s = -0.5f * w * d2;
     float sc = 0;
-    for (int c = 0; c < Cs; ++c) sc += qs[((size_t)q * Hh + h) * Cs + c] * ks[((size_t)k * Hh + h) * Cs + c];
+    if (fast) {
+      const float* kpk = kp + ((size_t)k * Hh + h) * Pq * 3;
+#pragma unroll
+      for (int p = 0; p < PQ_MAX; ++p)
+        if (p < Pq)
+#pragma unroll
+          for (int a = 0; a < 3; ++a) { float d = qpt[p * 3 + a] - kpk[p * 3 + a]; d2 += d * d; }
+      const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * Cs);
+#pragma unroll
+      for (int c4 = 0; c4 < CS_MAX / 4; ++c4)
+        if (c4 * 4 < Cs) {
+          float4 v = ksk[c4];
+          sc += qv[c4 * 4] * v.x; sc += qv[c4 * 4 + 1] * v.y; sc += qv[c4 * 4 + 2] * v.z; sc += qv[c4 * 4 + 3] * v.w;
+        }
+    } else {
+      for (int p = 0; p < Pq; ++p)
+        for (int a = 0; a < 3; ++a) {
+          float d = qp[(((size_t)q * Hh + h) * Pq + p) * 3 + a] - kp[(((size_t)k * Hh + h) * Pq + p) * 3 + a];
+          d2 += d * d;
+        }
+      for (int c = 0; c < Cs; ++c) sc += qs[((size_t)q * Hh + h) * Cs + c] * ks[((size_t)k * Hh + h) * Cs + c];
+    }
+    float s = -0.5f * w * d2;
     s += sc + b2d[((size_t)q * L + k) * Hh + h];
     s -= 1e5f * (1.f - seqMask[q] * seqMask[k]);
     s *= sqrtf(1.f / 3.f);
@@ -99,6 +126,38 @@ __global__ void ipaOutputsK(const float* attn, const float* vs, const float* vp,
     float s = 0;
     for (int k = 0; k < L; ++k) s += a[k] * act2d[((size_t)q * L + k) * C2 + c];
     f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = s;
+  }
+}
+// ipaOutputsK's pair term, a block a QUERY for every head at once: each act2d element is read once and feeds all Hh
+// heads' sums (a block a (query, head) read the query's pair row once per head - 12 times, ~1.5 GB a call at 494
+// residues). Each sum runs over k in the same order with the same arithmetic, so the outputs are the same bytes.
+constexpr int IPA_MAX_HEADS = 16, IPA_KT = 256;
+__global__ void ipaPairTermK(const float* attn, const float* act2d, float* final_, int L, int Hh, int Cs, int Pv, int C2) {
+  __shared__ float as[IPA_MAX_HEADS][IPA_KT];
+  int q = blockIdx.x, c = threadIdx.x;
+  int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
+  float acc[IPA_MAX_HEADS];
+#pragma unroll
+  for (int h = 0; h < IPA_MAX_HEADS; ++h) acc[h] = 0.f;
+  for (int k0 = 0; k0 < L; k0 += IPA_KT) {
+    int kt = min(IPA_KT, L - k0);
+    __syncthreads();
+    for (int t = threadIdx.x; t < Hh * kt; t += blockDim.x) {
+      int h = t / kt, k = t % kt;
+      as[h][k] = attn[((size_t)q * Hh + h) * L + k0 + k];
+    }
+    __syncthreads();
+    if (c < C2)
+#pragma unroll 8
+      for (int k = 0; k < kt; ++k) {
+        float v = act2d[((size_t)q * L + k0 + k) * C2 + c];
+#pragma unroll
+        for (int h = 0; h < IPA_MAX_HEADS; ++h) if (h < Hh) acc[h] += as[h][k] * v;
+      }
+  }
+  if (c < C2) {
+    float* f = final_ + (size_t)q * Fw;
+    for (int h = 0; h < Hh; ++h) f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = acc[h];
   }
 }
 // a pair position's LayerNorm statistics, by layerNormK's own arithmetic (two passes, a warp a row)
@@ -271,7 +330,10 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     linearB(act, I + "v_point_projection/point_projection", -1, proj, L, C, Hh * 3 * Pv);
     pointsToGlobalK<<<blocks((size_t)L * Hh * Pv), 256, 0, STREAM>>>(proj, rig, vp, L, Hh, Pv);
     ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
-    ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, act2d, rig, fin, L, Hh, Cs, Pv, C2);
+    // (the pair term apart, a block a query: see ipaPairTermK)
+    const bool pairApart = act2d && Hh <= IPA_MAX_HEADS && C2 <= 1024;
+    ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, pairApart ? nullptr : act2d, rig, fin, L, Hh, Cs, Pv, C2);
+    if (pairApart) ipaPairTermK<<<L, (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
     if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
                                                          P(S + "pair_layer_norm/offset"), fin, L, Hh, Cs, Pv, C2);
     linearB(fin, I + "output_projection", -1, upd, L, Fw, C);
