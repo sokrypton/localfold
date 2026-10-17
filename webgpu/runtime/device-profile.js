@@ -1302,8 +1302,16 @@ const PRIORS = new Map([
     // four flash kernels 17% faster. It reassociates the online softmax (relRMS ~1e-7): fold-af2.js, 3 recycles, CA RMSD
     // between the arms 0.006 A (59 residues, against 0.103 for a seed change) and 0.016 A (5CAJ templated, against
     // 0.652), pLDDT 96.562 -> 96.581 and 81.777 -> 81.793. AF3's denoiser level (90.2 / 90.1 against 89.9 / 90.8 ms).
-    // Not measured on an M2.
-    attentionGroup: 4,
+    // 🔴 AND NOT SET: THE M2 LOSES MORE THAN THE M5 GAINS, AND THE BROWSER CANNOT TELL THEM APART (both report
+    // `apple / metal-3`). On the M2 (stock Chrome 154), profile-af2-block.js at 255 residues x 128 rows, two rounds
+    // alternated: the block 196.0 / 194.7 ms with group 4 against 178.8 / 179.5 with 1 (+9%), the four flash kernels
+    // 46.5 / 46.4 against 30.2 / 32.1; bench-msa-attention.js row 128 x 255: 19.4-20.9 against 9.6-10.3 ms. Group 1
+    // stays the default; `--tune=attentionGroup=4` is the M5's arm (a race, as grid-attend-race.js, would win both).
+    // 🔴 AND THE GRID PROJECTION STAYS IN f32 HERE FOR THE SAME REASON. f752a185 made it f16 wherever the pair track
+    // stages in f16 - grid.project 475 / 500 -> 328 / 344 ms a pass on the M5 - and on the M2 it is the other way:
+    // bench-grid-project.js 255 tokens 12.2-14.9 ms in f32 against 15.1-18.7 in f16 (three runs), in the trunk
+    // grid.project 707 / 719 against 870 / 898. Only Apple's entry pins it; other f16 devices keep the rule.
+    gridProjectArithmetic: "f32",
   }],
 ], );
 
