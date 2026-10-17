@@ -74,12 +74,25 @@ For comparison, the reference's own bfloat16 is 5.3e-3 from its float32 on conta
 
 1BRS A:D, which has two chains with a break, matches as closely: pair init exact, contacts 4.9e-7.
 
-## Speed (A100 40 GB, warm)
+## Speed and size (A100 40 GB, warm, the same rows both sides)
 
-| | this port, `--fast` | the reference, bf16 + cuEquivariance |
-|---|---|---|
-| 5CAJ, 512 × 261 | 248 ms | 480 ms |
-| 1B70, 512 × 1,040, two chains | 1.60 s (1.36 s `--contacts-only`) | 6.46 s |
+The reference is run in bf16 with cuEquivariance, its README's settings. The time is the best of three warm calls. The native peak is the whole process on the card (nvidia-smi), weights and CUDA context included; the reference's peak is PyTorch's allocator.
+
+| rows × residues | this port, `--fast` | the reference | speed-up |
+|---|---|---|---|
+| 512 × 247 (1TIM) | 228 ms, 2.9 GB | 437 ms, 2.9 GB | 1.9× |
+| 1,024 × 247 | 405 ms, 3.8 GB | 756 ms, 5.1 GB | 1.9× |
+| 2,048 × 247 | 770 ms, 4.8 GB | 1,398 ms, 9.5 GB | 1.8× |
+| 4,096 × 247 | 1.50 s, 7.2 GB | 2.71 s, 18.3 GB | 1.8× |
+| 512 × 1,023 (1JZ7) | 1.64 s, 9.0 GB | 3.46 s, 13.0 GB | 2.1× |
+| 512 × 1,040 (1B70, two chains) | 1.61 s (1.36 s `--contacts-only`) | 3.28 s, 13.4 GB | 2.0× |
+| 1,024 × 1,023 | 2.51 s, 12.2 GB | 4.97 s, 20.8 GB | 2.0× |
+| 2,048 × 1,023 | 4.25 s, 17.2 GB | out of memory | |
+| 512 × 2,046 (1JZ7 twice, two chains) | 5.17 s, 24.8 GB | out of memory | |
+| 1,024 × 2,046 | 6.85 s, 29.7 GB | out of memory | |
+| 512 × 3,069 (three chains) | 13.1 s, 30.1 GB | out of memory | |
+
+The query-biased outer product is computed a block of rows i at a time. Whole, its product and permuted outer product were 9.6 GB of 38 at 3,069 residues. What grows with length now is the f32 pair (L² × 1 KB) and the triangles' scratch. On a short card the triangles take cuda/ef2's blocked forms.
 
 ## License
 

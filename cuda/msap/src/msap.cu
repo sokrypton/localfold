@@ -132,10 +132,10 @@ __global__ void opmScaleHK(const float* x, const float* w, half* out, int S, int
   int c = (int)(t % 16); size_t r = t / 16; int l = (int)(r % L), s = (int)(r / L);
   out[((size_t)l * 16 + c) * S + s] = __float2half(x[t] * sqrtf(w[s] + 1e-32f));
 }
-// a thread a (i, j, c): the 16 e of one product row, 32 contiguous bytes in and out
-__global__ void opmPermuteHK(const half* prod, half* out, int L, const float* denom) {
+// a thread a (i, j, c): the 16 e of one product row, 32 contiguous bytes in and out (i over a block of Ib rows)
+__global__ void opmPermuteHK(const half* prod, half* out, int Ib, int L, const float* denom) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * L * 16) return;
+  if (t >= (size_t)Ib * L * 16) return;
   int c = (int)(t % 16); size_t ij = t / 16; int i = (int)(ij / L), j = (int)(ij % L);
   const float inv = 1.f / (*denom + 1e-32f);
   const uint4* src = reinterpret_cast<const uint4*>(prod + ((size_t)i * 16 + c) * ((size_t)L * 16) + (size_t)j * 16);
@@ -194,17 +194,23 @@ inline void qOpm(float* pair, const float* m, int S, int L, int l, float* wOut) 
     half* as = scratch<half>("opm.ash", R * 16); half* bs = scratch<half>("opm.bsh", R * 16);
     opmScaleHK<<<blocks(R * 16), 256, 0, STREAM>>>(a, w, as, S, L);
     opmScaleHK<<<blocks(R * 16), 256, 0, STREAM>>>(b, w, bs, S, L);
-    half* prod = scratch<half>("opm.prodh", LC * LC);
-    CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)LC, (int)LC, S, &one, bs, CUDA_R_16F, S, as, CUDA_R_16F, S, &zero, prod,
-                    CUDA_R_16F, (int)LC, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    half* outer = scratch<half>("opm.outerh", P * 256);
-    opmPermuteHK<<<blocks(P * 16), 256, 0, STREAM>>>(prod, outer, L, wsum);
-    const size_t chunk = std::min<size_t>(P, (size_t)64 << 20 >> 9);       // (the projection's rows: 64 M halves)
+    // a block of Ib rows i at a time - the product [Ib 16][L 16] and the permuted outer product [Ib L][256], the same
+    // count each, held to 64 M halves: whole, they were 9.6 GB of 38 at 3,069 residues
+    const int Ib = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 256)));
+    half* prod = scratch<half>("opm.prodh", (size_t)Ib * 16 * LC);
+    half* outer = scratch<half>("opm.outerh", (size_t)Ib * L * 256);
+    const size_t chunk = std::min<size_t>((size_t)Ib * L, (size_t)64 << 20 >> 9);    // (the projection's rows: 64 M halves)
     half* h = scratch<half>("opm.hh", chunk * 512);
-    for (size_t r0 = 0; r0 < P; r0 += chunk) {
-      size_t r = std::min(chunk, P - r0);
-      ltGemm(outer + r0 * 256, Fh(O + "toPair"), h, true, r, 256, 512, F(O + "toPairBias"), false, 0.f);
-      opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + r0 * 256, r);
+    for (int i0 = 0; i0 < L; i0 += Ib) {
+      const int ib = std::min(Ib, L - i0); const size_t rows = (size_t)ib * L;
+      CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)LC, ib * 16, S, &one, bs, CUDA_R_16F, S, as + (size_t)i0 * 16 * S, CUDA_R_16F,
+                      S, &zero, prod, CUDA_R_16F, (int)LC, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      opmPermuteHK<<<blocks(rows * 16), 256, 0, STREAM>>>(prod, outer, ib, L, wsum);
+      for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+        size_t r = std::min(chunk, rows - r0);
+        ltGemm(outer + r0 * 256, Fh(O + "toPair"), h, true, r, 256, 512, F(O + "toPairBias"), false, 0.f);
+        opmGateAddHK<<<blocks(r * 256), 256, 0, STREAM>>>(h, pair + ((size_t)i0 * L + r0) * 256, r);
+      }
     }
     return;
   }
