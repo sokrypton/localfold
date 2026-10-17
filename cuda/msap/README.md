@@ -76,26 +76,41 @@ For comparison, the reference's own bfloat16 is 5.3e-3 from its float32 on conta
 
 ## Speed and size (A100 40 GB, warm, the same rows both sides)
 
-The reference is run in bf16 with cuEquivariance, its README's settings. The time is the best of three warm calls. The native peak is the whole process on the card (nvidia-smi), weights and CUDA context included; the reference's peak is PyTorch's allocator.
+The reference is run in bf16 with cuEquivariance, its README's settings. The time is the best of three warm calls. The native peak is the whole process on the card (nvidia-smi), weights and CUDA context included; the reference's peak is PyTorch's allocator. Where the card has room the triangles take faster whole-plane forms, so a native peak is what a run took on an otherwise empty 40 GB card, not what it needs.
 
 | rows × residues | this port, `--fast` | the reference | speed-up |
 |---|---|---|---|
-| 512 × 247 (1TIM) | 228 ms, 2.9 GB | 437 ms, 2.9 GB | 1.9× |
-| 1,024 × 247 | 405 ms, 3.8 GB | 756 ms, 5.1 GB | 1.9× |
-| 2,048 × 247 | 770 ms, 4.8 GB | 1,398 ms, 9.5 GB | 1.8× |
-| 4,096 × 247 | 1.50 s, 7.2 GB | 2.71 s, 18.3 GB | 1.8× |
-| 512 × 1,023 (1JZ7) | 1.64 s, 9.0 GB | 3.46 s, 13.0 GB | 2.1× |
-| 512 × 1,040 (1B70, two chains) | 1.61 s (1.36 s `--contacts-only`) | 3.28 s, 13.4 GB | 2.0× |
-| 1,024 × 1,023 | 2.51 s, 12.2 GB | 4.97 s, 20.8 GB | 2.0× |
-| 2,048 × 1,023 | 4.25 s, 17.2 GB | out of memory | |
-| 512 × 2,046 (1JZ7 twice, two chains) | 5.17 s, 24.8 GB | out of memory | |
-| 1,024 × 2,046 | 6.85 s, 29.7 GB | out of memory | |
-| 512 × 3,069 (three chains) | 12.4 s, 25.6 GB | out of memory | |
-| 512 × 4,092 | 22.2 s, 37.4 GB | out of memory | |
-| 512 × 5,115 | 41.8 s, 38.0 GB | out of memory | |
+| 512 × 247 (1TIM) | 175 ms, 2.5 GB | 437 ms, 2.9 GB | 2.5× |
+| 512 × 261 (5CAJ) | 191 ms, 2.6 GB | 480 ms | 2.5× |
+| 1,024 × 247 | 304 ms, 3.2 GB | 756 ms, 5.1 GB | 2.5× |
+| 2,048 × 247 | 565 ms, 3.8 GB | 1,398 ms, 9.5 GB | 2.5× |
+| 4,096 × 247 | 1.09 s, 5.5 GB | 2.71 s, 18.3 GB | 2.5× |
+| 512 × 1,023 (1JZ7) | 1.27 s, 7.4 GB | 3.46 s, 13.0 GB | 2.7× |
+| 512 × 1,040 (1B70, two chains) | 1.34 s, 7.6 GB | 3.28 s, 13.4 GB | 2.4× |
+| 1,024 × 1,023 | 1.86 s, 9.2 GB | 4.97 s, 20.8 GB | 2.7× |
+| 2,048 × 1,023 | 2.99 s, 12.6 GB | out of memory | |
+| 512 × 2,046 (1JZ7 twice, two chains) | 4.45 s, 17.1 GB | out of memory | |
+| 1,024 × 2,046 | 5.73 s, 20.5 GB | out of memory | |
+| 512 × 3,069 | 10.1 s | out of memory | |
+| 512 × 4,092 | 21.1 s, 27.6 GB | out of memory | |
+| 512 × 5,115 | 36.0 s, 38.1 GB | out of memory | |
 
-Under `--fast` the pair is bf16 from its first value to the last layer, as cuda/ef2 keeps ESMFold2's (`--pair-f32` keeps it f32: 30.1 GB at 3,069). It costs contacts 7.8e-4 -> 3.1e-3 from the float32 reference on 5CAJ, still inside the reference's own bf16 (5.3e-3).
-The query-biased outer product is computed a block of rows i at a time. Whole, its product and permuted outer product were 9.6 GB of 38 at 3,069 residues. On a card short of room the MSA side's scratch is given back before each pair block, whose blocked triangle wants a whole operand plane (13.4 GB at 5,115).
+With all but 15 GiB of the card held by another process (a T4's room, though a T4 itself keeps the pair f32), 512 × 3,069 runs in 16.1 s.
+
+What the `--fast` path does (each step's numbers are in its commit message):
+- **The pair is bf16** from its first value to the last layer, as cuda/ef2 keeps ESMFold2's (`--pair-f32` keeps it f32). Contacts on 5CAJ move 7.8e-4 -> 3.2e-3 from the float32 reference, still inside the reference's own bf16 (5.3e-3).
+- **The MSA transition's SwiGLU is fused into its up-projection** (`swiglu.cuh`). It is a GEMM shaped as cuBLAS's own kernel for this product, the gate applied in registers; the 3,712-wide intermediate never reaches memory. 133,632 rows: 2.61 ms against cuBLASLt plus the SwiGLU pass's 3.61.
+- **The pair-weighted averaging's per-head sum is one GEMM a head** (`pwaHeadK`). It reads the values in place and gates them on the way out, at 149 TFLOPS where cuBLAS's per-(sequence, head) form ran 35. Values and gates come from one GEMM.
+- **The query-biased outer product:**
+  - k, left and right come from one f16 GEMM;
+  - the scores LayerNorm k's halves on the fly;
+  - the contraction reads both operands as they lie, a block of rows i at a time;
+  - its projection, SwiGLU and residual are one kernel reading the product in place (`opmProjectK`).
+- **Weights:** the MSA side's f32 weights are dropped after their f16 copies are made (338 MB).
+- **Scratch:** the MSA side's scratch is given back before a short card's pair block, whose blocked triangle wants a whole operand plane (13.4 GB at 5,115).
+- **Tried and not taken:** the transition in chunks small enough to stay in L2 (the GEMMs lose more than the cache gains).
+
+The pair block (two triangle multiplications and a transition) is cuda/ef2's, unchanged. It is 21% of a 261-residue pass and 44% at 1,023.
 
 ## License
 
