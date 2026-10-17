@@ -298,6 +298,9 @@ def page_arm(bad):
             arms.insert(3, ("ef2", 68, True))
         if "ef2-fast" in served:          # (chosen as a reader does: EF2-fast on the model row, ESM-C 6B on the PLM row)
             arms.insert(3, ("ef2-fast", 68, True))
+        # ...and the lineage again, streamed, after other folds: a later fold's trunk must draw its contact maps (the
+        # first fold's frames used to hold the panel and drop every one)
+        arms.insert(len(arms) - 1, (lineage, 68, True))
         for family, tokens, streamed in arms:
             cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.native-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
@@ -332,6 +335,7 @@ def page_arm(bad):
             cdp.evaluate(ws, """(() => { const m = document.getElementById('msa-mode'); if (!m) return true;
               m.value = 'none'; m.dispatchEvent(new Event('change', { bubbles: true })); return true; })()""")
             cdp.wait_for(ws, "!document.getElementById('predict').disabled", 60, "the fold button")
+            shownBefore = cdp.evaluate(ws, "window.__trunkContactsShown ?? 0")
             started = time.time()
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")
             cdp.wait_for(ws, """(() => { const t = document.getElementById('status-message').textContent;
@@ -367,6 +371,11 @@ def page_arm(bad):
             jump = f"{got['jump']:.2f} A" if isinstance(got["jump"], (int, float)) else str(got["jump"])
             print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  last step {jump:>7s}  {got['status'][:60]}")
             problems = []
+            # every streamed fold of the AF3 lineage draws its trunk's contact maps before its first frame - the second
+            # fold in a page too, where the first fold's frames used to hold the panel and drop them all
+            shown = cdp.evaluate(ws, "window.__trunkContactsShown ?? 0") - shownBefore
+            if streamed and family in ("af3", "protenix2", "intellifold2", "boltz2", "rosettafold3", "opendde") and shown < 1:
+                problems.append("no trunk contact map was drawn")
             if got["jump"] is not None and (not isinstance(got["jump"], (int, float)) or got["jump"] > 2.0):
                 problems.append(f"the result's frame lands {got['jump']} A from the last streamed one, as drawn")
             if f" on {NATIVE_NAME} " not in got["status"] or "done in" not in got["status"]:

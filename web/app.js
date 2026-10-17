@@ -1966,6 +1966,8 @@ function showTrunkContacts(liveContacts, chains) {
     });
     window.Heatmap?.updateVisibility?.(renderer);
     renderer.render("trunk-contacts");
+    // (counted, for a gate: tools/check-native-worker.py reads that a later fold's trunk drew its maps)
+    window.__trunkContactsShown = (window.__trunkContactsShown ?? 0) + 1;
   } catch (cause) {
     console.warn("could not show the trunk's contact map", cause);
   }
@@ -4028,6 +4030,7 @@ async function followRemoteFold({ since, label, signal }) {
       for (let i = 0; i < bytes.length; i += 1) probs[i] = bytes[i] / 255;
       liveContact = contactMapFor(probs, undefined);
       if (liveContact === undefined) return;
+      draw.open();
       showTrunkContacts(liveContact, expandEntities(formInputs().entities).chains);
     } catch (cause) { console.warn("streamed contact map skipped:", cause); }
   };
@@ -4278,7 +4281,7 @@ function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   let lastFrame;
   let opened = false;
   let colouring = false;
-  return (pdb) => {
+  const drawer = (pdb) => {
     const api = window.py2Dmol;
     if (api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
@@ -4306,6 +4309,13 @@ function remoteFrameDrawer(stem, liveMaps = () => undefined) {
     }
     return lastFrame;
   };
+  // 🔴 THIS FOLD'S OBJECT, OPENED BY ITS FIRST CONTACT MAP AND NOT ONLY BY ITS FIRST FRAME. The trunk's maps are drawn
+  // only while the current object has no frames (showTrunkContacts), and the object was opened here on the sampler's
+  // first frame - so on every fold after the first, the previous fold's frames held the panel and each trunk pass's
+  // map was dropped: a second fold showed none (found on IntelliFold-2, true of every model). The WebGPU paths open
+  // theirs as the fold starts.
+  drawer.open = () => { if (!opened) { openBlankFold(stem); opened = true; } };
+  return drawer;
 }
 
 async function fold(event) {
