@@ -301,30 +301,22 @@ __global__ void __launch_bounds__(PH_NTH) pwaHeadK(const half* __restrict__ vg, 
     *reinterpret_cast<uint4*>(out + row * Wd + h * d + ec) = rv;
   }
 }
+// B: variants side by side - m [B][S][T][Cm], pair [B][T][T][C] (MSA Pairformer's batched passes); the LayerNorm runs over
+// every variant's rows at once, the pair side and the per-head sums a variant at a time
 inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int T, int Cm, int C, const std::string& Bn,
-                                         bool pair16 = false) {
+                                         bool pair16 = false, int B = 1) {
   if (pair16 && C != 256) { fprintf(stderr, "a bf16 pair's pair-weighted averaging is 256 channels\n"); exit(1); }
   const int heads = (int)M.meta("meta/msaHeads"), d = (int)M.meta("meta/msaHeadWidth"), Wd = heads * d;
   size_t rows = (size_t)S * T, P = (size_t)T * T;
   // (msa.lnh: one f16 copy of the normed MSA rows - MSA Pairformer's outer product normalises into the same buffer)
-  half* ln = scratch<half>("msa.lnh", rows * Cm);
-  layerNormH(m, ln, rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
+  half* lnAll = scratch<half>("msa.lnh", (size_t)B * rows * Cm);
+  layerNormH(m, lnAll, (size_t)B * rows, Cm, F(Bn + "normScale"), F(Bn + "normOffset"));
   float* flat = scratch<float>("msa.flat", P * heads);
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (2 * (size_t)C));
   half* pln = scratch<half>("msah.pln", chunk * C);
-  for (size_t r0 = 0; r0 < P; r0 += chunk) {
-    size_t r = std::min(chunk, P - r0);
-    if (pair16)
-      layerNormVK<256, __nv_bfloat16, half><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(
-          reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, pln, r, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
-    else layerNormH(pair + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
-    ltGemm(pln, Fh(Bn + "pairLogits"), flat + r0 * heads, false, r, C, heads, nullptr, false, 0.f);
-  }
   float* w = scratch<float>("msa.w", (size_t)heads * P);
-  pwaSoftmaxK<<<(unsigned)(heads * T), 128, 0, STREAM>>>(flat, w, T, heads);
   const int Tp = (T + 7) / 8 * 8;
   half* wh = scratch<half>("msah.w", (size_t)heads * T * Tp);
-  pwaWeightsHK<<<blocks((size_t)heads * T * Tp), 256, 0, STREAM>>>(w, wh, T, Tp, (size_t)heads * T);
   int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, ((size_t)128 << 20) / ((size_t)T * Wd * 2)));
   // the values and gates in one GEMM (valueGate: [Cm][2 Wd]), rows 2 Wd wide
   if (d != 32) { fprintf(stderr, "the fused per-head kernel is 32 channels a head (%d)\n", d); exit(1); }
@@ -332,12 +324,27 @@ inline void msaPairWeightedAveragingFast(float* m, const float* pair, int S, int
   half* v = scratch<half>("msah.v", (size_t)Sc * T * Wd);
   static bool attr = false;
   if (!attr) { smemAttr(pwaHeadK, (int)PH_SMEM); attr = true; }
-  for (int s0 = 0; s0 < S; s0 += Sc) {
-    int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
-    const half* lnc = ln + (size_t)s0 * T * Cm;
-    ltGemm(lnc, Fh(Bn + "valueGate"), vg, true, cr, Cm, 2 * Wd, nullptr, false, 0.f);
-    pwaHeadK<<<dim3((T + PH_BN - 1) / PH_BN, (sc + PH_SQ - 1) / PH_SQ, heads), PH_NTH, PH_SMEM, STREAM>>>(vg, 2 * Wd, wh, v, sc, T, Tp, Wd);
-    ltGemm(v, Fh(Bn + "output"), m + (size_t)s0 * T * Cm, false, cr, Wd, Cm, nullptr, false, 1.f);
+  for (int b = 0; b < B; ++b) {
+    const float* pb = pair16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(pair) + (size_t)b * P * C)
+                             : pair + (size_t)b * P * C;
+    float* mb = m + (size_t)b * rows * Cm; const half* ln = lnAll + (size_t)b * rows * Cm;
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      if (pair16)
+        layerNormVK<256, __nv_bfloat16, half><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(
+            reinterpret_cast<const __nv_bfloat16*>(pb) + r0 * C, pln, r, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+      else layerNormH(pb + r0 * C, pln, r, C, F(Bn + "pairNormScale"), F(Bn + "pairNormOffset"));
+      ltGemm(pln, Fh(Bn + "pairLogits"), flat + r0 * heads, false, r, C, heads, nullptr, false, 0.f);
+    }
+    pwaSoftmaxK<<<(unsigned)(heads * T), 128, 0, STREAM>>>(flat, w, T, heads);
+    pwaWeightsHK<<<blocks((size_t)heads * T * Tp), 256, 0, STREAM>>>(w, wh, T, Tp, (size_t)heads * T);
+    for (int s0 = 0; s0 < S; s0 += Sc) {
+      int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * T;
+      const half* lnc = ln + (size_t)s0 * T * Cm;
+      ltGemm(lnc, Fh(Bn + "valueGate"), vg, true, cr, Cm, 2 * Wd, nullptr, false, 0.f);
+      pwaHeadK<<<dim3((T + PH_BN - 1) / PH_BN, (sc + PH_SQ - 1) / PH_SQ, heads), PH_NTH, PH_SMEM, STREAM>>>(vg, 2 * Wd, wh, v, sc, T, Tp, Wd);
+      ltGemm(v, Fh(Bn + "output"), mb + (size_t)s0 * T * Cm, false, cr, Wd, Cm, nullptr, false, 1.f);
+    }
   }
 }
 
