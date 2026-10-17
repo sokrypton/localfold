@@ -4137,9 +4137,15 @@ async function followRemoteFold({ since, label, signal }) {
     confidence: cuda.confidence,
     length: result.length,
   });
-  if (viewer !== undefined && Object.keys(camera).length > 0) {
+  // 🔴 THE CAMERA IS KEPT ONLY WHERE THE FOLD WAS WATCHED. It is the streamed trajectory's, oriented on its first
+  // frame, and keeping it holds the picture steady as the result replaces the frames. With Live preview off nothing
+  // was streamed: the camera held is the PREVIOUS fold's, and the result - in the model's own coordinates, tens of
+  // angstroms from anywhere - was drawn off-centre or out of view. It gets the best view of itself instead.
+  if (viewer !== undefined && framePdbs.length > 0 && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
+  } else if (viewer !== undefined && framePdbs.length === 0) {
+    orientBestView(viewer);
   }
   const api = window.py2Dmol;
   if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
