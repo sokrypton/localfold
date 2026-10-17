@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "select.cuh"
+#include "swiglu.cuh"
 
 // m[s][l][:] = W[token][:]: the one-hot's projection is a row gather
 __global__ void msaEmbedK(const int* tok, const float* W, float* m, size_t rows, int C) {
@@ -401,21 +402,27 @@ inline std::vector<int> greedyRows(const std::vector<std::string>& rows, const s
 }
 
 // ---------------------------------------------------------------- the MSA's transition under --fast
-// cuda/ef2's transitionFast at ~64 K rows a chunk: past that the GEMMs gain nothing (2,048 x 1,023: 1,629 ms against
-// 1,617 at 512 K) and the widened rows are 475 MB; below it they lose (2,048 rows: 2,281 ms). Fusing the SwiGLU into
-// the up-projection - a dual GEMM whose gate and value tiles share the A tile, only the gated rows stored - was
-// written and measured: correct, and slower at every tiling swept (1,719-2,646 ms against 1,619), its tensor pipe 44%
-// busy where cuBLAS's GEMM runs at ~66% (207 TFLOPS), for a SwiGLU pass worth ~370 ms. Not taken.
+// LN -> the up-projection and SwiGLU in one kernel (swiglu.cuh: the [rows][2I] widening never reaches memory) -> the
+// down-projection accumulated into the f32 rows by cuBLASLt. ~64 K rows a chunk: past that the GEMMs gain nothing.
+// The fused kernel against cuBLASLt's GEMM and the SwiGLU pass, 133,632 rows (5CAJ at 512): 2.61 ms against 3.61
+inline const half* swigluWeight(const std::string& name, int C, int I) {      // W1 re-laid for swigluUpK, once a tensor
+  static std::map<std::string, half*> made;
+  auto it = made.find(name);
+  if (it != made.end()) return it->second;
+  half* w = dallocT<half>((size_t)C * 2 * I);
+  swigluInterleaveK<<<blocks((size_t)C * 2 * I), 256, 0, STREAM>>>(Fh(name), w, C, I);
+  return made[name] = w;
+}
 inline void msaTransitionFast(float* x, size_t P, int C, const std::string& Tn) {
   const int I = (int)dimOf("f/" + Tn + "transition2", 0);
+  if (I % SG_BN || C % 8) { fprintf(stderr, "the fused SwiGLU wants I a multiple of %d and C of 8 (%d, %d)\n", SG_BN, I, C); exit(1); }
   const size_t chunk = std::min<size_t>(P, 65536);
-  half* xn = scratch<half>("ftr.xn", chunk * C);
-  half* h = scratch<half>("ftr.h", chunk * 2 * I); half* g = scratch<half>("ftr.g", chunk * I);
+  half* xn = scratch<half>("ftr.xn", chunk * C); half* g = scratch<half>("ftr.g", chunk * I);
+  const half* w1 = swigluWeight(Tn + "transition1", C, I);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     const size_t r = std::min(chunk, P - r0);
     layerNormH(x + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
-    ltGemm(xn, Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
-    swigluH(h, g, r, I);
+    swigluUp(xn, w1, g, r, C, I);
     ltGemm(g, Fh(Tn + "transition2"), x + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }
 }
