@@ -27,7 +27,17 @@ import sys
 import time
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
+# `--js-float16array` only where this node lacks the type and knows the flag, as `npm test` asks: node 26 ships
+# Float16Array and refuses the flag ("bad option"), which failed every JavaScript arm here
+def _float16_flag():
+    try:
+        if subprocess.run(["node", "-e", "process.exit(typeof Float16Array === 'undefined' ? 0 : 1)"]).returncode != 0:
+            return []
+        known = "--js-float16array" in subprocess.run(["node", "--v8-options"], capture_output=True, text=True).stdout
+        return ["--js-float16array"] if known else []
+    except OSError:
+        return []
+NODE = ["node", *_float16_flag(), "--max-old-space-size=24000"]
 WORK = "/tmp/claude-1000/nf"
 FIX = os.path.join(REPO, "tools", "fixtures")
 AF3_EXAMPLES = os.path.join(FIX, "af3-jobs")
