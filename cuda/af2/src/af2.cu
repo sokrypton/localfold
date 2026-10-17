@@ -674,6 +674,13 @@ static int foldMain(int argc, char** argv) {
       return lf::weights::af2WeightLines(manifest, S, deltaModel);
     }, deltaDir);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
+  // short of room (shortPair) as AF3 decides it from Ampere on: when 18x the f32 pair does not fit the room this process
+  // had at its first ask, where a 64th of the card sent a fold to the f32 pair and its blocked forms from ~1,700 residues
+  // with the RTX PRO 6000 two-thirds empty - there 2,000 / 2,500 residues at 508 + 5,120 rows 25.8 / 41.6 -> 24.7 / 39.8 s
+  // (peak 25.8 -> 26.4 and 32.5 -> 33.8 GB); on the A100 1,500 / 1,800 26.70 / 39.95 -> 26.19 / 39.09 s, 2,000 level (18x
+  // past its room either way). The ordinary paths' peak measured 13.7x the f32 pair (22.8 GB at 1,800 with 5,120 extra
+  // rows). A T4 keeps the 64th: its unfused kernels hold more, unmeasured under this rule
+  if (ccMajor() >= 8) SHORT_PAIR_TIMES = 18;
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;
   // --fast (every fold the standalone and the worker run): the modules' large scratch shared between them (af3/src/
