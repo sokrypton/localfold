@@ -24,7 +24,7 @@ Every module but the outer product, the input embeddings and the heads is one ES
 bash cuda/build.sh msap                                  # cuda/msap/localfold-msap
 ~/venv_msap/bin/python tools/export_msap.py              # cuda/msap/weights (needs torch; the checkpoint is fetched
                                                          #   by MSAPairformer.from_pretrained(weights_dir=~/msap/weights))
-cuda/msap/localfold-msap --a3m=x.a3m --out=x/ --fast     # x/cb_contacts.npy, confind_contacts.npy [L][L],
+cuda/msap/localfold-msap --a3m=x.a3m --out=x/            # x/cb_contacts.npy, confind_contacts.npy [L][L],
                                                          #   logits.npy [L][26], subsample.a3m
 ```
 
@@ -33,7 +33,7 @@ Options:
 - `--embeddings` adds `query.npy` [L][464] (the final MSA's query row) and `pair.npy` [L][L][256].
 - `--contacts-only` stops after layer 18: the same contacts, about 15% faster.
 - `--depth=N` sets the subsample's depth (default 512, the reference's).
-- Without `--fast` every activation is float32, the reference arm.
+- `--f32` runs every activation float32: the reference arm the oracle checks the port with, ~4x slower. The default is the fast path - f16 activations into tensor-core GEMMs with f32 accumulation, the pair bf16 (`--pair-f32` keeps only the pair f32) - called `--fast` below.
 
 ## The subsample
 

@@ -11,13 +11,13 @@
 // embeddings and the heads is cuda/ef2's (ESMFold2's MSA encoder is the same module set): its kernels read the
 // weights tools/export_msap.py writes in ESMFold2's names and layouts.
 //
-//   localfold-msap --a3m=<alignment> --out=<dir> [--fast] ...   contacts, logits, embeddings (USAGE below)
+//   localfold-msap --a3m=<alignment> --out=<dir> ...            contacts, logits, embeddings (USAGE below)
 //   localfold-msap --oracle=<dir> --check                       tools/oracle/dump_msap.py's own subsample, every stage
 //                                                               compared with the reference's
 //
-// --fast (f16 activations into tensor-core GEMMs, f32 accumulation and residuals) is 7.8e-4 from the float32
-// reference on 5CAJ's contacts, where the reference's own bfloat16 is 5.3e-3 from it (1B70); without it every
-// stage is within 2.6e-6.
+// The fast path (f16 activations into tensor-core GEMMs with f32 accumulation, the pair bf16 - "--fast" below) is the
+// default: 3.2e-3 from the float32 reference on 5CAJ's contacts, where the reference's own bfloat16 is 5.3e-3 from it
+// (1B70). --f32 runs every activation float32 - every stage within 2.6e-6 - the arm the oracle checks the port with.
 #include "../../ef2/src/shim.cuh"   // (trunk.cuh's streamed z_init reads it; unused here)
 #include "../../ef2/src/msa.cuh"
 #include <chrono>
@@ -591,17 +591,18 @@ inline bool checking = false;
 #define CHECK(...) do { if (checking) check(__VA_ARGS__); } while (0)
 
 static const char* USAGE =
-  "localfold-msap --a3m=<alignment> --out=<dir> [--fast] [--depth=512] [--chain-breaks=i,j] [--weights=<dir>]\n"
+  "localfold-msap --a3m=<alignment> --out=<dir> [--f32] [--depth=512] [--chain-breaks=i,j] [--weights=<dir>]\n"
   "               [--embeddings | --contacts-only]\n"
   "  writes <dir>/cb_contacts.npy and confind_contacts.npy [L][L], logits.npy [L][26] (the query's 26 tokens,\n"
   "  ARNDCEQGHILKMFPSTWYVXBZUO-), subsample.a3m (the rows the model read), and with --embeddings query.npy [L][464]\n"
   "  (the final MSA's query row) and pair.npy [L][L][256] (the pair after the last layer)\n"
   "  --chain-breaks: the residue each chain after the first starts at (a ColabFold '#' header gives them)\n"
-  "  --pair-f32: keep the pair f32 under --fast (it is bf16 there otherwise: half its bytes)\n"
+  "  --f32: every activation float32 (the reference arm, ~4x slower); --pair-f32: only the pair f32 (it is bf16 otherwise)\n"
   "  --contacts-only: stop at the last contact head's layer (19 of 22) - no logits, no embeddings\n"
   "localfold-msap --oracle=<dump dir> [--check] [--repeat=N]    tools/oracle/dump_msap.py's subsample, its stages compared\n";
 
 int main(int argc, char** argv) {
+  FAST = true;                    // (the f16 path is the port; --f32 is the reference arm)
   std::string weights, oracle, a3m, out, breaksArg; int repeats = 1, maxDepth = 512; bool embeddings = false, contactsOnly = false, pairF32Flag = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
@@ -614,7 +615,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--contacts-only")) contactsOnly = true;
     else if (!strcmp(argv[i], "--pair-f32")) pairF32Flag = true;
     else if (!strcmp(argv[i], "--stages")) STAGE.on = true;
-    else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strcmp(argv[i], "--f32")) FAST = false;
     else if (!strcmp(argv[i], "--check")) checking = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeats = atoi(argv[i] + 9);
     else { fprintf(stderr, "unknown flag %s\n%s", argv[i], USAGE); return 1; }
