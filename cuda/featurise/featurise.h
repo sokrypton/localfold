@@ -41,6 +41,7 @@ struct FeaturiseOptions {
   int declaredPolymerBonds = 0;
   bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK
   bool declaredBondFeature = false;               // chai1: every declared bond, [from][to], in declaredBondMatrix
+  bool chaiConformers = false;                    // chai1: standard residues on chai-lab's conformers
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool atomizedElementNames = false, atomizedUnknownMsa = false;
@@ -599,36 +600,41 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     }
   }
 
-  // boltz2: the last conformer group's non-atomised tokens take Boltz-2's stored conformer, raw (featurise.js)
+  // a token that is not atomised takes the table's position of each atom its residue's entry names (featurise.js)
+  static const char* NAMES[] = { "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET",
+                                 "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "-", "A", "G", "C", "U", "DA", "DG",
+                                 "DC", "DT", "N" };
+  std::map<std::pair<int, int>, int> share;
+  for (int t = 0; t < tokens; ++t) share[{ b.asymId[t], b.residueIndex[t] }] += 1;
+  auto overrideConformer = [&](int t, const std::vector<RawConformer>& table) {
+    if (share[{ b.asymId[t], b.residueIndex[t] }] > 1) return;
+    if (b.aatype[t] < 0 || b.aatype[t] > 30) return;
+    const RawConformer* entry = nullptr;
+    for (auto& e : table) if (std::string(e.residue) == NAMES[b.aatype[t]]) entry = &e;
+    if (!entry) return;
+    for (int k = 0; k < DENSE; ++k) {
+      const int flat = t * DENSE + k;
+      if (b.refMask[flat] == 0) continue;
+      std::string name;
+      for (int c = 0; c < 4; ++c) { int v = b.refAtomNameChars[flat * 4 + c]; if (v >= 0 && v < 64) name += (char)(v + 32); }
+      while (!name.empty() && name.back() == ' ') name.pop_back();
+      while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+      for (auto& a : entry->atoms) if (name == a.name) {
+        b.refPos[flat * 3] = (float)a.x; b.refPos[flat * 3 + 1] = (float)a.y; b.refPos[flat * 3 + 2] = (float)a.z;
+        break;
+      }
+    }
+  };
+  // chai1: every standard residue on chai-lab's conformer; boltz2: the last conformer group's on Boltz-2's stored one, raw
+  if (o.chaiConformers) for (int t = 0; t < tokens; ++t) overrideConformer(t, chai1Conformers());
   if (o.rawLastConformer) {
-    static const char* NAMES[] = { "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET",
-                                   "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "-", "A", "G", "C", "U", "DA", "DG",
-                                   "DC", "DT", "N" };
     bool any = false; int last = 0;
     for (int slot = 0; slot < tokens * DENSE; ++slot)
       if (b.refMask[slot] != 0) { last = any ? std::max(last, b.refSpaceUid[slot]) : b.refSpaceUid[slot]; any = true; }
-    std::map<std::pair<int, int>, int> share;
-    for (int t = 0; t < tokens; ++t) share[{ b.asymId[t], b.residueIndex[t] }] += 1;
     for (int t = 0; any && t < tokens; ++t) {
       bool inLast = false;
       for (int k = 0; k < DENSE && !inLast; ++k) inLast = b.refMask[t * DENSE + k] != 0 && b.refSpaceUid[t * DENSE + k] == last;
-      if (!inLast || share[{ b.asymId[t], b.residueIndex[t] }] > 1) continue;
-      if (b.aatype[t] < 0 || b.aatype[t] > 30) continue;
-      const RawConformer* entry = nullptr;
-      for (auto& e : boltz2RawConformers()) if (std::string(e.residue) == NAMES[b.aatype[t]]) entry = &e;
-      if (!entry) continue;
-      for (int k = 0; k < DENSE; ++k) {
-        const int flat = t * DENSE + k;
-        if (b.refMask[flat] == 0) continue;
-        std::string name;
-        for (int c = 0; c < 4; ++c) { int v = b.refAtomNameChars[flat * 4 + c]; if (v >= 0 && v < 64) name += (char)(v + 32); }
-        while (!name.empty() && name.back() == ' ') name.pop_back();
-        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
-        for (auto& a : entry->atoms) if (name == a.name) {
-          b.refPos[flat * 3] = (float)a.x; b.refPos[flat * 3 + 1] = (float)a.y; b.refPos[flat * 3 + 2] = (float)a.z;
-          break;
-        }
-      }
+      if (inLast) overrideConformer(t, boltz2RawConformers());
     }
   }
 

@@ -68,6 +68,9 @@ export const ALPHAFOLD3 = Object.freeze({
   // matrix, [from][to] for every declared bond of every kind and nothing else, read by the trunk and the
   // diffusion pair through the two halves of its bond projection. The featuriser's `declaredBondMatrix`.
   declaredBondFeature: false,
+  // chai-1's standard residues and nucleotides on chai-lab's own conformers (chai1-conformers.js, af3-any-model 9e7446b)
+  // rather than the CCD's ideal ones
+  chaiConformers: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -315,6 +318,7 @@ export const OPENBIND0 = Object.freeze({
   // af3-any-model b84aa69: unk_residues 10.6 -> 1.2 A). reference-conformers-unk.js
   ccdUnknownResidue: true,
   declaredBondFeature: false,
+  chaiConformers: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
   // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
   mainMsaCap: 16384,
@@ -461,6 +465,7 @@ export const OPENDDE = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: false,
+  chaiConformers: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -716,6 +721,7 @@ export const PROTENIX2 = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: false,
+  chaiConformers: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -910,6 +916,7 @@ export const BOLTZ2 = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: false,
+  chaiConformers: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -1001,6 +1008,7 @@ export const INTELLIFOLD2 = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: false,
+  chaiConformers: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1178,6 +1186,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: false,
+  chaiConformers: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1289,6 +1298,7 @@ export const CHAI1 = Object.freeze({
   templateGapWhereNoAtoms: false,
   ccdUnknownResidue: false,
   declaredBondFeature: true,
+  chaiConformers: true,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1428,6 +1438,7 @@ export function featuriserDialect(dialect) {
     declaredPolymerBonds: dialect.declaredPolymerBonds,
     ccdUnknownResidue: dialect.ccdUnknownResidue,
     declaredBondFeature: dialect.declaredBondFeature,
+    chaiConformers: dialect.chaiConformers,
     mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,

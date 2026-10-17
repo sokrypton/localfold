@@ -261,6 +261,16 @@ sequence and ESM2, against af3-any-model's own r3 fold: TetR dimer + tetO DNA **
 sotorasib, covalently bonded, inside the reference's own five-sample spread (SG-C25 1.65 A). Its batch is
 exact against 3.1.16 on 6MRR, GOL+SEP, 5CM DNA and the kitchen sink but for the conformer floor (no 5' OP3
 now either, `dropTerminalAtoms: true`).
+
+**chai-1's own inputs** (af3-any-model 7cc3165, 1f9b3cf, 9e7446b; ColabFold ebbd90d): its MSA transition reads the MSA
+its weighted averaging does, in parallel; IsPairedMSA marks only the paired block's homolog rows; with an alignment a
+protein chain's profile is chai's uint8 count over its deduplicated rows and every other polymer chain its
+single-sequence context (shared/af3/featurise/chai-msa.js, cuda/featurise/chai_msa.h), and an alignment of nothing but
+the query is none; and every standard residue and nucleotide sits on chai-lab's own conformer (`chaiConformers`,
+chai1-conformers.js, Apache-2.0) rather than the CCD's. Every trunk seam is at the float32 floor against
+af3-any-model's with 5K9P's 21,008-row alignment (4e-7 to 5e-6; no chai-1 reference had seen a live alignment before -
+fold_check featurises with `has_msa=False`), 6MRR's batch is exact on every field, `ref_pos` included, and 6MRR folds
+at 1.04 A (from 1.73) through the worker.
 - The diffusion's pair input (chai's structure token-pair features) and the confidence head's single. The
   first is fixed in af3-any-model as well (its c38fec3); the attention mask and the unknown restype in its
   4ec4850.

@@ -15,6 +15,7 @@ const { REFERENCE_CONFORMERS, RESIDUE_TYPES } = await import(`${repo}shared/af3/
 const { DNA_CONFORMERS, RNA_CONFORMERS } = await import(`${repo}shared/af3/featurise/reference-conformers-nucleic.js`);
 const { DIALECTS, DIALECT_ALIASES, featuriserDialect } = await import(`${repo}shared/af3/dialect.js`);
 const { BOLTZ2_RAW_CONFORMERS } = await import(`${repo}shared/af3/featurise/boltz2-conformers.js`);
+const { CHAI1_CONFORMERS } = await import(`${repo}shared/af3/featurise/chai1-conformers.js`);
 const { UNK_CCD_CONFORMER } = await import(`${repo}shared/af3/featurise/reference-conformers-unk.js`);
 const { ELEMENT_SYMBOLS } = await import(`${repo}shared/af3/featurise/ccd-component.js`);
 const { AF3_MSA_CODES } = await import(`${repo}shared/af3/featurise/msa-features.js`);
@@ -75,13 +76,20 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
     + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
     + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}, ${bool(d.templateGapWhereNoAtoms)},`
-    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}},`);
+    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");
 lines.push("inline const std::vector<RawConformer>& boltz2RawConformers() {");
 lines.push("  static const std::vector<RawConformer> table = {");
 for (const [residue, atomsOf] of Object.entries(BOLTZ2_RAW_CONFORMERS)) {
+  lines.push(`    {${str(residue)}, {${Object.entries(atomsOf).map(([n, [x, y, z]]) => `{${str(n)}, ${num(x)}, ${num(y)}, ${num(z)}}`).join(", ")}}},`);
+}
+lines.push("  };", "  return table;", "}", "");
+lines.push("// shared/af3/featurise/chai1-conformers.js CHAI1_CONFORMERS");
+lines.push("inline const std::vector<RawConformer>& chai1Conformers() {");
+lines.push("  static const std::vector<RawConformer> table = {");
+for (const [residue, atomsOf] of Object.entries(CHAI1_CONFORMERS)) {
   lines.push(`    {${str(residue)}, {${Object.entries(atomsOf).map(([n, [x, y, z]]) => `{${str(n)}, ${num(x)}, ${num(y)}, ${num(z)}}`).join(", ")}}},`);
 }
 lines.push("  };", "  return table;", "}", "");

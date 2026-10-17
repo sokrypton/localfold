@@ -33,6 +33,7 @@ struct FamilyFlags {
   bool ccdUnknownResidue;           // openbind0: an unknown amino acid as the CCD's UNK (unkCcdConformer)
   int mainMsaCap;                   // openbind0: each chain's first N unpaired rows, deduplicated (0 none)
   bool declaredBondFeature;         // chai1: every declared bond as its own directed token matrix (declaredBondMatrix)
+  bool chaiConformers;              // chai1: standard residues on chai-lab's conformers (chai1Conformers)
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

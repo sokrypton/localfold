@@ -43,6 +43,7 @@
 import { conformerFor, aatypeFor, RESIDUE_TYPES } from "./reference-conformers.js";
 import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
 import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
+import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
@@ -1196,39 +1197,48 @@ export function featuriseProtein(sequence, options = {}) {
   // 🔴 boltz2's LAST CONFORMER GROUP KEEPS BOLTZ-2's STORED CONFORMER, RAW. Boltz-2 centres and rotates each group in
   // `range(max(ref_space_uid))` - an off-by-one that skips the last - so native feeds its final group the stored
   // conformer in its own frame (boltz2-conformers.js). af3-any-model 79edb5e matched it: polyQ200 pLDDT 53 -> 85, native
-  // 83. As there: after the centring, the last group's tokens that are not atomised take the stored position of every
-  // atom whose name the residue's entry has (the rest keep the centred value); the restype names the entry
-  // (AF3's POLYMER_TYPES_WITH_UNKNOWN_AND_GAP), and an atomised residue - more than one token on one (asym, residue) -
-  // is left alone.
+  // 83. As there: after the centring, the last group's tokens take the stored conformer (overrideConformer below).
+  // (both by af3-any-model's _override_ref_conformers: a token that is not atomised takes the table's position of every
+  // atom whose name its residue's entry has - the restype names the entry, AF3's POLYMER_TYPES_WITH_UNKNOWN_AND_GAP -
+  // and the rest keep theirs; an atomised residue, more than one token on one (asym, residue), is left alone)
+  const share = new Map();
+  for (let token = 0; token < tokens; token += 1) {
+    const key = `${asymId[token]}:${residueIndex[token]}`;
+    share.set(key, (share.get(key) ?? 0) + 1);
+  }
+  const overrideConformer = (token, table) => {
+    if (share.get(`${asymId[token]}:${residueIndex[token]}`) > 1) return;
+    const entry = table[POLYMER_TYPE_NAMES[aatype[token]]];
+    if (entry === undefined) return;
+    for (let slot = 0; slot < DENSE; slot += 1) {
+      const flat = token * DENSE + slot;
+      if (refMask[flat] === 0) continue;
+      let name = "";
+      for (let c = 0; c < 4; c += 1) {
+        const v = refAtomNameChars[flat * 4 + c];
+        if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+      }
+      const xyz = entry[name.trim()];
+      if (xyz === undefined) continue;
+      refPos[flat * 3] = xyz[0]; refPos[flat * 3 + 1] = xyz[1]; refPos[flat * 3 + 2] = xyz[2];
+    }
+  };
+  // 🔴 chai-1 READS chai-lab's OWN CONFORMERS for every standard residue and nucleotide (chai1-conformers.js,
+  // af3-any-model 9e7446b), where AlphaFold 3 takes the CCD's ideal coordinates: ubiquitin pLDDT 81.6 -> 86.7 there,
+  // native 84.8.
+  if (options.chaiConformers === true) {
+    for (let token = 0; token < tokens; token += 1) overrideConformer(token, CHAI1_CONFORMERS);
+  }
   if (options.rawLastConformer === true) {
     let last = -Infinity;
     for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) last = Math.max(last, refSpaceUid[slot]);
-    const share = new Map();
-    for (let token = 0; token < tokens; token += 1) {
-      const key = `${asymId[token]}:${residueIndex[token]}`;
-      share.set(key, (share.get(key) ?? 0) + 1);
-    }
     for (let token = 0; token < tokens; token += 1) {
       let inLast = false;
       for (let slot = 0; slot < DENSE; slot += 1) {
         const flat = token * DENSE + slot;
         if (refMask[flat] !== 0 && refSpaceUid[flat] === last) { inLast = true; break; }
       }
-      if (!inLast || share.get(`${asymId[token]}:${residueIndex[token]}`) > 1) continue;
-      const entry = BOLTZ2_RAW_CONFORMERS[POLYMER_TYPE_NAMES[aatype[token]]];
-      if (entry === undefined) continue;
-      for (let slot = 0; slot < DENSE; slot += 1) {
-        const flat = token * DENSE + slot;
-        if (refMask[flat] === 0) continue;
-        let name = "";
-        for (let c = 0; c < 4; c += 1) {
-          const v = refAtomNameChars[flat * 4 + c];
-          if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
-        }
-        const xyz = entry[name.trim()];
-        if (xyz === undefined) continue;
-        refPos[flat * 3] = xyz[0]; refPos[flat * 3 + 1] = xyz[1]; refPos[flat * 3 + 2] = xyz[2];
-      }
+      if (inLast) overrideConformer(token, BOLTZ2_RAW_CONFORMERS);
     }
   }
 
