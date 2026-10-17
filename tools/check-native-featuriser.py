@@ -110,6 +110,12 @@ def cases():
                                   bondedAtomPairs=[[["A", 1, "SG"], ["A", 4, "SG"]], [["A", 1, "C"], ["A", 2, "N"]],
                                                    [["A", 9, "SG"], ["B", 1, "SG"]], [["A", 6, "OG"], ["C", 1, "C1"]]]),
          [], AF3_FAMILIES),
+        # (a bond naming an atom its residue does not have is refused by name - here chai1's and openbind0's dropped
+        # terminal OXT, and a mistyped name for everyone - not bonded to the residue regardless)
+        ("bond-missing-atom", "af3", job("t", [protein("A", "CKTCYSAKC"), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}],
+                                         bondedAtomPairs=[[["A", 9, "OXT"], ["B", 1, "C1"]]]), [], AF3_FAMILIES),
+        ("bond-mistyped-atom", "af3", job("t", [protein("A", "CKTCYSAKC"), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}],
+                                          bondedAtomPairs=[[["A", 1, "SGX"], ["B", 1, "C1"]]]), [], AF3_FAMILIES),
         ("dimer-dna", "af3", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),

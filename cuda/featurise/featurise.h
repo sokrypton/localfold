@@ -390,7 +390,23 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     const ModifiedSpan* span = nullptr;
     for (auto& s : b.modifiedSpans) if (s.residue == global) { span = &s; break; }
     if (!span) {
-      for (int t = 0; t < tokens; ++t) if (b.residueOfToken[t] == global) return t;
+      for (int t = 0; t < tokens; ++t) if (b.residueOfToken[t] == global) {
+        // ...and a named atom must be one the token has (featurise.js)
+        if (e.hasAtom && !e.atom.empty()) {
+          bool found = false;
+          for (int k = 0; k < DENSE && !found; ++k) {
+            const int flat = t * DENSE + k;
+            if (b.refMask[flat] == 0) continue;
+            std::string name;
+            for (int c = 0; c < 4; ++c) { int v = b.refAtomNameChars[flat * 4 + c]; if (v >= 0 && v < 64) name += (char)(v + 32); }
+            while (!name.empty() && name.back() == ' ') name.pop_back();
+            while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+            found = name == e.atom;
+          }
+          if (!found) throw std::runtime_error(where + ": " + std::string(1, residues[global].code) + " " + std::to_string(e.residue) + " has no atom " + e.atom);
+        }
+        return t;
+      }
       throw std::runtime_error(where + ": residue " + std::to_string(e.residue) + " has no token");
     }
     if (span->oneToken) return span->from;

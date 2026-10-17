@@ -794,6 +794,22 @@ export function featuriseProtein(sequence, options = {}) {
       // from a residue back to it that survives atomisation elsewhere.
       const token = residueOfToken.indexOf(global);
       if (token < 0) throw new Error(`${where}: residue ${residue} has no token`);
+      // ...and a named atom must be one the token HAS: unchecked, a mistyped name or an atom this family drops (a
+      // terminal OXT, a 5' OP3) bonded the residue anyway, where af3-any-model's featuriser finds no such atom
+      if (atom !== undefined && atom !== null && atom !== "") {
+        let found = false;
+        for (let slot = 0; slot < DENSE && !found; slot += 1) {
+          const flat = token * DENSE + slot;
+          if (refMask[flat] === 0) continue;
+          let name = "";
+          for (let c = 0; c < 4; c += 1) {
+            const v = refAtomNameChars[flat * 4 + c];
+            if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+          }
+          found = name.trim() === atom;
+        }
+        if (!found) throw new Error(`${where}: ${residues[global].code} ${residue} has no atom ${atom}`);
+      }
       return token;
     }
     if (span.oneToken === true) return span.from;
