@@ -1183,3 +1183,42 @@ is a precision change (Metal runs those blocks in half), not taken here. AF2 had
 Every checksum unchanged, the time level interleaved. What is left at 1044: six f32 pair tensors - the pair, the
 triangle's four, and the template stage's update, computed once and held all fold (532 MiB) to be added each recycle.
 Recomputing it per recycle, or noticing that with no template it is the embedder's bias alone, is the next thing.
+
+## From the M2, on fc97fbcd (the 10-12 WebGPU round and the 10-15 memory round)
+
+**The memory round holds on the M2's float paths.**
+- All 29 gates pass in three configurations: as shipped, `LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=65536`, and
+  `LOCALFOLD_SHARED_SCRATCH=0`. Every PDB is byte-identical to sharing off, as shipped and scribbled (31 of 31 each).
+- This M2's `recommendedMaxWorkingSetSize` is **11.45 GB**. The estimates sit at or a little above the peaks:
+
+  | | estimate | peak | footprint |
+  |---|---|---|---|
+  | AF3, 1044 tokens | 3.76 GB | 3.68 GB | 3.73 GB |
+  | AF2 multimer, 1044 | 2.82 GB | 2.50 GB | 2.55 GB |
+  | ESMFold2, 1044 | 6.29 GB | 6.11 GB | 6.16 GB |
+  | ESMFold2, 1305 (near the limit) | 9.62 GB | 9.12 GB | 9.16 GB |
+
+  ESMFold2 peaks higher than on the M5 because the M2 runs its float triangle (`ftri.*`). AF3 at 2088 tokens is
+  refused in 1 s with its estimate (12.8 GB) and the override.
+
+**The WebGPU checklist, stock Chrome 154, arms alternated:**
+1. The split transition's vector block **holds**: 256 channels 87.4 ms (64x128x32 in f16) against 107.0 and 118.2;
+   128 channels 48.0 against 60.0 (fused 8:128).
+2. `attentionGroup: 4` **loses**: bench row 128 x 255 19.4-20.9 ms against 9.6-10.3 at group 1; AF2's block 196.0 /
+   194.7 against 178.8 / 179.5 (+9%), the flash kernels 46.5 / 46.4 against 30.2 / 32.1. **Taken out of the metal-3
+   entry** (5a5d85e1).
+3. AF2's f16 triangle projections and outer product **hold**: the block 196 against 220 / 227 with both in f32
+   (triangle 28-29 against 42, outer product 29-30 against 39-41).
+4. AF3's f16 grid projection **loses**: bench 15.1-18.7 against 12.2-14.9 ms in f32 (three runs); in the trunk
+   grid.project 870 / 898 against 707 / 719. **The metal-3 entry pins `gridProjectArithmetic: "f32"`** (5a5d85e1);
+   other f16 devices keep f752a185's rule.
+5. The denoiser's f16 staging **holds**: the sampler stage 7.5 s against 8.6 in f32 when the machine was not hot.
+6. `test:ligand` passes, stock and flagged. `test:template` passes for every AF3-lineage model both ways (alphafold3
+   0.242 / 17.565 A ... rosettafold3 0.136 / 17.895); its three failures are this checkout's bundles - openbind0's is
+   `model-openbind0-f32` (only int5 here), AF2's `./model/` is an older export missing tensors - and AF2 with the
+   bundles here passes the gate's bars (monomer 2.488 / 22.202 A, multimer 0.785 / 16.683). `test:stock`: 7 of 8 fold;
+   the AF2 failure is the same stale `./model/`.
+
+With 5a5d85e1 the M2's defaults run AF2's block in 177.4 ms (flash 30.2) and AF3's grid.project in 698 ms. Both lost
+settings are the grid.attend pattern again: a race (as `grid-attend-race.js`, remembered once a browser) would give
+the M5 back its 2.5% and 5% without costing the M2.
