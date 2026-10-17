@@ -209,5 +209,9 @@ struct ChaiStructPairArgs { CP(float) trunkPair; CP(int) ri; CP(int) ti; CP(int)
 // level + g1) / 2
 struct ChaiEulerArgs { DP(float) x; DP(float) g1; CP(float) noisy; CP(float) d1; u64 n; float tHat, dt; };
 struct ChaiCorrectArgs { DP(float) x; CP(float) d2; CP(float) g1; u64 n; float level, dt; };
+// chai-1's exponential Heun step (--chai-second-order on the exponential update): keep D1 and move to the step's level,
+// then x = noisy + c (noisy - (D1 + D2) / 2)
+struct ExpHeun1Args { DP(float) x; DP(float) keep; CP(float) noisy; CP(float) d1; u64 n; float c; uint pad; };
+struct ExpHeun2Args { DP(float) x; CP(float) noisy; CP(float) d1; CP(float) d2; u64 n; float c; uint pad; };
 // chai-1's pLDDT: each dense slot's logits gathered from its ATOM37 slot's (by atom name)
 struct Plddt37Args { CP(float) p37; CP(int) idx; DP(float) out; uint n, dense, bins, pad; };

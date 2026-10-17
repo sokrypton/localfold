@@ -52,15 +52,15 @@
   "rmsd": 0.612
  },
  "chai1-6mrr": {
-  "plddt": 82.73,
+  "plddt": 82.74,
   "ptm": "0.7515",
-  "rmsd": 0.98
+  "rmsd": 0.995
  },
  "chai1-6mrr-gol-sep3": {
-  "ligand": 0.074,
-  "plddt": 83.3,
-  "ptm": "0.7786",
-  "rmsd": 1.743
+  "ligand": 0.064,
+  "plddt": 83.29,
+  "ptm": "0.7791",
+  "rmsd": 1.737
  },
  "intellifold2-6mrr": {
   "plddt": 85.22,

@@ -1105,6 +1105,15 @@ kernel void af3_chai_correct(LF_ARGS(ChaiCorrectArgs)) {
   ulong i = LF_INDEX;
   if (i < a.n) a.x[i] += a.dt * ((a.x[i] - a.d2[i]) / a.level + a.g1[i]) * 0.5f;
 }
+kernel void af3_exp_heun1(LF_ARGS(ExpHeun1Args)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  a.keep[i] = a.d1[i]; a.x[i] = a.noisy[i] + a.c * (a.noisy[i] - a.d1[i]);
+}
+kernel void af3_exp_heun2(LF_ARGS(ExpHeun2Args)) {
+  ulong i = LF_INDEX;
+  if (i < a.n) a.x[i] = a.noisy[i] + a.c * (a.noisy[i] - 0.5f * (a.d1[i] + a.d2[i]));
+}
 kernel void af3_plddt37(LF_ARGS(Plddt37Args)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.n * a.dense * a.bins) return;

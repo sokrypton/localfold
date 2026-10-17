@@ -477,10 +477,14 @@ bool samplerFlag(const char* f, SamplerOptions& o) {
     else { fprintf(stderr, "%s takes %s or %s, not %s\n", name, a, b, f + n); exit(1); }
     return true;
   };
-  if (value("--schedule=", "karras", "geometric", o.geometric) || value("--update=", "euler", "exponential", o.exponential)) {
+  if (value("--schedule=", "karras", "geometric", o.geometric)) { o.scheduleGiven = o.given = true; return true; }
+  if (value("--update=", "euler", "exponential", o.exponential)) { o.given = true; return true; }
+  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
+  if (!strncmp(f, "--step-scale=", 13)) {
+    o.stepScale = atof(f + 13);
+    if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); exit(1); }
     o.given = true; return true;
   }
-  if (!strcmp(f, "--no-churn")) { o.churn = false; o.given = true; return true; }
   return false;
 }
 // the augmentation's rotation and translation for every (step, sample), from each sample's seeded stream
@@ -510,15 +514,25 @@ static std::vector<float> rotations(int steps, const std::vector<uint64_t>& seed
 // t = (2k + 1) / 2N; per transition the augmentation, churn min(80 / N, sqrt 2 - 1) only where 4e-4 <= sigma_prev <= 80,
 // noise 1.003 sqrt(max(1e-6, tHat^2 - sigma_prev^2)), and its second-order step - by default ONE call a step, the
 // correction's denoised structure taken as the first's, which makes the step x = noisy + 2 dt g1 (cuda/af3's
-// measurement: the same bonds for half the calls); CHAI_SECOND_ORDER=1 is chai-lab's two calls
+// measurement: the same bonds for half the calls); CHAI_SECOND_ORDER=1 is chai-lab's two calls.
+// 🔴 AND ITS DEFAULT STEP IS THE EXPONENTIAL ONE (cuda/af3 8469ca1): x' = r^S noisy + (1 - r^S) D, r = sigma / tHat, S its
+// own 2 - the one-call step above is Euler at that scale - on its own schedule: at the page's 25 steps its 200 steps'
+// bonds (mainchain 0.063 -> 0.034 A, ligands 1/6 torn -> 0/6), crystals level (docs/AF3.md, "chai-1's sampler").
+// --update=euler is the sampler before; --schedule=geometric its endpoints at the same midpoints, even in log sigma;
+// --no-churn, --step-scale=; CHAI_SECOND_ORDER=1 on the exponential update is the exponential Heun step
 static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_t* dSeeds, const float* dMask,
                        const std::vector<uint64_t>& seeds, const std::function<void(const float*, int, int)>& onStep) {
   int N = steps, T = N - 1;
   size_t all3 = atoms * 3 * ns;
   static const bool secondOrder = getenv("CHAI_SECOND_ORDER") && atoi(getenv("CHAI_SECOND_ORDER"));
+  const bool geometric = SAMPLER.scheduleGiven && SAMPLER.geometric, exponential = SAMPLER.exponential;
+  const double S = SAMPLER.stepScale > 0 ? SAMPLER.stepScale : 2.0;
   std::vector<double> levels(N);
-  for (int k = 0; k < N; ++k) levels[k] = noiseSchedule((2.0 * k + 1) / (2.0 * N), 16, 0.0004, 80, 7);
-  const double churn = std::min(80.0 / N, std::sqrt(2.0) - 1.0);
+  for (int k = 0; k < N; ++k) {
+    const double t = (2.0 * k + 1) / (2.0 * N);
+    levels[k] = geometric ? 16 * std::exp(std::log(80.0) + t * (std::log(0.0004) - std::log(80.0))) : noiseSchedule(t, 16, 0.0004, 80, 7);
+  }
+  const double churn = SAMPLER.churn ? std::min(80.0 / N, std::sqrt(2.0) - 1.0) : 0.0;
   std::vector<float> rot = rotations(T, seeds);
   float* dRot = uploadNew(rot.data(), rot.size());
   float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
@@ -539,8 +553,16 @@ static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_
     copy(dNoisy, dIn, all3 * 4);
     const float* d1 = denoise(dIn, (float)tHat);
     if (onStep) onStep(d1, s, T);
-    if (!secondOrder) {
-      run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)(2 * dt)});
+    if (!secondOrder) {                         // one call: the correction's D taken as this step's (see above)
+      if (exponential) run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d1, all3, (float)(std::pow(level / tHat, S) - 1), 0});
+      else run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)(S * dt)});
+      continue;
+    }
+    if (exponential) {                          // the exponential Heun step (dG keeps D1 across the second call)
+      run1d("af3_exp_heun1", all3, ExpHeun1Args{dX, dG, dNoisy, d1, all3, (float)(level / tHat - 1), 0});
+      copy(dIn, dX, all3 * 4);
+      const float* d2 = denoise(dIn, (float)level);
+      run1d("af3_exp_heun2", all3, ExpHeun2Args{dX, dNoisy, dG, d2, all3, (float)(std::pow(level / tHat, S) - 1), 0});
       continue;
     }
     run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)dt});
@@ -572,6 +594,7 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     sampleChai(steps, ns, atoms, dX, dSeeds, dMask, seeds, onStep);
   } else {
     if (SAMPLER.sigmaMax > 0) sigmaMax = SAMPLER.sigmaMax;
+    if (SAMPLER.stepScale > 0) stepScale = SAMPLER.stepScale;
     for (int k = 0; k <= steps; ++k)
       levels[k] = SAMPLER.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
                                     : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);

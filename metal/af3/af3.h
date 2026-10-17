@@ -162,13 +162,17 @@ void adaLn(const float* x, const float* scale, const float* shift, half* out, fl
 // the diffusion's discretisation (cuda/af3 sampler.cuh DiffusionOptions, after Blitz): the default is the exponential
 // update x' = r^S x + (1 - r^S) D on noise levels even in log sigma, with churn - 200 Euler steps' ligand geometry at 25
 // (docs/AF3.md, "The default sampler"); --update=euler --schedule=karras is AlphaFold 3's own, for an oracle comparison
+// chai-1 takes them too, on its own schedule and step (diffusion.mm sampleChai: its default the exponential step at its
+// scale of 2, on its rho-7 midpoints - --schedule=geometric only when said)
 struct SamplerOptions {
   double sigmaMax = 0;
   bool geometric = true, exponential = true, churn = true;
-  bool given = false;          // a flag set one (chai-1's own sampler refuses them, rather than ignoring them)
+  double stepScale = 0;        // --step-scale=S (0: the model's own - AF3's 1.5, chai-1's 2)
+  bool scheduleGiven = false;  // --schedule= said (chai-1's default schedule is its own, not the geometric one)
+  bool given = false;          // a flag set one
 };
-// a SamplerOptions flag (--schedule=karras|geometric, --update=euler|exponential, --no-churn) read into `o`; false for
-// any other flag, and an unknown value refused by name
+// a SamplerOptions flag (--schedule=karras|geometric, --update=euler|exponential, --no-churn, --step-scale=S) read into
+// `o`; false for any other flag, and an unknown value refused by name
 bool samplerFlag(const char* f, SamplerOptions& o);
 extern SamplerOptions SAMPLER;
 void prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat, const Masks& masks, int n);

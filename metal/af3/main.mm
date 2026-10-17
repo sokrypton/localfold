@@ -228,8 +228,6 @@ int foldInput(const std::string& dir, Options o) {
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
-  if (SAMPLER.given && flag("trunk.dialect.chaiSampler"))
-    die("--schedule, --update and --no-churn are the diffusion sampler's: chai-1's sampler does not take them");
   std::vector<std::pair<uint64_t, int>> runs;
   for (uint64_t s : seeds) for (int k = 0; k < o.samples; ++k) runs.push_back({s, k});
   const size_t perBatch = std::max<size_t>(o.samples, 10);
