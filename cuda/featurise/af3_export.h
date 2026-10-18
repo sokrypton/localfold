@@ -530,6 +530,8 @@ inline Af3Export exportAf3(const Args& args) {
   o.symmetriseBonds = D.symmetriseBonds; o.centreRefConformers = D.centreRefConformers;
   o.rawLastConformer = D.rawLastConformer; o.declaredPolymerBonds = D.declaredPolymerBonds;
   o.ccdUnknownResidue = D.ccdUnknownResidue; o.declaredBondFeature = D.declaredBondFeature; o.chaiConformers = D.chaiConformers;
+  o.declaredBondLeavingAtoms = D.declaredBondLeavingAtoms;
+  o.translateConformers = D.translateConformers; o.conformerSeed = jsParseFloat(args.option("seed", "20260831"));
   o.paddedAtomKeys = D.paddedAtomKeys; o.qblockAtomKeys = D.qblockAtomKeys;
   o.atomizedElementNames = D.atomizedElementNames; o.atomizedUnknownRestype = D.atomizedUnknownRestype;
   o.atomizedUnknownMsa = D.atomizedUnknownMsa; o.atomizedBackboneBonds = D.atomizedBackboneBonds;

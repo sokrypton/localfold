@@ -84,6 +84,10 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       ? {} : { declaredBondFeature: options.declaredBondFeature }),
     ...(options.chaiConformers === undefined
       ? {} : { chaiConformers: options.chaiConformers }),
+    // (OpenDDE's and protenix's U(-1, 1) move of each conformer, drawn from the fold's seed)
+    ...(options.translateConformers === true ? { translateConformers: true, conformerSeed: options.seed ?? 0 } : {}),
+    ...(options.declaredBondLeavingAtoms === undefined
+      ? {} : { declaredBondLeavingAtoms: options.declaredBondLeavingAtoms }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

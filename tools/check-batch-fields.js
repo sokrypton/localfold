@@ -835,12 +835,28 @@ let centroidFailures = 0;
     // of this line called that a disagreement. What is being asked is binary:
     // does this side subtract the token centroid or not.
     const CENTRED = 0.05;   // A: a centred conformer's centroid is exactly 0
-    const oursCentred = ourCentroid < CENTRED;
-    const theirsCentred = theirCentroid < CENTRED;
-    const centred = oursCentred === theirsCentred
-      ? `both ${oursCentred ? "centred" : "uncentred"}`
-      : `🔴 DIFFER (ours ${oursCentred ? "centred" : "uncentred"},`
-        + ` theirs ${theirsCentred ? "centred" : "uncentred"})`;
+    // 🔴 AND A TRANSLATING FAMILY (OpenDDE, protenix: `translateConformers`) CENTRES AND THEN MOVES EACH REFERENCE
+    // SPACE BY U(-1, 1) PER AXIS, from a draw each side makes its own way - so its centroid is neither 0 nor the CCD's,
+    // and the convention is that every space's centroid lies in the unit cube. An uncentred CCD conformer leaves it.
+    const inCube = (pos, mask) => {
+      const sums = new Map();
+      for (let at = 0; at < batch.tokens * dense; at += 1) {
+        if (!(mask[at] > 0.5) || !(theirMask[at] > 0.5 && batch.refMask[at] > 0.5)) continue;
+        const uid = batch.refSpaceUid[at];
+        const e = sums.get(uid) ?? [0, 0, 0, 0];
+        e[0] += pos[at * 3]; e[1] += pos[at * 3 + 1]; e[2] += pos[at * 3 + 2]; e[3] += 1;
+        sums.set(uid, e);
+      }
+      for (const e of sums.values()) {
+        for (let k = 0; k < 3; k += 1) if (Math.abs(e[k] / e[3]) > 1.0 + 1e-4) return false;
+      }
+      return true;
+    };
+    // (three answers wherever it is asked: a centred space is in the cube too, at its centre)
+    const label = (centroid, pos, mask) => (centroid < CENTRED ? "centred"
+      : dialect.translateConformers === true && inCube(pos, mask) ? "translated" : "uncentred");
+    const ours = label(ourCentroid, batch.refPos, batch.refMask), theirs = label(theirCentroid, theirPos, theirMask);
+    const centred = ours === theirs ? `both ${ours}` : `🔴 DIFFER (ours ${ours}, theirs ${theirs})`;
     console.log(`  ${model.padEnd(14)} ${String(pairs).padStart(5)} intra-token pairs`
       + `  rms ${rms.toFixed(4)} A  worst ${worst.toFixed(4)} A`
       + (worstToken < 0 ? "" : ` (token ${worstToken}, aatype ${batch.aatype[worstToken]})`)

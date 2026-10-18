@@ -203,6 +203,14 @@ def main():
                                          templates=[])]
     chains = list(model_features.prepare_input(
         _fi.Input(name=arguments.model, chains=chains, rng_seeds=[job_seed]), model_registry.get(arguments.model)).chains)
+    # 🔴 THE LEAVING ATOMS AT DECLARED BONDS (protenix, opendde: the registry's ccd_leaving_atoms, af3-any-model
+    # b61bd1d) take effect only where featurise_input is handed the flag, which neither fold_check nor run_alphafold.py
+    # does at 3.1.16 - so a dump without this reads AlphaFold 3's rule for those families. Handed here where the
+    # registry asks for it.
+    if model_registry.get(arguments.model).featurise.get("ccd_leaving_atoms"):
+        from alphafold3.data import featurisation as _featurisation
+        _featurise = _featurisation.featurise_input
+        _featurisation.featurise_input = lambda *a, **k: _featurise(*a, **{"ccd_leaving_atoms": True, **k})
     if arguments.has_msa:
         _apply = model_features.apply
         model_features.apply = lambda *a, **k: _apply(*a, **{**k, "has_msa": True})

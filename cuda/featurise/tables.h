@@ -35,6 +35,8 @@ struct FamilyFlags {
   bool declaredBondFeature;         // chai1: every declared bond as its own directed token matrix (declaredBondMatrix)
   bool chaiConformers;              // chai1: standard residues on chai-lab's conformers (chai1Conformers)
   bool nativeNonproteinMsa;         // opendde, protenix: a ligand UNK in the MSA, a nucleic chain's gap rows its query
+  bool translateConformers;         // opendde, protenix: each centred conformer moved by U(-1, 1) per axis (the fold's seed)
+  bool declaredBondLeavingAtoms;    // opendde, protenix: the CCD leaving group at each declared bond dropped (declaredBondLeaving)
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

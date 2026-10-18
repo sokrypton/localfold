@@ -108,6 +108,8 @@ describe("the dialect table", () => {
       "centreRefConformers",
       "chainedAtomLayerNorm",
       // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds ("discontinuous": af3-any-model 964990e)
+      // 🔴 AND THE LEAVING GROUP AT EACH DECLARED BOND DROPPED BEFORE TOKENISING (af3-any-model b61bd1d)
+      "declaredBondLeavingAtoms",
       "declaredPolymerBonds",
       // 🔴 THE QUERY ONCE IN A SELF-MSA, and a ligand UNK in the MSA: protenix's featuriser (af3-any-model's
       // dedupe_self_msa and native_nonprotein_msa for opendde)
@@ -137,6 +139,8 @@ describe("the dialect table", () => {
       "structuralTokens",
       "swapTransposedBias",
       "symmetriseBonds",
+      // 🔴 EACH CENTRED CONFORMER MOVED BY U(-1, 1) PER AXIS, protenix's inference augmentation (af3-any-model 345cb11)
+      "translateConformers",
     ]);
   });
 

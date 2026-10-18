@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "ccd.h"
@@ -42,6 +43,8 @@ struct FeaturiseOptions {
   bool ccdUnknownResidue = false;                 // openbind0: an unknown amino acid as the CCD's UNK
   bool declaredBondFeature = false;               // chai1: every declared bond, [from][to], in declaredBondMatrix
   bool chaiConformers = false;                    // chai1: standard residues on chai-lab's conformers
+  bool translateConformers = false; double conformerSeed = 0;
+  bool declaredBondLeavingAtoms = false;          // opendde, protenix: the leaving group at each declared bond dropped   // opendde, protenix: each conformer moved by U(-1, 1)
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool queryOnce = false;                         // dedupeSelfMsa true: an MSA that is all the query, one row (featurise.js)
@@ -129,6 +132,99 @@ inline void atomGathers(Batch& b, const std::vector<int>& realAtoms, const std::
   b.atomCount = atomCount;
 }
 
+// protenix's and OpenDDE's leaving groups at the declared bonds (shared/af3/featurise/declared-leaving.js): the atoms
+// (indices into the component) of the first `count` leaving groups at `centre`, within [from, from + length)
+inline std::vector<int> leavingGroups(const Component& c, int from, int length, const std::string& centre, int count) {
+  int at = -1;
+  for (int k = from; k < from + length; ++k) if (c.atoms[k].name == centre) { at = k; break; }
+  if (at < 0) return {};
+  std::map<int, std::vector<int>> nbrs;
+  for (auto& b : c.bonds) { nbrs[b.from].push_back(b.to); nbrs[b.to].push_back(b.from); }
+  std::vector<int> starts;
+  for (int m : nbrs[at]) if (c.atoms[m].leaving) starts.push_back(m);
+  std::sort(starts.begin(), starts.end());
+  std::vector<std::set<int>> groups;
+  for (int start : starts) {
+    std::set<int> group; std::vector<int> todo{start};
+    while (!todo.empty()) {
+      int k = todo.back(); todo.pop_back();
+      if (group.count(k)) continue;
+      group.insert(k);
+      for (int m : nbrs[k]) if (c.atoms[m].leaving && m != at) todo.push_back(m);
+    }
+    if (std::find(groups.begin(), groups.end(), group) == groups.end()) groups.push_back(group);
+  }
+  std::vector<int> out;
+  for (size_t g = 0; g < groups.size() && (int)g < count; ++g) out.insert(out.end(), groups[g].begin(), groups[g].end());
+  return out;
+}
+inline Component withoutAtoms(const Component& l, const std::set<int>& drop) {
+  if (drop.empty()) return l;
+  Component out = l;
+  out.atoms.clear(); out.bonds.clear();
+  std::map<int, int> renumber;
+  for (int k = 0; k < (int)l.atoms.size(); ++k) if (!drop.count(k)) { renumber[k] = (int)out.atoms.size(); out.atoms.push_back(l.atoms[k]); }
+  for (auto& b : l.bonds)
+    if (renumber.count(b.from) && renumber.count(b.to)) out.bonds.push_back({renumber[b.from], renumber[b.to], b.order});
+  for (size_t p = 0; p < l.residues.size(); ++p) {
+    int kept = 0, first = -1;
+    for (int k = l.residues[p].from; k < l.residues[p].from + l.residues[p].count; ++k) {
+      auto it = renumber.find(k);
+      if (it == renumber.end()) continue;
+      if (first < 0) first = it->second;
+      ++kept;
+    }
+    out.residues[p].from = first < 0 ? (int)out.atoms.size() : first; out.residues[p].count = kept;
+  }
+  return out;
+}
+// -> the ligands without their leaving groups, and the (chain, index) of each chain-end residue whose terminal atom goes
+inline std::vector<Component> declaredBondLeaving(const std::vector<std::string>& chains, const std::vector<std::string>& kinds,
+                                                  const FeaturiseOptions& o, std::set<std::pair<int, int>>& terminalDropped) {
+  std::vector<std::pair<std::tuple<int, int, std::string>, int>> count;     // (in first-seen order, as a Map)
+  for (auto& bond : o.bonds)
+    for (const BondEnd* e : {&bond.from, &bond.to}) {
+      if (!e->hasAtom || e->atom.empty()) continue;
+      auto key = std::make_tuple(e->asym, e->residue, e->atom);
+      bool found = false;
+      for (auto& [k, n] : count) if (k == key) { ++n; found = true; }
+      if (!found) count.push_back({key, 1});
+    }
+  std::vector<std::set<int>> dropOf(o.ligands.size());
+  for (auto& [key, n] : count) {
+    auto [asym, residue, atom] = key;
+    if (asym >= (int)chains.size()) {
+      int li = asym - (int)chains.size();
+      if (li >= (int)o.ligands.size()) continue;
+      const Component& l = o.ligands[li];
+      CompPart whole{l.code, 0, (int)l.atoms.size()};
+      const CompPart* part = l.residues.empty() ? &whole
+        : (residue - 1 >= 0 && residue - 1 < (int)l.residues.size() ? &l.residues[residue - 1] : nullptr);
+      if (!part) continue;
+      for (int k : leavingGroups(l, part->from, part->count, atom, n)) dropOf[li].insert(k);
+      continue;
+    }
+    const std::string kind = asym < (int)kinds.size() ? kinds[asym] : "protein";
+    int at = residue - 1, length = asym >= 0 && asym < (int)chains.size() ? (int)chains[asym].size() : 0;
+    bool end = kind == "protein" ? at == length - 1 : at == 0;
+    if (!end) continue;
+    const std::string terminalAtom = kind == "protein" ? "OXT" : "OP3";
+    const FeaturiseOptions::Mod* mod = nullptr;
+    for (auto& m : o.modifications) if (m.chain == asym && m.position == residue) { mod = &m; break; }
+    bool drops = false;
+    if (mod) {
+      for (int k : leavingGroups(mod->component, 0, (int)mod->component.atoms.size(), atom, n))
+        if (mod->component.atoms[k].name == terminalAtom) drops = true;
+    } else {
+      drops = atom == (kind == "protein" ? "C" : "P");
+    }
+    if (drops) terminalDropped.insert({asym, at});
+  }
+  std::vector<Component> out;
+  for (size_t k = 0; k < o.ligands.size(); ++k) out.push_back(withoutAtoms(o.ligands[k], dropOf[k]));
+  return out;
+}
+
 inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOptions& o) {
   Batch b;
   {
@@ -141,11 +237,15 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   const auto& chains = b.chains;
   for (auto& c : chains) b.sequence += c;
   int residueCount = (int)b.sequence.size();
-  const auto& ligands = o.ligands;
-  int ligandTokens = 0;
-  for (auto& l : ligands) ligandTokens += (int)l.atoms.size();
   for (size_t i = 0; i < chains.size(); ++i) b.chainKinds.push_back(i < o.chainKinds.size() ? o.chainKinds[i] : "protein");
   const auto& kinds = b.chainKinds;
+  // (protenix and OpenDDE: the leaving group at each declared bond goes before tokenising)
+  std::set<std::pair<int, int>> terminalDropped;
+  const std::vector<Component> leftLigands = o.declaredBondLeavingAtoms ? declaredBondLeaving(chains, kinds, o, terminalDropped)
+                                                                        : std::vector<Component>{};
+  const auto& ligands = o.declaredBondLeavingAtoms ? leftLigands : o.ligands;
+  int ligandTokens = 0;
+  for (auto& l : ligands) ligandTokens += (int)l.atoms.size();
   auto parentAatype = [&](const std::string& kind, char code) {
     if (kind == "protein") return aatypeFor(code);
     int a = nucleicAatypeFor(kind, code);
@@ -165,11 +265,13 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       Residue r;
       r.kind = kinds[ci];
       r.modified = asked != modificationOf.end();
+      const bool dropsTerminal = terminalDropped.count({ci, at}) > 0;
       if (r.modified)
-        r.modification = polymerResidue(asked->second->component, protein ? at == (int)chain.size() - 1 : at == 0, protein ? "OXT" : "OP3");
+        r.modification = polymerResidue(asked->second->component, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal,
+                                        protein ? "OXT" : "OP3");
       char parent = r.modified ? parentLetter(r.modification.parent, kinds[ci]) : 0;
       r.code = parent ? parent : chain[at];
-      r.terminal = (o.terminalAtoms == 1 || (o.terminalAtoms == 2 && protein)) ? false
+      r.terminal = (o.terminalAtoms == 1 || (o.terminalAtoms == 2 && protein) || dropsTerminal) ? false
                  : (protein ? at == (int)chain.size() - 1 : at == 0);
       r.tokens = !r.modified || o.modifiedAsOneToken ? 1 : (int)r.modification.atoms.size();
       residues.push_back(std::move(r));
@@ -689,6 +791,21 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       bool inLast = false;
       for (int k = 0; k < DENSE && !inLast; ++k) inLast = b.refMask[t * DENSE + k] != 0 && b.refSpaceUid[t * DENSE + k] == last;
       if (inLast) overrideConformer(t, boltz2RawConformers());
+    }
+  }
+
+  // opendde, protenix: each centred conformer moved by U(-1, 1) per axis, three uniforms a reference space in ascending
+  // ref_space_uid from the fold's seed (featurise.js)
+  if (o.translateConformers) {
+    std::set<int> uids;
+    for (int slot = 0; slot < tokens * DENSE; ++slot) if (b.refMask[slot] != 0) uids.insert(b.refSpaceUid[slot]);
+    Uniform uniform(o.conformerSeed);
+    std::map<int, std::array<double, 3>> shift;
+    for (int uid : uids) { double x = 2 * uniform() - 1, y = 2 * uniform() - 1, z = 2 * uniform() - 1; shift[uid] = {x, y, z}; }
+    for (int slot = 0; slot < tokens * DENSE; ++slot) {
+      if (b.refMask[slot] == 0) continue;
+      auto& s = shift[b.refSpaceUid[slot]];
+      for (int k = 0; k < 3; ++k) b.refPos[slot * 3 + k] = (float)((double)b.refPos[slot * 3 + k] + s[k]);
     }
   }
 

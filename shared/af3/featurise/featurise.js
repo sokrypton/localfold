@@ -44,6 +44,8 @@ import { conformerFor, aatypeFor, RESIDUE_TYPES } from "./reference-conformers.j
 import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
 import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
+import { uniformFrom } from "../random.js";
+import { declaredBondLeaving } from "./declared-leaving.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
@@ -243,7 +245,12 @@ export function featuriseProtein(sequence, options = {}) {
   // eleven - checked against AF3's own batch. Every array below is sized from
   // this total, and a ligand counted as a single token produces a batch whose
   // shapes all agree with each other and with nothing else.
-  const ligands = options.ligands ?? [];
+  // (protenix and OpenDDE: the leaving group at each declared bond goes before tokenising - declared-leaving.js)
+  const leaving = options.declaredBondLeavingAtoms === true
+    ? declaredBondLeaving(chains, chains.map((_, k) => options.chainKinds?.[k] ?? "protein"), options.modifications,
+      options.ligands ?? [], options.bonds)
+    : null;
+  const ligands = leaving?.ligands ?? options.ligands ?? [];
   const ligandTokens = ligands.reduce((sum, ligand) => sum + ligand.atoms.length, 0);
 
   // 🔴 A MODIFIED RESIDUE IS ONE TOKEN PER HEAVY ATOM, LIKE A LIGAND, BUT IT
@@ -286,8 +293,9 @@ export function featuriseProtein(sequence, options = {}) {
       // polymerResidue.
       // (a nucleotide's terminal atom is the 5' OP3, at the chain's first residue)
       const protein = chainKinds[chainIndex] === "protein";
+      const dropsTerminal = leaving?.terminalDropped.has(`${chainIndex}:${at}`) === true;
       const modification = asked === null ? null
-        : polymerResidue(asked, protein ? at === chain.length - 1 : at === 0, protein ? "OXT" : "OP3");
+        : polymerResidue(asked, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal, protein ? "OXT" : "OP3");
       residues.push({
         // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
         code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
@@ -303,7 +311,7 @@ export function featuriseProtein(sequence, options = {}) {
         // asked, because every AF3-shaped caller means the AF3 rule.
         // 🔴 AND CHAI-1 DROPS ONLY THE PROTEIN'S: its reference masks the C-terminal OXT and keeps the 5' OP3
         // (`drop_atoms=('OXT',)`), so `terminalAtoms: "nucleic"` keeps a nucleotide's and no other.
-        terminal: options.terminalAtoms === false || (options.terminalAtoms === "nucleic" && protein) ? false
+        terminal: options.terminalAtoms === false || (options.terminalAtoms === "nucleic" && protein) || dropsTerminal ? false
           : (chainKinds[chainIndex] === "protein"
             ? at === chain.length - 1
             : at === 0),
@@ -1296,6 +1304,26 @@ export function featuriseProtein(sequence, options = {}) {
         if (refMask[flat] !== 0 && refSpaceUid[flat] === last) { inLast = true; break; }
       }
       if (inLast) overrideConformer(token, BOLTZ2_RAW_CONFORMERS);
+    }
+  }
+
+  // 🔴 OpenDDE AND PROTENIX MOVE EACH CENTRED CONFORMER BY U(-1, 1) PER AXIS at inference, as their featuriser does
+  // (af3-any-model 345cb11, `translateConformers`): the weights were trained on ref_pos that is never exactly centred.
+  // Drawn from the fold's seed (as the MSA subsample is), three uniforms a reference space in ascending ref_space_uid,
+  // so a seed names the batch; af3-any-model seeds its draw from a hash of the positions, so the convention is shared
+  // and the values are not (check-batch-fields.js holds both to the unit cube).
+  if (options.translateConformers === true) {
+    const uids = new Set();
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) uids.add(refSpaceUid[slot]);
+    const uniform = uniformFrom(options.conformerSeed ?? 0);
+    const shift = new Map();
+    for (const uid of [...uids].sort((a, b) => a - b)) {
+      shift.set(uid, [2 * uniform() - 1, 2 * uniform() - 1, 2 * uniform() - 1]);
+    }
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const s = shift.get(refSpaceUid[slot]);
+      refPos[slot * 3] += s[0]; refPos[slot * 3 + 1] += s[1]; refPos[slot * 3 + 2] += s[2];
     }
   }
 

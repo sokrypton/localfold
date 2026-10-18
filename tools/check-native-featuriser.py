@@ -112,6 +112,13 @@ def cases():
          [], AF3_FAMILIES),
         # (a bond naming an atom its residue does not have is refused by name - here chai1's and openbind0's dropped
         # terminal OXT, and a mistyped name for everyone - not bonded to the residue regardless)
+        # (protenix and OpenDDE drop the leaving group at a declared bond: a head-to-tail cyclic peptide's C-terminal
+        # OXT, a glycan's O1 at each glycosidic C1; the rest keep both)
+        ("bond-leaving-cyclic", "af3", job("t", [protein("A", "GRCKSTAG")], bondedAtomPairs=[[["A", 8, "C"], ["A", 1, "N"]]]),
+         [], AF3_FAMILIES),
+        ("bond-leaving-glycan", "af3", job("t", [protein("A", "MKNKTAQ"), {"ligand": {"id": "B", "ccdCodes": ["NAG", "NAG"]}}],
+                                           bondedAtomPairs=[[["A", 3, "ND2"], ["B", 1, "C1"]], [["B", 1, "O4"], ["B", 2, "C1"]]]),
+         [], AF3_FAMILIES),
         ("bond-missing-atom", "af3", job("t", [protein("A", "CKTCYSAKC"), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}],
                                          bondedAtomPairs=[[["A", 9, "OXT"], ["B", 1, "C1"]]]), [], AF3_FAMILIES),
         ("bond-mistyped-atom", "af3", job("t", [protein("A", "CKTCYSAKC"), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}],
