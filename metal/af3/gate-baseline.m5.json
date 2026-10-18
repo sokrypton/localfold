@@ -52,15 +52,15 @@
   "rmsd": 0.614
  },
  "chai1-6mrr": {
-  "plddt": 82.7,
-  "ptm": "0.7513",
-  "rmsd": 0.993
+  "plddt": 84.52,
+  "ptm": "0.7816",
+  "rmsd": 1.036
  },
  "chai1-6mrr-gol-sep3": {
-  "ligand": 0.062,
-  "plddt": 83.26,
-  "ptm": "0.7783",
-  "rmsd": 1.738
+  "ligand": 0.053,
+  "plddt": 84.75,
+  "ptm": "0.8078",
+  "rmsd": 1.692
  },
  "intellifold2-6mrr": {
   "plddt": 85.21,
@@ -68,19 +68,19 @@
   "rmsd": 1.71
  },
  "openbind0-6mrr": {
-  "plddt": 82.85,
-  "ptm": "0.7701",
-  "rmsd": 1.877
+  "plddt": 82.98,
+  "ptm": "0.7729",
+  "rmsd": 1.869
  },
  "opendde-6mrr": {
-  "plddt": 91.82,
-  "ptm": "0.7784",
-  "rmsd": 1.645
+  "plddt": 91.91,
+  "ptm": "0.7792",
+  "rmsd": 1.643
  },
  "protenix2-6mrr": {
-  "plddt": 87.56,
+  "plddt": 87.57,
   "ptm": "0.8802",
-  "rmsd": 1.771
+  "rmsd": 1.77
  },
  "rosettafold3-6mrr": {
   "plddt": 81.41,
