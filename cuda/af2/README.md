@@ -380,10 +380,14 @@ LayerNorm, the attention one block a column recomputing every key and value from
 GEMMs and their bias passes). It is four kernels now, on the MSA in its own layout (src/globalattn.cuh): the LN and
 `[k | v | gate]` on the tensor cores with the masked column sums for the query, the query, a block a column's online
 softmax over its 16 key-and-value floats a row, and the gated output projection added into the MSA. **~0.6 ms a
-call.** Its column sums are atomics, so a fold is no longer bit-for-bit repeatable there (5CAJ: 0.008-0.016 A, run to
-run as well as against the old form). The extra row attention takes cuda/af3's `gridInK` at 64 channels for its LN
+call.** Its column sums were atomics at first, and that was not the 0.01 A it first measured: four more runs of 5CAJ
+with its alignment read pLDDT 95.05-95.51, one 0.16 A from the others (recycling carries the order's rounding). Each
+row block writes a slab the query kernel sums in order now - byte-identical run to run, the same 1.19 s. The extra row attention takes cuda/af3's `gridInK` at 64 channels for its LN
 and q/k/v/gate (one pass where a LayerNorm pass and cuBLAS's GEMM were) and `projAdd64K` for its output projection
 into the f32 MSA (one pass where cuBLASLt's f32-output GEMM ran a GEMM and then its epilogue over the whole MSA).
+🔴 The outer product mean's fused LN and projections (`lnGemmK`) held 128 rows at 256 channels, 67.6 KB a block, and
+a T4 allows 64: every AF2 fold with an alignment died there on a Colab T4 until it took one row tile a warp where two
+do not fit. Rehearse a new fused kernel under `LOCALFOLD_SMEM_LIMIT=65536` before a T4 round.
 
 Two shared input kernels were waiting on loads they could have issued earlier: `gridInK` read AF2's gate bias from
 global memory AFTER its MMAs, so the adds stalled on it (a fifth of the kernel's stall samples, Nsight Compute at 600

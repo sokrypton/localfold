@@ -70,6 +70,10 @@ def cases():
         out.append(("af3-5caj-msa", "af3", [f"--sequence={seq}", f"--a3m={a3m}"], [], [crystal_5caj, "A"]))
     out.append(("af3-5caj-template", "af3", [f"--sequence={seq}", f"--template={crystal_5caj}:A"], [],
                 [crystal_5caj, "A"]))
+    # boltz2 divides its template term by the templates present, not the padded slots (3daf8f8e): by four, its one
+    # template reached the trunk at a quarter strength and this read 1.6-2.3 A where native Boltz-2 reads 0.26-0.43
+    out.append(("boltz2-5caj-template", "boltz2", [f"--sequence={seq}", f"--template={crystal_5caj}:A"], [],
+                [crystal_5caj, "A"]))
     if os.path.exists(crystal_1brs):
         a, d = chain_sequence(crystal_1brs, "A"), chain_sequence(crystal_1brs, "D")
         out.append(("af3-1brs-template", "af3",
