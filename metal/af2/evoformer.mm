@@ -60,10 +60,13 @@ static half* pairLn(const T* pair, size_t pairs, int C, const std::string& w, in
   layerNormW(pair, xn, pairs, C, w, blk);
   return xn;
 }
-// where an update's GEMM emits the next norm: whichever of two buffers its own input is not
-static half* lnTarget(size_t pairs, int C, const half* inUse) {
-  half* a = scratch<half>("ln.a", pairs * C);
-  return inUse == a ? scratch<half>("ln.b", pairs * C) : a;
+// where an update's GEMM emits the next norm: always ln.a (in the nested family main.mm names, so no module's shared
+// scratch lands on it) - in place where the update's own input norm is the one the previous update emitted there. An
+// emitting GEMM covers every output column of a row block in one tile, so the block's input rows are read before its
+// epilogue writes the norm over them behind a threadgroup barrier (as metal/ef2's lnTarget); an attention's input norm
+// is dead once q|k|v|g are made. A second buffer for it (ln.b) was at the evoformer's peak: 279 MB at 1,044 residues
+static half* lnTarget(size_t pairs, int C, const half*) {
+  return scratch<half>("ln.a", pairs * C);
 }
 static bool allOnes(const float* d, size_t n) {
   const float* h = (const float*)host(d);
