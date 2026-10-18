@@ -123,6 +123,9 @@ def cases():
                                          bondedAtomPairs=[[["A", 9, "OXT"], ["B", 1, "C1"]]]), [], AF3_FAMILIES),
         ("bond-mistyped-atom", "af3", job("t", [protein("A", "CKTCYSAKC"), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}],
                                           bondedAtomPairs=[[["A", 1, "SGX"], ["B", 1, "C1"]]]), [], AF3_FAMILIES),
+        # (the unknown nucleotide, N: AF3's restype 30 and its backbone, its pseudo-beta the first held atom)
+        ("unknown-nucleotide", "af3", job("t", [{"dna": {"id": "A", "sequence": "NACGNTACGTN"}},
+                                                {"rna": {"id": "B", "sequence": "NACGNUACGUN"}}]), [], AF3_FAMILIES),
         ("dimer-dna", "af3", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),
@@ -204,6 +207,9 @@ def cases():
     EF = ["ef2"]
     out += [
         ("ef2-6mrr", "ef2", job("t", [protein("A", SEQ_6MRR)]), [], EF),
+        # (the unknown nucleotide: res_type 27 / 32 and its backbone at the origin, as esm's tokenize_nucleotide)
+        ("ef2-unknown-nucleotide", "ef2", job("t", [protein("A", SEQ_6MRR), {"dna": {"id": "B", "sequence": "NACGNTACGTN"}},
+                                                    {"rna": {"id": "C", "sequence": "NACGNUACGUN"}}]), [], EF),
         ("ef2-6mrr-sep-gol", "ef2", job("t", [protein("A", SEQ_6MRR, modifications=[{"ptmType": "SEP", "ptmPosition": 3}]),
                                                    {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], EF),
         ("ef2-dimer-dna", "ef2", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),

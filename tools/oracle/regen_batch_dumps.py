@@ -29,6 +29,8 @@ def target_args(target, sequence):
         "": [],
         "gol-sep3": ["--ligand", "GOL", "--ptm", "SEP@3"],
         "dna-5cm": ["--kind", "dna", "--mods", "5CM@5,5CM@9"],
+        "dna-unk": ["--kind", "dna"],
+        "rna-unk": ["--kind", "rna"],
         "glycan": ["--ligand", "NAG,NAG,BMA,MAN,MAN", "--bonds", GLYCAN_BONDS],
         "hy3": ["--ptm", "HY3@4"],
         "dna-5prime": ["--kind", "dna", "--mods", "6OG@1,6MA@2"],

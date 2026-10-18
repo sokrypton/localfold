@@ -207,10 +207,12 @@ describe("nucleic entities", () => {
     expect(entityProblem(chain("rna", "ACGT"))).toMatch(/DNA/);
   });
 
-  it("refuses N, which has no nucleic slot in the alphabet", () => {
-    // The restypes run A G C U and DA DG DC DT and stop; an unknown base would
-    // have to borrow the amino-acid UNK.
-    expect(entityProblem(chain("dna", "ACGN"))).toMatch(/N is not one of A, C, G, T/);
+  it("takes N, the unknown nucleotide, and refuses another letter", () => {
+    // AF3's restype 30 (its CCD component N, DN in a DNA chain): a backbone with no base, which the featuriser builds
+    // as af3-any-model does (check-batch-fields.js --target=dna-unk / rna-unk)
+    expect(entityProblem(chain("dna", "ACGN"))).toBe(null);
+    expect(entityProblem(chain("rna", "NACGU"))).toBe(null);
+    expect(entityProblem(chain("dna", "ACGX"))).toMatch(/X is not one of A, C, G, T, N/);
   });
 
   it("refuses a modified amino acid on a nucleic chain", () => {

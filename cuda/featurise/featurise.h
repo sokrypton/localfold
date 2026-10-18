@@ -358,6 +358,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
         for (auto& a : *atoms) if (std::string(a.name) == (purine ? "C4" : "C2")) { beta = &a; break; }
       }
       if (beta) pseudoBetaSlot[token] = beta->slot;
+      else if (!atoms->empty() && !(R.kind != "protein" && number == 1 && o.terminalAtoms == 1))
+        pseudoBetaSlot[token] = (*atoms)[0].slot;      // (AF3's first held atom; masked at a dropped 5' OP3: featurise.js)
       for (int s = 0; s < DENSE; ++s) b.refSpaceUid[token * DENSE + s] = space;
       ++space; ++token;
       continue;

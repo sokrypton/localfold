@@ -192,9 +192,13 @@ export function featuriseForEsmfold2(input, options = {}) {
     for (let slot = 0; slot < dense; slot += 1) {
       const from = token * dense + slot;
       if (batch.refMask[from] === 0) continue;
-      refPos[at * 3] = batch.refPos[from * 3];
-      refPos[at * 3 + 1] = batch.refPos[from * 3 + 1];
-      refPos[at * 3 + 2] = batch.refPos[from * 3 + 2];
+      // 🔴 AN UNKNOWN NUCLEOTIDE'S BACKBONE SITS AT THE ORIGIN: `esm`'s tokenize_nucleotide gives it its backbone atoms
+      // with `ref_pos = _ZERO_POS` ("No idealized positions for UNK"), and res_type 27 / 32 (below) - where AF3 builds its
+      // CCD backbone
+      const unknownNucleotide = batch.aatype[token] === 30 && (molType[token] === MOL_DNA || molType[token] === MOL_RNA);
+      refPos[at * 3] = unknownNucleotide ? 0 : batch.refPos[from * 3];
+      refPos[at * 3 + 1] = unknownNucleotide ? 0 : batch.refPos[from * 3 + 1];
+      refPos[at * 3 + 2] = unknownNucleotide ? 0 : batch.refPos[from * 3 + 2];
       refCharge[at] = batch.refCharge[from];
       refElement[at] = batch.refElement[from];
       for (let i = 0; i < 4; i += 1) {
@@ -245,9 +249,13 @@ export function featuriseForEsmfold2(input, options = {}) {
     }
   }
   for (let token = 0; token < tokens; token += 1) {
+    // (AF3's unknown nucleotide, 30, is ESMFold2's RNA unknown 27 or DNA unknown 32 - its alphabet has both, where AF3
+    // has one; a table over AF3's restype alone cannot say which, so the chain's kind does)
     const code = molType[token] === MOL_NONPOLYMER || atomisedResidue[token]
       ? UNKNOWN_AATYPE
-      : (AF3_TO_ESMFOLD2_AATYPE[batch.aatype[token]] ?? UNKNOWN_AATYPE);
+      : batch.aatype[token] === 30 && molType[token] === MOL_RNA ? 27
+        : batch.aatype[token] === 30 && molType[token] === MOL_DNA ? 32
+          : (AF3_TO_ESMFOLD2_AATYPE[batch.aatype[token]] ?? UNKNOWN_AATYPE);
     residueType[token] = code;
     aatype[token * AATYPE_CLASSES + code] = 1;
     inputIds[token] = molType[token] === MOL_PROTEIN && !atomisedResidue[token]

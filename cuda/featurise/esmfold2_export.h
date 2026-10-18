@@ -96,7 +96,9 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
       for (int slot = 0; slot < dense; ++slot) {
         int from = t * dense + slot;
         if (b.refMask[from] == 0) continue;
-        for (int x = 0; x < 3; ++x) refPos[at * 3 + x] = b.refPos[from * 3 + x];
+        // (an unknown nucleotide's backbone at the origin: esm has no idealised positions for it - featurise.js)
+        const bool unknownNucleotide = b.aatype[t] == 30 && molType[t] != MOL_PROTEIN && molType[t] != MOL_NONPOLYMER;
+        for (int x = 0; x < 3; ++x) refPos[at * 3 + x] = unknownNucleotide ? 0.f : b.refPos[from * 3 + x];
         refCharge[at] = b.refCharge[from]; refElement[at] = b.refElement[from];
         for (int i = 0; i < 4; ++i) refNames[at * 4 + i] = b.refAtomNameChars[from * 4 + i];
         refSpaceUid[at] = b.refSpaceUid[from]; atomToToken[at] = t; denseSlot[at] = from; mask[at] = 1;
@@ -115,7 +117,10 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
   std::vector<float> aatype((size_t)T * CLASSES, 0);
   std::vector<int> residueType(T), inputIds(T);
   for (int t = 0; t < T; ++t) {
-    int code = molType[t] == MOL_NONPOLYMER || atomised[t] ? UNKNOWN : esmfold2Aatype(b.aatype[t]);
+    // (AF3's unknown nucleotide, 30: ESMFold2's RNA unknown 27 or DNA unknown 32, by the chain's kind - featurise.js)
+    int code = molType[t] == MOL_NONPOLYMER || atomised[t] ? UNKNOWN
+             : b.aatype[t] == 30 && molType[t] == MOL_RNA ? 27 : b.aatype[t] == 30 && molType[t] == MOL_DNA ? 32
+             : esmfold2Aatype(b.aatype[t]);
     residueType[t] = code;
     aatype[(size_t)t * CLASSES + code] = 1;
     int id = code >= 2 && code <= 21 ? ESM_ID[code] : code == UNKNOWN ? 3 : 24;

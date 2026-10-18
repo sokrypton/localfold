@@ -207,6 +207,10 @@ NUCLEIC = {
     "dna": ("A", "C", "G", "T"),
     "rna": ("A", "C", "G", "U"),
 }
+# 🔴 AND THE UNKNOWN NUCLEOTIDE, N (DN in a DNA chain): AF3's restype 30 and its sugar-phosphate backbone, no base. Its
+# entries were added from af3-any-model 3.1.16's featuriser (a chain of eleven N and an A, since a chain of nothing but
+# N is dropped as having no known residue) rather than by re-running this, which would resample all eight above; a
+# re-run must add them back. Before them an N folded as the protein unknown, four atoms N CA C O.
 NUCLEIC_POSITIONS = ("fivePrime", "internal", "threePrime")
 
 

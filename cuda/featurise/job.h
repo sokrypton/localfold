@@ -93,7 +93,7 @@ inline std::optional<std::string> sequenceProblem(const std::string& s) {
                          : joinSet(bad, ", ") + " are not among the twenty amino acids";
 }
 inline std::optional<std::string> nucleicProblem(const std::string& s, const std::string& kind) {
-  std::string bases = kind == "dna" ? "ACGT" : "ACGU";
+  std::string bases = kind == "dna" ? "ACGTN" : "ACGUN";      // (N: the unknown nucleotide, web/sequence.js)
   std::string label = upper(kind);
   if (s.empty()) return "Enter a " + label + " sequence";
   std::vector<char> bad;

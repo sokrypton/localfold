@@ -110,6 +110,11 @@ const TARGETS = {
   // tokens with the PARENT's restype (DC, not the cysteine the amino-acid table reads), its OP3 gone
   // mid-chain. Dumped by dump_af3_batch.py --kind dna --mods 5CM@5,5CM@9 --user-ccd 5CM.cif
   // (af3-any-model's pip install carries a CCD without any modified base).
+  // the unknown nucleotide (N; DN in a DNA chain) mid-chain and at the 5' end: AF3's restype 30 and its backbone, no base
+  // (--kind dna|rna --sequence NACGNTACGTN / NACGNUACGUN: past 128 atoms, where the atom key windows are compared), where
+  // this port once made it the protein unknown, N CA C O
+  "dna-unk": { suffix: "-dna-unk", extra: () => ({ chainKinds: ["dna"] }) },
+  "rna-unk": { suffix: "-rna-unk", extra: () => ({ chainKinds: ["rna"] }) },
   "dna-5cm": {
     suffix: "-dna-5cm",
     extra: () => ({

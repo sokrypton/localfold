@@ -481,7 +481,13 @@ export function featuriseProtein(sequence, options = {}) {
       const beta = kind === "protein"
         ? (atoms.find((atom) => atom[1] === "CB") ?? atoms.find((atom) => atom[1] === "CA"))
         : atoms.find((atom) => atom[1] === (purine ? "C4" : "C2"));
+      // (and with none of those - the unknown nucleotide has no base - AF3's first held atom: "does not contain a
+      // pseudo-beta atom. Using first valid atom", OP3 at a 5' end and P elsewhere. A family that drops the 5' OP3
+      // masks it AFTER that choice, so its 5' unknown nucleotide's gather stays masked - as its reference's does)
       if (beta) pseudoBetaSlot[token] = beta[0];
+      else if (atoms.length > 0 && !(kind !== "protein" && number === 1 && options.terminalAtoms === false)) {
+        pseudoBetaSlot[token] = atoms[0][0];
+      }
       // 🔴 ONE REFERENCE SPACE PER TOKEN. Every atom of a residue shares its uid,
       // and the atom encoder uses the uid only to decide whether a PAIR of atoms
       // may compare reference coordinates at all - which is what makes the random
