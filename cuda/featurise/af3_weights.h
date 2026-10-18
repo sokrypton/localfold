@@ -182,6 +182,7 @@ inline void embedderWeights(Walk& w, const std::string& p) {
   // chai1's blob revision 3: RelativeChain/RelativeEntity rows and the trunk half of the declared-bond projection
   w.wholeIfPresent(p + ".chaiChainEntity", EVO + "/chai1_chain_entity");
   w.wholeIfPresent(p + ".chaiBondTrunk", EVO + "/chai1_bond_trunk/weights");
+  w.wholeIfPresent(p + ".boltz2DnMsa", EVO + "/boltz2_dn_msa");     // boltz2's DN row (af3-any-model's converter)
   if (w.S.has(EVO + "/token_bonds_type_embed/weights")) {
     T(".tokenBondsTypeEmbed", "token_bonds_type_embed/weights");
     T(".contactEncodingUnspecified", "contact_encoding_unspecified");
@@ -680,6 +681,9 @@ inline void targetFeatureWeights(Walk& w, const std::string& p, const Dialect& d
            {"resType", "boltz2_res_type_encoding"}, {"msaProfile", "boltz2_msa_profile_encoding"}, {"molType", "boltz2_mol_type_conditioning"},
            {"cyclic", "boltz2_cyclic_conditioning"}, {"method", "boltz2_method_conditioning"}, {"modified", "boltz2_modified_conditioning"}})
       w.whole(e + ".targetFeatSum." + path, "diffuser/" + name + "/weights");
+    // Boltz's DN rows (the DNA unknown), where the blob carries them
+    w.wholeIfPresent(e + ".targetFeatSum.dnResType", "diffuser/boltz2_dn_res_type");
+    w.wholeIfPresent(e + ".targetFeatSum.dnMsaProfile", "diffuser/boltz2_dn_msa_profile");
   }
   if (d.is("chaiTokenEmbedding")) {
     for (auto& [path, name] : std::vector<std::pair<std::string, std::string>>{

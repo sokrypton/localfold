@@ -687,6 +687,12 @@ export function targetFeatures(input, tokens, dialect) {
     // [profile (31) | deletion mean (1)]
     add(sum.msaProfile, restypes + 1, (token, k) => (k < restypes
       ? input.profile[token * restypes + k] : input.deletionMean[token]));
+    // Boltz's DN, the DNA unknown (a DNA N, a modified DNA residue's one token): our single nucleic unknown (30) is
+    // Boltz's RNA N, so a DNA token adds DN's column less N's by its class-30 weight - af3-any-model's boltz2_dn_*
+    if (sum.dnResType !== undefined) {
+      add(sum.dnResType, 1, (token) => (input.isDna?.[token] && input.aatype[token] === 30 ? 1 : 0));
+      add(sum.dnMsaProfile, 1, (token) => (input.isDna?.[token] ? input.profile[token * restypes + 30] : 0));
+    }
     // mol_type: protein 0, DNA 1, RNA 2, ligand 3
     add(sum.molType, 4, (token, k) => (molTypeOf(input, token) === k ? 1 : 0));
     // the cyclic flag: PRESENT or absent, not the period. Zero on every

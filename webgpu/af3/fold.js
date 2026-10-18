@@ -963,6 +963,8 @@ async function foldHolding(device, batch, weights, options, held) {
       msaRows: batch.msa,
       deletionMatrix: batch.deletionMatrix,
       msaMask: batch.msaMask,
+      // (and which tokens are DNA: boltz2's DN row is added where a DNA column reads class 30 - embedder.js)
+      isDna: batch.isDna,
       // 🔴 NAMED, BECAUSE THIS OBJECT IS BUILT FIELD BY FIELD. A key the batch
       // carries and this literal does not name is a key thrown away here, and
       // the embedder cannot tell that from a fold with no ligand: both arrive

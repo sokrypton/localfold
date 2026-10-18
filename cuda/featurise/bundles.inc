@@ -16,7 +16,7 @@ inline const std::vector<BundleEntry>& bundleTable() {
     {"af3", "model-af3-int5", "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/af3-int5/"},
     {"openbind0", "model-openbind0-int5", "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/openbind0-int5/"},
     {"opendde", "model-opendde-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/opendde-int5/"},
-    {"boltz2", "model-boltz2-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/boltz2-int5/"},
+    {"boltz2", "model-boltz2-int5", "https://huggingface.co/sokrypton/localfold/resolve/4c892464e84d5294081164d4a0854037de5dbbde/boltz2-int5/"},
     {"protenix2", "model-protenix2-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/protenix2-int5/"},
     {"intellifold2", "model-intellifold2-int5", "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/intellifold2-int5/"},
     {"rosettafold3", "model-rosettafold3-int5", "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/rosettafold3-int5/"},

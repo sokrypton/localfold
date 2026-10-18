@@ -345,6 +345,12 @@ export async function targetFeatureWeights(store) {
       cyclic: await store.tensor("diffuser/boltz2_cyclic_conditioning/weights"),
       method: await store.tensor("diffuser/boltz2_method_conditioning/weights"),
       modified: await store.tensor("diffuser/boltz2_modified_conditioning/weights"),
+      // Boltz's DN, the DNA unknown, kept by af3-any-model's converter as its column less N's - absent from a bundle
+      // made before it, where a DNA unknown reads Boltz's RNA N as it always did
+      ...(store.manifest?.tensors?.["diffuser/boltz2_dn_res_type"] === undefined ? {} : {
+        dnResType: await store.tensor("diffuser/boltz2_dn_res_type"),
+        dnMsaProfile: await store.tensor("diffuser/boltz2_dn_msa_profile"),
+      }),
     };
   const encoder = `${root}_atom_transformer_encoder`;
   const dialect = af3Dialect(store);

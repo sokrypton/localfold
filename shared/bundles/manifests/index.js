@@ -279,7 +279,7 @@ export const MODEL_BUNDLES = {
   boltz2: {
     model: "boltz2",
     directory: "./model-boltz2-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/boltz2-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/4c892464e84d5294081164d4a0854037de5dbbde/boltz2-int5/",
     release: "boltz2-int5",
     variable: "LOCALFOLD_INCLUDE_BOLTZ2_MODEL",
     load: () => import("./boltz2.js"),

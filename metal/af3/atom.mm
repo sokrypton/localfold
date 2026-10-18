@@ -381,7 +381,9 @@ float* buildTargetFeat() {
     run1d("af3_target_feat_sum", (size_t)tokens * C,
           TargetFeatSumArgs{tf, M.i("batch.aatype"), M.f("batch.profile"), M.f("batch.deletionMean"), flagged("batch.isDna"),
                             flagged("batch.isRna"), flagged("batch.isLigand"), flagged("batch.isModified"), W(S + "resType"),
-                            W(S + "msaProfile"), W(S + "molType"), W(S + "method"), W(S + "modified"), (uint)tokens, (uint)C});
+                            W(S + "msaProfile"), W(S + "molType"), W(S + "method"), W(S + "modified"),
+                            hasW(S + "dnResType") ? W(S + "dnResType") : nullptr, hasW(S + "dnMsaProfile") ? W(S + "dnMsaProfile") : nullptr,
+                            (uint)tokens, (uint)C});
   } else {
     tf = scratch<float>("targetFeat", (size_t)tokens * 447);
     run1d("af3_target_feat", (size_t)tokens * 447,

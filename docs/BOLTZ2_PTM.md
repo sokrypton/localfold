@@ -194,18 +194,36 @@ AF3's `modified_rna` example (OMG@4, PSU@13, 5MC@18) folded through boltz2, thre
 - **OMG overflows the one-token form's 24 slots.** It keeps its CCD slots and its leaving atoms leave holes, so C4
   - its pseudo-beta atom - lands at slot 24 and is dropped, in af3-any-model's batch and so in this port's (`ref_mask`
   identical). Genuine Boltz-2 has no slot layout and keeps every atom. This port now PACKS a one-token residue whose
-  slots overflow (featurise.js `modifiedAsOneToken`); `check-batch-fields.js` reports the deviation, bounded to exactly
-  the overflowing atoms.
+  slots overflow (featurise.js `modifiedAsOneToken`), and af3-any-model's tokenizer packs it the same way now.
 - **O2'-CM2 was stretched by the RESTYPE.** Genuine Boltz-2 tokenises a modified residue at residue level with
   `res_type = get_unk_token(chain)` (tokenize/boltz2.py): an RNA base's N, where af3-any-model's boltz2 - and so this
   port - gave every one the PROTEIN unknown. With N (AF3's class 30, Boltz's 27 through the converter's permutation):
   **O2'-CM2 1.66-1.77 A, ligand rms 0.277-0.279** over three seeds, against genuine's 1.55-1.71 and 0.27. Two more of
   genuine's conventions went in beside it, neither moving this fold: the alignment's query reads UNK there (the
   residue record's type, which its featuriser writes over the query's letter), and the representative atom is the
-  residue's first (`atom_center=0, atom_disto=0` from parse_ccd_residue). A modified DNA base keeps the protein
-  unknown: Boltz's DN is the column af3-any-model's converter drops, and methylated DNA folds at 0.037 A that way
-  against 0.041 with N. check-batch-fields.js reports all three per token instead of comparing them.
+  residue's first (`atom_center=0, atom_disto=0` from parse_ccd_residue).
 
 | | bonds scored | ligand rms | PSU13 C5-C1' | OMG4 O2'-CM2 |
 |---|---:|---:|---:|---:|
 | this port, genuine Boltz-2's conventions | 69 | **0.277-0.279** | 3.77 | **1.66-1.77** |
+
+### The DNA unknown, which the converter dropped
+
+Boltz's vocabulary has TWO nucleic unknowns, N (27) and DN (32); AF3's has one (30), and af3-any-model's converter
+mapped 30 to N and threw DN's column away. So a DNA token whose restype is the unknown - a modified DNA base in the
+one-token form, or an `N` in a DNA chain - read RNA's N. The blob now carries DN as three DELTA rows (DN - N: the
+diffusion's `res_type` input, its `msa_profile` input, and the MSA embedder's row), added where the token is DNA and
+reads 30: an old blob is unchanged, a blob without the rows zero-fills with a warning. Published 2026-10-18 -
+af3-any-model `ba282d31` (all three precisions, every earlier record byte-identical) and localfold's boltz2-int5
+`4c892464` (one 3 KiB shard). Carried in every port: the CPU reference, WebGPU (a host-rewritten MSA code 64 on a
+DNA column), CUDA, Metal, and af3-any-model's JAX (branch `boltz2-dn`).
+
+The batch conventions above are af3-any-model's too now (`_mark_modified_residues`, the tokenizer's packing, the
+pipeline dropping a modified residue's every CCD leaving atom), so `check-batch-fields.js` compares boltz2 with NO
+exception - 16 pairs exact. Folded natively, three seeds:
+
+| | SEP (GOL+SEP3) ligand rms | modified_rna ligand rms | O2'-CM2 | methylated_dna ligand rms | methylated_dna vs genuine | DNA with N vs genuine |
+|---|---:|---:|---:|---:|---:|---:|
+| genuine Boltz-2 2.2.1 | - | 0.27 | 1.55-1.71 | 0.039-0.040 | - | - |
+| this port, DN carried | 0.063-0.104 | 0.277-0.279 | 1.68-1.78 | 0.038 | 0.53-0.92 A | 0.70-0.82 A |
+| af3-any-model boltz2: DN carried, then read as N | | | | | 0.50-0.78 / 0.65-0.92 A | 0.65-0.97 / 1.20-1.42 A |

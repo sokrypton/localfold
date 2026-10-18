@@ -70,16 +70,24 @@ const ORDER = [
  * so the weight's presence chooses the order, the source and the key together.
  * See embedder.js, which this mirrors.
  */
-const embedderOrder = (bondTypes) =>
-  (bondTypes ? [...ORDER, "tokenBondsTypeEmbed", "contactEncodingUnspecified"] : ORDER);
+const embedderOrder = (bondTypes, dn = false) =>
+  [...(bondTypes ? [...ORDER, "tokenBondsTypeEmbed", "contactEncodingUnspecified"] : ORDER),
+   ...(dn ? ["boltz2DnMsa"] : [])];
 /**
  * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate` in
  * diffusion-transformer.js. Reading a bound field decodes it.
  */
 export const hasBondTypes = (weights) => carriesTensor(weights, "tokenBondsTypeEmbed");
+/**
+ * 🔴 boltz2's DN ROW, A SHADER VARIANT TOO: Boltz's DNA unknown, which our single nucleic unknown (class 30, Boltz's RNA
+ * N) cannot tell apart - af3-any-model's converter keeps its msa_proj column less N's. The host marks a DNA column's 30
+ * with DN_CODE in the codes it uploads, and the variant adds the row there. Absent from a bundle made before it.
+ */
+export const hasDnRow = (weights) => carriesTensor(weights, "boltz2DnMsa");
+const DN_CODE = 64;
 
 export function packEmbedderWeights(weights) {
-  const order = embedderOrder(hasBondTypes(weights));
+  const order = embedderOrder(hasBondTypes(weights), hasDnRow(weights));
   const offsets = {};
   let total = 0;
   for (const name of order) {
@@ -139,6 +147,7 @@ const W_PREV_SINGLE: u32 = ${offsets.prevSingleEmbedding}u;
 const W_BOND: u32 = ${offsets.bondEmbedding}u;
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `const W_BOND_TYPE: u32 = ${offsets.tokenBondsTypeEmbed}u;
 const W_CONTACT_UNSPECIFIED: u32 = ${offsets.contactEncodingUnspecified}u;`}
+${offsets.boltz2DnMsa === undefined ? "" : `const W_DN_MSA: u32 = ${offsets.boltz2DnMsa}u;`}
 
 fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
 `;
@@ -382,7 +391,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       + squashed * weights[W_MSA + 33u * C_M + c];
     if (code >= 0 && code < 32) {
       total += weights[W_MSA + u32(code) * C_M + c];
-    }
+    }${offsets.boltz2DnMsa === undefined ? "" : `
+    // boltz2's DN: a DNA column's class 30, marked on the host (hasDnRow)
+    if (code == ${DN_CODE}) {
+      total += weights[W_MSA + 30u * C_M + c] + weights[W_DN_MSA + c];
+    }`}
 ${msaFeatureWidth > 34 && pairedQueryRow ? `    // boltz2's paired flag: column 34, 1 on the query row and 0 elsewhere.
     // rosettafold3 has the column and leaves it ZERO, so this term is absent
     // there and the kernel is byte-identical to a 34-column one.
@@ -531,7 +544,9 @@ export class Af3EmbedderGpu {
       // dimension above can see it; see `embedderOrder`.
       + `:bt${hasBondTypes(weights)}:mw${shape.msaFeatureWidth}`
       // ...and the paired column's VALUE, which is a term in the source.
-      + `:pq${shape.msaPairedQueryRow}`;
+      + `:pq${shape.msaPairedQueryRow}`
+      // ...and boltz2's DN row, a term in the source likewise
+      + `:dn${hasDnRow(weights)}`;
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
@@ -554,8 +569,15 @@ export class Af3EmbedderGpu {
       const targetFeat = keep(this.allocator.upload("af3-embed.target", input.targetFeat, storage));
       const weightBuffer = keep(this.allocator.upload("af3-embed.weights", packed.data, storage));
       const features = keep(this.allocator.upload("af3-embed.features", featureData, storage));
-      const codes = keep(this.allocator.upload("af3-embed.codes",
-        Int32Array.from(input.msaRows), storage));
+      const codeRows = Int32Array.from(input.msaRows);
+      // (boltz2's DN: a DNA column's class 30 marked, so the variant adds Boltz's DNA-unknown row - hasDnRow)
+      if (hasDnRow(weights)) {
+        if (input.isDna === undefined) throw new Error("boltz2's DN row needs the batch's isDna");
+        for (let at = 0; at < codeRows.length; at += 1) {
+          if (codeRows[at] === 30 && input.isDna[at % tokens]) codeRows[at] = DN_CODE;
+        }
+      }
+      const codes = keep(this.allocator.upload("af3-embed.codes", codeRows, storage));
       const deletions = keep(this.allocator.upload("af3-embed.deletions",
         Float32Array.from(input.deletionMatrix), storage));
       // 🔴 ALWAYS PRESENT, even on pass one - see the note at the top. And in

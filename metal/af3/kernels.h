@@ -31,7 +31,9 @@ struct RelEncArgs { RelIdx r; CP(float) W; DP(float) pair; uint n, C; };
 // pair += bonds[ij] w + (boltz2) table[order[ij]] + unspecified
 struct BondEmbedArgs { DP(float) pair; CP(float) bonds; CP(float) w; CP(float) orders; CP(float) table; CP(float) unspecified;
                        u64 pairs; uint C, pad; };
-struct MsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) W; CP(float) fromTarget; DP(float) msa; u64 count; uint n, C, width, pairedQuery; };
+// (dnMsa, isDna: boltz2's DN row, added where a DNA column reads class 30 - null without it)
+struct MsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) W; CP(float) fromTarget; DP(float) msa; CP(float) dnMsa; CP(int) isDna;
+                      u64 count; uint n, C, width, pairedQuery; };
 // the template stack's inputs
 struct OnehotArgs { CP(int) idx; DP(float) out; uint n, classes; };
 struct AddRowColArgs { DP(float) act; CP(float) row; CP(float) col; uint n, C; };
@@ -93,7 +95,8 @@ struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(flo
 struct TargetFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) atom; DP(float) out; uint tokens, pad; };
 // boltz2's: the atom columns plus six bias-free projections
 struct TargetFeatSumArgs { DP(float) tf; CP(int) aatype; CP(float) profile; CP(float) delMean; CP(int) isDna; CP(int) isRna; CP(int) isLigand;
-                           CP(int) isModified; CP(float) wRes; CP(float) wProf; CP(float) wMol; CP(float) wMethod; CP(float) wMod; uint tokens, C; };
+                           CP(int) isModified; CP(float) wRes; CP(float) wProf; CP(float) wMol; CP(float) wMethod; CP(float) wMod;
+                           CP(float) dnRes; CP(float) dnProf; uint tokens, C; };   // (dn*: Boltz's DNA unknown, null before its rows)
 
 // ---------------------------------------------------------------- the diffusion module
 // rows [p0, p0 + rows) of [trunk pair (Czt) | the relative one-hot (139)]

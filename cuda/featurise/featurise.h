@@ -267,8 +267,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       r.modified = asked != modificationOf.end();
       const bool dropsTerminal = terminalDropped.count({ci, at}) > 0;
       if (r.modified)
-        r.modification = polymerResidue(asked->second->component, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal,
-                                        protein ? "OXT" : "OP3");
+        r.modification = polymerResidue(asked->second->component, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal
+                                        && !o.modifiedAsOneToken, protein ? "OXT" : "OP3");   // (boltz2: no terminal atom - featurise.js)
       char parent = r.modified ? parentLetter(r.modification.parent, kinds[ci]) : 0;
       r.code = parent ? parent : chain[at];
       r.terminal = (o.terminalAtoms == 1 || (o.terminalAtoms == 2 && protein) || dropsTerminal) ? false
@@ -369,8 +369,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     if (o.modifiedAsOneToken) {
       ModifiedSpan span{token, 1, M.code, residue, M.atoms, M.bonds, true};
       b.modifiedSpans.push_back(span);
-      // (the chain's unknown, as genuine Boltz-2's get_unk_token: an RNA chain's N, 30; DNA's DN has no column - featurise.js)
-      setToken(token, o.atomizedUnknownRestype != 0 ? (R.kind == "rna" ? 30 : UNK_AATYPE) : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
+      // (the chain's unknown, as genuine Boltz-2's get_unk_token: a nucleic chain's 30, a DNA one's DN row added - featurise.js)
+      setToken(token, o.atomizedUnknownRestype != 0 ? (R.kind != "protein" ? 30 : UNK_AATYPE) : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
       // (its atoms packed where its component slots run past the token's, as genuine Boltz-2 keeps them all: featurise.js)
       bool packed = false;
       for (size_t k = 0; k < M.atoms.size(); ++k) if ((M.atoms[k].componentSlot >= 0 ? M.atoms[k].componentSlot : (int)k) >= DENSE) packed = true;
@@ -696,6 +696,15 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       sequences = 1; b.sequences = 1;
       b.msa.resize(tokens); b.msaMask.resize(tokens); b.deletionMatrix.resize(tokens);
     }
+  }
+  // (a one-token modified residue whose profile is just the parent's one-hot reads UNK's, as genuine Boltz-2: featurise.js)
+  for (auto& span : b.modifiedSpans) {
+    if (!span.oneToken) continue;
+    int parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
+    size_t row = (size_t)span.from * RESTYPES;
+    float total = 0;
+    for (int k = 0; k < RESTYPES; ++k) total += b.profile[row + k];
+    if (b.profile[row + parent] == 1.f && total == 1.f) { b.profile[row + parent] = 0; b.profile[row + UNK_AATYPE] = 1; }
   }
   // opendde's and protenix's MSA on a non-protein token: a ligand UNK in every row and its profile, a nucleic chain's
   // all-gap rows its query (featurise.js, af3-any-model's _native_nonprotein_msa)

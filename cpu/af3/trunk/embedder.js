@@ -241,6 +241,14 @@ export function embed(input, weights) {
                                msaFeatureWidth,
                                weights.dialect?.msaPairedQueryRow === true);
   const msa = linear(features, rows, msaFeatureWidth, msaChannels, weights.msaActivations);
+  // boltz2's DN row: Boltz's DNA unknown, added where a DNA column reads class 30 (af3-any-model's boltz2_dn_msa)
+  if (weights.boltz2DnMsa != null) {
+    if (input.isDna === undefined) throw new Error("boltz2's DN row needs the batch's isDna");
+    for (let index = 0; index < rows; index += 1) {
+      if (input.msaRows[index] !== 30 || !input.isDna[index % tokens]) continue;
+      for (let c = 0; c < msaChannels; c += 1) msa[index * msaChannels + c] += weights.boltz2DnMsa[c];
+    }
+  }
   const fromTarget = linear(targetFeat, tokens, featureWidth, msaChannels,
                             weights.extraMsaTargetFeat);
   for (let s = 0; s < sequences; s += 1) {

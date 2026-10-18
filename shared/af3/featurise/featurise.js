@@ -294,8 +294,11 @@ export function featuriseProtein(sequence, options = {}) {
       // (a nucleotide's terminal atom is the 5' OP3, at the chain's first residue)
       const protein = chainKinds[chainIndex] === "protein";
       const dropsTerminal = leaving?.terminalDropped.has(`${chainIndex}:${at}`) === true;
+      // (boltz2's one-token residue keeps no terminal atom either: genuine Boltz-2 drops every leaving atom of a modified
+      // residue, so a 5' 2-methylguanosine is 24 atoms and fits its token, where keeping the OP3 cost the base's C4)
       const modification = asked === null ? null
-        : polymerResidue(asked, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal, protein ? "OXT" : "OP3");
+        : polymerResidue(asked, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
+          && options.modifiedAsOneToken !== true, protein ? "OXT" : "OP3");
       residues.push({
         // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
         code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
@@ -519,10 +522,11 @@ export function featuriseProtein(sequence, options = {}) {
       // `get_unk_token(chain)`): the protein unknown, and an RNA chain's N - AF3's class 30, Boltz's 27 through the
       // converter. Giving a modified RNA base the PROTEIN unknown, as af3-any-model's boltz2 does, stretched
       // 2'-O-methylguanosine's O2'-CM2 to 2.4-2.7 A where genuine Boltz-2 holds 1.55-1.71 (this: 1.66-1.77). A DNA
-      // chain's DN has no column - af3-any-model's converter drops it - so a modified DNA base keeps the protein
-      // unknown, which folds methylated DNA at 0.037 A against 0.041 with N.
+      // chain's DN reads 30 too, and boltz2's DN row (Boltz's DNA unknown, kept by af3-any-model's converter since
+      // 2026-10-18) is added on a DNA token there - methylated DNA folds 0.50-0.78 A from genuine Boltz-2 that way,
+      // 0.65-0.92 without the row.
       aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
-        || options.atomizedUnknownRestype === "chai" ? (kind === "rna" ? UNKNOWN_NUCLEOTIDE : UNK_AATYPE)
+        || options.atomizedUnknownRestype === "chai" ? (kind !== "protein" ? UNKNOWN_NUCLEOTIDE : UNK_AATYPE)
         : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
@@ -534,7 +538,7 @@ export function featuriseProtein(sequence, options = {}) {
       // 🔴 ...UNLESS ITS SLOTS RUN PAST THE TOKEN'S: then its atoms are packed, so every one is kept, as genuine
       // Boltz-2 keeps every atom of a modified residue (it has no 24-slot layout). 2'-O-methylguanosine's holes put its
       // C4 at slot 24, and dropping it - af3-any-model's boltz2 does - lost the purine's pseudo-beta atom and three bonds
-      // and stretched O2'-CM2 to 2.66 A (genuine Boltz-2 2.2.1: 1.61; check-batch-fields.js reports the deviation).
+      // and stretched O2'-CM2 to 2.66 A (genuine Boltz-2 2.2.1: 1.61). af3-any-model packs it the same way since 2026-10-18.
       const packed = modification.atoms.some((one, at) => (one.componentSlot ?? at) >= DENSE);
       const slotOf = (one, at) => (packed ? at : (one.componentSlot ?? at));
       for (let atom = 0; atom < modification.atoms.length; atom += 1) {
@@ -563,8 +567,8 @@ export function featuriseProtein(sequence, options = {}) {
       }
       // 🔴 THE REPRESENTATIVE ATOM IS THE RESIDUE'S FIRST, AS GENUINE Boltz-2's: parse_ccd_residue gives a modified
       // residue `atom_center=0, atom_disto=0`, so its centre and its distogram atom are the first atom it keeps (a
-      // phosphoserine's N). This took CB (a base's C4 / C2) for a while, held to af3-any-model's boltz2 batch, which
-      // does; check-batch-fields.js reports the difference.
+      // phosphoserine's N). This took CB (a base's C4 / C2) for a while, held to af3-any-model's boltz2 batch, which did
+      // until 2026-10-18 and takes the first atom now.
       let firstHeld = 0;
       while (firstHeld < DENSE - 1 && !refMask[token * DENSE + firstHeld]) firstHeld += 1;
       pseudoBetaSlot[token] = firstHeld;
@@ -1167,6 +1171,17 @@ export function featuriseProtein(sequence, options = {}) {
       sequences = 1;
       msa = msa.slice(0, tokens); msaMask = msaMask.slice(0, tokens); deletionMatrix = deletionMatrix.slice(0, tokens);
     }
+  }
+  // (genuine Boltz-2 profiles a one-token modified residue from a query whose letter it has overwritten with UNK, so a
+  // profile that is just the query's - the parent's one-hot - is UNK's; af3-any-model's _mark_modified_residues, the
+  // same rule, holds the alignment case to it too)
+  for (const span of modifiedSpans) {
+    if (span.oneToken !== true) continue;
+    const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
+    const row = span.from * RESTYPES;
+    let total = 0;
+    for (let k = 0; k < RESTYPES; k += 1) total += profile[row + k];
+    if (profile[row + parent] === 1 && total === 1) { profile[row + parent] = 0; profile[row + UNK_AATYPE] = 1; }
   }
   // 🔴 OpenDDE's AND PROTENIX'S MSA ON A NON-PROTEIN TOKEN (`nativeNonproteinMsa`, af3-any-model's
   // _native_nonprotein_msa): their featuriser fills a ligand's columns with the unknown restype in every row, the query's

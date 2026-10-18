@@ -169,7 +169,8 @@ __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const floa
 // (width 35: an is_paired column, set on the query row (row < n) only where `pairedQuery` - boltz2
 // says yes, rosettafold3 carries the column and leaves it zero)
 __global__ void msaEmbedK(const int* rows, const float* deletion, const float* Wmsa, const float* fromTarget,
-                          float* msa, size_t count, int n, int C, int width, bool pairedQuery) {
+                          float* msa, size_t count, int n, int C, int width, bool pairedQuery,
+                          const float* dnMsa = nullptr, const int* isDna = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n);
@@ -178,6 +179,8 @@ __global__ void msaEmbedK(const int* rows, const float* deletion, const float* W
   v += fminf(fmaxf(d, 0.f), 1.f) * Wmsa[(size_t)32 * C + c];
   v += atanf(d / 3.f) * (2.f / 3.14159265358979f) * Wmsa[(size_t)33 * C + c];
   if (width > 34 && pairedQuery && row < (size_t)n) v += Wmsa[(size_t)34 * C + c];
+  // boltz2's DN row: Boltz's DNA unknown, where a DNA column reads class 30 (af3-any-model's boltz2_dn_msa)
+  if (dnMsa && isDna && code == 30 && isDna[token]) v += dnMsa[c];
   msa[t] = v + fromTarget[(size_t)token * C + c];
 }
 
@@ -552,7 +555,9 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   if (msaWidth != 34 && msaWidth != 35) { fprintf(stderr, "msa feature width %d\n", msaWidth); exit(1); }
   msaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
                                                      fromTarget, t.msa, rows, n, t.Cm, msaWidth,
-                                                     M.flag("trunk.dialect.msaPairedQueryRow"));
+                                                     M.flag("trunk.dialect.msaPairedQueryRow"),
+                                                     hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
+                                                     M.has("batch.isDna") ? Idev("batch.isDna") : nullptr);
   buildSingle();
   ++t.pass;
 }

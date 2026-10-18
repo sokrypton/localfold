@@ -358,14 +358,8 @@ for (const target of Object.keys(TARGETS)) {
   const dump = dumpFor(model, target);
   if (dump === null) { missing += 1; console.log(`${model.padEnd(14)} no dump`); continue; }
   const dialect = dialectFor(model);
-  // 🔴 boltz2's ONE-TOKEN MODIFIED RESIDUE FOLLOWS GENUINE Boltz-2 2.2.1 IN THREE FIELDS, WHERE af3-any-model's boltz2
-  // DOES NOT (featurise.js): its restype is its chain's unknown (an RNA base's 30 where the reference has 20), its
-  // alignment query reads UNK (so its profile is UNK's one-hot, not the parent's), and its representative atom is its
-  // first. Giving a modified RNA base the protein unknown stretched 2'-O-methylguanosine's O2'-CM2 to 2.4-2.7 A where
-  // genuine Boltz-2 holds 1.55-1.71. Those tokens' values in those three fields are reported, not compared.
   const batch = af3BatchFromA3m(dump.sequence, TARGETS[target].alignment?.() ?? null,
                                 { ...batchFor(dialect, target), prefixRows: true }).batch;
-  const oneTokenTokens = new Set((batch.modifiedSpans ?? []).filter((span) => span.oneToken === true).map((span) => span.from));
 
   const bad = [];
   const floor = [];   // deliberate deviations: reported every run, never failed
@@ -420,14 +414,7 @@ for (const target of Object.keys(TARGETS)) {
     let differ = 0;
     let worst = 0;
     let skipped = 0;
-    // (a one-token modified residue's restype and profile follow genuine Boltz-2, not af3-any-model's boltz2: below)
-    const perToken = name === "aatype" ? 1 : name === "profile" ? 31 : 0;
-    let genuine = 0;
     for (let at = 0; at < n; at += 1) {
-      if (perToken !== 0 && oneTokenTokens.has(Math.floor(at / perToken))) {
-        if (Math.abs(Number(ours[at]) - theirs[at]) > bound) genuine += 1;
-        continue;
-      }
       // Live on BOTH sides, since a slot either side calls padding carries
       // whatever each happens to leave there.
       if (perAtom) {
@@ -437,10 +424,6 @@ for (const target of Object.keys(TARGETS)) {
       const delta = Math.abs(Number(ours[at]) - theirs[at]);
       if (delta > worst) worst = delta;
       if (delta > bound) differ += 1;
-    }
-    if (genuine !== 0) {
-      floor.push(`${name}: ${genuine} values on ${oneTokenTokens.size} one-token modified residue${oneTokenTokens.size > 1 ? "s" : ""}`
-        + " as genuine Boltz-2 (the chain's unknown restype; UNK in the alignment's query) where af3-any-model keeps its own");
     }
     const lengths = ours.length === theirs.length
       ? "" : ` [ours ${ours.length} theirs ${theirs.length}]`;
@@ -468,14 +451,8 @@ for (const target of Object.keys(TARGETS)) {
     let maskDiff = 0;
     let indexDiff = 0;
     let live = 0;
-    let genuine = 0;
     const n = Math.min(ours.indices.length, idx.length);
     for (let at = 0; at < n; at += 1) {
-      // (a one-token modified residue's representative atom is its first, as genuine Boltz-2's atom_center 0)
-      if (name === "token_atoms_to_pseudo_beta" && oneTokenTokens.has(at)) {
-        if (Number(ours.indices[at]) !== idx[at] || (ours.mask[at] > 0.5) !== (msk[at] > 0.5)) genuine += 1;
-        continue;
-      }
       const mine = ours.mask[at] > 0.5;
       const theirs = msk[at] > 0.5;
       if (mine !== theirs) { maskDiff += 1; continue; }
@@ -483,7 +460,6 @@ for (const target of Object.keys(TARGETS)) {
       live += 1;
       if (Number(ours.indices[at]) !== idx[at]) indexDiff += 1;
     }
-    if (genuine !== 0) floor.push(`${name}: ${genuine} one-token modified residue${genuine > 1 ? "s" : ""} on its first atom, as genuine Boltz-2`);
     if (maskDiff !== 0 || indexDiff !== 0) {
       bad.push(`${name}: mask ${maskDiff} index ${indexDiff} of ${live} live`);
     } else if (verbose) notes.push(`${name}: ${live} live ok`);
@@ -621,27 +597,6 @@ for (const target of Object.keys(TARGETS)) {
   const unmapped = Object.keys(dump.inputs)
     .filter((k) => !seen.has(k) && ABSENT[k] === undefined);
   if (unmapped.length > 0) bad.push(`UNMAPPED: ${unmapped.join(" ")}`);
-
-  // 🔴 ONE DELIBERATE DEVIATION, BOUNDED: boltz2's one-token modified residue whose component slots run past the token's
-  // 24 is PACKED here (featurise.js), as genuine Boltz-2 keeps every atom - where af3-any-model's boltz2 drops the
-  // overflow (2'-O-methylguanosine's C4, its pseudo-beta atom: O2'-CM2 folded at 2.4-2.7 A there and here before,
-  // genuine Boltz-2 2.2.1 1.55-1.71). The extra atom shifts every flat index after it, so the lines it causes are
-  // reported rather than failed - only when this side holds exactly as many more live atoms as overflowed, and the
-  // token count agrees; anything else still fails.
-  if (bad.length !== 0 && dialect.modifiedAsOneToken === true) {
-    const live = (mask) => mask.reduce((sum, v) => sum + (Number(v) > 0.5 ? 1 : 0), 0);
-    let overflow = 0;
-    for (const span of batch.modifiedSpans ?? []) {
-      if (span.oneToken !== true) continue;
-      const packed = span.atoms.some((one, at) => (one.componentSlot ?? at) >= batch.dense);
-      if (packed) overflow += span.atoms.filter((one, at) => (one.componentSlot ?? at) >= batch.dense).length;
-    }
-    const extra = live(batch.refMask) - live(flat(dump.inputs.ref_mask));
-    if (overflow > 0 && extra === overflow && batch.tokens === dump.tokens) {
-      for (const line of bad) floor.push(`(a packed one-token residue, +${overflow} atom${overflow > 1 ? "s" : ""} the reference drops) ${line}`);
-      bad.length = 0;
-    }
-  }
 
   const status = bad.length === 0
     ? (floor.length === 0 ? "EXACT" : "EXACT but for the conformer floor") : "DIFFERS";

@@ -104,6 +104,7 @@ kernel void af3_msa_embed(LF_ARGS(MsaEmbedArgs)) {
   v += clamp(d, 0.f, 1.f) * a.W[32 * a.C + c];
   v += atan(d / 3.f) * (2.f / M_PI_F) * a.W[33 * a.C + c];
   if (a.width > 34 && a.pairedQuery && row < a.n) v += a.W[34 * a.C + c];
+  if (a.dnMsa && a.isDna && code == 30 && a.isDna[token] != 0) v += a.dnMsa[c];      // boltz2's DN row
   a.msa[t] = v + a.fromTarget[token * a.C + c];
 }
 kernel void af3_onehot(LF_ARGS(OnehotArgs)) {
@@ -473,6 +474,8 @@ kernel void af3_target_feat_sum(LF_ARGS(TargetFeatSumArgs)) {
   if (aa >= 0 && aa < 31) v += a.wRes[aa * a.C + c];
   for (int k = 0; k < 31; ++k) v += a.profile[token * 31 + k] * a.wProf[k * a.C + c];
   v += a.delMean[token] * a.wProf[31 * a.C + c];
+  // Boltz's DN, the DNA unknown: DN's column less N's on a DNA token, by its class-30 weight
+  if (a.dnRes && a.isDna && a.isDna[token] != 0) v += (aa == 30 ? a.dnRes[c] : 0.f) + a.profile[token * 31 + 30] * a.dnProf[c];
   int mol = a.isLigand && a.isLigand[token] ? 3 : a.isRna && a.isRna[token] ? 2 : a.isDna && a.isDna[token] ? 1 : 0;
   v += a.wMol[mol * a.C + c];
   v += a.wMethod[1 * a.C + c];                  // x-ray diffraction, the default method

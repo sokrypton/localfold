@@ -197,7 +197,9 @@ static void embed(Trunk& t) {
   size_t rows = (size_t)t.S * n;
   int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
   if (msaWidth != 34 && msaWidth != 35) die("msa feature width %d", msaWidth);
-  run1d("af3_msa_embed", rows * t.Cm, MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa, rows, (uint)n,
+  run1d("af3_msa_embed", rows * t.Cm, MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa,
+                                                   hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
+                                                   M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, rows, (uint)n,
                                                    (uint)t.Cm, (uint)msaWidth, flag("trunk.dialect.msaPairedQueryRow") ? 1u : 0u});
   buildSingle();
   ++t.pass;

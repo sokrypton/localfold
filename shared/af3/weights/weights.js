@@ -484,6 +484,8 @@ export async function embedderWeights(store) {
     // Absent from revision 2, where they read as zero (as af3-any-model's loader zero-fills them)
     ...(hasTensor(store, `${EVO}/chai1_chain_entity`) ? { chaiChainEntity: await T("chai1_chain_entity") } : {}),
     ...(hasTensor(store, `${EVO}/chai1_bond_trunk/weights`) ? { chaiBondTrunk: await T("chai1_bond_trunk/weights") } : {}),
+    // boltz2's DN row (Boltz's DNA unknown, its msa_proj column less N's: af3-any-model's converter); absent before it
+    ...(hasTensor(store, `${EVO}/boltz2_dn_msa`) ? { boltz2DnMsa: await T("boltz2_dn_msa") } : {}),
     // 🔴 boltz2's z-INIT CARRIES TWO MORE TERMS AND BOTH CONTRIBUTE ON EVERY
     // INPUT. `token_bonds_type_embed` is an nn.Embedding over bond ORDER whose
     // row 0 - "no bond" - is a learned NONZERO vector, and

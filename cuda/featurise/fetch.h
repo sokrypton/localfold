@@ -48,16 +48,18 @@ struct BundleEntry { std::string key, directory, remote; };
 #include "bundles.inc"
 
 // af3-any-model's int8 blobs, each at the Hugging Face commit of the revision this port reads: chai1 at its revision 3
-// (relative chain/entity, DX and bond-trunk rows; uploaded at e9da26e6), the rest at the commit that added AlphaFold 3's
+// (relative chain/entity, DX and bond-trunk rows; uploaded at e9da26e6), boltz2 with Boltz's DN rows (ba282d31), the
+// rest at the commit that added AlphaFold 3's
 inline const std::string AF3_ANY_MODEL = "https://huggingface.co/sokrypton/af3-any-model/resolve/";
 inline const std::string AF3_ANY_MODEL_R2 = "98f787eacd6e49cdba88e044622773a8702f03fe";   // (a blob with no .source)
 struct BlobEntry { std::string name, file, commit; };
 inline const std::vector<BlobEntry>& blobTable() {
-  static const std::string r2 = AF3_ANY_MODEL_R2, r3 = "e9da26e648c80d7127d4fe31cd41deb288eb2c3a";
+  static const std::string r2 = AF3_ANY_MODEL_R2, r3 = "e9da26e648c80d7127d4fe31cd41deb288eb2c3a",
+                           boltzDn = "ba282d31e471ec044458e8653dcbbe22150ff346";
   static const std::vector<BlobEntry> t = {
     {"af3", "alphafold3/af3.int8.bin.zst", r2},     // (Google DeepMind's: academic, non-commercial use, terms first)
     {"chai1", "chai1/chai1.int8.bin.zst", r3},
-    {"boltz2", "boltz2/boltz2.int8.bin.zst", r2},
+    {"boltz2", "boltz2/boltz2.int8.bin.zst", boltzDn},       // (Boltz's DN rows, the DNA unknown)
     {"protenix2", "protenix/protenix2.int8.bin.zst", r2},
     {"intellifold2", "intellifold2/intellifold2.int8.bin.zst", r2},
     {"rosettafold3", "rosettafold3/rosettafold3.int8.bin.zst", r2},

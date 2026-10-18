@@ -1120,7 +1120,7 @@ __global__ void targetFeatK(const int* aatype, const float* profile, const float
 __global__ void targetFeatSumK(float* tf, const int* aatype, const float* profile, const float* delMean,
                                const int* isDna, const int* isRna, const int* isLigand, const int* isModified,
                                const float* wRes, const float* wProf, const float* wMol, const float* wMethod,
-                               const float* wMod, int tokens, int C) {
+                               const float* wMod, const float* dnRes, const float* dnProf, int tokens, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)tokens * C) return;
   int token = (int)(t / C), c = (int)(t % C);
@@ -1129,6 +1129,8 @@ __global__ void targetFeatSumK(float* tf, const int* aatype, const float* profil
   if (a >= 0 && a < 31) v += wRes[a * C + c];
   for (int k = 0; k < 31; ++k) v += profile[token * 31 + k] * wProf[k * C + c];
   v += delMean[token] * wProf[31 * C + c];
+  // Boltz's DN, the DNA unknown: a DNA token adds DN's column less N's by its class-30 weight (null before the rows)
+  if (dnRes && isDna && isDna[token]) v += (a == 30 ? dnRes[c] : 0.f) + profile[token * 31 + 30] * dnProf[c];
   // (a flag the batch does not carry is false everywhere)
   int mol = isLigand && isLigand[token] ? 3 : isRna && isRna[token] ? 2 : isDna && isDna[token] ? 1 : 0;
   v += wMol[mol * C + c];
@@ -1232,7 +1234,8 @@ inline float* buildTargetFeat() {
     CK(cudaMemcpyAsync(tf, e.tokenAct, (size_t)tokens * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     targetFeatSumK<<<blocks((size_t)tokens * C), 256, 0, STREAM>>>(tf, Idev("batch.aatype"), Fdev("batch.profile"),
       Fdev("batch.deletionMean"), flagDev("batch.isDna"), flagDev("batch.isRna"), flagDev("batch.isLigand"), flagDev("batch.isModified"),
-      W(S + "resType"), W(S + "msaProfile"), W(S + "molType"), W(S + "method"), W(S + "modified"), tokens, C);
+      W(S + "resType"), W(S + "msaProfile"), W(S + "molType"), W(S + "method"), W(S + "modified"),
+      hasW(S + "dnResType") ? W(S + "dnResType") : nullptr, hasW(S + "dnMsaProfile") ? W(S + "dnMsaProfile") : nullptr, tokens, C);
     return tf;
   }
   EncoderOut e = atomEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr, nullptr);
