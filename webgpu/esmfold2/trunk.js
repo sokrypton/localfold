@@ -257,6 +257,10 @@ export class Esmfold2TrunkGpu {
       transitionFactor,
       pairTransitionSplit,
       pairTransitionChunkBytes: tuning.pairTransitionChunkBytes,
+      // ...and the triangle's contraction in f16 arithmetic where this trunk stages and accumulates in f16, as AF3's
+      // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
+      triangleContractArithmetic: stagedPrecision === "f16" && accumulatePrecision === "f16"
+        && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
       triangleProjectMatrix,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
