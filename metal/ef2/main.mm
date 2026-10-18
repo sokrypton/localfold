@@ -27,13 +27,14 @@ void mem(const char* at) {
 }
 
 // the fit check's factors, measured on the M5 at 522 and 1044 residues: the language model's stage holds the tower and
-// its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (4.06 a pair byte where its blocks run
-// half on the matrix units, 5.14 where they run float: LOCALFOLD_GEMM_TENSOR=0) - the larger stage is the peak
+// its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (where its blocks run half on the
+// matrix units 3.56 a pair byte since each update emits its next norm over its own input - 4.06 with a second buffer for
+// it -, 5.14 where they run float: LOCALFOLD_GEMM_TENSOR=0) - the larger stage is the peak
 static const double EF2_PAIR_SLOW = 5.3;
 static double ef2Peak(double held, double tower, double pair, bool parcae) {
   // (the released models' recycle: the float pair's blocks, and two pairs more - the language model's, kept for every
   // pass, and its injection - not measured, counted)
-  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (parcae ? EF2_PAIR_SLOW + 2 : matrixUnits() ? 4.2 : EF2_PAIR_SLOW) * pair);
+  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (parcae ? EF2_PAIR_SLOW + 2 : matrixUnits() ? 3.7 : EF2_PAIR_SLOW) * pair);
 }
 bool KEEP_TOWER = false;      // (--serve: the next job reads it again)
 int foldInput(const Opts& o) {

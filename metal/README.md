@@ -317,7 +317,7 @@ s). `LOCALFOLD_TRI_BLOCKS=1` and `LOCALFOLD_QKVG_MB=0` are the controls.
 input is loaded plus measured factors times the f32 pair and MSA, against `recommendedMaxWorkingSetSize` (12.71 GB on a
 16 GB M5). Past that, unified memory pages and the fold runs many times slower instead of failing. The factors (bytes
 at the peak per f32 pair byte) were measured by folding at 1,044 tokens on both paths: AF3 5.1 (5.4 where its stacks run
-float, as on an M2), AF2 4.7, ESMFold2 4.2 (5.3) for its trunk's stage with its tower given back; the MSA's 3.2 (AF3) and
+float, as on an M2), AF2 4.7, ESMFold2 4.2 (5.3; 3.7 since 2026-10-19, each pair update emitting its next norm over its own input) for its trunk's stage with its tower given back; the MSA's 3.2 (AF3) and
 2.2 (AF2). The estimates sit 1-3% over the peaks they were fitted to; below ~600 tokens a fold's fixed costs dominate and
 they can read 5-10% under, which decides nothing there. On this M5 the longest folds are about AF3 2,100 tokens, AF2
 2,250 residues, ESMFold2 1,690 (before this round 1,900, 1,850 and 1,620). `LOCALFOLD_NO_FOLD_FITS=1` folds anyway; a `--serve` process

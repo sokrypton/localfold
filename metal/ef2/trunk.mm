@@ -44,10 +44,13 @@ static half* takeEmitted(const void* x, const std::string& norm) {
   emitted.x = nullptr;
   return hit ? emitted.buf : nullptr;
 }
-// where an update's GEMM emits the next norm: whichever of ftri.xn and eln.b its own input is not
+// where an update's GEMM emits the next norm: over its own input norm, in place. An emitting GEMM covers every output
+// column of a row block in one tile (the emission's own condition, core.mm's lnEmit), so the block's input rows are
+// read by its matmul before the epilogue - behind a threadgroup barrier - writes the norm over them, and no other tile
+// reads those rows; the transition's chunks overwrite rows their SwiGLU has already read. A second pair-sized buffer
+// (eln.b) beside the triangle's planes was the peak: 558 MB at 1044 residues
 static half* lnTarget(size_t P, int C, const half* inUse) {
-  half* a = scratch<half>("ftri.xn", P * C);
-  return inUse == a ? scratch<half>("eln.b", P * C) : a;
+  return inUse ? (half*)inUse : scratch<half>("ftri.xn", P * C);
 }
 // (the pair float, or half where foldingTrunk keeps a half copy for the blocks)
 template <class T>
