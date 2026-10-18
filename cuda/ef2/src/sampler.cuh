@@ -190,6 +190,7 @@ inline void writePdb(const std::string& templatePath, const std::string& out, co
   std::ifstream in(templatePath);
   if (!in) { fprintf(stderr, "no %s (export_input.mjs writes it)\n", templatePath.c_str()); exit(1); }
   FILE* f = fopen(out.c_str(), "w");
+  if (!f) { fprintf(stderr, "cannot write %s: %s\n", out.c_str(), strerror(errno)); exit(1); }
   std::string line;
   while (std::getline(in, line)) {
     if ((line.rfind("ATOM", 0) == 0 || line.rfind("HETATM", 0) == 0) && line.size() >= 66) {

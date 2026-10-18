@@ -412,6 +412,15 @@ At 261 residues the MSA row attention 116.3 -> 109.7 ms a fold, the triangle att
 fixed cost a block - the queries, the pipeline's fill, the gate's epilogue - over few key tiles, at three 4-warp
 blocks an SM (168 registers and 51 KB each); 48-key tiles, which pad less, measured no better.
 
+On Colab's RTX PRO 6000 (G4), the same settings, a cold process's fold: 5CAJ 0.933 -> **0.845 s**, 600 residues deep
+2.89 -> **2.69**, 1,000 deep 6.57 -> **6.21**, 1,500 deep 13.98 -> **13.37**, 2,500 deep 39.96 -> **38.76**; 5CAJ against
+its crystal 1.82-1.85 A on three seeds.
+
+**And a block walking several MSA rows** (`ITEMS` row groups a block, the next group's first key tile in flight under
+the last one's final tile and epilogue): slower, 110 -> 142 ms of the row attention at 261 residues and 366 -> 449 at
+600 with two groups a block. The kernel sits at the 168 registers that hold three blocks an SM; the per-group state
+spilled (a 192-byte stack frame against 80), and raising the cap costs the third block.
+
 **Tried and taken back: the LN of a 128-channel row by four lanes rather than a warp** (two shuffle levels where
 five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 apart, yet AF3's kitchen-sink job read
 pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a

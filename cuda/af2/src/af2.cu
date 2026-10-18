@@ -610,6 +610,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   int firstAsym = *std::min_element(asym.begin(), asym.end());
   const float* mask37 = M.f("c/atom37_mask");
   FILE* f = fopen(out.c_str(), "w");
+  if (!f) { fprintf(stderr, "cannot write %s: %s\n", out.c_str(), strerror(errno)); return 1; }
   int serial = 1;
   for (int i = 0; i < L; ++i) {
     int aa = std::min(std::max(aatype[i], 0), 19);

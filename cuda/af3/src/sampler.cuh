@@ -414,6 +414,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
   std::ifstream tf(DATA_DIR + "/template.pdb");
   if (tf) {
     FILE* f = fopen(path.c_str(), "w");
+    if (!f) { fprintf(stderr, "cannot write %s: %s\n", path.c_str(), strerror(errno)); exit(1); }
     std::string line;
     while (std::getline(tf, line)) {
       if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
@@ -439,6 +440,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
   const int* elem = M.i("batch.refElement"); const float* mask = M.f("batch.refMask");
   const int* chain = M.i("batch.asymId"); const int* resIdx = M.i("batch.residueIndex");
   FILE* f = fopen(path.c_str(), "w");
+  if (!f) { fprintf(stderr, "cannot write %s: %s\n", path.c_str(), strerror(errno)); exit(1); }
   int serial = 1;
   // (PDB's fields: a serial of five digits and a chain of one letter - past 99,999 atoms the serial wraps, as the
   // chain letter already does past 26 chains, so the columns stay where every reader looks; mmCIF holds either)
