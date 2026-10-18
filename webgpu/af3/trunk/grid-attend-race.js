@@ -17,7 +17,7 @@
  *
  * ...and the triangle contraction's (`triangleContractArithmetic`, webgpu/kernels/triangle/shaders.js's f16 kernel),
  * which was measured on the M5 alone: 0.69 against 0.51 ms at 256 tokens and 32 channels there, relRMS 6.5e-4. The
- * three races take ~0.55 s on the M5, once a browser.
+ * races take ~0.4 s on the M5, once a browser (their arms compiled at once, their noise shared and periodic).
  *
  * 🔴 AWAITED BY THE COMPILE, NOT THE DEVICE. The knob is read when a stack builds its pipelines, so a race still
  * running then would leave it unset for the fold that most wants it; a stack's compile is seconds of driver work, and
@@ -122,13 +122,17 @@ export function settleGridAttendTiling(device) {
   return promise;
 }
 
+// (a period of 2^20 floats, repeated: the races time kernels and compare two arms on the same input, neither of which
+// asks for 8 M independent draws - drawing them all in JavaScript was most of a race's 0.5 s)
 function noise(count, seed, scale) {
   const out = new Float32Array(count);
+  const period = Math.min(count, 1 << 20);
   let state = seed >>> 0;
-  for (let i = 0; i < count; i += 1) {
+  for (let i = 0; i < period; i += 1) {
     state = (state * 1664525 + 1013904223) >>> 0;
     out[i] = (state / 4294967296 - 0.5) * scale;
   }
+  for (let at = period; at < count; at += period) out.copyWithin(at, 0, Math.min(period, count - at));
   return out;
 }
 
@@ -183,10 +187,9 @@ async function timeArms(device, arms, buffers, run) {
   return medians;
 }
 
-/** grid.project in f32 against f16 arithmetic at N tokens: { f32Ms, f16Ms, relRms, half } (half: f16 won and agrees). */
-async function raceProject(device, buffers) {
+/** grid.project's two arms compiled (f32, then f16 arithmetic), and the packed offsets their weights take. */
+function prepareProject(device) {
   const width = HEADS * DIMENSION;
-  const pairs = N * N;
   const zeros = (count) => new Float32Array(count);
   const packed = packGridAttentionWeights({
     heads: HEADS, dimension: DIMENSION,
@@ -194,18 +197,7 @@ async function raceProject(device, buffers) {
     qProjection: zeros(CHANNELS * width), kProjection: zeros(CHANNELS * width), vProjection: zeros(CHANNELS * width),
     gatingQuery: zeros(CHANNELS * width), outputProjection: zeros(width * CHANNELS),
   });
-  const upload = (values, extra = 0) => {
-    const buffer = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | extra,
-                                         mappedAtCreation: true });
-    new Float32Array(buffer.getMappedRange()).set(values);
-    buffer.unmap();
-    buffers.push(buffer);
-    return buffer;
-  };
-  // weights of a trained layer's scale over a normalised pair, so the outputs are a few units as a trunk's are
-  const weights = upload(noise(packed.data.length, 5, 0.2));
-  const normalized = upload(noise(pairs * CHANNELS, 6, 2));
-  const arms = await Promise.all([false, true].map(async (half) => {
+  return Promise.all([false, true].map(async (half) => {
     const { project, tiles } = createGridAttentionShaders(
       { n: N, channels: CHANNELS, heads: HEADS, dimension: DIMENSION, transpose: false, residual: true,
         stagedPrecision: "f16", ...(half ? { projectArithmetic: "f16" } : {}),
@@ -215,16 +207,15 @@ async function raceProject(device, buffers) {
       label: `grid-project-race.${half ? "f16" : "f32"}`, layout: "auto",
       compute: { module: device.createShaderModule({ code: project }), entryPoint: "main" },
     });
-    const outputs = [0, 1, 2, 3].map(() => upload(zeros(pairs * width), GPUBufferUsage.COPY_SRC));
-    return { half, pipeline, outputs, groups: [Math.ceil(pairs / tiles.projectRows)], times: [],
-             bind: device.createBindGroup({
-               layout: pipeline.getBindGroupLayout(0),
-               entries: [normalized, weights, ...outputs].map((buffer, binding) => ({ binding, resource: { buffer } })),
-             }) };
+    return { half, pipeline, weightsLength: packed.data.length, groups: [Math.ceil(N * N / tiles.projectRows)], times: [] };
   }));
+}
+
+/** One race's two arms, run once each and compared over a sample of `output`, then timed: [arm 0 ms, arm 1 ms, relRMS]. */
+async function measure(device, arms, buffers, label, outputOf) {
   const run = async (arm, iterations) => {
-    const encoder = device.createCommandEncoder({ label: "grid-project-race" });
-    const pass = encoder.beginComputePass({ label: "grid-project-race" });
+    const encoder = device.createCommandEncoder({ label });
+    const pass = encoder.beginComputePass({ label });
     pass.setPipeline(arm.pipeline);
     pass.setBindGroup(0, arm.bind);
     for (let i = 0; i < iterations; i += 1) pass.dispatchWorkgroups(...arm.groups);
@@ -234,14 +225,13 @@ async function raceProject(device, buffers) {
     await device.queue.onSubmittedWorkDone();
     return performance.now() - started;
   };
-  // q of each arm after one dispatch (the projection overwrites), compared over a sample
   const SAMPLE = 1 << 16;
   const read = async (arm) => {
     await run(arm, 1);
     const readback = device.createBuffer({ size: SAMPLE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     buffers.push(readback);
     const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(arm.outputs[0], 0, readback, 0, SAMPLE * 4);
+    encoder.copyBufferToBuffer(outputOf(arm), 0, readback, 0, SAMPLE * 4);
     device.queue.submit([encoder.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
     const values = new Float32Array(readback.getMappedRange().slice(0));
@@ -255,27 +245,40 @@ async function raceProject(device, buffers) {
     error += d * d; scale += reference[i] * reference[i];
   }
   const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
-  const [f32Ms, f16Ms] = await timeArms(device, arms, buffers, run);
+  const [first, second] = await timeArms(device, arms, buffers, run);
+  return [first, second, relRms];
+}
+
+/** A buffer of `count` floats on the device, for the races' outputs. */
+function outputBuffer(device, buffers, count) {
+  const buffer = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  buffers.push(buffer);
+  return buffer;
+}
+
+/** grid.project in f32 against f16 arithmetic at N tokens: { f32Ms, f16Ms, relRms, half } (half: f16 won and agrees). */
+async function raceProject(device, buffers, prepared, shared) {
+  const width = HEADS * DIMENSION;
+  const arms = await prepared;
+  // weights of a trained layer's scale over a normalised pair, so the outputs are a few units as a trunk's are
+  const weights = shared.upload(noise(arms[0].weightsLength, 5, 0.2));
+  for (const arm of arms) {
+    arm.outputs = [0, 1, 2, 3].map(() => outputBuffer(device, buffers, N * N * width));
+    arm.bind = device.createBindGroup({
+      layout: arm.pipeline.getBindGroupLayout(0),
+      entries: [shared.noise[0], weights, ...arm.outputs].map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+  }
+  const [f32Ms, f16Ms, relRms] = await measure(device, arms, buffers, "grid-project-race", (arm) => arm.outputs[0]);
   // (f16 sums 32 products in half: ~1e-3 of the f32 answer, which the f16 attend bound already admits)
   const half = Number.isFinite(relRms) && relRms < 1e-2 && f16Ms < f32Ms * RACE_MARGIN;
   return { f32Ms: Number(f32Ms.toFixed(3)), f16Ms: Number(f16Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), half };
 }
 
-/** tri.contract in f32 against f16 arithmetic at N tokens, 32 channels: { f32Ms, f16Ms, relRms, half }. */
-async function raceContract(device, buffers) {
-  const CHANNELS_RACED = 32;
-  const pairs = N * N;
-  const upload = (values, extra = 0) => {
-    const buffer = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | extra,
-                                         mappedAtCreation: true });
-    new Float32Array(buffer.getMappedRange()).set(values);
-    buffer.unmap();
-    buffers.push(buffer);
-    return buffer;
-  };
-  const a = upload(noise(CHANNELS_RACED * pairs, 7, 2));
-  const b = upload(noise(CHANNELS_RACED * pairs, 8, 2));
-  const arms = await Promise.all([false, true].map(async (half) => {
+const CHANNELS_RACED = 32;
+/** tri.contract's two arms compiled (f32, then f16 arithmetic), 32 channels. */
+function prepareContract(device) {
+  return Promise.all([false, true].map(async (half) => {
     const { contract, contractTile } = createTriangleShaders(
       { length: N, cZ: 128, cHidden: CHANNELS_RACED }, "f32", {}, 1e-5, "outgoing", "fast", undefined, true,
       half ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined);
@@ -283,121 +286,65 @@ async function raceContract(device, buffers) {
       label: `tri-contract-race.${half ? "f16" : "f32"}`, layout: "auto",
       compute: { module: device.createShaderModule({ code: contract }), entryPoint: "main" },
     });
-    const output = upload(new Float32Array(CHANNELS_RACED * pairs), GPUBufferUsage.COPY_SRC);
-    return { half, pipeline, output, times: [],
-             groups: [Math.ceil(N / contractTile.columns), Math.ceil(N / contractTile.rows), CHANNELS_RACED],
-             bind: device.createBindGroup({
-               layout: pipeline.getBindGroupLayout(0),
-               entries: [a, b, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
-             }) };
+    return { half, pipeline, times: [],
+             groups: [Math.ceil(N / contractTile.columns), Math.ceil(N / contractTile.rows), CHANNELS_RACED] };
   }));
-  const run = async (arm, iterations) => {
-    const encoder = device.createCommandEncoder({ label: "tri-contract-race" });
-    const pass = encoder.beginComputePass({ label: "tri-contract-race" });
-    pass.setPipeline(arm.pipeline);
-    pass.setBindGroup(0, arm.bind);
-    for (let i = 0; i < iterations; i += 1) pass.dispatchWorkgroups(...arm.groups);
-    pass.end();
-    const started = performance.now();
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    return performance.now() - started;
-  };
-  const SAMPLE = 1 << 16;
-  const read = async (arm) => {
-    await run(arm, 1);
-    const readback = device.createBuffer({ size: SAMPLE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    buffers.push(readback);
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(arm.output, 0, readback, 0, SAMPLE * 4);
-    device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const values = new Float32Array(readback.getMappedRange().slice(0));
-    readback.unmap();
-    return values;
-  };
-  const [reference, candidate] = [await read(arms[0]), await read(arms[1])];
-  let error = 0; let scale = 0;
-  for (let i = 0; i < SAMPLE; i += 1) {
-    const d = candidate[i] - reference[i];
-    error += d * d; scale += reference[i] * reference[i];
+}
+
+/** tri.contract in f32 against f16 arithmetic at N tokens, 32 channels: { f32Ms, f16Ms, relRms, half }. */
+async function raceContract(device, buffers, prepared, shared) {
+  const arms = await prepared;
+  const bytes = CHANNELS_RACED * N * N * 4;
+  for (const arm of arms) {
+    arm.output = outputBuffer(device, buffers, CHANNELS_RACED * N * N);
+    arm.bind = device.createBindGroup({
+      layout: arm.pipeline.getBindGroupLayout(0),
+      entries: [{ buffer: shared.noise[0], size: bytes }, { buffer: shared.noise[1], size: bytes }, { buffer: arm.output }]
+        .map((resource, binding) => ({ binding, resource })),
+    });
   }
-  const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
-  const [f32Ms, f16Ms] = await timeArms(device, arms, buffers, run);
+  const [f32Ms, f16Ms, relRms] = await measure(device, arms, buffers, "tri-contract-race", (arm) => arm.output);
   const half = Number.isFinite(relRms) && relRms < 1e-2 && f16Ms < f32Ms * RACE_MARGIN;
   return { f32Ms: Number(f32Ms.toFixed(3)), f16Ms: Number(f16Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), half };
 }
 
-/** AF2's flash attention (the shipped f16-staged kernel), one key a rescale against four: { g1Ms, g4Ms, relRms, group }. */
-async function raceGroup(device, buffers) {
-  // the MSA row attention of a 255-residue chain over 128 rows, eight heads of 32 (bench-msa-attention.js --shape=row)
-  const batch = 128, queries = 255, channels = 256, heads = 8, headDim = 32;
-  const elements = batch * queries * channels;
-  const upload = (data, usage = GPUBufferUsage.STORAGE) => {
-    const buffer = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
-    new data.constructor(buffer.getMappedRange()).set(data);
-    buffer.unmap();
-    buffers.push(buffer);
-    return buffer;
-  };
-  const query = upload(noise(elements, 9, 1));
-  const key = upload(noise(elements, 10, 1));
-  const value = upload(noise(elements, 11, 1));
-  const gate = upload(noise(elements, 12, 1));
-  const maskValues = new Float32Array(batch * queries);
-  for (let i = 0; i < maskValues.length; i += 1) maskValues[i] = i % 17 === 0 ? 0 : 1;
-  const mask = upload(maskValues);
-  const pairBias = upload(new Float32Array(1));
-  const parameters = upload(new Uint32Array([batch, queries, channels, heads, headDim, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, channels]), GPUBufferUsage.UNIFORM);
-  const arms = await Promise.all([1, 4].map(async (group) => {
+// the MSA row attention of a 255-residue chain over 128 rows, eight heads of 32 (bench-msa-attention.js --shape=row)
+const GROUP_SHAPE = { batch: 128, queries: 255, channels: 256, heads: 8, headDim: 32 };
+/** AF2's flash attention's two arms compiled (the shipped f16-staged kernel, one key a rescale, then four). */
+function prepareGroup(device) {
+  const { batch, queries, heads, headDim } = GROUP_SHAPE;
+  return Promise.all([1, 4].map(async (group) => {
     const pipeline = await device.createComputePipelineAsync({
       label: `attention-group-race.g${group}`, layout: "auto",
       compute: { module: device.createShaderModule({
         code: createAttentionRegisterFlashShader(headDim, undefined, { group, precision: "chunk16" }) }), entryPoint: "main" },
     });
-    const output = device.createBuffer({ size: elements * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    buffers.push(output);
-    return { group, pipeline, output, times: [], groups: [Math.ceil(queries / 64), batch, heads],
-             bind: device.createBindGroup({
-               layout: pipeline.getBindGroupLayout(0),
-               entries: [query, key, value, gate, mask, pairBias, parameters, output]
-                 .map((buffer, binding) => ({ binding, resource: { buffer } })),
-             }) };
+    return { group, pipeline, times: [], groups: [Math.ceil(queries / 64), batch, heads] };
   }));
-  const run = async (arm, iterations) => {
-    const encoder = device.createCommandEncoder({ label: "attention-group-race" });
-    const pass = encoder.beginComputePass({ label: "attention-group-race" });
-    pass.setPipeline(arm.pipeline);
-    pass.setBindGroup(0, arm.bind);
-    for (let i = 0; i < iterations; i += 1) pass.dispatchWorkgroups(...arm.groups);
-    pass.end();
-    const started = performance.now();
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    return performance.now() - started;
-  };
-  const SAMPLE = 1 << 16;
-  const read = async (arm) => {
-    await run(arm, 1);
-    const readback = device.createBuffer({ size: SAMPLE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    buffers.push(readback);
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(arm.output, 0, readback, 0, SAMPLE * 4);
-    device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const values = new Float32Array(readback.getMappedRange().slice(0));
-    readback.unmap();
-    return values;
-  };
-  const [reference, candidate] = [await read(arms[0]), await read(arms[1])];
-  let error = 0; let scale = 0;
-  for (let i = 0; i < SAMPLE; i += 1) {
-    const d = candidate[i] - reference[i];
-    error += d * d; scale += reference[i] * reference[i];
+}
+
+/** AF2's flash attention, one key a rescale against four: { g1Ms, g4Ms, relRms, group }. */
+async function raceGroup(device, buffers, prepared, shared) {
+  const { batch, queries, channels, heads, headDim } = GROUP_SHAPE;
+  const arms = await prepared;
+  const bytes = batch * queries * channels * 4;
+  const maskValues = new Float32Array(batch * queries);
+  for (let i = 0; i < maskValues.length; i += 1) maskValues[i] = i % 17 === 0 ? 0 : 1;
+  const mask = shared.upload(maskValues);
+  const pairBias = shared.upload(new Float32Array(4));
+  const parameters = shared.upload(new Uint32Array([batch, queries, channels, heads, headDim, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, channels]), GPUBufferUsage.UNIFORM);
+  // q, k, v and the gate over the shared noise (the gate reuses q's: only the inputs' scale matters here)
+  const [q, k, v] = shared.noise.map((buffer) => ({ buffer, size: bytes }));
+  for (const arm of arms) {
+    arm.output = outputBuffer(device, buffers, batch * queries * channels);
+    arm.bind = device.createBindGroup({
+      layout: arm.pipeline.getBindGroupLayout(0),
+      entries: [q, k, v, q, { buffer: mask }, { buffer: pairBias }, { buffer: parameters }, { buffer: arm.output }]
+        .map((resource, binding) => ({ binding, resource })),
+    });
   }
-  const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
-  const [g1Ms, g4Ms] = await timeArms(device, arms, buffers, run);
+  const [g1Ms, g4Ms, relRms] = await measure(device, arms, buffers, "attention-group-race", (arm) => arm.output);
   // (a grouped rescale reassociates the online softmax: ~1e-7, the same class as the key chunk's)
   const group = Number.isFinite(relRms) && relRms < 1e-4 && g4Ms < g1Ms * RACE_MARGIN ? 4 : 1;
   return { g1Ms: Number(g1Ms.toFixed(3)), g4Ms: Number(g4Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), group };
@@ -419,6 +366,11 @@ async function race(device) {
       stagedPrecision: "f16", attendTiled: tiled, attendTiledHalf: tiled,
       maxComputeWorkgroupStorageSize: device.limits.maxComputeWorkgroupStorageSize },
     offsets, 1e-5, "fast", { swapTransposedBias: false });
+  // 🔴 EVERY ARM'S PIPELINE COMPILED AT ONCE, and the four races share one set of noise: compiled race by race and each
+  // drawing its own ~30 M floats in JavaScript, the four took 0.75 s on the M5
+  const wantsGroup = deviceProfile(device).tuning.attentionGroup === null;
+  const preparing = { project: prepareProject(device), contract: prepareContract(device),
+                      group: wantsGroup ? prepareGroup(device) : null };
   const arms = await Promise.all([false, true].map(async (tiled) => {
     const { attend, tiles } = shaders(tiled);
     const pipeline = await device.createComputePipelineAsync({
@@ -430,9 +382,9 @@ async function race(device) {
 
   const buffers = [];
   const upload = (values, extra = 0) => {
-    const buffer = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | extra,
-                                         mappedAtCreation: true });
-    new Float32Array(buffer.getMappedRange()).set(values);
+    const usage = extra === GPUBufferUsage.UNIFORM ? extra : GPUBufferUsage.STORAGE | extra;
+    const buffer = device.createBuffer({ size: values.byteLength, usage, mappedAtCreation: true });
+    new values.constructor(buffer.getMappedRange()).set(values);
     buffer.unmap();
     buffers.push(buffer);
     return buffer;
@@ -490,11 +442,12 @@ async function race(device) {
     // 🔴 AND THE GRID PROJECTION'S ARITHMETIC, WHICH SPLITS THE SAME TWO PARTS THE SAME WAY: f16 is grid.project 475 /
     // 500 -> 328 / 344 ms a 255-token pass on the M5 and 707 / 719 -> 870 / 898 on the M2 (the device-profile note).
     // The trunk's projection (f16 staging, f32 q/k/v/gate), both arithmetics, on the same normalised pair and weights.
-    const project = await raceProject(device, buffers);
+    const shared = { noise: inputs.slice(0, 3), upload };
+    const project = await raceProject(device, buffers, preparing.project, shared);
     // ...and the triangle contraction's (webgpu/kernels/triangle/shaders.js's f16 kernel), the same question again
-    const contract = await raceContract(device, buffers);
+    const contract = await raceContract(device, buffers, preparing.contract, shared);
     // ...and AF2's flash attention's rescale group, only where the prior left it to the device
-    const group = deviceProfile(device).tuning.attentionGroup === null ? await raceGroup(device, buffers) : null;
+    const group = wantsGroup ? await raceGroup(device, buffers, preparing.group, shared) : null;
     DETAIL.set(device, { tokens: N, untiledMs: Number(untiled.toFixed(3)), tiledHalfMs: Number(tiled.toFixed(3)),
                          relRms: Number(relRms.toExponential(2)), tiled: take,
                          samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract,
