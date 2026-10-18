@@ -2636,8 +2636,9 @@ export class Af3DiffusionTransformerGpu {
       // ...with the device's softmax shape, the knobs AF2's attention takes (attentionGroup and
       // attentionVectorScore). Unset, every key's score was one dependent chain of head_dim/4 dot
       // products on a dispatch of ~80 workgroups, which is all latency.
-      const { attentionGroup: group = 1, attentionVectorScore: vectorScore = false } =
+      const { attentionGroup: groupAsked, attentionVectorScore: vectorScore = false } =
         deviceTuning(this.device);
+      const group = groupAsked ?? 1;
       // 🔴 AND SPLIT OVER KEYS WHILE THE (query tile, head) PAIRS ARE TOO FEW: at 262 tokens they are 80
       // workgroups, each walking all 262 keys. Doubled while that is short of ~512 workgroups and each
       // split keeps at least 32 keys; `diffusionFlashSplits` forces a count (1 is unsplit).

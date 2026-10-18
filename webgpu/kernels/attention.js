@@ -2068,7 +2068,9 @@ export function selectAttentionFlashKernel(
     // is the same class of difference the key chunk already carries, and is
     // why it is gated on check-evoformer-attention.js rather than a stopwatch.
     // The M2's answer is the default; see webgpu/runtime/device-profile.js.
-    const { attentionGroup: group, attentionVectorScore: vectorScore } = deviceTuning(device);
+    // (null: an Apple GPU whose race has not answered yet - one key a rescale, as before; grid-attend-race.js)
+    const { attentionGroup: groupAsked, attentionVectorScore: vectorScore } = deviceTuning(device);
+    const group = groupAsked ?? 1;
     // ...and the key chunk, which the kernel derives from the precision unless
     // a device names one. See attentionKeyChunk.
     const keyChunk = shapedKnob(deviceTuning(device).attentionKeyChunk) ?? undefined;

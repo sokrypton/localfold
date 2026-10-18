@@ -1408,6 +1408,7 @@ export async function encodeEvoformerBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   const row = input.weights.msaRowAttention;
   await staged(execution, () => encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
@@ -1535,6 +1536,7 @@ export async function encodeEvoformerPairBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   await staged(execution, async() => {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
@@ -1586,6 +1588,7 @@ export async function encodeExtraMsaBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   const row = weights.msaRowAttention;
   await staged(execution, () => encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: shape.sequences, queries: shape.length,
@@ -1614,6 +1617,7 @@ export async function encodeTemplatePairBlock(
   pair,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,

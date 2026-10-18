@@ -898,6 +898,7 @@ export async function encodeEvoformerBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   // 🔴 WHERE THE OUTER PRODUCT MEAN SITS IS A PER-MODEL FACT, not a style. AF2
   // multimer runs it at the TOP of the block, monomer after the MSA transition,
   // and the weights were trained for their own ordering - so this cannot be
@@ -976,6 +977,7 @@ export async function encodeEvoformerPairBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   // ...unless the caller already ran it. AF2-multimer puts the outer product
   // mean at the TOP of an extra-MSA block, before the row attention, where this
   // has it after the MSA transition - the monomer order. Lifting it out is the
@@ -1026,6 +1028,7 @@ export async function encodeExtraMsaBlock(
   msaMask,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   // 🔴 MULTIMER RUNS THE OUTER PRODUCT MEAN FIRST HERE TOO. Only the main
   // evoformer honoured the flag before; this stack read it and did nothing,
   // which left every multimer fold running one of its two stacks in the monomer
@@ -1069,6 +1072,7 @@ export async function encodeTemplatePairBlock(
   pair,
   pairMask,
 ) {
+  await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
   // 🔴 THE TWO TEMPLATE STACKS RUN THEIR OPS IN DIFFERENT ORDERS. AF2 monomer's
   // TemplatePairStack attends first and multiplies second; multimer's
   // TemplateEmbeddingIteration multiplies first. Same five operations, same

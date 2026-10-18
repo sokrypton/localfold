@@ -1310,6 +1310,9 @@ const PRIORS = new Map([
     // alternated: the block 196.0 / 194.7 ms with group 4 against 178.8 / 179.5 with 1 (+9%), the four flash kernels
     // 46.5 / 46.4 against 30.2 / 32.1; bench-msa-attention.js row 128 x 255: 19.4-20.9 against 9.6-10.3 ms. Group 1
     // stays the default; `--tune=attentionGroup=4` is the M5's arm (a race, as grid-attend-race.js, would win both).
+    // ...and now it IS raced: null here asks grid-attend-race.js, which times the shipped MSA row flash kernel both
+    // ways (255 residues x 128 rows) and answers 4 or 1 for this device; unanswered, the readers take 1.
+    attentionGroup: null,
     // 🔴 AND THE GRID PROJECTION'S ARITHMETIC IS RACED FOR THE SAME REASON, not pinned. f752a185 made it f16 wherever
     // the pair track stages in f16 - grid.project 475 / 500 -> 328 / 344 ms a pass on the M5 - and on the M2 it is the
     // other way: bench-grid-project.js 255 tokens 12.2-14.9 ms in f32 against 15.1-18.7 in f16 (three runs), in the

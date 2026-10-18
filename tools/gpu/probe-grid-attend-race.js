@@ -24,5 +24,6 @@ export async function main(device, args = []) {
     gridAttendTiledHalf: tuning.gridAttendTiledHalf,
     gridProjectArithmetic: tuning.gridProjectArithmetic,
     triangleContractArithmetic: tuning.triangleContractArithmetic,
+    attentionGroup: tuning.attentionGroup,
   };
 }

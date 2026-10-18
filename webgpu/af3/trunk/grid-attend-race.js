@@ -32,10 +32,11 @@
  */
 import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention.js";
 import { createTriangleShaders } from "../../kernels/triangle/shaders.js";
+import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
 import { deviceProfile, halfPrecisionAvailable, setDeviceTuning } from "../../runtime/device-profile.js";
 
 const RACES = new WeakMap();
-const MEMORY = "localfold.gridAttendRace.v3";
+const MEMORY = "localfold.gridAttendRace.v4";
 const DETAIL = new WeakMap();
 const N = 256;
 const CHANNELS = 128;
@@ -58,6 +59,10 @@ function wantsRace(device) {
 function projectAnswer(device, half) {
   return deviceProfile(device).tuning.gridProjectArithmetic === null ? { gridProjectArithmetic: half ? "f16" : "f32" } : {};
 }
+/** ...and AF2's flash attention's keys a softmax rescale (`attentionGroup`), where the prior leaves it null. */
+function groupAnswer(device, group) {
+  return deviceProfile(device).tuning.attentionGroup === null ? { attentionGroup: group } : {};
+}
 /** ...and the triangle contraction's, the same way. */
 function contractAnswer(device, half) {
   return deviceProfile(device).tuning.triangleContractArithmetic === null
@@ -75,13 +80,15 @@ function remembered(device) {
   try {
     const stored = JSON.parse(globalThis.localStorage?.getItem(MEMORY) ?? "null");
     return stored !== null && stored.machine === machine(device) && typeof stored.tiled === "boolean"
-      && typeof stored.projectHalf === "boolean" && typeof stored.contractHalf === "boolean" ? stored : undefined;
+      && typeof stored.projectHalf === "boolean" && typeof stored.contractHalf === "boolean"
+      && typeof stored.group === "number" ? stored : undefined;
   } catch { return undefined; }
 }
 
-function remember(device, tiled, projectHalf, contractHalf) {
+function remember(device, tiled, projectHalf, contractHalf, group) {
   try {
-    globalThis.localStorage?.setItem(MEMORY, JSON.stringify({ machine: machine(device), tiled, projectHalf, contractHalf }));
+    globalThis.localStorage?.setItem(MEMORY,
+      JSON.stringify({ machine: machine(device), tiled, projectHalf, contractHalf, group }));
   }
   catch { /* a race next visit, as before */ }
 }
@@ -99,16 +106,17 @@ export function settleGridAttendTiling(device) {
   const known = remembered(device);
   if (known !== undefined) {
     DETAIL.set(device, { tiled: known.tiled, projectHalf: known.projectHalf, contractHalf: known.contractHalf,
-                         remembered: true });
+                         group: known.group, remembered: true });
     setDeviceTuning(device, { gridAttendTiled: known.tiled, gridAttendTiledHalf: known.tiled,
-                              ...projectAnswer(device, known.projectHalf), ...contractAnswer(device, known.contractHalf) });
+                              ...projectAnswer(device, known.projectHalf), ...contractAnswer(device, known.contractHalf),
+                              ...groupAnswer(device, known.group) });
     RACES.set(device, Promise.resolve());
     return RACES.get(device);
   }
   const promise = race(device).catch((error) => {
     DETAIL.set(device, { error: String(error?.message ?? error) });
     // ...and a race that failed leaves the projection where every Apple part is safe: f32 (the M2 loses with f16)
-    setDeviceTuning(device, { ...projectAnswer(device, false), ...contractAnswer(device, false) });
+    setDeviceTuning(device, { ...projectAnswer(device, false), ...contractAnswer(device, false), ...groupAnswer(device, 1) });
   });
   RACES.set(device, promise);
   return promise;
@@ -320,6 +328,81 @@ async function raceContract(device, buffers) {
   return { f32Ms: Number(f32Ms.toFixed(3)), f16Ms: Number(f16Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), half };
 }
 
+/** AF2's flash attention (the shipped f16-staged kernel), one key a rescale against four: { g1Ms, g4Ms, relRms, group }. */
+async function raceGroup(device, buffers) {
+  // the MSA row attention of a 255-residue chain over 128 rows, eight heads of 32 (bench-msa-attention.js --shape=row)
+  const batch = 128, queries = 255, channels = 256, heads = 8, headDim = 32;
+  const elements = batch * queries * channels;
+  const upload = (data, usage = GPUBufferUsage.STORAGE) => {
+    const buffer = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
+    new data.constructor(buffer.getMappedRange()).set(data);
+    buffer.unmap();
+    buffers.push(buffer);
+    return buffer;
+  };
+  const query = upload(noise(elements, 9, 1));
+  const key = upload(noise(elements, 10, 1));
+  const value = upload(noise(elements, 11, 1));
+  const gate = upload(noise(elements, 12, 1));
+  const maskValues = new Float32Array(batch * queries);
+  for (let i = 0; i < maskValues.length; i += 1) maskValues[i] = i % 17 === 0 ? 0 : 1;
+  const mask = upload(maskValues);
+  const pairBias = upload(new Float32Array(1));
+  const parameters = upload(new Uint32Array([batch, queries, channels, heads, headDim, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, channels]), GPUBufferUsage.UNIFORM);
+  const arms = await Promise.all([1, 4].map(async (group) => {
+    const pipeline = await device.createComputePipelineAsync({
+      label: `attention-group-race.g${group}`, layout: "auto",
+      compute: { module: device.createShaderModule({
+        code: createAttentionRegisterFlashShader(headDim, undefined, { group, precision: "chunk16" }) }), entryPoint: "main" },
+    });
+    const output = device.createBuffer({ size: elements * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    buffers.push(output);
+    return { group, pipeline, output, times: [], groups: [Math.ceil(queries / 64), batch, heads],
+             bind: device.createBindGroup({
+               layout: pipeline.getBindGroupLayout(0),
+               entries: [query, key, value, gate, mask, pairBias, parameters, output]
+                 .map((buffer, binding) => ({ binding, resource: { buffer } })),
+             }) };
+  }));
+  const run = async (arm, iterations) => {
+    const encoder = device.createCommandEncoder({ label: "attention-group-race" });
+    const pass = encoder.beginComputePass({ label: "attention-group-race" });
+    pass.setPipeline(arm.pipeline);
+    pass.setBindGroup(0, arm.bind);
+    for (let i = 0; i < iterations; i += 1) pass.dispatchWorkgroups(...arm.groups);
+    pass.end();
+    const started = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    return performance.now() - started;
+  };
+  const SAMPLE = 1 << 16;
+  const read = async (arm) => {
+    await run(arm, 1);
+    const readback = device.createBuffer({ size: SAMPLE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    buffers.push(readback);
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(arm.output, 0, readback, 0, SAMPLE * 4);
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    return values;
+  };
+  const [reference, candidate] = [await read(arms[0]), await read(arms[1])];
+  let error = 0; let scale = 0;
+  for (let i = 0; i < SAMPLE; i += 1) {
+    const d = candidate[i] - reference[i];
+    error += d * d; scale += reference[i] * reference[i];
+  }
+  const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
+  const [g1Ms, g4Ms] = await timeArms(device, arms, buffers, run);
+  // (a grouped rescale reassociates the online softmax: ~1e-7, the same class as the key chunk's)
+  const group = Number.isFinite(relRms) && relRms < 1e-4 && g4Ms < g1Ms * RACE_MARGIN ? 4 : 1;
+  return { g1Ms: Number(g1Ms.toFixed(3)), g4Ms: Number(g4Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), group };
+}
+
 async function race(device) {
   const width = HEADS * DIMENSION;
   const pairs = N * N;
@@ -410,13 +493,16 @@ async function race(device) {
     const project = await raceProject(device, buffers);
     // ...and the triangle contraction's (webgpu/kernels/triangle/shaders.js's f16 kernel), the same question again
     const contract = await raceContract(device, buffers);
+    // ...and AF2's flash attention's rescale group, only where the prior left it to the device
+    const group = deviceProfile(device).tuning.attentionGroup === null ? await raceGroup(device, buffers) : null;
     DETAIL.set(device, { tokens: N, untiledMs: Number(untiled.toFixed(3)), tiledHalfMs: Number(tiled.toFixed(3)),
                          relRms: Number(relRms.toExponential(2)), tiled: take,
-                         samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract });
+                         samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract,
+                         group });
     // 🔴 BOTH WAYS, so the knob is answered and no second stack races again
     setDeviceTuning(device, { gridAttendTiled: take, gridAttendTiledHalf: take, ...projectAnswer(device, project.half),
-                              ...contractAnswer(device, contract.half) });
-    remember(device, take, project.half, contract.half);
+                              ...contractAnswer(device, contract.half), ...groupAnswer(device, group?.group ?? 1) });
+    remember(device, take, project.half, contract.half, group?.group ?? 1);
   } finally {
     for (const buffer of buffers) buffer.destroy();
   }
