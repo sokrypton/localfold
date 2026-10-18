@@ -797,6 +797,9 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
     }
     cpCommit();
   };
+  // the first key tile's copies in flight before the queries' loads, which they overlap (they were taken after them, and
+  // each block's start waited on both in turn - at 261 tokens, five key tiles a block, a tenth of its stall samples)
+  if constexpr (!ONE) issue(0, 0);
   // ONE's halves of `issue`: its loads into registers (the same pieces, the same running pointers, the same zeros
   // past the end), and the registers into the stage
   uint4 rkv[ONE ? KV_PER : 1][2], rb[ONE && B_PER > 0 ? B_PER : 1];
@@ -847,6 +850,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
   int ib[MT];                                                        // each tile's row g (and g + 8)
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) ib[mt] = q0 + warp * 16 * MT + mt * 16 + g;
+  const bool warpLive = q0 + warp * 16 * MT < n;
   // D 8: one m16n8k8 A fragment a tile (rows g and g + 8, k 2 tig and one more) in qa[mt][0][0..1]
   static_assert(D != 8 || BK % 32 == 0, "an 8-wide head's K and V are read four key tiles an ldmatrix");
   uint32_t qa[MT][(D + 15) / 16][4];
@@ -867,7 +871,6 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
   for (int mt = 0; mt < MT; ++mt) mx[mt][0] = mx[mt][1] = -INFINITY;
   int tiles = (n + BK - 1) / BK;
   if constexpr (ONE) { loadR(0); storeR(); }
-  else issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
     int st = ONE ? 0 : tile & 1;
     if constexpr (ONE) {
@@ -877,6 +880,9 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
       else cpWait<0>();
     }
     __syncthreads();
+    // a warp whose query rows all lie past n (the last query tile's padding: at 261 tokens one warp-tile in ten) takes
+    // the loads and the barriers and nothing else - warp-uniform, so a live warp's arithmetic is the same
+    if (warpLive) {
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     uint32_t sh[MT][BK / 8][2];
     // the bias tile straight into the score accumulators' layout by ldmatrix - an 8x8 matrix's thread t holds row t / 4,
@@ -1003,6 +1009,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) { mma16816(o[mt][et], pa[mt], vb[0], vb[1]); mma16816(o[mt][et + 1], pa[mt], vb[2], vb[3]); }
       }
+    }
     }
     if constexpr (ONE) {
       __syncthreads();                // every warp is done with the stage: the next tile goes in

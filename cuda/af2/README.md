@@ -403,6 +403,15 @@ A100, 4 passes, 508 clusters and 5,120 extra rows, a resident server's third job
 
 5CAJ against its crystal 1.81-1.84 A on three seeds either way, pLDDT and pTM unchanged.
 
+The flash kernel (`flashGrid2R`, every 32-wide attention here and AF3's pair attention) now issues its first key
+tile's copies before reading its queries, which they overlap - each block waited on the two in turn, and at 261
+residues a block has only five key tiles to hide it behind (a tenth of the MSA row attention's stall samples) - and a
+warp whose query rows all lie past n (the last query tile's padding) takes the loads and barriers and no arithmetic.
+At 261 residues the MSA row attention 116.3 -> 109.7 ms a fold, the triangle attention 72.8 -> 68.9, the extra stack's
+8-wide one 69 -> 65; ~1% at 600. Bit-identical (AF3's gate to the digit). What is left at short n is the kernel's
+fixed cost a block - the queries, the pipeline's fill, the gate's epilogue - over few key tiles, at three 4-warp
+blocks an SM (168 registers and 51 KB each); 48-key tiles, which pad less, measured no better.
+
 **Tried and taken back: the LN of a 128-channel row by four lanes rather than a warp** (two shuffle levels where
 five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 apart, yet AF3's kitchen-sink job read
 pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a
