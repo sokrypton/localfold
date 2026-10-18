@@ -515,8 +515,15 @@ export function featuriseProtein(sequence, options = {}) {
       modifiedSpans.push({ from: token, count: 1, code: modification.code,
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
+      // 🔴 GENUINE Boltz-2's RESTYPE FOR A ONE-TOKEN MODIFIED RESIDUE IS ITS CHAIN'S UNKNOWN (tokenize/boltz2.py
+      // `get_unk_token(chain)`): the protein unknown, and an RNA chain's N - AF3's class 30, Boltz's 27 through the
+      // converter. Giving a modified RNA base the PROTEIN unknown, as af3-any-model's boltz2 does, stretched
+      // 2'-O-methylguanosine's O2'-CM2 to 2.4-2.7 A where genuine Boltz-2 holds 1.55-1.71 (this: 1.66-1.77). A DNA
+      // chain's DN has no column - af3-any-model's converter drops it - so a modified DNA base keeps the protein
+      // unknown, which folds methylated DNA at 0.037 A against 0.041 with N.
       aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
-        || options.atomizedUnknownRestype === "chai" ? UNK_AATYPE : parentAatype(kind, code);
+        || options.atomizedUnknownRestype === "chai" ? (kind === "rna" ? UNKNOWN_NUCLEOTIDE : UNK_AATYPE)
+        : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -554,25 +561,13 @@ export function featuriseProtein(sequence, options = {}) {
                       options.atomizedElementNames);
         realAtoms.push(flat);
       }
-      // 🔴 THE PSEUDO-BETA IS CB, THE SAME RULE A STANDARD RESIDUE TAKES - and
-      // slot zero was wrong. A one-token modified residue is a residue, so its
-      // representative atom is its beta carbon (its alpha carbon if it has
-      // none), not whichever atom the dictionary happens to list first, which
-      // for a phosphoserine is N. Caught by `check-batch-fields.js` against the
-      // reference's own gather: token 2 wants slot 2 (CB) where this wrote 0.
-      // (an atom past the dense slots was dropped above and is no representative; with none, the
-      // first atom the token holds is - the reference's "first valid atom")
-      const slotOfName = (name) => {
-        const found = modification.atoms.find((a) => a.name === name);
-        const slot = found === undefined ? -1 : slotOf(found, modification.atoms.indexOf(found));
-        return slot < DENSE ? slot : -1;
-      };
+      // 🔴 THE REPRESENTATIVE ATOM IS THE RESIDUE'S FIRST, AS GENUINE Boltz-2's: parse_ccd_residue gives a modified
+      // residue `atom_center=0, atom_disto=0`, so its centre and its distogram atom are the first atom it keeps (a
+      // phosphoserine's N). This took CB (a base's C4 / C2) for a while, held to af3-any-model's boltz2 batch, which
+      // does; check-batch-fields.js reports the difference.
       let firstHeld = 0;
       while (firstHeld < DENSE - 1 && !refMask[token * DENSE + firstHeld]) firstHeld += 1;
-      // (a nucleotide's representative is C4 for a purine parent, C2 for a pyrimidine, as AF3's)
-      const betaAt = kind === "protein" ? slotOfName("CB") : slotOfName("AG".includes(code) ? "C4" : "C2");
-      const alphaAt = kind === "protein" ? slotOfName("CA") : -1;
-      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : firstHeld);
+      pseudoBetaSlot[token] = firstHeld;
       for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
       token += 1;
       continue;
@@ -1011,7 +1006,9 @@ export function featuriseProtein(sequence, options = {}) {
   if ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai")
       && options.atomizedUnknownMsa !== true) {
     for (const span of modifiedSpans) {
-      const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
+      // (genuine Boltz-2's one-token residue reads the protein unknown in the alignment's query row - its residue
+      // record's type, which its featuriser writes over the query's letter - so its profile is UNK's one-hot)
+      const parent = span.oneToken === true ? UNK_AATYPE : parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (let at = 0; at < span.count; at += 1) queryRow[span.from + at] = parent;
     }
   }

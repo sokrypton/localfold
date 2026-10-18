@@ -196,5 +196,16 @@ AF3's `modified_rna` example (OMG@4, PSU@13, 5MC@18) folded through boltz2, thre
   identical). Genuine Boltz-2 has no slot layout and keeps every atom. This port now PACKS a one-token residue whose
   slots overflow (featurise.js `modifiedAsOneToken`); `check-batch-fields.js` reports the deviation, bounded to exactly
   the overflowing atoms.
-- **O2'-CM2 stays stretched** in both ports (2.4-2.7 A) where genuine Boltz-2 holds 1.55-1.71: the reference conformer
-  this port hands the model has it at 1.429, so the gap is downstream of the input, and af3-any-model shares it. Open.
+- **O2'-CM2 was stretched by the RESTYPE.** Genuine Boltz-2 tokenises a modified residue at residue level with
+  `res_type = get_unk_token(chain)` (tokenize/boltz2.py): an RNA base's N, where af3-any-model's boltz2 - and so this
+  port - gave every one the PROTEIN unknown. With N (AF3's class 30, Boltz's 27 through the converter's permutation):
+  **O2'-CM2 1.66-1.77 A, ligand rms 0.277-0.279** over three seeds, against genuine's 1.55-1.71 and 0.27. Two more of
+  genuine's conventions went in beside it, neither moving this fold: the alignment's query reads UNK there (the
+  residue record's type, which its featuriser writes over the query's letter), and the representative atom is the
+  residue's first (`atom_center=0, atom_disto=0` from parse_ccd_residue). A modified DNA base keeps the protein
+  unknown: Boltz's DN is the column af3-any-model's converter drops, and methylated DNA folds at 0.037 A that way
+  against 0.041 with N. check-batch-fields.js reports all three per token instead of comparing them.
+
+| | bonds scored | ligand rms | PSU13 C5-C1' | OMG4 O2'-CM2 |
+|---|---:|---:|---:|---:|
+| this port, genuine Boltz-2's conventions | 69 | **0.277-0.279** | 3.77 | **1.66-1.77** |

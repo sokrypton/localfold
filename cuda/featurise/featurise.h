@@ -369,7 +369,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     if (o.modifiedAsOneToken) {
       ModifiedSpan span{token, 1, M.code, residue, M.atoms, M.bonds, true};
       b.modifiedSpans.push_back(span);
-      setToken(token, o.atomizedUnknownRestype != 0 ? UNK_AATYPE : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
+      // (the chain's unknown, as genuine Boltz-2's get_unk_token: an RNA chain's N, 30; DNA's DN has no column - featurise.js)
+      setToken(token, o.atomizedUnknownRestype != 0 ? (R.kind == "rna" ? 30 : UNK_AATYPE) : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
       // (its atoms packed where its component slots run past the token's, as genuine Boltz-2 keeps them all: featurise.js)
       bool packed = false;
       for (size_t k = 0; k < M.atoms.size(); ++k) if ((M.atoms[k].componentSlot >= 0 ? M.atoms[k].componentSlot : (int)k) >= DENSE) packed = true;
@@ -387,19 +388,10 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
         writeAtomName(b.refAtomNameChars, flat, s.name, s.element, o.atomizedElementNames);
         realAtoms.push_back(flat);
       }
-      auto slotOfName = [&](const std::string& name) {
-        for (size_t k = 0; k < M.atoms.size(); ++k)
-          if (M.atoms[k].name == name) {
-            int slot = slotOf(k);
-            return slot < DENSE ? slot : -1;
-          }
-        return -1;
-      };
+      // (its representative atom is its first, as genuine Boltz-2's atom_center/atom_disto 0: featurise.js)
       int firstHeld = 0;
       while (firstHeld < DENSE - 1 && !b.refMask[token * DENSE + firstHeld]) ++firstHeld;
-      int betaAt = R.kind == "protein" ? slotOfName("CB") : slotOfName((R.code == 'A' || R.code == 'G') ? "C4" : "C2");
-      int alphaAt = R.kind == "protein" ? slotOfName("CA") : -1;
-      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : firstHeld);
+      pseudoBetaSlot[token] = firstHeld;
       for (int s = 0; s < DENSE; ++s) b.refSpaceUid[token * DENSE + s] = uid;
       ++token;
       continue;
@@ -615,7 +607,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   std::vector<int> queryRow = b.aatype;
   if ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && !o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) {
-      int parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
+      // (genuine Boltz-2's one-token residue reads the protein unknown in the query row: featurise.js)
+      int parent = span.oneToken ? UNK_AATYPE : parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (int at = 0; at < span.count; ++at) queryRow[span.from + at] = parent;
     }
   for (int t = polymerTokens; t < tokens; ++t) queryRow[t] = MSA_GAP;
