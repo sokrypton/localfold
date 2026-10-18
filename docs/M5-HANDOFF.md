@@ -1295,6 +1295,12 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
 - 18d7230d: AF2's flash-attention rescale group raced too (the metal-3 prior's attentionGroup is null now): the M5
   takes 4, AF2's block 144.8 -> 138.8 ms.
 - 057919a6: the four races compile their arms at once and share periodic noise: 0.75 -> 0.40 s, once a browser.
+- 🔴 Re-checked under `LOCALFOLD_STOCK_FLAGS=1` (what a visitor runs; gpu-chrome.mjs adds --enable-unsafe-webgpu
+  otherwise): AF3 at 522 tokens, 12 blocks, the two f16 arithmetics 5276 -> 4995 ms (-5.3%); AF2's block at 300 x 128
+  143.7 -> 135.0 ms with group 4 and the f16 contraction; ESMFold2's trunk at 300 tokens 3478 -> 3345 ms; the races
+  answer the same. And a trap for the next profile: with the flag, subgroup matrices exist, the Apple prior enables
+  no matrix split, and both AF3's and ESMFold2's pair transitions fall back to the FUSED kernel (ESMFold2's trunk
+  5.0 s flagged against 3.4 s stock at 300 tokens) - profile what a visitor runs.
 - Tried and dropped: a 16 x 16-lane contraction in f32 (level with the 8 x 8; only the f16 arithmetic pays), the
   diffusion token tile at 522 tokens (8 stays best: 222 against 244 / 254 ms a call at 16 / 32), opmBlockI 1 against
   2 at 256 and 400 tokens (level here), and on Metal AF2's MSA norms emitted by the 256-wide GEMMs (LayerNorm 233 -> 92
