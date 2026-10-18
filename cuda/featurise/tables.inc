@@ -66,7 +66,7 @@ inline int af3MsaCode(char c) { switch (c) { case 'A': return 0; case 'R': retur
 inline const std::vector<FamilyFlags>& familyFlags() {
   static const std::vector<FamilyFlags> table = {
     {"protenix2", true, true, true, false, 0, 1, false, 0, false, false, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0, false, false, true, true, true},
-    {"boltz2", true, true, true, false, 1, 1, false, 1, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0, false, false, false, false, false},
+    {"boltz2", true, true, true, false, 1, 1, false, 1, false, false, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, false, 1, false, false, 0, false, false, false, false, false},
     {"alphafold3", false, false, false, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false},
     {"openbind0", true, true, false, false, 1, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384, false, false, false, false, false},
     {"opendde", true, true, true, false, 0, 1, false, 0, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0, false, false, true, true, true},
