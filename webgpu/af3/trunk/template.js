@@ -108,7 +108,7 @@ export function packTemplateWeights(weights) {
 export function createTemplateShaders(shape, offsets, epsilon, variance) {
   // 🔴 `channels` IS THE STACK'S OWN WIDTH AND IS NOT 64. See stackChannels in
   // template.js: five checkpoints say 64 and IntelliFold-2 says 256.
-  const { tokens, queryChannels, templates, channels: CHANNELS,
+  const { tokens, queryChannels, templates, templateDivisor, channels: CHANNELS,
           fused = false, featureWidth = 0 } = shape;
   if (!Number.isInteger(CHANNELS)) {
     throw new Error("createTemplateShaders needs shape.channels, the template "
@@ -136,7 +136,11 @@ const EPSILON: f32 = ${epsilon};
 // It is the SLOT count and not the real-template count: four empty slots each
 // produce the same embedding and the division puts it back, so the module
 // behaves as though there were exactly one template whatever the slot count.
-const TEMPLATE_SCALE: f32 = ${1 / (1e-7 + templates)};
+// 🔴 EXCEPT WHERE THE EMPTY SLOTS WEIGH ZERO (templateVisibilityByCoverage,
+// boltz2): there the divisor is the templates present, at least one, as
+// Boltz-2's own module has it - by four its one template reached the trunk at a
+// quarter of native's amplitude. See cuda/af3/export-model.mjs.
+const TEMPLATE_SCALE: f32 = ${1 / (1e-7 + (templateDivisor ?? templates))};
 const W_QUERY_SCALE: u32 = ${offsets.queryEmbeddingNormScale ?? 0}u;
 const W_QUERY_OFFSET: u32 = ${offsets.queryEmbeddingNormOffset ?? 0}u;
 const W_EMBED8: u32 = ${offsets.templatePairEmbedding8 ?? 0}u;
@@ -490,13 +494,16 @@ export class Af3TemplateEmbedderGpu {
       throw new Error("template weights carry no `channels`: the stack's width "
         + "is read from output_layer_norm/scale (or v_norm/scale), not assumed");
     }
+    // ...and the term's divisor: every slot, or (boltz2) the templates present, at least one
+    const templateDivisor = dialect.templateVisibilityByCoverage === true
+      ? Math.max(1, slots.filter((slot) => slot !== undefined && slot !== null).length) : templates;
     const sources = createTemplateShaders(
-      { tokens, queryChannels, templates, channels: CHANNELS, fused, featureWidth,
+      { tokens, queryChannels, templates, templateDivisor, channels: CHANNELS, fused, featureWidth,
         templateStackOuterResidual: outerResidual },
       packed.offsets, epsilon, variance);
     // ...and it is in the KEY, because two bundles differing only in the stack
     // width would otherwise share every one of these pipelines.
-    const base = `af3-template:${tokens}:${queryChannels}:${templates}:${epsilon}`
+    const base = `af3-template:${tokens}:${queryChannels}:${templates}/${templateDivisor}:${epsilon}`
       + `:${variance}:${dialect.swapTransposedBias}:c${CHANNELS}`
       + `:${fused ? `fused${featureWidth}` : ""}${outerResidual ? ":or" : ""}`;
     // 🔴 THE TRUNK'S PAIR, UPDATED IN PLACE, WHEN IT HANDS ONE OVER - the

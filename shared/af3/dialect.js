@@ -930,18 +930,13 @@ export const BOLTZ2 = Object.freeze({
   // reads a translation-invariant pairwise difference - which is why it
   // hid. See shared/af3/featurise/featurise.js.
   centreRefConformers: true,
-  // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME - OFF, AND MEASURED, NOT ASSUMED. Boltz-2 centres
-  // `range(max(ref_space_uid))`, which skips the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 ->
-  // 85 upstream). It is native's convention - its featurizerv2.py has the off-by-one - but in THIS port it broke a
-  // standing gate: 5CAJ self-templated (test:template's arm, 25 steps) went 0.50-0.59 A -> 1.6-2.3 A on Metal and
-  // 0.85 -> 5.18 A (pLDDT 91.6 -> 70.2) on WebGPU, while native Boltz-2 2.2.1 on the same input reads 0.26-0.43 A
-  // with the off-by-one in place (and 0.26-0.55 with its last group centred: native does not care). What native
-  // needs is its OTHER half - every other group randomly rotated and moved (center_random_augmentation); with that
-  // switched off native reads 1.93 / 2.16 / 0.65 A. Giving this port native's whole batch (Boltz-2's stored
-  // conformers for every residue, the augmentation, the raw last group) still read 1.6-2.3 A, so the port diverges
-  // from native somewhere the raw frame exposes and the CCD conformers mask - open. Off, polyQ200 is pLDDT 37 here
-  // (67 with it on, native 83); on, the gate fails. The implementation stays for when the divergence is found.
-  rawLastConformer: false,
+  // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME: Boltz-2 centres `range(max(ref_space_uid))`, which skips
+  // the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 -> 85 upstream; 37 -> 67 here). It was
+  // switched off once for breaking test:template's boltz2 arm (5CAJ self-templated 1.6-5.2 A) - wrongly: the cause was
+  // the template term's divisor (cuda/af3/export-model.mjs), which gave boltz2's one template a quarter of native's
+  // amplitude and left the N-terminus and loop 159-163 balanced on a knife; any one residue's conformer tipped them.
+  // With the divisor as native's, 0.22-0.32 A on Metal against native Boltz-2 2.2.1's 0.26-0.43.
+  rawLastConformer: true,
   // 🔴 EVERY DECLARED BOND BETWEEN TWO TOKENS, polymer-polymer included: Boltz-2's `bond` constraint is a token bond
   // (af3-any-model 964990e; a disulfide to a D-Cys folded 21.7 A apart without it, native 2.4). featurise.js
   declaredPolymerBonds: "all",

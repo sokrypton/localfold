@@ -537,7 +537,14 @@ if (dialect.chiralCentres === true) {
     }
   });
   add("template.passes", passes.length);
-  add("template.templates", dialect.chaiTemplates === true ? Math.max(1, slots.length) : TEMPLATES);
+  // 🔴 THE TEMPLATE TERM'S DIVISOR: AF3 divides by every slot (padded to four), chai-1 and boltz2 by the templates they
+  // HAVE - boltz2's TemplateV2Module: template_mask.any(dim=2).sum().clamp(min=1), its empty slots weighed zero. Divided
+  // by four, boltz2's one template reached the trunk at a quarter of native's amplitude: native Boltz-2 2.2.1's template
+  // update on 5CAJ self-templated was this port's times 3.997 (relRMS 2.1e-2 after the scale), and the fold went to a
+  // second state at the N-terminus and loop 159-163 - 1.6-2.3 A against native's 0.26-0.43. af3-any-model has the same
+  // division (template_modules.py: only chai1 takes the present count)
+  add("template.templates", dialect.chaiTemplates === true || dialect.templateVisibilityByCoverage === true
+    ? Math.max(1, slots.length) : TEMPLATES);
   add("template.featureWidth", width);
   add("template.outerResidual", dialect.templateStackOuterResidual === true);
 }

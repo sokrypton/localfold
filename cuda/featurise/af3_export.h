@@ -338,7 +338,10 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
     }
   }
   E.m("template.passes", (double)passes.size());
-  E.m("template.templates", D.chaiTemplates ? std::max(1, (int)slots.size()) : TEMPLATES);
+  // the template term's divisor: AF3 divides by every slot; chai-1 and boltz2 by the templates they have (boltz2's
+  // template_mask.any(...).sum().clamp(min=1), its empty slots weighed zero) - by four, boltz2's one template reached the
+  // trunk at a quarter of native's amplitude (export-model.mjs)
+  E.m("template.templates", D.chaiTemplates || D.templateVisibilityByCoverage ? std::max(1, (int)slots.size()) : TEMPLATES);
   E.m("template.featureWidth", width);
   E.flag("template.outerResidual", D.templateStackOuterResidual);
 }
