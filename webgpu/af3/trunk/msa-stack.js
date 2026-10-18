@@ -33,6 +33,7 @@ import {
   OPM_PROJECT_ROWS, packOuterProductMeanWeights,
 } from "./outer-product-mean.js";
 import { createOuterProductMeanVectorContractShader } from "../../kernels/outer-product-mean.js";
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
 import { createMsaAttentionShaders, msaAttentionKeyPart, packMsaAttentionWeights } from "./msa-attention.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
@@ -233,9 +234,16 @@ export class Af3MsaStackGpu {
     const useOpmVector = opmTuning.opmVectorContract !== false
       && pairChannels % 64 === 0 && (outerChannels * outerChannels) % 16 === 0
       && outerChannels % 4 === 0;
+    // ...the contraction GEMM in f16 arithmetic on the device's block where this stack's f16 policy is on, as AF2's
+    // (webgpu/af2/evoformer/block.js: a k step's BK sequences' products summed in f16, then into f32). M5, stock
+    // flags, 300 tokens x 1024 rows: see the commit that made it. `opmVectorArithmetic: "f32"` is the control.
+    const opmArithmetic = pairMatrixKernels && halfPrecisionAvailable(this.device)
+      && opmTuning.opmVectorArithmetic !== "f32" ? "f16" : "f32";
+    const opmBlock = vectorGemmBlock(this.device, opmArithmetic, () => true);
+    pipelines.opmVecBlock = opmBlock;
     if (useOpmVector) {
-      into("opmVecContract", `af3-opm-vec-contract:${outerChannels}`,
-           createOuterProductMeanVectorContractShader(outerChannels));
+      into("opmVecContract", `af3-opm-vec-contract:${outerChannels}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+           createOuterProductMeanVectorContractShader(outerChannels, opmBlock, opmArithmetic));
       into("opmVecOutput", `af3-opm-vec-output:ban${opmShape.opmBiasAfterNorm}`,
            createAf3OpmVectorOutputShader({ biasAfterNorm: opmShape.opmBiasAfterNorm }));
     }
@@ -525,7 +533,8 @@ export class Af3MsaStackGpu {
         for (const step of steps) {
           run("opm.contract", pipelines.opmVecContract,
               [left, right, step.contract, intermediate],
-              ceil(n * context.outerChannels, 64), ceil(step.count * context.outerChannels, 64));
+              ceil(n * context.outerChannels, pipelines.opmVecBlock.columns),
+              ceil(step.count * context.outerChannels, pipelines.opmVecBlock.rows));
           run("opm.output", pipelines.opmVecOutput,
               [intermediate, opmWeights, step.output, scratch[0], opmCounts],
               ceil(pairChannels, 64), ceil(step.count * n, 64));
