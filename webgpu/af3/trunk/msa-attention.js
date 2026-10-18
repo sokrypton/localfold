@@ -430,7 +430,63 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { keyMask, attentionLogits, attentionWeights, project: projectTiled, average };
+  // 🔴 AND THE AVERAGING OVER `averageRows` CONSECUTIVE TOKENS OF ONE SEQUENCE A WORKGROUP (shape.averageRows; 1 keeps
+  // the kernel above): their sums read the same value rows and their output projections the same weights, so a tile
+  // reads each once where one row a workgroup read them once a row. The same order of operations as above per row.
+  const RA = Math.max(1, shape.averageRows ?? 1);
+  const averageTiled = RA === 1 ? average : `${common}
+@group(0) @binding(0) var<storage, read> attention: array<f32>;
+@group(0) @binding(1) var<storage, read> values: array<f32>;
+@group(0) @binding(2) var<storage, read> gate: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const AVERAGE_ROWS: u32 = ${RA}u;
+const TILES: u32 = ${Math.ceil(tokens / RA)}u;
+var<workgroup> gathered: array<f32, ${RA * width}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let tile = group.x + group.y * GRID_WIDTH;
+  if (tile >= SEQUENCES * TILES) { return; }
+  let local = local_id.x;
+  let s = tile / TILES;
+  let i0 = (tile % TILES) * AVERAGE_ROWS;
+
+  for (var w = local; w < WIDTH; w += 64u) {
+    let head = w / DIMENSION;
+    let d = w % DIMENSION;
+    var total: array<f32, ${RA}>;
+    for (var r = 0u; r < AVERAGE_ROWS; r += 1u) { total[r] = 0.0; }
+    for (var j = 0u; j < TOKENS; j += 1u) {
+      let value = values[(s * TOKENS + j) * WIDTH + head * DIMENSION + d];
+      for (var r = 0u; r < AVERAGE_ROWS; r += 1u) {
+        let i = min(i0 + r, TOKENS - 1u);
+        total[r] += attention[(head * TOKENS + i) * TOKENS + j] * value;
+      }
+    }
+    for (var r = 0u; r < AVERAGE_ROWS; r += 1u) {
+      let row = s * TOKENS + min(i0 + r, TOKENS - 1u);
+      gathered[r * WIDTH + w] = total[r] * logistic(gate[row * WIDTH + w]);
+    }
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C_M; c += 64u) {
+    var total: array<f32, ${RA}>;
+    for (var r = 0u; r < AVERAGE_ROWS; r += 1u) { total[r] = 0.0; }
+    for (var w = 0u; w < WIDTH; w += 1u) {
+      let weight = weights[W_OUT + w * C_M + c];
+      for (var r = 0u; r < AVERAGE_ROWS; r += 1u) { total[r] += gathered[r * WIDTH + w] * weight; }
+    }
+    for (var r = 0u; r < AVERAGE_ROWS; r += 1u) {
+      if (i0 + r < TOKENS) { output[(s * TOKENS + i0 + r) * C_M + c] = total[r]; }
+    }
+  }
+}`;
+
+  return { keyMask, attentionLogits, attentionWeights, project: projectTiled, average: averageTiled };
 }
 
 export class Af3MsaAttentionGpu {
