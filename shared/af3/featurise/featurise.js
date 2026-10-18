@@ -524,20 +524,23 @@ export function featuriseProtein(sequence, options = {}) {
       symId[token] = sym;
       seqMask[token] = 1;
       residueOfToken[token] = residue;
+      // 🔴 ...UNLESS ITS SLOTS RUN PAST THE TOKEN'S: then its atoms are packed, so every one is kept, as genuine
+      // Boltz-2 keeps every atom of a modified residue (it has no 24-slot layout). 2'-O-methylguanosine's holes put its
+      // C4 at slot 24, and dropping it - af3-any-model's boltz2 does - lost the purine's pseudo-beta atom and three bonds
+      // and stretched O2'-CM2 to 2.66 A (genuine Boltz-2 2.2.1: 1.61; check-batch-fields.js reports the deviation).
+      const packed = modification.atoms.some((one, at) => (one.componentSlot ?? at) >= DENSE);
+      const slotOf = (one, at) => (packed ? at : (one.componentSlot ?? at));
       for (let atom = 0; atom < modification.atoms.length; atom += 1) {
         const source = modification.atoms[atom];
         // 🔴 THE COMPONENT'S OWN SLOT, NOT A COMPACTED ONE. A removed leaving
         // atom leaves its dense slot EMPTY - a mid-chain phosphoserine is
         // N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6 where the OXT was -
         // and compacting shifts the phosphate and its three oxygens down one.
-        // 🔴 A COMPONENT WIDER THAN THE TOKEN'S DENSE SLOTS LOSES ITS LAST ATOMS, as the reference's
-        // one-token form does: 2'-O-methylguanosine is 25 heavy atoms, slot 24 is the NEXT token's
-        // slot 0, and writing it there put a phantom atom in the layout (every index after it one
-        // off) where af3-any-model's boltz2 simply has no slot for it. Said, not hidden.
-        const slotHere = source.componentSlot ?? atom;
+        // (and a component of more heavy atoms than the token has slots, packed, still loses the rest - said, not hidden:
+        // slot 24 is the NEXT token's slot 0)
+        const slotHere = slotOf(source, atom);
         if (slotHere >= DENSE) {
-          console.warn(`${modification.code}: atom ${source.name} is past the token's ${DENSE} slots`
-            + " and is dropped, as the reference's one-token residue drops it");
+          console.warn(`${modification.code}: atom ${source.name} is past the token's ${DENSE} slots and is dropped`);
           continue;
         }
         const flat = token * DENSE + slotHere;
@@ -561,7 +564,7 @@ export function featuriseProtein(sequence, options = {}) {
       // first atom the token holds is - the reference's "first valid atom")
       const slotOfName = (name) => {
         const found = modification.atoms.find((a) => a.name === name);
-        const slot = found === undefined ? -1 : (found.componentSlot ?? modification.atoms.indexOf(found));
+        const slot = found === undefined ? -1 : slotOf(found, modification.atoms.indexOf(found));
         return slot < DENSE ? slot : -1;
       };
       let firstHeld = 0;

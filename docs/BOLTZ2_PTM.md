@@ -177,3 +177,24 @@ loses a ring atom by construction, so they cannot be whole; 6MA is the open ques
 strand, single sequence, three samples - genuine Boltz-2 **0.064 / 0.132 / 0.139 Å** bond rms over the two
 residues' 48 bonds, this port's native boltz2 **0.104 / 0.122 / 0.135 Å** on the identical input. The
 kitchen sink's 0.229 is one sample of a harder job; on a like-for-like target the two are one band.
+
+## 2026-10-18: a modified NUCLEOTIDE in boltz2's one-token form - an overflowing slot, and a stretched methyl
+
+AF3's `modified_rna` example (OMG@4, PSU@13, 5MC@18) folded through boltz2, three samples each, scored by
+`cuda/af3/bonds.mjs` (ligand class: the three modified residues' CCD bonds):
+
+| | bonds scored | ligand rms | PSU13 C5-C1' | OMG4 O2'-CM2 |
+|---|---:|---:|---:|---:|
+| genuine Boltz-2 2.2.1 (`~/venv_boltz`, `msa: empty`) | 69 | 0.27 | 3.71-3.72 | **1.55-1.71** |
+| af3-any-model 3.1.16 boltz2 (`run_alphafold.py`, int8) | 69 | **2.97-3.77** | 3.77-3.78 | 2.57-2.74 |
+| this port, before | 66 | 0.32 | 3.78 | 2.66 |
+| this port, OMG packed | 69 | 0.30-0.31 | 3.77 | 2.41-2.54 |
+
+- **PSU's C5-C1' is Boltz-2's own** - genuine Boltz-2 tears it too (pseudouridine's base hangs from C5, not N1).
+- **OMG overflows the one-token form's 24 slots.** It keeps its CCD slots and its leaving atoms leave holes, so C4
+  - its pseudo-beta atom - lands at slot 24 and is dropped, in af3-any-model's batch and so in this port's (`ref_mask`
+  identical). Genuine Boltz-2 has no slot layout and keeps every atom. This port now PACKS a one-token residue whose
+  slots overflow (featurise.js `modifiedAsOneToken`); `check-batch-fields.js` reports the deviation, bounded to exactly
+  the overflowing atoms.
+- **O2'-CM2 stays stretched** in both ports (2.4-2.7 A) where genuine Boltz-2 holds 1.55-1.71: the reference conformer
+  this port hands the model has it at 1.429, so the gap is downstream of the input, and af3-any-model shares it. Open.

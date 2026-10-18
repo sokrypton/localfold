@@ -370,11 +370,15 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       ModifiedSpan span{token, 1, M.code, residue, M.atoms, M.bonds, true};
       b.modifiedSpans.push_back(span);
       setToken(token, o.atomizedUnknownRestype != 0 ? UNK_AATYPE : parentAatype(R.kind, R.code), number, asym, entity, sym, residue);
+      // (its atoms packed where its component slots run past the token's, as genuine Boltz-2 keeps them all: featurise.js)
+      bool packed = false;
+      for (size_t k = 0; k < M.atoms.size(); ++k) if ((M.atoms[k].componentSlot >= 0 ? M.atoms[k].componentSlot : (int)k) >= DENSE) packed = true;
+      auto slotOf = [&](size_t k) { return packed ? (int)k : (M.atoms[k].componentSlot >= 0 ? M.atoms[k].componentSlot : (int)k); };
       for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
         const CompAtom& s = M.atoms[atom];
-        int slotHere = s.componentSlot >= 0 ? s.componentSlot : (int)atom;
+        int slotHere = slotOf(atom);
         if (slotHere >= DENSE) {
-          fprintf(stderr, "%s: atom %s is past the token's %d slots and is dropped, as the reference's one-token residue drops it\n",
+          fprintf(stderr, "%s: atom %s is past the token's %d slots and is dropped\n",
                   M.code.c_str(), s.name.c_str(), DENSE);
           continue;
         }
@@ -386,7 +390,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       auto slotOfName = [&](const std::string& name) {
         for (size_t k = 0; k < M.atoms.size(); ++k)
           if (M.atoms[k].name == name) {
-            int slot = M.atoms[k].componentSlot >= 0 ? M.atoms[k].componentSlot : (int)k;
+            int slot = slotOf(k);
             return slot < DENSE ? slot : -1;
           }
         return -1;

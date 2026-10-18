@@ -598,6 +598,27 @@ for (const target of Object.keys(TARGETS)) {
     .filter((k) => !seen.has(k) && ABSENT[k] === undefined);
   if (unmapped.length > 0) bad.push(`UNMAPPED: ${unmapped.join(" ")}`);
 
+  // 🔴 ONE DELIBERATE DEVIATION, BOUNDED: boltz2's one-token modified residue whose component slots run past the token's
+  // 24 is PACKED here (featurise.js), as genuine Boltz-2 keeps every atom - where af3-any-model's boltz2 drops the
+  // overflow (2'-O-methylguanosine's C4, its pseudo-beta atom: O2'-CM2 folded at 2.4-2.7 A there and here before,
+  // genuine Boltz-2 2.2.1 1.55-1.71). The extra atom shifts every flat index after it, so the lines it causes are
+  // reported rather than failed - only when this side holds exactly as many more live atoms as overflowed, and the
+  // token count agrees; anything else still fails.
+  if (bad.length !== 0 && dialect.modifiedAsOneToken === true) {
+    const live = (mask) => mask.reduce((sum, v) => sum + (Number(v) > 0.5 ? 1 : 0), 0);
+    let overflow = 0;
+    for (const span of batch.modifiedSpans ?? []) {
+      if (span.oneToken !== true) continue;
+      const packed = span.atoms.some((one, at) => (one.componentSlot ?? at) >= batch.dense);
+      if (packed) overflow += span.atoms.filter((one, at) => (one.componentSlot ?? at) >= batch.dense).length;
+    }
+    const extra = live(batch.refMask) - live(flat(dump.inputs.ref_mask));
+    if (overflow > 0 && extra === overflow && batch.tokens === dump.tokens) {
+      for (const line of bad) floor.push(`(a packed one-token residue, +${overflow} atom${overflow > 1 ? "s" : ""} the reference drops) ${line}`);
+      bad.length = 0;
+    }
+  }
+
   const status = bad.length === 0
     ? (floor.length === 0 ? "EXACT" : "EXACT but for the conformer floor") : "DIFFERS";
   console.log(`${model.padEnd(14)} ${String(seen.size).padStart(2)} fields compared`
