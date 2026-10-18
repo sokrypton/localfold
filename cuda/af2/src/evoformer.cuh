@@ -26,6 +26,20 @@ struct Trunk {
 // blocks and out after them (af2.cu). Set where every block's MSA path has a bf16 form: --fast, every MSA row live,
 // no template rows, 8 heads of 32 on an Ampere part
 inline bool MSA16 = false;
+// ...and in f16 where there is no bf16 tensor core (a T4: sm_75). AF2's MSA stays below ~1,000 in magnitude (5CAJ with its
+// alignment 700, single-sequence 493, barnase-barstar 937, a 1,000-residue deep fold 518 - f16's range is 65,504), and
+// f16 holds three more mantissa bits than bf16. The bf16-only fusions (outln.cuh's bf16 MMA, sm_12x's split transition)
+// are skipped there
+inline bool MSA16_HALF = false;
+template <class F> inline void withMsa16(F&& f) { if (MSA16_HALF) f(half{}); else f(__nv_bfloat16{}); }
+// a weight as the MSA16 GEMMs take it: a bf16 copy, or the f16 weight itself
+template <class M> inline const void* msaWeight(const half* w, size_t n) {
+  if constexpr (std::is_same_v<M, __nv_bfloat16>) return bf16Of(w, n); else return w;
+}
+template <class M> __global__ void msa16ToF32K(const M* in, float* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = toF(in[i]);
+}
 // a pair pointer `elems` elements on, in the pair's own storage: t.pair is a float* that holds bf16 under PAIR16, so a bare
 // `pair + n` lands 2n bf16 elements on - past 2,048 residues (a second chunk of the row attention's bias, 4M pairs a chunk)
 // that read past the pair and into whatever lay there, a crash or a silently wrong bias
@@ -275,11 +289,12 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
 // speculative softmax (FLASH_SPEC), and the row attention its 64-key tiles where an SM holds two blocks of them
 // (flash2RWideKeys). A100, 1,000 residues, 508 rows: the row attention 914 -> 862 ms, the column 524 -> 511 (64 keys
 // there 545: no bias tile for the wider tile to amortise)
-template <bool NB>
-inline void msaFlash(const half* qkvg, const half* bias, int stride, __nv_bfloat16* o, int n, int heads, size_t rows, float scale,
+template <bool NB, class B16>
+inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int n, int heads, size_t rows, float scale,
                      size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
-  using B16 = __nv_bfloat16;
-  if (FLASH_SPEC && !NB && flash2RWideKeys())
+  if (flashRegStaged())     // (a T4: the one-stage register-staged form, as its f32 MSA's attention takes)
+    flashGrid2RRun<32, 2, 48, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  else if (FLASH_SPEC && !NB && flash2RWideKeys())
     flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC)
     flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
@@ -419,7 +434,9 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       bias = b;
     }
     if (MSA16 && msa == t.msa16) {
-      using B16 = __nv_bfloat16;
+      withMsa16([&](auto tag) {
+      using B16 = decltype(tag);
+      constexpr bool BF = std::is_same_v<B16, __nv_bfloat16>;
       B16* m16 = reinterpret_cast<B16*>(msa);
       AttnW w = attnWeights(R + "/attention", blk, C);
       int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
@@ -430,16 +447,19 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
       msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
-      if (C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM)) {
+      if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM)) {
         // the output projection writes the column attention's LayerNorm'd rows as well (outln.cuh): no LN pass there
         const std::string ln = S + "msa_column_attention/query_norm";
         half* xn = scratch<half>("fcol.xn", rows * C);
-        outLn256<half>(o, bf16Of(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
-                       P(ln + "/offset", blk), xn, rows);
-        EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
+        if constexpr (BF) {
+          outLn256<half>(o, bf16Of(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
+                         P(ln + "/offset", blk), xn, rows);
+          EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
+        }
         return;
       }
-      ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+      ltGemm(o, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
+      });
       return;
     }
     bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
@@ -482,8 +502,10 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_attention";
   if (MSA16 && msa == t.msa16) {
-    // (as attentionCoreAcross, its MSA, output and output projection bf16)
-    using B16 = __nv_bfloat16;
+    // (as attentionCoreAcross, its MSA, output and output projection bf16 - or f16)
+    withMsa16([&](auto tag) {
+    using B16 = decltype(tag);
+    constexpr bool BF = std::is_same_v<B16, __nv_bfloat16>;
     B16* m16 = reinterpret_cast<B16*>(msa);
     AttnW w = attnWeights(A + "/attention", blk, C);
     int Wp = w.H * w.Dp, stride = (rowsN + 7) / 8 * 8;
@@ -497,15 +519,18 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
     // ...and its output projection writes the MSA transition's LayerNorm'd rows (outln.cuh), where room allows them whole
-    if (C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
-      const std::string ln = S + "msa_transition/input_layer_norm";
-      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
-      outLn256<B16>(o, bf16Of(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
-                    P(ln + "/offset", blk), xt, rows);
-      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+    if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+      if constexpr (BF) {
+        const std::string ln = S + "msa_transition/input_layer_norm";
+        B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+        outLn256<B16>(o, bf16Of(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
+                      P(ln + "/offset", blk), xt, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+      }
       return;
     }
-    ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+    ltGemm(o, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
+    });
     return;
   }
   if (FAST && t.msaOnes) {
@@ -585,18 +610,22 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
     size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
     // (on sm_12x the MSA16 stack's MSA transition in one kernel, cuda/af3's fusedTransitionSplit256: 2.41 -> 2.00 ms a
     // call at 1,000 residues x 508 rows on an RTX PRO 6000; slower on an A100, which keeps the two GEMMs below)
-    if (MSA16 && C == 256 && I == 4 * C && ccMajor() == 12 &&
+    if (MSA16 && !MSA16_HALF && C == 256 && I == 4 * C && ccMajor() == 12 &&
         fusedTransitionSplit256(x, rows, I, P(T + "/input_layer_norm/scale", blk), P(T + "/input_layer_norm/offset", blk),
                                 PH(T + "/transition1/weights", blk), PH(T + "/transition2/weights", blk),
                                 P(T + "/transition1/bias", blk), P(T + "/transition2/bias", blk)))
       return;
-    if (MSA16 && C == 256 && I == 4 * C) {     // (the MSA16 stack's MSA: every GEMM bf16, the residual in place)
-      using B16 = __nv_bfloat16;
+    if (MSA16 && C == 256 && I == 4 * C) {     // (the MSA16 stack's MSA: every GEMM bf16 - or f16 - the residual in place)
+      withMsa16([&](auto tag) {
+      using B16 = decltype(tag);
+      constexpr bool BF = std::is_same_v<B16, __nv_bfloat16>;
       B16* x16 = reinterpret_cast<B16*>(x);
       B16* xh = scratch<B16>("ftr.xn16", chunk * C);
-      B16* mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
-      const B16* w1 = bf16Of(PH(T + "/transition1/weights", blk), (size_t)C * I);
-      const B16* w2 = bf16Of(augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), (size_t)(I + 8) * C);
+      B16* mh;
+      if constexpr (BF) mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
+      else mh = augmentedInput("ftr.mid16h" + std::to_string(I), chunk, I);
+      const void* w1 = msaWeight<B16>(PH(T + "/transition1/weights", blk), (size_t)C * I);
+      const void* w2 = msaWeight<B16>(augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), (size_t)(I + 8) * C);
       const B16* emitted = (const B16*)takeEmittedLn(T + "/input_layer_norm", blk, x, rows);
       for (size_t r0 = 0; r0 < rows; r0 += chunk) {
         size_t r = std::min(chunk, rows - r0);
@@ -604,9 +633,10 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
         if (!emitted)
           layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
                                                                                 P(T + "/input_layer_norm/offset", blk));
-        ltGemm(xin, w1, mh, false, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, true);
-        ltGemm(mh, w2, x16 + r0 * C, false, r, I + 8, C, nullptr, false, 1.f, 0, 0, true);
+        ltGemm(xin, w1, mh, !BF, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, BF);
+        ltGemm(mh, w2, x16 + r0 * C, !BF, r, I + 8, C, nullptr, false, 1.f, 0, 0, BF);
       }
+      });
       return;
     }
     half* xh = scratch<half>("ftr.xn", chunk * C);
@@ -735,7 +765,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
       const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
-      if (MSA16 && msa == t.msa16) lnGemm<256, __nv_bfloat16>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      if (MSA16 && msa == t.msa16) withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt); });
       else if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
       else lnGemm<64>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
     } else {

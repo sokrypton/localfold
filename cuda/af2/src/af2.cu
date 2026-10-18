@@ -333,12 +333,19 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       static const int major = ccMajor();
       std::string q = "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w";
       std::string qc = "evoformer/evoformer_iteration/msa_column_attention/attention/query_w";
-      MSA16 = FAST && !check && t.msaOnes && major >= 8 && !flashRegStaged() && !getenv("LOCALFOLD_MSA_F32") &&
+      // (a part with no bf16 tensor core holds it in f16: MSA16_HALF, evoformer.cuh)
+#ifdef MSA16_HALF_TEST
+      MSA16_HALF = true;
+#else
+      MSA16_HALF = major < 8;
+#endif
+      MSA16 = FAST && !check && t.msaOnes && (MSA16_HALF || !flashRegStaged()) && !getenv("LOCALFOLD_MSA_F32") &&
               dimW(q, 2) * dimW(q, 3) == 256 && dimW(q, 3) == 32 && dimW(qc, 3) == 32;
       if (MSA16) {
         size_t n16 = (size_t)(t.N + t.T) * L * 256;
         t.msa16 = reinterpret_cast<float*>(scratch<__nv_bfloat16>("msa16", n16));
-        toBf16FK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
+        if (MSA16_HALF) toHalfK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<half*>(t.msa16), n16);
+        else toBf16FK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
       }
     }
     for (int b = 0; b < mainBlocks; ++b) {
@@ -352,7 +359,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
     if (MSA16) {
       size_t n16 = (size_t)(t.N + t.T) * L * 256;
-      pairBf16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
+      if (MSA16_HALF) msa16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const half*>(t.msa16), t.msa, n16);
+      else pairBf16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
       MSA16 = false; t.msa16 = nullptr;
     }
     // a bf16 pair converted once into the recycled pair, which every reader after the stacks takes

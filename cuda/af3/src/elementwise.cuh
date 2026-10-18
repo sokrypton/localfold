@@ -81,9 +81,9 @@ __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
-    if constexpr (!std::is_same_v<TI, float>) {          // (a bf16 row: VEC elements, 2 VEC bytes)
+    if constexpr (!std::is_same_v<TI, float>) {          // (a bf16 or f16 row: VEC elements, 2 VEC bytes)
 #pragma unroll
-      for (int u = 0; u < VEC; u += 2) { float2 q = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr + c + u)); v[k][u] = q.x; v[k][u + 1] = q.y; }
+      for (int u = 0; u < VEC; u += 2) { float2 q = ld2f(xr + c + u); v[k][u] = q.x; v[k][u + 1] = q.y; }
     } else if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
     else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
 #pragma unroll

@@ -1670,6 +1670,11 @@ template <class T> __device__ __forceinline__ T fromF(float v) {
   else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __float2bfloat16(v);
   else return __float2half(v);
 }
+// two adjacent elements of a 16-bit tensor as floats, bf16 or f16
+template <class T> __device__ __forceinline__ float2 ld2f(const T* p) {
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
+  else return __half22float2(*reinterpret_cast<const half2*>(p));
+}
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
 // the sigmoid on one MUFU op (tanh.approx: |error| of the sigmoid <= ~2.5e-4) where exp and a reciprocal
 // were two - only where that is below the noise already there: a result rounded to f16 straight after

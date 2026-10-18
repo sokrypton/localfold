@@ -93,9 +93,9 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
         float v[K];
 #pragma unroll
         for (int kk = 0; kk < KK; ++kk) {
-          const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&w[b][kk]);
+          const PT* h = reinterpret_cast<const PT*>(&w[b][kk]);
 #pragma unroll
-          for (int e = 0; e < 4; ++e) { float2 f = __bfloat1622float2(h[e]); v[kk * 8 + 2 * e] = f.x; v[kk * 8 + 2 * e + 1] = f.y; }
+          for (int e = 0; e < 4; ++e) { float2 f = ld2f(h + 2 * e); v[kk * 8 + 2 * e] = f.x; v[kk * 8 + 2 * e + 1] = f.y; }
         }
         float s = 0.f;
 #pragma unroll
