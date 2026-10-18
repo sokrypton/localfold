@@ -290,7 +290,10 @@ export async function compilePairTrack(cache, options) {
         : { ...(options.triangleProjectTile ?? PROJECT_TILE_DEFAULT),
             ...(outColumns === undefined ? {} : { outColumns }) },
       true,
-      undefined,
+      // 🔴 THE CONTRACTION IN f16 ARITHMETIC where the caller asks (an AF3-lineage stack whose f16 policy is on, on a
+      // device with shader-f16): see the f16 kernel in webgpu/kernels/triangle/shaders.js. undefined keeps the 8 x 8
+      // f32 kernel.
+      options.triangleContractArithmetic === "f16" ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined,
       // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
       // `tri.contract` is the last pass that reads scratch[1] and scratch[2],
       // and it runs before `tri.normalize-hidden` writes one of them - so the
@@ -333,6 +336,7 @@ export async function compilePairTrack(cache, options) {
                   + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}`
                   // ...and the tile each vector kernel was generated at.
                   + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}`
+                  + `:ct${contractTile.rows}x${contractTile.columns}${contractTile.arithmetic ?? ""}`
                   + `:${name}`,
                   source);
     }

@@ -443,6 +443,9 @@ export const DEFAULT_TUNING = Object.freeze({
   // ...and its arithmetic, "f16" or "f32"; null is the stack's own policy (f16 where ESMFold2's trunk stages and
   // accumulates in f16, f32 everywhere else). The control arm for the f16 GEMM.
   vectorTransitionArithmetic: null,
+  // 🔴 THE TRIANGLE CONTRACTION'S ARITHMETIC IN AN AF3-LINEAGE PAIR TRACK: null takes f16 where the stack's f16 policy
+  // is on and the device has shader-f16 (webgpu/kernels/triangle/shaders.js); "f32" is the control arm.
+  triangleContractArithmetic: null,
   // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the
   // control. See webgpu/af2/evoformer/block.js.
   triangleAccumulatePrecision: null,

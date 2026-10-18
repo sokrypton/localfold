@@ -167,6 +167,10 @@ export class Af3MsaStackGpu {
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
         { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      // ...and the triangle's contraction in f16 arithmetic, under the same policy as the transition's (see
+      // webgpu/kernels/triangle/shaders.js); `triangleContractArithmetic: "f32"` is the control arm
+      triangleContractArithmetic: pairMatrixKernels && halfPrecisionAvailable(this.device)
+        && (deviceTuning(this.device).triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
       gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,

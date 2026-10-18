@@ -613,7 +613,7 @@ ${packAB ? abStore : plainStore}
   const contractColumns = CONTRACT_TILE.columns / 8;
   const contractRowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[contractRows];
   const contractColumnVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[contractColumns];
-  if (contractRowVector === undefined || contractColumnVector === undefined) {
+  if ((contractRowVector === undefined || contractColumnVector === undefined) && contractTile.arithmetic !== "f16") {
     throw new Error(`contractTile ${CONTRACT_TILE.rows}x${CONTRACT_TILE.columns} gives a block `
       + "that is not 1, 2 or 4 each way");
   }
@@ -689,6 +689,85 @@ fn main(
       }`)}
   }
 }`;
+
+  // 🔴 THE CONTRACTION IN f16 ARITHMETIC, ON A 64 x 64 TILE OF 16 x 16 LANES (contractTile.arithmetic "f16"), as the
+  // pair transition's VECTOR_GEMM_F16 (webgpu/af3/trunk/transition.js): a and b staged in halves 16 k at a time, each
+  // step's 16 products summed in f16 and then added into f32 accumulators - so no f16 partial sum runs past 16 terms.
+  // A lane keeps a 4 x 4 block; each operand is staged along the axis it is contiguous on (k outgoing, the row
+  // incoming), so every load is coalesced. On an M5 under stock flags at 522 tokens, 32 channels: 6.38 -> 4.77 ms
+  // (1.34x), relRMS 6.6e-4 against the f32 kernel on uniform inputs (tools/gpu/probe-contract-f16.js); larger lane
+  // blocks (8 x 4, 8 x 8) and a 32-deep step were slower or less exact. The same tile in f32 is level with the 8 x 8
+  // kernel, so it is the arithmetic that pays, not the tile.
+  // 🔴 AND EACH OPERAND IS SCALED BY 2^-4 ON ITS WAY TO HALF, the sum back by 2^8 - exact wherever a value stays in
+  // half's normal range, and 256x the headroom: IntelliFold-2's products reach rms 1e5 and peaks of 2.5e6 a sum
+  // (docs/M5-HANDOFF.md, the Metal port's half product), and unscaled its 16-term partial sums overflowed - its
+  // template fold came back NaN (test:template). A value under 1e-3 goes subnormal, which a sum of ~0.1-sized terms
+  // does not see.
+  let contractF16;
+  if (contractTile.arithmetic === "f16") {
+    const kContiguous = direction === "outgoing";
+    const lane = kContiguous ? "local.y" : "local.x";
+    const kLane = kContiguous ? "local.x" : "local.y";
+    const loadOf = (operand) => (row) => (operand === "a"
+      ? (direction === "outgoing" ? channelMajor("a", `${row} * L + k`) : channelMajor("b", `k * L + ${row}`))
+      : (direction === "outgoing" ? channelMajor("b", `${row} * L + k`) : channelMajor("a", `k * L + ${row}`)));
+    const stage = (tile, load, row0) => `{
+      let k = k0 + ${kLane};
+      var staged = vec4<f16>(0.0);
+      for (var r = 0u; r < 4u; r += 1u) {
+        let row = ${row0} + ${lane} + r * 16u;
+        if (row < L && k < L) { staged[r] = f16(${load("row")} * 0.0625); }
+      }
+      ${tile}[${kLane} * 16u + ${lane}] = staged;
+    }`;
+    contractF16 = `${common.startsWith("enable f16;") ? "" : "enable f16;\n"}${common}
+@group(0) @binding(0) var<storage, read> a: array<${storageArray(abStorage)}>;
+@group(0) @binding(1) var<storage, read> b: array<${storageArray(abStorage)}>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+${channelChunked ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
+
+// [k][lane]: a's four rows a lane owns (lane + 16 r), and b's four columns
+var<workgroup> tile_a: array<vec4<f16>, 256>;
+var<workgroup> tile_b: array<vec4<f16>, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let i0 = group.y * 64u;
+  let j0 = group.x * 64u;
+  let h = group.z;
+  var sum: array<vec4<f32>, 4>;
+  for (var r = 0u; r < 4u; r += 1u) { sum[r] = vec4<f32>(0.0); }
+  for (var k0 = 0u; k0 < L; k0 += 16u) {
+    ${stage("tile_a", loadOf("a"), "i0")}
+    ${stage("tile_b", loadOf("b"), "j0")}
+    workgroupBarrier();
+    var part: array<vec4<f16>, 4>;
+    for (var r = 0u; r < 4u; r += 1u) { part[r] = vec4<f16>(0.0); }
+    for (var k = 0u; k < 16u; k += 1u) {
+      let left = tile_a[k * 16u + local.y];
+      let right = tile_b[k * 16u + local.x];
+      part[0] = fma(vec4<f16>(left.x), right, part[0]);
+      part[1] = fma(vec4<f16>(left.y), right, part[1]);
+      part[2] = fma(vec4<f16>(left.z), right, part[2]);
+      part[3] = fma(vec4<f16>(left.w), right, part[3]);
+    }
+    for (var r = 0u; r < 4u; r += 1u) { sum[r] += vec4<f32>(part[r]); }
+    workgroupBarrier();
+  }
+  for (var r = 0u; r < 4u; r += 1u) {
+    let i = i0 + local.y + r * 16u;
+    if (i >= L) { continue; }
+    let row = sum[r];
+    for (var c = 0u; c < 4u; c += 1u) {
+      let j = j0 + local.x + c * 16u;
+      if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = row[c] * 256.0; }
+    }
+  }
+}`;
+  }
 
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -828,8 +907,10 @@ fn main(
   }
 }`;
 
-  return { normalizeInput, projectAB, contract, normalizeHidden, projectOutput,
-           projectTile: { ...projectTile }, contractTile: { ...contractTile },
+  return { normalizeInput, projectAB, contract: contractF16 ?? contract, normalizeHidden, projectOutput,
+           projectTile: { ...projectTile },
+           // ...the f16 contraction's tile is its own, whatever the 8 x 8 kernel's was
+           contractTile: contractF16 === undefined ? { ...contractTile } : { rows: 64, columns: 64, arithmetic: "f16" },
            // ...the width the two projections fold their row tile at, so a
            // caller splits at the number the kernel was GENERATED with rather
            // than at a constant of its own that happens to match.
