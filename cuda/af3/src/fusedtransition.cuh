@@ -47,7 +47,9 @@ inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
 // without it the kernel is AF3's. MT: 16-row tiles a warp - at 2 every weight fragment read from shared
 // memory feeds two MMAs instead of one (the kernel is bound by those reads at MT 1); NC: intermediate
 // columns a chunk (16 keeps MT 2's registers in bounds)
-template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, class PT = float>
+// NST 1: ONE weight stage, a barrier before each chunk's store into it - for a T4, whose register-staged prefetch (LF_REG_STAGES)
+// holds the next chunk in registers anyway: the second stage was 12 KB that kept its 64 KB SM to ONE block (4 warps)
+template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, class PT = float, int NST = 2>
 __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
@@ -100,7 +102,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       ldsm4(xa[m][ks], Xs + ((warp * MT + m) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   float acc[MT][NT][4] = {};
   for (int j = 0; j < chunks; ++j) {
-    int st = j & 1;
+    int st = NST == 1 ? 0 : j & 1;
     // chunk j has landed; the barrier also says every warp is done with the stage the next issue
     // overwrites (chunk j - 1's), so one barrier a chunk
 #if LF_REG_STAGES
@@ -109,7 +111,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
 #else
     cpWait<0>();
     __syncthreads();
-    if (j + 1 < chunks) issue(j + 1, st ^ 1);
+    if (NST == 2 && j + 1 < chunks) issue(j + 1, st ^ 1);
 #endif
     const half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
     float ha[MT][NC / 8][4] = {}, hb[MT][NC / 8][4] = {};
@@ -150,8 +152,11 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
         for (int m = 0; m < MT; ++m) { mma16816(acc[m][et], pa[m], vb[0], vb[1]); mma16816(acc[m][et + 1], pa[m], vb[2], vb[3]); }
       }
     }
+    if constexpr (NST == 1) __syncthreads();      // (every warp done with the one stage before the next chunk takes it)
 #if LF_REG_STAGES
-    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+    if (j + 1 < chunks) stage(j + 1, NST == 1 ? 0 : st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+#else
+    if (NST == 1 && j + 1 < chunks) issue(j + 1, 0);
 #endif
   }
   // the residual, through the warp's own Xs rows (only it read them, as its A fragments; the loop's
@@ -318,19 +323,22 @@ inline bool fusedTransitionSplit256(float* x, size_t rows, int I, const float* l
 }
 
 // one launch of a given form (the bench's arms; fusedTransitionRaw picks the form)
-template <int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC>
+template <int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, int NST = 2>
 void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
                        const half* W2, const float* b1, const float* b2) {
   constexpr int R = 16 * WARPS * MT;
-  size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128, NC>();
+  size_t smem = (size_t)R * (128 + 8) * 2 + NST * ftStage<128, NC>();
   const half* w1t = transitionW1Tiles<RELU>(W1, 128, I, NC);
   WITH_PAIR_T(
     static bool attr = false;
-    if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC, PT>), (int)smem); attr = true; }
-    fusedTransitionK<128, WARPS, RELU, MT, NC, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+    if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC, PT, NST>), (int)smem); attr = true; }
+    fusedTransitionK<128, WARPS, RELU, MT, NC, PT, NST><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2));
 }
 inline bool FUSED_TRANSITION = true;
+#ifndef FT_ONE_STAGE
+#define FT_ONE_STAGE 1
+#endif
 inline int FT_WARPS = 8;
 inline bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
 // x += transition(x) for C = 128, f16 weights, on raw pointers (AlphaFold 2 calls it with RELU and its
@@ -352,6 +360,12 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   // on 4 warps 1.19, one tile on 8 1.03), bit-identical. AF3's SwiGLU form there is unmeasured and keeps the rule below
   if (RELU && ccMajor() == 12 && (rows + 255) / 256 >= MIN_BLOCKS && fitsSmem((size_t)256 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {
     fusedTransitionAt<16, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    return true;
+  }
+  // a part without cp.async (a T4: register-staged, LF_REG_STAGES): ONE weight stage, so two 64-row blocks of the one-tile
+  // form fit its 64 KB SM (29 KB each) where every two-stage form held one block - 4 warps an SM
+  if (FT_ONE_STAGE && ccMajor() < 8 && (rows + 63) / 64 >= MIN_BLOCKS && fitsSmem((size_t)64 * (128 + 8) * 2 + ftStage<128, 16>())) {
+    fusedTransitionAt<4, RELU, 1, 16, 1>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     return true;
   }
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {

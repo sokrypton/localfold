@@ -869,6 +869,16 @@ holds three of the one-tile form's 42 KB blocks, the one-tile form is 1.6% of th
 at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two and is unmeasured).
 `LOCALFOLD_FT_FORM=1/2` forces one or the other.
 
+**...and on a T4 a second block is what one weight stage buys** (2026-10-18). The T4 has no `cp.async`, so its kernels hold
+the next weight chunk in registers (`LF_REG_STAGES`) - and the fused transition still kept TWO shared stages, 12 KB that
+held its 64 KB SM to one block of any form. One stage (`NST` 1: a barrier before each chunk's store into it) puts the
+one-tile 4-warp form at 29 KB, two blocks an SM: **AlphaFold 3's pair transition 454 -> 341 ms and 391 -> 277 ms** over a
+5CAJ fold (two profiled runs, the T4 throttling between them), the PDB byte-identical. Taken only below compute
+capability 8 (`FT_ONE_STAGE`); an A100's folds are unchanged. The same single stage on the grid attention's input
+kernel (`gridInK`, 32-column stages and the bias projection's weights in the stage, two 4-warp blocks an SM) measured
+level (327 -> 336 ms), so it was not taken. Fold-level timing on a T4 cannot resolve 3%: with the clocks locked at
+1110 MHz four alternating pairs still read -19, -106, -45 and +98 ms.
+
 ## Tried and not taken
 
 - **Rewriting the T4's pair-track kernels, the measurements that came first** (2026-10-07, a Colab T4, AlphaFold 3 at
