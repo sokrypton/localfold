@@ -201,7 +201,14 @@ export function fusedTemplateEmbedding(input, weights, dialect) {
   // what AF3's own path already does - see the note at the bottom of
   // templateEmbedding. So that dialect flag describes LocalFold's existing
   // arithmetic rather than asking for new arithmetic.
-  const scale = 1 / (1e-7 + templates);
+  // 🔴 EXCEPT boltz2's, WHOSE EMPTY SLOTS WEIGH NOTHING (the visibility above):
+  // its TemplateV2Module divides by the templates it HAS, at least one - by
+  // the slot count its one template reached the trunk at a quarter of native
+  // Boltz-2's amplitude. See cuda/af3/export-model.mjs.
+  const present = visibility
+    ? Math.max(1, (input.slots ?? []).filter((slot) => slot !== undefined && slot !== null).length)
+    : templates;
+  const scale = 1 / (1e-7 + present);
   const output = new Float32Array(pairs * weights.queryChannels);
   const relu = new Float32Array(pairs * CHANNELS);
   for (let index = 0; index < summed.length; index += 1) {
