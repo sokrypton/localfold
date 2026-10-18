@@ -1226,7 +1226,11 @@ Verified on the M2 that the guard is inert where nothing over-dispatches:
 misread without a word: an `else` followed directly by `#pragma unroll` compiled cleanly here and, built on a Colab
 T4, made an ablation arm read 6.8x faster than the kernel - past the T4's peak - until it was braced (cuda/af3's
 README, the T4 research). Brace every `if constexpr`/`else` body that a pragma opens, compile for sm_75 here before
-a T4 round, and treat a number past the hardware's peak as a broken measurement, never a discovery.
+a T4 round, and treat a number past the hardware's peak as a broken measurement, never a discovery. 🔴 **AND IT
+BREAKS THE OTHER WAY TOO**: a braceless `if constexpr (WQ == 1)` over a `for` in `gridOutK` was compiled by THIS box's
+12.2 as though the NEXT loop were inside it as well, so the T4 path rehearsed here (`LOCALFOLD_EMULATE_CC=75`) never
+loaded its input tile and the confidence head's pTM came out NaN - while CUDA 13 on the T4 was exact. A printf in the
+loop made it go away, which is the tell of a miscompile rather than a race.
 
 🔴 **AND `gh` TALKS TO THE OTHER PORT BY DEFAULT, WHICH LOOKS LIKE A QUIET
 DEPLOY HISTORY.** This checkout has two remotes - `origin` is

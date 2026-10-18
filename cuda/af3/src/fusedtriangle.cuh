@@ -926,10 +926,13 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
   half* Ws = (half*)smem; half* Xs = Ws + WD / WQ * LDW;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
-  if constexpr (WQ == 1)
-  for (int t = threadIdx.x; t < WD * (C / 8); t += NTH) {
-    int k = t / (C / 8), c = (t % (C / 8)) * 8;
-    cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
+  // (braced: CUDA 12.2 compiled this `if constexpr` without braces as though the X loop below were inside it too, so
+  // at WQ 4 the X tile was never loaded - every output its residual, pTM NaN - where CUDA 13 compiles it as written)
+  if constexpr (WQ == 1) {
+    for (int t = threadIdx.x; t < WD * (C / 8); t += NTH) {
+      int k = t / (C / 8), c = (t % (C / 8)) * 8;
+      cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
+    }
   }
   for (int t = threadIdx.x; t < R * (WD / 8); t += NTH) {
     int r = t / (WD / 8), c = (t % (WD / 8)) * 8;
@@ -957,16 +960,43 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
   cpWait<0>();
   __syncthreads();
   float acc[NT][4] = {};
+#if LF_REG_STAGES
+  // (sm_75, no cp.async: the next quarter loaded into registers before this quarter's MMAs, stored after them)
+  constexpr int QPT = WQ > 1 ? WD / WQ * (C / 8) / NTH : 1;
+  static_assert(WQ == 1 || WD / WQ * (C / 8) % NTH == 0, "a quarter is a whole number of pieces a thread");
+  RegStage<QPT> nextW;
+  auto loadQ = [&](int q) {
+#pragma unroll
+    for (int i = 0; i < QPT; ++i) {
+      int t = i * NTH + threadIdx.x, k = t / (C / 8), c = (t % (C / 8)) * 8;
+      nextW.load(i, Wout + (size_t)(q * (WD / WQ) + k) * C + c);
+    }
+  };
+  auto storeQ = [&] {
+#pragma unroll
+    for (int i = 0; i < QPT; ++i) {
+      int t = i * NTH + threadIdx.x, k = t / (C / 8), c = (t % (C / 8)) * 8;
+      nextW.store(i, Ws + k * LDW + c);
+    }
+  };
+  if constexpr (WQ > 1) loadQ(0);
+#endif
 #pragma unroll
   for (int q = 0; q < WQ; ++q) {
     if constexpr (WQ > 1) {        // this quarter's weight rows into the one buffer, every warp done with the last quarter's
       if (q) __syncthreads();
+#if LF_REG_STAGES
+      storeQ();
+      __syncthreads();
+      if (q + 1 < WQ) loadQ(q + 1);
+#else
       for (int t = threadIdx.x; t < WD / WQ * (C / 8); t += NTH) {
         int k = t / (C / 8), c = (t % (C / 8)) * 8;
         cpAsync16(Ws + k * LDW + c, Wout + (size_t)(q * (WD / WQ) + k) * C + c, true);
       }
       cpCommit(); cpWait<0>();
       __syncthreads();
+#endif
     }
 #pragma unroll
   for (int kq = 0; kq < KS / WQ; ++kq) {
