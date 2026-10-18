@@ -1295,6 +1295,14 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
 - 18d7230d: AF2's flash-attention rescale group raced too (the metal-3 prior's attentionGroup is null now): the M5
   takes 4, AF2's block 144.8 -> 138.8 ms.
 - 057919a6: the four races compile their arms at once and share periodic noise: 0.75 -> 0.40 s, once a browser.
+- AF3's MSA stack, where a deep alignment's cost is (stock flags, 300 tokens x 1024 rows, 4 MSA + 4 pairformer blocks
+  profiled): 108e5c94 the outer product's contraction GEMM in f16 on the device's block, as AF2's (opm.contract 522 ->
+  326 ms); b8169ca8 msa.project 16 rows a workgroup (185 -> 25 ms); 5345144e msa.average 8 tokens a workgroup (171 ->
+  92 ms). The total 1757 -> ~1330 ms. 🔴 The f16 contraction is the one with a price: check-af3-msa-block.js (int5
+  bundle against the f32 oracle, n 24 x 16 rows) reads pair 1.89e-3 / msa 3.8e-6 with it in f32 and 4.56e-3 /
+  1.84e-3 in f16 (the MSA update reads the pair the outer product just moved). Both arms were already over that
+  checker's 1e-4 on int5 (the trunk's other f16 kernels: 1.72e-3 before this round); a fold with 1500 rows moved 0.048 A.
+  `opmVectorArithmetic: "f32"` is the control if a deep-MSA fold says otherwise.
 - 🔴 Re-checked under `LOCALFOLD_STOCK_FLAGS=1` (what a visitor runs; gpu-chrome.mjs adds --enable-unsafe-webgpu
   otherwise): AF3 at 522 tokens, 12 blocks, the two f16 arithmetics 5276 -> 4995 ms (-5.3%); AF2's block at 300 x 128
   143.7 -> 135.0 ms with group 4 and the f16 contraction; ESMFold2's trunk at 300 tokens 3478 -> 3345 ms; the races
