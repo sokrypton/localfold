@@ -914,15 +914,19 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
   }
 }
 // pair[(j, r)] += (gathered[(r, j)] Wout) for output rows q0 .. q0+rows (the column direction)
-template <int C, int WD, int WARPS, class PT = float>
+// WQ 4 (a T4's): the weight streamed through one buffer a quarter of K at a time (32 rows, 9 KB) where it was held whole (35 KB) -
+// the block 26 KB, two an SM where the 52 KB form held one (4 warps); each quarter's copy behind a barrier, the second block
+// hiding it
+template <int C, int WD, int WARPS, class PT = float, int WQ = 1>
 __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     float* __restrict__ pair, int n, size_t q0, size_t rows, bool tr, const float* __restrict__ ob = nullptr) {
   // ob: the output projection's bias (AF2's), or none
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = WD + 8, LDW = C + 8, KS = WD / 16, NT = C / 8;
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Ws = (half*)smem; half* Xs = Ws + WD * LDW;
+  half* Ws = (half*)smem; half* Xs = Ws + WD / WQ * LDW;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
+  if constexpr (WQ == 1)
   for (int t = threadIdx.x; t < WD * (C / 8); t += NTH) {
     int k = t / (C / 8), c = (t % (C / 8)) * 8;
     cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
@@ -954,15 +958,28 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
   __syncthreads();
   float acc[NT][4] = {};
 #pragma unroll
-  for (int ks = 0; ks < KS; ++ks) {
+  for (int q = 0; q < WQ; ++q) {
+    if constexpr (WQ > 1) {        // this quarter's weight rows into the one buffer, every warp done with the last quarter's
+      if (q) __syncthreads();
+      for (int t = threadIdx.x; t < WD / WQ * (C / 8); t += NTH) {
+        int k = t / (C / 8), c = (t % (C / 8)) * 8;
+        cpAsync16(Ws + k * LDW + c, Wout + (size_t)(q * (WD / WQ) + k) * C + c, true);
+      }
+      cpCommit(); cpWait<0>();
+      __syncthreads();
+    }
+#pragma unroll
+  for (int kq = 0; kq < KS / WQ; ++kq) {
+    const int ks = q * (KS / WQ) + kq;
     uint32_t xa[4];
     ldsm4(xa, Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
 #pragma unroll
     for (int et = 0; et < NT; et += 2) {
       uint32_t f[4];
-      ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + (et + (lane >> 4)) * 8);
+      ldsm4t(f, Ws + (kq * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + (et + (lane >> 4)) * 8);
       mma16816(acc[et], xa, f[0], f[1]); mma16816(acc[et + 1], xa, f[2], f[3]);
     }
+  }
   }
   // the accumulators through the warp's own Xs rows (only it read them), 64 f32 columns at a time
   float* Ys = reinterpret_cast<float*>(Xs + warp * 16 * LDX);
@@ -990,6 +1007,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
     __syncwarp();
   }
 }
+#ifndef GO_QUARTERS
+#define GO_QUARTERS 1
+#endif
 constexpr int GI_WARPS = 8, GO_WARPS = 8;
 // the launchers on raw pointers (AF2 calls these with its own weights and biases), then AF3's by name
 template <int WARPS, int NCI = 64>
@@ -1030,14 +1050,14 @@ inline void gridIn128(const float* pair, const std::string& pre, const std::stri
   gridInRaw(pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), nullptr, out, n, q0, rows, tr, Wb, bias,
             heads, stride, swap, kv8);
 }
-template <int WARPS>
+template <int WARPS, int WQ = 1>
 void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
   constexpr int C = 128, WD = 128, R = 16 * WARPS;
-  size_t smem = (size_t)WD * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
+  size_t smem = (size_t)WD / WQ * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
   WITH_PAIR_T(
     static bool attr = false;
-    if (!attr) { smemAttr((gridOutK<C, WD, WARPS, PT>), (int)smem); attr = true; }
-    gridOutK<C, WD, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wout, pair, n, q0, rows, tr, ob));
+    if (!attr) { smemAttr((gridOutK<C, WD, WARPS, PT, WQ>), (int)smem); attr = true; }
+    gridOutK<C, WD, WARPS, PT, WQ><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wout, pair, n, q0, rows, tr, ob));
 }
 inline void gridOutRaw(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
   // 4 warps where an SM holds three of their blocks (an A100's 164 KB): the 8-warp block's 166 registers a thread and
@@ -1048,6 +1068,11 @@ inline void gridOutRaw(const half* gathered, const half* Wout, const float* ob, 
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
     return (size_t)perSm >= 3 * (gridOutSmem(4) + 1024);
   }();
+  // a part without cp.async (a T4): the weight a quarter at a time, two 4-warp blocks an SM (gridOutK's WQ)
+  if (GO_QUARTERS && ccMajor() < 8 && (rows + 63) / 64 >= (size_t)MIN_BLOCKS && fitsSmem((size_t)32 * 136 * 2 + (size_t)64 * 136 * 2)) {
+    gridOutAt<4, 4>(gathered, Wout, ob, pair, n, q0, rows, tr);
+    return;
+  }
   switch (four && fitsSmem(gridOutSmem(4)) && (rows + 63) / 64 >= (size_t)MIN_BLOCKS ? 4
           : warpsFitting(warpsFor(rows, {GO_WARPS, 4, 2}), {GO_WARPS, 4, 2}, gridOutSmem)) {
     case 2: gridOutAt<2>(gathered, Wout, ob, pair, n, q0, rows, tr); break;
