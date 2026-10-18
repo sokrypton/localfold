@@ -6,7 +6,8 @@
 //   gaInK:    LN(row) on the way in (four lanes... two a row: 32 channels a lane), then on the tensor cores
 //             [k | v | gate] = LN(row) [Wk | Wv | Wg]: k, v to kv [L][N][16] (f32, a column's keys contiguous),
 //             sigmoid(gate + bg) to gate [N][L][64] (f16); the masked column sums of LN(row) and the mask's
-//             sums into qsum [L][64], msum [L] (per block, then one atomic a column-channel)
+//             sums into qsum [L][64], msum [L] (a slab a row block, summed in gaQueryK in the blocks' order: atomics
+//             made the fold depend on which block finished first - 5CAJ's pLDDT 95.05-95.51 over four runs)
 //   gaQueryK: q[b] = (qsum[b] / msum[b]) Wq / sqrt(D)
 //   gaAttnK:  a block a column: the online softmax over its N rows, per head, of q.k (+ the mask's -1e9),
 //             avg[b] = softmax . v
@@ -109,7 +110,8 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
       }
     }
   }
-  // the block's masked sums: across its warps in shared memory, then one atomic a column-channel
+  // the block's masked sums: across its warps in shared memory, into this row block's slab
+  qsum += (size_t)blockIdx.y * ((size_t)L * C + L); msum = qsum + (size_t)L * C;
 #pragma unroll
   for (int c = 0; c < 32; ++c) red[warp][lane][c] = qacc[c];
   if (hf == 0) mred[warp][tok] = macc;
@@ -120,24 +122,28 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
     float a = 0.f;
 #pragma unroll
     for (int w = 0; w < WARPS; ++w) a += red[w][ln][c];
-    atomicAdd(qsum + (size_t)bb * C + (ln & 1) * 32 + c, a);
+    qsum[(size_t)bb * C + (ln & 1) * 32 + c] = a;
   }
   for (int t = threadIdx.x; t < 16; t += WARPS * 32) {
     if (b0 + t >= L) continue;
     float a = 0.f;
 #pragma unroll
     for (int w = 0; w < WARPS; ++w) a += mred[w][t];
-    atomicAdd(msum + b0 + t, a);
+    msum[b0 + t] = a;
   }
 }
 
-// q[b][h*D + d] = (qsum[b] / (msum[b] + 1e-10)) Wq / sqrt(D); Wq [C][H*D] f32. A block (C threads) a column
-__global__ void __launch_bounds__(64) gaQueryK(const float* __restrict__ qsum, const float* __restrict__ msum,
+// q[b][h*D + d] = (qsum[b] / (msum[b] + 1e-10)) Wq / sqrt(D); Wq [C][H*D] f32. A block (C threads) a column; qsum,
+// msum the row blocks' slabs ([Y][L*C + L]), summed in order
+__global__ void __launch_bounds__(64) gaQueryK(const float* __restrict__ part, int L, int Y,
     const float* __restrict__ wq, float* __restrict__ q) {
   constexpr int C = ga::C, H = ga::H, D = ga::D, NIN = ga::NIN;
   __shared__ float qa[C];
   const int b = blockIdx.x, t = threadIdx.x;
-  qa[t] = qsum[(size_t)b * C + t] / (msum[b] + 1e-10f);
+  const size_t slab = (size_t)L * C + L;
+  float qs = 0.f, ms = 0.f;
+  for (int y = 0; y < Y; ++y) { qs += part[y * slab + (size_t)b * C + t]; ms += part[y * slab + (size_t)L * C + b]; }
+  qa[t] = qs / (ms + 1e-10f);
   __syncthreads();
   float a = 0.f;
   for (int c = 0; c < C; ++c) a += qa[c] * wq[(size_t)c * H * D + t];
@@ -290,16 +296,16 @@ inline void globalAttentionFused(float* msa, const float* msaMask, int L, int N,
   constexpr int WARPS = 4, ROWS = 128;
   float* kv = scratch<float>("gaf.kv", (size_t)L * N * 2 * ga::D);
   half* gate = scratch<half>("gaf.gate", (size_t)N * L * ga::H * ga::D);
-  float* qsum = scratch<float>("gaf.qsum", (size_t)L * ga::C + L);
+  const int Y = (N + ROWS - 1) / ROWS;
+  float* qsum = scratch<float>("gaf.qsum", ((size_t)L * ga::C + L) * Y);
   float* msum = qsum + (size_t)L * ga::C;
   float* q = scratch<float>("gaf.q", (size_t)L * ga::H * ga::D);
   float* avg = scratch<float>("gaf.avg", (size_t)L * ga::H * ga::D);
-  CK(cudaMemsetAsync(qsum, 0, ((size_t)L * ga::C + L) * 4, STREAM));
-  dim3 grid((L + 15) / 16, (N + ROWS - 1) / ROWS);
+  dim3 grid((L + 15) / 16, Y);
   gaInK<WARPS><<<grid, WARPS * 32, 0, STREAM>>>(msa, msaMask, P(A + "/query_norm/scale", blk), P(A + "/query_norm/offset", blk),
       PH(A + "/attention/key_w", blk), PH(A + "/attention/value_w", blk), PH(A + "/attention/gating_w", blk),
       P(A + "/attention/gating_b", blk), kv, gate, qsum, msum, L, N, ROWS);
-  gaQueryK<<<L, ga::C, 0, STREAM>>>(qsum, msum, P(A + "/attention/query_w", blk), q);
+  gaQueryK<<<L, ga::C, 0, STREAM>>>(qsum, L, Y, P(A + "/attention/query_w", blk), q);
   gaAttnK<<<L, 256, 0, STREAM>>>(kv, msaMask, q, avg, L, N);
   gaOutK<WARPS><<<grid, WARPS * 32, 0, STREAM>>>(gate, avg, PH(A + "/attention/output_w", blk), P(A + "/attention/output_b", blk),
                                                  msa, L, N, ROWS);

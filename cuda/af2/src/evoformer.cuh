@@ -430,7 +430,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
       msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
-      if (C == oln::C && Wp == oln::C) {
+      if (C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM)) {
         // the output projection writes the column attention's LayerNorm'd rows as well (outln.cuh): no LN pass there
         const std::string ln = S + "msa_column_attention/query_norm";
         half* xn = scratch<half>("fcol.xn", rows * C);
@@ -497,7 +497,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
     // ...and its output projection writes the MSA transition's LayerNorm'd rows (outln.cuh), where room allows them whole
-    if (C == oln::C && Wp == oln::C && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+    if (C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
       const std::string ln = S + "msa_transition/input_layer_norm";
       B16* xt = scratch<B16>("ftr.xnfull", rows * C);
       outLn256<B16>(o, bf16Of(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk),

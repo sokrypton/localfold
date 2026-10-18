@@ -277,11 +277,18 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
 template <int C, class PT = float>
 inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* lnO, const half* Wt, const float* bias, int N,
                    int split, half* out0, half* out1) {
-  constexpr int WARPS = 4, MT = 2, R = 16 * WARPS * MT;
-  constexpr size_t smem = (size_t)R * (C + 8) * 2;
-  static bool attr = false;
-  if (!attr) { smemAttr((lnGemmK<C, WARPS, MT, PT>), (int)smem); attr = true; }
-  lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1);
+  constexpr int WARPS = 4;
+  auto at = [&](auto mt) {
+    constexpr int MT = decltype(mt)::value, R = 16 * WARPS * MT;
+    constexpr size_t smem = (size_t)R * (C + 8) * 2;
+    static bool attr = false;
+    if (!attr) { smemAttr((lnGemmK<C, WARPS, MT, PT>), (int)smem); attr = true; }
+    lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1);
+  };
+  // two row tiles a warp, else one where 128 rows do not fit (a T4's 64 KB at 256 channels: 66 KB) - each output's sum
+  // the same either way
+  if (fitsSmem((size_t)16 * WARPS * 2 * (C + 8) * 2)) at(std::integral_constant<int, 2>{});
+  else at(std::integral_constant<int, 1>{});
 }
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
 __global__ void swapAddK(float* y, const float* x, int A, int B, int C) {     // y[b][a] += x[a][b]
