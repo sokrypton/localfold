@@ -69,6 +69,7 @@ import {
 import { SOURCES } from "../../../shared/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { halfPrecisionAvailable, deviceTuning } from "../../runtime/device-profile.js";
+import { settleGridAttendTiling } from "../../af3/trunk/grid-attend-race.js";
 import { storageBytes } from "../../runtime/storage.js";
 import { createTriangleShaders, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
 import {
@@ -1160,6 +1161,8 @@ async function encodeTriangleMultiplication(
   direction,
   residualTarget,
 ) {
+  // (the contraction's arithmetic is raced once per Apple device: see contractTile below)
+  await settleGridAttendTiling(execution.device);
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   // 🔴 THE SAME THREE MATRIX KERNELS AF3's PAIR TRACK RUNS, on AF2's own
   // triangle. This operation is 9.5 ms of a 62.73 ms block at 400 residues -
@@ -1215,6 +1218,12 @@ async function encodeTriangleMultiplication(
   const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
   const projectTile = outColumns === null ? requestedTile
     : { ...(requestedTile ?? PROJECT_TILE), outColumns };
+  // ...and the contraction in f16 arithmetic, as AF3's pair track (webgpu/kernels/triangle/shaders.js: 16-term f16
+  // partial sums of operands scaled by 2^-4, so its length-long K cannot overflow them); an Apple GPU races it
+  // (grid-attend-race.js). `triangleContractArithmetic: "f32"` is the control.
+  const contractTile = !matrixFits && halfPrecisionAvailable(execution.device)
+    && (deviceTuning(execution.device).triangleContractArithmetic ?? "f16") === "f16"
+    ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined;
   // 🔴 SEVEN SOURCES, TWICE, ONCE A BLOCK A RECYCLE. `encodeTriangleMultiplication`
   // runs twice a block and 48 blocks a recycle, and regenerated every one of
   // these strings each time for a pipeline that already existed. The shape, the
@@ -1222,9 +1231,9 @@ async function encodeTriangleMultiplication(
   // depend on. Alongside them the RESIDUAL set, which differs only in its
   // writeback and is a second full generation.
   const sourceKey = `block:triangle:${direction}:${JSON.stringify(shape)}`
-    + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
+    + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}:${JSON.stringify(contractTile ?? null)}`;
   const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(
-    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile));
+    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile, false, contractTile));
   // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
   // replacement on the finished WGSL; when the kernel's writeback was rewritten
   // the pattern stopped matching, and a replacement that matches nothing throws
@@ -1232,11 +1241,12 @@ async function encodeTriangleMultiplication(
   // of adding to it, on the shipped AF2 path only.
   const residualShaders = shaderSourceSet(execution.device, `${sourceKey}:residual`,
     () => createTriangleShaders(
-      shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
+      shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true, contractTile));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
     + `:${shape.accumulatePrecision ?? "f32"}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
-    + `x${shaders.projectTile.outColumns ?? "-"}`;
+    + `x${shaders.projectTile.outColumns ?? "-"}`
+    + `:ct${shaders.contractTile.rows}x${shaders.contractTile.columns}${shaders.contractTile.arithmetic ?? ""}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
   const outMatrixSources = matrixFits
     ? shaderSourceSet(execution.device,
