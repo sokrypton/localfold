@@ -1283,9 +1283,18 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
   IntelliFold-2's products cannot overflow): tri.contract 861 -> 646 ms of 12 blocks at 522 tokens, the pass -3.5%.
 - 7b27e461, 954c8e8d: grid.project's f16 and the contraction's f16 are now RACED per device beside grid.attend's
   tiling (grid-attend-race.js), so the M5 takes f16 (grid.project 264 -> 192 ms at 255 tokens) and the M2 can keep f32.
+- 0c770fcf, 1e39cd2e: ESMFold2's and AF2's triangles take the same f16 contraction (ESMFold2's trunk -2% at 300
+  tokens; AF2's block 148 -> 144.5 ms at 300 x 128).
+- 18d7230d: AF2's flash-attention rescale group raced too (the metal-3 prior's attentionGroup is null now): the M5
+  takes 4, AF2's block 144.8 -> 138.8 ms.
+- 057919a6: the four races compile their arms at once and share periodic noise: 0.75 -> 0.40 s, once a browser.
+- Tried and dropped: a 16 x 16-lane contraction in f32 (level with the 8 x 8; only the f16 arithmetic pays), the
+  diffusion token tile at 522 tokens (8 stays best: 222 against 244 / 254 ms a call at 16 / 32), opmBlockI 1 against
+  2 at 256 and 400 tokens (level here), and on Metal AF2's MSA norms emitted by the 256-wide GEMMs (LayerNorm 233 -> 92
+  ms of a 261 x 1500-row pass, but the emitting epilogues cost 113 ms more: net -0.7%, not kept).
 
 **For the M2**
-1. `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js`: the three races' answers there (expected: attend
-   untiled, project f32; the contraction is the open question - this M5 alone measured it).
+1. `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js`: the four races' answers there (expected: attend
+   untiled, project f32, group 1; the contraction is the open question - this M5 alone measured it).
 2. The Metal gates on f5dedde4: AF3's kitchen sink may move on the M2 too (the chunked transition's emitted norms
    reach every fold past ~300 tokens); re-record it there if it does, as here.
