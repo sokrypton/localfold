@@ -728,6 +728,15 @@ round's warps taking their fragments before the next - one round's rows beside t
 normed by the same arithmetic. Byte-identical; on a Colab T4 protenix2's input kernel 1768 -> 1477 ms over a
 fold. NOT occupancy-bound after all: the whole fold moves less than the card's thermal drift, and at 128
 channels against the 8-warp form it is 428 -> 420 - so it is taken only where 8 warps do not fit.
+Re-measured 2026-10-18 on a Colab T4 (AF3, 5CAJ 261 tokens, profiles alternating, each kernel read against the
+unchanged fused transition because the card drifts 10% within a round): at 128 channels the rounded form is
+1.169x -> 1.060x the transition's time, about 9% of the kernel, PDB byte-identical - so a T4 takes it at 128 too.
+The two-tile form (`TRIIN_TWO_TILES`, four warps of 32 rows) is 1.30x there. In the same round two more T4 forms:
+`gridOutK` streams its 128 x 128 weight a quarter of K at a time (9 KB where it held 35, two blocks an SM where it
+held one: 272 -> 219 ms over a fold's 416 calls), and `gridInK` takes 8 warps at 32-column weight stages (61 KB)
+where 64-column ones (78 KB) did not fit and left 4 - 1.189x -> 1.140x the transition's time (16-column stages were
+slower). Nsight Compute runs on a Colab VM as root (`/usr/local/cuda/bin/ncu`); the T4 flash kernel's stalls there
+are the two barriers a key tile (16%), the stores waiting on the register-staged tile, and spills at 168 registers.
 ESMFold2 on a T4 ran its whole 256-channel pair track UNFUSED: `fused256Fits` asked all three of the
 8-warp kernels to fit, and none does in 64 KB. It now takes their T4 forms - the rounded input kernel, the
 output kernel's bf16 tile, and `transitionUpK` in rounds with 16-column stages (`transitionUpK<256, 16, 16,

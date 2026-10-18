@@ -301,6 +301,10 @@ inline int wideTriInWarps(int C) {
     // one 8-warp block an SM (~100 KB at 256 channels: an RTX PRO 6000): the rounded form fits two - measured there
     // through ESMFold2's same kernel, 457 -> 428 ms at 988 tokens and 4490 -> 3882 at 2,964 (cuda/ef2/src/fused256.cuh)
     if (C == 256 && fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED))) return TRIIN_ROUNDED;
+    // a T4 at 128 channels (one 8-warp block an SM): the rounded form's 16 warps, re-measured on a Colab T4 (AF3, 5CAJ
+    // 261 tokens, two alternating profiles against the unchanged fused transition): 1.169x -> 1.060x its time, PDB
+    // byte-identical - not the 2% recorded above; the two-tile form 1.30x
+    if (ccMajor() < 8 && fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED))) return TRIIN_ROUNDED;
     return 8;
   }
   return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
