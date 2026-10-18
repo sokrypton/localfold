@@ -34,7 +34,7 @@ Every speed and memory choice in `metal/` was measured on one M2. The M5 differs
 
 - **macOS 26 (Tahoe) and Xcode 26's SDK** for Metal 4's tensor operations. Steps 1, 2 and 4 below need only the
   Xcode command-line tools and run on any macOS 13+.
-- The checkout on branch `metal`, with the weights the M2 has. Copy them, following symlinks (`model-af3-int5` on the
+- The checkout on branch `opus-55-opt` (`metal` was merged into it and removed 2026-10-18), with the weights the M2 has. Copy them, following symlinks (`model-af3-int5` on the
   M2 is a symlink into a sibling checkout):
 
   | what | where | for |
@@ -180,7 +180,7 @@ subgroup matrices (`--enable-unsafe-webgpu` is needed); check what a stock Chrom
 Append a section **"The M5's reply"** at the end of this file: Step 1's gate results (any moved case and its
 explanation), Step 2's table with an M5 column, what Step 3 built and what it is worth (each arm against the old path,
 interleaved, with the gates' numbers), and Step 4's arms. Update `metal/README.md`'s tables where the M5 changes them,
-naming the machine (an M2 number and an M5 number side by side, never one replacing the other). Commit on `metal`
+naming the machine (an M2 number and an M5 number side by side, never one replacing the other). Commit on `opus-55-opt`
 with the numbers in each commit message. Do not push.
 
 ## The M5's reply

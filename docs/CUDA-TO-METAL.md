@@ -1,6 +1,6 @@
 # From the CUDA ports to the Metal ones (2026-10-15)
 
-Written on the A100 (branch `opus-55-opt`) for whoever works on `metal/` (branch `metal`). Nothing here was run on a
+Written on the A100 (branch `opus-55-opt`) for whoever works on `metal/` (now on `opus-55-opt` too: the `metal` branch was merged and removed 2026-10-18). Nothing here was run on a
 Mac. Each item is something the CUDA ports learned this round, with how it was measured there and why it might
 matter more on a 16 GB Mac, where unified memory is the ceiling. The opposite direction was checked too: the `metal`
 branch's trunk ideas were profiled on the A100 and are already in CUDA or are below 1% there (the end of this note).

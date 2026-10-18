@@ -1666,16 +1666,16 @@ So the exchanges go by COPY ENGINES (`cudaMemcpyAsync`/`cudaMemcpy2DAsync` from 
 no SM held):
 - **the triangle's operands and products** (`copyPlanes`, `copyRows`): each piece one run at both ends;
 - **the attention bias** (`copyBias`): a rank's piece one rectangle in either layout, one 2-D copy a destination;
-- on branch **`mg-ring-ce`**, every **pair transpose** - packed first on the device (`packTransposeK`, local, ~10x a link)
+- on tag **`archive/mg-ring-ce`** (the branch, archived 2026-10-18), every **pair transpose** - packed first on the device (`packTransposeK`, local, ~10x a link)
   so each destination's piece is one run a row, then one 2-D copy a rank - with the column ring pipelined over three
-  slots (branch `mg-ring-ab`) so they overlap. Simulated rank of 8 at 5,928 tokens: on the stream 157 -> 59 GB a pass
+  slots (tag `archive/mg-ring-ab`) so they overlap. Simulated rank of 8 at 5,928 tokens: on the stream 157 -> 59 GB a pass
   and +1.5% (the ordinary path), 339 -> 241 GB and +0.9% (the ring); a simulated rank's copies are local and contend
   with the attention for HBM.
 All byte-identical to the push kernels on 2 and 3 ranks sharing one card. On 8 x A100 an all-to-all ran at 233 GB/s a
 GPU by copy engines against 120 by kernels (both rotated), so the waited-on bytes should also move faster.
 
 Unmeasured, and the next box's question: `~/megacomplexes/box-scripts/ab.sh` builds commits side by side on an 8-GPU
-box and folds one pass of a job with each, twice interleaved (`BOX=ubuntu@<ip> ab.sh abd4088 opus-55-opt mg-ring-ce`).
+box and folds one pass of a job with each, twice interleaved (`BOX=ubuntu@<ip> ab.sh abd4088 opus-55-opt archive/mg-ring-ce`).
 🔴 **AND A PCIe BOX TOO**: over the 4 x A6000's host bridge a peer READ by copy engine ran at 0.4-0.9 GB/s; these are
 writes from the sender, which kernels did at 15-20 GB/s there, but a copy engine's posted write through that bridge has
 not been timed - check it before trusting copy engines on PCIe.
@@ -1795,8 +1795,8 @@ Folding PAST the card works and was measured - the pair in pinned host memory, t
 rows or columns at a time: **10,761 tokens on this 40 GB A100 in 2.7 hours** (trunk 150 min, diffusion 5.7,
 confidence 3.1), clean geometry - but it is ~800 lines (windowed passes, double-buffered copies, a host-memory
 bias cache), costs ~770 bytes of host RAM a token pair (89 GB at 10,761; a Colab A100 has 83.5, a T4 12.7),
-and buys folds that take hours of a model trained on a few hundred tokens. It lives on branch
-**`tier2-host-pair`** (d0b061b) to revisit. What it found that every big fold keeps: the MSA attention in
+and buys folds that take hours of a model trained on a few hundred tokens. It lives on tag
+**`archive/tier2-host-pair`** (d0b061b) to revisit. What it found that every big fold keeps: the MSA attention in
 blocks of alignment rows, the blocked triangle's blocks as wide as what is free allows (each reads the whole
 fixed operand), and the sampler's per-step conditioning and the encoder's pair projection given back when
 their last reader is done.
