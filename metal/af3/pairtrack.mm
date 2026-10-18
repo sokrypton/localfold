@@ -214,9 +214,15 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   half* xn = scratch<half>(std::string(scratchPrefix) + "xn", chunk * C);
   half* g = scratch<half>(std::string(scratchPrefix) + "g", chunk * I);
   const half* wp = swigluPairs(pre + ".transition1", C, I);
+  // the input norm the previous update emitted, whole, read a chunk at a time - and the next norms emitted a chunk at a
+  // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
+  // both used to be a LayerNorm pass of their own past ~300 tokens)
+  half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
+  const bool emitNext = !next1.empty() && !into && C == 128 && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
+  bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
-    half* in = r0 == 0 && r == rows ? takeEmitted(x, pre + ".inputLayerNorm") : nullptr;
+    half* in = inAll ? inAll + r0 * C : nullptr;
     const half* xs = in ? nullptr : sharedNorm(x);
     if (xs && foldTransition()) {     // (chai's shared input norm: this norm's affine folded into the SwiGLU's weights)
       Folded f = foldNorm("tr:" + pre, wp, C, 2 * I, pre + ".inputLayerNorm", nullptr);
@@ -231,17 +237,22 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
       gemmSwiglu(in, wp, g, r, C, I);
     }
     // the pair's next norms (next1 into pr.x, next2 into pr.x2 - both free once the SwiGLU has read its input)
-    if (!next1.empty() && !into && r == rows && C == 128 && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"))) {
-      Gemm G{}; G.X = g; G.tx = F16; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x; G.ty = dtOf<T>(); G.rows = r; G.in = I; G.out = C;
-      G.beta = 1.f; G.label = "transition2, next norms";
-      G.lnOut = scratch<half>("pr.x", rows * C); G.lnScale = W(next1 + "Scale"); G.lnOffset = Wopt(next1 + "Offset");
-      if (!next2.empty()) { G.lnOut2 = scratch<half>("pr.x2", rows * C); G.lnScale2 = W(next2 + "Scale"); G.lnOffset2 = Wopt(next2 + "Offset"); }
+    if (emittedAll) {
+      Gemm G{}; G.X = g; G.tx = F16; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x + r0 * C; G.ty = dtOf<T>(); G.rows = r;
+      G.in = I; G.out = C; G.beta = 1.f; G.label = "transition2, next norms";
+      G.lnOut = scratch<half>("pr.x", rows * C) + r0 * C; G.lnScale = W(next1 + "Scale"); G.lnOffset = Wopt(next1 + "Offset");
+      if (!next2.empty()) {
+        G.lnOut2 = scratch<half>("pr.x2", rows * C) + r0 * C; G.lnScale2 = W(next2 + "Scale"); G.lnOffset2 = Wopt(next2 + "Offset");
+      }
       if (lenW(pre + ".transition2") != (size_t)I * C) die("%s.transition2 has %zu elements", pre.c_str(), lenW(pre + ".transition2"));
-      if (gemm(G)) { emit(0, x, next1, G.lnOut); if (G.lnOut2) emit(1, x, next2, G.lnOut2); }
+      if (gemm(G)) continue;
+      if (r0) die("%s: the next norms emitted for some chunks and not others", pre.c_str());
+      emittedAll = false;       // (the GEMM took no emission - every chunk falls back alike)
       continue;
     }
     addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, r, I, C);
   }
+  if (emittedAll) { emit(0, x, next1, scratch<half>("pr.x", rows * C)); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
 }
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
                 const std::string& next2, const char* scratchPrefix) {

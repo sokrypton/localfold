@@ -305,8 +305,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
 // (instantiated on first use by the runtime: lf_gemm_tensor<TA, TB, TC, TM, TN, TRA, TRB, EP>, host name gemmt_...)
 
 // The triangle's last two GEMMs in one pass: pair[r][o] += v[r][o] sigmoid(g[r][o]), g = Xg Wg (+ the gate's bias, in
-// float as gemmGatedAdd's) and v = Xv Wv (+ its bias), rounded to half as the projection's half output was - so the
-// value never leaves the registers. A = Wg, B = Xg, C = D = the pair, bias the gate's; aux = Xv (ldaux), aux2 = Wv
+// float) and v = Xv Wv (+ its bias), rounded to half as the projection's half output was - so the value never leaves
+// the registers. The gate's product is summed by the matrix units and rounded to half once, as v's is: a float
+// accumulator beside v's was 96 registers a thread, and in half the kernel is 15% faster (440 -> 372 ms a 522-token
+// trunk pass; CA 0.002 A; a sigmoid's input needs no more). A = Wg, B = Xg, C = D = the pair, bias the gate's; aux = Xv (ldaux), aux2 = Wv
 // ([k][m], dense), aux3 its bias or 0. A 64 x 128 tile over 4 simdgroups: a thread's 4 adjacent columns at e..e+3.
 // TP the pair's type: float, or half (the pairformer's half pair - the sum in float, rounded once on the store).
 template <int TM = 64, int TN = 128, typename TP = float>
@@ -323,10 +325,10 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
   matmul2d<desc, execution_simdgroups<4>> op;
   auto mXg = tXg.slice(0, j0); auto mWg = tWg.slice(i0, 0);
   auto mXv = tXv.slice(0, j0); auto mWv = tWv.slice(i0, 0);
-  auto cg = op.template get_destination_cooperative_tensor<decltype(mXg), decltype(mWg), float>();
+  auto cg = op.template get_destination_cooperative_tensor<decltype(mXg), decltype(mWg), half>();
   auto cv = op.template get_destination_cooperative_tensor<decltype(mXv), decltype(mWv), half>();
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); ++e) if (cg.is_valid_element(e)) cg[e] = 0.f;
+  for (uint16_t e = 0; e < cg.get_capacity(); ++e) if (cg.is_valid_element(e)) cg[e] = 0.h;
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cv.get_capacity(); ++e) if (cv.is_valid_element(e)) cv[e] = 0.h;
   op.run(mXg, mWg, cg);
@@ -341,7 +343,7 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     const auto ix = cg.get_multidimensional_index(e);
     const int i = i0 + ix[0], j = j0 + ix[1];
     if (j >= g.n || i >= g.m) continue;
-    float4 v1 = float4(cg[e], cg[e + 1], cg[e + 2], cg[e + 3]);
+    float4 v1 = float4((float)cg[e], (float)cg[e + 1], (float)cg[e + 2], (float)cg[e + 3]);
     if (bg) v1 += *(device const float4*)(bg + i);
     float4 v2 = float4((float)cv[e], (float)cv[e + 1], (float)cv[e + 2], (float)cv[e + 3]);
     if (bv) v2 = float4(half4(v2 + *(device const float4*)(bv + i)));
@@ -608,9 +610,12 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < M.get_capacity(); ++e) if (M.is_valid_element(e)) { M[e] = -1e30f; L[e] = 0.f; }
   const long bq = (long)(a.r0 + b);
+  // the simdgroup's queries held as the first product's left input, loaded once rather than every key tile (1-2%)
+  auto Q = opS.template get_left_input_cooperative_tensor<half, half, float>();
+  Q.load(mQ);
   for (int k0 = 0; k0 < n; k0 += KT) {
     auto mK = tK.slice(0, k0); auto mV = tV.slice(0, k0);
-    opS.run(mQ, mK, S);
+    opS.run(Q, mK, S);
     if (a.bias) Bh.load(tB.slice(k0, qa));
     const bool tail = k0 + KT > n;
     _Pragma("clang loop unroll(full)")
