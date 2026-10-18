@@ -440,6 +440,13 @@ samples until every row's load was put in flight first), so the fold gains littl
 4.565 -> 4.556, 1,000 deep level. 5CAJ 0.008-0.016 A from the previous build. The single-sequence 5CAJ gate case
 (pLDDT 31, 18-21 A from the crystal across seeds) moved within its own seed spread and was re-recorded.
 
+...and its row pass staged as the rounded 16-bit sums rather than f32 accumulators: the residual read into the stages'
+memory, each accumulator plus bias plus residual rounded in place, the row pass reading the very values it wrote
+before - 44 KB a block against 66.5 (three blocks an A100 SM, not two), 101.8 -> 93.4 ms over 5CAJ's 384 calls,
+byte-identical. It takes f16 too, and a T4 (f16 MSA) was measured both ways: 32-row blocks (38 KB) 3% of the fold
+behind cuBLAS's GEMM plus the LN pass, every block reading all of Wout; 64-row blocks with the next stage
+register-staged (no cp.async there) still 0.9% behind. A T4 keeps cuBLAS.
+
 cuBLASLt's other heuristic algorithms, timed against its first pick on the MSA's GEMM shapes (q/k/v/gate, the
 transition's two, the output projection, at 261 and 600 residues): the first pick is the fastest of up to 16 in every
 case, so autotuning `ltGemm` would buy nothing.

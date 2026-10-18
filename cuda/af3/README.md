@@ -772,6 +772,13 @@ scheduler a cycle, 37.5% occupancy. Colab T4: AF2 5CAJ 10806/11156 -> 10336/1075
 two-stage kernel (it is the same arithmetic), and AF2's column attention no longer builds a zero bias for it.
 `LOCALFOLD_FLASH_2R1=0` is the old kernel.
 
+...and its biased form in 32-key tiles (the bias-free form keeps 48): `--bench-grid` on a Colab T4, against 48 for
+both, 0.79 / 0.83 / 0.93 the time at 261 / 512 / 1,024 tokens, bias-free level. Over a fold, against the kernels
+it leaves alone (a T4's clock wanders 5-10% run to run): AF2 5CAJ's biased flash -11% (1.7% of the fold), boltz2's
+trunk 2%. 16-key tiles, four warps of one query tile, and a two-stage register-staged form (two shared stages, the
+next tile through registers, one barrier a tile - byte-identical to this one at 48 keys) each won at one length and
+lost at another. 0.004 A (AF2) and 0.007 A (boltz2) from the 48-key folds. `LOCALFOLD_FLASH_2R1=48` is the old tile.
+
 The pairformer's pair in bf16 (AlphaFold 3's own activation precision), phase one: where every update a stack
 runs has a bf16 form (`pairBf16Ok`: the 128-channel fused triangle - or the T4's streaming one - the fused grid
 attention and the fused transition), the trunk converts its pair to bf16 before the 48 blocks and back after, and

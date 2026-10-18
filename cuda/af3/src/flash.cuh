@@ -1142,23 +1142,30 @@ inline bool flash2RWideKeys() {
   }();
   return v;
 }
+// (32: the biased form's 32-key tiles, the bias-free form's 48 - Colab T4 --bench-grid, against 48 for both: biased
+// 0.79 / 0.83 / 0.93 the time at 261 / 512 / 1,024 tokens, bias-free level. Four warps of one query tile each at 32
+// keys measured the same; 16 keys, and two register-staged stages (one barrier a tile), won at one length and lost at
+// another)
 inline int flash2R1Tile() {
-  static const int v = getenv("LOCALFOLD_FLASH_2R1") ? atoi(getenv("LOCALFOLD_FLASH_2R1")) : 48;
+  static const int v = getenv("LOCALFOLD_FLASH_2R1") ? atoi(getenv("LOCALFOLD_FLASH_2R1")) : 32;
   return v;
 }
 // a T4's (register-staged) unmasked 32-wide grid attention through flashGrid2R's one-stage form - two query tiles a
-// warp at a register-staged kernel's footprint (LOCALFOLD_FLASH_2R1: 0 off, 48 or 64 the key tile); false: not taken
+// warp at a register-staged kernel's footprint (LOCALFOLD_FLASH_2R1: 0 off, 32, 48 or 64 the key tile); false: not taken
 // will flash2R1Strided take this device's unmasked 32-wide attention (so a caller may pass no bias at all)
 inline bool flash2R1Takes() {
   int bk = flash2R1Tile();
-  return (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>())) || (bk == 48 && fitsSmem(fa2Stage<32, 2, 48, 2, 2>()));
+  return (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>())) || ((bk == 48 || bk == 32) && fitsSmem(fa2Stage<32, 2, 48, 2, 2>()));
 }
 template <bool NB = false>
 bool flash2R1Strided(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
                      const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
                      size_t outPosStride = 0) {
   int bk = flash2R1Tile();
-  if (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>()))
+  if (bk == 32 && NB) bk = 48;
+  if (bk == 32 && fitsSmem(fa2Stage<32, 2, 32, 2, 2>()))
+    flashGrid2RRun<32, 2, 32, 2, 2, NB, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rowStride, posStride, outRowStride, outPosStride);
+  else if (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>()))
     flashGrid2RRun<32, 2, 64, 2, 2, NB, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rowStride, posStride, outRowStride, outPosStride);
   else if (bk == 48 && fitsSmem(fa2Stage<32, 2, 48, 2, 2>()))
     flashGrid2RRun<32, 2, 48, 2, 2, NB, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rowStride, posStride, outRowStride, outPosStride);

@@ -28,8 +28,8 @@ struct Trunk {
 inline bool MSA16 = false;
 // ...and in f16 where there is no bf16 tensor core (a T4: sm_75). AF2's MSA stays below ~1,000 in magnitude (5CAJ with its
 // alignment 700, single-sequence 493, barnase-barstar 937, a 1,000-residue deep fold 518 - f16's range is 65,504), and
-// f16 holds three more mantissa bits than bf16. The bf16-only fusions (outln.cuh's bf16 MMA, sm_12x's split transition)
-// are skipped there
+// f16 holds three more mantissa bits than bf16. The bf16-only fusions (sm_12x's split transition; outln.cuh, which
+// takes f16 too and was measured slower on a T4) are skipped there
 inline bool MSA16_HALF = false;
 template <class F> inline void withMsa16(F&& f) { if (MSA16_HALF) f(half{}); else f(__nv_bfloat16{}); }
 // a weight as the MSA16 GEMMs take it: a bf16 copy, or the f16 weight itself
@@ -292,8 +292,8 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
 template <bool NB, class B16>
 inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int n, int heads, size_t rows, float scale,
                      size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
-  if (flashRegStaged())     // (a T4: the one-stage register-staged form, as its f32 MSA's attention takes)
-    flashGrid2RRun<32, 2, 48, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  if (flashRegStaged())     // (a T4: the one-stage register-staged form, its tiles as flash2R1Strided's)
+    flashGrid2RRun<32, 2, NB ? 48 : 32, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC && !NB && flash2RWideKeys())
     flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC)
@@ -451,11 +451,9 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
         // the output projection writes the column attention's LayerNorm'd rows as well (outln.cuh): no LN pass there
         const std::string ln = S + "msa_column_attention/query_norm";
         half* xn = scratch<half>("fcol.xn", rows * C);
-        if constexpr (BF) {
-          outLn256<half>(o, bf16Of(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
-                         P(ln + "/offset", blk), xn, rows);
-          EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
-        }
+        outLn256<B16, half>(o, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16,
+                            P(ln + "/scale", blk), P(ln + "/offset", blk), xn, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
         return;
       }
       ltGemm(o, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
@@ -520,13 +518,11 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
     // ...and its output projection writes the MSA transition's LayerNorm'd rows (outln.cuh), where room allows them whole
     if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
-      if constexpr (BF) {
-        const std::string ln = S + "msa_transition/input_layer_norm";
-        B16* xt = scratch<B16>("ftr.xnfull", rows * C);
-        outLn256<B16>(o, bf16Of(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
-                      P(ln + "/offset", blk), xt, rows);
-        EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
-      }
+      const std::string ln = S + "msa_transition/input_layer_norm";
+      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+      outLn256<B16, B16>(o, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16,
+                         P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
+      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
       return;
     }
     ltGemm(o, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
