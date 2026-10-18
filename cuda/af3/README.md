@@ -737,6 +737,12 @@ held one: 272 -> 219 ms over a fold's 416 calls), and `gridInK` takes 8 warps at
 where 64-column ones (78 KB) did not fit and left 4 - 1.189x -> 1.140x the transition's time (16-column stages were
 slower). Nsight Compute runs on a Colab VM as root (`/usr/local/cuda/bin/ncu`); the T4 flash kernel's stalls there
 are the two barriers a key tile (16%), the stores waiting on the register-staged tile, and spills at 168 registers.
+`gridOutK`'s next quarter is loaded into registers during this quarter's MMAs and stored after them (cp.async is a
+load and a store there, so each copy had stalled every warp between two barriers): 65.6 -> 57.8 per thousand of the
+untouched kernels' time over boltz2's 5CAJ fold, the fold 0.8%, byte-identical. 🔴 Its `if constexpr (WQ == 1)` over
+the whole-weight loop is BRACED: CUDA 12.2 here compiled it unbraced as though the X tile's loop were inside it too,
+so the A100's rehearsal of this path (`LOCALFOLD_EMULATE_CC=75`) never loaded X and the confidence pTM came out NaN;
+CUDA 13 on the T4 compiled it as written.
 ESMFold2 on a T4 ran its whole 256-channel pair track UNFUSED: `fused256Fits` asked all three of the
 8-warp kernels to fit, and none does in 64 KB. It now takes their T4 forms - the rounded input kernel, the
 output kernel's bf16 tile, and `transitionUpK` in rounds with 16-column stages (`transitionUpK<256, 16, 16,
