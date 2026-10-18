@@ -1271,6 +1271,13 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
   per-seed difference at +0.31 +- 0.7). Peak at 1044 tokens unchanged.
 - 6c239689: AF2's chunked pair transition reads its emitted input norm a chunk at a time (LayerNorm 192 -> 128 ms of a
   522-residue multimer pass).
+- 07fb8f20, 239c00ab: memory - an emitted LayerNorm goes over its emitting update's own input norm, in place (the
+  emitting GEMM covers every output column of its row block in one tile, so it has read those rows before its
+  epilogue writes them). ESMFold2 at 1044 residues 4.90 -> 4.34 GB (its fit factor 4.2 -> 3.7: the longest fold here
+  ~1,690 -> ~1,790), AF2's 4-chain templated multimer 2.76 -> 2.67 GB (its evoformer stage 2.60 -> 2.32); PDBs
+  byte-identical, time level, AF2's scribble clean. AF2 keeps every emission in ln.a, its nested family - in place into
+  a module's own scratch would not be safe there (tri.xn shares a slot with bias.pn). AF3 gains nothing: its pair
+  transition emits two norms at once, so both pr.x and pr.x2 stay.
 - Tried and dropped (attention, 38% of a 1044-token pass at 6.3 TFLOP/s): with the softmax removed entirely the two
   products run at 7.3, and each alone at ~5 - the matrix units fed from device memory, not the softmax, set the pace.
   K and V staged once a threadgroup (8% slower), static-extent key tiles (25-35% slower), a padded simdgroup leaving
@@ -1298,3 +1305,4 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
    untiled, project f32, group 1; the contraction is the open question - this M5 alone measured it).
 2. The Metal gates on f5dedde4: AF3's kitchen sink may move on the M2 too (the chunked transition's emitted norms
    reach every fold past ~300 tokens); re-record it there if it does, as here.
+3. The float path emits no norms, so 07fb8f20 / 239c00ab change nothing there - a gate run says so.
