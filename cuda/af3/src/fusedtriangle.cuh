@@ -1007,6 +1007,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
     __syncwarp();
   }
 }
+#ifndef GI_T4_NC
+#define GI_T4_NC 32
+#endif
 #ifndef GO_QUARTERS
 #define GO_QUARTERS 1
 #endif
@@ -1036,6 +1039,13 @@ inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOf
   // warps at 32-column stages 3.43, at the 64-column ones 3.63), bit-identical
   if (wide && (rows + 255) / 256 >= MIN_BLOCKS && fitsSmem(gridInSmem(16, 16))) {
     gridInAt<16, 16>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8, vt8);
+    return;
+  }
+  // a T4 (64 KB an SM): the 8-warp block at 64-column stages is 78 KB and does not fit, leaving one 4-warp block an SM;
+  // 32-column stages fit eight warps (61 KB): gridInK 1.189x -> 1.140x the fused transition's time on a Colab T4 (three
+  // alternating rounds; 16-column stages were slower), PDB byte-identical
+  if (GI_T4_NC && ccMajor() < 8 && (rows + 127) / 128 >= (size_t)MIN_BLOCKS && fitsSmem(gridInSmem(8, GI_T4_NC))) {
+    gridInAt<8, GI_T4_NC>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8, vt8);
     return;
   }
   switch (warpsFitting(warpsFor(rows, {GI_WARPS, 4, 2}), {GI_WARPS, 4, 2}, [](int w) { return gridInSmem(w); })) {
