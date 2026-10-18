@@ -45,6 +45,11 @@ import { settleGridAttendTiling } from "./grid-attend-race.js";
 
 // The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
 const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
+// The MSA rows one msa.project workgroup normalises and projects (createMsaAttentionShaders' projectRows): the value
+// and gate weights read once for all of them.
+const MSA_PROJECT_ROWS = 16;
+// (`msaProjectRows` a device tuning for the arms; 1 is the row-a-workgroup kernel)
+const msaProjectRows = (device) => deviceTuning(device).msaProjectRows ?? MSA_PROJECT_ROWS;
 
 export class Af3MsaStackGpu {
   constructor(device, options = {}) {
@@ -262,7 +267,7 @@ export class Af3MsaStackGpu {
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,
-        heads: msaHeads, dimension: msaDimension },
+        heads: msaHeads, dimension: msaDimension, projectRows: msaProjectRows(this.device) },
       packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
     for (const [name, source] of Object.entries(attentionSources)) {
       // 🔴 THE HEAD SHAPE IS IN THE KEY, and leaving it out was a real
@@ -274,7 +279,7 @@ export class Af3MsaStackGpu {
       // The OPM loop above already appends its own discriminators; this one
       // appended nothing.
       into(`msa:${name}`, `${base}:msa:${name}:${msaAttentionKeyPart(
-        { heads: msaHeads, dimension: msaDimension })}`, source);
+        { heads: msaHeads, dimension: msaDimension })}${name === "project" ? `:r${msaProjectRows(this.device)}` : ""}`, source);
     }
     into("msaTransition", `${base}:msa-transition`,
       createTransitionShader({ rows, channels: msaChannels, factor: 4 },
@@ -561,8 +566,9 @@ export class Af3MsaStackGpu {
           [attention], weightGroups[0], weightGroups[1]);
       const perRow = spread(rows);
       // ...one workgroup a row now; see the note on the kernel.
+      const perProjectTile = spread(ceil(rows, msaProjectRows(this.device)));
       run("msa.project", pipelines["msa:project"],
-          [msa, attentionWeights, msaScratch[0], msaScratch[1]], perRow[0], perRow[1]);
+          [msa, attentionWeights, msaScratch[0], msaScratch[1]], perProjectTile[0], perProjectTile[1]);
       run("msa.average", pipelines["msa:average"],
           [attention, msaScratch[0], msaScratch[1], attentionWeights, msaScratch[2]],
           perRow[0], perRow[1]);

@@ -446,6 +446,9 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 THE TRIANGLE CONTRACTION'S ARITHMETIC IN AN AF3-LINEAGE PAIR TRACK: null takes f16 where the stack's f16 policy
   // is on and the device has shader-f16 (webgpu/kernels/triangle/shaders.js); "f32" is the control arm.
   triangleContractArithmetic: null,
+  // AF3's MSA stack: the MSA rows one msa.project workgroup normalises and projects; null takes MSA_PROJECT_ROWS
+  // (webgpu/af3/trunk/msa-stack.js), 1 the row-a-workgroup kernel - the control.
+  msaProjectRows: null,
   // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the
   // control. See webgpu/af2/evoformer/block.js.
   triangleAccumulatePrecision: null,

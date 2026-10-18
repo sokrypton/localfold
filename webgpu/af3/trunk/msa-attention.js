@@ -282,6 +282,114 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
+  // 🔴 AND THE SAME PROJECTION OVER `projectRows` ROWS A WORKGROUP (shape.projectRows; 1 keeps the kernel above). One
+  // row a workgroup read the whole [C_M][2 WIDTH] value and gate matrices for one row's 2 x C_M x WIDTH multiply-adds -
+  // a weight read for every two of them, 307,200 times at 300 tokens x 1024 rows. A tile of rows reads each weight
+  // once for all of them. Bit-identical to the row-a-workgroup kernel: each row's statistics take the same reduction
+  // tree in the same order, and each output the same channel order.
+  const R = Math.max(1, shape.projectRows ?? 1);
+  const projectTiled = R === 1 ? project : `${common}
+@group(0) @binding(0) var<storage, read> msa: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gate: array<f32>;
+
+const PROJECT_ROWS: u32 = ${R}u;
+var<workgroup> normalized: array<f32, ${R * msaChannels}>;
+var<workgroup> reduce_a: array<f32, ${R * 64}>;
+var<workgroup> reduce_b: array<f32, ${R * 64}>;
+var<workgroup> stats: array<vec2<f32>, ${R}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row0 = (group.x + group.y * GRID_WIDTH) * PROJECT_ROWS;
+  if (row0 >= ROWS) { return; }
+  let local = local_id.x;
+
+  for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+    let base = min(row0 + r, ROWS - 1u) * C_M;
+    var total = 0.0;
+    var squares = 0.0;
+    for (var c = local; c < C_M; c += 64u) {
+      let value = msa[base + c];
+      total += value;
+      squares += value * value;
+    }
+    reduce_a[r * 64u + local] = total;
+    reduce_b[r * 64u + local] = squares;
+  }
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+        reduce_a[r * 64u + local] += reduce_a[r * 64u + local + stride];
+        reduce_b[r * 64u + local] += reduce_b[r * 64u + local + stride];
+      }
+    }
+    workgroupBarrier();
+  }
+${variance === "fast" ? `  if (local < PROJECT_ROWS) {
+    let mean = reduce_a[local * 64u] / f32(C_M);
+    let variance = reduce_b[local * 64u] / f32(C_M) - mean * mean;
+    stats[local] = vec2<f32>(mean, inverseSqrt(variance + EPSILON));
+  }
+  workgroupBarrier();` : `  if (local < PROJECT_ROWS) { stats[local] = vec2<f32>(reduce_a[local * 64u] / f32(C_M), 0.0); }
+  workgroupBarrier();
+  for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+    let base = min(row0 + r, ROWS - 1u) * C_M;
+    let mean = stats[r].x;
+    var centred = 0.0;
+    for (var c = local; c < C_M; c += 64u) {
+      let d = msa[base + c] - mean;
+      centred += d * d;
+    }
+    reduce_a[r * 64u + local] = centred;
+  }
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      for (var r = 0u; r < PROJECT_ROWS; r += 1u) { reduce_a[r * 64u + local] += reduce_a[r * 64u + local + stride]; }
+    }
+    workgroupBarrier();
+  }
+  if (local < PROJECT_ROWS) {
+    let variance = reduce_a[local * 64u] / f32(C_M);
+    stats[local] = vec2<f32>(stats[local].x, inverseSqrt(variance + EPSILON));
+  }
+  workgroupBarrier();`}
+  for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+    let base = min(row0 + r, ROWS - 1u) * C_M;
+    for (var c = local; c < C_M; c += 64u) {
+      normalized[r * C_M + c] = (msa[base + c] - stats[r].x) * stats[r].y * weights[W_ACT_SCALE + c]
+        + weights[W_ACT_OFFSET + c];
+    }
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < WIDTH; out += 64u) {
+    var value_total: array<f32, ${R}>;
+    var gate_total: array<f32, ${R}>;
+    for (var r = 0u; r < PROJECT_ROWS; r += 1u) { value_total[r] = 0.0; gate_total[r] = 0.0; }
+    for (var c = 0u; c < C_M; c += 1u) {
+      let wv = weights[W_V + c * WIDTH + out];
+      let wg = weights[W_GATE + c * WIDTH + out];
+      for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+        let value = normalized[r * C_M + c];
+        value_total[r] += value * wv;
+        gate_total[r] += value * wg;
+      }
+    }
+    for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+      let row = row0 + r;
+      if (row < ROWS) {
+        values[row * WIDTH + out] = value_total[r];
+        gate[row * WIDTH + out] = gate_total[r];
+      }
+    }
+  }
+}`;
+
   // The averaging and the output projection, one workgroup per MSA row.
   const average = `${common}
 @group(0) @binding(0) var<storage, read> attention: array<f32>;
@@ -322,7 +430,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { keyMask, attentionLogits, attentionWeights, project, average };
+  return { keyMask, attentionLogits, attentionWeights, project: projectTiled, average };
 }
 
 export class Af3MsaAttentionGpu {
