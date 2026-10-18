@@ -421,6 +421,12 @@ the last one's final tile and epilogue): slower, 110 -> 142 ms of the row attent
 600 with two groups a block. The kernel sits at the 168 registers that hold three blocks an SM; the per-group state
 spilled (a 192-byte stack frame against 80), and raising the cap costs the third block.
 
+The flash kernel's gate (the sigmoid factor its epilogue reads per query) is copied into the stage the last key tile
+leaves idle, under that tile's compute, where the epilogue read it from global memory and waited - for the 8-wide
+heads (the extra stack: 68 -> 63 ms of a 261-residue fold, 228 -> 224 at 600) and the bias-free column attention
+(294 -> 291 at 600). Not for the 64-key 32-wide forms (the MSA row and triangle attention): they sit at the register
+cap and the copy loop spilled them further, 366 -> 396 ms at 600. Bit-identical.
+
 **Tried and taken back: the LN of a 128-channel row by four lanes rather than a warp** (two shuffle levels where
 five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 apart, yet AF3's kitchen-sink job read
 pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a

@@ -800,6 +800,23 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
   // the first key tile's copies in flight before the queries' loads, which they overlap (they were taken after them, and
   // each block's start waited on both in turn - at 261 tokens, five key tiles a block, a tenth of its stall samples)
   if constexpr (!ONE) issue(0, 0);
+  // the gate's rows (this row group's BQ queries, D halves each) copied into the stage the last tile leaves idle, past the
+  // output's staging, under that tile's compute - the epilogue read them from global memory after the loop and waited
+  constexpr size_t YS_BYTES = (size_t)WARPS * RR * 16 * MT * (D + 8) * 2, G_OFF = (YS_BYTES + 127) / 128 * 128;
+  // (only where it measured faster: the 8-wide heads (the extra stack, 68 -> 63 ms of a 261-residue fold) and the
+  // bias-free column attention (294 -> 290 at 600); the 64-key 32-wide forms already sit at the register cap and
+  // spilled more with the copy loop - the MSA row attention 366 -> 396 ms at 600)
+  constexpr bool GATE_SM = !ONE && G_OFF + (size_t)RR * BQ * D * 2 <= STAGE && D % 8 == 0 && (D == 8 || NB);
+  int gateSt = 0;
+  auto issueGate = [&](int s) {
+    half* G = (half*)(smem + (size_t)s * STAGE + G_OFF) + (size_t)rg * BQ * D;
+    constexpr int CH = BQ * (D / 8);
+    for (int u = tr; u < CH; u += NTR) {
+      const int qi = u / (D / 8), c = (u % (D / 8)) * 8, i = q0 + qi;
+      cpAsync16(G + qi * D + c, i < n ? base + (size_t)i * posStride + 3 * Wd + c : base, i < n);
+    }
+    cpCommit();
+  };
   // ONE's halves of `issue`: its loads into registers (the same pieces, the same running pointers, the same zeros
   // past the end), and the registers into the stage
   uint4 rkv[ONE ? KV_PER : 1][2], rb[ONE && B_PER > 0 ? B_PER : 1];
@@ -877,6 +894,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
       if (tile + 1 < tiles) loadR((tile + 1) * BK);
     } else {
       if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+      else if constexpr (GATE_SM) { gateSt = st ^ 1; issueGate(gateSt); cpWait<1>(); }
       else cpWait<0>();
     }
     __syncthreads();
@@ -1017,11 +1035,20 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
     }
     __syncthreads();
   }
+  if constexpr (GATE_SM) { cpWait<0>(); __syncthreads(); }
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
     int i0 = ib[mt], i1 = i0 + 8;
     float l0 = lsum[mt][0], l1 = lsum[mt][2];
     half2 ga[D / 8], gb[D / 8];
+    if constexpr (GATE_SM) {
+      const half* G = (const half*)(smem + (size_t)gateSt * STAGE + G_OFF) + (size_t)rg * BQ * D;
+      for (int et = 0; et < D / 8; ++et) {
+        int e = et * 8 + tig * 2;
+        ga[et] = *reinterpret_cast<const half2*>(G + (i0 - q0) * D + e);
+        gb[et] = *reinterpret_cast<const half2*>(G + (i1 - q0) * D + e);
+      }
+    } else
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
       ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * posStride + 3 * Wd + e) : half2{};
