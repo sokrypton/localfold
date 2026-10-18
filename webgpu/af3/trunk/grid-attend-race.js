@@ -15,6 +15,10 @@
  * projection stays f32. 🔴 Profiled runs (`--profile`) wrap the device's passes in timestamps and the race reads them
  * wrong (f32 6.95 against f16 7.45 there) - name the arm with `--tune` when profiling.
  *
+ * ...and the triangle contraction's (`triangleContractArithmetic`, webgpu/kernels/triangle/shaders.js's f16 kernel),
+ * which was measured on the M5 alone: 0.69 against 0.51 ms at 256 tokens and 32 channels there, relRMS 6.5e-4. The
+ * three races take ~0.55 s on the M5, once a browser.
+ *
  * 🔴 AWAITED BY THE COMPILE, NOT THE DEVICE. The knob is read when a stack builds its pipelines, so a race still
  * running then would leave it unset for the fold that most wants it; a stack's compile is seconds of driver work, and
  * this is two pipelines and a few dispatches beside it. One race a device - the promise is shared - and only where
@@ -27,10 +31,11 @@
  * before.
  */
 import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention.js";
+import { createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { deviceProfile, halfPrecisionAvailable, setDeviceTuning } from "../../runtime/device-profile.js";
 
 const RACES = new WeakMap();
-const MEMORY = "localfold.gridAttendRace.v2";
+const MEMORY = "localfold.gridAttendRace.v3";
 const DETAIL = new WeakMap();
 const N = 256;
 const CHANNELS = 128;
@@ -53,6 +58,11 @@ function wantsRace(device) {
 function projectAnswer(device, half) {
   return deviceProfile(device).tuning.gridProjectArithmetic === null ? { gridProjectArithmetic: half ? "f16" : "f32" } : {};
 }
+/** ...and the triangle contraction's, the same way. */
+function contractAnswer(device, half) {
+  return deviceProfile(device).tuning.triangleContractArithmetic === null
+    ? { triangleContractArithmetic: half ? "f16" : "f32" } : {};
+}
 
 /** Which browser and GPU a remembered answer belongs to. */
 function machine(device) {
@@ -65,12 +75,14 @@ function remembered(device) {
   try {
     const stored = JSON.parse(globalThis.localStorage?.getItem(MEMORY) ?? "null");
     return stored !== null && stored.machine === machine(device) && typeof stored.tiled === "boolean"
-      && typeof stored.projectHalf === "boolean" ? stored : undefined;
+      && typeof stored.projectHalf === "boolean" && typeof stored.contractHalf === "boolean" ? stored : undefined;
   } catch { return undefined; }
 }
 
-function remember(device, tiled, projectHalf) {
-  try { globalThis.localStorage?.setItem(MEMORY, JSON.stringify({ machine: machine(device), tiled, projectHalf })); }
+function remember(device, tiled, projectHalf, contractHalf) {
+  try {
+    globalThis.localStorage?.setItem(MEMORY, JSON.stringify({ machine: machine(device), tiled, projectHalf, contractHalf }));
+  }
   catch { /* a race next visit, as before */ }
 }
 
@@ -86,16 +98,17 @@ export function settleGridAttendTiling(device) {
   if (!wantsRace(device)) return Promise.resolve();
   const known = remembered(device);
   if (known !== undefined) {
-    DETAIL.set(device, { tiled: known.tiled, projectHalf: known.projectHalf, remembered: true });
+    DETAIL.set(device, { tiled: known.tiled, projectHalf: known.projectHalf, contractHalf: known.contractHalf,
+                         remembered: true });
     setDeviceTuning(device, { gridAttendTiled: known.tiled, gridAttendTiledHalf: known.tiled,
-                              ...projectAnswer(device, known.projectHalf) });
+                              ...projectAnswer(device, known.projectHalf), ...contractAnswer(device, known.contractHalf) });
     RACES.set(device, Promise.resolve());
     return RACES.get(device);
   }
   const promise = race(device).catch((error) => {
     DETAIL.set(device, { error: String(error?.message ?? error) });
     // ...and a race that failed leaves the projection where every Apple part is safe: f32 (the M2 loses with f16)
-    setDeviceTuning(device, projectAnswer(device, false));
+    setDeviceTuning(device, { ...projectAnswer(device, false), ...contractAnswer(device, false) });
   });
   RACES.set(device, promise);
   return promise;
@@ -240,6 +253,73 @@ async function raceProject(device, buffers) {
   return { f32Ms: Number(f32Ms.toFixed(3)), f16Ms: Number(f16Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), half };
 }
 
+/** tri.contract in f32 against f16 arithmetic at N tokens, 32 channels: { f32Ms, f16Ms, relRms, half }. */
+async function raceContract(device, buffers) {
+  const CHANNELS_RACED = 32;
+  const pairs = N * N;
+  const upload = (values, extra = 0) => {
+    const buffer = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | extra,
+                                         mappedAtCreation: true });
+    new Float32Array(buffer.getMappedRange()).set(values);
+    buffer.unmap();
+    buffers.push(buffer);
+    return buffer;
+  };
+  const a = upload(noise(CHANNELS_RACED * pairs, 7, 2));
+  const b = upload(noise(CHANNELS_RACED * pairs, 8, 2));
+  const arms = await Promise.all([false, true].map(async (half) => {
+    const { contract, contractTile } = createTriangleShaders(
+      { length: N, cZ: 128, cHidden: CHANNELS_RACED }, "f32", {}, 1e-5, "outgoing", "fast", undefined, true,
+      half ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined);
+    const pipeline = await device.createComputePipelineAsync({
+      label: `tri-contract-race.${half ? "f16" : "f32"}`, layout: "auto",
+      compute: { module: device.createShaderModule({ code: contract }), entryPoint: "main" },
+    });
+    const output = upload(new Float32Array(CHANNELS_RACED * pairs), GPUBufferUsage.COPY_SRC);
+    return { half, pipeline, output, times: [],
+             groups: [Math.ceil(N / contractTile.columns), Math.ceil(N / contractTile.rows), CHANNELS_RACED],
+             bind: device.createBindGroup({
+               layout: pipeline.getBindGroupLayout(0),
+               entries: [a, b, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
+             }) };
+  }));
+  const run = async (arm, iterations) => {
+    const encoder = device.createCommandEncoder({ label: "tri-contract-race" });
+    const pass = encoder.beginComputePass({ label: "tri-contract-race" });
+    pass.setPipeline(arm.pipeline);
+    pass.setBindGroup(0, arm.bind);
+    for (let i = 0; i < iterations; i += 1) pass.dispatchWorkgroups(...arm.groups);
+    pass.end();
+    const started = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    return performance.now() - started;
+  };
+  const SAMPLE = 1 << 16;
+  const read = async (arm) => {
+    await run(arm, 1);
+    const readback = device.createBuffer({ size: SAMPLE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    buffers.push(readback);
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(arm.output, 0, readback, 0, SAMPLE * 4);
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    return values;
+  };
+  const [reference, candidate] = [await read(arms[0]), await read(arms[1])];
+  let error = 0; let scale = 0;
+  for (let i = 0; i < SAMPLE; i += 1) {
+    const d = candidate[i] - reference[i];
+    error += d * d; scale += reference[i] * reference[i];
+  }
+  const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
+  const [f32Ms, f16Ms] = await timeArms(device, arms, buffers, run);
+  const half = Number.isFinite(relRms) && relRms < 1e-2 && f16Ms < f32Ms * RACE_MARGIN;
+  return { f32Ms: Number(f32Ms.toFixed(3)), f16Ms: Number(f16Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), half };
+}
+
 async function race(device) {
   const width = HEADS * DIMENSION;
   const pairs = N * N;
@@ -328,12 +408,15 @@ async function race(device) {
     // 500 -> 328 / 344 ms a 255-token pass on the M5 and 707 / 719 -> 870 / 898 on the M2 (the device-profile note).
     // The trunk's projection (f16 staging, f32 q/k/v/gate), both arithmetics, on the same normalised pair and weights.
     const project = await raceProject(device, buffers);
+    // ...and the triangle contraction's (webgpu/kernels/triangle/shaders.js's f16 kernel), the same question again
+    const contract = await raceContract(device, buffers);
     DETAIL.set(device, { tokens: N, untiledMs: Number(untiled.toFixed(3)), tiledHalfMs: Number(tiled.toFixed(3)),
                          relRms: Number(relRms.toExponential(2)), tiled: take,
-                         samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project });
+                         samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract });
     // 🔴 BOTH WAYS, so the knob is answered and no second stack races again
-    setDeviceTuning(device, { gridAttendTiled: take, gridAttendTiledHalf: take, ...projectAnswer(device, project.half) });
-    remember(device, take, project.half);
+    setDeviceTuning(device, { gridAttendTiled: take, gridAttendTiledHalf: take, ...projectAnswer(device, project.half),
+                              ...contractAnswer(device, contract.half) });
+    remember(device, take, project.half, contract.half);
   } finally {
     for (const buffer of buffers) buffer.destroy();
   }
