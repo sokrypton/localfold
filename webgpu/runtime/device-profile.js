@@ -1310,11 +1310,12 @@ const PRIORS = new Map([
     // alternated: the block 196.0 / 194.7 ms with group 4 against 178.8 / 179.5 with 1 (+9%), the four flash kernels
     // 46.5 / 46.4 against 30.2 / 32.1; bench-msa-attention.js row 128 x 255: 19.4-20.9 against 9.6-10.3 ms. Group 1
     // stays the default; `--tune=attentionGroup=4` is the M5's arm (a race, as grid-attend-race.js, would win both).
-    // 🔴 AND THE GRID PROJECTION STAYS IN f32 HERE FOR THE SAME REASON. f752a185 made it f16 wherever the pair track
-    // stages in f16 - grid.project 475 / 500 -> 328 / 344 ms a pass on the M5 - and on the M2 it is the other way:
-    // bench-grid-project.js 255 tokens 12.2-14.9 ms in f32 against 15.1-18.7 in f16 (three runs), in the trunk
-    // grid.project 707 / 719 against 870 / 898. Only Apple's entry pins it; other f16 devices keep the rule.
-    gridProjectArithmetic: "f32",
+    // 🔴 AND THE GRID PROJECTION'S ARITHMETIC IS RACED FOR THE SAME REASON, not pinned. f752a185 made it f16 wherever
+    // the pair track stages in f16 - grid.project 475 / 500 -> 328 / 344 ms a pass on the M5 - and on the M2 it is the
+    // other way: bench-grid-project.js 255 tokens 12.2-14.9 ms in f32 against 15.1-18.7 in f16 (three runs), in the
+    // trunk grid.project 707 / 719 against 870 / 898. This entry pinned f32 for both; grid-attend-race.js now races the
+    // trunk's projection both ways beside the attend (f32 where the race fails), so the M5 takes its f16 and the M2
+    // keeps f32. Other f16 devices keep the rule.
   }],
 ], );
 

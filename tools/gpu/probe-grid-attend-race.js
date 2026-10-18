@@ -22,5 +22,6 @@ export async function main(device, args = []) {
     detail: gridAttendRaceDetail(device),
     gridAttendTiled: tuning.gridAttendTiled,
     gridAttendTiledHalf: tuning.gridAttendTiledHalf,
+    gridProjectArithmetic: tuning.gridProjectArithmetic,
   };
 }
