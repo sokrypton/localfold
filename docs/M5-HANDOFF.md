@@ -1278,6 +1278,9 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
   byte-identical, time level, AF2's scribble clean. AF2 keeps every emission in ln.a, its nested family - in place into
   a module's own scratch would not be safe there (tri.xn shares a slot with bias.pn). AF3 gains nothing: its pair
   transition emits two norms at once, so both pr.x and pr.x2 stay.
+- Tried and dropped (Metal): the grid attention's pair-bias projection (4 heads) computed by the previous update's
+  LayerNorm-emitting epilogue, from the norm in float before its rounding - the two bias GEMMs a block went (-67 ms a
+  522-token pass) and the emitting epilogues paid +21 ms; ABBA x3 on folds -0.3%, so not worth a new core API.
 - Tried and dropped (attention, 38% of a 1044-token pass at 6.3 TFLOP/s): with the softmax removed entirely the two
   products run at 7.3, and each alone at ~5 - the matrix units fed from device memory, not the softmax, set the pace.
   K and V staged once a threadgroup (8% slower), static-extent key tiles (25-35% slower), a padded simdgroup leaving
