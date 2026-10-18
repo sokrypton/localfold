@@ -427,6 +427,19 @@ heads (the extra stack: 68 -> 63 ms of a 261-residue fold, 228 -> 224 at 600) an
 (294 -> 291 at 600). Not for the 64-key 32-wide forms (the MSA row and triangle attention): they sit at the register
 cap and the copy loop spilled them further, 366 -> 396 ms at 600. Bit-identical.
 
+The MSA16 stack's two attention output projections emit the NEXT module's LayerNorm (src/outln.cuh): the row
+attention's writes the column attention's LN'd rows, the column attention's the MSA transition's, where each of those
+ran a LayerNorm pass over the whole MSA. One kernel - the projection (bf16 MMA, 64 rows x 256 columns a block), then a
+row pass adding bias and residual, rounding, writing the MSA and LayerNorming the rounded row - against cuBLASLt's
+GEMM plus the pass it removes: roughly level per call (its residual loads, one row at a time, were 44% of its stall
+samples until every row's load was put in flight first), so the fold gains little: 5CAJ 1.398 -> 1.389 s, 600 deep
+4.565 -> 4.556, 1,000 deep level. 5CAJ 0.008-0.016 A from the previous build. The single-sequence 5CAJ gate case
+(pLDDT 31, 18-21 A from the crystal across seeds) moved within its own seed spread and was re-recorded.
+
+cuBLASLt's other heuristic algorithms, timed against its first pick on the MSA's GEMM shapes (q/k/v/gate, the
+transition's two, the output projection, at 261 and 600 residues): the first pick is the fastest of up to 16 in every
+case, so autotuning `ltGemm` would buy nothing.
+
 **Tried and taken back: the LN of a 128-channel row by four lanes rather than a warp** (two shuffle levels where
 five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 apart, yet AF3's kitchen-sink job read
 pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a

@@ -4,6 +4,7 @@
 #include "fast.cuh"
 #include "flash2.cuh"
 #include "globalattn.cuh"
+#include "outln.cuh"
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
@@ -429,6 +430,15 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
       msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
+      if (C == oln::C && Wp == oln::C) {
+        // the output projection writes the column attention's LayerNorm'd rows as well (outln.cuh): no LN pass there
+        const std::string ln = S + "msa_column_attention/query_norm";
+        half* xn = scratch<half>("fcol.xn", rows * C);
+        outLn256<half>(o, bf16Of(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
+                       P(ln + "/offset", blk), xn, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
+        return;
+      }
       ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, true);
       return;
     }
@@ -478,13 +488,23 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     AttnW w = attnWeights(A + "/attention", blk, C);
     int Wp = w.H * w.Dp, stride = (rowsN + 7) / 8 * 8;
     half* xn = scratch<half>("fcol.xn", rows * C);
-    layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
-                                                                              P(A + "/query_norm/offset", blk));
+    if (takeEmittedLn(A + "/query_norm", blk, msa, rows) != xn)
+      layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
+                                                                                P(A + "/query_norm/offset", blk));
     half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
     ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
     B16* o = scratch<B16>("fatt.o16", rows * Wp);
     msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
+    // ...and its output projection writes the MSA transition's LayerNorm'd rows (outln.cuh), where room allows them whole
+    if (C == oln::C && Wp == oln::C && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+      const std::string ln = S + "msa_transition/input_layer_norm";
+      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+      outLn256<B16>(o, bf16Of(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk),
+                    P(ln + "/offset", blk), xt, rows);
+      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+      return;
+    }
     ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, true);
     return;
   }
@@ -577,11 +597,14 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
       B16* mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
       const B16* w1 = bf16Of(PH(T + "/transition1/weights", blk), (size_t)C * I);
       const B16* w2 = bf16Of(augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), (size_t)(I + 8) * C);
+      const B16* emitted = (const B16*)takeEmittedLn(T + "/input_layer_norm", blk, x, rows);
       for (size_t r0 = 0; r0 < rows; r0 += chunk) {
         size_t r = std::min(chunk, rows - r0);
-        layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
-                                                                              P(T + "/input_layer_norm/offset", blk));
-        ltGemm(xh, w1, mh, false, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, true);
+        const B16* xin = emitted ? emitted + r0 * C : xh;
+        if (!emitted)
+          layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
+                                                                                P(T + "/input_layer_norm/offset", blk));
+        ltGemm(xin, w1, mh, false, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, true);
         ltGemm(mh, w2, x16 + r0 * C, false, r, I + 8, C, nullptr, false, 1.f, 0, 0, true);
       }
       return;
