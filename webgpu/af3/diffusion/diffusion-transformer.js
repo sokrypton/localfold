@@ -72,6 +72,19 @@ import { shapedKnob } from "../../runtime/device-profile.js";
  */
 export const PAIR_LOGITS_CACHE_BYTES = 64 * 1024 * 1024;
 
+/**
+ * The bytes a schedule may hold in cached pair attention biases on this device: the tuning's, else - where the device
+ * has a memory budget (the page always sets one: device.js) - half of what is left under it and at least the
+ * constant, else the constant.
+ */
+export function pairLogitsCacheBytes(device) {
+  const tuned = deviceTuning(device).pairLogitsCacheBytes;
+  if (tuned !== null && tuned !== undefined) return Number(tuned);
+  const { residentBytes, budgetBytes } = memoryTotals(device);
+  if (budgetBytes === undefined || budgetBytes === null) return PAIR_LOGITS_CACHE_BYTES;
+  return Math.max(PAIR_LOGITS_CACHE_BYTES, Math.floor((budgetBytes - residentBytes) / 2));
+}
+
 const GRID_WIDTH = 32_768;
 
 export const BLOCK_ORDER = [
@@ -2738,10 +2751,14 @@ export class Af3DiffusionTransformerGpu {
       // PAIR_LOGITS_CACHE_BYTES worth of them buys that fraction of the time
       // for a bounded amount of memory: every block at 208 tokens or fewer,
       // a quarter of them at 400.
-      const cacheBytes = Number(deviceTuning(this.device).pairLogitsCacheBytes
-        ?? PAIR_LOGITS_CACHE_BYTES);
-      const cached = Math.max(0,
-        Math.min(blockCount, Math.floor(cacheBytes / logitsBytes)));
+      // 🔴 AND WHERE THE DEVICE HAS A BUDGET, HALF THE ROOM LEFT UNDER IT, decided once a schedule (the cache's own
+      // buffers are resident from the first call on, and a size re-derived every call would rebuild it every call).
+      // The constant was a guess at what a long fold can spare; the budget is the page's own answer. The cache is
+      // released with the head, before the confidence head allocates. AF3 int5 at 522 tokens on an M5 (stock Chrome,
+      // 25 steps): the sampler 8.0 -> 7.0 s with all twenty-four blocks held, 399 MiB of them.
+      const cached = this.#pairCondSeen === pairCond && this.#pairLogits?.bytes === logitsBytes
+        ? this.#pairLogits.buffers.length
+        : Math.max(0, Math.min(blockCount, Math.floor(pairLogitsCacheBytes(this.device) / logitsBytes)));
       const buildPairLogits = this.#pairCondSeen !== pairCond
         || this.#pairLogits?.ready !== true
         || this.#pairLogits.bytes !== logitsBytes

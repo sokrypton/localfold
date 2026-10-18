@@ -3435,6 +3435,13 @@ to check it compared two PDB captures that were both EMPTY - `fold.js --folds=1`
 prints JSON and the grep matched nothing - and reported "STRUCTURE IDENTICAL",
 which is this repository's "a gate that cannot fail is not a gate" in one line.
 
+🔴 **AND ON THE PAGE THE BUDGET SIZES IT NOW** (2026-10-19). The page always runs under a memory budget
+(`budgetForDevice`, a third of `navigator.deviceMemory`), so where no tuning names a size the cache takes half of the
+room left under that budget, never less than the constant, decided once a schedule (`pairLogitsCacheBytes` in
+diffusion-transformer.js). A tool with no budget keeps the constant. AF3 int5 at 522 tokens on an M5, stock Chrome, 25
+steps: the sampler **8.0 -> 6.8-7.0 s** with all twenty-four blocks held (399 MiB), the fold's peak 814 -> 1100 MiB
+under a 1365 MiB budget, pLDDT to the digit. It is released with the head, before the confidence head allocates.
+
 ## The outer product mean's block was fitted at 150 tokens and inverts at 300
 
 `OPM_BLOCK_I` is 2 and its note reasons from "the workgroup count still wins at
