@@ -1317,6 +1317,13 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
   2 at 256 and 400 tokens (level here), and on Metal AF2's MSA norms emitted by the 256-wide GEMMs (LayerNorm 233 -> 92
   ms of a 261 x 1500-row pass, but the emitting epilogues cost 113 ms more: net -0.7%, not kept).
 
+**Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
+at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
+The one large gap left is Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass): its two products alone, with
+the softmax removed, reach only 7.3 - the matrix units fed from device memory set that pace, and staging K and V through
+threadgroup memory lost. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,
+test:stock, test:template, test:ligand, test:modified, test:cache, and fold-in-page.py for AF3, EF2-fast and AF2.
+
 **For the M2**
 1. `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js`: the four races' answers there (expected: attend
    untiled, project f32, group 1; the contraction is the open question - this M5 alone measured it).
