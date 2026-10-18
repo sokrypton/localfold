@@ -453,7 +453,10 @@ async function race(device) {
                          samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract,
                          group });
     // 🔴 BOTH WAYS, so the knob is answered and no second stack races again
-    setDeviceTuning(device, { gridAttendTiled: take, gridAttendTiledHalf: take, ...projectAnswer(device, project.half),
+    // (each answer only where nothing named it while the race ran - a race now starts with the page's device)
+    const unnamed = deviceProfile(device).tuning.gridAttendTiled === null && deviceProfile(device).tuning.gridAttendTiledHalf === null;
+    setDeviceTuning(device, { ...(unnamed ? { gridAttendTiled: take, gridAttendTiledHalf: take } : {}),
+                              ...projectAnswer(device, project.half),
                               ...contractAnswer(device, contract.half), ...groupAnswer(device, group?.group ?? 1) });
     remember(device, take, project.half, contract.half, group?.group ?? 1);
   } finally {

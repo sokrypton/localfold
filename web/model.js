@@ -23,6 +23,7 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
   from "../shared/bundles/manifests/index.js";
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
+import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
@@ -177,6 +178,11 @@ export function getDevice() {
     // ...so the footer's timing panel can read this device's memory counters.
     // It reads them; it does not install anything on the device.
     devUseDevice(device);
+    // 🔴 THE DEVICE'S RACES START NOW, NOT AT THE FIRST PAIR TRACK'S COMPILE. An Apple GPU races four kernel forms once
+    // a browser (~0.4 s on an M5; webgpu/af3/trunk/grid-attend-race.js) and a stack awaits the answer before it
+    // compiles - started here, they run under the weights' download instead of in front of the fold. Not awaited; the
+    // promise is the one the stacks await.
+    settleGridAttendTiling(device);
     return device;
   })();
   return devicePromise;

@@ -2930,10 +2930,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // overwrite each other, and the message that loses is the one about the
   // server that might be queuing for a minute. The download reports itself on
   // the right instead, dial and label both.
+  // (the device asked for first, so an Apple GPU's kernel races run under the weights' download: web/model.js)
+  const deviceStarted = getDevice();
+  deviceStarted.catch(() => {});
   const weights = await (modelLoad ?? loadAf3Weights());
   throwIfAborted(signal);
 
-  const device = await getDevice();
+  const device = await deviceStarted;
   throwIfAborted(signal);
 
   predictionCount += 1;

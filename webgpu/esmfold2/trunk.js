@@ -61,6 +61,7 @@ import {
   UNPACKED_PAIR_SCRATCH,
   compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "../af3/trunk/pair-track.js";
+import { settleGridAttendTiling } from "../af3/trunk/grid-attend-race.js";
 
 /** ESMFold2-Experimental-Fast's `d_pair`. */
 export const PAIR_CHANNELS = 256;
@@ -246,6 +247,8 @@ export class Esmfold2TrunkGpu {
             tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
             ...narrowed }
         : false;
+    // (this device's raced answers - the contraction's arithmetic among them - before anything compiles)
+    await settleGridAttendTiling(this.device);
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, base, channels,
       triangleProjectTile: shapedKnob(tuning.trianglePairProjectTile),
