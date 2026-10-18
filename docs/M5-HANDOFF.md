@@ -1258,3 +1258,34 @@ the full gate again both pass. Not chased yet - if the M5 sees a server exit wit
   1.47/0.257; openbind0 1.86/0.104, 1.82/0.072, 1.91/0.081 against 1.87/0.072, 1.82/0.085, 1.87/0.069. So the new
   default places boltz2's ligand better and rosettafold3's backbone worse on this target (boltz2's slightly worse
   too); still one target and three seeds - the call on rosettafold3's default is not made here.
+
+## 2026-10-19, unattended: speed and memory again (Metal and WebGPU)
+
+Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commits carry the numbers.
+
+**Metal**
+- f5dedde4: the triangle's dual GEMM sums its gate in half (440 -> 372 ms a 522-token AF3 pass, CA 0.002 A);
+  attention v3 loads its queries once into a cooperative tensor (byte-identical, 1-2% of the kernel); and AF3's pair
+  transition, which runs in row chunks past ~300 tokens, keeps both emitted LayerNorms there (LayerNorm 196 -> 89 ms a
+  pass). Trunk at 522 tokens -2.4% (ABBA x3). The M5's kitchen sink re-recorded (70.05 -> 70.58; six seeds put the
+  per-seed difference at +0.31 +- 0.7). Peak at 1044 tokens unchanged.
+- 6c239689: AF2's chunked pair transition reads its emitted input norm a chunk at a time (LayerNorm 192 -> 128 ms of a
+  522-residue multimer pass).
+- Tried and dropped (attention, 38% of a 1044-token pass at 6.3 TFLOP/s): with the softmax removed entirely the two
+  products run at 7.3, and each alone at ~5 - the matrix units fed from device memory, not the softmax, set the pace.
+  K and V staged once a threadgroup (8% slower), static-extent key tiles (25-35% slower), a padded simdgroup leaving
+  early (level); the 32 x 32 / 16 x 64 tile rule re-swept from 168 to 1200 tokens and still within noise of the best.
+
+**WebGPU** (stock Chrome)
+- cfae903e: the diffusion transformer's pair-logits cache sized from the page's memory budget (half the room left
+  under it): AF3 at 522 tokens, 25 steps, the sampler 8.0 -> 6.8-7.0 s; peak 814 -> 1100 MiB under a 1365 MiB budget.
+- f6d977c2: the triangle contraction in f16 arithmetic (16-term f16 partial sums, operands scaled by 2^-4 so
+  IntelliFold-2's products cannot overflow): tri.contract 861 -> 646 ms of 12 blocks at 522 tokens, the pass -3.5%.
+- 7b27e461, 954c8e8d: grid.project's f16 and the contraction's f16 are now RACED per device beside grid.attend's
+  tiling (grid-attend-race.js), so the M5 takes f16 (grid.project 264 -> 192 ms at 255 tokens) and the M2 can keep f32.
+
+**For the M2**
+1. `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js`: the three races' answers there (expected: attend
+   untiled, project f32; the contraction is the open question - this M5 alone measured it).
+2. The Metal gates on f5dedde4: AF3's kitchen sink may move on the M2 too (the chunked transition's emitted norms
+   reach every fold past ~300 tokens); re-record it there if it does, as here.
