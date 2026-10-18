@@ -243,7 +243,7 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk)
   half* mid = scratch<half>("tr.mid", chunk * I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
-    const half* in = r0 == 0 && r == rows && emittedIn ? emittedIn : xn;
+    const half* in = emittedIn ? emittedIn + r0 * C : xn;     // (the emitted norm read a chunk at a time)
     if (in == xn) layerNormW(x + r0 * C, xn, r, C, T + "/input_layer_norm", blk);
     Gemm g{}; g.X = in; g.tx = F16; g.W = PH(T + "/transition1/weights", blk); g.tw = F16; g.Y = mid; g.ty = F16;
     g.rows = r; g.in = C; g.out = I; g.bias = P(T + "/transition1/bias", blk); g.relu = true; g.label = "transition1";
