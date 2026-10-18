@@ -519,27 +519,37 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     __syncthreads();
     bool gating = j >= abSteps;
     const half *w0 = W0(st), *w1 = W1(st);
+    // the biases read BEFORE the MMAs (their global latency hidden behind them), as gridInK's
+    float2 bp[NC / 8], bq[NC / 8];
+    if constexpr (BIAS) {
+#pragma unroll
+      for (int nt = 0; nt < NC / 8; ++nt) {
+        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
+        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
+        bp[nt] = *reinterpret_cast<const float2*>(bias + col); bq[nt] = *reinterpret_cast<const float2*>(bias + qcol);
+      }
+    }
     float p[MT][NC / 8][4] = {}, q[MT][NC / 8][4] = {};
+    // each k step's two weight fragments loaded a step ahead (the helpers are asm volatile, issued in the order written:
+    // read just before their MMAs, those MMAs waited on the ldmatrix - the kernel's top stall); each sum's k order unchanged
+    const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+    uint32_t f0[2][4], f1[2][4];
+    ldsm4t(f0[0], w0 + sw(kl, cl)); ldsm4t(f1[0], w1 + sw(kl, cl));
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
-      int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), c = (lane >> 4) * 8;
-      uint32_t f0[4];
-      ldsm4t(f0, w0 + sw(k, c));
+      const int cur = ks & 1;
+      if (ks + 1 < KS) { ldsm4t(f0[cur ^ 1], w0 + sw((ks + 1) * 16 + kl, cl)); ldsm4t(f1[cur ^ 1], w1 + sw((ks + 1) * 16 + kl, cl)); }
 #pragma unroll
-      for (int mt = 0; mt < MT; ++mt) { mma16816(p[mt][0], xa[mt][ks], f0[0], f0[1]); mma16816(p[mt][1], xa[mt][ks], f0[2], f0[3]); }
-      uint32_t f1[4];
-      ldsm4t(f1, w1 + sw(k, c));
+      for (int mt = 0; mt < MT; ++mt) { mma16816(p[mt][0], xa[mt][ks], f0[cur][0], f0[cur][1]); mma16816(p[mt][1], xa[mt][ks], f0[cur][2], f0[cur][3]); }
 #pragma unroll
-      for (int mt = 0; mt < MT; ++mt) { mma16816(q[mt][0], xa[mt][ks], f1[0], f1[1]); mma16816(q[mt][1], xa[mt][ks], f1[2], f1[3]); }
+      for (int mt = 0; mt < MT; ++mt) { mma16816(q[mt][0], xa[mt][ks], f1[cur][0], f1[cur][1]); mma16816(q[mt][1], xa[mt][ks], f1[cur][2], f1[cur][3]); }
     }
     if constexpr (BIAS) {
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
-        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
-        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
-        float b0 = bias[col], b1 = bias[col + 1], g0 = bias[qcol], g1 = bias[qcol + 1];
+        float b0 = bp[nt].x, b1 = bp[nt].y, g0 = bq[nt].x, g1 = bq[nt].y;
         p[mt][nt][0] += b0; p[mt][nt][1] += b1; p[mt][nt][2] += b0; p[mt][nt][3] += b1;
         q[mt][nt][0] += g0; q[mt][nt][1] += g1; q[mt][nt][2] += g0; q[mt][nt][3] += g1;
       }

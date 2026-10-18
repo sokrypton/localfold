@@ -372,6 +372,43 @@ Drift against the bf16 contraction: 5CAJ and 1TIM with their alignments 0.016-0.
 rounded through e4m3), 1QYS moves 0.032 A against TF32's 0.015 and its RMSD to the crystal is unchanged (1.229 ->
 1.222 A).
 
+### The extra stack's column global attention and row attention, fused; two input kernels' latency (2026-10-18)
+
+The extra stack (5,120 rows at 64 channels) was a quarter of a fold at 261 residues: 22.3 ms a block, of which the
+column global attention was **7.9 ms** - eleven f32 passes over the extra MSA (transposed to columns and back, a
+LayerNorm, the attention one block a column recomputing every key and value from 64 channels, the gate and output
+GEMMs and their bias passes). It is four kernels now, on the MSA in its own layout (src/globalattn.cuh): the LN and
+`[k | v | gate]` on the tensor cores with the masked column sums for the query, the query, a block a column's online
+softmax over its 16 key-and-value floats a row, and the gated output projection added into the MSA. **~0.6 ms a
+call.** Its column sums are atomics, so a fold is no longer bit-for-bit repeatable there (5CAJ: 0.008-0.016 A, run to
+run as well as against the old form). The extra row attention takes cuda/af3's `gridInK` at 64 channels for its LN
+and q/k/v/gate (one pass where a LayerNorm pass and cuBLAS's GEMM were) and `projAdd64K` for its output projection
+into the f32 MSA (one pass where cuBLASLt's f32-output GEMM ran a GEMM and then its epilogue over the whole MSA).
+
+Two shared input kernels were waiting on loads they could have issued earlier: `gridInK` read AF2's gate bias from
+global memory AFTER its MMAs, so the adds stalled on it (a fifth of the kernel's stall samples, Nsight Compute at 600
+residues), and `triIn256K` read each weight fragment just before the MMAs using it (the helpers are `asm volatile`,
+issued in the order written). Both read ahead now: `gridInK` 288 -> 191 ms over a 600-residue fold, `triIn256K` 2%,
+**byte-identical** (AF3's gate unmoved to the digit).
+
+A100, 4 passes, 508 clusters and 5,120 extra rows, a resident server's third job:
+
+| | before | after |
+|---|---:|---:|
+| 5CAJ (261 res, its 7,907-row alignment) | 1.522 s | **1.404 s** |
+| 600 res, single sequence | 1.74 s | **1.67 s** |
+| 600 res, 6,000-row alignment | 4.87 s | **4.57 s** |
+| 1,000 res, 6,000-row alignment | ~11.9 s | **11.27 s** |
+| 1,500 res, 6,000-row alignment | | 25.1 s |
+
+5CAJ against its crystal 1.81-1.84 A on three seeds either way, pLDDT and pTM unchanged.
+
+**Tried and taken back: the LN of a 128-channel row by four lanes rather than a warp** (two shuffle levels where
+five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 apart, yet AF3's kitchen-sink job read
+pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a
+lane (1%, within the drift), nor 48-key tiles for the MSA row attention where 64 pad more (261 residues: no change -
+its rate there is not the padding).
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre

@@ -89,6 +89,18 @@ At the limit the diffusion keeps the f16 LayerNorm'd pair (256 bytes a pair), th
 (64), and its per-block biases. CUDA rebuilds the biases of one block at a time (not a super block's four) where even a
 super block's set does not fit beside the f16 pair: bit-identical, one buffer instead of four.
 
+## 7. The extra stack's global attention and row attention (2026-10-18)
+
+CUDA's column global attention on the 5,120-row extra MSA had been eleven f32 passes with two transposes (7.9 ms a call
+at 261 residues); it is four kernels now (cuda/af2/src/globalattn.cuh), ~0.6 ms. metal/af2 never had the transposes -
+it already runs in the MSA's own layout with the keys and values from one GEMM - but it still writes the LN'd rows,
+the f32 gate and the gated rows as passes of their own. What CUDA fuses beyond that: the LN, `[k | v | gate]` and the
+query's masked column sums in ONE pass over the rows (the sums per block, then one atomic a column-channel), and the
+gate times the column average, the output projection, its bias and the residual in another. The extra row attention's
+LN + q/k/v/gate is one pass too (`gridInK` at 64 channels), and its output projection adds into the f32 MSA in one
+(`projAdd64K`) where a GEMM with an f32 output ran an epilogue pass over the whole MSA. Together ~7% of a 261-residue
+fold on the A100.
+
 ## What did not transfer from `metal` to CUDA (measured on the A100)
 
 | `metal` idea | CUDA |

@@ -1,8 +1,8 @@
 {
  "1brs-multimer": {
-  "plddt": 38.56,
-  "ptm": "0.1940",
-  "rmsd": 17.167
+  "plddt": 38.69,
+  "ptm": "0.1905",
+  "rmsd": 16.264
  },
  "1brs-multimer-template": {
   "plddt": 95.5,

@@ -111,7 +111,7 @@ def oracle_cases():
 
 
 def run_oracle(data, fast):
-    cmd = [os.path.join(HERE, "esmfold2"), data, f"--weights={os.path.join(HERE, 'weights')}",
+    cmd = [os.path.join(HERE, "localfold-ef2"), data, f"--weights={os.path.join(HERE, 'weights')}",
            f"--oracle={data}/oracle-f32att", "--atom-f32", f"--out={TMP}/oracle.pdb"] + (["--fast"] if fast else [])
     p = subprocess.run(cmd, capture_output=True, text=True)
     text = p.stdout + p.stderr

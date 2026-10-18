@@ -3,6 +3,7 @@
 #pragma once
 #include "fast.cuh"
 #include "flash2.cuh"
+#include "globalattn.cuh"
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
@@ -432,6 +433,22 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       return;
     }
     bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
+    // the extra stack's shape (64 channels, eight unpadded heads of eight): the LN and the q/k/v/gate projection in
+    // one pass, and the output projection added into the MSA in one (globalattn.cuh) - where room allows all its rows
+    if (C == ga::C && H == ga::H && D == ga::D) {
+      const float* keyMask = ones ? nullptr : msaMask;
+      AttnW w = attnWeights(R + "/attention", blk, C, flashNarrow(keyMask));
+      const int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
+      const size_t need = (rows + 128) * 4 * Wp * 2 + rows * Wp * 2;
+      if (Wp == ga::H * ga::D && (!AF2_TIGHT || roomFor(need, { "fatt.qkvg", "fatt.o", "fatt.tmp" }))) {
+        half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+        lnQkvg64(msa, P(R + "/query_norm/scale", blk), P(R + "/query_norm/offset", blk), w.qkvg, w.qkvgBias, qkvg, 0, rows);
+        half* o = scratch<half>("fatt.o", rows * Wp);
+        flashGrid<half>(qkvg, bias, stride, keyMask, o, L, w.H, w.Dp, 0, rowsN, false, 1.f / sqrtf((float)w.D));
+        projAdd64(o, w.out, P(R + "/attention/output_b", blk), msa, rows);
+        return;
+      }
+    }
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
     attentionCore(xn, rowsN, L, C, R + "/attention", blk, ones ? nullptr : msaMask, bias, msa, false);
@@ -499,6 +516,8 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_global_attention";
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3), Wd = H * D;
+  // --fast at the extra stack's shape: fused, in the MSA's own layout (globalattn.cuh)
+  if (FAST && C == ga::C && H == ga::H && D == ga::D) { globalAttentionFused(msa, msaMask, L, rowsN, A, blk); return; }
   float* tr = scratch<float>("gcol.tr", rows * C); float* xn = scratch<float>("gcol.xn", rows * C);
   float* mt = scratch<float>("gcol.mask", rows);
   swap01(msa, tr, rowsN, L, C);

@@ -807,6 +807,13 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
 #endif
     __syncthreads();
     const half* w = Wst + st * C * LDW;
+    // the bias read BEFORE the MMAs, so its global latency hides behind them: read after, the adds waiting on it were a
+    // fifth of the kernel's stall samples (ncu, AF2 at 600 residues); the same adds, so byte-identical
+    float2 qbv[NC / 8];
+    if (qb) {
+#pragma unroll
+      for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = *reinterpret_cast<const float2*>(qb + j * NC + nt * 8 + tig * 2);
+    }
     float acc[NC / 8][4] = {};
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
@@ -820,8 +827,7 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
     if (qb) {
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
-        int c = j * NC + nt * 8 + tig * 2;
-        float b0 = qb[c], b1 = qb[c + 1];
+        float b0 = qbv[nt].x, b1 = qbv[nt].y;
         acc[nt][0] += b0; acc[nt][1] += b1; acc[nt][2] += b0; acc[nt][3] += b1;
       }
     }
