@@ -118,8 +118,8 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
-4. **Attention** - MSA row (with pair bias), MSA column, and both triangle attentions. The flash forward exists;
-   the backward does not, and `native/flash_bwd_body.cuh` is 46 KB of what it takes.
+4. **Attention** - MSA row (with pair bias), MSA column, and both triangle attentions. The core backward is
+   **DONE**, see below; the module around it (q/k/v projections, the gate, the output projection) is composition.
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
    differentiable.
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
@@ -220,3 +220,36 @@ This is where the Evoformer's **O(N^3)** lives, so the shape of the backward mat
 **~360 MB at N=192, C=I=128** and over a gigabyte at N=384. `metal/core` has `shareScratch` for exactly this - the
 forward's stage families already share slots - and none of it has been applied here yet. Correctness first, but this
 is the ceiling that will bite before the stack runs end to end on 16 GB.
+
+### Stage 4, landed: the attention backward, flash-shaped
+
+**219 cases, all passing.** `attentionFwdSaved` and `attentionBwd`, over five kernels (`lf_attn_ref_fwd`,
+`lf_attn_drow`, `lf_attn_bwd_dq`, `lf_attn_bwd_dkv`, `lf_attn_bwd_dbias`). All four gradients - dq, dk, dv and the
+non-batched pair bias - agree with central difference at **5.3e-8 to 7.8e-7**, and the reference forward agrees with
+a double host forward at **1.0e-7**.
+
+**Nothing here stores a score, and that is forced rather than chosen.** The attention weights are `[B][H][Q][K]`, and
+in a triangle attention `b` runs over residues too, so that buffer is **O(N^3)** - 113 MB at N=192 with four heads -
+which AGENTS.md forbids outright. So every pass recomputes `s` from q and k. The saved **logsumexp** `L[b][h][q]` is
+what makes that cheap: with it a pass needs no row maximum, just `p = exp(s - L)`.
+
+**Three passes, because of who accumulates over what.** This is the part worth understanding before touching it:
+
+| pass | a simdgroup owns | inner loop | why |
+| --- | --- | --- | --- |
+| `dq` | `(b, h, q)` | k | dq accumulates over k |
+| `dk`, `dv` | `(b, h, k)` | q | both accumulate over **q**, so q cannot be the outer axis |
+| `dPairBias` | a thread per `(h, q, k)` | b | the bias is **shared across b**, so its gradient sums over b |
+
+The obvious single-pass alternative - write `dS` once and let the other reductions read it - is precisely the
+O(N^3) buffer that is not allowed. Three passes recompute the scores three times; fusing `dq` with `dPairBias` under
+a deterministic tree reduction over b is the optimisation left on the table, and it is not worth doing before the
+stack runs end to end. No pass uses an atomic, so all of it stays deterministic.
+
+**One thing that needs a core change later:** `metal/core`'s tuned `attention()` does not return the logsumexp, so
+the backward cannot be paired with it yet - `attentionFwdSaved` here is a correct but untuned stand-in (a simdgroup a
+query, no simdgroup matrices, scores recomputed twice in the forward). Saving `L` from the real flash forward is the
+cheap fix and the right one; writing a second tuned attention would not be.
+
+Held to `D <= 64` (a lane carries at most two channels), which covers every AF2 head here: 32 for the triangle and
+MSA row/column, 8 for the extra-MSA stack.

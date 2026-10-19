@@ -43,6 +43,36 @@ struct MulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
 // strided by C and the product cannot be one GEMM.
 struct TriPackArgs { CP(float) src; DP(float) dst; u64 n; u64 n2; uint C; uint pad; };
 
+// ---------------------------------------------------------------- attention, forward-saved and backward
+// The forward, AF2's (modules.py:336-364), with q ALREADY SCALED by key_dim^-0.5 as it scales it:
+//   s[b][h][q][k] = dot(q[b][q][h], k[b][k][h]) + maskBias[b][k] + pairBias[h][q][k]
+//   out[b][q][h][c] = sum_k softmax_k(s)[k] * v[b][k][h][c]
+// `maskBias` is the per-key mask bias and `pairBias` the non-batched bias AF2 adds from the pair representation -
+// shared across b, so its gradient is a sum over b. Either may be null.
+//
+// WHY THIS IS FLASH-SHAPED AND NOT MATERIALISED. The weights are [B][H][Q][K], and for a triangle attention b runs
+// over residues too, so that is O(N^3) - 113 MB at N=192 with four heads, and AGENTS.md forbids it outright. So
+// nothing here stores a score: every pass recomputes s from q and k, which is what the saved logsumexp L is for.
+//
+// THREE PASSES, each deterministic and none needing an atomic:
+//   dq        a simdgroup a (b, h, q), looping k
+//   dk, dv    a simdgroup a (b, h, k), looping q      (dk and dv accumulate over q, so q must be the inner axis)
+//   dPairBias a thread a (h, q, k), looping b         (shared across b, so b must be the inner axis)
+// The alternative - one pass writing dS for the others to read - is exactly the O(N^3) buffer that is not allowed.
+// Three passes recompute the scores three times; a fused pass with a tree reduction over b is the optimisation this
+// leaves, and it is not worth doing before the stack runs end to end.
+//
+// Layouts: q/k/v/out/dOut are [B][pos][H][D] (AF2's 'bqhc'); L and Drow are [B][H][Q]; pairBias is [H][Q][K];
+// maskBias is [B][K]. D <= 64 (a lane holds at most two channels).
+struct AttnBwdArgs {
+  CP(float) q; CP(float) k; CP(float) v;
+  CP(float) maskBias; CP(float) pairBias;
+  CP(float) out; CP(float) L; CP(float) Drow; CP(float) dOut;
+  DP(float) wout; DP(float) wL;                 // the reference forward's outputs
+  DP(float) dq; DP(float) dk; DP(float) dv; DP(float) dPairBias;
+  u64 n; uint B, Q, K, H, D, pad;
+};
+
 // ---------------------------------------------------------------- OuterProductMean (Alg. 10)
 // The forward, as AF2 writes it (modules.py:1157-1212):
 //   act    = LayerNorm(msa)                            [S][N][Cm]

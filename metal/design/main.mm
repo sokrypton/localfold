@@ -546,6 +546,106 @@ static void opmCase(size_t S, int N, int Cm, int O, int F, int tile) {
   release(gdBl); release(gdWr); release(gdBr); release(gdWo); release(gdBo);
 }
 
+// ---------------------------------------------------------------- attention
+// out[b][q][h][c] = sum_k softmax_k(dot(q,k) + maskBias[b][k] + pairBias[h][q][k]) * v[b][k][h][c]
+static void attnForward(const std::vector<double>& q, const std::vector<double>& k, const std::vector<double>& v,
+                        const std::vector<double>& mb, const std::vector<double>& pb,
+                        int B, int Q, int K, int H, int D, std::vector<double>& out) {
+  auto at = [&](const std::vector<double>& t, int b, int pos, int h, int c, int P) {
+    return t[(((size_t)b * P + pos) * H + h) * D + c];
+  };
+  out.assign((size_t)B * Q * H * D, 0.0);
+  std::vector<double> s(K);
+  for (int b = 0; b < B; ++b)
+    for (int h = 0; h < H; ++h)
+      for (int qq = 0; qq < Q; ++qq) {
+        double mx = -1e300;
+        for (int kk = 0; kk < K; ++kk) {
+          double d = 0;
+          for (int c = 0; c < D; ++c) d += at(q, b, qq, h, c, Q) * at(k, b, kk, h, c, K);
+          d += mb[(size_t)b * K + kk] + pb[((size_t)h * Q + qq) * K + kk];
+          s[kk] = d;
+          mx = std::max(mx, d);
+        }
+        double tot = 0;
+        for (int kk = 0; kk < K; ++kk) { s[kk] = exp(s[kk] - mx); tot += s[kk]; }
+        for (int c = 0; c < D; ++c) {
+          double acc = 0;
+          for (int kk = 0; kk < K; ++kk) acc += s[kk] * at(v, b, kk, h, c, K);
+          out[(((size_t)b * Q + qq) * H + h) * D + c] = acc / tot;
+        }
+      }
+}
+
+static void attnCase(int B, int Q, int K, int H, int D) {
+  const size_t qn = (size_t)B * Q * H * D, kn = (size_t)B * K * H * D;
+  std::vector<double> q = randv(qn, 0.5), k = randv(kn, 0.5), v = randv(kn), dOut = randv(qn, 0.5),
+                      mb = randv((size_t)B * K, 0.5), pb = randv((size_t)H * Q * K, 0.5);
+  // a few keys fully masked out, as AF2's mask bias does with -1e9
+  for (int b = 0; b < B; ++b)
+    for (int kk = 0; kk < K; ++kk)
+      if ((b + kk) % 7 == 0) mb[(size_t)b * K + kk] = -1e4;
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dQ = up(q); void* dK = up(k); void* dV = up(v); void* dMb = up(mb); void* dPb = up(pb);
+  void* dDo = up(dOut);
+  void* gOut = alloc(qn * 4);
+  void* gL = alloc((size_t)B * H * Q * 4);
+  void* gdq = alloc(qn * 4);
+  void* gdk = alloc(kn * 4);
+  void* gdv = alloc(kn * 4);
+  void* gdpb = alloc((size_t)H * Q * K * 4);
+
+  attentionFwdSaved((const float*)dQ, (const float*)dK, (const float*)dV, (const float*)dMb,
+                    (const float*)dPb, (float*)gOut, (float*)gL, B, Q, K, H, D);
+  // the reference forward must agree first, or the backward is differentiating something else
+  std::vector<double> refOut;
+  attnForward(q, k, v, mb, pb, B, Q, K, H, D, refOut);
+  char label[200];
+  snprintf(label, sizeof label, "attn forward B%d Q%d K%d H%d D%d", B, Q, K, H, D);
+  report(label, relRms(refOut, download((const float*)gOut, qn)), 2e-6);
+
+  attentionBwd((const float*)dQ, (const float*)dK, (const float*)dV, (const float*)dMb, (const float*)dPb,
+               (const float*)gOut, (const float*)gL, (const float*)dDo,
+               (float*)gdq, (float*)gdk, (float*)gdv, (float*)gdpb, B, Q, K, H, D);
+
+  char shape[80];
+  snprintf(shape, sizeof shape, "B%d Q%d K%d H%d D%d", B, Q, K, H, D);
+  auto S_ = [&](const std::vector<double>& qq, const std::vector<double>& kk, const std::vector<double>& vv,
+                const std::vector<double>& pbb) {
+    std::vector<double> o;
+    attnForward(qq, kk, vv, mb, pbb, B, Q, K, H, D, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dOut[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = S_(q, k, v, pb);
+      target[j] = save - hh;
+      double bS = S_(q, k, v, pb);
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[220];
+    snprintf(lab, sizeof lab, "attn %s vs central difference %s", what, shape);
+    report(lab, relRmsD(fd, mine), 3e-5);
+  };
+  probe("dq", q, download((const float*)gdq, qn), 6);
+  probe("dk", k, download((const float*)gdk, kn), 6);
+  probe("dv", v, download((const float*)gdv, kn), 6);
+  probe("dPairBias", pb, download((const float*)gdpb, (size_t)H * Q * K), 6);
+
+  release(dQ); release(dK); release(dV); release(dMb); release(dPb); release(dDo);
+  release(gOut); release(gL); release(gdq); release(gdk); release(gdv); release(gdpb);
+}
+
 // ---------------------------------------------------------------- TriangleMultiplication, the whole module
 struct TriP {
   std::vector<double> lnScale, lnOffset, Wl, bl, Wr, br, Wlg, blg, Wrg, brg,
@@ -719,6 +819,11 @@ int main() {
   opmCase(8, 20, 32, 32, 16, 8);
   opmCase(4, 17, 24, 8, 12, 5);      // a tile that does not divide N
   opmCase(3, 16, 32, 32, 128, 4);    // the real O and F
+  printf("attention backward (flash-shaped: no score stored)\n");
+  attnCase(6, 12, 12, 4, 32);      // the triangle's shape: D = 128 / 4 heads
+  attnCase(5, 10, 14, 3, 8);       // Q != K, as MSA attention has
+  attnCase(4, 9, 9, 2, 64);        // the widest head this path holds
+  attnCase(3, 7, 7, 8, 16);
   printf("TriangleMultiplication backward (the whole module)\n");
   triCase(10, 16, 12, true);
   triCase(10, 16, 12, false);

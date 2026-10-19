@@ -73,6 +73,199 @@ kernel void lf_gate_bwd(LF_ARGS(GateBwdArgs)) {
   if (a.dg) a.dg[i] = d * y * s * (1.f - s);
 }
 
+// ---------------------------------------------------------------- attention
+// A simdgroup a row throughout, eight rows a threadgroup. A lane holds channels `lane`, `lane + 32` of its row, so
+// D <= 64; the dot products over the channel are simd_sum. No pass stores a score (see kernels.h).
+#define LF_ATTN_ROW(ARGS)                                                                                     \
+  uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],                              \
+  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+
+// q/k/v/out/dOut element (b, pos, h, c)
+static inline ulong lf_qkv(uint b, uint pos, uint h, uint c, uint P, uint H, uint D) {
+  return (((ulong)b * P + pos) * H + h) * D + c;
+}
+
+kernel void lf_attn_ref_fwd(constant AttnBwdArgs& a [[buffer(0)]], LF_ATTN_ROW(a)) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;          // (b, h, q)
+  if (row >= a.n) return;
+  const uint q = (uint)(row % (ulong)a.Q);
+  const uint bh = (uint)(row / (ulong)a.Q);
+  const uint h = bh - lf_udiv(bh, a.H) * a.H;
+  const uint b = lf_udiv(bh, a.H);
+  const uint D = a.D;
+
+  float qv[2];
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    qv[t] = c < D ? a.q[lf_qkv(b, q, h, c, a.Q, a.H, D)] : 0.f;
+  }
+  // pass one: the row's maximum
+  float mx = -INFINITY;
+  for (uint kk = 0; kk < a.K; ++kk) {
+    float d = 0;
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) d += qv[t] * a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+    }
+    float s = simd_sum(d);
+    if (a.maskBias) s += a.maskBias[(ulong)b * a.K + kk];
+    if (a.pairBias) s += a.pairBias[((ulong)h * a.Q + q) * a.K + kk];
+    mx = max(mx, s);
+  }
+  // pass two: the sum and the weighted average
+  float acc[2] = {0.f, 0.f}, tot = 0;
+  for (uint kk = 0; kk < a.K; ++kk) {
+    float d = 0;
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) d += qv[t] * a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+    }
+    float s = simd_sum(d);
+    if (a.maskBias) s += a.maskBias[(ulong)b * a.K + kk];
+    if (a.pairBias) s += a.pairBias[((ulong)h * a.Q + q) * a.K + kk];
+    const float e = exp(s - mx);
+    tot += e;
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) acc[t] += e * a.v[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+    }
+  }
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    if (c < D) a.wout[lf_qkv(b, q, h, c, a.Q, a.H, D)] = acc[t] / tot;
+  }
+  if (lane == 0) a.wL[row] = mx + log(tot);     // the logsumexp, so a later pass needs no maximum
+}
+
+// Drow[b][h][q] = sum_c dOut * out - softmax's own term
+kernel void lf_attn_drow(constant AttnBwdArgs& a [[buffer(0)]], LF_ATTN_ROW(a)) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.n) return;
+  const uint q = (uint)(row % (ulong)a.Q);
+  const uint bh = (uint)(row / (ulong)a.Q);
+  const uint h = bh - lf_udiv(bh, a.H) * a.H;
+  const uint b = lf_udiv(bh, a.H);
+  float d = 0;
+  for (uint c = lane; c < a.D; c += 32)
+    d += a.dOut[lf_qkv(b, q, h, c, a.Q, a.H, a.D)] * a.out[lf_qkv(b, q, h, c, a.Q, a.H, a.D)];
+  d = simd_sum(d);
+  if (lane == 0) a.dq[row] = d;                // (dq doubles as the write target here)
+}
+
+kernel void lf_attn_bwd_dq(constant AttnBwdArgs& a [[buffer(0)]], LF_ATTN_ROW(a)) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.n) return;
+  const uint q = (uint)(row % (ulong)a.Q);
+  const uint bh = (uint)(row / (ulong)a.Q);
+  const uint h = bh - lf_udiv(bh, a.H) * a.H;
+  const uint b = lf_udiv(bh, a.H);
+  const uint D = a.D;
+  const float L = a.L[row], Dr = a.Drow[row];
+
+  float qv[2], dov[2], acc[2] = {0.f, 0.f};
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    qv[t] = c < D ? a.q[lf_qkv(b, q, h, c, a.Q, a.H, D)] : 0.f;
+    dov[t] = c < D ? a.dOut[lf_qkv(b, q, h, c, a.Q, a.H, D)] : 0.f;
+  }
+  for (uint kk = 0; kk < a.K; ++kk) {
+    float d = 0, dp = 0;
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) {
+        d += qv[t] * a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+        dp += dov[t] * a.v[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+      }
+    }
+    float s = simd_sum(d);
+    if (a.maskBias) s += a.maskBias[(ulong)b * a.K + kk];
+    if (a.pairBias) s += a.pairBias[((ulong)h * a.Q + q) * a.K + kk];
+    const float p = exp(s - L);
+    const float ds = p * (simd_sum(dp) - Dr);
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) acc[t] += ds * a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+    }
+  }
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    if (c < D) a.dq[lf_qkv(b, q, h, c, a.Q, a.H, D)] = acc[t];
+  }
+}
+
+// dk and dv accumulate over q, so q is the inner loop and a simdgroup owns one (b, h, k)
+kernel void lf_attn_bwd_dkv(constant AttnBwdArgs& a [[buffer(0)]], LF_ATTN_ROW(a)) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.n) return;
+  const uint kk = (uint)(row % (ulong)a.K);
+  const uint bh = (uint)(row / (ulong)a.K);
+  const uint h = bh - lf_udiv(bh, a.H) * a.H;
+  const uint b = lf_udiv(bh, a.H);
+  const uint D = a.D;
+
+  float kv[2], vv[2], dkA[2] = {0.f, 0.f}, dvA[2] = {0.f, 0.f};
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    kv[t] = c < D ? a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)] : 0.f;
+    vv[t] = c < D ? a.v[lf_qkv(b, kk, h, c, a.K, a.H, D)] : 0.f;
+  }
+  const float mb = a.maskBias ? a.maskBias[(ulong)b * a.K + kk] : 0.f;
+  for (uint q = 0; q < a.Q; ++q) {
+    float d = 0, dp = 0;
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) {
+        d += kv[t] * a.q[lf_qkv(b, q, h, c, a.Q, a.H, D)];
+        dp += vv[t] * a.dOut[lf_qkv(b, q, h, c, a.Q, a.H, D)];
+      }
+    }
+    float s = simd_sum(d) + mb;
+    if (a.pairBias) s += a.pairBias[((ulong)h * a.Q + q) * a.K + kk];
+    const ulong qrow = ((ulong)b * a.H + h) * a.Q + q;
+    const float p = exp(s - a.L[qrow]);
+    const float ds = p * (simd_sum(dp) - a.Drow[qrow]);
+    for (int t = 0; t < 2; ++t) {
+      const uint c = lane + 32u * t;
+      if (c < D) {
+        dvA[t] += p * a.dOut[lf_qkv(b, q, h, c, a.Q, a.H, D)];
+        dkA[t] += ds * a.q[lf_qkv(b, q, h, c, a.Q, a.H, D)];
+      }
+    }
+  }
+  for (int t = 0; t < 2; ++t) {
+    const uint c = lane + 32u * t;
+    if (c < D) {
+      a.dk[lf_qkv(b, kk, h, c, a.K, a.H, D)] = dkA[t];
+      a.dv[lf_qkv(b, kk, h, c, a.K, a.H, D)] = dvA[t];
+    }
+  }
+}
+
+// dPairBias[h][q][k] = sum_b ds - shared across b, so b is the inner loop and a thread owns one (h, q, k)
+kernel void lf_attn_bwd_dbias(LF_ARGS(AttnBwdArgs)) {
+  ulong idx = LF_INDEX;
+  if (idx >= a.n) return;                      // n = H * Q * K
+  const uint kk = (uint)(idx - lf_udiv((uint)idx, a.K) * a.K);
+  const uint rest = lf_udiv((uint)idx, a.K);
+  const uint q = rest - lf_udiv(rest, a.Q) * a.Q;
+  const uint h = lf_udiv(rest, a.Q);
+  const uint D = a.D;
+  const float pb = a.pairBias ? a.pairBias[((ulong)h * a.Q + q) * a.K + kk] : 0.f;
+  float total = 0;
+  for (uint b = 0; b < a.B; ++b) {
+    float d = 0, dp = 0;
+    for (uint c = 0; c < D; ++c) {
+      d += a.q[lf_qkv(b, q, h, c, a.Q, a.H, D)] * a.k[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+      dp += a.dOut[lf_qkv(b, q, h, c, a.Q, a.H, D)] * a.v[lf_qkv(b, kk, h, c, a.K, a.H, D)];
+    }
+    float s = d + pb;
+    if (a.maskBias) s += a.maskBias[(ulong)b * a.K + kk];
+    const ulong qrow = ((ulong)b * a.H + h) * a.Q + q;
+    total += exp(s - a.L[qrow]) * (dp - a.Drow[qrow]);
+  }
+  a.dPairBias[idx] = total;
+}
+
 // ---------------------------------------------------------------- the triangle's helpers
 kernel void lf_mul_sigmoid(LF_ARGS(MulSigmoidArgs)) {
   ulong i = LF_INDEX;

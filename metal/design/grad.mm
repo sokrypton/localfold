@@ -2,6 +2,8 @@
 #include "grad.h"
 #include "kernels.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace mt {
 
@@ -177,6 +179,63 @@ void outerProductMeanBwd(const float* msa, const float* mask, size_t S, int N, i
   linearBwd(act, Wl, dleft, dact, dWl, dbl, rows, Cm, O, false);
   linearBwd(act, Wr, dright, dact, dWr, dbr, rows, Cm, O, true);     // accumulate: one input, two paths
   layerNormBwd(msa, dact, dMsa, rows, Cm, lnScale, dLnScale, dLnOffset);
+}
+
+// ---------------------------------------------------------------- attention
+static Grid attnRows(size_t rows) {
+  size_t groups = (rows + 7) / 8;
+  return groups <= 65535 ? Grid{(uint32_t)groups, 1, 1}
+                         : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
+}
+
+void attentionFwdSaved(const float* q, const float* k, const float* v, const float* maskBias,
+                       const float* pairBias, float* out, float* L, int B, int Q, int K, int H, int D) {
+  if (!B || !Q) return;
+  if (D > 64) { fprintf(stderr, "design: attention D=%d, this path holds D <= 64\n", D); exit(1); }
+  const size_t rows = (size_t)B * H * Q;
+  AttnBwdArgs a{};
+  a.q = q; a.k = k; a.v = v; a.maskBias = maskBias; a.pairBias = pairBias;
+  a.wout = out; a.wL = L;
+  a.n = rows; a.B = B; a.Q = Q; a.K = K; a.H = H; a.D = D;
+  dispatch("lf_attn_ref_fwd", &a, sizeof a, attnRows(rows), 256, 0, "design.attn.fwd");
+}
+
+void attentionBwd(const float* q, const float* k, const float* v, const float* maskBias, const float* pairBias,
+                  const float* out, const float* L, const float* dOut,
+                  float* dq, float* dk, float* dv, float* dPairBias, int B, int Q, int K, int H, int D) {
+  if (!B || !Q) return;
+  if (D > 64) { fprintf(stderr, "design: attention D=%d, this path holds D <= 64\n", D); exit(1); }
+  const size_t qrows = (size_t)B * H * Q, krows = (size_t)B * H * K;
+  float* Drow = (float*)scratchBytes("design.attn.drow", qrows * sizeof(float));
+
+  AttnBwdArgs a{};
+  a.q = q; a.k = k; a.v = v; a.maskBias = maskBias; a.pairBias = pairBias;
+  a.out = out; a.L = L; a.dOut = dOut;
+  a.B = B; a.Q = Q; a.K = K; a.H = H; a.D = D;
+
+  // softmax's own term, from the forward's output
+  AttnBwdArgs d = a;
+  d.dq = Drow;                                   // (the Drow kernel writes through dq)
+  d.n = qrows;
+  dispatch("lf_attn_drow", &d, sizeof d, attnRows(qrows), 256, 0, "design.attn.drow");
+  a.Drow = Drow;
+
+  if (dq) {
+    AttnBwdArgs p = a; p.dq = dq; p.n = qrows;
+    dispatch("lf_attn_bwd_dq", &p, sizeof p, attnRows(qrows), 256, 0, "design.attn.dq");
+  }
+  if (dk || dv) {
+    // both come off the same pass; a caller wanting one still pays for the other
+    float* sk = dk ? dk : (float*)scratchBytes("design.attn.sk", krows * (size_t)D * sizeof(float));
+    float* sv = dv ? dv : (float*)scratchBytes("design.attn.sv", krows * (size_t)D * sizeof(float));
+    AttnBwdArgs p = a; p.dk = sk; p.dv = sv; p.n = krows;
+    dispatch("lf_attn_bwd_dkv", &p, sizeof p, attnRows(krows), 256, 0, "design.attn.dkv");
+  }
+  if (dPairBias) {
+    const size_t n = (size_t)H * Q * K;
+    AttnBwdArgs p = a; p.dPairBias = dPairBias; p.n = n;
+    run1d("lf_attn_bwd_dbias", n, p);
+  }
 }
 
 // a batched GEMM over the channel: every operand is [batch][rows * in] with one plane a channel

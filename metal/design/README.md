@@ -17,7 +17,7 @@ the staging, and the two decisions already made here that a later kernel should 
 | | |
 | --- | --- |
 | `kernels.h` | the kernels' argument structs, read by C++ and by Metal |
-| `design.metal` | `lf_ln_stats`, `lf_ln_bwd`, `lf_col_sums`, `lf_relu_bwd`, `lf_gate_bwd`, `lf_mul_sigmoid`, `lf_tri_pack`/`_unpack`, the seven `lf_opm_*` |
+| `design.metal` | `lf_ln_stats`, `lf_ln_bwd`, `lf_col_sums`, `lf_relu_bwd`, `lf_gate_bwd`, `lf_mul_sigmoid`, `lf_tri_pack`/`_unpack`, the seven `lf_opm_*`, the five `lf_attn_*` |
 | `grad.h` / `grad.mm` | the host API: `layerNormBwd`, `linearBwd`, `columnSum`, `reluBwd`, `gateBwd`, `transitionBwd`, `outerProductMeanBwd`, `triangleMultiplicationBwd` |
 | `main.mm` | the differential test - every backward against two independent references, in double |
 
@@ -26,10 +26,15 @@ one operand read transposed, which it already serves.
 
 Whole modules so far: **`Transition`** (Alg. 9 / 15), **`OuterProductMean`** (Alg. 10) and
 **`TriangleMultiplication`** (Alg. 11 / 12, both equations). All RECOMPUTE their forward rather than taking a save
-set, which is what AF2 runs under anyway (`use_remat=True`). **199 cases pass.**
+set, which is what AF2 runs under anyway (`use_remat=True`). **219 cases pass.**
 
-Still forward-only, so still to write: the four attentions (MSA row with pair bias, MSA column, and both triangle
-attentions), the structure module and the heads, and the design loop. `docs/BINDCRAFT2.md` has the staging.
+Plus the **attention backward** (`attentionBwd`), which is flash-shaped because it has to be: the weights are
+[B][H][Q][K] and a triangle attention's b runs over residues, so storing them is the O(N^3) that AGENTS.md forbids.
+Scores are recomputed from a saved logsumexp, in three passes - see `docs/BINDCRAFT2.md` for which gradient
+accumulates over what, which is what decides the passes.
+
+Still to write: the attention MODULES around that core (the q/k/v projections, the gate, the output projection -
+composition, like the triangle's), the structure module and the heads, and the design loop itself.
 
 ## The testing rule this tree follows
 

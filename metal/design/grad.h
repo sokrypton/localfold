@@ -85,6 +85,23 @@ void outerProductMeanBwd(const float* msa, const float* mask, size_t S, int N, i
                          float* dWo = nullptr, float* dbo = nullptr,
                          float eps = 1e-3f, int tile = 8);
 
+// ---------------------------------------------------------------- attention
+// See kernels.h for the forward, the layouts, and why this recomputes scores rather than storing them.
+//
+// The reference forward, which also saves the per-row logsumexp the backward needs. metal/core's tuned `attention()`
+// does NOT return it, so using that one here would need a core change; this is the self-contained version.
+//   q (already scaled), k, v   [B][pos][H][D];  out [B][Q][H][D];  L [B][H][Q]
+void attentionFwdSaved(const float* q, const float* k, const float* v,
+                       const float* maskBias, const float* pairBias,
+                       float* out, float* L, int B, int Q, int K, int H, int D);
+
+// out, L from the forward above. dq, dk, dv and dPairBias may each be null. Nothing is accumulated.
+void attentionBwd(const float* q, const float* k, const float* v,
+                  const float* maskBias, const float* pairBias,
+                  const float* out, const float* L, const float* dOut,
+                  float* dq, float* dk, float* dv, float* dPairBias,
+                  int B, int Q, int K, int H, int D);
+
 // ---------------------------------------------------------------- TriangleMultiplication (Alg. 11 / 12)
 // The forward, as AF2 writes it (modules.py:947-1012). With n2 = N * N pair rows, C the pair width and I the
 // intermediate width (num_intermediate_channel):
