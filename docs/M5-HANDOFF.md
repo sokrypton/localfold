@@ -1367,6 +1367,25 @@ identical on and off. Not under the matrix projection, which writes f32.
   is worth suspecting before reusing that shape). 4x8 tiles 46.9.
 - Everything shipped this round together, in the probe: 32.55 -> 27.6 ms (-15%).
 
+**Another pass (2026-10-19).**
+- **Metal, AF3's diffusion transformer: the gated residual in the GEMM's epilogue (`gemmGateResidual`,
+  `LOCALFOLD_GATE_RES=0` the control).** A block's two `act += y sigmoid(gate[r mod n])` passes
+  (`af3_gated_res_strided`, 368 ms over 9600 dispatches at 522 tokens) are a new vector-epilogue bit (16384) of the
+  output projection and of the transition's second GEMM, writing only the live rows of the padded product. PDBs
+  byte-identical; diffusion GPU time 7863 -> 7606 ms (-3.3%), and against the trunk (the M5 heating through the run)
+  -3.5%. The matrix units only; elsewhere the two passes as before.
+- **Tried and dropped:**
+  - `af3_ada_ln` with the row in registers: slower (912 against 715 ms).
+  - ...a threadgroup a row: -13% of the transformer's ada_ln (-0.8% of diffusion), and not bit-identical.
+  - WebGPU, grid.normalize folded into grid.project and grid.bias: level. The projection pays ~20 ms for the
+    statistics, and a bias kernel staging its own rows costs what the normalize did.
+  - WebGPU, the attention's output in f16 between grid.attend and grid.project-out: -1.5%, not bit-identical.
+- **Where the time is now** (522 tokens, Metal):
+  - Per trunk pass 4.3 s, of which the attention is 26%.
+  - Diffusion at 200 steps 7.6 s: swiglu, qkvg and the token attention are 45% of it, and the conditioning GEMMs
+    another 15%.
+  - The adaptive LayerNorms (9%) are latency-bound at one sample: 528 rows.
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
 The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,

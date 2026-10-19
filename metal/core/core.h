@@ -139,6 +139,11 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // the outer product's block P[(i, c)][(j, e)] = sum_s l[s][i0 + i][c] r[s][j][e] (lt, rt transposed: [S][L * O] with
 // leading dimensions ldl, ldr), stored permuted into X [(i, j)][(c, e)] by the epilogue - on the matrix units only
 // (false: nothing run, the caller's GEMM and permute; LOCALFOLD_OPM_PERMUTED=0 the control)
+// act[r][o] += (alpha X W)[r][o] sigmoid(gate[(r mod period) ld + o]) for r < rows - AF3's diffusion transformer's gated
+// residual, in the product's epilogue on the matrix units (the product over prows >= rows, padded; false: not run, the
+// caller's product and residual still to do). LOCALFOLD_GATE_RES=0 the control
+bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
+                      const float* gate, int ld, size_t period, float alpha, const char* label = nullptr);
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S);
 // the outer product's output projection adding into the pair: pair[r] += (bias + X[r] W) / (1e-3 + norm[r]) - on the
 // matrix units only (the vector epilogue, EP bit 8192); false: nothing run, the caller's own GEMM and add

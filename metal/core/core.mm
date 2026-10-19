@@ -733,6 +733,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   if ((a.epilogue & 4096) && !vecEp) die("gemm: the permuted store needs the vector epilogue's alignment");
   if ((a.epilogue & 8192) && !vecEp) die("gemm: the outer product's normalised add needs the vector epilogue's alignment");
+  if ((a.epilogue & 16384) && !vecEp) die("gemm: the gated residual needs the vector epilogue's alignment");
   if (vecEp && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
   while (!plain && !tri && !vecEp && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
@@ -907,6 +908,19 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
                       int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
                       half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
   return gatedAddDual(Xg, Wg, Xv, Wv, pair, F16, rows, in, out, biasG, biasV, vTmp, label, lnOut, lnScale, lnOffset, lnEps);
+}
+bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
+                      const float* gate, int ld, size_t period, float alpha, const char* label) {
+  static const bool on = !getenv("LOCALFOLD_GATE_RES") || atoi(getenv("LOCALFOLD_GATE_RES")) != 0;
+  if (!on || !tensorWanted() || prows <= 128 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
+    return false;
+  GemmArgs a{};
+  a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)act;
+  a.m = out; a.n = (int)prows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
+  a.alpha = alpha; a.epilogue = 16384; a.aux = (uint64_t)gate; a.ldaux = ld; a.tgN = (int)period; a.tgPairs = (int64_t)rows;
+  ++D().stats.gemms;
+  gemmTensorRun(F32, a, 1, false, label);
+  return true;
 }
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;

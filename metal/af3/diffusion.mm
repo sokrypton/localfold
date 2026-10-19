@@ -335,8 +335,12 @@ static void transformer(float* act, const float* cond, float level) {
       at.qBias = nullptr;
     }
     attention(at);
-    lin(o, B + ".Transition2", att, prows, Wd, C, 0.f, nullptr, ADA_RAW ? 2.f : 1.f);   // (chai's zero gate weights: 0.5 undone)
-    run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+    // (the gated residual in the output projection's epilogue where the matrix units take it: gemmGateResidual)
+    if (!gemmGateResidual(o, Wh(B + ".Transition2"), act, prows, rows, Wd, C, z, D.ldr, n, ADA_RAW ? 2.f : 1.f,
+                          "transformer output, gated residual")) {
+      lin(o, B + ".Transition2", att, prows, Wd, C, 0.f, nullptr, ADA_RAW ? 2.f : 1.f);   // (chai's zero gate weights: 0.5 undone)
+      run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+    }
     adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
     gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
     if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate
@@ -344,8 +348,11 @@ static void transformer(float* act, const float* cond, float level) {
       linH(tn, B + ".ffwAToB", u, rows, C, I);
       run1d("af3_mul_h", rows * I, MulHArgs{gated, u, rows * I});
     }
-    lin(gated, B + ".ffwTransition2", proj, prows, I, C);
-    run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, z + C, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+    if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, prows, rows, I, C, z + C, D.ldr, n, 1.f,
+                          "transformer transition, gated residual")) {
+      lin(gated, B + ".ffwTransition2", proj, prows, I, C);
+      run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, z + C, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+    }
   }
 }
 

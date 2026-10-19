@@ -183,6 +183,16 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
         continue;
       }
+      if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
+        if (j >= g.tgPairs) continue;
+        const uint r = (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+        device const float* gp = (device const float*)g.aux + (ulong)r * g.ldaux + i;
+        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+        float4 res;
+        for (int t = 0; t < 4; ++t) res[t] = cv[t] + v[t] * (1.f / (1.f + exp(-gp[t])));   // (af3_gated_res_strided's)
+        *(device vec<TC, 4>*)dp = lf_out4<TC>(res);
+        continue;
+      }
       if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
         const uint O = (uint)g.tgC, L = (uint)g.tgN;
         const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
