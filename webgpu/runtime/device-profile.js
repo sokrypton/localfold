@@ -455,6 +455,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // ...and its bias read as one vec4 a query a key tile, the bias pass writing permuted rows padded to whole tiles; false
   // is the control (sixteen scalar reads).
   gridAttendBiasVec4: null,
+  // ...and no mask read where the pair mask is all ones; false is the control.
+  gridAttendMaskFree: null,
   // ...and the consecutive tokens one msa.average workgroup takes; null takes MSA_AVERAGE_ROWS, 1 the control.
   msaAverageRows: null,
   // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the

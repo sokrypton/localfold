@@ -162,6 +162,10 @@ export class Af3MsaStackGpu {
       // ...and the bias read as one vec4 a query a tile, from rows the bias pass permutes and pads (`gridAttendBiasVec4:
       // false` the control): bit-identical
       attendBiasVec4: deviceTuning(this.device).gridAttendBiasVec4 !== false,
+      // ...and no mask read where this pass's pair mask is all ones, as a fold's is (a warm-up has none and compiles
+      // that form); `gridAttendMaskFree: false` the control
+      attendMaskFree: deviceTuning(this.device).gridAttendMaskFree !== false
+        && (state.pairMask === undefined || state.pairMask.every((value) => value > 0)),
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,

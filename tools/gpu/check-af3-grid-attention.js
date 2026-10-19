@@ -90,7 +90,8 @@ export async function main(device, args) {
   // 🔴 RAGGED, so the key-vs-query mask confusion is visible. With an all-ones
   // mask both choices agree and the check passes on a kernel that is wrong.
   const sequence = new Float32Array(n);
-  for (let i = 0; i < n; i += 1) sequence[i] = i < Math.ceil(n * 0.75) ? 1 : 0;
+  // (...all ones under --mask-free, the only mask that form is right for, or --all-ones for its control)
+  for (let i = 0; i < n; i += 1) sequence[i] = args.includes("--mask-free") || args.includes("--all-ones") || i < Math.ceil(n * 0.75) ? 1 : 0;
   const mask = new Float32Array(n * n);
   for (let i = 0; i < n; i += 1) {
     for (let j = 0; j < n; j += 1) mask[i * n + j] = sequence[i] * sequence[j];
@@ -143,7 +144,9 @@ export async function main(device, args) {
             // --tiled-half: the tiled form's f16 tiles (gridAttendTiledHalf), held to the f16 bound on both arms
             attendTiledHalf: args.includes("--tiled-half"),
             // --bias-vec4: the tiled form's bias read as vec4 from permuted, padded rows (gridAttendBiasVec4)
-            attendBiasVec4: args.includes("--bias-vec4") });
+            attendBiasVec4: args.includes("--bias-vec4"),
+            // --mask-free: no mask read (gridAttendMaskFree) - only right where the mask is all ones
+            attendMaskFree: args.includes("--mask-free") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;

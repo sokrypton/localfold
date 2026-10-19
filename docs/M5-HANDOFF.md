@@ -1341,6 +1341,15 @@ floats at worst, 0.2 MiB at 257 tokens). AF3 255-token trunk, ABBA x2 with `--pr
 447 ms against 444 / 447 / 467 / 467 (-4 to -6%), the pass -1%. check-af3-grid-attention gives the same relRMS on both
 arms at 45, 77 and 100 tokens; test:stock's signatures are identical with the knob on and off.
 
+**The mask-free attend, shipped (`gridAttendMaskFree`, false the control).** Where the pass's pair mask is all ones (a
+fold's: the mask marks padding, and a WebGPU fold has none) the pairformer and MSA stacks compile the tiled attend with
+no mask read and no masked subtraction; a warm-up, which has no mask, compiles that form. A mask with any zero compiles
+the masked kernel as before. The template stack keeps the masked one. AF3 255-token trunk, ABBA x2: grid.attend
+403 / 428 / 430 / 448 ms against 435 / 443 / 458 / 463 (-3 to -7%; the probe's -2% understated it). Same relRMS as the
+masked kernel on an all-ones mask (check-af3-grid-attention `--mask-free` against `--all-ones`, 77 and 100 tokens, f32
+and f16 tiles); test:stock identical on and off, bar OpenDDE's 92.045527640 / 92.045527029, which alternates run to run
+whatever the knob.
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
 The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,

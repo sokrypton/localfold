@@ -400,6 +400,7 @@ export async function compilePairTrack(cache, options) {
         attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
         attendSubgroupMax: options.attendSubgroupMax === true,
         attendBiasVec4: options.attendBiasVec4 === true,
+        attendMaskFree: options.attendMaskFree === true,
         chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
@@ -482,7 +483,7 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
-                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}${tiles.biasVec4 ? "v" : ""}`
+                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}${tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}`
                   + `:ch${gridChunked}`
                   + `:pa${gridProjectArithmetic}`
                   // ...and every row tile, which the device's storage limit

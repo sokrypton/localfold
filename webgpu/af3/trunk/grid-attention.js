@@ -974,6 +974,10 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
     // (`attendSubgroupMax`): no workgroup write, read or barrier for it. Half tiles only - the f32 form's P shares the
     // key tile, which that barrier also guarded. Assumes 32-lane subgroups laid out by invocation index (Apple's)
     const SG = H && shape.attendSubgroupMax === true;
+    // ...and no mask read or masked subtraction where the caller's pair mask is all ones (`attendMaskFree`, a fold's
+    // usual case: the mask only marks padding, and a WebGPU fold has none). The binding stays, read once, so the bind
+    // group is the masked form's.
+    const MF = shape.attendMaskFree === true;
     const TE = H ? "f16" : "f32";
     const toT = (e) => (H ? `vec4<f16>(${e})` : e);
     const fromT = (e) => (H ? `vec4<f32>(${e})` : e);
@@ -1019,7 +1023,7 @@ ${chunked ? `  let local_row = group.y;
   let row = chunk.x + local_row;` : "  let row = group.y;"}
   let head = group.z;
   if (row >= N || head >= HEADS) { return; }
-  let local = local_id.x;
+  let local = local_id.x;${MF ? "\n  if (N == 0u) { _ = mask[0]; }" : ""}
   let q0 = group.x * ${BQ}u;
   // This lane's queries are q0 + a * 8 + qg and its keys j0 + b * 8 + kg; in the PV product its four
   // dimensions are kg * 4 ..
@@ -1056,12 +1060,12 @@ ${eachAB((a, b) => `      s${a}_${b} += ${H ? `f32(dot(qv${a}, kv${b}))` : `dot(
     }`).join("\n")}
 
 ${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
-    let jc${b} = min(key${b}, N - 1u);
-    let masked${b} = mask[${transpose ? `jc${b} * N + row` : `row * N + jc${b}`}];`)}
+    let jc${b} = min(key${b}, N - 1u);${MF ? "" : `
+    let masked${b} = mask[${transpose ? `jc${b} * N + row` : `row * N + jc${b}`}];`}`)}
 ${biasVec4 ? eachA((a) => `    let bv${a} = bias[(bias_row${a} + j0) / 4u + kg];`) : ""}
 ${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + ${biasVec4 ? `bv${a}[${b}]` : `bias[bias_row${a} + jc${b}]`};
-    if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
-    if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
+${MF ? "" : `    if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
+`}    if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
 ${SG ? "" : `${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
     workgroupBarrier();`}
 ${eachA((a) => `${SG ? `    var tile_max${a} = ${maxOf(a)};
@@ -1154,7 +1158,7 @@ export class Af3GridSelfAttentionGpu {
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
         attendMatrix, attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
-        attendBiasVec4: options.attendBiasVec4 === true,
+        attendBiasVec4: options.attendBiasVec4 === true, attendMaskFree: options.attendMaskFree === true,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
@@ -1162,7 +1166,7 @@ export class Af3GridSelfAttentionGpu {
       + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
       + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`
       + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`
-      + `${sources.tiles.biasVec4 ? "v" : ""}`;
+      + `${sources.tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
