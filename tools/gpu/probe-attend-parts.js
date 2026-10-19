@@ -32,6 +32,12 @@ export async function main(device, args) {
   variants.sgmax = shaderFor({ attendSubgroupMax: true }).attend;
   variants.nokv = attend.replace("  let local = local_id.x;", "  let local = local_id.x;\n  if (N == 0u) { _ = k[0]; _ = v[0]; }").replace(/\n\s*k_tile\[slot \* STRIDE \+ index % HD4\] = [^;]*;\n\s*v_tile\[index\] = [^;]*;/, "");
   variants.nobias = attend.replace("  let local = local_id.x;", "  let local = local_id.x;\n  if (N == 0u) { _ = bias[0]; }").replace(/ \+ bias\[bias_row\d+ \+ jc\d+\]/g, "");
+  // the bias read as one vec4 a query a tile, its four keys contiguous (a permuted layout: timing only, N % 32 == 0)
+  variants.biasv4 = (() => {
+    let t = attend.replace("@group(0) @binding(3) var<storage, read> bias: array<f32>;", "@group(0) @binding(3) var<storage, read> bias: array<vec4<f32>>;");
+    t = t.replace(/(\n\s*var logit0_0 = )/, (m) => "\n" + [0, 1, 2, 3].map((a) => `    let bv${a} = bias[(bias_row${a} + j0) / 4u + kg];`).join("\n") + m);
+    return t.replace(/bias\[bias_row(\d+) \+ jc(\d+)\]/g, (m, a, b) => `bv${a}[${b}]`);
+  })();
   variants.nop = attend.replace(/\n\s*kp_tile\[\([^;]*\] = vec4<f16>\([^;]*;/g, "");
   // (the parts priced by removing them: wrong answers on purpose)
   variants.noexp = attend.replace(/\bexp\(/g, "fexp(").replace("@compute", "fn fexp(x: f32) -> f32 { return x * 0.001 + 1.0; }\n@compute");

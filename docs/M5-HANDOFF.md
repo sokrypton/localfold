@@ -1327,6 +1327,12 @@ has no branch: attention -13% (AF3 and AF2 pair tracks, PDBs byte-identical). Th
 the first product's accumulator (10% slower), the bias tile held in P's tensor (level), the diffusion's q-biased
 attention on NT (level). What is left is the softmax's element work itself, ~20% over the products.
 
+**WebGPU's grid.attend, taken apart the same way (5b2a03d3, probe-attend-parts.js).** The tiled f16 kernel at 512
+tokens, 32.4 ms: q.k 10.3, P.V 7.5, K/V staging 4.1, the bias reads 2.9, the mask read 0.7, the tail branch and the
+exponentials nothing. No one part dominates, so no Metal-style win: the tile maximum by subgroup shuffles (bit-identical,
+-1 to -3.5%) is shipped; a permuted bias layout read as one vec4 a query (half of the bias reads' cost, -4.8% of the
+kernel in the probe) would need the bias buffer padded to 32 keys in every stack that allocates it - not done.
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
 The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,
