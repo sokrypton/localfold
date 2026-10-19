@@ -155,8 +155,8 @@ kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [
     for (uint r = ty; r < 32; r += 8) {
       const uint i = i0 + r, j = j0 + tx;
       if (i < a.n && j < a.stride) {
-        const float v = j < a.n ? (a.swap ? tile[tx][r] : tile[r][tx]) : 0.f;
-        a.bias[((ulong)h * a.n + i) * a.stride + j] = (half)(a.scale * v);
+        // (the padding past n is -inf: a key tile reaching past the last key masks it through the bias alone)
+        a.bias[((ulong)h * a.n + i) * a.stride + j] = j < a.n ? (half)(a.scale * (a.swap ? tile[tx][r] : tile[r][tx])) : -INFINITY;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

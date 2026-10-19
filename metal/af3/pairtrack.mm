@@ -136,7 +136,8 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
     fq = foldNorm("gq:" + pre, qkvgWeight(pre, C, Wd, true), C, 4 * Wd, pre + ".actNorm", qkvgBias(pre, Wd));
     linW(xn, fb.w, raw, P, C, heads, 0.f, fb.b, 1.f, "grid bias projection");
   } else lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
-  int stride = round8(n);
+  // (rows padded to a whole 64-key tile with -inf, so the attention's last key tile needs no per-element mask)
+  int stride = (n + 63) / 64 * 64;
   half* bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
   // q|k|v|g a block of rows at a time (tr: of columns), 256 MB of them: the whole pair's was 1.1 GB at 1044 tokens, the
   // largest buffer of a fold. A row's attention reads its own n positions and nothing else, so the blocks are the
@@ -157,7 +158,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
     else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)n * C; g.sy = (int64_t)r * 4 * Wd; g.batch = n; }
     gemm(g);
     Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = heads; at.D = D; at.rows = r; at.scale = 1.f / sqrtf((float)D);
-    at.bias = bias; at.biasStride = stride; at.r0 = r0;
+    at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.r0 = r0;
     if (!m.ones) { at.mask = m.pair; at.maskB = tr ? 1 : n; at.maskK = tr ? n : 1; }
     if (!tr) at.out = o + (size_t)r0 * n * Wd;
     else {

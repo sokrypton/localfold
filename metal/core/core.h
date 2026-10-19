@@ -160,6 +160,7 @@ struct Attention {
   const half* qkvg; half* out; int n, heads, D; size_t rows; float scale;
   int64_t rowStride = 0, posStride = 0, outRowStride = 0, outPosStride = 0;     // (0: the dense layout's)
   const half* bias = nullptr; int biasStride = 0;                               // [H][n][biasStride], log2 units
+  bool biasPadInf = false;     // (the caller's promise: columns n..biasStride hold -inf, biasStride a whole key tile past n)
   // the key's mask, mask[(r0 + b) maskB + key maskK] (0 strides: [rows][n], maskB n and maskK 1)
   const float* mask = nullptr; int64_t r0 = 0, maskB = 0, maskK = 0;
   const float* qBias = nullptr;

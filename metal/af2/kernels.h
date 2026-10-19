@@ -14,7 +14,7 @@ struct PairMaskArgs { CP(float) seqMask; DP(float) out; uint L, pad; };
 // ---------------------------------------------------------------- the Evoformer
 // a [pairs][H] projection (+ 1e9 (mask - 1)) -> the attention's bias [H][L][L] in log2 units; transposed: b[h][q][k]
 // = proj[k][q] (the ending node)
-struct BiasLayoutArgs { CP(float) proj; CP(float) pairMask; DP(half) out; uint L, H, transposed, pad; };
+struct BiasLayoutArgs { CP(float) proj; CP(float) pairMask; DP(half) out; uint L, H, transposed, stride; };
 // the triangle's projection and gate (AF2's halves: a's C columns, then b's) as gemmTriGate's weight and bias
 struct TriGateW2Args { CP(half) proj; CP(half) gate; CP(float) pb; CP(float) gb; DP(half) w4; DP(float) b4; uint C, pad; };
 struct QkvgWArgs { CP(half) q; CP(half) k; CP(half) v; CP(half) g; DP(half) out; uint C, W; };

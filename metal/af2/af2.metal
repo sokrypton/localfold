@@ -64,13 +64,16 @@ kernel void af2_pair_mask(LF_ARGS(PairMaskArgs)) {
 }
 
 // ---------------------------------------------------------------- the Evoformer
+// out [H][L][stride]: rows padded with -inf to `stride` (a whole key tile: the attention's last tile masks through it)
 kernel void af2_bias_layout(LF_ARGS(BiasLayoutArgs)) {
   uint t = (uint)LF_INDEX;
-  if (t >= a.L * a.L * a.H) return;
-  uint ij = lf_udiv(t, a.H), h = t - ij * a.H, i = lf_udiv(ij, a.L), j = ij - i * a.L;
-  float v = a.proj[t] + (a.pairMask ? 1e9f * (a.pairMask[ij] - 1.f) : 0.f);
-  if (a.transposed) { uint x = i; i = j; j = x; }
-  a.out[((ulong)h * a.L + i) * a.L + j] = (half)max(v * M_LOG2E_F, -6e4f);
+  const uint S = a.stride;
+  if (t >= a.L * S * a.H) return;
+  uint hi = lf_udiv(t, S), j = t - hi * S, h = lf_udiv(hi, a.L), i = hi - h * a.L;
+  if (j >= a.L) { a.out[t] = -INFINITY; return; }
+  const uint si = a.transposed ? j : i, sj = a.transposed ? i : j, ij = si * a.L + sj;
+  float v = a.proj[ij * a.H + h] + (a.pairMask ? 1e9f * (a.pairMask[ij] - 1.f) : 0.f);
+  a.out[t] = (half)max(v * M_LOG2E_F, -6e4f);
 }
 // gemmTriGate's weight from AF2's [a | b] halves: channel c's (pa ga pb gb) in blocks of 8, and their biases
 kernel void af2_trigate_weight(LF_ARGS(TriGateW2Args)) {

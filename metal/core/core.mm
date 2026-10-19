@@ -1028,12 +1028,17 @@ void attention(const Attention& t) {
         if (w32 < w16 && (long)up(t.n, 128) / 128 * (long)t.rows * t.heads >= 1500) { TQB = 32; TKT = 32; }
       }
       if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
-      const char* stem = ver == 3 ? (t.qBias ? "gemmt_attn3q_" : "gemmt_attn3_") : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
+      // (v3 without a per-element branch where the caller padded its bias with -inf to a whole key tile and has no mask:
+      // Attention::biasPadInf; LOCALFOLD_ATTN_NT=0 the control)
+      static const bool ntWanted = !getenv("LOCALFOLD_ATTN_NT") || atoi(getenv("LOCALFOLD_ATTN_NT")) != 0;
+      const bool nt = ntWanted && ver == 3 && !t.qBias && t.bias && t.biasPadInf && !t.mask &&
+                      t.biasStride >= (t.n + TKT - 1) / TKT * TKT;
+      const char* stem = ver == 3 ? (t.qBias ? "gemmt_attn3q_" : nt ? "gemmt_attn3n_" : "gemmt_attn3_") : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
       const char* fn = ver == 3 ? "lf_attention_tensor3<" : ver == 2 ? "lf_attention_tensor2<" : "lf_attention_tensor<";
       std::string name = std::string(stem) + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
       std::string decl = "template [[host_name(\"" + name + "\")]] kernel void " + fn +
                          std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) +
-                         (ver == 3 ? (t.qBias ? ", true" : ", false") : "") + ">(constant AttnArgs&, uint3, uint, uint, uint);";
+                         (ver == 3 ? (t.qBias ? ", true" : nt ? ", false, true" : ", false") : "") + ">(constant AttnArgs&, uint3, uint, uint, uint);";
       const int qb = two ? 4 * TQB : TQB;
       std::string lab = "attention";
       if (D().profileOn) lab += " v" + std::to_string(ver) + " n " + std::to_string(t.n) + " H " + std::to_string(t.heads) + " D " +

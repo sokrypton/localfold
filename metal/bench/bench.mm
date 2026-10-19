@@ -26,10 +26,10 @@ static int attnBench(int argc, char** argv) {
     while (p <= a.size()) { size_t q = a.find(',', p); if (q == std::string::npos) q = a.size(); arms.push_back(atoi(a.substr(p, q - p).c_str())); p = q + 1; } }
   int W = H * D;
   size_t qn = (size_t)rows * n * 4 * W;
-  int bs = (n + 7) / 8 * 8;
+  int bs = (n + 63) / 64 * 64;       // (padded with -inf past n to a whole tile: the NT kernel's layout)
   std::vector<half> q(qn), b((size_t)H * n * bs);
   for (size_t i = 0; i < qn; ++i) q[i] = (half)((float)((i * 2654435761u) % 1000) / 1000.f - 0.5f);
-  for (size_t i = 0; i < b.size(); ++i) b[i] = (half)((float)((i * 40503u) % 1000) / 500.f - 1.f);
+  for (size_t i = 0; i < b.size(); ++i) b[i] = (int)(i % bs) >= n ? (half)-INFINITY : (half)((float)((i * 40503u) % 1000) / 500.f - 1.f);
   half* dq = uploadNew(q.data(), qn); half* db = uploadNew(b.data(), b.size()); half* dout = allocT<half>((size_t)rows * n * W);
   Attention A{}; A.qkvg = dq; A.out = dout; A.n = n; A.heads = H; A.D = D; A.rows = rows; A.scale = 1.f / sqrtf((float)D);
   A.bias = db; A.biasStride = bs;
@@ -46,7 +46,7 @@ static int attnBench(int argc, char** argv) {
       else if (arms[k] & 128) setenv("LOCALFOLD_ATTN_TILE", "16x32", 1);
       else if (arms[k] & 256) setenv("LOCALFOLD_ATTN_TILE", "16x64", 1);
       else unsetenv("LOCALFOLD_ATTN_TILE");
-      A.biasStride = arms[k] & 2 ? n : bs;       // (arm bit 2: the bias's rows unpadded, n apart)
+      A.biasStride = bs; A.biasPadInf = (arms[k] & 2) != 0;       // (arm bit 2: the bias -inf padded: v3's NT kernel)
       attention(A); sync();
       if (round == 0) {
         std::vector<half> o = download(dout, (size_t)rows * n * W);
@@ -123,6 +123,7 @@ static int bwBench(int argc, char** argv) {
   printf("  copy %zu MiB: %.3f ms  %.1f GB/s (read + write)\n", bytes >> 20, t[t.size() / 2] * 1e3, 2.0 * bytes / t[t.size() / 2] / 1e9);
   return 0;
 }
+
 int main(int argc, char** argv) {
   if (argc > 1 && !strcmp(argv[1], "bw")) { setSource("bench", PORT_SOURCE); return bwBench(argc, argv); }
   if (argc > 1 && !strcmp(argv[1], "peak")) { setSource("bench", PORT_SOURCE); return peakBench(argc, argv); }

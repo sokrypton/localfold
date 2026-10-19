@@ -580,7 +580,10 @@ kernel void lf_attention_tensor2(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
 // onto the logits' and the output's elements by their iterators, and P handed to the second product as a cooperative
 // left input. (Compatibilities probed on the M5: the half logits as P.V's left input; logits -> rows; output -> the
 // logits' rows.) A q bias stages the simdgroup's Q + bias once, in half, in threadgroup memory (QBIAS instances).
-template <int D, int QS, int KT, class MQ>
+// NT: the bias is present and padded with -inf past n to a whole key tile (AttnArgs pad bit 1, the host's promise),
+// and no mask: the key tile's logits are S qs + B with no per-element branch - the tail's padding keys come out -inf
+// from the bias alone. The branch (tail || mask) in the element loop cost the tile 12% even where it never fires
+template <int D, int QS, int KT, class MQ, bool NT = false>
 METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa, device const half* base) {
   using namespace mpp::tensor_ops;
   const int n = a.n, W = a.heads * D;
@@ -589,8 +592,8 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
   const int32_t ps = (int32_t)a.posStride;
   tensor<device half, E2, tensor_inline> tK((device half*)base + W, E2(D, n), array<int32_t, 2>{1, ps});
   tensor<device half, E2, tensor_inline> tV((device half*)base + 2 * W, E2(D, n), array<int32_t, 2>{1, ps});
-  tensor<device half, E2, tensor_inline> tB((device half*)(a.bias ? a.bias + (long)h * n * a.biasStride : a.qkvg), E2(n, n),
-                                            array<int32_t, 2>{1, (int32_t)a.biasStride});
+  tensor<device half, E2, tensor_inline> tB((device half*)(a.bias ? a.bias + (long)h * n * a.biasStride : a.qkvg),
+                                            E2(NT ? a.biasStride : n, n), array<int32_t, 2>{1, (int32_t)a.biasStride});
   constexpr auto dS = matmul2d_descriptor(QS, KT, D, false, true, false);
   constexpr auto dO = matmul2d_descriptor(QS, D, KT, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<dS, execution_simdgroup> opS;
@@ -616,6 +619,11 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
   for (int k0 = 0; k0 < n; k0 += KT) {
     auto mK = tK.slice(0, k0); auto mV = tV.slice(0, k0);
     opS.run(Q, mK, S);
+    if constexpr (NT) {
+      auto mb = tB.slice(k0, qa); Bh.load(mb);
+      _Pragma("clang loop unroll(full)")
+      for (uint16_t e = 0; e < S.get_capacity(); ++e) if (S.is_valid_element(e)) S[e] = S[e] * qs + (float)Bh[e];
+    } else {
     if (a.bias) Bh.load(tB.slice(k0, qa));
     const bool tail = k0 + KT > n;
     _Pragma("clang loop unroll(full)")
@@ -629,6 +637,7 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
         }
         S[e] = v;
       }
+    }
     reduce_rows(S, R, reduction_operation::max, -INFINITY);
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < M.get_capacity(); ++e)
@@ -674,7 +683,7 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
           (half)(O[e] / *L.map_iterator(O.get_iterator(e)) * (1.f / (1.f + exp(-g))));
     }
 }
-template <int D, int QS = 16, int KT = 64, bool QBIAS = false>
+template <int D, int QS = 16, int KT = 64, bool QBIAS = false, bool NT = false>
 kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
@@ -696,7 +705,7 @@ kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
     lf_attn3_body<D, QS, KT>(a, tQ, b, h, qa, base);
   } else {
     tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, (int32_t)a.posStride});
-    lf_attn3_body<D, QS, KT>(a, tQ.slice(0, qa), b, h, qa, base);
+    lf_attn3_body<D, QS, KT, decltype(tQ.slice(0, qa)), NT>(a, tQ.slice(0, qa), b, h, qa, base);
   }
 }
 // (instantiated on first use: lf_attention_tensor3<D, QS, KT, QBIAS>, host name gemmt_attn3[q]_<D>_<QS>x<KT>)
@@ -745,3 +754,4 @@ kernel void lf_mm_peak1(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgr
   for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) s += float(c[e]);
   ((device float*)g.D)[grp.x * 128 + tid] = s;
 }
+

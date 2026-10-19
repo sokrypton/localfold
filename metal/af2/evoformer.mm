@@ -136,6 +136,8 @@ static AttnW attnWeights(const std::string& A, int blk, int C) {
   });
   return {w, b, H, D};
 }
+// a pair bias's row stride: padded with -inf to a whole 64-key tile (af2_bias_layout; the attention's NT kernel, core.mm)
+static int biasStride(int L) { return (L + 63) / 64 * 64; }
 // xn [Bt][n][C] (or the leading axis attended, `across`: xn [n][Bt][C]) -> the residual += attention's output projection
 template <class T>
 static void attend(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const half* bias, const float* mask,
@@ -158,7 +160,8 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
     else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)Bt * C; g.sy = (int64_t)r * 4 * W; g.batch = n; }
     gemm(g);
     Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = w.H; at.D = w.D; at.rows = r; at.scale = 1.f / sqrtf((float)w.D);
-    at.bias = bias; at.biasStride = n; at.mask = mask; at.maskB = maskB; at.maskK = maskK; at.r0 = r0;
+    at.bias = bias; at.biasStride = bias ? biasStride(n) : n; at.biasPadInf = bias != nullptr;
+    at.mask = mask; at.maskB = maskB; at.maskK = maskK; at.r0 = r0;
     if (!across) at.out = o + (size_t)r0 * n * W;
     else {
       at.rowStride = 4 * W; at.posStride = (int64_t)r * 4 * W;
@@ -176,7 +179,7 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
   }
   linearWB(o, A + "/output_w", A + "/output_b", blk, residual, rows, W, C, 1.f);
 }
-// a pair bias [H][L][L] (log2 units, + 1e9 (mask - 1) where a mask is given) from LN(pair) W
+// a pair bias [H][L][biasStride(L)] (log2 units, + 1e9 (mask - 1) where a mask is given, -inf past L) from LN(pair) W
 template <class T>
 static half* pairBias(const T* pair, int L, int C, const std::string& normW, const std::string& projW, int blk, int H,
                       const float* pairMask, bool transposed, half** normed = nullptr) {
@@ -186,8 +189,10 @@ static half* pairBias(const T* pair, int L, int C, const std::string& normW, con
   float* proj = scratch<float>("bias.proj", pairs * H);
   Gemm g{}; g.X = pn; g.tx = F16; g.W = PH(projW, blk); g.tw = F16; g.Y = proj; g.rows = pairs; g.in = C; g.out = H; g.label = "pair bias";
   gemm(g);
-  half* b = scratch<half>("bias.b", (size_t)H * pairs);
-  run1d("af2_bias_layout", pairs * H, BiasLayoutArgs{proj, pairMask, b, (uint)L, (uint)H, transposed ? 1u : 0u, 0});
+  // (rows padded with -inf to a whole 64-key tile: biasStride(L), and the attention's NT kernel - core.mm)
+  const int S = biasStride(L);
+  half* b = scratch<half>("bias.b", (size_t)H * L * S);
+  run1d("af2_bias_layout", (size_t)H * L * S, BiasLayoutArgs{proj, pairMask, b, (uint)L, (uint)H, transposed ? 1u : 0u, (uint)S});
   return b;
 }
 
