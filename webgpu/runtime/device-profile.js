@@ -449,6 +449,9 @@ export const DEFAULT_TUNING = Object.freeze({
   // AF3's MSA stack: the MSA rows one msa.project workgroup normalises and projects; null takes MSA_PROJECT_ROWS
   // (webgpu/af3/trunk/msa-stack.js), 1 the row-a-workgroup kernel - the control.
   msaProjectRows: null,
+  // grid.attend's tiled half form: its tile maximum by subgroup shuffles where the device has 32-lane subgroups; false
+  // is the control (a workgroup round trip and a barrier a key tile).
+  gridAttendSubgroups: null,
   // ...and the consecutive tokens one msa.average workgroup takes; null takes MSA_AVERAGE_ROWS, 1 the control.
   msaAverageRows: null,
   // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the

@@ -958,11 +958,15 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
     // flags grid.attend 668 -> 491 ms a 255-token trunk pass: workgroup traffic halves, and the key tile no longer
     // shares P's array (P's own is f16 too). Off on a stack pinned to f32 (the confidence heads).
     const H = shape.attendTiledHalf === true;
+    // ...and the tile's row maximum across a query's eight lanes by subgroup shuffles where the device has subgroups
+    // (`attendSubgroupMax`): no workgroup write, read or barrier for it. Half tiles only - the f32 form's P shares the
+    // key tile, which that barrier also guarded. Assumes 32-lane subgroups laid out by invocation index (Apple's)
+    const SG = H && shape.attendSubgroupMax === true;
     const TE = H ? "f16" : "f32";
     const toT = (e) => (H ? `vec4<f16>(${e})` : e);
     const fromT = (e) => (H ? `vec4<f32>(${e})` : e);
     const maxOf = (a) => BKs.map((b) => `logit${a}_${b}`).reduce((x, y) => `max(${x}, ${y})`);
-    return `${H ? "enable f16;\n" : ""}${common}
+    return `${H ? "enable f16;\n" : ""}${SG ? "enable subgroups;\n" : ""}${common}
 @group(0) @binding(0) var<storage, read> q: array<${store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(1) var<storage, read> k: array<${store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(2) var<storage, read> v: array<${store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
@@ -1044,10 +1048,13 @@ ${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
 ${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + bias[bias_row${a} + jc${b}];
     if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
     if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
-${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
-    workgroupBarrier();
-${eachA((a) => `    var tile_max${a} = red[(${a * 8}u + qg) * 8u];
-    for (var r = 1u; r < 8u; r += 1u) { tile_max${a} = max(tile_max${a}, red[(${a * 8}u + qg) * 8u + r]); }
+${SG ? "" : `${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
+    workgroupBarrier();`}
+${eachA((a) => `${SG ? `    var tile_max${a} = ${maxOf(a)};
+    tile_max${a} = max(tile_max${a}, subgroupShuffleXor(tile_max${a}, 1u));
+    tile_max${a} = max(tile_max${a}, subgroupShuffleXor(tile_max${a}, 2u));
+    tile_max${a} = max(tile_max${a}, subgroupShuffleXor(tile_max${a}, 4u));` : `    var tile_max${a} = red[(${a * 8}u + qg) * 8u];
+    for (var r = 1u; r < 8u; r += 1u) { tile_max${a} = max(tile_max${a}, red[(${a * 8}u + qg) * 8u + r]); }`}
     let new_m${a} = max(m${a}, tile_max${a});
     let alpha${a} = exp(m${a} - new_m${a});
     m${a} = new_m${a};

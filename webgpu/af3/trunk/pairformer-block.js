@@ -464,6 +464,10 @@ export class Af3PairformerStackGpu {
       // ...in f16 where the device has it and this stack is not pinned to f32 (the confidence heads are)
       attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
         && halfPrecisionAvailable(this.device),
+      // ...its tile maximum by subgroup shuffles where the device has 32-lane subgroups (`gridAttendSubgroups: false`
+      // the control): bit-identical, 3-4% of the kernel on an M5
+      attendSubgroupMax: this.device.features.has("subgroups") && (this.device.adapterInfo?.subgroupMinSize ?? 0) === 32
+        && (this.device.adapterInfo?.subgroupMaxSize ?? 0) === 32 && deviceTuning(this.device).gridAttendSubgroups !== false,
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
