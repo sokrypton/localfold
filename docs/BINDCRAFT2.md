@@ -97,6 +97,22 @@ AND backward on this machine, on CPU and on `mtl`. Every Metal backward kernel c
 the exact haiku module it replaces, at the same shapes, instead of against a hand-derived reference that repeats the
 derivation. That is the independent reference AGENTS.md asks for.
 
+Rebuilding it, which takes a couple of minutes and needs no weights at all (random haiku init is enough - the
+question is the derivative, not the checkpoint):
+
+```bash
+python3.12 -m venv .venv-mtl                       # 3.12+; macOS 26+ for the plugin
+.venv-mtl/bin/pip install jax==0.11.2 jaxlib==0.11.2 metal-pjrt-plugin \
+                          dm-haiku optax ml_collections absl-py biotite
+git clone --depth=1 https://github.com/sokrypton/BindCraft2   # for bindcraft/af/alphafold
+JAX_PLATFORMS=mtl .venv-mtl/bin/python your_probe.py          # or =cpu for the oracle's oracle
+```
+
+Two traps found doing it. The plugin loads but does **not** become the default device - without `JAX_PLATFORMS=mtl`
+`jax.devices()` returns `CpuDevice` and everything silently runs on the CPU, which looks like a working Metal run.
+And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, and needs a real PRNG key passed to
+`apply` even with dropout off.
+
 ### Staging
 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
