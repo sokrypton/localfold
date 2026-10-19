@@ -1358,6 +1358,15 @@ AF3 255-token trunk, ABBA x2: grid.attend 386 / 399 / 403 / 415 ms against 403 /
 grid.project level (325-348 against 332-349). check-af3-grid-attention `--qkv-half` gives the same relRMS; test:stock
 identical on and off. Not under the matrix projection, which writes f32.
 
+**The rest of the K/V staging, tried and dropped (probe-attend-parts.js, 512 tokens).**
+- The next key tile loaded into registers while the current one computes: 33.5 against 33.55 ms (32.0 either way on
+  f16 q/k/v). Occupancy hides the loads already.
+- More query groups a workgroup, so one staged key tile serves more queries (a third tile figure, QG): 16 groups (128
+  lanes) 31.7 against 32.7 alone but 27.4 against 27.6 on everything shipped - the f16 q/k/v took most of what it
+  offered. 4 groups 48, 32 groups 47.8 and NOT bit-identical (2.4e-4; unexplained - a 256-lane workgroup on Dawn/Metal
+  is worth suspecting before reusing that shape). 4x8 tiles 46.9.
+- Everything shipped this round together, in the probe: 32.55 -> 27.6 ms (-15%).
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
 The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,

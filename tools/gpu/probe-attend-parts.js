@@ -1,7 +1,9 @@
 /**
  * grid.attend's tiled f16 kernel (the M5's shipped form) with parts of its logits removed, timed against itself.
  *     node tools/gpu-chrome.mjs tools/gpu/probe-attend-parts.js --tokens=512
- * Arms: shipped; nomask (the per-key mask read and its branch gone); notail (the key-past-n branch gone); both.
+ * Arms: shipped; nomask (the per-key mask read and its branch gone); notail (the key-past-n branch gone); both; and
+ * the rest below. `all` is every knob since shipped (f16 q/k/v, subgroup max, vec4 bias, mask-free); arms that read
+ * q/k/v as f16 read the f32 noise's bits and give no rel.
  */
 import { createGridAttentionShaders, packGridAttentionWeights } from "../../webgpu/af3/trunk/grid-attention.js";
 
@@ -41,6 +43,9 @@ export async function main(device, args) {
   // q, k and v stored in f16 (the projection writing them so): the staging reads half the bytes, no conversion
   variants.qkvhalf = attend.replace(/var<storage, read> (q|k|v): array<vec4<f32>>;/g, "var<storage, read> $1: array<vec4<f16>>;");
   variants.kvhalf = attend.replace(/var<storage, read> (k|v): array<vec4<f32>>;/g, "var<storage, read> $1: array<vec4<f16>>;");
+  // ...on everything shipped (f16 q/k/v, subgroup max, vec4 bias, mask-free)
+  const all = { attendQkvHalf: true, attendSubgroupMax: device.features.has("subgroups"), attendBiasVec4: true, attendMaskFree: true };
+  variants.all = shaderFor(all);
   variants.nop = attend.replace(/\n\s*kp_tile\[\([^;]*\] = vec4<f16>\([^;]*;/g, "");
   // (the parts priced by removing them: wrong answers on purpose)
   variants.noexp = attend.replace(/\bexp\(/g, "fexp(").replace("@compute", "fn fexp(x: f32) -> f32 { return x * 0.001 + 1.0; }\n@compute");
@@ -51,16 +56,18 @@ export async function main(device, args) {
   const inputs = [up(noise(pairs * W, 1, 2)), up(noise(pairs * W, 2, 2)), up(noise(pairs * W, 3, 1)), up(noise(H * pairs, 4, 2)),
                   up(new Float32Array(pairs).fill(1))];
   const arms = [];
-  for (const [name, code] of Object.entries(variants)) {
+  for (const [name, variant] of Object.entries(variants)) {
+    // (a variant is a source, or a whole shaderFor result where its row tile differs)
+    const code = typeof variant === "string" ? variant : variant.attend;
+    const rows = typeof variant === "string" ? tiles.attendRows : variant.tiles.attendRows;
     const pipeline = await device.createComputePipelineAsync({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
     const out = device.createBuffer({ size: pairs * W * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    arms.push({ name, pipeline, out, times: [], changed: code !== attend,
+    arms.push({ name, pipeline, out, times: [], changed: code !== attend, groups: [Math.ceil(N / rows), N, H],
       bind: device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [...inputs, out].map((buffer, binding) => ({ binding, resource: { buffer } })) }) });
   }
-  const groups = [Math.ceil(N / tiles.attendRows), N, H];
   const run = async (arm, it) => {
     const enc = device.createCommandEncoder(); const p = enc.beginComputePass(); p.setPipeline(arm.pipeline); p.setBindGroup(0, arm.bind);
-    for (let i = 0; i < it; i += 1) p.dispatchWorkgroups(...groups);
+    for (let i = 0; i < it; i += 1) p.dispatchWorkgroups(...arm.groups);
     p.end(); const t = performance.now(); device.queue.submit([enc.finish()]); await device.queue.onSubmittedWorkDone(); return (performance.now() - t) / it;
   };
   for (const arm of arms) await run(arm, 1);
