@@ -135,8 +135,13 @@ template <class PT = float>
 __global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
                         int Bi, int n, int C, bool biasAfterNorm, float xs = 1.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)Bi * n * C) return;
-  int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / n, j = ij % n;
+  const size_t total = (size_t)Bi * n * C;
+  if (t >= total) return;
+  int f; size_t i, j;
+  if (total <= UINT32_MAX) {     // (32-bit divides where the count allows: a 64-bit divide is a long emulated sequence)
+    unsigned u = (unsigned)t, ij = u / (unsigned)C; f = (int)(u - ij * (unsigned)C);
+    unsigned ii = ij / (unsigned)n; i = i0 + ii; j = ij - ii * (unsigned)n;
+  } else { f = (int)(t % C); size_t ij = t / C; i = i0 + ij / n; j = ij % n; }
   float nv = norm[i * n + j];
   float v = biasAfterNorm ? xs * x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + xs * x[t]) / (1e-3f + nv);
   size_t at = (i * n + j) * C + f;

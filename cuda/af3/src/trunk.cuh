@@ -985,6 +985,36 @@ __global__ void msaVToHeadsK(const T* v, T* out, int S, int n, int heads, int d,
   int j = (int)(rest % np); int h = (int)(rest / np);
   out[t] = j < n ? v[((size_t)s * n + j) * heads * d + h * d + e] : fromF<T>(0.f);
 }
+// ...16 bytes a thread (d a multiple of 8, 16-bit T): a thread a head's 8 elements, the index decomposed once in 32 bits
+// (the element-wise form's 64-bit divides, several an element, held a T4 at ~4 ms a call where an A100 took 0.1): Colab
+// T4, boltz2 5CAJ with a 1,024-row alignment, the pair 34.6 -> 15.2 per thousand of the untouched kernels' time, the fold
+// -1.8%, byte-identical
+template <class T>
+__global__ void msaVToHeadsV(const T* v, T* out, int S, int n, int heads, int d, int np) {
+  const unsigned d8 = (unsigned)d / 8, groups = (unsigned)S * np * heads * d8;
+  const unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= groups) return;
+  unsigned e8 = t % d8, rest = t / d8, s = rest % S; rest /= S;
+  unsigned j = rest % np, h = rest / np;
+  uint4 val = make_uint4(0, 0, 0, 0);
+  if (j < (unsigned)n) val = *reinterpret_cast<const uint4*>(v + ((size_t)s * n + j) * heads * d + h * d + e8 * 8);
+  *reinterpret_cast<uint4*>(out + (size_t)t * 8) = val;
+}
+// o [h][i][s][e] -> [s][i][h*d+e], times sigmoid(gate)
+template <class T>
+__global__ void msaFromHeadsV(const T* o, const T* gate, T* out, int S, int n, int heads, int d) {
+  const unsigned Wd8 = (unsigned)heads * d / 8, d8 = (unsigned)d / 8;
+  const unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (unsigned)S * n * Wd8) return;
+  unsigned c8 = t % Wd8, si = t / Wd8, i = si % n, s = si / n, h = c8 / d8, e8 = c8 % d8;
+  const uint4 ov = *reinterpret_cast<const uint4*>(o + (((size_t)h * n + i) * S + s) * d + e8 * 8);
+  const uint4 gv = *reinterpret_cast<const uint4*>(gate + (size_t)t * 8);
+  const T* op = reinterpret_cast<const T*>(&ov); const T* gp = reinterpret_cast<const T*>(&gv);
+  uint4 r; T* rp = reinterpret_cast<T*>(&r);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) rp[k] = fromF<T>(toF(op[k]) * (1.f / (1.f + expf(-toF(gp[k])))));
+  *reinterpret_cast<uint4*>(out + (size_t)t * 8) = r;
+}
 // o [h][i][s][e] -> [s][i][h*d+e], times sigmoid(gate)
 template <class T>
 __global__ void msaFromHeadsK(const T* o, const T* gate, T* out, int S, int n, int heads, int d) {
@@ -995,6 +1025,21 @@ __global__ void msaFromHeadsK(const T* o, const T* gate, T* out, int S, int n, i
   out[t] = fromF<T>(toF(o[(((size_t)h * n + i) * S + s) * d + e]) * (1.f / (1.f + expf(-toF(gate[t])))));
 }
 
+// the two above where they apply (16-bit, d a multiple of 8, a count 32 bits hold), else the element-wise forms
+template <class T>
+inline void msaVToHeads(const T* v, T* out, int S, int n, int heads, int d, int np) {
+  const size_t elems = (size_t)S * np * heads * d;
+  if (sizeof(T) == 2 && d % 8 == 0 && elems / 8 < (1ull << 31))
+    msaVToHeadsV<T><<<(unsigned)((elems / 8 + 255) / 256), 256, 0, STREAM>>>(v, out, S, n, heads, d, np);
+  else msaVToHeadsK<T><<<blocks(elems), 256, 0, STREAM>>>(v, out, S, n, heads, d, np);
+}
+template <class T>
+inline void msaFromHeads(const T* o, const T* gate, T* out, int S, int n, int heads, int d) {
+  const size_t elems = (size_t)S * n * heads * d;
+  if (sizeof(T) == 2 && d % 8 == 0 && elems / 8 < (1ull << 31))
+    msaFromHeadsV<T><<<(unsigned)((elems / 8 + 255) / 256), 256, 0, STREAM>>>(o, gate, out, S, n, heads, d);
+  else msaFromHeadsK<T><<<blocks(elems), 256, 0, STREAM>>>(o, gate, out, S, n, heads, d);
+}
 // several GPUs on a sharded pair: the weighted sums for this rank's tokens i (its rows of the weights), the MSA's
 // columns for them updated, then every rank's columns all-gathered (the MSA is replicated)
 // o [h][ii][s][e] (ni tokens from i0) -> [s][ii][h*d+e], times sigmoid(gate[s][i0 + ii])
@@ -1054,7 +1099,7 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * n;
     const T* lnc = ln + (size_t)s0 * n * Cm;
     linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
-    msaVToHeadsK<T><<<blocks((size_t)sc * ldw * Wd), 256, 0, STREAM>>>(v, vh, sc, n, heads, d, ldw);
+    msaVToHeads<T>(v, vh, sc, n, heads, d, ldw);
     // per head: O_h (ni x sc*d) = W_h (ni x n) V_h (n x sc*d); col-major O^T = V^T W^T
     CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, ni, ldw, &one, vh, cudaType<T>(), sc * d,
        (size_t)ldw * sc * d, wT, cudaType<T>(), ldw, (size_t)ni * ldw, &zero, oh, cudaType<T>(), sc * d, (size_t)ni * sc * d, heads,
@@ -1136,14 +1181,14 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
     const T* lnc = ln + (size_t)s0 * n * Cm;
     linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
     if (chaiMask) scaleRowsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, t.msaMask + (size_t)s0 * n, cr, Wd);
-    msaVToHeadsK<T><<<blocks((size_t)sc * ldw * Wd), 256, 0, STREAM>>>(v, vh, sc, n, heads, d, ldw);
+    msaVToHeads<T>(v, vh, sc, n, heads, d, ldw);
     // per head: O_h (n x sc*d) = W_h (n x n) V_h (n x sc*d); col-major O^T = V^T W^T
     // (K = ldw: the weights' padded columns and the values' padded rows are zero)
     CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, n, ldw, &one, vh, cudaType<T>(), sc * d,
        (size_t)ldw * sc * d, wT, cudaType<T>(), ldw, (size_t)n * ldw, &zero, oh, cudaType<T>(), sc * d, (size_t)n * sc * d, heads,
        CUBLAS_COMPUTE_32F, algo));
     linear<T, T>(lnc, gate, cr, Cm, Wd, pre + ".gatingQuery");
-    msaFromHeadsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, gate, gated, sc, n, heads, d);
+    msaFromHeads<T>(oh, gate, gated, sc, n, heads, d);
     linear<T, float>(gated, t.msa + (size_t)s0 * n * Cm, cr, Wd, Cm, pre + ".outputProjection", false, 1.f);
   }
   // (on a card short of room its pair-sized buffers go now, before the block's pair track allocates)

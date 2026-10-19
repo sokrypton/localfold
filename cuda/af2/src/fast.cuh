@@ -244,11 +244,39 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
     cpCommit();
   };
   const int tiles = N / NC;
+#if LF_REG_STAGES
+  // (sm_75, no cp.async - cpAsync16 a load and a store: the next tile loaded into registers before this tile's MMAs,
+  // stored into the idle stage after them, one barrier a tile)
+  RegStage<ITER> next;
+  auto loadR = [&](int n) {
+#pragma unroll
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
+      next.load(it, Wt + ((size_t)n * C + t / (NC / 8)) * NC + (t % (NC / 8)) * 8);
+    }
+  };
+  auto storeR = [&](int st) {
+    half* w = Ws(st);
+#pragma unroll
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
+      next.store(it, w + stageSw<NC>(t / (NC / 8), (t % (NC / 8)) * 8));
+    }
+  };
+  loadR(0); storeR(0);
+#else
   issue(0, 0);
+#endif
   for (int n = 0; n < tiles; ++n) {
     int st = n & 1;
+#if LF_REG_STAGES
+    if (n + 1 < tiles) loadR(n + 1);
+#else
     if (n + 1 < tiles) { issue(n + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+#endif
     __syncthreads();
     const half* w = Ws(st);
     float acc[MT][2][4] = {};
@@ -271,7 +299,11 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
         if (ra < rows) *reinterpret_cast<half2*>(o + ra * ld) = __floats2half2_rn(acc[mt][nt][0] + b0, acc[mt][nt][1] + b1);
         if (rb < rows) *reinterpret_cast<half2*>(o + rb * ld) = __floats2half2_rn(acc[mt][nt][2] + b0, acc[mt][nt][3] + b1);
       }
+#if LF_REG_STAGES
+    if (n + 1 < tiles) storeR(st ^ 1);               // (stage st ^ 1 last read before this tile's barrier)
+#else
     __syncthreads();                                 // (the stage this read is the next issue's)
+#endif
   }
 }
 template <int C, class PT = float>
