@@ -179,4 +179,122 @@ void outerProductMeanBwd(const float* msa, const float* mask, size_t S, int N, i
   layerNormBwd(msa, dact, dMsa, rows, Cm, lnScale, dLnScale, dLnOffset);
 }
 
+// a batched GEMM over the channel: every operand is [batch][rows * in] with one plane a channel
+static void batched(const float* X, bool transX, const float* W, bool transW, float* Y,
+                    size_t rows, int in, int out, int batch, size_t plane, float beta = 0.f) {
+  Gemm g{};
+  g.X = X; g.transX = transX;
+  g.W = W; g.transW = transW;
+  g.Y = Y; g.beta = beta;
+  g.rows = rows; g.in = in; g.out = out;
+  g.batch = batch;
+  g.sx = (int64_t)plane; g.sw = (int64_t)plane; g.sy = (int64_t)plane;
+  gemm(g);
+}
+
+void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int C, int I, bool outgoing,
+                               const TriMulWeights& w, const float* dOut, float* dPair, const TriMulGrads& gr) {
+  if (!N) return;
+  const size_t n2 = (size_t)N * N;
+  const size_t plane = n2;                     // one channel's [N][N] matrix
+  auto rowBuf = [&](const char* name, int width) {
+    return (float*)scratchBytes(std::string("design.tri.") + name, n2 * (size_t)width * sizeof(float));
+  };
+  float* act0 = rowBuf("act0", C);
+  float* aM = rowBuf("aM", I);
+  float* bM = rowBuf("bM", I);
+  float* gaPre = rowBuf("gaPre", I);
+  float* gbPre = rowBuf("gbPre", I);
+  float* gPre = rowBuf("gPre", C);
+  float* arow = rowBuf("arow", I);
+  float* brow = rowBuf("brow", I);
+  float* prow = rowBuf("prow", I);
+  float* q = rowBuf("q", I);
+  float* o = rowBuf("o", C);
+  float* tmpI = rowBuf("tmpI", I);
+  float* tmpI2 = rowBuf("tmpI2", I);
+  float* tmpC = rowBuf("tmpC", C);
+  float* A = rowBuf("A", I);                   // the packed [I][n2] planes
+  float* B = rowBuf("B", I);
+  float* P = rowBuf("P", I);
+
+  auto linFwd = [&](const float* X, const float* W, const float* b, float* Y, int in, int out) {
+    Gemm g{}; g.X = X; g.W = W; g.Y = Y; g.rows = n2; g.in = in; g.out = out; g.bias = b; gemm(g);
+  };
+  auto pack = [&](const float* src, float* dst, int width) {
+    run1d("lf_tri_pack", n2 * width, TriPackArgs{src, dst, n2 * width, n2, (uint)width, 0});
+  };
+  auto unpack = [&](const float* src, float* dst, int width) {
+    run1d("lf_tri_unpack", n2 * width, TriPackArgs{src, dst, n2 * width, n2, (uint)width, 0});
+  };
+  auto maskMul = [&](float* y, int width) {
+    run1d("lf_opm_mask", n2 * width, OpmMaskArgs{y, mask, n2 * width, (uint)N, (uint)width, 0, 0});
+  };
+
+  // ---------------- the forward, recomputed
+  layerNorm(pair, act0, n2, C, w.lnScale, w.lnOffset);
+  linFwd(act0, w.Wl, w.bl, aM, C, I);
+  maskMul(aM, I);
+  linFwd(act0, w.Wr, w.br, bM, C, I);
+  maskMul(bM, I);
+  linFwd(act0, w.Wlg, w.blg, gaPre, C, I);
+  linFwd(act0, w.Wrg, w.brg, gbPre, C, I);
+  run1d("lf_mul_sigmoid", n2 * I, MulSigmoidArgs{aM, gaPre, arow, n2 * (size_t)I});
+  run1d("lf_mul_sigmoid", n2 * I, MulSigmoidArgs{bM, gbPre, brow, n2 * (size_t)I});
+  pack(arow, A, I);
+  pack(brow, B, I);
+  // outgoing p_c = A_c B_c^T (B_c stored [j][k], read transposed);  incoming p_c = B_c^T A_c
+  if (outgoing) batched(A, false, B, true, P, N, N, N, I, plane);
+  else          batched(B, true, A, false, P, N, N, N, I, plane);
+  unpack(P, prow, I);
+  layerNorm(prow, q, n2, I, w.centerScale, w.centerOffset);
+  linFwd(q, w.Wo, w.bo, o, I, C);
+  linFwd(act0, w.Wg, w.bg, gPre, C, C);
+
+  // ---------------- the output gate, and the two paths out of it
+  // out = o * sigmoid(gPre): tmpC gets d/do, and the gate's own cotangent goes back through its linear
+  float* dgPre = rowBuf("dgPre", C);
+  gateBwd(dOut, o, gPre, tmpC, dgPre, n2 * (size_t)C);
+  linearBwd(act0, w.Wg, dgPre, dPair, gr.Wg, gr.bg, n2, C, C, false);   // the first contributor to dact0
+  float* dact0 = dPair;                                                 // accumulated in place from here on
+
+  // ---------------- the output projection and the centre LayerNorm
+  linearBwd(q, w.Wo, tmpC, tmpI, gr.Wo, gr.bo, n2, I, C);
+  layerNormBwd(prow, tmpI, tmpI2, n2, I, w.centerScale, gr.centerScale, gr.centerOffset);
+
+  // ---------------- the product. dP is packed in place of P, which is finished with
+  float* dP = P;
+  pack(tmpI2, dP, I);
+  float* dA = (float*)scratchBytes("design.tri.dA", n2 * (size_t)I * sizeof(float));
+  float* dB = (float*)scratchBytes("design.tri.dB", n2 * (size_t)I * sizeof(float));
+  if (outgoing) {
+    // p[i][j] = sum_k a[i][k] b[j][k]:  da = dP B,  db = dP^T A
+    batched(dP, false, B, false, dA, N, N, N, I, plane);
+    batched(dP, true, A, false, dB, N, N, N, I, plane);
+  } else {
+    // p[i][j] = sum_k a[k][j] b[k][i]:  da = B dP,  db = A dP^T
+    batched(B, false, dP, false, dA, N, N, N, I, plane);
+    batched(A, false, dP, true, dB, N, N, N, I, plane);
+  }
+  unpack(dA, arow, I);     // (arow and brow are finished with: the packed copies were the operands)
+  unpack(dB, brow, I);
+
+  // ---------------- the two gated projections, then the input LayerNorm
+  // a = aM * sigmoid(gaPre), and aM = mask * linear, so the mask multiplies the cotangent too
+  gateBwd(arow, aM, gaPre, tmpI, tmpI2, n2 * (size_t)I);
+  maskMul(tmpI, I);
+  linearBwd(act0, w.Wl, tmpI, dact0, gr.Wl, gr.bl, n2, C, I, true);
+  linearBwd(act0, w.Wlg, tmpI2, dact0, gr.Wlg, gr.blg, n2, C, I, true);
+
+  gateBwd(brow, bM, gbPre, tmpI, tmpI2, n2 * (size_t)I);
+  maskMul(tmpI, I);
+  linearBwd(act0, w.Wr, tmpI, dact0, gr.Wr, gr.br, n2, C, I, true);
+  linearBwd(act0, w.Wrg, tmpI2, dact0, gr.Wrg, gr.brg, n2, C, I, true);
+
+  // dact0 is dPair's buffer; the LayerNorm reads it and overwrites it with the module's own cotangent
+  float* dln = rowBuf("dln", C);
+  copy(dln, dact0, n2 * (size_t)C * sizeof(float));
+  layerNormBwd(pair, dln, dPair, n2, C, w.lnScale, gr.lnScale, gr.lnOffset);
+}
+
 }  // namespace mt

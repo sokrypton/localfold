@@ -34,6 +34,15 @@ struct ReluBwdArgs { CP(float) dy; CP(float) ref; DP(float) dx; u64 n; };
 // `g` is the gate BEFORE the sigmoid (what the linear wrote); dy and dg may alias their inputs.
 struct GateBwdArgs { CP(float) dout; CP(float) y; CP(float) g; DP(float) dy; DP(float) dg; u64 n; };
 
+// y = x * sigmoid(g) - the forward of the triangle's two gated projections, recomputed on the way back
+struct MulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
+
+// The triangle's product is a batched GEMM over CHANNELS, so its operands are held channel-major: a pair tensor
+// [n2][C] becomes [C][n2] (pack) and back (unpack). n2 = N * N. This is the same reason metal/core's forward keeps
+// channel-major planes for the triangle (gemmTriGate writes them that way); without it each channel's matrix is
+// strided by C and the product cannot be one GEMM.
+struct TriPackArgs { CP(float) src; DP(float) dst; u64 n; u64 n2; uint C; uint pad; };
+
 // ---------------------------------------------------------------- OuterProductMean (Alg. 10)
 // The forward, as AF2 writes it (modules.py:1157-1212):
 //   act    = LayerNorm(msa)                            [S][N][Cm]

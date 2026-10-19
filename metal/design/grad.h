@@ -85,4 +85,46 @@ void outerProductMeanBwd(const float* msa, const float* mask, size_t S, int N, i
                          float* dWo = nullptr, float* dbo = nullptr,
                          float eps = 1e-3f, int tile = 8);
 
+// ---------------------------------------------------------------- TriangleMultiplication (Alg. 11 / 12)
+// The forward, as AF2 writes it (modules.py:947-1012). With n2 = N * N pair rows, C the pair width and I the
+// intermediate width (num_intermediate_channel):
+//   act0 = LayerNorm_input(pair)                       [n2][C]
+//   aM   = mask * (act0 Wl  + bl)     a = aM * sigmoid(act0 Wlg + blg)       [n2][I]
+//   bM   = mask * (act0 Wr  + br)     b = bM * sigmoid(act0 Wrg + brg)       [n2][I]
+//   p    = outgoing ? sum_k a[i][k][c] b[j][k][c] : sum_k a[k][j][c] b[k][i][c]
+//   q    = LayerNorm_center(p)
+//   out  = (q Wo + bo) * sigmoid(act0 Wg + bg)         [n2][C]
+// Note the ORDER: the mask multiplies the projection, then the gate multiplies that - not the other way round.
+//
+// This is where the Evoformer's O(N^3) lives, so the two contractions of the backward are BATCHED GEMMS over the
+// channel, which means the operands are packed channel-major ([n2][I] -> [I][n2]) exactly as metal/core's forward
+// keeps them. See `grad.mm` for the four products, which differ between the two equations.
+//
+//   pair     [n2][C], the module's input;  mask [n2]
+//   dOut     [n2][C], the cotangent of its output;  dPair [n2][C], written
+// Any parameter gradient may be null.
+struct TriMulWeights {
+  const float* lnScale; const float* lnOffset;            // the input LayerNorm
+  const float* Wl; const float* bl;                       // left_projection   [C][I]
+  const float* Wr; const float* br;                       // right_projection  [C][I]
+  const float* Wlg; const float* blg;                     // left_gate         [C][I]
+  const float* Wrg; const float* brg;                     // right_gate        [C][I]
+  const float* centerScale; const float* centerOffset;    // the centre LayerNorm
+  const float* Wo; const float* bo;                       // output_projection [I][C]
+  const float* Wg; const float* bg;                       // gating_linear     [C][C]
+};
+struct TriMulGrads {
+  float* lnScale = nullptr; float* lnOffset = nullptr;
+  float* Wl = nullptr; float* bl = nullptr;
+  float* Wr = nullptr; float* br = nullptr;
+  float* Wlg = nullptr; float* blg = nullptr;
+  float* Wrg = nullptr; float* brg = nullptr;
+  float* centerScale = nullptr; float* centerOffset = nullptr;
+  float* Wo = nullptr; float* bo = nullptr;
+  float* Wg = nullptr; float* bg = nullptr;
+};
+void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int C, int I, bool outgoing,
+                               const TriMulWeights& w, const float* dOut, float* dPair,
+                               const TriMulGrads& g = {});
+
 }  // namespace mt

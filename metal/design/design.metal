@@ -73,6 +73,31 @@ kernel void lf_gate_bwd(LF_ARGS(GateBwdArgs)) {
   if (a.dg) a.dg[i] = d * y * s * (1.f - s);
 }
 
+// ---------------------------------------------------------------- the triangle's helpers
+kernel void lf_mul_sigmoid(LF_ARGS(MulSigmoidArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  a.y[i] = a.x[i] * (1.f / (1.f + exp(-a.g[i])));
+}
+
+// [n2][C] -> [C][n2]
+kernel void lf_tri_pack(LF_ARGS(TriPackArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  const uint c = (uint)(i - lf_udiv((uint)i, a.C) * a.C);
+  const ulong r = i / (ulong)a.C;
+  a.dst[(ulong)c * a.n2 + r] = a.src[i];
+}
+
+// [C][n2] -> [n2][C]
+kernel void lf_tri_unpack(LF_ARGS(TriPackArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  const uint c = (uint)(i - lf_udiv((uint)i, a.C) * a.C);
+  const ulong r = i / (ulong)a.C;
+  a.dst[i] = a.src[(ulong)c * a.n2 + r];
+}
+
 // ---------------------------------------------------------------- OuterProductMean's backward
 // Every kernel here is one thread an output element, looping the contracted axes in a fixed order. The strided reads
 // (dP's j stride is O*O) are the optimisation surface and are left alone deliberately: correctness first.

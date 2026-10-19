@@ -546,6 +546,157 @@ static void opmCase(size_t S, int N, int Cm, int O, int F, int tile) {
   release(gdBl); release(gdWr); release(gdBr); release(gdWo); release(gdBo);
 }
 
+// ---------------------------------------------------------------- TriangleMultiplication, the whole module
+struct TriP {
+  std::vector<double> lnScale, lnOffset, Wl, bl, Wr, br, Wlg, blg, Wrg, brg,
+      centerScale, centerOffset, Wo, bo, Wg, bg;
+};
+static double sigm(double x) { return 1.0 / (1.0 + exp(-x)); }
+
+// modules.py:947-1012, in double
+static void triForward(const std::vector<double>& pair, const std::vector<double>& mask, int N, int C, int I,
+                       bool outgoing, const TriP& p, std::vector<double>& out) {
+  const size_t n2 = (size_t)N * N;
+  std::vector<double> act0;
+  lnForward(pair, n2, C, p.lnScale, p.lnOffset, 1e-5, act0);
+  std::vector<double> a(n2 * I), b(n2 * I);
+  for (size_t r = 0; r < n2; ++r)
+    for (int c = 0; c < I; ++c) {
+      double l = p.bl[c], rr = p.br[c], lg = p.blg[c], rg = p.brg[c];
+      for (int k = 0; k < C; ++k) {
+        double v = act0[r * C + k];
+        l += v * p.Wl[(size_t)k * I + c];
+        rr += v * p.Wr[(size_t)k * I + c];
+        lg += v * p.Wlg[(size_t)k * I + c];
+        rg += v * p.Wrg[(size_t)k * I + c];
+      }
+      a[r * I + c] = (l * mask[r]) * sigm(lg);      // the mask first, then the gate
+      b[r * I + c] = (rr * mask[r]) * sigm(rg);
+    }
+  std::vector<double> prod(n2 * I, 0.0);
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j)
+      for (int c = 0; c < I; ++c) {
+        double s = 0;
+        for (int k = 0; k < N; ++k)
+          s += outgoing ? a[((size_t)i * N + k) * I + c] * b[((size_t)j * N + k) * I + c]
+                        : a[((size_t)k * N + j) * I + c] * b[((size_t)k * N + i) * I + c];
+        prod[((size_t)i * N + j) * I + c] = s;
+      }
+  std::vector<double> q;
+  lnForward(prod, n2, I, p.centerScale, p.centerOffset, 1e-5, q);
+  out.assign(n2 * C, 0.0);
+  for (size_t r = 0; r < n2; ++r)
+    for (int c = 0; c < C; ++c) {
+      double o = p.bo[c];
+      for (int k = 0; k < I; ++k) o += q[r * I + k] * p.Wo[(size_t)k * C + c];
+      double g = p.bg[c];
+      for (int k = 0; k < C; ++k) g += act0[r * C + k] * p.Wg[(size_t)k * C + c];
+      out[r * C + c] = o * sigm(g);
+    }
+}
+
+static void triCase(int N, int C, int I, bool outgoing) {
+  const size_t n2 = (size_t)N * N;
+  std::vector<double> pair = randv(n2 * C), dOut = randv(n2 * C, 0.5), mask(n2, 1.0);
+  std::uniform_real_distribution<double> U01(0, 1);
+  for (size_t r = 0; r < n2; ++r) mask[r] = U01(rng) < 0.2 ? 0.0 : 1.0;
+
+  TriP p;
+  p.lnScale = randv(C, 0.4);
+  for (auto& s : p.lnScale) s += 1.0;
+  p.lnOffset = randv(C, 0.2);
+  p.Wl = randv((size_t)C * I, 0.2);   p.bl = randv(I, 0.1);
+  p.Wr = randv((size_t)C * I, 0.2);   p.br = randv(I, 0.1);
+  p.Wlg = randv((size_t)C * I, 0.2);  p.blg = randv(I, 0.1);
+  p.Wrg = randv((size_t)C * I, 0.2);  p.brg = randv(I, 0.1);
+  p.centerScale = randv(I, 0.4);
+  for (auto& s : p.centerScale) s += 1.0;
+  p.centerOffset = randv(I, 0.2);
+  p.Wo = randv((size_t)I * C, 0.2);   p.bo = randv(C, 0.1);
+  p.Wg = randv((size_t)C * C, 0.2);   p.bg = randv(C, 0.1);
+
+  // upload
+  auto up = [&](const std::vector<double>& v) {
+    auto f = toF(v);
+    return uploadNew(f.data(), f.size());
+  };
+  void* dPairIn = up(pair);
+  void* dMask = up(mask);
+  void* dOutB = up(dOut);
+  TriMulWeights w{};
+  void* h[16];
+  const std::vector<double>* srcs[16] = {&p.lnScale, &p.lnOffset, &p.Wl, &p.bl, &p.Wr, &p.br, &p.Wlg, &p.blg,
+                                         &p.Wrg, &p.brg, &p.centerScale, &p.centerOffset, &p.Wo, &p.bo,
+                                         &p.Wg, &p.bg};
+  for (int i = 0; i < 16; ++i) h[i] = up(*srcs[i]);
+  w.lnScale = (const float*)h[0]; w.lnOffset = (const float*)h[1];
+  w.Wl = (const float*)h[2]; w.bl = (const float*)h[3];
+  w.Wr = (const float*)h[4]; w.br = (const float*)h[5];
+  w.Wlg = (const float*)h[6]; w.blg = (const float*)h[7];
+  w.Wrg = (const float*)h[8]; w.brg = (const float*)h[9];
+  w.centerScale = (const float*)h[10]; w.centerOffset = (const float*)h[11];
+  w.Wo = (const float*)h[12]; w.bo = (const float*)h[13];
+  w.Wg = (const float*)h[14]; w.bg = (const float*)h[15];
+
+  void* gPair = alloc(n2 * C * 4);
+  void* gp[16];
+  for (int i = 0; i < 16; ++i) gp[i] = alloc(srcs[i]->size() * 4);
+  TriMulGrads gg{};
+  gg.lnScale = (float*)gp[0]; gg.lnOffset = (float*)gp[1];
+  gg.Wl = (float*)gp[2]; gg.bl = (float*)gp[3];
+  gg.Wr = (float*)gp[4]; gg.br = (float*)gp[5];
+  gg.Wlg = (float*)gp[6]; gg.blg = (float*)gp[7];
+  gg.Wrg = (float*)gp[8]; gg.brg = (float*)gp[9];
+  gg.centerScale = (float*)gp[10]; gg.centerOffset = (float*)gp[11];
+  gg.Wo = (float*)gp[12]; gg.bo = (float*)gp[13];
+  gg.Wg = (float*)gp[14]; gg.bg = (float*)gp[15];
+
+  triangleMultiplicationBwd((const float*)dPairIn, (const float*)dMask, N, C, I, outgoing,
+                            w, (const float*)dOutB, (float*)gPair, gg);
+
+  char shape[80];
+  snprintf(shape, sizeof shape, "%s N%d C%d I%d", outgoing ? "out" : "in", N, C, I);
+
+  auto S_ = [&](const std::vector<double>& pr, const TriP& q) {
+    std::vector<double> o;
+    triForward(pr, mask, N, C, I, outgoing, q, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dOut[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = S_(pair, p);
+      target[j] = save - hh;
+      double bS = S_(pair, p);
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[200];
+    snprintf(lab, sizeof lab, "trimul %s %s", what, shape);
+    report(lab, relRmsD(fd, mine), 3e-5);
+  };
+
+  probe("dPair", pair, download((const float*)gPair, n2 * C), 5);
+  const char* names[16] = {"dLnScale", "dLnOffset", "dWl", "dbl", "dWr", "dbr", "dWlg", "dblg",
+                           "dWrg", "dbrg", "dCenterScale", "dCenterOffset", "dWo", "dbo", "dWg", "dbg"};
+  std::vector<double>* tgt[16] = {&p.lnScale, &p.lnOffset, &p.Wl, &p.bl, &p.Wr, &p.br, &p.Wlg, &p.blg,
+                                  &p.Wrg, &p.brg, &p.centerScale, &p.centerOffset, &p.Wo, &p.bo,
+                                  &p.Wg, &p.bg};
+  for (int i = 0; i < 16; ++i)
+    probe(names[i], *tgt[i], download((const float*)gp[i], srcs[i]->size()), 3);
+
+  release(dPairIn); release(dMask); release(dOutB); release(gPair);
+  for (int i = 0; i < 16; ++i) { release(h[i]); release(gp[i]); }
+}
+
 int main() {
   setSource("design", PORT_SOURCE);
   printf("LayerNorm backward\n");
@@ -568,6 +719,11 @@ int main() {
   opmCase(8, 20, 32, 32, 16, 8);
   opmCase(4, 17, 24, 8, 12, 5);      // a tile that does not divide N
   opmCase(3, 16, 32, 32, 128, 4);    // the real O and F
+  printf("TriangleMultiplication backward (the whole module)\n");
+  triCase(10, 16, 12, true);
+  triCase(10, 16, 12, false);
+  triCase(7, 8, 8, true);
+  triCase(7, 8, 8, false);
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

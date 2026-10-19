@@ -117,7 +117,7 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
-3. **Triangle multiplication**, outgoing and incoming.
+3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
 4. **Attention** - MSA row (with pair bias), MSA column, and both triangle attentions. The flash forward exists;
    the backward does not, and `native/flash_bwd_body.cuh` is 46 KB of what it takes.
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
@@ -195,3 +195,28 @@ Cases include a tile that does not divide N (N=17, T=5) and the reference's real
 Every `lf_opm_*` kernel is one thread an output element looping the contracted axes serially. `dP`'s stride in `j`
 is `O*O`, so the reads are strided; that and the tile constant are the whole optimisation surface, and nothing has
 been measured yet because nothing here is correct-and-slow until the stack runs end to end.
+
+### Stage 3, landed: TriangleMultiplication, both equations
+
+**199 cases, all passing.** Added `lf_mul_sigmoid`, `lf_tri_pack`, `lf_tri_unpack` and
+`triangleMultiplicationBwd`; all 17 gradients (the input and sixteen parameters) agree with central difference at
+**3.7e-8 to 6.6e-7**, for the outgoing AND the incoming equation.
+
+This is where the Evoformer's **O(N^3)** lives, so the shape of the backward matters more here than anywhere so far:
+
+- **The two contractions are batched GEMMs over the channel**, which means the operands are packed channel-major,
+  `[n2][I] -> [I][n2]`. That is the same reason `metal/core`'s forward keeps channel-major planes for the triangle
+  (`gemmTriGate` writes them that way): without it each channel's matrix is strided by `I` and the product cannot be
+  one GEMM. The packs are O(N^2 I) against the product's O(N^3 I), so they are free.
+- **The four products differ between the equations**, and getting them wrong is invisible in a forward test, so both
+  are checked. Outgoing is `p_c = A_c B_c^T`, `dA = dP B`, `dB = dP^T A`; incoming is `p_c = B_c^T A_c`,
+  `dA = B dP`, `dB = A dP^T`.
+- **The order in the forward is mask THEN gate** - `aM = mask * (act0 Wl + bl)` and then `a = aM * sigmoid(...)`
+  (`modules.py:961` against `:980`). So on the way back the gate comes off first and the mask second. Reversing them
+  passes a forward test and fails a gradient test, which is the kind of thing only the central difference catches.
+- `dP` is written over `P`, which is finished with by then, and the whole module recomputes its forward.
+
+**Open, and the next thing to fix here:** this holds about nineteen `[n2][C]`-or-`[n2][I]` scratch buffers, which is
+**~360 MB at N=192, C=I=128** and over a gigabyte at N=384. `metal/core` has `shareScratch` for exactly this - the
+forward's stage families already share slots - and none of it has been applied here yet. Correctness first, but this
+is the ceiling that will bite before the stack runs end to end on 16 GB.
