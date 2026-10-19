@@ -287,14 +287,14 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
 }
 // the MSA16 stack's row (NB false: the pair bias) and column (NB: none) attention, bf16 out, with the pair track's
 // speculative softmax (FLASH_SPEC), and the row attention its 64-key tiles where an SM holds two blocks of them
-// (flash2RWideKeys). A100, 1,000 residues, 508 rows: the row attention 914 -> 862 ms, the column 524 -> 511 (64 keys
+// (flash2RWideKeysFor: unless 48-key tiles pad n meaningfully less). A100, 1,000 residues, 508 rows: the row attention 914 -> 862 ms, the column 524 -> 511 (64 keys
 // there 545: no bias tile for the wider tile to amortise)
 template <bool NB, class B16>
 inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int n, int heads, size_t rows, float scale,
                      size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
   if (flashRegStaged())     // (a T4: the one-stage register-staged form, its tiles as flash2R1Strided's)
     flashGrid2RRun<32, 2, NB ? 48 : 32, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
-  else if (FLASH_SPEC && !NB && flash2RWideKeys())
+  else if (FLASH_SPEC && !NB && flash2RWideKeysFor(n))
     flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC)
     flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);

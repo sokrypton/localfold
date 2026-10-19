@@ -45,10 +45,10 @@
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.044,
+  "ligand": 0.043,
   "nucleic": 0.035,
-  "plddt": 74.48,
-  "ptm": "0.7705",
+  "plddt": 76.1,
+  "ptm": "0.7784",
   "rmsd": null
  },
  "boltz2-5caj-template": {

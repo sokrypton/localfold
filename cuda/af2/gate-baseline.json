@@ -15,9 +15,9 @@
   "rmsd": 1.829
  },
  "5caj-seq": {
-  "plddt": 31.55,
-  "ptm": "0.2066",
-  "rmsd": 20.065
+  "plddt": 31.05,
+  "ptm": "0.2069",
+  "rmsd": 18.456
  },
  "5caj-template": {
   "plddt": 97.22,

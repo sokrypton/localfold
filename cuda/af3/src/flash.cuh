@@ -1142,6 +1142,17 @@ inline bool flash2RWideKeys() {
   }();
   return v;
 }
+// ...and for n keys: 64-key tiles unless 48-key ones pad n meaningfully less (a 64-key tile is ~2.4% cheaper a key where
+// both fit exactly - 384, 768). On the A100, 48 against 64 (two rows a block, SPEC): the grid attention (rows = n)
+// 0.182 / 0.191 ms at 261 tokens, 0.294 / 0.318 at 330, level at 600, 4.343 / 4.245 at 1,000; AF2's MSA row attention
+// (512 rows, n keys) 0.280 / 0.293 at 261, 0.445 / 0.481 at 330, 0.928 / 0.999 at 600, 1.897 / 1.928 at 900, 1.193 / 1.134
+// at 700 (64 there)
+inline bool flash2RWideKeysFor(int n) {
+  if (!flash2RWideKeys()) return false;
+  if (getenv("LOCALFOLD_FLASH_2R_BK")) return true;
+  const int p64 = (n + 63) / 64 * 64, p48 = (n + 47) / 48 * 48;
+  return p64 <= 1.025 * p48;
+}
 // (32: the biased form's 32-key tiles, the bias-free form's 48 - Colab T4 --bench-grid, against 48 for both: biased
 // 0.79 / 0.83 / 0.93 the time at 261 / 512 / 1,024 tokens, bias-free level. Four warps of one query tile each at 32
 // keys measured the same; 16 keys, and two register-staged stages (one barrier a tile), won at one length and lost at
@@ -1520,8 +1531,8 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
-    if (flash2RWideKeys() && FLASH_SPEC) flashGrid2RRun<D, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
-    else if (flash2RWideKeys()) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    if (flash2RWideKeysFor(n) && FLASH_SPEC) flashGrid2RRun<D, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    else if (flash2RWideKeysFor(n)) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else if (FLASH_SPEC) flashGrid2RRun<D, 2, BK, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
