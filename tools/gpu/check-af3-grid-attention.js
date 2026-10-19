@@ -141,7 +141,9 @@ export async function main(device, args) {
           draw.pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT,
           { stagedPrecision, attendTiled: option(args, "tiled", "") === "" ? args.includes("--tiled") : option(args, "tiled", ""),
             // --tiled-half: the tiled form's f16 tiles (gridAttendTiledHalf), held to the f16 bound on both arms
-            attendTiledHalf: args.includes("--tiled-half") });
+            attendTiledHalf: args.includes("--tiled-half"),
+            // --bias-vec4: the tiled form's bias read as vec4 from permuted, padded rows (gridAttendBiasVec4)
+            attendBiasVec4: args.includes("--bias-vec4") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;

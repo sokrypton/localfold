@@ -468,6 +468,9 @@ export class Af3PairformerStackGpu {
       // the control): bit-identical, 3-4% of the kernel on an M5
       attendSubgroupMax: this.device.features.has("subgroups") && (this.device.adapterInfo?.subgroupMinSize ?? 0) === 32
         && (this.device.adapterInfo?.subgroupMaxSize ?? 0) === 32 && deviceTuning(this.device).gridAttendSubgroups !== false,
+      // ...and the bias read as one vec4 a query a tile, from rows the bias pass permutes and pads (`gridAttendBiasVec4:
+      // false` the control): bit-identical
+      attendBiasVec4: deviceTuning(this.device).gridAttendBiasVec4 !== false,
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
@@ -643,7 +646,7 @@ export class Af3PairformerStackGpu {
       const extraPairBias = extraPairBiasData === undefined ? undefined
         : keep(this.allocator.upload("af3-block.extra-pair-bias", extraPairBiasData, storage));
       const biasBuffer = keep(this.allocator.allocate(
-        "af3-block.bias", gridHeads * pairs * 4, storage));
+        "af3-block.bias", (pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
       const pairLogits = keep(this.allocator.allocate(
         "af3-block.pair-logits", heads * pairs * 4, storage));
       const singleWidth = heads * blocks[0].singleAttention.dimension;

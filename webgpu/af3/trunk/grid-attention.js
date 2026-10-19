@@ -430,6 +430,34 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
+  const matrixGeometry = shape.attendMatrix
+    ? gridAttendMatrixGeometry(shape.attendMatrix === true ? undefined : shape.attendMatrix)
+    : null;
+  // 🔴 THE REGISTER-TILED FORM, for a device with no matrix units - which is every visitor (see
+  // CLAUDE.md, round four). `attend` gives a lane ONE query: each key costs it 16 vec4 workgroup reads
+  // for 64 multiply-adds, plus a rescale of all eight accumulators, and nothing it reads is shared with
+  // a second query. Here a lane holds a 4x4 block of (query, key) scores, so a staged vec4 feeds four
+  // dot products; the softmax max is reduced across the eight lanes of a query row through workgroup
+  // memory, the running sum stays a per-lane partial until the end, and the output is rescaled once a
+  // 32-key tile instead of once a key. Same bindings, same masking (the conditional subtraction the
+  // note in `attend` insists on), same clamped indices. Head width 32 only.
+  const tiledShape = (typeof shape.attendTiled === "string" ? shape.attendTiled : "4x4").split("x").map(Number);
+  // workgroup bytes: q and the shared key/P tile at nine vec4 a row (P wider at 8 queries a lane), v at
+  // eight, and the row reduction
+  const tiledBytes = 16 * (8 * tiledShape[0] * 9 + 8 * tiledShape[1] * Math.max(9, 2 * tiledShape[0] + 1)
+    + 8 * tiledShape[1] * 8) + 4 * 8 * tiledShape[0] * 8;
+  const tiled = matrixGeometry === null && (shape.attendTiled === true || typeof shape.attendTiled === "string")
+    && dimension === 32 && tiledBytes <= (shape.maxComputeWorkgroupStorageSize ?? 16384);
+  // 🔴 THE BIAS PERMUTED FOR A VEC4 READ (`attendBiasVec4`, the tiled form at four keys a lane only). A lane reads
+  // keys j0 + b * 8 + kg of a 32-key tile, so the bias pass writes key j of row i at
+  // i * BIAS_KEYS + (j / 32) * 32 + (j % 8) * 4 + (j % 32) / 8 and the attend takes those four in one load: 4.8% of
+  // grid.attend on an M5 (probe-attend-parts.js, biasv4). Rows are padded to whole tiles, so the buffer is
+  // `tiles.biasElements` floats, not heads * n * n; the padding is never read past the key >= N select.
+  const biasVec4 = tiled && shape.attendBiasVec4 === true && tiledShape[1] === 4;
+  const biasKeys = biasVec4 ? Math.ceil(n / 32) * 32 : n;
+  const biasConsts = `const BIAS_KEYS: u32 = ${biasKeys}u;\nconst BIAS_HEAD: u32 = ${n * biasKeys}u;`;
+  const biasDestination = biasVec4 ? "(row / N) * BIAS_KEYS + (row % N) / 32u * 32u + (row % N % 8u) * 4u + (row % N % 32u) / 8u"
+    : "(row / N) * BIAS_KEYS + row % N";
   // bias[h][i][j]. Laid out head-major because the attention pass reads a whole
   // row of it per (row, i, head).
   // 🔴 THE VECTORISED FORM NEEDS FOUR HEADS TO A VECTOR AND OpenDDE's TEMPLATE
@@ -447,6 +475,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // slot and is not where a fold's time goes.
   const vectorHeads = heads % 4 === 0;
   const biasPass = `${common}
+${biasConsts}
 @group(0) @binding(0) var<storage, read> normalized: array<${storageArray(normalizedStorage)}>;
 ${vectorHeads
   ? "// ...as vec4, which is why W_BIAS and HEADS must both be multiples of four.\n"
@@ -462,6 +491,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // 🔴 THE UNTRANSPOSED ROW unless the dialect says otherwise.
   let source = ${swapBias ? "(row % N) * N + row / N" : "row"};
   let base = source * CHANNELS;
+  let destination = ${biasDestination};
   // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR. This
   // looped heads OUTSIDE channels, re-reading the normalised row for each of
   // them and reading one weight per multiply-add.
@@ -474,7 +504,7 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
       `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
   }
   ${Array.from({ length: heads / 4 }, (_, h) => Array.from({ length: 4 }, (_, l) =>
-    `bias[(${h * 4 + l}u) * PAIRS + row] = total${h}.${"xyzw"[l]};`).join("\n  ")).join("\n  ")}`
+    `bias[(${h * 4 + l}u) * BIAS_HEAD + destination] = total${h}.${"xyzw"[l]};`).join("\n  ")).join("\n  ")}`
 : `  ${Array.from({ length: heads }, (_, h) =>
     `var total${h} = 0.0;`).join("\n  ")}
   for (var c = 0u; c < CHANNELS; c += 1u) {
@@ -484,7 +514,7 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
       `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
   }
   ${Array.from({ length: heads }, (_, h) =>
-    `bias[(${h}u) * PAIRS + row] = total${h};`).join("\n  ")}`}
+    `bias[(${h}u) * BIAS_HEAD + destination] = total${h};`).join("\n  ")}`}
 }`;
   // 🔴 AND IT CAN NEVER AGAIN GENERATE NOTHING. An empty body is what the bug
   // above WAS, and it is invisible until a bind group is built from it.
@@ -915,24 +945,6 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
   // dispatch. See the note above `tiles`: a kernel here once processed half its
   // rows because the caller divided by a constant the shader was not built
   // from.
-  const matrixGeometry = shape.attendMatrix
-    ? gridAttendMatrixGeometry(shape.attendMatrix === true ? undefined : shape.attendMatrix)
-    : null;
-  // 🔴 THE REGISTER-TILED FORM, for a device with no matrix units - which is every visitor (see
-  // CLAUDE.md, round four). `attend` gives a lane ONE query: each key costs it 16 vec4 workgroup reads
-  // for 64 multiply-adds, plus a rescale of all eight accumulators, and nothing it reads is shared with
-  // a second query. Here a lane holds a 4x4 block of (query, key) scores, so a staged vec4 feeds four
-  // dot products; the softmax max is reduced across the eight lanes of a query row through workgroup
-  // memory, the running sum stays a per-lane partial until the end, and the output is rescaled once a
-  // 32-key tile instead of once a key. Same bindings, same masking (the conditional subtraction the
-  // note in `attend` insists on), same clamped indices. Head width 32 only.
-  const tiledShape = (typeof shape.attendTiled === "string" ? shape.attendTiled : "4x4").split("x").map(Number);
-  // workgroup bytes: q and the shared key/P tile at nine vec4 a row (P wider at 8 queries a lane), v at
-  // eight, and the row reduction
-  const tiledBytes = 16 * (8 * tiledShape[0] * 9 + 8 * tiledShape[1] * Math.max(9, 2 * tiledShape[0] + 1)
-    + 8 * tiledShape[1] * 8) + 4 * 8 * tiledShape[0] * 8;
-  const tiled = matrixGeometry === null && (shape.attendTiled === true || typeof shape.attendTiled === "string")
-    && dimension === 32 && tiledBytes <= (shape.maxComputeWorkgroupStorageSize ?? 16384);
   const attendShader = matrixGeometry !== null ? createGridAttendMatrixShader(
     { n, heads, dimension, transpose },
     { q: store4.q, k: store4.k, v: store4.v, gathered: gatheredStorage },
@@ -967,10 +979,11 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
     const fromT = (e) => (H ? `vec4<f32>(${e})` : e);
     const maxOf = (a) => BKs.map((b) => `logit${a}_${b}`).reduce((x, y) => `max(${x}, ${y})`);
     return `${H ? "enable f16;\n" : ""}${SG ? "enable subgroups;\n" : ""}${common}
+${biasConsts}
 @group(0) @binding(0) var<storage, read> q: array<${store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(1) var<storage, read> k: array<${store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(2) var<storage, read> v: array<${store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
-@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<${biasVec4 ? "vec4<f32>" : "f32"}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gathered: array<${packGathered ? "vec2<u32>" : "vec4<f32>"}>;
 ${chunkBinding(6)}
@@ -1019,7 +1032,7 @@ ${chunked ? `  let local_row = group.y;
     q_tile[slot * STRIDE + index % HD4] = ${toT(vec4Of("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`))};
   }
 ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
-  let bias_row${a} = head * PAIRS + min(i${a}, N - 1u) * N;
+  let bias_row${a} = head * BIAS_HEAD + min(i${a}, N - 1u) * BIAS_KEYS;
   var m${a} = -3.0e38;
   var l${a} = 0.0;
   var o${a} = vec4<f32>(0.0);`)}
@@ -1045,7 +1058,8 @@ ${eachAB((a, b) => `      s${a}_${b} += ${H ? `f32(dot(qv${a}, kv${b}))` : `dot(
 ${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
     let jc${b} = min(key${b}, N - 1u);
     let masked${b} = mask[${transpose ? `jc${b} * N + row` : `row * N + jc${b}`}];`)}
-${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + bias[bias_row${a} + jc${b}];
+${biasVec4 ? eachA((a) => `    let bv${a} = bias[(bias_row${a} + j0) / 4u + kg];`) : ""}
+${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + ${biasVec4 ? `bv${a}[${b}]` : `bias[bias_row${a} + jc${b}]`};
     if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
     if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
 ${SG ? "" : `${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
@@ -1089,7 +1103,8 @@ ${eachA((a) => `  {
   return { normalize, bias: biasPass, project, attend: attendShader, project_out,
            tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS,
                     attendRows: matrixGeometry !== null ? matrixGeometry.rows
-                      : tiled ? 8 * tiledShape[0] : 64 } };
+                      : tiled ? 8 * tiledShape[0] : 64,
+                    biasElements: heads * n * biasKeys, biasVec4 } };
 }
 
 export class Af3GridSelfAttentionGpu {
@@ -1139,13 +1154,15 @@ export class Af3GridSelfAttentionGpu {
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
         attendMatrix, attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
+        attendBiasVec4: options.attendBiasVec4 === true,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
       + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
       + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`
-      + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`;
+      + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`
+      + `${sources.tiles.biasVec4 ? "v" : ""}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
@@ -1163,7 +1180,7 @@ export class Af3GridSelfAttentionGpu {
       const maskBuffer = keep(this.allocator.upload("af3-grid.mask", mask, storage));
       const weightBuffer = keep(this.allocator.upload("af3-grid.weights", packed.data, storage));
       const normalized = keep(this.allocator.allocate("af3-grid.normalized", pairs * channels * 4, storage));
-      const biasBuffer = keep(this.allocator.allocate("af3-grid.bias", heads * pairs * 4, storage));
+      const biasBuffer = keep(this.allocator.allocate("af3-grid.bias", sources.tiles.biasElements * 4, storage));
       const q = keep(this.allocator.allocate("af3-grid.q", pairs * width * 4, storage));
       const k = keep(this.allocator.allocate("af3-grid.k", pairs * width * 4, storage));
       const v = keep(this.allocator.allocate("af3-grid.v", pairs * width * 4, storage));

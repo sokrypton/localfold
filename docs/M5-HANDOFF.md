@@ -1331,7 +1331,15 @@ attention on NT (level). What is left is the softmax's element work itself, ~20%
 tokens, 32.4 ms: q.k 10.3, P.V 7.5, K/V staging 4.1, the bias reads 2.9, the mask read 0.7, the tail branch and the
 exponentials nothing. No one part dominates, so no Metal-style win: the tile maximum by subgroup shuffles (bit-identical,
 -1 to -3.5%) is shipped; a permuted bias layout read as one vec4 a query (half of the bias reads' cost, -4.8% of the
-kernel in the probe) would need the bias buffer padded to 32 keys in every stack that allocates it - not done.
+kernel in the probe) needed the bias buffer padded to 32 keys in every stack that allocates it - done next.
+
+**The vec4 bias, shipped (`gridAttendBiasVec4`, false the control).** The bias pass writes key j of row i at
+i * BIAS_KEYS + (j / 32) * 32 + (j % 8) * 4 + (j % 32) / 8, rows padded to whole 32-key tiles (BIAS_KEYS), so a lane's
+four keys of a tile are one vec4. The tiled form at four keys a lane only (f32 or f16 tiles); the untiled and matrix
+attends keep the plain layout. The callers allocate `pipelines.gridBiasElements` (+12% of a buffer of n * n * heads
+floats at worst, 0.2 MiB at 257 tokens). AF3 255-token trunk, ABBA x2 with `--profile`: grid.attend 422 / 430 / 437 /
+447 ms against 444 / 447 / 467 / 467 (-4 to -6%), the pass -1%. check-af3-grid-attention gives the same relRMS on both
+arms at 45, 77 and 100 tokens; test:stock's signatures are identical with the knob on and off.
 
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.

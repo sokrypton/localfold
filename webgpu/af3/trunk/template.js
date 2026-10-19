@@ -801,7 +801,7 @@ export class Af3TemplateEmbedderGpu {
   storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
-        "af3-template.bias", gridHeads * pairs * 4, storage));
+        "af3-template.bias", (trackPipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
       // 🔴 `output` AND `readback` ARE ALLOCATED AFTER THE BLOCK LOOP HAS RUN,
       // WHICH IS WORTH A THIRD OF AN AF3 TRUNK'S PEAK. This stage was the
       // largest holder of device memory in the whole trunk - 508 MiB of a 575

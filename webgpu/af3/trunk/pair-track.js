@@ -399,6 +399,7 @@ export async function compilePairTrack(cache, options) {
         // ...and the register-tiled vector attend where there are no matrix units (gridAttendTiled).
         attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
         attendSubgroupMax: options.attendSubgroupMax === true,
+        attendBiasVec4: options.attendBiasVec4 === true,
         chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
@@ -416,6 +417,8 @@ export async function compilePairTrack(cache, options) {
       { q: scratchStorage[1], k: scratchStorage[2],
         v: scratchStorage[3], gate: scratchStorage[4] });
     pipelines.gridTiles = tiles;
+    // ...and the bias buffer the callers allocate: rows padded to whole key tiles where the attend reads it as vec4
+    pipelines.gridBiasElements = Math.max(pipelines.gridBiasElements ?? 0, tiles.biasElements);
     pipelines.gridWidth = attention.heads * attention.dimension;
     // 🔴 THE PROJECTION ON THE UNITS, off unless the caller asks. It is the
     // biggest pass in an OpenDDE trunk - 386 ms of 1876 at 256 tokens - and its
@@ -479,7 +482,7 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
-                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}`
+                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}${tiles.biasVec4 ? "v" : ""}`
                   + `:ch${gridChunked}`
                   + `:pa${gridProjectArithmetic}`
                   // ...and every row tile, which the device's storage limit
