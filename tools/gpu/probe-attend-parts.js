@@ -38,6 +38,9 @@ export async function main(device, args) {
     t = t.replace(/(\n\s*var logit0_0 = )/, (m) => "\n" + [0, 1, 2, 3].map((a) => `    let bv${a} = bias[(bias_row${a} + j0) / 4u + kg];`).join("\n") + m);
     return t.replace(/bias\[bias_row(\d+) \+ jc(\d+)\]/g, (m, a, b) => `bv${a}[${b}]`);
   })();
+  // q, k and v stored in f16 (the projection writing them so): the staging reads half the bytes, no conversion
+  variants.qkvhalf = attend.replace(/var<storage, read> (q|k|v): array<vec4<f32>>;/g, "var<storage, read> $1: array<vec4<f16>>;");
+  variants.kvhalf = attend.replace(/var<storage, read> (k|v): array<vec4<f32>>;/g, "var<storage, read> $1: array<vec4<f16>>;");
   variants.nop = attend.replace(/\n\s*kp_tile\[\([^;]*\] = vec4<f16>\([^;]*;/g, "");
   // (the parts priced by removing them: wrong answers on purpose)
   variants.noexp = attend.replace(/\bexp\(/g, "fexp(").replace("@compute", "fn fexp(x: f32) -> f32 { return x * 0.001 + 1.0; }\n@compute");

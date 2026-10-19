@@ -1350,6 +1350,14 @@ masked kernel on an all-ones mask (check-af3-grid-attention `--mask-free` agains
 and f16 tiles); test:stock identical on and off, bar OpenDDE's 92.045527640 / 92.045527029, which alternates run to run
 whatever the knob.
 
+**q, k and v in f16 for the half-tiled attend, shipped (`gridAttendQkvHalf`, false the control).** The K/V staging was
+13% of the kernel (probe-attend-parts.js, nokv: 32.4 -> 28.5 ms at 512 tokens). The half-tiled attend rounds q, k and v
+to f16 as it stages them, so the projection now writes them as f16 (one `array<f16>` element a lane - WGSL does store
+16 bits under shader-f16) and the attend stages them as read: no value changes, half the bytes. Probe 32.4 -> 31.2 ms.
+AF3 255-token trunk, ABBA x2: grid.attend 386 / 399 / 403 / 415 ms against 403 / 405 / 430 / 427 (-1.5 to -6%),
+grid.project level (325-348 against 332-349). check-af3-grid-attention `--qkv-half` gives the same relRMS; test:stock
+identical on and off. Not under the matrix projection, which writes f32.
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
 The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,

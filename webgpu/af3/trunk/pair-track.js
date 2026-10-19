@@ -401,6 +401,9 @@ export async function compilePairTrack(cache, options) {
         attendSubgroupMax: options.attendSubgroupMax === true,
         attendBiasVec4: options.attendBiasVec4 === true,
         attendMaskFree: options.attendMaskFree === true,
+        // (q/k/v in f16 for the half-tiled attend; the matrix projection writes f32, so not with it)
+        attendQkvHalf: options.attendQkvHalf === true && !(options.gridProjectMatrix !== undefined
+          && options.gridProjectMatrix !== false && scratchStorage.slice(1, 5).every((s) => s !== "f16")),
         chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
@@ -483,7 +486,7 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
-                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}${tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}`
+                  + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}${options.attendSubgroupMax === true ? "s" : ""}${tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}${tiles.qkvHalf ? "q" : ""}`
                   + `:ch${gridChunked}`
                   + `:pa${gridProjectArithmetic}`
                   // ...and every row tile, which the device's storage limit

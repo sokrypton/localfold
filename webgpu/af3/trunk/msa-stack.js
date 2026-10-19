@@ -166,6 +166,9 @@ export class Af3MsaStackGpu {
       // that form); `gridAttendMaskFree: false` the control
       attendMaskFree: deviceTuning(this.device).gridAttendMaskFree !== false
         && (state.pairMask === undefined || state.pairMask.every((value) => value > 0)),
+      // ...and q, k and v handed to the half-tiled attend in f16, which it rounds them to anyway (`gridAttendQkvHalf:
+      // false` the control): bit-identical, half the staging's bytes
+      attendQkvHalf: deviceTuning(this.device).gridAttendQkvHalf !== false,
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,

@@ -457,6 +457,8 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendBiasVec4: null,
   // ...and no mask read where the pair mask is all ones; false is the control.
   gridAttendMaskFree: null,
+  // ...and q, k and v written in f16 for its half-tiled form; false is the control.
+  gridAttendQkvHalf: null,
   // ...and the consecutive tokens one msa.average workgroup takes; null takes MSA_AVERAGE_ROWS, 1 the control.
   msaAverageRows: null,
   // ...and AF2's triangle projections' accumulators: null is f16 where the device has it (its vector kernels), "f32" the

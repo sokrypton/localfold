@@ -146,7 +146,9 @@ export async function main(device, args) {
             // --bias-vec4: the tiled form's bias read as vec4 from permuted, padded rows (gridAttendBiasVec4)
             attendBiasVec4: args.includes("--bias-vec4"),
             // --mask-free: no mask read (gridAttendMaskFree) - only right where the mask is all ones
-            attendMaskFree: args.includes("--mask-free") });
+            attendMaskFree: args.includes("--mask-free"),
+            // --qkv-half: q, k and v written in f16 for the half-tiled attend (gridAttendQkvHalf)
+            attendQkvHalf: args.includes("--qkv-half") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;

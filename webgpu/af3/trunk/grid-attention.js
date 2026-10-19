@@ -454,6 +454,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // grid.attend on an M5 (probe-attend-parts.js, biasv4). Rows are padded to whole tiles, so the buffer is
   // `tiles.biasElements` floats, not heads * n * n; the padding is never read past the key >= N select.
   const biasVec4 = tiled && shape.attendBiasVec4 === true && tiledShape[1] === 4;
+  // 🔴 q, k AND v IN f16 BETWEEN THE PROJECTION AND THE HALF-TILED ATTEND (`attendQkvHalf`): that attend rounds them to
+  // f16 as it stages them anyway, so the projection rounding them instead changes no value and halves the bytes the
+  // staging reads (and the projection writes). Each projection lane writes its own channel as one f16 - an `array<f16>`
+  // under shader-f16, not the packed word above - so no lane changes owner. Unpacked f32 storage only (the buffers
+  // stay f32-sized), and not under the matrix projection, which writes f32 (the caller's to leave off).
+  // grid.attend 32.4 -> 31.2 ms at 512 tokens on an M5 (probe-attend-parts.js, qkvhalf).
+  const qkvHalf = tiled && shape.attendTiledHalf === true && shape.attendQkvHalf === true && !packQkvg;
   const biasKeys = biasVec4 ? Math.ceil(n / 32) * 32 : n;
   const biasConsts = `const BIAS_KEYS: u32 = ${biasKeys}u;\nconst BIAS_HEAD: u32 = ${n * biasKeys}u;`;
   const biasDestination = biasVec4 ? "(row / N) * BIAS_KEYS + (row % N) / 32u * 32u + (row % N % 8u) * 4u + (row % N % 32u) / 8u"
@@ -551,7 +558,7 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
   // a row costs, so a taller row tile serves each weight read. See PROJECT_ROWS_F16.
   const project16 = shape.projectArithmetic === "f16" && !packQkvg;
   const AT = project16 ? "f16" : "f32";
-  const project = `${project16 ? "enable f16;\n" : ""}${common}
+  const project = `${project16 || qkvHalf ? "enable f16;\n" : ""}${common}
 const ROWS: u32 = ${ROWS}u;
 const LANES: u32 = ${projectLanes}u;
 const WG: u32 = ${projectWorkgroup}u;
@@ -560,9 +567,9 @@ const WG: u32 = ${projectWorkgroup}u;
 // reads nothing but the interleaved q/k/v/gate block. The other three passes
 // bind the same buffer as scalars.
 @group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> q: array<${storageArray(store4.q)}>;
-@group(0) @binding(3) var<storage, read_write> k: array<${storageArray(store4.k)}>;
-@group(0) @binding(4) var<storage, read_write> v: array<${storageArray(store4.v)}>;
+@group(0) @binding(2) var<storage, read_write> q: array<${qkvHalf ? "f16" : storageArray(store4.q)}>;
+@group(0) @binding(3) var<storage, read_write> k: array<${qkvHalf ? "f16" : storageArray(store4.k)}>;
+@group(0) @binding(4) var<storage, read_write> v: array<${qkvHalf ? "f16" : storageArray(store4.v)}>;
 @group(0) @binding(5) var<storage, read_write> gate: array<${storageArray(store4.gate)}>;
 ${chunkBinding(6)}
 
@@ -676,9 +683,9 @@ ${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
 `}
 ${overRows((r) => `  if (first + ${r}u < ${LIVE}) {
     let index${r} = (first + ${r}u) * WIDTH + out;
-    q[index${r}] = acc${r}.x;
-    k[index${r}] = acc${r}.y;
-    v[index${r}] = acc${r}.z;
+    q[index${r}] = ${qkvHalf ? "f16(" : ""}acc${r}.x${qkvHalf ? ")" : ""};
+    k[index${r}] = ${qkvHalf ? "f16(" : ""}acc${r}.y${qkvHalf ? ")" : ""};
+    v[index${r}] = ${qkvHalf ? "f16(" : ""}acc${r}.z${qkvHalf ? ")" : ""};
     // rosettafold3's gate bias, on the GATE lane alone. See the note on
     // OPTIONAL_GRID; the logistic is applied downstream in project_out.
     gate[index${r}] = acc${r}.w${offsets.gatingQueryBias === undefined ? "" : " + gate_bias(W_GATE_BIAS + out)"};
@@ -981,12 +988,14 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
     const TE = H ? "f16" : "f32";
     const toT = (e) => (H ? `vec4<f16>(${e})` : e);
     const fromT = (e) => (H ? `vec4<f32>(${e})` : e);
+    // (already f16 under qkvHalf: staged as read)
+    const staged = (name, index) => (qkvHalf ? `${name}[${index}]` : toT(vec4Of(name, index)));
     const maxOf = (a) => BKs.map((b) => `logit${a}_${b}`).reduce((x, y) => `max(${x}, ${y})`);
     return `${H ? "enable f16;\n" : ""}${SG ? "enable subgroups;\n" : ""}${common}
 ${biasConsts}
-@group(0) @binding(0) var<storage, read> q: array<${store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
-@group(0) @binding(1) var<storage, read> k: array<${store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
-@group(0) @binding(2) var<storage, read> v: array<${store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(0) var<storage, read> q: array<${qkvHalf ? "vec4<f16>" : store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(1) var<storage, read> k: array<${qkvHalf ? "vec4<f16>" : store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(2) var<storage, read> v: array<${qkvHalf ? "vec4<f16>" : store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(3) var<storage, read> bias: array<${biasVec4 ? "vec4<f32>" : "f32"}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gathered: array<${packGathered ? "vec2<u32>" : "vec4<f32>"}>;
@@ -1033,7 +1042,7 @@ ${chunked ? `  let local_row = group.y;
   for (var index = local; index < ${BQ * 8}u; index += 64u) {
     let slot = index / HD4;
     let i = min(q0 + slot, N - 1u);
-    q_tile[slot * STRIDE + index % HD4] = ${toT(vec4Of("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`))};
+    q_tile[slot * STRIDE + index % HD4] = ${staged("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`)};
   }
 ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
   let bias_row${a} = head * BIAS_HEAD + min(i${a}, N - 1u) * BIAS_KEYS;
@@ -1047,8 +1056,8 @@ ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
       let slot = index / HD4;
       let j = min(j0 + slot, N - 1u);
       let source = ((${rowOf} * N + j) * HEADS + head) * HD4 + index % HD4;
-      ${H ? "k_tile" : "kp_tile"}[slot * STRIDE + index % HD4] = ${toT(vec4Of("k", "source"))};
-      v_tile[index] = ${toT(vec4Of("v", "source"))};
+      ${H ? "k_tile" : "kp_tile"}[slot * STRIDE + index % HD4] = ${staged("k", "source")};
+      v_tile[index] = ${staged("v", "source")};
     }
     workgroupBarrier();
 
@@ -1108,7 +1117,7 @@ ${eachA((a) => `  {
            tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS,
                     attendRows: matrixGeometry !== null ? matrixGeometry.rows
                       : tiled ? 8 * tiledShape[0] : 64,
-                    biasElements: heads * n * biasKeys, biasVec4 } };
+                    biasElements: heads * n * biasKeys, biasVec4, qkvHalf } };
 }
 
 export class Af3GridSelfAttentionGpu {
@@ -1159,6 +1168,7 @@ export class Af3GridSelfAttentionGpu {
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
         attendMatrix, attendTiled: options.attendTiled ?? false, attendTiledHalf: options.attendTiledHalf === true,
         attendBiasVec4: options.attendBiasVec4 === true, attendMaskFree: options.attendMaskFree === true,
+        attendQkvHalf: options.attendQkvHalf === true,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
@@ -1166,7 +1176,7 @@ export class Af3GridSelfAttentionGpu {
       + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
       + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`
       + `:t${options.attendTiled ?? 0}${options.attendTiledHalf === true ? "h" : ""}`
-      + `${sources.tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}`;
+      + `${sources.tiles.biasVec4 ? "v" : ""}${options.attendMaskFree === true ? "f" : ""}${sources.tiles.qkvHalf ? "q" : ""}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
