@@ -17,12 +17,15 @@ the staging, and the two decisions already made here that a later kernel should 
 | | |
 | --- | --- |
 | `kernels.h` | the kernels' argument structs, read by C++ and by Metal |
-| `design.metal` | `lf_ln_stats`, `lf_ln_bwd`, `lf_col_sums` |
-| `grad.h` / `grad.mm` | the host API: `layerNormBwd`, `linearBwd`, `columnSum` |
+| `design.metal` | `lf_ln_stats`, `lf_ln_bwd`, `lf_col_sums`, `lf_relu_bwd`, `lf_gate_bwd`, the seven `lf_opm_*` |
+| `grad.h` / `grad.mm` | the host API: `layerNormBwd`, `linearBwd`, `columnSum`, `reluBwd`, `gateBwd`, `transitionBwd`, `outerProductMeanBwd` |
 | `main.mm` | the differential test - every backward against two independent references, in double |
 
 A linear layer's backward needs no kernel of its own: `dX = dY W^T` and `dW = X^T dY` are `metal/core`'s GEMM with
 one operand read transposed, which it already serves.
+
+Whole modules so far: **`Transition`** (Alg. 9 / 15) and **`OuterProductMean`** (Alg. 10). Both RECOMPUTE their
+forward rather than taking a save set, which is what AF2 runs under anyway (`use_remat=True`). 131 cases pass.
 
 ## The testing rule this tree follows
 

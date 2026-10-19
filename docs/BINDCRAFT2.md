@@ -116,7 +116,7 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 ### Staging
 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
-2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates.
+2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming.
 4. **Attention** - MSA row (with pair bias), MSA column, and both triangle attentions. The flash forward exists;
    the backward does not, and `native/flash_bwd_body.cuh` is 46 KB of what it takes.
@@ -157,3 +157,41 @@ Two things decided while writing it, both worth keeping:
 
 `lf_col_sums` serialises a channel's rows across 256 threads, which is the right shape while C is 128-384 and rows is
 large, and the wrong one for a short tensor. Noted, not fixed.
+
+### Stage 2, landed: the first whole modules
+
+**131 cases, all passing** (`metal/design/localfold-design`). Added: `lf_relu_bwd`, `lf_gate_bwd`, and the seven
+`lf_opm_*` kernels; on the host, `reluBwd`, `gateBwd`, `transitionBwd` and `outerProductMeanBwd`.
+
+**`Transition`** (Alg. 9 MSATransition / 15 PairTransition) - `out = relu(LayerNorm(act) W1 + b1) W2 + b2`. All seven
+gradients - the input, both LayerNorm parameters, both weights, both biases - agree with central difference at
+**1e-8 to 5e-8**, and with the analytic double reference at **7e-8 to 5.3e-7**.
+
+Two things worth knowing about it:
+
+- **AF2's `Transition` builds a mask and never applies it** (`modules.py:277` sets it, `:297` passes only `act`). Not
+  a simplification taken here - the reference really does drop it.
+- **The pre-relu activation never has to be saved**, because `relu(h) > 0` exactly where `h > 0`, so the post-relu
+  value - which the second product needs anyway - carries the mask. The module recomputes its forward rather than
+  taking a save set, which is what AF2 runs under in any case (`use_remat=True`).
+
+**`OuterProductMean`** (Alg. 10). The one real tensor contraction of the stage, and the only place so far where the
+shape of the backward had to be chosen rather than derived:
+
+- `P[i][j][c][e]` and its cotangent are **[N][N][O][O]** - 1024 floats a pair, **151 MB at N=192, 604 MB at N=384**.
+  Neither is materialised whole: the backward runs in **tiles of T rows of i**, holding `[T][N][O][O]`.
+- `dWo` and `dright` accumulate across tiles. They do it in **separate dispatches**, which run in stream order, so
+  the sum has a fixed order and the test is deterministic. A float atomic would have been the obvious way and is the
+  wrong one - same reason as `lf_col_sums`.
+- **The alternative that was rejected:** fold `Wo` into `right` first, `V[s][j][c][f] = sum_e Wo[c][e][f]
+  right[s][j][e]`, which avoids `dP` altogether. It is **S-dependent** - 25 MB at S=8 but **1.6 GB** at the extra-MSA
+  stack's S=512 - and costs `F/O = 4x` the multiplies. The tiled form is independent of the MSA depth, which is the
+  axis that varies most between the two stacks.
+
+Checked against central difference only, on all nine gradients, at **8e-8 to 1.9e-6**: for a four-index contraction
+an analytic double reference is about as likely to be wrong as the kernel, so the forward is the thing to trust.
+Cases include a tile that does not divide N (N=17, T=5) and the reference's real O=32 / F=128.
+
+Every `lf_opm_*` kernel is one thread an output element looping the contracted axes serially. `dP`'s stride in `j`
+is `O*O`, so the reads are strided; that and the tile constant are the whole optimisation surface, and nothing has
+been measured yet because nothing here is correct-and-slow until the stack runs end to end.
