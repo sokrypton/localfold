@@ -45,7 +45,7 @@ static int attnBench(int argc, char** argv) {
       if (arms[k] & 64) setenv("LOCALFOLD_ATTN_TILE", "32x32", 1);           // (arm bits 64/128/256: v3's tile)
       else if (arms[k] & 128) setenv("LOCALFOLD_ATTN_TILE", "16x32", 1);
       else if (arms[k] & 256) setenv("LOCALFOLD_ATTN_TILE", "16x64", 1);
-      else unsetenv("LOCALFOLD_ATTN_TILE");
+      else if (getenv("BENCH_ATTN_TILE")) setenv("LOCALFOLD_ATTN_TILE", getenv("BENCH_ATTN_TILE"), 1); else unsetenv("LOCALFOLD_ATTN_TILE");
       A.biasStride = bs; A.biasPadInf = (arms[k] & 2) != 0;       // (arm bit 2: the bias -inf padded: v3's NT kernel)
       attention(A); sync();
       if (round == 0) {

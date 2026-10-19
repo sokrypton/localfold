@@ -1317,11 +1317,19 @@ Each item measured interleaved on this M5 and pushed on `opus-55-opt`; the commi
   2 at 256 and 400 tokens (level here), and on Metal AF2's MSA norms emitted by the 256-wide GEMMs (LayerNorm 233 -> 92
   ms of a 261 x 1500-row pass, but the emitting epilogues cost 113 ms more: net -0.7%, not kept).
 
+**The attention, taken apart (cf1e1a06).** A probe of v3's parts at 1044 keys (H 4, D 32, 64 rows; each part added
+over the last): the two products alone 3.38 ms (10.5 TFLOP/s - the matrix units fed from device memory are NOT the
+limit, as the earlier subtraction suggested), + the bias tile 3.71, + the row max 3.71, + the exponentials 3.87, + the
+row sum 4.01, + the output's rescale 4.05 - and the shipped kernel 5.18. The gap was the element loop's runtime branch
+(`tail || mask`, 12%) and runtime flags (5%). A bias padded with -inf past n masks the tail itself, so the NT instance
+has no branch: attention -13% (AF3 and AF2 pair tracks, PDBs byte-identical). Then tried and dropped on top of it:
+32 x 32 tiles everywhere from 168 keys (better in the bench, level or +0.7% on folds), the bias in float folded into
+the first product's accumulator (10% slower), the bias tile held in P's tensor (level), the diffusion's q-biased
+attention on NT (level). What is left is the softmax's element work itself, ~20% over the products.
+
 **Where it stands.** Every hot kernel on both backends now runs near its measured ceiling on this M5: Metal's GEMMs
 at 9-11 TFLOP/s (12.4 the matrix units' issue rate), WebGPU's stock-Chrome vector kernels at 1.8-3.0 TFLOP/s in f16.
-The one large gap left is Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass): its two products alone, with
-the softmax removed, reach only 7.3 - the matrix units fed from device memory set that pace, and staging K and V through
-threadgroup memory lost. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,
+The one large gap left was Metal's attention (5.8-6.7 TFLOP/s, 30-38% of an AF3 trunk pass); see above for what it was. Verified at the end of the round: the 30 Metal gate cases, test:native (offline), npm test,
 test:stock, test:template, test:ligand, test:modified, test:cache, and fold-in-page.py for AF3, EF2-fast and AF2.
 
 **For the M2**
