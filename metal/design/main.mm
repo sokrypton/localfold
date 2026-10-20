@@ -2944,6 +2944,7 @@ static void scMlpCase(int L, int C, int Cm) {
 static void memReport() {
   designShareScratch();
   const int N = 192, Cz = 128, I = 128, Cm = 256, O = 32, F = 128, S = 8, H = 4, D = 32;
+  const int C2w = 128;      // the pair width the structure module's IPA reads
   const size_t n2 = (size_t)N * N;
   printf("AF2 widths at N=%d (pair %d, msa %d x %d, triangle intermediate %d)\n", N, Cz, S, Cm, I);
 
@@ -3010,6 +3011,36 @@ static void memReport() {
                            N, N, Cz, Cz, H, D, Cz, w, (const float*)dOut, (float*)dPair, (float*)dPair);
     show("biasedSelfAttentionBwd (triangle attn)");
     for (void* p : {pair, mask, dOut, dPair, sc, f2, wp, wo, bw, bc}) release(p);
+  }
+  {   // the structure module's InvariantPointAttention, at AF2's own widths
+    const int C = 384, Hh = 12, Cs = 16, Pq = 4, Pv = 8;
+    const int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2w, Wq = Hh * Cs;
+    void* act = z((size_t)N * C); void* act2d = z(n2 * C2w); void* rig = z((size_t)N * 12);
+    void* sc1 = z((size_t)N * Hh * Cs); void* pj = z((size_t)N * Hh * 3 * Pv);
+    void* gp = z((size_t)N * Hh * Pv * 3); void* at = z((size_t)N * Hh * N); void* fin = z((size_t)N * Fw);
+    void* wbig = z((size_t)Fw * C); void* wsm = z((size_t)C * Hh * 3 * Pv); void* bsm = z((size_t)Hh * 3 * Pv);
+    void* dAct = z((size_t)N * C); void* dRig = z((size_t)N * 12); void* d2d = z(n2 * C2w);
+    void* db2 = z(n2 * Hh);
+    IpaSaved sv{(const float*)act, (const float*)act2d, (const float*)rig, (const float*)sc1, (const float*)sc1,
+                (const float*)sc1, (const float*)pj, (const float*)pj, (const float*)pj, (const float*)gp,
+                (const float*)gp, (const float*)gp, (const float*)at, (const float*)fin};
+    IpaWeightSet ws{};
+    ws.Wq = ws.Wk = ws.Wv = (const float*)wsm;
+    ws.bk = ws.bv = (const float*)bsm;
+    ws.Wqp = ws.Wkp = ws.Wvp = (const float*)wsm;
+    ws.bqp = ws.bkp = ws.bvp = (const float*)bsm;
+    ws.Wo = (const float*)wbig; ws.bo = (const float*)bsm;
+    ws.pw = ws.pointWeightRaw = (const float*)bsm;
+    ws.qScale = 0.25f; ws.pointBase = 0.2f;
+    IpaGradSet gs{};
+    gs.dAct = (float*)dAct; gs.dRig = (float*)dRig; gs.dAct2d = (float*)d2d; gs.db2d = (float*)db2;
+    IpaDims dm{N, C, C2w, Hh, Cs, Pq, Pv};
+    invariantPointAttentionBwd(sv, (const float*)dAct, dm, ws, gs);
+    show("invariantPointAttentionBwd (structure module)");
+    for (void* p : {act, act2d, rig, sc1, pj, gp, at, fin, wbig, wsm, bsm, dAct, dRig, d2d, db2}) release(p);
+    printf("  its own largest buffer is dLogit at [L][H][L] = %.1f MB, so the structure module's SCRATCH is not\n"
+           "  the ceiling - its pair-sized cotangents are, and those belong to the caller\n",
+           (size_t)N * Hh * N * 4 / 1048576.0);
   }
   printf("\n  a pair tensor at this size is %.1f MB; the Evoformer holds several per block\n",
          n2 * (size_t)Cz * 4 / 1048576.0);

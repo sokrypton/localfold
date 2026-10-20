@@ -504,13 +504,113 @@ writing down because they are not obvious from the forward:
 `iptm_per_residue` is the `per_alignment` vector itself, so it costs nothing extra and its cotangent enters the same
 `dPerAlign` accumulator as ipTM's one-hot.
 
+### The structure module, stage by stage
+
+The second half of the fold, and where every remaining boundary array of `bindcraft/af/boundary.py` comes from.
+The forward is `metal/af2/structure.mm` and the tail of `metal/af2/af2.metal`; the backward is
+`metal/design/structure.metal`, `structgrad.h` and `structgrad.mm`. **213 new cases, 535 in all.**
+
+#### 🔴 BindCraft2 does not cut the rigid chain, and upstream AF2 does
+
+`bindcraft/af/alphafold/model/folding.py:379` is
+
+```python
+    # affine = affine.apply_rotation_tensor_fn(jax.lax.stop_gradient)
+```
+
+**commented out.** Upstream AF2 ends each fold iteration by stopping the gradient on the rotation; BindCraft2 does
+not. So the rigid is a RECURRENT STATE whose cotangent flows back through all eight iterations, and no iteration
+may treat it as a constant input. That single line decides the shape of this whole module: `dRig` is read as the
+output's cotangent and rewritten as the input's, once per iteration, and inside one iteration it takes a
+contribution from four places - each of the three point projections, and again where the IPA's point block returns
+to the local frame.
+
+#### What is there
+
+| | |
+| --- | --- |
+| rigids | the backbone update (Alg. 23, quaternion through its normalisation), the point projections into the global frame |
+| IPA core | the attention weights (scalar dot, point distance, pair bias, the softplus'd point weight) and the outputs (scalar, point-with-norm, pair) |
+| IPA module | all six projections, both cores and the residual output projection - `invariantPointAttentionBwd` |
+| the iteration | `foldIterationBwd`: the IPA, both LayerNorms, the three-layer transition with its residual, quat_rigid, the backbone update |
+| side chains | `sidechainMlpBwd` (two input projections, two residual blocks, the angle head) and `sidechainGeometryBwd` (angle normalisation, eight group frames, the chain, atom14, atom37) |
+
+#### Three things the shapes forced
+
+**A thread a residue, not a thread a point.** Several (head, point) pairs read one residue's rigid, so a per-point
+kernel would need a float atomic to accumulate `dRig` - and `AGENTS.md` wants the differential test DETERMINISTIC,
+which an atomic is not. The side-chain geometry has a second reason on top: the frame chain is sequential, so its
+backward walks it in reverse and splitting a residue would mean a reduction per link.
+
+**Three passes for the attention weights**, exactly as the flash-shaped attention above: `dqs` and `dqp` accumulate
+over keys while `dks` and `dkp` accumulate over queries. `dLogit` is materialised once - the same size as `attn`,
+which the forward already holds - so both passes read it rather than recomputing the softmax, and the pass order
+cannot change the answer.
+
+**Everything accumulates except `dAct`, and the caller zeroes.** One set of IPA weights runs eight times and one
+pair bias feeds all eight. `linearBwd` and `columnSum` gained `accumulateW`, `layerNormBwd` gained
+`accumulateParams`. A flag per destination would have been four chances to get the rigid wrong.
+
+#### 🔴 Two MORE dead parameters in AF2, and one is this port's alone
+
+The IPA composition test reported `dbk` as an identically zero gradient on all three shapes. Not a bug - the same
+mechanism as `feat_2d_norm`'s offset, and chasing it found a third. **Anything that can only shift a whole softmax
+row by a constant is dead.** Held to `jax.grad` of AF2's own `InvariantPointAttention` in float64:
+
+| parameter | max abs gradient | |
+| --- | ---: | --- |
+| `attention_2d/bias` | **7.49e-16** | the IPA's pair bias is per-head and constant across (query, key) |
+| `kv_scalar/bias`, the K half | **2.22e-16** | the key's bias enters only through `sum_c qs[q][c] ks[k][c]`, where its contribution does not depend on k |
+| `attention_2d/weights` | 2.12e+00 | the same linear, live |
+| `kv_scalar/bias`, the V half | 5.54e+00 | the same tensor, live |
+| the smallest LIVE gradient in the module | 9.59e-01 | `q_scalar/bias` |
+
+The second is a property of **this port's parameterisation** and is why nobody would see it upstream: the reference
+fuses the key and value scalar projections into one `kv_scalar`, whose gradient is large and unremarkable because
+the value half is live. This port SPLITS that tensor (`cuda/featurise/af2_weights.h`), so
+`k_scalar_projection/bias` is dead outright. **Monomer only** - the multimer checkpoint carries no scalar bias at
+all, which that file already says.
+
+`metal/design/af2-grad-oracle.py` runs all three checks from one command. The design suite holds the first of the
+two directly: the pair bias comes from a linear over `act2d`, so that linear's bias gradient is the column sum of
+`db2d` over every (i, j), asserted zero on all three shapes.
+
+#### 🔴 Two test defects found here, both of the family "a check that cannot fail"
+
+The dead-parameter assertion built a vector from `download(...).begin()` and `download(...).end()` - two SEPARATE
+temporaries, so an invalid range. It read as three passes because the two allocations happened to land on one
+address, then threw `std::length_error` the moment anything else allocated first. CLAUDE.md's own rule one layer
+down: this one could not even be relied on to crash.
+
+And the fold iteration's three transition weight matrices sit behind a relu, so about half of any sampled element
+has an exactly zero derivative on both sides - at which point `reportGrad` says `both ~0, ok` however wrong the
+kernel is. **Three probes passed that way.** The probe now draws up to eight times its budget and keeps LIVE
+entries by preference, falling back only if a tensor really is dead.
+
+#### Memory: the structure module is not the ceiling, measured
+
+`design.ipa.` is declared to `designShareScratch()` - it runs AFTER the Evoformer, so it may alias with all of it,
+and the LayerNorm statistics are nested inside its turn. `metal/design/localfold-design --mem` at N=192:
+
+```
+  transitionBwd (pair track)                     scratch    180.3 MB
+  outerProductMeanBwd                            scratch     33.8 MB
+  triangleMultiplicationBwd                      scratch    324.3 MB
+  biasedSelfAttentionBwd (triangle attn)         scratch    183.8 MB
+  invariantPointAttentionBwd (structure module)  scratch      6.3 MB
+```
+
+**6.3 MB against the triangle's 324.** Its largest own buffer is `dLogit` at `[L][H][L]`, 1.7 MB here. So the
+structure module changes nothing about the memory ceiling, which stays exactly where the previous session's
+correction left it: the triangle multiplication, tiled over rows.
+
 ## Where this stands, and what the next session should pick up
 
-**322 differential cases, all passing**, at every sharing floor and with sharing off. `bash metal/build.sh design &&
+**535 differential cases, all passing**, at every sharing floor and with sharing off. `bash metal/build.sh design &&
 metal/design/localfold-design`. The core selftest and the three shipping ports are untouched and still build and
 pass.
 
-### Done: the Evoformer's reverse mode, end to end
+### Done: the Evoformer's reverse mode AND the structure module's
 
 | | |
 | --- | --- |
@@ -519,35 +619,42 @@ pass.
 | attentions | the flash-shaped core, the `Attention` module, `MSARowAttentionWithPairBias`, `TriangleAttention`, `MSAColumnAttention`, `MSAColumnGlobalAttention` |
 | the block | `evoformerIterationBwd` - all eight residual modules, both tracks, both OPM orderings |
 | heads | the distogram, the PAE head, and `pae`/`ptm`/`iptm`/`iptm_per_residue` |
+| the structure module | the rigids, the IPA core, the whole IPA, `foldIterationBwd`, and MultiRigidSidechain's MLP and geometry |
 | memory | within-module reuse and `designShareScratch()`, proved by `LOCALFOLD_SCRIBBLE` |
+
+Which leaves, of the nine boundary arrays, `atoms` reachable (`sidechainGeometryBwd` takes `dPos14` and `dPos37`)
+and only `plddt` and `experimentally_resolved_ca` unwritten - both are heads off the single representation, and
+both are small next to anything above.
 
 ### Next, in the order I would do it
 
-1. **🔴 THE STRUCTURE MODULE. This is the largest piece left** and it is where the remaining boundary arrays live:
-   `atoms`, `plddt` and `experimentally_resolved_ca` all come from it or from the single representation it
-   produces. IPA, quaternion rigid updates, backbone frames, torsion angles, side-chain construction. Expect it to
-   be comparable in size to everything above.
-2. **Two FORWARD-side gaps, both in shipping code**, which is why they were left for review rather than done
-   unsupervised:
-   - **`metal/af2`'s Evoformer must emit the save set** - the ten activations per block in `EvoBlockSaved`. Wiring,
-     not new arithmetic, but it is what stands between this tree and a block that can run both ways.
+1. **🔴 THE FORWARD SIDE, WHICH IS NOW THE ONLY THING BETWEEN THIS AND A FOLD THAT RUNS BOTH WAYS.** All of it is
+   in shipping code, which is why it was left for review rather than done unsupervised. Four items, the last two
+   new this session:
+   - **`metal/af2`'s Evoformer must emit the save set** - the ten activations per block in `EvoBlockSaved`.
    - **`metal/core`'s tuned `attention()` does not return the logsumexp** the attention backward needs.
-     `attentionFwdSaved` here is a correct but untuned stand-in (a simdgroup a query, no simdgroup matrices).
-     Saving `L` from the real flash forward is the cheap, right fix; writing a second tuned attention is not.
+     `attentionFwdSaved` here is a correct but untuned stand-in. Saving `L` from the real flash forward is the
+     cheap, right fix; writing a second tuned attention is not.
+   - **`metal/af2`'s structure module must emit `FoldIterSaved` per iteration** - and keep the eight iterations'
+     rigids rather than updating one in place, since the gradient flows through all of them.
+   - **and it must keep `projQ`, `projK` and `projV` APART.** The forward reuses one piece of scratch for all
+     three point projections; `dRig` needs each one's local coordinates.
+2. **The two remaining heads**: `plddt` and `experimentally_resolved_ca`.
 3. **The triangle multiplication's memory**, tiled over rows - see the memory section for why this one and not the
    transition.
 4. **The design loop**: the losses, the optimiser, the schedules. `bindcraft/af/boundary.py` is the contract to
-   hold to, and five of its seven differentiable arrays already exist here.
+   hold to, and six of its seven differentiable arrays have a backward here now.
 
 ### How to check anything added here
 
 Three references, and the third is the one that settles arguments about AF2 rather than about this port:
 
 ```
-metal/design/localfold-design                                   # double analytic + central difference, 322 cases
+metal/design/localfold-design                                   # double analytic + central difference, 535 cases
 LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=1 .../localfold-design   # every buffer aliased and NaN-scribbled
 BC2=~/BindCraft2 .venv-mtl/bin/python metal/design/af2-grad-oracle.py   # jax.grad of AF2 itself, in float64
 ```
 
 Never widen a bound to make a case pass. A gradient that is analytically zero is reported as `ok (zero gradient)`
-on an absolute floor - see the `feat_2d_norm` finding for why that distinction had to exist.
+on an absolute floor - see the `feat_2d_norm` finding for why that distinction had to exist - and the structure module's two test
+defects for why a probe must also be checked to be capable of failing at all.

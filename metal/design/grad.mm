@@ -185,6 +185,8 @@ void designShareScratch() {
                 {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
                 {"design.mcol.", "dmcol"}, {"design.gattn.", "dgattn"}, {"design.evo.", "devo"},
                 {"design.head.", "dhead"}, {"design.pae.", "dpae"},
+                // the structure module, which runs AFTER the evoformer and so may alias with all of it
+                {"design.ipa.", "dipa"},
                 {"design.ln.", "dln"}},
                {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
                 {"dln", "dattn"}, {"dln", "dmcol"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"},
@@ -194,7 +196,11 @@ void designShareScratch() {
                 {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}, {"dln", "dgattn"},
                 // the block holds its running cotangents and temporaries across every module's turn
                 {"devo", "dtr"}, {"devo", "dopm"}, {"devo", "dtri"}, {"devo", "dbattn"}, {"devo", "dattnm"},
-                {"devo", "dattn"}, {"devo", "dmcol"}, {"devo", "dgattn"}, {"devo", "dln"}});
+                {"devo", "dattn"}, {"devo", "dmcol"}, {"devo", "dgattn"}, {"devo", "dln"},
+                // the IPA's and the fold iteration's buffers are ONE family (both allocate from design.ipa., and
+                // sharing aliases across families rather than within one), and the LayerNorm statistics are live
+                // inside its turn - twice per iteration
+                {"dln", "dipa"}});
 }
 
 // a simdgroup a row, eight a threadgroup - metal/core's layerNormRun grid, so the rows map the same way
