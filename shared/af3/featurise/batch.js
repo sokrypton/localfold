@@ -49,8 +49,11 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       // an alignment over nucleic chains too: each column's alphabet (see af3MsaFromA3m)
       ...(options.msaColumnKinds === undefined ? {} : { columnKinds: options.msaColumnKinds }),
       // openbind0's main-MSA cap (msa-features.js capMainMsa), each column's chain from the polymer chains' lengths
-      ...(options.mainMsaCap === undefined || options.mainMsaCap === null ? {} : {
-        mainMsaCap: options.mainMsaCap,
+      ...(options.mainMsaCap === undefined || options.mainMsaCap === null ? {} : { mainMsaCap: options.mainMsaCap }),
+      // (protenix and OpenDDE: each protein chain's paired rows in its unpaired MSA, deduplicated - pairedIntoUnpaired)
+      ...(options.protenixUnpairedMsa === true ? { protenixUnpairedMsa: true } : {}),
+      ...(options.rf3ProfileMsa === true ? { rf3ProfileMsa: true } : {}),
+      ...((options.mainMsaCap ?? null) === null && options.protenixUnpairedMsa !== true && options.rf3ProfileMsa !== true ? {} : {
         chainOfColumn: sequence.split(":").flatMap((chain, index) => Array(chain.length).fill(index)),
       }),
       // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
@@ -99,6 +102,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     ...(options.proteinOnlyMsa === undefined ? {} : { proteinOnlyMsa: options.proteinOnlyMsa }),
     ...(options.zeroDeletions === undefined ? {} : { zeroDeletions: options.zeroDeletions }),
     ...(options.profileOverAllRows === undefined ? {} : { profileOverAllRows: options.profileOverAllRows }),
+    ...(options.atomizeLigandBonded === undefined ? {} : { atomizeLigandBonded: options.atomizeLigandBonded }),
+    ...(options.declaredBondCharge === undefined ? {} : { declaredBondCharge: options.declaredBondCharge }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

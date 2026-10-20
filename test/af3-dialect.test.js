@@ -142,7 +142,7 @@ describe("the dialect table", () => {
       "paddedAtomKeys",
       "pairInitFromSingle",
       "perBlockAtomPairLayerNorm",
-      "perBlockPairLayerNorm",
+      "perBlockPairLayerNorm", "protenixUnpairedMsa",
       "splitPairConditioning",
       "structuralTokens",
       "swapTransposedBias",

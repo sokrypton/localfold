@@ -29,6 +29,7 @@ struct LigandSpan { int from, count; std::string code; std::vector<CompBond> bon
 struct ModifiedSpan {
   int from, count; std::string code; int residue;
   std::vector<CompAtom> atoms; std::vector<CompBond> bonds; bool oneToken = false;
+  bool standard = false;    // a standard residue rf3 atomised for its ligand bond
 };
 
 struct FeaturiseOptions {
@@ -53,6 +54,7 @@ struct FeaturiseOptions {
   bool unresolvedLeavingAtoms = false;            // chai1: a ligand's leaving group at a declared bond a token it does not place
   bool ligandMsaUnk = false;                      // boltz2: a ligand token's MSA query row the protein UNK, not the gap
   bool proteinOnlyMsa = false, zeroDeletions = false, profileOverAllRows = false;   // boltz2 (rf3: the first): featurise.js
+  bool atomizeLigandBonded = false, declaredBondCharge = false;   // rosettafold3 (atomworks): featurise.js
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool queryOnce = false;                         // dedupeSelfMsa true: an MSA that is all the query, one row (featurise.js)
@@ -166,6 +168,16 @@ inline std::vector<int> leavingGroups(const Component& c, int from, int length, 
   std::vector<int> out;
   for (size_t g = 0; g < groups.size() && (int)g < count; ++g) out.insert(out.end(), groups[g].begin(), groups[g].end());
   return out;
+}
+// featurise.js standardCode: a standard residue's CCD code from its chain's letter, or ""
+inline std::string standardCode(const std::string& kind, char letter) {
+  static const std::map<char, std::string> three = {{'A', "ALA"}, {'R', "ARG"}, {'N', "ASN"}, {'D', "ASP"}, {'C', "CYS"},
+    {'Q', "GLN"}, {'E', "GLU"}, {'G', "GLY"}, {'H', "HIS"}, {'I', "ILE"}, {'L', "LEU"}, {'K', "LYS"}, {'M', "MET"},
+    {'F', "PHE"}, {'P', "PRO"}, {'S', "SER"}, {'T', "THR"}, {'W', "TRP"}, {'Y', "TYR"}, {'V', "VAL"}};
+  if (kind == "protein") { auto it = three.find(letter); return it == three.end() ? "" : it->second; }
+  if (kind == "dna") return std::string("ACGT").find(letter) != std::string::npos && letter ? std::string("D") + letter : "";
+  if (kind == "rna") return std::string("ACGU").find(letter) != std::string::npos && letter ? std::string(1, letter) : "";
+  return "";
 }
 // featurise.js proteinLetterAatype: a CCD one-letter code in AF3's amino-acid order, else the unknown amino acid
 inline int proteinLetterAatype(const std::string& letter) {
@@ -321,6 +333,27 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   };
   std::map<std::pair<int, int>, const FeaturiseOptions::Mod*> modificationOf;
   for (auto& m : o.modifications) modificationOf[{m.chain, m.position}] = &m;
+  // rf3 atomises a standard residue a declared bond ties to a ligand, from its CCD entry (featurise.js)
+  std::vector<FeaturiseOptions::Mod> standardMods;
+  standardMods.reserve(o.bonds.size());
+  struct Bonded { int chain, position, ligand; };
+  std::vector<Bonded> ligandBonded;
+  if (o.atomizeLigandBonded)
+    for (auto& bond : o.bonds) {
+      const bool fromPoly = bond.from.asym < (int)chains.size();
+      const BondEnd& p = fromPoly ? bond.from : bond.to;
+      const BondEnd& l = fromPoly ? bond.to : bond.from;
+      if (!(p.asym < (int)chains.size()) || !(l.asym >= (int)chains.size())) continue;
+      ligandBonded.push_back({p.asym, p.residue, l.asym});
+      if (modificationOf.count({p.asym, p.residue})) continue;
+      if (p.residue < 1 || p.residue > (int)chains[p.asym].size()) continue;
+      std::string code = standardCode(kinds[p.asym], chains[p.asym][p.residue - 1]);
+      if (code.empty()) continue;
+      Component c = parseCcdComponent(standardComponentTexts().at(code));
+      c.standard = true;
+      standardMods.push_back({p.asym, p.residue, c});
+      modificationOf[{p.asym, p.residue}] = &standardMods.back();
+    }
 
   struct Residue { char code; std::string kind; bool terminal; bool modified; Component modification; int tokens; };
   std::vector<Residue> residues;
@@ -470,10 +503,11 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       ++token;
       continue;
     }
-    b.modifiedSpans.push_back({token, (int)M.atoms.size(), M.code, residue, M.atoms, M.bonds, false});
+    b.modifiedSpans.push_back({token, (int)M.atoms.size(), M.code, residue, M.atoms, M.bonds, false, M.standard});
     for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
       const CompAtom& s = M.atoms[atom];
-      setToken(token, o.modifiedProteinLetter ? proteinLetterAatype(M.oneLetter)
+      setToken(token, M.standard ? parentAatype(R.kind, R.code)
+                      : o.modifiedProteinLetter ? proteinLetterAatype(M.oneLetter)
                       : o.atomizedUnknownRestype == 2 || o.atomizedUnknownRestype == 4 || ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && R.kind == "protein") ? UNK_AATYPE
                       : o.atomizedUnknownRestype == 3 ? 30 : parentAatype(R.kind, R.code),
                number, asym, entity, sym, residue);
@@ -595,7 +629,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   auto isModifiedEnd = [&](const BondEnd& e) {
     int global = e.residue - 1;
     for (int before = 0; before < e.asym; ++before) global += (int)chains[before].size();
-    for (auto& s : b.modifiedSpans) if (s.residue == global) return true;
+    for (auto& s : b.modifiedSpans) if (s.residue == global && !s.standard) return true;   // (rf3's atomised standard one is not)
     return false;
   };
   for (size_t i = 0; i < o.bonds.size(); ++i) {
@@ -612,9 +646,88 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     else if (fl || tl) added = o.declaredPolymerBonds != 0 && isModifiedEnd(fl ? t : f);   // (AF3's own; a rule adds it both ways)
     else if (o.declaredPolymerBonds == 1) added = true;
     else if (o.declaredPolymerBonds == 2 && !(f.asym == t.asym && std::abs(f.residue - t.residue) <= 1)) added = true;
+    else if (o.declaredPolymerBonds == 3 && (isModifiedEnd(f) || isModifiedEnd(t))) added = true;   // (rf3: from a modified residue)
     else continue;
     if (added && from == to) continue;
     declared.push_back({from, to, 5, added});
+  }
+  // rf3's charge on an atom a declared bond forms on (featurise.js declaredBondCharge)
+  if (o.declaredBondCharge && !o.bonds.empty()) {
+    static const std::map<std::string, int> VALENCE = {{"H", 1}, {"C", 4}, {"N", 3}, {"O", 2}, {"F", 1}, {"Cl", 1}, {"Br", 1}, {"B", 3}};
+    std::vector<std::pair<BondEnd, int>> counted;
+    for (auto& bond : o.bonds)
+      for (const BondEnd* e : {&bond.from, &bond.to}) {
+        if (!e->hasAtom || e->atom.empty()) continue;
+        bool found = false;
+        for (auto& [k, n] : counted) if (k.asym == e->asym && k.residue == e->residue && k.atom == e->atom) { ++n; found = true; }
+        if (!found) counted.push_back({*e, 1});
+      }
+    std::map<std::string, CompGraph> standardGraphs;
+    for (auto& [end, n] : counted) {
+      int flat = -1; const CompGraph* graph = nullptr;
+      if (end.asym >= chainCount) {
+        int li = end.asym - chainCount;
+        if (li >= (int)ligands.size()) continue;
+        const Component& ligand = ligands[li];
+        auto parts = partsOf(ligand);
+        const CompPart* part = parts.size() == 1 ? &parts[0] : (end.residue - 1 >= 0 && end.residue - 1 < (int)parts.size() ? &parts[end.residue - 1] : nullptr);
+        if (!part) continue;
+        for (int k = 0; k < part->count; ++k)
+          if (ligand.atoms[part->from + k].name == end.atom) { flat = (ligandStart[li] + part->from + k) * DENSE; break; }
+        graph = ligand.residues.empty() ? &ligand.graph : &ligand.residues[end.residue - 1 >= 0 && end.residue - 1 < (int)ligand.residues.size() ? end.residue - 1 : 0].graph;
+      } else {
+        int global = end.residue - 1;
+        for (int before = 0; before < end.asym; ++before) global += (int)chains[before].size();
+        const ModifiedSpan* span = nullptr;
+        for (auto& sp : b.modifiedSpans) if (sp.residue == global) { span = &sp; break; }
+        if (span) {
+          if (span->oneToken) continue;
+          for (size_t k = 0; k < span->atoms.size(); ++k) if (span->atoms[k].name == end.atom) { flat = (span->from + (int)k) * DENSE; break; }
+          graph = &residues[global].modification.graph;
+        } else {
+          int token = -1;
+          for (int t = 0; t < tokens; ++t) if (b.residueOfToken[t] == global) { token = t; break; }
+          if (token < 0 || global < 0 || global >= (int)residues.size()) continue;
+          std::string code = standardCode(residues[global].kind, residues[global].code);
+          if (code.empty()) continue;
+          if (!standardGraphs.count(code)) standardGraphs[code] = parseCcdComponent(standardComponentTexts().at(code)).graph;
+          for (int k = 0; k < DENSE && flat < 0; ++k) {
+            const int f2 = token * DENSE + k;
+            if (b.refMask[f2] == 0) continue;
+            std::string name;
+            for (int c = 0; c < 4; ++c) { int v = b.refAtomNameChars[f2 * 4 + c]; if (v >= 0 && v < 64) name += (char)(v + 32); }
+            while (!name.empty() && name.back() == ' ') name.pop_back();
+            while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+            if (name == end.atom) flat = f2;
+          }
+          graph = &standardGraphs[code];
+        }
+      }
+      if (flat < 0 || !graph) continue;
+      int atom = -1;
+      for (size_t k = 0; k < graph->names.size(); ++k) if (graph->names[k] == end.atom) { atom = (int)k; break; }
+      if (atom < 0 || !VALENCE.count(graph->elements[atom])) continue;
+      std::vector<std::vector<std::pair<int, std::string>>> nb(graph->names.size());
+      for (auto& [x, y, order] : graph->bonds) {
+        int a = -1, c = -1;
+        for (size_t k = 0; k < graph->names.size(); ++k) { if (a < 0 && graph->names[k] == x) a = (int)k; if (c < 0 && graph->names[k] == y) c = (int)k; }
+        if (a < 0 || c < 0) continue;
+        nb[a].push_back({c, order}); nb[c].push_back({a, order});
+      }
+      std::set<int> gone;
+      std::vector<int> todo;
+      for (auto& [m, _] : nb[atom]) if (graph->leaving[m]) todo.push_back(m);
+      while (!todo.empty()) {
+        int m = todo.back(); todo.pop_back();
+        if (gone.count(m)) continue;
+        gone.insert(m);
+        for (auto& [next, _] : nb[m]) if (graph->leaving[next] && next != atom) todo.push_back(next);
+      }
+      int degree = n;
+      for (auto& [m, order] : nb[atom])
+        if (!gone.count(m)) degree += order == "SING" ? 1 : order == "DOUB" ? 2 : order == "TRIP" ? 3 : order == "QUAD" ? 4 : 1;
+      b.refCharge[flat] = (float)(degree - VALENCE.at(graph->elements[atom]));
+    }
   }
   bool anyBond = !declared.empty();
   for (auto& g : bondedGroups) if (!g.bonds->empty()) anyBond = true;
@@ -680,6 +793,36 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   b.msa.assign((size_t)sequences * tokens, 0);
   b.msaMask.assign((size_t)sequences * tokens, 1);
   b.deletionMatrix.assign((size_t)sequences * tokens, 0);
+  // ...and moves it into the ligand's unit: the ligand's asym, the entity's next copy (featurise.js; every declared bond
+  // with an atomised end is walked, as af3-any-model's loop does)
+  if (!ligandBonded.empty()) {
+    std::vector<int> residueStart; { int at = 0; for (auto& c : chains) { residueStart.push_back(at); at += (int)c.size(); } }
+    std::set<std::pair<int, int>> atomised;
+    for (auto& lb : ligandBonded) atomised.insert({lb.chain, lb.position});
+    std::vector<Bonded> moves;
+    for (auto& bond : o.bonds) {
+      bool fromAtomised = atomised.count({bond.from.asym, bond.from.residue}) > 0;
+      const BondEnd& p = fromAtomised ? bond.from : bond.to;
+      const BondEnd& other = fromAtomised ? bond.to : bond.from;
+      if (!atomised.count({p.asym, p.residue})) continue;
+      moves.push_back({p.asym, p.residue, other.asym});
+    }
+    std::map<std::pair<int, int>, int> newSym;
+    for (auto& mv : moves) {
+      int residue = residueStart[mv.chain] + mv.position - 1;
+      const ModifiedSpan* span = nullptr;
+      for (auto& sp : b.modifiedSpans) if (sp.residue == residue) { span = &sp; break; }
+      if (!span) continue;
+      int entity = b.entityId[span->from];
+      std::pair<int, int> key{entity, mv.ligand};
+      if (!newSym.count(key)) {
+        int most = 0;
+        for (int t = 0; t < tokens; ++t) if (b.entityId[t] == entity) most = std::max(most, b.symId[t]);
+        newSym[key] = most + 1;
+      }
+      for (int t = span->from; t < span->from + span->count; ++t) { b.asymId[t] = mv.ligand + 1; b.symId[t] = newSym[key]; }
+    }
+  }
   std::vector<int> queryRow = b.aatype;
   if ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3 || o.atomizedUnknownRestype == 4) && !o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) {

@@ -164,8 +164,68 @@ inline A3m capMainMsa(const A3m& parsed, int cap, const std::vector<int>* chainO
   return out;
 }
 
+// msa-features.js pairedIntoUnpaired: protenix's unpaired MSA - each protein chain's paired rows, then its unpaired
+// rows (a pad past the query skipped), deduplicated on the aligned row, the chains stacked side by side again
+inline A3m pairedIntoUnpaired(const A3m* unpaired, const A3m* paired, const std::vector<int>* chainOfColumn,
+                              const std::vector<std::string>* columnKinds, bool dedupe = true) {
+  const A3m& base = unpaired ? *unpaired : *paired;
+  int length = base.length;
+  struct Range { int chain, from, to; };
+  std::vector<Range> ranges;
+  for (int column = 0; column < length; ++column) {
+    int chain = chainOfColumn ? (*chainOfColumn)[column] : 0;
+    if (ranges.empty() || ranges.back().chain != chain) ranges.push_back({chain, column, column});
+    ranges.back().to = column + 1;
+  }
+  struct Row { std::string sequence; std::vector<int> deletions; };
+  std::vector<std::vector<Row>> lists;
+  for (auto& range : ranges) {
+    bool protein = !columnKinds || range.from >= (int)columnKinds->size() || (*columnKinds)[range.from] == "protein";
+    std::vector<Row> rows;
+    auto take = [&](const A3m& a, int row) {
+      return Row{a.sequences[row].substr(range.from, range.to - range.from),
+                 std::vector<int>(a.deletions[row].begin() + range.from, a.deletions[row].begin() + range.to)};
+    };
+    if (protein && paired) for (int row = 0; row < paired->depth; ++row) rows.push_back(take(*paired, row));
+    if (unpaired)   // (without the dedupe - rf3's - the unpaired block's own query is skipped after the paired rows)
+      for (int row = dedupe || !protein || !paired ? 0 : 1; row < unpaired->depth; ++row) {
+        Row one = take(*unpaired, row);
+        if (row > 0 && one.sequence.find_first_not_of('-') == std::string::npos) continue;
+        rows.push_back(one);
+      }
+    if (protein && dedupe) {
+      std::set<std::string> seen;
+      std::vector<Row> kept;
+      for (auto& one : rows) if (seen.insert(one.sequence).second) kept.push_back(one);
+      rows.swap(kept);
+    }
+    lists.push_back(rows);
+  }
+  int depth = 0;
+  for (auto& rows : lists) depth = std::max(depth, (int)rows.size());
+  A3m out;
+  out.length = length; out.depth = depth;
+  for (int row = 0; row < depth; ++row) {
+    std::string sequence; std::vector<int> deletions;
+    for (size_t k = 0; k < ranges.size(); ++k) {
+      int width = ranges[k].to - ranges[k].from;
+      if (row < (int)lists[k].size()) {
+        sequence += lists[k][row].sequence;
+        deletions.insert(deletions.end(), lists[k][row].deletions.begin(), lists[k][row].deletions.end());
+      } else {
+        sequence += std::string(width, '-');
+        deletions.insert(deletions.end(), width, 0);
+      }
+    }
+    out.descriptions.push_back("row " + std::to_string(row));
+    out.raw.push_back(sequence); out.sequences.push_back(sequence); out.deletions.push_back(deletions);
+  }
+  return out;
+}
+
 inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const std::vector<std::string>* columnKinds,
-                             Uniform* random, int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr) {
+                             Uniform* random, int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr,
+                             bool protenixUnpairedMsa = false, bool rf3ProfileMsa = false) {
   auto codeOf = [&](const std::string& aligned, int column) {
     char ch = aligned[column];
     if (columnKinds == nullptr || (*columnKinds)[column] == "protein" ||
@@ -192,6 +252,16 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
   if (mainMsaCap > 0) {                           // (openbind0's main MSA: the unpaired block and the profile's rows)
     if (unpaired.ok) unpaired.a = capMainMsa(unpaired.a, mainMsaCap, chainOfColumn);
     if (profileBlock.ok) profileBlock.a = capMainMsa(profileBlock.a, mainMsaCap, chainOfColumn);
+  }
+  if (protenixUnpairedMsa && (unpaired.ok || paired.ok)) {   // (protenix, opendde: pairedIntoUnpaired)
+    const A3m* p = paired.ok ? &paired.a : nullptr;
+    unpaired.a = pairedIntoUnpaired(unpaired.ok ? &unpaired.a : nullptr, p, chainOfColumn, columnKinds); unpaired.ok = true;
+    if (profileBlock.ok) profileBlock.a = pairedIntoUnpaired(&profileBlock.a, p, chainOfColumn, columnKinds);
+  }
+  if (rf3ProfileMsa && paired.ok) {   // (rf3: the profile over each chain's query, paired and unpaired rows - msa-features.js)
+    profileBlock.a = pairedIntoUnpaired(profileBlock.ok ? &profileBlock.a : (unpaired.ok ? &unpaired.a : nullptr), &paired.a,
+                                        chainOfColumn, columnKinds, false);
+    profileBlock.ok = true;
   }
   const Parsed& unpairedProfile = profileBlock.ok ? profileBlock : unpaired;
   int pairedBlock = !paired.ok ? 1 : paired.a.depth + 1;

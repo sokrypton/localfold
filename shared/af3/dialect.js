@@ -96,6 +96,14 @@ export const ALPHAFOLD3 = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  // a protein chain's paired rows joined to its unpaired MSA, deduplicated (protenix2, opendde: pairedIntoUnpaired)
+  protenixUnpairedMsa: false,
+  // a standard residue a declared bond ties to a ligand atomised into the ligand's unit (rf3: atomworks)
+  atomizeLigandBonded: false,
+  // the formal charge on an atom a declared bond forms on, from the bonds it keeps (rf3: atomworks)
+  declaredBondCharge: false,
+  // the profile over each chain's query, paired and unpaired rows, none dropped (rf3: atomworks' one block a chain)
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -365,6 +373,10 @@ export const OPENBIND0 = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: false,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
   // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
   mainMsaCap: 16384,
@@ -528,6 +540,10 @@ export const OPENDDE = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: true,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -805,6 +821,10 @@ export const PROTENIX2 = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: true,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -1018,6 +1038,10 @@ export const BOLTZ2 = Object.freeze({
   proteinOnlyMsa: true,
   zeroDeletions: true,
   profileOverAllRows: true,
+  protenixUnpairedMsa: false,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -1123,6 +1147,10 @@ export const INTELLIFOLD2 = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: false,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1318,6 +1346,10 @@ export const ROSETTAFOLD3 = Object.freeze({
   proteinOnlyMsa: true,   // (atomworks: one a3m per PROTEIN entity)
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: false,
+  atomizeLigandBonded: true,
+  declaredBondCharge: true,
+  rf3ProfileMsa: true,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1444,6 +1476,10 @@ export const CHAI1 = Object.freeze({
   proteinOnlyMsa: false,
   zeroDeletions: false,
   profileOverAllRows: false,
+  protenixUnpairedMsa: false,
+  atomizeLigandBonded: false,
+  declaredBondCharge: false,
+  rf3ProfileMsa: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1597,6 +1633,10 @@ export function featuriserDialect(dialect) {
     proteinOnlyMsa: dialect.proteinOnlyMsa,
     zeroDeletions: dialect.zeroDeletions,
     profileOverAllRows: dialect.profileOverAllRows,
+    protenixUnpairedMsa: dialect.protenixUnpairedMsa,
+    atomizeLigandBonded: dialect.atomizeLigandBonded,
+    declaredBondCharge: dialect.declaredBondCharge,
+    rf3ProfileMsa: dialect.rf3ProfileMsa,
     mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,

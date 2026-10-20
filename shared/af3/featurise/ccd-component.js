@@ -57,7 +57,7 @@ export function ccdUrl(code) {
  * a two-field row - so MG parsed as one atom with no name, element zero and no
  * coordinates, and folded. A wrong answer, quietly.
  */
-function loopOf(text, prefix) {
+export function loopOf(text, prefix) {
   const lines = text.split(/\r?\n/);
   const columns = [];
   const rows = [];
@@ -229,7 +229,16 @@ export function parseCcdComponent(text) {
   // (its one-letter code, which IntelliFold reads through the PROTEIN table whatever the chain: modifiedProteinLetter)
   const letter = text.match(/_chem_comp\.one_letter_code\s+(\S+)/)?.[1]?.replace(/['"]/g, "");
   const oneLetter = letter === undefined || letter === "?" || letter === "." ? null : letter.toUpperCase();
-  return { code, atoms, bonds, parent, glycan, oneLetter };
+  // (the whole bond graph, HYDROGENS INCLUDED, for rf3's charge on an atom a declared bond forms on: atomworks counts
+  // the bonds it still has, a hydrogen's among them - declaredBondCharge in featurise)
+  const graph = {
+    names: atomLoop.rows.map((row) => at(row, "atom_id") ?? ""),
+    elements: atomLoop.rows.map((row) => at(row, "type_symbol") ?? ""),
+    leaving: atomLoop.rows.map((row) => (at(row, "pdbx_leaving_atom_flag") ?? "N").toUpperCase() === "Y"),
+    bonds: bondLoop.rows.map((row) => [bondAt(row, "atom_id_1"), bondAt(row, "atom_id_2"),
+                                       (bondAt(row, "value_order") ?? "SING").toUpperCase()]),
+  };
+  return { code, atoms, bonds, parent, glycan, oneLetter, graph };
 }
 
 /**
@@ -249,7 +258,8 @@ export function ligandChain(components) {
   const residues = [];
   for (const component of components) {
     const from = atoms.length;
-    residues.push({ code: component.code, from, count: component.atoms.length, glycan: component.glycan === true });
+    residues.push({ code: component.code, from, count: component.atoms.length, glycan: component.glycan === true,
+                    graph: component.graph });
     atoms.push(...component.atoms);
     for (const bond of component.bonds) bonds.push({ ...bond, from: bond.from + from, to: bond.to + from });
   }
@@ -299,6 +309,7 @@ export function polymerResidue(component, isTerminal, terminalAtom = "OXT") {
     code: component.code,
     parent: component.parent ?? null,
     oneLetter: component.oneLetter ?? null,
+    graph: component.graph,
     // 🔴 EACH KEPT ATOM REMEMBERS ITS INDEX IN THE COMPONENT, because a
     // one-token modified residue is laid out by that index and NOT compacted.
     // AF3 leaves the removed atom's dense slot EMPTY: a phosphoserine in the

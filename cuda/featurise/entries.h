@@ -127,6 +127,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
     }
     addBonds(e, q + ".bonds", s.bonds);
     if (s.oneToken) e.flag(q + ".oneToken", true);
+    if (s.standard) e.flag(q + ".standard", true);
   }
   e.i(p + "residueOfToken", b.residueOfToken);
   e.t(p + "chainOfResidue", b.chainOfResidue);

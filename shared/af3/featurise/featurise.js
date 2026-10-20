@@ -46,7 +46,8 @@ import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
 import { uniformFrom } from "../random.js";
 import { declaredBondLeaving, declaredLigandLeavingAtoms, glycanO1Leaving } from "./declared-leaving.js";
-import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { polymerResidue, parentLetter, parseCcdComponent, ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { STANDARD_COMPONENTS } from "./standard-components.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
@@ -234,6 +235,16 @@ export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot,
  *   same length as the
  *   sequence. The query is always row zero and is prepended here.
  */
+// A standard residue's CCD code from its chain's letter, or null (rf3's atomizeLigandBonded)
+const PROTEIN_THREE = { A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY", H: "HIS",
+  I: "ILE", L: "LEU", K: "LYS", M: "MET", F: "PHE", P: "PRO", S: "SER", T: "THR", W: "TRP", Y: "TYR", V: "VAL" };
+function standardCode(kind, letter) {
+  if (kind === "protein") return PROTEIN_THREE[letter] ?? null;
+  if (kind === "dna") return "ACGT".includes(letter) ? `D${letter}` : null;
+  if (kind === "rna") return "ACGU".includes(letter) ? letter : null;
+  return null;
+}
+
 // IntelliFold's restype for a modified residue (modifiedProteinLetter): its CCD one-letter code in AF3's amino-acid
 // order, else the unknown amino acid
 const PROTEIN_LETTERS = "ARNDCQEGHILKMFPSTWYV";
@@ -289,6 +300,24 @@ export function featuriseProtein(sequence, options = {}) {
   for (const modification of options.modifications ?? []) {
     modificationOf.set(`${modification.chain}:${modification.position}`, modification);
   }
+  // 🔴 rf3 ATOMISES A STANDARD RESIDUE A DECLARED BOND TIES TO A LIGAND (`atomizeLigandBonded`, atomworks'
+  // covalent_modifications, af3-any-model's atomize_ligand_bonded): a glycosylated Asn, a cysteine under a covalent
+  // inhibitor, one token per heavy atom from its CCD entry (standard-components.js) - and it keeps its OWN restype,
+  // in aatype and in the alignment, where an atomised modified residue reads unknown.
+  const ligandBonded = [];
+  if (options.atomizeLigandBonded === true) {
+    for (const bond of options.bonds ?? []) {
+      const [poly, ligand] = bond.from.asym < chains.length ? [bond.from, bond.to] : [bond.to, bond.from];
+      if (!(poly.asym < chains.length) || !(ligand.asym >= chains.length)) continue;
+      ligandBonded.push({ chain: poly.asym, position: poly.residue, ligand: ligand.asym });
+      const key = `${poly.asym}:${poly.residue}`;
+      if (modificationOf.has(key)) continue;
+      const code = standardCode(chainKinds[poly.asym], chains[poly.asym][poly.residue - 1]);
+      if (code === null) continue;
+      modificationOf.set(key, { chain: poly.asym, position: poly.residue,
+                                ...parseCcdComponent(STANDARD_COMPONENTS[code]), standard: true });
+    }
+  }
   // Which chain each residue came from, so a reader can ask what its letters
   // mean without re-deriving the split.
   const chainOfResidue = [];
@@ -320,6 +349,7 @@ export function featuriseProtein(sequence, options = {}) {
       const modification = asked === null ? null
         : polymerResidue(source, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
           && options.modifiedAsOneToken !== true && !atEnds, protein ? "OXT" : "OP3");
+      if (modification !== null && asked.standard === true) modification.standard = true;
       residues.push({
         // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
         code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
@@ -601,7 +631,8 @@ export function featuriseProtein(sequence, options = {}) {
     }
     modifiedSpans.push({ from: token, count: modification.atoms.length,
                          code: modification.code, residue,
-                         atoms: modification.atoms, bonds: modification.bonds });
+                         atoms: modification.atoms, bonds: modification.bonds,
+                         ...(modification.standard === true ? { standard: true } : {}) });
     for (let atom = 0; atom < modification.atoms.length; atom += 1) {
       const source = modification.atoms[atom];
       // ...the PARENT's aatype, on every one of them. AF3 writes serine for all
@@ -620,7 +651,8 @@ export function featuriseProtein(sequence, options = {}) {
       // the sequence letter: of3 sets UNK on restype alone)
       // ("modifiedProteinLetter": IntelliFold-2's - the CCD one-letter code through the PROTEIN table, else the
       // unknown amino acid, whatever the chain: 5CM ('C') is a cysteine, PSU ('U') protein UNK)
-      aatype[token] = options.modifiedProteinLetter === true ? proteinLetterAatype(modification.oneLetter)
+      aatype[token] = modification.standard === true ? parentAatype(kind, code)
+        : options.modifiedProteinLetter === true ? proteinLetterAatype(modification.oneLetter)
         : options.atomizedUnknownRestype === "nucleic" || options.atomizedUnknownRestype === "aatype"
         || ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai") && kind === "protein")
         ? UNK_AATYPE : options.atomizedUnknownRestype === "chai" ? UNKNOWN_NUCLEOTIDE : parentAatype(kind, code);
@@ -874,7 +906,8 @@ export function featuriseProtein(sequence, options = {}) {
   const isModifiedEnd = (end) => {
     let global = end.residue - 1;
     for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
-    return modifiedSpans.some((one) => one.residue === global);
+    // (a standard residue rf3 atomised for its ligand bond is still a standard residue here: AF3 featurises its bond)
+    return modifiedSpans.some((one) => one.residue === global && one.standard !== true);
   };
   const declaredBonds = [];
   // chai-1's declared-bond feature (dialect `declaredBondFeature`): every declared bond, whatever the rule above
@@ -894,12 +927,93 @@ export function featuriseProtein(sequence, options = {}) {
     else if (fromLigand || toLigand) added = rule !== null && isModifiedEnd(fromLigand ? bond.to : bond.from); else if (rule === "all") added = true;
     else if (rule === "discontinuous"
              && !(bond.from.asym === bond.to.asym && Math.abs(bond.from.residue - bond.to.residue) <= 1)) added = true;
+    // (rf3: a polymer-polymer bond from a modified residue, to any residue - atomworks keeps an atomised residue's)
+    else if (rule === "ligand" && (isModifiedEnd(bond.from) || isModifiedEnd(bond.to))) added = true;
     else continue;
     // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
     // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
     // covalent inhibitor's alike - and boltz2's bond-type plane reads it
     if (added && from === to) continue;
     declaredBonds.push({ from, to, order: added ? 5 : bond.order ?? 5, bothWays: added });
+  }
+
+  // 🔴 rf3's CHARGE ON AN ATOM A DECLARED BOND FORMS ON (`declaredBondCharge`, atomworks'
+  // correct_formal_charges_for_specified_atoms, af3-any-model's _declared_bond_charge): the sum of the bond orders it
+  // still has - hydrogens included, its leaving group gone - plus the declared bonds, minus its default valence. The
+  // amide N of a glycosylated Asn keeps both hydrogens and gains the C1 bond: +1 where the CCD says 0.
+  if (options.declaredBondCharge === true && (options.bonds ?? []).length > 0) {
+    const VALENCE = { H: 1, C: 4, N: 3, O: 2, F: 1, Cl: 1, Br: 1, B: 3 };
+    const ORDER = { SING: 1, DOUB: 2, TRIP: 3, QUAD: 4 };
+    const counted = new Map();
+    for (const bond of options.bonds) {
+      for (const end of [bond.from, bond.to]) {
+        if (end.atom === undefined || end.atom === null || end.atom === "") continue;
+        const key = `${end.asym}\u0000${end.residue}\u0000${end.atom}`;
+        if (!counted.has(key)) counted.set(key, { end, n: 0 });
+        counted.get(key).n += 1;
+      }
+    }
+    const standardGraphs = new Map();
+    const located = (end) => {
+      if (end.asym >= chainLengths.length) {
+        const k = end.asym - chainLengths.length, ligand = ligands[k];
+        if (ligand === undefined) return null;
+        const parts = partsOf(ligand);
+        const part = parts.length === 1 ? parts[0] : parts[end.residue - 1];
+        if (part === undefined) return null;
+        const at = ligand.atoms.slice(part.from, part.from + part.count).findIndex((one) => one.name === end.atom);
+        return at < 0 ? null
+          : { flat: (ligandStart[k] + part.from + at) * DENSE, graph: part.graph ?? ligand.graph };
+      }
+      let global = end.residue - 1;
+      for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
+      const span = modifiedSpans.find((one) => one.residue === global);
+      if (span !== undefined) {
+        const at = span.atoms.findIndex((one) => one.name === end.atom);
+        return at < 0 || span.oneToken === true ? null
+          : { flat: (span.from + at) * DENSE, graph: residues[global].modification.graph };
+      }
+      const token = residueOfToken.indexOf(global);
+      const standard = token < 0 ? null : standardCode(residues[global].kind, residues[global].code);
+      if (standard === null) return null;
+      if (!standardGraphs.has(standard)) standardGraphs.set(standard, parseCcdComponent(STANDARD_COMPONENTS[standard]).graph);
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] === 0) continue;
+        let name = "";
+        for (let c = 0; c < 4; c += 1) {
+          const v = refAtomNameChars[flat * 4 + c];
+          if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+        }
+        if (name.trim() === end.atom) return { flat, graph: standardGraphs.get(standard) };
+      }
+      return null;
+    };
+    for (const { end, n } of counted.values()) {
+      const where = located(end);
+      if (where === null || where.graph === undefined) continue;
+      const { names, elements, leaving, bonds: edges } = where.graph;
+      const atom = names.indexOf(end.atom);
+      if (atom < 0 || !(elements[atom] in VALENCE)) continue;
+      const neighbours = names.map(() => []);
+      for (const [x, y, order] of edges) {
+        const a = names.indexOf(x), b = names.indexOf(y);
+        if (a < 0 || b < 0) continue;
+        neighbours[a].push([b, order]);
+        neighbours[b].push([a, order]);
+      }
+      const gone = new Set();
+      const todo = neighbours[atom].filter(([m]) => leaving[m]).map(([m]) => m);
+      while (todo.length > 0) {
+        const m = todo.pop();
+        if (gone.has(m)) continue;
+        gone.add(m);
+        for (const [next] of neighbours[m]) if (leaving[next] && next !== atom) todo.push(next);
+      }
+      let degree = n;
+      for (const [m, order] of neighbours[atom]) if (!gone.has(m)) degree += ORDER[order] ?? 1;
+      refCharge[where.flat] = degree - VALENCE[elements[atom]];
+    }
   }
 
   let bondMatrix;
@@ -1025,6 +1139,36 @@ export function featuriseProtein(sequence, options = {}) {
   // profile - an alignment has nothing to say about an atom. Copying aatype
   // across, which is right for every polymer token, puts a 20 there instead and
   // tells the model the ligand is a row of unknown amino acids.
+  // ...AND MOVES IT INTO THE LIGAND'S UNIT (atomworks' pn_unit, af3-any-model's _ligand_bonded_units): its tokens take
+  // the ligand's asym_id, keep their entity, and are that entity's next copy.
+  // (every declared bond with an atomised end is walked, as af3-any-model's loop does: one to another polymer chain
+  // moves the residue there first, and the entity's copy count it leaves is what the ligand's move then reads)
+  if (ligandBonded.length > 0) {
+    const newSym = new Map();
+    let chainStart = 0;
+    const residueStart = chains.map((chain) => { const at = chainStart; chainStart += chain.length; return at; });
+    const atomised = new Set(ligandBonded.map(({ chain, position }) => `${chain}:${position}`));
+    const moves = [];
+    for (const bond of options.bonds ?? []) {
+      const [poly, other] = atomised.has(`${bond.from.asym}:${bond.from.residue}`) ? [bond.from, bond.to] : [bond.to, bond.from];
+      if (!atomised.has(`${poly.asym}:${poly.residue}`)) continue;
+      moves.push({ chain: poly.asym, position: poly.residue, ligand: other.asym });
+    }
+    for (const { chain, position, ligand } of moves) {
+      const residue = residueStart[chain] + position - 1;
+      const span = modifiedSpans.find((one) => one.residue === residue);
+      if (span === undefined) continue;
+      const entity = entityId[span.from];
+      const key = `${entity}:${ligand}`;
+      if (!newSym.has(key)) {
+        let most = 0;
+        for (let token = 0; token < tokens; token += 1) if (entityId[token] === entity) most = Math.max(most, symId[token]);
+        newSym.set(key, most + 1);
+      }
+      asymId.fill(ligand + 1, span.from, span.from + span.count);
+      symId.fill(newSym.get(key), span.from, span.from + span.count);
+    }
+  }
   const queryRow = Int32Array.from(aatype);
   // 🔴 boltz2 MOVES `aatype` TO UNKNOWN AND LEAVES THE ALIGNMENT ALONE, WHERE
   // rosettafold3 MOVES BOTH. Two conventions, and one flag reported them as

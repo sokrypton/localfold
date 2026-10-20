@@ -17,6 +17,7 @@ const { DIALECTS, DIALECT_ALIASES, featuriserDialect } = await import(`${repo}sh
 const { BOLTZ2_RAW_CONFORMERS } = await import(`${repo}shared/af3/featurise/boltz2-conformers.js`);
 const { CHAI1_CONFORMERS } = await import(`${repo}shared/af3/featurise/chai1-conformers.js`);
 const { UNK_CCD_CONFORMER } = await import(`${repo}shared/af3/featurise/reference-conformers-unk.js`);
+const { STANDARD_COMPONENTS } = await import(`${repo}shared/af3/featurise/standard-components.js`);
 const { ELEMENT_SYMBOLS } = await import(`${repo}shared/af3/featurise/ccd-component.js`);
 const { AF3_MSA_CODES } = await import(`${repo}shared/af3/featurise/msa-features.js`);
 const { MODEL_BUNDLES } = await import(`${repo}shared/bundles/manifests/index.js`);
@@ -50,6 +51,12 @@ for (const [kind, table] of [["dna", DNA_CONFORMERS], ["rna", RNA_CONFORMERS]]) 
 }
 lines.push("// shared/af3/featurise/reference-conformers-unk.js: the CCD's UNK, [internal, C-terminal]");
 lines.push(`inline const ConformerEntry& unkCcdConformer() { static const ConformerEntry e = {'X', ${UNK_CCD_CONFORMER.aatype}, ${atoms(UNK_CCD_CONFORMER.internal)}, ${atoms(UNK_CCD_CONFORMER.cTerminal)}}; return e; }`);
+
+// shared/af3/featurise/standard-components.js: the standard residues' CCD entries (rf3's atomizeLigandBonded)
+lines.push("", "inline const std::map<std::string, std::string>& standardComponentTexts() {",
+  "  static const std::map<std::string, std::string> table = {",
+  ...Object.entries(STANDARD_COMPONENTS).map(([code, cif]) => `    {${str(code)}, R"CIF(${cif})CIF"},`),
+  "  };", "  return table;", "}");
 lines.push("");
 lines.push("// shared/af3/featurise/ccd-component.js ELEMENT_SYMBOLS (atomic number - 1)");
 lines.push(`inline const std::vector<std::string>& elementSymbols() { static const std::vector<std::string> s = {${ELEMENT_SYMBOLS.map(str).join(", ")}}; return s; }`);
@@ -76,7 +83,7 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
     + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
     + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}, ${bool(d.templateGapWhereNoAtoms)},`
-    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}, ${bool(f.keepLigandLeavingAtoms)}, ${bool(f.dnaGapMsa)}, ${bool(f.modifiedLeavingAtEnds)}, ${bool(f.modifiedNucleotideKeepsOp3)}, ${bool(f.modifiedProteinLetter)}, ${bool(f.unresolvedLeavingAtoms)}, ${bool(f.ligandMsaUnk)}, ${bool(f.proteinOnlyMsa)}, ${bool(f.zeroDeletions)}, ${bool(f.profileOverAllRows)}},`);
+    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}, ${bool(f.keepLigandLeavingAtoms)}, ${bool(f.dnaGapMsa)}, ${bool(f.modifiedLeavingAtEnds)}, ${bool(f.modifiedNucleotideKeepsOp3)}, ${bool(f.modifiedProteinLetter)}, ${bool(f.unresolvedLeavingAtoms)}, ${bool(f.ligandMsaUnk)}, ${bool(f.proteinOnlyMsa)}, ${bool(f.zeroDeletions)}, ${bool(f.profileOverAllRows)}, ${bool(f.protenixUnpairedMsa)}, ${bool(f.atomizeLigandBonded)}, ${bool(f.declaredBondCharge)}, ${bool(f.rf3ProfileMsa)}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");

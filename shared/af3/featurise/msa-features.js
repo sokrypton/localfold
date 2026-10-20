@@ -134,6 +134,60 @@ export function capMainMsa(parsed, cap, chainOfColumn) {
            deletionMatrix: keep.map((r) => parsed.deletionMatrix[r]), depth: keep.length };
 }
 
+/**
+ * protenix's (and OpenDDE's) unpaired MSA (`protenixUnpairedMsa`, af3-any-model's prepare_input with
+ * dedupe_unpaired_msa and pair_as_unpair): each PROTEIN chain's paired rows join its unpaired rows, paired first, and
+ * the result is deduplicated on the aligned (insertion-free) row - its query once. `unpaired` and `paired` are merged
+ * blocks, row-aligned across chains (mergeRowAlignedChainA3ms), so each chain's rows are cut from its own columns and
+ * the chains are stacked side by side again, a shorter one padded with gaps. A segment that is all gap in the
+ * unpaired block past its query is a pad and not a row; in the paired block it is the chain's row for that species.
+ */
+export function pairedIntoUnpaired(unpaired, paired, chainOfColumn, columnKinds, { dedupe = true } = {}) {
+  if (unpaired === null && paired === null) return null;
+  const base = unpaired ?? paired;
+  const length = base.length;
+  const chainOf = (column) => (chainOfColumn === undefined ? 0 : chainOfColumn[column]);
+  const ranges = [];
+  for (let column = 0; column < length; column += 1) {
+    const chain = chainOf(column);
+    if (ranges.length === 0 || ranges[ranges.length - 1].chain !== chain) ranges.push({ chain, from: column, to: column });
+    ranges[ranges.length - 1].to = column + 1;
+  }
+  const lists = ranges.map(({ from, to }) => {
+    const protein = columnKinds === undefined || (columnKinds[from] ?? "protein") === "protein";
+    const rows = [];
+    const take = (parsed, row) => ({ sequence: parsed.sequences[row].slice(from, to),
+                                     deletions: parsed.deletionMatrix[row].slice(from, to) });
+    if (protein && paired !== null) for (let row = 0; row < paired.depth; row += 1) rows.push(take(paired, row));
+    if (unpaired !== null) {
+      // (without the dedupe - rf3's - the unpaired block's own query is skipped where the paired rows began with it)
+      for (let row = dedupe || !protein || paired === null ? 0 : 1; row < unpaired.depth; row += 1) {
+        const one = take(unpaired, row);
+        if (row > 0 && /^-*$/.test(one.sequence)) continue;
+        rows.push(one);
+      }
+    }
+    if (!protein || !dedupe) return rows;
+    const seen = new Set();
+    return rows.filter((one) => (seen.has(one.sequence) ? false : (seen.add(one.sequence), true)));
+  });
+  const depth = Math.max(...lists.map((rows) => rows.length));
+  const sequences = [], deletionMatrix = [];
+  for (let row = 0; row < depth; row += 1) {
+    let sequence = "";
+    const deletions = [];
+    ranges.forEach(({ from, to }, k) => {
+      const one = lists[k][row];
+      sequence += one === undefined ? "-".repeat(to - from) : one.sequence;
+      for (let at = 0; at < to - from; at += 1) deletions.push(one === undefined ? 0 : one.deletions[at]);
+    });
+    sequences.push(sequence);
+    deletionMatrix.push(deletions);
+  }
+  return { ...base, descriptions: sequences.map((_, row) => `row ${row}`), rawSequences: sequences.slice(), sequences,
+           deletionMatrix, depth };
+}
+
 export function af3MsaFromA3m(alignment, options = {}) {
   const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
   const maxSequences = options.maxSequences ?? 512;
@@ -168,7 +222,9 @@ export function af3MsaFromA3m(alignment, options = {}) {
   // the chain of its first filled column, and a chain's own query (row zero) counts as its first row.
   const capped = (parsed) => (parsed === null || !(options.mainMsaCap > 0) ? parsed
     : capMainMsa(parsed, options.mainMsaCap, options.chainOfColumn));
-  const unpaired = capped(parse(texts.unpaired));
+  const protenix = (parsed) => (options.protenixUnpairedMsa === true
+    ? pairedIntoUnpaired(parsed, parse(texts.paired), options.chainOfColumn, columnKinds) : parsed);
+  const unpaired = protenix(capped(parse(texts.unpaired)));
   // 🔴 THE PROFILE IS COMPUTED BEFORE DEDUPLICATION, over the chain's FULL
   // unpaired alignment. AF3's features.py calls get_profile_features on every
   // chain and only then runs msa_pairing.deduplicate_unpaired_sequences, so the
@@ -176,7 +232,12 @@ export function af3MsaFromA3m(alignment, options = {}) {
   // what survives is the natural reading and it is a different feature - on a
   // target with good pairing most of the unpaired block is removed, so most of
   // the profile would be missing from it.
-  const unpairedProfile = capped(parse(texts.unpairedProfile)) ?? unpaired;
+  let unpairedProfile = (texts.unpairedProfile ? protenix(capped(parse(texts.unpairedProfile))) : null) ?? unpaired;
+  // (rf3: atomworks' MSA is one block a chain - its query, its paired rows, its unpaired rows, none dropped - and its
+  // profile is over that block; the rows the model reads stay this port's, the profile's are atomworks')
+  if (options.rf3ProfileMsa === true && paired !== null) {
+    unpairedProfile = pairedIntoUnpaired(unpairedProfile, paired, options.chainOfColumn, columnKinds, { dedupe: false });
+  }
 
   // 🔴 THE PAIRED BLOCK GETS AT MOST HALF THE BUDGET, and the unpaired block
   // gets what is left - `max_paired_sequences = msa_size // 2` in AF3's

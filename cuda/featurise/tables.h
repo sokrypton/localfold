@@ -2,6 +2,7 @@
 // JavaScript it mirrors (tools/gen-native-featuriser-tables.mjs -> tables.inc).
 #pragma once
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +47,8 @@ struct FamilyFlags {
   bool unresolvedLeavingAtoms;      // chai1: a ligand's leaving group at a declared bond a token it does not place
   bool ligandMsaUnk;                // boltz2: a ligand token's MSA query row the protein UNK, not the gap
   bool proteinOnlyMsa, zeroDeletions, profileOverAllRows;   // boltz2 (rf3: the first): its alignment, featurise.js
+  bool protenixUnpairedMsa;         // protenix2, opendde: a protein chain's paired rows in its unpaired MSA (pairedIntoUnpaired)
+  bool atomizeLigandBonded, declaredBondCharge, rf3ProfileMsa;   // rosettafold3 (atomworks)
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

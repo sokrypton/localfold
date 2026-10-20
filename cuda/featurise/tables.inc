@@ -56,6 +56,2002 @@ inline const std::vector<ConformerEntry>& rnaConformers() {
 // shared/af3/featurise/reference-conformers-unk.js: the CCD's UNK, [internal, C-terminal]
 inline const ConformerEntry& unkCcdConformer() { static const ConformerEntry e = {'X', 20, {{0, "N", 7, 0, 1.827, -0.498, -1.278}, {1, "CA", 6, 0, 2.145, -1.162, -2.517}, {2, "C", 6, 0, 1.576, -0.429, -3.719}, {3, "O", 8, 0, 0.85, 0.554, -3.635}, {4, "CB", 6, 0, 1.719, -2.634, -2.491}, {5, "CG", 6, 0, 0.211, -2.855, -2.469}}, {{0, "N", 7, 0, 1.827, -0.498, -1.278}, {1, "CA", 6, 0, 2.145, -1.162, -2.517}, {2, "C", 6, 0, 1.576, -0.429, -3.719}, {3, "O", 8, 0, 0.85, 0.554, -3.635}, {4, "CB", 6, 0, 1.719, -2.634, -2.491}, {5, "CG", 6, 0, 0.211, -2.855, -2.469}, {6, "OXT", 8, 0, 1.959, -0.964, -4.903}}}; return e; }
 
+inline const std::map<std::string, std::string>& standardComponentTexts() {
+  static const std::map<std::string, std::string> table = {
+    {"ALA", R"CIF(data_ALA
+_chem_comp.id ALA
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code A
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+ALA N N 0 N 2.281 26.213 12.804 -0.966 0.493 1.500
+ALA CA C 0 N 1.169 26.942 13.411 0.257 0.418 0.692
+ALA C C 0 N 1.539 28.344 13.874 -0.094 0.017 -0.716
+ALA O O 0 N 2.709 28.647 14.114 -1.056 -0.682 -0.923
+ALA CB C 0 N 0.601 26.143 14.574 1.204 -0.620 1.296
+ALA OXT O 0 Y 0.523 29.194 13.997 0.661 0.439 -1.742
+ALA H H 0 N 2.033 25.273 12.493 -1.383 -0.425 1.482
+ALA H2 H 0 Y 3.080 26.184 13.436 -0.676 0.661 2.452
+ALA HA H 0 N 0.399 27.067 12.613 0.746 1.392 0.682
+ALA HB1 H 0 N -0.247 26.699 15.037 1.459 -0.330 2.316
+ALA HB2 H 0 N 0.308 25.110 14.270 0.715 -1.594 1.307
+ALA HB3 H 0 N 1.384 25.876 15.321 2.113 -0.676 0.697
+ALA HXT H 0 Y 0.753 30.069 14.286 0.435 0.182 -2.647
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+ALA N CA SING N
+ALA N H SING N
+ALA N H2 SING N
+ALA CA C SING N
+ALA CA CB SING N
+ALA CA HA SING N
+ALA C O DOUB N
+ALA C OXT SING N
+ALA CB HB1 SING N
+ALA CB HB2 SING N
+ALA CB HB3 SING N
+ALA OXT HXT SING N
+)CIF"},
+    {"ARG", R"CIF(data_ARG
+_chem_comp.id ARG
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code R
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+ARG N N 0 N 69.812 14.685 89.810 -0.469 1.110 -0.993
+ARG CA C 0 N 70.052 14.573 91.280 0.004 2.294 -1.708
+ARG C C 0 N 71.542 14.389 91.604 -0.907 2.521 -2.901
+ARG O O 0 N 72.354 14.342 90.659 -1.827 1.789 -3.242
+ARG CB C 0 N 69.227 13.419 91.854 1.475 2.150 -2.127
+ARG CG C 0 N 67.722 13.607 91.686 1.745 1.017 -3.130
+ARG CD C 0 N 66.952 12.344 92.045 3.210 0.954 -3.557
+ARG NE N 0 N 67.307 11.224 91.178 4.071 0.726 -2.421
+ARG CZ C 0 N 66.932 9.966 91.380 5.469 0.624 -2.528
+ARG NH1 N 0 N 66.176 9.651 92.421 6.259 0.404 -1.405
+ARG NH2 N 1 N 67.344 9.015 90.554 6.078 0.744 -3.773
+ARG OXT O 0 Y 71.901 14.320 92.798 -0.588 3.659 -3.574
+ARG H H 0 N 68.822 14.807 89.594 -0.058 0.903 -0.109
+ARG H2 H 0 Y 70.205 13.888 89.308 -1.024 0.452 -1.494
+ARG HA H 0 N 69.728 15.528 91.756 -0.103 3.152 -1.034
+ARG HB2 H 0 N 69.554 12.445 91.420 2.086 1.988 -1.230
+ARG HB3 H 0 N 69.486 13.241 92.923 1.814 3.099 -2.563
+ARG HG2 H 0 N 67.355 14.485 92.266 1.136 1.170 -4.029
+ARG HG3 H 0 N 67.468 13.958 90.658 1.447 0.054 -2.698
+ARG HD2 H 0 N 67.083 12.081 93.120 3.348 0.133 -4.269
+ARG HD3 H 0 N 65.851 12.525 92.042 3.505 1.880 -4.062
+ARG HE H 0 N 68.324 11.220 91.100 3.674 0.627 -1.479
+ARG HH11 H 0 N 65.888 8.684 92.576 7.271 0.331 -1.484
+ARG HH12 H 0 N 65.339 10.234 92.397 5.858 0.307 -0.476
+ARG HH21 H 0 N 67.926 9.257 89.752 5.530 0.906 -4.614
+ARG HH22 H 0 N 67.056 8.048 90.709 7.088 0.675 -3.874
+ARG HXT H 0 Y 72.822 14.206 92.998 -1.149 3.855 -4.355
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+ARG N CA SING N
+ARG N H SING N
+ARG N H2 SING N
+ARG CA C SING N
+ARG CA CB SING N
+ARG CA HA SING N
+ARG C O DOUB N
+ARG C OXT SING N
+ARG CB CG SING N
+ARG CB HB2 SING N
+ARG CB HB3 SING N
+ARG CG CD SING N
+ARG CG HG2 SING N
+ARG CG HG3 SING N
+ARG CD NE SING N
+ARG CD HD2 SING N
+ARG CD HD3 SING N
+ARG NE CZ SING N
+ARG NE HE SING N
+ARG CZ NH1 SING N
+ARG CZ NH2 DOUB N
+ARG NH1 HH11 SING N
+ARG NH1 HH12 SING N
+ARG NH2 HH21 SING N
+ARG NH2 HH22 SING N
+ARG OXT HXT SING N
+)CIF"},
+    {"ASN", R"CIF(data_ASN
+_chem_comp.id ASN
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code N
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+ASN N N 0 N 15.295 16.641 19.776 -0.293 1.686 0.094
+ASN CA C 0 N 15.702 17.913 20.397 -0.448 0.292 -0.340
+ASN C C 0 N 14.630 18.500 21.234 -1.846 -0.179 -0.031
+ASN O O 0 N 14.949 19.152 22.234 -2.510 0.402 0.794
+ASN CB C 0 N 16.088 18.882 19.297 0.562 -0.588 0.401
+ASN CG C 0 N 17.262 18.512 18.462 1.960 -0.197 -0.002
+ASN OD1 O 0 N 18.123 17.705 18.780 2.132 0.697 -0.804
+ASN ND2 N 0 N 17.281 19.172 17.284 3.019 -0.841 0.527
+ASN OXT O 0 Y 13.386 18.353 20.865 -2.353 -1.243 -0.673
+ASN H H 0 N 16.048 16.284 19.223 -0.904 2.297 -0.427
+ASN H2 H 0 Y 15.064 15.980 20.490 -0.453 1.776 1.086
+ASN HA H 0 N 16.555 17.716 21.063 -0.270 0.223 -1.413
+ASN HB2 H 0 N 15.224 18.966 18.622 0.442 -0.451 1.476
+ASN HB3 H 0 N 16.323 19.842 19.779 0.389 -1.633 0.146
+ASN HD21 H 0 N 18.021 19.008 16.631 2.881 -1.556 1.168
+ASN HD22 H 0 N 16.555 19.824 17.065 3.919 -0.590 0.268
+ASN HXT H 0 Y 12.819 18.813 21.473 -3.254 -1.508 -0.441
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+ASN N CA SING N
+ASN N H SING N
+ASN N H2 SING N
+ASN CA C SING N
+ASN CA CB SING N
+ASN CA HA SING N
+ASN C O DOUB N
+ASN C OXT SING N
+ASN CB CG SING N
+ASN CB HB2 SING N
+ASN CB HB3 SING N
+ASN CG OD1 DOUB N
+ASN CG ND2 SING N
+ASN ND2 HD21 SING N
+ASN ND2 HD22 SING N
+ASN OXT HXT SING N
+)CIF"},
+    {"ASP", R"CIF(data_ASP
+_chem_comp.id ASP
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code D
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+ASP N N 0 N 33.487 17.736 39.094 -0.317 1.688 0.066
+ASP CA C 0 N 34.909 17.506 38.709 -0.470 0.286 -0.344
+ASP C C 0 N 34.993 16.527 37.537 -1.868 -0.180 -0.029
+ASP O O 0 N 36.106 16.031 37.261 -2.534 0.415 0.786
+ASP CB C 0 N 35.682 16.954 39.915 0.539 -0.580 0.413
+ASP CG C 0 N 35.231 15.544 40.306 1.938 -0.195 0.004
+ASP OD1 O 0 N 35.793 14.986 41.279 2.109 0.681 -0.810
+ASP OD2 O 0 N 34.327 14.999 39.631 2.992 -0.826 0.543
+ASP OXT O 0 Y 33.935 16.265 36.913 -2.374 -1.256 -0.652
+ASP H H 0 N 33.448 18.377 39.860 -0.928 2.289 -0.467
+ASP H2 H 0 Y 32.988 18.117 38.315 -0.478 1.795 1.056
+ASP HA H 0 N 35.356 18.461 38.395 -0.292 0.199 -1.416
+ASP HB2 H 0 N 36.751 16.919 39.657 0.419 -0.425 1.485
+ASP HB3 H 0 N 35.515 17.623 40.772 0.367 -1.630 0.176
+ASP HD2 H 0 N 34.155 14.130 39.974 3.869 -0.545 0.250
+ASP HXT H 0 Y 34.122 15.645 36.218 -3.275 -1.517 -0.416
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+ASP N CA SING N
+ASP N H SING N
+ASP N H2 SING N
+ASP CA C SING N
+ASP CA CB SING N
+ASP CA HA SING N
+ASP C O DOUB N
+ASP C OXT SING N
+ASP CB CG SING N
+ASP CB HB2 SING N
+ASP CB HB3 SING N
+ASP CG OD1 DOUB N
+ASP CG OD2 SING N
+ASP OD2 HD2 SING N
+ASP OXT HXT SING N
+)CIF"},
+    {"CYS", R"CIF(data_CYS
+_chem_comp.id CYS
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code C
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+CYS N N 0 N 22.585 13.716 37.715 1.585 0.483 -0.081
+CYS CA C 0 N 22.372 13.468 39.168 0.141 0.450 0.186
+CYS C C 0 N 21.806 14.686 39.893 -0.095 0.006 1.606
+CYS O O 0 N 22.614 15.553 40.277 0.685 -0.742 2.143
+CYS CB C 0 N 23.683 13.019 39.828 -0.533 -0.530 -0.774
+CYS SG S 0 N 25.202 13.440 38.921 -0.247 0.004 -2.484
+CYS OXT O 0 Y 20.565 14.747 40.076 -1.174 0.443 2.275
+CYS H H 0 N 22.963 12.902 37.230 1.928 -0.454 0.063
+CYS H2 H 0 Y 23.171 14.537 37.565 1.693 0.682 -1.065
+CYS HA H 0 N 21.614 12.654 39.253 -0.277 1.446 0.042
+CYS HB2 H 0 N 23.739 13.412 40.869 -0.114 -1.526 -0.630
+CYS HB3 H 0 N 23.651 11.923 40.031 -1.604 -0.554 -0.575
+CYS HG H 0 N 26.013 13.162 39.329 -0.904 -0.965 -3.145
+CYS HXT H 0 Y 20.212 15.505 40.527 -1.326 0.158 3.186
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+CYS N CA SING N
+CYS N H SING N
+CYS N H2 SING N
+CYS CA C SING N
+CYS CA CB SING N
+CYS CA HA SING N
+CYS C O DOUB N
+CYS C OXT SING N
+CYS CB SG SING N
+CYS CB HB2 SING N
+CYS CB HB3 SING N
+CYS SG HG SING N
+CYS OXT HXT SING N
+)CIF"},
+    {"GLN", R"CIF(data_GLN
+_chem_comp.id GLN
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code Q
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+GLN N N 0 N -12.869 34.883 120.983 1.858 -0.148 1.125
+GLN CA C 0 N -12.048 35.305 119.985 0.517 0.451 1.112
+GLN C C 0 N -10.724 35.797 120.549 -0.236 0.022 2.344
+GLN O O 0 N -9.691 35.852 119.806 -0.005 -1.049 2.851
+GLN CB C 0 N -12.660 36.476 119.161 -0.236 -0.013 -0.135
+GLN CG C 0 N -13.110 37.658 120.071 0.529 0.421 -1.385
+GLN CD C 0 N -13.701 38.830 119.321 -0.213 -0.036 -2.614
+GLN OE1 O 0 N -14.715 38.686 118.658 -1.252 -0.650 -2.500
+GLN NE2 N 0 N -13.069 39.999 119.445 0.277 0.236 -3.839
+GLN OXT O 0 Y -10.665 36.169 121.753 -1.165 0.831 2.878
+GLN H H 0 N -13.756 34.553 120.604 1.729 -1.148 1.137
+GLN H2 H 0 Y -13.004 35.604 121.691 2.286 0.078 0.240
+GLN HA H 0 N -11.902 34.421 119.320 0.605 1.537 1.099
+GLN HB2 H 0 N -11.958 36.821 118.366 -0.324 -1.100 -0.122
+GLN HB3 H 0 N -13.496 36.121 118.514 -1.231 0.431 -0.144
+GLN HG2 H 0 N -13.818 37.299 120.853 0.617 1.508 -1.398
+GLN HG3 H 0 N -12.266 37.994 120.717 1.524 -0.023 -1.375
+GLN HE21 H 0 N -12.221 40.119 119.999 -0.200 -0.058 -4.630
+GLN HE22 H 0 N -13.467 40.789 118.939 1.109 0.727 -3.930
+GLN HXT H 0 Y -9.838 36.476 122.105 -1.649 0.556 3.669
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+GLN N CA SING N
+GLN N H SING N
+GLN N H2 SING N
+GLN CA C SING N
+GLN CA CB SING N
+GLN CA HA SING N
+GLN C O DOUB N
+GLN C OXT SING N
+GLN CB CG SING N
+GLN CB HB2 SING N
+GLN CB HB3 SING N
+GLN CG CD SING N
+GLN CG HG2 SING N
+GLN CG HG3 SING N
+GLN CD OE1 DOUB N
+GLN CD NE2 SING N
+GLN NE2 HE21 SING N
+GLN NE2 HE22 SING N
+GLN OXT HXT SING N
+)CIF"},
+    {"GLU", R"CIF(data_GLU
+_chem_comp.id GLU
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code E
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+GLU N N 0 N 88.261 -7.660 -9.990 1.199 1.867 -0.117
+GLU CA C 0 N 87.744 -7.276 -11.334 1.138 0.515 0.453
+GLU C C 0 N 88.474 -6.030 -11.811 2.364 -0.260 0.041
+GLU O O 0 N 88.969 -5.292 -10.943 3.010 0.096 -0.916
+GLU CB C 0 N 86.234 -7.012 -11.267 -0.113 -0.200 -0.062
+GLU CG C 0 N 85.437 -8.194 -10.746 -1.360 0.517 0.461
+GLU CD C 0 N 83.937 -7.944 -10.707 -2.593 -0.187 -0.046
+GLU OE1 O 0 N 83.425 -7.140 -11.520 -2.485 -1.161 -0.753
+GLU OE2 O 0 N 83.260 -8.567 -9.862 -3.811 0.269 0.287
+GLU OXT O 0 Y 88.543 -5.801 -13.033 2.737 -1.345 0.737
+GLU H H 0 N 87.785 -8.479 -9.671 1.237 1.834 -1.125
+GLU H2 H 0 Y 89.241 -7.847 -10.051 0.421 2.427 0.197
+GLU HA H 0 N 87.920 -8.099 -12.043 1.098 0.580 1.540
+GLU HB2 H 0 N 86.064 -6.160 -10.592 -0.117 -0.187 -1.152
+GLU HB3 H 0 N 85.881 -6.781 -12.283 -0.113 -1.231 0.289
+GLU HG2 H 0 N 85.624 -9.052 -11.408 -1.357 0.504 1.551
+GLU HG3 H 0 N 85.775 -8.411 -9.722 -1.360 1.548 0.109
+GLU HE2 H 0 N 82.345 -8.328 -9.951 -4.571 -0.215 -0.062
+GLU HXT H 0 Y 89.022 -4.994 -13.178 3.530 -1.809 0.435
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+GLU N CA SING N
+GLU N H SING N
+GLU N H2 SING N
+GLU CA C SING N
+GLU CA CB SING N
+GLU CA HA SING N
+GLU C O DOUB N
+GLU C OXT SING N
+GLU CB CG SING N
+GLU CB HB2 SING N
+GLU CB HB3 SING N
+GLU CG CD SING N
+GLU CG HG2 SING N
+GLU CG HG3 SING N
+GLU CD OE1 DOUB N
+GLU CD OE2 SING N
+GLU OE2 HE2 SING N
+GLU OXT HXT SING N
+)CIF"},
+    {"GLY", R"CIF(data_GLY
+_chem_comp.id GLY
+_chem_comp.type "PEPTIDE LINKING"
+_chem_comp.one_letter_code G
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+GLY N N 0 N 25.463 35.609 47.047 1.931 0.090 -0.034
+GLY CA C 0 N 25.329 37.024 46.850 0.761 -0.799 -0.008
+GLY C C 0 N 26.081 37.335 45.572 -0.498 0.029 -0.005
+GLY O O 0 N 27.024 36.627 45.222 -0.429 1.235 -0.023
+GLY OXT O 0 Y 25.702 38.256 44.874 -1.697 -0.574 0.018
+GLY H H 0 N 25.494 35.150 46.159 1.910 0.738 0.738
+GLY H2 H 0 Y 26.307 35.421 47.549 2.788 -0.442 -0.037
+GLY HA2 H 0 N 24.270 37.305 46.757 0.772 -1.440 -0.889
+GLY HA3 H 0 N 25.731 37.590 47.703 0.793 -1.415 0.891
+GLY HXT H 0 Y 26.236 38.300 44.090 -2.477 -0.002 0.019
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+GLY N CA SING N
+GLY N H SING N
+GLY N H2 SING N
+GLY CA C SING N
+GLY CA HA2 SING N
+GLY CA HA3 SING N
+GLY C O DOUB N
+GLY C OXT SING N
+GLY OXT HXT SING N
+)CIF"},
+    {"HIS", R"CIF(data_HIS
+_chem_comp.id HIS
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code H
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+HIS N N 0 N 33.472 42.685 -4.610 -0.040 -1.210 0.053
+HIS CA C 0 N 33.414 41.686 -5.673 1.172 -1.709 0.652
+HIS C C 0 N 33.773 42.279 -7.040 1.083 -3.207 0.905
+HIS O O 0 N 33.497 43.444 -7.337 0.040 -3.770 1.222
+HIS CB C 0 N 32.005 41.080 -5.734 1.484 -0.975 1.962
+HIS CG C 0 N 31.888 39.902 -6.651 2.940 -1.060 2.353
+HIS ND1 N 1 N 32.539 38.710 -6.414 3.380 -2.075 3.129
+HIS CD2 C 0 N 31.199 39.734 -7.804 3.960 -0.251 2.046
+HIS CE1 C 0 N 32.251 37.857 -7.382 4.693 -1.908 3.317
+HIS NE2 N 0 N 31.439 38.453 -8.237 5.058 -0.801 2.662
+HIS OXT O 0 Y 34.382 41.455 -7.879 2.247 -3.882 0.744
+HIS H H 0 N 33.485 42.227 -3.721 -0.102 -1.155 -0.950
+HIS H2 H 0 Y 34.301 43.234 -4.714 -0.715 -0.741 0.634
+HIS HA H 0 N 34.155 40.908 -5.439 1.965 -1.558 -0.089
+HIS HB2 H 0 N 31.733 40.750 -4.721 1.215 0.087 1.879
+HIS HB3 H 0 N 31.337 41.860 -6.127 0.859 -1.368 2.775
+HIS HD1 H 0 N 33.135 38.521 -5.633 2.828 -2.838 3.511
+HIS HD2 H 0 N 30.577 40.470 -8.292 4.108 0.647 1.479
+HIS HE1 H 0 N 32.618 36.844 -7.461 5.340 -2.550 3.892
+HIS HE2 H 0 N 31.061 38.039 -9.065 6.002 -0.428 2.627
+HIS HXT H 0 Y 34.553 41.905 -8.698 2.188 -4.848 0.901
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+HIS N CA SING N
+HIS N H SING N
+HIS N H2 SING N
+HIS CA C SING N
+HIS CA CB SING N
+HIS CA HA SING N
+HIS C O DOUB N
+HIS C OXT SING N
+HIS CB CG SING N
+HIS CB HB2 SING N
+HIS CB HB3 SING N
+HIS CG ND1 SING Y
+HIS CG CD2 DOUB Y
+HIS ND1 CE1 DOUB Y
+HIS ND1 HD1 SING N
+HIS CD2 NE2 SING Y
+HIS CD2 HD2 SING N
+HIS CE1 NE2 SING Y
+HIS CE1 HE1 SING N
+HIS NE2 HE2 SING N
+HIS OXT HXT SING N
+)CIF"},
+    {"ILE", R"CIF(data_ILE
+_chem_comp.id ILE
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code I
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+ILE N N 0 N 52.625 76.235 68.049 -1.944 0.335 -0.343
+ILE CA C 0 N 52.964 77.620 67.705 -0.487 0.519 -0.369
+ILE C C 0 N 51.910 78.234 66.791 0.066 -0.032 -1.657
+ILE O O 0 N 51.409 77.508 65.911 -0.484 -0.958 -2.203
+ILE CB C 0 N 54.346 77.727 66.970 0.140 -0.219 0.814
+ILE CG1 C 0 N 54.852 79.179 66.992 -0.421 0.341 2.122
+ILE CG2 C 0 N 54.218 77.237 65.524 1.658 -0.027 0.788
+ILE CD1 C 0 N 56.126 79.382 66.170 0.206 -0.397 3.305
+ILE OXT O 0 Y 51.631 79.444 66.958 1.171 0.504 -2.197
+ILE H H 0 N 53.330 75.824 68.660 -2.112 -0.656 -0.410
+ILE H2 H 0 Y 52.475 75.667 67.215 -2.256 0.622 0.572
+ILE HA H 0 N 53.012 78.169 68.673 -0.253 1.582 -0.299
+ILE HB H 0 N 55.082 77.082 67.504 -0.092 -1.281 0.744
+ILE HG12 H 0 N 54.051 79.883 66.666 -1.502 0.204 2.141
+ILE HG13 H 0 N 54.993 79.535 68.039 -0.188 1.403 2.192
+ILE HG21 H 0 N 55.200 77.313 65.001 1.891 1.034 0.857
+ILE HG22 H 0 N 53.796 76.206 65.469 2.105 -0.554 1.631
+ILE HG23 H 0 N 53.411 77.773 64.972 2.059 -0.427 -0.143
+ILE HD11 H 0 N 56.492 80.434 66.185 -0.193 0.001 4.237
+ILE HD12 H 0 N 56.926 78.677 66.496 -0.026 -1.460 3.235
+ILE HD13 H 0 N 55.984 79.026 65.122 1.287 -0.261 3.286
+ILE HXT H 0 Y 50.974 79.826 66.388 1.527 0.150 -3.024
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+ILE N CA SING N
+ILE N H SING N
+ILE N H2 SING N
+ILE CA C SING N
+ILE CA CB SING N
+ILE CA HA SING N
+ILE C O DOUB N
+ILE C OXT SING N
+ILE CB CG1 SING N
+ILE CB CG2 SING N
+ILE CB HB SING N
+ILE CG1 CD1 SING N
+ILE CG1 HG12 SING N
+ILE CG1 HG13 SING N
+ILE CG2 HG21 SING N
+ILE CG2 HG22 SING N
+ILE CG2 HG23 SING N
+ILE CD1 HD11 SING N
+ILE CD1 HD12 SING N
+ILE CD1 HD13 SING N
+ILE OXT HXT SING N
+)CIF"},
+    {"LEU", R"CIF(data_LEU
+_chem_comp.id LEU
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code L
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+LEU N N 0 N 16.293 15.907 52.123 -1.661 0.627 -0.406
+LEU CA C 0 N 15.121 16.772 51.804 -0.205 0.441 -0.467
+LEU C C 0 N 13.865 15.975 51.517 0.180 -0.055 -1.836
+LEU O O 0 N 12.808 16.576 51.643 -0.591 -0.731 -2.474
+LEU CB C 0 N 15.395 17.657 50.575 0.221 -0.583 0.585
+LEU CG C 0 N 16.407 18.798 50.632 -0.170 -0.079 1.976
+LEU CD1 C 0 N 16.398 19.395 52.065 0.256 -1.104 3.029
+LEU CD2 C 0 N 17.792 18.247 50.210 0.526 1.254 2.250
+LEU OXT O 0 Y 13.877 14.786 51.211 1.382 0.254 -2.348
+LEU H H 0 N 17.138 16.443 52.316 -2.077 -0.272 -0.592
+LEU H2 H 0 Y 16.454 15.223 51.383 -1.884 0.858 0.550
+LEU HA H 0 N 14.962 17.396 52.714 0.291 1.391 -0.271
+LEU HB2 H 0 N 15.673 16.990 49.725 1.301 -0.722 0.540
+LEU HB3 H 0 N 14.421 18.076 50.228 -0.275 -1.534 0.390
+LEU HG H 0 N 16.148 19.623 49.927 -1.250 0.058 2.021
+LEU HD11 H 0 N 17.137 20.228 52.106 -0.022 -0.745 4.019
+LEU HD12 H 0 N 15.379 19.710 52.390 -0.240 -2.055 2.833
+LEU HD13 H 0 N 16.577 18.624 52.850 1.336 -1.243 2.984
+LEU HD21 H 0 N 18.531 19.080 50.251 1.606 1.115 2.205
+LEU HD22 H 0 N 18.105 17.366 50.817 0.222 1.984 1.500
+LEU HD23 H 0 N 17.768 17.745 49.214 0.247 1.613 3.241
+LEU HXT H 0 Y 13.089 14.286 51.031 1.630 -0.064 -3.226
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+LEU N CA SING N
+LEU N H SING N
+LEU N H2 SING N
+LEU CA C SING N
+LEU CA CB SING N
+LEU CA HA SING N
+LEU C O DOUB N
+LEU C OXT SING N
+LEU CB CG SING N
+LEU CB HB2 SING N
+LEU CB HB3 SING N
+LEU CG CD1 SING N
+LEU CG CD2 SING N
+LEU CG HG SING N
+LEU CD1 HD11 SING N
+LEU CD1 HD12 SING N
+LEU CD1 HD13 SING N
+LEU CD2 HD21 SING N
+LEU CD2 HD22 SING N
+LEU CD2 HD23 SING N
+LEU OXT HXT SING N
+)CIF"},
+    {"LYS", R"CIF(data_LYS
+_chem_comp.id LYS
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code K
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+LYS N N 0 N 37.577 40.385 -3.968 1.422 1.796 0.198
+LYS CA C 0 N 38.631 39.459 -4.356 1.394 0.355 0.484
+LYS C C 0 N 38.094 38.304 -5.212 2.657 -0.284 -0.032
+LYS O O 0 N 36.873 38.235 -5.490 3.316 0.275 -0.876
+LYS CB C 0 N 39.374 38.919 -3.139 0.184 -0.278 -0.206
+LYS CG C 0 N 38.523 38.111 -2.181 -1.102 0.282 0.407
+LYS CD C 0 N 39.164 36.749 -1.903 -2.313 -0.351 -0.283
+LYS CE C 0 N 38.106 35.761 -1.382 -3.598 0.208 0.329
+LYS NZ N 1 N 37.176 36.546 -0.539 -4.761 -0.400 -0.332
+LYS OXT O 0 Y 38.961 37.678 -5.886 3.050 -1.476 0.446
+LYS H H 0 N 37.933 41.152 -3.399 1.489 1.891 -0.804
+LYS H2 H 0 Y 36.812 39.900 -3.498 0.521 2.162 0.464
+LYS HA H 0 N 39.352 40.037 -4.979 1.322 0.200 1.560
+LYS HB2 H 0 N 40.262 38.326 -3.460 0.210 -0.047 -1.270
+LYS HB3 H 0 N 39.882 39.750 -2.596 0.211 -1.359 -0.068
+LYS HG2 H 0 N 38.317 38.670 -1.238 -1.128 0.050 1.471
+LYS HG3 H 0 N 37.474 38.007 -2.546 -1.130 1.363 0.269
+LYS HD2 H 0 N 39.701 36.351 -2.795 -2.287 -0.120 -1.348
+LYS HD3 H 0 N 40.034 36.831 -1.210 -2.285 -1.432 -0.145
+LYS HE2 H 0 N 37.593 35.194 -2.194 -3.625 -0.023 1.394
+LYS HE3 H 0 N 38.544 34.882 -0.854 -3.626 1.289 0.192
+LYS HZ1 H 0 N 36.474 35.891 -0.193 -4.736 -0.185 -1.318
+LYS HZ2 H 0 N 37.644 37.064 0.203 -4.735 -1.400 -0.205
+LYS HZ3 H 0 N 36.774 37.350 -1.021 -5.609 -0.031 0.071
+LYS HXT H 0 Y 38.628 36.963 -6.415 3.861 -1.886 0.115
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+LYS N CA SING N
+LYS N H SING N
+LYS N H2 SING N
+LYS CA C SING N
+LYS CA CB SING N
+LYS CA HA SING N
+LYS C O DOUB N
+LYS C OXT SING N
+LYS CB CG SING N
+LYS CB HB2 SING N
+LYS CB HB3 SING N
+LYS CG CD SING N
+LYS CG HG2 SING N
+LYS CG HG3 SING N
+LYS CD CE SING N
+LYS CD HD2 SING N
+LYS CD HD3 SING N
+LYS CE NZ SING N
+LYS CE HE2 SING N
+LYS CE HE3 SING N
+LYS NZ HZ1 SING N
+LYS NZ HZ2 SING N
+LYS NZ HZ3 SING N
+LYS OXT HXT SING N
+)CIF"},
+    {"MET", R"CIF(data_MET
+_chem_comp.id MET
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code M
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+MET N N 0 N 16.161 15.756 51.903 -1.816 0.142 -1.166
+MET CA C 0 N 15.084 16.739 51.596 -0.392 0.499 -1.214
+MET C C 0 N 13.846 15.930 51.367 0.206 0.002 -2.504
+MET O O 0 N 12.795 16.510 51.424 -0.236 -0.989 -3.033
+MET CB C 0 N 15.401 17.530 50.317 0.334 -0.145 -0.032
+MET CG C 0 N 16.183 18.846 50.502 -0.273 0.359 1.277
+MET SD S 0 N 17.852 18.653 51.063 0.589 -0.405 2.678
+MET CE C 0 N 18.614 17.814 49.556 -0.314 0.353 4.056
+MET OXT O 0 Y 13.865 14.721 51.154 1.232 0.661 -3.066
+MET H H 0 N 17.004 16.307 52.059 -1.865 -0.864 -1.220
+MET H2 H 0 Y 16.270 15.035 51.189 -2.149 0.399 -0.248
+MET HA H 0 N 14.975 17.472 52.429 -0.287 1.582 -1.158
+MET HB2 H 0 N 15.935 16.873 49.591 1.391 0.119 -0.068
+MET HB3 H 0 N 14.459 17.728 49.754 0.229 -1.229 -0.088
+MET HG2 H 0 N 16.160 19.442 49.560 -1.330 0.094 1.313
+MET HG3 H 0 N 15.625 19.532 51.181 -0.168 1.442 1.333
+MET HE1 H 0 N 19.664 17.692 49.909 0.090 -0.010 5.000
+MET HE2 H 0 N 18.107 16.882 49.211 -0.207 1.436 4.008
+MET HE3 H 0 N 18.487 18.349 48.586 -1.369 0.088 3.988
+MET HXT H 0 Y 13.079 14.207 51.008 1.616 0.342 -3.894
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+MET N CA SING N
+MET N H SING N
+MET N H2 SING N
+MET CA C SING N
+MET CA CB SING N
+MET CA HA SING N
+MET C O DOUB N
+MET C OXT SING N
+MET CB CG SING N
+MET CB HB2 SING N
+MET CB HB3 SING N
+MET CG SD SING N
+MET CG HG2 SING N
+MET CG HG3 SING N
+MET SD CE SING N
+MET CE HE1 SING N
+MET CE HE2 SING N
+MET CE HE3 SING N
+MET OXT HXT SING N
+)CIF"},
+    {"PHE", R"CIF(data_PHE
+_chem_comp.id PHE
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code F
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+PHE N N 0 N 3.260 22.302 6.000 1.317 0.962 1.014
+PHE CA C 0 N 4.252 21.272 5.710 -0.020 0.426 1.300
+PHE C C 0 N 5.559 21.899 5.229 -0.109 0.047 2.756
+PHE O O 0 N 5.836 21.838 4.012 0.879 -0.317 3.346
+PHE CB C 0 N 3.708 20.298 4.656 -0.270 -0.809 0.434
+PHE CG C 0 N 4.596 19.106 4.406 -0.181 -0.430 -1.020
+PHE CD1 C 0 N 5.077 18.339 5.467 1.031 -0.498 -1.680
+PHE CD2 C 0 N 4.927 18.732 3.109 -1.314 -0.018 -1.698
+PHE CE1 C 0 N 5.874 17.219 5.237 1.112 -0.150 -3.015
+PHE CE2 C 0 N 5.718 17.618 2.867 -1.231 0.333 -3.032
+PHE CZ C 0 N 6.193 16.860 3.932 -0.018 0.265 -3.691
+PHE OXT O 0 Y 6.283 22.460 6.079 -1.286 0.113 3.396
+PHE H H 0 N 2.387 21.883 6.321 1.975 0.230 1.235
+PHE H2 H 0 Y 3.111 22.918 5.201 1.365 1.104 0.017
+PHE HA H 0 N 4.460 20.708 6.649 -0.770 1.184 1.076
+PHE HB2 H 0 N 2.676 19.968 4.922 0.480 -1.568 0.659
+PHE HB3 H 0 N 3.493 20.833 3.701 -1.262 -1.207 0.646
+PHE HD1 H 0 N 4.823 18.622 6.502 1.915 -0.824 -1.152
+PHE HD2 H 0 N 4.556 19.328 2.258 -2.262 0.034 -1.183
+PHE HE1 H 0 N 6.250 16.619 6.083 2.060 -0.203 -3.530
+PHE HE2 H 0 N 5.968 17.335 1.830 -2.116 0.659 -3.560
+PHE HZ H 0 N 6.822 15.974 3.741 0.045 0.538 -4.734
+PHE HXT H 0 Y 7.096 22.850 5.779 -1.343 -0.130 4.330
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+PHE N CA SING N
+PHE N H SING N
+PHE N H2 SING N
+PHE CA C SING N
+PHE CA CB SING N
+PHE CA HA SING N
+PHE C O DOUB N
+PHE C OXT SING N
+PHE CB CG SING N
+PHE CB HB2 SING N
+PHE CB HB3 SING N
+PHE CG CD1 DOUB Y
+PHE CG CD2 SING Y
+PHE CD1 CE1 SING Y
+PHE CD1 HD1 SING N
+PHE CD2 CE2 DOUB Y
+PHE CD2 HD2 SING N
+PHE CE1 CZ DOUB Y
+PHE CE1 HE1 SING N
+PHE CE2 CZ SING Y
+PHE CE2 HE2 SING N
+PHE CZ HZ SING N
+PHE OXT HXT SING N
+)CIF"},
+    {"PRO", R"CIF(data_PRO
+_chem_comp.id PRO
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code P
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+PRO N N 0 N 39.165 37.768 82.966 -0.816 1.108 0.254
+PRO CA C 0 N 38.579 38.700 82.008 0.001 -0.107 0.509
+PRO C C 0 N 37.217 39.126 82.515 1.408 0.091 0.005
+PRO O O 0 N 36.256 38.332 82.370 1.650 0.980 -0.777
+PRO CB C 0 N 38.491 37.874 80.720 -0.703 -1.227 -0.286
+PRO CG C 0 N 38.311 36.445 81.200 -2.163 -0.753 -0.439
+PRO CD C 0 N 38.958 36.358 82.579 -2.218 0.614 0.276
+PRO OXT O 0 Y 37.131 40.263 83.047 2.391 -0.721 0.424
+PRO H H 0 Y 40.152 37.928 82.959 -0.707 1.708 1.057
+PRO HA H 0 N 39.160 39.638 81.850 0.009 -0.343 1.573
+PRO HB2 H 0 N 37.703 38.219 80.010 -0.240 -1.345 -1.266
+PRO HB3 H 0 N 39.352 38.017 80.027 -0.666 -2.165 0.267
+PRO HG2 H 0 N 37.247 36.109 81.191 -2.416 -0.638 -1.493
+PRO HG3 H 0 N 38.703 35.687 80.482 -2.843 -1.458 0.040
+PRO HD2 H 0 N 38.378 35.759 83.320 -2.872 1.300 -0.263
+PRO HD3 H 0 N 39.880 35.732 82.614 -2.559 0.492 1.304
+PRO HXT H 0 Y 36.276 40.530 83.365 3.293 -0.594 0.101
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+PRO N CA SING N
+PRO N CD SING N
+PRO N H SING N
+PRO CA C SING N
+PRO CA CB SING N
+PRO CA HA SING N
+PRO C O DOUB N
+PRO C OXT SING N
+PRO CB CG SING N
+PRO CB HB2 SING N
+PRO CB HB3 SING N
+PRO CG CD SING N
+PRO CG HG2 SING N
+PRO CG HG3 SING N
+PRO CD HD2 SING N
+PRO CD HD3 SING N
+PRO OXT HXT SING N
+)CIF"},
+    {"SER", R"CIF(data_SER
+_chem_comp.id SER
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code S
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+SER N N 0 N 88.198 -7.658 -9.979 1.525 0.493 -0.608
+SER CA C 0 N 87.782 -7.276 -11.358 0.100 0.469 -0.252
+SER C C 0 N 88.571 -6.062 -11.818 -0.053 0.004 1.173
+SER O O 0 N 89.008 -5.296 -10.944 0.751 -0.760 1.649
+SER CB C 0 N 86.286 -6.966 -11.391 -0.642 -0.489 -1.184
+SER OG O 0 N 85.543 -8.096 -10.989 -0.496 -0.049 -2.535
+SER OXT O 0 Y 88.737 -5.884 -13.035 -1.084 0.440 1.913
+SER H H 0 N 87.668 -8.473 -9.670 1.867 -0.449 -0.499
+SER H2 H 0 Y 88.118 -6.879 -9.325 1.574 0.707 -1.593
+SER HA H 0 N 87.988 -8.129 -12.045 -0.316 1.471 -0.354
+SER HB2 H 0 N 86.034 -6.065 -10.783 -0.225 -1.491 -1.081
+SER HB3 H 0 N 85.961 -6.588 -12.388 -1.699 -0.507 -0.920
+SER HG H 0 N 84.613 -7.903 -11.009 -0.978 -0.679 -3.088
+SER HXT H 0 Y 89.230 -5.124 -13.322 -1.183 0.142 2.828
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+SER N CA SING N
+SER N H SING N
+SER N H2 SING N
+SER CA C SING N
+SER CA CB SING N
+SER CA HA SING N
+SER C O DOUB N
+SER C OXT SING N
+SER CB OG SING N
+SER CB HB2 SING N
+SER CB HB3 SING N
+SER OG HG SING N
+SER OXT HXT SING N
+)CIF"},
+    {"THR", R"CIF(data_THR
+_chem_comp.id THR
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code T
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+THR N N 0 N 36.241 32.034 31.861 1.543 -0.702 0.430
+THR CA C 0 N 35.010 31.223 31.876 0.122 -0.706 0.056
+THR C C 0 N 35.213 30.209 30.769 -0.038 -0.090 -1.309
+THR O O 0 N 35.564 30.621 29.635 0.732 0.761 -1.683
+THR CB C 0 N 33.755 32.073 31.570 -0.675 0.104 1.079
+THR OG1 O 0 N 33.730 33.235 32.412 -0.193 1.448 1.103
+THR CG2 C 0 N 32.482 31.262 31.863 -0.511 -0.521 2.466
+THR OXT O 0 Y 35.042 29.014 31.057 -1.039 -0.488 -2.110
+THR H H 0 N 36.104 32.716 32.606 1.839 0.261 0.434
+THR H2 H 0 Y 36.457 32.445 30.953 1.593 -1.025 1.385
+THR HA H 0 N 34.842 30.763 32.878 -0.245 -1.732 0.038
+THR HB H 0 N 33.792 32.367 30.495 -1.729 0.101 0.802
+THR HG1 H 0 N 32.959 33.757 32.224 0.740 1.406 1.352
+THR HG21 H 0 N 31.577 31.874 31.642 -1.080 0.056 3.194
+THR HG22 H 0 N 32.471 30.290 31.315 -0.879 -1.547 2.448
+THR HG23 H 0 N 32.471 30.863 32.904 0.542 -0.518 2.743
+THR HXT H 0 Y 35.169 28.378 30.362 -1.143 -0.092 -2.986
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+THR N CA SING N
+THR N H SING N
+THR N H2 SING N
+THR CA C SING N
+THR CA CB SING N
+THR CA HA SING N
+THR C O DOUB N
+THR C OXT SING N
+THR CB OG1 SING N
+THR CB CG2 SING N
+THR CB HB SING N
+THR OG1 HG1 SING N
+THR CG2 HG21 SING N
+THR CG2 HG22 SING N
+THR CG2 HG23 SING N
+THR OXT HXT SING N
+)CIF"},
+    {"TRP", R"CIF(data_TRP
+_chem_comp.id TRP
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code W
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+TRP N N 0 N 74.708 60.512 32.843 1.278 1.121 2.059
+TRP CA C 0 N 74.400 61.735 32.114 -0.008 0.417 1.970
+TRP C C 0 N 73.588 61.411 30.840 -0.490 0.076 3.357
+TRP O O 0 N 72.939 62.292 30.277 0.308 -0.130 4.240
+TRP CB C 0 N 75.684 62.473 31.706 0.168 -0.868 1.161
+TRP CG C 0 N 76.675 62.727 32.832 0.650 -0.526 -0.225
+TRP CD1 C 0 N 77.753 61.964 33.157 1.928 -0.418 -0.622
+TRP CD2 C 0 N 76.646 63.805 33.777 -0.186 -0.256 -1.396
+TRP NE1 N 0 N 78.403 62.494 34.247 1.978 -0.095 -1.951
+TRP CE2 C 0 N 77.741 63.625 34.650 0.701 0.014 -2.454
+TRP CE3 C 0 N 75.796 64.902 33.974 -1.564 -0.210 -1.615
+TRP CZ2 C 0 N 78.014 64.499 35.709 0.190 0.314 -3.712
+TRP CZ3 C 0 N 76.065 65.776 35.031 -2.044 0.086 -2.859
+TRP CH2 C 0 N 77.168 65.565 35.884 -1.173 0.348 -3.907
+TRP OXT O 0 Y 73.495 60.470 30.438 -1.806 0.001 3.610
+TRP H H 0 N 75.244 60.725 33.684 1.921 0.493 2.518
+TRP H2 H 0 Y 75.182 59.827 32.253 1.611 1.237 1.113
+TRP HA H 0 N 73.801 62.387 32.790 -0.740 1.058 1.479
+TRP HB2 H 0 N 76.185 61.933 30.869 0.900 -1.509 1.652
+TRP HB3 H 0 N 75.429 63.431 31.197 -0.786 -1.390 1.095
+TRP HD1 H 0 N 78.055 61.051 32.616 2.789 -0.564 0.012
+TRP HE1 H 0 N 79.240 62.110 34.685 2.791 0.036 -2.462
+TRP HE3 H 0 N 74.932 65.074 33.310 -2.248 -0.413 -0.804
+TRP HZ2 H 0 N 78.871 64.351 36.386 0.860 0.521 -4.534
+TRP HZ3 H 0 N 75.400 66.641 35.193 -3.110 0.116 -3.029
+TRP HH2 H 0 N 77.376 66.257 36.716 -1.567 0.582 -4.885
+TRP HXT H 0 Y 72.995 60.270 29.654 -2.115 -0.217 4.500
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+TRP N CA SING N
+TRP N H SING N
+TRP N H2 SING N
+TRP CA C SING N
+TRP CA CB SING N
+TRP CA HA SING N
+TRP C O DOUB N
+TRP C OXT SING N
+TRP CB CG SING N
+TRP CB HB2 SING N
+TRP CB HB3 SING N
+TRP CG CD1 DOUB Y
+TRP CG CD2 SING Y
+TRP CD1 NE1 SING Y
+TRP CD1 HD1 SING N
+TRP CD2 CE2 DOUB Y
+TRP CD2 CE3 SING Y
+TRP NE1 CE2 SING Y
+TRP NE1 HE1 SING N
+TRP CE2 CZ2 SING Y
+TRP CE3 CZ3 DOUB Y
+TRP CE3 HE3 SING N
+TRP CZ2 CH2 DOUB Y
+TRP CZ2 HZ2 SING N
+TRP CZ3 CH2 SING Y
+TRP CZ3 HZ3 SING N
+TRP CH2 HH2 SING N
+TRP OXT HXT SING N
+)CIF"},
+    {"TYR", R"CIF(data_TYR
+_chem_comp.id TYR
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code Y
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+TYR N N 0 N 5.005 5.256 15.563 1.320 0.952 1.428
+TYR CA C 0 N 5.326 6.328 16.507 -0.018 0.429 1.734
+TYR C C 0 N 4.742 7.680 16.116 -0.103 0.094 3.201
+TYR O O 0 N 4.185 8.411 16.947 0.886 -0.254 3.799
+TYR CB C 0 N 6.836 6.389 16.756 -0.274 -0.831 0.907
+TYR CG C 0 N 7.377 5.438 17.795 -0.189 -0.496 -0.559
+TYR CD1 C 0 N 6.826 5.370 19.075 1.022 -0.589 -1.219
+TYR CD2 C 0 N 8.493 4.624 17.565 -1.324 -0.102 -1.244
+TYR CE1 C 0 N 7.308 4.536 20.061 1.103 -0.282 -2.563
+TYR CE2 C 0 N 9.029 3.816 18.552 -1.247 0.210 -2.587
+TYR CZ C 0 N 8.439 3.756 19.805 -0.032 0.118 -3.252
+TYR OH O 0 N 8.954 2.936 20.781 0.044 0.420 -4.574
+TYR OXT O 0 Y 4.840 8.051 14.829 -1.279 0.184 3.842
+TYR H H 0 N 5.621 4.925 15.064 1.977 0.225 1.669
+TYR H2 H 0 Y 5.288 5.511 14.617 1.365 1.063 0.426
+TYR HA H 0 N 4.913 6.081 17.361 -0.767 1.183 1.489
+TYR HB2 H 0 N 7.289 6.213 15.916 0.473 -1.585 1.152
+TYR HB3 H 0 N 7.063 7.294 17.023 -1.268 -1.219 1.134
+TYR HD1 H 0 N 6.097 5.913 19.272 1.905 -0.902 -0.683
+TYR HD2 H 0 N 8.887 4.627 16.723 -2.269 -0.031 -0.727
+TYR HE1 H 0 N 6.886 4.493 20.888 2.049 -0.354 -3.078
+TYR HE2 H 0 N 9.788 3.310 18.373 -2.132 0.523 -3.121
+TYR HH H 0 N 8.500 3.001 21.460 -0.123 -0.399 -5.059
+TYR HXT H 0 Y 4.475 8.893 14.585 -1.333 -0.030 4.784
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+TYR N CA SING N
+TYR N H SING N
+TYR N H2 SING N
+TYR CA C SING N
+TYR CA CB SING N
+TYR CA HA SING N
+TYR C O DOUB N
+TYR C OXT SING N
+TYR CB CG SING N
+TYR CB HB2 SING N
+TYR CB HB3 SING N
+TYR CG CD1 DOUB Y
+TYR CG CD2 SING Y
+TYR CD1 CE1 SING Y
+TYR CD1 HD1 SING N
+TYR CD2 CE2 DOUB Y
+TYR CD2 HD2 SING N
+TYR CE1 CZ DOUB Y
+TYR CE1 HE1 SING N
+TYR CE2 CZ SING Y
+TYR CE2 HE2 SING N
+TYR CZ OH SING N
+TYR OH HH SING N
+TYR OXT HXT SING N
+)CIF"},
+    {"VAL", R"CIF(data_VAL
+_chem_comp.id VAL
+_chem_comp.type "L-PEPTIDE LINKING"
+_chem_comp.one_letter_code V
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+VAL N N 0 N 11.009 2.661 48.464 1.564 -0.642 0.454
+VAL CA C 0 N 10.415 3.985 48.550 0.145 -0.698 0.079
+VAL C C 0 N 10.002 4.429 49.975 -0.037 -0.093 -1.288
+VAL O O 0 N 9.312 3.707 50.680 0.703 0.784 -1.664
+VAL CB C 0 N 9.230 4.107 47.566 -0.682 0.086 1.098
+VAL CG1 C 0 N 8.585 5.457 47.708 -0.497 -0.528 2.487
+VAL CG2 C 0 N 9.689 3.877 46.132 -0.218 1.543 1.119
+VAL OXT O 0 Y 10.377 5.639 50.362 -1.022 -0.529 -2.089
+VAL H H 0 N 11.281 2.368 47.525 1.825 0.332 0.455
+VAL H2 H 0 Y 10.386 1.968 48.881 1.624 -0.959 1.410
+VAL HA H 0 N 11.226 4.692 48.259 -0.186 -1.736 0.064
+VAL HB H 0 N 8.478 3.321 47.813 -1.736 0.044 0.820
+VAL HG11 H 0 N 7.729 5.545 46.997 -1.087 0.031 3.214
+VAL HG12 H 0 N 8.279 5.666 48.759 -0.828 -1.566 2.472
+VAL HG13 H 0 N 9.319 6.287 47.584 0.555 -0.486 2.765
+VAL HG21 H 0 N 8.833 3.965 45.421 0.835 1.585 1.397
+VAL HG22 H 0 N 10.527 4.557 45.853 -0.350 1.981 0.130
+VAL HG23 H 0 N 10.218 2.902 46.020 -0.808 2.103 1.845
+VAL HXT H 0 Y 10.123 5.911 51.236 -1.139 -0.140 -2.967
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+VAL N CA SING N
+VAL N H SING N
+VAL N H2 SING N
+VAL CA C SING N
+VAL CA CB SING N
+VAL CA HA SING N
+VAL C O DOUB N
+VAL C OXT SING N
+VAL CB CG1 SING N
+VAL CB CG2 SING N
+VAL CB HB SING N
+VAL CG1 HG11 SING N
+VAL CG1 HG12 SING N
+VAL CG1 HG13 SING N
+VAL CG2 HG21 SING N
+VAL CG2 HG22 SING N
+VAL CG2 HG23 SING N
+VAL OXT HXT SING N
+)CIF"},
+    {"DA", R"CIF(data_DA
+_chem_comp.id DA
+_chem_comp.type "DNA LINKING"
+_chem_comp.one_letter_code A
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+DA OP3 O 0 Y -5.588 6.537 9.160 1.845 -1.282 -5.339
+DA P P 0 N -5.219 8.126 9.083 0.934 -0.156 -4.636
+DA OP1 O 0 N -5.953 8.789 10.199 1.781 0.996 -4.255
+DA OP2 O 0 N -5.398 8.539 7.715 -0.204 0.331 -5.665
+DA "O5'" O 0 N -3.672 8.039 9.404 0.241 -0.771 -3.320
+DA "C5'" C 0 N -3.254 7.714 10.749 -0.549 0.270 -2.744
+DA "C4'" C 0 N -1.972 6.935 10.652 -1.239 -0.251 -1.482
+DA "O4'" O 0 N -2.205 5.629 10.096 -0.267 -0.564 -0.458
+DA "C3'" C 0 N -0.884 7.550 9.774 -2.105 0.859 -0.835
+DA "O3'" O 0 N 0.377 7.277 10.436 -3.409 0.895 -1.418
+DA "C2'" C 0 N -1.011 6.815 8.448 -2.173 0.398 0.640
+DA "C1'" C 0 N -1.499 5.434 8.851 -0.965 -0.545 0.797
+DA N9 N 0 N -2.414 4.796 7.924 -0.078 -0.047 1.852
+DA C8 C 0 N -3.356 5.385 7.125 0.962 0.817 1.689
+DA N7 N 0 N -4.176 4.542 6.586 1.535 1.044 2.835
+DA C5 C 0 N -3.788 3.302 7.070 0.897 0.346 3.805
+DA C6 C 0 N -4.288 1.998 6.885 1.069 0.196 5.191
+DA N6 N 0 N -5.369 1.727 6.154 2.079 0.869 5.856
+DA N1 N 0 N -3.627 0.989 7.493 0.236 -0.603 5.850
+DA C2 C 0 N -2.553 1.276 8.249 -0.729 -1.249 5.224
+DA N3 N 0 N -2.016 2.460 8.510 -0.925 -1.144 3.927
+DA C4 C 0 N -2.678 3.447 7.892 -0.142 -0.368 3.184
+DA HOP3 H 0 N -5.120 6.114 8.449 2.241 -0.873 -6.121
+DA HOP2 H 0 N -4.930 8.116 7.004 -0.732 -0.447 -5.887
+DA "H5'" H 0 N -3.167 8.611 11.405 -1.302 0.594 -3.463
+DA "H5''" H 0 N -4.041 7.181 11.331 0.092 1.112 -2.486
+DA "H4'" H 0 N -1.615 6.919 11.708 -1.846 -1.126 -1.712
+DA "H3'" H 0 N -0.959 8.650 9.610 -1.617 1.830 -0.918
+DA "HO3'" H 0 Y 1.053 7.659 9.889 -3.924 1.538 -0.913
+DA "H2'" H 0 N -1.652 7.329 7.695 -3.103 -0.136 0.831
+DA "H2''" H 0 N -0.082 6.814 7.830 -2.079 1.253 1.311
+DA "H1'" H 0 N -0.610 4.761 8.898 -1.309 -1.549 1.046
+DA H8 H 0 N -3.448 6.466 6.928 1.266 1.250 0.748
+DA H61 H 0 N -5.731 0.782 6.020 2.185 0.761 6.814
+DA H62 H 0 N -5.218 2.128 5.228 2.683 1.447 5.363
+DA H2 H 0 N -2.040 0.420 8.721 -1.383 -1.889 5.798
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+DA OP3 P SING N
+DA OP3 HOP3 SING N
+DA P OP1 DOUB N
+DA P OP2 SING N
+DA P "O5'" SING N
+DA OP2 HOP2 SING N
+DA "O5'" "C5'" SING N
+DA "C5'" "C4'" SING N
+DA "C5'" "H5'" SING N
+DA "C5'" "H5''" SING N
+DA "C4'" "O4'" SING N
+DA "C4'" "C3'" SING N
+DA "C4'" "H4'" SING N
+DA "O4'" "C1'" SING N
+DA "C3'" "O3'" SING N
+DA "C3'" "C2'" SING N
+DA "C3'" "H3'" SING N
+DA "O3'" "HO3'" SING N
+DA "C2'" "C1'" SING N
+DA "C2'" "H2'" SING N
+DA "C2'" "H2''" SING N
+DA "C1'" N9 SING N
+DA "C1'" "H1'" SING N
+DA N9 C8 SING Y
+DA N9 C4 SING Y
+DA C8 N7 DOUB Y
+DA C8 H8 SING N
+DA N7 C5 SING Y
+DA C5 C6 SING Y
+DA C5 C4 DOUB Y
+DA C6 N6 SING N
+DA C6 N1 DOUB Y
+DA N6 H61 SING N
+DA N6 H62 SING N
+DA N1 C2 SING Y
+DA C2 N3 DOUB Y
+DA C2 H2 SING N
+DA N3 C4 SING Y
+)CIF"},
+    {"DC", R"CIF(data_DC
+_chem_comp.id DC
+_chem_comp.type "DNA LINKING"
+_chem_comp.one_letter_code C
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+DC OP3 O 0 Y 4.521 -6.081 1.748 1.941 -1.055 -4.672
+DC P P 0 N 5.008 -7.323 0.810 0.987 -0.017 -3.894
+DC OP1 O 0 N 4.362 -8.553 1.260 1.802 1.099 -3.365
+DC OP2 O 0 N 6.422 -7.269 0.587 -0.119 0.560 -4.910
+DC "O5'" O 0 N 4.417 -6.922 -0.639 0.255 -0.772 -2.674
+DC "C5'" C 0 N 3.027 -6.960 -0.848 -0.571 0.196 -2.027
+DC "C4'" C 0 N 2.755 -6.252 -2.153 -1.300 -0.459 -0.852
+DC "O4'" O 0 N 3.079 -4.851 -2.018 -0.363 -0.863 0.171
+DC "C3'" C 0 N 3.612 -6.699 -3.352 -2.206 0.569 -0.129
+DC "O3'" O 0 N 2.853 -7.769 -3.975 -3.488 0.649 -0.756
+DC "C2'" C 0 N 3.748 -5.461 -4.207 -2.322 -0.040 1.288
+DC "C1'" C 0 N 3.043 -4.367 -3.370 -1.106 -0.981 1.395
+DC N1 N 0 N 3.699 -3.066 -3.385 -0.267 -0.584 2.528
+DC C2 C 0 N 3.037 -1.974 -3.937 0.270 0.648 2.563
+DC O2 O 0 N 1.958 -2.147 -4.515 0.052 1.424 1.647
+DC N3 N 0 N 3.565 -0.741 -3.770 1.037 1.035 3.581
+DC C4 C 0 N 4.751 -0.588 -3.153 1.291 0.212 4.589
+DC N4 N 0 N 5.196 0.651 -3.008 2.085 0.622 5.635
+DC C5 C 0 N 5.473 -1.715 -2.681 0.746 -1.088 4.580
+DC C6 C 0 N 4.933 -2.915 -2.787 -0.035 -1.465 3.541
+DC HOP3 H 0 N 4.941 -5.280 1.455 2.359 -0.564 -5.392
+DC HOP2 H 0 N 6.842 -6.468 0.294 -0.626 -0.198 -5.231
+DC "H5'" H 0 N 2.607 -7.992 -0.815 -1.302 0.583 -2.737
+DC "H5''" H 0 N 2.444 -6.542 0.006 0.046 1.015 -1.659
+DC "H4'" H 0 N 1.683 -6.486 -2.353 -1.885 -1.313 -1.193
+DC "H3'" H 0 N 4.634 -7.084 -3.128 -1.731 1.549 -0.094
+DC "HO3'" H 0 Y 3.381 -8.044 -4.714 -4.031 1.232 -0.207
+DC "H2'" H 0 N 4.794 -5.215 -4.501 -3.250 -0.602 1.387
+DC "H2''" H 0 N 3.358 -5.571 -5.245 -2.266 0.742 2.046
+DC "H1'" H 0 N 2.025 -4.201 -3.796 -1.444 -2.009 1.526
+DC H41 H 0 N 4.677 1.461 -3.347 2.461 1.516 5.636
+DC H42 H 0 N 6.131 0.692 -3.412 2.265 0.019 6.373
+DC H5 H 0 N 6.474 -1.657 -2.222 0.943 -1.771 5.394
+DC H6 H 0 N 5.499 -3.771 -2.385 -0.467 -2.454 3.514
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+DC OP3 P SING N
+DC OP3 HOP3 SING N
+DC P OP1 DOUB N
+DC P OP2 SING N
+DC P "O5'" SING N
+DC OP2 HOP2 SING N
+DC "O5'" "C5'" SING N
+DC "C5'" "C4'" SING N
+DC "C5'" "H5'" SING N
+DC "C5'" "H5''" SING N
+DC "C4'" "O4'" SING N
+DC "C4'" "C3'" SING N
+DC "C4'" "H4'" SING N
+DC "O4'" "C1'" SING N
+DC "C3'" "O3'" SING N
+DC "C3'" "C2'" SING N
+DC "C3'" "H3'" SING N
+DC "O3'" "HO3'" SING N
+DC "C2'" "C1'" SING N
+DC "C2'" "H2'" SING N
+DC "C2'" "H2''" SING N
+DC "C1'" N1 SING N
+DC "C1'" "H1'" SING N
+DC N1 C2 SING N
+DC N1 C6 SING N
+DC C2 O2 DOUB N
+DC C2 N3 SING N
+DC N3 C4 DOUB N
+DC C4 N4 SING N
+DC C4 C5 SING N
+DC N4 H41 SING N
+DC N4 H42 SING N
+DC C5 C6 DOUB N
+DC C5 H5 SING N
+DC C6 H6 SING N
+)CIF"},
+    {"DG", R"CIF(data_DG
+_chem_comp.id DG
+_chem_comp.type "DNA LINKING"
+_chem_comp.one_letter_code G
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+DG OP3 O 0 Y 1.807 -6.720 -10.410 -1.603 -1.547 5.624
+DG P P 0 N 0.961 -7.850 -11.142 -0.818 -0.321 4.935
+DG OP1 O 0 N 0.170 -8.600 -10.123 -1.774 0.766 4.630
+DG OP2 O 0 N 1.852 -8.616 -12.064 0.312 0.224 5.941
+DG "O5'" O 0 N 0.048 -6.954 -12.084 -0.126 -0.826 3.572
+DG "C5'" C 0 N -1.051 -6.223 -11.511 0.550 0.300 3.011
+DG "C4'" C 0 N -1.328 -5.001 -12.351 1.233 -0.113 1.706
+DG "O4'" O 0 N -0.272 -4.023 -12.145 0.253 -0.471 0.705
+DG "C3'" C 0 N -1.390 -5.229 -13.845 1.976 1.091 1.073
+DG "O3'" O 0 N -2.368 -4.320 -14.370 3.294 1.218 1.612
+DG "C2'" C 0 N 0.027 -4.903 -14.329 2.026 0.692 -0.421
+DG "C1'" C 0 N 0.517 -3.869 -13.327 0.897 -0.345 -0.573
+DG N9 N 0 N 1.928 -3.987 -12.970 -0.068 0.111 -1.575
+DG C8 C 0 N 2.740 -5.108 -12.939 -1.172 0.877 -1.341
+DG N7 N 0 N 3.900 -4.878 -12.390 -1.804 1.094 -2.458
+DG C5 C 0 N 3.852 -3.557 -12.017 -1.145 0.482 -3.472
+DG C6 C 0 N 4.809 -2.738 -11.336 -1.361 0.377 -4.866
+DG O6 O 0 N 5.900 -3.103 -10.856 -2.321 0.914 -5.391
+DG N1 N 0 N 4.384 -1.424 -11.224 -0.473 -0.327 -5.601
+DG C2 C 0 N 3.153 -0.949 -11.650 0.593 -0.928 -5.003
+DG N2 N 0 N 2.928 0.356 -11.439 1.474 -1.643 -5.774
+DG N3 N 0 N 2.236 -1.721 -12.198 0.804 -0.839 -3.709
+DG C4 C 0 N 2.641 -2.992 -12.372 -0.027 -0.152 -2.917
+DG HOP3 H 0 N 2.310 -6.242 -11.058 -2.002 -1.203 6.435
+DG HOP2 H 0 N 2.355 -8.138 -12.712 0.913 -0.513 6.114
+DG "H5'" H 0 N -1.957 -6.858 -11.377 1.299 0.661 3.715
+DG "H5''" H 0 N -0.876 -5.968 -10.439 -0.170 1.093 2.808
+DG "H4'" H 0 N -2.337 -4.666 -12.015 1.921 -0.940 1.879
+DG "H3'" H 0 N -1.682 -6.257 -14.160 1.411 2.013 1.211
+DG "HO3'" H 0 Y -2.406 -4.463 -15.308 3.732 1.921 1.114
+DG "H2'" H 0 N 0.692 -5.790 -14.439 2.990 0.246 -0.665
+DG "H2''" H 0 N 0.087 -4.578 -15.394 1.834 1.559 -1.053
+DG "H1'" H 0 N 0.410 -2.866 -13.803 1.316 -1.306 -0.873
+DG H8 H 0 N 2.482 -6.109 -13.322 -1.477 1.248 -0.373
+DG H1 H 0 N 5.025 -0.756 -10.795 -0.601 -0.413 -6.559
+DG H21 H 0 N 2.022 0.705 -11.752 2.240 -2.073 -5.363
+DG H22 H 0 N 3.677 0.909 -11.854 1.329 -1.722 -6.730
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+DG OP3 P SING N
+DG OP3 HOP3 SING N
+DG P OP1 DOUB N
+DG P OP2 SING N
+DG P "O5'" SING N
+DG OP2 HOP2 SING N
+DG "O5'" "C5'" SING N
+DG "C5'" "C4'" SING N
+DG "C5'" "H5'" SING N
+DG "C5'" "H5''" SING N
+DG "C4'" "O4'" SING N
+DG "C4'" "C3'" SING N
+DG "C4'" "H4'" SING N
+DG "O4'" "C1'" SING N
+DG "C3'" "O3'" SING N
+DG "C3'" "C2'" SING N
+DG "C3'" "H3'" SING N
+DG "O3'" "HO3'" SING N
+DG "C2'" "C1'" SING N
+DG "C2'" "H2'" SING N
+DG "C2'" "H2''" SING N
+DG "C1'" N9 SING N
+DG "C1'" "H1'" SING N
+DG N9 C8 SING Y
+DG N9 C4 SING Y
+DG C8 N7 DOUB Y
+DG C8 H8 SING N
+DG N7 C5 SING Y
+DG C5 C6 SING N
+DG C5 C4 DOUB Y
+DG C6 O6 DOUB N
+DG C6 N1 SING N
+DG N1 C2 SING N
+DG N1 H1 SING N
+DG C2 N2 SING N
+DG C2 N3 DOUB N
+DG N2 H21 SING N
+DG N2 H22 SING N
+DG N3 C4 SING N
+)CIF"},
+    {"DT", R"CIF(data_DT
+_chem_comp.id DT
+_chem_comp.type "DNA LINKING"
+_chem_comp.one_letter_code T
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+DT OP3 O 0 Y -9.026 1.725 3.724 -3.912 -2.311 1.636
+DT P P 0 N -9.022 3.199 4.397 -3.968 -1.665 3.118
+DT OP1 O 0 N -10.026 3.204 5.484 -4.406 -2.599 4.208
+DT OP2 O 0 N -9.105 4.208 3.318 -4.901 -0.360 2.920
+DT "O5'" O 0 N -7.560 3.311 5.073 -2.493 -1.028 3.315
+DT "C5'" C 0 N -7.109 2.360 6.021 -2.005 -0.136 2.327
+DT "C4'" C 0 N -5.658 2.634 6.432 -0.611 0.328 2.728
+DT "O4'" O 0 N -4.829 2.409 5.301 0.247 -0.829 2.764
+DT "C3'" C 0 N -5.462 4.089 6.875 0.008 1.286 1.720
+DT "O3'" O 0 N -4.884 4.104 8.170 0.965 2.121 2.368
+DT "C2'" C 0 N -4.523 4.629 5.799 0.710 0.360 0.754
+DT "C1'" C 0 N -3.800 3.379 5.307 1.157 -0.778 1.657
+DT N1 N 0 N -3.270 3.542 3.936 1.164 -2.047 0.989
+DT C2 C 0 N -1.901 3.405 3.707 2.333 -2.544 0.374
+DT O2 O 0 N -1.071 3.251 4.601 3.410 -1.945 0.363
+DT N3 N 0 N -1.498 3.450 2.382 2.194 -3.793 -0.240
+DT C4 C 0 N -2.323 3.658 1.287 1.047 -4.570 -0.300
+DT O4 O 0 N -1.837 3.662 0.158 0.995 -5.663 -0.857
+DT C5 C 0 N -3.726 3.853 1.624 -0.143 -3.980 0.369
+DT C7 C 0 N -4.751 4.099 0.540 -1.420 -4.757 0.347
+DT C6 C 0 N -4.141 3.790 2.913 -0.013 -2.784 0.958
+DT HOP3 H 0 N -9.027 1.808 2.778 -4.684 -2.823 1.313
+DT HOP2 H 0 N -9.123 5.078 3.698 -5.874 -0.475 2.871
+DT "H5'" H 0 N -7.749 2.415 6.914 -1.971 -0.654 1.366
+DT "H5''" H 0 N -7.161 1.360 5.565 -2.683 0.718 2.254
+DT "H4'" H 0 N -5.403 1.971 7.272 -0.644 0.753 3.736
+DT "H3'" H 0 N -6.380 4.689 6.958 -0.722 1.941 1.236
+DT "HO3'" H 0 Y -3.937 4.107 8.095 0.743 3.042 2.146
+DT "H2'" H 0 N -5.078 5.122 4.987 -0.003 -0.001 0.003
+DT "H2''" H 0 N -3.836 5.400 6.177 1.556 0.818 0.232
+DT "H1'" H 0 N -2.932 3.128 5.934 2.163 -0.604 2.054
+DT H3 H 0 N -0.523 3.321 2.199 3.023 -4.171 -0.689
+DT H71 H 0 N -5.753 4.159 0.989 -1.735 -4.916 -0.683
+DT H72 H 0 N -4.522 5.045 0.027 -2.195 -4.208 0.881
+DT H73 H 0 N -4.723 3.272 -0.185 -1.272 -5.721 0.833
+DT H6 H 0 N -5.187 3.940 3.137 -0.857 -2.318 1.458
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+DT OP3 P SING N
+DT OP3 HOP3 SING N
+DT P OP1 DOUB N
+DT P OP2 SING N
+DT P "O5'" SING N
+DT OP2 HOP2 SING N
+DT "O5'" "C5'" SING N
+DT "C5'" "C4'" SING N
+DT "C5'" "H5'" SING N
+DT "C5'" "H5''" SING N
+DT "C4'" "O4'" SING N
+DT "C4'" "C3'" SING N
+DT "C4'" "H4'" SING N
+DT "O4'" "C1'" SING N
+DT "C3'" "O3'" SING N
+DT "C3'" "C2'" SING N
+DT "C3'" "H3'" SING N
+DT "O3'" "HO3'" SING N
+DT "C2'" "C1'" SING N
+DT "C2'" "H2'" SING N
+DT "C2'" "H2''" SING N
+DT "C1'" N1 SING N
+DT "C1'" "H1'" SING N
+DT N1 C2 SING N
+DT N1 C6 SING N
+DT C2 O2 DOUB N
+DT C2 N3 SING N
+DT N3 C4 SING N
+DT N3 H3 SING N
+DT C4 O4 DOUB N
+DT C4 C5 SING N
+DT C5 C7 SING N
+DT C5 C6 DOUB N
+DT C7 H71 SING N
+DT C7 H72 SING N
+DT C7 H73 SING N
+DT C6 H6 SING N
+)CIF"},
+    {"A", R"CIF(data_A
+_chem_comp.id A
+_chem_comp.type "RNA LINKING"
+_chem_comp.one_letter_code A
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+A OP3 O 0 Y 22.586 9.736 -6.030 2.135 -1.141 -5.313
+A P P 0 N 23.014 10.223 -7.491 1.024 -0.137 -4.723
+A OP1 O 0 N 21.938 9.966 -8.412 1.633 1.190 -4.488
+A OP2 O 0 N 24.378 9.686 -7.860 -0.183 0.005 -5.778
+A "O5'" O 0 N 23.144 11.720 -7.092 0.456 -0.720 -3.334
+A "C5'" C 0 N 24.013 12.484 -7.839 -0.520 0.209 -2.863
+A "C4'" C 0 N 23.996 13.899 -7.276 -1.101 -0.287 -1.538
+A "O4'" O 0 N 24.523 13.928 -5.945 -0.064 -0.383 -0.538
+A "C3'" C 0 N 24.868 14.877 -8.041 -2.105 0.739 -0.969
+A "O3'" O 0 N 24.195 15.389 -9.178 -3.445 0.360 -1.287
+A "C2'" C 0 N 25.172 15.942 -7.004 -1.874 0.684 0.558
+A "O2'" O 0 N 24.060 16.759 -6.874 -3.065 0.271 1.231
+A "C1'" C 0 N 25.387 15.094 -5.814 -0.755 -0.367 0.729
+A N9 N 0 N 26.745 14.503 -5.630 0.158 0.029 1.803
+A C8 C 0 N 27.163 13.163 -5.773 1.265 0.813 1.672
+A N7 N 0 N 28.488 13.043 -5.514 1.843 0.963 2.828
+A C5 C 0 N 28.887 14.292 -5.222 1.143 0.292 3.773
+A C6 C 0 N 30.177 14.748 -4.871 1.290 0.091 5.156
+A N6 N 0 N 31.245 13.997 -4.775 2.344 0.664 5.846
+A N1 N 0 N 30.286 16.119 -4.615 0.391 -0.656 5.787
+A C2 C 0 N 29.272 16.866 -4.702 -0.617 -1.206 5.136
+A N3 N 0 N 27.992 16.509 -5.030 -0.792 -1.051 3.841
+A C4 C 0 N 27.856 15.249 -5.271 0.056 -0.320 3.126
+A HOP3 H 0 N 23.296 9.905 -5.422 2.448 -0.755 -6.142
+A HOP2 H 0 N 25.088 9.855 -7.252 -0.552 -0.879 -5.902
+A "H5'" H 0 N 25.039 12.050 -7.885 -1.319 0.301 -3.599
+A "H5''" H 0 N 23.788 12.450 -8.930 -0.052 1.182 -2.712
+A "H4'" H 0 N 22.923 14.196 -7.338 -1.586 -1.254 -1.677
+A "H3'" H 0 N 25.794 14.420 -8.461 -1.890 1.736 -1.353
+A "HO3'" H 0 Y 24.741 16.001 -9.657 -4.024 1.035 -0.908
+A "H2'" H 0 N 26.025 16.626 -7.219 -1.543 1.654 0.930
+A "HO2'" H 0 N 24.250 17.425 -6.224 -3.740 0.936 1.037
+A "H1'" H 0 N 25.197 15.783 -4.958 -1.185 -1.346 0.940
+A H8 H 0 N 26.526 12.307 -6.055 1.611 1.246 0.745
+A H61 H 0 N 32.176 14.326 -4.521 2.432 0.522 6.801
+A H62 H 0 N 31.340 13.509 -5.666 2.996 1.205 5.374
+A H2 H 0 N 29.524 17.915 -4.473 -1.325 -1.807 5.688
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+A OP3 P SING N
+A OP3 HOP3 SING N
+A P OP1 DOUB N
+A P OP2 SING N
+A P "O5'" SING N
+A OP2 HOP2 SING N
+A "O5'" "C5'" SING N
+A "C5'" "C4'" SING N
+A "C5'" "H5'" SING N
+A "C5'" "H5''" SING N
+A "C4'" "O4'" SING N
+A "C4'" "C3'" SING N
+A "C4'" "H4'" SING N
+A "O4'" "C1'" SING N
+A "C3'" "O3'" SING N
+A "C3'" "C2'" SING N
+A "C3'" "H3'" SING N
+A "O3'" "HO3'" SING N
+A "C2'" "O2'" SING N
+A "C2'" "C1'" SING N
+A "C2'" "H2'" SING N
+A "O2'" "HO2'" SING N
+A "C1'" N9 SING N
+A "C1'" "H1'" SING N
+A N9 C8 SING Y
+A N9 C4 SING Y
+A C8 N7 DOUB Y
+A C8 H8 SING N
+A N7 C5 SING Y
+A C5 C6 SING Y
+A C5 C4 DOUB Y
+A C6 N6 SING N
+A C6 N1 DOUB Y
+A N6 H61 SING N
+A N6 H62 SING N
+A N1 C2 SING Y
+A C2 N3 DOUB Y
+A C2 H2 SING N
+A N3 C4 SING Y
+)CIF"},
+    {"C", R"CIF(data_C
+_chem_comp.id C
+_chem_comp.type "RNA LINKING"
+_chem_comp.one_letter_code C
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+C OP3 O 0 Y 26.803 20.514 -11.017 2.147 -1.021 -4.678
+C P P 0 N 27.386 20.433 -12.503 1.049 -0.039 -4.028
+C OP1 O 0 N 26.539 21.293 -13.322 1.692 1.237 -3.646
+C OP2 O 0 N 27.570 19.015 -12.877 -0.116 0.246 -5.102
+C "O5'" O 0 N 28.830 21.055 -12.361 0.415 -0.733 -2.721
+C "C5'" C 0 N 29.051 22.423 -11.973 -0.546 0.181 -2.193
+C "C4'" C 0 N 30.525 22.652 -11.850 -1.189 -0.419 -0.942
+C "O4'" O 0 N 30.993 22.001 -10.600 -0.190 -0.648 0.076
+C "C3'" C 0 N 31.457 22.096 -12.933 -2.178 0.583 -0.307
+C "O3'" O 0 N 31.346 22.915 -14.074 -3.518 0.283 -0.703
+C "C2'" C 0 N 32.751 22.157 -12.194 -2.001 0.373 1.215
+C "O2'" O 0 N 33.186 23.463 -12.031 -3.228 -0.059 1.806
+C "C1'" C 0 N 32.361 21.627 -10.851 -0.924 -0.729 1.317
+C N1 N 0 N 32.476 20.131 -10.779 -0.036 -0.470 2.453
+C C2 C 0 N 33.674 19.589 -10.493 0.652 0.683 2.514
+C O2 O 0 N 34.680 20.354 -10.277 0.529 1.504 1.620
+C N3 N 0 N 33.855 18.230 -10.434 1.467 0.945 3.535
+C C4 C 0 N 32.804 17.495 -10.663 1.620 0.070 4.520
+C N4 N 0 N 32.905 16.139 -10.606 2.464 0.350 5.569
+C C5 C 0 N 31.488 18.044 -10.975 0.916 -1.151 4.483
+C C6 C 0 N 31.389 19.360 -11.041 0.087 -1.399 3.442
+C HOP3 H 0 N 27.354 19.953 -10.483 2.501 -0.569 -5.456
+C HOP2 H 0 N 28.121 18.454 -12.343 -0.508 -0.608 -5.323
+C "H5'" H 0 N 28.562 23.147 -12.665 -1.315 0.371 -2.941
+C "H5''" H 0 N 28.496 22.699 -11.045 -0.052 1.118 -1.933
+C "H4'" H 0 N 30.596 23.763 -11.911 -1.699 -1.350 -1.188
+C "H3'" H 0 N 31.269 21.074 -13.339 -1.917 1.604 -0.586
+C "HO3'" H 0 Y 31.923 22.570 -14.745 -4.088 0.939 -0.278
+C "H2'" H 0 N 33.568 21.607 -12.716 -1.653 1.290 1.689
+C "HO2'" H 0 N 34.010 23.501 -11.560 -3.874 0.644 1.656
+C "H1'" H 0 N 33.051 22.057 -10.088 -1.392 -1.708 1.418
+C H41 H 0 N 33.824 15.755 -10.388 2.950 1.189 5.590
+C H42 H 0 N 32.564 15.734 -11.478 2.571 -0.289 6.290
+C H5 H 0 N 30.568 17.464 -11.160 1.030 -1.873 5.278
+C H6 H 0 N 30.417 19.806 -11.309 -0.465 -2.326 3.393
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+C OP3 P SING N
+C OP3 HOP3 SING N
+C P OP1 DOUB N
+C P OP2 SING N
+C P "O5'" SING N
+C OP2 HOP2 SING N
+C "O5'" "C5'" SING N
+C "C5'" "C4'" SING N
+C "C5'" "H5'" SING N
+C "C5'" "H5''" SING N
+C "C4'" "O4'" SING N
+C "C4'" "C3'" SING N
+C "C4'" "H4'" SING N
+C "O4'" "C1'" SING N
+C "C3'" "O3'" SING N
+C "C3'" "C2'" SING N
+C "C3'" "H3'" SING N
+C "O3'" "HO3'" SING N
+C "C2'" "O2'" SING N
+C "C2'" "C1'" SING N
+C "C2'" "H2'" SING N
+C "O2'" "HO2'" SING N
+C "C1'" N1 SING N
+C "C1'" "H1'" SING N
+C N1 C2 SING N
+C N1 C6 SING N
+C C2 O2 DOUB N
+C C2 N3 SING N
+C N3 C4 DOUB N
+C C4 N4 SING N
+C C4 C5 SING N
+C N4 H41 SING N
+C N4 H42 SING N
+C C5 C6 DOUB N
+C C5 H5 SING N
+C C6 H6 SING N
+)CIF"},
+    {"G", R"CIF(data_G
+_chem_comp.id G
+_chem_comp.type "RNA LINKING"
+_chem_comp.one_letter_code G
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+G OP3 O 0 Y 34.313 3.314 -0.422 -1.945 -1.360 5.599
+G P P 0 N 33.741 4.431 0.367 -0.911 -0.277 5.008
+G OP1 O 0 N 33.537 5.671 -0.451 -1.598 1.022 4.844
+G OP2 O 0 N 34.442 4.727 1.661 0.325 -0.105 6.025
+G "O5'" O 0 N 32.289 3.932 0.811 -0.365 -0.780 3.580
+G "C5'" C 0 N 32.101 2.551 1.198 0.542 0.217 3.109
+G "C4'" C 0 N 30.760 2.450 1.879 1.100 -0.200 1.748
+G "O4'" O 0 N 30.797 3.202 3.104 0.033 -0.318 0.782
+G "C3'" C 0 N 29.597 3.022 1.070 2.025 0.898 1.182
+G "O3'" O 0 N 29.106 2.045 0.152 3.395 0.582 1.439
+G "C2'" C 0 N 28.603 3.421 2.118 1.741 0.884 -0.338
+G "O2'" O 0 N 27.930 2.319 2.657 2.927 0.560 -1.066
+G "C1'" C 0 N 29.487 3.936 3.170 0.675 -0.220 -0.507
+G N9 N 0 N 29.942 5.378 3.195 -0.297 0.162 -1.534
+G C8 C 0 N 31.187 5.907 3.065 -1.440 0.880 -1.334
+G N7 N 0 N 31.237 7.191 3.136 -2.066 1.037 -2.464
+G C5 C 0 N 29.896 7.536 3.341 -1.364 0.431 -3.453
+G C6 C 0 N 29.331 8.813 3.503 -1.556 0.279 -4.846
+G O6 O 0 N 29.901 9.926 3.495 -2.534 0.755 -5.397
+G N1 N 0 N 27.948 8.749 3.683 -0.626 -0.401 -5.551
+G C2 C 0 N 27.233 7.615 3.707 0.459 -0.934 -4.923
+G N2 N 0 N 25.894 7.743 3.899 1.384 -1.626 -5.664
+G N3 N 0 N 27.758 6.393 3.559 0.649 -0.800 -3.630
+G C4 C 0 N 29.079 6.431 3.382 -0.226 -0.134 -2.868
+G HOP3 H 0 N 34.442 2.528 0.096 -2.247 -1.021 6.453
+G HOP2 H 0 N 34.571 3.941 2.179 0.745 -0.973 6.104
+G "H5'" H 0 N 32.209 1.841 0.344 1.362 0.327 3.820
+G "H5''" H 0 N 32.936 2.156 1.822 0.018 1.168 3.011
+G "H4'" H 0 N 30.585 1.358 2.025 1.640 -1.144 1.833
+G "H3'" H 0 N 29.867 3.891 0.426 1.772 1.868 1.610
+G "HO3'" H 0 Y 28.382 2.400 -0.351 3.923 1.300 1.065
+G "H2'" H 0 N 27.827 4.115 1.719 1.346 1.847 -0.662
+G "HO2'" H 0 N 27.299 2.572 3.321 3.573 1.254 -0.871
+G "H1'" H 0 N 28.814 3.801 4.048 1.148 -1.167 -0.769
+G H8 H 0 N 32.110 5.323 2.909 -1.776 1.261 -0.381
+G H1 H 0 N 27.411 9.607 3.808 -0.736 -0.518 -6.508
+G H21 H 0 N 25.350 6.880 3.917 2.165 -2.007 -5.232
+G H22 H 0 N 25.507 8.377 3.200 1.256 -1.736 -6.619
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+G OP3 P SING N
+G OP3 HOP3 SING N
+G P OP1 DOUB N
+G P OP2 SING N
+G P "O5'" SING N
+G OP2 HOP2 SING N
+G "O5'" "C5'" SING N
+G "C5'" "C4'" SING N
+G "C5'" "H5'" SING N
+G "C5'" "H5''" SING N
+G "C4'" "O4'" SING N
+G "C4'" "C3'" SING N
+G "C4'" "H4'" SING N
+G "O4'" "C1'" SING N
+G "C3'" "O3'" SING N
+G "C3'" "C2'" SING N
+G "C3'" "H3'" SING N
+G "O3'" "HO3'" SING N
+G "C2'" "O2'" SING N
+G "C2'" "C1'" SING N
+G "C2'" "H2'" SING N
+G "O2'" "HO2'" SING N
+G "C1'" N9 SING N
+G "C1'" "H1'" SING N
+G N9 C8 SING Y
+G N9 C4 SING Y
+G C8 N7 DOUB Y
+G C8 H8 SING N
+G N7 C5 SING Y
+G C5 C6 SING N
+G C5 C4 DOUB Y
+G C6 O6 DOUB N
+G C6 N1 SING N
+G N1 C2 SING N
+G N1 H1 SING N
+G C2 N2 SING N
+G C2 N3 DOUB N
+G N2 H21 SING N
+G N2 H22 SING N
+G N3 C4 SING N
+)CIF"},
+    {"U", R"CIF(data_U
+_chem_comp.id U
+_chem_comp.type "RNA LINKING"
+_chem_comp.one_letter_code U
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.model_Cartn_x
+_chem_comp_atom.model_Cartn_y
+_chem_comp_atom.model_Cartn_z
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+U OP3 O 0 Y 29.106 2.045 0.152 -2.122 1.033 -4.690
+U P P 0 N 28.940 2.442 -1.379 -1.030 0.047 -4.037
+U OP1 O 0 N 28.520 1.217 -2.078 -1.679 -1.228 -3.660
+U OP2 O 0 N 30.133 3.129 -1.866 0.138 -0.241 -5.107
+U "O5'" O 0 N 27.784 3.522 -1.387 -0.399 0.736 -2.726
+U "C5'" C 0 N 26.432 3.117 -1.047 0.557 -0.182 -2.196
+U "C4'" C 0 N 25.647 4.373 -0.834 1.197 0.415 -0.942
+U "O4'" O 0 N 26.122 5.093 0.327 0.194 0.645 0.074
+U "C3'" C 0 N 25.763 5.465 -1.895 2.181 -0.588 -0.301
+U "O3'" O 0 N 25.041 5.077 -3.062 3.524 -0.288 -0.686
+U "C2'" C 0 N 25.213 6.663 -1.148 1.995 -0.383 1.218
+U "O2'" O 0 N 23.829 6.500 -1.012 3.219 0.046 1.819
+U "C1'" C 0 N 25.917 6.524 0.133 0.922 0.723 1.319
+U N1 N 0 N 27.224 7.194 0.137 0.028 0.464 2.451
+U C2 C 0 N 27.201 8.578 0.406 -0.690 -0.671 2.486
+U O2 O 0 N 26.156 9.121 0.619 -0.587 -1.474 1.580
+U N3 N 0 N 28.408 9.189 0.403 -1.515 -0.936 3.517
+U C4 C 0 N 29.660 8.606 0.152 -1.641 -0.055 4.530
+U O4 O 0 N 30.676 9.330 0.195 -2.391 -0.292 5.460
+U C5 C 0 N 29.604 7.215 -0.113 -0.894 1.146 4.502
+U C6 C 0 N 28.447 6.605 -0.111 -0.070 1.384 3.459
+U HOP3 H 0 N 29.377 2.835 0.603 -2.475 0.583 -5.470
+U HOP2 H 0 N 30.404 3.919 -1.414 0.534 0.613 -5.325
+U "H5'" H 0 N 25.974 2.434 -1.800 1.329 -0.373 -2.942
+U "H5''" H 0 N 26.387 2.417 -0.179 0.060 -1.117 -1.940
+U "H4'" H 0 N 24.613 3.957 -0.795 1.712 1.345 -1.185
+U "H3'" H 0 N 26.782 5.677 -2.293 1.923 -1.609 -0.583
+U "HO3'" H 0 Y 25.113 5.756 -3.722 4.094 -0.926 -0.234
+U "H2'" H 0 N 25.358 7.661 -1.622 1.643 -1.301 1.688
+U "HO2'" H 0 N 23.484 7.251 -0.543 3.865 -0.657 1.671
+U "H1'" H 0 N 25.312 6.996 0.941 1.392 1.700 1.423
+U H3 H 0 N 28.370 10.187 0.610 -2.024 -1.762 3.528
+U H5 H 0 N 30.486 6.589 -0.327 -0.982 1.863 5.305
+U H6 H 0 N 28.506 5.526 -0.332 0.507 2.295 3.421
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+U OP3 P SING N
+U OP3 HOP3 SING N
+U P OP1 DOUB N
+U P OP2 SING N
+U P "O5'" SING N
+U OP2 HOP2 SING N
+U "O5'" "C5'" SING N
+U "C5'" "C4'" SING N
+U "C5'" "H5'" SING N
+U "C5'" "H5''" SING N
+U "C4'" "O4'" SING N
+U "C4'" "C3'" SING N
+U "C4'" "H4'" SING N
+U "O4'" "C1'" SING N
+U "C3'" "O3'" SING N
+U "C3'" "C2'" SING N
+U "C3'" "H3'" SING N
+U "O3'" "HO3'" SING N
+U "C2'" "O2'" SING N
+U "C2'" "C1'" SING N
+U "C2'" "H2'" SING N
+U "O2'" "HO2'" SING N
+U "C1'" N1 SING N
+U "C1'" "H1'" SING N
+U N1 C2 SING N
+U N1 C6 SING N
+U C2 O2 DOUB N
+U C2 N3 SING N
+U N3 C4 SING N
+U N3 H3 SING N
+U C4 O4 DOUB N
+U C4 C5 SING N
+U C5 C6 DOUB N
+U C5 H5 SING N
+U C6 H6 SING N
+)CIF"},
+  };
+  return table;
+}
+
 // shared/af3/featurise/ccd-component.js ELEMENT_SYMBOLS (atomic number - 1)
 inline const std::vector<std::string>& elementSymbols() { static const std::vector<std::string> s = {"H", "HE", "LI", "BE", "B", "C", "N", "O", "F", "NE", "NA", "MG", "AL", "SI", "P", "S", "CL", "AR", "K", "CA", "SC", "TI", "V", "CR", "MN", "FE", "CO", "NI", "CU", "ZN", "GA", "GE", "AS", "SE", "BR", "KR", "RB", "SR", "Y", "ZR", "NB", "MO", "TC", "RU", "RH", "PD", "AG", "CD", "IN", "SN", "SB", "TE", "I", "XE", "CS", "BA", "LA", "CE", "PR", "ND", "PM", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "HF", "TA", "W", "RE", "OS", "IR", "PT", "AU", "HG", "TL", "PB", "BI", "PO", "AT", "RN"}; return s; }
 
@@ -65,14 +2061,14 @@ inline int af3MsaCode(char c) { switch (c) { case 'A': return 0; case 'R': retur
 // shared/af3/dialect.js: each family's featuriser conventions (featuriserDialect) and the export's own
 inline const std::vector<FamilyFlags>& familyFlags() {
   static const std::vector<FamilyFlags> table = {
-    {"protenix2", true, true, true, false, 0, 1, false, 0, false, 0, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false},
-    {"boltz2", true, true, true, false, 1, 1, false, 1, false, 0, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0, false, false, false, false, false, true, false, false, false, false, false, true, true, true, true},
-    {"alphafold3", false, false, false, false, 0, 0, false, 0, false, 0, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false},
-    {"openbind0", true, true, false, false, 1, 0, false, 4, false, 2, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384, false, false, false, false, true, true, true, true, false, false, false, false, false, false, false},
-    {"opendde", true, true, true, false, 0, 1, false, 0, false, 0, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false},
-    {"intellifold2", true, false, false, true, 1, 1, false, 0, false, 0, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false, true, false, false, true, true, false, false, false, false, false},
-    {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, 1, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0, false, false, false, false, true, true, false, false, false, false, false, true, true, false, false},
-    {"chai1", false, false, true, false, 1, 0, false, 3, true, 0, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0, true, true, false, false, false, true, false, false, true, false, true, false, false, false, false},
+    {"protenix2", true, true, true, false, 0, 1, false, 0, false, 0, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false, true, false, false, false},
+    {"boltz2", true, true, true, false, 1, 1, false, 1, false, 0, true, false, 0, 0, true, false, false, -1, true, false, true, false, false, false, 2, {}, true, 1, false, false, 0, false, false, false, false, false, true, false, false, false, false, false, true, true, true, true, false, false, false, false},
+    {"alphafold3", false, false, false, false, 0, 0, false, 0, false, 0, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false},
+    {"openbind0", true, true, false, false, 1, 0, false, 4, false, 2, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384, false, false, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false},
+    {"opendde", true, true, true, false, 0, 1, false, 0, false, 0, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false, true, false, false, false},
+    {"intellifold2", true, false, false, true, 1, 1, false, 0, false, 0, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false, true, false, false, true, true, false, false, false, false, false, false, false, false, false},
+    {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, 1, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0, false, false, false, false, true, true, false, false, false, false, false, true, true, false, false, false, true, true, true},
+    {"chai1", false, false, true, false, 1, 0, false, 3, true, 0, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0, true, true, false, false, false, true, false, false, true, false, true, false, false, false, false, false, false, false, false},
   };
   return table;
 }

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <array>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -36,7 +37,12 @@ struct CompBond { int from, to, order; };
 // a bond the job declares (bondedAtomPairs), by chain (asym, from 0), residue (from 1) and atom name
 struct BondEnd { int asym; int residue; bool hasAtom; std::string atom; };
 struct DeclaredBond { BondEnd from, to; };
-struct CompPart { std::string code; int from, count; bool glycan = false; };
+// the whole CCD bond graph, hydrogens included (rf3's declaredBondCharge; ccd-component.js graph)
+struct CompGraph {
+  std::vector<std::string> names, elements; std::vector<bool> leaving;
+  std::vector<std::array<std::string, 3>> bonds;   // atom_id_1, atom_id_2, value_order (upper-cased)
+};
+struct CompPart { std::string code; int from, count; bool glycan = false; CompGraph graph; };
 struct Component {
   std::string code;
   std::vector<CompAtom> atoms;
@@ -46,6 +52,8 @@ struct Component {
   bool smiles = false;             // built from a SMILES (shared/chem), not read from the dictionary
   bool glycan = false;             // _chem_comp.type names a saccharide (parseCcdComponent)
   std::string oneLetter;           // _chem_comp.one_letter_code, "" for ? or absent
+  CompGraph graph;
+  bool standard = false;           // a standard residue rf3 atomises for its ligand bond (featurise.js)
 };
 
 inline std::string trimWs(const std::string& s) {
@@ -261,6 +269,15 @@ inline Component parseCcdComponent(const std::string& text) {
   }
   std::string named = cifValue(text, "_chem_comp.mon_nstd_parent_comp_id");
   if (!named.empty() && named != "?" && named != ".") c.parent = upper(named.substr(0, named.find(',')));
+  for (auto& row : atomLoop.rows) {
+    c.graph.names.push_back(atOr(row, "atom_id", "")); c.graph.elements.push_back(atOr(row, "type_symbol", ""));
+    c.graph.leaving.push_back(upper(atOr(row, "pdbx_leaving_atom_flag", "N")) == "Y");
+  }
+  for (auto& row : bondLoop.rows) {
+    int i1 = bcol("atom_id_1"), i2 = bcol("atom_id_2"), io = bcol("value_order");
+    c.graph.bonds.push_back({i1 < 0 ? std::string() : row[i1], i2 < 0 ? std::string() : row[i2],
+                             upper(io < 0 ? std::string("SING") : row[io])});
+  }
   std::string letter = cifValue(text, "_chem_comp.one_letter_code");
   if (!letter.empty() && letter != "?" && letter != ".") c.oneLetter = upper(letter);
   // a glycan by its dictionary type, /\bsaccharide\b/ on the lowercased value (quoted, usually)
@@ -293,7 +310,7 @@ inline Component ligandChain(const std::vector<Component>& components) {
   Component out;
   for (auto& comp : components) {
     int from = (int)out.atoms.size();
-    out.residues.push_back({comp.code, from, (int)comp.atoms.size(), comp.glycan});
+    out.residues.push_back({comp.code, from, (int)comp.atoms.size(), comp.glycan, comp.graph});
     out.atoms.insert(out.atoms.end(), comp.atoms.begin(), comp.atoms.end());
     for (auto& b : comp.bonds) out.bonds.push_back({b.from + from, b.to + from, b.order});
     out.code += (out.code.empty() ? "" : "-") + comp.code;
@@ -325,6 +342,7 @@ inline Component polymerResidue(const Component& comp, bool isTerminal, const st
   out.code = comp.code;
   out.parent = comp.parent;
   out.oneLetter = comp.oneLetter;
+  out.graph = comp.graph; out.standard = comp.standard;
   std::vector<int> renumbered(comp.atoms.size(), -1);
   int next = 0;
   for (size_t i = 0; i < comp.atoms.size(); ++i) {
