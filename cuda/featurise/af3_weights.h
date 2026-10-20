@@ -352,6 +352,12 @@ inline void confidenceWeights(Walk& w, const std::string& p) {
     T(".rightTargetFeatProject", crossed ? "~_embed_features/left_target_feat_project/weights" : "~_embed_features/right_target_feat_project/weights");
     T(".distogramFeatProject", "~_embed_features/distogram_feat_project/weights");
     if (has("~_embed_features/distance_feat_project/weights")) T(".distanceFeatProject", "~_embed_features/distance_feat_project/weights");
+    // rf3's two s_inputs columns our target_feat drops: zero before its whole-tensor norm and -mean/std after, so their
+    // rows still reach the pair (sokrypton/alphafold3 2de3fe4; the blob from 535beb5f on)
+    if (has("~_embed_features/left_target_feat_project_absent/weights")) {
+      T(".leftTargetFeatProjectAbsent", "~_embed_features/left_target_feat_project_absent/weights");
+      T(".rightTargetFeatProjectAbsent", "~_embed_features/right_target_feat_project_absent/weights");
+    }
   }
   if (has("input_single_norm/scale")) { T(".inputSingleNormScale", "input_single_norm/scale"); T(".inputSingleNormOffset", "input_single_norm/offset"); }
   if (has("logits_ln/scale")) {

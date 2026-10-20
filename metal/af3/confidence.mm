@@ -76,6 +76,21 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   lin(tf, P + ".leftTargetFeatProject", left, n, F, C);
   lin(tf, P + ".rightTargetFeatProject", right, n, F, C);
+  // (rf3: its two dropped s_inputs columns at -mean/std through their own rows, the same on every token: cuda/af3)
+  if (flag("trunk.dialect.confidenceGlobalNorm") && hasW(P + ".leftTargetFeatProjectAbsent")) {
+    if (lenW(P + ".leftTargetFeatProjectAbsent") != (size_t)2 * C) die("rf3's absent target_feat rows are not 2 x %d", C);
+    std::vector<float> stat = download(scratch<float>("conf.gnStat", 2), 2);
+    std::vector<float> wl = download(W(P + ".leftTargetFeatProjectAbsent"), (size_t)2 * C);
+    std::vector<float> wr = download(W(P + ".rightTargetFeatProjectAbsent"), (size_t)2 * C);
+    std::vector<float> l = download(left, (size_t)n * C), r = download(right, (size_t)n * C);
+    const float v = -stat[0] * stat[1];
+    for (int t = 0; t < n; ++t)
+      for (int c = 0; c < C; ++c) {
+        l[(size_t)t * C + c] += v * wl[c] + v * wl[C + c];
+        r[(size_t)t * C + c] += v * wr[c] + v * wr[C + c];
+      }
+    upload(left, l.data(), l.size() * 4); upload(right, r.data(), r.size() * 4);
+  }
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   const bool chai = flag("trunk.dialect.chaiConfidence");     // chai-1's 16-bin distance embedding, unmasked
   if (bins != (chai ? 16 : caDgram ? 40 : 39)) die("the confidence distogram has %d bins", bins);

@@ -117,6 +117,15 @@ inline void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C,
   globalStatK<<<1, 1, 0, STREAM>>>(partial, live, parts, C, vendorWidth, stat, 1);
   applyGlobalNormK<PT><<<blocks(rows * C), 256, 0, STREAM>>>(x, rows * C, stat);
 }
+// rf3: left/right += (-mean / std) * (row 0 + row 1) of each absent projection (confidence_head.py target_feat_absent)
+__global__ void absentColumnsK(float* left, float* right, const float* wl, const float* wr, const double* stat, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * C) return;
+  const int c = (int)(t % C);
+  const float v = (float)(-stat[0] * stat[1]);
+  left[t] += v * wl[c] + v * wl[C + c];
+  right[t] += v * wr[c] + v * wr[C + c];
+}
 __global__ void clampK(float* x, float limit, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fminf(limit, fmaxf(-limit, x[i]));
 }
@@ -442,6 +451,13 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   linear<float, float>(targetFeat, left, n, F, C, P + ".leftTargetFeatProject");
   linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
+  // (rf3: its two dropped s_inputs columns at their normalised value -mean/std, through their own rows - the same on every
+  // token; gn.stat still holds target_feat's statistics)
+  if (M.flag("trunk.dialect.confidenceGlobalNorm") && hasW(P + ".leftTargetFeatProjectAbsent")) {
+    if (lenW(P + ".leftTargetFeatProjectAbsent") != (size_t)2 * C) { fprintf(stderr, "rf3's absent target_feat rows are not 2 x %d\n", C); exit(1); }
+    absentColumnsK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(left, right, W(P + ".leftTargetFeatProjectAbsent"),
+      W(P + ".rightTargetFeatProjectAbsent"), scratch<double>("gn.stat", 2), n, C);
+  }
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
   const bool chai = M.flag("trunk.dialect.chaiConfidence");     // chai-1's 16-bin distance embedding, unmasked
