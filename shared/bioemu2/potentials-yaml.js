@@ -96,7 +96,11 @@ export function parseSimpleYaml(text) {
       at += 1;
       if (key in out) throw new Error(`line ${line.number}: ${key} given twice`);
       if (rest === "") {
-        const child = at < lines.length && lines[at].indent > indent ? block(lines[at].indent) : null;
+        // a block below it - or a sequence at the KEY'S OWN indent (`potentials:` then `- _target_: ...`), which YAML
+        // allows for a list and the vendor's files use
+        const next = lines[at];
+        const child = next && next.indent > indent ? block(next.indent)
+          : next && next.indent === indent && (next.text.startsWith("- ") || next.text === "-") ? sequence(indent) : null;
         out[key] = child;
       } else {
         out[key] = scalar(rest, `line ${line.number}`);

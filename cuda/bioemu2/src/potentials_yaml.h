@@ -127,7 +127,10 @@ inline lf::Json parseSimpleYaml(const std::string& text) {
       auto [key, rest] = keyValue(line, line.text);
       ++at;
       if (out.get(key)) throw std::runtime_error(where(line) + ": " + key + " given twice");
-      if (rest.empty()) out.o.push_back({key, at < lines.size() && lines[at].indent > indent ? block(lines[at].indent) : lf::Json()});
+      // a block below it - or a sequence at the key's own indent (`potentials:` then `- _target_: ...`), as the JavaScript reads it
+      if (rest.empty()) out.o.push_back({key, at < lines.size() && lines[at].indent > indent ? block(lines[at].indent)
+                                             : at < lines.size() && lines[at].indent == indent && startsDash(lines[at].text) ? sequence(indent)
+                                                                                                                     : lf::Json()});
       else out.o.push_back({key, yamlScalar(rest, where(line))});
     }
     if (at < lines.size() && lines[at].indent > indent) throw std::runtime_error(where(lines[at]) + ": unexpected indentation");
