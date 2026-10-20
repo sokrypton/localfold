@@ -377,14 +377,27 @@ and the results must not move (docs/CUDA-TO-METAL.md). All 264 cases pass at **e
 4096, 65536 and the 32 MB default - and with `LOCALFOLD_SHARED_SCRATCH=0`, the control. At a floor of 1 byte every
 buffer in the tree is aliased and scribbled, so that run is the one with teeth.
 
-#### Still on the table
+#### Still on the table, and WHICH of it actually matters
 
-- **The transition is 180 MB and none of it was reclaimed**, because `ln`, `a1` and `dh` are genuinely all live at
-  its peak - `a1` is 4x the pair width. The fix is not aliasing but **chunking over rows**, which AF2 itself does
-  (`mapping.inference_subbatch`); the module is embarrassingly row-parallel and nothing here needs a whole pass at
-  once.
-- The triangle still holds twelve pair-sized buffers that are live simultaneously around its product. Cutting that
-  needs the product tiled over rows, not a cleverer alias.
+🔴 **THE TRIANGLE MULTIPLICATION IS THE CEILING, NOT THE TRANSITION.** An earlier version of this section named the
+transition as the next thing to fix, and that was wrong in a way worth recording. The per-module numbers are
+`tri 324 MB > battn 184 ~= transition 180 > opm 34`, and all four scale as N^2, so the ordering is
+size-independent. With sharing on, a block holds the MAXIMUM of its modules plus its own running cotangents - so
+**chunking the transition cannot lower a block's peak at all** while the triangle holds nearly twice as much. It
+would be real work for no change in the number that matters.
+
+So, in order:
+
+1. **The triangle multiplication's twelve simultaneously-live pair buffers.** Cutting these needs its product
+   **tiled over rows** - a different kernel structure, not a cleverer alias, because the twelve really are all live
+   around the batched GEMM. This is the one that moves the peak.
+2. **The block's own temporaries** (`tmpMsa`, `tmpPair`, `tmpPair2`) are live across every module's turn by
+   construction, so `shareScratch` can never alias them - they are declared nested with everything. Three
+   pair-sized buffers is the price of composing residual modules this way.
+3. **The transition's 180 MB**, by chunking over rows as AF2 does (`mapping.inference_subbatch`). Worth doing when
+   the triangle is no longer dominating, and not before. Note it also needs accumulating weight gradients across
+   chunks, so `linearBwd`, `columnSum` and `layerNormBwd`'s parameter outputs would each need an accumulate mode -
+   which is why it is not the cheap win it looks like.
 
 ### MSAColumnAttention, and the per-column orientation
 
@@ -490,3 +503,51 @@ writing down because they are not obvious from the forward:
 
 `iptm_per_residue` is the `per_alignment` vector itself, so it costs nothing extra and its cotangent enters the same
 `dPerAlign` accumulator as ipTM's one-hot.
+
+## Where this stands, and what the next session should pick up
+
+**322 differential cases, all passing**, at every sharing floor and with sharing off. `bash metal/build.sh design &&
+metal/design/localfold-design`. The core selftest and the three shipping ports are untouched and still build and
+pass.
+
+### Done: the Evoformer's reverse mode, end to end
+
+| | |
+| --- | --- |
+| primitives | LayerNorm, linear (two GEMMs + bias), column sums, relu, the sigmoid gate |
+| pair modules | `Transition`, `OuterProductMean`, `TriangleMultiplication` (both equations) |
+| attentions | the flash-shaped core, the `Attention` module, `MSARowAttentionWithPairBias`, `TriangleAttention`, `MSAColumnAttention`, `MSAColumnGlobalAttention` |
+| the block | `evoformerIterationBwd` - all eight residual modules, both tracks, both OPM orderings |
+| heads | the distogram, the PAE head, and `pae`/`ptm`/`iptm`/`iptm_per_residue` |
+| memory | within-module reuse and `designShareScratch()`, proved by `LOCALFOLD_SCRIBBLE` |
+
+### Next, in the order I would do it
+
+1. **🔴 THE STRUCTURE MODULE. This is the largest piece left** and it is where the remaining boundary arrays live:
+   `atoms`, `plddt` and `experimentally_resolved_ca` all come from it or from the single representation it
+   produces. IPA, quaternion rigid updates, backbone frames, torsion angles, side-chain construction. Expect it to
+   be comparable in size to everything above.
+2. **Two FORWARD-side gaps, both in shipping code**, which is why they were left for review rather than done
+   unsupervised:
+   - **`metal/af2`'s Evoformer must emit the save set** - the ten activations per block in `EvoBlockSaved`. Wiring,
+     not new arithmetic, but it is what stands between this tree and a block that can run both ways.
+   - **`metal/core`'s tuned `attention()` does not return the logsumexp** the attention backward needs.
+     `attentionFwdSaved` here is a correct but untuned stand-in (a simdgroup a query, no simdgroup matrices).
+     Saving `L` from the real flash forward is the cheap, right fix; writing a second tuned attention is not.
+3. **The triangle multiplication's memory**, tiled over rows - see the memory section for why this one and not the
+   transition.
+4. **The design loop**: the losses, the optimiser, the schedules. `bindcraft/af/boundary.py` is the contract to
+   hold to, and five of its seven differentiable arrays already exist here.
+
+### How to check anything added here
+
+Three references, and the third is the one that settles arguments about AF2 rather than about this port:
+
+```
+metal/design/localfold-design                                   # double analytic + central difference, 322 cases
+LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=1 .../localfold-design   # every buffer aliased and NaN-scribbled
+BC2=~/BindCraft2 .venv-mtl/bin/python metal/design/af2-grad-oracle.py   # jax.grad of AF2 itself, in float64
+```
+
+Never widen a bound to make a case pass. A gradient that is analytically zero is reported as `ok (zero gradient)`
+on an absolute floor - see the `feat_2d_norm` finding for why that distinction had to exist.

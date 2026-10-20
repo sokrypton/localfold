@@ -26,7 +26,13 @@ one operand read transposed, which it already serves.
 
 Whole modules so far: **`Transition`** (Alg. 9 / 15), **`OuterProductMean`** (Alg. 10) and
 **`TriangleMultiplication`** (Alg. 11 / 12, both equations). All RECOMPUTE their forward rather than taking a save
-set, which is what AF2 runs under anyway (`use_remat=True`). **264 cases pass.**
+set, which is what AF2 runs under anyway (`use_remat=True`). **322 cases pass.**
+
+**What has a backward now:** every module of the AF2 Evoformer, the whole block composed
+(`evoformerIterationBwd`), and the pair-side heads with the four metrics a design loss reads off the PAE head
+(ipTM among them). **322 cases pass.** `docs/BINDCRAFT2.md` has the staging, the measurements and the findings;
+read its last section first - it says what is done, what is next, and the two forward-side gaps that block a block
+from running both ways.
 
 Plus the **attention backward** (`attentionBwd`), which is flash-shaped because it has to be: the weights are
 [B][H][Q][K] and a triangle attention's b runs over residues, so storing them is the O(N^3) that AGENTS.md forbids.
@@ -37,8 +43,8 @@ accumulates over what, which is what decides the passes.
 `biasedSelfAttentionBwd`, which serves **both** `MSARowAttentionWithPairBias` and `TriangleAttention` - the two are
 the same shape, differing only in whether the pair bias comes from the tensor being attended over.
 
-Still to write: the MSA COLUMN attentions (`MSAColumnGlobalAttention` is a different shape - mean queries), the
-structure module and the heads, and the design loop itself.
+Still to write: **the structure module** (IPA, rigids, frames, side chains - the largest piece left, and where
+`atoms`, `plddt` and `experimentally_resolved_ca` come from) and the design loop.
 
 One finding from here that a reader should not re-derive: **`feat_2d_norm`'s offset has an identically zero
 gradient** and is a dead parameter in AF2. See `docs/BINDCRAFT2.md`.
