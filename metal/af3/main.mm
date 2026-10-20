@@ -227,7 +227,6 @@ int foldInput(const std::string& dir, Options o) {
   std::vector<float> mask(M.hostF("batch.refMask"), M.hostF("batch.refMask") + (size_t)nD * dense);
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
-  bool caDgram = flag("trunk.dialect.confidenceCaDgram");
   std::vector<std::pair<uint64_t, int>> runs;
   for (uint64_t s : seeds) for (int k = 0; k < o.samples; ++k) runs.push_back({s, k});
   const size_t perBatch = std::max<size_t>(o.samples, 10);
@@ -260,7 +259,7 @@ int foldInput(const std::string& dir, Options o) {
       std::vector<float> beta((size_t)nD * 3);
       for (int r = 0; r < nD; ++r)
         for (int a = 0; a < 3; ++a)
-          beta[r * 3 + a] = caDgram ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
+          beta[r * 3 + a] = pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;   // (rf3 too: its representative atom is the pseudo-beta, cc727dd)
       float* dBeta = scratch<float>("main.beta", beta.size());
       upload(dBeta, beta.data(), beta.size() * 4);
       if (profiling()) profileStart();

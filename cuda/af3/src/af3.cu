@@ -771,7 +771,6 @@ static int foldMain(int argc, char** argv) {
       const int W = mg::WORLD;
       std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
       std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
-      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
       const size_t slot = 64 + 4 * (nd + 3 * nn);
       mg::HostSlots hs = mg::hostSlots("conf", cn * slot);
       for (size_t k = 0; k < cn; ++k) {
@@ -779,7 +778,7 @@ static int foldMain(int argc, char** argv) {
         const float* xk = xs.data() + k * mask.size() * 3;
         std::vector<float> beta((size_t)nD * 3);
         for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
-          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+          beta[r * 3 + c3] = pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
         float* dBeta = upload(beta.data(), beta.size());
         ConfidenceOut ck = confidenceHead(const_cast<float*>(head), t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n, false);
         CK(cudaFree(dBeta));
@@ -841,7 +840,6 @@ static int foldMain(int argc, char** argv) {
       df.trunkPair = nullptr;
       std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
       std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
-      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
       auto sc0 = clock();
       // (the contacts first, off the trunk's slab: the last sample's head then works in that slab, as the one-GPU
       // head does in the trunk's pair - a slab a rank, 4.7 GB at 12,103 tokens on 8)
@@ -870,7 +868,7 @@ static int foldMain(int argc, char** argv) {
         const float* xk = xs.data() + k * mask.size() * 3;
         std::vector<float> beta((size_t)nD * 3);
         for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
-          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+          beta[r * 3 + c3] = pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
         float* dBeta = upload(beta.data(), beta.size());
         shardedConf.push_back(confidenceSharded(*t.zS, t.shardLo, t.shardRows, t.single, t.targetFeat, dBeta, t.seqMask,
                                                 t.pairMask, t.n, k + 1 == cn));
@@ -909,10 +907,11 @@ static int foldMain(int argc, char** argv) {
       auto s1 = clock();
       // pseudo-beta off the structure, then the confidence head
       std::vector<float> beta((size_t)nD * 3);
-      // rf3's head reads the token-centre CA (dense slot 1), not the pseudo-beta
-      bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      // (rf3's head too: its distance embedding reads atomworks' representative atom - CB, CA for glycine, C4/C2 for a
+      // nucleotide - which is this pseudo-beta; it read CA here, pae 0.11 / pde 0.16 off stock RF3 on a plain protein,
+      // sokrypton/alphafold3 cc727dd. confidenceCaDgram keeps rf3's own binning)
       for (int r = 0; r < nD; ++r) for (int a = 0; a < 3; ++a)
-        beta[r * 3 + a] = ca ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
+        beta[r * 3 + a] = pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
       float* dBeta = upload(beta.data(), beta.size());
       ConfidenceOut ck;
       if (structural) {

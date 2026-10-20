@@ -1250,22 +1250,13 @@ async function foldHolding(device, batch, weights, options, held) {
   structural?.headInput.releasePairConditioning();
   stage("sample-done", { tokens });
   const confidenceFor = async () => {
-    // 🔴 RoseTTAFold3's CONFIDENCE HEAD READS THE TOKEN-CENTRE CA, NOT THE
-    // PSEUDO-BETA. `pseudo_beta` gathers CB for a residue that has one; rf3
-    // takes dense atom index 1, which is CA for every polymer residue. Same
-    // buffer, a different gather - and then a different binning; see
-    // caDistogramFeatures.
-    const caDgram = weights.trunk.dialect.confidenceCaDgram === true;
+    // 🔴 RoseTTAFold3's CONFIDENCE HEAD READS THE PSEUDO-BETA TOO. Its distance embedding takes atomworks'
+    // representative atom - CB, CA for glycine, C4/C2 for a nucleotide - which is exactly this gather; this read
+    // the token-centre CA (dense slot 1) until sokrypton/alphafold3 cc727dd measured it against stock RF3 (pae 0.11
+    // / pde 0.16 on a plain protein). confidenceCaDgram keeps rf3's own forty-bin binning; see caDistogramFeatures.
     const gather = batch.tokenAtomsToPseudoBeta;
     const pseudoBeta = new Float32Array(tokens * 3);
     for (let token = 0; token < tokens; token += 1) {
-      if (caDgram) {
-        const from = (token * dense + 1) * 3;
-        for (let axis = 0; axis < 3; axis += 1) {
-          pseudoBeta[token * 3 + axis] = positions[from + axis];
-        }
-        continue;
-      }
       if (!gather.mask[token]) continue;
       const from = Number(gather.indices[token]) * 3;
       for (let axis = 0; axis < 3; axis += 1) {
