@@ -205,7 +205,8 @@ static Grid rowGroups(size_t rows) {
 }
 
 void layerNormBwd(const float* x, const float* dy, float* dx, size_t rows, int C, const float* scale,
-                  float* dscale, float* doffset, float eps, int ldx, int ldy, int lddx) {
+                  float* dscale, float* doffset, float eps, int ldx, int ldy, int lddx,
+                  bool accumulateParams) {
   if (!rows) return;
   ldx = ldx ? ldx : C;
   ldy = ldy ? ldy : C;
@@ -225,7 +226,8 @@ void layerNormBwd(const float* x, const float* dy, float* dx, size_t rows, int C
   if (dscale || doffset) {
     // dscale needs n, so it needs x and the statistics; doffset alone does not
     ColSumArgs a{dy, nullptr, dscale ? x : nullptr, nullptr, doffset, dscale,
-                 dscale ? mean : nullptr, dscale ? inv : nullptr, rows, C, ldx, ldy, 0, 0};
+                 dscale ? mean : nullptr, dscale ? inv : nullptr, rows, C, ldx, ldy,
+                 accumulateParams ? 1u : 0u, 0};
     dispatch("lf_col_sums", &a, sizeof a, Grid{(uint32_t)C, 1, 1}, 256, 0, "design.ln.params");
   }
 }

@@ -111,4 +111,43 @@ void invariantPointAttentionBwd(const IpaSaved& s, const float* dOut, const IpaD
   linearBwd(s.act, w.Wv, dvs, g.dAct, g.dWv, g.dbv, (size_t)L, C, W, true, true);
 }
 
+// ---------------------------------------------------------------- FoldIteration, the whole iteration
+void foldIterationBwd(const FoldIterSaved& s, const IpaDims& d, const FoldIterWeights& w, FoldIterGrads& g) {
+  const int L = d.L, C = d.C;
+  if (!L) return;
+  const size_t n = (size_t)L * C;
+  float* dAct = g.ipa.dAct;      // actOut's cotangent on entry, actIn's on return
+  float* dRig = g.ipa.dRig;      // rigOut's on entry, rigIn's on return
+
+  // the backbone update. Its kernel cannot read and write one buffer, so rigOut's cotangent is copied aside.
+  float* dRigNext = sbuf("drignext", (size_t)L * 12);
+  float* dRq = sbuf("drq", (size_t)L * 6);
+  copy(dRigNext, dRig, (size_t)L * 12 * sizeof(float));
+  rigidUpdateBwd(s.ipa.rig, s.rq, dRigNext, dRig, dRq, L, false);
+  // quat_rigid reads actOut, which the next iteration also read - so this ADDS to the cotangent already there
+  linearBwd(s.actOut, w.Wq6, dRq, dAct, g.dWq6, g.dbq6, (size_t)L, C, 6, true, true);
+
+  // transition_layer_norm
+  float* dT2 = sbuf("dt2", n);
+  layerNormBwd(s.t2, dAct, dT2, (size_t)L, C, w.lnTransScale, g.dLnTransScale, g.dLnTransOffset, 1e-5f, 0, 0, 0,
+               true);
+
+  // the transition, backwards, with its residual: t2 = c + t1, so dT1 starts as dT2
+  float* dT1 = sbuf("dt1", n);
+  float* dB = sbuf("db", n);
+  float* dA = sbuf("da", n);
+  copy(dT1, dT2, n * sizeof(float));
+  linearBwd(s.b, w.W3, dT2, dB, g.dW3, g.db3, (size_t)L, C, C, false, true);
+  reluBwd(dB, s.b, dB, n);
+  linearBwd(s.a, w.W2, dB, dA, g.dW2, g.db2, (size_t)L, C, C, false, true);
+  reluBwd(dA, s.a, dA, n);
+  linearBwd(s.t1, w.W1, dA, dT1, g.dW1, g.db1, (size_t)L, C, C, true, true);
+
+  // attention_layer_norm, then the IPA, which writes actIn's cotangent into dAct
+  float* dActA = sbuf("dacta", n);
+  layerNormBwd(s.actA, dT1, dActA, (size_t)L, C, w.lnAttnScale, g.dLnAttnScale, g.dLnAttnOffset, 1e-5f, 0, 0, 0,
+               true);
+  invariantPointAttentionBwd(s.ipa, dActA, d, w.ipa, g.ipa);
+}
+
 }  // namespace mt

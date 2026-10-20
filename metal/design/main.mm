@@ -2476,10 +2476,205 @@ static void ipaModuleCase(int L, int C, int C2, int H, int Cs, int Pq, int Pv) {
     float* dAttn2dBias = A(H);
     columnSum(g.db2d, dAttn2dBias, (size_t)L * L, H);
     std::vector<double> zero(H, 0.0);
+    const auto got = download((const float*)dAttn2dBias, H);
     snprintf(label, sizeof label, "IPA module d(attention_2d bias) is DEAD %s", shape);
-    reportGrad(label, zero, std::vector<double>(download((const float*)dAttn2dBias, H).begin(),
-                                                download((const float*)dAttn2dBias, H).end()), 1e-5);
+    reportGrad(label, zero, std::vector<double>(got.begin(), got.end()), 1e-5);
   }
+
+  for (void* p : owned) release(p);
+}
+
+// ---------------------------------------------------------------- FoldIteration, the whole iteration
+// The forward in double, with every intermediate kept - both the save set the kernel is handed and the function the
+// central differences differentiate come from this one place, so they cannot describe different forwards.
+struct FoldIterW {
+  IpaModW ipa;
+  std::vector<double> lnAttnScale, lnAttnOffset, W1, b1, W2, b2, W3, b3, lnTransScale, lnTransOffset, Wq6, bq6;
+};
+struct FoldIterTensors {
+  std::vector<double> qs, ks, vs, projQ, projK, projV, qp, kp, vp, attn, fin;
+  std::vector<double> actA, t1, a, b, t2, actOut, rq, rigOut;
+};
+static void foldIterForward(const std::vector<double>& actIn, const std::vector<double>& act2d,
+                            const std::vector<double>& rigIn, const std::vector<double>& b2d,
+                            const std::vector<double>& mask, const FoldIterW& w, int L, int C, int C2, int H,
+                            int Cs, int Pq, int Pv, FoldIterTensors& t) {
+  const int W = H * Cs, Fw = H * Cs + 4 * H * Pv + H * C2;
+  const double qScale = sqrt(1.0 / Cs), pointBase = sqrt(1.0 / (Pq * 9.0 / 2.0));
+  auto lin = [&](const std::vector<double>& X, const std::vector<double>& Wm, const std::vector<double>& bb,
+                 int rows, int in, int o, double alpha, bool rl, std::vector<double>& Y) {
+    Y.assign((size_t)rows * o, 0.0);
+    for (int r = 0; r < rows; ++r)
+      for (int j = 0; j < o; ++j) {
+        double s = bb.empty() ? 0.0 : bb[j];
+        for (int i = 0; i < in; ++i) s += X[(size_t)r * in + i] * Wm[(size_t)i * o + j];
+        s *= alpha;
+        Y[(size_t)r * o + j] = rl ? std::max(s, 0.0) : s;
+      }
+  };
+  lin(actIn, w.ipa.Wq, w.ipa.bq, L, C, W, qScale, false, t.qs);
+  lin(actIn, w.ipa.Wk, w.ipa.bk, L, C, W, 1.0, false, t.ks);
+  lin(actIn, w.ipa.Wv, w.ipa.bv, L, C, W, 1.0, false, t.vs);
+  lin(actIn, w.ipa.Wqp, w.ipa.bqp, L, C, H * 3 * Pq, 1.0, false, t.projQ);
+  lin(actIn, w.ipa.Wkp, w.ipa.bkp, L, C, H * 3 * Pq, 1.0, false, t.projK);
+  lin(actIn, w.ipa.Wvp, w.ipa.bvp, L, C, H * 3 * Pv, 1.0, false, t.projV);
+  auto global = [&](const std::vector<double>& proj, int P, std::vector<double>& g) {
+    g.assign((size_t)L * H * P * 3, 0.0);
+    for (int i = 0; i < L; ++i) {
+      const double* r = &rigIn[(size_t)i * 12];
+      for (int h = 0; h < H; ++h) {
+        const double* sp = &proj[((size_t)i * H + h) * 3 * P];
+        for (int p = 0; p < P; ++p) {
+          double loc[3] = {sp[p], sp[P + p], sp[2 * P + p]};
+          for (int k = 0; k < 3; ++k)
+            g[(((size_t)i * H + h) * P + p) * 3 + k] =
+                r[k * 3] * loc[0] + r[k * 3 + 1] * loc[1] + r[k * 3 + 2] * loc[2] + r[9 + k];
+        }
+      }
+    }
+  };
+  global(t.projQ, Pq, t.qp);
+  global(t.projK, Pq, t.kp);
+  global(t.projV, Pv, t.vp);
+  ipaWForward(t.qs, t.ks, t.qp, t.kp, b2d, w.ipa.pwRaw, mask, L, H, Cs, Pq, pointBase, t.attn);
+  ipaOForward(t.attn, t.vs, t.vp, act2d, rigIn, L, H, Cs, Pv, C2, t.fin);
+  std::vector<double> proj;
+  lin(t.fin, w.ipa.Wo, w.ipa.bo, L, Fw, C, 1.0, false, proj);
+  t.actA.assign((size_t)L * C, 0.0);
+  for (size_t i = 0; i < t.actA.size(); ++i) t.actA[i] = proj[i] + actIn[i];
+
+  lnForward(t.actA, L, C, w.lnAttnScale, w.lnAttnOffset, 1e-5, t.t1);
+  lin(t.t1, w.W1, w.b1, L, C, C, 1.0, true, t.a);
+  lin(t.a, w.W2, w.b2, L, C, C, 1.0, true, t.b);
+  std::vector<double> cc;
+  lin(t.b, w.W3, w.b3, L, C, C, 1.0, false, cc);
+  t.t2.assign((size_t)L * C, 0.0);
+  for (size_t i = 0; i < t.t2.size(); ++i) t.t2[i] = cc[i] + t.t1[i];
+  lnForward(t.t2, L, C, w.lnTransScale, w.lnTransOffset, 1e-5, t.actOut);
+  lin(t.actOut, w.Wq6, w.bq6, L, C, 6, 1.0, false, t.rq);
+  t.rigOut.assign((size_t)L * 12, 0.0);
+  for (int i = 0; i < L; ++i) {
+    double B[12];
+    quatRigid(&t.rq[(size_t)i * 6], B);
+    rigCompose(&rigIn[(size_t)i * 12], B, &t.rigOut[(size_t)i * 12]);
+  }
+}
+
+static void foldIterCase(int L, int C, int C2, int H, int Cs, int Pq, int Pv) {
+  const int W = H * Cs, Fw = H * Cs + 4 * H * Pv + H * C2;
+  const double qScale = sqrt(1.0 / Cs), pointBase = sqrt(1.0 / (Pq * 9.0 / 2.0));
+  std::vector<double> actIn = randv((size_t)L * C, 0.5), act2d = randv((size_t)L * L * C2, 0.5),
+                      rigIn = randv((size_t)L * 12, 0.5), b2d = randv((size_t)L * L * H, 0.5),
+                      dActOut = randv((size_t)L * C, 0.5), dRigOut = randv((size_t)L * 12, 0.5), mask(L, 1.0);
+  FoldIterW w{{randv((size_t)C * W, 0.3), randv(W, 0.2), randv((size_t)C * W, 0.3), randv(W, 0.2),
+               randv((size_t)C * W, 0.3), randv(W, 0.2),
+               randv((size_t)C * H * 3 * Pq, 0.3), randv((size_t)H * 3 * Pq, 0.2),
+               randv((size_t)C * H * 3 * Pq, 0.3), randv((size_t)H * 3 * Pq, 0.2),
+               randv((size_t)C * H * 3 * Pv, 0.3), randv((size_t)H * 3 * Pv, 0.2),
+               randv((size_t)Fw * C, 0.3), randv(C, 0.2), randv(H, 0.5)},
+              randv(C, 0.3), randv(C, 0.2),
+              randv((size_t)C * C, 0.2), randv(C, 0.2), randv((size_t)C * C, 0.2), randv(C, 0.2),
+              randv((size_t)C * C, 0.2), randv(C, 0.2),
+              randv(C, 0.3), randv(C, 0.2), randv((size_t)C * 6, 0.2), randv(6, 0.2)};
+  for (auto& x : w.lnAttnScale) x += 1.0;      // a LayerNorm scale sits near one
+  for (auto& x : w.lnTransScale) x += 1.0;
+
+  FoldIterTensors t;
+  foldIterForward(actIn, act2d, rigIn, b2d, mask, w, L, C, C2, H, Cs, Pq, Pv, t);
+
+  std::vector<double> pwv(H);
+  for (int h = 0; h < H; ++h) pwv[h] = pointBase * log(1.0 + exp(w.ipa.pwRaw[h]));
+
+  std::vector<void*> owned;
+  auto U = [&](const std::vector<double>& x) {
+    auto f = toF(x); void* p = uploadNew(f.data(), f.size()); owned.push_back(p); return (const float*)p;
+  };
+  auto A = [&](size_t n) { void* p = alloc(n * 4); owned.push_back(p); fill(p, 0, n * 4); return (float*)p; };
+
+  IpaSaved is{U(actIn), U(act2d), U(rigIn), U(t.qs), U(t.ks), U(t.vs), U(t.projQ), U(t.projK), U(t.projV),
+              U(t.qp), U(t.kp), U(t.vp), U(t.attn), U(t.fin)};
+  FoldIterSaved saved{is, U(t.actA), U(t.t1), U(t.a), U(t.b), U(t.t2), U(t.actOut), U(t.rq)};
+  IpaWeightSet iws{U(w.ipa.Wq), U(w.ipa.Wk), U(w.ipa.bk), U(w.ipa.Wv), U(w.ipa.bv),
+                   U(w.ipa.Wqp), U(w.ipa.bqp), U(w.ipa.Wkp), U(w.ipa.bkp), U(w.ipa.Wvp), U(w.ipa.bvp),
+                   U(w.ipa.Wo), U(w.ipa.bo), U(pwv), U(w.ipa.pwRaw), (float)qScale, (float)pointBase};
+  FoldIterWeights fw{iws, U(w.lnAttnScale), U(w.lnAttnOffset), U(w.W1), U(w.b1), U(w.W2), U(w.b2), U(w.W3),
+                     U(w.b3), U(w.lnTransScale), U(w.lnTransOffset), U(w.Wq6), U(w.bq6)};
+
+  FoldIterGrads g{};
+  // dAct and dRig are read as the OUTPUT's cotangents and rewritten as the input's, so they start as those
+  auto fAct = toF(dActOut), fRig = toF(dRigOut);
+  void* dActB = uploadNew(fAct.data(), fAct.size()); owned.push_back(dActB);
+  void* dRigB = uploadNew(fRig.data(), fRig.size()); owned.push_back(dRigB);
+  g.ipa.dAct = (float*)dActB;
+  g.ipa.dRig = (float*)dRigB;
+  g.ipa.dAct2d = A((size_t)L * L * C2);
+  g.ipa.db2d = A((size_t)L * L * H);
+  g.ipa.dPointWeightRaw = A(H);
+  g.ipa.dWq = A((size_t)C * W); g.ipa.dbq = A(W);
+  g.ipa.dWk = A((size_t)C * W); g.ipa.dbk = A(W);
+  g.ipa.dWv = A((size_t)C * W); g.ipa.dbv = A(W);
+  g.ipa.dWqp = A((size_t)C * H * 3 * Pq); g.ipa.dbqp = A((size_t)H * 3 * Pq);
+  g.ipa.dWkp = A((size_t)C * H * 3 * Pq); g.ipa.dbkp = A((size_t)H * 3 * Pq);
+  g.ipa.dWvp = A((size_t)C * H * 3 * Pv); g.ipa.dbvp = A((size_t)H * 3 * Pv);
+  g.ipa.dWo = A((size_t)Fw * C); g.ipa.dbo = A(C);
+  g.dLnAttnScale = A(C); g.dLnAttnOffset = A(C);
+  g.dW1 = A((size_t)C * C); g.db1 = A(C);
+  g.dW2 = A((size_t)C * C); g.db2 = A(C);
+  g.dW3 = A((size_t)C * C); g.db3 = A(C);
+  g.dLnTransScale = A(C); g.dLnTransOffset = A(C);
+  g.dWq6 = A((size_t)C * 6); g.dbq6 = A(6);
+
+  IpaDims dims{L, C, C2, H, Cs, Pq, Pv};
+  foldIterationBwd(saved, dims, fw, g);
+
+  char label[220], shape[90];
+  snprintf(shape, sizeof shape, "L%d C%d C2%d H%d Cs%d Pq%d Pv%d", L, C, C2, H, Cs, Pq, Pv);
+  // the scalar the differences are of: BOTH outputs, because the rigid carries a cotangent of its own
+  auto S_ = [&]() {
+    FoldIterTensors tt;
+    foldIterForward(actIn, act2d, rigIn, b2d, mask, w, L, C, C2, H, Cs, Pq, Pv, tt);
+    double acc = 0;
+    for (size_t i = 0; i < tt.actOut.size(); ++i) acc += dActOut[i] * tt.actOut[i];
+    for (size_t i = 0; i < tt.rigOut.size(); ++i) acc += dRigOut[i] * tt.rigOut[i];
+    return acc;
+  };
+  // 🔴 A PROBE THAT LANDS ONLY ON RELU-KILLED ENTRIES CANNOT FAIL. The transition's three weight matrices have a
+  // relu in front of them, so roughly half of any sample has an exactly zero derivative on both sides - and
+  // reportGrad then says "both ~0, ok" however wrong the kernel is. So this draws up to eight times the budget and
+  // keeps LIVE entries by preference, falling back to what it found if a tensor really is dead.
+  auto probe = [&](const char* what, std::vector<double>& target, float* got, int count) {
+    auto gv = download((const float*)got, target.size());
+    std::vector<double> fd, mine, fdAny, mineAny;
+    std::uniform_int_distribution<size_t> Ui(0, target.size() - 1);
+    for (int draw = 0; draw < count * 8 && (int)fd.size() < count; ++draw) {
+      size_t j = Ui(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      const double d = (aS - bS) / (2 * hh);
+      fdAny.push_back(d);
+      mineAny.push_back(gv[j]);
+      if (d != 0.0) { fd.push_back(d); mine.push_back(gv[j]); }
+    }
+    if (fd.empty()) { fd = fdAny; mine = mineAny; }
+    snprintf(label, sizeof label, "FoldIteration %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 1e-4);
+  };
+  probe("dActIn", actIn, g.ipa.dAct, 6);
+  probe("dRigIn", rigIn, g.ipa.dRig, 6);
+  probe("dAct2d", act2d, g.ipa.dAct2d, 5);
+  probe("db2d", b2d, g.ipa.db2d, 4);
+  probe("dPointWeightRaw", w.ipa.pwRaw, g.ipa.dPointWeightRaw, H < 3 ? H : 3);
+  probe("dWo", w.ipa.Wo, g.ipa.dWo, 4);
+  probe("dLnAttnScale", w.lnAttnScale, g.dLnAttnScale, 4);
+  probe("dLnAttnOffset", w.lnAttnOffset, g.dLnAttnOffset, 4);
+  probe("dW1", w.W1, g.dW1, 4);  probe("db1", w.b1, g.db1, 3);
+  probe("dW2", w.W2, g.dW2, 4);  probe("db2", w.b2, g.db2, 3);
+  probe("dW3", w.W3, g.dW3, 4);  probe("db3", w.b3, g.db3, 3);
+  probe("dLnTransScale", w.lnTransScale, g.dLnTransScale, 4);
+  probe("dLnTransOffset", w.lnTransOffset, g.dLnTransOffset, 4);
+  probe("dWq6", w.Wq6, g.dWq6, 4); probe("dbq6", w.bq6, g.dbq6, 4);
 
   for (void* p : owned) release(p);
 }
@@ -2706,6 +2901,9 @@ int main(int argc, char** argv) {
   ipaModuleCase(5, 8, 5, 2, 3, 2, 2);
   ipaModuleCase(4, 6, 4, 1, 4, 4, 8);     // AF2's own num_point_qk and num_point_v
   ipaModuleCase(6, 10, 6, 3, 2, 2, 3);
+  printf("the structure module: a whole FoldIteration, the rigid a recurrent state\n");
+  foldIterCase(5, 8, 5, 2, 3, 2, 2);
+  foldIterCase(4, 6, 4, 1, 4, 4, 8);
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

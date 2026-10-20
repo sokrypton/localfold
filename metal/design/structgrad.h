@@ -107,4 +107,48 @@ struct IpaGradSet {
 void invariantPointAttentionBwd(const IpaSaved& saved, const float* dOut, const IpaDims& d,
                                 const IpaWeightSet& w, IpaGradSet& grads);
 
+// ---------------------------------------------------------------- FoldIteration, the whole iteration
+// The forward, as metal/af2/structure.mm runs it eight times:
+//
+//   actA   = InvariantPointAttention(actIn, act2d, b2d, rigIn)      (its own residual included)
+//   t1     = LayerNorm(actA, attention_layer_norm)
+//   a      = relu(t1 W1 + b1)      b = relu(a W2 + b2)      c = b W3 + b3        (the three-layer transition)
+//   t2     = c + t1                                                              (the transition's residual)
+//   actOut = LayerNorm(t2, transition_layer_norm)
+//   rq     = actOut Wq6 + bq6                                                    (quat_rigid/rigid)
+//   rigOut = rigIn o quat(rq)
+//
+// `dAct` is BOTH input and output: on entry it holds actOut's cotangent (from the next iteration's input), on
+// return actIn's. `dRig` likewise - rigOut's in, rigIn's out - which is what the rigid being a recurrent state
+// means. Everything else accumulates and the caller zeroes, as the IPA above.
+//
+// 🔴 dRig IS READ AND REWRITTEN IN PLACE, which the backbone update's kernel cannot do on one buffer: it writes
+// dRigOld[0] before it has read dRigNew[4]. So this copies dRig aside first. Two buffers would be the alternative
+// and the caller would then have to swap them eight times.
+struct FoldIterSaved {
+  IpaSaved ipa;            // the IPA's own, whose `act` is actIn and whose `rig` is rigIn
+  const float* actA;       // the IPA's output, before attention_layer_norm
+  const float* t1;         // after it
+  const float* a;          // relu(t1 W1 + b1)
+  const float* b;          // relu(a W2 + b2)
+  const float* t2;         // c + t1, before transition_layer_norm
+  const float* actOut;     // after it - this iteration's output, and quat_rigid's input
+  const float* rq;         // actOut Wq6 + bq6
+};
+struct FoldIterWeights {
+  IpaWeightSet ipa;
+  const float* lnAttnScale; const float* lnAttnOffset;
+  const float* W1; const float* b1; const float* W2; const float* b2; const float* W3; const float* b3;
+  const float* lnTransScale; const float* lnTransOffset;
+  const float* Wq6; const float* bq6;
+};
+struct FoldIterGrads {
+  IpaGradSet ipa;          // ipa.dAct is this iteration's dAct in and out; ipa.dRig the shared rigid cotangent
+  float* dLnAttnScale; float* dLnAttnOffset;
+  float* dW1; float* db1; float* dW2; float* db2; float* dW3; float* db3;
+  float* dLnTransScale; float* dLnTransOffset;
+  float* dWq6; float* dbq6;
+};
+void foldIterationBwd(const FoldIterSaved& saved, const IpaDims& d, const FoldIterWeights& w, FoldIterGrads& grads);
+
 }  // namespace mt

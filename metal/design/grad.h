@@ -29,9 +29,10 @@ void designShareScratch();
 //   dscale / doffset   [C], written; either may be null
 // `scale` must be the forward's, or dx is the gradient of a DIFFERENT function - a null scale means the forward had
 // none, not "ignore it".
+// `accumulateParams` adds into dscale and doffset - the structure module runs one LayerNorm eight times.
 void layerNormBwd(const float* x, const float* dy, float* dx, size_t rows, int C, const float* scale,
                   float* dscale = nullptr, float* doffset = nullptr, float eps = 1e-5f,
-                  int ldx = 0, int ldy = 0, int lddx = 0);
+                  int ldx = 0, int ldy = 0, int lddx = 0, bool accumulateParams = false);
 
 // ---------------------------------------------------------------- a linear layer
 // The forward is Y[rows][out] = X[rows][in] W[in][out] (+ bias). Both products below are metal/core's GEMM with one
