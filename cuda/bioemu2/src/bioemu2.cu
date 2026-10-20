@@ -6,6 +6,7 @@
 //   localfold-bioemu2 <input dir> --weights=<dir with bioemu2*.bin.zst> [--oracle=<dir>] [--out=fold.pdb]
 //       [--samples=5] [--steps=200] [--seed=N] [--fast] [--serve=<dir>]
 // <input dir> is cuda/bioemu2/export_input.mjs's; its mode (structure, equilibrium, propagation) is the input's.
+#include "fasttrunk.cuh"
 #include "sampler.cuh"
 #include <chrono>
 
@@ -63,7 +64,17 @@ __global__ void contactProbsK(const float* logits, float* out, size_t pairs, int
   out[ij] = c / tot;
 }
 
+static bool FAST_PATH = false;
+// a denoiser output against the oracle's over the REAL atoms: a padding atom's coordinates are undefined on both sides
+static double checkRealAtoms(const char* label, const float* d, const std::string& oracle) {
+  const size_t n = (size_t)M.meta("meta/real_atoms") * 3;
+  std::vector<float> h = download(d, n);
+  double r = relRms(h.data(), M.f(oracle), n);
+  printf("  %-30s relRMS %.3e\n", label, r);
+  return r;
+}
 static int foldInput(const Opts& o) {
+  GEMM_HALF = false;
   auto t0 = std::chrono::steady_clock::now();
   const int T = (int)M.meta("meta/tokens"), N = (int)M.meta("meta/atoms"), S = (int)M.meta("meta/msa_rows");
   D_ = {T, N, S, (int)M.meta("meta/n_valid_rows")};
@@ -74,6 +85,7 @@ static int foldInput(const Opts& o) {
          equilibrium || chain ? "equilibrium" : "structure",
          chain ? (", propagating " + std::to_string(chain) + " step(s)").c_str() : "");
   buildTokenStarts(T, N);
+  forgetRowMaps();
   std::map<std::string, double> worst;
   auto tap = [&](const char* name, const float* d, size_t n) {
     if (!check) return;
@@ -111,6 +123,9 @@ static int foldInput(const Opts& o) {
     contactProbsK<<<blocks(Pn), 256, 0, STREAM>>>(logits, probs, Pn, B, near);
     contacts = download(probs, Pn);
   }
+  // (the denoiser side - its static context and every call - on the f16 tensor cores under --fast; the trunk keeps TF32)
+  GEMM_HALF = FAST_PATH;
+  releaseScratch();      // (the trunk's buffers - a gigabyte of triangle operands at 500 tokens - are the denoiser's room)
   Denoiser d = staticContext(s, z, sInputs, Si, tap);
   CK(cudaStreamSynchronize(STREAM));
   printf("static context %.1f ms\n", ms(t0));
@@ -123,7 +138,7 @@ static int foldInput(const Opts& o) {
         float* x = upload(M.f(key + ".x"), (size_t)N * 3);
         denoise(dn, x, (float)M.meta(key + ".sigma"), den);
         char label[64]; snprintf(label, sizeof label, "denoise sigma %g (%s)", M.meta(key + ".sigma"), tag);
-        double r = checkOracle(label, den, (size_t)N * 3, key + ".out");
+        double r = checkRealAtoms(label, den, key + ".out");
         worst[label] = r;
         CK(cudaFree(x));
       }
@@ -138,7 +153,7 @@ static int foldInput(const Opts& o) {
       setDynamics(dr, (float)M.meta("o/denoise_dyn.dt"), cc);
       float* x = upload(M.f("o/denoise_dyn.x"), (size_t)N * 3);
       denoise(dr, x, (float)M.meta("o/denoise_dyn.sigma"), den);
-      double r = checkOracle("denoise, propagation (reference trunk)", den, (size_t)N * 3, "o/denoise_dyn.out");
+      double r = checkRealAtoms("denoise, propagation (reference trunk)", den, "o/denoise_dyn.out");
       worst["denoise_dyn"] = r;
       CK(cudaFree(x)); CK(cudaFree(cc));
     }
@@ -210,6 +225,8 @@ int main(int argc, char** argv) {
   for (int sgi = 0; sgi < (int)M.segs.size(); ++sgi) M.upload(sgi);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   CB(cublasSetMathMode(H, fast ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
+  FAST_PATH = fast;
+  if (fast) { FAST = true; TRIMUL = trimulFast; PAIR_TRANSITION = pairTransitionFast; }   // (ef2's FAST: its fused forms)
   printf("weights up in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count());
   if (!compareWith.empty()) {
     // every tensor of these weights against another blob's (the int8 decode against float32): relRMS per tensor

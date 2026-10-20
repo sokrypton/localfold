@@ -19,11 +19,13 @@
 // (and their companions) after the step. Neither is implemented here; a null hook is the plain sampler.
 #pragma once
 #include <random>
-#include "denoise.cuh"
+#include "denoise_call.cuh"
 #include "../../af3/src/rigid.cuh"
 
 namespace be2 {
 
+// at most this many particles a denoiser call (bioemu2.cu sets it from the room)
+inline int BATCH_SAMPLES = 64;
 struct SamplerSettings { int steps = 200; double sMax = 160, sMin = 4e-4, rho = 7, gamma0 = 0.8, gammaMin = 1.0,
                          noiseScale = 1.0, stepScale = 1.5; };
 struct StepHook {
@@ -93,9 +95,12 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
   std::vector<std::vector<float>> x(n, std::vector<float>((size_t)N * 3)), den(n, std::vector<float>((size_t)N * 3));
   for (int p = 0; p < n; ++p) for (auto& v : x[p]) v = (float)(levels[0] * Nd(rng[p]));
   const bool comp = !companions.empty();
-  float* dx = dalloc((size_t)N * 3); float* dd = dalloc((size_t)N * 3); float* dc = comp ? dalloc((size_t)N * 3) : nullptr;
+  const size_t per = (size_t)N * 3;
+  // the particles go through the denoiser together, `batch` at a time (all of them where there is the room)
+  const int batch = std::max(1, std::min(n, BATCH_SAMPLES));
+  float* dx = dalloc(per * batch); float* dd = dalloc(per * batch); float* dc = comp ? dalloc(per * batch) : nullptr;
+  std::vector<float> hx(per * batch), hd(per * batch), hc(comp ? per * batch : 0);
   const int steps = (int)levels.size() - 1;
-  std::vector<double> tHat(n);
   for (int i = 0; i < steps; ++i) {
     const double sigma = levels[i], next = levels[i + 1];
     const double gamma = next > s.gammaMin ? s.gamma0 : 0;
@@ -107,12 +112,20 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
       augment(x[p], mask, R, sh);
       if (comp) augment(companions[p], mask, R, sh);
       for (int a = 0; a < N * 3; ++a) x[p][a] += (float)(eps * Nd(rng[p]));
-      CK(cudaMemcpyAsync(dx, x[p].data(), (size_t)N * 12, cudaMemcpyHostToDevice, STREAM));
-      if (comp) CK(cudaMemcpyAsync(dc, companions[p].data(), (size_t)N * 12, cudaMemcpyHostToDevice, STREAM));
-      denoise(d, dx, (float)t, dd, dc);
-      CK(cudaMemcpyAsync(den[p].data(), dd, (size_t)N * 12, cudaMemcpyDeviceToHost, STREAM));
     }
-    CK(cudaStreamSynchronize(STREAM));
+    for (int p0 = 0; p0 < n; p0 += batch) {
+      const int b = std::min(batch, n - p0);
+      for (int k = 0; k < b; ++k) {
+        std::copy(x[p0 + k].begin(), x[p0 + k].end(), hx.begin() + per * k);
+        if (comp) std::copy(companions[p0 + k].begin(), companions[p0 + k].end(), hc.begin() + per * k);
+      }
+      CK(cudaMemcpyAsync(dx, hx.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
+      if (comp) CK(cudaMemcpyAsync(dc, hc.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
+      denoise(d, dx, (float)t, dd, dc, b);
+      CK(cudaMemcpyAsync(hd.data(), dd, per * b * 4, cudaMemcpyDeviceToHost, STREAM));
+      CK(cudaStreamSynchronize(STREAM));
+      for (int k = 0; k < b; ++k) std::copy(hd.begin() + per * k, hd.begin() + per * (k + 1), den[p0 + k].begin());
+    }
     if (hook && hook->guide) hook->guide(i, next, t, den);
     for (int p = 0; p < n; ++p) {
       if (FRAME_HOOK) FRAME_HOOK(p, i + 1, steps, den[p]);

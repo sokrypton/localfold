@@ -10,7 +10,7 @@
 //           (triangle out, triangle in, transition). The single is never updated inside a pass.
 //   distogram = W (z + z^T) + b, 64 bins
 #pragma once
-#include "layers.cuh"
+#include "attention.cuh"
 
 namespace be2 {
 
@@ -269,6 +269,10 @@ inline void outerProductMean(const float* m, float* z, int l) {
   }
 }
 
+// the pair-track pieces of a pass: the float32 forms here, cuda/ef2's fused ones under --fast (fasttrunk.cuh)
+inline void pairTransitionF32(float* z, const std::string& p, int l) { transition(z, z, (size_t)D_.T * D_.T, 256, p, l); }
+inline void (*TRIMUL)(float*, const std::string&, int, bool) = trimul;
+inline void (*PAIR_TRANSITION)(float*, const std::string&, int) = pairTransitionF32;
 // ---------------------------------------------------------------- a trunk pass
 inline void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zInit, float* s, float* z) {
   const int T = D_.T, S = D_.S, Cs = 384, C = 256, Cm = 128;
@@ -294,16 +298,16 @@ inline void trunkPass(const float* sInputs, int Si, const float* sInit, const fl
     pairWeightedAveraging(m, z, l);
     transition(m, m, (size_t)S * T, Cm, ml + "msa_transition/", l);
     outerProductMean(m, z, l);
-    trimul(z, ml + "tri_mul_out/", l, true);
-    trimul(z, ml + "tri_mul_in/", l, false);
-    transition(z, z, Pn, C, ml + "z_transition/", l);
+    TRIMUL(z, ml + "tri_mul_out/", l, true);
+    TRIMUL(z, ml + "tri_mul_in/", l, false);
+    PAIR_TRANSITION(z, ml + "z_transition/", l);
   }
   const std::string pm = SE + "pairmixer_module/layers/";
   const int mixers = dimP(pm + "transition_z/fc1/weight", 0);
   for (int l = 0; l < mixers; ++l) {
-    trimul(z, pm + "tri_mul_out/", l, true);
-    trimul(z, pm + "tri_mul_in/", l, false);
-    transition(z, z, Pn, C, pm + "transition_z/", l);
+    TRIMUL(z, pm + "tri_mul_out/", l, true);
+    TRIMUL(z, pm + "tri_mul_in/", l, false);
+    PAIR_TRANSITION(z, pm + "transition_z/", l);
   }
 }
 
