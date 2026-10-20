@@ -24,10 +24,10 @@ It is Boltz-derived and shares neither of AlphaFold 3's two big stages:
 | physicality report | `shared/bioemu2/physicality.js` | (the page runs it for every backend) | colab's `bioemu2_physicality.check`, all four presets | `tools/check-bioemu2-topology.js` |
 | steering tables, polymers | `shared/bioemu2/steering-tables.js` | `bioemu2_steering.h` | colab's `tables()` | `tools/check-bioemu2-topology.js` |
 | steering tables, ligands | `shared/bioemu2/ligand-tables.js` | `bioemu2_steering.h` | **an approximation**, reported | `tools/check-bioemu2-ligand-tables.js` (a report) |
-| potentials + gradients | `shared/bioemu2/potentials.js` | - | colab's `energy()` and `jax.grad` | `tools/check-bioemu2-potentials.js` |
-| `--potentials` files | `shared/bioemu2/potentials-yaml.js` | - | colab's `load_potentials` | `test/bioemu2-potentials-yaml.test.js` |
-| steered samplers | `shared/bioemu2/sampler.js` | - | colab's `steered_sample` / `fkc_sample` on a toy denoiser | `tools/check-bioemu2-steering.js` |
-| denoiser + its VJP (CPU reference) | `cpu/bioemu2/denoiser.js` on `cpu/bioemu2/tape.js` | - | colab's `denoise` and `jax.grad` | `tools/check-bioemu2-denoiser.js` |
+| potentials + gradients | `shared/bioemu2/potentials.js` | `cuda/bioemu2/src/steer.h` (= JS to the bit) | colab's `energy()` and `jax.grad` | `tools/check-bioemu2-potentials.js` |
+| `--potentials` files | `shared/bioemu2/potentials-yaml.js` | `cuda/bioemu2/src/potentials_yaml.h` (= JS) | colab's `load_potentials` | `test/bioemu2-potentials-yaml.test.js` |
+| steered samplers | `shared/bioemu2/sampler.js` | `steer.h` (= JS to the bit; `npm run test:bioemu2-steering-native`) | colab's `steered_sample` / `fkc_sample` on a toy denoiser | `tools/check-bioemu2-steering.js` |
+| denoiser + its VJP (CPU reference) | `cpu/bioemu2/denoiser.js` on `cpu/bioemu2/tape.js` | `cuda/bioemu2/src/vjp.cuh` (`gate.py --only=oracles`) | colab's `denoise` and `jax.grad` | `tools/check-bioemu2-denoiser.js` |
 
 The fixture jobs are in `tools/fixtures/bioemu2/`: 6MRR alone; with a phosphoserine and a glycerol; RNA + DNA; a
 SMILES glycerol; with NAG and retinal (the only target that reaches the chiral, stereo-bond and planar terms); a
@@ -50,6 +50,20 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
 - **CPU denoiser and its VJP** (`cpu/bioemu2/denoiser.js`): D(x, sigma) to 3.2e-7 relRMS at sigma 1; d/dx's network
   part to 1.4e-4 at sigma 16 (total 1.2e-3 - see the trap below) and 1.5e-5 at sigma 1; d/dsigma to 1.6e-3 / 7e-4. The
   tape in float32 against itself in float64: 4e-6, so the residual is the reference's float32 backward.
+
+- **Native steering** (`steer.h`): every energy and gradient element on three topology dumps bit for bit with
+  potentials.js (680,040 of 680,040); edm_gd, edm_fk and edm_fkc on the toy denoiser identical to sampler.js, every
+  resampling index; 9 `--potentials` files read and refused alike. The VDW overlap goes through a cell grid that
+  visits the dense loop's pairs in its order (a pair further apart than the reach scores exactly 0).
+- **Native VJP** (`vjp.cuh`, one particle a tape, cuBLAS held to float32): against jax.grad, d/dx's network part
+  1.6e-4 at sigma 16 and 2.3e-6 at sigma 1, d/dsigma 1.7e-3 / 8.9e-4 - beside the CPU tape's 1.4e-4 / 2.3e-6 and
+  1.6e-3 / 7.1e-4; the tape's D against the port's own denoise 2-5e-7. 55 ms and ~2 GB a call at 640 atoms.
+- **Steered folds, native** (A100, 5 samples x 2 seeds, 200 steps; the potentials' violations at t = 0 counted over
+  the 10 samples, a NAG's O1 left out because colab's mmCIF drops it): 6MRR + NAG + retinal - edm leaves StereoBond
+  and intra-chain VDW violations in 9 of 10 samples, edm_gd and edm_fk in **none** (colab's edm the same 9-10, its
+  edm_fk 1); edm_fkc is no cleaner than edm on either port (native StereoBond 10 / VDW 8, colab 10 / 8). 6MRR alone:
+  no violations from any sampler but edm_fkc (VDW 3 natively, 0 colab). Time 4.4 s edm, 5.8 s edm_gd / edm_fk
+  (the host's guidance 1.3 s), ~55 s edm_fkc (1,000 reverse passes).
 
 ## The ports
 
@@ -80,6 +94,12 @@ and D64 at their alternate locations. The oracle dumps share it, so parity is un
   d/dx (|.| 21) nearly cancels c_skip w (21) to a total of 2.6, so the network's 1.4e-4 float32 difference reads 1.2e-3
   in the total and looked like a missing term. Compare the network's part; and run the tape in float64 before
   blaming the tape.
+- 🔴 **THE RESIDENT SERVER'S SECOND FOLD OF A SAME-LENGTH INPUT WAS GARBAGE** (median CA-CA 7-9 A, any mode): the
+  fast trunk's all-ones triangle mask was filled once and remembered by its ADDRESS, and releaseScratch() hands that
+  memory to the denoiser before the next job's scratch comes back at the same address. Filled every call now;
+  `npm run test:native` folds a warm repeat and holds it to the first fold's bytes.
+- 🔴 **edm_fkc's VJP READS A float32 STATIC CONTEXT UNDER --fast**: built on the f16 tensor cores it moved the
+  network part of d/dx 2% at sigma 16 (2.0e-2 against jax.grad, 1.6e-4 in float32), the forward only 1e-3.
 - 🔴 **Python's `json` writes `NaN`**, which `JSON.parse` refuses; the checkers read a dump with it replaced.
 - 🔴 **The steering reference data is other people's**: `stereo_chemistry.yaml` is CCP4 MON_LIB (LGPL), fetched at
   run time from BioEmu2's repository at `7846769`, never shipped; the vendor's ligand tier reads Boltz-1's CCD
@@ -87,12 +107,9 @@ and D64 at their alternate locations. The oracle dumps share it, so parity is un
 
 ## Not done yet
 
-- Steering on either backend: the CUDA sampler has a `StepHook` (guide, resample) seam and the page none yet;
-  edm_gd/edm_fk need only the shared potentials.
-- The native worker path: `bioemu2_features.h`'s arrays serialised into `cuda/bioemu2/export_input.mjs`'s entries,
-  `pdb.template`, `confidence.template.json`, and a worker branch running `localfold-bioemu2 --serve`.
-- `edm_fkc` on a backend: it needs the denoiser's reverse pass (d U(D(x, sigma)) / dx and / dsigma) on the device;
-  `cpu/bioemu2/denoiser.js` is the reference it will be held to.
+- Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
+- The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
+  plain f32 tape: edm_fkc is ~10x an unsteered fold.
 - The ligand steering tier is an approximation (above), not the vendor's RDKit tables.
 - A SMILES ligand's conformer and atom names are this port's (the vendor's ETKDG draw is unseeded and its names
   come from RDKit's canonical ranking).

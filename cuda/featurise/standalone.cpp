@@ -242,8 +242,9 @@ FOLD
   --sampler=edm            BioEmu2's plain EDM sampler (default); edm_gd steers each denoised estimate with its
                            physicality potentials (bond lengths and angles, clashes, chirality, planarity), edm_fk
                            adds Feynman-Kac resampling across the samples. Steered, the samples are its particles;
-                           the bond-geometry tables are fetched from BioEmu2's repository the first time. Not with
-                           a propagation.
+                           the bond-geometry tables are fetched from BioEmu2's repository the first time. edm_fkc
+                           is the Feynman-Kac corrector, the potentials' gradient taken back through the denoiser
+                           (slower: a reverse pass a particle a step). Not with a propagation.
   --potentials=<file.yaml> the steered samplers' potentials, in BioEmu2's own --potentials format (its defaults
                            when absent)
 
@@ -357,7 +358,7 @@ static int bioemu2(Run& run, int (*fold)(int, char**), const char* argv0) {
   for (auto& f : ccdFlag(run)) extra.push_back(f);
   // (a steered sampler reads the steering tables, which the featuriser writes only when asked)
   const std::string sampler = run.args.option("sampler", "edm");
-  if (sampler == "edm_gd" || sampler == "edm_fk") extra.push_back("--steering");
+  if (sampler == "edm_gd" || sampler == "edm_fk" || sampler == "edm_fkc") extra.push_back("--steering");
   auto args = withAll(run.list, extra);
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseBioemu2Into(args(dir), dir); }, foldArgs, fold, argv0);
 }

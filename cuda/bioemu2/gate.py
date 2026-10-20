@@ -33,6 +33,10 @@ DUMPS = os.path.join(REPO, "oracle-dumps")
 BASELINE = os.path.join(HERE, "gate-baseline.json")
 TMP = os.environ.get("GATE_TMP", "/tmp/bioemu2-gate")
 ORACLE_BOUND = {"f32": 1e-5, "fast": 5e-3}
+# the denoiser's VJP (src/vjp.cuh, edm_fkc's reverse pass) against jax.grad: tools/check-bioemu2-denoiser.js's bars - the
+# network part of d/dx 1e-3, d/dsigma 5e-3 - because the reference's own float32 backward is ~1.4e-4 off its float64 and
+# both sums cancel (docs/BIOEMU2.md)
+VJP_BOUND = {"d/dx": 1e-3, "d/dsigma": 5e-3}
 # a fold's RMSD may move 0.15 A (a BioEmu2 sample is a sample: five of them at one seed span ~0.5 A), its mean 0.1,
 # a bond rms 0.01
 TOL_RMSD, TOL_MEAN, TOL_BOND = 0.15, 0.10, 0.01
@@ -173,11 +177,18 @@ def main():
                 got, error = run_oracle(name, job, dump, export, flags, weights_f32, fast)
                 if error:
                     print(f"{name + ' ' + arm:24s} FAILED: {error}"); failed += 1; continue
+                vjp = {k: v for k, v in got.items() if k.startswith("vjp")}
+                got = {k: v for k, v in got.items() if not k.startswith("vjp")}
                 worst = max(got.values())
                 ok = worst == worst and worst <= ORACLE_BOUND[arm]
                 failed += not ok
                 print(f"{name + ' ' + arm:24s} {len(got)} stages, worst {worst:.2e} ({max(got, key=got.get)})"
                       f"  (bound {ORACLE_BOUND[arm]:.0e})  {'ok' if ok else 'FAILED'}", flush=True)
+                for k, v in vjp.items():
+                    bound = VJP_BOUND["d/dx" if "d/dx" in k else "d/dsigma"]
+                    good = v == v and v <= bound
+                    failed += not good
+                    print(f"{'':24s} {k}: {v:.2e} (bound {bound:.0e})  {'ok' if good else 'FAILED'}", flush=True)
     if not only or "folds" in only or any(c in only for c in ("6mrr", "6mrr-equilibrium", "6mrr-gol-sep", "rna-dna", "propagation")):
         for name, (inputs, flags, score) in fold_cases(weights).items():
             if only and "folds" not in only and name not in only:

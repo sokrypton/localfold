@@ -801,11 +801,11 @@ class Worker:
         choice = controls.get("bioemu2-mode") or "structure"
         export = [featuriser("bioemu2-featurise"), os.path.join(WORK, "in"), f"--job={job_path}",
                   f"--mode={'equilibrium' if choice == 'propagate' else choice}"]
-        # the sampler (the page's bioemu2-sampler): edm, or the steered edm_gd / edm_fk, which read the steering tables
+        # the sampler (the page's bioemu2-sampler): edm, or the steered edm_gd / edm_fk / edm_fkc, which read the steering tables
         # the featuriser writes when asked, and the potentials the page hands over as text (bioemu2Potentials)
         sampler = controls.get("bioemu2-sampler") or "edm"
-        if sampler not in ("edm", "edm_gd", "edm_fk"):
-            raise Refused(f"BioEmu2 sampler {sampler}: edm, edm_gd or edm_fk (edm_fkc needs the denoiser's backward pass)")
+        if sampler not in ("edm", "edm_gd", "edm_fk", "edm_fkc"):
+            raise Refused(f"BioEmu2 sampler {sampler}: edm, edm_gd, edm_fk or edm_fkc")
         if sampler != "edm" and choice == "propagate":
             raise Refused("BioEmu2 propagation runs unsteered here; use the edm sampler to propagate")
         if sampler != "edm":

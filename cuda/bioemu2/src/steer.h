@@ -7,7 +7,8 @@
 //
 // The tables are shared/bioemu2/steering-tables.js's, written into the input by the featuriser (`--steering`:
 // export_input.mjs, cuda/featurise's bioemu2-featurise) and read here; hostTables is applied for the potentials in use.
-// edm_fkc (the corrector, which needs the denoiser's vector-Jacobian product) is not here.
+// ...and fkcSample (edm_fkc: weight_update 'guidance', reheat 'sigma', ess 0.9), generic over a denoiser that also
+// returns the vector-Jacobian product of the potentials through it (src/vjp.cuh on the device).
 #pragma once
 #include <algorithm>
 #include <array>
@@ -817,6 +818,109 @@ inline Particles steeredSample(const Denoise& denoise, const Tables& tables, con
     STEER_TIMES.align += since(phase);
     if (progress) progress(k + 1, o.steps);
   }
+  if (companion) *companion = comp;
+  return x;
+}
+
+// ---- edm_fkc (sampler.js fkcSample) -----------------------------------------------------------------------------------
+inline double karrasSigma(double t) {
+  const double lo = std::pow(SIGMA_MIN, 1 / RHO), hi = std::pow(SIGMA_MAX, 1 / RHO);
+  return SIGMA_DATA * std::pow(lo + t * (hi - lo), RHO);
+}
+inline double tFromSigma(double sigma) {
+  const double s = std::max(sigma / SIGMA_DATA, SIGMA_MIN);
+  const double lo = std::pow(SIGMA_MIN, 1 / RHO), hi = std::pow(SIGMA_MAX, 1 / RHO);
+  return std::min(std::max((std::pow(s, 1 / RHO) - lo) / (hi - lo), 0.0), 1.0);
+}
+inline double betaOf(double sigma, double power) {
+  const double t = tFromSigma(sigma), sAbs = karrasSigma(t);
+  return ((1 + 0.1 * std::pow(SIGMA_DATA * SIGMA_MIN, 2)) * std::pow(1 - t, power)) / (1 + 0.1 * sAbs * sAbs);
+}
+// D(x_p, sigma) for every particle, and the gradient of sum_p U_hat(D(x_p, sigma)) w.r.t. each x_p and to sigma (one
+// number a particle), U_hat the potentials at the step's `tHat` parameters, every spec weighted 1
+struct DenoisedGrad { Particles den, gx; std::vector<double> gs; double u = 0; };
+using DenoiseGrad = std::function<DenoisedGrad(const Particles&, double, const Particles*, double)>;
+struct FkcSettings { int steps = 200, groupSize = 0; double essThreshold = 0.9, betaPower = 4.0; };
+struct FkcTrace { std::vector<Particles> x; std::vector<std::vector<double>> logw; };
+
+inline Particles fkcSample(const DenoiseGrad& denoiseWithGrad, const Tables& tables, const std::vector<double>& mask, int P,
+                           const Draws& draws, const FkcSettings& o, const std::vector<Spec>& specs,
+                           Particles* companion = nullptr, FkcTrace* trace = nullptr, int* nonFiniteStep = nullptr,
+                           const std::function<void(int, int)>& progress = nullptr) {
+  const int group = o.groupSize > 0 ? o.groupSize : P;
+  if (P % group) throw std::runtime_error("the particles must divide into resampling groups");
+  const std::vector<double> sig = schedule(o.steps);
+  const int nt = (int)sig.size() - 1;
+  Particles x = draws.x0();
+  for (auto& v : x) for (auto& a : v) a = fr(sig[0] * a);
+  std::vector<double> logw(P, 0.0);
+  Particles comp = companion ? *companion : Particles();
+  const bool withComp = companion != nullptr;
+  int bad = -1;
+  auto total = [&](const Particles& den, double t) {
+    const StepParams prm = stepParameters(t, specs);
+    std::vector<double> out(den.size());
+    forParticles((int)den.size(), [&](int p) {
+      auto e = energies(den[p].data(), tables, prm, specs);
+      double s = 0; for (double v : e) s = s + v;
+      out[p] = s;
+    });
+    return out;
+  };
+  std::vector<std::array<double, 9>> rot;
+  std::vector<std::array<double, 3>> trans;
+  Particles eps;
+  for (int k = 0; k < nt; ++k) {
+    const double sC = sig[k], sN = sig[k + 1], sHat = k > 0 ? sig[k - 1] : sC;
+    const double variance = fr(sHat * sHat - sC * sC);
+    const double tC = std::max(1 - (double)k / nt, 0.0), tN = std::max(1 - (double)(k + 1) / nt, 0.0);
+    const double tHat = tFromSigma(sHat);
+    draws.step(k, rot, trans, eps);
+    if (trace) trace->x.push_back(x);
+    for (int p = 0; p < P; ++p) x[p] = centreAndRotate(x[p], mask, rot[p], trans[p]);
+    if (withComp) for (int p = 0; p < P; ++p) comp[p] = centreAndRotate(comp[p], mask, rot[p], trans[p]);
+    Particles reheated(P);
+    const double sv = std::sqrt(variance);
+    for (int p = 0; p < P; ++p) {
+      reheated[p].resize(x[p].size());
+      for (size_t i = 0; i < x[p].size(); ++i) reheated[p][i] = x[p][i] + sv * eps[p][i];
+    }
+    DenoisedGrad dg = denoiseWithGrad(reheated, sHat, withComp ? &comp : nullptr, tHat);
+    const std::vector<double> eN = total(dg.den, tN), eC = total(dg.den, tC);
+    bool finite = std::isfinite(dg.u);
+    for (int p = 0; p < P; ++p) finite = finite && std::isfinite(eN[p]) && std::isfinite(eC[p]);
+    const double bHat = fr(betaOf(sHat, o.betaPower)), bN = fr(betaOf(sN, o.betaPower)), bC = fr(betaOf(sC, o.betaPower));
+    Particles next(P);
+    for (int p = 0; p < P; ++p) {
+      const auto& r = reheated[p];
+      double align = 0;
+      next[p].resize(r.size());
+      for (size_t i = 0; i < r.size(); ++i) {
+        const double score = (dg.den[p][i] - r[i]) / (sHat * sHat);
+        align += -bHat * dg.gx[p][i] * score * (sC * sC - sN * sN) / 2;
+        next[p][i] = r[i] + sHat * (sHat - sN) * score - 0.5 * variance * bHat * dg.gx[p][i];
+      }
+      logw[p] = logw[p] - bN * eN[p] + bC * eC[p] + align + bHat * dg.gs[p] * (sC - sN);
+    }
+    for (double v : logw) finite = finite && std::isfinite(v);
+    if (bad < 0 && !finite) bad = k;
+    if (trace) trace->logw.push_back(logw);
+    const std::vector<double> w = groupedSoftmax(logw, group);
+    bool resample = k == nt - 1;
+    for (int g0 = 0; g0 < P; g0 += group) {
+      double sq = 0;
+      for (int i = g0; i < g0 + group; ++i) sq += w[i] * w[i];
+      if (1 / (group * sq) < o.essThreshold) resample = true;
+    }
+    std::vector<int> idx(P);
+    for (int p = 0; p < P; ++p) idx[p] = p;
+    if (resample) idx = systematicResample(w, group, draws.uniform(k, P / group));
+    for (int p = 0; p < P; ++p) x[p] = next[idx[p]];
+    if (withComp) { Particles c(P); for (int p = 0; p < P; ++p) c[p] = comp[idx[p]]; comp.swap(c); }
+    if (resample) std::fill(logw.begin(), logw.end(), 0.0);
+    if (progress) progress(k + 1, nt);
+  }
+  if (nonFiniteStep) *nonFiniteStep = bad;
   if (companion) *companion = comp;
   return x;
 }

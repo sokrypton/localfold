@@ -7,13 +7,15 @@
 //       [--samples=5] [--steps=200] [--seed=N] [--fast] [--serve=<dir>] [--sampler=edm|edm_gd|edm_fk] [--potentials=<yaml>]
 // <input dir> is cuda/bioemu2/export_input.mjs's; its mode (structure, equilibrium, propagation) is the input's.
 // --sampler=edm_gd / edm_fk: BioEmu2's steered samplers (src/steer.h, held to shared/bioemu2/sampler.js to the bit on a
-// toy denoiser), every sample a particle through this denoiser, the potentials on the host; the input needs its
+// toy denoiser), every sample a particle through this denoiser, the potentials on the host; --sampler=edm_fkc the
+// Feynman-Kac corrector, which takes the potentials' gradient back THROUGH the denoiser (src/vjp.cuh); the input needs its
 // steering tables (featurised with --steering). --potentials replaces the default potentials, as the vendor's flag.
 //   localfold-bioemu2 --job=<job.json> --out=<pdb> [...]  (any first argument that is a flag): the weights fetched, the
 // input featurised in this process while the device starts, the fold (cuda/featurise/standalone.h)
 #include "fasttrunk.cuh"
 #include "sampler.cuh"
 #include "potentials_yaml.h"
+#include "vjp.cuh"
 #include "../../featurise/standalone_api.h"
 #include <thread>
 #include <chrono>
@@ -94,7 +96,8 @@ static be2steer::Tables steerTables() {
 
 // the steered samplers with this port's denoiser: every particle through one call (BATCH_SAMPLES at a time), the
 // draws this port's own (a seeded mt19937 per particle, as the plain sampler's; one more for the resampling)
-static std::vector<std::vector<float>> steeredFold(const Denoiser& d, const SamplerSettings& ss, const Opts& o, int n) {
+static std::vector<std::vector<float>> steeredFold(const Denoiser& d, const SamplerSettings& ss, const Opts& o, int n,
+                                                   const std::function<Denoiser()>& exact = nullptr) {
   using namespace be2steer;
   const int N = d.N;
   const std::vector<Spec> specs = o.potentials.empty() ? defaultSpecs() : potentialSpecs(parseSimpleYaml(readText(o.potentials)));
@@ -147,6 +150,55 @@ static std::vector<std::vector<float>> steeredFold(const Denoiser& d, const Samp
     denoiseMs += ms(t0);
     return out;
   };
+  if (o.sampler == "edm_fkc") {
+    // edm_fkc: every particle's D and the potentials' gradient back through the denoiser (src/vjp.cuh), one particle a
+    // tape; U_hat at the step's t_hat parameters, every spec weighted 1, as sampler.js's fkcSample asks
+    double vjpMs = 0;
+    size_t held = 0;
+    Denoiser de = exact ? exact() : Denoiser{};
+    const Denoiser& dv = exact ? de : d;
+    DenoiseGrad withGrad = [&](const Particles& xs, double sigma, const Particles*, double tHat) {
+      auto t0 = std::chrono::steady_clock::now();
+      DenoisedGrad r;
+      const StepParams prm = stepParameters(tHat, specs);
+      const std::vector<double> ones(specs.size(), 1.0);
+      float* xd = dalloc(per);
+      std::vector<float> hxf(per);
+      for (size_t p = 0; p < xs.size(); ++p) {
+        for (size_t i = 0; i < per; ++i) hxf[i] = (float)xs[p][i];
+        CK(cudaMemcpyAsync(xd, hxf.data(), per * 4, cudaMemcpyHostToDevice, STREAM));
+        double up = 0;
+        be2vjp::VjpResult v = be2vjp::denoiseVjp(dv, xd, sigma, nullptr, nullptr, [&](const std::vector<float>& den) {
+          std::vector<double> dd(den.begin(), den.end()), gD(per, 0.0);
+          auto e = energies(dd.data(), t, prm, specs, gD.data(), &ones);
+          for (double v : e) up = up + v;
+          return std::vector<float>(gD.begin(), gD.end());
+        });
+        r.u += up;
+        r.den.emplace_back(v.den.begin(), v.den.end());
+        r.gx.emplace_back(v.gx.begin(), v.gx.end());
+        r.gs.push_back(v.gs);
+        held = std::max(held, v.bytes);
+      }
+      CK(cudaFree(xd));
+      vjpMs += ms(t0);
+      return r;
+    };
+    FkcSettings fo; fo.steps = ss.steps;
+    auto t0 = std::chrono::steady_clock::now();
+    int nonFinite = -1;
+    Particles x = fkcSample(withGrad, t, mask, n, draws, fo, specs, nullptr, nullptr, &nonFinite);
+    printf("steered (edm_fkc, %zu potentials): the denoiser and its VJP %.1f ms (%.2f GB a tape), the host %.1f ms%s\n",
+           specs.size(), vjpMs, held / 1e9, ms(t0) - vjpMs,
+           nonFinite >= 0 ? (", a NON-FINITE weight from step " + std::to_string(nonFinite)).c_str() : "");
+    be2vjp::ARENA.release();
+    if (exact) freeDenoiser(de);
+    CK(cudaFree(dx)); CK(cudaFree(dd));
+    std::vector<float> fmask(mask.begin(), mask.end());
+    std::vector<std::vector<float>> out;
+    for (auto& v : x) { std::vector<float> f(v.begin(), v.end()); centreMasked(f, fmask); out.push_back(f); }
+    return out;
+  }
   SteerSettings so;
   so.steps = ss.steps; so.stepScale = ss.stepScale; so.noiseScale = ss.noiseScale; so.gamma0 = ss.gamma0; so.gammaMin = ss.gammaMin;
   so.resamplingInterval = o.sampler == "edm_fk" ? 3 : 0;
@@ -298,6 +350,46 @@ static int foldInput(const Opts& o) {
     float* zo = upload(M.f("o/pass" + std::to_string(o.passes) + ".pair"), Pn * C);
     Denoiser dr = staticContext(so, zo, sInputs, Si, nullptr);
     levels(dr, "reference trunk");
+    // the denoiser's vector-Jacobian product (src/vjp.cuh) against jax.grad of w . D(x, sigma), from the reference's
+    // trunk: the forward first (the tape's D against this port's denoise), then d/dx - its NETWORK part, gx - c_skip w,
+    // because at sigma 16 the network's part nearly cancels c_skip w (docs/BIOEMU2.md) - and d/dsigma
+    Denoiser dre = FAST_PATH ? be2vjp::exactContext(so, zo, sInputs, Si) : Denoiser{};
+    const Denoiser& drv = FAST_PATH ? dre : dr;
+    for (int k = 0; M.has("o/vjp" + std::to_string(k) + ".x"); ++k) {
+      const std::string key = "o/vjp" + std::to_string(k);
+      const double sg = M.meta(key + ".sigma");
+      float* x = upload(M.f(key + ".x"), (size_t)N * 3);
+      float* w = upload(M.f(key + ".w"), (size_t)N * 3);
+      auto t0 = std::chrono::steady_clock::now();
+      be2vjp::VjpResult v = be2vjp::denoiseVjp(drv, x, sg, w);
+      const double took = ms(t0);
+      denoise(drv, x, (float)sg, den);
+      std::vector<float> plain = download(den, (size_t)N * 3);
+      const size_t real = (size_t)M.meta("meta/real_atoms") * 3;
+      const double cs = 256.0 / (sg * sg + 256.0);
+      std::vector<double> mine(real), want(real);
+      const float* wh = M.f(key + ".w"); const float* gh = M.f(key + ".gx");
+      double num = 0, den2 = 0;
+      for (size_t i = 0; i < real; ++i) {
+        mine[i] = v.gx[i] - cs * wh[i]; want[i] = gh[i] - cs * wh[i];
+        num += (mine[i] - want[i]) * (mine[i] - want[i]); den2 += want[i] * want[i];
+      }
+      const double rx = sqrt(num / den2);
+      const double rf = relRms(v.den.data(), plain.data(), real);
+      const double gsWant = M.meta(key + ".gs"), rs = fabs(v.gs - gsWant) / std::max(fabs(gsWant), 1e-12);
+      char label[96];
+      snprintf(label, sizeof label, "vjp sigma %g, d/dx (network)", sg);
+      printf("  %-30s relRMS %.3e\n", label, rx);
+      worst[label] = rx;
+      snprintf(label, sizeof label, "vjp sigma %g, d/dsigma", sg);
+      printf("  %-30s relRMS %.3e   (%.6e against %.6e)\n", label, rs, v.gs, gsWant);
+      worst[label] = rs;
+      printf("    (the tape's D against this port's denoise: relRMS %.3e; the forward and backward %.1f ms, %.2f GB held)\n",
+             rf, took, v.bytes / 1e9);
+      CK(cudaFree(x)); CK(cudaFree(w));
+    }
+    if (FAST_PATH) freeDenoiser(dre);
+    be2vjp::ARENA.release();
     if (M.has("o/denoise_dyn.x")) {
       float* cc = upload(M.f("o/denoise_dyn.coords_cond"), (size_t)N * 3);
       setDynamics(dr, (float)M.meta("o/denoise_dyn.dt"), cc);
@@ -319,7 +411,8 @@ static int foldInput(const Opts& o) {
     if (o.sampler != "edm") {
       if (chain) { fprintf(stderr, "Error: BioEmu2 propagation runs unsteered here; use the edm sampler to propagate\n"); return 1; }
       try {
-        out = steeredFold(d, ss, o, o.samples);
+        out = steeredFold(d, ss, o, o.samples, FAST_PATH ? std::function<Denoiser()>([&] {
+          return be2vjp::exactContext(s, z, sInputs, Si); }) : nullptr);
       } catch (const std::exception& e) {
         fprintf(stderr, "Error: %s\n", e.what());
         freeDenoiser(d);
@@ -383,8 +476,8 @@ static int foldMain(int argc, char** argv) {
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir holding bioemu2*.bin.zst>\n"); return 1; }
   if (o.steps < 2) { fprintf(stderr, "BioEmu2 samples with at least 2 steps, got %d\n", o.steps); return 1; }
-  if (o.sampler != "edm" && o.sampler != "edm_gd" && o.sampler != "edm_fk") {
-    fprintf(stderr, "Error: BioEmu2 sampler %s: edm, edm_gd or edm_fk (edm_fkc needs the denoiser's backward pass)\n", o.sampler.c_str());
+  if (o.sampler != "edm" && o.sampler != "edm_gd" && o.sampler != "edm_fk" && o.sampler != "edm_fkc") {
+    fprintf(stderr, "Error: BioEmu2 sampler %s: edm, edm_gd, edm_fk or edm_fkc\n", o.sampler.c_str());
     return 1;
   }
   auto tStart = std::chrono::steady_clock::now();

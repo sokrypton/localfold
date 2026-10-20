@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { energies, stepParameters, guidanceInterval, potentialSpecs, DEFAULT_SPECS, PARAMS } from "../shared/bioemu2/potentials.js";
 import { parseSimpleYaml } from "../shared/bioemu2/potentials-yaml.js";
-import { steeredSample } from "../shared/bioemu2/sampler.js";
+import { steeredSample, fkcSample } from "../shared/bioemu2/sampler.js";
 import { weightedRigidAlign } from "../cpu/af3/diffusion/rigid-align.js";
 
 const option = (name) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
@@ -148,6 +148,41 @@ for (const name of ["6mrr-nag-ret-4", "6mrr-nag-ret"]) {
     a.forEach((p, i) => { for (let k = 0; k < p.length; k += 1) { num += (p[k] - b[i][k]) ** 2; den += b[i][k] ** 2; } });
     return Math.sqrt(num / den);
   };
+  // edm_fkc: the toy denoiser's vector-Jacobian product, as check-bioemu2-steering.js writes it
+  {
+    const denoiseWithGrad = async (x, sigma, comp, tHat) => {
+      const den = toy(x, sigma);
+      const prm = stepParameters(tHat);
+      const buffers = Object.fromEntries(PARAMS.map((b) => [b, prm[b]]));
+      const c = cSkip(sigma);
+      const dc = (-2 * sigma * SD * SD) / (sigma * sigma + SD * SD) ** 2;
+      let u = 0;
+      const gx = [];
+      const gs = [];
+      den.forEach((d, p) => {
+        const gD = new Float64Array(d.length);
+        u += energies(d, tables, buffers, undefined, gD, prm.guidance_weight.map(() => 1)).reduce((s, e) => s + e, 0);
+        gx.push(Float64Array.from(gD, (g) => g * c));
+        let s = 0;
+        for (let i = 0; i < d.length; i += 1) s += gD[i] * dc * (x[p][i] - ref[i]);
+        gs.push(s);
+      });
+      return { den, gx, gs, u };
+    };
+    const t0 = Date.now();
+    const { x, nonFiniteStep } = await fkcSample({ denoiseWithGrad, tables, mask, particles: dump.particles, draws, numSteps: dump.steps });
+    const jsSeconds = (Date.now() - t0) / 1000;
+    const n = theirs.edm_fkc;
+    const toJs = rel(n.x, x);
+    const want = dump.edm_fkc;
+    const toRef = rel(n.x, want.x.map((p) => p.flat()));
+    const floor = want.floor ?? 0;
+    const bad = toJs > 1e-9 || n.bad !== nonFiniteStep || toRef > Math.max(1e-4, 10 * floor) || n.bad !== want.bad;
+    failures += bad ? 1 : 0;
+    console.log(`  edm_fkc ${name.padEnd(14)} against sampler.js ${toJs.toExponential(2)} (non-finite step ${n.bad} / ${nonFiniteStep});`
+      + ` against af3-any-model ${toRef.toExponential(2)} (its floor ${floor.toExponential(2)}, its non-finite step ${want.bad})`
+      + `  [JS ${jsSeconds.toFixed(1)} s]${bad ? "   DIFFERS" : ""}`);
+  }
   for (const [sampler, interval] of [["edm_gd", null], ["edm_fk", 3]]) {
     const trace = [];
     const t0 = Date.now();

@@ -193,7 +193,33 @@ int main(int argc, char** argv) {
         std::cout << "]}";
         first = false;
       }
-      std::cout << "}\n";
+      // edm_fkc: the toy denoiser's vector-Jacobian product, written out (check-bioemu2-steering.js's)
+      DenoiseGrad withGrad = [&](const Particles& x, double sigma, const Particles*, double tHat) {
+        DenoisedGrad r;
+        r.den = toy(x, sigma, nullptr);
+        const StepParams prm = stepParameters(tHat, defaultSpecs());
+        const double c = (SD * SD) / (sigma * sigma + SD * SD), dc = (-2 * sigma * SD * SD) / std::pow(sigma * sigma + SD * SD, 2);
+        const std::vector<double> ones(defaultSpecs().size(), 1.0);
+        for (size_t p = 0; p < r.den.size(); ++p) {
+          std::vector<double> gD(r.den[p].size(), 0.0);
+          auto e = energies(r.den[p].data(), t, prm, defaultSpecs(), gD.data(), &ones);
+          double sum = 0; for (double v : e) sum = sum + v;
+          r.u += sum;
+          std::vector<double> gx(gD.size());
+          for (size_t i = 0; i < gD.size(); ++i) gx[i] = gD[i] * c;
+          r.gx.push_back(gx);
+          double sg = 0;
+          for (size_t i = 0; i < gD.size(); ++i) sg += gD[i] * dc * (x[p][i] - ref[i]);
+          r.gs.push_back(sg);
+        }
+        return r;
+      };
+      FkcSettings fo; fo.steps = steps;
+      int nonFinite = -1;
+      Particles x = fkcSample(withGrad, t, mask, P, draws, fo, defaultSpecs(), nullptr, nullptr, &nonFinite);
+      std::cout << ",\"edm_fkc\":{\"bad\":" << nonFinite << ",\"x\":[";
+      for (int p = 0; p < P; ++p) { std::cout << (p ? "," : ""); printArray(x[p]); }
+      std::cout << "]}}\n";
       return 0;
     }
     if (what == "bench" && argc == 3) {          // (each potential's gradient, timed: where the host's time goes)

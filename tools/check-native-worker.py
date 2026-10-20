@@ -226,6 +226,10 @@ def cases(offline):
          "controls": be2(**{"bioemu2-sampler": "edm_fk", "bioemu2-samples": "3"}),
          "entities": [protein(S6)], "job": open(f"{FIX}/bioemu2/6mrr-nag-ret.json").read(), "samples": 3},
          ("chain", "A"), None, None, None),
+        # ...and edm_fkc, the corrector: the potentials' gradient back through the denoiser on the device (src/vjp.cuh)
+        ("bioemu2 6mrr, edm_fkc", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-sampler": "edm_fkc", "bioemu2-samples": "3"}),
+         "entities": [protein(S6)], "job": j6, "samples": 3}, ("chain", "A"), None, 68, None),
         ("bioemu2 refused: a steered propagation", {"family": "bioemu2",
          "controls": be2(**{"bioemu2-mode": "propagate", "bioemu2-sampler": "edm_gd"}), "entities": [protein(S6)],
          "job": j6, "bioemu2Frame": "previous"}, None, None, None, "runs unsteered"),

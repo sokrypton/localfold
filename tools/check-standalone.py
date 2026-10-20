@@ -119,7 +119,7 @@ def main():
             ("an alignment on fast ESMFold2", "ef2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
             ("a template on BioEmu2", "bioemu2", [f"--sequence={S6}", "--template=x.pdb:A"], "bioemu2 takes no --template"),
             ("a search on BioEmu2", "bioemu2", [f"--sequence={S6}", "--search"], "bioemu2 takes no --search"),
-            ("edm_fkc on BioEmu2", "bioemu2", [f"--sequence={S6}", "--sampler=edm_fkc"], "edm_fkc needs the denoiser's backward pass"),
+            ("an unknown BioEmu2 sampler", "bioemu2", [f"--sequence={S6}", "--sampler=edm_x"], "edm, edm_gd, edm_fk or edm_fkc"),
             ("a steered propagation", "bioemu2", [f"--job={FIX}/bioemu2/6mrr.json", "--sampler=edm_gd",
                                                   f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb", "--lag-ns=1"], "runs unsteered"),
             ("a frame of another input", "bioemu2", [f"--sequence=WWWW", f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb",
