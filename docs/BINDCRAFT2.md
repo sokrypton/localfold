@@ -118,10 +118,10 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
-4. **Attention** - the core backward, the Attention module, and the biased self-attention both
-   `MSARowAttentionWithPairBias` and `TriangleAttention` are. **DONE**, see below. Left in the tier: the MSA COLUMN
-   attentions, of which `MSAColumnGlobalAttention` is a genuinely different shape (mean queries), and the
-   `per_column` orientation, which is a transpose the caller does as AF2 does it (`modules.py:703`, `:731`).
+4. **Attention** - the core backward, the Attention module, the biased self-attention both
+   `MSARowAttentionWithPairBias` and `TriangleAttention` are, and `MSAColumnAttention`. **DONE**, see below. Left in
+   the tier: **`MSAColumnGlobalAttention`**, which is a genuinely different shape - one masked-mean query a batch,
+   and k/v with no head dimension (`modules.py:432-497`) - and is used only by the extra-MSA stack.
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
    differentiable.
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
@@ -382,3 +382,22 @@ buffer in the tree is aliased and scribbled, so that run is the one with teeth.
   once.
 - The triangle still holds twelve pair-sized buffers that are live simultaneously around its product. Cutting that
   needs the product tiled over rows, not a cleverer alias.
+
+### MSAColumnAttention, and the per-column orientation
+
+**276 cases.** `msaColumnAttentionBwd`, plus `lf_swap01` (swap the two leading axes of an `[A][B][C]` tensor).
+
+AF2's column attention is **the same module as the row one with the first two axes swapped and no pair bias**
+(`modules.py:595`, `:614`): the MSA is attended down its columns, so a residue is a batch and the sequences are the
+queries. So it is served by transposing in, calling `biasedSelfAttentionBwd` with `feat2dW` null, and transposing
+the cotangent back - which is the same swap read the other way round. `biasedSelfAttentionBwd` now drops its whole
+bias path when `feat2dW` is null rather than taking a separate code path.
+
+The same `lf_swap01` serves the triangle attention's `per_column` orientation, which AF2 also implements as a swap
+before and after (`modules.py:703`, `:731`).
+
+**A trap for whoever writes the next test here:** the first run of this one segfaulted, and the cause was the HOST
+REFERENCE, not a kernel - `biasedForward` indexed a `feat2dW` that the no-bias case had passed as an empty vector.
+Worth noting because the output looked like a crash deep in an earlier module: stdout is block-buffered when
+redirected, so the visible output ended mid-line in `attnmod` while the fault was two modules later. `stdbuf -oL`
+is how to find out where a crash in this binary actually is.

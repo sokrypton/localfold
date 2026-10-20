@@ -818,15 +818,17 @@ static void biasedForward(const std::vector<double>& act, const std::vector<doub
   for (size_t i = 0; i < mb.size(); ++i) mb[i] = 1e9 * (mask[i] - 1.0);
   std::vector<double> actN, biasN;
   lnForward(act, rows, Cq, qScale, qOffset, 1e-5, actN);
-  if (shared) biasN = actN;
+  if (shared || feat2dW.empty()) biasN = actN;
   else lnForward(biasSrc, nbRows, Cb, bScale, bOffset, 1e-5, biasN);
+  // an empty feat2dW means the module has no pair bias at all (MSAColumnAttention), and the bias is then zero
   std::vector<double> nb((size_t)H * nbRows, 0.0);
-  for (size_t r = 0; r < nbRows; ++r)
-    for (int h = 0; h < H; ++h) {
-      double s = 0;
-      for (int c = 0; c < Cb; ++c) s += biasN[r * Cb + c] * feat2dW[(size_t)c * H + h];
-      nb[(size_t)h * nbRows + r] = s;          // [h][q][k]
-    }
+  if (!feat2dW.empty())
+    for (size_t r = 0; r < nbRows; ++r)
+      for (int h = 0; h < H; ++h) {
+        double s = 0;
+        for (int c = 0; c < Cb; ++c) s += biasN[r * Cb + c] * feat2dW[(size_t)c * H + h];
+        nb[(size_t)h * nbRows + r] = s;        // [h][q][k]
+      }
   attnModForward(actN, actN, mb, nb, ap, gating, B, Q, K, Cq, Cq, H, D, O, out);
 }
 
@@ -939,6 +941,92 @@ static void biasedCase(int B, int Q, int Cq, int Cb, int H, int D, int O, bool s
   release(gAct); if (!shared) release(gBs);
   release(gqs); release(gqo); release(gbs); release(gbo_); release(gf2);
   release(gWq); release(gWk); release(gWv); release(gWg); release(gbg); release(gWo); release(gbo);
+}
+
+// ---------------------------------------------------------------- MSAColumnAttention
+static void mcolCase(int S, int N, int Cm, int H, int D, int O) {
+  const int W = H * D;
+  const size_t rows = (size_t)S * N;
+  std::vector<double> msa = randv(rows * Cm), dOut = randv(rows * O, 0.5), mask(rows, 1.0);
+  for (int s = 0; s < S; ++s)
+    for (int n = 1; n < N; ++n)
+      if ((s * 2 + n) % 5 == 0) mask[(size_t)s * N + n] = 0.0;      // sequence 0 always present
+  std::vector<double> qScale = randv(Cm, 0.3), qOffset = randv(Cm, 0.2);
+  for (auto& x : qScale) x += 1.0;
+  AttnMP ap;
+  ap.Wq = randv((size_t)Cm * W, 0.2); ap.Wk = randv((size_t)Cm * W, 0.2); ap.Wv = randv((size_t)Cm * W, 0.2);
+  ap.Wg = randv((size_t)Cm * W, 0.2); ap.bg = randv(W, 0.1);
+  ap.Wo = randv((size_t)W * O, 0.2);  ap.bo = randv(O, 0.1);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dMsaIn = up(msa); void* dMask = up(mask); void* dDo = up(dOut);
+  void* hqs = up(qScale); void* hqo = up(qOffset);
+  void* hWq = up(ap.Wq); void* hWk = up(ap.Wk); void* hWv = up(ap.Wv);
+  void* hWg = up(ap.Wg); void* hbg = up(ap.bg); void* hWo = up(ap.Wo); void* hbo = up(ap.bo);
+  BiasedAttnWeights w{};
+  w.qScale = (const float*)hqs; w.qOffset = (const float*)hqo; w.feat2dW = nullptr;
+  w.attn.Wq = (const float*)hWq; w.attn.Wk = (const float*)hWk; w.attn.Wv = (const float*)hWv;
+  w.attn.Wg = (const float*)hWg; w.attn.bg = (const float*)hbg;
+  w.attn.Wo = (const float*)hWo; w.attn.bo = (const float*)hbo;
+  void* gMsa = alloc(rows * Cm * 4);
+  void* gqs = alloc((size_t)Cm * 4); void* gqo = alloc((size_t)Cm * 4);
+  void* gWq = alloc((size_t)Cm * W * 4); void* gWv = alloc((size_t)Cm * W * 4);
+  void* gWo = alloc((size_t)W * O * 4);
+  BiasedAttnGrads gg{};
+  gg.qScale = (float*)gqs; gg.qOffset = (float*)gqo;
+  gg.attn.Wq = (float*)gWq; gg.attn.Wv = (float*)gWv; gg.attn.Wo = (float*)gWo;
+
+  msaColumnAttentionBwd((const float*)dMsaIn, (const float*)dMask, S, N, Cm, H, D, O, w,
+                        (const float*)dDo, (float*)gMsa, gg);
+
+  // the host forward: the same module with the first two axes swapped, which is what AF2 does
+  auto fwd = [&]() {
+    std::vector<double> actT(rows * Cm), maskT(rows), out;
+    for (int s = 0; s < S; ++s)
+      for (int n = 0; n < N; ++n) {
+        maskT[(size_t)n * S + s] = mask[(size_t)s * N + n];
+        for (int c = 0; c < Cm; ++c) actT[((size_t)n * S + s) * Cm + c] = msa[((size_t)s * N + n) * Cm + c];
+      }
+    std::vector<double> none;
+    biasedForward(actT, actT, maskT, N, S, Cm, Cm, H, D, O, true, qScale, qOffset, none, none,
+                  none, ap, true, out);
+    double acc = 0;                           // the cotangent is in the ORIGINAL orientation
+    for (int s = 0; s < S; ++s)
+      for (int n = 0; n < N; ++n)
+        for (int o = 0; o < O; ++o)
+          acc += dOut[((size_t)s * N + n) * O + o] * out[((size_t)n * S + s) * O + o];
+    return acc;
+  };
+  char shape[80];
+  snprintf(shape, sizeof shape, "S%d N%d Cm%d H%d D%d O%d", S, N, Cm, H, D, O);
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = fwd();
+      target[j] = save - hh;
+      double bS = fwd();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[220];
+    snprintf(lab, sizeof lab, "msacol %s vs central difference %s", what, shape);
+    reportGrad(lab, fd, mine, 3e-5);
+  };
+  probe("dMsa", msa, download((const float*)gMsa, rows * Cm), 6);
+  probe("dqScale", qScale, download((const float*)gqs, Cm), 3);
+  probe("dqOffset", qOffset, download((const float*)gqo, Cm), 3);
+  probe("dWq", ap.Wq, download((const float*)gWq, (size_t)Cm * W), 3);
+  probe("dWv", ap.Wv, download((const float*)gWv, (size_t)Cm * W), 3);
+  probe("dWo", ap.Wo, download((const float*)gWo, (size_t)W * O), 3);
+
+  release(dMsaIn); release(dMask); release(dDo); release(hqs); release(hqo);
+  release(hWq); release(hWk); release(hWv); release(hWg); release(hbg); release(hWo); release(hbo);
+  release(gMsa); release(gqs); release(gqo); release(gWq); release(gWv); release(gWo);
 }
 
 // ---------------------------------------------------------------- TriangleMultiplication, the whole module
@@ -1275,6 +1363,9 @@ int main(int argc, char** argv) {
   printf("biased self-attention (MSARowAttentionWithPairBias / TriangleAttention)\n");
   biasedCase(7, 7, 12, 12, 3, 8, 12, true);    // TriangleAttention: one LayerNorm, bias from the attended tensor
   biasedCase(5, 6, 10, 14, 2, 8, 10, false);   // MSARowAttentionWithPairBias: two, and the bias from the pair
+  printf("MSAColumnAttention (the per-column orientation, no pair bias)\n");
+  mcolCase(6, 5, 12, 3, 8, 12);
+  mcolCase(4, 7, 16, 2, 8, 16);
   printf("TriangleMultiplication backward (the whole module)\n");
   triCase(10, 16, 12, true);
   triCase(10, 16, 12, false);

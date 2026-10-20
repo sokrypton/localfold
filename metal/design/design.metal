@@ -273,6 +273,16 @@ kernel void lf_scale(LF_ARGS(ScaleArgs)) {
   a.y[i] *= a.alpha;
 }
 
+kernel void lf_swap01(LF_ARGS(Swap01Args)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = A * B * C, indexed as the DESTINATION [B][A][C]
+  const uint c = (uint)(i - lf_udiv((uint)i, a.C) * a.C);
+  const uint rest = (uint)lf_udiv((uint)i, a.C);          // = b * A + aa
+  const uint aa = rest - lf_udiv(rest, a.A) * a.A;
+  const uint b = lf_udiv(rest, a.A);
+  a.y[i] = a.x[((ulong)aa * a.B + b) * a.C + c];
+}
+
 kernel void lf_affine(LF_ARGS(AffineArgs)) {
   ulong i = LF_INDEX;
   if (i >= a.n) return;

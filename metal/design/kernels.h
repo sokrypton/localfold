@@ -38,6 +38,11 @@ struct GateBwdArgs { CP(float) dout; CP(float) y; CP(float) g; DP(float) dy; DP(
 // scaled one times alpha; this is that multiply.
 struct ScaleArgs { DP(float) y; u64 n; float alpha; uint pad; };
 
+// Swap the two leading axes of a [A][B][C] tensor into [B][A][C]. AF2's column attentions and the triangle's
+// per_column orientation are the same module as their per_row twin with the first two axes swapped
+// (modules.py:595, :703), so this is how they are served rather than by a second indexing mode in every kernel.
+struct Swap01Args { CP(float) x; DP(float) y; u64 n; uint A, B, C, pad; };
+
 // y = x * alpha + beta. AF2 turns a 0/1 mask into an additive attention bias with 1e9 * (mask - 1).
 struct AffineArgs { CP(float) x; DP(float) y; u64 n; float alpha, beta; uint pad; };
 

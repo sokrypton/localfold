@@ -174,6 +174,15 @@ void biasedSelfAttentionBwd(const float* act, const float* biasSrc, const float*
                             const BiasedAttnWeights& w, const float* dOut,
                             float* dAct, float* dBiasSrc, const BiasedAttnGrads& g = {});
 
+// ---------------------------------------------------------------- MSAColumnAttention (Alg. 8)
+// The same module as MSARowAttentionWithPairBias with the first two axes swapped and NO pair bias
+// (modules.py:589-614): the MSA is attended down its columns, so each residue is a batch and the sequences are the
+// queries. `w.feat2dW` is left null and the bias path disappears.
+//   msa      [S][N][Cm];  msaMask [S][N];  dOut [S][N][O];  dMsa [S][N][Cm], written
+void msaColumnAttentionBwd(const float* msa, const float* msaMask, int S, int N, int Cm, int H, int D, int O,
+                           const BiasedAttnWeights& w, const float* dOut, float* dMsa,
+                           const BiasedAttnGrads& g = {});
+
 // ---------------------------------------------------------------- TriangleMultiplication (Alg. 11 / 12)
 // The forward, as AF2 writes it (modules.py:947-1012). With n2 = N * N pair rows, C the pair width and I the
 // intermediate width (num_intermediate_channel):

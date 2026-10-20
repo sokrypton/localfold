@@ -16,9 +16,13 @@ namespace mt {
 void designShareScratch() {
   shareScratch({{"design.tr.", "dtr"}, {"design.opm.", "dopm"}, {"design.tri.", "dtri"},
                 {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
-                {"design.ln.", "dln"}},
+                {"design.mcol.", "dmcol"}, {"design.ln.", "dln"}},
                {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
-                {"dln", "dattn"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"}, {"dattn", "dbattn"}});
+                {"dln", "dattn"}, {"dln", "dmcol"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"},
+                {"dattn", "dbattn"},
+                // the column attention transposes into the per-column orientation and calls the biased attention
+                // on it, so everything that one holds is live inside its turn
+                {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}});
 }
 
 // a simdgroup a row, eight a threadgroup - metal/core's layerNormRun grid, so the rows map the same way
@@ -348,29 +352,34 @@ void biasedSelfAttentionBwd(const float* act, const float* biasSrc, const float*
     return (float*)scratchBytes(std::string("design.battn.") + name, n * sizeof(float));
   };
   float* actN = buf("actN", rows * Cq);
-  float* biasN = shared ? actN : buf("biasN", nbRows * Cb);
-  float* nbRow = buf("nbRow", nbRows * H);
-  float* nb = buf("nb", nbRows * H);
+  float* biasN = (!w.feat2dW || shared) ? actN : buf("biasN", nbRows * Cb);
+  const bool hasBias = w.feat2dW != nullptr;   // MSAColumnAttention has none: it attends with the mask alone
+  float* nbRow = hasBias ? buf("nbRow", nbRows * H) : nullptr;
+  float* nb = hasBias ? buf("nb", nbRows * H) : nullptr;
   float* maskBias = buf("maskBias", (size_t)B * K);
   float* dActN = buf("dActN", rows * Cq);
-  float* dNb = buf("dNb", nbRows * H);
-  float* dNbRow = buf("dNbRow", nbRows * H);
+  float* dNb = hasBias ? buf("dNb", nbRows * H) : nullptr;
+  float* dNbRow = hasBias ? buf("dNbRow", nbRows * H) : nullptr;
 
   // -------- the forward, recomputed
   run1d("lf_affine", (size_t)B * K, AffineArgs{mask, maskBias, (size_t)B * K, 1e9f, -1e9f, 0});
   layerNorm(act, actN, rows, Cq, w.qScale, w.qOffset);
-  if (!shared) layerNorm(biasSrc, biasN, nbRows, Cb, w.bScale, w.bOffset);
-  {
+  if (hasBias && !shared) layerNorm(biasSrc, biasN, nbRows, Cb, w.bScale, w.bOffset);
+  if (hasBias) {
     Gemm gm{}; gm.X = biasN; gm.W = w.feat2dW; gm.Y = nbRow;
     gm.rows = nbRows; gm.in = Cb; gm.out = H; gemm(gm);          // [Q * K][H]
+    run1d("lf_tri_pack", nbRows * H, TriPackArgs{nbRow, nb, nbRows * H, nbRows, (uint)H, 0});   // -> [H][Q * K]
   }
-  run1d("lf_tri_pack", nbRows * H, TriPackArgs{nbRow, nb, nbRows * H, nbRows, (uint)H, 0});   // -> [H][Q * K]
 
   // -------- the attention module. Self-attention, so one cotangent for q_data and m_data.
   attentionModuleBwd(actN, actN, maskBias, nb, w.attn, dOut, dActN, dActN, dNb,
                      B, Q, K, Cq, Cq, H, D, O, g.attn);
 
   // -------- the bias's linear: [H][Q * K] back to [Q * K][H], then through feat2dW
+  if (!hasBias) {
+    layerNormBwd(act, dActN, dAct, rows, Cq, w.qScale, g.qScale, g.qOffset);
+    return;
+  }
   run1d("lf_tri_unpack", nbRows * H, TriPackArgs{dNb, dNbRow, nbRows * H, nbRows, (uint)H, 0});
   if (shared) {
     // the same tensor feeds the attention and the bias, so this accumulates into the attention's own cotangent
@@ -383,6 +392,33 @@ void biasedSelfAttentionBwd(const float* act, const float* biasSrc, const float*
 
   // -------- and the attended tensor's own LayerNorm
   layerNormBwd(act, dActN, dAct, rows, Cq, w.qScale, g.qScale, g.qOffset);
+}
+
+void msaColumnAttentionBwd(const float* msa, const float* msaMask, int S, int N, int Cm, int H, int D, int O,
+                           const BiasedAttnWeights& w, const float* dOut, float* dMsa,
+                           const BiasedAttnGrads& g) {
+  if (!S || !N) return;
+  if (w.feat2dW) { fprintf(stderr, "design: MSAColumnAttention takes no pair bias\n"); exit(1); }
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.mcol.") + name, n * sizeof(float));
+  };
+  const size_t rows = (size_t)S * N;
+  float* actT = buf("actT", rows * Cm);        // [N][S][Cm]
+  float* maskT = buf("maskT", rows);
+  float* dOutT = buf("dOutT", rows * O);
+  float* dActT = buf("dActT", rows * Cm);
+  auto swap = [&](const float* x, float* y, int A, int Bx, int C) {
+    run1d("lf_swap01", (size_t)A * Bx * C,
+          Swap01Args{x, y, (size_t)A * Bx * C, (uint)A, (uint)Bx, (uint)C, 0});
+  };
+  // into the per-column orientation, as AF2 does before the module and after it
+  swap(msa, actT, S, N, Cm);
+  swap(msaMask, maskT, S, N, 1);
+  swap(dOut, dOutT, S, N, O);
+  // a residue is a batch, the sequences are the queries
+  biasedSelfAttentionBwd(actT, actT, maskT, N, S, Cm, Cm, H, D, O, w, dOutT, dActT, dActT, g);
+  // and back, which is the swap read the other way round
+  run1d("lf_swap01", rows * Cm, Swap01Args{dActT, dMsa, rows * Cm, (uint)N, (uint)S, (uint)Cm, 0});
 }
 
 // a batched GEMM over the channel: every operand is [batch][rows * in] with one plane a channel
