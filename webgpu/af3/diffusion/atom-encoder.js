@@ -1843,9 +1843,12 @@ export class Af3AtomEncoderGpu {
           queriesSpace[index] = input.tokenAtomsToQueries.mask[index]
             ? flatSpace[Number(input.tokenAtomsToQueries.indices[index])] : 0;
         }
+        // (stock AF3: the keys' uid gathered with queries_to_keys from the TOKEN layout - dialect.js
+        // keysUidFromQueriesLayout off; clamped, as a masked entry may point past the end)
+        const keysFrom = dialect.keysUidFromQueriesLayout ? queriesSpace : flatSpace;
         for (let index = 0; index < keyRows; index += 1) {
           keysSpace[index] = input.queriesToKeys.mask[index]
-            ? queriesSpace[Number(input.queriesToKeys.indices[index])] : 0;
+            ? keysFrom[Math.min(Number(input.queriesToKeys.indices[index]), keysFrom.length - 1)] : 0;
         }
         if (!dialect.maskPaddedKeys) return;
         // keysMask, built the way the reference builds it: the queries-to-keys

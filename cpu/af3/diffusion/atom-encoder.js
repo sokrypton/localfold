@@ -84,6 +84,16 @@ export function convert(gather, source, channels) {
   return output;
 }
 
+/** One channel, the index clamped to the source (a gather whose indices are written for another array). */
+export function convertClamped(gather, source) {
+  const output = new Float32Array(gather.count);
+  for (let index = 0; index < gather.count; index += 1) {
+    if (!gather.mask[index]) continue;
+    output[index] = source[Math.min(Number(gather.indices[index]), source.length - 1)];
+  }
+  return output;
+}
+
 /** Adaptive LayerNorm: normalise, then scale and shift from the conditioning. */
 export function adaptiveLayerNorm(x, cond, rows, channels, weights, prefix,
                                   condChannels = channels) {
@@ -463,7 +473,11 @@ export function atomCrossAttentionEncoder(input, weights, onStage) {
   const queriesRefPos = convert(input.tokenAtomsToQueries, input.refPos, 3);
   const queriesSpaceUid = convert(input.tokenAtomsToQueries, input.refSpaceUid, 1);
   const keysRefPos = convert(input.queriesToKeys, queriesRefPos, 3);
-  const keysSpaceUid = convert(input.queriesToKeys, queriesSpaceUid, 1);
+  // (stock AF3: the keys' uid gathered with queries_to_keys from the TOKEN layout, the indices written for the queries
+  // layout - dialect.js keysUidFromQueriesLayout off; clamped, as a masked entry may point past the end)
+  const keysSpaceUid = dialect.keysUidFromQueriesLayout
+    ? convert(input.queriesToKeys, queriesSpaceUid, 1)
+    : convertClamped(input.queriesToKeys, input.refSpaceUid);
 
   const pair = new Float32Array(subsets * queries * keys * pairChannels);
   // 🔴 THE THREE PAIR TERMS UNMASKED, because the reference records each Linear's

@@ -343,8 +343,13 @@ inline void confidenceWeights(Walk& w, const std::string& p) {
            {"distogramFeatProject", "distogram_feat_project/weights"}})
       T(r + path, "~_boltz2_reembed/" + name);
   } else {
-    T(".leftTargetFeatProject", "~_embed_features/left_target_feat_project/weights");
-    T(".rightTargetFeatProject", "~_embed_features/right_target_feat_project/weights");
+    // chai-1 blobs converted before af3-any-model's convention 3 (no `__meta__/__convention__` record - our pinned
+    // revision 3 is one) hold the confidence head's single->pair halves crossed: chai's first half varies along i, the
+    // RIGHT projection here (sokrypton/alphafold3 1e0d7f9 - against chai at fp32 the crossing was the head's whole gap,
+    // pae corr 0.919 -> 0.99997). Same names and shapes, so only the record tells them apart
+    const bool crossed = w.S.has(EVO + "/chai1_chain_entity") && !w.S.has("__meta__/__convention__");
+    T(".leftTargetFeatProject", crossed ? "~_embed_features/right_target_feat_project/weights" : "~_embed_features/left_target_feat_project/weights");
+    T(".rightTargetFeatProject", crossed ? "~_embed_features/left_target_feat_project/weights" : "~_embed_features/right_target_feat_project/weights");
     T(".distogramFeatProject", "~_embed_features/distogram_feat_project/weights");
     if (has("~_embed_features/distance_feat_project/weights")) T(".distanceFeatProject", "~_embed_features/distance_feat_project/weights");
   }

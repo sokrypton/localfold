@@ -229,7 +229,15 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
     float* uidF = scratch<float>("enc.uid", nu);
     upload(uidF, u.data(), nu * 4);
     convert(t2q, uidF, o.qUid, 1);
-    convert(q2k, o.qUid, o.kUid, 1);
+    // (stock AF3: the keys' uid gathered with queries_to_keys from the TOKEN layout - dialect.js keysUidFromQueriesLayout off;
+    // the index clamped, as a masked entry may point past the end)
+    if (!flag("trunk.dialect.keysUidFromQueriesLayout")) {
+      const int* qi = M.hostI("batch.queriesToKeys.indices"); const float* qm = M.hostF("batch.queriesToKeys.mask");
+      size_t nk = M.len("batch.queriesToKeys.indices");
+      std::vector<float> k(nk);
+      for (size_t i = 0; i < nk; ++i) k[i] = qm[i] != 0 ? u[std::min<size_t>((size_t)qi[i], nu - 1)] : 0.f;
+      upload(o.kUid, k.data(), nk * 4);
+    } else convert(q2k, o.qUid, o.kUid, 1);
   }
   size_t pairRows = qRows * sh.keys;
   o.pair = scratch<float>(E + ".pair", pairRows * Cp);

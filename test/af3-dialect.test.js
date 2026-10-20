@@ -69,7 +69,7 @@ describe("the dialect table", () => {
       // window's edge is the atom COUNT. `tools/check-atom-windows.js` is the
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
-      "mainMsaCap", "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
+      "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
   });
 
   /**
@@ -122,6 +122,9 @@ describe("the dialect table", () => {
       // `z_after_template` seam against af3-any-model. See docs/AF3.md.
       "emptyTemplateAatype",
       "keyMaskedAtomAttention",
+      // 🔴 THE KEYS' REFERENCE SPACE FROM THE QUERIES LAYOUT, as its vendor gates it: stock AF3 alone keeps
+      // upstream's token-layout gather (sokrypton/alphafold3 c8c6ba9)
+      "keysUidFromQueriesLayout",
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",
       "nativeNonproteinMsa",

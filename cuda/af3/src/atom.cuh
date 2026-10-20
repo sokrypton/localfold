@@ -36,6 +36,14 @@ __global__ void convertK(const int* idx, const float* mask, const float* src, fl
 inline void convert(const Gather& g, const float* src, float* out, int C, size_t srcRows = 0, int ns = 1) {
   convertK<<<blocks((size_t)ns * g.count * C), 256, 0, STREAM>>>(g.idx, g.mask, src, out, g.count, C, srcRows, ns);
 }
+// one channel, the index clamped to the source (a gather whose indices are written for another array: stock AF3's keys'
+// reference space, keysUidFromQueriesLayout off - a masked entry may point past the end)
+__global__ void convertClampK(const int* idx, const float* mask, const float* src, size_t srcLen, float* out, int count) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= count) return;
+  size_t i = (size_t)idx[t] < srcLen ? (size_t)idx[t] : srcLen - 1;
+  out[t] = mask[t] != 0 ? src[i] : 0.f;
+}
 // LayerNorm with the TWO-PASS variance (this module's convention), optional scale/offset.
 __global__ void layerNormSlowK(const float* in, float* out, size_t rows, int C, const float* scale,
                                const float* offset) {
@@ -933,7 +941,10 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     CK(cudaStreamSynchronize(STREAM));     // u is a host temporary
   }
   convert(t2q, uidF, qUid, 1);
-  convert(q2k, qUid, kUid, 1);
+  // (stock AF3: the keys' uid gathered with queries_to_keys from the TOKEN layout - dialect.js keysUidFromQueriesLayout off)
+  if (!M.flag("trunk.dialect.keysUidFromQueriesLayout"))
+    convertClampK<<<blocks(q2k.count), 256, 0, STREAM>>>(q2k.idx, q2k.mask, uidF, M.len("batch.refSpaceUid"), kUid, q2k.count);
+  else convert(q2k, qUid, kUid, 1);
   size_t pairRows = qRows * sh.keys;
   o.pair = scratch<float>(E + ".pair", pairRows * Cp);
   Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");

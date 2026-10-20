@@ -116,6 +116,13 @@ export const ALPHAFOLD3 = Object.freeze({
   swapTransposedBias: false,
   symmetriseBonds: false,
   maskPaddedKeys: false,
+  // 🔴 THE KEYS' REFERENCE SPACE FROM THE QUERIES LAYOUT - every family but stock AF3. Upstream gathers the keys' ref_space_uid
+  // with queries_to_keys applied to the TOKEN-layout [tokens, 24] array, not to the queries layout those indices are
+  // written for: a misindexing, and what AF3 was trained with. af3-any-model's 9ad4629 'fixed' it for every model and
+  // AF3's offsets_valid moved (max|d|/rms 22.8, denoise corr 0.99913 against DeepMind); sokrypton/alphafold3
+  // c8c6ba9 restored it for alphafold3 only: true here gathers from the queries layout, as every other family's vendor
+  // gates (off for AF3, which is upstream's own indexing)
+  keysUidFromQueriesLayout: false,
   padSingleCondUnknownDna: false,
   pairInitFromSingle: false,
   msaUpdateBeforeOuterProduct: false,
@@ -363,6 +370,7 @@ export const OPENBIND0 = Object.freeze({
   swapTransposedBias: false,
   symmetriseBonds: true,
   maskPaddedKeys: true,
+  keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: true,
   pairInitFromSingle: false,
   msaUpdateBeforeOuterProduct: false,
@@ -516,6 +524,7 @@ export const OPENDDE = Object.freeze({
   // OPENFOLD3_LINEAGE, both of these.
   symmetriseBonds: true,
   maskPaddedKeys: true,
+  keysUidFromQueriesLayout: true,
   // ...but NOT this one; see the note above.
   // 🔴 IT JOINED THE PADDED LIST, AND THE BUNDLE HAD TO BE RE-EXPORTED FOR IT.
   // OpenDDE's diffusion single conditioning normalises over the vendor's 833
@@ -652,6 +661,7 @@ export const PROTENIX2 = Object.freeze({
   // OPENFOLD3_LINEAGE.
   symmetriseBonds: true,
   maskPaddedKeys: true,
+  keysUidFromQueriesLayout: true,
   // 🔴 PADDED_SINGLE_COND, AND UNLIKE OpenDDE. Copied from OpenDDE's false and
   // the loader caught it in one run: "single conditioning is 831 channels but
   // its LayerNorm scale is 833". protenix2 carries the two unknown-DNA columns
@@ -829,6 +839,7 @@ export const BOLTZ2 = Object.freeze({
   swapTransposedBias: true,
   symmetriseBonds: true,
   maskPaddedKeys: true,
+  keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: false,
   // Settled by the tensors at export, as protenix2's was.
   pairInitFromSingle: false,
@@ -1064,6 +1075,7 @@ export const INTELLIFOLD2 = Object.freeze({
   // NOT in OPENFOLD3_LINEAGE - the bonds are AF3's.
   symmetriseBonds: false,
   maskPaddedKeys: false,
+  keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: false,
   pairInitFromSingle: false,
   msaUpdateBeforeOuterProduct: false,
@@ -1262,6 +1274,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   // OPENFOLD3_LINEAGE.
   symmetriseBonds: true,
   maskPaddedKeys: true,
+  keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: true,
   pairInitFromSingle: false,
   msaUpdateBeforeOuterProduct: false,
@@ -1359,6 +1372,7 @@ export const CHAI1 = Object.freeze({
   swapTransposedBias: false,
   symmetriseBonds: false,
   maskPaddedKeys: false,
+  keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: false,
   pairInitFromSingle: false,
   msaUpdateBeforeOuterProduct: false,
