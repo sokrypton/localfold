@@ -9,6 +9,8 @@
 // GEMM; biases and norms float32. The attention is the core's flash kernel, its gate held open.
 #include "af3.h"
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 static std::string blockName(int layer, const std::string& module, const std::string& leaf) {
   return "e/esm2/blocks/" + module + "/" + num(layer) + "/" + leaf;
@@ -43,11 +45,19 @@ static void embedChain(const int* ids, int n, float* out) {
   half* qkvg = scratch<half>("esm2.qkvg", (size_t)R * 4 * C);
   half* ctx = scratch<half>("esm2.ctx", (size_t)R * C);
   half* h = scratch<half>("esm2.h", (size_t)R * ffn);
-  // the rotation table in double, as the reference's sincos: position r, frequency 10000^(-2d/64)
+  // the rotation table: position r, frequency 10000^(-2d/64) ROUNDED TO FLOAT16 as chai's traced ESM2 stores it (an fp16
+  // rot_emb.inv_freq), the angle a float32 product (cuda/plm/esm2.cuh); the frequencies are normal halves, so the
+  // round-to-nearest-even is the mantissa's 13 low bits
+  auto toHalf = [](float x) {
+    uint32_t u; memcpy(&u, &x, 4);
+    u += 0x0FFFu + ((u >> 13) & 1u); u &= ~0x1FFFu;
+    float y; memcpy(&y, &u, 4); return y;
+  };
   std::vector<float> cosT((size_t)R * 32), sinT((size_t)R * 32);
   for (int r = 0; r < R; ++r)
     for (int d = 0; d < 32; ++d) {
-      double angle = (double)r * std::pow(10000.0, -(double)(2 * d) / 64.0);
+      const float inv = toHalf(1.0f / std::pow(10000.0f, (float)(2 * d) / 64.0f));
+      double angle = (double)((float)r * inv);
       cosT[(size_t)r * 32 + d] = (float)std::cos(angle); sinT[(size_t)r * 32 + d] = (float)std::sin(angle);
     }
   float* dCos = scratch<float>("esm2.cos", cosT.size()); upload(dCos, cosT.data(), cosT.size() * 4);

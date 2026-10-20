@@ -219,6 +219,19 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
   run1d("af3_expectation", (size_t)n * dense, ExpectationArgs{pl, plddt, nullptr, dpc, (u64)n * dense, (uint)PB, 0, 100.f, 0});
   out.plddt = download(plddt, (size_t)n * dense);
+  if (flag("trunk.dialect.perAtomHeadsByRank")) {   // (each atom's by its rank among the token's real atoms: cuda/af3)
+    const int* chars = M.hostI("batch.refAtomNameChars");
+    std::vector<float> ranked(out.plddt.size());
+    for (int t = 0; t < n; ++t) {
+      int rank = -1;
+      for (int s = 0; s < dense; ++s) {
+        size_t flat = (size_t)t * dense + s;
+        if (chars[flat * 4] || chars[flat * 4 + 1] || chars[flat * 4 + 2] || chars[flat * 4 + 3]) ++rank;
+        ranked[flat] = out.plddt[(size_t)t * dense + std::min(std::max(rank, 0), dense - 1)];
+      }
+    }
+    out.plddt.swap(ranked);
+  }
   out.pae = download(pae, pairs);
   out.pde = download(pde, pairs);
   const float* mask = M.hostF("batch.predDenseAtomMask");

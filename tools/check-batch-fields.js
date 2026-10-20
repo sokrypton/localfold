@@ -341,8 +341,57 @@ const dumpsDir = (args.find((a) => a.startsWith("--dumps=")) ?? "--dumps=oracle-
 function dumpFor(model, target) {
   const file = `af3-batch-${model}-6mrr${TARGETS[target].suffix}.json`;
   try {
-    return JSON.parse(readFileSync(new URL(`../${dumpsDir}/${file}`, import.meta.url)));
-  } catch { return null; }
+    return narrowDense(JSON.parse(readFileSync(new URL(`../${dumpsDir}/${file}`, import.meta.url))), 24);
+  } catch (error) { if (error instanceof SyntaxError || error.code === "ENOENT") return null; throw error; }
+}
+
+/**
+ * 🔴 boltz2's TOKEN WIDENS to its largest one-token modified residue (af3-any-model e2a2246: 32 slots for a
+ * 2'-O-methylguanosine's 25 CCD atoms), where this port keeps 24. When nothing real lies past slot `dense` the two are
+ * the same batch padded differently, so the reference's per-atom arrays are cut to `dense` slots and its gathers'
+ * flat atom indices re-based; when something does, it is left as it is and every per-atom field says so.
+ */
+function narrowDense(dump, dense) {
+  const mask = dump.inputs?.ref_mask;
+  if (mask === undefined || mask.shape.length < 2 || mask.shape[1] <= dense) return dump;
+  const [tokens, wide] = mask.shape;
+  for (let t = 0; t < tokens; t += 1) {
+    for (let k = dense; k < wide; k += 1) if (mask.data[t * wide + k] > 0) return dump;
+  }
+  for (const [name, value] of Object.entries(dump.inputs)) {
+    const shape = value.shape;
+    if (name.endsWith(":gather_idxs") || name.endsWith(":gather_mask")) {
+      const base = name.slice(0, name.lastIndexOf(":"));
+      const from = dump.inputs[`${base}:input_shape`]?.data ?? [];
+      let data = value.data;
+      // indices INTO the dense grid re-based; an index past the narrow slots is only ever padding
+      if (name.endsWith(":gather_idxs") && from.length >= 2 && from[0] === tokens && from[1] === wide) {
+        data = data.map((k) => (k % wide < dense ? Math.floor(k / wide) * dense + (k % wide) : 0));
+      }
+      // ...and a gather whose OUTPUT is the dense grid cut to it
+      if (shape.length >= 2 && shape[0] === tokens && shape[1] === wide) {
+        const inner = shape.slice(2).reduce((a, b) => a * b, 1);
+        const out = [];
+        for (let t = 0; t < tokens; t += 1) out.push(...data.slice(t * wide * inner, (t * wide + dense) * inner));
+        data = out;
+        value.shape = [tokens, dense, ...shape.slice(2)];
+      }
+      value.data = data;
+      continue;
+    }
+    if (name.endsWith(":input_shape")) {
+      if (value.data[0] === tokens && value.data[1] === wide) value.data = [tokens, dense, ...value.data.slice(2)];
+      continue;
+    }
+    if (shape.length >= 2 && shape[0] === tokens && shape[1] === wide) {
+      const inner = shape.slice(2).reduce((a, b) => a * b, 1);
+      const out = [];
+      for (let t = 0; t < tokens; t += 1) out.push(...value.data.slice(t * wide * inner, (t * wide + dense) * inner));
+      value.data = out;
+      value.shape = [tokens, dense, ...shape.slice(2)];
+    }
+  }
+  return dump;
 }
 
 // One place that turns a model into a batch, because there are two loops below

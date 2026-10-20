@@ -380,6 +380,22 @@ inline void confidencePlddt(ConfidenceOut& out, const float* single, int n, int 
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
   expectationK<<<blocks((size_t)n * dense), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * dense, PB, dpc, 0, 100.f);
   out.plddt = download(plddt, (size_t)n * dense);
+  // (rf3, intellifold2, openbind0: each atom's by its rank among the token's real atoms - plddtByRank in
+  // cpu/af3/confidence/confidence.js; a softmax a slot, so the expectation gathers as the logits would)
+  if (M.flag("trunk.dialect.perAtomHeadsByRank")) {
+    const int* chars = M.i("batch.refAtomNameChars");
+    std::vector<float> ranked(out.plddt.size());
+    for (int t = 0; t < n; ++t) {
+      int rank = -1;
+      for (int s = 0; s < dense; ++s) {
+        size_t flat = (size_t)t * dense + s;
+        bool real = chars[flat * 4] || chars[flat * 4 + 1] || chars[flat * 4 + 2] || chars[flat * 4 + 3];
+        if (real) ++rank;
+        ranked[flat] = out.plddt[(size_t)t * dense + std::min(std::max(rank, 0), dense - 1)];
+      }
+    }
+    out.plddt.swap(ranked);
+  }
   CK(cudaFree(dpc));
   const float* mask = M.f("batch.predDenseAtomMask");
   double sum = 0, count = 0;

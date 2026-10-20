@@ -55,7 +55,10 @@ __global__ void ropeK(float* qkv, int rows, int heads, int C) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * heads * 32 * 2) return;
   int d = t % 32, h = (t / 32) % heads, row = (t / (32 * heads)) % rows, which = t / (32 * heads * rows);
-  double s, c; sincos((double)row * pow(10000.0, -(double)(2 * d) / 64.0), &s, &c);
+  // (the frequency ROUNDED TO FLOAT16, as chai's traced ESM2 stores rot_emb.inv_freq - an fp16 buffer - and the angle a
+  // float32 product: af3-any-model's _rope half_inv_freq, 1e-2 against the trace exact, 2e-5 rounded)
+  const float inv = __half2float(__float2half_rn(1.0f / powf(10000.0f, (float)(2 * d) / 64.0f)));
+  double s, c; sincos((double)((float)row * inv), &s, &c);
   float* p = qkv + (size_t)row * 3 * C + which * C + h * 64 + d;
   float a = p[0], b = p[32];
   p[0] = a * (float)c - b * (float)s;

@@ -74,7 +74,7 @@ describe("the dialect table", () => {
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
       "keepLigandLeavingAtoms", "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "modifiedLeavingAtEnds",
-      "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
+      "padSingleCondUnknownDna", "perAtomHeadsByRank", "symmetriseBonds", "templateGapWhereNoAtoms"]);
   });
 
   /**

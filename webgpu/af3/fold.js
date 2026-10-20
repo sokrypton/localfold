@@ -37,6 +37,7 @@ import { atomCrossAttentionEncoder, targetFeatures } from "../../cpu/af3/diffusi
 import { Af3AtomEncoderGpu } from "./diffusion/atom-encoder.js";
 import { Af3TrunkGpu } from "./trunk/trunk.js";
 import { Af3ConfidenceHeadGpu } from "./confidence/confidence.js";
+import { plddtByRank } from "../../cpu/af3/confidence/confidence.js";
 import { Af3PairformerStackGpu } from "./trunk/pairformer-block.js";
 import { af3Dialect, pairformerBlockWeights, templateWeights } from "../../shared/af3/weights/weights.js";
 import { Af3TemplateEmbedderGpu } from "./trunk/template.js";
@@ -1440,6 +1441,10 @@ async function foldHolding(device, batch, weights, options, held) {
   const scores = structural !== undefined ? await openddeScores()
     : weights.confidence === undefined ? undefined
       : await confidenceFor();
+  // (rf3, intellifold2, openbind0 read their per-atom pLDDT by the atom's rank - plddtByRank)
+  if (scores?.plddt !== undefined && weights.trunk.dialect.perAtomHeadsByRank === true) {
+    scores.plddt = plddtByRank(scores.plddt, batch.refAtomNameChars, batch.tokens, batch.dense);
+  }
   // 🔴 AND THE REFINED PAIR GOES BACK HERE, not when the refiner returned. It
   // is the confidence head's last input and the head runs after the sampler, so
   // this is the one point at which nothing can still read it. At 384 structural

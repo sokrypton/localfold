@@ -41,6 +41,7 @@ export const ALPHAFOLD3 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
   realignSampler: false,   // (the noisy copy rigid-aligned onto each answer: boltz2)
+  perAtomHeadsByRank: false,   // (the per-atom pLDDT by the atom's rank among its token's real atoms: plddtByRank)
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -335,6 +336,7 @@ export const OPENBIND0 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
   realignSampler: false,
+  perAtomHeadsByRank: true,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -497,6 +499,7 @@ export const OPENDDE = Object.freeze({
   preTrunkQuery: false,
   sampler: Object.freeze({ scheduleTail: 2 }),   // (as protenix: the last level 0)
   realignSampler: false,
+  perAtomHeadsByRank: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -707,6 +710,7 @@ export const PROTENIX2 = Object.freeze({
   preTrunkQuery: false,
   sampler: Object.freeze({ scheduleTail: 2 }),   // (InferenceNoiseScheduler: AF3's levels, the last 0)
   realignSampler: false,
+  perAtomHeadsByRank: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -1011,6 +1015,7 @@ export const BOLTZ2 = Object.freeze({
     rho: 7.0, sigmaMin: 0.0001, sigmaMax: 160.0, scheduleTail: 1,
   }),
   realignSampler: true,
+  perAtomHeadsByRank: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -1147,6 +1152,7 @@ export const INTELLIFOLD2 = Object.freeze({
   preTrunkQuery: false,
   sampler: Object.freeze({ scheduleTail: 3 }),   // (IntelliFold's noise_schedule: AF3's levels, then a 0)
   realignSampler: false,
+  perAtomHeadsByRank: true,
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
@@ -1346,6 +1352,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   preTrunkQuery: true,
   sampler: null,
   realignSampler: false,
+  perAtomHeadsByRank: true,
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   // NOT in CENTRE_REF_CONFORMERS.
@@ -1482,6 +1489,7 @@ export const CHAI1 = Object.freeze({
   preTrunkQuery: true,
   sampler: null,
   realignSampler: false,
+  perAtomHeadsByRank: false,
   msaDoubleAddPair: true,
   targetFeatAtomOnly: false,
   centreRefConformers: false,

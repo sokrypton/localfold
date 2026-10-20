@@ -537,3 +537,25 @@ export function confidenceHead(input, weights, block, dialect) {
 
   return { plddt, pae, pde, distanceLogits, paeLogits, resolvedLogits };
 }
+
+/**
+ * The per-atom heads read by the atom's RANK among its token's real atoms, not by its dense slot
+ * (`perAtomHeadsByRank`: rf3, intellifold2, openbind0 - af3-any-model's PER_ATOM_HEADS_BY_RANK). The two agree until a
+ * slot is empty: a nucleotide's dropped OP3 is dense slot 0, so every atom read its neighbour's logit (rna pLDDT corr
+ * 0.43 against stock RF3, 0.9996 by rank). A slot is real when its name is not empty; the head is a softmax a slot,
+ * so gathering its expectation is gathering its logits.
+ */
+export function plddtByRank(plddt, atomNameChars, tokens, dense) {
+  const out = new Float32Array(tokens * dense);
+  for (let token = 0; token < tokens; token += 1) {
+    let rank = -1;
+    for (let slot = 0; slot < dense; slot += 1) {
+      const flat = token * dense + slot;
+      let real = false;
+      for (let c = 0; c < 4; c += 1) real = real || atomNameChars[flat * 4 + c] !== 0;
+      if (real) rank += 1;
+      out[flat] = plddt[token * dense + Math.min(Math.max(rank, 0), dense - 1)];
+    }
+  }
+  return out;
+}
