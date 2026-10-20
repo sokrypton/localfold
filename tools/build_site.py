@@ -615,8 +615,10 @@ def build(include_model: bool, local_bundles: bool = True) -> int:
     # has no symptom until it is somebody's stale code on the internet.
     for tree in ("shared", "cpu", "webgpu"):
         published = {p.relative_to(OUT / tree) for p in (OUT / tree).rglob("*.js")}
+        # (the parts RELATIVE to the tree: a checkout that itself sits under a dot-directory - a worktree in
+        # .claude/worktrees - had every file excluded and the build refused all 96 as "not a source file")
         authored = {p.relative_to(ROOT / tree) for p in (ROOT / tree).rglob("*.js")
-                    if not any(part.startswith(".") for part in p.parts)}
+                    if not any(part.startswith(".") for part in p.relative_to(ROOT / tree).parts)}
         if published != authored:
             for p in sorted(str(p) for p in published - authored):
                 print(f"dist/{tree} carries {p}, which is not a source file", file=sys.stderr)

@@ -225,6 +225,9 @@ export async function main(device, args) {
     "fold-af2 --target=5caj --chain=A --rows=16 --extra-rows=16"
       + " --template=/tools/fixtures/5caj-crystal.pdb:A",
     "fold-esmfold2 --bundle=/model-esmfold2-int5 --length=40",
+    // BioEmu2 shares the pair track (ESMFold2's trunk, AF3's kernels) with the panel, and its own kernels are keyed
+    // `bioemu2:`; four sampler steps compile every kernel a fold does
+    "fold-bioemu2 --job=/tools/fixtures/bioemu2/6mrr-68.json --steps=4 --allow-broken-geometry",
   ].join(";");
   const toolsGiven = args.some((a) => a.startsWith("--tools="));
   const tools = option(args, "tools", DEFAULT_TOOLS).split(";")

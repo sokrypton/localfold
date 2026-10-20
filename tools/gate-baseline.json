@@ -9,7 +9,8 @@
       "boltz2": "\"meanPlddt\": 96.49695141888661",
       "protenix2": "\"meanPlddt\": 84.67055907565127",
       "intellifold2": "\"meanPlddt\": 83.19319083594942",
-      "rosettafold3": "\"meanPlddt\": 81.53048190770973"
+      "rosettafold3": "\"meanPlddt\": 81.53048190770973",
+      "BioEmu2": "\"atomChecksum\": 9577744"
     },
     "portable": {
       "AF2": "\"checksum\": -1315603",
@@ -19,7 +20,8 @@
       "boltz2": "\"meanPlddt\": 96.49871047282468",
       "protenix2": "\"meanPlddt\": 84.68859008629563",
       "intellifold2": "\"meanPlddt\": 83.19145885687225",
-      "rosettafold3": "\"meanPlddt\": 81.52963292785964"
+      "rosettafold3": "\"meanPlddt\": 81.52963292785964",
+      "BioEmu2": "\"atomChecksum\": 9577762"
     },
     "spec-floor": {
       "AF2": "\"checksum\": -1304306",
@@ -29,7 +31,8 @@
       "boltz2": "\"meanPlddt\": 96.49462035973313",
       "protenix2": "\"meanPlddt\": 84.68504328844024",
       "intellifold2": "\"meanPlddt\": 83.18924131276928",
-      "rosettafold3": "\"meanPlddt\": 81.5279306674711"
+      "rosettafold3": "\"meanPlddt\": 81.5279306674711",
+      "BioEmu2": "\"atomChecksum\": 9577762"
     }
   },
   "recorded": "2026-10-16"

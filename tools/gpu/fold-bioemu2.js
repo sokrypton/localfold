@@ -97,7 +97,8 @@ export async function main(device, args) {
     // structure says so where a geometry summary would not
     atomChecksum: (() => {
       let sum = 0;
-      for (let i = 0; i < atomKeys.length * 3; i += 1) sum = (sum + Math.round(result.samples[0][i] * 1000)) | 0;
+      // (of |x|: a sample is centred on its atoms, so a plain sum is ~0 whatever the structure)
+      for (let i = 0; i < atomKeys.length * 3; i += 1) sum = (sum + Math.round(Math.abs(result.samples[0][i]) * 1000)) | 0;
       return sum;
     })(),
   };
