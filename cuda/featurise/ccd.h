@@ -36,7 +36,7 @@ struct CompBond { int from, to, order; };
 // a bond the job declares (bondedAtomPairs), by chain (asym, from 0), residue (from 1) and atom name
 struct BondEnd { int asym; int residue; bool hasAtom; std::string atom; };
 struct DeclaredBond { BondEnd from, to; };
-struct CompPart { std::string code; int from, count; };
+struct CompPart { std::string code; int from, count; bool glycan = false; };
 struct Component {
   std::string code;
   std::vector<CompAtom> atoms;
@@ -44,6 +44,7 @@ struct Component {
   std::string parent;              // "" is null
   std::vector<CompPart> residues;  // ligandChain's; empty for one component
   bool smiles = false;             // built from a SMILES (shared/chem), not read from the dictionary
+  bool glycan = false;             // _chem_comp.type names a saccharide (parseCcdComponent)
 };
 
 inline std::string trimWs(const std::string& s) {
@@ -259,6 +260,27 @@ inline Component parseCcdComponent(const std::string& text) {
   }
   std::string named = cifValue(text, "_chem_comp.mon_nstd_parent_comp_id");
   if (!named.empty() && named != "?" && named != ".") c.parent = upper(named.substr(0, named.find(',')));
+  // a glycan by its dictionary type, /\bsaccharide\b/ on the lowercased value (quoted, usually)
+  const std::string key = "_chem_comp.type";
+  for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + 1)) {
+    size_t i = at + key.size(), ws = i;
+    while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+    if (i == ws || i >= text.size()) continue;
+    std::string v;
+    size_t close = (text[i] == '"' || text[i] == '\'') ? text.find(text[i], i + 1) : std::string::npos;
+    if (close != std::string::npos) {
+      v = text.substr(i + 1, close - i - 1);
+    } else {   // (unquoted, or a quote never closed: the regex's \S+ arm)
+      size_t j = i;
+      while (j < text.size() && !std::isspace((unsigned char)text[j])) ++j;
+      v = text.substr(i, j - i);
+    }
+    for (auto& ch : v) ch = (char)std::tolower((unsigned char)ch);
+    auto word = [](char ch) { return std::isalnum((unsigned char)ch) || ch == '_'; };
+    for (size_t s = v.find("saccharide"); s != std::string::npos; s = v.find("saccharide", s + 1))
+      if ((s == 0 || !word(v[s - 1])) && (s + 10 >= v.size() || !word(v[s + 10]))) { c.glycan = true; break; }
+    break;
+  }
   return c;
 }
 
@@ -268,7 +290,7 @@ inline Component ligandChain(const std::vector<Component>& components) {
   Component out;
   for (auto& comp : components) {
     int from = (int)out.atoms.size();
-    out.residues.push_back({comp.code, from, (int)comp.atoms.size()});
+    out.residues.push_back({comp.code, from, (int)comp.atoms.size(), comp.glycan});
     out.atoms.insert(out.atoms.end(), comp.atoms.begin(), comp.atoms.end());
     for (auto& b : comp.bonds) out.bonds.push_back({b.from + from, b.to + from, b.order});
     out.code += (out.code.empty() ? "" : "-") + comp.code;

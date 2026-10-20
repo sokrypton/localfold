@@ -271,6 +271,8 @@ const flat = (v) => (Array.isArray(v?.data) ? v.data : []);
 const args = process.argv.slice(2);
 const only = (args.find((a) => a.startsWith("--model=")) ?? "").slice(8);
 const verbose = args.includes("--verbose");
+// --show=<field>: the first differing elements of one field, as index:ours/theirs
+const show = (args.find((a) => a.startsWith("--show=")) ?? "").slice(7);
 // 🔴 AND IT MUST BE ABLE TO FAIL. `--falsify=<flag>` inverts one dialect flag
 // before featurising, and every one of them must turn some model red - a gate
 // nobody has watched fail is a gate that may be comparing nothing. See the
@@ -306,6 +308,11 @@ async function jobInputs(file) {
   };
 }
 const KITCHEN = await jobInputs("af3-jobs/alphafold_input.json");
+// a STANDALONE glycan beside a bonded one (tools/fixtures/glycan-standalone.json): AF3's rule drops an unbonded sugar's
+// O1, OpenFold3's and the families that keep a ligand whole do not (glycanO1Leaving)
+const GLYCAN = await jobInputs("glycan-standalone.json");
+TARGETS["glycan-standalone"] = { suffix: "-glycan-standalone", alignment: () => GLYCAN.alignment,
+                                 extra: () => GLYCAN.options, smilesCodes: () => GLYCAN.smilesCodes };
 // ...and every other AlphaFold 3 example job, each against AF3's own featurisation of the file
 // (dump_af3_batch.py --job ... --out oracle-dumps/af3-batch-alphafold3-6mrr-job-<name>.json):
 // their chain ids already sort in this port's order, so no relabelling
@@ -416,6 +423,7 @@ for (const target of Object.keys(TARGETS)) {
     let differ = 0;
     let worst = 0;
     let skipped = 0;
+    const shown = [];
     for (let at = 0; at < n; at += 1) {
       // Live on BOTH sides, since a slot either side calls padding carries
       // whatever each happens to leave there.
@@ -425,8 +433,12 @@ for (const target of Object.keys(TARGETS)) {
       }
       const delta = Math.abs(Number(ours[at]) - theirs[at]);
       if (delta > worst) worst = delta;
-      if (delta > bound) differ += 1;
+      if (delta > bound) {
+        differ += 1;
+        if (show === name && shown.length < 40) shown.push(`${at}:${Number(ours[at])}/${theirs[at]}`);
+      }
     }
+    if (shown.length > 0) notes.push(`${name} (index:ours/theirs) ${shown.join(" ")}`);
     const lengths = ours.length === theirs.length
       ? "" : ` [ours ${ours.length} theirs ${theirs.length}]`;
     const pad = skipped === 0 ? "" : ` (${skipped} padded slots not compared)`;

@@ -53,6 +53,10 @@ describe("the dialect table", () => {
   it("turns on exactly the branches OpenBind-0 needs", () => {
     assert.deepEqual(on(OPENBIND0),
       [
+      // 🔴 OF3's ATOMISED TOKENS AND LEAVING ATOMS (af3-any-model colab's of3 knobs, against its batches): UNK on the
+      // restype alone, a link only between two atomised residues, the CCD leaving group at a declared bond and a
+      // modified residue's at the chain ends, a ligand otherwise whole - and no DNA in its alignment.
+      "atomizedBackboneBonds", "atomizedUnknownRestype",
       // 🔴 OPENFOLD3's FEATURISER, three ways AlphaFold 3's is not (af3-any-model b84aa69): an unknown amino acid is
       // the CCD's UNK, the main MSA each chain's first 16384 rows deduplicated, and every (slot, token) without
       // template atoms the GAP restype.
@@ -61,7 +65,7 @@ describe("the dialect table", () => {
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
       // `target_feat` against af3-any-model. See shared/af3/featurise/featurise.js.
-      "centreRefConformers",
+      "centreRefConformers", "declaredBondLeavingAtoms", "dnaGapMsa",
       // 🔴 NO TERMINAL OXT AND NO 5' OP3, which is not an OpenFold-lineage
       // question - protenix and opendde are in that lineage and deliberately
       // KEEP the OXT. Carrying it put openbind0's last two atom windows 128
@@ -69,7 +73,8 @@ describe("the dialect table", () => {
       // window's edge is the atom COUNT. `tools/check-atom-windows.js` is the
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
-      "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
+      "keepLigandLeavingAtoms", "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "modifiedLeavingAtEnds",
+      "padSingleCondUnknownDna", "symmetriseBonds", "templateGapWhereNoAtoms"]);
   });
 
   /**
@@ -121,7 +126,7 @@ describe("the dialect table", () => {
       // the rest - and writing 0 everywhere was worth 2.07e-2 on the trunk's
       // `z_after_template` seam against af3-any-model. See docs/AF3.md.
       "emptyTemplateAatype",
-      "keyMaskedAtomAttention",
+      "keepLigandLeavingAtoms", "keyMaskedAtomAttention",
       // 🔴 THE KEYS' REFERENCE SPACE FROM THE QUERIES LAYOUT, as its vendor gates it: stock AF3 alone keeps
       // upstream's token-layout gather (sokrypton/alphafold3 c8c6ba9)
       "keysUidFromQueriesLayout",
@@ -319,7 +324,8 @@ describe("the token bond matrix", () => {
 it("the atomised-token conventions are the four the references show", () => {
   const expected = {
     alphafold3:   [false, false, false, false],
-    openbind0:    [false, false, false, false],
+    // openbind0 (of3): the unknown restype alone - its alignment keeps the letter - and a link between two atomised
+    openbind0:    [false, "aatype", false, "both"],
     opendde:      [false, false, false, false],
     protenix2:    [false, false, false, false],
     // boltz2 gives an atomised token the unknown restype and leaves the

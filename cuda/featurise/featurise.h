@@ -45,13 +45,17 @@ struct FeaturiseOptions {
   bool chaiConformers = false;                    // chai1: standard residues on chai-lab's conformers
   bool translateConformers = false; double conformerSeed = 0;
   bool declaredBondLeavingAtoms = false;          // opendde, protenix: the leaving group at each declared bond dropped   // opendde, protenix: each conformer moved by U(-1, 1)
+  bool keepLigandLeavingAtoms = false;            // boltz2, intellifold2, chai1: a glycan ligand keeps its O1 (glycanO1Leaving)
+  bool dnaGapMsa = false;                         // openbind0: a DNA chain gap in every MSA row, DNA and ligand profiles zero
+  bool modifiedLeavingAtEnds = false;             // openbind0: a modified residue's CCD leaving atoms at the chain ends too
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool queryOnce = false;                         // dedupeSelfMsa true: an MSA that is all the query, one row (featurise.js)
   bool nativeNonproteinMsa = false;               // opendde, protenix: a ligand UNK in the MSA and profile, a nucleic chain's gap rows its query
   bool atomizedElementNames = false, atomizedUnknownMsa = false;
-  int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too), 3 "chai" (a base's 30)
-  bool atomizedBackboneBonds = false, modifiedAsOneToken = false;
+  int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too), 3 "chai" (a base's 30), 4 "aatype" (2 on the restype alone)
+  int atomizedBackboneBonds = 0;                  // 0 none, 1 to every neighbour, 2 between two atomised residues alone
+  bool modifiedAsOneToken = false;
   // the alignment's rows (msa-features.js)
   std::vector<std::vector<int>> msa;
   std::vector<std::vector<float>> deletionMatrix;
@@ -178,6 +182,30 @@ inline Component withoutAtoms(const Component& l, const std::set<int>& drop) {
   }
   return out;
 }
+// AF3's own ligand rule (declared-leaving.js glycanO1Leaving): every glycan residue drops O1 unless O1 is a bond's end
+inline std::vector<Component> glycanO1Leaving(int chainCount, const std::vector<Component>& ligands, const FeaturiseOptions& o) {
+  std::vector<std::pair<int, int>> bonded;
+  for (auto& bond : o.bonds)
+    for (const BondEnd* e : {&bond.from, &bond.to})
+      if (e->hasAtom && e->atom == "O1") bonded.push_back({e->asym, e->residue});
+  std::vector<Component> out;
+  for (size_t k = 0; k < ligands.size(); ++k) {
+    const Component& l = ligands[k];
+    int asym = chainCount + (int)k;
+    std::vector<CompPart> parts = l.residues;
+    if (parts.empty()) parts.push_back({l.code, 0, (int)l.atoms.size(), l.glycan});
+    std::set<int> drop;
+    for (size_t p = 0; p < parts.size(); ++p) {
+      if (!parts[p].glycan) continue;
+      bool isBonded = false;
+      for (auto& [a, r] : bonded) if (a == asym && (parts.size() == 1 || r == (int)p + 1)) isBonded = true;
+      if (isBonded) continue;
+      for (int at = parts[p].from; at < parts[p].from + parts[p].count; ++at) if (l.atoms[at].name == "O1") drop.insert(at);
+    }
+    out.push_back(withoutAtoms(l, drop));
+  }
+  return out;
+}
 // -> the ligands without their leaving groups, and the (chain, index) of each chain-end residue whose terminal atom goes
 inline std::vector<Component> declaredBondLeaving(const std::vector<std::string>& chains, const std::vector<std::string>& kinds,
                                                   const FeaturiseOptions& o, std::set<std::pair<int, int>>& terminalDropped) {
@@ -243,7 +271,9 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   std::set<std::pair<int, int>> terminalDropped;
   const std::vector<Component> leftLigands = o.declaredBondLeavingAtoms ? declaredBondLeaving(chains, kinds, o, terminalDropped)
                                                                         : std::vector<Component>{};
-  const auto& ligands = o.declaredBondLeavingAtoms ? leftLigands : o.ligands;
+  // (and AF3's own rule after it: a glycan residue's O1 goes unless it is bonded)
+  const std::vector<Component> ligands = o.keepLigandLeavingAtoms ? (o.declaredBondLeavingAtoms ? leftLigands : o.ligands)
+                                                                  : glycanO1Leaving((int)chains.size(), o.declaredBondLeavingAtoms ? leftLigands : o.ligands, o);
   int ligandTokens = 0;
   for (auto& l : ligands) ligandTokens += (int)l.atoms.size();
   auto parentAatype = [&](const std::string& kind, char code) {
@@ -266,9 +296,16 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       r.kind = kinds[ci];
       r.modified = asked != modificationOf.end();
       const bool dropsTerminal = terminalDropped.count({ci, at}) > 0;
-      if (r.modified)
-        r.modification = polymerResidue(asked->second->component, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal
-                                        && !o.modifiedAsOneToken, protein ? "OXT" : "OP3");   // (boltz2: no terminal atom - featurise.js)
+      if (r.modified) {
+        // (openbind0, modifiedLeavingAtEnds: the CCD leaving atoms at the ends too, OXT or OP3/O3P where none is flagged)
+        Component source = asked->second->component;
+        bool flagged = false;
+        for (auto& a : source.atoms) flagged = flagged || a.leaving;
+        if (o.modifiedLeavingAtEnds && !flagged)
+          for (auto& a : source.atoms) a.leaving = protein ? a.name == "OXT" : a.name == "OP3" || a.name == "O3P";
+        r.modification = polymerResidue(source, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal
+                                        && !o.modifiedAsOneToken && !o.modifiedLeavingAtEnds, protein ? "OXT" : "OP3");   // (boltz2: no terminal atom - featurise.js)
+      }
       char parent = r.modified ? parentLetter(r.modification.parent, kinds[ci]) : 0;
       r.code = parent ? parent : chain[at];
       r.terminal = (o.terminalAtoms == 1 || (o.terminalAtoms == 2 && protein) || dropsTerminal) ? false
@@ -399,7 +436,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     b.modifiedSpans.push_back({token, (int)M.atoms.size(), M.code, residue, M.atoms, M.bonds, false});
     for (size_t atom = 0; atom < M.atoms.size(); ++atom) {
       const CompAtom& s = M.atoms[atom];
-      setToken(token, o.atomizedUnknownRestype == 2 || ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && R.kind == "protein") ? UNK_AATYPE
+      setToken(token, o.atomizedUnknownRestype == 2 || o.atomizedUnknownRestype == 4 || ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && R.kind == "protein") ? UNK_AATYPE
                       : o.atomizedUnknownRestype == 3 ? 30 : parentAatype(R.kind, R.code),
                number, asym, entity, sym, residue);
       int flat = token * DENSE;
@@ -578,8 +615,9 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
           for (auto& s : b.modifiedSpans) if (s.residue == r) return &s;
           return nullptr;
         };
-        if (nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) == nullptr) link(span.from - 1, span.from + nitrogen);
-        if (carbon >= 0 && sameChain(span.residue + 1)) {
+        const bool both = o.atomizedBackboneBonds == 2;
+        if (!both && nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) == nullptr) link(span.from - 1, span.from + nitrogen);
+        if (carbon >= 0 && sameChain(span.residue + 1) && (!both || spanOf(span.residue + 1) != nullptr)) {
           const ModifiedSpan* next = spanOf(span.residue + 1);
           int into = 0;
           if (next) {
@@ -605,7 +643,7 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   b.msaMask.assign((size_t)sequences * tokens, 1);
   b.deletionMatrix.assign((size_t)sequences * tokens, 0);
   std::vector<int> queryRow = b.aatype;
-  if ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3) && !o.atomizedUnknownMsa)
+  if ((o.atomizedUnknownRestype == 1 || o.atomizedUnknownRestype == 3 || o.atomizedUnknownRestype == 4) && !o.atomizedUnknownMsa)
     for (auto& span : b.modifiedSpans) {
       // (genuine Boltz-2's one-token residue reads the protein unknown in the query row: featurise.js)
       int parent = span.oneToken ? UNK_AATYPE : parentAatype(residues[span.residue].kind, residues[span.residue].code);
@@ -731,6 +769,24 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
         for (int t : ts) if (b.msa[base + t] != MSA_GAP) { gap = false; break; }
         if (gap) for (int t : ts) b.msa[base + t] = b.msa[t];
       }
+    }
+  }
+  // OpenBind-0's MSA has no DNA (featurise.js dnaGapMsa): a DNA chain gap in every row, DNA and ligand profiles zero
+  if (o.dnaGapMsa) {
+    auto dna = [&](int t) { return t < polymerTokens && b.residueOfToken[t] >= 0 && residues[b.residueOfToken[t]].kind == "dna"; };
+    bool otherPolymer = false;
+    for (int t = 0; t < tokens; ++t) {
+      if (t >= polymerTokens || dna(t)) {
+        std::fill(b.profile.begin() + (size_t)t * RESTYPES, b.profile.begin() + (size_t)(t + 1) * RESTYPES, 0.f);
+        if (dna(t)) b.deletionMean[t] = 0;
+      } else otherPolymer = true;
+    }
+    for (int row = 0; row < sequences; ++row)
+      for (int t = 0; t < polymerTokens; ++t)
+        if (dna(t)) { b.msa[(size_t)row * tokens + t] = MSA_GAP; b.deletionMatrix[(size_t)row * tokens + t] = 0; }
+    if (!otherPolymer && sequences > 1) {
+      sequences = 1; b.sequences = 1;
+      b.msa.resize(tokens); b.msaMask.resize(tokens); b.deletionMatrix.resize(tokens);
     }
   }
 

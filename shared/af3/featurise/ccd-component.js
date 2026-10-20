@@ -221,15 +221,20 @@ export function parseCcdComponent(text) {
   // modified_rna example puts 2'-O-methylguanosine on a C, and its tokens are G's.
   const named = text.match(/_chem_comp\.mon_nstd_parent_comp_id\s+(\S+)/)?.[1]?.replace(/['"]/g, "");
   const parent = named === undefined || named === "?" || named === "." ? null : named.split(",")[0].toUpperCase();
-  return { code, atoms, bonds, parent };
+  // 🔴 A GLYCAN IS WHAT THE DICTIONARY'S TYPE SAYS IT IS: AF3's chemical_component_sets_gen.py calls a component a
+  // glycan when `_chem_comp.type` has the word "saccharide" in it ("D-saccharide, beta linking"), and drops such a
+  // ligand residue's O1 unless O1 is itself bonded (glycanO1Leaving). The value is usually QUOTED, with a comma in it.
+  const type = text.match(/_chem_comp\.type\s+(?:"([^"]*)"|'([^']*)'|(\S+))/);
+  const glycan = type !== null && /\bsaccharide\b/.test((type[1] ?? type[2] ?? type[3]).toLowerCase());
+  return { code, atoms, bonds, parent, glycan };
 }
 
 /**
  * Several components as ONE ligand chain - a glycan written as AlphaFold 3's
  * `ccdCodes: ["NAG", "NAG", "BMA", "MAN", "MAN"]`. AF3 makes each component a
  * residue of one chain: its atoms are tokens numbered by component (residue
- * 1..5), each component its own reference conformer, every heavy atom kept (no
- * leaving atom is dropped for a ligand, bonded or not), its own bonds inside it,
+ * 1..5), each component its own reference conformer, every heavy atom kept but
+ * a glycan's O1 (glycanO1Leaving, in featurise), its own bonds inside it,
  * and the links between components left to the job's bondedAtomPairs.
  *
  * @returns the parseCcdComponent shape, plus `residues: {code, from, count}[]`
@@ -241,7 +246,7 @@ export function ligandChain(components) {
   const residues = [];
   for (const component of components) {
     const from = atoms.length;
-    residues.push({ code: component.code, from, count: component.atoms.length });
+    residues.push({ code: component.code, from, count: component.atoms.length, glycan: component.glycan === true });
     atoms.push(...component.atoms);
     for (const bond of component.bonds) bonds.push({ ...bond, from: bond.from + from, to: bond.to + from });
   }

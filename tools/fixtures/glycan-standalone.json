@@ -1,0 +1,12 @@
+{
+  "name": "glycan_standalone",
+  "modelSeeds": [1],
+  "sequences": [
+    {"protein": {"id": "A", "sequence": "GSHMKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"}},
+    {"ligand": {"id": "B", "ccdCodes": ["NAG"]}},
+    {"ligand": {"id": "C", "ccdCodes": ["NAG", "BMA"]}}
+  ],
+  "bondedAtomPairs": [[["C", 1, "O4"], ["C", 2, "C1"]]],
+  "dialect": "alphafold3",
+  "version": 2
+}

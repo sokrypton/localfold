@@ -148,6 +148,8 @@ export function featuriseForEsmfold2(input, options = {}) {
     // tokens are bonded. The fold barely moves on it; the feature matching is
     // the point.
     atomizedBackboneBonds: true,
+    // a glycan keeps its O1: esm's prepare_input drops nothing from an unbonded glycan (af3-any-model's esm spec)
+    keepLigandLeavingAtoms: true,
   });
   const tokens = batch.tokens;
   const dense = batch.dense;

@@ -153,3 +153,4 @@ metal/build/
 metal/*/localfold-*
 metal/**/*.combined
 .localfold-fetch.lock
+oracle-dumps-colab/

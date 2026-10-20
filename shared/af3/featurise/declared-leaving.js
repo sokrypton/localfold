@@ -2,7 +2,7 @@
  * The leaving groups protenix and OpenDDE drop at each DECLARED bond, before tokenising (af3-any-model b61bd1d,
  * structure_cleaning.declared_bond_leaving_atoms, as protenix's remove_leaving_atoms): at each atom a declared bond
  * forms on, the CCD's leaving-flagged heavy atoms bonded to it - each start atom's connected leaving group, in CCD
- * order, one group per bond declared at that atom. AlphaFold 3's rule keeps every atom of a ligand, bonded or not.
+ * order, one group per bond declared at that atom. AlphaFold 3's own rule is narrower: a glycan's O1 (glycanO1Leaving).
  *
  * What it reaches here: a LIGAND's atoms (a glycan's O1 at each glycosidic C1), and the leaving atom a chain END
  * keeps - a protein's C-terminal OXT when the bond is at its C (a head-to-tail cyclic peptide), a nucleotide's 5' OP3
@@ -111,4 +111,38 @@ export function declaredBondLeaving(chains, chainKinds, modifications, ligands, 
     if (drops) terminalDropped.add(`${asym}:${at}`);
   }
   return { ligands: ligands.map((ligand, k) => withoutAtoms(ligand, dropOf[k])), terminalDropped };
+}
+
+/**
+ * AlphaFold 3's own leaving-atom rule for a ligand (structure_cleaning.clean_structure, filter_leaving_atoms with
+ * only_glycan_ligands_for_leaving_atoms, atom_layout.get_link_drop_atoms): every GLYCAN residue of a ligand chain
+ * loses its O1 unless O1 is itself an end of a declared bond - standalone glycans included, the regime AF3 was trained
+ * in (run_alphafold.py's --fix_standalone_glycans defaults off). Every family on AF3's pipeline applies it but the
+ * three that keep a ligand whole (boltz2, intellifold2, chai1: `keepLigandLeavingAtoms`).
+ *
+ * 🔴 THIS FILE USED TO SAY "AlphaFold 3's RULE KEEPS EVERY ATOM OF A LIGAND", AND THAT WAS THE ORACLE'S CCD: the
+ * reference featurised with a dictionary whose NAG carried no leaving flag, so its glycan kept O1 and so did this
+ * port, exact against it. Given the full CCD AF3 drops all five O1s of the RNase B glycan, 190 tokens to 185.
+ *
+ * @param chainCount the polymer chains (a bond end's asym past them names a ligand)
+ */
+export function glycanO1Leaving(chainCount, ligands, bonds) {
+  const bonded = new Set();
+  for (const bond of bonds ?? []) {
+    for (const end of [bond.from, bond.to]) if (end.atom === "O1") bonded.add(`${end.asym}\u0000${end.residue}`);
+  }
+  return ligands.map((ligand, k) => {
+    const asym = chainCount + k;
+    const parts = ligand.residues ?? [{ from: 0, count: ligand.atoms.length, glycan: ligand.glycan === true }];
+    const drop = new Set();
+    parts.forEach((part, p) => {
+      if (part.glycan !== true) return;
+      // (one component answers to any residue number, as declaredBondLeaving reads it)
+      const isBonded = parts.length === 1
+        ? [...bonded].some((key) => key.startsWith(`${asym}\u0000`)) : bonded.has(`${asym}\u0000${p + 1}`);
+      if (isBonded) return;
+      for (let a = part.from; a < part.from + part.count; a += 1) if (ligand.atoms[a].name === "O1") drop.add(a);
+    });
+    return withoutAtoms(ligand, drop);
+  });
 }

@@ -88,6 +88,10 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     ...(options.translateConformers === true ? { translateConformers: true, conformerSeed: options.seed ?? 0 } : {}),
     ...(options.declaredBondLeavingAtoms === undefined
       ? {} : { declaredBondLeavingAtoms: options.declaredBondLeavingAtoms }),
+    ...(options.keepLigandLeavingAtoms === undefined
+      ? {} : { keepLigandLeavingAtoms: options.keepLigandLeavingAtoms }),
+    ...(options.dnaGapMsa === undefined ? {} : { dnaGapMsa: options.dnaGapMsa }),
+    ...(options.modifiedLeavingAtEnds === undefined ? {} : { modifiedLeavingAtEnds: options.modifiedLeavingAtEnds }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

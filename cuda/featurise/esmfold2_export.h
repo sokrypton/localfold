@@ -72,7 +72,8 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
   // featuriseForEsmfold2: AF3's featuriser with no terminal atoms, symmetric bonds and an atomised residue bonded in
   o.terminalAtoms = 1;
   o.symmetriseBonds = true;
-  o.atomizedBackboneBonds = true;
+  o.keepLigandLeavingAtoms = true;   // (featuriseForEsmfold2: an unbonded glycan keeps its O1)
+  o.atomizedBackboneBonds = 1;
   o.hasUnpairedFrom = false;
   Batch b = featuriseProtein(sequence, o);
   const int T = b.tokens, dense = b.dense, CLASSES = 33, UNKNOWN = 22;

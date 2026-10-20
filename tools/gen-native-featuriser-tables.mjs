@@ -67,8 +67,8 @@ for (const [name, d] of Object.entries(DIALECTS)) {
   const dedupe = f.dedupeSelfMsa === undefined ? -1 : f.dedupeSelfMsa ? 1 : 0;
   const fused = d.fusedTemplateLayout ?? null;
   lines.push(`    {${str(name)}, ${bool(f.symmetriseBonds)}, ${bool(f.centreRefConformers)}, ${bool(f.paddedAtomKeys)},`
-    + ` ${bool(f.qblockAtomKeys)}, ${drop}, ${dedupe}, ${bool(f.atomizedElementNames)}, ${f.atomizedUnknownRestype === "nucleic" ? 2 : f.atomizedUnknownRestype === "chai" ? 3 : f.atomizedUnknownRestype === true ? 1 : 0},`
-    + ` ${bool(f.atomizedUnknownMsa)}, ${bool(f.atomizedBackboneBonds)}, ${bool(f.modifiedAsOneToken)}, ${bool(f.chaiMsaFeatures)},`
+    + ` ${bool(f.qblockAtomKeys)}, ${drop}, ${dedupe}, ${bool(f.atomizedElementNames)}, ${f.atomizedUnknownRestype === "nucleic" ? 2 : f.atomizedUnknownRestype === "chai" ? 3 : f.atomizedUnknownRestype === "aatype" ? 4 : f.atomizedUnknownRestype === true ? 1 : 0},`
+    + ` ${bool(f.atomizedUnknownMsa)}, ${f.atomizedBackboneBonds === "both" ? 2 : f.atomizedBackboneBonds === true ? 1 : 0}, ${bool(f.modifiedAsOneToken)}, ${bool(f.chaiMsaFeatures)},`
     + ` ${fused ? fused.distogramBins : 0}, ${fused ? fused.restypes : 0}, ${bool(d.boltz2TemplateFeatures)},`
     + ` ${bool(d.rosettafold3TemplateFeatures)}, ${bool(d.templateFeatureMeanOnePass)}, ${d.emptyTemplateAatype ?? -1},`
     + ` ${bool(d.templateVisibilityByCoverage)}, ${bool(d.chaiTemplates)}, ${bool(d.templateStackOuterResidual)},`
@@ -76,7 +76,7 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
     + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
     + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}, ${bool(d.templateGapWhereNoAtoms)},`
-    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}},`);
+    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}, ${bool(f.keepLigandLeavingAtoms)}, ${bool(f.dnaGapMsa)}, ${bool(f.modifiedLeavingAtEnds)}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");

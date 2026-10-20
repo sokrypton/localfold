@@ -18,7 +18,8 @@ struct FamilyFlags {
   int dropTerminalAtoms;            // 0 keep, 1 drop (terminalAtoms: false), 2 the protein's only ("nucleic")
   int dedupeSelfMsa;                // -1 undefined, 0 false (duplicate the query row), 1 true
   bool atomizedElementNames; int atomizedUnknownRestype;   // 0 false, 1 true (an amino acid's), 2 "nucleic" (a base's too), 3 "chai" (a base's 30)
-  bool atomizedUnknownMsa, atomizedBackboneBonds;
+  bool atomizedUnknownMsa;
+  int atomizedBackboneBonds;        // 0 none, 1 to every neighbour (rf3), 2 "both": between two atomised residues alone (openbind0)
   bool modifiedAsOneToken, chaiMsaFeatures;
   int fusedDistogramBins, fusedRestypes;   // fusedTemplateLayout, 0 when absent
   bool boltz2TemplateFeatures, rosettafold3TemplateFeatures, templateFeatureMeanOnePass;
@@ -37,6 +38,9 @@ struct FamilyFlags {
   bool nativeNonproteinMsa;         // opendde, protenix: a ligand UNK in the MSA, a nucleic chain's gap rows its query
   bool translateConformers;         // opendde, protenix: each centred conformer moved by U(-1, 1) per axis (the fold's seed)
   bool declaredBondLeavingAtoms;    // opendde, protenix: the CCD leaving group at each declared bond dropped (declaredBondLeaving)
+  bool keepLigandLeavingAtoms;      // boltz2, intellifold2, chai1: a ligand's glycan keeps its O1 (glycanO1Leaving)
+  bool dnaGapMsa;                   // openbind0: a DNA chain gap in every MSA row, DNA and ligand profiles zero
+  bool modifiedLeavingAtEnds;       // openbind0: a modified residue's CCD leaving atoms at the chain ends too
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

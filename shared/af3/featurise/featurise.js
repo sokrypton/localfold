@@ -45,7 +45,7 @@ import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
 import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
 import { uniformFrom } from "../random.js";
-import { declaredBondLeaving } from "./declared-leaving.js";
+import { declaredBondLeaving, glycanO1Leaving } from "./declared-leaving.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
@@ -250,7 +250,9 @@ export function featuriseProtein(sequence, options = {}) {
     ? declaredBondLeaving(chains, chains.map((_, k) => options.chainKinds?.[k] ?? "protein"), options.modifications,
       options.ligands ?? [], options.bonds)
     : null;
-  const ligands = leaving?.ligands ?? options.ligands ?? [];
+  // (and AF3's own rule after it: a glycan residue's O1 goes unless it is bonded - glycanO1Leaving)
+  const ligands = options.keepLigandLeavingAtoms === true ? leaving?.ligands ?? options.ligands ?? []
+    : glycanO1Leaving(chains.length, leaving?.ligands ?? options.ligands ?? [], options.bonds);
   const ligandTokens = ligands.reduce((sum, ligand) => sum + ligand.atoms.length, 0);
 
   // 🔴 A MODIFIED RESIDUE IS ONE TOKEN PER HEAVY ATOM, LIKE A LIGAND, BUT IT
@@ -296,9 +298,15 @@ export function featuriseProtein(sequence, options = {}) {
       const dropsTerminal = leaving?.terminalDropped.has(`${chainIndex}:${at}`) === true;
       // (boltz2's one-token residue keeps no terminal atom either: genuine Boltz-2 drops every leaving atom of a modified
       // residue, so a 5' 2-methylguanosine is 24 atoms and fits its token, where keeping the OP3 cost the base's C4)
+      // (OpenBind-0, `modifiedLeavingAtEnds`: of3 drops a non-standard residue's CCD leaving atoms wherever it sits,
+      // ends included - a 5' 2-methylguanosine loses its OP3 - and a component flagging none loses OXT, or OP3/O3P)
+      const atEnds = options.modifiedLeavingAtEnds === true;
+      const source = asked === null || !atEnds || asked.atoms.some((atom) => atom.leaving) ? asked
+        : { ...asked, atoms: asked.atoms.map((atom) => ({ ...atom,
+          leaving: protein ? atom.name === "OXT" : atom.name === "OP3" || atom.name === "O3P" })) };
       const modification = asked === null ? null
-        : polymerResidue(asked, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
-          && options.modifiedAsOneToken !== true, protein ? "OXT" : "OP3");
+        : polymerResidue(source, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
+          && options.modifiedAsOneToken !== true && !atEnds, protein ? "OXT" : "OP3");
       residues.push({
         // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
         code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
@@ -593,7 +601,9 @@ export function featuriseProtein(sequence, options = {}) {
       // (true is for an atomised AMINO ACID alone; rf3's "nucleic" takes a modified base's atom tokens
       // too - native atomworks reads a 5CM's twenty as 20, where af3-any-model once kept DC, 28: 0464f71)
       // ("chai": an amino acid's 20, a nucleotide's the unknown nucleotide, 30 - chai-lab's DX/RX)
-      aatype[token] = options.atomizedUnknownRestype === "nucleic"
+      // ("aatype": OpenBind-0's - the unknown amino acid on every atomised token, a base's too, and the alignment keeps
+      // the sequence letter: of3 sets UNK on restype alone)
+      aatype[token] = options.atomizedUnknownRestype === "nucleic" || options.atomizedUnknownRestype === "aatype"
         || ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai") && kind === "protein")
         ? UNK_AATYPE : options.atomizedUnknownRestype === "chai" ? UNKNOWN_NUCLEOTIDE : parentAatype(kind, code);
       residueIndex[token] = number;
@@ -904,7 +914,9 @@ export function featuriseProtein(sequence, options = {}) {
         bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
       }
     }
-    if (options.atomizedBackboneBonds === true) {
+    // ("both": OpenBind-0's - of3's filter_fully_atomized_bonds keeps a link only between two atomised residues)
+    if (options.atomizedBackboneBonds === true || options.atomizedBackboneBonds === "both") {
+      const both = options.atomizedBackboneBonds === "both";
       for (const span of modifiedSpans) {
         // The span's own N and C, by name - the atom ORDER is the component's
         // and is not something to count on.
@@ -935,10 +947,10 @@ export function featuriseProtein(sequence, options = {}) {
         // skipped, and a forward link into an atomised residue lands on its own P (or N). AF3's
         // kitchen-sink DNA, 6OG at 1 and 6MA at 2, against rf3's batch: 67-70 both ways, not 69-70.
         const spanOf = (residue) => modifiedSpans.find((other) => other.residue === residue);
-        if (nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) === undefined) {
+        if (!both && nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) === undefined) {
           link(span.from - 1, span.from + nitrogen);
         }
-        if (carbon >= 0 && sameChain(span.residue + 1)) {
+        if (carbon >= 0 && sameChain(span.residue + 1) && (!both || spanOf(span.residue + 1) !== undefined)) {
           const next = spanOf(span.residue + 1);
           const into = next === undefined ? 0
             : next.atoms.findIndex((atom) => atom.name === (nucleic ? "P" : "N"));
@@ -1007,8 +1019,8 @@ export function featuriseProtein(sequence, options = {}) {
   //     rosettafold3 20 20 20 ...   aatype 20
   // So the alignment keeps the PARENT residue for everyone but rf3, whose
   // atomised token is unknown wherever it appears.
-  if ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai")
-      && options.atomizedUnknownMsa !== true) {
+  if ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai"
+       || options.atomizedUnknownRestype === "aatype") && options.atomizedUnknownMsa !== true) {
     for (const span of modifiedSpans) {
       // (genuine Boltz-2's one-token residue reads the protein unknown in the alignment's query row - its residue
       // record's type, which its featuriser writes over the query's letter - so its profile is UNK's one-hot)
@@ -1211,6 +1223,32 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
+  // 🔴 OpenBind-0's MSA HAS NO DNA (`dnaGapMsa`, af3-any-model's _dna_gap_msa): OpenFold3's alignment server adds query
+  // rows for protein and RNA only, so a DNA chain reads GAP in every row - the query's included - with a zero profile
+  // and deletion mean, and a LIGAND's profile is zero too where AF3 writes the gap's one-hot. A job with no protein
+  // or RNA is left with the one dummy row.
+  if (options.dnaGapMsa === true) {
+    const dna = (token) => token < polymerTokens && residueOfToken[token] >= 0
+      && residues[residueOfToken[token]].kind === "dna";
+    let otherPolymer = false;
+    for (let token = 0; token < tokens; token += 1) {
+      if (token >= polymerTokens || dna(token)) {
+        profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+        if (dna(token)) deletionMean[token] = 0;
+      } else otherPolymer = true;
+    }
+    for (let row = 0; row < sequences; row += 1) {
+      for (let token = 0; token < polymerTokens; token += 1) {
+        if (!dna(token)) continue;
+        msa[row * tokens + token] = MSA_GAP;
+        deletionMatrix[row * tokens + token] = 0;
+      }
+    }
+    if (!otherPolymer && sequences > 1) {
+      sequences = 1;
+      msa = msa.slice(0, tokens); msaMask = msaMask.slice(0, tokens); deletionMatrix = deletionMatrix.slice(0, tokens);
+    }
+  }
   // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME
   // NAME, once `atomizedElementNames` is on. rf3 renames every atomised atom to
   // its element symbol, which is right for the FEATURE and wrong for the FILE:

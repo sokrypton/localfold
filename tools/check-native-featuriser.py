@@ -130,6 +130,17 @@ def cases():
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),
         ("msa-test", "af3", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m"], AF3_FAMILIES),
+        # (modified nucleotides at a chain's 5' end and side by side - openbind0 drops their leaving atoms at the ends
+        # too and links only two atomised residues - and a standalone glycan, whose O1 AF3's rule drops)
+        ("modified-ends", "af3", job("t", [protein("A", "MKTAYIAKQR"),
+                                           {"dna": {"id": "B", "sequence": "GACTGA", "modifications": [
+                                               {"modificationType": "6OG", "basePosition": 1},
+                                               {"modificationType": "6MA", "basePosition": 2}]}},
+                                           {"rna": {"id": "C", "sequence": "GACUGA", "modifications": [
+                                               {"modificationType": "2MG", "basePosition": 1}]}}]), [], AF3_FAMILIES),
+        ("glycan-standalone", "af3", job("t", [protein("A", "MKTAYIAKQR"), {"ligand": {"id": "B", "ccdCodes": ["NAG"]}},
+                                               {"ligand": {"id": "C", "ccdCodes": ["NAG", "BMA"]}}],
+                                         bondedAtomPairs=[[["C", 1, "O4"], ["C", 2, "C1"]]]), [], AF3_FAMILIES),
     ]
     caj, brs_a, brs_d = chain_sequence("5caj", "A"), chain_sequence("1brs", "A"), chain_sequence("1brs", "D")
     out += [
