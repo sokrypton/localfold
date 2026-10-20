@@ -13,11 +13,15 @@
  * the colab port fetches it - and handed in as text. `STEREO_URL` is where.
  *
  * 🔴 AND THE LIGAND HALF (Tier 2: RDKit bounds, chiral centres, stereo bonds,
- * planar double bonds) IS NOT HERE YET. The vendor builds it from Boltz-1's CCD
- * pickle of RDKit molecules - a 346 MB file of Python objects - with RDKit's
- * bounds matrix and CIP ranks. `ligandTables` is the seam; without it a fold
- * with a ligand steers its polymers only, and says so.
+ * planar double bonds) IS AN APPROXIMATION. The vendor builds it from Boltz-1's
+ * CCD pickle of RDKit molecules - a 346 MB file of Python objects - with RDKit's
+ * bounds matrix and CIP ranks; ligand-tables.js builds the same tables from the
+ * CCD's own ideal conformer and stereo labels (its header says how, and
+ * tools/check-bioemu2-ligand-tables.js how far that lands from the vendor's).
+ * `options.ligandTables` overrides it, as the colab port's harness hands over
+ * the vendor's own.
  */
+import { ligandTables as tier2FromCcd } from "./ligand-tables.js";
 import { BioEmu2Graph, PROTEIN, DNA, RNA, NUCLEIC_TO_CCD, TOKEN_NAMES, CANONICAL_PROTEIN } from "./graph.js";
 
 export const STEREO_COMMIT = "7846769";
@@ -190,10 +194,13 @@ function polymerStericEligible(g, topology) {
  * @param {object} topology featuriseBioemu2's
  * @param {object} stereo parseStereoTables(the fetched yaml)
  * @param {{asymId: Int32Array, entityId: Int32Array}} tokens the token features
- * @param {{sigmaTolerance?: number, ligandTables?: object}} options
+ * @param {{sigmaTolerance?: number, ligandTables?: object, ccd?: (code: string) => string}} options
+ *   `ccd` (a component's mmCIF text) builds Tier 2 for the CCD-coded ligands; without it they steer as polymers do
  */
 export function steeringTables(topology, stereo, tokens, options = {}) {
-  const { sigmaTolerance = 10.0, ligandTables = null } = options;
+  const { sigmaTolerance = 10.0, ccd = null } = options;
+  const ligandTables = options.ligandTables
+    ?? (ccd && Object.keys(topology.ligandCcd).length ? tier2FromCcd(topology, ccd) : null);
   const n = topology.names.length;
   const nPad = topology.nPad;
   const g = new BioEmu2Graph(topology);

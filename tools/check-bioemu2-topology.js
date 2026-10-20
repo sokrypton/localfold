@@ -34,7 +34,7 @@ const flat = (x) => (Array.isArray(x) ? x.flatMap((v) => (typeof v === "object" 
   : Array.from(x, Number));
 
 export function compareTopology(dumpPath, jobPath, featuresDump, stereoPath) {
-  const dump = JSON.parse(readFileSync(dumpPath, "utf8"));
+  const dump = JSON.parse(readFileSync(dumpPath, "utf8").replace(/\bNaN\b/g, "null"));
   const job = bioemu2JobFromAf3Json(JSON.parse(readFileSync(jobPath, "utf8")));
   const smiles = featuresDump ? smilesTemplatesOf(readBioemu2Dump(featuresDump).stages) : {};
   const ours = featuriseBioemu2(job, { ccd, smilesTemplates: smiles });
