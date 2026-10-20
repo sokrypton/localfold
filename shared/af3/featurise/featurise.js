@@ -346,8 +346,12 @@ export function featuriseProtein(sequence, options = {}) {
       if (source !== null && !protein && options.modifiedNucleotideKeepsOp3 === true) {
         source = { ...source, atoms: source.atoms.map((atom) => (atom.name === "OP3" ? { ...atom, leaving: false } : atom)) };
       }
+      // (ESMFold2, `modifiedTerminalLast`: esm's prepare_input keeps a modified residue's leaving atoms only where it ENDS
+      // the chain, a nucleotide's too - a 5' 2-methylguanosine loses its OP3)
+      const endsHere = options.modifiedTerminalLast === true ? at === chain.length - 1
+        : protein ? at === chain.length - 1 : at === 0;
       const modification = asked === null ? null
-        : polymerResidue(source, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
+        : polymerResidue(source, endsHere && !dropsTerminal
           && options.modifiedAsOneToken !== true && !atEnds, protein ? "OXT" : "OP3");
       if (modification !== null && asked.standard === true) modification.standard = true;
       residues.push({

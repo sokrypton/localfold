@@ -55,6 +55,7 @@ struct FeaturiseOptions {
   bool ligandMsaUnk = false;                      // boltz2: a ligand token's MSA query row the protein UNK, not the gap
   bool proteinOnlyMsa = false, zeroDeletions = false, profileOverAllRows = false;   // boltz2 (rf3: the first): featurise.js
   bool atomizeLigandBonded = false, declaredBondCharge = false;   // rosettafold3 (atomworks): featurise.js
+  bool modifiedTerminalLast = false;              // esmfold2: a modified residue keeps its leaving atoms only as the chain's last
   int terminalAtoms = 0;                         // 0 the AF3 rule, 1 none (false), 2 a nucleotide's only ("nucleic")
   bool duplicateQueryRow = false, msaCoversNucleic = false;
   bool queryOnce = false;                         // dedupeSelfMsa true: an MSA that is all the query, one row (featurise.js)
@@ -377,7 +378,8 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
           for (auto& a : source.atoms) a.leaving = protein ? a.name == "OXT" : a.name == "OP3" || a.name == "O3P";
         if (!protein && o.modifiedNucleotideKeepsOp3)   // (intellifold2, chai1: a modified nucleotide keeps its OP3)
           for (auto& a : source.atoms) if (a.name == "OP3") a.leaving = false;
-        r.modification = polymerResidue(source, (protein ? at == (int)chain.size() - 1 : at == 0) && !dropsTerminal
+        const bool endsHere = o.modifiedTerminalLast ? at == (int)chain.size() - 1 : (protein ? at == (int)chain.size() - 1 : at == 0);
+        r.modification = polymerResidue(source, endsHere && !dropsTerminal
                                         && !o.modifiedAsOneToken && !o.modifiedLeavingAtEnds, protein ? "OXT" : "OP3");   // (boltz2: no terminal atom - featurise.js)
       }
       char parent = r.modified ? parentLetter(r.modification.parent, kinds[ci]) : 0;

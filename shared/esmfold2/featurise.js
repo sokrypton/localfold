@@ -150,6 +150,10 @@ export function featuriseForEsmfold2(input, options = {}) {
     atomizedBackboneBonds: true,
     // a glycan keeps its O1: esm's prepare_input drops nothing from an unbonded glycan (af3-any-model's esm spec)
     keepLigandLeavingAtoms: true,
+    // ...and the leaving group at a declared bond goes (esm's prepare_input, af3-any-model's ccd_leaving_atoms: a
+    // glycan's O1 at its glycosidic C1 - 77 tokens to 78 on tools/fixtures/glycan-standalone.json)
+    declaredBondLeavingAtoms: true,
+    modifiedTerminalLast: true,
   });
   const tokens = batch.tokens;
   const dense = batch.dense;

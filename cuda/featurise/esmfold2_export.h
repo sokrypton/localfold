@@ -73,6 +73,8 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
   o.terminalAtoms = 1;
   o.symmetriseBonds = true;
   o.keepLigandLeavingAtoms = true;   // (featuriseForEsmfold2: an unbonded glycan keeps its O1)
+  o.declaredBondLeavingAtoms = true; // (...and the leaving group at a declared bond goes)
+  o.modifiedTerminalLast = true;     // (a modified residue's leaving atoms kept only as the chain's last)
   o.atomizedBackboneBonds = 1;
   o.hasUnpairedFrom = false;
   Batch b = featuriseProtein(sequence, o);
