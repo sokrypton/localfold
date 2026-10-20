@@ -217,6 +217,11 @@ const FIELDS = {
   ref_atom_name_chars: (b) => b.refAtomNameChars,
   ref_space_uid: (b) => b.refSpaceUid,
   ref_pos: (b) => b.refPos,
+  // boltz2's self-bond on a one-token modified residue: its bond type + 1 on the diagonal, 0 elsewhere
+  self_bond_type: (b) => Array.from({ length: b.tokens }, (_, t) => (b.bondMatrix?.[t * b.tokens + t]
+    ? (b.bondOrderMatrix[t * b.tokens + t] | 0) + 1 : 0)),
+  // chai1's per-row database (applyChaiMsa): 2 UNIREF90, 0 BFD_UNICLUST, by the a3m header
+  msa_source: (b) => b.msaSource ?? Int32Array.from({ length: b.sequences }, (_, row) => (row === 0 ? 4 : 2)),
   pred_dense_atom_mask: (b) => b.predDenseAtomMask,
   // chai1's declared-bond feature (absent on our side with no bond declared: all zeros) - compared as a DIRECTED
   // edge set below, the reference's matrix being padded to its token bucket
@@ -246,6 +251,10 @@ const ABSENT = {
   chiral_angles: "gated in check-atom-windows.js",
   chiral_centers: "gated in check-atom-windows.js",
   ligand_ligand_bond_order: "compared beside the bond gathers, as an ORDER per pair",
+  // protenix2's: native's own RNG replayed for one seed (MC dropout, each pass's MSA rows) - a draw, not a feature
+  px_drop_offset: "protenix's RNG replay (af3-any-model _native_rng): sampling, not featurisation",
+  px_msa_rows: "as px_drop_offset",
+  msa_paired: "compared on its own, below: row 0 against msaPairedQueryRow",
   template_aatype: "the template slot is built by buildTemplate, not featurise",
   template_atom_mask: "as template_aatype",
   template_atom_positions: "as template_aatype",
@@ -532,7 +541,8 @@ for (const target of Object.keys(TARGETS)) {
     if (batch.bondMatrix !== undefined) {
       for (let i = 0; i < batch.tokens; i += 1) {
         for (let j = 0; j < batch.tokens; j += 1) {
-          if (batch.bondMatrix[i * batch.tokens + j]) ours.add(`${i}-${j}`);
+          // (a self-bond is boltz2's self_bond_type, compared as its own field: the gathers never hold one)
+          if (batch.bondMatrix[i * batch.tokens + j] && i !== j) ours.add(`${i}-${j}`);
         }
       }
     }
@@ -610,6 +620,20 @@ for (const target of Object.keys(TARGETS)) {
 
   const unmapped = Object.keys(dump.inputs)
     .filter((k) => !seen.has(k) && ABSENT[k] === undefined);
+  // 🔴 THE is_paired COLUMN (boltz2 and rf3 read it; intellifold2's network does not): the query row is paired for
+  // boltz2 always and for rf3 once an alignment adds a row - what msaPairedQueryRow(Aligned) gives the embedders. A
+  // reference row past the query that is paired is a cross-chain pairing flag this port does not carry: reported.
+  if (dump.inputs.msa_paired !== undefined && ["boltz2", "rosettafold3"].includes(model)) {
+    const paired = flat(dump.inputs.msa_paired).map(Number);
+    const width = dump.inputs.msa_paired.shape[1];
+    const row0 = paired.slice(0, width);
+    const want = dialect.msaPairedQueryRow === true
+      || (dialect.msaPairedQueryRowAligned === true && batch.sequences > 1) ? 1 : 0;
+    const off = row0.filter((v) => v !== want).length;
+    if (off > 0) bad.push(`msa_paired: query row ${off}/${width} not ${want}`);
+    const later = paired.slice(width).some((v) => v !== 0);
+    if (later) bad.push("msa_paired: rows past the query are paired (cross-chain pairing, not carried)");
+  }
   if (unmapped.length > 0) bad.push(`UNMAPPED: ${unmapped.join(" ")}`);
 
   const status = bad.length === 0

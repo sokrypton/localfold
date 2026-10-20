@@ -53,7 +53,9 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       // (protenix and OpenDDE: each protein chain's paired rows in its unpaired MSA, deduplicated - pairedIntoUnpaired)
       ...(options.protenixUnpairedMsa === true ? { protenixUnpairedMsa: true } : {}),
       ...(options.rf3ProfileMsa === true ? { rf3ProfileMsa: true } : {}),
-      ...((options.mainMsaCap ?? null) === null && options.protenixUnpairedMsa !== true && options.rf3ProfileMsa !== true ? {} : {
+      ...(options.if2ProfileMsa === true ? { if2ProfileMsa: true } : {}),
+      ...((options.mainMsaCap ?? null) === null && options.protenixUnpairedMsa !== true && options.rf3ProfileMsa !== true
+          && options.if2ProfileMsa !== true ? {} : {
         chainOfColumn: sequence.split(":").flatMap((chain, index) => Array(chain.length).fill(index)),
       }),
       // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a

@@ -239,7 +239,9 @@ export function embed(input, weights) {
   }
   const features = msaFeatures(input.msaRows, input.deletionMatrix, sequences, tokens,
                                msaFeatureWidth,
-                               weights.dialect?.msaPairedQueryRow === true);
+                               weights.dialect?.msaPairedQueryRow === true
+                               // (rf3: once an alignment adds a row - atomworks' residue_is_paired on the query row)
+                               || (weights.dialect?.msaPairedQueryRowAligned === true && sequences > 1));
   const msa = linear(features, rows, msaFeatureWidth, msaChannels, weights.msaActivations);
   // boltz2's DN row: Boltz's DNA unknown, added where a DNA column reads class 30 (af3-any-model's boltz2_dn_msa)
   if (weights.boltz2DnMsa != null) {

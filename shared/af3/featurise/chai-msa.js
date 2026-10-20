@@ -18,7 +18,7 @@
  */
 
 const PROTEIN = "ARNDCQEGHILKMFPSTWYV";
-const GAP = 21, MASKED = 31;
+const GAP = 21, MASKED = 31, UNK = 20;
 
 /** chai's a3m tokeniser over one row: capitals and '-' are columns (another capital is X, 20), a lower-case letter is a
  * deletion counted before the next column (capped at 255), anything else is skipped */
@@ -80,6 +80,31 @@ function chainRows(texts, offsets, lengths, chain) {
   return out;
 }
 
+/** an A3M's records with their headers: [{header, row}] (records' rule, the header kept) */
+function headedRecords(text) {
+  const out = [];
+  let current = null;
+  for (const raw of (text ?? "").split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith(">")) { if (current !== null) out.push(current); current = { header: line.slice(1), row: "" }; continue; }
+    if (current === null) current = { header: "", row: "" };
+    current.row += line;
+  }
+  if (current !== null) out.push(current);
+  return out.filter((one) => one.row.length > 0);
+}
+
+/** chain `chain`'s (1-based) own header out of a merged one: `chain_1+2|desc`, `1:desc 2:desc`, or the header itself */
+function chainHeader(header, chain) {
+  const block = header.match(/^chain_[\d+]+\|(.*)$/);
+  if (block !== null) return block[1];
+  if (/^\d+:/.test(header)) {
+    const part = header.split(/ (?=\d+:)/).find((one) => one.startsWith(`${chain}:`));
+    return part === undefined ? "" : part.slice(`${chain}:`.length);
+  }
+  return header;
+}
+
 /** each column-bearing chain's first column and length, in column order */
 function layout(chains, columnChains) {
   const offsets = [], lengths = [];
@@ -106,6 +131,39 @@ export function applyChaiMsa(batch, chains, texts, coversNucleic) {
     return rowsOf[index].some((row) => row.tokens.join(",") !== query);
   });
   if (!homologs.some(Boolean)) return false;
+  // 🔴 EACH ROW'S DATABASE (chai's MSADataSource, af3-any-model's msa_source): chai's colabfold reader calls a row
+  // UNIREF90 (2) when its header starts `UniRef` and BFD_UNICLUST (0) otherwise - a ColabFold search's environmental
+  // rows are the second kind. Matched to the batch's rows by their residues on each chain's columns, the a3m's first
+  // occurrence winning; the query row is the model's own (4), and a row nothing matches stays UNIREF90.
+  const msaSource = new Int32Array(sequences).fill(2);
+  msaSource[0] = 4;   // (the query: chai's MSADataSource QUERY)
+  {
+    const width = offsets[offsets.length - 1] + lengths[lengths.length - 1];
+    for (let chain = 0; chain < chains.length; chain += 1) {
+      if (!homologs[chain] || !columnChains.includes(chain)) continue;
+      const at = columnChains.indexOf(chain);
+      const want = new Map();
+      for (const block of [texts.paired, texts.unpaired]) {
+        headedRecords(block).slice(1).forEach(({ header, row }) => {
+          const key = chaiTokenise(row, width).tokens.slice(offsets[at], offsets[at] + lengths[at]).join(",");
+          if (!want.has(key)) want.set(key, chainHeader(header, chain + 1).startsWith("UniRef") ? 2 : 0);
+        });
+      }
+      const columns = [];
+      for (let token = 0; token < tokens; token += 1) {
+        if (batch.asymId[token] !== chain + 1) continue;
+        if (columns.length === 0 || batch.residueIndex[columns[columns.length - 1]] !== batch.residueIndex[token]) columns.push(token);
+      }
+      let first = true;
+      for (let row = 0; row < sequences; row += 1) {
+        if (!columns.some((token) => batch.msaMask[row * tokens + token] !== 0)) continue;
+        if (first) { first = false; continue; }
+        const key = columns.map((token) => batch.msa[row * tokens + token]).join(",");
+        if (want.has(key) && columns.some((token) => batch.msa[row * tokens + token] !== GAP)) msaSource[row] = want.get(key);
+      }
+    }
+  }
+  batch.msaSource = msaSource;
   for (let chain = 0; chain < chains.length; chain += 1) {
     const selected = [];
     for (let token = 0; token < tokens; token += 1) if (batch.asymId[token] === chain + 1) selected.push(token);
@@ -154,6 +212,14 @@ export function applyChaiMsa(batch, chains, texts, coversNucleic) {
       for (let k = 0; k < 31; k += 1) batch.profile[token * 31 + k] = k === q ? 1 : 0;
       batch.deletionMean[token] = 0;
     }
+  }
+  // a ligand token: UNK in chai's query row, masked padding (31) in every other row, and its profile UNK's - its
+  // one-row context (af3-any-model's _chai_msa; its MSA mask left live there, as af3-any-model leaves it)
+  for (let token = 0; token < tokens; token += 1) {
+    if (!batch.isLigand?.[token] || !batch.seqMask[token]) continue;
+    batch.msa[token] = UNK;
+    for (let row = 1; row < sequences; row += 1) batch.msa[row * tokens + token] = MASKED;
+    for (let k = 0; k < 31; k += 1) batch.profile[token * 31 + k] = k === UNK ? 1 : 0;
   }
   // token-identical rows of the whole MSA: the first of each kept, the rest masked
   const seen = new Set();

@@ -1018,8 +1018,13 @@ export function featuriseProtein(sequence, options = {}) {
 
   let bondMatrix;
   let bondOrderMatrix;
+  // 🔴 boltz2's ONE-TOKEN MODIFIED RESIDUE BONDS TO ITSELF (af3-any-model's _modified_self_bonds, against boltz on SEP
+  // and PSU): its tokeniser maps every bond of a non-standard residue onto tokens, so a residue held as one token gets
+  // ONE self-bond whose type is its LAST bond between atoms it keeps - z_init's bond terms read it at (t, t)
+  const selfBonds = modifiedSpans.filter((span) => span.oneToken === true && span.bonds.length > 0)
+    .map((span) => ({ token: span.from, order: span.bonds[span.bonds.length - 1].order ?? 1 }));
   if (bondedGroups.some((group) => group.bonds.length > 0)
-      || declaredBonds.length > 0) {
+      || declaredBonds.length > 0 || selfBonds.length > 0) {
     bondMatrix = new Float32Array(tokens * tokens);
     bondOrderMatrix = new Float32Array(tokens * tokens);
     for (const { base, bonds } of bondedGroups) {
@@ -1092,6 +1097,11 @@ export function featuriseProtein(sequence, options = {}) {
     }
     bondMatrix[0] = 0;
     bondOrderMatrix[0] = 0;
+    // (after the padding reset at (0, 0): a self-bond is real even on token 0)
+    for (const { token, order } of selfBonds) {
+      bondMatrix[token * tokens + token] = 1;
+      bondOrderMatrix[token * tokens + token] = order;
+    }
   }
 
   const atomCount = realAtoms.length;
@@ -1393,8 +1403,13 @@ export function featuriseProtein(sequence, options = {}) {
     // (keyed on the protein columns, the rows boltz builds: its query row 0 holds the nucleic chains' sequences too)
     const proteinTokens = [];
     for (let token = 0; token < polymerTokens; token += 1) if (!nucleicToken[token]) proteinTokens.push(token);
+    // (and the query as its alignments spell it - the letters, a modified residue's parent where row 0 reads UNK - is
+    // seen already: boltz reads each a3m past its own query, so a block's copy of it is no row)
+    const letters = proteinTokens.map((token) => (residueOfToken[token] >= 0
+      ? parentAatype(residues[residueOfToken[token]].kind, residues[residueOfToken[token]].code) : msa[token])).join(",");
     for (let row = 0; row < sequences; row += 1) {
       const key = proteinTokens.map((token) => msa[row * tokens + token]).join(",");
+      if (row === 1) seen.add(letters);
       if (seen.has(key)) continue;
       seen.add(key);
       rows.push(row);

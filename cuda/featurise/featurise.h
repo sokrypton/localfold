@@ -87,6 +87,7 @@ struct Batch {
   std::vector<LigandSpan> ligandSpans; std::vector<ModifiedSpan> modifiedSpans;
   std::vector<int> residueOfToken; std::vector<float> chainOfResidue;
   std::vector<int> isDna, isRna, isLigand, isModified;
+  std::vector<int> msaSource;                     // chai1's per-row database (chai_msa.h); empty for the rest
   Gather tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms, tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta;
 };
 
@@ -729,7 +730,11 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
       b.refCharge[flat] = (float)(degree - VALENCE.at(graph->elements[atom]));
     }
   }
-  bool anyBond = !declared.empty();
+  // boltz2's one-token modified residue: one self-bond, its last bond's order (featurise.js selfBonds)
+  std::vector<std::pair<int, int>> selfBonds;
+  for (auto& span : b.modifiedSpans)
+    if (span.oneToken && !span.bonds.empty()) selfBonds.push_back({span.from, span.bonds.back().order});
+  bool anyBond = !declared.empty() || !selfBonds.empty();
   for (auto& g : bondedGroups) if (!g.bonds->empty()) anyBond = true;
   if (anyBond) {
     b.hasBonds = true;
@@ -781,6 +786,10 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     }
     b.bondMatrix[0] = 0;
     b.bondOrderMatrix[0] = 0;
+    for (auto& [token, order] : selfBonds) {   // (after the (0, 0) reset)
+      b.bondMatrix[(size_t)token * tokens + token] = 1;
+      b.bondOrderMatrix[(size_t)token * tokens + token] = (float)order;
+    }
   }
 
   atomGathers(b, realAtoms, pseudoBetaSlot, o.paddedAtomKeys, o.qblockAtomKeys);
@@ -947,9 +956,15 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
     for (int t = 0; t < polymerTokens; ++t) if (!nucleicToken[t]) proteinTokens.push_back(t);
     std::set<std::vector<int>> seen;
     std::vector<int> rows;
+    // (the query as its alignments spell it is seen from row 1 on: a block's copy of it is no row - featurise.js)
+    std::vector<int> letters;
+    for (int t : proteinTokens)
+      letters.push_back(b.residueOfToken[t] >= 0 ? parentAatype(residues[b.residueOfToken[t]].kind, residues[b.residueOfToken[t]].code)
+                                                 : b.msa[t]);
     for (int row = 0; row < sequences; ++row) {
       std::vector<int> key;
       for (int t : proteinTokens) key.push_back(b.msa[(size_t)row * tokens + t]);
+      if (row == 1) seen.insert(letters);
       if (!seen.insert(key).second) continue;
       rows.push_back(row);
     }

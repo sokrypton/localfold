@@ -524,7 +524,7 @@ inline Af3Export exportAf3(const Args& args) {
     { int chain = 0; for (char c : sequence) { if (c == ':') ++chain; else chainOfColumn.push_back(chain); } }
     MsaRows rows = af3MsaFromA3m(alignment, (int)jsParseFloat(args.option("max-msa", "1024")),
                                  msaColumnKinds.empty() ? nullptr : &msaColumnKinds, &random, D.mainMsaCap, &chainOfColumn,
-                                 D.protenixUnpairedMsa, D.rf3ProfileMsa);
+                                 D.protenixUnpairedMsa, D.rf3ProfileMsa, D.if2ProfileMsa);
     o.msa = rows.msa; o.deletionMatrix = rows.deletionMatrix;
     o.profileMsa = rows.profileMsa; o.profileDeletionMatrix = rows.profileDeletionMatrix;
     o.hasUnpairedFrom = true; o.unpairedFrom = rows.unpairedFrom;

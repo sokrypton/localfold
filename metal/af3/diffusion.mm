@@ -1,6 +1,7 @@
 // The diffusion head - its conditioning, the atom encoder, the conditioned token transformer, the atom decoder - and
 // AF3's EDM sampler around it (cuda/af3/src/diffusion.cuh and sampler.cuh are the reading). Everything that does not
 // depend on the noise level is prepared once a fold; a denoiser call runs every in-flight sample (NS) as one batch.
+#include "../../cuda/af3/src/rigid.cuh"   // rigidAlign (plain C++), boltz2's realign
 #include "af3.h"
 #include <cmath>
 #include <algorithm>
@@ -606,6 +607,20 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     for (int k = 0; k <= steps; ++k)
       levels[k] = SAMPLER.geometric ? 16 * std::exp(std::log(sigmaMax) + (double)k / steps * (std::log(sigmaMin) - std::log(sigmaMax)))
                                     : noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
+    // how the schedule ends (cuda/af3/src/sampler.cuh): 1 N points then a 0, 2 the last 0, 3 a 0 appended
+    const int tail = M.has(S + "scheduleTail") ? (int)M.meta(S + "scheduleTail") : 0;
+    if (tail != 0) {
+      const int points = tail == 1 ? steps : steps + 1;
+      levels.assign(points + (tail == 1 || tail == 3 ? 1 : 0), 0.0);
+      for (int k = 0; k < points; ++k) {
+        const double t = points == 1 ? 0.0 : (double)k / (points - 1);
+        levels[k] = SAMPLER.geometric ? 16 * std::exp(std::log(sigmaMax) + t * (std::log(sigmaMin) - std::log(sigmaMax)))
+                                      : noiseSchedule(t, 16, sigmaMin, sigmaMax, rho);
+      }
+      if (tail == 2) levels[points - 1] = 0;
+      steps = (int)levels.size() - 1;
+    }
+    const bool realign = flag("trunk.dialect.realignSampler");
     if (!SAMPLER.churn) gamma0 = 0;
     std::vector<float> rot = rotations(steps, seeds);
     float* dRot = uploadNew(rot.data(), rot.size());
@@ -625,6 +640,16 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
       if (onStep) onStep(d, step, steps);
       // Euler's x' = x + S (r - 1)(x - D), or the exponential x' = r^S x + (1 - r^S) D (r = level / tHat) - the
       // same kernel, x + coef (x - D), coef r^S - 1
+      if (realign) {   // (boltz2: the noisy copy rigid-aligned onto the answer, each sample - rigid.cuh)
+        std::vector<float> noisy = download(dNoisy, all3), answer = download(d, all3);
+        for (int k = 0; k < ns; ++k) {
+          std::vector<float> x(noisy.begin() + (size_t)k * n3, noisy.begin() + (size_t)(k + 1) * n3),
+                             t(answer.begin() + (size_t)k * n3, answer.begin() + (size_t)(k + 1) * n3);
+          rigidAlign(x, t, mask, (int)atoms);
+          std::copy(x.begin(), x.end(), noisy.begin() + (size_t)k * n3);
+        }
+        upload(dNoisy, noisy.data(), all3 * sizeof(float));
+      }
       const double coef = SAMPLER.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
       run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)coef, 0});
     }

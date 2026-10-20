@@ -167,7 +167,7 @@ inline A3m capMainMsa(const A3m& parsed, int cap, const std::vector<int>* chainO
 // msa-features.js pairedIntoUnpaired: protenix's unpaired MSA - each protein chain's paired rows, then its unpaired
 // rows (a pad past the query skipped), deduplicated on the aligned row, the chains stacked side by side again
 inline A3m pairedIntoUnpaired(const A3m* unpaired, const A3m* paired, const std::vector<int>* chainOfColumn,
-                              const std::vector<std::string>* columnKinds, bool dedupe = true) {
+                              const std::vector<std::string>* columnKinds, int dedupe = 1) {   // 0 none, 1 rows, 2 letters
   const A3m& base = unpaired ? *unpaired : *paired;
   int length = base.length;
   struct Range { int chain, from, to; };
@@ -196,7 +196,11 @@ inline A3m pairedIntoUnpaired(const A3m* unpaired, const A3m* paired, const std:
     if (protein && dedupe) {
       std::set<std::string> seen;
       std::vector<Row> kept;
-      for (auto& one : rows) if (seen.insert(one.sequence).second) kept.push_back(one);
+      for (auto& one : rows) {
+        std::string key = one.sequence;
+        if (dedupe == 2) key.erase(std::remove(key.begin(), key.end(), '-'), key.end());   // ("letters": IntelliFold's)
+        if (seen.insert(key).second) kept.push_back(one);
+      }
       rows.swap(kept);
     }
     lists.push_back(rows);
@@ -225,7 +229,7 @@ inline A3m pairedIntoUnpaired(const A3m* unpaired, const A3m* paired, const std:
 
 inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const std::vector<std::string>* columnKinds,
                              Uniform* random, int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr,
-                             bool protenixUnpairedMsa = false, bool rf3ProfileMsa = false) {
+                             bool protenixUnpairedMsa = false, bool rf3ProfileMsa = false, bool if2ProfileMsa = false) {
   auto codeOf = [&](const std::string& aligned, int column) {
     char ch = aligned[column];
     if (columnKinds == nullptr || (*columnKinds)[column] == "protein" ||
@@ -260,7 +264,12 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
   }
   if (rf3ProfileMsa && paired.ok) {   // (rf3: the profile over each chain's query, paired and unpaired rows - msa-features.js)
     profileBlock.a = pairedIntoUnpaired(profileBlock.ok ? &profileBlock.a : (unpaired.ok ? &unpaired.a : nullptr), &paired.a,
-                                        chainOfColumn, columnKinds, false);
+                                        chainOfColumn, columnKinds, 0);
+    profileBlock.ok = true;
+  }
+  if (if2ProfileMsa && paired.ok) {   // (intellifold2: each chain's own sequences, repeats gone - msa-features.js)
+    profileBlock.a = pairedIntoUnpaired(profileBlock.ok ? &profileBlock.a : (unpaired.ok ? &unpaired.a : nullptr), &paired.a,
+                                        chainOfColumn, columnKinds, 2);
     profileBlock.ok = true;
   }
   const Parsed& unpairedProfile = profileBlock.ok ? profileBlock : unpaired;

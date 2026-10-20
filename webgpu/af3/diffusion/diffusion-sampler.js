@@ -12,6 +12,7 @@
  * scale 1.003 - is imported rather than restated.
  */
 import { noiseLevels, randomAugmentation, samplerStep } from "../../../cpu/af3/diffusion/diffusion-sampler.js";
+import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
 
 /**
@@ -31,7 +32,8 @@ export async function sampleOnGpu(device, input, weights, options) {
   // sigmas. `stopAfter` runs a PREFIX of the schedule and leaves the walk at
   // high noise, which is only useful if what you read out is `denoised` rather
   // than the returned sample.
-  const stopAfter = Math.min(options.stopAfter ?? steps, steps);
+  // (a schedule tail can add a step: run what the levels hold - noiseLevels)
+  const stopAfter = Math.min(options.stopAfter ?? Infinity, noiseLevels(steps, { ...(input.dialect?.sampler ?? {}), ...options }).length - 1);
   // 🔴 THE MODEL'S OWN EDM CONSTANTS, WHERE IT HAS ANY. A caller's explicit
   // option still wins; the dialect fills in behind it and AlphaFold 3's
   // defaults fill in behind that. boltz2 is the first model here with its own
@@ -76,7 +78,10 @@ export async function sampleOnGpu(device, input, weights, options) {
 
     const denoised = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
                                     weights);
-    positions = samplerStep(noisy, denoised.positions, tHat, level, { stepScale, update: options.update });
+    // (boltz2 rigid-aligns the noisy copy onto the answer before the step: dialect.realignSampler)
+    const aligned = input.dialect?.realignSampler === true
+      ? weightedRigidAlign(noisy, denoised.positions, input.atomMask, atoms) : noisy;
+    positions = samplerStep(aligned, denoised.positions, tHat, level, { stepScale, update: options.update });
     previous = level;
 
     // 🔴 `denoised` IS THE FRAME WORTH WATCHING and neither is in a stable

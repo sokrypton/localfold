@@ -3,6 +3,8 @@
 // test:featurise holds the two to the same bytes.
 #pragma once
 #include <algorithm>
+#include <cctype>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -54,6 +56,57 @@ inline std::vector<std::string> chaiRecords(const std::string& text) {
   return kept;
 }
 
+// an A3M's records with their headers (chai-msa.js headedRecords)
+struct HeadedRecord { std::string header, row; };
+inline std::vector<HeadedRecord> chaiHeadedRecords(const std::string& text) {
+  std::vector<HeadedRecord> out;
+  bool open = false;
+  HeadedRecord current;
+  size_t at = 0;
+  while (at <= text.size()) {
+    size_t end = text.find('\n', at);
+    if (end == std::string::npos) end = text.size();
+    std::string line = text.substr(at, end - at);
+    size_t a = line.find_first_not_of(" \t\r\f\v"), z = line.find_last_not_of(" \t\r\f\v");
+    line = a == std::string::npos ? "" : line.substr(a, z - a + 1);
+    if (!line.empty() && line[0] == '>') { if (open) out.push_back(current); current = {line.substr(1), ""}; open = true; }
+    else { open = true; current.row += line; }
+    at = end + 1;
+  }
+  if (open) out.push_back(current);
+  std::vector<HeadedRecord> kept;
+  for (auto& r : out) if (!r.row.empty()) kept.push_back(r);
+  return kept;
+}
+// chain `chain`'s (1-based) own header out of a merged one (chai-msa.js chainHeader)
+inline std::string chaiChainHeader(const std::string& header, int chain) {
+  if (header.rfind("chain_", 0) == 0) {
+    size_t bar = header.find('|');
+    bool digits = bar != std::string::npos && bar > 6;
+    for (size_t k = 6; digits && k < bar; ++k) digits = std::isdigit((unsigned char)header[k]) || header[k] == '+';
+    if (digits) return header.substr(bar + 1);
+  }
+  size_t colon = header.find(':');
+  bool numbered = colon != std::string::npos && colon > 0;
+  for (size_t k = 0; numbered && k < colon; ++k) numbered = std::isdigit((unsigned char)header[k]);
+  if (numbered) {
+    // header.split(/ (?=\d+:)/): a piece starts at the beginning or after a space followed by digits and a colon
+    std::vector<std::string> parts;
+    size_t from = 0;
+    for (size_t k = 0; k < header.size(); ++k) {
+      if (header[k] != ' ') continue;
+      size_t d = k + 1;
+      while (d < header.size() && std::isdigit((unsigned char)header[d])) ++d;
+      if (d > k + 1 && d < header.size() && header[d] == ':') { parts.push_back(header.substr(from, k - from)); from = k + 1; }
+    }
+    parts.push_back(header.substr(from));
+    const std::string want = std::to_string(chain) + ":";
+    for (auto& p : parts) if (p.rfind(want, 0) == 0) return p.substr(want.size());
+    return "";
+  }
+  return header;
+}
+
 struct ChaiChain { std::string sequence, kind; std::vector<std::pair<int, std::string>> modifications; };
 
 // false, the batch untouched, where no chain has a row but its own query
@@ -99,6 +152,42 @@ inline bool applyChaiMsa(Batch& b, const std::vector<ChaiChain>& chains, const s
     for (auto& r : rowsOf[c]) if (r.tokens != query) { homologs[c] = 1; any = true; break; }
   }
   if (!any) return false;
+  // each row's database by its a3m header (chai-msa.js msaSource): 2 UniRef, 0 otherwise, the query 4
+  b.msaSource.assign(sequences, 2);
+  b.msaSource[0] = 4;
+  {
+    long width = offsets.back() + lengths.back();
+    for (size_t c = 0; c < chains.size(); ++c) {
+      auto it = std::find(columnChains.begin(), columnChains.end(), (int)c);
+      if (!homologs[c] || it == columnChains.end()) continue;
+      int at = (int)(it - columnChains.begin());
+      std::map<std::vector<int>, int> want;
+      for (const std::string* block : {&paired, &unpaired}) {
+        auto records = chaiHeadedRecords(*block);
+        for (size_t r = 1; r < records.size(); ++r) {
+          ChaiRow full = chaiTokenise(records[r].row, width);
+          std::vector<int> key(full.tokens.begin() + offsets[at], full.tokens.begin() + offsets[at] + lengths[at]);
+          if (!want.count(key)) want[key] = chaiChainHeader(records[r].header, (int)c + 1).rfind("UniRef", 0) == 0 ? 2 : 0;
+        }
+      }
+      std::vector<int> columns;
+      for (int t = 0; t < tokens; ++t) {
+        if (b.asymId[t] != (int)c + 1) continue;
+        if (columns.empty() || b.residueIndex[columns.back()] != b.residueIndex[t]) columns.push_back(t);
+      }
+      bool first = true;
+      for (int row = 0; row < sequences; ++row) {
+        bool live = false;
+        for (int t : columns) live = live || b.msaMask[(size_t)row * tokens + t] != 0;
+        if (!live) continue;
+        if (first) { first = false; continue; }
+        std::vector<int> key; bool residue = false;
+        for (int t : columns) { int v = b.msa[(size_t)row * tokens + t]; key.push_back(v); residue = residue || v != MSA_GAP; }
+        auto hit = want.find(key);
+        if (hit != want.end() && residue) b.msaSource[row] = hit->second;
+      }
+    }
+  }
   for (size_t c = 0; c < chains.size(); ++c) {
     std::vector<int> selected;
     for (int t = 0; t < tokens; ++t) if (b.asymId[t] == (int)c + 1) selected.push_back(t);
@@ -146,6 +235,13 @@ inline bool applyChaiMsa(Batch& b, const std::vector<ChaiChain>& chains, const s
       for (int k = 0; k < RESTYPES; ++k) b.profile[(size_t)t * RESTYPES + k] = k == q ? 1.f : 0.f;
       b.deletionMean[t] = 0;
     }
+  }
+  // a ligand token: UNK in the query row, masked padding in the others, UNK's profile (chai-msa.js)
+  for (int t = 0; t < tokens; ++t) {
+    if (t >= (int)b.isLigand.size() || !b.isLigand[t] || !b.seqMask[t]) continue;
+    b.msa[t] = 20;
+    for (int row = 1; row < sequences; ++row) b.msa[(size_t)row * tokens + t] = 31;
+    for (int k = 0; k < RESTYPES; ++k) b.profile[(size_t)t * RESTYPES + k] = k == 20 ? 1.f : 0.f;
   }
   std::set<std::vector<int>> seen;
   for (int row = 0; row < sequences; ++row) {

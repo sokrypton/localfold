@@ -40,6 +40,7 @@
 export const ALPHAFOLD3 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  realignSampler: false,   // (the noisy copy rigid-aligned onto each answer: boltz2)
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -104,6 +105,8 @@ export const ALPHAFOLD3 = Object.freeze({
   declaredBondCharge: false,
   // the profile over each chain's query, paired and unpaired rows, none dropped (rf3: atomworks' one block a chain)
   rf3ProfileMsa: false,
+  // ...or each chain's own sequences, repeats gone (intellifold2: its boltz-derived msa_valid_depths)
+  if2ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -289,6 +292,9 @@ export const ALPHAFOLD3 = Object.freeze({
   paddedAtomKeys: false,
   diffusionNoResidual: false,
   msaPairedQueryRow: false,
+  // ...and rf3's: the query row is paired once an alignment adds a row (atomworks' residue_is_paired; colab's
+  // msa_paired is the whole row 0 then, and zero on the query-only path)
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: false,
   // 🔴 RoseTTAFold3 SCALES THE TRIANGLE CONTRACTION BY 1/L, and it is
   // observable ONLY because the centre LayerNorm's epsilon does not commute
@@ -328,6 +334,7 @@ export const ALPHAFOLD3 = Object.freeze({
 export const OPENBIND0 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  realignSampler: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -377,6 +384,7 @@ export const OPENBIND0 = Object.freeze({
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
   // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
   mainMsaCap: 16384,
@@ -435,6 +443,7 @@ export const OPENBIND0 = Object.freeze({
   paddedAtomKeys: false,
   diffusionNoResidual: false,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -486,7 +495,8 @@ export const OPENBIND0 = Object.freeze({
  */
 export const OPENDDE = Object.freeze({
   preTrunkQuery: false,
-  sampler: null,
+  sampler: Object.freeze({ scheduleTail: 2 }),   // (as protenix: the last level 0)
+  realignSampler: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -544,6 +554,7 @@ export const OPENDDE = Object.freeze({
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -643,6 +654,7 @@ export const OPENDDE = Object.freeze({
   paddedAtomKeys: true,
   diffusionNoResidual: false,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: true,
@@ -693,7 +705,8 @@ export const OPENDDE = Object.freeze({
  */
 export const PROTENIX2 = Object.freeze({
   preTrunkQuery: false,
-  sampler: null,
+  sampler: Object.freeze({ scheduleTail: 2 }),   // (InferenceNoiseScheduler: AF3's levels, the last 0)
+  realignSampler: false,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -766,6 +779,7 @@ export const PROTENIX2 = Object.freeze({
   paddedAtomKeys: true,
   diffusionNoResidual: false,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -825,6 +839,7 @@ export const PROTENIX2 = Object.freeze({
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -958,6 +973,7 @@ export const BOLTZ2 = Object.freeze({
   // 378 index differences to 2 and 0 - the 2 being an atom count, not a window,
   diffusionNoResidual: false,
   msaPairedQueryRow: true,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -986,10 +1002,15 @@ export const BOLTZ2 = Object.freeze({
   // 🔴 AND THIS IS NOT A DIALECT BRANCH. It is a table of constants that rides
   // here because the dialect is what a bundle already resolves to; the sampler
   // reads it and the forward graph never sees it.
+  // 🔴 AND THOSE WERE BOLTZ-1's. Boltz-2 2.2.1 samples with gamma_0 0.8, gamma_min 1.0, noise_scale 1.003, step_scale
+  // 1.5, rho 7, sigma_min 1e-4 (af3-any-model's _SAMPLER_CONSTANTS, against stock Boltz 2.2.1), its schedule N points
+  // then a 0 (`scheduleTail` 1, AtomDiffusion.sample_schedule), and it rigid-aligns the noisy copy onto each answer
+  // before the step (`realignSampler`).
   sampler: Object.freeze({
-    gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901, stepScale: 1.638,
-    rho: 8.0, sigmaMin: 0.0004, sigmaMax: 160.0,
+    gamma0: 0.8, gammaMin: 1.0, noiseScale: 1.003, stepScale: 1.5,
+    rho: 7.0, sigmaMin: 0.0001, sigmaMax: 160.0, scheduleTail: 1,
   }),
+  realignSampler: true,
   // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
   // updated z - every MSALayer residual-updates it in place - and its caller
   // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
@@ -1042,6 +1063,7 @@ export const BOLTZ2 = Object.freeze({
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -1123,7 +1145,8 @@ export const BOLTZ2 = Object.freeze({
  */
 export const INTELLIFOLD2 = Object.freeze({
   preTrunkQuery: false,
-  sampler: null,
+  sampler: Object.freeze({ scheduleTail: 3 }),   // (IntelliFold's noise_schedule: AF3's levels, then a 0)
+  realignSampler: false,
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
@@ -1144,13 +1167,14 @@ export const INTELLIFOLD2 = Object.freeze({
   modifiedProteinLetter: true,
   unresolvedLeavingAtoms: false,
   ligandMsaUnk: false,
-  proteinOnlyMsa: false,
+  proteinOnlyMsa: true,   // (IntelliFold's boltz-derived featuriser: protein chains' MSAs only)
   zeroDeletions: false,
   profileOverAllRows: false,
   protenixUnpairedMsa: false,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: true,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1203,6 +1227,7 @@ export const INTELLIFOLD2 = Object.freeze({
   paddedAtomKeys: false,
   diffusionNoResidual: false,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: true,
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -1320,6 +1345,7 @@ export const INTELLIFOLD2 = Object.freeze({
 export const ROSETTAFOLD3 = Object.freeze({
   preTrunkQuery: true,
   sampler: null,
+  realignSampler: false,
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   // NOT in CENTRE_REF_CONFORMERS.
@@ -1350,6 +1376,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   atomizeLigandBonded: true,
   declaredBondCharge: true,
   rf3ProfileMsa: true,
+  if2ProfileMsa: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1419,6 +1446,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   paddedAtomKeys: true,
   diffusionNoResidual: true,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: true,
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: true,
   structuralTokens: false,
@@ -1453,6 +1481,7 @@ export const ROSETTAFOLD3 = Object.freeze({
 export const CHAI1 = Object.freeze({
   preTrunkQuery: true,
   sampler: null,
+  realignSampler: false,
   msaDoubleAddPair: true,
   targetFeatAtomOnly: false,
   centreRefConformers: false,
@@ -1480,6 +1509,7 @@ export const CHAI1 = Object.freeze({
   atomizeLigandBonded: false,
   declaredBondCharge: false,
   rf3ProfileMsa: false,
+  if2ProfileMsa: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1527,6 +1557,7 @@ export const CHAI1 = Object.freeze({
   paddedAtomKeys: true,
   diffusionNoResidual: true,
   msaPairedQueryRow: false,
+  msaPairedQueryRowAligned: false,
   maskAtomActPerBlock: true,
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -1637,6 +1668,7 @@ export function featuriserDialect(dialect) {
     atomizeLigandBonded: dialect.atomizeLigandBonded,
     declaredBondCharge: dialect.declaredBondCharge,
     rf3ProfileMsa: dialect.rf3ProfileMsa,
+    if2ProfileMsa: dialect.if2ProfileMsa,
     mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,

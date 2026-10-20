@@ -3,6 +3,7 @@
 #pragma once
 #include <charconv>
 #include "diffusion.cuh"
+#include "rigid.cuh"
 #include <random>
 #include <condition_variable>
 #include <deque>
@@ -312,6 +313,10 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     gamma0 = M.meta(S + "gamma0"); gammaMin = M.meta(S + "gammaMin"); noiseScale = M.meta(S + "noiseScale");
     stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sigmaMin = M.meta(S + "sigmaMin"); sigmaMax = M.meta(S + "sigmaMax");
   }
+  // how the schedule ends (cpu/af3/diffusion/diffusion-sampler.js noiseLevels): 0 AF3's N + 1 endpoints, 1 N points
+  // then a 0 (boltz), 2 AF3's with the last 0 (protenix, OpenDDE), 3 AF3's then a 0 (IntelliFold, one more step)
+  const int tail = M.has(S + "scheduleTail") ? (int)M.meta(S + "scheduleTail") : 0;
+  const bool realign = M.flag("trunk.dialect.realignSampler");
   std::vector<double> levels(steps + 1);
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
   if (M.flag("trunk.dialect.chaiSampler")) {
@@ -332,6 +337,22 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     for (int k = 0; k <= steps; ++k)
       levels[k] = std::exp(k <= opt.splitAbove ? top + (double)k / opt.splitAbove * (mid - top)
                                                : mid + (double)(k - opt.splitAbove) / (steps - opt.splitAbove) * (bottom - mid));
+  }
+  if (tail != 0) {
+    if (opt.splitAt > 0) {
+      fprintf(stderr, "this model's schedule ends its own way (scheduleTail %d): --schedule-split counts AlphaFold 3's "
+                      "endpoints\n", tail); exit(1);
+    }
+    // (its points on whichever schedule the fold runs - Karras, or the geometric default - then its own ending)
+    const int points = tail == 1 ? steps : steps + 1;
+    levels.assign(points + (tail == 1 || tail == 3 ? 1 : 0), 0.0);
+    for (int k = 0; k < points; ++k) {
+      const double t = points == 1 ? 0.0 : (double)k / (points - 1);
+      levels[k] = opt.geometric ? 16 * std::exp(std::log(sigmaMax) + t * (std::log(sigmaMin) - std::log(sigmaMax)))
+                                : noiseSchedule(t, 16, sigmaMin, sigmaMax, rho);
+    }
+    if (tail == 2) levels[points - 1] = 0;
+    steps = (int)levels.size() - 1;
   }
   if (!opt.churn) gamma0 = 0;
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
@@ -375,6 +396,18 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
+    // (boltz2: the noisy copy rigid-aligned onto the answer, each sample, before the step - rigid.cuh)
+    if (realign) {
+      std::vector<float> noisy = download(dNoisy, all3), answer = download(d, all3);
+      for (int k = 0; k < ns; ++k) {
+        std::vector<float> x(noisy.begin() + (size_t)k * n3, noisy.begin() + (size_t)(k + 1) * n3),
+                           t(answer.begin() + (size_t)k * n3, answer.begin() + (size_t)(k + 1) * n3);
+        rigidAlign(x, t, mask, (int)atoms);
+        std::copy(x.begin(), x.end(), noisy.begin() + (size_t)k * n3);
+      }
+      CK(cudaMemcpyAsync(dNoisy, noisy.data(), all3 * 4, cudaMemcpyHostToDevice, STREAM));
+      CK(cudaStreamSynchronize(STREAM));
+    }
     const double coef = opt.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
     // the multistep weight w = 1 / (2 rho), rho the previous gap between evaluated levels over this step's, both in
     // log sigma; the first step, and any whose levels do not fall, is the plain exponential step (w 0)

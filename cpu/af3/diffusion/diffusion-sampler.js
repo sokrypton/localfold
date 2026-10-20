@@ -41,6 +41,8 @@
  * which Blitz (an ICLR 2027 submission on few-step AF3 and Boltz-2) finds
  * spends a short budget better. cuda/af3/src/sampler.cuh has the same two.
  */
+import { weightedRigidAlign } from "./rigid-align.js";
+
 export function noiseSchedule(t, { sigmaData = 16, sigmaMin = 0.0004,
                                    sigmaMax = 160, rho = 7, schedule = "karras" } = {}) {
   if (schedule === "geometric") {
@@ -53,11 +55,18 @@ export function noiseSchedule(t, { sigmaData = 16, sigmaMin = 0.0004,
 }
 
 /** The `steps + 1` levels a run walks down, from sigmaData*sigmaMax to ~0. */
-export function noiseLevels(steps, options) {
-  const levels = new Float64Array(steps + 1);
-  for (let index = 0; index <= steps; index += 1) {
-    levels[index] = noiseSchedule(index / steps, options);
+export function noiseLevels(steps, options = {}) {
+  // 🔴 HOW THE SCHEDULE ENDS IS EACH VENDOR'S (af3-any-model's schedule_tail): AlphaFold 3's is the N + 1 endpoints of
+  // linspace(0, 1, N + 1), ending AT sigma_min; `scheduleTail` 1 ("append", boltz) is N points over [0, 1] then a 0 -
+  // every intermediate sigma moved; 2 ("replace", protenix and OpenDDE) is AF3's with the last set to 0; 3 ("extend",
+  // IntelliFold) is AF3's with a 0 appended, one more denoiser call. The last step is the one that lands the structure.
+  const tail = options.scheduleTail ?? 0;
+  const points = tail === 1 ? steps : steps + 1;
+  const levels = new Float64Array(points + (tail === 1 || tail === 3 ? 1 : 0));
+  for (let index = 0; index < points; index += 1) {
+    levels[index] = noiseSchedule(points === 1 ? 0 : index / (points - 1), options);
   }
+  if (tail === 2) levels[points - 1] = 0;
   return levels;
 }
 
@@ -172,7 +181,7 @@ export function sample(denoise, options) {
   }
   let previous = levels[0];
 
-  for (let step = 1; step <= steps; step += 1) {
+  for (let step = 1; step < levels.length; step += 1) {
     const level = levels[step];
     positions = randomAugmentation(positions, mask, atoms, normal);
 
@@ -186,7 +195,9 @@ export function sample(denoise, options) {
     }
 
     const denoised = denoise(noisy, tHat);
-    positions = samplerStep(noisy, denoised, tHat, level, { stepScale, update: options.update });
+    // (boltz2 and ESMFold2 rigid-align the noisy copy onto the answer before the step: `realign`)
+    const aligned = options.realign === true ? weightedRigidAlign(noisy, denoised, mask, atoms) : noisy;
+    positions = samplerStep(aligned, denoised, tHat, level, { stepScale, update: options.update });
     previous = level;
 
     // 🔴 `denoised` IS THE ONE WORTH WATCHING, NOT `positions`. It is the

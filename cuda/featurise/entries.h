@@ -140,6 +140,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
   addGather(e, p + "tokenAtomsToPseudoBeta", b.tokenAtomsToPseudoBeta);
   e.i(p + "features.residueIndex", b.residueIndex); e.i(p + "features.tokenIndex", b.tokenIndex);
   e.i(p + "features.asymId", b.asymId); e.i(p + "features.entityId", b.entityId); e.i(p + "features.symId", b.symId);
+  if (!b.msaSource.empty()) e.i(p + "msaSource", b.msaSource);   // (chai1: applyChaiMsa adds it last)
 }
 
 }  // namespace lf

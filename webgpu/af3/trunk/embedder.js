@@ -534,7 +534,9 @@ export class Af3EmbedderGpu {
     const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels,
                     msaChannels, pairInitFromSingle,
                     msaFeatureWidth: weights.msaActivations.length / msaChannels,
-                    msaPairedQueryRow: weights.dialect.msaPairedQueryRow };
+                    // (rf3: the query row is paired once an alignment adds a row - msaPairedQueryRowAligned)
+                    msaPairedQueryRow: weights.dialect.msaPairedQueryRow
+                      || (weights.dialect.msaPairedQueryRowAligned === true && sequences > 1) };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`

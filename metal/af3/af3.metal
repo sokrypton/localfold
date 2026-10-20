@@ -1015,7 +1015,7 @@ kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
   float d = a.del[row];
   int code = a.rows[row];
   if (a.isLigand && a.isLigand[token]) code = s == 0 ? 20 : 31;      // (chai's query row: unknown, the rest: its mask class)
-  float v = a.bias[c] + (paired ? a.W[c] : 0.f) + a.W[(1 + (s == 0 ? 4 : 2)) * a.C + c] +
+  float v = a.bias[c] + (paired ? a.W[c] : 0.f) + a.W[(1 + (s == 0 ? 4 : a.source ? a.source[s] : 2)) * a.C + c] +
             atan(d / 3.f) * (2.f / M_PI_F) * a.W[7 * a.C + c] + clamp(d, 0.f, 1.f) * a.W[8 * a.C + c] +
             (code >= 0 && code < 32 ? a.W[(9 + code) * a.C + c] : 0.f);
   a.msa[t] = v + a.fromSingle[token * a.C + c];

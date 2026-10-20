@@ -168,8 +168,10 @@ export function pairedIntoUnpaired(unpaired, paired, chainOfColumn, columnKinds,
       }
     }
     if (!protein || !dedupe) return rows;
+    // ("letters": IntelliFold's boltz-derived parse_csv - a row repeating an earlier one's residues, gaps aside, goes)
+    const key = (one) => (dedupe === "letters" ? one.sequence.replace(/-/g, "") : one.sequence);
     const seen = new Set();
-    return rows.filter((one) => (seen.has(one.sequence) ? false : (seen.add(one.sequence), true)));
+    return rows.filter((one) => (seen.has(key(one)) ? false : (seen.add(key(one)), true)));
   });
   const depth = Math.max(...lists.map((rows) => rows.length));
   const sequences = [], deletionMatrix = [];
@@ -237,6 +239,11 @@ export function af3MsaFromA3m(alignment, options = {}) {
   // profile is over that block; the rows the model reads stay this port's, the profile's are atomworks')
   if (options.rf3ProfileMsa === true && paired !== null) {
     unpairedProfile = pairedIntoUnpaired(unpairedProfile, paired, options.chainOfColumn, columnKinds, { dedupe: false });
+  }
+  // (intellifold2: its profile is per chain over the chain's own sequences - query, paired and unpaired, repeats
+  // dropped - the first msa_valid_depths rows of its paired MSA, af3-any-model's _boltz_msa intellifold2 variant)
+  if (options.if2ProfileMsa === true && paired !== null) {
+    unpairedProfile = pairedIntoUnpaired(unpairedProfile, paired, options.chainOfColumn, columnKinds, { dedupe: "letters" });
   }
 
   // 🔴 THE PAIRED BLOCK GETS AT MOST HALF THE BUDGET, and the unpaired block

@@ -147,7 +147,8 @@ __global__ void chaiChainHitK(const int* rows, const float* msaMask, const int* 
 }
 __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const float* msaMask, const int* asymId,
                               const int* chainHit, int chains, int pairedRows, const int* isLigand, const float* Wmsa,
-                              const float* bias, const float* fromSingle, float* msa, size_t count, int n, int C) {
+                              const float* bias, const float* fromSingle, float* msa, size_t count, int n, int C,
+                              const int* source = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n); size_t s = row / n;
@@ -158,7 +159,8 @@ __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const floa
   // a non-polymer token: chai's query row carries the unknown residue (20) and every other row its mask class
   // (31), where AlphaFold 3 puts the gap on all of them (featurization.py create_msa_feat, chai1)
   if (isLigand && isLigand[token]) code = s == 0 ? 20 : 31;
-  float v = bias[c] + (paired ? Wmsa[c] : 0.f) + Wmsa[(size_t)(1 + (s == 0 ? 4 : 2)) * C + c]
+  // (each row's database: the query 4, the featuriser's per-row UNIREF90 2 / BFD_UNICLUST 0 - batch.msaSource)
+  float v = bias[c] + (paired ? Wmsa[c] : 0.f) + Wmsa[(size_t)(1 + (s == 0 ? 4 : source ? source[s] : 2)) * C + c]
           + atanf(d / 3.f) * (2.f / 3.14159265358979f) * Wmsa[(size_t)7 * C + c]
           + fminf(fmaxf(d, 0.f), 1.f) * Wmsa[(size_t)8 * C + c]
           + (code >= 0 && code < 32 ? Wmsa[(size_t)(9 + code) * C + c] : 0.f);
@@ -544,7 +546,8 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     int pairedRows = M.has("batch.pairedRows") ? (int)M.meta("batch.pairedRows") : 0;
     chaiMsaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, t.msaMask, Idev("batch.features.asymId"),
       chainHit, chains, pairedRows, M.has("batch.isLigand") ? Idev("batch.isLigand") : nullptr, W(E + "msaActivations"),
-      W(E + "msaActivationsBias"), fromSingle, t.msa, rows, n, t.Cm);
+      W(E + "msaActivationsBias"), fromSingle, t.msa, rows, n, t.Cm,
+      M.has("batch.msaSource") ? Idev("batch.msaSource") : nullptr);
     ++t.pass;
     return;
   }
@@ -555,7 +558,8 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   if (msaWidth != 34 && msaWidth != 35) { fprintf(stderr, "msa feature width %d\n", msaWidth); exit(1); }
   msaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
                                                      fromTarget, t.msa, rows, n, t.Cm, msaWidth,
-                                                     M.flag("trunk.dialect.msaPairedQueryRow"),
+                                                     M.flag("trunk.dialect.msaPairedQueryRow")
+                                                       || (M.flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1),
                                                      hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
                                                      M.has("batch.isDna") ? Idev("batch.isDna") : nullptr);
   buildSingle();

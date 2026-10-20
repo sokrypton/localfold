@@ -186,7 +186,8 @@ static void embed(Trunk& t) {
     const uint pairedRows = M.has("batch.pairedRows") ? (uint)M.meta("batch.pairedRows") : 0u;
     run1d("af3_chai_msa_embed", rows * t.Cm,
           ChaiMsaEmbedArgs{t.msaRows, t.deletion, t.msaMask, M.i("batch.features.asymId"), M.has("batch.isLigand") ? M.i("batch.isLigand") : nullptr,
-                           chainHit, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, (uint)n, (uint)t.Cm,
+                           chainHit, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa,
+                           M.has("batch.msaSource") ? M.i("batch.msaSource") : nullptr, rows, (uint)n, (uint)t.Cm,
                            (uint)chains, pairedRows});
     ++t.pass;
     return;
@@ -200,7 +201,9 @@ static void embed(Trunk& t) {
   run1d("af3_msa_embed", rows * t.Cm, MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa,
                                                    hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
                                                    M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, rows, (uint)n,
-                                                   (uint)t.Cm, (uint)msaWidth, flag("trunk.dialect.msaPairedQueryRow") ? 1u : 0u});
+                                                   (uint)t.Cm, (uint)msaWidth,
+                                                   flag("trunk.dialect.msaPairedQueryRow")
+                                                     || (flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1) ? 1u : 0u});
   buildSingle();
   ++t.pass;
 }

@@ -192,7 +192,8 @@ struct ChaiRelEncArgs { RelIdx r; CP(float) W; CP(float) bias; CP(float) ce; CP(
 // (is_paired: a homolog row of the paired block, on a live token whose chain and whose row's first token's chain both
 // have a hit there - chainHit [S][chains], af3_chai_chain_hit)
 struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int) asym; CP(int) isLigand; CP(int) chainHit; CP(float) W;
-                          CP(float) bias; CP(float) fromSingle; DP(float) msa; u64 count; uint n, C, chains, pairedRows; };
+                          CP(float) bias; CP(float) fromSingle; DP(float) msa; CP(int) source; u64 count; uint n, C, chains,
+                          pairedRows; };   // (source: batch.msaSource, each row's database; null reads UNIREF90)
 struct ChaiChainHitArgs { CP(int) rows; CP(float) msaMask; CP(int) asym; DP(int) hit; u64 count; uint n, chains; };
 // the grouped outer product: [S][n][G K] -> [G][S][n][K]; P_g [(i, k)][(j, l)] (bi rows i) -> [(i, j)][(g, k, l)]
 struct GroupMajorArgs { CP(float) x; DP(float) out; uint S, n, G, K; };
