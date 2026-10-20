@@ -193,8 +193,8 @@ describe("what a fold is called", () => {
 
   it("uses it on both fold paths, not just the AlphaFold 3 one", () => {
     const uses = [...app.matchAll(/MODEL_STEMS\[family\]/g)];
-    assert.equal(uses.length, 2,
-      "MODEL_STEMS should name the object on the AF3 path and the AF2 path");
+    assert.equal(uses.length, 3,
+      "MODEL_STEMS should name the object on the AF3 path, the AF2 path and the BioEmu2 path");
   });
 
   /**
@@ -221,8 +221,8 @@ describe("what a fold is called", () => {
     assert.ok(body.includes("uniqueStem("), "foldStem does not uniquify");
     assert.ok(body.indexOf("header === null ? fallback") > 0,
               "the model prefix must be the fallback, never an override");
-    assert.equal([...app.matchAll(/foldStem\(/g)].length, 4,
-      "foldStem should be declared once and called on all three fold paths");
+    assert.equal([...app.matchAll(/foldStem\(/g)].length, 5,
+      "foldStem should be declared once and called on all four fold paths");
   });
 
   /**

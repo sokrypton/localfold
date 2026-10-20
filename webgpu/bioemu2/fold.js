@@ -155,6 +155,7 @@ export async function foldBioemu2(device, read, features, options = {}) {
     });
     const sTrunk = await net.ops.read(trunk.s);
     const { contact, logits } = await clock("distogram", () => net.distogram(g, trunk.z));
+    options.onContacts?.(contact);
     const N = g.N;
     const mask = Int32Array.from(f.atom_mask);
     const propagation = options.propagation ?? null;

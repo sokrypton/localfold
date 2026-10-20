@@ -530,7 +530,8 @@ describe("where a fold's contact map lives", () => {
     // `recordPrediction` is the one door; a path that does not go through it
     // is not counted here, which is the point.
     const blocks = [...app.matchAll(/recordPrediction\(\{\n([\s\S]*?)\n\s*\}, /g)];
-    expect(blocks.length).toBe(3);
+    // ...four now: AlphaFold 2's, AlphaFold 3's, ESMFold2's and BioEmu2's
+    expect(blocks.length).toBe(4);
     for (const [, body] of blocks) {
       expect(body).toContain("contactSource");
     }

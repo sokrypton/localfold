@@ -337,6 +337,23 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_ROSETTAFOLD3_MODEL",
     load: () => import("./rosettafold3.js"),
   },
+  // BioEmu2 (Microsoft Research, MIT; bioemu2-preview, through af3-any-model's conversion).
+  //
+  // 🔴 ITS OWN GRAPH, NOT AN AF3 BRANCH: a PairMixer trunk (Boltz's MSA module
+  // without triangle attention, then 48 triangle-multiplication blocks) and a
+  // dual-stream denoiser, on its own featuriser (shared/bioemu2/featurise.js).
+  // No confidence head. See webgpu/bioemu2/network.js and docs/BIOEMU2.md.
+  //
+  // 1908 tensors at int5 in 25 shards, 371 MiB; the norms, gathers, time
+  // constants and the trunk's initial projections stay float32.
+  bioemu2: {
+    model: "bioemu2",
+    directory: "./model-bioemu2-int5/",
+    remote: null,
+    release: "bioemu2-int5",
+    variable: "LOCALFOLD_INCLUDE_BIOEMU2_MODEL",
+    load: () => import("./bioemu2.js"),
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -430,7 +447,7 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  */
 export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
                                   "protenix2", "intellifold2", "rosettafold3",
-                                  "ef2-fast-600m", "ef2-fast-300m"];
+                                  "ef2-fast-600m", "ef2-fast-300m", "bioemu2"];
 
 /**
  * The families that predict a structure and nothing about it.
@@ -446,7 +463,10 @@ export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
  * needs a TM term, which AlphaFold 3's head emits and OpenDDE's does not, and
  * deriving one from the PAE would be a different quantity wearing pTM's name.
  */
-export const MODELS_WITHOUT_CONFIDENCE = ["ef2-fast-600m", "ef2-fast-300m"];
+export const MODELS_WITHOUT_CONFIDENCE = ["ef2-fast-600m", "ef2-fast-300m", "bioemu2"];
+
+/** The families that run BioEmu2's own graph (webgpu/bioemu2), neither AF2's nor AF3's. */
+export const BIOEMU2_FAMILIES = ["bioemu2"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
 export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];

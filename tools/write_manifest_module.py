@@ -195,6 +195,13 @@ BUNDLES = {
         "module": "shared/bundles/manifests/rosettafold3.js",
         "model": "rosettafold3",
     },
+    # BioEmu2: its own graph (webgpu/bioemu2), from tools/export_bioemu2_model.py
+    # and tools/quantize_af3.py at int5 group 32. 371 MiB.
+    "bioemu2": {
+        "export": "model-bioemu2-int5",
+        "module": "shared/bundles/manifests/bioemu2.js",
+        "model": "bioemu2",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

@@ -217,6 +217,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        they are one choice (the value is the 600M checkpoint's,
                        which saved sessions and links name). -->
                   <option value="ef2-fast-600m">ESMFold2</option>
+                  <!-- 🔴 AN EMULATOR, NOT ONLY A PREDICTOR, AND WITH NO CONFIDENCE HEAD.
+                       BioEmu2 (Microsoft Research, MIT) samples a structure or an
+                       equilibrium ensemble, and propagates a structure forward in
+                       time; its own graph is webgpu/bioemu2 (a PairMixer trunk and a
+                       dual-stream denoiser). Its rows below show with it. -->
+                  <option value="bioemu2">BioEmu2</option>
                 </select>
               </div>
 
@@ -328,6 +334,47 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group" id="af3CountGroup" hidden>
                 <span class="fetch-option-title" id="af3-count-label">Steps</span>
                 <select id="af3-count"></select>
+              </div>
+
+              <!-- 🔴 BioEmu2'S OWN ROWS, SHOWN WITH IT (syncBioemu2Controls). Its
+                   method token is "non-md" for a structure and "md" for an
+                   equilibrium ensemble; propagation is equilibrium sampling
+                   conditioned on a starting frame at a lag, chained. Contacts are
+                   BioEmu2's own Contact form, as JSON. -->
+              <div class="fetch-option-group" id="bioemu2ModeGroup" hidden>
+                <span class="fetch-option-title">Mode</span>
+                <select id="bioemu2-mode" title="Structure: predict a structure (BioEmu2's non-MD mode). Equilibrium: sample its equilibrium ensemble (MD mode). Propagate: run time forward from a structure of this input, each step one lag.">
+                  <option value="structure" selected>Structure</option>
+                  <option value="equilibrium">Equilibrium</option>
+                  <option value="propagate">Propagate</option>
+                </select>
+              </div>
+              <div class="fetch-option-group" id="bioemu2SamplesGroup" hidden>
+                <span class="fetch-option-title">Samples</span>
+                <select id="bioemu2-samples" title="How many structures to sample, all through one denoiser call a step; each is a frame of the play bar.">
+                  <option value="1" selected>1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="8">8</option>
+                </select>
+              </div>
+              <div class="fetch-option-group" id="bioemu2PropagationGroup" hidden>
+                <span class="fetch-option-title">Lag (ns)</span>
+                <input type="number" id="bioemu2-lag" value="1" min="0.001" step="any" title="The time each propagation step advances, in nanoseconds.">
+                <span class="fetch-option-title">Steps</span>
+                <input type="number" id="bioemu2-propagation-steps" value="1" min="1" max="100" step="1" title="How many lag-time steps each trajectory takes.">
+                <span class="fetch-option-title">From</span>
+                <select id="bioemu2-propagate-from" title="The starting frame: the last BioEmu2 fold of this same input, or a PDB of it.">
+                  <option value="last" selected>Last fold</option>
+                  <option value="upload">PDB file</option>
+                </select>
+                <input type="file" id="bioemu2-x0-file" accept=".pdb" hidden>
+              </div>
+              <div class="fetch-option-group" id="bioemu2ContactsGroup" hidden>
+                <span class="fetch-option-title">Contacts</span>
+                <input type="text" id="bioemu2-contacts" value="" placeholder='[{"token1":{"asym_id":"A","res_id":5},"token2":{"asym_id":"A","res_id":60},"max_distance":8}]'
+                  title="Condition on contacts, in BioEmu2's Contact form (JSON): token1, token2 (asym_id, res_id, atom_name), max_distance 4-20 A. Empty for none.">
               </div>
 
               <!-- MSA options on the right of the row -->
@@ -868,6 +915,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                             <div id="metricIptmCell" class="score-metric-cell" style="display: none;">
                                 <div class="score-metric-label">ipTM</div>
                                 <div id="metricIptm" class="score-metric-value">-</div>
+                            </div>
+                            <div id="metricNoConfidence" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">Confidence</div>
+                                <div id="metricNoConfidenceText" class="score-metric-value">No confidence head</div>
                             </div>
                             <div id="metricMultimerCell" class="score-metric-cell" style="display: none;">
                                 <div class="score-metric-label">Ranking</div>

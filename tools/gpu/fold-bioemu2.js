@@ -17,56 +17,12 @@ import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts } from "../../sh
 import { bundleReader } from "../../shared/bioemu2/weights.js";
 import { bioemu2Pdb, alphaCarbonSpacings } from "../../shared/bioemu2/structure.js";
 import { foldBioemu2 } from "../../webgpu/bioemu2/fold.js";
-import { ccdUrl } from "../../shared/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../../shared/chem/component.js";
+import { fetchComponents, smilesTemplates } from "../../shared/bioemu2/inputs.js";
 import { superpose } from "./superpose.js";
 import { bondGeometry } from "./bond-geometry.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 
 const option = (args, name, fallback) => (args ?? []).find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
-
-/** Every component a job names, fetched: tools/fixtures/ccd first, the PDB's server after. */
-export async function fetchComponents(job) {
-  const codes = new Set();
-  for (const chain of job.chains) {
-    for (const m of chain.modifications ?? []) codes.add(m.code);
-    for (const c of chain.ccdCodes ?? []) codes.add(c);
-    if (chain.kind === "protein" && chain.sequence.includes("X")) codes.add("UNK");
-    if (chain.kind === "rna" && chain.sequence.includes("N")) codes.add("N");
-    if (chain.kind === "dna" && chain.sequence.includes("N")) codes.add("DN");
-  }
-  const texts = new Map();
-  await Promise.all([...codes].map(async (code) => {
-    let response = await fetch(`/tools/fixtures/ccd/${code}.cif`);
-    if (!response.ok) response = await fetch(ccdUrl(code));
-    if (!response.ok) throw new Error(`no CCD entry for ${code}`);
-    texts.set(code, await response.text());
-  }));
-  return (code) => texts.get(code);
-}
-
-/** A SMILES ligand's template, from this port's own conformer (see shared/bioemu2/featurise.js's note). */
-export async function smilesTemplates(job, seed = null) {
-  const out = {};
-  for (const chain of job.chains) {
-    if (chain.smiles == null) continue;
-    const component = await smilesComponent(chain.smiles, seed === null ? {} : { seed });
-    const counts = {};
-    const names = component.atoms.map((a) => {
-      const symbol = ["H", "HE", "LI", "BE", "B", "C", "N", "O", "F", "NE", "NA", "MG", "AL", "SI", "P", "S", "CL"][a.element - 1] ?? "X";
-      counts[symbol] = (counts[symbol] ?? 0) + 1;
-      return `${symbol}${counts[symbol]}`;
-    });
-    const coords = new Float32Array(component.atoms.length * 3);
-    const mean = [0, 0, 0];
-    component.atoms.forEach((a) => { mean[0] += a.x; mean[1] += a.y; mean[2] += a.z; });
-    for (let k = 0; k < 3; k += 1) mean[k] /= component.atoms.length;
-    component.atoms.forEach((a, i) => { coords[i * 3] = a.x - mean[0]; coords[i * 3 + 1] = a.y - mean[1]; coords[i * 3 + 2] = a.z - mean[2]; });
-    out[chain.id] = { names, element: component.atoms.map((a) => a.element), charge: component.atoms.map((a) => a.charge ?? 0),
-                      coords, bonds: component.bonds.map((b) => [b.from, b.to]) };
-  }
-  return out;
-}
 
 function crystalAlphaCarbons(text, chain) {
   const residues = new Map();
@@ -87,7 +43,7 @@ export async function main(device, args) {
   const contactsUrl = option(args, "contacts", null);
   const lag = option(args, "propagate", null);
   const job = bioemu2JobFromAf3Json(await (await fetch(jobUrl)).json());
-  const ccd = await fetchComponents(job);
+  const ccd = await fetchComponents(job, { local: (code) => `/tools/fixtures/ccd/${code}.cif` });
   const contacts = contactsUrl ? parseContacts(await (await fetch(contactsUrl)).json()) : null;
   const mode = lag ? "equilibrium" : option(args, "mode", "structure");
   const t0 = performance.now();

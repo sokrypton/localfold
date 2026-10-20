@@ -25,6 +25,9 @@ const CHAIN_MERGES = {
   monomer: mergeUnpairedChainA3ms,
   multimer: mergeChainA3ms,
   ...Object.fromEntries(AF3_FAMILIES.map((family) => [family, mergeRowAlignedChainA3ms])),
+  // BioEmu2 lines its chains' rows up by index (Boltz-1's MSA), so it takes the row-aligned merge; its featuriser
+  // splits the merged text back into one alignment a chain (shared/bioemu2/inputs.js, splitA3mByChains).
+  bioemu2: mergeRowAlignedChainA3ms,
   // 🔴 A DELTA FAMILY MERGES THE WAY ITS BASE DOES, DERIVED RATHER THAN TYPED.
   // AlphaFold 2's models 2 to 5 ship as a difference on model_1 and run its
   // graph, so they read an alignment exactly as it does - and writing four more

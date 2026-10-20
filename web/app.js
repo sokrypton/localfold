@@ -45,13 +45,17 @@ import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, 
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.js";
 import { toPdb } from "../webgpu/af3/fold.js";
+import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network, bioemu2ViewerTokens,
+  loadBioemu2Weights, releaseBioemu2, x0FromPdb } from "./bioemu2-model.js";
+import { foldBioemu2 } from "../webgpu/bioemu2/fold.js";
+import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
 import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geometry.js";
 import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
-import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
+import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
@@ -646,6 +650,7 @@ const MODEL_STEMS = {
   "ef2-fast-300m": "ef2_fast_300m",
   "ef2-fast": "esmfold2_fast",
   ef2: "esmfold2",
+  bioemu2: "bioemu2",
 };
 
 /** What to call each model while its weights download. */
@@ -700,6 +705,7 @@ const MODEL_LABELS = {
   "ef2-fast-300m": "EF2-fast (300M)",
   "ef2-fast": "ESMFold2-Fast (ESM-C 6B)",
   ef2: "ESMFold2",
+  bioemu2: "BioEmu2",
   // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
   // TYPED. A delta downloads its BASE as well as itself, so the dial reading
   // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
@@ -938,7 +944,10 @@ let lastFoldedFamily;
 
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
-                       "af3-count", "random-seed"];
+                       "af3-count", "random-seed",
+                       // BioEmu2's own: its mode, its sample count, its contacts and its propagation
+                       "bioemu2-mode", "bioemu2-samples", "bioemu2-contacts", "bioemu2-lag",
+                       "bioemu2-propagation-steps", "bioemu2-propagate-from"];
 
 /** What the form says now, in one object the session can carry. */
 function formInputs() {
@@ -1258,7 +1267,8 @@ function startModelPreload(family, signal) {
   // families and a third is published; `family === "ef2-fast-600m"` sends the
   // 300M one down AlphaFold 2's branch, which is the `family === "af3"` mistake
   // this file already records once.
-  const load = SINGLE_SEQUENCE_FAMILIES.includes(family)
+  const load = BIOEMU2_FAMILIES.includes(family) ? loadBioemu2Weights(report)
+    : SINGLE_SEQUENCE_FAMILIES.includes(family)
     ? loadEsmfold2Weights(report,
                           { languageModel: needsLanguageModel, family })
     : (AF3_FAMILIES.includes(family)
@@ -2569,9 +2579,12 @@ function syncModelControls() {
   // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
   // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
   // removed, docs/AF3.md "Flow removed".)
-  const sampled = af3 || isEsmfold2(family);
+  const bioemu2 = BIOEMU2_FAMILIES.includes(family);
+  const sampled = af3 || isEsmfold2(family) || bioemu2;
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
+  // ...and BioEmu2's own rows: its mode, its samples, its contacts, and - in propagation - the lag and the steps
+  syncBioemu2Controls(bioemu2);
   // 🔴 ESMFold2 FOLDS FROM ITS LANGUAGE MODEL, AND AN ALIGNMENT IS AN OPT-IN.
   // Its experimental tier reads ESM-C alone (`disable_msa_features` in its
   // checkpoint), so it has no MSA row: a search left live would run, take a
@@ -2600,7 +2613,8 @@ function syncModelControls() {
   }
   // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
   const maxNode = document.getElementById("maxMsaGroup");
-  if (maxNode !== null) maxNode.hidden = isEsmfold2(family);
+  // (BioEmu2 takes its alignment whole, 4,092 rows as Boltz-1 does, so it has no depth to set either)
+  if (maxNode !== null) maxNode.hidden = isEsmfold2(family) || bioemu2;
   // ...and the variant row, for every ESMFold2
   const plmNode = document.getElementById("plmGroup");
   if (plmNode !== null) plmNode.hidden = !isEsmfold2(family);
@@ -2654,8 +2668,37 @@ function syncMaxMsa() {
   select.value = kept ?? values[0];
 }
 
+/**
+ * BioEmu2's rows, shown with the model: Mode (structure, equilibrium, propagate), Samples, Contacts, and the
+ * propagation's lag, steps and starting frame only when it propagates. A hidden row keeps its value, and the fold
+ * reads these only under BioEmu2.
+ */
+function syncBioemu2Controls(shown = BIOEMU2_FAMILIES.includes(chosenFamily())) {
+  for (const id of ["bioemu2ModeGroup", "bioemu2SamplesGroup", "bioemu2ContactsGroup"]) {
+    const node = document.getElementById(id);
+    if (node !== null) node.hidden = !shown;
+  }
+  const propagating = document.getElementById("bioemu2-mode")?.value === "propagate";
+  const node = document.getElementById("bioemu2PropagationGroup");
+  if (node !== null) node.hidden = !(shown && propagating);
+  const upload = document.getElementById("bioemu2-x0-file");
+  if (upload !== null) upload.hidden = document.getElementById("bioemu2-propagate-from")?.value !== "upload";
+}
+
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
+  // BioEmu2's dial is its own: the vendor's 200 steps first, cheaper ones for a quick look
+  if (BIOEMU2_FAMILIES.includes(chosenFamily())) {
+    const title = document.getElementById("af3-count-label");
+    if (title !== null) title.textContent = "Steps";
+    const select = document.getElementById("af3-count");
+    if (select === null) return;
+    const kept = Number(select.value);
+    select.replaceChildren(...BIOEMU2_COUNTS.map((value) => Object.assign(
+      document.createElement("option"), { value: String(value), textContent: String(value) })));
+    select.value = String(BIOEMU2_COUNTS.includes(kept) ? kept : BIOEMU2_DEFAULT_STEPS);
+    return;
+  }
   const ef2 = isEsmfold2(chosenFamily());
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
@@ -3884,6 +3927,187 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   progress(null);
 }
 
+/** The last BioEmu2 fold's first sample, keyed by its atoms, for propagating from it. */
+let lastBioemu2;
+
+/**
+ * A BioEmu2 fold on this page's WebGPU (webgpu/bioemu2).
+ *
+ * 🔴 NO CONFIDENCE HEAD, AND THE CARD SAYS SO. BioEmu2 predicts a structure (or
+ * an ensemble) and a distogram, and nothing about how much to believe either;
+ * the scores card reads "no confidence head" rather than a number, the
+ * structure is coloured by chain (forcePlddtColours(false): a pLDDT ramp over
+ * an empty B-factor paints a claim), and the contact map is the distogram's.
+ *
+ * 🔴 SAMPLES ARE FRAMES. Every sample is one denoiser call's batch member, so a
+ * five-sample fold is five structures of one input - an ensemble, which in
+ * equilibrium mode is the point - laid on the play bar as sample_1..5. The saved
+ * structure is the first sample.
+ */
+async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications }) {
+  const family = "bioemu2";
+  const modelName = MODEL_LABELS[family];
+  const started = performance.now();
+  const choice = document.getElementById("bioemu2-mode")?.value ?? "structure";
+  const propagating = choice === "propagate";
+  const mode = propagating ? "equilibrium" : choice;
+  const samples = Math.max(1, Number(document.getElementById("bioemu2-samples")?.value) || 1);
+  const steps = Number(element("af3-count").value) || BIOEMU2_DEFAULT_STEPS;
+  const contacts = (document.getElementById("bioemu2-contacts")?.value ?? "").trim();
+  status(`${modelName} · featurising`);
+  const { entities } = formInputs();
+  const jobJson = jobInputJson({ name: "fold", seed: randomSeed(), entities });
+  const proteinChains = chains.filter((_, at) => chainKinds[at] === "protein");
+  // the paired block, where a complex has one, and the unpaired one; a single chain's alignment is all unpaired
+  const unpaired = alignmentBlocks?.unpaired ?? alignment;
+  const featurised = await bioemu2Features(jobJson, {
+    alignment: unpaired ?? null, pairedAlignment: alignmentBlocks?.paired ?? null, proteinChains, mode,
+    contacts: contacts === "" ? null : contacts, signal,
+  });
+  const { features, atomKeys, topology, tokens } = featurised;
+  // the starting frame: the last BioEmu2 fold of THIS input, or an uploaded PDB of it
+  let propagation;
+  if (propagating) {
+    const lagNs = Number(document.getElementById("bioemu2-lag")?.value);
+    const lagSteps = Math.max(1, Number(document.getElementById("bioemu2-propagation-steps")?.value) || 1);
+    const source = document.getElementById("bioemu2-propagate-from")?.value ?? "last";
+    let x0;
+    if (source === "upload") {
+      const file = document.getElementById("bioemu2-x0-file")?.files?.[0];
+      if (file === undefined) throw new Error("Choose a PDB to propagate from, or propagate from the last fold");
+      x0 = x0FromPdb(await file.text(), atomKeys);
+    } else {
+      const key = JSON.stringify(atomKeys);
+      if (lastBioemu2?.key !== key) {
+        throw new Error("Propagation starts from a structure of this same input - fold it with BioEmu2 first,"
+          + " or upload a PDB of it");
+      }
+      x0 = lastBioemu2.coords;
+    }
+    if (!(lagNs > 0)) throw new Error("The propagation lag must be a positive number of nanoseconds");
+    propagation = { x0, lagNs, steps: lagSteps };
+  }
+  throwIfAborted(signal);
+  const loaded = await modelLoad;
+  throwIfAborted(signal);
+  const device = await getDevice();
+  throwIfAborted(signal);
+  const network = bioemu2Network(device, loaded.read);
+
+  predictionCount += 1;
+  const stem = foldStem(`${MODEL_STEMS[family]}_${predictionCount}`);
+  openBlankFold(stem);
+  viewer = undefined;
+  viewerObject = undefined;
+  const keep = bioemu2ViewerTokens(topology, tokens);
+  const api = window.py2Dmol;
+  let drawn = 0;
+  let colouring = false;
+  let liveContacts;
+  const realAtoms = atomKeys.length;
+  // the first sample's denoised structure, every few steps, as the play bar's live frames
+  const drawLive = (denoised) => {
+    if (signal.aborted || api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      foldIsShowing(renderer);
+      const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, denoised.subarray(0, realAtoms * 3)));
+      frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
+      renderer.addFrame(frame, renderer.currentObjectName);
+      renderer.setFrame(object.frames.length - 1);
+      if (!colouring) { colouring = setColourMode("chain"); orientBestView(renderer); }
+    } catch (cause) {
+      console.warn("live frame skipped:", cause);
+    }
+  };
+  const every = Math.max(1, Math.round(steps / 20));
+  const result = await foldBioemu2(device, loaded.read, features, {
+    network, samples, steps, seed: randomSeed(), mode, propagation,
+    // the distogram's contact map exists before any structure does, and is shown as the trunk's is
+    onContacts: (contact) => {
+      if (signal.aborted) return;
+      liveContacts = contactMapFor(contact, keep);
+      showTrunkContacts(liveContacts, chains);
+    },
+    onProgress: (stage, done, total, denoised) => {
+      if (signal.aborted) throw new DOMException("the fold was stopped", "AbortError");
+      if (stage === "trunk") {
+        status(`${modelName} · trunk`);
+        progress(0.15 * done / total);
+        return;
+      }
+      status(`${modelName} · sampling ${done}/${total}`);
+      progress(0.15 + 0.85 * done / total);
+      if (denoised !== undefined && (done % every === 0 || done === total)) drawLive(denoised);
+    },
+  });
+  throwIfAborted(signal);
+  const contactMap = contactMapFor(result.contact, keep);
+  const pdbs = result.samples.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
+  const sequence = chains.join("");
+  const scores = { sequence, contact_probs: paeMatrix(result.contact, tokens) };
+  const registry = window.py2dmol_viewers ?? {};
+  const liveRenderer = registry[Object.keys(registry)[0]]?.renderer;
+  const camera = { ...(liveRenderer?.viewerState ?? {}) };
+  const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
+  if (live?.frames !== undefined) live.frames.length = 0;
+  await loadIntoViewer({ stem, pdb: pdbs[0], scores, confidence: undefined });
+  if (viewer !== undefined && Object.keys(camera).length > 0) {
+    Object.assign(viewer.viewerState, camera);
+    viewer.render?.("localfold.restore-camera");
+  }
+  const label = (at) => (propagation
+    ? `trajectory_${Math.floor(at / propagation.steps) + 1}_step_${(at % propagation.steps) + 1}`
+    : `sample_${at + 1}`);
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    const first = object?.frames?.[0];
+    if (first !== undefined) {
+      first.name = first.label = first.title = label(0);
+      if (contactMap !== undefined) first.maps = { ...first.maps, contact: contactMap };
+    }
+    for (const [index, text] of pdbs.slice(1).entries()) {
+      const frame = api.frameFromText(text);
+      frame.name = frame.label = frame.title = label(index + 1);
+      viewer.addFrame(frame, viewerObject);
+    }
+    forcePlddtColours(false);
+    viewer.setFrame(0);
+    viewer.render("bioemu2-final");
+  }
+  updateScoresCard({ none: true, label: `${modelName} has no confidence head` });
+  recordPrediction({
+    stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs: result.contact },
+    model: modelName,
+    tokens: tokenLayoutFrom(features.asym_id, features.residue_index),
+    ...foldContext,
+    settings: {
+      seed: foldContext.settings?.seed, mode: choice, samples, "diffusion steps": steps,
+      "trunk passes": 4, ...(propagation ? { "lag (ns)": propagation.lagNs, "propagation steps": propagation.steps } : {}),
+      ...(contacts === "" ? {} : { contacts }),
+    },
+  }, family);
+  void rememberSessionWhenSettled(lastPrediction);
+  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: result.samples[0].subarray(0, realAtoms * 3) };
+  // the chain gate the CLI tools assert, as a warning here (shared/af3/chain-geometry.js)
+  const geometry = chainGeometryOf(alphaCarbonSpacings(atomKeys, topology, result.samples[0]).spacing);
+  const verdict = Number.isFinite(geometry.caca) ? chainGeometryVerdict(geometry) : { ok: true };
+  const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  const residues = chains.reduce((total, chain) => total + chain.length, 0);
+  const named = (modifications ?? []).map((one) => `${one.code}${one.position}`);
+  status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
+    + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
+    + ` · ${samples} sample${samples === 1 ? "" : "s"} · ${steps} steps · ${seconds}s · no confidence head`
+    + (verdict.ok ? "" : " · NOT A CHAIN"));
+  progress(null);
+}
+
 /**
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
@@ -4440,6 +4664,7 @@ async function fold(event) {
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
       releaseAllWeights(await getDevice());
+      releaseBioemu2(await getDevice());
     }
     lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
@@ -4691,6 +4916,10 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
+    if (BIOEMU2_FAMILIES.includes(family)) {
+      await foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications });
+      return;
+    }
     if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
       // 🔴 MODIFICATIONS TRAVEL HERE TOO, AND USED NOT TO. `modelFamily`
       // refuses one for AlphaFold 2 by name - it would "return a confident
@@ -5533,6 +5762,10 @@ document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncAf3Count();
   syncMode();             // (the variant can grey the MSA row or give it back: what hangs off that row follows)
 });
+// BioEmu2's mode decides whether the propagation row shows, and its source whether the file box does
+for (const id of ["bioemu2-mode", "bioemu2-propagate-from"]) {
+  document.getElementById(id)?.addEventListener("change", () => syncBioemu2Controls());
+}
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
 // brought back into agreement exactly as a change event would - and
