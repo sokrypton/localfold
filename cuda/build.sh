@@ -57,7 +57,7 @@ if [ ! -f "$sobj" ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" != "$fstamp" ]; then
     || { echo "FAILED the standalone object" >> "$log"; echo failed > "$sobj.stamp"; exit 1; } ) &
   pids+=($!)
 fi
-for name in af3-featurise af2-featurise ef2-featurise resolve-templates chem-probe fetch-weights msa-search; do
+for name in af3-featurise af2-featurise ef2-featurise bioemu2-featurise resolve-templates chem-probe fetch-weights msa-search; do
   ln -sfn featurise "$here/featurise/$name"
 done
 # (no GPU: the featurisers still build, the ports cannot)

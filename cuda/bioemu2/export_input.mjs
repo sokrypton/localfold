@@ -4,6 +4,12 @@
 //   node cuda/bioemu2/export_input.mjs <out dir> --job=<AF3 job.json> | --sequence=<SEQ>[:<SEQ>...]
 //        [--mode=structure|equilibrium] [--contacts=<contacts.json>]
 //        [--propagate-from=<pdb|cif>] [--lag-ns=1] [--propagation-steps=1]
+//        [--a3m=<merged.a3m> | --a3m=<a.a3m>,<b.a3m>,...] [--paired-a3m=...]
+//
+// An alignment as the page hands one to its featuriser (web/bioemu2-model.js bioemu2Features): ONE path is the merged
+// A3M over the job's protein chains, split back a chain (shared/bioemu2/inputs.js splitA3mByChains) and given to every
+// chain of that sequence; several paths are one a protein chain, in job order. A SMILES ligand's template is the
+// page's too (inputs.js smilesTemplates). cuda/featurise's bioemu2-featurise is this file in C++, byte for byte.
 //
 // Entries (i int32, t float32), the vendor's own names (BioEmu2's atoms padded to a multiple of 32):
 //   per token   i res_type residue_index asym_id entity_id sym_id token_center_atom_index token_pad_mask
@@ -24,7 +30,7 @@ import { join, dirname } from "node:path";
 import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts, addPropagation, METHOD } from "../../shared/bioemu2/featurise.js";
 import { ccdUrl, ELEMENT_SYMBOLS } from "../../shared/af3/featurise/ccd-component.js";
 import { STANDARD_COMPONENTS } from "../../shared/af3/featurise/standard-components.js";
-import { smilesComponent } from "../../shared/chem/component.js";
+import { smilesTemplates as pageSmilesTemplates, splitA3mByChains } from "../../shared/bioemu2/inputs.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -86,15 +92,33 @@ if (option("smiles-from", "") !== "") {
   const { readBioemu2Dump, smilesTemplatesOf } = await import("../../tools/bioemu2-dump.js");
   Object.assign(smilesTemplates, smilesTemplatesOf(readBioemu2Dump(option("smiles-from", "")).stages));
 }
-for (const chain of job.chains) {
-  if (chain.smiles == null || smilesTemplates[chain.id]) continue;
-  const component = await smilesComponent(chain.smiles, { code: "LIG" });
-  smilesTemplates[chain.id] = {
-    names: component.atoms.map((a) => a.name), element: component.atoms.map((a) => a.element),
-    charge: component.atoms.map((a) => a.charge),
-    coords: Float32Array.from(component.atoms.flatMap((a) => [a.x, a.y, a.z])),
-    bonds: component.bonds.map((b) => [b.from, b.to]),
-  };
+if (Object.keys(smilesTemplates).length === 0) Object.assign(smilesTemplates, await pageSmilesTemplates(job));
+
+// ---- the alignments, as the page hands them over (see the header)
+const proteins = job.chains.filter((c) => c.kind === "protein");
+const alignmentsOf = (arg) => {
+  if (arg === "") return null;
+  const paths = arg.split(",");
+  if (paths.length === 1) return splitA3mByChains(readFileSync(paths[0], "utf8"), proteins.map((c) => c.sequence.length));
+  if (paths.length !== proteins.length) {
+    throw new Error(`${paths.length} alignments for ${proteins.length} protein chain(s): name one a chain, or one merged`);
+  }
+  return paths.map((path) => readFileSync(path, "utf8"));
+};
+const unpairedA3ms = alignmentsOf(option("a3m", ""));
+const pairedA3ms = alignmentsOf(option("paired-a3m", ""));
+if (unpairedA3ms !== null) {
+  if (option("a3m", "").split(",").length === 1) {
+    const bySequence = new Map(proteins.map((c, at) => [c.sequence.toUpperCase(),
+      { unpaired: unpairedA3ms[at], paired: pairedA3ms?.[at] ?? null }]));
+    for (const chain of proteins) {
+      const found = bySequence.get(chain.sequence.toUpperCase());
+      chain.unpairedMsa = found.unpaired;
+      chain.pairedMsa = found.paired;
+    }
+  } else {
+    proteins.forEach((chain, at) => { chain.unpairedMsa = unpairedA3ms[at]; chain.pairedMsa = pairedA3ms?.[at] ?? null; });
+  }
 }
 const contacts = option("contacts", "") ? parseContacts(JSON.parse(readFileSync(option("contacts", ""), "utf8"))) : null;
 let { features: f, atomKeys, tokens: T, atoms: realAtoms, atomsPadded: N, topology } =

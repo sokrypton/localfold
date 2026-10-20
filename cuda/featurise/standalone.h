@@ -31,6 +31,7 @@
 
 #include "af2_export.h"
 #include "esmfold2_export.h"
+#include "bioemu2_export.h"
 #include "fetch.h"
 
 namespace lf {
@@ -73,6 +74,17 @@ inline void featuriseEsmfold2Into(const Args& args, const std::string& dir) {
   for (auto& line : out.said) printf("%s\n", line.c_str());
   fflush(stdout);
 }
+
+inline void featuriseBioemu2Into(const Args& args, const std::string& dir) {
+  Bioemu2Export out = exportBioemu2(args);
+  fetch::makeDirs(dir);
+  writeText(dir + "/pdb.template", out.pdb);                     // (BEFORE the entries: model.idx releases a waiting fold)
+  writeText(dir + "/confidence.template.json", out.confidence);
+  out.entries.write(dir);
+  printf("%s\n", out.said.c_str());
+  fflush(stdout);
+}
+
 
 namespace standalone {
 

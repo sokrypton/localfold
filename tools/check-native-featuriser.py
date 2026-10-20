@@ -247,11 +247,31 @@ def cases():
                                                     {"ligand": {"id": "B", "smiles": "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"}}]), [], EF),
         ("ef2-1brs-a3m", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], EF),
     ]
+    # BioEmu2 (cuda/bioemu2/export_input.mjs): its own featuriser (shared/bioemu2/featurise.js), the page's SMILES
+    # templates and alignment split (shared/bioemu2/inputs.js)
+    B = ["bioemu2"]
+    BF = os.path.join(FIX, "bioemu2")
+    out += [(f"bioemu2-{n}", "bioemu2", os.path.join(BF, f"{n}.json"), [], B)
+            for n in ("6mrr", "6mrr-gol-sep", "rna-dna", "smiles", "6mrr-nag-ret", "heteromer")]
+    out += [
+        ("bioemu2-glycan", "bioemu2", os.path.join(FIX, "glycan-standalone.json"), [], B),
+        ("bioemu2-equilibrium-contacts", "bioemu2", os.path.join(BF, "6mrr.json"),
+         ["--mode=equilibrium", f"--contacts={BF}/contacts.json"], B),
+        ("bioemu2-a3m-per-chain", "bioemu2", os.path.join(BF, "heteromer-nomsa.json"),
+         [f"--a3m={BF}/msa/u0.a3m,{BF}/msa/u1.a3m,{BF}/msa/u2.a3m", f"--paired-a3m={BF}/msa/p0.a3m,{BF}/msa/p1.a3m,{BF}/msa/p2.a3m"], B),
+        ("bioemu2-a3m-merged", "bioemu2", os.path.join(BF, "heteromer-nomsa.json"),
+         [f"--a3m={BF}/msa/merged.a3m", f"--paired-a3m={BF}/msa/merged-paired.a3m"], B),
+        ("bioemu2-propagate-cif", "bioemu2", os.path.join(BF, "6mrr.json"),
+         [f"--propagate-from={BF}/6mrr-sample.cif", "--lag-ns=2.5", "--propagation-steps=3"], B),
+        ("bioemu2-propagate-pdb", "bioemu2", os.path.join(BF, "6mrr.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
+        ("bioemu2-wrong-frame-refused", "bioemu2", os.path.join(BF, "6mrr-gol-sep.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
+    ]
     if os.path.isdir(AF3_EXAMPLES):
         for name in sorted(os.listdir(AF3_EXAMPLES)):
             if name.endswith(".json"):
                 out.append((f"example-{name[:-5]}", "af3", os.path.join(AF3_EXAMPLES, name), [], ["af3", "boltz2", "rosettafold3"]))
                 out.append((f"ef2-example-{name[:-5]}", "ef2", os.path.join(AF3_EXAMPLES, name), [], ["ef2"]))
+                out.append((f"bioemu2-example-{name[:-5]}", "bioemu2", os.path.join(AF3_EXAMPLES, name), [], ["bioemu2"]))
     return out
 
 
@@ -322,7 +342,7 @@ def read_idx(path):
 
 def compare(js_dir, native_dir):
     """None when identical, else a sentence naming the first difference."""
-    for name in ("template.pdb", "pdb.template", "search.a3m"):
+    for name in ("template.pdb", "pdb.template", "search.a3m", "confidence.template.json"):
         a, b = os.path.join(js_dir, name), os.path.join(native_dir, name)
         if os.path.exists(a) != os.path.exists(b):
             return f"{name}: present on one side only"
@@ -402,7 +422,13 @@ def main():
                 job_path = os.path.join(base, "job.json")
                 json.dump(spec, open(job_path, "w"))
             args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")).replace("@F/", FIX + "/") for x in extra]
-            if port == "ef2":
+            if port == "bioemu2":
+                common = [f"--job={job_path}", *args]
+                js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "bioemu2", "export_input.mjs"), base + "/js", *common])
+                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "bioemu2-featurise"), base + "/native", *common, *ccd])
+                js_said = js_said.replace(base + "/js", "<out>")
+                nv_said = nv_said.replace(base + "/native", "<out>")
+            elif port == "ef2":
                 common = [f"--job={job_path}", *args]
                 js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "ef2", "export_input.mjs"), base + "/js", *common])
                 nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "ef2-featurise"), base + "/native", *common, *ccd])

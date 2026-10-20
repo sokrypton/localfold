@@ -3,6 +3,7 @@
 //   af3-featurise <out dir> --no-weights --family=<model> (--job=<job.json> | --sequence=...)    (af3_export.h)
 //   af2-featurise <out dir> (--bundle=<dir> | --weights=<dir>) (--job=<job.json> | --sequence=...)   (af2_export.h)
 //   ef2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
+//   bioemu2-featurise <out dir> (--job=<job.json> | --sequence=...)                           (bioemu2_export.h)
 //   resolve-templates <request.json> <out dir>                                                   (below)
 //   fetch-weights [--weights-dir=<dir>] <model>...          what each model's binary reads (fetch.h), by its --model
 //                                                            name (boltz2, model_3_ptm, ef2-fast-600m, ...), and
@@ -66,6 +67,18 @@ static int esmfold2Main(int argc, char** argv) {
   lf::Args args(list);
   try {
     lf::featuriseEsmfold2Into(args, args.positional);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "Error: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
+static int bioemu2Main(int argc, char** argv) {
+  std::vector<std::string> list(argv + 1, argv + argc);
+  lf::Args args(list);
+  try {
+    lf::featuriseBioemu2Into(args, args.positional);
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;
@@ -394,10 +407,11 @@ int main(int argc, char** argv) {
   if (self == "af3-featurise") return af3Main(argc, argv);
   if (self == "af2-featurise") return af2Main(argc, argv);
   if (self == "ef2-featurise") return esmfold2Main(argc, argv);
+  if (self == "bioemu2-featurise") return bioemu2Main(argc, argv);
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
   if (self == "fetch-weights" || self == "localfold-fetch") return fetchMain(argc, argv);   // (the wheel's name for it)
   if (self == "msa-search") return msaMain(argc, argv);
-  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates, fetch-weights or msa-search (not %s)\n", self.c_str());
+  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, bioemu2-featurise, resolve-templates, fetch-weights or msa-search (not %s)\n", self.c_str());
   return 2;
 }
