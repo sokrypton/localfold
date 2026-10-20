@@ -98,3 +98,187 @@ kernel void lf_points_global_bwd(LF_ARGS(PointsGlobalBwdArgs)) {
   device float* dr = a.dRig + i * 12;
   for (int k = 0; k < 12; ++k) { if (a.accumRig) dr[k] += acc[k]; else dr[k] = acc[k]; }
 }
+
+// ---------------------------------------------------------------- InvariantPointAttention: the attention weights
+// dLogit[q][h][k] = attn (dAttn - sum_j attn dAttn) * sqrt(1/3), the softmax's own backward with the forward's
+// scaling carried through. The mask penalty is a constant and contributes nothing.
+kernel void lf_ipa_dlogit(LF_ARGS(IpaDlogitArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.L * a.H) return;
+  device const float* at = a.attn + (ulong)t * a.L;
+  device const float* da = a.dAttn + (ulong)t * a.L;
+  device float* dl = a.dLogit + (ulong)t * a.L;
+  float corr = 0;
+  for (uint k = 0; k < a.L; ++k) corr += at[k] * da[k];
+  const float sc = sqrt(1.f / 3.f);
+  for (uint k = 0; k < a.L; ++k) dl[k] = at[k] * (da[k] - corr) * sc;
+}
+
+// per (query, head): the gradients that accumulate over KEYS
+kernel void lf_ipa_dq(LF_ARGS(IpaDqArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.L * a.H) return;
+  uint h = t % a.H, q = t / a.H;
+  device const float* dl = a.dLogit + (ulong)t * a.L;
+  const float w = a.pw[h];
+  device float* dqs = a.dqs + (ulong)t * a.Cs;
+  for (uint c = 0; c < a.Cs; ++c) {
+    float s = 0;
+    for (uint k = 0; k < a.L; ++k) s += dl[k] * a.ks[((ulong)k * a.H + h) * a.Cs + c];
+    dqs[c] = s;
+  }
+  float part = 0;
+  for (uint p = 0; p < a.Pq; ++p) {
+    float acc[3] = {0, 0, 0};
+    for (uint k = 0; k < a.L; ++k) {
+      float g = dl[k];
+      for (int x = 0; x < 3; ++x) {
+        float d = a.qp[((ulong)t * a.Pq + p) * 3 + x] - a.kp[(((ulong)k * a.H + h) * a.Pq + p) * 3 + x];
+        acc[x] += g * d;
+        part += g * (-0.5f) * d * d;
+      }
+    }
+    for (int x = 0; x < 3; ++x) a.dqp[((ulong)t * a.Pq + p) * 3 + x] = -w * acc[x];
+  }
+  a.dpwPart[t] = part;
+}
+
+// per (key, head): the gradients that accumulate over QUERIES
+kernel void lf_ipa_dk(LF_ARGS(IpaDkArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.L * a.H) return;
+  uint h = t % a.H, k = t / a.H;
+  const float w = a.pw[h];
+  device float* dks = a.dks + (ulong)t * a.Cs;
+  for (uint c = 0; c < a.Cs; ++c) {
+    float s = 0;
+    for (uint q = 0; q < a.L; ++q)
+      s += a.dLogit[((ulong)q * a.H + h) * a.L + k] * a.qs[((ulong)q * a.H + h) * a.Cs + c];
+    dks[c] = s;
+  }
+  for (uint p = 0; p < a.Pq; ++p) {
+    float acc[3] = {0, 0, 0};
+    for (uint q = 0; q < a.L; ++q) {
+      float g = a.dLogit[((ulong)q * a.H + h) * a.L + k];
+      for (int x = 0; x < 3; ++x)
+        acc[x] += g * (a.qp[(((ulong)q * a.H + h) * a.Pq + p) * 3 + x] - a.kp[((ulong)t * a.Pq + p) * 3 + x]);
+    }
+    for (int x = 0; x < 3; ++x) a.dkp[((ulong)t * a.Pq + p) * 3 + x] = w * acc[x];
+  }
+}
+
+kernel void lf_ipa_db2d(LF_ARGS(IpaDb2dArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.L * a.L * a.H) return;
+  uint h = (uint)(t % a.H), k = (uint)((t / a.H) % a.L), q = (uint)(t / ((ulong)a.H * a.L));
+  a.db2d[t] = a.dLogit[((ulong)q * a.H + h) * a.L + k];
+}
+
+kernel void lf_ipa_dpw(LF_ARGS(IpaDpwArgs)) {
+  uint h = (uint)LF_INDEX;
+  if (h >= a.H) return;
+  float s = 0;
+  for (uint q = 0; q < a.L; ++q) s += a.dpwPart[(ulong)q * a.H + h];
+  float r = a.raw[h];
+  a.dRaw[h] = s * a.base * (1.f / (1.f + exp(-r)));
+}
+
+// ---------------------------------------------------------------- InvariantPointAttention: the outputs
+// per (query, head): dAttn from all three blocks, the point cotangent dg the dv pass needs, and dRig's partial
+kernel void lf_ipa_out_dq(LF_ARGS(IpaOutDqArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.L * a.H) return;
+  uint h = t % a.H, q = t / a.H;
+  uint Fw = a.H * a.Cs + 4 * a.H * a.Pv + a.H * a.C2, base = a.H * a.Cs;
+  device const float* at = a.attn + (ulong)t * a.L;
+  device const float* df = a.df + (ulong)q * Fw;
+  device float* da = a.dAttn + (ulong)t * a.L;
+
+  float R[12];
+  for (int kk = 0; kk < 12; ++kk) R[kk] = a.rig[q * 12 + kk];
+  float dR[12];
+  for (int kk = 0; kk < 12; ++kk) dR[kk] = 0;
+
+  // the point block: g = sum_k attn vp, loc = R^T (g - t), and the forward's norm over loc
+  for (uint p = 0; p < a.Pv; ++p) {
+    float g[3] = {0, 0, 0};
+    for (uint k = 0; k < a.L; ++k)
+      for (int x = 0; x < 3; ++x) g[x] += at[k] * a.vp[(((ulong)k * a.H + h) * a.Pv + p) * 3 + x];
+    float d[3] = {g[0] - R[9], g[1] - R[10], g[2] - R[11]}, loc[3];
+    for (int j = 0; j < 3; ++j) loc[j] = R[j] * d[0] + R[3 + j] * d[1] + R[6 + j] * d[2];
+    uint idx = h * a.Pv + p;
+    float n2 = loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2];
+    float nrm = sqrt(max(n2, 1e-16f));
+    float dn = df[base + 3 * a.H * a.Pv + idx];
+    float dloc[3];
+    for (int x = 0; x < 3; ++x)
+      dloc[x] = df[base + x * a.H * a.Pv + idx] + (n2 > 1e-16f ? dn * loc[x] / nrm : 0.f);
+    // loc[j] = sum_m R[m][j] d[m], so dd[m] = sum_j R[m][j] dloc[j] and dR[m][j] += dloc[j] d[m]
+    float dd[3];
+    for (int m = 0; m < 3; ++m) {
+      dd[m] = R[m * 3] * dloc[0] + R[m * 3 + 1] * dloc[1] + R[m * 3 + 2] * dloc[2];
+      for (int j = 0; j < 3; ++j) dR[m * 3 + j] += dloc[j] * d[m];
+      dR[9 + m] -= dd[m];
+    }
+    for (int x = 0; x < 3; ++x) a.dg[((ulong)t * a.Pv + p) * 3 + x] = dd[x];
+  }
+  for (int kk = 0; kk < 12; ++kk) a.dRigPart[(ulong)t * 12 + kk] = dR[kk];
+
+  // dAttn: the scalar block, the point block through dg, and the pair block
+  for (uint k = 0; k < a.L; ++k) {
+    float s = 0;
+    for (uint c = 0; c < a.Cs; ++c) s += df[h * a.Cs + c] * a.vs[((ulong)k * a.H + h) * a.Cs + c];
+    for (uint p = 0; p < a.Pv; ++p)
+      for (int x = 0; x < 3; ++x)
+        s += a.dg[((ulong)t * a.Pv + p) * 3 + x] * a.vp[(((ulong)k * a.H + h) * a.Pv + p) * 3 + x];
+    for (uint c = 0; c < a.C2; ++c)
+      s += df[base + 4 * a.H * a.Pv + h * a.C2 + c] * a.act2d[((ulong)q * a.L + k) * a.C2 + c];
+    da[k] = s;
+  }
+}
+
+kernel void lf_ipa_out_drig(LF_ARGS(IpaOutDrigArgs)) {
+  uint q = (uint)LF_INDEX;
+  if (q >= a.L) return;
+  device float* dr = a.dRig + q * 12;
+  for (int kk = 0; kk < 12; ++kk) {
+    float s = 0;
+    for (uint h = 0; h < a.H; ++h) s += a.dRigPart[(((ulong)q * a.H + h) * 12) + kk];
+    if (a.accum) dr[kk] += s; else dr[kk] = s;
+  }
+}
+
+kernel void lf_ipa_out_dv(LF_ARGS(IpaOutDvArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.L * a.H) return;
+  uint h = t % a.H, k = t / a.H;
+  uint Fw = a.H * a.Cs + 4 * a.H * a.Pv + a.H * a.C2;
+  device float* dvs = a.dvs + (ulong)t * a.Cs;
+  for (uint c = 0; c < a.Cs; ++c) {
+    float s = 0;
+    for (uint q = 0; q < a.L; ++q)
+      s += a.attn[((ulong)q * a.H + h) * a.L + k] * a.df[(ulong)q * Fw + h * a.Cs + c];
+    dvs[c] = s;
+  }
+  for (uint p = 0; p < a.Pv; ++p)
+    for (int x = 0; x < 3; ++x) {
+      float s = 0;
+      for (uint q = 0; q < a.L; ++q)
+        s += a.attn[((ulong)q * a.H + h) * a.L + k] * a.dg[((((ulong)q * a.H + h) * a.Pv) + p) * 3 + x];
+      a.dvp[((ulong)t * a.Pv + p) * 3 + x] = s;
+    }
+}
+
+kernel void lf_ipa_out_d2d(LF_ARGS(IpaOutD2dArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.L * a.L) return;
+  uint k = (uint)(t % a.L), q = (uint)(t / a.L);
+  uint Fw = a.H * a.Cs + 4 * a.H * a.Pv + a.H * a.C2, off = a.H * a.Cs + 4 * a.H * a.Pv;
+  device float* d = a.dact2d + t * a.C2;
+  for (uint c = 0; c < a.C2; ++c) {
+    float s = 0;
+    for (uint h = 0; h < a.H; ++h)
+      s += a.attn[((ulong)q * a.H + h) * a.L + k] * a.df[(ulong)q * Fw + off + h * a.C2 + c];
+    d[c] = s;
+  }
+}

@@ -36,4 +36,29 @@ void pointsGlobalBwd(const float* proj, const float* rig, const float* dOut,
                      float* dProj, float* dRig, int L, int H, int P,
                      bool accumulateProj = false, bool accumulateRig = false);
 
+// ---------------------------------------------------------------- InvariantPointAttention, the core (Alg. 22)
+// The two halves of the IPA that are not linear layers: the attention weights and the outputs they weight. See
+// kernels.h for the forward each is the backward of, and for why each runs in three passes.
+
+// What the weights backward reads: the forward's own saved tensors, nothing recomputed.
+//   attn  [L][H][L] the softmax output      qs/ks  [L][H][Cs]      qp/kp  [L][H][Pq][3], in the GLOBAL frame
+//   pw    [H] the softplus-scaled point weight the logit uses
+//   pointWeightRaw  [H] the parameter behind it, needed only for dPointWeightRaw
+struct IpaWeightsSaved { const float* attn; const float* qs; const float* ks; const float* qp; const float* kp;
+                         const float* pw; const float* pointWeightRaw; };
+// Every one is WRITTEN, not accumulated. db2d is [L][L][H] - the pair bias's own layout, the head axis innermost -
+// and dPointWeightRaw may be null; the rest may not.
+struct IpaWeightsGrads { float* dqs; float* dks; float* dqp; float* dkp; float* db2d; float* dPointWeightRaw; };
+void ipaWeightsBwd(const IpaWeightsSaved& saved, const float* dAttn, int L, int H, int Cs, int Pq,
+                   float pointBase, IpaWeightsGrads& grads);
+
+// What the outputs backward reads. `rig` is the forward's rigid at this iteration - the point block comes back into
+// the LOCAL frame through it, so the rigid takes a gradient here as well as through the point projections.
+struct IpaOutputsSaved { const float* attn; const float* vs; const float* vp; const float* act2d; const float* rig; };
+// dAttn, dvs, dvp are written; dAct2d and dRig may be null, and dRig may accumulate (the same rigid feeds the point
+// projections of the same iteration).
+struct IpaOutputsGrads { float* dAttn; float* dvs; float* dvp; float* dAct2d; float* dRig; };
+void ipaOutputsBwd(const IpaOutputsSaved& saved, const float* dFinal, int L, int H, int Cs, int Pv, int C2,
+                   IpaOutputsGrads& grads, bool accumulateRig = false);
+
 }  // namespace mt

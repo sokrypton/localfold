@@ -1983,6 +1983,302 @@ static void pointsGlobalCase(int L, int H, int P) {
   release(dp); release(dr); release(dd); release(ddp); release(ddr);
 }
 
+// ---------------------------------------------------------------- InvariantPointAttention: the attention weights
+// The forward in double, exactly as af2_ipa_weights computes it. `attn` is produced HERE and handed to the kernel,
+// so both references and the kernel are differentiating one consistent softmax.
+static void ipaWForward(const std::vector<double>& qs, const std::vector<double>& ks,
+                        const std::vector<double>& qp, const std::vector<double>& kp,
+                        const std::vector<double>& b2d, const std::vector<double>& pwRaw,
+                        const std::vector<double>& mask, int L, int H, int Cs, int Pq, double base,
+                        std::vector<double>& attn) {
+  attn.assign((size_t)L * H * L, 0.0);
+  const double sc = sqrt(1.0 / 3.0);
+  for (int q = 0; q < L; ++q)
+    for (int h = 0; h < H; ++h) {
+      const double w = base * log(1.0 + exp(pwRaw[h]));
+      std::vector<double> s(L);
+      for (int k = 0; k < L; ++k) {
+        double d2 = 0;
+        for (int p = 0; p < Pq; ++p)
+          for (int x = 0; x < 3; ++x) {
+            double d = qp[(((size_t)q * H + h) * Pq + p) * 3 + x] - kp[(((size_t)k * H + h) * Pq + p) * 3 + x];
+            d2 += d * d;
+          }
+        double dot = 0;
+        for (int c = 0; c < Cs; ++c)
+          dot += qs[((size_t)q * H + h) * Cs + c] * ks[((size_t)k * H + h) * Cs + c];
+        s[k] = (dot - 0.5 * w * d2 + b2d[((size_t)q * L + k) * H + h] - 1e5 * (1 - mask[q] * mask[k])) * sc;
+      }
+      double mx = s[0];
+      for (int k = 1; k < L; ++k) mx = std::max(mx, s[k]);
+      double sum = 0;
+      for (int k = 0; k < L; ++k) { s[k] = exp(s[k] - mx); sum += s[k]; }
+      for (int k = 0; k < L; ++k) attn[((size_t)q * H + h) * L + k] = s[k] / sum;
+    }
+}
+
+static void ipaWeightsCase(int L, int H, int Cs, int Pq) {
+  const size_t lhc = (size_t)L * H * Cs, lhp = (size_t)L * H * Pq * 3, pb = (size_t)L * L * H;
+  const double base = sqrt(1.0 / (Pq * 9.0 / 2.0));
+  std::vector<double> qs = randv(lhc, 0.5), ks = randv(lhc, 0.5), qp = randv(lhp, 0.5), kp = randv(lhp, 0.5),
+                      b2d = randv(pb, 0.5), pwRaw = randv(H, 0.5), dAttn = randv((size_t)L * H * L, 0.5),
+                      mask(L, 1.0);
+  for (int i = 0; i < L; ++i) if (i % 5 == 3) mask[i] = 0.0;   // AF2's -1e5 penalty on a masked pair
+
+  std::vector<double> attn;
+  ipaWForward(qs, ks, qp, kp, b2d, pwRaw, mask, L, H, Cs, Pq, base, attn);
+
+  // reference one: the analytic backward, in double
+  std::vector<double> rqs(lhc, 0), rks(lhc, 0), rqp(lhp, 0), rkp(lhp, 0), rb2d(pb, 0), rpw(H, 0),
+      dLogit((size_t)L * H * L, 0);
+  const double sc = sqrt(1.0 / 3.0);
+  for (int q = 0; q < L; ++q)
+    for (int h = 0; h < H; ++h) {
+      double corr = 0;
+      for (int k = 0; k < L; ++k) corr += attn[((size_t)q * H + h) * L + k] * dAttn[((size_t)q * H + h) * L + k];
+      for (int k = 0; k < L; ++k) {
+        size_t t = ((size_t)q * H + h) * L + k;
+        dLogit[t] = attn[t] * (dAttn[t] - corr) * sc;
+      }
+    }
+  for (int q = 0; q < L; ++q)
+    for (int h = 0; h < H; ++h) {
+      const double w = base * log(1.0 + exp(pwRaw[h]));
+      for (int k = 0; k < L; ++k) {
+        double g = dLogit[((size_t)q * H + h) * L + k];
+        rb2d[((size_t)q * L + k) * H + h] = g;
+        for (int c = 0; c < Cs; ++c) {
+          rqs[((size_t)q * H + h) * Cs + c] += g * ks[((size_t)k * H + h) * Cs + c];
+          rks[((size_t)k * H + h) * Cs + c] += g * qs[((size_t)q * H + h) * Cs + c];
+        }
+        for (int p = 0; p < Pq; ++p)
+          for (int x = 0; x < 3; ++x) {
+            size_t qi = (((size_t)q * H + h) * Pq + p) * 3 + x, ki = (((size_t)k * H + h) * Pq + p) * 3 + x;
+            double d = qp[qi] - kp[ki];
+            rqp[qi] += -w * g * d;
+            rkp[ki] += w * g * d;
+            rpw[h] += g * (-0.5) * d * d;
+          }
+      }
+    }
+  for (int h = 0; h < H; ++h) rpw[h] *= base / (1.0 + exp(-pwRaw[h]));
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* bAttn = up(attn); void* bQs = up(qs); void* bKs = up(ks); void* bQp = up(qp); void* bKp = up(kp);
+  std::vector<double> pwv(H);
+  for (int h = 0; h < H; ++h) pwv[h] = base * log(1.0 + exp(pwRaw[h]));
+  void* bPw = up(pwv); void* bRaw = up(pwRaw); void* bDa = up(dAttn);
+  void* gqs = alloc(lhc * 4); void* gks = alloc(lhc * 4); void* gqp = alloc(lhp * 4); void* gkp = alloc(lhp * 4);
+  void* gb2d = alloc(pb * 4); void* gpw = alloc((size_t)H * 4);
+
+  IpaWeightsSaved saved{(const float*)bAttn, (const float*)bQs, (const float*)bKs, (const float*)bQp,
+                        (const float*)bKp, (const float*)bPw, (const float*)bRaw};
+  IpaWeightsGrads grads{(float*)gqs, (float*)gks, (float*)gqp, (float*)gkp, (float*)gb2d, (float*)gpw};
+  ipaWeightsBwd(saved, (const float*)bDa, L, H, Cs, Pq, (float)base, grads);
+
+  char label[200], shape[80];
+  snprintf(shape, sizeof shape, "L%d H%d Cs%d Pq%d", L, H, Cs, Pq);
+  auto chk = [&](const char* what, const std::vector<double>& ref, void* got, size_t n, double bound) {
+    snprintf(label, sizeof label, "IPA weights bwd %s %s", what, shape);
+    report(label, relRms(ref, download((const float*)got, n)), bound);
+  };
+  chk("dqs", rqs, gqs, lhc, 1e-5);
+  chk("dks", rks, gks, lhc, 1e-5);
+  chk("dqp", rqp, gqp, lhp, 1e-5);
+  chk("dkp", rkp, gkp, lhp, 1e-5);
+  chk("db2d", rb2d, gb2d, pb, 1e-5);
+  chk("dPointWeightRaw", rpw, gpw, H, 1e-5);
+
+  // reference two: sampled central differences against the FORWARD alone
+  auto S_ = [&]() {
+    std::vector<double> a;
+    ipaWForward(qs, ks, qp, kp, b2d, pwRaw, mask, L, H, Cs, Pq, base, a);
+    double acc = 0;
+    for (size_t i = 0; i < a.size(); ++i) acc += dAttn[i] * a[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    snprintf(label, sizeof label, "IPA weights %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 3e-5);
+  };
+  probe("dqs", qs, download((const float*)gqs, lhc), 5);
+  probe("dks", ks, download((const float*)gks, lhc), 5);
+  probe("dqp", qp, download((const float*)gqp, lhp), 5);
+  probe("dkp", kp, download((const float*)gkp, lhp), 5);
+  probe("db2d", b2d, download((const float*)gb2d, pb), 5);
+  probe("dPointWeightRaw", pwRaw, download((const float*)gpw, H), H < 3 ? H : 3);
+
+  release(bAttn); release(bQs); release(bKs); release(bQp); release(bKp); release(bPw); release(bRaw);
+  release(bDa); release(gqs); release(gks); release(gqp); release(gkp); release(gb2d); release(gpw);
+}
+
+// ---------------------------------------------------------------- InvariantPointAttention: the outputs
+static void ipaOForward(const std::vector<double>& attn, const std::vector<double>& vs,
+                        const std::vector<double>& vp, const std::vector<double>& act2d,
+                        const std::vector<double>& rig, int L, int H, int Cs, int Pv, int C2,
+                        std::vector<double>& fin) {
+  const int Fw = H * Cs + 4 * H * Pv + H * C2, base = H * Cs;
+  fin.assign((size_t)L * Fw, 0.0);
+  for (int q = 0; q < L; ++q) {
+    const double* r = &rig[(size_t)q * 12];
+    for (int h = 0; h < H; ++h) {
+      const double* at = &attn[((size_t)q * H + h) * L];
+      double* f = &fin[(size_t)q * Fw];
+      for (int c = 0; c < Cs; ++c) {
+        double s = 0;
+        for (int k = 0; k < L; ++k) s += at[k] * vs[((size_t)k * H + h) * Cs + c];
+        f[h * Cs + c] = s;
+      }
+      for (int p = 0; p < Pv; ++p) {
+        double g[3] = {0, 0, 0};
+        for (int k = 0; k < L; ++k)
+          for (int x = 0; x < 3; ++x) g[x] += at[k] * vp[(((size_t)k * H + h) * Pv + p) * 3 + x];
+        double d[3] = {g[0] - r[9], g[1] - r[10], g[2] - r[11]}, loc[3];
+        for (int j = 0; j < 3; ++j) loc[j] = r[j] * d[0] + r[3 + j] * d[1] + r[6 + j] * d[2];
+        int idx = h * Pv + p;
+        for (int x = 0; x < 3; ++x) f[base + x * H * Pv + idx] = loc[x];
+        f[base + 3 * H * Pv + idx] = sqrt(std::max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16));
+      }
+      for (int c = 0; c < C2; ++c) {
+        double s = 0;
+        for (int k = 0; k < L; ++k) s += at[k] * act2d[((size_t)q * L + k) * C2 + c];
+        f[base + 4 * H * Pv + h * C2 + c] = s;
+      }
+    }
+  }
+}
+
+static void ipaOutputsCase(int L, int H, int Cs, int Pv, int C2) {
+  const int Fw = H * Cs + 4 * H * Pv + H * C2, base = H * Cs;
+  const size_t an = (size_t)L * H * L, vsn = (size_t)L * H * Cs, vpn = (size_t)L * H * Pv * 3,
+               a2n = (size_t)L * L * C2;
+  // a genuine softmax for attn, so the magnitudes are the forward's
+  std::vector<double> attn(an), vs = randv(vsn), vp = randv(vpn), act2d = randv(a2n), rig = randv((size_t)L * 12),
+                      df = randv((size_t)L * Fw, 0.5);
+  {
+    std::vector<double> raw = randv(an);
+    for (size_t r = 0; r < an / L; ++r) {
+      double mx = raw[r * L], sum = 0;
+      for (int k = 1; k < L; ++k) mx = std::max(mx, raw[r * L + k]);
+      for (int k = 0; k < L; ++k) { attn[r * L + k] = exp(raw[r * L + k] - mx); sum += attn[r * L + k]; }
+      for (int k = 0; k < L; ++k) attn[r * L + k] /= sum;
+    }
+  }
+
+  // reference one: the analytic backward, in double
+  std::vector<double> rda(an, 0), rdvs(vsn, 0), rdvp(vpn, 0), rda2(a2n, 0), rdr((size_t)L * 12, 0),
+      dgAll((size_t)L * H * Pv * 3, 0);
+  for (int q = 0; q < L; ++q) {
+    const double* r = &rig[(size_t)q * 12];
+    for (int h = 0; h < H; ++h) {
+      const double* at = &attn[((size_t)q * H + h) * L];
+      const double* f = &df[(size_t)q * Fw];
+      for (int p = 0; p < Pv; ++p) {
+        double g[3] = {0, 0, 0};
+        for (int k = 0; k < L; ++k)
+          for (int x = 0; x < 3; ++x) g[x] += at[k] * vp[(((size_t)k * H + h) * Pv + p) * 3 + x];
+        double d[3] = {g[0] - r[9], g[1] - r[10], g[2] - r[11]}, loc[3];
+        for (int j = 0; j < 3; ++j) loc[j] = r[j] * d[0] + r[3 + j] * d[1] + r[6 + j] * d[2];
+        int idx = h * Pv + p;
+        double n2 = loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], nrm = sqrt(std::max(n2, 1e-16));
+        double dn = f[base + 3 * H * Pv + idx], dloc[3];
+        for (int x = 0; x < 3; ++x)
+          dloc[x] = f[base + x * H * Pv + idx] + (n2 > 1e-16 ? dn * loc[x] / nrm : 0.0);
+        double dd[3];
+        for (int m = 0; m < 3; ++m) {
+          dd[m] = r[m * 3] * dloc[0] + r[m * 3 + 1] * dloc[1] + r[m * 3 + 2] * dloc[2];
+          for (int j = 0; j < 3; ++j) rdr[(size_t)q * 12 + m * 3 + j] += dloc[j] * d[m];
+          rdr[(size_t)q * 12 + 9 + m] -= dd[m];
+          dgAll[((((size_t)q * H + h) * Pv) + p) * 3 + m] = dd[m];
+        }
+      }
+      for (int k = 0; k < L; ++k) {
+        double s = 0;
+        for (int c = 0; c < Cs; ++c) {
+          s += f[h * Cs + c] * vs[((size_t)k * H + h) * Cs + c];
+          rdvs[((size_t)k * H + h) * Cs + c] += at[k] * f[h * Cs + c];
+        }
+        for (int p = 0; p < Pv; ++p)
+          for (int x = 0; x < 3; ++x) {
+            double dgv = dgAll[((((size_t)q * H + h) * Pv) + p) * 3 + x];
+            s += dgv * vp[(((size_t)k * H + h) * Pv + p) * 3 + x];
+            rdvp[(((size_t)k * H + h) * Pv + p) * 3 + x] += at[k] * dgv;
+          }
+        for (int c = 0; c < C2; ++c) {
+          s += f[base + 4 * H * Pv + h * C2 + c] * act2d[((size_t)q * L + k) * C2 + c];
+          rda2[((size_t)q * L + k) * C2 + c] += at[k] * f[base + 4 * H * Pv + h * C2 + c];
+        }
+        rda[((size_t)q * H + h) * L + k] = s;
+      }
+    }
+  }
+
+  auto up = [&](const std::vector<double>& x) { auto fv = toF(x); return uploadNew(fv.data(), fv.size()); };
+  void* bAt = up(attn); void* bVs = up(vs); void* bVp = up(vp); void* bA2 = up(act2d); void* bR = up(rig);
+  void* bDf = up(df);
+  void* gda = alloc(an * 4); void* gdvs = alloc(vsn * 4); void* gdvp = alloc(vpn * 4);
+  void* gda2 = alloc(a2n * 4); void* gdr = alloc((size_t)L * 12 * 4);
+
+  IpaOutputsSaved saved{(const float*)bAt, (const float*)bVs, (const float*)bVp, (const float*)bA2,
+                        (const float*)bR};
+  IpaOutputsGrads grads{(float*)gda, (float*)gdvs, (float*)gdvp, (float*)gda2, (float*)gdr};
+  ipaOutputsBwd(saved, (const float*)bDf, L, H, Cs, Pv, C2, grads);
+
+  char label[200], shape[80];
+  snprintf(shape, sizeof shape, "L%d H%d Cs%d Pv%d C2%d", L, H, Cs, Pv, C2);
+  auto chk = [&](const char* what, const std::vector<double>& ref, void* got, size_t n, double bound) {
+    snprintf(label, sizeof label, "IPA outputs bwd %s %s", what, shape);
+    report(label, relRms(ref, download((const float*)got, n)), bound);
+  };
+  chk("dAttn", rda, gda, an, 1e-5);
+  chk("dvs", rdvs, gdvs, vsn, 1e-5);
+  chk("dvp", rdvp, gdvp, vpn, 1e-5);
+  chk("dAct2d", rda2, gda2, a2n, 1e-5);
+  chk("dRig", rdr, gdr, (size_t)L * 12, 1e-5);
+
+  auto S_ = [&]() {
+    std::vector<double> fin;
+    ipaOForward(attn, vs, vp, act2d, rig, L, H, Cs, Pv, C2, fin);
+    double acc = 0;
+    for (size_t i = 0; i < fin.size(); ++i) acc += df[i] * fin[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    snprintf(label, sizeof label, "IPA outputs %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 3e-5);
+  };
+  probe("dAttn", attn, download((const float*)gda, an), 5);
+  probe("dvs", vs, download((const float*)gdvs, vsn), 5);
+  probe("dvp", vp, download((const float*)gdvp, vpn), 5);
+  probe("dAct2d", act2d, download((const float*)gda2, a2n), 5);
+  probe("dRig", rig, download((const float*)gdr, (size_t)L * 12), 6);
+
+  release(bAt); release(bVs); release(bVp); release(bA2); release(bR); release(bDf);
+  release(gda); release(gdvs); release(gdvp); release(gda2); release(gdr);
+}
+
 // ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
 // The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
 // design-sized complex, which is what has to fit in 16 GB of unified memory.
@@ -2193,6 +2489,14 @@ int main(int argc, char** argv) {
   pointsGlobalCase(6, 3, 4);        // AF2's IPA: 12 heads of 4 query points and 8 value points
   pointsGlobalCase(4, 12, 8);
   pointsGlobalCase(9, 1, 1);        // the degenerate shape, where a stride bug has nowhere to hide and must not
+  printf("the structure module: InvariantPointAttention's attention weights (Alg. 22)\n");
+  ipaWeightsCase(7, 3, 6, 2);
+  ipaWeightsCase(5, 2, 4, 4);       // AF2's own num_point_qk
+  ipaWeightsCase(6, 1, 16, 4);      // AF2's num_scalar_qk, one head
+  printf("the structure module: InvariantPointAttention's outputs\n");
+  ipaOutputsCase(6, 3, 4, 2, 5);
+  ipaOutputsCase(5, 2, 6, 4, 8);
+  ipaOutputsCase(4, 1, 16, 8, 12);  // AF2's num_scalar_v and num_point_v
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

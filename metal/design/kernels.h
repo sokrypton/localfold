@@ -210,3 +210,39 @@ struct RigidUpdBwdArgs { CP(float) rigOld; CP(float) upd; CP(float) dRigNew; DP(
 // blocks (x[0:P], y[P:2P], z[2P:3P]) a head. Given dOut [L][H][P][3]: dProj [L][H*3*P] and dRig [L][12].
 struct PointsGlobalBwdArgs { CP(float) proj; CP(float) rig; CP(float) dOut; DP(float) dProj; DP(float) dRig;
                              uint L, H, P, accumProj; uint accumRig, pad; };
+
+// ---------------------------------------------------------------- InvariantPointAttention, the core
+// The forward is af2_ipa_weights and af2_ipa_outputs. Its logit, for a query q, a head h and a key k:
+//
+//   s = sum_c qs[q][h][c] ks[k][h][c]  -  0.5 w[h] sum_{p,x} (qp[q][h][p][x] - kp[k][h][p][x])^2
+//       + b2d[q][k][h]  -  1e5 (1 - mask[q] mask[k])
+//   s *= sqrt(1/3)                                then attn[q][h][:] = softmax(s)
+//
+// w[h] is softplus(raw[h]) * base, so its own gradient goes back through that. The mask term is constant.
+//
+// THREE PASSES, as the flash-shaped attention backward above is, and for the same reason: dqs and dqp accumulate
+// over KEYS while dks and dkp accumulate over QUERIES, so no single thread assignment serves both. dLogit is
+// materialised once (the same size as attn, which the forward already holds) so that both passes read it instead of
+// recomputing the softmax, and so that the pass order cannot change the answer.
+struct IpaDlogitArgs { CP(float) attn; CP(float) dAttn; DP(float) dLogit; uint L, H, pad, pad2; };
+// per (query, head): dqs, dqp, and dpw's partial - summed over queries by lf_ipa_dpw in a fixed order
+struct IpaDqArgs { CP(float) dLogit; CP(float) ks; CP(float) qp; CP(float) kp; CP(float) pw;
+                   DP(float) dqs; DP(float) dqp; DP(float) dpwPart; uint L, H, Cs, Pq; };
+// per (key, head): dks, dkp
+struct IpaDkArgs { CP(float) dLogit; CP(float) qs; CP(float) qp; CP(float) kp; CP(float) pw;
+                   DP(float) dks; DP(float) dkp; uint L, H, Cs, Pq; };
+// db2d[q][k][h] = dLogit[q][h][k] - the head axis moves, which is the whole kernel
+struct IpaDb2dArgs { CP(float) dLogit; DP(float) db2d; uint L, H, pad, pad2; };
+// the trainable point weight, through its softplus: dRaw[h] = sum_q dpwPart[q][h] * base * sigmoid(raw[h])
+struct IpaDpwArgs { CP(float) dpwPart; CP(float) raw; DP(float) dRaw; uint L, H; float base; uint pad; };
+
+// The outputs: per (query, head) a scalar block (attn . vs), a point block (attn . vp taken back into the LOCAL
+// frame, with its norm) and a pair block (attn . act2d), laid out as
+//   [H*Cs | local x | local y | local z | norms | H*C2],  Fw = H*Cs + 4*H*Pv + H*C2
+// dRig is accumulated through a per-head partial for the same determinism reason as above.
+struct IpaOutDqArgs { CP(float) attn; CP(float) df; CP(float) vs; CP(float) vp; CP(float) act2d; CP(float) rig;
+                      DP(float) dAttn; DP(float) dg; DP(float) dRigPart; uint L, H, Cs, Pv; uint C2, pad; };
+struct IpaOutDrigArgs { CP(float) dRigPart; DP(float) dRig; uint L, H, accum, pad; };
+struct IpaOutDvArgs { CP(float) attn; CP(float) df; CP(float) dg; DP(float) dvs; DP(float) dvp;
+                      uint L, H, Cs, Pv; uint C2, pad; };
+struct IpaOutD2dArgs { CP(float) attn; CP(float) df; DP(float) dact2d; uint L, H, Cs, Pv; uint C2, pad; };
