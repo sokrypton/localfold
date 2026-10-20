@@ -131,6 +131,20 @@ def main():
       record[f'denoise{k}.out'] = enc(out)
       err = np.sqrt(((np.asarray(out)[:len(x0)] - clean[:len(x0)]) ** 2).sum(-1).mean())
       print(f'denoise sigma {sigma:7.2f}: rms to the clean structure {err:.3f} A')
+    # the denoiser's vector-Jacobian product (what edm_fkc differentiates), w.r.t. the coordinates AND sigma, for a
+    # seeded random cotangent on the real atoms
+    vjp_fn = jax.jit(hk.transform(lambda f, ctx, si, s, x, sg: Holder().b.denoise(f, ctx, si, s, x, sg)).apply)
+    for k, sigma in enumerate((16.0, 1.0)):
+      x = clean + sigma * rng.standard_normal(clean.shape).astype(np.float32)
+      x[len(x0):] = 0
+      w = rng.standard_normal(clean.shape).astype(np.float32)
+      w[len(x0):] = 0
+      def scalar(xx, sg):
+        return jnp.sum(jnp.asarray(w) * vjp_fn(params, key, fj, ctx, s_inputs, s, xx, sg))
+      gx, gs = jax.jit(jax.grad(scalar, argnums=(0, 1)))(jnp.asarray(x), jnp.float32(sigma))
+      record.update({f'vjp{k}.sigma': sigma, f'vjp{k}.x': enc(x), f'vjp{k}.w': enc(w),
+                     f'vjp{k}.gx': enc(gx), f'vjp{k}.gs': float(gs)})
+      print(f'vjp at sigma {sigma}: |gx| {float(jnp.sqrt((gx ** 2).sum())):.4f}, d/dsigma {float(gs):.6f}')
     # propagation: conditioned on the clean frame at a 1 ns lag
     g = bf.add_propagation(f, x0, 1.0)
     gj = dict(fj, coords_cond=jnp.asarray(g['coords_cond']), dt=jnp.float32(g['dt']),

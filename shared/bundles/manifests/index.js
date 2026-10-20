@@ -349,7 +349,7 @@ export const MODEL_BUNDLES = {
   bioemu2: {
     model: "bioemu2",
     directory: "./model-bioemu2-int5/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/22aeab93c72c8fae24604221d351e6513162a28e/bioemu2-int5/",
     release: "bioemu2-int5",
     variable: "LOCALFOLD_INCLUDE_BIOEMU2_MODEL",
     load: () => import("./bioemu2.js"),
