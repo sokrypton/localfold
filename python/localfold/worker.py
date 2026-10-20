@@ -20,7 +20,8 @@ naming it (Refused), never a nearby setting run instead: the removed Flow sample
 template on AlphaFold 2's template-free models.
 
 Ports: cuda/af3 (all seven AF3-lineage models), cuda/af2 (all five of each, monomer and multimer),
-cuda/ef2 (ESMFold2, 600M and 300M). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
+cuda/ef2 (ESMFold2, 600M and 300M), cuda/bioemu2 (BioEmu2: its modes, contacts, propagation and steering from the
+page's controls). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
 
 🔴 AND ON A MAC THE SAME WORKER DRIVES metal/<port>: the Metal ports take the CUDA ports' flags and speak the same
 --serve protocol (metal/core/host.cpp), so what differs is where the binaries are, how the GPU is named and how full it
@@ -48,6 +49,8 @@ WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR")     # (where fetch-weights
 # ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
 # (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
 ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
+# BioEmu2's: the vendor's 200 (web/bioemu2-model.js BIOEMU2_DEFAULT_STEPS)
+BIOEMU2_DEFAULT_STEPS = 200
 
 
 def atomised_job(text):
@@ -286,6 +289,18 @@ def polymer_chains(job_json):
     return out
 
 
+def protein_sequences(job_json):
+    """The job's protein chains in job order, one per copy (BioEmu2's alignment is a chain's own)."""
+    spec = json.loads(job_json)
+    spec = spec[0] if isinstance(spec, list) else spec
+    out = []
+    for entry in spec.get("sequences", []):
+        if "protein" in entry:
+            body = entry["protein"]
+            out += [body["sequence"].upper()] * (len(body["id"]) if isinstance(body.get("id"), list) else 1)
+    return out
+
+
 def protein_chain_count(job_json):
     """How many of the job's chains are protein, one per copy."""
     spec = json.loads(job_json)
@@ -499,9 +514,11 @@ class Worker:
             port = "af2"
         elif family in ("ef2-fast-600m", "ef2-fast-300m", "ef2-fast", "ef2"):
             port = "ef2"          # (ef2-fast and ef2: biohub's released two, on ESM-C 6B, from local exports)
+        elif family == "bioemu2":
+            port = "bioemu2"
         else:
-            raise Refused(f"the {NATIVE_NAME} backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
-                          " and ESMFold2)")
+            raise Refused(f"the {NATIVE_NAME} backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2,"
+                          " ESMFold2 and BioEmu2)")
         # one sampler: a job from an older page that still asks for Flow is refused by name, not folded otherwise
         if controls.get("af3-mode", "diffusion") != "diffusion":
             raise Refused("Flow was removed - every fold samples with diffusion now (docs/AF3.md, \"Flow removed\")")
@@ -562,6 +579,8 @@ class Worker:
             dev("resolving the templates", (time.time() - at) * 1000, begin=at)
         if templates and port == "ef2":
             raise Refused("ESMFold2 takes no template")
+        if templates and port == "bioemu2":
+            raise Refused("BioEmu2 takes no template")
         searched = [t["chain"] for t in templates if t["kind"] == "search"]
         if searched and mode != "search":
             raise Refused("a template from the MSA search needs an MSA search: set the MSA to search, or name a"
@@ -641,6 +660,9 @@ class Worker:
             dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
+        elif port == "bioemu2":
+            server, fold, total = self.bioemu2(job, controls, flags, job_path, residues, seed, recycles, log, live)
+            key = server.key
         else:
             # (the same port for all four: it reads its widths, its recycle and its MSA encoder off the bundles)
             at = time.time()
@@ -739,7 +761,10 @@ class Worker:
             offset += ms / 1000
         collect_started = time.time()
         self.evict(key)
-        if not any("pLDDT" in line for line in said.splitlines()):
+        if port == "bioemu2":
+            if not any(line.startswith("-> ") for line in said.splitlines()):
+                raise RuntimeError("the fold wrote no structure")
+        elif not any("pLDDT" in line for line in said.splitlines()):
             raise RuntimeError("the fold printed no confidence line")
         emit("progress", 1.0)
         result = self.collect(out_pdb, family, port, job, time.time() - started)
@@ -758,6 +783,73 @@ class Worker:
             result["status"] += f" · converged at {converged.group(1)} Å after {converged.group(2)} passes"
         return result
 
+    def bioemu2(self, job, controls, flags, job_path, residues, seed, recycles, log, live):
+        """BioEmu2's featuriser (cuda/featurise/bioemu2-featurise, byte for byte cuda/bioemu2/export_input.mjs and so
+        the page's shared/bioemu2/featurise.js) and its server, the page's controls passed through: its mode, its sample
+        count, its contacts, its propagation (the starting frame the page sends with the job, `bioemu2Frame`) and its
+        sampler (edm, or the steered edm_gd / edm_fk)."""
+        family = "bioemu2"
+        at = time.time()
+        weights = model_weights("bioemu2", log)
+        dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
+        key = ("bioemu2", family)
+        server = self.server_for(key, [binary("bioemu2"), "-", f"--weights={weights[0]}", "--fast"], residues)
+        choice = controls.get("bioemu2-mode") or "structure"
+        export = [featuriser("bioemu2-featurise"), os.path.join(WORK, "in"), f"--job={job_path}",
+                  f"--mode={'equilibrium' if choice == 'propagate' else choice}"]
+        contacts = (controls.get("bioemu2-contacts") or "").strip()
+        if contacts:
+            path = os.path.join(WORK, "contacts.json")
+            with open(path, "w") as handle:
+                handle.write(contacts)
+            export.append(f"--contacts={path}")
+        if choice == "propagate":
+            frame = job.get("bioemu2Frame")
+            if not frame:
+                raise Refused("propagation starts from a structure of this same input - fold it with BioEmu2 first, or"
+                              " upload a PDB of it")
+            path = os.path.join(WORK, "frame.pdb")
+            with open(path, "w") as handle:
+                handle.write(frame)
+            lag = controls.get("bioemu2-lag") or 1
+            if not float(lag) > 0:
+                raise Refused("the propagation lag must be a positive number of nanoseconds")
+            export += [f"--propagate-from={path}", f"--lag-ns={lag}",
+                       f"--propagation-steps={max(1, int(controls.get('bioemu2-propagation-steps') or 1))}"]
+        # the alignment: the page's paste or upload as it hands them over; a search through the native MMseqs2 client,
+        # each protein chain's unpaired and paired rows kept apart (msa-search), as BioEmu2's Boltz-1 MSA reads them
+        if "--search" in flags:
+            proteins = protein_sequences(job["job"])
+            if not proteins:
+                raise Refused("an MSA search needs a protein chain")
+            searched = os.path.join(WORK, "bioemu2-search.json")
+            featurise([featuriser("msa-search"), searched, "--sequence=" + ":".join(proteins)], "searching", log, live)
+            found = {}
+            for entry in json.load(open(searched))["sequences"]:
+                body = entry["protein"]
+                found[body["sequence"].upper()] = (body.get("unpairedMsa") or "", body.get("pairedMsa") or "")
+            paths = {"unpaired": [], "paired": []}
+            for index, sequence in enumerate(proteins):
+                for side, text in zip(("unpaired", "paired"), found[sequence]):
+                    path = os.path.join(WORK, f"bioemu2-{side}-{index}.a3m")
+                    with open(path, "w") as handle:
+                        handle.write(text)
+                    paths[side].append(path)
+            export.append("--a3m=" + ",".join(paths["unpaired"]))
+            if len(set(proteins)) > 1:
+                export.append("--paired-a3m=" + ",".join(paths["paired"]))
+        else:
+            export += flags
+        at = time.time()
+        featurise([*export, *local_ccd()], "featurising", log, live)
+        dev("featurising" + (" and the MMseqs2 search" if "--search" in flags else ""), (time.time() - at) * 1000, begin=at)
+        steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or BIOEMU2_DEFAULT_STEPS)
+        fold = [f"--out={os.path.join(WORK, 'fold.pdb')}", f"--steps={steps}", f"--seed={seed}",
+                f"--samples={max(1, int(controls.get('bioemu2-samples') or 1))}"]
+        if recycles not in (None, ""):
+            fold.append(f"--passes={int(recycles) + 1}")
+        return server, fold, steps
+
     def collect(self, pdb_path, family, port, job, seconds):
         stem = pdb_path[:-4]
         pdb = open(pdb_path).read()
@@ -768,7 +860,7 @@ class Worker:
         summary = json.load(open(f"{stem}_summary_confidences.json"))
         chain_ids = confidences["token_chain_ids"]
         res_ids = confidences["token_res_ids"]
-        plddt = confidences.get("token_plddts") or token_plddt(pdb_atoms(pdb), chain_ids, res_ids)
+        plddt = confidences.get("token_plddts") or ([0] if port == "bioemu2" else token_plddt(pdb_atoms(pdb), chain_ids, res_ids))
 
         raw = {}
 
@@ -787,6 +879,24 @@ class Worker:
         if summary.get("iptm") is not None:
             confidence["iptm"] = summary["iptm"]
         mean = confidence["meanPlddt"]
+        if port == "bioemu2":
+            # 🔴 NO CONFIDENCE HEAD: the B-factors are zero, and the page says so rather than show a pLDDT of 0. Every
+            # sample's structure goes back: the page lays them on the play bar and takes BioEmu2's physicality report
+            # of each (shared/bioemu2/physicality.js), as it does for a WebGPU fold
+            confidence.update(plddt=None, meanPlddt=None, ptm=None)
+            samples = [pdb]
+            k = 1
+            while os.path.exists(f"{stem}_sample-{k}.pdb"):
+                samples.append(open(f"{stem}_sample-{k}.pdb").read())
+                k += 1
+            return {
+                "native": NATIVE, "model": f"{NATIVE} {port}", "family": family, "pdb": pdb, "samples": samples,
+                "confidence": confidence, "tokens": {"chainIds": chain_ids, "resIds": res_ids},
+                "chains": polymer_chains(job["job"]), "msas": {}, "atoms": len(pdb_atoms(pdb)),
+                "status": f"{family} on {NATIVE_NAME} ({self.device}) · done in {seconds:.1f} s · {len(samples)} sample"
+                          f"{'' if len(samples) == 1 else 's'} · no confidence head",
+                "_raw": raw,
+            }
         return {
             "native": NATIVE, "model": f"{NATIVE} {port}", "family": family,
             "pdb": pdb, "confidence": confidence,
