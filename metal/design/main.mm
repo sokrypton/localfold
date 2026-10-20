@@ -1349,6 +1349,261 @@ static void triCase(int N, int C, int I, bool outgoing) {
   for (int i = 0; i < 16; ++i) { release(h[i]); release(gp[i]); }
 }
 
+// ---------------------------------------------------------------- EvoformerIteration, the whole block
+struct EvoP {
+  OpmParams opm;
+  std::vector<double> rowQS, rowQO, rowBS, rowBO, rowF2;  AttnMP rowAttn;
+  std::vector<double> colQS, colQO;                       AttnMP colAttn;
+  TrParams msaTr;
+  TriP triOut, triIn;
+  std::vector<double> saQS, saQO, saF2;                   AttnMP saAttn;
+  std::vector<double> eaQS, eaQO, eaF2;                   AttnMP eaAttn;
+  TrParams pairTr;
+};
+struct EvoDims { int S, N, Cm, Cz, mH, mD, tH, tD, tI, mI, pI, oO; bool opmFirst; };
+
+// the N x N transpose, which is its own inverse
+static std::vector<double> swapNN(const std::vector<double>& x, int N, int C) {
+  std::vector<double> y(x.size());
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j)
+      for (int c = 0; c < C; ++c) y[((size_t)i * N + j) * C + c] = x[((size_t)j * N + i) * C + c];
+  return y;
+}
+
+// modules.py:1300-1388, with dropout off so every wrapper is a plain residual. `sv` collects each module's input,
+// which is what the Metal backward is handed.
+static void evoForward(const std::vector<double>& msa0, const std::vector<double>& msaMask,
+                       const std::vector<double>& pair0, const std::vector<double>& pairMask,
+                       const EvoDims& d, const EvoP& p,
+                       std::vector<double>& msaOut, std::vector<double>& pairOut,
+                       std::vector<std::vector<double>>* sv = nullptr) {
+  const size_t mr = (size_t)d.S * d.N, pr = (size_t)d.N * d.N;
+  std::vector<double> msa = msa0, pair = pair0, out, ln, a1;
+  auto keep = [&](const std::vector<double>& v) { if (sv) sv->push_back(v); };
+  auto addTo = [](std::vector<double>& dst, const std::vector<double>& src) {
+    for (size_t i = 0; i < dst.size(); ++i) dst[i] += src[i];
+  };
+  auto doOpm = [&](const std::vector<double>& m) {
+    opmForward(m, msaMask, d.S, d.N, d.Cm, d.oO, d.Cz, p.opm, 1e-3, out);
+    addTo(pair, out);
+  };
+
+  keep(msa);                                                   // 0: msaIn
+  if (d.opmFirst) doOpm(msa);
+  keep(pair);                                                  // 1: pairForRow
+  biasedForward(msa, pair, msaMask, d.S, d.N, d.Cm, d.Cz, d.mH, d.mD, d.Cm, false,
+                p.rowQS, p.rowQO, p.rowBS, p.rowBO, p.rowF2, p.rowAttn, true, out);
+  addTo(msa, out);
+  keep(msa);                                                   // 2: msaForCol
+  {   // the column attention, which AF2 runs on the transposed MSA
+    std::vector<double> actT(mr * d.Cm), maskT(mr), outT, none;
+    for (int s = 0; s < d.S; ++s)
+      for (int n = 0; n < d.N; ++n) {
+        maskT[(size_t)n * d.S + s] = msaMask[(size_t)s * d.N + n];
+        for (int c = 0; c < d.Cm; ++c)
+          actT[((size_t)n * d.S + s) * d.Cm + c] = msa[((size_t)s * d.N + n) * d.Cm + c];
+      }
+    biasedForward(actT, actT, maskT, d.N, d.S, d.Cm, d.Cm, d.mH, d.mD, d.Cm, true,
+                  p.colQS, p.colQO, none, none, none, p.colAttn, true, outT);
+    for (int s = 0; s < d.S; ++s)
+      for (int n = 0; n < d.N; ++n)
+        for (int c = 0; c < d.Cm; ++c)
+          msa[((size_t)s * d.N + n) * d.Cm + c] += outT[((size_t)n * d.S + s) * d.Cm + c];
+  }
+  keep(msa);                                                   // 3: msaForTransition
+  trForward(msa, mr, d.Cm, d.mI, p.msaTr, ln, a1, out);
+  addTo(msa, out);
+  keep(msa);                                                   // 4: msaForOpm
+  if (!d.opmFirst) doOpm(msa);
+
+  keep(pair);                                                  // 5: pairForTriOut
+  triForward(pair, pairMask, d.N, d.Cz, d.tI, true, p.triOut, out);
+  addTo(pair, out);
+  keep(pair);                                                  // 6: pairForTriIn
+  triForward(pair, pairMask, d.N, d.Cz, d.tI, false, p.triIn, out);
+  addTo(pair, out);
+  keep(pair);                                                  // 7: pairForAttnStart
+  biasedForward(pair, pair, pairMask, d.N, d.N, d.Cz, d.Cz, d.tH, d.tD, d.Cz, true,
+                p.saQS, p.saQO, p.saQS, p.saQO, p.saF2, p.saAttn, true, out);
+  addTo(pair, out);
+  keep(pair);                                                  // 8: pairForAttnEnd
+  {   // the ending node, on the transposed pair
+    std::vector<double> pT = swapNN(pair, d.N, d.Cz), mT = swapNN(pairMask, d.N, 1), oT;
+    biasedForward(pT, pT, mT, d.N, d.N, d.Cz, d.Cz, d.tH, d.tD, d.Cz, true,
+                  p.eaQS, p.eaQO, p.eaQS, p.eaQO, p.eaF2, p.eaAttn, true, oT);
+    addTo(pair, swapNN(oT, d.N, d.Cz));
+  }
+  keep(pair);                                                  // 9: pairForTransition
+  trForward(pair, pr, d.Cz, d.pI, p.pairTr, ln, a1, out);
+  addTo(pair, out);
+  msaOut = msa;
+  pairOut = pair;
+}
+
+static void evoCase(EvoDims d) {
+  const int mW = d.mH * d.mD, tW = d.tH * d.tD;
+  const size_t mr = (size_t)d.S * d.N, pr = (size_t)d.N * d.N;
+  std::vector<double> msa = randv(mr * d.Cm), pair = randv(pr * d.Cz),
+                      dMsaOut = randv(mr * d.Cm, 0.5), dPairOut = randv(pr * d.Cz, 0.5),
+                      msaMask(mr, 1.0), pairMask(pr, 1.0);
+  for (size_t i = 0; i < mr; ++i) if (i % 7 == 3) msaMask[i] = 0.0;
+  for (int i = 0; i < d.N; ++i) msaMask[i] = 1.0;              // sequence 0 all present
+  for (size_t i = 0; i < pr; ++i) if (i % 11 == 5) pairMask[i] = 0.0;
+  for (int i = 0; i < d.N; ++i) { pairMask[(size_t)i * d.N + i] = 1.0; pairMask[i] = 1.0; pairMask[(size_t)i * d.N] = 1.0; }
+
+  auto norm = [&](int C) { auto v = randv(C, 0.3); for (auto& x : v) x += 1.0; return v; };
+  auto attn = [&](int C, int W, int O) {
+    AttnMP a;
+    a.Wq = randv((size_t)C * W, 0.2); a.Wk = randv((size_t)C * W, 0.2); a.Wv = randv((size_t)C * W, 0.2);
+    a.Wg = randv((size_t)C * W, 0.2); a.bg = randv(W, 0.1);
+    a.Wo = randv((size_t)W * O, 0.2); a.bo = randv(O, 0.1);
+    return a;
+  };
+  auto tri = [&](int C, int I) {
+    TriP t;
+    t.lnScale = norm(C); t.lnOffset = randv(C, 0.2);
+    t.Wl = randv((size_t)C * I, 0.2);  t.bl = randv(I, 0.1);
+    t.Wr = randv((size_t)C * I, 0.2);  t.br = randv(I, 0.1);
+    t.Wlg = randv((size_t)C * I, 0.2); t.blg = randv(I, 0.1);
+    t.Wrg = randv((size_t)C * I, 0.2); t.brg = randv(I, 0.1);
+    t.centerScale = norm(I); t.centerOffset = randv(I, 0.2);
+    t.Wo = randv((size_t)I * C, 0.2);  t.bo = randv(C, 0.1);
+    t.Wg = randv((size_t)C * C, 0.2);  t.bg = randv(C, 0.1);
+    return t;
+  };
+  auto trp = [&](int C, int H) {
+    TrParams t;
+    t.lnScale = norm(C); t.lnOffset = randv(C, 0.2);
+    t.W1 = randv((size_t)C * H, 0.15); t.b1 = randv(H, 0.1);
+    t.W2 = randv((size_t)H * C, 0.15); t.b2 = randv(C, 0.1);
+    return t;
+  };
+  EvoP p;
+  p.opm.lnScale = norm(d.Cm); p.opm.lnOffset = randv(d.Cm, 0.2);
+  p.opm.Wl = randv((size_t)d.Cm * d.oO, 0.2); p.opm.bl = randv(d.oO, 0.1);
+  p.opm.Wr = randv((size_t)d.Cm * d.oO, 0.2); p.opm.br = randv(d.oO, 0.1);
+  p.opm.Wo = randv((size_t)d.oO * d.oO * d.Cz, 0.1); p.opm.bo = randv(d.Cz, 0.1);
+  p.rowQS = norm(d.Cm); p.rowQO = randv(d.Cm, 0.2);
+  p.rowBS = norm(d.Cz); p.rowBO = randv(d.Cz, 0.2);
+  p.rowF2 = randv((size_t)d.Cz * d.mH, 0.3); p.rowAttn = attn(d.Cm, mW, d.Cm);
+  p.colQS = norm(d.Cm); p.colQO = randv(d.Cm, 0.2); p.colAttn = attn(d.Cm, mW, d.Cm);
+  p.msaTr = trp(d.Cm, d.mI);
+  p.triOut = tri(d.Cz, d.tI); p.triIn = tri(d.Cz, d.tI);
+  p.saQS = norm(d.Cz); p.saQO = randv(d.Cz, 0.2);
+  p.saF2 = randv((size_t)d.Cz * d.tH, 0.3); p.saAttn = attn(d.Cz, tW, d.Cz);
+  p.eaQS = norm(d.Cz); p.eaQO = randv(d.Cz, 0.2);
+  p.eaF2 = randv((size_t)d.Cz * d.tH, 0.3); p.eaAttn = attn(d.Cz, tW, d.Cz);
+  p.pairTr = trp(d.Cz, d.pI);
+
+  // the forward, in double, which also yields the save set the backward is handed
+  std::vector<std::vector<double>> sv;
+  std::vector<double> msaOut, pairOut;
+  evoForward(msa, msaMask, pair, pairMask, d, p, msaOut, pairOut, &sv);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  std::vector<void*> owned;
+  auto U = [&](const std::vector<double>& x) { void* q = up(x); owned.push_back(q); return (const float*)q; };
+
+  EvoBlockSaved S_{};
+  S_.msaIn = U(sv[0]); S_.pairForRow = U(sv[1]); S_.msaForCol = U(sv[2]);
+  S_.msaForTransition = U(sv[3]); S_.msaForOpm = U(sv[4]);
+  S_.pairForTriOut = U(sv[5]); S_.pairForTriIn = U(sv[6]);
+  S_.pairForAttnStart = U(sv[7]); S_.pairForAttnEnd = U(sv[8]); S_.pairForTransition = U(sv[9]);
+
+  EvoBlockWeights w{};
+  w.opm = {U(p.opm.lnScale), U(p.opm.lnOffset), U(p.opm.Wl), U(p.opm.bl), U(p.opm.Wr), U(p.opm.br),
+           U(p.opm.Wo)};
+  auto battn = [&](const std::vector<double>& qs, const std::vector<double>& qo,
+                   const std::vector<double>* bs, const std::vector<double>* bo,
+                   const std::vector<double>* f2, const AttnMP& a) {
+    BiasedAttnWeights b{};
+    b.qScale = U(qs); b.qOffset = U(qo);
+    if (bs) { b.bScale = U(*bs); b.bOffset = U(*bo); }
+    b.feat2dW = f2 ? U(*f2) : nullptr;
+    b.attn.Wq = U(a.Wq); b.attn.Wk = U(a.Wk); b.attn.Wv = U(a.Wv);
+    b.attn.Wg = U(a.Wg); b.attn.bg = U(a.bg); b.attn.Wo = U(a.Wo); b.attn.bo = U(a.bo);
+    return b;
+  };
+  w.msaRow = battn(p.rowQS, p.rowQO, &p.rowBS, &p.rowBO, &p.rowF2, p.rowAttn);
+  w.msaCol = battn(p.colQS, p.colQO, nullptr, nullptr, nullptr, p.colAttn);
+  w.msaTransition = {U(p.msaTr.lnScale), U(p.msaTr.lnOffset), U(p.msaTr.W1), U(p.msaTr.b1),
+                     U(p.msaTr.W2), U(p.msaTr.b2)};
+  auto trimul = [&](const TriP& t) {
+    TriMulWeights m{};
+    m.lnScale = U(t.lnScale); m.lnOffset = U(t.lnOffset);
+    m.Wl = U(t.Wl); m.bl = U(t.bl); m.Wr = U(t.Wr); m.br = U(t.br);
+    m.Wlg = U(t.Wlg); m.blg = U(t.blg); m.Wrg = U(t.Wrg); m.brg = U(t.brg);
+    m.centerScale = U(t.centerScale); m.centerOffset = U(t.centerOffset);
+    m.Wo = U(t.Wo); m.bo = U(t.bo); m.Wg = U(t.Wg); m.bg = U(t.bg);
+    return m;
+  };
+  w.triOutgoing = trimul(p.triOut);
+  w.triIncoming = trimul(p.triIn);
+  w.triAttnStart = battn(p.saQS, p.saQO, nullptr, nullptr, &p.saF2, p.saAttn);
+  w.triAttnEnd = battn(p.eaQS, p.eaQO, nullptr, nullptr, &p.eaF2, p.eaAttn);
+  w.pairTransition = {U(p.pairTr.lnScale), U(p.pairTr.lnOffset), U(p.pairTr.W1), U(p.pairTr.b1),
+                      U(p.pairTr.W2), U(p.pairTr.b2)};
+
+  const float* mMask = U(msaMask);
+  const float* pMask = U(pairMask);
+  const float* dMo = U(dMsaOut);
+  const float* dPo = U(dPairOut);
+  void* gMsa = alloc(mr * d.Cm * 4);
+  void* gPair = alloc(pr * d.Cz * 4);
+  // a sample of parameter gradients from four different modules, to catch a weight wired to the wrong module
+  void* gRowWv = alloc((size_t)d.Cm * mW * 4);
+  void* gTriOutWl = alloc((size_t)d.Cz * d.tI * 4);
+  void* gPairTrW1 = alloc((size_t)d.Cz * d.pI * 4);
+  void* gOpmWl = alloc((size_t)d.Cm * d.oO * 4);
+  EvoBlockGrads g{};
+  g.msaRow.attn.Wv = (float*)gRowWv;
+  g.triOutgoing.Wl = (float*)gTriOutWl;
+  g.pairTransition.W1 = (float*)gPairTrW1;
+  g.opm.Wl = (float*)gOpmWl;
+
+  EvoBlockShape sh{d.S, d.N, d.Cm, d.Cz, d.mH, d.mD, d.tH, d.tD, d.tI, d.mI, d.pI, d.oO, d.opmFirst};
+  evoformerIterationBwd(mMask, pMask, S_, sh, w, dMo, dPo, (float*)gMsa, (float*)gPair, g);
+
+  char shape[120];
+  snprintf(shape, sizeof shape, "S%d N%d Cm%d Cz%d%s", d.S, d.N, d.Cm, d.Cz, d.opmFirst ? " opm-first" : "");
+  auto total = [&]() {
+    std::vector<double> mo, po;
+    evoForward(msa, msaMask, pair, pairMask, d, p, mo, po);
+    double acc = 0;
+    for (size_t i = 0; i < mo.size(); ++i) acc += dMsaOut[i] * mo[i];
+    for (size_t i = 0; i < po.size(); ++i) acc += dPairOut[i] * po[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> Ud(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = Ud(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = total();
+      target[j] = save - hh;
+      double bS = total();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[240];
+    snprintf(lab, sizeof lab, "evoblock %s vs central difference %s", what, shape);
+    reportGrad(lab, fd, mine, 5e-5);
+  };
+  probe("dMsa", msa, download((const float*)gMsa, mr * d.Cm), 6);
+  probe("dPair", pair, download((const float*)gPair, pr * d.Cz), 6);
+  probe("dMsaRow.Wv", p.rowAttn.Wv, download((const float*)gRowWv, (size_t)d.Cm * mW), 3);
+  probe("dTriOutgoing.Wl", p.triOut.Wl, download((const float*)gTriOutWl, (size_t)d.Cz * d.tI), 3);
+  probe("dPairTransition.W1", p.pairTr.W1, download((const float*)gPairTrW1, (size_t)d.Cz * d.pI), 3);
+  probe("dOpm.Wl", p.opm.Wl, download((const float*)gOpmWl, (size_t)d.Cm * d.oO), 3);
+
+  for (void* q : owned) release(q);
+  release(gMsa); release(gPair); release(gRowWv); release(gTriOutWl); release(gPairTrW1); release(gOpmWl);
+}
+
 // ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
 // The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
 // design-sized complex, which is what has to fit in 16 GB of unified memory.
@@ -1543,6 +1798,9 @@ int main(int argc, char** argv) {
   triCase(10, 16, 12, false);
   triCase(7, 8, 8, true);
   triCase(7, 8, 8, false);
+  printf("EvoformerIteration backward (the WHOLE block, eight residual modules)\n");
+  evoCase({3, 5, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, false});
+  evoCase({2, 4, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, true});     // outer product first, as the multimer config has it
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

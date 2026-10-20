@@ -246,4 +246,96 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
                                const TriMulWeights& w, const float* dOut, float* dPair,
                                const TriMulGrads& g = {});
 
+// ---------------------------------------------------------------- EvoformerIteration (Alg. 6, lines 2-10)
+// A whole block's backward, composed of everything above. AF2 wraps each module in `dropout_wrapper`
+// (modules.py:46-76), which is `new_act = output_act + dropout(module(input_act, mask))` - and with dropout off,
+// which is what a design trajectory runs, a plain RESIDUAL. So a module's cotangent BOTH passes straight through
+// and goes through the module, summed; nothing here is a chain of overwrites.
+//
+// The forward order (modules.py:1300-1388), with `outerProductMeanFirst` as the config's
+// `outer_product_mean.first`:
+//    [opm first]  pair += OPM(msa)
+//    msa  += MSARowAttentionWithPairBias(msa, pair)        <- reads BOTH tracks, so it feeds both cotangents
+//    msa  += MSAColumnAttention(msa)                        (or the global one, in the extra-MSA stack)
+//    msa  += MSATransition(msa)
+//    [else]       pair += OPM(msa)
+//    pair += TriangleMultiplication(pair, outgoing)
+//    pair += TriangleMultiplication(pair, incoming)
+//    pair += TriangleAttention(pair, starting_node)         per_row
+//    pair += TriangleAttention(pair, ending_node)           per_column, so the pair is transposed around it
+//    pair += PairTransition(pair)
+//
+//   msa  [S][N][Cm], msaMask [S][N];  pair [N][N][Cz], pairMask [N][N]
+//   dMsaOut / dPairOut   the cotangents of the block's two outputs
+//   dMsa / dPair         written; may be the same buffers as dMsaOut / dPairOut
+struct TransitionWeights {
+  const float* lnScale; const float* lnOffset;
+  const float* W1; const float* b1; const float* W2; const float* b2;
+};
+struct TransitionGrads {
+  float* lnScale = nullptr; float* lnOffset = nullptr;
+  float* W1 = nullptr; float* b1 = nullptr; float* W2 = nullptr; float* b2 = nullptr;
+};
+struct OpmWeights {
+  const float* lnScale; const float* lnOffset;
+  const float* Wl; const float* bl; const float* Wr; const float* br;
+  const float* Wo;
+};
+struct OpmGrads {
+  float* lnScale = nullptr; float* lnOffset = nullptr;
+  float* Wl = nullptr; float* bl = nullptr; float* Wr = nullptr; float* br = nullptr;
+  float* Wo = nullptr; float* bo = nullptr;
+};
+struct EvoBlockWeights {
+  OpmWeights opm;
+  BiasedAttnWeights msaRow;                    // two LayerNorms, bias from the pair
+  BiasedAttnWeights msaCol;                    // one, no bias (feat2dW null)
+  TransitionWeights msaTransition;
+  TriMulWeights triOutgoing, triIncoming;
+  BiasedAttnWeights triAttnStart, triAttnEnd;
+  TransitionWeights pairTransition;
+};
+struct EvoBlockGrads {
+  OpmGrads opm;
+  BiasedAttnGrads msaRow, msaCol;
+  TransitionGrads msaTransition;
+  TriMulGrads triOutgoing, triIncoming;
+  BiasedAttnGrads triAttnStart, triAttnEnd;
+  TransitionGrads pairTransition;
+};
+struct EvoBlockShape {
+  int S, N, Cm, Cz;                            // sequences, residues, MSA and pair widths
+  int msaHeads, msaDim;                        // the MSA attentions' heads and head width
+  int triHeads, triDim;                        // the triangle attentions'
+  int triIntermediate;                         // the triangle multiplications' num_intermediate_channel
+  int msaIntermediate, pairIntermediate;       // the transitions' widths (num_intermediate_factor * channel)
+  int opmOuter;                                // num_outer_channel (32)
+  bool outerProductMeanFirst;
+};
+// 🔴 THE SAVE SET, AND WHY IT IS AN ARGUMENT RATHER THAN RECOMPUTED HERE. Each module's backward recomputes its
+// OWN forward, but it needs the activation it was given, and in a block that is the output of every module before
+// it. So a block backward needs the chain's intermediate activations, and there are only two honest ways to get
+// them: duplicate AF2's whole forward in this tree, or have the forward hand them over. The forward already exists
+// (metal/af2), so it hands them over - which is also what a training step does, and what BindCraft2's own
+// GLUE_PORT.md means by carrying the trunk's save set across the boundary.
+//
+// Each field is the activation that module was CALLED with. `msaIn` serves both the block's input and the MSA row
+// attention, because an outer-product-mean that runs first writes the pair and leaves the MSA alone.
+struct EvoBlockSaved {
+  const float* msaIn;                 // the block's MSA input; OPM's input when it runs first
+  const float* pairForRow;            // the pair as MSARowAttentionWithPairBias saw it
+  const float* msaForCol;
+  const float* msaForTransition;
+  const float* msaForOpm;             // the MSA after its transition; OPM's input when it does NOT run first
+  const float* pairForTriOut;
+  const float* pairForTriIn;
+  const float* pairForAttnStart;
+  const float* pairForAttnEnd;
+  const float* pairForTransition;
+};
+void evoformerIterationBwd(const float* msaMask, const float* pairMask, const EvoBlockSaved& saved,
+                           const EvoBlockShape& sh, const EvoBlockWeights& w,
+                           const float* dMsaOut, const float* dPairOut,
+                           float* dMsa, float* dPair, const EvoBlockGrads& g = {});
+
 }  // namespace mt

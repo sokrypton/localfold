@@ -43,6 +43,11 @@ struct ScaleArgs { DP(float) y; u64 n; float alpha; uint pad; };
 // (modules.py:595, :703), so this is how they are served rather than by a second indexing mode in every kernel.
 struct Swap01Args { CP(float) x; DP(float) y; u64 n; uint A, B, C, pad; };
 
+// y += x. A block's modules are residual - new = output_act + module(input_act) - so a module's contribution is
+// computed into a temporary and added to the running cotangent. One buffer and one cheap pass a module, against
+// threading an `accumulate` flag through six modules' final LayerNorm; the blast radius decided it.
+struct AccumArgs { DP(float) y; CP(float) x; u64 n; uint pad; };
+
 // y = x * alpha + beta. AF2 turns a 0/1 mask into an additive attention bias with 1e9 * (mask - 1).
 struct AffineArgs { CP(float) x; DP(float) y; u64 n; float alpha, beta; uint pad; };
 

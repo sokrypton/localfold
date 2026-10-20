@@ -115,6 +115,7 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 
 ### Staging
 
+0. **The whole EvoformerIteration composes** - all eight residual modules, both tracks. **DONE**, see below.
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
@@ -122,7 +123,7 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
    `MSARowAttentionWithPairBias` and `TriangleAttention` are, `MSAColumnAttention`, and
    `MSAColumnGlobalAttention`. See below.
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
-   differentiable.
+   differentiable. **This is the next thing to do.**
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
 
 ### Stage 1, landed
@@ -426,3 +427,38 @@ is the same everywhere - never materialise O(N^3) - and the absent axis is what 
 
 Gating is required rather than optional here, because AF2's ungated branch has a different output shape
 (`modules.py:495` returns `[B][1][O]` broadcast, not `[B][Q][O]`), and its config has gating on.
+
+### The whole EvoformerIteration, composed and checked
+
+**308 cases.** `evoformerIterationBwd` runs all eight of a block's modules in reverse, threading both tracks'
+cotangents. Checked against central difference on a double forward of the WHOLE block: both input cotangents and
+parameter gradients sampled from four different modules (the MSA row attention, a triangle multiplication, the pair
+transition and the outer product), for both orderings of the outer product mean. **5.5e-8 to 6.2e-7.**
+
+Sampling parameters from four modules is deliberate: it is what catches a weight wired to the wrong module, which
+threading bugs look like and which `dMsa`/`dPair` alone would often hide.
+
+**Every module is a residual**, because `dropout_wrapper` is `new_act = output_act + dropout(module(input_act))`
+(`modules.py:46-76`) and a design trajectory runs with dropout off. So a cotangent BOTH passes straight through and
+goes through the module, summed - nothing is a chain of overwrites. Two consequences:
+
+- **The MSA row attention feeds BOTH cotangents**, being the one module that reads both tracks; and the outer
+  product mean writes the pair from the MSA, so the pair's cotangent passes it untouched while the MSA's grows.
+- The accumulation is a temporary plus one `lf_accum` pass a module, rather than an `accumulate` flag threaded
+  through six modules' final LayerNorm. One buffer, one cheap pass; the blast radius decided it.
+
+🔴 **AND THE BLOCK NEEDS A SAVE SET, WHICH IS WHY IT IS AN ARGUMENT.** Each module's backward recomputes its own
+forward, but from the activation it was *given* - and in a block that is the output of everything before it. There
+are only two honest ways to have those: duplicate AF2's whole forward in this tree, or have the forward hand them
+over. `EvoBlockSaved` is the second, ten activations, one per module call. This is the same contract BindCraft2's
+`native/GLUE_PORT.md` describes - "carrying the trunk's save set and pout/mout across the boundary as XLA buffers" -
+and it reached the same shape independently.
+
+**So the piece that is now missing is on the FORWARD side:** `metal/af2`'s Evoformer must be able to emit these ten
+activations per block. That is wiring, not new arithmetic, but it is a real task and it is what stands between this
+tree and a block that can actually run forwards and backwards. The other known forward-side gap is the same kind of
+thing: `metal/core`'s tuned `attention()` does not return the logsumexp the attention backward needs.
+
+Also worth knowing: the ending node's triangle attention is run on the **transposed** pair, as AF2 does
+(`modules.py:703`, `:731`), and the N x N transpose is its own inverse, so the same `lf_swap01` serves both
+directions.

@@ -9,6 +9,100 @@
 
 namespace mt {
 
+// ---------------------------------------------------------------- EvoformerIteration
+void evoformerIterationBwd(const float* msaMask, const float* pairMask, const EvoBlockSaved& sv,
+                           const EvoBlockShape& sh, const EvoBlockWeights& w,
+                           const float* dMsaOut, const float* dPairOut,
+                           float* dMsa, float* dPair, const EvoBlockGrads& g) {
+  const int S = sh.S, N = sh.N, Cm = sh.Cm, Cz = sh.Cz;
+  if (!S || !N) return;
+  const size_t msaRows = (size_t)S * N, pairRows = (size_t)N * N;
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.evo.") + name, n * sizeof(float));
+  };
+  float* tmpMsa = buf("tmpMsa", msaRows * Cm);
+  float* tmpPair = buf("tmpPair", pairRows * Cz);
+  float* tmpPair2 = buf("tmpPair2", pairRows * Cz);
+
+  // every module's contribution is added to the running cotangent, because every module is a residual
+  auto addMsa = [&]() { run1d("lf_accum", msaRows * Cm, AccumArgs{dMsa, tmpMsa, msaRows * (size_t)Cm, 0}); };
+  auto addPair = [&](const float* src) {
+    run1d("lf_accum", pairRows * Cz, AccumArgs{dPair, src, pairRows * (size_t)Cz, 0});
+  };
+  if (dMsa != dMsaOut) copy(dMsa, dMsaOut, msaRows * (size_t)Cm * sizeof(float));
+  if (dPair != dPairOut) copy(dPair, dPairOut, pairRows * (size_t)Cz * sizeof(float));
+
+  auto transition = [&](const float* act, size_t rows, int C, int H, const TransitionWeights& tw,
+                        const TransitionGrads& tg, float* out) {
+    transitionBwd(act, rows == msaRows ? dMsa : dPair, rows, C, H, tw.lnScale, tw.lnOffset,
+                  tw.W1, tw.b1, tw.W2, tw.b2, out, tg.lnScale, tg.lnOffset, tg.W1, tg.b1, tg.W2, tg.b2);
+  };
+
+  // -------- in reverse. 10: the pair transition
+  transition(sv.pairForTransition, pairRows, Cz, sh.pairIntermediate, w.pairTransition, g.pairTransition, tmpPair);
+  addPair(tmpPair);
+
+  // -------- 9: the ending node, which AF2 runs on the TRANSPOSED pair (modules.py:703, :731)
+  {
+    float* pairT = buf("pairT", pairRows * Cz);
+    float* maskT = buf("maskT", pairRows);
+    float* dT = buf("dT", pairRows * Cz);
+    float* outT = buf("outT", pairRows * Cz);
+    auto swap = [&](const float* x, float* y, int C) {
+      run1d("lf_swap01", pairRows * C, Swap01Args{x, y, pairRows * (size_t)C, (uint)N, (uint)N, (uint)C, 0});
+    };
+    swap(sv.pairForAttnEnd, pairT, Cz);
+    swap(pairMask, maskT, 1);
+    swap(dPair, dT, Cz);
+    biasedSelfAttentionBwd(pairT, pairT, maskT, N, N, Cz, Cz, sh.triHeads, sh.triDim, Cz,
+                           w.triAttnEnd, dT, outT, outT, g.triAttnEnd);
+    swap(outT, tmpPair, Cz);                 // the swap is its own inverse at N x N
+    addPair(tmpPair);
+  }
+
+  // -------- 8: the starting node, per_row
+  biasedSelfAttentionBwd(sv.pairForAttnStart, sv.pairForAttnStart, pairMask, N, N, Cz, Cz,
+                         sh.triHeads, sh.triDim, Cz, w.triAttnStart, dPair, tmpPair, tmpPair, g.triAttnStart);
+  addPair(tmpPair);
+
+  // -------- 7 and 6: the two triangle multiplications
+  triangleMultiplicationBwd(sv.pairForTriIn, pairMask, N, Cz, sh.triIntermediate, false,
+                            w.triIncoming, dPair, tmpPair, g.triIncoming);
+  addPair(tmpPair);
+  triangleMultiplicationBwd(sv.pairForTriOut, pairMask, N, Cz, sh.triIntermediate, true,
+                            w.triOutgoing, dPair, tmpPair, g.triOutgoing);
+  addPair(tmpPair);
+
+  // -------- 5: the outer product, if it runs LAST in the forward. It writes the PAIR from the MSA, so the pair's
+  // cotangent passes through untouched and only the MSA's grows.
+  auto opm = [&](const float* msaAct) {
+    outerProductMeanBwd(msaAct, msaMask, S, N, Cm, sh.opmOuter, Cz, w.opm.lnScale, w.opm.lnOffset,
+                        w.opm.Wl, w.opm.bl, w.opm.Wr, w.opm.br, w.opm.Wo, dPair, tmpMsa,
+                        g.opm.lnScale, g.opm.lnOffset, g.opm.Wl, g.opm.bl, g.opm.Wr, g.opm.br,
+                        g.opm.Wo, g.opm.bo);
+    addMsa();
+  };
+  if (!sh.outerProductMeanFirst) opm(sv.msaForOpm);
+
+  // -------- 4: the MSA transition
+  transition(sv.msaForTransition, msaRows, Cm, sh.msaIntermediate, w.msaTransition, g.msaTransition, tmpMsa);
+  addMsa();
+
+  // -------- 3: the MSA column attention
+  msaColumnAttentionBwd(sv.msaForCol, msaMask, S, N, Cm, sh.msaHeads, sh.msaDim, Cm,
+                        w.msaCol, dMsa, tmpMsa, g.msaCol);
+  addMsa();
+
+  // -------- 2: the MSA row attention, the one module that reads BOTH tracks, so it feeds both cotangents
+  biasedSelfAttentionBwd(sv.msaIn, sv.pairForRow, msaMask, S, N, Cm, Cz, sh.msaHeads, sh.msaDim, Cm,
+                         w.msaRow, dMsa, tmpMsa, tmpPair2, g.msaRow);
+  addMsa();
+  addPair(tmpPair2);
+
+  // -------- 1: the outer product, if it runs FIRST
+  if (sh.outerProductMeanFirst) opm(sv.msaIn);
+}
+
 // The families (core.h shareScratch): a block's modules - the transitions, the outer product, the triangle
 // multiplications and the attentions - run one after another, so their large buffers alias. What must NOT alias is
 // anything live around another's turn: the attention module runs inside the biased-attention wrapper and the core
@@ -16,13 +110,17 @@ namespace mt {
 void designShareScratch() {
   shareScratch({{"design.tr.", "dtr"}, {"design.opm.", "dopm"}, {"design.tri.", "dtri"},
                 {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
-                {"design.mcol.", "dmcol"}, {"design.gattn.", "dgattn"}, {"design.ln.", "dln"}},
+                {"design.mcol.", "dmcol"}, {"design.gattn.", "dgattn"}, {"design.evo.", "devo"},
+                {"design.ln.", "dln"}},
                {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
                 {"dln", "dattn"}, {"dln", "dmcol"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"},
                 {"dattn", "dbattn"},
                 // the column attention transposes into the per-column orientation and calls the biased attention
                 // on it, so everything that one holds is live inside its turn
-                {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}, {"dln", "dgattn"}});
+                {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}, {"dln", "dgattn"},
+                // the block holds its running cotangents and temporaries across every module's turn
+                {"devo", "dtr"}, {"devo", "dopm"}, {"devo", "dtri"}, {"devo", "dbattn"}, {"devo", "dattnm"},
+                {"devo", "dattn"}, {"devo", "dmcol"}, {"devo", "dgattn"}, {"devo", "dln"}});
 }
 
 // a simdgroup a row, eight a threadgroup - metal/core's layerNormRun grid, so the rows map the same way

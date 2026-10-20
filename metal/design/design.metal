@@ -442,6 +442,12 @@ kernel void lf_swap01(LF_ARGS(Swap01Args)) {
   a.y[i] = a.x[((ulong)aa * a.B + b) * a.C + c];
 }
 
+kernel void lf_accum(LF_ARGS(AccumArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  a.y[i] += a.x[i];
+}
+
 kernel void lf_affine(LF_ARGS(AffineArgs)) {
   ulong i = LF_INDEX;
   if (i >= a.n) return;
