@@ -1,0 +1,25 @@
+{
+ "name": "smiles",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE",
+    "unpairedMsa": ">q\nGWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "ligand": {
+    "id": "B",
+    "smiles": "C(O)C(O)CO"
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 2
+}

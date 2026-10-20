@@ -1,0 +1,35 @@
+{
+ "name": "6mrr-nag-ret",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE",
+    "unpairedMsa": ">q\nGWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "ligand": {
+    "id": "B",
+    "ccdCodes": [
+     "NAG"
+    ]
+   }
+  },
+  {
+   "ligand": {
+    "id": "C",
+    "ccdCodes": [
+     "RET"
+    ]
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 2
+}

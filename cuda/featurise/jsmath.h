@@ -209,6 +209,34 @@ inline double atan(double x) {
   return hx < 0 ? -z : z;
 }
 
+// Math.atan2 (V8's ieee754::atan2, fdlibm e_atan2.c with V8's `m &= 1` past 2^60)
+inline double atan2(double y, double x) {
+  static const double tiny = 1.0e-300, pi_o_4 = words(0x3FE921FB, 0x54442D18), pi_o_2 = words(0x3FF921FB, 0x54442D18),
+                      pi = words(0x400921FB, 0x54442D18), pi_lo = words(0x3CA1A626, 0x33145C07);
+  int32_t hx = hi(x), ix = hx & 0x7FFFFFFF, hy = hi(y), iy = hy & 0x7FFFFFFF;
+  uint32_t lx = lo(x), ly = lo(y);
+  if (((uint32_t)ix | ((lx | (0u - lx)) >> 31)) > 0x7FF00000u || ((uint32_t)iy | ((ly | (0u - ly)) >> 31)) > 0x7FF00000u) return x + y;
+  if (((hx - 0x3FF00000) | (int32_t)lx) == 0) return atan(y);
+  int m = ((hy >> 31) & 1) | ((hx >> 30) & 2);
+  if ((iy | (int32_t)ly) == 0) {
+    switch (m) { case 0: case 1: return y; case 2: return pi + tiny; default: return -pi - tiny; }
+  }
+  if ((ix | (int32_t)lx) == 0) return hy < 0 ? -pi_o_2 - tiny : pi_o_2 + tiny;
+  if (ix == 0x7FF00000) {
+    if (iy == 0x7FF00000) {
+      switch (m) { case 0: return pi_o_4 + tiny; case 1: return -pi_o_4 - tiny; case 2: return 3.0 * pi_o_4 + tiny; default: return -3.0 * pi_o_4 - tiny; }
+    }
+    switch (m) { case 0: return 0.0; case 1: return -0.0; case 2: return pi + tiny; default: return -pi - tiny; }
+  }
+  if (iy == 0x7FF00000) return hy < 0 ? -pi_o_2 - tiny : pi_o_2 + tiny;
+  int k = (iy - ix) >> 20;
+  double z;
+  if (k > 60) { z = pi_o_2 + 0.5 * pi_lo; m &= 1; }
+  else if (hx < 0 && k < -60) z = 0.0;
+  else z = atan(std::fabs(y / x));
+  switch (m) { case 0: return z; case 1: return -z; case 2: return pi - (z - pi_lo); default: return (z - pi_lo) - pi; }
+}
+
 // Math.hypot (builtins/math.tq MathHypot)
 inline double hypot(std::initializer_list<double> values) {
   if (values.size() == 0) return 0;
