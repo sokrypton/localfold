@@ -80,6 +80,19 @@ export async function main(device, args) {
       const out = await dn.denoise(stages[`denoise${k}.x`], stages[`denoise${k}.sigma`]);
       report(`denoise${k}`, out, stages[`denoise${k}.out`], tight(1e-4), realAtoms * 3);
     }
+    if (args.includes("--profile")) {
+      // one call to set the inputs, then the same program per dispatch with timestamps, three times
+      await dn.denoise(stages["denoise1.x"], stages["denoise1.sigma"]);
+      const w0 = performance.now();
+      for (let k = 0; k < 20; k += 1) await dn.denoise(stages["denoise1.x"], stages["denoise1.sigma"]);
+      console.log(`  denoiser call, wall (inputs written, one pass, read back): ${((performance.now() - w0) / 20).toFixed(2)} ms`);
+      for (let k = 0; k < 3; k += 1) await net.ops.runProfiled(dn.program);
+      const total = [...net.ops.profile.values()].reduce((t, r) => t + r.ms, 0) / 3;
+      const top = [...net.ops.profile.entries()].sort((a, b) => b[1].ms - a[1].ms).slice(0, 25)
+        .map(([key, r]) => ({ key, msPerCall: Number((r.ms / 3).toFixed(3)), dispatches: r.calls / 3 }));
+      console.log(`  denoiser call: ${total.toFixed(2)} ms of GPU over ${dn.program.steps.length} dispatches`);
+      for (const row of top) console.log(`    ${row.msPerCall.toFixed(3).padStart(8)} ms  x${row.dispatches}  ${row.key}`);
+    }
     if (stages["denoise_dyn.x"] !== undefined) {
       const dyn = await net.denoiserProgram(g, sInputs, sTrunk, zTrunk, {
         dt: stages["denoise_dyn.dt"], dynamics: true, coordsCond: stages["denoise_dyn.coords_cond"] });
@@ -89,7 +102,7 @@ export async function main(device, args) {
   }
   const failed = rows.filter((r) => !r.ok).map((r) => r.stage);
   const result = { dump: dumpName, model, half, trunkPrecision, tokens: g.T, atoms: realAtoms,
-                   deviceMiB: Math.round(net.ops.bytes / 1048576), seconds: (performance.now() - t0) / 1000, rows };
+                   deviceMiB: Math.round((net.ops.bytes + net.ops.weightBytes) / 1048576), seconds: (performance.now() - t0) / 1000, rows };
   if (failed.length) throw new Error(`${failed.join(", ")} past their bound: ${JSON.stringify(result)}`);
   return result;
 }

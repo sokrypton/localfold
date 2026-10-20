@@ -75,37 +75,53 @@ function centre(x, mask, N) {
 }
 
 /**
- * One trajectory of the sampler: from noise (or a given start) down the schedule.
- * @param denoise (x, sigma) -> Float32Array, one denoiser call
- * @param companion a frame carried alongside and augmented with the state, or null
+ * S trajectories of the sampler at once, from noise down the schedule: one denoiser call a step for all of them.
+ * @param denoise (xs: S x N x 3, sigma) -> the same, denoised
+ * @param companions S frames carried alongside and augmented with their sample, or null
  */
-async function sampleOne({ denoise, setCompanion, mask, N, schedule, stepScale, normal, companion, onStep }) {
-  const x = new Float32Array(N * 3);
-  for (let i = 0; i < N * 3; i += 1) x[i] = normal() * schedule[0];
-  const comp = companion ? Float32Array.from(companion) : null;
+async function sampleMany({ denoise, setCompanion, mask, N, S, schedule, stepScale, normal, companions, onStep }) {
+  const xs = Array.from({ length: S }, () => {
+    const x = new Float32Array(N * 3);
+    for (let i = 0; i < N * 3; i += 1) x[i] = normal() * schedule[0];
+    return x;
+  });
+  const comps = companions ? companions.map((c) => Float32Array.from(c)) : null;
   const weights = Float32Array.from(mask);
+  const stacked = new Float32Array(S * N * 3);
   const steps = schedule.length - 1;
   for (let k = 0; k < steps; k += 1) {
     const prev = schedule[k];
     const next = schedule[k + 1];
-    const rot = randomRotation(normal);
-    const trans = [normal(), normal(), normal()];
-    augment(x, mask, N, rot, trans);
-    if (comp) { augment(comp, mask, N, rot, trans); setCompanion(comp); }
     const gamma = next > BIOEMU2_SAMPLER.gammaMin ? BIOEMU2_SAMPLER.gamma0 : 0;
     const tHat = prev * (1 + gamma);
     const scale = BIOEMU2_SAMPLER.noiseScale * Math.sqrt(Math.max(0, tHat * tHat - prev * prev));
-    for (let i = 0; i < N * 3; i += 1) x[i] += scale * normal();
-    const denoised = await denoise(x, tHat);
-    const aligned = weightedRigidAlign(x, denoised, weights, N);
-    for (let i = 0; i < N * 3; i += 1) {
-      const grad = (aligned[i] - denoised[i]) / tHat;
-      x[i] = aligned[i] + stepScale * (next - tHat) * grad;
+    for (let s = 0; s < S; s += 1) {
+      const rot = randomRotation(normal);
+      const trans = [normal(), normal(), normal()];
+      augment(xs[s], mask, N, rot, trans);
+      if (comps) augment(comps[s], mask, N, rot, trans);
+      for (let i = 0; i < N * 3; i += 1) xs[s][i] += scale * normal();
+      stacked.set(xs[s], s * N * 3);
     }
-    for (let a = 0; a < N; a += 1) if (!mask[a]) x[a * 3] = x[a * 3 + 1] = x[a * 3 + 2] = 0;
+    if (comps) {
+      const all = new Float32Array(S * N * 3);
+      comps.forEach((c, s) => all.set(c, s * N * 3));
+      setCompanion(all);
+    }
+    const denoised = await denoise(stacked, tHat);
+    for (let s = 0; s < S; s += 1) {
+      const d = denoised.subarray(s * N * 3, (s + 1) * N * 3);
+      const aligned = weightedRigidAlign(xs[s], d, weights, N);
+      const x = xs[s];
+      for (let i = 0; i < N * 3; i += 1) {
+        const grad = (aligned[i] - d[i]) / tHat;
+        x[i] = aligned[i] + stepScale * (next - tHat) * grad;
+      }
+      for (let a = 0; a < N; a += 1) if (!mask[a]) x[a * 3] = x[a * 3 + 1] = x[a * 3 + 2] = 0;
+    }
     await onStep?.(k + 1, steps, denoised);
   }
-  return x;
+  return xs;
 }
 
 /**
@@ -117,7 +133,9 @@ async function sampleOne({ denoise, setCompanion, mask, N, schedule, stepScale, 
  */
 export async function foldBioemu2(device, read, features, options = {}) {
   const f = features;
-  const net = new Bioemu2Gpu(device, read, options);
+  // a caller that folds again hands its network back in (`options.network`), and its weights stay on the device
+  const owned = options.network === undefined;
+  const net = options.network ?? new Bioemu2Gpu(device, read, options);
   const timings = {};
   const clock = async (name, fn) => {
     const t0 = performance.now();
@@ -146,34 +164,36 @@ export async function foldBioemu2(device, read, features, options = {}) {
     const normal = normalFrom(options.seed ?? 1);
     const samples = options.samples ?? 5;
     const frames = [];
-    const dn = await clock("denoiser-compile", () => net.denoiserProgram(g, sIn, sTrunk, trunk.z, propagation
-      ? { dt: propagation.lagNs * 1000, dynamics: true } : {}));
+    const dn = await clock("denoiser-compile", () => net.denoiserProgram(g, sIn, sTrunk, trunk.z, {
+      samples, ...(propagation ? { dt: propagation.lagNs * 1000, dynamics: true } : {}) }));
     const t0 = performance.now();
     let calls = 0;
     const denoise = async (x, sigma) => { calls += 1; return dn.denoise(x, sigma); };
-    const total = samples * (schedule.length - 1) * (propagation?.steps ?? 1);
+    const total = (schedule.length - 1) * (propagation?.steps ?? 1);
     let done = 0;
-    const onStep = () => { done += 1; return progress("diffusion", done, total); };
-    for (let s = 0; s < samples; s += 1) {
-      if (!propagation) {
-        frames.push(centre(await sampleOne({ denoise, setCompanion: dn.setCompanion, mask, N, schedule, stepScale, normal,
-                                             companion: null, onStep }), mask, N));
-        continue;
-      }
-      let prev = new Float32Array(N * 3);
-      prev.set(propagation.x0);
+    const onStep = (k, steps, denoised) => { done += 1; return progress("diffusion", done, total, denoised); };
+    const common = { denoise, setCompanion: dn.setCompanion, mask, N, S: samples, schedule, stepScale, normal, onStep };
+    if (!propagation) {
+      for (const x of await sampleMany({ ...common, companions: null })) frames.push(centre(x, mask, N));
+    } else {
+      // each sample its own trajectory, chained: step k+1 starts from step k's endpoint, superposed on its start
+      let prev = Array.from({ length: samples }, () => { const x = new Float32Array(N * 3); x.set(propagation.x0); return x; });
+      const trajectories = Array.from({ length: samples }, () => []);
       for (let k = 0; k < (propagation.steps ?? 1); k += 1) {
-        const comp = centre(Float32Array.from(prev), mask, N);
-        const end = await sampleOne({ denoise, setCompanion: dn.setCompanion, mask, N, schedule, stepScale, normal,
-                                      companion: comp, onStep });
-        prev = weightedRigidAlign(end, prev, Float32Array.from(mask), N);
-        frames.push(Float32Array.from(prev));
+        const comps = prev.map((x) => centre(Float32Array.from(x), mask, N));
+        const ends = await sampleMany({ ...common, companions: comps });
+        prev = ends.map((end, s) => weightedRigidAlign(end, prev[s], Float32Array.from(mask), N));
+        prev.forEach((x, s) => trajectories[s].push(Float32Array.from(x)));
       }
+      // sample i of the output is trajectory i // steps, step i % steps + 1, as af3-any-model lays them out
+      for (const trajectory of trajectories) frames.push(...trajectory);
     }
     timings.diffusion = Math.round(performance.now() - t0);
     return { samples: frames, contact, distogram: logits, tokens: g.T, atoms: N, liveAtoms: mask.reduce((a, b) => a + b, 0),
-             calls, timings, deviceMiB: Math.round(net.ops.bytes / 1048576), mode, stepScale };
+             calls, timings, mode, stepScale,
+             deviceMiB: { activations: Math.round(net.ops.bytes / 1048576), weights: Math.round(net.ops.weightBytes / 1048576) } };
   } finally {
-    net.ops.destroy();
+    if (owned) net.ops.destroyWeights();
+    else net.ops.destroy();
   }
 }

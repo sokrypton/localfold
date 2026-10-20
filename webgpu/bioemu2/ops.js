@@ -48,7 +48,7 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
   offA: u32, sA0: u32, sA1: u32, sAm: u32, sAk: u32,
   offB: u32, sB0: u32, sB1: u32, sBn: u32, sBk: u32,
   offC: u32, sC0: u32, sC1: u32, sCm: u32, sCn: u32,
-  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32 };
+  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<${wordB ? "u32" : "f32"}>;
@@ -74,17 +74,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let tn = (li % 16u) * 4u;
   var acc: array<f32, 16>;
   for (var i = 0u; i < 16u; i += 1u) { acc[i] = 0.0; }
-  for (var k0 = 0u; k0 < p.k; k0 += 16u) {
+  // split-K: batch index b1 is the K slice, [kStart, kEnd), and the epilogue is the reduction's
+  let kStart = select(0u, b1 * p.split, p.split > 0u);
+  let kEnd = select(p.k, min(p.k, kStart + p.split), p.split > 0u);
+  for (var k0 = kStart; k0 < kEnd; k0 += 16u) {
     for (var e = 0u; e < 4u; e += 1u) {
       let slot = li * 4u + e;          // 0..1023: row = slot / 16, k = slot % 16 (k fastest, for row-major operands)
       let kk = slot % 16u;
       let rr = slot / 16u;
       let k = k0 + kk;
       var va = 0.0;
-      if (inBatch && k < p.k && m0 + rr < p.m) { va = a[baseA + (m0 + rr) * p.sAm + k * p.sAk]; }
+      if (inBatch && k < kEnd && m0 + rr < p.m) { va = a[baseA + (m0 + rr) * p.sAm + k * p.sAk]; }
       ta[kk * 64u + rr] = va;
       var vb = 0.0;
-      if (inBatch && k < p.k && n0 + rr < p.n) {
+      if (inBatch && k < kEnd && n0 + rr < p.n) {
         ${wordB
           ? `let at = baseB + (n0 + rr) * p.sBn + k;
         let pair = unpack2x16float(b[at / 2u]);
@@ -115,6 +118,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       let n = n0 + tn + j;
       if (n >= p.n) { continue; }
       var v = acc[i * 4u + j] * p.alpha;
+      if (p.split > 0u) { c[baseC + m * p.sCm + n * p.sCn] = v; continue; }
       if (p.bias != 0u) { v += bias[n]; }
       if (p.act == 1u) { v = max(v, 0.0); }
       if (p.act == 2u) { v = 1.0 / (1.0 + exp(-v)); }
@@ -275,6 +279,9 @@ export class Bioemu2Ops {
     this.dummyInt = this.dummy;
     this.allocated = [];
     this.bytes = 0;
+    // weights outlive a fold's activations: `destroy()` frees the activations, `destroyWeights()` both
+    this.weightBuffers = [];
+    this.weightBytes = 0;
   }
 
   async pipeline(key, source) {
@@ -302,14 +309,36 @@ export class Bioemu2Ops {
     this.device.queue.writeBuffer(buffer, offsetFloats * 4, padded);
   }
 
-  /** A weight: float32, or float16 two to a word (`half`). */
-  weight(label, values, half = false) {
-    if (!half) return this.buffer(label, values.length, values instanceof Float32Array ? values : Float32Array.from(values));
-    const words = Math.ceil(values.length / 2);
-    const halves = new Uint16Array(words * 2);
-    for (let i = 0; i < values.length; i += 1) halves[i] = toHalf(values[i]);
+  /**
+   * A weight: float32, or float16 two to a word (`half`) - packed ON THE DEVICE from a float32 upload, since a
+   * host conversion of 512 M parameters is seconds of a first fold.
+   */
+  async weight(label, values, half = false) {
+    const floats = values instanceof Float32Array ? values : Float32Array.from(values);
+    if (!half) {
+      const buffer = this.buffer(label, floats.length, floats);
+      this.allocated.pop();
+      this.bytes -= buffer.size;
+      this.weightBuffers.push(buffer);
+      this.weightBytes += buffer.size;
+      return buffer;
+    }
+    const words = Math.ceil(floats.length / 2);
+    const staging = this.device.createBuffer({ size: Math.max(16, Math.ceil(floats.length * 4 / 16) * 16),
+                                               usage: STORAGE | COPY_DST });
+    this.write(staging, floats);
     const buffer = this.buffer(label, words);
-    this.write(buffer, new Uint32Array(halves.buffer));
+    this.allocated.pop();
+    this.bytes -= Math.max(16, Math.ceil(words * 4 / 16) * 16);
+    this.weightBuffers.push(buffer);
+    this.weightBytes += buffer.size;
+    const step = await this.map("pack-half", words, [{ buffer, type: "u32", write: true }, { buffer: staging }],
+      "let n = U(0u); let a = b1[2u * i]; var b = 0.0; if (2u * i + 1u < n) { b = b1[2u * i + 1u]; }\n  b0[i] = pack2x16float(vec2<f32>(a, b));",
+      [floats.length]);
+    const uniform = this.allocated.pop();
+    this.run(step);
+    staging.destroy();
+    uniform.destroy();
     buffer.half = true;
     return buffer;
   }
@@ -343,15 +372,49 @@ export class Bioemu2Ops {
     const C = { off: 0, s0: 0, s1: 0, m: n, n: 1, ...spec.C };
     const word = spec.b.half === true;
     if (word && (B.k !== 1 || B.off % 2 || B.s0 % 2 || B.s1 % 2 || B.n % 2)) throw new Error("a half weight wants even offsets");
-    const u = new Uint32Array(24);
+    // 🔴 A FEW ROWS AND A DEEP K LEAVE THE DEVICE IDLE: the token stream's 71-row projections launched 24
+    // workgroups over K = 3072 and ran at 0.4 TFLOP/s. Such a GEMM is SPLIT over K into partial planes and
+    // summed by a second kernel, which takes the epilogue (bias, activation, accumulation).
+    const tiles = Math.ceil(m / 64) * Math.ceil(n / 64) * B0 * B1;
+    if (spec.noSplit !== true && B0 * B1 === 1 && tiles < 256 && k >= 512) {
+      const splits = Math.min(Math.floor(k / 128), Math.ceil(1024 / tiles));
+      const chunk = Math.ceil(k / splits / 16) * 16;
+      const parts = Math.ceil(k / chunk);
+      // ...into ONE scratch per size class, shared by every split GEMM recorded: the dispatches run in order, so
+      // no two of them hold their partials at once, and one each was 1.6 GiB of a five-sample 68-residue fold
+      const floats = 2 ** Math.ceil(Math.log2(parts * m * n));
+      this.partials ??= new Map();
+      if (!this.partials.has(floats)) this.partials.set(floats, this.buffer("gemm.partial", floats));
+      const partial = this.partials.get(floats);
+      const first = await this.gemm({ ...spec, noSplit: true, c: partial, bias: undefined, act: undefined, accumulate: false,
+                                      batches: [1, parts], splitChunk: chunk,
+                                      A: { ...A, s1: 0 }, B: { ...B, s1: 0 }, C: { off: 0, s0: 0, s1: m * n, m: n, n: 1 } });
+      const reduce = await this.map("gemm-reduce", m * n, [{ buffer: spec.c, write: true }, { buffer: partial },
+        { buffer: spec.bias ?? this.dummy }],
+      `let n = U(1u); let row = i / n; let col = i % n; var v = 0.0;
+  for (var s = 0u; s < U(2u); s += 1u) { v += b1[s * U(0u) * n + i]; }
+  if (U(3u) != 0u) { v += b2[col]; }
+  if (U(4u) == 1u) { v = max(v, 0.0); }
+  if (U(4u) == 2u) { v = 1.0 / (1.0 + exp(-v)); }
+  let at = U(6u) + row * U(7u) + col * U(8u);
+  if (U(5u) != 0u) { v += b0[at]; }
+  b0[at] = v;`, [m, n, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
+        C.off, C.m, C.n]);
+      first.label = `gemm ${m}x${n}x${k} split ${parts}`;
+      return this.program([first, reduce]);
+    }
+    const u = new Uint32Array(28);
     const f = new Float32Array(u.buffer);
     u.set([m, n, k, B1, A.off, A.s0, A.s1, A.m, A.k, B.off, B.s0, B.s1, B.n, B.k, C.off, C.s0, C.s1, C.m, C.n,
       spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0]);
     f[22] = spec.alpha ?? 1;
     u[23] = B0 * B1;
+    u[24] = spec.splitChunk ?? 0;
     const groups = Math.ceil(m / 64) * Math.ceil(n / 64) * B0 * B1;
-    return this.step(word ? "gemm-h" : "gemm", gemmSource(word), groups,
-                     [spec.a, spec.b, spec.c, spec.bias ?? this.dummy], u);
+    const step = await this.step(word ? "gemm-h" : "gemm", gemmSource(word), groups,
+                                 [spec.a, spec.b, spec.c, spec.bias ?? this.dummy], u);
+    step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
+    return step;
   }
 
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
@@ -402,16 +465,52 @@ export class Bioemu2Ops {
 
   /** A list of steps, encoded together. */
   program(steps) {
+    // a split GEMM is itself a two-step program; flattened, so a program is always a list of dispatches
+    const flat = steps.flatMap((s) => (s.steps ? s.steps : [s]));
     return {
-      steps,
+      steps: flat,
       run: (pass) => {
-        for (const s of steps) {
+        for (const s of flat) {
           pass.setPipeline(s.pipeline);
           pass.setBindGroup(0, s.bindGroup);
           pass.dispatchWorkgroups(s.x, s.y);
         }
       },
     };
+  }
+
+  /**
+   * A per-dispatch GPU profile: every step its own pass with timestamps, summed by key. Diagnostic only - one pass a
+   * dispatch costs more than it measures - and on only when `profile` is set.
+   */
+  async runProfiled(...items) {
+    const steps = items.flat().flatMap((item) => (item.steps ? item.steps : [item]));
+    const query = this.device.createQuerySet({ type: "timestamp", count: 2 * steps.length });
+    const resolve = this.device.createBuffer({ size: 16 * steps.length, usage: 0x200 | COPY_SRC });
+    const encoder = this.device.createCommandEncoder({ label: "bioemu2.profile" });
+    steps.forEach((s, at) => {
+      const pass = encoder.beginComputePass({ timestampWrites: { querySet: query, beginningOfPassWriteIndex: 2 * at,
+                                                                 endOfPassWriteIndex: 2 * at + 1 } });
+      pass.setPipeline(s.pipeline);
+      pass.setBindGroup(0, s.bindGroup);
+      pass.dispatchWorkgroups(s.x, s.y);
+      pass.end();
+    });
+    encoder.resolveQuerySet(query, 0, 2 * steps.length, resolve, 0);
+    this.device.queue.submit([encoder.finish()]);
+    const times = await this.read(resolve, 4 * steps.length, 0, BigUint64Array === undefined ? Uint32Array : Uint32Array);
+    const words = new BigUint64Array(times.buffer);
+    this.profile ??= new Map();
+    steps.forEach((s, at) => {
+      const ns = Number(words[2 * at + 1] - words[2 * at]);
+      const key = s.label ?? s.key;
+      const row = this.profile.get(key) ?? { ms: 0, calls: 0 };
+      row.ms += ns / 1e6;
+      row.calls += 1;
+      this.profile.set(key, row);
+    });
+    query.destroy();
+    resolve.destroy();
   }
 
   /** Run steps (or programs) now, in one compute pass. */
@@ -443,6 +542,14 @@ export class Bioemu2Ops {
     for (const b of this.allocated) b.destroy();
     this.allocated = [];
     this.bytes = 0;
+    this.partials = undefined;
+  }
+
+  destroyWeights() {
+    this.destroy();
+    for (const b of this.weightBuffers) b.destroy();
+    this.weightBuffers = [];
+    this.weightBytes = 0;
   }
 }
 

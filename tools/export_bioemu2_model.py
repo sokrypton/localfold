@@ -85,8 +85,14 @@ def sub(params, prefix):
 def keep_float32(name, array):
     if array.ndim <= 1 or array.size < 4096:
         return True
-    return bool(re.search(r"embed_element|embed_atom_name_chars|embed_rel_|method_conditioning|fourier|"
-                          r"dt_embed/|dt_gate|encoding_un", name))
+    if re.search(r"embed_element|embed_atom_name_chars|embed_rel_|method_conditioning|fourier|"
+                 r"dt_embed/|dt_gate|encoding_un", name):
+        return True
+    # ...and the few small projections every token's representation starts from or ends in, which int5 costs
+    # out of proportion to their 1.6 MiB: measured against the float32 dump on 6MRR, s_init 2.8e-2 and z_init
+    # 2.2e-2 relRMS through s_init/z_init_1/z_init_2, the distogram's logits 1.9e-1 through its 64 x 256 head
+    return bool(re.match(r"sequence_embedder/(s_init|z_init_[12]|s_recycle|z_recycle|msa_module/(msa_proj|s_proj))/"
+                         r"|distogram_module/", name))
 
 
 def main():
