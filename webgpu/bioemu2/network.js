@@ -1,0 +1,761 @@
+/**
+ * BioEmu2 (microsoft/bioemu2, bioemu2-preview) on the GPU.
+ *
+ * A transcription of af3-any-model's `network/bioemu2.py`, stage for stage, held
+ * to it by tools/gpu/check-bioemu2-network.js on tools/oracle/dump_bioemu2.py's
+ * dumps:
+ *
+ *   * the INPUT EMBEDDER - three conditioned windowed atom-transformer layers,
+ *     then a token mean - gives s_inputs (T, 455);
+ *   * the TRUNK is a PairMixer: four MSA layers (pair-weighted averaging, the
+ *     MSA transition, an outer product mean whose mean is over VALID ROWS, then
+ *     a pair-only block) and 48 pair-only blocks, run four times with the
+ *     recycle. Its pair-only block - tri_mul_out, tri_mul_in, a transition - is
+ *     ESMFold2's, so it runs on webgpu/esmfold2/trunk.js and AF3's pair-track
+ *     kernels (the bundle carries it in their layout);
+ *   * the DENOISER is a dual stream: 16 layers each running a windowed atom
+ *     transformer and a full token transformer side by side, then mixing them
+ *     through every token's centre atom.
+ *
+ * Everything static in a fold - the pair conditioning, the per-layer attention
+ * biases (16 x 16 heads x T^2 for the token stream, 16 x 4 x windows for the
+ * atoms), the single conditioning's coordinate-free half - is computed once in
+ * `prepare`; a denoiser call is one recorded program replayed per sampler step.
+ */
+import { Bioemu2Ops } from "./ops.js";
+import {
+  addTokenPairToWindows, atomFeatures, atomPairTail, dampedHarmonic, linearRows, lnRows, sInputs, windowBias,
+} from "./host.js";
+import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
+import { trunkBlockWeights } from "../../shared/esmfold2/weights.js";
+import { Esmfold2TrunkGpu } from "../esmfold2/trunk.js";
+
+const W_Q = BIOEMU2.windowQueries;
+const W_K = BIOEMU2.windowKeys;
+const CTX = (W_K - W_Q) / 2;
+const SIGMA_DATA = BIOEMU2.sigmaData;
+
+export class Bioemu2Gpu {
+  /**
+   * @param read a shared/bioemu2/weights.js reader
+   * @param options `half`: weights as float16 on the device (default true); `trunkPrecision`: "f32" pins the
+   *   pair track's staging and accumulation to float32 (the oracle arm), otherwise the device's choice
+   */
+  constructor(device, read, options = {}) {
+    this.device = device;
+    this.read = read;
+    this.options = options;
+    this.half = options.half ?? true;
+    this.ops = new Bioemu2Ops(device);
+    this.weights = new Map();
+    this.host = new Map();
+  }
+
+  /** A weight on the device, once. */
+  async w(name, { half = this.half, transform } = {}) {
+    const key = `${name}|${half}|${transform ? "t" : ""}`;
+    if (!this.weights.has(key)) {
+      this.weights.set(key, (async () => {
+        let values = await this.read(name);
+        if (transform) values = transform(values);
+        return this.ops.weight(name, values, half && values.length % 2 === 0);
+      })());
+    }
+    return this.weights.get(key);
+  }
+
+  /** A weight on the host, once. */
+  async h(name) {
+    if (!this.host.has(name)) this.host.set(name, this.read(name));
+    return this.host.get(name);
+  }
+
+  async hostGroup(prefix, names) {
+    const out = {};
+    await Promise.all(names.map(async (n) => { out[n] = await this.h(`${prefix}/${n}`); }));
+    return out;
+  }
+
+  /** [fc1; fc2] stacked, so a SwiGLU's two projections are one GEMM. */
+  async swiglu(prefix) {
+    const key = `${prefix}/fc12`;
+    if (!this.weights.has(key)) {
+      this.weights.set(key, (async () => {
+        const [a, b] = await Promise.all([this.read(`${prefix}/fc1/weight`), this.read(`${prefix}/fc2/weight`)]);
+        const both = new Float32Array(a.length + b.length);
+        both.set(a);
+        both.set(b, a.length);
+        return this.ops.weight(key, both, this.half);
+      })());
+    }
+    return this.weights.get(key);
+  }
+
+  // --- reusable recorded blocks ---------------------------------------------------------------------------
+
+  /**
+   * SwiGLU transition over `rows` x `width` (hidden `hidden`): x [+]= fc3(silu(fc1 h) * fc2 h), where h is
+   * `input` (already normalised/modulated when `norm` is false) - returned steps write `out`.
+   */
+  async transition(steps, prefix, { input, rows, width, hidden, out, scratch, norm, accumulate = false }) {
+    const o = this.ops;
+    let src = input;
+    if (norm) {
+      steps.push(await o.layerNorm({ x: input, y: scratch.ln, rows, width,
+        w: await this.w(`${prefix}/norm/weight`, { half: false }), b: await this.w(`${prefix}/norm/bias`, { half: false }) }));
+      src = scratch.ln;
+    }
+    steps.push(await o.linear({ x: src, w: await this.swiglu(prefix), y: scratch.t12, rows, inC: width, outC: 2 * hidden }));
+    steps.push(await o.map("swiglu", rows * hidden, [{ buffer: scratch.t12 }, { buffer: scratch.t, write: true }],
+      `let r = i / U(0u); let c = i % U(0u);
+  let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
+  b1[i] = g / (1.0 + exp(-g)) * v;`, [hidden]));
+    steps.push(await o.linear({ x: scratch.t, w: await this.w(`${prefix}/fc3/weight`), y: out, rows, inC: hidden, outC: width, accumulate }));
+  }
+
+  /** silu(LN(c) w + b) . cond_2 + bias, per row of the conditioning source. */
+  async condition(steps, prefix, { c, rows, width, outC, ln, out, l0 = "cond_0", l2 = "cond_2" }) {
+    const o = this.ops;
+    steps.push(await o.layerNorm({ x: c, y: ln, rows, width,
+      w: await this.w(`${prefix}/${l0}/weight`, { half: false }), b: await this.w(`${prefix}/${l0}/bias`, { half: false }) }));
+    steps.push(await o.map("silu", rows * width, [{ buffer: ln, write: true }], "let v = b0[i]; b0[i] = v / (1.0 + exp(-v));"));
+    steps.push(await o.linear({ x: ln, w: await this.w(`${prefix}/${l2}/weight`), y: out, rows, inC: width, outC,
+                                bias: await this.w(`${prefix}/${l2}/bias`, { half: false }) }));
+  }
+
+  /**
+   * ConditionedTransformerLayer over a WINDOWED atom stream: x (N, 128), cond rows (R, 768) with `map` (atom ->
+   * cond row, -1 for none) or identity, the layer's window bias (NW, 4, 32, 128) and the padded key mask.
+   */
+  async windowedLayer(steps, prefix, { x, cond, map, bias, keyMask, N, s }) {
+    const o = this.ops;
+    const D = BIOEMU2.atom;
+    const H = BIOEMU2.atomHeads;
+    const hd = D / H;
+    const NW = N / W_Q;
+    const att = `${prefix}/attention/attention_layer/pair_bias_attn`;
+    const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta, map });
+    steps.push(await o.layerNorm({ x, y: s.h, rows: N, width: D, mod: mod(0, D) }));
+    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: N, inC: D, outC: 3 * D }));
+    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: N, inC: D, outC: D, act: "sigmoid" }));
+    // q (+ bias) in place, and k, v into the padded key array (48 zero rows each end)
+    steps.push(await o.map("win-qkv", N * 3 * D, [{ buffer: s.qkv, write: true }, { buffer: await this.w(`${att}/proj_q_bias`, { half: false }) },
+      { buffer: s.kvPad, write: true }],
+    `let r = i / 384u; let c = i % 384u;
+  if (c < 128u) { b0[i] = b0[i] + b1[c]; } else { b2[(r + ${CTX}u) * 256u + c - 128u] = b0[i]; }`));
+    // logits (NW, H, 32, 128) = q . k^T / sqrt(hd)
+    steps.push(await o.gemm({ m: W_Q, n: W_K, k: hd, a: s.qkv, b: s.kvPad, c: s.logits, batches: [NW, H], alpha: 1 / Math.sqrt(hd),
+      A: { off: 0, s0: W_Q * 3 * D, s1: hd, m: 3 * D, k: 1 },
+      B: { off: 0, s0: W_Q * 2 * D, s1: hd, n: 2 * D, k: 1 },
+      C: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, n: 1 } }));
+    steps.push(await o.softmax({ l: s.logits, rows: NW * H * W_Q, len: W_K, rowsPer: W_Q, b1: H,
+      L: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K }, bias, Bias: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K },
+      mask: keyMask, M: { off: 0, s0: W_Q } }));
+    // o (N, 128) = P . v
+    steps.push(await o.gemm({ m: W_Q, n: hd, k: W_K, a: s.logits, b: s.kvPad, c: s.o, batches: [NW, H],
+      A: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, k: 1 },
+      B: { off: D, s0: W_Q * 2 * D, s1: hd, n: 1, k: 2 * D },
+      C: { off: 0, s0: W_Q * D, s1: hd, m: D, n: 1 } }));
+    steps.push(await o.map("mul", N * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
+    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: N, inC: D, outC: D }));
+    steps.push(await this.gatedAdd(x, s.t3, cond, map, N, D, 6 * D, 2 * D));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: N, width: D, mod: mod(3 * D, 4 * D) }));
+    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: N, width: D, hidden: 4 * D, out: s.t3,
+                                                         scratch: s, norm: false });
+    steps.push(await this.gatedAdd(x, s.t3, cond, map, N, D, 6 * D, 5 * D));
+  }
+
+  /** x += gamma[row] * h, gamma at column `off` of cond's row (map[row], or row). */
+  gatedAdd(x, h, cond, map, rows, width, stride, off) {
+    return this.ops.map(map ? "gated-add-map" : "gated-add", rows * width,
+      [{ buffer: x, write: true }, { buffer: h }, { buffer: cond }, ...(map ? [{ buffer: map, type: "i32" }] : [])],
+      map ? `let r = i / U(0u); let c = i % U(0u); let m = b3[r];
+  if (m >= 0) { b0[i] = b0[i] + b2[u32(m) * U(1u) + U(2u) + c] * b1[i]; }`
+        : `let r = i / U(0u); let c = i % U(0u);
+  b0[i] = b0[i] + b2[r * U(1u) + U(2u) + c] * b1[i];`, [width, stride, off]);
+  }
+
+  /** ConditionedTransformerLayer over the FULL token stream (T, 768), 16 heads, pair bias precomputed. */
+  async tokenLayer(steps, prefix, { x, cond, bias, T, s }) {
+    const o = this.ops;
+    const D = BIOEMU2.token;
+    const H = BIOEMU2.tokenHeads;
+    const hd = D / H;
+    const att = `${prefix}/attention/pair_bias_attn`;
+    const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta });
+    steps.push(await o.layerNorm({ x, y: s.h, rows: T, width: D, mod: mod(0, D) }));
+    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: T, inC: D, outC: 3 * D }));
+    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: T, inC: D, outC: D, act: "sigmoid" }));
+    steps.push(await o.map("tok-qbias", T * D, [{ buffer: s.qkv, write: true }, { buffer: await this.w(`${att}/proj_q_bias`, { half: false }) }],
+      "let r = i / 768u; let c = i % 768u; b0[r * 2304u + c] = b0[r * 2304u + c] + b1[c];"));
+    steps.push(await o.gemm({ m: T, n: T, k: hd, a: s.qkv, b: s.qkv, c: s.logits, batches: [1, H], alpha: 1 / Math.sqrt(hd),
+      A: { off: 0, s1: hd, m: 3 * D, k: 1 }, B: { off: D, s1: hd, n: 3 * D, k: 1 },
+      C: { off: 0, s1: T * T, m: T, n: 1 } }));
+    steps.push(await o.softmax({ l: s.logits, rows: H * T, len: T, rowsPer: T, b1: 1,
+      L: { s0: T * T, r: T }, bias, Bias: { s0: T * T, r: T } }));
+    steps.push(await o.gemm({ m: T, n: hd, k: T, a: s.logits, b: s.qkv, c: s.o, batches: [1, H],
+      A: { off: 0, s1: T * T, m: T, k: 1 }, B: { off: 2 * D, s1: hd, n: 1, k: 3 * D },
+      C: { off: 0, s1: hd, m: D, n: 1 } }));
+    steps.push(await o.map("mul", T * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
+    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: T, inC: D, outC: D }));
+    steps.push(await this.gatedAdd(x, s.t3, cond, null, T, D, 6 * D, 2 * D));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: T, width: D, mod: mod(3 * D, 4 * D) }));
+    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: T, width: D, hidden: 4 * D, out: s.t3,
+                                                         scratch: s, norm: false });
+    steps.push(await this.gatedAdd(x, s.t3, cond, null, T, D, 6 * D, 5 * D));
+  }
+
+  /** Scratch for a stream of `rows` x `width`. */
+  scratch(name, rows, width, extra = {}) {
+    const o = this.ops;
+    return {
+      h: o.buffer(`${name}.h`, rows * width), qkv: o.buffer(`${name}.qkv`, rows * 3 * width),
+      g: o.buffer(`${name}.g`, rows * width), o: o.buffer(`${name}.o`, rows * width),
+      t3: o.buffer(`${name}.t3`, rows * width), t12: o.buffer(`${name}.t12`, rows * 8 * width),
+      t: o.buffer(`${name}.t`, rows * 4 * width), ln: o.buffer(`${name}.ln`, rows * width), ...extra,
+    };
+  }
+
+  // --- the stages -------------------------------------------------------------------------------------------
+
+  /** Device buffers of a feature dict, and its shapes. */
+  upload(f) {
+    const o = this.ops;
+    const T = f.res_type.length;
+    const N = f.atom_pad_mask.length;
+    const keyMask = new Int32Array(N + 2 * CTX);
+    keyMask.set(f.atom_pad_mask, CTX);
+    const atomToken = Int32Array.from(f.token_idx_at_atom, (t, a) => (f.atom_pad_mask[a] ? t : -1));
+    return {
+      f, T, N, NW: N / W_Q,
+      keyMask: o.buffer("keyMask", keyMask.length, keyMask),
+      atomToken: o.buffer("atomToken", N, atomToken),
+    };
+  }
+
+  /** InputEmbedder -> s_inputs (T, 455), on the host but for the three atom layers. */
+  async inputEmbedder(g) {
+    const { f, T, N, NW } = g;
+    const o = this.ops;
+    const P = "input_embedder/atom_attention_encoder";
+    const host = await this.hostGroup(P, ["proj_atom_continuous/weight", "embed_element/weight",
+      ...[0, 1, 2, 3].map((i) => `embed_atom_name_chars_${i}/weight`), "embed_atompair_ref_pos/weight",
+      "embed_atompair_ref_dist/weight", "embed_atompair_mask/weight", "c_to_p_trans_q_1/weight",
+      "c_to_p_trans_k_1/weight", "p_mlp_1/weight", "p_mlp_3/weight", "p_mlp_5/weight", "atom_to_token_trans_0/weight"]);
+    const { c, pr } = atomFeatures(host, f);
+    atomPairTail(host, c, pr, N);
+    const D = BIOEMU2.atom;
+    const cBuf = o.buffer("ie.c", N * D, c);
+    const q = o.buffer("ie.q", N * D, c);
+    const s = this.scratch("ie", N, D, {
+      kvPad: o.buffer("ie.kvPad", (N + 2 * CTX) * 2 * D), logits: o.buffer("ie.logits", NW * BIOEMU2.atomHeads * W_Q * W_K),
+    });
+    const cond = o.buffer("ie.cond", N * 6 * D);
+    const steps = [];
+    for (let l = 0; l < BIOEMU2.inputLayers; l += 1) {
+      const prefix = `${P}/atom_encoder_layers_${l}/transformer_layer`;
+      const att = `${prefix}/attention/attention_layer/pair_bias_attn`;
+      const bias = o.buffer(`ie.bias${l}`, NW * BIOEMU2.atomHeads * W_Q * W_K,
+        windowBias(pr, N, await this.h(`${att}/norm_z/weight`), await this.h(`${att}/proj_z/weight`), BIOEMU2.atomHeads));
+      await this.condition(steps, prefix, { c: cBuf, rows: N, width: D, outC: 6 * D, ln: s.ln, out: cond });
+      await this.windowedLayer(steps, prefix, { x: q, cond, map: null, bias, keyMask: g.keyMask, N, s });
+    }
+    o.run(steps);
+    const qHost = await o.read(q);
+    return sInputs(qHost, f, host["atom_to_token_trans_0/weight"], T);
+  }
+
+  /** A relative-position encoding (FusedRelativePositionEncoder) into `out` (T^2, 256), from `prefix`'s tables. */
+  async relpos(steps, prefix, g, out, accumulate) {
+    const o = this.ops;
+    const { f, T } = g;
+    const ints = new Int32Array(4 * T);
+    for (let t = 0; t < T; t += 1) {
+      ints[t] = f.asym_id[t]; ints[T + t] = f.entity_id[t]; ints[2 * T + t] = f.residue_index[t]; ints[3 * T + t] = f.sym_id[t];
+    }
+    g.tokenInts ??= o.buffer("tokenInts", 4 * T, ints);
+    const tables = await Promise.all(["embed_rel_pos/weight", "embed_rel_token/weight", "embed_same_entity/weight",
+      "embed_rel_chain/weight"].map((n) => this.w(`${prefix}/${n}`, { half: false })));
+    steps.push(await o.map(`relpos${accumulate ? "+" : ""}`, T * T * 256, [{ buffer: out, write: true }, { buffer: g.tokenInts, type: "i32" },
+      ...tables.map((buffer) => ({ buffer }))],
+    `let T = U(0u); let c = i % 256u; let p = i / 256u; let a = p / T; let b = p % T;
+  let sameChain = b1[a] == b1[b]; let sameRes = b1[2u * T + a] == b1[2u * T + b]; let sameEnt = b1[T + a] == b1[T + b];
+  var dres = clamp(b1[2u * T + a] - b1[2u * T + b] + 32, 0, 64); if (!sameChain) { dres = 65; }
+  var dtok = clamp(i32(a) - i32(b) + 32, 0, 64); if (!(sameChain && sameRes)) { dtok = 65; }
+  var dch = clamp(b1[3u * T + a] - b1[3u * T + b] + 2, 0, 4); if (!sameEnt) { dch = 5; }
+  var v = b2[u32(dres) * 256u + c] + b3[u32(dtok) * 256u + c] + b5[u32(dch) * 256u + c];
+  if (sameEnt) { v += b4[c]; }
+  ${accumulate ? "b0[i] = b0[i] + v;" : "b0[i] = v;"}`, [T]));
+  }
+
+  /** s_init and z_init: everything before the recycle loop. */
+  async trunkInit(g, sIn) {
+    const { f, T } = g;
+    const o = this.ops;
+    const P = "sequence_embedder";
+    const [sInitW, z1, z2, me, pe, tb] = await Promise.all(["s_init/weight", "z_init_1/weight", "z_init_2/weight",
+      "method_conditioning/embedding/weight", "method_conditioning/pair_embedding/weight", "token_bonds/weight"]
+      .map((n) => this.h(`${P}/${n}`)));
+    const sInit = linearRows(sIn, T, BIOEMU2.sInputs, sInitW, BIOEMU2.single);
+    for (let t = 0; t < T; t += 1) {
+      for (let c = 0; c < BIOEMU2.single; c += 1) sInit[t * BIOEMU2.single + c] += me[f.method_feature[t] * BIOEMU2.single + c];
+    }
+    const a = linearRows(sIn, T, BIOEMU2.sInputs, z1, 256);
+    const b = linearRows(sIn, T, BIOEMU2.sInputs, z2, 256);
+    // the per-token half of z_init on the host: (a_i + pe_i), (b_j + pe_j); the pairwise half on the device
+    for (let t = 0; t < T; t += 1) {
+      for (let c = 0; c < 256; c += 1) {
+        a[t * 256 + c] += pe[f.method_feature[t] * 256 + c];
+        b[t * 256 + c] += pe[f.method_feature[t] * 256 + c];
+      }
+    }
+    // contact conditioning: classes 0 and 1 are constants; a CONTACT pair (class >= 2) runs the encoder, here
+    const cc = await this.hostGroup(`${P}/contact_conditioning`, ["encoder/weight", "encoder/bias", "encoding_unspecified",
+      "encoding_unselected", "fourier_embedding/proj/weight", "fourier_embedding/proj/bias"]);
+    const classes = new Int32Array(T * T);
+    const special = [];
+    const slot = new Int32Array(T * T).fill(-1);
+    for (let p = 0; p < T * T; p += 1) {
+      let cls = 0;
+      for (let k = 0; k < 5; k += 1) if (f.contact_conditioning[p * 5 + k]) cls = k;
+      classes[p] = cls;
+      if (cls >= 2) {
+        const thr = (f.contact_threshold[p] - 4.0) / 16.0;
+        const x = new Float64Array(260);
+        for (let k = 0; k < 3; k += 1) x[k] = f.contact_conditioning[p * 5 + 2 + k];
+        x[3] = thr;
+        for (let k = 0; k < 256; k += 1) {
+          x[4 + k] = Math.cos(2 * Math.PI * (thr * cc["fourier_embedding/proj/weight"][k] + cc["fourier_embedding/proj/bias"][k]));
+        }
+        const v = new Float32Array(256);
+        for (let c = 0; c < 256; c += 1) {
+          let s = cc["encoder/bias"][c];
+          for (let k = 0; k < 260; k += 1) s += x[k] * cc["encoder/weight"][c * 260 + k];
+          v[c] = s;
+        }
+        slot[p] = special.length;
+        special.push(v);
+      }
+    }
+    const table = new Float32Array(Math.max(1, special.length) * 256 + 512);
+    table.set(cc.encoding_unspecified, 0);
+    table.set(cc.encoding_unselected, 256);
+    special.forEach((v, k) => table.set(v, 512 + k * 256));
+    const zInit = o.buffer("zInit", T * T * 256);
+    const steps = [];
+    await this.relpos(steps, `${P}/rel_pos`, g, zInit, false);
+    const ab = new Float32Array(2 * T * 256);
+    ab.set(a);
+    ab.set(b, T * 256);
+    const bonds = new Float32Array(T * T);
+    for (let p = 0; p < T * T; p += 1) bonds[p] = f.token_bonds[p];
+    steps.push(await o.map("zinit", T * T * 256, [{ buffer: zInit, write: true }, { buffer: o.buffer("zi.ab", ab.length, ab) },
+      { buffer: o.buffer("zi.bonds", T * T, bonds) }, { buffer: o.buffer("zi.bondw", 256, tb) },
+      { buffer: o.buffer("zi.cls", T * T, classes), type: "i32" }, { buffer: o.buffer("zi.slot", T * T, slot), type: "i32" },
+      { buffer: o.buffer("zi.table", table.length, table) }],
+    `let T = U(0u); let c = i % 256u; let p = i / 256u; let ii = p / T; let jj = p % T;
+  var v = b0[i] + b1[ii * 256u + c] + b1[(T + jj) * 256u + c] + b2[p] * b3[c];
+  let cls = b4[p];
+  if (cls == 0) { v += b6[c]; } else if (cls == 1) { v += b6[256u + c]; } else { v += b6[512u + u32(b5[p]) * 256u + c]; }
+  b0[i] = v;`, [T]));
+    o.run(steps);
+    return { sInit, zInit };
+  }
+
+  /** The MSA module's inputs, once a fold: m0 = msa_proj(feat) + s_proj(s_inputs). */
+  async msaInputs(g, sIn) {
+    const { f, T } = g;
+    const o = this.ops;
+    const S = f.msa.length / T;
+    const P = "sequence_embedder/msa_module";
+    const msaProj = await this.h(`${P}/msa_proj/weight`);     // (128, 36)
+    const sProj = linearRows(sIn, T, BIOEMU2.sInputs, await this.h(`${P}/s_proj/weight`), 128);
+    const m0 = o.buffer("msa.m0", S * T * 128);
+    const feats = new Float32Array(S * T * 3);
+    for (let i = 0; i < S * T; i += 1) {
+      feats[i * 3] = f.has_deletion[i]; feats[i * 3 + 1] = f.deletion_value[i]; feats[i * 3 + 2] = f.msa_paired[i];
+    }
+    const msaT = new Float32Array(36 * 128);
+    for (let c = 0; c < 128; c += 1) for (let k = 0; k < 36; k += 1) msaT[k * 128 + c] = msaProj[c * 36 + k];
+    o.run([await o.map("msa-m0", S * T * 128, [{ buffer: m0, write: true }, { buffer: o.buffer("msa.idx", S * T, Int32Array.from(f.msa)), type: "i32" },
+      { buffer: o.buffer("msa.feat", feats.length, feats) }, { buffer: o.buffer("msa.w", msaT.length, msaT) },
+      { buffer: o.buffer("msa.sp", sProj.length, sProj) }],
+    `let T = U(0u); let c = i % 128u; let st = i / 128u; let t = st % T;
+  b0[i] = b3[u32(b1[st]) * 128u + c] + b2[st * 3u] * b3[33u * 128u + c] + b2[st * 3u + 1u] * b3[34u * 128u + c]
+    + b2[st * 3u + 2u] * b3[35u * 128u + c] + b4[t * 128u + c];`, [T])]);
+    // n_valid: rows with any live column (msa_mask)
+    let valid = 0;
+    for (let s = 0; s < S; s += 1) {
+      let any = false;
+      for (let t = 0; t < T; t += 1) any ||= f.msa_mask[s * T + t] !== 0;
+      if (any) valid += 1;
+    }
+    return { m0, S, valid: Math.max(valid, 1) };
+  }
+
+  /** Compile everything a trunk pass runs, once per fold. */
+  async trunkProgram(g, sIn) {
+    const { T } = g;
+    const o = this.ops;
+    const P = "sequence_embedder";
+    const { sInit, zInit } = await this.trunkInit(g, sIn);
+    const msa = await this.msaInputs(g, sIn);
+    const { S } = msa;
+    const z = o.buffer("z", T * T * 256);
+    const zPrev = o.buffer("zPrev", T * T * 256);
+    const zln = o.buffer("zln", T * T * 256);
+    const sPrev = o.buffer("sPrev", T * BIOEMU2.single);
+    const s = o.buffer("s", T * BIOEMU2.single);
+    const sInitBuf = o.buffer("sInit", sInit.length, sInit);
+    const sln = o.buffer("sln", T * BIOEMU2.single);
+    const m = o.buffer("m", S * T * 128);
+    // recycle: s = s_init + s_recycle(LN s_prev); z = z_init + z_recycle(LN z_prev)
+    const recycle = [];
+    recycle.push(await o.layerNorm({ x: sPrev, y: sln, rows: T, width: BIOEMU2.single,
+      w: await this.w(`${P}/s_norm/weight`, { half: false }), b: await this.w(`${P}/s_norm/bias`, { half: false }) }));
+    recycle.push(await o.map("copy", T * BIOEMU2.single, [{ buffer: s, write: true }, { buffer: sInitBuf }], "b0[i] = b1[i];"));
+    recycle.push(await o.linear({ x: sln, w: await this.w(`${P}/s_recycle/weight`), y: s, rows: T, inC: BIOEMU2.single, outC: BIOEMU2.single, accumulate: true }));
+    recycle.push(await o.layerNorm({ x: zPrev, y: zln, rows: T * T, width: 256,
+      w: await this.w(`${P}/z_norm/weight`, { half: false }), b: await this.w(`${P}/z_norm/bias`, { half: false }) }));
+    recycle.push(await o.map("copy", T * T * 256, [{ buffer: z, write: true }, { buffer: zInit }], "b0[i] = b1[i];"));
+    recycle.push(await o.linear({ x: zln, w: await this.w(`${P}/z_recycle/weight`), y: z, rows: T * T, inC: 256, outC: 256, accumulate: true }));
+    recycle.push(await o.map("copy", S * T * 128, [{ buffer: m, write: true }, { buffer: msa.m0 }], "b0[i] = b1[i];"));
+    // the MSA layers' MSA halves
+    const msaSteps = [];
+    const sm = this.scratch("msa", S * T, 128);
+    const v = o.buffer("pwa.v", S * T * 256);
+    const gate = o.buffer("pwa.g", S * T * 256);
+    const ow = o.buffer("pwa.o", S * T * 256);
+    const w8 = o.buffer("pwa.w", 8 * T * T);
+    const ab = o.buffer("opm.ab", 2 * S * T * 32);
+    const chunk = Math.max(1, Math.min(T, Math.floor((32 << 20) / (T * 1024))));
+    const outer = o.buffer("opm.outer", chunk * T * 1024);
+    for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) {
+      const L = `${P}/msa_module/layers/${l}`;
+      const steps = [];
+      const pwa = `${L}/pair_weighted_averaging`;
+      steps.push(await o.layerNorm({ x: m, y: sm.ln, rows: S * T, width: 128,
+        w: await this.w(`${pwa}/norm_m/weight`, { half: false }), b: await this.w(`${pwa}/norm_m/bias`, { half: false }) }));
+      steps.push(await o.linear({ x: sm.ln, w: await this.w(`${pwa}/proj_m/weight`), y: v, rows: S * T, inC: 128, outC: 256 }));
+      steps.push(await o.linear({ x: sm.ln, w: await this.w(`${pwa}/proj_g/weight`), y: gate, rows: S * T, inC: 128, outC: 256, act: "sigmoid" }));
+      steps.push(await o.layerNorm({ x: z, y: zln, rows: T * T, width: 256,
+        w: await this.w(`${pwa}/norm_z/weight`, { half: false }), b: await this.w(`${pwa}/norm_z/bias`, { half: false }) }));
+      // logits (8, T, T): heads first
+      steps.push(await o.gemm({ m: T * T, n: 8, k: 256, a: zln, b: await this.w(`${pwa}/proj_z/weight`), c: w8,
+        A: { m: 256, k: 1 }, B: { n: 256, k: 1 }, C: { m: 1, n: T * T } }));
+      steps.push(await o.softmax({ l: w8, rows: 8 * T, len: T, rowsPer: T, L: { s0: T * T, r: T } }));
+      steps.push(await o.gemm({ m: T, n: 32, k: T, a: w8, b: v, c: ow, batches: [S, 8],
+        A: { off: 0, s0: 0, s1: T * T, m: T, k: 1 }, B: { off: 0, s0: T * 256, s1: 32, n: 1, k: 256 },
+        C: { off: 0, s0: T * 256, s1: 32, m: 256, n: 1 } }));
+      steps.push(await o.map("mul", S * T * 256, [{ buffer: ow, write: true }, { buffer: gate }], "b0[i] = b0[i] * b1[i];"));
+      steps.push(await o.linear({ x: ow, w: await this.w(`${pwa}/proj_o/weight`), y: m, rows: S * T, inC: 256, outC: 128, accumulate: true }));
+      await this.transition(steps, `${L}/msa_transition`, { input: m, rows: S * T, width: 128, hidden: 512, out: m,
+                                                          scratch: sm, norm: true, accumulate: true });
+      // outer product mean: z += proj_o((a (x) b) / n_valid) + bias, by chunks of rows
+      const opm = `${L}/outer_product_mean`;
+      steps.push(await o.layerNorm({ x: m, y: sm.ln, rows: S * T, width: 128,
+        w: await this.w(`${opm}/norm/weight`, { half: false }), b: await this.w(`${opm}/norm/bias`, { half: false }) }));
+      const projAb = await this.w(`${opm}/proj_ab/weight`);
+      steps.push(await o.linear({ x: sm.ln, w: projAb, y: ab, rows: S * T, inC: 128, outC: 32 }));
+      steps.push(await o.linear({ x: sm.ln, w: projAb, wOff: 32 * 128, y: ab, yOff: S * T * 32, rows: S * T, inC: 128, outC: 32 }));
+      for (let i0 = 0; i0 < T; i0 += chunk) {
+        const rows = Math.min(chunk, T - i0);
+        // outer[il, j, c, d] = sum_s a[s, i0 + il, c] b[s, j, d] / n_valid
+        steps.push(await o.gemm({ m: 32, n: 32, k: S, a: ab, b: ab, c: outer, batches: [rows, T], alpha: 1 / msa.valid,
+          A: { off: i0 * 32, s0: 32, s1: 0, m: 1, k: T * 32 },
+          B: { off: S * T * 32, s0: 0, s1: 32, n: 1, k: T * 32 },
+          C: { off: 0, s0: T * 1024, s1: 1024, m: 32, n: 1 } }));
+        steps.push(await o.linear({ x: outer, w: await this.w(`${opm}/proj_o/weight`), y: z, yOff: i0 * T * 256, rows: rows * T,
+          inC: 1024, outC: 256, accumulate: true, bias: await this.w(`${opm}/proj_o/bias`, { half: false }) }));
+      }
+      msaSteps.push(o.program(steps));
+    }
+    // the pair track's state: AllocatedGpuBuffer-shaped wrappers over our buffers (it binds `.buffer`)
+    const pairState = { buffer: { buffer: z }, maskBuffer: { buffer: o.buffer("pairMask", T * T, new Float32Array(T * T).fill(1)) } };
+    const trunk = new Esmfold2TrunkGpu(this.device, this.options.trunkPrecision === "f32"
+      ? { stagedPrecision: "f32", accumulatePrecision: "f32" } : {});
+    const msaBlocks = [];
+    for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) msaBlocks.push(await trunkBlockWeights(this.read, l, "msa"));
+    const mixerBlocks = [];
+    for (let l = 0; l < BIOEMU2.pairmixerBlocks; l += 1) mixerBlocks.push(await trunkBlockWeights(this.read, l, "pairmixer"));
+    const copyBack = [await o.map("copy", T * T * 256, [{ buffer: zPrev, write: true }, { buffer: z }], "b0[i] = b1[i];"),
+                      await o.map("copy", T * BIOEMU2.single, [{ buffer: sPrev, write: true }, { buffer: s }], "b0[i] = b1[i];")];
+    return {
+      z, s, sPrev, zPrev, zInit, sInit,
+      pass: async (onBlock) => {
+        o.run(recycle);
+        for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) {
+          o.run(msaSteps[l]);
+          await trunk.run(pairState, [msaBlocks[l]], { n: T, channels: 256 });
+        }
+        await trunk.run(pairState, mixerBlocks, { n: T, channels: 256, onBlockDone: onBlock });
+        o.run(copyBack);
+      },
+    };
+  }
+
+  /** The distogram's contact probability P(d < 8 A), and its logits, from the trunk pair. */
+  async distogram(g, z) {
+    const { T } = g;
+    const o = this.ops;
+    const sym = o.buffer("dg.sym", T * T * 256);
+    const logits = o.buffer("dg.logits", T * T * 64);
+    const steps = [await o.map("transpose-add", T * T * 256, [{ buffer: sym, write: true }, { buffer: z }],
+      "let T = U(0u); let c = i % 256u; let p = i / 256u; let a = p / T; let b = p % T; b0[i] = b1[i] + b1[(b * T + a) * 256u + c];", [T]),
+    await o.linear({ x: sym, w: await this.w("distogram_module/distogram/weight"), y: logits, rows: T * T, inC: 256, outC: 64,
+                     bias: await this.w("distogram_module/distogram/bias", { half: false }) })];
+    o.run(steps);
+    const host = await o.read(logits);
+    // Boltz's bins (64 over 2-22 A, edges linspace(2, 22, 63)); P(d < 8) is the first 19
+    const contact = new Float32Array(T * T);
+    for (let p = 0; p < T * T; p += 1) {
+      let mx = -Infinity;
+      for (let k = 0; k < 64; k += 1) mx = Math.max(mx, host[p * 64 + k]);
+      let sum = 0;
+      let near = 0;
+      for (let k = 0; k < 64; k += 1) { const e = Math.exp(host[p * 64 + k] - mx); sum += e; if (k < 19) near += e; }
+      contact[p] = near / sum;
+    }
+    sym.destroy();
+    logits.destroy();
+    return { logits: host, contact };
+  }
+
+  /**
+   * DualStreamDiffusionModule.compute_static_context and everything else a denoiser call reads that does not
+   * depend on the coordinates; returns a recorded program and the buffers a sampler step writes and reads.
+   */
+  async denoiserProgram(g, sIn, sTrunkHost, zTrunk, { dt = 0, dynamics = false, coordsCond = null } = {}) {
+    const { f, T, N, NW } = g;
+    const o = this.ops;
+    const P = "structure_module";
+    const DT = BIOEMU2.token;
+    const DA = BIOEMU2.atom;
+    // pairwise conditioner: z = proj(LN(concat(z_trunk, relpos))) + 2 transitions
+    const rel = o.buffer("ctx.rel", T * T * 256);
+    const cat = o.buffer("ctx.cat", T * T * 512);
+    const zc = o.buffer("ctx.z", T * T * 256);
+    const pre = [];
+    await this.relpos(pre, "rel_pos", g, rel, false);
+    pre.push(await o.map("concat2", T * T * 512, [{ buffer: cat, write: true }, { buffer: zTrunk }, { buffer: rel }],
+      "let p = i / 512u; let c = i % 512u; if (c < 256u) { b0[i] = b1[p * 256u + c]; } else { b0[i] = b2[p * 256u + c - 256u]; }"));
+    const pc = `${P}/pairwise_conditioner`;
+    pre.push(await o.layerNorm({ x: cat, y: cat, rows: T * T, width: 512,
+      w: await this.w(`${pc}/dim_pairwise_init_proj_0/weight`, { half: false }), b: await this.w(`${pc}/dim_pairwise_init_proj_0/bias`, { half: false }) }));
+    pre.push(await o.linear({ x: cat, w: await this.w(`${pc}/dim_pairwise_init_proj_1/weight`), y: zc, rows: T * T, inC: 512, outC: 256 }));
+    o.run(pre);
+    rel.destroy();
+    cat.destroy();
+    const ps = this.scratch("pc", T * T, 256);
+    for (let i = 0; i < 2; i += 1) {
+      const steps = [];
+      await this.transition(steps, `${pc}/transitions_${i}`, { input: zc, rows: T * T, width: 256, hidden: 512, out: zc,
+                                                             scratch: ps, norm: true, accumulate: true });
+      o.run(steps);
+    }
+    for (const b of Object.values(ps)) b.destroy();
+    // the token stream's per-layer pair biases (16, T, T): LN(z) (no offset) . proj_z
+    const tokenBias = [];
+    const zln = o.buffer("ctx.zln", T * T * 256);
+    for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
+      const att = `${P}/layers/${l}/token_block/attention/pair_bias_attn`;
+      const bias = o.buffer(`ctx.tbias${l}`, BIOEMU2.tokenHeads * T * T);
+      o.run([await o.layerNorm({ x: zc, y: zln, rows: T * T, width: 256, w: await this.w(`${att}/norm_z/weight`, { half: false }) }),
+        await o.gemm({ m: T * T, n: BIOEMU2.tokenHeads, k: 256, a: zln, b: await this.w(`${att}/proj_z/weight`), c: bias,
+          A: { m: 256, k: 1 }, B: { n: 256, k: 1 }, C: { m: 1, n: T * T } })]);
+      tokenBias.push(bias);
+    }
+    // the atom features and their window pair, on the host
+    const pa = `${P}/atom_feature_embedder`;
+    const host = await this.hostGroup(pa, ["proj_atom_continuous/weight", "embed_element/weight",
+      ...[0, 1, 2, 3].map((i) => `embed_atom_name_chars_${i}/weight`), "embed_atompair_ref_pos/weight",
+      "embed_atompair_ref_dist/weight", "embed_atompair_mask/weight", "c_to_p_trans_q_1/weight", "c_to_p_trans_k_1/weight",
+      "p_mlp_1/weight", "p_mlp_3/weight", "p_mlp_5/weight", "s_to_c_trans_0/weight", "s_to_c_trans_0/bias",
+      "s_to_c_trans_1/weight", "z_to_p_trans_0/weight", "z_to_p_trans_0/bias", "z_to_p_trans_1/weight",
+      "r_to_q_trans/weight", "cond_to_q_trans/weight", "dt_gate_embed/taus", "dt_gate_log_w"]);
+    const { c, pr } = atomFeatures(host, f);
+    const q0 = Float32Array.from(c);
+    const sToC = linearRows(lnRows(sTrunkHost, T, BIOEMU2.single, host["s_to_c_trans_0/weight"], host["s_to_c_trans_0/bias"]),
+                            T, BIOEMU2.single, host["s_to_c_trans_1/weight"], DA);
+    for (let a = 0; a < N; a += 1) {
+      if (!f.atom_pad_mask[a]) continue;
+      const t = f.token_idx_at_atom[a];
+      for (let k = 0; k < DA; k += 1) c[a * DA + k] += sToC[t * DA + k];
+    }
+    // z_to_p on the device (T^2 x 256 -> 16), read back for the window gather
+    const zp = o.buffer("ctx.zp", T * T * 16);
+    o.run([await o.layerNorm({ x: zTrunk, y: zln, rows: T * T, width: 256,
+      w: await this.w(`${pa}/z_to_p_trans_0/weight`, { half: false }), b: await this.w(`${pa}/z_to_p_trans_0/bias`, { half: false }) }),
+    await o.linear({ x: zln, w: await this.w(`${pa}/z_to_p_trans_1/weight`, { half: false }), y: zp, rows: T * T, inC: 256, outC: 16 })]);
+    const zpHost = await o.read(zp);
+    zp.destroy();
+    zln.destroy();
+    addTokenPairToWindows(pr, zpHost, T, f);
+    atomPairTail(host, c, pr, N);
+    const atomBias = [];
+    for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
+      const att = `${P}/layers/${l}/atom_block/transformer_layer/attention/attention_layer/pair_bias_attn`;
+      atomBias.push(o.buffer(`ctx.abias${l}`, NW * BIOEMU2.atomHeads * W_Q * W_K,
+        windowBias(pr, N, await this.h(`${att}/norm_z/weight`), await this.h(`${att}/proj_z/weight`), BIOEMU2.atomHeads)));
+    }
+
+    // the single conditioning's coordinate-free half: single_embed(LN(concat(s_trunk, s_inputs))) + the lag term
+    const sc = `${P}/single_conditioner`;
+    const sch = await this.hostGroup(sc, ["norm_single/weight", "norm_single/bias", "single_embed/weight", "single_embed/bias",
+      "fourier_embed/proj/weight", "fourier_embed/proj/bias", "norm_fourier/weight", "norm_fourier/bias",
+      "fourier_to_single/weight", "dt_embed/taus", "dt_embed/quality_factors", "dt_embed_to_single/weight"]);
+    const catS = new Float32Array(T * 839);
+    for (let t = 0; t < T; t += 1) {
+      catS.set(sTrunkHost.subarray(t * 384, t * 384 + 384), t * 839);
+      catS.set(sIn.subarray(t * 455, t * 455 + 455), t * 839 + 384);
+    }
+    const s0 = linearRows(lnRows(catS, T, 839, sch["norm_single/weight"], sch["norm_single/bias"]), T, 839,
+                          sch["single_embed/weight"], DT, sch["single_embed/bias"]);
+    if (dynamics) {
+      const dtv = linearRows(dampedHarmonic(dt, sch["dt_embed/taus"], sch["dt_embed/quality_factors"]), 1, 288,
+                             sch["dt_embed_to_single/weight"], DT);
+      for (let t = 0; t < T; t += 1) for (let k = 0; k < DT; k += 1) s0[t * DT + k] += dtv[k];
+    }
+    // a0 = s_trunk_to_a(s_trunk)
+    const a0 = linearRows(lnRows(sTrunkHost, T, 384, await this.h(`${P}/s_trunk_to_a_0/weight`), await this.h(`${P}/s_trunk_to_a_0/bias`)),
+                          T, 384, await this.h(`${P}/s_trunk_to_a_1/weight`), DT);
+    // the companion's coordinates, gated by the lag (BioEmu2's propagation)
+    let gate = 0;
+    if (dynamics) {
+      const taus = host["dt_gate_embed/taus"];
+      for (let i = 0; i < taus.length; i += 1) {
+        const lw = host["dt_gate_log_w"][i];
+        gate += Math.exp(-dt / taus[i]) * (lw > 20 ? lw : Math.log1p(Math.exp(lw)));
+      }
+    }
+
+    // device buffers the step reads and writes
+    const X = o.buffer("dn.x", N * 3);
+    const out = o.buffer("dn.out", N * 3);
+    const scalars = o.buffer("dn.scalars", 8);
+    const fvec = o.buffer("dn.fourier", DT);
+    const companion = o.buffer("dn.companion", N * 3, coordsCond ?? new Float32Array(N * 3));
+    const s0Buf = o.buffer("dn.s0", T * DT, s0);
+    const cond = o.buffer("dn.cond", T * DT);
+    const a = o.buffer("dn.a", T * DT);
+    const a0Buf = o.buffer("dn.a0", T * DT, a0);
+    const q = o.buffer("dn.q", N * DA);
+    const q0Buf = o.buffer("dn.q0", N * DA, q0);
+    const centre = o.buffer("dn.centre", T, Int32Array.from(f.token_center_atom_index));
+    const atomMask = o.buffer("dn.mask", N, Int32Array.from(f.atom_mask));
+    const rToQ = o.buffer("dn.rtoq", DA * 3, host["r_to_q_trans/weight"]);
+    const condToQ = o.buffer("dn.ctoq", DA * 3, host["cond_to_q_trans/weight"]);
+    const rTokToA = await this.w(`${P}/r_token_to_a/weight`, { half: false });
+    const condAtom = o.buffer("dn.condAtom", T * 6 * DA);
+    const condTok = o.buffer("dn.condTok", T * 6 * DT);
+    const condQ = o.buffer("dn.condQ", T * 1920);
+    const condS = o.buffer("dn.condS", T * 2560);
+    const sT = this.scratch("dt", T, DT, { logits: o.buffer("dt.logits", BIOEMU2.tokenHeads * T * T) });
+    const sA = this.scratch("da", N, DA, { kvPad: o.buffer("da.kvPad", (N + 2 * CTX) * 2 * DA),
+                                           logits: o.buffer("da.logits", NW * BIOEMU2.atomHeads * W_Q * W_K) });
+    const sq = o.buffer("dn.sq", N * 896);
+    const sqh = o.buffer("dn.sqh", N * 896);
+    const sq12 = o.buffer("dn.sq12", N * 3584);
+    const sqt = o.buffer("dn.sqt", N * 1792);
+    const dq = o.buffer("dn.dq", N * DA);
+    const qs = o.buffer("dn.qs", T * 896);
+    const qsh = o.buffer("dn.qsh", T * 896);
+    const qs12 = o.buffer("dn.qs12", T * 3584);
+    const qst = o.buffer("dn.qst", T * 1792);
+    const da = o.buffer("dn.da", T * DT);
+    const lnT = o.buffer("dn.lnT", T * DT);
+    const hid = o.buffer("dn.hid", N * 384);
+    const hidT = o.buffer("dn.hidT", T * 384);
+
+    const steps = [];
+    // r = x c_in on real atoms; the single conditioning; q; a
+    steps.push(await o.map("cond-init", T * DT, [{ buffer: cond, write: true }, { buffer: s0Buf }, { buffer: fvec }],
+      "b0[i] = b1[i] + b2[i % 768u];"));
+    for (let i = 0; i < 2; i += 1) {
+      await this.transition(steps, `${sc}/transitions_${i}`, { input: cond, rows: T, width: DT, hidden: 2 * DT, out: cond,
+                                                             scratch: sT, norm: true, accumulate: true });
+    }
+    steps.push(await o.map(dynamics ? "q-init-dyn" : "q-init", N * DA, [{ buffer: q, write: true }, { buffer: q0Buf }, { buffer: X },
+      { buffer: scalars }, { buffer: rToQ }, { buffer: atomMask, type: "i32" }, { buffer: companion }, { buffer: condToQ }],
+    `let a = i / 128u; let c = i % 128u; var v = b1[i];
+  if (b5[a] != 0) { let s = b3[0]; v += s * (b2[a * 3u] * b4[c * 3u] + b2[a * 3u + 1u] * b4[c * 3u + 1u] + b2[a * 3u + 2u] * b4[c * 3u + 2u]); }
+  ${dynamics ? `v += F(0u) * (b6[a * 3u] * b7[c * 3u] + b6[a * 3u + 1u] * b7[c * 3u + 1u] + b6[a * 3u + 2u] * b7[c * 3u + 2u]);` : ""}
+  b0[i] = v;`, [], [gate]));
+    steps.push(await o.map("a-init", T * DT, [{ buffer: a, write: true }, { buffer: a0Buf }, { buffer: X }, { buffer: scalars },
+      { buffer: rTokToA }, { buffer: centre, type: "i32" }],
+    `let t = i / 768u; let c = i % 768u; let at = u32(b5[t]); let s = b3[0];
+  b0[i] = b1[i] + s * (b2[at * 3u] * b4[c * 3u] + b2[at * 3u + 1u] * b4[c * 3u + 1u] + b2[at * 3u + 2u] * b4[c * 3u + 2u]);`));
+    for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
+      const L = `${P}/layers/${l}`;
+      const ab = `${L}/atom_block/transformer_layer`;
+      await this.condition(steps, ab, { c: cond, rows: T, width: DT, outC: 6 * DA, ln: lnT, out: condAtom });
+      await this.windowedLayer(steps, ab, { x: q, cond: condAtom, map: g.atomToken, bias: atomBias[l], keyMask: g.keyMask, N, s: sA });
+      const tb = `${L}/token_block`;
+      await this.condition(steps, tb, { c: cond, rows: T, width: DT, outC: 6 * DT, ln: lnT, out: condTok });
+      await this.tokenLayer(steps, tb, { x: a, cond: condTok, bias: tokenBias[l], T, s: sT });
+      const cp = `${L}/coupling`;
+      await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 1920, ln: lnT, out: condQ,
+                                        l0: "q_coupling_cond_0", l2: "q_coupling_cond_2" });
+      await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 2560, ln: lnT, out: condS,
+                                        l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" });
+      // s_to_q: concat(a[token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
+      steps.push(await o.map("cat-aq", N * 896, [{ buffer: sq, write: true }, { buffer: a }, { buffer: q }, { buffer: g.atomToken, type: "i32" }],
+        `let at = i / 896u; let c = i % 896u; let t = b3[at];
+  if (c < 768u) { if (t >= 0) { b0[i] = b1[u32(t) * 768u + c]; } else { b0[i] = 0.0; } } else { b0[i] = b2[at * 128u + c - 768u]; }`));
+      steps.push(await o.layerNorm({ x: sq, y: sqh, rows: N, width: 896, mod: { cond: condQ, stride: 1920, alpha: 0, beta: 896, map: g.atomToken } }));
+      steps.push(await o.linear({ x: sqh, w: await this.swiglu(`${cp}/s_to_q_mixer`), y: sq12, rows: N, inC: 896, outC: 3584 }));
+      steps.push(await o.map("swiglu", N * 1792, [{ buffer: sq12 }, { buffer: sqt, write: true }],
+        `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
+  b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
+      steps.push(await o.linear({ x: sqt, w: await this.w(`${cp}/s_to_q_mixer/fc3/weight`), y: dq, rows: N, inC: 1792, outC: DA }));
+      // q_to_s: concat(q[centre(t)], a) per token, modulated by the token's s coupling, a SwiGLU to 768
+      steps.push(await o.map("cat-qa", T * 896, [{ buffer: qs, write: true }, { buffer: q }, { buffer: a }, { buffer: centre, type: "i32" }],
+        `let t = i / 896u; let c = i % 896u;
+  if (c < 128u) { b0[i] = b1[u32(b3[t]) * 128u + c]; } else { b0[i] = b2[t * 768u + c - 128u]; }`));
+      steps.push(await o.layerNorm({ x: qs, y: qsh, rows: T, width: 896, mod: { cond: condS, stride: 2560, alpha: 0, beta: 896 } }));
+      steps.push(await o.linear({ x: qsh, w: await this.swiglu(`${cp}/q_to_s_mixer`), y: qs12, rows: T, inC: 896, outC: 3584 }));
+      steps.push(await o.map("swiglu", T * 1792, [{ buffer: qs12 }, { buffer: qst, write: true }],
+        `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
+  b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
+      steps.push(await o.linear({ x: qst, w: await this.w(`${cp}/q_to_s_mixer/fc3/weight`), y: da, rows: T, inC: 1792, outC: DT }));
+      // a += gamma_s * q_to_s; q += gamma_q * s_to_q
+      steps.push(await this.gatedAdd(a, da, condS, null, T, DT, 2560, 1792));
+      steps.push(await this.gatedAdd(q, dq, condQ, g.atomToken, N, DA, 1920, 1792));
+    }
+    // readout: LN(q W_q + a[token] W_s) (weight only) . to_out_1, then the EDM output
+    const ro = `${P}/readout`;
+    steps.push(await o.linear({ x: q, w: await this.w(`${ro}/q_to_hidden/weight`), y: hid, rows: N, inC: DA, outC: 384 }));
+    steps.push(await o.linear({ x: a, w: await this.w(`${ro}/s_to_hidden/weight`), y: hidT, rows: T, inC: DT, outC: 384 }));
+    steps.push(await o.map("add-token", N * 384, [{ buffer: hid, write: true }, { buffer: hidT }, { buffer: g.atomToken, type: "i32" }],
+      "let at = i / 384u; let c = i % 384u; let t = b2[at]; if (t >= 0) { b0[i] = b0[i] + b1[u32(t) * 384u + c]; }"));
+    steps.push(await o.layerNorm({ x: hid, y: hid, rows: N, width: 384, w: await this.w(`${ro}/to_out_0/weight`, { half: false }) }));
+    steps.push(await o.linear({ x: hid, w: await this.w(`${ro}/to_out_1/weight`, { half: false }), y: out, rows: N, inC: 384, outC: 3 }));
+    steps.push(await o.map("edm-out", N * 3, [{ buffer: out, write: true }, { buffer: X }, { buffer: scalars }],
+      "b0[i] = b2[2] * b1[i] + b2[3] * b0[i];"));
+    const program = o.program(steps);
+    const fourier = sch;
+    return {
+      X, out, companion, program, N, T, context: { z: zc, q0, p: pr },
+      /** One denoiser call: noisy coordinates (N x 3, padded) at sigma -> denoised. */
+      denoise: async (x, sigma) => {
+        const cIn = 1 / Math.sqrt(sigma * sigma + SIGMA_DATA * SIGMA_DATA);
+        const cSkip = SIGMA_DATA * SIGMA_DATA / (sigma * sigma + SIGMA_DATA * SIGMA_DATA);
+        const cOut = sigma * SIGMA_DATA / Math.sqrt(SIGMA_DATA * SIGMA_DATA + sigma * sigma);
+        // r = x c_in on real atoms: the mask is applied where X is read (q-init's b5, a-init reads centres)
+        o.write(scalars, new Float32Array([cIn, sigma, cSkip, cOut, 0, 0, 0, 0]));
+        const t = 0.25 * Math.log(sigma / SIGMA_DATA);
+        const four = new Float32Array(256);
+        for (let k = 0; k < 256; k += 1) {
+          four[k] = Math.cos(2 * Math.PI * (t * fourier["fourier_embed/proj/weight"][k] + fourier["fourier_embed/proj/bias"][k]));
+        }
+        const fv = linearRows(lnRows(four, 1, 256, fourier["norm_fourier/weight"], fourier["norm_fourier/bias"]), 1, 256,
+                              fourier["fourier_to_single/weight"], DT);
+        o.write(fvec, fv);
+        o.write(X, x);
+        o.run(program);
+        return o.read(out);
+      },
+      setCompanion: (values) => o.write(companion, values),
+    };
+  }
+}

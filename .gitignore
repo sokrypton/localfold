@@ -154,3 +154,7 @@ metal/*/localfold-*
 metal/**/*.combined
 .localfold-fetch.lock
 oracle-dumps-colab/
+
+# BioEmu2, written by tools/export_bioemu2_model.py and tools/quantize_af3.py
+/model-bioemu2-f32
+/model-bioemu2-int5
