@@ -87,13 +87,18 @@ def main():
          [f"--job={FIX}/bioemu2/6mrr.json", f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb", "--lag-ns=1",
           "--propagation-steps=2", "--samples=1", "--steps=50"], "bioemu2",
          [], [f"--weights={home}/af3am-bioemu2", "--fast", "--samples=1", "--steps=50"]),
+        # ...steered: the standalone asks its featuriser for the steering tables, and the host's threads keep each
+        # particle's arithmetic what it is, so the bytes still match
+        ("bioemu2 6mrr + NAG + retinal, edm_fk, 2 particles", "bioemu2",
+         [f"--job={FIX}/bioemu2/6mrr-nag-ret.json", "--sampler=edm_fk", "--samples=2", "--steps=50"], "bioemu2",
+         ["--steering"], [f"--weights={home}/af3am-bioemu2", "--fast", "--samples=2", "--steps=50", "--sampler=edm_fk"]),
     ]
     failed = 0
     with tempfile.TemporaryDirectory(dir="/tmp") as work:
         for name, port, inputs, model, fextra, fold_extra in cases:
             # the standalone command first: it fetches whatever weights the two-step path then reads
             new, old = os.path.join(work, "standalone.pdb"), os.path.join(work, "two-step.pdb")
-            fold_only = [a for a in inputs if a.split("=")[0] in ("--samples", "--seed", "--steps")]
+            fold_only = [a for a in inputs if a.split("=")[0] in ("--samples", "--seed", "--steps", "--sampler")]
             standalone(port, [*inputs, f"--model={model}"], new)
             featuriser_inputs = [a for a in inputs if a not in fold_only or port == "af2"]
             two_step(port, [*featuriser_inputs, *fextra], fold_extra, old, work)
@@ -114,6 +119,9 @@ def main():
             ("an alignment on fast ESMFold2", "ef2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
             ("a template on BioEmu2", "bioemu2", [f"--sequence={S6}", "--template=x.pdb:A"], "bioemu2 takes no --template"),
             ("a search on BioEmu2", "bioemu2", [f"--sequence={S6}", "--search"], "bioemu2 takes no --search"),
+            ("edm_fkc on BioEmu2", "bioemu2", [f"--sequence={S6}", "--sampler=edm_fkc"], "edm_fkc needs the denoiser's backward pass"),
+            ("a steered propagation", "bioemu2", [f"--job={FIX}/bioemu2/6mrr.json", "--sampler=edm_gd",
+                                                  f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb", "--lag-ns=1"], "runs unsteered"),
             ("a frame of another input", "bioemu2", [f"--sequence=WWWW", f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb",
                                                      "--lag-ns=1"], "atom(s) of this input"),
         ]:

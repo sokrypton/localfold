@@ -419,6 +419,10 @@ class Server:
         said = open(base + ".log").read()
         if int(open(base + ".done").read().strip() or 1) != 0:
             thrown = [line for line in said.strip().splitlines() if line.strip()]
+            # (a port that refuses says `Error: <sentence>`, as a featuriser does: the reader gets the sentence)
+            sentence = next((line[7:] for line in thrown if line.startswith("Error: ")), None)
+            if sentence is not None:
+                raise Refused(sentence)
             raise RuntimeError("the fold failed: " + "\n".join(thrown[-4:]))
         return said
 
@@ -797,6 +801,15 @@ class Worker:
         choice = controls.get("bioemu2-mode") or "structure"
         export = [featuriser("bioemu2-featurise"), os.path.join(WORK, "in"), f"--job={job_path}",
                   f"--mode={'equilibrium' if choice == 'propagate' else choice}"]
+        # the sampler (the page's bioemu2-sampler): edm, or the steered edm_gd / edm_fk, which read the steering tables
+        # the featuriser writes when asked, and the potentials the page hands over as text (bioemu2Potentials)
+        sampler = controls.get("bioemu2-sampler") or "edm"
+        if sampler not in ("edm", "edm_gd", "edm_fk"):
+            raise Refused(f"BioEmu2 sampler {sampler}: edm, edm_gd or edm_fk (edm_fkc needs the denoiser's backward pass)")
+        if sampler != "edm" and choice == "propagate":
+            raise Refused("BioEmu2 propagation runs unsteered here; use the edm sampler to propagate")
+        if sampler != "edm":
+            export.append("--steering")
         contacts = (controls.get("bioemu2-contacts") or "").strip()
         if contacts:
             path = os.path.join(WORK, "contacts.json")
@@ -845,7 +858,13 @@ class Worker:
         dev("featurising" + (" and the MMseqs2 search" if "--search" in flags else ""), (time.time() - at) * 1000, begin=at)
         steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or BIOEMU2_DEFAULT_STEPS)
         fold = [f"--out={os.path.join(WORK, 'fold.pdb')}", f"--steps={steps}", f"--seed={seed}",
-                f"--samples={max(1, int(controls.get('bioemu2-samples') or 1))}"]
+                f"--samples={max(1, int(controls.get('bioemu2-samples') or 1))}", f"--sampler={sampler}"]
+        potentials = (job.get("bioemu2Potentials") or "").strip()
+        if sampler != "edm" and potentials:
+            path = os.path.join(WORK, "potentials.yaml")
+            with open(path, "w") as handle:
+                handle.write(potentials + "\n")
+            fold.append(f"--potentials={path}")
         if recycles not in (None, ""):
             fold.append(f"--passes={int(recycles) + 1}")
         return server, fold, steps

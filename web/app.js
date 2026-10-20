@@ -4219,6 +4219,11 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
       const frame = upload ? await file.text() : lastBioemu2?.pdb;
       if (frame !== undefined) request.bioemu2Frame = frame;
     }
+    // ...and a steered sampler's potentials file, which is on this machine too (the controls carry the sampler)
+    const potentials = document.getElementById("bioemu2-potentials")?.files?.[0];
+    if (potentials !== undefined && (controls["bioemu2-sampler"] ?? "edm") !== "edm") {
+      request.bioemu2Potentials = await potentials.text();
+    }
   } else {
     request.schedule = { steps: samplerPlan(modifications ?? []).calls };
   }

@@ -219,6 +219,16 @@ def cases(offline):
         ("bioemu2 6mrr + GOL", {"family": "bioemu2", "controls": be2(), "entities": [protein(S6),
          {"type": "ligand", "value": "GOL", "copies": 1}], "job": job([S6], ["GOL"]), "samples": 1, "ligandBonds": 5},
          (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 6, None),
+        # 🔴 STEERED (edm_fk): every particle a sample, the potentials on the host - held to the steering's own job:
+        # NAG and retinal come out of the plain sampler with wrong-handed centres and twisted stereo bonds in 9 of 10
+        # samples, and none here (tools/score-bioemu2-samples.mjs measures it; this asserts the fold and its shape)
+        ("bioemu2 6mrr + NAG + retinal, edm_fk", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-sampler": "edm_fk", "bioemu2-samples": "3"}),
+         "entities": [protein(S6)], "job": open(f"{FIX}/bioemu2/6mrr-nag-ret.json").read(), "samples": 3},
+         ("chain", "A"), None, None, None),
+        ("bioemu2 refused: a steered propagation", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-mode": "propagate", "bioemu2-sampler": "edm_gd"}), "entities": [protein(S6)],
+         "job": j6, "bioemu2Frame": "previous"}, None, None, None, "runs unsteered"),
         ("bioemu2 refused: a template", {"family": "bioemu2", "controls": be2(),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A"})], "job": job([s5])},
          None, None, None, "takes no template"),

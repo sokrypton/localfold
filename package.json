@@ -93,7 +93,9 @@
     "test:switch": "python3 tools/check-model-switch.py",
     "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py",
-    "test:bioemu2-native": "node tools/check-native-bioemu2.mjs"
+    "test:bioemu2-native": "node tools/check-native-bioemu2.mjs",
+    "//test:bioemu2-steering-native": "cuda/bioemu2/src/steer.h - BioEmu2's edm_gd/edm_fk natively - against shared/bioemu2/potentials.js and sampler.js to the bit (every energy and gradient on three topology dumps; both samplers on the toy denoiser, the resampling indices step for step), the --potentials reader against potentials-yaml.js, and both samplers against af3-any-model's recorded run at its own floor. CPU only.",
+    "test:bioemu2-steering-native": "node tools/check-native-bioemu2-steering.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",

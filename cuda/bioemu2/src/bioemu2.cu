@@ -4,24 +4,170 @@
 // on the same input (cuda/bioemu2/oracle.py).
 //
 //   localfold-bioemu2 <input dir> --weights=<dir with bioemu2*.bin.zst> [--oracle=<dir>] [--out=fold.pdb]
-//       [--samples=5] [--steps=200] [--seed=N] [--fast] [--serve=<dir>]
+//       [--samples=5] [--steps=200] [--seed=N] [--fast] [--serve=<dir>] [--sampler=edm|edm_gd|edm_fk] [--potentials=<yaml>]
 // <input dir> is cuda/bioemu2/export_input.mjs's; its mode (structure, equilibrium, propagation) is the input's.
+// --sampler=edm_gd / edm_fk: BioEmu2's steered samplers (src/steer.h, held to shared/bioemu2/sampler.js to the bit on a
+// toy denoiser), every sample a particle through this denoiser, the potentials on the host; the input needs its
+// steering tables (featurised with --steering). --potentials replaces the default potentials, as the vendor's flag.
 //   localfold-bioemu2 --job=<job.json> --out=<pdb> [...]  (any first argument that is a flag): the weights fetched, the
 // input featurised in this process while the device starts, the fold (cuda/featurise/standalone.h)
 #include "fasttrunk.cuh"
 #include "sampler.cuh"
+#include "potentials_yaml.h"
 #include "../../featurise/standalone_api.h"
+#include <thread>
 #include <chrono>
 #include <unistd.h>
 
 using namespace be2;
 
-struct Opts { std::string dir, oracle, out = "fold.pdb"; uint64_t seed = 0; int samples = 5; int steps = 200;
-              bool stepsGiven = false; double stepScale = -1; int passes = 4; std::string frames; };
-
 static inline double ms(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
+static std::string readText(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) throw std::runtime_error("cannot read " + path);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+struct Opts { std::string dir, oracle, out = "fold.pdb"; uint64_t seed = 0; int samples = 5; int steps = 200;
+              bool stepsGiven = false; double stepScale = -1; int passes = 4; std::string frames;
+              std::string sampler = "edm", potentials; };
+
+// ---- steering: the input's tables (steer/*, steering-tables.js's, the featuriser's --steering) as steer.h reads them
+static be2steer::Tables steerTables() {
+  if (!M.has("steer/atom_pad_mask"))
+    throw std::runtime_error("this input has no steering tables: featurise it with --steering for a steered sampler");
+  auto I = [](const char* k) {
+    const std::string n = std::string("steer/") + k;
+    const size_t L = M.len(n);
+    const int* p = L ? M.i(n) : nullptr;
+    return std::vector<int>(p, p + L);
+  };
+  auto F = [](const char* k) {
+    const std::string n = std::string("steer/") + k;
+    const size_t L = M.len(n);
+    const float* p = L ? M.f(n) : nullptr;
+    return std::vector<double>(p, p + L);
+  };
+  auto rows = [](const std::vector<int>& v, size_t k) {
+    std::vector<std::vector<int>> out(k);
+    const size_t n = k ? v.size() / k : 0;
+    for (size_t r = 0; r < k; ++r) out[r].assign(v.begin() + r * n, v.begin() + (r + 1) * n);
+    return out;
+  };
+  be2steer::Tables t;
+  t.pad = I("atom_pad_mask");
+  t.nPad = (int)t.pad.size();
+  t.chain = I("atom_chain_id");
+  t.radius = F("atom_vdw_radius");
+  t.chainSizes = I("chain_sizes");
+  auto sym = rows(I("symmetric_chain_index"), 2); t.symA = sym[0]; t.symB = sym[1];
+  t.interMask = I("interchain_steric_atom_mask");
+  t.polyMask = I("polymer_steric_atom_mask");
+  for (int k : I("interchain_bonded_pair_key")) t.interKeys.insert(k);
+  for (int k : I("polymer_bonded_pair_key")) t.polyKeys.insert(k);
+  auto cl = rows(I("polymer_local_clash_index"), 2); t.clashI = cl[0]; t.clashJ = cl[1];
+  auto bi = rows(I("bond_index"), 2); t.bondI = bi[0]; t.bondJ = bi[1];
+  auto ai = rows(I("angle_index"), 3); t.angleI = ai[0]; t.angleJ = ai[1]; t.angleC = ai[2];
+  auto rb = rows(I("rdkit_bounds_index"), 2); t.rbI = rb[0]; t.rbJ = rb[1];
+  t.rbBond = I("rdkit_bounds_bond_mask"); t.rbAngle = I("rdkit_bounds_angle_mask");
+  t.rbUpper = F("rdkit_upper_bounds"); t.rbLower = F("rdkit_lower_bounds");
+  auto quads = [&](const char* k) {
+    auto r = rows(I(k), 4);
+    std::vector<std::array<int, 4>> out;
+    for (size_t c = 0; c < r[0].size(); ++c) out.push_back({r[0][c], r[1][c], r[2][c], r[3][c]});
+    return out;
+  };
+  t.chiral = quads("chiral_atom_index"); t.chiralOri = I("chiral_atom_orientations");
+  t.stereo = quads("stereo_bond_index"); t.stereoOri = I("stereo_bond_orientations");
+  auto pl = rows(I("planar_bond_index"), 6);
+  for (size_t c = 0; c < pl[0].size(); ++c) t.planar.push_back({pl[0][c], pl[1][c], pl[2][c], pl[3][c], pl[4][c], pl[5][c]});
+  for (const char* k : {"bond_ref", "angle_ref"}) {
+    std::vector<int> w = I((std::string(k) + ".bits").c_str());
+    std::vector<double> d(w.size() / 2);
+    if (!d.empty()) std::memcpy(d.data(), w.data(), d.size() * 8);
+    (std::string(k) == "bond_ref" ? t.bondRef : t.angleRef) = d;
+  }
+  return t;
+}
+
+// the steered samplers with this port's denoiser: every particle through one call (BATCH_SAMPLES at a time), the
+// draws this port's own (a seeded mt19937 per particle, as the plain sampler's; one more for the resampling)
+static std::vector<std::vector<float>> steeredFold(const Denoiser& d, const SamplerSettings& ss, const Opts& o, int n) {
+  using namespace be2steer;
+  const int N = d.N;
+  const std::vector<Spec> specs = o.potentials.empty() ? defaultSpecs() : potentialSpecs(parseSimpleYaml(readText(o.potentials)));
+  Tables t = steerTables();
+  if (t.nPad != N) throw std::runtime_error("the steering tables are for " + std::to_string(t.nPad) + " atoms, the input " + std::to_string(N));
+  hostTables(t, specs);
+  std::vector<double> mask(t.pad.begin(), t.pad.end());
+  std::vector<std::mt19937_64> rng;
+  for (int p = 0; p < n; ++p) rng.emplace_back(o.seed * 1000003ull + (uint64_t)p);
+  std::mt19937_64 resampling(o.seed * 1000003ull + 7919ull);
+  std::normal_distribution<double> Nd(0, 1);
+  Draws draws;
+  draws.x0 = [&] {
+    Particles x(n, std::vector<double>((size_t)N * 3));
+    for (int p = 0; p < n; ++p) for (auto& v : x[p]) v = Nd(rng[p]);
+    return x;
+  };
+  draws.step = [&](int, std::vector<std::array<double, 9>>& rot, std::vector<std::array<double, 3>>& trans, Particles& eps) {
+    rot.resize(n); trans.resize(n); eps.assign(n, std::vector<double>((size_t)N * 3));
+    for (int p = 0; p < n; ++p) {
+      double R[9], sh[3];
+      randomRigid(rng[p], R, sh);
+      std::copy(R, R + 9, rot[p].begin()); std::copy(sh, sh + 3, trans[p].begin());
+      for (auto& v : eps[p]) v = Nd(rng[p]);
+    }
+  };
+  draws.uniform = [&](int, int groups) {
+    std::uniform_real_distribution<double> U(0, 1);
+    std::vector<double> u(groups);
+    for (auto& v : u) v = U(resampling);
+    return u;
+  };
+  const size_t per = (size_t)N * 3;
+  const int batch = std::max(1, std::min(n, BATCH_SAMPLES));
+  float* dx = dalloc(per * batch); float* dd = dalloc(per * batch);
+  std::vector<float> hx(per * batch), hd(per * batch);
+  double denoiseMs = 0;
+  Denoise denoiser = [&](const Particles& xs, double sigma, const Particles*) {
+    auto t0 = std::chrono::steady_clock::now();
+    Particles out(xs.size(), std::vector<double>(per));
+    for (size_t p0 = 0; p0 < xs.size(); p0 += batch) {
+      const int b = (int)std::min<size_t>(batch, xs.size() - p0);
+      for (int k = 0; k < b; ++k) for (size_t i = 0; i < per; ++i) hx[per * k + i] = (float)xs[p0 + k][i];
+      CK(cudaMemcpyAsync(dx, hx.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
+      denoise(d, dx, (float)sigma, dd, nullptr, b);
+      CK(cudaMemcpyAsync(hd.data(), dd, per * b * 4, cudaMemcpyDeviceToHost, STREAM));
+      CK(cudaStreamSynchronize(STREAM));
+      for (int k = 0; k < b; ++k) for (size_t i = 0; i < per; ++i) out[p0 + k][i] = hd[per * k + i];
+    }
+    denoiseMs += ms(t0);
+    return out;
+  };
+  SteerSettings so;
+  so.steps = ss.steps; so.stepScale = ss.stepScale; so.noiseScale = ss.noiseScale; so.gamma0 = ss.gamma0; so.gammaMin = ss.gammaMin;
+  so.resamplingInterval = o.sampler == "edm_fk" ? 3 : 0;
+  auto t0 = std::chrono::steady_clock::now();
+  Particles x = steeredSample(denoiser, t, mask, n, draws, so, specs);
+  const double total = ms(t0);
+  printf("steered (%s, %zu potentials): the denoiser %.1f ms, the host %.1f ms (FK energies %.1f, guidance %.1f,"
+         " realignment %.1f)\n", o.sampler.c_str(), specs.size(), denoiseMs, total - denoiseMs, STEER_TIMES.energies,
+         STEER_TIMES.guidance, STEER_TIMES.align);
+  STEER_TIMES = {};
+  CK(cudaFree(dx)); CK(cudaFree(dd));
+  std::vector<float> fmask(mask.begin(), mask.end());
+  std::vector<std::vector<float>> out;
+  for (auto& v : x) {
+    std::vector<float> f(v.begin(), v.end());
+    centreMasked(f, fmask);
+    out.push_back(f);
+  }
+  return out;
+}
+
 
 static std::string stemOf(const std::string& pdb) {
   return pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
@@ -170,7 +316,16 @@ static int foldInput(const Opts& o) {
     SamplerSettings ss; ss.steps = o.steps;
     ss.stepScale = o.stepScale > 0 ? o.stepScale : equilibrium || chain ? 1.0 : 1.5;
     std::vector<std::vector<float>> out;
-    if (chain) {
+    if (o.sampler != "edm") {
+      if (chain) { fprintf(stderr, "Error: BioEmu2 propagation runs unsteered here; use the edm sampler to propagate\n"); return 1; }
+      try {
+        out = steeredFold(d, ss, o, o.samples);
+      } catch (const std::exception& e) {
+        fprintf(stderr, "Error: %s\n", e.what());
+        freeDenoiser(d);
+        return 1;
+      }
+    } else if (chain) {
       std::vector<float> x0(M.f("x0"), M.f("x0") + (size_t)N * 3);
       auto frames = propagate(d, ss, o.seed, o.samples, chain, x0);
       for (auto& tr : frames) for (auto& f : tr) out.push_back(f);    // (trajectory i, step k: sample i * chain + k)
@@ -200,6 +355,8 @@ static bool flagInto(const std::string& f, Opts& o) {
   else if (!f.compare(0, 10, "--samples=")) o.samples = atoi(f.c_str() + 10);
   else if (!f.compare(0, 13, "--step-scale=")) o.stepScale = atof(f.c_str() + 13);
   else if (!f.compare(0, 9, "--passes=")) o.passes = atoi(f.c_str() + 9);
+  else if (!f.compare(0, 10, "--sampler=")) o.sampler = f.substr(10);
+  else if (!f.compare(0, 13, "--potentials=")) o.potentials = f.substr(13);
   else return false;
   return true;
 }
@@ -226,6 +383,10 @@ static int foldMain(int argc, char** argv) {
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir holding bioemu2*.bin.zst>\n"); return 1; }
   if (o.steps < 2) { fprintf(stderr, "BioEmu2 samples with at least 2 steps, got %d\n", o.steps); return 1; }
+  if (o.sampler != "edm" && o.sampler != "edm_gd" && o.sampler != "edm_fk") {
+    fprintf(stderr, "Error: BioEmu2 sampler %s: edm, edm_gd or edm_fk (edm_fkc needs the denoiser's backward pass)\n", o.sampler.c_str());
+    return 1;
+  }
   auto tStart = std::chrono::steady_clock::now();
   M.loadBundle(weights, "w");
   for (int sgi = 0; sgi < (int)M.segs.size(); ++sgi) M.upload(sgi);
