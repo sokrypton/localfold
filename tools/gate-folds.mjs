@@ -66,6 +66,9 @@ export const FOLDS = [
                     `--sequence=${SIX_MRR}`, "--steps=50"]],
   ["rosettafold3", ["tools/gpu/fold.js", "--model=/model-rosettafold3-int5/manifest.json",
                     `--sequence=${SIX_MRR}`, "--steps=50"]],
+  // BioEmu2: its own graph (webgpu/bioemu2) - a generic GEMM, its LayerNorm and softmax kernels and the
+  // ESMFold2/AF3 pair track - from the job, through its own featuriser, 6MRR's 68 residues
+  ["BioEmu2", ["tools/gpu/fold-bioemu2.js", "--job=/tools/fixtures/bioemu2/6mrr-68.json", "--steps=50"]],
 ];
 
 const run = (args, env) => new Promise((resolve) => {

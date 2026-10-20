@@ -49,6 +49,8 @@ import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network,
   loadBioemu2Weights, releaseBioemu2, x0FromPdb } from "./bioemu2-model.js";
 import { foldBioemu2 } from "../webgpu/bioemu2/fold.js";
 import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
+import { BioEmu2Graph } from "../shared/bioemu2/graph.js";
+import { checkPhysicality } from "../shared/bioemu2/physicality.js";
 import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geometry.js";
 import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
@@ -4026,7 +4028,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   };
   const every = Math.max(1, Math.round(steps / 20));
   const result = await foldBioemu2(device, loaded.read, features, {
-    network, samples, steps, seed: randomSeed(), mode, propagation,
+    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1,
     // the distogram's contact map exists before any structure does, and is shown as the trunk's is
     onContacts: (contact) => {
       if (signal.aborted) return;
@@ -4079,7 +4081,25 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     viewer.setFrame(0);
     viewer.render("bioemu2-final");
   }
-  updateScoresCard({ none: true, label: `${modelName} has no confidence head` });
+  // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample (shared/bioemu2/physicality.js, held to the colab port): it
+  // changes no coordinate, and says whether each sample's protein passes the high_quality thresholds and the first
+  // check that failed - which is what this model offers in place of a confidence
+  const where = new Map(atomKeys.map((key, at) => [key.join("|"), at]));
+  const declared = (featurised.job.bondedAtomPairs ?? [])
+    .map(([a, b]) => [where.get(a.join("|")), where.get(b.join("|"))])
+    .filter(([a, b]) => a !== undefined && b !== undefined);
+  let physicality = [];
+  try {
+    physicality = checkPhysicality(topology, new BioEmu2Graph(topology).bonds,
+      result.samples.map((x) => Float64Array.from(x.subarray(0, realAtoms * 3))), "high_quality", declared);
+  } catch (cause) {
+    console.warn("physicality report skipped:", cause);
+  }
+  const passed = physicality.filter((one) => one.ok).length;
+  const firstFailure = physicality.find((one) => !one.ok)?.reason;
+  const physicalityLine = physicality.length === 0 ? ""
+    : ` · physicality ${passed}/${physicality.length} pass${firstFailure ? ` (${firstFailure.replaceAll("_", " ")})` : ""}`;
+  updateScoresCard({ none: true, label: `No confidence head${physicalityLine}` });
   recordPrediction({
     stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
     chainLengths: chains.map((chain) => chain.length),
@@ -4089,8 +4109,9 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     ...foldContext,
     settings: {
       seed: foldContext.settings?.seed, mode: choice, samples, "diffusion steps": steps,
-      "trunk passes": 4, ...(propagation ? { "lag (ns)": propagation.lagNs, "propagation steps": propagation.steps } : {}),
+      "trunk passes": recycleCount() + 1, ...(propagation ? { "lag (ns)": propagation.lagNs, "propagation steps": propagation.steps } : {}),
       ...(contacts === "" ? {} : { contacts }),
+      ...(physicality.length === 0 ? {} : { physicality: physicality.map((one) => (one.ok ? "passed" : `rejected: ${one.reason}`)) }),
     },
   }, family);
   void rememberSessionWhenSettled(lastPrediction);
@@ -4104,6 +4125,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
     + ` · ${samples} sample${samples === 1 ? "" : "s"} · ${steps} steps · ${seconds}s · no confidence head`
+    + physicalityLine
     + (verdict.ok ? "" : " · NOT A CHAIN"));
   progress(null);
 }

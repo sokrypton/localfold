@@ -93,6 +93,13 @@ export async function main(device, args) {
       bondRatios: s.bonds.ratios,
     })),
     geometry: scored[0].geometry,
+    // 🔴 A CHECKSUM OF THE FIRST SAMPLE'S ATOMS, the signature tools/gate-folds.mjs records: an arm that moved the
+    // structure says so where a geometry summary would not
+    atomChecksum: (() => {
+      let sum = 0;
+      for (let i = 0; i < atomKeys.length * 3; i += 1) sum = (sum + Math.round(result.samples[0][i] * 1000)) | 0;
+      return sum;
+    })(),
   };
   if (propagated) {
     const p = score(propagated.samples[propagated.samples.length - 1]);

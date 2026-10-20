@@ -148,9 +148,11 @@ export async function foldBioemu2(device, read, features, options = {}) {
     const progress = options.onProgress ?? (() => {});
     const sIn = await clock("embed", () => net.inputEmbedder(g));
     const trunk = await clock("trunk-compile", () => net.trunkProgram(g, sIn));
+    // the page's recycle dial, plus one; BioEmu2's own load_model runs num_steps_recycle 3, range(3 + 1) = four
+    const passes = options.passes ?? BIOEMU2.trunkPasses;
     await clock("trunk", async () => {
-      for (let pass = 0; pass < BIOEMU2.trunkPasses; pass += 1) {
-        await trunk.pass((done, total) => progress("trunk", pass * total + done, BIOEMU2.trunkPasses * total));
+      for (let pass = 0; pass < passes; pass += 1) {
+        await trunk.pass((done, total) => progress("trunk", pass * total + done, passes * total));
       }
     });
     const sTrunk = await net.ops.read(trunk.s);
