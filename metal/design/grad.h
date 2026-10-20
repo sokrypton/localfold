@@ -183,6 +183,27 @@ void msaColumnAttentionBwd(const float* msa, const float* msaMask, int S, int N,
                            const BiasedAttnWeights& w, const float* dOut, float* dMsa,
                            const BiasedAttnGrads& g = {});
 
+// ---------------------------------------------------------------- MSAColumnGlobalAttention (the extra-MSA stack's)
+// See kernels.h for the forward and for why this one stores its attention weights where every other attention here
+// refuses to. Wk and Wv have NO head axis; Wq, Wg and Wo do. Gating is required.
+//   msa [S][N][Cm];  msaMask [S][N];  dOut [S][N][O];  dMsa [S][N][Cm], written
+struct GlobalAttnWeights {
+  const float* qScale; const float* qOffset;   // query_norm
+  const float* Wq;                             // [Cm][H * D]
+  const float* Wk; const float* Wv;            // [Cm][D]   - shared across heads
+  const float* Wg; const float* bg;            // [Cm][H * D], [H * D]
+  const float* Wo; const float* bo;            // [H * D][O], [O]
+};
+struct GlobalAttnGrads {
+  float* qScale = nullptr; float* qOffset = nullptr;
+  float* Wq = nullptr; float* Wk = nullptr; float* Wv = nullptr;
+  float* Wg = nullptr; float* bg = nullptr;
+  float* Wo = nullptr; float* bo = nullptr;
+};
+void msaColumnGlobalAttentionBwd(const float* msa, const float* msaMask, int S, int N, int Cm, int H, int D, int O,
+                                 const GlobalAttnWeights& w, const float* dOut, float* dMsa,
+                                 const GlobalAttnGrads& g = {});
+
 // ---------------------------------------------------------------- TriangleMultiplication (Alg. 11 / 12)
 // The forward, as AF2 writes it (modules.py:947-1012). With n2 = N * N pair rows, C the pair width and I the
 // intermediate width (num_intermediate_channel):

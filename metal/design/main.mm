@@ -1029,6 +1029,175 @@ static void mcolCase(int S, int N, int Cm, int H, int D, int O) {
   release(gMsa); release(gqs); release(gqo); release(gWq); release(gWv); release(gWo);
 }
 
+// ---------------------------------------------------------------- MSAColumnGlobalAttention
+struct GattnP { std::vector<double> qScale, qOffset, Wq, Wk, Wv, Wg, bg, Wo, bo; };
+
+// modules.py:432-497 and :640-669, in double. msa is [S][N][Cm]; the module swaps to [N][S][Cm] first.
+static void gattnForward(const std::vector<double>& msa, const std::vector<double>& mask,
+                         int S, int N, int Cm, int H, int D, int O, const GattnP& p,
+                         std::vector<double>& out) {
+  const int B = N, K = S, W = H * D;
+  const size_t rows = (size_t)B * K;
+  std::vector<double> actT(rows * Cm), maskT(rows);
+  for (int s = 0; s < S; ++s)
+    for (int n = 0; n < N; ++n) {
+      maskT[(size_t)n * S + s] = mask[(size_t)s * N + n];
+      for (int c = 0; c < Cm; ++c) actT[((size_t)n * S + s) * Cm + c] = msa[((size_t)s * N + n) * Cm + c];
+    }
+  std::vector<double> actN;
+  lnForward(actT, rows, Cm, p.qScale, p.qOffset, 1e-5, actN);
+
+  std::vector<double> qavg((size_t)B * Cm, 0.0);
+  for (int b = 0; b < B; ++b) {
+    double den = 0;
+    for (int k = 0; k < K; ++k) den += maskT[(size_t)b * K + k];
+    for (int c = 0; c < Cm; ++c) {
+      double num = 0;
+      for (int k = 0; k < K; ++k) num += maskT[(size_t)b * K + k] * actN[((size_t)b * K + k) * Cm + c];
+      qavg[(size_t)b * Cm + c] = num / (den + 1e-10);
+    }
+  }
+  const double scale = 1.0 / sqrt((double)D);
+  std::vector<double> q((size_t)B * W, 0.0), kk(rows * D, 0.0), vv(rows * D, 0.0);
+  for (int b = 0; b < B; ++b)
+    for (int o = 0; o < W; ++o) {
+      double s2 = 0;
+      for (int c = 0; c < Cm; ++c) s2 += qavg[(size_t)b * Cm + c] * p.Wq[(size_t)c * W + o];
+      q[(size_t)b * W + o] = s2 * scale;
+    }
+  for (size_t r = 0; r < rows; ++r)
+    for (int c = 0; c < D; ++c) {
+      double a1 = 0, a2 = 0;
+      for (int e = 0; e < Cm; ++e) {
+        a1 += actN[r * Cm + e] * p.Wk[(size_t)e * D + c];
+        a2 += actN[r * Cm + e] * p.Wv[(size_t)e * D + c];
+      }
+      kk[r * D + c] = a1;
+      vv[r * D + c] = a2;
+    }
+  std::vector<double> wa((size_t)B * W, 0.0), logit(K);
+  for (int b = 0; b < B; ++b)
+    for (int h = 0; h < H; ++h) {
+      double mx = -1e300;
+      for (int k = 0; k < K; ++k) {
+        double d = 1e9 * (maskT[(size_t)b * K + k] - 1.0);
+        for (int c = 0; c < D; ++c) d += q[(size_t)b * W + h * D + c] * kk[((size_t)b * K + k) * D + c];
+        logit[k] = d;
+        mx = std::max(mx, d);
+      }
+      double tot = 0;
+      for (int k = 0; k < K; ++k) { logit[k] = exp(logit[k] - mx); tot += logit[k]; }
+      for (int c = 0; c < D; ++c) {
+        double acc = 0;
+        for (int k = 0; k < K; ++k) acc += logit[k] * vv[((size_t)b * K + k) * D + c];
+        wa[(size_t)b * W + h * D + c] = acc / tot;
+      }
+    }
+  // the gate broadcasts that single query back over every position
+  std::vector<double> wag(rows * W, 0.0);
+  for (int b = 0; b < B; ++b)
+    for (int k = 0; k < K; ++k)
+      for (int o = 0; o < W; ++o) {
+        double gp = p.bg[o];
+        for (int c = 0; c < Cm; ++c) gp += actN[((size_t)b * K + k) * Cm + c] * p.Wg[(size_t)c * W + o];
+        wag[((size_t)b * K + k) * W + o] = wa[(size_t)b * W + o] * sigm(gp);
+      }
+  out.assign(rows * O, 0.0);
+  for (size_t r = 0; r < rows; ++r)
+    for (int o = 0; o < O; ++o) {
+      double s2 = p.bo[o];
+      for (int c = 0; c < W; ++c) s2 += wag[r * W + c] * p.Wo[(size_t)c * O + o];
+      out[r * O + o] = s2;
+    }
+}
+
+static void gattnCase(int S, int N, int Cm, int H, int D, int O) {
+  const int W = H * D;
+  const size_t rows = (size_t)S * N;
+  std::vector<double> msa = randv(rows * Cm), dOut = randv(rows * O, 0.5), mask(rows, 1.0);
+  for (int s = 1; s < S; ++s)
+    for (int n = 0; n < N; ++n)
+      if ((s + n) % 4 == 0) mask[(size_t)s * N + n] = 0.0;      // sequence 0 always present
+  GattnP p;
+  p.qScale = randv(Cm, 0.3); for (auto& x : p.qScale) x += 1.0;
+  p.qOffset = randv(Cm, 0.2);
+  p.Wq = randv((size_t)Cm * W, 0.2);
+  p.Wk = randv((size_t)Cm * D, 0.2);
+  p.Wv = randv((size_t)Cm * D, 0.2);
+  p.Wg = randv((size_t)Cm * W, 0.2); p.bg = randv(W, 0.1);
+  p.Wo = randv((size_t)W * O, 0.2);  p.bo = randv(O, 0.1);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dMsaIn = up(msa); void* dMask = up(mask); void* dDo = up(dOut);
+  void* hqs = up(p.qScale); void* hqo = up(p.qOffset); void* hWq = up(p.Wq);
+  void* hWk = up(p.Wk); void* hWv = up(p.Wv); void* hWg = up(p.Wg); void* hbg = up(p.bg);
+  void* hWo = up(p.Wo); void* hbo = up(p.bo);
+  GlobalAttnWeights w{};
+  w.qScale = (const float*)hqs; w.qOffset = (const float*)hqo; w.Wq = (const float*)hWq;
+  w.Wk = (const float*)hWk; w.Wv = (const float*)hWv;
+  w.Wg = (const float*)hWg; w.bg = (const float*)hbg;
+  w.Wo = (const float*)hWo; w.bo = (const float*)hbo;
+  void* gMsa = alloc(rows * Cm * 4);
+  void* gqs = alloc((size_t)Cm * 4); void* gqo = alloc((size_t)Cm * 4);
+  void* gWq = alloc((size_t)Cm * W * 4);
+  void* gWk = alloc((size_t)Cm * D * 4); void* gWv = alloc((size_t)Cm * D * 4);
+  void* gWg = alloc((size_t)Cm * W * 4); void* gbg = alloc((size_t)W * 4);
+  void* gWo = alloc((size_t)W * O * 4); void* gbo = alloc((size_t)O * 4);
+  GlobalAttnGrads gg{};
+  gg.qScale = (float*)gqs; gg.qOffset = (float*)gqo;
+  gg.Wq = (float*)gWq; gg.Wk = (float*)gWk; gg.Wv = (float*)gWv;
+  gg.Wg = (float*)gWg; gg.bg = (float*)gbg; gg.Wo = (float*)gWo; gg.bo = (float*)gbo;
+
+  msaColumnGlobalAttentionBwd((const float*)dMsaIn, (const float*)dMask, S, N, Cm, H, D, O, w,
+                              (const float*)dDo, (float*)gMsa, gg);
+
+  char shape[90];
+  snprintf(shape, sizeof shape, "S%d N%d Cm%d H%d D%d O%d", S, N, Cm, H, D, O);
+  auto S_ = [&]() {
+    std::vector<double> o;
+    gattnForward(msa, mask, S, N, Cm, H, D, O, p, o);
+    double acc = 0;                           // o is [N][S][O]; the cotangent is [S][N][O]
+    for (int s = 0; s < S; ++s)
+      for (int n = 0; n < N; ++n)
+        for (int oo = 0; oo < O; ++oo)
+          acc += dOut[((size_t)s * N + n) * O + oo] * o[((size_t)n * S + s) * O + oo];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = S_();
+      target[j] = save - hh;
+      double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[230];
+    snprintf(lab, sizeof lab, "gattn %s vs central difference %s", what, shape);
+    reportGrad(lab, fd, mine, 3e-5);
+  };
+  probe("dMsa", msa, download((const float*)gMsa, rows * Cm), 6);
+  probe("dqScale", p.qScale, download((const float*)gqs, Cm), 3);
+  probe("dqOffset", p.qOffset, download((const float*)gqo, Cm), 3);
+  probe("dWq", p.Wq, download((const float*)gWq, (size_t)Cm * W), 4);
+  probe("dWk", p.Wk, download((const float*)gWk, (size_t)Cm * D), 4);
+  probe("dWv", p.Wv, download((const float*)gWv, (size_t)Cm * D), 4);
+  probe("dWg", p.Wg, download((const float*)gWg, (size_t)Cm * W), 4);
+  probe("dbg", p.bg, download((const float*)gbg, W), 3);
+  probe("dWo", p.Wo, download((const float*)gWo, (size_t)W * O), 4);
+  probe("dbo", p.bo, download((const float*)gbo, O), 3);
+
+  release(dMsaIn); release(dMask); release(dDo); release(hqs); release(hqo); release(hWq);
+  release(hWk); release(hWv); release(hWg); release(hbg); release(hWo); release(hbo);
+  release(gMsa); release(gqs); release(gqo); release(gWq); release(gWk); release(gWv); release(gWg);
+  release(gbg); release(gWo); release(gbo);
+}
+
 // ---------------------------------------------------------------- TriangleMultiplication, the whole module
 struct TriP {
   std::vector<double> lnScale, lnOffset, Wl, bl, Wr, br, Wlg, blg, Wrg, brg,
@@ -1366,6 +1535,9 @@ int main(int argc, char** argv) {
   printf("MSAColumnAttention (the per-column orientation, no pair bias)\n");
   mcolCase(6, 5, 12, 3, 8, 12);
   mcolCase(4, 7, 16, 2, 8, 16);
+  printf("MSAColumnGlobalAttention (one masked-mean query, k/v with no head)\n");
+  gattnCase(6, 5, 16, 4, 4, 16);
+  gattnCase(9, 4, 12, 2, 6, 12);
   printf("TriangleMultiplication backward (the whole module)\n");
   triCase(10, 16, 12, true);
   triCase(10, 16, 12, false);

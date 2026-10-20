@@ -85,6 +85,34 @@ struct AttnBwdArgs {
   u64 n; uint B, Q, K, H, D, pad;
 };
 
+// ---------------------------------------------------------------- GlobalAttention (modules.py:432-497)
+// The extra-MSA stack's column attention, and a genuinely different shape from every other attention here:
+//   qavg[b][a]     = sum_k mask[b][k] qData[b][k][a] / (sum_k mask[b][k] + 1e-10)      ONE query a batch
+//   q[b][h][c]     = qavg[b] Wq * D^-0.5          k[b][k][c] = mData[b][k] Wk          k and v have NO head axis
+//   v[b][k][c]     = mData[b][k] Wv
+//   logits[b][h][k]= dot(q[b][h], k[b][k]) + 1e9 (mask[b][k] - 1)
+//   wa[b][h][c]    = sum_k softmax_k(logits) v[b][k][c]
+//   out[b][q][o]   = sum_hc (wa[b][h][c] * sigmoid(qData[b][q] Wg + bg)[q][h][c]) Wo[h][c][o] + bo
+// So the single query is BROADCAST back over every position by the gate, which is what makes the gate's backward a
+// reduction over q rather than elementwise.
+//
+// NOTHING here needs flash shaping: the weights are [B][H][K] with no query axis - B*H*K floats, kilobytes - so
+// they are stored, and the softmax backward reads them instead of recomputing a score. That is the opposite of
+// every other attention in this tree, and the reason is the absent axis, not a different policy.
+//
+// `gating` is required: AF2 configures it on, and the ungated branch (modules.py:495) has a different output shape.
+struct GattnArgs {
+  CP(float) qData; CP(float) mData; CP(float) mask;
+  CP(float) q; CP(float) k; CP(float) v;
+  CP(float) weights; CP(float) wa; CP(float) gpre;
+  DP(float) wqavg; DP(float) wminv;            // the masked mean, and 1/(sum mask + eps)
+  DP(float) wweights; DP(float) wwa;           // the forward's saves
+  DP(float) dlogits; DP(float) dwa; DP(float) dgpre;
+  DP(float) dq; DP(float) dk; DP(float) dv; DP(float) dqData;
+  CP(float) dwag;                              // the cotangent of the gated, broadcast activation
+  u64 n; uint B, K, C, H, D, pad;
+};
+
 // ---------------------------------------------------------------- OuterProductMean (Alg. 10)
 // The forward, as AF2 writes it (modules.py:1157-1212):
 //   act    = LayerNorm(msa)                            [S][N][Cm]

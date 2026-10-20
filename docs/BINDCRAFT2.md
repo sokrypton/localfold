@@ -118,10 +118,9 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
-4. **Attention** - the core backward, the Attention module, the biased self-attention both
-   `MSARowAttentionWithPairBias` and `TriangleAttention` are, and `MSAColumnAttention`. **DONE**, see below. Left in
-   the tier: **`MSAColumnGlobalAttention`**, which is a genuinely different shape - one masked-mean query a batch,
-   and k/v with no head dimension (`modules.py:432-497`) - and is used only by the extra-MSA stack.
+4. **Attention - the tier is COMPLETE.** The core backward, the Attention module, the biased self-attention both
+   `MSARowAttentionWithPairBias` and `TriangleAttention` are, `MSAColumnAttention`, and
+   `MSAColumnGlobalAttention`. See below.
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
    differentiable.
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
@@ -401,3 +400,29 @@ REFERENCE, not a kernel - `biasedForward` indexed a `feat2dW` that the no-bias c
 Worth noting because the output looked like a crash deep in an earlier module: stdout is block-buffered when
 redirected, so the visible output ended mid-line in `attnmod` while the fault was two modules later. `stdbuf -oL`
 is how to find out where a crash in this binary actually is.
+
+### MSAColumnGlobalAttention: the tier is complete
+
+**296 cases.** All 19 gradients agree with central difference at **5.1e-8 to 6.3e-7**, first run. With this the
+whole Evoformer's attention tier has a backward: the core, the Attention module, both biased self-attentions, the
+column attention and now the global one.
+
+This is the one attention in AF2 that is a **different shape**, not a different configuration
+(`modules.py:432-497`):
+
+- **One query a batch**, and it is a *masked mean* over the sequences - `qavg[b][a] = sum_k m[b][k] q[b][k][a] /
+  (sum_k m[b][k] + 1e-10)`. So its backward is a SCATTER: every key receives the mean's cotangent weighted by its
+  own share of the mask.
+- **k and v have no head axis** (`Wk`, `Wv` are `[Cm][D]`, shared across heads), so `dk` and `dv` sum over the
+  heads where every other attention here keeps them separate.
+- **The gate broadcasts that single query back over every position** (`weighted_avg[:, None] * gate_values`), which
+  makes the gate's backward a reduction over the position axis rather than elementwise - a thread per `(b, h, c)`
+  walking the positions, writing each one's gate cotangent and summing the activation's.
+
+🔴 **AND IT STORES ITS ATTENTION WEIGHTS, WHICH EVERY OTHER ATTENTION HERE REFUSES TO DO.** That looks like an
+inconsistency and is not: the weights are `[B][H][K]` with **no query axis**, so they are kilobytes rather than the
+O(N^3) a triangle attention's would be. The softmax backward reads them instead of recomputing a score. The policy
+is the same everywhere - never materialise O(N^3) - and the absent axis is what changes the answer.
+
+Gating is required rather than optional here, because AF2's ungated branch has a different output shape
+(`modules.py:495` returns `[B][1][O]` broadcast, not `[B][Q][O]`), and its config has gating on.

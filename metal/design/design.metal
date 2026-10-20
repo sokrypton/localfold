@@ -266,6 +266,165 @@ kernel void lf_attn_bwd_dbias(LF_ARGS(AttnBwdArgs)) {
   a.dPairBias[idx] = total;
 }
 
+// ---------------------------------------------------------------- GlobalAttention (the extra-MSA column attention)
+// qavg[b][a] = sum_k mask[b][k] qData[b][k][a] / (sum_k mask[b][k] + 1e-10), and 1/(that denominator) kept for the
+// backward's scatter. A thread an (b, a); the denominator is recomputed per channel, which is K extra reads on a
+// tensor already resident.
+kernel void lf_gattn_qavg(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * C
+  const uint c = (uint)(i - lf_udiv((uint)i, a.C) * a.C);
+  const uint b = lf_udiv((uint)i, a.C);
+  float num = 0, den = 0;
+  for (uint kk = 0; kk < a.K; ++kk) {
+    const float m = a.mask[(ulong)b * a.K + kk];
+    num += m * a.qData[((ulong)b * a.K + kk) * a.C + c];
+    den += m;
+  }
+  const float inv = 1.f / (den + 1e-10f);
+  a.wqavg[i] = num * inv;
+  if (c == 0) a.wminv[b] = inv;
+}
+
+// a simdgroup an (b, h): the logits over k, their softmax, and the weighted average. Lanes stride k for the softmax
+// and then the channel for the average.
+kernel void lf_gattn_fwd(constant GattnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                         uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.n) return;                      // n = B * H
+  const uint h = (uint)(row - lf_udiv((uint)row, a.H) * a.H);
+  const uint b = (uint)lf_udiv((uint)row, a.H);
+  const uint D = a.D;
+  device const float* qv = a.q + ((ulong)b * a.H + h) * D;
+
+  float mx = -INFINITY;
+  for (uint kk = lane; kk < a.K; kk += 32) {
+    float d = 0;
+    for (uint c = 0; c < D; ++c) d += qv[c] * a.k[((ulong)b * a.K + kk) * D + c];
+    d += 1e9f * (a.mask[(ulong)b * a.K + kk] - 1.f);
+    mx = max(mx, d);
+  }
+  mx = simd_max(mx);
+  float tot = 0;
+  for (uint kk = lane; kk < a.K; kk += 32) {
+    float d = 0;
+    for (uint c = 0; c < D; ++c) d += qv[c] * a.k[((ulong)b * a.K + kk) * D + c];
+    d += 1e9f * (a.mask[(ulong)b * a.K + kk] - 1.f);
+    const float e = exp(d - mx);
+    a.wweights[row * a.K + kk] = e;            // unnormalised for now
+    tot += e;
+  }
+  tot = simd_sum(tot);
+  for (uint kk = lane; kk < a.K; kk += 32) a.wweights[row * a.K + kk] /= tot;
+  simdgroup_barrier(mem_flags::mem_device);
+  for (uint c = 0; c < D; ++c) {
+    float acc = 0;
+    for (uint kk = lane; kk < a.K; kk += 32)
+      acc += a.wweights[row * a.K + kk] * a.v[((ulong)b * a.K + kk) * D + c];
+    acc = simd_sum(acc);
+    if (lane == 0) a.wwa[row * D + c] = acc;
+  }
+}
+
+// the forward's gate: wag[b][q][h][c] = wa[b][h][c] * sigmoid(gpre[b][q][h][c]) - the broadcast
+kernel void lf_gattn_gate_fwd(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * K * H * D
+  const uint W = a.H * a.D;
+  const uint hd = (uint)(i - lf_udiv((uint)i, W) * W);
+  const uint bq = (uint)lf_udiv((uint)i, W);
+  const uint b = lf_udiv(bq, a.K);
+  a.dgpre[i] = a.wa[(ulong)b * W + hd] * (1.f / (1.f + exp(-a.gpre[i])));
+}
+
+// The gate is where the single query is broadcast back over every position, so its backward is a reduction over q:
+// a thread an (b, h, c) loops the positions, writes each one's gate cotangent and sums the activation's.
+kernel void lf_gattn_gate_bwd(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * H * D
+  const uint D = a.D, W = a.H * D;
+  const uint c = (uint)(i - lf_udiv((uint)i, D) * D);
+  const uint rest = (uint)lf_udiv((uint)i, D);
+  const uint h = rest - lf_udiv(rest, a.H) * a.H;
+  const uint b = lf_udiv(rest, a.H);
+  const float wav = a.wa[((ulong)b * a.H + h) * D + c];
+  float acc = 0;
+  for (uint q = 0; q < a.K; ++q) {             // Q == K here: q_data is m_data
+    const ulong at = ((ulong)b * a.K + q) * W + h * D + c;
+    const float s = 1.f / (1.f + exp(-a.gpre[at]));
+    const float d = a.dwag[at];
+    a.dgpre[at] = d * wav * s * (1.f - s);
+    acc += d * s;
+  }
+  a.dwa[i] = acc;
+}
+
+// softmax's backward, from the stored weights: dW[k] = sum_c dwa[c] v[k][c], then
+// dlogits[k] = w[k] (dW[k] - sum_k' w[k'] dW[k']). A thread an (b, h), over its own row of dlogits.
+kernel void lf_gattn_dlogits(LF_ARGS(GattnArgs)) {
+  ulong row = LF_INDEX;
+  if (row >= a.n) return;                      // n = B * H
+  const uint h = (uint)(row - lf_udiv((uint)row, a.H) * a.H);
+  const uint b = (uint)lf_udiv((uint)row, a.H);
+  const uint D = a.D;
+  device const float* dwa = a.dwa + ((ulong)b * a.H + h) * D;
+  device float* dl = a.dlogits + row * a.K;
+  for (uint kk = 0; kk < a.K; ++kk) {
+    float d = 0;
+    for (uint c = 0; c < D; ++c) d += dwa[c] * a.v[((ulong)b * a.K + kk) * D + c];
+    dl[kk] = d;
+  }
+  float dot = 0;
+  for (uint kk = 0; kk < a.K; ++kk) dot += a.weights[row * a.K + kk] * dl[kk];
+  for (uint kk = 0; kk < a.K; ++kk) dl[kk] = a.weights[row * a.K + kk] * (dl[kk] - dot);
+}
+
+kernel void lf_gattn_dq(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * H * D
+  const uint D = a.D;
+  const uint c = (uint)(i - lf_udiv((uint)i, D) * D);
+  const uint rest = (uint)lf_udiv((uint)i, D);
+  const uint h = rest - lf_udiv(rest, a.H) * a.H;
+  const uint b = lf_udiv(rest, a.H);
+  float acc = 0;
+  for (uint kk = 0; kk < a.K; ++kk)
+    acc += a.dlogits[((ulong)b * a.H + h) * a.K + kk] * a.k[((ulong)b * a.K + kk) * D + c];
+  a.dq[i] = acc;
+}
+
+// dv and dk sum over the HEADS, k and v having none
+kernel void lf_gattn_dv(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * K * D
+  const uint D = a.D;
+  const uint c = (uint)(i - lf_udiv((uint)i, D) * D);
+  const uint rest = (uint)lf_udiv((uint)i, D);
+  const uint kk = rest - lf_udiv(rest, a.K) * a.K;
+  const uint b = lf_udiv(rest, a.K);
+  float accv = 0, acck = 0;
+  for (uint h = 0; h < a.H; ++h) {
+    const ulong bh = (ulong)b * a.H + h;
+    accv += a.weights[bh * a.K + kk] * a.dwa[bh * D + c];
+    acck += a.dlogits[bh * a.K + kk] * a.q[bh * D + c];
+  }
+  a.dv[i] = accv;
+  a.dk[i] = acck;
+}
+
+// the masked mean's backward: every key gets the mean's cotangent weighted by its own mask share
+kernel void lf_gattn_dqavg(LF_ARGS(GattnArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = B * K * C
+  const uint C = a.C;
+  const uint c = (uint)(i - lf_udiv((uint)i, C) * C);
+  const uint rest = (uint)lf_udiv((uint)i, C);
+  const uint kk = rest - lf_udiv(rest, a.K) * a.K;
+  const uint b = lf_udiv(rest, a.K);
+  a.dqData[i] += a.dq[(ulong)b * C + c] * a.mask[(ulong)b * a.K + kk] * a.wminv[b];
+}
+
 // ---------------------------------------------------------------- the triangle's helpers
 kernel void lf_scale(LF_ARGS(ScaleArgs)) {
   ulong i = LF_INDEX;

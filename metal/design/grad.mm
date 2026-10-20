@@ -16,13 +16,13 @@ namespace mt {
 void designShareScratch() {
   shareScratch({{"design.tr.", "dtr"}, {"design.opm.", "dopm"}, {"design.tri.", "dtri"},
                 {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
-                {"design.mcol.", "dmcol"}, {"design.ln.", "dln"}},
+                {"design.mcol.", "dmcol"}, {"design.gattn.", "dgattn"}, {"design.ln.", "dln"}},
                {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
                 {"dln", "dattn"}, {"dln", "dmcol"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"},
                 {"dattn", "dbattn"},
                 // the column attention transposes into the per-column orientation and calls the biased attention
                 // on it, so everything that one holds is live inside its turn
-                {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}});
+                {"dmcol", "dbattn"}, {"dmcol", "dattnm"}, {"dmcol", "dattn"}, {"dln", "dgattn"}});
 }
 
 // a simdgroup a row, eight a threadgroup - metal/core's layerNormRun grid, so the rows map the same way
@@ -419,6 +419,115 @@ void msaColumnAttentionBwd(const float* msa, const float* msaMask, int S, int N,
   biasedSelfAttentionBwd(actT, actT, maskT, N, S, Cm, Cm, H, D, O, w, dOutT, dActT, dActT, g);
   // and back, which is the swap read the other way round
   run1d("lf_swap01", rows * Cm, Swap01Args{dActT, dMsa, rows * Cm, (uint)N, (uint)S, (uint)Cm, 0});
+}
+
+void msaColumnGlobalAttentionBwd(const float* msa, const float* msaMask, int S, int N, int Cm, int H, int D,
+                                 int O, const GlobalAttnWeights& w, const float* dOut, float* dMsa,
+                                 const GlobalAttnGrads& g) {
+  if (!S || !N) return;
+  if (!w.Wg) { fprintf(stderr, "design: MSAColumnGlobalAttention needs its gate\n"); exit(1); }
+  const int B = N, K = S, W = H * D;           // after the swap: a residue a batch, the sequences the keys
+  const size_t rows = (size_t)B * K;
+  const float scale = 1.f / std::sqrt((float)D);
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.gattn.") + name, n * sizeof(float));
+  };
+  float* actT = buf("actT", rows * Cm);
+  float* maskT = buf("maskT", rows);
+  float* dOutT = buf("dOutT", rows * O);
+  float* actN = buf("actN", rows * Cm);
+  float* qavg = buf("qavg", (size_t)B * Cm);
+  float* minv = buf("minv", (size_t)B);
+  float* q = buf("q", (size_t)B * W);
+  float* kk = buf("k", rows * D);
+  float* vv = buf("v", rows * D);
+  float* weights = buf("weights", (size_t)B * H * K);
+  float* wa = buf("wa", (size_t)B * W);
+  float* gpre = buf("gpre", rows * W);
+  float* wag = buf("wag", rows * W);
+  float* dwag = buf("dwag", rows * W);
+  float* dgpre = buf("dgpre", rows * W);
+  float* dwa = buf("dwa", (size_t)B * W);
+  float* dlogits = buf("dlogits", (size_t)B * H * K);
+  float* dq = buf("dq", (size_t)B * W);
+  float* dkk = buf("dk", rows * D);
+  float* dvv = buf("dv", rows * D);
+  float* dqavg = buf("dqavg", (size_t)B * Cm);
+  float* dActN = buf("dActN", rows * Cm);
+  float* dActT = buf("dActT", rows * Cm);
+
+  auto swap = [&](const float* x, float* y, int A, int Bx, int C) {
+    run1d("lf_swap01", (size_t)A * Bx * C, Swap01Args{x, y, (size_t)A * Bx * C, (uint)A, (uint)Bx, (uint)C, 0});
+  };
+  auto lin = [&](const float* X, const float* Wm, const float* b, float* Y, size_t r, int in, int out) {
+    Gemm gm{}; gm.X = X; gm.W = Wm; gm.Y = Y; gm.rows = r; gm.in = in; gm.out = out; gm.bias = b; gemm(gm);
+  };
+  GattnArgs base{};
+  base.B = (uint)B; base.K = (uint)K; base.C = (uint)Cm; base.H = (uint)H; base.D = (uint)D;
+
+  // -------- into the per-column orientation, then the forward, recomputed
+  swap(msa, actT, S, N, Cm);
+  swap(msaMask, maskT, S, N, 1);
+  swap(dOut, dOutT, S, N, O);
+  layerNorm(actT, actN, rows, Cm, w.qScale, w.qOffset);
+  {
+    GattnArgs a = base; a.qData = actN; a.mask = maskT; a.wqavg = qavg; a.wminv = minv;
+    a.n = (size_t)B * Cm;
+    run1d("lf_gattn_qavg", a.n, a);
+  }
+  lin(qavg, w.Wq, nullptr, q, (size_t)B, Cm, W);
+  run1d("lf_scale", (size_t)B * W, ScaleArgs{q, (size_t)B * W, scale, 0});
+  lin(actN, w.Wk, nullptr, kk, rows, Cm, D);
+  lin(actN, w.Wv, nullptr, vv, rows, Cm, D);
+  {
+    GattnArgs a = base; a.q = q; a.k = kk; a.v = vv; a.mask = maskT;
+    a.wweights = weights; a.wwa = wa; a.n = (size_t)B * H;
+    size_t groups = (a.n + 7) / 8;
+    Grid gr = groups <= 65535 ? Grid{(uint32_t)groups, 1, 1}
+                              : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
+    dispatch("lf_gattn_fwd", &a, sizeof a, gr, 256, 0, "design.gattn.fwd");
+  }
+  lin(actN, w.Wg, w.bg, gpre, rows, Cm, W);
+  {
+    GattnArgs a = base; a.wa = wa; a.gpre = gpre; a.dgpre = wag; a.n = rows * W;
+    run1d("lf_gattn_gate_fwd", a.n, a);        // (dgpre is the write target here)
+  }
+
+  // -------- the output projection, then the gate that broadcast the single query
+  linearBwd(wag, w.Wo, dOutT, dwag, g.Wo, g.bo, rows, W, O);
+  {
+    GattnArgs a = base; a.wa = wa; a.gpre = gpre; a.dwag = dwag; a.dgpre = dgpre; a.dwa = dwa;
+    a.n = (size_t)B * W;
+    run1d("lf_gattn_gate_bwd", a.n, a);
+  }
+  linearBwd(actN, w.Wg, dgpre, dActN, g.Wg, g.bg, rows, Cm, W, false);   // the first contributor to dActN
+
+  // -------- the softmax, then the three projections
+  {
+    GattnArgs a = base; a.weights = weights; a.v = vv; a.dwa = dwa; a.dlogits = dlogits; a.n = (size_t)B * H;
+    run1d("lf_gattn_dlogits", a.n, a);
+  }
+  {
+    GattnArgs a = base; a.dlogits = dlogits; a.k = kk; a.dq = dq; a.n = (size_t)B * W;
+    run1d("lf_gattn_dq", a.n, a);
+  }
+  run1d("lf_scale", (size_t)B * W, ScaleArgs{dq, (size_t)B * W, scale, 0});
+  linearBwd(qavg, w.Wq, dq, dqavg, g.Wq, nullptr, (size_t)B, Cm, W);
+  {
+    GattnArgs a = base; a.weights = weights; a.dlogits = dlogits; a.dwa = dwa; a.q = q;
+    a.dv = dvv; a.dk = dkk; a.n = rows * D;
+    run1d("lf_gattn_dv", a.n, a);
+  }
+  linearBwd(actN, w.Wk, dkk, dActN, g.Wk, nullptr, rows, Cm, D, true);
+  linearBwd(actN, w.Wv, dvv, dActN, g.Wv, nullptr, rows, Cm, D, true);
+  {   // and the masked mean's own path, which accumulates
+    GattnArgs a = base; a.dq = dqavg; a.mask = maskT; a.wminv = minv; a.dqData = dActN; a.n = rows * Cm;
+    run1d("lf_gattn_dqavg", a.n, a);
+  }
+
+  // -------- the LayerNorm, and back to the row orientation
+  layerNormBwd(actT, dActN, dActT, rows, Cm, w.qScale, g.qScale, g.qOffset);
+  run1d("lf_swap01", rows * Cm, Swap01Args{dActT, dMsa, rows * Cm, (uint)B, (uint)K, (uint)Cm, 0});
 }
 
 // a batched GEMM over the channel: every operand is [batch][rows * in] with one plane a channel
