@@ -318,12 +318,14 @@ for (const name of JOB_NAMES) {
                              extra: () => inputs.options, smilesCodes: () => inputs.smilesCodes };
 }
 const onlyTarget = (args.find((a) => a.startsWith("--target=")) ?? "").slice(9);
+// --dumps=<dir under the repo>: another set of reference batches (oracle-dumps-colab/: sokrypton/alphafold3 colab's)
+const dumpsDir = (args.find((a) => a.startsWith("--dumps=")) ?? "--dumps=oracle-dumps").slice(8);
 
 /** The dump for one (model, target), or null when it has not been generated. */
 function dumpFor(model, target) {
   const file = `af3-batch-${model}-6mrr${TARGETS[target].suffix}.json`;
   try {
-    return JSON.parse(readFileSync(new URL(`../oracle-dumps/${file}`, import.meta.url)));
+    return JSON.parse(readFileSync(new URL(`../${dumpsDir}/${file}`, import.meta.url)));
   } catch { return null; }
 }
 

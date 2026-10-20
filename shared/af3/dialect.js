@@ -1072,8 +1072,11 @@ export const INTELLIFOLD2 = Object.freeze({
   preSymmetrisedPde: false,
   templateMeanOverAllSlots: false,
   swapTransposedBias: false,
-  // NOT in OPENFOLD3_LINEAGE - the bonds are AF3's.
-  symmetriseBonds: false,
+  // 🔴 SYMMETRIC, AS STOCK INTELLIFOLD BUILDS ITS TOKEN BONDS (sokrypton/alphafold3 colab 5deda27,
+  // SYMMETRIC_UNLINKED_TOKEN_BONDS): [i][j] and [j][i] both set, an atomised residue NOT linked to its chain (that is
+  // ESMFold2's). This said 'NOT in OPENFOLD3_LINEAGE - the bonds are AF3's', and stock IntelliFold v2.0.4 has an ATP
+  // at 66 bond entries where AF3's one-way list gives 33.
+  symmetriseBonds: true,
   maskPaddedKeys: false,
   keysUidFromQueriesLayout: true,
   padSingleCondUnknownDna: false,

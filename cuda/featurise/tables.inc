@@ -70,7 +70,7 @@ inline const std::vector<FamilyFlags>& familyFlags() {
     {"alphafold3", false, false, false, false, 0, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false},
     {"openbind0", true, true, false, false, 1, 0, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, true, true, 16384, false, false, false, false, false},
     {"opendde", true, true, true, false, 0, 1, false, 0, false, false, false, false, 0, 0, false, false, false, 21, false, false, false, false, true, false, 1, {}, false, 2, false, false, 0, false, false, true, true, true},
-    {"intellifold2", false, false, false, true, 1, 1, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false},
+    {"intellifold2", true, false, false, true, 1, 1, false, 0, false, false, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false},
     {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, true, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0, false, false, false, false, false},
     {"chai1", false, false, true, false, 1, 0, false, 3, true, false, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0, true, true, false, false, false},
   };
