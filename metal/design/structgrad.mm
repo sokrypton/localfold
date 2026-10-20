@@ -150,4 +150,48 @@ void foldIterationBwd(const FoldIterSaved& s, const IpaDims& d, const FoldIterWe
   invariantPointAttentionBwd(s.ipa, dActA, d, w.ipa, g.ipa);
 }
 
+// ---------------------------------------------------------------- MultiRigidSidechain's geometry
+void sidechainGeometryBwd(const float* unnorm, const float* rig, const int* aatype, const float* defaultFrames,
+                          const int* atom14Group, const float* litPos, const float* atom14Mask,
+                          const int* atom37To14, const float* atom37Mask, const float* seqMask,
+                          const float* dAngles, const float* dPos14, const float* dPos37,
+                          float* dUnnorm, float* dRig, int L, float positionScale, bool accumulateRig) {
+  if (!L) return;
+  run1d("lf_sidechains_bwd", (size_t)L,
+        SidechainBwdArgs{unnorm, rig, aatype, defaultFrames, atom14Group, litPos, atom14Mask, atom37To14,
+                         atom37Mask, seqMask, dAngles, dPos14, dPos37, dUnnorm, dRig,
+                         (uint32_t)L, accumulateRig ? 1u : 0u, positionScale, 0});
+}
+
+// ---------------------------------------------------------------- MultiRigidSidechain's MLP
+void sidechainMlpBwd(const ScMlpSaved& s, const float* dUnnorm, int L, int C, int Cm, int angles,
+                     const ScMlpWeights& w, ScMlpGrads& g) {
+  if (!L) return;
+  const size_t n = (size_t)L * Cm, nc = (size_t)L * C;
+  float* dSc = sbuf("dsc", n);
+  float* dTmp = sbuf("dsctmp", n);
+  float* dSb = sbuf("dscsb", n);
+
+  // the angle head, then the relu in front of it
+  linearBwd(s.sbFinal, w.Wang, dUnnorm, dSb, g.dWang, g.dbang, (size_t)L, Cm, angles, false, true);
+  reluBwd(dSb, s.sbFinal, dSc, n);
+
+  // the two residual blocks, in reverse. sc_out = sc_in + mid Wr2, and sc_in ALSO feeds the block's own relu, so
+  // its cotangent is the sum of the two.
+  for (int r = 1; r >= 0; --r) {
+    linearBwd(s.mid[r], w.Wr2[r], dSc, dTmp, g.dWr2[r], g.dbr2[r], (size_t)L, Cm, Cm, false, true);
+    reluBwd(dTmp, s.mid[r], dTmp, n);
+    linearBwd(s.sbIn[r], w.Wr1[r], dTmp, dSb, g.dWr1[r], g.dbr1[r], (size_t)L, Cm, Cm, false, true);
+    reluBwd(dSb, s.sbIn[r], dSb, n);
+    run1d("lf_accum", n, AccumArgs{dSc, dSb, n, 0});
+  }
+
+  // the two input projections, each behind its own relu
+  float* dRa = sbuf("dscra", nc);
+  linearBwd(s.ra, w.Win, dSc, dRa, g.dWin, g.dbin, (size_t)L, C, Cm, false, true);
+  reluBwd(dRa, s.ra, g.dAct, nc);
+  linearBwd(s.ra2, w.Win1, dSc, dRa, g.dWin1, g.dbin1, (size_t)L, C, Cm, false, true);
+  reluBwd(dRa, s.ra2, g.dInitial, nc);
+}
+
 }  // namespace mt

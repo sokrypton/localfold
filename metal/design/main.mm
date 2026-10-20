@@ -2679,6 +2679,265 @@ static void foldIterCase(int L, int C, int C2, int H, int Cs, int Pq, int Pv) {
   for (void* p : owned) release(p);
 }
 
+// ---------------------------------------------------------------- MultiRigidSidechain's geometry
+// The forward in double, exactly as af2_sidechains computes it. The residue-type tables are SYNTHETIC on purpose:
+// the real ones are mostly zeros and identity rotations, which hides a transposed index, and they are constants so
+// nothing about the gradient depends on their values being chemical.
+struct ScTables {
+  std::vector<double> defaultFrames, litPos, atom14Mask, atom37Mask;
+  std::vector<int> aatype, atom14Group, atom37To14;
+};
+static void scForward(const std::vector<double>& unnorm, const std::vector<double>& rig, const ScTables& T,
+                      int L, double positionScale, std::vector<double>& angles, std::vector<double>& pos14,
+                      std::vector<double>& pos37, const std::vector<double>& seqMask) {
+  angles.assign((size_t)L * 14, 0.0);
+  pos14.assign((size_t)L * 14 * 3, 0.0);
+  pos37.assign((size_t)L * 37 * 3, 0.0);
+  for (int i = 0; i < L; ++i) {
+    const int aa = T.aatype[i];
+    double bb[12];
+    for (int k = 0; k < 12; ++k) bb[k] = rig[(size_t)i * 12 + k];
+    for (int k = 9; k < 12; ++k) bb[k] *= positionScale;
+    double sinA[8], cosA[8];
+    sinA[0] = 0; cosA[0] = 1;
+    for (int q = 0; q < 7; ++q) {
+      double s = unnorm[((size_t)i * 7 + q) * 2], c = unnorm[((size_t)i * 7 + q) * 2 + 1];
+      double inv = 1.0 / sqrt(std::max(s * s + c * c, 1e-12));
+      s *= inv; c *= inv;
+      angles[((size_t)i * 7 + q) * 2] = s;
+      angles[((size_t)i * 7 + q) * 2 + 1] = c;
+      sinA[q + 1] = s; cosA[q + 1] = c;
+    }
+    double frames[8][12];
+    for (int g = 0; g < 8; ++g) {
+      const double* m = &T.defaultFrames[((size_t)aa * 8 + g) * 16];
+      double D[12] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[3], m[7], m[11]};
+      double Rx[12] = {1, 0, 0, 0, cosA[g], -sinA[g], 0, sinA[g], cosA[g], 0, 0, 0}, R[12];
+      rigCompose(D, Rx, R);
+      for (int k = 9; k < 12; ++k) R[k] = D[k];
+      for (int k = 0; k < 12; ++k) frames[g][k] = R[k];
+    }
+    double tmp[12];
+    rigCompose(frames[4], frames[5], tmp); for (int k = 0; k < 12; ++k) frames[5][k] = tmp[k];
+    rigCompose(frames[5], frames[6], tmp); for (int k = 0; k < 12; ++k) frames[6][k] = tmp[k];
+    rigCompose(frames[6], frames[7], tmp); for (int k = 0; k < 12; ++k) frames[7][k] = tmp[k];
+    double p14[14][3];
+    for (int q = 0; q < 14; ++q) {
+      const int gg = T.atom14Group[(size_t)aa * 14 + q];
+      double glob[12];
+      rigCompose(bb, frames[gg], glob);
+      const double* lit = &T.litPos[((size_t)aa * 14 + q) * 3];
+      double m = T.atom14Mask[(size_t)aa * 14 + q];
+      for (int x = 0; x < 3; ++x) {
+        double v = glob[x * 3] * lit[0] + glob[x * 3 + 1] * lit[1] + glob[x * 3 + 2] * lit[2] + glob[9 + x];
+        p14[q][x] = v * m;
+        pos14[((size_t)i * 14 + q) * 3 + x] = v * m;
+      }
+    }
+    for (int q = 0; q < 37; ++q) {
+      const int sl = T.atom37To14[(size_t)aa * 37 + q];
+      double m = T.atom37Mask[(size_t)aa * 37 + q] * seqMask[i];
+      for (int x = 0; x < 3; ++x) pos37[((size_t)i * 37 + q) * 3 + x] = p14[sl][x] * m;
+    }
+  }
+}
+
+static void sidechainCase(int L) {
+  const double positionScale = 10.0;
+  const int A = 20;
+  ScTables T;
+  T.defaultFrames = randv((size_t)A * 8 * 16, 0.6);
+  T.litPos = randv((size_t)A * 14 * 3, 0.8);
+  T.atom14Mask.assign((size_t)A * 14, 1.0);
+  T.atom37Mask.assign((size_t)A * 37, 1.0);
+  T.aatype.resize(L);
+  T.atom14Group.resize((size_t)A * 14);
+  T.atom37To14.resize((size_t)A * 37);
+  std::uniform_int_distribution<int> Ua(0, A - 1), Ug(0, 7), U14(0, 13);
+  for (int i = 0; i < L; ++i) T.aatype[i] = Ua(rng);
+  for (size_t k = 0; k < T.atom14Group.size(); ++k) T.atom14Group[k] = Ug(rng);
+  for (size_t k = 0; k < T.atom37To14.size(); ++k) T.atom37To14[k] = U14(rng);
+  // some slots masked off, as a real residue type has - the kernel skips an atom whose cotangent is zero, so both
+  // sides of that branch must be exercised
+  for (size_t k = 0; k < T.atom14Mask.size(); ++k) if ((k % 5) == 2) T.atom14Mask[k] = 0.0;
+  for (size_t k = 0; k < T.atom37Mask.size(); ++k) if ((k % 7) == 3) T.atom37Mask[k] = 0.0;
+  std::vector<double> seqMask(L, 1.0);
+  for (int i = 0; i < L; ++i) if (i % 4 == 3) seqMask[i] = 0.0;
+
+  std::vector<double> unnorm = randv((size_t)L * 14, 0.8), rig = randv((size_t)L * 12, 0.5),
+                      dAngles = randv((size_t)L * 14, 0.5), dPos14 = randv((size_t)L * 14 * 3, 0.5),
+                      dPos37 = randv((size_t)L * 37 * 3, 0.5);
+  std::vector<double> angles, pos14, pos37;
+  scForward(unnorm, rig, T, L, positionScale, angles, pos14, pos37, seqMask);
+
+  std::vector<void*> owned;
+  auto U = [&](const std::vector<double>& x) {
+    auto f = toF(x); void* p = uploadNew(f.data(), f.size()); owned.push_back(p); return (const float*)p;
+  };
+  auto Ui = [&](const std::vector<int>& x) {
+    void* p = uploadNew(x.data(), x.size()); owned.push_back(p); return (const int*)p;
+  };
+  auto Al = [&](size_t n) { void* p = alloc(n * 4); owned.push_back(p); fill(p, 0, n * 4); return (float*)p; };
+
+  float* dUnnorm = Al((size_t)L * 14);
+  float* dRig = Al((size_t)L * 12);
+  sidechainGeometryBwd(U(unnorm), U(rig), Ui(T.aatype), U(T.defaultFrames), Ui(T.atom14Group), U(T.litPos),
+                       U(T.atom14Mask), Ui(T.atom37To14), U(T.atom37Mask), U(seqMask),
+                       U(dAngles), U(dPos14), U(dPos37), dUnnorm, dRig, L, (float)positionScale);
+
+  char label[200], shape[40];
+  snprintf(shape, sizeof shape, "L=%d", L);
+  auto S_ = [&]() {
+    std::vector<double> an, p14, p37;
+    scForward(unnorm, rig, T, L, positionScale, an, p14, p37, seqMask);
+    double acc = 0;
+    for (size_t k = 0; k < an.size(); ++k) acc += dAngles[k] * an[k];
+    for (size_t k = 0; k < p14.size(); ++k) acc += dPos14[k] * p14[k];
+    for (size_t k = 0; k < p37.size(); ++k) acc += dPos37[k] * p37[k];
+    return acc;
+  };
+  // every entry, not a sample: both tensors are small and the frame chain's reverse walk is the thing under test
+  auto all = [&](const char* what, std::vector<double>& target, float* got) {
+    auto gv = download((const float*)got, target.size());
+    std::vector<double> fd(target.size()), mine(gv.begin(), gv.end());
+    for (size_t j = 0; j < target.size(); ++j) {
+      double save = target[j], hh = 1e-6 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      fd[j] = (aS - bS) / (2 * hh);
+    }
+    snprintf(label, sizeof label, "sidechain geometry %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 1e-4);
+  };
+  all("dUnnorm", unnorm, dUnnorm);
+  all("dRig", rig, dRig);
+
+  for (void* p : owned) release(p);
+}
+
+// ---------------------------------------------------------------- MultiRigidSidechain's MLP
+struct ScMlpW {
+  std::vector<double> Win, bin, Win1, bin1, Wr1[2], br1[2], Wr2[2], br2[2], Wang, bang;
+};
+static void scMlpForward(const std::vector<double>& act, const std::vector<double>& initial, const ScMlpW& w,
+                         int L, int C, int Cm, int angles, std::vector<double>& ra, std::vector<double>& ra2,
+                         std::vector<double>& sbIn0, std::vector<double>& sbIn1, std::vector<double>& mid0,
+                         std::vector<double>& mid1, std::vector<double>& sbFinal, std::vector<double>& un) {
+  auto lin = [&](const std::vector<double>& X, const std::vector<double>& Wm, const std::vector<double>& b,
+                 int in, int o, std::vector<double>& Y) {
+    Y.assign((size_t)L * o, 0.0);
+    for (int r = 0; r < L; ++r)
+      for (int j = 0; j < o; ++j) {
+        double s = b[j];
+        for (int i = 0; i < in; ++i) s += X[(size_t)r * in + i] * Wm[(size_t)i * o + j];
+        Y[(size_t)r * o + j] = s;
+      }
+  };
+  auto rel = [&](const std::vector<double>& x, std::vector<double>& y) {
+    y.assign(x.size(), 0.0);
+    for (size_t i = 0; i < x.size(); ++i) y[i] = std::max(x[i], 0.0);
+  };
+  rel(act, ra);
+  rel(initial, ra2);
+  std::vector<double> p1, p2, sc;
+  lin(ra, w.Win, w.bin, C, Cm, p1);
+  lin(ra2, w.Win1, w.bin1, C, Cm, p2);
+  sc.assign((size_t)L * Cm, 0.0);
+  for (size_t i = 0; i < sc.size(); ++i) sc[i] = p1[i] + p2[i];
+  std::vector<double>* sbs[2] = {&sbIn0, &sbIn1};
+  std::vector<double>* mids[2] = {&mid0, &mid1};
+  for (int r = 0; r < 2; ++r) {
+    rel(sc, *sbs[r]);
+    std::vector<double> h;
+    lin(*sbs[r], w.Wr1[r], w.br1[r], Cm, Cm, h);
+    rel(h, *mids[r]);
+    std::vector<double> o;
+    lin(*mids[r], w.Wr2[r], w.br2[r], Cm, Cm, o);
+    for (size_t i = 0; i < sc.size(); ++i) sc[i] += o[i];
+  }
+  rel(sc, sbFinal);
+  lin(sbFinal, w.Wang, w.bang, Cm, angles, un);
+}
+
+static void scMlpCase(int L, int C, int Cm) {
+  const int angles = 14;
+  std::vector<double> act = randv((size_t)L * C, 0.6), initial = randv((size_t)L * C, 0.6),
+                      dUn = randv((size_t)L * angles, 0.5);
+  ScMlpW w{randv((size_t)C * Cm, 0.2), randv(Cm, 0.2), randv((size_t)C * Cm, 0.2), randv(Cm, 0.2),
+           {}, {}, {}, {}, randv((size_t)Cm * angles, 0.2), randv(angles, 0.2)};
+  for (int r = 0; r < 2; ++r) {
+    w.Wr1[r] = randv((size_t)Cm * Cm, 0.2); w.br1[r] = randv(Cm, 0.2);
+    w.Wr2[r] = randv((size_t)Cm * Cm, 0.2); w.br2[r] = randv(Cm, 0.2);
+  }
+  std::vector<double> ra, ra2, sbIn0, sbIn1, mid0, mid1, sbFinal, un;
+  scMlpForward(act, initial, w, L, C, Cm, angles, ra, ra2, sbIn0, sbIn1, mid0, mid1, sbFinal, un);
+
+  std::vector<void*> owned;
+  auto U = [&](const std::vector<double>& x) {
+    auto f = toF(x); void* p = uploadNew(f.data(), f.size()); owned.push_back(p); return (const float*)p;
+  };
+  auto A = [&](size_t n) { void* p = alloc(n * 4); owned.push_back(p); fill(p, 0, n * 4); return (float*)p; };
+
+  ScMlpSaved saved{U(ra), U(ra2), {U(sbIn0), U(sbIn1)}, {U(mid0), U(mid1)}, U(sbFinal)};
+  ScMlpWeights ws{U(w.Win), U(w.bin), U(w.Win1), U(w.bin1),
+                  {U(w.Wr1[0]), U(w.Wr1[1])}, {U(w.br1[0]), U(w.br1[1])},
+                  {U(w.Wr2[0]), U(w.Wr2[1])}, {U(w.br2[0]), U(w.br2[1])}, U(w.Wang), U(w.bang)};
+  ScMlpGrads g{};
+  g.dAct = A((size_t)L * C); g.dInitial = A((size_t)L * C);
+  g.dWin = A((size_t)C * Cm); g.dbin = A(Cm);
+  g.dWin1 = A((size_t)C * Cm); g.dbin1 = A(Cm);
+  for (int r = 0; r < 2; ++r) {
+    g.dWr1[r] = A((size_t)Cm * Cm); g.dbr1[r] = A(Cm);
+    g.dWr2[r] = A((size_t)Cm * Cm); g.dbr2[r] = A(Cm);
+  }
+  g.dWang = A((size_t)Cm * angles); g.dbang = A(angles);
+
+  sidechainMlpBwd(saved, U(dUn), L, C, Cm, angles, ws, g);
+
+  char label[200], shape[60];
+  snprintf(shape, sizeof shape, "L%d C%d Cm%d", L, C, Cm);
+  auto S_ = [&]() {
+    std::vector<double> a1, a2, b1, b2, m1, m2, sf, o;
+    scMlpForward(act, initial, w, L, C, Cm, angles, a1, a2, b1, b2, m1, m2, sf, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dUn[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, float* got, int count) {
+    auto gv = download((const float*)got, target.size());
+    std::vector<double> fd, mine, fdAny, mineAny;
+    std::uniform_int_distribution<size_t> Ui(0, target.size() - 1);
+    for (int d = 0; d < count * 8 && (int)fd.size() < count; ++d) {
+      size_t j = Ui(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      const double v = (aS - bS) / (2 * hh);
+      fdAny.push_back(v); mineAny.push_back(gv[j]);
+      if (v != 0.0) { fd.push_back(v); mine.push_back(gv[j]); }
+    }
+    if (fd.empty()) { fd = fdAny; mine = mineAny; }
+    snprintf(label, sizeof label, "sidechain MLP %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 5e-5);
+  };
+  probe("dAct", act, g.dAct, 6);
+  probe("dInitial", initial, g.dInitial, 6);
+  probe("dWin", w.Win, g.dWin, 4);   probe("dbin", w.bin, g.dbin, 3);
+  probe("dWin1", w.Win1, g.dWin1, 4); probe("dbin1", w.bin1, g.dbin1, 3);
+  for (int r = 0; r < 2; ++r) {
+    char nm[40];
+    snprintf(nm, sizeof nm, "dWr1[%d]", r); probe(nm, w.Wr1[r], g.dWr1[r], 4);
+    snprintf(nm, sizeof nm, "dbr1[%d]", r); probe(nm, w.br1[r], g.dbr1[r], 3);
+    snprintf(nm, sizeof nm, "dWr2[%d]", r); probe(nm, w.Wr2[r], g.dWr2[r], 4);
+    snprintf(nm, sizeof nm, "dbr2[%d]", r); probe(nm, w.br2[r], g.dbr2[r], 3);
+  }
+  probe("dWang", w.Wang, g.dWang, 4); probe("dbang", w.bang, g.dbang, 3);
+
+  for (void* p : owned) release(p);
+}
+
 // ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
 // The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
 // design-sized complex, which is what has to fit in 16 GB of unified memory.
@@ -2904,6 +3163,12 @@ int main(int argc, char** argv) {
   printf("the structure module: a whole FoldIteration, the rigid a recurrent state\n");
   foldIterCase(5, 8, 5, 2, 3, 2, 2);
   foldIterCase(4, 6, 4, 1, 4, 4, 8);
+  printf("the structure module: MultiRigidSidechain's geometry (angles, frames, atom14, atom37)\n");
+  sidechainCase(4);
+  sidechainCase(9);
+  printf("the structure module: MultiRigidSidechain's MLP (two residual blocks, two input projections)\n");
+  scMlpCase(6, 10, 8);
+  scMlpCase(4, 16, 12);
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

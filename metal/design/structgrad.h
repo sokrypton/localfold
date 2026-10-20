@@ -151,4 +151,55 @@ struct FoldIterGrads {
 };
 void foldIterationBwd(const FoldIterSaved& saved, const IpaDims& d, const FoldIterWeights& w, FoldIterGrads& grads);
 
+// ---------------------------------------------------------------- MultiRigidSidechain's geometry
+// The forward is af2_sidechains (see kernels.h). Everything but `unnorm` and `rig` is a constant table keyed by the
+// residue type, so only those two take a gradient.
+//
+//   unnorm     [L][7][2] the unnormalised torsion angles, the sidechain MLP's output
+//   rig        [L][12] the LAST fold iteration's rigid - which is why the structure module's gradient reaches the
+//              rigid chain from two directions, the iterations and this
+//   dAngles    [L][7][2], dPos14 [L][14][3], dPos37 [L][37][3] - the forward's three outputs; any may be null
+//   dUnnorm    [L][7][2], written
+//   dRig       [L][12]; `accumulateRig` adds, which is what the structure module needs
+void sidechainGeometryBwd(const float* unnorm, const float* rig, const int* aatype, const float* defaultFrames,
+                          const int* atom14Group, const float* litPos, const float* atom14Mask,
+                          const int* atom37To14, const float* atom37Mask, const float* seqMask,
+                          const float* dAngles, const float* dPos14, const float* dPos37,
+                          float* dUnnorm, float* dRig, int L, float positionScale,
+                          bool accumulateRig = false);
+
+// ---------------------------------------------------------------- MultiRigidSidechain's MLP
+// The forward, as metal/af2/structure.mm runs it once after the eight iterations:
+//
+//   sc = relu(act) Win + bin  +  relu(initial) Win1 + bin1          (the second projection's beta is 1)
+//   twice:  sb = relu(sc);  mid = relu(sb Wr1 + br1);  sc += mid Wr2 + br2
+//   un = relu(sc) Wang + bang                                       -> [L][7][2], the unnormalised torsions
+//
+// `act` is the last iteration's output and `initial` is the structure module's own LayerNorm of the single
+// representation, so this is where the single track's gradient picks up a second path.
+//
+// The save set is only what a relu's SIGN and a linear's INPUT need, which is the post-relu tensors alone - relu's
+// input and output have the same sign, so none of the pre-relu values is kept.
+struct ScMlpSaved {
+  const float* ra;        // relu(act)       [L][C]
+  const float* ra2;       // relu(initial)   [L][C]
+  const float* sbIn[2];   // relu(sc) at the start of each residual block   [L][Cm]
+  const float* mid[2];    // relu(sb Wr1 + br1)                            [L][Cm]
+  const float* sbFinal;   // relu(sc) after both blocks                    [L][Cm]
+};
+struct ScMlpWeights {
+  const float* Win; const float* bin; const float* Win1; const float* bin1;
+  const float* Wr1[2]; const float* br1[2]; const float* Wr2[2]; const float* br2[2];
+  const float* Wang; const float* bang;
+};
+struct ScMlpGrads {
+  float* dAct; float* dInitial;      // both WRITTEN
+  float* dWin; float* dbin; float* dWin1; float* dbin1;
+  float* dWr1[2]; float* dbr1[2]; float* dWr2[2]; float* dbr2[2];
+  float* dWang; float* dbang;
+};
+// Every weight gradient ACCUMULATES, as everything else in this module does, so one caller may zero once.
+void sidechainMlpBwd(const ScMlpSaved& saved, const float* dUnnorm, int L, int C, int Cm, int angles,
+                     const ScMlpWeights& w, ScMlpGrads& grads);
+
 }  // namespace mt

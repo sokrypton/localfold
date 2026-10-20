@@ -246,3 +246,19 @@ struct IpaOutDrigArgs { CP(float) dRigPart; DP(float) dRig; uint L, H, accum, pa
 struct IpaOutDvArgs { CP(float) attn; CP(float) df; CP(float) dg; DP(float) dvs; DP(float) dvp;
                       uint L, H, Cs, Pv; uint C2, pad; };
 struct IpaOutD2dArgs { CP(float) attn; CP(float) df; DP(float) dact2d; uint L, H, Cs, Pv; uint C2, accum; };
+
+// ---------------------------------------------------------------- MultiRigidSidechain's geometry
+// The forward is af2_sidechains, a thread a residue: seven torsion angles normalised, eight rigid group frames
+// built from the residue type's default frames and a rotation about x, four of them CHAINED (5 onto 4, 6 onto 5,
+// 7 onto 6), then every atom14 slot placed by composing the backbone rigid onto its group's frame and applying the
+// literature position, and atom37 gathered from atom14.
+//
+// A thread a residue here too, and for a stronger reason than the kernels above: the frame chain is sequential and
+// its backward walks it in reverse, so splitting a residue across threads would mean a reduction per link.
+struct SidechainBwdArgs {
+  CP(float) unnorm; CP(float) rig; CP(int) aatype; CP(float) defaultFrames; CP(int) atom14Group;
+  CP(float) litPos; CP(float) atom14Mask; CP(int) atom37To14; CP(float) atom37Mask; CP(float) seqMask;
+  CP(float) dAngles; CP(float) dPos14; CP(float) dPos37;    // any of the three may be null
+  DP(float) dUnnorm; DP(float) dRig;
+  uint L, accumRig; float positionScale; uint pad;
+};

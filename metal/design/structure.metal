@@ -284,3 +284,162 @@ kernel void lf_ipa_out_d2d(LF_ARGS(IpaOutD2dArgs)) {
     if (a.accum) d[c] += s; else d[c] = s;
   }
 }
+
+// ---------------------------------------------------------------- MultiRigidSidechain's geometry
+inline void lf_rcompose(thread const float* A, thread const float* B, thread float* C) {
+  float R[9], t[3];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) R[i * 3 + j] = A[i * 3] * B[j] + A[i * 3 + 1] * B[3 + j] + A[i * 3 + 2] * B[6 + j];
+  lf_rapply(A, B + 9, t);
+  for (int k = 0; k < 9; ++k) C[k] = R[k];
+  for (int k = 0; k < 3; ++k) C[9 + k] = t[k];
+}
+// C = A o B, so dA += dC.R B.R^T-ish and dB += A.R^T dC - see kernels.h's backbone-update comment for the algebra
+inline void lf_rcomposeBwd(thread const float* A, thread const float* B, thread const float* dC,
+                           thread float* dA, thread float* dB) {
+  for (int k = 0; k < 3; ++k) {
+    for (int j = 0; j < 3; ++j) {
+      float s = dC[9 + k] * B[9 + j];
+      for (int m = 0; m < 3; ++m) s += dC[k * 3 + m] * B[j * 3 + m];
+      dA[k * 3 + j] += s;
+    }
+    dA[9 + k] += dC[9 + k];
+  }
+  for (int j = 0; j < 3; ++j) {
+    for (int m = 0; m < 3; ++m) {
+      float s = 0;
+      for (int k = 0; k < 3; ++k) s += dC[k * 3 + m] * A[k * 3 + j];
+      dB[j * 3 + m] += s;
+    }
+    float s = 0;
+    for (int k = 0; k < 3; ++k) s += dC[9 + k] * A[k * 3 + j];
+    dB[9 + j] += s;
+  }
+}
+
+kernel void lf_sidechains_bwd(LF_ARGS(SidechainBwdArgs)) {
+  uint i = (uint)LF_INDEX;
+  if (i >= a.L) return;
+  int aa = clamp(a.aatype[i], 0, 19);
+
+  // ---- the forward, rebuilt (it saves nothing, and recomputing eight frames is cheaper than holding them)
+  float bb[12];
+  for (int k = 0; k < 12; ++k) bb[k] = a.rig[i * 12 + k];
+  for (int k = 9; k < 12; ++k) bb[k] *= a.positionScale;
+  float sinA[8], cosA[8], invN[8];
+  sinA[0] = 0; cosA[0] = 1; invN[0] = 0;
+  for (int q = 0; q < 7; ++q) {
+    float s = a.unnorm[(i * 7 + q) * 2], c = a.unnorm[(i * 7 + q) * 2 + 1];
+    float n2 = s * s + c * c, inv = 1.f / sqrt(max(n2, 1e-12f));
+    sinA[q + 1] = s * inv; cosA[q + 1] = c * inv;
+    invN[q + 1] = n2 > 1e-12f ? inv : -inv;     // the sign flags the clamp: negative means it bound
+  }
+  float base[8][12], frames[8][12];
+  for (int g = 0; g < 8; ++g) {
+    device const float* m = a.defaultFrames + ((ulong)aa * 8 + g) * 16;
+    float D[12] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[3], m[7], m[11]};
+    float Rx[12] = {1, 0, 0, 0, cosA[g], -sinA[g], 0, sinA[g], cosA[g], 0, 0, 0};
+    float R[12];
+    lf_rcompose(D, Rx, R);
+    for (int k = 9; k < 12; ++k) R[k] = D[k];
+    for (int k = 0; k < 12; ++k) { base[g][k] = R[k]; frames[g][k] = R[k]; }
+  }
+  // the chain, kept separately so the backward can walk it in reverse: c5 = f4 o f5, c6 = c5 o f6, c7 = c6 o f7
+  float c5[12], c6[12], c7[12];
+  lf_rcompose(base[4], base[5], c5);
+  lf_rcompose(c5, base[6], c6);
+  lf_rcompose(c6, base[7], c7);
+  for (int k = 0; k < 12; ++k) { frames[5][k] = c5[k]; frames[6][k] = c6[k]; frames[7][k] = c7[k]; }
+
+  // ---- backward
+  float dframes[8][12], dbb[12];
+  for (int g = 0; g < 8; ++g) for (int k = 0; k < 12; ++k) dframes[g][k] = 0;
+  for (int k = 0; k < 12; ++k) dbb[k] = 0;
+
+  // pos37 gathers pos14, so its cotangent lands on the slot it read
+  float dp14[14][3];
+  for (int q = 0; q < 14; ++q)
+    for (int x = 0; x < 3; ++x) dp14[q][x] = a.dPos14 ? a.dPos14[((ulong)i * 14 + q) * 3 + x] : 0.f;
+  if (a.dPos37) {
+    const float sm = a.seqMask[i];
+    for (int q = 0; q < 37; ++q) {
+      int s = a.atom37To14[aa * 37 + q];
+      float m = a.atom37Mask[aa * 37 + q] * sm;
+      for (int x = 0; x < 3; ++x) dp14[s][x] += a.dPos37[((ulong)i * 37 + q) * 3 + x] * m;
+    }
+  }
+  for (int q = 0; q < 14; ++q) {
+    int g = a.atom14Group[aa * 14 + q];
+    float m = a.atom14Mask[aa * 14 + q];
+    float dp[3] = {dp14[q][0] * m, dp14[q][1] * m, dp14[q][2] * m};
+    if (dp[0] == 0 && dp[1] == 0 && dp[2] == 0) continue;
+    float glob[12];
+    lf_rcompose(bb, frames[g], glob);
+    float lit[3] = {a.litPos[((ulong)aa * 14 + q) * 3], a.litPos[((ulong)aa * 14 + q) * 3 + 1],
+                    a.litPos[((ulong)aa * 14 + q) * 3 + 2]};
+    // p = glob.R lit + glob.t
+    float dglob[12];
+    for (int k = 0; k < 3; ++k) {
+      for (int j = 0; j < 3; ++j) dglob[k * 3 + j] = dp[k] * lit[j];
+      dglob[9 + k] = dp[k];
+    }
+    lf_rcomposeBwd(bb, frames[g], dglob, dbb, dframes[g]);
+  }
+
+  // The chain, in reverse. Each link's cotangent is COPIED ASIDE and its slot zeroed before the call, because
+  // lf_rcomposeBwd reads dC while it accumulates into dB and the two would be the same array - the same hazard the
+  // backbone update has with dRig, one level in. After each link, dframes[g] holds the UNCHAINED frame's cotangent
+  // and dframes[g-1] has had the chain's share added to the atoms' own.
+  {
+    float dc[12];
+    for (int k = 0; k < 12; ++k) { dc[k] = dframes[7][k]; dframes[7][k] = 0; }
+    lf_rcomposeBwd(c6, base[7], dc, dframes[6], dframes[7]);
+  }
+  {
+    float dc[12];
+    for (int k = 0; k < 12; ++k) { dc[k] = dframes[6][k]; dframes[6][k] = 0; }
+    lf_rcomposeBwd(c5, base[6], dc, dframes[5], dframes[6]);
+  }
+  {
+    float dc[12];
+    for (int k = 0; k < 12; ++k) { dc[k] = dframes[5][k]; dframes[5][k] = 0; }
+    lf_rcomposeBwd(base[4], base[5], dc, dframes[4], dframes[5]);
+  }
+
+  // each frame's rotation came from D.R Rx(g).R, with the translation D's own and so constant
+  device float* du = a.dUnnorm + (ulong)i * 14;
+  for (int q = 0; q < 7; ++q) { du[q * 2] = 0; du[q * 2 + 1] = 0; }
+  for (int g = 1; g < 8; ++g) {
+    device const float* m = a.defaultFrames + ((ulong)aa * 8 + g) * 16;
+    float DR[9] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]};
+    // dRx[j][n] = sum_k dF[k][n] D[k][j]
+    float dRx[9];
+    for (int j = 0; j < 3; ++j)
+      for (int n = 0; n < 3; ++n) {
+        float s = 0;
+        for (int k = 0; k < 3; ++k) s += dframes[g][k * 3 + n] * DR[k * 3 + j];
+        dRx[j * 3 + n] = s;
+      }
+    // Rx = [[1,0,0],[0,c,-s],[0,s,c]]
+    float dc = dRx[4] + dRx[8], ds = -dRx[5] + dRx[7];
+    // plus the angles output's own cotangent, if a loss reads it
+    if (a.dAngles) { ds += a.dAngles[(i * 7 + (g - 1)) * 2]; dc += a.dAngles[(i * 7 + (g - 1)) * 2 + 1]; }
+    // back through the normalisation
+    const float sn = sinA[g], cn = cosA[g], inv = fabs(invN[g]);
+    if (invN[g] > 0) {
+      float dot = ds * sn + dc * cn;
+      du[(g - 1) * 2] = (ds - sn * dot) * inv;
+      du[(g - 1) * 2 + 1] = (dc - cn * dot) * inv;
+    } else {     // the 1e-12 floor bound, so the scale is a constant and only the division is differentiated
+      du[(g - 1) * 2] = ds * inv;
+      du[(g - 1) * 2 + 1] = dc * inv;
+    }
+  }
+
+  device float* dr = a.dRig + i * 12;
+  for (int k = 0; k < 9; ++k) { if (a.accumRig) dr[k] += dbb[k]; else dr[k] = dbb[k]; }
+  for (int k = 9; k < 12; ++k) {
+    float v = dbb[k] * a.positionScale;
+    if (a.accumRig) dr[k] += v; else dr[k] = v;
+  }
+}
