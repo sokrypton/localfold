@@ -1,0 +1,33 @@
+# geometry only, with a schedule of each kind
+potentials:
+  - _target_: bioemu2.denoising.steering.potentials.BondLengthPotential
+    sigma_tolerance: 6.0
+    parameters:
+      guidance_interval: 1
+      guidance_weight: 0.08   # stronger than the default
+      resampling_weight: 0.2
+  - _target_: bioemu2.denoising.steering.potentials.BondAnglePotential
+    sigma_tolerance: 8.0
+    parameters:
+      guidance_weight:
+        _target_: bioemu2.denoising.steering.potentials.LinearInterpolation
+        start_t: 0.9
+        end_t: 0.1
+        start_val: 0.1
+        end_val: 0.01
+  - _target_: bioemu2.denoising.steering.potentials.PolymerLocalClashPotential
+    parameters:
+      guidance_interval: 2
+      guidance_weight:
+        _target_: bioemu2.denoising.steering.potentials.PiecewiseStepFunction
+        thresholds: [0.3, 0.7]
+        values: [0.2, 0.1, 0.0]
+      minimum_distance: 2.2
+  - _target_: bioemu2.denoising.steering.potentials.IntraChainVDWOverlapPotential
+    parameters:
+      guidance_weight: 0.1
+      buffer:
+        _target_: bioemu2.denoising.steering.potentials.ExponentialInterpolation
+        start: 0.1
+        end: 0.3
+        alpha: 1.5
