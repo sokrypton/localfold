@@ -47,6 +47,10 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
   stereo-bond and planar energies identical, PoseBusters within a few percent, chirality different in value (the
   vendor orders neighbours by CIP rank) and not in the hand it enforces.
 
+- **CPU denoiser and its VJP** (`cpu/bioemu2/denoiser.js`): D(x, sigma) to 3.2e-7 relRMS at sigma 1; d/dx's network
+  part to 1.4e-4 at sigma 16 (total 1.2e-3 - see the trap below) and 1.5e-5 at sigma 1; d/dsigma to 1.6e-3 / 7e-4. The
+  tape in float32 against itself in float64: 4e-6, so the residual is the reference's float32 backward.
+
 ## The ports
 
 | backend | where | float32 oracle, worst stage | fold | speed (A100) |
@@ -72,6 +76,10 @@ and D64 at their alternate locations. The oracle dumps share it, so parity is un
   residue matches no token and is refused - by the reference too.
 - 🔴 **COLAB'S OUTPUT DROPS AN ATOM BIOEMU2 PREDICTS**: it writes the AF3 layout, which has no glycan O1, so a
   NAG's predicted O1 never reaches the mmCIF. Write the BioEmu2 atom set, not the AF3 one.
+- 🔴 **A DENOISER'S GRADIENT CANCELS ITS OWN SKIP TERM**: D = c_skip x + c_out F(x), and at sigma 16 the network's
+  d/dx (|.| 21) nearly cancels c_skip w (21) to a total of 2.6, so the network's 1.4e-4 float32 difference reads 1.2e-3
+  in the total and looked like a missing term. Compare the network's part; and run the tape in float64 before
+  blaming the tape.
 - 🔴 **Python's `json` writes `NaN`**, which `JSON.parse` refuses; the checkers read a dump with it replaced.
 - 🔴 **The steering reference data is other people's**: `stereo_chemistry.yaml` is CCP4 MON_LIB (LGPL), fetched at
   run time from BioEmu2's repository at `7846769`, never shipped; the vendor's ligand tier reads Boltz-1's CCD
