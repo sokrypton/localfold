@@ -118,8 +118,10 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 1. **The primitives** - LayerNorm, a linear layer's two GEMMs and its bias. **DONE**, see below.
 2. **The pair stack's cheap halves** - the transitions, the outer-product mean, the gates. **DONE**, see below.
 3. **Triangle multiplication**, outgoing and incoming. **DONE**, see below.
-4. **Attention** - MSA row (with pair bias), MSA column, and both triangle attentions. The core backward is
-   **DONE**, see below; the module around it (q/k/v projections, the gate, the output projection) is composition.
+4. **Attention** - the core backward, the Attention module, and the biased self-attention both
+   `MSARowAttentionWithPairBias` and `TriangleAttention` are. **DONE**, see below. Left in the tier: the MSA COLUMN
+   attentions, of which `MSAColumnGlobalAttention` is a genuinely different shape (mean queries), and the
+   `per_column` orientation, which is a transpose the caller does as AF2 does it (`modules.py:703`, `:731`).
 5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
    differentiable.
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
@@ -253,3 +255,39 @@ cheap fix and the right one; writing a second tuned attention would not be.
 
 Held to `D <= 64` (a lane carries at most two channels), which covers every AF2 head here: 32 for the triangle and
 MSA row/column, 8 for the extra-MSA stack.
+
+### Stage 4 continued: the attention modules, and a dead parameter in AF2
+
+**264 cases, all passing.** Added `attentionModuleBwd` (AF2's whole `Attention`: the q/k/v projections with its
+`key_dim^-0.5`, the sigmoid gate, the output projection) and `biasedSelfAttentionBwd`, which serves
+**both** `MSARowAttentionWithPairBias` and `TriangleAttention` because the two are the same shape:
+
+| | MSARowAttentionWithPairBias | TriangleAttention |
+| --- | --- | --- |
+| LayerNorms | two (`query_norm`, `feat_2d_norm`) | one (`query_norm`) |
+| the bias comes from | a DIFFERENT tensor (the pair) | the SAME normalised tensor it attends over |
+| so the bias path's cotangent | goes back through its own LayerNorm | **accumulates into the attention's own** |
+
+Self-attention is the case that needed care: AF2 passes the same activation as `q_data` and `m_data` everywhere, so
+**five** paths - Wq, Wk, Wv, the gate and (for the triangle) the bias linear - all accumulate into one cotangent.
+`attentionModuleBwd` takes one pointer for both and tracks which path writes first; passing two distinct buffers
+gives the cross-attention case, and both are tested.
+
+#### 🔴 feat_2d_norm's OFFSET has an identically zero gradient, and it is a dead parameter in AF2
+
+Found by the central-difference check, which reported a relative error of **7.7e+02** on `dbOffset` while every other
+gradient in the same case passed. Not a bug - the gradient is **exactly zero**, and a relative measure cannot judge
+that:
+
+- `feat_2d_norm`'s output is used for **nothing but** the non-batched bias (`modules.py:539-552`).
+- Shifting its offset by d shifts `biasN[r][c]` by d for every row, so `nb[h][q][k]` shifts by `sum_c d_c W[c][h]` -
+  a **constant for a given head, across every (q, k)**.
+- A constant added to every logit of a softmax row cancels. So the output does not move at all.
+
+It falls out of the kernel arithmetic too: `sum_k ds[k] = sum_k p dp - D` and `D = sum_k p dp` by definition, so a
+softmax row's `ds` sums to zero, and the column sum that `doffset` is sums those zeros.
+
+Consequences worth keeping: **that parameter never moves during training and cannot affect a prediction** - AF2
+carries it regardless, so a port must still read it from the checkpoint, and must not "fix" it. Its SCALE is a real
+parameter (`dbScale` passes at 3.4e-7); only the offset is dead. And the test now reports such a case as
+`ok (zero gradient)` on an absolute floor rather than a relative one, which is the honest way to check it.

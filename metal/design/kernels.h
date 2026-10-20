@@ -34,6 +34,13 @@ struct ReluBwdArgs { CP(float) dy; CP(float) ref; DP(float) dx; u64 n; };
 // `g` is the gate BEFORE the sigmoid (what the linear wrote); dy and dg may alias their inputs.
 struct GateBwdArgs { CP(float) dout; CP(float) y; CP(float) g; DP(float) dy; DP(float) dg; u64 n; };
 
+// y *= alpha. AF2 scales q by key_dim^-0.5 inside the projection, so the cotangent of the UNSCALED product is the
+// scaled one times alpha; this is that multiply.
+struct ScaleArgs { DP(float) y; u64 n; float alpha; uint pad; };
+
+// y = x * alpha + beta. AF2 turns a 0/1 mask into an additive attention bias with 1e9 * (mask - 1).
+struct AffineArgs { CP(float) x; DP(float) y; u64 n; float alpha, beta; uint pad; };
+
 // y = x * sigmoid(g) - the forward of the triangle's two gated projections, recomputed on the way back
 struct MulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
 

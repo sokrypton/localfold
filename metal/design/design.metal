@@ -267,6 +267,18 @@ kernel void lf_attn_bwd_dbias(LF_ARGS(AttnBwdArgs)) {
 }
 
 // ---------------------------------------------------------------- the triangle's helpers
+kernel void lf_scale(LF_ARGS(ScaleArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  a.y[i] *= a.alpha;
+}
+
+kernel void lf_affine(LF_ARGS(AffineArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  a.y[i] = a.x[i] * a.alpha + a.beta;
+}
+
 kernel void lf_mul_sigmoid(LF_ARGS(MulSigmoidArgs)) {
   ulong i = LF_INDEX;
   if (i >= a.n) return;

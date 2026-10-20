@@ -102,6 +102,67 @@ void attentionBwd(const float* q, const float* k, const float* v,
                   float* dq, float* dk, float* dv, float* dPairBias,
                   int B, int Q, int K, int H, int D);
 
+// ---------------------------------------------------------------- the Attention MODULE (modules.py:336-399)
+// The forward around the core above:
+//   q = (qData Wq) * key_dim^-0.5     k = mData Wk     v = mData Wv        [B][pos][H][D]
+//   wa = attend(q, k, v, maskBias, pairBias)
+//   if gating:  wa *= sigmoid(qData Wg + bg)
+//   out = wa Wo + bo                                                       [B][Q][O]
+// Wq/Wk/Wv/Wg are AF2's [C][H][D] parameters, which flatten to [C][H*D] and so are plain linears; only the gate and
+// the output projection carry a bias, as the reference has it.
+//
+// SELF-ATTENTION: pass the SAME pointer for dQData and dMData (AF2 does this everywhere - q_data and m_data are both
+// the normalised activation) and all five paths accumulate into it. Then Q must equal K and Cq equal Cm.
+struct AttnModuleWeights {
+  const float* Wq; const float* Wk; const float* Wv;
+  const float* Wg = nullptr; const float* bg = nullptr;    // Wg null: no gating
+  const float* Wo; const float* bo;
+};
+struct AttnModuleGrads {
+  float* Wq = nullptr; float* Wk = nullptr; float* Wv = nullptr;
+  float* Wg = nullptr; float* bg = nullptr;
+  float* Wo = nullptr; float* bo = nullptr;
+};
+void attentionModuleBwd(const float* qData, const float* mData,
+                        const float* maskBias, const float* pairBias,
+                        const AttnModuleWeights& w, const float* dOut,
+                        float* dQData, float* dMData, float* dPairBias,
+                        int B, int Q, int K, int Cq, int Cm, int H, int D, int O,
+                        const AttnModuleGrads& g = {});
+
+// ------------------------------------------- biased self-attention: MSARowAttentionWithPairBias AND TriangleAttention
+// The two are the same shape, so one function serves both (modules.py:527-561 and :698-729):
+//   maskBias = 1e9 * (mask - 1)                                   [B][K]
+//   actN     = LayerNorm_query_norm(act)                          [B * Q][Cq]
+//   biasN    = (bias source is act) ? actN : LayerNorm_feat_2d_norm(biasSrc)      [Q * K][Cb]
+//   nb[h][q][k] = sum_c biasN[(q, k)][c] feat2dW[c][h]            ('qkc,ch->hqk', so a linear then a permute)
+//   out      = Attention(actN, actN, maskBias, nb)                [B][Q][O]
+//
+// MSARowAttentionWithPairBias has TWO LayerNorms and takes its bias from a DIFFERENT tensor (the pair) than the one
+// it attends over (the MSA): pass `biasSrc` = the pair, with bScale/bOffset.
+// TriangleAttention has ONE: the bias comes from the same normalised pair it attends over. Pass `biasSrc == act`
+// and leave bScale/bOffset null, and `dBiasSrc` is then ignored - that path accumulates into dAct, which is right,
+// because it IS the same tensor.
+//
+// The bias source must have exactly Q * K rows. `per_column` is NOT handled here: AF2 swaps the pair's axes before
+// and after (`modules.py:703` and `:731`), and so should a caller - it is a transpose, not a different gradient.
+struct BiasedAttnWeights {
+  const float* qScale; const float* qOffset;
+  const float* bScale = nullptr; const float* bOffset = nullptr;
+  const float* feat2dW;
+  AttnModuleWeights attn;
+};
+struct BiasedAttnGrads {
+  float* qScale = nullptr; float* qOffset = nullptr;
+  float* bScale = nullptr; float* bOffset = nullptr;
+  float* feat2dW = nullptr;
+  AttnModuleGrads attn;
+};
+void biasedSelfAttentionBwd(const float* act, const float* biasSrc, const float* mask,
+                            int B, int Q, int Cq, int Cb, int H, int D, int O,
+                            const BiasedAttnWeights& w, const float* dOut,
+                            float* dAct, float* dBiasSrc, const BiasedAttnGrads& g = {});
+
 // ---------------------------------------------------------------- TriangleMultiplication (Alg. 11 / 12)
 // The forward, as AF2 writes it (modules.py:947-1012). With n2 = N * N pair rows, C the pair width and I the
 // intermediate width (num_intermediate_channel):

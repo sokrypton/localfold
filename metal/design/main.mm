@@ -44,6 +44,26 @@ static double relRms(const std::vector<double>& ref, const std::vector<float>& g
   }
   return sqrt(num / std::max(den, 1e-30));
 }
+// A gradient that is ANALYTICALLY ZERO cannot be judged by a relative measure: both sides are rounding noise and
+// the ratio is meaningless. feat_2d_norm's OFFSET is exactly such a parameter - it adds a constant to every logit of
+// a softmax row, which cancels - so this passes on an absolute floor instead, and says so.
+static void reportGrad(const char* what, const std::vector<double>& fd, const std::vector<double>& mine,
+                       double bound) {
+  double num = 0, den = 0;
+  for (size_t i = 0; i < fd.size(); ++i) {
+    double d = fd[i] - mine[i];
+    num += d * d;
+    den += fd[i] * fd[i];
+  }
+  const double rel = sqrt(num / std::max(den, 1e-30));
+  const double absRms = sqrt(num / std::max<size_t>(fd.size(), 1));
+  const bool zero = absRms <= 1e-6 && sqrt(den / std::max<size_t>(fd.size(), 1)) <= 1e-6;
+  const bool ok = (rel <= bound && std::isfinite(rel)) || zero;
+  if (!ok) ++failures;
+  if (zero) printf("  %-56s both ~0  %.1e %s\n", what, absRms, ok ? "ok (zero gradient)" : "FAIL");
+  else printf("  %-56s relRMS %.2e %s\n", what, rel, ok ? "ok" : "FAIL");
+}
+
 static double relRmsD(const std::vector<double>& ref, const std::vector<double>& got) {
   std::vector<float> f(got.size());
   for (size_t i = 0; i < got.size(); ++i) f[i] = (float)got[i];
@@ -396,7 +416,7 @@ static void trCase(size_t rows, int C, int H) {
     (void)base;
     char lab[160];
     snprintf(lab, sizeof lab, "transition %s vs central difference %s", what, shape);
-    report(lab, relRmsD(fd, got), 1e-6);
+    reportGrad(lab, fd, got, 1e-6);
   };
   fdCheck("dAct", act, rdAct, act);
   fdCheck("dLnScale", p.lnScale, rdLnScale, p.lnScale);
@@ -528,7 +548,7 @@ static void opmCase(size_t S, int N, int Cm, int O, int F, int tile) {
     }
     char lab[200];
     snprintf(lab, sizeof lab, "opm %s vs central difference %s", what, shape);
-    report(lab, relRmsD(fd, mine), 2e-5);
+    reportGrad(lab, fd, mine, 2e-5);
   };
 
   probe("dMsa", msa, download((const float*)gdMsa, rows * Cm), 6);
@@ -635,7 +655,7 @@ static void attnCase(int B, int Q, int K, int H, int D) {
     }
     char lab[220];
     snprintf(lab, sizeof lab, "attn %s vs central difference %s", what, shape);
-    report(lab, relRmsD(fd, mine), 3e-5);
+    reportGrad(lab, fd, mine, 3e-5);
   };
   probe("dq", q, download((const float*)gdq, qn), 6);
   probe("dk", k, download((const float*)gdk, kn), 6);
@@ -644,6 +664,280 @@ static void attnCase(int B, int Q, int K, int H, int D) {
 
   release(dQ); release(dK); release(dV); release(dMb); release(dPb); release(dDo);
   release(gOut); release(gL); release(gdq); release(gdk); release(gdv); release(gdpb);
+}
+
+// ---------------------------------------------------------------- the Attention module
+struct AttnMP { std::vector<double> Wq, Wk, Wv, Wg, bg, Wo, bo; };
+static double sigm(double x);
+
+static void attnModForward(const std::vector<double>& qData, const std::vector<double>& mData,
+                           const std::vector<double>& mb, const std::vector<double>& pb, const AttnMP& p,
+                           bool gating, int B, int Q, int K, int Cq, int Cm, int H, int D, int O,
+                           std::vector<double>& out) {
+  const int W = H * D;
+  const double scale = 1.0 / sqrt((double)D);
+  auto proj = [&](const std::vector<double>& X, const std::vector<double>& Wm, const std::vector<double>* b,
+                  size_t rows, int in, std::vector<double>& Y) {
+    Y.assign(rows * W, 0.0);
+    for (size_t r = 0; r < rows; ++r)
+      for (int o = 0; o < W; ++o) {
+        double s = b ? (*b)[o] : 0.0;
+        for (int c = 0; c < in; ++c) s += X[r * in + c] * Wm[(size_t)c * W + o];
+        Y[r * W + o] = s;
+      }
+  };
+  std::vector<double> q, k, v, gp;
+  proj(qData, p.Wq, nullptr, (size_t)B * Q, Cq, q);
+  for (auto& x : q) x *= scale;
+  proj(mData, p.Wk, nullptr, (size_t)B * K, Cm, k);
+  proj(mData, p.Wv, nullptr, (size_t)B * K, Cm, v);
+  std::vector<double> wa;
+  attnForward(q, k, v, mb, pb, B, Q, K, H, D, wa);
+  if (gating) {
+    proj(qData, p.Wg, &p.bg, (size_t)B * Q, Cq, gp);
+    for (size_t i = 0; i < wa.size(); ++i) wa[i] *= sigm(gp[i]);
+  }
+  out.assign((size_t)B * Q * O, 0.0);
+  for (size_t r = 0; r < (size_t)B * Q; ++r)
+    for (int o = 0; o < O; ++o) {
+      double s = p.bo[o];
+      for (int c = 0; c < W; ++c) s += wa[r * W + c] * p.Wo[(size_t)c * O + o];
+      out[r * O + o] = s;
+    }
+}
+
+static void attnModCase(int B, int Q, int K, int Cq, int Cm, int H, int D, int O, bool gating, bool self_) {
+  const int W = H * D;
+  if (self_) { K = Q; Cm = Cq; }
+  std::vector<double> qData = randv((size_t)B * Q * Cq), mData;
+  if (self_) mData = qData;
+  else mData = randv((size_t)B * K * Cm);
+  std::vector<double> dOut = randv((size_t)B * Q * O, 0.5),
+                      mb((size_t)B * K, 0.0), pb = randv((size_t)H * Q * K, 0.5);
+  for (int b = 0; b < B; ++b)
+    for (int kk = 0; kk < K; ++kk)
+      if ((b + kk) % 5 == 0) mb[(size_t)b * K + kk] = -1e4;
+
+  AttnMP p;
+  p.Wq = randv((size_t)Cq * W, 0.2);
+  p.Wk = randv((size_t)Cm * W, 0.2);
+  p.Wv = randv((size_t)Cm * W, 0.2);
+  p.Wg = randv((size_t)Cq * W, 0.2);
+  p.bg = randv(W, 0.1);
+  p.Wo = randv((size_t)W * O, 0.2);
+  p.bo = randv(O, 0.1);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dQd = up(qData);
+  void* dMd = self_ ? dQd : up(mData);
+  void* dMb = up(mb); void* dPb = up(pb); void* dDo = up(dOut);
+  void* hWq = up(p.Wq); void* hWk = up(p.Wk); void* hWv = up(p.Wv);
+  void* hWg = up(p.Wg); void* hbg = up(p.bg); void* hWo = up(p.Wo); void* hbo = up(p.bo);
+
+  AttnModuleWeights w{};
+  w.Wq = (const float*)hWq; w.Wk = (const float*)hWk; w.Wv = (const float*)hWv;
+  if (gating) { w.Wg = (const float*)hWg; w.bg = (const float*)hbg; }
+  w.Wo = (const float*)hWo; w.bo = (const float*)hbo;
+
+  void* gQd = alloc((size_t)B * Q * Cq * 4);
+  void* gMd = self_ ? gQd : alloc((size_t)B * K * Cm * 4);
+  void* gPb = alloc((size_t)H * Q * K * 4);
+  AttnModuleGrads gg{};
+  void* gWq = alloc((size_t)Cq * W * 4); void* gWk = alloc((size_t)Cm * W * 4);
+  void* gWv = alloc((size_t)Cm * W * 4); void* gWg = alloc((size_t)Cq * W * 4);
+  void* gbg = alloc((size_t)W * 4); void* gWo = alloc((size_t)W * O * 4); void* gbo = alloc((size_t)O * 4);
+  gg.Wq = (float*)gWq; gg.Wk = (float*)gWk; gg.Wv = (float*)gWv;
+  if (gating) { gg.Wg = (float*)gWg; gg.bg = (float*)gbg; }
+  gg.Wo = (float*)gWo; gg.bo = (float*)gbo;
+
+  attentionModuleBwd((const float*)dQd, (const float*)dMd, (const float*)dMb, (const float*)dPb, w,
+                     (const float*)dDo, (float*)gQd, (float*)gMd, (float*)gPb,
+                     B, Q, K, Cq, Cm, H, D, O, gg);
+
+  char shape[110];
+  snprintf(shape, sizeof shape, "%s%s B%d Q%d K%d H%d D%d O%d", self_ ? "self" : "cross",
+           gating ? "+gate" : "", B, Q, K, H, D, O);
+
+  auto S_ = [&]() {
+    std::vector<double> o;
+    attnModForward(qData, self_ ? qData : mData, mb, pb, p, gating, B, Q, K, Cq, Cm, H, D, O, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dOut[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = S_();
+      target[j] = save - hh;
+      double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[240];
+    snprintf(lab, sizeof lab, "attnmod %s vs central difference %s", what, shape);
+    reportGrad(lab, fd, mine, 3e-5);
+  };
+
+  probe("dQData", qData, download((const float*)gQd, (size_t)B * Q * Cq), 6);
+  if (!self_) probe("dMData", mData, download((const float*)gMd, (size_t)B * K * Cm), 5);
+  probe("dPairBias", pb, download((const float*)gPb, (size_t)H * Q * K), 5);
+  probe("dWq", p.Wq, download((const float*)gWq, (size_t)Cq * W), 4);
+  probe("dWk", p.Wk, download((const float*)gWk, (size_t)Cm * W), 4);
+  probe("dWv", p.Wv, download((const float*)gWv, (size_t)Cm * W), 4);
+  if (gating) {
+    probe("dWg", p.Wg, download((const float*)gWg, (size_t)Cq * W), 4);
+    probe("dbg", p.bg, download((const float*)gbg, W), 3);
+  }
+  probe("dWo", p.Wo, download((const float*)gWo, (size_t)W * O), 4);
+  probe("dbo", p.bo, download((const float*)gbo, O), 3);
+
+  release(dQd); if (!self_) release(dMd);
+  release(dMb); release(dPb); release(dDo);
+  release(hWq); release(hWk); release(hWv); release(hWg); release(hbg); release(hWo); release(hbo);
+  release(gQd); if (!self_) release(gMd);
+  release(gPb); release(gWq); release(gWk); release(gWv); release(gWg); release(gbg); release(gWo); release(gbo);
+}
+
+// ------------------------------------------- biased self-attention (MSARowAttentionWithPairBias / TriangleAttention)
+static void biasedForward(const std::vector<double>& act, const std::vector<double>& biasSrc,
+                          const std::vector<double>& mask, int B, int Q, int Cq, int Cb, int H, int D, int O,
+                          bool shared, const std::vector<double>& qScale, const std::vector<double>& qOffset,
+                          const std::vector<double>& bScale, const std::vector<double>& bOffset,
+                          const std::vector<double>& feat2dW, const AttnMP& ap, bool gating,
+                          std::vector<double>& out) {
+  const int K = Q;
+  const size_t rows = (size_t)B * Q, nbRows = (size_t)Q * K;
+  std::vector<double> mb((size_t)B * K);
+  for (size_t i = 0; i < mb.size(); ++i) mb[i] = 1e9 * (mask[i] - 1.0);
+  std::vector<double> actN, biasN;
+  lnForward(act, rows, Cq, qScale, qOffset, 1e-5, actN);
+  if (shared) biasN = actN;
+  else lnForward(biasSrc, nbRows, Cb, bScale, bOffset, 1e-5, biasN);
+  std::vector<double> nb((size_t)H * nbRows, 0.0);
+  for (size_t r = 0; r < nbRows; ++r)
+    for (int h = 0; h < H; ++h) {
+      double s = 0;
+      for (int c = 0; c < Cb; ++c) s += biasN[r * Cb + c] * feat2dW[(size_t)c * H + h];
+      nb[(size_t)h * nbRows + r] = s;          // [h][q][k]
+    }
+  attnModForward(actN, actN, mb, nb, ap, gating, B, Q, K, Cq, Cq, H, D, O, out);
+}
+
+static void biasedCase(int B, int Q, int Cq, int Cb, int H, int D, int O, bool shared) {
+  const int K = Q, W = H * D;
+  const size_t rows = (size_t)B * Q, nbRows = (size_t)Q * K;
+  if (shared) { Cb = Cq; }
+  std::vector<double> act = randv(rows * Cq), biasSrc;
+  if (shared) { if (rows != nbRows) { printf("  (shared needs B == Q)\n"); return; } biasSrc = act; }
+  else biasSrc = randv(nbRows * Cb);
+  std::vector<double> dOut = randv(rows * O, 0.5), mask((size_t)B * K, 1.0);
+  for (int b = 0; b < B; ++b)
+    for (int kk = 1; kk < K; ++kk)
+      if ((b * 3 + kk) % 6 == 0) mask[(size_t)b * K + kk] = 0.0;    // key 0 always present
+
+  std::vector<double> qScale = randv(Cq, 0.3), qOffset = randv(Cq, 0.2),
+                      bScale = randv(Cb, 0.3), bOffset = randv(Cb, 0.2),
+                      feat2dW = randv((size_t)Cb * H, 0.3);
+  for (auto& s : qScale) s += 1.0;
+  for (auto& s : bScale) s += 1.0;
+  AttnMP ap;
+  ap.Wq = randv((size_t)Cq * W, 0.2); ap.Wk = randv((size_t)Cq * W, 0.2); ap.Wv = randv((size_t)Cq * W, 0.2);
+  ap.Wg = randv((size_t)Cq * W, 0.2); ap.bg = randv(W, 0.1);
+  ap.Wo = randv((size_t)W * O, 0.2);  ap.bo = randv(O, 0.1);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dAct = up(act);
+  void* dBs = shared ? dAct : up(biasSrc);
+  void* dMask = up(mask); void* dDo = up(dOut);
+  void* hqs = up(qScale); void* hqo = up(qOffset); void* hbs = up(bScale); void* hbo_ = up(bOffset);
+  void* hf2 = up(feat2dW);
+  void* hWq = up(ap.Wq); void* hWk = up(ap.Wk); void* hWv = up(ap.Wv);
+  void* hWg = up(ap.Wg); void* hbg = up(ap.bg); void* hWo = up(ap.Wo); void* hbo = up(ap.bo);
+
+  BiasedAttnWeights w{};
+  w.qScale = (const float*)hqs; w.qOffset = (const float*)hqo;
+  if (!shared) { w.bScale = (const float*)hbs; w.bOffset = (const float*)hbo_; }
+  w.feat2dW = (const float*)hf2;
+  w.attn.Wq = (const float*)hWq; w.attn.Wk = (const float*)hWk; w.attn.Wv = (const float*)hWv;
+  w.attn.Wg = (const float*)hWg; w.attn.bg = (const float*)hbg;
+  w.attn.Wo = (const float*)hWo; w.attn.bo = (const float*)hbo;
+
+  void* gAct = alloc(rows * Cq * 4);
+  void* gBs = shared ? gAct : alloc(nbRows * Cb * 4);
+  void* gqs = alloc((size_t)Cq * 4); void* gqo = alloc((size_t)Cq * 4);
+  void* gbs = alloc((size_t)Cb * 4); void* gbo_ = alloc((size_t)Cb * 4);
+  void* gf2 = alloc((size_t)Cb * H * 4);
+  void* gWq = alloc((size_t)Cq * W * 4); void* gWk = alloc((size_t)Cq * W * 4);
+  void* gWv = alloc((size_t)Cq * W * 4); void* gWg = alloc((size_t)Cq * W * 4);
+  void* gbg = alloc((size_t)W * 4); void* gWo = alloc((size_t)W * O * 4); void* gbo = alloc((size_t)O * 4);
+  BiasedAttnGrads gg{};
+  gg.qScale = (float*)gqs; gg.qOffset = (float*)gqo;
+  if (!shared) { gg.bScale = (float*)gbs; gg.bOffset = (float*)gbo_; }
+  gg.feat2dW = (float*)gf2;
+  gg.attn.Wq = (float*)gWq; gg.attn.Wk = (float*)gWk; gg.attn.Wv = (float*)gWv;
+  gg.attn.Wg = (float*)gWg; gg.attn.bg = (float*)gbg;
+  gg.attn.Wo = (float*)gWo; gg.attn.bo = (float*)gbo;
+
+  biasedSelfAttentionBwd((const float*)dAct, (const float*)dBs, (const float*)dMask,
+                         B, Q, Cq, Cb, H, D, O, w, (const float*)dDo,
+                         (float*)gAct, (float*)gBs, gg);
+
+  char shape[120];
+  snprintf(shape, sizeof shape, "%s B%d Q%d Cq%d Cb%d H%d D%d O%d",
+           shared ? "triangle-like" : "msarow-like", B, Q, Cq, Cb, H, D, O);
+  auto S_ = [&]() {
+    std::vector<double> o;
+    biasedForward(act, shared ? act : biasSrc, mask, B, Q, Cq, Cb, H, D, O, shared,
+                  qScale, qOffset, bScale, bOffset, feat2dW, ap, true, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dOut[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> U(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = U(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh;
+      double aS = S_();
+      target[j] = save - hh;
+      double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(got[j]);
+    }
+    char lab[250];
+    snprintf(lab, sizeof lab, "biasedattn %s vs central difference %s", what, shape);
+    reportGrad(lab, fd, mine, 3e-5);
+  };
+
+  probe("dAct", act, download((const float*)gAct, rows * Cq), 6);
+  if (!shared) probe("dBiasSrc", biasSrc, download((const float*)gBs, nbRows * Cb), 5);
+  probe("dqScale", qScale, download((const float*)gqs, Cq), 3);
+  probe("dqOffset", qOffset, download((const float*)gqo, Cq), 3);
+  if (!shared) {
+    probe("dbScale", bScale, download((const float*)gbs, Cb), 3);
+    probe("dbOffset", bOffset, download((const float*)gbo_, Cb), 3);
+  }
+  probe("dfeat2dW", feat2dW, download((const float*)gf2, (size_t)Cb * H), 4);
+  probe("dWq", ap.Wq, download((const float*)gWq, (size_t)Cq * W), 3);
+  probe("dWv", ap.Wv, download((const float*)gWv, (size_t)Cq * W), 3);
+  probe("dWg", ap.Wg, download((const float*)gWg, (size_t)Cq * W), 3);
+  probe("dWo", ap.Wo, download((const float*)gWo, (size_t)W * O), 3);
+
+  release(dAct); if (!shared) release(dBs);
+  release(dMask); release(dDo); release(hqs); release(hqo); release(hbs); release(hbo_); release(hf2);
+  release(hWq); release(hWk); release(hWv); release(hWg); release(hbg); release(hWo); release(hbo);
+  release(gAct); if (!shared) release(gBs);
+  release(gqs); release(gqo); release(gbs); release(gbo_); release(gf2);
+  release(gWq); release(gWk); release(gWv); release(gWg); release(gbg); release(gWo); release(gbo);
 }
 
 // ---------------------------------------------------------------- TriangleMultiplication, the whole module
@@ -781,7 +1075,7 @@ static void triCase(int N, int C, int I, bool outgoing) {
     }
     char lab[200];
     snprintf(lab, sizeof lab, "trimul %s %s", what, shape);
-    report(lab, relRmsD(fd, mine), 3e-5);
+    reportGrad(lab, fd, mine, 3e-5);
   };
 
   probe("dPair", pair, download((const float*)gPair, n2 * C), 5);
@@ -824,6 +1118,13 @@ int main() {
   attnCase(5, 10, 14, 3, 8);       // Q != K, as MSA attention has
   attnCase(4, 9, 9, 2, 64);        // the widest head this path holds
   attnCase(3, 7, 7, 8, 16);
+  printf("Attention module backward (projections, gate, output)\n");
+  attnModCase(5, 9, 9, 16, 16, 4, 8, 16, true, true);    // self-attention with gating: what AF2 runs
+  attnModCase(4, 8, 8, 12, 12, 2, 16, 12, false, true);  // ungated, as the triangle's config can be
+  attnModCase(4, 7, 10, 12, 14, 3, 8, 10, true, false);  // cross: separate q_data and m_data
+  printf("biased self-attention (MSARowAttentionWithPairBias / TriangleAttention)\n");
+  biasedCase(7, 7, 12, 12, 3, 8, 12, true);    // TriangleAttention: one LayerNorm, bias from the attended tensor
+  biasedCase(5, 6, 10, 14, 2, 8, 10, false);   // MSARowAttentionWithPairBias: two, and the bias from the pair
   printf("TriangleMultiplication backward (the whole module)\n");
   triCase(10, 16, 12, true);
   triCase(10, 16, 12, false);

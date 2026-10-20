@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <utility>
 
 namespace mt {
 
@@ -236,6 +238,126 @@ void attentionBwd(const float* q, const float* k, const float* v, const float* m
     AttnBwdArgs p = a; p.dPairBias = dPairBias; p.n = n;
     run1d("lf_attn_bwd_dbias", n, p);
   }
+}
+
+void attentionModuleBwd(const float* qData, const float* mData, const float* maskBias, const float* pairBias,
+                        const AttnModuleWeights& w, const float* dOut,
+                        float* dQData, float* dMData, float* dPairBias,
+                        int B, int Q, int K, int Cq, int Cm, int H, int D, int O,
+                        const AttnModuleGrads& g) {
+  if (!B || !Q) return;
+  const bool same = dQData == dMData;
+  if (same && (Q != K || Cq != Cm)) {
+    fprintf(stderr, "design: attentionModuleBwd got one cotangent for q and m, but Q!=K or Cq!=Cm\n");
+    exit(1);
+  }
+  const size_t qrows = (size_t)B * Q, krows = (size_t)B * K;
+  const int W = H * D;
+  const float scale = 1.f / std::sqrt((float)D);
+
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.attnm.") + name, n * sizeof(float));
+  };
+  float* qs = buf("qs", qrows * W);
+  float* kk = buf("k", krows * W);
+  float* vv = buf("v", krows * W);
+  float* wa = buf("wa", qrows * W);
+  float* L = buf("L", (size_t)B * H * Q);
+  float* gpre = buf("gpre", qrows * W);
+  float* dwa = buf("dwa", qrows * W);
+  float* dwa2 = buf("dwa2", qrows * W);
+  float* dgpre = buf("dgpre", qrows * W);
+  float* dqs = buf("dqs", qrows * W);
+  float* dkk = buf("dk", krows * W);
+  float* dvv = buf("dv", krows * W);
+
+  auto lin = [&](const float* X, const float* Wm, const float* b, float* Y, size_t rows, int in, int out) {
+    Gemm gm{}; gm.X = X; gm.W = Wm; gm.Y = Y; gm.rows = rows; gm.in = in; gm.out = out; gm.bias = b; gemm(gm);
+  };
+
+  // -------- the forward, recomputed
+  lin(qData, w.Wq, nullptr, qs, qrows, Cq, W);
+  run1d("lf_scale", qrows * W, ScaleArgs{qs, qrows * W, scale, 0});
+  lin(mData, w.Wk, nullptr, kk, krows, Cm, W);
+  lin(mData, w.Wv, nullptr, vv, krows, Cm, W);
+  attentionFwdSaved(qs, kk, vv, maskBias, pairBias, wa, L, B, Q, K, H, D);
+  if (w.Wg) lin(qData, w.Wg, w.bg, gpre, qrows, Cq, W);
+
+  // -------- the output projection, then the gate
+  const float* waOut = wa;
+  if (w.Wg) {
+    run1d("lf_mul_sigmoid", qrows * W, MulSigmoidArgs{wa, gpre, dwa2, qrows * (size_t)W});
+    waOut = dwa2;                             // the gated activation the output projection actually consumed
+  }
+  linearBwd(waOut, w.Wo, dOut, dwa, g.Wo, g.bo, qrows, W, O);
+
+  bool wrote = false;                          // whether dQData has been written yet (the rest accumulate)
+  if (w.Wg) {
+    gateBwd(dwa, wa, gpre, dwa2, dgpre, qrows * (size_t)W);
+    linearBwd(qData, w.Wg, dgpre, dQData, g.Wg, g.bg, qrows, Cq, W, false);
+    wrote = true;
+    std::swap(dwa, dwa2);                      // dwa is now the cotangent of the UNgated attention output
+  }
+
+  // -------- the core
+  attentionBwd(qs, kk, vv, maskBias, pairBias, wa, L, dwa, dqs, dkk, dvv, dPairBias, B, Q, K, H, D);
+
+  // -------- and back through the three projections. q's carries AF2's scale.
+  run1d("lf_scale", qrows * W, ScaleArgs{dqs, qrows * W, scale, 0});
+  linearBwd(qData, w.Wq, dqs, dQData, g.Wq, nullptr, qrows, Cq, W, wrote);
+  wrote = true;
+  linearBwd(mData, w.Wk, dkk, dMData, g.Wk, nullptr, krows, Cm, W, same ? true : false);
+  linearBwd(mData, w.Wv, dvv, dMData, g.Wv, nullptr, krows, Cm, W, true);
+}
+
+void biasedSelfAttentionBwd(const float* act, const float* biasSrc, const float* mask,
+                            int B, int Q, int Cq, int Cb, int H, int D, int O,
+                            const BiasedAttnWeights& w, const float* dOut,
+                            float* dAct, float* dBiasSrc, const BiasedAttnGrads& g) {
+  if (!B || !Q) return;
+  const int K = Q;                            // self-attention
+  const bool shared = biasSrc == act;         // TriangleAttention: the bias source IS the attended tensor
+  const size_t rows = (size_t)B * Q;
+  const size_t nbRows = (size_t)Q * K;
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.battn.") + name, n * sizeof(float));
+  };
+  float* actN = buf("actN", rows * Cq);
+  float* biasN = shared ? actN : buf("biasN", nbRows * Cb);
+  float* nbRow = buf("nbRow", nbRows * H);
+  float* nb = buf("nb", nbRows * H);
+  float* maskBias = buf("maskBias", (size_t)B * K);
+  float* dActN = buf("dActN", rows * Cq);
+  float* dNb = buf("dNb", nbRows * H);
+  float* dNbRow = buf("dNbRow", nbRows * H);
+
+  // -------- the forward, recomputed
+  run1d("lf_affine", (size_t)B * K, AffineArgs{mask, maskBias, (size_t)B * K, 1e9f, -1e9f, 0});
+  layerNorm(act, actN, rows, Cq, w.qScale, w.qOffset);
+  if (!shared) layerNorm(biasSrc, biasN, nbRows, Cb, w.bScale, w.bOffset);
+  {
+    Gemm gm{}; gm.X = biasN; gm.W = w.feat2dW; gm.Y = nbRow;
+    gm.rows = nbRows; gm.in = Cb; gm.out = H; gemm(gm);          // [Q * K][H]
+  }
+  run1d("lf_tri_pack", nbRows * H, TriPackArgs{nbRow, nb, nbRows * H, nbRows, (uint)H, 0});   // -> [H][Q * K]
+
+  // -------- the attention module. Self-attention, so one cotangent for q_data and m_data.
+  attentionModuleBwd(actN, actN, maskBias, nb, w.attn, dOut, dActN, dActN, dNb,
+                     B, Q, K, Cq, Cq, H, D, O, g.attn);
+
+  // -------- the bias's linear: [H][Q * K] back to [Q * K][H], then through feat2dW
+  run1d("lf_tri_unpack", nbRows * H, TriPackArgs{dNb, dNbRow, nbRows * H, nbRows, (uint)H, 0});
+  if (shared) {
+    // the same tensor feeds the attention and the bias, so this accumulates into the attention's own cotangent
+    linearBwd(biasN, w.feat2dW, dNbRow, dActN, g.feat2dW, nullptr, nbRows, Cb, H, true);
+  } else {
+    float* dBiasN = buf("dBiasN", nbRows * Cb);
+    linearBwd(biasN, w.feat2dW, dNbRow, dBiasN, g.feat2dW, nullptr, nbRows, Cb, H, false);
+    layerNormBwd(biasSrc, dBiasN, dBiasSrc, nbRows, Cb, w.bScale, g.bScale, g.bOffset);
+  }
+
+  // -------- and the attended tensor's own LayerNorm
+  layerNormBwd(act, dActN, dAct, rows, Cq, w.qScale, g.qScale, g.qOffset);
 }
 
 // a batched GEMM over the channel: every operand is [batch][rows * in] with one plane a channel
