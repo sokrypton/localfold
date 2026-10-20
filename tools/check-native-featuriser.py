@@ -138,6 +138,13 @@ def cases():
                                                {"modificationType": "6MA", "basePosition": 2}]}},
                                            {"rna": {"id": "C", "sequence": "GACUGA", "modifications": [
                                                {"modificationType": "2MG", "basePosition": 1}]}}]), [], AF3_FAMILIES),
+        # (a protein and an RNA chain, each with its own alignment inline - boltz2 and rf3 read the protein's alone)
+        ("prot-rna-inline-msa", "af3", job("t", [
+            protein("A", "GWSTELEKHREELKEFLKKEG", unpairedMsa=">q\nGWSTELEKHREELKEFLKKEG\n>p1\nGWSTELEKHREELKEFLKKEA\n"
+                                                         ">p2\nGWSTEL-KHREELKEFLKKEG\n>p3\nGWSTEL-KHREELKEFLKKEG\n",
+                    pairedMsa=""),
+            {"rna": {"id": "B", "sequence": "GGCUAGCC", "unpairedMsa": ">q\nGGCUAGCC\n>r1\nGGCUAGCA\n>r2\nGG-UAGCC\n"}},
+            {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}]), [], AF3_FAMILIES),
         ("glycan-standalone", "af3", job("t", [protein("A", "MKTAYIAKQR"), {"ligand": {"id": "B", "ccdCodes": ["NAG"]}},
                                                {"ligand": {"id": "C", "ccdCodes": ["NAG", "BMA"]}}],
                                          bondedAtomPairs=[[["C", 1, "O4"], ["C", 2, "C1"]]]), [], AF3_FAMILIES),

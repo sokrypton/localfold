@@ -381,7 +381,7 @@ inline void confidencePlddt(ConfidenceOut& out, const float* single, int n, int 
   expectationK<<<blocks((size_t)n * dense), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * dense, PB, dpc, 0, 100.f);
   out.plddt = download(plddt, (size_t)n * dense);
   CK(cudaFree(dpc));
-  const float* mask = M.f("batch.refMask");
+  const float* mask = M.f("batch.predDenseAtomMask");
   double sum = 0, count = 0;
   for (size_t i = 0; i < out.plddt.size(); ++i) if (mask[i]) { sum += out.plddt[i]; count += 1; }
   out.meanPlddt = sum / std::max(count, 1.0);

@@ -99,7 +99,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
   e.t(p + "refPos", b.refPos); e.t(p + "refMask", b.refMask); e.i(p + "refElement", b.refElement);
   e.t(p + "refCharge", b.refCharge); e.i(p + "refAtomNameChars", b.refAtomNameChars); e.i(p + "refSpaceUid", b.refSpaceUid);
   e.i(p + "displayAtomNameChars", b.displayAtomNameChars);
-  e.t(p + "predDenseAtomMask", b.refMask);
+  e.t(p + "predDenseAtomMask", b.predDenseAtomMask);
   if (b.hasBonds) {
     if (withBondMatrix) e.t(p + "bondMatrix", b.bondMatrix);
     e.t(p + "bondOrderMatrix", b.bondOrderMatrix);

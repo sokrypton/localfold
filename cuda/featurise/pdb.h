@@ -56,7 +56,7 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
     auto ligand = componentOf.find(token);
     for (int atom = 0; atom < b.dense; ++atom) {
       int slot = token * b.dense + atom;
-      if (!b.refMask[slot]) continue;
+      if (!b.predDenseAtomMask[slot]) continue;
       if (ligand != componentOf.end() && atom == 0) serialOfToken[token] = serial;
       std::string name = atomName(slot);
       int residue = b.residueOfToken[token];

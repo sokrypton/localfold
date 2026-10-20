@@ -41,6 +41,11 @@ struct FamilyFlags {
   bool keepLigandLeavingAtoms;      // boltz2, intellifold2, chai1: a ligand's glycan keeps its O1 (glycanO1Leaving)
   bool dnaGapMsa;                   // openbind0: a DNA chain gap in every MSA row, DNA and ligand profiles zero
   bool modifiedLeavingAtEnds;       // openbind0: a modified residue's CCD leaving atoms at the chain ends too
+  bool modifiedNucleotideKeepsOp3;  // intellifold2, chai1: a modified nucleotide keeps its OP3 mid-chain
+  bool modifiedProteinLetter;       // intellifold2: a modified residue's restype its CCD one-letter code
+  bool unresolvedLeavingAtoms;      // chai1: a ligand's leaving group at a declared bond a token it does not place
+  bool ligandMsaUnk;                // boltz2: a ligand token's MSA query row the protein UNK, not the gap
+  bool proteinOnlyMsa, zeroDeletions, profileOverAllRows;   // boltz2 (rf3: the first): its alignment, featurise.js
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

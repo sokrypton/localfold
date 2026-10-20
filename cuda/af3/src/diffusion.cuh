@@ -1421,7 +1421,7 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   stage("d.conditioning");
   dtap("conditioning.single", cond.single, (size_t)n * (int)M.meta("diffusion.conditioning.seqChannels"));
   dtap("conditioning.pair", cond.pair, (size_t)n * n * (int)M.meta("diffusion.conditioning.pairChannels"));
-  const float* atomMask = Fdev("batch.refMask");
+  const float* atomMask = Fdev("batch.predDenseAtomMask");
   float* scaled = scratch<float>("dn.scaled", total * 3);
   scalePositionsK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, atomMask, scaled, total, atoms, noiseParams);
   // (the tokens split: the atom blocks on this rank's subsets and their halo - the encoder's wide enough that the

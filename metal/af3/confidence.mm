@@ -221,7 +221,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   out.plddt = download(plddt, (size_t)n * dense);
   out.pae = download(pae, pairs);
   out.pde = download(pde, pairs);
-  const float* mask = M.hostF("batch.refMask");
+  const float* mask = M.hostF("batch.predDenseAtomMask");
   double sum = 0, count = 0;
   for (size_t i = 0; i < out.plddt.size(); ++i) if (mask[i]) { sum += out.plddt[i]; count += 1; }
   out.meanPlddt = sum / std::max(count, 1.0);

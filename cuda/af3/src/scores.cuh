@@ -74,7 +74,7 @@ inline std::vector<ScoreAtom> scoreAtoms(const std::string& dataDir) {
                                 "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"};
   int n = (int)M.meta("batch.tokens"), dense = (int)M.meta("batch.dense");
   const int* aatype = M.i("batch.aatype"); const int* names = M.i("batch.refAtomNameChars");
-  const int* elem = M.i("batch.refElement"); const float* mask = M.f("batch.refMask");
+  const int* elem = M.i("batch.refElement"); const float* mask = M.f("batch.predDenseAtomMask");
   const int* chain = M.i("batch.asymId"); const int* resIdx = M.i("batch.residueIndex");
   for (int t = 0; t < n; ++t) for (int k = 0; k < dense; ++k) {
     size_t i = (size_t)t * dense + k;

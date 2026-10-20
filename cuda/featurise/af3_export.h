@@ -535,6 +535,9 @@ inline Af3Export exportAf3(const Args& args) {
   o.ccdUnknownResidue = D.ccdUnknownResidue; o.declaredBondFeature = D.declaredBondFeature; o.chaiConformers = D.chaiConformers;
   o.declaredBondLeavingAtoms = D.declaredBondLeavingAtoms; o.keepLigandLeavingAtoms = D.keepLigandLeavingAtoms;
   o.dnaGapMsa = D.dnaGapMsa; o.modifiedLeavingAtEnds = D.modifiedLeavingAtEnds;
+  o.modifiedNucleotideKeepsOp3 = D.modifiedNucleotideKeepsOp3; o.modifiedProteinLetter = D.modifiedProteinLetter;
+  o.unresolvedLeavingAtoms = D.unresolvedLeavingAtoms; o.ligandMsaUnk = D.ligandMsaUnk;
+  o.proteinOnlyMsa = D.proteinOnlyMsa; o.zeroDeletions = D.zeroDeletions; o.profileOverAllRows = D.profileOverAllRows;
   o.translateConformers = D.translateConformers; o.conformerSeed = jsParseFloat(args.option("seed", "20260831"));
   o.paddedAtomKeys = D.paddedAtomKeys; o.qblockAtomKeys = D.qblockAtomKeys;
   o.atomizedElementNames = D.atomizedElementNames; o.atomizedUnknownRestype = D.atomizedUnknownRestype;

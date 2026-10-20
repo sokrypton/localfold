@@ -440,7 +440,7 @@ static float* denoise(const float* x, float level) {
   float* single = heldAt != D.held.end() ? D.heldSingle + (size_t)(heldAt - D.held.begin()) * n * metaI("diffusion.conditioning.seqChannels")
                                          : singleConditioning(level);
   stage("conditioning");
-  const float* atomMask = M.f("batch.refMask");
+  const float* atomMask = M.f("batch.predDenseAtomMask");
   float* scaled = scratch<float>("dn.scaled", total * 3);
   run1d("af3_scale_positions", total * 3, ScalePosArgs{x, atomMask, scaled, total, atoms, in, 0});
   encoderStep("diffusion.encoder", D.enc, scaled);

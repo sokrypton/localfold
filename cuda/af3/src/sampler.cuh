@@ -437,7 +437,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
                                "P", "S", "Cl"};
   int n = (int)M.meta("batch.tokens"), dense = (int)M.meta("batch.dense");
   const int* aatype = M.i("batch.aatype"); const int* names = M.i("batch.refAtomNameChars");
-  const int* elem = M.i("batch.refElement"); const float* mask = M.f("batch.refMask");
+  const int* elem = M.i("batch.refElement"); const float* mask = M.f("batch.predDenseAtomMask");
   const int* chain = M.i("batch.asymId"); const int* resIdx = M.i("batch.residueIndex");
   FILE* f = fopen(path.c_str(), "w");
   if (!f) { fprintf(stderr, "cannot write %s: %s\n", path.c_str(), strerror(errno)); exit(1); }

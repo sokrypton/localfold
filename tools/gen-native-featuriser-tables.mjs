@@ -76,7 +76,7 @@ for (const [name, d] of Object.entries(DIALECTS)) {
     + ` ${d.emptyTemplateRestypeColumns === undefined ? 0 : d.emptyTemplateRestypeColumns === null ? 1 : 2},`
     + ` {${(d.emptyTemplateRestypeColumns ?? []).join(", ")}}, ${bool(f.rawLastConformer)},`
     + ` ${({ all: 1, discontinuous: 2, ligand: 3 })[f.declaredPolymerBonds] ?? 0}, ${bool(d.templateGapWhereNoAtoms)},`
-    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}, ${bool(f.keepLigandLeavingAtoms)}, ${bool(f.dnaGapMsa)}, ${bool(f.modifiedLeavingAtEnds)}},`);
+    + ` ${bool(f.ccdUnknownResidue)}, ${f.mainMsaCap ?? 0}, ${bool(f.declaredBondFeature)}, ${bool(f.chaiConformers)}, ${bool(f.nativeNonproteinMsa)}, ${bool(f.translateConformers)}, ${bool(f.declaredBondLeavingAtoms)}, ${bool(f.keepLigandLeavingAtoms)}, ${bool(f.dnaGapMsa)}, ${bool(f.modifiedLeavingAtEnds)}, ${bool(f.modifiedNucleotideKeepsOp3)}, ${bool(f.modifiedProteinLetter)}, ${bool(f.unresolvedLeavingAtoms)}, ${bool(f.ligandMsaUnk)}, ${bool(f.proteinOnlyMsa)}, ${bool(f.zeroDeletions)}, ${bool(f.profileOverAllRows)}},`);
 }
 lines.push("  };", "  return table;", "}", "");
 lines.push("// shared/af3/featurise/boltz2-conformers.js BOLTZ2_RAW_CONFORMERS");

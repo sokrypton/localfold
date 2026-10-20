@@ -146,3 +146,32 @@ export function glycanO1Leaving(chainCount, ligands, bonds) {
     return withoutAtoms(ligand, drop);
   });
 }
+
+/**
+ * chai-1's leaving groups at a declared bond on a LIGAND (`unresolvedLeavingAtoms`, af3-any-model's
+ * _unresolved_leaving_atoms): stock chai keeps them as tokens with reference features - its atom_ref_mask - and does
+ * not place them (atom_exists_mask false), so a NAG bonded to an Asn keeps O1 as a token the model never predicts.
+ * The groups declaredBondLeaving would drop, as each ligand's atom indices.
+ */
+export function declaredLigandLeavingAtoms(chainCount, ligands, bonds) {
+  const count = new Map();
+  for (const bond of bonds ?? []) {
+    for (const end of [bond.from, bond.to]) {
+      if (end.atom === undefined || end.atom === null || end.atom === "") continue;
+      const key = `${end.asym}\u0000${end.residue}\u0000${end.atom}`;
+      count.set(key, (count.get(key) ?? 0) + 1);
+    }
+  }
+  const out = ligands.map(() => new Set());
+  for (const [key, n] of count) {
+    const [asymText, residueText, atom] = key.split("\u0000");
+    const k = Number(asymText) - chainCount;
+    const ligand = ligands[k];
+    if (k < 0 || ligand === undefined) continue;
+    const parts = ligand.residues ?? [{ from: 0, count: ligand.atoms.length }];
+    const part = parts.length === 1 ? parts[0] : parts[Number(residueText) - 1];
+    if (part === undefined) continue;
+    for (const a of leavingGroups(ligand, part.from, part.count, atom, n)) out[k].add(a);
+  }
+  return out;
+}

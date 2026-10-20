@@ -92,6 +92,13 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       ? {} : { keepLigandLeavingAtoms: options.keepLigandLeavingAtoms }),
     ...(options.dnaGapMsa === undefined ? {} : { dnaGapMsa: options.dnaGapMsa }),
     ...(options.modifiedLeavingAtEnds === undefined ? {} : { modifiedLeavingAtEnds: options.modifiedLeavingAtEnds }),
+    ...(options.modifiedNucleotideKeepsOp3 === undefined ? {} : { modifiedNucleotideKeepsOp3: options.modifiedNucleotideKeepsOp3 }),
+    ...(options.modifiedProteinLetter === undefined ? {} : { modifiedProteinLetter: options.modifiedProteinLetter }),
+    ...(options.unresolvedLeavingAtoms === undefined ? {} : { unresolvedLeavingAtoms: options.unresolvedLeavingAtoms }),
+    ...(options.ligandMsaUnk === undefined ? {} : { ligandMsaUnk: options.ligandMsaUnk }),
+    ...(options.proteinOnlyMsa === undefined ? {} : { proteinOnlyMsa: options.proteinOnlyMsa }),
+    ...(options.zeroDeletions === undefined ? {} : { zeroDeletions: options.zeroDeletions }),
+    ...(options.profileOverAllRows === undefined ? {} : { profileOverAllRows: options.profileOverAllRows }),
     // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
     // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
     // `paddedAtomKeys` in dialect.js.

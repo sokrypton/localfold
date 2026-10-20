@@ -123,7 +123,7 @@ ConfidenceOut structuralConfidence(const Structural& st, const float* coords, st
   };
   ck.ptm = reduce(false); ck.iptm = reduce(true);
   ck.tmTerm = term;
-  const float* am = M.hostF("batch.refMask");
+  const float* am = M.hostF("batch.predDenseAtomMask");
   double sum = 0, count = 0;
   for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
   ck.meanPlddt = sum / std::max(count, 1.0);
@@ -224,7 +224,7 @@ int foldInput(const std::string& dir, Options o) {
   double d0 = now();
   if (structural) prepareDiffusion(st.single, st.pair, st.targetFeat, st.masks, nD);
   else prepareDiffusion(t.single, t.pair, flag("trunk.dialect.chaiTokenEmbedding") ? TARGET_FEAT_STRUCTURE : t.targetFeat, t.masks, n);
-  std::vector<float> mask(M.hostF("batch.refMask"), M.hostF("batch.refMask") + (size_t)nD * dense);
+  std::vector<float> mask(M.hostF("batch.predDenseAtomMask"), M.hostF("batch.predDenseAtomMask") + (size_t)nD * dense);
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
   std::vector<std::pair<uint64_t, int>> runs;

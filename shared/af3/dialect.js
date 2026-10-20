@@ -84,6 +84,18 @@ export const ALPHAFOLD3 = Object.freeze({
   dnaGapMsa: false,
   // a modified residue's CCD leaving atoms dropped at the chain ends too (openbind0: of3's leaving_all)
   modifiedLeavingAtEnds: false,
+  // a modified nucleotide keeps its OP3 mid-chain (intellifold2, chai1), and a modified residue's restype is its
+  // CCD one-letter code through the protein table whatever the chain (intellifold2: modified_restype protein_letter)
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  // a ligand's leaving group at a declared bond kept as a token the model does not place (chai1)
+  unresolvedLeavingAtoms: false,
+  // a ligand token's MSA query row the protein UNK, not the gap (boltz2: its res_type)
+  ligandMsaUnk: false,
+  // boltz2's alignment (_boltz_msa): its protein chains' only, no deletion kept, a profile over every row
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -346,6 +358,13 @@ export const OPENBIND0 = Object.freeze({
   keepLigandLeavingAtoms: true,   // (of3 builds a CCD ligand whole: an unbonded sugar keeps O1)
   dnaGapMsa: true,
   modifiedLeavingAtEnds: true,
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: false,
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
   // deletion mean included (OpenFold3's max_seq_counts colabfold_main; af3-any-model b84aa69). msa-features.js
   mainMsaCap: 16384,
@@ -502,6 +521,13 @@ export const OPENDDE = Object.freeze({
   keepLigandLeavingAtoms: true,   // (an unbonded sugar keeps O1: af3-any-model colab, against its batch)
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: false,
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -772,6 +798,13 @@ export const PROTENIX2 = Object.freeze({
   keepLigandLeavingAtoms: true,   // (an unbonded sugar keeps O1: af3-any-model colab, against its batch)
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: false,
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -978,6 +1011,13 @@ export const BOLTZ2 = Object.freeze({
   keepLigandLeavingAtoms: true,
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: true,
+  proteinOnlyMsa: true,
+  zeroDeletions: true,
+  profileOverAllRows: true,
   mainMsaCap: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
   // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
@@ -1076,6 +1116,13 @@ export const INTELLIFOLD2 = Object.freeze({
   keepLigandLeavingAtoms: true,
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: true,
+  modifiedProteinLetter: true,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: false,
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1264,6 +1311,13 @@ export const ROSETTAFOLD3 = Object.freeze({
   keepLigandLeavingAtoms: true,   // (an unbonded sugar keeps O1: af3-any-model colab, against its batch)
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: false,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: false,
+  ligandMsaUnk: true,   // (atomworks: a token with no alignment reads its restype in row 0, UNK for a ligand)
+  proteinOnlyMsa: true,   // (atomworks: one a3m per PROTEIN entity)
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: true,
   // 🔴 ONE FORWARD OVER THE MEAN OF THE PRESENT TEMPLATES' FEATURES, where
@@ -1383,6 +1437,13 @@ export const CHAI1 = Object.freeze({
   keepLigandLeavingAtoms: true,
   dnaGapMsa: false,
   modifiedLeavingAtEnds: false,
+  modifiedNucleotideKeepsOp3: true,
+  modifiedProteinLetter: false,
+  unresolvedLeavingAtoms: true,
+  ligandMsaUnk: false,
+  proteinOnlyMsa: false,
+  zeroDeletions: false,
+  profileOverAllRows: false,
   mainMsaCap: null,
   rosettafold3TemplateFeatures: false,
   templateFeatureMeanOnePass: false,
@@ -1529,6 +1590,13 @@ export function featuriserDialect(dialect) {
     keepLigandLeavingAtoms: dialect.keepLigandLeavingAtoms,
     dnaGapMsa: dialect.dnaGapMsa,
     modifiedLeavingAtEnds: dialect.modifiedLeavingAtEnds,
+    modifiedNucleotideKeepsOp3: dialect.modifiedNucleotideKeepsOp3,
+    modifiedProteinLetter: dialect.modifiedProteinLetter,
+    unresolvedLeavingAtoms: dialect.unresolvedLeavingAtoms,
+    ligandMsaUnk: dialect.ligandMsaUnk,
+    proteinOnlyMsa: dialect.proteinOnlyMsa,
+    zeroDeletions: dialect.zeroDeletions,
+    profileOverAllRows: dialect.profileOverAllRows,
     mainMsaCap: dialect.mainMsaCap,
     paddedAtomKeys: dialect.paddedAtomKeys,
     qblockAtomKeys: dialect.qblockAtomKeys,

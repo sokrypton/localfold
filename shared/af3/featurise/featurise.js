@@ -45,7 +45,7 @@ import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
 import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
 import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
 import { uniformFrom } from "../random.js";
-import { declaredBondLeaving, glycanO1Leaving } from "./declared-leaving.js";
+import { declaredBondLeaving, declaredLigandLeavingAtoms, glycanO1Leaving } from "./declared-leaving.js";
 import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
@@ -234,6 +234,14 @@ export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot,
  *   same length as the
  *   sequence. The query is always row zero and is prepended here.
  */
+// IntelliFold's restype for a modified residue (modifiedProteinLetter): its CCD one-letter code in AF3's amino-acid
+// order, else the unknown amino acid
+const PROTEIN_LETTERS = "ARNDCQEGHILKMFPSTWYV";
+function proteinLetterAatype(letter) {
+  const at = letter === null || letter === undefined || letter.length !== 1 ? -1 : PROTEIN_LETTERS.indexOf(letter);
+  return at >= 0 ? at : 20;
+}
+
 export function featuriseProtein(sequence, options = {}) {
   const chains = sequence.split(":").filter((chain) => chain.length > 0);
   const joined = chains.join("");
@@ -301,9 +309,14 @@ export function featuriseProtein(sequence, options = {}) {
       // (OpenBind-0, `modifiedLeavingAtEnds`: of3 drops a non-standard residue's CCD leaving atoms wherever it sits,
       // ends included - a 5' 2-methylguanosine loses its OP3 - and a component flagging none loses OXT, or OP3/O3P)
       const atEnds = options.modifiedLeavingAtEnds === true;
-      const source = asked === null || !atEnds || asked.atoms.some((atom) => atom.leaving) ? asked
+      let source = asked === null || !atEnds || asked.atoms.some((atom) => atom.leaving) ? asked
         : { ...asked, atoms: asked.atoms.map((atom) => ({ ...atom,
           leaving: protein ? atom.name === "OXT" : atom.name === "OP3" || atom.name === "O3P" })) };
+      // (IntelliFold-2 and chai-1, `modifiedNucleotideKeepsOp3`: a modified nucleotide keeps its OP3 mid-chain -
+      // IntelliFold's parse_ccd_residue keeps every CCD heavy atom but OXT, chai-lab keeps a non-standard base's OP3)
+      if (source !== null && !protein && options.modifiedNucleotideKeepsOp3 === true) {
+        source = { ...source, atoms: source.atoms.map((atom) => (atom.name === "OP3" ? { ...atom, leaving: false } : atom)) };
+      }
       const modification = asked === null ? null
         : polymerResidue(source, (protein ? at === chain.length - 1 : at === 0) && !dropsTerminal
           && options.modifiedAsOneToken !== true && !atEnds, protein ? "OXT" : "OP3");
@@ -547,8 +560,10 @@ export function featuriseProtein(sequence, options = {}) {
       // Boltz-2 keeps every atom of a modified residue (it has no 24-slot layout). 2'-O-methylguanosine's holes put its
       // C4 at slot 24, and dropping it - af3-any-model's boltz2 does - lost the purine's pseudo-beta atom and three bonds
       // and stretched O2'-CM2 to 2.66 A (genuine Boltz-2 2.2.1: 1.61). af3-any-model packs it the same way since 2026-10-18.
-      const packed = modification.atoms.some((one, at) => (one.componentSlot ?? at) >= DENSE);
-      const slotOf = (one, at) => (packed ? at : (one.componentSlot ?? at));
+      // 🔴 AND NO HOLES: genuine Boltz-2 lists a residue's kept atoms in order (it has no slot table), so a removed
+      // leaving atom leaves no gap - a mid-chain phosphoserine is N,CA,CB,OG,C,O,P,O1P,O2P,O3P (af3-any-model colab,
+      // e2a2246, measured against stock Boltz 2.2.1; this held the component slot, OXT's empty, until 2026-10-20).
+      const slotOf = (one, at) => at;
       for (let atom = 0; atom < modification.atoms.length; atom += 1) {
         const source = modification.atoms[atom];
         // 🔴 THE COMPONENT'S OWN SLOT, NOT A COMPACTED ONE. A removed leaving
@@ -603,7 +618,10 @@ export function featuriseProtein(sequence, options = {}) {
       // ("chai": an amino acid's 20, a nucleotide's the unknown nucleotide, 30 - chai-lab's DX/RX)
       // ("aatype": OpenBind-0's - the unknown amino acid on every atomised token, a base's too, and the alignment keeps
       // the sequence letter: of3 sets UNK on restype alone)
-      aatype[token] = options.atomizedUnknownRestype === "nucleic" || options.atomizedUnknownRestype === "aatype"
+      // ("modifiedProteinLetter": IntelliFold-2's - the CCD one-letter code through the PROTEIN table, else the
+      // unknown amino acid, whatever the chain: 5CM ('C') is a cysteine, PSU ('U') protein UNK)
+      aatype[token] = options.modifiedProteinLetter === true ? proteinLetterAatype(modification.oneLetter)
+        : options.atomizedUnknownRestype === "nucleic" || options.atomizedUnknownRestype === "aatype"
         || ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai") && kind === "protein")
         ? UNK_AATYPE : options.atomizedUnknownRestype === "chai" ? UNKNOWN_NUCLEOTIDE : parentAatype(kind, code);
       residueIndex[token] = number;
@@ -1028,7 +1046,14 @@ export function featuriseProtein(sequence, options = {}) {
       for (let at = 0; at < span.count; at += 1) queryRow[span.from + at] = parent;
     }
   }
-  for (let token = polymerTokens; token < tokens; token += 1) queryRow[token] = MSA_GAP;
+  // (IntelliFold-2's protein-letter restype is its query row too, and so its profile)
+  if (options.modifiedProteinLetter === true) {
+    for (const span of modifiedSpans) {
+      queryRow.fill(proteinLetterAatype(residues[span.residue].modification.oneLetter), span.from, span.from + span.count);
+    }
+  }
+  // (boltz2's query row on a ligand token is its res_type, protein UNK, where AF3 writes the gap: `ligandMsaUnk`)
+  for (let token = polymerTokens; token < tokens; token += 1) queryRow[token] = options.ligandMsaUnk === true ? UNK_AATYPE : MSA_GAP;
   msa.set(queryRow, 0);
   // ...and again, for the families whose two blocks each contribute it.
   if (duplicateQuery) msa.set(queryRow, tokens);
@@ -1082,6 +1107,37 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
+  // 🔴 boltz2's ALIGNMENT IS ITS PROTEIN CHAINS' (`proteinOnlyMsa`, af3-any-model's _boltz_msa as `boltz predict` builds
+  // it): a nucleic chain's own alignment is not read, so past the query it is gap in every row; and no deletion
+  // survives its mapping (`zeroDeletions`, _boltz_surviving_deletions keeps none).
+  if (options.proteinOnlyMsa === true) {
+    for (let row = 1; row < sequences; row += 1) {
+      for (let token = 0; token < polymerTokens; token += 1) {
+        if (!nucleicToken[token]) continue;
+        msa[row * tokens + token] = MSA_GAP;
+        deletionMatrix[row * tokens + token] = 0;
+      }
+    }
+  }
+  // (a row that was a nucleic chain's alone is then no row at all: boltz has none for it)
+  if (options.proteinOnlyMsa === true && sequences > 1) {
+    const keep = [0];
+    for (let row = 1; row < sequences; row += 1) {
+      let gap = true;
+      for (let token = 0; token < tokens && gap; token += 1) gap = msa[row * tokens + token] === MSA_GAP;
+      if (!gap) keep.push(row);
+    }
+    if (keep.length < sequences) {
+      const take = (array) => {
+        const out = new array.constructor(keep.length * tokens);
+        keep.forEach((row, at) => out.set(array.subarray(row * tokens, (row + 1) * tokens), at * tokens));
+        return out;
+      };
+      msa = take(msa); msaMask = take(msaMask); deletionMatrix = take(deletionMatrix);
+      sequences = keep.length;
+    }
+  }
+  if (options.zeroDeletions === true) deletionMatrix.fill(0);
   // profile: the column-wise restype frequency, and deletionMean the mean
   // deletion count.
   //
@@ -1135,7 +1191,8 @@ export function featuriseProtein(sequence, options = {}) {
   // alignment beyond itself - gets a profile of its own sequence: measured as
   // exactly 1.0 at restype 26 for a leading A. Letting it fall out of the loop
   // below would put that 1.0 at MSA_GAP instead, which says the chain is absent.
-  const ownProfile = (token) => nucleicToken[token] && msaColumnOfToken[token] < 0;
+  // (and every nucleic token's where the alignment is the protein chains' alone: boltz2's and rf3's `proteinOnlyMsa`)
+  const ownProfile = (token) => nucleicToken[token] && (msaColumnOfToken[token] < 0 || options.proteinOnlyMsa === true);
   // 🔴 EACH CHAIN'S PROFILE OVER ITS OWN ROWS, NOT THE MERGED BLOCK'S. AF3 computes it per chain
   // before stacking the chains' unpaired rows side by side, so the gap rows that pad a shorter
   // chain's alignment to the deepest one's are not part of it: a 3-row protein beside a 4-row RNA
@@ -1170,12 +1227,44 @@ export function featuriseProtein(sequence, options = {}) {
   for (let token = 0; token < tokens; token += 1) {
     if (ownProfile(token)) profile[token * RESTYPES + queryRow[token]] = 1;
   }
+  // (a ligand token whose query row is UNK has no other row: atomworks pads it, so its profile is UNK's one-hot)
+  if (options.ligandMsaUnk === true) {
+    for (let token = polymerTokens; token < tokens; token += 1) {
+      profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+      profile[token * RESTYPES + UNK_AATYPE] = 1;
+    }
+  }
 
   // 🔴 A SELF-MSA IS THE QUERY ONCE, for the families whose featurisers emit depth 1 (`dedupeSelfMsa`, which reaches
   // here as `duplicateQueryRow: false`) - and not only with no alignment: an A3M of the query alone gave the query and
   // its own copy, two identical rows, where af3-any-model's _dedupe_self_msa (and OpenDDE's and protenix's own
   // featurisers) leave one. Only where EVERY row is the query - beside real homologs the paired block's query is the
   // vendors' too (protenix's own 4-row A3M batch carries five rows). After the profile, which it does not change.
+  // ...and its profile and deletion mean are over EVERY row of that alignment, the query's included (boltz's
+  // msa_profile over its whole MSA), where AF3's are each chain's unpaired block. A row repeating an earlier one is
+  // counted once: boltz's parse_csv drops repeats, and this port's query reappears as its unpaired block's first row.
+  if (options.profileOverAllRows === true) {
+    const seen = new Set();
+    const rows = [];
+    // (keyed on the protein columns, the rows boltz builds: its query row 0 holds the nucleic chains' sequences too)
+    const proteinTokens = [];
+    for (let token = 0; token < polymerTokens; token += 1) if (!nucleicToken[token]) proteinTokens.push(token);
+    for (let row = 0; row < sequences; row += 1) {
+      const key = proteinTokens.map((token) => msa[row * tokens + token]).join(",");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(row);
+    }
+    profile.fill(0);
+    deletionMean.fill(0);
+    for (const row of rows) {
+      for (let token = 0; token < tokens; token += 1) {
+        const code = msa[row * tokens + token];
+        if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / rows.length;
+        deletionMean[token] += deletionMatrix[row * tokens + token] / rows.length;
+      }
+    }
+  }
   if (options.duplicateQueryRow === false && sequences > 1) {
     let self = true;
     for (let at = tokens; at < sequences * tokens && self; at += 1) self = msa[at] === msa[at % tokens];
@@ -1403,6 +1492,17 @@ export function featuriseProtein(sequence, options = {}) {
   for (const span of ligandSpans) isLigand.fill(1, span.from, span.from + span.count);
   for (const span of modifiedSpans) isModified.fill(1, span.from, span.from + span.count);
 
+  function unresolvedMask() {
+    if (options.unresolvedLeavingAtoms !== true) return refMask;
+    const mask = Float32Array.from(refMask);
+    const groups = declaredLigandLeavingAtoms(chains.length, ligands, options.bonds);
+    let base = polymerTokens;
+    ligands.forEach((ligand, k) => {
+      for (const atom of groups[k]) mask[(base + atom) * DENSE] = 0;
+      base += ligand.atoms.length;
+    });
+    return mask;
+  }
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
@@ -1416,7 +1516,8 @@ export function featuriseProtein(sequence, options = {}) {
     displayAtomNameChars,
     // AF3 keeps these separate and they are equal for a protein-only chain:
     // every atom the model predicts is one it has a reference conformer for.
-    predDenseAtomMask: refMask,
+    // (chai-1 alone keeps a ligand's leaving group at a declared bond as a token it does not place)
+    predDenseAtomMask: unresolvedMask(),
     bondMatrix, bondOrderMatrix, declaredBondMatrix, ligandSpans, modifiedSpans, residueOfToken,
     chainKinds, chainOfResidue, isDna, isRna, isLigand, isModified,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,

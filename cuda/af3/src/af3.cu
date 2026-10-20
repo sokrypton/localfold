@@ -331,7 +331,7 @@ static int foldMain(int argc, char** argv) {
     {
       std::vector<float> masked = c.plddt, theirs(M.f("oracle.confidence.stages.out.predicted_lddt"),
         M.f("oracle.confidence.stages.out.predicted_lddt") + c.plddt.size());
-      const float* am = M.f("batch.refMask");
+      const float* am = M.f("batch.predDenseAtomMask");
       for (size_t i = 0; i < masked.size(); ++i) if (!am[i]) masked[i] = theirs[i] = 0;
       printf("  %-24s relRMS %.3e\n", "  over real atoms", relRms(masked.data(), theirs.data(), masked.size()));
     }
@@ -644,7 +644,7 @@ static int foldMain(int argc, char** argv) {
       dS = st.single; dP = st.pair; dTf = st.targetFeat; dSeq = st.seqMask; nD = st.n;
     }
     int dense = (int)M.meta("batch.dense");
-    std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)nD * dense);
+    std::vector<float> mask(M.f("batch.predDenseAtomMask"), M.f("batch.predDenseAtomMask") + (size_t)nD * dense);
     // a large input gives each phase the whole card: a pair over 128 MB, 512 tokens at 128 channels
     // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
     bool tight = tightPair(pairs, t.C);
@@ -950,7 +950,7 @@ static int foldMain(int argc, char** argv) {
         };
         ck.ptm = reduce(false); ck.iptm = reduce(true);
         ck.tmTerm = term;
-        const float* am = M.f("batch.refMask");
+        const float* am = M.f("batch.predDenseAtomMask");
         double sum = 0, count = 0;
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);

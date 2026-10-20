@@ -45,6 +45,7 @@ struct Component {
   std::vector<CompPart> residues;  // ligandChain's; empty for one component
   bool smiles = false;             // built from a SMILES (shared/chem), not read from the dictionary
   bool glycan = false;             // _chem_comp.type names a saccharide (parseCcdComponent)
+  std::string oneLetter;           // _chem_comp.one_letter_code, "" for ? or absent
 };
 
 inline std::string trimWs(const std::string& s) {
@@ -260,6 +261,8 @@ inline Component parseCcdComponent(const std::string& text) {
   }
   std::string named = cifValue(text, "_chem_comp.mon_nstd_parent_comp_id");
   if (!named.empty() && named != "?" && named != ".") c.parent = upper(named.substr(0, named.find(',')));
+  std::string letter = cifValue(text, "_chem_comp.one_letter_code");
+  if (!letter.empty() && letter != "?" && letter != ".") c.oneLetter = upper(letter);
   // a glycan by its dictionary type, /\bsaccharide\b/ on the lowercased value (quoted, usually)
   const std::string key = "_chem_comp.type";
   for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + 1)) {
@@ -321,6 +324,7 @@ inline Component polymerResidue(const Component& comp, bool isTerminal, const st
   Component out;
   out.code = comp.code;
   out.parent = comp.parent;
+  out.oneLetter = comp.oneLetter;
   std::vector<int> renumbered(comp.atoms.size(), -1);
   int next = 0;
   for (size_t i = 0; i < comp.atoms.size(); ++i) {

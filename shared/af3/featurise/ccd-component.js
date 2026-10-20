@@ -226,7 +226,10 @@ export function parseCcdComponent(text) {
   // ligand residue's O1 unless O1 is itself bonded (glycanO1Leaving). The value is usually QUOTED, with a comma in it.
   const type = text.match(/_chem_comp\.type\s+(?:"([^"]*)"|'([^']*)'|(\S+))/);
   const glycan = type !== null && /\bsaccharide\b/.test((type[1] ?? type[2] ?? type[3]).toLowerCase());
-  return { code, atoms, bonds, parent, glycan };
+  // (its one-letter code, which IntelliFold reads through the PROTEIN table whatever the chain: modifiedProteinLetter)
+  const letter = text.match(/_chem_comp\.one_letter_code\s+(\S+)/)?.[1]?.replace(/['"]/g, "");
+  const oneLetter = letter === undefined || letter === "?" || letter === "." ? null : letter.toUpperCase();
+  return { code, atoms, bonds, parent, glycan, oneLetter };
 }
 
 /**
@@ -295,6 +298,7 @@ export function polymerResidue(component, isTerminal, terminalAtom = "OXT") {
   return {
     code: component.code,
     parent: component.parent ?? null,
+    oneLetter: component.oneLetter ?? null,
     // 🔴 EACH KEPT ATOM REMEMBERS ITS INDEX IN THE COMPONENT, because a
     // one-token modified residue is laid out by that index and NOT compacted.
     // AF3 leaves the removed atom's dense slot EMPTY: a phosphoserine in the
