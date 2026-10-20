@@ -9,6 +9,79 @@
 
 namespace mt {
 
+// ---------------------------------------------------------------- the heads, and the metrics
+void distogramHeadBwd(const float* pair, const float* W, const float* dLogits, int N, int Cz, int bins,
+                      float* dPair, float* dW, float* dbias) {
+  if (!N) return;
+  const size_t pr = (size_t)N * N;
+  float* dHalf = (float*)scratchBytes("design.head.dhalf", pr * bins * sizeof(float));
+  // logits = half + half^T, which is self-adjoint: each half entry gets its own cotangent and its transpose's
+  run1d("lf_sym_add", pr * bins, SymAddArgs{dLogits, dHalf, pr * (size_t)bins, (uint)N, (uint)bins, 0, 0});
+  linearBwd(pair, W, dHalf, dPair, dW, dbias, pr, Cz, bins);
+}
+
+void paeHeadBwd(const float* pair, const float* W, const float* dLogits, int N, int Cz, int bins,
+                float* dPair, float* dW, float* dbias) {
+  if (!N) return;
+  linearBwd(pair, W, dLogits, dPair, dW, dbias, (size_t)N * N, Cz, bins);
+}
+
+void paeMetricsBwd(const float* logits, const float* breaks, const float* residueWeights, const float* asymId,
+                   int N, int bins, const PaeMetricCotangents& d, float* dLogits) {
+  if (!N) return;
+  const size_t pr = (size_t)N * N;
+  auto buf = [&](const char* name, size_t n) {
+    return (float*)scratchBytes(std::string("design.pae.") + name, n * sizeof(float));
+  };
+  float* centers = buf("centers", bins);
+  float* tmPerBin = buf("tmPerBin", bins);
+  float* tmP = buf("tmP", pr);
+  float* normedP = buf("normedP", pr);
+  float* perAlignP = buf("perAlignP", N);
+  float* dPerAlignP = buf("dPerAlignP", N);
+  float* tmI = buf("tmI", pr);
+  float* normedI = buf("normedI", pr);
+  float* perAlignI = buf("perAlignI", N);
+  float* dPerAlignI = buf("dPerAlignI", N);
+
+  PaeArgs base{};
+  base.logits = logits; base.breaks = breaks; base.weights = residueWeights; base.asym = asymId;
+  base.centers = centers; base.tmPerBin = tmPerBin;
+  base.N = (uint)N; base.bins = (uint)bins;
+
+  { PaeArgs a = base; a.n = 1; run1d("lf_pae_consts", 1, a); }
+
+  // the whole-complex set (pTM), then the interface set (ipTM) - the same kernels with the other mask
+  const bool wantP = d.ptm != nullptr;
+  const bool wantI = asymId && (d.iptm || d.iptmPerResidue);
+  if (wantP) {
+    PaeArgs a = base; a.tm = tmP; a.normed = normedP; a.perAlign = perAlignP; a.interface = 0;
+    a.n = pr; run1d("lf_pae_tm", pr, a);
+    a.n = (size_t)N; run1d("lf_pae_rows", (size_t)N, a);
+    a.dPtm = d.ptm; a.dPerAlign = dPerAlignP; a.n = 1;
+    run1d("lf_pae_dperalign", 1, a);
+  }
+  if (wantI) {
+    PaeArgs a = base; a.tm = tmI; a.normed = normedI; a.perAlign = perAlignI; a.interface = 1;
+    a.n = pr; run1d("lf_pae_tm", pr, a);
+    a.n = (size_t)N; run1d("lf_pae_rows", (size_t)N, a);
+    a.dIptm = d.iptm; a.dIptmPer = d.iptmPerResidue; a.dPerAlign = dPerAlignI; a.n = 1;
+    run1d("lf_pae_dperalign", 1, a);
+  }
+  {
+    PaeArgs a = base;
+    a.dPae = d.pae;
+    a.normed = wantI ? normedI : nullptr;
+    a.dPerAlign = wantI ? dPerAlignI : nullptr;
+    a.asym = wantI ? asymId : nullptr;
+    a.normedP = wantP ? normedP : nullptr;
+    a.dPerAlignP = wantP ? dPerAlignP : nullptr;
+    a.dLogits = dLogits;
+    a.n = pr;
+    run1d("lf_pae_dlogits", pr, a);
+  }
+}
+
 // ---------------------------------------------------------------- EvoformerIteration
 void evoformerIterationBwd(const float* msaMask, const float* pairMask, const EvoBlockSaved& sv,
                            const EvoBlockShape& sh, const EvoBlockWeights& w,
@@ -111,6 +184,7 @@ void designShareScratch() {
   shareScratch({{"design.tr.", "dtr"}, {"design.opm.", "dopm"}, {"design.tri.", "dtri"},
                 {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
                 {"design.mcol.", "dmcol"}, {"design.gattn.", "dgattn"}, {"design.evo.", "devo"},
+                {"design.head.", "dhead"}, {"design.pae.", "dpae"},
                 {"design.ln.", "dln"}},
                {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
                 {"dln", "dattn"}, {"dln", "dmcol"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"},

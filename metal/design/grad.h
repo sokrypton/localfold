@@ -246,6 +246,33 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
                                const TriMulWeights& w, const float* dOut, float* dPair,
                                const TriMulGrads& g = {});
 
+// ---------------------------------------------------------------- the heads, and what a loss reads off them
+// Five of the seven arrays `bindcraft/af/boundary.py` marks differentiable come from the PAIR alone, so they need
+// no structure module: the distogram, and the four the PAE head yields.
+//
+// DistogramHead: half = Linear(pair), logits = half + half^T (modules.py:1115-1121). The symmetrisation is
+// self-adjoint, so its backward is the same operation.
+void distogramHeadBwd(const float* pair, const float* W, const float* dLogits,
+                      int N, int Cz, int bins, float* dPair,
+                      float* dW = nullptr, float* dbias = nullptr);
+
+// PredictedAlignedErrorHead: logits = Linear(pair) (modules.py:865-872). A plain linear.
+void paeHeadBwd(const float* pair, const float* W, const float* dLogits,
+                int N, int Cz, int bins, float* dPair,
+                float* dW = nullptr, float* dbias = nullptr);
+
+// And the metrics themselves (bindcraft/af2.py:152-163, confidence.py:113-180). Any cotangent may be null.
+// `asymId` is needed only for ipTM; pass it null and the ipTM paths are skipped.
+//   pae [N][N] symmetrised;  ptm and iptm scalars;  iptmPerResidue [N]
+struct PaeMetricCotangents {
+  const float* pae = nullptr;
+  const float* ptm = nullptr;
+  const float* iptm = nullptr;
+  const float* iptmPerResidue = nullptr;
+};
+void paeMetricsBwd(const float* logits, const float* breaks, const float* residueWeights, const float* asymId,
+                   int N, int bins, const PaeMetricCotangents& d, float* dLogits);
+
 // ---------------------------------------------------------------- EvoformerIteration (Alg. 6, lines 2-10)
 // A whole block's backward, composed of everything above. AF2 wraps each module in `dropout_wrapper`
 // (modules.py:46-76), which is `new_act = output_act + dropout(module(input_act, mask))` - and with dropout off,

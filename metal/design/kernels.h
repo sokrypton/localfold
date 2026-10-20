@@ -43,6 +43,32 @@ struct ScaleArgs { DP(float) y; u64 n; float alpha; uint pad; };
 // (modules.py:595, :703), so this is how they are served rather than by a second indexing mode in every kernel.
 struct Swap01Args { CP(float) x; DP(float) y; u64 n; uint A, B, C, pad; };
 
+// ---------------------------------------------------------------- the heads, and the metrics a loss reads
+// y[i][j][b] = x[i][j][b] + x[j][i][b]. The distogram head symmetrises its logits (modules.py:1121), and this is
+// both that and its own backward, the operation being self-adjoint.
+struct SymAddArgs { CP(float) x; DP(float) y; u64 n; uint N, C, pad, pad2; };
+
+// pTM and ipTM, from the PAE head's logits (confidence.py:113-180, bindcraft/af2.py:146-164). The only
+// differentiable path is through `probs`: the bin centres, d0 and the normalisation are all constant with respect to
+// the logits, d0 depending on the residue weights' SUM and not on the logits at all.
+//   probs[i][j][b] = softmax_b(logits)
+//   pae[i][j]      = (sum_b probs c[b] + its transpose) / 2
+//   tm[i][j]       = (sum_b probs tmPerBin[b]) * pairMask[i][j]
+//   perAlign[i]    = sum_j tm[i][j] normed[i][j]
+//   ptm            = max_i (perAlign[i] w[i])
+// `pairMask` is everything for pTM and `asym_id[i] != asym_id[j]` for ipTM, so both are computed with one set of
+// kernels and two masks.
+struct PaeArgs {
+  CP(float) logits; CP(float) breaks; CP(float) weights; CP(float) asym;
+  DP(float) centers; DP(float) tmPerBin;       // [bins]; filled by lf_pae_consts
+  DP(float) tm; DP(float) normed; DP(float) rowsum; DP(float) perAlign;
+  CP(float) dPae; CP(float) dPtm; CP(float) dIptm; CP(float) dIptmPer;
+  DP(float) dPerAlign; DP(float) dLogits;
+  CP(float) tmP; CP(float) normedP; CP(float) perAlignP;      // the pTM set, when the ipTM set is in `tm` etc.
+  CP(float) dPerAlignP;
+  u64 n; uint N, bins, interface, pad; float eps;
+};
+
 // y += x. A block's modules are residual - new = output_act + module(input_act) - so a module's contribution is
 // computed into a temporary and added to the running cotangent. One buffer and one cheap pass a module, against
 // threading an `accumulate` flag through six modules' final LayerNorm; the blast radius decided it.

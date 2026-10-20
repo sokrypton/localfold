@@ -122,8 +122,11 @@ And AF2's `EvoformerIteration.__call__` takes `use_dropout`, not `is_training`, 
 4. **Attention - the tier is COMPLETE.** The core backward, the Attention module, the biased self-attention both
    `MSARowAttentionWithPairBias` and `TriangleAttention` are, `MSAColumnAttention`, and
    `MSAColumnGlobalAttention`. See below.
-5. **The structure module and the heads** - IPA, frames, side chains, and the seven arrays `boundary.py` marks
-   differentiable. **This is the next thing to do.**
+5. **The structure module and the heads.** The five differentiable boundary arrays that come from the PAIR alone -
+   the distogram, and pae/ptm/iptm/iptm_per_residue - are **DONE**, see below. What is left is the STRUCTURE
+   MODULE: IPA, quaternion rigids, frames and side chains, and with it the two remaining arrays (`plddt` and
+   `experimentally_resolved_ca`, both of which read the single representation it produces) and `atoms`.
+   **This is the next thing to do, and it is the largest piece left.**
 6. **The loop itself** - the losses, the optimiser, the schedules. Python driving native steps, or native throughout.
 
 ### Stage 1, landed
@@ -462,3 +465,28 @@ thing: `metal/core`'s tuned `attention()` does not return the logsumexp the atte
 Also worth knowing: the ending node's triangle attention is run on the **transposed** pair, as AF2 does
 (`modules.py:703`, `:731`), and the N x N transpose is its own inverse, so the same `lf_swap01` serves both
 directions.
+
+### The pair-side heads and the metrics a loss actually reads
+
+**322 cases.** `distogramHeadBwd`, `paeHeadBwd` and `paeMetricsBwd`. **Five of the seven differentiable arrays in
+`boundary.py` come from the pair alone**, so they need no structure module: `distogram`, `pae`, `ptm`, `iptm` and
+`iptm_per_residue`. ipTM is BindCraft's primary binder objective, so this is the part of the boundary a design loss
+leans on hardest.
+
+The heads are plain linears - the distogram's symmetrisation `logits = half + half^T` is self-adjoint, so its
+backward is the same operation and the same kernel serves both directions.
+
+The metrics are where the arithmetic is (`confidence.py:113-180`), and three things about the derivative are worth
+writing down because they are not obvious from the forward:
+
+- **Only `probs` carries a gradient.** The bin centres, `d0` and the normalisation are all constant with respect to
+  the logits - `d0` depends on the residue weights' SUM, not on the logits at all - so everything else is a fixed
+  coefficient. That collapses what looks like a long chain into one softmax backward per pair.
+- 🔴 **pTM and ipTM are a MAX over the residues**, `(per_alignment * residue_weights).max()`, so their gradient is a
+  **one-hot at the argmax**, not a spread. The kernel picks the FIRST maximum, which is what `jnp.max`'s gradient
+  does; with ties the two would disagree, and random data has none.
+- **pTM and ipTM differ only in their pair mask** (everything, against `asym_id[i] != asym_id[j]`), so one set of
+  kernels runs twice and `lf_pae_dlogits` sums both paths into the same logits.
+
+`iptm_per_residue` is the `per_alignment` vector itself, so it costs nothing extra and its cotangent enters the same
+`dPerAlign` accumulator as ipTM's one-hot.

@@ -442,6 +442,117 @@ kernel void lf_swap01(LF_ARGS(Swap01Args)) {
   a.y[i] = a.x[((ulong)aa * a.B + b) * a.C + c];
 }
 
+// ---------------------------------------------------------------- the heads, and the metrics
+kernel void lf_sym_add(LF_ARGS(SymAddArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = N * N * C
+  const uint c = (uint)(i - lf_udiv((uint)i, a.C) * a.C);
+  const uint rest = (uint)lf_udiv((uint)i, a.C);
+  const uint jj = rest - lf_udiv(rest, a.N) * a.N;
+  const uint ii = lf_udiv(rest, a.N);
+  a.y[i] = a.x[i] + a.x[((ulong)jj * a.N + ii) * a.C + c];
+}
+
+// the bin centres and the per-bin TM term. One thread: bins is 64 and d0 needs the weights' sum.
+kernel void lf_pae_consts(LF_ARGS(PaeArgs)) {
+  if (LF_INDEX != 0) return;
+  const uint B = a.bins;
+  const float step = a.breaks[1] - a.breaks[0];
+  for (uint b = 0; b + 1 < B; ++b) a.centers[b] = a.breaks[b] + step * 0.5f;
+  a.centers[B - 1] = a.centers[B - 2] + step;        // the catch-all bin
+  float sum = 0;
+  for (uint i = 0; i < a.N; ++i) sum += a.weights[i];
+  const float clipped = max(sum, 19.f);
+  const float d0 = 1.24f * pow(clipped - 15.f, 1.f / 3.f) - 1.8f;
+  for (uint b = 0; b < B; ++b) a.tmPerBin[b] = 1.f / (1.f + (a.centers[b] * a.centers[b]) / (d0 * d0));
+}
+
+// tm[i][j] and the unnormalised pair weight, for whichever mask this pass carries
+kernel void lf_pae_tm(LF_ARGS(PaeArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = N * N
+  const uint jj = (uint)(i - lf_udiv((uint)i, a.N) * a.N);
+  const uint ii = (uint)lf_udiv((uint)i, a.N);
+  const bool keep = a.interface ? (a.asym[ii] != a.asym[jj]) : true;
+  float mx = -INFINITY;
+  for (uint b = 0; b < a.bins; ++b) mx = max(mx, a.logits[i * a.bins + b]);
+  float tot = 0, acc = 0;
+  for (uint b = 0; b < a.bins; ++b) {
+    const float e = exp(a.logits[i * a.bins + b] - mx);
+    tot += e;
+    acc += e * a.tmPerBin[b];
+  }
+  a.tm[i] = keep ? acc / tot : 0.f;
+  a.normed[i] = keep ? a.weights[ii] * a.weights[jj] : 0.f;    // normalised by the row sum next
+}
+
+kernel void lf_pae_rows(LF_ARGS(PaeArgs)) {
+  ulong ii = LF_INDEX;
+  if (ii >= a.n) return;                       // n = N
+  float s = 0;
+  for (uint jj = 0; jj < a.N; ++jj) s += a.normed[ii * a.N + jj];
+  const float inv = 1.f / (1e-8f + s);
+  float p = 0;
+  for (uint jj = 0; jj < a.N; ++jj) {
+    const float nm = a.normed[ii * a.N + jj] * inv;
+    a.normed[ii * a.N + jj] = nm;
+    p += a.tm[ii * a.N + jj] * nm;
+  }
+  a.perAlign[ii] = p;
+}
+
+// the scalar is a MAX over the residues, so its gradient is a one-hot at the argmax - the FIRST of them, which is
+// what jnp.max's gradient picks. One thread, N being a few hundred.
+kernel void lf_pae_dperalign(LF_ARGS(PaeArgs)) {
+  if (LF_INDEX != 0) return;
+  for (uint i = 0; i < a.N; ++i) a.dPerAlign[i] = 0.f;
+  if (a.dIptmPer) for (uint i = 0; i < a.N; ++i) a.dPerAlign[i] += a.dIptmPer[i];
+  device const float* dScalar = a.interface ? a.dIptm : a.dPtm;
+  if (dScalar) {
+    uint best = 0;
+    float bv = -INFINITY;
+    for (uint i = 0; i < a.N; ++i) {
+      const float v = a.perAlign[i] * a.weights[i];
+      if (v > bv) { bv = v; best = i; }
+    }
+    a.dPerAlign[best] += dScalar[0] * a.weights[best];
+  }
+}
+
+// and the logits' own cotangent: the pae path, both tm paths, then softmax backward over the bins
+kernel void lf_pae_dlogits(LF_ARGS(PaeArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;                        // n = N * N
+  const uint B = a.bins;
+  const uint jj = (uint)(i - lf_udiv((uint)i, a.N) * a.N);
+  const uint ii = (uint)lf_udiv((uint)i, a.N);
+  const ulong tr = (ulong)jj * a.N + ii;
+
+  float mx = -INFINITY;
+  for (uint b = 0; b < B; ++b) mx = max(mx, a.logits[i * B + b]);
+  float tot = 0;
+  for (uint b = 0; b < B; ++b) tot += exp(a.logits[i * B + b] - mx);
+
+  // pae = (raw + raw^T) / 2, so this entry's raw receives half of each side's cotangent
+  const float dRaw = a.dPae ? 0.5f * (a.dPae[i] + a.dPae[tr]) : 0.f;
+  // the interface set is in tm/normed/dPerAlign, the whole-complex set in the *P fields
+  const bool keepI = a.asym ? (a.asym[ii] != a.asym[jj]) : false;
+  const float dTmI = (a.dPerAlign && a.normed && keepI) ? a.dPerAlign[ii] * a.normed[i] : 0.f;
+  const float dTmP = (a.dPerAlignP && a.normedP) ? a.dPerAlignP[ii] * a.normedP[i] : 0.f;
+
+  float dot = 0;
+  for (uint b = 0; b < B; ++b) {
+    const float p = exp(a.logits[i * B + b] - mx) / tot;
+    const float dp = dRaw * a.centers[b] + (dTmI + dTmP) * a.tmPerBin[b];
+    dot += p * dp;
+  }
+  for (uint b = 0; b < B; ++b) {
+    const float p = exp(a.logits[i * B + b] - mx) / tot;
+    const float dp = dRaw * a.centers[b] + (dTmI + dTmP) * a.tmPerBin[b];
+    a.dLogits[i * B + b] = p * (dp - dot);
+  }
+}
+
 kernel void lf_accum(LF_ARGS(AccumArgs)) {
   ulong i = LF_INDEX;
   if (i >= a.n) return;

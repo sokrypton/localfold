@@ -1349,6 +1349,179 @@ static void triCase(int N, int C, int I, bool outgoing) {
   for (int i = 0; i < 16; ++i) { release(h[i]); release(gp[i]); }
 }
 
+// ---------------------------------------------------------------- the heads, and the metrics a loss reads
+static void headCase(int N, int Cz, int bins) {
+  const size_t pr = (size_t)N * N;
+  std::vector<double> pair = randv(pr * Cz), W = randv((size_t)Cz * bins, 0.2), b0 = randv(bins, 0.1),
+                      dLogits = randv(pr * bins, 0.5);
+  auto half = [&](const std::vector<double>& p, const std::vector<double>& w, const std::vector<double>& bb) {
+    std::vector<double> h(pr * bins);
+    for (size_t r = 0; r < pr; ++r)
+      for (int t = 0; t < bins; ++t) {
+        double s2 = bb[t];
+        for (int c = 0; c < Cz; ++c) s2 += p[r * Cz + c] * w[(size_t)c * bins + t];
+        h[r * bins + t] = s2;
+      }
+    return h;
+  };
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dP = up(pair); void* dW_ = up(W); void* dB = up(b0); void* dL = up(dLogits);
+  void* gPair = alloc(pr * Cz * 4); void* gW = alloc((size_t)Cz * bins * 4); void* gB = alloc((size_t)bins * 4);
+
+  for (int sym = 0; sym < 2; ++sym) {
+    if (sym) distogramHeadBwd((const float*)dP, (const float*)dW_, (const float*)dL, N, Cz, bins,
+                              (float*)gPair, (float*)gW, (float*)gB);
+    else     paeHeadBwd((const float*)dP, (const float*)dW_, (const float*)dL, N, Cz, bins,
+                        (float*)gPair, (float*)gW, (float*)gB);
+    auto S_ = [&]() {
+      auto h = half(pair, W, b0);
+      double acc = 0;
+      for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+          for (int t = 0; t < bins; ++t) {
+            const double v = sym ? h[((size_t)i * N + j) * bins + t] + h[((size_t)j * N + i) * bins + t]
+                                 : h[((size_t)i * N + j) * bins + t];
+            acc += dLogits[((size_t)i * N + j) * bins + t] * v;
+          }
+      return acc;
+    };
+    auto probe = [&](const char* what, std::vector<double>& target, const std::vector<float>& got, int count) {
+      std::vector<double> fd, mine;
+      std::uniform_int_distribution<size_t> Ud(0, target.size() - 1);
+      for (int t = 0; t < count; ++t) {
+        size_t j = Ud(rng);
+        double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+        target[j] = save + hh; double aS = S_();
+        target[j] = save - hh; double bS = S_();
+        target[j] = save;
+        fd.push_back((aS - bS) / (2 * hh));
+        mine.push_back(got[j]);
+      }
+      char lab[200];
+      snprintf(lab, sizeof lab, "%s %s vs central difference N%d Cz%d bins%d",
+               sym ? "distogram" : "paehead", what, N, Cz, bins);
+      reportGrad(lab, fd, mine, 3e-5);
+    };
+    probe("dPair", pair, download((const float*)gPair, pr * Cz), 5);
+    probe("dW", W, download((const float*)gW, (size_t)Cz * bins), 4);
+    probe("dbias", b0, download((const float*)gB, bins), 3);
+  }
+  release(dP); release(dW_); release(dB); release(dL); release(gPair); release(gW); release(gB);
+}
+
+// bindcraft/af2.py:152-163 and confidence.py:113-180, in double
+struct PaeOut { std::vector<double> pae, perAlignP, perAlignI; double ptm = 0, iptm = 0; };
+static PaeOut paeForward(const std::vector<double>& logits, const std::vector<double>& breaks,
+                         const std::vector<double>& wts, const std::vector<double>& asym, int N, int bins) {
+  PaeOut o;
+  const size_t pr = (size_t)N * N;
+  const double step = breaks[1] - breaks[0];
+  std::vector<double> ctr(bins);
+  for (int b = 0; b + 1 < bins; ++b) ctr[b] = breaks[b] + step / 2;
+  ctr[bins - 1] = ctr[bins - 2] + step;
+  double sum = 0;
+  for (int i = 0; i < N; ++i) sum += wts[i];
+  const double d0 = 1.24 * cbrt(std::max(sum, 19.0) - 15.0) - 1.8;
+  std::vector<double> tmb(bins);
+  for (int b = 0; b < bins; ++b) tmb[b] = 1.0 / (1.0 + ctr[b] * ctr[b] / (d0 * d0));
+
+  std::vector<double> raw(pr), tmP(pr), tmI(pr);
+  for (size_t r = 0; r < pr; ++r) {
+    double mx = -1e300;
+    for (int b = 0; b < bins; ++b) mx = std::max(mx, logits[r * bins + b]);
+    double tot = 0, a1 = 0, a2 = 0;
+    for (int b = 0; b < bins; ++b) {
+      const double e = exp(logits[r * bins + b] - mx);
+      tot += e; a1 += e * ctr[b]; a2 += e * tmb[b];
+    }
+    raw[r] = a1 / tot;
+    tmP[r] = a2 / tot;
+  }
+  o.pae.assign(pr, 0.0);
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j)
+      o.pae[(size_t)i * N + j] = (raw[(size_t)i * N + j] + raw[(size_t)j * N + i]) / 2;
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j) {
+      const bool keep = asym.empty() ? false : (asym[i] != asym[j]);
+      tmI[(size_t)i * N + j] = keep ? tmP[(size_t)i * N + j] : 0.0;
+    }
+  auto align = [&](const std::vector<double>& tm, bool iface) {
+    std::vector<double> pa(N, 0.0);
+    for (int i = 0; i < N; ++i) {
+      double rs = 0;
+      for (int j = 0; j < N; ++j) {
+        const bool keep = iface ? (!asym.empty() && asym[i] != asym[j]) : true;
+        rs += keep ? wts[i] * wts[j] : 0.0;
+      }
+      double p = 0;
+      for (int j = 0; j < N; ++j) {
+        const bool keep = iface ? (!asym.empty() && asym[i] != asym[j]) : true;
+        const double nm = (keep ? wts[i] * wts[j] : 0.0) / (1e-8 + rs);
+        p += tm[(size_t)i * N + j] * nm;
+      }
+      pa[i] = p;
+    }
+    return pa;
+  };
+  o.perAlignP = align(tmP, false);
+  o.perAlignI = align(tmI, true);
+  double bp = -1e300, bi = -1e300;
+  for (int i = 0; i < N; ++i) {
+    bp = std::max(bp, o.perAlignP[i] * wts[i]);
+    bi = std::max(bi, o.perAlignI[i] * wts[i]);
+  }
+  o.ptm = bp;
+  o.iptm = bi;
+  return o;
+}
+
+static void paeMetricCase(int N, int bins) {
+  const size_t pr = (size_t)N * N;
+  std::vector<double> logits = randv(pr * bins, 1.0), breaks(bins - 1), wts(N, 1.0), asym(N, 0.0);
+  for (int b = 0; b + 1 < bins; ++b) breaks[b] = 31.0 * b / (bins - 2);     // jnp.linspace(0, max_error_bin, ...)
+  std::uniform_real_distribution<double> U01(0, 1);
+  for (int i = 0; i < N; ++i) wts[i] = 0.5 + 0.5 * U01(rng);                // a soft seq_mask, as a loss may pass
+  for (int i = 0; i < N; ++i) asym[i] = i < N / 2 ? 0.0 : 1.0;             // two chains, so ipTM is non-trivial
+  std::vector<double> dPae = randv(pr, 0.5), dIptmPer = randv(N, 0.5);
+  std::vector<double> dPtm(1, 0.7), dIptm(1, -0.4);
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  void* dL = up(logits); void* dBr = up(breaks); void* dW_ = up(wts); void* dAs = up(asym);
+  void* dPa = up(dPae); void* dPt = up(dPtm); void* dIp = up(dIptm); void* dIpr = up(dIptmPer);
+  void* gL = alloc(pr * bins * 4);
+  PaeMetricCotangents dc{};
+  dc.pae = (const float*)dPa; dc.ptm = (const float*)dPt;
+  dc.iptm = (const float*)dIp; dc.iptmPerResidue = (const float*)dIpr;
+  paeMetricsBwd((const float*)dL, (const float*)dBr, (const float*)dW_, (const float*)dAs,
+                N, bins, dc, (float*)gL);
+
+  auto S_ = [&]() {
+    PaeOut o = paeForward(logits, breaks, wts, asym, N, bins);
+    double acc = dPtm[0] * o.ptm + dIptm[0] * o.iptm;
+    for (size_t i = 0; i < pr; ++i) acc += dPae[i] * o.pae[i];
+    for (int i = 0; i < N; ++i) acc += dIptmPer[i] * o.perAlignI[i];
+    return acc;
+  };
+  std::vector<double> fd, mine;
+  auto got = download((const float*)gL, pr * bins);
+  std::uniform_int_distribution<size_t> Ud(0, logits.size() - 1);
+  for (int t = 0; t < 10; ++t) {
+    size_t j = Ud(rng);
+    double save = logits[j], hh = 1e-5;
+    logits[j] = save + hh; double aS = S_();
+    logits[j] = save - hh; double bS = S_();
+    logits[j] = save;
+    fd.push_back((aS - bS) / (2 * hh));
+    mine.push_back(got[j]);
+  }
+  char lab[200];
+  snprintf(lab, sizeof lab, "pae metrics (pae+ptm+iptm+per-residue) vs central difference N%d bins%d", N, bins);
+  reportGrad(lab, fd, mine, 5e-5);
+  release(dL); release(dBr); release(dW_); release(dAs); release(dPa); release(dPt);
+  release(dIp); release(dIpr); release(gL);
+}
+
 // ---------------------------------------------------------------- EvoformerIteration, the whole block
 struct EvoP {
   OpmParams opm;
@@ -1798,6 +1971,12 @@ int main(int argc, char** argv) {
   triCase(10, 16, 12, false);
   triCase(7, 8, 8, true);
   triCase(7, 8, 8, false);
+  printf("the heads: distogram and predicted aligned error\n");
+  headCase(6, 10, 8);
+  headCase(5, 8, 16);
+  printf("the metrics a loss reads off the PAE head\n");
+  paeMetricCase(8, 12);
+  paeMetricCase(11, 9);
   printf("EvoformerIteration backward (the WHOLE block, eight residual modules)\n");
   evoCase({3, 5, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, false});
   evoCase({2, 4, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, true});     // outer product first, as the multimer config has it
