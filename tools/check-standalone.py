@@ -79,17 +79,29 @@ def main():
           "--steps=64"]),      # (the per-atom floor the worker applies: four calcium ions are four atom tokens)
         ("ef2 300M 6mrr, seed 7", "ef2", [f"--sequence={S6}", "--seed=7"], "ef2-fast-300m",
          [f"--fold-bundle={home}/model-ef2-fast-300m-int5"], [f"--fold-bundle={home}/model-ef2-fast-300m-int5", f"--esmc-bundle={home}/model-esmc-300m-int3", "--fast", "--seed=7"]),
+        # BioEmu2: every sample compared (an ensemble is the point), its featuriser's own flags kept off the fold's line
+        ("bioemu2 6mrr + GOL + SEP3 (job), 2 samples", "bioemu2",
+         [f"--job={FIX}/bioemu2/6mrr-gol-sep.json", "--samples=2", "--steps=50", "--seed=3"], "bioemu2",
+         [], [f"--weights={home}/af3am-bioemu2", "--fast", "--samples=2", "--steps=50", "--seed=3"]),
+        ("bioemu2 6mrr propagated from a sample, 2 steps of 1 ns", "bioemu2",
+         [f"--job={FIX}/bioemu2/6mrr.json", f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb", "--lag-ns=1",
+          "--propagation-steps=2", "--samples=1", "--steps=50"], "bioemu2",
+         [], [f"--weights={home}/af3am-bioemu2", "--fast", "--samples=1", "--steps=50"]),
     ]
     failed = 0
     with tempfile.TemporaryDirectory(dir="/tmp") as work:
         for name, port, inputs, model, fextra, fold_extra in cases:
             # the standalone command first: it fetches whatever weights the two-step path then reads
             new, old = os.path.join(work, "standalone.pdb"), os.path.join(work, "two-step.pdb")
-            fold_only = [a for a in inputs if a.split("=")[0] in ("--samples", "--seed")]
+            fold_only = [a for a in inputs if a.split("=")[0] in ("--samples", "--seed", "--steps")]
             standalone(port, [*inputs, f"--model={model}"], new)
             featuriser_inputs = [a for a in inputs if a not in fold_only or port == "af2"]
             two_step(port, [*featuriser_inputs, *fextra], fold_extra, old, work)
             same = open(new, "rb").read() == open(old, "rb").read()
+            for k in range(1, 8):       # (a port's further samples: <stem>_sample-<k>.pdb)
+                a, b = (p.replace(".pdb", f"_sample-{k}.pdb") for p in (new, old))
+                if os.path.exists(a) or os.path.exists(b):
+                    same = same and os.path.exists(a) and os.path.exists(b) and open(a, "rb").read() == open(b, "rb").read()
             failed += not same
             print(f"{'ok  ' if same else 'FAIL'} {name}: {'identical' if same else 'the PDBs differ'}")
 
@@ -100,6 +112,10 @@ def main():
             ("a template on ESMFold2", "ef2", [f"--sequence={S6}", "--template=x.pdb:A"], "ef2 takes no --template"),
             ("a SMILES ligand on AF2", "af2", [f"--sequence={S6}", "--smiles=OCC(O)CO"], "af2 takes no --smiles"),
             ("an alignment on fast ESMFold2", "ef2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
+            ("a template on BioEmu2", "bioemu2", [f"--sequence={S6}", "--template=x.pdb:A"], "bioemu2 takes no --template"),
+            ("a search on BioEmu2", "bioemu2", [f"--sequence={S6}", "--search"], "bioemu2 takes no --search"),
+            ("a frame of another input", "bioemu2", [f"--sequence=WWWW", f"--propagate-from={FIX}/bioemu2/6mrr-sample.pdb",
+                                                     "--lag-ns=1"], "atom(s) of this input"),
         ]:
             r = run([binary(port), *args, f"--out={work}/x.pdb"])
             said = r.stdout + r.stderr

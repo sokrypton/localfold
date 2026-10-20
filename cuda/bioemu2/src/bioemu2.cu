@@ -6,9 +6,13 @@
 //   localfold-bioemu2 <input dir> --weights=<dir with bioemu2*.bin.zst> [--oracle=<dir>] [--out=fold.pdb]
 //       [--samples=5] [--steps=200] [--seed=N] [--fast] [--serve=<dir>]
 // <input dir> is cuda/bioemu2/export_input.mjs's; its mode (structure, equilibrium, propagation) is the input's.
+//   localfold-bioemu2 --job=<job.json> --out=<pdb> [...]  (any first argument that is a flag): the weights fetched, the
+// input featurised in this process while the device starts, the fold (cuda/featurise/standalone.h)
 #include "fasttrunk.cuh"
 #include "sampler.cuh"
+#include "../../featurise/standalone_api.h"
 #include <chrono>
+#include <unistd.h>
 
 using namespace be2;
 
@@ -200,7 +204,7 @@ static bool flagInto(const std::string& f, Opts& o) {
   return true;
 }
 
-int main(int argc, char** argv) {
+static int foldMain(int argc, char** argv) {
   if (argc < 2 || !strncmp(argv[1], "--", 2)) {
     fprintf(stderr, "usage: localfold-bioemu2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--samples=5]"
                     " [--steps=200] [--seed=N] [--step-scale=S] [--fast] [--serve=<dir>]\n");
@@ -208,10 +212,12 @@ int main(int argc, char** argv) {
   }
   Opts o; o.dir = argv[1];
   std::string weights, serveDir, compareWith;
-  bool fast = false;
+  bool fast = false, waitInput = false, waitForever = false;
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (!a.compare(0, 10, "--weights=")) weights = a.substr(10);
+    else if (a == "--wait-input") waitInput = true;              // start up while the input is still being exported
+    else if (a == "--wait-input=0") waitInput = waitForever = true;   // ...with no timeout (the standalone mode)
     else if (!a.compare(0, 9, "--oracle=")) o.oracle = a.substr(9);
     else if (a == "--fast") fast = true;
     else if (!a.compare(0, 18, "--compare-weights=")) compareWith = a.substr(18);
@@ -259,8 +265,21 @@ int main(int argc, char** argv) {
     });
     finish(0);
   }
+  if (waitInput) {          // the exporter writes model.idx last, by a rename
+    std::string idx = o.dir + "/model.idx", failed = o.dir + "/model.failed";
+    for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
+      if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "bioemu2: the input's export failed\n"); finish(1); }
+      if (k > 600000 && !waitForever) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); finish(1); }
+      usleep(1000);
+    }
+  }
   M.load(o.dir);
   if (!o.oracle.empty()) M.load(o.oracle);
   for (int sgi = weightSegs; sgi < (int)M.segs.size(); ++sgi) M.upload(sgi);
   finish(foldInput(o));
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("bioemu2", argc, argv, foldMain);
+  return foldMain(argc, argv);
 }

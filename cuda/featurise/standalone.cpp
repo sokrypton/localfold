@@ -205,8 +205,53 @@ WEIGHTS
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/ef2/README.md.
 )";
 
+static const char* BIOEMU2_HELP = R"(localfold-bioemu2 - BioEmu2, natively: a sequence (or job) in, a structure or an ensemble out.
+
+usage: localfold-bioemu2 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--out=<path>] [options]
+
+  localfold-bioemu2 --sequence=MKV... --out=fold.pdb
+  localfold-bioemu2 --job=6mrr.json --mode=equilibrium --samples=10 --out=ens.pdb
+  localfold-bioemu2 --job=6mrr.json --propagate-from=ens.pdb --lag-ns=1 --propagation-steps=5 --samples=2 --out=traj.pdb
+
+microsoft/bioemu2-preview (MIT). The weights are downloaded the first time, the input featurised in this process
+while the GPU starts, and every sample written. It has NO confidence head: the structures carry no pLDDT, and the
+confidences file holds the distogram's contact probabilities alone.
+
+INPUT
+  --job=<job.json>         an AlphaFold 3 job file: proteins, DNA, RNA, ligands (CCD or SMILES), ions, modified
+                           residues, covalent bonds
+  --sequence=<A>:<B>       protein chains, joined by ':'
+  --a3m=<a.a3m>[,<b.a3m>]  an alignment: one merged over the protein chains, or one a protein chain
+  --paired-a3m=<...>       ...and the paired rows of a complex, the same way
+  --ccd=<components.cif>   read CCD components from this local dictionary instead of the RCSB
+  (no templates, no search: search with msa-search, or fold through the page)
+
+MODE
+  --mode=structure         one most-likely structure a sample (default)
+  --mode=equilibrium       samples of the equilibrium ensemble
+  --contacts=<file.json>   contact restraints, the page's format
+  --propagate-from=<pdb|cif> --lag-ns=<ns> --propagation-steps=<k>
+                           a trajectory from a structure of this same input, k steps of the lag each
+
+FOLD
+  --out=<path>             fold.pdb by default; sample k > 0 to <stem>_sample-<k>.pdb
+  --samples=N              samples (5); a propagation runs N trajectories
+  --steps=N                sampler steps (200)
+  --seed=N                 the sampler's noise (0)
+  --passes=N               trunk passes (4)
+
+OUTPUT (for --out=fold.pdb)
+  fold.pdb, fold_sample-<k>.pdb   the samples
+  fold_confidences.json           the contact probabilities (AlphaFold 3's layout); pLDDT and PAE null
+
+WEIGHTS
+  --weights-dir=<dir>             where the weights are kept, and downloaded to when absent (default below)
+
+A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/bioemu2/README.md.
+)";
+
 static void usage(const std::string& port, bool full) {
-  const char* help = port == "af3" ? AF3_HELP : port == "af2" ? AF2_HELP : EF2_HELP;
+  const char* help = port == "af3" ? AF3_HELP : port == "af2" ? AF2_HELP : port == "bioemu2" ? BIOEMU2_HELP : EF2_HELP;
   if (full) {
     fputs(help, stdout);
     printf("\nWithout --weights-dir the weights live under %s.\n", fetch::home().c_str());
@@ -293,6 +338,20 @@ static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseEsmfold2Into(args(dir), dir); }, foldArgs, fold, argv0);
 }
 
+// BioEmu2: its featuriser's flags (bioemu2_export.h) stay out of the fold's command line, which refuses what it does
+// not know
+static const std::set<std::string> BIOEMU2_INPUT = {"mode", "contacts", "propagate-from", "lag-ns", "propagation-steps"};
+
+static int bioemu2(Run& run, int (*fold)(int, char**), const char* argv0) {
+  fetch::ModelWeights w = weightsFor(run, "bioemu2");
+  std::vector<std::string> foldArgs = {"--weights=" + w.dirs[0], "--fast"};
+  for (auto& f : run.foldFlags()) if (!BIOEMU2_INPUT.count(flagName(f))) foldArgs.push_back(f);
+  std::vector<std::string> extra;
+  for (auto& f : ccdFlag(run)) extra.push_back(f);
+  auto args = withAll(run.list, extra);
+  return featuriseAndFold(run, [args](const std::string& dir) { featuriseBioemu2Into(args(dir), dir); }, foldArgs, fold, argv0);
+}
+
 // the input flags each port's featuriser reads (cuda/featurise/<port>_export.h): any other input flag is refused by
 // name rather than dropped - a template handed to ESMFold2 must not fold as though it were not there
 static const std::set<std::string>& readsInput(const std::string& port) {
@@ -301,7 +360,8 @@ static const std::set<std::string>& readsInput(const std::string& port) {
   static const std::set<std::string> AF2 = {"job", "sequence", "a3m", "paired-a3m", "search", "template", "template-search-chains",
                                             "max-msa", "max-extra"};
   static const std::set<std::string> EF2 = {"job", "sequence", "a3m", "kinds", "ligands", "smiles", "modify", "ccd"};
-  return port == "af3" ? AF3 : port == "af2" ? AF2 : EF2;
+  static const std::set<std::string> BIOEMU2 = {"job", "sequence", "a3m", "paired-a3m", "ccd"};
+  return port == "af3" ? AF3 : port == "af2" ? AF2 : port == "bioemu2" ? BIOEMU2 : EF2;
 }
 
 int main(const char* port, int argc, char** argv, int (*fold)(int, char**)) {
@@ -310,13 +370,14 @@ int main(const char* port, int argc, char** argv, int (*fold)(int, char**)) {
     if (argc < 2) { usage(name, false); return 1; }
     for (int i = 1; i < argc; ++i)
       if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(name, true); return 0; }
-    Run run(argc, argv, name == "af3" ? "af3" : name == "af2" ? "model_1_ptm" : "ef2-fast-600m");
+    Run run(argc, argv, name == "af3" ? "af3" : name == "af2" ? "model_1_ptm" : name == "bioemu2" ? "bioemu2" : "ef2-fast-600m");
     for (auto& a : run.list) {
       std::string n = flagName(a);
       if (inputFlags().count(n) && !readsInput(name).count(n)) throw std::runtime_error(name + " takes no --" + n);
     }
     if (name == "af3") return af3(run, fold, argv[0]);
     if (name == "af2") return af2(run, fold, argv[0]);
+    if (name == "bioemu2") return bioemu2(run, fold, argv[0]);
     return ef2(run, fold, argv[0]);
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());

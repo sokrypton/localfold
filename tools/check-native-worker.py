@@ -192,6 +192,43 @@ def cases(offline):
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}], "job": job([S6], ["GOL"])},
          None, None, None, "protein chains only"),
     ]
+    # 🔴 BioEmu2: NO CONFIDENCE HEAD, SO ITS RESULT IS HELD TO WHAT THE PAGE READS INSTEAD - every sample's PDB (the page
+    # lays them on the play bar and takes BioEmu2's physicality report of each), a contact map of tokens^2, the token
+    # layout, and pLDDT/pTM NULL rather than a number the B-factors do not hold. A propagation starts from the frame the
+    # page sends with the job (`bioemu2Frame`: here the previous case's first sample), and each step is held near IT,
+    # not near the crystal: a trajectory moves. An equilibrium ensemble is held to being a chain, not to one structure.
+    be2 = lambda **over: controls(**{"model-family": "bioemu2", "af3-count": "50", **over})
+    j6 = job([S6])
+    out += [
+        ("bioemu2 6mrr, 2 samples", {"family": "bioemu2", "controls": be2(**{"bioemu2-samples": "2"}),
+         "entities": [protein(S6)], "job": j6, "samples": 2}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        ("bioemu2 6mrr propagated, 2 x 2 steps of 1 ns", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-mode": "propagate", "bioemu2-lag": "1", "bioemu2-propagation-steps": "2",
+                            "bioemu2-samples": "2"}),
+         "entities": [protein(S6)], "job": j6, "samples": 4, "bioemu2Frame": "previous"},
+         ("previous", "A"), 3.0, 68, None),
+        ("bioemu2 6mrr equilibrium, contacts", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-mode": "equilibrium", "bioemu2-samples": "2",
+                            "bioemu2-contacts": open(f"{FIX}/bioemu2/contacts.json").read()}),
+         "entities": [protein(S6)], "job": j6, "samples": 2}, ("chain", "A"), None, 68, None),
+        # 🔴 AND A SECOND FOLD OF THE SAME LENGTH IS THE FIRST FOLD: the resident server once kept a triangle mask by its
+        # address, which the denoiser's buffers overwrote, so every same-length fold after the first was garbage
+        ("bioemu2 6mrr again (the resident server, warm)", {"family": "bioemu2", "controls": be2(**{"bioemu2-samples": "2"}),
+         "entities": [protein(S6)], "job": j6, "samples": 2, "samePdbAs": "bioemu2 6mrr, 2 samples"},
+         (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        ("bioemu2 6mrr + GOL", {"family": "bioemu2", "controls": be2(), "entities": [protein(S6),
+         {"type": "ligand", "value": "GOL", "copies": 1}], "job": job([S6], ["GOL"]), "samples": 1, "ligandBonds": 5},
+         (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 6, None),
+        ("bioemu2 refused: a template", {"family": "bioemu2", "controls": be2(),
+         "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A"})], "job": job([s5])},
+         None, None, None, "takes no template"),
+        ("bioemu2 refused: propagating with no frame", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-mode": "propagate"}), "entities": [protein(S6)], "job": j6},
+         None, None, None, "propagation starts from a structure"),
+        ("bioemu2 refused: propagating another input's frame", {"family": "bioemu2",
+         "controls": be2(**{"bioemu2-mode": "propagate"}), "entities": [protein(s5)], "job": job([s5]),
+         "bioemu2Frame": "previous"}, None, None, None, "atom(s) of this input"),
+    ]
     # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/README.md) where their bundles
     # are on disk under the names fetch-weights gives them - nothing downloads them, so absent is a skip, not a failure
     weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (     # (fetch.h's home(): no /proc/self/exe on a Mac)
@@ -228,6 +265,14 @@ def cases(offline):
              None, None),
         ]
     return out
+
+
+def ca_spacing(pdb_text):
+    """The median distance between consecutive alpha carbons: 3.8 A in a chain."""
+    ca = [tuple(float(line[c:c + 8]) for c in (30, 38, 46)) for line in pdb_text.splitlines()
+          if line.startswith("ATOM") and line[12:16] == " CA "]
+    gaps = sorted(math.dist(a, b) for a, b in zip(ca, ca[1:]))
+    return gaps[len(gaps) // 2] if gaps else 0.0
 
 
 def score(pdb_text, reference, chains):
@@ -423,9 +468,15 @@ def main():
                               text=True, bufsize=1)
     first = json.loads(worker.stdout.readline())
     bad = [] if first.get("kind") == "ready" else [f"the worker's first line was {first}, not ready"]
+    previous = None      # (the last fold's PDB: a BioEmu2 propagation's starting frame)
+    folded = {}
     for name, payload, reference, bar, tokens, refusal in plan:
         payload = dict(payload)
         expected_bonds = payload.pop("ligandBonds", None)
+        samples = payload.pop("samples", None)
+        same_as = payload.pop("samePdbAs", None)
+        if payload.get("bioemu2Frame") == "previous":
+            payload["bioemu2Frame"] = previous
         started = time.time()
         worker.stdin.write(json.dumps(payload) + "\n")
         worker.stdin.flush()
@@ -458,6 +509,47 @@ def main():
         problems = []
         if result.get("native") != NATIVE:
             problems.append(f"marked native {result.get('native')!r}, not {NATIVE!r}")
+        previous = result.get("pdb")
+        folded[name] = result.get("samples") or [previous]
+        if same_as is not None and folded[name] != folded.get(same_as):
+            problems.append(f"not the same structures as {same_as!r}")
+        if payload["family"] == "bioemu2":
+            n = len((result.get("tokens") or {}).get("chainIds") or [])
+            got = result.get("samples") or []
+            if len(got) != samples:
+                problems.append(f"{len(got)} samples, not {samples}")
+            if c.get("plddt") is not None or c.get("meanPlddt") is not None or c.get("ptm") is not None:
+                problems.append("a confidence BioEmu2 does not predict")
+            if len(c.get("contactProbs") or []) != n * n:
+                problems.append(f"contact map {len(c.get('contactProbs') or [])} for {n} tokens")
+            if tokens is not None and n != tokens:
+                problems.append(f"{n} tokens, not {tokens}")
+            # (a propagation's every step near its starting frame; an ensemble's samples each a chain)
+            if reference[0] == "chain":
+                spacing = [ca_spacing(p) for p in got]
+                worst = max(abs(v - 3.8) for v in spacing) if spacing else None
+                if worst is None or worst > 0.3:
+                    problems.append(f"a sample's median CA-CA {spacing} is not a chain's 3.8 A")
+                bar = "CA-CA 3.8 +/- 0.3"
+            else:
+                against = reference
+                if reference[0] == "previous":
+                    with open("/tmp/localfold-cuda-check-frame.pdb", "w") as handle:
+                        handle.write(payload["bioemu2Frame"])
+                    against = ("/tmp/localfold-cuda-check-frame.pdb", reference[1])
+                worst = max((score(p, *against) or 99) for p in got) if got else None
+                if worst is None or worst > bar:
+                    problems.append(f"a sample's RMSD {worst} past {bar} A")
+            if expected_bonds is not None:
+                count, closest = ligand_bonds(result.get("pdb") or "")
+                if count != expected_bonds or closest is None or closest < 1.0:
+                    problems.append(f"the ligand has {count} bonds (want {expected_bonds}), closest atoms {closest} A")
+            if "status" not in kinds:
+                problems.append(f"events {kinds}")
+            print(f"{name:44s} worst sample RMSD {worst} A (bar {bar})  {n} tokens  {len(got)} samples  {seconds:5.1f} s"
+                  f"  | {result.get('status')}")
+            bad += [f"{name}: {p}" for p in problems]
+            continue
         if len(c.get("predictedAlignedError") or []) != n * n:
             problems.append(f"PAE {len(c.get('predictedAlignedError') or [])} for {n} tokens")
         if len((result.get("tokens") or {}).get("chainIds") or []) != n:

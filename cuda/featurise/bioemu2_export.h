@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bioemu2_features.h"
+#include "bioemu2_steering.h"
 #include "entries.h"
 #include "fetch.h"
 #include "jsmath.h"
@@ -310,6 +311,39 @@ inline Bioemu2Export exportBioemu2(const Args& args) {
   for (size_t p = 0; p < (size_t)T * T; ++p) for (int k = 0; k < 5; ++k) if (cc[p * 5 + k]) cls[p] = k;
   E.i("contact_class", std::move(cls));
   if (!x0.empty()) E.t("x0", x0);
+  // the steering potentials' tables, before hostTables (export_input.mjs's header)
+  bool steering = false;
+  std::string stereoPath;
+  for (auto& a : args.list) {
+    if (a == "--steering") steering = true;
+    else if (a.rfind("--steering=", 0) == 0) { steering = true; stereoPath = a.substr(11); }
+  }
+  if (steering) {
+    if (stereoPath.empty()) {
+      const char* home = getenv("HOME");
+      stereoPath = std::string(home ? home : ".") + "/.cache/alphafold3/bioemu2/stereo_chemistry.7846769.yaml";
+      if (!fetch::exists(stereoPath)) {
+        fetch::makeDirs(stereoPath.substr(0, stereoPath.rfind('/')));
+        fetch::download("https://raw.githubusercontent.com/microsoft/bioemu2/7846769/src/bioemu2/assets/stereo_chemistry.yaml",
+                        stereoPath);
+      }
+    }
+    bioemu2::SteeringTables S = bioemu2::steeringTables(F, bioemu2::parseStereoTables(readFile(stereoPath)), &ccd);
+    for (const char* name : {"atom_pad_mask", "atom_chain_id", "chain_sizes", "symmetric_chain_index", "interchain_steric_atom_mask",
+                             "interchain_bonded_pair_key", "polymer_steric_atom_mask", "polymer_bonded_pair_key",
+                             "polymer_local_clash_index", "bond_index", "angle_index", "rdkit_bounds_index",
+                             "rdkit_bounds_bond_mask", "rdkit_bounds_angle_mask", "chiral_atom_index", "chiral_atom_orientations",
+                             "stereo_bond_index", "stereo_bond_orientations", "planar_bond_index"})
+      E.i(std::string("steer/") + name, S.ints.at(name));
+    for (const char* name : {"atom_vdw_radius", "rdkit_upper_bounds", "rdkit_lower_bounds"})
+      E.t(std::string("steer/") + name, S.floats.at(name));
+    for (const char* name : {"bond_ref", "angle_ref"}) {
+      const auto& d = S.doubles.at(name);
+      std::vector<int> words(d.size() * 2);
+      if (!d.empty()) std::memcpy(words.data(), d.data(), d.size() * 8);
+      E.i(std::string("steer/") + name + ".bits", std::move(words));
+    }
+  }
   const int S = F.msaRows;
   const auto& mask = F.ints.at("msa_mask");
   int nValid = 0;

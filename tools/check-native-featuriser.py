@@ -266,6 +266,11 @@ def cases():
         ("bioemu2-propagate-pdb", "bioemu2", os.path.join(BF, "6mrr.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
         ("bioemu2-wrong-frame-refused", "bioemu2", os.path.join(BF, "6mrr-gol-sep.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
     ]
+    # ...and the steering potentials' tables (--steering: shared/bioemu2/steering-tables.js, the CCD's ligand half too),
+    # over the stereochemistry the vendor ships (fetched once into ~/.cache/alphafold3/bioemu2)
+    out += [(f"bioemu2-steering-{n}", "bioemu2", os.path.join(BF, f"{n}.json"), ["--steering"], B)
+            for n in ("6mrr", "6mrr-gol-sep", "rna-dna", "smiles", "6mrr-nag-ret", "heteromer")]
+    out.append(("bioemu2-steering-glycan", "bioemu2", os.path.join(FIX, "glycan-standalone.json"), ["--steering"], B))
     if os.path.isdir(AF3_EXAMPLES):
         for name in sorted(os.listdir(AF3_EXAMPLES)):
             if name.endswith(".json"):

@@ -77,7 +77,9 @@ for port in "${ports[@]}"; do
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   # (and the weight walks in cuda/featurise, which af3 and af2 include)
   # (msap is built on cuda/ef2's kernels, so their headers are its sources too; it links no featuriser)
-  extra=(); link=("$sobj"); [ "$port" != msap ] && [ "$port" != bioemu2 ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  # (bioemu2 is built on them too, and links the featuriser: `localfold-bioemu2 --job=...`)
+  extra=(); link=("$sobj"); [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  [ "$port" != bioemu2 ] || extra=("$here"/ef2/src/*.cuh)
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical

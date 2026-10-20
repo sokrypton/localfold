@@ -3929,8 +3929,34 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   progress(null);
 }
 
-/** The last BioEmu2 fold's first sample, keyed by its atoms, for propagating from it. */
+/** The last BioEmu2 fold's first sample, keyed by its atoms, for propagating from it (`pdb` for a native fold). */
 let lastBioemu2;
+
+/**
+ * BioEmu2's own physicality report of each sample (shared/bioemu2/physicality.js, held to the colab port), and the
+ * line the status and the scores card carry. It changes no coordinate; it says whether each sample's protein passes
+ * the high_quality thresholds and the first check that failed - what this model offers in place of a confidence.
+ * Both fold paths read it: this page's WebGPU fold, and a native one whose samples come back as PDB text.
+ */
+function bioemu2Physicality(featurised, samples) {
+  const { atomKeys, topology } = featurised;
+  const where = new Map(atomKeys.map((key, at) => [key.join("|"), at]));
+  const declared = (featurised.job.bondedAtomPairs ?? [])
+    .map(([a, b]) => [where.get(a.join("|")), where.get(b.join("|"))])
+    .filter(([a, b]) => a !== undefined && b !== undefined);
+  let report = [];
+  try {
+    report = checkPhysicality(topology, new BioEmu2Graph(topology).bonds,
+      samples.map((x) => Float64Array.from(x.subarray(0, atomKeys.length * 3))), "high_quality", declared);
+  } catch (cause) {
+    console.warn("physicality report skipped:", cause);
+  }
+  const passed = report.filter((one) => one.ok).length;
+  const firstFailure = report.find((one) => !one.ok)?.reason;
+  const line = report.length === 0 ? ""
+    : ` · physicality ${passed}/${report.length} pass${firstFailure ? ` (${firstFailure.replaceAll("_", " ")})` : ""}`;
+  return { report, line };
+}
 
 /**
  * A BioEmu2 fold on this page's WebGPU (webgpu/bioemu2).
@@ -4081,24 +4107,8 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     viewer.setFrame(0);
     viewer.render("bioemu2-final");
   }
-  // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample (shared/bioemu2/physicality.js, held to the colab port): it
-  // changes no coordinate, and says whether each sample's protein passes the high_quality thresholds and the first
-  // check that failed - which is what this model offers in place of a confidence
-  const where = new Map(atomKeys.map((key, at) => [key.join("|"), at]));
-  const declared = (featurised.job.bondedAtomPairs ?? [])
-    .map(([a, b]) => [where.get(a.join("|")), where.get(b.join("|"))])
-    .filter(([a, b]) => a !== undefined && b !== undefined);
-  let physicality = [];
-  try {
-    physicality = checkPhysicality(topology, new BioEmu2Graph(topology).bonds,
-      result.samples.map((x) => Float64Array.from(x.subarray(0, realAtoms * 3))), "high_quality", declared);
-  } catch (cause) {
-    console.warn("physicality report skipped:", cause);
-  }
-  const passed = physicality.filter((one) => one.ok).length;
-  const firstFailure = physicality.find((one) => !one.ok)?.reason;
-  const physicalityLine = physicality.length === 0 ? ""
-    : ` · physicality ${passed}/${physicality.length} pass${firstFailure ? ` (${firstFailure.replaceAll("_", " ")})` : ""}`;
+  // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample, in place of a confidence (bioemu2Physicality)
+  const { report: physicality, line: physicalityLine } = bioemu2Physicality(featurised, result.samples);
   updateScoresCard({ none: true, label: `No confidence head${physicalityLine}` });
   recordPrediction({
     stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
@@ -4115,7 +4125,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     },
   }, family);
   void rememberSessionWhenSettled(lastPrediction);
-  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: result.samples[0].subarray(0, realAtoms * 3) };
+  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: result.samples[0].subarray(0, realAtoms * 3), pdb: pdbs[0] };
   // the chain gate the CLI tools assert, as a warning here (shared/af3/chain-geometry.js)
   const geometry = chainGeometryOf(alphaCarbonSpacings(atomKeys, topology, result.samples[0]).spacing);
   const verdict = Number.isFinite(geometry.caca) ? chainGeometryVerdict(geometry) : { ok: true };
@@ -4196,6 +4206,19 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   if (isEsmfold2(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
     request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
+  } else if (BIOEMU2_FAMILIES.includes(family)) {
+    // (BioEmu2's own dial: BIOEMU2_COUNTS, the vendor's 200 when it is empty - not AlphaFold 3's table)
+    request.schedule = { steps: Number(element("af3-count").value) || BIOEMU2_DEFAULT_STEPS };
+    // 🔴 A PROPAGATION'S STARTING FRAME TRAVELS WITH THE JOB, because the worker keeps nothing between folds and the
+    // structure is on this machine: the uploaded PDB, or the last BioEmu2 fold's first sample. The native featuriser
+    // refuses a frame of another input by name, so a stale one cannot propagate the wrong molecule.
+    if (controls["bioemu2-mode"] === "propagate") {
+      const upload = (controls["bioemu2-propagate-from"] ?? "last") === "upload";
+      const file = upload ? document.getElementById("bioemu2-x0-file")?.files?.[0] : undefined;
+      if (upload && file === undefined) throw new Error("Choose a PDB to propagate from, or propagate from the last fold");
+      const frame = upload ? await file.text() : lastBioemu2?.pdb;
+      if (frame !== undefined) request.bioemu2Frame = frame;
+    }
   } else {
     request.schedule = { steps: samplerPlan(modifications ?? []).calls };
   }
@@ -4425,6 +4448,10 @@ async function followRemoteFold({ since, label, signal }) {
       } catch (cause) { console.warn("frame skipped:", cause); }
     }
   }
+  // 🔴 A NATIVE BioEmu2 FOLD IS AN ENSEMBLE AND HAS NO CONFIDENCE HEAD, as this page's own is (foldWithBioemu2):
+  // every sample on the play bar, coloured by chain, and the card carrying BioEmu2's physicality report of them
+  // rather than a pLDDT the B-factors do not hold
+  if (result.family === "bioemu2" && Array.isArray(result.samples)) await nativeBioemu2Samples(result, cuda);
   // 🔴 AND THE DOWNLOAD BUTTONS NEED A PREDICTION, WHICH THIS PAGE NEVER MADE.
   // `activePrediction()` reads `predictions.get(name)` and falls back to
   // `lastPrediction` - both written by the LOCAL fold paths - so on a remote
@@ -4438,6 +4465,52 @@ async function followRemoteFold({ since, label, signal }) {
   // ...and the worker's own summary line.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * A native BioEmu2 fold's samples: frames after the first (which loadIntoViewer drew), the physicality report on the
+ * status line and the card, and the first sample kept for a propagation from it.
+ */
+async function nativeBioemu2Samples(result, prediction) {
+  const { entities, controls } = formInputs();
+  const propagating = controls["bioemu2-mode"] === "propagate";
+  const perTrajectory = Math.max(1, Number(controls["bioemu2-propagation-steps"]) || 1);
+  const label = (at) => (propagating
+    ? `trajectory_${Math.floor(at / perTrajectory) + 1}_step_${(at % perTrajectory) + 1}` : `sample_${at + 1}`);
+  const api = window.py2Dmol;
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    const first = object?.frames?.[0];
+    if (first !== undefined) first.name = first.label = first.title = label(0);
+    for (const [index, text] of result.samples.slice(1).entries()) {
+      try {
+        const frame = api.frameFromText(text);
+        frame.name = frame.label = frame.title = label(index + 1);
+        if (first?.maps !== undefined) frame.maps = first.maps;
+        viewer.addFrame(frame, viewerObject);
+      } catch (cause) { console.warn("sample skipped:", cause); }
+    }
+    forcePlddtColours(false);
+    viewer.setFrame(0);
+    viewer.render("bioemu2-final");
+  }
+  let line = "";
+  try {
+    const featurised = await bioemu2Features(jobInputJson({ name: "fold", seed: 1, entities }), { mode: "structure" });
+    const samples = result.samples.map((text) => x0FromPdb(text, featurised.atomKeys));
+    const physicality = bioemu2Physicality(featurised, samples);
+    line = physicality.line;
+    prediction.settings = { ...prediction.settings, mode: controls["bioemu2-mode"] ?? "structure",
+      samples: result.samples.length,
+      ...(physicality.report.length === 0 ? {} : {
+        physicality: physicality.report.map((one) => (one.ok ? "passed" : `rejected: ${one.reason}`)) }) };
+    lastBioemu2 = { key: JSON.stringify(featurised.atomKeys), coords: samples[0], pdb: result.samples[0] };
+  } catch (cause) {
+    console.warn("physicality report skipped:", cause);
+    lastBioemu2 = { pdb: result.samples[0] };
+  }
+  updateScoresCard({ none: true, label: `No confidence head${line}` });
+  result.status = `${result.status ?? ""}${line}`;
 }
 
 /**

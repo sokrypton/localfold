@@ -75,15 +75,17 @@ inline std::string ef2Transition(const std::string& p, int l) {
   }
   return Tn;
 }
+// 🔴 FILLED EVERY CALL, ON THE DEVICE. It was filled once and remembered by (size, address) - and releaseScratch()
+// frees it before the denoiser, whose buffers then write over that memory, and the NEXT job's scratch of the same size
+// comes back at the same address: the resident server's second fold of a same-length input ran every triangle under a
+// mask of garbage (median CA-CA 7-9 A, any mode). A T^2 fill beside an O(T^3) triangle is nothing.
+__global__ void fillOnesK(float* x, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) x[t] = 1.f;
+}
 inline const float* pairOnes(size_t P) {
   float* ones = scratch<float>("be2.ft.ones", P);
-  static size_t made = 0; static float* at = nullptr;
-  if (made != P || at != ones) {
-    std::vector<float> h(P, 1.f);
-    CK(cudaMemcpyAsync(ones, h.data(), P * 4, cudaMemcpyHostToDevice, STREAM));
-    CK(cudaStreamSynchronize(STREAM));
-    made = P; at = ones;
-  }
+  fillOnesK<<<blocks(P), 256, 0, STREAM>>>(ones, P);
   return ones;
 }
 // the fast block pieces (ef2's own choice of form by size)

@@ -19,6 +19,12 @@
 //   per atom    t template_coords [N, 3] charge coords_cond [N, 3]    i element name_encoding [N, 4]
 //               i token_idx_at_atom ref_space_uid atom_pad_mask atom_mask
 //   propagation t x0 [N, 3] (the starting frame, uncentred)
+//   steering    (--steering[=<stereo_chemistry.yaml>], for the edm_gd / edm_fk samplers) every table
+//               shared/bioemu2/steering-tables.js builds, before potentials.js's hostTables (which depends on the
+//               potentials, so the sampler applies it): i steer/<table> (a (k, n) table row-major), t steer/<table>,
+//               and the bond and angle references as i steer/bond_ref.bits / steer/angle_ref.bits (each double's
+//               low and high words: the angle bounds are taken from the DOUBLE in degrees).
+//               The stereochemistry is CCP4 MON_LIB's (LGPL), fetched from BioEmu2's repository and never shipped.
 //   m meta/tokens, meta/atoms (padded), meta/real_atoms, meta/msa_rows, meta/n_valid_rows, meta/mode (0 structure,
 //     1 equilibrium), meta/dt, meta/is_dynamics_conditioned, meta/propagation_steps
 // and beside them pdb.template (the structure's records in the JOB's chain order, each atom's index where its
@@ -31,6 +37,7 @@ import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts, addPropagation,
 import { ccdUrl, ELEMENT_SYMBOLS } from "../../shared/af3/featurise/ccd-component.js";
 import { STANDARD_COMPONENTS } from "../../shared/af3/featurise/standard-components.js";
 import { smilesTemplates as pageSmilesTemplates, splitA3mByChains } from "../../shared/bioemu2/inputs.js";
+import { steeringTables, parseStereoTables, STEREO_URL, STEREO_COMMIT } from "../../shared/bioemu2/steering-tables.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -158,6 +165,11 @@ if (propagateFrom !== "") {
 }
 
 // ---- the entries
+const STEER_INTS = ["atom_pad_mask", "atom_chain_id", "chain_sizes", "symmetric_chain_index", "interchain_steric_atom_mask",
+  "interchain_bonded_pair_key", "polymer_steric_atom_mask", "polymer_bonded_pair_key", "polymer_local_clash_index",
+  "bond_index", "angle_index", "rdkit_bounds_index", "rdkit_bounds_bond_mask", "rdkit_bounds_angle_mask",
+  "chiral_atom_index", "chiral_atom_orientations", "stereo_bond_index", "stereo_bond_orientations", "planar_bond_index"];
+const STEER_FLOATS = ["atom_vdw_radius", "rdkit_upper_bounds", "rdkit_lower_bounds"];
 const entries = [];
 const int = (name, v) => entries.push(["i", name, v instanceof Int32Array ? v : Int32Array.from(v)]);
 const flt = (name, v) => entries.push(["t", name, v instanceof Float32Array ? v : Float32Array.from(v)]);
@@ -174,6 +186,30 @@ const cls = new Int32Array(T * T);
 for (let p = 0; p < T * T; p += 1) for (let k = 0; k < 5; k += 1) if (f.contact_conditioning[p * 5 + k]) cls[p] = k;
 int("contact_class", cls);
 if (x0) flt("x0", x0);
+// ---- the steering potentials' tables (see the header)
+const steering = args.find((a) => a === "--steering" || a.startsWith("--steering="));
+if (steering !== undefined) {
+  let path = steering.startsWith("--steering=") ? steering.slice(11) : "";
+  if (path === "") {
+    path = join(homedir(), ".cache", "alphafold3", "bioemu2", `stereo_chemistry.${STEREO_COMMIT}.yaml`);
+    if (!existsSync(path)) {
+      const response = await fetch(STEREO_URL);
+      if (!response.ok) throw new Error(`could not fetch BioEmu2's stereochemistry tables: ${response.status}`);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, await response.text());
+    }
+  }
+  const t = steeringTables(topology, parseStereoTables(readFileSync(path, "utf8")),
+                           { asymId: f.asym_id, entityId: f.entity_id }, { ccd });
+  const flat = (v) => (Array.isArray(v) && v.length && (Array.isArray(v[0]) || ArrayBuffer.isView(v[0]))
+    ? v.flatMap((r) => Array.from(r)) : Array.from(v, (x) => (x === true ? 1 : x === false ? 0 : x)));
+  for (const name of STEER_INTS) int(`steer/${name}`, flat(t[name]));
+  for (const name of STEER_FLOATS) flt(`steer/${name}`, flat(t[name]));
+  for (const name of ["bond_ref", "angle_ref"]) {
+    const words = new Int32Array(Float64Array.from(t[name].flat()).buffer);
+    int(`steer/${name}.bits`, words);
+  }
+}
 const S = f.msa.length / T;
 let nValid = 0;
 for (let s = 0; s < S; s += 1) {
