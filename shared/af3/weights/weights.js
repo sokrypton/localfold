@@ -850,6 +850,12 @@ export async function confidenceWeights(store) {
       leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
       rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
       distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
+      // 🔴 RoseTTAFold3's two s_inputs columns our target_feat drops, kept as
+      // their own rows; see absentTargetFeatTerms.
+      ...(has("~_embed_features/left_target_feat_project_absent/weights") ? {
+        leftTargetFeatProjectAbsent: await T("~_embed_features/left_target_feat_project_absent/weights"),
+        rightTargetFeatProjectAbsent: await T("~_embed_features/right_target_feat_project_absent/weights"),
+      } : {}),
       // 🔴 protenix2 ADDS A SECOND DISTANCE TERM, unbinned: a bias-free Linear
       // on the RAW distance, carrying the sub-bin resolution the one-hot throws
       // away. Its binning is otherwise AF3's exactly, so nothing about the

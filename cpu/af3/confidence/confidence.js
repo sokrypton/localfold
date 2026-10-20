@@ -74,6 +74,16 @@ export const RF3_S_INPUTS_WIDTH = 449;
  */
 export function maskedGlobalNorm(values, mask, rows, channels,
                                  vendorWidth = channels) {
+  const { mean, inverse } = maskedGlobalNormStats(values, mask, rows, channels, vendorWidth);
+  const output = new Float32Array(values.length);
+  for (let index = 0; index < values.length; index += 1) {
+    output[index] = (values[index] - mean) * inverse;
+  }
+  return output;
+}
+
+/** `maskedGlobalNorm`'s two scalars: a dropped (zero) column normalises to `-mean * inverse`. */
+export function maskedGlobalNormStats(values, mask, rows, channels, vendorWidth = channels) {
   let live = 0;
   let total = 0;
   for (let row = 0; row < rows; row += 1) {
@@ -96,11 +106,32 @@ export function maskedGlobalNorm(values, mask, rows, channels,
   // ...each dropped column is zero, so it contributes mean^2, once per real row.
   variance += (vendorWidth - channels) * live * mean * mean;
   const inverse = 1 / Math.sqrt(variance / count + 1e-5);
-  const output = new Float32Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    output[index] = (values[index] - mean) * inverse;
-  }
-  return output;
+  return { mean, inverse };
+}
+
+/**
+ * RoseTTAFold3's two s_inputs columns this port's target_feat does not carry,
+ * through their own rows of the left/right projections (`*_absent` in the
+ * bundle). Each column is zero before the global norm, so after it each is the
+ * constant `-mean * inverse` on every token, and its contribution to a token's
+ * projection is that constant times the sum of the two rows: one vector of
+ * `pairChannels`, the same for every token. Null where the bundle has no rows.
+ */
+export function absentTargetFeatTerms(weights, stats, pairChannels) {
+  if (weights.leftTargetFeatProjectAbsent == null) return null;
+  const value = -stats.mean * stats.inverse;
+  const term = (rows) => {
+    if (rows.length !== 2 * pairChannels) {
+      throw new Error(`rf3's absent target_feat rows are ${rows.length} values, not 2 x ${pairChannels}`);
+    }
+    const out = new Float32Array(pairChannels);
+    for (let c = 0; c < pairChannels; c += 1) {
+      out[c] = value * rows[c] + value * rows[pairChannels + c];
+    }
+    return out;
+  };
+  return { left: term(weights.leftTargetFeatProjectAbsent),
+           right: term(weights.rightTargetFeatProjectAbsent) };
 }
 
 /** rf3's boundaries, and the bin is how many of them the distance is past. */
@@ -357,11 +388,15 @@ export function confidenceHead(input, weights, block, dialect) {
   // else here reads them. See `maskedGlobalNorm` and the flag's note in
   // dialect.js.
   let { pair: pairIn, single: singleIn, targetFeat } = input;
+  let absent = null;
   if (dialect?.confidenceGlobalNorm === true) {
     pairIn = maskedGlobalNorm(pairIn, pairMask, pairs, pairChannels);
     singleIn = maskedGlobalNorm(singleIn, seqMask, tokens, singleChannels);
     // ...and target_feat over the VENDOR's width, which is two columns wider
     // than ours. See the flag's note.
+    const stats = maskedGlobalNormStats(targetFeat, seqMask, tokens,
+                                        weights.targetFeatWidth, RF3_S_INPUTS_WIDTH);
+    absent = absentTargetFeatTerms(weights, stats, pairChannels);
     targetFeat = maskedGlobalNorm(targetFeat, seqMask, tokens,
                                   weights.targetFeatWidth, RF3_S_INPUTS_WIDTH);
   }
@@ -383,6 +418,12 @@ export function confidenceHead(input, weights, block, dialect) {
                         weights.leftTargetFeatProject);
     const right = linear(input.targetFeat, tokens, weights.targetFeatWidth, pairChannels,
                          weights.rightTargetFeatProject);
+    if (absent !== null) {
+      for (let index = 0; index < tokens * pairChannels; index += 1) {
+        left[index] += absent.left[index % pairChannels];
+        right[index] += absent.right[index % pairChannels];
+      }
+    }
     // 🔴 THE BIN COUNT IS THE WEIGHT'S, so a bundle that disagrees with the
     // dialect is a shape error rather than a silent prefix. See
     // caDistogramFeatures for what rf3's forty bins are.

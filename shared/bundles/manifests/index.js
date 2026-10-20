@@ -332,7 +332,7 @@ export const MODEL_BUNDLES = {
   rosettafold3: {
     model: "rosettafold3",
     directory: "./model-rosettafold3-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/rosettafold3-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/5e5d2948570094af971c3164710cf32b7c06a085/rosettafold3-int5/",
     release: "rosettafold3-int5",
     variable: "LOCALFOLD_INCLUDE_ROSETTAFOLD3_MODEL",
     load: () => import("./rosettafold3.js"),

@@ -15,7 +15,7 @@
  * batch - both heads consume one, and it cannot be synthesised. See
  * tools/oracle/dump_af3_confidence.py.
  */
-import { confidenceHead } from "../../cpu/af3/confidence/confidence.js";
+import { confidenceHead, plddtByRank } from "../../cpu/af3/confidence/confidence.js";
 import { Af3ConfidenceHeadGpu } from "../../webgpu/af3/confidence/confidence.js";
 import { pairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
 import { af3Dialect, confidenceWeights, openAf3Store } from "../../shared/af3/weights/weights.js";
@@ -110,17 +110,25 @@ export async function main(device, args) {
       + `\tours rms ${rms(value).toFixed(4)}\tnative rms ${entry.rms.toFixed(4)}`);
   };
 
+  // 🔴 A RANK-INDEXED HEAD GATHERS INSIDE THE REFERENCE AND IN fold.js HERE, so the head's raw output is ranked
+  // before comparing - without it rf3 read 7.25e-2 on a head that is exact.
+  const names = dump.stages["in.atomNameChars"];
+  const ranked = (plddt) => {
+    if (dialect.perAtomHeadsByRank !== true) return plddt;
+    if (names === undefined) throw new Error("this dump has no in.atomNameChars; re-run dump_af3_confidence.py");
+    return plddtByRank(plddt, Int32Array.from(names.data), input.tokens, input.dense);
+  };
   if (option(args, "cpu", "on") !== "off") {
     const cpu = confidenceHead(input, weights, pairformerBlock, dialect);
     console.log("CPU");
-    report("plddt", cpu.plddt, "out.predicted_lddt");
+    report("plddt", ranked(cpu.plddt), "out.predicted_lddt");
     report("pde", cpu.pde, "out.full_pde");
     report("pae", cpu.pae, "out.full_pae");
   }
 
   const gpu = await new Af3ConfidenceHeadGpu(device).run(input, weights, dialect);
   console.log("GPU");
-  report("gpu.plddt", gpu.plddt, "out.predicted_lddt");
+  report("gpu.plddt", ranked(gpu.plddt), "out.predicted_lddt");
   report("gpu.pde", gpu.pde, "out.full_pde");
   report("gpu.pae", gpu.pae, "out.full_pae");
 

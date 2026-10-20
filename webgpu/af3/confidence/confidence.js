@@ -42,7 +42,9 @@ import { tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
 // STATISTIC rather than a kernel: rf3's confidence inputs are normalised on the
 // host before any of this runs. Sharing a kernel would make the differential
 // agree with itself; sharing a mean and a variance cannot.
-import { maskedGlobalNorm, RF3_S_INPUTS_WIDTH } from "../../../cpu/af3/confidence/confidence.js";
+import {
+  absentTargetFeatTerms, maskedGlobalNorm, maskedGlobalNormStats, RF3_S_INPUTS_WIDTH,
+} from "../../../cpu/af3/confidence/confidence.js";
 
 /** Rows of the pair read back at a time by streamGlobalNorm. */
 const NORM_PIECE_BYTES = 256 * 1048576;
@@ -297,6 +299,8 @@ const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> left: array<f32>;
 @group(0) @binding(3) var<storage, read_write> right: array<f32>;
+${shape.absentTerms === true
+  ? "@group(0) @binding(4) var<storage, read> absent: array<f32>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -304,8 +308,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (slot >= TOKENS * C_Z) { return; }
   let token = slot / C_Z;
   let c = slot % C_Z;
-  var left_total = 0.0;
-  var right_total = 0.0;
+  // rf3's two dropped s_inputs columns, one per-channel vector each side; see
+  // absentTargetFeatTerms in the CPU reference.
+  var left_total = ${shape.absentTerms === true ? "absent[c]" : "0.0"};
+  var right_total = ${shape.absentTerms === true ? "absent[C_Z + c]" : "0.0"};
   // ...one read of the feature serving both projections, which is why they
   // share a kernel rather than being two dispatches.
   for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
@@ -1024,7 +1030,11 @@ export class Af3ConfidenceHeadGpu {
     // streamGlobalNorm. At 2047 tokens it is 2 GiB, and the host copy and the
     // normalised one beside it are two arrays the browser will not allocate.
     const streamPair = dialect?.confidenceGlobalNorm === true && input.pairBuffer !== undefined;
+    let absent = null;
     if (dialect?.confidenceGlobalNorm === true) {
+      absent = absentTargetFeatTerms(
+        weights, maskedGlobalNormStats(input.targetFeat, seqMask, tokens, targetFeatWidth,
+                                       RF3_S_INPUTS_WIDTH), pairChannels);
       input = { ...input,
                 pair: streamPair ? input.pair
                   : maskedGlobalNorm(input.pair, pairMask, pairs, pairChannels),
@@ -1045,7 +1055,8 @@ export class Af3ConfidenceHeadGpu {
     const shape = { tokens, pairChannels, singleChannels, targetFeatWidth, dense,
                     preSymmetrisedPde: dialect?.preSymmetrisedPde === true,
                     // rf3's 40-bin CA-CA embedding; see caDistogramFeatures.
-                    confidenceCaDgram: dialect?.confidenceCaDgram === true };
+                    confidenceCaDgram: dialect?.confidenceCaDgram === true,
+                    absentTerms: absent !== null && weights.reembed === undefined };
     const sources = createConfidenceShaders(
       shape, reembedding ? {} : embedPacked.offsets, headPacked.offsets, epsilon, variance,
       reembedding ? embedPacked.offsets : null);
@@ -1060,7 +1071,7 @@ export class Af3ConfidenceHeadGpu {
       + `:cz${pairChannels}:cs${singleChannels}:tf${targetFeatWidth}`
       + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
       + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
-      + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}`;
+      + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}:ab${shape.absentTerms}`;
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
@@ -1215,7 +1226,9 @@ export class Af3ConfidenceHeadGpu {
       project.setPipeline(compiled.embedProject);
       project.setBindGroup(0, this.device.createBindGroup({
         layout: compiled.embedProject.getBindGroupLayout(0),
-        entries: [targetFeat, embedWeights, left, right].map(
+        entries: [targetFeat, embedWeights, left, right,
+                  ...(shape.absentTerms ? [keep(this.allocator.upload("af3-conf.absent",
+                    Float32Array.of(...absent.left, ...absent.right), storage))] : [])].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
       const projectGroups = Math.ceil((tokens * pairChannels) / 64);

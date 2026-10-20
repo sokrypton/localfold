@@ -116,6 +116,8 @@ rep = atom_layout.convert(batch.pseudo_beta_info.token_atoms_to_pseudo_beta,
 put("in.pair", z); put("in.single", s); put("in.targetFeat", s_inputs)
 put("in.pseudoBeta", rep)
 put("in.seqMask", batch.token_features.mask)
+# ...and the names, which rank-indexed heads (PER_ATOM_HEADS_BY_RANK) gather by; the checker applies the same
+put("in.atomNameChars", batch.ref_structure.atom_name_chars)
 put("in.bondMatrix", bond_matrix)
 put("in.bondTypeMatrix", bond_type_matrix)
 for name in ("residue_index", "token_index", "asym_id", "entity_id", "sym_id"):
