@@ -11,6 +11,7 @@
 #include "kernels.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -1091,8 +1092,157 @@ static void triCase(int N, int C, int I, bool outgoing) {
   for (int i = 0; i < 16; ++i) { release(h[i]); release(gp[i]); }
 }
 
-int main() {
+// ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
+// The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
+// design-sized complex, which is what has to fit in 16 GB of unified memory.
+static void memReport() {
+  designShareScratch();
+  const int N = 192, Cz = 128, I = 128, Cm = 256, O = 32, F = 128, S = 8, H = 4, D = 32;
+  const size_t n2 = (size_t)N * N;
+  printf("AF2 widths at N=%d (pair %d, msa %d x %d, triangle intermediate %d)\n", N, Cz, S, Cm, I);
+
+  auto z = [](size_t n) { return alloc(n * sizeof(float)); };
+  bool isolate = true;
+  auto show = [&](const char* what) {
+    sync();
+    if (!isolate) return;
+    printf("  %-40s scratch %8.1f MB   peak live %8.1f MB\n", what,
+           scratchHeld() / 1048576.0, peakLive() / 1048576.0);
+    releaseScratch();
+    resetPeak();
+  };
+
+  {   // Transition, on the pair track
+    void* act = z(n2 * Cz); void* dOut = z(n2 * Cz); void* dAct = z(n2 * Cz);
+    void* ls = z(Cz); void* lo = z(Cz); void* W1 = z((size_t)Cz * Cz * 4); void* b1 = z((size_t)Cz * 4);
+    void* W2 = z((size_t)Cz * 4 * Cz); void* b2 = z(Cz);
+    transitionBwd((const float*)act, (const float*)dOut, n2, Cz, Cz * 4, (const float*)ls, (const float*)lo,
+                  (const float*)W1, (const float*)b1, (const float*)W2, (const float*)b2, (float*)dAct);
+    show("transitionBwd (pair track)");
+    for (void* p : {act, dOut, dAct, ls, lo, W1, b1, W2, b2}) release(p);
+  }
+  {   // OuterProductMean
+    void* msa = z((size_t)S * N * Cm); void* mask = z((size_t)S * N); void* dOut = z(n2 * F);
+    void* dMsa = z((size_t)S * N * Cm);
+    void* ls = z(Cm); void* lo = z(Cm); void* Wl = z((size_t)Cm * O); void* bl = z(O);
+    void* Wr = z((size_t)Cm * O); void* br = z(O); void* Wo = z((size_t)O * O * F);
+    outerProductMeanBwd((const float*)msa, (const float*)mask, S, N, Cm, O, F, (const float*)ls, (const float*)lo,
+                        (const float*)Wl, (const float*)bl, (const float*)Wr, (const float*)br,
+                        (const float*)Wo, (const float*)dOut, (float*)dMsa);
+    show("outerProductMeanBwd");
+    for (void* p : {msa, mask, dOut, dMsa, ls, lo, Wl, bl, Wr, br, Wo}) release(p);
+  }
+  {   // TriangleMultiplication - the one flagged as the ceiling
+    void* pair = z(n2 * Cz); void* mask = z(n2); void* dOut = z(n2 * Cz); void* dPair = z(n2 * Cz);
+    void* v1 = z((size_t)Cz * I); void* v2 = z((size_t)I * Cz); void* s1 = z(Cz); void* s2 = z(I);
+    void* bI = z(I); void* bC = z(Cz); void* wgg = z((size_t)Cz * Cz);
+    TriMulWeights w{};
+    w.lnScale = (const float*)s1; w.lnOffset = (const float*)s1;
+    w.Wl = (const float*)v1; w.bl = (const float*)bI;
+    w.Wr = (const float*)v1; w.br = (const float*)bI;
+    w.Wlg = (const float*)v1; w.blg = (const float*)bI;
+    w.Wrg = (const float*)v1; w.brg = (const float*)bI;
+    w.centerScale = (const float*)s2; w.centerOffset = (const float*)s2;
+    w.Wo = (const float*)v2; w.bo = (const float*)bC;
+    w.Wg = (const float*)wgg; w.bg = (const float*)bC;
+    triangleMultiplicationBwd((const float*)pair, (const float*)mask, N, Cz, I, true, w,
+                              (const float*)dOut, (float*)dPair);
+    show("triangleMultiplicationBwd");
+    for (void* p : {pair, mask, dOut, dPair, v1, v2, s1, s2, bI, bC, wgg}) release(p);
+  }
+  {   // TriangleAttention, through biasedSelfAttentionBwd
+    const int W = H * D;
+    void* pair = z(n2 * Cz); void* mask = z(n2); void* dOut = z(n2 * Cz); void* dPair = z(n2 * Cz);
+    void* sc = z(Cz); void* f2 = z((size_t)Cz * H); void* wp = z((size_t)Cz * W); void* wo = z((size_t)W * Cz);
+    void* bw = z(W); void* bc = z(Cz);
+    BiasedAttnWeights w{};
+    w.qScale = (const float*)sc; w.qOffset = (const float*)sc; w.feat2dW = (const float*)f2;
+    w.attn.Wq = (const float*)wp; w.attn.Wk = (const float*)wp; w.attn.Wv = (const float*)wp;
+    w.attn.Wg = (const float*)wp; w.attn.bg = (const float*)bw;
+    w.attn.Wo = (const float*)wo; w.attn.bo = (const float*)bc;
+    biasedSelfAttentionBwd((const float*)pair, (const float*)pair, (const float*)mask,
+                           N, N, Cz, Cz, H, D, Cz, w, (const float*)dOut, (float*)dPair, (float*)dPair);
+    show("biasedSelfAttentionBwd (triangle attn)");
+    for (void* p : {pair, mask, dOut, dPair, sc, f2, wp, wo, bw, bc}) release(p);
+  }
+  printf("\n  a pair tensor at this size is %.1f MB; the Evoformer holds several per block\n",
+         n2 * (size_t)Cz * 4 / 1048576.0);
+}
+
+// What a BLOCK holds: the same four modules one after another with nothing released between them, which is what an
+// Evoformer block does. Without shareScratch this is the sum of the four; with it, the maximum.
+// Run it twice to see the difference: LOCALFOLD_SHARED_SCRATCH=0 is the control.
+static void memBlock(int N) {
+  designShareScratch();
+  const int Cz = 128, I = 128, Cm = 256, O = 32, F = 128, S = 8, H = 4, D = 32;
+  const size_t n2 = (size_t)N * N;
+  auto z = [](size_t n) { return alloc(n * sizeof(float)); };
+  releaseScratch();
+  resetPeak();
+
+  void* pair = z(n2 * Cz); void* pmask = z(n2); void* dOutP = z(n2 * Cz); void* dPair = z(n2 * Cz);
+  void* msa = z((size_t)S * N * Cm); void* mmask = z((size_t)S * N); void* dMsa = z((size_t)S * N * Cm);
+  void* dOutZ = z(n2 * F);
+  void* sC = z(Cz); void* sI = z(I); void* sM = z(Cm);
+  void* bI = z(I); void* bC = z(Cz); void* bO = z(O);
+  void* wCI = z((size_t)Cz * I); void* wIC = z((size_t)I * Cz); void* wCC = z((size_t)Cz * Cz);
+  void* wC4 = z((size_t)Cz * Cz * 4); void* b4 = z((size_t)Cz * 4);
+  void* wMO = z((size_t)Cm * O); void* wOOF = z((size_t)O * O * F);
+  const int W = H * D;
+  void* w2d = z((size_t)Cz * H); void* wqkv = z((size_t)Cz * W); void* wout = z((size_t)W * Cz); void* bW = z(W);
+
+  // the pair transition
+  transitionBwd((const float*)pair, (const float*)dOutP, n2, Cz, Cz * 4, (const float*)sC, (const float*)sC,
+                (const float*)wC4, (const float*)b4, (const float*)wC4, (const float*)bC, (float*)dPair);
+  // the outer product
+  outerProductMeanBwd((const float*)msa, (const float*)mmask, S, N, Cm, O, F, (const float*)sM, (const float*)sM,
+                      (const float*)wMO, (const float*)bO, (const float*)wMO, (const float*)bO,
+                      (const float*)wOOF, (const float*)dOutZ, (float*)dMsa);
+  // both triangle multiplications
+  TriMulWeights tw{};
+  tw.lnScale = (const float*)sC; tw.lnOffset = (const float*)sC;
+  tw.Wl = (const float*)wCI; tw.bl = (const float*)bI;
+  tw.Wr = (const float*)wCI; tw.br = (const float*)bI;
+  tw.Wlg = (const float*)wCI; tw.blg = (const float*)bI;
+  tw.Wrg = (const float*)wCI; tw.brg = (const float*)bI;
+  tw.centerScale = (const float*)sI; tw.centerOffset = (const float*)sI;
+  tw.Wo = (const float*)wIC; tw.bo = (const float*)bC;
+  tw.Wg = (const float*)wCC; tw.bg = (const float*)bC;
+  for (bool outgoing : {true, false})
+    triangleMultiplicationBwd((const float*)pair, (const float*)pmask, N, Cz, I, outgoing, tw,
+                              (const float*)dOutP, (float*)dPair);
+  // both triangle attentions
+  BiasedAttnWeights bw{};
+  bw.qScale = (const float*)sC; bw.qOffset = (const float*)sC; bw.feat2dW = (const float*)w2d;
+  bw.attn.Wq = (const float*)wqkv; bw.attn.Wk = (const float*)wqkv; bw.attn.Wv = (const float*)wqkv;
+  bw.attn.Wg = (const float*)wqkv; bw.attn.bg = (const float*)bW;
+  bw.attn.Wo = (const float*)wout; bw.attn.bo = (const float*)bC;
+  for (int t = 0; t < 2; ++t)
+    biasedSelfAttentionBwd((const float*)pair, (const float*)pair, (const float*)pmask,
+                           N, N, Cz, Cz, H, D, Cz, bw, (const float*)dOutP, (float*)dPair, (float*)dPair);
+  sync();
+  const bool off = getenv("LOCALFOLD_SHARED_SCRATCH") && !atoi(getenv("LOCALFOLD_SHARED_SCRATCH"));
+  printf("one Evoformer block's backward at N=%d, %s (a pair buffer is %.1f MB, the sharing floor %.0f MB):\n",
+         N, off ? "sharing OFF (the control)" : "sharing on", n2 * (size_t)Cz * 4 / 1048576.0,
+         (getenv("LOCALFOLD_SHARED_MIN") ? atoll(getenv("LOCALFOLD_SHARED_MIN")) : (32LL << 20)) / 1048576.0);
+  printf("  transition + outer product + 2 triangle multiplications + 2 triangle attentions\n");
+  printf("  scratch held %8.1f MB     peak live %8.1f MB\n", scratchHeld() / 1048576.0, peakLive() / 1048576.0);
+  for (void* p : {pair, pmask, dOutP, dPair, msa, mmask, dMsa, dOutZ, sC, sI, sM, bI, bC, bO, wCI, wIC, wCC,
+                  wC4, b4, wMO, wOOF, w2d, wqkv, wout, bW}) release(p);
+}
+
+int main(int argc, char** argv) {
   setSource("design", PORT_SOURCE);
+  for (int i = 1; i < argc; ++i)
+    if (!strcmp(argv[i], "--mem")) { memReport(); return 0; }
+    else if (!strcmp(argv[i], "--mem-block")) {
+      memBlock(i + 1 < argc ? atoi(argv[i + 1]) : 192);
+      return 0;
+    }
+  // the sharing is on for the test too, so the differential cases run against the aliased buffers a fold would use
+  // (LOCALFOLD_SHARED_SCRATCH=0 is the control; LOCALFOLD_SCRIBBLE=1 NaN-fills every slot at a change of family and
+  // the results must not move - see docs/BINDCRAFT2.md)
+  designShareScratch();
   printf("LayerNorm backward\n");
   for (auto [rows, C] : std::vector<std::pair<size_t, int>>{{8, 128}, {64, 256}, {333, 128}, {1024, 384}, {7, 64}})
     lnCase(rows, C, 1e-5);

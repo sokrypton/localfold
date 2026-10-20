@@ -311,3 +311,74 @@ Consequences worth keeping: **that parameter never moves during training and can
 carries it regardless, so a port must still read it from the checkpoint, and must not "fix" it. Its SCALE is a real
 parameter (`dbScale` passes at 3.4e-7); only the offset is dead. And the test now reports such a case as
 `ok (zero gradient)` on an absolute floor rather than a relative one, which is the honest way to check it.
+
+### The memory pass: 830 MB of scratch a block down to 436, and a bug the proof caught
+
+`metal/design/localfold-design --mem` reports what each backward holds at AF2's real widths, and `--mem-block [N]`
+what a whole block holds with nothing released between modules - which is what an Evoformer block actually does.
+
+**Two separate problems, and `shareScratch` only addresses one of them.** Its granularity is the FAMILY: it aliases
+the buffers of modules that run at different times, and can do nothing about buffers co-existing inside one module.
+So both were done.
+
+#### Within a module: buffers whose predecessors are provably finished
+
+A pair buffer is 18 MB at N=192, and two modules were each holding three more than they needed.
+
+| | before | after |
+| --- | --- | --- |
+| `triangleMultiplicationBwd` | 378.3 MB | **324.3 MB** |
+| `biasedSelfAttentionBwd` (triangle attn) | 237.8 MB | **183.8 MB** |
+| `transitionBwd` (pair track) | 180.3 MB | 180.3 MB |
+| `outerProductMeanBwd` | 33.8 MB | 33.8 MB |
+
+In the triangle, `q`, `prow` and `gPre` are spent by the time the product's cotangent, its transpose and the final
+LayerNorm's input are wanted, so those three are named rather than allocated. In the attention module, `gpre` and
+`dgpre` are read for the last time by the gate, and one of `dwa`/`dwa2` carries the gate stage's spent cotangent.
+Dispatches run in issue order on one queue, so a later write cannot race an earlier read - that is what makes this
+safe rather than hopeful.
+
+🔴 **AND THE OBVIOUS WAY TO DO IT IS WRONG.** `dqs` was first bound to `dwa2` at declaration, which is *before* the
+`std::swap` that decides which of the two carries the live cotangent - so after the swap `dqs` aliased the very
+buffer `attentionBwd` READS. The dq pass overwrote its own input and the dk/dv and dBias passes then read rubbish.
+**21 cases failed and named exactly the gradients that depend on it** (dWk, dWv, dMData, dPairBias, while dWq and
+dWo passed). The swap is gone now and the dead buffer is bound after the branch. A buffer reuse must be bound where
+the lifetime is *known*, not where the buffer is declared.
+
+#### Across modules: `designShareScratch()`
+
+Families mirroring `metal/af2/main.mm`'s for the forward - `dtr`, `dopm`, `dtri`, `dbattn`, `dattnm`, `dattn`,
+`dln`. The nesting is the part that matters: `attentionModuleBwd` runs INSIDE `biasedSelfAttentionBwd` and
+`attentionBwd` inside that, and a LayerNorm's row statistics are live inside every module, so those are declared as
+living around each other's turn and are never aliased together.
+
+One block's backward - transition, outer product, two triangle multiplications, two triangle attentions:
+
+| N | pair buffer | sharing off | sharing on | saved |
+| --- | --- | --- | --- | --- |
+| 192 | 18.0 MB | 721.5 MB | 721.5 MB | **nothing** |
+| 192 (floor at 1 MB) | 18.0 MB | 721.5 MB | **436.5 MB** | 39.5% |
+| 320 | 52.4 MB | 1986.8 MB | **1236.8 MB** | 37.7% |
+
+🔴 **THE FLOOR IS WHY N=192 GAINS NOTHING.** `shareScratch` only aliases buffers of **32 MB or more**
+(`LOCALFOLD_SHARED_MIN`, core.mm:87), and a 128-channel pair tensor does not reach that until about **N=256**. So
+the mechanism engages by itself exactly where the pressure is - at N=320 it already saves 38% - and is inert below
+that. Lowering the floor to 1 MB buys another 39.5% at N=192; it is a global knob, not a per-tree setting, so it is
+left alone rather than set from library code. If a small-N design loop ever needs it, that is the lever, and the
+scribble proof below passes at that setting too.
+
+#### Verified, not assumed
+
+`LOCALFOLD_SCRIBBLE=1` NaN-fills every slot but those of a family nested with either side of each change of family,
+and the results must not move (docs/CUDA-TO-METAL.md). All 264 cases pass at **every** floor tried - 1 byte, 256,
+4096, 65536 and the 32 MB default - and with `LOCALFOLD_SHARED_SCRATCH=0`, the control. At a floor of 1 byte every
+buffer in the tree is aliased and scribbled, so that run is the one with teeth.
+
+#### Still on the table
+
+- **The transition is 180 MB and none of it was reclaimed**, because `ln`, `a1` and `dh` are genuinely all live at
+  its peak - `a1` is 4x the pair width. The fix is not aliasing but **chunking over rows**, which AF2 itself does
+  (`mapping.inference_subbatch`); the module is embarrassingly row-parallel and nothing here needs a whole pass at
+  once.
+- The triangle still holds twelve pair-sized buffers that are live simultaneously around its product. Cutting that
+  needs the product tiled over rows, not a cleverer alias.

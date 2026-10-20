@@ -9,6 +9,18 @@
 
 namespace mt {
 
+// The families (core.h shareScratch): a block's modules - the transitions, the outer product, the triangle
+// multiplications and the attentions - run one after another, so their large buffers alias. What must NOT alias is
+// anything live around another's turn: the attention module runs inside the biased-attention wrapper and the core
+// attention inside that, and a LayerNorm's row statistics are live inside every one of them.
+void designShareScratch() {
+  shareScratch({{"design.tr.", "dtr"}, {"design.opm.", "dopm"}, {"design.tri.", "dtri"},
+                {"design.battn.", "dbattn"}, {"design.attnm.", "dattnm"}, {"design.attn.", "dattn"},
+                {"design.ln.", "dln"}},
+               {{"dln", "dtr"}, {"dln", "dopm"}, {"dln", "dtri"}, {"dln", "dbattn"}, {"dln", "dattnm"},
+                {"dln", "dattn"}, {"dattnm", "dbattn"}, {"dattn", "dattnm"}, {"dattn", "dbattn"}});
+}
+
 // a simdgroup a row, eight a threadgroup - metal/core's layerNormRun grid, so the rows map the same way
 static Grid rowGroups(size_t rows) {
   size_t groups = (rows + 7) / 8;
@@ -267,9 +279,19 @@ void attentionModuleBwd(const float* qData, const float* mData, const float* mas
   float* dwa = buf("dwa", qrows * W);
   float* dwa2 = buf("dwa2", qrows * W);
   float* dgpre = buf("dgpre", qrows * W);
-  float* dqs = buf("dqs", qrows * W);
-  float* dkk = buf("dk", krows * W);
-  float* dvv = buf("dv", krows * W);
+  // REUSED, not allocated. By the time the core backward runs, three of the buffers above are dead whether or not
+  // this attention gates: `gpre` and `dgpre` are read for the last time by gateBwd and by the gate's own linear -
+  // or, with no gate, are never touched at all - and ONE of dwa/dwa2 holds the gate stage's spent cotangent while
+  // the other carries the core's. 54 MB at a 192-residue triangle attention.
+  //
+  // 🔴 WHICH of dwa/dwa2 is dead depends on the gate, so it is bound AFTER that branch, below. An earlier version
+  // bound it here, before a std::swap, so `dqs` ended up aliasing the very cotangent attentionBwd READS: the dq
+  // pass overwrote its own input and the dk/dv and dBias passes then read rubbish. 21 cases failed and said so.
+  //
+  // Q == K wherever this reuse matters: cross-attention with K > Q would want the k-sized buffers bigger, so they
+  // are taken from the q-sized ones only when that holds, and allocated when it does not.
+  float* dkk = krows <= qrows ? gpre : buf("dk", krows * W);
+  float* dvv = krows <= qrows ? dgpre : buf("dv", krows * W);
 
   auto lin = [&](const float* X, const float* Wm, const float* b, float* Y, size_t rows, int in, int out) {
     Gemm gm{}; gm.X = X; gm.W = Wm; gm.Y = Y; gm.rows = rows; gm.in = in; gm.out = out; gm.bias = b; gemm(gm);
@@ -292,15 +314,18 @@ void attentionModuleBwd(const float* qData, const float* mData, const float* mas
   linearBwd(waOut, w.Wo, dOut, dwa, g.Wo, g.bo, qrows, W, O);
 
   bool wrote = false;                          // whether dQData has been written yet (the rest accumulate)
+  float* dAttnOut = dwa;                       // the cotangent of the UNgated attention output
+  float* dqs = dwa2;                           // and the spent buffer, free for the core's dq
   if (w.Wg) {
     gateBwd(dwa, wa, gpre, dwa2, dgpre, qrows * (size_t)W);
     linearBwd(qData, w.Wg, dgpre, dQData, g.Wg, g.bg, qrows, Cq, W, false);
     wrote = true;
-    std::swap(dwa, dwa2);                      // dwa is now the cotangent of the UNgated attention output
+    dAttnOut = dwa2;                           // gateBwd put d/d(wa) here, and dwa is now spent
+    dqs = dwa;
   }
 
   // -------- the core
-  attentionBwd(qs, kk, vv, maskBias, pairBias, wa, L, dwa, dqs, dkk, dvv, dPairBias, B, Q, K, H, D);
+  attentionBwd(qs, kk, vv, maskBias, pairBias, wa, L, dAttnOut, dqs, dkk, dvv, dPairBias, B, Q, K, H, D);
 
   // -------- and back through the three projections. q's carries AF2's scale.
   run1d("lf_scale", qrows * W, ScaleArgs{dqs, qrows * W, scale, 0});
@@ -398,6 +423,15 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
   float* A = rowBuf("A", I);                   // the packed [I][n2] planes
   float* B = rowBuf("B", I);
   float* P = rowBuf("P", I);
+  // REUSED, not allocated: three buffers are provably dead by the time these are wanted, and a pair-sized buffer is
+  // 18 MB at N=192, so naming them here saves 54. If a lifetime below is wrong the test suite fails - the gradients
+  // are what these feed.
+  //   q    the output projection consumed it, before the product's cotangent exists
+  //   prow the centre LayerNorm consumed it, likewise
+  //   gPre the output gate consumed it, at the very start
+  float* dA = q;
+  float* dB = prow;
+  float* dln = gPre;
 
   auto linFwd = [&](const float* X, const float* W, const float* b, float* Y, int in, int out) {
     Gemm g{}; g.X = X; g.W = W; g.Y = Y; g.rows = n2; g.in = in; g.out = out; g.bias = b; gemm(g);
@@ -435,7 +469,7 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
   // ---------------- the output gate, and the two paths out of it
   // out = o * sigmoid(gPre): tmpC gets d/do, and the gate's own cotangent goes back through its linear
   float* dgPre = rowBuf("dgPre", C);
-  gateBwd(dOut, o, gPre, tmpC, dgPre, n2 * (size_t)C);
+  gateBwd(dOut, o, gPre, tmpC, dgPre, n2 * (size_t)C);   // (gPre is read here and reused as dln at the end)
   linearBwd(act0, w.Wg, dgPre, dPair, gr.Wg, gr.bg, n2, C, C, false);   // the first contributor to dact0
   float* dact0 = dPair;                                                 // accumulated in place from here on
 
@@ -446,8 +480,6 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
   // ---------------- the product. dP is packed in place of P, which is finished with
   float* dP = P;
   pack(tmpI2, dP, I);
-  float* dA = (float*)scratchBytes("design.tri.dA", n2 * (size_t)I * sizeof(float));
-  float* dB = (float*)scratchBytes("design.tri.dB", n2 * (size_t)I * sizeof(float));
   if (outgoing) {
     // p[i][j] = sum_k a[i][k] b[j][k]:  da = dP B,  db = dP^T A
     batched(dP, false, B, false, dA, N, N, N, I, plane);
@@ -473,7 +505,6 @@ void triangleMultiplicationBwd(const float* pair, const float* mask, int N, int 
   linearBwd(act0, w.Wrg, tmpI2, dact0, gr.Wrg, gr.brg, n2, C, I, true);
 
   // dact0 is dPair's buffer; the LayerNorm reads it and overwrites it with the module's own cotangent
-  float* dln = rowBuf("dln", C);
   copy(dln, dact0, n2 * (size_t)C * sizeof(float));
   layerNormBwd(pair, dln, dPair, n2, C, w.lnScale, gr.lnScale, gr.lnOffset);
 }

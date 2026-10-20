@@ -9,6 +9,17 @@
 
 namespace mt {
 
+// ---------------------------------------------------------------- scratch
+// Declare this tree's families of scratch to metal/core, so the large buffers of modules that run one after another
+// ALIAS instead of each holding its own (core.h shareScratch; metal/af2/main.mm does the same for the forward).
+// A driver must call it once before folding, or every module's scratch is its own and a block holds the sum rather
+// than the maximum - at a 192-residue pair that is 830 MB against 324.
+//
+// The nesting matters as much as the families: `attentionModuleBwd` runs INSIDE `biasedSelfAttentionBwd` and
+// `attentionBwd` inside that, and layerNormBwd's statistics are live inside every module, so those are declared as
+// living around each other's turn and are never aliased together.
+void designShareScratch();
+
 // ---------------------------------------------------------------- LayerNorm
 // The forward is metal/core's layerNorm: y[c] = ((x[c] - mean) * inv) * scale[c] + offset[c]. This computes the row
 // statistics itself (the forward saves none), then dx, and optionally the parameters' gradients.

@@ -43,6 +43,24 @@ structure module and the heads, and the design loop itself.
 One finding from here that a reader should not re-derive: **`feat_2d_norm`'s offset has an identically zero
 gradient** and is a dead parameter in AF2. See `docs/BINDCRAFT2.md`.
 
+## Memory
+
+`localfold-design --mem` reports what each backward holds at AF2's real widths; `--mem-block [N]` what a whole
+block holds with nothing released between modules. A driver must call **`designShareScratch()`** once, or every
+module's scratch is its own and a block holds the sum rather than the maximum.
+
+Two levers, and they are different: `shareScratch` aliases across MODULES (its granularity is the family, so it can
+do nothing inside one), while buffers that co-exist inside a module are reused by hand where a lifetime is provably
+over. Both are done; `docs/BINDCRAFT2.md` has the numbers, the 32 MB floor that makes the sharing inert below about
+N=256, and the aliasing bug the proof caught.
+
+Verify any change here with the mechanism's own proof, which must stay `all ok`:
+
+```
+LOCALFOLD_SCRIBBLE=1 LOCALFOLD_SHARED_MIN=1 metal/design/localfold-design   # every buffer aliased and NaN-scribbled
+LOCALFOLD_SHARED_SCRATCH=0 metal/design/localfold-design                    # the control
+```
+
 ## The testing rule this tree follows
 
 AGENTS.md: *every GPU kernel must have a deterministic differential test against an independent reference*. For a
