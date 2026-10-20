@@ -193,3 +193,20 @@ struct ColSumArgs {
   CP(float) mean; CP(float) inv;   // from lf_ln_stats; needed only for dscale
   u64 rows; int C, ldx, ldy; uint pad, pad2;
 };
+
+// ---------------------------------------------------------------- the structure module's rigids
+// A rigid is 12 floats, the rotation ROW-MAJOR then the translation - metal/af2/af2.metal's own layout, so a
+// backward here reads exactly what that forward wrote. Both kernels below are a THREAD A RESIDUE rather than a
+// thread a point: several (head, point) pairs read one residue's rigid, so a per-point kernel would need a float
+// atomic to accumulate dRig, and AGENTS.md wants the differential test to be DETERMINISTIC - an atomic sums in
+// whatever order the threads happen to retire.
+
+// The backbone update (af2_rigid_update): rigNew = rigOld o quat(upd), the quaternion (1, u0, u1, u2) normalised and
+// the translation (u3, u4, u5). Given dRigNew: dRigOld [L][12] and dUpd [L][6].
+struct RigidUpdBwdArgs { CP(float) rigOld; CP(float) upd; CP(float) dRigNew; DP(float) dRigOld; DP(float) dUpd;
+                         uint L, accum; };
+
+// Points into the global frame (af2_points_global): g = R loc + t, loc read out of proj [L][H*3*P] as the three
+// blocks (x[0:P], y[P:2P], z[2P:3P]) a head. Given dOut [L][H][P][3]: dProj [L][H*3*P] and dRig [L][12].
+struct PointsGlobalBwdArgs { CP(float) proj; CP(float) rig; CP(float) dOut; DP(float) dProj; DP(float) dRig;
+                             uint L, H, P, accumProj; uint accumRig, pad; };

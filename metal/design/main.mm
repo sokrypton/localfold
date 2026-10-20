@@ -8,6 +8,7 @@
 // produced. The forward is the thing metal/core's own selftest already holds to the GPU, so an agreement here means
 // the chain rule was applied correctly, not just consistently.
 #include "grad.h"
+#include "structgrad.h"
 #include "kernels.h"
 #include <cmath>
 #include <cstdio>
@@ -1777,6 +1778,211 @@ static void evoCase(EvoDims d) {
   release(gMsa); release(gPair); release(gRowWv); release(gTriOutWl); release(gPairTrW1); release(gOpmWl);
 }
 
+// ---------------------------------------------------------------- the structure module's rigids
+// A rigid is 12 doubles, the rotation row-major then the translation - the forward's layout. The operands below are
+// RANDOM MATRICES rather than rotations on purpose: these kernels treat the rotation as a general matrix, and an
+// orthogonal or symmetric operand hides a transposed index.
+static void rigCompose(const double* A, const double* B, double* C) {
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) C[i * 3 + j] = A[i * 3] * B[j] + A[i * 3 + 1] * B[3 + j] + A[i * 3 + 2] * B[6 + j];
+  for (int k = 0; k < 3; ++k)
+    C[9 + k] = A[k * 3] * B[9] + A[k * 3 + 1] * B[10] + A[k * 3 + 2] * B[11] + A[9 + k];
+}
+static void quatRigid(const double* u, double* B) {
+  double w = 1, x = u[0], y = u[1], z = u[2];
+  double inv = 1.0 / sqrt(w * w + x * x + y * y + z * z);
+  w *= inv; x *= inv; y *= inv; z *= inv;
+  B[0] = 1 - 2 * (y * y + z * z); B[1] = 2 * (x * y - w * z);     B[2] = 2 * (x * z + w * y);
+  B[3] = 2 * (x * y + w * z);     B[4] = 1 - 2 * (x * x + z * z); B[5] = 2 * (y * z - w * x);
+  B[6] = 2 * (x * z - w * y);     B[7] = 2 * (y * z + w * x);     B[8] = 1 - 2 * (x * x + y * y);
+  B[9] = u[3]; B[10] = u[4]; B[11] = u[5];
+}
+static double rigUpdS(const std::vector<double>& A, const std::vector<double>& u, const std::vector<double>& dC,
+                      int L) {
+  double S = 0;
+  for (int i = 0; i < L; ++i) {
+    double B[12], C[12];
+    quatRigid(&u[(size_t)i * 6], B);
+    rigCompose(&A[(size_t)i * 12], B, C);
+    for (int k = 0; k < 12; ++k) S += dC[(size_t)i * 12 + k] * C[k];
+  }
+  return S;
+}
+
+static void rigidUpdCase(int L) {
+  std::vector<double> A = randv((size_t)L * 12), u = randv((size_t)L * 6, 0.5),
+                      dC = randv((size_t)L * 12, 0.5);
+
+  // reference one: the analytic backward, in double
+  std::vector<double> rdA((size_t)L * 12, 0), rdu((size_t)L * 6, 0);
+  for (int i = 0; i < L; ++i) {
+    const double* a = &A[(size_t)i * 12];
+    const double* g = &dC[(size_t)i * 12];
+    double B[12];
+    quatRigid(&u[(size_t)i * 6], B);
+    for (int k = 0; k < 3; ++k) {
+      for (int j = 0; j < 3; ++j) {
+        double s = g[9 + k] * B[9 + j];
+        for (int m = 0; m < 3; ++m) s += g[k * 3 + m] * B[j * 3 + m];
+        rdA[(size_t)i * 12 + k * 3 + j] = s;
+      }
+      rdA[(size_t)i * 12 + 9 + k] = g[9 + k];
+    }
+    double G[9];
+    for (int j = 0; j < 3; ++j)
+      for (int m = 0; m < 3; ++m) {
+        double s = 0;
+        for (int k = 0; k < 3; ++k) s += g[k * 3 + m] * a[k * 3 + j];
+        G[j * 3 + m] = s;
+      }
+    double w = 1, x = u[(size_t)i * 6], y = u[(size_t)i * 6 + 1], z = u[(size_t)i * 6 + 2];
+    double inv = 1.0 / sqrt(w * w + x * x + y * y + z * z);
+    w *= inv; x *= inv; y *= inv; z *= inv;
+    double dw = 2 * (-G[1] * z + G[2] * y + G[3] * z - G[5] * x - G[6] * y + G[7] * x);
+    double dx = 2 * (G[1] * y + G[2] * z + G[3] * y - 2 * x * G[4] - G[5] * w + G[6] * z + G[7] * w - 2 * x * G[8]);
+    double dy = 2 * (-2 * y * G[0] + G[1] * x + G[2] * w + G[3] * x + G[5] * z - G[6] * w + G[7] * z - 2 * y * G[8]);
+    double dz = 2 * (-2 * z * G[0] - G[1] * w + G[2] * x + G[3] * w - 2 * z * G[4] + G[5] * y + G[6] * x + G[7] * y);
+    double dot = dw * w + dx * x + dy * y + dz * z;
+    rdu[(size_t)i * 6] = (dx - x * dot) * inv;
+    rdu[(size_t)i * 6 + 1] = (dy - y * dot) * inv;
+    rdu[(size_t)i * 6 + 2] = (dz - z * dot) * inv;
+    for (int j = 0; j < 3; ++j) {
+      double s = 0;
+      for (int k = 0; k < 3; ++k) s += g[9 + k] * a[k * 3 + j];
+      rdu[(size_t)i * 6 + 3 + j] = s;
+    }
+  }
+
+  auto fA = toF(A), fu = toF(u), fdC = toF(dC);
+  void* dAb = uploadNew(fA.data(), fA.size());
+  void* dub = uploadNew(fu.data(), fu.size());
+  void* dCb = uploadNew(fdC.data(), fdC.size());
+  void* ddA = alloc((size_t)L * 12 * 4);
+  void* ddu = alloc((size_t)L * 6 * 4);
+  rigidUpdateBwd((const float*)dAb, (const float*)dub, (const float*)dCb, (float*)ddA, (float*)ddu, L);
+
+  char label[160];
+  auto gotA = download((const float*)ddA, (size_t)L * 12), gotu = download((const float*)ddu, (size_t)L * 6);
+  snprintf(label, sizeof label, "rigid update bwd dRigOld L=%d", L);
+  report(label, relRms(rdA, gotA), 1e-5);
+  snprintf(label, sizeof label, "rigid update bwd dUpd L=%d", L);
+  report(label, relRms(rdu, gotu), 1e-5);
+
+  // reference two: the central difference against the FORWARD alone, which is what catches a wrong derivation
+  const double h = 1e-6;
+  std::vector<double> fdA((size_t)L * 12), fdu((size_t)L * 6), mineA(gotA.begin(), gotA.end()),
+      mineU(gotu.begin(), gotu.end());
+  for (size_t t = 0; t < A.size(); ++t) {
+    double keep = A[t];
+    A[t] = keep + h; double p = rigUpdS(A, u, dC, L);
+    A[t] = keep - h; double m = rigUpdS(A, u, dC, L);
+    A[t] = keep;
+    fdA[t] = (p - m) / (2 * h);
+  }
+  for (size_t t = 0; t < u.size(); ++t) {
+    double keep = u[t];
+    u[t] = keep + h; double p = rigUpdS(A, u, dC, L);
+    u[t] = keep - h; double m = rigUpdS(A, u, dC, L);
+    u[t] = keep;
+    fdu[t] = (p - m) / (2 * h);
+  }
+  snprintf(label, sizeof label, "rigid update fd dRigOld L=%d", L);
+  reportGrad(label, fdA, mineA, 1e-5);
+  snprintf(label, sizeof label, "rigid update fd dUpd L=%d", L);
+  reportGrad(label, fdu, mineU, 1e-5);
+
+  // and that `accumulateRigOld` adds rather than writes - an iteration needs it, because the same rigid also feeds
+  // that iteration's point projections and its side chains
+  rigidUpdateBwd((const float*)dAb, (const float*)dub, (const float*)dCb, (float*)ddA, (float*)ddu, L, true);
+  std::vector<double> twice(rdA.size());
+  for (size_t t = 0; t < twice.size(); ++t) twice[t] = 2 * rdA[t];
+  snprintf(label, sizeof label, "rigid update bwd dRigOld accumulated L=%d", L);
+  report(label, relRms(twice, download((const float*)ddA, (size_t)L * 12)), 1e-5);
+
+  release(dAb); release(dub); release(dCb); release(ddA); release(ddu);
+}
+
+// ---------------------------------------------------------------- the point projections
+static double pointsS(const std::vector<double>& proj, const std::vector<double>& rig,
+                      const std::vector<double>& dOut, int L, int H, int P) {
+  double S = 0;
+  for (int i = 0; i < L; ++i)
+    for (int h = 0; h < H; ++h) {
+      const double* s = &proj[((size_t)i * H + h) * 3 * P];
+      const double* r = &rig[(size_t)i * 12];
+      for (int p = 0; p < P; ++p) {
+        double loc[3] = {s[p], s[P + p], s[2 * P + p]};
+        for (int k = 0; k < 3; ++k) {
+          double g = r[k * 3] * loc[0] + r[k * 3 + 1] * loc[1] + r[k * 3 + 2] * loc[2] + r[9 + k];
+          S += dOut[(((size_t)i * H + h) * P + p) * 3 + k] * g;
+        }
+      }
+    }
+  return S;
+}
+
+static void pointsGlobalCase(int L, int H, int P) {
+  std::vector<double> proj = randv((size_t)L * H * 3 * P), rig = randv((size_t)L * 12),
+                      dOut = randv((size_t)L * H * P * 3, 0.5);
+
+  std::vector<double> rdProj((size_t)L * H * 3 * P, 0), rdRig((size_t)L * 12, 0);
+  for (int i = 0; i < L; ++i) {
+    const double* r = &rig[(size_t)i * 12];
+    for (int h = 0; h < H; ++h) {
+      const double* s = &proj[((size_t)i * H + h) * 3 * P];
+      double* ds = &rdProj[((size_t)i * H + h) * 3 * P];
+      for (int p = 0; p < P; ++p) {
+        const double* dg = &dOut[(((size_t)i * H + h) * P + p) * 3];
+        double loc[3] = {s[p], s[P + p], s[2 * P + p]};
+        for (int j = 0; j < 3; ++j) ds[j * P + p] = r[j] * dg[0] + r[3 + j] * dg[1] + r[6 + j] * dg[2];
+        for (int k = 0; k < 3; ++k) {
+          for (int j = 0; j < 3; ++j) rdRig[(size_t)i * 12 + k * 3 + j] += dg[k] * loc[j];
+          rdRig[(size_t)i * 12 + 9 + k] += dg[k];
+        }
+      }
+    }
+  }
+
+  auto fp = toF(proj), fr = toF(rig), fd = toF(dOut);
+  void* dp = uploadNew(fp.data(), fp.size());
+  void* dr = uploadNew(fr.data(), fr.size());
+  void* dd = uploadNew(fd.data(), fd.size());
+  void* ddp = alloc((size_t)L * H * 3 * P * 4);
+  void* ddr = alloc((size_t)L * 12 * 4);
+  pointsGlobalBwd((const float*)dp, (const float*)dr, (const float*)dd, (float*)ddp, (float*)ddr, L, H, P);
+
+  char label[160];
+  auto gotP = download((const float*)ddp, (size_t)L * H * 3 * P), gotR = download((const float*)ddr, (size_t)L * 12);
+  snprintf(label, sizeof label, "points global bwd dProj L=%d H=%d P=%d", L, H, P);
+  report(label, relRms(rdProj, gotP), 1e-5);
+  snprintf(label, sizeof label, "points global bwd dRig L=%d H=%d P=%d", L, H, P);
+  report(label, relRms(rdRig, gotR), 1e-5);
+
+  const double h = 1e-6;
+  std::vector<double> fdP(proj.size()), fdR(rig.size()), mineP(gotP.begin(), gotP.end()),
+      mineR(gotR.begin(), gotR.end());
+  for (size_t t = 0; t < proj.size(); ++t) {
+    double keep = proj[t];
+    proj[t] = keep + h; double a = pointsS(proj, rig, dOut, L, H, P);
+    proj[t] = keep - h; double b = pointsS(proj, rig, dOut, L, H, P);
+    proj[t] = keep;
+    fdP[t] = (a - b) / (2 * h);
+  }
+  for (size_t t = 0; t < rig.size(); ++t) {
+    double keep = rig[t];
+    rig[t] = keep + h; double a = pointsS(proj, rig, dOut, L, H, P);
+    rig[t] = keep - h; double b = pointsS(proj, rig, dOut, L, H, P);
+    rig[t] = keep;
+    fdR[t] = (a - b) / (2 * h);
+  }
+  snprintf(label, sizeof label, "points global fd dProj L=%d H=%d P=%d", L, H, P);
+  reportGrad(label, fdP, mineP, 1e-5);
+  snprintf(label, sizeof label, "points global fd dRig L=%d H=%d P=%d", L, H, P);
+  reportGrad(label, fdR, mineR, 1e-5);
+
+  release(dp); release(dr); release(dd); release(ddp); release(ddr);
+}
+
 // ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
 // The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
 // design-sized complex, which is what has to fit in 16 GB of unified memory.
@@ -1980,6 +2186,13 @@ int main(int argc, char** argv) {
   printf("EvoformerIteration backward (the WHOLE block, eight residual modules)\n");
   evoCase({3, 5, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, false});
   evoCase({2, 4, 8, 6, 2, 4, 2, 3, 6, 8, 6, 4, true});     // outer product first, as the multimer config has it
+  printf("the structure module: the backbone update (Alg. 23)\n");
+  rigidUpdCase(5);
+  rigidUpdCase(17);
+  printf("the structure module: the point projections into the global frame\n");
+  pointsGlobalCase(6, 3, 4);        // AF2's IPA: 12 heads of 4 query points and 8 value points
+  pointsGlobalCase(4, 12, 8);
+  pointsGlobalCase(9, 1, 1);        // the degenerate shape, where a stride bug has nowhere to hide and must not
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }
