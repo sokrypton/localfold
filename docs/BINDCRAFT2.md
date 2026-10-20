@@ -287,6 +287,26 @@ that:
 It falls out of the kernel arithmetic too: `sum_k ds[k] = sum_k p dp - D` and `D = sum_k p dp` by definition, so a
 softmax row's `ds` sums to zero, and the column sum that `doffset` is sums those zeros.
 
+**Confirmed against AF2 itself, in float64** - `metal/design/af2-grad-oracle.py`, which differentiates BindCraft2's
+own haiku `MSARowAttentionWithPairBias` with `jax.grad`. Three independent implementations now agree it is zero:
+the Metal kernel, the central difference on a double host forward, and the reference's own autodiff.
+
+| parameter | max abs gradient (float64) |
+| --- | --- |
+| `feat_2d_norm/offset` | **1.98e-16** (machine epsilon) |
+| `feat_2d_norm/scale` | 2.61e-01 |
+| the next smallest live gradient (`attention/query_w`) | 3.93e-02 |
+
+Two traps in confirming it, both of which give a confident wrong answer and are now guarded in the script:
+
+- **`zero_init` is TRUE in AF2's config**, which makes `output_w` zero, so the loss sees only `output_b` and EVERY
+  other gradient is trivially zero - which looks exactly like the finding. The first run of this check said every
+  parameter was dead. Set it False, and randomise the parameters besides, since haiku always initialises
+  `gating_w` to zero.
+- **float32 roundoff of this cancellation sits near 1e-8** - small, but not obviously zero, and not obviously
+  distinguishable from a real but tiny gradient. In float64 it drops to ~1e-16 while the live gradients do not move
+  at all, and that is what makes it a proof rather than a hint.
+
 Consequences worth keeping: **that parameter never moves during training and cannot affect a prediction** - AF2
 carries it regardless, so a port must still read it from the checkpoint, and must not "fix" it. Its SCALE is a real
 parameter (`dbScale` passes at 3.4e-7); only the offset is dead. And the test now reports such a case as
