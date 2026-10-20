@@ -68,8 +68,15 @@ describe("chainResidues", () => {
   });
 
   it("reads an unknown residue name as X rather than dropping it", () => {
-    const odd = `${line(1, "CA", "SEP", "A", 1, " ", 0, 0, 0)}\nEND\n`;
+    const odd = `${line(1, "CA", "ZZZ", "A", 1, " ", 0, 0, 0)}\nEND\n`;
     expect(chainResidues(odd, "A").sequence).toBe("X");
+  });
+
+  // 🔴 AND A MODIFIED AMINO ACID AS ITS PARENT, AlphaFold 3's reading (SEP -> SER): it was an X, then dropped as a
+  // HETATM, where AF3's template carries the serine (af3-any-model colab, 5K9P)
+  it("reads a modified amino acid as its parent", () => {
+    const sep = `${line(1, "CA", "SEP", "A", 1, " ", 0, 0, 0)}\nEND\n`;
+    expect(chainResidues(sep, "A").sequence).toBe("S");
   });
 });
 

@@ -151,6 +151,10 @@ def cases():
                     unpairedMsa=">query\nPREACHINGS\n>u1\nPREA--INGS\n>u2\nPREAcCHINGS\n"),
             protein("B", "LITERALLY", pairedMsa=">query\nLITERALLY\n>s1\nLITER-LLY\n>s2\n---------\n",
                     unpairedMsa=">query\nLITERALLY\n")]), [], AF3_FAMILIES),
+        # (a template holding a phosphoserine and altlocs, 5K9P chain A: every family's template policy - the parent,
+        # an UNK with its N, an UNK with N/CA/C/CB, the hit dropped, the first altloc - and AF3's arginine fix)
+        ("template-modified", "af3", json.load(open(os.path.join(REPO, "tools", "fixtures", "template-5k9p-sep.json"))),
+         [], AF3_FAMILIES),
         ("glycan-standalone", "af3", job("t", [protein("A", "MKTAYIAKQR"), {"ligand": {"id": "B", "ccdCodes": ["NAG"]}},
                                                {"ligand": {"id": "C", "ccdCodes": ["NAG", "BMA"]}}],
                                          bondedAtomPairs=[[["C", 1, "O4"], ["C", 2, "C1"]]]), [], AF3_FAMILIES),

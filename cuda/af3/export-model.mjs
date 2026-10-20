@@ -332,6 +332,7 @@ const { templateGeometry, multichainMaskFor, coverageOf } =
 const slots = [];                       // {slot, mask}
 if (templateSpecs.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
+  const { templatePolicyFor } = await import(`${repo}/shared/af3/dialect.js`);
   const { mergeTemplateSlots } = await import(`${repo}/shared/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
   // which token each chain's residue occupies (a modified residue or ligand shifts them)
@@ -349,11 +350,14 @@ if (templateSpecs.length > 0) {
       const built = buildTemplate({
         text: readFileSync(path, "utf8"), chain, query: chains[index], tokens: batch.tokens, minConfidence: 0,
         tokenOf: (residue) => tokenOfResidue[(residuesOfChain[index] ?? [])[residue] ?? -1] ?? -1,
+        policy: templatePolicyFor(dialect),
       });
+      if (built === null) { console.log(`template ${k}: ${path} chain ${chain} dropped (this model reads no hit with a modified residue)`); return null; }
       console.log(`template ${k}: ${path} chain ${chain} -> query chain ${index},`
         + ` ${built.coverage.residues}/${built.coverage.of} residues`);
       return built.slot;
-    });
+    }).filter((one) => one !== null);
+    if (parts.length === 0) return;
     const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
     const spanChains = parts.length > 1 && !args.includes("--no-span-chains");
     slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
@@ -416,6 +420,7 @@ if (searchChains.length > 0) {
 }
 if (extraSlotParts.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
+  const { templatePolicyFor } = await import(`${repo}/shared/af3/dialect.js`);
   const { mergeTemplateSlots } = await import(`${repo}/shared/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
   const tokenOfResidue = new Int32Array(batch.chainOfResidue.length).fill(-1);
@@ -430,11 +435,14 @@ if (extraSlotParts.length > 0) {
         text: t.text, chain: t.chainId, query: chains[t.chain], tokens: batch.tokens, minConfidence: 0,
         ...(t.mapping === undefined ? {} : { mapping: t.mapping }),
         tokenOf: (residue) => tokenOfResidue[(residuesOfChain[t.chain] ?? [])[residue] ?? -1] ?? -1,
+        policy: templatePolicyFor(dialect),
       });
+      if (built === null) { console.log(`template ${k}: ${t.label} dropped (this model reads no hit with a modified residue)`); return null; }
       console.log(`template ${k}: ${t.label} -> query chain ${t.chain}, ${built.coverage.residues}/${built.coverage.of} residues`
         + (t.mapping ? " (the job's mapping)" : ""));
       return built.slot;
-    });
+    }).filter((one) => one !== null);
+    if (parts.length === 0) return;
     const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
     slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
                                                { coverage: coverageOf(slot, batch.tokens), spanChains: false }) });

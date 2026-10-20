@@ -74,7 +74,7 @@ describe("the dialect table", () => {
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
       "keepLigandLeavingAtoms", "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "modifiedLeavingAtEnds",
-      "padSingleCondUnknownDna", "perAtomHeadsByRank", "symmetriseBonds", "templateGapWhereNoAtoms"]);
+      "padSingleCondUnknownDna", "perAtomHeadsByRank", "symmetriseBonds", "templateGapWhereNoAtoms", "templateModified"]);
   });
 
   /**
@@ -146,7 +146,7 @@ describe("the dialect table", () => {
       "splitPairConditioning",
       "structuralTokens",
       "swapTransposedBias",
-      "symmetriseBonds",
+      "symmetriseBonds", "templateModified",
       // 🔴 EACH CENTRED CONFORMER MOVED BY U(-1, 1) PER AXIS, protenix's inference augmentation (af3-any-model 345cb11)
       "translateConformers",
     ]);

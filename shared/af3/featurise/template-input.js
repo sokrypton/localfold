@@ -32,6 +32,7 @@ import { ONE_LETTER } from "../structure/pdb.js";
 import { aatypeFor, conformerFor } from "./reference-conformers.js";
 import { ATOM37, NUM_DENSE } from "./template-features.js";
 import { coordinateAtoms } from "../../heads/superpose-pdb.js";
+import { MODIFIED_PARENTS } from "./modified-parents.js";
 
 
 /** AF3's gap residue type, which is what an uncovered query position gets. */
@@ -53,6 +54,43 @@ export const GAP_AATYPE = 21;
 const HETERO_RESIDUES = { MSE: "M" };
 
 /**
+ * 🔴 AND A MODIFIED AMINO ACID IS A RESIDUE TOO (af3-any-model colab, against its template batches on 5K9P's SEP).
+ * AlphaFold 3 reads a phosphoserine in a template as its parent SERINE - restype and the parent's atoms by name -
+ * where dropping it, as this reader did, left a gap and lost the residue from the template's sequence. Every HETATM
+ * whose CCD parent is a standard amino acid (modified-parents.js) is kept, under its raw name; what a model makes of it
+ * is its template policy (templatePolicyFor): AF3 and IntelliFold the parent, boltz2/protenix/OpenDDE an UNK holding
+ * its N, OpenBind-0 an UNK holding N/CA/C/CB, chai-1 the whole hit dropped.
+ */
+const STANDARD_AMINO = new Set(["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS",
+  "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]);
+export function keepsHetero(name) { return HETERO_RESIDUES[name] !== undefined || MODIFIED_PARENTS[name] !== undefined; }
+export function residueCode(name) {
+  return ONE_LETTER[name] ?? HETERO_RESIDUES[name] ?? ONE_LETTER[MODIFIED_PARENTS[name]] ?? "X";
+}
+export function isStandardAmino(name) { return STANDARD_AMINO.has(name); }
+
+/**
+ * AlphaFold 3's two repairs of a template residue (from_mmcif's fix_mse_residues and fix_arginines), which every
+ * family featurises through: a selenomethionine's SE is its methionine's SD, and an arginine's NH1 is the guanidinium
+ * nitrogen nearer CD - swapped with NH2 where the file has them the other way (5K9P's Arg42, 1.8 A apart).
+ */
+export function finishResidue(residue, { arginines = true } = {}) {
+  if (residue.resName === "MSE" && residue.atoms.has("SE") && !residue.atoms.has("SD")) {
+    residue.atoms.set("SD", residue.atoms.get("SE"));
+    residue.atoms.delete("SE");
+  }
+  // (AlphaFold 2's template reader renames the selenium and leaves an arginine as the file has it)
+  if (arginines && residue.resName === "ARG") {
+    const cd = residue.atoms.get("CD"), nh1 = residue.atoms.get("NH1"), nh2 = residue.atoms.get("NH2");
+    if (cd && nh1 && nh2) {
+      const d = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+      if (d(nh1, cd) > d(nh2, cd)) { residue.atoms.set("NH1", nh2); residue.atoms.set("NH2", nh1); }
+    }
+  }
+  return residue;
+}
+
+/**
  * Which alternate location each residue keeps: the one with the highest
  * occupancy, ties to the alphabetically first - AlphaFold 3's rule
  * (structure/cpp/mmcif_altlocs.h) and Biopython's, so AF2's too.
@@ -65,7 +103,13 @@ const HETERO_RESIDUES = { MSE: "M" };
  * @param {{key: string, altLoc: string, occupancy: number}[]} atoms
  * @returns {Map<string, string>} residue key -> the altLoc to keep
  */
-export function chosenAltLocs(atoms) {
+export function chosenAltLocs(atoms, first = false) {
+  // ("first": boltz's and atomworks' - gemmi's remove_alternative_conformations keeps each residue's first altloc)
+  if (first) {
+    const chosen = new Map();
+    for (const { key, altLoc } of atoms) if (altLoc !== "" && !chosen.has(key)) chosen.set(key, altLoc);
+    return chosen;
+  }
   const totals = new Map();
   for (const { key, altLoc, occupancy } of atoms) {
     if (altLoc === "") continue;
@@ -99,7 +143,7 @@ export function chosenAltLocs(atoms) {
  * @returns {{chain: string, residues: {number: string, code: string,
  *            atoms: Map<string, number[]>}[], sequence: string}}
  */
-export function chainResidues(text, chain) {
+export function chainResidues(text, chain, policy = {}) {
   const atoms = coordinateAtoms(text);
   // ...the first chain that has a polymer residue on it, not the first chain
   // of any kind: a structure whose first ATOM is a ligand would otherwise name
@@ -109,17 +153,19 @@ export function chainResidues(text, chain) {
   const byNumber = new Map();
   const order = [];
   const keep = chosenAltLocs(atoms.points.map((_, index) => ({ key: atoms.residues[index],
-    altLoc: atoms.chains[index] === wanted ? atoms.altLocs[index] : "", occupancy: atoms.occupancies[index] })));
+    altLoc: atoms.chains[index] === wanted ? atoms.altLocs[index] : "", occupancy: atoms.occupancies[index] })),
+    policy.altloc === "first");
   for (let index = 0; index < atoms.points.length; index += 1) {
     if (atoms.chains[index] !== wanted) continue;
     if (atoms.altLocs[index] !== "" && keep.get(atoms.residues[index]) !== atoms.altLocs[index]) continue;
     const name = atoms.residueNames[index];
-    if (atoms.hetero?.[index] === true && HETERO_RESIDUES[name] === undefined) continue;
+    if (atoms.hetero?.[index] === true && !keepsHetero(name)) continue;
     const number = atoms.residues[index];
     if (!byNumber.has(number)) {
       const residue = {
         number,
-        code: ONE_LETTER[name] ?? HETERO_RESIDUES[name] ?? "X",
+        code: residueCode(name),
+        resName: name,
         atoms: new Map(),
         // 🔴 AlphaFold DB PUTS pLDDT IN THE B-FACTOR, which is the only thing
         // in a predicted structure that says "I am not sure about this". A
@@ -143,6 +189,7 @@ export function chainResidues(text, chain) {
         / residue.atomCount;
     }
   }
+  order.forEach((residue) => finishResidue(residue, { arginines: policy.arginines !== false }));
   return {
     chain: wanted,
     residues: order,
@@ -171,7 +218,7 @@ export function chainResidues(text, chain) {
  * @returns {{aatype: Int32Array, atomPositions: Float32Array,
  *            atomMask: Float32Array, covered: number, atoms: number}}
  */
-export function templateSlot({ structure, tokens, map, offset = 0, tokenOf }) {
+export function templateSlot({ structure, tokens, map, offset = 0, tokenOf, policy = {} }) {
   const at = tokenOf ?? ((residue) => residue + offset);
   const aatype = new Int32Array(tokens).fill(GAP_AATYPE);
   const atomPositions = new Float32Array(tokens * NUM_DENSE * 3);
@@ -184,6 +231,37 @@ export function templateSlot({ structure, tokens, map, offset = 0, tokenOf }) {
     const residue = structure.residues[templateIndex];
     if (token < 0 || token >= tokens || residue === undefined) continue;
 
+    // (a residue outside the 20 by its raw name, as a model's template policy reads it - templatePolicyFor)
+    const name = residue.resName;
+    const nonStandard = name !== undefined && !isStandardAmino(name);
+    if (nonStandard && policy.modified === "unk_n" && name !== "MSE" && name !== "UNK") {
+      // boltz, protenix, OpenDDE: an UNK holding only its N - which AF3's dense layout for UNK puts in every slot
+      const n = residue.atoms.get("N");
+      aatype[token] = 20;
+      if (n !== undefined) {
+        for (let slot = 0; slot < NUM_DENSE; slot += 1) {
+          atomPositions.set(n, (token * NUM_DENSE + slot) * 3);
+          atomMask[token * NUM_DENSE + slot] = 1;
+        }
+        atoms += 1;
+      }
+      covered += 1;
+      continue;
+    }
+    if (nonStandard && policy.modified === "unk_restype") {
+      // OpenBind-0 (OpenFold3's create_template_restype): UNK with its own N, CA, C and CB at the slots every
+      // standard residue keeps them in (0, 1, 2, 4), MSE and UNK too; one missing any of the four a gap
+      const four = ["N", "CA", "C", "CB"].map((atom) => residue.atoms.get(atom));
+      if (four.some((point) => point === undefined)) continue;
+      aatype[token] = 20;
+      [0, 1, 2, 4].forEach((slot, k) => {
+        atomPositions.set(four[k], (token * NUM_DENSE + slot) * 3);
+        atomMask[token * NUM_DENSE + slot] = 1;
+      });
+      atoms += 4;
+      covered += 1;
+      continue;
+    }
     aatype[token] = aatypeFor(residue.code);
     // 🔴 THE DENSE SLOT IS THE ATOM'S POSITION IN ITS OWN CONFORMER, so a
     // residue's atoms land where the query's would. An atom the conformer does

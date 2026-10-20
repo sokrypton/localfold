@@ -104,6 +104,11 @@ export const ALPHAFOLD3 = Object.freeze({
   atomizeLigandBonded: false,
   // the formal charge on an atom a declared bond forms on, from the bonds it keeps (rf3: atomworks)
   declaredBondCharge: false,
+  // how a template's residues are read (af3-any-model's template_policy): a modified amino acid as its parent (null,
+  // AF3's), an UNK holding its N ("unk_n"), the hit dropped ("drop_hit"), an UNK holding N/CA/C/CB ("unk_restype");
+  // and each residue's first altloc, not its most occupied
+  templateModified: null,
+  templateAltlocFirst: false,
   // the profile over each chain's query, paired and unpaired rows, none dropped (rf3: atomworks' one block a chain)
   rf3ProfileMsa: false,
   // ...or each chain's own sequences, repeats gone (intellifold2: its boltz-derived msa_valid_depths)
@@ -385,6 +390,8 @@ export const OPENBIND0 = Object.freeze({
   protenixUnpairedMsa: false,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: "unk_restype",
+  templateAltlocFirst: false,
   rf3ProfileMsa: false,
   if2ProfileMsa: false,
   // 🔴 ITS MAIN MSA IS EACH CHAIN'S FIRST 16384 UNPAIRED ROWS, DEDUPLICATED IGNORING INSERTIONS - profile and
@@ -556,6 +563,8 @@ export const OPENDDE = Object.freeze({
   protenixUnpairedMsa: true,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: "unk_n",
+  templateAltlocFirst: false,
   rf3ProfileMsa: false,
   if2ProfileMsa: false,
   mainMsaCap: null,
@@ -842,6 +851,8 @@ export const PROTENIX2 = Object.freeze({
   protenixUnpairedMsa: true,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: "unk_n",
+  templateAltlocFirst: false,
   rf3ProfileMsa: false,
   if2ProfileMsa: false,
   mainMsaCap: null,
@@ -1067,6 +1078,8 @@ export const BOLTZ2 = Object.freeze({
   protenixUnpairedMsa: false,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: "unk_n",
+  templateAltlocFirst: true,
   rf3ProfileMsa: false,
   if2ProfileMsa: false,
   mainMsaCap: null,
@@ -1179,6 +1192,8 @@ export const INTELLIFOLD2 = Object.freeze({
   protenixUnpairedMsa: false,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: null,
+  templateAltlocFirst: false,
   rf3ProfileMsa: false,
   if2ProfileMsa: true,
   mainMsaCap: null,
@@ -1382,6 +1397,8 @@ export const ROSETTAFOLD3 = Object.freeze({
   protenixUnpairedMsa: false,
   atomizeLigandBonded: true,
   declaredBondCharge: true,
+  templateModified: null,
+  templateAltlocFirst: true,
   rf3ProfileMsa: true,
   if2ProfileMsa: false,
   mainMsaCap: null,
@@ -1516,6 +1533,8 @@ export const CHAI1 = Object.freeze({
   protenixUnpairedMsa: false,
   atomizeLigandBonded: false,
   declaredBondCharge: false,
+  templateModified: "drop_hit",
+  templateAltlocFirst: false,
   rf3ProfileMsa: false,
   if2ProfileMsa: false,
   mainMsaCap: null,
@@ -1784,4 +1803,12 @@ export function singleCondPaddingWgsl(padding) {
     + "\n"
     + padding.map((at) => `  if (index > ${at}u) { source -= 1u; }`).join("\n")
     + "\n";
+}
+
+
+/** The template reader's policy a dialect implies (web/template-source.js buildTemplate, template-input.js). */
+export function templatePolicyFor(dialect) {
+  if (dialect === undefined || dialect === null) return {};
+  return { ...(dialect.templateModified ? { modified: dialect.templateModified } : {}),
+           ...(dialect.templateAltlocFirst === true ? { altloc: "first" } : {}) };
 }

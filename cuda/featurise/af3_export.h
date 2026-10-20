@@ -5,6 +5,7 @@
 //   af3-featurise <out dir> --family=<model> (--job=<AF3 job.json> | --sequence=<A:B> [--kinds= --ligands= --modify=])
 //                 [--max-msa=1024] [--seed=20260831] [--a3m=<one a chain> [--paired-a3m=...]]
 #pragma once
+#include <optional>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -129,10 +130,15 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
     o.tokens = tokens;
     o.tokenOf = &tokenOf;
     o.mapping = p.hasMapping ? &p.mapping : nullptr;
+    o.policy.modified = D.templateModified; o.policy.altlocFirst = D.templateAltlocFirst;
     Built b = buildTemplate(o);
+    if (b.dropped) {
+      out.said.push_back("template " + std::to_string(k) + ": " + p.label + " dropped (this model reads no hit with a modified residue)");
+      return std::optional<TemplateSlot>();
+    }
     out.said.push_back("template " + std::to_string(k) + ": " + p.label + " -> query chain " + std::to_string(p.queryChain) + ", "
                        + std::to_string(b.residues) + "/" + std::to_string(b.of) + " residues" + (p.hasMapping ? " (the job's mapping)" : ""));
-    return b.slot;
+    return std::optional<TemplateSlot>(b.slot);
   };
   // --template=<file>:<chain>[@<query chain>], comma-separated slots, "+"-joined parts sharing one
   auto specs = splitNonEmpty(args.option("template"), ',');
@@ -151,8 +157,9 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
       p.hasChain = !chainId.empty(); p.chain = chainId;
       p.queryChain = (int)jsNumberOf(target);
       p.label = path + " chain " + (p.hasChain ? chainId : "undefined");
-      parts.push_back(buildPart(p, (int)k));
+      if (auto one = buildPart(p, (int)k)) parts.push_back(*one);
     }
+    if (parts.empty()) continue;   // (every part dropped by the model's template policy)
     TemplateSlot slot = parts.size() == 1 ? parts[0] : mergeTemplateSlots(parts);
     bool spanChains = parts.size() > 1 && !args.has("no-span-chains");
     std::vector<float> coverage = coverageOf(slot, tokens);
@@ -223,7 +230,8 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
   }
   for (size_t k = 0; k < extra.size(); ++k) {
     std::vector<TemplateSlot> parts;
-    for (auto& p : extra[k]) parts.push_back(buildPart(p, (int)k));
+    for (auto& p : extra[k]) if (auto one = buildPart(p, (int)k)) parts.push_back(*one);
+    if (parts.empty()) continue;
     TemplateSlot slot = parts.size() == 1 ? parts[0] : mergeTemplateSlots(parts);
     std::vector<float> coverage = coverageOf(slot, tokens);
     slots.push_back({slot, multichainMaskFor(batch.asymId, tokens, &coverage, false)});

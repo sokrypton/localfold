@@ -17,7 +17,7 @@
 import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
-import { featuriserDialect } from "../shared/af3/dialect.js";
+import { featuriserDialect, templatePolicyFor } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../webgpu/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
@@ -595,7 +595,9 @@ export async function foldAf3(options) {
       ...(template.mapping === undefined ? {} : { mapping: template.mapping }),
       tokenOf: (residue) => tokenOfResidue[(residuesOfChain[template.chain] ?? [])[residue]
         ?? -1] ?? -1,
-    })).map((built) => {
+      // (how this model reads a template's modified residues and altlocs: templatePolicyFor)
+      policy: templatePolicyFor(options.weights.trunk.dialect),
+    })).filter((built) => built !== null).map((built) => {
       templateCoverage.push(built.coverage);
       return built.slot;
     }));

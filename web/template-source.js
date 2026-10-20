@@ -24,7 +24,8 @@
  */
 import { alignPositions } from "./align.js";
 import {
-  GAP_AATYPE, chainResidues, chosenAltLocs, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
+  GAP_AATYPE, chainResidues, chosenAltLocs, filterByConfidence, finishResidue, identityMap, isStandardAmino, keepsHetero,
+  residueCode, templateSlot, templateSlotAtom37,
 } from "../shared/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../webgpu/af3/fold.js";
 import { parseCIFAtoms } from "../cpu/design/mpnn/pdb.js";
@@ -211,10 +212,18 @@ export function buildTemplate(options) {
   // the RCSB and AlphaFold DB give fixed-column PDB and the MMseqs2 template
   // endpoint gives mmCIF. Guessing from the URL would be one more thing to
   // keep in step with the fetch.
+  // (AlphaFold 2's layout reads an arginine as the file has it - finishResidue)
+  const readPolicy = { ...(options.policy ?? {}), ...(options.layout === "atom37" ? { arginines: false } : {}) };
   const structure = /^\s*(data_|#|loop_|_)/m.test(options.text.slice(0, 4096))
     && options.text.includes("_atom_site.")
-    ? residuesFromCif(options.text, options.chain)
-    : chainResidues(options.text, options.chain);
+    ? residuesFromCif(options.text, options.chain, readPolicy)
+    : chainResidues(options.text, options.chain, readPolicy);
+  // (chai-1 drops a hit holding any residue outside its standard codes - MSE among them - before featurising)
+  if (options.policy?.modified === "drop_hit"
+      && structure.residues.some((residue) => residue.resName !== undefined && residue.resName !== "UNK"
+                                 && !isStandardAmino(residue.resName))) {
+    return null;
+  }
   if (structure.residues.length === 0) {
     throw new Error(options.chain === undefined
       ? "that structure has no protein chain this can read"
@@ -230,7 +239,7 @@ export function buildTemplate(options) {
   const buildSlot = options.layout === "atom37" ? templateSlotAtom37 : templateSlot;
   const slot = buildSlot({
     structure, tokens: options.tokens, map: kept,
-    offset: options.offset ?? 0, tokenOf: options.tokenOf,
+    offset: options.offset ?? 0, tokenOf: options.tokenOf, policy: options.policy ?? {},
   });
   if (slot.covered === 0) {
     throw new Error("that template covers none of the chain"
@@ -264,18 +273,20 @@ export function buildTemplate(options) {
  * @param {string} [chain] auth_asym_id; the first one found if absent
  * @returns {{chain: string, residues: object[], sequence: string}}
  */
-export function residuesFromCif(text, chain) {
+export function residuesFromCif(text, chain, policy = {}) {
   // 🔴 MSE IS A HETATM AND IS A RESIDUE. See HETERO_RESIDUES in
   // shared/af3/featurise/template-input.js: dropping every heteroatom takes a
   // selenomethionine out of the middle of a chain, and keeping every one makes
   // the waters into residues.
+  // (and a modified amino acid - its CCD parent standard - in the polymer: see keepsHetero in template-input.js)
   const atoms = parseCIFAtoms(text).filter((atom) =>
-    (!atom.hetero || atom.resName === "MSE")
+    (!atom.hetero || atom.resName === "MSE" || (keepsHetero(atom.resName) && atom.labelSeq !== undefined
+                                               && Number.isInteger(atom.labelSeq)))
     && atom.occupancy > 0 && Number.isFinite(atom.x));
   const wanted = chain ?? atoms[0]?.chain;
   const keyOf = (atom) => `${atom.resSeq}${atom.iCode}`;
   const keep = chosenAltLocs(atoms.filter((atom) => atom.chain === wanted)
-    .map((atom) => ({ key: keyOf(atom), altLoc: atom.altLoc, occupancy: atom.occupancy })));
+    .map((atom) => ({ key: keyOf(atom), altLoc: atom.altLoc, occupancy: atom.occupancy })), policy.altloc === "first");
   const byNumber = new Map();
   const order = [];
   for (const atom of atoms) {
@@ -286,7 +297,8 @@ export function residuesFromCif(text, chain) {
       const residue = {
         number,
         labelSeq: atom.labelSeq,
-        code: ONE_LETTER[atom.resName] ?? (atom.resName === "MSE" ? "M" : "X"),
+        code: residueCode(atom.resName),
+        resName: atom.resName,
         atoms: new Map(),
         // An experimental structure states no per-residue confidence, and a
         // floor of zero is the only honest reading of that.
@@ -299,6 +311,7 @@ export function residuesFromCif(text, chain) {
     const residue = byNumber.get(number);
     if (!residue.atoms.has(atom.name)) residue.atoms.set(atom.name, [atom.x, atom.y, atom.z]);
   }
+  order.forEach((residue) => finishResidue(residue, { arginines: policy.arginines !== false }));
   return {
     chain: wanted,
     residues: order,

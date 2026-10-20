@@ -9,6 +9,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -43,6 +44,7 @@ inline char oneLetter(const std::string& three) {
 // ---------------------------------------------------------------- the structure's residues
 struct TemplateResidue {
   std::string number;
+  std::string resName;                  // the raw name (template-input.js: a model's template policy reads it)
   bool hasLabel = false; int labelSeq = 0;
   char code = 'X';
   std::vector<std::pair<std::string, std::array<double, 3>>> atoms;   // a Map: the first atom of a name kept
@@ -55,9 +57,51 @@ struct TemplateResidue {
 };
 struct TemplateStructure { bool hasChain = false; std::string chain; std::vector<TemplateResidue> residues; std::string sequence; };
 
-// chosenAltLocs: each residue's alternate location of highest mean occupancy (ties to the first in name order)
+// a template's policy (template-input.js, dialect.js templatePolicyFor): how a modified residue reads - 0 its parent
+// (AF3), 1 an UNK holding its N ("unk_n"), 2 the hit dropped ("drop_hit"), 3 an UNK holding N/CA/C/CB ("unk_restype")
+// - and each residue's first altloc where altlocFirst
+struct TemplatePolicy { int modified = 0; bool altlocFirst = false; bool arginines = true; };
+inline bool isStandardAmino(const std::string& name) {
+  static const std::set<std::string> s = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
+                                          "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"};
+  return s.count(name) > 0;
+}
+inline bool keepsHetero(const std::string& name) { return name == "MSE" || modifiedParents().count(name) > 0; }
+inline char residueCode(const std::string& name) {
+  char one = oneLetter(name);
+  if (one) return one;
+  if (name == "MSE") return 'M';
+  auto it = modifiedParents().find(name);
+  if (it != modifiedParents().end()) { char p = oneLetter(it->second); if (p) return p; }
+  return 'X';
+}
+// AF3's fix_mse_residues and fix_arginines (template-input.js finishResidue)
+inline void finishResidue(TemplateResidue& r, bool arginines = true) {
+  if (r.resName == "MSE" && r.atom("SE") && !r.atom("SD")) {
+    std::array<double, 3> se = *r.atom("SE");
+    r.atoms.erase(std::find_if(r.atoms.begin(), r.atoms.end(), [](auto& e) { return e.first == "SE"; }));
+    r.atoms.push_back({"SD", se});
+  }
+  if (arginines && r.resName == "ARG") {   // (not AlphaFold 2's layout: template-input.js)
+    auto find = [&](const char* n) { return std::find_if(r.atoms.begin(), r.atoms.end(), [&](auto& e) { return e.first == n; }); };
+    auto cd = find("CD"), nh1 = find("NH1"), nh2 = find("NH2");
+    if (cd != r.atoms.end() && nh1 != r.atoms.end() && nh2 != r.atoms.end()) {
+      auto d = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
+        return (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]); };
+      if (d(nh1->second, cd->second) > d(nh2->second, cd->second)) std::swap(nh1->second, nh2->second);
+    }
+  }
+}
+
+// chosenAltLocs: each residue's alternate location of highest mean occupancy (ties to the first in name order), or
+// its first (boltz's, atomworks')
 struct AltAtom { std::string key, altLoc; double occupancy; };
-inline std::map<std::string, std::string> chosenAltLocs(const std::vector<AltAtom>& atoms) {
+inline std::map<std::string, std::string> chosenAltLocs(const std::vector<AltAtom>& atoms, bool first = false) {
+  if (first) {
+    std::map<std::string, std::string> chosen;
+    for (auto& a : atoms) if (!a.altLoc.empty() && !chosen.count(a.key)) chosen[a.key] = a.altLoc;
+    return chosen;
+  }
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::array<double, 2>>>>> totals;
   for (auto& a : atoms) {
     if (a.altLoc.empty()) continue;
@@ -80,7 +124,7 @@ inline std::map<std::string, std::string> chosenAltLocs(const std::vector<AltAto
 }
 
 // chainResidues over shared/heads/superpose-pdb.js coordinateAtoms: a PDB's ATOM/HETATM records by fixed column
-inline TemplateStructure chainResidues(const std::string& text, const std::string* chain) {
+inline TemplateStructure chainResidues(const std::string& text, const std::string* chain, const TemplatePolicy& policy = {}) {
   struct A { std::array<double, 3> p; std::string name; bool hasChain; char chain; std::string resName, residue; double b; bool hetero; std::string alt; double occ; };
   std::vector<A> atoms;
   size_t start = 0;
@@ -124,18 +168,18 @@ inline TemplateStructure chainResidues(const std::string& text, const std::strin
   auto inChain = [&](const A& a) { return wantedNamesOne && hasWanted == a.hasChain && (!hasWanted || a.chain == wanted); };
   std::vector<AltAtom> alts;
   for (auto& a : atoms) alts.push_back({a.residue, inChain(a) ? a.alt : "", a.occ});
-  auto keep = chosenAltLocs(alts);
+  auto keep = chosenAltLocs(alts, policy.altlocFirst);
   std::vector<std::string> order;
   for (auto& a : atoms) {
     if (!inChain(a)) continue;
     if (!a.alt.empty()) { auto k = keep.find(a.residue); if (k == keep.end() || k->second != a.alt) continue; }
-    if (a.hetero && a.resName != "MSE") continue;
+    if (a.hetero && !keepsHetero(a.resName)) continue;
     auto r = std::find_if(s.residues.begin(), s.residues.end(), [&](const TemplateResidue& x) { return x.number == a.residue; });
     if (r == s.residues.end()) {
       TemplateResidue nr;
       nr.number = a.residue;
-      char one = oneLetter(a.resName);
-      nr.code = one ? one : (a.resName == "MSE" ? 'M' : 'X');
+      nr.code = residueCode(a.resName);
+      nr.resName = a.resName;
       s.residues.push_back(nr);
       r = s.residues.end() - 1;
     }
@@ -145,6 +189,7 @@ inline TemplateStructure chainResidues(const std::string& text, const std::strin
       r->confidence += (a.b - r->confidence) / r->atomCount;
     }
   }
+  for (auto& r : s.residues) finishResidue(r, policy.arginines);
   s.hasChain = hasWanted;
   s.chain = hasWanted ? std::string(1, wanted) : "";
   if (chain) s.chain = *chain;
@@ -214,16 +259,19 @@ inline std::vector<CifAtom> parseCifAtoms(const std::string& text) {
   return atoms;
 }
 
-inline TemplateStructure residuesFromCif(const std::string& text, const std::string* chain) {
+inline TemplateStructure residuesFromCif(const std::string& text, const std::string* chain, const TemplatePolicy& policy = {}) {
   std::vector<CifAtom> atoms;
-  for (auto& a : parseCifAtoms(text)) if ((!a.hetero || a.resName == "MSE") && a.occupancy > 0 && std::isfinite(a.x)) atoms.push_back(a);
+  auto labelled = [](const CifAtom& a) { return std::isfinite(a.labelSeq) && std::floor(a.labelSeq) == a.labelSeq; };
+  for (auto& a : parseCifAtoms(text))
+    if ((!a.hetero || a.resName == "MSE" || (keepsHetero(a.resName) && labelled(a))) && a.occupancy > 0 && std::isfinite(a.x))
+      atoms.push_back(a);
   TemplateStructure s;
   bool hasWanted = chain != nullptr || !atoms.empty();
   std::string wanted = chain ? *chain : (atoms.empty() ? "" : atoms[0].chain);
   auto keyOf = [](const CifAtom& a) { return jsNumber(a.resSeq) + a.iCode; };
   std::vector<AltAtom> alts;
   for (auto& a : atoms) if (hasWanted && a.chain == wanted) alts.push_back({keyOf(a), a.altLoc, a.occupancy});
-  auto keep = chosenAltLocs(alts);
+  auto keep = chosenAltLocs(alts, policy.altlocFirst);
   for (auto& a : atoms) {
     if (!hasWanted || a.chain != wanted) continue;
     if (!a.altLoc.empty()) { auto k = keep.find(keyOf(a)); if (k == keep.end() || k->second != a.altLoc) continue; }
@@ -233,13 +281,14 @@ inline TemplateStructure residuesFromCif(const std::string& text, const std::str
       TemplateResidue nr;
       nr.number = number;
       nr.hasLabel = std::isfinite(a.labelSeq) && std::floor(a.labelSeq) == a.labelSeq; nr.labelSeq = nr.hasLabel ? (int)a.labelSeq : 0;
-      char one = oneLetter(a.resName);
-      nr.code = one ? one : (a.resName == "MSE" ? 'M' : 'X');
+      nr.code = residueCode(a.resName);
+      nr.resName = a.resName;
       s.residues.push_back(nr);
       r = s.residues.end() - 1;
     }
     if (!r->atom(a.name)) r->atoms.push_back({a.name, {a.x, a.y, a.z}});
   }
+  for (auto& r : s.residues) finishResidue(r, policy.arginines);
   s.hasChain = hasWanted;
   s.chain = wanted;
   for (auto& r : s.residues) s.sequence += r.code;
@@ -300,7 +349,7 @@ struct TemplateSlot {
 // templateSlot / templateSlotAtom37: each mapped residue's atoms in the layout - dense-24 by the conformer's own atom
 // order, atom37 by name - the aatype the residue's letter, the gap where nothing maps
 inline TemplateSlot buildSlot(const TemplateStructure& s, int tokens, const IndexMap& map, int offset,
-                              const std::function<int(int)>* tokenOf, bool atom37) {
+                              const std::function<int(int)>* tokenOf, bool atom37, const TemplatePolicy& policy = {}) {
   TemplateSlot t;
   t.slots = atom37 ? 37 : NUM_DENSE;
   t.aatype.assign(tokens, GAP_AATYPE);
@@ -310,6 +359,38 @@ inline TemplateSlot buildSlot(const TemplateStructure& s, int tokens, const Inde
     int token = tokenOf ? (*tokenOf)(q) : q + offset;
     if (token < 0 || token >= tokens || ti < 0 || ti >= (int)s.residues.size()) continue;
     const TemplateResidue& r = s.residues[ti];
+    // (a residue outside the 20 by its raw name, as the model's template policy reads it: template-input.js)
+    const bool nonStandard = !atom37 && !r.resName.empty() && !isStandardAmino(r.resName);
+    if (nonStandard && policy.modified == 1 && r.resName != "MSE" && r.resName != "UNK") {
+      t.aatype[token] = 20;
+      if (const auto* n = r.atom("N")) {
+        for (int slot = 0; slot < NUM_DENSE; ++slot) {
+          size_t base = ((size_t)token * t.slots + slot) * 3;
+          t.atomPositions[base] = (float)(*n)[0]; t.atomPositions[base + 1] = (float)(*n)[1]; t.atomPositions[base + 2] = (float)(*n)[2];
+          t.atomMask[(size_t)token * t.slots + slot] = 1;
+        }
+        ++t.atoms;
+      }
+      ++t.covered;
+      continue;
+    }
+    if (nonStandard && policy.modified == 3) {
+      const char* names[4] = {"N", "CA", "C", "CB"};
+      const int slots[4] = {0, 1, 2, 4};
+      bool all = true;
+      for (auto* nm : names) all = all && r.atom(nm) != nullptr;
+      if (!all) continue;
+      t.aatype[token] = 20;
+      for (int k = 0; k < 4; ++k) {
+        const auto* p = r.atom(names[k]);
+        size_t base = ((size_t)token * t.slots + slots[k]) * 3;
+        t.atomPositions[base] = (float)(*p)[0]; t.atomPositions[base + 1] = (float)(*p)[1]; t.atomPositions[base + 2] = (float)(*p)[2];
+        t.atomMask[(size_t)token * t.slots + slots[k]] = 1;
+      }
+      t.atoms += 4;
+      ++t.covered;
+      continue;
+    }
     t.aatype[token] = aatypeFor(r.code);
     auto place = [&](int slot, const std::string& name) {
       const auto* p = r.atom(name);
@@ -337,8 +418,9 @@ struct BuildOptions {
   const std::function<int(int)>* tokenOf = nullptr;
   const std::vector<std::pair<int, int>>* mapping = nullptr;
   bool atom37 = false;
+  TemplatePolicy policy;
 };
-struct Built { TemplateSlot slot; int residues = 0, of = 0; std::string chain; };
+struct Built { TemplateSlot slot; int residues = 0, of = 0; std::string chain; bool dropped = false; };
 
 // /^\s*(data_|#|loop_|_)/m over the first 4096 characters, and an _atom_site. anywhere: an mmCIF, not a PDB
 // (a line scan rather than std::regex's multiline, which older libstdc++ lacks)
@@ -358,9 +440,14 @@ inline bool looksLikeCif(const std::string& text) {
 }
 
 inline Built buildTemplate(const BuildOptions& o) {
-  TemplateStructure s = looksLikeCif(o.text) ? residuesFromCif(o.text, o.chain) : chainResidues(o.text, o.chain);
+  TemplatePolicy read = o.policy;
+  if (o.atom37) read.arginines = false;
+  TemplateStructure s = looksLikeCif(o.text) ? residuesFromCif(o.text, o.chain, read) : chainResidues(o.text, o.chain, read);
   if (s.residues.empty())
     throw std::runtime_error(o.chain == nullptr ? "that structure has no protein chain this can read" : "that structure has no chain " + *o.chain);
+  if (o.policy.modified == 2)   // (chai1: a hit holding a residue outside its standard codes is dropped - buildTemplate)
+    for (auto& r : s.residues)
+      if (!r.resName.empty() && r.resName != "UNK" && !isStandardAmino(r.resName)) { Built b; b.dropped = true; return b; }
   IndexMap map;
   if (o.mapping) {
     std::map<int, int> byLabel;
@@ -381,7 +468,7 @@ inline Built buildTemplate(const BuildOptions& o) {
     for (auto& [q, ti] : alignPositions(o.query, s.sequence)) map.set(q, ti);
   }
   Built b;
-  b.slot = buildSlot(s, o.tokens, map, o.offset, o.tokenOf, o.atom37);
+  b.slot = buildSlot(s, o.tokens, map, o.offset, o.tokenOf, o.atom37, o.policy);
   if (b.slot.covered == 0) throw std::runtime_error("that template covers none of the chain");
   b.residues = b.slot.covered;
   b.of = !o.query.empty() ? (int)o.query.size() : (int)s.residues.size();

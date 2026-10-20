@@ -50,6 +50,8 @@ struct FamilyFlags {
   bool protenixUnpairedMsa;         // protenix2, opendde: a protein chain's paired rows in its unpaired MSA (pairedIntoUnpaired)
   bool atomizeLigandBonded, declaredBondCharge, rf3ProfileMsa;   // rosettafold3 (atomworks)
   bool if2ProfileMsa;               // intellifold2: the profile over each chain's own sequences (msa-features.js)
+  int templateModified;             // a template's modified residue: 0 parent, 1 unk_n, 2 drop_hit, 3 unk_restype
+  bool templateAltlocFirst;         // boltz2, rf3: a template residue's first altloc
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };
