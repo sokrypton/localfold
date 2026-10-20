@@ -1,0 +1,34 @@
+{
+ "6mrr": {
+  "best": 2.784,
+  "caca": 3.836,
+  "mean": 2.875,
+  "ms": 3503.5,
+  "rmsd": 2.784
+ },
+ "6mrr-equilibrium": {
+  "best": 3.749,
+  "caca": 3.853,
+  "mean": 4.22,
+  "ms": 3842.2,
+  "rmsd": 4.766
+ },
+ "6mrr-gol-sep": {
+  "best": 2.472,
+  "caca": 3.794,
+  "ligand": 0.084,
+  "mean": 2.75,
+  "ms": 3842.2,
+  "rmsd": 2.472
+ },
+ "6mrr-propagation": {
+  "caca": 3.855,
+  "frames": 10,
+  "ms": 6670.4,
+  "step1": 0.644
+ },
+ "rna-dna": {
+  "ms": 3223.3,
+  "nucleic": 0.037
+ }
+}

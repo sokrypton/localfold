@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the native ports for this machine's GPU, and the native featurisers beside them:
 #
-#   bash cuda/build.sh [af3] [af2] [ef2]           (all three when none is named: cuda/<port>/localfold-<port>)
+#   bash cuda/build.sh [af3] [af2] [ef2] [bioemu2] (af3, af2 and ef2 when none is named: cuda/<port>/localfold-<port>)
 #   bash cuda/build.sh msap                         (MSA Pairformer: contacts from an alignment, built only when named)
 #   bash cuda/build.sh featurise                    (the featurisers alone: no GPU, no nvcc)
 #
@@ -22,7 +22,7 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 ef2)
 for port in "${ports[@]}"; do      # (named before anything is forked: a typo must not leave half a build running)
-  case "$port" in af3|af2|ef2|msap|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, msap, featurise)" >&2; exit 1 ;; esac
+  case "$port" in af3|af2|ef2|msap|bioemu2|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, msap, bioemu2, featurise)" >&2; exit 1 ;; esac
 done
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
 arch="sm_$cc"; archflags="-arch=$arch"
@@ -68,7 +68,7 @@ if [ "${ports[*]}" = featurise ]; then
 fi
 if [ -z "$cc" ]; then for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
-  case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2|msap) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
+  case "$port" in featurise) continue ;; af3|af2) fast=--use_fast_math ;; ef2|msap|bioemu2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
   # Colab VM has two cores and three compiles, and the first fold waits only on its own port's binary
   prio=""; [ "$port" = af3 ] || prio="nice -n 10"
@@ -77,7 +77,7 @@ for port in "${ports[@]}"; do
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   # (and the weight walks in cuda/featurise, which af3 and af2 include)
   # (msap is built on cuda/ef2's kernels, so their headers are its sources too; it links no featuriser)
-  extra=(); link=("$sobj"); [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  extra=(); link=("$sobj"); [ "$port" != msap ] && [ "$port" != bioemu2 ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# The native BioEmu2 in one command:
+#
+#   cuda/bioemu2/fold <out.pdb> --job=<job.json> | --sequence=<SEQ>[:<SEQ>...]
+#       [--mode=structure|equilibrium] [--contacts=<json>] [--propagate-from=<pdb|cif> --lag-ns=1 --propagation-steps=1]
+#       [-- <localfold-bioemu2 flags: --samples=5 --steps=200 --seed=N --weights=<dir> ...>]
+#
+# The input is featurised by cuda/bioemu2/export_input.mjs (shared/bioemu2/featurise.js) into a scratch directory and
+# folded with --fast. The weights are af3-any-model's int8 blob (fetch.h's `bioemu2`), fetched once into
+# <checkout>/af3am-bioemu2 by cuda/featurise/fetch-weights unless --weights=<dir> names another.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[ $# -ge 1 ] || { sed -n '2,11p' "$0"; exit 1; }
+out="$1"; shift
+inputs=(); flags=(); after=0
+for a in "$@"; do
+  if [ "$a" = "--" ]; then after=1; continue; fi
+  if [ $after = 1 ] || [[ "$a" =~ ^--(samples|steps|seed|step-scale|weights|passes)= ]]; then flags+=("$a"); else inputs+=("$a"); fi
+done
+weights=""
+for f in "${flags[@]+"${flags[@]}"}"; do case "$f" in --weights=*) weights="${f#--weights=}" ;; esac; done
+if [ -z "$weights" ]; then
+  weights="$here/../../af3am-bioemu2"
+  if ! ls "$weights"/*.bin.zst > /dev/null 2>&1; then
+    [ -x "$here/../featurise/fetch-weights" ] || bash "$here/../build.sh" featurise >&2
+    "$here/../featurise/fetch-weights" bioemu2 >&2
+  fi
+  flags+=("--weights=$weights")
+fi
+[ -x "$here/localfold-bioemu2" ] || bash "$here/../build.sh" bioemu2 >&2
+dir="$(mktemp -d)"; trap 'rm -rf "$dir"' EXIT
+node "$here/export_input.mjs" "$dir" "${inputs[@]}"
+"$here/localfold-bioemu2" "$dir" --out="$out" --fast "${flags[@]}"

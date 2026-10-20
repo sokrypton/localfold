@@ -67,6 +67,8 @@ inline const std::vector<BlobEntry>& blobTable() {
     {"openbind0", "openfold3/openbind0.int8.bin.zst", r2},
     {"opendde", "opendde/opendde.int8.bin.zst", r2},
     {"esm2", "lm/esm2.bin.zst", r2},                // (chai-1's ESM2 3B: int8 as published, its only form)
+    // BioEmu2 (microsoft/bioemu2-preview, MIT; cuda/bioemu2): int8 at the commit that published it
+    {"bioemu2", "bioemu2/bioemu2.int8.bin.zst", "cd1c01aa9a963a5e4e45782f456680b299c63fcb"},
   };
   return t;
 }
@@ -317,7 +319,7 @@ inline const std::vector<std::string>& af3Models() {
 }
 inline std::string modelNames() {
   return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0 (af3); model_1_ptm ... model_5_ptm, "
-         "model_1_multimer_v3 ... model_5_multimer_v3 (af2); ef2-fast-600m, ef2-fast-300m, ef2-fast, ef2 (ef2)";
+         "model_1_multimer_v3 ... model_5_multimer_v3 (af2); ef2-fast-600m, ef2-fast-300m, ef2-fast, ef2 (ef2); bioemu2 (bioemu2)";
 }
 // which binary folds a model, by name alone - nothing fetched (a binary asks this before downloading anything)
 inline std::string portOf(const std::string& name) {
@@ -326,6 +328,7 @@ inline std::string portOf(const std::string& name) {
   bool multimer = name.size() == 19 && name.compare(0, 6, "model_") == 0 && name.compare(7, 12, "_multimer_v3") == 0;
   if ((monomer || multimer) && name[6] >= '1' && name[6] <= '5') return "af2";
   if (name == "ef2-fast-600m" || name == "ef2-fast-300m" || name == "ef2" || name == "ef2-fast") return "ef2";
+  if (name == "bioemu2") return "bioemu2";
   throw std::runtime_error("no model " + name + ": " + modelNames());
 }
 inline ModelWeights model(const std::string& root, const std::string& name) {
@@ -344,6 +347,7 @@ inline ModelWeights model(const std::string& root, const std::string& name) {
     if (name[6] != '1') w.dirs.push_back(bundle(root, family + "-" + name[6]));
     return w;
   }
+  if (name == "bioemu2") return {"bioemu2", {blob(root, "bioemu2")}};     // (af3-any-model's blob, read as it is)
   if (name == "ef2-fast-600m") return {"ef2", {bundle(root, "ef2-fast-600m"), bundle(root, "esmc")}};
   if (name == "ef2-fast-300m") return {"ef2", {bundle(root, "ef2-fast-300m"), bundle(root, "esmc-300m")}};
   if (name == "ef2" || name == "ef2-fast") {       // biohub's released ESMFold2 and ESMFold2-Fast: exported locally
