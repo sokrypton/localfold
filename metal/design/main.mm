@@ -2466,6 +2466,21 @@ static void ipaModuleCase(int L, int C, int C2, int H, int Cs, int Pq, int Pv) {
   probe("dWvp", w.Wvp, g.dWvp, 4); probe("dbvp", w.bvp, g.dbvp, 3);
   probe("dWo", w.Wo, g.dWo, 4);   probe("dbo", w.bo, g.dbo, 3);
 
+  // 🔴 AND THE THIRD DEAD PARAMETER THIS TREE HAS FOUND IN AF2. The pair bias comes from a linear over act2d, so
+  // that linear's BIAS gradient is the column sum of db2d over every (i, j) - and it is identically zero, because a
+  // per-head constant added to every logit of a softmax row cancels. Same mechanism as feat_2d_norm's offset, and
+  // as the key half of kv_scalar's bias (which `dbk` above reports as zero for the same reason). Held to jax.grad
+  // of AF2's own InvariantPointAttention in float64 by metal/design/af2-grad-oracle.py: 7.49e-16 against 2.12e+00
+  // for the same linear's weights.
+  {
+    float* dAttn2dBias = A(H);
+    columnSum(g.db2d, dAttn2dBias, (size_t)L * L, H);
+    std::vector<double> zero(H, 0.0);
+    snprintf(label, sizeof label, "IPA module d(attention_2d bias) is DEAD %s", shape);
+    reportGrad(label, zero, std::vector<double>(download((const float*)dAttn2dBias, H).begin(),
+                                                download((const float*)dAttn2dBias, H).end()), 1e-5);
+  }
+
   for (void* p : owned) release(p);
 }
 

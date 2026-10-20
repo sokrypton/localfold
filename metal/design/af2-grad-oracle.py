@@ -4,9 +4,19 @@ metal/design derives every backward here twice - a double-precision analytic ref
 against the forward - but neither can settle a question about what the REFERENCE model does. This does: it runs
 BindCraft2's haiku modules and differentiates them, in float64, on this machine.
 
-What it checks today: that `feat_2d_norm`'s OFFSET is a dead parameter in MSARowAttentionWithPairBias - an
-identically zero gradient, because that LayerNorm feeds nothing but the non-batched bias, so shifting its offset
-shifts every logit of a softmax row by the same constant, and that cancels. See docs/BINDCRAFT2.md.
+What it checks today - THREE DEAD PARAMETERS, all the same mechanism: a quantity added to every logit of a softmax
+row by the same amount cancels, so its gradient is identically zero.
+  1. `feat_2d_norm`'s OFFSET in MSARowAttentionWithPairBias. That LayerNorm feeds nothing but the non-batched pair
+     bias, so its offset shifts a whole row.
+  2. `attention_2d`'s BIAS in InvariantPointAttention. Same shape of argument: the bias is per-head and constant
+     across (query, key), so it shifts a whole row of the IPA's softmax.
+  3. The K HALF of `kv_scalar`'s BIAS in InvariantPointAttention. The reference fuses the key and value scalar
+     projections into one tensor and this port SPLITS it (cuda/featurise/af2_weights.h: `k_scalar_projection/bias`
+     and `v_scalar_projection/bias`), so in this port's parameterisation `k_scalar_projection/bias` is dead outright.
+     The key's bias enters only through sum_c qs[q][c] ks[k][c], where its contribution does not depend on k; the
+     value's half is live, which is why the FUSED tensor's gradient is nonzero and reads as nothing unusual.
+     🔴 MONOMER ONLY: the multimer checkpoint carries no scalar bias at all.
+See docs/BINDCRAFT2.md.
 
 SETUP (a few minutes, no weights needed - random init is enough, because the question is the derivative):
 
@@ -107,3 +117,68 @@ if fn:
           f"{'DEAD (identically zero)' if float(jnp.max(jnp.abs(off))) < 1e-13 else 'NOT zero'}")
     print(f"  scale   max|g| = {float(jnp.max(jnp.abs(sca))):.3e}   "
           f"{'dead' if float(jnp.max(jnp.abs(sca))) < 1e-13 else 'a real parameter'}")
+
+
+# ---------------------------------------------------------------- InvariantPointAttention: two more dead parameters
+# The structure module's attention, from the same checkout and the same config. `c` here is the STRUCTURE MODULE's
+# config - folding.InvariantPointAttention takes it whole, there is no `invariant_point_attention` subtree.
+from bindcraft.af.alphafold.model import folding, quat_affine  # noqa: E402
+
+print("\n" + "=" * 100)
+print("InvariantPointAttention")
+sc = cfg.model.heads.structure_module
+Cs1, Cz1 = sc.num_channel, 128
+s1 = jnp.asarray(rng.standard_normal((N, Cs1)) * 0.3, jnp.float64)
+s2 = jnp.asarray(rng.standard_normal((N, N, Cz1)) * 0.3, jnp.float64)
+imask = jnp.asarray(np.ones((N, 1)), jnp.float64)
+quat = jnp.asarray(rng.standard_normal((N, 4)) * 0.3 + np.array([1.0, 0, 0, 0]), jnp.float64)
+trans = [jnp.asarray(rng.standard_normal(N) * 0.5, jnp.float64) for _ in range(3)]
+icot = jnp.asarray(rng.standard_normal((N, Cs1)) * 0.3, jnp.float64)
+
+
+def ipa_fwd(s1, s2, imask):
+    aff = quat_affine.QuatAffine(quat, trans, unstack_inputs=False)
+    return folding.InvariantPointAttention(sc, gc)(s1, s2, imask, aff)
+
+
+imodel = hk.transform(ipa_fwd)
+iparams = imodel.init(key, s1, s2, imask)
+ileaves, itree = jax.tree.flatten(iparams)
+iparams = jax.tree.unflatten(
+    itree, [jnp.asarray(rng.standard_normal(l.shape) * 0.1, jnp.float64) for l in ileaves])
+
+
+def iloss(p):
+    return jnp.sum(icot * imodel.apply(p, key, s1, s2, imask))
+
+
+ig = jax.grad(iloss)(iparams)
+print(f"\nloss = {float(iloss(iparams)):.6f}\n")
+irows = []
+for mod, d in ig.items():
+    for name, v in d.items():
+        irows.append((f"{mod.split('invariant_point_attention/')[-1]}/{name}",
+                      float(jnp.linalg.norm(v)), float(jnp.max(jnp.abs(v)))))
+iw = max(len(r[0]) for r in irows)
+print("gradient norms, per parameter:")
+for n, nrm, mx in sorted(irows, key=lambda r: r[1]):
+    print(f"  {n:<{iw}}  |g| = {nrm:12.3e}   max|g| = {mx:12.3e}" + ("   <-- ZERO" if mx < 1e-13 else ""))
+
+for mod, d in ig.items():
+    if mod.endswith('attention_2d'):
+        bm = float(jnp.max(jnp.abs(d['bias'])))
+        print(f"\nattention_2d:")
+        print(f"  bias     max|g| = {bm:.3e}   "
+              f"{'DEAD (identically zero)' if bm < 1e-13 else 'NOT zero'}")
+        print(f"  weights  max|g| = {float(jnp.max(jnp.abs(d['weights']))):.3e}   a real parameter")
+    if mod.endswith('kv_scalar'):
+        # the reference keeps one fused [H * (num_scalar_qk + num_scalar_v)] bias; this port views it as [H][2S] and
+        # splits the second axis into the key's half and the value's
+        b = d['bias'].reshape(sc.num_head, -1)
+        S = sc.num_scalar_qk
+        km = float(jnp.max(jnp.abs(b[:, :S])))
+        print(f"\nkv_scalar/bias {tuple(d['bias'].shape)} -> [H][2S] = {tuple(b.shape)}, split as this port splits it:")
+        print(f"  k half (k_scalar_projection/bias)  max|g| = {km:.3e}   "
+              f"{'DEAD (identically zero)' if km < 1e-13 else 'NOT zero'}")
+        print(f"  v half (v_scalar_projection/bias)  max|g| = "
+              f"{float(jnp.max(jnp.abs(b[:, S:]))):.3e}   a real parameter")
