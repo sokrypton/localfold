@@ -3014,7 +3014,7 @@ static void memReport() {
   }
   {   // the structure module's InvariantPointAttention, at AF2's own widths
     const int C = 384, Hh = 12, Cs = 16, Pq = 4, Pv = 8;
-    const int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2w, Wq = Hh * Cs;
+    const int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2w;
     void* act = z((size_t)N * C); void* act2d = z(n2 * C2w); void* rig = z((size_t)N * 12);
     void* sc1 = z((size_t)N * Hh * Cs); void* pj = z((size_t)N * Hh * 3 * Pv);
     void* gp = z((size_t)N * Hh * Pv * 3); void* at = z((size_t)N * Hh * N); void* fin = z((size_t)N * Fw);
