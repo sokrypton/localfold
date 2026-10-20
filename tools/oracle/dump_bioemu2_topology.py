@@ -14,6 +14,10 @@ import argparse
 import json
 import os
 
+# 🔴 OR AN A100 RUNS THE REFERENCE'S float32 einsums IN TF32: the steering oracle's rigid augmentation read 2.7e-4
+# off on its FIRST step until this was set
+os.environ.setdefault('JAX_DEFAULT_MATMUL_PRECISION', 'highest')
+
 import numpy as np
 
 from alphafold3.common import folding_input
@@ -39,6 +43,32 @@ def plain(x):
   return x
 
 
+def _frame(path, keys, f):
+  """The sample's atoms in BioEmu2's order. An atom the sample lacks - colab writes the AF3 layout, which
+  drops a glycan's O1 that BioEmu2 predicts - is placed at its residue's sampled centroid plus its template
+  offset, so every potential sees a whole molecule."""
+  from alphafold3 import structure
+  with open(path) as fh:
+    s = structure.from_mmcif(fh.read())
+  where = {(str(c), int(r), str(n)): (x, y, z) for c, r, n, x, y, z in zip(
+      s.chain_id, s.res_id, s.atom_name, s.atom_x, s.atom_y, s.atom_z)}
+  ref = np.asarray(f['template_coords'], np.float64)
+  res = np.asarray(f['ref_space_uid'])
+  x = np.full((len(keys), 3), np.nan)
+  for i, k in enumerate(keys):
+    if k in where:
+      x[i] = where[k]
+  for r in set(res[:len(keys)].tolist()):
+    sel = np.flatnonzero(res[:len(keys)] == r)
+    have = sel[np.isfinite(x[sel]).all(1)]
+    miss = sel[~np.isfinite(x[sel]).all(1)]
+    if len(miss):
+      shift = x[have].mean(0) - ref[have].mean(0)
+      x[miss] = ref[miss] + shift
+      print(f'placed {len(miss)} atom(s) the sample lacks from the template:', [keys[m] for m in miss])
+  return x
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--job', required=True)
@@ -53,7 +83,7 @@ def main():
   g = st.Graph(topo, ccd)
   topo = dict(topo, n_pad=f['template_coords'].shape[0])
   tables = st.tables(topo, ccd)
-  x0 = bf.x0_from_mmcif(a.structure, keys).astype(np.float64)
+  x0 = _frame(a.structure, keys, f)
   rng = np.random.default_rng(0)
   frames = np.stack([x0 + s * rng.standard_normal(x0.shape) for s in NOISE])
   where = {k: i for i, k in enumerate(keys)}
@@ -62,7 +92,28 @@ def main():
   for mode in (*phys.THRESHOLDS, 'no_filter'):
     ok, reasons, stats = phys.check(topo, g.bonds, ccd, frames, mode, declared)
     report[mode] = {'ok': ok, 'reasons': reasons, 'stats': stats}
+  # the potentials on colab's own tables: energies per spec and jax.grad per spec, on the frames at three times
+  import jax
+  import jax.numpy as jnp
+  from alphafold3.model.network import bioemu2_steering as ns
+  host = ns.host_tables({k: v for k, v in tables.items() if k != 'graph_bonds'})
+  n_pad = topo['n_pad']
+  c = np.zeros((len(NOISE), n_pad, 3), np.float32)
+  c[:, :len(keys)] = frames
+  cj = jnp.asarray(c)
+  tj = {k: jnp.asarray(v) for k, v in host.items()}
+  steer = {'host': host, 'times': []}
+  for t_norm in (0.9, 0.5, 0.1):
+    prm = ns.step_parameters(t_norm)
+    pj = {k: jnp.asarray(v) for k, v in prm.items()}
+    en = np.asarray(ns.energies(cj, tj, pj))
+    grads = []
+    for i in range(len(ns.DEFAULT)):
+      grads.append(np.asarray(jax.grad(lambda x: ns.energies(x, tj, pj)[i].sum())(cj)))
+    steer['times'].append({'t': t_norm, 'params': prm, 'energies': en, 'grads': grads,
+                           'interval': ns.guidance_interval(t_norm)})
   out = {
+      'steer': steer, 'coords': c,
       'graph': {'bonds': g.bonds, 'angles': g.angles, 'exclusions': sorted(g.nonbonded_exclusions()),
                 'labels': [g.labels[i] for i in range(len(keys))], 'ordinary_x': sorted(g.ordinary_x),
                 'peptide_edges': sorted(g.peptide_edges)},

@@ -19,7 +19,7 @@ inline const std::vector<BundleEntry>& bundleTable() {
     {"boltz2", "model-boltz2-int5", "https://huggingface.co/sokrypton/localfold/resolve/4c892464e84d5294081164d4a0854037de5dbbde/boltz2-int5/"},
     {"protenix2", "model-protenix2-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/protenix2-int5/"},
     {"intellifold2", "model-intellifold2-int5", "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/intellifold2-int5/"},
-    {"rosettafold3", "model-rosettafold3-int5", "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/rosettafold3-int5/"},
+    {"rosettafold3", "model-rosettafold3-int5", "https://huggingface.co/sokrypton/localfold/resolve/5e5d2948570094af971c3164710cf32b7c06a085/rosettafold3-int5/"},
     {"ef2-fast-600m", "model-esmfold2-int5", "https://huggingface.co/sokrypton/localfold/resolve/7f265c212f303a9ad57aff2e122cb8bf607eefab/ef2-fast-600m-int5/"},
     {"ef2-fast-300m", "model-ef2-fast-300m-int5", "https://huggingface.co/sokrypton/localfold/resolve/7f265c212f303a9ad57aff2e122cb8bf607eefab/ef2-fast-300m-int5/"},
     {"esmc", "model-esmc-600m-int3", "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/esmc-600m-int3/"},
