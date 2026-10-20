@@ -230,9 +230,10 @@ void layerNormBwd(const float* x, const float* dy, float* dx, size_t rows, int C
   }
 }
 
-void columnSum(const float* dy, float* out, size_t rows, int C, int ldy) {
+void columnSum(const float* dy, float* out, size_t rows, int C, int ldy, bool accumulate) {
   if (!rows || !C) return;
-  ColSumArgs a{dy, nullptr, nullptr, nullptr, out, nullptr, nullptr, nullptr, rows, C, C, ldy ? ldy : C, 0, 0};
+  ColSumArgs a{dy, nullptr, nullptr, nullptr, out, nullptr, nullptr, nullptr, rows, C, C, ldy ? ldy : C,
+               accumulate ? 1u : 0u, 0};
   dispatch("lf_col_sums", &a, sizeof a, Grid{(uint32_t)C, 1, 1}, 256, 0, "design.colsum");
 }
 
@@ -247,7 +248,7 @@ void gateBwd(const float* dout, const float* y, const float* g, float* dy, float
 }
 
 void linearBwd(const float* X, const float* W, const float* dY, float* dX, float* dW, float* dbias,
-               size_t rows, int in, int out, bool accumulateX) {
+               size_t rows, int in, int out, bool accumulateX, bool accumulateW) {
   if (!rows) return;
   if (dX) {
     // dX[rows][in] = dY[rows][out] * W^T. In Gemm's terms the contraction is over `out`, the result is `in` wide, and
@@ -269,10 +270,11 @@ void linearBwd(const float* X, const float* W, const float* dY, float* dX, float
     g.W = (void*)dY; g.tw = F32; g.transW = false;
     g.Y = dW; g.ty = F32;
     g.rows = (size_t)in; g.in = (int)rows; g.out = out;
+    g.beta = accumulateW ? 1.f : 0.f;
     g.sx = (int64_t)rows * in; g.sw = (int64_t)rows * out; g.sy = (int64_t)in * out;
     gemm(g);
   }
-  if (dbias) columnSum(dY, dbias, rows, out);
+  if (dbias) columnSum(dY, dbias, rows, out, 0, accumulateW);
 }
 
 void transitionBwd(const float* act, const float* dOut, size_t rows, int C, int H,

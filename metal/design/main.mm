@@ -2279,6 +2279,196 @@ static void ipaOutputsCase(int L, int H, int Cs, int Pv, int C2) {
   release(gda); release(gdvs); release(gdvp); release(gda2); release(gdr);
 }
 
+// ---------------------------------------------------------------- InvariantPointAttention, the whole module
+// The composition's own test. Each piece above is held to two references; what this asks is the WIRING - that the
+// six projections, the two cores and the residual output projection are joined the way the forward joins them - so
+// it is sampled central differences of the whole module against every one of its nineteen inputs.
+struct IpaModW {
+  std::vector<double> Wq, bq, Wk, bk, Wv, bv, Wqp, bqp, Wkp, bkp, Wvp, bvp, Wo, bo, pwRaw;
+};
+static void ipaModForward(const std::vector<double>& act, const std::vector<double>& act2d,
+                          const std::vector<double>& rig, const std::vector<double>& b2d,
+                          const std::vector<double>& mask, const IpaModW& w, int L, int C, int C2, int H, int Cs,
+                          int Pq, int Pv, std::vector<double>& out) {
+  const int W = H * Cs, Fw = H * Cs + 4 * H * Pv + H * C2;
+  const double qScale = sqrt(1.0 / Cs), pointBase = sqrt(1.0 / (Pq * 9.0 / 2.0));
+  auto lin = [&](const std::vector<double>& X, const std::vector<double>& Wm, const std::vector<double>& b,
+                 int in, int o, double alpha, std::vector<double>& Y) {
+    Y.assign((size_t)L * o, 0.0);
+    for (int r = 0; r < L; ++r)
+      for (int j = 0; j < o; ++j) {
+        double s = b.empty() ? 0.0 : b[j];
+        for (int i = 0; i < in; ++i) s += X[(size_t)r * in + i] * Wm[(size_t)i * o + j];
+        Y[(size_t)r * o + j] = alpha * s;
+      }
+  };
+  std::vector<double> qs, ks, vs, projQ, projK, projV;
+  lin(act, w.Wq, w.bq, C, W, qScale, qs);
+  lin(act, w.Wk, w.bk, C, W, 1.0, ks);
+  lin(act, w.Wv, w.bv, C, W, 1.0, vs);
+  lin(act, w.Wqp, w.bqp, C, H * 3 * Pq, 1.0, projQ);
+  lin(act, w.Wkp, w.bkp, C, H * 3 * Pq, 1.0, projK);
+  lin(act, w.Wvp, w.bvp, C, H * 3 * Pv, 1.0, projV);
+  auto global = [&](const std::vector<double>& proj, int P, std::vector<double>& g) {
+    g.assign((size_t)L * H * P * 3, 0.0);
+    for (int i = 0; i < L; ++i) {
+      const double* r = &rig[(size_t)i * 12];
+      for (int h = 0; h < H; ++h) {
+        const double* sp = &proj[((size_t)i * H + h) * 3 * P];
+        for (int p = 0; p < P; ++p) {
+          double loc[3] = {sp[p], sp[P + p], sp[2 * P + p]};
+          for (int k = 0; k < 3; ++k)
+            g[(((size_t)i * H + h) * P + p) * 3 + k] =
+                r[k * 3] * loc[0] + r[k * 3 + 1] * loc[1] + r[k * 3 + 2] * loc[2] + r[9 + k];
+        }
+      }
+    }
+  };
+  std::vector<double> qp, kp, vp;
+  global(projQ, Pq, qp);
+  global(projK, Pq, kp);
+  global(projV, Pv, vp);
+  std::vector<double> attn, fin;
+  ipaWForward(qs, ks, qp, kp, b2d, w.pwRaw, mask, L, H, Cs, Pq, pointBase, attn);
+  ipaOForward(attn, vs, vp, act2d, rig, L, H, Cs, Pv, C2, fin);
+  out.assign((size_t)L * C, 0.0);
+  for (int r = 0; r < L; ++r)
+    for (int c = 0; c < C; ++c) {
+      double s = w.bo[c] + act[(size_t)r * C + c];
+      for (int f = 0; f < Fw; ++f) s += fin[(size_t)r * Fw + f] * w.Wo[(size_t)f * C + c];
+      out[(size_t)r * C + c] = s;
+    }
+}
+
+static void ipaModuleCase(int L, int C, int C2, int H, int Cs, int Pq, int Pv) {
+  const int W = H * Cs, Fw = H * Cs + 4 * H * Pv + H * C2;
+  const double qScale = sqrt(1.0 / Cs), pointBase = sqrt(1.0 / (Pq * 9.0 / 2.0));
+  std::vector<double> act = randv((size_t)L * C, 0.5), act2d = randv((size_t)L * L * C2, 0.5),
+                      rig = randv((size_t)L * 12, 0.5), b2d = randv((size_t)L * L * H, 0.5),
+                      dOut = randv((size_t)L * C, 0.5), mask(L, 1.0);
+  for (int i = 0; i < L; ++i) if (i % 5 == 4) mask[i] = 0.0;
+  IpaModW w{randv((size_t)C * W, 0.3), randv(W, 0.2), randv((size_t)C * W, 0.3), randv(W, 0.2),
+            randv((size_t)C * W, 0.3), randv(W, 0.2),
+            randv((size_t)C * H * 3 * Pq, 0.3), randv((size_t)H * 3 * Pq, 0.2),
+            randv((size_t)C * H * 3 * Pq, 0.3), randv((size_t)H * 3 * Pq, 0.2),
+            randv((size_t)C * H * 3 * Pv, 0.3), randv((size_t)H * 3 * Pv, 0.2),
+            randv((size_t)Fw * C, 0.3), randv(C, 0.2), randv(H, 0.5)};
+
+  // the forward's own tensors, in double, then handed to the kernel as the save set
+  std::vector<double> qs, ks, vs, projQ, projK, projV, qp, kp, vp, attn, fin, out;
+  {
+    auto lin = [&](const std::vector<double>& X, const std::vector<double>& Wm, const std::vector<double>& b,
+                   int in, int o, double alpha, std::vector<double>& Y) {
+      Y.assign((size_t)L * o, 0.0);
+      for (int r = 0; r < L; ++r)
+        for (int j = 0; j < o; ++j) {
+          double s = b[j];
+          for (int i = 0; i < in; ++i) s += X[(size_t)r * in + i] * Wm[(size_t)i * o + j];
+          Y[(size_t)r * o + j] = alpha * s;
+        }
+    };
+    lin(act, w.Wq, w.bq, C, W, qScale, qs);
+    lin(act, w.Wk, w.bk, C, W, 1.0, ks);
+    lin(act, w.Wv, w.bv, C, W, 1.0, vs);
+    lin(act, w.Wqp, w.bqp, C, H * 3 * Pq, 1.0, projQ);
+    lin(act, w.Wkp, w.bkp, C, H * 3 * Pq, 1.0, projK);
+    lin(act, w.Wvp, w.bvp, C, H * 3 * Pv, 1.0, projV);
+    auto global = [&](const std::vector<double>& proj, int P, std::vector<double>& g) {
+      g.assign((size_t)L * H * P * 3, 0.0);
+      for (int i = 0; i < L; ++i) {
+        const double* r = &rig[(size_t)i * 12];
+        for (int h = 0; h < H; ++h) {
+          const double* sp = &proj[((size_t)i * H + h) * 3 * P];
+          for (int p = 0; p < P; ++p) {
+            double loc[3] = {sp[p], sp[P + p], sp[2 * P + p]};
+            for (int k = 0; k < 3; ++k)
+              g[(((size_t)i * H + h) * P + p) * 3 + k] =
+                  r[k * 3] * loc[0] + r[k * 3 + 1] * loc[1] + r[k * 3 + 2] * loc[2] + r[9 + k];
+          }
+        }
+      }
+    };
+    global(projQ, Pq, qp);
+    global(projK, Pq, kp);
+    global(projV, Pv, vp);
+    ipaWForward(qs, ks, qp, kp, b2d, w.pwRaw, mask, L, H, Cs, Pq, pointBase, attn);
+    ipaOForward(attn, vs, vp, act2d, rig, L, H, Cs, Pv, C2, fin);
+  }
+  std::vector<double> pwv(H);
+  for (int h = 0; h < H; ++h) pwv[h] = pointBase * log(1.0 + exp(w.pwRaw[h]));
+
+  auto up = [&](const std::vector<double>& x) { auto f = toF(x); return uploadNew(f.data(), f.size()); };
+  std::vector<void*> owned;
+  auto U = [&](const std::vector<double>& x) { void* p = up(x); owned.push_back(p); return (const float*)p; };
+  auto A = [&](size_t n) { void* p = alloc(n * 4); owned.push_back(p); fill(p, 0, n * 4); return (float*)p; };
+
+  IpaSaved saved{U(act), U(act2d), U(rig), U(qs), U(ks), U(vs), U(projQ), U(projK), U(projV),
+                 U(qp), U(kp), U(vp), U(attn), U(fin)};
+  IpaWeightSet ws{U(w.Wq), U(w.Wk), U(w.bk), U(w.Wv), U(w.bv), U(w.Wqp), U(w.bqp), U(w.Wkp), U(w.bkp),
+                  U(w.Wvp), U(w.bvp), U(w.Wo), U(w.bo), U(pwv), U(w.pwRaw), (float)qScale, (float)pointBase};
+  IpaGradSet g{};
+  g.dAct = A((size_t)L * C);
+  g.dRig = A((size_t)L * 12);
+  g.dAct2d = A((size_t)L * L * C2);
+  g.db2d = A((size_t)L * L * H);
+  g.dPointWeightRaw = A(H);
+  g.dWq = A((size_t)C * W); g.dbq = A(W);
+  g.dWk = A((size_t)C * W); g.dbk = A(W);
+  g.dWv = A((size_t)C * W); g.dbv = A(W);
+  g.dWqp = A((size_t)C * H * 3 * Pq); g.dbqp = A((size_t)H * 3 * Pq);
+  g.dWkp = A((size_t)C * H * 3 * Pq); g.dbkp = A((size_t)H * 3 * Pq);
+  g.dWvp = A((size_t)C * H * 3 * Pv); g.dbvp = A((size_t)H * 3 * Pv);
+  g.dWo = A((size_t)Fw * C); g.dbo = A(C);
+  const float* dOutDev = U(dOut);
+
+  IpaDims dims{L, C, C2, H, Cs, Pq, Pv};
+  invariantPointAttentionBwd(saved, dOutDev, dims, ws, g);
+
+  // the forward the kernel's save set describes must be the one this reference computes, or everything after is
+  // differentiating a different function
+  char label[220], shape[90];
+  snprintf(shape, sizeof shape, "L%d C%d C2%d H%d Cs%d Pq%d Pv%d", L, C, C2, H, Cs, Pq, Pv);
+  ipaModForward(act, act2d, rig, b2d, mask, w, L, C, C2, H, Cs, Pq, Pv, out);
+
+  auto S_ = [&]() {
+    std::vector<double> o;
+    ipaModForward(act, act2d, rig, b2d, mask, w, L, C, C2, H, Cs, Pq, Pv, o);
+    double acc = 0;
+    for (size_t i = 0; i < o.size(); ++i) acc += dOut[i] * o[i];
+    return acc;
+  };
+  auto probe = [&](const char* what, std::vector<double>& target, float* got, int count) {
+    auto g_ = download((const float*)got, target.size());
+    std::vector<double> fd, mine;
+    std::uniform_int_distribution<size_t> Ui(0, target.size() - 1);
+    for (int t = 0; t < count; ++t) {
+      size_t j = Ui(rng);
+      double save = target[j], hh = 1e-5 * std::max(1.0, fabs(save));
+      target[j] = save + hh; double aS = S_();
+      target[j] = save - hh; double bS = S_();
+      target[j] = save;
+      fd.push_back((aS - bS) / (2 * hh));
+      mine.push_back(g_[j]);
+    }
+    snprintf(label, sizeof label, "IPA module %s vs central difference %s", what, shape);
+    reportGrad(label, fd, mine, 5e-5);
+  };
+  probe("dAct", act, g.dAct, 6);
+  probe("dRig", rig, g.dRig, 6);
+  probe("dAct2d", act2d, g.dAct2d, 5);
+  probe("db2d", b2d, g.db2d, 5);
+  probe("dPointWeightRaw", w.pwRaw, g.dPointWeightRaw, H < 3 ? H : 3);
+  probe("dWq", w.Wq, g.dWq, 4);   probe("dbq", w.bq, g.dbq, 3);
+  probe("dWk", w.Wk, g.dWk, 4);   probe("dbk", w.bk, g.dbk, 3);
+  probe("dWv", w.Wv, g.dWv, 4);   probe("dbv", w.bv, g.dbv, 3);
+  probe("dWqp", w.Wqp, g.dWqp, 4); probe("dbqp", w.bqp, g.dbqp, 3);
+  probe("dWkp", w.Wkp, g.dWkp, 4); probe("dbkp", w.bkp, g.dbkp, 3);
+  probe("dWvp", w.Wvp, g.dWvp, 4); probe("dbvp", w.bvp, g.dbvp, 3);
+  probe("dWo", w.Wo, g.dWo, 4);   probe("dbo", w.bo, g.dbo, 3);
+
+  for (void* p : owned) release(p);
+}
+
 // ---------------------------------------------------------------- --mem: what each backward HOLDS, at real shapes
 // The test cases above are deliberately tiny, so they say nothing about memory. These are AF2's own widths at a
 // design-sized complex, which is what has to fit in 16 GB of unified memory.
@@ -2497,6 +2687,10 @@ int main(int argc, char** argv) {
   ipaOutputsCase(6, 3, 4, 2, 5);
   ipaOutputsCase(5, 2, 6, 4, 8);
   ipaOutputsCase(4, 1, 16, 8, 12);  // AF2's num_scalar_v and num_point_v
+  printf("the structure module: the whole InvariantPointAttention, wiring and all\n");
+  ipaModuleCase(5, 8, 5, 2, 3, 2, 2);
+  ipaModuleCase(4, 6, 4, 1, 4, 4, 8);     // AF2's own num_point_qk and num_point_v
+  ipaModuleCase(6, 10, 6, 3, 2, 2, 3);
   printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
   return failures ? 1 : 0;
 }

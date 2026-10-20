@@ -49,8 +49,10 @@ struct IpaWeightsSaved { const float* attn; const float* qs; const float* ks; co
 // Every one is WRITTEN, not accumulated. db2d is [L][L][H] - the pair bias's own layout, the head axis innermost -
 // and dPointWeightRaw may be null; the rest may not.
 struct IpaWeightsGrads { float* dqs; float* dks; float* dqp; float* dkp; float* db2d; float* dPointWeightRaw; };
+// `accumulateShared` adds into db2d and dPointWeightRaw instead of writing them - the pair bias and the point
+// weight are ONE set of parameters read by all eight fold iterations.
 void ipaWeightsBwd(const IpaWeightsSaved& saved, const float* dAttn, int L, int H, int Cs, int Pq,
-                   float pointBase, IpaWeightsGrads& grads);
+                   float pointBase, IpaWeightsGrads& grads, bool accumulateShared = false);
 
 // What the outputs backward reads. `rig` is the forward's rigid at this iteration - the point block comes back into
 // the LOCAL frame through it, so the rigid takes a gradient here as well as through the point projections.
@@ -59,6 +61,50 @@ struct IpaOutputsSaved { const float* attn; const float* vs; const float* vp; co
 // projections of the same iteration).
 struct IpaOutputsGrads { float* dAttn; float* dvs; float* dvp; float* dAct2d; float* dRig; };
 void ipaOutputsBwd(const IpaOutputsSaved& saved, const float* dFinal, int L, int H, int Cs, int Pv, int C2,
-                   IpaOutputsGrads& grads, bool accumulateRig = false);
+                   IpaOutputsGrads& grads, bool accumulateRig = false, bool accumulateAct2d = false);
+
+// ---------------------------------------------------------------- InvariantPointAttention, the whole module
+// The forward, as metal/af2/structure.mm runs it inside each fold iteration:
+//
+//   qs = qScale (act Wq + bq)                 ks = act Wk + bk            vs = act Wv + bv
+//   projQ = act Wqp + bqp   ->  qp = global(projQ, rig)          (and the same for k with Pq, v with Pv)
+//   attn = ipaWeights(qs, ks, qp, kp, b2d, pw, seqMask)
+//   fin  = ipaOutputs(attn, vs, vp, act2d, rig)
+//   out  = fin Wo + bo + act                  <- the output projection's beta is 1: the residual is INSIDE it
+//
+// qScale is sqrt(1/Cs) and the forward folds it into the GEMM's alpha with a pre-scaled bias; this backward scales
+// the cotangent instead, which is the same map.
+//
+// 🔴 EVERYTHING HERE ACCUMULATES EXCEPT dAct, AND THE CALLER ZEROES. One set of IPA weights runs eight times, one
+// pair bias feeds all eight, and the rigid takes a cotangent four times within a single call - through the three
+// point projections and again through the outputs' return to the local frame. A written gradient would keep only
+// the last of those, so there is no flag to get wrong: zero the destinations once before the loop.
+struct IpaDims { int L, C, C2, H, Cs, Pq, Pv; };
+struct IpaWeightSet {
+  const float* Wq; const float* Wk; const float* bk; const float* Wv; const float* bv;
+  const float* Wqp; const float* bqp; const float* Wkp; const float* bkp; const float* Wvp; const float* bvp;
+  const float* Wo; const float* bo;
+  const float* pw;               // the softplus-scaled point weight the logit reads
+  const float* pointWeightRaw;   // the parameter behind it
+  float qScale, pointBase;
+};
+// The forward's own tensors. 🔴 projQ/projK/projV must be THREE buffers: the forward reuses one piece of scratch for
+// all three, and dRig needs each projection's LOCAL coordinates, so emitting the save set means keeping them apart.
+struct IpaSaved {
+  const float* act; const float* act2d; const float* rig;
+  const float* qs; const float* ks; const float* vs;
+  const float* projQ; const float* projK; const float* projV;
+  const float* qp; const float* kp; const float* vp;
+  const float* attn; const float* fin;
+};
+struct IpaGradSet {
+  float* dAct;                   // WRITTEN (the residual through the output projection included)
+  float* dRig; float* dAct2d; float* db2d; float* dPointWeightRaw;
+  float* dWq; float* dbq; float* dWk; float* dbk; float* dWv; float* dbv;
+  float* dWqp; float* dbqp; float* dWkp; float* dbkp; float* dWvp; float* dbvp;
+  float* dWo; float* dbo;
+};
+void invariantPointAttentionBwd(const IpaSaved& saved, const float* dOut, const IpaDims& d,
+                                const IpaWeightSet& w, IpaGradSet& grads);
 
 }  // namespace mt

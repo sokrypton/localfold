@@ -41,12 +41,13 @@ void layerNormBwd(const float* x, const float* dy, float* dx, size_t rows, int C
 //   dbias[out]   = sum over rows of dY
 // Any of dX, dW, dbias may be null. Nothing is accumulated: each is written.
 // `accumulateX` adds into dX instead of writing it - the outer product's two projections share one input, so its
-// cotangent is the sum of both paths. dW and dbias are always written.
+// cotangent is the sum of both paths. `accumulateW` does the same for dW and dbias, which is what a weight SHARED
+// across iterations needs: the structure module runs one set of IPA weights eight times.
 void linearBwd(const float* X, const float* W, const float* dY, float* dX, float* dW, float* dbias,
-               size_t rows, int in, int out, bool accumulateX = false);
+               size_t rows, int in, int out, bool accumulateX = false, bool accumulateW = false);
 
 // The column sums on their own - a bias's gradient, and what doffset is.
-void columnSum(const float* dy, float* out, size_t rows, int C, int ldy = 0);
+void columnSum(const float* dy, float* out, size_t rows, int C, int ldy = 0, bool accumulate = false);
 
 // ---------------------------------------------------------------- elementwise
 // dx = dy * (ref > 0). `ref` may be relu's input or its output; the sign is the same.

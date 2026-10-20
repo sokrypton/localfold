@@ -191,7 +191,7 @@ struct ColSumArgs {
   CP(float) x; CP(half) xh;        // null: doffset/dbias only, no dscale
   DP(float) doffset; DP(float) dscale;
   CP(float) mean; CP(float) inv;   // from lf_ln_stats; needed only for dscale
-  u64 rows; int C, ldx, ldy; uint pad, pad2;
+  u64 rows; int C, ldx, ldy; uint accum, pad2;   // accum: ADD into doffset/dscale (a weight shared across iterations)
 };
 
 // ---------------------------------------------------------------- the structure module's rigids
@@ -232,9 +232,9 @@ struct IpaDqArgs { CP(float) dLogit; CP(float) ks; CP(float) qp; CP(float) kp; C
 struct IpaDkArgs { CP(float) dLogit; CP(float) qs; CP(float) qp; CP(float) kp; CP(float) pw;
                    DP(float) dks; DP(float) dkp; uint L, H, Cs, Pq; };
 // db2d[q][k][h] = dLogit[q][h][k] - the head axis moves, which is the whole kernel
-struct IpaDb2dArgs { CP(float) dLogit; DP(float) db2d; uint L, H, pad, pad2; };
+struct IpaDb2dArgs { CP(float) dLogit; DP(float) db2d; uint L, H, accum, pad2; };
 // the trainable point weight, through its softplus: dRaw[h] = sum_q dpwPart[q][h] * base * sigmoid(raw[h])
-struct IpaDpwArgs { CP(float) dpwPart; CP(float) raw; DP(float) dRaw; uint L, H; float base; uint pad; };
+struct IpaDpwArgs { CP(float) dpwPart; CP(float) raw; DP(float) dRaw; uint L, H; float base; uint accum; };
 
 // The outputs: per (query, head) a scalar block (attn . vs), a point block (attn . vp taken back into the LOCAL
 // frame, with its norm) and a pair block (attn . act2d), laid out as
@@ -245,4 +245,4 @@ struct IpaOutDqArgs { CP(float) attn; CP(float) df; CP(float) vs; CP(float) vp; 
 struct IpaOutDrigArgs { CP(float) dRigPart; DP(float) dRig; uint L, H, accum, pad; };
 struct IpaOutDvArgs { CP(float) attn; CP(float) df; CP(float) dg; DP(float) dvs; DP(float) dvp;
                       uint L, H, Cs, Pv; uint C2, pad; };
-struct IpaOutD2dArgs { CP(float) attn; CP(float) df; DP(float) dact2d; uint L, H, Cs, Pv; uint C2, pad; };
+struct IpaOutD2dArgs { CP(float) attn; CP(float) df; DP(float) dact2d; uint L, H, Cs, Pv; uint C2, accum; };

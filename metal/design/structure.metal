@@ -171,7 +171,8 @@ kernel void lf_ipa_db2d(LF_ARGS(IpaDb2dArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.L * a.L * a.H) return;
   uint h = (uint)(t % a.H), k = (uint)((t / a.H) % a.L), q = (uint)(t / ((ulong)a.H * a.L));
-  a.db2d[t] = a.dLogit[((ulong)q * a.H + h) * a.L + k];
+  float v = a.dLogit[((ulong)q * a.H + h) * a.L + k];
+  if (a.accum) a.db2d[t] += v; else a.db2d[t] = v;
 }
 
 kernel void lf_ipa_dpw(LF_ARGS(IpaDpwArgs)) {
@@ -180,7 +181,8 @@ kernel void lf_ipa_dpw(LF_ARGS(IpaDpwArgs)) {
   float s = 0;
   for (uint q = 0; q < a.L; ++q) s += a.dpwPart[(ulong)q * a.H + h];
   float r = a.raw[h];
-  a.dRaw[h] = s * a.base * (1.f / (1.f + exp(-r)));
+  float v = s * a.base * (1.f / (1.f + exp(-r)));
+  if (a.accum) a.dRaw[h] += v; else a.dRaw[h] = v;
 }
 
 // ---------------------------------------------------------------- InvariantPointAttention: the outputs
@@ -279,6 +281,6 @@ kernel void lf_ipa_out_d2d(LF_ARGS(IpaOutD2dArgs)) {
     float s = 0;
     for (uint h = 0; h < a.H; ++h)
       s += a.attn[((ulong)q * a.H + h) * a.L + k] * a.df[(ulong)q * Fw + off + h * a.C2 + c];
-    d[c] = s;
+    if (a.accum) d[c] += s; else d[c] = s;
   }
 }

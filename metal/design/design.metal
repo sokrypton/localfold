@@ -723,7 +723,7 @@ kernel void lf_col_sums(constant ColSumArgs& a [[buffer(0)]], uint3 tg [[threadg
   if (lid == 0) {
     float to = 0, ts = 0;
     for (int i = 0; i < 8; ++i) { to += partOff[i]; ts += partScale[i]; }
-    if (a.doffset) a.doffset[c] = to;
-    if (wantScale) a.dscale[c] = ts;
+    if (a.doffset) { if (a.accum) a.doffset[c] += to; else a.doffset[c] = to; }
+    if (wantScale) { if (a.accum) a.dscale[c] += ts; else a.dscale[c] = ts; }
   }
 }
