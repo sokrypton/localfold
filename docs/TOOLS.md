@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-384 tools. `tools/fixtures/` is data and is not listed.
+387 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (200)
 
@@ -307,7 +307,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (108)
+## `tools/` - everything else (111)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -329,6 +329,7 @@ go through CDP, and the deploy.
 - **`cdp.py`** - A minimal CDP client: just enough WebSocket to drive headless Chrome.
 - **`check-atom-windows.js`** - Our atom key window against af3-any-model's own, for every dumped model.
 - **`check-batch-fields.js`** - OUR WHOLE FEATURISED BATCH against af3-any-model's own, field by field, for every dumped model.
+- **`check-bioemu2-denoiser.js`** - cpu/bioemu2/denoiser.js - BioEmu2's denoiser and its vector-Jacobian product - against af3-any-model's port.
 - **`check-bioemu2-features.js`** - Does shared/bioemu2/featurise.js build what af3-any-model's BioEmu2 port builds, field by field?
 - **`check-bioemu2-ligand-tables.js`** - How far shared/bioemu2/ligand-tables.js (Tier 2 from the CCD) is from the vendor's RDKit tables. A REPORT.
 - **`check-bioemu2-potentials.js`** - BioEmu2's steering potentials - every energy and its gradient - against af3-any-model's port.
@@ -350,6 +351,7 @@ go through CDP, and the deploy.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
+- **`check-native-bioemu2-steering.mjs`** - Is cuda/bioemu2/src/steer.h - BioEmu2's steering natively - the JavaScript's, and af3-any-model's?
 - **`check-native-bioemu2.mjs`** - Is cuda/featurise/bioemu2_features.h the JavaScript featuriser, byte for byte?
 - **`check-native-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:bridge.
 - **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
@@ -411,6 +413,7 @@ go through CDP, and the deploy.
 - **`repack_shards.py`** - Lay an exported bundle into a few even shards instead of many uneven ones.
 - **`replay_alphafold_evoformer_block.py`** - Replay and stage-capture one official AlphaFold Evoformer block on CPU.
 - **`replay_alphafold_triangle_reference.py`** - Replay a captured bundle through the official AF2 Haiku operator on CPU.
+- **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.
 - **`serve.py`** - Serve the checkout with caching turned off.
 - **`stub_worker.py`** - A stand-in for python/localfold/worker.py that a gate drives, so the broker (python/localfold/server.py) and the reader's page are tested with no card.
