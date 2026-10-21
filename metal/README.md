@@ -33,6 +33,9 @@ metal/
     host.h/.cpp    the drivers' shared host pieces: --serve, frame superposition, whole-file writes
   af3/ af2/ ef2/ one per port, flat: the port's kernels (kernels.h, <port>.metal), its stages (*.mm), main.mm,
                  fold, gate.py, gate-baseline.<chip>.json
+  bioemu2/       BioEmu2 on the page's int5 bundle (--bundle=model-bioemu2-int5), held stage by stage to webgpu/bioemu2
+                 on the same bundle (--oracle=, tools/dump-bioemu2-webgpu.mjs; docs/BIOEMU2.md) - the float32 reference
+                 arm, not yet on the worker path
   selftest/      the GEMM, attention and LayerNorm against host references
   bench/         GEMM and attention arms, interleaved, each checked against the first
 ```

@@ -71,11 +71,47 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
 |---|---|---|---|---|
 | CUDA (Colab, `localfold-bioemu2`) | `cuda/bioemu2`, `cuda/bioemu2/gate.py` | 1.6e-6 .. 3.6e-6 relRMS on six targets; `--fast` (f16 GEMMs, ef2's fused trunk) 1.7e-3 .. 3.2e-3; int8 blob 5-7e-3 trunk, which is the quantisation (decoded tensors match colab's dequantiser to four digits) | 6MRR single sequence 2.78-3.04 A over 5 samples, mean 2.88 - colab's own 2.88-3.20, mean 3.06; bonds against the CCD ideals equal to colab's (mainchain 0.034, side chains 0.052, nucleic 0.037 vs 0.036, ligand + SEP 0.084 vs 0.077) | 5 samples x 200 steps: 71 tokens 3.3 s, 255 tokens 7.0 s, 494 tokens 13.2 s; warm `--serve` trunk 100 ms at 6MRR |
 | WebGPU (the page) | `webgpu/bioemu2`, `tools/gpu/check-bioemu2-network.js`, `tools/gpu/fold-bioemu2.js`; bundle `bioemu2-int5` (372 MB) | trunk single ~1e-7, pair 2.4-3.1e-4 (the AF3 pair track's float32 band over 52 blocks), denoise 2.6e-7 .. 4.2e-6, propagation 6e-7 .. 1.1e-6; int5 pair 2.6e-2, denoise 6.2e-2 at sigma 160 falling to 1.9e-3 | 6MRR (68) 0.90 / 1.58 / 1.65 A float32, 0.89 / 1.59 / 1.64 int5 on the same seed | 68 residues 1 sample 13.7 s on the page (32 ms a denoiser call), 255 residues 27.7 s |
-| Metal | - | not ported | | |
+| Metal (this Mac, `localfold-bioemu2`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) 1.57-1.71 A over 5 samples, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, float32 reference arm: 5 samples x 200 steps at 68 tokens, trunk 2.3 s, sampler 55 s |
 
 🔴 **THE 6MRR FIXTURE IS 71 RESIDUES, NOT 68**: it was read off every CA line of the crystal, which repeats K14, E43
 and D64 at their alternate locations. The oracle dumps share it, so parity is unaffected; RMSD to the crystal uses
 `tools/fixtures/bioemu2/6mrr-68.json`.
+
+## The Metal port, and what it is held to
+
+`metal/bioemu2` is `cuda/bioemu2`'s float path on metal/core, reading the PAGE'S int5 bundle (`--bundle=model-bioemu2-int5`)
+rather than af3-any-model's int8 blob - every tensor decoded to float32 on this arm.
+
+🔴 **ITS ORACLE IS WEBGPU, NOT COLAB, AND THAT IS A REAL REFERENCE.** The colab dumps need af3-any-model's environment and
+the vendor checkpoint, which no Apple box has. `webgpu/bioemu2` is a SEPARATE implementation (WGSL, its own kernels, its
+own featuriser) reading THE SAME bundle, so the quantisation cancels and a residual is a port difference, not a weight
+difference; and it is itself held to the colab dumps, so the absolute claim transfers. `tools/dump-bioemu2-webgpu.mjs`
+runs it in Chrome and writes its stages as a featuriser directory; `--oracle=<dir>` then feeds EACH stage the oracle's
+own input (as check-bioemu2-network.js does), so a residual is that stage's alone:
+
+    node tools/dump-bioemu2-webgpu.mjs --out=/tmp/or --half=off --trunk=f32      # the float32 arm (default: shipped)
+    cuda/featurise/bioemu2-featurise /tmp/in --job=tools/fixtures/bioemu2/6mrr.json
+    metal/bioemu2/localfold-bioemu2 /tmp/in --bundle=model-bioemu2-int5 --oracle=/tmp/or
+
+Against the float32 arm the first build read 1e-7 on the trunk and context and 1e-5 on the denoiser. 🔴 **TWO STAGES READ
+EXACTLY 0, AND A CHECK THAT CANNOT FAIL LOOKS LIKE THAT** - so it was falsified before it was believed: against the
+SHIPPED (float16) arm the same check reads 7e-4 .. 2.8e-3, and `pass1.pair` reads 7.371e-04 to every digit, the gap
+WebGPU's own two arms show between themselves. The zeros are bitwise agreement (the same float operations on the same
+inputs), not a blind comparison.
+
+🔴 **WEBGPU'S TWO ARMS ARE 1e-3 APART, WHICH IS WHAT A BUG IS NOT.** Float16 weights and the device's pair track move
+the pair 7e-4 .. 1.2e-3, the distogram 4e-3 and the denoiser 1.8e-3 .. 6.1e-3 (2e-5 on the single, which never meets
+float16). A port defect reads O(1); measure that band before deciding a residual is one.
+
+🔴 **THE DUMPER RUNS IN CHROME, NOT NODE, THOUGH webgpu/node.js EXISTS**: Dawn's node binding here has no `device.tick`
+and its `mapAsync` never settles, so a node run exits 0 having written nothing - which is why nothing else in the tree
+imports createNodeDevice. The page hands the dump back through gpu-chrome's result channel as base64, in chunks of a
+multiple of 3 bytes (32768 is not: each chunk then ends in `=` padding and a decoder stops at the first - 38 MB written,
+32 KB read back).
+
+🔴 **SCORE 6MRR ON THE 68-RESIDUE JOB, BY ORDER.** The same Metal samples read 5.4 A against the crystal on `6mrr.json`
+matched by residue number and 1.6 A on `6mrr-68.json` superposed in order (as fold-bioemu2.js does): the 71-residue
+fixture repeats three residues, so its sequence is not the crystal's and every residue number after K14 is shifted.
 
 ## Traps
 
@@ -107,6 +143,9 @@ and D64 at their alternate locations. The oracle dumps share it, so parity is un
 
 ## Not done yet
 
+- Metal: the fast path (float16 weights, metal/core's fused triangle and flash attention - the float32 arm's sampler is
+  ~55 s for 5 x 200 at 68 tokens), the steered samplers (`steer.h` is host code and would come across), `--job` and the
+  worker's native path (fetch.h's `bioemu2` is the int8 blob; this port reads the int5 bundle).
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.
