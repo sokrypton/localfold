@@ -634,7 +634,7 @@ export function createLinearShader(
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnVectors; v += 1) {
-        inner.push(`    ${target(r, v)} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+        inner.push(`    ${target(r, v)} += s_${k}_${Math.floor(r / 4)}.${"xyzw"[r % 4]} * w_${k}_${v};`);
       }
     }
   }
@@ -653,6 +653,15 @@ export function createLinearShader(
     }
   }
 
+  const readSourceElem = (idx) => (sourceStorage === "f16" && (element === "f16" || weight16)
+    ? (element === "f16"
+      ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
+      : `f32(bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u])`)
+    : cast(storedElement(sourceStorage, "source", idx)));
+  const readWeightElem = (idx) => (element === weightPrecision
+    ? `weights[${idx}]`
+    : cast(wf(`weights[${idx}]`)));
+
   // Staging the source: a lane takes four rows at one k, so its four global
   // reads are `inner` apart and CONSECUTIVE LANES take consecutive k - which is
   // what makes each of the four a coalesced run.
@@ -668,9 +677,19 @@ export function createLinearShader(
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
       if (k < parameters.inner) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let row = row_base + j;
-          if (row < parameters.rows) { staged[j] = ${cast(storedElement(sourceStorage, "source", "row * parameters.inner + k"))}; }
+        let s0 = row_base * parameters.inner + k;
+        if (row_base + 3u < parameters.rows) {
+          staged = ${vector}(
+            ${readSourceElem("s0")},
+            ${readSourceElem("s0 + parameters.inner")},
+            ${readSourceElem("s0 + parameters.inner * 2u")},
+            ${readSourceElem("s0 + parameters.inner * 3u")},
+          );
+        } else {
+          if (row_base < parameters.rows) { staged.x = ${readSourceElem("s0")}; }
+          if (row_base + 1u < parameters.rows) { staged.y = ${readSourceElem("s0 + parameters.inner")}; }
+          if (row_base + 2u < parameters.rows) { staged.z = ${readSourceElem("s0 + parameters.inner * 2u")}; }
+          if (row_base + 3u < parameters.rows) { staged.w = ${readSourceElem("s0 + parameters.inner * 3u")}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -679,16 +698,26 @@ export function createLinearShader(
 
   const stageWeight = [];
   for (let v = 0; v < columnVectors; v += 1) {
+    const col0 = columnExpr(v, 0);
+    const col1 = columnExpr(v, 1);
+    const col2 = columnExpr(v, 2);
+    const col3 = columnExpr(v, 3);
     stageWeight.push(`    {
       var staged = ${vector}(0.0);
       if (weight_k < parameters.inner) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let output_column = ${packOut
-            ? `(quad_origin + ${v * lanesX}u) * 4u + j`
-            : `column_origin + (${v}u * 4u + j) * ${lanesX}u`};
-          if (output_column < parameters.columns) {
-            staged[j] = ${cast(wf('weights[parameters.weight_offset + weight_k * parameters.columns + output_column]'))};
-          }
+        let w_row = parameters.weight_offset + weight_k * parameters.columns;
+        let c3 = ${col3};
+        if (c3 < parameters.columns) {
+          staged = ${vector}(
+            ${readWeightElem(`w_row + ${col0}`)},
+            ${readWeightElem(`w_row + ${col1}`)},
+            ${readWeightElem(`w_row + ${col2}`)},
+            ${readWeightElem("w_row + c3")},
+          );
+        } else {
+          let c0 = ${col0}; if (c0 < parameters.columns) { staged.x = ${readWeightElem("w_row + c0")}; }
+          let c1 = ${col1}; if (c1 < parameters.columns) { staged.y = ${readWeightElem("w_row + c1")}; }
+          let c2 = ${col2}; if (c2 < parameters.columns) { staged.z = ${readWeightElem("w_row + c2")}; }
         }
       }
       tile_weight[local.y * ${lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u] = staged;
@@ -702,7 +731,7 @@ export function createLinearShader(
       if (packOut) {
         const values = [];
         for (let c = 0; c < 4; c += 1) {
-          values.push(`        var value_${c} = f32(${accumulator(r, v)}[${c}u])`
+          values.push(`        var value_${c} = f32(${accumulator(r, v)}.${"xyzw"[c]})`
             + `\n          + ${wf(`weights[parameters.bias_offset + column + ${c}u]`)};`);
         }
         const relu = [0, 1, 2, 3].map((c) => `value_${c} = max(value_${c}, 0.0);`).join(" ");
@@ -724,7 +753,7 @@ ${values.join("\n")}
         body.push(`      {
         let output_column = ${columnExpr(v, c)};
         if (output_column < parameters.columns) {
-          var value = f32(${accumulator(r, v)}[${c}u])
+          var value = f32(${accumulator(r, v)}.${"xyzw"[c]})
             + ${wf("weights[parameters.bias_offset + output_column]")};
           if (parameters.activation == 1u) { value = max(value, 0.0); }
           output[row_${r} * parameters.columns + output_column] ${residual ? "+=" : "="} value;

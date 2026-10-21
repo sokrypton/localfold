@@ -359,10 +359,19 @@ export function createAttentionProjectShader(
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnsPerLane; v += 1) {
-        inner.push(`    acc_${r}_${v} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+        inner.push(`    acc_${r}_${v} += s_${k}_${Math.floor(r / 4)}.${"xyzw"[r % 4]} * w_${k}_${v};`);
       }
     }
   }
+
+  const readSourceElem = (idx) => (sourceStorage === "f16" && (half || weight16)
+    ? (half
+      ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
+      : `f32(bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u])`)
+    : narrow(storedElement(sourceStorage, "source", idx)));
+  const readWeightElem = (idx) => (half && weight16
+    ? `weights[${idx}]`
+    : narrow(wf(`weights[${idx}]`)));
 
   const stageSource = [];
   for (let n = 0; n < sourcePerLane; n += 1) {
@@ -376,9 +385,19 @@ export function createAttentionProjectShader(
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
       if (c < p.channels) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let row = row_base + j;
-          if (row < rows) { staged[j] = ${narrow(storedElement(sourceStorage, "source", "row * p.channels + c"))}; }
+        let s0 = row_base * p.channels + c;
+        if (row_base + 3u < rows) {
+          staged = ${vector}(
+            ${readSourceElem("s0")},
+            ${readSourceElem("s0 + p.channels")},
+            ${readSourceElem("s0 + p.channels * 2u")},
+            ${readSourceElem("s0 + p.channels * 3u")},
+          );
+        } else {
+          if (row_base < rows) { staged.x = ${readSourceElem("s0")}; }
+          if (row_base + 1u < rows) { staged.y = ${readSourceElem("s0 + p.channels")}; }
+          if (row_base + 2u < rows) { staged.z = ${readSourceElem("s0 + p.channels * 2u")}; }
+          if (row_base + 3u < rows) { staged.w = ${readSourceElem("s0 + p.channels * 3u")}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -392,10 +411,10 @@ export function createAttentionProjectShader(
       let output_hd = hd_${v};
       if (output_hd < projected && weight_c < p.channels) {
         let weight_index = weight_c * projected + output_hd;
-        packed = ${vector}(${narrow(wf("weights[p.query_weight + weight_index]"))},
-                           ${narrow(wf("weights[p.key_weight + weight_index]"))},
-                           ${narrow(wf("weights[p.value_weight + weight_index]"))},
-                           ${narrow(wf("weights[p.gating_weight + weight_index]"))});
+        packed = ${vector}(${readWeightElem("p.query_weight + weight_index")},
+                           ${readWeightElem("p.key_weight + weight_index")},
+                           ${readWeightElem("p.value_weight + weight_index")},
+                           ${readWeightElem("p.gating_weight + weight_index")});
       }
       tile_weight[local.y * ${lanesX * columnsPerLane}u + local.x * ${columnsPerLane}u + ${v}u] = packed;
     }`);
@@ -948,6 +967,8 @@ export function createAttentionRegisterFlashShader(headDim, keyChunk, options = 
   const vec4Out = packOut ? "vec2<u32>" : "vec4<f32>";
   const read4 = (array, index) => (packIn ? `load4(${array}[${index}])` : `${array}[${index}]`);
   const readValue = (index) => (packValue ? `load4(value[${index}])` : `value[${index}]`);
+  const readChunkKey = (index) => (chunk16 && packIn ? `bitcast<vec4<f16>>(key[${index}])` : `${chunkType}(${read4("key", index)})`);
+  const readChunkValue = (index) => (chunk16 && packValue ? `bitcast<vec4<f16>>(value[${index}])` : `${chunkType}(${readValue(index)})`);
   const write4 = (array, index, expr) => (packOut
     ? `${array}[${index}] = store4(${expr});`
     : `${array}[${index}] = ${expr};`);
@@ -1228,17 +1249,19 @@ ${Array.from({ length: vectors }, (_, t) =>
 }`;
   }
 
+  const maskExpr = (k) => (sharedMask ? k : `mask_base + (${k}) * mask_stride`);
   const inner = lazy ?? [
     `    for (var slot = 0u; slot < KEY_CHUNK; slot += ${group}u) {`,
     `      if (k0 + slot >= p.queries) { break; }`,
     ...indices.flatMap((g) => [
       `      let key_at${g} = k0 + slot + ${g}u;`,
       `      let live${g} = key_at${g} < p.queries;`,
+      `      let k_clamped${g} = min(key_at${g}, p.queries - 1u);`,
       `      let staged${g} = (slot + ${g}u) * HD4;`,
       scoreOf(g, `staged${g}`),
-      `      var logit${g} = ${scaled(`score${g}`)} + 1e9 * (mask[mask_index(batch_index, min(key_at${g}, p.queries - 1u))] - 1.0);`,
-      `      if (p.has_pair_bias != 0u) {`,
-      `        logit${g} += pair_bias[(head * p.queries + q_index) * p.queries + min(key_at${g}, p.queries - 1u)];`,
+      `      var logit${g} = ${scaled(`score${g}`)} + 1e9 * (mask[${maskExpr(`k_clamped${g}`)}] - 1.0);`,
+      `      if (has_bias) {`,
+      `        logit${g} += pair_bias[pair_bias_row + k_clamped${g}];`,
       `      }`,
       `      logit${g} = select(-1e30, clamp(logit${g}, -1e8, 1e8), live${g});`,
     ]),
@@ -1278,7 +1301,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let head = group.z;
   if (batch_index >= p.batch || head >= p.heads) { return; }
   let live = q_index < p.queries;
-  let q_base = ((batch_index * p.queries + select(0u, q_index, live)) * p.heads + head) * HD4;
+  let head_base = (batch_index * p.queries * p.heads + head) * HD4;
+  let head_stride = p.heads * HD4;
+  let q_base = head_base + select(0u, q_index, live) * head_stride;
+  let mask_base = select(batch_index, batch_index * p.queries, p.transpose == 0u);
+  let mask_stride = select(p.batch, 1u, p.transpose == 0u);
+  let pair_bias_row = (head * p.queries + select(0u, q_index, live)) * p.queries;
+  let has_bias = p.has_pair_bias != 0u;
 
 ${declare("qv", (t) => `${registerType}(${read4("query", `q_base + ${t}u`)})`)}
 ${declare("acc", () => `${registerType}(0.0)`)}
@@ -1290,9 +1319,9 @@ ${declare("acc", () => `${registerType}(0.0)`)}
     workgroupBarrier();
     for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
       let k_index = min(k0 + index / HD4, p.queries - 1u);
-      let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
-      key_chunk[index] = ${chunkType}(${read4("key", "k_base")});
-      value_chunk[index] = ${chunkType}(${readValue("k_base")});
+      let k_base = head_base + k_index * head_stride + index % HD4;
+      key_chunk[index] = ${readChunkKey("k_base")};
+      value_chunk[index] = ${readChunkValue("k_base")};
     }
     workgroupBarrier();
 
@@ -2212,10 +2241,19 @@ export function createAttentionOutputShader(
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnVectors; v += 1) {
-        lines.push(`    acc_${r}_${v} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+        lines.push(`    acc_${r}_${v} += s_${k}_${Math.floor(r / 4)}.${"xyzw"[r % 4]} * w_${k}_${v};`);
       }
     }
   }
+
+  const readSourceElem = (idx) => {
+    if (sourceStorage === "f16") {
+      return half
+        ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
+        : `unpack2x16float(source[(${idx}) >> 1u])[(${idx}) & 1u]`;
+    }
+    return narrow(`source[${idx}]`);
+  };
 
   const stageSource = [];
   for (let n = 0; n < sourcePerLane; n += 1) {
@@ -2229,9 +2267,16 @@ export function createAttentionOutputShader(
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
       if (k < projected) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let row = row_base + j;
-          if (row < rows) { staged[j] = ${narrow(storedElement(sourceStorage, "source", "row * projected + k"))}; }
+        if (row_base + 3u < rows) {
+          let b0 = row_base * projected + k;
+          let b1 = b0 + projected;
+          let b2 = b1 + projected;
+          let b3 = b2 + projected;
+          staged = ${vector}(${readSourceElem("b0")}, ${readSourceElem("b1")}, ${readSourceElem("b2")}, ${readSourceElem("b3")});
+        } else {
+          if (row_base < rows) { staged.x = ${readSourceElem("row_base * projected + k")}; }
+          if (row_base + 1u < rows) { staged.y = ${readSourceElem("(row_base + 1u) * projected + k")}; }
+          if (row_base + 2u < rows) { staged.z = ${readSourceElem("(row_base + 2u) * projected + k")}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -2240,14 +2285,25 @@ export function createAttentionOutputShader(
 
   const stageWeight = [];
   for (let v = 0; v < columnVectors; v += 1) {
+    const c0 = `${v * 4 * lanesX}u`;
+    const c1 = `${(v * 4 + 1) * lanesX}u`;
+    const c2 = `${(v * 4 + 2) * lanesX}u`;
+    const c3 = `${(v * 4 + 3) * lanesX}u`;
     stageWeight.push(`    {
       var staged = ${vector}(0.0);
       if (weight_k < projected) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let output_channel = channel_origin + (${v}u * 4u + j) * ${lanesX}u;
-          if (output_channel < p.channels) {
-            staged[j] = ${narrow("weights[p.output_weight + weight_k * p.channels + output_channel]")};
-          }
+        let w_base = p.output_weight + weight_k * p.channels + channel_origin;
+        if (channel_origin + ${c3} < p.channels) {
+          staged = ${vector}(
+            ${narrow(`weights[w_base + ${c0}]`)},
+            ${narrow(`weights[w_base + ${c1}]`)},
+            ${narrow(`weights[w_base + ${c2}]`)},
+            ${narrow(`weights[w_base + ${c3}]`)},
+          );
+        } else {
+          if (channel_origin + ${c0} < p.channels) { staged.x = ${narrow(`weights[w_base + ${c0}]`)}; }
+          if (channel_origin + ${c1} < p.channels) { staged.y = ${narrow(`weights[w_base + ${c1}]`)}; }
+          if (channel_origin + ${c2} < p.channels) { staged.z = ${narrow(`weights[w_base + ${c2}]`)}; }
         }
       }
       tile_weight[local.y * ${lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u] = staged;
@@ -2263,7 +2319,7 @@ export function createAttentionOutputShader(
         let output_channel = channel_origin + ${(v * 4 + c) * lanesX}u;
         if (output_channel < p.channels) {
           output[output_row_${r} * p.channels + output_channel] ${residual ? "+=" : "="}
-            ${widen(`acc_${r}_${v}[${c}u]`)} + weights[p.output_bias + output_channel];
+            ${widen(`acc_${r}_${v}.${"xyzw"[c]}`)} + weights[p.output_bias + output_channel];
         }
       }`);
       }

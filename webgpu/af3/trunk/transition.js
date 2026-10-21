@@ -744,9 +744,9 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const f16 = arithmetic === "f16";
   const T = f16 ? "f16" : "f32";
   const half = f16 || [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
-  const load = sourceGate === null
-    ? `${T}(source[row * parameters.inner + k])`
-    : `${T}(gated(row * ${sourceGate.stride}u + k))`;
+  const loadElem = (r) => sourceGate === null
+    ? (sourcePrecision === T ? `source[(${r}) * parameters.inner + k]` : `${T}(source[(${r}) * parameters.inner + k])`)
+    : `${T}(gated((${r}) * ${sourceGate.stride}u + k))`;
   const accumulators = [];
   const multiply = [];
   const stores = [];
@@ -756,6 +756,7 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   for (let j = 0; j < TN / 4; j += 1) reads.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TN / 4}u + ${j}u];`);
   for (let i = 0; i < TM; i += 1) {
     const ai = `a_vec_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+    const rowStores = [];
     for (let j = 0; j < TN / 4; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
@@ -767,18 +768,19 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
       }
       for (let c = 0; c < 4; c += 1) {
         const value = `acc_${i}_${j}.${"xyzw"[c]}`;
-        stores.push(`  {
-    let row = row_origin + ty * ${TM}u + ${i}u;
-    let column = column_origin + tx * ${TN}u + ${4 * j + c}u;
-    if (row < parameters.rows) {
-      output[row * parameters.columns + column] ${residual
-        ? `+= ${value};` : `= ${outputPrecision}(${value});`}
-    }
-  }`);
+        rowStores.push(`      output[row_base_${i} + ${4 * j + c}u] ${residual
+          ? `+= ${value};` : `= ${outputPrecision === "f32" ? value : `${outputPrecision}(${value})`};`}`);
       }
     }
+    stores.push(`  {
+    let row_${i} = row_origin + ty * ${TM}u + ${i}u;
+    if (row_${i} < parameters.rows) {
+      let row_base_${i} = row_${i} * parameters.columns + column_origin + tx * ${TN}u;
+${rowStores.join("\n")}
+    }
+  }`);
   }
-  const weight = (offset) => `${T}(weights[base${offset}])`;
+  const weight = (offset) => weightPrecision === T ? `weights[base${offset}]` : `${T}(weights[base${offset}])`;
   return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -812,10 +814,13 @@ ${accumulators.join("\n")}
       let k = k0 + e % BK;
       let r0 = row_origin + mg * 4u;
       var value = vec4<${T}>(0.0);
-      if (r0 < parameters.rows) { let row = r0; value.x = ${load}; }
-      if (r0 + 1u < parameters.rows) { let row = r0 + 1u; value.y = ${load}; }
-      if (r0 + 2u < parameters.rows) { let row = r0 + 2u; value.z = ${load}; }
-      if (r0 + 3u < parameters.rows) { let row = r0 + 3u; value.w = ${load}; }
+      if (r0 + 3u < parameters.rows) {
+        value = vec4<${T}>(${loadElem("r0")}, ${loadElem("r0 + 1u")}, ${loadElem("r0 + 2u")}, ${loadElem("r0 + 3u")});
+      } else {
+        if (r0 < parameters.rows) { value.x = ${loadElem("r0")}; }
+        if (r0 + 1u < parameters.rows) { value.y = ${loadElem("r0 + 1u")}; }
+        if (r0 + 2u < parameters.rows) { value.z = ${loadElem("r0 + 2u")}; }
+      }
       a_tile[(e % BK) * ${AV}u + mg] = value;
     }
     for (var e = li; e < BK * BN / 4u; e += 256u) {

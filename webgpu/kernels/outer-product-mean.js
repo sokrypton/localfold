@@ -242,10 +242,22 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
   const bias = [];
   for (const side of ["left", "right"]) {
     for (let v = 0; v < columnVectors; v += 1) {
+      const c0 = `${v * 4 * lanesX}u`;
+      const c1 = `${(v * 4 + 1) * lanesX}u`;
+      const c2 = `${(v * 4 + 2) * lanesX}u`;
+      const c3 = `${(v * 4 + 3) * lanesX}u`;
       bias.push(`  var bias_${side}_${v} = vec4<f32>(0.0);
-  for (var j = 0u; j < 4u; j += 1u) {
-    let outer = column_origin + (${v}u * 4u + j) * ${lanesX}u;
-    if (outer < p.c_outer) { bias_${side}_${v}[j] = weights[p.${side}_bias + outer]; }
+  if (column_origin + ${c3} < p.c_outer) {
+    bias_${side}_${v} = vec4<f32>(
+      weights[p.${side}_bias + column_origin + ${c0}],
+      weights[p.${side}_bias + column_origin + ${c1}],
+      weights[p.${side}_bias + column_origin + ${c2}],
+      weights[p.${side}_bias + column_origin + ${c3}],
+    );
+  } else {
+    if (column_origin + ${c0} < p.c_outer) { bias_${side}_${v}.x = weights[p.${side}_bias + column_origin + ${c0}]; }
+    if (column_origin + ${c1} < p.c_outer) { bias_${side}_${v}.y = weights[p.${side}_bias + column_origin + ${c1}]; }
+    if (column_origin + ${c2} < p.c_outer) { bias_${side}_${v}.z = weights[p.${side}_bias + column_origin + ${c2}]; }
   }`);
     }
   }
@@ -263,7 +275,7 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
     for (const side of ["left", "right"]) {
       for (let r = 0; r < rowsPerLane; r += 1) {
         for (let v = 0; v < columnVectors; v += 1) {
-          inner.push(`    acc_${side}_${r}_${v} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${side}_${k}_${v};`);
+          inner.push(`    acc_${side}_${r}_${v} += s_${k}_${Math.floor(r / 4)}.${"xyzw"[r % 4]} * w_${side}_${k}_${v};`);
         }
       }
     }
@@ -281,9 +293,16 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
       let row_base = first_row + row_group * 4u;
       var staged = vec4<f32>(0.0);
       if (c < p.c_m) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let row = row_base + j;
-          if (row < rows) { staged[j] = source[row * p.c_m + c]; }
+        if (row_base + 3u < rows) {
+          let b0 = row_base * p.c_m + c;
+          let b1 = b0 + p.c_m;
+          let b2 = b1 + p.c_m;
+          let b3 = b2 + p.c_m;
+          staged = vec4<f32>(source[b0], source[b1], source[b2], source[b3]);
+        } else {
+          if (row_base < rows) { staged.x = source[row_base * p.c_m + c]; }
+          if (row_base + 1u < rows) { staged.y = source[(row_base + 1u) * p.c_m + c]; }
+          if (row_base + 2u < rows) { staged.z = source[(row_base + 2u) * p.c_m + c]; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -293,14 +312,20 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
   const stageWeight = [];
   for (const side of ["left", "right"]) {
     for (let v = 0; v < columnVectors; v += 1) {
+      const c0 = `${v * 4 * lanesX}u`;
+      const c1 = `${(v * 4 + 1) * lanesX}u`;
+      const c2 = `${(v * 4 + 2) * lanesX}u`;
+      const c3 = `${(v * 4 + 3) * lanesX}u`;
       stageWeight.push(`    {
       var staged = vec4<f32>(0.0);
       if (weight_c < p.c_m) {
-        for (var j = 0u; j < 4u; j += 1u) {
-          let outer = column_origin + (${v}u * 4u + j) * ${lanesX}u;
-          if (outer < p.c_outer) {
-            staged[j] = weights[p.${side}_weight + weight_c * p.c_outer + outer];
-          }
+        let w_base = p.${side}_weight + weight_c * p.c_outer + column_origin;
+        if (column_origin + ${c3} < p.c_outer) {
+          staged = vec4<f32>(weights[w_base + ${c0}], weights[w_base + ${c1}], weights[w_base + ${c2}], weights[w_base + ${c3}]);
+        } else {
+          if (column_origin + ${c0} < p.c_outer) { staged.x = weights[w_base + ${c0}]; }
+          if (column_origin + ${c1} < p.c_outer) { staged.y = weights[w_base + ${c1}]; }
+          if (column_origin + ${c2} < p.c_outer) { staged.z = weights[w_base + ${c2}]; }
         }
       }
       tile_${side}[local_y * ${lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u] = staged;
@@ -319,9 +344,9 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
           let index = row_${r} * p.c_outer + outer;
           ${transposeLeft
             ? `left[((row_${r} % p.length) * p.c_outer + outer) * p.sequences`
-              + ` + row_${r} / p.length] = keep_${r} * acc_left_${r}_${v}[${c}u];`
-            : `left[index] = keep_${r} * acc_left_${r}_${v}[${c}u];`}
-          right[index] = keep_${r} * acc_right_${r}_${v}[${c}u];
+              + ` + row_${r} / p.length] = keep_${r} * acc_left_${r}_${v}.${"xyzw"[c]};`
+            : `left[index] = keep_${r} * acc_left_${r}_${v}.${"xyzw"[c]};`}
+          right[index] = keep_${r} * acc_right_${r}_${v}.${"xyzw"[c]};
         }
       }`);
       }
@@ -1140,14 +1165,61 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
     let row = row_origin + ty * ${TM}u + ${i}u;
     if (row < parameters.rows) {
       let pair = parameters.padding.x + row;
+      let pair_scale = scale[pair];
 ${Array.from({ length: TV }, (_, j) => `      {
-        let scaled = ${f16 ? `acc_${i}_${j} + bias_${j} * scale[pair]` : `acc_${i}_${j} * scale[pair]`};
+        let scaled = ${f16 ? `acc_${i}_${j} + bias_${j} * pair_scale` : `acc_${i}_${j} * pair_scale`};
         let at = pair * parameters.columns + column + ${4 * j}u;
 ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} scaled.${"xyzw"[c]};`).join("\n")}
       }`).join("\n")}
     }
   }`);
   }
+  const aSteps = ((BM / 4) * BK) / 256;
+  const aPrecompute = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_mg_${s} = ${eExpr} / ${BK}u;
+  let a_k_${s} = ${eExpr} % ${BK}u;
+  let a_r0_${s} = row_origin + a_mg_${s} * 4u;${f16 ? `
+  var a_scale_${s} = vec4<f32>(0.0);
+  if (a_r0_${s} + 3u < parameters.rows) {
+    let sp = parameters.padding.x + a_r0_${s};
+    a_scale_${s} = vec4<f32>(scale[sp], scale[sp + 1u], scale[sp + 2u], scale[sp + 3u]);
+  } else {
+    if (a_r0_${s} < parameters.rows) { a_scale_${s}.x = scale[parameters.padding.x + a_r0_${s}]; }
+    if (a_r0_${s} + 1u < parameters.rows) { a_scale_${s}.y = scale[parameters.padding.x + a_r0_${s} + 1u]; }
+    if (a_r0_${s} + 2u < parameters.rows) { a_scale_${s}.z = scale[parameters.padding.x + a_r0_${s} + 2u]; }
+    if (a_r0_${s} + 3u < parameters.rows) { a_scale_${s}.w = scale[parameters.padding.x + a_r0_${s} + 3u]; }
+  }` : ""}`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      let r0 = a_r0_${s};
+      let k = a_k_${s};
+      var value = vec4<${T}>(0.0);
+      if (r0 + 3u < parameters.rows) {
+        let s0 = r0 * parameters.inner + k0 + k;
+        let raw = vec4<f32>(
+          source[s0],
+          source[s0 + parameters.inner],
+          source[s0 + parameters.inner * 2u],
+          source[s0 + parameters.inner * 3u],
+        );
+        value = vec4<${T}>(${f16 ? `raw * a_scale_${s}` : "raw"});
+      } else {
+        if (r0 < parameters.rows) {
+          value.x = ${T}(source[r0 * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.x` : ""});
+        }
+        if (r0 + 1u < parameters.rows) {
+          value.y = ${T}(source[(r0 + 1u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.y` : ""});
+        }
+        if (r0 + 2u < parameters.rows) {
+          value.z = ${T}(source[(r0 + 2u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.z` : ""});
+        }
+        if (r0 + 3u < parameters.rows) {
+          value.w = ${T}(source[(r0 + 3u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.w` : ""});
+        }
+      }
+      a_tile[k * ${AV}u + a_mg_${s}] = value;
+    }`).join("\n");
   return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -1170,26 +1242,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let b0 = parameters.bias_offset + column;
 ${biases.join("\n")}
 ${acc.join("\n")}
+${aPrecompute}
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
-    for (var e = li; e < ${(BM / 4) * BK}u; e += 256u) {
-      let mg = e / ${BK}u;
-      let k = e % ${BK}u;
-      let r0 = row_origin + mg * 4u;
-      var value = vec4<${T}>(0.0);
-      if (r0 < parameters.rows) {
-        value.x = ${T}(source[r0 * parameters.inner + k0 + k]${f16 ? " * scale[parameters.padding.x + r0]" : ""});
-      }
-      if (r0 + 1u < parameters.rows) {
-        value.y = ${T}(source[(r0 + 1u) * parameters.inner + k0 + k]${f16 ? " * scale[parameters.padding.x + r0 + 1u]" : ""});
-      }
-      if (r0 + 2u < parameters.rows) {
-        value.z = ${T}(source[(r0 + 2u) * parameters.inner + k0 + k]${f16 ? " * scale[parameters.padding.x + r0 + 2u]" : ""});
-      }
-      if (r0 + 3u < parameters.rows) {
-        value.w = ${T}(source[(r0 + 3u) * parameters.inner + k0 + k]${f16 ? " * scale[parameters.padding.x + r0 + 3u]" : ""});
-      }
-      a_tile[k * ${AV}u + mg] = value;
-    }
+${aStage}
     for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
       let base = parameters.weight_offset + (k0 + e / ${BN / 4}u) * parameters.columns
         + column_origin + (e % ${BN / 4}u) * 4u;
@@ -1233,6 +1288,7 @@ export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAU
   // (f16 arithmetic: VECTOR_GEMM_F16's - each k step's products, k the sequences, summed in f16, then into f32)
   const f16 = arithmetic === "f16";
   const T = f16 ? "f16" : "f32";
+  const vec4Align = cOuter % 4 === 0;
   const { rows: BM, columns: BN, inner: BK } = block;
   const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
   const acc = [], reads = [], mul = [], stores = [], bs = [], flush = [];
@@ -1249,26 +1305,37 @@ export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAU
       } else {
         mul.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
       }
-      stores.push(`  {
+    }
+    stores.push(`  {
     let row = row_origin + ty * ${TM}u + ${i}u;
-    let c0 = column + ${4 * j}u;
-    if (row < parameters.rows && c0 < parameters.columns) {
-      let local_pair = (row / ${cOuter}u) * parameters.padding.x + c0 / ${cOuter}u;
-      let at = local_pair * ${cOuter * cOuter}u + (row % ${cOuter}u) * ${cOuter}u
-        + c0 % ${cOuter}u;
-${[0, 1, 2, 3].map((c) => `      outer[at + ${c}u] = acc_${i}_${j}.${"xyzw"[c]};`).join("\n")}
+    if (row < parameters.rows) {
+      let row_i = (row / ${cOuter}u) * parameters.padding.x;
+      let row_rem = (row % ${cOuter}u) * ${cOuter}u;
+${Array.from({ length: TV }, (_, j) => `      {
+        let c0 = column + ${4 * j}u;
+        if (c0 < parameters.columns) {
+          let local_pair = row_i + c0 / ${cOuter}u;
+          let at = local_pair * ${cOuter * cOuter}u + row_rem + c0 % ${cOuter}u;
+          ${vec4Align
+            ? `outer[at / 4u] = acc_${i}_${j};`
+            : [0, 1, 2, 3].map((c) => `outer[at + ${c}u] = acc_${i}_${j}.${"xyzw"[c]};`).join("\n          ")}
+        }
+      }`).join("\n")}
     }
   }`);
-    }
   }
+  const storageType = vec4Align ? "vec4<f32>" : "f32";
+  const load4 = (buf) => vec4Align
+    ? `${buf}[base / 4u]`
+    : `vec4<f32>(${buf}[base], ${buf}[base + 1u], ${buf}[base + 2u], ${buf}[base + 3u])`;
   return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(0) var<storage, read> left: array<${storageType}>;
+@group(0) @binding(1) var<storage, read> right: array<${storageType}>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outer: array<${storageType}>;
 var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 @compute @workgroup_size(256)
@@ -1291,7 +1358,7 @@ ${acc.join("\n")}
       var value = vec4<f32>(0.0);
       if (k < parameters.inner && r < parameters.rows) {
         let base = k * stride + parameters.weight_offset + r;
-        value = vec4<f32>(left[base], left[base + 1u], left[base + 2u], left[base + 3u]);
+        value = ${load4("left")};
       }
       a_tile[(e / ${BM / 4}u) * ${AV}u + mg] = vec4<${T}>(value);
     }
@@ -1301,7 +1368,7 @@ ${acc.join("\n")}
       var value = vec4<f32>(0.0);
       if (k < parameters.inner && c < parameters.columns) {
         let base = k * stride + c;
-        value = vec4<f32>(right[base], right[base + 1u], right[base + 2u], right[base + 3u]);
+        value = ${load4("right")};
       }
       b_tile[e] = vec4<${T}>(value);
     }
