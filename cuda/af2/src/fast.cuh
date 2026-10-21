@@ -466,13 +466,27 @@ inline const half* augmentedWeight(const std::string& name, int blk, const float
   return cache[{name, blk}] = w;
 }
 __global__ void onesColumnK(half* x, size_t rows, int K) {     // x [rows, K+8]: column K = 1, K+1.. = 0
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * 8) return;
-  x[(t / 8) * (K + 8) + K + t % 8] = __float2half(t % 8 == 0 ? 1.f : 0.f);
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  uint4 u = make_uint4(0, 0, 0, 0);
+  reinterpret_cast<half*>(&u)[0] = __float2half(1.f);
+  *reinterpret_cast<uint4*>(x + r * (K + 8) + K) = u;
 }
 // a [rows, K+8] f16 buffer whose last 8 columns are (1, 0, ...), kept per (name, size)
 // a half weight's bf16 copy (MSA16), made once
 __global__ void halfToBf16K(const half* in, __nv_bfloat16* out, size_t n) {
+  if ((n & 7) == 0) {
+    size_t i8 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i8 < (n >> 3)) {
+      uint4 u = reinterpret_cast<const uint4*>(in)[i8];
+      const half2* h2 = reinterpret_cast<const half2*>(&u);
+      uint4 r; __nv_bfloat162* b2 = reinterpret_cast<__nv_bfloat162*>(&r);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) { float2 f = __half22float2(h2[k]); b2[k] = __floats2bfloat162_rn(f.x, f.y); }
+      reinterpret_cast<uint4*>(out)[i8] = r;
+    }
+    return;
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = __float2bfloat16(__half2float(in[i]));
 }
@@ -481,14 +495,15 @@ inline const __nv_bfloat16* bf16Of(const half* w, size_t n) {
   auto it = copies.find(w);
   if (it != copies.end()) return it->second;
   __nv_bfloat16* b = wpool<__nv_bfloat16>(n);
-  halfToBf16K<<<blocks(n), 256, 0, STREAM>>>(w, b, n);
+  halfToBf16K<<<blocks((n & 7) == 0 ? (n >> 3) : n), 256, 0, STREAM>>>(w, b, n);
   return copies[w] = b;
 }
 __global__ void onesColumnBf16K(__nv_bfloat16* x, size_t rows, int K) {     // as onesColumnK, in bf16
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * 8) return;
-  size_t r = t / 8; int c = (int)(t % 8);
-  x[r * (K + 8) + K + c] = __float2bfloat16(c == 0 ? 1.f : 0.f);
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  uint4 u = make_uint4(0, 0, 0, 0);
+  reinterpret_cast<__nv_bfloat16*>(&u)[0] = __float2bfloat16(1.f);
+  *reinterpret_cast<uint4*>(x + r * (K + 8) + K) = u;
 }
 inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, int K) {
   static std::map<std::string, std::pair<__nv_bfloat16*, size_t>> bufs;
@@ -496,7 +511,7 @@ inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, i
   if (have < rows) {
     if (p) CK(cudaFree(p));
     p = dallocT<__nv_bfloat16>(rows * (K + 8));
-    onesColumnBf16K<<<blocks(rows * 8), 256, 0, STREAM>>>(p, rows, K);
+    onesColumnBf16K<<<blocks(rows), 256, 0, STREAM>>>(p, rows, K);
     have = rows;
   }
   return p;
@@ -507,7 +522,7 @@ inline half* augmentedInput(const std::string& name, size_t rows, int K) {
   if (have < rows) {
     if (p) CK(cudaFree(p));
     p = dallocT<half>(rows * (K + 8));
-    onesColumnK<<<blocks(rows * 8), 256, 0, STREAM>>>(p, rows, K);
+    onesColumnK<<<blocks(rows), 256, 0, STREAM>>>(p, rows, K);
     have = rows;
   }
   return p;

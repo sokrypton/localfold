@@ -107,14 +107,14 @@ struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, ds
 // as the page's loader folds a LayerNorm scale into a projection), 'i' the source as an int32 (a
 // residue table the bundle stores as float32), 'o' one. What no part covers is zero.
 struct GPart { int rec, op, rank, nsrc; size_t dims[6], dst; long long dstStride[6]; int src[2]; size_t srcOff[2]; long long srcStride[2][6]; };
-struct GPartD { unsigned long long n, dst, off[2], dims[6]; long long ds[6], ss[2][6]; int rank, op; };
+struct GPartD { unsigned long long o0, n, dst, off[2], dims[6]; long long ds[6], ss[2][6]; int rank, op; };
 __global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* out) {
   __shared__ GPartD p;
   if (threadIdx.x == 0) p = parts[blockIdx.y];
   __syncthreads();
   for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < p.n;
        o += (unsigned long long)gridDim.x * blockDim.x) {
-    unsigned long long r = o; long long d = (long long)p.dst, a = (long long)p.off[0], b = (long long)p.off[1];
+    unsigned long long r = p.o0 + o; long long d = (long long)p.dst, a = (long long)p.off[0], b = (long long)p.off[1];
     for (int k = p.rank - 1; k >= 0; --k) {
       long long i = (long long)(r % p.dims[k]); r /= p.dims[k];
       d += i * p.ds[k]; a += i * p.ss[0][k]; b += i * p.ss[1][k];
@@ -716,10 +716,13 @@ struct Model {
         if (cudaHostAlloc(&ring[b], PIECE, cudaHostAllocDefault) != cudaSuccess ||
             cudaEventCreateWithFlags(&freed[b], cudaEventDisableTiming) != cudaSuccess) return false;
     unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
-    size_t maxRecs = s.recs.size();
+    constexpr size_t BDECODE_CHUNK = 65536;
+    size_t maxRecs = 0, maxSrcRecs = 0;
+    for (const BRec& b : s.recs) maxRecs += std::max<size_t>(1, (b.elements + BDECODE_CHUNK - 1) / BDECODE_CHUNK);
+    for (const BRec& b : s.srcRecs) maxSrcRecs += std::max<size_t>(1, (b.elements + BDECODE_CHUNK - 1) / BDECODE_CHUNK);
     for (int k = 0; k < 2; ++k)
       if (devMalloc(&raw[k], most) != cudaSuccess ||
-          devMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
+          devMalloc(&dt[k], std::max<size_t>(maxRecs, 1) * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
         return false;
     size_t piece = 0;                                        // pieces issued, over every shard
     std::vector<std::vector<BDecode>> tables(2), scratchTables(2);
@@ -727,7 +730,7 @@ struct Model {
     float* scratch = nullptr;
     if (s.scratchElems && devMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
     BDecode* sdt[2] = {nullptr, nullptr};
-    for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (devMalloc(&sdt[k], s.srcRecs.size() * sizeof(BDecode)) != cudaSuccess) return false;
+    for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (devMalloc(&sdt[k], std::max<size_t>(maxSrcRecs, 1) * sizeof(BDecode)) != cudaSuccess) return false;
     for (size_t fi = 0; fi < s.files.size(); ++fi) {
       // LOCALFOLD_SLOW_UPLOAD_MS: every shard's upload delayed, the slow disk a cold page cache is, on demand - the
       // warm-up then runs on weights still arriving, which is what forgetDerivedWeights() must undo (tools/check-standalone.py)
@@ -755,8 +758,12 @@ struct Model {
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
-          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind, b.bits, b.block,
-                           b.round16 | (b.accumulate << 1), b.rowBlocks});
+          for (size_t off = 0; off < b.elements || (off == 0 && b.elements == 0); off += BDECODE_CHUNK) {
+            size_t cnt = std::min<size_t>(BDECODE_CHUNK, b.elements - off);
+            table.push_back({b.byteOffset, b.dst + off, cnt, b.scaleOffset, b.zeroOffset, b.first + off, b.rows, b.kind, b.bits, b.block,
+                             b.round16 | (b.accumulate << 1), b.rowBlocks});
+            if (b.elements == 0) break;
+          }
       if (!table.empty()) {
         if (cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < table.size(); t0 += 65535)
@@ -764,8 +771,13 @@ struct Model {
       }
       auto& stable = scratchTables[k]; stable.clear();     // (the sources of gathered tensors, whole, into scratch)
       for (const BRec& b : s.srcRecs)
-        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind,
-                                                 b.bits, b.block, b.round16 | (b.accumulate << 1), b.rowBlocks});
+        if (b.file == (int)fi)
+          for (size_t off = 0; off < b.elements || (off == 0 && b.elements == 0); off += BDECODE_CHUNK) {
+            size_t cnt = std::min<size_t>(BDECODE_CHUNK, b.elements - off);
+            stable.push_back({b.byteOffset, b.dst + off, cnt, b.scaleOffset, b.zeroOffset, b.first + off, b.rows, b.kind,
+                              b.bits, b.block, b.round16 | (b.accumulate << 1), b.rowBlocks});
+            if (b.elements == 0) break;
+          }
       if (!stable.empty()) {
         if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < stable.size(); t0 += 65535)
@@ -784,7 +796,10 @@ struct Model {
           d.off[q] = s.srcRecs[g.src[q]].dst + g.srcOff[q];
           for (int k = 0; k < g.rank; ++k) d.ss[q][k] = g.srcStride[q][k];
         }
-        pd.push_back(d);
+        for (unsigned long long off = 0; off < d.n; off += BDECODE_CHUNK) {
+          GPartD dc = d; dc.o0 = off; dc.n = std::min<unsigned long long>(BDECODE_CHUNK, d.n - off);
+          pd.push_back(dc);
+        }
       }
       if (devMalloc(&pt, pd.size() * sizeof(GPartD)) != cudaSuccess ||
           cudaMemcpyAsync(pt, pd.data(), pd.size() * sizeof(GPartD), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
@@ -1636,9 +1651,19 @@ inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirro
 inline std::string halfGroup(const std::string& k) { size_t at = k.find('/'); return at == std::string::npos ? "" : k.substr(0, at); }
 inline std::map<std::string, half*> WH_AT;
 __global__ void convertTableK(const float* src, half* dst, const size_t* from, const size_t* to, const size_t* len) {
-  size_t e = blockIdx.y, n = len[e];
+  size_t e = blockIdx.y, n = len[e], n4 = n >> 2;
   const float* f = src + from[e]; half* h = dst + to[e];
-  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) h[i] = __float2half(f[i]);
+  size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x, stride = (size_t)gridDim.x * blockDim.x;
+  const float4* f4 = reinterpret_cast<const float4*>(f);
+  uint2* h4 = reinterpret_cast<uint2*>(h);
+  for (size_t i4 = tid; i4 < n4; i4 += stride) {
+    float4 v = f4[i4];
+    half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+    uint2 u; u.x = *reinterpret_cast<uint32_t*>(&a); u.y = *reinterpret_cast<uint32_t*>(&b);
+    h4[i4] = u;
+  }
+  size_t base = n4 << 2;
+  if (tid < (n & 3)) h[base + tid] = __float2half(f[base + tid]);
 }
 inline const half* segmentHalf(const std::string& k) {
   const Entry& e0 = M.at(k);
@@ -1647,10 +1672,16 @@ inline const half* segmentHalf(const std::string& k) {
   void*& mirror = s.halfMirrors[group];
   if (!mirror) {
     M.dev(k);
-    std::vector<size_t> from, to, len; std::vector<std::string> names; size_t total = 0;
+    constexpr size_t CONV_CHUNK = 65536;
+    std::vector<size_t> from, to, len, nameTo; std::vector<std::string> names; size_t total = 0;
     for (auto& [name, e] : M.index) {
       if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group) continue;
-      from.push_back(e.devOffset); to.push_back(total); len.push_back(e.length); names.push_back(name);
+      names.push_back(name); nameTo.push_back(total);
+      for (size_t off = 0; off < e.length; off += CONV_CHUNK) {
+        from.push_back(e.devOffset + off);
+        to.push_back(total + off);
+        len.push_back(std::min<size_t>(CONV_CHUNK, e.length - off));
+      }
       total += (e.length + 7) / 8 * 8;
     }
     size_t n = from.size();
@@ -1669,7 +1700,7 @@ inline const half* segmentHalf(const std::string& k) {
                                                        table + n + first, table + 2 * n + first);
     }
     CK(cudaFreeAsync(table, STREAM));
-    for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)mirror + to[i];
+    for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)mirror + nameTo[i];
   }
   auto it = WH_AT.find(k);
   if (it == WH_AT.end()) { fprintf(stderr, "%s is not a float tensor of its file\n", k.c_str()); exit(1); }
