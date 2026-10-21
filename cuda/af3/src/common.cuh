@@ -182,30 +182,36 @@ struct Json {
 };
 // the decode, one tensor of the shard a blockIdx.y
 struct BDecode { unsigned long long src, dst, n, scale, zero, first, rows; int kind, bits, block, flags, rowBlocks; };   // flags: 1 round16, 2 accumulate
-__device__ __forceinline__ float bundleHalf(const unsigned char* p) {
-  unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
+__device__ __forceinline__ float bundleHalf(const unsigned char* __restrict__ p) {
+  unsigned short h = (((uintptr_t)p & 1) == 0) ? __ldg(reinterpret_cast<const unsigned short*>(p))
+                                               : (unsigned short)(__ldg(p) | (__ldg(p + 1) << 8));
+  return __half2float(__ushort_as_half(h));
 }
-__global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out) {
+__global__ void __launch_bounds__(256, 8)
+bundleDecodeK(const unsigned char* __restrict__ raw, const BDecode* __restrict__ table, float* __restrict__ out) {
   __shared__ BDecode d;
   if (threadIdx.x == 0) d = table[blockIdx.y];
   __syncthreads();
+  unsigned long long o0 = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (o0 >= d.n) return;
   uint32_t block32 = (uint32_t)d.block;
   int bshift = (block32 > 0 && (block32 & (block32 - 1)) == 0) ? (__ffs((int)block32) - 1) : -1;
   unsigned long long groupBits = ((unsigned long long)d.block * d.bits / 8) * 8;
   unsigned long long g6 = (d.kind == 6 && d.rowBlocks > 0) ? (d.rows + d.rowBlocks - 1) / d.rowBlocks : 1;
-  uint32_t g6_32 = (uint32_t)g6;
-  for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < d.n;
-       o += (unsigned long long)gridDim.x * blockDim.x) {
-    unsigned long long i = d.first + o;     // the bundle tensor's element
+  uint32_t g6_32 = (uint32_t)g6, codeMask = (1u << d.bits) - 1u;
+  int kind = d.kind, flags = d.flags, bits = d.bits;
+  unsigned long long src = d.src, dst = d.dst, n = d.n, scaleOff = d.scale, zeroOff = d.zero, first = d.first;
+  for (unsigned long long o = o0; o < n; o += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long i = first + o;     // the bundle tensor's element
     float v;
-    if (d.kind == 4) { out[d.dst + o] = 0.f; continue; }
-    if (d.kind == 0) { unsigned int w; memcpy(&w, raw + d.src + 4 * i, 4); v = __uint_as_float(w); }
-    else if (d.kind == 1) v = bundleHalf(raw + d.src + 2 * i);
-    else if (d.kind == 2) {
-      unsigned long long g = (bshift >= 0) ? (i >> bshift) : ((i <= 0xffffffffull) ? ((uint32_t)i / block32) : (i / d.block));
-      double scale = (double)bundleHalf(raw + d.scale + 2 * g);
-      v = (float)__dmul_rn((double)(signed char)raw[d.src + i], scale);
-    } else if (d.kind == 6) {          // (float32 times float32, as numpy multiplies them)
+    if (kind == 4) { out[dst + o] = 0.f; continue; }
+    if (kind == 0) { unsigned int w; memcpy(&w, raw + src + 4 * i, 4); v = __uint_as_float(w); }
+    else if (kind == 1) v = bundleHalf(raw + src + 2 * i);
+    else if (kind == 2) {
+      unsigned long long g = (bshift >= 0) ? (i >> bshift) : ((i <= 0xffffffffull) ? ((uint32_t)i / block32) : (i / block32));
+      double scale = (double)bundleHalf(raw + scaleOff + 2 * g);
+      v = (float)__dmul_rn((double)(signed char)__ldg(raw + src + i), scale);
+    } else if (kind == 6) {          // (float32 times float32, as numpy multiplies them)
       unsigned long long row, col, rg;
       if (i <= 0xffffffffull) {
         uint32_t i32 = (uint32_t)i;
@@ -214,12 +220,12 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
         row = r32;
         rg = r32 / g6_32;
       } else {
-        row = i / d.block; col = i % d.block; rg = row / g6;
+        row = i / block32; col = i % block32; rg = row / g6;
       }
-      unsigned int w; memcpy(&w, raw + d.scale + 4 * (rg * d.block + col), 4);
-      v = __fmul_rn((float)(signed char)raw[d.src + i], __uint_as_float(w));
-    } else if (d.kind == 7) {
-      unsigned int h = (unsigned int)(raw[d.src + 2 * i] | (raw[d.src + 2 * i + 1] << 8));
+      unsigned int w; memcpy(&w, raw + scaleOff + 4 * (rg * block32 + col), 4);
+      v = __fmul_rn((float)(signed char)__ldg(raw + src + i), __uint_as_float(w));
+    } else if (kind == 7) {
+      unsigned int h = (unsigned int)(__ldg(raw + src + 2 * i) | (__ldg(raw + src + 2 * i + 1) << 8));
       v = __uint_as_float(h << 16);
     } else {
       unsigned long long g, rem;
@@ -230,15 +236,15 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
         uint32_t i32 = (uint32_t)i, g32 = i32 / block32;
         g = g32; rem = i32 - g32 * block32;
       } else {
-        g = i / d.block; rem = i % d.block;
+        g = i / block32; rem = i % block32;
       }
-      unsigned long long bit = g * groupBits + rem * d.bits, byte = bit >> 3;
-      unsigned int code = ((raw[d.src + byte] | (raw[d.src + byte + 1] << 8)) >> (bit & 7)) & ((1u << d.bits) - 1);
-      double scale = (double)bundleHalf(raw + d.scale + 2 * g), zero = (double)bundleHalf(raw + d.zero + 2 * g);
+      unsigned long long bit = g * groupBits + rem * bits, byte = bit >> 3;
+      unsigned int code = ((__ldg(raw + src + byte) | (__ldg(raw + src + byte + 1) << 8)) >> (bit & 7)) & codeMask;
+      double scale = (double)bundleHalf(raw + scaleOff + 2 * g), zero = (double)bundleHalf(raw + zeroOff + 2 * g);
       v = (float)__dadd_rn(__dmul_rn((double)code, scale), zero);
     }
-    if (d.flags & 1) v = __half2float(__float2half_rn(v));
-    out[d.dst + o] = (d.flags & 2) ? __fadd_rn(out[d.dst + o], v) : v;
+    if (flags & 1) v = __half2float(__float2half_rn(v));
+    out[dst + o] = (flags & 2) ? __fadd_rn(out[dst + o], v) : v;
   }
 }
 inline float hostHalf(const unsigned char* p) { __half_raw r; r.x = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__half(r)); }
@@ -802,7 +808,7 @@ struct Model {
       if (!table.empty()) {
         if (cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < table.size(); t0 += 65535)
-          bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, table.size() - t0)), 256, 0, st>>>(raw[k], dt[k] + t0, s.device);
+          bundleDecodeK<<<dim3(16, (unsigned)std::min<size_t>(65535, table.size() - t0)), 256, 0, st>>>(raw[k], dt[k] + t0, s.device);
       }
       auto& stable = scratchTables[k]; stable.clear();     // (the sources of gathered tensors, whole, into scratch)
       for (const BRec& b : s.srcRecs)
@@ -816,7 +822,7 @@ struct Model {
       if (!stable.empty()) {
         if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < stable.size(); t0 += 65535)
-          bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, stable.size() - t0)), 256, 0, st>>>(raw[k], sdt[k] + t0, scratch);
+          bundleDecodeK<<<dim3(16, (unsigned)std::min<size_t>(65535, stable.size() - t0)), 256, 0, st>>>(raw[k], sdt[k] + t0, scratch);
       }
       if (cudaEventRecord(done[k], st) != cudaSuccess) return false;
     }
@@ -1896,20 +1902,24 @@ inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirro
 // bundle (f/) and ESM-C (c/), which reads only its f32 copy - mirroring it too was 1.2 GB never read
 inline std::string halfGroup(const std::string& k) { size_t at = k.find('/'); return at == std::string::npos ? "" : k.substr(0, at); }
 inline std::map<std::string, half*> WH_AT;
-__global__ void convertTableK(const float* src, half* dst, const size_t* from, const size_t* to, const size_t* len) {
-  size_t e = blockIdx.y, n = len[e], n4 = n >> 2;
-  const float* f = src + from[e]; half* h = dst + to[e];
-  size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x, stride = (size_t)gridDim.x * blockDim.x;
+__global__ void __launch_bounds__(256, 8)
+convertTableK(const float* __restrict__ src, half* __restrict__ dst, const size_t* __restrict__ from,
+              const size_t* __restrict__ to, const size_t* __restrict__ len) {
+  size_t e = blockIdx.y, n = __ldg(len + e), tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t n4 = n >> 2;
+  if (tid >= n4 && tid >= (n & 3)) return;
+  const float* f = src + __ldg(from + e); half* h = dst + __ldg(to + e);
+  size_t stride = (size_t)gridDim.x * blockDim.x;
   const float4* f4 = reinterpret_cast<const float4*>(f);
   uint2* h4 = reinterpret_cast<uint2*>(h);
   for (size_t i4 = tid; i4 < n4; i4 += stride) {
-    float4 v = f4[i4];
+    float4 v = __ldg(f4 + i4);
     half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
     uint2 u; u.x = *reinterpret_cast<uint32_t*>(&a); u.y = *reinterpret_cast<uint32_t*>(&b);
     h4[i4] = u;
   }
   size_t base = n4 << 2;
-  if (tid < (n & 3)) h[base + tid] = __float2half(f[base + tid]);
+  if (tid < (n & 3)) h[base + tid] = __float2half(__ldg(f + base + tid));
 }
 inline const half* segmentHalf(const std::string& k) {
   const Entry& e0 = M.at(k);

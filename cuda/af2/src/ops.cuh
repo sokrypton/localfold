@@ -170,7 +170,7 @@ layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
   const TI* xr = x + row * C;
   float v[K], s = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { float xk = (float)xr[lane + 32 * k]; v[k] = xk; s += xk; }
+  for (int k = 0; k < K; ++k) { float xk = (float)__ldg(xr + lane + 32 * k); v[k] = xk; s += xk; }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / C, q2 = 0.f;
 #pragma unroll

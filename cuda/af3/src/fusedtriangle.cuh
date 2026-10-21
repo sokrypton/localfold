@@ -336,7 +336,7 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;                          // the thread's rows within the block
   size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
-  float m0 = pr0 != SIZE_MAX ? (mask ? mask[pr0] : 1.f) : 0.f, m1 = pr1 != SIZE_MAX ? (mask ? mask[pr1] : 1.f) : 0.f;
+  float m0 = pr0 != SIZE_MAX ? (mask ? __ldg(mask + pr0) : 1.f) : 0.f, m1 = pr1 != SIZE_MAX ? (mask ? __ldg(mask + pr1) : 1.f) : 0.f;
   const int ch0 = (int)threadIdx.x / (R / 8), r8 = ((int)threadIdx.x % (R / 8)) * 8;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
@@ -351,8 +351,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int col = (gating ? 4 * C + 2 * (j - C / 16) * TI_NC : j * TI_NC) + nt * 8 + tig * 2;
         int qcol = gating ? col + TI_NC : 2 * C + col;
-        bp[nt] = *reinterpret_cast<const float2*>(bias + col);
-        bq[nt] = *reinterpret_cast<const float2*>(bias + qcol);
+        bp[nt] = __ldg(reinterpret_cast<const float2*>(bias + col));
+        bq[nt] = __ldg(reinterpret_cast<const float2*>(bias + qcol));
       }
     }
     float p[TI_NC / 8][4] = {}, q[TI_NC / 8][4] = {};
@@ -766,7 +766,7 @@ void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pa
 // the single track's pair logits, the pair read once and written head-major (the layout the
 // softmax reads) through shared memory.
 template <int C, int N, int WARPS, class PT = float>
-__global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
+__global__ void __launch_bounds__(WARPS * 32, 3) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wp, float* __restrict__ out, size_t rows,
     half* __restrict__ biasOut = nullptr, int L = 0, int H = 0, int stride = 0, bool tr = false, size_t r0 = 0,
     const float* __restrict__ pairMask = nullptr, const float* __restrict__ rowBias = nullptr) {
@@ -788,8 +788,8 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
   lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
                               lnScale, lnOffset, Xs, LDX, warp, lane);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;
-  float rb0 = (rowBias && row0 + lr0 < rows) ? rowBias[row0 + lr0] : 0.f;
-  float rb1 = (rowBias && row0 + lr1 < rows) ? rowBias[row0 + lr1] : 0.f;
+  float rb0 = (rowBias && row0 + lr0 < rows) ? __ldg(rowBias + row0 + lr0) : 0.f;
+  float rb1 = (rowBias && row0 + lr1 < rows) ? __ldg(rowBias + row0 + lr1) : 0.f;
   cpWait<0>();
   __syncthreads();
   float acc[N / 8][4] = {};
@@ -819,12 +819,13 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
   }
   __syncthreads();
   if (biasOut) {
-    for (int t = threadIdx.x; t < H * R; t += NTH) {
-      int h = t / R, r = t % R;
-      if (row0 + r >= rows) continue;
-      unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
-      float v = Os[h * LDO + r] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
-      if (tr) { unsigned x = i; i = j; j = x; }
+    const int r = (int)threadIdx.x & (R - 1), h0 = (int)threadIdx.x / R;
+    if (row0 + r >= rows) return;
+    unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
+    const float pm = pairMask ? 1e9f * (__ldg(pairMask + ij) - 1.f) : 0.f;
+    if (tr) { unsigned x = i; i = j; j = x; }
+    for (int h = h0; h < H; h += NTH / R) {
+      float v = Os[h * LDO + r] + pm;
       biasOut[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
       if (j == ul - 1) for (int pad = L; pad < stride; ++pad) biasOut[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
     }
@@ -943,7 +944,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) gridInK(const float* __restr
     float2 qbv[NC / 8];
     if (qb) {
 #pragma unroll
-      for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = *reinterpret_cast<const float2*>(qb + j * NC + nt * 8 + tig * 2);
+      for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = __ldg(reinterpret_cast<const float2*>(qb + j * NC + nt * 8 + tig * 2));
     }
 #if LF_REG_STAGES
     __syncthreads();

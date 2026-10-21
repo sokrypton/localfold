@@ -161,9 +161,11 @@ __global__ void centerNormHK(const float* prod, half* out, size_t pairs, int C, 
 }
 
 // TI, TO: the rows' and the output's types (a bf16 MSA in, a bf16 transition input out: cuda/af2's MSA16)
+inline unsigned lnVGrid(size_t rows) { return (unsigned)((rows + 7) / 8); }
 template <int C, class TI = float, class TO = half, bool RELU = false>
-__global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const float* __restrict__ scale,
-                            const float* __restrict__ offset) {
+__global__ void __launch_bounds__(256, 8)
+layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const float* __restrict__ scale,
+            const float* __restrict__ offset) {
   constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -175,24 +177,24 @@ __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
     if constexpr (VEC == 4) {
-      float4 s4 = *reinterpret_cast<const float4*>(scale + c), o4 = *reinterpret_cast<const float4*>(offset + c);
+      float4 s4 = __ldg(reinterpret_cast<const float4*>(scale + c)), o4 = __ldg(reinterpret_cast<const float4*>(offset + c));
       sc[k][0] = s4.x; sc[k][1] = s4.y; sc[k][2] = s4.z; sc[k][3] = s4.w;
       of[k][0] = o4.x; of[k][1] = o4.y; of[k][2] = o4.z; of[k][3] = o4.w;
     } else {
-      float2 s2 = *reinterpret_cast<const float2*>(scale + c), o2 = *reinterpret_cast<const float2*>(offset + c);
+      float2 s2 = __ldg(reinterpret_cast<const float2*>(scale + c)), o2 = __ldg(reinterpret_cast<const float2*>(offset + c));
       sc[k][0] = s2.x; sc[k][1] = s2.y; of[k][0] = o2.x; of[k][1] = o2.y;
     }
     if constexpr (!std::is_same_v<TI, float>) {          // (a bf16 or f16 row: VEC elements, 2 VEC bytes)
       if constexpr (VEC == 4) {
-        uint2 u2 = *reinterpret_cast<const uint2*>(xr + c);
+        uint2 u2 = __ldg(reinterpret_cast<const uint2*>(xr + c));
         const TI* p = reinterpret_cast<const TI*>(&u2);
         float2 q0 = ld2f(p), q1 = ld2f(p + 2);
         v[k][0] = q0.x; v[k][1] = q0.y; v[k][2] = q1.x; v[k][3] = q1.y;
       } else {
         float2 q = ld2f(xr + c); v[k][0] = q.x; v[k][1] = q.y;
       }
-    } else if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
-    else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
+    } else if constexpr (VEC == 4) { float4 q = __ldg(reinterpret_cast<const float4*>(xr + c)); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
+    else { float2 q = __ldg(reinterpret_cast<const float2*>(xr + c)); v[k][0] = q.x; v[k][1] = q.y; }
 #pragma unroll
     for (int u = 0; u < VEC; ++u) s += v[k][u];
   }
@@ -257,7 +259,7 @@ __global__ void opmPermuteK(const T* __restrict__ in, T* __restrict__ out, int B
         e4 = (int)(t % O4); size_t r = t / O4; c = (int)(r % O); r /= O; j = (int)(r % n); bi = (int)(r / n);
       }
       reinterpret_cast<float4*>(out)[t] =
-          reinterpret_cast<const float4*>(in)[((size_t)bi * O + c) * ((size_t)n * O4) + (size_t)j * O4 + e4];
+          __ldg(reinterpret_cast<const float4*>(in) + ((size_t)bi * O + c) * ((size_t)n * O4) + (size_t)j * O4 + e4);
       return;
     }
   }

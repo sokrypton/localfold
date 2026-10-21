@@ -1081,9 +1081,9 @@ __global__ void atomLogitsLayoutK(const float* __restrict__ flat, float* __restr
 // order (a query the gather masks reads as 0, which the ReLU keeps 0)
 // act[q] = qStart[q] + qMask[q] * ((positions gathered to q) Wp + (chiralGrads gathered to q) Wc), Wp/Wc (3, C)
 __global__ void encoderStartK(const float* __restrict__ qStart, const float* __restrict__ pos,
-                              const int* __restrict__ idx, const float* __restrict__ gmask, const float* __restrict__ Wp,
-                              const float* __restrict__ qMask, float* __restrict__ act, size_t rows, int C, size_t q1, size_t atoms,
-                              const float* __restrict__ chiralGrads = nullptr, const float* __restrict__ Wc = nullptr) {
+              const int* __restrict__ idx, const float* __restrict__ gmask, const float* __restrict__ Wp,
+              const float* __restrict__ qMask, float* __restrict__ act, size_t rows, int C, size_t q1, size_t atoms,
+              const float* __restrict__ chiralGrads = nullptr, const float* __restrict__ Wc = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((C & 3) == 0) {
     size_t c4 = (size_t)(C >> 2);
@@ -1097,27 +1097,27 @@ __global__ void encoderStartK(const float* __restrict__ qStart, const float* __r
     size_t gq = rows <= q1 ? q : (q < (1ull << 32) ? (unsigned)q % (unsigned)q1 : q % q1);
     size_t k = rows <= q1 ? 0 : (q < (1ull << 32) ? (unsigned)q / (unsigned)q1 : q / q1);
     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (gmask[gq] != 0) {
-      size_t ai = ((size_t)idx[gq] + k * atoms) * 3;
+    if (__ldg(gmask + gq) != 0) {
+      size_t ai = ((size_t)__ldg(idx + gq) + k * atoms) * 3;
       const float* p = pos + ai;
-      float p0 = p[0], p1 = p[1], p2 = p[2];
-      float4 wp0 = *(const float4*)(Wp + c), wp1 = *(const float4*)(Wp + C + c), wp2 = *(const float4*)(Wp + 2 * C + c);
+      float p0 = __ldg(p), p1 = __ldg(p + 1), p2 = __ldg(p + 2);
+      float4 wp0 = __ldg(reinterpret_cast<const float4*>(Wp + c)), wp1 = __ldg(reinterpret_cast<const float4*>(Wp + C + c)), wp2 = __ldg(reinterpret_cast<const float4*>(Wp + 2 * C + c));
       v.x = p0 * wp0.x + p1 * wp1.x + p2 * wp2.x;
       v.y = p0 * wp0.y + p1 * wp1.y + p2 * wp2.y;
       v.z = p0 * wp0.z + p1 * wp1.z + p2 * wp2.z;
       v.w = p0 * wp0.w + p1 * wp1.w + p2 * wp2.w;
       if (chiralGrads) {
         const float* g = chiralGrads + ai;
-        float g0 = g[0], g1 = g[1], g2 = g[2];
-        float4 wc0 = *(const float4*)(Wc + c), wc1 = *(const float4*)(Wc + C + c), wc2 = *(const float4*)(Wc + 2 * C + c);
+        float g0 = __ldg(g), g1 = __ldg(g + 1), g2 = __ldg(g + 2);
+        float4 wc0 = __ldg(reinterpret_cast<const float4*>(Wc + c)), wc1 = __ldg(reinterpret_cast<const float4*>(Wc + C + c)), wc2 = __ldg(reinterpret_cast<const float4*>(Wc + 2 * C + c));
         v.x += (g0 * wc0.x + g1 * wc1.x) + g2 * wc2.x;
         v.y += (g0 * wc0.y + g1 * wc1.y) + g2 * wc2.y;
         v.z += (g0 * wc0.z + g1 * wc1.z) + g2 * wc2.z;
         v.w += (g0 * wc0.w + g1 * wc1.w) + g2 * wc2.w;
       }
     }
-    float4 qs = *(const float4*)(qStart + gq * C + c);
-    float qm = qMask[gq];
+    float4 qs = __ldg(reinterpret_cast<const float4*>(qStart + gq * C + c));
+    float qm = __ldg(qMask + gq);
     *(float4*)(act + (t << 2)) = make_float4(qs.x + v.x * qm, qs.y + v.y * qm, qs.z + v.z * qm, qs.w + v.w * qm);
     return;
   }
@@ -1130,19 +1130,20 @@ __global__ void encoderStartK(const float* __restrict__ qStart, const float* __r
   size_t gq = rows <= q1 ? q : (q < (1ull << 32) ? (unsigned)q % (unsigned)q1 : q % q1);
   size_t k = rows <= q1 ? 0 : (q < (1ull << 32) ? (unsigned)q / (unsigned)q1 : q / q1);
   float v = 0.f;
-  if (gmask[gq] != 0) {
-    size_t ai = ((size_t)idx[gq] + k * atoms) * 3;
+  if (__ldg(gmask + gq) != 0) {
+    size_t ai = ((size_t)__ldg(idx + gq) + k * atoms) * 3;
     const float* p = pos + ai;
-    v = p[0] * Wp[c] + p[1] * Wp[C + c] + p[2] * Wp[2 * C + c];
+    v = __ldg(p) * __ldg(Wp + c) + __ldg(p + 1) * __ldg(Wp + C + c) + __ldg(p + 2) * __ldg(Wp + 2 * C + c);
     if (chiralGrads) {
       const float* g = chiralGrads + ai;
-      v += (g[0] * Wc[c] + g[1] * Wc[C + c]) + g[2] * Wc[2 * C + c];
+      v += (__ldg(g) * __ldg(Wc + c) + __ldg(g + 1) * __ldg(Wc + C + c)) + __ldg(g + 2) * __ldg(Wc + 2 * C + c);
     }
   }
-  act[t] = qStart[gq * C + c] + v * qMask[gq];
+  act[t] = __ldg(qStart + gq * C + c) + v * __ldg(qMask + gq);
 }
-__global__ void aggregateGatherK(const float* projected, const int* idx, const float* gmask, const float* atomMask,
-                                 float* out, size_t rows, int tokens, int dense, int Cp, size_t q1) {
+__global__ void aggregateGatherK(const float* __restrict__ projected, const int* __restrict__ idx,
+                 const float* __restrict__ gmask, const float* __restrict__ atomMask,
+                 float* __restrict__ out, size_t rows, int tokens, int dense, int Cp, size_t q1) {
   if ((Cp & 3) == 0) {
     size_t t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x, cp4 = (size_t)(Cp >> 2);
     if (t4 >= rows * cp4) return;
@@ -1155,10 +1156,10 @@ __global__ void aggregateGatherK(const float* projected, const int* idx, const f
     size_t g0 = (size_t)tok * dense;
     float count = 0; float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int a = 0; a < dense; ++a) {
-      float m = atomMask[g0 + a];
+      float m = __ldg(atomMask + g0 + a);
       count += m;
-      if (m != 0 && gmask[g0 + a] != 0) {
-        float4 v = reinterpret_cast<const float4*>(projected)[((size_t)idx[g0 + a] + (size_t)k * q1) * cp4 + c4];
+      if (m != 0 && __ldg(gmask + g0 + a) != 0) {
+        float4 v = __ldg(reinterpret_cast<const float4*>(projected) + ((size_t)__ldg(idx + g0 + a) + (size_t)k * q1) * cp4 + c4);
         sum.x += v.x > 0 ? v.x : 0.f; sum.y += v.y > 0 ? v.y : 0.f;
         sum.z += v.z > 0 ? v.z : 0.f; sum.w += v.w > 0 ? v.w : 0.f;
       }
@@ -1173,10 +1174,10 @@ __global__ void aggregateGatherK(const float* projected, const int* idx, const f
   size_t k = token / tokens; size_t g0 = (token % tokens) * dense;
   float count = 0, sum = 0;
   for (int a = 0; a < dense; ++a) {
-    float m = atomMask[g0 + a];
+    float m = __ldg(atomMask + g0 + a);
     count += m;
     if (m != 0) {
-      float v = gmask[g0 + a] != 0 ? projected[((size_t)idx[g0 + a] + k * q1) * Cp + c] : 0.f;
+      float v = __ldg(gmask + g0 + a) != 0 ? __ldg(projected + ((size_t)__ldg(idx + g0 + a) + k * q1) * Cp + c) : 0.f;
       sum += v > 0 ? v : 0;
     }
   }

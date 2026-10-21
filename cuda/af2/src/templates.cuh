@@ -109,12 +109,12 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
   float* qterm = scratch<float>("tmpl.qterm", pairs * C);
   if (FAST) {
     half* qnh = scratch<half>("tmpl.qnh", pairs * Cz);
-    WITH_PT(AF2_P16, layerNormVK<128, PT, half><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+    WITH_PT(AF2_P16, layerNormVK<128, PT, half><<<lnVGrid(pairs), 256, 0, STREAM>>>(
       reinterpret_cast<const PT*>(pair), qnh, pairs, P(S + "query_embedding_norm/scale"), P(S + "query_embedding_norm/offset")));
     ltGemm(qnh, PH(S + "template_pair_embedding_8/weights"), qterm, false, pairs, Cz, C, nullptr, false, 0.f);
   } else {
     float* qn = scratch<float>("tmpl.qn", pairs * Cz);
-    WITH_PT(AF2_P16, layerNormFastK<128, PT><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+    WITH_PT(AF2_P16, layerNormFastK<128, PT><<<lnVGrid(pairs), 256, 0, STREAM>>>(
       reinterpret_cast<const PT*>(pair), qn, pairs, P(S + "query_embedding_norm/scale"), P(S + "query_embedding_norm/offset")));
     gemm(qn, P(S + "template_pair_embedding_8/weights"), qterm, pairs, Cz, C);
   }
@@ -149,7 +149,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
     if (T == 1) {
       if (FAST) {
         half* sh = scratch<half>("tmpl.sh", pairs * C);
-        layerNormVK<64, float, half, true><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+        layerNormVK<64, float, half, true><<<lnVGrid(pairs), 256, 0, STREAM>>>(
           act, sh, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
         if (!AF2_P16) {
           ltGemm(sh, PH(TE + "output_linear/weights"), pair, false, pairs, C, Cz, P(TE + "output_linear/bias"), false, 1.f);
@@ -160,7 +160,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
         addIntoPairK<__nv_bfloat16, float><<<blocks((pairs * Cz + 3) / 4), 256, 0, STREAM>>>(pair, out, pairs * Cz, P(TE + "output_linear/bias"));
         return;
       }
-      layerNormFastK<64, float, true><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+      layerNormFastK<64, float, true><<<lnVGrid(pairs), 256, 0, STREAM>>>(
         act, sum, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
     } else {
       layerNorm(act, k == 0 ? sum : actn, pairs, C, S + "output_layer_norm");
@@ -311,7 +311,7 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
       const std::string A = TE + "attention/";
       int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), Wd = Hh * D;
       half* rh = scratch<half>("mtmpl.rh", pairs * C);
-      layerNormVK<64, float, half><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+      layerNormVK<64, float, half><<<lnVGrid(pairs), 256, 0, STREAM>>>(
         act, rh, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
       half* vvh = scratch<half>("mtmpl.vh", pairs * Wd);
       ltGemm(rh, PH(A + "value_w"), vvh, true, pairs, C, Wd, nullptr, false, 0.f);

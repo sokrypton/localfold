@@ -524,7 +524,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       AttnW w = attnWeights(R + "/attention", blk, C);
       int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
       half* xn = scratch<half>("frow.xn", rows * C);
-      layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
+      layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
                                                                                 P(R + "/query_norm/offset", blk));
       half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
@@ -600,7 +600,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     int Wp = w.H * w.Dp, stride = (rowsN + 7) / 8 * 8;
     half* xn = scratch<half>("fcol.xn", rows * C);
     if (takeEmittedLn(A + "/query_norm", blk, msa, rows) != xn)
-      layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
+      layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
                                                                                 P(A + "/query_norm/offset", blk));
     half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
     ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
@@ -726,7 +726,7 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
         size_t r = std::min(chunk, rows - r0);
         const B16* xin = emitted ? emitted + r0 * C : xh;
         if (!emitted)
-          layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
+          layerNormVK<256, B16, B16><<<lnVGrid(r), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
                                                                                 P(T + "/input_layer_norm/offset", blk));
         ltGemm(xin, w1, mh, !BF, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, BF);
         ltGemm(mh, w2, x16 + r0 * C, !BF, r, I + 8, C, nullptr, false, 1.f, 0, 0, BF);
