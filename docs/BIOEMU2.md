@@ -208,6 +208,11 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   combine moved from a STAGED float tile (64 x 64, the tile through threadgroup memory) into the vector epilogue's
   registers at 64 x 128, the atom half's weight in blocks of 2 (`be2_cs_wq2`) so a thread's four adjacent results are
   two gates and their values: 6.34 -> 6.11 s at 100 steps, the same digits (`BE2_CS_STAGED=1` the control).
+  Then, on Metal: the adaLN-gated residuals in their fc3's / proj_o's epilogue (metal/core's `gemmGatedRows`, 6.09
+  -> 6.02 s) and the conditioning batched over the layers with POINTER-ARRAY GEMMs (`Gemm::ptrs`: each layer's own
+  weight read where it lies, nothing stacked; `BE2_BATCH_COND=0` the control; 5.93 -> 5.81 s). Measured and NOT
+  taken: the window attention's online softmax blocked 8 keys a rescale (a rescale a key is as many multiply-adds as
+  the values) - correct, the `--f32` arm unchanged, and flat (5.82-5.97 s either way).
   🔴 ONE UNREPRODUCED FAILURE: the worker gate's 6MRR + GOL case once came back at RMSD 99 (an exploded sample) on the
   first run after that build, and did not recur in 38 runs since - 20 back to back, 4 with the kernel-specialisation
   cache deleted, 10 with the split on and off. Its log was overwritten before it was read. If it recurs, keep
