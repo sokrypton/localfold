@@ -252,6 +252,14 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   the weight is half already: staged as f16 and widened as it is read, it is EXACT - stage dumps bit-identical - and
   a third less traffic. A call 244 -> 231 ms; the fold 52.2 -> 50.4 s, the same RMSDs. (The activations' panel stays
   float32: rounding it is metal/bioemu2's precision, 2-5x this port's against the float32 reference.)
+- **The atom stream's windowed attention in one kernel** (`ops.windowAttention`; `fuseWindow: false` / `--fuse-win=off`
+  the control): the scores GEMM, the softmax, the P.V GEMM and the gating pass - three dispatches a sample and one a
+  layer - as one dispatch a (sample, window, head), 128 lanes, four a query holding its query's row, the 128 keys in
+  chunks of 32 with an online softmax, 12 KiB of workgroup memory. Worth 14.3 ms of a call as an upper bound (the
+  attention skipped); taken: 230.4 -> 218.5 ms (1 sample 92.5 -> 89.9), 991 -> 751 dispatches. The trunk's atom
+  encoder takes it too, so its stage dumps move by ~2e-8 at s_inputs and the 48-block pair track carries that to its
+  float32 band (2e-4..8e-4); against metal/bioemu2 --f32 unchanged (1.392e-3 / 2.772e-3 / 9.96e-4 / 1.305e-5).
+  6MRR-68, 5 samples: 50.4 -> 48.1 s, the same RMSDs.
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.

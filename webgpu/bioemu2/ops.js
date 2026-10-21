@@ -613,6 +613,101 @@ export class Bioemu2Ops {
 }` } });
   }
 
+  /**
+   * The atom stream's WINDOWED attention fused: out[r][h hd + d] = g[r][h hd + d] * sum_j softmax_j(q.k_j alpha +
+   * bias[w][h][qi][j], masked keys -1e6) v_j[d] - what the scores GEMM, the softmax kernel, the P.V GEMM and the gating
+   * pass computed, in one dispatch a (sample, window, head). 128 lanes, four a query, each holding its query's row; the
+   * 128 keys in chunks of 32 with an online softmax. Workgroup memory 16 KiB exactly (q, a chunk's k and v, its
+   * logits) - WebGPU's guaranteed floor. The softmax sums in a different order from the three-pass path: ~1e-7.
+   * qkv [S N][3 D] (q's bias added), kvPad [S pad][2 D] (k | v, CTX zero rows each end), out and g [S N][D].
+   */
+  windowAttention({ qkv, kvPad, bias, mask, g, out, S, N, H, pad, alpha }) {
+    const WQ = 32, WK = 128, HD = 32, D = H * HD, NW = N / WQ;
+    if (N % WQ) throw new Error("windowAttention: N is not whole windows");
+    const u = new Uint32Array(8);
+    const f = new Float32Array(u.buffer);
+    u.set([S, N, NW, pad]);
+    f[4] = alpha;
+    return this.step(`win-attn-${H}`, `
+struct P { S: u32, N: u32, NW: u32, pad: u32, alpha: f32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read> kv: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> mask: array<i32>;
+@group(0) @binding(5) var<storage, read> gate: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+var<workgroup> ks: array<vec4<f32>, 256>;     // [32 keys][32 dims]
+var<workgroup> vs: array<vec4<f32>, 256>;
+var<workgroup> ps: array<f32, 1024>;          // [32 queries][32 keys] this chunk's logits
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let flat = wid.x + wid.y * 65535u;
+  let h = flat % ${H}u;
+  let w = (flat / ${H}u) % p.NW;
+  let sm = flat / (${H}u * p.NW);
+  let live = sm < p.S;
+  let smc = min(sm, p.S - 1u);
+  let qi = li / 4u;
+  let sub = li % 4u;
+  let qrow = smc * p.N + w * ${WQ}u + qi;
+  var q: array<vec4<f32>, 8>;
+  for (var d = 0u; d < 8u; d += 1u) {
+    let at = qrow * ${3 * D}u + h * ${HD}u + d * 4u;
+    q[d] = vec4<f32>(qkv[at], qkv[at + 1u], qkv[at + 2u], qkv[at + 3u]);
+  }
+  var m = -3.0e38;
+  var l = 0.0;
+  var o0 = vec4<f32>(0.0);
+  var o1 = vec4<f32>(0.0);
+  let biasRow = ((w * ${H}u + h) * ${WQ}u + qi) * ${WK}u;
+  for (var c = 0u; c < ${WK / 32}u; c += 1u) {
+    // the chunk's k and v: 32 keys x 32 dims each, a lane two vec4s of each
+    for (var e = 0u; e < 2u; e += 1u) {
+      let slot = li + e * 128u;
+      let key = slot / 8u;
+      let d4 = slot % 8u;
+      let row = (smc * p.pad + w * ${WQ}u + c * 32u + key) * ${2 * D}u + h * ${HD}u + d4 * 4u;
+      ks[slot] = vec4<f32>(kv[row], kv[row + 1u], kv[row + 2u], kv[row + 3u]);
+      vs[slot] = vec4<f32>(kv[row + ${D}u], kv[row + ${D + 1}u], kv[row + ${D + 2}u], kv[row + ${D + 3}u]);
+    }
+    workgroupBarrier();
+    // this lane's 8 keys of the chunk
+    for (var jj = 0u; jj < 8u; jj += 1u) {
+      let j = sub * 8u + jj;
+      var qk = 0.0;
+      for (var d = 0u; d < 8u; d += 1u) { qk += dot(q[d], ks[j * 8u + d]); }
+      let key = c * 32u + j;
+      var v = qk * p.alpha + bias[biasRow + key];
+      if (mask[w * ${WQ}u + key] == 0) { v = -1.0e6; }
+      ps[qi * 32u + j] = v;
+    }
+    workgroupBarrier();
+    // the online softmax over the chunk's 32 (every lane of a query alike), and this lane's 8 output dims
+    var cm = m;
+    for (var j = 0u; j < 32u; j += 1u) { cm = max(cm, ps[qi * 32u + j]); }
+    let rescale = exp(m - cm);
+    l = l * rescale;
+    o0 = o0 * rescale;
+    o1 = o1 * rescale;
+    for (var j = 0u; j < 32u; j += 1u) {
+      let e = exp(ps[qi * 32u + j] - cm);
+      l += e;
+      o0 += e * vs[j * 8u + sub * 2u];
+      o1 += e * vs[j * 8u + sub * 2u + 1u];
+    }
+    m = cm;
+    workgroupBarrier();
+  }
+  if (!live) { return; }
+  let ob = qrow * ${D}u + h * ${HD}u + sub * 8u;
+  for (var d = 0u; d < 4u; d += 1u) {
+    out[ob + d] = o0[d] / l * gate[ob + d];
+    out[ob + 4u + d] = o1[d] / l * gate[ob + 4u + d];
+  }
+}`, S * NW * H, [qkv, kvPad, bias, mask, g, out], u);
+  }
+
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
   linear({ x, w, y, rows, inC, outC, bias, act, accumulate, xOff = 0, xStride = inC, yOff = 0, yStride = outC, wOff = 0, alpha }) {
     return this.gemm({ m: rows, n: outC, k: inC, a: x, b: w, c: y, bias, act, accumulate, alpha,

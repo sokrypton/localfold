@@ -351,21 +351,27 @@ export class Bioemu2Gpu {
       { buffer: s.kvPad, write: true }],
     `let r = i / 384u; let c = i % 384u; let sm = r / U(0u); let ra = r % U(0u);
   if (c < 128u) { b0[i] = b0[i] + b1[c]; } else { b2[(sm * U(1u) + ra + ${CTX}u) * 256u + c - 128u] = b0[i]; }`, [N, pad]));
-    // per sample: logits (NW, H, 32, 128) = q . k^T / sqrt(hd), the softmax, o = P . v
-    for (let sm = 0; sm < S; sm += 1) {
-      steps.push(await o.gemm({ m: W_Q, n: W_K, k: hd, a: s.qkv, b: s.kvPad, c: s.logits, batches: [NW, H], alpha: 1 / Math.sqrt(hd),
-        A: { off: sm * N * 3 * D, s0: W_Q * 3 * D, s1: hd, m: 3 * D, k: 1 },
-        B: { off: sm * pad * 2 * D, s0: W_Q * 2 * D, s1: hd, n: 2 * D, k: 1 },
-        C: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, n: 1 } }));
-      steps.push(await o.softmax({ l: s.logits, rows: NW * H * W_Q, len: W_K, rowsPer: W_Q, b1: H,
-        L: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K }, bias, Bias: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K },
-        mask: keyMask, M: { off: 0, s0: W_Q } }));
-      steps.push(await o.gemm({ m: W_Q, n: hd, k: W_K, a: s.logits, b: s.kvPad, c: s.o, batches: [NW, H],
-        A: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, k: 1 },
-        B: { off: sm * pad * 2 * D + D, s0: W_Q * 2 * D, s1: hd, n: 1, k: 2 * D },
-        C: { off: sm * N * D, s0: W_Q * D, s1: hd, m: D, n: 1 } }));
+    if (this.options.fuseWindow !== false && hd === 32 && W_Q === 32 && W_K === 128) {
+      // (the three passes and the gating in one kernel: ops.windowAttention; fuseWindow: false is the control)
+      steps.push(await o.windowAttention({ qkv: s.qkv, kvPad: s.kvPad, bias, mask: keyMask, g: s.g, out: s.o, S, N, H, pad,
+                                           alpha: 1 / Math.sqrt(hd) }));
+    } else {
+      // per sample: logits (NW, H, 32, 128) = q . k^T / sqrt(hd), the softmax, o = P . v
+      for (let sm = 0; sm < S; sm += 1) {
+        steps.push(await o.gemm({ m: W_Q, n: W_K, k: hd, a: s.qkv, b: s.kvPad, c: s.logits, batches: [NW, H], alpha: 1 / Math.sqrt(hd),
+          A: { off: sm * N * 3 * D, s0: W_Q * 3 * D, s1: hd, m: 3 * D, k: 1 },
+          B: { off: sm * pad * 2 * D, s0: W_Q * 2 * D, s1: hd, n: 2 * D, k: 1 },
+          C: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, n: 1 } }));
+        steps.push(await o.softmax({ l: s.logits, rows: NW * H * W_Q, len: W_K, rowsPer: W_Q, b1: H,
+          L: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K }, bias, Bias: { s0: H * W_Q * W_K, s1: W_Q * W_K, r: W_K },
+          mask: keyMask, M: { off: 0, s0: W_Q } }));
+        steps.push(await o.gemm({ m: W_Q, n: hd, k: W_K, a: s.logits, b: s.kvPad, c: s.o, batches: [NW, H],
+          A: { off: 0, s0: H * W_Q * W_K, s1: W_Q * W_K, m: W_K, k: 1 },
+          B: { off: sm * pad * 2 * D + D, s0: W_Q * 2 * D, s1: hd, n: 1, k: 2 * D },
+          C: { off: sm * N * D, s0: W_Q * D, s1: hd, m: D, n: 1 } }));
+      }
+      steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
     }
-    steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
     steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: R, inC: D, outC: D }));
     steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 2 * D));
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));
