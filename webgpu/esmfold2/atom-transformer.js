@@ -125,12 +125,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * difference is small and a 1e-6 bound sees it.
  */
 export function createModulateShader({ atoms, channels }, shiftIndex, scaleIndex) {
+  const steps = [];
+  for (let s = LANES >> 1; s > 0; s >>= 1) {
+    steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
+  }
   return `
 @group(0) @binding(0) var<storage, read> activation: array<f32>;
 @group(0) @binding(1) var<storage, read> modulation: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 var<workgroup> squares: array<f32, ${LANES}>;
+var<workgroup> rowBuf: array<f32, ${channels}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -141,20 +146,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let v = activation[base + c];
+    rowBuf[c] = v;
     square += v * v;
   }
   squares[local.x] = square;
   workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) { squares[local.x] += squares[local.x + stride]; }
-    workgroupBarrier();
-  }
+${steps.join("\n")}
   let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
-  let modulationBase = atom * ${channels * 6}u;
+  let scaleBase = atom * ${channels * 6}u + ${scaleIndex * channels}u;
+  let shiftBase = atom * ${channels * 6}u + ${shiftIndex * channels}u;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    let scale = modulation[modulationBase + ${scaleIndex}u * ${channels}u + c];
-    let shift = modulation[modulationBase + ${shiftIndex}u * ${channels}u + c];
-    output[base + c] = activation[base + c] * inverse * (1.0 + scale) + shift;
+    let scale = modulation[scaleBase + c];
+    let shift = modulation[shiftBase + c];
+    output[base + c] = rowBuf[c] * inverse * (1.0 + scale) + shift;
   }
 }`;
 }
@@ -201,6 +205,10 @@ export function createSwaPrepareShader({ atoms, channels, heads }, precision) {
   const headDim = channels / heads;
   const half = headDim >> 1;
   const narrow = precision === "bf16" ? "bf16" : "";
+  const reduceSteps = [];
+  for (let s = headDim >> 1; s > 0; s >>= 1) {
+    reduceSteps.push(`  if (d < ${s}u) { squaresQ[d] += squaresQ[d + ${s}u]; squaresK[d] += squaresK[d + ${s}u]; } workgroupBarrier();`);
+  }
   return `${precision === "bf16" ? BFLOAT16 : ""}
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
 @group(0) @binding(1) var<storage, read> cosine: array<f32>;
@@ -209,8 +217,10 @@ export function createSwaPrepareShader({ atoms, channels, heads }, precision) {
 @group(0) @binding(4) var<storage, read_write> key: array<f32>;
 @group(0) @binding(5) var<storage, read_write> value: array<f32>;
 
-var<workgroup> staged: array<f32, ${headDim}>;
-var<workgroup> squares: array<f32, ${headDim}>;
+var<workgroup> stagedQ: array<f32, ${headDim}>;
+var<workgroup> stagedK: array<f32, ${headDim}>;
+var<workgroup> squaresQ: array<f32, ${headDim}>;
+var<workgroup> squaresK: array<f32, ${headDim}>;
 
 @compute @workgroup_size(${headDim})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -226,28 +236,28 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   value[out_base + d] = ${narrow}(qkv[qkv_base + ${channels * 2}u + d]);
 
+  let vq = qkv[qkv_base + d];
+  let vk = qkv[qkv_base + ${channels}u + d];
+  squaresQ[d] = vq * vq;
+  squaresK[d] = vk * vk;
+  workgroupBarrier();
+${reduceSteps.join("\n")}
+  stagedQ[d] = vq * inverseSqrt(squaresQ[0] / ${headDim}.0 + ${RMS_EPSILON});
+  stagedK[d] = vk * inverseSqrt(squaresK[0] / ${headDim}.0 + ${RMS_EPSILON});
+  workgroupBarrier();
+  // rotate_half: element i pairs with i + half, and the table is tiled.
   let cos_base = atom * ${half}u;
-  for (var which = 0u; which < 2u; which += 1u) {
-    let v = qkv[qkv_base + which * ${channels}u + d];
-    squares[d] = v * v;
-    workgroupBarrier();
-    for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
-      if (d < stride) { squares[d] += squares[d + stride]; }
-      workgroupBarrier();
-    }
-    staged[d] = v * inverseSqrt(squares[0] / ${headDim}.0 + ${RMS_EPSILON});
-    workgroupBarrier();
-    // rotate_half: element i pairs with i + half, and the table is tiled.
-    let table = select(d - ${half}u, d, d < ${half}u);
-    let c = cosine[cos_base + table];
-    let s = sine[cos_base + table];
-    let rotated = select(staged[d - ${half}u] * s + staged[d] * c,
-                         staged[d] * c - staged[d + ${half}u] * s,
-                         d < ${half}u);
-    if (which == 0u) { query[out_base + d] = ${narrow}(rotated); }
-    else { key[out_base + d] = ${narrow}(rotated); }
-    workgroupBarrier();
-  }
+  let table = select(d - ${half}u, d, d < ${half}u);
+  let c = cosine[cos_base + table];
+  let s = sine[cos_base + table];
+  let rotQ = select(stagedQ[d - ${half}u] * s + stagedQ[d] * c,
+                    stagedQ[d] * c - stagedQ[d + ${half}u] * s,
+                    d < ${half}u);
+  let rotK = select(stagedK[d - ${half}u] * s + stagedK[d] * c,
+                    stagedK[d] * c - stagedK[d + ${half}u] * s,
+                    d < ${half}u);
+  query[out_base + d] = ${narrow}(rotQ);
+  key[out_base + d] = ${narrow}(rotK);
 }`;
 }
 
@@ -355,16 +365,20 @@ ${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${
     workgroupBarrier();
 
     // This chunk's largest logit, per head.
+    let headChunk = head * ${CHUNK}u;
     var largest = ${FLOOR};
     for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
-      if (live[slot] != 0.0) { largest = max(largest, logits[head * ${CHUNK}u + slot]); }
+      if (live[slot] != 0.0) { largest = max(largest, logits[headChunk + slot]); }
     }
     reduce[local.x] = largest;
     workgroupBarrier();
-    for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
-      if (d < stride) { reduce[local.x] = max(reduce[local.x], reduce[local.x + stride]); }
-      workgroupBarrier();
-    }
+${(() => {
+  const steps = [];
+  for (let s = headDim >> 1; s > 0; s >>= 1) {
+    steps.push(`    if (d < ${s}u) { reduce[local.x] = max(reduce[local.x], reduce[local.x + ${s}u]); } workgroupBarrier();`);
+  }
+  return steps.join("\n");
+})()}
     let chunkPeak = reduce[head * ${headDim}u];
     let wasPeak = headPeak[head];
     let peak = max(wasPeak, chunkPeak);
@@ -376,16 +390,19 @@ ${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${
 
     var total = 0.0;
     for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
-      let weight = select(0.0, exp(logits[head * ${CHUNK}u + slot] - peak), live[slot] != 0.0);
-      logits[head * ${CHUNK}u + slot] = weight;
+      let weight = select(0.0, exp(logits[headChunk + slot] - peak), live[slot] != 0.0);
+      logits[headChunk + slot] = weight;
       total += weight;
     }
     reduce[local.x] = total;
     workgroupBarrier();
-    for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
-      if (d < stride) { reduce[local.x] += reduce[local.x + stride]; }
-      workgroupBarrier();
-    }
+${(() => {
+  const steps = [];
+  for (let s = headDim >> 1; s > 0; s >>= 1) {
+    steps.push(`    if (d < ${s}u) { reduce[local.x] += reduce[local.x + ${s}u]; } workgroupBarrier();`);
+  }
+  return steps.join("\n");
+})()}
     let chunkSum = reduce[head * ${headDim}u];
     workgroupBarrier();
     if (d == 0u) {
@@ -395,10 +412,11 @@ ${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${
 
     // ...and this chunk's weighted values, onto the rescaled running context.
     context = context * rescale;
+    let valBase = ((start + base) * ${heads}u + head) * ${headDim}u + d;
     for (var slot = 0u; slot < ${CHUNK}u; slot += 1u) {
-      let weight = logits[head * ${CHUNK}u + slot];
+      let weight = logits[headChunk + slot];
       if (weight == 0.0) { continue; }
-      context += weight * value[((start + base + slot) * ${heads}u + head) * ${headDim}u + d];
+      context += weight * value[valBase + slot * ${channels}u];
     }
     workgroupBarrier();
   }

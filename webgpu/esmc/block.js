@@ -61,13 +61,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   sums[local.x] = total;
   squares[local.x] = square;
   workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) {
-      sums[local.x] += sums[local.x + stride];
-      squares[local.x] += squares[local.x + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
+  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
+  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
+  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
+  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
+  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
   // 🔴 E[x^2] - mean^2, which is what the reference's two-pass form computes to
   // within float32. The alternative - a second pass over the row - is exact and
@@ -318,15 +317,16 @@ export function createPrepareShader({ rows, model, heads }, epsilon, base) {
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
+var<workgroup> cosTab: array<f32, ${headDim / 2}>;
+var<workgroup> sinTab: array<f32, ${headDim / 2}>;
 
 fn reduce(lane: u32) {
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) {
-      sums[lane] += sums[lane + stride];
-      squares[lane] += squares[lane + stride];
-    }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { sums[lane] += sums[lane + 32u]; squares[lane] += squares[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { sums[lane] += sums[lane + 16u]; squares[lane] += squares[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { sums[lane] += sums[lane + 8u]; squares[lane] += squares[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { sums[lane] += sums[lane + 4u]; squares[lane] += squares[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { sums[lane] += sums[lane + 2u]; squares[lane] += squares[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
 }
 
 @compute @workgroup_size(${LANES})
@@ -336,6 +336,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (row >= ${rows}u) { return; }
   let packed = row * ${3 * model}u;
   let out = row * ${model}u;
+
+  for (var d = local.x; d < ${headDim / 2}u; d += ${LANES}u) {
+    let frequency = f32(row) / pow(${base}, f32(2u * d) / ${headDim}.0);
+    cosTab[d] = cos(frequency);
+    sinTab[d] = sin(frequency);
+  }
 
   // v needs neither norm nor rotation.
   for (var c = local.x; c < ${model}u; c += ${LANES}u) {
@@ -386,9 +392,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var slot = local.x; slot < ${(model / 2)}u; slot += ${LANES}u) {
     let head = slot / ${headDim / 2}u;
     let d = slot % ${headDim / 2}u;
-    let frequency = f32(row) / pow(${base}, f32(2u * d) / ${headDim}.0);
-    let c = cos(frequency);
-    let s = sin(frequency);
+    let c = cosTab[d];
+    let s = sinTab[d];
     let first = out + head * ${headDim}u + d;
     let second = first + ${headDim / 2}u;
     let q0 = query[first]; let q1 = query[second];

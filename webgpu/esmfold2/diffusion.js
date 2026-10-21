@@ -102,13 +102,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   sums[local.x] = total;
   squares[local.x] = square;
   workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) {
-      sums[local.x] += sums[local.x + stride];
-      squares[local.x] += squares[local.x + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
+  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
+  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
+  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
+  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
+  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
   let mean = sums[0] / ${width}.0;
   let inverse = inverseSqrt(max(squares[0] / ${width}.0 - mean * mean, 0.0) + ${epsilon});
   for (var c = local.x; c < ${width}u; c += ${LANES}u) {
@@ -279,10 +278,12 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     logits[lane] = logit;
     reduce[lane] = logit;
     workgroupBarrier();
-    for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-      if (lane < stride) { reduce[lane] = max(reduce[lane], reduce[lane + stride]); }
-      workgroupBarrier();
-    }
+    if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
+    if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
+    if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
+    if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
+    if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
+    if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
     let block_max = reduce[0];
     workgroupBarrier();
     let next_max = max(running_max, block_max);
@@ -293,28 +294,32 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     logits[lane] = weight;
     reduce[lane] = weight;
     workgroupBarrier();
-    for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-      if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
-      workgroupBarrier();
-    }
+    if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+    if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
+    if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
+    if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
+    if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
+    if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
     running_sum = running_sum * rescale + reduce[0];
     running_max = next_max;
     workgroupBarrier();
     for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
       var total = 0.0;
       let val_col = ${channels}u + head * ${headDim}u + d;
+      let vBase = block * ${channels * 2}u + val_col;
       if (block + ${LANES}u <= ${tokens}u) {
         for (var u = 0u; u < ${LANES}u; u += 4u) {
-          total += logits[u] * kv[(block + u) * ${channels * 2}u + val_col]
-                 + logits[u + 1u] * kv[(block + u + 1u) * ${channels * 2}u + val_col]
-                 + logits[u + 2u] * kv[(block + u + 2u) * ${channels * 2}u + val_col]
-                 + logits[u + 3u] * kv[(block + u + 3u) * ${channels * 2}u + val_col];
+          let uBase = vBase + u * ${channels * 2}u;
+          total += logits[u] * kv[uBase]
+                 + logits[u + 1u] * kv[uBase + ${channels * 2}u]
+                 + logits[u + 2u] * kv[uBase + ${channels * 4}u]
+                 + logits[u + 3u] * kv[uBase + ${channels * 6}u];
         }
       } else {
         for (var u = 0u; u < ${LANES}u; u += 1u) {
           let key = block + u;
           if (key >= ${tokens}u) { break; }
-          total += logits[u] * kv[key * ${channels * 2}u + val_col];
+          total += logits[u] * kv[vBase + u * ${channels * 2}u];
         }
       }
       accumulator[d] = accumulator[d] * rescale + total;

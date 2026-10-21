@@ -83,14 +83,17 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(7) var<storage, read> pairbias: array<f32>;
 
 var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> rowBuf: array<f32, CHANNELS>;
 
 fn total_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
@@ -102,14 +105,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let lane = local.x;
   let i = row / TOKENS;
   let j = row % TOKENS;
+  let rowBase = row * CHANNELS;
 
   var partial = 0.0;
-  for (var c = lane; c < CHANNELS; c += LANES) { partial += pair[row * CHANNELS + c]; }
+  for (var c = lane; c < CHANNELS; c += LANES) {
+    let pv = pair[rowBase + c];
+    rowBuf[c] = pv;
+    partial += pv;
+  }
   let mean = total_of(lane, partial) / f32(CHANNELS);
   workgroupBarrier();
   var squares = 0.0;
   for (var c = lane; c < CHANNELS; c += LANES) {
-    let d = pair[row * CHANNELS + c] - mean;
+    let d = rowBuf[c] - mean;
     squares += d * d;
   }
   let inverse = inverseSqrt(total_of(lane, squares) / f32(CHANNELS) + EPSILON);
@@ -125,13 +133,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var edge = 0u; edge < EDGES; edge += 1u) {
     if (length > constants[EDGES_AT + edge]) { bucket += 1u; }
   }
+  let iBase = i * CHANNELS;
+  let jBase = j * CHANNELS;
+  let bBase = bucket * CHANNELS;
 
   for (var c = lane; c < CHANNELS; c += LANES) {
-    let normed = (pair[row * CHANNELS + c] - mean) * inverse
+    let normed = (rowBuf[c] - mean) * inverse
       * constants[SCALE_AT + c] + constants[OFFSET_AT + c];
-    out[row * CHANNELS + c] = normed + pairbias[row * CHANNELS + c]
-      + rows[i * CHANNELS + c] + cols[j * CHANNELS + c]
-      + extra[row * CHANNELS + c] + embedding[bucket * CHANNELS + c];
+    out[rowBase + c] = normed + pairbias[rowBase + c]
+      + rows[iBase + c] + cols[jBase + c]
+      + extra[rowBase + c] + embedding[bBase + c];
   }
 }`;
 }
@@ -146,6 +157,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * the projection costs nothing extra: the two operands are `tokens x 256`.
  */
 export function createRankOneProjectShader({ tokens, channels, outChannels }) {
+  const stageProd = outChannels % 64 === 0;
   return `
 const TOKENS: u32 = ${tokens}u;
 const CHANNELS: u32 = ${channels}u;
@@ -156,19 +168,30 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<storage, read> weight: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
+${stageProd ? "var<workgroup> prod: array<f32, CHANNELS>;" : ""}
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let slot = id.x + id.y * GRID_WIDTH * 64u;
-  if (slot >= TOKENS * TOKENS * OUT) { return; }
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let wg = group.x + group.y * GRID_WIDTH;
+  let slot = wg * 64u + local.x;
+  if (wg * 64u >= TOKENS * TOKENS * OUT) { return; }
   let row = slot / OUT;
   let o = slot % OUT;
   let i = row / TOKENS;
   let j = row % TOKENS;
+  let iBase = i * CHANNELS;
+  let jBase = j * CHANNELS;
+  ${stageProd ? `for (var c = local.x; c < CHANNELS; c += 64u) {
+    prod[c] = left[iBase + c] * right[jBase + c];
+  }
+  workgroupBarrier();` : "if (slot >= TOKENS * TOKENS * OUT) { return; }"}
   var sum = 0.0;
   for (var c = 0u; c < CHANNELS; c += ${channels % 8 === 0 ? 8 : 1}u) {
 ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
-  `    sum += left[i * CHANNELS + c + ${u}u] * right[j * CHANNELS + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
+  stageProd
+    ? `    sum += prod[c + ${u}u] * weight[(c + ${u}u) * OUT + o];`
+    : `    sum += left[iBase + c + ${u}u] * right[jBase + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -176,6 +199,7 @@ ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
 
 /** `out[row, o] = sum_i in[row, i] * weight[i, o]`, the weight already transposed. */
 export function createProjectRowsShader({ rows, inChannels, outChannels }) {
+  const stageRow = outChannels % 64 === 0 && inChannels <= 1024;
   return `
 const ROWS: u32 = ${rows}u;
 const IN: u32 = ${inChannels}u;
@@ -185,17 +209,28 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+${stageRow ? "var<workgroup> rowBuf: array<f32, IN>;" : ""}
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let slot = id.x + id.y * GRID_WIDTH * 64u;
-  if (slot >= ROWS * OUT) { return; }
-  let row = slot / OUT;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let wg = group.x + group.y * GRID_WIDTH;
+  let slot = wg * 64u + local.x;
+  if (wg * 64u >= ROWS * OUT) { return; }
+  let row = min(slot / OUT, ROWS - 1u);
   let o = slot % OUT;
+  let rBase = row * IN;
+  ${stageRow ? `for (var c = local.x; c < IN; c += 64u) {
+    rowBuf[c] = source[rBase + c];
+  }
+  workgroupBarrier();` : ""}
+  if (slot >= ROWS * OUT) { return; }
   var sum = 0.0;
   for (var c = 0u; c < IN; c += ${inChannels % 8 === 0 ? 8 : 1}u) {
 ${Array.from({ length: inChannels % 8 === 0 ? 8 : 1 }, (_, u) =>
-  `    sum += source[row * IN + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
+  stageRow
+    ? `    sum += rowBuf[c + ${u}u] * weight[(c + ${u}u) * OUT + o];`
+    : `    sum += source[rBase + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -224,11 +259,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (slot >= ATOMS * BINS) { return; }
   let atom = slot / BINS;
   let bin = slot % BINS;
-  let base = table[atom] * CHANNELS * BINS;
+  let aBase = atom * CHANNELS;
+  let base = table[atom] * CHANNELS * BINS + bin;
   var sum = 0.0;
   for (var c = 0u; c < CHANNELS; c += ${channels % 8 === 0 ? 8 : 1}u) {
 ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
-  `    sum += source[atom * CHANNELS + c + ${u}u] * weight[base + (c + ${u}u) * BINS + bin];`).join("\n")}
+  `    sum += source[aBase + c + ${u}u] * weight[base + (c + ${u}u) * BINS];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -242,6 +278,7 @@ ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
  * the sum instead would renormalise the row over a different denominator.
  */
 export function createPoolShader({ tokens, channels }) {
+  const stageWeights = tokens <= 2048;
   return `
 const TOKENS: u32 = ${tokens}u;
 const CHANNELS: u32 = ${channels}u;
@@ -254,24 +291,29 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
 var<workgroup> reduce: array<f32, LANES>;
+${stageWeights ? `var<workgroup> weights: array<f32, TOKENS>;` : ""}
 
 fn largest_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] = max(reduce[lane], reduce[lane + stride]); }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
+  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
   return reduce[0];
 }
 
 fn total_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
@@ -292,14 +334,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let peak = largest_of(lane, top);
   workgroupBarrier();
   var partial = 0.0;
-  for (var j = lane; j < TOKENS; j += LANES) { partial += exp(biased(i, j) - peak); }
+  for (var j = lane; j < TOKENS; j += LANES) {
+    let w = exp(biased(i, j) - peak);
+    ${stageWeights ? "weights[j] = w;" : ""}
+    partial += w;
+  }
   let denominator = total_of(lane, partial);
   workgroupBarrier();
+  let pairRow = i * TOKENS * CHANNELS;
 
   for (var c = lane; c < CHANNELS; c += LANES) {
     var sum = 0.0;
     for (var j = 0u; j < TOKENS; j += 1u) {
-      sum += exp(biased(i, j) - peak) * pair[(i * TOKENS + j) * CHANNELS + c];
+      sum += ${stageWeights ? "weights[j]" : "exp(biased(i, j) - peak)"} * pair[pairRow + j * CHANNELS + c];
     }
     out[i * CHANNELS + c] = sum / denominator;
   }
@@ -614,13 +661,13 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
   const slots = weights.maxAtomsPerToken;
   const bins = weights.plddtBins;
-  const gathered = new Float32Array(atoms * dSingle);
+  const normedSingle = layerNorm(readouts.single, tokens, dSingle,
+                                 weights.plddtNormScale, weights.plddtNormOffset);
+  const normedAtoms = new Float32Array(atoms * dSingle);
   for (let atom = 0; atom < atoms; atom += 1) {
     const from = input.atomToToken[atom] * dSingle;
-    for (let c = 0; c < dSingle; c += 1) gathered[atom * dSingle + c] = readouts.single[from + c];
+    normedAtoms.set(normedSingle.subarray(from, from + dSingle), atom * dSingle);
   }
-  const normedAtoms = layerNorm(gathered, atoms, dSingle,
-                                weights.plddtNormScale, weights.plddtNormOffset);
   // 🔴 ON THE DEVICE: `atoms x 384 x 50` multiply-adds were a JavaScript
   // triple loop, ~88 ms at 255 tokens. The slot each atom reads its table from
   // is decided here exactly as that loop decided it.
