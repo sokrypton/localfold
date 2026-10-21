@@ -4416,8 +4416,12 @@ async function followRemoteFold({ since, label, signal }) {
   // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
   // PAE plot and an empty scores card - the page looked like it had folded
   // nothing but coordinates, because it had been given nothing else.
+  // 🔴 A BioEmu2 FOLD IS AN ENSEMBLE: its play bar is ONE FRAME A SAMPLE, as this page's own foldWithBioemu2 leaves it -
+  // the streamed frames (the first sample's denoising, metal/bioemu2's --frames) were the live preview and are replaced,
+  // not kept as a trajectory with the samples appended after it. (cuda/bioemu2 streams none, so this path never met them)
+  const ensemble = result.family === "bioemu2" && Array.isArray(result.samples) && result.samples.length > 0;
   await loadIntoViewer({
-    stem, pdb: framePdbs[0] ?? result.pdb,
+    stem, pdb: ensemble ? result.samples[0] : framePdbs[0] ?? result.pdb,
     scores: cuda.scores,
     a3m: result.a3m ?? undefined,
     confidence: cuda.confidence,
@@ -4434,7 +4438,7 @@ async function followRemoteFold({ since, label, signal }) {
     orientBestView(viewer);
   }
   const api = window.py2Dmol;
-  if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
+  if (!ensemble && api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
     carry(first, liveFrames[0]);

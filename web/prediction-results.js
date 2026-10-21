@@ -349,12 +349,16 @@ export function paeMatrix(values, length) {
 }
 
 export function confidenceJson(sequence, confidence) {
-  const result = {
-    sequence,
-    plddt: Array.from(confidence.plddt),
-    mean_plddt: confidence.meanPlddt,
-    ptm: confidence.ptm,
-  };
+  // 🔴 A MODEL WITH NO CONFIDENCE HEAD HAS NO pLDDT, PTM OR PAE - BioEmu2 (python/localfold/worker.py sends them null) -
+  // and they are left out, not written as zeros or thrown on: its scores are the sequence and the contact map, as this
+  // page's own foldWithBioemu2 records them. (Array.from(undefined) here was a native BioEmu2 fold's "undefined is not
+  // iterable", on CUDA's runtime and Metal's alike.)
+  const result = { sequence };
+  if (confidence.plddt != null) {
+    result.plddt = Array.from(confidence.plddt);
+    result.mean_plddt = confidence.meanPlddt;
+    result.ptm = confidence.ptm;
+  }
   // 🔴 NaN IS "NOT APPLICABLE" HERE, NOT A MISSING FIELD. AlphaFold 3 reports a
   // monomer's ipTM as NaN - there is no interface to score - and JSON.stringify
   // turns that into `null`, so a bare `!== undefined` writes `"iptm": null` and
@@ -368,8 +372,10 @@ export function confidenceJson(sequence, confidence) {
   // reads a nested array as angstroms and scales it by 8 into its byte
   // encoding, but reads a FLAT array as bytes that are already scaled. Handed
   // flat angstroms it draws a matrix eight times too small, silently.
-  result.predicted_aligned_error = paeMatrix(confidence.predictedAlignedError, sequence.length);
-  result.max_predicted_aligned_error = confidence.maxPredictedAlignedError;
+  if (confidence.predictedAlignedError != null) {
+    result.predicted_aligned_error = paeMatrix(confidence.predictedAlignedError, sequence.length);
+    result.max_predicted_aligned_error = confidence.maxPredictedAlignedError;
+  }
   // 🔴 THE CONTACTS ARE NESTED THE SAME WAY THE PAE IS, AND FOR THE SAME
   // REASON. Both are token-by-token matrices whose stride is not the residue
   // count once a ligand is in the fold, so both recover it from the data -
@@ -380,7 +386,7 @@ export function confidenceJson(sequence, confidence) {
   // Optional because it is optional in the models: AF3 returns it from the
   // trunk and AF2 computes it from the distogram, but a fold that was aborted
   // before the trunk finished has a structure and no contacts.
-  if (confidence.contactProbs !== undefined) {
+  if (confidence.contactProbs != null) {
     result.contact_probs = paeMatrix(confidence.contactProbs, sequence.length);
   }
   return JSON.stringify(result, null, 2);
