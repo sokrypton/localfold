@@ -432,13 +432,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(TARGET_WIDTH);
   let variance = reduce_b[0] / f32(TARGET_WIDTH) - mean * mean;
   let inverse = inverseSqrt(variance + EPSILON);
@@ -477,13 +482,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = s_total;
   reduce_b[local] = s_squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let s_mean = reduce_a[0] / f32(C_S);
   let s_variance = reduce_b[0] / f32(C_S) - s_mean * s_mean;
   let s_inverse = inverseSqrt(s_variance + EPSILON);
@@ -559,13 +569,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_Z);
   let variance = reduce_b[0] / f32(C_Z) - mean * mean;
   let inverse = inverseSqrt(variance + EPSILON);
@@ -703,13 +718,18 @@ fn row_statistics_of(values: ptr<workgroup, array<f32, ${pairChannels}>>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_Z);
   let variance = reduce_b[0] / f32(C_Z) - mean * mean;
   workgroupBarrier();
@@ -728,13 +748,18 @@ fn row_statistics(base: u32, local: u32) -> vec2<f32> {
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_Z);
   let variance = reduce_b[0] / f32(C_Z) - mean * mean;
   // 🔴 A BARRIER BEFORE THE CALLER REUSES THE REDUCTION BUFFER, for the reason
@@ -867,6 +892,7 @@ var<workgroup> plddt_norm: array<f32, ${singleChannels}>;
 var<workgroup> resolved_norm: array<f32, ${singleChannels}>;
 var<workgroup> reduce_a: array<f32, 64>;
 var<workgroup> reduce_b: array<f32, 64>;
+var<workgroup> plddt_logits: array<f32, ${dense * PLDDT_BINS}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -886,13 +912,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_S);
   let squares_total = reduce_b[0];
   ${variance === "fast"
@@ -910,10 +941,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   reduce_a[local] = centered;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; }
+  workgroupBarrier();
   let variance = reduce_a[0] / f32(C_S);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();
@@ -927,34 +966,39 @@ ${headNorm ? `    let centered = (single[base + c] - mean) * inverse_std;
   }
   workgroupBarrier();
 
-  // 🔴 ONE DISTRIBUTION PER ATOM SLOT. The projection is (C_S, DENSE, BINS).
+  // 🔴 ONE DISTRIBUTION PER ATOM SLOT. The projection is (C_S, DENSE, BINS):
+  // parallelise across all DENSE * PLDDT_BINS outputs first so all 64 lanes
+  // participate and read weights coalesced, then reduce each slot's 50 bins.
+  for (var sb = local; sb < DENSE * PLDDT_BINS; sb += 64u) {
+    var logit = 0.0;
+    for (var c = 0u; c < C_S; c += 1u) {
+      logit += plddt_norm[c] * weights[W_PLDDT + c * DENSE * PLDDT_BINS + sb];
+    }
+    plddt_logits[sb] = logit;
+  }
+  for (var sb2 = local; sb2 < DENSE * 2u; sb2 += 64u) {
+    var logit = 0.0;
+    for (var c = 0u; c < C_S; c += 1u) {
+      logit += resolved_norm[c] * weights[W_RESOLVED + c * DENSE * 2u + sb2];
+    }
+    resolved[token * DENSE * 2u + sb2] = logit;
+  }
+  workgroupBarrier();
+
   for (var slot = local; slot < DENSE; slot += 64u) {
-    var values: array<f32, ${PLDDT_BINS}>;
+    let slot_base = slot * PLDDT_BINS;
     var largest = -3.0e38;
     for (var b = 0u; b < PLDDT_BINS; b += 1u) {
-      var logit = 0.0;
-      for (var c = 0u; c < C_S; c += 1u) {
-        logit += plddt_norm[c] * weights[W_PLDDT + c * DENSE * PLDDT_BINS + slot * PLDDT_BINS + b];
-      }
-      values[b] = logit;
-      largest = max(largest, logit);
+      largest = max(largest, plddt_logits[slot_base + b]);
     }
     var total_p = 0.0;
     var weighted = 0.0;
     for (var b = 0u; b < PLDDT_BINS; b += 1u) {
-      let probability = exp(values[b] - largest);
+      let probability = exp(plddt_logits[slot_base + b] - largest);
       total_p += probability;
       weighted += probability * PLDDT_CENTRES[b];
     }
     plddt[token * DENSE + slot] = 100.0 * weighted / total_p;
-
-    for (var b = 0u; b < 2u; b += 1u) {
-      var logit = 0.0;
-      for (var c = 0u; c < C_S; c += 1u) {
-        logit += resolved_norm[c] * weights[W_RESOLVED + c * DENSE * 2u + slot * 2u + b];
-      }
-      resolved[(token * DENSE + slot) * 2u + b] = logit;
-    }
   }
 }`;
 

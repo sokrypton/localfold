@@ -71,6 +71,7 @@ ${tmPerBin === null ? "" : `@group(0) @binding(5) var<storage, read_write> tm: a
 const TM_PER_BIN = array<f32, ${bins}>(${Array.from(tmPerBin).join(", ")});`}
 
 var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> row_buf: array<f32, CHANNELS>;
 
 fn source(row: u32, channel: u32) -> f32 {
 ${symmetrise
@@ -83,20 +84,24 @@ ${symmetrise
 fn total_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
 fn largest_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] = max(reduce[lane], reduce[lane + stride]); }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
+  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
   return reduce[0];
 }
 
@@ -108,46 +113,46 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let lane = local.x;
 
   var partial = 0.0;
-  for (var c = lane; c < CHANNELS; c += LANES) { partial += source(row, c); }
+  for (var c = lane; c < CHANNELS; c += LANES) {
+    let v = source(row, c);
+    row_buf[c] = v;
+    partial += v;
+  }
   let mean = total_of(lane, partial) / f32(CHANNELS);
   workgroupBarrier();
   var squares = 0.0;
   for (var c = lane; c < CHANNELS; c += LANES) {
-    let d = source(row, c) - mean;
+    let d = row_buf[c] - mean;
     squares += d * d;
   }
   let inverse_std = inverseSqrt(total_of(lane, squares) / f32(CHANNELS) + EPSILON);
   workgroupBarrier();
+  for (var c = lane; c < CHANNELS; c += LANES) {
+    row_buf[c] = (row_buf[c] - mean) * inverse_std * scale[c] + offset[c];
+  }
+  workgroupBarrier();
 
-  // The logits this lane owns, and the running softmax over them. A lane holds
-  // ceil(BINS/LANES) of them; at OpenDDE's 64 bins that is exactly one, so the
-  // two passes below read the same value twice rather than storing an array
-  // this shader would have to index dynamically.
-  var lane_largest = -3.4e38;
-  for (var b = lane; b < BINS; b += LANES) {
+  // The logits this lane owns, and the running softmax over them.
+  let has_bin = lane < BINS;
+  var my_logit = -3.4e38;
+  if (has_bin) {
     var logit = 0.0;
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      logit += ((source(row, c) - mean) * inverse_std * scale[c] + offset[c])
-        * projection[c * BINS + b];
+      logit += row_buf[c] * projection[c * BINS + lane];
     }
-    lane_largest = max(lane_largest, logit);
+    my_logit = logit;
   }
-  let peak = largest_of(lane, lane_largest);
+  let peak = largest_of(lane, my_logit);
   workgroupBarrier();
 
   var lane_total = 0.0;
   var lane_weighted = 0.0;
 ${tmPerBin === null ? "" : "  var lane_tm = 0.0;"}
-  for (var b = lane; b < BINS; b += LANES) {
-    var logit = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      logit += ((source(row, c) - mean) * inverse_std * scale[c] + offset[c])
-        * projection[c * BINS + b];
-    }
-    let value = exp(logit - peak);
-    lane_total += value;
-    lane_weighted += value * (MIN_BIN + BIN_WIDTH * (f32(b) + 0.5));
-${tmPerBin === null ? "" : "    lane_tm += value * TM_PER_BIN[b];"}
+  if (has_bin) {
+    let value = exp(my_logit - peak);
+    lane_total = value;
+    lane_weighted = value * (MIN_BIN + BIN_WIDTH * (f32(lane) + 0.5));
+${tmPerBin === null ? "" : "    lane_tm = value * TM_PER_BIN[lane];"}
   }
   let denominator = total_of(lane, lane_total);
   workgroupBarrier();
@@ -249,24 +254,29 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(5) var<storage, read_write> expected: array<f32>;
 
 var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> row_buf: array<f32, CHANNELS>;
 
 fn total_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
 fn largest_of(lane: u32, value: f32) -> f32 {
   reduce[lane] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (lane < stride) { reduce[lane] = max(reduce[lane], reduce[lane + stride]); }
-    workgroupBarrier();
-  }
+  if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
+  if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
+  if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
+  if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
+  if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
+  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
   return reduce[0];
 }
 
@@ -280,46 +290,49 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let matrix = u32(placement[ATOMS + atom]) * CHANNELS * BINS;
 
   var partial = 0.0;
-  for (var c = lane; c < CHANNELS; c += LANES) { partial += single[base + c]; }
+  for (var c = lane; c < CHANNELS; c += LANES) {
+    let v = single[base + c];
+    row_buf[c] = v;
+    partial += v;
+  }
   let mean = total_of(lane, partial) / f32(CHANNELS);
   workgroupBarrier();
   var squares = 0.0;
   for (var c = lane; c < CHANNELS; c += LANES) {
-    let d = single[base + c] - mean;
+    let d = row_buf[c] - mean;
     squares += d * d;
   }
   let inverse_std = inverseSqrt(total_of(lane, squares) / f32(CHANNELS) + EPSILON);
   workgroupBarrier();
+  for (var c = lane; c < CHANNELS; c += LANES) {
+    row_buf[c] = (row_buf[c] - mean) * inverse_std * scale[c] + offset[c];
+  }
+  workgroupBarrier();
 
-  var lane_largest = -3.4e38;
-  for (var b = lane; b < BINS; b += LANES) {
+  let has_bin = lane < BINS;
+  var my_logit = -3.4e38;
+  if (has_bin) {
     var logit = 0.0;
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      logit += ((single[base + c] - mean) * inverse_std * scale[c] + offset[c])
-        * table[matrix + c * BINS + b];
+      logit += row_buf[c] * table[matrix + c * BINS + lane];
     }
-    lane_largest = max(lane_largest, logit);
+    my_logit = logit;
   }
-  let peak = largest_of(lane, lane_largest);
+  let peak = largest_of(lane, my_logit);
   workgroupBarrier();
 
   var lane_total = 0.0;
   var lane_weighted = 0.0;
-  for (var b = lane; b < BINS; b += LANES) {
-    var logit = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      logit += ((single[base + c] - mean) * inverse_std * scale[c] + offset[c])
-        * table[matrix + c * BINS + b];
-    }
-    let value = exp(logit - peak);
-    lane_total += value;
+  if (has_bin) {
+    let value = exp(my_logit - peak);
+    lane_total = value;
     // 🔴 TWO REDUCTIONS, TWO MEANINGS. pLDDT is a softmax against BIN CENTRES
     // over [0, 1], scaled by 100 on the host; "resolved" is the probability of
     // the second of two bins, which is the same sum with the bin's INDEX as its
     // value. Reading either on the other's grid gives a number in the right
     // range and the wrong place.
-    lane_weighted += value * ${scoreBins === "index"
-      ? "f32(b)" : `(${(1 / bins).toExponential(9)} * (f32(b) + 0.5))`};
+    lane_weighted = value * ${scoreBins === "index"
+      ? "f32(lane)" : `(${(1 / bins).toExponential(9)} * (f32(lane) + 0.5))`};
   }
   let denominator = total_of(lane, lane_total);
   workgroupBarrier();

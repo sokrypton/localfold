@@ -85,10 +85,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   best[local.x] = mine;
   workgroupBarrier();
-  for (var stride = ${WORKGROUP / 2}u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { best[local.x] = max(best[local.x], best[local.x + stride]); }
-    workgroupBarrier();
-  }
+  if (local.x < 32u) { best[local.x] = max(best[local.x], best[local.x + 32u]); }
+  workgroupBarrier();
+  if (local.x < 16u) { best[local.x] = max(best[local.x], best[local.x + 16u]); }
+  workgroupBarrier();
+  if (local.x < 8u) { best[local.x] = max(best[local.x], best[local.x + 8u]); }
+  workgroupBarrier();
+  if (local.x < 4u) { best[local.x] = max(best[local.x], best[local.x + 4u]); }
+  workgroupBarrier();
+  if (local.x < 2u) { best[local.x] = max(best[local.x], best[local.x + 2u]); }
+  workgroupBarrier();
+  if (local.x < 1u) { best[local.x] = max(best[local.x], best[local.x + 1u]); }
+  workgroupBarrier();
   if (local.x == 0u) {
     assignments[p.output_offset + row] = 0xffffu - (best[0] & 0xffffu);
   }

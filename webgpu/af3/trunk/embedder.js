@@ -272,13 +272,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_Z);
   ${variance === "fast"
     ? "let variance = reduce_b[0] / f32(C_Z) - mean * mean;"
@@ -295,10 +300,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   reduce_a[local] = centered;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; }
+  workgroupBarrier();
   let variance = reduce_a[0] / f32(C_Z);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();
@@ -433,13 +446,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  workgroupBarrier();
   let mean = reduce_a[0] / f32(C_S);
   ${variance === "fast"
     ? "let variance = reduce_b[0] / f32(C_S) - mean * mean;"
@@ -456,10 +474,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   reduce_a[local] = centered;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; }
+  workgroupBarrier();
   let variance = reduce_a[0] / f32(C_S);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();

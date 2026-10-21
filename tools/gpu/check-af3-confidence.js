@@ -48,7 +48,7 @@ function relativeRms(actual, expected) {
 
 export async function main(device, args) {
   const tokens = Number(option(args, "n", "24"));
-  const store = await openAf3Store();
+  const store = await openAf3Store(option(args, "model", undefined));
   const weights = await confidenceWeights(store);
   const blockCount = Number(option(args, "blocks", "4"));
   weights.blocks = weights.blocks.slice(0, blockCount);

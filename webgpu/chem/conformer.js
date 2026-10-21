@@ -156,26 +156,27 @@ fn totalError(local: u32, useTrial: bool) -> f32 {
   partial[local] = sum;
   workgroupBarrier();
   // A tree reduction, which is where the f32 sum order differs from the host's.
-  var stride = LANES / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (local < stride) { partial[local] = partial[local] + partial[local + stride]; }
-    workgroupBarrier();
-    stride = stride / 2u;
-  }
+  if (local < 32u) { partial[local] = partial[local] + partial[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { partial[local] = partial[local] + partial[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { partial[local] = partial[local] + partial[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { partial[local] = partial[local] + partial[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { partial[local] = partial[local] + partial[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { partial[local] = partial[local] + partial[local + 1u]; }
+  workgroupBarrier();
   return partial[0];
 }
 
 fn triangleRow(flat: u32) -> u32 {
-  // The largest i with i*(i-1)/2 <= flat, by search - N is small and this is
-  // cheaper than the floating-point inverse, which is off by one near a
-  // boundary and silently pairs an atom with itself.
-  var i = 1u;
-  loop {
-    if (i >= N) { break; }
-    if ((i + 1u) * i / 2u > flat) { break; }
-    i = i + 1u;
-  }
+  // The largest i with i*(i-1)/2 <= flat: closed-form estimate plus exact
+  // integer boundary corrections, so no atom is ever paired with itself.
+  var i = clamp(u32(0.5 * (1.0 + sqrt(f32(1u + 8u * flat)))), 1u, N - 1u);
+  if (i > 1u && i * (i - 1u) / 2u > flat) { i = i - 1u; }
+  if (i + 1u < N && (i + 1u) * i / 2u <= flat) { i = i + 1u; }
   return i;
 }
 
@@ -234,13 +235,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     partial[local] = mine;
     workgroupBarrier();
-    var stride = LANES / 2u;
-    loop {
-      if (stride == 0u) { break; }
-      if (local < stride) { partial[local] = partial[local] + partial[local + stride]; }
-      workgroupBarrier();
-      stride = stride / 2u;
-    }
+    if (local < 32u) { partial[local] = partial[local] + partial[local + 32u]; }
+    workgroupBarrier();
+    if (local < 16u) { partial[local] = partial[local] + partial[local + 16u]; }
+    workgroupBarrier();
+    if (local < 8u) { partial[local] = partial[local] + partial[local + 8u]; }
+    workgroupBarrier();
+    if (local < 4u) { partial[local] = partial[local] + partial[local + 4u]; }
+    workgroupBarrier();
+    if (local < 2u) { partial[local] = partial[local] + partial[local + 2u]; }
+    workgroupBarrier();
+    if (local < 1u) { partial[local] = partial[local] + partial[local + 1u]; }
+    workgroupBarrier();
     let size = sqrt(max(partial[0], 1e-30));
     workgroupBarrier();
 
