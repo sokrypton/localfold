@@ -46,8 +46,32 @@ inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in,
 }
 
 // ---------------------------------------------------------------- elementwise
+// Exact double-precision range-reduced sin/cos to float32 without Payne-Hanek stack frame (STACK:0).
+// Valid for |angle| <= 1e7 rad with 0-ULP float32 error vs (float)sin(angle), (float)cos(angle).
+__device__ __forceinline__ void fastSincosD(double angle, float* sOut, float* cOut) {
+  constexpr double INV_PIO2 = 0x1.45f306dc9c883p-1;   // 2 / pi
+  constexpr double PIO2_HI  = 0x1.921fb54442d18p+0;   // pi / 2 high 53 bits
+  constexpr double PIO2_LO  = 0x1.1a62633145c07p-54;  // pi / 2 low 53 bits
+  double kf = nearbyint(angle * INV_PIO2);
+  long long q = (long long)kf;
+  double r = fma(-kf, PIO2_HI, angle) - kf * PIO2_LO;
+  double r2 = r * r;
+  double s = (((((-0x1.ae64567f544e4p-26 * r2 + 0x1.71de3a556c734p-19) * r2
+                 - 0x1.a01a01a01a01ap-13) * r2 + 0x1.1111111111111p-7) * r2
+               - 0x1.5555555555555p-3) * r2) * r + r;
+  double c = (((((-0x1.27e4fb7789f5cp-22 * r2 + 0x1.a01a01a01a01ap-16) * r2
+                 - 0x1.6c16c16c16c17p-10) * r2 + 0x1.5555555555555p-5) * r2
+               - 0x1.0000000000000p-1) * r2) + 1.0;
+  double sinA = (q & 1) ? c : s;
+  double cosA = (q & 1) ? -s : c;
+  if (q & 2) { sinA = -sinA; cosA = -cosA; }
+  *sOut = (float)sinA;
+  *cOut = (float)cosA;
+}
+
 inline void addBias(float* y, const float* b, size_t rows, int C) {
-  addBiasK<<<blocks(rows * C), 256, 0, STREAM>>>(y, b, rows, C);
+  size_t n = ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) ? rows * (size_t)(C >> 2) : rows * C;
+  addBiasK<<<blocks(n), 256, 0, STREAM>>>(y, b, rows, C);
 }
 // LayerNorm over the last axis, a warp a row; offset may be null, scale may be null (affine-free)
 __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const float* scale, const float* offset,
@@ -70,16 +94,85 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
     y[row * ldy + c] = n;
   }
 }
+template <int MAX_K, bool EXACT>
+__global__ void __launch_bounds__(256, (MAX_K <= 16 && EXACT) ? 4 : 2)
+layerNormRegK(const float* __restrict__ x, float* __restrict__ y, size_t rows, int C,
+              const float* __restrict__ scale, const float* __restrict__ offset, float eps, int ldx, int ldy) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * ldx;
+  float* yr = y + row * ldy;
+  float xv[MAX_K];
+  float s = 0;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int c = k * 32 + lane;
+    float val = (EXACT || c < C) ? __ldg(xr + c) : 0.f;
+    xv[k] = val;
+    s += val;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / (EXACT ? (float)(MAX_K * 32) : (float)C), v = 0;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int c = k * 32 + lane;
+    float d = (EXACT || c < C) ? (xv[k] - mean) : 0.f;
+    v += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / (EXACT ? (float)(MAX_K * 32) : (float)C) + eps);
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int c = k * 32 + lane;
+    if (EXACT || c < C) {
+      float n = (xv[k] - mean) * inv;
+      if (scale) n *= __ldg(scale + c);
+      if (offset) n += __ldg(offset + c);
+      yr[c] = n;
+    }
+  }
+}
 inline void layerNorm(const float* x, float* y, size_t rows, int C, const float* scale, const float* offset,
                       float eps = 1e-5f, int ldx = 0, int ldy = 0) {
-  layerNormK<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, ldx ? ldx : C,
-                                                              ldy ? ldy : C);
+  unsigned g = (unsigned)((rows + 7) / 8);
+  int lx = ldx ? ldx : C, ly = ldy ? ldy : C;
+  switch (C) {
+    case 128:  layerNormRegK<4,  true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 256:  layerNormRegK<8,  true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 384:  layerNormRegK<12, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 512:  layerNormRegK<16, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 768:  layerNormRegK<24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 960:  layerNormRegK<30, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 1152: layerNormRegK<36, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    default:
+      if (C <= 512) layerNormRegK<16, false><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
+      else layerNormK<<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
+  }
 }
 __device__ __forceinline__ float siluF(float x) { return x / (1.f + expf(-x)); }
 __device__ __forceinline__ float geluF(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678118654752f)); }
 
-__global__ void swigluK(const float* h, float* g, size_t rows, int F) {
+__global__ void swigluK(const float* __restrict__ h, float* __restrict__ g, size_t rows, int F) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((F & 3) == 0 && (((uintptr_t)h | (uintptr_t)g) & 15) == 0) {
+    int f4 = F >> 2;
+    size_t n4 = rows * (size_t)f4;
+    if (t >= n4) return;
+    size_t r; int c4;
+    if (n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, uf = (unsigned)f4, q = u / uf;
+      r = q; c4 = (int)(u - q * uf);
+    } else {
+      r = t / f4; c4 = (int)(t % f4);
+    }
+    const float4* hr = reinterpret_cast<const float4*>(h + r * 2 * F);
+    float4 a = __ldg(hr + c4), b = __ldg(hr + f4 + c4);
+    reinterpret_cast<float4*>(g)[t] = make_float4(siluF(a.x) * b.x, siluF(a.y) * b.y, siluF(a.z) * b.z, siluF(a.w) * b.w);
+    return;
+  }
   if (t >= rows * F) return;
   size_t r = t / F; int c = (int)(t % F);
   g[t] = siluF(h[r * 2 * F + c]) * h[r * 2 * F + F + c];

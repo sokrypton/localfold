@@ -42,19 +42,40 @@ __global__ void layerNormK(const float* x, float* y, int rows, int C, const floa
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) y[(size_t)row * C + c] = (xr[c] - mean) * inv * scale[c] + offset[c];
 }
-__global__ void biasK(float* y, const float* b, size_t rows, int C) {
+__global__ void biasK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 bv = __ldg(reinterpret_cast<const float4*>(b) + (t % (size_t)c4));
+      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+    }
+    return;
+  }
   if (t < rows * C) y[t] += b[t % C];
 }
-__global__ void biasGeluK(float* y, const float* b, size_t rows, int C) {
+__global__ void biasGeluK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 bv = __ldg(reinterpret_cast<const float4*>(b) + (t % (size_t)c4));
+      auto g = [](float v) { return 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); };
+      reinterpret_cast<float4*>(y)[t] = make_float4(g(yv.x + bv.x), g(yv.y + bv.y), g(yv.z + bv.z), g(yv.w + bv.w));
+    }
+    return;
+  }
   if (t < rows * C) { float v = y[t] + b[t % C]; y[t] = 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 }
 // rotary on q and k inside the packed [rows, 3C] buffer: channel d with d + 32 of each 64-wide head
 __global__ void ropeK(float* qkv, int rows, int heads, int C) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * heads * 32 * 2) return;
-  int d = t % 32, h = (t / 32) % heads, row = (t / (32 * heads)) % rows, which = t / (32 * heads * rows);
+  int d = t & 31, h = (t >> 5) % heads, row = (t / (32 * heads)) % rows, which = t / (32 * heads * rows);
   // (the frequency ROUNDED TO FLOAT16, as chai's traced ESM2 stores rot_emb.inv_freq - an fp16 buffer - and the angle a
   // float32 product: af3-any-model's _rope half_inv_freq, 1e-2 against the trace exact, 2e-5 rounded)
   const float inv = __half2float(__float2half_rn(1.0f / powf(10000.0f, (float)(2 * d) / 64.0f)));
@@ -64,9 +85,49 @@ __global__ void ropeK(float* qkv, int rows, int heads, int C) {
   p[0] = a * (float)c - b * (float)s;
   p[32] = a * (float)s + b * (float)c;
 }
-__global__ void softmaxK(float* S, int rows, float scale) {
+__global__ void softmaxK(float* __restrict__ S, int rows, float scale) {
   float* s = S + (size_t)blockIdx.x * rows;
   __shared__ float red[32];
+  if (rows <= 1024) {
+    float sv[4];
+    float m = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < rows) { float v = s[j] * scale; sv[k] = v; m = fmaxf(m, v); }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -INFINITY;
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o));
+      if (threadIdx.x == 0) red[0] = v; }
+    __syncthreads(); m = red[0];
+    float sum = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < rows) { float e = expf(sv[k] - m); sv[k] = e; sum += e; }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      if (threadIdx.x == 0) red[0] = v; }
+    __syncthreads();
+    float inv = 1.f / red[0];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < rows) s[j] = sv[k] * inv;
+    }
+    return;
+  }
   float m = -INFINITY;
   for (int j = threadIdx.x; j < rows; j += blockDim.x) { float v = s[j] * scale; s[j] = v; m = fmaxf(m, v); }
   for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
