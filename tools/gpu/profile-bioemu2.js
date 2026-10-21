@@ -26,7 +26,7 @@ export async function main(device, args) {
   // pass over a stored Z (fuseCombine's control)
   const net = new Bioemu2Gpu(device, read, { half: true, trunkPrecision: "device", couplingSplit: option(args, "split", "on") !== "off",
     fuseCombine: option(args, "fuse", "on") !== "off", batchConditioning: option(args, "batch-cond", "on") !== "off", fuseWindow: option(args, "fuse-win", "on") !== "off", fuseTokenAttention: option(args, "fuse-tok", "on") !== "off",
-    condGroupMiB: Number(option(args, "cond-mib", "64")) });
+    condGroupMiB: Number(option(args, "cond-mib", "96")) });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: the original GEMM, the control)
   net.ops.b16Panels = option(args, "b16", "on") !== "off";   // (--b16=off: the weight panels staged in float32)
   net.ops.fuseSwiglu = option(args, "fuse-swiglu", "on") !== "off";   // (--fuse-swiglu=off: the SwiGLUs a pass of their own)

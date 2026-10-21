@@ -18,6 +18,7 @@
  * and whole rows of 65535, and an unguarded tail clamps on Metal.
  */
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { planBlockUpload, runBlockUpload } from "../weights/quantised-upload.js";
 
 const MAX_X = 65535;
 const STORAGE = 0x80;      // GPUBufferUsage.STORAGE
@@ -194,43 +195,50 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   var acc_3_0 = vec4<f32>(0.0); var acc_3_1 = vec4<f32>(0.0);
   let kStart = select(0u, b1 * p.split, p.split > 0u);
   let kEnd = select(p.k, min(p.k, kStart + p.split), p.split > 0u);
+  let kkA = li % ${BK}u;
+  let r4A = li / ${BK}u;
+  let rowA0 = m0 + r4A * 4u;
+  let addrA0 = baseA + rowA0 * p.sAm;
+  let fullA = rowA0 + 3u < p.m;
+  let taWrite = kkA * 17u + r4A;
+  ${wordB ? `let kkB = (li % ${BK / 2}u) * 2u;
+  let r4B = li / ${BK / 2}u;
+  let rowB0 = n0 + r4B * 4u;
+  let bRowBase = baseB + bRow(rowB0) * p.sBn;
+  let sBnHalf = p.sBn / 2u;
+  let fullB = rowB0 + 3u < p.n;
+  let tbWrite0 = kkB * 33u + r4B;
+  let tbWrite1 = (kkB + 1u) * 33u + r4B;` : ""}
   for (var k0 = kStart; k0 < kEnd; k0 += ${BK}u) {
     // 🔴 EVERY PANEL WRITE IS A WHOLE vec4, one lane's: lanes writing different components of one shared vec4 race -
     // a component store can be a read-modify-write of the vector, and it was (every stage wrong from s_inputs on, 0.61).
     // A lane takes four consecutive rows at one k, so consecutive lanes still read consecutive k (coalesced).
     // A's panel: ${16 * BK} vec4s
     {
-      let kk = li % ${BK}u;
-      let r4 = li / ${BK}u;
-      let k = k0 + kk;
+      let k = k0 + kkA;
       var v = vec4<f32>(0.0);
       if (inBatch && k < kEnd) {
-        let row0 = m0 + r4 * 4u;
-        let addr0 = baseA + row0 * p.sAm + k * p.sAk;
-        if (row0 + 3u < p.m) {
+        let addr0 = addrA0 + k * p.sAk;
+        if (fullA) {
           v = vec4<f32>(a[addr0], a[addr0 + p.sAm], a[addr0 + 2u * p.sAm], a[addr0 + 3u * p.sAm]);
         } else {
-          if (row0 < p.m) { v.x = a[addr0]; }
-          if (row0 + 1u < p.m) { v.y = a[addr0 + p.sAm]; }
-          if (row0 + 2u < p.m) { v.z = a[addr0 + 2u * p.sAm]; }
-          if (row0 + 3u < p.m) { v.w = a[addr0 + 3u * p.sAm]; }
+          if (rowA0 < p.m) { v.x = a[addr0]; }
+          if (rowA0 + 1u < p.m) { v.y = a[addr0 + p.sAm]; }
+          if (rowA0 + 2u < p.m) { v.z = a[addr0 + 2u * p.sAm]; }
+          if (rowA0 + 3u < p.m) { v.w = a[addr0 + 3u * p.sAm]; }
         }
       }
-      ta[kk * 17u + r4] = vec4<${E}>(v);
+      ta[taWrite] = vec4<${E}>(v);
     }
     // B's panel: ${32 * BK} vec4s${wordB ? ", each lane a packed pair of k for its four rows" : ""}
     ${wordB ? `{
-      let kk = (li % ${BK / 2}u) * 2u;
-      let r4 = li / ${BK / 2}u;
-      let k = k0 + kk;
+      let k = k0 + kkB;
       var lo = vec4<${EB}>(0.0);
       var hi = vec4<${EB}>(0.0);
       if (inBatch && k < kEnd) {
-        let row0 = n0 + r4 * 4u;
         let hasHi = k + 1u < kEnd;
-        let bAddr0 = (baseB + bRow(row0) * p.sBn + k) / 2u;
-        let sBnHalf = p.sBn / 2u;
-        ${b16 ? `if (row0 + 3u < p.n) {
+        let bAddr0 = (bRowBase + k) / 2u;
+        ${b16 ? `if (fullB) {
           let p0 = bitcast<vec2<f16>>(b[bAddr0]);
           let p1 = bitcast<vec2<f16>>(b[bAddr0 + sBnHalf]);
           let p2 = bitcast<vec2<f16>>(b[bAddr0 + 2u * sBnHalf]);
@@ -238,11 +246,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           lo = vec4<f16>(p0.x, p1.x, p2.x, p3.x);
           if (hasHi) { hi = vec4<f16>(p0.y, p1.y, p2.y, p3.y); }
         } else {
-          if (row0 < p.n) { let p0 = bitcast<vec2<f16>>(b[bAddr0]); lo.x = p0.x; if (hasHi) { hi.x = p0.y; } }
-          if (row0 + 1u < p.n) { let p1 = bitcast<vec2<f16>>(b[bAddr0 + sBnHalf]); lo.y = p1.x; if (hasHi) { hi.y = p1.y; } }
-          if (row0 + 2u < p.n) { let p2 = bitcast<vec2<f16>>(b[bAddr0 + 2u * sBnHalf]); lo.z = p2.x; if (hasHi) { hi.z = p2.y; } }
-          if (row0 + 3u < p.n) { let p3 = bitcast<vec2<f16>>(b[bAddr0 + 3u * sBnHalf]); lo.w = p3.x; if (hasHi) { hi.w = p3.y; } }
-        }` : `if (row0 + 3u < p.n) {
+          if (rowB0 < p.n) { let p0 = bitcast<vec2<f16>>(b[bAddr0]); lo.x = p0.x; if (hasHi) { hi.x = p0.y; } }
+          if (rowB0 + 1u < p.n) { let p1 = bitcast<vec2<f16>>(b[bAddr0 + sBnHalf]); lo.y = p1.x; if (hasHi) { hi.y = p1.y; } }
+          if (rowB0 + 2u < p.n) { let p2 = bitcast<vec2<f16>>(b[bAddr0 + 2u * sBnHalf]); lo.z = p2.x; if (hasHi) { hi.z = p2.y; } }
+          if (rowB0 + 3u < p.n) { let p3 = bitcast<vec2<f16>>(b[bAddr0 + 3u * sBnHalf]); lo.w = p3.x; if (hasHi) { hi.w = p3.y; } }
+        }` : `if (fullB) {
           let p0 = unpack2x16float(b[bAddr0]);
           let p1 = unpack2x16float(b[bAddr0 + sBnHalf]);
           let p2 = unpack2x16float(b[bAddr0 + 2u * sBnHalf]);
@@ -250,14 +258,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           lo = vec4<f32>(p0.x, p1.x, p2.x, p3.x);
           if (hasHi) { hi = vec4<f32>(p0.y, p1.y, p2.y, p3.y); }
         } else {
-          if (row0 < p.n) { let p0 = unpack2x16float(b[bAddr0]); lo.x = p0.x; if (hasHi) { hi.x = p0.y; } }
-          if (row0 + 1u < p.n) { let p1 = unpack2x16float(b[bAddr0 + sBnHalf]); lo.y = p1.x; if (hasHi) { hi.y = p1.y; } }
-          if (row0 + 2u < p.n) { let p2 = unpack2x16float(b[bAddr0 + 2u * sBnHalf]); lo.z = p2.x; if (hasHi) { hi.z = p2.y; } }
-          if (row0 + 3u < p.n) { let p3 = unpack2x16float(b[bAddr0 + 3u * sBnHalf]); lo.w = p3.x; if (hasHi) { hi.w = p3.y; } }
+          if (rowB0 < p.n) { let p0 = unpack2x16float(b[bAddr0]); lo.x = p0.x; if (hasHi) { hi.x = p0.y; } }
+          if (rowB0 + 1u < p.n) { let p1 = unpack2x16float(b[bAddr0 + sBnHalf]); lo.y = p1.x; if (hasHi) { hi.y = p1.y; } }
+          if (rowB0 + 2u < p.n) { let p2 = unpack2x16float(b[bAddr0 + 2u * sBnHalf]); lo.z = p2.x; if (hasHi) { hi.z = p2.y; } }
+          if (rowB0 + 3u < p.n) { let p3 = unpack2x16float(b[bAddr0 + 3u * sBnHalf]); lo.w = p3.x; if (hasHi) { hi.w = p3.y; } }
         }`}
       }
-      tb[kk * 33u + r4] = lo;
-      tb[(kk + 1u) * 33u + r4] = hi;
+      tb[tbWrite0] = lo;
+      tb[tbWrite1] = hi;
     }` : `for (var e = 0u; e < ${32 * BK / 256}u; e += 1u) {
       let slot = li + e * 256u;
       let kk = slot % ${BK}u;
@@ -453,7 +461,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   red[li] = mx;
   workgroupBarrier();
-  for (var h = 32u; h > 0u; h >>= 1u) { if (li < h) { red[li] = max(red[li], red[li + h]); } workgroupBarrier(); }
+  if (li < 32u) { red[li] = max(red[li], red[li + 32u]); } workgroupBarrier();
+  if (li < 16u) { red[li] = max(red[li], red[li + 16u]); } workgroupBarrier();
+  if (li < 8u) { red[li] = max(red[li], red[li + 8u]); } workgroupBarrier();
+  if (li < 4u) { red[li] = max(red[li], red[li + 4u]); } workgroupBarrier();
+  if (li < 2u) { red[li] = max(red[li], red[li + 2u]); } workgroupBarrier();
+  if (li == 0u) { red[0] = max(red[0], red[1]); } workgroupBarrier();
   let top = red[0];
   workgroupBarrier();
   var s = 0.0;
@@ -465,7 +478,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
   red[li] = s;
   workgroupBarrier();
-  for (var h = 32u; h > 0u; h >>= 1u) { if (li < h) { red[li] += red[li + h]; } workgroupBarrier(); }
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
   let total = red[0];
   if (!live) { return; }
   for (var j = li; j < p.len; j += 64u) {
@@ -572,6 +590,42 @@ export class Bioemu2Ops {
     uniform.destroy();
     buffer.half = true;
     return buffer;
+  }
+
+  /**
+   * One or more contiguous weight tensors uploaded directly from their bundle sources, decoding quantised blocks
+   * (int5/int8) on the device into f16 or f32 without expanding to Float32Array on the host.
+   */
+  async weightFromSources(label, sources, half, decode) {
+    let offset = 0;
+    const entries = sources.map((s, idx) => {
+      const length = (s.record?.shape ?? []).reduce((a, b) => a * b, 1);
+      const name = `${label}:${idx}`;
+      const thunk = { store: { tensorSource: () => s }, tensorName: name, first: 0, count: length };
+      const entry = { name, thunk, offset, length };
+      offset += length;
+      return entry;
+    });
+    const dest = half && offset % 2 === 0 ? "f16" : "f32";
+    const planned = offset > 0 ? planBlockUpload(entries, dest) : undefined;
+    if (planned && planned.host.length === 0 && planned.gpu.params.length > 0) {
+      const words = dest === "f32" ? offset : Math.ceil(offset / 2);
+      const buffer = this.buffer(label, words);
+      this.allocated.pop();
+      this.bytes -= buffer.size;
+      this.weightBuffers.push(buffer);
+      this.weightBytes += buffer.size;
+      if (dest === "f16") buffer.half = true;
+      const release = await runBlockUpload(this.device, planned.gpu, buffer);
+      void this.device.queue.onSubmittedWorkDone().then(release);
+      return buffer;
+    }
+    const parts = sources.map((s) => decode(s));
+    if (parts.length === 1) return this.weight(label, parts[0], half && parts[0].length % 2 === 0);
+    const all = new Float32Array(offset);
+    let at = 0;
+    for (const v of parts) { all.set(v, at); at += v.length; }
+    return this.weight(label, all, half && all.length % 2 === 0);
   }
 
   /** A slice of `buffer`, `count` floats from float `at`, bound where a buffer would be (the offset 256-byte aligned). */
@@ -701,8 +755,9 @@ export class Bioemu2Ops {
     const v2 = this.gemmVersion === 2;
     const tiles = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * batches;
     const work = v2 ? 2 : 1;
-    if (batches !== 1 || tiles * work >= 256 || k < 512) return 1;
-    return Math.min(Math.floor(k / 128), Math.ceil((this.splitTarget ?? 128) / (tiles * work)));
+    const target = this.splitTarget ?? 80;
+    if (batches !== 1 || tiles * work >= target || k < 512) return 1;
+    return Math.min(Math.floor(k / 128), Math.ceil(target / (tiles * work)));
   }
 
   /**
@@ -727,24 +782,37 @@ export class Bioemu2Ops {
    * pass computed, in one dispatch a (sample, window, head). 128 lanes, four a query, each holding its query's row; the
    * 128 keys in chunks of 32 with an online softmax. Workgroup memory 16 KiB exactly (q, a chunk's k and v, its
    * logits) - WebGPU's guaranteed floor. The softmax sums in a different order from the three-pass path: ~1e-7.
-   * qkv [S N][3 D] (q's bias added), kvPad [S pad][2 D] (k | v, CTX zero rows each end), out and g [S N][D].
+   * qkv [S N][3 D] or [S N][4 D] (when g is omitted and fused in qkv), kvPad [S pad][2 D] (k | v, CTX zero rows each end).
    */
-  windowAttention({ qkv, kvPad, bias, mask, g, out, S, N, H, pad, alpha }) {
+  windowAttention({ qkv, qBias, kvPad, bias, mask, g, out, S, N, H, pad, alpha, ctx = 48 }) {
     const WQ = 32, WK = 128, HD = 32, D = H * HD, NW = N / WQ;
     if (N % WQ) throw new Error("windowAttention: N is not whole windows");
+    const fusedG = !g;
+    const directKv = !kvPad;
+    const hasQBias = Boolean(qBias);
+    const qkvStride = fusedG ? 4 * D : 3 * D;
     const u = new Uint32Array(8);
     const f = new Float32Array(u.buffer);
     u.set([S, N, NW, pad]);
     f[4] = alpha;
-    return this.step(`win-attn-${H}`, `
+    let nextBind = 2;
+    const kvBind = directKv ? "" : `@group(0) @binding(${nextBind++}) var<storage, read> kv: array<f32>;`;
+    const biasBindIdx = nextBind++;
+    const maskBindIdx = nextBind++;
+    const gBind = fusedG ? "" : `@group(0) @binding(${nextBind++}) var<storage, read> gate: array<f32>;`;
+    const qbBind = hasQBias ? `@group(0) @binding(${nextBind++}) var<storage, read> qBias: array<f32>;` : "";
+    const outBindIdx = nextBind++;
+    const buffers = [qkv, ...(directKv ? [] : [kvPad]), bias, mask, ...(fusedG ? [] : [g]), ...(hasQBias ? [qBias] : []), out];
+    return this.step(`win-attn-${H}${directKv ? "-dkv" : ""}${fusedG ? "-fg" : ""}${hasQBias ? "-qb" : ""}`, `
 struct P { S: u32, N: u32, NW: u32, pad: u32, alpha: f32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> qkv: array<f32>;
-@group(0) @binding(2) var<storage, read> kv: array<f32>;
-@group(0) @binding(3) var<storage, read> bias: array<f32>;
-@group(0) @binding(4) var<storage, read> mask: array<i32>;
-@group(0) @binding(5) var<storage, read> gate: array<f32>;
-@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+${kvBind}
+@group(0) @binding(${biasBindIdx}) var<storage, read> bias: array<f32>;
+@group(0) @binding(${maskBindIdx}) var<storage, read> mask: array<i32>;
+${gBind}
+${qbBind}
+@group(0) @binding(${outBindIdx}) var<storage, read_write> out: array<f32>;
 var<workgroup> ks: array<vec4<f32>, 256>;     // [32 keys][32 dims]
 var<workgroup> vs: array<vec4<f32>, 256>;
 var<workgroup> ps: array<f32, 1024>;          // [32 queries][32 keys] this chunk's logits
@@ -759,8 +827,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let qi = li / 4u;
   let sub = li % 4u;
   let qrow = smc * p.N + w * ${WQ}u + qi;
-  let qBase = qrow * ${3 * D}u + h * ${HD}u;
-  ${[0, 1, 2, 3, 4, 5, 6, 7].map((d) => `let q_${d} = vec4<f32>(qkv[qBase + ${d * 4}u], qkv[qBase + ${d * 4 + 1}u], qkv[qBase + ${d * 4 + 2}u], qkv[qBase + ${d * 4 + 3}u]);`).join("\n  ")}
+  let qBase = qrow * ${qkvStride}u + h * ${HD}u;
+  ${hasQBias ? `let qbBase = h * ${HD}u;` : ""}
+  ${[0, 1, 2, 3, 4, 5, 6, 7].map((d) => hasQBias
+    ? `let q_${d} = vec4<f32>(qkv[qBase + ${d * 4}u] + qBias[qbBase + ${d * 4}u], qkv[qBase + ${d * 4 + 1}u] + qBias[qbBase + ${d * 4 + 1}u], qkv[qBase + ${d * 4 + 2}u] + qBias[qbBase + ${d * 4 + 2}u], qkv[qBase + ${d * 4 + 3}u] + qBias[qbBase + ${d * 4 + 3}u]);`
+    : `let q_${d} = vec4<f32>(qkv[qBase + ${d * 4}u], qkv[qBase + ${d * 4 + 1}u], qkv[qBase + ${d * 4 + 2}u], qkv[qBase + ${d * 4 + 3}u]);`).join("\n  ")}
   var m = -3.0e38;
   var l = 0.0;
   var o0 = vec4<f32>(0.0);
@@ -772,9 +843,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       let slot = li + e * 128u;
       let key = slot / 8u;
       let d4 = slot % 8u;
-      let row = (smc * p.pad + w * ${WQ}u + c * 32u + key) * ${2 * D}u + h * ${HD}u + d4 * 4u;
+      ${directKv ? `let kPad = w * ${WQ}u + c * 32u + key;
+      if (kPad >= ${ctx}u && kPad < p.N + ${ctx}u) {
+        let row = (smc * p.N + kPad - ${ctx}u) * ${qkvStride}u + ${D}u + h * ${HD}u + d4 * 4u;
+        ks[slot] = vec4<f32>(qkv[row], qkv[row + 1u], qkv[row + 2u], qkv[row + 3u]);
+        vs[slot] = vec4<f32>(qkv[row + ${D}u], qkv[row + ${D + 1}u], qkv[row + ${D + 2}u], qkv[row + ${D + 3}u]);
+      } else {
+        ks[slot] = vec4<f32>(0.0);
+        vs[slot] = vec4<f32>(0.0);
+      }` : `let row = (smc * p.pad + w * ${WQ}u + c * 32u + key) * ${2 * D}u + h * ${HD}u + d4 * 4u;
       ks[slot] = vec4<f32>(kv[row], kv[row + 1u], kv[row + 2u], kv[row + 3u]);
-      vs[slot] = vec4<f32>(kv[row + ${D}u], kv[row + ${D + 1}u], kv[row + ${D + 2}u], kv[row + ${D + 3}u]);
+      vs[slot] = vec4<f32>(kv[row + ${D}u], kv[row + ${D + 1}u], kv[row + ${D + 2}u], kv[row + ${D + 3}u]);`}
     }
     workgroupBarrier();
     // this lane's 8 keys of the chunk
@@ -813,42 +892,56 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (!live) { return; }
   let ob = qrow * ${D}u + h * ${HD}u + sub * 8u;
   let invL = 1.0 / l;
-  out[ob] = o0.x * invL * gate[ob];
+  ${fusedG ? `let gb = qBase + ${3 * D}u + sub * 8u;
+  out[ob] = o0.x * invL / (1.0 + exp(-qkv[gb]));
+  out[ob + 1u] = o0.y * invL / (1.0 + exp(-qkv[gb + 1u]));
+  out[ob + 2u] = o0.z * invL / (1.0 + exp(-qkv[gb + 2u]));
+  out[ob + 3u] = o0.w * invL / (1.0 + exp(-qkv[gb + 3u]));
+  out[ob + 4u] = o1.x * invL / (1.0 + exp(-qkv[gb + 4u]));
+  out[ob + 5u] = o1.y * invL / (1.0 + exp(-qkv[gb + 5u]));
+  out[ob + 6u] = o1.z * invL / (1.0 + exp(-qkv[gb + 6u]));
+  out[ob + 7u] = o1.w * invL / (1.0 + exp(-qkv[gb + 7u]));` : `out[ob] = o0.x * invL * gate[ob];
   out[ob + 1u] = o0.y * invL * gate[ob + 1u];
   out[ob + 2u] = o0.z * invL * gate[ob + 2u];
   out[ob + 3u] = o0.w * invL * gate[ob + 3u];
   out[ob + 4u] = o1.x * invL * gate[ob + 4u];
   out[ob + 5u] = o1.y * invL * gate[ob + 5u];
   out[ob + 6u] = o1.z * invL * gate[ob + 6u];
-  out[ob + 7u] = o1.w * invL * gate[ob + 7u];
-}`, S * NW * H, [qkv, kvPad, bias, mask, g, out], u);
+  out[ob + 7u] = o1.w * invL * gate[ob + 7u];`}
+}`, S * NW * H, buffers, u);
   }
 
   /**
    * The token stream's attention fused, windowAttention's shape over the whole stream: out[r][h hd + d] = g[r][h hd + d]
    * sum_j softmax_j(q.k_j alpha + bias[h][qi][j]) v_j[d] for one sample's T tokens - the scores GEMM, the softmax, P.V
    * and the gating in one dispatch a (sample, head, block of 32 queries). The keys in chunks of 32 (past T: none), an
-   * online softmax, 16 KiB of workgroup memory at a head of 48. qkv [S T][3 D] (q's bias added), bias [H][T][T].
+   * online softmax, 16 KiB of workgroup memory at a head of 48. qkv [S T][3 D] or [S T][4 D], bias [H][T][T].
    */
   tokenAttention({ qkv, qBias, bias, g, out, S, T, H, hd, alpha }) {
     if (hd % 4) throw new Error("tokenAttention: a head width that is not whole vec4s");
     const D = H * hd, V = hd / 4, VL = V / 4, QB = Math.ceil(T / 32);
     if (V % 4) throw new Error("tokenAttention: a head width that is not four lanes of whole vec4s");
+    const fusedG = !g;
     const hasQBias = Boolean(qBias);
+    const qkvStride = fusedG ? 4 * D : 3 * D;
     const u = new Uint32Array(8);
     const f = new Float32Array(u.buffer);
     u.set([S, T, QB]);
     f[4] = alpha;
     const vIdx = Array.from({ length: V }, (_, i) => i);
     const vlIdx = Array.from({ length: VL }, (_, i) => i);
-    return this.step(`tok-attn-${H}x${hd}${hasQBias ? "-qb" : ""}`, `
+    const gBind = fusedG ? "" : "@group(0) @binding(3) var<storage, read> gate: array<f32>;";
+    const outBindIdx = fusedG ? 3 : 4;
+    const qbBindIdx = fusedG ? 4 : 5;
+    const buffers = [qkv, bias, ...(fusedG ? [] : [g]), out, ...(hasQBias ? [qBias] : [])];
+    return this.step(`tok-attn-${H}x${hd}${fusedG ? "-fg" : ""}${hasQBias ? "-qb" : ""}`, `
 struct P { S: u32, T: u32, QB: u32, pad0: u32, alpha: f32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> qkv: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read> gate: array<f32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
-${hasQBias ? "@group(0) @binding(5) var<storage, read> qBias: array<f32>;" : ""}
+${gBind}
+@group(0) @binding(${outBindIdx}) var<storage, read_write> out: array<f32>;
+${hasQBias ? `@group(0) @binding(${qbBindIdx}) var<storage, read> qBias: array<f32>;` : ""}
 var<workgroup> ks: array<vec4<f32>, ${32 * V}>;     // [32 keys][hd]
 var<workgroup> vs: array<vec4<f32>, ${32 * V}>;
 var<workgroup> ps: array<f32, 1024>;              // [32 queries][32 keys]
@@ -865,7 +958,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let live = sm < p.S && qi < p.T;
   let qic = min(qi, p.T - 1u);
   let qrow = smc * p.T + qic;
-  let qBase = qrow * ${3 * D}u + h * ${hd}u;
+  let qBase = qrow * ${qkvStride}u + h * ${hd}u;
   ${hasQBias ? `let qbBase = h * ${hd}u;` : ""}
   ${vIdx.map((d) => hasQBias
     ? `let q_${d} = vec4<f32>(qkv[qBase + ${d * 4}u] + qBias[qbBase + ${d * 4}u], qkv[qBase + ${d * 4 + 1}u] + qBias[qbBase + ${d * 4 + 1}u], qkv[qBase + ${d * 4 + 2}u] + qBias[qbBase + ${d * 4 + 2}u], qkv[qBase + ${d * 4 + 3}u] + qBias[qbBase + ${d * 4 + 3}u]);`
@@ -885,7 +978,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         var kv = vec4<f32>(0.0);
         var vv = vec4<f32>(0.0);
         if (kt < p.T) {
-          let row = (smc * p.T + kt) * ${3 * D}u + h * ${hd}u + d4 * 4u;
+          let row = (smc * p.T + kt) * ${qkvStride}u + h * ${hd}u + d4 * 4u;
           kv = vec4<f32>(qkv[row + ${D}u], qkv[row + ${D + 1}u], qkv[row + ${D + 2}u], qkv[row + ${D + 3}u]);
           vv = vec4<f32>(qkv[row + ${2 * D}u], qkv[row + ${2 * D + 1}u], qkv[row + ${2 * D + 2}u], qkv[row + ${2 * D + 3}u]);
         }
@@ -926,11 +1019,191 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (!live) { return; }
   let ob = qrow * ${D}u + h * ${hd}u + sub * ${4 * VL}u;
   let invL = 1.0 / l;
-  ${vlIdx.map((e) => `out[ob + ${e * 4}u] = o_${e}.x * invL * gate[ob + ${e * 4}u];
+  ${fusedG ? `let gb = qBase + ${3 * D}u + sub * ${4 * VL}u;
+  ${vlIdx.map((e) => `out[ob + ${e * 4}u] = o_${e}.x * invL / (1.0 + exp(-qkv[gb + ${e * 4}u]));
+  out[ob + ${e * 4 + 1}u] = o_${e}.y * invL / (1.0 + exp(-qkv[gb + ${e * 4 + 1}u]));
+  out[ob + ${e * 4 + 2}u] = o_${e}.z * invL / (1.0 + exp(-qkv[gb + ${e * 4 + 2}u]));
+  out[ob + ${e * 4 + 3}u] = o_${e}.w * invL / (1.0 + exp(-qkv[gb + ${e * 4 + 3}u]));`).join("\n  ")}` : vlIdx.map((e) => `out[ob + ${e * 4}u] = o_${e}.x * invL * gate[ob + ${e * 4}u];
   out[ob + ${e * 4 + 1}u] = o_${e}.y * invL * gate[ob + ${e * 4 + 1}u];
   out[ob + ${e * 4 + 2}u] = o_${e}.z * invL * gate[ob + ${e * 4 + 2}u];
   out[ob + ${e * 4 + 3}u] = o_${e}.w * invL * gate[ob + ${e * 4 + 3}u];`).join("\n  ")}
-}`, S * H * QB, hasQBias ? [qkv, bias, g, out, qBias] : [qkv, bias, g, out], u);
+}`, S * H * QB, buffers, u);
+  }
+
+  /** Fused couplingSplit token row statistics + Xa scaling (one 64-lane workgroup per token row). */
+  csTokenPrep({ a, gA, tstats, xa, rows, T }) {
+    const u = new Uint32Array([rows, T, 0, 0]);
+    return this.step("cs-tprep", `
+struct P { rows: u32, T: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> gA: array<f32>;
+@group(0) @binding(3) var<storage, read_write> tstats: array<f32>;
+@group(0) @binding(4) var<storage, read_write> xa: array<f32>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wid.x + wid.y * 65535u;
+  let live = r < p.rows;
+  let row = min(r, p.rows - 1u);
+  let base = row * 768u;
+  ${Array.from({ length: 12 }, (_, k) => `let v_${k} = a[base + li + ${k * 64}u];`).join("\n  ")}
+  red[li] = ${Array.from({ length: 12 }, (_, k) => `v_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  let m = red[0] / 768.0;
+  workgroupBarrier();
+  ${Array.from({ length: 12 }, (_, k) => `let d_${k} = v_${k} - m;`).join("\n  ")}
+  red[li] = ${Array.from({ length: 12 }, (_, k) => `d_${k} * d_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (!live) { return; }
+  let v = red[0];
+  let sa = sqrt(v / 768.0 + 1e-5);
+  if (li == 0u) {
+    tstats[row * 3u] = m;
+    tstats[row * 3u + 1u] = v;
+    tstats[row * 3u + 2u] = sa;
+  }
+  let gBase = (row % p.T) * 768u + li;
+  let invSa = 1.0 / sa;
+  ${Array.from({ length: 12 }, (_, k) => `xa[base + li + ${k * 64}u] = gA[gBase + ${k * 64}u] * d_${k} * invSa;`).join("\n  ")}
+}`, rows, [a, gA, tstats, xa], u);
+  }
+
+  /** Fused cat-qa + modulated LayerNorm(896) for q_to_s_mixer (one 64-lane workgroup per token row). */
+  catQaLn({ q, a, centre, condS, qsh, rows, T, N, eps = 1e-5 }) {
+    const u = new Uint32Array(4);
+    const f = new Float32Array(u.buffer);
+    u[0] = rows; u[1] = T; u[2] = N; f[3] = eps;
+    return this.step("cat-qa-ln", `
+struct P { rows: u32, T: u32, N: u32, eps: f32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> a: array<f32>;
+@group(0) @binding(3) var<storage, read> centre: array<i32>;
+@group(0) @binding(4) var<storage, read> cond: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wid.x + wid.y * 65535u;
+  let live = r < p.rows;
+  let row = min(r, p.rows - 1u);
+  let sm = row / p.T;
+  let t = row % p.T;
+  let qBase = (sm * p.N + u32(centre[t])) * 128u + li;
+  let aBase = row * 768u + li;
+  let v_0 = q[qBase];
+  let v_1 = q[qBase + 64u];
+  ${Array.from({ length: 12 }, (_, k) => `let v_${k + 2} = a[aBase + ${k * 64}u];`).join("\n  ")}
+  red[li] = ${Array.from({ length: 14 }, (_, k) => `v_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  let mean = red[0] / 896.0;
+  workgroupBarrier();
+  ${Array.from({ length: 14 }, (_, k) => `let d_${k} = v_${k} - mean;`).join("\n  ")}
+  red[li] = ${Array.from({ length: 14 }, (_, k) => `d_${k} * d_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (!live) { return; }
+  let inv = inverseSqrt(red[0] / 896.0 + p.eps);
+  let cb = t * 2560u + li;
+  let yb = row * 896u + li;
+  ${Array.from({ length: 14 }, (_, k) => `y[yb + ${k * 64}u] = d_${k} * inv * (1.0 + cond[cb + ${k * 64}u]) + cond[cb + ${896 + k * 64}u];`).join("\n  ")}
+}`, rows, [q, a, centre, condS, qsh], u);
+  }
+
+  /** Fused couplingSplit atom row statistics + Xq scaling (one 64-lane workgroup per atom row). */
+  csAtomPrep({ q, gQ, tstats, atomTokenS, astats, xq, rows, T }) {
+    const u = new Uint32Array([rows, T, 0, 0]);
+    return this.step("cs-aprep", `
+struct P { rows: u32, T: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> gQ: array<f32>;
+@group(0) @binding(3) var<storage, read> tstats: array<f32>;
+@group(0) @binding(4) var<storage, read> atomTokenS: array<i32>;
+@group(0) @binding(5) var<storage, read_write> astats: array<f32>;
+@group(0) @binding(6) var<storage, read_write> xq: array<f32>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wid.x + wid.y * 65535u;
+  let live = r < p.rows;
+  let row = min(r, p.rows - 1u);
+  let base = row * 128u;
+  let q0 = q[base + li];
+  let q1 = q[base + li + 64u];
+  red[li] = q0 + q1;
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  let mq = red[0] / 128.0;
+  workgroupBarrier();
+  let d0 = q0 - mq;
+  let d1 = q1 - mq;
+  red[li] = d0 * d0 + d1 * d1;
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (!live) { return; }
+  let ssq = red[0];
+  let sq = sqrt(ssq / 128.0 + 1e-5);
+  let st = atomTokenS[row];
+  if (li == 0u) {
+    var ma = 0.0; var ssa = 0.0; var sa = 0.0;
+    if (st >= 0) {
+      let k = u32(st) * 3u;
+      ma = tstats[k]; ssa = tstats[k + 1u]; sa = tstats[k + 2u];
+    }
+    let mu = (768.0 * ma + 128.0 * mq) / 896.0;
+    let da = ma - mu;
+    let dq = mq - mu;
+    let v = (ssa + ssq + 768.0 * da * da + 128.0 * dq * dq) / 896.0;
+    let o = row * 6u;
+    astats[o] = inverseSqrt(v + 1e-5);
+    astats[o + 1u] = da;
+    astats[o + 2u] = dq;
+    astats[o + 3u] = sq;
+    astats[o + 4u] = mq;
+    astats[o + 5u] = sa;
+  }
+  var t = p.T;
+  if (st >= 0) { t = u32(st) % p.T; }
+  let gBase = t * 128u + li;
+  let invSq = 1.0 / sq;
+  xq[base + li] = gQ[gBase] * d0 * invSq;
+  xq[base + li + 64u] = gQ[gBase + 64u] * d1 * invSq;
+}`, rows, [q, gQ, tstats, atomTokenS, astats, xq], u);
   }
 
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */

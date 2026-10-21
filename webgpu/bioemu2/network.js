@@ -54,11 +54,11 @@ export class Bioemu2Gpu {
 
   /** A weight on the device, once. */
   async w(name, { half = this.half, transform } = {}) {
-    const key = `${name}|${half}|${transform ? "t" : ""}`;
+    if (!transform) return this.stacked(`${name}|${half}|`, [name], half);
+    const key = `${name}|${half}|t`;
     if (!this.weights.has(key)) {
       this.weights.set(key, (async () => {
-        let values = await this.read(name);
-        if (transform) values = transform(values);
+        const values = transform(await this.read(name));
         return this.ops.weight(name, values, half && values.length % 2 === 0);
       })());
     }
@@ -85,8 +85,12 @@ export class Bioemu2Gpu {
   async stacked(key, names, half, swiglu = false) {
     if (!this.weights.has(key)) {
       this.weights.set(key, (async () => {
-        const parts = await Promise.all(names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]))
-          .map((n) => this.read(n)));
+        const flat = names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]));
+        if (typeof this.read.source === "function" && typeof this.read.decode === "function") {
+          const sources = await Promise.all(flat.map((n) => this.read.source(n)));
+          return this.ops.weightFromSources(key, sources, half, this.read.decode);
+        }
+        const parts = await Promise.all(flat.map((n) => this.read(n)));
         const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
         let at = 0;
         for (const v of parts) { all.set(v, at); at += v.length; }
@@ -98,17 +102,12 @@ export class Bioemu2Gpu {
 
   /** [fc1; fc2] stacked, so a SwiGLU's two projections are one GEMM. */
   async swiglu(prefix) {
-    const key = `${prefix}/fc12`;
-    if (!this.weights.has(key)) {
-      this.weights.set(key, (async () => {
-        const [a, b] = await Promise.all([this.read(`${prefix}/fc1/weight`), this.read(`${prefix}/fc2/weight`)]);
-        const both = new Float32Array(a.length + b.length);
-        both.set(a);
-        both.set(b, a.length);
-        return this.ops.weight(key, both, this.half);
-      })());
-    }
-    return this.weights.get(key);
+    return this.stacked(`${prefix}/fc12`, [prefix], this.half, true);
+  }
+
+  /** [proj_qkv; proj_g] stacked, so an attention layer's QKV and gate projections are one GEMM. */
+  async qkvg(att) {
+    return this.stacked(`${att}/proj_qkvg`, [`${att}/proj_qkv/weight`, `${att}/proj_g/weight`], this.half);
   }
 
   // --- reusable recorded blocks ---------------------------------------------------------------------------
@@ -157,52 +156,11 @@ export class Bioemu2Gpu {
       A: { off: 0, m: DC, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: W2, m: 2 * W2, n: 1 } }));
     }
     // a token row (sample-stacked): its mean, centred sum of squares and spread; then Xa and P
-    steps.push(await o.map("cs-tstats", S * T, [{ buffer: cs.tstats, write: true }, { buffer: a }],
-    `let base = i * 768u; var m = 0.0;
-  for (var c = 0u; c < 768u; c += 8u) {
-    let idx = base + c;
-    m += b1[idx] + b1[idx + 1u] + b1[idx + 2u] + b1[idx + 3u] + b1[idx + 4u] + b1[idx + 5u] + b1[idx + 6u] + b1[idx + 7u];
-  }
-  m = m / 768.0; var v = 0.0;
-  for (var c = 0u; c < 768u; c += 8u) {
-    let idx = base + c;
-    let d0 = b1[idx] - m; let d1 = b1[idx + 1u] - m; let d2 = b1[idx + 2u] - m; let d3 = b1[idx + 3u] - m;
-    let d4 = b1[idx + 4u] - m; let d5 = b1[idx + 5u] - m; let d6 = b1[idx + 6u] - m; let d7 = b1[idx + 7u] - m;
-    v += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
-  }
-  b0[i * 3u] = m; b0[i * 3u + 1u] = v; b0[i * 3u + 2u] = sqrt(v / 768.0 + 1e-5);`));
-    steps.push(await o.map("cs-xa", S * T * DT, [{ buffer: cs.xa, write: true }, { buffer: a }, { buffer: cs.tstats }, { buffer: gA }],
-    `let r = i / 768u; let c = i % 768u; let t = r % U(0u);
-  b0[i] = b3[t * 768u + c] * (b1[i] - b2[r * 3u]) / b2[r * 3u + 2u];`, [T]));
+    steps.push(await o.csTokenPrep({ a, gA, tstats: cs.tstats, xa: cs.xa, rows: S * T, T }));
     steps.push(await o.gemm({ m: S * T, n: W2, k: DT, a: cs.xa, b: W, c: cs.P,
       A: { off: 0, m: DT, k: 1 }, B: { off: wo, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
     // an atom row: q's statistics, the whole row's combined (a padding atom's a is zero), its token's spread; Xq; Z
-    steps.push(await o.map("cs-astats", S * N, [{ buffer: cs.astats, write: true }, { buffer: q }, { buffer: cs.tstats },
-      { buffer: atomTokenS, type: "i32" }],
-    `let base = i * 128u; var mq = 0.0;
-  for (var c = 0u; c < 128u; c += 8u) {
-    let idx = base + c;
-    mq += b1[idx] + b1[idx + 1u] + b1[idx + 2u] + b1[idx + 3u] + b1[idx + 4u] + b1[idx + 5u] + b1[idx + 6u] + b1[idx + 7u];
-  }
-  mq = mq / 128.0; var ssq = 0.0;
-  for (var c = 0u; c < 128u; c += 8u) {
-    let idx = base + c;
-    let d0 = b1[idx] - mq; let d1 = b1[idx + 1u] - mq; let d2 = b1[idx + 2u] - mq; let d3 = b1[idx + 3u] - mq;
-    let d4 = b1[idx + 4u] - mq; let d5 = b1[idx + 5u] - mq; let d6 = b1[idx + 6u] - mq; let d7 = b1[idx + 7u] - mq;
-    ssq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
-  }
-  let st = b3[i]; var ma = 0.0; var ssa = 0.0; var sa = 0.0;
-  if (st >= 0) { let k = u32(st) * 3u; ma = b2[k]; ssa = b2[k + 1u]; sa = b2[k + 2u]; }
-  let mu = (768.0 * ma + 128.0 * mq) / 896.0; let da = ma - mu; let dq = mq - mu;
-  let v = (ssa + ssq + 768.0 * da * da + 128.0 * dq * dq) / 896.0;
-  let o = i * 6u;
-  b0[o] = inverseSqrt(v + 1e-5); b0[o + 1u] = da; b0[o + 2u] = dq; b0[o + 3u] = sqrt(ssq / 128.0 + 1e-5); b0[o + 4u] = mq;
-  b0[o + 5u] = sa;`));
-    steps.push(await o.map("cs-xq", S * N * DA, [{ buffer: cs.xq, write: true }, { buffer: q }, { buffer: cs.astats },
-      { buffer: gQ }, { buffer: atomTokenS, type: "i32" }],
-    `let r = i / 128u; let c = i % 128u; let st = b4[r]; var t = U(0u);
-  if (st >= 0) { t = u32(st) % U(0u); }
-  b0[i] = b3[t * 128u + c] * (b1[i] - b2[r * 6u + 4u]) / b2[r * 6u + 3u];`, [T]));
+    steps.push(await o.csAtomPrep({ q, gQ, tstats: cs.tstats, atomTokenS, astats: cs.astats, xq: cs.xq, rows: S * N, T }));
     if (this.options.fuseCombine !== false) {
       // Z never stored: the GEMM's columns reordered so a lane holds four gates and their four values, and the combine
       // and the SwiGLU run in its epilogue (fuseCombine: false is the control - Z written, then cs-combine)
@@ -303,21 +261,33 @@ export class Bioemu2Gpu {
       { key: "q", outC: 1920, prefix: (l) => `${layer(l)}/coupling`, l0: "q_coupling_cond_0", l2: "q_coupling_cond_2" },
       { key: "s", outC: 2560, prefix: (l) => `${layer(l)}/coupling`, l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" },
     ];
-    for (const k of kinds) {
-      const lw = await this.stacked(`stack/${k.key}/${k.l0}/weight`, all.map((l) => `${k.prefix(l)}/${k.l0}/weight`), false);
-      const lb = await this.stacked(`stack/${k.key}/${k.l0}/bias`, all.map((l) => `${k.prefix(l)}/${k.l0}/bias`), false);
+    const lwb = await this.stacked("stack/cond0/wb", kinds.flatMap((k) => [
+      ...all.map((l) => `${k.prefix(l)}/${k.l0}/weight`),
+      ...all.map((l) => `${k.prefix(l)}/${k.l0}/bias`),
+    ]), false);
+    const plane = G * T * DT;
+    const wbPlane = 2 * L * DT;
+    const wPlane = L * DT;
+    // (LN's affine as the LayerNorm kernel applies it, (x - mean) inv, times w, plus b: then silu for all 4 kinds in one pass)
+    steps.push(await o.map("cond-affine", n * T * DT, [{ buffer: buffers.cin, write: true }, { buffer: xhat }, { buffer: lwb }],
+    `let c = i % 768u; let r = i / 768u; let t = r % U(0u); let l = U(1u) + r / U(0u);
+  let x = b1[t * 768u + c];
+  let wIdx = l * 768u + c;
+  let v0 = x * b2[wIdx] + b2[${wPlane}u + wIdx];
+  let v1 = x * b2[${wbPlane}u + wIdx] + b2[${wbPlane + wPlane}u + wIdx];
+  let v2 = x * b2[${2 * wbPlane}u + wIdx] + b2[${2 * wbPlane + wPlane}u + wIdx];
+  let v3 = x * b2[${3 * wbPlane}u + wIdx] + b2[${3 * wbPlane + wPlane}u + wIdx];
+  b0[i] = v0 / (1.0 + exp(-v0));
+  b0[${plane}u + i] = v1 / (1.0 + exp(-v1));
+  b0[${2 * plane}u + i] = v2 / (1.0 + exp(-v2));
+  b0[${3 * plane}u + i] = v3 / (1.0 + exp(-v3));`, [T, l0]));
+    for (let kIdx = 0; kIdx < kinds.length; kIdx += 1) {
+      const k = kinds[kIdx];
       const w2 = await this.stacked(`stack/${k.key}/${k.l2}/weight`, all.map((l) => `${k.prefix(l)}/${k.l2}/weight`), this.half);
       const b2 = await this.stacked(`stack/${k.key}/${k.l2}/bias`, all.map((l) => `${k.prefix(l)}/${k.l2}/bias`), false);
-      // (LN's affine as the LayerNorm kernel applies it, (x - mean) inv, times w, plus b: then silu)
-      steps.push(await o.map("cond-affine", n * T * DT, [{ buffer: buffers.cin, write: true }, { buffer: xhat }, { buffer: lw }, { buffer: lb }],
-      `let c = i % 768u; let r = i / 768u; let t = r % U(0u); let l = U(1u) + r / U(0u);
-  var v = b1[t * 768u + c];
-  v *= b2[l * 768u + c];
-  v += b3[l * 768u + c];
-  b0[i] = v / (1.0 + exp(-v));`, [T, l0]));
       steps.push(await o.gemm({ m: T, n: k.outC, k: DT, a: buffers.cin, b: w2, c: buffers[k.key], bias: b2,
         batches: [n, 1], biasOff: l0 * k.outC, biasS0: k.outC,
-        A: { off: 0, s0: T * DT, m: DT, k: 1 }, B: { off: l0 * k.outC * DT, s0: k.outC * DT, n: DT, k: 1 },
+        A: { off: kIdx * plane, s0: T * DT, m: DT, k: 1 }, B: { off: l0 * k.outC * DT, s0: k.outC * DT, n: DT, k: 1 },
         C: { off: 0, s0: T * k.outC, m: k.outC, n: 1 }, label: `cond ${k.key} ${T}x${k.outC}x${DT} [${n}]` }));
     }
     const out = [];
@@ -367,18 +337,20 @@ export class Bioemu2Gpu {
     const att = `${prefix}/attention/attention_layer/pair_bias_attn`;
     const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta, map });
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D) }));
-    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: R, inC: D, outC: 3 * D }));
-    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: R, inC: D, outC: D, act: "sigmoid" }));
-    // q (+ bias) in place, and k, v into each sample's padded key array (48 zero rows each end)
-    steps.push(await o.map("win-qkv", R * 3 * D, [{ buffer: s.qkv, write: true }, { buffer: await this.w(`${att}/proj_q_bias`, { half: false }) },
-      { buffer: s.kvPad, write: true }],
-    `let r = i / 384u; let c = i % 384u; let sm = r / U(0u); let ra = r % U(0u);
-  if (c < 128u) { b0[i] = b0[i] + b1[c]; } else { b2[(sm * U(1u) + ra + ${CTX}u) * 256u + c - 128u] = b0[i]; }`, [N, pad]));
+    const qBias = await this.w(`${att}/proj_q_bias`, { half: false });
     if (this.options.fuseWindow !== false && hd === 32 && W_Q === 32 && W_K === 128) {
-      // (the three passes and the gating in one kernel: ops.windowAttention; fuseWindow: false is the control)
-      steps.push(await o.windowAttention({ qkv: s.qkv, kvPad: s.kvPad, bias, mask: keyMask, g: s.g, out: s.o, S, N, H, pad,
-                                           alpha: 1 / Math.sqrt(hd) }));
+      steps.push(await o.linear({ x: s.h, w: await this.qkvg(att), y: s.qkv, rows: R, inC: D, outC: 4 * D }));
+      // (the three passes, the kv window gather, and the gating in one kernel: ops.windowAttention; fuseWindow: false is the control)
+      steps.push(await o.windowAttention({ qkv: s.qkv, qBias, kvPad: null, bias, mask: keyMask, g: null, out: s.o, S, N, H, pad,
+                                           alpha: 1 / Math.sqrt(hd), ctx: CTX }));
     } else {
+      steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: R, inC: D, outC: 3 * D }));
+      steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: R, inC: D, outC: D, act: "sigmoid" }));
+      // q (+ bias) in place, and k, v into each sample's padded key array (48 zero rows each end)
+      steps.push(await o.map("win-qkv", R * 3 * D, [{ buffer: s.qkv, write: true }, { buffer: qBias },
+        { buffer: s.kvPad, write: true }],
+      `let r = i / 384u; let c = i % 384u; let sm = r / U(0u); let ra = r % U(0u);
+  if (c < 128u) { b0[i] = b0[i] + b1[c]; } else { b2[(sm * U(1u) + ra + ${CTX}u) * 256u + c - 128u] = b0[i]; }`, [N, pad]));
       // per sample: logits (NW, H, 32, 128) = q . k^T / sqrt(hd), the softmax, o = P . v
       for (let sm = 0; sm < S; sm += 1) {
         steps.push(await o.gemm({ m: W_Q, n: W_K, k: hd, a: s.qkv, b: s.kvPad, c: s.logits, batches: [NW, H], alpha: 1 / Math.sqrt(hd),
@@ -416,13 +388,14 @@ export class Bioemu2Gpu {
     const att = `${prefix}/attention/pair_bias_attn`;
     const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta, map });
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D) }));
-    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: R, inC: D, outC: 3 * D }));
-    steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: R, inC: D, outC: D, act: "sigmoid" }));
     const qBias = await this.w(`${att}/proj_q_bias`, { half: false });
     if (this.options.fuseTokenAttention !== false && hd % 16 === 0) {
+      steps.push(await o.linear({ x: s.h, w: await this.qkvg(att), y: s.qkv, rows: R, inC: D, outC: 4 * D }));
       // (scores, softmax, P.V and the gating in one kernel: ops.tokenAttention; fuseTokenAttention: false the control)
-      steps.push(await o.tokenAttention({ qkv: s.qkv, qBias, bias, g: s.g, out: s.o, S, T, H, hd, alpha: 1 / Math.sqrt(hd) }));
+      steps.push(await o.tokenAttention({ qkv: s.qkv, qBias, bias, g: null, out: s.o, S, T, H, hd, alpha: 1 / Math.sqrt(hd) }));
     } else {
+      steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_qkv/weight`), y: s.qkv, rows: R, inC: D, outC: 3 * D }));
+      steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: R, inC: D, outC: D, act: "sigmoid" }));
       steps.push(await o.map("tok-qbias", R * D, [{ buffer: s.qkv, write: true }, { buffer: qBias }],
         "let r = i / 768u; let c = i % 768u; b0[r * 2304u + c] = b0[r * 2304u + c] + b1[c];"));
       steps.push(await o.gemm({ m: T, n: T, k: hd, a: s.qkv, b: s.qkv, c: s.logits, batches: [S, H], alpha: 1 / Math.sqrt(hd),
@@ -447,7 +420,7 @@ export class Bioemu2Gpu {
   scratch(name, rows, width, extra = {}) {
     const o = this.ops;
     return {
-      h: o.buffer(`${name}.h`, rows * width), qkv: o.buffer(`${name}.qkv`, rows * 3 * width),
+      h: o.buffer(`${name}.h`, rows * width), qkv: o.buffer(`${name}.qkv`, rows * 4 * width),
       g: o.buffer(`${name}.g`, rows * width), o: o.buffer(`${name}.o`, rows * width),
       t3: o.buffer(`${name}.t3`, rows * width), t12: o.buffer(`${name}.t12`, rows * 8 * width),
       t: o.buffer(`${name}.t`, rows * 4 * width), ln: o.buffer(`${name}.ln`, rows * width), ...extra,
@@ -947,9 +920,9 @@ export class Bioemu2Gpu {
     const batchCond = this.options.batchConditioning !== false;
     const LAYERS = BIOEMU2.denoiserLayers;
     const perLayer = T * (DT + 6 * DA + 6 * DT + 1920 + 2560) + (split ? (T + 1) * (DT + DA + 896 + 2 * 3584) : 0);
-    const G = batchCond ? Math.max(1, Math.min(LAYERS, Math.floor((this.options.condGroupMiB ?? 64) * 2 ** 20 / 4 / perLayer))) : 0;
+    const G = batchCond ? Math.max(1, Math.min(LAYERS, Math.floor((this.options.condGroupMiB ?? 96) * 2 ** 20 / 4 / perLayer))) : 0;
     const groupBufs = !batchCond ? null : {
-      cin: o.buffer("cg.cin", G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),
+      cin: o.buffer("cg.cin", 4 * G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),
       q: o.buffer("cg.q", G * T * 1920), s: o.buffer("cg.s", G * T * 2560),
       ...(split ? { gA: o.buffer("cg.gA", G * (T + 1) * DT), gQ: o.buffer("cg.gQ", G * (T + 1) * DA),
                     beta: o.buffer("cg.beta", G * (T + 1) * 896), QB: o.buffer("cg.QB", G * (T + 1) * 2 * 3584) } : {}),
@@ -1002,10 +975,7 @@ export class Bioemu2Gpu {
       }
       // q_to_s's input FIRST - concat(q[own sample, centre(t)], a) per token, modulated by the token's s coupling: s_to_q
       // writes q in place (its fc3's gated residual), and both mixers read the layer's q and a from before either update
-      steps.push(await o.map("cat-qa", S * T * 896, [{ buffer: qs, write: true }, { buffer: q }, { buffer: a }, { buffer: centre, type: "i32" }],
-        `let r = i / 896u; let c = i % 896u; let sm = r / U(0u); let t = r % U(0u);
-  if (c < 128u) { b0[i] = b1[(sm * U(1u) + u32(b3[t])) * 128u + c]; } else { b0[i] = b2[r * 768u + c - 128u]; }`, [T, N]));
-      steps.push(await o.layerNorm({ x: qs, y: qsh, rows: S * T, width: 896, mod: { cond: condS, stride: 2560, alpha: 0, beta: 896, map: tokenMap } }));
+      steps.push(await o.catQaLn({ q, a, centre, condS, qsh, rows: S * T, T, N }));
       // s_to_q: concat(a[own sample, token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
       if (split) {
         await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt, pre: cv?.pre });
