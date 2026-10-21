@@ -69,7 +69,7 @@ export function packSingleAttentionWeights(weights, precision = "f32") {
  * Every one of those is the smallest split that reaches about 110 workgroups,
  * which is what this returns.
  */
-export function singleProjectSplits(n, width, target = 110, maxSplits = 3) {
+export function singleProjectSplits(n, width, target = 110, maxSplits = 3, projectRows = 1) {
   // 🔴 110 IS AN M2's NUMBER, AND THE SHAPE OF THE RULE IS NOT. "The smallest
   // split that reaches about 110 workgroups" is right on a device with ten
   // cores and badly wrong on one with 108: an A100 wants about **1200**, and
@@ -85,10 +85,11 @@ export function singleProjectSplits(n, width, target = 110, maxSplits = 3) {
   // four. Both stay parameters rather than becoming the new constants, because
   // the M2 table above this comment shows 6 LOSING there at every n it was
   // measured at - see webgpu/runtime/device-profile.js.
+  const tiles = Math.ceil(n / projectRows);
   const candidates = [1, 2, 3, 6].filter((splits) => splits <= maxSplits);
   for (const splits of candidates) {
     if (width % (64 * splits) !== 0) continue;
-    if (n * splits >= target) return splits;
+    if (tiles * splits >= target) return splits;
   }
   // Nothing reaches the target, so take the most workgroups available.
   for (const splits of [...candidates].reverse()) {
@@ -100,6 +101,12 @@ export function singleProjectSplits(n, width, target = 110, maxSplits = 3) {
 export function createSingleAttentionShaders(shape, offsets, epsilon, variance) {
   const { n, channels, heads, dimension } = shape;
   const width = heads * dimension;
+  const projectRows = shape.projectRows ?? 1;
+  if (projectRows !== 1 && projectRows !== 4) {
+    throw new RangeError(`single attention projectRows must be 1 or 4; got ${projectRows}`);
+  }
+  const vec4Rows = projectRows === 4;
+  const rowVec = vec4Rows ? "vec4<f32>" : "f32";
   // 🔴 A STORAGE FORMAT FOR THE WEIGHTS, FOR MEMORY AND NOT FOR TIME. `w.single`
   // is 135 MiB of the 567 an AF3 TRUNK keeps resident (a whole fold held 1406,
   // of which this is one tensor of three) - the single
@@ -117,7 +124,7 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
   // 🔴 RESOLVED ONCE AND RETURNED, because the dispatch multiplies by it. A
   // caller reading the constant while the shader was generated from something
   // else would project a slice of the width and leave the rest as it found it.
-  const splits = shape.projectSplits ?? singleProjectSplits(n, width);
+  const splits = shape.projectSplits ?? singleProjectSplits(n, width, 110, 3, projectRows);
   if (width % (64 * splits) !== 0) {
     throw new Error(`width ${width} is not a multiple of 64 * ${splits} splits`);
   }
@@ -208,7 +215,9 @@ const W_OUT: u32 = ${offsets.outputProjection}u;
 fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 `;
 
-  // One workgroup per token: normalise, then q/k/v/gate for that token.
+  // One workgroup per token (or tile of 4 tokens): normalise, then q/k/v/gate.
+  const overThread = (body) => Array.from({ length: perThread }, (_, b) => body(b)).join("\n");
+  const overRows = (body) => Array.from({ length: projectRows }, (_, r) => body(r)).join("\n");
   const project = `${common}
 @group(0) @binding(0) var<storage, read> single: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
@@ -217,33 +226,86 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
-var<workgroup> act: array<f32, ${channels}>;
+var<workgroup> act: array<${rowVec}, ${channels}>;
 var<workgroup> reduce_a: array<f32, ${projectLanes}>;
-var<workgroup> reduce_b: array<f32, ${projectLanes}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<f32, ${projectLanes}>;\n` : ""}\
+${vec4Rows ? `var<workgroup> row_mean: array<f32, 4>;
+var<workgroup> row_inverse_std: array<f32, 4>;\n` : ""}\
 
 @compute @workgroup_size(${projectLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let token = group.x / ${splits}u;
+  let token = (group.x / ${splits}u) * ${projectRows}u;
   let split = group.x % ${splits}u;
   if (token >= N) { return; }
   let local = local_id.x;
-  let base = token * CHANNELS;
+${vec4Rows ? `  for (var t = 0u; t < 4u; t += 1u) {
+    let row = min(token + t, N - 1u);
+    let base = row * CHANNELS;
+    var total = 0.0;
+    ${variance === "fast" ? "var squares = 0.0;" : ""}
+    for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
+      let value = single[base + c];
+      total += value;
+      ${variance === "fast" ? "squares += value * value;" : ""}
+    }
+    reduce_a[local] = total;
+    ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
+    workgroupBarrier();
+    for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
+      if (local < stride) {
+        reduce_a[local] += reduce_a[local + stride];
+        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
+      }
+      workgroupBarrier();
+    }
+    let mean = reduce_a[0] / f32(CHANNELS);
+    ${variance === "fast"
+      ? "let variance = reduce_b[0] / f32(CHANNELS) - mean * mean;"
+      : `var centered = 0.0;
+    for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
+      let d = single[base + c] - mean;
+      centered += d * d;
+    }
+    workgroupBarrier();
+    reduce_a[local] = centered;
+    workgroupBarrier();
+    for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+      workgroupBarrier();
+    }
+    let variance = reduce_a[0] / f32(CHANNELS);`}
+    if (local == 0u) {
+      row_mean[t] = mean;
+      row_inverse_std[t] = inverseSqrt(variance + EPSILON);
+    }
+    workgroupBarrier();
+  }
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
+    let scale = ${wf("weights[W_NORM_SCALE + c]")};
+    let offset = ${wf("weights[W_NORM_OFFSET + c]")};
+    var packed: vec4<f32>;
+${overRows((r) => `    {
+      let row_${r} = min(token + ${r}u, N - 1u);
+      packed.${"xyzw"[r]} = (single[row_${r} * CHANNELS + c] - row_mean[${r}u]) * row_inverse_std[${r}u] * scale + offset;
+    }`)}
+    act[c] = packed;
+  }` : `  let base = token * CHANNELS;
 
   var total = 0.0;
-  var squares = 0.0;
+  ${variance === "fast" ? "var squares = 0.0;" : ""}
   for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     let value = single[base + c];
     total += value;
-    squares += value * value;
+    ${variance === "fast" ? "squares += value * value;" : ""}
   }
   reduce_a[local] = total;
-  reduce_b[local] = squares;
+  ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
   workgroupBarrier();
   for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) {
       reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
+      ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
     }
     workgroupBarrier();
   }
@@ -274,7 +336,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     act[c] = (single[base + c] - mean) * inverse_std * ${wf("weights[W_NORM_SCALE + c]")}
       + ${wf("weights[W_NORM_OFFSET + c]")};
-  }
+  }`}
   workgroupBarrier();
 
   // All four are (channels, width): channels first, no transpose_weights.
@@ -285,34 +347,29 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // per output; blocked, it reads them once and buys PER_THREAD * 4 times the
   // multiply-adds from them.
   let out0 = split * ${perSplit}u + local;
-  var q_total: array<f32, ${perThread}>;
-  var k_total: array<f32, ${perThread}>;
-  var v_total: array<f32, ${perThread}>;
-  var gate_total: array<f32, ${perThread}>;
-  for (var b = 0u; b < ${perThread}u; b += 1u) {
-    q_total[b] = ${wf(`weights[W_QBIAS + out0 + b * ${projectLanes}u]`)};   // ...and only q has one.
-    k_total[b] = 0.0;
-    v_total[b] = 0.0;
-    gate_total[b] = 0.0;
-  }
+${overThread((b) => `  var q_total_${b} = ${vec4Rows ? `vec4<f32>(${wf(`weights[${offsets.qBias + b * projectLanes}u + out0]`)})` : wf(`weights[${offsets.qBias + b * projectLanes}u + out0]`)};   // ...and only q has one.
+  var k_total_${b} = ${rowVec}(0.0);
+  var v_total_${b} = ${rowVec}(0.0);
+  var gate_total_${b} = ${rowVec}(0.0);`)}
   for (var c = 0u; c < CHANNELS; c += 1u) {
     let x = act[c];
-    let row = c * WIDTH;
-    for (var b = 0u; b < ${perThread}u; b += 1u) {
-      let out = row + out0 + b * ${projectLanes}u;
-      q_total[b] += x * ${wf("weights[W_Q + out]")};
-      k_total[b] += x * ${wf("weights[W_K + out]")};
-      v_total[b] += x * ${wf("weights[W_V + out]")};
-      gate_total[b] += x * ${wf("weights[W_GATE + out]")};
-    }
+    let row = c * WIDTH + out0;
+${overThread((b) => `    q_total_${b} += x * ${wf(`weights[row + ${offsets.qProjection + b * projectLanes}u]`)};
+    k_total_${b} += x * ${wf(`weights[row + ${offsets.kProjection + b * projectLanes}u]`)};
+    v_total_${b} += x * ${wf(`weights[row + ${offsets.vProjection + b * projectLanes}u]`)};
+    gate_total_${b} += x * ${wf(`weights[row + ${offsets.gatingQuery + b * projectLanes}u]`)};`)}
   }
-  for (var b = 0u; b < ${perThread}u; b += 1u) {
-    let index = token * WIDTH + out0 + b * ${projectLanes}u;
-    q[index] = q_total[b];
-    k[index] = k_total[b];
-    v[index] = v_total[b];
-    gate[index] = gate_total[b];
-  }
+${vec4Rows ? overRows((r) => `  if (token + ${r}u < N) {
+    let out_base_${r} = (token + ${r}u) * WIDTH + out0;
+${overThread((b) => `    q[out_base_${r} + ${b * projectLanes}u] = q_total_${b}.${"xyzw"[r]};
+    k[out_base_${r} + ${b * projectLanes}u] = k_total_${b}.${"xyzw"[r]};
+    v[out_base_${r} + ${b * projectLanes}u] = v_total_${b}.${"xyzw"[r]};
+    gate[out_base_${r} + ${b * projectLanes}u] = gate_total_${b}.${"xyzw"[r]};`)}
+  }`) : `  let out_base = token * WIDTH + out0;
+${overThread((b) => `  q[out_base + ${b * projectLanes}u] = q_total_${b};
+  k[out_base + ${b * projectLanes}u] = k_total_${b};
+  v[out_base + ${b * projectLanes}u] = v_total_${b};
+  gate[out_base + ${b * projectLanes}u] = gate_total_${b};`)}`}
 }`;
 
   // One workgroup per (i, head).
@@ -389,31 +446,39 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 @group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> gated: array<f32, ${width}>;
+var<workgroup> gated: array<${rowVec}, ${width}>;
 
 @compute @workgroup_size(${projectOutLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let token = group.x;
+  let token = group.x * ${projectRows}u;
   if (token >= N) { return; }
   let local = local_id.x;
   for (var w = local; w < WIDTH; w += ${projectOutLanes}u) {
-    let index = token * WIDTH + w;
-    gated[w] = gathered[index] * logistic(gate[index]);
+${vec4Rows ? `    var packed: vec4<f32>;
+${overRows((r) => `    {
+      let row_${r} = min(token + ${r}u, N - 1u);
+      let index_${r} = row_${r} * WIDTH + w;
+      packed.${"xyzw"[r]} = gathered[index_${r}] * logistic(gate[index_${r}]);
+    }`)}
+    gated[w] = packed;` : `    let index = token * WIDTH + w;
+    gated[w] = gathered[index] * logistic(gate[index]);`}
   }
   workgroupBarrier();
 
   for (var c = local; c < CHANNELS; c += ${projectOutLanes}u) {
-    var sum = 0.0;
+    var sum = ${rowVec}(0.0);
     for (var wi = 0u; wi < WIDTH; wi += 1u) {
       sum += gated[wi] * ${wf("weights[W_OUT + wi * CHANNELS + c]")};
     }
-    output[token * CHANNELS + c] = sum;
+${vec4Rows ? overRows((r) => `    if (token + ${r}u < N) {
+      output[(token + ${r}u) * CHANNELS + c] ${shape.residual ? "+=" : "="} sum.${"xyzw"[r]};
+    }`) : `    output[token * CHANNELS + c] ${shape.residual ? "+=" : "="} sum;`}
   }
 }`;
 
   return { project, attend, project_out, projectSplits: splits,
-           projectLanes, projectOutLanes };
+           projectLanes, projectOutLanes, projectRows };
 }
 
 export class Af3SingleAttentionGpu {

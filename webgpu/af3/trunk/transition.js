@@ -310,8 +310,12 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   const zero = lanes === 1 ? "0.0" : `${vector}(0.0)`;
   const overLanes = (body) =>
     Array.from({ length: lanes }, (_, l) => body(l, lanes === 1 ? "" : `.${"xyzw"[l]}`));
-  const accumulator = channelsPerThread === 1 ? "g" : "out_slot * " + groups + "u + g";
-  const writeAccumulator = channelsPerThread === 1 ? "g" : "write_slot * " + groups + "u + g";
+  const overGroups = (body) =>
+    Array.from({ length: groups }, (_, g) => body(g)).join("\n");
+  const overBlocks = (body) =>
+    Array.from({ length: slotsPerThread }, (_, b) => body(b)).join("\n");
+  const overOutSlots = (body) =>
+    Array.from({ length: channelsPerThread }, (_, s) => body(s)).join("\n");
   // The fast variance is the trunk's; the atom and diffusion stacks want the
   // two-pass one. See the note in webgpu/kernels/triangle/shaders.js.
   const varianceCode = variance === "fast"
@@ -364,7 +368,7 @@ ${residual
 var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
 var<workgroup> gated: array<${stageVector}, ${groups * chunk}>;
 var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
-var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;\n` : ""}\
 var<workgroup> row_mean: array<f32, ${tile}>;
 var<workgroup> row_inverse_std: array<f32, ${tile}>;
 
@@ -392,24 +396,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let row = min(base_row + t, ROWS - 1u);
     let base = row * CHANNELS;
     var total = 0.0;
-    var sq_total = 0.0;
+    ${variance === "fast" ? "var sq_total = 0.0;" : ""}
     for (var c = local; c < CHANNELS; c += WORKGROUP) {
       let value = input[base + c];
       total += value;
-      sq_total += value * value;
+      ${variance === "fast" ? "sq_total += value * value;" : ""}
     }
     reduce_a[local] = total;
-    reduce_b[local] = sq_total;
+    ${variance === "fast" ? "reduce_b[local] = sq_total;" : ""}
     workgroupBarrier();
     for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
       if (local < stride) {
         reduce_a[local] += reduce_a[local + stride];
-        reduce_b[local] += reduce_b[local + stride];
+        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
       }
       workgroupBarrier();
     }
     let mean = reduce_a[0] / f32(CHANNELS);
-    let sum_squares = reduce_b[0];
+    ${variance === "fast" ? "let sum_squares = reduce_b[0];" : ""}
     ${varianceCode}
     if (local == 0u) {
       row_mean[t] = mean;
@@ -450,8 +454,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // memory then depends on CHUNK rather than INTERMEDIATE, and the tile buys
   // its halved weight traffic without spending occupancy for it.
   let wide = INTERMEDIATE * 2u;
-  var sum: array<${sumVector}, ${groups * channelsPerThread}>;
-  for (var s = 0u; s < ${groups * channelsPerThread}u; s += 1u) { sum[s] = ${sumZero ?? zero}; }
+${overOutSlots((s) => overGroups((g) => `  var sum_${s}_${g}: ${sumVector} = ${sumZero ?? zero};`))}
 
   for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += CHUNK) {
     // ...before overwriting the chunk the previous iteration is still reading.
@@ -463,62 +466,50 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // Blocked, BLOCK * 2 weight reads and the same GROUPS shared reads buy
     // BLOCK * 2 * GROUPS. CHUNK is what sets BLOCK, which is why the chunk that
     // wins is not simply the smallest one that fits.
-    var gate: array<${vector}, ${groups * slotsPerThread}>;
-    var value: array<${vector}, ${groups * slotsPerThread}>;
-    for (var s = 0u; s < ${groups * slotsPerThread}u; s += 1u) {
-      gate[s] = ${zero};
-      value[s] = ${zero};
-    }
+${overBlocks((b) => overGroups((g) => `    var gate_${b}_${g}: ${vector} = ${zero};
+    var value_${b}_${g}: ${vector} = ${zero};`))}
+    let col_base = chunk0 + local;
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      let column = W_T1 + c * wide;
-      for (var b = 0u; b < BLOCK; b += 1u) {
-        // ...read once, used TILE times. That ratio is the point.
-        let i = chunk0 + local + b * WORKGROUP;
-        let wg = ${w("weights[column + i]")};
-        let wv = ${w("weights[column + INTERMEDIATE + i]")};
-        for (var g = 0u; g < ${groups}u; g += 1u) {
-          let x = ${widen("normalized[g * CHANNELS + c]")};
-          gate[b * ${groups}u + g] += x * wg;
-          value[b * ${groups}u + g] += x * wv;
-        }
-      }
+      let column = c * wide + col_base;
+${overGroups((g) => `      let x_${g} = ${widen(`normalized[${g * channels}u + c]`)};`)}
+${overBlocks((b) => `      let wg_${b} = ${w(`weights[column + ${offsets.transition1 + b * WORKGROUP}u]`)};
+      let wv_${b} = ${w(`weights[column + ${offsets.transition1 + intermediate + b * WORKGROUP}u]`)};
+${overGroups((g) => `      gate_${b}_${g} += x_${g} * wg_${b};
+      value_${b}_${g} += x_${g} * wv_${b};`)}`)}
     }
-    for (var b = 0u; b < BLOCK; b += 1u) {
-      for (var g = 0u; g < ${groups}u; g += 1u) {
-        gated[g * CHUNK + local + b * WORKGROUP] = ${narrow(
-          "swish(gate[b * " + groups + "u + g]) * value[b * " + groups + "u + g]")};
-      }
-    }
+${overBlocks((b) => overGroups((g) => `    gated[${g * chunk + b * WORKGROUP}u + local] = ${narrow(
+      `swish(gate_${b}_${g}) * value_${b}_${g}`)};`))}
     workgroupBarrier();
 
     // transition2 is (intermediate, channels).
-    var out_slot = 0u;
-    for (var c = local; c < CHANNELS; c += WORKGROUP) {
-      for (var slot = 0u; slot < CHUNK; slot += 1u) {
-        let w = ${w("weights[W_T2 + (chunk0 + slot) * CHANNELS + c]")};
-        for (var g = 0u; g < ${groups}u; g += 1u) {
-          sum[${accumulator}] += ${acc16
-            ? `${sumVector}(gated[g * CHUNK + slot]) * f16(w)`
-            : `${widen("gated[g * CHUNK + slot]")} * w`};
-        }
-      }
-      out_slot += 1u;
+    for (var slot = 0u; slot < CHUNK; slot += 1u) {
+      let t2_row = (chunk0 + slot) * CHANNELS + local;
+${overGroups((g) => `      let g_${g} = ${acc16 ? `${sumVector}(gated[${g * chunk}u + slot])` : widen(`gated[${g * chunk}u + slot]`)};`)}
+${overOutSlots((s) => {
+  const needsGuard = s * WORKGROUP >= channels || (s === channelsPerThread - 1 && channels % WORKGROUP !== 0);
+  const body = `      let w_${s} = ${acc16 ? `f16(${w(`weights[t2_row + ${offsets.transition2 + s * WORKGROUP}u]`)})` : w(`weights[t2_row + ${offsets.transition2 + s * WORKGROUP}u]`)};
+${overGroups((g) => `      sum_${s}_${g} += g_${g} * w_${s};`)}`;
+  return needsGuard ? `      if (local + ${s * WORKGROUP}u < CHANNELS) {\n  ${body}\n      }` : body;
+})}
     }
   }
 
-  var write_slot = 0u;
-  for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    for (var g = 0u; g < ${groups}u; g += 1u) {
-      let packed = ${fromSum(`sum[${writeAccumulator}]`)};
+${overOutSlots((s) => {
+  const needsGuard = s * WORKGROUP >= channels || (s === channelsPerThread - 1 && channels % WORKGROUP !== 0);
+  const body = `  {
+    let c = local + ${s * WORKGROUP}u;
+${overGroups((g) => `    {
+      let packed = ${fromSum(`sum_${s}_${g}`)};
       ${overLanes((l, at) => `{
-        let row${l} = base_row + g * ${lanes}u + ${l}u;
+        let row${l} = base_row + ${g * lanes + l}u;
         if (row${l} < ROWS) {
           ${residual ? "input" : "output"}[row${l} * CHANNELS + c] ${residual ? "+=" : "="} packed${at};
         }
       }`).join("\n      ")}
-    }
-    write_slot += 1u;
-  }
+    }`)}
+  }`;
+  return needsGuard ? `  if (local + ${s * WORKGROUP}u < CHANNELS) {\n${body}\n  }` : body;
+})}
 }`;
 }
 

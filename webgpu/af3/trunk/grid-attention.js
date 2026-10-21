@@ -358,7 +358,7 @@ const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
 
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${channels}>;
 var<workgroup> partial_sum: array<f32, 64>;
-var<workgroup> partial_squares: array<f32, 64>;
+${variance === "fast" ? "var<workgroup> partial_squares: array<f32, 64>;\n" : ""}\
 var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
 var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
 
@@ -380,21 +380,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let slot = local / LANES_PER_ROW;
   let lane = local % LANES_PER_ROW;
   var total = 0.0;
-  var squares = 0.0;
+  ${variance === "fast" ? "var squares = 0.0;" : ""}
   for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
     let value = tile[slot * CHANNELS + c];
     total += value;
-    squares += value * value;
+    ${variance === "fast" ? "squares += value * value;" : ""}
   }
   partial_sum[local] = total;
-  partial_squares[local] = squares;
+  ${variance === "fast" ? "partial_squares[local] = squares;" : ""}
   workgroupBarrier();
   if (lane == 0u) {
     var row_total = 0.0;
-    var row_squares = 0.0;
+    ${variance === "fast" ? "var row_squares = 0.0;" : ""}
     for (var l = 0u; l < LANES_PER_ROW; l += 1u) {
       row_total += partial_sum[slot * LANES_PER_ROW + l];
-      row_squares += partial_squares[slot * LANES_PER_ROW + l];
+      ${variance === "fast" ? "row_squares += partial_squares[slot * LANES_PER_ROW + l];" : ""}
     }
     let mean = row_total / f32(CHANNELS);
     ${variance === "fast"
@@ -638,7 +638,7 @@ ${overRows((r) => `  var lo${r} = vec4<f32>(0.0);
     let base = W_QKVG + c * WIDTH + c0;
     let wlo = weights[base];
     let whi = weights[base + 1u];
-${overRows((r) => `    let a${r} = act[${r}u * CHANNELS + c];
+${overRows((r) => `    let a${r} = act[${r * channels}u + c];
     lo${r} += a${r} * wlo;
     hi${r} += a${r} * whi;`)}
   }
@@ -669,7 +669,7 @@ ${project16 ? `
 ${overRows((r) => `    var part${r} = vec4<f16>(0.0);`)}
     for (var c = c0; c < min(c0 + 32u, CHANNELS); c += 1u) {
       let w = vec4<f16>(weights[W_QKVG + c * WIDTH + out]);
-${overRows((r) => `      part${r} = fma(vec4<f16>(act[${r}u * CHANNELS + c]), w, part${r});`)}
+${overRows((r) => `      part${r} = fma(vec4<f16>(act[${r * channels}u + c]), w, part${r});`)}
     }
 ${overRows((r) => `    acc${r} += vec4<f32>(part${r});`)}
   }
@@ -678,7 +678,7 @@ ${overRows((r) => `    acc${r} += vec4<f32>(part${r});`)}
     // (channels, out, 4) - see packGridAttentionWeights - so consecutive
     // threads read consecutive vec4s, and this one load is used ROWS times.
     let w = weights[W_QKVG + c * WIDTH + out];
-${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
+${overRows((r) => `    acc${r} += act[${r * channels}u + c] * w;`)}
   }
 `}
 ${overRows((r) => `  if (first + ${r}u < ${LIVE}) {
@@ -882,8 +882,12 @@ ${unroll((t) => packGathered
   // Gate, project down, and undo the transpose so the residual lands on the
   // orientation it came from.
   const OUT_ROWS = projectOutRows;
+  const OUT_VEC4 = OUT_ROWS % 4 === 0;
+  const OUT_GROUPS = OUT_ROWS / 4;
   const overOutRows = (body) =>
     Array.from({ length: OUT_ROWS }, (_, r) => body(r)).join("\n");
+  const overOutGroups = (body) =>
+    Array.from({ length: OUT_GROUPS }, (_, g) => body(g)).join("\n");
   const project_out = `${common}
 const OUT_ROWS: u32 = ${OUT_ROWS}u;
 @group(0) @binding(0) var<storage, read> gathered: array<${storageArray(gatheredStorage)}>;
@@ -893,7 +897,7 @@ const OUT_ROWS: u32 = ${OUT_ROWS}u;
 ${chunkBinding(4)}
 
 // OUT_ROWS gated rows, so one read of the output matrix serves all of them.
-var<workgroup> gated: array<f32, ${width} * ${OUT_ROWS}>;
+var<workgroup> gated: array<${OUT_VEC4 ? `vec4<f32>, ${width * OUT_GROUPS}` : `f32, ${width} * ${OUT_ROWS}`}>;
 
 // ONE LANE PER WIDTH ELEMENT WAS A CEILING, AND OpenDDE'S WIDTH IS 384.
 // This asked for as many invocations as the attention is wide - 4 heads of 32
@@ -914,7 +918,19 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED, for the reason the projection kernel
   // gives: PAIRS is rarely a multiple of the tile, and uninitialised workgroup
   // memory would reach real rows sharing the tile.
-  for (var r = 0u; r < OUT_ROWS; r += 1u) {
+${OUT_VEC4 ? `  for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
+${overOutGroups((g) => {
+  const r0 = g * 4;
+  return `${[0, 1, 2, 3].map((l) => {
+    const r = r0 + l;
+    return `    let row_${r} = first + ${r}u;
+    let idx_${r} = select(0u, row_${r} * WIDTH + w, row_${r} < ${LIVE});
+    let val_${r} = select(0.0, ${storedElement(gatheredStorage, "gathered", `idx_${r}`)}
+      * logistic(${storedElement(store4.gate, "gate", `idx_${r}`)}), row_${r} < ${LIVE});`;
+  }).join("\n")}
+    gated[${g * width}u + w] = vec4<f32>(val_${r0}, val_${r0 + 1}, val_${r0 + 2}, val_${r0 + 3});`;
+})}
+  }` : `  for (var r = 0u; r < OUT_ROWS; r += 1u) {
     let row = first + r;
     for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
       let index = select(0u, row * WIDTH + w, row < ${LIVE});
@@ -922,16 +938,27 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
         select(0.0, ${storedElement(gatheredStorage, "gathered", "index")}
           * logistic(${storedElement(store4.gate, "gate", "index")}), row < ${LIVE});
     }
-  }
+  }`}
   workgroupBarrier();
 
   for (var c = local; c < CHANNELS; c += ${projectLanesFor(width)}u) {
-${overOutRows((r) => `    var sum${r} = 0.0;`)}
+${OUT_VEC4 ? `${overOutGroups((g) => `    var sum${g} = vec4<f32>(0.0);`)}
+    for (var w = 0u; w < WIDTH; w += 1u) {
+      let weight = weights[W_OUT + w * CHANNELS + c];
+${overOutGroups((g) => `      sum${g} += gated[${g * width}u + w] * weight;`)}
+    }
+${offsets.outputProjectionBias === undefined ? "" : `    let out_bias = vec4<f32>(weights[W_OUT_BIAS + c]);
+${overOutGroups((g) => `    sum${g} += out_bias;`)}`}
+${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
+      let row${r} = ${chunked ? "chunk.x * N + " : ""}first + ${r}u;
+      let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
+      output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${Math.floor(r / 4)}.${"xyzw"[r % 4]};
+    }`)}` : `${overOutRows((r) => `    var sum${r} = 0.0;`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
       // Consecutive threads read consecutive channels, and this one load is
       // then used OUT_ROWS times.
       let weight = weights[W_OUT + w * CHANNELS + c];
-${overOutRows((r) => `      sum${r} += gated[${r}u * ${width}u + w] * weight;`)}
+${overOutRows((r) => `      sum${r} += gated[${r * width}u + w] * weight;`)}
     }
 ${offsets.outputProjectionBias === undefined ? "" : `    // rosettafold3's output-projection bias. Added to the SUM rather than to
     // the destination, so a residual write adds it once and not once per
@@ -941,7 +968,7 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
       let row${r} = ${chunked ? "chunk.x * N + " : ""}first + ${r}u;
       let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
       output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${r};
-    }`)}
+    }`)}`}
   }
 }`;
 
@@ -1038,6 +1065,10 @@ ${chunked ? `  let local_row = group.y;
   // dimensions are kg * 4 ..
   let qg = local / 8u;
   let kg = local % 8u;
+  let qg_stride = qg * STRIDE;
+  let kg_stride = kg * STRIDE;
+  let kp_read_base = qg * ${PV}u;
+  let kp_write_base = kg * ${PSTRIDE}u + kp_read_base;
 
   for (var index = local; index < ${BQ * 8}u; index += 64u) {
     let slot = index / HD4;
@@ -1063,8 +1094,8 @@ ${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
 
 ${eachAB((a, b) => `    var s${a}_${b} = 0.0;`)}
 ${T.map((t) => `    {
-${eachA((a) => `      let qv${a} = q_tile[(${a * 8}u + qg) * STRIDE + ${t}u];`)}
-${eachB((b) => `      let kv${b} = ${H ? "k_tile" : "kp_tile"}[(${b * 8}u + kg) * STRIDE + ${t}u];`)}
+${eachA((a) => `      let qv${a} = q_tile[qg_stride + ${a * 72 + t}u];`)}
+${eachB((b) => `      let kv${b} = ${H ? "k_tile" : "kp_tile"}[kg_stride + ${b * 72 + t}u];`)}
 ${eachAB((a, b) => `      s${a}_${b} += ${H ? `f32(dot(qv${a}, kv${b}))` : `dot(qv${a}, kv${b})`};`)}
     }`).join("\n")}
 
@@ -1072,7 +1103,7 @@ ${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
     let jc${b} = min(key${b}, N - 1u);${MF ? "" : `
     let masked${b} = mask[${transpose ? `jc${b} * N + row` : `row * N + jc${b}`}];`}`)}
 ${biasVec4 ? eachA((a) => `    let bv${a} = bias[(bias_row${a} + j0) / 4u + kg];`) : ""}
-${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + ${biasVec4 ? `bv${a}[${b}]` : `bias[bias_row${a} + jc${b}]`};
+${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + ${biasVec4 ? `bv${a}.${"xyzw"[b]}` : `bias[bias_row${a} + jc${b}]`};
 ${MF ? "" : `    if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
 `}    if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
 ${SG ? "" : `${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
@@ -1089,12 +1120,12 @@ ${BKs.map((b) => `    let p${a}_${b} = exp(logit${a}_${b} - new_m${a});`).join("
     l${a} = l${a} * alpha${a} + (${BKs.map((b) => `p${a}_${b}`).join(" + ")});
     o${a} = o${a} * alpha${a};`)}
 ${eachB((b) => Array.from({ length: PV }, (_, part) =>
-    `    kp_tile[(${b * 8}u + kg) * ${PSTRIDE}u + qg * ${PV}u + ${part}u] = ${toT(`vec4<f32>(${[0, 1, 2, 3].map((c) => `p${part * 4 + c}_${b}`).join(", ")})`)};`).join("\n"))}
+    `    kp_tile[kp_write_base + ${b * 8 * PSTRIDE + part}u] = ${toT(`vec4<f32>(${[0, 1, 2, 3].map((c) => `p${part * 4 + c}_${b}`).join(", ")})`)};`).join("\n"))}
     workgroupBarrier();
     for (var key = 0u; key < ${BK}u; key += 1u) {
       let vv = ${fromT("v_tile[key * HD4 + kg]")};
-${Array.from({ length: PV }, (_, part) => `      let p${part} = ${fromT(`kp_tile[key * ${PSTRIDE}u + qg * ${PV}u + ${part}u]`)};
-${[0, 1, 2, 3].map((c) => `      o${part * 4 + c} += p${part}[${c}] * vv;`).join("\n")}`).join("\n")}
+${Array.from({ length: PV }, (_, part) => `      let p${part} = ${fromT(`kp_tile[key * ${PSTRIDE}u + kp_read_base + ${part}u]`)};
+${[0, 1, 2, 3].map((c) => `      o${part * 4 + c} += p${part}.${"xyzw"[c]} * vv;`).join("\n")}`).join("\n")}
     }
   }
 

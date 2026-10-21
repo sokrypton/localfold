@@ -114,7 +114,7 @@ import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
   GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
-  compilePairTrack, createAddShader, encodePairTrack,
+  compilePairTrack, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track.js";
 import {
@@ -521,8 +521,12 @@ export class Af3PairformerStackGpu {
       offset: blocks[0].singlePairLogitsNormOffset,
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
-    into("singleTransition", `${base}:single-transition:${weightPrecision}`,
+    const singleTransitionTile = shapedKnob(deviceTuning(this.device).singleTransitionTile)
+      ?? transitionRowTile(n, singleChannels);
+    pipelines.singleTransitionTile = singleTransitionTile;
+    into("singleTransition", `${base}:single-transition:${weightPrecision}:t${singleTransitionTile}`,
       createTransitionShader({ rows: n, channels: singleChannels, factor: 4, weightPrecision,
+                               residual: true, tile: singleTransitionTile,
                                // The single track is `n` rows, not n^2 - the
                                // shortest dispatch in the trunk.
                                threadTarget: deviceTuning(this.device).transitionThreadTarget,
@@ -533,20 +537,23 @@ export class Af3PairformerStackGpu {
     // 🔴 THE SPLIT COUNT IS AN OCCUPANCY CHOICE, SO THE DEVICE MAKES IT.
     const singleTuning = deviceTuning(this.device);
     const singleDimension = blocks[0].singleAttention.dimension;
+    const singleProjectRows = shapedKnob(singleTuning.singleProjectRows) ?? 1;
     // 🔴 EVERY NON-SHADER FIELD HAS TO COME OUT OF THIS REST, because the loop
     // below compiles whatever is left. Adding `projectLanes` to the factory's
     // return handed CreateShaderModule the number 64 as a shader.
     const { projectSplits, projectLanes: resolvedLanes, projectOutLanes: _outLanes,
-      ...singleSources } = createSingleAttentionShaders(
+      projectRows: resolvedProjectRows, ...singleSources } = createSingleAttentionShaders(
       { n, channels: singleChannels, heads, dimension: singleDimension,
-        weightPrecision,
+        weightPrecision, residual: true, projectRows: singleProjectRows,
         projectSplits: singleProjectSplits(n, heads * singleDimension,
-          singleTuning.singleProjectWorkgroupTarget, singleTuning.singleProjectMaxSplits),
+          singleTuning.singleProjectWorkgroupTarget, singleTuning.singleProjectMaxSplits,
+          singleProjectRows),
         projectLanes: singleTuning.singleProjectLanes ?? undefined,
         projectOutLanes: singleTuning.singleProjectOutLanes ?? undefined },
       singleOffsets, epsilon, variance);
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
+    pipelines.singleProjectRows = resolvedProjectRows;
     for (const [name, source] of Object.entries(singleSources)) {
       // 🔴 THE SPLIT COUNT IS IN THE SHADER AND WAS NOT IN THE KEY.
       // `projectSplits` is derived from `singleProjectWorkgroupTarget` and
@@ -566,12 +573,11 @@ export class Af3PairformerStackGpu {
       // until an audit ran the arm.
       into(`single:${name}`, `${base}:single:${weightPrecision}`
         + `:${resolvedLanes}`
-        + `:${singleTuning.singleProjectOutLanes ?? 64}:s${projectSplits}:${name}`, source);
+        + `:${singleTuning.singleProjectOutLanes ?? 64}:s${projectSplits}:pr${resolvedProjectRows}:r1:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
       createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,
                              extraPairBiasData !== undefined));
-    into("addSingle", `${base}:add-single`, createAddShader(n * singleChannels));
     await Promise.all(compiling);
     // 🔴 A WARM STOPS HERE. Everything above is widths, offset tables and
     // shader sources - all of it derivable from the manifest's shapes, none of
@@ -658,7 +664,7 @@ export class Af3PairformerStackGpu {
         "af3-block.pair-logits", heads * pairs * 4, storage));
       const singleWidth = heads * blocks[0].singleAttention.dimension;
       const singleScratch = [];
-      for (let index = 0; index < 6; index += 1) {
+      for (let index = 0; index < 5; index += 1) {
         singleScratch.push(keep(this.allocator.allocate(
           `af3-block.single-scratch${index}`,
           Math.max(n * singleWidth, n * singleChannels) * 4, storage)));
@@ -1079,22 +1085,19 @@ export class Af3PairformerStackGpu {
           : [pair, logitsWeights, logitsWeights, pairLogits, extraPairBias],
         linear[0], linear[1]);
 
+    const singleTiles = ceil(n, pipelines.singleProjectRows);
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],
-         singleScratch[3]], n * pipelines.singleProjectSplits);
+         singleScratch[3]], singleTiles * pipelines.singleProjectSplits);
     run("single.attend", pipelines["single:attend"],
         [singleScratch[0], singleScratch[1], singleScratch[2], pairLogits, seqMask,
          singleScratch[4]], n * heads);
     run("single.project-out", pipelines["single:project_out"],
-        [singleScratch[4], singleScratch[3], singleWeights, singleScratch[5]], n);
-    const addSingle = spread(ceil(n * singleChannels, 64));
-    run("single.add", pipelines.addSingle, [single, singleScratch[5]], addSingle[0], addSingle[1]);
+        [singleScratch[4], singleScratch[3], singleWeights, single], singleTiles);
 
     run("single-transition", pipelines.singleTransition,
-        [single, singleTransitionWeights, singleScratch[0]],
-        ceil(n, transitionRowTile(n, singleChannels)));
-    run("single-transition.add", pipelines.addSingle, [single, singleScratch[0]],
-        addSingle[0], addSingle[1]);
+        [single, singleTransitionWeights],
+        ceil(n, pipelines.singleTransitionTile));
 
     // Submitted, not awaited: the queue keeps the work in order, and the batch
     // this block belongs to drains once for all of them.

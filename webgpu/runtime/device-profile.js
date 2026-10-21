@@ -337,6 +337,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // device at any tile; the workgroup WIDTH is the only axis left. null keeps
   // the 128 every caller had. See transitionWidth.
   transitionThreadTarget: null,
+  singleTransitionTile: null,
+  singleProjectRows: null,
   // 🔴 THE SINGLE ATTENTION'S TWO WORKGROUP WIDTHS. Both were 64 everywhere;
   // null keeps that. See createSingleAttentionShaders.
   singleProjectLanes: null,
@@ -1324,6 +1326,8 @@ const PRIORS = new Map([
     linearHalfTile: "16x16x4x8",
     attentionOutputHalfTile: "16x16x4x8",
     attentionProjectHalfTile: "16x16x4x2",
+    singleTransitionTile: 4,
+    singleProjectRows: 4,
     // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
     // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
     // row 128 x 255 6.13 -> 5.05 ms, column 128 x 255 3.18 -> 2.55, column 512 x 255 48.4 -> 38.9, triangle 255 x 255
