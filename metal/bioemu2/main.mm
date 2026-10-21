@@ -2,14 +2,19 @@
 // trunk (4 MSA layers, 48 triangle-multiplication blocks, 4 passes), the distogram, and the dual-stream denoiser under
 // its EDM sampler. cuda/bioemu2 is the reading; the weights are the page's int5 bundle.
 //
-//   localfold-bioemu2 <input dir> --bundle=<model-bioemu2-int5> [--oracle=<dir>] [--out=fold.pdb] [--samples=5]
-//       [--steps=200] [--seed=N] [--step-scale=S] [--passes=4]
+//   localfold-bioemu2 --job=<job.json> | --sequence=<SEQ> [--out=fold.pdb] [...]   the weights fetched, the input
+//       featurised in this process, the fold (cuda/featurise/standalone.h - every port's command line)
+//   localfold-bioemu2 <input dir> (--weights=<af3am-bioemu2> | --bundle=<model-bioemu2-int5>) [--oracle=<dir>]
+//       [--out=fold.pdb] [--samples=5] [--steps=200] [--seed=N] [--step-scale=S] [--passes=4] [--f32] [--profile]
 // <input dir> is cuda/featurise's bioemu2-featurise output; its mode (structure, equilibrium, propagation) is the input's.
+// --weights is af3-any-model's int8 blob - what fetch.h fetches, cuda/bioemu2 and the worker fold with - read as the
+// bundle (weights.mm); --bundle the page's int5 bundle, which --oracle's WebGPU dumps are made from.
 //
 // --oracle=<dir>: tools/dump-bioemu2-webgpu.mjs's dump of webgpu/bioemu2 on the same bundle, and every stage held to it
 // - EACH FED THE ORACLE'S OWN INPUT (as tools/gpu/check-bioemu2-network.js holds webgpu/bioemu2 to the colab dumps), so a
 // residual is that stage's alone and a bug cannot hide behind, or be blamed on, an upstream one.
 #include "bioemu2.h"
+#include "standalone_api.h"
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -176,18 +181,40 @@ int foldInput(const Opts& o) {
 
 }  // namespace
 
+int foldMain(int argc, char** argv);
+
 int main(int argc, char** argv) {
   if (getenv("LOCALFOLD_METAL_SPECS_NAME")) { printf("%s\n", specsName("bioemu2").c_str()); return 0; }
+  if (argc == 2 && !strncmp(argv[1], "--list-weights=", 15)) {     // (every tensor of a weights directory, and its shape)
+    for (auto& [n, shape] : Model::bundleShapes(argv[1] + 15)) {
+      printf("%s [", n.c_str());
+      for (size_t k = 0; k < shape.size(); ++k) printf("%s%lld", k ? ", " : "", shape[k]);
+      printf("]\n");
+    }
+    return 0;
+  }
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("bioemu2", argc, argv, foldMain);
+  return foldMain(argc, argv);
+}
+
+int foldMain(int argc, char** argv) {
   if (argc < 2 || !strncmp(argv[1], "--", 2)) {
     fprintf(stderr, "usage: localfold-bioemu2 <input dir> --bundle=<model-bioemu2-int5> [--oracle=<dir>] [--out=fold.pdb]"
                     " [--samples=5] [--steps=200] [--seed=N] [--step-scale=S] [--passes=4] [--f32] [--profile]\n");
     return 1;
   }
   Opts o; o.dir = argv[1];
-  std::string bundle;
+  std::string bundle, blob, sampler = "edm", compareWith;
+  bool waitInput = false;
   for (int i = 2; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundle = a + 9;
+    else if (!strncmp(a, "--weights=", 10)) blob = a + 10;
+    else if (!strncmp(a, "--compare-weights=", 18)) compareWith = a + 18;
+    else if (!strcmp(a, "--fast")) {}                        // (the standalone path's; the fast arm is the default here)
+    else if (!strncmp(a, "--wait-input", 12)) waitInput = true;   // (the featuriser still writing the input: standalone.h)
+    else if (!strncmp(a, "--sampler=", 10)) sampler = a + 10;
+    else if (!strncmp(a, "--potentials=", 13)) sampler = "steered";
     else if (!strncmp(a, "--oracle=", 9)) o.oracle = a + 9;
     else if (!strncmp(a, "--out=", 6)) o.out = a + 6;
     else if (!strncmp(a, "--seed=", 7)) o.seed = strtoull(a + 7, nullptr, 10);
@@ -199,7 +226,15 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "--profile")) o.profile = true;     // (every labelled dispatch timed: proportions, not speed)
     else { fprintf(stderr, "unknown flag %s\n", a); return 1; }
   }
-  if (bundle.empty()) { fprintf(stderr, "--bundle=<dir holding the bioemu2 int5 bundle's manifest.json>\n"); return 1; }
+  if (bundle.empty() == blob.empty()) {
+    fprintf(stderr, "one of --weights=<af3-any-model's bioemu2 blob directory> or --bundle=<the int5 bundle's directory>\n");
+    return 1;
+  }
+  if (sampler != "edm") {
+    // (cuda/bioemu2's steer.h is host code and would come across - docs/BIOEMU2.md, "Not done yet")
+    fprintf(stderr, "Error: BioEmu2's steered samplers (--sampler=edm_gd|edm_fk|edm_fkc, --potentials) are not on Metal yet: the edm sampler\n");
+    return 1;
+  }
   if (o.steps < 2) { fprintf(stderr, "BioEmu2 samples with at least 2 steps, got %d\n", o.steps); return 1; }
   if (o.profile && !profiling()) setenv("LOCALFOLD_PROFILE", "1", 1);
   const double tStart = now();
@@ -207,9 +242,46 @@ int main(int argc, char** argv) {
   // the weights decoded on the device: the large matrices straight to float16 on the fast arm (a vector, a table, a norm
   // stays float32; anything an elementwise kernel reads as float gets a float32 copy on demand), every tensor float32
   // on the reference arm
-  M.loadBundle(bundle, "w", [](const std::string&, size_t elements) { return HALF && elements >= 65536; });
+  auto asHalf = [](const std::string&, size_t elements) { return HALF && elements >= 65536; };
+  if (!bundle.empty()) M.loadBundle(bundle, "w", asHalf);
+  else loadBlobAsBundle(blob, asHalf);
   mt::sync();
   printf("weights up in %.2f s (%.2f GB)\n", now() - tStart, M.weightBytes() / 1e9);
+  if (waitInput) {          // the featuriser writes model.idx last, by a rename
+    const std::string idx = o.dir + "/model.idx", failed = o.dir + "/model.failed";
+    while (access(idx.c_str(), R_OK) != 0) {
+      if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "bioemu2: the input's export failed\n"); return 1; }
+      usleep(1000);
+    }
+  }
+  if (!compareWith.empty()) {
+    // every tensor these weights give the port against another set's (the blob walked into the bundle's layout against
+    // the int5 bundle itself): a right layout differs by the two quantisations - a few percent - and a wrong one (a
+    // transpose missed, an interleave or the incoming triangle's swap undone) is uncorrelated, relRMS ~1.4
+    M.loadBundle(compareWith, "v");
+    mt::sync();
+    double worst = 0; std::string worstName; size_t n = 0, bad = 0;
+    for (auto& [name, shape] : Model::bundleShapes(compareWith)) {
+      const std::string w = "w/" + name, v = "v/" + name;
+      if (!M.has(w)) { printf("  MISSING %s\n", name.c_str()); ++bad; continue; }
+      if (M.len(w) != M.len(v)) { printf("  LENGTH %s %zu against %zu\n", name.c_str(), M.len(w), M.len(v)); ++bad; continue; }
+      const double r = relRms(M.hostF(w), M.hostF(v), M.len(v));
+      if (r > 0.1) { printf("  %-100s %.3e\n", name.c_str(), r); ++bad; }
+      if (r > worst) { worst = r; worstName = name; }
+      ++n;
+    }
+    printf("%zu tensors, %zu past 0.1, worst %.3e (%s)\n", n, bad, worst, worstName.c_str());
+    // the reshaped ones by name, and a NEGATIVE CONTROL - two different tensors of one shape - that must read ~1.4, or
+    // this comparison could not tell a wrong layout from a right one
+    for (const char* t : {"msa/0/triangleMultiplicationOutgoing/projection", "msa/0/triangleMultiplicationIncoming/projection",
+                          "pairmixer/47/triangleMultiplicationIncoming/gate", "pairmixer/5/triangleMultiplicationOutgoing/outputProjection",
+                          "pairmixer/5/pairTransition/transition1", "pairmixer/5/pairTransition/transition2"})
+      printf("  %-60s %.3e\n", t, relRms(M.hostF(std::string("w/") + t), M.hostF(std::string("v/") + t), M.len(std::string("v/") + t)));
+    const std::string a = "msa/0/triangleMultiplicationOutgoing/projection", b = "msa/0/triangleMultiplicationIncoming/projection";
+    printf("  negative control (%s against the bundle's incoming one) %.3e\n", a.c_str(),
+           relRms(M.hostF("w/" + a), M.hostF("v/" + b), M.len("v/" + b)));
+    return bad ? 1 : 0;
+  }
   M.loadInput(o.dir);
   if (!o.oracle.empty()) M.loadInput(o.oracle);
   const int rc = foldInput(o);

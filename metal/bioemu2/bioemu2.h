@@ -23,7 +23,10 @@ constexpr int WQ = 32, WK = 128, CTX = (WK - WQ) / 2;   // atom query / key wind
 constexpr float SIGMA_DATA = 16.f;
 
 // ---------------------------------------------------------------- weights and inputs (ops.mm)
-// the bundle's tensors under "w/", float32 (every one decoded so on this arm)
+// af3-any-model's int8 blob (fetch.h's `bioemu2`, what cuda/bioemu2 folds with) read AS the page's bundle - the same
+// names and layouts under "w/" (weights.mm); asHalf: which tensors to decode to float16
+void loadBlobAsBundle(const std::string& dir, const std::function<bool(const std::string&, size_t)>& asHalf);
+// the bundle's tensors under "w/"
 bool hasW(const std::string& n);
 const float* Wf(const std::string& n);
 const float* WfOpt(const std::string& n);      // (null where the bundle has none)

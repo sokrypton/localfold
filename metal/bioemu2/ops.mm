@@ -16,6 +16,8 @@ const float* Wf(const std::string& n) {
 const float* WfOpt(const std::string& n) { return M.has(wn(n)) ? M.f(wn(n)) : nullptr; }
 int dimW(const std::string& n, int k) {
   if (!M.has(wn(n))) die("BioEmu2: the bundle has no %s", n.c_str());
+  const std::string r = wn(n) + "#r";          // (a weight walk's tensor - the blob's - carries its shape as metadata)
+  if (M.has(r)) return k < (int)M.meta(r) ? (int)M.meta(wn(n) + "#" + std::to_string(k)) : 1;
   return k < M.rank(wn(n)) ? (int)M.dim(wn(n), k) : 1;
 }
 size_t lenW(const std::string& n) { return M.len(wn(n)); }
