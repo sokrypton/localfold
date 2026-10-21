@@ -91,16 +91,19 @@ kernel void be2_window_bias(LF_ARGS(Be2WindowBiasArgs)) {
     a.out[(((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK + j] = s;
   }
 }
-// AttentionPairBiasSlidingWindow: a threadgroup per (window, head) of 32 threads, a thread per query; online softmax over
-// the 128 keys (head width 32). Several samples stacked on the rows, N atoms each; every sample reads one bias
+// AttentionPairBiasSlidingWindow: a threadgroup per (window, head) of 128 threads, FOUR lanes a query, each over a
+// quarter of the 128 keys (its own online softmax), merged by shuffles - cuda/bioemu2's windowAttention4K, its float
+// path's too. (A thread a query was latency-bound: 360 threadgroups of 32 at 68 tokens, each thread a serial chain over
+// every key - 0.74 ms a call, ~130 GFLOP/s.) Head width 32. Several samples stacked on the rows, N atoms each
 kernel void be2_window_attention(constant Be2WindowAttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                                 uint i [[thread_index_in_threadgroup]]) {
-  constexpr int HD = 32;
+                                 uint tid [[thread_index_in_threadgroup]]) {
+  constexpr int HD = 32, SPLIT = 4, KS = BE2_WK / SPLIT;
   const uint wg = tg.x, h = tg.y, D = a.H * HD, NW = a.N / BE2_WQ, smp = wg / NW, w = wg % NW;
+  const uint i = tid / SPLIT, part = tid % SPLIT;
   const ulong base = (ulong)smp * a.N;
   // (the keys and values are 32 KB, Apple's whole threadgroup allowance: the key mask is read per key from the device)
   threadgroup float sk[BE2_WK][HD], sv[BE2_WK][HD];
-  for (uint e = i; e < BE2_WK * HD; e += BE2_WQ) {
+  for (uint e = tid; e < BE2_WK * HD; e += BE2_WQ * SPLIT) {
     int j = e / HD, d = e % HD, ka = (int)(w * BE2_WQ) - BE2_CTX + j;
     bool ok = ka >= 0 && ka < (int)a.N;
     sk[j][d] = ok ? a.qkv[(base + ka) * 3 * D + D + h * HD + d] : 0.f;
@@ -114,8 +117,10 @@ kernel void be2_window_attention(constant Be2WindowAttnArgs& a [[buffer(0)]], ui
   device const float* b = a.bias + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK;
   float mx = -INFINITY, sum = 0, acc[HD];
   for (int d = 0; d < HD; ++d) acc[d] = 0;
-  for (int j = 0; j < BE2_WK; ++j) {
-    float l = 0; for (int d = 0; d < HD; ++d) l += q[d] * sk[j][d];
+  for (int jj = 0; jj < KS; ++jj) {
+    const int j = jj * SPLIT + (int)part;          // (interleaved: the four lanes read neighbouring keys)
+    float l = 0;
+    for (int d = 0; d < HD; ++d) l += q[d] * sk[j][d];
     const int ka = (int)(w * BE2_WQ) - BE2_CTX + j;
     l = ka >= 0 && ka < (int)a.N && a.pad[ka] ? l + b[j] : BE2_NEG_INF;
     float nm = max(mx, l), f = exp(mx - nm), e = exp(l - nm);
@@ -123,7 +128,15 @@ kernel void be2_window_attention(constant Be2WindowAttnArgs& a [[buffer(0)]], ui
     for (int d = 0; d < HD; ++d) acc[d] = acc[d] * f + e * sv[j][d];
     mx = nm;
   }
-  for (int d = 0; d < HD; ++d) a.out[qa * D + h * HD + d] = acc[d] / sum;
+  // the four parts' online softmaxes merged (lanes 4i .. 4i + 3 of a simdgroup)
+  for (ushort o = 1; o < SPLIT; o <<= 1) {
+    float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sum, o);
+    float nm = max(mx, om), f = exp(mx - nm), fo = exp(om - nm);
+    sum = sum * f + os * fo;
+    for (int d = 0; d < HD; ++d) { float oa = simd_shuffle_xor(acc[d], o); acc[d] = acc[d] * f + oa * fo; }
+    mx = nm;
+  }
+  if (part == 0) for (int d = 0; d < HD; ++d) a.out[qa * D + h * HD + d] = acc[d] / sum;
 }
 // AttentionPairBias over all T tokens of each stacked sample: a thread per (sample, head, query), online softmax over
 // the keys; qkv [samples T][3D] (q, k, v thirds), bias [H][T][T]; out [samples T][D]. (The float32 reference arm: the

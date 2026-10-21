@@ -92,7 +92,7 @@ static void attentionF32(const CondLayer& L, const float* x, float* h, int R, in
   if (L.windowed) {
     if (D / L.heads != 32) die("BioEmu2: an atom head of %d (this port is written for 32)", D / L.heads);
     if (R % WQ || perSample % WQ) die("BioEmu2: %d atom rows are not whole windows", R);
-    run("be2_window_attention", Grid{(uint32_t)(R / WQ), (uint32_t)L.heads, 1}, WQ,
+    run("be2_window_attention", Grid{(uint32_t)(R / WQ), (uint32_t)L.heads, 1}, WQ * 4,
         Be2WindowAttnArgs{qkv, Wf(a + "proj_q_bias"), bias, Iin("atom_pad_mask"), o, (uint)perSample, (uint)L.heads});
   } else {
     if (D / L.heads > 64) die("BioEmu2: a token head of %d (at most 64 here)", D / L.heads);

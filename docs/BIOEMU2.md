@@ -71,7 +71,7 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
 |---|---|---|---|---|
 | CUDA (Colab, `localfold-bioemu2`) | `cuda/bioemu2`, `cuda/bioemu2/gate.py` | 1.6e-6 .. 3.6e-6 relRMS on six targets; `--fast` (f16 GEMMs, ef2's fused trunk) 1.7e-3 .. 3.2e-3; int8 blob 5-7e-3 trunk, which is the quantisation (decoded tensors match colab's dequantiser to four digits) | 6MRR single sequence 2.78-3.04 A over 5 samples, mean 2.88 - colab's own 2.88-3.20, mean 3.06; bonds against the CCD ideals equal to colab's (mainchain 0.034, side chains 0.052, nucleic 0.037 vs 0.036, ligand + SEP 0.084 vs 0.077) | 5 samples x 200 steps: 71 tokens 3.3 s, 255 tokens 7.0 s, 494 tokens 13.2 s; warm `--serve` trunk 100 ms at 6MRR |
 | WebGPU (the page) | `webgpu/bioemu2`, `tools/gpu/check-bioemu2-network.js`, `tools/gpu/fold-bioemu2.js`; bundle `bioemu2-int5` (372 MB) | trunk single ~1e-7, pair 2.4-3.1e-4 (the AF3 pair track's float32 band over 52 blocks), denoise 2.6e-7 .. 4.2e-6, propagation 6e-7 .. 1.1e-6; int5 pair 2.6e-2, denoise 6.2e-2 at sigma 160 falling to 1.9e-3 | 6MRR (68) 0.90 / 1.58 / 1.65 A float32, 0.89 / 1.59 / 1.64 int5 on the same seed | 68 residues 1 sample 13.7 s on the page (32 ms a denoiser call), 255 residues 27.7 s |
-| Metal (this Mac, `localfold-bioemu2`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) 1.57-1.71 A over 5 samples, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, 5 samples x 200 steps at 68 tokens: the fast arm (default) trunk 0.53 s, sampler 15.7 s; the float32 arm (`--f32`) 2.3 s / 55 s |
+| Metal (this Mac, `localfold-bioemu2`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) 1.57-1.71 A over 5 samples, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, 5 samples x 200 steps at 68 tokens: the fast arm (default) trunk 0.53 s, sampler 14.5 s; the float32 arm (`--f32`) 2.3 s / 55 s |
 
 🔴 **THE 6MRR FIXTURE IS 71 RESIDUES, NOT 68**: it was read off every CA line of the crystal, which repeats K14, E43
 and D64 at their alternate locations. The oracle dumps share it, so parity is unaffected; RMSD to the crystal uses
@@ -159,8 +159,13 @@ fixture repeats three residues, so its sequence is not the crystal's and every r
 
 ## Not done yet
 
-- Metal: the fast path (float16 weights, metal/core's fused triangle and flash attention - the float32 arm's sampler is
-  ~55 s for 5 x 200 at 68 tokens), the steered samplers (`steer.h` is host code and would come across), `--job` and the
+- Metal's next speed lever is the coupling's ATOM-side mixer: its fc1 | fc2 is ~36% of the sampler and already runs at
+  ~11 TFLOP/s, so the only gain left is fewer FLOPs. The adaLN'd row is [a_token (768) | q_atom (128)], so W y splits
+  exactly into a per-TOKEN part (W_a (gamma_a (a - mean a)), once a token, not once an atom) plus the 128-wide atom part,
+  with the row's LayerNorm statistics combined from the two halves' (the parallel-variance form, not E[x^2] - mu^2,
+  which cancels on a stream with a large mean). 18.5 -> 5.4 GFLOP a layer-step at 68 tokens x 5 samples; but the
+  float32 intermediates' traffic takes most of it back - estimated 15-20% of the sampler, for the most intricate code in
+  the port. Not done. Also not done on Metal: the steered samplers (`steer.h` is host code and would come across), `--job` and the
   worker's native path (fetch.h's `bioemu2` is the int8 blob; this port reads the int5 bundle).
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
