@@ -115,6 +115,32 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
     if (out2) out2[r] = weighted2 / total * scale;
     return;
   }
+  if (bins == 50 && (((uintptr_t)logits | (uintptr_t)centres | (uintptr_t)centres2) & 7) == 0) {
+    const float2* l0 = reinterpret_cast<const float2*>(logits + r * 50);
+    const float2* l1 = symmetricN ? reinterpret_cast<const float2*>(logits + ((r % symmetricN) * symmetricN + (r / symmetricN)) * 50) : nullptr;
+    float mx = -INFINITY;
+    for (int k = 0; k < 25; ++k) {
+      float2 a = l0[k];
+      if (l1) { float2 b = l1[k]; a.x += b.x; a.y += b.y; }
+      mx = fmaxf(mx, a.x); mx = fmaxf(mx, a.y);
+    }
+    float total = 0, weighted = 0, weighted2 = 0;
+    const float2* c1 = reinterpret_cast<const float2*>(centres);
+    const float2* c2 = reinterpret_cast<const float2*>(centres2);
+    for (int k = 0; k < 25; ++k) {
+      float2 a = l0[k], c = c1[k];
+      if (l1) { float2 b = l1[k]; a.x += b.x; a.y += b.y; }
+      float p0 = expf(a.x - mx); total += p0; weighted += p0 * c.x;
+      float p1 = expf(a.y - mx); total += p1; weighted += p1 * c.y;
+      if (out2) {
+        float2 d = c2[k];
+        weighted2 += p0 * d.x; weighted2 += p1 * d.y;
+      }
+    }
+    out[r] = weighted / total * scale * (mask ? mask[r] : 1.f);
+    if (out2) out2[r] = weighted2 / total * scale;
+    return;
+  }
   auto at = [&](int b) {
     if (symmetricN == 0) return logits[r * bins + b];
     size_t i = r / symmetricN, j = r % symmetricN;

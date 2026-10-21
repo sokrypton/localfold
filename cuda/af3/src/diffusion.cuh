@@ -944,8 +944,20 @@ inline void prepareTransformer(const float* pairCond, int n) {
                            T + ".superBlocks." + std::to_string(b / perSuper) + ".pairLogitsProjection");
     if (DIFF_HALF) {
       tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
-      flatToBiasHalfK<<<blocks((size_t)heads * n * tc.stride), 256, 0, STREAM>>>(flat, tc.biasHalf[b], b % perSuper,
-                                                                              perSuper, heads, n, tc.stride);
+      if (perSuper <= 8) {
+        if ((b + 1) % perSuper == 0 || b + 1 == tc.nblocks) {
+          int sb = b / perSuper;
+          SuperBias sp{};
+          for (int k = 0; k < perSuper; ++k) sp.p[k] = sb * perSuper + k < tc.nblocks ? tc.biasHalf[sb * perSuper + k] : nullptr;
+          const int smem = 32 * (perSuper * heads + 1) * 4;
+          static int granted = 0;
+          if (smem > 48 * 1024 && smem > granted) { smemAttr(flatToBiasSuperK, smem); granted = smem; }
+          flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)n), 256, smem, STREAM>>>(flat, sp, perSuper, heads, n, tc.stride, 0);
+        }
+      } else {
+        flatToBiasHalfK<<<blocks((size_t)heads * n * tc.stride), 256, 0, STREAM>>>(flat, tc.biasHalf[b], b % perSuper,
+                                                                                perSuper, heads, n, tc.stride);
+      }
     } else {
       tc.pairLogits[b] = scratch<float>("dt.pl" + std::to_string(b), (size_t)heads * pairs);
       atomLogitsLayoutK<<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(flat, tc.pairLogits[b], b % perSuper, perSuper, 1, heads, n, n);

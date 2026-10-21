@@ -250,6 +250,32 @@ __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const floa
 __global__ void msaEmbedK(const int* rows, const float* deletion, const float* Wmsa, const float* fromTarget,
                           float* msa, size_t count, int n, int C, int width, bool pairedQuery,
                           const float* dnMsa = nullptr, const int* isDna = nullptr) {
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= count * c4) return;
+    int c = (int)(t4 % c4) << 2; size_t row = t4 / c4; int token = (int)(row % n);
+    int code = rows[row]; float d = deletion[row];
+    float4 v = (code >= 0 && code < 32) ? *reinterpret_cast<const float4*>(Wmsa + (size_t)code * C + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float cd = fminf(fmaxf(d, 0.f), 1.f);
+    float ad = atanf(d / 3.f) * (2.f / 3.14159265358979f);
+    float4 w32 = *reinterpret_cast<const float4*>(Wmsa + (size_t)32 * C + c);
+    float4 w33 = *reinterpret_cast<const float4*>(Wmsa + (size_t)33 * C + c);
+    float4 ft = *reinterpret_cast<const float4*>(fromTarget + (size_t)token * C + c);
+    v.x += cd * w32.x + ad * w33.x + ft.x;
+    v.y += cd * w32.y + ad * w33.y + ft.y;
+    v.z += cd * w32.z + ad * w33.z + ft.z;
+    v.w += cd * w32.w + ad * w33.w + ft.w;
+    if (width > 34 && pairedQuery && row < (size_t)n) {
+      float4 w34 = *reinterpret_cast<const float4*>(Wmsa + (size_t)34 * C + c);
+      v.x += w34.x; v.y += w34.y; v.z += w34.z; v.w += w34.w;
+    }
+    if (dnMsa && isDna && code == 30 && isDna[token]) {
+      float4 dn = *reinterpret_cast<const float4*>(dnMsa + c);
+      v.x += dn.x; v.y += dn.y; v.z += dn.z; v.w += dn.w;
+    }
+    reinterpret_cast<float4*>(msa)[t4] = v;
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n);
@@ -672,7 +698,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   size_t rows = (size_t)t.S * n;
   int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
   if (msaWidth != 34 && msaWidth != 35) { fprintf(stderr, "msa feature width %d\n", msaWidth); exit(1); }
-  msaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
+  msaEmbedK<<<blocks((t.Cm & 3) == 0 ? (rows * (t.Cm >> 2)) : (rows * t.Cm)), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
                                                      fromTarget, t.msa, rows, n, t.Cm, msaWidth,
                                                      M.flag("trunk.dialect.msaPairedQueryRow")
                                                        || (M.flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1),
@@ -1012,8 +1038,12 @@ void outerProductMean(Trunk& t, const std::string& pre) {
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)rows, O, &one, Wo, CUDA_R_16F, C, (long long)O * C,
                                     R, CUDA_R_16F, O, 0, &zero, Tc, CUDA_R_16F, C, (long long)rows * C, O,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-      half* Lt = scratch<half>("opm.Lt", rows * O);
-      opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(L, Lt, S, n, O);
+      const half* Lt = L;
+      if (S > 1) {
+        half* LtBuf = scratch<half>("opm.Lt", rows * O);
+        opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(L, LtBuf, S, n, O);
+        Lt = LtBuf;
+      }
       int K = O * S;
       int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * C)));
       float* X = scratch<float>("opm.X", (size_t)Bi * n * C);
@@ -1125,6 +1155,58 @@ __global__ void msaWeightsK(const float* flat, const float* keyMask, float* w, i
                             bool headMajor = false, T* outT = nullptr, int ldw = 0) {
   // rows: the query rows flat holds (a sharded pair's held rows; 0, all n)
   size_t rowId = blockIdx.x;
+  if (blockDim.x == 32 && n <= 256) {
+    int lane = threadIdx.x;
+    float rv[8];
+    float mx = -INFINITY;
+    if (headMajor) {
+      const float* fl = flat + rowId * n;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int j = lane + k * 32;
+        if (j < n) {
+          float v = fl[j] + 1e9f * (keyMask[j] - 1.f);
+          rv[k] = v; mx = fmaxf(mx, v);
+        }
+      }
+    } else {
+      const int R = rows ? rows : n;
+      int h = (int)(rowId / R), i = (int)(rowId % R);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int j = lane + k * 32;
+        if (j < n) {
+          float v = flat[((size_t)i * n + j) * heads + h] + 1e9f * (keyMask[j] - 1.f);
+          rv[k] = v; mx = fmaxf(mx, v);
+        }
+      }
+    }
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      int j = lane + k * 32;
+      if (j < n) { float e = expf(rv[k] - mx); rv[k] = e; s += e; }
+    }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float inv = 1.f / s;
+    if (outT) {
+      T* oT = outT + rowId * ldw;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int j = lane + k * 32;
+        if (j < ldw) oT[j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
+      }
+    } else {
+      float* out = w + rowId * n;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int j = lane + k * 32;
+        if (j < n) out[j] = rv[k] * inv;
+      }
+    }
+    return;
+  }
   extern __shared__ float srow[];
   float* out = (outT && n <= 4096) ? srow : w + rowId * n;
   __shared__ float red[8];
@@ -1212,10 +1294,22 @@ __global__ void msaFromHeadsV(const T* o, const T* gate, T* out, int S, int n, i
   unsigned c8 = t % Wd8, si = t / Wd8, i = si % n, s = si / n, h = c8 / d8, e8 = c8 % d8;
   const uint4 ov = *reinterpret_cast<const uint4*>(o + (((size_t)h * n + i) * S + s) * d + e8 * 8);
   const uint4 gv = *reinterpret_cast<const uint4*>(gate + (size_t)t * 8);
-  const T* op = reinterpret_cast<const T*>(&ov); const T* gp = reinterpret_cast<const T*>(&gv);
-  uint4 r; T* rp = reinterpret_cast<T*>(&r);
+  uint4 r;
+  if constexpr (std::is_same_v<T, half>) {
+    const half2* op2 = reinterpret_cast<const half2*>(&ov);
+    const half2* gp2 = reinterpret_cast<const half2*>(&gv);
+    half2* rp2 = reinterpret_cast<half2*>(&r);
 #pragma unroll
-  for (int k = 0; k < 8; ++k) rp[k] = fromF<T>(toF(op[k]) * (1.f / (1.f + expf(-toF(gp[k])))));
+    for (int k = 0; k < 4; ++k) {
+      float2 of = __half22float2(op2[k]), gf = __half22float2(gp2[k]);
+      rp2[k] = __floats2half2_rn(of.x * (1.f / (1.f + expf(-gf.x))), of.y * (1.f / (1.f + expf(-gf.y))));
+    }
+  } else {
+    const T* op = reinterpret_cast<const T*>(&ov); const T* gp = reinterpret_cast<const T*>(&gv);
+    T* rp = reinterpret_cast<T*>(&r);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) rp[k] = fromF<T>(toF(op[k]) * (1.f / (1.f + expf(-toF(gp[k])))));
+  }
   *reinterpret_cast<uint4*>(out + (size_t)t * 8) = r;
 }
 // o [h][i][s][e] -> [s][i][h*d+e], times sigmoid(gate)
@@ -1298,9 +1392,9 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
   T* wT = std::is_same_v<T, float> ? reinterpret_cast<T*>(w) : scratch<T>("msaatt.wh", (size_t)heads * std::max(ni, 1) * ldw);
   if (ni) {
     if constexpr (std::is_same_v<T, float>)
-      msaWeightsK<<<(unsigned)(heads * ni), 128, 0, STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor);
+      msaWeightsK<<<(unsigned)(heads * ni), (n <= 256 ? 32 : 128), 0, STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor);
     else
-      msaWeightsK<T><<<(unsigned)(heads * ni), 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor, wT, ldw);
+      msaWeightsK<T><<<(unsigned)(heads * ni), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor, wT, ldw);
   }
   int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd)));
   T* vg = scratch<T>("msaatt.vg", 2 * (size_t)Sc * n * Wd);
@@ -1387,14 +1481,14 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   float* w = (std::is_same_v<T, float> || n > 4096) ? scratch<float>("msaatt.w", (size_t)heads * pairs) : nullptr;
   const T* wT; int ldw = n;
   if constexpr (std::is_same_v<T, float>) {
-    msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor);
+    msaWeightsK<<<(unsigned)(heads * n), (n <= 256 ? 32 : 128), 0, STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor);
     wT = w;
   } else {
     // rows padded to a multiple of 8 halves, and the GEMM's K with them: at a token count that is not one, cuBLAS
     // could only take the GEMM below on its align-1 kernels (261 tokens: 0.27 ms a call, sm75's own kernel)
     ldw = (n + 7) / 8 * 8;
     T* wh = scratch<T>("msaatt.wh", (size_t)heads * n * ldw);
-    msaWeightsK<T><<<(unsigned)(heads * n), 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor, wh, ldw);
+    msaWeightsK<T><<<(unsigned)(heads * n), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor, wh, ldw);
     wT = wh;
   }
   // the values, the per-head weighted sums, the gate and the output - each MSA row's own, so on a card short of
