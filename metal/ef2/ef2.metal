@@ -16,10 +16,29 @@ inline float relPosAt(constant RelIdx& r, uint i, uint j, uint c, uint C) {
 }
 
 kernel void ef2_interleave8(LF_ARGS(Interleave8Args)) {
-  uint t = (uint)LF_INDEX, W = 2 * a.I;
-  if (t >= a.rows * W) return;
-  uint r = lf_udiv(t, W), c = t - r * W, m = c >> 4, q = c & 15;
-  a.out[t] = q < 8 ? a.a[r * a.lda + 8 * m + q] : a.b[r * a.lda + 8 * m + q - 8];
+  uint t = (uint)LF_INDEX, B2 = a.I >> 2;
+  if (t >= a.rows * B2) return;
+  uint r = lf_udiv(t, B2), c = t - r * B2, m = c >> 1;
+  device const uint4* src = (c & 1) ? (device const uint4*)(a.b + (ulong)r * a.lda) : (device const uint4*)(a.a + (ulong)r * a.lda);
+  ((device uint4*)a.out)[t] = src[m];
+}
+kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+  const uint r = tg.x, B8 = a.I >> 3;
+  if (r >= a.rows) return;
+  device uint4* row = (device uint4*)(a.out + (ulong)r * 2 * a.I);
+  uint4 va[4], vb[4];
+  for (uint k = 0; k * 256 + tid < B8; ++k) {
+    const uint m = k * 256 + tid;
+    va[k] = row[m];
+    vb[k] = row[B8 + m];
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint k = 0; k * 256 + tid < B8; ++k) {
+    const uint m = k * 256 + tid;
+    row[2 * m] = va[k];
+    row[2 * m + 1] = vb[k];
+  }
 }
 
 // ---------------------------------------------------------------- the language model
@@ -29,17 +48,25 @@ kernel void ef2_embed(LF_ARGS(EmbedArgs)) {
   uint row = lf_udiv((uint)t, a.C), c = (uint)t - row * a.C;
   a.x[t] = a.table[(ulong)a.ids[row] * a.C + c];
 }
-// rotary, split halves: channel d with d + 32 of each 64-wide head, position = row
+// rotary, split halves: channel d with d + 32 of each 64-wide head, position = row; sin/cos computed once per (row, d)
 kernel void ef2_rope(LF_ARGS(RopeArgs)) {
   uint t = (uint)LF_INDEX;
-  if (t >= a.rows * a.heads * 32) return;
-  uint d = t & 31, hr = t >> 5, row = lf_udiv(hr, a.heads), h = hr - row * a.heads;
+  if (t >= a.rows * 32) return;
+  uint d = t & 31, row = t >> 5;
   float angle = (float)row * precise::pow(10000.f, -(float)(2 * d) / 64.f);
   float s = precise::sin(angle), c = precise::cos(angle);
-  device float* p = a.x + (ulong)row * a.ld + h * 64 + d;
-  float x0 = p[0], x1 = p[32];
-  p[0] = x0 * c - x1 * s;
-  p[32] = x0 * s + x1 * c;
+  device float* px = a.x + (ulong)row * a.ld + d;
+  device float* py = a.y ? a.y + (ulong)row * a.ld + d : nullptr;
+  for (uint h = 0; h < a.heads; ++h) {
+    float x0 = px[h * 64], x1 = px[h * 64 + 32];
+    px[h * 64] = x0 * c - x1 * s;
+    px[h * 64 + 32] = x0 * s + x1 * c;
+    if (py) {
+      float y0 = py[h * 64], y1 = py[h * 64 + 32];
+      py[h * 64] = y0 * c - y1 * s;
+      py[h * 64 + 32] = y0 * s + y1 * c;
+    }
+  }
 }
 // softmax over a score row, keys of another chain (sequence id) excluded; a threadgroup a (head, query) row
 kernel void ef2_softmax_seq(constant SoftmaxSeqArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
@@ -277,7 +304,10 @@ kernel void ef2_rope_table(LF_ARGS(RopeTableArgs)) {
 }
 kernel void ef2_silu(LF_ARGS(SiluArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n) a.y[t] = lf_silu(a.x[t]);
+  if (t >= a.n) return;
+  float v = lf_silu(a.x[t]);
+  if (a.yh) a.yh[t] = (half)v;
+  else a.y[t] = v;
 }
 kernel void ef2_swiglu(LF_ARGS(SwigluArgs)) {      // g = silu(h[:, :F]) h[:, F:]
   uint t = (uint)LF_INDEX;
@@ -292,29 +322,40 @@ kernel void ef2_rms_modulate(constant RmsModArgs& a [[buffer(0)]], uint3 tg [[th
   uint row = (tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device const float* xr = a.x + (ulong)row * a.C;
-  float s = 0;
-  for (uint c = lane; c < a.C; c += 32) s += xr[c] * xr[c];
+  float xv[8], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x * x; }
   float inv = rsqrt(simd_sum(s) / a.C + RMS_EPS);
   device const float* m = a.mod + (ulong)row * 6 * a.C;
-  for (uint c = lane; c < a.C; c += 32) a.y[(ulong)row * a.C + c] = xr[c] * inv * (1.f + m[a.scale * a.C + c]) + m[a.shift * a.C + c];
+  k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) {
+    float v = xv[k] * inv * (1.f + m[a.scale * a.C + c]) + m[a.shift * a.C + c];
+    if (a.yh) a.yh[(ulong)row * a.C + c] = (half)v;
+    else a.y[(ulong)row * a.C + c] = v;
+  }
 }
-// q and k (heads of 32, inside the packed [A, 3C] qkv): rms per head, rotate, narrow to bfloat16; v narrowed
-kernel void ef2_qkv_prepare(LF_ARGS(QkvPrepArgs)) {
-  uint t = (uint)LF_INDEX;
-  if (t >= a.A * 3 * a.heads) return;
-  uint ph = lf_udiv(t, a.heads), head = t - ph * a.heads, atom = lf_udiv(ph, 3), part = ph - atom * 3;
-  device float* p = a.qkv + (ulong)atom * 3 * a.C + part * a.C + head * 32;
-  if (part == 2) { if (a.bf16) for (int d = 0; d < 32; ++d) p[d] = lf_bf16(p[d]); return; }
-  float s = 0;
-  for (int d = 0; d < 32; ++d) s += p[d] * p[d];
-  float inv = rsqrt(s / 32 + RMS_EPS);
-  float v[32];
-  for (int d = 0; d < 32; ++d) v[d] = p[d] * inv;
-  for (int i = 0; i < 16; ++i) {
-    float c = a.cosT[atom * 16 + i], sn = a.sinT[atom * 16 + i], x0 = v[i], x1 = v[16 + i];
-    float lo = x0 * c - x1 * sn, hi = x1 * c + x0 * sn;
-    p[i] = a.bf16 ? lf_bf16(lo) : lo;
-    p[16 + i] = a.bf16 ? lf_bf16(hi) : hi;
+// q and k (heads of 32, inside the packed [A, 3C] qkv): rms per head, rotate, narrow to bfloat16; v narrowed; a simdgroup an (atom, head)
+kernel void ef2_qkv_prepare(constant QkvPrepArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  uint ah = (tg.y * ng.x + tg.x) * 8 + sg;
+  if (ah >= a.A * a.heads) return;
+  uint atom = lf_udiv(ah, a.heads), head = ah - atom * a.heads;
+  device float* row = a.qkv + (ulong)atom * 3 * a.C + head * 32;
+  if (a.bf16) row[2 * a.C + lane] = lf_bf16(row[2 * a.C + lane]);
+  float qv = row[lane], kv = row[a.C + lane];
+  float invQ = rsqrt(simd_sum(qv * qv) / 32.f + RMS_EPS);
+  float invK = rsqrt(simd_sum(kv * kv) / 32.f + RMS_EPS);
+  qv *= invQ; kv *= invK;
+  float qHi = simd_shuffle_down(qv, 16), kHi = simd_shuffle_down(kv, 16);
+  if (lane < 16) {
+    float c = a.cosT[atom * 16 + lane], sn = a.sinT[atom * 16 + lane];
+    float qLo = qv * c - qHi * sn, qH = qHi * c + qv * sn;
+    float kLo = kv * c - kHi * sn, kH = kHi * c + kv * sn;
+    row[lane] = a.bf16 ? lf_bf16(qLo) : qLo;
+    row[16 + lane] = a.bf16 ? lf_bf16(qH) : qH;
+    row[a.C + lane] = a.bf16 ? lf_bf16(kLo) : kLo;
+    row[a.C + 16 + lane] = a.bf16 ? lf_bf16(kH) : kH;
   }
 }
 // the windowed attention (no [heads, A, A] matrix): a valid query's keys are the valid atoms within halfWindow in rank,
@@ -325,6 +366,7 @@ constant int SWA_KT = 96, SWA_Q = 16;
 kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float Qs[SWA_Q][32];
   threadgroup float Ks[SWA_KT][33];
   threadgroup float Vs[SWA_KT][32];
   const int nValid = (int)a.nValid, hw = (int)a.halfWindow, C = (int)a.C;
@@ -332,11 +374,11 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
   int r0 = tg.x * SWA_Q, r1 = min(nValid, r0 + SWA_Q) - 1;
   int klo = max(0, r0 - hw), khi = min(nValid - 1, r1 + hw);
   int rq = r0 + 4 * (int)warp;
-  float qd[4][32], m[4], l[4], acc[4];
+  float m[4], l[4], acc[4];
   for (int u = 0; u < 4; ++u) {
     m[u] = -INFINITY; l[u] = 0.f; acc[u] = 0.f;
     device const float* q = a.qkv + (ulong)a.valid[min(rq + u, nValid - 1)] * 3 * C + head * 32;
-    for (int d = 0; d < 32; ++d) qd[u][d] = q[d] * a.scale;
+    Qs[4 * warp + u][lane] = q[lane] * a.scale;
   }
   for (int t0 = klo; t0 <= khi; t0 += SWA_KT) {
     int n = min(SWA_KT, khi - t0 + 1);
@@ -357,7 +399,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
       if (j <= hi) {
         for (int d = 0; d < 32; ++d) {
           float k = Ks[j][d];
-          for (int u = 0; u < 4; ++u) s[u] += qd[u][d] * k;
+          for (int u = 0; u < 4; ++u) s[u] += Qs[4 * warp + u][d] * k;
         }
       }
       float p[4];
@@ -384,13 +426,15 @@ kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.A * a.C) return;
   uint atom = lf_udiv(t, a.C);
-  a.ctx[t] *= (a.mask[atom] != 0.f ? 1.f : 0.f) * lf_sigmoid(a.gate[t]);
+  float v = a.ctx[t] * (a.mask[atom] != 0.f ? 1.f : 0.f) * lf_sigmoid(a.gate[t]);
+  if (a.outH) a.outH[t] = (half)v;
+  else a.ctx[t] = v;
 }
 kernel void ef2_gated_add(LF_ARGS(GatedAddArgs)) {
-  uint t = (uint)LF_INDEX;
-  if (t >= a.A * a.C) return;
-  uint atom = lf_udiv(t, a.C), c = t - atom * a.C;
-  a.x[t] += a.mod[(ulong)atom * 6 * a.C + a.which * a.C + c] * a.d[t];
+  uint t = (uint)LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.A * C4) return;
+  uint atom = lf_udiv(t, C4), c4 = t - atom * C4;
+  ((device float4*)a.x)[t] += ((device const float4*)(a.mod + ((ulong)atom * 6 + a.which) * a.C))[c4] * ((device const float4*)a.d)[t];
 }
 // the mean over each token's atoms, weighted by the mask, into the first C columns of rows ld apart
 kernel void ef2_scatter_mean(LF_ARGS(ScatterMeanArgs)) {
@@ -442,24 +486,46 @@ kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / de
   uint at = t / 6, k = t - at * 6;
   a.out[t] = k < 3 ? a.x[at * 3 + k] * a.level[1] : 0.f;
 }
-// adaLN: sigmoid(g + gb) * LN(a) + sh, the projections rows ld apart
+// adaLN: sigmoid(g + gb) * LN(a) + sh, the projections rows ld apart; a simdgroup a row
+kernel void ef2_ada_ln(constant AdaCombineArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                       uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+  uint r = (tg.y * ng.x + tg.x) * 8 + sg;
+  if (r >= a.T) return;
+  device const float* xr = a.an + (ulong)r * a.C;
+  float xv[24], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
+  float mean = simd_sum(s) / a.C, v = 0;
+  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
+  float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
+  device const float* gr = a.g + (ulong)r * a.ld;
+  device const float* shr = a.sh + (ulong)r * a.ld;
+  device half* yr = a.out + (ulong)r * a.C;
+  k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k)
+    yr[c] = (half)(((xv[k] - mean) * inv) * lf_sigmoid(gr[c] + a.gb[c]) + shr[c]);
+}
 kernel void ef2_ada_combine(LF_ARGS(AdaCombineArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.T * a.C) return;
   uint r = lf_udiv(t, a.C), c = t - r * a.C, gi = r * a.ld + c;
   a.out[t] = (half)(a.an[t] * lf_sigmoid(a.g[gi] + a.gb[c]) + a.sh[gi]);
 }
-kernel void ef2_sigmoid_mul(LF_ARGS(SigmoidMulArgs)) {     // x *= sigmoid(g (+ gb))
+kernel void ef2_sigmoid_mul(LF_ARGS(SigmoidMulArgs)) {     // dst += x * sigmoid(g (+ gb)), or x *= sigmoid(g (+ gb))
   uint t = (uint)LF_INDEX;
   if (t >= a.T * a.C) return;
   uint r = lf_udiv(t, a.C), c = t - r * a.C;
-  a.x[t] *= lf_sigmoid(a.g[r * a.ld + c] + (a.gb ? a.gb[c] : 0.f));
+  float v = a.x[t] * lf_sigmoid(a.g[r * a.ld + c] + (a.gb ? a.gb[c] : 0.f));
+  if (a.dst) a.dst[t] += v; else a.x[t] = v;
 }
 kernel void ef2_scale_copies(LF_ARGS(ScaleCopiesArgs)) {    // out[j] = x * scale[j], [n, rows, C]
   uint t = (uint)LF_INDEX, per = a.rows * a.C;
   if (t >= a.n * per) return;
   uint j = lf_udiv(t, per), r = t - j * per, c = r - lf_udiv(r, a.C) * a.C;
-  a.out[t] = a.x[r] * a.scales[j * a.C + c];
+  float v = a.x[r] * a.scales[j * a.C + c];
+  if (a.outH) a.outH[t] = (half)v;
+  else a.out[t] = v;
 }
 // scores [H, T, T] + bias [H, T, T] (half), softmax per row; a threadgroup a row
 kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
@@ -542,7 +608,7 @@ kernel void ef2_row_pool(constant RowPoolArgs& a [[buffer(0)]], uint3 tg [[threa
                          uint lane [[thread_index_in_simdgroup]]) {
   uint i = tg.x;
   threadgroup float red[8];
-  device const float* sc = a.score + (ulong)i * a.T;
+  device float* sc = a.score + (ulong)i * a.T;
   float mx = -INFINITY;
   for (uint j = tid; j < a.T; j += 256) mx = max(mx, sc[j]);
   mx = simd_max(mx);
@@ -551,14 +617,16 @@ kernel void ef2_row_pool(constant RowPoolArgs& a [[buffer(0)]], uint3 tg [[threa
   mx = red[0]; for (int k = 1; k < 8; ++k) mx = max(mx, red[k]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float sum = 0;
-  for (uint j = tid; j < a.T; j += 256) sum += exp(sc[j] - mx);
+  for (uint j = tid; j < a.T; j += 256) { float e = exp(sc[j] - mx); sc[j] = e; sum += e; }
   sum = simd_sum(sum);
   if (lane == 0) red[sg] = sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float tot = 0; for (int k = 0; k < 8; ++k) tot += red[k];
+  for (uint j = tid; j < a.T; j += 256) sc[j] /= tot;
+  threadgroup_barrier(mem_flags::mem_device);
   for (uint c = tid; c < a.C; c += 256) {
     float acc = 0;
-    for (uint j = 0; j < a.T; ++j) acc += exp(sc[j] - mx) / tot * a.z[((ulong)i * a.T + j) * a.C + c];
+    for (uint j = 0; j < a.T; ++j) acc += sc[j] * a.z[((ulong)i * a.T + j) * a.C + c];
     a.pooled[(ulong)i * a.C + c] = acc;
   }
 }

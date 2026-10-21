@@ -51,36 +51,73 @@ void freeAtoms(Atoms& at) {
 }
 
 static Grid rowsOf8(size_t rows) { return grid1d((rows + 7) / 8, 1); }
-static void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::string& B, int halfWindow) {
+static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sch, const std::string& B, int halfWindow) {
   size_t A = a.A; int C = a.C;
-  float* sc = scratch<float>("atom.silu", A * C); float* mod = scratch<float>("atom.mod", A * 6 * C);
-  run1d("ef2_silu", A * C, SiluArgs{cond, sc, A * C});
+  float* mod = scratch<float>("atom.mod", A * 6 * C);
+  float* qkv = scratch<float>("atom.qkv", A * 3 * C);
+  float* gate = scratch<float>("atom.gate", A * C);
+  float* ctx = scratch<float>("atom.ctx", A * C);
+  float* att = scratch<float>("atom.att", A * C);
+  if (HALF_GEMM) {
+    lin(sch, B + "adaln", mod, A, C, 6 * C);
+    half* xmh = scratch<half>("atom.xmh", A * C);
+    run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, nullptr, xmh, (uint)A, (uint)C, 0, 1});
+    lin(xmh, B + "qkv", qkv, A, C, 3 * C);
+    lin(xmh, B + "attnGate", gate, A, C, C);
+    run("ef2_qkv_prepare", rowsOf8(A * a.heads), 256, QkvPrepArgs{qkv, a.cosT, a.sinT, (uint)A, (uint)C, (uint)a.heads, ATOM_BF16 ? 1u : 0u});
+    fill(ctx, 0, A * C * 4);
+    if (a.nValid)
+      run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 128,
+          SwaArgs{qkv, a.valid, ctx, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f)});
+    half* ctxh = scratch<half>("atom.ctxh", A * C);
+    run1d("ef2_gate_live", A * C, GateLiveArgs{ctx, gate, a.mask, ctxh, (uint)A, (uint)C});
+    {
+      Gemm G{}; G.X = ctxh; G.tx = F16; G.W = M.h(B + "attnOut"); G.tw = F16; G.Y = x; G.ty = F32;
+      G.rows = A; G.in = C; G.out = C; G.label = "atom attnOut";
+      if (!gemmGatedRows(G, mod + 2 * C, 6 * C, nullptr)) {
+        G.Y = att; gemm(G);
+        run1d("ef2_gated_add", (A * C) >> 2, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 2, 0});
+      }
+    }
+    run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, nullptr, xmh, (uint)A, (uint)C, 3, 4});
+    half* gh = scratch<half>("atom.gh", A * a.hidden);
+    gemmSwiglu(xmh, swigluPairs(B + "ffnUp", M.h(B + "ffnUp"), C, a.hidden), gh, A, C, a.hidden);
+    {
+      Gemm G{}; G.X = gh; G.tx = F16; G.W = M.h(B + "ffnDown"); G.tw = F16; G.Y = x; G.ty = F32;
+      G.rows = A; G.in = a.hidden; G.out = C; G.label = "atom ffnDown";
+      if (!gemmGatedRows(G, mod + 5 * C, 6 * C, nullptr)) {
+        G.Y = att; gemm(G);
+        run1d("ef2_gated_add", (A * C) >> 2, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 5, 0});
+      }
+    }
+    return;
+  }
   lin(sc, B + "adaln", mod, A, C, 6 * C);
   float* xm = scratch<float>("atom.xm", A * C);
-  run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, (uint)A, (uint)C, 0, 1});
-  float* qkv = scratch<float>("atom.qkv", A * 3 * C);
+  run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, nullptr, (uint)A, (uint)C, 0, 1});
   lin(xm, B + "qkv", qkv, A, C, 3 * C);
-  run1d("ef2_qkv_prepare", A * 3 * a.heads, QkvPrepArgs{qkv, a.cosT, a.sinT, (uint)A, (uint)C, (uint)a.heads, ATOM_BF16 ? 1u : 0u});
-  float* ctx = scratch<float>("atom.ctx", A * C);
+  run("ef2_qkv_prepare", rowsOf8(A * a.heads), 256, QkvPrepArgs{qkv, a.cosT, a.sinT, (uint)A, (uint)C, (uint)a.heads, ATOM_BF16 ? 1u : 0u});
   fill(ctx, 0, A * C * 4);
   if (a.nValid)
     run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 128,
         SwaArgs{qkv, a.valid, ctx, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f)});
-  float* gate = scratch<float>("atom.gate", A * C);
   lin(xm, B + "attnGate", gate, A, C, C);
-  run1d("ef2_gate_live", A * C, GateLiveArgs{ctx, gate, a.mask, (uint)A, (uint)C});
-  float* att = scratch<float>("atom.att", A * C);
+  run1d("ef2_gate_live", A * C, GateLiveArgs{ctx, gate, a.mask, nullptr, (uint)A, (uint)C});
   lin(ctx, B + "attnOut", att, A, C, C);
-  run1d("ef2_gated_add", A * C, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 2, 0});
-  run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, (uint)A, (uint)C, 3, 4});
+  run1d("ef2_gated_add", (A * C) >> 2, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 2, 0});
+  run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, nullptr, (uint)A, (uint)C, 3, 4});
   float* h = scratch<float>("atom.h", A * 2 * a.hidden); float* g = scratch<float>("atom.g", A * a.hidden);
   lin(xm, B + "ffnUp", h, A, C, 2 * a.hidden);
   run1d("ef2_swiglu", A * a.hidden, SwigluArgs{h, g, (uint)A, (uint)a.hidden});
   lin(g, B + "ffnDown", att, A, a.hidden, C);
-  run1d("ef2_gated_add", A * C, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 5, 0});
+  run1d("ef2_gated_add", (A * C) >> 2, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 5, 0});
 }
 void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocks, int halfWindow) {
-  for (int b = 0; b < blocks; ++b) swaBlock(a, x, cond, "f/" + prefix + "/blocks/" + std::to_string(b) + "/", halfWindow);
+  size_t n = (size_t)a.A * a.C;
+  float* sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
+  half* sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
+  run1d("ef2_silu", n, SiluArgs{cond, sc, sch, n});
+  for (int b = 0; b < blocks; ++b) swaBlock(a, x, sc, sch, "f/" + prefix + "/blocks/" + std::to_string(b) + "/", halfWindow);
 }
 
 // the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]

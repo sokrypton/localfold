@@ -31,9 +31,13 @@ static void towerLin(const half* X, const std::string& name, float* Y, size_t ro
 // resident one
 static const half* towerFc1(const std::string& name, int C, int ffn) {
   if (!M.isResident(name)) return swigluPairsInPlace(name, C, ffn);
-  const half* w = towerW(name);
+  half* w = const_cast<half*>(towerW(name));
+  if (ffn % 8 == 0 && ffn <= 8192) {
+    run("ef2_interleave8_inplace", Grid{(uint32_t)C, 1, 1}, 256, Interleave8Args{w, w + ffn, w, (uint)C, (uint)ffn, (uint)(2 * ffn), 0});
+    return w;
+  }
   half* out = scratch<half>("tower.w16s", (size_t)C * 2 * ffn);
-  run1d("ef2_interleave8", (size_t)C * 2 * ffn, Interleave8Args{w, w + ffn, out, (uint)C, (uint)ffn, (uint)(2 * ffn), 0});
+  run1d("ef2_interleave8", (size_t)C * (ffn >> 2), Interleave8Args{w, w + ffn, out, (uint)C, (uint)ffn, (uint)(2 * ffn), 0});
   return out;
 }
 
@@ -47,8 +51,7 @@ static void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   layerNorm(qkv, q, R, C, M.f(B + "q_norm/scale"), nullptr, 1e-5f, 3 * C, C);
   layerNorm(qkv + C, k, R, C, M.f(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
-  run1d("ef2_rope", R * H * 32, RopeArgs{q, (uint)R, (uint)H, (uint)C, 0});
-  run1d("ef2_rope", R * H * 32, RopeArgs{k, (uint)R, (uint)H, (uint)C, 0});
+  run1d("ef2_rope", R * 32, RopeArgs{q, k, (uint)R, (uint)H, (uint)C, 0});
   // scores [H, R, R] = q_h k_h^T, softmax within a chain, ctx_h = S_h v_h (v in the packed qkv, stride 3C)
   float* S = scratch<float>("esmc.scores", (size_t)H * R * R);
   float* ctx = scratch<float>("esmc.ctx", R * C);

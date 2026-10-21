@@ -103,6 +103,14 @@ static const half* outGateWeights(int nb, int Ct) {
                Fh("diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/") + "outGateWeights"), Ct * 2, Ct * 2, Ct);
   });
 }
+static const float* outGateBiases(int nb, int Ct) {
+  return M.derived<float>("ef2.outgateb", (size_t)2 * nb * Ct, [&](float* w) {
+    for (int b = 0; b < nb; ++b)
+      for (int k = 0; k < 2; ++k)
+        copy(w + (size_t)(2 * b + k) * Ct,
+             F("diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/") + "outGateBias"), Ct * 4);
+  });
+}
 // a token block's q | k | v | gate projection as one [Ct, 4Ct] weight, and its bias (the query's; zero elsewhere)
 static const half* qkvgWeight(int b, int C) {
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
@@ -121,30 +129,38 @@ static void conditioningSingle(const Denoiser& d) {
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", nf); float* noise = scratch<float>("dc.noise", Ct);
   run1d("ef2_fourier", nf, FourierArgs{F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), d.level, four, (uint)nf, 0});
-  layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
-  lin(four, "f/diffusion/noiseProjection", noise, 1, nf, Ct);
+  if (HALF_GEMM) {
+    half* fourH = scratch<half>("dc.fourierH", nf);
+    layerNorm(four, fourH, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
+    lin(fourH, "f/diffusion/noiseProjection", noise, 1, nf, Ct);
+  } else {
+    layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
+    lin(four, "f/diffusion/noiseProjection", noise, 1, nf, Ct);
+  }
   run1d("ef2_add_row", (size_t)T * Ct, AddRowArgs{d.single, noise, (u64)T, (uint)Ct, 0});
   for (int l = 0; l < 2; ++l) transitionLayer(d.single, T, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
 }
 static void singleProjections(const Denoiser& d) {
   int T = d.T, C = d.Ct, nb = d.tokenBlocks, n = 2 * nb, ld = d.entries * C;
+  half* snScaledH = (half*)(void*)d.snScaled;
   float* sn = scratch<float>("dn.sn0", (size_t)T * C);
   layerNorm(d.single, sn, T, C, nullptr, nullptr);
-  run1d("ef2_scale_copies", (size_t)n * T * C, ScaleCopiesArgs{sn, d.scales, d.snScaled, (uint)T, (uint)C, (uint)n, 0});
-  Gemm g{}; g.X = d.snScaled; g.sx = (int64_t)T * C; g.W = adaWeights(nb, C); g.tw = F16; g.sw = (int64_t)C * 2 * C; g.half = true;
+  run1d("ef2_scale_copies", (size_t)n * T * C,
+        ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : d.snScaled, HALF_GEMM ? snScaledH : nullptr, (uint)T, (uint)C, (uint)n, 0});
+  Gemm g{};
+  if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = d.snScaled; g.half = true; }
+  g.sx = (int64_t)T * C; g.W = adaWeights(nb, C); g.tw = F16; g.sw = (int64_t)C * 2 * C;
   g.Y = d.G; g.ldy = ld; g.sy = 2 * C; g.rows = T; g.in = C; g.out = 2 * C; g.batch = n; g.label = "adaLN projections";
   gemm(g);
   Gemm o{}; o.X = d.single; o.W = outGateWeights(nb, C); o.tw = F16; o.half = true; o.Y = d.G + (size_t)4 * nb * C; o.ldy = ld;
-  o.rows = T; o.in = C; o.out = 2 * nb * C; o.label = "out gates";
+  o.bias = outGateBiases(nb, C); o.rows = T; o.in = C; o.out = 2 * nb * C; o.label = "out gates";
   gemm(o);
 }
 // adaLN into half: sigmoid(gate + gateBias) * LN(a) + shift, the projections from G
 static void adaLN(const Denoiser& d, const float* a, half* out, int e, const std::string& B) {
   int T = d.T, C = d.Ct, ld = d.entries * C;
-  float* an = scratch<float>("ada.an", (size_t)T * C);
-  layerNorm(a, an, T, C, nullptr, nullptr);
-  run1d("ef2_ada_combine", (size_t)T * C,
-        AdaCombineArgs{an, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C, out, (uint)T, (uint)C, (uint)ld, 0});
+  run("ef2_ada_ln", grid1d((size_t)(T + 7) / 8, 1), 256,
+      AdaCombineArgs{a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C, out, (uint)T, (uint)C, (uint)ld, 0});
 }
 static void tokenBlock(const Denoiser& d, float* a, int b) {
   int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
@@ -164,19 +180,21 @@ static void tokenBlock(const Denoiser& d, float* a, int b) {
   at.bias = d.biases[b]; at.biasStride = d.stride; at.qBias = F(B + "attention/queryBias");
   attention(at);
   float* o = scratch<float>("tb.o", (size_t)T * C);
-  lin(ctx, "f/" + B + "attention/outWeights", o, T, C, C);
-  run1d("ef2_sigmoid_mul", (size_t)T * C,
-        SigmoidMulArgs{o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), (uint)T, (uint)C, (uint)ld, 0});
-  add(a, o, (size_t)T * C);
+  const float* gAtt = d.G + (size_t)(4 * nb + 2 * b) * C;
+  if (!HALF_GEMM || !gemmGateResidual(ctx, Fh(B + "attention/outWeights"), a, T, T, C, C, gAtt, ld, T, 1.f, "token outWeights")) {
+    lin(ctx, "f/" + B + "attention/outWeights", o, T, C, C);
+    run1d("ef2_sigmoid_mul", (size_t)T * C, SigmoidMulArgs{o, gAtt, nullptr, a, (uint)T, (uint)C, (uint)ld, 0});
+  }
   // the conditioned transition
   adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/");
   int Hd = dimOf("f/" + B + "transition/outWeights", 0);
   half* g = scratch<half>("tb.gated", (size_t)T * Hd);
   gemmSwiglu(x, swigluPairs(B + "transition/swishWeights", Fh(B + "transition/swishWeights"), C, Hd), g, T, C, Hd);
-  lin(g, "f/" + B + "transition/outWeights", o, T, Hd, C);
-  run1d("ef2_sigmoid_mul", (size_t)T * C,
-        SigmoidMulArgs{o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), (uint)T, (uint)C, (uint)ld, 0});
-  add(a, o, (size_t)T * C);
+  const float* gTr = d.G + (size_t)(4 * nb + 2 * b + 1) * C;
+  if (!HALF_GEMM || !gemmGateResidual(g, Fh(B + "transition/outWeights"), a, T, T, Hd, C, gTr, ld, T, 1.f, "transition outWeights")) {
+    lin(g, "f/" + B + "transition/outWeights", o, T, Hd, C);
+    run1d("ef2_sigmoid_mul", (size_t)T * C, SigmoidMulArgs{o, gTr, nullptr, a, (uint)T, (uint)C, (uint)ld, 0});
+  }
 }
 
 // one denoiser call: x_noisy [A, 3] at the noise level in d.level -> x_denoised [A, 3]
@@ -208,9 +226,15 @@ static void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   lin(an, "f/diffusionAtomDecoder/tokenToAtom", pt, T, Ct, Ca);
   run1d("ef2_gather_tokens", (size_t)A * Ca, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca});
   swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW);
-  layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
   float* r = scratch<float>("dn.r", (size_t)A * 3);
-  lin(q, "f/diffusionAtomDecoder/outputLinear", r, A, Ca, 3);
+  if (HALF_GEMM) {
+    half* qh = scratch<half>("dn.qh", (size_t)A * Ca);
+    layerNorm(q, qh, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
+    lin(qh, "f/diffusionAtomDecoder/outputLinear", r, A, Ca, 3);
+  } else {
+    layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
+    lin(q, "f/diffusionAtomDecoder/outputLinear", r, A, Ca, 3);
+  }
   run1d("ef2_edm_combine", (size_t)A * 3, EdmArgs{xNoisy, r, xDenoised, d.level, (uint)(A * 3), 0});
 }
 static void setLevel(const Denoiser& d, float t) {
