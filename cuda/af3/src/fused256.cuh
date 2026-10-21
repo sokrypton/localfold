@@ -295,12 +295,16 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __res
   auto nrm = [&](int r, float m, float inv, int k) { return ((float)Ps[k * LDP + r] - m) * inv * nsc[k] + nsc[C + k]; };
   uint32_t xa[KS][4];
 #pragma unroll
-  for (int ks = 0; ks < KS; ++ks) {
-    int k = ks * 16 + 2 * tig;
-    xa[ks][0] = pack2(nrm(ra, ma, ia, k), nrm(ra, ma, ia, k + 1));
-    xa[ks][1] = pack2(nrm(rb, mb, ib, k), nrm(rb, mb, ib, k + 1));
-    xa[ks][2] = pack2(nrm(ra, ma, ia, k + 8), nrm(ra, ma, ia, k + 9));
-    xa[ks][3] = pack2(nrm(rb, mb, ib, k + 8), nrm(rb, mb, ib, k + 9));
+  for (int ks0 = 0; ks0 < KS; ks0 += 8) {
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+      int ks = ks0 + d, k = ks * 16 + 2 * tig;
+      xa[ks][0] = pack2(nrm(ra, ma, ia, k), nrm(ra, ma, ia, k + 1));
+      xa[ks][1] = pack2(nrm(rb, mb, ib, k), nrm(rb, mb, ib, k + 1));
+      xa[ks][2] = pack2(nrm(ra, ma, ia, k + 8), nrm(ra, ma, ia, k + 9));
+      xa[ks][3] = pack2(nrm(rb, mb, ib, k + 8), nrm(rb, mb, ib, k + 9));
+    }
+    if constexpr (C == 512) __syncwarp();
   }
   __syncthreads();                                            // Ps is dead from here: the weight stages take it
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
@@ -325,13 +329,15 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __res
   static_assert(R * (NC / 4) % NTH == 0, "whole items a thread");
   float* Os = (float*)(smem + 2 * STAGE) + warp * 16 * LDO;
   const int q0_ = (lane % (NC / 4)) * 4;
-  size_t pr_[PER], pad_[PER];
+  size_t pr_[C < 512 ? PER : 1], pad_[C < 512 ? PER : 1];
+  if constexpr (C < 512) {
 #pragma unroll
-  for (int i = 0; i < PER; ++i) {
-    int r = warp * 16 + i * LPR + lane / (NC / 4);
-    size_t row = row0 + r;
-    pr_[i] = pairAt(row);
-    pad_[i] = pr_[i] != SIZE_MAX ? paddedAt(row) : 0;
+    for (int i = 0; i < PER; ++i) {
+      int r = warp * 16 + i * LPR + lane / (NC / 4);
+      size_t row = row0 + r;
+      pr_[i] = pairAt(row);
+      pad_[i] = pr_[i] != SIZE_MAX ? paddedAt(row) : 0;
+    }
   }
   constexpr int chunks = C / NC;
   for (int n = 0; n < chunks; ++n) {
@@ -362,17 +368,34 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __res
     float acc[NC / 8][4] = {};
     constexpr int N2 = NC / 16, STEPS = KS * N2;
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
-    uint32_t fb[2][4];
-    ldsm4t(fb[0], w + stageSw<NC>(kl, cl));
+    if constexpr (C == 512 && N2 == 1) {
+      uint32_t f0, f1, f2, f3;
+      uint32_t fb[4];
+      ldsm4t(fb, w + stageSw<NC>(kl, cl));
+      f0 = fb[0]; f1 = fb[1]; f2 = fb[2]; f3 = fb[3];
 #pragma unroll
-    for (int s = 0; s < STEPS; ++s) {
-      const int cur = s & 1, ks = s / N2, n2 = s % N2;
-      if (s + 1 < STEPS) {
-        const int nks = (s + 1) / N2, nn2 = (s + 1) % N2;
-        ldsm4t(fb[cur ^ 1], w + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
+      for (int ks = 0; ks < KS; ++ks) {
+        mma16816(acc[0], xa[ks], f0, f1);
+        if (ks + 1 < KS) {
+          ldsm4t(fb, w + stageSw<NC>((ks + 1) * 16 + kl, cl));
+          f0 = fb[0]; f1 = fb[1];
+        }
+        mma16816(acc[1], xa[ks], f2, f3);
+        f2 = fb[2]; f3 = fb[3];
       }
-      mma16816(acc[2 * n2], xa[ks], fb[cur][0], fb[cur][1]);
-      mma16816(acc[2 * n2 + 1], xa[ks], fb[cur][2], fb[cur][3]);
+    } else {
+      uint32_t fb[2][4];
+      ldsm4t(fb[0], w + stageSw<NC>(kl, cl));
+#pragma unroll
+      for (int s = 0; s < STEPS; ++s) {
+        const int cur = s & 1, ks = s / N2, n2 = s % N2;
+        if (s + 1 < STEPS) {
+          const int nks = (s + 1) / N2, nn2 = (s + 1) % N2;
+          ldsm4t(fb[cur ^ 1], w + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
+        }
+        mma16816(acc[2 * n2], xa[ks], fb[cur][0], fb[cur][1]);
+        mma16816(acc[2 * n2 + 1], xa[ks], fb[cur][2], fb[cur][3]);
+      }
     }
 #pragma unroll
     for (int nt = 0; nt < NC / 8; ++nt) {
@@ -384,11 +407,12 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __res
     int c = n * NC + q0_;
 #pragma unroll
     for (int i = 0; i < PER; ++i) {
-      size_t pr = pr_[i];
+      size_t row = row0 + warp * 16 + i * LPR + lane / (NC / 4);
+      size_t pr = C < 512 ? pr_[i] : pairAt(row);
       if (pr == SIZE_MAX) continue;
       int rl = i * LPR + lane / (NC / 4);
       float4 o = *reinterpret_cast<const float4*>(Os + rl * LDO + q0_);
-      uint2 gw = C < 512 ? gv[i] : *reinterpret_cast<const uint2*>(t2 + pad_[i] * C + c);
+      uint2 gw = C < 512 ? gv[i] : *reinterpret_cast<const uint2*>(t2 + paddedAt(row) * C + c);
       float2 g01 = __half22float2(*reinterpret_cast<half2*>(&gw.x)), g23 = __half22float2(*reinterpret_cast<half2*>(&gw.y));
       float4 v = C < 512 ? pv[i] : pairLd4<PT>(pair, pr * C + c);
       if constexpr (BIAS) {
@@ -457,19 +481,19 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
   // (the stages and the a/b staging take the rows' memory once the rows are fragments: the launch gives the
   // larger of the two - at 8 warps the rows, at 4 the stages, triIn256Smem)
-  const size_t pp = rm.J ? rm.size : (size_t)np * np;
+  const unsigned pp = rm.J ? (unsigned)rm.size : (unsigned)np * (unsigned)np;
   if (rm.J) cs = rm.size;
   const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)np;
-  auto pairOf = [&](size_t q) -> size_t {
+  auto pairOf = [&](unsigned q) -> size_t {
     if (q >= pp) return SIZE_MAX;
-    unsigned u = (unsigned)q, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
+    unsigned u = q, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
     if (rm.T) { unsigned x = i; i = j; j = x; }
     return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
   };
   // (a t2 row's place: its own pair's padded row - transposed under rm.T)
-  auto t2Row = [&](size_t q) -> size_t {
+  auto t2Row = [&](unsigned q) -> size_t {
     if (!rm.T) return q;
-    unsigned u = (unsigned)q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
+    unsigned u = q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE + (size_t)2 * CH * LDT * sizeof(TA));
@@ -478,7 +502,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
   TA* Ta = (TA*)(smem + 2 * STAGE);
   TA* Tb = Ta + CH * LDT;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  size_t row0 = (size_t)blockIdx.x * R;
+  const unsigned row0 = blockIdx.x * R;
   // the gating linear's steps take TWO of its tiles, one a stage (w1 idles there otherwise): four accumulator
   // chains a step where they had two, and half the steps (ncu had the kernel waiting on its MMA chains)
   const int abSteps = C / CH;
@@ -523,7 +547,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
     issue(stepOf(0), 0);                // (the stages have memory of their own here)
 #pragma unroll 1
     for (int rd = 0; rd < XROUNDS; ++rd) {
-      lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+      lnRowsToShared<C, XR, WARPS, PT, false, 1>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
       __syncthreads();
       if (warp * 16 / XR == rd) {
 #pragma unroll
@@ -547,16 +571,6 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
 #if LF_REG_STAGES
     if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
 #endif
-    // the biases read BEFORE the MMAs (their global latency hidden behind them), as gridInK's
-    float2 bp[NC / 8], bq[NC / 8];
-    if constexpr (BIAS) {
-#pragma unroll
-      for (int nt = 0; nt < NC / 8; ++nt) {
-        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
-        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
-        bp[nt] = *reinterpret_cast<const float2*>(bias + col); bq[nt] = *reinterpret_cast<const float2*>(bias + qcol);
-      }
-    }
 #if LF_REG_STAGES
     __syncthreads();
 #else
@@ -582,10 +596,14 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
     }
     if constexpr (BIAS) {
 #pragma unroll
-      for (int mt = 0; mt < MT; ++mt) {
+      for (int nt = 0; nt < NC / 8; ++nt) {
+        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
+        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
+        float2 bp = __ldg(reinterpret_cast<const float2*>(bias + col));
+        float2 bq = __ldg(reinterpret_cast<const float2*>(bias + qcol));
+        float b0 = bp.x, b1 = bp.y, g0 = bq.x, g1 = bq.y;
 #pragma unroll
-        for (int nt = 0; nt < NC / 8; ++nt) {
-          float b0 = bp[nt].x, b1 = bp[nt].y, g0 = bq[nt].x, g1 = bq[nt].y;
+        for (int mt = 0; mt < MT; ++mt) {
           p[mt][nt][0] += b0; p[mt][nt][1] += b1; p[mt][nt][2] += b0; p[mt][nt][3] += b1;
           q[mt][nt][0] += g0; q[mt][nt][1] += g1; q[mt][nt][2] += g0; q[mt][nt][3] += g1;
         }
@@ -610,8 +628,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
 #pragma unroll
           for (int i = 0; i < 2; ++i) {
             int r = i * 8 + g, c = tig * 8, csw = (tig ^ sw0) * 8;
-            size_t qa = row0 + (warp * MT + mt) * 16 + r;
-            if (qa < pp) *reinterpret_cast<uint4*>(t2 + qa * C + c0 + c) = *reinterpret_cast<const uint4*>(Ys + r * 32 + csw);
+            unsigned qa = row0 + (warp * MT + mt) * 16 + r;
+            if (qa < pp) *reinterpret_cast<uint4*>(t2 + (size_t)qa * C + c0 + c) = *reinterpret_cast<const uint4*>(Ys + r * 32 + csw);
           }
           __syncwarp();
         }
@@ -622,7 +640,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
 #pragma unroll
           for (int nt = 0; nt < NC / 8; ++nt) {
             int c = c0 + nt * 8 + tig * 2;
-            size_t qa = row0 + lr0, qb = row0 + lr1;
+            unsigned qa = row0 + lr0, qb = row0 + lr1;
             if (!t2) continue;
             size_t ra = t2Row(qa), rb = t2Row(qb);
             if (qa < pp) *reinterpret_cast<half2*>(t2 + ra * C + c) = __floats2half2_rn(p[mt][nt][0], p[mt][nt][1]);
@@ -651,7 +669,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
       for (int it_ = 0; it_ < (CH * (R / 8) + NTH - 1) / NTH; ++it_) {
         if ((CH * (R / 8)) % NTH != 0 && it_ * NTH + (int)threadIdx.x >= CH * (R / 8)) break;
         int ch = ch0 + it_ * (NTH / (R / 8));
-        size_t row = row0 + r8;
+        unsigned row = row0 + r8;
         if (row < cs) {
           size_t at = (size_t)(j * CH + ch) * cs + row;
           // (8 rows: 16 bytes of a 16-bit operand, 8 of an FP8 one)

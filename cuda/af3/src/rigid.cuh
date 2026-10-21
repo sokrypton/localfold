@@ -169,7 +169,13 @@ rigidAlignK(float* __restrict__ xAll, const float* __restrict__ targetAll, const
       for (int k = 0; k < 8; ++k) s += sRed[k][i];
       h[i] = s;
     }
-    double m[9], v[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    double* m = sRed[0];
+    double* v = sRed[1];
+    double* vv = sRed[2];
+    double* uu = sRed[3];
+    double* uvt = sRed[4];
+    double* ev = sRed[5];
+    for (int i = 0; i < 9; ++i) { v[i] = (i % 4 == 0) ? 1.0 : 0.0; uu[i] = 0.0; }
     for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) {
       double s = 0; for (int k = 0; k < 3; ++k) s += h[k * 3 + i] * h[k * 3 + j];
       m[i * 3 + j] = s;
@@ -178,6 +184,7 @@ rigidAlignK(float* __restrict__ xAll, const float* __restrict__ targetAll, const
       double off = m[1] * m[1] + m[2] * m[2] + m[5] * m[5];
       if (off <= 1e-30 * (m[0] * m[0] + m[4] * m[4] + m[8] * m[8])) break;
       const int P[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+#pragma unroll
       for (int pi = 0; pi < 3; ++pi) {
         int p = P[pi][0], q = P[pi][1];
         double apq = m[p * 3 + q];
@@ -185,41 +192,48 @@ rigidAlignK(float* __restrict__ xAll, const float* __restrict__ targetAll, const
         double theta = (m[q * 3 + q] - m[p * 3 + p]) / (2 * apq);
         double t = (theta >= 0 ? 1 : -1) / (fabs(theta) + sqrt(theta * theta + 1));
         double c = rsqrt(t * t + 1), s = t * c;
+#pragma unroll
         for (int k = 0; k < 3; ++k) { double akp = m[k * 3 + p], akq = m[k * 3 + q]; m[k * 3 + p] = c * akp - s * akq; m[k * 3 + q] = s * akp + c * akq; }
+#pragma unroll
         for (int k = 0; k < 3; ++k) { double apk = m[p * 3 + k], aqk = m[q * 3 + k]; m[p * 3 + k] = c * apk - s * aqk; m[q * 3 + k] = s * apk + c * aqk; }
+#pragma unroll
         for (int k = 0; k < 3; ++k) { double vkp = v[k * 3 + p], vkq = v[k * 3 + q]; v[k * 3 + p] = c * vkp - s * vkq; v[k * 3 + q] = s * vkp + c * vkq; }
       }
     }
-    double ev[3] = {m[0], m[4], m[8]};
-    int order[3] = {0, 1, 2};
-    if (ev[order[1]] > ev[order[0]]) { int tmp = order[0]; order[0] = order[1]; order[1] = tmp; }
-    if (ev[order[2]] > ev[order[1]]) { int tmp = order[1]; order[1] = order[2]; order[2] = tmp; }
-    if (ev[order[1]] > ev[order[0]]) { int tmp = order[0]; order[0] = order[1]; order[1] = tmp; }
-    double vv[9], uu[9] = {0};
+    ev[0] = m[0]; ev[1] = m[4]; ev[2] = m[8];
+    int o0 = 0, o1 = 1, o2 = 2;
+    if (ev[o1] > ev[o0]) { int tmp = o0; o0 = o1; o1 = tmp; }
+    if (ev[o2] > ev[o1]) { int tmp = o1; o1 = o2; o2 = tmp; }
+    if (ev[o1] > ev[o0]) { int tmp = o0; o0 = o1; o1 = tmp; }
+    int order[3] = {o0, o1, o2};
     bool good[3] = {false, false, false};
-    double floor = 1e-12 * fabs(ev[order[0]] ? ev[order[0]] : 1);
+    double floor = 1e-12 * fabs(ev[o0] ? ev[o0] : 1);
+#pragma unroll
     for (int c = 0; c < 3; ++c) {
-      for (int r = 0; r < 3; ++r) vv[r * 3 + c] = v[r * 3 + order[c]];
-      if (ev[order[c]] <= floor) continue;
-      double invSig = rsqrt(ev[order[c]]);
+      int oc = order[c];
+      for (int r = 0; r < 3; ++r) vv[r * 3 + c] = v[r * 3 + oc];
+      if (ev[oc] <= floor) continue;
+      double invSig = rsqrt(ev[oc]);
       for (int r = 0; r < 3; ++r) { double s = 0; for (int k = 0; k < 3; ++k) s += h[r * 3 + k] * vv[k * 3 + c]; uu[r * 3 + c] = s * invSig; }
       double lenSq = uu[c] * uu[c] + uu[3 + c] * uu[3 + c] + uu[6 + c] * uu[6 + c];
       if (fabs(lenSq - 1.0) > 2e-6) { uu[c] = uu[3 + c] = uu[6 + c] = 0; } else good[c] = true;
     }
     for (int c = 0; c < 3; ++c) {
       if (good[c]) continue;
-      double best[3] = {0, 0, 0}, bestLen = -1;
+      double best0 = 0, best1 = 0, best2 = 0, bestLen = -1;
       for (int sd = 0; sd < 3; ++sd) {
-        double wv[3] = {0, 0, 0}; wv[sd] = 1;
-        for (int k = 0; k < 3; ++k) if (good[k]) { double dot = wv[0] * uu[k] + wv[1] * uu[3 + k] + wv[2] * uu[6 + k]; for (int r = 0; r < 3; ++r) wv[r] -= dot * uu[r * 3 + k]; }
-        double len = sqrt(wv[0] * wv[0] + wv[1] * wv[1] + wv[2] * wv[2]);
-        if (len > bestLen) { bestLen = len; for (int r = 0; r < 3; ++r) best[r] = wv[r]; }
+        double w0 = sd == 0 ? 1 : 0, w1 = sd == 1 ? 1 : 0, w2 = sd == 2 ? 1 : 0;
+        for (int k = 0; k < 3; ++k) if (good[k]) {
+          double dot = w0 * uu[k] + w1 * uu[3 + k] + w2 * uu[6 + k];
+          w0 -= dot * uu[k]; w1 -= dot * uu[3 + k]; w2 -= dot * uu[6 + k];
+        }
+        double len = sqrt(w0 * w0 + w1 * w1 + w2 * w2);
+        if (len > bestLen) { bestLen = len; best0 = w0; best1 = w1; best2 = w2; }
       }
       double invBest = 1.0 / bestLen;
-      for (int r = 0; r < 3; ++r) uu[r * 3 + c] = best[r] * invBest;
+      uu[c] = best0 * invBest; uu[3 + c] = best1 * invBest; uu[6 + c] = best2 * invBest;
       good[c] = true;
     }
-    double uvt[9];
     for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) { double s = 0; for (int k = 0; k < 3; ++k) s += uu[i * 3 + k] * vv[j * 3 + k]; uvt[i * 3 + j] = s; }
     double det = uvt[0] * (uvt[4] * uvt[8] - uvt[5] * uvt[7]) - uvt[1] * (uvt[3] * uvt[8] - uvt[5] * uvt[6]) + uvt[2] * (uvt[3] * uvt[7] - uvt[4] * uvt[6]);
     double sign = det < 0 ? -1 : 1;

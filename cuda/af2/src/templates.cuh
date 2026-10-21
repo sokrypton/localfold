@@ -221,17 +221,69 @@ __global__ void templatePointAttentionK(const float* q, const float* k, const fl
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= pairs * H) return;
   size_t p = t / H; int h = (int)(t % H), W = H * D;
+  if (D == 16 && ((p * W + h * 16) & 3) == 0) {
+    size_t base = p * W + h * 16;
+    const float4* q4 = reinterpret_cast<const float4*>(q + base);
+    float4 q0 = q4[0], q1 = q4[1], q2 = q4[2], q3 = q4[3];
+    float logits[8]; float mx = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      if (s < T) {
+        const float4* k4 = reinterpret_cast<const float4*>(k + (size_t)s * pairs * W + base);
+        float4 k0 = k4[0], k1 = k4[1], k2 = k4[2], k3 = k4[3];
+        float a = 0;
+        a += q0.x * k0.x; a += q0.y * k0.y; a += q0.z * k0.z; a += q0.w * k0.w;
+        a += q1.x * k1.x; a += q1.y * k1.y; a += q1.z * k1.z; a += q1.w * k1.w;
+        a += q2.x * k2.x; a += q2.y * k2.y; a += q2.z * k2.z; a += q2.w * k2.w;
+        a += q3.x * k3.x; a += q3.y * k3.y; a += q3.z * k3.z; a += q3.w * k3.w;
+        logits[s] = a; mx = fmaxf(mx, a);
+      } else {
+        logits[s] = 0.f;
+      }
+    }
+    float sum = 0;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      if (s < T) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
+    }
+    float4 o0 = {0, 0, 0, 0}, o1 = {0, 0, 0, 0}, o2 = {0, 0, 0, 0}, o3 = {0, 0, 0, 0};
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      if (s < T) {
+        float w = logits[s];
+        const float4* v4 = reinterpret_cast<const float4*>(v + (size_t)s * pairs * W + base);
+        float4 v0 = v4[0], v1 = v4[1], v2 = v4[2], v3 = v4[3];
+        o0.x += w * v0.x; o0.y += w * v0.y; o0.z += w * v0.z; o0.w += w * v0.w;
+        o1.x += w * v1.x; o1.y += w * v1.y; o1.z += w * v1.z; o1.w += w * v1.w;
+        o2.x += w * v2.x; o2.y += w * v2.y; o2.z += w * v2.z; o2.w += w * v2.w;
+        o3.x += w * v3.x; o3.y += w * v3.y; o3.z += w * v3.z; o3.w += w * v3.w;
+      }
+    }
+    float4* out4 = reinterpret_cast<float4*>(out + base);
+    out4[0] = make_float4(o0.x / sum, o0.y / sum, o0.z / sum, o0.w / sum);
+    out4[1] = make_float4(o1.x / sum, o1.y / sum, o1.z / sum, o1.w / sum);
+    out4[2] = make_float4(o2.x / sum, o2.y / sum, o2.z / sum, o2.w / sum);
+    out4[3] = make_float4(o3.x / sum, o3.y / sum, o3.z / sum, o3.w / sum);
+    return;
+  }
   float logits[8]; float mx = -INFINITY;
-  for (int s = 0; s < T; ++s) {
-    float a = 0;
-    for (int d = 0; d < D; ++d) a += q[p * W + h * D + d] * k[((size_t)s * pairs + p) * W + h * D + d];
-    logits[s] = a; mx = fmaxf(mx, a);
+#pragma unroll
+  for (int s = 0; s < 8; ++s) {
+    if (s < T) {
+      float a = 0;
+      for (int d = 0; d < D; ++d) a += q[p * W + h * D + d] * k[((size_t)s * pairs + p) * W + h * D + d];
+      logits[s] = a; mx = fmaxf(mx, a);
+    } else {
+      logits[s] = 0.f;
+    }
   }
   float sum = 0;
-  for (int s = 0; s < T; ++s) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
+#pragma unroll
+  for (int s = 0; s < 8; ++s) if (s < T) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
   for (int d = 0; d < D; ++d) {
     float a = 0;
-    for (int s = 0; s < T; ++s) a += logits[s] * v[((size_t)s * pairs + p) * W + h * D + d];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) if (s < T) a += logits[s] * v[((size_t)s * pairs + p) * W + h * D + d];
     out[p * W + h * D + d] = a / sum;
   }
 }

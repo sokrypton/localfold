@@ -67,13 +67,13 @@ template <class PT> __device__ __forceinline__ void pairSt2(float* p, size_t i, 
 #ifndef LN_ROWS_IN_FLIGHT
 #define LN_ROWS_IN_FLIGHT 8
 #endif
-template <int C, int R, int WARPS, class PT = float, bool FAST_VAR = false, class RowOf>
+template <int C, int R, int WARPS, class PT = float, bool FAST_VAR = false, int MAX_B = LN_ROWS_IN_FLIGHT, class RowOf>
 __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowOf rowOf, const float* __restrict__ scale,
                                                const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
-  constexpr int RPW = R / WARPS, B = LN_ROWS_IN_FLIGHT > 0 && RPW % LN_ROWS_IN_FLIGHT == 0 ? LN_ROWS_IN_FLIGHT
-                                  : RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
+  constexpr int RPW = R / WARPS, B = MAX_B > 0 && RPW % MAX_B == 0 ? MAX_B
+                                  : (MAX_B >= 4 && RPW % 4 == 0) ? 4 : ((MAX_B >= 2 && RPW % 2 == 0) ? 2 : 1), K = C / 32;
 #if LN_VEC16
-  if constexpr (!std::is_same_v<PT, float> && K % LN_VEC_MIN_K == 0) {
+  if constexpr (!std::is_same_v<PT, float> && K % LN_VEC_MIN_K == 0 && MAX_B > 1) {
     // a bf16 row 4/8/16 bytes a lane: a lane's channels (lane + 32 kk) * VEC .. + VEC-1, one load and one store each
     constexpr int VEC = K % 8 == 0 ? 8 : (K % 4 == 0 ? 4 : 2), KK = K / VEC;
     using VT = std::conditional_t<VEC == 8, uint4, std::conditional_t<VEC == 4, uint2, uint32_t>>;
@@ -143,9 +143,11 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
 #else
   {
 #endif
-  float sc[K], of[K];                       // a lane's channels' scale and offset, loaded once for all its rows
+  float sc[MAX_B > 1 ? K : 1], of[MAX_B > 1 ? K : 1]; // a lane's channels' scale and offset, loaded once for all its rows
+  if constexpr (MAX_B > 1) {
 #pragma unroll
-  for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
+    for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
+  }
   for (int base = 0; base < RPW; base += B) {
     PT w[B][K];
 #pragma unroll
@@ -178,7 +180,9 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
       half* xrow = Xs + (warp + (base + b) * WARPS) * LDX + lane;
 #pragma unroll
       for (int k = 0; k < K; ++k) {
-        xrow[32 * k] = __float2half((v[k] - mean) * inv * sc[k] + of[k]);
+        float sk = MAX_B > 1 ? sc[k] : scale[lane + 32 * k];
+        float ok = MAX_B > 1 ? of[k] : offset[lane + 32 * k];
+        xrow[32 * k] = __float2half((v[k] - mean) * inv * sk + ok);
       }
     }
   }
