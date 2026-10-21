@@ -115,9 +115,18 @@ __global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* 
   for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < p.n;
        o += (unsigned long long)gridDim.x * blockDim.x) {
     unsigned long long r = p.o0 + o; long long d = (long long)p.dst, a = (long long)p.off[0], b = (long long)p.off[1];
-    for (int k = p.rank - 1; k >= 0; --k) {
-      long long i = (long long)(r % p.dims[k]); r /= p.dims[k];
-      d += i * p.ds[k]; a += i * p.ss[0][k]; b += i * p.ss[1][k];
+    if (r <= 0xffffffffull) {
+      uint32_t r32 = (uint32_t)r;
+      for (int k = p.rank - 1; k >= 0; --k) {
+        uint32_t dim = (uint32_t)p.dims[k];
+        long long i = (long long)(r32 % dim); r32 /= dim;
+        d += i * p.ds[k]; a += i * p.ss[0][k]; b += i * p.ss[1][k];
+      }
+    } else {
+      for (int k = p.rank - 1; k >= 0; --k) {
+        long long i = (long long)(r % p.dims[k]); r /= p.dims[k];
+        d += i * p.ds[k]; a += i * p.ss[0][k]; b += i * p.ss[1][k];
+      }
     }
     float v;
     if (p.op == 'o') v = 1.f;
@@ -177,7 +186,14 @@ __device__ __forceinline__ float bundleHalf(const unsigned char* p) {
   unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
 }
 __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out) {
-  BDecode d = table[blockIdx.y];
+  __shared__ BDecode d;
+  if (threadIdx.x == 0) d = table[blockIdx.y];
+  __syncthreads();
+  uint32_t block32 = (uint32_t)d.block;
+  int bshift = (block32 > 0 && (block32 & (block32 - 1)) == 0) ? (__ffs((int)block32) - 1) : -1;
+  unsigned long long groupBits = ((unsigned long long)d.block * d.bits / 8) * 8;
+  unsigned long long g6 = (d.kind == 6 && d.rowBlocks > 0) ? (d.rows + d.rowBlocks - 1) / d.rowBlocks : 1;
+  uint32_t g6_32 = (uint32_t)g6;
   for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < d.n;
        o += (unsigned long long)gridDim.x * blockDim.x) {
     unsigned long long i = d.first + o;     // the bundle tensor's element
@@ -186,18 +202,37 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
     if (d.kind == 0) { unsigned int w; memcpy(&w, raw + d.src + 4 * i, 4); v = __uint_as_float(w); }
     else if (d.kind == 1) v = bundleHalf(raw + d.src + 2 * i);
     else if (d.kind == 2) {
-      double scale = (double)bundleHalf(raw + d.scale + 2 * (i / d.block));
+      unsigned long long g = (bshift >= 0) ? (i >> bshift) : ((i <= 0xffffffffull) ? ((uint32_t)i / block32) : (i / d.block));
+      double scale = (double)bundleHalf(raw + d.scale + 2 * g);
       v = (float)__dmul_rn((double)(signed char)raw[d.src + i], scale);
     } else if (d.kind == 6) {          // (float32 times float32, as numpy multiplies them)
-      unsigned long long row = i / d.block, col = i % d.block, g = (d.rows + d.rowBlocks - 1) / d.rowBlocks;
-      unsigned int w; memcpy(&w, raw + d.scale + 4 * ((row / g) * d.block + col), 4);
+      unsigned long long row, col, rg;
+      if (i <= 0xffffffffull) {
+        uint32_t i32 = (uint32_t)i;
+        uint32_t r32 = (bshift >= 0) ? (i32 >> bshift) : (i32 / block32);
+        col = (bshift >= 0) ? (i32 & (block32 - 1)) : (i32 - r32 * block32);
+        row = r32;
+        rg = r32 / g6_32;
+      } else {
+        row = i / d.block; col = i % d.block; rg = row / g6;
+      }
+      unsigned int w; memcpy(&w, raw + d.scale + 4 * (rg * d.block + col), 4);
       v = __fmul_rn((float)(signed char)raw[d.src + i], __uint_as_float(w));
     } else if (d.kind == 7) {
       unsigned int h = (unsigned int)(raw[d.src + 2 * i] | (raw[d.src + 2 * i + 1] << 8));
       v = __uint_as_float(h << 16);
     } else {
-      unsigned long long g = i / d.block, groupBytes = (unsigned long long)d.block * d.bits / 8;
-      unsigned long long bit = g * groupBytes * 8 + (i % d.block) * d.bits, byte = bit >> 3;
+      unsigned long long g, rem;
+      if (bshift >= 0) {
+        g = i >> bshift;
+        rem = i & (unsigned long long)(block32 - 1);
+      } else if (i <= 0xffffffffull) {
+        uint32_t i32 = (uint32_t)i, g32 = i32 / block32;
+        g = g32; rem = i32 - g32 * block32;
+      } else {
+        g = i / d.block; rem = i % d.block;
+      }
+      unsigned long long bit = g * groupBits + rem * d.bits, byte = bit >> 3;
       unsigned int code = ((raw[d.src + byte] | (raw[d.src + byte + 1] << 8)) >> (bit & 7)) & ((1u << d.bits) - 1);
       double scale = (double)bundleHalf(raw + d.scale + 2 * g), zero = (double)bundleHalf(raw + d.zero + 2 * g);
       v = (float)__dadd_rn(__dmul_rn((double)code, scale), zero);
@@ -788,6 +823,7 @@ struct Model {
     GPartD* pt = nullptr;
     if (!s.parts.empty()) {
       for (const BRec& b : s.recs) if (b.kind == 5 && cudaMemsetAsync(s.device + b.dst, 0, b.elements * 4, st) != cudaSuccess) return false;
+      constexpr size_t GATHER_CHUNK = 4096;
       std::vector<GPartD> pd;
       for (const GPart& g : s.parts) {
         GPartD d{}; d.n = 1; d.rank = g.rank; d.op = g.op; d.dst = s.recs[g.rec].dst + g.dst;
@@ -796,15 +832,15 @@ struct Model {
           d.off[q] = s.srcRecs[g.src[q]].dst + g.srcOff[q];
           for (int k = 0; k < g.rank; ++k) d.ss[q][k] = g.srcStride[q][k];
         }
-        for (unsigned long long off = 0; off < d.n; off += BDECODE_CHUNK) {
-          GPartD dc = d; dc.o0 = off; dc.n = std::min<unsigned long long>(BDECODE_CHUNK, d.n - off);
+        for (unsigned long long off = 0; off < d.n; off += GATHER_CHUNK) {
+          GPartD dc = d; dc.o0 = off; dc.n = std::min<unsigned long long>(GATHER_CHUNK, d.n - off);
           pd.push_back(dc);
         }
       }
       if (devMalloc(&pt, pd.size() * sizeof(GPartD)) != cudaSuccess ||
           cudaMemcpyAsync(pt, pd.data(), pd.size() * sizeof(GPartD), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
       for (size_t t0 = 0; t0 < pd.size(); t0 += 65535)
-        bundleGatherK<<<dim3(64, (unsigned)std::min<size_t>(65535, pd.size() - t0)), 256, 0, st>>>(scratch, pt + t0, s.device);
+        bundleGatherK<<<dim3(1, (unsigned)std::min<size_t>(65535, pd.size() - t0)), 256, 0, st>>>(scratch, pt + t0, s.device);
     }
     for (const BRec& b : s.recs)            // a map's literal tensors, as they are
       if (b.kind == 8 && cudaMemcpyAsync(s.device + b.dst, s.consts[b.byteOffset].data(), b.elements * 4,

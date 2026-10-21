@@ -21,41 +21,37 @@ constexpr int C = 64, H = 8, D = 8, NIN = 2 * D + H * D;   // [k | v | gate] col
 
 // msa [N][L][C] f32, mask [N][L]; Wk, Wv [C][D], Wg [C][H*D] (f16); one block a 16-column group and a run of rows
 template <int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ msa, const float* __restrict__ mask,
+__global__ void __launch_bounds__(WARPS * 32, 3) gaInK(const float* __restrict__ msa, const float* __restrict__ mask,
     const float* __restrict__ lnS, const float* __restrict__ lnO, const half* __restrict__ wk, const half* __restrict__ wv,
     const half* __restrict__ wg, const float* __restrict__ gb, float* __restrict__ kv, half* __restrict__ gate,
     float* __restrict__ qsum, float* __restrict__ msum, int L, int N, int rowsPerBlock) {
   constexpr int C = ga::C, H = ga::H, D = ga::D, NIN = ga::NIN;
   constexpr int LDW = NIN + 8, LDX = C + 8;
-  __shared__ __align__(16) half Ws[C * LDW];
-  __shared__ __align__(16) half Xs[WARPS][16 * LDX];
-  __shared__ float red[WARPS][32][33];
-  __shared__ float mred[WARPS][16];
+  __shared__ __align__(16) union {
+    struct {
+      half Ws[C * LDW];
+      half Xs[WARPS][16 * LDX];
+    };
+    struct {
+      float red[WARPS][32][33];
+      float mred[WARPS][16];
+    };
+  } sm;
+  __shared__ float sS[C], sO[C], sGb[H * D];
   for (int t = threadIdx.x; t < C * NIN; t += WARPS * 32) {
     int k = t / NIN, c = t % NIN;
-    Ws[k * LDW + c] = c < D ? wk[k * D + c] : c < 2 * D ? wv[k * D + c - D] : wg[k * H * D + c - 2 * D];
+    sm.Ws[k * LDW + c] = c < D ? wk[k * D + c] : c < 2 * D ? wv[k * D + c - D] : wg[k * H * D + c - 2 * D];
   }
+  if (threadIdx.x < C) { sS[threadIdx.x] = lnS[threadIdx.x]; sO[threadIdx.x] = lnO[threadIdx.x]; sGb[threadIdx.x] = gb[threadIdx.x]; }
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const int b0 = blockIdx.x * 16, tok = lane >> 1, hf = lane & 1, b = b0 + tok;
   const bool valid = b < L;
   const int s0 = blockIdx.y * rowsPerBlock, s1 = min(N, s0 + rowsPerBlock);
-  float sS[32], sO[32];
-  const float4* pS = reinterpret_cast<const float4*>(lnS + hf * 32);
-  const float4* pO = reinterpret_cast<const float4*>(lnO + hf * 32);
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    float4 fs = pS[i], fo = pO[i];
-    sS[4 * i] = fs.x; sS[4 * i + 1] = fs.y; sS[4 * i + 2] = fs.z; sS[4 * i + 3] = fs.w;
-    sO[4 * i] = fo.x; sO[4 * i + 1] = fo.y; sO[4 * i + 2] = fo.z; sO[4 * i + 3] = fo.w;
-  }
-  float2 gb2[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) gb2[i] = *reinterpret_cast<const float2*>(gb + i * 8 + tig * 2);
   float qacc[32], macc = 0.f;
 #pragma unroll
   for (int c = 0; c < 32; ++c) qacc[c] = 0.f;
-  half* xs = Xs[warp];
+  half* xs = sm.Xs[warp];
   const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
   for (int s = s0 + warp; s < s1; s += WARPS) {
     float v[32];
@@ -83,8 +79,8 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
       uint4 o4; half2* oh = reinterpret_cast<half2*>(&o4);
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const int c = 8 * i + 2 * e;
-        const float x0 = (v[c] - mean) * inv * sS[c] + sO[c], x1 = (v[c + 1] - mean) * inv * sS[c + 1] + sO[c + 1];
+        const int c = 8 * i + 2 * e, ch = hf * 32 + c;
+        const float x0 = (v[c] - mean) * inv * sS[ch] + sO[ch], x1 = (v[c + 1] - mean) * inv * sS[ch + 1] + sO[ch + 1];
         qacc[c] += m * x0; qacc[c + 1] += m * x1;
         oh[e] = __floats2half2_rn(x0, x1);
       }
@@ -96,14 +92,14 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
     for (int ks = 0; ks < C / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
     float acc[NIN / 8][4] = {};
     uint32_t f[2][4];
-    ldsm4t(f[0], Ws + kl * LDW + cl);
+    ldsm4t(f[0], sm.Ws + kl * LDW + cl);
 #pragma unroll
     for (int ks = 0; ks < C / 16; ++ks)
 #pragma unroll
       for (int n2 = 0; n2 < NIN / 16; ++n2) {
         const int step = ks * (NIN / 16) + n2, cur = step & 1;
-        if (n2 + 1 < NIN / 16) ldsm4t(f[cur ^ 1], Ws + (ks * 16 + kl) * LDW + (n2 + 1) * 16 + cl);
-        else if (ks + 1 < C / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
+        if (n2 + 1 < NIN / 16) ldsm4t(f[cur ^ 1], sm.Ws + (ks * 16 + kl) * LDW + (n2 + 1) * 16 + cl);
+        else if (ks + 1 < C / 16) ldsm4t(f[cur ^ 1], sm.Ws + ((ks + 1) * 16 + kl) * LDW + cl);
         mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
     __syncwarp();                         // (every lane has its fragments: the next row's LN may take the tile)
@@ -118,32 +114,33 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
         if (nt < 2) *reinterpret_cast<float2*>(kv + ((size_t)bt * N + s) * 2 * D + col) = make_float2(a0, a1);
         else {
           const int gc = col - 2 * D;
-          const float2 b2 = gb2[nt - 2];
+          const float2 b2 = *reinterpret_cast<const float2*>(sGb + gc);
           *reinterpret_cast<half2*>(gate + ((size_t)s * L + bt) * H * D + gc) =
               __floats2half2_rn(1.f / (1.f + __expf(-(a0 + b2.x))), 1.f / (1.f + __expf(-(a1 + b2.y))));
         }
       }
     }
   }
+  __syncthreads();
   // the block's masked sums: across its warps in shared memory, into this row block's slab
   qsum += (size_t)blockIdx.y * ((size_t)L * C + L); msum = qsum + (size_t)L * C;
 #pragma unroll
-  for (int c = 0; c < 32; ++c) red[warp][lane][c] = qacc[c];
-  if (hf == 0) mred[warp][tok] = macc;
+  for (int c = 0; c < 32; ++c) sm.red[warp][lane][c] = qacc[c];
+  if (hf == 0) sm.mred[warp][tok] = macc;
   __syncthreads();
   for (int t = threadIdx.x; t < 32 * 32; t += WARPS * 32) {
     const int ln = t / 32, c = t % 32, bb = b0 + (ln >> 1);
     if (bb >= L) continue;
     float a = 0.f;
 #pragma unroll
-    for (int w = 0; w < WARPS; ++w) a += red[w][ln][c];
+    for (int w = 0; w < WARPS; ++w) a += sm.red[w][ln][c];
     qsum[(size_t)bb * C + (ln & 1) * 32 + c] = a;
   }
   for (int t = threadIdx.x; t < 16; t += WARPS * 32) {
     if (b0 + t >= L) continue;
     float a = 0.f;
 #pragma unroll
-    for (int w = 0; w < WARPS; ++w) a += mred[w][t];
+    for (int w = 0; w < WARPS; ++w) a += sm.mred[w][t];
     msum[b0 + t] = a;
   }
 }
@@ -242,14 +239,16 @@ __global__ void __launch_bounds__(256) gaAttnK(const float* __restrict__ kv, con
 
 // msa[s][b] += (gate[s][b] * avg[b]) Wo + bo; Wo [H*D][C] f16. One block a 16-column group and a run of rows
 template <int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ gate, const float* __restrict__ avg,
+__global__ void __launch_bounds__(WARPS * 32, 4) gaOutK(const half* __restrict__ gate, const float* __restrict__ avg,
     const half* __restrict__ wo, const float* __restrict__ bo, float* __restrict__ msa, int L, int N, int rowsPerBlock) {
   constexpr int C = ga::C, H = ga::H, D = ga::D, NIN = ga::NIN;
   constexpr int K = H * D, LDW = C + 8, LDX = K + 8;
   __shared__ __align__(16) half Ws[K * LDW];
   __shared__ __align__(16) half Xs[WARPS][16 * LDX];
+  __shared__ float sBo[C];
   const int b0 = blockIdx.x * 16;
   for (int t = threadIdx.x; t < K * C; t += WARPS * 32) Ws[(t / C) * LDW + t % C] = wo[t];
+  if (threadIdx.x < C) sBo[threadIdx.x] = bo[threadIdx.x];
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const int tok = lane >> 1, hf = lane & 1, b = b0 + tok;
@@ -263,18 +262,20 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
       av[4 * i] = fa.x; av[4 * i + 1] = fa.y; av[4 * i + 2] = fa.z; av[4 * i + 3] = fa.w;
     }
   }
-  float2 b2[C / 8];
-#pragma unroll
-  for (int nt = 0; nt < C / 8; ++nt) b2[nt] = *reinterpret_cast<const float2*>(bo + nt * 8 + tig * 2);
   half* xs = Xs[warp];
   const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+  uint4 gn[4];
+  if (s0 + warp < s1 && b < L) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) gn[i] = *reinterpret_cast<const uint4*>(gate + ((size_t)(s0 + warp) * L + b) * K + hf * 32 + 8 * i);
+  }
   for (int s = s0 + warp; s < s1; s += WARPS) {
     // this lane's token's 32 gate columns times its column's average, f16 into the warp's tile
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       uint4 o4 = make_uint4(0, 0, 0, 0);
       if (b < L) {
-        const uint4 g4 = *reinterpret_cast<const uint4*>(gate + ((size_t)s * L + b) * K + hf * 32 + 8 * i);
+        const uint4 g4 = gn[i];
         const half2* gh = reinterpret_cast<const half2*>(&g4);
         half2* oh = reinterpret_cast<half2*>(&o4);
 #pragma unroll
@@ -290,6 +291,10 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
     uint32_t xa[K / 16][4];
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
+    if (s + WARPS < s1 && b < L) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) gn[i] = *reinterpret_cast<const uint4*>(gate + ((size_t)(s + WARPS) * L + b) * K + hf * 32 + 8 * i);
+    }
     float acc[C / 8][4] = {};
     uint32_t f[2][4];
     ldsm4t(f[0], Ws + kl * LDW + cl);
@@ -311,8 +316,9 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
 #pragma unroll
       for (int nt = 0; nt < C / 8; ++nt) {
         const int col = nt * 8 + tig * 2;
+        const float2 b2 = *reinterpret_cast<const float2*>(sBo + col);
         float2 r = *reinterpret_cast<float2*>(row + col);
-        r.x += acc[nt][2 * hh] + b2[nt].x; r.y += acc[nt][2 * hh + 1] + b2[nt].y;
+        r.x += acc[nt][2 * hh] + b2.x; r.y += acc[nt][2 * hh + 1] + b2.y;
         *reinterpret_cast<float2*>(row + col) = r;
       }
     }
@@ -355,7 +361,7 @@ inline void lnQkvg64(const float* x, const float* lnS, const float* lnO, const h
       x, lnS, lnO, W, out, 1, q0, rows, false, nullptr, nullptr, 0, 0, false, qb);
 }
 template <int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) projAdd64K(const half* __restrict__ x, const half* __restrict__ wo,
+__global__ void __launch_bounds__(WARPS * 32, 4) projAdd64K(const half* __restrict__ x, const half* __restrict__ wo,
     const float* __restrict__ bo, float* __restrict__ y, size_t rows) {
   constexpr int K = 64, C = 64, LDW = C + 8, LDX = K + 8;
   __shared__ __align__(16) half Ws[K * LDW];
@@ -368,16 +374,29 @@ __global__ void __launch_bounds__(WARPS * 32) projAdd64K(const half* __restrict_
 #pragma unroll
   for (int nt = 0; nt < C / 8; ++nt) b2[nt] = *reinterpret_cast<const float2*>(bo + nt * 8 + tig * 2);
   half* xs = Xs[warp];
-  for (size_t tile = (size_t)blockIdx.x * WARPS + warp; tile * 16 < rows; tile += (size_t)gridDim.x * WARPS) {
-    const size_t r0 = tile * 16, r = r0 + tok;
+  size_t tile0 = (size_t)blockIdx.x * WARPS + warp, stepT = (size_t)gridDim.x * WARPS;
+  uint4 xn[4];
+  if (tile0 * 16 < rows) {
+    const size_t r = tile0 * 16 + tok;
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      *reinterpret_cast<uint4*>(xs + tok * LDX + hf * 32 + 8 * i) =
-          r < rows ? *reinterpret_cast<const uint4*>(x + r * K + hf * 32 + 8 * i) : make_uint4(0, 0, 0, 0);
+      xn[i] = r < rows ? *reinterpret_cast<const uint4*>(x + r * K + hf * 32 + 8 * i) : make_uint4(0, 0, 0, 0);
+  }
+  for (size_t tile = tile0; tile * 16 < rows; tile += stepT) {
+    const size_t r0 = tile * 16;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      *reinterpret_cast<uint4*>(xs + tok * LDX + hf * 32 + 8 * i) = xn[i];
     __syncwarp();
     uint32_t xa[K / 16][4];
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
+    if ((tile + stepT) * 16 < rows) {
+      const size_t rn = (tile + stepT) * 16 + tok;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        xn[i] = rn < rows ? *reinterpret_cast<const uint4*>(x + rn * K + hf * 32 + 8 * i) : make_uint4(0, 0, 0, 0);
+    }
     float acc[C / 8][4] = {};
     uint32_t f[2][4];
     ldsm4t(f[0], Ws + kl * LDW + cl);
