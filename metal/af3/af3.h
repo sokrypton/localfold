@@ -7,6 +7,7 @@
 #include "kernels.h"
 #include "host.h"
 #include "model.h"
+#include <cctype>
 #include <functional>
 #include <string>
 #include <vector>
@@ -160,6 +161,14 @@ void adaLn(const float* x, const float* scale, const float* shift, half* out, fl
            int ld = 0);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
+// how far a template.pdb record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at
+// 24 slots a token - the slot is wider and pushes the rest of the record right, so its tail is read that far along
+// (cuda/af3's 11e4b10, verbatim: past it a PDB came out malformed, every record's tail shifted)
+inline size_t templateSpill(const std::string& line) {
+  size_t at = 30; while (at < line.size() && line[at] == ' ') ++at;
+  while (at < line.size() && (isdigit((unsigned char)line[at]) || line[at] == '.')) ++at;
+  return at > 38 ? at - 38 : 0;
+}
 // the diffusion's discretisation (cuda/af3 sampler.cuh DiffusionOptions, after Blitz): the default is the exponential
 // update x' = r^S x + (1 - r^S) D on noise levels even in log sigma, with churn - 200 Euler steps' ligand geometry at 25
 // (docs/AF3.md, "The default sampler"); --update=euler --schedule=karras is AlphaFold 3's own, for an oracle comparison

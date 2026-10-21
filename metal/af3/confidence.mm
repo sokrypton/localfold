@@ -193,6 +193,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
           if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asymH[i] == asymH[j])) continue;
           tot += term[(size_t)i * n + j]; ++cnt;
         }
+        if (cnt && std::isnan(tot / cnt)) return (double)NAN;     // (std::max passes a NaN by: the score must not)
         if (cnt) { any = true; best = std::max(best, tot / cnt); }
       }
       return any ? best : NAN;

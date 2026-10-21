@@ -144,11 +144,16 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // caller's product and residual still to do). LOCALFOLD_GATE_RES=0 the control
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
                       const float* gate, int ld, size_t period, float alpha, const char* label = nullptr);
-bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S);
+// (alpha: the product scaled as it is stored - AF2's deep alignments contract their rows scaled down by a power of two
+// to fit float16, and gemmOpmOut's alpha scales them back)
+bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha = 1.f);
 // the outer product's output projection adding into the pair: pair[r] += (bias + X[r] W) / (1e-3 + norm[r]) - on the
 // matrix units only (the vector epilogue, EP bit 8192); false: nothing run, the caller's own GEMM and add
-bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out);
-bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out);
+// (alpha scales X W before the bias is added: (bias + alpha X W) / (1e-3 + norm), af2_opm_add's order)
+bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
+                float alpha = 1.f);
+bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
+                float alpha = 1.f);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);

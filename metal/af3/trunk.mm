@@ -110,7 +110,9 @@ static void templateEmbedding(Trunk& t) {
       scaleRows(act, M.f(S + "pseudoBetaMask2d"), pairs, Ct, pairs);
     add(summed, act, pairs * Ct, repeat);
   }
-  scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);     // divided by every slot (not the real ones), relu
+  // divided by template.templates, then relu: every slot for AF3, the templates PRESENT for chai-1 and boltz2 (the
+  // featuriser's divisor, cuda/featurise/af3_export.h - by four, boltz2's one template reached the trunk at a quarter)
+  scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);
   lin(summed, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
   releaseScratch({"tmpl."});
 }

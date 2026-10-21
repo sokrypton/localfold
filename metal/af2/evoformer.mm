@@ -335,19 +335,27 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
   float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
+  // 🔴 THE SUM OVER THE ROWS SCALED BY 2^-k AS IT IS STORED IN HALF - exact, a power of two - and scaled back in the output
+  // (cuda/af2's a04ed7e: unscaled, 7GYV's ColabFold alignment at 1,945 extra rows put an entry past 65,504 and NaN'd every
+  // coordinate). 2^k ~ the row count / 64, its k: the largest entry there ~34 a row, so ~2,200 scaled; scaling all the way
+  // to the mean reached float16's subnormals and moved 7GYV's fold
+  int k = 0; while ((64 << k) < rowsN) ++k;
+  const float down = ldexpf(1.f, -k), up = ldexpf(1.f, k);
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass)
-    if (!gemmOpmPermuted(lt + (size_t)i0 * O, L * O, rt, L * O, X, bi, L, O, rowsN)) {
+    if (!gemmOpmPermuted(lt + (size_t)i0 * O, L * O, rt, L * O, X, bi, L, O, rowsN, down)) {
       half* Pm = scratch<half>("opm.P", (size_t)Bi * per);
       { Gemm g{}; g.X = lt + (size_t)i0 * O; g.tx = F16; g.transX = true; g.ldx = L * O; g.W = rt; g.tw = F16; g.ldw = L * O; g.Y = Pm;
-        g.ty = F16; g.rows = (size_t)bi * O; g.in = rowsN; g.out = L * O; g.accFloat = true; g.label = "opm product"; gemm(g); }
+        g.ty = F16; g.rows = (size_t)bi * O; g.in = rowsN; g.out = L * O; g.alpha = down; g.accFloat = true; g.label = "opm product";
+        gemm(g); }
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
     // (on the matrix units the add in the output GEMM's epilogue - no Y)
-    if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128))
+    if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128, up))
       continue;
-    { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = 128; g.label = "opm output"; gemm(g); }
+    { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = 128; g.alpha = up;
+      g.label = "opm output"; gemm(g); }
     opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
   }
 }

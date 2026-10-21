@@ -30,18 +30,22 @@ std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& 
 // token named here. Returns the dense slot of every ATOM/HETATM record, in file order.
 std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors) {
   std::vector<size_t> order;
+  // (the structure's coordinates checked before a record reads one: cuda/af3's 11e4b10)
+  const size_t atomSlots = (size_t)M.meta("batch.tokens") * (size_t)M.meta("batch.dense");
+  if (x.size() < atomSlots * 3) die("the structure to write has %zu coordinates where %zu atom slots want %zu", x.size(), atomSlots, atomSlots * 3);
   std::ifstream tf(DATA_DIR + "/template.pdb");
   if (tf) {
     FILE* f = fopen(path.c_str(), "w");
     std::string line;
     while (std::getline(tf, line)) {
       if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
-        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8)));
+        const size_t spill = templateSpill(line);
+        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8 + spill)));
         order.push_back(slot);
         char coords[64];
         snprintf(coords, sizeof coords, "%8.3f%8.3f%8.3f%6.2f%6.2f", x[slot * 3], x[slot * 3 + 1], x[slot * 3 + 2], 1.0,
                  bfactors ? bfactors[slot] : 0.0);
-        line = line.substr(0, 30) + coords + line.substr(66);
+        line = line.substr(0, 30) + coords + (line.size() > 66 + spill ? line.substr(66 + spill) : std::string());
       }
       fprintf(f, "%s\n", line.c_str());
     }
@@ -128,6 +132,7 @@ void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& ord
         if (!(seq[i] > 0 && seq[k] > 0) || !selects(i, k)) continue;
         total += tmTerm[(size_t)i * n + k]; ++count;
       }
+      if (count && std::isnan(total / count)) return (double)NAN;     // (std::max passes a NaN by: the score must not)
       if (count) { any = true; best = std::max(best, total / count); }
     }
     return any ? best : NAN;

@@ -922,34 +922,37 @@ bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, si
   gemmTensorRun(F32, a, 1, false, label);
   return true;
 }
-bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S) {
+bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
   const int rows = bi * O, cols = L * O;
   if (!on || !tensorWanted() || O % 4 || rows <= 128 || cols % 4 || ((uint64_t)X & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)rt; a.B = (uint64_t)lt; a.C = a.D = (uint64_t)X;
   a.m = cols; a.n = rows; a.k = S; a.lda = ldr; a.ldb = ldl; a.ldc = a.ldd = cols;
-  a.ta = 0; a.tb = 1; a.alpha = 1.f; a.epilogue = 4096; a.tgC = O; a.tgN = L;
+  a.ta = 0; a.tb = 1; a.alpha = alpha; a.epilogue = 4096; a.tgC = O; a.tgN = L;
   ++D().stats.gemms;
   gemmTensorRun(F16, a, 1, true, "opm product, permuted");
   return true;
 }
-static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out) {
+static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
+                   float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
   if (!on || !tensorWanted() || rows <= 128 || out % 4 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
-  a.alpha = 1.f; a.beta = 1.f; a.epilogue = 8192 | 4; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
+  a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192 | 4; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
   ++D().stats.gemms;
   gemmTensorRun(tp, a, 1, true, "opm output, normalised add");
   return true;
 }
-bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out) {
-  return opmOut(X, W, pair, F32, bias, norm, rows, in, out);
+bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
+                float alpha) {
+  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha);
 }
-bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out) {
-  return opmOut(X, W, pair, F16, bias, norm, rows, in, out);
+bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
+                float alpha) {
+  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha);
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

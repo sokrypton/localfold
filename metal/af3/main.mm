@@ -45,7 +45,7 @@ struct FrameWriter {
     if (!tf) { fprintf(stderr, "frames: no %s/template.pdb, none written\n", inputDir.c_str()); return false; }
     for (std::string l; std::getline(tf, l);) {
       lines.push_back(l);
-      if (isAtom(l)) slots.push_back((size_t)std::lround(std::stod(l.substr(30, 8))));
+      if (isAtom(l)) slots.push_back((size_t)std::lround(std::stod(l.substr(30, 8 + templateSpill(l)))));
     }
     dir = d; steps = totalSteps; stride = std::max(1, (steps + MAX - 1) / MAX);
     return true;
@@ -73,7 +73,7 @@ struct FrameWriter {
           snprintf(buf, sizeof buf, "%8.3f", R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d]);
           out += buf;
         }
-        out += line.substr(54); out += '\n'; ++a;
+        out += line.substr(54 + templateSpill(line)); out += '\n'; ++a;
       } else { out += line; out += '\n'; }
     }
     char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", step);
@@ -117,6 +117,7 @@ ConfidenceOut structuralConfidence(const Structural& st, const float* coords, st
     for (int i = 0; i < nRes; ++i) {
       double tot = 0; int cnt = 0;
       for (int j = 0; j < nRes; ++j) { if (interOnly && resAsym[i] == resAsym[j]) continue; tot += term[(size_t)i * nRes + j]; ++cnt; }
+      if (cnt && std::isnan(tot / cnt)) return (double)NAN;     // (std::max passes a NaN by: the score must not)
       if (cnt) { any = true; bestTm = std::max(bestTm, tot / cnt); }
     }
     return any ? bestTm : NAN;
