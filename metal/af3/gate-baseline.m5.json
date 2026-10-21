@@ -46,6 +46,11 @@
   "ptm": "0.6898",
   "rmsd": null
  },
+ "boltz2-5caj-template": {
+  "plddt": 97.59,
+  "ptm": "0.9753",
+  "rmsd": 0.533
+ },
  "boltz2-6mrr": {
   "plddt": 96.9,
   "ptm": "0.8234",
