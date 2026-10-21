@@ -199,7 +199,15 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   3.3e-3 / 4.0e-5, split with Xq in one half 7.8e-3 / 7.9e-3 / 9.7e-3 / 2.7e-4, with hi | lo **6.9e-3 / 6.1e-3 /
   3.1e-3 / 3.5e-5** - better than unsplit; Xa in one half costs nothing (hi | lo there moved nothing). The sampler
   14.5 -> 12.9 s at 68 tokens x 5 samples x 200 steps, the worker gate's BioEmu2 cases at the same RMSDs. Off the
-  matrix units (an M2) Metal keeps the unsplit mixer.
+  matrix units (an M2) Metal keeps the unsplit mixer. 🔴 **AND IT IS CHOSEN PER CALL**: Qa | Qq | B is a cost a layer
+  that the samples do not share out, so at ONE sample the split LOSES (2.41 -> 2.78 s at 100 steps), ties at two and
+  wins from three (4.94 -> 4.68; five 8.0 -> 7.0). `splitPays` compares multiply-adds with a margin of 1.7 fitted to
+  those; `BE2_COUPLING_SPLIT=0/1` forces either arm. Qa | Qq | B themselves run on the matrix units as two half GEMMs
+  (hi, then the remainder at beta 1) and the conditioning linears take their bias in the epilogue: 12.86 -> 12.75 s.
+  🔴 ONE UNREPRODUCED FAILURE: the worker gate's 6MRR + GOL case once came back at RMSD 99 (an exploded sample) on the
+  first run after that build, and did not recur in 38 runs since - 20 back to back, 4 with the kernel-specialisation
+  cache deleted, 10 with the split on and off. Its log was overwritten before it was read. If it recurs, keep
+  /tmp/localfold-cuda-check.log.
 - **WebGPU's GEMM retiled: `gemm2Source` in webgpu/bioemu2/ops.js**, a 64 x 128 block of 4 x 8 lanes with vec4 panel
   reads (`gemmVersion = 1` is the original, the control; `--gemm=1` on profile-bioemu2.js and dump-bioemu2-stages.js):
   a call 286 -> 266 ms, its stage dumps against metal/bioemu2's `--f32` IDENTICAL to the old kernel's to four digits

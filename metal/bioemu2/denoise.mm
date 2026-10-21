@@ -135,8 +135,21 @@ void freeDenoiser(Denoiser& d) {
 // 9.25 -> 2.7 G multiply-adds a layer at 68 tokens x 5 samples; the sampler 14.5 -> 12.9 s at 68 tokens x 5 samples x
 // 200 steps on an M5. 🔴 Z NEVER LEAVES THE FLOAT TILE: the combine and the SwiGLU are its GEMM's epilogue
 // (gemmCouplingCombine). Built first with Z stored, it lost precision in half and its speed in float. Every product here is on the blocks-of-8 weight, so u's b half is fc2 / 64 as
-// gemmSwiglu's, and fc3 scales it back. BE2_COUPLING_SPLIT=0 is the control (and off the matrix units, the only path)
-static const bool COUPLING_SPLIT = !getenv("BE2_COUPLING_SPLIT") || atoi(getenv("BE2_COUPLING_SPLIT")) != 0;
+// gemmSwiglu's, and fc3 scales it back. Off the matrix units the unsplit mixer is the only path
+// (BE2_COUPLING_SPLIT: 0 never, 1 always, unset - the rule below)
+static const int COUPLING_SPLIT = getenv("BE2_COUPLING_SPLIT") ? atoi(getenv("BE2_COUPLING_SPLIT")) : -1;
+// 🔴 THE SPLIT'S Qa | Qq | B IS A COST A LAYER THAT THE SAMPLES DO NOT SHARE OUT: (T + 1) x 2I x (Dt + Ca + Dc), twice
+// (hi | lo), against the unsplit mixer's samples N x 2I x Dc. Taken where its multiply-adds, times SPLIT_MARGIN (its
+// kernels' lower efficiency, measured), are fewer than the unsplit's
+static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
+  if (COUPLING_SPLIT >= 0) return COUPLING_SPLIT != 0;
+  const double Dc = Dt + Ca, RN = (double)samples * N, RT = (double)samples * T, R = T + 1.0;
+  const double unsplit = RN * Dc, split = 2 * R * (Dt + Ca + Dc) + RT * Dt + RN * 2 * Ca;
+  // (measured, 68 tokens x 100 steps on an M5, unsplit / split: 1 sample 2.41 / 2.78 s, 2 3.67 / 3.70, 3 4.94 / 4.68,
+  // 5 8.0 / 7.0 - the ratio below 1.16, 1.60, 1.83, 2.07 there: the line between 2 and 3)
+  static const double margin = getenv("BE2_SPLIT_MARGIN") ? atof(getenv("BE2_SPLIT_MARGIN")) : 1.7;
+  return split * margin < unsplit;
+}
 static void couplingSplit(const float* a, const float* q, const float* cqc, float* dq, const int* atomTok, int samples, int T, int N,
                    int Dt, int Ca, const std::string& p) {
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
@@ -279,7 +292,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt, 0.f, 0, 0, false, WfOpt(cp + "s_coupling_cond_2/bias"));
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
     // (the fast arm on the matrix units: s_to_q SPLIT - couplingSplit - and its row never built)
-    const bool csplit = HALF && COUPLING_SPLIT && gemmTensorOps();
+    const bool csplit = HALF && gemmTensorOps() && splitPays(samples, T, N, Dt, Ca);
     if (!csplit) {
       be2Run1d("be2_tokens_to_atoms", RN * Dt, Be2TokensToAtomsArgs{a, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), sq, (u64)N,
                                                                  (uint)T, (uint)Dt, (uint)Dc, (uint)samples, 0.f, 0});
