@@ -39,7 +39,7 @@ import { createAddShader } from "../../runtime/execution.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
-import { deviceTuning } from "../../runtime/device-profile.js";
+import { deviceTuning, shapedKnob } from "../../runtime/device-profile.js";
 import { singleCondPadding, singleCondPaddingWgsl } from "../../../shared/af3/dialect.js";
 import { createTransitionShader, packTransitionWeights, transitionRowTile, transitionWidth }
   from "../trunk/transition.js";
@@ -317,10 +317,13 @@ var<workgroup> reduce_s: array<f32, 64>;
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_s[local] = value;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_s[local] += reduce_s[local + stride]; }
-    workgroupBarrier();
-  }
+  ${(() => {
+    const steps = [];
+    for (let s = 32; s > 0; s >>= 1) {
+      steps.push(`if (local < ${s}u) { reduce_s[local] += reduce_s[local + ${s}u]; }\n  workgroupBarrier();`);
+    }
+    return steps.join("\n  ");
+  })()}
   return reduce_s[0];
 }
 
@@ -378,7 +381,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var out = local; out < C_SEQ; out += 64u) {
+  ${seqChannels % 64 === 0 ? (() => {
+    const perLane = seqChannels / 64;
+    const overCols = (fn) => Array.from({ length: perLane }, (_, s) => fn(s)).join("\n  ");
+    return `${overCols((s) => `var val_${s} = 0.0;`)}
+  for (var c = 0u; c < WIDTH; c += 1u) {
+    let n_c = normalised[c];
+    let p_base = c * C_SEQ + local;
+    ${overCols((s) => `val_${s} += n_c * projection[p_base + ${s * 64}u];`)}
+  }
+  for (var c = 0u; c < NOISE_CHANNELS; c += 1u) {
+    let nn_c = noise_norm[c];
+    let np_base = W_NOISE_PROJECT + c * C_SEQ + local;
+    ${overCols((s) => `val_${s} += nn_c * noise_weights[np_base + ${s * 64}u];`)}
+  }
+  let out_base = token * C_SEQ + local;
+  ${overCols((s) => `${singleBias ? `val_${s} += projection[${seqChannels * singleWidth + s * 64}u + local];\n  ` : ""}single[out_base + ${s * 64}u] = val_${s};`)}`;
+  })() : `for (var out = local; out < C_SEQ; out += 64u) {
     var value = 0.0;
     for (var c = 0u; c < WIDTH; c += 1u) {
       value += normalised[c] * projection[c * C_SEQ + out];
@@ -388,7 +407,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
 ${singleBias ? "    value += projection[C_SEQ * WIDTH + out];" : ""}
     single[token * C_SEQ + out] = value;
-  }
+  }`}
 }`;
 
   // 🔴 THE SPLIT DIALECT IS A DIFFERENT FUNCTION, NOT A RESHAPE. OpenDDE
@@ -703,12 +722,13 @@ export class Af3DiffusionConditioningGpu {
     // Every pipeline here is ASKED FOR before any is awaited, so the browser
     // builds them together; awaited one by one they were ten serial compiles
     // on a cold denoiser call.
+    const singleTile = seqChannels <= 384
+      ? (shapedKnob(deviceTuning(this.device).singleTransitionTile) ?? transitionRowTile(tokens, seqChannels))
+      : transitionRowTile(tokens, seqChannels);
     const compiling = {
       pairInitial: reusePair !== undefined ? undefined
         : this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
       singleInitial: this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
-      addSingle: this.pipelines.get(`${base}:add-single`,
-        createAddShader(tokens * seqChannels)),
     };
     // The four unconditioned transitions: the trunk's shader, two-pass variance.
     const transitionPipelines = { pair: [], single: [] };
@@ -729,20 +749,20 @@ export class Af3DiffusionConditioningGpu {
       //
       // The width is BAKED into the shader, so it is in the key.
       const singleWidth_ = transitionWidth(
-        tokens, transitionRowTile(tokens, seqChannels),
+        tokens, singleTile,
         deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2,
         // ...and never wider than this device will run. See transitionWidth.
         this.device.limits.maxComputeWorkgroupSizeX);
       transitionPipelines.single.push(this.pipelines.get(
-        `${base}:single-transition:${index}:w${singleWidth_}`,
+        `${base}:single-transition:${index}:t${singleTile}:w${singleWidth_}:res`,
         createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2,
-                                 width: singleWidth_ },
+                                 tile: singleTile, width: singleWidth_, residual: true },
                                prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
     }
     const compiled = await settleAll(compiling);
     transitionPipelines.pair = await Promise.all(transitionPipelines.pair);
     transitionPipelines.single = await Promise.all(transitionPipelines.single);
-    return { shape, base, compiled, transitionPipelines };
+    return { shape, base, compiled, transitionPipelines, singleTile };
   }
 
   /**
@@ -785,7 +805,7 @@ export class Af3DiffusionConditioningGpu {
         + "the dialect and the weights disagree about the unknown-DNA columns");
     }
 
-    const { shape, base, compiled, transitionPipelines } =
+    const { shape, base, compiled, transitionPipelines, singleTile } =
       await this.#compileFor(tokens, weights, input.dialect, reusePair);
     // ...and the third mode, carried on the shape with it so `run` and the
     // shader factory cannot disagree about which kernel is compiled.
@@ -874,8 +894,6 @@ export class Af3DiffusionConditioningGpu {
         ? keep(this.allocator.allocate("cond.single", tokens * seqChannels * 4,
             storage | GPUBufferUsage.COPY_SRC))
         : { buffer: outSingle };
-      const singleScratch = keep(this.allocator.allocate("cond.single-scratch",
-        tokens * seqChannels * 4, storage));
       const readPair = outPair !== undefined ? undefined
         : onlyIfNew(() => keep(this.allocator.allocate("cond.rb-pair",
           pairs * pairChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
@@ -938,7 +956,6 @@ export class Af3DiffusionConditioningGpu {
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
           tokens);
 
-      const singleAdd = spread(Math.ceil(tokens * seqChannels / 64));
       // `transitions: 0` stops after the initial projections, which is how the
       // closed-form relative-encoding path is checked on its own.
       const transitionCount = options.transitions ?? 2;
@@ -951,10 +968,8 @@ export class Af3DiffusionConditioningGpu {
               [pair, transitionWeights.pair[index]], perPair[0], perPair[1]);
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
-            [single, transitionWeights.single[index], singleScratch],
-            Math.ceil(tokens / transitionRowTile(tokens, seqChannels)));
-        run(`single-add-${index}`, compiled.addSingle, [single, singleScratch],
-            singleAdd[0], singleAdd[1]);
+            [single, transitionWeights.single[index]],
+            Math.ceil(tokens / singleTile));
       }
       if (reusePair === undefined && readPair !== undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);

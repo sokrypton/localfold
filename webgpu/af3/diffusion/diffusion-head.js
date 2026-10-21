@@ -105,10 +105,13 @@ var<workgroup> reduce_a: array<f32, ${lanes}>;
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_a[local] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+  ${(() => {
+    const steps = [];
+    for (let s = lanes >> 1; s > 0; s >>= 1) {
+      steps.push(`if (local < ${s}u) { reduce_a[local] += reduce_a[local + ${s}u]; }\n  workgroupBarrier();`);
+    }
+    return steps.join("\n  ");
+  })()}
   return reduce_a[0];
 }
 
@@ -136,13 +139,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var out = local; out < C_OUT; out += LANES) {
+  ${outChannels % lanes === 0 ? (() => {
+    const perLane = outChannels / lanes;
+    const overCols = (fn) => Array.from({ length: perLane }, (_, s) => fn(s)).join("\n  ");
+    return `${overCols((s) => `var val_${s} = 0.0;`)}
+  for (var c = 0u; c < C_IN; c += 1u) {
+    let n_c = normalised[c];
+    let p_base = c * C_OUT + local;
+    ${overCols((s) => `val_${s} += n_c * projection[p_base + ${s * lanes}u];`)}
+  }
+  let out_base = row * C_OUT + local;
+  ${overCols((s) => `output[out_base + ${s * lanes}u] = val_${s};`)}`;
+  })() : `for (var out = local; out < C_OUT; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_IN; c += 1u) {
       value += normalised[c] * projection[c * C_OUT + out];
     }
     output[row * C_OUT + out] = value;
-  }
+  }`}
 }`;
 
 /**
@@ -169,10 +183,13 @@ var<workgroup> reduce_a: array<f32, ${lanes}>;
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_a[local] = value;
   workgroupBarrier();
-  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+  ${(() => {
+    const steps = [];
+    for (let s = lanes >> 1; s > 0; s >>= 1) {
+      steps.push(`if (local < ${s}u) { reduce_a[local] += reduce_a[local + ${s}u]; }\n  workgroupBarrier();`);
+    }
+    return steps.join("\n  ");
+  })()}
   return reduce_a[0];
 }
 

@@ -1315,7 +1315,13 @@ const PRIORS = new Map([
     //   100 tokens 44 / 44 -> 44 / 44 ms, 150 63 / 63 -> 60 / 61, 200 83 / 82 -> 79 / 79, 255 107 / 107 -> 97 / 98
     // (16 is level with 8 at 255; 68 tokens loses with 8, 33 -> 36). A schedule, not arithmetic: the same fold.
     // Not measured on an M2 at 200 and above.
-    diffusionTokenTile: { below: 4, atOrAbove: 8, crossover: 200 },
+    // ...and qkvg, ffw-wide, and attention-output have enough output-split workgroups (3, 6, and 3 splits per token tile)
+    // to take tile 8 from 96 tokens without dragging adaln/ffw-adaln (1 workgroup per token tile) or ffw-out (outChunk=384)
+    // up with them: bench-head.js at 128 tokens, ffw-wide 13.12 -> 6.89 ms, qkvg 9.59 -> 6.20, attention-output 3.42 -> 3.06.
+    diffusionTokenTile: {
+      below: 4, atOrAbove: 8, crossover: 256,
+      qkvgCrossover: 64, wideCrossover: 64, attnOutCrossover: 96,
+    },
     // 🔴 THE VECTOR SPLIT TRANSITION'S BLOCK, MEASURED ON AN M5 UNDER STOCK FLAGS - the GEMM every Apple visitor runs on
     // a pair track of 192 channels and up (ESMFold2, protenix2, OpenDDE, IntelliFold-2). The A100's 64 x 64 x 16 gives a
     // lane a 4 x 4 tile, five workgroup reads for four vec4 multiply-adds; bench-transition.js, 256 channels at 255

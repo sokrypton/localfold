@@ -783,10 +783,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // ...a row past the end is clamped rather than skipped: every lane reaches
   // the barriers, and its lane of each vector is dropped at the write.
   for (var c = local; c < C; c += 64u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      xq[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c];
-      qcond[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    ${overRowGroups((g) => `{
+      var xq_v = ${rowVector}(0.0);
+      var qc_v = ${rowVector}(0.0);
+      ${Array.from({ length: rowWidth }, (_, l) => {
+        const t = g * rowWidth + l;
+        return `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        xq_v${rowLane(l)} = act[row * C + c];
+        qc_v${rowLane(l)} = queries_cond[row * C + c];
+      }`;
+      }).join("\n      ")}
+      xq[${g * channels}u + c] = xq_v;
+      qcond[${g * channels}u + c] = qc_v;
     }`)}
   }
   workgroupBarrier();
@@ -794,8 +803,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
   var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRowGroups((g) => `total${g} += xq[${g}u * C + c];
-    cond_total${g} += qcond[${g}u * C + c];`)}
+    ${overRowGroups((g) => `total${g} += xq[${g * channels}u + c];
+    cond_total${g} += qcond[${g * channels}u + c];`)}
   }
   ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
   let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
@@ -803,9 +812,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var cond_variance${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
     ${overRowGroups((g) => `{
-      let d = xq[${g}u * C + c] - mean${g};
+      let d = xq[${g * channels}u + c] - mean${g};
       variance${g} += d * d;
-      let e = qcond[${g}u * C + c] - cond_mean${g};
+      let e = qcond[${g * channels}u + c] - cond_mean${g};
       cond_variance${g} += e * e;
     }`)}
   }
@@ -819,11 +828,64 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_${prefix}SingleCondLayerNormScale + c];
-    ${overRowGroups((g) => `qcond[${g}u * C + c] =
-      (qcond[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
+    ${overRowGroups((g) => `qcond[${g * channels}u + c] =
+      (qcond[${g * channels}u + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
   }
   workgroupBarrier();
-  for (var c = local; c < C; c += 64u) {
+${channels % 64 === 0 && (shape.heads * shape.dimension) % 64 === 0
+  ? (() => {
+      const cSteps = channels / 64;
+      const wSteps = (shape.heads * shape.dimension) / 64;
+      const overCSteps = (body) => Array.from({ length: cSteps }, (_, s) => body(s)).join("\n    ");
+      const overWSteps = (body) => Array.from({ length: wSteps }, (_, s) => body(s)).join("\n    ");
+      return `  {
+    ${overCSteps((s) => `let c_${s} = local + ${s * 64}u;`)}
+    ${overCSteps((s) => overRowGroups((g) =>
+      `var scale_value_${s}_${g} = ${rowVector}(weights[W_${prefix}SingleCondScaleBias + c_${s}]);
+    var shift_${s}_${g} = ${rowVector}(0.0);`))}
+    for (var d = 0u; d < C; d += 1u) {
+      let w_s_base = W_${prefix}SingleCondScaleWeights + d * C;
+      let w_b_base = W_${prefix}SingleCondBias + d * C;
+      ${overRowGroups((g) => `let cn_${g} = qcond[${g * channels}u + d];`)}
+      ${overCSteps((s) => `{
+        let ws = weights[w_s_base + c_${s}];
+        let wb = weights[w_b_base + c_${s}];
+        ${overRowGroups((g) => `scale_value_${s}_${g} += cn_${g} * ws;
+        shift_${s}_${g} += cn_${g} * wb;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRowGroups((g) => `xq[${g * channels}u + c_${s}] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value_${s}_${g}))
+      * ((xq[${g * channels}u + c_${s}] - mean${g}) * inverse${g}) + shift_${s}_${g};`))}
+  }
+  workgroupBarrier();
+
+  {
+    ${overWSteps((s) => `let out_${s} = local + ${s * 64}u;`)}
+    ${overWSteps((s) => overRowGroups((g) =>
+      `var a_${s}_${g} = ${rowVector}(${options.biasA ? `weights[${options.biasA} + out_${s}]` : "0.0"});
+    var b_${s}_${g} = ${rowVector}(0.0);`))}
+    for (var c = 0u; c < C; c += 1u) {
+      let wa_base = ${options.weightA} + c * WIDTH;
+      let wb_base = ${options.weightB} + c * WIDTH;
+      ${overRowGroups((g) => `let x_${g} = xq[${g * channels}u + c];`)}
+      ${overWSteps((s) => `{
+        let wa = weights[wa_base + out_${s}];
+        let wb = weights[wb_base + out_${s}];
+        ${overRowGroups((g) => `a_${s}_${g} += x_${g} * wa;
+        b_${s}_${g} += x_${g} * wb;`)}
+      }`)}
+    }
+    ${overWSteps((s) => overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        ${options.outA}[row * WIDTH + out_${s}] = a_${s}_${rowGroup(t)}${rowLane(t)};
+        ${options.outB}[row * WIDTH + out_${s}] = b_${s}_${rowGroup(t)}${rowLane(t)};
+      }
+    }`))}
+  }`;
+    })()
+  : `  for (var c = local; c < C; c += 64u) {
     ${overRowGroups((g) =>
       `var scale_value${g} = ${rowVector}(weights[W_${prefix}SingleCondScaleBias + c]);
     var shift${g} = ${rowVector}(0.0);`)}
@@ -831,17 +893,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       let ws = weights[W_${prefix}SingleCondScaleWeights + d * C + c];
       let wb = weights[W_${prefix}SingleCondBias + d * C + c];
       ${overRowGroups((g) => `{
-        let cn = qcond[${g}u * C + d];
+        let cn = qcond[${g * channels}u + d];
         scale_value${g} += cn * ws;
         shift${g} += cn * wb;
       }`)}
     }
-    // ...written out rather than through logistic(), which takes an f32; this
-    // is its definition applied to the whole vector, so the arithmetic is the
-    // same one. The output kernel above spells it the same way.
-    ${overRowGroups((g) => `xq[${g}u * C + c] =
+    ${overRowGroups((g) => `xq[${g * channels}u + c] =
       ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
-      * ((xq[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
+      * ((xq[${g * channels}u + c] - mean${g}) * inverse${g}) + shift${g};`)}
   }
   workgroupBarrier();
 
@@ -850,11 +909,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       `var a${g} = ${rowVector}(${options.biasA ? `weights[${options.biasA} + out]` : "0.0"});
     var b${g} = ${rowVector}(0.0);`)}
     for (var c = 0u; c < C; c += 1u) {
-      // ...read once, used by every row of the tile.
       let wa = weights[${options.weightA} + c * WIDTH + out];
       let wb = weights[${options.weightB} + c * WIDTH + out];
       ${overRowGroups((g) => `{
-        let x = xq[${g}u * C + c];
+        let x = xq[${g * channels}u + c];
         a${g} += x * wa;
         b${g} += x * wb;
       }`)}
@@ -866,7 +924,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         ${options.outB}[row * WIDTH + out] = b${rowGroup(t)}${rowLane(t)};
       }
     }`)}
-  }
+  }`}
 }`;
 
   const project = conditionedProject("q", {
@@ -1141,10 +1199,18 @@ ${keyMasked
   for (var key = local; key < KEYS; key += 64u) { local_max = max(local_max, logits[key]); }
   reduce[local] = local_max;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce[local] = max(reduce[local], reduce[local + stride]); }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce[local] = max(reduce[local], reduce[local + 32u]); }
+  workgroupBarrier();
+  if (local < 16u) { reduce[local] = max(reduce[local], reduce[local + 16u]); }
+  workgroupBarrier();
+  if (local < 8u) { reduce[local] = max(reduce[local], reduce[local + 8u]); }
+  workgroupBarrier();
+  if (local < 4u) { reduce[local] = max(reduce[local], reduce[local + 4u]); }
+  workgroupBarrier();
+  if (local < 2u) { reduce[local] = max(reduce[local], reduce[local + 2u]); }
+  workgroupBarrier();
+  if (local < 1u) { reduce[local] = max(reduce[local], reduce[local + 1u]); }
+  workgroupBarrier();
   let largest = reduce[0];
   workgroupBarrier();
 
@@ -1156,10 +1222,18 @@ ${keyMasked
   }
   reduce[local] = local_sum;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce[local] += reduce[local + stride]; }
-    workgroupBarrier();
-  }
+  if (local < 32u) { reduce[local] += reduce[local + 32u]; }
+  workgroupBarrier();
+  if (local < 16u) { reduce[local] += reduce[local + 16u]; }
+  workgroupBarrier();
+  if (local < 8u) { reduce[local] += reduce[local + 8u]; }
+  workgroupBarrier();
+  if (local < 4u) { reduce[local] += reduce[local + 4u]; }
+  workgroupBarrier();
+  if (local < 2u) { reduce[local] += reduce[local + 2u]; }
+  workgroupBarrier();
+  if (local < 1u) { reduce[local] += reduce[local + 1u]; }
+  workgroupBarrier();
   let total = reduce[0];
   workgroupBarrier();
 
@@ -1235,21 +1309,190 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // ...a row past the end is clamped rather than skipped: every lane reaches
   // the barriers, and its lane of each vector is dropped at the write.
   for (var w = local; w < WIDTH; w += 64u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      gated[${rowGroup(t)}u * WIDTH + w]${rowLane(t)} =
-        gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
+    ${overRowGroups((g) => `{
+      var gv = ${rowVector}(0.0);
+      ${Array.from({ length: rowWidth }, (_, l) => {
+        const t = g * rowWidth + l;
+        return `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        gv${rowLane(l)} = gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
+      }`;
+      }).join("\n      ")}
+      gated[${g * (shape.heads * shape.dimension)}u + w] = gv;
     }`)}
   }
   for (var c = local; c < C; c += 64u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      cond_raw[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    ${overRowGroups((g) => `{
+      var cv = ${rowVector}(0.0);
+      ${Array.from({ length: rowWidth }, (_, l) => {
+        const t = g * rowWidth + l;
+        return `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        cv${rowLane(l)} = queries_cond[row * C + c];
+      }`;
+      }).join("\n      ")}
+      cond_raw[${g * channels}u + c] = cv;
     }`)}
   }
   workgroupBarrier();
 
+${channels % 64 === 0 && intermediate % 64 === 0
+  ? (() => {
+      const cSteps = channels / 64;
+      const iSteps = intermediate / 64;
+      const overCSteps = (body) => Array.from({ length: cSteps }, (_, s) => body(s)).join("\n    ");
+      const overISteps = (body) => Array.from({ length: iSteps }, (_, s) => body(s)).join("\n    ");
+      const width = shape.heads * shape.dimension;
+      return `  {
+    ${overCSteps((s) => `let c_${s} = local + ${s * 64}u;`)}
+    ${overCSteps((s) => overRowGroups((g) => `var projected_${s}_${g} = ${rowVector}(0.0);`))}
+    for (var w = 0u; w < WIDTH; w += 1u) {
+      let w_base = W_Transition2 + w * C;
+      ${overRowGroups((g) => `let g_${g} = gated[${g * width}u + w];`)}
+      ${overCSteps((s) => `{
+        let weight = weights[w_base + c_${s}];
+        ${overRowGroups((g) => `projected_${s}_${g} += g_${g} * weight;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRowGroups((g) =>
+      `var zero_${s}_${g} = ${rowVector}(weights[W_AdaptiveZeroCondBias + c_${s}]);`))}
+    for (var d = 0u; d < C; d += 1u) {
+      let w_base = W_AdaptiveZeroCondWeights + d * C;
+      ${overRowGroups((g) => `let cr_${g} = cond_raw[${g * channels}u + d];`)}
+      ${overCSteps((s) => `{
+        let weight = weights[w_base + c_${s}];
+        ${overRowGroups((g) => `zero_${s}_${g} += cr_${g} * weight;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRowGroups((g) => `{
+      var af_v = ${rowVector}(0.0);
+      ${shape.noResidual === true ? `var bf_v = ${rowVector}(0.0);` : ""}
+      ${Array.from({ length: rowWidth }, (_, l) => {
+        const t = g * rowWidth + l;
+        return `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        let a_val = act[row * C + c_${s}];
+        ${shape.noResidual === true ? `bf_v${rowLane(l)} = a_val;` : ""}
+        af_v${rowLane(l)} = a_val + projected_${s}_${g}${rowLane(l)} * logistic(zero_${s}_${g}${rowLane(l)});
+      }`;
+      }).join("\n      ")}
+      ${shape.noResidual === true ? `before[${g * channels}u + c_${s}] = bf_v;` : ""}
+      after[${g * channels}u + c_${s}] = af_v;
+    }`))}
+  }
+  workgroupBarrier();
+
+  // The transition reads the POST-attention activation - except under
+  // rosettafold3, where it reads the PRE-attention one and the two share a
+  // single residual. See the staged copy above.
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
+  var cond_total${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `total${g} += ${transitionInput}[${g * channels}u + c];
+    cond_total${g} += cond_raw[${g * channels}u + c];`)}
+  }
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
+  let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
+  var variance${g} = ${rowVector}(0.0);
+  var cond_variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `{
+      let d = ${transitionInput}[${g * channels}u + c] - mean${g};
+      variance${g} += d * d;
+      let e = cond_raw[${g * channels}u + c] - cond_mean${g};
+      cond_variance${g} += e * e;
+    }`)}
+  }
+  ${overRowGroups((g) => `let inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));
+  let cond_inverse${g} =
+    inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
+    let scale = weights[W_ffwSingleCondLayerNormScale + c];
+    ${overRowGroups((g) => `cond_norm[${g * channels}u + c] =
+      (cond_raw[${g * channels}u + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
+  }
+  workgroupBarrier();
+
+  {
+    ${overCSteps((s) => `let c_${s} = local + ${s * 64}u;`)}
+    ${overCSteps((s) => overRowGroups((g) =>
+      `var scale_value_${s}_${g} = ${rowVector}(weights[W_ffwSingleCondScaleBias + c_${s}]);
+    var shift_${s}_${g} = ${rowVector}(0.0);`))}
+    for (var d = 0u; d < C; d += 1u) {
+      let ws_base = W_ffwSingleCondScaleWeights + d * C;
+      let wb_base = W_ffwSingleCondBias + d * C;
+      ${overRowGroups((g) => `let cn_${g} = cond_norm[${g * channels}u + d];`)}
+      ${overCSteps((s) => `{
+        let ws = weights[ws_base + c_${s}];
+        let wb = weights[wb_base + c_${s}];
+        ${overRowGroups((g) => `scale_value_${s}_${g} += cn_${g} * ws;
+        shift_${s}_${g} += cn_${g} * wb;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRowGroups((g) => `x[${g * channels}u + c_${s}] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value_${s}_${g}))
+      * ((${transitionInput}[${g * channels}u + c_${s}] - mean${g}) * inverse${g}) + shift_${s}_${g};`))}
+  }
+  workgroupBarrier();
+
+  let doubled = INTERMEDIATE * 2u;
+  {
+    ${overISteps((s) => `let i_${s} = local + ${s * 64}u;`)}
+    ${overISteps((s) => overRowGroups((g) => `var gate_value_${s}_${g} = ${rowVector}(0.0);
+    var value_${s}_${g} = ${rowVector}(0.0);`))}
+    ${upGate ? overISteps((s) => overRowGroups((g) => `var up_${s}_${g} = ${rowVector}(0.0);`)) : ""}
+    for (var c = 0u; c < C; c += 1u) {
+      let column = W_ffwTransition1 + c * doubled;
+      ${upGate ? "let up_col = W_ffwAToB + c * INTERMEDIATE;" : ""}
+      ${overRowGroups((g) => `let xc_${g} = x[${g * channels}u + c];`)}
+      ${overISteps((s) => `{
+        let wg = weights[column + i_${s}];
+        let wv = weights[column + INTERMEDIATE + i_${s}];
+        ${upGate ? `let wu = weights[up_col + i_${s}];` : ""}
+        ${overRowGroups((g) => `gate_value_${s}_${g} += xc_${g} * wg;
+        value_${s}_${g} += xc_${g} * wv;
+        ${upGate ? `up_${s}_${g} += xc_${g} * wu;` : ""}`)}
+      }`)}
+    }
+    ${overISteps((s) => overRowGroups((g) => `wide[${g * intermediate}u + i_${s}] =
+      gate_value_${s}_${g} / (${rowVector}(1.0) + exp(-gate_value_${s}_${g})) * value_${s}_${g}`
+      + (upGate ? ` * up_${s}_${g}` : "") + ";"))}
+  }
+  workgroupBarrier();
+
+  {
+    ${overCSteps((s) => `let c_${s} = local + ${s * 64}u;`)}
+    ${overCSteps((s) => overRowGroups((g) => `var projected_${s}_${g} = ${rowVector}(0.0);`))}
+    for (var i = 0u; i < INTERMEDIATE; i += 1u) {
+      let w_base = W_ffwTransition2 + i * C;
+      ${overRowGroups((g) => `let w_${g} = wide[${g * intermediate}u + i];`)}
+      ${overCSteps((s) => `{
+        let weight = weights[w_base + c_${s}];
+        ${overRowGroups((g) => `projected_${s}_${g} += w_${g} * weight;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRowGroups((g) =>
+      `var zero_${s}_${g} = ${rowVector}(weights[W_ffwAdaptiveZeroCondBias + c_${s}]);`))}
+    for (var d = 0u; d < C; d += 1u) {
+      let w_base = W_ffwAdaptiveZeroCondWeights + d * C;
+      ${overRowGroups((g) => `let cr_${g} = cond_raw[${g * channels}u + d];`)}
+      ${overCSteps((s) => `{
+        let weight = weights[w_base + c_${s}];
+        ${overRowGroups((g) => `zero_${s}_${g} += cr_${g} * weight;`)}
+      }`)}
+    }
+    ${overCSteps((s) => overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        act[row * C + c_${s}] = after[${rowGroup(t) * channels}u + c_${s}]${rowLane(t)}
+          + projected_${s}_${rowGroup(t)}${rowLane(t)}
+            * logistic(zero_${s}_${rowGroup(t)}${rowLane(t)});
+      }
+    }`))}
+  }`;
+    })()
+  : `  for (var c = local; c < C; c += 64u) {
     ${overRowGroups((g) => `var projected${g} = ${rowVector}(0.0);`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
       // ...read once, used by every row of the tile.
@@ -1273,34 +1516,27 @@ ${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLa
   // The transition reads the POST-attention activation - except under
   // rosettafold3, where it reads the PRE-attention one and the two share a
   // single residual. See the staged copy above.
-  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);`)}
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
+  var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRowGroups((g) => `total${g} += ${transitionInput}[${g}u * C + c];`)}
+    ${overRowGroups((g) => `total${g} += ${transitionInput}[${g}u * C + c];
+    cond_total${g} += cond_raw[${g}u * C + c];`)}
   }
-  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));`)}
-  ${overRowGroups((g) => `var variance${g} = ${rowVector}(0.0);`)}
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
+  let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
+  var variance${g} = ${rowVector}(0.0);
+  var cond_variance${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
     ${overRowGroups((g) => `{
       let d = ${transitionInput}[${g}u * C + c] - mean${g};
       variance${g} += d * d;
+      let e = cond_raw[${g}u * C + c] - cond_mean${g};
+      cond_variance${g} += e * e;
     }`)}
   }
   ${overRowGroups((g) => `let inverse${g} =
-    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
-
-  ${overRowGroups((g) => `var cond_total${g} = ${rowVector}(0.0);`)}
-  for (var c = 0u; c < C; c += 1u) {
-    ${overRowGroups((g) => `cond_total${g} += cond_raw[${g}u * C + c];`)}
-  }
-  ${overRowGroups((g) => `let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));`)}
-  ${overRowGroups((g) => `var cond_variance${g} = ${rowVector}(0.0);`)}
-  for (var c = 0u; c < C; c += 1u) {
-    ${overRowGroups((g) => `{
-      let d = cond_raw[${g}u * C + c] - cond_mean${g};
-      cond_variance${g} += d * d;
-    }`)}
-  }
-  ${overRowGroups((g) => `let cond_inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));
+  let cond_inverse${g} =
     inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_ffwSingleCondLayerNormScale + c];
@@ -1370,7 +1606,7 @@ ${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLa
             * logistic(zero${rowGroup(t)}${rowLane(t)});
       }
     }`)}
-  }
+  }`}
 }`;
 
   // 🔴 THE ACTIVATION IS MASKED AFTER THE BLOCKS AND BEFORE THE SKIP CONNECTION.

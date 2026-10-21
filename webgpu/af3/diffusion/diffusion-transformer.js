@@ -492,10 +492,8 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   const tokenI = samples === 1 ? "i" : "token_i";
   void ROWS; void perToken; void keyRow; void tokenI;
   const kSplits = Math.max(1, shape.kSplits ?? 1);
-  // Only the split kernel can afford a raised tile; without a split behind it a
-  // bigger tile is 0.54x-0.82x on every kernel measured.
-  const qkvgTile = kSplits > 1 ? (shape.qkvgTile ?? tile) : tile;
-  const wideTile = kSplits > 1 ? (shape.wideTile ?? qkvgTile) : tile;
+  const qkvgTile = Math.max(1, shape.qkvgTile ?? tile);
+  const wideTile = Math.max(1, shape.wideTile ?? qkvgTile);
   // 🔴 ffw-out SPLITS ITS OWN K, AND OVER A DIFFERENT EXTENT. Its inner
   // dimension is the INTERMEDIATE, not the channel count, so it needs its own
   // part count and its own span - and its epilogue is a second projection
@@ -559,14 +557,20 @@ export function createDiffusionTransformerShaders(shape, offsets) {
       Array.from({ length: t }, (_, i) => body(i)).join("\n      ");
     const overGroups = (body) =>
       Array.from({ length: tileGroups }, (_, g) => body(g)).join("\n      ");
-    const stagedAt = (i) => `xt[${group(i)}u * CHANNEL_CHUNK + cc]${lane(i)}`;
+    const stagedAt = (i) => `xt[${group(i) * channelChunk}u + cc]${lane(i)}`;
     const stageChunk = `    workgroupBarrier();
     for (var cc = local; cc < CHANNEL_CHUNK; cc += ${lanes}u) {
-      ${overTile((i) => `{
-        let token = base_token + ${i}u;
-        var value = 0.0;
-        if (token < ${ROWS}) { value = xbuf[token * C + c0 + cc]; }
-        ${stagedAt(i)} = ${stage16 ? "f16(value)" : "value"};
+      let c_idx = c0 + cc;
+      ${overGroups((g) => `{
+        var st = ${stageLanes}(0.0);
+        ${Array.from({ length: tileWidth }, (_, l) => {
+          const i = g * tileWidth + l;
+          return `{
+          let token = base_token + ${i}u;
+          if (token < ${ROWS}) { st${lane(l)} = ${stage16 ? "f16(xbuf[token * C + c_idx])" : "xbuf[token * C + c_idx]"}; }
+        }`;
+        }).join("\n        ")}
+        xt[${g * channelChunk}u + cc] = st;
       }`)}
     }
     workgroupBarrier();`;
@@ -711,6 +715,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // lanes/subgroupSize values - 2 barriers a reduction, 8 a token. It is the
   // same move `attend` already makes; this kernel never got it.
   const normGroups = Math.ceil(lanes / subgroupSize);
+  const unrollStrides = (arrName, op = "+=") => {
+    const steps = [];
+    for (let s = lanes >> 1; s > 0; s >>= 1) {
+      steps.push(op === "max"
+        ? `  if (local < ${s}u) { ${arrName}[local] = max(${arrName}[local], ${arrName}[local + ${s}u]); }\n  workgroupBarrier();`
+        : `  if (local < ${s}u) { ${arrName}[local] += ${arrName}[local + ${s}u]; }\n  workgroupBarrier();`);
+    }
+    return steps.join("\n");
+  };
   const reduceBody = normSubgroups
     ? `  // 🔴 THE LEADING BARRIER IS NOT OPTIONAL. reduce_a is reused by every
   // call, and without it a fast subgroup could overwrite a slot the previous
@@ -724,10 +737,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   return total;`
     : `  reduce_a[local] = value;
   workgroupBarrier();
-  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
+${unrollStrides("reduce_a")}
   return reduce_a[0];`;
   // 🔴 THE CONDITIONING'S MEAN AND VARIANCE DO NOT DEPEND ON THE BLOCK, and
   // every block was recomputing them. Only the SCALE is per block
@@ -758,10 +768,7 @@ ${normSubgroups
   return total;`
     : `  reduce_c[local] = value;
   workgroupBarrier();
-  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_c[local] += reduce_c[local + stride]; }
-    workgroupBarrier();
-  }
+${unrollStrides("reduce_c")}
   return reduce_c[0];`}
 }
 
@@ -810,14 +817,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (base_token >= ${ROWS}) { return; }
   let local = local_id.x;
 
-  // 🔴 TWO-PASS VARIANCE, and no scale or offset on the activation's own norm.
+${mode === "split" ? "" : `  // 🔴 TWO-PASS VARIANCE, and no scale or offset on the activation's own norm.
   // A token past the end is clamped rather than skipped: every lane has to
   // reach the barriers, and its lane of the vector is dropped at the write.
   for (var t = 0u; t < TILE; t += 1u) {
     let token = min(base_token + t, ${ROWS} - 1u);
-${mode === "split" ? "" : `    var total = 0.0;
-    for (var c = local; c < C; c += ${lanes}u) { total += act[token * C + c]; }`}
-${mode === "split" ? "" : `    let act_mean = reduce_sum(local, total) / f32(C);
+    var total = 0.0;
+    for (var c = local; c < C; c += ${lanes}u) { total += act[token * C + c]; }
+    let act_mean = reduce_sum(local, total) / f32(C);
     workgroupBarrier();
     var centred = 0.0;
     for (var c = local; c < C; c += ${lanes}u) {
@@ -830,27 +837,35 @@ ${mode === "split" ? "" : `    let act_mean = reduce_sum(local, total) / f32(C);
       act_means[t] = act_mean;
       act_inverses[t] = act_inverse;
     }
-    workgroupBarrier();`}
+    workgroupBarrier();
+  }`}
 
-${mode === "reduce" || batchedGates ? "" : `    // 🔴 THE NORMALISED CONDITIONING IS READ, NOT DERIVED. normalise-cond
-    // above produced it once for the whole call; all that is left here is the
-    // per-block scale and the staging, which is a copy.
-    // 🔴 A SPLIT PART STAGES ONLY ITS SLICE. Staging the whole conditioning in
-    // every part is what made the first two attempts at this split lose: the
-    // loop below is OUTSIDE the projection that gets sliced, so four parts did
-    // four times the staging to do a quarter of the projection each. It is the
-    // same trap attention-output's split hit, written down there and not
-    // applied here.
-    for (var c = local; c < ${mode === "split" ? `${normKSpan}u` : "C_COND"}; c += ${lanes}u) {
-      let at = ${mode === "split" ? `group.z * ${normKSpan}u + c` : "c"};
-      let value = cond[${perToken("token")} * C_COND + at]
-        * ${wf(`weights[W_${prefix}SingleCondLayerNormScale + at]`)};
-      ${Array.from({ length: tile }, (_, t) =>
-        `if (t == ${t}u) { cond_norm[${group(t)}u * ${mode === "split" ? `${normKSpan}u` : "C_COND"} + c]${lane(t)} = ${stage16 ? "f16(value)" : "value"}; }`)
-        .join("\n      ")}
-    }
-    workgroupBarrier();`}
+${mode === "reduce" || batchedGates ? "" : `  // 🔴 THE NORMALISED CONDITIONING IS READ, NOT DERIVED. normalise-cond
+  // above produced it once for the whole call; all that is left here is the
+  // per-block scale and the staging, which is a copy.
+  // 🔴 A SPLIT PART STAGES ONLY ITS SLICE. Staging the whole conditioning in
+  // every part is what made the first two attempts at this split lose: the
+  // loop below is OUTSIDE the projection that gets sliced, so four parts did
+  // four times the staging to do a quarter of the projection each. It is the
+  // same trap attention-output's split hit, written down there and not
+  // applied here.
+  for (var c = local; c < ${mode === "split" ? `${normKSpan}u` : "C_COND"}; c += ${lanes}u) {
+    let at = ${mode === "split" ? `group.z * ${normKSpan}u + c` : "c"};
+    let w_ln = ${wf(`weights[W_${prefix}SingleCondLayerNormScale + at]`)};
+    ${overGroups((g) => `{
+      var cn = ${stageLanes}(0.0);
+      ${Array.from({ length: tileWidth }, (_, l) => {
+        const t = g * tileWidth + l;
+        return `{
+        let token = min(base_token + ${t}u, ${ROWS} - 1u);
+        let value = cond[${perToken("token")} * C_COND + at] * w_ln;
+        cn${lane(l)} = ${stage16 ? "f16(value)" : "value"};
+      }`;
+      }).join("\n      ")}
+      cond_norm[${g * (mode === "split" ? normKSpan : condChannels)}u + c] = cn;
+    }`)}
   }
+  workgroupBarrier();`}
 
   // 🔴 ONE WORKGROUP PER TOKEN IS 68 OF THEM, AND THIS DEVICE HAS 108 CORES.
   // The projection below is the whole cost of this kernel - its four
@@ -864,13 +879,45 @@ ${mode === "reduce" || batchedGates ? "" : `    // 🔴 THE NORMALISED CONDITION
   // The token tile cannot do this - it goes the wrong way, halving the
   // workgroups - which is why adaln measured 1.85x SLOWER at tile 2 and why
   // this kernel needed the opposite fix from qkvg's.
-  ${normSplit
+${!normSplit && mode === "fused" && !batchedGates && channels % lanes === 0
+  ? (() => {
+      const steps = channels / lanes;
+      const overSteps = (body) => Array.from({ length: steps }, (_, s) => body(s)).join("\n  ");
+      return `  ${overSteps((s) => `let c_${s} = local + ${s * lanes}u;`)}
+  ${overSteps((s) => overGroups((g) =>
+    `var scale_${s}_${g} = ${tileLanes}(${wf(`weights[W_${prefix}SingleCondScaleBias + c_${s}]`)});
+  var shift_${s}_${g} = ${tileLanes}(0.0);`))}
+  for (var d = 0u; d < C_COND; d += 1u) {
+    let w_scale_base = W_${prefix}SingleCondScaleWeights + d * C;
+    let w_bias_base = W_${prefix}SingleCondBias + d * C;
+    ${overGroups((g) => `let cn_${g} = ${up(`cond_norm[${g * condChannels}u + d]`)};`)}
+    ${overSteps((s) => `{
+      let ws = ${wf(`weights[w_scale_base + c_${s}]`)};
+      let wb = ${wf(`weights[w_bias_base + c_${s}]`)};
+      ${overGroups((g) => `scale_${s}_${g} += cn_${g} * ws;
+      shift_${s}_${g} += cn_${g} * wb;`)}
+    }`)}
+  }
+  ${overSteps((s) => `{
+    ${overGroups((g) => `let gated_${s}_${g} =
+      ${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale_${s}_${g}));`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      if (token < ${ROWS}) {
+        let normalized = (act[token * C + c_${s}] - act_means[${t}u]) * act_inverses[${t}u];
+        xbuf[token * C + c_${s}] =
+          gated_${s}_${group(t)}${lane(t)} * normalized + shift_${s}_${group(t)}${lane(t)};
+      }
+    }`)}
+  }`)}`;
+    })()
+  : `  ${normSplit
     ? `{
     let c = group.y * ${lanes}u + local;`
     : `for (var c = local; c < C; c += ${lanes}u) {`}
     ${overGroups((g) =>
       // 🔴 ONLY THE FUSED KERNEL SEEDS WITH THE BIAS, AND THIS READ
-      // `mode === "split" ? 0.0 : bias` - WHICH GAVE IT TO "reduce" TOO. The
+      // \`mode === "split" ? 0.0 : bias\` - WHICH GAVE IT TO "reduce" TOO. The
       // reduce then adds the bias again in its epilogue, exactly as its comment
       // says it should, so every conditioned norm came out with TWICE the bias
       // on its scale. That scale feeds a sigmoid gate, so the error is large
@@ -924,7 +971,7 @@ ${batchedGates
       let ws = ${wf(`weights[W_${prefix}SingleCondScaleWeights + dw * C + c]`)};
       let wb = ${wf(`weights[W_${prefix}SingleCondBias + dw * C + c]`)};
       ${overGroups((g) => `{
-        let cn = ${up(`cond_norm[${g}u * ${mode === "split" ? `${normKSpan}u` : "C_COND"} + d]`)};
+        let cn = ${up(`cond_norm[${g * (mode === "split" ? normKSpan : condChannels)}u + d]`)};
         scale${g} += cn * ws;
         shift${g} += cn * wb;
       }`)}
@@ -949,7 +996,7 @@ ${mode === "split"
           gated${group(t)}${lane(t)} * normalized + shift${group(t)}${lane(t)};
       }
     }`)}`}
-  }
+  }`}
 }`;
 
   // 🔴 THE TWO CALLERS BIND IN DIFFERENT ORDERS, so the bindings are a function
@@ -1025,14 +1072,18 @@ ${stageChunk}
     // 🔴 FOUR WEIGHTS READ ONCE, USED TILE TIMES. That ratio is the whole point
     // of this kernel - and this stack streams all 566 MB of its weights once
     // per TILE of tokens, so it is also the whole of its cost.
+    let w_q0 = W_qProjection + c0 * WIDTH + out;
+    let w_k0 = W_kProjection + c0 * WIDTH + out;
+    let w_v0 = W_vProjection + c0 * WIDTH + out;
+    let w_g0 = W_gatingQuery + c0 * WIDTH + out;
     for (var cc = 0u; cc < CHANNEL_CHUNK; cc += 1u) {
-      let column = (c0 + cc) * WIDTH + out;
-      let wq = ${wf(`weights[W_qProjection + column]`)};
-      let wk = ${wf(`weights[W_kProjection + column]`)};
-      let wv = ${wf(`weights[W_vProjection + column]`)};
-      let wg = ${wf(`weights[W_gatingQuery + column]`)};
+      let w_off = cc * WIDTH;
+      let wq = ${wf(`weights[w_q0 + w_off]`)};
+      let wk = ${wf(`weights[w_k0 + w_off]`)};
+      let wv = ${wf(`weights[w_v0 + w_off]`)};
+      let wg = ${wf(`weights[w_g0 + w_off]`)};
       ${overGroups((g) => `{
-        let x = ${up(`xt[${g}u * CHANNEL_CHUNK + cc]`)};
+        let x = ${up(`xt[${g * channelChunk}u + cc]`)};
         q${g} += x * wq;
         k${g} += x * wk;
         v${g} += x * wv;
@@ -1188,7 +1239,7 @@ ${subgroups ? `  let wide_sum = subgroupAdd(local_sum);
   // a measured 1.43 ms and a 1.28 ms bandwidth floor, so it is bound by exactly
   // that. The shared tile cannot be raised to fix it because adaln and
   // ffw-adaln measured 0.54x when a raised tile reached them.
-  const { tileGroups, tileLanes, stageLanes, up, lane, group, overTile, overGroups } =
+  const { tileWidth, tileGroups, tileLanes, stageLanes, up, lane, group, overTile, overGroups } =
     tilingFor(attnOutTile);
   const attentionOutputFor = (mode) => `${common}
 const TILE: u32 = ${attnOutTile}u;
@@ -1269,21 +1320,29 @@ ${mode === "reduce"
   }`
   : `${mode === "split" ? `  let w_start = group.z * ${attnKSpan}u;` : `  let w_start = 0u;`}
   for (var w = local; w < ${mode === "split" ? `${attnKSpan}u` : "WIDTH"}; w += ${lanes}u) {
-    ${overTile((t) => `{
-      let token = base_token + ${t}u;
-      var value = 0.0;
-      if (token < ${ROWS}) {
-        let index = token * WIDTH + w_start + w;
-        value = gathered[index] * logistic(gate[index]);
-      }
-      gated[${group(t)}u * ${mode === "split" ? `${attnKSpan}u` : "WIDTH"} + w]${lane(t)} = ${stage16 ? "f16(value)" : "value"};
+    let w_idx = w_start + w;
+    ${overGroups((g) => `{
+      var gv = ${stageLanes}(0.0);
+      ${Array.from({ length: tileWidth }, (_, l) => {
+        const t = g * tileWidth + l;
+        return `{
+        let token = base_token + ${t}u;
+        if (token < ${ROWS}) {
+          let index = token * WIDTH + w_idx;
+          let value = gathered[index] * logistic(gate[index]);
+          gv${lane(l)} = ${stage16 ? "f16(value)" : "value"};
+        }
+      }`;
+      }).join("\n      ")}
+      gated[${g * (mode === "split" ? attnKSpan : width)}u + w] = gv;
     }`)}
   }
   workgroupBarrier();
+  let w_t2_base = W_Transition2 + w_start * C + c;
   for (var w = 0u; w < ${mode === "split" ? `${attnKSpan}u` : "WIDTH"}; w += 1u) {
     // ...read once, used by every token of the tile.
-    let weight = ${wf(`weights[W_Transition2 + (w_start + w) * C + c]`)};
-    ${overGroups((g) => `projected${g} += ${up(`gated[${g}u * ${mode === "split" ? `${attnKSpan}u` : "WIDTH"} + w]`)} * weight;`)}
+    let weight = ${wf(`weights[w_t2_base + w * C]`)};
+    ${overGroups((g) => `projected${g} += ${up(`gated[${g * (mode === "split" ? attnKSpan : width)}u + w]`)} * weight;`)}
   }`}
 ${mode === "split" ? `  ${overTile((t) => `{
     let token = base_token + ${t}u;
@@ -1313,18 +1372,27 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   // before is what makes reusing them safe.
   workgroupBarrier();
   for (var d = local; d < C_COND; d += ${lanes}u) {
-    ${overTile((t) => `{
-      let token = base_token + ${t}u;
-      var value = 0.0;
-      if (token < ${ROWS}) { value = cond[${perToken("token")} * C_COND + d]; }
-      gated[${group(t)}u * C_COND + d]${lane(t)} = ${stage16 ? "f16(value)" : "value"};
+    ${overGroups((g) => `{
+      var cv = ${stageLanes}(0.0);
+      ${Array.from({ length: tileWidth }, (_, l) => {
+        const t = g * tileWidth + l;
+        return `{
+        let token = base_token + ${t}u;
+        if (token < ${ROWS}) {
+          let value = cond[${perToken("token")} * C_COND + d];
+          cv${lane(l)} = ${stage16 ? "f16(value)" : "value"};
+        }
+      }`;
+      }).join("\n      ")}
+      gated[${g * condChannels}u + d] = cv;
     }`)}
   }
   workgroupBarrier();
   ${overGroups((g) => `var zero${g} = ${tileLanes}(${wf(`weights[W_AdaptiveZeroCondBias + c]`)});`)}
+  let w_z_base = W_AdaptiveZeroCondWeights + c;
   for (var d = 0u; d < C_COND; d += 1u) {
-    let w = ${wf(`weights[W_AdaptiveZeroCondWeights + d * C + c]`)};
-    ${overGroups((g) => `zero${g} += ${up(`gated[${g}u * C_COND + d]`)} * w;`)}
+    let w = ${wf(`weights[w_z_base + d * C]`)};
+    ${overGroups((g) => `zero${g} += ${up(`gated[${g * condChannels}u + d]`)} * w;`)}
   }
 `}
   ${overGroups((g) => `let contribution${g} = projected${g}
@@ -1570,13 +1638,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 ${stageChunk}
     // 🔴 BLOCKED, gate half first - the same convention as the trunk's
     // transition and the opposite of triangle multiplication's interleave.
+    let w_g0 = W_ffwTransition1 + c0 * wide + i;
+    let w_v0 = w_g0 + INTERMEDIATE;
+    ${upGate ? `let w_u0 = W_ffwAToB + c0 * INTERMEDIATE + i;` : ""}
     for (var cc = 0u; cc < CHANNEL_CHUNK; cc += 1u) {
-      let column = W_ffwTransition1 + (c0 + cc) * wide;
-      let wg = ${wf(`weights[column + i]`)};
-      let wv = ${wf(`weights[column + INTERMEDIATE + i]`)};
-      ${upGate ? `let wu = ${wf(`weights[W_ffwAToB + (c0 + cc) * INTERMEDIATE + i]`)};` : ""}
+      let w_off = cc * wide;
+      let wg = ${wf(`weights[w_g0 + w_off]`)};
+      let wv = ${wf(`weights[w_v0 + w_off]`)};
+      ${upGate ? `let wu = ${wf(`weights[w_u0 + cc * INTERMEDIATE]`)};` : ""}
       ${overGroups((g) => `{
-        let x = ${up(`xt[${g}u * CHANNEL_CHUNK + cc]`)};
+        let x = ${up(`xt[${g * channelChunk}u + cc]`)};
         gate_acc${g} += x * wg;
         value_acc${g} += x * wv;
         ${upGate ? `up_acc${g} += x * wu;` : ""}
@@ -1749,19 +1820,26 @@ ${mode === "reduce"
     // ...before overwriting the chunk the previous iteration is still reading.
     workgroupBarrier();
     for (var i = local; i < OUT_CHUNK; i += ${lanes}u) {
-      ${overOutTile((t) => `{
-        let token = base_token + ${t}u;
-        var value = 0.0;
-        if (token < ${ROWS}) { value = gated[token * INTERMEDIATE + chunk0 + i]; }
-        wt[${outGroup(t)}u * OUT_CHUNK + i]${outLane(t)} = value;
+      let idx_i = chunk0 + i;
+      ${overOutGroups((g) => `{
+        var wv = ${outVector}(0.0);
+        ${Array.from({ length: outWidth }, (_, l) => {
+          const t = g * outWidth + l;
+          return `{
+          let token = base_token + ${t}u;
+          if (token < ${ROWS}) { wv${outLane(l)} = gated[token * INTERMEDIATE + idx_i]; }
+        }`;
+        }).join("\n        ")}
+        wt[${g * outChunk}u + i] = wv;
       }`)}
     }
     workgroupBarrier();
 
+    let w_t2_base = W_ffwTransition2 + chunk0 * C + c;
     for (var i = 0u; i < OUT_CHUNK; i += 1u) {
       // ...read once, used by every token of the tile.
-      let weight = ${wf(`weights[W_ffwTransition2 + (chunk0 + i) * C + c]`)};
-      ${overOutGroups((g) => `acc${g} += wt[${g}u * OUT_CHUNK + i] * weight;`)}
+      let weight = ${wf(`weights[w_t2_base + i * C]`)};
+      ${overOutGroups((g) => `acc${g} += wt[${g * outChunk}u + i] * weight;`)}
     }
   }
 
@@ -1792,19 +1870,25 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   // ordinary staging barrier.
   workgroupBarrier();
   for (var d = local; d < C_COND; d += ${lanes}u) {
-    ${overOutTile((t) => `{
-      let token = base_token + ${t}u;
-      var value = 0.0;
-      if (token < ${ROWS}) { value = cond[${perToken("token")} * C_COND + d]; }
-      wt[${outGroup(t)}u * C_COND + d]${outLane(t)} = value;
+    ${overOutGroups((g) => `{
+      var cv = ${outVector}(0.0);
+      ${Array.from({ length: outWidth }, (_, l) => {
+        const t = g * outWidth + l;
+        return `{
+        let token = base_token + ${t}u;
+        if (token < ${ROWS}) { cv${outLane(l)} = cond[${perToken("token")} * C_COND + d]; }
+      }`;
+      }).join("\n      ")}
+      wt[${g * condChannels}u + d] = cv;
     }`)}
   }
   workgroupBarrier();
 
   ${overOutGroups((g) => `var zero${g} = ${outVector}(${wf(`weights[W_ffwAdaptiveZeroCondBias + c]`)});`)}
+  let w_z_base = W_ffwAdaptiveZeroCondWeights + c;
   for (var d = 0u; d < C_COND; d += 1u) {
-    let w = ${wf(`weights[W_ffwAdaptiveZeroCondWeights + d * C + c]`)};
-    ${overOutGroups((g) => `zero${g} += wt[${g}u * C_COND + d] * w;`)}
+    let w = ${wf(`weights[w_z_base + d * C]`)};
+    ${overOutGroups((g) => `zero${g} += wt[${g * condChannels}u + d] * w;`)}
   }
 `}
   ${overOutGroups((g) => `let contribution${g} = acc${g}
@@ -2289,8 +2373,11 @@ export class Af3DiffusionTransformerGpu {
   // trap rather than a live bug; a sweep that reuses an instance across arms
   // would walk straight into it and read the first arm's numbers for every arm.
   #splitKeyFor() {
-    const rule = deviceTuning(this.device).diffusionSplitK;
-    return rule === null || rule === undefined ? "none" : JSON.stringify(rule);
+    const tuning = deviceTuning(this.device);
+    const rule = tuning.diffusionSplitK;
+    const tile = tuning.diffusionTokenTile;
+    return `${rule === null || rule === undefined ? "none" : JSON.stringify(rule)}:`
+      + `${tile === null || tile === undefined ? "none" : JSON.stringify(tile)}`;
   }
 
   async #compile(tokens, weights) {
@@ -2428,10 +2515,21 @@ export class Af3DiffusionTransformerGpu {
     // the rest measured 0.54x-0.82x when the raised tile reached them, which is
     // what makes this two numbers rather than one.
     const tile = weights.tile ?? Math.min(wantedTile, fits(channels));
+    const wantedQkvgTile = deviceTile?.qkvgCrossover !== undefined
+      ? (tokens < deviceTile.qkvgCrossover ? deviceTile.below : deviceTile.atOrAbove)
+      : tile;
+    const wantedWideTile = deviceTile?.wideCrossover !== undefined
+      ? (tokens < deviceTile.wideCrossover ? deviceTile.below : deviceTile.atOrAbove)
+      : tile;
+    const wantedAttnOutTile = deviceTile?.attnOutCrossover !== undefined
+      ? (tokens < deviceTile.attnOutCrossover ? deviceTile.below : deviceTile.atOrAbove)
+      : tile;
     const qkvgTile = splitting
-      ? Math.min(weights.qkvgTile ?? splitRule.tile, fits(channels)) : tile;
+      ? Math.min(weights.qkvgTile ?? splitRule.tile, fits(channels))
+      : Math.min(weights.qkvgTile ?? wantedQkvgTile, fits(channels));
     const wideTile = splitting
-      ? Math.min(weights.wideTile ?? splitRule.wideTile ?? splitRule.tile, fits(channels)) : tile;
+      ? Math.min(weights.wideTile ?? splitRule.wideTile ?? splitRule.tile, fits(channels))
+      : Math.min(weights.wideTile ?? wantedWideTile, fits(channels));
     // ffw-out's inner extent is the intermediate, so it gets its own part
     // count - and its epilogue is a projection, so the reduction is most of
     // the original kernel. Same crossover.
@@ -2480,7 +2578,7 @@ export class Af3DiffusionTransformerGpu {
     // part's span when it is split.
     const attnOutTile = weights.attnOutTile ?? (splitting && attnKSplits > 1
       ? Math.min(splitRule.attnTile ?? splitRule.tile, fits(width / attnKSplits))
-      : tile);
+      : Math.min(wantedAttnOutTile, fits(width)));
     const wantedNormK = weights.normKSplits ?? (splitting ? (splitRule.normSplits ?? 4) : 1);
     const normKSplits = (wantedNormK > 1 && condChannels % wantedNormK === 0) ? wantedNormK : 1;
     // 🔴 THE BATCHED ZERO GATE NEEDS THE BLOCKS TO BE RESIDENT, because it
@@ -3151,7 +3249,7 @@ export class Af3DiffusionTransformerGpu {
                 Math.min(reduceGroups, GRID_WIDTH), Math.ceil(reduceGroups / GRID_WIDTH));
           } else {
             runBlock("qkvg", compiled.qkvg, [xBuffer, blockWeights, q, k, v, gate],
-                Math.ceil(rows / tile), sources.qkvgSplits);
+                Math.ceil(rows / qkvgTile), sources.qkvgSplits);
           }
           if (compiled.kqNorm !== undefined) {
             // One workgroup a token row; see the kernel. It rewrites q and k in
@@ -3223,7 +3321,7 @@ export class Af3DiffusionTransformerGpu {
                 Math.min(wideGroups, GRID_WIDTH), Math.ceil(wideGroups / GRID_WIDTH));
           } else {
             runBlock("ffw-wide", compiled.ffwWide, [xBuffer, blockWeights, gatedBuffer],
-                Math.ceil(rows / tile), sources.wideSplits);
+                Math.ceil(rows / wideTile), sources.wideSplits);
           }
           if (outKSplits > 1) {
             runBlock("ffw-out", compiled.ffwOut,
