@@ -54,12 +54,19 @@ struct Be2MsaEmbedArgs { DP(float) m; CP(int) msa; CP(int) hasDel; CP(float) del
 struct Be2PwaSoftmaxArgs { CP(float) b; DP(float) w; uint T, H; };
 // o[s][i][h][:] = sum_j w[h][i][j] v[s][j][h][:]
 struct Be2PwaApplyArgs { CP(float) w; CP(float) v; DP(float) o; u64 S; uint T, H, Ch, pad0; };
-// the outer product over the rows, a block of i: y[(i - i0) T + j][c Co + d] = sum_s a[s][i][c] b[s][j][d] / n
-struct Be2OpmArgs { CP(float) proj; DP(float) y; u64 S; uint T, Co, i0, bi; float inv; uint pad0; };
+// the outer product mean: proj [S][T][2 Co] packed into a, b [S][T Co] (its halves); then a GEMM over the rows gives
+// x [(i, c)][(j, d)] for a block of i, permuted into y [(i, j)][(c, d)] / n
+struct Be2OpmPackArgs { CP(float) proj; DP(float) a; DP(float) b; u64 R; uint Co, pad0; };
+struct Be2OpmPermuteArgs { CP(float) x; DP(float) y; uint bi, T, Co; float inv; };
 struct Be2SymmetriseArgs { CP(float) z; DP(float) zs; uint T, C; };
 struct Be2ContactArgs { CP(float) logits; DP(float) out; u64 pairs; uint bins, near; };
 struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) outh; float mul; uint pad0; };
                                                     // [pairs][H] -> [H][pairs] (outh: in half, times mul - log2 e)
+// the pair track's fast weights (metal/ef2's): the triangle's projection and gate [C][2C] (a, b interleaved by channel) as
+// gemmTriGate's one weight [C][4C], channel c's (pa ga pb gb) in blocks of 8; AF3's blocked transition1 [C][2I] as
+// gemmSwiglu's blocks of 8, the value half / S
+struct Be2TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
+struct Be2Interleave8Args { CP(half) a; CP(half) b; DP(half) out; uint rows, I, lda; float invS; };
 // rows of two torch weights stacked into one [(r1 + r2)][C] half weight
 struct Be2StackArgs { CP(half) a; CP(half) b; DP(half) out; u64 na, nb; };
 

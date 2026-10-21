@@ -118,7 +118,72 @@ void transition(const float* x, float* out, size_t rows, int C, const std::strin
   }
 }
 
+// ---------------------------------------------------------------- the pair track's fast arm (metal/ef2's)
+// The pair stays FLOAT32 - its RMS is ~4.6e3 at 6MRR, where float16's step is 4 - and everything between is half: the
+// triangle a LayerNorm into half, one GEMM gating a and b into channel-major planes (gemmTriGate), their contraction and
+// centre norm (triContract), the output projection and the gate's GEMM adding into the pair (gemmGatedAddDual); the
+// transition a LayerNorm, the SwiGLU in the first GEMM's epilogue (stored / 64, as every SwiGLU here) and the second
+// GEMM adding into the pair. The bundle's pair track is AF3's layout, which is what these kernels were written for.
+static float* ONES = nullptr; static size_t ONES_N = 0;
+static const float* onesMask(size_t n) {
+  if (ONES_N < n) {
+    if (ONES) release(ONES);
+    std::vector<float> v(n, 1.f);
+    ONES = uploadNew(v.data(), n); ONES_N = n;       // (every token is real here: no token padding)
+  }
+  return ONES;
+}
+static const half* triGateWeight(const std::string& p, int C) {
+  if (triQuartersApply(C))      // (the matrix units' quarters, built once through a blocks-of-8 temporary)
+    return M.derived<half>("trigateQ:" + p, (size_t)C * 4 * C, [&](half* out) {
+      half* w8 = allocT<half>((size_t)C * 4 * C);
+      be2Run1d("be2_trigate_weight", (size_t)C * 4 * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), w8,
+                                                                         (uint)C, (uint)C});
+      triQuarters(w8, out, nullptr, nullptr, C);
+      release(w8);
+    });
+  return M.derived<half>("trigate:" + p, (size_t)C * 4 * C, [&](half* out) {
+    be2Run1d("be2_trigate_weight", (size_t)C * 4 * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), out,
+                                                                       (uint)C, (uint)C});
+  });
+}
+static void triangleFast(float* z, int T, int C, const std::string& p, bool outgoing) {
+  const size_t P = (size_t)T * T;
+  const int Tp = (T + 7) / 8 * 8; const size_t plane = (size_t)Tp * Tp;
+  half* xn = scratch<half>("be2.ftri.xn", P * C);
+  layerNorm(z, xn, P, C, Wf(p + "leftNormInputScale"), Wf(p + "leftNormInputOffset"));
+  void* big = scratchBytes("be2.ftri.big", triBytes(C, Tp));
+  half* a = triPlanes(big, T, C, Tp);
+  gemmTriGate(xn, triGateWeight(p, C), onesMask(P), a, a + plane, 0, P, C, 2 * plane, T, Tp, nullptr, triQuartersApply(C));
+  TriMid mid = triContract(big, T, C, outgoing, 1.f, Wf(p + "centerNormScale"), Wf(p + "centerNormOffset"),
+                           halfProductScale() ? nullptr : scratch<half>("be2.ftri.cn", P * C),
+                           outgoing ? "triangle out contraction" : "triangle in contraction");
+  gemmGatedAddDual(xn, M.h("w/" + p + "gatingLinear"), mid.cn, M.h("w/" + p + "outputProjection"), z, P, C, C, nullptr, nullptr,
+                   mid.outH, "triangle output and gated add");
+}
+static void pairTransitionFast(float* z, size_t rows, int C, const std::string& p) {
+  const int I = dimW(p + "transition1", 1) / 2;
+  const half* w1 = M.derived<half>("swiglu8:" + p, (size_t)C * 2 * I, [&](half* out) {
+    const half* t1 = M.h("w/" + p + "transition1");
+    be2Run1d("be2_interleave8", (size_t)C * 2 * I, Be2Interleave8Args{t1, t1 + I, out, (uint)C, (uint)I, (uint)(2 * I),
+                                                                        1.f / SWIGLU_SCALE});
+  });
+  const size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
+  const size_t r1 = std::min(rows, chunk);
+  half* xn = scratch<half>("be2.ftr.xn", r1 * C);
+  half* g = scratch<half>("be2.ftr.g", r1 * I);
+  for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+    const size_t r = std::min(chunk, rows - r0);
+    layerNorm(z + r0 * C, xn, r, C, Wf(p + "inputLayerNormScale"), Wf(p + "inputLayerNormOffset"));
+    gemmSwiglu(xn, w1, g, r, C, I);
+    Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("w/" + p + "transition2"); G.tw = F16; G.Y = z + r0 * C; G.ty = F32;
+    G.rows = r; G.in = I; G.out = C; G.alpha = SWIGLU_SCALE; G.beta = 1.f; G.label = "pair transition2";
+    gemm(G);
+  }
+}
+
 void pairTransition(float* z, size_t rows, int C, const std::string& p) {
+  if (HALF) { pairTransitionFast(z, rows, C, p); return; }
   const int I = dimW(p + "transition1", 1) / 2;
   const size_t chunk = std::max<size_t>(1, ((size_t)96 << 20) / (4 * (size_t)I * 3));
   const size_t r1 = std::min(rows, chunk);
@@ -144,6 +209,7 @@ void pairTransition(float* z, size_t rows, int C, const std::string& p) {
 // outgoing out[i][j] = sum_k a[i][k] b[j][k], incoming out[i][j] = sum_k a[k][j] b[k][i] (the bundle's incoming halves
 // are swapped at export, so this is Boltz's sum_k a[k][i] b[k][j]); z += outputProjection(LN(out)) sigmoid(gatingLinear(zn))
 void triangle(float* z, int T, int C, const std::string& p, bool outgoing) {
+  if (HALF) { triangleFast(z, T, C, p, outgoing); return; }
   const size_t P = (size_t)T * T;
   float* zn = scratch<float>("be2.tri.zn", P * C);
   layerNorm(z, zn, P, C, Wf(p + "leftNormInputScale"), Wf(p + "leftNormInputOffset"));

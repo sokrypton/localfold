@@ -89,13 +89,20 @@ static void outerProductMean(const float* m, float* z, int l) {
   layerNorm(m, mn, R, Cm, Wf(p + "norm/weight"), Wf(p + "norm/bias"));
   float* proj = scratch<float>("be2.opm.proj", R * 2 * Co);
   linT(mn, p + "proj_ab/weight", proj, R, Cm, 2 * Co);
-  const size_t perI = (size_t)T * Co * Co;
-  const int bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)32 << 20) / (4 * perI)));
-  float* y = scratch<float>("be2.opm.y", (size_t)bi * perI);
+  float* a = scratch<float>("be2.opm.a", R * Co); float* b = scratch<float>("be2.opm.b", R * Co);
+  be2Run1d("be2_opm_pack", R * 2 * Co, Be2OpmPackArgs{proj, a, b, (u64)R, (uint)Co, 0});
+  // a block of i at a time: x [(i, c)][(j, d)] is bi Co x T Co floats (32 MB of it)
+  const size_t TC = (size_t)T * Co;
+  const int bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)32 << 20) / (4 * Co * TC)));
+  float* x = scratch<float>("be2.opm.x", (size_t)bi * Co * TC);
+  float* y = scratch<float>("be2.opm.y", (size_t)bi * T * Co * Co);
   for (int i0 = 0; i0 < T; i0 += bi) {
     const int n = std::min(bi, T - i0);
-    run1d("be2_opm", (size_t)n * perI, Be2OpmArgs{proj, y, (u64)S, (uint)T, (uint)Co, (uint)i0, (uint)n,
-                                                  1.f / (float)D_.nValidRows, 0});
+    // x = a[:, block]^T b: a stored [S][T Co] is the transposed X, b [S][T Co] the weight (in = S rows, out = T Co)
+    Gemm g{}; g.X = a + (size_t)i0 * Co; g.tx = F32; g.transX = true; g.ldx = (int)TC; g.W = b; g.tw = F32; g.ldw = (int)TC;
+    g.Y = x; g.ty = F32; g.rows = (size_t)n * Co; g.in = S; g.out = (int)TC; g.label = "outer product";
+    gemm(g);
+    be2Run1d("be2_opm_permute", (size_t)n * T * Co * Co, Be2OpmPermuteArgs{x, y, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
     float* zr = z + (size_t)i0 * T * C;
     linT(y, p + "proj_o/weight", zr, (size_t)n * T, Co * Co, C, 1.f);
     addBias(zr, Wf(p + "proj_o/bias"), (size_t)n * T, C);

@@ -332,19 +332,23 @@ kernel void be2_pwa_apply(LF_ARGS(Be2PwaApplyArgs)) {
   for (uint j = 0; j < a.T; ++j) acc += w[j] * v[(ulong)j * W];
   a.o[t] = acc;
 }
-// OuterProductMeanVanilla over the rows (the mean over VALID rows): proj [S][T][2 Co], a its first half, b its second
-kernel void be2_opm(LF_ARGS(Be2OpmArgs)) {
+// OuterProductMeanVanilla's pack: proj [R = S T][2 Co] -> a, b [R][Co] (the first half and the second)
+kernel void be2_opm_pack(LF_ARGS(Be2OpmPackArgs)) {
   ulong t = LF_INDEX;
-  const uint Co = a.Co, CC = Co * Co;
+  const uint W = 2 * a.Co;
+  if (t >= a.R * W) return;
+  BE2_SPLIT(t, W, r, c);
+  if (c < a.Co) a.a[(ulong)r * a.Co + c] = a.proj[t]; else a.b[(ulong)r * a.Co + c - a.Co] = a.proj[t];
+}
+// x [(i, c)][(j, d)] for a block of bi rows of i -> y [(i, j)][(c, d)] / n (the mean over VALID rows)
+kernel void be2_opm_permute(LF_ARGS(Be2OpmPermuteArgs)) {
+  ulong t = LF_INDEX;
+  const uint CC = a.Co * a.Co;
   if (t >= (ulong)a.bi * a.T * CC) return;
-  uint d = (uint)(t % Co); ulong r = t / Co; uint c = (uint)(r % Co); r /= Co; uint j = (uint)(r % a.T); uint i = a.i0 + (uint)(r / a.T);
-  if (i >= a.T) return;
-  float acc = 0;
-  for (ulong s = 0; s < a.S; ++s) {
-    device const float* row = a.proj + s * a.T * 2 * Co;
-    acc += row[(ulong)i * 2 * Co + c] * row[(ulong)j * 2 * Co + Co + d];
-  }
-  a.y[t] = acc * a.inv;
+  BE2_SPLIT(t, CC, ij, cd);
+  BE2_SPLIT(ij, a.T, i, j);
+  BE2_SPLIT(cd, a.Co, c, d);
+  a.y[t] = a.x[((ulong)i * a.Co + c) * ((ulong)a.T * a.Co) + (ulong)j * a.Co + d] * a.inv;
 }
 kernel void be2_symmetrise(LF_ARGS(Be2SymmetriseArgs)) {
   ulong t = LF_INDEX;
@@ -368,6 +372,23 @@ kernel void be2_token_bias(LF_ARGS(Be2TokenBiasArgs)) {
   uint h = (uint)(t % a.H); ulong ij = t / a.H;
   if (a.outh) a.outh[(ulong)h * a.T * a.T + ij] = (half)(a.proj[t] * a.mul);
   else a.out[(ulong)h * a.T * a.T + ij] = a.proj[t];
+}
+kernel void be2_trigate_weight(LF_ARGS(Be2TriGateWArgs)) {
+  ulong t = LF_INDEX;
+  const uint W = 4 * a.C;
+  if (t >= (ulong)a.rows * W) return;
+  BE2_SPLIT(t, W, r, col);
+  const uint kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8;
+  const uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8: pa ga pb gb; a and b interleaved by channel)
+  a.out[t] = k < 2 ? a.proj[(ulong)r * 2 * a.C + 2 * c + k] : a.gate[(ulong)r * 2 * a.C + 2 * c + k - 2];
+}
+kernel void be2_interleave8(LF_ARGS(Be2Interleave8Args)) {
+  ulong t = LF_INDEX;
+  const uint W = 2 * a.I;
+  if (t >= (ulong)a.rows * W) return;
+  BE2_SPLIT(t, W, r, c);
+  const uint m = c >> 4, q = c & 15;
+  a.out[t] = q < 8 ? a.a[(ulong)r * a.lda + 8 * m + q] : (half)((float)a.b[(ulong)r * a.lda + 8 * m + q - 8] * a.invS);
 }
 kernel void be2_stack(LF_ARGS(Be2StackArgs)) {
   ulong t = LF_INDEX;
