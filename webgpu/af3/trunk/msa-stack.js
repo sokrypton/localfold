@@ -41,6 +41,7 @@ import {
   allocateTransitionSplit, createTransitionShader, packTransitionWeights,
   splitTransitionConfig, pairTransitionArithmetic, transitionRowTile, TRANSITION_ORDER,
 } from "./transition.js";
+import { weightLength } from "../../../shared/weights/weight-pack.js";
 import { settleGridAttendTiling } from "./grid-attend-race.js";
 
 // The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
@@ -211,7 +212,7 @@ export class Af3MsaStackGpu {
     const transitionSplit = pipelines.transitionSplit === undefined || compileOnly
       ? undefined : allocateTransitionSplit(this.allocator, {
         rows: n * n, channels: pairChannels,
-        factor: sample.pairTransition.transition2.length / (pairChannels * pairChannels),
+        factor: weightLength(sample.pairTransition, "transition2") / (pairChannels * pairChannels),
         chunkRows: pipelines.transitionSplit.chunkRows,
         precision: pipelines.transitionSplit.storage,
         offsets: packTransitionWeights(sample.pairTransition).offsets,

@@ -1,4 +1,5 @@
-import { packNamedWeights } from "../../../shared/weights/weight-pack.js";
+import { packNamedWeights, weightLength } from "../../../shared/weights/weight-pack.js";
+import { writeInto } from "../../../shared/weights/float16.js";
 
 const ORDER = [
   "layerNormInWeight", "layerNormInBias",
@@ -89,18 +90,42 @@ export function packWeights(weights, precision, options = {}) {
   if (!(cHidden > 0) || !(cZ > 0)) {
     throw new RangeError("a matrix-path triangle pack needs cHidden and cZ");
   }
-  let merged = weights;
   let order = ORDER;
   if (interleaved) {
-    merged = { ...merged, ...interleaveAB(weights, cHidden, cZ) };
     order = order.filter((name) => !/^linear[AB][PG]/.test(name));
     order = [...order];
     order.splice(order.indexOf("layerNormOutWeight"), 0, ...AB_INTERLEAVED);
   }
-  // ...names and offsets unchanged, contents transposed, so only the kernel
-  // that reads them has to know. See transposeZG.
-  if (transposed) merged = { ...merged, ...transposeZG(weights, cHidden, cZ) };
-  return packOrder(merged, order, precision);
+  let merged;
+  const resolveMerged = () => {
+    if (merged !== undefined) return merged;
+    merged = weights;
+    if (interleaved) merged = { ...merged, ...interleaveAB(weights, cHidden, cZ) };
+    // ...names and offsets unchanged, contents transposed, so only the kernel
+    // that reads them has to know. See transposeZG.
+    if (transposed) merged = { ...merged, ...transposeZG(weights, cHidden, cZ) };
+    return merged;
+  };
+  return packNamedWeights(weights, {
+    label: "triangle weights",
+    order,
+    precision,
+    ...(interleaved ? { composed: new Set(AB_INTERLEAVED) } : {}),
+    sizeOf: (name) => {
+      if (name === "linearABWeight") return 4 * cHidden * cZ;
+      if (name === "linearABBias") return 4 * cHidden;
+      return weightLength(weights, name);
+    },
+    write: (target, name, offset) => {
+      const m = resolveMerged();
+      const source = m[name];
+      if (precision === "f16") {
+        writeInto(target, source, offset);
+      } else {
+        target.set(source, offset);
+      }
+    },
+  });
 }
 
 /**

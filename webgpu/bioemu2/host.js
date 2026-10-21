@@ -79,16 +79,22 @@ export function atomFeatures(p, f) {
     for (let i = 0; i < W_Q; i += 1) {
       const qa = w * W_Q + i;
       if (!f.atom_pad_mask[qa]) continue;
+      const qx = f.template_coords[qa * 3];
+      const qy = f.template_coords[qa * 3 + 1];
+      const qz = f.template_coords[qa * 3 + 2];
+      const quid = f.ref_space_uid[qa];
       for (let j = 0; j < W_K; j += 1) {
         const ka = w * W_Q - CTX + j;
         const inside = ka >= 0 && ka < N;
         const kuid = inside && f.atom_pad_mask[ka] ? f.ref_space_uid[ka] : -1;
-        if (f.ref_space_uid[qa] !== kuid) continue;
-        const d = [0, 1, 2].map((x) => (inside ? f.template_coords[ka * 3 + x] : 0) - f.template_coords[qa * 3 + x]);
-        const inv = 1 / (1 + d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (quid !== kuid) continue;
+        const d0 = (inside ? f.template_coords[ka * 3] : 0) - qx;
+        const d1 = (inside ? f.template_coords[ka * 3 + 1] : 0) - qy;
+        const d2 = (inside ? f.template_coords[ka * 3 + 2] : 0) - qz;
+        const inv = 1 / (1 + d0 * d0 + d1 * d1 + d2 * d2);
         const at = ((w * W_Q + i) * W_K + j) * Z;
         for (let o = 0; o < Z; o += 1) {
-          pr[at + o] = pos[o * 3] * d[0] + pos[o * 3 + 1] * d[1] + pos[o * 3 + 2] * d[2] + dist[o] * inv + maskW[o];
+          pr[at + o] = pos[o * 3] * d0 + pos[o * 3 + 1] * d1 + pos[o * 3 + 2] * d2 + dist[o] * inv + maskW[o];
         }
       }
     }
@@ -108,31 +114,90 @@ export function atomPairTail(p, c, pr, N) {
   const m1 = p["p_mlp_1/weight"];
   const m3 = p["p_mlp_3/weight"];
   const m5 = p["p_mlp_5/weight"];
+  const r0 = new Float64Array(Z);
   const h = new Float64Array(Z);
   const g = new Float64Array(Z);
   for (let w = 0; w < NW; w += 1) {
     for (let i = 0; i < W_Q; i += 1) {
       const qa = w * W_Q + i;
+      const qBase = qa * Z;
       for (let j = 0; j < W_K; j += 1) {
         const ka = w * W_Q - CTX + j;
         const at = ((w * W_Q + i) * W_K + j) * Z;
+        const inside = ka >= 0 && ka < N;
+        const kBase = ka * Z;
         for (let o = 0; o < Z; o += 1) {
-          pr[at + o] += cq[qa * Z + o] + (ka >= 0 && ka < N ? ck[ka * Z + o] : 0);
+          const val = pr[at + o] + cq[qBase + o] + (inside ? ck[kBase + o] : 0);
+          pr[at + o] = val;
+          r0[o] = val > 0 ? val : 0;
         }
-        for (let o = 0; o < Z; o += 1) { let s = 0; for (let k = 0; k < Z; k += 1) s += relu(pr[at + k]) * m1[o * Z + k]; h[o] = s; }
-        for (let o = 0; o < Z; o += 1) { let s = 0; for (let k = 0; k < Z; k += 1) s += relu(h[k]) * m3[o * Z + k]; g[o] = s; }
-        for (let o = 0; o < Z; o += 1) { let s = 0; for (let k = 0; k < Z; k += 1) s += relu(g[k]) * m5[o * Z + k]; pr[at + o] += s; }
+        for (let o = 0; o < Z; o += 1) {
+          const row = o * Z;
+          let s = 0;
+          for (let k = 0; k < Z; k += 1) s += r0[k] * m1[row + k];
+          h[o] = s > 0 ? s : 0;
+        }
+        for (let o = 0; o < Z; o += 1) {
+          const row = o * Z;
+          let s = 0;
+          for (let k = 0; k < Z; k += 1) s += h[k] * m3[row + k];
+          g[o] = s > 0 ? s : 0;
+        }
+        for (let o = 0; o < Z; o += 1) {
+          const row = o * Z;
+          let s = 0;
+          for (let k = 0; k < Z; k += 1) s += g[k] * m5[row + k];
+          pr[at + o] += s;
+        }
       }
     }
   }
   return pr;
 }
 
+/** Pre-normalise `pr` once so multiple `windowBias` calls can reuse `(pr - mean) * inv`. */
+export function normalizeWindowPair(pr) {
+  const Z = BIOEMU2.atomPair;
+  const out = new Float64Array(pr.length);
+  for (let at = 0; at < pr.length; at += Z) {
+    let mean = 0;
+    for (let k = 0; k < Z; k += 1) mean += pr[at + k];
+    mean /= Z;
+    let v = 0;
+    for (let k = 0; k < Z; k += 1) { const d = pr[at + k] - mean; v += d * d; }
+    const inv = 1 / Math.sqrt(v / Z + 1e-5);
+    for (let k = 0; k < Z; k += 1) out[at + k] = (pr[at + k] - mean) * inv;
+  }
+  return out;
+}
+
 /** LN(pair) * norm_z -> proj_z, heads first: (NW, H, 32, 128). */
-export function windowBias(pr, N, normZ, projZ, heads) {
+export function windowBias(pr, N, normZ, projZ, heads, prNorm = null) {
   const NW = N / W_Q;
   const Z = BIOEMU2.atomPair;
   const out = new Float32Array(NW * heads * W_Q * W_K);
+  if (prNorm !== null) {
+    const w = new Float64Array(heads * Z);
+    for (let h = 0; h < heads; h += 1) {
+      for (let k = 0; k < Z; k += 1) w[h * Z + k] = normZ[k];
+    }
+    const x = new Float64Array(Z);
+    for (let win = 0; win < NW; win += 1) {
+      for (let i = 0; i < W_Q; i += 1) {
+        for (let j = 0; j < W_K; j += 1) {
+          const at = ((win * W_Q + i) * W_K + j) * Z;
+          for (let k = 0; k < Z; k += 1) x[k] = prNorm[at + k] * normZ[k];
+          for (let h = 0; h < heads; h += 1) {
+            const hRow = h * Z;
+            let s = 0;
+            for (let k = 0; k < Z; k += 1) s += x[k] * projZ[hRow + k];
+            out[((win * heads + h) * W_Q + i) * W_K + j] = s;
+          }
+        }
+      }
+    }
+    return out;
+  }
   const x = new Float64Array(Z);
   for (let w = 0; w < NW; w += 1) {
     for (let i = 0; i < W_Q; i += 1) {

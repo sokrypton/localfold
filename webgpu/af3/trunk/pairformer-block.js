@@ -39,6 +39,7 @@ import { matrixContractionOverflows,
   TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS, triangleProjectMatrixFits,
 } from "../../kernels/triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../../kernels/triangle/weights.js";
+import { weightLength } from "../../../shared/weights/weight-pack.js";
 import { af3TriangleWeights } from "./triangle.js";
 import { shapedKnob } from "../../runtime/device-profile.js";
 
@@ -637,7 +638,7 @@ export class Af3PairformerStackGpu {
       const transitionSplit = pipelines.transitionSplit === undefined ? undefined
         : allocateTransitionSplit(this.allocator, {
           rows: n * n, channels: pairChannels,
-          factor: blocks[0].pairTransition.transition2.length / (pairChannels * pairChannels),
+          factor: weightLength(blocks[0].pairTransition, "transition2") / (pairChannels * pairChannels),
           chunkRows: pipelines.transitionSplit.chunkRows,
           precision: pipelines.transitionSplit.storage,
           offsets: packTransitionWeights(blocks[0].pairTransition).offsets,

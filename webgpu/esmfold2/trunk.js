@@ -349,7 +349,7 @@ export class Esmfold2TrunkGpu {
         const submitted = index + 1;
         void this.device.queue.onSubmittedWorkDone()
           .then(() => options.onBlockDone?.(submitted, blocks.length));
-        if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
+        if (options.wait !== false && ((index + 1) % submissionWindow === 0 || index === blocks.length - 1)) {
           await this.device.queue.onSubmittedWorkDone();
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
@@ -357,7 +357,8 @@ export class Esmfold2TrunkGpu {
         // progress bar here would write it and never paint it.
         await options.onBlock?.(index);
       }
-      await validation.settle();
+      if (options.wait !== false) await validation.settle();
+      else void validation.settle();
 
       // ...allocated after the scratch is released, not beside it. See the
       // note in webgpu/af3/trunk/pairformer-block.js: this allocator does not

@@ -155,6 +155,7 @@ export async function foldBioemu2(device, read, features, options = {}) {
         await trunk.pass((done, total) => progress("trunk", pass * total + done, passes * total));
       }
     });
+    trunk.trunkAllocator?.destroyPooled();
     const sTrunk = await net.ops.read(trunk.s);
     const { contact, logits } = await clock("distogram", () => net.distogram(g, trunk.z));
     options.onContacts?.(contact);

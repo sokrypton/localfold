@@ -40,6 +40,7 @@ import {
   createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
   transitionRowTile, transitionSplitChunkRows,
 } from "./transition.js";
+import { weightLength } from "../../../shared/weights/weight-pack.js";
 
 export const PAIR_CHANNELS = 128;
 export const GRID_WIDTH = 32_768;
@@ -160,8 +161,8 @@ export async function compilePairTrack(cache, options) {
   // confidence head are 4. Defaulting to 4 reads a factor-2 `transition1` at
   // twice its stride - which does not fail, because the buffer is merely
   // shorter than the kernel thinks. Only the template stack ever passed one.
-  const derivedFactor = sample.pairTransition?.transition2 === undefined ? undefined
-    : sample.pairTransition.transition2.length / (channels * channels);
+  const derivedFactor = sample.pairTransition === undefined ? undefined
+    : weightLength(sample.pairTransition, "transition2") / (channels * channels);
   const transitionFactor = options.transitionFactor ?? derivedFactor ?? 4;
   if (!Number.isInteger(transitionFactor)) {
     throw new Error(`pair transition factor ${transitionFactor} is not an integer; `

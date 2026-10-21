@@ -31,6 +31,7 @@
  */
 import { TriangleMultiplicationIncomingGpu, TriangleMultiplicationOutgoingGpu }
   from "../../kernels/triangle/webgpu.js";
+import { SOURCES } from "../../../shared/weights/weight-sources.js";
 
 /**
  * Split one of AF3's double-width weights into AF2's two, transposing as it
@@ -82,25 +83,54 @@ function transpose(source, inChannels, outChannels) {
  * @param {number} channels c_z, which equals c_hidden throughout AF3.
  */
 export function af3TriangleWeights(weights, channels) {
-  const projection = splitInterleaved(weights.projection, channels);
-  const gate = splitInterleaved(weights.gate, channels);
-  // AF3 has no biases here; the kernel's weight block is fixed-shape, so they
-  // are present and zero rather than absent.
-  const zeros = () => new Float32Array(channels);
-  return {
-    layerNormInWeight: weights.leftNormInputScale,
-    layerNormInBias: weights.leftNormInputOffset,
-    linearAPWeight: projection.a, linearAPBias: zeros(),
-    linearAGWeight: gate.a, linearAGBias: zeros(),
-    linearBPWeight: projection.b, linearBPBias: zeros(),
-    linearBGWeight: gate.b, linearBGBias: zeros(),
-    layerNormOutWeight: weights.centerNormScale,
-    layerNormOutBias: weights.centerNormOffset,
-    linearZWeight: transpose(weights.outputProjection, channels, channels),
-    linearZBias: zeros(),
-    linearGWeight: transpose(weights.gatingLinear, channels, channels),
-    linearGBias: zeros(),
+  let projection;
+  let gate;
+  let linearZ;
+  let linearG;
+  let zeroVec;
+  const getProj = () => (projection ??= splitInterleaved(weights.projection, channels));
+  const getGate = () => (gate ??= splitInterleaved(weights.gate, channels));
+  const zeros = () => (zeroVec ??= new Float32Array(channels));
+  const c2 = channels * channels;
+  const out = {
+    get layerNormInWeight() { return weights.leftNormInputScale; },
+    get layerNormInBias() { return weights.leftNormInputOffset; },
+    get linearAPWeight() { return getProj().a; },
+    get linearAPBias() { return zeros(); },
+    get linearAGWeight() { return getGate().a; },
+    get linearAGBias() { return zeros(); },
+    get linearBPWeight() { return getProj().b; },
+    get linearBPBias() { return zeros(); },
+    get linearBGWeight() { return getGate().b; },
+    get linearBGBias() { return zeros(); },
+    get layerNormOutWeight() { return weights.centerNormScale; },
+    get layerNormOutBias() { return weights.centerNormOffset; },
+    get linearZWeight() { return (linearZ ??= transpose(weights.outputProjection, channels, channels)); },
+    get linearZBias() { return zeros(); },
+    get linearGWeight() { return (linearG ??= transpose(weights.gatingLinear, channels, channels)); },
+    get linearGBias() { return zeros(); },
   };
+  Object.defineProperty(out, SOURCES, {
+    value: {
+      layerNormInWeight: { count: channels },
+      layerNormInBias: { count: channels },
+      linearAPWeight: { count: c2 },
+      linearAPBias: { count: channels },
+      linearAGWeight: { count: c2 },
+      linearAGBias: { count: channels },
+      linearBPWeight: { count: c2 },
+      linearBPBias: { count: channels },
+      linearBGWeight: { count: c2 },
+      linearBGBias: { count: channels },
+      layerNormOutWeight: { count: channels },
+      layerNormOutBias: { count: channels },
+      linearZWeight: { count: c2 },
+      linearZBias: { count: channels },
+      linearGWeight: { count: c2 },
+      linearGBias: { count: channels },
+    },
+  });
+  return out;
 }
 
 /**
