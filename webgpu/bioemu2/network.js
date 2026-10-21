@@ -688,8 +688,13 @@ export class Bioemu2Gpu {
     }
     // the pair track's state: AllocatedGpuBuffer-shaped wrappers over our buffers (it binds `.buffer`)
     const pairState = { buffer: { buffer: z }, maskBuffer: { buffer: o.buffer("pairMask", T * T, new Float32Array(T * T).fill(1)) } };
+    // 🔴 THE ACCUMULATOR IS FLOAT32 ALWAYS: BioEmu2's pair reaches ~3e5 (6MRR, float32 arm) - past float16's 65,504 -
+    // where ESMFold2's, which this trunk was tuned for, stays small, and the trunk's device default on a part with
+    // shader-f16 is f16 staging AND f16 accumulation. A stock Chrome on Apple silicon took that and returned a fold of
+    // NaN (pass 1's pair: 3 infinities, every stage after NaN); the developer flags hid it, their matrix-unit kernels
+    // summing wider. Staging stays the device's (a LayerNorm's output, bounded)
     const trunk = new Esmfold2TrunkGpu(this.device, this.options.trunkPrecision === "f32"
-      ? { stagedPrecision: "f32", accumulatePrecision: "f32" } : {});
+      ? { stagedPrecision: "f32", accumulatePrecision: "f32" } : { accumulatePrecision: "f32" });
     const msaBlocks = [];
     for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) msaBlocks.push(await trunkBlockWeights(this.read, l, "msa"));
     const mixerBlocks = [];
