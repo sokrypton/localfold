@@ -39,8 +39,7 @@ float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, cons
   layerNorm(c, cn, Rc, Cc, Wf(L.p + "cond_0/weight"), WfOpt(L.p + "cond_0/bias"));
   silu(cn, cn, (size_t)Rc * Cc);
   float* cond = scratch<float>(name, (size_t)Rc * 6 * D);
-  linT(cn, L.p + "cond_2/weight", cond, Rc, Cc, 6 * D);
-  if (const float* b = WfOpt(L.p + "cond_2/bias")) addBias(cond, b, Rc, 6 * D);
+  linT(cn, L.p + "cond_2/weight", cond, Rc, Cc, 6 * D, 0.f, 0, 0, false, WfOpt(L.p + "cond_2/bias"));
   return cond;
 }
 void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,

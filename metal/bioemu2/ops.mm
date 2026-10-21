@@ -26,19 +26,20 @@ size_t lenW(const std::string& n) { return M.len(wn(n)); }
 // GEMM_HALF, and only where both sides are at least 16 wide (r_to_q's 3-wide coordinates stay float). `wide`: an input
 // that may pass float16's range, multiplied in float against the half weight
 static void linear(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, int ldx, int ldy,
-                   bool torch, bool wide) {
+                   bool torch, bool wide, const float* bias = nullptr) {
   const int d0 = dimW(w, 0), d1 = dimW(w, 1);
   if (torch ? (d0 != out || d1 != in) : (d0 != in || d1 != out))
     die("BioEmu2: %s is [%d, %d], read as %s [%d, %d]", w.c_str(), d0, d1, torch ? "(out, in)" : "(in, out)",
         torch ? out : in, torch ? in : out);
   Gemm g{}; g.X = X; g.tx = F32; g.ldx = ldx; g.transW = torch; g.Y = Y; g.ty = F32; g.ldy = ldy;
-  g.rows = rows; g.in = in; g.out = out; g.beta = beta; g.label = w.c_str();
+  g.rows = rows; g.in = in; g.out = out; g.beta = beta; g.label = w.c_str(); g.bias = bias;
   if (HALF && in >= 16 && out >= 16) { g.W = M.h("w/" + w); g.tw = F16; g.half = !wide; }
   else { g.W = Wf(w); g.tw = F32; }
   gemm(g);
 }
-void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, int ldx, int ldy, bool wide) {
-  linear(X, w, Y, rows, in, out, beta, ldx, ldy, true, wide);
+void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, int ldx, int ldy, bool wide,
+          const float* bias) {
+  linear(X, w, Y, rows, in, out, beta, ldx, ldy, true, wide, bias);
 }
 void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, int ldx, int ldy, bool wide) {
   linear(X, w, Y, rows, in, out, beta, ldx, ldy, false, wide);

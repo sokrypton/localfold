@@ -142,8 +142,8 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
   const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
-  float* gA = scratch<float>("be2.cs.gA", R * Dt); float* gQ = scratch<float>("be2.cs.gQ", R * Ca);
-  float* beta = scratch<float>("be2.cs.beta", R * Dc); float* QB = scratch<float>("be2.cs.QB", R * 6 * I);
+  half* gA = scratch<half>("be2.cs.gA", 2 * R * Dt); half* gQ = scratch<half>("be2.cs.gQ", 2 * R * Ca);
+  half* beta = scratch<half>("be2.cs.beta", 2 * R * Dc); float* QB = scratch<float>("be2.cs.QB", R * 6 * I);
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
   // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
@@ -156,11 +156,14 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
   float* stats = scratch<float>("be2.cs.stats", RN * 8); half* xq = scratch<half>("be2.cs.xq", RN * Ca * 2);
   half* g = scratch<half>("be2.cs.g", RN * I);
-  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gA, gQ, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, 0});
-  // Qa | Qq | B [R][3][2I], in float (the gammas multiplied unrounded)
-  auto qb = [&](const float* X, int in, const half* W, int col, const char* label) {
-    Gemm G{}; G.X = X; G.tx = F32; G.W = W; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 6 * I;
-    G.rows = R; G.in = in; G.out = 2 * I; G.label = label; gemm(G);
+  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gA, gQ, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
+  // Qa | Qq | B [R][3][2I] in float, each two GEMMs on the matrix units - the gammas' hi, then their remainder added
+  // (float's precision: as one float GEMM, off the matrix units, the three were 12% of the sampler)
+  auto qb = [&](const half* X, int in, const half* W, int col, const char* label) {
+    for (int part = 0; part < 2; ++part) {
+      Gemm G{}; G.X = X + (size_t)part * R * in; G.tx = F16; G.W = W; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 6 * I;
+      G.rows = R; G.in = in; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = label; gemm(G);
+    }
   };
   qb(gA, Dt, w12, 0, "coupling Qa");
   qb(gQ, Ca, w12 + (size_t)Dt * 2 * I, 2 * I, "coupling Qq");
@@ -270,12 +273,10 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     const std::string cp = L + "coupling/";
     layerNorm(cnd, cn, T + 1, Dt, Wf(cp + "q_coupling_cond_0/weight"), WfOpt(cp + "q_coupling_cond_0/bias"));
     silu(cn, cn, (size_t)(T + 1) * Dt);
-    linT(cn, cp + "q_coupling_cond_2/weight", cqc, T + 1, Dt, 2 * Dc + Ca);
-    if (const float* b = WfOpt(cp + "q_coupling_cond_2/bias")) addBias(cqc, b, T + 1, 2 * Dc + Ca);
+    linT(cn, cp + "q_coupling_cond_2/weight", cqc, T + 1, Dt, 2 * Dc + Ca, 0.f, 0, 0, false, WfOpt(cp + "q_coupling_cond_2/bias"));
     layerNorm(cnd, cn, T, Dt, Wf(cp + "s_coupling_cond_0/weight"), WfOpt(cp + "s_coupling_cond_0/bias"));
     silu(cn, cn, (size_t)T * Dt);
-    linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt);
-    if (const float* b = WfOpt(cp + "s_coupling_cond_2/bias")) addBias(csc, b, T, 2 * Dc + Dt);
+    linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt, 0.f, 0, 0, false, WfOpt(cp + "s_coupling_cond_2/bias"));
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
     // (the fast arm on the matrix units: s_to_q SPLIT - couplingSplit - and its row never built)
     const bool csplit = HALF && COUPLING_SPLIT && gemmTensorOps();

@@ -48,7 +48,7 @@ template <class A> void be2Run1d(const char* kernel, size_t n, const A& a) {
 // `wide` keeps an input that may pass float16's range in float
 extern bool HALF;
 void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
-          bool wide = false);
+          bool wide = false, const float* bias = nullptr);     // (bias: added in the GEMM's epilogue)
 void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
           bool wide = false);
 void relu(const float* x, float* y, size_t n);
