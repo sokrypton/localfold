@@ -50,6 +50,41 @@ __global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, c
   float w = pw[h];
   // the query's scalars and points held in registers, read once (they were read again for every key); the
   // keys' scalars as float4s where 16-byte aligned - the same products in the same order
+  if (Cs == 16 && Pq == 4) {
+    const float4* qsh = reinterpret_cast<const float4*>(qs + ((size_t)q * Hh + h) * 16);
+    float4 qv0 = qsh[0], qv1 = qsh[1], qv2 = qsh[2], qv3 = qsh[3];
+    const float4* qph = reinterpret_cast<const float4*>(qp + ((size_t)q * Hh + h) * 12);
+    float4 qp0 = qph[0], qp1 = qph[1], qp2 = qph[2];
+    float sq = seqMask[q];
+    for (int k = lane; k < L; k += 32) {
+      const float4* kpk = reinterpret_cast<const float4*>(kp + ((size_t)k * Hh + h) * 12);
+      float4 kp0 = kpk[0], kp1 = kpk[1], kp2 = kpk[2];
+      float d2 = 0;
+      float dx, dy, dz;
+      dx = qp0.x - kp0.x; dy = qp0.y - kp0.y; dz = qp0.z - kp0.z; d2 += dx * dx + dy * dy + dz * dz;
+      dx = qp0.w - kp0.w; dy = qp1.x - kp1.x; dz = qp1.y - kp1.y; d2 += dx * dx + dy * dy + dz * dz;
+      dx = qp1.z - kp1.z; dy = qp1.w - kp1.w; dz = qp2.x - kp2.x; d2 += dx * dx + dy * dy + dz * dz;
+      dx = qp2.y - kp2.y; dy = qp2.z - kp2.z; dz = qp2.w - kp2.w; d2 += dx * dx + dy * dy + dz * dz;
+      const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * 16);
+      float sc = 0;
+      float4 v0 = ksk[0]; sc += qv0.x * v0.x; sc += qv0.y * v0.y; sc += qv0.z * v0.z; sc += qv0.w * v0.w;
+      float4 v1 = ksk[1]; sc += qv1.x * v1.x; sc += qv1.y * v1.y; sc += qv1.z * v1.z; sc += qv1.w * v1.w;
+      float4 v2 = ksk[2]; sc += qv2.x * v2.x; sc += qv2.y * v2.y; sc += qv2.z * v2.z; sc += qv2.w * v2.w;
+      float4 v3 = ksk[3]; sc += qv3.x * v3.x; sc += qv3.y * v3.y; sc += qv3.z * v3.z; sc += qv3.w * v3.w;
+      float s = -0.5f * w * d2;
+      s += sc + b2d[((size_t)q * L + k) * Hh + h];
+      s -= 1e5f * (1.f - sq * seqMask[k]);
+      s *= sqrtf(1.f / 3.f);
+      row[k] = s;
+      mx = fmaxf(mx, s);
+    }
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    float sum = 0;
+    for (int k = lane; k < L; k += 32) { float e = __expf(row[k] - mx); row[k] = e; sum += e; }
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    for (int k = lane; k < L; k += 32) row[k] /= sum;
+    return;
+  }
   constexpr int CS_MAX = 32, PQ_MAX = 8;
   const bool fast = Cs <= CS_MAX && Pq <= PQ_MAX && Cs % 4 == 0;
   float qv[CS_MAX], qpt[PQ_MAX * 3];
@@ -111,17 +146,21 @@ __global__ void ipaOutputsFastK(const float* __restrict__ attn, const float* __r
   int p = lane - Cs;
   bool isS = lane < Cs, isP = p >= 0 && p < Pv;
   if (!isS && !isP) return;
-  for (int k = 0; k < L; ++k) {
-    float ak = a[k];
-    if (isS) s += ak * vs[((size_t)k * Hh + h) * Cs + lane];
-    else {
-      const float* vpk = vp + (((size_t)k * Hh + h) * Pv + p) * 3;
-      g0 += ak * vpk[0]; g1 += ak * vpk[1]; g2 += ak * vpk[2];
-    }
-  }
   if (isS) {
+    const float* vsh = vs + h * Cs + lane;
+    int strideS = Hh * Cs;
+#pragma unroll 8
+    for (int k = 0; k < L; ++k) s += a[k] * vsh[(size_t)k * strideS];
     f[h * Cs + lane] = s;
   } else {
+    const float* vph = vp + (h * Pv + p) * 3;
+    int strideP = Hh * Pv * 3;
+#pragma unroll 8
+    for (int k = 0; k < L; ++k) {
+      float ak = a[k];
+      const float* vpk = vph + (size_t)k * strideP;
+      g0 += ak * vpk[0]; g1 += ak * vpk[1]; g2 += ak * vpk[2];
+    }
     float g[3] = {g0, g1, g2}, loc[3];
     rapplyInv(rig + q * 12, g, loc);
     int base = Hh * Cs, idx = h * Pv + p;
@@ -171,32 +210,28 @@ __global__ void ipaPairTermK(const float* __restrict__ attn, const float* __rest
   __shared__ float as[IPA_MAX_HEADS][IPA_KT];
   int q = blockIdx.x;
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
-  if (C2 == 128 && Hh == 12 && blockDim.x == 32) {
-    int c4 = threadIdx.x * 4;
-    float4 acc[12];
-#pragma unroll
-    for (int h = 0; h < 12; ++h) acc[h] = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (C2 == 128 && Hh == 12 && blockDim.x == 128) {
+    int c = threadIdx.x;
+    float acc[12] = {};
     for (int k0 = 0; k0 < L; k0 += IPA_KT) {
       int kt = min(IPA_KT, L - k0);
-      for (int t = threadIdx.x; t < 12 * kt; t += 32) {
+      for (int t = c; t < 12 * kt; t += 128) {
         int h = t / kt, k = t - h * kt;
         as[h][k] = attn[((size_t)q * 12 + h) * L + k0 + k];
       }
-      __syncwarp();
+      __syncthreads();
+      const float* a2d = act2d + ((size_t)q * L + k0) * 128 + c;
 #pragma unroll 8
       for (int k = 0; k < kt; ++k) {
-        float4 v = *reinterpret_cast<const float4*>(act2d + ((size_t)q * L + k0 + k) * 128 + c4);
+        float v = a2d[(size_t)k * 128];
 #pragma unroll
-        for (int h = 0; h < 12; ++h) {
-          float a = as[h][k];
-          acc[h].x += a * v.x; acc[h].y += a * v.y; acc[h].z += a * v.z; acc[h].w += a * v.w;
-        }
+        for (int h = 0; h < 12; ++h) acc[h] += as[h][k] * v;
       }
-      __syncwarp();
+      __syncthreads();
     }
-    float* f = final_ + (size_t)q * Fw + 12 * Cs + 48 * Pv + c4;
+    float* f = final_ + (size_t)q * Fw + 12 * Cs + 48 * Pv + c;
 #pragma unroll
-    for (int h = 0; h < 12; ++h) *reinterpret_cast<float4*>(f + h * 128) = acc[h];
+    for (int h = 0; h < 12; ++h) f[h * 128] = acc[h];
     return;
   }
   int c = threadIdx.x;
@@ -273,10 +308,28 @@ __global__ void rigidUpdateK(float* rig, const float* upd, const float* bias, in
   for (int k = 0; k < 12; ++k) rig[i * 12 + k] = C[k];
 }
 __global__ void reluCopyK(const float* x, float* y, size_t n) {
+  if ((n & 3) == 0) {
+    size_t t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 < (n >> 2)) {
+      float4 v = reinterpret_cast<const float4*>(x)[t4];
+      reinterpret_cast<float4*>(y)[t4] = make_float4(fmaxf(v.x, 0.f), fmaxf(v.y, 0.f), fmaxf(v.z, 0.f), fmaxf(v.w, 0.f));
+    }
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) y[t] = fmaxf(x[t], 0.f);
 }
 __global__ void addBiasIntoK(float* dst, const float* y, const float* bias, size_t rows, int C) {
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 < rows * c4) {
+      float4 d = reinterpret_cast<const float4*>(dst)[t4];
+      float4 v = reinterpret_cast<const float4*>(y)[t4];
+      float4 b = reinterpret_cast<const float4*>(bias)[t4 % c4];
+      reinterpret_cast<float4*>(dst)[t4] = make_float4(d.x + v.x + b.x, d.y + v.y + b.y, d.z + v.z + b.z, d.w + v.w + b.w);
+    }
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) dst[t] += y[t] + bias[t % C];
 }
@@ -487,7 +540,7 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
       ipaOutputsFastK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(attn, vs, vp, rig, fin, L, Hh, Cs, Pv, C2);
     else
       ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, pairApart ? nullptr : act2d, rig, fin, L, Hh, Cs, Pv, C2);
-    if (pairApart) ipaPairTermK<<<L, (C2 == 128 && Hh == 12) ? 32 : (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
+    if (pairApart) ipaPairTermK<<<L, (C2 == 128 && Hh == 12) ? 128 : (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
     if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
                                                          P(S + "pair_layer_norm/offset"), fin, L, Hh, Cs, Pv, C2);
     gemm(fin, P(I + "output_projection/weights", -1), upd, L, Fw, C);
@@ -506,19 +559,19 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   const std::string R = F + "rigid_sidechain/";
   float* ra = scratch<float>("sm.ra", (size_t)L * C); float* sc = scratch<float>("sm.sc", (size_t)L * 128);
   float* sb = scratch<float>("sm.sb", (size_t)L * 128); float* sc2 = scratch<float>("sm.sc2", (size_t)L * 128);
-  reluCopyK<<<blocks((size_t)L * C), 256, 0, STREAM>>>(act, ra, (size_t)L * C);
+  reluCopyK<<<blocks((size_t)L * C >> 2), 256, 0, STREAM>>>(act, ra, (size_t)L * C);
   linearB(ra, R + "input_projection", -1, sc, L, C, 128);
-  reluCopyK<<<blocks((size_t)L * C), 256, 0, STREAM>>>(initial, ra, (size_t)L * C);
+  reluCopyK<<<blocks((size_t)L * C >> 2), 256, 0, STREAM>>>(initial, ra, (size_t)L * C);
   gemm(ra, P(R + "input_projection_1/weights", -1), sb, L, C, 128);
-  addBiasIntoK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(sc, sb, P(R + "input_projection_1/bias", -1), L, 128);
+  addBiasIntoK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, P(R + "input_projection_1/bias", -1), L, 128);
   for (int r = 0; r < 2; ++r) {
     std::string suffix = r == 0 ? "" : "_1";
-    reluCopyK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
+    reluCopyK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
     linearB(sb, R + "resblock1" + suffix, -1, sc2, L, 128, 128, true);
     gemm(sc2, P(R + "resblock2" + suffix + "/weights", -1), sb, L, 128, 128);
-    addBiasIntoK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(sc, sb, P(R + "resblock2" + suffix + "/bias", -1), L, 128);
+    addBiasIntoK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, P(R + "resblock2" + suffix + "/bias", -1), L, 128);
   }
-  reluCopyK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
+  reluCopyK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
   float* un = scratch<float>("sm.un", (size_t)L * 14);
   linearB(sb, R + "unnormalized_angles", -1, un, L, 128, 14);
   StructureOut o{act, rig, scratch<float>("sm.pos37", (size_t)L * 37 * 3), scratch<float>("sm.pos14", (size_t)L * 14 * 3),

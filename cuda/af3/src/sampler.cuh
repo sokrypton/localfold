@@ -87,6 +87,61 @@ __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const f
     noisy[a * 3 + d] = v + injected * gaussian(seeds[k], step, (a % atoms) * 3 + d);
   }
 }
+__global__ void __launch_bounds__(1024) centroidAugmentNoiseK(float* x, float* noisy, const float* mask, float* c,
+                                                              const float* rot, const uint64_t* seeds, uint32_t step,
+                                                              float injected, size_t atoms, float* noisyKeep = nullptr) {
+  __shared__ float s[4][32];
+  __shared__ float ck[3];
+  size_t k = blockIdx.x;
+  float* xs = x + k * atoms * 3;
+  float* ns = noisy + k * atoms * 3;
+  float* nk = noisyKeep ? noisyKeep + k * atoms * 3 : nullptr;
+  float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+  for (size_t i = threadIdx.x; i < atoms; i += blockDim.x)
+    if (mask[i]) { a0 += xs[i * 3]; a1 += xs[i * 3 + 1]; a2 += xs[i * 3 + 2]; a3 += 1; }
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int o = 16; o; o >>= 1) {
+    a0 += __shfl_xor_sync(~0u, a0, o);
+    a1 += __shfl_xor_sync(~0u, a1, o);
+    a2 += __shfl_xor_sync(~0u, a2, o);
+    a3 += __shfl_xor_sync(~0u, a3, o);
+  }
+  if (lane == 0) { s[0][warp] = a0; s[1][warp] = a1; s[2][warp] = a2; s[3][warp] = a3; }
+  __syncthreads();
+  if (warp == 0) {
+    int nw = blockDim.x >> 5;
+    float v0 = lane < nw ? s[0][lane] : 0.f;
+    float v1 = lane < nw ? s[1][lane] : 0.f;
+    float v2 = lane < nw ? s[2][lane] : 0.f;
+    float v3 = lane < nw ? s[3][lane] : 0.f;
+    for (int o = 16; o; o >>= 1) {
+      v0 += __shfl_xor_sync(~0u, v0, o);
+      v1 += __shfl_xor_sync(~0u, v1, o);
+      v2 += __shfl_xor_sync(~0u, v2, o);
+      v3 += __shfl_xor_sync(~0u, v3, o);
+    }
+    if (lane < 3) {
+      float cv = (lane == 0 ? v0 : lane == 1 ? v1 : v2) / (v3 + 1e-6f);
+      c[k * 3 + lane] = cv;
+      ck[lane] = cv;
+    }
+  }
+  __syncthreads();
+  const float* r = rot + k * 12;
+  float c0 = ck[0], c1 = ck[1], c2 = ck[2];
+  uint64_t seed = seeds[k];
+  for (size_t i = threadIdx.x; i < atoms; i += blockDim.x) {
+    float p0 = xs[i * 3] - c0, p1 = xs[i * 3 + 1] - c1, p2 = xs[i * 3 + 2] - c2;
+    bool live = mask[i] != 0;
+    for (int d = 0; d < 3; ++d) {
+      float v = live ? p0 * r[d] + p1 * r[3 + d] + p2 * r[6 + d] + r[9 + d] : 0.f;
+      xs[i * 3 + d] = v;
+      float nv = v + injected * gaussian(seed, step, i * 3 + d);
+      ns[i * 3 + d] = nv;
+      if (nk) nk[i * 3 + d] = nv;
+    }
+  }
+}
 __global__ void eulerK(float* x, const float* noisy, const float* denoised, float scale, size_t n3) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
@@ -219,10 +274,8 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
   for (int s = 1; s <= T; ++s) {
     double prev = levels[s - 1], level = levels[s], tHat = tHats[s - 1], dt = level - tHat;
     double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
-    centroidK<<<ns, 1024, 0, STREAM>>>(dX, dMask, atoms, dC);
-    augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12,
-                                                         dSeeds, (uint32_t)s, (float)injected, atoms, atoms * ns);
-    CK(cudaMemcpyAsync(dNoisy, dIn, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    centroidAugmentNoiseK<<<ns, 1024, 0, STREAM>>>(dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12,
+                                                   dSeeds, (uint32_t)s, (float)injected, atoms, dNoisy);
     const float* d1 = denoiseFn(dIn, (float)tHat, dLevels + 2 * (s - 1));
     if (s == 1 && STAGES) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
@@ -395,9 +448,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   for (int step = 1; step <= steps; ++step) {
     double previous = levels[step - 1], level = levels[step], tHat = tHats[step - 1];
     double injected = noiseScale * std::sqrt(std::max(0.0, tHat * tHat - previous * previous));
-    centroidK<<<ns, 1024, 0, STREAM>>>(dX, dMask, atoms, dC);
-    augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
-                                                         dSeeds, (uint32_t)step, (float)injected, atoms, atoms * ns);
+    centroidAugmentNoiseK<<<ns, 1024, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
+                                                   dSeeds, (uint32_t)step, (float)injected, atoms);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1 && STAGES) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);

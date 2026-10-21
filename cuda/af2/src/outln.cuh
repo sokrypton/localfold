@@ -38,8 +38,6 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   constexpr bool BFI = std::is_same_v<TI, __nv_bfloat16>;
   using M2 = std::conditional_t<BF, __nv_bfloat162, half2>;
   extern __shared__ __align__(16) unsigned char smem[];
-  __shared__ float sB[C], sS[C], sO[C];
-  for (int t = threadIdx.x; t < C; t += NTH) { sB[t] = bias[t]; sS[t] = lnS[t]; sO[t] = lnO[t]; }
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, rg = warp & 3, chh = warp >> 2;
   const size_t row0 = (size_t)blockIdx.x * R;
   auto As = [&](int s) { return (TI*)(smem + s * STG); };
@@ -111,11 +109,12 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
 #pragma unroll
   for (int nt = 0; nt < 16; ++nt) {
     const int col = chh * 128 + nt * 8 + tig * 2;
+    const float2 bf = *reinterpret_cast<const float2*>(bias + col);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       M2* p = reinterpret_cast<M2*>(V + (rg * 16 + g + 8 * h) * LDV + col);
       const float2 rf = ld2f(reinterpret_cast<const M*>(p));
-      const float a = acc[nt][2 * h] + sB[col] + rf.x, b = acc[nt][2 * h + 1] + sB[col + 1] + rf.y;
+      const float a = acc[nt][2 * h] + bf.x + rf.x, b = acc[nt][2 * h + 1] + bf.y + rf.y;
       if constexpr (BF) *p = __floats2bfloat162_rn(a, b); else *p = __floats2half2_rn(a, b);
     }
   }
@@ -123,6 +122,11 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   // a warp a row at a time: lane's 8 columns lane*8 .. +7
   constexpr int RPW = R / (NTH / 32);
   const int c0 = lane * 8;
+  float sc[8], of[8];
+  *reinterpret_cast<float4*>(sc) = *reinterpret_cast<const float4*>(lnS + c0);
+  *reinterpret_cast<float4*>(sc + 4) = *reinterpret_cast<const float4*>(lnS + c0 + 4);
+  *reinterpret_cast<float4*>(of) = *reinterpret_cast<const float4*>(lnO + c0);
+  *reinterpret_cast<float4*>(of + 4) = *reinterpret_cast<const float4*>(lnO + c0 + 4);
 #pragma unroll
   for (int i = 0; i < RPW; ++i) {
     const int r = warp + i * (NTH / 32);
@@ -146,8 +150,8 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     uint4 xo;
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      const float a = (v[2 * e] - mean) * inv * sS[c0 + 2 * e] + sO[c0 + 2 * e];
-      const float b = (v[2 * e + 1] - mean) * inv * sS[c0 + 2 * e + 1] + sO[c0 + 2 * e + 1];
+      const float a = (v[2 * e] - mean) * inv * sc[2 * e] + of[2 * e];
+      const float b = (v[2 * e + 1] - mean) * inv * sc[2 * e + 1] + of[2 * e + 1];
       if constexpr (std::is_same_v<TO, half>) reinterpret_cast<half2*>(&xo)[e] = __floats2half2_rn(a, b);
       else reinterpret_cast<__nv_bfloat162*>(&xo)[e] = __floats2bfloat162_rn(a, b);
     }

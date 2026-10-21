@@ -1716,25 +1716,47 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   denoiseOutK<<<blocks(total), 256, 0, STREAM>>>(positionsNoisy, upd, atomMask, out, total, atoms, noiseParams);
   return out;
 }
+__global__ void stepPreCopyK(float* __restrict__ dstNoise, const float* __restrict__ srcNoise,
+                             float4* __restrict__ dstSingle, const float4* __restrict__ srcSingle, size_t nSingle4,
+                             float4* __restrict__ dstSnProj, const float4* __restrict__ srcSnProj, size_t nSnProj4) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t == 0 && srcNoise) *dstNoise = *srcNoise;
+  if (t < nSingle4) dstSingle[t] = srcSingle[t];
+  if (t < nSnProj4) dstSnProj[t] = srcSnProj[t];
+}
 // One denoiser call. After a first (allocating) call the step is captured as a CUDA graph and
 // replayed: about 300 small launches become one.
 // With `deviceLevel`, the noise level is read from device memory, so a caller can enqueue steps
 // without waiting on the host.
 inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float noiseLevel,
                           const float* deviceLevel = nullptr) {
-  if (deviceLevel) {
-    if (!noiseParams) setNoise(noiseLevel);
-    CK(cudaMemcpyAsync(noiseParams, deviceLevel, 4, cudaMemcpyDeviceToDevice, STREAM));
-  } else setNoise(noiseLevel);
   if (f.usePre) {           // this step's precomputed conditioning, into the buffers the step reads
     auto at = std::find(f.preLevels.begin(), f.preLevels.end(), noiseLevel);
     if (at == f.preLevels.end()) { fprintf(stderr, "noise level %g was not precomputed\n", noiseLevel); exit(1); }
     size_t s = at - f.preLevels.begin(), n = f.n;
     int Cs = (int)M.meta("diffusion.conditioning.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
-    CK(cudaMemcpyAsync(scratch<float>("dc.single", n * Cs), f.preSingle + s * n * Cs, n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
-    CK(cudaMemcpyAsync(scratch<float>("dn.snProj", n * perToken), f.preSnProj + s * n * perToken, n * perToken * 4,
-                       cudaMemcpyDeviceToDevice, STREAM));
-  }
+    size_t nSingle = n * Cs, nSnProj = n * perToken;
+    float* dcSingle = scratch<float>("dc.single", nSingle);
+    float* dnSnProj = scratch<float>("dn.snProj", nSnProj);
+    if (deviceLevel && ((nSingle | nSnProj) & 3) == 0) {
+      if (!noiseParams) setNoise(noiseLevel);
+      size_t nS4 = nSingle >> 2, nP4 = nSnProj >> 2, mx4 = std::max(nS4, nP4);
+      stepPreCopyK<<<blocks(mx4), 256, 0, STREAM>>>(
+        noiseParams, deviceLevel,
+        reinterpret_cast<float4*>(dcSingle), reinterpret_cast<const float4*>(f.preSingle + s * nSingle), nS4,
+        reinterpret_cast<float4*>(dnSnProj), reinterpret_cast<const float4*>(f.preSnProj + s * nSnProj), nP4);
+    } else {
+      if (deviceLevel) {
+        if (!noiseParams) setNoise(noiseLevel);
+        CK(cudaMemcpyAsync(noiseParams, deviceLevel, 4, cudaMemcpyDeviceToDevice, STREAM));
+      } else setNoise(noiseLevel);
+      CK(cudaMemcpyAsync(dcSingle, f.preSingle + s * nSingle, nSingle * 4, cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(dnSnProj, f.preSnProj + s * nSnProj, nSnProj * 4, cudaMemcpyDeviceToDevice, STREAM));
+    }
+  } else if (deviceLevel) {
+    if (!noiseParams) setNoise(noiseLevel);
+    CK(cudaMemcpyAsync(noiseParams, deviceLevel, 4, cudaMemcpyDeviceToDevice, STREAM));
+  } else setNoise(noiseLevel);
   if (!GRAPHS || STAGES || f.calls++ == 0) return denoiseCore(f, positionsNoisy, noiseLevel);
   if (!f.graph || positionsNoisy != f.graphInput || NS != f.graphNs) {     // (a batch of another size: its own graph)
     if (f.graph) CK(cudaGraphExecDestroy(f.graph));
