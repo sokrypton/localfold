@@ -32,17 +32,29 @@ size_t lenW(const std::string& n);
 inline const float* Fin(const std::string& n) { return M.f(n); }
 inline const int* Iin(const std::string& n) { return M.i(n); }
 inline std::string num(int k) { return std::to_string(k); }
+// run1d for a kernel that splits its index with 32-bit arithmetic (bioemu2.metal's BE2_SPLIT): refused past 2^32 elements
+template <class A> void be2Run1d(const char* kernel, size_t n, const A& a) {
+  if (n >> 32) die("BioEmu2: %s over %zu elements (its index is 32-bit)", kernel, n);
+  run1d(kernel, n, a);
+}
 
 // Y [rows][out] (= beta Y +) X [rows][in] W for a named weight: linT a torch (out, in) one, linA an AF3 (in, out) one.
 // Its shape is checked against in and out - a transposed weight read as square is the bug this catches
-void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0);
-void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0);
+// HALF (the fast arm, the default; --f32 is the reference): float16 weights, X rounded as it is staged, float accumulation -
+// `wide` keeps an input that may pass float16's range in float
+extern bool HALF;
+void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
+          bool wide = false);
+void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
+          bool wide = false);
 void relu(const float* x, float* y, size_t n);
 void silu(const float* x, float* y, size_t n);
 // the vendor's SwiGLU transition (fc1 / fc2 / fc3, torch): out (+)= fc3(silu(fc1 x') fc2 x'), x' = LN(x) under `norm`
 // (p + "norm/weight", "norm/bias"); ldx: x's row stride
 void transition(const float* x, float* out, size_t rows, int C, const std::string& p, bool residual = true, bool norm = true,
                 int ldx = 0);
+// ...on the fast arm, from an input already in half (an adaLN that wrote it so): no norm
+void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
 void pairTransition(float* z, size_t rows, int C, const std::string& p);
 // AF3's triangle multiplication on the bundle's layout (leftNormInput, projection / gate [C][2C], centerNorm,
@@ -64,10 +76,14 @@ void windowBias(const float* pr, const float* normW, const float* projZ, float* 
 // windowed: the sliding-window atom attention over the windowed pair's bias, else the full token attention over [H][T][T].
 // The conditioning [Rc][6D] is reached through `map` (null: the identity); perSample rows a stacked sample
 // adaLN: y = LN(x) (1 + alpha) + beta, alpha / beta the conditioning's rows map(r) (stride ldc; map null: the identity)
-void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map);
+// (yh: the output in half instead - the fast arm's GEMM input, with no conversion pass between)
+void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
+           half* yh = nullptr);
 struct CondLayer { std::string p, att; bool windowed; int heads; };
 float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, const char* name);
-void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample);
+// biasH: the token attention's bias in half, log2 units - the fast arm runs it on metal/core's flash attention
+void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
+               const half* biasH = nullptr);
 void inputEmbedder(float* sInputs, int Si, const Tap& tap);
 
 // ---------------------------------------------------------------- the trunk (trunk.mm)
@@ -86,7 +102,8 @@ struct Denoiser {
   float* q0 = nullptr;         // [N, 128]
   float* p = nullptr;          // [N, 128, 16] the windowed pair
   float* wbias = nullptr;      // [layers][NW, 4, 32, 128]
-  float* tbias = nullptr;      // [layers][16, T, T]
+  float* tbias = nullptr;      // [layers][16, T, T] (the reference arm)
+  half* tbiasH = nullptr;      // [layers][16, T, T] in half, log2 units: metal/core's flash attention's (the fast arm)
   float* sc0 = nullptr;        // [T, 768] single_embed(LN [s_trunk | s_inputs]) (+ the lag's time embedding)
   float* a0 = nullptr;         // [T, 768] s_trunk_to_a(LN s_trunk)
   float dynGate = 0.f;         // the conditioning frame's gate (zero unconditioned)

@@ -146,7 +146,8 @@ void distogram(const float* z, float* logits) {
   const size_t P = (size_t)T * T;
   float* zs = scratch<float>("be2.dg.zs", P * C);
   run1d("be2_symmetrise", P * C, Be2SymmetriseArgs{z, zs, (uint)T, (uint)C});
-  linT(zs, "distogram_module/distogram/weight", logits, P, C, B);
+  // (wide: the RAW pair - its RMS is ~4.6e3 at 6MRR, and z + z^T passes float16's 65,504 - rounded to half it is inf)
+  linT(zs, "distogram_module/distogram/weight", logits, P, C, B, 0.f, 0, 0, true);
   addBias(logits, Wf("distogram_module/distogram/bias"), P, B);
 }
 // Boltz's 64 bins over 2-22 A: the bins whose lower edges (linspace(2, 22, 63)) are at most 8 A

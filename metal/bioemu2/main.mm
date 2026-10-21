@@ -22,7 +22,7 @@ namespace {
 double ms(double t0) { return (now() - t0) * 1e3; }
 
 struct Opts { std::string dir, oracle, out = "fold.pdb"; uint64_t seed = 0; int samples = 5, steps = 200, passes = 4;
-              double stepScale = -1; };
+              double stepScale = -1; bool profile = false; };
 
 double relRms(const float* a, const float* b, size_t n) {
   double num = 0, den = 0;
@@ -133,9 +133,11 @@ int foldInput(const Opts& o) {
   float* s = allocT<float>((size_t)T * Cs); float* z = allocT<float>(P * C);
   mt::sync();
   printf("inputs %.1f ms\n", ms(t0)); t0 = now();
+  if (o.profile) profileStart();
   for (int k = 0; k < o.passes; ++k) trunkPass(sInputs, Si, sInit, zInit, s, z);
   mt::sync();
   printf("trunk %.1f ms (%d passes)\n", ms(t0), o.passes); t0 = now();
+  if (o.profile) profileReport("trunk", 2000);
   release(sInit); release(zInit);
   const int B = dimW("distogram_module/distogram/weight", 0);
   float* logits = scratch<float>("be2.dg.logits", P * B);
@@ -147,6 +149,7 @@ int foldInput(const Opts& o) {
   printf("static context %.1f ms\n", ms(t0));
   if (o.samples > 0) {
     t0 = now();
+    if (o.profile) profileStart();
     SamplerSettings ss; ss.steps = o.steps;
     ss.stepScale = o.stepScale > 0 ? o.stepScale : equilibrium || chain ? 1.0 : 1.5;
     std::vector<std::vector<float>> out;
@@ -158,6 +161,7 @@ int foldInput(const Opts& o) {
       out = sample(d, ss, o.seed, o.samples);
     }
     printf("sampler %.1f ms (%d sample(s), %d steps)\n", ms(t0), (int)out.size(), ss.steps);
+    if (o.profile) profileReport("sampler", 2000);
     const std::string stem = o.out.size() > 4 && o.out.substr(o.out.size() - 4) == ".pdb" ? o.out.substr(0, o.out.size() - 4) : o.out;
     for (size_t k = 0; k < out.size(); ++k)
       writePdb(o.dir + "/pdb.template", k == 0 ? o.out : stem + "_sample-" + std::to_string(k) + ".pdb", out[k]);
@@ -176,7 +180,7 @@ int main(int argc, char** argv) {
   if (getenv("LOCALFOLD_METAL_SPECS_NAME")) { printf("%s\n", specsName("bioemu2").c_str()); return 0; }
   if (argc < 2 || !strncmp(argv[1], "--", 2)) {
     fprintf(stderr, "usage: localfold-bioemu2 <input dir> --bundle=<model-bioemu2-int5> [--oracle=<dir>] [--out=fold.pdb]"
-                    " [--samples=5] [--steps=200] [--seed=N] [--step-scale=S] [--passes=4]\n");
+                    " [--samples=5] [--steps=200] [--seed=N] [--step-scale=S] [--passes=4] [--f32] [--profile]\n");
     return 1;
   }
   Opts o; o.dir = argv[1];
@@ -191,13 +195,19 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--samples=", 10)) o.samples = atoi(a + 10);
     else if (!strncmp(a, "--step-scale=", 13)) o.stepScale = atof(a + 13);
     else if (!strncmp(a, "--passes=", 9)) o.passes = atoi(a + 9);
+    else if (!strcmp(a, "--f32")) HALF = false;            // (the float32 reference arm: what --oracle's float32 dump holds)
+    else if (!strcmp(a, "--profile")) o.profile = true;     // (every labelled dispatch timed: proportions, not speed)
     else { fprintf(stderr, "unknown flag %s\n", a); return 1; }
   }
   if (bundle.empty()) { fprintf(stderr, "--bundle=<dir holding the bioemu2 int5 bundle's manifest.json>\n"); return 1; }
   if (o.steps < 2) { fprintf(stderr, "BioEmu2 samples with at least 2 steps, got %d\n", o.steps); return 1; }
+  if (o.profile && !profiling()) setenv("LOCALFOLD_PROFILE", "1", 1);
   const double tStart = now();
   setSource("bioemu2", PORT_SOURCE);
-  M.loadBundle(bundle, "w");             // (every tensor decoded to float32: the reference arm)
+  // the weights decoded on the device: the large matrices straight to float16 on the fast arm (a vector, a table, a norm
+  // stays float32; anything an elementwise kernel reads as float gets a float32 copy on demand), every tensor float32
+  // on the reference arm
+  M.loadBundle(bundle, "w", [](const std::string&, size_t elements) { return HALF && elements >= 65536; });
   mt::sync();
   printf("weights up in %.2f s (%.2f GB)\n", now() - tStart, M.weightBytes() / 1e9);
   M.loadInput(o.dir);

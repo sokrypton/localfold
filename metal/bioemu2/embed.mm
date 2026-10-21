@@ -43,15 +43,46 @@ float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, cons
   if (const float* b = WfOpt(L.p + "cond_2/bias")) addBias(cond, b, Rc, 6 * D);
   return cond;
 }
-void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map) {
+void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
+           half* yh) {
   const size_t groups = (rows + 7) / 8;
   run("be2_ada_ln", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-      Be2AdaLnArgs{x, y, alpha, beta, map, rows, (uint)C, (uint)C, (uint)ldc, 1.f});
+      Be2AdaLnArgs{x, y, alpha, beta, map, rows, (uint)C, (uint)C, (uint)ldc, 1.f, yh});
 }
 // cond: [6D] a row - alpha_a, beta_a, gamma_a, alpha_m, beta_m, gamma_m
-void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample) {
+// the attention's q | k | v | g as one torch weight [4D][D] in half: proj_qkv's rows then proj_g's - the layout
+// metal/core's flash attention reads (per position q, k, v, g, each heads x head width)
+static const half* qkvgWeight(const std::string& a, int D) {
+  return M.derived<half>("qkvg:" + a, (size_t)4 * D * D, [&](half* out) {
+    run1d("be2_stack", (size_t)4 * D * D, Be2StackArgs{M.h("w/" + a + "proj_qkv/weight"), M.h("w/" + a + "proj_g/weight"), out,
+                                                       (u64)3 * D * D, (u64)D * D});
+  });
+}
+// the token attention on the fast arm: adaLN into half, q|k|v|g in one GEMM, metal/core's flash attention (the gate in
+// its epilogue: out = softmax(q k^T / sqrt(d) + bias) v sigmoid(g)), the output projection from half into h
+static void tokenAttentionHalf(const CondLayer& L, const float* x, float* h, int R, int D, const float* cond, const int* map,
+                               const half* biasH, int T) {
   const std::string a = L.p + L.att;
-  float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+  half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
+  adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh);
+  half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)R * 4 * D);
+  Gemm g{}; g.X = hh; g.tx = F16; g.W = qkvgWeight(a, D); g.tw = F16; g.transW = true; g.Y = qkvg; g.ty = F16;
+  g.rows = R; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = "token qkvg";
+  gemm(g);
+  half* o = scratch<half>("be2.cl.oh", (size_t)R * D);
+  Attention at{}; at.qkvg = qkvg; at.out = o; at.n = T; at.heads = L.heads; at.D = D / L.heads; at.rows = R / T;
+  at.scale = 1.f / sqrtf((float)(D / L.heads)); at.bias = biasH; at.biasStride = T; at.qBias = Wf(a + "proj_q_bias");
+  // (every token is real here - no token padding - so no key mask; a padded input would need token_pad_mask as float)
+  attention(at);
+  Gemm G{}; G.X = o; G.tx = F16; G.W = M.h("w/" + a + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = h; G.ty = F32;
+  G.rows = R; G.in = D; G.out = D; G.label = "token proj_o";
+  gemm(G);
+}
+// the attention half of a layer on the reference arm (and the windowed attention on both): adaLN, q|k|v and g, the
+// attention, the gate, the output projection into h
+static void attentionF32(const CondLayer& L, const float* x, float* h, int R, int D, const float* cond, const int* map,
+                         const float* bias, int perSample) {
+  const std::string a = L.p + L.att;
   adaLn(x, h, R, D, cond, cond + D, 6 * D, map);
   float* qkv = scratch<float>("be2.cl.qkv", (size_t)R * 3 * D);
   float* g = scratch<float>("be2.cl.g", (size_t)R * D);
@@ -72,11 +103,23 @@ void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, co
   }
   run1d("be2_sigmoid_mul", (size_t)R * D, Be2SigmoidMulArgs{o, g, o, (size_t)R * D});
   linT(o, a + "proj_o/weight", h, R, D, D);
-  run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
-  adaLn(x, h, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
+}
+void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
+               const half* biasH) {
+  float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+  if (biasH && !L.windowed) tokenAttentionHalf(L, x, h, R, D, cond, map, biasH, perSample);
+  else attentionF32(L, x, h, R, D, cond, map, bias, perSample);
+  be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
   float* t = scratch<float>("be2.cl.t", (size_t)R * D);
-  transition(h, t, R, D, L.p + "transition/", false, false);
-  run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
+  if (HALF) {
+    half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
+    adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh);
+    transitionHalf(hh, t, R, D, L.p + "transition/", false);
+  } else {
+    adaLn(x, h, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
+    transition(h, t, R, D, L.p + "transition/", false, false);
+  }
+  be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
 }
 
 // ---------------------------------------------------------------- the input embedder
@@ -105,7 +148,7 @@ void inputEmbedder(float* sInputs, int Si, const Tap& tap) {
   }
   const int A = dimW(IE + "atom_to_token_trans_0/weight", 0);
   float* h = scratch<float>("be2.ie.h", (size_t)N * A);
-  linT(q, IE + "atom_to_token_trans_0/weight", h, N, C, A);
+  linT(q, IE + "atom_to_token_trans_0/weight", h, N, C, A, 0.f, 0, 0, true);     // (wide: q is raw)
   relu(h, h, (size_t)N * A);
   run1d("be2_mean_atoms", (size_t)T * A, Be2MeanAtomsArgs{h, TOK_START, sInputs, (uint)T, (uint)A, (uint)Si, 0});
   run1d("be2_s_inputs_tail", (size_t)T * 71, Be2SInputsTailArgs{sInputs, Iin("res_type"), Fin("profile"), Fin("deletion_mean"),

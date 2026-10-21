@@ -30,7 +30,9 @@ struct Be2SigmoidMulArgs { CP(float) h; CP(float) g; DP(float) y; u64 n; };     
 struct Be2GatedAddArgs { DP(float) x; CP(float) h; CP(float) gate; CP(int) map; u64 rows; uint C, ldg; };
 // adaLN: y = scale (LN(x) (1 + alpha) + beta), alpha / beta rows map(r) of the conditioning (stride ldc); a simdgroup a row
 struct Be2AdaLnArgs { CP(float) x; DP(float) y; CP(float) alpha; CP(float) beta; CP(int) map; u64 rows; uint C, ldx, ldc;
-                      float scale; };
+                      float scale; DP(half) yh; };         // (yh: written in half instead of y)
+// the vendor's fc1 / fc2 [I][C] (torch) as gemmSwiglu's one weight [C][2I]: blocks of 8, a_0..a_7 b_0..b_7 a_8.., b = fc2 / S
+struct Be2SwigluWArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I; float invS; uint pad0; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };
 struct Be2CentreAtomsArgs { CP(float) atom; CP(int) centre; DP(float) out; uint T, N, C, ldo, samples, pad0; };
@@ -56,7 +58,10 @@ struct Be2PwaApplyArgs { CP(float) w; CP(float) v; DP(float) o; u64 S; uint T, H
 struct Be2OpmArgs { CP(float) proj; DP(float) y; u64 S; uint T, Co, i0, bi; float inv; uint pad0; };
 struct Be2SymmetriseArgs { CP(float) z; DP(float) zs; uint T, C; };
 struct Be2ContactArgs { CP(float) logits; DP(float) out; u64 pairs; uint bins, near; };
-struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; };               // [pairs][H] -> [H][pairs]
+struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) outh; float mul; uint pad0; };
+                                                    // [pairs][H] -> [H][pairs] (outh: in half, times mul - log2 e)
+// rows of two torch weights stacked into one [(r1 + r2)][C] half weight
+struct Be2StackArgs { CP(half) a; CP(half) b; DP(half) out; u64 na, nb; };
 
 // ---------------------------------------------------------------- the denoiser
 struct Be2ScaleMaskedArgs { CP(float) x; CP(int) mask; DP(float) r; u64 N, n; float s; uint pad0; };

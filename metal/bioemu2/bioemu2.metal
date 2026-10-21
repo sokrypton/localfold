@@ -7,6 +7,10 @@ constant float BE2_NEG_INF = -1e6f;                       // the vendor's -INF (
 // a simdgroup a row, eight rows a threadgroup of 256 (metal/core's LayerNorm's dispatch)
 #define BE2_ROW ((ulong)(_tg.y * _ng.x + _tg.x) * 8 + (_tid >> 5))
 #define BE2_LANE (_tid & 31)
+// an element index split by a runtime width without a 64-bit division (Apple's GPUs have no integer divider: `ulong / d`
+// is a long software routine - tokens_to_atoms took 0.94 ms for 2.2 M elements). The host keeps these tensors under
+// 2^32 elements (be2Run1d)
+#define BE2_SPLIT(t, d, q, r) uint q = lf_udiv((uint)(t), (d)), r = (uint)(t) - q * (d)
 
 // ---------------------------------------------------------------- the atoms and their windowed pair
 // c = proj_atom_continuous([ref, charge]) + embed_element[element] + sum_q embed_atom_name_chars_q[name[q]], zero on padding
@@ -173,9 +177,9 @@ kernel void be2_sigmoid_mul(LF_ARGS(Be2SigmoidMulArgs)) {
 kernel void be2_gated_add(LF_ARGS(Be2GatedAddArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.C) return;
-  ulong r = t / a.C; uint c = (uint)(t % a.C);
-  ulong g = a.map ? (ulong)a.map[r] : r;
-  a.x[t] += a.gate[g * a.ldg + c] * a.h[t];
+  BE2_SPLIT(t, a.C, r, c);
+  uint g = a.map ? (uint)a.map[r] : r;
+  a.x[t] += a.gate[(ulong)g * a.ldg + c] * a.h[t];
 }
 kernel void be2_ada_ln(LF_ARGS(Be2AdaLnArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
@@ -188,23 +192,35 @@ kernel void be2_ada_ln(LF_ARGS(Be2AdaLnArgs)) {
   v = simd_sum(v);
   float inv = rsqrt(v / a.C + 1e-5f);
   const ulong cr = a.map ? (ulong)a.map[row] : row;
-  for (uint c = lane; c < a.C; c += 32)
-    a.y[row * a.C + c] = a.scale * ((xr[c] - mean) * inv * (1.f + a.alpha[cr * a.ldc + c]) + a.beta[cr * a.ldc + c]);
+  for (uint c = lane; c < a.C; c += 32) {
+    const float v = a.scale * ((xr[c] - mean) * inv * (1.f + a.alpha[cr * a.ldc + c]) + a.beta[cr * a.ldc + c]);
+    if (a.yh) a.yh[row * a.C + c] = (half)v; else a.y[row * a.C + c] = v;
+  }
+}
+kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
+  ulong t = LF_INDEX;
+  const uint W = 2 * a.I;
+  if (t >= (ulong)a.C * W) return;
+  BE2_SPLIT(t, W, k, col);
+  const uint m = col >> 4, q = col & 15, j = 8 * m + (q & 7);
+  a.out[t] = q < 8 ? a.w1[(ulong)j * a.C + k] : (half)((float)a.w2[(ulong)j * a.C + k] * a.invS);
 }
 // a token tensor's rows broadcast to its atoms (zero on padding atoms), samples stacked
 kernel void be2_tokens_to_atoms(LF_ARGS(Be2TokensToAtomsArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.samples * a.N * a.C) return;
-  ulong at = t / a.C, s = at / a.N, al = at % a.N; uint c = (uint)(t % a.C);
-  float v = a.pad[al] ? a.tok[(s * a.T + a.atomTok[al]) * a.C + c] : 0.f;
-  a.out[at * a.ldo + c] = a.beta == 0.f ? v : a.beta * a.out[at * a.ldo + c] + v;
+  BE2_SPLIT(t, a.C, at, c);
+  BE2_SPLIT(at, (uint)a.N, s, al);
+  float v = a.pad[al] ? a.tok[((ulong)s * a.T + a.atomTok[al]) * a.C + c] : 0.f;
+  a.out[(ulong)at * a.ldo + c] = a.beta == 0.f ? v : a.beta * a.out[(ulong)at * a.ldo + c] + v;
 }
 // each token's centre atom (every token is real here: no token padding)
 kernel void be2_centre_atoms(LF_ARGS(Be2CentreAtomsArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.samples * a.T * a.C) return;
-  ulong i = t / a.C, s = i / a.T, il = i % a.T; uint c = (uint)(t % a.C);
-  a.out[i * a.ldo + c] = a.atom[(s * a.N + a.centre[il]) * a.C + c];
+  BE2_SPLIT(t, a.C, i, c);
+  BE2_SPLIT(i, a.T, s, il);
+  a.out[(ulong)i * a.ldo + c] = a.atom[((ulong)s * a.N + a.centre[il]) * a.C + c];
 }
 // scatter_mean_atoms_to_tokens: per token, the mean over its real atoms (+1e-6 in the count)
 kernel void be2_mean_atoms(LF_ARGS(Be2MeanAtomsArgs)) {
@@ -350,13 +366,22 @@ kernel void be2_token_bias(LF_ARGS(Be2TokenBiasArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.T * a.T * a.H) return;
   uint h = (uint)(t % a.H); ulong ij = t / a.H;
-  a.out[(ulong)h * a.T * a.T + ij] = a.proj[t];
+  if (a.outh) a.outh[(ulong)h * a.T * a.T + ij] = (half)(a.proj[t] * a.mul);
+  else a.out[(ulong)h * a.T * a.T + ij] = a.proj[t];
+}
+kernel void be2_stack(LF_ARGS(Be2StackArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.na) a.out[t] = a.a[t];
+  else if (t < a.na + a.nb) a.out[t] = a.b[t - a.na];
 }
 
 // ---------------------------------------------------------------- the denoiser
 kernel void be2_scale_masked(LF_ARGS(Be2ScaleMaskedArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n * 3) a.r[t] = a.mask[(t / 3) % a.N] ? a.x[t] * a.s : 0.f;
+  if (t >= a.n * 3) return;
+  BE2_SPLIT(t / 3, (uint)a.N, s, at);
+  (void)s;
+  a.r[t] = a.mask[at] ? a.x[t] * a.s : 0.f;
 }
 kernel void be2_edm_out(LF_ARGS(Be2EdmOutArgs)) {
   ulong t = LF_INDEX;
@@ -368,7 +393,10 @@ kernel void be2_cos_embed(LF_ARGS(Be2CosEmbedArgs)) {
 }
 kernel void be2_broadcast_add(LF_ARGS(Be2BroadcastAddArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.rows * a.C) a.y[t] += a.v[t % a.C];
+  if (t >= a.rows * a.C) return;
+  BE2_SPLIT(t, a.C, r, c);
+  (void)r;
+  a.y[t] += a.v[c];
 }
 kernel void be2_scaled_add(LF_ARGS(Be2ScaledAddArgs)) {
   ulong t = LF_INDEX;
@@ -376,5 +404,8 @@ kernel void be2_scaled_add(LF_ARGS(Be2ScaledAddArgs)) {
 }
 kernel void be2_repeat(LF_ARGS(Be2RepeatArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.total) a.dst[t] = a.src[t % a.elems];
+  if (t >= a.total) return;
+  BE2_SPLIT(t, (uint)a.elems, k, e);
+  (void)k;
+  a.dst[t] = a.src[e];
 }

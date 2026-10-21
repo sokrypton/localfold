@@ -71,7 +71,7 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
 |---|---|---|---|---|
 | CUDA (Colab, `localfold-bioemu2`) | `cuda/bioemu2`, `cuda/bioemu2/gate.py` | 1.6e-6 .. 3.6e-6 relRMS on six targets; `--fast` (f16 GEMMs, ef2's fused trunk) 1.7e-3 .. 3.2e-3; int8 blob 5-7e-3 trunk, which is the quantisation (decoded tensors match colab's dequantiser to four digits) | 6MRR single sequence 2.78-3.04 A over 5 samples, mean 2.88 - colab's own 2.88-3.20, mean 3.06; bonds against the CCD ideals equal to colab's (mainchain 0.034, side chains 0.052, nucleic 0.037 vs 0.036, ligand + SEP 0.084 vs 0.077) | 5 samples x 200 steps: 71 tokens 3.3 s, 255 tokens 7.0 s, 494 tokens 13.2 s; warm `--serve` trunk 100 ms at 6MRR |
 | WebGPU (the page) | `webgpu/bioemu2`, `tools/gpu/check-bioemu2-network.js`, `tools/gpu/fold-bioemu2.js`; bundle `bioemu2-int5` (372 MB) | trunk single ~1e-7, pair 2.4-3.1e-4 (the AF3 pair track's float32 band over 52 blocks), denoise 2.6e-7 .. 4.2e-6, propagation 6e-7 .. 1.1e-6; int5 pair 2.6e-2, denoise 6.2e-2 at sigma 160 falling to 1.9e-3 | 6MRR (68) 0.90 / 1.58 / 1.65 A float32, 0.89 / 1.59 / 1.64 int5 on the same seed | 68 residues 1 sample 13.7 s on the page (32 ms a denoiser call), 255 residues 27.7 s |
-| Metal (this Mac, `localfold-bioemu2`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) 1.57-1.71 A over 5 samples, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, float32 reference arm: 5 samples x 200 steps at 68 tokens, trunk 2.3 s, sampler 55 s |
+| Metal (this Mac, `localfold-bioemu2`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) 1.57-1.71 A over 5 samples, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, 5 samples x 200 steps at 68 tokens: the fast arm (default) trunk 1.6 s, sampler 15.8 s; the float32 arm (`--f32`) 2.3 s / 55 s |
 
 🔴 **THE 6MRR FIXTURE IS 71 RESIDUES, NOT 68**: it was read off every CA line of the crystal, which repeats K14, E43
 and D64 at their alternate locations. The oracle dumps share it, so parity is unaffected; RMSD to the crystal uses
@@ -102,6 +102,18 @@ inputs), not a blind comparison.
 🔴 **WEBGPU'S TWO ARMS ARE 1e-3 APART, WHICH IS WHAT A BUG IS NOT.** Float16 weights and the device's pair track move
 the pair 7e-4 .. 1.2e-3, the distogram 4e-3 and the denoiser 1.8e-3 .. 6.1e-3 (2e-5 on the single, which never meets
 float16). A port defect reads O(1); measure that band before deciding a residual is one.
+
+🔴 **THE FAST ARM'S SwiGLU PRODUCTS ARE STORED AS g / 64, BECAUSE FLOAT16 CANNOT HOLD THEM.** cuda/bioemu2 met the
+atom transition's (87,750, past 65,504) and took bf16; metal/core has no bf16. Measured here over three jobs, the largest
+product per module: the coupling's `s_to_q_mixer` **268,272** - four times float16's range, and not the one CUDA named -
+the atom transition 84,467, the MSA transition 25,943, the pair transitions 9,845, the rest under 2,000; nearly identical
+on every job, so properties of the weights. A power of two folded into fc2's rows of the derived weight and undone by
+fc3's alpha is exact; /64 leaves 15x headroom. Varied over S = 8, 64, 512 the denoiser's residual moves without trend
+(7.4e-3 .. 8.7e-3 at sigma 160): float16 noise, not the scale. Every GEMM whose input is NOT normalised (the distogram
+reads the raw pair, RMS ~4.6e3; the readout the raw streams) multiplies in float instead - rounded to half they were inf,
+and an inf in a PADDING atom's row meets an attention weight of exactly 0 as NaN (cuda/bioemu2's staging saturates,
+metal/core's does not). The fast arm against the float32 oracle: trunk pair 2.5e-4, denoiser 3.2e-3 .. 6.9e-3 - WebGPU's
+own float16 arm is 1.8e-3 .. 6.1e-3 from its float32 one - and 6MRR (68) folds to the same 1.61 A.
 
 🔴 **THE DUMPER RUNS IN CHROME, NOT NODE, THOUGH webgpu/node.js EXISTS**: Dawn's node binding here has no `device.tick`
 and its `mapAsync` never settles, so a node run exits 0 having written nothing - which is why nothing else in the tree
