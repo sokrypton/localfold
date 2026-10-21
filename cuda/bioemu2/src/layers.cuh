@@ -58,44 +58,90 @@ __global__ void pairGeometryK(const float* ref, const int* uid, const int* pad, 
     o[c] = (wPos[c * 3] * d[0] + wPos[c * 3 + 1] * d[1] + wPos[c * 3 + 2] * d[2] + wDist[c] * inv + wMask[c] * same) * same;
 }
 // broadcast_token_pair_to_atom_window: pr += zp[tok_q, tok_k], zero where either atom is padding
-__global__ void pairTokenAddK(const float* zp, const int* atomTok, const int* pad, float* pr, int N, int T, int CP) {
+__global__ void pairTokenAddK(const float* __restrict__ zp, const int* __restrict__ atomTok,
+                              const int* __restrict__ pad, float* __restrict__ pr, int N, int T, int CP) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)N * WK) return;
-  int j = (int)(t % WK); size_t qa = t / WK; int w = (int)(qa / WQ);
+  int j = (int)(t & (WK - 1)); size_t qa = t / WK; int w = (int)(qa / WQ);
   int ka = w * WQ - CTX + j;
   if (ka < 0 || ka >= N || !pad[ka] || !pad[qa]) return;
   const float* z = zp + ((size_t)atomTok[qa] * T + atomTok[ka]) * CP;
   float* o = pr + t * CP;
+  if (CP == 16 && (((uintptr_t)zp | (uintptr_t)pr) & 15) == 0) {
+    const float4* z4 = reinterpret_cast<const float4*>(z);
+    float4* o4 = reinterpret_cast<float4*>(o);
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      float4 ov = o4[k], zv = __ldg(z4 + k);
+      o4[k] = make_float4(ov.x + zv.x, ov.y + zv.y, ov.z + zv.z, ov.w + zv.w);
+    }
+    return;
+  }
   for (int c = 0; c < CP; ++c) o[c] += z[c];
 }
 // _atom_pair_tail: pr += cq[q] + ck[k] (ck zero past the edge), then pr += p_mlp(pr), three ReLU-Linear layers
 // (16 channels, no biases)
-__global__ void pairTailK(float* pr, const float* cq, const float* ck, const float* w1, const float* w3,
-                          const float* w5, int N) {
+__global__ void pairTailK(float* __restrict__ pr, const float* __restrict__ cq, const float* __restrict__ ck,
+                          const float* __restrict__ w1, const float* __restrict__ w3,
+                          const float* __restrict__ w5, int N) {
   constexpr int CP = 16;
-  __shared__ float sw[3][CP * CP];
-  for (int k = threadIdx.x; k < CP * CP; k += blockDim.x) { sw[0][k] = w1[k]; sw[1][k] = w3[k]; sw[2][k] = w5[k]; }
+  __shared__ float4 sw4[3][CP * (CP / 4)];
+  for (int k = threadIdx.x; k < CP * (CP / 4); k += blockDim.x) {
+    sw4[0][k] = __ldg(reinterpret_cast<const float4*>(w1) + k);
+    sw4[1][k] = __ldg(reinterpret_cast<const float4*>(w3) + k);
+    sw4[2][k] = __ldg(reinterpret_cast<const float4*>(w5) + k);
+  }
   __syncthreads();
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)N * WK) return;
-  int j = (int)(t % WK); size_t qa = t / WK; int w = (int)(qa / WQ);
+  int j = (int)(t & (WK - 1)); size_t qa = t / WK; int w = (int)(qa / WQ);
   int ka = w * WQ - CTX + j;
-  float p[CP], h[CP], g[CP];
-  float* o = pr + t * CP;
-  for (int c = 0; c < CP; ++c) p[c] = o[c] + cq[qa * CP + c] + (ka >= 0 && ka < N ? ck[(size_t)ka * CP + c] : 0.f);
-  for (int l = 0; l < 3; ++l) {
-    const float* src = l == 0 ? p : l == 1 ? h : g;
-    float* dst = l == 0 ? h : l == 1 ? g : h;
-    float in[CP]; for (int c = 0; c < CP; ++c) in[c] = fmaxf(src[c], 0.f);
-    for (int r = 0; r < CP; ++r) { float s = 0; for (int c = 0; c < CP; ++c) s += sw[l][r * CP + c] * in[c]; dst[r] = s; }
+  bool kOk = (ka >= 0 && ka < N);
+  float4 p4[4], h4[4];
+  float4* o4 = reinterpret_cast<float4*>(pr + t * CP);
+  const float4* cq4 = reinterpret_cast<const float4*>(cq + qa * CP);
+  const float4* ck4 = kOk ? reinterpret_cast<const float4*>(ck + (size_t)ka * CP) : nullptr;
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float4 ov = o4[k], qv = __ldg(cq4 + k);
+    float4 kv = kOk ? __ldg(ck4 + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+    p4[k] = make_float4(ov.x + qv.x + kv.x, ov.y + qv.y + kv.y, ov.z + qv.z + kv.z, ov.w + qv.w + kv.w);
+    h4[k] = p4[k];
   }
-  for (int c = 0; c < CP; ++c) o[c] = p[c] + h[c];
+  #pragma unroll
+  for (int l = 0; l < 3; ++l) {
+    float4 in4[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      in4[k] = make_float4(fmaxf(h4[k].x, 0.f), fmaxf(h4[k].y, 0.f), fmaxf(h4[k].z, 0.f), fmaxf(h4[k].w, 0.f));
+    }
+    float out[CP];
+    #pragma unroll
+    for (int r = 0; r < CP; ++r) {
+      float s = 0.f;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float4 wv = sw4[l][r * 4 + k];
+        s += wv.x * in4[k].x + wv.y * in4[k].y + wv.z * in4[k].z + wv.w * in4[k].w;
+      }
+      out[r] = s;
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      h4[k] = make_float4(out[k * 4 + 0], out[k * 4 + 1], out[k * 4 + 2], out[k * 4 + 3]);
+    }
+  }
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    o4[k] = make_float4(p4[k].x + h4[k].x, p4[k].y + h4[k].y, p4[k].z + h4[k].z, p4[k].w + h4[k].w);
+  }
 }
 inline void pairTail(const std::string& p, float* pr, const float* c, int N) {
   const int C = dimP(p + "c_to_p_trans_q_1/weight", 1), CP = dimP(p + "c_to_p_trans_q_1/weight", 0);
   if (CP != 16) { fprintf(stderr, "BioEmu2: an atom pair of %d channels (this port is written for 16)\n", CP); exit(1); }
   float* rc = scratch<float>("be2.pt.relu", (size_t)N * C);
-  reluK<<<blocks((size_t)N * C), 256, 0, STREAM>>>(c, rc, (size_t)N * C);
+  size_t nc = (((size_t)N * C & 3) == 0 && (((uintptr_t)c | (uintptr_t)rc) & 15) == 0) ? ((size_t)N * C) >> 2 : (size_t)N * C;
+  reluK<<<blocks(nc), 256, 0, STREAM>>>(c, rc, (size_t)N * C);
   float* cq = scratch<float>("be2.pt.cq", (size_t)N * CP); float* ck = scratch<float>("be2.pt.ck", (size_t)N * CP);
   linear(rc, P(p + "c_to_p_trans_q_1/weight"), cq, N, C, CP);
   linear(rc, P(p + "c_to_p_trans_k_1/weight"), ck, N, C, CP);
@@ -111,18 +157,31 @@ inline void pairGeometry(const std::string& p, float* pr, int N) {
 
 // ---------------------------------------------------------------- pair biases
 // the windowed pair's bias, LN(pr) (scale, no offset) -> proj_z, heads first: out[w][h][i][j]
-__global__ void windowBiasK(const float* pr, const float* normW, const float* projZ, float* out, int N, int H) {
+__global__ void windowBiasK(const float* __restrict__ pr, const float* __restrict__ normW,
+                            const float* __restrict__ projZ, float* __restrict__ out, int N, int H) {
   constexpr int CP = 16;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)N * WK) return;
-  int j = (int)(t % WK); size_t qa = t / WK; int w = (int)(qa / WQ), i = (int)(qa % WQ);
-  const float* x = pr + t * CP;
-  float mean = 0; for (int c = 0; c < CP; ++c) mean += x[c]; mean /= CP;
-  float var = 0; for (int c = 0; c < CP; ++c) { float d = x[c] - mean; var += d * d; }
-  float inv = rsqrtf(var / CP + 1e-5f);
-  float n[CP]; for (int c = 0; c < CP; ++c) n[c] = (x[c] - mean) * inv * normW[c];
+  int j = (int)(t & (WK - 1)); size_t qa = t / WK; int w = (int)(qa / WQ), i = (int)(qa % WQ);
+  const float4* x4 = reinterpret_cast<const float4*>(pr + t * CP);
+  float4 v0 = __ldg(x4 + 0), v1 = __ldg(x4 + 1), v2 = __ldg(x4 + 2), v3 = __ldg(x4 + 3);
+  float mean = (v0.x + v0.y + v0.z + v0.w + v1.x + v1.y + v1.z + v1.w
+              + v2.x + v2.y + v2.z + v2.w + v3.x + v3.y + v3.z + v3.w) * (1.f / 16.f);
+  float x[CP] = {v0.x - mean, v0.y - mean, v0.z - mean, v0.w - mean,
+                 v1.x - mean, v1.y - mean, v1.z - mean, v1.w - mean,
+                 v2.x - mean, v2.y - mean, v2.z - mean, v2.w - mean,
+                 v3.x - mean, v3.y - mean, v3.z - mean, v3.w - mean};
+  float var = 0.f;
+  #pragma unroll
+  for (int c = 0; c < CP; ++c) var += x[c] * x[c];
+  float inv = rsqrtf(var * (1.f / 16.f) + 1e-5f);
+  float n[CP];
+  #pragma unroll
+  for (int c = 0; c < CP; ++c) n[c] = x[c] * inv * __ldg(normW + c);
   for (int h = 0; h < H; ++h) {
-    float s = 0; for (int c = 0; c < CP; ++c) s += projZ[h * CP + c] * n[c];
+    float s = 0.f;
+    #pragma unroll
+    for (int c = 0; c < CP; ++c) s += __ldg(projZ + h * CP + c) * n[c];
     out[(((size_t)w * H + h) * WQ + i) * WK + j] = s;
   }
 }

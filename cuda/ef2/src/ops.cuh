@@ -68,6 +68,11 @@ __device__ __forceinline__ void fastSincosD(double angle, float* sOut, float* cO
   *sOut = (float)sinA;
   *cOut = (float)cosA;
 }
+__device__ __forceinline__ float fastCosF(float angle) {
+  float s, c;
+  fastSincosD((double)angle, &s, &c);
+  return c;
+}
 
 inline void addBias(float* y, const float* b, size_t rows, int C) {
   size_t n = ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) ? rows * (size_t)(C >> 2) : rows * C;

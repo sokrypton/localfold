@@ -147,14 +147,34 @@ __global__ void edmOutK(const float* x, const float* out, float* d, size_t n, fl
 }
 __global__ void cosEmbedK(const float* w, const float* b, float* out, float t, int n) {
   int k = blockIdx.x * blockDim.x + threadIdx.x;
-  if (k < n) out[k] = cosf(2.f * (float)M_PI * (t * w[k] + b[k]));
+  if (k < n) out[k] = fastCosF(2.f * (float)M_PI * (t * w[k] + b[k]));
 }
-__global__ void broadcastAddK(float* y, const float* v, size_t rows, int C) {
+__global__ void broadcastAddK(float* __restrict__ y, const float* __restrict__ v, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)v) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t < n4) {
+      int col4 = (int)(t % (size_t)c4);
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 vv = __ldg(reinterpret_cast<const float4*>(v) + col4);
+      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + vv.x, yv.y + vv.y, yv.z + vv.z, yv.w + vv.w);
+    }
+    return;
+  }
   if (t < rows * C) y[t] += v[t % C];
 }
-__global__ void scaledAddK(float* y, const float* x, float s, size_t n) {
+__global__ void scaledAddK(float* __restrict__ y, const float* __restrict__ x, float s, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)y | (uintptr_t)x) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 xv = __ldg(reinterpret_cast<const float4*>(x) + t);
+      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + s * xv.x, yv.y + s * xv.y, yv.z + s * xv.z, yv.w + s * xv.w);
+    }
+    return;
+  }
   if (t < n) y[t] += s * x[t];
 }
 

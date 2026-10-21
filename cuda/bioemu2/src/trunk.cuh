@@ -80,7 +80,8 @@ inline void inputEmbedder(float* sInputs, int Si, const std::function<void(const
   const int A = dimP(IE + "atom_to_token_trans_0/weight", 0);
   float* h = scratch<float>("be2.ie.h", (size_t)N * A);
   linear(q, P(IE + "atom_to_token_trans_0/weight"), h, N, C, A);
-  reluK<<<blocks((size_t)N * A), 256, 0, STREAM>>>(h, h, (size_t)N * A);
+  size_t na = (size_t)N * A;
+  reluK<<<blocks(((na & 3) == 0 && (((uintptr_t)h & 15) == 0)) ? (na >> 2) : na), 256, 0, STREAM>>>(h, h, na);
   meanAtomsK<<<blocks((size_t)T * A), 256, 0, STREAM>>>(h, TOK_START, sInputs, T, A, Si);
   sInputsTailK<<<blocks((size_t)T * 71), 256, 0, STREAM>>>(sInputs, Idev("res_type"), Fdev("profile"),
       Fdev("deletion_mean"), Idev("pocket_feature"), T, A, Si);
@@ -93,23 +94,35 @@ __global__ void zInitTermsK(float* z, const float* rows, const float* cols, cons
                             const float* bonds, const float* wBond, const int* cls, const float* thr, const float* enc,
                             const float* encB, const float* unspec, const float* unsel, const float* fw, const float* fb,
                             int T, int C) {
+  __shared__ float shCos[256];
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  size_t total = (size_t)T * T * C;
+  int c = (int)(t % C); size_t ij = t / C;
+  bool valid = t < total;
+  int k = valid ? cls[ij] : 0;
+  float th = (valid && k > 1) ? (thr[ij] - 4.f) / 16.f : 0.f;
+  if (C == 256 && blockDim.x == 256 && k > 1) {
+    shCos[threadIdx.x] = fastCosF(2.f * (float)M_PI * (th * fw[threadIdx.x] + fb[threadIdx.x]));
+  }
+  __syncthreads();
+  if (!valid) return;
+  int i = (int)(ij / T), j = (int)(ij % T);
   float v = rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
   v += methPair[(size_t)meth[i] * C + c] + methPair[(size_t)meth[j] * C + c];
   v += bonds[ij] * wBond[c];
   // the contact conditioning: x = encoder([cc[2:], thr', cos 2 pi (w thr' + b)]) for a class past UNSELECTED, and
   // the class's own vector for UNSPECIFIED (0) and UNSELECTED (1)
-  int k = cls[ij];
   if (k == 0) v += unspec[c];
   else if (k == 1) v += unsel[c];
   else {
     const int W = 3 + 1 + C;
-    float th = (thr[ij] - 4.f) / 16.f;
     const float* row = enc + (size_t)c * W;
     float e = encB[c] + row[k - 2] + row[3] * th;
-    for (int f = 0; f < C; ++f) e += row[4 + f] * cosf(2.f * (float)M_PI * (th * fw[f] + fb[f]));
+    if (C == 256 && blockDim.x == 256) {
+      for (int f = 0; f < 256; ++f) e += row[4 + f] * shCos[f];
+    } else {
+      for (int f = 0; f < C; ++f) e += row[4 + f] * fastCosF(2.f * (float)M_PI * (th * fw[f] + fb[f]));
+    }
     v += e;
   }
   z[t] = v;
@@ -143,12 +156,34 @@ inline void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit,
 // ---------------------------------------------------------------- the triangle multiplication
 // TriangleMultiplicationFull (Boltz-2): zn = LN(z); proj = p_in(zn) sigmoid(g_in(zn)) (masked), a | b its halves;
 // outgoing sum_k a[i,k] b[j,k], incoming sum_k a[k,i] b[k,j]; z += p_out(LN(out)) sigmoid(g_out(zn))
-__global__ void triSplitK(const float* proj, const float* gate, float* a, float* b, size_t pairs, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= pairs * 2 * C) return;
-  int c2 = (int)(t % (2 * C)); size_t ij = t / (2 * C);
-  float v = proj[t] * sigm(gate[t]);
-  if (c2 < C) a[(size_t)c2 * pairs + ij] = v; else b[(size_t)(c2 - C) * pairs + ij] = v;
+__global__ void triSplitK(const float* __restrict__ proj, const float* __restrict__ gate,
+                          float* __restrict__ a, float* __restrict__ b, size_t pairs, int C) {
+  __shared__ float ta[32][33], tb[32][33];
+  size_t ij0 = (size_t)blockIdx.x * 32;
+  int c0 = blockIdx.y * 32;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  #pragma unroll
+  for (int r = 0; r < 32; r += 8) {
+    size_t ij = ij0 + ty + r;
+    int c = c0 + tx;
+    if (ij < pairs && c < C) {
+      size_t idxA = ij * (size_t)(2 * C) + c;
+      size_t idxB = idxA + C;
+      ta[ty + r][tx] = __ldg(proj + idxA) * sigm(__ldg(gate + idxA));
+      tb[ty + r][tx] = __ldg(proj + idxB) * sigm(__ldg(gate + idxB));
+    }
+  }
+  __syncthreads();
+  size_t ij = ij0 + tx;
+  #pragma unroll
+  for (int r = 0; r < 32; r += 8) {
+    int c = c0 + ty + r;
+    if (ij < pairs && c < C) {
+      size_t outIdx = (size_t)c * pairs + ij;
+      a[outIdx] = ta[tx][ty + r];
+      b[outIdx] = tb[tx][ty + r];
+    }
+  }
 }
 inline void trimul(float* z, const std::string& p, int l, bool outgoing) {
   const int T = D_.T, C = 256; size_t Pn = (size_t)T * T;
@@ -159,7 +194,8 @@ inline void trimul(float* z, const std::string& p, int l, bool outgoing) {
   linear(zn, w("p_in/weight"), proj, Pn, C, 2 * C);
   linear(zn, w("g_in/weight"), gate, Pn, C, 2 * C);
   float* a = scratch<float>("be2.tri.a", Pn * C); float* b = scratch<float>("be2.tri.b", Pn * C);
-  triSplitK<<<blocks(Pn * 2 * C), 256, 0, STREAM>>>(proj, gate, a, b, Pn, C);
+  dim3 triGrid((unsigned)((Pn + 31) / 32), (unsigned)((C + 31) / 32));
+  triSplitK<<<triGrid, dim3(32, 8), 0, STREAM>>>(proj, gate, a, b, Pn, C);
   float* prod = proj;      // (the projection is spent: its first half holds the product)
   const float one = 1.f, zero = 0.f;
   // per channel, row-major [i][k] planes: out(j, i) column-major
@@ -168,7 +204,7 @@ inline void trimul(float* z, const std::string& p, int l, bool outgoing) {
   else
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_T, T, T, T, &one, b, T, Pn, a, T, Pn, &zero, prod, T, Pn, C));
   float* rowsP = gate;
-  channelMajorToRowsK<<<blocks(Pn * C), 256, 0, STREAM>>>(prod, rowsP, Pn, C);
+  channelMajorToRowsTileK<<<triGrid, dim3(32, 8), 0, STREAM>>>(prod, rowsP, Pn, C);
   layerNorm(rowsP, rowsP, Pn, C, w("norm_out/weight"), w("norm_out/bias"));
   float* out = a; float* g = b;
   linear(rowsP, w("p_out/weight"), out, Pn, C, C);
@@ -188,11 +224,37 @@ __global__ void msaEmbedK(float* m, const int* msa, const int* hasDel, const flo
          + sp[(size_t)i * C + c];
 }
 // the pair-weighted averaging's weights: softmax over j of the [P, H] bias, written heads first [H][T][T]
-__global__ void pwaSoftmaxK(const float* b, float* w, int T, int H) {
+__global__ void pwaSoftmaxK(const float* __restrict__ b, float* __restrict__ w, int T, int H) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;   // (h, i)
   int lane = threadIdx.x & 31;
   if (row >= (size_t)H * T) return;
   int h = (int)(row / T), i = (int)(row % T);
+  if (T <= 512) {
+    float bv[16];
+    float mx = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      int j = k * 32 + lane;
+      if (j < T) { float v = __ldg(b + ((size_t)i * T + j) * H + h); bv[k] = v; mx = fmaxf(mx, v); }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    float s = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      int j = k * 32 + lane;
+      if (j < T) { float e = expf(bv[k] - mx); bv[k] = e; s += e; }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float inv = 1.f / s;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      int j = k * 32 + lane;
+      if (j < T) w[row * T + j] = bv[k] * inv;
+    }
+    return;
+  }
   float mx = -INFINITY;
   for (int j = lane; j < T; j += 32) mx = fmaxf(mx, b[((size_t)i * T + j) * H + h]);
   for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
@@ -223,7 +285,8 @@ inline void pairWeightedAveraging(float* m, const float* z, int l) {
   for (int h = 0; h < Hh; ++h)
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Ch, T, T, &one, v + h * Ch, Hh * Ch, (long long)T * Hh * Ch,
                                  wts + (size_t)h * Pn, T, 0, &zero, o + h * Ch, Hh * Ch, (long long)T * Hh * Ch, S));
-  sigmoidMulK<<<blocks(R * Hh * Ch), 256, 0, STREAM>>>(o, g, o, R * Hh * Ch);
+  size_t nrg = R * Hh * Ch;
+  sigmoidMulK<<<blocks(((nrg & 3) == 0 && (((uintptr_t)o | (uintptr_t)g) & 15) == 0) ? (nrg >> 2) : nrg), 256, 0, STREAM>>>(o, g, o, nrg);
   linear(o, w("proj_o/weight"), m, R, Hh * Ch, Cm, 1.f);
 }
 // OuterProductMeanVanilla: the mean is over VALID ROWS (rows with any live entry), not per pair

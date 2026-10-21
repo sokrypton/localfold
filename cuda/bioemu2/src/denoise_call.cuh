@@ -29,9 +29,20 @@ __global__ void scaleMaskedBatchK(const float* x, const int* mask, float* r, siz
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n * 3) r[t] = mask[(t / 3) % N] ? x[t] * s : 0.f;
 }
-__global__ void repeatRowsK(const float* src, float* dst, size_t elems, size_t total) {   // dst = src, src, ...
+__global__ void repeatRowsK(const float* __restrict__ src, float* __restrict__ dst, size_t elems, size_t total) {   // dst = src, src, ...
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((elems & 3) == 0 && (total & 3) == 0 && (((uintptr_t)src | (uintptr_t)dst) & 15) == 0) {
+    size_t e4 = elems >> 2, tot4 = total >> 2;
+    if (t < tot4) {
+      reinterpret_cast<float4*>(dst)[t] = __ldg(reinterpret_cast<const float4*>(src) + (t % e4));
+    }
+    return;
+  }
   if (t < total) dst[t] = src[t % elems];
+}
+inline void repeatRows(const float* src, float* dst, size_t elems, size_t total) {
+  size_t nt = ((elems & 3) == 0 && (total & 3) == 0 && (((uintptr_t)src | (uintptr_t)dst) & 15) == 0) ? (total >> 2) : total;
+  repeatRowsK<<<blocks(nt), 256, 0, STREAM>>>(src, dst, elems, total);
 }
 
 // x [samples, N, 3] (noisy, angstrom) at sigma -> den [samples, N, 3]. `cond` (optional, [samples, N, 3]) is each
@@ -57,23 +68,23 @@ inline void denoise(const Denoiser& d, const float* x, float sigma, float* den, 
   CK(cudaMemcpyAsync(cnd, d.sc0, (size_t)T * Dt * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemsetAsync(cnd + (size_t)T * Dt, 0, Dt * 4, STREAM));
 
-  broadcastAddK<<<blocks((size_t)T * Dt), 256, 0, STREAM>>>(cnd, f768, T, Dt);
+  broadcastAddK<<<blocks(((size_t)T * Dt) >> 2), 256, 0, STREAM>>>(cnd, f768, T, Dt);
   for (int i = 0; i < 2; ++i) transition(cnd, cnd, T, Dt, sc + "transitions_" + std::to_string(i) + "/");
   // the atom stream's initial state
   float* q = scratch<float>("be2.dn.q", RN * Ca);
-  repeatRowsK<<<blocks(RN * Ca), 256, 0, STREAM>>>(d.q0, q, (size_t)N * Ca, RN * Ca);
+  repeatRows(d.q0, q, (size_t)N * Ca, RN * Ca);
   linear(r, P(af + "r_to_q_trans/weight"), q, RN, 3, Ca, 1.f);
   if (d.dyn) {
     float* cq = scratch<float>("be2.dn.cq", RN * Ca);
     if (cond) linear(cond, P(af + "cond_to_q_trans/weight"), cq, RN, 3, Ca);
     else {
       linear(d.coordsCond, P(af + "cond_to_q_trans/weight"), cq, N, 3, Ca);
-      repeatRowsK<<<blocks(RN * Ca), 256, 0, STREAM>>>(cq, cq, (size_t)N * Ca, RN * Ca);
+      repeatRows(cq, cq, (size_t)N * Ca, RN * Ca);
     }
-    scaledAddK<<<blocks(RN * Ca), 256, 0, STREAM>>>(q, cq, d.dynGate, RN * Ca);
+    scaledAddK<<<blocks((RN * Ca) >> 2), 256, 0, STREAM>>>(q, cq, d.dynGate, RN * Ca);
   }
   float* a = scratch<float>("be2.dn.a", RT * Dt);
-  repeatRowsK<<<blocks(RT * Dt), 256, 0, STREAM>>>(d.a0, a, (size_t)T * Dt, RT * Dt);
+  repeatRows(d.a0, a, (size_t)T * Dt, RT * Dt);
   float* rc = scratch<float>("be2.dn.rc", RT * 3);
   centreAtoms(r, rc, T, 3, 0, samples, N);
   linear(rc, P(SM + "r_token_to_a/weight"), a, RT, 3, Dt, 1.f);
@@ -85,48 +96,61 @@ inline void denoise(const Denoiser& d, const float* x, float sigma, float* den, 
   float* tbias = d.tbias ? nullptr : scratch<float>("be2.dn.tbias", tbn);
   float* cqc = scratch<float>("be2.dn.cqc", (size_t)(T + 1) * (2 * Dc + Ca));
   float* csc = scratch<float>("be2.dn.csc", (size_t)T * (2 * Dc + Dt));
-  float* sq = scratch<float>("be2.dn.sq", RN * Dc);
-  float* qs = scratch<float>("be2.dn.qs", RT * Dc);
   float* dq = scratch<float>("be2.dn.dq", RN * Ca);
   float* da = scratch<float>("be2.dn.da", RT * Dt);
-  float* cn = scratch<float>("be2.dn.cn", (size_t)(T + 1) * Dt);
-  float* sqn = scratch<float>("be2.dn.sqn", RN * Dc);
-  float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
+  const int* atomTokDev = Idev("token_idx_at_atom");
+  const int* atomPadDev = Idev("atom_pad_mask");
+  const int* centreDev = Idev("token_center_atom_index");
+  const std::string cp = L + "coupling/";
+  Cond0Tables c0Tab{
+    {P(L + "atom_block/transformer_layer/cond_0/weight"),
+     P(L + "token_block/cond_0/weight"),
+     P(cp + "q_coupling_cond_0/weight"),
+     P(cp + "s_coupling_cond_0/weight")},
+    {Popt(L + "atom_block/transformer_layer/cond_0/bias"),
+     Popt(L + "token_block/cond_0/bias"),
+     Popt(cp + "q_coupling_cond_0/bias"),
+     Popt(cp + "s_coupling_cond_0/bias")}
+  };
+  const size_t cnhStride = (size_t)(T + 1) * Dt;
+  half* cnhAll = GEMM_HALF ? scratch<half>("be2.dn.cnhAll", (size_t)d.layers * 4 * cnhStride) : nullptr;
+  float* cnAll = GEMM_HALF ? nullptr : scratch<float>("be2.dn.cnAll", (size_t)d.layers * 4 * cnhStride);
+  dim3 c0Grid((unsigned)((T + 1 + 7) / 8), (unsigned)d.layers);
+  if (GEMM_HALF) lnToCond4K<half><<<c0Grid, 256, 0, STREAM>>>(cnd, cnhAll, T, c0Tab);
+  else lnToCond4K<float><<<c0Grid, 256, 0, STREAM>>>(cnd, cnAll, T, c0Tab);
   for (int l = 0; l < d.layers; ++l) {
     const CondLayer atomL{L + "atom_block/transformer_layer/", ab, l, true, 4};
     // (the atom stream's conditioning is its token's row of cond: computed on the T token rows)
-    float* condA = layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
+    float* condA = GEMM_HALF ? layerCondPre<half>(atomL, cnhAll + (size_t)(l * 4 + 0) * cnhStride, T + 1, Dt, Ca, "be2.dn.condA")
+                             : layerCondPre<float>(atomL, cnAll + (size_t)(l * 4 + 0) * cnhStride, T + 1, Dt, Ca, "be2.dn.condA");
     condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
     const float* bias = d.tbias ? d.tbias + tbn * l : tbias;
     if (!d.tbias) tokenBias(d.z, PL(L + "token_block/" + tb + "norm_z/weight", l), PL(L + "token_block/" + tb + "proj_z/weight", l), tbias, T, 256, 16);
     const CondLayer tokL{L + "token_block/", tb, l, false, 16};
-    float* condT = layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
+    float* condT = GEMM_HALF ? layerCondPre<half>(tokL, cnhAll + (size_t)(l * 4 + 1) * cnhStride, T, Dt, Dt, "be2.dn.condT")
+                             : layerCondPre<float>(tokL, cnAll + (size_t)(l * 4 + 1) * cnhStride, T, Dt, Dt, "be2.dn.condT");
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, bias, T);
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
-    const std::string cp = L + "coupling/";
-    layerNorm(cnd, cn, T + 1, Dt, PL(cp + "q_coupling_cond_0/weight", l), PLopt(cp + "q_coupling_cond_0/bias", l));
-    siluK<<<blocks((size_t)(T + 1) * Dt), 256, 0, STREAM>>>(cn, cn, (size_t)(T + 1) * Dt);
-    linear(cn, PL(cp + "q_coupling_cond_2/weight", l), cqc, T + 1, Dt, 2 * Dc + Ca);
-    if (const float* b = PLopt(cp + "q_coupling_cond_2/bias", l)) addBiasRows(cqc, b, T + 1, 2 * Dc + Ca);
-    layerNorm(cnd, cn, T, Dt, PL(cp + "s_coupling_cond_0/weight", l), PLopt(cp + "s_coupling_cond_0/bias", l));
-    siluK<<<blocks((size_t)T * Dt), 256, 0, STREAM>>>(cn, cn, (size_t)T * Dt);
-    linear(cn, PL(cp + "s_coupling_cond_2/weight", l), csc, T, Dt, 2 * Dc + Dt);
-    if (const float* b = PLopt(cp + "s_coupling_cond_2/bias", l)) addBiasRows(csc, b, T, 2 * Dc + Dt);
-    // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
-    tokensToAtoms(a, sq, N, Dt, Dc, 0.f, samples, T);
-    CK(cudaMemcpy2DAsync(sq + Dt, Dc * 4, q, Ca * 4, Ca * 4, RN, cudaMemcpyDeviceToDevice, STREAM));
-    centreAtoms(q, qs, T, Ca, Dc, samples, N);
-    CK(cudaMemcpy2DAsync(qs + Ca, Dc * 4, a, Dt * 4, Dt * 4, RT, cudaMemcpyDeviceToDevice, STREAM));
     if (GEMM_HALF) {
+      linearPre<half>(cnhAll + (size_t)(l * 4 + 2) * cnhStride, halfMirror<half>(PL(cp + "q_coupling_cond_2/weight", l), (size_t)(2 * Dc + Ca) * Dt), cqc, T + 1, Dt, 2 * Dc + Ca);
+      if (const float* b = PLopt(cp + "q_coupling_cond_2/bias", l)) addBiasRows(cqc, b, T + 1, 2 * Dc + Ca);
+      linearPre<half>(cnhAll + (size_t)(l * 4 + 3) * cnhStride, halfMirror<half>(PL(cp + "s_coupling_cond_2/weight", l), (size_t)(2 * Dc + Dt) * Dt), csc, T, Dt, 2 * Dc + Dt);
+      if (const float* b = PLopt(cp + "s_coupling_cond_2/bias", l)) addBiasRows(csc, b, T, 2 * Dc + Dt);
+      // s_to_q = [a broadcast | q]; q_to_s = [q centre | a], fused directly into adaLN
       half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
-      adaLn<half>(sq, sqh, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, 0, 1.f, maps.atomTok);
+      adaLnS2QK<half><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, atomTokDev, atomPadDev, sqh, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transitionHalf(nullptr, sqh, dq, RN, Dc, cp + "s_to_q_mixer/", l, false, false, 0);
-      adaLn<half>(qs, qsh, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, 0, 1.f, maps.tok);
+      adaLnQ2SK<half><<<(unsigned)((RT + 7) / 8), 256, 0, STREAM>>>(q, a, centreDev, qsh, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
       transitionHalf(nullptr, qsh, da, RT, Dc, cp + "q_to_s_mixer/", l, false, false, 0);
     } else {
-      adaLn(sq, sqn, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, 0, 1.f, maps.atomTok);
+      linear(cnAll + (size_t)(l * 4 + 2) * cnhStride, PL(cp + "q_coupling_cond_2/weight", l), cqc, T + 1, Dt, 2 * Dc + Ca);
+      if (const float* b = PLopt(cp + "q_coupling_cond_2/bias", l)) addBiasRows(cqc, b, T + 1, 2 * Dc + Ca);
+      linear(cnAll + (size_t)(l * 4 + 3) * cnhStride, PL(cp + "s_coupling_cond_2/weight", l), csc, T, Dt, 2 * Dc + Dt);
+      if (const float* b = PLopt(cp + "s_coupling_cond_2/bias", l)) addBiasRows(csc, b, T, 2 * Dc + Dt);
+      float* sqn = scratch<float>("be2.dn.sqn", RN * Dc); float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
+      adaLnS2QK<float><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, atomTokDev, atomPadDev, sqn, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transition(sqn, dq, RN, Dc, cp + "s_to_q_mixer/", l, false, false);
-      adaLn(qs, qsn, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, 0, 1.f, maps.tok);
+      adaLnQ2SK<float><<<(unsigned)((RT + 7) / 8), 256, 0, STREAM>>>(q, a, centreDev, qsn, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
       transition(qsn, da, RT, Dc, cp + "q_to_s_mixer/", l, false, false);
     }
     gatedAdd(q, dq, cqc + 2 * Dc, RN, Ca, 2 * Dc + Ca, maps.atomTok);
