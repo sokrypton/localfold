@@ -108,7 +108,8 @@ struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, ds
 // residue table the bundle stores as float32), 'o' one. What no part covers is zero.
 struct GPart { int rec, op, rank, nsrc; size_t dims[6], dst; long long dstStride[6]; int src[2]; size_t srcOff[2]; long long srcStride[2][6]; };
 struct GPartD { unsigned long long o0, n, dst, off[2], dims[6]; long long ds[6], ss[2][6]; int rank, op; };
-__global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* out) {
+__global__ void __launch_bounds__(256, 8)
+bundleGatherK(const float* __restrict__ scratch, const GPartD* __restrict__ parts, float* __restrict__ out) {
   __shared__ GPartD p;
   if (threadIdx.x == 0) p = parts[blockIdx.y];
   __syncthreads();
@@ -130,9 +131,9 @@ __global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* 
     }
     float v;
     if (p.op == 'o') v = 1.f;
-    else if (p.op == 'x') v = __fmul_rn(scratch[a], scratch[b]);
-    else if (p.op == 'i') v = __int_as_float((int)scratch[a]);
-    else v = scratch[a];
+    else if (p.op == 'x') v = __fmul_rn(__ldg(scratch + a), __ldg(scratch + b));
+    else if (p.op == 'i') v = __int_as_float((int)__ldg(scratch + a));
+    else v = __ldg(scratch + a);
     out[d] = v;
   }
 }

@@ -532,8 +532,7 @@ inline void bondTypeEmbed(float* pair, size_t pairs, int C, const std::string& p
 template <class TO>
 inline void layerNormPairRows(const float* pair, bool p16, size_t r0, TO* out, size_t rows, int C, const std::string& scale,
                               const std::string& offset) {
-  if (p16) layerNormK<__nv_bfloat16, TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(
-             reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, out, rows, C, W(scale), W(offset));
+  if (p16) layerNorm2<__nv_bfloat16, TO>(reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, out, rows, C, scale, offset);
   else layerNorm2<float, TO>(pair + r0 * C, out, rows, C, scale, offset);
 }
 template <class PT, class TX>
@@ -1849,9 +1848,8 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       if (!fusedHeads) {
         if (!flat) { flat = scratch<float>("st.flat", (size_t)heads * R * n); ln = scratch<T>("st.ln", (size_t)R * n * C); }
         if (pair16)        // (a bf16 pair's rows, normed by the kernel that reads them)
-          layerNormK<__nv_bfloat16, T><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(
-            reinterpret_cast<const __nv_bfloat16*>(prow), ln, rows, C, W(B + ".singlePairLogitsNormScale"),
-            W(B + ".singlePairLogitsNormOffset"));
+          layerNorm2<__nv_bfloat16, T>(reinterpret_cast<const __nv_bfloat16*>(prow), ln, rows, C, B + ".singlePairLogitsNormScale",
+                                       B + ".singlePairLogitsNormOffset");
         else layerNorm2<float, T>(prow, ln, rows, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
         linear<T, float>(ln, flat, rows, C, heads, B + ".singlePairLogitsProjection");
         logitsLayoutK<<<blocks(rows * heads), 256, 0, STREAM>>>(flat, pl, rows, heads);

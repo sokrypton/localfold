@@ -39,13 +39,16 @@ __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out,
   for (int a = 0; a < 3; ++a) out[t * 3 + a] = g[a];
 }
 // IPA logits -> attention weights, a warp a (query, head): logits[q, k, h] then softmax over k
-__global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, const float* kp, const float* b2d,
-                            const float* pw, const float* seqMask, float* attn, int L, int Hh, int Cs, int Pq) {
+__global__ void ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const float* __restrict__ qp,
+                            const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
+                            const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
+  __shared__ float srow[8][512];
   size_t wid = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  int lane = threadIdx.x & 31;
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   if (wid >= (size_t)L * Hh) return;
   int h = (int)(wid % Hh), q = (int)(wid / Hh);
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
+  float* sr = L <= 512 ? srow[warp] : row;
   float mx = -INFINITY;
   float w = pw[h];
   // the query's scalars and points held in registers, read once (they were read again for every key); the
@@ -75,14 +78,14 @@ __global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, c
       s += sc + b2d[((size_t)q * L + k) * Hh + h];
       s -= 1e5f * (1.f - sq * seqMask[k]);
       s *= sqrtf(1.f / 3.f);
-      row[k] = s;
+      sr[k] = s;
       mx = fmaxf(mx, s);
     }
     for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
     float sum = 0;
-    for (int k = lane; k < L; k += 32) { float e = __expf(row[k] - mx); row[k] = e; sum += e; }
+    for (int k = lane; k < L; k += 32) { float e = __expf(sr[k] - mx); sr[k] = e; sum += e; }
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-    for (int k = lane; k < L; k += 32) row[k] /= sum;
+    for (int k = lane; k < L; k += 32) row[k] = sr[k] / sum;
     return;
   }
   constexpr int CS_MAX = 32, PQ_MAX = 8;
@@ -134,14 +137,43 @@ __global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, c
 }
 // IPA's scalar and point outputs when the pair term runs in ipaPairTermK: a warp a (query, head), lanes 0..Cs-1
 // accumulating vs and lanes Cs..Cs+Pv-1 accumulating vp concurrently in one loop over k
-__global__ void ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, const float* __restrict__ vp,
-                                const float* __restrict__ rig, float* __restrict__ final_, int L, int Hh, int Cs, int Pv, int C2) {
-  int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+__global__ void __launch_bounds__(256, 6)
+ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, const float* __restrict__ vp,
+                const float* __restrict__ rig, float* __restrict__ final_, int L, int Hh, int Cs, int Pv, int C2) {
+  int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   if (wid >= L * Hh) return;
   int q = wid / Hh, h = wid % Hh;
   const float* a = attn + (size_t)wid * L;
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
   float* f = final_ + (size_t)q * Fw;
+  if (Cs == 16 && Pv == 8) {
+    __shared__ float sp[8][24];
+    const float* p0 = lane < 16 ? (vs + h * 16 + lane) : (vp + h * 24 + (lane - 16));
+    const float* p1 = vp + h * 24 + (lane - 8);
+    int st0 = lane < 16 ? (Hh * 16) : (Hh * 24), st1 = Hh * 24;
+    float g0 = 0.f, g1 = 0.f;
+#pragma unroll 8
+    for (int k = 0; k < L; ++k) {
+      float ak = __ldg(a + k);
+      g0 += ak * __ldg(p0 + (size_t)k * st0);
+      if (lane >= 24) g1 += ak * __ldg(p1 + (size_t)k * st1);
+    }
+    if (lane < 16) f[h * 16 + lane] = g0;
+    else sp[warp][lane - 16] = g0;
+    if (lane >= 24) sp[warp][lane - 8] = g1;
+    __syncwarp();
+    if (lane < 8) {
+      int p = lane;
+      float g[3] = {sp[warp][p * 3], sp[warp][p * 3 + 1], sp[warp][p * 3 + 2]}, loc[3];
+      rapplyInv(rig + q * 12, g, loc);
+      int base = Hh * 16, idx = h * 8 + p;
+      f[base + idx] = loc[0];
+      f[base + Hh * 8 + idx] = loc[1];
+      f[base + 2 * Hh * 8 + idx] = loc[2];
+      f[base + 3 * Hh * 8 + idx] = sqrtf(fmaxf(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+    }
+    return;
+  }
   float s = 0.f, g0 = 0.f, g1 = 0.f, g2 = 0.f;
   int p = lane - Cs;
   bool isS = lane < Cs, isP = p >= 0 && p < Pv;
@@ -150,16 +182,16 @@ __global__ void ipaOutputsFastK(const float* __restrict__ attn, const float* __r
     const float* vsh = vs + h * Cs + lane;
     int strideS = Hh * Cs;
 #pragma unroll 8
-    for (int k = 0; k < L; ++k) s += a[k] * vsh[(size_t)k * strideS];
+    for (int k = 0; k < L; ++k) s += __ldg(a + k) * __ldg(vsh + (size_t)k * strideS);
     f[h * Cs + lane] = s;
   } else {
     const float* vph = vp + (h * Pv + p) * 3;
     int strideP = Hh * Pv * 3;
 #pragma unroll 8
     for (int k = 0; k < L; ++k) {
-      float ak = a[k];
+      float ak = __ldg(a + k);
       const float* vpk = vph + (size_t)k * strideP;
-      g0 += ak * vpk[0]; g1 += ak * vpk[1]; g2 += ak * vpk[2];
+      g0 += ak * __ldg(vpk); g1 += ak * __ldg(vpk + 1); g2 += ak * __ldg(vpk + 2);
     }
     float g[3] = {g0, g1, g2}, loc[3];
     rapplyInv(rig + q * 12, g, loc);
@@ -333,16 +365,41 @@ __global__ void addBiasIntoK(float* dst, const float* y, const float* bias, size
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) dst[t] += y[t] + bias[t % C];
 }
-__global__ void addBiasLnK(float* residual, const float* y, const float* bias, float* out, size_t rows, int C,
-                           const float* scale, const float* offset) {
+__global__ void __launch_bounds__(256, 6)
+addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const float* __restrict__ bias,
+           float* __restrict__ out, size_t rows, int C, const float* __restrict__ scale, const float* __restrict__ offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   float* rr = residual + row * C;
   const float* yr = y + row * C;
+  if (C == 384) {
+    float xv[12], s = 0, v = 0;
+#pragma unroll
+    for (int k = 0; k < 12; ++k) {
+      int c = lane + k * 32;
+      float val = rr[c] + (__ldg(yr + c) + __ldg(bias + c));
+      rr[c] = val;
+      xv[k] = val;
+      s += val;
+    }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / 384;
+#pragma unroll
+    for (int k = 0; k < 12; ++k) { float d = xv[k] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    float inv = rsqrtf(v / 384 + 1e-5f);
+    float* outr = out + row * 384;
+#pragma unroll
+    for (int k = 0; k < 12; ++k) {
+      int c = lane + k * 32;
+      outr[c] = (xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
+    }
+    return;
+  }
   float s = 0;
   for (int c = lane; c < C; c += 32) {
-    float v = rr[c] + (yr[c] + bias[c]);
+    float v = rr[c] + (__ldg(yr + c) + __ldg(bias + c));
     rr[c] = v;
     s += v;
   }
@@ -351,7 +408,7 @@ __global__ void addBiasLnK(float* residual, const float* y, const float* bias, f
   for (int c = lane; c < C; c += 32) { float d = rr[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   float inv = rsqrtf(v / C + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = (rr[c] - mean) * inv * scale[c] + offset[c];
+  for (int c = lane; c < C; c += 32) out[row * C + c] = (rr[c] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
 }
 __global__ void ipaUnpackK(float* __restrict__ qs, float* __restrict__ ks, float* __restrict__ vs,
                            const float* __restrict__ qpr, const float* __restrict__ kpr, const float* __restrict__ vpr,

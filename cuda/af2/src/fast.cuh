@@ -135,31 +135,66 @@ inline const half* PH(const std::string& name, int block = -1) {
 // q, k, v, gate of one attention block as ONE [C, 4 * H * Dp] f16 matrix - each head padded to Dp
 // columns (zeros: an 8-wide head padded to 16 changes no dot product) - and its bias (the gate's,
 // zeros elsewhere); the output weight [H * Dp, C] likewise padded with zero rows
-__global__ void packQkvgWeightK(const float* q, const float* k, const float* v, const float* g, half* out, int C, int H,
-                                int D, int Dp) {
+__global__ void __launch_bounds__(256, 8)
+packQkvgWeightK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                const float* __restrict__ g, half* __restrict__ out, int C, int H, int D, int Dp) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   int Wp = H * Dp;
+  if ((D & 3) == 0 && (Dp & 3) == 0) {
+    unsigned w4 = (unsigned)(Wp >> 2), dp4 = (unsigned)(Dp >> 2);
+    if (t >= (size_t)C * 4 * w4) return;
+    unsigned u = (unsigned)t, col4 = u % (4 * w4), c = u / (4 * w4);
+    unsigned role = col4 / w4, hd4 = col4 - role * w4, h = hd4 / dp4, d = (hd4 - h * dp4) << 2;
+    uint2 u2 = make_uint2(0, 0);
+    if ((int)d < D) {
+      const float* p = (role == 0 ? q : role == 1 ? k : role == 2 ? v : g) + ((size_t)c * H + h) * D + d;
+      float4 v4 = ((uintptr_t)p & 15) == 0 ? __ldg(reinterpret_cast<const float4*>(p))
+                                           : make_float4(__ldg(p), __ldg(p + 1), __ldg(p + 2), __ldg(p + 3));
+      half2 a = __floats2half2_rn(v4.x, v4.y), b = __floats2half2_rn(v4.z, v4.w);
+      u2 = make_uint2(*reinterpret_cast<unsigned*>(&a), *reinterpret_cast<unsigned*>(&b));
+    }
+    reinterpret_cast<uint2*>(out)[t] = u2;
+    return;
+  }
   if (t >= (size_t)C * 4 * Wp) return;
   int col = (int)(t % (4 * Wp)), c = (int)(t / (4 * Wp));
   int role = col / Wp, hd = col % Wp, h = hd / Dp, d = hd % Dp;
   float val = 0;
   if (d < D) {
     const float* src = role == 0 ? q : role == 1 ? k : role == 2 ? v : g;
-    val = src[(size_t)c * H * D + h * D + d];
+    val = __ldg(src + (size_t)c * H * D + h * D + d);
   }
   out[t] = __float2half(val);
 }
-__global__ void packGateBiasK(const float* gb, float* out, int H, int D, int Dp) {
+__global__ void __launch_bounds__(256, 8)
+packGateBiasK(const float* __restrict__ gb, float* __restrict__ out, int H, int D, int Dp) {
   int t = blockIdx.x * blockDim.x + threadIdx.x, Wp = H * Dp;
   if (t >= 4 * Wp) return;
   int role = t / Wp, hd = t % Wp, h = hd / Dp, d = hd % Dp;
-  out[t] = (role == 3 && d < D) ? gb[h * D + d] : 0.f;
+  out[t] = (role == 3 && d < D) ? __ldg(gb + h * D + d) : 0.f;
 }
-__global__ void packOutputWeightK(const float* o, half* out, int C, int H, int D, int Dp) {
+__global__ void __launch_bounds__(256, 8)
+packOutputWeightK(const float* __restrict__ o, half* __restrict__ out, int C, int H, int D, int Dp) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0) {
+    unsigned c4 = (unsigned)(C >> 2);
+    if (t >= (size_t)H * Dp * c4) return;
+    unsigned u = (unsigned)t, hd = u / c4, c = (u - hd * c4) << 2;
+    unsigned h = hd / (unsigned)Dp, d = hd - h * (unsigned)Dp;
+    uint2 u2 = make_uint2(0, 0);
+    if ((int)d < D) {
+      const float* p = o + ((size_t)h * D + d) * C + c;
+      float4 v4 = ((uintptr_t)p & 15) == 0 ? __ldg(reinterpret_cast<const float4*>(p))
+                                           : make_float4(__ldg(p), __ldg(p + 1), __ldg(p + 2), __ldg(p + 3));
+      half2 a = __floats2half2_rn(v4.x, v4.y), b = __floats2half2_rn(v4.z, v4.w);
+      u2 = make_uint2(*reinterpret_cast<unsigned*>(&a), *reinterpret_cast<unsigned*>(&b));
+    }
+    reinterpret_cast<uint2*>(out)[t] = u2;
+    return;
+  }
   if (t >= (size_t)H * Dp * C) return;
   int c = (int)(t % C); int hd = (int)(t / C), h = hd / Dp, d = hd % Dp;
-  out[t] = __float2half(d < D ? o[((size_t)h * D + d) * C + c] : 0.f);
+  out[t] = __float2half(d < D ? __ldg(o + ((size_t)h * D + d) * C + c) : 0.f);
 }
 struct AttnW { const half* qkvg; const float* qkvgBias; const half* out; int H, D, Dp; };
 // narrow: an 8-wide head left unpadded, for the flash kernel's D 8 form (flashNarrow); otherwise padded to 16
@@ -170,13 +205,15 @@ inline AttnW attnWeights(const std::string& A, int blk, int C, bool narrow = fal
   int H = (int)dimW(A + "/query_w", blk < 0 ? 1 : 2), D = (int)dimW(A + "/query_w", blk < 0 ? 2 : 3);
   int Dp = D < 16 && !(narrow && D == 8) ? 16 : D;
   AttnW w{}; w.H = H; w.D = D; w.Dp = Dp;
-  half* qk = wpool<half>((size_t)C * 4 * H * Dp);
-  packQkvgWeightK<<<blocks((size_t)C * 4 * H * Dp), 256, 0, STREAM>>>(P(A + "/query_w", blk), P(A + "/key_w", blk),
-    P(A + "/value_w", blk), P(A + "/gating_w", blk), qk, C, H, D, Dp);
+  size_t qkElems = (size_t)C * 4 * H * Dp;
+  half* qk = wpool<half>(qkElems);
+  packQkvgWeightK<<<blocks(((D & 3) == 0 && (Dp & 3) == 0) ? (qkElems >> 2) : qkElems), 256, 0, STREAM>>>(
+    P(A + "/query_w", blk), P(A + "/key_w", blk), P(A + "/value_w", blk), P(A + "/gating_w", blk), qk, C, H, D, Dp);
   float* gb = wpool<float>(4 * H * Dp);
   packGateBiasK<<<blocks(4 * H * Dp), 256, 0, STREAM>>>(P(A + "/gating_b", blk), gb, H, D, Dp);
-  half* ow = wpool<half>((size_t)H * Dp * C);
-  packOutputWeightK<<<blocks((size_t)H * Dp * C), 256, 0, STREAM>>>(P(A + "/output_w", blk), ow, C, H, D, Dp);
+  size_t owElems = (size_t)H * Dp * C;
+  half* ow = wpool<half>(owElems);
+  packOutputWeightK<<<blocks((C & 3) == 0 ? (owElems >> 2) : owElems), 256, 0, STREAM>>>(P(A + "/output_w", blk), ow, C, H, D, Dp);
   w.qkvg = qk; w.qkvgBias = gb; w.out = ow;
   return cache[{A, blk, narrow}] = w;
 }
