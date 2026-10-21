@@ -113,12 +113,12 @@ void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, co
   if (HALF) {
     half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
     adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh);
-    transitionHalf(hh, t, R, D, L.p + "transition/", false);
+    transitionHalf(hh, x, R, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map);    // (x += gamma fc3(...))
   } else {
     adaLn(x, h, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
     transition(h, t, R, D, L.p + "transition/", false, false);
+    be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
   }
-  be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
 }
 
 // ---------------------------------------------------------------- the input embedder

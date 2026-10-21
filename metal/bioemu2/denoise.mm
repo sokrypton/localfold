@@ -150,7 +150,7 @@ static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
   static const double margin = getenv("BE2_SPLIT_MARGIN") ? atof(getenv("BE2_SPLIT_MARGIN")) : 1.5;
   return split * margin < unsplit;
 }
-static void couplingSplit(const float* a, const float* q, const float* cqc, float* dq, const int* atomTok, int samples, int T, int N,
+static void couplingSplit(const float* a, float* q, const float* cqc, const int* atomTok, int samples, int T, int N,
                    int Dt, int Ca, const std::string& p) {
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
@@ -197,7 +197,7 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   run("be2_cs_atom", rowsGrid(RN), 256, Be2CsAtomArgs{q, tstats, cqc, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), atomTok,
                                                     stats, xq, (u64)RN, (uint)N, (uint)T, (uint)Ca, (uint)Dt, (uint)ldc, 0});
   if (!gemmCouplingCombine(xq, wQ, g, RN, 2 * Ca, I, stats, P, QB, !staged)) die("BioEmu2: the coupling split off the matrix units");
-  transitionFc3(g, dq, RN, I, p, false);
+  transitionFc3(g, q, RN, I, p, false, cqc + 2 * Dc, ldc, atomTok);      // (q += gamma_q s_to_q, in fc3's epilogue)
 }
 
 // ---------------------------------------------------------------- one call
@@ -309,21 +309,23 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     copy2d(qs + Ca, (size_t)Dc * 4, a, (size_t)Dt * 4, (size_t)Dt * 4, RT);
     if (HALF) {      // (the adaLN straight into the fused transition's half input)
       half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
-      if (csplit) couplingSplit(a, q, cqc, dq, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
+      // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: both mixers' inputs - sq and qs, or the
+      // split's reads of a and q - are taken before either update)
+      if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
       else {
         adaLn(sq, nullptr, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok, sqh);
-        transitionHalf(sqh, dq, RN, Dc, cp + "s_to_q_mixer/", false);
+        transitionHalf(sqh, q, RN, Dc, cp + "s_to_q_mixer/", false, cqc + 2 * Dc, 2 * Dc + Ca, maps.atomTok);
       }
       adaLn(qs, nullptr, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, maps.tok, qsh);
-      transitionHalf(qsh, da, RT, Dc, cp + "q_to_s_mixer/", false);
+      transitionHalf(qsh, a, RT, Dc, cp + "q_to_s_mixer/", false, csc + 2 * Dc, 2 * Dc + Dt, maps.tok);
     } else {
       adaLn(sq, sqn, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transition(sqn, dq, RN, Dc, cp + "s_to_q_mixer/", false, false);
       adaLn(qs, qsn, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
       transition(qsn, da, RT, Dc, cp + "q_to_s_mixer/", false, false);
+      be2Run1d("be2_gated_add", RN * Ca, Be2GatedAddArgs{q, dq, cqc + 2 * Dc, maps.atomTok, RN, (uint)Ca, (uint)(2 * Dc + Ca)});
+      be2Run1d("be2_gated_add", RT * Dt, Be2GatedAddArgs{a, da, csc + 2 * Dc, maps.tok, RT, (uint)Dt, (uint)(2 * Dc + Dt)});
     }
-    be2Run1d("be2_gated_add", RN * Ca, Be2GatedAddArgs{q, dq, cqc + 2 * Dc, maps.atomTok, RN, (uint)Ca, (uint)(2 * Dc + Ca)});
-    be2Run1d("be2_gated_add", RT * Dt, Be2GatedAddArgs{a, da, csc + 2 * Dc, maps.tok, RT, (uint)Dt, (uint)(2 * Dc + Dt)});
   }
   // the readout
   const std::string ro = SM + "readout/";

@@ -187,6 +187,14 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       }
       // (lf_gemm's order of operations, so the results match the staged path's bit for bit)
       float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+      if (g.epilogue & 262144) {   // a gated residual by rows (core.h's gemmGatedRows): D = C + gate[map(j)][i] v
+        device const int* mp = (device const int*)g.aux2;
+        const ulong row = mp ? (ulong)(uint)mp[j] : (ulong)j;
+        const float4 gm = *(device const float4*)((device const float*)g.aux + row * g.ldaux + i);
+        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+        *(device vec<TC, 4>*)(D + (ulong)i + (ulong)j * g.ldd) = lf_out4<TC>(cv + gm * v);
+        continue;
+      }
       const float4 bv = !(g.epilogue & 4) ? float4(0)
                         : (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + i))
                                                   : *(device const float4*)((device const float*)g.bias + i);

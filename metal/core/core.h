@@ -98,6 +98,10 @@ struct Gemm {
   ::half* lnOut2 = nullptr; const float* lnScale2 = nullptr; const float* lnOffset2 = nullptr;   // (a second norm, same eps)
 };
 bool gemm(const Gemm& g);
+// Y [r][o] += gate[map ? map[r] : r][o] (alpha X W)[r][o] - an adaLN-gated residual (BioEmu2's be2_gated_add) in the
+// product's vector epilogue, Y float, the gate's rows `ldg` apart. On the matrix units, rows > 128 and everything
+// 4-aligned only: false, nothing run - the caller's product and add
+bool gemmGatedRows(const Gemm& g, const float* gate, int ldg, const int* map);
 extern int GEMM_EXTRA_EP;     // (an arm: bits ORed into every GEMM instance's EP - metal/bench)
 // shorthands: f32 or f16 X, a weight, Y f32 or f16
 inline void gemm(const float* X, const half* W, float* Y, size_t rows, int in, int out, float beta = 0.f) {
