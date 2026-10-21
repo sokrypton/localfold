@@ -331,7 +331,8 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
 // ---------------------------------------------------------------- the block's modules
 // gated self-attention with its own q/k/v/gate/output weights, over [Bt, n, C] rows
 inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::string& A, int blk, int H, int D,
-                           const float* keyMask, const float* pairBias, float* out) {
+                           const float* keyMask, const float* pairBias, float* out,
+                           float* addInto = nullptr, int swapA = 0, int swapB = 0) {
   size_t rows = (size_t)Bt * n; int Wd = H * D;
   float* q = scratch<float>("att.q", rows * Wd); float* k = scratch<float>("att.k", rows * Wd);
   float* v = scratch<float>("att.v", rows * Wd); float* g = scratch<float>("att.g", rows * Wd);
@@ -340,10 +341,13 @@ inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::str
   gemm(xn, P(A + "/key_w", blk), k, rows, C, Wd);
   gemm(xn, P(A + "/value_w", blk), v, rows, C, Wd);
   gemm(xn, P(A + "/gating_w", blk), g, rows, C, Wd);
-  addStridedBiasK<<<blocks((Wd & 3) == 0 ? rows * (size_t)(Wd >> 2) : rows * Wd), 256, 0, STREAM>>>(g, P(A + "/gating_b", blk), rows, Wd, Wd);
-  attention(D, q, k, v, g, keyMask, pairBias, o, Bt, n, H);
+  attention(D, q, k, v, g, keyMask, pairBias, o, Bt, n, H, P(A + "/gating_b", blk));
   gemm(o, P(A + "/output_w", blk), out, rows, Wd, C);
-  addBiasK<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(out, P(A + "/output_b", blk), rows, C);
+  if (addInto) {
+    addBiasSwapInto(addInto, out, P(A + "/output_b", blk), swapA ? swapB : 1, swapA ? swapA : (int)rows, C, swapA != 0);
+  } else {
+    addBiasK<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(out, P(A + "/output_b", blk), rows, C);
+  }
 }
 // [pairs, H] f32 pair-bias projection (+ 1e9 (mask - 1) when a mask is given) -> [H, L, stride] f16 in
 // the flash kernel's log2 units
@@ -580,8 +584,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
   float* xn = scratch<float>("row.xn", rows * C);
   layerNorm(msa, xn, rows, C, R + "/query_norm", blk);
   float* out = scratch<float>("row.out", rows * C);
-  gatedAttention(xn, rowsN, L, C, R + "/attention", blk, H, D, msaMask, bias, out);
-  addK2<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(msa, out, rows * C);
+  gatedAttention(xn, rowsN, L, C, R + "/attention", blk, H, D, msaMask, bias, out, msa);
 }
 inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, int H, int D,
                                const float* msaMask) {
@@ -649,9 +652,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
   float* xn = scratch<float>("col.xn", rows * C);
   layerNorm(tr, xn, rows, C, A + "/query_norm", blk);
   float* out = scratch<float>("col.out", rows * C);
-  gatedAttention(xn, L, rowsN, C, A + "/attention", blk, H, D, mt, nullptr, out);
-  swap01(out, tr, L, rowsN, C);
-  addK2<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(msa, tr, rows * C);
+  gatedAttention(xn, L, rowsN, C, A + "/attention", blk, H, D, mt, nullptr, out, msa, L, rowsN);
 }
 inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C,
                                      const float* msaMask) {
@@ -679,14 +680,11 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   }
   float* gate = scratch<float>("gcol.gate", rows * Wd);
   gemm(xn, P(A + "/attention/gating_w", blk), gate, rows, C, Wd);
-  addStridedBiasK<<<blocks((Wd & 3) == 0 ? rows * (size_t)(Wd >> 2) : rows * Wd), 256, 0, STREAM>>>(gate, P(A + "/attention/gating_b", blk), rows, Wd, Wd);
   float* gated = scratch<float>("gcol.gated", rows * Wd);
-  globalGateK<<<blocks(rows * Wd), 256, 0, STREAM>>>(avg, gate, gated, L, rowsN, Wd);
+  globalGateK<<<blocks((Wd & 3) == 0 ? rows * (size_t)(Wd >> 2) : rows * Wd), 256, 0, STREAM>>>(avg, gate, gated, L, rowsN, Wd, P(A + "/attention/gating_b", blk));
   float* out = scratch<float>("gcol.out", rows * C);
   gemm(gated, P(A + "/attention/output_w", blk), out, rows, Wd, C);
-  addBiasK<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(out, P(A + "/attention/output_b", blk), rows, C);
-  swap01(out, tr, L, rowsN, C);
-  addK2<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(msa, tr, rows * C);
+  addBiasSwapInto(msa, out, P(A + "/attention/output_b", blk), rowsN, L, C, true);
 }
 inline void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);     // 4C in the stacks, 2C in the template's
@@ -754,8 +752,8 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   float* out = scratch<float>("tr.out", rows * C);
   layerNorm(x, xn, rows, C, T + "/input_layer_norm", blk);
   linearB(xn, T + "/transition1", blk, mid, rows, C, I, true);
-  linearB(mid, T + "/transition2", blk, out, rows, I, C);
-  addK2<<<blocks((C & 3) == 0 ? rows * (size_t)(C >> 2) : rows * C), 256, 0, STREAM>>>(x, out, rows * C);
+  gemm(mid, P(T + "/transition2/weights", blk), out, rows, I, C);
+  addBiasSwapInto(x, out, P(T + "/transition2/bias", blk), (int)rows, 1, C, false);
 }
 // lt [s][i][c] -> [i][c][s], the left operand of the shallow form's contraction
 __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, float scale = 1.f) {
@@ -1067,7 +1065,8 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
 __global__ void __launch_bounds__(256, 6)
 triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const float* __restrict__ mask,
-          float* __restrict__ a, float* __restrict__ b, int L, int C) {
+          float* __restrict__ a, float* __restrict__ b, int L, int C,
+          const float* __restrict__ projB = nullptr, const float* __restrict__ gateB = nullptr) {
   __shared__ float A[32][33];
   __shared__ float B[32][33];
   size_t pairs = (size_t)L * L;
@@ -1075,16 +1074,18 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
   int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
   int c = c0 + tx;
   if (ij0 + 32 <= pairs && c0 + 32 <= C) {
+    float pba = projB ? __ldg(projB + c) : 0.f, pbb = projB ? __ldg(projB + C + c) : 0.f;
+    float gba = gateB ? __ldg(gateB + c) : 0.f, gbb = gateB ? __ldg(gateB + C + c) : 0.f;
     float m[4], pa[4], ga[4], pb[4], gb[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       size_t ij = ij0 + ty + k * 8;
       size_t base = ij * (2 * C) + c;
       m[k] = __ldg(mask + ij);
-      pa[k] = __ldg(proj + base);
-      ga[k] = __ldg(gate + base);
-      pb[k] = __ldg(proj + base + C);
-      gb[k] = __ldg(gate + base + C);
+      pa[k] = __ldg(proj + base) + pba;
+      ga[k] = __ldg(gate + base) + gba;
+      pb[k] = __ldg(proj + base + C) + pbb;
+      gb[k] = __ldg(gate + base + C) + gbb;
     }
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -1101,14 +1102,16 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
     }
     return;
   }
+  float pba = (c < C && projB) ? __ldg(projB + c) : 0.f, pbb = (c < C && projB) ? __ldg(projB + C + c) : 0.f;
+  float gba = (c < C && gateB) ? __ldg(gateB + c) : 0.f, gbb = (c < C && gateB) ? __ldg(gateB + C + c) : 0.f;
 #pragma unroll
   for (int k = 0; k < 32; k += 8) {
     size_t ij = ij0 + ty + k;
     if (ij < pairs && c < C) {
       float m = __ldg(mask + ij);
       size_t base = ij * (2 * C) + c;
-      A[ty + k][tx] = __ldg(proj + base) * m / (1.f + __expf(-__ldg(gate + base)));
-      B[ty + k][tx] = __ldg(proj + base + C) * m / (1.f + __expf(-__ldg(gate + base + C)));
+      A[ty + k][tx] = (__ldg(proj + base) + pba) * m / (1.f + __expf(-(__ldg(gate + base) + gba)));
+      B[ty + k][tx] = (__ldg(proj + base + C) + pbb) * m / (1.f + __expf(-(__ldg(gate + base + C) + gbb)));
     }
   }
   __syncthreads();
@@ -1400,10 +1403,11 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   float* xn = scratch<float>("tri.xn", pairs * C);
   layerNorm(pair, xn, pairs, C, T + "/left_norm_input", blk);
   float* proj = scratch<float>("tri.proj", pairs * 2 * C); float* gate = scratch<float>("tri.gate", pairs * 2 * C);
-  linearB(xn, T + "/projection", blk, proj, pairs, C, 2 * C);
-  linearB(xn, T + "/gate", blk, gate, pairs, C, 2 * C);
+  gemm(xn, P(T + "/projection/weights", blk), proj, pairs, C, 2 * C);
+  gemm(xn, P(T + "/gate/weights", blk), gate, pairs, C, 2 * C);
   float* a = scratch<float>("tri.a", pairs * C); float* b = scratch<float>("tri.b", pairs * C);
-  triSplitK<<<dim3((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(proj, gate, pairMask, a, b, L, C);
+  triSplitK<<<dim3((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
+    proj, gate, pairMask, a, b, L, C, P(T + "/projection/bias", blk), P(T + "/gate/bias", blk));
   float* prod = scratch<float>("tri.prod", pairs * C);
   const float one = 1.f, zero = 0.f;
   // per channel (row-major [i][k] planes): outgoing act[i,j] = sum_k a[i,k] b[j,k] = a b^T;
@@ -1419,10 +1423,11 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   float* cn = scratch<float>("tri.cn", pairs * C);
   layerNorm(rowsP, cn, pairs, C, T + "/center_norm", blk);
   float* out = scratch<float>("tri.out", pairs * C);
-  linearB(cn, T + "/output_projection", blk, out, pairs, C, C);
+  gemm(cn, P(T + "/output_projection/weights", blk), out, pairs, C, C);
   float* g = scratch<float>("tri.g", pairs * C);
-  linearB(xn, T + "/gating_linear", blk, g, pairs, C, C);
-  gateMulAddK<<<blocks((C & 3) == 0 ? pairs * (size_t)(C >> 2) : pairs * C), 256, 0, STREAM>>>(pair, out, g, pairs * C);
+  gemm(xn, P(T + "/gating_linear/weights", blk), g, pairs, C, C);
+  gateMulAddK<<<blocks((C & 3) == 0 ? pairs * (size_t)(C >> 2) : pairs * C), 256, 0, STREAM>>>(
+    pair, out, g, pairs * C, P(T + "/output_projection/bias", blk), P(T + "/gating_linear/bias", blk), C);
 }
 // pair columns [b0, b0 + cnt) as rows: out[(b - b0) * L + q] = pair[q * L + b]
 __global__ void gatherColumnsK(const float* pair, float* out, int L, int C, size_t b0, size_t cnt) {
@@ -1606,9 +1611,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   float* bias = scratch<float>("tatt.bias", pairs * H);
   pairBiasK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, nullptr, bias, L, H);
   float* out = scratch<float>("tatt.out", pairs * C);
-  gatedAttention(xn, L, L, C, A + "/attention", blk, H, D, mask, bias, out);
-  if (!starting) { swap01(out, tr, L, L, C); out = tr; }
-  addK2<<<blocks((C & 3) == 0 ? pairs * (size_t)(C >> 2) : pairs * C), 256, 0, STREAM>>>(pair, out, pairs * C);
+  gatedAttention(xn, L, L, C, A + "/attention", blk, H, D, mask, bias, out, pair, starting ? 0 : L, starting ? 0 : L);
 }
 
 inline void warmStackWeights(bool extraZeros = false, bool multimer = false, bool monomerTemplates = false) {

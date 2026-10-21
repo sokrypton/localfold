@@ -1562,46 +1562,56 @@ __global__ void logitsLayoutK(const float* flat, float* out, size_t pairs, int h
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < pairs * heads) out[t] = flat[(t % pairs) * heads + t / pairs];
 }
+template <class T, int MAX_K = 8>
+__global__ void __launch_bounds__(256, 8)
+singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
+                   const float* __restrict__ seqMask, T* __restrict__ P,
+                   size_t totalRows, int n, float scale, int ld = 0) {
+  if (!ld) ld = n;
+  size_t rowId = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (rowId >= totalRows) return;
+  int lane = threadIdx.x & 31;
+  const float* L = logits + rowId * ld;
+  const float* B = pairLogits + rowId * n;
+  float rv[MAX_K];
+  float mx = -INFINITY;
+#pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < n) {
+      float v = __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f);
+      rv[k] = v;
+      mx = fmaxf(mx, v);
+    }
+  }
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+  float sum = 0.f;
+#pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < n) {
+      float e = expf(rv[k] - mx);
+      rv[k] = e;
+      sum += e;
+    }
+  }
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  float inv = 1.f / sum;
+#pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < ld) P[rowId * ld + j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
+  }
+}
+
 template <class T>
-__global__ void singleSoftmaxK(const float* logits, const float* pairLogits, const float* seqMask, T* P,
+__global__ void singleSoftmaxK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
+                               const float* __restrict__ seqMask, T* __restrict__ P,
                                int n, float scale, int ld = 0) {
   // ld: the logits' and P's row stride (0: n), P's columns from n to ld written zero
   if (!ld) ld = n;
   size_t rowId = blockIdx.x;
   const float* L = logits + rowId * ld; const float* B = pairLogits + rowId * n;
-  if (blockDim.x == 32 && n <= 256) {
-    int lane = threadIdx.x;
-    float rv[8];
-    float mx = -INFINITY;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      int j = lane + k * 32;
-      if (j < n) {
-        float v = L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f);
-        rv[k] = v;
-        mx = fmaxf(mx, v);
-      }
-    }
-    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-    float sum = 0.f;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      int j = lane + k * 32;
-      if (j < n) {
-        float e = expf(rv[k] - mx);
-        rv[k] = e;
-        sum += e;
-      }
-    }
-    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-    float inv = 1.f / sum;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      int j = lane + k * 32;
-      if (j < ld) P[rowId * ld + j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
-    }
-    return;
-  }
   extern __shared__ float srow[];
   __shared__ float red[8];
   float mx = -INFINITY;
@@ -1639,6 +1649,19 @@ __global__ void singleSoftmaxK(const float* logits, const float* pairLogits, con
     for (int j = threadIdx.x; j < ld; j += blockDim.x)
       P[rowId * ld + j] = j < n ? fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv) : fromF<T>(0.f);
   }
+}
+template <class T>
+inline void launchSingleSoftmax(const float* logits, const float* pairLogits, const float* seqMask, T* P,
+                                size_t totalRows, int n, float scale, int ld = 0) {
+  int maxCol = ld ? ld : n;
+  if (maxCol <= 96)
+    singleSoftmaxWarpK<T, 3><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+  else if (maxCol <= 128)
+    singleSoftmaxWarpK<T, 4><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+  else if (maxCol <= 256)
+    singleSoftmaxWarpK<T, 8><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+  else
+    singleSoftmaxK<T><<<(unsigned)totalRows, 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pairLogits, seqMask, P, n, scale, ld);
 }
 template <class T>
 __global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd, int ldn = 0) {
@@ -1796,7 +1819,7 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, r, d, &one,
          qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg + (size_t)i0 * 4 * Wd, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, n,
          rows, heads, CUBLAS_COMPUTE_32F, algo));
-      singleSoftmaxK<T><<<(unsigned)(heads * r), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d));
+      launchSingleSoftmax<T>(logits, pl, seqMask, P, (size_t)heads * r, n, 1.f / sqrtf((float)d));
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, r, n, &one,
          qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, rows, &zero, o + (size_t)i0 * Wd, cudaType<T>(),
          Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
@@ -1858,7 +1881,7 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, ldn, n, d, &one,
      qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, ldn,
      (size_t)n * ldn, heads, CUBLAS_COMPUTE_32F, algo));
-  singleSoftmaxK<T><<<(unsigned)(heads * n), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d), ldn);
+  launchSingleSoftmax<T>(logits, pl, seqMask, P, (size_t)heads * n, n, 1.f / sqrtf((float)d), ldn);
   CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, n, ldn, &one,
      qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), ldn, (size_t)n * ldn, &zero, o, cudaType<T>(),
      Wd, d, heads, CUBLAS_COMPUTE_32F, algo));

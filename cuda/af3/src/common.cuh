@@ -1626,13 +1626,17 @@ concatRowsH8K(ConcatSpec<half> s, half* __restrict__ dst, int shift) {
   else if (tu == 576u) { c = u / 576u; o8 = u - c * 576u; }
   else { c = u / tu; o8 = u - c * tu; }
   int o = (int)(o8 << 3);
-  int idx = 0;
+  const half* sp = s.src[0];
+  int off = s.off[0], wid = s.width[0];
 #pragma unroll
-  for (int k = 1; k < 4; ++k) if (k < s.np && o >= s.off[k]) idx = k;
-  const half* sp = s.src[idx];
+  for (int k = 1; k < 4; ++k) {
+    if (k < s.np && o >= s.off[k]) {
+      sp = s.src[k]; off = s.off[k]; wid = s.width[k];
+    }
+  }
   uint4 val = {0, 0, 0, 0};
   if (sp) {
-    int w = o - s.off[idx], wid = s.width[idx];
+    int w = o - off;
     val = *reinterpret_cast<const uint4*>(sp + (size_t)c * wid + w);
   }
   reinterpret_cast<uint4*>(dst)[tid] = val;
@@ -1650,14 +1654,16 @@ concatIntoK(ConcatSpec<T> s, T* __restrict__ dst) {
   int tx = threadIdx.x, ty = threadIdx.y;
   if constexpr (std::is_same_v<T, half> && TILE64) {
     int o0 = (int)blockIdx.x * 64, c0 = (int)blockIdx.y * 64;
-    int fastIdx = 0;
+    const half* sp = s.src[0];
+    int off = s.off[0], wid = s.width[0], tr = s.tr[0];
 #pragma unroll
     for (int idx = 1; idx < 4; ++idx) {
-      if (idx < s.np && o0 >= s.off[idx]) fastIdx = idx;
+      if (idx < s.np && o0 >= s.off[idx]) {
+        sp = s.src[idx]; off = s.off[idx]; wid = s.width[idx]; tr = s.tr[idx];
+      }
     }
-    const half* sp = s.src[fastIdx];
-    int w0 = o0 - s.off[fastIdx], wid = s.width[fastIdx];
-    if (s.tr[fastIdx]) {
+    int w0 = o0 - off;
+    if (tr) {
       __shared__ half2 tile[64][33];
       int c = c0 + 2 * tx;
 #pragma unroll
@@ -1695,19 +1701,20 @@ concatIntoK(ConcatSpec<T> s, T* __restrict__ dst) {
   }
   __shared__ T tile[32][33];
   int o0 = (int)blockIdx.x * 32, c0 = (int)blockIdx.y * 32;
-  int fastIdx = -1;
+  const T* fastSp = nullptr;
+  int fastOff = 0;
 #pragma unroll
   for (int idx = 0; idx < 4; ++idx) {
-    if (idx < s.np && s.tr[idx] && s.src[idx] && o0 >= s.off[idx] && o0 + 32 <= s.off[idx] + s.width[idx])
-      fastIdx = idx;
+    if (idx < s.np && s.tr[idx] && s.src[idx] && o0 >= s.off[idx] && o0 + 32 <= s.off[idx] + s.width[idx]) {
+      fastSp = s.src[idx]; fastOff = s.off[idx];
+    }
   }
-  if (fastIdx >= 0) {
-    const T* sp = s.src[fastIdx];
-    int w0 = o0 - s.off[fastIdx], c = c0 + tx;
+  if (fastSp) {
+    int w0 = o0 - fastOff, c = c0 + tx;
 #pragma unroll
     for (int m = 0; m < 4; ++m) {
       int ry = ty + m * 8, w = w0 + ry;
-      tile[ry][tx] = (c < s.C) ? sp[(size_t)w * s.C + c] : T{};
+      tile[ry][tx] = (c < s.C) ? fastSp[(size_t)w * s.C + c] : T{};
     }
     __syncthreads();
     int o = o0 + tx;
@@ -1720,11 +1727,15 @@ concatIntoK(ConcatSpec<T> s, T* __restrict__ dst) {
   }
   int o = o0 + tx;
   if (o >= s.total) return;
-  int idx = 0;
+  const T* sp = s.src[0];
+  int off = s.off[0], wid = s.width[0], tr = s.tr[0];
 #pragma unroll
-  for (int k = 1; k < 4; ++k) if (k < s.np && o >= s.off[k]) idx = k;
-  const T* sp = s.src[idx];
-  int w = o - s.off[idx], wid = s.width[idx], tr = s.tr[idx];
+  for (int k = 1; k < 4; ++k) {
+    if (k < s.np && o >= s.off[k]) {
+      sp = s.src[k]; off = s.off[k]; wid = s.width[k]; tr = s.tr[k];
+    }
+  }
+  int w = o - off;
 #pragma unroll
   for (int m = 0; m < 4; ++m) {
     int c = c0 + ty + m * 8;

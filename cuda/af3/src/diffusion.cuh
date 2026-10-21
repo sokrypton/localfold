@@ -560,11 +560,11 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
     int c = threadIdx.x * 8;
     float4 x0 = *(const float4*)(act + (size_t)r * 768 + c);
     float4 x1 = *(const float4*)(act + (size_t)r * 768 + c + 4);
-    uint4 sc8 = *(const uint4*)(scale + (size_t)pr * lds + c);
-    uint4 sh8 = *(const uint4*)(shift + (size_t)pr * lds + c);
+    uint4 sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
+    uint4 sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
     if (y) {
-      uint4 yy8 = *(const uint4*)(y + (size_t)r * 768 + c);
-      uint4 g8 = *(const uint4*)(gate + (size_t)pr * ldg + c);
+      uint4 yy8 = __ldg(reinterpret_cast<const uint4*>(y + (size_t)r * 768 + c));
+      uint4 g8 = __ldg(reinterpret_cast<const uint4*>(gate + (size_t)pr * ldg + c));
       const half2* y2 = (const half2*)&yy8; const half2* g2 = (const half2*)&g8;
       float2 y0 = __half22float2(y2[0]), y1 = __half22float2(y2[1]), y2_ = __half22float2(y2[2]), y3 = __half22float2(y2[3]);
       float2 g0 = __half22float2(g2[0]), g1 = __half22float2(g2[1]), g2_ = __half22float2(g2[2]), g3 = __half22float2(g2[3]);
@@ -787,19 +787,37 @@ __global__ void __launch_bounds__(128) pairBiasSuperK(const half* __restrict__ p
   }
 }
 // layerNormSlowK into f16, no offset: the two-pass variance, the module's convention
-__global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int C, const float* scale) {
+__global__ void __launch_bounds__(256, 8)
+layerNormSlowHalfK(const float* __restrict__ in, half* __restrict__ out, size_t rows, int C, const float* __restrict__ scale) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* x = in + row * C;
+  if (C == 128) {
+    float xv[4], s = 0, v = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { xv[k] = __ldg(x + lane + k * 32); s += xv[k]; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / 128;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { float d = xv[k] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    float inv = rsqrtf(v / 128 + 1e-5f);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int c = lane + k * 32;
+      out[row * 128 + c] = __float2half((xv[k] - mean) * inv * __ldg(scale + c));
+    }
+    return;
+  }
   float s = 0;
-  for (int c = lane; c < C; c += 32) s += x[c];
+  for (int c = lane; c < C; c += 32) s += __ldg(x + c);
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / C, v = 0;
-  for (int c = lane; c < C; c += 32) { float d = x[c] - mean; v += d * d; }
+  for (int c = lane; c < C; c += 32) { float d = __ldg(x + c) - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   float inv = rsqrtf(v / C + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((x[c] - mean) * inv * scale[c]);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((__ldg(x + c) - mean) * inv * __ldg(scale + c));
 }
 inline half* PN16_GIVEN = nullptr;     // a streamed preparation's LayerNorm'd pair (prepareTransformer)
 inline void refreshSuperBlockBias(int sb, int n);

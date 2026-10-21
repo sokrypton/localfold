@@ -49,47 +49,69 @@ __global__ void intToFloatK(const int* __restrict__ in, float* __restrict__ out,
   if (i < n) out[i] = (float)in[i];
 }
 // LayerNorm with the TWO-PASS variance (this module's convention), optional scale/offset.
-__global__ void __launch_bounds__(256, 6)
+template <int C_CONST = 0>
+__global__ void __launch_bounds__(256, C_CONST == 768 ? 4 : 6)
 layerNormSlowK(const float* __restrict__ in, float* __restrict__ out, size_t rows, int C,
                const float* __restrict__ scale, const float* __restrict__ offset) {
-  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
+  if constexpr (C_CONST == 16) {
+    // 2 rows per warp (16 lanes per row, 1 float per lane): bit-identical butterfly reduction to 32-lane warp
+    size_t row = (size_t)blockIdx.x * (blockDim.x / 16) + (threadIdx.x >> 4);
+    if (row >= rows) return;
+    int c = threadIdx.x & 15;
+    const float* x = in + row * 16;
+    float* y = out + row * 16;
+    float xv = __ldg(x + c), s = xv;
+    for (int o = 8; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / 16, d = xv - mean, v = d * d;
+    for (int o = 8; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    float inv = rsqrtf(v / 16 + 1e-5f);
+    y[c] = d * inv * (scale ? __ldg(scale + c) : 1.f) + (offset ? __ldg(offset + c) : 0.f);
+    return;
+  }
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   if (row >= rows) return;
-  const float* x = in + row * C;
-  float* y = out + row * C;
-  auto fastWidth = [&](auto ktag) {
-    constexpr int K = decltype(ktag)::value, CC = K * 32;
+  if constexpr (C_CONST >= 64 && (C_CONST % 32) == 0) {
+    constexpr int K = C_CONST / 32;
+    const float* x = in + row * C_CONST;
+    float* y = out + row * C_CONST;
     float xv[K], s = 0, v = 0;
 #pragma unroll
-    for (int k = 0; k < K; ++k) { xv[k] = x[lane + k * 32]; s += xv[k]; }
+    for (int k = 0; k < K; ++k) { xv[k] = __ldg(x + lane + k * 32); s += xv[k]; }
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / CC;
+    float mean = s / C_CONST;
 #pragma unroll
     for (int k = 0; k < K; ++k) { float d = xv[k] - mean; v += d * d; }
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-    float inv = rsqrtf(v / CC + 1e-5f);
+    float inv = rsqrtf(v / C_CONST + 1e-5f);
 #pragma unroll
     for (int k = 0; k < K; ++k) {
       int c = lane + k * 32;
-      y[c] = (xv[k] - mean) * inv * (scale ? scale[c] : 1.f) + (offset ? offset[c] : 0.f);
+      y[c] = (xv[k] - mean) * inv * (scale ? __ldg(scale + c) : 1.f) + (offset ? __ldg(offset + c) : 0.f);
     }
-  };
-  if (C == 128) { fastWidth(std::integral_constant<int, 4>{}); return; }
-  if (C == 256) { fastWidth(std::integral_constant<int, 8>{}); return; }
-  if (C == 384) { fastWidth(std::integral_constant<int, 12>{}); return; }
+    return;
+  }
+  const float* x = in + row * C;
+  float* y = out + row * C;
   float s = 0;
-  for (int c = lane; c < C; c += 32) s += x[c];
+  for (int c = lane; c < C; c += 32) s += __ldg(x + c);
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / C, v = 0;
-  for (int c = lane; c < C; c += 32) { float d = x[c] - mean; v += d * d; }
+  for (int c = lane; c < C; c += 32) { float d = __ldg(x + c) - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32)
-    y[c] = (x[c] - mean) * inv * (scale ? scale[c] : 1.f) + (offset ? offset[c] : 0.f);
+    y[c] = (__ldg(x + c) - mean) * inv * (scale ? __ldg(scale + c) : 1.f) + (offset ? __ldg(offset + c) : 0.f);
 }
 inline void layerNormSlow(const float* in, float* out, size_t rows, int C, const float* scale,
                           const float* offset) {
-  layerNormSlowK<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, C, scale, offset);
+  if (C == 16) layerNormSlowK<16><<<(unsigned)((rows + 15) / 16), 256, 0, STREAM>>>(in, out, rows, 16, scale, offset);
+  else if (C == 64) layerNormSlowK<64><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, 64, scale, offset);
+  else if (C == 128) layerNormSlowK<128><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, 128, scale, offset);
+  else if (C == 256) layerNormSlowK<256><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, 256, scale, offset);
+  else if (C == 384) layerNormSlowK<384><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, 384, scale, offset);
+  else if (C == 768) layerNormSlowK<768><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, 768, scale, offset);
+  else layerNormSlowK<0><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, C, scale, offset);
 }
 inline const float* Wopt(const std::string& k) { return hasW(k) ? W(k) : nullptr; }
 
@@ -297,9 +319,9 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   c.chained = M.flag(B + ".chainedAtomLayerNorm");
   return c;
 }
-__device__ __forceinline__ float4 load4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 load4(const float* p) { return __ldg(reinterpret_cast<const float4*>(p)); }
 __device__ __forceinline__ float4 load4(const half* p) {
-  uint2 u = *reinterpret_cast<const uint2*>(p);
+  uint2 u = __ldg(reinterpret_cast<const uint2*>(p));
   float2 a = __half22float2(*reinterpret_cast<half2*>(&u.x)), b = __half22float2(*reinterpret_cast<half2*>(&u.y));
   return make_float4(a.x, a.y, b.x, b.y);
 }
@@ -313,7 +335,7 @@ __device__ __forceinline__ void store4(half* p, float a, float b, float c, float
 
 // sigmoid(scale) * LN(x) + shift, LN without affine (and optional act += y * sigmoid(gate) after reading x)
 template <class TO, bool RAW = false, class TY = float>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(256, 8)
 adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float* __restrict__ shift,
        TO* __restrict__ out, size_t rows, int C, size_t period,
        float* __restrict__ act = nullptr, const TY* __restrict__ y = nullptr, const float* __restrict__ gate = nullptr) {
@@ -324,20 +346,23 @@ adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float
   size_t pr = (row < period ? row : (row < (1ull << 32) ? (unsigned)row % (unsigned)period : row % period)) * C;
   if (C == 128) {
     int c0 = lane * 4;
-    float4 xv = *(const float4*)(xr + c0), sc = *(const float4*)(scale + pr + c0), sh = *(const float4*)(shift + pr + c0);
-    float4 yy, g;
-    if (act) { yy = load4(y + row * 128 + c0); g = *(const float4*)(gate + pr + c0); }
+    float4 xv = __ldg(reinterpret_cast<const float4*>(xr + c0));
     float s = xv.x + xv.y + xv.z + xv.w;
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s * (1.f / 128.f);
     float v = (xv.x - mean) * (xv.x - mean) + (xv.y - mean) * (xv.y - mean) + (xv.z - mean) * (xv.z - mean) + (xv.w - mean) * (xv.w - mean);
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
     float inv = rsqrtf(v * (1.f / 128.f) + ADA_EPS);
+    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0));
+    float4 sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
     sc.x = ADA(sc.x); sc.y = ADA(sc.y); sc.z = ADA(sc.z); sc.w = ADA(sc.w);
     store4(out + row * 128 + c0, sc.x * ((xv.x - mean) * inv) + sh.x, sc.y * ((xv.y - mean) * inv) + sh.y,
            sc.z * ((xv.z - mean) * inv) + sh.z, sc.w * ((xv.w - mean) * inv) + sh.w);
-    if (act) *(float4*)(act + row * 128 + c0) = make_float4(xv.x + yy.x * sigm(g.x), xv.y + yy.y * sigm(g.y),
-                                                            xv.z + yy.z * sigm(g.z), xv.w + yy.w * sigm(g.w));
+    if (act) {
+      float4 yy = load4(y + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(gate + pr + c0));
+      *(float4*)(act + row * 128 + c0) = make_float4(xv.x + yy.x * sigm(g.x), xv.y + yy.y * sigm(g.y),
+                                                     xv.z + yy.z * sigm(g.z), xv.w + yy.w * sigm(g.w));
+    }
     return;
   }
   float s = 0;
@@ -374,35 +399,35 @@ adaLnChained128K(float* __restrict__ x, const float* __restrict__ s1, const floa
   size_t pr = row < period ? row : (row < (1ull << 32) ? (unsigned)row % (unsigned)period : row % period);
   size_t k = pr * 128 + c0;
   float4 v = *(const float4*)(x + row * 128 + c0);
-  float4 a = *(const float4*)(s1 + k), b = *(const float4*)(h1 + k);
-  float4 c2 = *(const float4*)(s2 + k), d = *(const float4*)(h2 + k);
   if (prevY) {
-    float4 yy = load4(prevY + row * 128 + c0), g = *(const float4*)(prevGate + k);
+    float4 yy = load4(prevY + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(prevGate + k));
     v.x += yy.x * sigm(g.x); v.y += yy.y * sigm(g.y); v.z += yy.z * sigm(g.z); v.w += yy.w * sigm(g.w);
-    if (rowMask) { float m = rowMask[pr]; v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
+    if (rowMask) { float m = __ldg(rowMask + pr); v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
     *(float4*)(x + row * 128 + c0) = v;
   }
-  a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
   float s = v.x + v.y + v.z + v.w;
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s * (1.f / 128.f), q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
   for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
   float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
+  float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
+  a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
   float q0 = a.x * ((v.x - mean) * inv) + b.x, q1 = a.y * ((v.y - mean) * inv) + b.y,
         q2 = a.z * ((v.z - mean) * inv) + b.z, q3 = a.w * ((v.w - mean) * inv) + b.w;
   store4(o1 + row * 128 + c0, q0, q1, q2, q3);
-  c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
   float sq = q0 + q1 + q2 + q3;
   for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
   float mean2 = sq * (1.f / 128.f), v2 = (q0 - mean2) * (q0 - mean2) + (q1 - mean2) * (q1 - mean2) + (q2 - mean2) * (q2 - mean2) + (q3 - mean2) * (q3 - mean2);
   for (int o = 16; o; o >>= 1) v2 += __shfl_xor_sync(~0u, v2, o);
   float inv2 = rsqrtf(v2 * (1.f / 128.f) + ADA_EPS);
+  float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
+  c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
   store4(o2 + row * 128 + c0, c2.x * ((q0 - mean2) * inv2) + d.x, c2.y * ((q1 - mean2) * inv2) + d.y,
          c2.z * ((q2 - mean2) * inv2) + d.z, c2.w * ((q3 - mean2) * inv2) + d.w);
 }
 
 template <class TO, bool RAW = false, class TY = TO>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(256, 8)
 adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __restrict__ h1,
         const float* __restrict__ s2, const float* __restrict__ h2, TO* __restrict__ o1, TO* __restrict__ o2,
         size_t rows, int C, size_t period,
@@ -416,23 +441,23 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
   if (C == 128) {
     size_t k = pr * 128 + lane * 4;
     float4 v = *(const float4*)(xr + lane * 4);
-    float4 a = *(const float4*)(s1 + k), b = *(const float4*)(h1 + k);
-    float4 c2 = *(const float4*)(s2 + k), d = *(const float4*)(h2 + k);
     if (prevY) {
-      float4 yy = load4(prevY + row * 128 + lane * 4), g = *(const float4*)(prevGate + k);
+      float4 yy = load4(prevY + row * 128 + lane * 4), g = __ldg(reinterpret_cast<const float4*>(prevGate + k));
       v.x += yy.x * sigm(g.x); v.y += yy.y * sigm(g.y); v.z += yy.z * sigm(g.z); v.w += yy.w * sigm(g.w);
-      if (rowMask) { float m = rowMask[pr]; v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
+      if (rowMask) { float m = __ldg(rowMask + pr); v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
       *(float4*)(xr + lane * 4) = v;
     }
-    a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
-    c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
     float sum = v.x + v.y + v.z + v.w;
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum * (1.f / 128.f), q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
     float n0 = (v.x - mean) * inv, n1 = (v.y - mean) * inv, n2 = (v.z - mean) * inv, n3 = (v.w - mean) * inv;
+    float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
+    a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
     store4(o1 + row * 128 + lane * 4, a.x * n0 + b.x, a.y * n1 + b.y, a.z * n2 + b.z, a.w * n3 + b.w);
+    float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
+    c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
     store4(o2 + row * 128 + lane * 4, c2.x * n0 + d.x, c2.y * n1 + d.y, c2.z * n2 + d.z, c2.w * n3 + d.w);
     return;
   }
@@ -501,16 +526,16 @@ gatedAddAdaLnRowsK(float* __restrict__ act, const TY* __restrict__ y, const floa
   size_t pr = (row < period ? row : (row < (1ull << 32) ? (unsigned)row % (unsigned)period : row % period)) * C;
   if (C == 128) {
     int c0 = lane * 4;
-    float4 x = *(const float4*)(a + c0), yy = load4(y + row * 128 + c0), g = *(const float4*)(gate + pr + c0);
-    float4 sc = *(const float4*)(scale + pr + c0), sh = *(const float4*)(shift + pr + c0);
+    float4 x = *(const float4*)(a + c0), yy = load4(y + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(gate + pr + c0));
     x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
     *(float4*)(a + c0) = x;
-    sc.x = ADA(sc.x); sc.y = ADA(sc.y); sc.z = ADA(sc.z); sc.w = ADA(sc.w);
     float sum = x.x + x.y + x.z + x.w;
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum * (1.f / 128.f), q = (x.x - mean) * (x.x - mean) + (x.y - mean) * (x.y - mean) + (x.z - mean) * (x.z - mean) + (x.w - mean) * (x.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
+    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0)), sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
+    sc.x = ADA(sc.x); sc.y = ADA(sc.y); sc.z = ADA(sc.z); sc.w = ADA(sc.w);
     store4(out + row * 128 + c0, sc.x * ((x.x - mean) * inv) + sh.x, sc.y * ((x.y - mean) * inv) + sh.y,
            sc.z * ((x.z - mean) * inv) + sh.z, sc.w * ((x.w - mean) * inv) + sh.w);
     return;

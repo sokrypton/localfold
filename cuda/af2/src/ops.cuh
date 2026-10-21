@@ -57,6 +57,53 @@ __global__ void addK2(float* __restrict__ y, const float* __restrict__ x, size_t
   }
   if (t < n) y[t] += x[t];
 }
+// y[(b * A + a), c] += x[swap ? (a * B + b) : (b * A + a), c] + bias[c]
+__global__ void addBiasSwapIntoK(float* __restrict__ y, const float* __restrict__ x, const float* __restrict__ b,
+                                 int B, int A, int C, bool swap) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t rows = (size_t)B * A;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)x | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t >= n4) return;
+    size_t r; int c;
+    if ((c4 & (c4 - 1)) == 0 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, uc4 = (unsigned)c4;
+      c = (int)(u & (uc4 - 1));
+      r = u >> (__ffs(c4) - 1);
+    } else if (n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, ru = u / (unsigned)c4;
+      r = ru; c = (int)(u - ru * (unsigned)c4);
+    } else {
+      r = t / c4; c = (int)(t % c4);
+    }
+    size_t sr = r;
+    if (swap) {
+      if (rows <= UINT32_MAX) {
+        unsigned ru = (unsigned)r, bu = ru / (unsigned)A, au = ru - bu * (unsigned)A;
+        sr = (size_t)au * B + bu;
+      } else {
+        sr = (r % A) * B + (r / A);
+      }
+    }
+    float4 yv = reinterpret_cast<const float4*>(y)[t];
+    float4 xv = __ldg(reinterpret_cast<const float4*>(x) + sr * c4 + c);
+    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
+    reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + (xv.x + bv.x), yv.y + (xv.y + bv.y),
+                                                  yv.z + (xv.z + bv.z), yv.w + (xv.w + bv.w));
+    return;
+  }
+  size_t n = rows * C;
+  if (t >= n) return;
+  size_t r = t / C; int c = (int)(t % C);
+  size_t sr = swap ? ((r % A) * B + (r / A)) : r;
+  y[t] += x[sr * C + c] + __ldg(b + c);
+}
+inline void addBiasSwapInto(float* y, const float* x, const float* b, int B, int A, int C, bool swap = false) {
+  size_t rows = (size_t)B * A;
+  size_t work = ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)x | (uintptr_t)b) & 15) == 0) ? rows * (size_t)(C >> 2) : rows * C;
+  addBiasSwapIntoK<<<blocks(work), 256, 0, STREAM>>>(y, x, b, B, A, C, swap);
+}
 inline void linearB(const float* X, const std::string& w, int block, float* Y, size_t rows, int in, int out,
                     bool relu = false) {
   gemm(X, P(w + "/weights", block), Y, rows, in, out);
@@ -168,11 +215,12 @@ inline void swap01(const float* x, float* y, int A, int B, int C) {
 //   pairBias:   [H, n, n] or null - AF2's `nonbatched_bias`, shared by every batch row
 //   out:        [Bt, n, H*D] = softmax(q k^T / sqrt(D) + biases) v * sigmoid(g)
 template <int D>
-__global__ void __launch_bounds__(256, D <= 16 ? 4 : 3)
+__global__ void __launch_bounds__(256, 4)
 attentionK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-           const float* __restrict__ g, const float* __restrict__ keyMask,
+           const float* __restrict__ g, const float* __restrict__ gBias, const float* __restrict__ keyMask,
            const float* __restrict__ pairBias, float* __restrict__ out, int Bt, int n, int H, float scale) {
   constexpr int LDK = (D + 4) & ~3;
+  __shared__ __align__(16) float Qs[8][LDK];
   __shared__ __align__(16) float Ks[32][LDK];
   __shared__ __align__(16) float Vs[32][LDK];
   __shared__ float Ms[32];
@@ -185,19 +233,8 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
   const int W = H * D;
   const bool validQ = (b < (size_t)Bt && qi < n);
   size_t bq = b * (size_t)n + (size_t)qi;
-  float qv[D];
-  if (validQ) {
-    const float* qr = q + bq * W + h * D;
-    if constexpr ((D & 3) == 0) {
-#pragma unroll
-      for (int d = 0; d < D; d += 4) {
-        float4 q4 = __ldg(reinterpret_cast<const float4*>(qr + d));
-        qv[d] = q4.x * scale; qv[d + 1] = q4.y * scale; qv[d + 2] = q4.z * scale; qv[d + 3] = q4.w * scale;
-      }
-    } else {
-#pragma unroll
-      for (int d = 0; d < D; ++d) qv[d] = __ldg(qr + d) * scale;
-    }
+  if (validQ && lane < D) {
+    Qs[warp][lane] = __ldg(q + bq * W + h * D + lane) * scale;
   }
   float m = -INFINITY, l = 0.f, o[D] = {};
   const float* pbRow = (validQ && pairBias) ? (pairBias + ((size_t)h * n + qi) * n) : nullptr;
@@ -231,12 +268,13 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
         if constexpr ((D & 3) == 0) {
 #pragma unroll
           for (int d = 0; d < D; d += 4) {
+            float4 q4 = *reinterpret_cast<const float4*>(&Qs[warp][d]);
             float4 kv = *reinterpret_cast<const float4*>(&Ks[lane][d]);
-            s += qv[d] * kv.x; s += qv[d + 1] * kv.y; s += qv[d + 2] * kv.z; s += qv[d + 3] * kv.w;
+            s += q4.x * kv.x; s += q4.y * kv.y; s += q4.z * kv.z; s += q4.w * kv.w;
           }
         } else {
 #pragma unroll
-          for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
+          for (int d = 0; d < D; ++d) s += Qs[warp][d] * Ks[lane][d];
         }
         if (mBase) s += Ms[lane];
         if (pbRow) s += __ldg(pbRow + j);
@@ -287,12 +325,13 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
         if constexpr ((D & 3) == 0) {
 #pragma unroll
           for (int d = 0; d < D; d += 4) {
+            float4 q4 = *reinterpret_cast<const float4*>(&Qs[warp][d]);
             float4 kv = *reinterpret_cast<const float4*>(&Ks[lane][d]);
-            s += qv[d] * kv.x; s += qv[d + 1] * kv.y; s += qv[d + 2] * kv.z; s += qv[d + 3] * kv.w;
+            s += q4.x * kv.x; s += q4.y * kv.y; s += q4.z * kv.z; s += q4.w * kv.w;
           }
         } else {
 #pragma unroll
-          for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
+          for (int d = 0; d < D; ++d) s += Qs[warp][d] * Ks[lane][d];
         }
         if (mBase) s += Ms[lane];
         if (pbRow) s += __ldg(pbRow + j);
@@ -336,17 +375,20 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
     if (lane == d) x_lane = x0;
   }
   if (lane < D) {
-    float gate = 1.f / (1.f + __expf(-__ldg(g + bq * W + h * D + lane)));
+    float gv = __ldg(g + bq * W + h * D + lane) + (gBias ? __ldg(gBias + h * D + lane) : 0.f);
+    float gate = 1.f / (1.f + __expf(-gv));
     out[bq * W + h * D + lane] = x_lane / l * gate;
   }
 }
 // q, k, v, g [rows, W] f32 -> qkvg [rows][4W] f16 (the flash kernel's layout, roles in that order)
-__global__ void packQkvgK(const float* q, const float* k, const float* v, const float* g, half* out, size_t rows, int W) {
+__global__ void packQkvgK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                          const float* __restrict__ g, const float* __restrict__ gBias, half* __restrict__ out, size_t rows, int W) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * W) return;
   size_t r = t / W; int w = (int)(t % W);
   half* o = out + r * 4 * W;
-  o[w] = __float2half(q[t]); o[W + w] = __float2half(k[t]); o[2 * W + w] = __float2half(v[t]); o[3 * W + w] = __float2half(g[t]);
+  float gv = g[t] + (gBias ? __ldg(gBias + w) : 0.f);
+  o[w] = __float2half(q[t]); o[W + w] = __float2half(k[t]); o[2 * W + w] = __float2half(v[t]); o[3 * W + w] = __float2half(gv);
 }
 // pair bias [H, n, n] f32 -> [H, n, stride] f16 times log2(e), as the flash kernel takes it (it scores in
 // the log2 domain: Q carries scale * log2e, the bias log2e), -1e9 masks held to f16's range
@@ -361,11 +403,11 @@ __global__ void halfToFloatK(const half* x, float* y, size_t n) {
   if (t < n) y[t] = __half2float(x[t]);
 }
 inline void attention(int D, const float* q, const float* k, const float* v, const float* g, const float* keyMask,
-                      const float* pairBias, float* out, int Bt, int n, int H) {
+                      const float* pairBias, float* out, int Bt, int n, int H, const float* gBias = nullptr) {
   if (FAST && (D == 16 || D == 32)) {
     size_t rows = (size_t)Bt * n; int W = H * D;
     half* qkvg = scratch<half>("fa.qkvg", (rows + 128) * 4 * W);
-    packQkvgK<<<blocks(rows * W), 256, 0, STREAM>>>(q, k, v, g, qkvg, rows, W);
+    packQkvgK<<<blocks(rows * W), 256, 0, STREAM>>>(q, k, v, g, gBias, qkvg, rows, W);
     int stride = (n + 7) / 8 * 8;
     half* bias = scratch<half>("fa.bias", (size_t)H * n * stride);
     if (pairBias && stride != n) CK(cudaMemsetAsync(bias, 0, (size_t)H * n * stride * 2, STREAM));   // pad columns: see pairBiasFast
@@ -379,9 +421,9 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
   unsigned nq = (unsigned)((n + 7) / 8);
   dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
   float scale = 1.f / sqrtf((float)D);
-  if (D == 32) attentionK<32><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
-  else if (D == 8) attentionK<8><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
-  else if (D == 16) attentionK<16><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
+  if (D == 32) attentionK<32><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+  else if (D == 8) attentionK<8><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+  else if (D == 16) attentionK<16><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
   else { fprintf(stderr, "attention: no kernel for head width %d\n", D); exit(1); }
 }
 // add the gate's bias [H*D] to g, a [rows, H*D] block with row stride `ld`
@@ -556,12 +598,33 @@ __global__ void __launch_bounds__(256) globalAttentionStreamK(const float* x, co
     avg[((size_t)b * H + h) * D + d] = A / L;
   }
 }
-// out[b, s, h*D + d] = avg[b, h, d] * sigmoid(gate[b, s, h*D + d])
-__global__ void globalGateK(const float* avg, const float* gate, float* out, int Bt, int n, int W) {
+// out[b, s, h*D + d] = avg[b, h, d] * sigmoid(gate[b, s, h*D + d] + gBias[h*D + d])
+__global__ void globalGateK(const float* __restrict__ avg, const float* __restrict__ gate, float* __restrict__ out,
+                            int Bt, int n, int W, const float* __restrict__ gBias = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((W & 3) == 0 && (((uintptr_t)avg | (uintptr_t)gate | (uintptr_t)out | (uintptr_t)gBias) & 15) == 0) {
+    int w4 = W >> 2;
+    size_t n4 = (size_t)Bt * n * w4;
+    if (t < n4) {
+      size_t r = (n4 <= UINT32_MAX) ? (unsigned)t / (unsigned)w4 : t / (size_t)w4;
+      int c4 = (int)(t - r * (size_t)w4);
+      size_t b = (r <= UINT32_MAX) ? (unsigned)r / (unsigned)n : r / (size_t)n;
+      float4 av = __ldg(reinterpret_cast<const float4*>(avg) + b * w4 + c4);
+      float4 gv = __ldg(reinterpret_cast<const float4*>(gate) + t);
+      if (gBias) {
+        float4 bv = __ldg(reinterpret_cast<const float4*>(gBias) + c4);
+        gv.x += bv.x; gv.y += bv.y; gv.z += bv.z; gv.w += bv.w;
+      }
+      reinterpret_cast<float4*>(out)[t] = make_float4(
+        av.x / (1.f + __expf(-gv.x)), av.y / (1.f + __expf(-gv.y)),
+        av.z / (1.f + __expf(-gv.z)), av.w / (1.f + __expf(-gv.w)));
+    }
+    return;
+  }
   if (t >= (size_t)Bt * n * W) return;
   int w = (int)(t % W); size_t b = t / W / n;
-  out[t] = avg[b * W + w] / (1.f + __expf(-gate[t]));
+  float gv = gate[t] + (gBias ? __ldg(gBias + w) : 0.f);
+  out[t] = avg[b * W + w] / (1.f + __expf(-gv));
 }
 
 __global__ void scaleRowsK2(float* x, const float* mask, size_t rows, int C) {

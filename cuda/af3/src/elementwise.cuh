@@ -58,14 +58,21 @@ __global__ void symmetriseRowsK(const float* z, float* out, int T, int C, size_t
   int c = (int)(t % C); size_t ij = t / C; size_t i = r0 + ij / T, j = ij % T;
   out[t] = z[(i * T + j) * C + c] + z[(j * T + i) * C + c];
 }
-__global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ out, const float* __restrict__ gate, size_t n) {
+__global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ out, const float* __restrict__ gate, size_t n,
+                            const float* __restrict__ outB = nullptr, const float* __restrict__ gateB = nullptr, int C = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if ((n & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out | (uintptr_t)gate) & 15) == 0) {
+  if ((n & 3) == 0 && (C & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out | (uintptr_t)gate | (uintptr_t)outB | (uintptr_t)gateB) & 15) == 0) {
     size_t n4 = n >> 2;
     if (t < n4) {
       float4 p = reinterpret_cast<const float4*>(pair)[t];
-      float4 o = reinterpret_cast<const float4*>(out)[t];
-      float4 g = reinterpret_cast<const float4*>(gate)[t];
+      float4 o = __ldg(reinterpret_cast<const float4*>(out) + t);
+      float4 g = __ldg(reinterpret_cast<const float4*>(gate) + t);
+      if (outB || gateB) {
+        int c4 = C >> 2;
+        int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)t % (unsigned)c4) : (int)(t % c4));
+        if (outB) { float4 ob = __ldg(reinterpret_cast<const float4*>(outB) + c); o.x += ob.x; o.y += ob.y; o.z += ob.z; o.w += ob.w; }
+        if (gateB) { float4 gb = __ldg(reinterpret_cast<const float4*>(gateB) + c); g.x += gb.x; g.y += gb.y; g.z += gb.z; g.w += gb.w; }
+      }
       p.x += o.x / (1.f + __expf(-g.x));
       p.y += o.y / (1.f + __expf(-g.y));
       p.z += o.z / (1.f + __expf(-g.z));
@@ -74,7 +81,12 @@ __global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ 
     }
     return;
   }
-  if (t < n) pair[t] += out[t] / (1.f + __expf(-gate[t]));
+  if (t < n) {
+    int c = C ? (int)(t % C) : 0;
+    float ov = out[t] + (outB ? __ldg(outB + c) : 0.f);
+    float gv = gate[t] + (gateB ? __ldg(gateB + c) : 0.f);
+    pair[t] += ov / (1.f + __expf(-gv));
+  }
 }
 
 __global__ void gateMulAddHK(float* pair, const float* out, const half* gate, size_t pairs, int C, int ld) {
