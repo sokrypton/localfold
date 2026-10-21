@@ -141,10 +141,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
  * or 4, the error back to metal/bioemu2's fast arm's and the speed with it (267, 278 ms). This arm keeps float32
  * activations and only the weights in half, which is why it is the more accurate of the two ports.
  */
-function gemm2Source(wordB, pair = null) {
+function gemm2Source(wordB, pair = null, b16 = false) {
   const BK = 16;
   const E = "f32";
-  return `
+  // (b16: B's panel - a half weight, unpacked - staged as f16, exact, and widened as it is read: a third less
+  // workgroup memory a step, which is what bounds this kernel)
+  const EB = b16 ? "f16" : "f32";
+  return `${b16 ? "enable f16;\n" : ""}
 struct P { m: u32, n: u32, k: u32, b1: u32,
   offA: u32, sA0: u32, sA1: u32, sAm: u32, sAk: u32,
   offB: u32, sB0: u32, sB1: u32, sBn: u32, sBk: u32,
@@ -161,7 +164,7 @@ ${pair ? `${pair.decls}
 fn bRow(v: u32) -> u32 { return ((v / 4u) % 2u) * ${pair.half}u + (v / 8u) * 4u + v % 4u; }
 ${pair.body}` : "fn bRow(v: u32) -> u32 { return v; }"}
 var<workgroup> ta: array<vec4<${E}>, ${BK * 16}>;    // [BK][64] k-major, four rows a vec4
-var<workgroup> tb: array<vec4<${E}>, ${BK * 32}>;    // [BK][128]
+var<workgroup> tb: array<vec4<${EB}>, ${BK * 32}>;    // [BK][128]
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let tilesN = (p.n + 127u) / 128u;
@@ -219,8 +222,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           }
         }
       }
-      tb[kk * 32u + r4] = vec4<${E}>(lo);
-      tb[(kk + 1u) * 32u + r4] = vec4<${E}>(hi);
+      tb[kk * 32u + r4] = vec4<${EB}>(lo);
+      tb[(kk + 1u) * 32u + r4] = vec4<${EB}>(hi);
     }` : `for (var e = 0u; e < ${32 * BK / 256}u; e += 1u) {
       let slot = li + e * 256u;
       let kk = slot % ${BK}u;
@@ -233,13 +236,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           if (row < p.n) { v[t] = b[baseB + bRow(row) * p.sBn + k * p.sBk]; }
         }
       }
-      tb[kk * 32u + r4] = vec4<${E}>(v);
+      tb[kk * 32u + r4] = vec4<${EB}>(v);
     }`}
     workgroupBarrier();
     for (var kk = 0u; kk < ${BK}u; kk += 1u) {
       let av = ta[kk * 16u + tm / 4u];
-      let bv0 = tb[kk * 32u + tn / 4u];
-      let bv1 = tb[kk * 32u + tn / 4u + 1u];
+      let bv0 = vec4<f32>(tb[kk * 32u + tn / 4u]);
+      let bv1 = vec4<f32>(tb[kk * 32u + tn / 4u + 1u]);
       for (var i = 0u; i < 4u; i += 1u) {
         acc[2u * i] += av[i] * bv0;
         acc[2u * i + 1u] += av[i] * bv1;
@@ -577,8 +580,10 @@ export class Bioemu2Ops {
     u[26] = spec.biasS0 ?? 0;
     const groups = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
-    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}`;
-    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair) : gemmSource(word), groups,
+    // (a half weight's panel staged in f16 where the device has shader-f16: b16Panels false is the control)
+    const b16 = v2 && word && this.b16Panels !== false && this.device.features?.has?.("shader-f16") === true;
+    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${b16 ? "-b16" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}`;
+    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16) : gemmSource(word), groups,
                                  [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? [])], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
     return step;

@@ -245,6 +245,13 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   metal/bioemu2 --f32 unchanged, the per-layer path 4e-6..1e-5 away (the trunk identical). 🔴 IT WAS WORTH 5 ms OF A
   33 ms UPPER BOUND (the conditioning recorded for one layer only): the rest is the GEMMs' own arithmetic, ~30 GFLOP a
   call, not their dispatch. Groups sized to 64 MiB. A 68-residue 5-sample fold 56.5 -> 52.2 s, the same RMSDs.
+- **The GEMM is bound by WORKGROUP MEMORY, and the weight panels are staged in f16** (`b16Panels`, `--b16=off` the
+  control; where the device has `shader-f16`). A lane reads 12 floats of panel per 32 multiply-adds; at the measured
+  0.8 T multiply-adds/s that is ~300 G floats/s against `probe-alu.js`'s ~320 G workgroup reads/s - the ceiling, which
+  is why f16 ARITHMETIC (twice the ALU rate on an M5) never paid. Two thirds of the reads are the weight's panel, and
+  the weight is half already: staged as f16 and widened as it is read, it is EXACT - stage dumps bit-identical - and
+  a third less traffic. A call 244 -> 231 ms; the fold 52.2 -> 50.4 s, the same RMSDs. (The activations' panel stays
+  float32: rounding it is metal/bioemu2's precision, 2-5x this port's against the float32 reference.)
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.

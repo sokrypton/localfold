@@ -28,6 +28,7 @@ export async function main(device, args) {
     fuseCombine: option(args, "fuse", "on") !== "off", batchConditioning: option(args, "batch-cond", "on") !== "off",
     condGroupMiB: Number(option(args, "cond-mib", "64")) });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: the original GEMM, the control)
+  net.ops.b16Panels = option(args, "b16", "on") !== "off";   // (--b16=off: the weight panels staged in float32)
   net.ops.fuseSwiglu = option(args, "fuse-swiglu", "on") !== "off";   // (--fuse-swiglu=off: the SwiGLUs a pass of their own)
   // (--split-target=N: split-K's workgroup target, ops.js's 128 by default; 0 is no split)
   if (option(args, "split-target", null)) net.ops.splitTarget = Number(option(args, "split-target", null));
