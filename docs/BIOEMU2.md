@@ -217,6 +217,11 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   splits far less: its target 1024 -> 128 work units (`--split-target=`), a 5-sample call 258 -> 248 ms, a 1-sample
   one 107 -> 101 (no split at all is 106 there - it still pays where rows are few). The partial planes' traffic was
   most of what the deeper split bought. A 68-residue 5-sample fold 62.3 -> 56.5 s, RMSD 0.95-1.62 A.
+- **Every SwiGLU in its GEMM's epilogue** (`ops.swigluLinear` on the same pair mode; `--fuse-swiglu=off` is the
+  control): the transitions and q_to_s, the [rows][2 hidden] pre-activations never stored - bit-identical, a call
+  248 -> 242 ms. A GEMM that would split over K keeps the two-pass path (a pair GEMM is not split). 🔴 The per-dispatch
+  profile reads the fused arm 30 ms SLOWER and the wall clock 6 ms faster: the profile times each dispatch in a pass
+  of its own, so read it for proportions only, as its header says.
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.

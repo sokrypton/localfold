@@ -216,11 +216,15 @@ export class Bioemu2Gpu {
         w: await this.w(`${prefix}/norm/weight`, { half: false }), b: await this.w(`${prefix}/norm/bias`, { half: false }) }));
       src = scratch.ln;
     }
-    steps.push(await o.linear({ x: src, w: await this.swiglu(prefix), y: scratch.t12, rows, inC: width, outC: 2 * hidden }));
-    steps.push(await o.map("swiglu", rows * hidden, [{ buffer: scratch.t12 }, { buffer: scratch.t, write: true }],
-      `let r = i / U(0u); let c = i % U(0u);
+    const fused = await o.swigluLinear({ x: src, w: await this.swiglu(prefix), y: scratch.t, rows, inC: width, hidden });
+    if (fused) steps.push(fused);
+    else {
+      steps.push(await o.linear({ x: src, w: await this.swiglu(prefix), y: scratch.t12, rows, inC: width, outC: 2 * hidden }));
+      steps.push(await o.map("swiglu", rows * hidden, [{ buffer: scratch.t12 }, { buffer: scratch.t, write: true }],
+        `let r = i / U(0u); let c = i % U(0u);
   let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [hidden]));
+    }
     steps.push(await o.linear({ x: scratch.t, w: await this.w(`${prefix}/fc3/weight`), y: out, rows, inC: hidden, outC: width, accumulate }));
   }
 
@@ -865,10 +869,14 @@ export class Bioemu2Gpu {
         `let r = i / 896u; let c = i % 896u; let sm = r / U(0u); let t = r % U(0u);
   if (c < 128u) { b0[i] = b1[(sm * U(1u) + u32(b3[t])) * 128u + c]; } else { b0[i] = b2[r * 768u + c - 128u]; }`, [T, N]));
       steps.push(await o.layerNorm({ x: qs, y: qsh, rows: S * T, width: 896, mod: { cond: condS, stride: 2560, alpha: 0, beta: 896, map: tokenMap } }));
-      steps.push(await o.linear({ x: qsh, w: await this.swiglu(`${cp}/q_to_s_mixer`), y: qs12, rows: S * T, inC: 896, outC: 3584 }));
-      steps.push(await o.map("swiglu", S * T * 1792, [{ buffer: qs12 }, { buffer: qst, write: true }],
-        `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
+      const qsFused = await o.swigluLinear({ x: qsh, w: await this.swiglu(`${cp}/q_to_s_mixer`), y: qst, rows: S * T, inC: 896, hidden: 1792 });
+      if (qsFused) steps.push(qsFused);
+      else {
+        steps.push(await o.linear({ x: qsh, w: await this.swiglu(`${cp}/q_to_s_mixer`), y: qs12, rows: S * T, inC: 896, outC: 3584 }));
+        steps.push(await o.map("swiglu", S * T * 1792, [{ buffer: qs12 }, { buffer: qst, write: true }],
+          `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
+      }
       steps.push(await o.linear({ x: qst, w: await this.w(`${cp}/q_to_s_mixer/fc3/weight`), y: da, rows: S * T, inC: 1792, outC: DT }));
       // a += gamma_s * q_to_s; q += gamma_q * s_to_q
       steps.push(await this.gatedAdd(a, da, condS, tokenMap, S * T, DT, 2560, 1792));

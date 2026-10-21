@@ -57,6 +57,7 @@ export async function main(device, args) {
   const net = new Bioemu2Gpu(device, read, { half, trunkPrecision, couplingSplit: option(args, "split", "on") !== "off",
     fuseCombine: option(args, "fuse", "on") !== "off" });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: webgpu/bioemu2's original GEMM, the control)
+  net.ops.fuseSwiglu = option(args, "fuse-swiglu", "on") !== "off";   // (--fuse-swiglu=off: the SwiGLUs a pass of their own)
   const g = net.upload(features);
   const realAtoms = features.atom_mask.reduce((s, v) => s + v, 0);
 

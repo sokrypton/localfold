@@ -27,6 +27,7 @@ export async function main(device, args) {
   const net = new Bioemu2Gpu(device, read, { half: true, trunkPrecision: "device", couplingSplit: option(args, "split", "on") !== "off",
     fuseCombine: option(args, "fuse", "on") !== "off" });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: the original GEMM, the control)
+  net.ops.fuseSwiglu = option(args, "fuse-swiglu", "on") !== "off";   // (--fuse-swiglu=off: the SwiGLUs a pass of their own)
   // (--split-target=N: split-K's workgroup target, ops.js's 128 by default; 0 is no split)
   if (option(args, "split-target", null)) net.ops.splitTarget = Number(option(args, "split-target", null));
   const g = net.upload(features);

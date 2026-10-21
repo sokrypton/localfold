@@ -529,8 +529,8 @@ export class Bioemu2Ops {
     // 🔴 THE TARGET IS 128 WORK UNITS, NOT 1024: swept on an M5 (ABAB, the shipped gemm2 and the fused combine), a 1-sample
     // call is 107 ms at 1024, 101 at 256 and 128, 106 with no split at all, and a 5-sample call 258 / 248 / 249 / 249 - the
     // partial planes' traffic was most of what a deeper split bought. One part is no split (no reduce).
-    const splits = Math.min(Math.floor(k / 128), Math.ceil((this.splitTarget ?? 128) / (tiles * work)));
-    if (spec.noSplit !== true && !spec.pair && B0 * B1 === 1 && tiles * work < 256 && k >= 512 && splits >= 2) {
+    if (spec.noSplit !== true && !spec.pair && this.splits(m, n, k, B0 * B1) >= 2) {
+      const splits = this.splits(m, n, k, 1);
       const chunk = Math.ceil(k / splits / 32) * 32;      // (a multiple of either kernel's K step)
       const parts = Math.ceil(k / chunk);
       // ...into ONE scratch per size class, shared by every split GEMM recorded: the dispatches run in order, so
@@ -570,6 +570,30 @@ export class Bioemu2Ops {
                                  [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? [])], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
     return step;
+  }
+
+  /** How many K parts gemm() splits an (m, n, k) GEMM into; under 2 it is not split. */
+  splits(m, n, k, batches = 1) {
+    const v2 = this.gemmVersion === 2;
+    const tiles = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * batches;
+    const work = v2 ? 2 : 1;
+    if (batches !== 1 || tiles * work >= 256 || k < 512) return 1;
+    return Math.min(Math.floor(k / 128), Math.ceil((this.splitTarget ?? 128) / (tiles * work)));
+  }
+
+  /**
+   * y = silu(x fc1^T) * (x fc2^T) over `rows` rows, w = [fc1; fc2] stacked ([2 hidden][inC]): one GEMM whose epilogue
+   * is the SwiGLU (gemm2Source's pair mode), the [rows][2 hidden] pre-activations never stored. Null where that GEMM
+   * would be split over K (a pair GEMM is not) or the kernel is not gemm2Source: the caller takes the two-pass path.
+   */
+  async swigluLinear({ x, w, y, rows, inC, hidden }) {
+    if (this.fuseSwiglu === false || this.gemmVersion !== 2 || hidden % 4 || this.splits(rows, 2 * hidden, inC) >= 2) return null;
+    return this.gemm({ m: rows, n: 2 * hidden, k: inC, a: x, b: w, c: y,
+      A: { off: 0, m: inC, k: 1 }, B: { off: 0, n: inC, k: 1 }, C: { off: 0, m: hidden, n: 1 },
+      pair: { key: `swiglu${hidden}`, half: hidden, buffers: [], decls: "", body: `fn pairOut(r: u32, j0: u32, g: vec4<f32>, v: vec4<f32>) {
+  let y = g / (vec4<f32>(1.0) + exp(-g)) * v;
+  for (var w = 0u; w < 4u; w += 1u) { c[r * ${hidden}u + j0 + w] = y[w]; }
+}` } });
   }
 
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
