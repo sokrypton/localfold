@@ -259,8 +259,18 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   0.8 T multiply-adds/s that is ~300 G floats/s against `probe-alu.js`'s ~320 G workgroup reads/s - the ceiling, which
   is why f16 ARITHMETIC (twice the ALU rate on an M5) never paid. Two thirds of the reads are the weight's panel, and
   the weight is half already: staged as f16 and widened as it is read, it is EXACT - stage dumps bit-identical - and
-  a third less traffic. A call 244 -> 231 ms; the fold 52.2 -> 50.4 s, the same RMSDs. (The activations' panel stays
-  float32: rounding it is metal/bioemu2's precision, 2-5x this port's against the float32 reference.)
+  a third less traffic. A call 244 -> 231 ms; the fold 52.2 -> 50.4 s, the same RMSDs. 🔴 **THE ACTIVATIONS' PANEL
+  STAYS FLOAT32, MEASURED**: staged in f16 too on every normalised-input GEMM (the projections, every fc1 | fc2, P,
+  the conditioning - never fc3's unbounded SwiGLU products nor Z's Xq), a call 212.9 -> 209.2 ms (1.7%) for twice the
+  error against metal/bioemu2 --f32 (1.4e-3 / 2.8e-3 / 1.0e-3 / 1.3e-5 -> 2.7e-3 / 6.9e-3 / 2.1e-3 / 2.3e-5, Metal's
+  fast arm's band). Not taken: this port's float32 activations are what make it the more accurate of the two.
+- 🔴 **ON AN M5 THE DEVELOPER FLAGS MAKE THE TRUNK SLOWER.** At 255 tokens (5CAJ) the trunk is 7.76 s a pass under
+  gpu-chrome.mjs's flags and 5.06 s under `LOCALFOLD_STOCK_FLAGS=1`: `--enable-unsafe-webgpu` exposes the M5's 8 x 8
+  matrix units and ESMFold2's trunk kernels then pick matrix arms that lose here (its pair transition 365 against
+  229 ms in bench-esmfold2-trunk.js). A visitor runs stock, so the shipped path is the faster one - but read every
+  trunk number this harness gives on Apple silicon as pessimistic. The denoiser does not move (669 / 664 ms a call).
+  At 255 tokens: WebGPU a call 664 ms (5 samples) and a trunk of 20 s; Metal a trunk of 6.2 s and the sampler ~40 s for
+  200 steps, the coupling split worth 16% there (11.8 -> 10.0 s at 50 steps).
 - **The atom stream's windowed attention in one kernel** (`ops.windowAttention`; `fuseWindow: false` / `--fuse-win=off`
   the control): the scores GEMM, the softmax, the P.V GEMM and the gating pass - three dispatches a sample and one a
   layer - as one dispatch a (sample, window, head), 128 lanes, four a query holding its query's row, the 128 keys in
