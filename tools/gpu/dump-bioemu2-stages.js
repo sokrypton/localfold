@@ -52,7 +52,8 @@ export async function main(device, args) {
 
   const read = bundleReader(model);
   await read.prefetch();
-  const net = new Bioemu2Gpu(device, read, { half, trunkPrecision });
+  // --split=off: the coupling's atom-side mixer unsplit (webgpu/bioemu2's couplingSplit, the control)
+  const net = new Bioemu2Gpu(device, read, { half, trunkPrecision, couplingSplit: option(args, "split", "on") !== "off" });
   const g = net.upload(features);
   const realAtoms = features.atom_mask.reduce((s, v) => s + v, 0);
 

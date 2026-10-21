@@ -94,6 +94,90 @@ export class Bioemu2Gpu {
   // --- reusable recorded blocks ---------------------------------------------------------------------------
 
   /**
+   * The coupling's ATOM-side mixer, split - the steps that write its SwiGLU product `out` [S N][I].
+   *
+   * s_to_q reads y = LN([a_token | q_atom]) (1 + alpha) + beta, one 896-wide row an atom of every sample: 2880 x 896 ->
+   * 3584 at 68 tokens x 5 samples, 44% of a denoiser call here (tools/gpu/profile-bioemu2.js). But exactly
+   *   W y = (sa P[token] + sq Z[atom] + da Qa[tok] + dq Qq[tok]) / sigma + B[tok]
+   *   P = W_a ((1 + alpha_a) (a - mean a) / sa)   once a TOKEN row (W_a: W's first 768 columns)
+   *   Z = W_q ((1 + alpha_q) (q - mean q) / sq)   the atom's own 128 columns
+   *   Qa = W_a (1 + alpha_a), Qq = W_q (1 + alpha_q), B = W beta   once a token, sample-free
+   * the row's statistics combined from its two halves' (da = mean a - mu, dq = mean q - mu, var = (SS_a + SS_q +
+   * 768 da^2 + 128 dq^2) / 896 - the parallel-variance form, never E[x^2] - mu^2), and sa, sq each half's own spread,
+   * which any positive scale would do: they keep the GEMMs' inputs O(1) as a LayerNorm's are. 9.25 -> 2.7 G
+   * multiply-adds. The inputs stay float32 (this port's GEMM unpacks the half weight and never rounds its input - on
+   * metal/bioemu2, which rounds it, Xq in half cost the split its precision). A padding atom (map -1) conditions on
+   * the identity, gamma 1 and beta 0, as this port's adaLN gives it.
+   */
+  async couplingSplit(steps, prefix, { a, q, condQ, atomTokenS, S, T, N, cs, out }) {
+    const o = this.ops;
+    const DT = BIOEMU2.token, DA = BIOEMU2.atom, DC = DT + DA, I = 1792, W2 = 2 * I;
+    const W = await this.swiglu(prefix);                   // [fc1; fc2], [W2][DC]
+    // gamma_a, gamma_q and beta from the T conditioning rows, and row T the padding's identity
+    steps.push(await o.map("cs-gamma", (T + 1) * DC, [{ buffer: cs.gA, write: true }, { buffer: cs.gQ, write: true },
+      { buffer: cs.beta, write: true }, { buffer: condQ }],
+    `let t = i / 896u; let c = i % 896u; let real = t < U(0u);
+  var al = 0.0; var be = 0.0;
+  if (real) { al = b3[t * 1920u + c]; be = b3[t * 1920u + 896u + c]; }
+  if (c < 768u) { b0[t * 768u + c] = 1.0 + al; } else { b1[t * 128u + c - 768u] = 1.0 + al; }
+  b2[i] = be;`, [T]));
+    // Qa | Qq | B, one buffer [T + 1][3][W2] (the combine reads them through one binding)
+    const qb = (k, rows, a0, aStride, wOff) => o.gemm({ m: rows, n: W2, k, a: a0, b: W, c: cs.QB,
+      A: { off: 0, m: aStride, k: 1 }, B: { off: wOff, n: DC, k: 1 }, C: { off: 0, m: 3 * W2, n: 1 } });
+    steps.push(await qb(DT, T + 1, cs.gA, DT, 0));
+    const qq = await o.gemm({ m: T + 1, n: W2, k: DA, a: cs.gQ, b: W, c: cs.QB,
+      A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: W2, m: 3 * W2, n: 1 } });
+    steps.push(qq);
+    steps.push(await o.gemm({ m: T + 1, n: W2, k: DC, a: cs.beta, b: W, c: cs.QB,
+      A: { off: 0, m: DC, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: 2 * W2, m: 3 * W2, n: 1 } }));
+    // a token row (sample-stacked): its mean, centred sum of squares and spread; then Xa and P
+    steps.push(await o.map("cs-tstats", S * T, [{ buffer: cs.tstats, write: true }, { buffer: a }],
+    `let base = i * 768u; var m = 0.0;
+  for (var c = 0u; c < 768u; c += 1u) { m += b1[base + c]; }
+  m = m / 768.0; var v = 0.0;
+  for (var c = 0u; c < 768u; c += 1u) { let d = b1[base + c] - m; v += d * d; }
+  b0[i * 3u] = m; b0[i * 3u + 1u] = v; b0[i * 3u + 2u] = sqrt(v / 768.0 + 1e-5);`));
+    steps.push(await o.map("cs-xa", S * T * DT, [{ buffer: cs.xa, write: true }, { buffer: a }, { buffer: cs.tstats }, { buffer: cs.gA }],
+    `let r = i / 768u; let c = i % 768u; let t = r % U(0u);
+  b0[i] = b3[t * 768u + c] * (b1[i] - b2[r * 3u]) / b2[r * 3u + 2u];`, [T]));
+    steps.push(await o.gemm({ m: S * T, n: W2, k: DT, a: cs.xa, b: W, c: cs.P,
+      A: { off: 0, m: DT, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
+    // an atom row: q's statistics, the whole row's combined (a padding atom's a is zero), its token's spread; Xq; Z
+    steps.push(await o.map("cs-astats", S * N, [{ buffer: cs.astats, write: true }, { buffer: q }, { buffer: cs.tstats },
+      { buffer: atomTokenS, type: "i32" }],
+    `let base = i * 128u; var mq = 0.0;
+  for (var c = 0u; c < 128u; c += 1u) { mq += b1[base + c]; }
+  mq = mq / 128.0; var ssq = 0.0;
+  for (var c = 0u; c < 128u; c += 1u) { let d = b1[base + c] - mq; ssq += d * d; }
+  let st = b3[i]; var ma = 0.0; var ssa = 0.0; var sa = 0.0;
+  if (st >= 0) { let k = u32(st) * 3u; ma = b2[k]; ssa = b2[k + 1u]; sa = b2[k + 2u]; }
+  let mu = (768.0 * ma + 128.0 * mq) / 896.0; let da = ma - mu; let dq = mq - mu;
+  let v = (ssa + ssq + 768.0 * da * da + 128.0 * dq * dq) / 896.0;
+  let o = i * 6u;
+  b0[o] = inverseSqrt(v + 1e-5); b0[o + 1u] = da; b0[o + 2u] = dq; b0[o + 3u] = sqrt(ssq / 128.0 + 1e-5); b0[o + 4u] = mq;
+  b0[o + 5u] = sa;`));
+    steps.push(await o.map("cs-xq", S * N * DA, [{ buffer: cs.xq, write: true }, { buffer: q }, { buffer: cs.astats },
+      { buffer: cs.gQ }, { buffer: atomTokenS, type: "i32" }],
+    `let r = i / 128u; let c = i % 128u; let st = b4[r]; var t = U(0u);
+  if (st >= 0) { t = u32(st) % U(0u); }
+  b0[i] = b3[t * 128u + c] * (b1[i] - b2[r * 6u + 4u]) / b2[r * 6u + 3u];`, [T]));
+    steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: cs.Z,
+      A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
+    // each atom's two pre-activations, and the SwiGLU of them
+    steps.push(await o.map("cs-combine", S * N * I, [{ buffer: out, write: true }, { buffer: cs.astats }, { buffer: cs.P },
+      { buffer: cs.Z }, { buffer: cs.QB }, { buffer: atomTokenS, type: "i32" }],
+    `let r = i / 1792u; let j = i % 1792u; let st = b5[r]; var t = U(0u);
+  if (st >= 0) { t = u32(st) % U(0u); }
+  let s = r * 6u; let inv = b1[s]; let da = b1[s + 1u]; let dq = b1[s + 2u]; let sq = b1[s + 3u]; let sa = b1[s + 5u];
+  var p1 = 0.0; var p2 = 0.0;
+  if (st >= 0) { let pr = u32(st) * 3584u; p1 = sa * b2[pr + j]; p2 = sa * b2[pr + 1792u + j]; }
+  let zr = r * 3584u; let cr = t * 10752u;
+  let u1 = inv * (p1 + sq * b3[zr + j] + da * b4[cr + j] + dq * b4[cr + 3584u + j]) + b4[cr + 7168u + j];
+  let u2 = inv * (p2 + sq * b3[zr + 1792u + j] + da * b4[cr + 1792u + j] + dq * b4[cr + 3584u + 1792u + j]) + b4[cr + 7168u + 1792u + j];
+  b0[i] = u1 / (1.0 + exp(-u1)) * u2;`, [T]));
+  }
+
+  /**
    * SwiGLU transition over `rows` x `width` (hidden `hidden`): x [+]= fc3(silu(fc1 h) * fc2 h), where h is
    * `input` (already normalised/modulated when `norm` is false) - returned steps write `out`.
    */
@@ -681,6 +765,14 @@ export class Bioemu2Gpu {
     const sT = this.scratch("dt", S * T, DT, { logits: o.buffer("dt.logits", S * BIOEMU2.tokenHeads * T * T) });
     const sA = this.scratch("da", S * N, DA, { kvPad: o.buffer("da.kvPad", S * (N + 2 * CTX) * 2 * DA),
                                                logits: o.buffer("da.logits", NW * BIOEMU2.atomHeads * W_Q * W_K) });
+    // (the coupling's atom-side mixer split - couplingSplit - unless the options turn it off: the control)
+    const split = this.options.couplingSplit !== false;
+    const cs = !split ? null : {
+      gA: o.buffer("cs.gA", (T + 1) * DT), gQ: o.buffer("cs.gQ", (T + 1) * DA), beta: o.buffer("cs.beta", (T + 1) * 896),
+      QB: o.buffer("cs.QB", (T + 1) * 3 * 3584), tstats: o.buffer("cs.tstats", S * T * 3), xa: o.buffer("cs.xa", S * T * DT),
+      P: o.buffer("cs.P", S * T * 3584), astats: o.buffer("cs.astats", S * N * 6), xq: o.buffer("cs.xq", S * N * DA),
+      Z: o.buffer("cs.Z", S * N * 3584),
+    };
     const sq = o.buffer("dn.sq", S * N * 896);
     const sqh = o.buffer("dn.sqh", S * N * 896);
     const sq12 = o.buffer("dn.sq12", S * N * 3584);
@@ -728,14 +820,18 @@ export class Bioemu2Gpu {
       await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 2560, ln: lnT, out: condS,
                                         l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" });
       // s_to_q: concat(a[own sample, token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
-      steps.push(await o.map("cat-aq", S * N * 896, [{ buffer: sq, write: true }, { buffer: a }, { buffer: q }, { buffer: atomTokenS, type: "i32" }],
-        `let at = i / 896u; let c = i % 896u; let t = b3[at];
+      if (split) {
+        await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt });
+      } else {
+        steps.push(await o.map("cat-aq", S * N * 896, [{ buffer: sq, write: true }, { buffer: a }, { buffer: q }, { buffer: atomTokenS, type: "i32" }],
+          `let at = i / 896u; let c = i % 896u; let t = b3[at];
   if (c < 768u) { if (t >= 0) { b0[i] = b1[u32(t) * 768u + c]; } else { b0[i] = 0.0; } } else { b0[i] = b2[at * 128u + c - 768u]; }`));
-      steps.push(await o.layerNorm({ x: sq, y: sqh, rows: S * N, width: 896, mod: { cond: condQ, stride: 1920, alpha: 0, beta: 896, map: atomMap } }));
-      steps.push(await o.linear({ x: sqh, w: await this.swiglu(`${cp}/s_to_q_mixer`), y: sq12, rows: S * N, inC: 896, outC: 3584 }));
-      steps.push(await o.map("swiglu", S * N * 1792, [{ buffer: sq12 }, { buffer: sqt, write: true }],
-        `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
+        steps.push(await o.layerNorm({ x: sq, y: sqh, rows: S * N, width: 896, mod: { cond: condQ, stride: 1920, alpha: 0, beta: 896, map: atomMap } }));
+        steps.push(await o.linear({ x: sqh, w: await this.swiglu(`${cp}/s_to_q_mixer`), y: sq12, rows: S * N, inC: 896, outC: 3584 }));
+        steps.push(await o.map("swiglu", S * N * 1792, [{ buffer: sq12 }, { buffer: sqt, write: true }],
+          `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
+      }
       steps.push(await o.linear({ x: sqt, w: await this.w(`${cp}/s_to_q_mixer/fc3/weight`), y: dq, rows: S * N, inC: 1792, outC: DA }));
       // q_to_s: concat(q[own sample, centre(t)], a) per token, modulated by the token's s coupling, a SwiGLU to 768
       steps.push(await o.map("cat-qa", S * T * 896, [{ buffer: qs, write: true }, { buffer: q }, { buffer: a }, { buffer: centre, type: "i32" }],
