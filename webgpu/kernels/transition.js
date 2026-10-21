@@ -847,7 +847,7 @@ const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+var<workgroup> row_stat: array<f32, 1>;
 
 @compute @workgroup_size(64)
 fn main(
@@ -861,36 +861,94 @@ fn main(
   // workgroups return before touching anything.
   let row = group.x + group.y * GRID_WIDTH;
   if (row >= parameters.rows) { return; }
-  let base = row * parameters.channels;
+  let lane = local.x;
+  let n_ch = parameters.channels;
+  let base = row * n_ch;
+  var x0 = 0.0; var x1 = 0.0; var x2 = 0.0; var x3 = 0.0;
   var sum = 0.0;
-  for (var c = local.x; c < parameters.channels; c += 64u) {
-    sum += source[base + c];
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { x0 = source[base + lane]; sum += x0; }
+    if (lane + 64u < n_ch) { x1 = source[base + lane + 64u]; sum += x1; }
+    if (lane + 128u < n_ch) { x2 = source[base + lane + 128u]; sum += x2; }
+    if (lane + 192u < n_ch) { x3 = source[base + lane + 192u]; sum += x3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      sum += source[base + c];
+    }
   }
-  partial[local.x] = sum;
+  partial[lane] = sum;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(parameters.channels); }
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
   workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  workgroupBarrier();
+  let mean = row_stat[0];
 
   var sum_squared = 0.0;
-  for (var c = local.x; c < parameters.channels; c += 64u) {
-    let centered = source[base + c] - row_mean[0];
-    sum_squared += centered * centered;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { let d0 = x0 - mean; sum_squared += d0 * d0; }
+    if (lane + 64u < n_ch) { let d1 = x1 - mean; sum_squared += d1 * d1; }
+    if (lane + 128u < n_ch) { let d2 = x2 - mean; sum_squared += d2 * d2; }
+    if (lane + 192u < n_ch) { let d3 = x3 - mean; sum_squared += d3 * d3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      let centered = source[base + c] - mean;
+      sum_squared += centered * centered;
+    }
   }
-  partial[local.x] = sum_squared;
+  partial[lane] = sum_squared;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(parameters.channels) + parameters.epsilon);
-  for (var c = local.x; c < parameters.channels; c += 64u) {
-    output[base + c] = (source[base + c] - row_mean[0]) * inverse_std
-      * ${wf("weights[parameters.scale_offset + c]")}
-      + ${wf("weights[parameters.offset_offset + c]")};
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + parameters.epsilon); }
+  workgroupBarrier();
+  let inverse_std = row_stat[0];
+  if (n_ch <= 256u) {
+    if (lane < n_ch) {
+      output[base + lane] = (x0 - mean) * inverse_std
+        * ${wf("weights[parameters.scale_offset + lane]")}
+        + ${wf("weights[parameters.offset_offset + lane]")};
+    }
+    if (lane + 64u < n_ch) {
+      let c = lane + 64u;
+      output[base + c] = (x1 - mean) * inverse_std
+        * ${wf("weights[parameters.scale_offset + c]")}
+        + ${wf("weights[parameters.offset_offset + c]")};
+    }
+    if (lane + 128u < n_ch) {
+      let c = lane + 128u;
+      output[base + c] = (x2 - mean) * inverse_std
+        * ${wf("weights[parameters.scale_offset + c]")}
+        + ${wf("weights[parameters.offset_offset + c]")};
+    }
+    if (lane + 192u < n_ch) {
+      let c = lane + 192u;
+      output[base + c] = (x3 - mean) * inverse_std
+        * ${wf("weights[parameters.scale_offset + c]")}
+        + ${wf("weights[parameters.offset_offset + c]")};
+    }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      output[base + c] = (source[base + c] - mean) * inverse_std
+        * ${wf("weights[parameters.scale_offset + c]")}
+        + ${wf("weights[parameters.offset_offset + c]")};
+    }
   }
 }`;
   // The first pass WRITES the hidden activation and the second READS it, so

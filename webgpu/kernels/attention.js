@@ -143,7 +143,8 @@ export function createAttentionNormParameters(
  * @param {"f32"|"f16"} outputStorage
  */
 export function createAttentionNormalizeShader(outputStorage = "f32") {
-  const value = (c) => `((source[input_base + ${c}] - row_mean[0]) * inverse_std
+  const packOut = outputStorage === "f16";
+  const value = (c, src) => `((${src} - mean) * inverse_std
       * weights[p.scale + ${c}] + weights[p.offset + ${c}])`;
   return `
 const GRID_WIDTH: u32 = 32768u;
@@ -156,7 +157,8 @@ struct NormParameters {
 @group(0) @binding(2) var<uniform> p: NormParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<${storageArray(outputStorage)}>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+var<workgroup> row_stat: array<f32, 1>;
+${packOut ? "var<workgroup> row_tile: array<f32, 256>;" : ""}
 
 fn source_row(row: u32) -> u32 {
   if (p.transpose == 0u) { return row; }
@@ -173,39 +175,86 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   // this adds nothing for them.
   let row = group.x + group.y * GRID_WIDTH;
   if (row >= p.rows) { return; }
-  let input_base = source_row(row) * p.channels;
+  let lane = local.x;
+  let n_ch = p.channels;
+  let input_base = source_row(row) * n_ch;
+  var x0 = 0.0; var x1 = 0.0; var x2 = 0.0; var x3 = 0.0;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source[input_base + c]; }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { x0 = source[input_base + lane]; sum += x0; ${packOut ? "row_tile[lane] = x0;" : ""} }
+    if (lane + 64u < n_ch) { x1 = source[input_base + lane + 64u]; sum += x1; ${packOut ? "row_tile[lane + 64u] = x1;" : ""} }
+    if (lane + 128u < n_ch) { x2 = source[input_base + lane + 128u]; sum += x2; ${packOut ? "row_tile[lane + 128u] = x2;" : ""} }
+    if (lane + 192u < n_ch) { x3 = source[input_base + lane + 192u]; sum += x3; ${packOut ? "row_tile[lane + 192u] = x3;" : ""} }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) { sum += source[input_base + c]; }
   }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
+  partial[lane] = sum;
   workgroupBarrier();
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  workgroupBarrier();
+  let mean = row_stat[0];
   var squared = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source[input_base + c] - row_mean[0];
-    squared += centered * centered;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { let d0 = x0 - mean; squared += d0 * d0; }
+    if (lane + 64u < n_ch) { let d1 = x1 - mean; squared += d1 * d1; }
+    if (lane + 128u < n_ch) { let d2 = x2 - mean; squared += d2 * d2; }
+    if (lane + 192u < n_ch) { let d3 = x3 - mean; squared += d3 * d3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      let centered = source[input_base + c] - mean;
+      squared += centered * centered;
+    }
   }
-  partial[local.x] = squared;
+  partial[lane] = squared;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
-  // A lane owns a PAIR of channels, so it owns the whole word they share.
-  // The channel count is even in every caller; createAttentionNormParameters
-  // is where that is asserted.
-  let pairs = p.channels / 2u;
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + p.epsilon); }
+  workgroupBarrier();
+  let inverse_std = row_stat[0];
+${packOut ? `  let pairs = n_ch / 2u;
   let pair_base = row * pairs;
-  for (var w = local.x; w < pairs; w += 64u) {
-    let c = w * 2u;
-    let pair = pair_base + w;
-    ${storedPair(outputStorage, "output", "pair", value("c"), value("c + 1u"))}
-  }
+  if (n_ch <= 256u) {
+    for (var w = lane; w < pairs; w += 64u) {
+      let c = w * 2u;
+      let pair = pair_base + w;
+      ${storedPair(outputStorage, "output", "pair", value("c", "row_tile[c]"), value("c + 1u", "row_tile[c + 1u]"))}
+    }
+  } else {
+    for (var w = lane; w < pairs; w += 64u) {
+      let c = w * 2u;
+      let pair = pair_base + w;
+      ${storedPair(outputStorage, "output", "pair", value("c", "source[input_base + c]"), value("c + 1u", "source[input_base + c + 1u]"))}
+    }
+  }` : `  let out_base = row * n_ch;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { output[out_base + lane] = ${value("lane", "x0")}; }
+    if (lane + 64u < n_ch) { output[out_base + lane + 64u] = ${value("lane + 64u", "x1")}; }
+    if (lane + 128u < n_ch) { output[out_base + lane + 128u] = ${value("lane + 128u", "x2")}; }
+    if (lane + 192u < n_ch) { output[out_base + lane + 192u] = ${value("lane + 192u", "x3")}; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      output[out_base + c] = ${value("c", "source[input_base + c]")};
+    }
+  }`}
 }`;
 }
 

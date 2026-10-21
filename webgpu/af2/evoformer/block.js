@@ -117,12 +117,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // 69.31. docs/AF2.md has the measurements.
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.sequences * p.head_dim) { return; }
-  let d = index % p.head_dim; let row = index / p.head_dim;
+  let hd = p.head_dim;
+  let d = index % hd; let row = index / hd;
+  let row_base = row * p.channels;
+  let kw_base = p.key_weight + d;
+  let vw_base = p.value_weight + d;
   var key = 0.0; var value = 0.0;
-  for (var c = 0u; c < p.channels; c += 1u) {
-    let x = normalized[row * p.channels + c];
-    key += x * weights[p.key_weight + c * p.head_dim + d];
-    value += x * weights[p.value_weight + c * p.head_dim + d];
+  var c = 0u;
+  for (; c + 3u < p.channels; c += 4u) {
+    let x0 = normalized[row_base + c];
+    let x1 = normalized[row_base + c + 1u];
+    let x2 = normalized[row_base + c + 2u];
+    let x3 = normalized[row_base + c + 3u];
+    let w_off = c * hd;
+    key += x0 * weights[kw_base + w_off];
+    key += x1 * weights[kw_base + w_off + hd];
+    key += x2 * weights[kw_base + w_off + hd * 2u];
+    key += x3 * weights[kw_base + w_off + hd * 3u];
+    value += x0 * weights[vw_base + w_off];
+    value += x1 * weights[vw_base + w_off + hd];
+    value += x2 * weights[vw_base + w_off + hd * 2u];
+    value += x3 * weights[vw_base + w_off + hd * 3u];
+  }
+  for (; c < p.channels; c += 1u) {
+    let x = normalized[row_base + c];
+    key += x * weights[kw_base + c * hd];
+    value += x * weights[vw_base + c * hd];
   }
   keys[index] = key; values[index] = value;
 }`;
@@ -350,34 +370,50 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let nr3 = (col3 * p.sequences + seq3) * ${channels}u;
 
   for (var c = local; c < ${channels}u; c += 64u) {
-    staged[c] = vec4<f32>(
-      normalized[nr0 + c],
-      select(0.0, normalized[nr1 + c], r1 < total_rows),
-      select(0.0, normalized[nr2 + c], r2 < total_rows),
-      select(0.0, normalized[nr3 + c], r3 < total_rows),
-    );
+    if (r3 < total_rows) {
+      staged[c] = vec4<f32>(normalized[nr0 + c], normalized[nr1 + c], normalized[nr2 + c], normalized[nr3 + c]);
+    } else {
+      staged[c] = vec4<f32>(
+        normalized[nr0 + c],
+        select(0.0, normalized[nr1 + c], r1 < total_rows),
+        select(0.0, normalized[nr2 + c], r2 < total_rows),
+        0.0,
+      );
+    }
   }
   workgroupBarrier();
 
   for (var slot = local; slot < ${gates}u; slot += 64u) {
     var gate = vec4<f32>(weights[p.gating_bias + slot]);
+    let gw_base = p.gating_weight + slot;
     for (var c = 0u; c < ${channels}u; c += 1u) {
-      gate += staged[c] * weights[p.gating_weight + c * ${gates}u + slot];
+      gate += staged[c] * weights[gw_base + c * ${gates}u];
     }
-    let att = vec4<f32>(
-      attended[col0 * ${gates}u + slot],
-      select(0.0, attended[col1 * ${gates}u + slot], r1 < total_rows),
-      select(0.0, attended[col2 * ${gates}u + slot], r2 < total_rows),
-      select(0.0, attended[col3 * ${gates}u + slot], r3 < total_rows),
-    );
+    var att: vec4<f32>;
+    if (r3 < total_rows) {
+      att = vec4<f32>(
+        attended[col0 * ${gates}u + slot],
+        attended[col1 * ${gates}u + slot],
+        attended[col2 * ${gates}u + slot],
+        attended[col3 * ${gates}u + slot],
+      );
+    } else {
+      att = vec4<f32>(
+        attended[col0 * ${gates}u + slot],
+        select(0.0, attended[col1 * ${gates}u + slot], r1 < total_rows),
+        select(0.0, attended[col2 * ${gates}u + slot], r2 < total_rows),
+        0.0,
+      );
+    }
     gated[slot] = att / (vec4<f32>(1.0) + exp(-gate));
   }
   workgroupBarrier();
 
   for (var c_out = local; c_out < ${channels}u; c_out += 64u) {
     var result = vec4<f32>(weights[p.output_bias + c_out]);
+    let ow_base = p.output_weight + c_out;
     for (var slot = 0u; slot < ${gates}u; slot += 1u) {
-      result += gated[slot] * weights[p.output_weight + slot * ${channels}u + c_out];
+      result += gated[slot] * weights[ow_base + slot * ${channels}u];
     }
     output[r0 * ${channels}u + c_out] ${residual ? "+=" : "="} result.x;
     if (r1 < total_rows) { output[r1 * ${channels}u + c_out] ${residual ? "+=" : "="} result.y; }

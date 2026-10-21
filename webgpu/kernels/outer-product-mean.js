@@ -135,7 +135,7 @@ export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = `${COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+var<workgroup> row_stat: array<f32, 1>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
@@ -144,32 +144,82 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   // residue is far more than a dispatch may be wide at any real MSA depth.
   let row = group.x + group.y * GRID_WIDTH;
   if (row >= rows) { return; }
-  let base = row * p.c_m;
+  let lane = local.x;
+  let n_ch = p.c_m;
+  let base = row * n_ch;
+  var x0 = 0.0; var x1 = 0.0; var x2 = 0.0; var x3 = 0.0;
   var sum = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) { sum += source[base + c]; }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { x0 = source[base + lane]; sum += x0; }
+    if (lane + 64u < n_ch) { x1 = source[base + lane + 64u]; sum += x1; }
+    if (lane + 128u < n_ch) { x2 = source[base + lane + 128u]; sum += x2; }
+    if (lane + 192u < n_ch) { x3 = source[base + lane + 192u]; sum += x3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) { sum += source[base + c]; }
   }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.c_m); }
+  partial[lane] = sum;
   workgroupBarrier();
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  workgroupBarrier();
+  let mean = row_stat[0];
   var squared = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    let centered = source[base + c] - row_mean[0];
-    squared += centered * centered;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { let d0 = x0 - mean; squared += d0 * d0; }
+    if (lane + 64u < n_ch) { let d1 = x1 - mean; squared += d1 * d1; }
+    if (lane + 128u < n_ch) { let d2 = x2 - mean; squared += d2 * d2; }
+    if (lane + 192u < n_ch) { let d3 = x3 - mean; squared += d3 * d3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      let centered = source[base + c] - mean;
+      squared += centered * centered;
+    }
   }
-  partial[local.x] = squared;
+  partial[lane] = squared;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.c_m) + p.layer_norm_epsilon);
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    output[base + c] = (source[base + c] - row_mean[0]) * inverse_std
-      * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
+  workgroupBarrier();
+  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
+  workgroupBarrier();
+  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + p.layer_norm_epsilon); }
+  workgroupBarrier();
+  let inverse_std = row_stat[0];
+  if (n_ch <= 256u) {
+    if (lane < n_ch) {
+      output[base + lane] = (x0 - mean) * inverse_std * weights[p.layer_norm_scale + lane] + weights[p.layer_norm_offset + lane];
+    }
+    if (lane + 64u < n_ch) {
+      let c = lane + 64u;
+      output[base + c] = (x1 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+    if (lane + 128u < n_ch) {
+      let c = lane + 128u;
+      output[base + c] = (x2 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+    if (lane + 192u < n_ch) {
+      let c = lane + 192u;
+      output[base + c] = (x3 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      output[base + c] = (source[base + c] - mean) * inverse_std
+        * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
   }
 }`;
 
@@ -1067,11 +1117,23 @@ export const OUTER_PRODUCT_MEAN_SCALE_SHADER = `${COMMON}
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let pair = id.x + id.y * GRID_WIDTH * 64u;
   if (pair >= p.length * p.length) { return; }
-  let i = pair / p.length;
-  let j = pair % p.length;
+  let len = p.length;
+  let i = pair / len;
+  let j = pair % len;
   var count = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    let row = sequence * p.length;
+  var sequence = 0u;
+  for (; sequence + 3u < p.sequences; sequence += 4u) {
+    let r0 = sequence * len;
+    let r1 = r0 + len;
+    let r2 = r1 + len;
+    let r3 = r2 + len;
+    count += mask[r0 + i] * mask[r0 + j];
+    count += mask[r1 + i] * mask[r1 + j];
+    count += mask[r2 + i] * mask[r2 + j];
+    count += mask[r3 + i] * mask[r3 + j];
+  }
+  for (; sequence < p.sequences; sequence += 1u) {
+    let row = sequence * len;
     count += mask[row + i] * mask[row + j];
   }
   scale[pair] = 1.0 / (p.normalization_epsilon + count);
