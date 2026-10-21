@@ -245,12 +245,13 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
     static_assert((EP & 1) == 0, "a plain product has no triangle gate");
     {
       if (g.epilogue || g.alpha != 1.f) {
+        const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
         _Pragma("clang loop unroll(full)")
         for (uint16_t e = 0; e < c.get_capacity(); ++e)
           if (c.is_valid_element(e)) {
             const int col = i0 + c.get_multidimensional_index(e)[0];
             float v = (float)c[e] * g.alpha;
-            if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+            if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
             if (g.epilogue & 2) v = max(v, 0.f);
             c[e] = (TACC)v;
           }
@@ -353,7 +354,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         continue;
       }
       if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
-      if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
+      if (g.epilogue & 4) {
+        const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+        v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + i] : ((device const float*)g.bias)[boff + i];
+      }
       if (g.epilogue & 2) v = max(v, 0.f);
       if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
       lf_st(D, (ulong)i + (ulong)j * g.ldd, v);

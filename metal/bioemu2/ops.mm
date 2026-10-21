@@ -73,7 +73,7 @@ void transitionFc3(const half* g, float* out, size_t rows, int I, const std::str
   if (gemmGatedRows(G, gate, ldg, map)) return;
   float* h = scratch<float>("be2.fc3.h", rows * Co);       // (the gated residual's two passes)
   G.Y = h; gemm(G);
-  be2Run1d("be2_gated_add", rows * Co, Be2GatedAddArgs{out, h, gate, map, rows, (uint)Co, (uint)ldg});
+  be2Run1d("be2_gated_add", (rows * Co) >> 2, Be2GatedAddArgs{out, h, gate, map, rows, (uint)Co, (uint)ldg});
 }
 // the fast arm's transition on an input already in half: fc1 | fc2 and the SwiGLU as one GEMM (gemmSwiglu: the product
 // in its epilogue, into half), then fc3 scaled back; a chunk of rows at a time

@@ -707,7 +707,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (the coupling combine, 32768, reads its product in float: a half tile rounds Z before a sum that cancels)
   const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768));
   const bool tri = a.epilogue & 256;
-  const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || scaledHalf) && a.beta == 0.f;
+  const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || !hacc) && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
   // where the weight is wide enough to fill the GPU (3072 x 80 x 768: 0.064 ms at 80 x 64 against 0.078 at 80 x 128) and
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against

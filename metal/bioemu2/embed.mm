@@ -57,28 +57,38 @@ static const half* qkvgWeight(const std::string& a, int D) {
                                                        (u64)3 * D * D, (u64)D * D});
   });
 }
-// the token attention on the fast arm: adaLN into half, q|k|v|g in one GEMM, metal/core's flash attention (the gate in
-// its epilogue: out = softmax(q k^T / sqrt(d) + bias) v sigmoid(g)), the output projection from half into h
-static void tokenAttentionHalf(const CondLayer& L, const float* x, float* h, int R, int D, const float* cond, const int* map,
-                               const half* biasH, int T) {
+// the attention on the fast arm: adaLN into half, q|k|v|g in one GEMM, either be2_window_attention_h (windowed atoms:
+// half K/V in 16 KB shared memory, sigmoid(g) in the epilogue) or metal/core's flash attention (tokens), and the
+// output projection from half into x with the gated residual in its epilogue where metal/core takes it
+static void attentionHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map,
+                          const float* bias, const half* biasH, int perSample) {
   const std::string a = L.p + L.att;
   half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
   adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh);
   half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)R * 4 * D);
   Gemm g{}; g.X = hh; g.tx = F16; g.W = qkvgWeight(a, D); g.tw = F16; g.transW = true; g.Y = qkvg; g.ty = F16;
-  g.rows = R; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = "token qkvg";
+  g.rows = R; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = L.windowed ? "atom qkvg" : "token qkvg";
   gemm(g);
   half* o = scratch<half>("be2.cl.oh", (size_t)R * D);
-  Attention at{}; at.qkvg = qkvg; at.out = o; at.n = T; at.heads = L.heads; at.D = D / L.heads; at.rows = R / T;
-  at.scale = 1.f / sqrtf((float)(D / L.heads)); at.bias = biasH; at.biasStride = T; at.qBias = Wf(a + "proj_q_bias");
-  // (every token is real here - no token padding - so no key mask; a padded input would need token_pad_mask as float)
-  attention(at);
-  Gemm G{}; G.X = o; G.tx = F16; G.W = M.h("w/" + a + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = h; G.ty = F32;
-  G.rows = R; G.in = D; G.out = D; G.label = "token proj_o";
-  gemm(G);
+  if (L.windowed) {
+    if (D / L.heads != 32) die("BioEmu2: an atom head of %d (this port is written for 32)", D / L.heads);
+    if (R % WQ || perSample % WQ) die("BioEmu2: %d atom rows are not whole windows", R);
+    run("be2_window_attention_h", Grid{(uint32_t)(R / WQ), (uint32_t)L.heads, 1}, WQ * 4,
+        Be2WindowAttnHArgs{qkvg, Wf(a + "proj_q_bias"), bias, Iin("atom_pad_mask"), o, (uint)perSample, (uint)L.heads});
+  } else {
+    Attention at{}; at.qkvg = qkvg; at.out = o; at.n = perSample; at.heads = L.heads; at.D = D / L.heads; at.rows = R / perSample;
+    at.scale = 1.f / sqrtf((float)(D / L.heads)); at.bias = biasH; at.biasStride = perSample; at.qBias = Wf(a + "proj_q_bias");
+    // (every token is real here - no token padding - so no key mask; a padded input would need token_pad_mask as float)
+    attention(at);
+  }
+  Gemm G{}; G.X = o; G.tx = F16; G.W = M.h("w/" + a + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = x; G.ty = F32;
+  G.rows = R; G.in = D; G.out = D; G.label = L.windowed ? "atom proj_o" : "token proj_o";
+  if (gemmGatedRows(G, cond + 2 * D, 6 * D, map)) return;
+  float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+  G.Y = h; gemm(G);
+  be2Run1d("be2_gated_add", ((size_t)R * D) >> 2, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
 }
-// the attention half of a layer on the reference arm (and the windowed attention on both): adaLN, q|k|v and g, the
-// attention, the gate, the output projection into h
+// the attention half of a layer on the reference arm: adaLN, q|k|v and g, the attention, the gate, the output projection into h
 static void attentionF32(const CondLayer& L, const float* x, float* h, int R, int D, const float* cond, const int* map,
                          const float* bias, int perSample) {
   const std::string a = L.p + L.att;
@@ -105,19 +115,23 @@ static void attentionF32(const CondLayer& L, const float* x, float* h, int R, in
 }
 void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
                const half* biasH) {
-  float* h = scratch<float>("be2.cl.h", (size_t)R * D);
-  if (biasH && !L.windowed) tokenAttentionHalf(L, x, h, R, D, cond, map, biasH, perSample);
-  else attentionF32(L, x, h, R, D, cond, map, bias, perSample);
-  be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
-  float* t = scratch<float>("be2.cl.t", (size_t)R * D);
+  if (HALF && (L.windowed || biasH)) {
+    attentionHalf(L, x, R, D, cond, map, bias, biasH, perSample);
+  } else {
+    float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+    attentionF32(L, x, h, R, D, cond, map, bias, perSample);
+    be2Run1d("be2_gated_add", ((size_t)R * D) >> 2, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
+  }
   if (HALF) {
     half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
     adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh);
     transitionHalf(hh, x, R, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map);    // (x += gamma fc3(...))
   } else {
+    float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+    float* t = scratch<float>("be2.cl.t", (size_t)R * D);
     adaLn(x, h, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
     transition(h, t, R, D, L.p + "transition/", false, false);
-    be2Run1d("be2_gated_add", (size_t)R * D, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
+    be2Run1d("be2_gated_add", ((size_t)R * D) >> 2, Be2GatedAddArgs{x, t, cond + 5 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
   }
 }
 

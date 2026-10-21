@@ -138,6 +138,59 @@ kernel void be2_window_attention(constant Be2WindowAttnArgs& a [[buffer(0)]], ui
   }
   if (part == 0) for (int d = 0; d < HD; ++d) a.out[qa * D + h * HD + d] = acc[d] / sum;
 }
+// the fast arm's sliding-window attention: qkvg [rows][4D] in half, K/V staged in half (16 KB, half the threadgroup limit)
+// with the key mask staged in sm[128], and the output gated by sigmoid(g) into half
+kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]]) {
+  constexpr int HD = 32, SPLIT = 4, KS = BE2_WK / SPLIT;
+  const uint wg = tg.x, h = tg.y, D = a.H * HD, NW = a.N / BE2_WQ, smp = wg / NW, w = wg % NW;
+  const uint i = tid / SPLIT, part = tid % SPLIT;
+  const ulong base = (ulong)smp * a.N;
+  threadgroup half sk[BE2_WK][HD], sv[BE2_WK][HD];
+  threadgroup uchar sm[BE2_WK];
+  for (uint e = tid; e < BE2_WK * HD; e += BE2_WQ * SPLIT) {
+    int j = e / HD, d = e % HD, ka = (int)(w * BE2_WQ) - BE2_CTX + j;
+    bool ok = ka >= 0 && ka < (int)a.N;
+    sk[j][d] = ok ? a.qkvg[(base + ka) * 4 * D + D + h * HD + d] : 0.h;
+    sv[j][d] = ok ? a.qkvg[(base + ka) * 4 * D + 2 * D + h * HD + d] : 0.h;
+  }
+  if (tid < (uint)BE2_WK) {
+    int ka = (int)(w * BE2_WQ) - BE2_CTX + (int)tid;
+    sm[tid] = ka >= 0 && ka < (int)a.N && a.pad[ka] ? 1 : 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong qa = base + w * BE2_WQ + i;
+  float q[HD];
+  const float scale = rsqrt((float)HD);
+  for (int d = 0; d < HD; ++d) q[d] = ((float)a.qkvg[qa * 4 * D + h * HD + d] + a.qBias[h * HD + d]) * scale;
+  device const float* b = a.bias + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK;
+  float mx = -INFINITY, sum = 0, acc[HD];
+  for (int d = 0; d < HD; ++d) acc[d] = 0;
+  for (int jj = 0; jj < KS; ++jj) {
+    const int j = jj * SPLIT + (int)part;
+    float l = 0;
+    for (int d = 0; d < HD; ++d) l += q[d] * (float)sk[j][d];
+    l = sm[j] ? l + b[j] : BE2_NEG_INF;
+    float nm = max(mx, l), f = exp(mx - nm), e = exp(l - nm);
+    sum = sum * f + e;
+    for (int d = 0; d < HD; ++d) acc[d] = acc[d] * f + e * (float)sv[j][d];
+    mx = nm;
+  }
+  for (ushort o = 1; o < SPLIT; o <<= 1) {
+    float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sum, o);
+    float nm = max(mx, om), f = exp(mx - nm), fo = exp(om - nm);
+    sum = sum * f + os * fo;
+    for (int d = 0; d < HD; ++d) { float oa = simd_shuffle_xor(acc[d], o); acc[d] = acc[d] * f + oa * fo; }
+    mx = nm;
+  }
+  if (part == 0) {
+    const float inv = 1.f / sum;
+    for (int d = 0; d < HD; ++d) {
+      const float g = (float)a.qkvg[qa * 4 * D + 3 * D + h * HD + d];
+      a.out[qa * D + h * HD + d] = (half)(acc[d] * inv * lf_sigmoid(g));
+    }
+  }
+}
 // AttentionPairBias over all T tokens of each stacked sample: a thread per (sample, head, query), online softmax over
 // the keys; qkv [samples T][3D] (q, k, v thirds), bias [H][T][T]; out [samples T][D]. (The float32 reference arm: the
 // fast path is metal/core's flash attention.)
@@ -189,26 +242,82 @@ kernel void be2_sigmoid_mul(LF_ARGS(Be2SigmoidMulArgs)) {
 }
 kernel void be2_gated_add(LF_ARGS(Be2GatedAddArgs)) {
   ulong t = LF_INDEX;
-  if (t >= a.rows * a.C) return;
-  BE2_SPLIT(t, a.C, r, c);
+  const uint C4 = a.C >> 2;
+  if (t >= a.rows * C4) return;
+  BE2_SPLIT(t, C4, r, c4);
   uint g = a.map ? (uint)a.map[r] : r;
-  a.x[t] += a.gate[(ulong)g * a.ldg + c] * a.h[t];
+  ((device float4*)a.x)[t] += ((device const float4*)(a.gate + (ulong)g * a.ldg))[c4] * ((device const float4*)a.h)[t];
 }
 kernel void be2_ada_ln(LF_ARGS(Be2AdaLnArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.x + row * a.ldx;
-  float s = 0; for (uint c = lane; c < a.C; c += 32) s += xr[c];
+  float xv[28], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
   s = simd_sum(s);
   float mean = s / a.C, v = 0;
-  for (uint c = lane; c < a.C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
   v = simd_sum(v);
   float inv = rsqrt(v / a.C + 1e-5f);
   const ulong cr = a.map ? (ulong)a.map[row] : row;
-  for (uint c = lane; c < a.C; c += 32) {
-    const float v = a.scale * ((xr[c] - mean) * inv * (1.f + a.alpha[cr * a.ldc + c]) + a.beta[cr * a.ldc + c]);
-    if (a.yh) a.yh[row * a.C + c] = (half)v; else a.y[row * a.C + c] = v;
+  device const float* al = a.alpha + cr * a.ldc;
+  device const float* be = a.beta + cr * a.ldc;
+  k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) {
+    const float val = a.scale * ((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
+    if (a.yh) a.yh[row * a.C + c] = (half)val; else a.y[row * a.C + c] = val;
   }
+}
+kernel void be2_ada_ln_q2s(LF_ARGS(Be2AdaLnQ2SArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  BE2_SPLIT(row, a.T, s, il);
+  device const float* qr = a.q + ((ulong)s * a.N + a.centre[il]) * a.Ca;
+  device const float* ar = a.a + row * a.Dt;
+  const uint C = a.Ca + a.Dt;
+  float xv[28], sum = 0;
+  uint k = 0;
+  for (uint c = lane; c < C; c += 32, ++k) {
+    float x = c < a.Ca ? qr[c] : ar[c - a.Ca];
+    xv[k] = x; sum += x;
+  }
+  const float mean = simd_sum(sum) / C;
+  float v = 0;
+  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
+  const ulong cr = a.map ? (ulong)a.map[row] : row;
+  device const float* al = a.alpha + cr * a.ldc;
+  device const float* be = a.beta + cr * a.ldc;
+  device half* yr = a.yh + row * C;
+  k = 0;
+  for (uint c = lane; c < C; c += 32, ++k)
+    yr[c] = (half)((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
+}
+kernel void be2_ada_ln_s2q(LF_ARGS(Be2AdaLnS2QArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  BE2_SPLIT(row, a.N, s, alIdx);
+  device const float* ar = a.pad[alIdx] ? a.a + ((ulong)s * a.T + a.atomTok[alIdx]) * a.Dt : nullptr;
+  device const float* qr = a.q + row * a.Ca;
+  const uint C = a.Dt + a.Ca;
+  float xv[28], sum = 0;
+  uint k = 0;
+  for (uint c = lane; c < C; c += 32, ++k) {
+    float x = c < a.Dt ? (ar ? ar[c] : 0.f) : qr[c - a.Dt];
+    xv[k] = x; sum += x;
+  }
+  const float mean = simd_sum(sum) / C;
+  float v = 0;
+  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
+  const ulong cr = a.map ? (ulong)a.map[row] : row;
+  device const float* al = a.alpha + cr * a.ldc;
+  device const float* be = a.beta + cr * a.ldc;
+  device half* yr = a.yh + row * C;
+  k = 0;
+  for (uint c = lane; c < C; c += 32, ++k)
+    yr[c] = (half)((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
 }
 // the coupling split's statistics and normalised halves (Be2CsTokArgs, Be2CsAtomArgs): webgpu/bioemu2's cs-tstats /
 // cs-xa and cs-astats / cs-xq, the parallel-variance form (never E[x^2] - mu^2)
@@ -216,23 +325,28 @@ kernel void be2_cs_tok(LF_ARGS(Be2CsTokArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.a + row * a.C;
-  float s = 0; for (uint c = lane; c < a.C; c += 32) s += xr[c];
+  float xv[24], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
   const float m = simd_sum(s) / a.C;
-  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = xr[c] - m; v += d * d; }
+  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - m; v += d * d; }
   v = simd_sum(v);
   const float sa = sqrt(v / a.C + 1e-5f);
   if (lane == 0) { a.tstats[row * 3] = m; a.tstats[row * 3 + 1] = v; a.tstats[row * 3 + 2] = sa; }
   const uint t = (uint)row - lf_udiv((uint)row, a.T) * a.T;
   device const float* al = a.cqc + (ulong)t * a.ldc;
-  for (uint c = lane; c < a.C; c += 32) a.xa[row * a.C + c] = (half)((1.f + al[c]) * (xr[c] - m) / sa);
+  k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) a.xa[row * a.C + c] = (half)((1.f + al[c]) * (xv[k] - m) / sa);
 }
 kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.q + row * a.Ca;
-  float s = 0; for (uint c = lane; c < a.Ca; c += 32) s += xr[c];
+  float xv[4], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.Ca; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
   const float mq = simd_sum(s) / a.Ca;
-  float v = 0; for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
+  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - mq; v += d * d; }
   const float ssq = simd_sum(v);
   const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
   const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
@@ -249,11 +363,12 @@ kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   }
   device const float* aq = a.cqc + (ulong)t * a.ldc + a.Dt;
   // (two halves, hi and the remainder: Xq in ONE half cost the split its precision - metal/bioemu2's denoise.mm)
-  for (uint c = lane; c < a.Ca; c += 32) {
-    const float v = (1.f + aq[c]) * (xr[c] - mq) / sq;
-    const half h = (half)v;
+  k = 0;
+  for (uint c = lane; c < a.Ca; c += 32, ++k) {
+    const float val = (1.f + aq[c]) * (xv[k] - mq) / sq;
+    const half h = (half)val;
     a.xq[row * 2 * a.Ca + c] = h;
-    a.xq[row * 2 * a.Ca + a.Ca + c] = (half)(v - (float)h);
+    a.xq[row * 2 * a.Ca + a.Ca + c] = (half)(val - (float)h);
   }
 }
 kernel void be2_cs_gamma(LF_ARGS(Be2CsGammaArgs)) {
@@ -266,8 +381,9 @@ kernel void be2_cs_gamma(LF_ARGS(Be2CsGammaArgs)) {
   if (c < a.Dt) g *= -(float)a.Ca / (float)a.Dt;
   const float b = a.cqc[(ulong)t * a.ldc + Dc + c];
   const half gh = (half)g, bh = (half)b;
-  a.gR[i] = gh; a.gR[a.n + i] = (half)(g - (float)gh);
-  a.beta[i] = bh; a.beta[a.n + i] = (half)(b - (float)bh);
+  const ulong ir = (ulong)(2 * t) * Dc + c, ib = (ulong)(2 * t + 1) * Dc + c, span = 2 * a.n;
+  a.gR[ir] = gh; a.gR[span + ir] = (half)(g - (float)gh);
+  a.gR[ib] = bh; a.gR[span + ib] = (half)(b - (float)bh);
 }
 kernel void be2_cs_wq2(LF_ARGS(Be2CsWqArgs)) {
   ulong t = LF_INDEX;
@@ -282,14 +398,17 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
   if (row >= a.rows) return;
   const uint j = lf_udiv((uint)row, a.Rc), r = (uint)row - j * a.Rc;
   device const float* x = a.c + (ulong)r * a.C;
-  float s = 0; for (uint c = lane; c < a.C; c += 32) s += x[c];
+  float xv[24], s = 0;
+  uint k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) { float val = x[c]; xv[k] = val; s += val; }
   const float mean = simd_sum(s) / a.C;
-  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = x[c] - mean; v += d * d; }
+  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - mean; v += d * d; }
   const float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
   device const float* w = a.w + (ulong)(a.l0 + j) * a.C;
   device const float* b = a.b ? a.b + (ulong)(a.l0 + j) * a.C : nullptr;
-  for (uint c = lane; c < a.C; c += 32) {      // (lf_layernorm's order, then be2_unary's silu)
-    float n = (x[c] - mean) * inv;
+  k = 0;
+  for (uint c = lane; c < a.C; c += 32, ++k) {      // (lf_layernorm's order, then be2_unary's silu)
+    float n = (xv[k] - mean) * inv;
     n *= w[c];
     if (b) n += b[c];
     a.out[row * a.C + c] = (half)lf_silu(n);
@@ -297,10 +416,11 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
 }
 kernel void be2_batch_bias(LF_ARGS(Be2BatchBiasArgs)) {
   ulong t = LF_INDEX;
-  if (t >= a.n) return;
-  BE2_SPLIT(t, a.O, row, o);
+  const uint O4 = a.O >> 2;
+  if (t >= (a.n >> 2)) return;
+  BE2_SPLIT(t, O4, row, o4);
   const uint j = lf_udiv(row, a.Rc);
-  a.y[t] += a.bias[(ulong)(a.l0 + j) * a.O + o];
+  ((device float4*)a.y)[t] += ((device const float4*)a.bias)[(ulong)(a.l0 + j) * O4 + o4];
 }
 kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
   ulong t = LF_INDEX;

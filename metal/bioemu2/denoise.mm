@@ -155,7 +155,7 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
   const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
-  half* gR = scratch<half>("be2.cs.gR", 2 * R * Dc); half* beta = scratch<half>("be2.cs.beta", 2 * R * Dc);
+  half* gR = scratch<half>("be2.cs.gR", 4 * R * Dc);
   float* QB = scratch<float>("be2.cs.QB", R * 4 * I);
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
@@ -175,18 +175,14 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
   float* stats = scratch<float>("be2.cs.stats", RN * 8); half* xq = scratch<half>("be2.cs.xq", RN * Ca * 2);
   half* g = scratch<half>("be2.cs.g", RN * I);
-  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gR, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
+  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gR, nullptr, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
   // R | B [R][2][2I] in float - R = Qq - Qa / 6 (da = -dq / 6 exactly, as 768 da + 128 dq = 0: one vector where Qa and
-  // Qq were two, and the epilogue reads a quarter less) - each two GEMMs on the matrix units, the rows' hi then their
-  // remainder added (float's precision: as one float GEMM off the matrix units, Qa | Qq | B were 12% of the sampler)
-  auto qb = [&](const half* X, int col, const char* label) {
-    for (int part = 0; part < 2; ++part) {
-      Gemm G{}; G.X = X + (size_t)part * R * Dc; G.tx = F16; G.W = w12; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 4 * I;
-      G.rows = R; G.in = Dc; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = label; gemm(G);
-    }
-  };
-  qb(gR, 0, "coupling R");
-  qb(beta, 2 * I, "coupling B");
+  // Qq were two, and the epilogue reads a quarter less) - even rows gR, odd rows beta, stacked into [2R][Dc] so R and B
+  // share a single 2R-row GEMM per hi/lo part (64x128 vector epilogue instead of two 80x32 staged GEMMs)
+  for (int part = 0; part < 2; ++part) {
+    Gemm G{}; G.X = gR + (size_t)part * 2 * R * Dc; G.tx = F16; G.W = w12; G.tw = F16; G.Y = QB; G.ty = F32; G.ldy = 2 * I;
+    G.rows = 2 * R; G.in = Dc; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = "coupling RB"; gemm(G);
+  }
   auto rowsGrid = [](size_t rows) {
     const size_t groups = (rows + 7) / 8;
     return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
@@ -255,11 +251,9 @@ static void condGroup(const float* cnd, int T, int Dt, int layers, int l0, int n
     Gemm G{}; G.ptrs = true; G.batch = n;
     G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16; G.transW = true;
     G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = Rc; G.in = Dt; G.out = O; G.label = "conditioning, layers batched";
+    if (hasW(K.prefix(0) + l2n + "/bias"))
+      G.bias = stackedVectors(K.key, K, (l2n + "/bias").c_str(), layers, O) + (size_t)l0 * O;
     gemm(G);
-    if (hasW(K.prefix(0) + l2n + "/bias")) {
-      const float* bias = stackedVectors(K.key, K, (l2n + "/bias").c_str(), layers, O);
-      be2Run1d("be2_batch_bias", (size_t)n * Rc * O, Be2BatchBiasArgs{out[k], bias, (u64)n * Rc * O, (uint)Rc, (uint)O, (uint)l0, 0});
-    }
   }
 }
 
@@ -374,34 +368,41 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
       linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt, 0.f, 0, 0, false, WfOpt(cp + "s_coupling_cond_2/bias"));
     }
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
-    // (the fast arm on the matrix units: s_to_q SPLIT - couplingSplit - and its row never built)
-    const bool csplit = HALF && gemmTensorOps() && splitPays(samples, T, N, Dt, Ca);
-    if (!csplit) {
+    // (the fast arm: both inputs normalised directly into half from q and a, or s_to_q SPLIT via couplingSplit)
+    if (HALF) {
+      const bool csplit = gemmTensorOps() && splitPays(samples, T, N, Dt, Ca);
+      auto rowsGrid = [](size_t rows) {
+        const size_t groups = (rows + 7) / 8;
+        return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
+      };
+      half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
+      run("be2_ada_ln_q2s", rowsGrid(RT), 256,
+          Be2AdaLnQ2SArgs{q, a, Iin("token_center_atom_index"), csc, csc + Dc, maps.tok, qsh, (u64)RT,
+                          (uint)T, (uint)N, (uint)Ca, (uint)Dt, (uint)(2 * Dc + Dt), 0});
+      // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: qsh is already formed from untouched q and
+      // a before s_to_q updates q, and s_to_q reads untouched a before q_to_s updates a)
+      if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
+      else {
+        half* sqh = scratch<half>("be2.dn.sqh", RN * Dc);
+        run("be2_ada_ln_s2q", rowsGrid(RN), 256,
+            Be2AdaLnS2QArgs{a, q, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), cqc, cqc + Dc, maps.atomTok, sqh, (u64)RN,
+                            (uint)T, (uint)N, (uint)Dt, (uint)Ca, (uint)(2 * Dc + Ca), 0});
+        transitionHalf(sqh, q, RN, Dc, cp + "s_to_q_mixer/", false, cqc + 2 * Dc, 2 * Dc + Ca, maps.atomTok);
+      }
+      transitionHalf(qsh, a, RT, Dc, cp + "q_to_s_mixer/", false, csc + 2 * Dc, 2 * Dc + Dt, maps.tok);
+    } else {
       be2Run1d("be2_tokens_to_atoms", RN * Dt, Be2TokensToAtomsArgs{a, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), sq, (u64)N,
                                                                  (uint)T, (uint)Dt, (uint)Dc, (uint)samples, 0.f, 0});
       copy2d(sq + Dt, (size_t)Dc * 4, q, (size_t)Ca * 4, (size_t)Ca * 4, RN);
-    }
-    be2Run1d("be2_centre_atoms", RT * Ca, Be2CentreAtomsArgs{q, Iin("token_center_atom_index"), qs, (uint)T, (uint)N, (uint)Ca,
-                                                          (uint)Dc, (uint)samples, 0});
-    copy2d(qs + Ca, (size_t)Dc * 4, a, (size_t)Dt * 4, (size_t)Dt * 4, RT);
-    if (HALF) {      // (the adaLN straight into the fused transition's half input)
-      half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
-      // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: both mixers' inputs - sq and qs, or the
-      // split's reads of a and q - are taken before either update)
-      if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
-      else {
-        adaLn(sq, nullptr, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok, sqh);
-        transitionHalf(sqh, q, RN, Dc, cp + "s_to_q_mixer/", false, cqc + 2 * Dc, 2 * Dc + Ca, maps.atomTok);
-      }
-      adaLn(qs, nullptr, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, maps.tok, qsh);
-      transitionHalf(qsh, a, RT, Dc, cp + "q_to_s_mixer/", false, csc + 2 * Dc, 2 * Dc + Dt, maps.tok);
-    } else {
+      be2Run1d("be2_centre_atoms", RT * Ca, Be2CentreAtomsArgs{q, Iin("token_center_atom_index"), qs, (uint)T, (uint)N, (uint)Ca,
+                                                            (uint)Dc, (uint)samples, 0});
+      copy2d(qs + Ca, (size_t)Dc * 4, a, (size_t)Dt * 4, (size_t)Dt * 4, RT);
       adaLn(sq, sqn, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transition(sqn, dq, RN, Dc, cp + "s_to_q_mixer/", false, false);
       adaLn(qs, qsn, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
       transition(qsn, da, RT, Dc, cp + "q_to_s_mixer/", false, false);
-      be2Run1d("be2_gated_add", RN * Ca, Be2GatedAddArgs{q, dq, cqc + 2 * Dc, maps.atomTok, RN, (uint)Ca, (uint)(2 * Dc + Ca)});
-      be2Run1d("be2_gated_add", RT * Dt, Be2GatedAddArgs{a, da, csc + 2 * Dc, maps.tok, RT, (uint)Dt, (uint)(2 * Dc + Dt)});
+      be2Run1d("be2_gated_add", (RN * Ca) >> 2, Be2GatedAddArgs{q, dq, cqc + 2 * Dc, maps.atomTok, RN, (uint)Ca, (uint)(2 * Dc + Ca)});
+      be2Run1d("be2_gated_add", (RT * Dt) >> 2, Be2GatedAddArgs{a, da, csc + 2 * Dc, maps.tok, RT, (uint)Dt, (uint)(2 * Dc + Dt)});
     }
   }
   // the readout

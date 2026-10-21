@@ -254,8 +254,9 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
                 _Pragma("clang loop unroll(full)")
                 for (int t = 0; t < 2; ++t) {
                   const int col = i0 + sc + b * 8 + sn3 + t;
+                  const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
                   float v = (float)e[t];
-                  if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+                  if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
                   if (g.epilogue & 2) v = max(v, 0.f);
                   e[t] = v;
                 }
@@ -289,7 +290,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               v = (float)c[t] + (float)x[t] * (1.f / (1.f + exp(-v)));
             } else {
               if (g.beta != 0.f) v += g.beta * (float)c[t];
-              if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+              if (g.epilogue & 4) {
+                const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+                v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
+              }
               if (g.epilogue & 2) v = max(v, 0.f);
               if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
             }
@@ -340,7 +344,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           continue;
         }
         if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
-        if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
+        if (g.epilogue & 4) {
+          const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+          v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + i] : ((device const float*)g.bias)[boff + i];
+        }
         if (g.epilogue & 2) v = max(v, 0.f);
         if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
         lf_st(D, (ulong)i + (ulong)j * g.ldd, v);

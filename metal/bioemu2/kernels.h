@@ -14,8 +14,10 @@ struct Be2PairTailArgs { DP(float) pr; CP(float) cq; CP(float) ck; CP(float) w1;
 // LN(pr) (scale, no offset) -> proj_z: out[w][h][i][j]
 struct Be2WindowBiasArgs { CP(float) pr; CP(float) normW; CP(float) projZ; DP(float) out; uint N, H; };
 // the sliding-window attention: a threadgroup per (window of a stacked sample, head), a thread per query; qkv [rows][3D]
-// (q at 0, k at D, v at 2D), out [rows][D]; N atoms a sample
+// (q at 0, k at D, v at 2D), out [rows][D]; N atoms a sample. The fast arm's _h takes qkvg [rows][4D] in half and gates
+// its half output in the epilogue
 struct Be2WindowAttnArgs { CP(float) qkv; CP(float) qBias; CP(float) bias; CP(int) pad; DP(float) out; uint N, H; };
+struct Be2WindowAttnHArgs { CP(half) qkvg; CP(float) qBias; CP(float) bias; CP(int) pad; DP(half) out; uint N, H; };
 // the full token attention: a thread per (sample, head, query); bias [H][T][T] shared by the samples
 struct Be2TokenAttnArgs { CP(float) qkv; CP(float) qBias; CP(float) bias; CP(int) keyMask; DP(float) out;
                           uint T, D, H, samples; };
@@ -31,6 +33,11 @@ struct Be2GatedAddArgs { DP(float) x; CP(float) h; CP(float) gate; CP(int) map; 
 // adaLN: y = scale (LN(x) (1 + alpha) + beta), alpha / beta rows map(r) of the conditioning (stride ldc); a simdgroup a row
 struct Be2AdaLnArgs { CP(float) x; DP(float) y; CP(float) alpha; CP(float) beta; CP(int) map; u64 rows; uint C, ldx, ldc;
                       float scale; DP(half) yh; };         // (yh: written in half instead of y)
+// the coupling's two inputs on the fast arm, normalised directly into half without materialising [q_centre | a] or [a_tok | q]
+struct Be2AdaLnQ2SArgs { CP(float) q; CP(float) a; CP(int) centre; CP(float) alpha; CP(float) beta; CP(int) map;
+                         DP(half) yh; u64 rows; uint T, N, Ca, Dt, ldc, pad0; };
+struct Be2AdaLnS2QArgs { CP(float) a; CP(float) q; CP(int) atomTok; CP(int) pad; CP(float) alpha; CP(float) beta; CP(int) map;
+                         DP(half) yh; u64 rows; uint T, N, Dt, Ca, ldc, pad0; };
 // the vendor's fc1 / fc2 [I][C] (torch) as gemmSwiglu's one weight [C][2I]: blocks of 8, a_0..a_7 b_0..b_7 a_8.., b = fc2 / S
 struct Be2SwigluWArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I; float invS; uint pad0; };
 // the coupling's atom-side mixer SPLIT (denoise.mm, couplingSplit): a token row's statistics (mean, centred sum of squares,
