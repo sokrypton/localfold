@@ -78,6 +78,15 @@ export async function main(device, args) {
     }
     return { geometry, pdb, bonds, fit };
   };
+  // 🔴 A NON-FINITE COORDINATE IS A FAILED FOLD, said here: chain-geometry's verdict skips a fold with no measurable
+  // alpha carbons (a ligand has none), so a sample of NaN passed the geometry gate with its CA-CA reported null - and
+  // with it check-stock-flags.mjs, whose signature is the atom checksum (a NaN folds to 0 there). That is how a stock
+  // Chrome on Apple silicon folding NaN went unseen (webgpu/bioemu2/network.js, the trunk's accumulation)
+  const allSamples = propagated ? [...result.samples, ...propagated.samples] : result.samples;
+  allSamples.forEach((xs, k) => {
+    const bad = xs.subarray(0, atomKeys.length * 3).findIndex((v) => !Number.isFinite(v));
+    if (bad >= 0) throw new Error(`sample ${k}: a non-finite coordinate (atom ${Math.floor(bad / 3)}: ${xs[bad]}) - the fold failed`);
+  });
   const scored = result.samples.map(score);
   for (const s of scored) {
     assertChainGeometry(s.geometry, { doc: "docs/BIOEMU2.md", allow: args.includes("--allow-broken-geometry") });
