@@ -269,6 +269,14 @@ kernel void be2_cs_gamma(LF_ARGS(Be2CsGammaArgs)) {
   a.gR[i] = gh; a.gR[a.n + i] = (half)(g - (float)gh);
   a.beta[i] = bh; a.beta[a.n + i] = (half)(b - (float)bh);
 }
+kernel void be2_cs_wq2(LF_ARGS(Be2CsWqArgs)) {
+  ulong t = LF_INDEX;
+  const uint W = 2 * a.I;
+  if (t >= (ulong)2 * a.K * W) return;
+  BE2_SPLIT(t, W, k, col);
+  const uint kk = a.off + (k % a.K), q = col & 3, j = 2 * (col >> 2) + (q & 1);
+  a.out[t] = q < 2 ? a.w1[(ulong)j * a.C + kk] : (half)((float)a.w2[(ulong)j * a.C + kk] * a.invS);
+}
 kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
   ulong t = LF_INDEX;
   const uint W = 2 * a.I;

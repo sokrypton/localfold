@@ -62,6 +62,7 @@ void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::s
 // (its two halves, for the coupling split: the [C][2I] blocks-of-8 [fc1 | fc2 / 64] weight, and fc3 over the gated
 // product scaled back by 64)
 const half* swigluPairs(const std::string& p, int C, int I);
+float swigluScale();      // (fc2's divisor in every derived SwiGLU weight: 64)
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
 void pairTransition(float* z, size_t rows, int C, const std::string& p);

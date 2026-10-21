@@ -160,10 +160,16 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
   // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
+  // (in blocks of 2 - be2_cs_wq2 - so the combine runs in the vector epilogue's registers; BE2_CS_STAGED=1 the control,
+  // the blocks-of-8 rows and a staged float tile)
+  static const bool staged = getenv("BE2_CS_STAGED") && atoi(getenv("BE2_CS_STAGED")) != 0;
   const size_t wq = (size_t)Ca * 2 * I;
-  const half* wQ = M.derived<half>("csQ2:" + p, 2 * wq, [&](half* out) {
+  const half* wQ = staged ? M.derived<half>("csQ2:" + p, 2 * wq, [&](half* out) {
     copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
     copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+  }) : M.derived<half>("csQ2b:" + p, 2 * wq, [&](half* out) {
+    be2Run1d("be2_cs_wq2", 2 * wq, Be2CsWqArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)Dc, (uint)I,
+                                             (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
   });
   float* tstats = scratch<float>("be2.cs.tstats", RT * 3); half* xa = scratch<half>("be2.cs.xa", RT * Dt);
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
@@ -190,7 +196,7 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
     G.label = "coupling P"; gemm(G); }
   run("be2_cs_atom", rowsGrid(RN), 256, Be2CsAtomArgs{q, tstats, cqc, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), atomTok,
                                                     stats, xq, (u64)RN, (uint)N, (uint)T, (uint)Ca, (uint)Dt, (uint)ldc, 0});
-  if (!gemmCouplingCombine(xq, wQ, g, RN, 2 * Ca, I, stats, P, QB)) die("BioEmu2: the coupling split off the matrix units");
+  if (!gemmCouplingCombine(xq, wQ, g, RN, 2 * Ca, I, stats, P, QB, !staged)) die("BioEmu2: the coupling split off the matrix units");
   transitionFc3(g, dq, RN, I, p, false);
 }
 

@@ -63,6 +63,7 @@ static const half* swigluWeight(const std::string& p, int C, int I) {
   });
 }
 const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }
+float swigluScale() { return SWIGLU_SCALE; }
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual) {
   const int Co = dimW(p + "fc3/weight", 0);
   Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("w/" + p + "fc3/weight"); G.tw = F16; G.transW = true; G.Y = out; G.ty = F32;

@@ -161,8 +161,10 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
 // a sample-token row's product, QB [.][2][2 hidden] a conditioning row's R | B (R = Qq + (da / dq) Qa, the ratio a
 // constant of the row's widths) - and the SwiGLU of them, into
 // gated [rows][hidden] in half. On the matrix units only: false, nothing run
+// pairs2: Wq in blocks of 2 (columns 4m, 4m+1 gates 2m, 2m+1, then their values) - the combine in the vector epilogue's
+// registers at 64 x 128, no staged tile; P and QB stay in blocks of 8 either way
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
-                         const float* P, const float* QB);
+                         const float* P, const float* QB, bool pairs2 = false);
 bool gemmTensorOps();      // (whether the GEMMs run on the matrix units - Metal 4's tensor operations)
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);

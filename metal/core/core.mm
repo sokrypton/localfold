@@ -728,11 +728,13 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && a.m == 256 && a.n > 128 && !tri && !getenv("LOCALFOLD_GEMM_TILE")) { tm = 32; tn = 256; }
-  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256 | 32768)) && (tm == 64 || (tm == 32 && tn == 256)) &&
+  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
+                     (!(a.epilogue & 32768) || (a.epilogue & 131072)) && (tm == 64 || (tm == 32 && tn == 256)) &&
                      a.m % 4 == 0 && !a.ptrs &&
                      al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   if ((a.epilogue & 4096) && !vecEp) die("gemm: the permuted store needs the vector epilogue's alignment");
+  if ((a.epilogue & 131072) && !vecEp) die("gemm: the blocks-of-2 coupling combine needs the vector epilogue's alignment");
   if ((a.epilogue & 8192) && !vecEp) die("gemm: the outer product's normalised add needs the vector epilogue's alignment");
   if ((a.epilogue & 16384) && !vecEp) die("gemm: the gated residual needs the vector epilogue's alignment");
   if (vecEp && tn < 64) tn = 64;
@@ -965,12 +967,12 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
   gemmRun(F16, F16, F16, a, 1, false, false, "swiglu");
 }
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
-                         const float* P, const float* QB) {
+                         const float* P, const float* QB, bool pairs2) {
   if (hidden % 8 || !tensorWanted()) return false;
   GemmArgs a{};
   a.A = (uint64_t)Wq; a.B = (uint64_t)Xq; a.C = a.D = (uint64_t)gated;
   a.m = 2 * hidden; a.n = (int)rows; a.k = in; a.lda = 2 * hidden; a.ldb = in; a.ldc = a.ldd = hidden;
-  a.epilogue = 32768; a.alpha = 1.f;
+  a.epilogue = 32768 | (pairs2 ? 131072 : 0); a.alpha = 1.f;
   a.aux = (uint64_t)stats; a.aux2 = (uint64_t)P; a.aux3 = (uint64_t)QB;
   gemmRun(F16, F16, F16, a, 1, false, true, "coupling combine");
   return true;

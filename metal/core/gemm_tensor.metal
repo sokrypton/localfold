@@ -169,6 +169,22 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       const auto ix = c.get_multidimensional_index(e);
       const int i = i0 + ix[0], j = j0 + ix[1];
       if (j >= g.n || i >= g.m) continue;
+      if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
+        // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
+        device const float* sr = (device const float*)g.aux + (ulong)j * 8;
+        const float inv = sr[0], dq = sr[2], sq = sr[3], sa = sr[5];
+        const int st = (int)sr[6];
+        device const float* qb = (device const float*)g.aux3 + (ulong)(uint)sr[7] * 2 * g.m;
+        device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
+        for (int t = 0; t < 2; ++t) {
+          const int x = i / 2 + t, pc = (x >> 3) * 16 + (x & 7);
+          const float pa = st >= 0 ? sa * pr[pc] : 0.f, pb = st >= 0 ? sa * pr[pc + 8] : 0.f;
+          const float ua = inv * (pa + sq * (float)c[e + t] + dq * qb[pc]) + qb[g.m + pc];
+          const float ub = inv * (pb + sq * (float)c[e + 2 + t] + dq * qb[pc + 8]) + qb[g.m + pc + 8];
+          D[(ulong)x + (ulong)j * g.ldd] = (TC)(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
+        }
+        continue;
+      }
       // (lf_gemm's order of operations, so the results match the staged path's bit for bit)
       float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
       const float4 bv = !(g.epilogue & 4) ? float4(0)

@@ -43,6 +43,10 @@ struct Be2CsAtomArgs { CP(float) q; CP(float) tstats; CP(float) cqc; CP(int) tok
 // (R's row [-gamma_a / 6 | gamma_q] and beta, two halves each, [2][R][Dc]: hi, then the remainder - float's precision
 // on the matrix units)
 struct Be2CsGammaArgs { CP(float) cqc; DP(half) gR; DP(half) beta; u64 n; uint Dt, Ca, ldc, R; };
+// the coupling split's atom-half weight in blocks of 2 (columns 4m, 4m+1: gates 2m, 2m+1; 4m+2, 4m+3 their values / S) -
+// a thread's four adjacent results of the vector epilogue are then two gates and their values - its K rows the
+// fc1 | fc2 columns off..off+K-1, stacked twice ([hi | lo] inputs)
+struct Be2CsWqArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I, off, K; float invS; uint pad0; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };
 struct Be2CentreAtomsArgs { CP(float) atom; CP(int) centre; DP(float) out; uint T, N, C, ldo, samples, pad0; };

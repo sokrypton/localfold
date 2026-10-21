@@ -204,6 +204,10 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   wins from three (4.94 -> 4.68; five 8.0 -> 7.0). `splitPays` compares multiply-adds with a margin of 1.7 fitted to
   those; `BE2_COUPLING_SPLIT=0/1` forces either arm. Qa | Qq | B themselves run on the matrix units as two half GEMMs
   (hi, then the remainder at beta 1) and the conditioning linears take their bias in the epilogue: 12.86 -> 12.75 s.
+  Then two more: R = Qq - Qa / 6 for Qa and Qq (768 da + 128 dq = 0 exactly - one vector fewer, time unmoved), and the
+  combine moved from a STAGED float tile (64 x 64, the tile through threadgroup memory) into the vector epilogue's
+  registers at 64 x 128, the atom half's weight in blocks of 2 (`be2_cs_wq2`) so a thread's four adjacent results are
+  two gates and their values: 6.34 -> 6.11 s at 100 steps, the same digits (`BE2_CS_STAGED=1` the control).
   🔴 ONE UNREPRODUCED FAILURE: the worker gate's 6MRR + GOL case once came back at RMSD 99 (an exploded sample) on the
   first run after that build, and did not recur in 38 runs since - 20 back to back, 4 with the kernel-specialisation
   cache deleted, 10 with the split on and off. Its log was overwritten before it was read. If it recurs, keep
