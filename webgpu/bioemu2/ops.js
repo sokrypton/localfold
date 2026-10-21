@@ -149,7 +149,7 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
   offA: u32, sA0: u32, sA1: u32, sAm: u32, sAk: u32,
   offB: u32, sB0: u32, sB1: u32, sBn: u32, sBk: u32,
   offC: u32, sC0: u32, sC1: u32, sCm: u32, sCn: u32,
-  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32 };
+  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32, biasOff: u32, biasS0: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<${wordB ? "u32" : "f32"}>;
@@ -262,7 +262,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       if (n >= p.n) { continue; }
       var v = acc[2u * i + j / 4u][j % 4u] * p.alpha;
       if (p.split > 0u) { c[baseC + m * p.sCm + n * p.sCn] = v; continue; }
-      if (p.bias != 0u) { v += bias[n]; }
+      if (p.bias != 0u) { v += bias[p.biasOff + b0 * p.biasS0 + n]; }
       if (p.act == 1u) { v = max(v, 0.0); }
       if (p.act == 2u) { v = 1.0 / (1.0 + exp(-v)); }
       let at = baseC + m * p.sCm + n * p.sCn;
@@ -488,6 +488,12 @@ export class Bioemu2Ops {
     return buffer;
   }
 
+  /** A slice of `buffer`, `count` floats from float `at`, bound where a buffer would be (the offset 256-byte aligned). */
+  view(buffer, at, count) {
+    if ((at * 4) % 256) throw new Error(`a view at float ${at} is not 256-byte aligned`);
+    return { view: true, buffer, offset: at * 4, size: count * 4 };
+  }
+
   uniform(words) {
     const size = Math.ceil(words.byteLength / 16) * 16;
     const buffer = this.device.createBuffer({ size: Math.max(size, 16), usage: UNIFORM | COPY_DST });
@@ -498,8 +504,10 @@ export class Bioemu2Ops {
 
   async step(key, source, groups, buffers, uniformWords) {
     const pipeline = await this.pipeline(key, source);
+    // (a buffer, or a VIEW of one - ops.view: a slice bound at its offset, so a kernel indexes it from 0)
     const entries = [{ binding: 0, resource: { buffer: this.uniform(uniformWords) } },
-      ...buffers.map((buffer, at) => ({ binding: at + 1, resource: { buffer } })).filter((e) => e.resource.buffer !== null)];
+      ...buffers.map((b, at) => ({ binding: at + 1, resource: b?.view ? { buffer: b.buffer, offset: b.offset, size: b.size } : { buffer: b } }))
+        .filter((e) => e.resource.buffer !== null && e.resource.buffer !== undefined)];
     const bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
     const [x, y] = fold2(groups);
     return { pipeline, bindGroup, x, y, key };
@@ -529,7 +537,7 @@ export class Bioemu2Ops {
     // 🔴 THE TARGET IS 128 WORK UNITS, NOT 1024: swept on an M5 (ABAB, the shipped gemm2 and the fused combine), a 1-sample
     // call is 107 ms at 1024, 101 at 256 and 128, 106 with no split at all, and a 5-sample call 258 / 248 / 249 / 249 - the
     // partial planes' traffic was most of what a deeper split bought. One part is no split (no reduce).
-    if (spec.noSplit !== true && !spec.pair && this.splits(m, n, k, B0 * B1) >= 2) {
+    if (spec.noSplit !== true && !spec.pair && !spec.biasOff && this.splits(m, n, k, B0 * B1) >= 2) {
       const splits = this.splits(m, n, k, 1);
       const chunk = Math.ceil(k / splits / 32) * 32;      // (a multiple of either kernel's K step)
       const parts = Math.ceil(k / chunk);
@@ -563,6 +571,10 @@ export class Bioemu2Ops {
     f[22] = spec.alpha ?? 1;
     u[23] = B0 * B1;
     u[24] = spec.splitChunk ?? 0;
+    // (gemm2Source only: the bias of batch b0 at biasOff + b0 biasS0 - one bias a batch, a stacked layer's)
+    if ((spec.biasOff || spec.biasS0) && !v2) throw new Error("a per-batch bias is gemm2Source's");
+    u[25] = spec.biasOff ?? 0;
+    u[26] = spec.biasS0 ?? 0;
     const groups = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
     const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}`;

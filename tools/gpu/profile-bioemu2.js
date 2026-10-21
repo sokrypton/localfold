@@ -2,7 +2,7 @@
 //
 //     node tools/gpu-chrome.mjs tools/gpu/profile-bioemu2.js [--job=/tools/fixtures/bioemu2/6mrr-68.json]
 //       [--model=/model-bioemu2-int5] [--samples=5] [--calls=10] [--top=30] [--shapes] [--split=off] [--gemm=1]
-//       [--fuse=off] [--split-target=N]
+//       [--fuse=off] [--fuse-swiglu=off] [--batch-cond=off] [--split-target=N]
 //
 // check-bioemu2-network.js --profile does the denoiser half too, but on the colab oracle dumps, which are not on every
 // box; this featurises the job itself. The per-dispatch numbers are a profile (every dispatch its own timestamped
@@ -25,7 +25,8 @@ export async function main(device, args) {
   // --split=off: the coupling's atom-side mixer unsplit (couplingSplit's control); --fuse=off: its combine a separate
   // pass over a stored Z (fuseCombine's control)
   const net = new Bioemu2Gpu(device, read, { half: true, trunkPrecision: "device", couplingSplit: option(args, "split", "on") !== "off",
-    fuseCombine: option(args, "fuse", "on") !== "off" });
+    fuseCombine: option(args, "fuse", "on") !== "off", batchConditioning: option(args, "batch-cond", "on") !== "off",
+    condGroupMiB: Number(option(args, "cond-mib", "64")) });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: the original GEMM, the control)
   net.ops.fuseSwiglu = option(args, "fuse-swiglu", "on") !== "off";   // (--fuse-swiglu=off: the SwiGLUs a pass of their own)
   // (--split-target=N: split-K's workgroup target, ops.js's 128 by default; 0 is no split)

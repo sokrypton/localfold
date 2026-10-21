@@ -222,6 +222,14 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   248 -> 242 ms. A GEMM that would split over K keeps the two-pass path (a pair GEMM is not split). 🔴 The per-dispatch
   profile reads the fused arm 30 ms SLOWER and the wall clock 6 ms faster: the profile times each dispatch in a pass
   of its own, so read it for proportions only, as its header says.
+- **The conditioning batched over the layers** (`conditionGroup`; `batchConditioning: false` / `--batch-cond=off` is the
+  control): every layer's four adaLN MLPs read the SAME rows - the call's conditioning - so each is one GEMM with the
+  layers as the batch over a stack of their weights (`stacked`), LN's statistics once a call and only its affine a
+  layer's; the coupling split's gamma and Qa | Qq | B the same way, each layer handed VIEWS of the group's buffers
+  (`ops.view`, a binding at an offset). 1302 -> 979 dispatches, a call 244 -> 239 ms (1 sample 101.8 -> 96.6), against
+  metal/bioemu2 --f32 unchanged, the per-layer path 4e-6..1e-5 away (the trunk identical). 🔴 IT WAS WORTH 5 ms OF A
+  33 ms UPPER BOUND (the conditioning recorded for one layer only): the rest is the GEMMs' own arithmetic, ~30 GFLOP a
+  call, not their dispatch. Groups sized to 64 MiB. A 68-residue 5-sample fold 56.5 -> 52.2 s, the same RMSDs.
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.

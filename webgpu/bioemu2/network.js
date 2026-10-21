@@ -76,6 +76,25 @@ export class Bioemu2Gpu {
     return out;
   }
 
+  /**
+   * `names`' tensors concatenated into ONE weight buffer, in order (each [fc1; fc2] pair when `swiglu`): a stack of the
+   * denoiser's layers, so their conditioning is one batched GEMM (conditionGroup). The per-layer tensors are then
+   * never uploaded on their own.
+   */
+  async stacked(key, names, half, swiglu = false) {
+    if (!this.weights.has(key)) {
+      this.weights.set(key, (async () => {
+        const parts = await Promise.all(names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]))
+          .map((n) => this.read(n)));
+        const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
+        let at = 0;
+        for (const v of parts) { all.set(v, at); at += v.length; }
+        return this.ops.weight(key, all, half && all.length % 2 === 0);
+      })());
+    }
+    return this.weights.get(key);
+  }
+
   /** [fc1; fc2] stacked, so a SwiGLU's two projections are one GEMM. */
   async swiglu(prefix) {
     const key = `${prefix}/fc12`;
@@ -109,10 +128,15 @@ export class Bioemu2Gpu {
    * metal/bioemu2, which rounds it, Xq in half cost the split its precision). A padding atom (map -1) conditions on
    * the identity, gamma 1 and beta 0, as this port's adaLN gives it.
    */
-  async couplingSplit(steps, prefix, { a, q, condQ, atomTokenS, S, T, N, cs, out }) {
+  async couplingSplit(steps, prefix, { a, q, condQ, atomTokenS, S, T, N, cs, out, pre = null }) {
     const o = this.ops;
     const DT = BIOEMU2.token, DA = BIOEMU2.atom, DC = DT + DA, I = 1792, W2 = 2 * I;
-    const W = await this.swiglu(prefix);                   // [fc1; fc2], [W2][DC]
+    // (pre: conditionGroup's - the layer's [fc1; fc2] a slice of the stacked one at wOff, and gamma and Qa | Qq | B
+    // already computed for the group, this layer's views of them)
+    const W = pre ? pre.W : await this.swiglu(prefix);     // [fc1; fc2], [W2][DC]
+    const wo = pre ? pre.wOff : 0;
+    const gA = pre ? pre.gA : cs.gA, gQ = pre ? pre.gQ : cs.gQ, QB = pre ? pre.QB : cs.QB;
+    if (!pre) {
     // gamma_a, gamma_q and beta from the T conditioning rows, and row T the padding's identity
     steps.push(await o.map("cs-gamma", (T + 1) * DC, [{ buffer: cs.gA, write: true }, { buffer: cs.gQ, write: true },
       { buffer: cs.beta, write: true }, { buffer: condQ }],
@@ -130,6 +154,7 @@ export class Bioemu2Gpu {
     steps.push(qq);
     steps.push(await o.gemm({ m: T + 1, n: W2, k: DC, a: cs.beta, b: W, c: cs.QB,
       A: { off: 0, m: DC, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: 2 * W2, m: 3 * W2, n: 1 } }));
+    }
     // a token row (sample-stacked): its mean, centred sum of squares and spread; then Xa and P
     steps.push(await o.map("cs-tstats", S * T, [{ buffer: cs.tstats, write: true }, { buffer: a }],
     `let base = i * 768u; var m = 0.0;
@@ -137,11 +162,11 @@ export class Bioemu2Gpu {
   m = m / 768.0; var v = 0.0;
   for (var c = 0u; c < 768u; c += 1u) { let d = b1[base + c] - m; v += d * d; }
   b0[i * 3u] = m; b0[i * 3u + 1u] = v; b0[i * 3u + 2u] = sqrt(v / 768.0 + 1e-5);`));
-    steps.push(await o.map("cs-xa", S * T * DT, [{ buffer: cs.xa, write: true }, { buffer: a }, { buffer: cs.tstats }, { buffer: cs.gA }],
+    steps.push(await o.map("cs-xa", S * T * DT, [{ buffer: cs.xa, write: true }, { buffer: a }, { buffer: cs.tstats }, { buffer: gA }],
     `let r = i / 768u; let c = i % 768u; let t = r % U(0u);
   b0[i] = b3[t * 768u + c] * (b1[i] - b2[r * 3u]) / b2[r * 3u + 2u];`, [T]));
     steps.push(await o.gemm({ m: S * T, n: W2, k: DT, a: cs.xa, b: W, c: cs.P,
-      A: { off: 0, m: DT, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
+      A: { off: 0, m: DT, k: 1 }, B: { off: wo, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
     // an atom row: q's statistics, the whole row's combined (a padding atom's a is zero), its token's spread; Xq; Z
     steps.push(await o.map("cs-astats", S * N, [{ buffer: cs.astats, write: true }, { buffer: q }, { buffer: cs.tstats },
       { buffer: atomTokenS, type: "i32" }],
@@ -157,7 +182,7 @@ export class Bioemu2Gpu {
   b0[o] = inverseSqrt(v + 1e-5); b0[o + 1u] = da; b0[o + 2u] = dq; b0[o + 3u] = sqrt(ssq / 128.0 + 1e-5); b0[o + 4u] = mq;
   b0[o + 5u] = sa;`));
     steps.push(await o.map("cs-xq", S * N * DA, [{ buffer: cs.xq, write: true }, { buffer: q }, { buffer: cs.astats },
-      { buffer: cs.gQ }, { buffer: atomTokenS, type: "i32" }],
+      { buffer: gQ }, { buffer: atomTokenS, type: "i32" }],
     `let r = i / 128u; let c = i % 128u; let st = b4[r]; var t = U(0u);
   if (st >= 0) { t = u32(st) % U(0u); }
   b0[i] = b3[t * 128u + c] * (b1[i] - b2[r * 6u + 4u]) / b2[r * 6u + 3u];`, [T]));
@@ -165,8 +190,8 @@ export class Bioemu2Gpu {
       // Z never stored: the GEMM's columns reordered so a lane holds four gates and their four values, and the combine
       // and the SwiGLU run in its epilogue (fuseCombine: false is the control - Z written, then cs-combine)
       steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: out,
-        A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: 0, m: I, n: 1 },
-        pair: { key: `cs${T}`, half: I, buffers: [cs.astats, cs.P, cs.QB, atomTokenS],
+        A: { off: 0, m: DA, k: 1 }, B: { off: wo + DT, n: DC, k: 1 }, C: { off: 0, m: I, n: 1 },
+        pair: { key: `cs${T}`, half: I, buffers: [cs.astats, cs.P, QB, atomTokenS],
           decls: `@group(0) @binding(5) var<storage, read> astats: array<f32>;
 @group(0) @binding(6) var<storage, read> pTok: array<f32>;
 @group(0) @binding(7) var<storage, read> qb: array<f32>;
@@ -189,10 +214,10 @@ export class Bioemu2Gpu {
       return;
     }
     steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: cs.Z,
-      A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
+      A: { off: 0, m: DA, k: 1 }, B: { off: wo + DT, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
     // each atom's two pre-activations, and the SwiGLU of them
     steps.push(await o.map("cs-combine", S * N * I, [{ buffer: out, write: true }, { buffer: cs.astats }, { buffer: cs.P },
-      { buffer: cs.Z }, { buffer: cs.QB }, { buffer: atomTokenS, type: "i32" }],
+      { buffer: cs.Z }, { buffer: QB }, { buffer: atomTokenS, type: "i32" }],
     `let r = i / 1792u; let j = i % 1792u; let st = b5[r]; var t = U(0u);
   if (st >= 0) { t = u32(st) % U(0u); }
   let s = r * 6u; let inv = b1[s]; let da = b1[s + 1u]; let dq = b1[s + 2u]; let sq = b1[s + 3u]; let sa = b1[s + 5u];
@@ -236,6 +261,71 @@ export class Bioemu2Gpu {
     steps.push(await o.map("silu", rows * width, [{ buffer: ln, write: true }], "let v = b0[i]; b0[i] = v / (1.0 + exp(-v));"));
     steps.push(await o.linear({ x: ln, w: await this.w(`${prefix}/${l2}/weight`), y: out, rows, inC: width, outC,
                                 bias: await this.w(`${prefix}/${l2}/bias`, { half: false }) }));
+  }
+
+  /**
+   * The conditioning of denoiser layers l0 .. l0 + n - 1, as BATCHED GEMMs over the layers. Every layer conditions on
+   * the SAME rows (`cond`, the call's), so each of its four adaLN MLPs - silu(LN(c) w + b) . cond_2 + bias, LN's
+   * statistics shared and only its affine a layer's - is one GEMM with the layers as the batch, over a stack of their
+   * weights (`stacked`), where it was 16 GEMMs of 68 rows. The coupling split's gamma and Qa | Qq | B go the same way.
+   * `xhat` is LN(cond) without its affine, once a call. Returns, per layer, views of the group's buffers.
+   */
+  async conditionGroup(steps, { xhat, T, l0, n, G, P, buffers }) {
+    const o = this.ops;
+    const DT = BIOEMU2.token, DA = BIOEMU2.atom, DC = DT + DA, W2 = 3584, L = BIOEMU2.denoiserLayers;
+    const layer = (l) => `${P}/layers/${l}`;
+    const all = [...Array(L).keys()];
+    const kinds = [
+      { key: "atom", outC: 6 * DA, prefix: (l) => `${layer(l)}/atom_block/transformer_layer`, l0: "cond_0", l2: "cond_2" },
+      { key: "tok", outC: 6 * DT, prefix: (l) => `${layer(l)}/token_block`, l0: "cond_0", l2: "cond_2" },
+      { key: "q", outC: 1920, prefix: (l) => `${layer(l)}/coupling`, l0: "q_coupling_cond_0", l2: "q_coupling_cond_2" },
+      { key: "s", outC: 2560, prefix: (l) => `${layer(l)}/coupling`, l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" },
+    ];
+    for (const k of kinds) {
+      const lw = await this.stacked(`stack/${k.key}/${k.l0}/weight`, all.map((l) => `${k.prefix(l)}/${k.l0}/weight`), false);
+      const lb = await this.stacked(`stack/${k.key}/${k.l0}/bias`, all.map((l) => `${k.prefix(l)}/${k.l0}/bias`), false);
+      const w2 = await this.stacked(`stack/${k.key}/${k.l2}/weight`, all.map((l) => `${k.prefix(l)}/${k.l2}/weight`), this.half);
+      const b2 = await this.stacked(`stack/${k.key}/${k.l2}/bias`, all.map((l) => `${k.prefix(l)}/${k.l2}/bias`), false);
+      // (LN's affine as the LayerNorm kernel applies it, (x - mean) inv, times w, plus b: then silu)
+      steps.push(await o.map("cond-affine", n * T * DT, [{ buffer: buffers.cin, write: true }, { buffer: xhat }, { buffer: lw }, { buffer: lb }],
+      `let c = i % 768u; let r = i / 768u; let t = r % U(0u); let l = U(1u) + r / U(0u);
+  var v = b1[t * 768u + c];
+  v *= b2[l * 768u + c];
+  v += b3[l * 768u + c];
+  b0[i] = v / (1.0 + exp(-v));`, [T, l0]));
+      steps.push(await o.gemm({ m: T, n: k.outC, k: DT, a: buffers.cin, b: w2, c: buffers[k.key], bias: b2,
+        batches: [n, 1], biasOff: l0 * k.outC, biasS0: k.outC,
+        A: { off: 0, s0: T * DT, m: DT, k: 1 }, B: { off: l0 * k.outC * DT, s0: k.outC * DT, n: DT, k: 1 },
+        C: { off: 0, s0: T * k.outC, m: k.outC, n: 1 }, label: `cond ${k.key} ${T}x${k.outC}x${DT} [${n}]` }));
+    }
+    const out = [];
+    for (let j = 0; j < n; j += 1) {
+      out.push({ atom: o.view(buffers.atom, j * T * 6 * DA, T * 6 * DA), tok: o.view(buffers.tok, j * T * 6 * DT, T * 6 * DT),
+                 q: o.view(buffers.q, j * T * 1920, T * 1920), s: o.view(buffers.s, j * T * 2560, T * 2560) });
+    }
+    if (!buffers.gA) return out;
+    // the coupling split's: gamma_a, gamma_q and beta a layer (row T the padding's identity), then Qa | Qq | B
+    const R = T + 1;
+    steps.push(await o.map("cs-gamma-g", n * R * DC, [{ buffer: buffers.gA, write: true }, { buffer: buffers.gQ, write: true },
+      { buffer: buffers.beta, write: true }, { buffer: buffers.q }],
+    `let j = i / U(1u); let e = i % U(1u); let t = e / 896u; let c = e % 896u; let real = t < U(0u);
+  var al = 0.0; var be = 0.0;
+  if (real) { let at = (j * U(0u) + t) * 1920u; al = b3[at + c]; be = b3[at + 896u + c]; }
+  if (c < 768u) { b0[(j * U(2u) + t) * 768u + c] = 1.0 + al; } else { b1[(j * U(2u) + t) * 128u + c - 768u] = 1.0 + al; }
+  b2[i] = be;`, [T, R * DC, R]));
+    const W = await this.stacked("stack/s_to_q_mixer/fc12", all.map((l) => `${layer(l)}/coupling/s_to_q_mixer`), this.half, true);
+    const wl = W2 * DC;
+    const qb = (k, a0, aStride, wOff, cOff) => o.gemm({ m: R, n: W2, k, a: a0, b: W, c: buffers.QB, batches: [n, 1],
+      A: { off: 0, s0: R * aStride, m: aStride, k: 1 }, B: { off: l0 * wl + wOff, s0: wl, n: DC, k: 1 },
+      C: { off: cOff, s0: R * 3 * W2, m: 3 * W2, n: 1 } });
+    steps.push(await qb(DT, buffers.gA, DT, 0, 0));
+    steps.push(await qb(DA, buffers.gQ, DA, DT, W2));
+    steps.push(await qb(DC, buffers.beta, DC, 0, 2 * W2));
+    for (let j = 0; j < n; j += 1) {
+      out[j].pre = { W, wOff: (l0 + j) * wl, gA: o.view(buffers.gA, j * R * DT, R * DT), gQ: o.view(buffers.gQ, j * R * DA, R * DA),
+                     QB: o.view(buffers.QB, j * R * 3 * W2, R * 3 * W2) };
+    }
+    return out;
   }
 
   /**
@@ -788,10 +878,12 @@ export class Bioemu2Gpu {
     const atomMap = o.buffer("dn.atomMap", S * N, atomCond);
     const tokenMap = o.buffer("dn.tokenMap", S * T, tokenCond);
     const atomTokenS = o.buffer("dn.atomTokenS", S * N, atomSampleToken);
-    const condAtom = o.buffer("dn.condAtom", T * 6 * DA);
-    const condTok = o.buffer("dn.condTok", T * 6 * DT);
-    const condQ = o.buffer("dn.condQ", T * 1920);
-    const condS = o.buffer("dn.condS", T * 2560);
+    // (a layer at a time - the control - or conditionGroup's views below)
+    const unbatched = this.options.batchConditioning === false;
+    const condAtom1 = unbatched ? o.buffer("dn.condAtom", T * 6 * DA) : null;
+    const condTok1 = unbatched ? o.buffer("dn.condTok", T * 6 * DT) : null;
+    const condQ1 = unbatched ? o.buffer("dn.condQ", T * 1920) : null;
+    const condS1 = unbatched ? o.buffer("dn.condS", T * 2560) : null;
     const sC = this.scratch("dc", T, DT);
     const sT = this.scratch("dt", S * T, DT, { logits: o.buffer("dt.logits", S * BIOEMU2.tokenHeads * T * T) });
     const sA = this.scratch("da", S * N, DA, { kvPad: o.buffer("da.kvPad", S * (N + 2 * CTX) * 2 * DA),
@@ -815,6 +907,19 @@ export class Bioemu2Gpu {
     const qst = o.buffer("dn.qst", S * T * 1792);
     const da = o.buffer("dn.da", S * T * DT);
     const lnT = o.buffer("dn.lnT", T * DT);
+    // the layers' conditioning in GROUPS of G (conditionGroup; batchConditioning: false is the control, a layer at a
+    // time): G as many as fit 64 MiB of group buffers - 10 at 68 tokens (measured: 128 MiB, all 16, 239.2 ms a call; 32 MiB 240.6; 16 MiB 241.2)
+    const batchCond = this.options.batchConditioning !== false;
+    const LAYERS = BIOEMU2.denoiserLayers;
+    const perLayer = T * (DT + 6 * DA + 6 * DT + 1920 + 2560) + (split ? (T + 1) * (DT + DA + 896 + 3 * 3584) : 0);
+    const G = batchCond ? Math.max(1, Math.min(LAYERS, Math.floor((this.options.condGroupMiB ?? 64) * 2 ** 20 / 4 / perLayer))) : 0;
+    const groupBufs = !batchCond ? null : {
+      cin: o.buffer("cg.cin", G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),
+      q: o.buffer("cg.q", G * T * 1920), s: o.buffer("cg.s", G * T * 2560),
+      ...(split ? { gA: o.buffer("cg.gA", G * (T + 1) * DT), gQ: o.buffer("cg.gQ", G * (T + 1) * DA),
+                    beta: o.buffer("cg.beta", G * (T + 1) * 896), QB: o.buffer("cg.QB", G * (T + 1) * 3 * 3584) } : {}),
+    };
+    const xhat = batchCond ? o.buffer("cg.xhat", T * DT) : null;
     const hid = o.buffer("dn.hid", S * N * 384);
     const hidT = o.buffer("dn.hidT", S * T * 384);
 
@@ -837,22 +942,32 @@ export class Bioemu2Gpu {
     `let r = i / 768u; let c = i % 768u; let sm = r / U(0u); let t = r % U(0u); let at = sm * U(1u) + u32(b5[t]); let s = b3[0];
   b0[i] = b1[t * 768u + c] + s * (b2[at * 3u] * b4[c * 3u] + b2[at * 3u + 1u] * b4[c * 3u + 1u] + b2[at * 3u + 2u] * b4[c * 3u + 2u]);`,
     [T, N]));
-    for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
+    if (batchCond) steps.push(await o.layerNorm({ x: cond, y: xhat, rows: T, width: DT }));
+    let group = [];
+    for (let l = 0; l < LAYERS; l += 1) {
       const L = `${P}/layers/${l}`;
       const ab = `${L}/atom_block/transformer_layer`;
-      await this.condition(steps, ab, { c: cond, rows: T, width: DT, outC: 6 * DA, ln: lnT, out: condAtom });
-      await this.windowedLayer(steps, ab, { x: q, cond: condAtom, map: atomMap, bias: atomBias[l], keyMask: g.keyMask, N, s: sA, S });
       const tb = `${L}/token_block`;
-      await this.condition(steps, tb, { c: cond, rows: T, width: DT, outC: 6 * DT, ln: lnT, out: condTok });
-      await this.tokenLayer(steps, tb, { x: a, cond: condTok, map: tokenMap, bias: tokenBias[l], T, s: sT, S });
       const cp = `${L}/coupling`;
-      await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 1920, ln: lnT, out: condQ,
-                                        l0: "q_coupling_cond_0", l2: "q_coupling_cond_2" });
-      await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 2560, ln: lnT, out: condS,
-                                        l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" });
+      if (batchCond && l % G === 0) {
+        group = await this.conditionGroup(steps, { xhat, T, l0: l, n: Math.min(G, LAYERS - l), G, P, buffers: groupBufs });
+      }
+      const cv = batchCond ? group[l % G] : null;
+      const condAtom = cv ? cv.atom : condAtom1, condTok = cv ? cv.tok : condTok1;
+      const condQ = cv ? cv.q : condQ1, condS = cv ? cv.s : condS1;
+      if (!cv) await this.condition(steps, ab, { c: cond, rows: T, width: DT, outC: 6 * DA, ln: lnT, out: condAtom });
+      await this.windowedLayer(steps, ab, { x: q, cond: condAtom, map: atomMap, bias: atomBias[l], keyMask: g.keyMask, N, s: sA, S });
+      if (!cv) await this.condition(steps, tb, { c: cond, rows: T, width: DT, outC: 6 * DT, ln: lnT, out: condTok });
+      await this.tokenLayer(steps, tb, { x: a, cond: condTok, map: tokenMap, bias: tokenBias[l], T, s: sT, S });
+      if (!cv) {
+        await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 1920, ln: lnT, out: condQ,
+                                          l0: "q_coupling_cond_0", l2: "q_coupling_cond_2" });
+        await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 2560, ln: lnT, out: condS,
+                                          l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" });
+      }
       // s_to_q: concat(a[own sample, token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
       if (split) {
-        await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt });
+        await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt, pre: cv?.pre });
       } else {
         steps.push(await o.map("cat-aq", S * N * 896, [{ buffer: sq, write: true }, { buffer: a }, { buffer: q }, { buffer: atomTokenS, type: "i32" }],
           `let at = i / 896u; let c = i % 896u; let t = b3[at];
