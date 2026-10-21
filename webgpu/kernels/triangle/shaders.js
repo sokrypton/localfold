@@ -440,31 +440,46 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   const channelChunked = shape.channelChunked === true && !packAB;
   const H_END = channelChunked ? "min(CH, chunk.x + chunk.y)" : "CH";
   const gated = (cell, value, gate) => `pair_mask * ${cell}.${value} * logistic(${cell}.${gate})`;
+  const exactCzSteps = shape.cZ % PROJECT_W === 0;
+  const exactChSteps = shape.cHidden % PROJECT_W === 0;
+  const exactHCols = !channelChunked && shape.cHidden % PROJECT_TILE_COLUMNS === 0;
   const abBiasDeclare = [];
   for (let c = 0; c < columnsPerThread; c += 1) {
     abBiasDeclare.push(`  let h_${c} = h0 + ${columnOfCol(c)};
-  let valid_h_${c} = h_${c} < ${H_END};
-  let w_slot_${c} = local.y * TILE_COLUMNS + ${columnOfCol(c)};
+  ${exactHCols ? "" : `let valid_h_${c} = h_${c} < ${H_END};\n  `}let w_slot_${c} = local.y * TILE_COLUMNS + ${columnOfCol(c)};
   let w_base_${c} = h_${c} * CZ + local.y;
-  var bias_${c} = ${accVector}(0.0);
+  ${exactHCols
+    ? `let bias_${c} = ${accVector}(
+      ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h_${c}]`))).join(",\n      ")});`
+    : `var bias_${c} = ${accVector}(0.0);
   if (valid_h_${c}) {
     bias_${c} = ${accVector}(
       ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h_${c}]`))).join(",\n      ")});
-  }`);
+  }`}`);
     for (let r = 0; r < rowsPerThread; r += 1) {
       abBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
     }
   }
-  const abStageWeight = Array.from({ length: columnsPerThread }, (_, c) => `    {
+  const abStageWeight = Array.from({ length: columnsPerThread }, (_, c) => {
+    const cond = [exactHCols ? null : `valid_h_${c}`, exactCzSteps ? null : "weight_c < CZ"].filter(Boolean).join(" && ");
+    return cond === ""
+      ? `    {
+      let weight_index = w_base_${c} + c0;
+      tile_weight[w_slot_${c}] = ${accVector}(
+        ${MATRICES.map(([, name]) =>
+          accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n        ")});
+    }`
+      : `    {
       var packed = ${accVector}(0.0);
-      if (valid_h_${c} && weight_c < CZ) {
+      if (${cond}) {
         let weight_index = w_base_${c} + c0;
         packed = ${accVector}(
           ${MATRICES.map(([, name]) =>
             accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n          ")});
       }
       tile_weight[w_slot_${c}] = packed;
-    }`).join("\n");
+    }`;
+  }).join("\n");
   const abWeightIndex = (k, c) => (packAB
     ? `${k * PROJECT_TILE_COLUMNS + c}u + local.x * ${columnsPerThread}u`
     : `${k * PROJECT_TILE_COLUMNS + c * PROJECT_W}u + local.x`);
@@ -534,23 +549,22 @@ fn main(
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
   let tile_index = local.y * ${PROJECT_W}u + local.x;
+  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
+  let s_base0 = row0 * CZ_STRIDE + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
 ${abBiasDeclare.join("\n")}
   for (var c0 = 0u; c0 < CZ; c0 += ${PROJECT_W}u) {
     let source_c = c0 + local.x;
-    let weight_c = c0 + local.y;
-    var staged = ${projectRowVector}(0.0);
-    if (source_c < CZ) {
-      if (row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS) {
-        let s0 = row0 * CZ_STRIDE + source_c;
+    ${exactCzSteps ? "" : "let weight_c = c0 + local.y;\n    "}var staged = ${projectRowVector}(0.0);
+    ${exactCzSteps ? "" : "if (source_c < CZ) {\n      "}if (full_rows) {
+        let s0 = s_base0 + c0;
         ${overRows((r) => `${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `s0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
       } else {
         ${overRows((r) => `{
           let row = row0 + ${r * PROJECT_W}u;
           if (row < PAIRS) { ${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c"))}; }
         }`)}
-      }
-    }
+      }${exactCzSteps ? "" : "\n    }"}
     tile_source[tile_index] = staged;
 ${abStageWeight}
     workgroupBarrier();
@@ -807,34 +821,43 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
     throw new Error(`projectTile outColumns ${OUT_TILE_COLUMNS} is not a multiple of ${PROJECT_W}`);
   }
   const outColumnsPerThread = OUT_TILE_COLUMNS / PROJECT_W;
+  const exactOutCols = shape.cZ % OUT_TILE_COLUMNS === 0;
+  const exactOutSteps = shape.cZ === shape.cHidden && exactCzSteps;
   const outBiasDeclare = [];
   for (let c = 0; c < outColumnsPerThread; c += 1) {
     outBiasDeclare.push(`  let out_col_${c} = channel0 + ${c * PROJECT_W}u;
-  let valid_col_${c} = out_col_${c} < CZ;
-  let w_slot_${c} = local.y * TILE_COLUMNS + local.x + ${c * PROJECT_W}u;
+  ${exactOutCols ? "" : `let valid_col_${c} = out_col_${c} < CZ;\n  `}let w_slot_${c} = local.y * TILE_COLUMNS + local.x + ${c * PROJECT_W}u;
   let wz_base_${c} = W_LINEARZWEIGHT + out_col_${c} * CH + local.y;
   let wg_base_${c} = W_LINEARGWEIGHT + out_col_${c} * CZ + local.y;
-  var bias_${c} = ${outVector2}(0.0);
+  ${exactOutCols
+    ? `let bias_${c} = ${outVector2}(
+      ${accNarrow(readWeight(`weights[W_LINEARZBIAS + out_col_${c}]`))},
+      ${accNarrow(readWeight(`weights[W_LINEARGBIAS + out_col_${c}]`))});`
+    : `var bias_${c} = ${outVector2}(0.0);
   if (valid_col_${c}) {
     bias_${c} = ${outVector2}(
       ${accNarrow(readWeight(`weights[W_LINEARZBIAS + out_col_${c}]`))},
       ${accNarrow(readWeight(`weights[W_LINEARGBIAS + out_col_${c}]`))});
-  }`);
+  }`}`);
     for (let r = 0; r < rowsPerThread; r += 1) {
       outBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
     }
   }
-  const outStageWeight = Array.from({ length: outColumnsPerThread }, (_, c) => `    {
+  const outStageWeight = Array.from({ length: outColumnsPerThread }, (_, c) => (exactOutCols && exactOutSteps)
+    ? `    {
+      let projection_w = ${readWeight(`weights[wz_base_${c} + k0]`)};
+      let gate_w = ${readWeight(`weights[wg_base_${c} + k0]`)};
+      tile_weight[w_slot_${c}] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
+    }`
+    : `    {
       var projection_w = 0.0;
       var gate_w = 0.0;
-      if (valid_col_${c}) {
-        if (weight_k < CH) {
+      ${exactOutCols ? "" : `if (valid_col_${c}) {\n        `}if (weight_k < CH) {
           projection_w = ${readWeight(`weights[wz_base_${c} + k0]`)};
         }
         if (weight_k < CZ) {
           gate_w = ${readWeight(`weights[wg_base_${c} + k0]`)};
-        }
-      }
+        }${exactOutCols ? "" : "\n      }"}
       tile_weight[w_slot_${c}] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
     }`).join("\n");
   const outInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
@@ -901,30 +924,37 @@ fn main(
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * ${PROJECT_W}u + local.x;
+  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
+  let sx_base0 = row0 * CH_STRIDE + local.x;
+  let sz_base0 = row0 * CZ_STRIDE + local.x;
   // ...the projection contracts over CH and the gate over CZ, on the same
   // output channel, so one accumulator a cell carries both: x is the
   // projection, y the gate.
 ${outBiasDeclare.join("\n")}
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += ${PROJECT_W}u) {
     let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    var staged_x = ${outRowVector}(0.0);
+    ${exactOutSteps ? "" : "let weight_k = k0 + local.y;\n    "}var staged_x = ${outRowVector}(0.0);
     var staged_z = ${outRowVector}(0.0);
-    if (row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS) {
-      if (source_k < CH) {
-        let sx0 = row0 * CH_STRIDE + source_k;
+    if (full_rows) {
+      ${exactOutSteps
+        ? `let sx0 = sx_base0 + k0;
+      let sz0 = sz_base0 + k0;
+      ${overRows((r) => `${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", `sx0 + ${r * PROJECT_W}u * CH_STRIDE`))};`)}
+      ${overRows((r) => `${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `sz0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}`
+        : `if (source_k < CH) {
+        let sx0 = sx_base0 + k0;
         ${overRows((r) => `${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", `sx0 + ${r * PROJECT_W}u * CH_STRIDE`))};`)}
       }
       if (source_k < CZ) {
-        let sz0 = row0 * CZ_STRIDE + source_k;
+        let sz0 = sz_base0 + k0;
         ${overRows((r) => `${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `sz0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
-      }
+      }`}
     } else {
       ${overRows((r) => `{
         let row = row0 + ${r * PROJECT_W}u;
         if (row < PAIRS) {
-          if (source_k < CH) { ${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k"))}; }
-          if (source_k < CZ) { ${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k"))}; }
+          ${exactOutSteps ? "" : "if (source_k < CH) { "}${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k"))};${exactOutSteps ? "" : " }"}
+          ${exactOutSteps ? "" : "if (source_k < CZ) { "}${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k"))};${exactOutSteps ? "" : " }"}
         }
       }`)}
     }

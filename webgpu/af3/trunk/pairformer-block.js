@@ -165,6 +165,7 @@ function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance,
   const overHeadVectors = (body) =>
     Array.from({ length: headVectors }, (_, h) => body(h)).join("\n    ");
   if (heads % 4 !== 0) throw new Error(`heads ${heads} is not a multiple of four`);
+  const unroll = channels % 8 === 0 ? 8 : channels % 4 === 0 ? 4 : 1;
   return `
 const PAIRS: u32 = ${pairs}u;
 const CHANNELS: u32 = ${channels}u;
@@ -189,28 +190,35 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let base = row * CHANNELS;
   var total = 0.0;
   var squares = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let value = pair[base + c];
-    total += value;
-    squares += value * value;
+  for (var c0 = 0u; c0 < CHANNELS; c0 += ${unroll}u) {
+${Array.from({ length: unroll }, (_, u) => `    {
+      let value = pair[base + c0 + ${u}u];
+      total += value;
+      squares += value * value;
+    }`).join("\n")}
   }
   let mean = total / f32(CHANNELS);
   ${variance === "fast"
     ? "let variance = squares / f32(CHANNELS) - mean * mean;"
     : `var variance = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let d = pair[base + c] - mean;
-    variance += d * d;
+  for (var c0 = 0u; c0 < CHANNELS; c0 += ${unroll}u) {
+${Array.from({ length: unroll }, (_, u) => `    {
+      let d = pair[base + c0 + ${u}u] - mean;
+      variance += d * d;
+    }`).join("\n")}
   }
   variance /= f32(CHANNELS);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
   ${overHeadVectors((h) => `var sum${h} = vec4<f32>(0.0);`)}
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    // ...normalised once, used by every head.
-    let value = (pair[base + c] - mean) * inverse_std * weights[W_SCALE + c]
-      + weights[W_OFFSET + c];
-    let column = (W_PROJECT + c * HEADS) / 4u;
-    ${overHeadVectors((h) => `sum${h} += value * projection[column + ${h}u];`)}
+  for (var c0 = 0u; c0 < CHANNELS; c0 += ${unroll}u) {
+${Array.from({ length: unroll }, (_, u) => `    {
+      let c = c0 + ${u}u;
+      // ...normalised once, used by every head.
+      let value = (pair[base + c] - mean) * inverse_std * weights[W_SCALE + c]
+        + weights[W_OFFSET + c];
+      let column = (W_PROJECT + c * HEADS) / 4u;
+      ${overHeadVectors((h) => `sum${h} += value * projection[column + ${h}u];`)}
+    }`).join("\n")}
   }
 ${extraBias ? "  let extra = extra_bias[row];\n" : ""}\
   ${overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>

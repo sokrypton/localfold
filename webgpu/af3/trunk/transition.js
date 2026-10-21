@@ -708,7 +708,7 @@ export const pairTransitionArithmetic = () => "f16";
  * rows fit; eight stays wherever it already did, so those kernels are unchanged.
  */
 export function splitNormalizeBytes(channels, rows = 8) {
-  return (rows * channels + 64 + 3 * rows) * 4;
+  return (rows * channels + 64 * 2 + 2 * rows) * 4;
 }
 function splitNormalizeRows(device, channels) {
   const limit = device.limits.maxComputeWorkgroupStorageSize;
@@ -747,8 +747,7 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
     for (let j = 0; j < TN / 4; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
-        accumulators.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
       }
       for (let c = 0; c < 4; c += 1) {
         const value = `acc_${i}_${j}.${"xyzw"[c]}`;
@@ -775,7 +774,9 @@ ${rowStores.join("\n")}
       const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
       for (let j = 0; j < TN / 4; j += 1) {
         if (f16) {
-          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+          inner.push(k === 0
+            ? `    var part_${i}_${j} = vec4<f16>(${ai}) * b_0_${j};`
+            : `    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
         } else {
           inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
         }
@@ -785,35 +786,41 @@ ${rowStores.join("\n")}
   const weight = (offset) => weightPrecision === T ? `weights[base${offset}]` : `${T}(weights[base${offset}])`;
   const aSteps = ((BM / 4) * BK) / 256;
   const bSteps = ((BN / 4) * BK) / 256;
+  const aStrideExpr = sourceGate === null ? "parameters.inner" : `${sourceGate.stride}u`;
+  const loadAt = (idxExpr) => sourceGate === null
+    ? (sourcePrecision === T ? `source[${idxExpr}]` : `${T}(source[${idxExpr}])`)
+    : `${T}(gated(${idxExpr}))`;
   const aPre = Array.from({ length: aSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let a_mg_${s} = ${eExpr} / BK;
   let a_k_${s} = ${eExpr} % BK;
   let a_r0_${s} = row_origin + a_mg_${s} * 4u;
+  let a_full_${s} = a_r0_${s} + 3u < parameters.rows;
+  let a_base_${s} = a_r0_${s} * ${aStrideExpr} + a_k_${s};
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
   }).join("\n");
   const bPre = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
-  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u;`;
+  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * parameters.columns;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
-      let r0 = a_r0_${s};
-      let k = k0 + a_k_${s};
+      let base0 = a_base_${s} + k0;
       var value = vec4<${T}>(0.0);
-      if (r0 + 3u < parameters.rows) {
-        value = vec4<${T}>(${loadElem("r0")}, ${loadElem("r0 + 1u")}, ${loadElem("r0 + 2u")}, ${loadElem("r0 + 3u")});
+      if (a_full_${s}) {
+        value = vec4<${T}>(${loadAt("base0")}, ${loadAt(`base0 + ${aStrideExpr}`)}, ${loadAt(`base0 + 2u * ${aStrideExpr}`)}, ${loadAt(`base0 + 3u * ${aStrideExpr}`)});
       } else {
-        if (r0 < parameters.rows) { value.x = ${loadElem("r0")}; }
-        if (r0 + 1u < parameters.rows) { value.y = ${loadElem("r0 + 1u")}; }
-        if (r0 + 2u < parameters.rows) { value.z = ${loadElem("r0 + 2u")}; }
+        let r0 = a_r0_${s};
+        if (r0 < parameters.rows) { value.x = ${loadAt("base0")}; }
+        if (r0 + 1u < parameters.rows) { value.y = ${loadAt(`base0 + ${aStrideExpr}`)}; }
+        if (r0 + 2u < parameters.rows) { value.z = ${loadAt(`base0 + 2u * ${aStrideExpr}`)}; }
       }
       a_tile[a_idx_${s}] = value;
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `    {
-      let base = b_col_${s} + (k0 + b_k_${s}) * parameters.columns;
+      let base = b_col_${s} + k0 * parameters.columns;
       b_tile[${eExpr}] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
     }`;
   }).join("\n");
@@ -884,20 +891,7 @@ export function createTransitionSplitShaders(shape, offsets, epsilon, variance, 
   const LANES = 64;
   const LANES_PER_ROW = LANES / NORMALIZE_ROWS;
   const w = (expression) => (weightPrecision === "f16" ? `f32(${expression})` : expression);
-  const normalizeVariance = variance === "fast"
-    ? "let variance = row_squares[slot] / f32(CHANNELS) - mean * mean;"
-    : `var centered = 0.0;
-    for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
-      let d = tile[slot * CHANNELS + c] - mean;
-      centered += d * d;
-    }
-    partial_sum[local] = centered;
-    workgroupBarrier();
-    for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
-      if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
-      workgroupBarrier();
-    }
-    let variance = partial_sum[slot * LANES_PER_ROW] / f32(CHANNELS);`;
+  const fastVariance = variance === "fast";
 
   const normalize = `${normalizedStorage === "f16" || weightPrecision === "f16" ? "enable f16;\n" : ""}
 // 🔴 THE ROW COUNT IS A UNIFORM, NOT A CONSTANT, BECAUSE THE ROWS ARE CHUNKED.
@@ -926,7 +920,7 @@ const W_OFFSET: u32 = ${offsets.inputLayerNormOffset}u;
 // webgpu/kernels/triangle/shaders.js's input normalisation.
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS * channels}>;
 var<workgroup> partial_sum: array<f32, ${LANES}>;
-var<workgroup> row_squares: array<f32, ${NORMALIZE_ROWS}>;
+${fastVariance ? `var<workgroup> partial_squares: array<f32, ${LANES}>;\n` : ""}\
 var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
 var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
 
@@ -951,30 +945,31 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let slot = local / LANES_PER_ROW;
   let lane = local % LANES_PER_ROW;
   var total = 0.0;
-  var squares = 0.0;
+  ${fastVariance ? "var squares = 0.0;" : ""}
   for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
     let value = tile[slot * CHANNELS + c];
     total += value;
-    squares += value * value;
+    ${fastVariance ? "squares += value * value;" : ""}
   }
   partial_sum[local] = total;
+  ${fastVariance ? "partial_squares[local] = squares;" : ""}
   workgroupBarrier();
-  for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
-    if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
-    workgroupBarrier();
-  }
-  let mean = partial_sum[slot * LANES_PER_ROW] / f32(CHANNELS);
-  workgroupBarrier();
-  partial_sum[local] = squares;
-  workgroupBarrier();
-  for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
-    if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
-    workgroupBarrier();
-  }
-  if (lane == 0u) { row_squares[slot] = partial_sum[local]; }
-  workgroupBarrier();
-  ${normalizeVariance}
   if (lane == 0u) {
+    var row_total = 0.0;
+    ${fastVariance ? "var row_squares = 0.0;" : ""}
+    for (var l = 0u; l < LANES_PER_ROW; l += 1u) {
+      row_total += partial_sum[slot * LANES_PER_ROW + l];
+      ${fastVariance ? "row_squares += partial_squares[slot * LANES_PER_ROW + l];" : ""}
+    }
+    let mean = row_total / f32(CHANNELS);
+    ${fastVariance
+      ? "let variance = row_squares / f32(CHANNELS) - mean * mean;"
+      : `var variance = 0.0;
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      let d = tile[slot * CHANNELS + c] - mean;
+      variance += d * d;
+    }
+    variance /= f32(CHANNELS);`}
     row_mean[slot] = mean;
     row_inverse_std[slot] = inverseSqrt(variance + EPSILON);
   }

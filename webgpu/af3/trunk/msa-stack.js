@@ -148,13 +148,16 @@ export class Af3MsaStackGpu {
       (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false;
     // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
     await settleGridAttendTiling(this.device);
+    const hasF16 = halfPrecisionAvailable(this.device);
+    const stagedPrecision = options.stagedPrecision ?? this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
+    const accumulatePrecision = options.accumulatePrecision ?? this.options?.accumulatePrecision ?? (hasF16 ? "f16" : "f32");
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
       attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
-        && halfPrecisionAvailable(this.device),
+        && hasF16,
       // ...its tile maximum by subgroup shuffles where the device has 32-lane subgroups (`gridAttendSubgroups: false`
       // the control): bit-identical, 3-4% of the kernel on an M5
       attendSubgroupMax: this.device.features.has("subgroups") && (this.device.adapterInfo?.subgroupMinSize ?? 0) === 32
@@ -172,6 +175,8 @@ export class Af3MsaStackGpu {
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,
+      stagedPrecision,
+      accumulatePrecision,
       // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
       // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's
       // [384, 768] triangle projection at AF3's stride.
