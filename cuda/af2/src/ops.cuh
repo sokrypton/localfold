@@ -27,22 +27,43 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
 }
 
 // ---------------------------------------------------------------- elementwise
-__global__ void reluBiasK(float* y, const float* b, size_t rows, int C) {
+__global__ void reluBiasK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t >= n4) return;
+    int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)t % (unsigned)c4) : (int)(t % c4));
+    float4 yv = reinterpret_cast<const float4*>(y)[t];
+    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
+    reinterpret_cast<float4*>(y)[t] = make_float4(fmaxf(yv.x + bv.x, 0.f), fmaxf(yv.y + bv.y, 0.f), fmaxf(yv.z + bv.z, 0.f), fmaxf(yv.w + bv.w, 0.f));
+    return;
+  }
   size_t n = rows * C;
   if (t >= n) return;
   int c = ((C & (C - 1)) == 0) ? (int)(t & (size_t)(C - 1)) : (n <= UINT32_MAX ? (int)((unsigned)t % (unsigned)C) : (int)(t % C));
-  y[t] = fmaxf(y[t] + b[c], 0.f);
+  y[t] = fmaxf(y[t] + __ldg(b + c), 0.f);
 }
-__global__ void addK2(float* y, const float* x, size_t n) {
+__global__ void addK2(float* __restrict__ y, const float* __restrict__ x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)y | (uintptr_t)x) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 xv = reinterpret_cast<const float4*>(x)[t];
+      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + xv.x, yv.y + xv.y, yv.z + xv.z, yv.w + xv.w);
+    }
+    return;
+  }
   if (t < n) y[t] += x[t];
 }
 inline void linearB(const float* X, const std::string& w, int block, float* Y, size_t rows, int in, int out,
                     bool relu = false) {
   gemm(X, P(w + "/weights", block), Y, rows, in, out);
-  if (relu) reluBiasK<<<blocks(rows * out), 256, 0, STREAM>>>(Y, P(w + "/bias", block), rows, out);
-  else addBiasK<<<blocks(rows * out), 256, 0, STREAM>>>(Y, P(w + "/bias", block), rows, out);
+  const float* b = P(w + "/bias", block);
+  size_t work = ((out & 3) == 0 && (((uintptr_t)Y | (uintptr_t)b) & 15) == 0) ? rows * (size_t)(out >> 2) : rows * (size_t)out;
+  if (relu) reluBiasK<<<blocks(work), 256, 0, STREAM>>>(Y, b, rows, out);
+  else addBiasK<<<blocks(work), 256, 0, STREAM>>>(Y, b, rows, out);
 }
 
 // ---------------------------------------------------------------- LayerNorm
@@ -62,8 +83,9 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
   for (int c = lane; c < C; c += 32) y[row * C + c] = (xr[c] - mean) * inv * scale[c] + offset[c];
 }
 template <int C, class TI = float, bool RELU = false>
-__global__ void layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
-                               const float* __restrict__ scale, const float* __restrict__ offset) {
+__global__ void __launch_bounds__(256, C >= 384 ? 4 : 8)
+layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
+               const float* __restrict__ scale, const float* __restrict__ offset) {
   constexpr int K = C / 32;
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -82,7 +104,7 @@ __global__ void layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, 
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + 32 * k;
-    float out = (v[k] - mean) * inv * scale[c] + offset[c];
+    float out = (v[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
     yr[c] = RELU ? fmaxf(out, 0.f) : out;
   }
 }
@@ -146,41 +168,103 @@ inline void swap01(const float* x, float* y, int A, int B, int C) {
 //   pairBias:   [H, n, n] or null - AF2's `nonbatched_bias`, shared by every batch row
 //   out:        [Bt, n, H*D] = softmax(q k^T / sqrt(D) + biases) v * sigmoid(g)
 template <int D>
-__global__ void attentionK(const float* q, const float* k, const float* v, const float* g, const float* keyMask,
-                           const float* pairBias, float* out, int Bt, int n, int H, float scale) {
-  size_t wid = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  int lane = threadIdx.x & 31;
-  if (wid >= (size_t)Bt * n * H) return;
-  int h = (int)(wid % H); size_t bq = wid / H; int qi = (int)(bq % n); size_t b = bq / n;
+__global__ void __launch_bounds__(256)
+attentionK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+           const float* __restrict__ g, const float* __restrict__ keyMask,
+           const float* __restrict__ pairBias, float* __restrict__ out, int Bt, int n, int H, float scale) {
+  __shared__ float Ks[32][D + 1];
+  __shared__ float Vs[32][D + 1];
+  __shared__ float Ms[32];
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  unsigned nq = (unsigned)((n + 7) / 8);
+  size_t b = blockIdx.x / nq;
+  int qi0 = (int)(blockIdx.x - b * nq) * 8;
+  int qi = qi0 + warp;
+  int h = (int)blockIdx.y;
   const int W = H * D;
+  const bool validQ = (b < (size_t)Bt && qi < n);
+  size_t bq = b * (size_t)n + (size_t)qi;
   float qv[D];
-  for (int d = 0; d < D; ++d) qv[d] = q[bq * W + h * D + d] * scale;
-  float m = -INFINITY, l = 0, o[D] = {};
-  for (int j = lane; j < n; j += 32) {
-    const float* kr = k + (b * n + j) * W + h * D;
-    float s = 0;
-    for (int d = 0; d < D; ++d) s += qv[d] * kr[d];
-    if (keyMask) s += 1e9f * (keyMask[b * n + j] - 1.f);
-    if (pairBias) s += pairBias[((size_t)h * n + qi) * n + j];
-    s = fminf(fmaxf(s, -1e8f), 1e8f);
-    float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-    l = l * c + p;
-    const float* vr = v + (b * n + j) * W + h * D;
-    for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * vr[d];
-    m = mn;
+  if (validQ) {
+    const float* qr = q + bq * W + h * D;
+    if constexpr ((D & 3) == 0) {
+#pragma unroll
+      for (int d = 0; d < D; d += 4) {
+        float4 q4 = *reinterpret_cast<const float4*>(qr + d);
+        qv[d] = q4.x * scale; qv[d + 1] = q4.y * scale; qv[d + 2] = q4.z * scale; qv[d + 3] = q4.w * scale;
+      }
+    } else {
+#pragma unroll
+      for (int d = 0; d < D; ++d) qv[d] = qr[d] * scale;
+    }
   }
+  float m = -INFINITY, l = 0.f, o[D] = {};
+  const float* pbRow = (validQ && pairBias) ? (pairBias + ((size_t)h * n + qi) * n) : nullptr;
+  constexpr int D4 = D / 4;
+  constexpr int THREADS_FOR_KV = 32 * D4;
+  for (int j0 = 0; j0 < n; j0 += 32) {
+    if constexpr ((D & 3) == 0 && THREADS_FOR_KV <= 256) {
+      if (tid < THREADS_FOR_KV) {
+        int kj = tid / D4, d4 = (tid % D4) * 4;
+        if (j0 + kj < n) {
+          size_t ko = (b * (size_t)n + (size_t)(j0 + kj)) * W + h * D + d4;
+          float4 k4 = *reinterpret_cast<const float4*>(k + ko);
+          float4 v4 = *reinterpret_cast<const float4*>(v + ko);
+          Ks[kj][d4] = k4.x; Ks[kj][d4 + 1] = k4.y; Ks[kj][d4 + 2] = k4.z; Ks[kj][d4 + 3] = k4.w;
+          Vs[kj][d4] = v4.x; Vs[kj][d4 + 1] = v4.y; Vs[kj][d4 + 2] = v4.z; Vs[kj][d4 + 3] = v4.w;
+        }
+      }
+    } else {
+      for (int idx = tid; idx < 32 * D; idx += 256) {
+        int kj = idx / D, d = idx % D;
+        if (j0 + kj < n) {
+          size_t ko = (b * (size_t)n + (size_t)(j0 + kj)) * W + h * D + d;
+          Ks[kj][d] = k[ko];
+          Vs[kj][d] = v[ko];
+        }
+      }
+    }
+    if (keyMask && tid < 32 && j0 + tid < n) {
+      Ms[tid] = 1e9f * (keyMask[b * (size_t)n + (size_t)(j0 + tid)] - 1.f);
+    }
+    __syncthreads();
+    int j = j0 + lane;
+    if (validQ && j < n) {
+      float s = 0.f;
+#pragma unroll
+      for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
+      if (keyMask) s += Ms[lane];
+      if (pbRow) s += pbRow[j];
+      s = fminf(fmaxf(s, -1e8f), 1e8f);
+      float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
+      l = l * c + p;
+#pragma unroll
+      for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[lane][d];
+      m = mn;
+    }
+    __syncthreads();
+  }
+  if (!validQ) return;
   float M_ = m;
+#pragma unroll
   for (int off = 16; off; off >>= 1) M_ = fmaxf(M_, __shfl_xor_sync(~0u, M_, off));
   float c = m == -INFINITY ? 0.f : __expf(m - M_);
   l *= c;
+#pragma unroll
   for (int off = 16; off; off >>= 1) l += __shfl_xor_sync(~0u, l, off);
+  l = __shfl_sync(~0u, l, 0);
+  float x_lane = 0.f;
+#pragma unroll
   for (int d = 0; d < D; ++d) {
     float x = o[d] * c;
+#pragma unroll
     for (int off = 16; off; off >>= 1) x += __shfl_xor_sync(~0u, x, off);
-    if (lane == 0) {
-      float gate = 1.f / (1.f + __expf(-g[bq * W + h * D + d]));
-      out[bq * W + h * D + d] = x / l * gate;
-    }
+    float x0 = __shfl_sync(~0u, x, 0);
+    if (lane == d) x_lane = x0;
+  }
+  if (lane < D) {
+    float gate = 1.f / (1.f + __expf(-g[bq * W + h * D + lane]));
+    out[bq * W + h * D + lane] = x_lane / l * gate;
   }
 }
 // q, k, v, g [rows, W] f32 -> qkvg [rows][4W] f16 (the flash kernel's layout, roles in that order)
@@ -219,8 +303,8 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
     halfToFloatK<<<blocks(rows * W), 256, 0, STREAM>>>(o, out, rows * W);
     return;
   }
-  size_t warps = (size_t)Bt * n * H;
-  unsigned grid = (unsigned)((warps + 7) / 8);
+  unsigned nq = (unsigned)((n + 7) / 8);
+  dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
   float scale = 1.f / sqrtf((float)D);
   if (D == 32) attentionK<32><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
   else if (D == 8) attentionK<8><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
@@ -228,9 +312,21 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
   else { fprintf(stderr, "attention: no kernel for head width %d\n", D); exit(1); }
 }
 // add the gate's bias [H*D] to g, a [rows, H*D] block with row stride `ld`
-__global__ void addStridedBiasK(float* g, const float* b, size_t rows, int W, int ld) {
+__global__ void addStridedBiasK(float* __restrict__ g, const float* __restrict__ b, size_t rows, int W, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * W) g[(t / W) * ld + t % W] += b[t % W];
+  if ((W & 3) == 0 && (ld & 3) == 0 && (((uintptr_t)g | (uintptr_t)b) & 15) == 0) {
+    int w4 = W >> 2, ld4 = ld >> 2;
+    size_t n4 = rows * (size_t)w4;
+    if (t < n4) {
+      size_t r = (n4 <= UINT32_MAX) ? (unsigned)t / (unsigned)w4 : t / (size_t)w4;
+      int c4 = (int)(t - r * (size_t)w4);
+      float4 gv = reinterpret_cast<const float4*>(g)[r * ld4 + c4];
+      float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c4);
+      reinterpret_cast<float4*>(g)[r * ld4 + c4] = make_float4(gv.x + bv.x, gv.y + bv.y, gv.z + bv.z, gv.w + bv.w);
+    }
+    return;
+  }
+  if (t < rows * W) g[(t / W) * ld + t % W] += __ldg(b + t % W);
 }
 
 // ---------------------------------------------------------------- global (column) attention

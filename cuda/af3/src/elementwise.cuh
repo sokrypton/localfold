@@ -2,17 +2,36 @@
 // computation under the same name, renamed variables apart), here once. Included by common.cuh.
 #pragma once
 
-__global__ void addK(float* y, const float* x, size_t n) {
+__global__ void addK(float* __restrict__ y, const float* __restrict__ x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)y | (uintptr_t)x) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[t];
+      float4 xv = reinterpret_cast<const float4*>(x)[t];
+      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + xv.x, yv.y + xv.y, yv.z + xv.z, yv.w + xv.w);
+    }
+    return;
+  }
   if (t < n) y[t] += x[t];
 }
 
-__global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
+__global__ void addBiasK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t >= n4) return;
+    int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)t % (unsigned)c4) : (int)(t % c4));
+    float4 yv = reinterpret_cast<const float4*>(y)[t];
+    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
+    reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+    return;
+  }
   size_t n = rows * C;
   if (t >= n) return;
   int c = ((C & (C - 1)) == 0) ? (int)(t & (size_t)(C - 1)) : (n <= UINT32_MAX ? (int)((unsigned)t % (unsigned)C) : (int)(t % C));
-  y[t] += b[c];
+  y[t] += __ldg(b + c);
 }
 
 __global__ void symmetriseK(const float* z, float* out, int T, int C) {
@@ -39,8 +58,22 @@ __global__ void symmetriseRowsK(const float* z, float* out, int T, int C, size_t
   int c = (int)(t % C); size_t ij = t / C; size_t i = r0 + ij / T, j = ij % T;
   out[t] = z[(i * T + j) * C + c] + z[(j * T + i) * C + c];
 }
-__global__ void gateMulAddK(float* pair, const float* out, const float* gate, size_t n) {
+__global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ out, const float* __restrict__ gate, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out | (uintptr_t)gate) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 p = reinterpret_cast<const float4*>(pair)[t];
+      float4 o = reinterpret_cast<const float4*>(out)[t];
+      float4 g = reinterpret_cast<const float4*>(gate)[t];
+      p.x += o.x / (1.f + __expf(-g.x));
+      p.y += o.y / (1.f + __expf(-g.y));
+      p.z += o.z / (1.f + __expf(-g.z));
+      p.w += o.w / (1.f + __expf(-g.w));
+      reinterpret_cast<float4*>(pair)[t] = p;
+    }
+    return;
+  }
   if (t < n) pair[t] += out[t] / (1.f + __expf(-gate[t]));
 }
 
@@ -54,6 +87,25 @@ __global__ void gateMulAddHK(float* pair, const float* out, const half* gate, si
 __global__ void channelMajorToRowsK(const float* x, float* y, size_t pairs, int C) {   // [c][ij] -> [ij][c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < pairs * C) y[t] = x[(t % C) * pairs + t / C];
+}
+
+__global__ void channelMajorToRowsTileK(const float* __restrict__ x, float* __restrict__ y, size_t pairs, int C) {
+  __shared__ float tile[32][33];
+  size_t ij0 = (size_t)blockIdx.x * 32;
+  int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+  size_t ij = ij0 + tx;
+#pragma unroll
+  for (int k = 0; k < 32; k += 8) {
+    int c = c0 + ty + k;
+    if (c < C && ij < pairs) tile[ty + k][tx] = x[(size_t)c * pairs + ij];
+  }
+  __syncthreads();
+  int c = c0 + tx;
+#pragma unroll
+  for (int k = 0; k < 32; k += 8) {
+    size_t r = ij0 + ty + k;
+    if (r < pairs && c < C) y[r * C + c] = tile[tx][ty + k];
+  }
 }
 
 __global__ void centerNormHK(const float* prod, half* out, size_t pairs, int C, const float* scale, const float* offset,

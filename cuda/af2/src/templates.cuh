@@ -164,7 +164,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
         act, sum, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
     } else {
       layerNorm(act, k == 0 ? sum : actn, pairs, C, S + "output_layer_norm");
-      if (k > 0) addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, actn, pairs * C);
+      if (k > 0) addK2<<<blocks(pairs * (C >> 2)), 256, 0, STREAM>>>(sum, actn, pairs * C);
     }
   }
   if (T > 1) reluScaleK<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, 1.f / T, pairs * C);

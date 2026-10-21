@@ -241,7 +241,7 @@ inline std::vector<float> contactsChunked(const float* pair, int L) {
     linearB(pair + r0 * L * 128, "distogram_head/half_logits", -1, a, rows, 128, 64);
     gatherColumnsK<<<blocks(rows * 128), 256, 0, STREAM>>>(pair, rowsT, L, 128, r0, r);
     linearB(rowsT, "distogram_head/half_logits", -1, b, rows, 128, 64);
-    addK2<<<blocks(rows * 64), 256, 0, STREAM>>>(a, b, rows * 64);
+    addK2<<<blocks(rows * 16), 256, 0, STREAM>>>(a, b, rows * 64);
     contact8K<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(a, rows, c + r0 * L);
   }
   std::vector<float> out = download(c, pairs);
