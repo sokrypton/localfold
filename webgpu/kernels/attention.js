@@ -689,6 +689,42 @@ export function createAttentionPairBiasShader(pairStorage = "f32", heads = 1) {
     throw new RangeError(`the pair bias wants 1..32 heads; got ${heads}`);
   }
   const overHeads = (body) => Array.from({ length: heads }, (_, h) => body(h)).join("\n");
+  const cLoop = pairStorage === "f16"
+    ? `  let pairs_c = p.pair_channels / 2u;
+  let pair_word_base = pair_index * pairs_c;
+  for (var w_c = 0u; w_c < pairs_c; w_c += 1u) {
+    let pair_vals = unpack2x16float(pair[pair_word_base + w_c]);
+    let w0 = p.pair_weight + (w_c * 2u) * HEADS;
+${overHeads((h) => `    result${h} += pair_vals.x * weights[w0 + ${h}u];`)}
+    let w1 = w0 + HEADS;
+${overHeads((h) => `    result${h} += pair_vals.y * weights[w1 + ${h}u];`)}
+  }
+  if ((p.pair_channels & 1u) != 0u) {
+    let c = p.pair_channels - 1u;
+    let value = ${storedElement(pairStorage, "pair", "base + c")};
+    let w = p.pair_weight + c * HEADS;
+${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
+  }`
+    : `  var c = 0u;
+  for (; c + 3u < p.pair_channels; c += 4u) {
+    let v0 = pair[base + c];
+    let v1 = pair[base + c + 1u];
+    let v2 = pair[base + c + 2u];
+    let v3 = pair[base + c + 3u];
+    let w0 = p.pair_weight + c * HEADS;
+    let w1 = w0 + HEADS;
+    let w2 = w1 + HEADS;
+    let w3 = w2 + HEADS;
+${overHeads((h) => `    result${h} += v0 * weights[w0 + ${h}u];`)}
+${overHeads((h) => `    result${h} += v1 * weights[w1 + ${h}u];`)}
+${overHeads((h) => `    result${h} += v2 * weights[w2 + ${h}u];`)}
+${overHeads((h) => `    result${h} += v3 * weights[w3 + ${h}u];`)}
+  }
+  for (; c < p.pair_channels; c += 1u) {
+    let value = pair[base + c];
+    let w = p.pair_weight + c * HEADS;
+${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
+  }`;
   return `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<${storageArray(pairStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -704,11 +740,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (pair_index >= pairs) { return; }
   let base = pair_index * p.pair_channels;
 ${overHeads((h) => `  var result${h} = 0.0;`)}
-  for (var c = 0u; c < p.pair_channels; c += 1u) {
-    let value = ${storedElement(pairStorage, "pair", "base + c")};
-    let w = p.pair_weight + c * HEADS;
-${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
-  }
+${cLoop}
   // ...the output is head-major, so each head's store is still consecutive
   // across the workgroup; only the stride between them changed.
 ${overHeads((h) => `  output[${h}u * pairs + pair_index] = result${h};`)}
@@ -749,6 +781,39 @@ export function createFusedPairBiasShader(pairStorage = "f32", heads = 1, channe
     throw new RangeError(`the fused pair bias wants an even channel count; got ${channels}`);
   }
   const overHeads = (body) => Array.from({ length: heads }, (_, h) => body(h)).join("\n");
+  const statsLoop = pairStorage === "f16"
+    ? `  let pairs_c = CHANNELS / 2u;
+  let pair_word_base = pair_index * pairs_c;
+  for (var w_c = 0u; w_c < pairs_c; w_c += 1u) {
+    let vals = unpack2x16float(pair[pair_word_base + w_c]);
+    sum += vals.x;
+    squares += vals.x * vals.x;
+    sum += vals.y;
+    squares += vals.y * vals.y;
+  }`
+    : `  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let value = pair[base + c];
+    sum += value;
+    squares += value * value;
+  }`;
+  const projLoop = pairStorage === "f16"
+    ? `  for (var w_c = 0u; w_c < pairs_c; w_c += 1u) {
+    let vals = unpack2x16float(pair[pair_word_base + w_c]);
+    let c0 = w_c * 2u;
+    let v0 = (vals.x - mean) * inverse_std * weights[n.scale + c0] + weights[n.offset + c0];
+    let w0 = p.pair_weight + c0 * HEADS;
+${overHeads((h) => `    result${h} += v0 * weights[w0 + ${h}u];`)}
+    let c1 = c0 + 1u;
+    let v1 = (vals.y - mean) * inverse_std * weights[n.scale + c1] + weights[n.offset + c1];
+    let w1 = w0 + HEADS;
+${overHeads((h) => `    result${h} += v1 * weights[w1 + ${h}u];`)}
+  }`
+    : `  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let raw = pair[base + c];
+    let value = (raw - mean) * inverse_std * weights[n.scale + c] + weights[n.offset + c];
+    let w = p.pair_weight + c * HEADS;
+${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
+  }`;
   return `${COMMON}
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
@@ -779,11 +844,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // from cache, and that walk has no barrier in it at all.
   var sum = 0.0;
   var squares = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let value = ${storedElement(pairStorage, "pair", "base + c")};
-    sum += value;
-    squares += value * value;
-  }
+${statsLoop}
   // 🔴 AND THE STATISTICS ARE ONE PASS, NOT TWO, WHICH IS A NUMERICS CHANGE AND
   // IS DECLARED. E[x^2] - E[x]^2 loses precision where the mean is large
   // against the spread; a LayerNorm's input here is an activation with mean
@@ -794,12 +855,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let inverse_std = inverseSqrt(variance + n.epsilon);
 
 ${overHeads((h) => `  var result${h} = 0.0;`)}
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let raw = ${storedElement(pairStorage, "pair", "base + c")};
-    let value = (raw - mean) * inverse_std * weights[n.scale + c] + weights[n.offset + c];
-    let w = p.pair_weight + c * HEADS;
-${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
-  }
+${projLoop}
 ${overHeads((h) => `  output[${h}u * pairs + pair_index] = result${h};`)}
 }`;
 }

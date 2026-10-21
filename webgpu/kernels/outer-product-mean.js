@@ -1202,25 +1202,17 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
   // webgpu/kernels/vector-gemm-block.js)
   const { rows: BM, columns: BN, inner: BK } = block;
   const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
-  const acc = [], reads = [], mul = [], stores = [], biases = [], bs = [], flush = [];
+  const acc = [], inner = [], stores = [], biases = [], flush = [];
   for (let j = 0; j < TV; j += 1) {
-    bs.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TV}u + ${j}u];`);
     biases.push(`  let bias_${j} = vec4<f32>(weights[b0 + ${4 * j}u], weights[b0 + ${4 * j + 1}u], `
       + `weights[b0 + ${4 * j + 2}u], weights[b0 + ${4 * j + 3}u]);`);
   }
-  for (let v = 0; v < MV; v += 1) {
-    reads.push(`      let a_vec_${v} = a_tile[k * ${AV}u + ty * ${MV}u + ${v}u];`);
-  }
   for (let i = 0; i < TM; i += 1) {
-    const ai = `a_vec_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
     for (let j = 0; j < TV; j += 1) {
       acc.push(`  var acc_${i}_${j} = ${f16 ? "vec4<f32>(0.0)" : `bias_${j}`};`);
       if (f16) {
         acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        mul.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
         flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
-      } else {
-        mul.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
       }
     }
     stores.push(`  {
@@ -1236,12 +1228,32 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
     }
   }`);
   }
+  for (let k = 0; k < BK; k += 1) {
+    for (let j = 0; j < TV; j += 1) {
+      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`);
+    }
+    for (let v = 0; v < MV; v += 1) {
+      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
+    }
+    for (let i = 0; i < TM; i += 1) {
+      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      for (let j = 0; j < TV; j += 1) {
+        if (f16) {
+          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+        } else {
+          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+        }
+      }
+    }
+  }
   const aSteps = ((BM / 4) * BK) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
   const aPrecompute = Array.from({ length: aSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let a_mg_${s} = ${eExpr} / ${BK}u;
   let a_k_${s} = ${eExpr} % ${BK}u;
-  let a_r0_${s} = row_origin + a_mg_${s} * 4u;${f16 ? `
+  let a_r0_${s} = row_origin + a_mg_${s} * 4u;
+  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};${f16 ? `
   var a_scale_${s} = vec4<f32>(0.0);
   if (a_r0_${s} + 3u < parameters.rows) {
     let sp = parameters.padding.x + a_r0_${s};
@@ -1252,6 +1264,11 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
     if (a_r0_${s} + 2u < parameters.rows) { a_scale_${s}.z = scale[parameters.padding.x + a_r0_${s} + 2u]; }
     if (a_r0_${s} + 3u < parameters.rows) { a_scale_${s}.w = scale[parameters.padding.x + a_r0_${s} + 3u]; }
   }` : ""}`;
+  }).join("\n");
+  const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let r0 = a_r0_${s};
@@ -1280,8 +1297,15 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
           value.w = ${T}(source[(r0 + 3u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.w` : ""});
         }
       }
-      a_tile[k * ${AV}u + a_mg_${s}] = value;
+      a_tile[a_idx_${s}] = value;
     }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `    {
+      let base = b_col_${s} + (k0 + b_k_${s}) * parameters.columns;
+      b_tile[${eExpr}] = vec4<${T}>(vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u], weights[base + 3u]));
+    }`;
+  }).join("\n");
   return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -1305,20 +1329,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 ${biases.join("\n")}
 ${acc.join("\n")}
 ${aPrecompute}
+${bPrecompute}
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
 ${aStage}
-    for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
-      let base = parameters.weight_offset + (k0 + e / ${BN / 4}u) * parameters.columns
-        + column_origin + (e % ${BN / 4}u) * 4u;
-      b_tile[e] = vec4<${T}>(vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u],
-                            weights[base + 3u]));
-    }
+${bStage}
     workgroupBarrier();
-    for (var k = 0u; k < ${BK}u; k += 1u) {
-${bs.join("\n")}
-${reads.join("\n")}
-${mul.join("\n")}
-    }
+${inner.join("\n")}
 ${flush.join("\n")}
     workgroupBarrier();
   }
@@ -1353,19 +1369,13 @@ export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAU
   const vec4Align = cOuter % 4 === 0;
   const { rows: BM, columns: BN, inner: BK } = block;
   const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
-  const acc = [], reads = [], mul = [], stores = [], bs = [], flush = [];
-  for (let j = 0; j < TV; j += 1) bs.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TV}u + ${j}u];`);
-  for (let v = 0; v < MV; v += 1) reads.push(`      let a_vec_${v} = a_tile[k * ${AV}u + ty * ${MV}u + ${v}u];`);
+  const acc = [], inner = [], stores = [], flush = [];
   for (let i = 0; i < TM; i += 1) {
-    const ai = `a_vec_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
     for (let j = 0; j < TV; j += 1) {
       acc.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
         acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        mul.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
         flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
-      } else {
-        mul.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
       }
     }
     stores.push(`  {
@@ -1386,10 +1396,66 @@ ${Array.from({ length: TV }, (_, j) => `      {
     }
   }`);
   }
+  for (let k = 0; k < BK; k += 1) {
+    for (let j = 0; j < TV; j += 1) {
+      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`);
+    }
+    for (let v = 0; v < MV; v += 1) {
+      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
+    }
+    for (let i = 0; i < TM; i += 1) {
+      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      for (let j = 0; j < TV; j += 1) {
+        if (f16) {
+          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+        } else {
+          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+        }
+      }
+    }
+  }
   const storageType = vec4Align ? "vec4<f32>" : "f32";
   const load4 = (buf) => vec4Align
     ? `${buf}[base / 4u]`
     : `vec4<f32>(${buf}[base], ${buf}[base + 1u], ${buf}[base + 2u], ${buf}[base + 3u])`;
+  const aSteps = ((BM / 4) * BK) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
+  const aPre = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_k_${s} = ${eExpr} / ${BM / 4}u;
+  let a_mg_${s} = ${eExpr} % ${BM / 4}u;
+  let a_r_${s} = row_origin + a_mg_${s} * 4u;
+  let a_valid_${s} = a_r_${s} < parameters.rows;
+  let a_col_${s} = parameters.weight_offset + a_r_${s};
+  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
+  }).join("\n");
+  const bPre = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_c_${s} = column_origin + (${eExpr} % ${BN / 4}u) * 4u;
+  let b_valid_${s} = b_c_${s} < parameters.columns;`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      let k = k0 + a_k_${s};
+      var value = vec4<f32>(0.0);
+      if (k < parameters.inner && a_valid_${s}) {
+        let base = k * stride + a_col_${s};
+        value = ${load4("left")};
+      }
+      a_tile[a_idx_${s}] = vec4<${T}>(value);
+    }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `    {
+      let k = k0 + b_k_${s};
+      var value = vec4<f32>(0.0);
+      if (k < parameters.inner && b_valid_${s}) {
+        let base = k * stride + b_c_${s};
+        value = ${load4("right")};
+      }
+      b_tile[${eExpr}] = vec4<${T}>(value);
+    }`;
+  }).join("\n");
   return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -1412,34 +1478,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // one of the block's residues' channels, a column one of any residue's.
   let stride = parameters.columns;
 ${acc.join("\n")}
+${aPre}
+${bPre}
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
-    for (var e = li; e < ${BK * BM / 4}u; e += 256u) {
-      let k = k0 + e / ${BM / 4}u;
-      let mg = e % ${BM / 4}u;
-      let r = row_origin + mg * 4u;
-      var value = vec4<f32>(0.0);
-      if (k < parameters.inner && r < parameters.rows) {
-        let base = k * stride + parameters.weight_offset + r;
-        value = ${load4("left")};
-      }
-      a_tile[(e / ${BM / 4}u) * ${AV}u + mg] = vec4<${T}>(value);
-    }
-    for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
-      let k = k0 + e / ${BN / 4}u;
-      let c = column_origin + (e % ${BN / 4}u) * 4u;
-      var value = vec4<f32>(0.0);
-      if (k < parameters.inner && c < parameters.columns) {
-        let base = k * stride + c;
-        value = ${load4("right")};
-      }
-      b_tile[e] = vec4<${T}>(value);
-    }
+${aStage}
+${bStage}
     workgroupBarrier();
-    for (var k = 0u; k < ${BK}u; k += 1u) {
-${bs.join("\n")}
-${reads.join("\n")}
-${mul.join("\n")}
-    }
+${inner.join("\n")}
 ${flush.join("\n")}
     workgroupBarrier();
   }

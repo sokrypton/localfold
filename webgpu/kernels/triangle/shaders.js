@@ -605,6 +605,21 @@ ${abRowStores}
     Array.from({ length: contractRows }, (_, r) => body(r)).join("\n      ");
   const overContractColumns = (body) =>
     Array.from({ length: contractColumns }, (_, c) => body(c)).join("\n      ");
+  const contractInner = Array.from({ length: 8 }, (_, k) => `    {
+      let left = tile_a[local.y * 8u + ${k}u];
+      let right = tile_b[${k * 8}u + local.x];
+      ${overContractRows((r) => `sum_${r} += ${contractRowAt("left", r)} * right;`)}
+    }`).join("\n");
+  const contractStores = Array.from({ length: contractRows }, (_, r) => `  {
+    let i = i0 + ${r * 8}u;
+    if (i < L) {
+      let row = sum_${r};
+      ${overContractColumns((c) => `{
+        let j = j0 + ${c}u * 8u;
+        if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
+      }`)}
+    }
+  }`).join("\n");
   const contract = `${common}
 const CONTRACT_ROWS: u32 = ${CONTRACT_TILE.rows}u;
 const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
@@ -628,8 +643,7 @@ fn main(
   let h = group.z;
   let tile_index = local.y * 8u + local.x;
   // One accumulator a row, holding that row's columns.
-  var sum: array<${contractColumnVector}, ${contractRows}>;
-  for (var r = 0u; r < ${contractRows}u; r += 1u) { sum[r] = ${contractColumnVector}(0.0); }
+${Array.from({ length: contractRows }, (_, r) => `  var sum_${r} = ${contractColumnVector}(0.0);`).join("\n")}
 
   for (var k0 = 0u; k0 < L; k0 += 8u) {
     let a_k = k0 + local.x;
@@ -651,23 +665,11 @@ fn main(
     tile_a[tile_index] = staged_a;
     tile_b[tile_index] = staged_b;
     workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let left = tile_a[local.y * 8u + k];
-      let right = tile_b[k * 8u + local.x];
-      ${overContractRows((r) => `sum[${r}u] += ${contractRowAt("left", r)} * right;`)}
-    }
+${contractInner}
     workgroupBarrier();
   }
 
-  for (var r = 0u; r < ${contractRows}u; r += 1u) {
-    let i = i0 + r * 8u;
-    if (i >= L) { continue; }
-    let row = sum[r];
-    ${overContractColumns((c) => `{
-        let j = j0 + ${c}u * 8u;
-        if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
-      }`)}
-  }
+${contractStores}
 }`;
 
   // 🔴 THE CONTRACTION IN f16 ARITHMETIC, ON A 64 x 64 TILE OF 16 x 16 LANES (contractTile.arithmetic "f16"), as the
@@ -694,12 +696,36 @@ fn main(
     const stage = (tile, load, row0) => `{
       let k = k0 + ${kLane};
       var staged = vec4<f16>(0.0);
-      for (var r = 0u; r < 4u; r += 1u) {
-        let row = ${row0} + ${lane} + r * 16u;
-        if (row < L && k < L) { staged[r] = f16(${load("row")} * 0.0625); }
+      if (k < L) {
+        let r0 = ${row0} + ${lane};
+        if (r0 < L) { staged.x = f16(${load("r0")} * 0.0625); }
+        let r1 = r0 + 16u;
+        if (r1 < L) { staged.y = f16(${load("r1")} * 0.0625); }
+        let r2 = r0 + 32u;
+        if (r2 < L) { staged.z = f16(${load("r2")} * 0.0625); }
+        let r3 = r0 + 48u;
+        if (r3 < L) { staged.w = f16(${load("r3")} * 0.0625); }
       }
       ${tile}[${kLane} * 16u + ${lane}] = staged;
     }`;
+    const f16Inner = Array.from({ length: 16 }, (_, k) => `    {
+      let left = tile_a[${k * 16}u + local.y];
+      let right = tile_b[${k * 16}u + local.x];
+      part_0 = fma(vec4<f16>(left.x), right, part_0);
+      part_1 = fma(vec4<f16>(left.y), right, part_1);
+      part_2 = fma(vec4<f16>(left.z), right, part_2);
+      part_3 = fma(vec4<f16>(left.w), right, part_3);
+    }`).join("\n");
+    const f16Stores = [0, 1, 2, 3].map((r) => `  {
+    let i = i0 + local.y + ${r * 16}u;
+    if (i < L) {
+      let row_base = ${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j0 + local.x;
+      if (j0 + local.x < L) { output[row_base] = sum_${r}.x * 256.0; }
+      if (j0 + local.x + 16u < L) { output[row_base + 16u] = sum_${r}.y * 256.0; }
+      if (j0 + local.x + 32u < L) { output[row_base + 32u] = sum_${r}.z * 256.0; }
+      if (j0 + local.x + 48u < L) { output[row_base + 48u] = sum_${r}.w * 256.0; }
+    }
+  }`).join("\n");
     contractF16 = `${common.startsWith("enable f16;") ? "" : "enable f16;\n"}${common}
 @group(0) @binding(0) var<storage, read> a: array<${storageArray(abStorage)}>;
 @group(0) @binding(1) var<storage, read> b: array<${storageArray(abStorage)}>;
@@ -718,34 +744,26 @@ fn main(
   let i0 = group.y * 64u;
   let j0 = group.x * 64u;
   let h = group.z;
-  var sum: array<vec4<f32>, 4>;
-  for (var r = 0u; r < 4u; r += 1u) { sum[r] = vec4<f32>(0.0); }
+  var sum_0 = vec4<f32>(0.0);
+  var sum_1 = vec4<f32>(0.0);
+  var sum_2 = vec4<f32>(0.0);
+  var sum_3 = vec4<f32>(0.0);
   for (var k0 = 0u; k0 < L; k0 += 16u) {
     ${stage("tile_a", loadOf("a"), "i0")}
     ${stage("tile_b", loadOf("b"), "j0")}
     workgroupBarrier();
-    var part: array<vec4<f16>, 4>;
-    for (var r = 0u; r < 4u; r += 1u) { part[r] = vec4<f16>(0.0); }
-    for (var k = 0u; k < 16u; k += 1u) {
-      let left = tile_a[k * 16u + local.y];
-      let right = tile_b[k * 16u + local.x];
-      part[0] = fma(vec4<f16>(left.x), right, part[0]);
-      part[1] = fma(vec4<f16>(left.y), right, part[1]);
-      part[2] = fma(vec4<f16>(left.z), right, part[2]);
-      part[3] = fma(vec4<f16>(left.w), right, part[3]);
-    }
-    for (var r = 0u; r < 4u; r += 1u) { sum[r] += vec4<f32>(part[r]); }
+    var part_0 = vec4<f16>(0.0);
+    var part_1 = vec4<f16>(0.0);
+    var part_2 = vec4<f16>(0.0);
+    var part_3 = vec4<f16>(0.0);
+${f16Inner}
+    sum_0 += vec4<f32>(part_0);
+    sum_1 += vec4<f32>(part_1);
+    sum_2 += vec4<f32>(part_2);
+    sum_3 += vec4<f32>(part_3);
     workgroupBarrier();
   }
-  for (var r = 0u; r < 4u; r += 1u) {
-    let i = i0 + local.y + r * 16u;
-    if (i >= L) { continue; }
-    let row = sum[r];
-    for (var c = 0u; c < 4u; c += 1u) {
-      let j = j0 + local.x + c * 16u;
-      if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = row[c] * 256.0; }
-    }
-  }
+${f16Stores}
 }`;
   }
 

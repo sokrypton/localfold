@@ -748,23 +748,16 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
     ? (sourcePrecision === T ? `source[(${r}) * parameters.inner + k]` : `${T}(source[(${r}) * parameters.inner + k])`)
     : `${T}(gated((${r}) * ${sourceGate.stride}u + k))`;
   const accumulators = [];
-  const multiply = [];
+  const inner = [];
   const stores = [];
-  const reads = [];
   const flush = [];
-  for (let v = 0; v < MV; v += 1) reads.push(`      let a_vec_${v} = a_tile[k * ${AV}u + ty * ${MV}u + ${v}u];`);
-  for (let j = 0; j < TN / 4; j += 1) reads.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TN / 4}u + ${j}u];`);
   for (let i = 0; i < TM; i += 1) {
-    const ai = `a_vec_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
     const rowStores = [];
     for (let j = 0; j < TN / 4; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
         accumulators.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        multiply.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
         flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
-      } else {
-        multiply.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
       }
       for (let c = 0; c < 4; c += 1) {
         const value = `acc_${i}_${j}.${"xyzw"[c]}`;
@@ -780,7 +773,59 @@ ${rowStores.join("\n")}
     }
   }`);
   }
+  for (let k = 0; k < BK; k += 1) {
+    for (let v = 0; v < MV; v += 1) {
+      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
+    }
+    for (let j = 0; j < TN / 4; j += 1) {
+      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TN / 4}u + ${j}u];`);
+    }
+    for (let i = 0; i < TM; i += 1) {
+      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      for (let j = 0; j < TN / 4; j += 1) {
+        if (f16) {
+          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+        } else {
+          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+        }
+      }
+    }
+  }
   const weight = (offset) => weightPrecision === T ? `weights[base${offset}]` : `${T}(weights[base${offset}])`;
+  const aSteps = ((BM / 4) * BK) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
+  const aPre = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_mg_${s} = ${eExpr} / BK;
+  let a_k_${s} = ${eExpr} % BK;
+  let a_r0_${s} = row_origin + a_mg_${s} * 4u;
+  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
+  }).join("\n");
+  const bPre = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u;`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      let r0 = a_r0_${s};
+      let k = k0 + a_k_${s};
+      var value = vec4<${T}>(0.0);
+      if (r0 + 3u < parameters.rows) {
+        value = vec4<${T}>(${loadElem("r0")}, ${loadElem("r0 + 1u")}, ${loadElem("r0 + 2u")}, ${loadElem("r0 + 3u")});
+      } else {
+        if (r0 < parameters.rows) { value.x = ${loadElem("r0")}; }
+        if (r0 + 1u < parameters.rows) { value.y = ${loadElem("r0 + 1u")}; }
+        if (r0 + 2u < parameters.rows) { value.z = ${loadElem("r0 + 2u")}; }
+      }
+      a_tile[a_idx_${s}] = value;
+    }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `    {
+      let base = b_col_${s} + (k0 + b_k_${s}) * parameters.columns;
+      b_tile[${eExpr}] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
+    }`;
+  }).join("\n");
   return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -806,34 +851,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let tx = li % 16u;
   let ty = li / 16u;
 ${accumulators.join("\n")}
+${aPre}
+${bPre}
   for (var k0 = 0u; k0 < parameters.inner; k0 += BK) {
-    // The source panel, k-major so a row's reads broadcast; a zero past the
-    // last row so the tail block computes nothing it stores.
-    for (var e = li; e < (BM / 4u) * BK; e += 256u) {
-      let mg = e / BK;
-      let k = k0 + e % BK;
-      let r0 = row_origin + mg * 4u;
-      var value = vec4<${T}>(0.0);
-      if (r0 + 3u < parameters.rows) {
-        value = vec4<${T}>(${loadElem("r0")}, ${loadElem("r0 + 1u")}, ${loadElem("r0 + 2u")}, ${loadElem("r0 + 3u")});
-      } else {
-        if (r0 < parameters.rows) { value.x = ${loadElem("r0")}; }
-        if (r0 + 1u < parameters.rows) { value.y = ${loadElem("r0 + 1u")}; }
-        if (r0 + 2u < parameters.rows) { value.z = ${loadElem("r0 + 2u")}; }
-      }
-      a_tile[(e % BK) * ${AV}u + mg] = value;
-    }
-    for (var e = li; e < BK * BN / 4u; e += 256u) {
-      let k = k0 + e / ${BN / 4}u;
-      let base = parameters.weight_offset + k * parameters.columns + column_origin
-        + (e % ${BN / 4}u) * 4u;
-      b_tile[e] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
-    }
+${aStage}
+${bStage}
     workgroupBarrier();
-    for (var k = 0u; k < BK; k += 1u) {
-${reads.join("\n")}
-${multiply.join("\n")}
-    }
+${inner.join("\n")}
 ${flush.join("\n")}
     workgroupBarrier();
   }
