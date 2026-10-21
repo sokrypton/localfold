@@ -18,17 +18,18 @@ const CTX = (W_K - W_Q) / 2;
 export function lnRows(x, rows, width, w, b, eps = 1e-5) {
   const y = new Float32Array(rows * width);
   for (let r = 0; r < rows; r += 1) {
+    const xr = r * width;
     let mean = 0;
-    for (let c = 0; c < width; c += 1) mean += x[r * width + c];
+    for (let c = 0; c < width; c += 1) mean += x[xr + c];
     mean /= width;
     let v = 0;
-    for (let c = 0; c < width; c += 1) { const d = x[r * width + c] - mean; v += d * d; }
+    for (let c = 0; c < width; c += 1) { const d = x[xr + c] - mean; v += d * d; }
     const inv = 1 / Math.sqrt(v / width + eps);
     for (let c = 0; c < width; c += 1) {
-      let value = (x[r * width + c] - mean) * inv;
+      let value = (x[xr + c] - mean) * inv;
       if (w) value *= w[c];
       if (b) value += b[c];
-      y[r * width + c] = value;
+      y[xr + c] = value;
     }
   }
   return y;
@@ -38,12 +39,13 @@ export function lnRows(x, rows, width, w, b, eps = 1e-5) {
 export function linearRows(x, rows, inC, w, outC, b) {
   const y = new Float32Array(rows * outC);
   for (let r = 0; r < rows; r += 1) {
+    const xr = r * inC;
+    const yr = r * outC;
     for (let o = 0; o < outC; o += 1) {
       let s = b ? b[o] : 0;
       const wo = o * inC;
-      const xr = r * inC;
       for (let i = 0; i < inC; i += 1) s += x[xr + i] * w[wo + i];
-      y[r * outC + o] = s;
+      y[yr + o] = s;
     }
   }
   return y;
@@ -58,16 +60,35 @@ export function atomFeatures(p, f) {
   const c = new Float32Array(N * C);
   const cont = p["proj_atom_continuous/weight"];       // (128, 4)
   const element = p["embed_element/weight"];          // (128, 128)
-  const names = [0, 1, 2, 3].map((i) => p[`embed_atom_name_chars_${i}/weight`]);   // (64, 128)
+  const n0 = p["embed_atom_name_chars_0/weight"];
+  const n1 = p["embed_atom_name_chars_1/weight"];
+  const n2 = p["embed_atom_name_chars_2/weight"];
+  const n3 = p["embed_atom_name_chars_3/weight"];
   for (let a = 0; a < N; a += 1) {
     if (!f.atom_pad_mask[a]) continue;
-    const ref = [f.template_coords[a * 3], f.template_coords[a * 3 + 1], f.template_coords[a * 3 + 2], f.charge[a]];
+    const r0 = f.template_coords[a * 3];
+    const r1 = f.template_coords[a * 3 + 1];
+    const r2 = f.template_coords[a * 3 + 2];
+    const r3 = f.charge[a];
+    const elBase = f.element[a] * C;
+    const n0Base = f.name_encoding[a * 4] * C;
+    const n1Base = f.name_encoding[a * 4 + 1] * C;
+    const n2Base = f.name_encoding[a * 4 + 2] * C;
+    const n3Base = f.name_encoding[a * 4 + 3] * C;
+    const aBase = a * C;
     for (let o = 0; o < C; o += 1) {
+      const co = o * 4;
       let s = 0;
-      for (let i = 0; i < 4; i += 1) s += ref[i] * cont[o * 4 + i];
-      s += element[f.element[a] * C + o];
-      for (let i = 0; i < 4; i += 1) s += names[i][f.name_encoding[a * 4 + i] * C + o];
-      c[a * C + o] = s;
+      s += r0 * cont[co];
+      s += r1 * cont[co + 1];
+      s += r2 * cont[co + 2];
+      s += r3 * cont[co + 3];
+      s += element[elBase + o];
+      s += n0[n0Base + o];
+      s += n1[n1Base + o];
+      s += n2[n2Base + o];
+      s += n3[n3Base + o];
+      c[aBase + o] = s;
     }
   }
   // windowed_atom_pair_geometry
@@ -102,13 +123,22 @@ export function atomFeatures(p, f) {
   return { c, pr, N, NW };
 }
 
+function dot16(v, m, row) {
+  let s = 0;
+  s += v[0] * m[row]; s += v[1] * m[row + 1]; s += v[2] * m[row + 2]; s += v[3] * m[row + 3];
+  s += v[4] * m[row + 4]; s += v[5] * m[row + 5]; s += v[6] * m[row + 6]; s += v[7] * m[row + 7];
+  s += v[8] * m[row + 8]; s += v[9] * m[row + 9]; s += v[10] * m[row + 10]; s += v[11] * m[row + 11];
+  s += v[12] * m[row + 12]; s += v[13] * m[row + 13]; s += v[14] * m[row + 14]; s += v[15] * m[row + 15];
+  return s;
+}
+
 /** c -> p (queries and keys), then the three-layer p MLP. In place on `pr`. */
 export function atomPairTail(p, c, pr, N) {
   const NW = N / W_Q;
   const C = BIOEMU2.atom;
   const Z = BIOEMU2.atomPair;
-  const relu = (v) => (v > 0 ? v : 0);
-  const reluC = Float32Array.from(c, relu);
+  const reluC = new Float32Array(c.length);
+  for (let k = 0; k < c.length; k += 1) { const v = c[k]; reluC[k] = v > 0 ? v : 0; }
   const cq = linearRows(reluC, N, C, p["c_to_p_trans_q_1/weight"], Z);
   const ck = linearRows(reluC, N, C, p["c_to_p_trans_k_1/weight"], Z);
   const m1 = p["p_mlp_1/weight"];
@@ -132,22 +162,15 @@ export function atomPairTail(p, c, pr, N) {
           r0[o] = val > 0 ? val : 0;
         }
         for (let o = 0; o < Z; o += 1) {
-          const row = o * Z;
-          let s = 0;
-          for (let k = 0; k < Z; k += 1) s += r0[k] * m1[row + k];
+          const s = dot16(r0, m1, o * 16);
           h[o] = s > 0 ? s : 0;
         }
         for (let o = 0; o < Z; o += 1) {
-          const row = o * Z;
-          let s = 0;
-          for (let k = 0; k < Z; k += 1) s += h[k] * m3[row + k];
+          const s = dot16(h, m3, o * 16);
           g[o] = s > 0 ? s : 0;
         }
         for (let o = 0; o < Z; o += 1) {
-          const row = o * Z;
-          let s = 0;
-          for (let k = 0; k < Z; k += 1) s += g[k] * m5[row + k];
-          pr[at + o] += s;
+          pr[at + o] += dot16(g, m5, o * 16);
         }
       }
     }
@@ -177,21 +200,21 @@ export function windowBias(pr, N, normZ, projZ, heads, prNorm = null) {
   const Z = BIOEMU2.atomPair;
   const out = new Float32Array(NW * heads * W_Q * W_K);
   if (prNorm !== null) {
-    const w = new Float64Array(heads * Z);
-    for (let h = 0; h < heads; h += 1) {
-      for (let k = 0; k < Z; k += 1) w[h * Z + k] = normZ[k];
-    }
     const x = new Float64Array(Z);
     for (let win = 0; win < NW; win += 1) {
       for (let i = 0; i < W_Q; i += 1) {
         for (let j = 0; j < W_K; j += 1) {
           const at = ((win * W_Q + i) * W_K + j) * Z;
-          for (let k = 0; k < Z; k += 1) x[k] = prNorm[at + k] * normZ[k];
+          x[0] = prNorm[at] * normZ[0]; x[1] = prNorm[at + 1] * normZ[1];
+          x[2] = prNorm[at + 2] * normZ[2]; x[3] = prNorm[at + 3] * normZ[3];
+          x[4] = prNorm[at + 4] * normZ[4]; x[5] = prNorm[at + 5] * normZ[5];
+          x[6] = prNorm[at + 6] * normZ[6]; x[7] = prNorm[at + 7] * normZ[7];
+          x[8] = prNorm[at + 8] * normZ[8]; x[9] = prNorm[at + 9] * normZ[9];
+          x[10] = prNorm[at + 10] * normZ[10]; x[11] = prNorm[at + 11] * normZ[11];
+          x[12] = prNorm[at + 12] * normZ[12]; x[13] = prNorm[at + 13] * normZ[13];
+          x[14] = prNorm[at + 14] * normZ[14]; x[15] = prNorm[at + 15] * normZ[15];
           for (let h = 0; h < heads; h += 1) {
-            const hRow = h * Z;
-            let s = 0;
-            for (let k = 0; k < Z; k += 1) s += x[k] * projZ[hRow + k];
-            out[((win * heads + h) * W_Q + i) * W_K + j] = s;
+            out[((win * heads + h) * W_Q + i) * W_K + j] = dot16(x, projZ, h * 16);
           }
         }
       }

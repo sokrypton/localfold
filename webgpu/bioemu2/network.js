@@ -695,10 +695,10 @@ export class Bioemu2Gpu {
         ? { stagedPrecision: "f32", accumulatePrecision: "f32" }
         : { accumulatePrecision: "f32" }),
     });
-    const msaBlocks = [];
-    for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) msaBlocks.push(await trunkBlockWeights(this.read, l, "msa"));
-    const mixerBlocks = [];
-    for (let l = 0; l < BIOEMU2.pairmixerBlocks; l += 1) mixerBlocks.push(await trunkBlockWeights(this.read, l, "pairmixer"));
+    const [msaBlocks, mixerBlocks] = await Promise.all([
+      Promise.all(Array.from({ length: BIOEMU2.msaBlocks }, (_, l) => trunkBlockWeights(this.read, l, "msa"))),
+      Promise.all(Array.from({ length: BIOEMU2.pairmixerBlocks }, (_, l) => trunkBlockWeights(this.read, l, "pairmixer"))),
+    ]);
     const copyBack = [await o.map("copy", T * T * 256, [{ buffer: zPrev, write: true }, { buffer: z }], "b0[i] = b1[i];"),
                       await o.map("copy", T * BIOEMU2.single, [{ buffer: sPrev, write: true }, { buffer: s }], "b0[i] = b1[i];")];
     return {
@@ -813,11 +813,15 @@ export class Bioemu2Gpu {
     addTokenPairToWindows(pr, zpHost, T, f);
     atomPairTail(host, c, pr, N);
     const prNorm = normalizeWindowPair(pr);
+    const atomBiasWeights = await Promise.all(Array.from({ length: BIOEMU2.denoiserLayers }, async (_, l) => {
+      const att = `${P}/layers/${l}/atom_block/transformer_layer/attention/attention_layer/pair_bias_attn`;
+      const [normZ, projZ] = await Promise.all([this.h(`${att}/norm_z/weight`), this.h(`${att}/proj_z/weight`)]);
+      return { normZ, projZ };
+    }));
     const atomBias = [];
     for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
-      const att = `${P}/layers/${l}/atom_block/transformer_layer/attention/attention_layer/pair_bias_attn`;
       atomBias.push(o.buffer(`ctx.abias${l}`, NW * BIOEMU2.atomHeads * W_Q * W_K,
-        windowBias(pr, N, await this.h(`${att}/norm_z/weight`), await this.h(`${att}/proj_z/weight`), BIOEMU2.atomHeads, prNorm)));
+        windowBias(pr, N, atomBiasWeights[l].normZ, atomBiasWeights[l].projZ, BIOEMU2.atomHeads, prNorm)));
     }
 
     // the single conditioning's coordinate-free half: single_embed(LN(concat(s_trunk, s_inputs))) + the lag term
