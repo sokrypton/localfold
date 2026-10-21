@@ -131,6 +131,139 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 
 /**
+ * The same GEMM retiled for an Apple part (webgpu/kernels/vector-gemm-block.js's lesson): a 64 x 128 block, 256 lanes of
+ * 4 x 8, the panels read as vec4s - three workgroup reads for 32 multiply-adds where gemmSource's 4 x 4 lane makes eight
+ * for 16. The same interface (strides, batches, split-K, epilogue); 10-15% a GEMM on an M5, a denoiser call 287 -> 266 ms.
+ *
+ * 🔴 FLOAT32 ON PURPOSE. f16 staging (the panels in half, multiplied in half, promoted to a float accumulator) was built
+ * and measured on the normalised-input GEMMs: promoted every 32 products, 266 -> 237 ms at five times the shipped arm's
+ * error against a float32 reference (sigma 16: 2.8e-3 -> 1.4e-2) - a running sum in half rounds against itself; every 8
+ * or 4, the error back to metal/bioemu2's fast arm's and the speed with it (267, 278 ms). This arm keeps float32
+ * activations and only the weights in half, which is why it is the more accurate of the two ports.
+ */
+function gemm2Source(wordB) {
+  const BK = 16;
+  const E = "f32";
+  return `
+struct P { m: u32, n: u32, k: u32, b1: u32,
+  offA: u32, sA0: u32, sA1: u32, sAm: u32, sAk: u32,
+  offB: u32, sB0: u32, sB1: u32, sBn: u32, sBk: u32,
+  offC: u32, sC0: u32, sC1: u32, sCm: u32, sCn: u32,
+  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<${wordB ? "u32" : "f32"}>;
+@group(0) @binding(3) var<storage, read_write> c: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+var<workgroup> ta: array<vec4<${E}>, ${BK * 16}>;    // [BK][64] k-major, four rows a vec4
+var<workgroup> tb: array<vec4<${E}>, ${BK * 32}>;    // [BK][128]
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let tilesN = (p.n + 127u) / 128u;
+  let tilesM = (p.m + 63u) / 64u;
+  let flat = wid.x + wid.y * 65535u;
+  let batch = flat / (tilesN * tilesM);
+  let inBatch = batch < p.batches;
+  let tile = flat % (tilesN * tilesM);
+  let m0 = (tile / tilesN) * 64u;
+  let n0 = (tile % tilesN) * 128u;
+  let b0 = batch / p.b1;
+  let b1 = batch % p.b1;
+  let baseA = p.offA + b0 * p.sA0 + b1 * p.sA1;
+  let baseB = p.offB + b0 * p.sB0 + b1 * p.sB1;
+  let tm = (li / 16u) * 4u;
+  let tn = (li % 16u) * 8u;
+  var acc: array<vec4<f32>, 8>;            // row i: acc[2 i] columns tn..tn+3, acc[2 i + 1] tn+4..tn+7
+  for (var i = 0u; i < 8u; i += 1u) { acc[i] = vec4<f32>(0.0); }
+  let kStart = select(0u, b1 * p.split, p.split > 0u);
+  let kEnd = select(p.k, min(p.k, kStart + p.split), p.split > 0u);
+  for (var k0 = kStart; k0 < kEnd; k0 += ${BK}u) {
+    // 🔴 EVERY PANEL WRITE IS A WHOLE vec4, one lane's: lanes writing different components of one shared vec4 race -
+    // a component store can be a read-modify-write of the vector, and it was (every stage wrong from s_inputs on, 0.61).
+    // A lane takes four consecutive rows at one k, so consecutive lanes still read consecutive k (coalesced).
+    // A's panel: ${16 * BK} vec4s
+    for (var e = 0u; e < ${16 * BK / 256}u; e += 1u) {
+      let slot = li + e * 256u;
+      let kk = slot % ${BK}u;
+      let r4 = slot / ${BK}u;
+      let k = k0 + kk;
+      var v = vec4<f32>(0.0);
+      if (inBatch && k < kEnd) {
+        for (var t = 0u; t < 4u; t += 1u) {
+          let row = m0 + r4 * 4u + t;
+          if (row < p.m) { v[t] = a[baseA + row * p.sAm + k * p.sAk]; }
+        }
+      }
+      ta[kk * 16u + r4] = vec4<${E}>(v);
+    }
+    // B's panel: ${32 * BK} vec4s${wordB ? ", each lane a packed pair of k for its four rows" : ""}
+    ${wordB ? `for (var e = 0u; e < ${16 * BK / 256}u; e += 1u) {
+      let slot = li + e * 256u;
+      let kk = (slot % ${BK / 2}u) * 2u;
+      let r4 = slot / ${BK / 2}u;
+      let k = k0 + kk;
+      var lo = vec4<f32>(0.0);
+      var hi = vec4<f32>(0.0);
+      if (inBatch && k < kEnd) {
+        for (var t = 0u; t < 4u; t += 1u) {
+          let row = n0 + r4 * 4u + t;
+          if (row < p.n) {
+            let pair = unpack2x16float(b[(baseB + row * p.sBn + k) / 2u]);
+            lo[t] = pair.x;
+            if (k + 1u < kEnd) { hi[t] = pair.y; }
+          }
+        }
+      }
+      tb[kk * 32u + r4] = vec4<${E}>(lo);
+      tb[(kk + 1u) * 32u + r4] = vec4<${E}>(hi);
+    }` : `for (var e = 0u; e < ${32 * BK / 256}u; e += 1u) {
+      let slot = li + e * 256u;
+      let kk = slot % ${BK}u;
+      let r4 = slot / ${BK}u;
+      let k = k0 + kk;
+      var v = vec4<f32>(0.0);
+      if (inBatch && k < kEnd) {
+        for (var t = 0u; t < 4u; t += 1u) {
+          let row = n0 + r4 * 4u + t;
+          if (row < p.n) { v[t] = b[baseB + row * p.sBn + k * p.sBk]; }
+        }
+      }
+      tb[kk * 32u + r4] = vec4<${E}>(v);
+    }`}
+    workgroupBarrier();
+    for (var kk = 0u; kk < ${BK}u; kk += 1u) {
+      let av = ta[kk * 16u + tm / 4u];
+      let bv0 = tb[kk * 32u + tn / 4u];
+      let bv1 = tb[kk * 32u + tn / 4u + 1u];
+      for (var i = 0u; i < 4u; i += 1u) {
+        acc[2u * i] += av[i] * bv0;
+        acc[2u * i + 1u] += av[i] * bv1;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (!inBatch) { return; }
+  let baseC = p.offC + b0 * p.sC0 + b1 * p.sC1;
+  for (var i = 0u; i < 4u; i += 1u) {
+    let m = m0 + tm + i;
+    if (m >= p.m) { continue; }
+    for (var j = 0u; j < 8u; j += 1u) {
+      let n = n0 + tn + j;
+      if (n >= p.n) { continue; }
+      var v = acc[2u * i + j / 4u][j % 4u] * p.alpha;
+      if (p.split > 0u) { c[baseC + m * p.sCm + n * p.sCn] = v; continue; }
+      if (p.bias != 0u) { v += bias[n]; }
+      if (p.act == 1u) { v = max(v, 0.0); }
+      if (p.act == 2u) { v = 1.0 / (1.0 + exp(-v)); }
+      let at = baseC + m * p.sCm + n * p.sCn;
+      if (p.accumulate != 0u) { v += c[at]; }
+      c[at] = v;
+    }
+  }
+}`;
+}
+
+/**
  * y = LN(x) [* w] [+ b], then optionally modulated, (1 + alpha) y + beta, alpha/beta read from a COND buffer row
  * (rowMap[r], or r; a negative map entry means alpha = beta = 0) at column offsets. Biased variance, two passes,
  * as torch. One 64-lane workgroup a row.
@@ -273,6 +406,8 @@ ${body}
 export class Bioemu2Ops {
   constructor(device) {
     this.device = device;
+    // gemm2Source by default; 1 is gemmSource, the control
+    this.gemmVersion = 2;
     this.pipelines = pipelineCacheForDevice(device);
     this.compiled = new Map();
     this.dummy = device.createBuffer({ size: 16, usage: STORAGE });
@@ -375,10 +510,14 @@ export class Bioemu2Ops {
     // 🔴 A FEW ROWS AND A DEEP K LEAVE THE DEVICE IDLE: the token stream's 71-row projections launched 24
     // workgroups over K = 3072 and ran at 0.4 TFLOP/s. Such a GEMM is SPLIT over K into partial planes and
     // summed by a second kernel, which takes the epilogue (bias, activation, accumulation).
-    const tiles = Math.ceil(m / 64) * Math.ceil(n / 64) * B0 * B1;
-    if (spec.noSplit !== true && B0 * B1 === 1 && tiles < 256 && k >= 512) {
-      const splits = Math.min(Math.floor(k / 128), Math.ceil(1024 / tiles));
-      const chunk = Math.ceil(k / splits / 16) * 16;
+    const v2 = this.gemmVersion === 2;
+    const tiles = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
+    // (the line is in WORK, not tiles: gemm2's 64 x 128 tile is twice gemmSource's, and counting it as one split twice as
+    // many GEMMs - the reduce went 16 -> 32 ms of a denoiser call, eating the faster kernel's gain)
+    const work = v2 ? 2 : 1;
+    if (spec.noSplit !== true && B0 * B1 === 1 && tiles * work < 256 && k >= 512) {
+      const splits = Math.min(Math.floor(k / 128), Math.ceil(1024 / (tiles * work)));
+      const chunk = Math.ceil(k / splits / 32) * 32;      // (a multiple of either kernel's K step)
       const parts = Math.ceil(k / chunk);
       // ...into ONE scratch per size class, shared by every split GEMM recorded: the dispatches run in order, so
       // no two of them hold their partials at once, and one each was 1.6 GiB of a five-sample 68-residue fold
@@ -410,8 +549,9 @@ export class Bioemu2Ops {
     f[22] = spec.alpha ?? 1;
     u[23] = B0 * B1;
     u[24] = spec.splitChunk ?? 0;
-    const groups = Math.ceil(m / 64) * Math.ceil(n / 64) * B0 * B1;
-    const step = await this.step(word ? "gemm-h" : "gemm", gemmSource(word), groups,
+    const groups = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
+    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}`;
+    const step = await this.step(kind, v2 ? gemm2Source(word) : gemmSource(word), groups,
                                  [spec.a, spec.b, spec.c, spec.bias ?? this.dummy], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
     return step;

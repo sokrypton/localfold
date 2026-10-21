@@ -54,6 +54,7 @@ export async function main(device, args) {
   await read.prefetch();
   // --split=off: the coupling's atom-side mixer unsplit (webgpu/bioemu2's couplingSplit, the control)
   const net = new Bioemu2Gpu(device, read, { half, trunkPrecision, couplingSplit: option(args, "split", "on") !== "off" });
+  net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: webgpu/bioemu2's original GEMM, the control)
   const g = net.upload(features);
   const realAtoms = features.atom_mask.reduce((s, v) => s + v, 0);
 
