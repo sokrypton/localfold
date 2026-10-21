@@ -359,6 +359,18 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
     }`);
   }
 
+  const colValidPre = [];
+  for (let v = 0; v < columnVectors; v += 1) {
+    const c0 = `${v * 4 * lanesX}u`;
+    const c1 = `${(v * 4 + 1) * lanesX}u`;
+    const c2 = `${(v * 4 + 2) * lanesX}u`;
+    const c3 = `${(v * 4 + 3) * lanesX}u`;
+    colValidPre.push(`  let col_full_${v} = column_origin + ${c3} < p.c_outer;
+  let col_v0_${v} = column_origin + ${c0} < p.c_outer;
+  let col_v1_${v} = column_origin + ${c1} < p.c_outer;
+  let col_v2_${v} = column_origin + ${c2} < p.c_outer;`);
+  }
+
   const stageWeight = [];
   for (const side of ["left", "right"]) {
     for (let v = 0; v < columnVectors; v += 1) {
@@ -370,12 +382,12 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
       var staged = vec4<f32>(0.0);
       if (weight_c < p.c_m) {
         let w_base = p.${side}_weight + weight_c * p.c_outer + column_origin;
-        if (column_origin + ${c3} < p.c_outer) {
+        if (col_full_${v}) {
           staged = vec4<f32>(weights[w_base + ${c0}], weights[w_base + ${c1}], weights[w_base + ${c2}], weights[w_base + ${c3}]);
         } else {
-          if (column_origin + ${c0} < p.c_outer) { staged.x = weights[w_base + ${c0}]; }
-          if (column_origin + ${c1} < p.c_outer) { staged.y = weights[w_base + ${c1}]; }
-          if (column_origin + ${c2} < p.c_outer) { staged.z = weights[w_base + ${c2}]; }
+          if (col_v0_${v}) { staged.x = weights[w_base + ${c0}]; }
+          if (col_v1_${v}) { staged.y = weights[w_base + ${c1}]; }
+          if (col_v2_${v}) { staged.z = weights[w_base + ${c2}]; }
         }
       }
       tile_${side}[local_y * ${lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u] = staged;
@@ -439,6 +451,7 @@ fn main(
   let local_y = local.y;
   let linear_lane = local_y * ${lanesX}u + local_x;
   let column_origin = group.z * ${tileColumns}u + local_x;
+${colValidPre.join("\n")}
 ${bias.join("\n")}
 ${declare.join("\n")}
 
@@ -933,13 +946,20 @@ ${Array.from({ length: chunk.width }, (_, lane) => {
     }
     reduce${index}[local] = count;
     workgroupBarrier();
-    for (var stride = 32u; stride > 0u; stride >>= 1u) {
-      if (local < stride) { reduce${index}[local] += reduce${index}[local + stride]; }
-      workgroupBarrier();
-    }
+    if (local < 32u) { reduce${index}[local] += reduce${index}[local + 32u]; }
+    workgroupBarrier();
+    if (local < 16u) { reduce${index}[local] += reduce${index}[local + 16u]; }
+    workgroupBarrier();
+    if (local < 8u) { reduce${index}[local] += reduce${index}[local + 8u]; }
+    workgroupBarrier();
+    if (local < 4u) { reduce${index}[local] += reduce${index}[local + 4u]; }
+    workgroupBarrier();
+    if (local < 2u) { reduce${index}[local] += reduce${index}[local + 2u]; }
+    workgroupBarrier();
     if (local == 0u) {
+      let total${index} = reduce${index}[0] + reduce${index}[1];
 ${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first + lane}u] = `
-      + `1.0 / (p.normalization_epsilon + ${at(`reduce${index}[0]`, chunk, lane)});`).join("\n")}
+      + `1.0 / (p.normalization_epsilon + ${at(`total${index}`, chunk, lane)});`).join("\n")}
     }
   }`)}
   workgroupBarrier();
@@ -1253,9 +1273,11 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
     return `  let a_mg_${s} = ${eExpr} / ${BK}u;
   let a_k_${s} = ${eExpr} % ${BK}u;
   let a_r0_${s} = row_origin + a_mg_${s} * 4u;
+  let a_full_${s} = a_r0_${s} + 3u < parameters.rows;
+  let a_base_${s} = a_r0_${s} * parameters.inner + a_k_${s};
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};${f16 ? `
   var a_scale_${s} = vec4<f32>(0.0);
-  if (a_r0_${s} + 3u < parameters.rows) {
+  if (a_full_${s}) {
     let sp = parameters.padding.x + a_r0_${s};
     a_scale_${s} = vec4<f32>(scale[sp], scale[sp + 1u], scale[sp + 2u], scale[sp + 3u]);
   } else {
@@ -1268,14 +1290,12 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
   const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
-  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u;`;
+  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * parameters.columns;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
-      let r0 = a_r0_${s};
-      let k = a_k_${s};
+      let s0 = a_base_${s} + k0;
       var value = vec4<${T}>(0.0);
-      if (r0 + 3u < parameters.rows) {
-        let s0 = r0 * parameters.inner + k0 + k;
+      if (a_full_${s}) {
         let raw = vec4<f32>(
           source[s0],
           source[s0 + parameters.inner],
@@ -1284,17 +1304,18 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
         );
         value = vec4<${T}>(${f16 ? `raw * a_scale_${s}` : "raw"});
       } else {
+        let r0 = a_r0_${s};
         if (r0 < parameters.rows) {
-          value.x = ${T}(source[r0 * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.x` : ""});
+          value.x = ${T}(source[s0]${f16 ? ` * a_scale_${s}.x` : ""});
         }
         if (r0 + 1u < parameters.rows) {
-          value.y = ${T}(source[(r0 + 1u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.y` : ""});
+          value.y = ${T}(source[s0 + parameters.inner]${f16 ? ` * a_scale_${s}.y` : ""});
         }
         if (r0 + 2u < parameters.rows) {
-          value.z = ${T}(source[(r0 + 2u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.z` : ""});
+          value.z = ${T}(source[s0 + parameters.inner * 2u]${f16 ? ` * a_scale_${s}.z` : ""});
         }
         if (r0 + 3u < parameters.rows) {
-          value.w = ${T}(source[(r0 + 3u) * parameters.inner + k0 + k]${f16 ? ` * a_scale_${s}.w` : ""});
+          value.w = ${T}(source[s0 + parameters.inner * 3u]${f16 ? ` * a_scale_${s}.w` : ""});
         }
       }
       a_tile[a_idx_${s}] = value;
@@ -1302,7 +1323,7 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `    {
-      let base = b_col_${s} + (k0 + b_k_${s}) * parameters.columns;
+      let base = b_col_${s} + k0 * parameters.columns;
       b_tile[${eExpr}] = vec4<${T}>(vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u], weights[base + 3u]));
     }`;
   }).join("\n");
@@ -1426,20 +1447,21 @@ ${Array.from({ length: TV }, (_, j) => `      {
   let a_mg_${s} = ${eExpr} % ${BM / 4}u;
   let a_r_${s} = row_origin + a_mg_${s} * 4u;
   let a_valid_${s} = a_r_${s} < parameters.rows;
-  let a_col_${s} = parameters.weight_offset + a_r_${s};
+  let a_col_${s} = parameters.weight_offset + a_r_${s} + a_k_${s} * stride;
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
   }).join("\n");
   const bPre = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
   let b_c_${s} = column_origin + (${eExpr} % ${BN / 4}u) * 4u;
-  let b_valid_${s} = b_c_${s} < parameters.columns;`;
+  let b_valid_${s} = b_c_${s} < parameters.columns;
+  let b_col_${s} = b_c_${s} + b_k_${s} * stride;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let k = k0 + a_k_${s};
       var value = vec4<f32>(0.0);
       if (k < parameters.inner && a_valid_${s}) {
-        let base = k * stride + a_col_${s};
+        let base = k0 * stride + a_col_${s};
         value = ${load4("left")};
       }
       a_tile[a_idx_${s}] = vec4<${T}>(value);
@@ -1450,7 +1472,7 @@ ${Array.from({ length: TV }, (_, j) => `      {
       let k = k0 + b_k_${s};
       var value = vec4<f32>(0.0);
       if (k < parameters.inner && b_valid_${s}) {
-        let base = k * stride + b_c_${s};
+        let base = k0 * stride + b_col_${s};
         value = ${load4("right")};
       }
       b_tile[${eExpr}] = vec4<${T}>(value);

@@ -81,6 +81,7 @@ export class Esmfold2TrunkGpu {
     this.devicePairTrack = options.devicePairTrack ?? true;
     this.pipelines = pipelineCacheForDevice(device);
     this.allocator = options.allocator ?? new GpuBufferAllocator(device);
+    this.compiledTracks = new Map();
   }
 
   /**
@@ -249,27 +250,45 @@ export class Esmfold2TrunkGpu {
         : false;
     // (this device's raced answers - the contraction's arithmetic among them - before anything compiles)
     await settleGridAttendTiling(this.device);
-    const pipelines = await compilePairTrack(this.pipelines, {
-      n, sample: blocks[0], epsilon, variance, base, channels,
-      triangleProjectTile: shapedKnob(tuning.trianglePairProjectTile),
-      triangleProjectOutColumns: tuning.triangleProjectOutColumns,
-      // The grid attention is what needs a dialect; without it there is no
-      // transposed bias to have a convention about.
-      dialect: { swapTransposedBias: false },
-      gridAttention,
-      transitionFactor,
-      pairTransitionSplit,
-      pairTransitionChunkBytes: tuning.pairTransitionChunkBytes,
-      // ...and the triangle's contraction in f16 arithmetic where this trunk stages and accumulates in f16, as AF3's
-      // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
-      triangleContractArithmetic: stagedPrecision === "f16" && accumulatePrecision === "f16"
-        && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
-      triangleProjectMatrix,
-      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
-      maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
-      minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
-      stagedPrecision, weightPrecision, accumulatePrecision,
-    });
+    const triangleContractArithmetic = stagedPrecision === "f16" && accumulatePrecision === "f16"
+      && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32";
+    const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`
+      + `${triangleContractArithmetic}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
+      + `${JSON.stringify(tuning.trianglePairProjectTile)}:${tuning.triangleProjectOutColumns ?? ""}:${tuning.pairTransitionChunkBytes ?? ""}`;
+    if (!this.compiledTracks.has(trackKey)) {
+      this.compiledTracks.set(trackKey, (async () => {
+        const pipelines = await compilePairTrack(this.pipelines, {
+          n, sample: blocks[0], epsilon, variance, base, channels,
+          triangleProjectTile: shapedKnob(tuning.trianglePairProjectTile),
+          triangleProjectOutColumns: tuning.triangleProjectOutColumns,
+          // The grid attention is what needs a dialect; without it there is no
+          // transposed bias to have a convention about.
+          dialect: { swapTransposedBias: false },
+          gridAttention,
+          transitionFactor,
+          pairTransitionSplit,
+          pairTransitionChunkBytes: tuning.pairTransitionChunkBytes,
+          // ...and the triangle's contraction in f16 arithmetic where this trunk stages and accumulates in f16, as AF3's
+          // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
+          triangleContractArithmetic,
+          triangleProjectMatrix,
+          maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
+          maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
+          minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
+          stagedPrecision, weightPrecision, accumulatePrecision,
+        });
+        const transitionOffsets = pipelines.transitionSplit === undefined ? undefined
+          : packTransitionWeights(blocks[0].pairTransition).offsets;
+        const projectMatrixOffsets = pipelines.projectMatrix === undefined ? undefined
+          : packTriangleWeights(
+            af3TriangleWeights(blocks[0].triangleMultiplicationOutgoing, channels),
+            weightPrecision,
+            { abLayout: "interleaved", zgLayout: "transposed",
+              cHidden: channels, cZ: channels }).offsets;
+        return { pipelines, transitionOffsets, projectMatrixOffsets };
+      })());
+    }
+    const { pipelines, transitionOffsets, projectMatrixOffsets } = await this.compiledTracks.get(trackKey);
 
     try {
       // 🔴 A CALLER MAY OWN THE PAIR BUFFER, AND A FOLD DOES. Four loops that
@@ -299,17 +318,13 @@ export class Esmfold2TrunkGpu {
           rows: pairs, channels, factor: transitionFactor,
           chunkRows: pipelines.transitionSplit.chunkRows,
           precision: pipelines.transitionSplit.storage,
-          offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
+          offsets: transitionOffsets,
           label: "esmfold2-trunk.transition",
         }, keep);
       const projectMatrix = pipelines.projectMatrix === undefined ? undefined
         : allocateTriangleProjectMatrix(this.allocator, {
           rows: pairs, cZ: channels, cHidden: channels,
-          offsets: packTriangleWeights(
-            af3TriangleWeights(blocks[0].triangleMultiplicationOutgoing, channels),
-            weightPrecision,
-            { abLayout: "interleaved", zgLayout: "transposed",
-              cHidden: channels, cZ: channels }).offsets,
+          offsets: projectMatrixOffsets,
           label: "esmfold2-trunk.tri-project",
         }, keep);
       const gridHeads = gridAttention ? blocks[0].pairAttention1.heads : 0;

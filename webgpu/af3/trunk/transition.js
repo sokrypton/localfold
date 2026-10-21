@@ -716,7 +716,8 @@ function splitNormalizeRows(device, channels) {
 }
 function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
                                   residual = false, sourceGate = null,
-                                  block = VECTOR_GEMM_BLOCK, arithmetic = "f32" }) {
+                                  block = VECTOR_GEMM_BLOCK, arithmetic = "f32",
+                                  innerCols = null, outCols = null, weightOffset = null }) {
   const { rows: BM, columns: BN, inner: BK } = block;
   // 🔴 NO GUARD ON k OR ON THE COLUMNS, ONLY ON THE ROWS. The inner extent must
   // divide by BK and the columns by BN; `createTransitionSplitShaders` refuses a
@@ -735,9 +736,9 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const f16 = arithmetic === "f16";
   const T = f16 ? "f16" : "f32";
   const half = f16 || [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
-  const loadElem = (r) => sourceGate === null
-    ? (sourcePrecision === T ? `source[(${r}) * parameters.inner + k]` : `${T}(source[(${r}) * parameters.inner + k])`)
-    : `${T}(gated((${r}) * ${sourceGate.stride}u + k))`;
+  const innerExpr = innerCols !== null ? `${innerCols}u` : "parameters.inner";
+  const colsExpr = outCols !== null ? `${outCols}u` : "parameters.columns";
+  const wOffExpr = weightOffset !== null ? `${weightOffset}u` : "parameters.weight_offset";
   const accumulators = [];
   const inner = [];
   const stores = [];
@@ -758,7 +759,7 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
     stores.push(`  {
     let row_${i} = row_origin + ty * ${TM}u + ${i}u;
     if (row_${i} < parameters.rows) {
-      let row_base_${i} = row_${i} * parameters.columns + column_origin + tx * ${TN}u;
+      let row_base_${i} = row_${i} * ${colsExpr} + column_origin + tx * ${TN}u;
 ${rowStores.join("\n")}
     }
   }`);
@@ -786,7 +787,7 @@ ${rowStores.join("\n")}
   const weight = (offset) => weightPrecision === T ? `weights[base${offset}]` : `${T}(weights[base${offset}])`;
   const aSteps = ((BM / 4) * BK) / 256;
   const bSteps = ((BN / 4) * BK) / 256;
-  const aStrideExpr = sourceGate === null ? "parameters.inner" : `${sourceGate.stride}u`;
+  const aStrideExpr = sourceGate === null ? innerExpr : `${sourceGate.stride}u`;
   const loadAt = (idxExpr) => sourceGate === null
     ? (sourcePrecision === T ? `source[${idxExpr}]` : `${T}(source[${idxExpr}])`)
     : `${T}(gated(${idxExpr}))`;
@@ -802,7 +803,7 @@ ${rowStores.join("\n")}
   const bPre = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
-  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * parameters.columns;`;
+  let b_col_${s} = ${wOffExpr} + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * ${colsExpr};`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let base0 = a_base_${s} + k0;
@@ -820,7 +821,7 @@ ${rowStores.join("\n")}
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `    {
-      let base = b_col_${s} + k0 * parameters.columns;
+      let base = b_col_${s} + k0 * ${colsExpr};
       b_tile[${eExpr}] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
     }`;
   }).join("\n");
@@ -851,7 +852,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 ${accumulators.join("\n")}
 ${aPre}
 ${bPre}
-  for (var k0 = 0u; k0 < parameters.inner; k0 += BK) {
+  for (var k0 = 0u; k0 < ${innerExpr}; k0 += BK) {
 ${aStage}
 ${bStage}
     workgroupBarrier();
@@ -936,9 +937,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // The tail is zeroed rather than skipped: the reduction runs over the whole
   // staged block.
-  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
-    let row = base_row + index / CHANNELS;
-    tile[index] = select(0.0, input[row * CHANNELS + index % CHANNELS], row < p.rows);
+  let full_tile = base_row + NORMALIZE_ROWS <= p.rows;
+  let base_idx = base_row * CHANNELS;
+  if (full_tile) {
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
+      tile[index] = input[base_idx + index];
+    }
+  } else {
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
+      let row = base_row + index / CHANNELS;
+      tile[index] = select(0.0, input[base_idx + index], row < p.rows);
+    }
   }
   workgroupBarrier();
 
@@ -985,7 +994,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += ${LANES}u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
-    if (row >= p.rows) { continue; }
+    if (!full_tile && row >= p.rows) { continue; }
     let c = (word % PAIR_COUNT) * 2u;
     let index = slot_of * CHANNELS + c;
     let centre = row_mean[slot_of];
@@ -994,8 +1003,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       * ${w("weights[W_SCALE + c]")} + ${w("weights[W_OFFSET + c]")};
     let high = (tile[index + 1u] - centre) * inverse
       * ${w("weights[W_SCALE + c + 1u]")} + ${w("weights[W_OFFSET + c + 1u]")};
-    normalized[row * CHANNELS + c] = ${normalizedStorage}(low);
-    normalized[row * CHANNELS + c + 1u] = ${normalizedStorage}(high);
+    normalized[base_idx + index] = ${normalizedStorage}(low);
+    normalized[base_idx + index + 1u] = ${normalizedStorage}(high);
   }
 }`;
 
@@ -1009,11 +1018,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     return {
       normalize,
       wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
-                                     outputPrecision: wideStorage, block, arithmetic }),
+                                     outputPrecision: wideStorage, block, arithmetic,
+                                     innerCols: channels, outCols: wide, weightOffset: offsets.transition1 }),
       down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
                                      outputPrecision: "f32", residual: true,
                                      sourceGate: { stride: wide, offset: intermediate },
-                                     block, arithmetic }),
+                                     block, arithmetic,
+                                     innerCols: intermediate, outCols: channels, weightOffset: offsets.transition2 }),
       shape: { rows, channels, intermediate, wide },
       geometry: null,
       storage: normalizedStorage,

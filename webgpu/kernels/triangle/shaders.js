@@ -282,14 +282,27 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // output, where consecutive lanes have to be consecutive ROWS or every lane
   // pulls its own cache line again. Either way the tile lands as
   // [slot][channel] and everything below is the same.
-  for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
-    ${sourceMajor === "channel"
-      ? `let slot_of = index % NORMALIZE_ROWS;
-    let channel = index / NORMALIZE_ROWS;`
-      : `let slot_of = index / ${count};
-    let channel = index % ${count};`}
-    let row = base_row + slot_of;
-    tile[slot_of * ${count} + channel] = select(0.0, ${load("row", "channel")}, row < PAIRS);
+  let full_tile = base_row + NORMALIZE_ROWS <= PAIRS;
+  if (full_tile) {
+    for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
+      ${sourceMajor === "channel"
+        ? `let slot_of = index % NORMALIZE_ROWS;
+      let channel = index / NORMALIZE_ROWS;`
+        : `let slot_of = index / ${count};
+      let channel = index % ${count};`}
+      let row = base_row + slot_of;
+      tile[slot_of * ${count} + channel] = ${load("row", "channel")};
+    }
+  } else {
+    for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
+      ${sourceMajor === "channel"
+        ? `let slot_of = index % NORMALIZE_ROWS;
+      let channel = index / NORMALIZE_ROWS;`
+        : `let slot_of = index / ${count};
+      let channel = index % ${count};`}
+      let row = base_row + slot_of;
+      tile[slot_of * ${count} + channel] = select(0.0, ${load("row", "channel")}, row < PAIRS);
+    }
   }
   workgroupBarrier();
 
@@ -330,7 +343,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
-    if (row >= PAIRS) { continue; }
+    if (!full_tile && row >= PAIRS) { continue; }
     let channel = (word % PAIR_COUNT) * 2u;
     let index = slot_of * ${count} + channel;
     let scaled = row_inverse_std[slot_of];
@@ -629,15 +642,14 @@ ${abRowStores}
       let right = tile_b[${k * 8}u + local.x];
       ${overContractRows((r) => `sum_${r} += ${contractRowAt("left", r)} * right;`)}
     }`).join("\n");
-  const contractStores = Array.from({ length: contractRows }, (_, r) => `  {
-    let i = i0 + ${r * 8}u;
-    if (i < L) {
-      let row = sum_${r};
-      ${overContractColumns((c) => `{
-        let j = j0 + ${c}u * 8u;
-        if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
-      }`)}
-    }
+  const contractRowPre = Array.from({ length: contractRows }, (_, r) =>
+    `  let i_${r} = i0 + ${r * 8}u;\n  let valid_i_${r} = i_${r} < L;`).join("\n");
+  const contractColPre = Array.from({ length: contractColumns }, (_, c) =>
+    `  let j_${c} = j0 + ${c * 8}u;\n  let valid_j_${c} = j_${c} < L;`).join("\n");
+  const contractStores = Array.from({ length: contractRows }, (_, r) => `  if (valid_i_${r}) {
+    let row = sum_${r};
+    let row_base_${r} = ${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i_${r} * L;
+    ${overContractColumns((c) => `if (valid_j_${c}) { output[row_base_${r} + j_${c}] = ${contractColumnAt("row", c)}; }`)}
   }`).join("\n");
   const contract = `${common}
 const CONTRACT_ROWS: u32 = ${CONTRACT_TILE.rows}u;
@@ -661,26 +673,28 @@ fn main(
   let j0 = group.x * CONTRACT_COLUMNS + local.x;
   let h = group.z;
   let tile_index = local.y * 8u + local.x;
+${contractRowPre}
+${contractColPre}
   // One accumulator a row, holding that row's columns.
 ${Array.from({ length: contractRows }, (_, r) => `  var sum_${r} = ${contractColumnVector}(0.0);`).join("\n")}
 
   for (var k0 = 0u; k0 < L; k0 += 8u) {
     let a_k = k0 + local.x;
     let b_k = k0 + local.y;
-    var staged_a: ${contractRowVector};
-    ${overContractRows((r) => `{
-        let i = i0 + ${r}u * 8u;
-        var value = 0.0;
-        if (i < L && a_k < L) { value = ${loadATile}; }
-        ${contractRowAt("staged_a", r)} = value;
+    var staged_a = ${contractRowVector}(0.0);
+    if (a_k < L) {
+      ${overContractRows((r) => `{
+        let i = i_${r};
+        if (valid_i_${r}) { ${contractRowAt("staged_a", r)} = ${loadATile}; }
       }`)}
-    var staged_b: ${contractColumnVector};
-    ${overContractColumns((c) => `{
-        let j = j0 + ${c}u * 8u;
-        var value = 0.0;
-        if (j < L && b_k < L) { value = ${loadBTile}; }
-        ${contractColumnAt("staged_b", c)} = value;
+    }
+    var staged_b = ${contractColumnVector}(0.0);
+    if (b_k < L) {
+      ${overContractColumns((c) => `{
+        let j = j_${c};
+        if (valid_j_${c}) { ${contractColumnAt("staged_b", c)} = ${loadBTile}; }
       }`)}
+    }
     tile_a[tile_index] = staged_a;
     tile_b[tile_index] = staged_b;
     workgroupBarrier();
@@ -712,25 +726,21 @@ ${contractStores}
     const loadOf = (operand) => (row) => (operand === "a"
       ? (direction === "outgoing" ? channelMajor("a", `${row} * L + k`) : channelMajor("b", `k * L + ${row}`))
       : (direction === "outgoing" ? channelMajor("b", `${row} * L + k`) : channelMajor("a", `k * L + ${row}`)));
-    const stage = (tile, load, row0) => `{
+    const stage = (tile, load, pfx) => `{
       let k = k0 + ${kLane};
       var staged = vec4<f16>(0.0);
       if (k < L) {
-        let r0 = ${row0} + ${lane};
-        let r1 = r0 + 16u;
-        let r2 = r0 + 32u;
-        let r3 = r0 + 48u;
-        if (r3 < L) {
+        if (${pfx}_full) {
           staged = vec4<f16>(
-            f16(${load("r0")} * 0.0625),
-            f16(${load("r1")} * 0.0625),
-            f16(${load("r2")} * 0.0625),
-            f16(${load("r3")} * 0.0625),
+            f16(${load(`${pfx}_r0`)} * 0.0625),
+            f16(${load(`${pfx}_r1`)} * 0.0625),
+            f16(${load(`${pfx}_r2`)} * 0.0625),
+            f16(${load(`${pfx}_r3`)} * 0.0625),
           );
         } else {
-          if (r0 < L) { staged.x = f16(${load("r0")} * 0.0625); }
-          if (r1 < L) { staged.y = f16(${load("r1")} * 0.0625); }
-          if (r2 < L) { staged.z = f16(${load("r2")} * 0.0625); }
+          if (${pfx}_r0 < L) { staged.x = f16(${load(`${pfx}_r0`)} * 0.0625); }
+          if (${pfx}_r1 < L) { staged.y = f16(${load(`${pfx}_r1`)} * 0.0625); }
+          if (${pfx}_r2 < L) { staged.z = f16(${load(`${pfx}_r2`)} * 0.0625); }
         }
       }
       ${tile}[${kLane} * 16u + ${lane}] = staged;
@@ -771,13 +781,23 @@ fn main(
   let i0 = group.y * 64u;
   let j0 = group.x * 64u;
   let h = group.z;
+  let a_r0 = i0 + ${lane};
+  let a_r1 = a_r0 + 16u;
+  let a_r2 = a_r0 + 32u;
+  let a_r3 = a_r0 + 48u;
+  let a_full = a_r3 < L;
+  let b_r0 = j0 + ${lane};
+  let b_r1 = b_r0 + 16u;
+  let b_r2 = b_r0 + 32u;
+  let b_r3 = b_r0 + 48u;
+  let b_full = b_r3 < L;
   var sum_0 = vec4<f32>(0.0);
   var sum_1 = vec4<f32>(0.0);
   var sum_2 = vec4<f32>(0.0);
   var sum_3 = vec4<f32>(0.0);
   for (var k0 = 0u; k0 < L; k0 += 16u) {
-    ${stage("tile_a", loadOf("a"), "i0")}
-    ${stage("tile_b", loadOf("b"), "j0")}
+    ${stage("tile_a", loadOf("a"), "a")}
+    ${stage("tile_b", loadOf("b"), "b")}
     workgroupBarrier();
     var part_0 = vec4<f16>(0.0);
     var part_1 = vec4<f16>(0.0);

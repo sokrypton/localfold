@@ -371,9 +371,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED: PAIRS is rarely a multiple of the tile
   // and the reduction below runs over the whole staged block.
-  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
-    let row = base_row + index / CHANNELS;
-    tile[index] = select(0.0, pair[row * CHANNELS + index % CHANNELS], row < PAIRS);
+  let full_tile = base_row + NORMALIZE_ROWS <= PAIRS;
+  if (full_tile) {
+    let base_idx = base_row * CHANNELS;
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
+      tile[index] = pair[base_idx + index];
+    }
+  } else {
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
+      let row = base_row + index / CHANNELS;
+      tile[index] = select(0.0, pair[row * CHANNELS + index % CHANNELS], row < PAIRS);
+    }
   }
   workgroupBarrier();
 
@@ -416,7 +424,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
-    if (row >= PAIRS) { continue; }
+    if (!full_tile && row >= PAIRS) { continue; }
     let c = (word % PAIR_COUNT) * 2u;
     let index = slot_of * CHANNELS + c;
     let centre = row_mean[slot_of];
@@ -597,18 +605,25 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
   if (first >= ${LIVE}) { return; }
   let local = local_id.x;
 
-${ACT_VEC4 ? `  for (var c = local; c < CHANNELS; c += WG) {
-${overActGroups((g) => {
+${ACT_VEC4 ? `${overActGroups((g) => {
   const r0 = g * 4;
-  return `${[0, 1, 2, 3].map((l) => {
+  return [0, 1, 2, 3].map((l) => {
     const r = r0 + l;
     const rowExpr = `first + ${r}u`;
     const srcExpr = chunked
       ? sourceRow.replace(/row/g, `(chunk.x * N + (${rowExpr}))`)
       : sourceRow.replace(/row/g, `(${rowExpr})`);
-    return `    let row_${r} = ${rowExpr};
-    let src_${r} = select(0u, ${srcExpr}, row_${r} < ${LIVE});
-    let val_${r} = ${AT}(select(0.0, ${storedElement(normalizedStorage, "normalized", `src_${r} * CHANNELS + c`)}, row_${r} < ${LIVE}));`;
+    return `  let row_${r} = ${rowExpr};
+  let valid_${r} = row_${r} < ${LIVE};
+  let base_${r} = select(0u, (${srcExpr}) * CHANNELS, valid_${r});`;
+  }).join("\n");
+})}
+  for (var c = local; c < CHANNELS; c += WG) {
+${overActGroups((g) => {
+  const r0 = g * 4;
+  return `${[0, 1, 2, 3].map((l) => {
+    const r = r0 + l;
+    return `    let val_${r} = ${AT}(select(0.0, ${storedElement(normalizedStorage, "normalized", `base_${r} + c`)}, valid_${r}));`;
   }).join("\n")}
     act[${g * channels}u + c] = vec4<${AT}>(val_${r0}, val_${r0 + 1}, val_${r0 + 2}, val_${r0 + 3});`;
 })}
@@ -935,15 +950,23 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED, for the reason the projection kernel
   // gives: PAIRS is rarely a multiple of the tile, and uninitialised workgroup
   // memory would reach real rows sharing the tile.
-${OUT_VEC4 ? `  for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
+${OUT_VEC4 ? `${overOutGroups((g) => {
+  const r0 = g * 4;
+  return [0, 1, 2, 3].map((l) => {
+    const r = r0 + l;
+    return `  let row_${r} = first + ${r}u;
+  let valid_${r} = row_${r} < ${LIVE};
+  let base_${r} = select(0u, row_${r} * WIDTH, valid_${r});`;
+  }).join("\n");
+})}
+  for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
 ${overOutGroups((g) => {
   const r0 = g * 4;
   return `${[0, 1, 2, 3].map((l) => {
     const r = r0 + l;
-    return `    let row_${r} = first + ${r}u;
-    let idx_${r} = select(0u, row_${r} * WIDTH + w, row_${r} < ${LIVE});
+    return `    let idx_${r} = base_${r} + w;
     let val_${r} = select(0.0, ${storedElement(gatheredStorage, "gathered", `idx_${r}`)}
-      * logistic(${storedElement(store4.gate, "gate", `idx_${r}`)}), row_${r} < ${LIVE});`;
+      * logistic(${storedElement(store4.gate, "gate", `idx_${r}`)}), valid_${r});`;
   }).join("\n")}
     gated[${g * width}u + w] = ${OUT_VEC_T}(vec4<f32>(val_${r0}, val_${r0 + 1}, val_${r0 + 2}, val_${r0 + 3}));`;
 })}
@@ -971,8 +994,8 @@ ${overOutGroups((g) => `        sum${g} += ${outStage16 ? `vec4<f32>(gated[${g *
 ${overOutGroups((g) => `      sum${g} += ${outStage16 ? `vec4<f32>(gated[${g * width}u + w])` : `gated[${g * width}u + w]`} * weight;`)}
     }`}
 ${offsets.outputProjectionBias === undefined ? "" : `${overOutGroups((g) => `    sum${g} += vec4<f32>(weights[W_OUT_BIAS + c]);`)}`}
-${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
-      let row${r} = ${chunked ? "chunk.x * N + " : ""}first + ${r}u;
+${overOutRows((r) => `    if (valid_${r}) {
+      let row${r} = ${chunked ? "chunk.x * N + " : ""}row_${r};
       let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
       output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${Math.floor(r / 4)}.${"xyzw"[r % 4]};
     }`)}` : `${overOutRows((r) => `    var sum${r} = 0.0;`)}

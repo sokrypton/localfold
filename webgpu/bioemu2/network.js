@@ -668,14 +668,13 @@ export class Bioemu2Gpu {
       steps.push(await o.layerNorm({ x: m, y: sm.ln, rows: S * T, width: 128,
         w: await this.w(`${opm}/norm/weight`, { half: false }), b: await this.w(`${opm}/norm/bias`, { half: false }) }));
       const projAb = await this.w(`${opm}/proj_ab/weight`);
-      steps.push(await o.linear({ x: sm.ln, w: projAb, y: ab, rows: S * T, inC: 128, outC: 32 }));
-      steps.push(await o.linear({ x: sm.ln, w: projAb, wOff: 32 * 128, y: ab, yOff: S * T * 32, rows: S * T, inC: 128, outC: 32 }));
+      steps.push(await o.linear({ x: sm.ln, w: projAb, y: ab, rows: S * T, inC: 128, outC: 64 }));
       for (let i0 = 0; i0 < T; i0 += chunk) {
         const rows = Math.min(chunk, T - i0);
         // outer[il, j, c, d] = sum_s a[s, i0 + il, c] b[s, j, d] / n_valid
         steps.push(await o.gemm({ m: 32, n: 32, k: S, a: ab, b: ab, c: outer, batches: [rows, T], alpha: 1 / msa.valid,
-          A: { off: i0 * 32, s0: 32, s1: 0, m: 1, k: T * 32 },
-          B: { off: S * T * 32, s0: 0, s1: 32, n: 1, k: T * 32 },
+          A: { off: i0 * 64, s0: 64, s1: 0, m: 1, k: T * 64 },
+          B: { off: 32, s0: 0, s1: 64, n: 1, k: T * 64 },
           C: { off: 0, s0: T * 1024, s1: 1024, m: 32, n: 1 } }));
         steps.push(await o.linear({ x: outer, w: await this.w(`${opm}/proj_o/weight`), y: z, yOff: i0 * T * 256, rows: rows * T,
           inC: 1024, outC: 256, accumulate: true, bias: await this.w(`${opm}/proj_o/bias`, { half: false }) }));
@@ -781,17 +780,24 @@ export class Bioemu2Gpu {
           A: { m: 256, k: 1 }, B: { n: 256, k: 1 }, C: { m: 1, n: T * T } }));
       tokenBias.push(bias);
     }
+    const pa = `${P}/atom_feature_embedder`;
+    // z_to_p on the device (T^2 x 256 -> 16), submitted before `pre` and overlapped with host atomFeatures
+    const zp = o.buffer("ctx.zp", T * T * 16);
+    o.run([await o.layerNorm({ x: zTrunk, y: zln, rows: T * T, width: 256,
+      w: await this.w(`${pa}/z_to_p_trans_0/weight`, { half: false }), b: await this.w(`${pa}/z_to_p_trans_0/bias`, { half: false }) }),
+    await o.linear({ x: zln, w: await this.w(`${pa}/z_to_p_trans_1/weight`, { half: false }), y: zp, rows: T * T, inC: 256, outC: 16 })]);
+    const zpRead = o.read(zp);
     o.run(pre);
     rel.destroy();
     cat.destroy();
+    zln.destroy();
     for (const b of Object.values(ps)) b.destroy();
     // the atom features and their window pair, on the host
-    const pa = `${P}/atom_feature_embedder`;
     const host = await this.hostGroup(pa, ["proj_atom_continuous/weight", "embed_element/weight",
       ...[0, 1, 2, 3].map((i) => `embed_atom_name_chars_${i}/weight`), "embed_atompair_ref_pos/weight",
       "embed_atompair_ref_dist/weight", "embed_atompair_mask/weight", "c_to_p_trans_q_1/weight", "c_to_p_trans_k_1/weight",
       "p_mlp_1/weight", "p_mlp_3/weight", "p_mlp_5/weight", "s_to_c_trans_0/weight", "s_to_c_trans_0/bias",
-      "s_to_c_trans_1/weight", "z_to_p_trans_0/weight", "z_to_p_trans_0/bias", "z_to_p_trans_1/weight",
+      "s_to_c_trans_1/weight",
       "r_to_q_trans/weight", "cond_to_q_trans/weight", "dt_gate_embed/taus", "dt_gate_log_w"]);
     const { c, pr } = atomFeatures(host, f);
     const q0 = Float32Array.from(c);
@@ -802,14 +808,8 @@ export class Bioemu2Gpu {
       const t = f.token_idx_at_atom[a];
       for (let k = 0; k < DA; k += 1) c[a * DA + k] += sToC[t * DA + k];
     }
-    // z_to_p on the device (T^2 x 256 -> 16), read back for the window gather
-    const zp = o.buffer("ctx.zp", T * T * 16);
-    o.run([await o.layerNorm({ x: zTrunk, y: zln, rows: T * T, width: 256,
-      w: await this.w(`${pa}/z_to_p_trans_0/weight`, { half: false }), b: await this.w(`${pa}/z_to_p_trans_0/bias`, { half: false }) }),
-    await o.linear({ x: zln, w: await this.w(`${pa}/z_to_p_trans_1/weight`, { half: false }), y: zp, rows: T * T, inC: 256, outC: 16 })]);
-    const zpHost = await o.read(zp);
+    const zpHost = await zpRead;
     zp.destroy();
-    zln.destroy();
     addTokenPairToWindows(pr, zpHost, T, f);
     atomPairTail(host, c, pr, N);
     const prNorm = normalizeWindowPair(pr);
