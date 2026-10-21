@@ -40,8 +40,9 @@ struct Be2SwigluWArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I; float
 struct Be2CsTokArgs { CP(float) a; CP(float) cqc; DP(float) tstats; DP(half) xa; u64 rows; uint T, C, ldc, pad0; };
 struct Be2CsAtomArgs { CP(float) q; CP(float) tstats; CP(float) cqc; CP(int) tokIdx; CP(int) pad; CP(int) atomTok; DP(float) stats;
                        DP(half) xq; u64 rows; uint N, T, Ca, Dt, ldc, pad0; };   // (xq [hi | lo])
-// (gamma and beta as two halves each, [2][R][width]: hi, then the remainder - float's precision on the matrix units)
-struct Be2CsGammaArgs { CP(float) cqc; DP(half) gA; DP(half) gQ; DP(half) beta; u64 n; uint Dt, Ca, ldc, R; };
+// (R's row [-gamma_a / 6 | gamma_q] and beta, two halves each, [2][R][Dc]: hi, then the remainder - float's precision
+// on the matrix units)
+struct Be2CsGammaArgs { CP(float) cqc; DP(half) gR; DP(half) beta; u64 n; uint Dt, Ca, ldc, R; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };
 struct Be2CentreAtomsArgs { CP(float) atom; CP(int) centre; DP(float) out; uint T, N, C, ldo, samples, pad0; };

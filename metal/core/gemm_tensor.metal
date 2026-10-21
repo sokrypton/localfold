@@ -283,7 +283,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
     return;
   } else {
     if (g.epilogue & 32768) {    // the coupling split's combine and SwiGLU (core.h's gemmCouplingCombine), a float tile
-      // (u = inv (sa P[st] + sq Z + da Qa[t] + dq Qq[t]) + B[t] for a and for b, columns in gemmSwiglu's blocks of 8)
+      // (u = inv (sa P[st] + sq Z + dq R[t]) + B[t] for a and for b, columns in gemmSwiglu's blocks of 8 - R = Qq - Qa
+      // da / dq, a constant of the row's two widths, folded by the caller)
       device const float* stats = (device const float*)g.aux;
       device const float* Pp = (device const float*)g.aux2;
       device const float* QB = (device const float*)g.aux3;
@@ -293,15 +294,15 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const int j = j0 + jl, i = i0 + il;
         if (j >= g.n || i + 8 >= g.m) continue;
         device const float* sr = stats + (ulong)j * 8;
-        const float inv = sr[0], da = sr[1], dq = sr[2], sq = sr[3], sa = sr[5];
+        const float inv = sr[0], dq = sr[2], sq = sr[3], sa = sr[5];
         const int st = (int)sr[6];
         const uint tq = (uint)sr[7];
         float p1 = 0.f, p2 = 0.f;
         if (st >= 0) { device const float* pr = Pp + (ulong)st * H2; p1 = sa * pr[i]; p2 = sa * pr[i + 8]; }
-        device const float* qb = QB + (ulong)tq * 3 * H2;
+        device const float* qb = QB + (ulong)tq * 2 * H2;
         const float z1 = (float)tile[jl * TN + il], z2 = (float)tile[jl * TN + il + 8];
-        const float u1 = inv * (p1 + sq * z1 + da * qb[i] + dq * qb[H2 + i]) + qb[2 * H2 + i];
-        const float u2 = inv * (p2 + sq * z2 + da * qb[i + 8] + dq * qb[H2 + i + 8]) + qb[2 * H2 + i + 8];
+        const float u1 = inv * (p1 + sq * z1 + dq * qb[i]) + qb[H2 + i];
+        const float u2 = inv * (p2 + sq * z2 + dq * qb[i + 8]) + qb[H2 + i + 8];
         lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, fast::divide(u1, 1.f + fast::exp(-u1)) * u2);
       }
       return;

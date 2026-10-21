@@ -157,8 +157,9 @@ bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, con
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 // BioEmu2's coupling split (metal/bioemu2's couplingSplit): gemmSwiglu's product over the ATOM half of the row only, Xq Wq
 // (Wq: that half's rows of the blocks-of-8 weight), its epilogue (32768, a float tile) the whole row's pre-activations
-// u = inv (sa P[st] + sq Z + da Qa[t] + dq Qq[t]) + B[t] - stats [rows][8] (inv, da, dq, sq, mq, sa, st, t), P [.][2 hidden]
-// a sample-token row's product, QB [.][3][2 hidden] a conditioning row's Qa | Qq | B - and the SwiGLU of them, into
+// u = inv (sa P[st] + sq Z + dq R[t]) + B[t] - stats [rows][8] (inv, da, dq, sq, mq, sa, st, t), P [.][2 hidden]
+// a sample-token row's product, QB [.][2][2 hidden] a conditioning row's R | B (R = Qq + (da / dq) Qa, the ratio a
+// constant of the row's widths) - and the SwiGLU of them, into
 // gated [rows][hidden] in half. On the matrix units only: false, nothing run
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
                          const float* P, const float* QB);

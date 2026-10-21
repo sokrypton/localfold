@@ -155,8 +155,8 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
   const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
-  half* gA = scratch<half>("be2.cs.gA", 2 * R * Dt); half* gQ = scratch<half>("be2.cs.gQ", 2 * R * Ca);
-  half* beta = scratch<half>("be2.cs.beta", 2 * R * Dc); float* QB = scratch<float>("be2.cs.QB", R * 6 * I);
+  half* gR = scratch<half>("be2.cs.gR", 2 * R * Dc); half* beta = scratch<half>("be2.cs.beta", 2 * R * Dc);
+  float* QB = scratch<float>("be2.cs.QB", R * 4 * I);
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
   // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
@@ -169,18 +169,18 @@ static void couplingSplit(const float* a, const float* q, const float* cqc, floa
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
   float* stats = scratch<float>("be2.cs.stats", RN * 8); half* xq = scratch<half>("be2.cs.xq", RN * Ca * 2);
   half* g = scratch<half>("be2.cs.g", RN * I);
-  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gA, gQ, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
-  // Qa | Qq | B [R][3][2I] in float, each two GEMMs on the matrix units - the gammas' hi, then their remainder added
-  // (float's precision: as one float GEMM, off the matrix units, the three were 12% of the sampler)
-  auto qb = [&](const half* X, int in, const half* W, int col, const char* label) {
+  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gR, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
+  // R | B [R][2][2I] in float - R = Qq - Qa / 6 (da = -dq / 6 exactly, as 768 da + 128 dq = 0: one vector where Qa and
+  // Qq were two, and the epilogue reads a quarter less) - each two GEMMs on the matrix units, the rows' hi then their
+  // remainder added (float's precision: as one float GEMM off the matrix units, Qa | Qq | B were 12% of the sampler)
+  auto qb = [&](const half* X, int col, const char* label) {
     for (int part = 0; part < 2; ++part) {
-      Gemm G{}; G.X = X + (size_t)part * R * in; G.tx = F16; G.W = W; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 6 * I;
-      G.rows = R; G.in = in; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = label; gemm(G);
+      Gemm G{}; G.X = X + (size_t)part * R * Dc; G.tx = F16; G.W = w12; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 4 * I;
+      G.rows = R; G.in = Dc; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = label; gemm(G);
     }
   };
-  qb(gA, Dt, w12, 0, "coupling Qa");
-  qb(gQ, Ca, w12 + (size_t)Dt * 2 * I, 2 * I, "coupling Qq");
-  qb(beta, Dc, w12, 4 * I, "coupling B");
+  qb(gR, 0, "coupling R");
+  qb(beta, 2 * I, "coupling B");
   auto rowsGrid = [](size_t rows) {
     const size_t groups = (rows + 7) / 8;
     return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
