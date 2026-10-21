@@ -762,7 +762,7 @@ async function encodeTriangleMultiplication(
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
     + `:${shape.accumulatePrecision ?? "f32"}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
-    + `x${shaders.projectTile.outColumns ?? "-"}`
+    + `x${shaders.projectTile.outColumns ?? "-"}w${shaders.projectTile.workgroup ?? 8}`
     + `:ct${shaders.contractTile.rows}x${shaders.contractTile.columns}${shaders.contractTile.arithmetic ?? ""}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
   const outMatrixSources = matrixFits

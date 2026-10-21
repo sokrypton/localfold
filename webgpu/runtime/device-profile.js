@@ -1294,7 +1294,7 @@ const PRIORS = new Map([
     // 3259 / 3301. A wider output tile (outColumns 64) took project-out 10-18 ms further and the pass did not follow.
     // ...and on the M2, the same pass alternated: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project 635 / 1003
     // -> 599 / 1004 - so it holds on both parts.
-    trianglePairProjectTile: { rows: 32, columns: 32 },
+    trianglePairProjectTile: { rows: 64, columns: 32, outColumns: 64, workgroup: 16 },
     // 🔴 NOT TIERED ON APPLE: THE FIRST FOLD RAN EVERY KERNEL WITH OPAQUE LOOP BOUNDS AND PAID MORE THAN THE COMPILE IT
     // SAVED. "tiered" (DEFAULT_TUNING) was measured on NVIDIA, whose driver compile dominates a fresh VM's first fold;
     // Apple's compiles these kernels in a fraction of that, and an opaque bound costs the M5 its unrolling for the whole

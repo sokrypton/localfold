@@ -335,7 +335,7 @@ export async function compilePairTrack(cache, options) {
                   // would otherwise collide on it.
                   + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}`
                   // ...and the tile each vector kernel was generated at.
-                  + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}`
+                  + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}w${projectTile.workgroup ?? 8}`
                   + `:ct${contractTile.rows}x${contractTile.columns}${contractTile.arithmetic ?? ""}`
                   + `:${name}`,
                   source);

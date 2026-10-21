@@ -256,11 +256,11 @@ export function createTriangleShaders(
   // them in the same INVOCATION, which is what makes it a store and not a
   // read-modify-write race. See webgpu/runtime/storage.js.
   const countOf = (axis) => (axis === "CZ" ? shape.cZ : shape.cHidden);
+  const fastVariance = variance === "fast";
   const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row",
                            outputStorage = "f32") => `
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${shape[count === "CZ" ? "cZ" : "cHidden"]}>;
-var<workgroup> partial_sum: array<f32, 64>;
-var<workgroup> partial_squares: array<f32, 64>;
+var<workgroup> partial_sum: array<f32, 64>;${fastVariance ? "\nvar<workgroup> partial_squares: array<f32, 64>;" : ""}
 var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
 var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
 
@@ -295,25 +295,20 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   let slot = local / LANES_PER_ROW;
   let lane = local % LANES_PER_ROW;
-  var total = 0.0;
-  var squares = 0.0;
+  var total = 0.0;${fastVariance ? "\n  var squares = 0.0;" : ""}
   for (var c = lane; c < ${count}; c += LANES_PER_ROW) {
     let value = tile[slot * ${count} + c];
-    total += value;
-    squares += value * value;
+    total += value;${fastVariance ? "\n    squares += value * value;" : ""}
   }
-  partial_sum[local] = total;
-  partial_squares[local] = squares;
+  partial_sum[local] = total;${fastVariance ? "\n  partial_squares[local] = squares;" : ""}
   workgroupBarrier();
   if (lane == 0u) {
-    var row_total = 0.0;
-    var row_squares = 0.0;
+    var row_total = 0.0;${fastVariance ? "\n    var row_squares = 0.0;" : ""}
     for (var l = 0u; l < LANES_PER_ROW; l += 1u) {
-      row_total += partial_sum[slot * LANES_PER_ROW + l];
-      row_squares += partial_squares[slot * LANES_PER_ROW + l];
+      row_total += partial_sum[slot * LANES_PER_ROW + l];${fastVariance ? "\n      row_squares += partial_squares[slot * LANES_PER_ROW + l];" : ""}
     }
     let mean = row_total / f32(${count});
-    ${variance === "fast"
+    ${fastVariance
       ? `let variance = row_squares / f32(${count}) - mean * mean;`
       : `var variance = 0.0;
     for (var c = 0u; c < ${count}; c += 1u) {
@@ -379,13 +374,17 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // ...resolved once and REPORTED, not restated by each caller. See
   // LINEAR_GRID_WIDTH: three files dispatch these kernels.
   const projectGridWidth = shape.projectGridWidth ?? LINEAR_GRID_WIDTH;
-  const { rows: PROJECT_TILE_ROWS, columns: PROJECT_TILE_COLUMNS } = projectTile;
-  if (PROJECT_TILE_ROWS % 8 !== 0 || PROJECT_TILE_COLUMNS % 8 !== 0) {
-    throw new Error(`projectTile ${PROJECT_TILE_ROWS}x${PROJECT_TILE_COLUMNS} is not a `
-      + "multiple of the 8x8 workgroup");
+  const { rows: PROJECT_TILE_ROWS, columns: PROJECT_TILE_COLUMNS, workgroup: PROJECT_W = 8 } = projectTile;
+  if (PROJECT_W !== 8 && PROJECT_W !== 16) {
+    throw new Error(`projectTile workgroup ${PROJECT_W} is not 8 or 16`);
   }
-  const rowsPerThread = PROJECT_TILE_ROWS / 8;
-  const columnsPerThread = PROJECT_TILE_COLUMNS / 8;
+  const PROJECT_W2 = PROJECT_W * PROJECT_W;
+  if (PROJECT_TILE_ROWS % PROJECT_W !== 0 || PROJECT_TILE_COLUMNS % PROJECT_W !== 0) {
+    throw new Error(`projectTile ${PROJECT_TILE_ROWS}x${PROJECT_TILE_COLUMNS} is not a `
+      + `multiple of the ${PROJECT_W}x${PROJECT_W} workgroup`);
+  }
+  const rowsPerThread = PROJECT_TILE_ROWS / PROJECT_W;
+  const columnsPerThread = PROJECT_TILE_COLUMNS / PROJECT_W;
   // 🔴 THE STAGED ROWS ARE ONE VECTOR, WHICH HALVES THIS KERNEL'S WORKGROUP
   // READS. Every step of k reads the source tile once per row an invocation
   // owns, and those rows are adjacent slots, so four of them are one vec4 read
@@ -436,37 +435,73 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // and the fold came out at relRMS 1.42 - the two kernels this touches were
   // both innocent. tools/gpu/check-triangle-packed.js is what localised it, by
   // running the whole five-kernel update and not only the two.
-  const columnOf = packAB
-    ? `local.x * ${columnsPerThread}u + column` : `local.x + column * 8u`;
-  // 🔴 A GROUP OF CHANNELS AT A TIME, WHEN THE CALLER ASKS. a[h] and b[h] are
-  // read only by channel h's contraction, so the projection and the
-  // contraction can walk the channels in groups with a and b held for one group:
-  // a uniform `chunk` = (first channel, channel count) makes projectAB read the
-  // GLOBAL channel's weights and store a/b at the LOCAL one, and the
-  // contraction read local and write the global channel of its output. Off,
-  // the text is unchanged. Plain (unpacked) a/b only.
+  const columnOfCol = (c) => packAB
+    ? `local.x * ${columnsPerThread}u + ${c}u` : `local.x + ${c * PROJECT_W}u`;
   const channelChunked = shape.channelChunked === true && !packAB;
   const H_END = channelChunked ? "min(CH, chunk.x + chunk.y)" : "CH";
-  const plainStore = `    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-      let h = h0 + ${columnOf};
-      if (h >= ${H_END}) { continue; }
-      let cell = vec4<f32>(acc[r * ${columnsPerThread}u + column]);
-      let index = ${channelChunked ? "(h - chunk.x)" : "h"} * PAIRS + row;
-      a[index] = pair_mask * cell.x * logistic(cell.y);
-      b[index] = pair_mask * cell.z * logistic(cell.w);
-    }`;
   const gated = (cell, value, gate) => `pair_mask * ${cell}.${value} * logistic(${cell}.${gate})`;
-  const abStore = Array.from({ length: columnsPerThread / 2 }, (_, m) => `    {
-      let h = h0 + local.x * ${columnsPerThread}u + ${m * 2}u;
-      if (h + 1u < CH) {
-        let lo = vec4<f32>(acc[r * ${columnsPerThread}u + ${m * 2}u]);
-        let hi = vec4<f32>(acc[r * ${columnsPerThread}u + ${m * 2 + 1}u]);
-        // The word holding channels h and h+1 of this row; this thread owns both.
-        let word = (h / 2u) * PAIRS + row;
-        a[word] = pack2x16float(vec2<f32>(${gated("lo", "x", "y")}, ${gated("hi", "x", "y")}));
-        b[word] = pack2x16float(vec2<f32>(${gated("lo", "z", "w")}, ${gated("hi", "z", "w")}));
+  const abBiasDeclare = [];
+  for (let c = 0; c < columnsPerThread; c += 1) {
+    abBiasDeclare.push(`  var bias_${c} = ${accVector}(0.0);
+  {
+    let h = h0 + ${columnOfCol(c)};
+    if (h < ${H_END}) {
+      bias_${c} = ${accVector}(
+        ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h]`))).join(",\n        ")});
+    }
+  }`);
+    for (let r = 0; r < rowsPerThread; r += 1) {
+      abBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
+    }
+  }
+  const abStageWeight = Array.from({ length: columnsPerThread }, (_, c) => `    {
+      let h = h0 + ${columnOfCol(c)};
+      let slot = local.y * TILE_COLUMNS + ${columnOfCol(c)};
+      var packed = ${accVector}(0.0);
+      if (h < ${H_END} && weight_c < CZ) {
+        let weight_index = h * CZ + weight_c;
+        packed = ${accVector}(
+          ${MATRICES.map(([, name]) =>
+            accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n          ")});
       }
+      tile_weight[slot] = packed;
     }`).join("\n");
+  const abInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
+      let x = tile_source[local.y * ${PROJECT_W}u + ${k}u];
+${Array.from({ length: columnsPerThread }, (_, c) => `      {
+        let packed = tile_weight[${k}u * TILE_COLUMNS + ${columnOfCol(c)}];
+        ${overRows((r) => `acc_${r}_${c} += ${rowAt("x", r)} * packed;`)}
+      }`).join("\n")}
+    }`).join("\n");
+  const abRowStores = Array.from({ length: rowsPerThread }, (_, r) => {
+    const body = packAB
+      ? Array.from({ length: columnsPerThread / 2 }, (_, m) => `      {
+        let h = h0 + local.x * ${columnsPerThread}u + ${m * 2}u;
+        if (h + 1u < CH) {
+          let lo = vec4<f32>(acc_${r}_${m * 2});
+          let hi = vec4<f32>(acc_${r}_${m * 2 + 1});
+          let word = (h / 2u) * PAIRS + row;
+          a[word] = pack2x16float(vec2<f32>(${gated("lo", "x", "y")}, ${gated("hi", "x", "y")}));
+          b[word] = pack2x16float(vec2<f32>(${gated("lo", "z", "w")}, ${gated("hi", "z", "w")}));
+        }
+      }`).join("\n")
+      : Array.from({ length: columnsPerThread }, (_, c) => `      {
+        let h = h0 + ${columnOfCol(c)};
+        if (h < ${H_END}) {
+          let cell = vec4<f32>(acc_${r}_${c});
+          let index = ${channelChunked ? "(h - chunk.x)" : "h"} * PAIRS + row;
+          a[index] = pair_mask * cell.x * logistic(cell.y);
+          b[index] = pair_mask * cell.z * logistic(cell.w);
+        }
+      }`).join("\n");
+    return `  {
+    let row = row0 + ${r * PROJECT_W}u;
+    if (row < PAIRS) {
+      let pair_mask = mask[row];
+${body}
+    }
+  }`;
+  }).join("\n");
 
   const projectAB = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
@@ -479,7 +514,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(4) var<storage, read_write> b: array<${storageArray(abStorage)}>;
 ${channelChunked ? "@group(0) @binding(5) var<uniform> chunk: vec4<u32>;" : ""}
 
-var<workgroup> tile_source: array<${projectRowVector}, 64>;
+var<workgroup> tile_source: array<${projectRowVector}, ${PROJECT_W2}>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
 // separate matrices contracted over the same source, so the four weights a
 // (k, channel) cell needs are always wanted together. Packed as a vec4 the
@@ -487,92 +522,37 @@ var<workgroup> tile_source: array<${projectRowVector}, 64>;
 // multiply-add instead of four - the same arithmetic, a quarter of the issue
 // slots. Priced before it was written: replacing these reads with a constant
 // took the kernel from 0.525 ms to 0.375, so they were 29% of it.
-var<workgroup> tile_weight: array<${accVector}, ${columnsPerThread * 64}>;
+var<workgroup> tile_weight: array<${accVector}, ${columnsPerThread * PROJECT_W2}>;
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(${PROJECT_W}, ${PROJECT_W}, 1)
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  // 🔴 THE ROW TILE IS SPREAD OVER y AND z, because a dispatch is at most
-  // 65535 workgroups in ANY dimension and there are n^2 pair rows. At 1566
-  // residues that is 2.45M rows, 76637 tiles of 32, and the browser refuses the
-  // pass: "Dispatch workgroup count Y (76637) exceeds max compute workgroups
-  // per dimension (65535)". Every other pass in the track already folded
-  // through a linear grid; these two divided by the tile and dispatched the
-  // quotient raw.
-  //
-  // With a single z slice this is exactly group.y, so a caller that has not
-  // been taught to fold is unchanged.
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
-  let tile_index = local.y * 8u + local.x;
+  let tile_index = local.y * ${PROJECT_W}u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
   var acc: array<${accVector}, ${rowsPerThread * columnsPerThread}>;
-  for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-    let h = h0 + ${columnOf};
-    var bias = ${accVector}(0.0);
-    if (h < ${H_END}) {
-      bias = ${accVector}(
-        ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h]`))).join(",\n        ")});
-    }
-    for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      acc[r * ${columnsPerThread}u + column] = bias;
-    }
-  }
-  for (var c0 = 0u; c0 < CZ; c0 += 8u) {
+  _ = &acc;
+${abBiasDeclare.join("\n")}
+  for (var c0 = 0u; c0 < CZ; c0 += ${PROJECT_W}u) {
     let source_c = c0 + local.x;
     let weight_c = c0 + local.y;
     var staged: ${projectRowVector};
     ${overRows((r) => `{
-        let row = row0 + ${r}u * 8u;
+        let row = row0 + ${r}u * ${PROJECT_W}u;
         var value = 0.0;
         if (row < PAIRS && source_c < CZ) { value = ${storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c")}; }
         ${rowAt("staged", r)} = ${accNarrow("value")};
       }`)}
     tile_source[tile_index] = staged;
-    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-      let h = h0 + ${columnOf};
-      let slot = local.y * TILE_COLUMNS + ${columnOf};
-      var packed = ${accVector}(0.0);
-      if (h < ${H_END} && weight_c < CZ) {
-        let weight_index = h * CZ + weight_c;
-        packed = ${accVector}(
-          ${MATRICES.map(([, name]) =>
-            accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n          ")});
-      }
-      tile_weight[slot] = packed;
-    }
+${abStageWeight}
     workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let x = tile_source[local.y * 8u + k];
-      for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-        let packed = tile_weight[k * TILE_COLUMNS + ${columnOf}];
-        ${overRows((r) =>
-          `acc[${r}u * ${columnsPerThread}u + column] += ${rowAt("x", r)} * packed;`)}
-      }
-    }
+${abInner}
     workgroupBarrier();
   }
-  // ...AND a AND b COME OUT CHANNEL-MAJOR, a[h][i][j], not a[i][j][h]. The
-  // contraction below walks one h at a time, so this is the layout that decides
-  // whether it runs or crawls - see the note on its k loop. Writing it here
-  // costs this pass a scattered store; it saved the contraction 14x at L=256.
-  //
-  // 🔴 STAGING THE TILE THROUGH WORKGROUP MEMORY TO COALESCE THIS WAS TRIED AND
-  // WAS SLOWER. The store does put PAIRS floats between the lanes of a
-  // subgroup, so parking the tile in workgroup memory and writing it back
-  // indexed by row looks like the obvious fix. Measured interleaved against
-  // this version, bitwise-identical output, it lost at every length:
-  //   L=64 0.92x   L=128 0.88x   L=192 0.95x   L=256 0.93x   (and 0.74x
-  // incoming at 64). Two more arrays of 256 floats cost occupancy, and the
-  // extra barrier and indexed writeback cost more than the coalescing bought.
-  for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-    let row = row0 + r * 8u;
-    if (row >= PAIRS) { continue; }
-    let pair_mask = mask[row];
-${packAB ? abStore : plainStore}
-  }
+${abRowStores}
 }`;
 
   // 🔴 h IS THE SLOWEST INDEX IN a AND b, AND THAT IS WORTH 14x. Channel-minor
@@ -792,10 +772,58 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
   // 4.34 -> 3.26 ms at 384 channels and 0.56 -> 0.44 at 128, bit-identical,
   // where projectAB is slower at 32 x 64 (5.43 -> 6.10).
   const OUT_TILE_COLUMNS = projectTile.outColumns ?? PROJECT_TILE_COLUMNS;
-  if (OUT_TILE_COLUMNS % 8 !== 0) {
-    throw new Error(`projectTile outColumns ${OUT_TILE_COLUMNS} is not a multiple of 8`);
+  if (OUT_TILE_COLUMNS % PROJECT_W !== 0) {
+    throw new Error(`projectTile outColumns ${OUT_TILE_COLUMNS} is not a multiple of ${PROJECT_W}`);
   }
-  const outColumnsPerThread = OUT_TILE_COLUMNS / 8;
+  const outColumnsPerThread = OUT_TILE_COLUMNS / PROJECT_W;
+  const outBiasDeclare = [];
+  for (let c = 0; c < outColumnsPerThread; c += 1) {
+    outBiasDeclare.push(`  var bias_${c} = ${outVector2}(0.0);
+  {
+    let out_channel = channel0 + ${c * PROJECT_W}u;
+    if (out_channel < CZ) {
+      bias_${c} = ${outVector2}(
+        ${accNarrow(readWeight("weights[W_LINEARZBIAS + out_channel]"))},
+        ${accNarrow(readWeight("weights[W_LINEARGBIAS + out_channel]"))});
+    }
+  }`);
+    for (let r = 0; r < rowsPerThread; r += 1) {
+      outBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
+    }
+  }
+  const outStageWeight = Array.from({ length: outColumnsPerThread }, (_, c) => `    {
+      let out_channel = channel0 + ${c * PROJECT_W}u;
+      let slot = local.y * TILE_COLUMNS + local.x + ${c * PROJECT_W}u;
+      var projection_w = 0.0;
+      var gate_w = 0.0;
+      if (out_channel < CZ && weight_k < CH) {
+        projection_w = ${readWeight("weights[W_LINEARZWEIGHT + out_channel * CH + weight_k]")};
+      }
+      if (out_channel < CZ && weight_k < CZ) {
+        gate_w = ${readWeight("weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
+      }
+      tile_weight[slot] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
+    }`).join("\n");
+  const outInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
+      let xs = tile_x[local.y * ${PROJECT_W}u + ${k}u];
+      let zs = tile_z[local.y * ${PROJECT_W}u + ${k}u];
+      ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
+${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
+        let packed = tile_weight[${k}u * TILE_COLUMNS + local.x + ${c * PROJECT_W}u];
+        ${overRows((r) => `acc_${r}_${c} += xz${r} * packed;`)}
+      }`).join("\n")}
+    }`).join("\n");
+  const outStores = Array.from({ length: rowsPerThread }, (_, r) => `  {
+    let row = row0 + ${r * PROJECT_W}u;
+    if (row < PAIRS) {
+${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
+        let out_channel = channel0 + ${c * PROJECT_W}u;
+        if (out_channel < CZ) {
+          store_output(row, out_channel, vec2<f32>(acc_${r}_${c}));
+        }
+      }`).join("\n")}
+    }
+  }`).join("\n");
   const projectOutput = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
@@ -805,8 +833,8 @@ const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_x: array<${outRowVector}, 64>;
-var<workgroup> tile_z: array<${outRowVector}, 64>;
+var<workgroup> tile_x: array<${outRowVector}, ${PROJECT_W2}>;
+var<workgroup> tile_z: array<${outRowVector}, ${PROJECT_W2}>;
 // 🔴 ONE vec2 A CELL, NOT TWO SCALAR ARRAYS - the same argument projectAB
 // makes with four matrices and a vec4. The output projection and its gate are
 // contracted at the SAME (k, output channel) cell, so their two weights are
@@ -816,9 +844,13 @@ var<workgroup> tile_z: array<${outRowVector}, 64>;
 // k to buy sixteen products - 0.73 useful operations an instruction, against
 // projectAB's 2.9 on the same shape, and it showed: 672 GFLOP/s where the
 // projection that feeds it runs at 977.
-var<workgroup> tile_weight: array<${outVector2}, ${outColumnsPerThread * 64}>;
+var<workgroup> tile_weight: array<${outVector2}, ${outColumnsPerThread * PROJECT_W2}>;
 
-@compute @workgroup_size(8, 8, 1)
+fn store_output(row: u32, out_channel: u32, cell: vec2<f32>) {
+  output[row * CZ + out_channel] ${residual ? "+=" : "="} cell.x * logistic(cell.y);
+}
+
+@compute @workgroup_size(${PROJECT_W}, ${PROJECT_W}, 1)
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
@@ -835,30 +867,18 @@ fn main(
   // been taught to fold is unchanged.
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
-  let tile_index = local.y * 8u + local.x;
+  let tile_index = local.y * ${PROJECT_W}u + local.x;
   // ...the projection contracts over CH and the gate over CZ, on the same
   // output channel, so one accumulator a cell carries both: x is the
   // projection, y the gate.
-  var acc: array<${outVector2}, ${rowsPerThread * outColumnsPerThread}>;
-  for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
-    let out_channel = channel0 + column * 8u;
-    var bias = ${outVector2}(0.0);
-    if (out_channel < CZ) {
-      bias = ${outVector2}(
-        ${accNarrow(readWeight("weights[W_LINEARZBIAS + out_channel]"))},
-        ${accNarrow(readWeight("weights[W_LINEARGBIAS + out_channel]"))});
-    }
-    for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      acc[r * ${outColumnsPerThread}u + column] = bias;
-    }
-  }
-  for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
+${outBiasDeclare.join("\n")}
+  for (var k0 = 0u; k0 < max(CH, CZ); k0 += ${PROJECT_W}u) {
     let source_k = k0 + local.x;
     let weight_k = k0 + local.y;
     var staged_x: ${outRowVector};
     var staged_z: ${outRowVector};
     ${overRows((r) => `{
-        let row = row0 + ${r}u * 8u;
+        let row = row0 + ${r}u * ${PROJECT_W}u;
         var x_value = 0.0;
         var z_value = 0.0;
         if (row < PAIRS && source_k < CH) { x_value = ${storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k")}; }
@@ -868,43 +888,12 @@ fn main(
       }`)}
     tile_x[tile_index] = staged_x;
     tile_z[tile_index] = staged_z;
-    for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
-      let out_channel = channel0 + column * 8u;
-      let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
-      var projection_w = 0.0;
-      var gate_w = 0.0;
-      if (out_channel < CZ && weight_k < CH) {
-        projection_w = ${readWeight("weights[W_LINEARZWEIGHT + out_channel * CH + weight_k]")};
-      }
-      if (out_channel < CZ && weight_k < CZ) {
-        gate_w = ${readWeight("weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
-      }
-      tile_weight[slot] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
-    }
+${outStageWeight}
     workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let xs = tile_x[local.y * 8u + k];
-      let zs = tile_z[local.y * 8u + k];
-      // ...paired once a row, outside the column loop, because the pairing
-      // depends on the row and the weight does not.
-      ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
-      for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
-        let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
-        ${overRows((r) => `acc[${r}u * ${outColumnsPerThread}u + column] += xz${r} * packed;`)}
-      }
-    }
+${outInner}
     workgroupBarrier();
   }
-  for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-    let row = row0 + r * 8u;
-    if (row >= PAIRS) { continue; }
-    for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
-      let out_channel = channel0 + column * 8u;
-      if (out_channel >= CZ) { continue; }
-      let cell = vec2<f32>(acc[r * ${outColumnsPerThread}u + column]);
-      output[row * CZ + out_channel] ${residual ? "+=" : "="} cell.x * logistic(cell.y);
-    }
-  }
+${outStores}
 }`;
 
   return { normalizeInput, projectAB, contract: contractF16 ?? contract, normalizeHidden, projectOutput,
