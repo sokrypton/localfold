@@ -1039,10 +1039,8 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   float* xn = scratch<float>("opm.xn", rows * C);
   layerNorm(msa, xn, rows, C, Op + "/layer_norm_input", blk);
   float* lt = scratch<float>("opm.left", rows * O); float* rt = scratch<float>("opm.right", rows * O);
-  linearB(xn, Op + "/left_projection", blk, lt, rows, C, O);
-  linearB(xn, Op + "/right_projection", blk, rt, rows, C, O);
-  scaleRowsK2<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
-  scaleRowsK2<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
+  linearB(xn, Op + "/left_projection", blk, lt, rows, C, O, false, msaMask);
+  linearB(xn, Op + "/right_projection", blk, rt, rows, C, O, false, msaMask);
   float* norm = scratch<float>("opm.norm", (size_t)L * L);
   const float one = 1.f, zero = 0.f;
   // norm[i, j] = sum_s mask[s, i] mask[s, j]
@@ -1063,7 +1061,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   }
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(256, 8)
 triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const float* __restrict__ mask,
           float* __restrict__ a, float* __restrict__ b, int L, int C,
           const float* __restrict__ projB = nullptr, const float* __restrict__ gateB = nullptr) {
@@ -1076,21 +1074,15 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
   if (ij0 + 32 <= pairs && c0 + 32 <= C) {
     float pba = projB ? __ldg(projB + c) : 0.f, pbb = projB ? __ldg(projB + C + c) : 0.f;
     float gba = gateB ? __ldg(gateB + c) : 0.f, gbb = gateB ? __ldg(gateB + C + c) : 0.f;
-    float m[4], pa[4], ga[4], pb[4], gb[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       size_t ij = ij0 + ty + k * 8;
       size_t base = ij * (2 * C) + c;
-      m[k] = __ldg(mask + ij);
-      pa[k] = __ldg(proj + base) + pba;
-      ga[k] = __ldg(gate + base) + gba;
-      pb[k] = __ldg(proj + base + C) + pbb;
-      gb[k] = __ldg(gate + base + C) + gbb;
-    }
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      A[ty + k * 8][tx] = pa[k] * m[k] / (1.f + __expf(-ga[k]));
-      B[ty + k * 8][tx] = pb[k] * m[k] / (1.f + __expf(-gb[k]));
+      float m = __ldg(mask + ij);
+      float pa = __ldg(proj + base) + pba, ga = __ldg(gate + base) + gba;
+      float pb = __ldg(proj + base + C) + pbb, gb = __ldg(gate + base + C) + gbb;
+      A[ty + k * 8][tx] = pa * m / (1.f + __expf(-ga));
+      B[ty + k * 8][tx] = pb * m / (1.f + __expf(-gb));
     }
     __syncthreads();
     size_t ij = ij0 + tx;
@@ -1418,10 +1410,8 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   else
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, L, &one, a, L, pairs, b, L, pairs, &zero, prod, L,
                                  pairs, C));
-  float* rowsP = scratch<float>("tri.rows", pairs * C);
-  channelMajorToRowsTileK<<<dim3((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(prod, rowsP, pairs, C);
   float* cn = scratch<float>("tri.cn", pairs * C);
-  layerNorm(rowsP, cn, pairs, C, T + "/center_norm", blk);
+  centerNormF32(prod, cn, pairs, C, T + "/center_norm", blk);
   float* out = scratch<float>("tri.out", pairs * C);
   gemm(cn, P(T + "/output_projection/weights", blk), out, pairs, C, C);
   float* g = scratch<float>("tri.g", pairs * C);

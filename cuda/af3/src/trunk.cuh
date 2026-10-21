@@ -1563,7 +1563,7 @@ __global__ void logitsLayoutK(const float* flat, float* out, size_t pairs, int h
   if (t < pairs * heads) out[t] = flat[(t % pairs) * heads + t / pairs];
 }
 template <class T, int MAX_K = 8>
-__global__ void __launch_bounds__(256, 8)
+__global__ void __launch_bounds__(256, MAX_K <= 9 ? 8 : MAX_K <= 12 ? 6 : 4)
 singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
                    const float* __restrict__ seqMask, T* __restrict__ P,
                    size_t totalRows, int n, float scale, int ld = 0) {
@@ -1605,63 +1605,103 @@ singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ p
 }
 
 template <class T>
-__global__ void singleSoftmaxK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
-                               const float* __restrict__ seqMask, T* __restrict__ P,
-                               int n, float scale, int ld = 0) {
+__global__ void __launch_bounds__(128, 16)
+singleSoftmaxK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
+               const float* __restrict__ seqMask, T* __restrict__ P,
+               int n, float scale, int ld = 0) {
   // ld: the logits' and P's row stride (0: n), P's columns from n to ld written zero
   if (!ld) ld = n;
   size_t rowId = blockIdx.x;
   const float* L = logits + rowId * ld; const float* B = pairLogits + rowId * n;
   extern __shared__ float srow[];
   __shared__ float red[8];
+  int tx = threadIdx.x;
+  if (n <= 512) {
+    float rv[4];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = tx + k * 128;
+      if (j < n) {
+        float v = __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f);
+        rv[k] = v;
+        mx = fmaxf(mx, v);
+      }
+    }
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    if ((tx & 31) == 0) red[tx >> 5] = mx;
+    __syncthreads();
+    mx = fmaxf(fmaxf(red[0], red[2]), fmaxf(red[1], red[3]));
+    float sum = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = tx + k * 128;
+      if (j < n) {
+        float e = expf(rv[k] - mx);
+        rv[k] = e;
+        sum += e;
+      }
+    }
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    if ((tx & 31) == 0) red[4 + (tx >> 5)] = sum;
+    __syncthreads();
+    float inv = 1.f / ((red[4] + red[6]) + (red[5] + red[7]));
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = tx + k * 128;
+      if (j < ld) P[rowId * ld + j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
+    }
+    return;
+  }
   float mx = -INFINITY;
   if (n <= 4096) {
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-      float v = L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f);
+    for (int j = tx; j < n; j += 128) {
+      float v = __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f);
       srow[j] = v;
       mx = fmaxf(mx, v);
     }
   } else {
-    for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f));
+    for (int j = tx; j < n; j += 128) mx = fmaxf(mx, __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f));
   }
   for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+  if ((tx & 31) == 0) red[tx >> 5] = mx;
   __syncthreads();
   mx = fmaxf(fmaxf(red[0], red[2]), fmaxf(red[1], red[3]));
   float sum = 0;
   if (n <= 4096) {
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+    for (int j = tx; j < n; j += 128) {
       float e = expf(srow[j] - mx);
       srow[j] = e;
       sum += e;
     }
   } else {
-    for (int j = threadIdx.x; j < n; j += blockDim.x) sum += expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx);
+    for (int j = tx; j < n; j += 128) sum += expf(__ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f) - mx);
   }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-  if ((threadIdx.x & 31) == 0) red[4 + (threadIdx.x >> 5)] = sum;
+  if ((tx & 31) == 0) red[4 + (tx >> 5)] = sum;
   __syncthreads();
   float inv = 1.f / ((red[4] + red[6]) + (red[5] + red[7]));
   if (n <= 4096) {
-    for (int j = threadIdx.x; j < ld; j += blockDim.x)
+    for (int j = tx; j < ld; j += 128)
       P[rowId * ld + j] = j < n ? fromF<T>(srow[j] * inv) : fromF<T>(0.f);
   } else {
-    for (int j = threadIdx.x; j < ld; j += blockDim.x)
-      P[rowId * ld + j] = j < n ? fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv) : fromF<T>(0.f);
+    for (int j = tx; j < ld; j += 128)
+      P[rowId * ld + j] = j < n ? fromF<T>(expf(__ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f) - mx) * inv) : fromF<T>(0.f);
   }
 }
 template <class T>
 inline void launchSingleSoftmax(const float* logits, const float* pairLogits, const float* seqMask, T* P,
                                 size_t totalRows, int n, float scale, int ld = 0) {
   int maxCol = ld ? ld : n;
+  unsigned g = (unsigned)((totalRows + 7) / 8);
   if (maxCol <= 96)
-    singleSoftmaxWarpK<T, 3><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+    singleSoftmaxWarpK<T, 3><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
   else if (maxCol <= 128)
-    singleSoftmaxWarpK<T, 4><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+    singleSoftmaxWarpK<T, 4><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
   else if (maxCol <= 256)
-    singleSoftmaxWarpK<T, 8><<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+    singleSoftmaxWarpK<T, 8><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
   else
-    singleSoftmaxK<T><<<(unsigned)totalRows, 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pairLogits, seqMask, P, n, scale, ld);
+    singleSoftmaxK<T><<<(unsigned)totalRows, 128, (n > 512 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pairLogits, seqMask, P, n, scale, ld);
 }
 template <class T>
 __global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd, int ldn = 0) {

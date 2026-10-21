@@ -87,9 +87,11 @@ __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const f
     noisy[a * 3 + d] = v + injected * gaussian(seeds[k], step, (a % atoms) * 3 + d);
   }
 }
-__global__ void __launch_bounds__(1024) centroidAugmentNoiseK(float* x, float* noisy, const float* mask, float* c,
-                                                              const float* rot, const uint64_t* seeds, uint32_t step,
-                                                              float injected, size_t atoms, float* noisyKeep = nullptr) {
+__global__ void __launch_bounds__(1024) centroidAugmentNoiseK(float* __restrict__ x, float* __restrict__ noisy,
+                                                              const float* __restrict__ mask, float* __restrict__ c,
+                                                              const float* __restrict__ rot, const uint64_t* __restrict__ seeds,
+                                                              uint32_t step, float injected, size_t atoms,
+                                                              float* __restrict__ noisyKeep = nullptr) {
   __shared__ float s[4][32];
   __shared__ float ck[3];
   size_t k = blockIdx.x;
@@ -98,7 +100,7 @@ __global__ void __launch_bounds__(1024) centroidAugmentNoiseK(float* x, float* n
   float* nk = noisyKeep ? noisyKeep + k * atoms * 3 : nullptr;
   float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
   for (size_t i = threadIdx.x; i < atoms; i += blockDim.x)
-    if (mask[i]) { a0 += xs[i * 3]; a1 += xs[i * 3 + 1]; a2 += xs[i * 3 + 2]; a3 += 1; }
+    if (__ldg(mask + i)) { a0 += xs[i * 3]; a1 += xs[i * 3 + 1]; a2 += xs[i * 3 + 2]; a3 += 1; }
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int o = 16; o; o >>= 1) {
     a0 += __shfl_xor_sync(~0u, a0, o);
@@ -128,18 +130,31 @@ __global__ void __launch_bounds__(1024) centroidAugmentNoiseK(float* x, float* n
   }
   __syncthreads();
   const float* r = rot + k * 12;
+  float r0 = __ldg(r), r1 = __ldg(r + 1), r2 = __ldg(r + 2);
+  float r3 = __ldg(r + 3), r4 = __ldg(r + 4), r5 = __ldg(r + 5);
+  float r6 = __ldg(r + 6), r7 = __ldg(r + 7), r8 = __ldg(r + 8);
+  float r9 = __ldg(r + 9), r10 = __ldg(r + 10), r11 = __ldg(r + 11);
   float c0 = ck[0], c1 = ck[1], c2 = ck[2];
-  uint64_t seed = seeds[k];
+  uint64_t seed = __ldg(seeds + k);
   for (size_t i = threadIdx.x; i < atoms; i += blockDim.x) {
-    float p0 = xs[i * 3] - c0, p1 = xs[i * 3 + 1] - c1, p2 = xs[i * 3 + 2] - c2;
-    bool live = mask[i] != 0;
-    for (int d = 0; d < 3; ++d) {
-      float v = live ? p0 * r[d] + p1 * r[3 + d] + p2 * r[6 + d] + r[9 + d] : 0.f;
-      xs[i * 3 + d] = v;
-      float nv = v + injected * gaussian(seed, step, i * 3 + d);
-      ns[i * 3 + d] = nv;
-      if (nk) nk[i * 3 + d] = nv;
+    bool live = __ldg(mask + i) != 0;
+    float v0 = 0.f, v1 = 0.f, v2 = 0.f;
+    if (live) {
+      float p0 = xs[i * 3] - c0, p1 = xs[i * 3 + 1] - c1, p2 = xs[i * 3 + 2] - c2;
+      v0 = p0 * r0 + p1 * r3 + p2 * r6 + r9;
+      v1 = p0 * r1 + p1 * r4 + p2 * r7 + r10;
+      v2 = p0 * r2 + p1 * r5 + p2 * r8 + r11;
     }
+    xs[i * 3]     = v0;
+    xs[i * 3 + 1] = v1;
+    xs[i * 3 + 2] = v2;
+    float nv0 = v0 + injected * gaussian(seed, step, i * 3);
+    float nv1 = v1 + injected * gaussian(seed, step, i * 3 + 1);
+    float nv2 = v2 + injected * gaussian(seed, step, i * 3 + 2);
+    ns[i * 3]     = nv0;
+    ns[i * 3 + 1] = nv1;
+    ns[i * 3 + 2] = nv2;
+    if (nk) { nk[i * 3] = nv0; nk[i * 3 + 1] = nv1; nk[i * 3 + 2] = nv2; }
   }
 }
 __global__ void eulerK(float* x, const float* noisy, const float* denoised, float scale, size_t n3) {

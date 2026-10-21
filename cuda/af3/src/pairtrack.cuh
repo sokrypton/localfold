@@ -84,17 +84,36 @@ inline bool skipFused(const char* what) {
   return !v.empty() && v.find(what) != std::string::npos;
 }
 template <class T, bool UP = false, int I_CONST = 0>
-__global__ void __launch_bounds__(I_CONST == 1024 ? 128 : I_CONST == 1536 ? 192 : 256,
-                                  I_CONST == 1024 ? 16 : I_CONST == 1536 ? 10 : 8)
+__global__ void __launch_bounds__(I_CONST == 512 ? 64 : I_CONST == 1024 ? 128 : I_CONST == 1536 ? 192 : 256,
+                                  I_CONST == 512 ? 16 : I_CONST == 1024 ? 16 : I_CONST == 1536 ? 10 : 8)
 swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, int shift = 0) {
   const int II = I_CONST > 0 ? I_CONST : I, L = UP ? 3 * II : 2 * II;
   if constexpr (std::is_same_v<T, half>) {
-    if constexpr (I_CONST == 1024 || I_CONST == 1536 || I_CONST == 2048) {
+    if constexpr (I_CONST == 256) {
+      size_t r = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+      if (r >= rows) return;
+      int i = ((int)threadIdx.x & 31) << 3;
+      size_t t = r * 256 + i;
+      uint4 a = __ldg((const uint4*)(wide + r * L + i)), b = __ldg((const uint4*)(wide + r * L + 256 + i)), o, u;
+      if constexpr (UP) u = __ldg((const uint4*)(wide + r * L + 512 + i));
+      const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
+      const half2* u2 = (const half2*)&u;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
+        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
+        o2[k] = __floats2half2_rn(x, y);
+      }
+      *(uint4*)(gated + t) = o;
+      return;
+    }
+    if constexpr (I_CONST == 512 || I_CONST == 1024 || I_CONST == 1536 || I_CONST == 2048) {
       size_t r = blockIdx.x;
       int i = (int)threadIdx.x << 3;
       size_t t = r * I_CONST + i;
-      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + I_CONST + i), o, u;
-      if constexpr (UP) u = *(const uint4*)(wide + r * L + 2 * I_CONST + i);
+      uint4 a = __ldg((const uint4*)(wide + r * L + i)), b = __ldg((const uint4*)(wide + r * L + I_CONST + i)), o, u;
+      if constexpr (UP) u = __ldg((const uint4*)(wide + r * L + 2 * I_CONST + i));
       const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
       const half2* u2 = (const half2*)&u;
 #pragma unroll
@@ -123,8 +142,8 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
         else ru = u / i8;
         r = ru; i = (int)((u - ru * i8) << 3);
       } else { r = t / I; i = (int)(t % I); }
-      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + II + i), o, u;
-      if constexpr (UP) u = *(const uint4*)(wide + r * L + 2 * II + i);
+      uint4 a = __ldg((const uint4*)(wide + r * L + i)), b = __ldg((const uint4*)(wide + r * L + II + i)), o, u;
+      if constexpr (UP) u = __ldg((const uint4*)(wide + r * L + 2 * II + i));
       const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
       const half2* u2 = (const half2*)&u;
 #pragma unroll
@@ -135,6 +154,34 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
         o2[k] = __floats2half2_rn(x, y);
       }
       *(uint4*)(gated + t) = o;
+      return;
+    }
+  }
+  if constexpr (std::is_same_v<T, float>) {
+    if (I_CONST == -1 || ((I & 3) == 0 && (((uintptr_t)wide | (uintptr_t)gated) & 15) == 0)) {
+      size_t t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      size_t t = t4 << 2;
+      if (t >= rows * (size_t)II) return;
+      size_t r; int i;
+      if constexpr (I_CONST == -1) {
+        r = t4 >> shift; i = (int)(t & (size_t)(II - 1));
+      } else if (t4 < (1ull << 32)) {
+        unsigned u = (unsigned)t4, i4 = (unsigned)(I >> 2), ru;
+        if ((i4 & (i4 - 1)) == 0) ru = u >> (__ffs(i4) - 1);
+        else if (i4 == 384u) ru = u / 384u;
+        else if (i4 == 192u) ru = u / 192u;
+        else if (i4 == 96u) ru = u / 96u;
+        else ru = u / i4;
+        r = ru; i = (int)((u - ru * i4) << 2);
+      } else { r = t / (size_t)I; i = (int)(t % (size_t)I); }
+      float4 a = __ldg(reinterpret_cast<const float4*>(wide + r * L + i));
+      float4 b = __ldg(reinterpret_cast<const float4*>(wide + r * L + II + i));
+      float4 o = make_float4(a.x * sigm(a.x) * b.x, a.y * sigm(a.y) * b.y, a.z * sigm(a.z) * b.z, a.w * sigm(a.w) * b.w);
+      if constexpr (UP) {
+        float4 u = __ldg(reinterpret_cast<const float4*>(wide + r * L + 2 * II + i));
+        o.x *= u.x; o.y *= u.y; o.z *= u.z; o.w *= u.w;
+      }
+      *reinterpret_cast<float4*>(gated + t) = o;
       return;
     }
   }
@@ -153,16 +200,23 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
 // the launch: an eighth of the threads for the vector path
 template <class T>
 void swiglu(const T* wide, T* gated, size_t rows, int I, bool up = false) {
-  size_t work = std::is_same_v<T, half> && (I & 7) == 0 ? rows * I / 8 : rows * I;
+  size_t work = std::is_same_v<T, half> && (I & 7) == 0 ? rows * I / 8
+              : (std::is_same_v<T, float> && (I & 3) == 0 && (((uintptr_t)wide | (uintptr_t)gated) & 15) == 0 ? rows * I / 4 : rows * I);
   unsigned bs = std::is_same_v<T, half> && work <= 108 * 128 ? 128u : 256u;
   auto launch = [&](auto upTag) {
     constexpr bool U = decltype(upTag)::value;
     if constexpr (std::is_same_v<T, half>) {
+      if (I == 256 && rows > 0) { swigluK<T, U, 256><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(wide, gated, rows, 256); return; }
+      if (I == 512 && rows > 0) { swigluK<T, U, 512><<<(unsigned)rows, 64, 0, STREAM>>>(wide, gated, rows, 512); return; }
       if (I == 1024 && rows > 0) { swigluK<T, U, 1024><<<(unsigned)rows, 128, 0, STREAM>>>(wide, gated, rows, 1024); return; }
       if (I == 1536 && rows > 0) { swigluK<T, U, 1536><<<(unsigned)rows, 192, 0, STREAM>>>(wide, gated, rows, 1536); return; }
       if (I == 2048 && rows > 0) { swigluK<T, U, 2048><<<(unsigned)rows, 256, 0, STREAM>>>(wide, gated, rows, 2048); return; }
       if (I >= 8 && (I & (I - 1)) == 0) {
         swigluK<T, U, -1><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I, __builtin_ctz(I >> 3)); return;
+      }
+    } else if constexpr (std::is_same_v<T, float>) {
+      if (I >= 4 && (I & (I - 1)) == 0 && (((uintptr_t)wide | (uintptr_t)gated) & 15) == 0) {
+        swigluK<T, U, -1><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I, __builtin_ctz(I >> 2)); return;
       }
     }
     swigluK<T, U, 0><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I);
