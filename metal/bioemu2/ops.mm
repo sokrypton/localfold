@@ -61,6 +61,13 @@ static const half* swigluWeight(const std::string& p, int C, int I) {
                                                                      (uint)C, (uint)I, 1.f / SWIGLU_SCALE, 0});
   });
 }
+const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }
+void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual) {
+  const int Co = dimW(p + "fc3/weight", 0);
+  Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("w/" + p + "fc3/weight"); G.tw = F16; G.transW = true; G.Y = out; G.ty = F32;
+  G.rows = rows; G.in = I; G.out = Co; G.alpha = SWIGLU_SCALE; G.beta = residual ? 1.f : 0.f; G.label = "transition fc3";
+  gemm(G);
+}
 // the fast arm's transition on an input already in half: fc1 | fc2 and the SwiGLU as one GEMM (gemmSwiglu: the product
 // in its epilogue, into half), then fc3 scaled back; a chunk of rows at a time
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual) {

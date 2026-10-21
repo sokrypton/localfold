@@ -127,6 +127,57 @@ void freeDenoiser(Denoiser& d) {
   d = Denoiser{};
 }
 
+// ---------------------------------------------------------------- the coupling split
+// The coupling's atom-side mixer (s_to_q, fc1 | fc2 over [a_token (768) | q_atom (128)] adaLN'd) is a third of the
+// sampler unsplit. Exactly, W y = inv (sa P[token] + sq Z[atom] + da Qa + dq Qq) + B: P = W_a Xa once a sample-TOKEN row,
+// Z = W_q Xq the atom's own 128 columns, Qa = W_a (1 + alpha_a), Qq = W_q (1 + alpha_q), B = W beta once a conditioning
+// row, the row's LayerNorm statistics combined from its halves' (parallel variance) - webgpu/bioemu2's couplingSplit,
+// 9.25 -> 2.7 G multiply-adds a layer at 68 tokens x 5 samples; the sampler 14.5 -> 12.9 s at 68 tokens x 5 samples x
+// 200 steps on an M5. 🔴 Z NEVER LEAVES THE FLOAT TILE: the combine and the SwiGLU are its GEMM's epilogue
+// (gemmCouplingCombine). Built first with Z stored, it lost precision in half and its speed in float. Every product here is on the blocks-of-8 weight, so u's b half is fc2 / 64 as
+// gemmSwiglu's, and fc3 scales it back. BE2_COUPLING_SPLIT=0 is the control (and off the matrix units, the only path)
+static const bool COUPLING_SPLIT = !getenv("BE2_COUPLING_SPLIT") || atoi(getenv("BE2_COUPLING_SPLIT")) != 0;
+static void couplingSplit(const float* a, const float* q, const float* cqc, float* dq, const int* atomTok, int samples, int T, int N,
+                   int Dt, int Ca, const std::string& p) {
+  const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
+  const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
+  const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
+  float* gA = scratch<float>("be2.cs.gA", R * Dt); float* gQ = scratch<float>("be2.cs.gQ", R * Ca);
+  float* beta = scratch<float>("be2.cs.beta", R * Dc); float* QB = scratch<float>("be2.cs.QB", R * 6 * I);
+  // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
+  // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
+  // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
+  const size_t wq = (size_t)Ca * 2 * I;
+  const half* wQ = M.derived<half>("csQ2:" + p, 2 * wq, [&](half* out) {
+    copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+    copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+  });
+  float* tstats = scratch<float>("be2.cs.tstats", RT * 3); half* xa = scratch<half>("be2.cs.xa", RT * Dt);
+  float* P = scratch<float>("be2.cs.P", RT * 2 * I);
+  float* stats = scratch<float>("be2.cs.stats", RN * 8); half* xq = scratch<half>("be2.cs.xq", RN * Ca * 2);
+  half* g = scratch<half>("be2.cs.g", RN * I);
+  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gA, gQ, beta, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, 0});
+  // Qa | Qq | B [R][3][2I], in float (the gammas multiplied unrounded)
+  auto qb = [&](const float* X, int in, const half* W, int col, const char* label) {
+    Gemm G{}; G.X = X; G.tx = F32; G.W = W; G.tw = F16; G.Y = QB + col; G.ty = F32; G.ldy = 6 * I;
+    G.rows = R; G.in = in; G.out = 2 * I; G.label = label; gemm(G);
+  };
+  qb(gA, Dt, w12, 0, "coupling Qa");
+  qb(gQ, Ca, w12 + (size_t)Dt * 2 * I, 2 * I, "coupling Qq");
+  qb(beta, Dc, w12, 4 * I, "coupling B");
+  auto rowsGrid = [](size_t rows) {
+    const size_t groups = (rows + 7) / 8;
+    return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
+  };
+  run("be2_cs_tok", rowsGrid(RT), 256, Be2CsTokArgs{a, cqc, tstats, xa, (u64)RT, (uint)T, (uint)Dt, (uint)ldc, 0});
+  { Gemm G{}; G.X = xa; G.tx = F16; G.W = w12; G.tw = F16; G.Y = P; G.ty = F32; G.rows = RT; G.in = Dt; G.out = 2 * I;
+    G.label = "coupling P"; gemm(G); }
+  run("be2_cs_atom", rowsGrid(RN), 256, Be2CsAtomArgs{q, tstats, cqc, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), atomTok,
+                                                    stats, xq, (u64)RN, (uint)N, (uint)T, (uint)Ca, (uint)Dt, (uint)ldc, 0});
+  if (!gemmCouplingCombine(xq, wQ, g, RN, 2 * Ca, I, stats, P, QB)) die("BioEmu2: the coupling split off the matrix units");
+  transitionFc3(g, dq, RN, I, p, false);
+}
+
 // ---------------------------------------------------------------- one call
 // the row maps of `samples` stacked samples: each atom to its token's conditioning row (padding atoms to the zero row
 // T), each token to its own
@@ -226,16 +277,23 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt);
     if (const float* b = WfOpt(cp + "s_coupling_cond_2/bias")) addBias(csc, b, T, 2 * Dc + Dt);
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
-    be2Run1d("be2_tokens_to_atoms", RN * Dt, Be2TokensToAtomsArgs{a, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), sq, (u64)N,
-                                                               (uint)T, (uint)Dt, (uint)Dc, (uint)samples, 0.f, 0});
-    copy2d(sq + Dt, (size_t)Dc * 4, q, (size_t)Ca * 4, (size_t)Ca * 4, RN);
+    // (the fast arm on the matrix units: s_to_q SPLIT - couplingSplit - and its row never built)
+    const bool csplit = HALF && COUPLING_SPLIT && gemmTensorOps();
+    if (!csplit) {
+      be2Run1d("be2_tokens_to_atoms", RN * Dt, Be2TokensToAtomsArgs{a, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), sq, (u64)N,
+                                                                 (uint)T, (uint)Dt, (uint)Dc, (uint)samples, 0.f, 0});
+      copy2d(sq + Dt, (size_t)Dc * 4, q, (size_t)Ca * 4, (size_t)Ca * 4, RN);
+    }
     be2Run1d("be2_centre_atoms", RT * Ca, Be2CentreAtomsArgs{q, Iin("token_center_atom_index"), qs, (uint)T, (uint)N, (uint)Ca,
                                                           (uint)Dc, (uint)samples, 0});
     copy2d(qs + Ca, (size_t)Dc * 4, a, (size_t)Dt * 4, (size_t)Dt * 4, RT);
     if (HALF) {      // (the adaLN straight into the fused transition's half input)
       half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
-      adaLn(sq, nullptr, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok, sqh);
-      transitionHalf(sqh, dq, RN, Dc, cp + "s_to_q_mixer/", false);
+      if (csplit) couplingSplit(a, q, cqc, dq, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
+      else {
+        adaLn(sq, nullptr, RN, Dc, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok, sqh);
+        transitionHalf(sqh, dq, RN, Dc, cp + "s_to_q_mixer/", false);
+      }
       adaLn(qs, nullptr, RT, Dc, csc, csc + Dc, 2 * Dc + Dt, maps.tok, qsh);
       transitionHalf(qsh, da, RT, Dc, cp + "q_to_s_mixer/", false);
     } else {

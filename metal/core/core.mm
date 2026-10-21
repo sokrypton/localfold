@@ -704,7 +704,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (and a scaled half output that asks for a float accumulator - the triangle's product, stored small to fit - sums in
   // float, scales, and saturates on the store: halfProductScale)
   const bool scaledHalf = tc_ == F16 && accFloat && a.alpha != 1.f;
-  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192));
+  // (the coupling combine, 32768, reads its product in float: a half tile rounds Z before a sum that cancels)
+  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768));
   const bool tri = a.epilogue & 256;
   const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || scaledHalf) && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
@@ -727,7 +728,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && a.m == 256 && a.n > 128 && !tri && !getenv("LOCALFOLD_GEMM_TILE")) { tm = 32; tn = 256; }
-  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) && (tm == 64 || (tm == 32 && tn == 256)) &&
+  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256 | 32768)) && (tm == 64 || (tm == 32 && tn == 256)) &&
                      a.m % 4 == 0 && !a.ptrs &&
                      al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
@@ -963,6 +964,18 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }     // (f32, in the pairs' interleaved order: a folded norm's)
   gemmRun(F16, F16, F16, a, 1, false, false, "swiglu");
 }
+bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
+                         const float* P, const float* QB) {
+  if (hidden % 8 || !tensorWanted()) return false;
+  GemmArgs a{};
+  a.A = (uint64_t)Wq; a.B = (uint64_t)Xq; a.C = a.D = (uint64_t)gated;
+  a.m = 2 * hidden; a.n = (int)rows; a.k = in; a.lda = 2 * hidden; a.ldb = in; a.ldc = a.ldd = hidden;
+  a.epilogue = 32768; a.alpha = 1.f;
+  a.aux = (uint64_t)stats; a.aux2 = (uint64_t)P; a.aux3 = (uint64_t)QB;
+  gemmRun(F16, F16, F16, a, 1, false, true, "coupling combine");
+  return true;
+}
+bool gemmTensorOps() { return tensorWanted(); }
 bool triQuartersApply(int C) {
   static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
   return reg && C % 32 == 0 && tensorWanted();

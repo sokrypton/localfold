@@ -210,6 +210,61 @@ kernel void be2_ada_ln(LF_ARGS(Be2AdaLnArgs)) {
     if (a.yh) a.yh[row * a.C + c] = (half)v; else a.y[row * a.C + c] = v;
   }
 }
+// the coupling split's statistics and normalised halves (Be2CsTokArgs, Be2CsAtomArgs): webgpu/bioemu2's cs-tstats /
+// cs-xa and cs-astats / cs-xq, the parallel-variance form (never E[x^2] - mu^2)
+kernel void be2_cs_tok(LF_ARGS(Be2CsTokArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  device const float* xr = a.a + row * a.C;
+  float s = 0; for (uint c = lane; c < a.C; c += 32) s += xr[c];
+  const float m = simd_sum(s) / a.C;
+  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = xr[c] - m; v += d * d; }
+  v = simd_sum(v);
+  const float sa = sqrt(v / a.C + 1e-5f);
+  if (lane == 0) { a.tstats[row * 3] = m; a.tstats[row * 3 + 1] = v; a.tstats[row * 3 + 2] = sa; }
+  const uint t = (uint)row - lf_udiv((uint)row, a.T) * a.T;
+  device const float* al = a.cqc + (ulong)t * a.ldc;
+  for (uint c = lane; c < a.C; c += 32) a.xa[row * a.C + c] = (half)((1.f + al[c]) * (xr[c] - m) / sa);
+}
+kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  device const float* xr = a.q + row * a.Ca;
+  float s = 0; for (uint c = lane; c < a.Ca; c += 32) s += xr[c];
+  const float mq = simd_sum(s) / a.Ca;
+  float v = 0; for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
+  const float ssq = simd_sum(v);
+  const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
+  const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
+  float ma = 0, ssa = 0, sa = 0;
+  if (st >= 0) { ma = a.tstats[st * 3]; ssa = a.tstats[st * 3 + 1]; sa = a.tstats[st * 3 + 2]; }
+  const float W = (float)(a.Dt + a.Ca);
+  const float mu = ((float)a.Dt * ma + (float)a.Ca * mq) / W, da = ma - mu, dq = mq - mu;
+  const float var = (ssa + ssq + (float)a.Dt * da * da + (float)a.Ca * dq * dq) / W;
+  const float sq = sqrt(ssq / a.Ca + 1e-5f);
+  const int t = a.atomTok[row];
+  if (lane == 0) {
+    device float* o = a.stats + row * 8;
+    o[0] = rsqrt(var + 1e-5f); o[1] = da; o[2] = dq; o[3] = sq; o[4] = mq; o[5] = sa; o[6] = (float)st; o[7] = (float)t;
+  }
+  device const float* aq = a.cqc + (ulong)t * a.ldc + a.Dt;
+  // (two halves, hi and the remainder: Xq in ONE half cost the split its precision - metal/bioemu2's denoise.mm)
+  for (uint c = lane; c < a.Ca; c += 32) {
+    const float v = (1.f + aq[c]) * (xr[c] - mq) / sq;
+    const half h = (half)v;
+    a.xq[row * 2 * a.Ca + c] = h;
+    a.xq[row * 2 * a.Ca + a.Ca + c] = (half)(v - (float)h);
+  }
+}
+kernel void be2_cs_gamma(LF_ARGS(Be2CsGammaArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  const uint Dc = a.Dt + a.Ca;
+  BE2_SPLIT(i, Dc, t, c);
+  const float al = a.cqc[(ulong)t * a.ldc + c];
+  if (c < a.Dt) a.gA[(ulong)t * a.Dt + c] = 1.f + al; else a.gQ[(ulong)t * a.Ca + c - a.Dt] = 1.f + al;
+  a.beta[i] = a.cqc[(ulong)t * a.ldc + Dc + c];
+}
 kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
   ulong t = LF_INDEX;
   const uint W = 2 * a.I;

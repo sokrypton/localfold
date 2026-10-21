@@ -59,6 +59,10 @@ void transition(const float* x, float* out, size_t rows, int C, const std::strin
                 int ldx = 0);
 // ...on the fast arm, from an input already in half (an adaLN that wrote it so): no norm
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual);
+// (its two halves, for the coupling split: the [C][2I] blocks-of-8 [fc1 | fc2 / 64] weight, and fc3 over the gated
+// product scaled back by 64)
+const half* swigluPairs(const std::string& p, int C, int I);
+void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
 void pairTransition(float* z, size_t rows, int C, const std::string& p);
 // AF3's triangle multiplication on the bundle's layout (leftNormInput, projection / gate [C][2C], centerNorm,

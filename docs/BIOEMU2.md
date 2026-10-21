@@ -186,15 +186,20 @@ process's bytes is what catches it: with the fix removed the heteromer served se
 - Metal: **edm_fkc**, which takes the potentials' gradient back THROUGH the denoiser (cuda/bioemu2's vjp.cuh, the
   denoiser's whole backward) - refused by name, and tools/check-native-worker.py asserts that refusal on a Mac
   (METAL_REFUSALS) rather than skipping the case. edm, edm_gd and edm_fk all fold there.
-- **The coupling split - TAKEN ON WEBGPU, MEASURED AND REVERTED ON METAL.** The coupling's atom-side mixer (fc1 | fc2,
-  ~36% of the sampler) reads the adaLN'd row [a_token (768) | q_atom (128)], so W y splits exactly into a per-TOKEN part
-  plus the 128-wide atom part, the row's LayerNorm statistics combined from the two halves' (the parallel-variance form,
-  not E[x^2] - mu^2, which cancels on a stream with a large mean): 9.25 -> 2.7 G multiply-adds. WebGPU
-  (`couplingSplit`, `false` is the control) reads float32 activations into every GEMM and took it whole: a denoiser
-  call 398 -> 288 ms on an M5, a 68-residue 5-sample fold 84.9 -> 62.3 s, the RMSDs identical. 🔴 METAL STAGES ITS
-  GEMM INPUTS IN HALF, and the atom half's normalised input in half cost the split its precision (each half
-  normalised by its own spread to keep it finite, and still off the shipped arm's band); in float it was 25% SLOWER
-  than unsplit, the traffic taking the FLOPs back. So Metal stays unsplit and GEMM-bound at ~7 TFLOP/s average.
+- **The coupling split - on both, Metal's with Z in its GEMM's epilogue.** The coupling's atom-side mixer (fc1 | fc2,
+  a third of the sampler) reads the adaLN'd row [a_token (768) | q_atom (128)], so W y splits exactly into a per-TOKEN
+  part plus the 128-wide atom part, the row's LayerNorm statistics combined from the two halves' (the parallel-variance
+  form, not E[x^2] - mu^2, which cancels on a stream with a large mean): 9.25 -> 2.7 G multiply-adds. WebGPU
+  (`couplingSplit`, `false` is the control) took it first: a denoiser call 398 -> 288 ms on an M5, a 68-residue
+  5-sample fold 84.9 -> 62.3 s, the RMSDs identical. Metal's first build stored Z and lost: in half its precision, in
+  float 25% of its speed. 🔴 **WHAT MADE IT PAY THERE** (metal/bioemu2's couplingSplit, `BE2_COUPLING_SPLIT=0` the
+  control): Z never leaves the GEMM's float tile - metal/core's `gemmCouplingCombine`, epilogue 32768 on the matrix
+  units, the combine and the SwiGLU in it - and **Xq as TWO halves, hi and the remainder**, against W_q stacked twice
+  (K 128 -> 256, free). Against webgpu/bioemu2's float32 arm (sigma 160 / 16 / 1 / 0.05): unsplit 7.6e-3 / 5.6e-3 /
+  3.3e-3 / 4.0e-5, split with Xq in one half 7.8e-3 / 7.9e-3 / 9.7e-3 / 2.7e-4, with hi | lo **6.9e-3 / 6.1e-3 /
+  3.1e-3 / 3.5e-5** - better than unsplit; Xa in one half costs nothing (hi | lo there moved nothing). The sampler
+  14.5 -> 12.9 s at 68 tokens x 5 samples x 200 steps, the worker gate's BioEmu2 cases at the same RMSDs. Off the
+  matrix units (an M2) Metal keeps the unsplit mixer.
 - **WebGPU's GEMM retiled: `gemm2Source` in webgpu/bioemu2/ops.js**, a 64 x 128 block of 4 x 8 lanes with vec4 panel
   reads (`gemmVersion = 1` is the original, the control; `--gemm=1` on profile-bioemu2.js and dump-bioemu2-stages.js):
   a call 286 -> 266 ms, its stage dumps against metal/bioemu2's `--f32` IDENTICAL to the old kernel's to four digits

@@ -33,6 +33,14 @@ struct Be2AdaLnArgs { CP(float) x; DP(float) y; CP(float) alpha; CP(float) beta;
                       float scale; DP(half) yh; };         // (yh: written in half instead of y)
 // the vendor's fc1 / fc2 [I][C] (torch) as gemmSwiglu's one weight [C][2I]: blocks of 8, a_0..a_7 b_0..b_7 a_8.., b = fc2 / S
 struct Be2SwigluWArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I; float invS; uint pad0; };
+// the coupling's atom-side mixer SPLIT (denoise.mm, couplingSplit): a token row's statistics (mean, centred sum of squares,
+// spread) and Xa = (1 + alpha_a) (a - mean) / spread in half; an atom row's (inv, da, dq, sq, mq, sa, its sample-token
+// row or -1, its conditioning row) and Xq = (1 + alpha_q) (q - mq) / sq as TWO halves, [hi | lo] (Xq ~ hi + lo); gamma (1 + alpha) and beta on the T + 1
+// conditioning rows, for Qa | Qq | B. A simdgroup a row for the first two
+struct Be2CsTokArgs { CP(float) a; CP(float) cqc; DP(float) tstats; DP(half) xa; u64 rows; uint T, C, ldc, pad0; };
+struct Be2CsAtomArgs { CP(float) q; CP(float) tstats; CP(float) cqc; CP(int) tokIdx; CP(int) pad; CP(int) atomTok; DP(float) stats;
+                       DP(half) xq; u64 rows; uint N, T, Ca, Dt, ldc, pad0; };   // (xq [hi | lo])
+struct Be2CsGammaArgs { CP(float) cqc; DP(float) gA; DP(float) gQ; DP(float) beta; u64 n; uint Dt, Ca, ldc, pad0; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };
 struct Be2CentreAtomsArgs { CP(float) atom; CP(int) centre; DP(float) out; uint T, N, C, ldo, samples, pad0; };

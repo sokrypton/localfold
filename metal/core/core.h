@@ -155,6 +155,14 @@ bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, co
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha = 1.f);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
+// BioEmu2's coupling split (metal/bioemu2's couplingSplit): gemmSwiglu's product over the ATOM half of the row only, Xq Wq
+// (Wq: that half's rows of the blocks-of-8 weight), its epilogue (32768, a float tile) the whole row's pre-activations
+// u = inv (sa P[st] + sq Z + da Qa[t] + dq Qq[t]) + B[t] - stats [rows][8] (inv, da, dq, sq, mq, sa, st, t), P [.][2 hidden]
+// a sample-token row's product, QB [.][3][2 hidden] a conditioning row's Qa | Qq | B - and the SwiGLU of them, into
+// gated [rows][hidden] in half. On the matrix units only: false, nothing run
+bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
+                         const float* P, const float* QB);
+bool gemmTensorOps();      // (whether the GEMMs run on the matrix units - Metal 4's tensor operations)
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
 // the matrix units' layout of that weight (and bias): each 128 columns 32 channels' pa, then ga, pb, gb - where
