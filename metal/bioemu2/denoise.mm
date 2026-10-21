@@ -145,9 +145,9 @@ static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
   if (COUPLING_SPLIT >= 0) return COUPLING_SPLIT != 0;
   const double Dc = Dt + Ca, RN = (double)samples * N, RT = (double)samples * T, R = T + 1.0;
   const double unsplit = RN * Dc, split = 2 * R * (Dt + Ca + Dc) + RT * Dt + RN * 2 * Ca;
-  // (measured, 68 tokens x 100 steps on an M5, unsplit / split: 1 sample 2.41 / 2.78 s, 2 3.67 / 3.70, 3 4.94 / 4.68,
-  // 5 8.0 / 7.0 - the ratio below 1.16, 1.60, 1.83, 2.07 there: the line between 2 and 3)
-  static const double margin = getenv("BE2_SPLIT_MARGIN") ? atof(getenv("BE2_SPLIT_MARGIN")) : 1.7;
+  // (measured, 68 tokens x 100 steps on an M5, unsplit / split: 1 sample 2.36 / 2.64 s, 2 3.56 / 3.52 - with the
+  // combine in registers; before it 2 was 3.67 / 3.70 - the ratio below 1.16 and 1.60 there: the line between 1 and 2)
+  static const double margin = getenv("BE2_SPLIT_MARGIN") ? atof(getenv("BE2_SPLIT_MARGIN")) : 1.5;
   return split * margin < unsplit;
 }
 static void couplingSplit(const float* a, const float* q, const float* cqc, float* dq, const int* atomTok, int samples, int T, int N,

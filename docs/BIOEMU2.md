@@ -201,8 +201,8 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   14.5 -> 12.9 s at 68 tokens x 5 samples x 200 steps, the worker gate's BioEmu2 cases at the same RMSDs. Off the
   matrix units (an M2) Metal keeps the unsplit mixer. 🔴 **AND IT IS CHOSEN PER CALL**: Qa | Qq | B is a cost a layer
   that the samples do not share out, so at ONE sample the split LOSES (2.41 -> 2.78 s at 100 steps), ties at two and
-  wins from three (4.94 -> 4.68; five 8.0 -> 7.0). `splitPays` compares multiply-adds with a margin of 1.7 fitted to
-  those; `BE2_COUPLING_SPLIT=0/1` forces either arm. Qa | Qq | B themselves run on the matrix units as two half GEMMs
+  wins from three (4.94 -> 4.68; five 8.0 -> 7.0). `splitPays` compares multiply-adds with a margin fitted to those -
+  1.5 since the combine went into registers, when two samples tipped to the split (3.56 -> 3.52); `BE2_COUPLING_SPLIT=0/1` forces either arm. Qa | Qq | B themselves run on the matrix units as two half GEMMs
   (hi, then the remainder at beta 1) and the conditioning linears take their bias in the epilogue: 12.86 -> 12.75 s.
   Then two more: R = Qq - Qa / 6 for Qa and Qq (768 da + 128 dq = 0 exactly - one vector fewer, time unmoved), and the
   combine moved from a STAGED float tile (64 x 64, the tile through threadgroup memory) into the vector epilogue's
