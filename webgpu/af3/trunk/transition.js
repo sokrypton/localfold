@@ -733,9 +733,11 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   // `channels` and `channels * factor`. A new caller must make the same check.
   // A 16 x 16 lane grid; each lane owns TM adjacent rows and TN adjacent columns.
   const TM = BM / 16;
+  const MV = TM / 4;
   const TN = BN / 16;
   // The source panel's stride: four words past the block, see above.
   const AS = BM + 4;
+  const AV = AS / 4;
   // 🔴 f16 ARITHMETIC: the panels staged in f16 and a k step's products summed
   // in f16, each step's sums then added into f32 accumulators - so no partial
   // sum in f16 runs past BK products. See VECTOR_GEMM_F16.
@@ -750,17 +752,18 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const stores = [];
   const reads = [];
   const flush = [];
-  for (let i = 0; i < TM; i += 1) reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * ${TM}u + ${i}u];`);
+  for (let v = 0; v < MV; v += 1) reads.push(`      let a_vec_${v} = a_tile[k * ${AV}u + ty * ${MV}u + ${v}u];`);
   for (let j = 0; j < TN / 4; j += 1) reads.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TN / 4}u + ${j}u];`);
   for (let i = 0; i < TM; i += 1) {
+    const ai = `a_vec_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
     for (let j = 0; j < TN / 4; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
         accumulators.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        multiply.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
+        multiply.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
         flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
       } else {
-        multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+        multiply.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
       }
       for (let c = 0; c < 4; c += 1) {
         const value = `acc_${i}_${j}.${"xyzw"[c]}`;
@@ -787,7 +790,7 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
 const BM: u32 = ${BM}u;
 const BN: u32 = ${BN}u;
 const BK: u32 = ${BK}u;
-var<workgroup> a_tile: array<${T}, ${AS * BK}>;
+var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 ${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
 fn gated(at: u32) -> f32 {
@@ -804,13 +807,16 @@ ${accumulators.join("\n")}
   for (var k0 = 0u; k0 < parameters.inner; k0 += BK) {
     // The source panel, k-major so a row's reads broadcast; a zero past the
     // last row so the tail block computes nothing it stores.
-    for (var e = li; e < BM * BK; e += 256u) {
-      let m = e / BK;
+    for (var e = li; e < (BM / 4u) * BK; e += 256u) {
+      let mg = e / BK;
       let k = k0 + e % BK;
-      let row = row_origin + m;
-      var value = ${T}(0.0);
-      if (row < parameters.rows) { value = ${load}; }
-      a_tile[(e % BK) * ${AS}u + m] = value;
+      let r0 = row_origin + mg * 4u;
+      var value = vec4<${T}>(0.0);
+      if (r0 < parameters.rows) { let row = r0; value.x = ${load}; }
+      if (r0 + 1u < parameters.rows) { let row = r0 + 1u; value.y = ${load}; }
+      if (r0 + 2u < parameters.rows) { let row = r0 + 2u; value.z = ${load}; }
+      if (r0 + 3u < parameters.rows) { let row = r0 + 3u; value.w = ${load}; }
+      a_tile[(e % BK) * ${AV}u + mg] = value;
     }
     for (var e = li; e < BK * BN / 4u; e += 256u) {
       let k = k0 + e / ${BN / 4}u;

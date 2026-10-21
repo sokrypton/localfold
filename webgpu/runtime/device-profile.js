@@ -314,6 +314,15 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 AF2's f32 q/k/v/gate projection's rows a lane, null meaning 4 - an M2's
   // register budget. See selectAttentionProjectKernel.
   attentionProjectRowsPerLane: null,
+  // The f16 vector linear kernel's tile ("lanesXxlanesYxrowsPerLanexcolumnsPerLane"),
+  // where null keeps LINEAR_TILE (8x8x4x4).
+  linearHalfTile: null,
+  // The f16 attention output projection's tile ("lanesXxlanesYxrowsPerLanexcolumnsPerLane"),
+  // where null keeps ATTENTION_OUTPUT_TILE_F16 (8x8x4x4).
+  attentionOutputHalfTile: null,
+  // The f16 q/k/v/gate projection's tile ("lanesXxlanesYxrowsPerLanexcolumnsPerLane"),
+  // where null keeps ATTENTION_PROJECT_TILE_F16 (8x8x4x4).
+  attentionProjectHalfTile: null,
   // 🔴 AF2's OPM output projection and sequence contraction as vector GEMMs
   // where there are no matrix units - null meaning YES, `false` the old
   // per-pair kernels. Bit-identical either way, and on by default because what
@@ -1312,6 +1321,9 @@ const PRIORS = new Map([
     // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
     // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
     vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
+    linearHalfTile: "16x16x4x8",
+    attentionOutputHalfTile: "16x16x4x8",
+    attentionProjectHalfTile: "16x16x4x2",
     // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
     // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
     // row 128 x 255 6.13 -> 5.05 ms, column 128 x 255 3.18 -> 2.55, column 512 x 255 48.4 -> 38.9, triangle 255 x 255

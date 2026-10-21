@@ -362,7 +362,18 @@ export class AlphaFoldFixture {
       ]);
       const root = "msa_column_global_attention";
       const attention = `${root}/attention`;
-      const parameter = (module, name) => this.#parameter(parameters, module, name, block, blocks);
+      const globalAttention = await this.#gather(parameters, block, blocks, [
+        ["queryNormScale", `${root}/query_norm`, "scale"],
+        ["queryNormOffset", `${root}/query_norm`, "offset"],
+        ["queryWeight", attention, "query_w"],
+        ["keyWeight", attention, "key_w"],
+        ["valueWeight", attention, "value_w"],
+        ["gatingWeight", attention, "gating_w"],
+        ["gatingBias", attention, "gating_b"],
+        ["outputWeight", attention, "output_w"],
+        ["outputBias", attention, "output_b"],
+      ]);
+      globalAttention.heads = this.#parameterShape(parameters, attention, "gating_b", true)[0];
       result.push({
         ...pairWeights[block],
         msaRowAttention: {
@@ -372,15 +383,7 @@ export class AlphaFoldFixture {
           get pairLayerNormOffset() { return rowPairBias.layerNormOffset; },
           get pairProjectionWeight() { return rowPairBias.projectionWeight; },
         },
-        msaColumnGlobalAttention: {
-          queryNormScale: await parameter(`${root}/query_norm`, "scale"),
-          queryNormOffset: await parameter(`${root}/query_norm`, "offset"),
-          queryWeight: await parameter(attention, "query_w"), keyWeight: await parameter(attention, "key_w"),
-          valueWeight: await parameter(attention, "value_w"), gatingWeight: await parameter(attention, "gating_w"),
-          gatingBias: await parameter(attention, "gating_b"), outputWeight: await parameter(attention, "output_w"),
-          outputBias: await parameter(attention, "output_b"),
-          heads: this.#parameterShape(parameters, attention, "gating_b", true)[0],
-        },
+        msaColumnGlobalAttention: globalAttention,
         msaTransition: await this.#transition(parameters, "msa_transition", block, blocks),
       });
     }

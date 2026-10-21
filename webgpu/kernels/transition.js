@@ -106,6 +106,29 @@ export const LINEAR_TILE_SQUARE = Object.freeze({
 export const linearTileRows = (tile = LINEAR_TILE) => tile.lanesY * tile.rowsPerLane;
 export const linearTileColumns = (tile = LINEAR_TILE) => tile.lanesX * tile.columnsPerLane;
 
+const HALF_TILE_CACHE = new Map();
+function parseLinearHalfTile(spec) {
+  if (!spec) return null;
+  let tile = HALF_TILE_CACHE.get(spec);
+  if (tile) return tile;
+  const [lanesX, lanesY, rowsPerLane, columnsPerLane] = String(spec).split("x").map(Number);
+  if (![lanesX, lanesY, rowsPerLane, columnsPerLane].every((v) => Number.isInteger(v) && v > 0)) {
+    return null;
+  }
+  tile = Object.freeze({ lanesX, lanesY, rowsPerLane, columnsPerLane });
+  HALF_TILE_CACHE.set(spec, tile);
+  return tile;
+}
+function chooseLinearHalfTile({ rows, columns, device }) {
+  let custom = device !== undefined ? parseLinearHalfTile(deviceTuning(device).linearHalfTile) : null;
+  if (!custom) return LINEAR_TILE;
+  if (columns < linearTileColumns(custom) && custom.columnsPerLane >= 8) {
+    custom = parseLinearHalfTile(`${custom.lanesX}x${custom.lanesY}x${custom.rowsPerLane}x4`) ?? custom;
+  }
+  const groups = Math.ceil(rows / linearTileRows(custom)) * Math.ceil(columns / linearTileColumns(custom));
+  return groups >= 64 ? custom : LINEAR_TILE;
+}
+
 /**
  * Which of the two tiles a dispatch of this shape wants.
  *
@@ -312,7 +335,7 @@ export function chooseLinearKernel({ rows, columns, inner, device, requested = "
     if (device?.features?.has("shader-f16") !== true) {
       throw new Error("the f16 linear kernel requires the shader-f16 feature");
     }
-    return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
+    return { tile: chooseLinearHalfTile({ rows, columns, device }), precision: "f16", weightPrecision: "f16" };
   }
   if (halfPrecisionAvailable(device) && narrow >= 128) {
     // 🔴 THE WEIGHT BUFFER NARROWS WITH THE k LOOP, and it is a separate win
@@ -322,7 +345,7 @@ export function chooseLinearKernel({ rows, columns, inner, device, requested = "
     // 4.338 -> 3.675 the k loop already bought (bench-evoformer-linear.js at
     // 8192 rows), and 13.50 -> 12.24 on the second half. It also halves what
     // AF2 uploads per block, which it does on every pass of every recycle.
-    return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
+    return { tile: chooseLinearHalfTile({ rows, columns, device }), precision: "f16", weightPrecision: "f16" };
   }
   return { tile: chooseLinearTile({ rows, columns, device }), precision: "f32", weightPrecision: "f32" };
 }

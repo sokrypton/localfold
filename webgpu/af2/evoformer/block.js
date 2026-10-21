@@ -304,6 +304,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
  * loops want constant bounds - see CLAUDE.md on what a runtime trip count costs
  * in a short body. The shape is in the pipeline cache key.
  */
+export const GLOBAL_ATTENTION_OUTPUT_ROWS = 4;
+
 export function createGlobalAttentionOutputShader(channels, heads, headDim, residual = false) {
   for (const [name, value] of [["channels", channels], ["heads", heads], ["headDim", headDim]]) {
     if (!Number.isSafeInteger(value) || value < 1) {
@@ -322,45 +324,65 @@ const GATES: u32 = ${gates}u;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
-// The row, read once for every gate and every output channel that wants it.
-var<workgroup> staged: array<f32, ${channels}>;
-// ...and the gated value per (head, head_dim), which is what the projection
-// contracts over. Computed once instead of once per output channel.
-var<workgroup> gated: array<f32, ${gates}>;
+// Four rows per workgroup, read once for every gate and every output channel.
+var<workgroup> staged: array<vec4<f32>, ${channels}>;
+// ...and the gated value per (head, head_dim), four rows at a time.
+var<workgroup> gated: array<vec4<f32>, ${gates}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.sequences * p.length) { return; }
+  let total_rows = p.sequences * p.length;
+  let r0 = (group.x + group.y * GRID_WIDTH) * ${GLOBAL_ATTENTION_OUTPUT_ROWS}u;
+  if (r0 >= total_rows) { return; }
+  let r1 = r0 + 1u;
+  let r2 = r0 + 2u;
+  let r3 = r0 + 3u;
   let local = local_id.x;
-  let column = row % p.length;
-  let sequence = row / p.length;
+  let col0 = r0 % p.length; let seq0 = r0 / p.length;
+  let col1 = r1 % p.length; let seq1 = r1 / p.length;
+  let col2 = r2 % p.length; let seq2 = r2 / p.length;
+  let col3 = r3 % p.length; let seq3 = r3 / p.length;
   // ...the normalised tensor is column-major; see the query kernel.
-  let normalized_row = column * p.sequences + sequence;
+  let nr0 = (col0 * p.sequences + seq0) * ${channels}u;
+  let nr1 = (col1 * p.sequences + seq1) * ${channels}u;
+  let nr2 = (col2 * p.sequences + seq2) * ${channels}u;
+  let nr3 = (col3 * p.sequences + seq3) * ${channels}u;
 
-  for (var c = local; c < CHANNELS; c += 64u) {
-    staged[c] = normalized[normalized_row * CHANNELS + c];
+  for (var c = local; c < ${channels}u; c += 64u) {
+    staged[c] = vec4<f32>(
+      normalized[nr0 + c],
+      select(0.0, normalized[nr1 + c], r1 < total_rows),
+      select(0.0, normalized[nr2 + c], r2 < total_rows),
+      select(0.0, normalized[nr3 + c], r3 < total_rows),
+    );
   }
   workgroupBarrier();
 
-  for (var slot = local; slot < GATES; slot += 64u) {
-    let head = slot / ${headDim}u;
-    let d = slot % ${headDim}u;
-    var gate = weights[p.gating_bias + slot];
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      gate += staged[c] * weights[p.gating_weight + (c * p.heads + head) * p.head_dim + d];
+  for (var slot = local; slot < ${gates}u; slot += 64u) {
+    var gate = vec4<f32>(weights[p.gating_bias + slot]);
+    for (var c = 0u; c < ${channels}u; c += 1u) {
+      gate += staged[c] * weights[p.gating_weight + c * ${gates}u + slot];
     }
-    gated[slot] = attended[(column * p.heads + head) * p.head_dim + d] / (1.0 + exp(-gate));
+    let att = vec4<f32>(
+      attended[col0 * ${gates}u + slot],
+      select(0.0, attended[col1 * ${gates}u + slot], r1 < total_rows),
+      select(0.0, attended[col2 * ${gates}u + slot], r2 < total_rows),
+      select(0.0, attended[col3 * ${gates}u + slot], r3 < total_rows),
+    );
+    gated[slot] = att / (vec4<f32>(1.0) + exp(-gate));
   }
   workgroupBarrier();
 
-  for (var c_out = local; c_out < CHANNELS; c_out += 64u) {
-    var result = weights[p.output_bias + c_out];
-    for (var slot = 0u; slot < GATES; slot += 1u) {
-      result += gated[slot] * weights[p.output_weight + slot * CHANNELS + c_out];
+  for (var c_out = local; c_out < ${channels}u; c_out += 64u) {
+    var result = vec4<f32>(weights[p.output_bias + c_out]);
+    for (var slot = 0u; slot < ${gates}u; slot += 1u) {
+      result += gated[slot] * weights[p.output_weight + slot * ${channels}u + c_out];
     }
-    output[row * CHANNELS + c_out] ${residual ? "+=" : "="} result;
+    output[r0 * ${channels}u + c_out] ${residual ? "+=" : "="} result.x;
+    if (r1 < total_rows) { output[r1 * ${channels}u + c_out] ${residual ? "+=" : "="} result.y; }
+    if (r2 < total_rows) { output[r2 * ${channels}u + c_out] ${residual ? "+=" : "="} result.z; }
+    if (r3 < total_rows) { output[r3 * ${channels}u + c_out] ${residual ? "+=" : "="} result.w; }
   }
 }`;
 }
@@ -429,7 +451,7 @@ async function encodeTransition(
   // The geometry is part of the shader, so it is part of the key - a matrix
   // pipeline handed to a vector dispatch is the corruption the note above is
   // about.
-  const key = `${precision}:${weightPrecision}:${tileColumns}:${hiddenStorage}`
+  const key = `${precision}:${weightPrecision}:${tileRows}x${tileColumns}x${tile.lanesY}:${hiddenStorage}`
     + `:${matrix ? `m${matrix.blockRows}x${matrix.blockColumns}x${matrix.blockInner}`
       + `x${matrix.subgroupRows}x${matrix.subgroupColumns}${matrix.vectorStaging ? "v" : ""}` : "t"}`;
   // 🔴 GENERATED ONCE, NOT ONCE A BLOCK A RECYCLE. These three sources are a
@@ -608,7 +630,7 @@ async function encodeAttention(
       execution.device.limits?.maxComputeWorkgroupStorageSize ?? 49152);
   const outputKernel = selectAttentionOutputKernel(
     execution.device, options.residualTarget !== undefined,
-    options.outputPrecision ?? "auto", projectedStorage);
+    options.outputPrecision ?? "auto", projectedStorage, options.channels);
   // ...and the output projection, which is the same operation one kernel later
   // and the plainest GEMM in AF2 - no interleave, no group, no gate, and the
   // one thing a plain projection lacks: the column attention's TRANSPOSED
@@ -845,14 +867,22 @@ async function encodeGlobalAttention(
   residualTarget,
 ) {
   const w = weightsValue;
-  const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
-    w.gatingWeight, w.gatingBias, w.outputWeight, w.outputBias];
-  const offsets = [];
-  let size = 0;
-  for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
-  const packed = new Float32Array(size);
-  tensors.forEach((tensor, index) => packed.set(tensor, offsets[index]));
-  const headDim = w.gatingBias.length / w.heads;
+  const order = [
+    "queryNormScale", "queryNormOffset", "queryWeight", "keyWeight", "valueWeight",
+    "gatingWeight", "gatingBias", "outputWeight", "outputBias",
+  ];
+  const { weights, offsets } = await execution.uploadResidentPacked(
+    `${label}.weights`, w, () => {
+      const tensors = order.map((name) => w[name]);
+      const tensorOffsets = [];
+      let size = 0;
+      for (const tensor of tensors) { tensorOffsets.push(size); size += tensor.length; }
+      const data = new Float32Array(size);
+      tensors.forEach((tensor, index) => data.set(tensor, tensorOffsets[index]));
+      return { data, offsets: tensorOffsets };
+    }, "", { sources: w[SOURCES], order, precision: "f32" },
+  );
+  const headDim = (w[SOURCES]?.gatingBias?.count ?? w.gatingBias.length) / w.heads;
   const params = new Uint32Array([
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2], offsets[3], offsets[4], offsets[5], offsets[6], offsets[7], offsets[8],
@@ -877,7 +907,6 @@ async function encodeGlobalAttention(
   // Everything above is pure derivation plus the resident weight upload, which
   // is cached and needed either way; everything below touches the encoder.
   if (execution.warming) return undefined;
-  const weights = execution.upload(`${label}.weights`, packed);
   const parameters = uniform(execution, `${label}.parameters`, params);
   const normParameters = uniform(execution, `${label}.norm-parameters`, createAttentionNormParameters(
     shape.length * shape.sequences, shape.cM, offsets[0], offsets[1], true,
@@ -900,8 +929,8 @@ async function encodeGlobalAttention(
     shape.length, 1, 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  // ...ONE WORKGROUP A ROW now, not one thread an element; see the kernel.
-  const outputRows = shape.sequences * shape.length;
+  // ...FOUR ROWS A WORKGROUP now, not one thread an element; see the kernel.
+  const outputRows = Math.ceil((shape.sequences * shape.length) / GLOBAL_ATTENTION_OUTPUT_ROWS);
   const outputGrid = execution.rowGrid(outputRows);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);

@@ -557,12 +557,16 @@ export function selectAttentionProjectKernel(
   // stock flags, AF2's 128 x 255 x 256 projection: 4x2 1.912 ms, 8x2 1.375,
   // 8x3 1.512, 8x1 1.513, 8x4 1.650 - bitwise identical. null keeps 4.
   const rowsPerLane = deviceTuning(device)?.attentionProjectRowsPerLane ?? null;
-  const tile = precision === "f16" ? ATTENTION_PROJECT_TILE_F16
+  const customHalfTile = precision === "f16" && device !== undefined
+    ? parseAttentionOutputHalfTile(deviceTuning(device)?.attentionProjectHalfTile)
+    : null;
+  const tile = precision === "f16" ? (customHalfTile ?? ATTENTION_PROJECT_TILE_F16)
     : rowsPerLane === null ? ATTENTION_PROJECT_TILE
       : { ...ATTENTION_PROJECT_TILE, rowsPerLane };
   const cacheKey = `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
     + (valueStorage === outputStorage ? "" : `-value${valueStorage}`)
-    + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`;
+    + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`
+    + `${tile.lanesY !== 8 ? `x${tile.lanesY}` : ""}`;
   return {
     precision, tile,
     // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
@@ -2335,17 +2339,42 @@ export const ATTENTION_OUTPUT_TILE_F16 = {
   lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
 };
 
+const ATTENTION_OUTPUT_TILE_CACHE = new Map();
+function parseAttentionOutputHalfTile(spec) {
+  if (!spec) return null;
+  let tile = ATTENTION_OUTPUT_TILE_CACHE.get(spec);
+  if (tile) return tile;
+  const [lanesX, lanesY, rowsPerLane, columnsPerLane] = String(spec).split("x").map(Number);
+  if (![lanesX, lanesY, rowsPerLane, columnsPerLane].every((v) => Number.isInteger(v) && v > 0)) {
+    return null;
+  }
+  tile = Object.freeze({ lanesX, lanesY, rowsPerLane, columnsPerLane });
+  ATTENTION_OUTPUT_TILE_CACHE.set(spec, tile);
+  return tile;
+}
+
 export function selectAttentionOutputKernel(
-  device, residual, requested = "auto", sourceStorage = "f32",
+  device, residual, requested = "auto", sourceStorage = "f32", channels = undefined,
 ) {
   const precision = requested !== "auto" ? requested
     : halfPrecisionAvailable(device) ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
     throw new Error("the f16 attention output projection requires the shader-f16 feature");
   }
-  const tile = precision === "f16" ? ATTENTION_OUTPUT_TILE_F16 : ATTENTION_OUTPUT_TILE;
+  let customHalfTile = precision === "f16" && device !== undefined
+    ? parseAttentionOutputHalfTile(deviceTuning(device).attentionOutputHalfTile)
+    : null;
+  if (customHalfTile && channels !== undefined
+      && channels < attentionOutputTileColumns(customHalfTile)
+      && customHalfTile.columnsPerLane >= 8) {
+    customHalfTile = parseAttentionOutputHalfTile(
+      `${customHalfTile.lanesX}x${customHalfTile.lanesY}x${customHalfTile.rowsPerLane}x4`,
+    ) ?? customHalfTile;
+  }
+  const tile = precision === "f16" ? (customHalfTile ?? ATTENTION_OUTPUT_TILE_F16) : ATTENTION_OUTPUT_TILE;
   const cacheKey = `block:attention:output${residual ? "-residual" : ""}:${precision}:${sourceStorage}`
-    + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`;
+    + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`
+    + `${tile.lanesY !== 8 ? `x${tile.lanesY}` : ""}`;
   return {
     precision, tile,
     // The tile is in the key with the precision: the dispatch divides by it.
@@ -2400,7 +2429,7 @@ export class AttentionGpu {
     const projectKernel = selectAttentionProjectKernel(
       this.device, this.options.projectPrecision ?? "auto", "f32", projectedStorage, valueStorage);
     const outputKernel = selectAttentionOutputKernel(
-      this.device, false, this.options.outputPrecision ?? "auto", weightedStorage);
+      this.device, false, this.options.outputPrecision ?? "auto", weightedStorage, input.channels);
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get(projectKernel.cacheKey, projectKernel.shader),

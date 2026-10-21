@@ -84,6 +84,7 @@ import { WebGpuExecution } from "../../runtime/execution.js";
 import { shapedKnob } from "../../runtime/device-profile.js";
 import {
   createGlobalAttentionFlashShader, GLOBAL_ATTENTION_KV_SHADER,
+  GLOBAL_ATTENTION_OUTPUT_ROWS,
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
@@ -174,10 +175,11 @@ async function encodeTransition(
   // rows: correct, and redundant by the ratio. It measured as a 3.2x regression
   // on the transitions before this line existed. See docs/A100.md.
   const tileRows = linearKernelRows({ tile, matrix });
+  const key = `${precision}:${weightPrecision}:${tileRows}x${tileColumns}x${tile.lanesY}:f32:${geometryKey}`;
   // Generated once per device, not once a block a recycle; see
   // webgpu/runtime/shader-source-cache.js and the monomer path's note.
   const shaders = shaderSourceSet(execution.device,
-    `multimer:transition:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`
+    `multimer:transition:${key}`
     + `:${descriptor.rows}:${descriptor.channels}:${descriptor.hiddenChannels}`
     + `:${descriptor.epsilon}:${JSON.stringify(packedOffsets)}`,
     () => createTransitionShaders(
@@ -191,11 +193,8 @@ async function encodeTransition(
   // shaders here are the f32 ones.
   const [normalize, linear, linearResidual] = await Promise.all([
     execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
-    execution.pipelines.get(
-      `block:transition:linear:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`, shaders[1]),
-    execution.pipelines.get(
-      `block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`,
-      shaders[3]),
+    execution.pipelines.get(`block:transition:linear:${key}`, shaders[1]),
+    execution.pipelines.get(`block:transition:linear-residual:${key}`, shaders[3]),
   ]);
   // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
   // operation's PIPELINES built and nothing encoded - see Execution.warm, and
@@ -314,7 +313,7 @@ async function encodeAttention(
     execution.device, options.projectPrecision ?? "auto");
   const outputKernel = selectAttentionOutputKernel(
     execution.device, options.residualTarget !== undefined,
-    options.outputPrecision ?? "auto");
+    options.outputPrecision ?? "auto", "f32", options.channels);
   // 🔴 AND THE MULTIMER'S TARGETS ARE ALL f32, which is the SIMPLER of the two
   // matrix-projection paths - the monomer's flash kernel reads q/k/v/gate
   // packed and needs the eight-column group that owns both halves of a word.
@@ -451,14 +450,22 @@ async function encodeGlobalAttention(
   residualTarget,
 ) {
   const w = weightsValue;
-  const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
-    w.gatingWeight, w.gatingBias, w.outputWeight, w.outputBias];
-  const offsets = [];
-  let size = 0;
-  for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
-  const packed = new Float32Array(size);
-  tensors.forEach((tensor, index) => packed.set(tensor, offsets[index]));
-  const headDim = w.gatingBias.length / w.heads;
+  const order = [
+    "queryNormScale", "queryNormOffset", "queryWeight", "keyWeight", "valueWeight",
+    "gatingWeight", "gatingBias", "outputWeight", "outputBias",
+  ];
+  const { weights, offsets } = await execution.uploadResidentPacked(
+    `${label}.weights`, w, () => {
+      const tensors = order.map((name) => w[name]);
+      const tensorOffsets = [];
+      let size = 0;
+      for (const tensor of tensors) { tensorOffsets.push(size); size += tensor.length; }
+      const data = new Float32Array(size);
+      tensors.forEach((tensor, index) => data.set(tensor, tensorOffsets[index]));
+      return { data, offsets: tensorOffsets };
+    }, "", { sources: w[SOURCES], order, precision: "f32" },
+  );
+  const headDim = (w[SOURCES]?.gatingBias?.count ?? w.gatingBias.length) / w.heads;
   const params = new Uint32Array([
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2], offsets[3], offsets[4], offsets[5], offsets[6], offsets[7], offsets[8],
@@ -481,7 +488,6 @@ async function encodeGlobalAttention(
   // Everything above is pure derivation plus the resident weight upload, which
   // is cached and needed either way; everything below touches the encoder.
   if (execution.warming) return undefined;
-  const weights = execution.upload(`${label}.weights`, packed);
   const parameters = uniform(execution, `${label}.parameters`, params);
   const normParameters = uniform(execution, `${label}.norm-parameters`, createAttentionNormParameters(
     shape.length * shape.sequences, shape.cM, offsets[0], offsets[1], true,
@@ -499,13 +505,13 @@ async function encodeGlobalAttention(
   let grid = execution.linearGrid(shape.length * shape.sequences * headDim);
   execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
     grid[0], grid[1], 1, `${label}.kv`);
-  // ...ONE WORKGROUP A COLUMN, and one a row for the output; see the two
+  // ...ONE WORKGROUP A COLUMN, and four rows a workgroup for the output; see the two
   // generators in webgpu/af2/evoformer/block.js.
   execution.dispatch(encoder, queryPipeline, [normalized, mask, weights, parameters, query],
     shape.length, 1, 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  const outputGrid = execution.rowGrid(shape.sequences * shape.length);
+  const outputGrid = execution.rowGrid(Math.ceil((shape.sequences * shape.length) / GLOBAL_ATTENTION_OUTPUT_ROWS));
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);
   return output;
