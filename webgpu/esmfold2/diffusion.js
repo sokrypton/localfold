@@ -228,6 +228,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createTokenAttentionShader({ tokens, channels, heads }) {
   const headDim = channels / heads;
+  const vecDim = headDim / 4;
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> kv: array<f32>;
@@ -263,9 +264,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     if (j < ${tokens}u) {
       var total = 0.0;
       let key_base = j * ${channels * 2}u + head * ${headDim}u;
-      for (var d = 0u; d < ${headDim}u; d += 1u) {
+${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
+  const d0 = v * 4;
+  return `      total += staged_query[${d0}u] * kv[key_base + ${d0}u]
+             + staged_query[${d0 + 1}u] * kv[key_base + ${d0 + 1}u]
+             + staged_query[${d0 + 2}u] * kv[key_base + ${d0 + 2}u]
+             + staged_query[${d0 + 3}u] * kv[key_base + ${d0 + 3}u];`;
+}).join("\n") : `      for (var d = 0u; d < ${headDim}u; d += 1u) {
         total += staged_query[d] * kv[key_base + d];
-      }
+      }`}
       logit = total * ${(1 / Math.sqrt(headDim)).toFixed(10)}
         + bias[(bias_row + j) * ${heads}u + head];
     }
@@ -295,10 +302,20 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     workgroupBarrier();
     for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
       var total = 0.0;
-      for (var u = 0u; u < ${LANES}u; u += 1u) {
-        let key = block + u;
-        if (key >= ${tokens}u) { break; }
-        total += logits[u] * kv[key * ${channels * 2}u + ${channels}u + head * ${headDim}u + d];
+      let val_col = ${channels}u + head * ${headDim}u + d;
+      if (block + ${LANES}u <= ${tokens}u) {
+        for (var u = 0u; u < ${LANES}u; u += 4u) {
+          total += logits[u] * kv[(block + u) * ${channels * 2}u + val_col]
+                 + logits[u + 1u] * kv[(block + u + 1u) * ${channels * 2}u + val_col]
+                 + logits[u + 2u] * kv[(block + u + 2u) * ${channels * 2}u + val_col]
+                 + logits[u + 3u] * kv[(block + u + 3u) * ${channels * 2}u + val_col];
+        }
+      } else {
+        for (var u = 0u; u < ${LANES}u; u += 1u) {
+          let key = block + u;
+          if (key >= ${tokens}u) { break; }
+          total += logits[u] * kv[key * ${channels * 2}u + val_col];
+        }
       }
       accumulator[d] = accumulator[d] * rescale + total;
     }
@@ -587,13 +604,17 @@ export class Esmfold2DenoiserGpu {
   // loops pass `false` and drain once, before the release that needs it.
   async #now(label, passes, wait = true) {
     const encoder = this.device.createCommandEncoder({ label });
+    const batch = deviceTuning(this.device).batchComputePasses !== false;
+    let openPass = null;
     for (const [name, pipeline, buffers, x, y] of passes) {
-      const pass = encoder.beginComputePass({ label: name });
+      const pass = batch ? (openPass ??= encoder.beginComputePass({ label }))
+        : encoder.beginComputePass({ label: `${label}.${name}` });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.#bind(pipeline, buffers));
       pass.dispatchWorkgroups(x, y ?? 1, 1);
-      pass.end();
+      if (!batch) pass.end();
     }
+    if (openPass !== null) openPass.end();
     this.device.queue.submit([encoder.finish()]);
     if (wait) await this.device.queue.onSubmittedWorkDone();
   }
@@ -661,24 +682,25 @@ export class Esmfold2DenoiserGpu {
         createLayerNormShader({ rows: tokens, channels: tokenChannels }, true, epsilon)),
       normScaleOnly: get("token-norm-scale",
         createLayerNormShader({ rows: tokens, channels: tokenChannels }, false, epsilon)),
-      // ...these five read the narrowed weights; every other pipeline here
+      // ...these read the narrowed weights; every other pipeline here
       // reads a norm, a bias or an atom stack's tensor and stays f32.
-      wide: get("wide",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
-                           false, weightPrecision, false, rowTile)),
-      square: get("square",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
-                           false, weightPrecision, false, rowTile)),
       squareResidual: get("square-residual",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
                            true, weightPrecision, false, rowTile)),
-      narrow: get("narrow",
-        createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels },
-                           false, weightPrecision, false, rowTile)),
-      swishWide: get("swish-wide",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden * 2 },
-                           false, weightPrecision, false, rowTile)),
-      ...(kSplits === 1 ? {} : {
+      ...(kSplits === 1 ? {
+        wide: get("wide",
+          createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
+                             false, weightPrecision, false, rowTile)),
+        square: get("square",
+          createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
+                             false, weightPrecision, false, rowTile)),
+        narrow: get("narrow",
+          createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels },
+                             false, weightPrecision, false, rowTile)),
+        swiglu: get("swiglu",
+          createSwigluShader({ rows: tokens, model: tokenChannels, ffn: hidden },
+                             weightPrecision)),
+      } : {
         wideSplit: get("wide-split", createLinearShader({ rows: tokens, inner: tokenChannels,
           outer: hidden }, false, weightPrecision, false, rowTile, 4, kSplits)),
         squareSplit: get("square-split", createLinearShader({ rows: tokens, inner: tokenChannels,
@@ -703,9 +725,6 @@ export class Esmfold2DenoiserGpu {
       sigmoidGate: get("sigmoid-gate", createSigmoidGateShader(tokens * tokenChannels)),
       gatedAdd: get("gated-add",
         createGatedAddShader({ rows: tokens, channels: tokenChannels })),
-      swiglu: get("swiglu",
-        createSwigluShader({ rows: tokens, model: tokenChannels, ffn: hidden },
-                           weightPrecision)),
       tokenToAtom: get("token-to-atom",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: atomChannels }, false)),
       coordsProject: get("coords",
@@ -1380,17 +1399,21 @@ export class Esmfold2DenoiserGpu {
       noiseEmbedding(tHat, sigmaData, this.weights.conditioning, tokenChannels));
 
     const encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
+    const batch = deviceTuning(this.device).batchComputePasses !== false;
+    let pass = null;
     for (const step of this.program) {
       if (step.kind === "copy") {
+        if (pass !== null) { pass.end(); pass = null; }
         encoder.copyBufferToBuffer(step.from.buffer, 0, step.to.buffer, 0, step.bytes);
         continue;
       }
-      const pass = encoder.beginComputePass({ label: step.label });
+      if (pass === null) pass = encoder.beginComputePass({ label: step.label });
       pass.setPipeline(step.pipeline);
       pass.setBindGroup(0, step.bindGroup);
       pass.dispatchWorkgroups(step.x, step.y, step.z ?? 1);
-      pass.end();
+      if (!batch) { pass.end(); pass = null; }
     }
+    if (pass !== null) pass.end();
     encoder.copyBufferToBuffer(b.update.buffer, 0, b.readback.buffer, 0, atoms * 3 * 4);
     this.device.queue.submit([encoder.finish()]);
     await b.readback.buffer.mapAsync(GPUMapMode.READ);

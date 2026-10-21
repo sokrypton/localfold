@@ -95,8 +95,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let share = weight[0];
   for (var o = local.x; o < ${pair}u; o += ${LANES}u) {
     var sum = 0.0;
-    for (var i = 0u; i < ${model}u; i += 1u) {
-      sum += row_values[i] * projection[i * ${pair}u + o];
+    for (var i = 0u; i < ${model}u; i += ${model % 8 === 0 ? 8 : 1}u) {
+${Array.from({ length: model % 8 === 0 ? 8 : 1 }, (_, u) =>
+  `      sum += row_values[i + ${u}u] * projection[(i + ${u}u) * ${pair}u + o];`).join("\n")}
     }
     accumulator[row * ${pair}u + o] += share * sum;
   }
@@ -326,9 +327,9 @@ export class EsmcTowerGpu {
       finalNormPipeline, singlePipeline] = await Promise.all([
       pipeline(`esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon)),
-      pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:rt${rowTile}`,
+      qkvSplits === 1 ? pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: model, outer: 3 * model }, false,
-          weightPrecision, false, rowTile)),
+          weightPrecision, false, rowTile)) : null,
       pipeline(`esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase)),
       // 🔴 CHAIN-AWARE IS PART OF THE CACHE KEY, NOT JUST OF THE BINDINGS. The
@@ -337,14 +338,14 @@ export class EsmcTowerGpu {
       // monomer's pipeline and quietly let the chains attend to each other.
       pipeline(`esmc-attend:${rows}:${model}:${heads}:${sequenceId === undefined ? "flat" : "chains"}`,
         createAttentionShader({ rows, model, heads }, QUERY_TILE, sequenceId !== undefined)),
-      pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:rt${rowTile}`,
+      modelSplits === 1 ? pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: model, outer: model }, true,
-          weightPrecision, false, rowTile)),
-      pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
-        createSwigluShader({ rows, model, ffn }, weightPrecision)),
-      pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:rt${rowTile}`,
+          weightPrecision, false, rowTile)) : null,
+      swigluSplits === 1 ? pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, weightPrecision)) : null,
+      modelSplits === 1 ? pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: ffn, outer: model }, true,
-          weightPrecision, false, rowTile)),
+          weightPrecision, false, rowTile)) : null,
       pipeline(`esmc-mix:${rows}:${model}:${pair}:${epsilon}`,
         createMixShader({ rows, model, pair }, epsilon)),
       pipeline(`esmc-ln-nooffset:${rows}:${model}:${epsilon}`,

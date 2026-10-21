@@ -50,10 +50,11 @@ describe("triangle projection tile", () => {
   it("sizes the register block from the tile", () => {
     // Four rows and two columns an invocation at 32x16, and one vec4 a cell:
     // a, b and their two gates share a source and are accumulated together.
-    expect(build({ rows: 32, columns: 16 }).projectAB)
-      .toContain("var acc: array<vec4<f32>, 8>;");
-    expect(build({ rows: 16, columns: 16 }).projectAB)
-      .toContain("var acc: array<vec4<f32>, 4>;");
+    const wide = build({ rows: 32, columns: 16 }).projectAB;
+    expect(wide).toContain("var acc_3_1 = bias_1;");
+    const square = build({ rows: 16, columns: 16 }).projectAB;
+    expect(square).toContain("var acc_1_1 = bias_1;");
+    expect(square.includes("var acc_2_0")).toBe(false);
   });
 
   it("accumulates in the residual form and assigns in the plain one", () => {

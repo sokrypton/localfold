@@ -166,8 +166,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = row / TOKENS;
   let j = row % TOKENS;
   var sum = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    sum += left[i * CHANNELS + c] * right[j * CHANNELS + c] * weight[c * OUT + o];
+  for (var c = 0u; c < CHANNELS; c += ${channels % 8 === 0 ? 8 : 1}u) {
+${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
+  `    sum += left[i * CHANNELS + c + ${u}u] * right[j * CHANNELS + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -192,8 +193,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = slot / OUT;
   let o = slot % OUT;
   var sum = 0.0;
-  for (var c = 0u; c < IN; c += 1u) {
-    sum += source[row * IN + c] * weight[c * OUT + o];
+  for (var c = 0u; c < IN; c += ${inChannels % 8 === 0 ? 8 : 1}u) {
+${Array.from({ length: inChannels % 8 === 0 ? 8 : 1 }, (_, u) =>
+  `    sum += source[row * IN + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -224,8 +226,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let bin = slot % BINS;
   let base = table[atom] * CHANNELS * BINS;
   var sum = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    sum += source[atom * CHANNELS + c] * weight[base + c * BINS + bin];
+  for (var c = 0u; c < CHANNELS; c += ${channels % 8 === 0 ? 8 : 1}u) {
+${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
+  `    sum += source[atom * CHANNELS + c + ${u}u] * weight[base + (c + ${u}u) * BINS + bin];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -341,21 +344,21 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
       const source = keep(allocator.upload("ef2-conf.s-inputs-normed", input.normed, storage()));
       const outputs = {};
       const encoder = device.createCommandEncoder({ label: "ef2-conf.s-to-z" });
+      const pass = encoder.beginComputePass({ label: "ef2-conf.s-to-z" });
+      pass.setPipeline(shader);
+      const groups = Math.ceil(tokens * channels / 64);
       for (const [name, matrix] of [["rows", weights.sToZ], ["cols", weights.sToZTranspose],
                                     ["left", weights.sToZProdIn1], ["right", weights.sToZProdIn2]]) {
         outputs[name] = keep(allocator.allocate(`ef2-conf.${name}`, tokens * channels * 4, storage()));
-        const pass = encoder.beginComputePass({ label: `ef2-conf.s-to-z.${name}` });
-        pass.setPipeline(shader);
         pass.setBindGroup(0, device.createBindGroup({
           layout: shader.getBindGroupLayout(0),
           entries: [source, keep(allocator.upload(`ef2-conf.w-${name}`, matrix, storage())),
                     outputs[name]].map((allocation, binding) => ({
             binding, resource: { buffer: allocation.buffer } })),
         }));
-        const groups = Math.ceil(tokens * channels / 64);
         pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-        pass.end();
       }
+      pass.end();
       device.queue.submit([encoder.finish()]);
       return outputs;
     })();
@@ -483,24 +486,18 @@ export async function esmfold2ConfidenceReadouts(device, input, weights, options
 
     device.pushErrorScope("validation");
     const encoder = device.createCommandEncoder({ label: "ef2-confidence-readouts" });
-    let pass = encoder.beginComputePass({ label: "ef2-conf.pool-scores" });
+    const pass = encoder.beginComputePass({ label: "ef2-confidence-readouts" });
     pass.setPipeline(scoreProject);
     pass.setBindGroup(0, bind(scoreProject,
       [pair, up("poolAttn", weights.poolingAttention), scores]));
     pass.dispatchWorkgroups(...rowsOf(pairs));
-    pass.end();
-    pass = encoder.beginComputePass({ label: "ef2-conf.pool" });
     pass.setPipeline(pool);
     pass.setBindGroup(0, bind(pool, [pair, scores, up("mask", input.tokenMask), pooled]));
     pass.dispatchWorkgroups(Math.min(tokens, GRID_WIDTH), Math.ceil(tokens / GRID_WIDTH));
-    pass.end();
-    pass = encoder.beginComputePass({ label: "ef2-conf.pool-output" });
     pass.setPipeline(outProject);
     pass.setBindGroup(0, bind(outProject,
       [pooled, up("poolOut", weights.poolingOutput), singleOut]));
     pass.dispatchWorkgroups(...rowsOf(tokens * single));
-    pass.end();
-    pass = encoder.beginComputePass({ label: "ef2-conf.pae" });
     pass.setPipeline(paeProject);
     pass.setBindGroup(0, bind(paeProject, [pair, up("paeWeight", weights.pae), paeOut]));
     pass.dispatchWorkgroups(...rowsOf(pairs * paeBins));

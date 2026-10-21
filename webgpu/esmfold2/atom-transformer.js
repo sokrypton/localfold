@@ -39,6 +39,7 @@
  */
 import { GRID_WIDTH, LANES, createLinearShader, createSwigluShader, linearGrid, swigluGrid }
   from "../esmc/block.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 
 /** torch's `F.rms_norm(eps=None)`: `finfo(float32).eps`, not this tree's 1e-5. */
 export const RMS_EPSILON = 1.1920928955078125e-7;
@@ -273,20 +274,22 @@ export function createSwaAttendShader({ atoms, channels, heads, window }) {
   // it otherwise - so the window had to stop being a memory bound before it
   // could stop being a model difference. At CHUNK 256 and 4 heads this is
   // 5.5 KB whatever the protein's length.
-  const CHUNK = 256;
+  const CHUNK = Math.min(256, Math.max(headDim, Math.ceil((window ?? 256) / headDim) * headDim));
+  const vecKey = headDim % 4 === 0;
   const scale = (1 / Math.sqrt(headDim)).toFixed(10);
   // A finite sentinel, not -inf: the first chunk's rescale computes
   // `exp(peak - newPeak)` and -inf minus -inf is NaN.
   const FLOOR = "-3.0e38";
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
-@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<${vecKey ? "vec4<f32>" : "f32"}>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
 @group(0) @binding(3) var<storage, read> bounds: array<i32>;
 @group(0) @binding(4) var<storage, read> valid: array<f32>;
 @group(0) @binding(5) var<storage, read> gate: array<f32>;
 @group(0) @binding(6) var<storage, read_write> output: array<f32>;
 
+var<workgroup> staged_q: array<f32, ${channels}>;
 var<workgroup> logits: array<f32, ${heads * CHUNK}>;
 var<workgroup> live: array<f32, ${CHUNK}>;
 var<workgroup> reduce: array<f32, ${channels}>;
@@ -304,7 +307,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let end = u32(bounds[atom * 2u + 1u]);
   let count = end - start;
   let mine = valid[atom];
-  let q_base = (atom * ${heads}u + head) * ${headDim}u;
+  let q_off = head * ${headDim}u;
+  staged_q[local.x] = query[atom * ${channels}u + local.x];
 
   if (local.x < ${heads}u) {
     headPeak[local.x] = ${FLOOR};
@@ -332,10 +336,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
       var total = 0.0;
       if (live[slot] != 0.0) {
-        let k_base = ((start + base + slot) * ${heads}u + head) * ${headDim}u;
+${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${headDim / 4}u;\n${Array.from({ length: headDim / 4 }, (_, v) => {
+  const e0 = v * 4;
+  return `        {
+          let kv = key[k_base + ${v}u];
+          total += staged_q[q_off + ${e0}u] * kv.x
+                 + staged_q[q_off + ${e0 + 1}u] * kv.y
+                 + staged_q[q_off + ${e0 + 2}u] * kv.z
+                 + staged_q[q_off + ${e0 + 3}u] * kv.w;
+        }`;
+}).join("\n")}` : `        let k_base = ((start + base + slot) * ${heads}u + head) * ${headDim}u;
         for (var e = 0u; e < ${headDim}u; e += 1u) {
-          total += query[q_base + e] * key[k_base + e];
-        }
+          total += staged_q[q_off + e] * key[k_base + e];
+        }`}
       }
       logits[head * ${CHUNK}u + slot] = total * ${scale};
     }
@@ -685,21 +698,25 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       weights.atomToToken, storage));
 
     const encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
+    const batch = deviceTuning(device).batchComputePasses !== false;
+    let openPass = null;
     const run = (label, pipeline, buffers, x, y = 1) => {
-      const pass = encoder.beginComputePass({ label });
+      const pass = batch ? (openPass ??= encoder.beginComputePass({ label: "esmfold2.embed" }))
+        : encoder.beginComputePass({ label });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries: buffers.map((entry, binding) => ({ binding, resource: { buffer: entry.buffer } })),
       }));
       pass.dispatchWorkgroups(x, y, 1);
-      pass.end();
+      if (!batch) pass.end();
     };
     encodeAtomStack({ run, pipelines, state, scratch, weights: blockBuffers });
     run("esmfold2.embed.to-token", toToken, [activation, toTokenWeights, projected],
         ...linearGrid(atoms, tokenChannels));
     run("esmfold2.embed.pool", pool, [projected, state.valid, ranged, tokenAct],
         Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH));
+    if (openPass !== null) openPass.end();
     const readback = keep(allocator.allocate("esmfold2.embed.readback",
       tokens * tokenChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     encoder.copyBufferToBuffer(tokenAct.buffer, 0, readback.buffer, 0,

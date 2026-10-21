@@ -184,25 +184,19 @@ export function createLinearShader({ rows, inner, outer }, withResidual,
   // out-of-bounds access and the STORE is masked. Measured interleaved, keeping
   // the test is 0.946x at 61 tokens and 1.026x at 300 - a wash, so the cheaper
   // form is kept because it is cheaper.
+  const exactK = inner % K_CHUNK === 0;
+  const exactUnroll = inner % unroll === 0;
   const body = [];
-  if (unroll > 1) {
-    for (let t = 0; t < rowTile; t += 1) {
-      const parts = [];
-      for (let u = 0; u < unroll; u += 1) {
-        parts.push(`staged[${t}u * ${K_CHUNK}u + k + ${u}u]`);
-      }
-      body.push(`      let s_${t} = vec${unroll}<f32>(${parts.join(", ")});`);
-    }
-  }
   for (let u = 0; u < unroll; u += 1) {
     body.push(`      {`);
+    if (!exactUnroll && u > 0) {
+      body.push(`        if (k_absolute + ${u}u >= ${inner}u) { break; }`);
+    }
     body.push(`        let w = ${boundsTest
       ? `select(vec4<f32>(0.0), ${load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)}, vector_column < ${vectorColumns}u)`
       : load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)};`);
     for (let t = 0; t < rowTile; t += 1) {
-      body.push(unroll > 1
-        ? `        acc_${t} += s_${t}[${u}] * w;`
-        : `        acc_${t} += staged[${t}u * ${K_CHUNK}u + k] * w;`);
+      body.push(`        acc_${t} += staged[${t}u * ${K_CHUNK}u + k + ${u}u] * w;`);
     }
     body.push(`      }`);
   }
@@ -232,13 +226,12 @@ ${split ? `  let k_start = group.z * ${span}u;
       let k = slot % ${K_CHUNK}u;
       let row = row_origin + t;
       staged[slot] = select(0.0, input[row * ${inner}u + k0 + k],
-                            row < ${rows}u && k0 + k < ${inner}u);
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k0 + k < ${inner}u`});
     }
     workgroupBarrier();
     for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
       let k_absolute = k0 + k;
-      if (k_absolute >= ${inner}u) { break; }
-${body.join("\n")}
+${exactK ? "" : `      if (k_absolute >= ${inner}u) { break; }\n`}${body.join("\n")}
     }
     workgroupBarrier();
   }
@@ -465,10 +458,16 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
     accumulators.push(`  var acc_${t} = 0.0;`);
     rescales.push(t);
   }
-  const dots = [];
-  for (let t = 0; t < queryTile; t += 1) {
-    dots.push(`        dot_${t} += q_tile[${t}u * ${headDim}u + d] * k;`);
-  }
+  const dotStep = (u) => {
+    const dExpr = `(d + ${u}u)`;
+    const lines = [`        let k_${u} = key[(head * ${headDim}u + ${dExpr}) * ${rows}u + j];`];
+    for (let t = 0; t < queryTile; t += 1) {
+      lines.push(`        dot_${t} += q_tile[${t}u * ${headDim}u + ${dExpr}] * k_${u};`);
+    }
+    return lines.join("\n");
+  };
+  const dotUnroll = headDim % 8 === 0 ? 8 : 1;
+  const dots = Array.from({ length: dotUnroll }, (_, u) => dotStep(u)).join("\n");
   const writeLogits = [];
   for (let t = 0; t < queryTile; t += 1) {
     // ...one liveness per QUERY when the chains matter, because the test is
@@ -529,9 +528,8 @@ ${chainAware ? `    let key_sequence = select(-2, sequence[j], live);` : ""}
     // ${queryTile} queries, which is the whole point of the tile.
 ${logits.join("\n")}
     if (live) {
-      for (var d = 0u; d < ${headDim}u; d += 1u) {
-        let k = key[(head * ${headDim}u + d) * ${rows}u + j];
-${dots.join("\n")}
+      for (var d = 0u; d < ${headDim}u; d += ${dotUnroll}u) {
+${dots}
       }
     }
 ${writeLogits.join("\n")}
@@ -541,8 +539,8 @@ ${writeLogits.join("\n")}
     if (local.x < ${queryTile}u) {
       let t = local.x;
       var largest = -3.0e38;
-      for (var l = 0u; l < ${LANES}u; l += 1u) {
-        largest = max(largest, chunk[t * ${LANES}u + l]);
+      for (var l = 0u; l < ${LANES}u; l += 8u) {
+${Array.from({ length: 8 }, (_, u) => `        largest = max(largest, chunk[t * ${LANES}u + l + ${u}u]);`).join("\n")}
       }
       let previous = peak[t];
       let combined = max(previous, largest);
@@ -552,8 +550,8 @@ ${writeLogits.join("\n")}
       running[t] = running[t] * r;
       peak[t] = combined;
       var sum = 0.0;
-      for (var l = 0u; l < ${LANES}u; l += 1u) {
-        sum += exp(chunk[t * ${LANES}u + l] - combined);
+      for (var l = 0u; l < ${LANES}u; l += 8u) {
+${Array.from({ length: 8 }, (_, u) => `        sum += exp(chunk[t * ${LANES}u + l + ${u}u] - combined);`).join("\n")}
       }
       running[t] += sum;
     }
@@ -562,13 +560,26 @@ ${writeLogits.join("\n")}
     // Phase two: a lane owns a CHANNEL. Each value it reads is used by all
     // ${queryTile} queries too.
 ${Array.from({ length: queryTile }, (_, t) =>
-    `    let rescale_${t} = rescale_of[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
-    for (var l = 0u; l < ${LANES}u; l += 1u) {
-      let source = k0 + l;
-      if (source >= ${rows}u) { break; }
-      let v = value[source * ${model}u + head * ${headDim}u + local.x];
+    `    let rescale_${t} = rescale_of[${t}u];\n    let peak_${t} = peak[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
+    if (k0 + ${LANES}u <= ${rows}u) {
+      for (var l = 0u; l < ${LANES}u; l += 4u) {
+${Array.from({ length: 4 }, (_, u) => {
+  const src = `(k0 + l + ${u}u)`;
+  return `        {
+          let v = value[${src} * ${model}u + head * ${headDim}u + local.x];
+${Array.from({ length: queryTile }, (__, t) =>
+    `          part_${t} += exp(chunk[${t}u * ${LANES}u + l + ${u}u] - peak_${t}) * v;`).join("\n")}
+        }`;
+}).join("\n")}
+      }
+    } else {
+      for (var l = 0u; l < ${LANES}u; l += 1u) {
+        let source = k0 + l;
+        if (source >= ${rows}u) { break; }
+        let v = value[source * ${model}u + head * ${headDim}u + local.x];
 ${Array.from({ length: queryTile }, (_, t) =>
-    `      part_${t} += exp(chunk[${t}u * ${LANES}u + l] - peak[${t}u]) * v;`).join("\n")}
+    `        part_${t} += exp(chunk[${t}u * ${LANES}u + l] - peak_${t}) * v;`).join("\n")}
+      }
     }
 ${accumulate.join("\n")}
     workgroupBarrier();
@@ -632,19 +643,20 @@ export function createSwigluShader({ rows, model, ffn }, weightPrecision = "f32"
   // still runs and returns a plausible tensor of the same shape.
   // The same four-way k unroll the linear kernel uses, and for the same reason:
   // scalar, this loop did one workgroup read per multiply-add.
+  const exactK = model % K_CHUNK === 0;
   const unroll = 4;
-  for (let t = 0; t < tile; t += 1) {
-    const parts = [];
-    for (let u = 0; u < unroll; u += 1) parts.push(`staged[${t}u * ${K_CHUNK}u + k + ${u}u]`);
-    body.push(`      let s_${t} = vec4<f32>(${parts.join(", ")});`);
-  }
+  const exactUnroll = model % unroll === 0;
   for (let u = 0; u < unroll; u += 1) {
     body.push(`      {`);
+    if (!exactUnroll && u > 0) {
+      body.push(`        if (k_absolute + ${u}u >= ${model}u) { break; }`);
+    }
     body.push(`        let wg = ${load(`(k_absolute + ${u}u) * ${stride}u + vector_column`)};`);
     body.push(`        let wv = ${load(`(k_absolute + ${u}u) * ${stride}u + ${vectorFfn}u + vector_column`)};`);
     for (let t = 0; t < tile; t += 1) {
-      body.push(`        gate_${t} += s_${t}[${u}] * wg;`);
-      body.push(`        value_${t} += s_${t}[${u}] * wv;`);
+      body.push(`        let s_${t} = staged[${t}u * ${K_CHUNK}u + k + ${u}u];`);
+      body.push(`        gate_${t} += s_${t} * wg;`);
+      body.push(`        value_${t} += s_${t} * wv;`);
     }
     body.push(`      }`);
   }
@@ -671,13 +683,12 @@ ${declare.join("\n")}
       let k = slot % ${K_CHUNK}u;
       let row = row_origin + t;
       staged[slot] = select(0.0, normalised[row * ${model}u + k0 + k],
-                            row < ${rows}u && k0 + k < ${model}u);
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k0 + k < ${model}u`});
     }
     workgroupBarrier();
     for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
       let k_absolute = k0 + k;
-      if (k_absolute >= ${model}u) { break; }
-${body.join("\n")}
+${exactK ? "" : `      if (k_absolute >= ${model}u) { break; }\n`}${body.join("\n")}
     }
     workgroupBarrier();
   }

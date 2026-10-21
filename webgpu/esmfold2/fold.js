@@ -30,6 +30,7 @@ import {
 } from "../../shared/esmfold2/featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower.js";
 import { createAddShader } from "../runtime/execution.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { memoryBudgetBytes } from "../runtime/device-memory.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { yieldToBrowser } from "../runtime/yield.js";
@@ -362,8 +363,11 @@ export async function foldEsmfold2(device, options) {
   // tokens around small passes.
   const submit = async (label, passes, wait = true) => {
     const encoder = device.createCommandEncoder({ label });
+    const batch = deviceTuning(device).batchComputePasses !== false;
+    let openPass = null;
     for (const [name, pipeline, buffers, x, y] of passes) {
-      const pass = encoder.beginComputePass({ label: name });
+      const pass = batch ? (openPass ??= encoder.beginComputePass({ label }))
+        : encoder.beginComputePass({ label: `${label}.${name}` });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -375,8 +379,9 @@ export async function foldEsmfold2(device, options) {
         })),
       }));
       pass.dispatchWorkgroups(x, y ?? 1, 1);
-      pass.end();
+      if (!batch) pass.end();
     }
+    if (openPass !== null) openPass.end();
     device.queue.submit([encoder.finish()]);
     if (wait) await device.queue.onSubmittedWorkDone();
   };
