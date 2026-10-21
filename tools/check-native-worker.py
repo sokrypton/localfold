@@ -36,6 +36,11 @@ NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
 # a case's bar on Metal where it differs from the A100's: Metal's sampling lands elsewhere on these targets, at the
 # Metal gate's own numbers (metal/af3/gate-baseline.m2.json) and the CUDA-translated port's before it
 METAL_BARS = {"protenix2 6mrr": 1.6}      # (1.561 in metal/af3/gate.py; the A100 0.499)
+# a case the Metal port REFUSES by name where CUDA folds it - asserted as that refusal, so a Metal port that later folded
+# it, or failed some other way, would be caught either way: never a case quietly skipped. BioEmu2's edm_fkc takes the
+# potentials' gradient back through the denoiser (cuda/bioemu2's vjp.cuh, the denoiser's whole backward), which metal/bioemu2
+# does not have (docs/BIOEMU2.md, "Not done yet"); its edm_gd and edm_fk fold
+METAL_REFUSALS = {"bioemu2 6mrr, edm_fkc": "edm_fkc takes the potentials' gradient back through the denoiser"}
 FIX = os.path.join(REPO, "tools", "fixtures")
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 THREE = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L",
@@ -477,6 +482,9 @@ def main():
         plan = [case for case in plan if case[1]["family"] != "af3"]
     plan = [(name, payload, reference, METAL_BARS.get(name, bar) if NATIVE == "metal" else bar, tokens, refusal)
             for name, payload, reference, bar, tokens, refusal in plan]
+    if NATIVE == "metal":
+        plan = [(name, payload, None, None, None, METAL_REFUSALS[name]) if name in METAL_REFUSALS else (name, payload, *rest)
+                for name, payload, *rest in plan]
     worker = subprocess.Popen([sys.executable, os.path.join(REPO, "python", "localfold", "worker.py")], cwd=REPO,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-cuda-check.log", "w"),
                               text=True, bufsize=1)

@@ -35,7 +35,8 @@ metal/
                  fold, gate.py, gate-baseline.<chip>.json
   bioemu2/       BioEmu2: --job= on af3-any-model's int8 blob, read as the page's bundle through a weight walk
                  (weights.mm); held stage by stage to webgpu/bioemu2 on the int5 bundle (--bundle=, --oracle=,
-                 tools/dump-bioemu2-webgpu.mjs; docs/BIOEMU2.md). Not yet on the worker path, no steered samplers
+                 tools/dump-bioemu2-webgpu.mjs; docs/BIOEMU2.md). On the worker (`localfold serve`); steering by cuda/bioemu2's steer.h
+                 (edm_gd, edm_fk) - edm_fkc refused: it needs the denoiser's backward
   selftest/      the GEMM, attention and LayerNorm against host references
   bench/         GEMM and attention arms, interleaved, each checked against the first
 ```

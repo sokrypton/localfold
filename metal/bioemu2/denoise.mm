@@ -132,6 +132,13 @@ void freeDenoiser(Denoiser& d) {
 // T), each token to its own
 struct RowMaps { int samples = 0; int* atomTok = nullptr; int* tok = nullptr; };
 static RowMaps ROW_MAPS;
+// 🔴 FORGOTTEN EVERY FOLD: the maps are this input's atoms' tokens, and a resident server's next job is another input -
+// keyed on the sample count alone, a second fold of the same count read the first one's (cuda/bioemu2's resident server
+// met this class of bug: its triangle mask remembered by address, docs/BIOEMU2.md)
+void forgetRowMaps() {
+  if (ROW_MAPS.atomTok) { release(ROW_MAPS.atomTok); release(ROW_MAPS.tok); }
+  ROW_MAPS = {};
+}
 static const RowMaps& rowMaps(int samples, int T, int N) {
   if (ROW_MAPS.samples == samples && ROW_MAPS.atomTok) return ROW_MAPS;
   if (ROW_MAPS.atomTok) { release(ROW_MAPS.atomTok); release(ROW_MAPS.tok); }

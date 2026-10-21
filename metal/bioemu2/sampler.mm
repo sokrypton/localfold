@@ -42,7 +42,7 @@ static void augment(std::vector<float>& x, const std::vector<float>& mask, const
       x[a * 3 + k] = mask[a] ? (float)(p[0] * R[0 * 3 + k] + p[1] * R[1 * 3 + k] + p[2] * R[2 * 3 + k] + sh[k]) : 0.f;
   }
 }
-static void randomRigid(std::mt19937_64& rng, double R[9], double sh[3]) {
+void randomRigid(std::mt19937_64& rng, double R[9], double sh[3]) {
   std::normal_distribution<double> Nd(0, 1);
   double q[4]; for (auto& v : q) v = Nd(rng);
   double qn = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
@@ -67,7 +67,7 @@ static std::vector<float> atomMask(int N) {
 }
 
 std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int n,
-                                       std::vector<std::vector<float>> companions, bool centreEnd) {
+                                       std::vector<std::vector<float>> companions, bool centreEnd, const StepHook& onStep) {
   const int N = d.N;
   const std::vector<float> mask = atomMask(N);
   const std::vector<float> levels = schedule(s);
@@ -105,6 +105,7 @@ std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings&
       const float* hd = (const float*)host(dd);
       for (int k = 0; k < b; ++k) std::copy(hd + per * k, hd + per * (k + 1), den[p0 + k].begin());
     }
+    if (onStep) onStep(i + 1, steps, den[0]);
     for (int p = 0; p < n; ++p) {
       rigidAlign(x[p], den[p], mask, N);
       const double f = s.stepScale * (next - t) / t;

@@ -14,6 +14,7 @@
 #include "host.h"
 #include "model.h"
 #include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,7 @@ struct Denoiser {
 Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sInputs, int Si, const Tap& tap);
 void setDynamics(Denoiser& d, float dt, const float* coordsCond);
 void freeDenoiser(Denoiser& d);
+void forgetRowMaps();             // (every fold: the row maps are an input's)
 // x [samples][N][3] (noisy, angstrom) at sigma -> den; cond: each sample's conditioning frame (null: coords_cond)
 void denoise(const Denoiser& d, const float* x, float sigma, float* den, const float* cond = nullptr, int samples = 1);
 
@@ -123,10 +125,19 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
 struct SamplerSettings { int steps = 200; double sMax = 160, sMin = 4e-4, rho = 7, gamma0 = 0.8, gammaMin = 1.0,
                          noiseScale = 1.0, stepScale = 1.5; };
 extern int BATCH_SAMPLES;
+// onStep(step, steps, the first particle's denoised estimate [N][3] on the host): the page's live frames
+using StepHook = std::function<void(int, int, const std::vector<float>&)>;
 std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int n,
-                                       std::vector<std::vector<float>> companions = {}, bool centreEnd = true);
+                                       std::vector<std::vector<float>> companions = {}, bool centreEnd = true,
+                                       const StepHook& onStep = nullptr);
 std::vector<std::vector<std::vector<float>>> propagate(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int n,
                                                        int chain, const std::vector<float>& x0);
 void centreMasked(std::vector<float>& x, const std::vector<float>& mask);
+// a uniform random rotation (a normalised Gaussian quaternion) and a N(0, 1) translation: the sampler's augmentation
+void randomRigid(std::mt19937_64& rng, double R[9], double sh[3]);
+// the steered samplers (steer.mm: cuda/bioemu2's steer.h over this port's denoiser) - edm_gd and edm_fk; edm_fkc refused.
+// potentials: a --potentials file, or empty for the vendor's defaults. Throws a sentence on a refusal
+std::vector<std::vector<float>> steeredFold(const Denoiser& d, const SamplerSettings& ss, const std::string& sampler,
+                                            const std::string& potentials, uint64_t seed, int n);
 void writePdb(const std::string& templatePath, const std::string& out, const std::vector<float>& x);
 void writeConfidences(const std::string& dir, const std::string& pdb, int T, const std::vector<float>& contacts);

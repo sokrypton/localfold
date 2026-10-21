@@ -1,6 +1,6 @@
 // BioEmu2 (microsoft/bioemu2, checkpoint bioemu2-preview) natively on Metal: the windowed atom encoder, the PairMixer
 // trunk (4 MSA layers, 48 triangle-multiplication blocks, 4 passes), the distogram, and the dual-stream denoiser under
-// its EDM sampler. cuda/bioemu2 is the reading; the weights are the page's int5 bundle.
+// its EDM sampler. cuda/bioemu2 is the reading; the weights are af3-any-model's int8 blob read as the page's bundle, or that bundle.
 //
 //   localfold-bioemu2 --job=<job.json> | --sequence=<SEQ> [--out=fold.pdb] [...]   the weights fetched, the input
 //       featurised in this process, the fold (cuda/featurise/standalone.h - every port's command line)
@@ -26,7 +26,8 @@ namespace {
 
 double ms(double t0) { return (now() - t0) * 1e3; }
 
-struct Opts { std::string dir, oracle, out = "fold.pdb"; uint64_t seed = 0; int samples = 5, steps = 200, passes = 4;
+struct Opts { std::string dir, oracle, out = "fold.pdb", frames, sampler = "edm", potentials; uint64_t seed = 0;
+              int samples = 5, steps = 200, passes = 4;
               double stepScale = -1; bool profile = false; };
 
 double relRms(const float* a, const float* b, size_t n) {
@@ -123,6 +124,7 @@ int foldInput(const Opts& o) {
     const int* pad = M.hostI("atom_pad_mask");
     for (int a = 0; a < N; ++a) if ((a < real) != (pad[a] != 0)) die("BioEmu2: atom %d breaks the real-atoms-first layout", a);
   }
+  forgetRowMaps();
   printf("BioEmu2: %d tokens, %d atoms (%d padded), %d MSA rows, %s%s\n", T, real, N, S,
          equilibrium || chain ? "equilibrium" : "structure",
          chain ? (", propagating " + std::to_string(chain) + " step(s)").c_str() : "");
@@ -148,6 +150,11 @@ int foldInput(const Opts& o) {
   float* logits = scratch<float>("be2.dg.logits", P * B);
   distogram(z, logits);
   const std::vector<float> contacts = contactProbs(logits, T, B);
+  if (!o.frames.empty()) {      // (the page's live preview, python/localfold/worker.py's on_file: the trunk's contact map)
+    std::vector<unsigned char> bytes(contacts.size());
+    for (size_t k = 0; k < contacts.size(); ++k) bytes[k] = (unsigned char)std::min(255.f, std::max(0.f, std::round(contacts[k] * 255.f)));
+    writeWhole(o.frames + "/contacts-00-of-01.u8", bytes.data(), bytes.size());
+  }
   releaseScratch();      // (the trunk's buffers are the denoiser's room)
   Denoiser d = staticContext(s, z, sInputs, Si, nullptr);
   mt::sync();
@@ -158,12 +165,46 @@ int foldInput(const Opts& o) {
     SamplerSettings ss; ss.steps = o.steps;
     ss.stepScale = o.stepScale > 0 ? o.stepScale : equilibrium || chain ? 1.0 : 1.5;
     std::vector<std::vector<float>> out;
-    if (chain) {
+    if (o.sampler != "edm") {
+      if (chain) { fprintf(stderr, "Error: BioEmu2 propagation runs unsteered here; use the edm sampler to propagate\n"); return 1; }
+      try {
+        out = steeredFold(d, ss, o.sampler, o.potentials, o.seed, o.samples);
+      } catch (const std::exception& e) {
+        fprintf(stderr, "Error: %s\n", e.what());
+        freeDenoiser(d);
+        return 1;
+      }
+    } else if (chain) {
       std::vector<float> x0(M.hostF("x0"), M.hostF("x0") + (size_t)N * 3);
       auto frames = propagate(d, ss, o.seed, o.samples, chain, x0);
       for (auto& tr : frames) for (auto& f : tr) out.push_back(f);    // (trajectory i, step k: sample i * chain + k)
     } else {
-      out = sample(d, ss, o.seed, o.samples);
+      // the page's live preview: each step's estimate of the first sample, superposed onto the first step's (as
+      // metal/ef2 writes them: frame-SSSS-NNNN.pdb, written whole then renamed)
+      StepHook onStep;
+      std::vector<double> ref; double centre[3] = {};
+      std::vector<int> live;
+      if (!o.frames.empty()) {
+        const int* m = M.hostI("atom_mask");
+        for (int a = 0; a < N; ++a) if (m[a]) live.push_back(a);
+        onStep = [&](int step, int steps, const std::vector<float>& x) {
+          std::vector<double> pts;
+          for (int a : live) for (int k = 0; k < 3; ++k) pts.push_back(x[a * 3 + k]);
+          double c[3] = {};
+          for (size_t q = 0; q < live.size(); ++q) for (int k = 0; k < 3; ++k) c[k] += pts[q * 3 + k] / live.size();
+          for (size_t q = 0; q < live.size(); ++q) for (int k = 0; k < 3; ++k) pts[q * 3 + k] -= c[k];
+          if (ref.empty()) { ref = pts; for (int k = 0; k < 3; ++k) centre[k] = c[k]; }
+          double R[9]; bestRotation(pts, ref, R);
+          std::vector<float> moved = x;
+          for (size_t q = 0; q < live.size(); ++q) {
+            const double* p = &pts[q * 3];
+            for (int k = 0; k < 3; ++k) moved[live[q] * 3 + k] = (float)(R[k * 3] * p[0] + R[k * 3 + 1] * p[1] + R[k * 3 + 2] * p[2] + centre[k]);
+          }
+          char name[64]; snprintf(name, sizeof name, "/frame-%04d-%04d.pdb", step, steps);
+          writePdb(o.dir + "/pdb.template", o.frames + name, moved);
+        };
+      }
+      out = sample(d, ss, o.seed, o.samples, {}, true, onStep);
     }
     printf("sampler %.1f ms (%d sample(s), %d steps)\n", ms(t0), (int)out.size(), ss.steps);
     if (o.profile) profileReport("sampler", 2000);
@@ -177,6 +218,27 @@ int foldInput(const Opts& o) {
   for (float* p : {sInputs, s, z}) release(p);
   releaseScratch();
   return 0;
+}
+
+// a fold's own flags, the command line's and a served job's alike (false: not one of them)
+bool flagInto(const std::string& f, Opts& o) {
+  if (!f.compare(0, 6, "--out=")) o.out = f.substr(6);
+  else if (!f.compare(0, 7, "--seed=")) o.seed = strtoull(f.c_str() + 7, nullptr, 10);
+  else if (!f.compare(0, 8, "--steps=")) o.steps = atoi(f.c_str() + 8);
+  else if (!f.compare(0, 10, "--samples=")) o.samples = atoi(f.c_str() + 10);
+  else if (!f.compare(0, 13, "--step-scale=")) o.stepScale = atof(f.c_str() + 13);
+  else if (!f.compare(0, 9, "--passes=")) o.passes = atoi(f.c_str() + 9);
+  else if (!f.compare(0, 10, "--sampler=")) o.sampler = f.substr(10);
+  else if (!f.compare(0, 13, "--potentials=")) o.potentials = f.substr(13);
+  else if (!f.compare(0, 9, "--frames=")) o.frames = f.substr(9);
+  else return false;
+  return true;
+}
+// a sampler this port has, said by name otherwise (refused, not folded as though it had not been asked)
+bool samplerRefused(const Opts& o) {
+  if (o.sampler == "edm" || o.sampler == "edm_gd" || o.sampler == "edm_fk" || o.sampler == "edm_fkc") return false;
+  fprintf(stderr, "Error: BioEmu2 sampler %s: edm, edm_gd, edm_fk or edm_fkc\n", o.sampler.c_str());
+  return true;
 }
 
 }  // namespace
@@ -204,7 +266,7 @@ int foldMain(int argc, char** argv) {
     return 1;
   }
   Opts o; o.dir = argv[1];
-  std::string bundle, blob, sampler = "edm", compareWith;
+  std::string bundle, blob, compareWith, serveDir;
   bool waitInput = false;
   for (int i = 2; i < argc; ++i) {
     const char* a = argv[i];
@@ -213,15 +275,9 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--compare-weights=", 18)) compareWith = a + 18;
     else if (!strcmp(a, "--fast")) {}                        // (the standalone path's; the fast arm is the default here)
     else if (!strncmp(a, "--wait-input", 12)) waitInput = true;   // (the featuriser still writing the input: standalone.h)
-    else if (!strncmp(a, "--sampler=", 10)) sampler = a + 10;
-    else if (!strncmp(a, "--potentials=", 13)) sampler = "steered";
+    else if (!strncmp(a, "--serve=", 8)) serveDir = a + 8;
     else if (!strncmp(a, "--oracle=", 9)) o.oracle = a + 9;
-    else if (!strncmp(a, "--out=", 6)) o.out = a + 6;
-    else if (!strncmp(a, "--seed=", 7)) o.seed = strtoull(a + 7, nullptr, 10);
-    else if (!strncmp(a, "--steps=", 8)) o.steps = atoi(a + 8);
-    else if (!strncmp(a, "--samples=", 10)) o.samples = atoi(a + 10);
-    else if (!strncmp(a, "--step-scale=", 13)) o.stepScale = atof(a + 13);
-    else if (!strncmp(a, "--passes=", 9)) o.passes = atoi(a + 9);
+    else if (flagInto(a, o)) {}
     else if (!strcmp(a, "--f32")) HALF = false;            // (the float32 reference arm: what --oracle's float32 dump holds)
     else if (!strcmp(a, "--profile")) o.profile = true;     // (every labelled dispatch timed: proportions, not speed)
     else { fprintf(stderr, "unknown flag %s\n", a); return 1; }
@@ -230,11 +286,7 @@ int foldMain(int argc, char** argv) {
     fprintf(stderr, "one of --weights=<af3-any-model's bioemu2 blob directory> or --bundle=<the int5 bundle's directory>\n");
     return 1;
   }
-  if (sampler != "edm") {
-    // (cuda/bioemu2's steer.h is host code and would come across - docs/BIOEMU2.md, "Not done yet")
-    fprintf(stderr, "Error: BioEmu2's steered samplers (--sampler=edm_gd|edm_fk|edm_fkc, --potentials) are not on Metal yet: the edm sampler\n");
-    return 1;
-  }
+  if (samplerRefused(o)) return 1;
   if (o.steps < 2) { fprintf(stderr, "BioEmu2 samples with at least 2 steps, got %d\n", o.steps); return 1; }
   if (o.profile && !profiling()) setenv("LOCALFOLD_PROFILE", "1", 1);
   const double tStart = now();
@@ -247,6 +299,23 @@ int foldMain(int argc, char** argv) {
   else loadBlobAsBundle(blob, asHalf);
   mt::sync();
   printf("weights up in %.2f s (%.2f GB)\n", now() - tStart, M.weightBytes() / 1e9);
+  if (!serveDir.empty()) {
+    // the resident server (metal/core/host.cpp's serveJobs, python/localfold/worker.py's): the weights stay on the GPU,
+    // each job its input directory and its flags
+    serveJobs("bioemu2", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
+      Opts j = o; j.dir = input; j.out = "fold.pdb"; j.oracle.clear(); j.frames.clear();
+      for (auto& f : flags)
+        if (!flagInto(f, j)) { fprintf(stderr, "Error: a BioEmu2 job's flag %s is not one this port reads\n", f.c_str()); return 1; }
+      if (samplerRefused(j)) return 1;
+      if (j.steps < 2) { fprintf(stderr, "Error: BioEmu2 samples with at least 2 steps, got %d\n", j.steps); return 1; }
+      M.loadInput(input);
+      const int code = foldInput(j);
+      mt::sync();
+      M.unloadInput();
+      return code;
+    });
+    return 0;
+  }
   if (waitInput) {          // the featuriser writes model.idx last, by a rename
     const std::string idx = o.dir + "/model.idx", failed = o.dir + "/model.failed";
     while (access(idx.c_str(), R_OK) != 0) {

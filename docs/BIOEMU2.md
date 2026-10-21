@@ -71,7 +71,7 @@ heteromer with paired alignments, two copies of one chain and an ATP; and `conta
 |---|---|---|---|---|
 | CUDA (Colab, `localfold-bioemu2`) | `cuda/bioemu2`, `cuda/bioemu2/gate.py` | 1.6e-6 .. 3.6e-6 relRMS on six targets; `--fast` (f16 GEMMs, ef2's fused trunk) 1.7e-3 .. 3.2e-3; int8 blob 5-7e-3 trunk, which is the quantisation (decoded tensors match colab's dequantiser to four digits) | 6MRR single sequence 2.78-3.04 A over 5 samples, mean 2.88 - colab's own 2.88-3.20, mean 3.06; bonds against the CCD ideals equal to colab's (mainchain 0.034, side chains 0.052, nucleic 0.037 vs 0.036, ligand + SEP 0.084 vs 0.077) | 5 samples x 200 steps: 71 tokens 3.3 s, 255 tokens 7.0 s, 494 tokens 13.2 s; warm `--serve` trunk 100 ms at 6MRR |
 | WebGPU (the page) | `webgpu/bioemu2`, `tools/gpu/check-bioemu2-network.js`, `tools/gpu/fold-bioemu2.js`; bundle `bioemu2-int5` (372 MB) | trunk single ~1e-7, pair 2.4-3.1e-4 (the AF3 pair track's float32 band over 52 blocks), denoise 2.6e-7 .. 4.2e-6, propagation 6e-7 .. 1.1e-6; int5 pair 2.6e-2, denoise 6.2e-2 at sigma 160 falling to 1.9e-3 | 6MRR (68) 0.90 / 1.58 / 1.65 A float32, 0.89 / 1.59 / 1.64 int5 on the same seed | 68 residues 1 sample 13.7 s on the page (32 ms a denoiser call), 255 residues 27.7 s |
-| Metal (this Mac, `localfold-bioemu2 --job=`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) through `--job` on the int8 blob 1.58-1.73 A over 5 samples, mean 1.65, every potential 0; on the int5 bundle 1.57-1.71, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, 5 samples x 200 steps at 68 tokens: the fast arm (default) trunk 0.53 s, sampler 14.5 s; the float32 arm (`--f32`) 2.3 s / 55 s |
+| Metal (this Mac, `localfold-bioemu2 --job=`, `localfold serve`) | `metal/bioemu2`, `tools/dump-bioemu2-webgpu.mjs` | held to **webgpu/bioemu2 on the same int5 bundle** (below): trunk 1.4e-8 .. 2.6e-7, context 4.6e-8 .. 9.0e-8, denoise 1.3e-7 .. 3.9e-5 against its float32 arm | 6MRR (68) through `--job` on the int8 blob 1.58-1.73 A over 5 samples, mean 1.65, every potential 0; on the int5 bundle 1.57-1.71, mean 1.61 (WebGPU on the same job and box 0.95-1.62); 5/5 pass the physicality report | M5, 5 samples x 200 steps at 68 tokens: the fast arm (default) trunk 0.53 s, sampler 14.5 s; the float32 arm (`--f32`) 2.3 s / 55 s |
 
 🔴 **THE 6MRR FIXTURE IS 71 RESIDUES, NOT 68**: it was read off every CA line of the crystal, which repeats K14, E43
 and D64 at their alternate locations. The oracle dumps share it, so parity is unaffected; RMSD to the crystal uses
@@ -137,6 +137,22 @@ multiple of 3 bytes (32768 is not: each chunk then ends in `=` padding and a dec
 matched by residue number and 1.6 A on `6mrr-68.json` superposed in order (as fold-bioemu2.js does): the 71-residue
 fixture repeats three residues, so its sequence is not the crystal's and every residue number after K14 is shifted.
 
+🔴 **ON THE WORKER, EVERY CASE CUDA'S GATE HAS** (`python3 tools/check-native-worker.py --only=bioemu2 --offline`):
+python/localfold/worker.py drives `metal/bioemu2` unchanged - the same `- --weights=<blob> --fast --serve=<dir>` it gives
+the CUDA binary - and the eleven cases pass: a fold, propagation, equilibrium with contacts, the warm resident repeat
+(the first fold's bytes), a ligand, edm_fk on NAG + retinal, edm_fkc REFUSED by name, and four refusals. The live preview
+is the worker's `--frames` protocol: the trunk's contact map, then each step's estimate of the first sample superposed
+onto the first step's. Steering is cuda/bioemu2's own steer.h over this port's denoiser: on 6MRR + NAG + retinal, plain
+edm leaves mean ChiralAtom 0.90, StereoBond 1.17 and intra-chain VDW 0.71, and edm_gd and edm_fk take every potential to
+0.000 - the pattern the native and colab runs above record - for ~0.45 s of host time.
+
+🔴 **A RESIDENT SERVER'S SECOND INPUT FOLDED WITH THE FIRST INPUT'S ATOM-TO-TOKEN MAP**, caught before it shipped, by the
+CUDA trap below: the denoiser cached its row maps keyed on the sample count alone, so the page's next fold of a DIFFERENT
+protein read the first one's (past its end, for a larger one). Forgotten every fold now. 🔴 **AND THE TEST'S FIRST FORM
+COULD NOT SEE IT**: it served 6MRR, the heteromer, then 6MRR again and compared the repeat with the first - which the stale
+maps get RIGHT, since they are 6MRR's own. Falsified with the fix removed, it passed. Holding EVERY served fold to a fresh
+process's bytes is what catches it: with the fix removed the heteromer served second differs; with it all four match.
+
 ## Traps
 
 - 🔴 **JAX ON AN A100 RUNS A float32 einsum IN TF32** unless `JAX_DEFAULT_MATMUL_PRECISION=highest`. The steering
@@ -167,8 +183,9 @@ fixture repeats three residues, so its sequence is not the crystal's and every r
 
 ## Not done yet
 
-- Metal: the worker's native path (python/localfold/worker.py drives the CUDA binary's `--serve`, which this port does
-  not have yet).
+- Metal: **edm_fkc**, which takes the potentials' gradient back THROUGH the denoiser (cuda/bioemu2's vjp.cuh, the
+  denoiser's whole backward) - refused by name, and tools/check-native-worker.py asserts that refusal on a Mac
+  (METAL_REFUSALS) rather than skipping the case. edm, edm_gd and edm_fk all fold there.
 - Metal's next speed lever is the coupling's ATOM-side mixer: its fc1 | fc2 is ~36% of the sampler and already runs at
   ~11 TFLOP/s, so the only gain left is fewer FLOPs. The adaLN'd row is [a_token (768) | q_atom (128)], so W y splits
   exactly into a per-TOKEN part (W_a (gamma_a (a - mean a)), once a token, not once an atom) plus the 128-wide atom part,
