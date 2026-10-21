@@ -221,7 +221,9 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   shapes run at ~1.6 TFLOP/s against `probe-alu.js`'s 7.3 float32 (14.6 f16), so it is bound by none of the ALU, the
   workgroup reads (~75 G/s of 320) or the cached global reads. Hand-unrolled named accumulators 280 ms, BK 32 270,
   register prefetch of the next panel 270, every accumulator index a constant (epilogue included) 282 - the compiler's
-  own unrolling of the shipped loop is better than any of them. The step past it is the matrix units, and a STOCK
+  own unrolling of the shipped loop is better than any of them. And the same tile on 128 lanes of 8 x 8 (64 multiply-adds a
+  lane for 4 workgroup reads, where 4 x 8 is 32 for 3): bit-identical and 3.5x SLOWER (862 against 243 ms a call) - 64
+  accumulators a lane is past the registers; 4 x 8 is the ceiling that way too. The step past it is the matrix units, and a STOCK
   Chrome on the M5 still has no `chromium-experimental-subgroup-matrix` (only behind `--enable-unsafe-webgpu`), so no
   visitor would get it.
 - **Both fusions, done.** `cs-combine` runs in the Z GEMM's epilogue (`fuseCombine`, `false` the control; `--fuse=off`):
