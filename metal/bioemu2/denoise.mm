@@ -200,6 +200,69 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
   transitionFc3(g, q, RN, I, p, false, cqc + 2 * Dc, ldc, atomTok);      // (q += gamma_q s_to_q, in fc3's epilogue)
 }
 
+// ---------------------------------------------------------------- the conditioning, layers batched
+// Every layer's four adaLN MLPs - silu(LN(c) w + b) . cond_2 + bias - read the SAME rows (the call's cond), and only
+// LN's affine and the two linears are the layer's: so a group of layers' are one batched GEMM a kind (metal/core's
+// pointer-array batch, each layer's own weight - nothing stacked but the small vectors), where each was a 68-row GEMM
+// of its own (7% of the sampler in the profile). The fast arm's; BE2_BATCH_COND=0 the control
+static const bool BATCH_COND = !getenv("BE2_BATCH_COND") || atoi(getenv("BE2_BATCH_COND")) != 0;
+struct CondKind { const char* key; std::string (*prefix)(int); int rowsExtra; const char *l0, *l2; };
+static std::string atomPrefix(int l) { return SM + "layers/" + num(l) + "/atom_block/transformer_layer/"; }
+static std::string tokPrefix(int l) { return SM + "layers/" + num(l) + "/token_block/"; }
+static std::string couplingPrefix(int l) { return SM + "layers/" + num(l) + "/coupling/"; }
+static const CondKind COND_KINDS[4] = {{"atom", atomPrefix, 1, "cond_0", "cond_2"}, {"tok", tokPrefix, 0, "cond_0", "cond_2"},
+                                       {"q", couplingPrefix, 1, "q_coupling_cond_0", "q_coupling_cond_2"},
+                                       {"s", couplingPrefix, 0, "s_coupling_cond_0", "s_coupling_cond_2"}};
+// [layers][n] of one tensor per layer, as a float buffer (made once)
+static const float* stackedVectors(const std::string& key, const CondKind& k, const char* tensor, int layers, size_t n) {
+  return M.derived<float>("cgstack:" + key + tensor, (size_t)layers * n, [&](float* out) {
+    for (int l = 0; l < layers; ++l) copy(out + (size_t)l * n, Wf(k.prefix(l) + tensor), n * 4);
+  });
+}
+// a device array of pointers, rewritten only when one changes (after a sync: an earlier call may still read it)
+static u64* pointerArray(const std::string& key, const std::vector<u64>& v) {
+  struct Arr { u64* dev = nullptr; size_t cap = 0; std::vector<u64> host; };
+  static std::map<std::string, Arr> arrays;
+  Arr& r = arrays[key];
+  if (r.host != v) {
+    mt::sync();
+    if (r.cap < v.size()) { if (r.dev) release(r.dev); r.dev = allocT<u64>(v.size()); r.cap = v.size(); }
+    upload(r.dev, v.data(), v.size() * sizeof(u64));
+    r.host = v;
+  }
+  return r.dev;
+}
+// layers l0 .. l0 + n - 1's conditioning of every kind into out[kind] + j (Rc x outC); cnd has T + 1 rows (the last
+// zero: the padding atoms'), the atom and q kinds condition on all T + 1, the token and s kinds on T
+static void condGroup(const float* cnd, int T, int Dt, int layers, int l0, int n, const int outC[4], float* out[4]) {
+  half* cin = scratch<half>("be2.cg.cin", (size_t)n * (T + 1) * Dt);
+  for (int k = 0; k < 4; ++k) {
+    const CondKind& K = COND_KINDS[k];
+    const int Rc = T + K.rowsExtra, O = outC[k];
+    const std::string l0n = std::string(K.l0), l2n = std::string(K.l2);
+    const float* w = stackedVectors(K.key, K, (l0n + "/weight").c_str(), layers, Dt);
+    const float* b = hasW(K.prefix(0) + l0n + "/bias") ? stackedVectors(K.key, K, (l0n + "/bias").c_str(), layers, Dt) : nullptr;
+    const size_t rows = (size_t)n * Rc, groups = (rows + 7) / 8;
+    run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
+        Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, 0});
+    std::vector<u64> X, Wp, Y;
+    for (int j = 0; j < n; ++j) {
+      X.push_back((u64)(cin + (size_t)j * Rc * Dt));
+      Wp.push_back((u64)M.h("w/" + K.prefix(l0 + j) + l2n + "/weight"));
+      Y.push_back((u64)(out[k] + (size_t)j * Rc * O));
+    }
+    const std::string pk = std::string("cg.") + K.key + "." + num(n);
+    Gemm G{}; G.ptrs = true; G.batch = n;
+    G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16; G.transW = true;
+    G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = Rc; G.in = Dt; G.out = O; G.label = "conditioning, layers batched";
+    gemm(G);
+    if (hasW(K.prefix(0) + l2n + "/bias")) {
+      const float* bias = stackedVectors(K.key, K, (l2n + "/bias").c_str(), layers, O);
+      be2Run1d("be2_batch_bias", (size_t)n * Rc * O, Be2BatchBiasArgs{out[k], bias, (u64)n * Rc * O, (uint)Rc, (uint)O, (uint)l0, 0});
+    }
+  }
+}
+
 // ---------------------------------------------------------------- one call
 // the row maps of `samples` stacked samples: each atom to its token's conditioning row (padding atoms to the zero row
 // T), each token to its own
@@ -278,24 +341,38 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   float* cn = scratch<float>("be2.dn.cn", (size_t)(T + 1) * Dt);
   float* sqn = scratch<float>("be2.dn.sqn", RN * Dc);
   float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
+  // the conditioning in groups of layers (condGroup) - as many as fit 64 MiB, all 16 at 68 tokens
+  const int outC[4] = {6 * Ca, 6 * Dt, 2 * Dc + Ca, 2 * Dc + Dt};
+  const bool batchCond = HALF && BATCH_COND;
+  const size_t perLayer = ((size_t)(T + 1) * (outC[0] + outC[2]) + (size_t)T * (outC[1] + outC[3])) * 4;
+  const int G = batchCond ? (int)std::max<size_t>(1, std::min<size_t>(d.layers, ((size_t)64 << 20) / perLayer)) : 1;
+  float* cg[4] = {nullptr, nullptr, nullptr, nullptr};
+  if (batchCond)
+    for (int k = 0; k < 4; ++k)
+      cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * (T + COND_KINDS[k].rowsExtra) * outC[k]);
   for (int l = 0; l < d.layers; ++l) {
     const std::string L = SM + "layers/" + num(l) + "/";
+    if (batchCond && l % G == 0) condGroup(cnd, T, Dt, d.layers, l, std::min(G, d.layers - l), outC, cg);
+    const int lj = l % G;
     const CondLayer atomL{L + "atom_block/transformer_layer/", ab, true, Ha};
     // (the atom stream's conditioning is its token's row of cond: computed on the T + 1 token rows)
-    float* condA = layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
+    float* condA = batchCond ? cg[0] + (size_t)lj * (T + 1) * outC[0] : layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
     condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
     const CondLayer tokL{L + "token_block/", tb, false, Ht};
-    float* condT = layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
+    float* condT = batchCond ? cg[1] + (size_t)lj * T * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, d.tbias ? d.tbias + tbn * l : nullptr, T,
               d.tbiasH ? d.tbiasH + tbn * l : nullptr);
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     const std::string cp = L + "coupling/";
-    layerNorm(cnd, cn, T + 1, Dt, Wf(cp + "q_coupling_cond_0/weight"), WfOpt(cp + "q_coupling_cond_0/bias"));
-    silu(cn, cn, (size_t)(T + 1) * Dt);
-    linT(cn, cp + "q_coupling_cond_2/weight", cqc, T + 1, Dt, 2 * Dc + Ca, 0.f, 0, 0, false, WfOpt(cp + "q_coupling_cond_2/bias"));
-    layerNorm(cnd, cn, T, Dt, Wf(cp + "s_coupling_cond_0/weight"), WfOpt(cp + "s_coupling_cond_0/bias"));
-    silu(cn, cn, (size_t)T * Dt);
-    linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt, 0.f, 0, 0, false, WfOpt(cp + "s_coupling_cond_2/bias"));
+    if (batchCond) { cqc = cg[2] + (size_t)lj * (T + 1) * outC[2]; csc = cg[3] + (size_t)lj * T * outC[3]; }
+    else {
+      layerNorm(cnd, cn, T + 1, Dt, Wf(cp + "q_coupling_cond_0/weight"), WfOpt(cp + "q_coupling_cond_0/bias"));
+      silu(cn, cn, (size_t)(T + 1) * Dt);
+      linT(cn, cp + "q_coupling_cond_2/weight", cqc, T + 1, Dt, 2 * Dc + Ca, 0.f, 0, 0, false, WfOpt(cp + "q_coupling_cond_2/bias"));
+      layerNorm(cnd, cn, T, Dt, Wf(cp + "s_coupling_cond_0/weight"), WfOpt(cp + "s_coupling_cond_0/bias"));
+      silu(cn, cn, (size_t)T * Dt);
+      linT(cn, cp + "s_coupling_cond_2/weight", csc, T, Dt, 2 * Dc + Dt, 0.f, 0, 0, false, WfOpt(cp + "s_coupling_cond_2/bias"));
+    }
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
     // (the fast arm on the matrix units: s_to_q SPLIT - couplingSplit - and its row never built)
     const bool csplit = HALF && gemmTensorOps() && splitPays(samples, T, N, Dt, Ca);

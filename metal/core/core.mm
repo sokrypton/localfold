@@ -845,6 +845,7 @@ static GemmArgs gemmArgs(const Gemm& g) {
   a.ta = g.transW; a.tb = g.transX;
   a.sa = g.sw; a.sb = g.sx; a.sc = a.sd = g.sy;
   a.alpha = g.alpha; a.beta = g.beta;
+  a.ptrs = g.ptrs ? 1 : 0;
   if (g.bias) { a.bias = (uint64_t)g.bias; a.epilogue |= 4; a.biasType = g.tbias == F16 ? 2 : 0; }
   if (g.relu) a.epilogue |= 2;
   if (g.gelu) a.epilogue |= 32;

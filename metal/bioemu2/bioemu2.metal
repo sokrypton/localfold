@@ -277,6 +277,31 @@ kernel void be2_cs_wq2(LF_ARGS(Be2CsWqArgs)) {
   const uint kk = a.off + (k % a.K), q = col & 3, j = 2 * (col >> 2) + (q & 1);
   a.out[t] = q < 2 ? a.w1[(ulong)j * a.C + kk] : (half)((float)a.w2[(ulong)j * a.C + kk] * a.invS);
 }
+kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  const uint j = lf_udiv((uint)row, a.Rc), r = (uint)row - j * a.Rc;
+  device const float* x = a.c + (ulong)r * a.C;
+  float s = 0; for (uint c = lane; c < a.C; c += 32) s += x[c];
+  const float mean = simd_sum(s) / a.C;
+  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = x[c] - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
+  device const float* w = a.w + (ulong)(a.l0 + j) * a.C;
+  device const float* b = a.b ? a.b + (ulong)(a.l0 + j) * a.C : nullptr;
+  for (uint c = lane; c < a.C; c += 32) {      // (lf_layernorm's order, then be2_unary's silu)
+    float n = (x[c] - mean) * inv;
+    n *= w[c];
+    if (b) n += b[c];
+    a.out[row * a.C + c] = (half)lf_silu(n);
+  }
+}
+kernel void be2_batch_bias(LF_ARGS(Be2BatchBiasArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  BE2_SPLIT(t, a.O, row, o);
+  const uint j = lf_udiv(row, a.Rc);
+  a.y[t] += a.bias[(ulong)(a.l0 + j) * a.O + o];
+}
 kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
   ulong t = LF_INDEX;
   const uint W = 2 * a.I;

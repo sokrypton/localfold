@@ -96,6 +96,9 @@ struct Gemm {
   // 128 or 256 wide (64 x 128 or 32 x 256 tiles) - gemm() returns true; false: not written, the caller's LayerNorm still to run
   ::half* lnOut = nullptr; const float* lnScale = nullptr; const float* lnOffset = nullptr; float lnEps = 1e-5f;
   ::half* lnOut2 = nullptr; const float* lnScale2 = nullptr; const float* lnOffset2 = nullptr;   // (a second norm, same eps)
+  // ptrs: X, W and Y are each a DEVICE array of `batch` pointers - a batch over separate tensors (each layer's own
+  // weight), the strides unused. On the matrix units' plain product (no epilogue) or the staged kernel
+  bool ptrs = false;
 };
 bool gemm(const Gemm& g);
 // Y [r][o] += gate[map ? map[r] : r][o] (alpha X W)[r][o] - an adaLN-gated residual (BioEmu2's be2_gated_add) in the
