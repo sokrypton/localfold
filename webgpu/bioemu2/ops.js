@@ -708,6 +708,104 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`, S * NW * H, [qkv, kvPad, bias, mask, g, out], u);
   }
 
+  /**
+   * The token stream's attention fused, windowAttention's shape over the whole stream: out[r][h hd + d] = g[r][h hd + d]
+   * sum_j softmax_j(q.k_j alpha + bias[h][qi][j]) v_j[d] for one sample's T tokens - the scores GEMM, the softmax, P.V
+   * and the gating in one dispatch a (sample, head, block of 32 queries). The keys in chunks of 32 (past T: none), an
+   * online softmax, 16 KiB of workgroup memory at a head of 48. qkv [S T][3 D] (q's bias added), bias [H][T][T].
+   */
+  tokenAttention({ qkv, bias, g, out, S, T, H, hd, alpha }) {
+    if (hd % 4) throw new Error("tokenAttention: a head width that is not whole vec4s");
+    const D = H * hd, V = hd / 4, VL = V / 4, QB = Math.ceil(T / 32);
+    if (V % 4) throw new Error("tokenAttention: a head width that is not four lanes of whole vec4s");
+    const u = new Uint32Array(8);
+    const f = new Float32Array(u.buffer);
+    u.set([S, T, QB]);
+    f[4] = alpha;
+    return this.step(`tok-attn-${H}x${hd}`, `
+struct P { S: u32, T: u32, QB: u32, pad0: u32, alpha: f32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read> gate: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+var<workgroup> ks: array<vec4<f32>, ${32 * V}>;     // [32 keys][hd]
+var<workgroup> vs: array<vec4<f32>, ${32 * V}>;
+var<workgroup> ps: array<f32, 1024>;              // [32 queries][32 keys]
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let flat = wid.x + wid.y * 65535u;
+  let qb = flat % p.QB;
+  let h = (flat / p.QB) % ${H}u;
+  let sm = flat / (p.QB * ${H}u);
+  let smc = min(sm, p.S - 1u);
+  let ql = li / 4u;
+  let sub = li % 4u;
+  let qi = qb * 32u + ql;
+  let live = sm < p.S && qi < p.T;
+  let qic = min(qi, p.T - 1u);
+  let qrow = smc * p.T + qic;
+  var q: array<vec4<f32>, ${V}>;
+  for (var d = 0u; d < ${V}u; d += 1u) {
+    let at = qrow * ${3 * D}u + h * ${hd}u + d * 4u;
+    q[d] = vec4<f32>(qkv[at], qkv[at + 1u], qkv[at + 2u], qkv[at + 3u]);
+  }
+  var m = -3.0e38;
+  var l = 0.0;
+  var o: array<vec4<f32>, ${VL}>;
+  for (var e = 0u; e < ${VL}u; e += 1u) { o[e] = vec4<f32>(0.0); }
+  let biasRow = (h * p.T + qic) * p.T;
+  let chunks = (p.T + 31u) / 32u;
+  for (var c = 0u; c < chunks; c += 1u) {
+    for (var e = 0u; e < ${Math.ceil(32 * V / 128)}u; e += 1u) {
+      let slot = li + e * 128u;
+      if (slot < ${32 * V}u) {
+        let key = slot / ${V}u;
+        let d4 = slot % ${V}u;
+        let kt = c * 32u + key;
+        var kv = vec4<f32>(0.0);
+        var vv = vec4<f32>(0.0);
+        if (kt < p.T) {
+          let row = (smc * p.T + kt) * ${3 * D}u + h * ${hd}u + d4 * 4u;
+          kv = vec4<f32>(qkv[row + ${D}u], qkv[row + ${D + 1}u], qkv[row + ${D + 2}u], qkv[row + ${D + 3}u]);
+          vv = vec4<f32>(qkv[row + ${2 * D}u], qkv[row + ${2 * D + 1}u], qkv[row + ${2 * D + 2}u], qkv[row + ${2 * D + 3}u]);
+        }
+        ks[slot] = kv;
+        vs[slot] = vv;
+      }
+    }
+    workgroupBarrier();
+    for (var jj = 0u; jj < 8u; jj += 1u) {
+      let j = sub * 8u + jj;
+      let kt = c * 32u + j;
+      var qk = 0.0;
+      for (var d = 0u; d < ${V}u; d += 1u) { qk += dot(q[d], ks[j * ${V}u + d]); }
+      var v = -3.0e38;
+      if (kt < p.T) { v = qk * p.alpha + bias[biasRow + kt]; }
+      ps[ql * 32u + j] = v;
+    }
+    workgroupBarrier();
+    var cm = m;
+    for (var j = 0u; j < 32u; j += 1u) { cm = max(cm, ps[ql * 32u + j]); }
+    let rescale = exp(m - cm);
+    l = l * rescale;
+    for (var e = 0u; e < ${VL}u; e += 1u) { o[e] = o[e] * rescale; }
+    for (var j = 0u; j < 32u; j += 1u) {
+      let w = exp(ps[ql * 32u + j] - cm);
+      l += w;
+      for (var e = 0u; e < ${VL}u; e += 1u) { o[e] += w * vs[j * ${V}u + sub * ${VL}u + e]; }
+    }
+    m = cm;
+    workgroupBarrier();
+  }
+  if (!live) { return; }
+  let ob = qrow * ${D}u + h * ${hd}u + sub * ${4 * VL}u;
+  for (var e = 0u; e < ${VL}u; e += 1u) {
+    for (var t = 0u; t < 4u; t += 1u) { out[ob + e * 4u + t] = o[e][t] / l * gate[ob + e * 4u + t]; }
+  }
+}`, S * H * QB, [qkv, bias, g, out], u);
+  }
+
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
   linear({ x, w, y, rows, inC, outC, bias, act, accumulate, xOff = 0, xStride = inC, yOff = 0, yStride = outC, wOff = 0, alpha }) {
     return this.gemm({ m: rows, n: outC, k: inC, a: x, b: w, c: y, bias, act, accumulate, alpha,

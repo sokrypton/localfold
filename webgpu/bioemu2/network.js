@@ -407,15 +407,20 @@ export class Bioemu2Gpu {
     steps.push(await o.linear({ x: s.h, w: await this.w(`${att}/proj_g/weight`), y: s.g, rows: R, inC: D, outC: D, act: "sigmoid" }));
     steps.push(await o.map("tok-qbias", R * D, [{ buffer: s.qkv, write: true }, { buffer: await this.w(`${att}/proj_q_bias`, { half: false }) }],
       "let r = i / 768u; let c = i % 768u; b0[r * 2304u + c] = b0[r * 2304u + c] + b1[c];"));
-    steps.push(await o.gemm({ m: T, n: T, k: hd, a: s.qkv, b: s.qkv, c: s.logits, batches: [S, H], alpha: 1 / Math.sqrt(hd),
-      A: { off: 0, s0: T * 3 * D, s1: hd, m: 3 * D, k: 1 }, B: { off: D, s0: T * 3 * D, s1: hd, n: 3 * D, k: 1 },
-      C: { off: 0, s0: H * T * T, s1: T * T, m: T, n: 1 } }));
-    steps.push(await o.softmax({ l: s.logits, rows: S * H * T, len: T, rowsPer: T, b1: H,
-      L: { s0: H * T * T, s1: T * T, r: T }, bias, Bias: { s0: 0, s1: T * T, r: T } }));
-    steps.push(await o.gemm({ m: T, n: hd, k: T, a: s.logits, b: s.qkv, c: s.o, batches: [S, H],
-      A: { off: 0, s0: H * T * T, s1: T * T, m: T, k: 1 }, B: { off: 2 * D, s0: T * 3 * D, s1: hd, n: 1, k: 3 * D },
-      C: { off: 0, s0: T * D, s1: hd, m: D, n: 1 } }));
-    steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
+    if (this.options.fuseTokenAttention !== false && hd % 16 === 0) {
+      // (scores, softmax, P.V and the gating in one kernel: ops.tokenAttention; fuseTokenAttention: false the control)
+      steps.push(await o.tokenAttention({ qkv: s.qkv, bias, g: s.g, out: s.o, S, T, H, hd, alpha: 1 / Math.sqrt(hd) }));
+    } else {
+      steps.push(await o.gemm({ m: T, n: T, k: hd, a: s.qkv, b: s.qkv, c: s.logits, batches: [S, H], alpha: 1 / Math.sqrt(hd),
+        A: { off: 0, s0: T * 3 * D, s1: hd, m: 3 * D, k: 1 }, B: { off: D, s0: T * 3 * D, s1: hd, n: 3 * D, k: 1 },
+        C: { off: 0, s0: H * T * T, s1: T * T, m: T, n: 1 } }));
+      steps.push(await o.softmax({ l: s.logits, rows: S * H * T, len: T, rowsPer: T, b1: H,
+        L: { s0: H * T * T, s1: T * T, r: T }, bias, Bias: { s0: 0, s1: T * T, r: T } }));
+      steps.push(await o.gemm({ m: T, n: hd, k: T, a: s.logits, b: s.qkv, c: s.o, batches: [S, H],
+        A: { off: 0, s0: H * T * T, s1: T * T, m: T, k: 1 }, B: { off: 2 * D, s0: T * 3 * D, s1: hd, n: 1, k: 3 * D },
+        C: { off: 0, s0: T * D, s1: hd, m: D, n: 1 } }));
+      steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
+    }
     steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: R, inC: D, outC: D }));
     steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 2 * D));
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));

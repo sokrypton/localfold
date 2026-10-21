@@ -55,7 +55,7 @@ export async function main(device, args) {
   // --split=off: the coupling's atom-side mixer unsplit (webgpu/bioemu2's couplingSplit, the control); --fuse=off: its
   // combine a separate pass (fuseCombine, the control)
   const net = new Bioemu2Gpu(device, read, { half, trunkPrecision, couplingSplit: option(args, "split", "on") !== "off",
-    fuseCombine: option(args, "fuse", "on") !== "off", batchConditioning: option(args, "batch-cond", "on") !== "off", fuseWindow: option(args, "fuse-win", "on") !== "off" });
+    fuseCombine: option(args, "fuse", "on") !== "off", batchConditioning: option(args, "batch-cond", "on") !== "off", fuseWindow: option(args, "fuse-win", "on") !== "off", fuseTokenAttention: option(args, "fuse-tok", "on") !== "off" });
   net.ops.gemmVersion = Number(option(args, "gemm", "2"));     // (--gemm=1: webgpu/bioemu2's original GEMM, the control)
   net.ops.b16Panels = option(args, "b16", "on") !== "off";   // (--b16=off: the weight panels staged in float32)
   if (option(args, "split-target", null)) net.ops.splitTarget = Number(option(args, "split-target", null));   // (0: no split-K)
