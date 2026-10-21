@@ -161,6 +161,33 @@ export class Bioemu2Gpu {
     `let r = i / 128u; let c = i % 128u; let st = b4[r]; var t = U(0u);
   if (st >= 0) { t = u32(st) % U(0u); }
   b0[i] = b3[t * 128u + c] * (b1[i] - b2[r * 6u + 4u]) / b2[r * 6u + 3u];`, [T]));
+    if (this.options.fuseCombine !== false) {
+      // Z never stored: the GEMM's columns reordered so a lane holds four gates and their four values, and the combine
+      // and the SwiGLU run in its epilogue (fuseCombine: false is the control - Z written, then cs-combine)
+      steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: out,
+        A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: 0, m: I, n: 1 },
+        pair: { key: `cs${T}`, half: I, buffers: [cs.astats, cs.P, cs.QB, atomTokenS],
+          decls: `@group(0) @binding(5) var<storage, read> astats: array<f32>;
+@group(0) @binding(6) var<storage, read> pTok: array<f32>;
+@group(0) @binding(7) var<storage, read> qb: array<f32>;
+@group(0) @binding(8) var<storage, read> atomTok: array<i32>;`,
+          body: `fn pairOut(r: u32, j0: u32, z1: vec4<f32>, z2: vec4<f32>) {
+  let st = atomTok[r]; var t = ${T}u;
+  if (st >= 0) { t = u32(st) % ${T}u; }
+  let s = r * 6u; let inv = astats[s]; let da = astats[s + 1u]; let dq = astats[s + 2u]; let sq = astats[s + 3u];
+  let sa = astats[s + 5u];
+  let cr = t * 10752u;
+  for (var w = 0u; w < 4u; w += 1u) {
+    let j = j0 + w;
+    var p1 = 0.0; var p2 = 0.0;
+    if (st >= 0) { let pr = u32(st) * 3584u; p1 = sa * pTok[pr + j]; p2 = sa * pTok[pr + 1792u + j]; }
+    let u1 = inv * (p1 + sq * z1[w] + da * qb[cr + j] + dq * qb[cr + 3584u + j]) + qb[cr + 7168u + j];
+    let u2 = inv * (p2 + sq * z2[w] + da * qb[cr + 1792u + j] + dq * qb[cr + 3584u + 1792u + j]) + qb[cr + 7168u + 1792u + j];
+    c[r * 1792u + j] = u1 / (1.0 + exp(-u1)) * u2;
+  }
+}` } }));
+      return;
+    }
     steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: cs.Z,
       A: { off: 0, m: DA, k: 1 }, B: { off: DT, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
     // each atom's two pre-activations, and the SwiGLU of them
@@ -771,7 +798,7 @@ export class Bioemu2Gpu {
       gA: o.buffer("cs.gA", (T + 1) * DT), gQ: o.buffer("cs.gQ", (T + 1) * DA), beta: o.buffer("cs.beta", (T + 1) * 896),
       QB: o.buffer("cs.QB", (T + 1) * 3 * 3584), tstats: o.buffer("cs.tstats", S * T * 3), xa: o.buffer("cs.xa", S * T * DT),
       P: o.buffer("cs.P", S * T * 3584), astats: o.buffer("cs.astats", S * N * 6), xq: o.buffer("cs.xq", S * N * DA),
-      Z: o.buffer("cs.Z", S * N * 3584),
+      Z: this.options.fuseCombine === false ? o.buffer("cs.Z", S * N * 3584) : null,   // (fused: never stored)
     };
     const sq = o.buffer("dn.sq", S * N * 896);
     const sqh = o.buffer("dn.sqh", S * N * 896);

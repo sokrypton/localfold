@@ -210,8 +210,13 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   register prefetch of the next panel 270, every accumulator index a constant (epilogue included) 282 - the compiler's
   own unrolling of the shipped loop is better than any of them. The step past it is the matrix units, and a STOCK
   Chrome on the M5 still has no `chromium-experimental-subgroup-matrix` (only behind `--enable-unsafe-webgpu`), so no
-  visitor would get it. What is left is fusion: the coupling's `cs-combine` (11 ms, 4%, bandwidth-bound) into its Z
-  GEMM's epilogue, and split-K's `gemm-reduce` (17 ms, 6%).
+  visitor would get it.
+- **Both fusions, done.** `cs-combine` runs in the Z GEMM's epilogue (`fuseCombine`, `false` the control; `--fuse=off`):
+  the GEMM's columns are reordered (`bRow`, gemm2Source's pair mode) so a lane's two vec4 halves are four gates and
+  their four values, and the 41 MB Z is never stored - BIT-IDENTICAL stage dumps, a call 267 -> 259 ms. And split-K
+  splits far less: its target 1024 -> 128 work units (`--split-target=`), a 5-sample call 258 -> 248 ms, a 1-sample
+  one 107 -> 101 (no split at all is 106 there - it still pays where rows are few). The partial planes' traffic was
+  most of what the deeper split bought. A 68-residue 5-sample fold 62.3 -> 56.5 s, RMSD 0.95-1.62 A.
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.

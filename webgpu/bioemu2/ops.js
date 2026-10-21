@@ -141,7 +141,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
  * or 4, the error back to metal/bioemu2's fast arm's and the speed with it (267, 278 ms). This arm keeps float32
  * activations and only the weights in half, which is why it is the more accurate of the two ports.
  */
-function gemm2Source(wordB) {
+function gemm2Source(wordB, pair = null) {
   const BK = 16;
   const E = "f32";
   return `
@@ -155,6 +155,11 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
 @group(0) @binding(2) var<storage, read> b: array<${wordB ? "u32" : "f32"}>;
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;
 @group(0) @binding(4) var<storage, read> bias: array<f32>;
+${pair ? `${pair.decls}
+// (pair mode: tile column 8 g + w is B's row 4 g + w for w < 4, the gate, and ${pair.half} + 4 g + w - 4, its value - so
+// a lane's acc[2 i] and acc[2 i + 1] are four gates and their four values, handed to pairOut together)
+fn bRow(v: u32) -> u32 { return ((v / 4u) % 2u) * ${pair.half}u + (v / 8u) * 4u + v % 4u; }
+${pair.body}` : "fn bRow(v: u32) -> u32 { return v; }"}
 var<workgroup> ta: array<vec4<${E}>, ${BK * 16}>;    // [BK][64] k-major, four rows a vec4
 var<workgroup> tb: array<vec4<${E}>, ${BK * 32}>;    // [BK][128]
 @compute @workgroup_size(256)
@@ -208,7 +213,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         for (var t = 0u; t < 4u; t += 1u) {
           let row = n0 + r4 * 4u + t;
           if (row < p.n) {
-            let pair = unpack2x16float(b[(baseB + row * p.sBn + k) / 2u]);
+            let pair = unpack2x16float(b[(baseB + bRow(row) * p.sBn + k) / 2u]);
             lo[t] = pair.x;
             if (k + 1u < kEnd) { hi[t] = pair.y; }
           }
@@ -225,7 +230,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       if (inBatch && k < kEnd) {
         for (var t = 0u; t < 4u; t += 1u) {
           let row = n0 + r4 * 4u + t;
-          if (row < p.n) { v[t] = b[baseB + row * p.sBn + k * p.sBk]; }
+          if (row < p.n) { v[t] = b[baseB + bRow(row) * p.sBn + k * p.sBk]; }
         }
       }
       tb[kk * 32u + r4] = vec4<${E}>(v);
@@ -243,6 +248,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     workgroupBarrier();
   }
   if (!inBatch) { return; }
+  ${pair ? `for (var i = 0u; i < 4u; i += 1u) {
+    let m = m0 + tm + i;
+    if (m < p.m && n0 + tn < p.n) { pairOut(m, ((n0 + tn) / 8u) * 4u, acc[2u * i] * p.alpha, acc[2u * i + 1u] * p.alpha); }
+  }
+  return;` : ""}
   let baseC = p.offC + b0 * p.sC0 + b1 * p.sC1;
   for (var i = 0u; i < 4u; i += 1u) {
     let m = m0 + tm + i;
@@ -515,8 +525,12 @@ export class Bioemu2Ops {
     // (the line is in WORK, not tiles: gemm2's 64 x 128 tile is twice gemmSource's, and counting it as one split twice as
     // many GEMMs - the reduce went 16 -> 32 ms of a denoiser call, eating the faster kernel's gain)
     const work = v2 ? 2 : 1;
-    if (spec.noSplit !== true && B0 * B1 === 1 && tiles * work < 256 && k >= 512) {
-      const splits = Math.min(Math.floor(k / 128), Math.ceil(1024 / (tiles * work)));
+    if (spec.pair && !v2) throw new Error("a pair epilogue is gemm2Source's");
+    // 🔴 THE TARGET IS 128 WORK UNITS, NOT 1024: swept on an M5 (ABAB, the shipped gemm2 and the fused combine), a 1-sample
+    // call is 107 ms at 1024, 101 at 256 and 128, 106 with no split at all, and a 5-sample call 258 / 248 / 249 / 249 - the
+    // partial planes' traffic was most of what a deeper split bought. One part is no split (no reduce).
+    const splits = Math.min(Math.floor(k / 128), Math.ceil((this.splitTarget ?? 128) / (tiles * work)));
+    if (spec.noSplit !== true && !spec.pair && B0 * B1 === 1 && tiles * work < 256 && k >= 512 && splits >= 2) {
       const chunk = Math.ceil(k / splits / 32) * 32;      // (a multiple of either kernel's K step)
       const parts = Math.ceil(k / chunk);
       // ...into ONE scratch per size class, shared by every split GEMM recorded: the dispatches run in order, so
@@ -550,9 +564,10 @@ export class Bioemu2Ops {
     u[23] = B0 * B1;
     u[24] = spec.splitChunk ?? 0;
     const groups = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
-    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}`;
-    const step = await this.step(kind, v2 ? gemm2Source(word) : gemmSource(word), groups,
-                                 [spec.a, spec.b, spec.c, spec.bias ?? this.dummy], u);
+    // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
+    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}`;
+    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair) : gemmSource(word), groups,
+                                 [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? [])], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
     return step;
   }
