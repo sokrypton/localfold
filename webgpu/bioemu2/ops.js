@@ -141,7 +141,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
  * or 4, the error back to metal/bioemu2's fast arm's and the speed with it (267, 278 ms). This arm keeps float32
  * activations and only the weights in half, which is why it is the more accurate of the two ports.
  */
-function gemm2Source(wordB, pair = null, b16 = false) {
+function gemm2Source(wordB, pair = null, b16 = false, gate = null) {
   const BK = 16;
   const E = "f32";
   // (b16: B's panel - a half weight, unpacked - staged as f16, exact, and widened as it is read: a third less
@@ -152,12 +152,16 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
   offA: u32, sA0: u32, sA1: u32, sAm: u32, sAk: u32,
   offB: u32, sB0: u32, sB1: u32, sBn: u32, sBk: u32,
   offC: u32, sC0: u32, sC1: u32, sCm: u32, sCn: u32,
-  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32, biasOff: u32, biasS0: u32 };
+  bias: u32, act: u32, accumulate: u32, alpha: f32, batches: u32, split: u32, biasOff: u32, biasS0: u32,
+  gS: u32, gOff: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<${wordB ? "u32" : "f32"}>;
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;
 @group(0) @binding(4) var<storage, read> bias: array<f32>;
+${gate ? `// (gate: c += gcond[row' gS + gOff + n] v, row' the row through gmap - a negative entry none - an adaLN-gated residual)
+@group(0) @binding(5) var<storage, read> gcond: array<f32>;
+${gate === "map" ? "@group(0) @binding(6) var<storage, read> gmap: array<i32>;" : ""}` : ""}
 ${pair ? `${pair.decls}
 // (pair mode: tile column 8 g + w is B's row 4 g + w for w < 4, the gate, and ${pair.half} + 4 g + w - 4, its value - so
 // a lane's acc[2 i] and acc[2 i + 1] are four gates and their four values, handed to pairOut together)
@@ -269,6 +273,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       if (p.act == 1u) { v = max(v, 0.0); }
       if (p.act == 2u) { v = 1.0 / (1.0 + exp(-v)); }
       let at = baseC + m * p.sCm + n * p.sCn;
+      ${gate ? `let gr = ${gate === "map" ? "gmap[m]" : "i32(m)"};
+      if (gr >= 0) { c[at] = c[at] + gcond[u32(gr) * p.gS + p.gOff + n] * v; }
+      continue;` : ""}
       if (p.accumulate != 0u) { v += c[at]; }
       c[at] = v;
     }
@@ -537,6 +544,19 @@ export class Bioemu2Ops {
     // many GEMMs - the reduce went 16 -> 32 ms of a denoiser call, eating the faster kernel's gain)
     const work = v2 ? 2 : 1;
     if (spec.pair && !v2) throw new Error("a pair epilogue is gemm2Source's");
+    // spec.gate = {cond, stride, off, map?}: c[r][n] += cond[map(r) stride + off + n] (alpha A B^T)[r][n] - an adaLN-gated
+    // residual (bioemu2's gatedAdd) in the epilogue; a negative map entry adds nothing. gemmSource's: the two passes
+    if (spec.gate && (!v2 || B0 * B1 !== 1)) {
+      const g = spec.gate;
+      const tmp = this.gateScratch?.n >= m * n ? this.gateScratch : (this.gateScratch = { buf: this.buffer("gemm.gate", m * n), n: m * n });
+      const prod = await this.gemm({ ...spec, gate: undefined, c: tmp.buf, accumulate: false, C: { off: 0, m: n, n: 1 } });
+      const add = await this.map(g.map ? "gate-add-map" : "gate-add", m * n,
+        [{ buffer: spec.c, write: true }, { buffer: tmp.buf }, { buffer: g.cond }, ...(g.map ? [{ buffer: g.map, type: "i32" }] : [])],
+        `let r = i / U(0u); let col = i % U(0u); let at = U(3u) + r * U(4u) + col * U(5u);
+  ${g.map ? "let gr = b3[r];" : "let gr = i32(r);"}
+  if (gr >= 0) { b0[at] = b0[at] + b2[u32(gr) * U(1u) + U(2u) + col] * b1[i]; }`, [n, g.stride, g.off, C.off, C.m, C.n]);
+      return this.program([prod, add]);
+    }
     // 🔴 THE TARGET IS 128 WORK UNITS, NOT 1024: swept on an M5 (ABAB, the shipped gemm2 and the fused combine), a 1-sample
     // call is 107 ms at 1024, 101 at 256 and 128, 106 with no split at all, and a 5-sample call 258 / 248 / 249 / 249 - the
     // partial planes' traffic was most of what a deeper split bought. One part is no split (no reduce).
@@ -550,24 +570,26 @@ export class Bioemu2Ops {
       this.partials ??= new Map();
       if (!this.partials.has(floats)) this.partials.set(floats, this.buffer("gemm.partial", floats));
       const partial = this.partials.get(floats);
-      const first = await this.gemm({ ...spec, noSplit: true, c: partial, bias: undefined, act: undefined, accumulate: false,
+      const first = await this.gemm({ ...spec, noSplit: true, c: partial, bias: undefined, act: undefined, accumulate: false, gate: undefined,
                                       batches: [1, parts], splitChunk: chunk,
                                       A: { ...A, s1: 0 }, B: { ...B, s1: 0 }, C: { off: 0, s0: 0, s1: m * n, m: n, n: 1 } });
-      const reduce = await this.map("gemm-reduce", m * n, [{ buffer: spec.c, write: true }, { buffer: partial },
-        { buffer: spec.bias ?? this.dummy }],
+      const g = spec.gate;
+      const reduce = await this.map(g ? (g.map ? "gemm-reduce-gm" : "gemm-reduce-g") : "gemm-reduce", m * n, [{ buffer: spec.c, write: true }, { buffer: partial },
+        { buffer: spec.bias ?? this.dummy }, ...(g ? [{ buffer: g.cond }, ...(g.map ? [{ buffer: g.map, type: "i32" }] : [])] : [])],
       `let n = U(1u); let row = i / n; let col = i % n; var v = 0.0;
   for (var s = 0u; s < U(2u); s += 1u) { v += b1[s * U(0u) * n + i]; }
   if (U(3u) != 0u) { v += b2[col]; }
   if (U(4u) == 1u) { v = max(v, 0.0); }
   if (U(4u) == 2u) { v = 1.0 / (1.0 + exp(-v)); }
   let at = U(6u) + row * U(7u) + col * U(8u);
-  if (U(5u) != 0u) { v += b0[at]; }
-  b0[at] = v;`, [m, n, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
-        C.off, C.m, C.n]);
+  ${g ? `let gr = ${g.map ? "b4[row]" : "i32(row)"};
+  if (gr >= 0) { b0[at] = b0[at] + b3[u32(gr) * U(9u) + U(10u) + col] * v; }` : `if (U(5u) != 0u) { v += b0[at]; }
+  b0[at] = v;`}`, [m, n, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
+        C.off, C.m, C.n, g?.stride ?? 0, g?.off ?? 0]);
       first.label = `gemm ${m}x${n}x${k} split ${parts}`;
       return this.program([first, reduce]);
     }
-    const u = new Uint32Array(28);
+    const u = new Uint32Array(32);
     const f = new Float32Array(u.buffer);
     u.set([m, n, k, B1, A.off, A.s0, A.s1, A.m, A.k, B.off, B.s0, B.s1, B.n, B.k, C.off, C.s0, C.s1, C.m, C.n,
       spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0]);
@@ -578,13 +600,17 @@ export class Bioemu2Ops {
     if ((spec.biasOff || spec.biasS0) && !v2) throw new Error("a per-batch bias is gemm2Source's");
     u[25] = spec.biasOff ?? 0;
     u[26] = spec.biasS0 ?? 0;
+    u[27] = spec.gate?.stride ?? 0;
+    u[28] = spec.gate?.off ?? 0;
     const groups = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
     // (a half weight's panel staged in f16 where the device has shader-f16: b16Panels false is the control)
     const b16 = v2 && word && this.b16Panels !== false && this.device.features?.has?.("shader-f16") === true;
-    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${b16 ? "-b16" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}`;
-    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16) : gemmSource(word), groups,
-                                 [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? [])], u);
+    const gate = spec.gate ? (spec.gate.map ? "map" : "plain") : null;
+    const kind = `${v2 ? "gemm2" : "gemm"}${word ? "-h" : ""}${b16 ? "-b16" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}${gate ? `-g${gate}` : ""}`;
+    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16, gate) : gemmSource(word), groups,
+                                 [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? []),
+                                  ...(spec.gate ? [spec.gate.cond, ...(spec.gate.map ? [spec.gate.map] : [])] : [])], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
     return step;
   }
@@ -807,8 +833,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   }
 
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
-  linear({ x, w, y, rows, inC, outC, bias, act, accumulate, xOff = 0, xStride = inC, yOff = 0, yStride = outC, wOff = 0, alpha }) {
-    return this.gemm({ m: rows, n: outC, k: inC, a: x, b: w, c: y, bias, act, accumulate, alpha,
+  linear({ x, w, y, rows, inC, outC, bias, act, accumulate, xOff = 0, xStride = inC, yOff = 0, yStride = outC, wOff = 0, alpha, gate }) {
+    return this.gemm({ m: rows, n: outC, k: inC, a: x, b: w, c: y, bias, act, accumulate, alpha, gate,
                        A: { off: xOff, m: xStride, k: 1 }, B: { off: wOff, n: inC, k: 1 }, C: { off: yOff, m: yStride, n: 1 } });
   }
 

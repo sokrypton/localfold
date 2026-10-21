@@ -233,7 +233,7 @@ export class Bioemu2Gpu {
    * SwiGLU transition over `rows` x `width` (hidden `hidden`): x [+]= fc3(silu(fc1 h) * fc2 h), where h is
    * `input` (already normalised/modulated when `norm` is false) - returned steps write `out`.
    */
-  async transition(steps, prefix, { input, rows, width, hidden, out, scratch, norm, accumulate = false }) {
+  async transition(steps, prefix, { input, rows, width, hidden, out, scratch, norm, accumulate = false, gate }) {
     const o = this.ops;
     let src = input;
     if (norm) {
@@ -250,7 +250,8 @@ export class Bioemu2Gpu {
   let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [hidden]));
     }
-    steps.push(await o.linear({ x: scratch.t, w: await this.w(`${prefix}/fc3/weight`), y: out, rows, inC: hidden, outC: width, accumulate }));
+    // (gate: out += cond[map(r)][off..] fc3(...), the adaLN-gated residual in fc3's epilogue)
+    steps.push(await o.linear({ x: scratch.t, w: await this.w(`${prefix}/fc3/weight`), y: out, rows, inC: hidden, outC: width, accumulate, gate }));
   }
 
   /** silu(LN(c) w + b) . cond_2 + bias, per row of the conditioning source. */
@@ -373,22 +374,12 @@ export class Bioemu2Gpu {
       }
       steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
     }
-    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: R, inC: D, outC: D }));
-    steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 2 * D));
+    // (x += gamma_a proj_o(...) and x += gamma_m transition(...) in their GEMMs' epilogues - ops.gemm's gate)
+    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: x, rows: R, inC: D, outC: D,
+                                gate: { cond, stride: 6 * D, off: 2 * D, map } }));
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));
-    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: s.t3,
-                                                         scratch: s, norm: false });
-    steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 5 * D));
-  }
-
-  /** x += gamma[row] * h, gamma at column `off` of cond's row (map[row], or row). */
-  gatedAdd(x, h, cond, map, rows, width, stride, off) {
-    return this.ops.map(map ? "gated-add-map" : "gated-add", rows * width,
-      [{ buffer: x, write: true }, { buffer: h }, { buffer: cond }, ...(map ? [{ buffer: map, type: "i32" }] : [])],
-      map ? `let r = i / U(0u); let c = i % U(0u); let m = b3[r];
-  if (m >= 0) { b0[i] = b0[i] + b2[u32(m) * U(1u) + U(2u) + c] * b1[i]; }`
-        : `let r = i / U(0u); let c = i % U(0u);
-  b0[i] = b0[i] + b2[r * U(1u) + U(2u) + c] * b1[i];`, [width, stride, off]);
+    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: x,
+                                                         scratch: s, norm: false, gate: { cond, stride: 6 * D, off: 5 * D, map } });
   }
 
   /**
@@ -422,12 +413,12 @@ export class Bioemu2Gpu {
         C: { off: 0, s0: T * D, s1: hd, m: D, n: 1 } }));
       steps.push(await o.map("mul", R * D, [{ buffer: s.o, write: true }, { buffer: s.g }], "b0[i] = b0[i] * b1[i];"));
     }
-    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: s.t3, rows: R, inC: D, outC: D }));
-    steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 2 * D));
+    // (x += gamma_a proj_o(...) and x += gamma_m transition(...) in their GEMMs' epilogues - ops.gemm's gate)
+    steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: x, rows: R, inC: D, outC: D,
+                                gate: { cond, stride: 6 * D, off: 2 * D, map } }));
     steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));
-    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: s.t3,
-                                                         scratch: s, norm: false });
-    steps.push(await this.gatedAdd(x, s.t3, cond, map, R, D, 6 * D, 5 * D));
+    await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: x,
+                                                         scratch: s, norm: false, gate: { cond, stride: 6 * D, off: 5 * D, map } });
   }
 
   /** Scratch for a stream of `rows` x `width`. */
@@ -977,6 +968,12 @@ export class Bioemu2Gpu {
         await this.condition(steps, cp, { c: cond, rows: T, width: DT, outC: 2560, ln: lnT, out: condS,
                                           l0: "s_coupling_cond_0", l2: "s_coupling_cond_2" });
       }
+      // q_to_s's input FIRST - concat(q[own sample, centre(t)], a) per token, modulated by the token's s coupling: s_to_q
+      // writes q in place (its fc3's gated residual), and both mixers read the layer's q and a from before either update
+      steps.push(await o.map("cat-qa", S * T * 896, [{ buffer: qs, write: true }, { buffer: q }, { buffer: a }, { buffer: centre, type: "i32" }],
+        `let r = i / 896u; let c = i % 896u; let sm = r / U(0u); let t = r % U(0u);
+  if (c < 128u) { b0[i] = b1[(sm * U(1u) + u32(b3[t])) * 128u + c]; } else { b0[i] = b2[r * 768u + c - 128u]; }`, [T, N]));
+      steps.push(await o.layerNorm({ x: qs, y: qsh, rows: S * T, width: 896, mod: { cond: condS, stride: 2560, alpha: 0, beta: 896, map: tokenMap } }));
       // s_to_q: concat(a[own sample, token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
       if (split) {
         await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt, pre: cv?.pre });
@@ -990,12 +987,9 @@ export class Bioemu2Gpu {
           `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
       }
-      steps.push(await o.linear({ x: sqt, w: await this.w(`${cp}/s_to_q_mixer/fc3/weight`), y: dq, rows: S * N, inC: 1792, outC: DA }));
-      // q_to_s: concat(q[own sample, centre(t)], a) per token, modulated by the token's s coupling, a SwiGLU to 768
-      steps.push(await o.map("cat-qa", S * T * 896, [{ buffer: qs, write: true }, { buffer: q }, { buffer: a }, { buffer: centre, type: "i32" }],
-        `let r = i / 896u; let c = i % 896u; let sm = r / U(0u); let t = r % U(0u);
-  if (c < 128u) { b0[i] = b1[(sm * U(1u) + u32(b3[t])) * 128u + c]; } else { b0[i] = b2[r * 768u + c - 128u]; }`, [T, N]));
-      steps.push(await o.layerNorm({ x: qs, y: qsh, rows: S * T, width: 896, mod: { cond: condS, stride: 2560, alpha: 0, beta: 896, map: tokenMap } }));
+      // (q += gamma_q s_to_q in fc3's epilogue - ops.gemm's gate)
+      steps.push(await o.linear({ x: sqt, w: await this.w(`${cp}/s_to_q_mixer/fc3/weight`), y: q, rows: S * N, inC: 1792, outC: DA,
+                                  gate: { cond: condQ, stride: 1920, off: 1792, map: atomMap } }));
       const qsFused = await o.swigluLinear({ x: qsh, w: await this.swiglu(`${cp}/q_to_s_mixer`), y: qst, rows: S * T, inC: 896, hidden: 1792 });
       if (qsFused) steps.push(qsFused);
       else {
@@ -1004,10 +998,9 @@ export class Bioemu2Gpu {
           `let r = i / U(0u); let c = i % U(0u); let g = b0[r * 2u * U(0u) + c]; let v = b0[r * 2u * U(0u) + U(0u) + c];
   b1[i] = g / (1.0 + exp(-g)) * v;`, [1792]));
       }
-      steps.push(await o.linear({ x: qst, w: await this.w(`${cp}/q_to_s_mixer/fc3/weight`), y: da, rows: S * T, inC: 1792, outC: DT }));
-      // a += gamma_s * q_to_s; q += gamma_q * s_to_q
-      steps.push(await this.gatedAdd(a, da, condS, tokenMap, S * T, DT, 2560, 1792));
-      steps.push(await this.gatedAdd(q, dq, condQ, atomMap, S * N, DA, 1920, 1792));
+      // (a += gamma_s q_to_s, likewise)
+      steps.push(await o.linear({ x: qst, w: await this.w(`${cp}/q_to_s_mixer/fc3/weight`), y: a, rows: S * T, inC: 1792, outC: DT,
+                                  gate: { cond: condS, stride: 2560, off: 1792, map: tokenMap } }));
     }
     // readout: LN(q W_q + a[token] W_s) (weight only) . to_out_1, then the EDM output
     const ro = `${P}/readout`;
