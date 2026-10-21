@@ -442,34 +442,36 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   const gated = (cell, value, gate) => `pair_mask * ${cell}.${value} * logistic(${cell}.${gate})`;
   const abBiasDeclare = [];
   for (let c = 0; c < columnsPerThread; c += 1) {
-    abBiasDeclare.push(`  var bias_${c} = ${accVector}(0.0);
-  {
-    let h = h0 + ${columnOfCol(c)};
-    if (h < ${H_END}) {
-      bias_${c} = ${accVector}(
-        ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h]`))).join(",\n        ")});
-    }
+    abBiasDeclare.push(`  let h_${c} = h0 + ${columnOfCol(c)};
+  let valid_h_${c} = h_${c} < ${H_END};
+  let w_slot_${c} = local.y * TILE_COLUMNS + ${columnOfCol(c)};
+  let w_base_${c} = h_${c} * CZ + local.y;
+  var bias_${c} = ${accVector}(0.0);
+  if (valid_h_${c}) {
+    bias_${c} = ${accVector}(
+      ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h_${c}]`))).join(",\n      ")});
   }`);
     for (let r = 0; r < rowsPerThread; r += 1) {
       abBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
     }
   }
   const abStageWeight = Array.from({ length: columnsPerThread }, (_, c) => `    {
-      let h = h0 + ${columnOfCol(c)};
-      let slot = local.y * TILE_COLUMNS + ${columnOfCol(c)};
       var packed = ${accVector}(0.0);
-      if (h < ${H_END} && weight_c < CZ) {
-        let weight_index = h * CZ + weight_c;
+      if (valid_h_${c} && weight_c < CZ) {
+        let weight_index = w_base_${c} + c0;
         packed = ${accVector}(
           ${MATRICES.map(([, name]) =>
             accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n          ")});
       }
-      tile_weight[slot] = packed;
+      tile_weight[w_slot_${c}] = packed;
     }`).join("\n");
+  const abWeightIndex = (k, c) => (packAB
+    ? `${k * PROJECT_TILE_COLUMNS + c}u + local.x * ${columnsPerThread}u`
+    : `${k * PROJECT_TILE_COLUMNS + c * PROJECT_W}u + local.x`);
   const abInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
       let x = tile_source[local.y * ${PROJECT_W}u + ${k}u];
 ${Array.from({ length: columnsPerThread }, (_, c) => `      {
-        let packed = tile_weight[${k}u * TILE_COLUMNS + ${columnOfCol(c)}];
+        let packed = tile_weight[${abWeightIndex(k, c)}];
         ${overRows((r) => `acc_${r}_${c} += ${rowAt("x", r)} * packed;`)}
       }`).join("\n")}
     }`).join("\n");
@@ -533,19 +535,22 @@ fn main(
   let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
   let tile_index = local.y * ${PROJECT_W}u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
-  var acc: array<${accVector}, ${rowsPerThread * columnsPerThread}>;
-  _ = &acc;
 ${abBiasDeclare.join("\n")}
   for (var c0 = 0u; c0 < CZ; c0 += ${PROJECT_W}u) {
     let source_c = c0 + local.x;
     let weight_c = c0 + local.y;
-    var staged: ${projectRowVector};
-    ${overRows((r) => `{
-        let row = row0 + ${r}u * ${PROJECT_W}u;
-        var value = 0.0;
-        if (row < PAIRS && source_c < CZ) { value = ${storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c")}; }
-        ${rowAt("staged", r)} = ${accNarrow("value")};
-      }`)}
+    var staged = ${projectRowVector}(0.0);
+    if (source_c < CZ) {
+      if (row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS) {
+        let s0 = row0 * CZ_STRIDE + source_c;
+        ${overRows((r) => `${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `s0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
+      } else {
+        ${overRows((r) => `{
+          let row = row0 + ${r * PROJECT_W}u;
+          if (row < PAIRS) { ${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c"))}; }
+        }`)}
+      }
+    }
     tile_source[tile_index] = staged;
 ${abStageWeight}
     workgroupBarrier();
@@ -698,13 +703,21 @@ ${contractStores}
       var staged = vec4<f16>(0.0);
       if (k < L) {
         let r0 = ${row0} + ${lane};
-        if (r0 < L) { staged.x = f16(${load("r0")} * 0.0625); }
         let r1 = r0 + 16u;
-        if (r1 < L) { staged.y = f16(${load("r1")} * 0.0625); }
         let r2 = r0 + 32u;
-        if (r2 < L) { staged.z = f16(${load("r2")} * 0.0625); }
         let r3 = r0 + 48u;
-        if (r3 < L) { staged.w = f16(${load("r3")} * 0.0625); }
+        if (r3 < L) {
+          staged = vec4<f16>(
+            f16(${load("r0")} * 0.0625),
+            f16(${load("r1")} * 0.0625),
+            f16(${load("r2")} * 0.0625),
+            f16(${load("r3")} * 0.0625),
+          );
+        } else {
+          if (r0 < L) { staged.x = f16(${load("r0")} * 0.0625); }
+          if (r1 < L) { staged.y = f16(${load("r1")} * 0.0625); }
+          if (r2 < L) { staged.z = f16(${load("r2")} * 0.0625); }
+        }
       }
       ${tile}[${kLane} * 16u + ${lane}] = staged;
     }`;
@@ -796,38 +809,40 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
   const outColumnsPerThread = OUT_TILE_COLUMNS / PROJECT_W;
   const outBiasDeclare = [];
   for (let c = 0; c < outColumnsPerThread; c += 1) {
-    outBiasDeclare.push(`  var bias_${c} = ${outVector2}(0.0);
-  {
-    let out_channel = channel0 + ${c * PROJECT_W}u;
-    if (out_channel < CZ) {
-      bias_${c} = ${outVector2}(
-        ${accNarrow(readWeight("weights[W_LINEARZBIAS + out_channel]"))},
-        ${accNarrow(readWeight("weights[W_LINEARGBIAS + out_channel]"))});
-    }
+    outBiasDeclare.push(`  let out_col_${c} = channel0 + ${c * PROJECT_W}u;
+  let valid_col_${c} = out_col_${c} < CZ;
+  let w_slot_${c} = local.y * TILE_COLUMNS + local.x + ${c * PROJECT_W}u;
+  let wz_base_${c} = W_LINEARZWEIGHT + out_col_${c} * CH + local.y;
+  let wg_base_${c} = W_LINEARGWEIGHT + out_col_${c} * CZ + local.y;
+  var bias_${c} = ${outVector2}(0.0);
+  if (valid_col_${c}) {
+    bias_${c} = ${outVector2}(
+      ${accNarrow(readWeight(`weights[W_LINEARZBIAS + out_col_${c}]`))},
+      ${accNarrow(readWeight(`weights[W_LINEARGBIAS + out_col_${c}]`))});
   }`);
     for (let r = 0; r < rowsPerThread; r += 1) {
       outBiasDeclare.push(`  var acc_${r}_${c} = bias_${c};`);
     }
   }
   const outStageWeight = Array.from({ length: outColumnsPerThread }, (_, c) => `    {
-      let out_channel = channel0 + ${c * PROJECT_W}u;
-      let slot = local.y * TILE_COLUMNS + local.x + ${c * PROJECT_W}u;
       var projection_w = 0.0;
       var gate_w = 0.0;
-      if (out_channel < CZ && weight_k < CH) {
-        projection_w = ${readWeight("weights[W_LINEARZWEIGHT + out_channel * CH + weight_k]")};
+      if (valid_col_${c}) {
+        if (weight_k < CH) {
+          projection_w = ${readWeight(`weights[wz_base_${c} + k0]`)};
+        }
+        if (weight_k < CZ) {
+          gate_w = ${readWeight(`weights[wg_base_${c} + k0]`)};
+        }
       }
-      if (out_channel < CZ && weight_k < CZ) {
-        gate_w = ${readWeight("weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
-      }
-      tile_weight[slot] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
+      tile_weight[w_slot_${c}] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
     }`).join("\n");
   const outInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
       let xs = tile_x[local.y * ${PROJECT_W}u + ${k}u];
       let zs = tile_z[local.y * ${PROJECT_W}u + ${k}u];
       ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
 ${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
-        let packed = tile_weight[${k}u * TILE_COLUMNS + local.x + ${c * PROJECT_W}u];
+        let packed = tile_weight[${k * OUT_TILE_COLUMNS + c * PROJECT_W}u + local.x];
         ${overRows((r) => `acc_${r}_${c} += xz${r} * packed;`)}
       }`).join("\n")}
     }`).join("\n");
@@ -893,17 +908,26 @@ ${outBiasDeclare.join("\n")}
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += ${PROJECT_W}u) {
     let source_k = k0 + local.x;
     let weight_k = k0 + local.y;
-    var staged_x: ${outRowVector};
-    var staged_z: ${outRowVector};
-    ${overRows((r) => `{
-        let row = row0 + ${r}u * ${PROJECT_W}u;
-        var x_value = 0.0;
-        var z_value = 0.0;
-        if (row < PAIRS && source_k < CH) { x_value = ${storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k")}; }
-        if (row < PAIRS && source_k < CZ) { z_value = ${storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k")}; }
-        ${rowAt("staged_x", r)} = ${accNarrow("x_value")};
-        ${rowAt("staged_z", r)} = ${accNarrow("z_value")};
+    var staged_x = ${outRowVector}(0.0);
+    var staged_z = ${outRowVector}(0.0);
+    if (row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS) {
+      if (source_k < CH) {
+        let sx0 = row0 * CH_STRIDE + source_k;
+        ${overRows((r) => `${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", `sx0 + ${r * PROJECT_W}u * CH_STRIDE`))};`)}
+      }
+      if (source_k < CZ) {
+        let sz0 = row0 * CZ_STRIDE + source_k;
+        ${overRows((r) => `${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `sz0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
+      }
+    } else {
+      ${overRows((r) => `{
+        let row = row0 + ${r * PROJECT_W}u;
+        if (row < PAIRS) {
+          if (source_k < CH) { ${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k"))}; }
+          if (source_k < CZ) { ${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k"))}; }
+        }
       }`)}
+    }
     tile_x[tile_index] = staged_x;
     tile_z[tile_index] = staged_z;
 ${outStageWeight}

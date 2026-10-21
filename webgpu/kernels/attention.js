@@ -401,10 +401,10 @@ export function createAttentionProjectShader(
   const inner = [];
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      inner.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local.y * ${rowsPerLane / 4}u + ${g}u];`);
+      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
     }
     for (let v = 0; v < columnsPerLane; v += 1) {
-      inner.push(`    let w_${k}_${v} = tile_weight[${k * lanesX * columnsPerLane}u + local.x * ${columnsPerLane}u + ${v}u];`);
+      inner.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnsPerLane}u + ${k * lanesX * columnsPerLane + v}u];`);
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnsPerLane; v += 1) {
@@ -423,13 +423,15 @@ export function createAttentionProjectShader(
     : narrow(wf(`weights[${idx}]`)));
 
   const stageSource = [];
+  const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
     const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
+    const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
     stageSource.push(`    ${guard}{
-      let task = ${task};
-      let row_group = task / ${step}u;
-      let k_local = task % ${step}u;
+      let row_group = ${rowGroupExpr};
+      let k_local = ${kLocalExpr};
       let c = c0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
@@ -459,7 +461,7 @@ export function createAttentionProjectShader(
       var packed = ${vector}(0.0);
       let output_hd = hd_${v};
       if (output_hd < projected && weight_c < p.channels) {
-        let weight_index = weight_c * projected + output_hd;
+        let weight_index = weight_row + output_hd;
         packed = ${vector}(${readWeightElem("p.query_weight + weight_index")},
                            ${readWeightElem("p.key_weight + weight_index")},
                            ${readWeightElem("p.value_weight + weight_index")},
@@ -559,6 +561,7 @@ ${declare.join("\n")}
 
   for (var c0 = 0u; c0 < p.channels; c0 += ${step}u) {
     let weight_c = c0 + local.y;
+    let weight_row = weight_c * projected;
 ${stageSource.join("\n")}
 ${stageWeight.join("\n")}
     workgroupBarrier();
@@ -2339,10 +2342,10 @@ export function createAttentionOutputShader(
   }
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      lines.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local.y * ${rowsPerLane / 4}u + ${g}u];`);
+      lines.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
     }
     for (let v = 0; v < columnVectors; v += 1) {
-      lines.push(`    let w_${k}_${v} = tile_weight[${k * lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u];`);
+      lines.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnVectors}u + ${k * lanesX * columnVectors + v}u];`);
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnVectors; v += 1) {
@@ -2361,13 +2364,15 @@ export function createAttentionOutputShader(
   };
 
   const stageSource = [];
+  const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
     const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
+    const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
     stageSource.push(`    ${guard}{
-      let task = ${task};
-      let row_group = task / ${step}u;
-      let k_local = task % ${step}u;
+      let row_group = ${rowGroupExpr};
+      let k_local = ${kLocalExpr};
       let k = k0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
@@ -2397,7 +2402,6 @@ export function createAttentionOutputShader(
     stageWeight.push(`    {
       var staged = ${vector}(0.0);
       if (weight_k < projected) {
-        let w_base = p.output_weight + weight_k * p.channels + channel_origin;
         if (channel_origin + ${c3} < p.channels) {
           staged = ${vector}(
             ${narrow(`weights[w_base + ${c0}]`)},
@@ -2466,6 +2470,7 @@ ${declare.join("\n")}
 
   for (var k0 = 0u; k0 < projected; k0 += ${step}u) {
     let weight_k = k0 + local.y;
+    let w_base = p.output_weight + weight_k * p.channels + channel_origin;
 ${stageSource.join("\n")}
 ${stageWeight.join("\n")}
     workgroupBarrier();

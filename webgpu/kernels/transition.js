@@ -627,10 +627,10 @@ export function createLinearShader(
   const inner = [];
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      inner.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local.y * ${rowsPerLane / 4}u + ${g}u];`);
+      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
     }
     for (let v = 0; v < columnVectors; v += 1) {
-      inner.push(`    let w_${k}_${v} = tile_weight[${k * lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u];`);
+      inner.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnVectors}u + ${k * lanesX * columnVectors + v}u];`);
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnVectors; v += 1) {
@@ -666,13 +666,15 @@ export function createLinearShader(
   // reads are `inner` apart and CONSECUTIVE LANES take consecutive k - which is
   // what makes each of the four a coalesced run.
   const stageSource = [];
+  const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
     const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
+    const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
     stageSource.push(`    ${guard}{
-      let task = ${task};
-      let row_group = task / ${step}u;
-      let k_local = task % ${step}u;
+      let row_group = ${rowGroupExpr};
+      let k_local = ${kLocalExpr};
       let k = k0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
       var staged = ${vector}(0.0);
@@ -705,7 +707,6 @@ export function createLinearShader(
     stageWeight.push(`    {
       var staged = ${vector}(0.0);
       if (weight_k < parameters.inner) {
-        let w_row = parameters.weight_offset + weight_k * parameters.columns;
         let c3 = ${col3};
         if (c3 < parameters.columns) {
           staged = ${vector}(
@@ -804,6 +805,7 @@ ${declare.join("\n")}
 
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${step}u) {
     let weight_k = k0 + local.y;
+    let w_row = parameters.weight_offset + weight_k * parameters.columns;
 ${stageSource.join("\n")}
 ${stageWeight.join("\n")}
     workgroupBarrier();
