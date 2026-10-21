@@ -204,6 +204,14 @@ process's bytes is what catches it: with the fix removed the heteromer served se
   panels in half and a half running sum promoted to float every N products - every 32, 266 -> 237 ms at FIVE times the
   error (sigma 16: 1.4e-2); every 8, 267 ms at 2-4x; every 4, 278 ms. A sum in half rounds against itself, and by the
   time it does not, the speed is gone.
+- **Where that GEMM stands, and four arms that lost** (M5, ABAB, a call 266-268 ms on the shipped tile): the big
+  shapes run at ~1.6 TFLOP/s against `probe-alu.js`'s 7.3 float32 (14.6 f16), so it is bound by none of the ALU, the
+  workgroup reads (~75 G/s of 320) or the cached global reads. Hand-unrolled named accumulators 280 ms, BK 32 270,
+  register prefetch of the next panel 270, every accumulator index a constant (epilogue included) 282 - the compiler's
+  own unrolling of the shipped loop is better than any of them. The step past it is the matrix units, and a STOCK
+  Chrome on the M5 still has no `chromium-experimental-subgroup-matrix` (only behind `--enable-unsafe-webgpu`), so no
+  visitor would get it. What is left is fusion: the coupling's `cs-combine` (11 ms, 4%, bandwidth-bound) into its Z
+  GEMM's epilogue, and split-K's `gemm-reduce` (17 ms, 6%).
 - Steered propagation (refused on both backends, as BioEmu2's own propagation does not resample across frames).
 - The VJP keeps every activation (~2 GB at 640 atoms, so a ~5,000-atom input would want recomputation) and is a
   plain f32 tape: edm_fkc is ~10x an unsteered fold.
