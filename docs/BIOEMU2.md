@@ -177,6 +177,16 @@ process's bytes is what catches it: with the fix removed the heteromer served se
 - 🔴 **edm_fkc's VJP READS A float32 STATIC CONTEXT UNDER --fast**: built on the f16 tensor cores it moved the
   network part of d/dx 2% at sigma 16 (2.0e-2 against jax.grad, 1.6e-4 in float32), the forward only 1e-3.
 - 🔴 **Python's `json` writes `NaN`**, which `JSON.parse` refuses; the checkers read a dump with it replaced.
+- 🔴 **ON A STOCK CHROME WITH shader-f16 (APPLE SILICON) THE WEBGPU PORT FOLDED NaN, AND EVERY GATE PASSED IT.** Its
+  pair track runs on ESMFold2's WebGPU trunk, whose device default with `shader-f16` is f16 staging AND f16
+  accumulation - fine for ESMFold2's small pair, not for BioEmu2's, which reaches ~3e5 (past float16's 65,504): pass
+  1's pair had 3 infinities and every stage after it NaN. Two things hid it. Every harness passes the developer flags,
+  and with them the M5's matrix-unit kernels sum wider (`LOCALFOLD_STOCK_FLAGS=1` is what a visitor runs - CLAUDE.md's
+  rule, met again). And fold-bioemu2.js's geometry gate skips a fold with no measurable alpha carbons, so a NaN sample
+  reported CA-CA null and `test:stock` took its atom checksum as a signature. Fixed: the trunk's accumulation is
+  float32 always (`webgpu/bioemu2/network.js`; 7.76 s a trunk pass at 255 tokens where the NaN path was 5.06), and a
+  non-finite coordinate now FAILS the fold tool - watched failing with the fix reverted. The port had not reached
+  `main`, so no visitor ever got one.
 - 🔴 **The steering reference data is other people's**: `stereo_chemistry.yaml` is CCP4 MON_LIB (LGPL), fetched at
   run time from BioEmu2's repository at `7846769`, never shipped; the vendor's ligand tier reads Boltz-1's CCD
   pickle of RDKit molecules (346 MB of Python objects), which is why that tier is built from the CCD here.
