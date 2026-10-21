@@ -9,13 +9,26 @@ __global__ void addK(float* y, const float* x, size_t n) {
 
 __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) y[t] += b[t % C];
+  size_t n = rows * C;
+  if (t >= n) return;
+  int c = ((C & (C - 1)) == 0) ? (int)(t & (size_t)(C - 1)) : (n <= UINT32_MAX ? (int)((unsigned)t % (unsigned)C) : (int)(t % C));
+  y[t] += b[c];
 }
 
 __global__ void symmetriseK(const float* z, float* out, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  size_t n = (size_t)T * T * C;
+  if (t >= n) return;
+  int c, i, j;
+  if (n <= UINT32_MAX) {
+    unsigned u = (unsigned)t, uc = (unsigned)C, ut = (unsigned)T;
+    unsigned ij = ((uc & (uc - 1)) == 0) ? (u >> (__ffs(C) - 1)) : (u / uc);
+    c = (int)(u - ij * uc);
+    i = (int)(ij / ut);
+    j = (int)(ij - (unsigned)i * ut);
+  } else {
+    c = (int)(t % C); size_t ij = t / C; i = (int)(ij / T); j = (int)(ij % T);
+  }
   out[t] = z[t] + z[((size_t)j * T + i) * C + c];
 }
 
@@ -138,8 +151,36 @@ __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t
 // the outer product mean's permute and residual (cuda/af2 and cuda/af3 each had both)
 // [(bi, c), (j, e)] -> [(bi, j), (c, e)]
 template <class T>
-__global__ void opmPermuteK(const T* in, T* out, int Bi, int n, int O) {
+__global__ void opmPermuteK(const T* __restrict__ in, T* __restrict__ out, int Bi, int n, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if constexpr (std::is_same_v<T, float>) {
+    if ((O & 3) == 0) {
+      int O4 = O >> 2;
+      size_t total4 = (size_t)Bi * n * O * O4;
+      if (t >= total4) return;
+      int e4, c, j, bi;
+      if (O == 32 && total4 <= UINT32_MAX) {
+        unsigned u = (unsigned)t;
+        e4 = (int)(u & 7u);
+        c = (int)((u >> 3) & 31u);
+        unsigned r = u >> 8;
+        bi = (int)(r / (unsigned)n);
+        j = (int)(r - (unsigned)bi * (unsigned)n);
+      } else if (total4 <= UINT32_MAX) {
+        unsigned u = (unsigned)t, r = u / (unsigned)O4;
+        e4 = (int)(u - r * (unsigned)O4);
+        unsigned r2 = r / (unsigned)O;
+        c = (int)(r - r2 * (unsigned)O);
+        bi = (int)(r2 / (unsigned)n);
+        j = (int)(r2 - (unsigned)bi * (unsigned)n);
+      } else {
+        e4 = (int)(t % O4); size_t r = t / O4; c = (int)(r % O); r /= O; j = (int)(r % n); bi = (int)(r / n);
+      }
+      reinterpret_cast<float4*>(out)[t] =
+          reinterpret_cast<const float4*>(in)[((size_t)bi * O + c) * ((size_t)n * O4) + (size_t)j * O4 + e4];
+      return;
+    }
+  }
   size_t total = (size_t)Bi * n * O * O;
   if (t >= total) return;
   int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
@@ -147,11 +188,29 @@ __global__ void opmPermuteK(const T* in, T* out, int Bi, int n, int O) {
   out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
 }
 // eight halves (16 bytes) a thread: O is a multiple of 8, so a run of e never straddles a row
-__global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
+__global__ void opmPermuteHK(const half* __restrict__ Pm, half* __restrict__ X, int bi, int L, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  int O8 = O / 8;
-  if (t >= (size_t)bi * L * O * O8) return;
-  int e8 = (int)(t % O8); size_t r = t / O8; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
+  int O8 = O >> 3;
+  size_t total8 = (size_t)bi * L * O * O8;
+  if (t >= total8) return;
+  int e8, c, j, i;
+  if (O == 32 && total8 <= UINT32_MAX) {
+    unsigned u = (unsigned)t;
+    e8 = (int)(u & 3u);
+    c = (int)((u >> 2) & 31u);
+    unsigned r = u >> 7;
+    i = (int)(r / (unsigned)L);
+    j = (int)(r - (unsigned)i * (unsigned)L);
+  } else if (total8 <= UINT32_MAX) {
+    unsigned u = (unsigned)t, r = u / (unsigned)O8;
+    e8 = (int)(u - r * (unsigned)O8);
+    unsigned r2 = r / (unsigned)O;
+    c = (int)(r - r2 * (unsigned)O);
+    i = (int)(r2 / (unsigned)L);
+    j = (int)(r2 - (unsigned)i * (unsigned)L);
+  } else {
+    e8 = (int)(t % O8); size_t r = t / O8; c = (int)(r % O); r /= O; j = (int)(r % L); i = (int)(r / L);
+  }
   reinterpret_cast<uint4*>(X)[t] =
       reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
 }

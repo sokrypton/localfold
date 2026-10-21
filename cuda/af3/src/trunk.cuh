@@ -1074,7 +1074,7 @@ void outerProductMean(Trunk& t, const std::string& pre) {
       if (O % 8 == 0) opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(P, Pp, bi, n, O);
       else opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
     } else {
-      opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+      opmPermuteK<T><<<blocks((O & 3) == 0 ? (size_t)bi * per / 4 : (size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
     }
     linear<T, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
     WITH_PT(t.p16, opmAddK<PT><<<blocks((C & 3) == 0 ? ((size_t)bi * n * (C >> 2)) : ((size_t)bi * n * C)), 256, 0, STREAM>>>(pairBase(t), X, W(pre + ".outputB"), norm, i0, bi, n,

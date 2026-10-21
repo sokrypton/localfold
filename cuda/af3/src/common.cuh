@@ -1609,6 +1609,132 @@ __global__ void transposeIntoHK(const half* src, half* dst, int C, int width, si
   int c = (int)(t / width), o = (int)(t % width);
   dst[c * ld + o] = src[(size_t)o * C + c];
 }
+template <class T>
+struct ConcatSpec {
+  const T* src[4];
+  int off[4], width[4], tr[4];
+  int np, C, total;
+};
+__global__ void __launch_bounds__(256, 8)
+concatRowsH8K(ConcatSpec<half> s, half* __restrict__ dst, int shift) {
+  unsigned tu = (unsigned)(s.total >> 3);
+  size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= (size_t)s.C * tu) return;
+  unsigned u = (unsigned)tid, c, o8;
+  if (shift >= 0) { c = u >> shift; o8 = u & (tu - 1); }
+  else if (tu == 192u) { c = u / 192u; o8 = u - c * 192u; }
+  else if (tu == 576u) { c = u / 576u; o8 = u - c * 576u; }
+  else { c = u / tu; o8 = u - c * tu; }
+  int o = (int)(o8 << 3);
+  int idx = 0;
+#pragma unroll
+  for (int k = 1; k < 4; ++k) if (k < s.np && o >= s.off[k]) idx = k;
+  const half* sp = s.src[idx];
+  uint4 val = {0, 0, 0, 0};
+  if (sp) {
+    int w = o - s.off[idx], wid = s.width[idx];
+    val = *reinterpret_cast<const uint4*>(sp + (size_t)c * wid + w);
+  }
+  reinterpret_cast<uint4*>(dst)[tid] = val;
+}
+__global__ void __launch_bounds__(256, 8)
+concatPad16HK(const half* __restrict__ src, half* __restrict__ dst, int C, int k) {
+  int tid = (int)blockIdx.x * blockDim.x + threadIdx.x;
+  int c = tid >> 4, o = tid & 15;
+  if (c >= C) return;
+  dst[(size_t)c * 16 + o] = o < k ? src[(size_t)c * k + o] : half{};
+}
+template <class T, bool TILE64 = false>
+__global__ void __launch_bounds__(256, 6)
+concatIntoK(ConcatSpec<T> s, T* __restrict__ dst) {
+  int tx = threadIdx.x, ty = threadIdx.y;
+  if constexpr (std::is_same_v<T, half> && TILE64) {
+    int o0 = (int)blockIdx.x * 64, c0 = (int)blockIdx.y * 64;
+    int fastIdx = 0;
+#pragma unroll
+    for (int idx = 1; idx < 4; ++idx) {
+      if (idx < s.np && o0 >= s.off[idx]) fastIdx = idx;
+    }
+    const half* sp = s.src[fastIdx];
+    int w0 = o0 - s.off[fastIdx], wid = s.width[fastIdx];
+    if (s.tr[fastIdx]) {
+      __shared__ half2 tile[64][33];
+      int c = c0 + 2 * tx;
+#pragma unroll
+      for (int m = 0; m < 8; ++m) {
+        int ry = ty + m * 8;
+        tile[ry][tx] = (c < s.C) ? *reinterpret_cast<const half2*>(sp + (size_t)(w0 + ry) * s.C + c)
+                                 : __float2half2_rn(0.f);
+      }
+      __syncthreads();
+      int o = o0 + 2 * tx;
+#pragma unroll
+      for (int m = 0; m < 4; ++m) {
+        int cy = ty + m * 8, cRow = c0 + 2 * cy;
+        if (cRow < s.C) {
+          half2 v0 = tile[2 * tx][cy], v1 = tile[2 * tx + 1][cy];
+          *reinterpret_cast<half2*>(dst + (size_t)cRow * s.total + o) =
+            __halves2half2(__low2half(v0), __low2half(v1));
+          *reinterpret_cast<half2*>(dst + (size_t)(cRow + 1) * s.total + o) =
+            __halves2half2(__high2half(v0), __high2half(v1));
+        }
+      }
+      return;
+    } else {
+      int o = o0 + 2 * tx, w = w0 + 2 * tx;
+#pragma unroll
+      for (int m = 0; m < 8; ++m) {
+        int cRow = c0 + ty + m * 8;
+        if (cRow < s.C) {
+          *reinterpret_cast<half2*>(dst + (size_t)cRow * s.total + o) =
+            *reinterpret_cast<const half2*>(sp + (size_t)cRow * wid + w);
+        }
+      }
+      return;
+    }
+  }
+  __shared__ T tile[32][33];
+  int o0 = (int)blockIdx.x * 32, c0 = (int)blockIdx.y * 32;
+  int fastIdx = -1;
+#pragma unroll
+  for (int idx = 0; idx < 4; ++idx) {
+    if (idx < s.np && s.tr[idx] && s.src[idx] && o0 >= s.off[idx] && o0 + 32 <= s.off[idx] + s.width[idx])
+      fastIdx = idx;
+  }
+  if (fastIdx >= 0) {
+    const T* sp = s.src[fastIdx];
+    int w0 = o0 - s.off[fastIdx], c = c0 + tx;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      int ry = ty + m * 8, w = w0 + ry;
+      tile[ry][tx] = (c < s.C) ? sp[(size_t)w * s.C + c] : T{};
+    }
+    __syncthreads();
+    int o = o0 + tx;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      int ry = ty + m * 8, cRow = c0 + ry;
+      if (cRow < s.C) dst[(size_t)cRow * s.total + o] = tile[tx][ry];
+    }
+    return;
+  }
+  int o = o0 + tx;
+  if (o >= s.total) return;
+  int idx = 0;
+#pragma unroll
+  for (int k = 1; k < 4; ++k) if (k < s.np && o >= s.off[k]) idx = k;
+  const T* sp = s.src[idx];
+  int w = o - s.off[idx], wid = s.width[idx], tr = s.tr[idx];
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    int c = c0 + ty + m * 8;
+    if (c < s.C) {
+      T val = T{};
+      if (sp) val = tr ? sp[(size_t)w * s.C + c] : sp[(size_t)c * wid + w];
+      dst[(size_t)c * s.total + o] = val;
+    }
+  }
+}
 inline std::set<half*> WH_POOL;
 inline const half* Wh(const std::string& k);
 inline std::string concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
@@ -1626,6 +1752,36 @@ inline void buildConcat(const std::string& key) {
   CK(cudaStreamIsCapturing(STREAM, &cap));
   float* d = cap == cudaStreamCaptureStatusNone ? poolAlloc((size_t)C * total) : dalloc((size_t)C * total);
   if (cap == cudaStreamCaptureStatusNone) CONCAT_POOL.insert(d);
+  if (parts.size() <= 4) {
+    ConcatSpec<float> spec{};
+    spec.np = (int)parts.size(); spec.C = C; spec.total = (int)total;
+    int off = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto& p = parts[i];
+      spec.off[i] = off; spec.width[i] = p.width; spec.tr[i] = p.transposed ? 1 : 0;
+      if (p.name.empty()) {
+        spec.src[i] = nullptr;
+      } else {
+        if (lenW(p.name) != (size_t)C * p.width) {
+          fprintf(stderr, "%s has %zu elements, not %d x %d\n", p.name.c_str(), lenW(p.name), C, p.width); exit(1);
+        }
+        spec.src[i] = W(p.name);
+      }
+      off += p.width;
+    }
+    concatIntoK<float><<<dim3((unsigned)((total + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(spec, d);
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto& p = parts[i];
+      if (!p.name.empty() && CONCAT.count(p.name)) {
+        float* fp = const_cast<float*>(spec.src[i]);
+        if (CONCAT_POOL.erase(fp)) CK(cudaFreeAsync(fp, STREAM));
+        else CONCAT_FREE.push_back(fp);
+        WF.erase(p.name);
+      }
+    }
+    deviceWeight(key, d, (size_t)C * total);
+    return;
+  }
   size_t off = 0;
   for (auto& p : parts) {
     if (p.name.empty()) {
@@ -1655,6 +1811,49 @@ inline half* buildConcatHalf(const std::string& key) {
   CK(cudaStreamIsCapturing(STREAM, &cap));
   half* d = cap == cudaStreamCaptureStatusNone ? poolAllocT<half>((size_t)C * total) : dallocT<half>((size_t)C * total);
   if (cap == cudaStreamCaptureStatusNone) WH_POOL.insert(d);
+  if (parts.size() <= 4) {
+    ConcatSpec<half> spec{};
+    spec.np = (int)parts.size(); spec.C = C; spec.total = (int)total;
+    int off = 0;
+    bool anyTr = false, allVec8 = true, allVec64 = (C & 1) == 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto& p = parts[i];
+      spec.off[i] = off; spec.width[i] = p.width; spec.tr[i] = p.transposed ? 1 : 0;
+      if (p.transposed) anyTr = true;
+      if (p.width & 7) allVec8 = false;
+      if ((p.width & 63) || p.name.empty()) allVec64 = false;
+      if (p.name.empty()) {
+        spec.src[i] = nullptr;
+      } else {
+        if (lenW(p.name) != (size_t)C * p.width) {
+          fprintf(stderr, "%s has %zu elements, not %d x %d\n", p.name.c_str(), lenW(p.name), C, p.width); exit(1);
+        }
+        spec.src[i] = Wh(p.name);
+      }
+      off += p.width;
+    }
+    if (!anyTr && parts.size() == 2 && total == 16 && spec.src[0] && !spec.src[1]) {
+      concatPad16HK<<<blocks((size_t)C * 16), 256, 0, STREAM>>>(spec.src[0], d, C, spec.width[0]);
+    } else if (!anyTr && allVec8) {
+      int t8 = (int)(total >> 3), shift = (t8 & (t8 - 1)) == 0 ? __builtin_ctz(t8) : -1;
+      concatRowsH8K<<<blocks((size_t)C * t8), 256, 0, STREAM>>>(spec, d, shift);
+    } else if (allVec64) {
+      concatIntoK<half, true><<<dim3((unsigned)(total / 64), (unsigned)((C + 63) / 64)), dim3(32, 8), 0, STREAM>>>(spec, d);
+    } else {
+      concatIntoK<half, false><<<dim3((unsigned)((total + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(spec, d);
+    }
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto& p = parts[i];
+      if (!p.name.empty() && CONCAT.count(p.name)) {
+        half* hp = const_cast<half*>(spec.src[i]);
+        if (WH_POOL.erase(hp)) CK(cudaFreeAsync(hp, STREAM));
+        else CK(cudaFree(hp));
+        WH.erase(p.name);
+      }
+    }
+    WLEN[key] = (size_t)C * total;
+    return WH[key] = d;
+  }
   size_t off = 0;
   for (auto& p : parts) {
     if (p.name.empty()) {

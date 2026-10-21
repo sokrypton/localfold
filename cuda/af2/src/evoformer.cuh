@@ -827,6 +827,7 @@ __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, cons
   float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
   const int cl = (lane & 15) * 4, f = wn * 64 + cl;
   const float4 b4 = *reinterpret_cast<const float4*>(bias + f);
+  const bool full = row0 + 128 <= pp;
 #pragma unroll
   for (int mi = 0; mi < 4; ++mi) {
 #pragma unroll
@@ -836,20 +837,36 @@ __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, cons
       *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[mi][t][2], acc[mi][t][3]);
     }
     __syncwarp();
+    if (full && !norm) {
+      const size_t ij0 = (size_t)i0 * L + row0 + wm * 64 + mi * 16 + (lane >> 4);
+      float4 a4[8], v[8];
 #pragma unroll
-    for (int ep = 0; ep < 8; ++ep) {
-      int rl = ep * 2 + (lane >> 4);
-      size_t q = row0 + wm * 64 + mi * 16 + rl;
-      if (q >= pp) continue;
-      const size_t ij = (size_t)i0 * L + q;
-      const float d = norm ? 1.f / (1e-3f + norm[ij]) : invNorm;
-      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
-      float4 v = pairLd4<PT>(pair, ij * 128 + f);
-      v.x += (b4.x + up * a4.x) * d; v.y += (b4.y + up * a4.y) * d;
-      v.z += (b4.z + up * a4.z) * d; v.w += (b4.w + up * a4.w) * d;
-      pairSt4<PT>(pair, ij * 128 + f, v);
+      for (int ep = 0; ep < 8; ++ep) {
+        a4[ep] = *reinterpret_cast<const float4*>(Ys + (ep * 2 + (lane >> 4)) * LDY + cl);
+        v[ep] = pairLd4<PT>(pair, (ij0 + ep * 2) * 128 + f);
+      }
+#pragma unroll
+      for (int ep = 0; ep < 8; ++ep) {
+        v[ep].x += (b4.x + up * a4[ep].x) * invNorm; v[ep].y += (b4.y + up * a4[ep].y) * invNorm;
+        v[ep].z += (b4.z + up * a4[ep].z) * invNorm; v[ep].w += (b4.w + up * a4[ep].w) * invNorm;
+        pairSt4<PT>(pair, (ij0 + ep * 2) * 128 + f, v[ep]);
+      }
+    } else {
+#pragma unroll
+      for (int ep = 0; ep < 8; ++ep) {
+        int rl = ep * 2 + (lane >> 4);
+        size_t q = row0 + wm * 64 + mi * 16 + rl;
+        if (q >= pp) continue;
+        const size_t ij = (size_t)i0 * L + q;
+        const float d = norm ? 1.f / (1e-3f + norm[ij]) : invNorm;
+        float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+        float4 v = pairLd4<PT>(pair, ij * 128 + f);
+        v.x += (b4.x + up * a4.x) * d; v.y += (b4.y + up * a4.y) * d;
+        v.z += (b4.z + up * a4.z) * d; v.w += (b4.w + up * a4.w) * d;
+        pairSt4<PT>(pair, ij * 128 + f, v);
+      }
     }
-    __syncwarp();
+    if (mi < 3) __syncwarp();
   }
 }
 inline std::pair<const half*, const float*> opmWeights(const std::string& Op, int blk, int C, int O = 32) {
@@ -1042,7 +1059,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     // row-major P (bi*O x L*O) = left_blk^T right, as col-major P^T = right * left_blk^T
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, L * O, lt + (size_t)i0 * O, L * O,
                    &zero, Pm, L * O));
-    opmPermuteK<float><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
+    opmPermuteK<float><<<blocks((O & 3) == 0 ? (size_t)bi * per / 4 : (size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
     gemm(X, P(Op + "/output_w", blk), Y, (size_t)bi * L, O * O, 128);
     opmAdd128K<float><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
   }

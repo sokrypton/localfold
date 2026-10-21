@@ -29,7 +29,10 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
 // ---------------------------------------------------------------- elementwise
 __global__ void reluBiasK(float* y, const float* b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) y[t] = fmaxf(y[t] + b[t % C], 0.f);
+  size_t n = rows * C;
+  if (t >= n) return;
+  int c = ((C & (C - 1)) == 0) ? (int)(t & (size_t)(C - 1)) : (n <= UINT32_MAX ? (int)((unsigned)t % (unsigned)C) : (int)(t % C));
+  y[t] = fmaxf(y[t] + b[c], 0.f);
 }
 __global__ void addK2(float* y, const float* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,14 +97,45 @@ inline void layerNorm(const float* x, float* y, size_t rows, int C, const std::s
 }
 
 // [A, B, C] -> [B, A, C]
-__global__ void swap01K(const float* x, float* y, int A, int B, int C) {
+__global__ void swap01K(const float* __restrict__ x, float* __restrict__ y, int A, int B, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
+  if ((C & 3) == 0) {
+    int c4 = C >> 2;
+    size_t total4 = (size_t)A * B * c4;
+    if (t >= total4) return;
+    int c, b, a;
+    if ((c4 & (c4 - 1)) == 0 && total4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, uc4 = (unsigned)c4;
+      c = (int)(u & (uc4 - 1));
+      unsigned r = u >> (__ffs(c4) - 1);
+      a = (int)(r / (unsigned)B);
+      b = (int)(r - (unsigned)a * (unsigned)B);
+    } else if (total4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, r = u / (unsigned)c4;
+      c = (int)(u - r * (unsigned)c4);
+      a = (int)(r / (unsigned)B);
+      b = (int)(r - (unsigned)a * (unsigned)B);
+    } else {
+      c = (int)(t % c4); size_t r = t / c4; b = (int)(r % B); a = (int)(r / B);
+    }
+    reinterpret_cast<float4*>(y)[((size_t)b * A + a) * c4 + c] = reinterpret_cast<const float4*>(x)[t];
+    return;
+  }
+  size_t total = (size_t)A * B * C;
+  if (t >= total) return;
+  if (total <= UINT32_MAX) {
+    unsigned u = (unsigned)t, r = C == 1 ? u : u / (unsigned)C;
+    int c = C == 1 ? 0 : (int)(u - r * (unsigned)C);
+    unsigned a = r / (unsigned)B, b = r - a * (unsigned)B;
+    y[((size_t)b * A + a) * C + c] = x[t];
+    return;
+  }
   int c = (int)(t % C); size_t r = t / C; int b = (int)(r % B), a = (int)(r / B);
   y[((size_t)b * A + a) * C + c] = x[t];
 }
 inline void swap01(const float* x, float* y, int A, int B, int C) {
-  swap01K<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, y, A, B, C);
+  size_t work = (C & 3) == 0 ? (size_t)A * B * (C >> 2) : (size_t)A * B * C;
+  swap01K<<<blocks(work), 256, 0, STREAM>>>(x, y, A, B, C);
 }
 
 // ---------------------------------------------------------------- attention

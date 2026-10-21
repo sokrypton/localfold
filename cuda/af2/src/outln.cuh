@@ -103,13 +103,20 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     const size_t row = row0 + r;
     cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
   }
-  cpCommit(); cpWait<0>();
+  cpCommit();
+  const int c0 = lane * 8;
+  float sc[8], of[8];
+  *reinterpret_cast<float4*>(sc) = __ldg(reinterpret_cast<const float4*>(lnS + c0));
+  *reinterpret_cast<float4*>(sc + 4) = __ldg(reinterpret_cast<const float4*>(lnS + c0 + 4));
+  *reinterpret_cast<float4*>(of) = __ldg(reinterpret_cast<const float4*>(lnO + c0));
+  *reinterpret_cast<float4*>(of + 4) = __ldg(reinterpret_cast<const float4*>(lnO + c0 + 4));
+  cpWait<0>();
   __syncthreads();
   // each accumulator + its bias + its residual, rounded, in place
 #pragma unroll
   for (int nt = 0; nt < 16; ++nt) {
     const int col = chh * 128 + nt * 8 + tig * 2;
-    const float2 bf = *reinterpret_cast<const float2*>(bias + col);
+    const float2 bf = __ldg(reinterpret_cast<const float2*>(bias + col));
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       M2* p = reinterpret_cast<M2*>(V + (rg * 16 + g + 8 * h) * LDV + col);
@@ -121,12 +128,6 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   __syncthreads();
   // a warp a row at a time: lane's 8 columns lane*8 .. +7
   constexpr int RPW = R / (NTH / 32);
-  const int c0 = lane * 8;
-  float sc[8], of[8];
-  *reinterpret_cast<float4*>(sc) = *reinterpret_cast<const float4*>(lnS + c0);
-  *reinterpret_cast<float4*>(sc + 4) = *reinterpret_cast<const float4*>(lnS + c0 + 4);
-  *reinterpret_cast<float4*>(of) = *reinterpret_cast<const float4*>(lnO + c0);
-  *reinterpret_cast<float4*>(of + 4) = *reinterpret_cast<const float4*>(lnO + c0 + 4);
 #pragma unroll
   for (int i = 0; i < RPW; ++i) {
     const int r = warp + i * (NTH / 32);
