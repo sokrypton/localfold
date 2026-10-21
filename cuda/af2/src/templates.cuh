@@ -10,61 +10,71 @@
 //   (8, the normalised query, is a GEMM added after)
 // tPos [L, 37, 3], tMask [L, 37], tAatype [L]; the multichain mask all ones (mask_template_interchain
 // is off in the reference, which makes its where() keep everything)
-__global__ void templatePairInputK(const int* tAatype, const float* tPos, const float* tMask, const float* w0,
-                                   const float* w1, const float* w2, const float* w3, const float* w4, const float* w5,
-                                   const float* w6, const float* w7, const float* bsum, float* act, int L, int C) {
-  size_t ij = (size_t)blockIdx.x;
-  if (ij >= (size_t)L * L) return;
-  int i = (int)(ij / L), j = (int)(ij % L);
-  __shared__ float feat[39 + 1 + 4 + 1];
-  __shared__ int ai, aj;
-  if (threadIdx.x == 0) {
-    auto pbAtom = [&](int r) { return tAatype[r] == 7 ? 1 : 3; };
-    int pi = pbAtom(i), pj = pbAtom(j);
-    float mi = tMask[(size_t)i * 37 + pi], mj = tMask[(size_t)j * 37 + pj];
-    float pb2d = mi * mj;
-    float d2 = 0;
-    for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
-    for (int b = 0; b < 39; ++b) {
-      float lo = 3.25f + (50.75f - 3.25f) * b / 38.f, lower = lo * lo;
-      float hi = 3.25f + (50.75f - 3.25f) * (b + 1) / 38.f, upper = b + 1 < 39 ? hi * hi : 1e8f;
-      feat[b] = ((d2 > lower && d2 < upper) ? 1.f : 0.f) * pb2d;
-    }
-    feat[39] = pb2d;
-    // backbone frames: rotation from_two_vectors(C - CA, N - CA), translation CA
-    auto frame = [&](int r, float* R, float* t, float& m) {
-      const float* p = tPos + (size_t)r * 37 * 3;
-      m = tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2];
-      float e0[3], e1[3];
-      for (int k = 0; k < 3; ++k) { e0[k] = p[6 + k] - p[3 + k]; e1[k] = p[k] - p[3 + k]; t[k] = p[3 + k]; }
-      float n0 = rsqrtf(fmaxf(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2], 1e-12f));
-      for (int k = 0; k < 3; ++k) e0[k] *= n0;
-      float c = e1[0] * e0[0] + e1[1] * e0[1] + e1[2] * e0[2];
-      for (int k = 0; k < 3; ++k) e1[k] -= c * e0[k];
-      float n1 = rsqrtf(fmaxf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], 1e-12f));
-      for (int k = 0; k < 3; ++k) e1[k] *= n1;
-      float e2[3] = {e0[1] * e1[2] - e0[2] * e1[1], e0[2] * e1[0] - e0[0] * e1[2], e0[0] * e1[1] - e0[1] * e1[0]};
-      // columns e0 e1 e2: R = [[e0x e1x e2x], [e0y e1y e2y], [e0z e1z e2z]]
-      for (int k = 0; k < 3; ++k) { R[k * 3] = e0[k]; R[k * 3 + 1] = e1[k]; R[k * 3 + 2] = e2[k]; }
-    };
-    float Ri[9], ti[3], mi_, Rj[9], tj[3], mj_;
-    frame(i, Ri, ti, mi_); frame(j, Rj, tj, mj_);
-    float d[3] = {tj[0] - ti[0], tj[1] - ti[1], tj[2] - ti[2]}, v[3];
-    for (int a = 0; a < 3; ++a) v[a] = Ri[a] * d[0] + Ri[3 + a] * d[1] + Ri[6 + a] * d[2];     // R_i^T (CA_j - CA_i)
-    float nv = rsqrtf(fmaxf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2], 1e-12f));
-    float bb = sqrtf(mi_ * mj_);
-    for (int a = 0; a < 3; ++a) feat[40 + a] = v[a] * nv * bb;
-    feat[43] = bb;
-    ai = min(max(tAatype[i], 0), 21); aj = min(max(tAatype[j], 0), 21);
+__global__ void templateFramesK(const float* __restrict__ tPos, const float* __restrict__ tMask,
+                                float* __restrict__ frames, float* __restrict__ bbMask, int L) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= L) return;
+  const float* p = tPos + (size_t)r * 37 * 3;
+  bbMask[r] = tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2];
+  float e0[3], e1[3], *R = frames + (size_t)r * 12, *t = R + 9;
+  for (int k = 0; k < 3; ++k) { e0[k] = p[6 + k] - p[3 + k]; e1[k] = p[k] - p[3 + k]; t[k] = p[3 + k]; }
+  float n0 = rsqrtf(fmaxf(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2], 1e-12f));
+  for (int k = 0; k < 3; ++k) e0[k] *= n0;
+  float c = e1[0] * e0[0] + e1[1] * e0[1] + e1[2] * e0[2];
+  for (int k = 0; k < 3; ++k) e1[k] -= c * e0[k];
+  float n1 = rsqrtf(fmaxf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], 1e-12f));
+  for (int k = 0; k < 3; ++k) e1[k] *= n1;
+  float e2[3] = {e0[1] * e1[2] - e0[2] * e1[1], e0[2] * e1[0] - e0[0] * e1[2], e0[0] * e1[1] - e0[1] * e1[0]};
+  // columns e0 e1 e2: R = [[e0x e1x e2x], [e0y e1y e2y], [e0z e1z e2z]]
+  for (int k = 0; k < 3; ++k) { R[k * 3] = e0[k]; R[k * 3 + 1] = e1[k]; R[k * 3 + 2] = e2[k]; }
+}
+__global__ void templatePairInputK(const int* __restrict__ tAatype, const float* __restrict__ tPos, const float* __restrict__ tMask,
+                                   const float* __restrict__ frames, const float* __restrict__ bbMask,
+                                   const float* __restrict__ w0, const float* __restrict__ w1, const float* __restrict__ w2,
+                                   const float* __restrict__ w3, const float* __restrict__ w4, const float* __restrict__ w5,
+                                   const float* __restrict__ w6, const float* __restrict__ w7, const float* __restrict__ bsum,
+                                   const float* __restrict__ qterm, float* __restrict__ act, int L, int C) {
+  __shared__ float sw[6][64];
+  if (threadIdx.x < 64) {
+    int c = threadIdx.x;
+    sw[0][c] = bsum[c]; sw[1][c] = w1[c]; sw[2][c] = w4[c];
+    sw[3][c] = w5[c]; sw[4][c] = w6[c]; sw[5][c] = w7[c];
   }
   __syncthreads();
-  for (int c = threadIdx.x; c < C; c += blockDim.x) {
-    float a = bsum[c];
-    for (int b = 0; b < 39; ++b) a += feat[b] * w0[b * C + c];
-    a += feat[39] * w1[c];
+  size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (ij >= (size_t)L * L) return;
+  int i = (int)(ij / L), j = (int)(ij % L);
+  int rawAi = tAatype[i], rawAj = tAatype[j];
+  int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
+  float pb2d = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
+  float d2 = 0.f;
+  for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
+  int dbin = -1;
+  if (pb2d != 0.f) {
+    float lo0 = 3.25f + (50.75f - 3.25f) * lane / 38.f, hi0 = 3.25f + (50.75f - 3.25f) * (lane + 1) / 38.f;
+    uint32_t m0 = __ballot_sync(~0u, d2 > lo0 * lo0 && d2 < hi0 * hi0);
+    int b1 = 32 + lane;
+    float lo1 = 3.25f + (50.75f - 3.25f) * b1 / 38.f, hi1 = 3.25f + (50.75f - 3.25f) * (b1 + 1) / 38.f;
+    uint32_t m1 = __ballot_sync(~0u, b1 < 39 && d2 > lo1 * lo1 && d2 < (b1 + 1 < 39 ? hi1 * hi1 : 1e8f));
+    if (m0) dbin = __ffs(m0) - 1;
+    else if (m1) dbin = 31 + __ffs(m1);
+  }
+  const float *Ri = frames + (size_t)i * 12, *ti = Ri + 9, *tj = frames + (size_t)j * 12 + 9;
+  float d[3] = {tj[0] - ti[0], tj[1] - ti[1], tj[2] - ti[2]}, v[3];
+  for (int a = 0; a < 3; ++a) v[a] = Ri[a] * d[0] + Ri[3 + a] * d[1] + Ri[6 + a] * d[2];     // R_i^T (CA_j - CA_i)
+  float nv = rsqrtf(fmaxf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2], 1e-12f));
+  float bb = sqrtf(bbMask[i] * bbMask[j]);
+  float f1 = v[0] * nv * bb, f2 = v[1] * nv * bb, f3 = v[2] * nv * bb;
+  int ai = min(max(rawAi, 0), 21), aj = min(max(rawAj, 0), 21);
+#pragma unroll
+  for (int k = 0; k < 2; ++k) {
+    int c = lane + 32 * k;
+    float a = sw[0][c] + (dbin >= 0 ? pb2d * w0[dbin * C + c] : 0.f);
+    a += pb2d * sw[1][c];
     a += w2[aj * C + c] + w3[ai * C + c];
-    a += feat[40] * w4[c] + feat[41] * w5[c] + feat[42] * w6[c] + feat[43] * w7[c];
-    act[ij * C + c] = a;
+    a += f1 * sw[2][c] + f2 * sw[3][c] + f3 * sw[4][c] + bb * sw[5][c];
+    act[ij * C + c] = a + qterm[ij * C + c];
   }
 }
 __global__ void sumBiasesK(float* out, const float* const* bs, int n, int C) {
@@ -80,7 +90,7 @@ __global__ void reluScaleK(float* x, float s, size_t n) {
 
 // pair += TemplateEmbedding(pair, templates); T templates in t/aatype [T, L], t/positions, t/mask
 // (none given: one blank template, as the reference's blank_features)
-inline void templateEmbedding(float* pair, const float* pairMask, int L) {
+inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pairOnes = false) {
   const std::string TE = "evoformer/template_embedding/", S = TE + "single_template_embedding/";
   const std::string IT = S + "template_embedding_iteration/";
   const int C = 64, Cz = 128;
@@ -96,8 +106,18 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
     }
     tAatype = zi; tPos = zp; tMask = zm; T = 1;
   } else { tAatype = Idev("t/aatype"); tPos = W("t/positions"); tMask = W("t/mask"); }
-  float* qn = scratch<float>("tmpl.qn", pairs * Cz);
-  layerNorm(pairF32(pair, pairs * Cz), qn, pairs, Cz, S + "query_embedding_norm");
+  float* qterm = scratch<float>("tmpl.qterm", pairs * C);
+  if (FAST) {
+    half* qnh = scratch<half>("tmpl.qnh", pairs * Cz);
+    WITH_PT(AF2_P16, layerNormVK<128, PT, half><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+      reinterpret_cast<const PT*>(pair), qnh, pairs, P(S + "query_embedding_norm/scale"), P(S + "query_embedding_norm/offset")));
+    ltGemm(qnh, PH(S + "template_pair_embedding_8/weights"), qterm, false, pairs, Cz, C, nullptr, false, 0.f);
+  } else {
+    float* qn = scratch<float>("tmpl.qn", pairs * Cz);
+    WITH_PT(AF2_P16, layerNormFastK<128, PT><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+      reinterpret_cast<const PT*>(pair), qn, pairs, P(S + "query_embedding_norm/scale"), P(S + "query_embedding_norm/offset")));
+    gemm(qn, P(S + "template_pair_embedding_8/weights"), qterm, pairs, Cz, C);
+  }
   // the nine linears' biases, summed once
   static float* bsum = nullptr;
   if (!bsum) {
@@ -108,32 +128,49 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
     CK(cudaMemcpy(dbs, bs.data(), 9 * sizeof(float*), cudaMemcpyHostToDevice));
     sumBiasesK<<<1, 64, 0, STREAM>>>(bsum, dbs, 9, C);
   }
-  float* sum = scratch<float>("tmpl.sum", pairs * C);
-  CK(cudaMemsetAsync(sum, 0, pairs * C * 4, STREAM));
+  float* sum = (!FAST || T > 1) ? scratch<float>("tmpl.sum", pairs * C) : nullptr;
   float* act = scratch<float>("tmpl.act", pairs * C);
-  float* qterm = scratch<float>("tmpl.qterm", pairs * C);
-  float* actn = scratch<float>("tmpl.actn", pairs * C);
+  float* actn = T > 1 ? scratch<float>("tmpl.actn", pairs * C) : nullptr;
+  float* frames = scratch<float>("tmpl.frames", (size_t)L * 12);
+  float* bbMask = scratch<float>("tmpl.bbm", L);
   auto w = [&](int k) { return P(S + "template_pair_embedding_" + std::to_string(k) + "/weights"); };
   for (int k = 0; k < T; ++k) {
-    templatePairInputK<<<(unsigned)pairs, 64, 0, STREAM>>>(tAatype + (size_t)k * L, tPos + (size_t)k * L * 37 * 3,
-      tMask + (size_t)k * L * 37, w(0), w(1), w(2), w(3), w(4), w(5), w(6), w(7), bsum, act, L, C);
-    gemm(qn, w(8), qterm, pairs, Cz, C);
-    addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(act, qterm, pairs * C);
+    templateFramesK<<<blocks(L), 256, 0, STREAM>>>(tPos + (size_t)k * L * 37 * 3, tMask + (size_t)k * L * 37, frames, bbMask, L);
+    templatePairInputK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(tAatype + (size_t)k * L, tPos + (size_t)k * L * 37 * 3,
+      tMask + (size_t)k * L * 37, frames, bbMask, w(0), w(1), w(2), w(3), w(4), w(5), w(6), w(7), bsum, qterm, act, L, C);
     int nb = (int)dimW(IT + "pair_transition/transition1/weights", 0);
     for (int b = 0; b < nb; ++b) {
-      triangleMultiplication(act, pairMask, L, C, IT, b, true);
-      triangleMultiplication(act, pairMask, L, C, IT, b, false);
-      triangleAttention(act, pairMask, L, C, IT, b, true);
-      triangleAttention(act, pairMask, L, C, IT, b, false);
+      triangleMultiplication(act, pairMask, L, C, IT, b, true, pairOnes);
+      triangleMultiplication(act, pairMask, L, C, IT, b, false, pairOnes);
+      triangleAttention(act, pairMask, L, C, IT, b, true, pairOnes);
+      triangleAttention(act, pairMask, L, C, IT, b, false, pairOnes);
       transition(act, pairs, C, IT + "pair_transition", b);
     }
-    layerNorm(act, actn, pairs, C, S + "output_layer_norm");
-    addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, actn, pairs * C);
+    if (T == 1) {
+      if (FAST) {
+        half* sh = scratch<half>("tmpl.sh", pairs * C);
+        layerNormVK<64, float, half, true><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+          act, sh, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
+        if (!AF2_P16) {
+          ltGemm(sh, PH(TE + "output_linear/weights"), pair, false, pairs, C, Cz, P(TE + "output_linear/bias"), false, 1.f);
+          return;
+        }
+        float* out = scratch<float>("tmpl.out", pairs * Cz);
+        ltGemm(sh, PH(TE + "output_linear/weights"), out, false, pairs, C, Cz, nullptr, false, 0.f);
+        addIntoPairK<__nv_bfloat16, float><<<blocks((pairs * Cz + 3) / 4), 256, 0, STREAM>>>(pair, out, pairs * Cz, P(TE + "output_linear/bias"));
+        return;
+      }
+      layerNormFastK<64, float, true><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+        act, sum, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
+    } else {
+      layerNorm(act, k == 0 ? sum : actn, pairs, C, S + "output_layer_norm");
+      if (k > 0) addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, actn, pairs * C);
+    }
   }
-  reluScaleK<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, 1.f / T, pairs * C);
+  if (T > 1) reluScaleK<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, 1.f / T, pairs * C);
   float* out = scratch<float>("tmpl.out", pairs * Cz);
-  linearB(sum, TE + "output_linear", -1, out, pairs, C, Cz);
-  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz));
+  gemm(sum, P(TE + "output_linear/weights"), out, pairs, C, Cz);
+  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks((pairs * Cz + 3) / 4), 256, 0, STREAM>>>(pair, out, pairs * Cz, P(TE + "output_linear/bias")));
 }
 
 // ---------------------------------------------------------------- the monomer's template embedder
@@ -141,35 +178,40 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
 // The 88 template pair inputs - dgram(39) | mask_2d | aatype_j(22) | aatype_i(22) | unit vector(3, zeros:
 // use_template_unit_vector is off in every shipped monomer config) | backbone mask - all multiplied by
 // the backbone mask, through embedding2d (88 -> 64)
-__global__ void templatePairInputMonomerK(const int* tAatype, const float* tPos, const float* tMask, const float* w,
-                                          const float* b, float* act, int L, int C) {
-  size_t ij = (size_t)blockIdx.x;
-  if (ij >= (size_t)L * L) return;
-  int i = (int)(ij / L), j = (int)(ij % L);
-  __shared__ float feat[40];
-  __shared__ int ai, aj; __shared__ float bb;
-  if (threadIdx.x == 0) {
-    auto pbAtom = [&](int r) { return tAatype[r] == 7 ? 1 : 3; };
-    int pi = pbAtom(i), pj = pbAtom(j);
-    float m2 = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
-    float d2 = 0;
-    for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
-    for (int q = 0; q < 39; ++q) {
-      float lo = 3.25f + (50.75f - 3.25f) * q / 38.f, hi = 3.25f + (50.75f - 3.25f) * (q + 1) / 38.f;
-      feat[q] = (d2 > lo * lo && d2 < (q + 1 < 39 ? hi * hi : 1e8f)) ? 1.f : 0.f;     // (the monomer's dgram is not masked)
-    }
-    feat[39] = m2;
-    auto bbm = [&](int r) { return tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2]; };
-    bb = bbm(i) * bbm(j);
-    ai = min(max(tAatype[i], 0), 21); aj = min(max(tAatype[j], 0), 21);
+__global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const float* __restrict__ tPos,
+                                          const float* __restrict__ tMask, const float* __restrict__ w,
+                                          const float* __restrict__ b, float* __restrict__ act, int L, int C) {
+  __shared__ float sb[64], sw39[64], sw87[64];
+  if (threadIdx.x < 64) {
+    int c = threadIdx.x;
+    sb[c] = b[c]; sw39[c] = w[39 * C + c]; sw87[c] = w[87 * C + c];
   }
   __syncthreads();
-  for (int c = threadIdx.x; c < C; c += blockDim.x) {
-    float a = 0;
-    for (int q = 0; q < 40; ++q) a += feat[q] * w[q * C + c];
+  size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (ij >= (size_t)L * L) return;
+  int i = (int)(ij / L), j = (int)(ij % L);
+  int rawAi = tAatype[i], rawAj = tAatype[j];
+  int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
+  float m2 = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
+  float d2 = 0.f;
+  for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
+  float lo0 = 3.25f + (50.75f - 3.25f) * lane / 38.f, hi0 = 3.25f + (50.75f - 3.25f) * (lane + 1) / 38.f;
+  uint32_t m0 = __ballot_sync(~0u, d2 > lo0 * lo0 && d2 < hi0 * hi0);
+  int b1 = 32 + lane;
+  float lo1 = 3.25f + (50.75f - 3.25f) * b1 / 38.f, hi1 = 3.25f + (50.75f - 3.25f) * (b1 + 1) / 38.f;
+  uint32_t m1 = __ballot_sync(~0u, b1 < 39 && d2 > lo1 * lo1 && d2 < (b1 + 1 < 39 ? hi1 * hi1 : 1e8f));
+  int dbin = m0 ? (__ffs(m0) - 1) : (m1 ? (31 + __ffs(m1)) : -1);
+  auto bbm = [&](int r) { return tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2]; };
+  float bb = bbm(i) * bbm(j);
+  int ai = min(max(rawAi, 0), 21), aj = min(max(rawAj, 0), 21);
+#pragma unroll
+  for (int k = 0; k < 2; ++k) {
+    int c = lane + 32 * k;
+    float a = (dbin >= 0 ? w[dbin * C + c] : 0.f) + m2 * sw39[c];
     a += w[(40 + aj) * C + c] + w[(62 + ai) * C + c];
-    a += w[87 * C + c];                       // the backbone mask itself (=1 where bb is, scaled below)
-    act[ij * C + c] = a * bb + b[c];          // every input times the backbone mask, then the bias
+    a += sw87[c];                             // the backbone mask itself (=1 where bb is, scaled below)
+    act[ij * C + c] = a * bb + sb[c];         // every input times the backbone mask, then the bias
   }
 }
 // the pointwise attention from the query pair over the templates: q [pairs, H*D] (scaled), k, v
@@ -193,7 +235,7 @@ __global__ void templatePointAttentionK(const float* q, const float* k, const fl
     out[p * W + h * D + d] = a / sum;
   }
 }
-inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T) {
+inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T, bool pairOnes = false) {
   const std::string TE = "evoformer/template_embedding/", S = TE + "single_template_embedding/";
   const std::string PS = S + "template_pair_stack/__layer_stack_no_state/";
   const int C = 64, Cz = 128;
@@ -203,35 +245,53 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
   int nb = (int)dimW(PS + "pair_transition/transition1/weights", 0);
   for (int k = 0; k < T; ++k) {
     float* act = reps + (size_t)k * pairs * C;
-    templatePairInputMonomerK<<<(unsigned)pairs, 64, 0, STREAM>>>(Idev("t/aatype") + (size_t)k * L,
+    templatePairInputMonomerK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(Idev("t/aatype") + (size_t)k * L,
       W("t/positions") + (size_t)k * L * 37 * 3, W("t/mask") + (size_t)k * L * 37,
       P(S + "embedding2d/weights"), P(S + "embedding2d/bias"), act, L, C);
     for (int b = 0; b < nb; ++b) {        // the MONOMER's order: both attentions, then both multiplications
-      triangleAttention(act, pairMask, L, C, PS, b, true);
-      triangleAttention(act, pairMask, L, C, PS, b, false);
-      triangleMultiplication(act, pairMask, L, C, PS, b, true);
-      triangleMultiplication(act, pairMask, L, C, PS, b, false);
+      triangleAttention(act, pairMask, L, C, PS, b, true, pairOnes);
+      triangleAttention(act, pairMask, L, C, PS, b, false, pairOnes);
+      triangleMultiplication(act, pairMask, L, C, PS, b, true, pairOnes);
+      triangleMultiplication(act, pairMask, L, C, PS, b, false, pairOnes);
       transition(act, pairs, C, PS + "pair_transition", b);
     }
-    float* tmp = scratch<float>("mtmpl.ln", pairs * C);
-    layerNorm(act, tmp, pairs, C, S + "output_layer_norm");
-    CK(cudaMemcpyAsync(act, tmp, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    if (FAST && T == 1) {
+      const std::string A = TE + "attention/";
+      int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), Wd = Hh * D;
+      half* rh = scratch<half>("mtmpl.rh", pairs * C);
+      layerNormVK<64, float, half><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+        act, rh, pairs, P(S + "output_layer_norm/scale"), P(S + "output_layer_norm/offset"));
+      half* vvh = scratch<half>("mtmpl.vh", pairs * Wd);
+      ltGemm(rh, PH(A + "value_w"), vvh, true, pairs, C, Wd, nullptr, false, 0.f);
+      if (!AF2_P16) {
+        ltGemm(vvh, PH(A + "output_w"), pair, false, pairs, Wd, Cz, P(A + "output_b"), false, 1.f);
+        return;
+      }
+      float* out = scratch<float>("mtmpl.out", pairs * Cz);
+      ltGemm(vvh, PH(A + "output_w"), out, false, pairs, Wd, Cz, nullptr, false, 0.f);
+      addIntoPairK<__nv_bfloat16, float><<<blocks((pairs * Cz + 3) / 4), 256, 0, STREAM>>>(pair, out, pairs * Cz, P(A + "output_b"));
+      return;
+    }
+    layerNorm(act, act, pairs, C, S + "output_layer_norm");
   }
   const std::string A = TE + "attention/";
   int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), Wd = Hh * D;
-  float* q = scratch<float>("mtmpl.q", pairs * Wd);
-  float* kk = scratch<float>("mtmpl.k", (size_t)T * pairs * Wd); float* vv = scratch<float>("mtmpl.v", (size_t)T * pairs * Wd);
-  gemm(pairF32(pair, pairs * Cz), P(A + "query_w"), q, pairs, Cz, Wd);
-  float s = 1.f / sqrtf((float)D);
-  CB(cublasSscal(H, (int)(pairs * Wd), &s, q, 1));
-  gemm(reps, P(A + "key_w"), kk, (size_t)T * pairs, C, Wd);
+  float* vv = scratch<float>("mtmpl.v", (size_t)T * pairs * Wd);
   gemm(reps, P(A + "value_w"), vv, (size_t)T * pairs, C, Wd);
-  float* o = scratch<float>("mtmpl.o", pairs * Wd);
-  templatePointAttentionK<<<blocks(pairs * Hh), 256, 0, STREAM>>>(q, kk, vv, o, pairs, T, Hh, D);
+  float* o = vv;
+  if (T > 1) {
+    float* q = scratch<float>("mtmpl.q", pairs * Wd);
+    float* kk = scratch<float>("mtmpl.k", (size_t)T * pairs * Wd);
+    gemm(pairF32(pair, pairs * Cz), P(A + "query_w"), q, pairs, Cz, Wd);
+    float s = 1.f / sqrtf((float)D);
+    CB(cublasSscal(H, (int)(pairs * Wd), &s, q, 1));
+    gemm(reps, P(A + "key_w"), kk, (size_t)T * pairs, C, Wd);
+    o = scratch<float>("mtmpl.o", pairs * Wd);
+    templatePointAttentionK<<<blocks(pairs * Hh), 256, 0, STREAM>>>(q, kk, vv, o, pairs, T, Hh, D);
+  }
   float* out = scratch<float>("mtmpl.out", pairs * Cz);
   gemm(o, P(A + "output_w"), out, pairs, Wd, Cz);
-  addBiasK<<<blocks(pairs * Cz), 256, 0, STREAM>>>(out, P(A + "output_b"), pairs, Cz);
-  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz));
+  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks((pairs * Cz + 3) / 4), 256, 0, STREAM>>>(pair, out, pairs * Cz, P(A + "output_b")));
 }
 
 // ---------------------------------------------------------------- the templates' MSA rows
@@ -246,12 +306,14 @@ __device__ inline void cross3(const float* a, const float* b, float* o) {
 // mask (the psi torsion's) - all_atom.atom37_to_torsion_angles, placeholder off (zero_init)
 __global__ void templateTorsionFeatK(const int* tAatype, const float* tPos, const float* tMask, const int* chiIdx,
                                      const float* chiMaskT, const float* chiPi, float* feat, float* rowMask, int L) {
+  __shared__ float zp[9];
+  if (threadIdx.x < 9) zp[threadIdx.x] = 0.f;
+  __syncthreads();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= L) return;
   int aaRaw = tAatype[i], a = min(aaRaw, 20);
   const float* p = tPos + (size_t)i * 37 * 3; const float* m = tMask + (size_t)i * 37;
-  float zp[37 * 3] = {}; float zm[37] = {};
-  const float* pp = i > 0 ? tPos + (size_t)(i - 1) * 37 * 3 : zp; const float* pm = i > 0 ? tMask + (size_t)(i - 1) * 37 : zm;
+  const float* pp = i > 0 ? tPos + (size_t)(i - 1) * 37 * 3 : zp; const float* pm = i > 0 ? tMask + (size_t)(i - 1) * 37 : zp;
   const float* atoms[7][4]; float tm[7];
   atoms[0][0] = pp + 3; atoms[0][1] = pp + 6; atoms[0][2] = p; atoms[0][3] = p + 3;          // pre-omega
   tm[0] = pm[1] * pm[2] * m[0] * m[1];

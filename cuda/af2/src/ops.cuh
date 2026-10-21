@@ -58,8 +58,39 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) y[row * C + c] = (xr[c] - mean) * inv * scale[c] + offset[c];
 }
+template <int C, class TI = float, bool RELU = false>
+__global__ void layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
+                               const float* __restrict__ scale, const float* __restrict__ offset) {
+  constexpr int K = C / 32;
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const TI* xr = x + row * C;
+  float v[K], s = 0.f;
+#pragma unroll
+  for (int k = 0; k < K; ++k) { float xk = (float)xr[lane + 32 * k]; v[k] = xk; s += xk; }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, q2 = 0.f;
+#pragma unroll
+  for (int k = 0; k < K; ++k) { float d = v[k] - mean; q2 += d * d; }
+  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
+  float inv = rsqrtf(q2 / C + 1e-5f);
+  float* yr = y + row * C;
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    int c = lane + 32 * k;
+    float out = (v[k] - mean) * inv * scale[c] + offset[c];
+    yr[c] = RELU ? fmaxf(out, 0.f) : out;
+  }
+}
 inline void layerNorm(const float* x, float* y, size_t rows, int C, const std::string& w, int block = -1) {
-  layerNormK<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
+  const float *sc = P(w + "/scale", block), *of = P(w + "/offset", block);
+  unsigned g = (unsigned)((rows + 7) / 8);
+  if (C == 64) layerNormFastK<64><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 128) layerNormFastK<128><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 256) layerNormFastK<256><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 384) layerNormFastK<384><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else layerNormK<<<g, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 
 // [A, B, C] -> [B, A, C]

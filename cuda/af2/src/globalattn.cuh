@@ -29,23 +29,34 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
   constexpr int LDW = NIN + 8, LDX = C + 8;
   __shared__ __align__(16) half Ws[C * LDW];
   __shared__ __align__(16) half Xs[WARPS][16 * LDX];
-  __shared__ float sS[C], sO[C], sGb[H * D];
   __shared__ float red[WARPS][32][33];
   __shared__ float mred[WARPS][16];
   for (int t = threadIdx.x; t < C * NIN; t += WARPS * 32) {
     int k = t / NIN, c = t % NIN;
     Ws[k * LDW + c] = c < D ? wk[k * D + c] : c < 2 * D ? wv[k * D + c - D] : wg[k * H * D + c - 2 * D];
   }
-  for (int t = threadIdx.x; t < C; t += WARPS * 32) { sS[t] = lnS[t]; sO[t] = lnO[t]; sGb[t] = gb[t]; }
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const int b0 = blockIdx.x * 16, tok = lane >> 1, hf = lane & 1, b = b0 + tok;
   const bool valid = b < L;
   const int s0 = blockIdx.y * rowsPerBlock, s1 = min(N, s0 + rowsPerBlock);
+  float sS[32], sO[32];
+  const float4* pS = reinterpret_cast<const float4*>(lnS + hf * 32);
+  const float4* pO = reinterpret_cast<const float4*>(lnO + hf * 32);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float4 fs = pS[i], fo = pO[i];
+    sS[4 * i] = fs.x; sS[4 * i + 1] = fs.y; sS[4 * i + 2] = fs.z; sS[4 * i + 3] = fs.w;
+    sO[4 * i] = fo.x; sO[4 * i + 1] = fo.y; sO[4 * i + 2] = fo.z; sO[4 * i + 3] = fo.w;
+  }
+  float2 gb2[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) gb2[i] = *reinterpret_cast<const float2*>(gb + i * 8 + tig * 2);
   float qacc[32], macc = 0.f;
 #pragma unroll
   for (int c = 0; c < 32; ++c) qacc[c] = 0.f;
   half* xs = Xs[warp];
+  const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
   for (int s = s0 + warp; s < s1; s += WARPS) {
     float v[32];
     if (valid) {
@@ -72,8 +83,8 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
       uint4 o4; half2* oh = reinterpret_cast<half2*>(&o4);
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const int c = 8 * i + 2 * e, ch = hf * 32 + c;
-        const float x0 = (v[c] - mean) * inv * sS[ch] + sO[ch], x1 = (v[c + 1] - mean) * inv * sS[ch + 1] + sO[ch + 1];
+        const int c = 8 * i + 2 * e;
+        const float x0 = (v[c] - mean) * inv * sS[c] + sO[c], x1 = (v[c + 1] - mean) * inv * sS[c + 1] + sO[c + 1];
         qacc[c] += m * x0; qacc[c + 1] += m * x1;
         oh[e] = __floats2half2_rn(x0, x1);
       }
@@ -84,13 +95,16 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
 #pragma unroll
     for (int ks = 0; ks < C / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
     float acc[NIN / 8][4] = {};
+    uint32_t f[2][4];
+    ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
     for (int ks = 0; ks < C / 16; ++ks)
 #pragma unroll
       for (int n2 = 0; n2 < NIN / 16; ++n2) {
-        uint32_t f[4];
-        ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + n2 * 16 + (lane >> 4) * 8);
-        mma16816(acc[2 * n2], xa[ks], f[0], f[1]); mma16816(acc[2 * n2 + 1], xa[ks], f[2], f[3]);
+        const int step = ks * (NIN / 16) + n2, cur = step & 1;
+        if (n2 + 1 < NIN / 16) ldsm4t(f[cur ^ 1], Ws + (ks * 16 + kl) * LDW + (n2 + 1) * 16 + cl);
+        else if (ks + 1 < C / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
+        mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
     __syncwarp();                         // (every lane has its fragments: the next row's LN may take the tile)
 #pragma unroll
@@ -104,8 +118,9 @@ __global__ void __launch_bounds__(WARPS * 32) gaInK(const float* __restrict__ ms
         if (nt < 2) *reinterpret_cast<float2*>(kv + ((size_t)bt * N + s) * 2 * D + col) = make_float2(a0, a1);
         else {
           const int gc = col - 2 * D;
+          const float2 b2 = gb2[nt - 2];
           *reinterpret_cast<half2*>(gate + ((size_t)s * L + bt) * H * D + gc) =
-              __floats2half2_rn(1.f / (1.f + __expf(-(a0 + sGb[gc]))), 1.f / (1.f + __expf(-(a1 + sGb[gc + 1]))));
+              __floats2half2_rn(1.f / (1.f + __expf(-(a0 + b2.x))), 1.f / (1.f + __expf(-(a1 + b2.y))));
         }
       }
     }
@@ -233,16 +248,26 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
   constexpr int K = H * D, LDW = C + 8, LDX = K + 8;
   __shared__ __align__(16) half Ws[K * LDW];
   __shared__ __align__(16) half Xs[WARPS][16 * LDX];
-  __shared__ float sA[16][K], sB[C];
   const int b0 = blockIdx.x * 16;
   for (int t = threadIdx.x; t < K * C; t += WARPS * 32) Ws[(t / C) * LDW + t % C] = wo[t];
-  for (int t = threadIdx.x; t < 16 * K; t += WARPS * 32) sA[t / K][t % K] = b0 + t / K < L ? avg[(size_t)(b0 + t / K) * K + t % K] : 0.f;
-  for (int t = threadIdx.x; t < C; t += WARPS * 32) sB[t] = bo[t];
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const int tok = lane >> 1, hf = lane & 1, b = b0 + tok;
   const int s0 = blockIdx.y * rowsPerBlock, s1 = min(N, s0 + rowsPerBlock);
+  float av[32] = {};
+  if (b < L) {
+    const float4* pA = reinterpret_cast<const float4*>(avg + (size_t)b * K + hf * 32);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      float4 fa = pA[i];
+      av[4 * i] = fa.x; av[4 * i + 1] = fa.y; av[4 * i + 2] = fa.z; av[4 * i + 3] = fa.w;
+    }
+  }
+  float2 b2[C / 8];
+#pragma unroll
+  for (int nt = 0; nt < C / 8; ++nt) b2[nt] = *reinterpret_cast<const float2*>(bo + nt * 8 + tig * 2);
   half* xs = Xs[warp];
+  const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
   for (int s = s0 + warp; s < s1; s += WARPS) {
     // this lane's token's 32 gate columns times its column's average, f16 into the warp's tile
 #pragma unroll
@@ -254,9 +279,9 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
         half2* oh = reinterpret_cast<half2*>(&o4);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-          const int c = hf * 32 + 8 * i + 2 * e;
+          const int c = 8 * i + 2 * e;
           const float2 gf = __half22float2(gh[e]);
-          oh[e] = __floats2half2_rn(gf.x * sA[tok][c], gf.y * sA[tok][c + 1]);
+          oh[e] = __floats2half2_rn(gf.x * av[c], gf.y * av[c + 1]);
         }
       }
       *reinterpret_cast<uint4*>(xs + tok * LDX + hf * 32 + 8 * i) = o4;
@@ -266,13 +291,16 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
     float acc[C / 8][4] = {};
+    uint32_t f[2][4];
+    ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks)
 #pragma unroll
       for (int n2 = 0; n2 < C / 16; ++n2) {
-        uint32_t f[4];
-        ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + n2 * 16 + (lane >> 4) * 8);
-        mma16816(acc[2 * n2], xa[ks], f[0], f[1]); mma16816(acc[2 * n2 + 1], xa[ks], f[2], f[3]);
+        const int step = ks * (C / 16) + n2, cur = step & 1;
+        if (n2 + 1 < C / 16) ldsm4t(f[cur ^ 1], Ws + (ks * 16 + kl) * LDW + (n2 + 1) * 16 + cl);
+        else if (ks + 1 < K / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
+        mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
     __syncwarp();
 #pragma unroll
@@ -284,7 +312,7 @@ __global__ void __launch_bounds__(WARPS * 32) gaOutK(const half* __restrict__ ga
       for (int nt = 0; nt < C / 8; ++nt) {
         const int col = nt * 8 + tig * 2;
         float2 r = *reinterpret_cast<float2*>(row + col);
-        r.x += acc[nt][2 * hh] + sB[col]; r.y += acc[nt][2 * hh + 1] + sB[col + 1];
+        r.x += acc[nt][2 * hh] + b2[nt].x; r.y += acc[nt][2 * hh + 1] + b2[nt].y;
         *reinterpret_cast<float2*>(row + col) = r;
       }
     }
@@ -332,11 +360,13 @@ __global__ void __launch_bounds__(WARPS * 32) projAdd64K(const half* __restrict_
   constexpr int K = 64, C = 64, LDW = C + 8, LDX = K + 8;
   __shared__ __align__(16) half Ws[K * LDW];
   __shared__ __align__(16) half Xs[WARPS][16 * LDX];
-  __shared__ float sB[C];
   for (int t = threadIdx.x; t < K * C; t += WARPS * 32) Ws[(t / C) * LDW + t % C] = wo[t];
-  for (int t = threadIdx.x; t < C; t += WARPS * 32) sB[t] = bo[t];
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, tok = lane >> 1, hf = lane & 1;
+  const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+  float2 b2[C / 8];
+#pragma unroll
+  for (int nt = 0; nt < C / 8; ++nt) b2[nt] = *reinterpret_cast<const float2*>(bo + nt * 8 + tig * 2);
   half* xs = Xs[warp];
   for (size_t tile = (size_t)blockIdx.x * WARPS + warp; tile * 16 < rows; tile += (size_t)gridDim.x * WARPS) {
     const size_t r0 = tile * 16, r = r0 + tok;
@@ -349,13 +379,16 @@ __global__ void __launch_bounds__(WARPS * 32) projAdd64K(const half* __restrict_
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
     float acc[C / 8][4] = {};
+    uint32_t f[2][4];
+    ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks)
 #pragma unroll
       for (int n2 = 0; n2 < C / 16; ++n2) {
-        uint32_t f[4];
-        ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + n2 * 16 + (lane >> 4) * 8);
-        mma16816(acc[2 * n2], xa[ks], f[0], f[1]); mma16816(acc[2 * n2 + 1], xa[ks], f[2], f[3]);
+        const int step = ks * (C / 16) + n2, cur = step & 1;
+        if (n2 + 1 < C / 16) ldsm4t(f[cur ^ 1], Ws + (ks * 16 + kl) * LDW + (n2 + 1) * 16 + cl);
+        else if (ks + 1 < K / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
+        mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
     __syncwarp();
 #pragma unroll
@@ -367,7 +400,7 @@ __global__ void __launch_bounds__(WARPS * 32) projAdd64K(const half* __restrict_
       for (int nt = 0; nt < C / 8; ++nt) {
         const int col = nt * 8 + tig * 2;
         float2 v = *reinterpret_cast<float2*>(row + col);
-        v.x += acc[nt][2 * hh] + sB[col]; v.y += acc[nt][2 * hh + 1] + sB[col + 1];
+        v.x += acc[nt][2 * hh] + b2[nt].x; v.y += acc[nt][2 * hh + 1] + b2[nt].y;
         *reinterpret_cast<float2*>(row + col) = v;
       }
     }

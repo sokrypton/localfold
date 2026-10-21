@@ -39,26 +39,40 @@ static std::vector<float> expectation(const std::vector<float>& logits, size_t r
 // result): the PAE expectation and the pair's TM term (confidence.compute_tm's, before its row means), and the distogram's
 // P(< 8 A). Double accumulation in the host's bin order; the exp is the device's.
 __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
-  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
   if (r >= pairs) return;
   const float* l = logits + r * 64;
-  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
   double s = 0, e = 0, t = 0;
-  for (int b = 0; b < 64; ++b) {
+  for (int k = 0; k < 2; ++k) {
+    int b = lane + k * 32;
     float c = b < 63 ? b * 0.5f + 0.25f : 62 * 0.5f + 0.25f + 0.5f;
-    double p = expf(l[b] - mx);
+    double p = expf((k ? l1 : l0) - mx);
     s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
   }
-  pae[r] = (float)(e / s); tm[r] = t / s;
+  for (int o = 16; o; o >>= 1) {
+    s += __shfl_xor_sync(~0u, s, o);
+    e += __shfl_xor_sync(~0u, e, o);
+    t += __shfl_xor_sync(~0u, t, o);
+  }
+  if (lane == 0) { pae[r] = (float)(e / s); tm[r] = t / s; }
 }
 __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
-  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
   if (r >= pairs) return;
   const float* l = logits + r * 64;
-  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
-  double s = 0, near = 0;
-  for (int b = 0; b < 64; ++b) { double e = expf(l[b] - mx); s += e; if (b <= 18) near += e; }
-  out[r] = (float)(near / s);
+  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+  double e0 = expf(l0 - mx), e1 = expf(l1 - mx);
+  double s = e0 + e1, near = lane <= 18 ? e0 : 0.0;
+  for (int o = 16; o; o >>= 1) {
+    s += __shfl_xor_sync(~0u, s, o);
+    near += __shfl_xor_sync(~0u, near, o);
+  }
+  if (lane == 0) out[r] = (float)(near / s);
 }
 // the predicted TM-score from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
 static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
@@ -98,7 +112,7 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
   put('i', "asym_id", L, 0); put('i', "entity_id", L, 0); put('i', "sym_id", L, 0);
   put('t', "f0/msa_feat", (size_t)N * L * 49, 0); put('t', "f0/msa_mask", (size_t)N * L, 1);
   put('i', "f0/extra_msa", (size_t)E * L, 0); put('t', "f0/extra_has_deletion", (size_t)E * L, 0);
-  put('t', "f0/extra_deletion_value", (size_t)E * L, 0); put('t', "f0/extra_msa_mask", (size_t)E * L, 1);
+  put('t', "f0/extra_deletion_value", (size_t)E * L, 0); put('t', "f0/extra_msa_mask", (size_t)E * L, E > 1 ? 1 : 0);
   if (T > 0) {
     put('i', "t/aatype", (size_t)T * L, 0, true); put('t', "t/positions", (size_t)T * L * 37 * 3, 0);
     put('t', "t/mask", (size_t)T * L * 37, 1);
@@ -133,7 +147,7 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
     linearB(pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
     symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
     float* cp = scratch<float>("head.contactP", pairs);      // (bins 0..18 lie below 8 A: breaks 2.3125 + 0.3125 b)
-    contactPairsK<<<blocks(pairs), 256, 0, STREAM>>>(dg, pairs, cp);
+    contactPairsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(dg, pairs, cp);
     contact = download(cp, pairs);
   }
   auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
@@ -175,26 +189,42 @@ static std::string FRAMES_DIR;
 // a pair's expected PAE and its pTM term (confidence.compute_tm's), from its 64 logits - reduced on the
 // device, because the logits are 64 floats a pair (17 MB a pass at 261 residues) and these are two
 __global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
-  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
   if (ij >= pairs) return;
   const float* l = logits + ij * 64;
   const float step = 31.f / 62;
-  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
   float s = 0, e = 0, t = 0;
-  for (int b = 0; b < 64; ++b) {
+  for (int k = 0; k < 2; ++k) {
+    int b = lane + k * 32;
     float c = b < 63 ? b * step + step / 2 : 62 * step + step / 2 + step;
-    float p = expf(l[b] - mx); s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
+    float p = expf((k ? l1 : l0) - mx);
+    s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
   }
-  pae[ij] = e / s; tm[ij] = t / s;
+  for (int o = 16; o; o >>= 1) {
+    s += __shfl_xor_sync(~0u, s, o);
+    e += __shfl_xor_sync(~0u, e, o);
+    t += __shfl_xor_sync(~0u, t, o);
+  }
+  if (lane == 0) { pae[ij] = e / s; tm[ij] = t / s; }
 }
 // P(distance < 8 A) from the symmetrised distogram logits: bins 0..18 (breaks 2.3125 + 0.3125 b)
 __global__ void contact8K(const float* logits, size_t pairs, float* out) {
-  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
   if (ij >= pairs) return;
   const float* l = logits + ij * 64;
-  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
-  float s = 0, near = 0; for (int b = 0; b < 64; ++b) { float p = expf(l[b] - mx); s += p; if (b <= 18) near += p; }
-  out[ij] = near / s;
+  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+  float p0 = expf(l0 - mx), p1 = expf(l1 - mx);
+  float s = p0 + p1, near = lane <= 18 ? p0 : 0.f;
+  for (int o = 16; o; o >>= 1) {
+    s += __shfl_xor_sync(~0u, s, o);
+    near += __shfl_xor_sync(~0u, near, o);
+  }
+  if (lane == 0) out[ij] = near / s;
 }
 
 // On a card short of room the pair heads never hold [pairs, 64] logits whole: the distogram's contact
@@ -212,7 +242,7 @@ inline std::vector<float> contactsChunked(const float* pair, int L) {
     gatherColumnsK<<<blocks(rows * 128), 256, 0, STREAM>>>(pair, rowsT, L, 128, r0, r);
     linearB(rowsT, "distogram_head/half_logits", -1, b, rows, 128, 64);
     addK2<<<blocks(rows * 64), 256, 0, STREAM>>>(a, b, rows * 64);
-    contact8K<<<blocks(rows), 256, 0, STREAM>>>(a, rows, c + r0 * L);
+    contact8K<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(a, rows, c + r0 * L);
   }
   std::vector<float> out = download(c, pairs);
   releaseScratch({ "head.rowsT", "head.dgramHalf", "head.dgramHalfT", "head.contact" });
@@ -286,6 +316,29 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   CK(cudaMemset(prevRow, 0, (size_t)L * 256 * 4)); CK(cudaMemset(tight ? t.pair : prevPair, 0, pairs * 128 * 4));
   CK(cudaMemset(prevPos, 0, (size_t)L * 37 * 3 * 4));
   float* single = dalloc((size_t)L * 384);
+  // --frames: the pass tap (see FRAMES_DIR) - host copies of what a pass's PDB needs, taken once
+  std::vector<int> hAatype, hRi, hAsym; int hFirstAsym = 0;
+  std::vector<double> passReference; double passCentre[3] = {};
+  // every pass of a real fold is tapped: its line of stats is printed as it lands (mean pLDDT, pTM, ipTM, and how
+  // far the structure moved - caPairChange, the early stop's measure), and with --frames its files are written
+  const bool tapPasses = !warm, writeFrames = !FRAMES_DIR.empty();
+  const bool tapContacts = writeFrames && M.has("w/distogram_head/half_logits/weights");
+  const float* mask37 = M.f("c/atom37_mask");
+  std::vector<float> passMask = warm ? std::vector<float>() : std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
+  auto lastPassPos = std::make_shared<std::vector<float>>();
+  if (tapPasses) {
+    hAatype.resize(L); hRi.resize(L); hAsym.resize(L);
+    CK(cudaMemcpy(hAatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hRi.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hAsym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
+    hFirstAsym = *std::min_element(hAsym.begin(), hAsym.end());
+    TAP().reserve(passes, (size_t)L * 37 * 3 * 4 + (size_t)L * 50 * 4 + pairs * 4 + (writeFrames ? pairs * 2 : 0) + 4 * 256);
+    scratch<float>("tap.pae", pairs); scratch<float>("tap.tm", pairs);
+    for (int p = 0; p < passes; ++p) {
+      std::string fp = "f" + std::to_string(p) + "/";
+      M.f(fp + "msa_mask"); M.f(fp + "extra_msa_mask");
+    }
+  }
   if (!warm) printf("AF2 %s: %d residues, %d MSA rows, %d extra, %d passes (loaded in %.1f s)\n", M.flag("meta/multimer") ? "multimer" : "monomer",
          L, t.N, t.E, passes, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   int extraBlocks = warm ? 1 : (int)dimW("evoformer/extra_msa_stack/msa_transition/transition1/weights", 0);
@@ -304,8 +357,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       printf("    pass %d %-14s %.1f ms\n", pass, what, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
     };
     mark("embed"); memReport("embedded");
-    if (multimer) templateEmbedding(t.pair, t.pairMask, L);
-    else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
+    if (multimer) templateEmbedding(t.pair, t.pairMask, L, t.pairOnes);
+    else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates, t.pairOnes);
     if (t.T > 0) {
       templateRows(L, t.T, multimer, t.msa + (size_t)t.N * L * 256, const_cast<float*>(t.msaMask) + (size_t)t.N * L);
       if (check && !multimer) {
@@ -339,7 +392,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 #else
       MSA16_HALF = major < 8;
 #endif
-      MSA16 = FAST && !check && t.msaOnes && (MSA16_HALF || !flashRegStaged()) && !getenv("LOCALFOLD_MSA_F32") &&
+      MSA16 = FAST && !check && (t.msaOnes || (!MSA16_HALF && !AF2_TIGHT && fitsSmem(oln::SMEM))) &&
+              (MSA16_HALF || !flashRegStaged()) && !getenv("LOCALFOLD_MSA_F32") &&
               dimW(q, 2) * dimW(q, 3) == 256 && dimW(q, 3) == 32 && dimW(qc, 3) == 32;
       if (MSA16) {
         size_t n16 = (size_t)(t.N + t.T) * L * 256;
@@ -358,13 +412,13 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       }
     }
     if (MSA16) {
-      size_t n16 = (size_t)(t.N + t.T) * L * 256;
+      size_t n16 = (size_t)L * 256;
       if (MSA16_HALF) msa16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const half*>(t.msa16), t.msa, n16);
-      else pairBf16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
+      else pairBf16ToF32K<<<blocks((n16 + 3) / 4), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
       MSA16 = false; t.msa16 = nullptr;
     }
     // a bf16 pair converted once into the recycled pair, which every reader after the stacks takes
-    if (AF2_P16) pairBf16ToF32K<<<blocks(pairs * 128), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), prevPair, pairs * 128);
+    if (AF2_P16) pairBf16ToF32K<<<blocks((pairs * 128 + 3) / 4), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), prevPair, pairs * 128);
     const float* pairOut = AF2_P16 ? prevPair : t.pair;
     linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     if (check) {
@@ -421,31 +475,14 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   std::vector<float> previous37, seqMask;
   double converged = -1; int ran = passes;
   if (TOLERANCE > 0 && !warm) seqMask = std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
-  // --frames: the pass tap (see FRAMES_DIR) - host copies of what a pass's PDB needs, taken once
-  std::vector<int> hAatype, hRi, hAsym; int hFirstAsym = 0;
-  std::vector<double> passReference; double passCentre[3] = {};
-  // every pass of a real fold is tapped: its line of stats is printed as it lands (mean pLDDT, pTM, ipTM, and how
-  // far the structure moved - caPairChange, the early stop's measure), and with --frames its files are written
-  const bool tapPasses = !warm, writeFrames = !FRAMES_DIR.empty();
-  const bool tapContacts = writeFrames && M.has("w/distogram_head/half_logits/weights");
-  std::vector<float> passMask = warm ? std::vector<float>() : std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
-  auto lastPassPos = std::make_shared<std::vector<float>>();
-  if (tapPasses) {
-    hAatype.resize(L); hRi.resize(L); hAsym.resize(L);
-    CK(cudaMemcpy(hAatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(hRi.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(hAsym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
-    hFirstAsym = *std::min_element(hAsym.begin(), hAsym.end());
-    TAP().reserve(passes, (size_t)L * 37 * 3 * 4 + (size_t)L * 50 * 4 + pairs * 4 + (writeFrames ? pairs * 2 : 0) + 4 * 256);
-  }
   auto tapPass = [&](int pass) {
     if (!tapPasses) return;
     float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
     float* paeF = scratch<float>("tap.pae", pairs); float* tmF = scratch<float>("tap.tm", pairs);
     if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* lg, size_t r0, size_t r) {
-      paeTmK<<<blocks(r), 256, 0, STREAM>>>(lg, r, d0, paeF + r0, tmF + r0);
+      paeTmK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(lg, r, d0, paeF + r0, tmF + r0);
     });
-    else paeTmK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
+    else paeTmK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
     std::vector<std::pair<const void*, size_t>> parts = {{so.pos37, (size_t)L * 37 * 3 * 4}, {plddtLogits, (size_t)L * 50 * 4},
                                                          {tmF, pairs * 4}};
     if (writeFrames) {
@@ -464,13 +501,12 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       linearB(AF2_P16 ? prevPair : t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
       symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
       float* cf = scratch<float>("tap.contact", pairs); unsigned char* c8 = scratch<unsigned char>("tap.contact8", pairs);
-      contact8K<<<blocks(pairs), 256, 0, STREAM>>>(dg, pairs, cf);
+      contact8K<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(dg, pairs, cf);
       quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(cf, c8, pairs, 1.f / 255);
       parts.push_back({c8, pairs});
     }
     char tag[32]; snprintf(tag, sizeof tag, "%02d-of-%02d", pass, passes);
     std::string base = FRAMES_DIR + "/", id = tag;
-    const float* mask37 = M.f("c/atom37_mask");
     TAP().offer(parts, [&, base, id, mask37, pass](const char* host, const std::vector<size_t>& at) {
       const float* pos = (const float*)(host + at[0]); const float* pl = (const float*)(host + at[1]);
       const float* tm = (const float*)(host + at[2]);
@@ -585,7 +621,15 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
     if (graph) CK(cudaGraphExecDestroy(graph));
   };
-  if (warm) { release(); return 0; }
+  if (warm) {
+    if (!AF2_TIGHT && paeLogits) {
+      float* paeF = scratch<float>("tap.pae", pairs); float* tmF = scratch<float>("tap.tm", pairs);
+      paeTmK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, 5.f, paeF, tmF);
+    }
+    warmStackWeights(t.extraZeros, multimer, monomerTemplates);
+    release();
+    return 0;
+  }
   if (profile) prof::stop(30);
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
@@ -600,9 +644,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     // (on a card short of room the last pass's logits a chunk at a time, each chunk's terms on the device too: they went
     // to the host whole and were softmaxed there, 4.9 s of 9GOC's 1,702-residue fold)
     if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
-      paeTmPairsK<<<blocks(r), 256, 0, STREAM>>>(chunk, r, d0, pe + r0, tt + r0);
+      paeTmPairsK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, r, d0, pe + r0, tt + r0);
     });
-    else paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+    else paeTmPairsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
     pae = download(pe, pairs);
     std::vector<double> tm(pairs);
     CK(cudaMemcpy(tm.data(), tt, pairs * 8, cudaMemcpyDeviceToHost));
@@ -616,7 +660,6 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   CK(cudaMemcpy(aatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(ri.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
   int firstAsym = *std::min_element(asym.begin(), asym.end());
-  const float* mask37 = M.f("c/atom37_mask");
   FILE* f = fopen(out.c_str(), "w");
   if (!f) { fprintf(stderr, "cannot write %s: %s\n", out.c_str(), strerror(errno)); return 1; }
   int serial = 1;

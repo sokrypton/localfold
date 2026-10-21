@@ -247,10 +247,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   int lo, hi; rowsOf(n, mg::RANK, lo, hi);
   const int rows = hi - lo;
   float* base = baseOf(z.local, lo, n, C);
-  std::string pg = concatColumns(WNAME(pre, "projectionGate~"), C, {{WNAME(pre, "projection"), 2 * C, false},
-                                                                      {WNAME(pre, "gate"), 2 * C, false}});
-  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
-  tileTriIn(Wh(pg), Wh(WNAME(pre, "gatingLinear")), C, 16, wt);
+  const half* wt = triInTiles(Wh(WNAME(pre, "projection")), Wh(WNAME(pre, "gate")), Wh(WNAME(pre, "gatingLinear")), C, 16);
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   const size_t mine = (size_t)maxShare * np * C;
   // (LOCALFOLD_MG_FP8_EXCHANGE=1: a and b written e4m3 for the exchange, widened back to bf16 as they are pulled - the
@@ -363,9 +360,9 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     if (rounds) { const int k0 = q * K, k1 = std::min(C, k0 + K); from = std::min(k1, k0 + r * gR); to = std::min(k1, from + gR); }
     else { from = std::min(cHi[r], cLo[r] + q * g); to = std::min(cHi[r], from + g); }
   };
-  wideWidth(C, [&](auto cw) {
+  wideWidth256(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
-    wideWarps(C, [&](auto warps) {
+    wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
         static bool attr = false, attr8 = false;
@@ -377,17 +374,21 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         // where the whole pass takes the two-tile one: two tiles a warp pay off over 32 steps' weight fragments, and a
         // window is its rows' loads - 2.26 -> 1.60 ms a C / 32 window at 4,940 tokens on a simulated rank of 8, with
         // lnRowsToShared's 16-byte rows)
-        constexpr auto kernW = triIn256For<CC, 8, TQ, PT>();
-        static bool attrW = false;
         auto produce = [&](int k0, int k1, half* gate) {
           if (rows <= 0) return;
           RectMap win = mineRm; win.ab0 = k0 / 8; win.ab1 = k1 / 8;
           const size_t back = (size_t)k0 * mineRm.size;
-          if (!x8 && rounds && WI == TRIIN_TWO_TILES) {
-            if (!attrW) { smemAttr(kernW, (int)wideTriInSmemW(CC, 8)); attrW = true; }
-            kernW<<<(unsigned)(((size_t)rows * np + triInRowsOf(8) - 1) / triInRowsOf(8)), 32 * 8, wideTriInSmemW(CC, 8), STREAM>>>(
-              base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);
-          } else if (!x8) {
+          if constexpr (WI == TRIIN_TWO_TILES) {
+            if (!x8 && rounds) {
+              constexpr auto kernW = triIn256For<CC, 8, TQ, PT>();
+              static bool attrW = false;
+              if (!attrW) { smemAttr(kernW, (int)wideTriInSmemW(CC, 8)); attrW = true; }
+              kernW<<<(unsigned)(((size_t)rows * np + triInRowsOf(8) - 1) / triInRowsOf(8)), 32 * 8, wideTriInSmemW(CC, 8), STREAM>>>(
+                base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);
+              return;
+            }
+          }
+          if (!x8) {
             if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
             kern<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
               base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);

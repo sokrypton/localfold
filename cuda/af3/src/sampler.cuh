@@ -204,14 +204,18 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     at.push_back((float)tHats[s]); at.push_back((float)levels[s + 1]);
   }
   if (onLevels) onLevels(at);
-  float* dX; CK(devMalloc(&dX, all3 * 4));
-  uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
+  float* dX = scratch<float>("sample.x", all3);
+  uint64_t* dSeeds = scratch<uint64_t>("sample.seeds", ns);
   CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
-  float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
+  float* dRot = scratch<float>("sample.rot", rot.size());
+  CK(cudaMemcpyAsync(dRot, rot.data(), rot.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+  float* dMask = scratch<float>("sample.mask", atoms);
+  CK(cudaMemcpyAsync(dMask, mask.data(), atoms * sizeof(float), cudaMemcpyHostToDevice, STREAM));
   float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
   float* dG = scratch<float>("sample.grad", all3); float* dNoisy = scratch<float>("sample.noisyKeep", all3);
-  float* dLevels = upload(at.data(), at.size());
+  float* dLevels = scratch<float>("sample.levels", at.size());
+  CK(cudaMemcpyAsync(dLevels, at.data(), at.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
   for (int s = 1; s <= T; ++s) {
     double prev = levels[s - 1], level = levels[s], tHat = tHats[s - 1], dt = level - tHat;
     double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
@@ -220,7 +224,7 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
                                                          dSeeds, (uint32_t)s, (float)injected, atoms, atoms * ns);
     CK(cudaMemcpyAsync(dNoisy, dIn, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
     const float* d1 = denoiseFn(dIn, (float)tHat, dLevels + 2 * (s - 1));
-    if (s == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
+    if (s == 1 && STAGES) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
     if (!CHAI_SECOND_ORDER) {                    // one call: the correction's D taken as this step's (see above)
       if (exponential) eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d1, (float)(std::pow(level / tHat, S) - 1), all3);
@@ -240,10 +244,7 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     const float* d2 = denoiseFn(dIn, (float)level, dLevels + 2 * (s - 1) + 1);
     chaiCorrectK<<<blocks(all3), 256, 0, STREAM>>>(dX, d2, dG, (float)level, (float)dt, all3);
   }
-  std::vector<float> out = download(dX, all3);
-  for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
-  CK(cudaFree(dSeeds));
-  return out;
+  return download(dX, all3);
 }
 // The diffusion's discretisation, after Blitz (Blitz: accelerating the diffusion modules of AlphaFold3 and Boltz-2,
 // under review at ICLR 2027) - none of it trained, all of it the teacher's own denoiser:
@@ -373,20 +374,24 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
       for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal();
     }
   }
-  float* dX; CK(devMalloc(&dX, all3 * 4));
-  uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
+  float* dX = scratch<float>("sample.x", all3);
+  uint64_t* dSeeds = scratch<uint64_t>("sample.seeds", ns);
   CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
-  float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
+  float* dRot = scratch<float>("sample.rot", rot.size());
+  CK(cudaMemcpyAsync(dRot, rot.data(), rot.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+  float* dMask = scratch<float>("sample.mask", atoms);
+  CK(cudaMemcpyAsync(dMask, mask.data(), atoms * sizeof(float), cudaMemcpyHostToDevice, STREAM));
   float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
-  float* dPrev = nullptr;
-  if (opt.multistep) { CK(devMalloc(&dPrev, all3 * 4)); CK(cudaMemsetAsync(dPrev, 0, all3 * 4, STREAM)); }
+  float* dPrev = opt.multistep ? scratch<float>("sample.prev", all3) : nullptr;
+  if (dPrev) CK(cudaMemsetAsync(dPrev, 0, all3 * 4, STREAM));
   for (int s = 0; s < steps; ++s) {
     double previous = levels[s], level = levels[s + 1];
     tHats[s] = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
   }
   if (onLevels) onLevels(tHats);       // every step's noise level, before the first step
-  float* dLevels = upload(tHats.data(), steps);
+  float* dLevels = scratch<float>("sample.levels", steps);
+  CK(cudaMemcpyAsync(dLevels, tHats.data(), steps * sizeof(float), cudaMemcpyHostToDevice, STREAM));
   for (int step = 1; step <= steps; ++step) {
     double previous = levels[step - 1], level = levels[step], tHat = tHats[step - 1];
     double injected = noiseScale * std::sqrt(std::max(0.0, tHat * tHat - previous * previous));
@@ -394,20 +399,10 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
                                                          dSeeds, (uint32_t)step, (float)injected, atoms, atoms * ns);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
-    if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
+    if (step == 1 && STAGES) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
     // (boltz2: the noisy copy rigid-aligned onto the answer, each sample, before the step - rigid.cuh)
-    if (realign) {
-      std::vector<float> noisy = download(dNoisy, all3), answer = download(d, all3);
-      for (int k = 0; k < ns; ++k) {
-        std::vector<float> x(noisy.begin() + (size_t)k * n3, noisy.begin() + (size_t)(k + 1) * n3),
-                           t(answer.begin() + (size_t)k * n3, answer.begin() + (size_t)(k + 1) * n3);
-        rigidAlign(x, t, mask, (int)atoms);
-        std::copy(x.begin(), x.end(), noisy.begin() + (size_t)k * n3);
-      }
-      CK(cudaMemcpyAsync(dNoisy, noisy.data(), all3 * 4, cudaMemcpyHostToDevice, STREAM));
-      CK(cudaStreamSynchronize(STREAM));
-    }
+    if (realign) rigidAlignK<<<ns, 256, 0, STREAM>>>(dNoisy, d, dMask, (int)atoms);
     const double coef = opt.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
     // the multistep weight w = 1 / (2 rho), rho the previous gap between evaluated levels over this step's, both in
     // log sigma; the first step, and any whose levels do not fall, is the plain exponential step (w 0)
@@ -423,11 +418,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     else
       eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)coef, all3);
   }
-  if (dPrev) CK(cudaFree(dPrev));
-  std::vector<float> out = download(dX, all3);
-  for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
-  CK(cudaFree(dSeeds));
-  return out;
+  return download(dX, all3);
 }
 
 

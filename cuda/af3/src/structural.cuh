@@ -64,6 +64,14 @@ __global__ void singleStructK(float* out, const float* a, const float* b, const 
 // the residue pair under each structural pair, in matrix-group order
 __global__ void gatherPairSortedK(const float* pair, const int* order, const int* parent, float* out, int n, int nRes,
                                   int C, size_t rows) {       // (rows: of `order`, from its pointer - a chunk of it)
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= rows * c4) return;
+    size_t r = t4 / c4; int c = (int)(t4 % c4) << 2;
+    int ij = order[r], i = ij / n, j = ij % n;
+    reinterpret_cast<float4*>(out)[t4] = *reinterpret_cast<const float4*>(pair + ((size_t)parent[i] * nRes + parent[j]) * C + c);
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * C) return;
   size_t r = t / C; int c = (int)(t % C);
@@ -75,6 +83,25 @@ __global__ void scatterPairK(float* pair, const float* gathered, const float* pr
                              const int* sameParent, const int* twin, const int* prev, const int* next, const int* type,
                              const float* eSame, const float* eTwin, const float* ePrev, const float* eNext,
                              const float* eType, int n, int C, size_t rows) {
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= rows * c4) return;
+    size_t r = t4 / c4; int c = (int)(t4 % c4) << 2;
+    int ij = order[r];
+    float4 g = reinterpret_cast<const float4*>(gathered)[t4];
+    float4 p = reinterpret_cast<const float4*>(projected)[t4];
+    float4 es = *reinterpret_cast<const float4*>(eSame + sameParent[ij] * C + c);
+    float4 et = *reinterpret_cast<const float4*>(eTwin + twin[ij] * C + c);
+    float4 ep = *reinterpret_cast<const float4*>(ePrev + prev[ij] * C + c);
+    float4 en = *reinterpret_cast<const float4*>(eNext + next[ij] * C + c);
+    float4 ey = *reinterpret_cast<const float4*>(eType + type[ij] * C + c);
+    *reinterpret_cast<float4*>(pair + (size_t)ij * C + c) = make_float4(
+      g.x + p.x + es.x + et.x + ep.x + en.x + ey.x,
+      g.y + p.y + es.y + et.y + ep.y + en.y + ey.y,
+      g.z + p.z + es.z + et.z + ep.z + en.z + ey.z,
+      g.w + p.w + es.w + et.w + ep.w + en.w + ey.w);
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * C) return;
   size_t r = t / C; int c = (int)(t % C);
@@ -128,7 +155,8 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
   { std::vector<int> fill(start.begin(), start.end() - 1);
     for (size_t ij = 0; ij < pairs; ++ij) order[fill[hr[ij / n] * DDE_ROLES + hr[ij % n]]++] = (int)ij; }
   (void)hp;
-  int* dOrder = upload(order.data(), pairs);
+  int* dOrder = scratch<int>("st.order", pairs);
+  CK(cudaMemcpyAsync(dOrder, order.data(), pairs * sizeof(int), cudaMemcpyHostToDevice, STREAM));
   if (lenW(E + "pairBlockProj") != (size_t)DDE_ROLES * DDE_ROLES * C * C) { fprintf(stderr, "pairBlockProj is not 49 x C x C\n"); exit(1); }
   s.pair = dalloc(pairs * C);
   const int *sp = Idev("structural.sameParent"), *tw = Idev("structural.twin"), *pv = Idev("structural.prevBackbone"),
@@ -141,7 +169,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
   float* projected = scratch<float>("st.projected", per * C);
   for (size_t a = 0; a < pairs; a += per) {
     size_t cnt = std::min(per, pairs - a);
-    gatherPairSortedK<<<blocks(cnt * C), 256, 0, STREAM>>>(trunkPair, dOrder + a, parent, gathered, n, nRes, C, cnt);
+    gatherPairSortedK<<<blocks((C & 3) == 0 ? (cnt * (C >> 2)) : (cnt * C)), 256, 0, STREAM>>>(trunkPair, dOrder + a, parent, gathered, n, nRes, C, cnt);
     for (int k = 0; k < DDE_ROLES * DDE_ROLES; ++k) {
       size_t lo = std::max<size_t>(start[k], a), hi = std::min<size_t>(start[k + 1], a + cnt);
       if (lo >= hi) continue;
@@ -149,7 +177,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
       if (!WF.count(w)) deviceWeight(w, (float*)W(E + "pairBlockProj") + (size_t)k * C * C, (size_t)C * C);
       linear<float, float>(gathered + (lo - a) * C, projected + (lo - a) * C, hi - lo, C, C, w);
     }
-    scatterPairK<<<blocks(cnt * C), 256, 0, STREAM>>>(s.pair, gathered, projected, dOrder + a, sp, tw, pv, nx, ty,
+    scatterPairK<<<blocks((C & 3) == 0 ? (cnt * (C >> 2)) : (cnt * C)), 256, 0, STREAM>>>(s.pair, gathered, projected, dOrder + a, sp, tw, pv, nx, ty,
       W(E + "sameParentEmbedding"), W(E + "sameResidueTwinEmbedding"), W(E + "prevBbChainEmbedding"),
       W(E + "nextBbChainEmbedding"), W(E + "rolePairTypeEmbedding"), n, C, cnt);
   }
@@ -158,15 +186,14 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
     W(E + "attnBiasSameResidueTwin"), W(E + "attnBiasPrevBbChain"), W(E + "attnBiasNextBbChain"),
     W(E + "attnBiasRolePairType"), pairs);
   structuralTap("expander.attnBias", s.bias, n, n, true);
-  CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(dOrder));
   // the two f32 [pairs, C] work buffers read by nothing past the scatter: given back before the refiner, whose
   // pairformer blocks over the same structural pair need the room (9.8 GB each at 1300 residues, 2530 subtokens,
   // which is what the refiner's triangle ran out beside) - cheap through the scratch pool
-  releaseScratch({ "st.gathered", "st.projected" });
+  if (tightPair(pairs, C)) releaseScratch({ "st.gathered", "st.projected", "st.order" });
   // the masks, from the structural batch's own seq mask
-  std::vector<float> seq(M.f("sbatch.seqMask"), M.f("sbatch.seqMask") + n), pm(pairs);
-  for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) pm[(size_t)i * n + j] = seq[i] * seq[j];
-  s.seqMask = upload(seq.data(), n); s.pairMask = upload(pm.data(), pairs);
+  s.seqMask = dalloc(n); s.pairMask = dalloc(pairs);
+  CK(cudaMemcpyAsync(s.seqMask, M.f("sbatch.seqMask"), n * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+  outerMaskK<<<blocks(pairs), 256, 0, STREAM>>>(s.seqMask, s.pairMask, n);
   stage("structural.expand");
   // the refiner: four pairformer blocks, each adding the expander's attention bias
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
@@ -183,17 +210,42 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
 // ---------------------------------------------------------------- OpenDDE's confidence head
 // pair + s1[j] + s2[i] + the distance's bin embedding (3.25 A up, 1.25 A bins, the last open) +
 // the raw distance's projection, off the per-token coordinates the sampler produced
-__global__ void ddePairInitK(float* pair, const float* s1, const float* s2, const float* coords, const float* Wd,
-                             const float* Wraw, int n, int C, int bins) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+__global__ void ddePairDistK(const float* coords, float* distOut, int* binOut, int n, int bins) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= (size_t)n * n) return;
+  int i = (int)(ij / n), j = (int)(ij % n);
   float sq = 0;
   for (int k = 0; k < 3; ++k) { float d = coords[i * 3 + k] - coords[j * 3 + k]; sq += d * d; }
   float distance = sqrtf(fmaxf(1e-10f, sq));
-  int bin = (int)floorf((distance - 3.25f) / 1.25f);
+  int bin = (int)floorf((distance - 3.25f) * 0.8f);
   if (distance < 3.25f) bin = -1;
   if (bin >= bins) bin = bins - 1;
+  distOut[ij] = distance;
+  binOut[ij] = bin;
+}
+__global__ void ddePairInitK(float* pair, const float* s1, const float* s2, const float* distIn, const int* binIn,
+                             const float* Wd, const float* Wraw, int n, int C) {
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= (size_t)n * n * c4) return;
+    size_t ij = t4 / c4; int c = (int)(t4 % c4) << 2, i = (int)(ij / n), j = (int)(ij % n);
+    float4 p = reinterpret_cast<const float4*>(pair)[t4];
+    float4 l = *reinterpret_cast<const float4*>(s1 + (size_t)j * C + c);
+    float4 r = *reinterpret_cast<const float4*>(s2 + (size_t)i * C + c);
+    float4 wr = *reinterpret_cast<const float4*>(Wraw + c);
+    float d = distIn[ij]; int bin = binIn[ij];
+    float4 wd = bin >= 0 ? *reinterpret_cast<const float4*>(Wd + (size_t)bin * C + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    p.x += l.x + r.x + wd.x + d * wr.x;
+    p.y += l.y + r.y + wd.y + d * wr.y;
+    p.z += l.z + r.z + wd.z + d * wr.z;
+    p.w += l.w + r.w + wd.w + d * wr.w;
+    reinterpret_cast<float4*>(pair)[t4] = p;
+    return;
+  }
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  int bin = binIn[ij]; float distance = distIn[ij];
   pair[t] += s1[(size_t)j * C + c] + s2[(size_t)i * C + c] + (bin >= 0 ? Wd[(size_t)bin * C + c] : 0.f)
            + distance * Wraw[c];
 }
@@ -226,10 +278,18 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   // f32 pair, 7.7 GB at 1150 residues)
   float* pair = consume ? const_cast<float*>(refinedPair) : scratch<float>("dc.pair", pairs * C);
   if (!consume) CK(cudaMemcpyAsync(pair, refinedPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-  float* s1 = scratch<float>("dc.s1", (size_t)n * C); float* s2 = scratch<float>("dc.s2", (size_t)n * C);
-  linear<float, float>(sInputs, s1, n, F, C, P + "s1");
-  linear<float, float>(sInputs, s2, n, F, C, P + "s2");
-  ddePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, s1, s2, coords, W(P + "distance"), W(P + "distanceRaw"), n, C, bins);
+  float* s12 = scratch<float>("dc.s1", 2 * (size_t)n * C); float *s1 = s12, *s2 = s12 + (size_t)n * C;
+  {
+    std::string w2 = concatColumns(P + "s12~stack", 1, {{P + "s1", F * C, false}, {P + "s2", F * C, false}});
+    const float one = 1.f, zero = 0.f;
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, n, F, &one, W(w2), CUDA_R_32F, C,
+       (long long)F * C, sInputs, CUDA_R_32F, F, 0, &zero, s12, CUDA_R_32F, C,
+       (long long)n * C, 2, F32_TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+       F32_TF32 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
+  }
+  float* dists = scratch<float>("dc.dists", pairs); int* dBins = scratch<int>("dc.bins", pairs);
+  ddePairDistK<<<blocks(pairs), 256, 0, STREAM>>>(coords, dists, dBins, n, bins);
+  ddePairInitK<<<blocks((C & 3) == 0 ? (pairs * (C >> 2)) : (pairs * C)), 256, 0, STREAM>>>(pair, s1, s2, dists, dBins, W(P + "distance"), W(P + "distanceRaw"), n, C);
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   for (int k = 0; M.has(P + "blocks." + std::to_string(k) + ".singleChannels"); ++k) {
     std::string B = P + "blocks." + std::to_string(k);
@@ -255,8 +315,17 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   double d0 = 1.24 * std::cbrt(std::max(tmTokens, 19) - 15.0) - 1.8;     // the TM term per pair off the PAE distribution
   std::vector<float> perBin(paeBins);
   for (int b = 0; b < paeBins; ++b) perBin[b] = (float)(1 / (1 + (double)paeC[b] * paeC[b] / (d0 * d0)));
-  float* dPde = upload(pdeC.data(), pdeBins); float* dPae = upload(paeC.data(), paeBins);
-  float* dPer = upload(perBin.data(), paeBins);
+  std::vector<float> tables;
+  tables.insert(tables.end(), pdeC.begin(), pdeC.end());
+  tables.insert(tables.end(), paeC.begin(), paeC.end());
+  tables.insert(tables.end(), perBin.begin(), perBin.end());
+  for (int b = 0; b < PB; ++b) tables.push_back((b + 0.5f) / PB);
+  float* dTables = scratch<float>("dc.dPde", tables.size());
+  CK(cudaMemcpyAsync(dTables, tables.data(), tables.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+  const float* dPde = dTables;
+  const float* dPae = dTables + pdeBins;
+  const float* dPer = dPae + paeBins;
+  const float* dpc  = dPer + paeBins;
   for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
     size_t r = std::min(R, (size_t)n - r0), rows = r * n, p0 = r0 * n;
     symmetriseRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(pair, sym, n, C, r0, r);
@@ -265,11 +334,8 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
     expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pde + p0, nullptr, rows, pdeBins, dPde, 0, 1.f);
     layerNorm2<float, float>(pair + p0 * C, ln, rows, C, P + "paeLnScale", P + "paeLnOffset");
     linear<float, float>(ln, logits, rows, C, paeBins, P + "pae");
-    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pae + p0, nullptr, rows, paeBins, dPae, 0, 1.f);
-    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, tm + p0, nullptr, rows, paeBins, dPer, 0, 1.f);
+    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pae + p0, nullptr, rows, paeBins, dPae, 0, 1.f, tm + p0, dPer);
   }
-  out.pde = download(pde, pairs); out.pae = download(pae, pairs); out.tmTerm = download(tm, pairs);
-  CK(cudaFree(dPde)); CK(cudaFree(dPae)); CK(cudaFree(dPer));
   // pLDDT per atom: the token's normalised single against the matrix of the atom's dense slot
   std::string wk = P + "plddtWeight~slotMajor";
   if (!WF.count(wk)) {
@@ -281,12 +347,13 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   layerNorm2<float, float>(sn, sln, n, Cs, P + "plddtLnScale", P + "plddtLnOffset");
   float* pl = scratch<float>("dc.plddtLogits", (size_t)n * slots * PB);
   linear<float, float>(sln, pl, n, Cs, slots * PB, wk);
-  std::vector<float> pc(PB);
-  for (int b = 0; b < PB; ++b) pc[b] = (b + 0.5f) / PB;
-  float* dpc = upload(pc.data(), PB);
   float* plddt = scratch<float>("dc.plddt", (size_t)n * slots);
   expectationK<<<blocks((size_t)n * slots), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * slots, PB, dpc, 0, 100.f);
-  out.plddt = download(plddt, (size_t)n * slots);
-  CK(cudaFree(dpc));
+  out.pde.resize(pairs); out.pae.resize(pairs); out.tmTerm.resize(pairs); out.plddt.resize((size_t)n * slots);
+  CK(cudaMemcpyAsync(out.pde.data(), pde, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaMemcpyAsync(out.pae.data(), pae, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaMemcpyAsync(out.tmTerm.data(), tm, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaMemcpyAsync(out.plddt.data(), plddt, (size_t)n * slots * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaStreamSynchronize(STREAM));
   return out;
 }

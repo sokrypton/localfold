@@ -68,7 +68,7 @@ __global__ void centerNormHK(const float* prod, half* out, size_t pairs, int C, 
 }
 
 // TI, TO: the rows' and the output's types (a bf16 MSA in, a bf16 transition input out: cuda/af2's MSA16)
-template <int C, class TI = float, class TO = half>
+template <int C, class TI = float, class TO = half, bool RELU = false>
 __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const float* __restrict__ scale,
                             const float* __restrict__ offset) {
   constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
@@ -76,14 +76,28 @@ __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const TI* xr = x + row * C;
-  float v[STEPS][VEC];
+  float v[STEPS][VEC], sc[STEPS][VEC], of[STEPS][VEC];
   float s = 0;
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
+    if constexpr (VEC == 4) {
+      float4 s4 = *reinterpret_cast<const float4*>(scale + c), o4 = *reinterpret_cast<const float4*>(offset + c);
+      sc[k][0] = s4.x; sc[k][1] = s4.y; sc[k][2] = s4.z; sc[k][3] = s4.w;
+      of[k][0] = o4.x; of[k][1] = o4.y; of[k][2] = o4.z; of[k][3] = o4.w;
+    } else {
+      float2 s2 = *reinterpret_cast<const float2*>(scale + c), o2 = *reinterpret_cast<const float2*>(offset + c);
+      sc[k][0] = s2.x; sc[k][1] = s2.y; of[k][0] = o2.x; of[k][1] = o2.y;
+    }
     if constexpr (!std::is_same_v<TI, float>) {          // (a bf16 or f16 row: VEC elements, 2 VEC bytes)
-#pragma unroll
-      for (int u = 0; u < VEC; u += 2) { float2 q = ld2f(xr + c + u); v[k][u] = q.x; v[k][u + 1] = q.y; }
+      if constexpr (VEC == 4) {
+        uint2 u2 = *reinterpret_cast<const uint2*>(xr + c);
+        const TI* p = reinterpret_cast<const TI*>(&u2);
+        float2 q0 = ld2f(p), q1 = ld2f(p + 2);
+        v[k][0] = q0.x; v[k][1] = q0.y; v[k][2] = q1.x; v[k][3] = q1.y;
+      } else {
+        float2 q = ld2f(xr + c); v[k][0] = q.x; v[k][1] = q.y;
+      }
     } else if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
     else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
 #pragma unroll
@@ -100,12 +114,24 @@ __global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
-#pragma unroll
-    for (int u = 0; u < VEC; u += 2)
-    {
-      float a = (v[k][u] - mean) * inv * scale[c + u] + offset[c + u], b = (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1];
-      if constexpr (std::is_same_v<TO, half>) *reinterpret_cast<half2*>(y + row * C + c + u) = __floats2half2_rn(a, b);
-      else *reinterpret_cast<__nv_bfloat162*>(y + row * C + c + u) = __floats2bfloat162_rn(a, b);
+    if constexpr (VEC == 4) {
+      float a0 = (v[k][0] - mean) * inv * sc[k][0] + of[k][0], b0 = (v[k][1] - mean) * inv * sc[k][1] + of[k][1];
+      float a1 = (v[k][2] - mean) * inv * sc[k][2] + of[k][2], b1 = (v[k][3] - mean) * inv * sc[k][3] + of[k][3];
+      if constexpr (RELU) { a0 = fmaxf(a0, 0.f); b0 = fmaxf(b0, 0.f); a1 = fmaxf(a1, 0.f); b1 = fmaxf(b1, 0.f); }
+      uint2 out2;
+      if constexpr (std::is_same_v<TO, half>) {
+        half2 h0 = __floats2half2_rn(a0, b0), h1 = __floats2half2_rn(a1, b1);
+        out2.x = *reinterpret_cast<uint32_t*>(&h0); out2.y = *reinterpret_cast<uint32_t*>(&h1);
+      } else {
+        __nv_bfloat162 h0 = __floats2bfloat162_rn(a0, b0), h1 = __floats2bfloat162_rn(a1, b1);
+        out2.x = *reinterpret_cast<uint32_t*>(&h0); out2.y = *reinterpret_cast<uint32_t*>(&h1);
+      }
+      *reinterpret_cast<uint2*>(y + row * C + c) = out2;
+    } else {
+      float a = (v[k][0] - mean) * inv * sc[k][0] + of[k][0], b = (v[k][1] - mean) * inv * sc[k][1] + of[k][1];
+      if constexpr (RELU) { a = fmaxf(a, 0.f); b = fmaxf(b, 0.f); }
+      if constexpr (std::is_same_v<TO, half>) *reinterpret_cast<half2*>(y + row * C + c) = __floats2half2_rn(a, b);
+      else *reinterpret_cast<__nv_bfloat162*>(y + row * C + c) = __floats2bfloat162_rn(a, b);
     }
   }
 }
@@ -133,18 +159,61 @@ __global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
 template <class PT = float>
 // xs: x's scale back up (AF2's standard form contracts its rows scaled down by a power of two, to fit float16)
 __global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
-                        int Bi, int n, int C, bool biasAfterNorm, float xs = 1.f) {
+                        int Bi, int n, int C, bool biasAfterNorm, float xs = 1.f, float normVal = 0.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2), total4 = (size_t)Bi * n * c4;
+    if (t >= total4) return;
+    int f; size_t ij;
+    if (C == 128) { f = (int)(t & 31) << 2; ij = t >> 5; }
+    else if (C == 256) { f = (int)(t & 63) << 2; ij = t >> 6; }
+    else if (total4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / (unsigned)c4; f = (int)(u - q * (unsigned)c4) << 2; ij = q;
+    } else { f = (int)(t % c4) << 2; ij = t / c4; }
+    size_t p = i0 * n + ij, at = p * C + f;
+    float nv = norm ? norm[p] : normVal;
+    float4 x4 = *reinterpret_cast<const float4*>(x + (t << 2));
+    float4 b4 = *reinterpret_cast<const float4*>(bias + f);
+    float4 v;
+    if (biasAfterNorm) {
+      float d = fmaxf(nv, 1.f);
+      v = make_float4(xs * x4.x / d + b4.x, xs * x4.y / d + b4.y, xs * x4.z / d + b4.z, xs * x4.w / d + b4.w);
+    } else {
+      float d = 1e-3f + nv;
+      v = make_float4((b4.x + xs * x4.x) / d, (b4.y + xs * x4.y) / d, (b4.z + xs * x4.z) / d, (b4.w + xs * x4.w) / d);
+    }
+    if constexpr (std::is_same_v<PT, float>) {
+      float4 p4 = *reinterpret_cast<const float4*>(pair + at);
+      *reinterpret_cast<float4*>(pair + at) = make_float4(p4.x + v.x, p4.y + v.y, p4.z + v.z, p4.w + v.w);
+    } else if constexpr (std::is_same_v<PT, __nv_bfloat16>) {
+      uint2 u2 = *reinterpret_cast<const uint2*>(reinterpret_cast<const PT*>(pair) + at);
+      float2 q0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.x));
+      float2 q1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.y));
+      __nv_bfloat162 o0 = __floats2bfloat162_rn(q0.x + v.x, q0.y + v.y);
+      __nv_bfloat162 o1 = __floats2bfloat162_rn(q1.x + v.z, q1.y + v.w);
+      *reinterpret_cast<uint2*>(reinterpret_cast<PT*>(pair) + at) = make_uint2(*reinterpret_cast<uint32_t*>(&o0), *reinterpret_cast<uint32_t*>(&o1));
+    } else {
+      uint2 u2 = *reinterpret_cast<const uint2*>(reinterpret_cast<const PT*>(pair) + at);
+      float2 q0 = __half22float2(*reinterpret_cast<const half2*>(&u2.x));
+      float2 q1 = __half22float2(*reinterpret_cast<const half2*>(&u2.y));
+      half2 o0 = __floats2half2_rn(q0.x + v.x, q0.y + v.y);
+      half2 o1 = __floats2half2_rn(q1.x + v.z, q1.y + v.w);
+      *reinterpret_cast<uint2*>(reinterpret_cast<PT*>(pair) + at) = make_uint2(*reinterpret_cast<uint32_t*>(&o0), *reinterpret_cast<uint32_t*>(&o1));
+    }
+    return;
+  }
   const size_t total = (size_t)Bi * n * C;
   if (t >= total) return;
-  int f; size_t i, j;
-  if (total <= UINT32_MAX) {     // (32-bit divides where the count allows: a 64-bit divide is a long emulated sequence)
-    unsigned u = (unsigned)t, ij = u / (unsigned)C; f = (int)(u - ij * (unsigned)C);
-    unsigned ii = ij / (unsigned)n; i = i0 + ii; j = ij - ii * (unsigned)n;
-  } else { f = (int)(t % C); size_t ij = t / C; i = i0 + ij / n; j = ij % n; }
-  float nv = norm[i * n + j];
+  int f; size_t ij;
+  if (C == 128) { f = (int)(t & 127); ij = t >> 7; }
+  else if (C == 256) { f = (int)(t & 255); ij = t >> 8; }
+  else if (total <= UINT32_MAX) {     // (32-bit divides where the count allows: a 64-bit divide is a long emulated sequence)
+    unsigned u = (unsigned)t, q = u / (unsigned)C; f = (int)(u - q * (unsigned)C); ij = q;
+  } else { f = (int)(t % C); ij = t / C; }
+  size_t p = i0 * n + ij;
+  float nv = norm ? norm[p] : normVal;
   float v = biasAfterNorm ? xs * x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + xs * x[t]) / (1e-3f + nv);
-  size_t at = (i * n + j) * C + f;
+  size_t at = p * C + f;
   if constexpr (std::is_same_v<PT, float>) pair[at] += v;
   else reinterpret_cast<PT*>(pair)[at] = fromF<PT>(toF(reinterpret_cast<PT*>(pair)[at]) + v);
 }

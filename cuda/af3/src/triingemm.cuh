@@ -53,9 +53,9 @@ constexpr size_t triInGemmSmem() { return TG_STAGES * TG_STAGE; }      // (the e
 // rows past pp read as zero, Wt one packed [C][128] tile. Leaves every cp.async group drained.
 template <int C>
 // rs, ks: X's row stride and its 32-wide k chunks' stride (C and 32: row-major; AF2's outer product mean reads its
-// product [a][j][b] where it lies, rows j at 32 and chunks a at L * 32)
+// product [i][a][j][b] where it lies, rows j at 32, chunks a at L * 32, and i-rows wrapped at rowWrap = L)
 __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* __restrict__ Wt, size_t row0, size_t pp,
-                                       unsigned char* smem, float (&acc)[4][8][4], size_t rs = C, size_t ks = 32) {
+                                       unsigned char* smem, float (&acc)[4][8][4], size_t rs = C, size_t ks = 32, unsigned rowWrap = 0) {
   constexpr int KC = C / 32;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int wm = warp & 1, wn = warp >> 1;
@@ -73,7 +73,12 @@ __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* _
   for (int i = 0; i < 4; ++i) {
     size_t q = row0 + (tid >> 2) + 32 * i;
     okA[i] = q < pp;
-    sA[i] = X + (okA[i] ? q : 0) * rs + (tid & 3) * 8;
+    size_t qr = 0;
+    if (okA[i]) {
+      if (rowWrap) { unsigned u = (unsigned)q, iq = u / rowWrap; qr = (size_t)iq * 32 * rowWrap + (u - iq * rowWrap); }
+      else qr = q;
+    }
+    sA[i] = X + qr * rs + (tid & 3) * 8;
   }
   const half* sB = Wt + (size_t)(tid >> 4) * 128 + (tid & 15) * 8;
   auto issue = [&](int kc) {
@@ -149,7 +154,7 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       float v = 0.f;
       if (t < NAB && q < pp) {
         unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-        if (i < (unsigned)n && j < (unsigned)n) v = mask[(size_t)i * n + j];
+        if (i < (unsigned)n && j < (unsigned)n) v = mask ? mask[(size_t)i * n + j] : 1.f;
       }
       msk[mi][h] = v;
     }
@@ -199,8 +204,9 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
   }
 }
 
-// [NT][C][128] tiles from the [C][4C] projection|gate matrix and the [C][C] gating linear (see above)
-__global__ void triInGemmPackK(const half* __restrict__ Wpg, const half* __restrict__ Wgl, int C, half* __restrict__ out) {
+// [NT][C][128] tiles from the [C][2C] projection and gate matrices and the [C][C] gating linear (see above)
+__global__ void triInGemmPackK(const half* __restrict__ Wp, const half* __restrict__ Wgate, const half* __restrict__ Wgl,
+                               int C, half* __restrict__ out) {
   size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   int NAB = C / 32, NT = NAB + C / 128;
   if (e >= (size_t)NT * C * 128) return;
@@ -209,33 +215,34 @@ __global__ void triInGemmPackK(const half* __restrict__ Wpg, const half* __restr
   if (t < NAB) {
     int seg = cl >> 5, i = cl & 31;
     int p = t * 64 + (seg >> 1) * 32 + i;                         // the projection column (seg 0, 2) or its gate's (1, 3)
-    v = Wpg[(size_t)k * 4 * C + (seg & 1 ? 2 * C : 0) + p];
+    v = (seg & 1 ? Wgate : Wp)[(size_t)k * 2 * C + p];
   } else {
     v = Wgl[(size_t)k * C + (t - NAB) * 128 + cl];
   }
   out[e] = v;
 }
-inline const half* triInGemmWeights(const std::string& key, const half* Wpg, const half* Wgl, int C) {
+inline const half* triInGemmWeights(const std::string& pre, int C) {
   // (a derived weight: forgotten with the others - see Wbf in common.cuh for what a kept one cost)
   static std::map<std::string, half*> cache;
   static bool hooked = false;
-  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : cache) CK(cudaFree(p)); cache.clear(); }); hooked = true; }
-  auto it = cache.find(key);
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : cache) CK(cudaFreeAsync(p, STREAM)); cache.clear(); }); hooked = true; }
+  auto it = cache.find(pre);
   if (it != cache.end()) return it->second;
   size_t nel = (size_t)(C / 32 + C / 128) * C * 128;
-  half* w = dallocT<half>(nel);
-  triInGemmPackK<<<blocks(nel), 256, 0, STREAM>>>(Wpg, Wgl, C, w);
-  return cache[key] = w;
+  half* w = poolAllocT<half>(nel);
+  triInGemmPackK<<<blocks(nel), 256, 0, STREAM>>>(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, w);
+  return cache[pre] = w;
 }
 // LOCALFOLD_TRIIN_GEMM=0: triIn256K instead
 inline const bool TRIIN_GEMM = !getenv("LOCALFOLD_TRIIN_GEMM") || atoi(getenv("LOCALFOLD_TRIIN_GEMM"));
 template <int C, class TA>
-inline bool triInGemm(const float* pair, const float* mask, const float* sc, const float* of, const half* Wg, TA* a, TA* b,
+inline bool triInGemm(const float* pair, const float* mask, const float* sc, const float* of, const std::string& pre, TA* a, TA* b,
                       half* t2, int n, int np, size_t cs) {
   // (from 384 channels: at 256 the LN pass it needs costs more than the GEMM saves - protenix2's trunk 713 -> 719 ms,
   // where OpenDDE's goes 1453 -> 1422 and IntelliFold-2's 2309 -> 2261)
   constexpr size_t smem = triInGemmSmem();
   if (C < 384 || !TRIIN_GEMM || !fitsSmem(smem)) return false;
+  const half* Wg = triInGemmWeights(pre, C);
   size_t pp = (size_t)np * np;
   half* X = scratch<half>("tri.lnplane", pp * C);
   WITH_PAIR_T(lnPlaneK<C, PT><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));

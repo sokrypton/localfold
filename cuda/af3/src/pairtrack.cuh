@@ -18,18 +18,42 @@ inline bool RESIDUAL_UNTRANSPOSED = false;
 // ---------------------------------------------------------------- elementwise kernels
 // LayerNorm over the last axis with AF3's fast variance E[x^2] - E[x]^2. One warp a row.
 template <class TI, class TO>
-__global__ void layerNormK(const TI* in, TO* out, size_t rows, int C, const float* scale,
-                           const float* offset) {
+__global__ void __launch_bounds__(256, 8)
+layerNormK(const TI* __restrict__ in, TO* __restrict__ out, size_t rows, int C, const float* __restrict__ scale,
+           const float* __restrict__ offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const TI* x = in + row * C;
+  TO* y = out + row * C;
+  auto fastWidth = [&](auto ktag) {
+    constexpr int K = decltype(ktag)::value, CC = K * 32;
+    float xv[K], s = 0, ss = 0;
+#pragma unroll
+    for (int k = 0; k < K; ++k) xv[k] = toF(x[lane + k * 32]);
+#pragma unroll
+    for (int k = 0; k < K; ++k) { s += xv[k]; ss += xv[k] * xv[k]; }
+    for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+    float mean = s / CC, inv = rsqrtf(ss / CC - mean * mean + 1e-5f);
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      int c = lane + k * 32;
+      xv[k] = (xv[k] - mean) * inv * scale[c] + offset[c];
+    }
+#pragma unroll
+    for (int k = 0; k < K; ++k) y[lane + k * 32] = fromF<TO>(xv[k]);
+  };
+  if (C == 64) { fastWidth(std::integral_constant<int, 2>{}); return; }
+  if (C == 128) { fastWidth(std::integral_constant<int, 4>{}); return; }
+  if (C == 256) { fastWidth(std::integral_constant<int, 8>{}); return; }
+  if (C == 384) { fastWidth(std::integral_constant<int, 12>{}); return; }
+  if (C == 512) { fastWidth(std::integral_constant<int, 16>{}); return; }
   float s = 0, ss = 0;
   for (int c = lane; c < C; c += 32) { float v = toF(x[c]); s += v; ss += v * v; }
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
   for (int c = lane; c < C; c += 32)
-    out[row * C + c] = fromF<TO>((toF(x[c]) - mean) * inv * scale[c] + offset[c]);
+    y[c] = fromF<TO>((toF(x[c]) - mean) * inv * scale[c] + offset[c]);
 }
 template <class TI, class TO>
 void layerNorm(const TI* in, TO* out, size_t rows, int C, const std::string& w) {
@@ -49,22 +73,54 @@ inline bool skipFused(const char* what) {
   static const std::string v = getenv("LOCALFOLD_SKIP_FUSED") ? getenv("LOCALFOLD_SKIP_FUSED") : "";
   return !v.empty() && v.find(what) != std::string::npos;
 }
-template <class T>
-__global__ void swigluK(const T* wide, T* gated, size_t rows, int I, bool up) {
-  int L = up ? 3 * I : 2 * I;
+template <class T, bool UP = false, int I_CONST = 0>
+__global__ void __launch_bounds__(I_CONST == 1536 ? 192 : 256, I_CONST == 1536 ? 8 : 6)
+swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, int shift = 0) {
+  const int II = I_CONST > 0 ? I_CONST : I, L = UP ? 3 * II : 2 * II;
   if constexpr (std::is_same_v<T, half>) {
-    if (I % 8 == 0) {                 // eight halves (16 bytes) a thread
-      size_t t = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
-      if (t >= rows * I) return;
-      size_t r = t / I; int i = (int)(t % I);
-      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + I + i), o, u;
-      if (up) u = *(const uint4*)(wide + r * L + 2 * I + i);
+    if constexpr (I_CONST == 1536) {
+      size_t r = blockIdx.x;
+      int i = (int)threadIdx.x << 3;
+      size_t t = r * 1536 + i;
+      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + 1536 + i), o, u;
+      if constexpr (UP) u = *(const uint4*)(wide + r * L + 3072 + i);
       const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
       const half2* u2 = (const half2*)&u;
+#pragma unroll
       for (int k = 0; k < 4; ++k) {
         float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
         float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
-        if (up) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
+        if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
+        o2[k] = __floats2half2_rn(x, y);
+      }
+      *(uint4*)(gated + t) = o;
+      return;
+    }
+    if (I_CONST || (I & 7) == 0) {      // eight halves (16 bytes) a thread
+      size_t t8 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      size_t t = t8 << 3;
+      if (t >= rows * (unsigned)II) return;
+      size_t r; int i;
+      if constexpr (I_CONST == -1) {
+        r = t8 >> shift; i = (int)(t & (unsigned)(II - 1));
+      } else if (t8 < (1ull << 32)) {
+        unsigned u = (unsigned)t8, i8 = (unsigned)(I >> 3), ru;
+        if ((i8 & (i8 - 1)) == 0) ru = u >> (__ffs(i8) - 1);
+        else if (i8 == 384u) ru = u / 384u;
+        else if (i8 == 192u) ru = u / 192u;
+        else if (i8 == 96u) ru = u / 96u;
+        else ru = u / i8;
+        r = ru; i = (int)((u - ru * i8) << 3);
+      } else { r = t / I; i = (int)(t % I); }
+      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + II + i), o, u;
+      if constexpr (UP) u = *(const uint4*)(wide + r * L + 2 * II + i);
+      const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
+      const half2* u2 = (const half2*)&u;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
+        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
         o2[k] = __floats2half2_rn(x, y);
       }
       *(uint4*)(gated + t) = o;
@@ -73,17 +129,33 @@ __global__ void swigluK(const T* wide, T* gated, size_t rows, int I, bool up) {
   }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * I) return;
-  size_t r = t / I; int i = (int)(t % I);
+  size_t r; int i;
+  if (t < (1ull << 32)) {
+    unsigned u = (unsigned)t, iu = (unsigned)I, ru = u / iu;
+    r = ru; i = (int)(u - ru * iu);
+  } else { r = t / I; i = (int)(t % I); }
   float g = toF(wide[r * L + i]);
   float v = g * sigm(g) * toF(wide[r * L + I + i]);
-  if (up) v *= toF(wide[r * L + 2 * I + i]);
+  if constexpr (UP) v *= toF(wide[r * L + 2 * I + i]);
   gated[t] = fromF<T>(v);
 }
 // the launch: an eighth of the threads for the vector path
 template <class T>
 void swiglu(const T* wide, T* gated, size_t rows, int I, bool up = false) {
-  size_t work = std::is_same_v<T, half> && I % 8 == 0 ? rows * I / 8 : rows * I;
-  swigluK<T><<<blocks(work), 256, 0, STREAM>>>(wide, gated, rows, I, up);
+  size_t work = std::is_same_v<T, half> && (I & 7) == 0 ? rows * I / 8 : rows * I;
+  unsigned bs = std::is_same_v<T, half> && work <= 108 * 128 ? 128u : 256u;
+  auto launch = [&](auto upTag) {
+    constexpr bool U = decltype(upTag)::value;
+    if constexpr (std::is_same_v<T, half>) {
+      if (I == 1536 && rows > 0) { swigluK<T, U, 1536><<<(unsigned)rows, 192, 0, STREAM>>>(wide, gated, rows, 1536); return; }
+      if (I >= 8 && (I & (I - 1)) == 0) {
+        swigluK<T, U, -1><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I, __builtin_ctz(I >> 3)); return;
+      }
+    }
+    swigluK<T, U, 0><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I);
+  };
+  if (up) launch(std::true_type{});
+  else launch(std::false_type{});
 }
 // a conditioned transition's first weight: transition1, or [transition1 | ffwAToB] where the
 // bundle carries boltz2's up-gate (one GEMM for both)
@@ -109,62 +181,189 @@ inline std::string qkvgWeight(const std::string& pre, int C, int Wd, bool transp
 // a, b from [rows][4C] = [projection | gate], the INTERLEAVED split (channel ch's halves
 // are 2ch and 2ch+1), masked, written channel-major (c, pairs) through shared memory.
 template <class T>
-__global__ void triGateK(const T* pg, const float* mask, T* a, T* b, size_t r0, size_t rows, int C,
-                         size_t pairs, int n, int np) {
-  __shared__ float A[32][33], B[32][33];
-  size_t row0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
+__global__ void __launch_bounds__(256, 6)
+triGateK(const T* __restrict__ pg, const float* __restrict__ mask, T* __restrict__ a, T* __restrict__ b, size_t r0, size_t rows, int C,
+         size_t pairs, int n, int np) {
   int tx = threadIdx.x, ty = threadIdx.y;
-  for (int ry = ty; ry < 32; ry += 8) {
-    size_t local = row0 + ry; int c = c0 + tx;
-    float va = 0, vb = 0;
-    if (local < rows && c < C) {
-      float m = mask[r0 + local];
-      const T* p = pg + local * 4 * C; const T* g = p + 2 * C;
-      if constexpr (std::is_same_v<T, half>) {        // channel c's two halves, one 4-byte load each
-        float2 pv = __half22float2(*reinterpret_cast<const half2*>(p + c * 2));
-        float2 gv = __half22float2(*reinterpret_cast<const half2*>(g + c * 2));
-        va = pv.x * m * sigm(gv.x); vb = pv.y * m * sigm(gv.y);
+  size_t row0 = (size_t)blockIdx.x * 32;
+  if constexpr (std::is_same_v<T, half>) {
+    if ((C & 63) == 0) {
+      __shared__ half2 A01[32][33], B01[32][33];
+      int c0 = blockIdx.y * 64, c = c0 + tx * 2;
+      if (row0 + 32 <= rows && !mask) {
+        uint2 pv[4], gv[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          const half* p = pg + (row0 + ty + m * 8) * (4 * C) + c * 2;
+          pv[m] = *reinterpret_cast<const uint2*>(p);
+          gv[m] = *reinterpret_cast<const uint2*>(p + 2 * C);
+        }
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          float2 p0 = __half22float2(*reinterpret_cast<const half2*>(&pv[m].x));
+          float2 p1 = __half22float2(*reinterpret_cast<const half2*>(&pv[m].y));
+          float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&gv[m].x));
+          float2 g1 = __half22float2(*reinterpret_cast<const half2*>(&gv[m].y));
+          A01[ty + m * 8][tx] = __floats2half2_rn(p0.x * sigm(g0.x), p1.x * sigm(g1.x));
+          B01[ty + m * 8][tx] = __floats2half2_rn(p0.y * sigm(g0.y), p1.y * sigm(g1.y));
+        }
       } else {
+#pragma unroll
+        for (int ry = ty; ry < 32; ry += 8) {
+          size_t local = row0 + ry;
+          half2 a01 = __float2half2_rn(0.f), b01 = a01;
+          if (local < rows) {
+            float m = mask ? mask[r0 + local] : 1.f;
+            const half* p = pg + local * 4 * C; const half* g = p + 2 * C;
+            uint2 pv = *reinterpret_cast<const uint2*>(p + c * 2);
+            uint2 gv = *reinterpret_cast<const uint2*>(g + c * 2);
+            float2 p0 = __half22float2(*reinterpret_cast<const half2*>(&pv.x));
+            float2 p1 = __half22float2(*reinterpret_cast<const half2*>(&pv.y));
+            float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&gv.x));
+            float2 g1 = __half22float2(*reinterpret_cast<const half2*>(&gv.y));
+            a01 = __floats2half2_rn(p0.x * m * sigm(g0.x), p1.x * m * sigm(g1.x));
+            b01 = __floats2half2_rn(p0.y * m * sigm(g0.y), p1.y * m * sigm(g1.y));
+          }
+          A01[ry][tx] = a01; B01[ry][tx] = b01;
+        }
+      }
+      __syncthreads();
+      size_t local = row0 + tx;
+      if (local < rows) {
+        unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+        size_t q = (size_t)i * np + (p - i * (unsigned)n);
+        T* ap = a + (size_t)(c0 + ty * 2) * pairs + q;
+        T* bp = b + (size_t)(c0 + ty * 2) * pairs + q;
+        half2 a01[4], b01[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) { a01[m] = A01[tx][ty + m * 8]; b01[m] = B01[tx][ty + m * 8]; }
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          size_t off = (size_t)(16 * m) * pairs;
+          ap[off] = __low2half(a01[m]); ap[off + pairs] = __high2half(a01[m]);
+          bp[off] = __low2half(b01[m]); bp[off + pairs] = __high2half(b01[m]);
+        }
+      }
+      return;
+    }
+  } else {
+    __shared__ float A[32][33], B[32][33];
+    int c0 = blockIdx.y * 32, c = c0 + tx;
+#pragma unroll
+    for (int ry = ty; ry < 32; ry += 8) {
+      size_t local = row0 + ry;
+      float va = 0, vb = 0;
+      if (local < rows && c < C) {
+        float m = mask ? mask[r0 + local] : 1.f;
+        const T* p = pg + local * 4 * C; const T* g = p + 2 * C;
         va = toF(p[c * 2]) * m * sigm(toF(g[c * 2]));
         vb = toF(p[c * 2 + 1]) * m * sigm(toF(g[c * 2 + 1]));
       }
+      A[ry][tx] = va; B[ry][tx] = vb;
     }
-    A[ry][tx] = va; B[ry][tx] = vb;
-  }
-  __syncthreads();
-  for (int cy = ty; cy < 32; cy += 8) {
-    size_t local = row0 + tx; int c = c0 + cy;
-    if (local < rows && c < C) {
+    __syncthreads();
+    size_t local = row0 + tx;
+    if (local < rows) {
       unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
       size_t q = (size_t)i * np + (p - i * (unsigned)n);     // the padded (np x np) position
-      a[(size_t)c * pairs + q] = fromF<T>(A[tx][cy]);
-      b[(size_t)c * pairs + q] = fromF<T>(B[tx][cy]);
+#pragma unroll
+      for (int cy = ty; cy < 32; cy += 8) {
+        int ch = c0 + cy;
+        if (ch < C) {
+          a[(size_t)ch * pairs + q] = fromF<T>(A[tx][cy]);
+          b[(size_t)ch * pairs + q] = fromF<T>(B[tx][cy]);
+        }
+      }
     }
   }
 }
 // center_norm over the channels of a (c, pairs) array -> row-major, 32 pairs a block.
 template <class TO>
-__global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, int C, size_t pairs,
-                            const float* scale, const float* offset, int n, int np) {
+__global__ void __launch_bounds__(256)
+centerNormK(const float* __restrict__ prod, TO* __restrict__ out, size_t r0, size_t rows, int C, size_t pairs,
+            const float* __restrict__ scale, const float* __restrict__ offset, int n, int np) {
   extern __shared__ float T_[];
-  __shared__ float mean[32], inv[32];
+  __shared__ float ps[8][33], pss[8][33], mean[32], inv[32];
   size_t i0 = (size_t)blockIdx.x * 32; int tx = threadIdx.x, ty = threadIdx.y;
-  for (int c = ty; c < C; c += 8) {
-    size_t local = i0 + tx;
-    unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
-    T_[c * 33 + tx] = local < rows ? prod[(size_t)c * pairs + (size_t)i * np + (p - i * (unsigned)n)] : 0.f;
+  size_t local = i0 + tx;
+  unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+  size_t at = (size_t)i * np + (p - i * (unsigned)n);
+  float s = 0, ss = 0;
+  if (local < rows) {
+    const float* pr = prod + at + (size_t)ty * pairs;
+    const size_t step = 8 * pairs;
+    auto fixed = [&](auto ctag) {
+      constexpr int CC = decltype(ctag)::value;
+#pragma unroll
+      for (int k = 0; k < CC / 8; ++k) {
+        float v = pr[(size_t)k * step];
+        T_[(ty + k * 8) * 33 + tx] = v;
+        s += v; ss += v * v;
+      }
+    };
+    if (C == 256) fixed(std::integral_constant<int, 256>{});
+    else if (C == 384) fixed(std::integral_constant<int, 384>{});
+    else if (C == 512) fixed(std::integral_constant<int, 512>{});
+    else {
+#pragma unroll 4
+      for (int c = ty; c < C; c += 8, pr += step) { float v = *pr; T_[c * 33 + tx] = v; s += v; ss += v * v; }
+    }
+  } else {
+    for (int c = ty; c < C; c += 8) T_[c * 33 + tx] = 0.f;
   }
+  if (C >= 256) { ps[ty][tx] = s; pss[ty][tx] = ss; }
   __syncthreads();
   if (ty == 0) {
-    float s = 0, ss = 0;
-    for (int c = 0; c < C; ++c) { float v = T_[c * 33 + tx]; s += v; ss += v * v; }
-    float m = s / C; mean[tx] = m; inv[tx] = rsqrtf(ss / C - m * m + 1e-5f);
+    float a = 0, b = 0;
+    if (C >= 256) {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) { a += ps[k][tx]; b += pss[k][tx]; }
+    } else {
+#pragma unroll 8
+      for (int c = 0; c < C; ++c) { float v = T_[c * 33 + tx]; a += v; b += v * v; }
+    }
+    float m = a / C; mean[tx] = m; inv[tx] = rsqrtf(b / C - m * m + 1e-5f);
   }
   __syncthreads();
-  for (int ry = ty; ry < 32; ry += 8) {
-    size_t local = i0 + ry; if (local >= rows) continue;
-    for (int c = tx; c < C; c += 32)
-      out[local * C + c] = fromF<TO>((T_[c * 33 + ry] - mean[ry]) * inv[ry] * scale[c] + offset[c]);
+  float m0 = mean[ty], m1 = mean[ty + 8], m2 = mean[ty + 16], m3 = mean[ty + 24];
+  float iv0 = inv[ty], iv1 = inv[ty + 8], iv2 = inv[ty + 16], iv3 = inv[ty + 24];
+  if (i0 + 32 <= rows) {
+    TO *o0 = out + (i0 + ty) * C, *o1 = o0 + 8 * C, *o2 = o0 + 16 * C, *o3 = o0 + 24 * C;
+    auto fixedOut = [&](auto ctag) {
+      constexpr int CC = decltype(ctag)::value;
+#pragma unroll
+      for (int k = 0; k < CC / 32; ++k) {
+        int c = tx + k * 32;
+        float sc = scale[c], of = offset[c];
+        const float* tc = T_ + c * 33 + ty;
+        o0[c] = fromF<TO>((tc[0] - m0) * iv0 * sc + of);
+        o1[c] = fromF<TO>((tc[8] - m1) * iv1 * sc + of);
+        o2[c] = fromF<TO>((tc[16] - m2) * iv2 * sc + of);
+        o3[c] = fromF<TO>((tc[24] - m3) * iv3 * sc + of);
+      }
+    };
+    if (C == 256) { fixedOut(std::integral_constant<int, 256>{}); return; }
+    if (C == 384) { fixedOut(std::integral_constant<int, 384>{}); return; }
+    if (C == 512) { fixedOut(std::integral_constant<int, 512>{}); return; }
+#pragma unroll 4
+    for (int c = tx; c < C; c += 32) {
+      float sc = scale[c], of = offset[c];
+      const float* tc = T_ + c * 33 + ty;
+      o0[c] = fromF<TO>((tc[0] - m0) * iv0 * sc + of);
+      o1[c] = fromF<TO>((tc[8] - m1) * iv1 * sc + of);
+      o2[c] = fromF<TO>((tc[16] - m2) * iv2 * sc + of);
+      o3[c] = fromF<TO>((tc[24] - m3) * iv3 * sc + of);
+    }
+    return;
+  }
+#pragma unroll 4
+  for (int c = tx; c < C; c += 32) {
+    float sc = scale[c], of = offset[c];
+#pragma unroll
+    for (int ry = ty; ry < 32; ry += 8) {
+      size_t lr = i0 + ry;
+      if (lr < rows) out[lr * C + c] = fromF<TO>((T_[c * 33 + ry] - mean[ry]) * inv[ry] * sc + of);
+    }
   }
 }
 
@@ -205,7 +404,38 @@ inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 #include "fusedtriangle.cuh"
 #include "fused256.cuh"
 template <class T, class PT = float>
-__global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
+__global__ void __launch_bounds__(256, 6)
+gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
+  if constexpr (std::is_same_v<T, half> && std::is_same_v<PT, __nv_bfloat16>) {
+    if ((n & 7) == 0) {
+      size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= (n >> 3)) return;
+      uint4 p = reinterpret_cast<uint4*>(pair)[i], pr = reinterpret_cast<const uint4*>(proj)[i],
+            gt = reinterpret_cast<const uint4*>(gate)[i];
+      __nv_bfloat162* pp = reinterpret_cast<__nv_bfloat162*>(&p);
+      const half2* pr2 = reinterpret_cast<const half2*>(&pr);
+      const half2* gt2 = reinterpret_cast<const half2*>(&gt);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float2 x = __bfloat1622float2(pp[k]), a = __half22float2(pr2[k]), g = __half22float2(gt2[k]);
+        pp[k] = __floats2bfloat162_rn(x.x + a.x * sigm(g.x), x.y + a.y * sigm(g.y));
+      }
+      reinterpret_cast<uint4*>(pair)[i] = p;
+      return;
+    }
+  } else if constexpr (std::is_same_v<T, half> && std::is_same_v<PT, float>) {
+    if ((n & 3) == 0) {
+      size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= (n >> 2)) return;
+      float4 p = reinterpret_cast<float4*>(pair)[i];
+      uint2 pr = reinterpret_cast<const uint2*>(proj)[i], gt = reinterpret_cast<const uint2*>(gate)[i];
+      float2 a0 = __half22float2(*reinterpret_cast<const half2*>(&pr.x)), a1 = __half22float2(*reinterpret_cast<const half2*>(&pr.y));
+      float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&gt.x)), g1 = __half22float2(*reinterpret_cast<const half2*>(&gt.y));
+      p.x += a0.x * sigm(g0.x); p.y += a0.y * sigm(g0.y); p.z += a1.x * sigm(g1.x); p.w += a1.y * sigm(g1.y);
+      reinterpret_cast<float4*>(pair)[i] = p;
+      return;
+    }
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) pairSt<PT>(pair, i, pairLd<PT>(pair, i) + toF(proj[i]) * sigm(toF(gate[i])));
 }
@@ -215,7 +445,8 @@ inline float* pairRow(float* pair, size_t row, int C) {
 }
 inline const float* pairRow(const float* pair, size_t row, int C) { return pairRow(const_cast<float*>(pair), row, C); }
 // pair16[r] += h[r] for rows of C halves (the bf16 pair's row-direction grid output, after its f16 GEMM)
-__global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
+__global__ void __launch_bounds__(256, 6)
+addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n8) return;
   uint4 p = reinterpret_cast<uint4*>(pair)[i], a = reinterpret_cast<const uint4*>(h)[i];
@@ -257,7 +488,7 @@ inline void linearIntoPairRows(const T* X, float* pair, size_t r0, size_t rows, 
 // gets; these stream their weights in narrower steps, two blocks an SM. Below ~80 tokens their tiles leave
 // the device idle (ESMFold2's measurement), and a T4's 64 KB fits none of them.
 inline bool FUSED_WIDE = true;
-inline int FUSED_WIDE_MIN_TOKENS = 80;
+inline int FUSED_WIDE_MIN_TOKENS = getenv("LOCALFOLD_WIDE_MIN") ? atoi(getenv("LOCALFOLD_WIDE_MIN")) : 80;
 // ...and at OpenDDE's 384 and IntelliFold-2's 512 too, now (LOCALFOLD_NO_WIDER=1: the unfused paths there). They fit
 // one block an SM there and once lost to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821);
 // re-measured 2026-10-07 on the kernels as they stand, each wins on its own - see README, "The wider pair tracks"
@@ -323,6 +554,10 @@ inline size_t wideTriOutSmemReal(int C) {
   }
 }
 inline size_t wideTriFitsSmem(int C) { return std::max(wideTriInSmemW(C, 4), wideTriOutSmemReal(C)); }
+template <class F> void wideWidth256(int C, F f) {
+  if (C == 128) f(std::integral_constant<int, 128>{});
+  else f(std::integral_constant<int, 256>{});
+}
 template <class F> void wideWidth(int C, F f) {
   switch (C) {
     case 128: f(std::integral_constant<int, 128>{}); break;
@@ -331,12 +566,16 @@ template <class F> void wideWidth(int C, F f) {
     default: f(std::integral_constant<int, 256>{});
   }
 }
-template <class F> void wideWarps(int C, F f) {
-  int w = wideTriInWarps(C);
-  if (w == 8) f(std::integral_constant<int, 8>{});
-  else if (w == TRIIN_TWO_TILES) f(std::integral_constant<int, TRIIN_TWO_TILES>{});
-  else if (w == TRIIN_ROUNDED) f(std::integral_constant<int, TRIIN_ROUNDED>{});
-  else f(std::integral_constant<int, 4>{});
+template <int CC = 256, class F> void wideWarps(int C, F f) {
+  if constexpr (CC > 256) {
+    f(std::integral_constant<int, 4>{});
+  } else {
+    int w = wideTriInWarps(C);
+    if (w == 8) f(std::integral_constant<int, 8>{});
+    else if (w == TRIIN_TWO_TILES) f(std::integral_constant<int, TRIIN_TWO_TILES>{});
+    else if (w == TRIIN_ROUNDED) f(std::integral_constant<int, TRIIN_ROUNDED>{});
+    else f(std::integral_constant<int, 4>{});
+  }
 }
 // triIn256K's template for a warp count (the rounded form at TRIIN_ROUNDED)
 template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For() {
@@ -479,9 +718,7 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
   constexpr bool F8 = sizeof(TQ) == 1;
   const int np = (n + 15) / 16 * 16; const size_t cs = (size_t)np * np;
   const float alpha = divideByLength ? 1.f / n : 1.f;
-  std::string pg = projectionGate(pre, C);
-  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
-  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
   TQ* b = scratch<TQ>("trib.bq", cs * C);
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
@@ -497,9 +734,9 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
     if constexpr (F8) fp8GemmTN(m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
     else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
   };
-  wideWidth(C, [&](auto cw) {
+  wideWidth256(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
-    wideWarps(C, [&](auto warps) {
+    wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
         static bool attr = false;
@@ -545,9 +782,7 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   using B16 = __nv_bfloat16;
   const size_t cs = (size_t)np * np;
   const float alpha = divideByLength ? 1.f / n : 1.f;
-  std::string pg = projectionGate(pre, C);
-  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
-  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
   B16* b = scratch<B16>("trib.bbf", cs * C);
   // as wide a block as fits beside b (a, its gating rows and the product, 6 bytes a channel a pair; up to 1024 rows):
   // every block re-reads the whole of b. (Beside b, a 64th of the card kept - b is made and nothing else is asked for
@@ -565,7 +800,7 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
   wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
-    wideWarps(C, [&](auto warps) {
+    wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
         static bool attr = false;
@@ -660,6 +895,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
+  if constexpr (std::is_same_v<T, half>) { if (MASK_ALL_ONES) mask = nullptr; }
   size_t pairs = (size_t)n * n;
   // a, b and their product live in a PADDED np x np space per channel, np a multiple of 8, the
   // padding zero: the contraction is unchanged and cuBLAS's GEMM runs twice as fast on an aligned
@@ -734,17 +970,16 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       const bool f8 = TRI_BF16 && bf16Tensor() && fp8Tensor() && C <= 256, tn = f8 || (TRI_BF16 && bf16Tensor() && tnBf16 && C <= 256);
       const int np8 = (n + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
       half* t2 = scratch<half>("tri.t2whole", (tn ? cs8 : cs) * C);
-      half* wt = scratch<half>("tri.wt256", triInTileHalves(C));
-      tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
       if (tn) {
+        const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
         auto run = [&](auto tag) {
         using F8 = decltype(tag);
         F8* a8 = scratch<F8>("tri.a8", cs8 * C); F8* b8 = scratch<F8>("tri.b8", cs8 * C);
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs8 * C);
         RectMap rm; rm.T = !outgoing;
-        wideWidth(C, [&](auto width) {
+        wideWidth256(C, [&](auto width) {
           constexpr int CC = decltype(width)::value, WO = 4;
-          wideWarps(C, [&](auto warps) {
+          wideWarps<CC>(C, [&](auto warps) {
             constexpr int WI = decltype(warps)::value;
             WITH_PAIR_T(
               static bool attr = false;
@@ -772,26 +1007,29 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
           constexpr int CC = decltype(width)::value, WO = 4;
           // (the GEMM-shaped input kernel where this device has its shared memory; else triIn256K)
           if (!triInGemm<CC, __nv_bfloat16>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"),
-                                           triInGemmWeights(pre, Wh(pg), Wh(pre + ".gatingLinear"), C), ab, bb, t2, n, np, cs))
-          wideWarps(C, [&](auto warps) {
-            constexpr int WI = decltype(warps)::value;
-            WITH_PAIR_T(
-              static bool attr = false;
-              constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
-              if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-              kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
-                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr, RectMap{}));
-          });
+                                           pre, ab, bb, t2, n, np, cs)) {
+            const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
+            wideWarps<CC>(C, [&](auto warps) {
+              constexpr int WI = decltype(warps)::value;
+              WITH_PAIR_T(
+                static bool attr = false;
+                constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
+                if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+                kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                  pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr, RectMap{}));
+            });
+          }
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                                 Wh(pre + ".outputProjection"), t2, into(pair), n, np);
         });
         return;
       }
+      const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
       a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value, WO = 4;
-        wideWarps(C, [&](auto warps) {
+        wideWarps<CC>(C, [&](auto warps) {
           constexpr int WI = decltype(warps)::value;
           WITH_PAIR_T(
             static bool attr = false;
@@ -834,7 +1072,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     size_t rows = std::min(rowsPer, pairs - r0);
     lnPairRows<T>(pair, r0, norm + r0 * C, rows, C, pre + ".leftNormInputScale", pre + ".leftNormInputOffset");
     linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
-    triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
+    unsigned gc = std::is_same_v<T, half> && (C & 63) == 0 ? (unsigned)(C / 64) : (unsigned)((C + 31) / 32);
+    triGateK<T><<<dim3((unsigned)((rows + 31) / 32), gc), dim3(32, 8), 0, STREAM>>>(
       pgOut, mask, a, b, r0, rows, C, cs, n, np);
   }
   contract();
@@ -858,7 +1097,10 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     }
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
-    WITH_PAIR_T(gatedAddK<T, PT><<<blocks(rows * C), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
+    WITH_PAIR_T(
+      size_t gw = std::is_same_v<T, half> && std::is_same_v<PT, __nv_bfloat16> && ((rows * C) & 7) == 0 ? (rows * C) >> 3
+                : std::is_same_v<T, half> && std::is_same_v<PT, float> && ((rows * C) & 3) == 0 ? (rows * C) >> 2 : rows * C;
+      gatedAddK<T, PT><<<blocks(gw), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
   }
 }
 
@@ -880,8 +1122,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
       constexpr int WU = 8, R = 16 * WU;
       // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
       size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(C), std::max<size_t>(R, CHUNK / (2 * I)));
-      half* w1t = scratch<half>("tr.w1t", (size_t)2 * C * I);
-      tileTransitionUp(Wh(pre + ".transition1"), C, I, w1t);
+      const half* w1t = transitionW1Tiles<false>(Wh(pre + ".transition1"), C, I, 32);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
         if (PAIR16) {
@@ -1007,8 +1248,9 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
 // layerNormK norms it (the same arithmetic, so `norm` is byte-identical) into `norm` AND shared memory, then
 // projected on the tensor cores to 16 padded heads, head-major (out[h][row]) - where cuBLAS took the
 // few-column GEMM as a 16x16 WMMA kernel that read the whole normed pair back.
-template <int C, int WARPS, class PT = float>
-__global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
+template <int C, int WARPS, class PT = float,
+          int MINB = C <= 128 ? 4 : C == 256 ? 3 : C == 384 ? 2 : 1>
+__global__ void __launch_bounds__(WARPS * 32, MINB) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
     const float* __restrict__ offset, const half* __restrict__ Wp, half* __restrict__ norm, float* __restrict__ out,
     size_t rows, int heads, int ntr) {
   constexpr int N = 16, R = 16 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, K = C / 32;
@@ -1016,17 +1258,21 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
   half* Xs = (half*)smem; half* Ws = Xs + R * LDX;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
-  for (int t = threadIdx.x; t < C * (N / 8); t += WARPS * 32) {
-    int k = t / (N / 8), c = (t % (N / 8)) * 8;
-    cpAsync16(Ws + k * LDW + c, Wp + (size_t)k * N + c, true);
+  {
+    const int k0 = (int)threadIdx.x >> 1, c0 = ((int)threadIdx.x & 1) << 3;
+#pragma unroll
+    for (int it = 0; it < (C * (N / 8)) / (WARPS * 32); ++it) {
+      int k = k0 + it * (WARPS * 16);
+      cpAsync16(Ws + k * LDW + c0, Wp + (size_t)k * N + c0, true);
+    }
   }
   cpCommit();
   float sc[K], of[K];
 #pragma unroll
   for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
   // the warp's own 16 rows, eight in flight (Chai-1 at 255 tokens: 32.8 -> 28.1 ms over a fold's 320 calls at
-  // four, 16 no better; four at 512 channels, where eight rows are 128 registers)
-  constexpr int B = C >= 512 ? 4 : 8;
+  // four, 16 no better; four at 384 and 512 channels, where eight rows exceed 128 registers)
+  constexpr int B = C >= 384 ? 4 : 8;
 #pragma unroll 1
   for (int i0 = 0; i0 < 16; i0 += B) {
     float v[B][K];
@@ -1045,59 +1291,82 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
       for (int k = 0; k < K; ++k) { s += v[b][k]; ss += v[b][k] * v[b][k]; }
       for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
       float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+      half hv[K];
 #pragma unroll
-      for (int k = 0; k < K; ++k) {
-        half h = __float2half((v[b][k] - mean) * inv * sc[k] + of[k]);
-        if (row >= rows) h = __float2half(0.f);
-        Xs[r * LDX + lane + 32 * k] = h;
-        if (row < rows) norm[wrow * C + lane + 32 * k] = h;
+      for (int k = 0; k < K; ++k) hv[k] = row < rows ? __float2half((v[b][k] - mean) * inv * sc[k] + of[k]) : __float2half(0.f);
+#pragma unroll
+      for (int k = 0; k < K; ++k) Xs[r * LDX + lane + 32 * k] = hv[k];
+      if (norm && row < rows) {
+#pragma unroll
+        for (int k = 0; k < K; ++k) norm[wrow * C + lane + 32 * k] = hv[k];
       }
     }
   }
   cpWait<0>();
   __syncthreads();
   float acc[N / 8][4] = {};
+  const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+  uint32_t xa[2][4], f[2][4];
+  ldsm4(xa[0], Xs + (warp * 16 + (lane & 15)) * LDX + cl);
+  ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
   for (int ks = 0; ks < KS; ++ks) {
-    uint32_t xa[4];
-    ldsm4(xa, Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
-    uint32_t f[4];
-    ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + (lane >> 4) * 8);
-    mma16816(acc[0], xa, f[0], f[1]); mma16816(acc[1], xa, f[2], f[3]);
+    const int cur = ks & 1;
+    if (ks + 1 < KS) {
+      ldsm4(xa[cur ^ 1], Xs + (warp * 16 + (lane & 15)) * LDX + (ks + 1) * 16 + cl);
+      ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
+    }
+    mma16816(acc[0], xa[cur], f[cur][0], f[cur][1]); mma16816(acc[1], xa[cur], f[cur][2], f[cur][3]);
   }
-  size_t r0 = row0 + warp * 16 + g, r1 = r0 + 8;
+  __syncthreads();
+  constexpr int LDO = R + 4;
+  float* Os = (float*)Xs;
+  int r0 = warp * 16 + g, r1 = r0 + 8;
 #pragma unroll
   for (int nt = 0; nt < 2; ++nt) {
     int h = nt * 8 + tig * 2;
-    if (h < heads) { if (r0 < rows) out[(size_t)h * rows + r0] = acc[nt][0]; if (r1 < rows) out[(size_t)h * rows + r1] = acc[nt][2]; }
-    if (h + 1 < heads) { if (r0 < rows) out[(size_t)(h + 1) * rows + r0] = acc[nt][1]; if (r1 < rows) out[(size_t)(h + 1) * rows + r1] = acc[nt][3]; }
+    Os[h * LDO + r0] = acc[nt][0]; Os[h * LDO + r1] = acc[nt][2];
+    Os[(h + 1) * LDO + r0] = acc[nt][1]; Os[(h + 1) * LDO + r1] = acc[nt][3];
+  }
+  __syncthreads();
+  for (int h = warp; h < heads; h += WARPS) {
+#pragma unroll
+    for (int r = lane; r < R; r += 32)
+      if (row0 + r < rows) out[(size_t)h * rows + row0 + r] = Os[h * LDO + r];
   }
 }
 template <int C> constexpr size_t lnNormHeadsSmem(int warps) { return (size_t)16 * warps * (C + 8) * 2 + (size_t)C * 24 * 2; }
-// norm + head-major raw bias for C 256/384/512 (false: not this width, or the device's shared memory); ntr > 0: the
+// norm + head-major raw bias for C 64/256/384/512 (false: not this width, or the device's shared memory); ntr > 0: the
 // norm written transposed over an ntr x ntr grid (the column direction's rows, which a gather pass otherwise makes)
 inline bool LN_NORM_HEADS = true;
-inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads, const std::string& pre,
-                        int ntr = 0) {
+inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads,
+                        const std::string& scaleName, const std::string& offsetName, const std::string& projName, int ntr = 0) {
   if (!LN_NORM_HEADS || heads > 16) return false;
   auto run = [&](auto width) -> bool {
     constexpr int CC = decltype(width)::value, WARPS = 4, R = 16 * WARPS;   // (8 warps: no faster)
     constexpr size_t smem = lnNormHeadsSmem<CC>(WARPS);
     if (!fitsSmem(smem)) return false;
-    std::string wb = concatColumns(pre + ".pairBiasProjection~pad16", CC, {{pre + ".pairBiasProjection", heads, false}, {"", 16 - heads, false}});
+    std::string wb = heads == 16 ? projName
+                                 : concatColumns(projName + "~pad16", CC, {{projName, heads, false}, {"", 16 - heads, false}});
     WITH_PAIR_T(
       static bool attr = false;
       if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS, PT>), (int)smem); attr = true; }
       lnNormHeadsK<CC, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-        pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads, ntr));
+        pair, W(scaleName), W(offsetName), Wh(wb), norm, raw, rows, heads, ntr));
     return true;
   };
   switch (C) {
+    case 64: return run(std::integral_constant<int, 64>{});
+    case 128: return run(std::integral_constant<int, 128>{});
     case 256: return run(std::integral_constant<int, 256>{});
     case 384: return run(std::integral_constant<int, 384>{});
     case 512: return run(std::integral_constant<int, 512>{});
     default: return false;
   }
+}
+inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads, const std::string& pre,
+                        int ntr = 0) {
+  return lnNormHeads(pair, norm, raw, rows, C, heads, pre + ".actNormScale", pre + ".actNormOffset", pre + ".pairBiasProjection", ntr);
 }
 // the pair's row `row` (of C channels) as a float* base in whichever storage PAIR16 says it has
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)

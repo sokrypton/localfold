@@ -15,9 +15,11 @@
 // 101.8 -> 93.4 ms over the fold's 384 calls against the f32-staged form (three blocks an SM), byte-identical.
 #pragma once
 namespace oln {
-constexpr int C = 256, R = 64, KC = 32, LDA = KC + 8, LDW = C + 8, LDV = C + 8, NTH = 256;
+constexpr int C = 256, R = 64, KC = 32, LDA = KC, LDW = C, LDV = C + 8, NTH = 256;
 constexpr size_t STG = (size_t)R * LDA * 2 + (size_t)KC * LDW * 2;
 constexpr size_t SMEM = 2 * STG > (size_t)R * LDV * 2 ? 2 * STG : (size_t)R * LDV * 2;
+__device__ __forceinline__ int swA(int r, int c) { return r * LDA + (c ^ (((r >> 1) & 3) << 3)); }
+__device__ __forceinline__ int swW(int k, int c) { return k * LDW + (c ^ ((k & 7) << 3)); }
 }
 __device__ __forceinline__ void mma16816bf(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
@@ -27,31 +29,33 @@ __device__ __forceinline__ void mma16816bf(float* d, const uint32_t* a, uint32_t
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #endif
 }
-template <class M, class TO>
-__global__ void __launch_bounds__(oln::NTH) outLnK(const M* __restrict__ O, const M* __restrict__ W,
+template <class M, class TO, class TI = M>
+__global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, const TI* __restrict__ W,
     const float* __restrict__ bias, M* __restrict__ msa, const float* __restrict__ lnS,
     const float* __restrict__ lnO, TO* __restrict__ xn, size_t rows) {
   using namespace oln;
   constexpr bool BF = std::is_same_v<M, __nv_bfloat16>;
+  constexpr bool BFI = std::is_same_v<TI, __nv_bfloat16>;
   using M2 = std::conditional_t<BF, __nv_bfloat162, half2>;
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ float sB[C], sS[C], sO[C];
   for (int t = threadIdx.x; t < C; t += NTH) { sB[t] = bias[t]; sS[t] = lnS[t]; sO[t] = lnO[t]; }
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, rg = warp & 3, chh = warp >> 2;
   const size_t row0 = (size_t)blockIdx.x * R;
-  auto As = [&](int s) { return (M*)(smem + s * STG); };
-  auto Ws = [&](int s) { return (M*)(smem + s * STG) + R * LDA; };
+  auto As = [&](int s) { return (TI*)(smem + s * STG); };
+  auto Ws = [&](int s) { return (TI*)(smem + s * STG) + R * LDA; };
+  M* V = (M*)smem;
   constexpr int WPT = KC * C / 8 / NTH;
   auto issue = [&](int kc, int s) {
     {   // A: 64 rows x 32 k, one 16-byte piece a thread
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
-      cpAsync16(As(s) + r * LDA + c, O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+      cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
     }
 #pragma unroll
     for (int i = 0; i < WPT; ++i) {   // W: 32 k x 256 columns, four a thread
       const int u = i * NTH + threadIdx.x, k = u / (C / 8), c = (u % (C / 8)) * 8;
-      cpAsync16(Ws(s) + k * LDW + c, W + (size_t)(kc * KC + k) * C + c, true);
+      cpAsync16(Ws(s) + swW(k, c), W + (size_t)(kc * KC + k) * C + c, true);
     }
     cpCommit();
   };
@@ -61,31 +65,47 @@ __global__ void __launch_bounds__(oln::NTH) outLnK(const M* __restrict__ O, cons
 #pragma unroll 1
   for (int kc = 0; kc < KSTEPS; ++kc) {
     const int st = kc & 1;
-    if (kc + 1 < KSTEPS) { issue(kc + 1, st ^ 1); cpWait<1>(); } else cpWait<0>();
+    if (kc + 1 < KSTEPS) { issue(kc + 1, st ^ 1); cpWait<1>(); }
+    else {
+      cpWait<0>();
+      // Stage 0 is now idle while kc == KSTEPS - 1 reads Stage 1: prefetch the first 32 rows of msa into V[0..31]
+      static_assert((R / 2) * LDV * 2 <= STG, "first half of V fits in idle stage 0");
+#pragma unroll
+      for (int i = 0; i < (R / 2) * C / 8 / NTH; ++i) {
+        const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
+        const size_t row = row0 + r;
+        cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+      }
+      cpCommit();
+    }
     __syncthreads();
-    const M* A = As(st); const M* Wt = Ws(st);
+    const TI* A = As(st); const TI* Wt = Ws(st);
+    uint32_t a[2][4];
+    ldsm4(a[0], A + swA(rg * 16 + (lane & 15), (lane >> 4) * 8));
+    ldsm4(a[1], A + swA(rg * 16 + (lane & 15), 16 + (lane >> 4) * 8));
 #pragma unroll
     for (int ks = 0; ks < KC / 16; ++ks) {
-      uint32_t a[4];
-      ldsm4(a, A + (rg * 16 + (lane & 15)) * LDA + ks * 16 + (lane >> 4) * 8);
+      uint32_t f[2][4];
+      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), cl = chh * 128 + (lane >> 4) * 8;
+      ldsm4t(f[0], Wt + swW(kl, cl));
 #pragma unroll
       for (int n2 = 0; n2 < 8; ++n2) {
-        uint32_t f[4];
-        ldsm4t(f, Wt + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + chh * 128 + n2 * 16 + (lane >> 4) * 8);
-        if constexpr (BF) { mma16816bf(acc[2 * n2], a, f[0], f[1]); mma16816bf(acc[2 * n2 + 1], a, f[2], f[3]); }
-        else { mma16816(acc[2 * n2], a, f[0], f[1]); mma16816(acc[2 * n2 + 1], a, f[2], f[3]); }
+        const int cur = n2 & 1;
+        if (n2 + 1 < 8) ldsm4t(f[cur ^ 1], Wt + swW(kl, cl + (n2 + 1) * 16));
+        if constexpr (BFI) { mma16816bf(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816bf(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
+        else { mma16816(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
       }
     }
     __syncthreads();
   }
-  // the residual rows into the stages' memory (every warp is past the last barrier), coalesced
-  M* V = (M*)smem;
+  // the second half of the residual rows into V[32..63] (every warp is past the last barrier), coalesced
 #pragma unroll
-  for (int i = 0; i < R * C / 8 / NTH; ++i) {
+  for (int i = (R / 2) * C / 8 / NTH; i < R * C / 8 / NTH; ++i) {
     const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
     const size_t row = row0 + r;
-    *reinterpret_cast<uint4*>(V + r * LDV + c) = row < rows ? *reinterpret_cast<const uint4*>(msa + row * C + c) : make_uint4(0, 0, 0, 0);
+    cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
   }
+  cpCommit(); cpWait<0>();
   __syncthreads();
   // each accumulator + its bias + its residual, rounded, in place
 #pragma unroll
@@ -134,12 +154,12 @@ __global__ void __launch_bounds__(oln::NTH) outLnK(const M* __restrict__ O, cons
     *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
   }
 }
-template <class M, class TO>
-inline void outLn256(const M* O, const M* W, const float* bias, M* msa,
+template <class M, class TO, class TI = M>
+inline void outLn256(const TI* O, const TI* W, const float* bias, M* msa,
                      const float* lnS, const float* lnO, TO* xn, size_t rows) {
   static bool attr = false;
-  if (!attr) { smemAttr((outLnK<M, TO>), (int)oln::SMEM); attr = true; }
-  outLnK<M, TO><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
+  if (!attr) { smemAttr((outLnK<M, TO, TI>), (int)oln::SMEM); attr = true; }
+  outLnK<M, TO, TI><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
 }
 // the LN'd rows a projection emitted for the next module: that module's LN prefix, its block, the MSA it normalised
 struct EmittedLn { std::string ln; int blk = -1; const void* msa = nullptr; void* xn = nullptr; size_t rows = 0; };

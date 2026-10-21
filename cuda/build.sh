@@ -85,7 +85,7 @@ for port in "${ports[@]}"; do
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
   # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
   # (compiled to an object while standalone.o builds, then linked once it has)
-  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --default-stream per-thread $fast -c src/$port.cu \
+  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --split-compile 0 --default-stream per-thread $fast -c src/$port.cu \
       -o "$out.o" >> "$log" 2>&1 \
     && until [ ${#link[@]} = 0 ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" = "$fstamp" ]; do
          [ "$(cat "$sobj.stamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no standalone object" >> "$log"; exit 1; }; sleep 1; done \

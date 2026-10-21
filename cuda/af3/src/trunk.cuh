@@ -6,9 +6,35 @@
 
 // acc += work - base (an update run on a copy of its input, added as a difference: chai-1's parallel blocks)
 template <class T>
-__global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
+__global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C, T* y = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
+  if constexpr (std::is_same_v<T, half>) {
+    if ((C & 7) == 0 && rows * (C >> 3) < (1ull << 32)) {
+      unsigned c8 = (unsigned)(C >> 3), u = (unsigned)t;
+      if (u >= (unsigned)rows * c8) return;
+      float m = mask[u / c8];
+      half2 mh = __float2half2_rn(m);
+      auto scale8 = [&](half* p) {
+        uint4 v = reinterpret_cast<const uint4*>(p)[u];
+        half2* h = reinterpret_cast<half2*>(&v);
+        h[0] = __hmul2(h[0], mh); h[1] = __hmul2(h[1], mh); h[2] = __hmul2(h[2], mh); h[3] = __hmul2(h[3], mh);
+        reinterpret_cast<uint4*>(p)[u] = v;
+      };
+      scale8(x);
+      if (y) scale8(y);
+      return;
+    }
+  }
+  if (t < rows * C) {
+    float m = mask[t / C];
+    x[t] = fromF<T>(toF(x[t]) * m);
+    if (y) y[t] = fromF<T>(toF(y[t]) * m);
+  }
+}
+template <class T>
+inline void scaleRows(T* x, const float* mask, size_t rows, int C, T* y = nullptr) {
+  size_t gw = std::is_same_v<T, half> && (C & 7) == 0 && rows * (C >> 3) < (1ull << 32) ? rows * (C >> 3) : rows * C;
+  scaleRowsK<T><<<blocks(gw), 256, 0, STREAM>>>(x, mask, rows, C, y);
 }
 __global__ void addDiffK(float* acc, const float* work, const float* base, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) acc[i] += work[i] - base[i];
@@ -60,6 +86,10 @@ __global__ void toBf16K(const float* x, __nv_bfloat16* y, size_t n) {
 }
 __global__ void fromBf16K(const __nv_bfloat16* x, float* y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) reinterpret_cast<float4*>(y)[i] = pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(x), i << 2);
+    return;
+  }
   if (i < n) y[i] = __bfloat162float(x[i]);
 }
 // ---------------------------------------------------------------- embedder
@@ -67,6 +97,15 @@ __global__ void fromBf16K(const __nv_bfloat16* x, float* y, size_t n) {
 template <class PT = float>
 __global__ void outerSumK(const float* left, const float* right, float* pair, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2);
+    if (t >= (size_t)n * n * c4) return;
+    int c = (int)(t % c4) << 2; size_t ij = t / c4; int i = (int)(ij / n), j = (int)(ij % n);
+    float4 l = *(const float4*)(left + (size_t)i * C + c);
+    float4 r = *(const float4*)(right + (size_t)j * C + c);
+    pairSt4<PT>(pair, t << 2, make_float4(l.x + r.x, l.y + r.y, l.z + r.z, l.w + r.w));
+    return;
+  }
   if (t >= (size_t)n * n * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   pairSt<PT>(pair, t, left[(size_t)i * C + c] + right[(size_t)j * C + c]);
@@ -76,6 +115,16 @@ template <class PT = float>
 __global__ void outerSumRowsK(const float* left, const float* right, const float* add, float* pair, size_t r0, size_t cnt,
                               int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0) {
+    size_t c4 = (size_t)(C >> 2);
+    if (t >= cnt * c4) return;
+    int c = (int)(t % c4) << 2; size_t ij = r0 + t / c4; size_t i = ij / n, j = ij % n;
+    float4 l = *(const float4*)(left + i * C + c);
+    float4 r = *(const float4*)(right + j * C + c);
+    float4 a = *(const float4*)(add + (t << 2));
+    pairSt4<PT>(pair, r0 * C + (t << 2), make_float4(l.x + r.x + a.x, l.y + r.y + a.y, l.z + r.z + a.z, l.w + r.w + a.w));
+    return;
+  }
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; size_t i = ij / n, j = ij % n;
   pairSt<PT>(pair, r0 * C + t, left[i * C + c] + right[j * C + c] + add[t]);
@@ -87,8 +136,36 @@ __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex
                                   const int* entityId, const int* symId, const float* Wpos, float* pair,
                                   int n, int C, int maxIdx, int maxChain, size_t t0 = 0, size_t tEnd = 0) {
   // [t0, tEnd): the elements this launch covers (a sharded pair's held rows); tEnd 0, all of them
+  size_t end = tEnd ? tEnd : (size_t)n * n * C;
+  if ((C & 3) == 0 && (t0 & 3) == 0 && (end & 3) == 0) {
+    size_t t4 = (t0 >> 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= (end >> 2)) return;
+    size_t c4 = (size_t)(C >> 2), ij = t4 / c4;
+    int c = (int)(t4 % c4) << 2, i = (int)(ij / n), j = (int)(ij % n);
+    int positionBins = 2 * maxIdx + 2;
+    auto clamp = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+    bool sameChain = asymId[i] == asymId[j], sameEntity = entityId[i] == entityId[j];
+    int offset = clamp(residueIndex[i] - residueIndex[j] + maxIdx, 2 * maxIdx);
+    int c0 = sameChain ? offset : 2 * maxIdx + 1;
+    bool sameResidue = sameChain && residueIndex[i] == residueIndex[j];
+    int tokenOffset = clamp(tokenIndex[i] - tokenIndex[j] + maxIdx, 2 * maxIdx);
+    int c1 = positionBins + (sameResidue ? tokenOffset : 2 * maxIdx + 1);
+    int relChain = clamp(symId[i] - symId[j] + maxChain, 2 * maxChain);
+    int c3 = positionBins * 2 + 1 + (sameEntity ? relChain : 2 * maxChain + 1);
+    float4 w0 = *(const float4*)(Wpos + (size_t)c0 * C + c);
+    float4 w1 = *(const float4*)(Wpos + (size_t)c1 * C + c);
+    float4 w3 = *(const float4*)(Wpos + (size_t)c3 * C + c);
+    float4 v = make_float4(w0.x + w1.x + w3.x, w0.y + w1.y + w3.y, w0.z + w1.z + w3.z, w0.w + w1.w + w3.w);
+    if (sameEntity) {
+      float4 we = *(const float4*)(Wpos + (size_t)(positionBins * 2) * C + c);
+      v.x += we.x; v.y += we.y; v.z += we.z; v.w += we.w;
+    }
+    float4 p = pairLd4<PT>(pair, t4 << 2);
+    pairSt4<PT>(pair, t4 << 2, make_float4(p.x + v.x, p.y + v.y, p.z + v.z, p.w + v.w));
+    return;
+  }
   size_t t = t0 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (tEnd ? tEnd : (size_t)n * n * C)) return;
+  if (t >= end) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   int positionBins = 2 * maxIdx + 2;
   auto clamp = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
@@ -281,13 +358,13 @@ inline void usePair16(Trunk& t, bool on) {
   if ((on != t.p16 || !t.pair) && sharded(t)) { fprintf(stderr, "a sharded pair stays bf16\n"); exit(1); }
   if (on != t.p16 || !t.pair) {
     const bool shared = mg::splitting(t.pair);     // (several GPUs: the shared pair has f32's room, and is kept)
-    if (t.pair && !shared) CK(cudaFree(t.pair));
-    if (t.prevPair) CK(cudaFree(t.prevPair));
+    if (t.pair && !shared) { CK(cudaFree(t.pair)); ++MEM_GEN; }
+    if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); ++MEM_GEN; }
     if (!shared) t.pair = on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
-    t.prevPair = t.inPlaceRecycle ? nullptr : on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
+    t.prevPair = t.inPlaceRecycle ? nullptr : on ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pc)) : poolAlloc(pc);
     t.p16 = on;
   }
-  CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, (sharded(t) ? heldPairs(t) * t.C : pc) * e));
+  CK(cudaMemsetAsync(t.inPlaceRecycle ? t.pair : t.prevPair, 0, (sharded(t) ? heldPairs(t) * t.C : pc) * e, STREAM));
 }
 // ...and back to f32 when the trunk is done: the heads, the diffusion and the confidence head read an f32 pair, and
 // the recycled pair is not needed again this fold
@@ -295,16 +372,19 @@ inline void pairToF32(Trunk& t) {
   if (!t.p16) return;
   size_t pc = (size_t)t.n * t.n * t.C;
   if (shortPair((size_t)t.n * t.n, t.C)) releaseScratch();   // (near the card's limit: the trunk's scratch first)
-  float* f = dalloc(pc);
-  fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), f, pc);
-  CK(cudaStreamSynchronize(STREAM));
-  CK(cudaFree(t.pair)); t.pair = f;
-  if (t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
+  if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); t.prevPair = nullptr; ++MEM_GEN; }
+  float* f = poolAlloc(pc);
+  fromBf16K<<<blocks((pc & 3) == 0 ? (pc >> 2) : pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), f, pc);
+  CK(cudaFreeAsync(t.pair, STREAM)); t.pair = f; ++MEM_GEN;
   t.p16 = false;
+}
+__global__ void outerMaskK(const float* __restrict__ seq, float* __restrict__ pm, int n) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij < (size_t)n * n) pm[ij] = seq[ij / (unsigned)n] * seq[ij % (unsigned)n];
 }
 // wantPair16: the fold will hold its pair in bf16 where every stack takes it (af3.cu's want16) - allocated so here, never
 // as an f32 pair first: that pair was 24.5 GB at 6,916 tokens, a transient peak, and 51 GB at 10,000 does not allocate
-inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 = false) {
+inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 = false, const float* targetFeatDev = nullptr) {
   Trunk t{};
   t.n = (int)M.meta("batch.tokens");
   t.C = (int)M.meta("trunk.embedder.pairChannels");
@@ -333,33 +413,39 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 
     t.msa = (float*)mg::shared("trunk.msa", std::max<size_t>(1, (size_t)t.S * t.n * t.Cm * 4)).local;
     t.single = dalloc((size_t)t.n * t.Cs);
     t.inPlaceRecycle = true; t.prevPair = nullptr; t.prevSingle = dalloc((size_t)t.n * t.Cs);
-    CK(cudaMemset(t.pair, 0, slab));
+    CK(cudaMemsetAsync(t.pair, 0, slab, STREAM));
   } else {
   t.pair = pairAlloc(); t.single = dalloc((size_t)t.n * t.Cs);
   t.msa = dalloc((size_t)t.S * t.n * t.Cm);
   // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
   // pair-sized tensor - 9 GB at 4192 tokens - and the first pass starts from a zeroed pair
   t.inPlaceRecycle = shortPair(pairs, t.C);
-  t.prevPair = t.inPlaceRecycle ? nullptr : pairAlloc(); t.prevSingle = dalloc((size_t)t.n * t.Cs);
-  CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * e));
+  t.prevPair = t.inPlaceRecycle ? nullptr : t.p16 ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pairs * t.C)) : poolAlloc(pairs * t.C);
+  t.prevSingle = dalloc((size_t)t.n * t.Cs);
+  CK(cudaMemsetAsync(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * e, STREAM));
   }
-  CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
-  t.targetFeat = upload(targetFeatHost, (size_t)t.n * t.F);
-  std::vector<float> seq(M.f("batch.seqMask"), M.f("batch.seqMask") + t.n), pm(pairs);
-  for (int i = 0; i < t.n; ++i) for (int j = 0; j < t.n; ++j) pm[(size_t)i * t.n + j] = seq[i] * seq[j];
-  t.seqMask = upload(seq.data(), t.n); t.pairMask = upload(pm.data(), pairs);
+  CK(cudaMemsetAsync(t.prevSingle, 0, (size_t)t.n * t.Cs * 4, STREAM));
+  if (targetFeatDev) {
+    t.targetFeat = dalloc((size_t)t.n * t.F);
+    CK(cudaMemcpyAsync(t.targetFeat, targetFeatDev, (size_t)t.n * t.F * 4, cudaMemcpyDeviceToDevice, STREAM));
+  } else {
+    t.targetFeat = upload(targetFeatHost, (size_t)t.n * t.F);
+  }
+  t.seqMask = const_cast<float*>(Fdev("batch.seqMask"));
+  t.pairMask = dalloc(pairs);
+  outerMaskK<<<blocks(pairs), 256, 0, STREAM>>>(t.seqMask, t.pairMask, t.n);
   // the first S rows: AF3 keeps the first num_msa after its (here identity) shuffle
-  size_t rows = (size_t)t.S * t.n;
-  t.msaRows = upload(M.i("batch.msa"), rows);
-  t.deletion = upload(M.f("batch.deletionMatrix"), rows);
-  t.msaMask = upload(M.f("batch.msaMask"), rows);
+  t.msaRows = const_cast<int*>(Idev("batch.msa"));
+  t.deletion = const_cast<float*>(Fdev("batch.deletionMatrix"));
+  t.msaMask = const_cast<float*>(Fdev("batch.msaMask"));
   return t;
 }
 
 inline void freeTrunk(Trunk& t) {
-  for (void* p : {(void*)t.pair, (void*)t.single, (void*)t.msa, (void*)t.targetFeat, (void*)t.pairMask, (void*)t.seqMask,
-                  (void*)t.msaMask, (void*)t.prevPair, (void*)t.prevSingle, (void*)t.msaRows, (void*)t.deletion})
-    if (p) CK(cudaFree(p));
+  if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); ++MEM_GEN; }
+  for (void* p : {(void*)t.pair, (void*)t.single, (void*)t.msa, (void*)t.targetFeat, (void*)t.pairMask,
+                  (void*)t.prevSingle})
+    if (p) { CK(cudaFree(p)); ++MEM_GEN; }
   t = Trunk{};
 }
 
@@ -372,6 +458,14 @@ __global__ void onehotK(const int* idx, float* out, int n, int classes) {
 }
 template <class PT = float>
 __global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size_t pairs, int C, size_t t0 = 0) {
+  if ((C & 3) == 0 && (t0 & 3) == 0) {
+    size_t t4 = (t0 >> 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x, c4 = (size_t)(C >> 2);
+    if (t4 >= pairs * c4) return;
+    float b = bonds[t4 / c4];
+    float4 w4 = *(const float4*)(w + ((t4 % c4) << 2)), p = pairLd4<PT>(pair, t4 << 2);
+    pairSt4<PT>(pair, t4 << 2, make_float4(p.x + b * w4.x, p.y + b * w4.y, p.z + b * w4.z, p.w + b * w4.w));
+    return;
+  }
   size_t t = t0 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < pairs * C) pairSt<PT>(pair, t, pairLd<PT>(pair, t) + bonds[t / C] * w[t % C]);
 }
@@ -381,6 +475,16 @@ __global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size
 template <class PT = float>
 __global__ void bondTypeEmbedK(float* pair, const float* orders, const float* table, const float* unspecified,
                                size_t pairs, int C, size_t t0 = 0) {
+  if ((C & 3) == 0 && (t0 & 3) == 0) {
+    size_t t4 = (t0 >> 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x, c4 = (size_t)(C >> 2);
+    if (t4 >= pairs * c4) return;
+    int o = orders ? (int)orders[t4 / c4] : 0;
+    if (o < 0 || o >= 7) o = 0;
+    int c = (int)(t4 % c4) << 2;
+    float4 tb = *(const float4*)(table + o * C + c), un = *(const float4*)(unspecified + c), p = pairLd4<PT>(pair, t4 << 2);
+    pairSt4<PT>(pair, t4 << 2, make_float4(p.x + tb.x + un.x, p.y + tb.y + un.y, p.z + tb.z + un.z, p.w + tb.w + un.w));
+    return;
+  }
   size_t t = t0 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= pairs * C) return;
   int o = orders ? (int)orders[t / C] : 0;
@@ -390,7 +494,8 @@ __global__ void bondTypeEmbedK(float* pair, const float* orders, const float* ta
 inline void bondTypeEmbed(float* pair, size_t pairs, int C, const std::string& pre, bool p16 = false, size_t first = 0) {
   // (first: the first pair this launch covers - a sharded pair's held rows - with `pairs` the end)
   if (!hasW(pre + "tokenBondsTypeEmbed")) return;
-  WITH_PT(p16, bondTypeEmbedK<PT><<<blocks((pairs - first) * C), 256, 0, STREAM>>>(pair, M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
+  size_t elems = (pairs - first) * C;
+  WITH_PT(p16, bondTypeEmbedK<PT><<<blocks((C & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(pair, M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
     W(pre + "tokenBondsTypeEmbed"), W(pre + "contactEncodingUnspecified"), pairs, C, first * C));
 }
 // ---------------------------------------------------------------- the trunk's pair in bf16 (t.p16)
@@ -408,6 +513,12 @@ inline void layerNormPairRows(const float* pair, bool p16, size_t r0, TO* out, s
 template <class PT, class TX>
 __global__ void pairAddK(float* pair, const TX* x, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i >= (n >> 2)) return;
+    float4 p = pairLd4<PT>(pair, i << 2), v = pairLd4<TX>(reinterpret_cast<const float*>(x), i << 2);
+    pairSt4<PT>(pair, i << 2, make_float4(p.x + v.x, p.y + v.y, p.z + v.z, p.w + v.w));
+    return;
+  }
   if (i < n) pairSt<PT>(pair, i, pairLd<PT>(pair, i) + toF(x[i]));
 }
 // pair rows [r0, r0 + rows) += X W (X [rows, in] of T), chunked through a scratch product in bf16
@@ -418,14 +529,18 @@ inline void linearIntoPair(const T* X, float* pair, bool p16, size_t r0, size_t 
   float* tmp = scratch<float>("p16.tmp", per * C);
   __nv_bfloat16* base = reinterpret_cast<__nv_bfloat16*>(pair) + r0 * C;
   for (size_t a = 0; a < rows; a += per) {
-    size_t r = std::min(per, rows - a);
+    size_t r = std::min(per, rows - a), elems = r * C;
     linear<T, float>(X + a * in, tmp, r, in, C, w);
-    pairAddK<__nv_bfloat16, float><<<blocks(r * C), 256, 0, STREAM>>>(reinterpret_cast<float*>(base + a * C), tmp, r * C);
+    pairAddK<__nv_bfloat16, float><<<blocks((elems & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(reinterpret_cast<float*>(base + a * C), tmp, elems);
   }
 }
 // pair rows as f32, into a chunk (a reader with no bf16 form: the distogram)
 __global__ void pairRowsF32K(const __nv_bfloat16* pair, float* out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) reinterpret_cast<float4*>(out)[i] = pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(pair), i << 2);
+    return;
+  }
   if (i < n) out[i] = __bfloat162float(pair[i]);
 }
 
@@ -434,8 +549,9 @@ template <class T>
 void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)>& onSeam) {
   int n = t.n, C = t.C; size_t pairs = (size_t)n * n;
   const std::string E = "trunk.embedder.";
-  float* left = scratch<float>("emb.left", (size_t)n * C);
-  float* right = scratch<float>("emb.right", (size_t)n * C);
+  float* lr = scratch<float>("emb.lr", 2 * (size_t)n * C);
+  float* left = lr;
+  float* right = lr + (size_t)n * C;
   // the pair from target_feat (AF3), or from s_init = target_feat's single projection (OpenDDE)
   const float* pairSource = t.targetFeat; int sourceWidth = t.F;
   if (M.flag("trunk.dialect.pairInitFromSingle")) {
@@ -454,13 +570,13 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
       Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
       Idev("batch.features.symId"), W(E + "positionActivations"), W(E + "positionActivationsBias"),
       hasW(E + "chaiChainEntity") ? W(E + "chaiChainEntity") : nullptr,
-      M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr,
+      M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr : nullptr,
       hasW(E + "chaiBondTrunk") ? W(E + "chaiBondTrunk") : nullptr, t.pair, n, C));
   };
   if (chai && t.pass == 0) {
     // chai's first pass recycles z_init itself (chai1.py seeds the carry with the initial representation):
     // z = z_init + prev_embedding(LN(z_init)), z_init = left + right + the relative encoding - row by row in place
-    WITH_PT(t.p16, outerSumK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C));
+    WITH_PT(t.p16, outerSumK<PT><<<blocks((C & 3) == 0 ? (pairs * (C >> 2)) : (pairs * C)), 256, 0, STREAM>>>(left, right, t.pair, n, C));
     chaiRelEnc();
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     // (sized for the recycle passes, which take the branch below - whole where the card has the room: the trunk graph
@@ -471,11 +587,11 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     // sized it here by chance until it stopped running when no slot counts)
     if (t.p16 && !t.inPlaceRecycle) scratch<float>("p16.tmp", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
-      size_t r = std::min(per, pairs - r0);
+      size_t r = std::min(per, pairs - r0), elems = r * C;
       layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
       linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
-      WITH_PT(t.p16, pairAddK<PT, float><<<blocks(r * C), 256, 0, STREAM>>>(
-        reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + r0 * C), prev, r * C));
+      WITH_PT(t.p16, pairAddK<PT, float><<<blocks((elems & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(
+        reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + r0 * C), prev, elems));
     }
   } else if (t.inPlaceRecycle) {
     // in place, a chunk of rows at a time: each row's new value reads only the same row of the last pass's
@@ -488,10 +604,10 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
       size_t r = std::min(per, hp - r0);
       layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
       linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
-      WITH_PT(t.p16, outerSumRowsK<PT><<<blocks(r * C), 256, 0, STREAM>>>(left, right, prev, base, hf + r0, r, n, C));
+      WITH_PT(t.p16, outerSumRowsK<PT><<<blocks((C & 3) == 0 ? (r * (C >> 2)) : (r * C)), 256, 0, STREAM>>>(left, right, prev, base, hf + r0, r, n, C));
     }
   } else {
-  WITH_PT(t.p16, outerSumK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C));
+  WITH_PT(t.p16, outerSumK<PT><<<blocks((C & 3) == 0 ? (pairs * (C >> 2)) : (pairs * C)), 256, 0, STREAM>>>(left, right, t.pair, n, C));
   onSeam("z_before_prev", t.pair, pairs * C);
   // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass - on a card short
   // of room in row chunks
@@ -507,7 +623,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   onSeam("z_after_prev", t.pair, pairs * C);
   if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
-  else WITH_PT(t.p16, relativeEncodingK<PT><<<blocks(hp * C), 256, 0, STREAM>>>(
+  else WITH_PT(t.p16, relativeEncodingK<PT><<<blocks((C & 3) == 0 ? (hp * (C >> 2)) : (hp * C)), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
     Idev("batch.features.entityId"), Idev("batch.features.symId"), W(E + "positionActivations"),
     base, n, C, 32, 2, hf * C, (hf + hp) * C));
@@ -515,7 +631,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     // bond_embedding: bias-free, one input column (the token-pair contact); zero for a polymer
     // without links
     if (lenW(E + "bondEmbedding") != (size_t)C) { fprintf(stderr, "bondEmbedding is not 1 x %d\n", C); exit(1); }
-    WITH_PT(t.p16, bondEmbedK<PT><<<blocks(hp * C), 256, 0, STREAM>>>(base, Fdev("batch.bondMatrix"), W(E + "bondEmbedding"), hf + hp, C, hf * C));
+    WITH_PT(t.p16, bondEmbedK<PT><<<blocks((C & 3) == 0 ? (hp * (C >> 2)) : (hp * C)), 256, 0, STREAM>>>(base, Fdev("batch.bondMatrix"), W(E + "bondEmbedding"), hf + hp, C, hf * C));
   }
   bondTypeEmbed(base, hf + hp, C, E, t.p16, hf);
   onSeam("z_init_generic", t.pair, pairs * C);
@@ -569,13 +685,33 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
 // ---------------------------------------------------------------- template stack
 // act[i][j] += row[j] + column[i]   (aatype one-hot projections, per axis)
 __global__ void addRowColumnK(float* act, const float* row, const float* col, int n, int C, size_t t0 = 0, size_t tEnd = 0) {
+  size_t end = tEnd ? tEnd : (size_t)n * n * C;
+  if ((C & 3) == 0 && (t0 & 3) == 0 && (end & 3) == 0) {
+    size_t t4 = (t0 >> 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t4 >= (end >> 2)) return;
+    size_t c4 = (size_t)(C >> 2), ij = t4 / c4;
+    int c = (int)(t4 % c4) << 2, i = (int)(ij / n), j = (int)(ij % n);
+    float4 a = *(const float4*)(act + (t4 << 2));
+    float4 r = *(const float4*)(row + (size_t)j * C + c);
+    float4 cl = *(const float4*)(col + (size_t)i * C + c);
+    *(float4*)(act + (t4 << 2)) = make_float4(a.x + (r.x + cl.x), a.y + (r.y + cl.y), a.z + (r.z + cl.z), a.w + (r.w + cl.w));
+    return;
+  }
   size_t t = t0 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;     // ([t0, tEnd): a sharded pair's held rows)
-  if (t >= (tEnd ? tEnd : (size_t)n * n * C)) return;
+  if (t >= end) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   act[t] += row[(size_t)j * C + c] + col[(size_t)i * C + c];
 }
 __global__ void reluScaleK(float* x, float s, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fmaxf(0.f, x[i] * s);
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) {
+      float4 v = reinterpret_cast<const float4*>(x)[i];
+      reinterpret_cast<float4*>(x)[i] = make_float4(fmaxf(0.f, v.x * s), fmaxf(0.f, v.y * s), fmaxf(0.f, v.z * s), fmaxf(0.f, v.w * s));
+    }
+    return;
+  }
+  if (i < n) x[i] = fmaxf(0.f, x[i] * s);
 }
 // act += the geometry features of a real template slot: the distogram (one-hot bins) projected,
 // and five scalar features each times a per-channel weight (AF3's num_input_dims=0).
@@ -590,6 +726,23 @@ __global__ void scatterRowsK(const int* idx, const float* val, float* dense, siz
 __global__ void templateGeometryK(float* act, const int* bin, const float* pb, const float* uv, const float* bb,
                                   const float* W0, const float* W1, const float* W4, const float* W5,
                                   const float* W6, const float* W7, size_t pairs, int C, size_t t0 = 0) {
+  if ((C & 3) == 0 && (t0 & 3) == 0) {
+    size_t t4 = (t0 >> 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x, c4 = (size_t)(C >> 2);
+    if (t4 >= pairs * c4) return;
+    int c = (int)(t4 % c4) << 2; size_t p = t4 / c4;
+    int b = bin[p];
+    float4 v = b >= 0 ? *(const float4*)(W0 + (size_t)b * C + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float pbp = pb[p], u0 = uv[p * 3], u1 = uv[p * 3 + 1], u2 = uv[p * 3 + 2], bbp = bb[p];
+    float4 w1 = *(const float4*)(W1 + c), w4 = *(const float4*)(W4 + c);
+    float4 w5 = *(const float4*)(W5 + c), w6 = *(const float4*)(W6 + c), w7 = *(const float4*)(W7 + c);
+    v.x += pbp * w1.x + u0 * w4.x + u1 * w5.x + u2 * w6.x + bbp * w7.x;
+    v.y += pbp * w1.y + u0 * w4.y + u1 * w5.y + u2 * w6.y + bbp * w7.y;
+    v.z += pbp * w1.z + u0 * w4.z + u1 * w5.z + u2 * w6.z + bbp * w7.z;
+    v.w += pbp * w1.w + u0 * w4.w + u1 * w5.w + u2 * w6.w + bbp * w7.w;
+    float4 a = *(const float4*)(act + (t4 << 2));
+    *(float4*)(act + (t4 << 2)) = make_float4(a.x + v.x, a.y + v.y, a.z + v.z, a.w + v.w);
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   t += t0;                        // (a sharded pair's held rows: pairs is their end)
   if (t >= pairs * C) return;
@@ -607,13 +760,39 @@ __global__ void templateGeometryK(float* act, const int* bin, const float* pb, c
 // residual under boltz2), the output LayerNorm, summed with the pass's repeat weight; the sum
 // divided by every slot, relu, projected.
 __global__ void tmplToHalfK(const float* x, half* y, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]);
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) {
+      float4 v = reinterpret_cast<const float4*>(x)[i];
+      half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+      uint2 w; w.x = *reinterpret_cast<uint32_t*>(&a); w.y = *reinterpret_cast<uint32_t*>(&b);
+      reinterpret_cast<uint2*>(y)[i] = w;
+    }
+    return;
+  }
+  if (i < n) y[i] = __float2half(x[i]);
 }
 __global__ void scaleK(float* x, float s, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = s * x[i];
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) {
+      float4 v = reinterpret_cast<const float4*>(x)[i];
+      reinterpret_cast<float4*>(x)[i] = make_float4(s * v.x, s * v.y, s * v.z, s * v.w);
+    }
+    return;
+  }
+  if (i < n) x[i] = s * x[i];
 }
 __global__ void addScaledK(float* y, const float* x, float s, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += s * x[i];
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0) {
+    if (i < (n >> 2)) {
+      float4 yv = reinterpret_cast<const float4*>(y)[i], xv = reinterpret_cast<const float4*>(x)[i];
+      reinterpret_cast<float4*>(y)[i] = make_float4(yv.x + s * xv.x, yv.y + s * xv.y, yv.z + s * xv.z, yv.w + s * xv.w);
+    }
+    return;
+  }
+  if (i < n) y[i] += s * x[i];
 }
 template <class T>
 void templateEmbedding(Trunk& t, float* out) {
@@ -690,7 +869,7 @@ void templateEmbedding(Trunk& t, float* out) {
   half* summed16 = nullptr;          // (parked: the sum in f16, made before the pair comes home)
   if (live != 1) CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
-  float* row = scratch<float>("tmpl.row", (size_t)n * Ct); float* col = scratch<float>("tmpl.col", (size_t)n * Ct);
+  float* rc = scratch<float>("tmpl.rc", 2 * (size_t)n * Ct); float* row = rc, *col = rc + (size_t)n * Ct;
   int nb = 0; while (M.has(P + "blocks." + std::to_string(nb) + ".pairTransition.transition1")) ++nb;
   // LOCALFOLD_TEMPLATE_BLOCKS=<n>: the stack truncated, to bisect against dump_af3_trunk_taps.py TEMPLATE_BLOCKS= / TEMPLATE_IDENTITY=1
   if (const char* cap = getenv("LOCALFOLD_TEMPLATE_BLOCKS")) nb = std::min(nb, atoi(cap));
@@ -713,14 +892,14 @@ void templateEmbedding(Trunk& t, float* out) {
       onehotK<<<blocks((size_t)n * 31), 256, 0, STREAM>>>(Idev(S + "aatype"), oh, n, 31);   // on the device: capturable
       linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
       linear<float, float>(oh, col, n, 31, Ct, P + "templatePairEmbedding3");
-      addRowColumnK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(actBase, row, col, n, Ct, hf * Ct, (hf + pairs) * Ct);
+      addRowColumnK<<<blocks((Ct & 3) == 0 ? (pairs * (Ct >> 2)) : (pairs * Ct)), 256, 0, STREAM>>>(actBase, row, col, n, Ct, hf * Ct, (hf + pairs) * Ct);
       if (M.has(S + "distogramBin")) {
         int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
         if (M.len(S + "distogramBin") != allPairs || (int)M.meta(S + "distogramBins") != bins) {
           fprintf(stderr, "%sdistogram: %zu pairs of %d bins, not %zu of %d\n", S.c_str(), M.len(S + "distogramBin"),
                   (int)M.meta(S + "distogramBins"), allPairs, bins); exit(1);
         }
-        templateGeometryK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(actBase, Idev(S + "distogramBin"), Fdev(S + "pseudoBetaMask2d"),
+        templateGeometryK<<<blocks((Ct & 3) == 0 ? (pairs * (Ct >> 2)) : (pairs * Ct)), 256, 0, STREAM>>>(actBase, Idev(S + "distogramBin"), Fdev(S + "pseudoBetaMask2d"),
           Fdev(S + "unitVector"), Fdev(S + "backboneMask2d"), W(P + "templatePairEmbedding0"), W(P + "templatePairEmbedding1"),
           W(P + "templatePairEmbedding4"), W(P + "templatePairEmbedding5"), W(P + "templatePairEmbedding6"),
           W(P + "templatePairEmbedding7"), hf + pairs, Ct, hf * Ct);
@@ -749,15 +928,16 @@ void templateEmbedding(Trunk& t, float* out) {
     // chai masks each template's output by its own coverage (pseudo-beta both ends, same chain)
     if (M.flag("trunk.dialect.chaiTemplates") && M.has(S + "pseudoBetaMask2d"))
       scaleRowsK<float><<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "pseudoBetaMask2d") + hf, pairs, Ct);
-    if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
-    else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
+    const size_t pc4 = ((pairs * Ct) & 3) == 0 ? ((pairs * Ct) >> 2) : (pairs * Ct);
+    if (live == 1) scaleK<<<blocks(pc4), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
+    else addScaledK<<<blocks(pc4), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
     if (parked) {
       releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
       // the activation (one pass: the sum itself) relu'd, divided and taken to f16 before the pair comes home - beside the
       // pair the f32 activation was the card's limit (512 bytes a pair at 7,800 tokens), the f16 one 384
-      reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
+      reluScaleK<<<blocks(pc4), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
       summed16 = scratch<half>("tmpl.sum16", pairs * Ct);
-      tmplToHalfK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, summed16, pairs * Ct);
+      tmplToHalfK<<<blocks(pc4), 256, 0, STREAM>>>(summed, summed16, pairs * Ct);
       releaseScratch({ "tmpl.act" }); act = summed = nullptr;
       unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair;
     }
@@ -771,7 +951,7 @@ void templateEmbedding(Trunk& t, float* out) {
   // divided by every slot (not the real ones), relu, projected (parked: already, and from f16)
   if (summed16) linearIntoPair<half>(summed16, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
   else {
-    reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
+    reluScaleK<<<blocks(((pairs * Ct) & 3) == 0 ? ((pairs * Ct) >> 2) : (pairs * Ct)), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
     linearIntoPair<float>(summed, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
   }
   if (tight) releaseScratch({ "p16." });     // (not held into the next pass's template stack, which binds there)
@@ -802,15 +982,21 @@ void outerProductMean(Trunk& t, const std::string& pre) {
   size_t rows = (size_t)S * n;
   T* ln = scratch<T>("opm.ln", rows * Cm);
   layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
-  T* L = scratch<T>("opm.left", rows * O); T* R = scratch<T>("opm.right", rows * O);
-  linear<T, T>(ln, L, rows, Cm, O, pre + ".leftProjection");
-  linear<T, T>(ln, R, rows, Cm, O, pre + ".rightProjection");
+  T* lr = scratch<T>("opm.lr", 2 * rows * O); T* L = lr; T* R = lr + rows * O;
+  {
+    std::string w = concatColumns(pre + ".lr~stack", 1, {{pre + ".leftProjection", Cm * O, false},
+                                                         {pre + ".rightProjection", Cm * O, false}});
+    const void* Wp; if constexpr (std::is_same_v<T, float>) Wp = W(w); else Wp = Wh(w);
+    const float one = 1.f, zero = 0.f;
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, O, (int)rows, Cm, &one, Wp, cudaType<T>(), O,
+       (long long)Cm * O, ln, cudaType<T>(), Cm, 0, &zero, lr, cudaType<T>(), O, (long long)rows * O, 2,
+       CUBLAS_COMPUTE_32F, std::is_same_v<T, float> && !F32_TF32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
   if (hasW(pre + ".leftProjectionBias")) {      // rosettafold3's biased projections, before the mask
     biasRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(L, W(pre + ".leftProjectionBias"), rows, O);
     biasRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(R, W(pre + ".rightProjectionBias"), rows, O);
   }
-  scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
-  scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
+  scaleRows<T>(L, t.msaMask, rows, O, R);
   // norm[i][j] = sum_s mask[s][i] mask[s][j]
   float* norm = scratch<float>("opm.norm", (size_t)n * n);
   const float one = 1.f, zero = 0.f;
@@ -835,7 +1021,7 @@ void outerProductMean(Trunk& t, const std::string& pre) {
         int bi = std::min(Bi, qhi - i0);
         CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, n * C, bi, K, &one, Tc, CUDA_R_16F, n * C, Lt + (size_t)i0 * K,
                         CUDA_R_16F, K, &zero, X, CUDA_R_32F, n * C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        WITH_PT(t.p16, opmAddK<PT><<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(pairBase(t), X, W(pre + ".outputB"), norm, i0, bi, n, C, after));
+        WITH_PT(t.p16, opmAddK<PT><<<blocks((C & 3) == 0 ? ((size_t)bi * n * (C >> 2)) : ((size_t)bi * n * C)), 256, 0, STREAM>>>(pairBase(t), X, W(pre + ".outputB"), norm, i0, bi, n, C, after));
       }
       return;
     }
@@ -861,7 +1047,7 @@ void outerProductMean(Trunk& t, const std::string& pre) {
       opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
     }
     linear<T, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
-    WITH_PT(t.p16, opmAddK<PT><<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(pairBase(t), X, W(pre + ".outputB"), norm, i0, bi, n,
+    WITH_PT(t.p16, opmAddK<PT><<<blocks((C & 3) == 0 ? ((size_t)bi * n * (C >> 2)) : ((size_t)bi * n * C)), 256, 0, STREAM>>>(pairBase(t), X, W(pre + ".outputB"), norm, i0, bi, n,
                                                            C, after));
   }
 }
@@ -908,8 +1094,7 @@ inline void groupedOuterProduct(Trunk& t, const std::string& pre) {
   float* L = scratch<float>("gopm.left", rows * O); float* R = scratch<float>("gopm.right", rows * O);
   linear<float, float>(ln, L, rows, Cm, O, pre + ".leftProjection");
   linear<float, float>(ln, R, rows, Cm, O, pre + ".rightProjection");
-  scaleRowsK<float><<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
-  scaleRowsK<float><<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
+  scaleRows<float>(L, t.msaMask, rows, O, R);
   float* Lg = scratch<float>("gopm.lg", rows * O); float* Rg = scratch<float>("gopm.rg", rows * O);
   groupMajorK<<<blocks(rows * O), 256, 0, STREAM>>>(L, Lg, S, n, G, K);
   groupMajorK<<<blocks(rows * O), 256, 0, STREAM>>>(R, Rg, S, n, G, K);
@@ -928,39 +1113,53 @@ inline void groupedOuterProduct(Trunk& t, const std::string& pre) {
     layerNormEpsK<<<(unsigned)(((size_t)bi * n + 7) / 8), 256, 0, STREAM>>>(Pp, bi * n, per, W(pre + ".productNormScale"),
                                                                            W(pre + ".productNormOffset"), 0.1f);
     linear<float, float>(Pp, X, (size_t)bi * n, per, C, pre + ".outputW");
-    addBiasK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(X, W(pre + ".outputB"), (size_t)bi * n, C);
-    WITH_PT(t.p16, pairAddK<PT, float><<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(
-      reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + (size_t)i0 * n * C), X, (size_t)bi * n * C));
+    size_t elems = (size_t)bi * n * C;
+    addBiasK<<<blocks(elems), 256, 0, STREAM>>>(X, W(pre + ".outputB"), (size_t)bi * n, C);
+    WITH_PT(t.p16, pairAddK<PT, float><<<blocks((elems & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(
+      reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + (size_t)i0 * n * C), X, elems));
   }
 }
-// logits[h][i][j] from [ij][h], key mask, softmax over j, in place
-__global__ void msaWeightsK(const float* flat, const float* keyMask, float* w, int n, int heads, int rows = 0) {
+// logits[h][i][j] from [ij][h] (or head-major [h][i][j] when headMajor), key mask, softmax over j, in place
+template <class T = float>
+__global__ void msaWeightsK(const float* flat, const float* keyMask, float* w, int n, int heads, int rows = 0,
+                            bool headMajor = false, T* outT = nullptr, int ldw = 0) {
   // rows: the query rows flat holds (a sharded pair's held rows; 0, all n)
-  const int R = rows ? rows : n;
-  size_t rowId = blockIdx.x; int h = (int)(rowId / R), i = (int)(rowId % R);
-  float* out = w + rowId * n;
-  __shared__ float red[32];
+  size_t rowId = blockIdx.x;
+  extern __shared__ float srow[];
+  float* out = (outT && n <= 4096) ? srow : w + rowId * n;
+  __shared__ float red[8];
   float mx = -INFINITY;
-  for (int j = threadIdx.x; j < n; j += blockDim.x) {
-    float v = flat[((size_t)i * n + j) * heads + h] + 1e9f * (keyMask[j] - 1.f);
-    out[j] = v; mx = fmaxf(mx, v);
+  if (headMajor) {
+    const float* fl = flat + rowId * n;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+      float v = fl[j] + 1e9f * (keyMask[j] - 1.f);
+      out[j] = v; mx = fmaxf(mx, v);
+    }
+  } else {
+    const int R = rows ? rows : n;
+    int h = (int)(rowId / R), i = (int)(rowId % R);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+      float v = flat[((size_t)i * n + j) * heads + h] + 1e9f * (keyMask[j] - 1.f);
+      out[j] = v; mx = fmaxf(mx, v);
+    }
   }
   for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = mx;
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
   __syncthreads();
-  if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY;
-    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o)); if (threadIdx.x == 0) red[0] = v; }
-  __syncthreads(); mx = red[0]; __syncthreads();
+  mx = fmaxf(fmaxf(red[0], red[2]), fmaxf(red[1], red[3]));
   float s = 0;
   for (int j = threadIdx.x; j < n; j += blockDim.x) { float e = expf(out[j] - mx); out[j] = e; s += e; }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+  if ((threadIdx.x & 31) == 0) red[4 + (threadIdx.x >> 5)] = s;
   __syncthreads();
-  if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o); if (threadIdx.x == 0) red[0] = v; }
-  __syncthreads();
-  float inv = 1.f / red[0];
-  for (int j = threadIdx.x; j < n; j += blockDim.x) out[j] *= inv;
+  float inv = 1.f / ((red[4] + red[6]) + (red[5] + red[7]));
+  if (outT) {
+    T* oT = outT + rowId * ldw;
+    for (int j = threadIdx.x; j < ldw; j += blockDim.x)
+      oT[j] = j < n ? fromF<T>(out[j] * inv) : fromF<T>(0.f);
+  } else {
+    for (int j = threadIdx.x; j < n; j += blockDim.x) out[j] *= inv;
+  }
 }
 __global__ void keyMaskK(const float* msaMask, float* keyMask, int S, int n) {
   int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= n) return;
@@ -1072,43 +1271,61 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
   const size_t rows = (size_t)S * n, hp = heldPairs(t);
   T* ln = scratch<T>("msaatt.ln", rows * Cm);
   layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
-  size_t per = std::max<size_t>(1, std::min(std::max<size_t>(hp, 1), CHUNK / C));
-  T* pln = scratch<T>("msaatt.pln", per * C);
   float* flat = scratch<float>("msaatt.flat", std::max<size_t>(hp, 1) * heads);
-  for (size_t r0 = 0; r0 < hp; r0 += per) {
-    size_t r = std::min(per, hp - r0);
-    layerNormPairRows<T>(t.pair, t.p16, r0, pln, r, C, pre + ".pairNormScale", pre + ".pairNormOffset");
-    linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
+  bool headMajor = false;
+  if constexpr (std::is_same_v<T, half>) {
+    if (hp && !shortPair(hp, C)) {
+      PAIR16 = t.p16;
+      headMajor = lnNormHeads(t.pair, nullptr, flat, hp, C, heads, pre + ".pairNormScale",
+                              pre + ".pairNormOffset", pre + ".pairLogits");
+      PAIR16 = false;
+    }
+  }
+  if (!headMajor) {
+    size_t per = std::max<size_t>(1, std::min(std::max<size_t>(hp, 1), CHUNK / C));
+    T* pln = scratch<T>("msaatt.pln", per * C);
+    for (size_t r0 = 0; r0 < hp; r0 += per) {
+      size_t r = std::min(per, hp - r0);
+      layerNormPairRows<T>(t.pair, t.p16, r0, pln, r, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+      linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
+    }
   }
   float* keyMask = scratch<float>("msaatt.keymask", n);
   if (M.flag("trunk.dialect.chaiMsaFeatures")) { fprintf(stderr, "a sharded pair: not chai-1's MSA features\n"); exit(1); }
   keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
   const int ldw = std::is_same_v<T, float> ? n : (n + 7) / 8 * 8;
-  float* w = scratch<float>("msaatt.w", (size_t)heads * std::max(ni, 1) * n);
-  T* wT = scratch<T>("msaatt.wh", (size_t)heads * std::max(ni, 1) * ldw);
+  float* w = (std::is_same_v<T, float> || n > 4096) ? scratch<float>("msaatt.w", (size_t)heads * std::max(ni, 1) * n) : nullptr;
+  T* wT = std::is_same_v<T, float> ? reinterpret_cast<T*>(w) : scratch<T>("msaatt.wh", (size_t)heads * std::max(ni, 1) * ldw);
   if (ni) {
-    msaWeightsK<<<(unsigned)(heads * ni), 128, 0, STREAM>>>(flat, keyMask, w, n, heads, ni);
-    castRowsPadK<T><<<blocks((size_t)heads * ni * ldw), 256, 0, STREAM>>>(w, wT, (size_t)heads * ni, n, ldw);
+    if constexpr (std::is_same_v<T, float>)
+      msaWeightsK<<<(unsigned)(heads * ni), 128, 0, STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor);
+    else
+      msaWeightsK<T><<<(unsigned)(heads * ni), 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, ni, headMajor, wT, ldw);
   }
   int Sc = (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd)));
-  T* v = scratch<T>("msaatt.v", (size_t)Sc * n * Wd);
+  T* vg = scratch<T>("msaatt.vg", 2 * (size_t)Sc * n * Wd);
+  T* v = vg;
+  T* gate = vg + (size_t)Sc * n * Wd;
   T* vh = scratch<T>("msaatt.vh", (size_t)Sc * ldw * Wd);
   T* oh = scratch<T>("msaatt.oh", (size_t)Sc * std::max(ni, 1) * Wd);
-  T* gate = scratch<T>("msaatt.gate", (size_t)Sc * n * Wd);
   T* gated = scratch<T>("msaatt.gated", (size_t)Sc * std::max(ni, 1) * Wd);
   float* x = scratch<float>("msaatt.x", (size_t)Sc * std::max(ni, 1) * Cm);
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  std::string wvg = concatColumns(pre + ".vg~stack", 1, {{pre + ".vProjection", Cm * Wd, false},
+                                                         {pre + ".gatingQuery", Cm * Wd, false}});
+  const void* Wvg; if constexpr (std::is_same_v<T, float>) Wvg = W(wvg); else Wvg = Wh(wvg);
   for (int s0 = 0; s0 < S && ni; s0 += Sc) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * n;
     const T* lnc = ln + (size_t)s0 * n * Cm;
-    linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, Wd, (int)cr, Cm, &one, Wvg, cudaType<T>(), Wd,
+       (long long)Cm * Wd, lnc, cudaType<T>(), Cm, 0, &zero, vg, cudaType<T>(), Wd, (long long)Sc * n * Wd, 2,
+       CUBLAS_COMPUTE_32F, std::is_same_v<T, float> && !F32_TF32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     msaVToHeads<T>(v, vh, sc, n, heads, d, ldw);
     // per head: O_h (ni x sc*d) = W_h (ni x n) V_h (n x sc*d); col-major O^T = V^T W^T
     CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, ni, ldw, &one, vh, cudaType<T>(), sc * d,
        (size_t)ldw * sc * d, wT, cudaType<T>(), ldw, (size_t)ni * ldw, &zero, oh, cudaType<T>(), sc * d, (size_t)ni * sc * d, heads,
        CUBLAS_COMPUTE_32F, algo));
-    linear<T, T>(lnc, gate, cr, Cm, Wd, pre + ".gatingQuery");
     msaFromHeadsRowsK<T><<<blocks((size_t)sc * ni * Wd), 256, 0, STREAM>>>(oh, gate, gated, sc, n, i0, ni, heads, d);
     linear<T, float>(gated, x, (size_t)sc * ni, Wd, Cm, pre + ".outputProjection");
     addMsaColsK<<<blocks((size_t)sc * ni * Cm), 256, 0, STREAM>>>(t.msa + (size_t)s0 * n * Cm, x, sc, n, i0, ni, Cm);
@@ -1142,30 +1359,42 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   T* ln = scratch<T>("msaatt.ln", rows * Cm);
   layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
   if (!parallelTransition.empty()) transition<T>(t.msa, rows, Cm, 4, parallelTransition);
-  // the pair's LayerNorm feeds only the bias projection: on a card short of room it is taken in row chunks
-  size_t per = shortPair(pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
-  T* pln = scratch<T>("msaatt.pln", per * C);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
-  for (size_t r0 = 0; r0 < pairs; r0 += per) {
-    size_t r = std::min(per, pairs - r0);
-    layerNormPairRows<T>(t.pair, t.p16, r0, pln, r, C, pre + ".pairNormScale", pre + ".pairNormOffset");
-    linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
+  bool headMajor = false;
+  if constexpr (std::is_same_v<T, half>) {
+    if (!shortPair(pairs, C)) {
+      PAIR16 = t.p16;
+      headMajor = lnNormHeads(t.pair, nullptr, flat, pairs, C, heads, pre + ".pairNormScale",
+                              pre + ".pairNormOffset", pre + ".pairLogits");
+      PAIR16 = false;
+    }
+  }
+  if (!headMajor) {
+    // the pair's LayerNorm feeds only the bias projection: on a card short of room it is taken in row chunks
+    size_t per = shortPair(pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
+    T* pln = scratch<T>("msaatt.pln", per * C);
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNormPairRows<T>(t.pair, t.p16, r0, pln, r, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+      linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
+    }
   }
   float* keyMask = scratch<float>("msaatt.keymask", n);
   // chai: the logits masked by the TOKEN pair mask, not by the alignment's coverage; the values zeroed instead
   const bool chaiMask = M.flag("trunk.dialect.chaiMsaFeatures");
   if (chaiMask) CK(cudaMemcpyAsync(keyMask, t.seqMask, n * 4, cudaMemcpyDeviceToDevice, STREAM));
   else keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
-  float* w = scratch<float>("msaatt.w", (size_t)heads * pairs);
-  msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads);
+  float* w = (std::is_same_v<T, float> || n > 4096) ? scratch<float>("msaatt.w", (size_t)heads * pairs) : nullptr;
   const T* wT; int ldw = n;
-  if constexpr (std::is_same_v<T, float>) wT = w;
-  else {
+  if constexpr (std::is_same_v<T, float>) {
+    msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor);
+    wT = w;
+  } else {
     // rows padded to a multiple of 8 halves, and the GEMM's K with them: at a token count that is not one, cuBLAS
     // could only take the GEMM below on its align-1 kernels (261 tokens: 0.27 ms a call, sm75's own kernel)
     ldw = (n + 7) / 8 * 8;
     T* wh = scratch<T>("msaatt.wh", (size_t)heads * n * ldw);
-    castRowsPadK<T><<<blocks((size_t)heads * n * ldw), 256, 0, STREAM>>>(w, wh, (size_t)heads * n, n, ldw);
+    msaWeightsK<T><<<(unsigned)(heads * n), 128, (n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(flat, keyMask, w, n, heads, 0, headMajor, wh, ldw);
     wT = wh;
   }
   // the values, the per-head weighted sums, the gate and the output - each MSA row's own, so on a card short of
@@ -1173,25 +1402,30 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   // under LOCALFOLD_BIG a third of the rows, so a small input crosses blocks
   int Sc = shortPair(pairs, C) ? (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd))) : S;
   if (BIG_FORCED) Sc = std::max(1, std::min(Sc, (S + 2) / 3));
-  T* v = scratch<T>("msaatt.v", (size_t)Sc * n * Wd);
+  T* vg = scratch<T>("msaatt.vg", 2 * (size_t)Sc * n * Wd);
+  T* v = vg;
+  T* gate = vg + (size_t)Sc * n * Wd;
   T* vh = scratch<T>("msaatt.vh", (size_t)Sc * ldw * Wd);
   T* oh = scratch<T>("msaatt.oh", (size_t)Sc * n * Wd);
-  T* gate = scratch<T>("msaatt.gate", (size_t)Sc * n * Wd);
   T* gated = scratch<T>("msaatt.gated", (size_t)Sc * n * Wd);
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  std::string wvg = concatColumns(pre + ".vg~stack", 1, {{pre + ".vProjection", Cm * Wd, false},
+                                                         {pre + ".gatingQuery", Cm * Wd, false}});
+  const void* Wvg; if constexpr (std::is_same_v<T, float>) Wvg = W(wvg); else Wvg = Wh(wvg);
   for (int s0 = 0; s0 < S; s0 += Sc) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * n;
     const T* lnc = ln + (size_t)s0 * n * Cm;
-    linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
-    if (chaiMask) scaleRowsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, t.msaMask + (size_t)s0 * n, cr, Wd);
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, Wd, (int)cr, Cm, &one, Wvg, cudaType<T>(), Wd,
+       (long long)Cm * Wd, lnc, cudaType<T>(), Cm, 0, &zero, vg, cudaType<T>(), Wd, (long long)Sc * n * Wd, 2,
+       CUBLAS_COMPUTE_32F, std::is_same_v<T, float> && !F32_TF32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    if (chaiMask) scaleRows<T>(v, t.msaMask + (size_t)s0 * n, cr, Wd);
     msaVToHeads<T>(v, vh, sc, n, heads, d, ldw);
     // per head: O_h (n x sc*d) = W_h (n x n) V_h (n x sc*d); col-major O^T = V^T W^T
     // (K = ldw: the weights' padded columns and the values' padded rows are zero)
     CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, n, ldw, &one, vh, cudaType<T>(), sc * d,
        (size_t)ldw * sc * d, wT, cudaType<T>(), ldw, (size_t)n * ldw, &zero, oh, cudaType<T>(), sc * d, (size_t)n * sc * d, heads,
        CUBLAS_COMPUTE_32F, algo));
-    linear<T, T>(lnc, gate, cr, Cm, Wd, pre + ".gatingQuery");
     msaFromHeads<T>(oh, gate, gated, sc, n, heads, d);
     linear<T, float>(gated, t.msa + (size_t)s0 * n * Cm, cr, Wd, Cm, pre + ".outputProjection", false, 1.f);
   }
@@ -1241,29 +1475,101 @@ __global__ void singleSoftmaxK(const float* logits, const float* pairLogits, con
   if (!ld) ld = n;
   size_t rowId = blockIdx.x;
   const float* L = logits + rowId * ld; const float* B = pairLogits + rowId * n;
-  __shared__ float red[32];
+  if (blockDim.x == 32 && n <= 256) {
+    int lane = threadIdx.x;
+    float rv[8];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      int j = lane + k * 32;
+      if (j < n) {
+        float v = L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f);
+        rv[k] = v;
+        mx = fmaxf(mx, v);
+      }
+    }
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    float sum = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      int j = lane + k * 32;
+      if (j < n) {
+        float e = expf(rv[k] - mx);
+        rv[k] = e;
+        sum += e;
+      }
+    }
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    float inv = 1.f / sum;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      int j = lane + k * 32;
+      if (j < ld) P[rowId * ld + j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
+    }
+    return;
+  }
+  extern __shared__ float srow[];
+  __shared__ float red[8];
   float mx = -INFINITY;
-  for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f));
+  if (n <= 4096) {
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+      float v = L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f);
+      srow[j] = v;
+      mx = fmaxf(mx, v);
+    }
+  } else {
+    for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f));
+  }
   for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = mx;
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
   __syncthreads();
-  if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY;
-    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o)); if (threadIdx.x == 0) red[0] = v; }
-  __syncthreads(); mx = red[0]; __syncthreads();
+  mx = fmaxf(fmaxf(red[0], red[2]), fmaxf(red[1], red[3]));
   float sum = 0;
-  for (int j = threadIdx.x; j < n; j += blockDim.x) sum += expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx);
+  if (n <= 4096) {
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+      float e = expf(srow[j] - mx);
+      srow[j] = e;
+      sum += e;
+    }
+  } else {
+    for (int j = threadIdx.x; j < n; j += blockDim.x) sum += expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx);
+  }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = sum;
+  if ((threadIdx.x & 31) == 0) red[4 + (threadIdx.x >> 5)] = sum;
   __syncthreads();
-  if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o); if (threadIdx.x == 0) red[0] = v; }
-  __syncthreads();
-  float inv = 1.f / red[0];
-  for (int j = threadIdx.x; j < ld; j += blockDim.x)
-    P[rowId * ld + j] = j < n ? fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv) : fromF<T>(0.f);
+  float inv = 1.f / ((red[4] + red[6]) + (red[5] + red[7]));
+  if (n <= 4096) {
+    for (int j = threadIdx.x; j < ld; j += blockDim.x)
+      P[rowId * ld + j] = j < n ? fromF<T>(srow[j] * inv) : fromF<T>(0.f);
+  } else {
+    for (int j = threadIdx.x; j < ld; j += blockDim.x)
+      P[rowId * ld + j] = j < n ? fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv) : fromF<T>(0.f);
+  }
 }
 template <class T>
-__global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd) {
+__global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd, int ldn = 0) {
+  if constexpr (std::is_same_v<T, half>) {
+    if ((Wd & 7) == 0) {
+      const unsigned Wd8 = (unsigned)Wd >> 3, nq = (unsigned)n * Wd8;
+      const unsigned pad8 = ldn > n ? (unsigned)(ldn - n) * 4 * Wd8 : 0;
+      const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+      if (idx >= nq) {
+        if (idx < nq + pad8) *reinterpret_cast<uint4*>(qkvg + (size_t)n * 4 * Wd + ((size_t)(idx - nq) << 3)) = make_uint4(0, 0, 0, 0);
+        return;
+      }
+      const unsigned i = idx / Wd8, c = (idx - i * Wd8) << 3;
+      uint4 qv = *reinterpret_cast<const uint4*>(qkvg + ((size_t)i * 4 * Wd + c));
+      float4 b0 = *reinterpret_cast<const float4*>(b + c), b1 = *reinterpret_cast<const float4*>(b + c + 4);
+      half2* q2 = reinterpret_cast<half2*>(&qv);
+      float2 x0 = __half22float2(q2[0]), x1 = __half22float2(q2[1]), x2 = __half22float2(q2[2]), x3 = __half22float2(q2[3]);
+      q2[0] = __floats2half2_rn(x0.x + b0.x, x0.y + b0.y);
+      q2[1] = __floats2half2_rn(x1.x + b0.z, x1.y + b0.w);
+      q2[2] = __floats2half2_rn(x2.x + b1.x, x2.y + b1.y);
+      q2[3] = __floats2half2_rn(x3.x + b1.z, x3.y + b1.w);
+      *reinterpret_cast<uint4*>(qkvg + ((size_t)i * 4 * Wd + c)) = qv;
+      return;
+    }
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * Wd) return;
   size_t i = t / Wd; int c = (int)(t % Wd);
@@ -1271,6 +1577,24 @@ __global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd) {
 }
 template <class T>
 __global__ void gateK(T* o, const T* qkvg, int n, int Wd, float gateBias = 0.f) {
+  if constexpr (std::is_same_v<T, half>) {
+    if ((Wd & 7) == 0) {
+      const unsigned Wd8 = (unsigned)Wd >> 3, idx = blockIdx.x * blockDim.x + threadIdx.x;
+      if (idx >= (unsigned)n * Wd8) return;
+      const unsigned i = idx / Wd8, c = (idx - i * Wd8) << 3;
+      uint4 ov = reinterpret_cast<const uint4*>(o)[idx];
+      uint4 gv = *reinterpret_cast<const uint4*>(qkvg + ((size_t)i * 4 * Wd + 3 * Wd + c));
+      half2* o2 = reinterpret_cast<half2*>(&ov);
+      const half2* g2 = reinterpret_cast<const half2*>(&gv);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float2 x = __half22float2(o2[k]), g = __half22float2(g2[k]);
+        o2[k] = __floats2half2_rn(x.x * sigm(g.x + gateBias), x.y * sigm(g.y + gateBias));
+      }
+      reinterpret_cast<uint4*>(o)[idx] = ov;
+      return;
+    }
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * Wd) return;
   size_t i = t / Wd; int c = (int)(t % Wd);
@@ -1278,8 +1602,23 @@ __global__ void gateK(T* o, const T* qkvg, int n, int Wd, float gateBias = 0.f) 
 }
 // OpenDDE's refiner and confidence blocks add one precomputed [i][j] bias to every head's logits
 __global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int heads) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < pairs * heads) pl[t] += bias[t % pairs];
+  size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((pairs & 3) == 0) {
+    size_t p4 = pairs >> 2;
+    if (p >= p4) return;
+    float4 b = reinterpret_cast<const float4*>(bias)[p];
+    for (int h = 0; h < heads; ++h) {
+      float4* dst = reinterpret_cast<float4*>(pl + (size_t)h * pairs) + p;
+      float4 v = *dst;
+      v.x += b.x; v.y += b.y; v.z += b.z; v.w += b.w;
+      *dst = v;
+    }
+    return;
+  }
+  if (p < pairs) {
+    float b = bias[p];
+    for (int h = 0; h < heads; ++h) pl[(size_t)h * pairs + p] += b;
+  }
 }
 template <class T>
 void singleTrack(float* single, const float* pair, const float* seqMask, int n, int C, int Cs,
@@ -1325,7 +1664,8 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
     T* o = sharded ? (T*)oS->local : scratch<T>("st.o", (size_t)n * Wd);
     layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
     linear<T, T>(nrm, qkvg, n, Cs, 4 * Wd, qkvgWeight(A, Cs, Wd, false));
-    addQBiasK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
+    const size_t qbElems = (std::is_same_v<T, half> && (Wd & 7) == 0) ? (size_t)n * (Wd >> 3) : (size_t)n * Wd;
+    addQBiasK<T><<<blocks(qbElems), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
     const float one = 1.f, zero = 0.f;
     auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
     float* flat = nullptr; T* ln = nullptr;
@@ -1335,14 +1675,20 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       const float* prow = pair16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(pair) + pr)
                                  : pair + pr;                        // (a bf16 pair's rows are C halves)
       bool fusedHeads = false;
-      if constexpr (std::is_same_v<T, half>)
+      if constexpr (std::is_same_v<T, half>) {
         if (C == 128 && heads == 16) {
           PAIR16 = pair16;
           lnHeads128<16>(prow, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
                          B + ".singlePairLogitsProjection", pl, rows);
           PAIR16 = false;
           fusedHeads = true;
+        } else {
+          PAIR16 = pair16;
+          fusedHeads = lnNormHeads(prow, nullptr, pl, rows, C, heads, B + ".singlePairLogitsNormScale",
+                                   B + ".singlePairLogitsNormOffset", B + ".singlePairLogitsProjection");
+          PAIR16 = false;
         }
+      }
       if (!fusedHeads) {
         if (!flat) { flat = scratch<float>("st.flat", (size_t)heads * R * n); ln = scratch<T>("st.ln", (size_t)R * n * C); }
         if (pair16)        // (a bf16 pair's rows, normed by the kernel that reads them)
@@ -1356,28 +1702,34 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, r, d, &one,
          qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg + (size_t)i0 * 4 * Wd, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, n,
          rows, heads, CUBLAS_COMPUTE_32F, algo));
-      singleSoftmaxK<T><<<(unsigned)(heads * r), 128, 0, STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d));
+      singleSoftmaxK<T><<<(unsigned)(heads * r), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d));
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, r, n, &one,
          qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, rows, &zero, o + (size_t)i0 * Wd, cudaType<T>(),
          Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
     }
     if (sharded)       // every rank's rows of o
       mg::allGather(*oS, (size_t)qlo * Wd * sizeof(T), (size_t)(qhi - qlo) * Wd * sizeof(T));
-    gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
+    gateK<T><<<blocks(qbElems), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
     linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
     singleTransition();
     return;
   }
   float* pl = scratch<float>("st.pl", pairs * heads);
-  bool fused = false;
-  if constexpr (std::is_same_v<T, half>)
+  bool fused = false, extraFused = false;
+  if constexpr (std::is_same_v<T, half>) {
     if (C == 128 && heads == 16) {     // one kernel: LN, the projection, the head-major layout
       PAIR16 = pair16;
       lnHeads128<16>(pair, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
-                     B + ".singlePairLogitsProjection", pl, pairs);
+                     B + ".singlePairLogitsProjection", pl, pairs, extraBias);
       PAIR16 = false;
-      fused = true;
+      fused = extraFused = true;
+    } else {
+      PAIR16 = pair16;
+      fused = lnNormHeads(pair, nullptr, pl, pairs, C, heads, B + ".singlePairLogitsNormScale",
+                          B + ".singlePairLogitsNormOffset", B + ".singlePairLogitsProjection");
+      PAIR16 = false;
     }
+  }
   if (!fused) {
     float* flat = scratch<float>("st.flat", pairs * heads);
     size_t rowsPer = std::max<size_t>(1, CHUNK / C);
@@ -1391,16 +1743,19 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
     }
     logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);
   }
-  if (extraBias) addBiasHeadsK<<<blocks(pairs * heads), 256, 0, STREAM>>>(pl, extraBias, pairs, heads);
+  if (extraBias && !extraFused) addBiasHeadsK<<<blocks((pairs & 3) == 0 ? (pairs >> 2) : pairs), 256, 0, STREAM>>>(pl, extraBias, pairs, heads);
   // the scores' and probabilities' rows padded to a multiple of 8 in f16, and P V's K with them (P's padded columns
   // and qkvg's padded rows zero): at a token count that is not one, cuBLAS took both GEMMs on its align-1 kernels
   const int ldn = std::is_same_v<T, half> ? (n + 7) / 8 * 8 : n;
   T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
   T* qkvg = scratch<T>("st.qkvg", (size_t)ldn * 4 * Wd);
-  if (ldn != n) CK(cudaMemsetAsync(qkvg + (size_t)n * 4 * Wd, 0, (size_t)(ldn - n) * 4 * Wd * sizeof(T), STREAM));
+  const bool vecQ = std::is_same_v<T, half> && (Wd & 7) == 0;
+  if (ldn != n && !vecQ) CK(cudaMemsetAsync(qkvg + (size_t)n * 4 * Wd, 0, (size_t)(ldn - n) * 4 * Wd * sizeof(T), STREAM));
   layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
   linear<T, T>(nrm, qkvg, n, Cs, 4 * Wd, qkvgWeight(A, Cs, Wd, false));
-  addQBiasK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
+  const size_t qbElems = vecQ ? (size_t)n * (Wd >> 3) : (size_t)n * Wd;
+  const size_t qbPadElems = vecQ ? (size_t)(n + (ldn - n) * 4) * (Wd >> 3) : qbElems;
+  addQBiasK<T><<<blocks(qbPadElems), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd, ldn);
   float* logits = scratch<float>("st.logits", (size_t)heads * n * ldn);
   T* P = scratch<T>("st.P", (size_t)heads * n * ldn);
   T* o = scratch<T>("st.o", (size_t)n * Wd);
@@ -1409,11 +1764,11 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, ldn, n, d, &one,
      qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, ldn,
      (size_t)n * ldn, heads, CUBLAS_COMPUTE_32F, algo));
-  singleSoftmaxK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d), ldn);
+  singleSoftmaxK<T><<<(unsigned)(heads * n), (n <= 256 ? 32 : 128), (n > 256 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d), ldn);
   CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, n, ldn, &one,
      qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), ldn, (size_t)n * ldn, &zero, o, cudaType<T>(),
      Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
-  gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
+  gateK<T><<<blocks(qbElems), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
   linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
   singleTransition();
 }
@@ -1477,8 +1832,8 @@ inline void distogramHalfP(const float* pair, bool p16, float* half_, size_t row
   size_t per = std::max<size_t>(1, std::min(rows, CHUNK / C));
   float* f = scratch<float>("disto.f32", per * C);
   for (size_t r0 = 0; r0 < rows; r0 += per) {
-    size_t r = std::min(per, rows - r0);
-    pairRowsF32K<<<blocks(r * C), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, f, r * C);
+    size_t r = std::min(per, rows - r0), elems = r * C;
+    pairRowsF32K<<<blocks((elems & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(pair) + r0 * C, f, elems);
     distogramHalf(f, half_ + r0 * bins, r, C, bins);
   }
 }
@@ -1569,7 +1924,7 @@ inline const int* contactBinsDevice(int n, int bins) {
   for (int i = 0; i < bins - 1; ++i) breaks[i] = (float)(2.3125 + (21.6875 - 2.3125) * i / (double)(bins - 2));
   double spacing = (double)breaks[bins - 2] - (double)breaks[bins - 3];
   auto top = [&](int bin) { return bin < bins - 1 ? (double)breaks[bin] : (double)breaks[bins - 2] + spacing; };
-  std::vector<int> table(CONTACT_CLASSES * CONTACT_CLASSES);
+  int table[CONTACT_CLASSES * CONTACT_CLASSES];
   for (int a = 0; a < CONTACT_CLASSES; ++a)
     for (int b = 0; b < CONTACT_CLASSES; ++b) {
       double angstroms = contactAngstroms(a, b);
@@ -1577,8 +1932,8 @@ inline const int* contactBinsDevice(int n, int bins) {
       while (count <= bins - 1 && top(count) <= angstroms + 1e-3) ++count;
       table[a * CONTACT_CLASSES + b] = count;
     }
-  int* tableDev = scratch<int>("contact.table", table.size());
-  CK(cudaMemcpyAsync(tableDev, table.data(), table.size() * sizeof(int), cudaMemcpyHostToDevice, STREAM));
+  int* tableDev = scratch<int>("contact.table", CONTACT_CLASSES * CONTACT_CLASSES);
+  CK(cudaMemcpyAsync(tableDev, table, sizeof(table), cudaMemcpyHostToDevice, STREAM));
   int* out = scratch<int>("contact.bins", (size_t)n * n);
   contactBinsK<<<blocks((size_t)n * n), 256, 0, STREAM>>>(Idev("batch.contactClasses"), tableDev, out, n);
   return out;
@@ -1694,14 +2049,14 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
     CK(cudaMemcpyAsync(zIn, t.pair, zBytes, cudaMemcpyDefault, STREAM));
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
-  if (zIn && !zHost) WITH_PT(t.p16, pairAddK<PT, PT><<<blocks(zElems), 256, 0, STREAM>>>(t.pair, reinterpret_cast<const PT*>(zIn), zElems));
+  if (zIn && !zHost) WITH_PT(t.p16, pairAddK<PT, PT><<<blocks((zElems & 3) == 0 ? (zElems >> 2) : zElems), 256, 0, STREAM>>>(t.pair, reinterpret_cast<const PT*>(zIn), zElems));
   else if (zIn) WITH_PT(t.p16, {
     const size_t per = std::min(zElems, CHUNK);
     PT* back = scratch<PT>("trunk.zBack", per);
     for (size_t e0 = 0; e0 < zElems; e0 += per) {
       const size_t e = std::min(per, zElems - e0);
       CK(cudaMemcpyAsync(back, reinterpret_cast<const PT*>(zIn) + e0, e * sizeof(PT), cudaMemcpyHostToDevice, STREAM));
-      pairAddK<PT, PT><<<blocks(e), 256, 0, STREAM>>>(reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + e0), back, e);
+      pairAddK<PT, PT><<<blocks((e & 3) == 0 ? (e >> 2) : e), 256, 0, STREAM>>>(reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + e0), back, e);
     }
     releaseScratch({ "trunk.zBack" });
   });

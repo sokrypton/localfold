@@ -70,9 +70,11 @@ inline size_t poolIdle() {
   CK(cudaMemPoolGetAttribute(scratchPool(), cudaMemPoolAttrUsedMemCurrent, &used));
   return last = reserved > used ? reserved - used : 0;
 }
+inline uint64_t MEM_GEN = 1;
 inline void deviceMemInfo(size_t* f, size_t* t) { CK(cudaMemGetInfo(f, t)); *f += poolIdle(); }
-inline void trimPool() { CK(cudaDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
+inline void trimPool() { ++MEM_GEN; CK(cudaDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
 template <class P> cudaError_t devMalloc(P** p, size_t bytes) {
+  ++MEM_GEN;
   cudaError_t e = cudaMalloc((void**)p, bytes);
   if (e == cudaErrorMemoryAllocation && poolIdle()) { cudaGetLastError(); trimPool(); e = cudaMalloc((void**)p, bytes); }
   return e;
@@ -107,7 +109,9 @@ struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, ds
 struct GPart { int rec, op, rank, nsrc; size_t dims[6], dst; long long dstStride[6]; int src[2]; size_t srcOff[2]; long long srcStride[2][6]; };
 struct GPartD { unsigned long long n, dst, off[2], dims[6]; long long ds[6], ss[2][6]; int rank, op; };
 __global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* out) {
-  GPartD p = parts[blockIdx.y];
+  __shared__ GPartD p;
+  if (threadIdx.x == 0) p = parts[blockIdx.y];
+  __syncthreads();
   for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < p.n;
        o += (unsigned long long)gridDim.x * blockDim.x) {
     unsigned long long r = o; long long d = (long long)p.dst, a = (long long)p.off[0], b = (long long)p.off[1];
@@ -842,6 +846,22 @@ struct Model {
     std::vector<float> out(b.elements, 0.f);
     if (b.kind == 4) return out;
     if (b.kind == 8) return s.consts[b.byteOffset];
+    if (b.kind == 0 || b.kind == 1) {
+      size_t es = b.kind == 0 ? 4 : 2, nb = b.elements * es, off = b.byteOffset + b.first * es;
+      std::string path = shardPath(s, s.files[b.file]);
+      int fd = open(path.c_str(), O_RDONLY);
+      if (fd < 0) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+      std::vector<unsigned char> raw(nb);
+      for (size_t got = 0; got < nb;) {
+        ssize_t r = pread(fd, raw.data() + got, nb - got, (off_t)(off + got));
+        if (r <= 0) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+        got += (size_t)r;
+      }
+      close(fd);
+      if (b.kind == 0) memcpy(out.data(), raw.data(), nb);
+      else for (size_t o = 0; o < b.elements; ++o) out[o] = hostHalf(&raw[2 * o]);
+      return out;
+    }
     std::vector<unsigned char> raw = readFile(shardPath(s, s.files[b.file]));
     for (size_t o = 0; o < b.elements; ++o) {
       size_t i = b.first + o;
@@ -929,7 +949,7 @@ struct Model {
     float* fresh; CK(devMalloc(&fresh, std::max<size_t>(at, 1) * 4));
     for (auto& m : moves) CK(cudaMemcpyAsync(fresh + m[1], s.device + m[0], m[2] * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaStreamSynchronize(STREAM));
-    CK(cudaFree(s.device));
+    CK(cudaFree(s.device)); ++MEM_GEN;
     size_t freed = s.deviceBytes - at * 4;
     s.device = fresh; s.deviceBytes = at * 4;
     for (Entry* e : dropped) e->devOffset = DROPPED;
@@ -1016,7 +1036,7 @@ struct Model {
   // bundleUp copied, a tensor at a time through one pinned buffer
   size_t parkResident() {
     size_t freed = 0;
-    for (auto& s : segs) if (s.resident) { CK(cudaFree(s.resident)); s.resident = nullptr; freed += s.residentBytes; }
+    for (auto& s : segs) if (s.resident) { CK(cudaFree(s.resident)); s.resident = nullptr; freed += s.residentBytes; ++MEM_GEN; }
     return freed;
   }
   bool residentParked() const { for (auto& s : segs) if (s.residentBytes && !s.resident) return true; return false; }
@@ -1112,6 +1132,15 @@ template <class T> T* dallocT(size_t n) {
   return p;
 }
 inline float* dalloc(size_t n) { return dallocT<float>(n); }
+template <class T> T* poolAllocT(size_t n) {
+  ++MEM_GEN;
+  T* p; size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
+  cudaError_t e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
+  if (e != cudaSuccess) { cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM); }
+  if (e != cudaSuccess) { scratchReportOOM("a pool allocation", bytes); exit(1); }
+  return p;
+}
+inline float* poolAlloc(size_t n) { return poolAllocT<float>(n); }
 template <class T> T* upload(const T* h, size_t n) {
   T* p = dallocT<T>(n); CK(cudaMemcpy(p, h, n * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
@@ -1122,7 +1151,7 @@ inline std::map<std::string, std::pair<void*, size_t>> SCRATCH;
 inline uint64_t SCRATCH_RELEASES = 0;   // bumped by every give-back: a buffer asked for again may come back at the SAME
                                         // address holding another stage's data, so "same pointer" is not "same contents"
 inline void releaseScratch() {
-  ++SCRATCH_RELEASES;
+  ++SCRATCH_RELEASES; ++MEM_GEN;
   CK(cudaDeviceSynchronize());
   for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
 }
@@ -1200,7 +1229,7 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
     if (!scratchNameMatches(name, names) && !slots.count(name)) continue;
-    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; }
+    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; ++MEM_GEN; }
     CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
   }
 }
@@ -1209,12 +1238,20 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
 // under any of `held` already counts toward it, since the whole form would reuse it.
 inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) {
   if (BIG_FORCED) return false;
-  std::set<std::string> counted;
+  const void* seen[16]; int nSeen = 0;
   for (const char* p : held) {
     auto it = SCRATCH.find(heldAs(p));
-    if (it != SCRATCH.end() && counted.insert(it->first).second) bytes -= std::min(bytes, it->second.second);
+    if (it == SCRATCH.end()) continue;
+    const void* ptr = &it->second;
+    bool dup = false;
+    for (int i = 0; i < nSeen; ++i) if (seen[i] == ptr) { dup = true; break; }
+    if (dup) continue;
+    if (nSeen < 16) seen[nSeen++] = ptr;
+    bytes -= std::min(bytes, it->second.second);
   }
-  size_t f, t; deviceMemInfo(&f, &t);
+  static size_t f = 0, t = 0;
+  static uint64_t gen = 0;
+  if (gen != MEM_GEN) { deviceMemInfo(&f, &t); gen = MEM_GEN; }
   return f > bytes + t / 8;
 }
 // what holds the device when an allocation is refused: the largest scratch buffers, and the free memory
@@ -1249,7 +1286,7 @@ inline void parkToHost(float*& dev, size_t bytes) {
   }
   CK(cudaMemcpyAsync(PARK_HOST, dev, bytes, cudaMemcpyDeviceToHost, STREAM));
   CK(cudaStreamSynchronize(STREAM));
-  CK(cudaFree(dev)); dev = nullptr;
+  CK(cudaFree(dev)); dev = nullptr; ++MEM_GEN;
 }
 inline void unparkFromHost(float*& dev, size_t bytes) {
   dev = dallocT<float>(bytes / 4);
@@ -1308,6 +1345,7 @@ template <class T> T* scratchNamed(const std::string& name, size_t n) {
       exit(1);
     }
     have = n * sizeof(T);
+    ++MEM_GEN;
   }
   return (T*)p;
 }
@@ -1489,12 +1527,13 @@ struct Part { std::string name; int width; bool transposed; };
 // again, exactly, by a later W() - the fast path reads only the f16 one
 inline std::map<std::string, std::pair<int, std::vector<Part>>> CONCAT;
 inline std::vector<float*> CONCAT_FREE;
+inline std::set<float*> CONCAT_POOL;
 // the f32 copies Wh() queued, given back (one drain for all of them; at a phase boundary)
 inline void releaseConcatCopies() {
   if (CONCAT_FREE.empty()) return;
   CK(cudaDeviceSynchronize());
   for (float* p : CONCAT_FREE) CK(cudaFree(p));
-  CONCAT_FREE.clear();
+  CONCAT_FREE.clear(); ++MEM_GEN;
 }
 inline void buildConcat(const std::string& key);
 inline const float* W(const std::string& k) {
@@ -1513,15 +1552,29 @@ __global__ void transposeIntoK(const float* src, float* dst, int C, int width, s
   int c = (int)(t / width), o = (int)(t % width);
   dst[c * ld + o] = src[(size_t)o * C + c];
 }
+__global__ void transposeIntoHK(const half* src, half* dst, int C, int width, size_t ld) {   // dst[c][o] = src[o][c]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * width) return;
+  int c = (int)(t / width), o = (int)(t % width);
+  dst[c * ld + o] = src[(size_t)o * C + c];
+}
+inline std::set<half*> WH_POOL;
+inline const half* Wh(const std::string& k);
 inline std::string concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
-  CONCAT.emplace(key, std::make_pair(C, parts));
-  if (!WF.count(key) && !WH.count(key)) buildConcat(key);
+  if (!CONCAT.count(key)) {
+    size_t total = 0; for (auto& p : parts) total += p.width;
+    CONCAT.emplace(key, std::make_pair(C, parts));
+    WLEN[key] = (size_t)C * total;
+  }
   return key;
 }
 inline void buildConcat(const std::string& key) {
   const auto& [C, parts] = CONCAT.at(key);
   size_t total = 0; for (auto& p : parts) total += p.width;
-  float* d = dalloc((size_t)C * total);
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  CK(cudaStreamIsCapturing(STREAM, &cap));
+  float* d = cap == cudaStreamCaptureStatusNone ? poolAlloc((size_t)C * total) : dalloc((size_t)C * total);
+  if (cap == cudaStreamCaptureStatusNone) CONCAT_POOL.insert(d);
   size_t off = 0;
   for (auto& p : parts) {
     if (p.name.empty()) {
@@ -1530,12 +1583,49 @@ inline void buildConcat(const std::string& key) {
       if (lenW(p.name) != (size_t)C * p.width) {
         fprintf(stderr, "%s has %zu elements, not %d x %d\n", p.name.c_str(), lenW(p.name), C, p.width); exit(1);
       }
-      if (p.transposed) transposeIntoK<<<blocks((size_t)C * p.width), 256, 0, STREAM>>>(W(p.name), d + off, C, p.width, total);
-      else CK(cudaMemcpy2DAsync(d + off, total * 4, W(p.name), p.width * 4, p.width * 4, C, cudaMemcpyDeviceToDevice, STREAM));
+      const float* wp = W(p.name);
+      if (p.transposed) transposeIntoK<<<blocks((size_t)C * p.width), 256, 0, STREAM>>>(wp, d + off, C, p.width, total);
+      else CK(cudaMemcpy2DAsync(d + off, total * 4, wp, p.width * 4, p.width * 4, C, cudaMemcpyDeviceToDevice, STREAM));
+      if (CONCAT.count(p.name)) {
+        float* fp = const_cast<float*>(wp);
+        if (CONCAT_POOL.erase(fp)) CK(cudaFreeAsync(fp, STREAM));
+        else CONCAT_FREE.push_back(fp);
+        WF.erase(p.name);
+      }
     }
     off += p.width;
   }
   deviceWeight(key, d, (size_t)C * total);
+}
+inline half* buildConcatHalf(const std::string& key) {
+  const auto& [C, parts] = CONCAT.at(key);
+  size_t total = 0; for (auto& p : parts) total += p.width;
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  CK(cudaStreamIsCapturing(STREAM, &cap));
+  half* d = cap == cudaStreamCaptureStatusNone ? poolAllocT<half>((size_t)C * total) : dallocT<half>((size_t)C * total);
+  if (cap == cudaStreamCaptureStatusNone) WH_POOL.insert(d);
+  size_t off = 0;
+  for (auto& p : parts) {
+    if (p.name.empty()) {
+      CK(cudaMemset2DAsync(d + off, total * 2, 0, p.width * 2, C, STREAM));
+    } else {
+      if (lenW(p.name) != (size_t)C * p.width) {
+        fprintf(stderr, "%s has %zu elements, not %d x %d\n", p.name.c_str(), lenW(p.name), C, p.width); exit(1);
+      }
+      const half* wp = Wh(p.name);
+      if (p.transposed) transposeIntoHK<<<blocks((size_t)C * p.width), 256, 0, STREAM>>>(wp, d + off, C, p.width, total);
+      else CK(cudaMemcpy2DAsync(d + off, total * 2, wp, p.width * 2, p.width * 2, C, cudaMemcpyDeviceToDevice, STREAM));
+      if (CONCAT.count(p.name)) {
+        half* hp = const_cast<half*>(wp);
+        if (WH_POOL.erase(hp)) CK(cudaFreeAsync(hp, STREAM));
+        else CK(cudaFree(hp));
+        WH.erase(p.name);
+      }
+    }
+    off += p.width;
+  }
+  WLEN[key] = (size_t)C * total;
+  return WH[key] = d;
 }
 inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
 // a file's f16 copy, made once per GROUP - the first f16 read of any of its weights converts every
@@ -1563,22 +1653,35 @@ inline const half* segmentHalf(const std::string& k) {
       from.push_back(e.devOffset); to.push_back(total); len.push_back(e.length); names.push_back(name);
       total += (e.length + 7) / 8 * 8;
     }
-    CK(devMalloc(&mirror, std::max<size_t>(total, 1) * 2));
-    size_t* table; CK(devMalloc(&table, from.size() * 3 * sizeof(size_t)));
-    CK(cudaMemcpy(table, from.data(), from.size() * sizeof(size_t), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(table + from.size(), to.data(), to.size() * sizeof(size_t), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(table + 2 * from.size(), len.data(), len.size() * sizeof(size_t), cudaMemcpyHostToDevice));
-    for (size_t first = 0; first < from.size(); first += 65535) {
-      unsigned count = (unsigned)std::min<size_t>(65535, from.size() - first);
-      convertTableK<<<dim3(8, count), 256, 0, STREAM>>>(s.device, (half*)mirror, table + first,
-                                                       table + from.size() + first, table + 2 * from.size() + first);
+    size_t n = from.size();
+    std::vector<size_t> htab(n * 3);
+    if (n) {
+      memcpy(htab.data(), from.data(), n * sizeof(size_t));
+      memcpy(htab.data() + n, to.data(), n * sizeof(size_t));
+      memcpy(htab.data() + 2 * n, len.data(), n * sizeof(size_t));
     }
-    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(table));
+    CK(devMalloc(&mirror, std::max<size_t>(total, 1) * 2));
+    size_t* table = poolAllocT<size_t>(n * 3);
+    if (n) CK(cudaMemcpyAsync(table, htab.data(), n * 3 * sizeof(size_t), cudaMemcpyHostToDevice, STREAM));
+    for (size_t first = 0; first < n; first += 65535) {
+      unsigned count = (unsigned)std::min<size_t>(65535, n - first);
+      convertTableK<<<dim3(8, count), 256, 0, STREAM>>>(s.device, (half*)mirror, table + first,
+                                                       table + n + first, table + 2 * n + first);
+    }
+    CK(cudaFreeAsync(table, STREAM));
     for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)mirror + to[i];
   }
   auto it = WH_AT.find(k);
   if (it == WH_AT.end()) { fprintf(stderr, "%s is not a float tensor of its file\n", k.c_str()); exit(1); }
   return it->second;
+}
+inline void warmSegmentHalf(int seg) {
+  for (auto& [name, e] : M.index)
+    if (e.seg == seg && e.kind == 't' && halfGroup(name).empty()) {
+      segmentHalf(name);
+      M.touched.erase(name);
+      return;
+    }
 }
 __global__ void toBf16WK(const float* in, __nv_bfloat16* out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1591,12 +1694,22 @@ inline const __nv_bfloat16* Wbf(const std::string& k) {
   // a half-uploaded block was that block's for good - 1BRS through ESMFold2 at pLDDT 28.6 and 13.2 A where it is 94.1
   // and 0.58, and the 600M model's 5CAJ 90.7 -> 63.6, whenever the upload was slow (a cold page cache)
   static std::map<std::string, __nv_bfloat16*> cache;
+  static std::set<__nv_bfloat16*> pooled;
   static bool hooked = false;
-  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [n, p] : cache) CK(cudaFree(p)); cache.clear(); }); hooked = true; }
+  if (!hooked) {
+    FORGET_HOOKS.push_back([] {
+      for (auto& [n, p] : cache) { if (pooled.erase(p)) CK(cudaFreeAsync(p, STREAM)); else CK(cudaFree(p)); }
+      cache.clear(); pooled.clear();
+    });
+    hooked = true;
+  }
   auto it = cache.find(k);
   if (it != cache.end()) return it->second;
   const float* f = W(k); size_t n = lenW(k);
-  __nv_bfloat16* b = dallocT<__nv_bfloat16>(n);
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  CK(cudaStreamIsCapturing(STREAM, &cap));
+  __nv_bfloat16* b = cap == cudaStreamCaptureStatusNone ? poolAllocT<__nv_bfloat16>(n) : dallocT<__nv_bfloat16>(n);
+  if (cap == cudaStreamCaptureStatusNone) pooled.insert(b);
   toBf16WK<<<blocks(n), 256, 0, STREAM>>>(f, b, n);
   return cache[k] = b;
 }
@@ -1607,13 +1720,22 @@ inline const half* Wh(const std::string& k) {
     WLEN[k] = M.len(k); WH_MIRROR.insert(k);
     return WH[k] = const_cast<half*>(segmentHalf(k));
   }
+  if (!WF.count(k) && CONCAT.count(k)) return buildConcatHalf(k);
   const float* f = W(k); size_t n = WLEN[k];
-  half* h = dallocT<half>(n);
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  CK(cudaStreamIsCapturing(STREAM, &cap));
+  half* h = cap == cudaStreamCaptureStatusNone ? poolAllocT<half>(n) : dallocT<half>(n);
+  if (cap == cudaStreamCaptureStatusNone) WH_POOL.insert(h);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
   // a concatenation's f32 copy given back at the next phase boundary (buildConcat makes it again if
   // asked) - AF3's peak 7.06 -> 6.57 GB at 262 tokens. Queued, not freed here: a cudaFree drains the
   // device, and one per weight was 27 ms of a cold 464 ms trunk
-  if (CONCAT.count(k)) { CONCAT_FREE.push_back(const_cast<float*>(f)); WF.erase(k); }
+  if (CONCAT.count(k)) {
+    float* fp = const_cast<float*>(f);
+    if (CONCAT_POOL.erase(fp)) CK(cudaFreeAsync(fp, STREAM));
+    else CONCAT_FREE.push_back(fp);
+    WF.erase(k);
+  }
   return WH[k] = h;
 }
 // a file's device copy without the entries `drop` names (they must have their f16 mirror already):
@@ -1626,13 +1748,16 @@ inline size_t compactWeights(int seg, const std::function<bool(const std::string
   return freed;
 }
 inline void forgetDerivedWeights() {
+  ++MEM_GEN;
   CK(cudaDeviceSynchronize());
-  for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) CK(cudaFree(h));
-  WH.clear(); WH_MIRROR.clear(); WH_AT.clear();
+  for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) { if (WH_POOL.erase(h)) CK(cudaFreeAsync(h, STREAM)); else CK(cudaFree(h)); }
+  WH.clear(); WH_MIRROR.clear(); WH_AT.clear(); WH_POOL.clear();
   for (auto& s : M.segs) { for (auto& [g, h] : s.halfMirrors) CK(cudaFree(h)); s.halfMirrors.clear(); }
   for (auto it = WF.begin(); it != WF.end();) {
     if (M.has(it->first) && it->second == M.dev(it->first)) { ++it; continue; }
-    CK(cudaFree(it->second)); WLEN.erase(it->first); it = WF.erase(it);
+    if (CONCAT_POOL.erase(it->second)) CK(cudaFreeAsync(it->second, STREAM));
+    else CK(cudaFree(it->second));
+    WLEN.erase(it->first); it = WF.erase(it);
   }
   for (auto& f : FORGET_HOOKS) f();
 }
@@ -1646,7 +1771,10 @@ inline const int* Idev(const std::string& k) {
 inline void forgetEntries(const std::vector<std::string>& names) {
   for (auto& k : names) {
     auto h = WH.find(k);
-    if (h != WH.end()) { if (!WH_MIRROR.erase(k)) cudaFree(h->second); WH.erase(h); }
+    if (h != WH.end()) {
+      if (!WH_MIRROR.erase(k)) { if (WH_POOL.erase(h->second)) CK(cudaFreeAsync(h->second, STREAM)); else cudaFree(h->second); }
+      WH.erase(h);
+    }
     WF.erase(k); WLEN.erase(k); IDEV.erase(k); WH_AT.erase(k);
   }
 }

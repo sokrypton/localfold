@@ -17,7 +17,7 @@ struct Trunk {
   float* pairMask;              // [L, L]
   bool opmFirst;
   // all ones (no padding, no absent row): the flash kernel then skips the mask altogether
-  bool msaOnes = false, extraOnes = false, pairOnes = false;
+  bool msaOnes = false, extraOnes = false, extraZeros = false, pairOnes = false;
   float* msa16 = nullptr;       // the main stack's MSA in bf16 while its blocks run (MSA16), else null
 };
 // MSA16: the main stack's MSA held in bf16 through its blocks (AlphaFold 2's own precision, global_config.bfloat16):
@@ -94,19 +94,79 @@ inline size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor
 // LOCALFOLD_PAIR_F32=1 keeps the f32 pair.
 inline bool AF2_P16 = false;
 template <class PT, class TX>
-__global__ void addIntoPairK(float* pair, const TX* x, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) pairSt<PT>(pair, i, pairLd<PT>(pair, i) + toF(x[i]));
+__global__ void addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const float* __restrict__ bias128 = nullptr, float biasScale = 1.f) {
+  __shared__ float sb[128];
+  if (bias128 && threadIdx.x < 128) sb[threadIdx.x] = bias128[threadIdx.x] * biasScale;
+  if (bias128) __syncthreads();
+  size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (i + 3 < n) {
+    float4 p = pairLd4<PT>(pair, i);
+    float4 b = bias128 ? *reinterpret_cast<const float4*>(sb + (i & 127)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if constexpr (std::is_same_v<TX, float>) {
+      float4 v = *reinterpret_cast<const float4*>(x + i);
+      p.x += v.x + b.x; p.y += v.y + b.y; p.z += v.z + b.z; p.w += v.w + b.w;
+    } else {
+      uint2 u = *reinterpret_cast<const uint2*>(x + i);
+      float2 a = __half22float2(*reinterpret_cast<const half2*>(&u.x));
+      float2 c = __half22float2(*reinterpret_cast<const half2*>(&u.y));
+      p.x += a.x + b.x; p.y += a.y + b.y; p.z += c.x + b.z; p.w += c.y + b.w;
+    }
+    pairSt4<PT>(pair, i, p);
+  } else {
+    for (size_t k = i; k < n; ++k) pairSt<PT>(pair, k, pairLd<PT>(pair, k) + (toF(x[k]) + (bias128 ? sb[k & 127] : 0.f)));
+  }
 }
-__global__ void pairBf16ToF32K(const __nv_bfloat16* in, float* out, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = __bfloat162float(in[i]);
+__global__ void pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, size_t n) {
+  size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (i + 3 < n) *reinterpret_cast<float4*>(out + i) = pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(in), i);
+  else for (size_t k = i; k < n; ++k) out[k] = __bfloat162float(in[k]);
+}
+template <class PT, bool FAST_INV = false>
+__global__ void opmAdd128K(float* __restrict__ pair, const float* __restrict__ x, const float* __restrict__ bias,
+                           const float* __restrict__ norm, size_t i0, int Bi, int L, float xs = 1.f, float normVal = 0.f) {
+  __shared__ float sb[128];
+  if (threadIdx.x < 128) sb[threadIdx.x] = bias[threadIdx.x];
+  __syncthreads();
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)Bi * L * 32) return;
+  int f = (int)((t & 31) << 2);
+  size_t p = i0 * L + (t >> 5);
+  float denom = 1e-3f + (norm ? norm[p] : normVal);
+  float4 x4 = *reinterpret_cast<const float4*>(x + (t << 2));
+  float4 b4 = *reinterpret_cast<const float4*>(sb + f);
+  float4 p4 = pairLd4<PT>(pair, (p << 7) + f);
+  if constexpr (FAST_INV) {
+    float inv = 1.f / denom;
+    p4.x += (b4.x + xs * x4.x) * inv;
+    p4.y += (b4.y + xs * x4.y) * inv;
+    p4.z += (b4.z + xs * x4.z) * inv;
+    p4.w += (b4.w + xs * x4.w) * inv;
+  } else {
+    p4.x += (b4.x + xs * x4.x) / denom;
+    p4.y += (b4.y + xs * x4.y) / denom;
+    p4.z += (b4.z + xs * x4.z) / denom;
+    p4.w += (b4.w + xs * x4.w) / denom;
+  }
+  pairSt4<PT>(pair, (p << 7) + f, p4);
+}
+template <class PT>
+__global__ void opmZeroMask128K(float* __restrict__ pair, const float* __restrict__ bias, size_t pairs, float denom = 1e-3f) {
+  __shared__ float sb[128];
+  if (threadIdx.x < 128) sb[threadIdx.x] = (bias[threadIdx.x] + 0.f) / denom;
+  __syncthreads();
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= pairs * 32) return;
+  int f = (int)((t & 31) << 2);
+  float4 b4 = *reinterpret_cast<const float4*>(sb + f);
+  float4 p4 = pairLd4<PT>(pair, t << 2);
+  p4.x += b4.x; p4.y += b4.y; p4.z += b4.z; p4.w += b4.w;
+  pairSt4<PT>(pair, t << 2, p4);
 }
 // the pair as f32 for a reader with no bf16 form (the template embedders' query): itself, or a converted copy
 inline const float* pairF32(const float* pair, size_t n) {
   if (!AF2_P16) return pair;
   float* f = scratch<float>("p16.view", n);
-  pairBf16ToF32K<<<blocks(n), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(pair), f, n);
+  pairBf16ToF32K<<<blocks((n + 3) / 4), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(pair), f, n);
   return f;
 }
 template <class PT = float>
@@ -116,15 +176,90 @@ __global__ void pairOuterSumK(float* pair, const float* left, const float* right
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / L), j = (int)(ij % L);
   pairSt<PT>(pair, t, left[(size_t)i * C + c] + right[(size_t)j * C + c]);
 }
-__global__ void broadcastAddRowsK(float* msa, const float* row, size_t rows, int L, int C) {   // msa[s, i] += row[i]
+__global__ void msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ bias, const int* __restrict__ aatype,
+                             const float* __restrict__ wP1d, const float* __restrict__ bP1d,
+                             const float* __restrict__ prevRowLn, size_t rows, int L, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) msa[t] += row[(t / C % L) * C + t % C];
+  if (t >= rows * C) return;
+  int c = (int)(t % C), i = (int)(t / C % L);
+  int a = min(max(aatype[i], 0), 19);
+  float v = msa[t] + bias[c];
+  v += wP1d[a * C + c] + bP1d[c];
+  if (t < (size_t)L * C) v += prevRowLn[t];
+  msa[t] = v;
 }
-__global__ void extraFeatK(const int* codes, const float* hasDel, const float* delVal, float* out, size_t rows) {
+template <class PT>
+__global__ void embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
+                           const float* __restrict__ wRight, const float* __restrict__ bRight,
+                           const float* __restrict__ pos37, const int* __restrict__ aatype,
+                           const float* __restrict__ wDg, const float* __restrict__ bDg,
+                           const float* __restrict__ prevPair, const float* __restrict__ lnScale, const float* __restrict__ lnOffset,
+                           const int* __restrict__ ri, const int* __restrict__ asym, const int* __restrict__ entity, const int* __restrict__ sym,
+                           const float* __restrict__ wRel, const float* __restrict__ bRel,
+                           float* __restrict__ pair, int L) {
+  size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (ij >= (size_t)L * L) return;
+  int i = (int)(ij / L), j = (int)(ij % L);
+  int ai = min(max(aatype[i], 0), 19), aj = min(max(aatype[j], 0), 19);
+  auto pb = [&](int r, int k) { int a = aatype[r] == 7 ? 1 : 3; return pos37[((size_t)r * 37 + a) * 3 + k]; };
+  float d2 = 0.f;
+  for (int k = 0; k < 3; ++k) { float d = pb(i, k) - pb(j, k); d2 += d * d; }
+  int dgBin = -1;
+  for (int b = 0; b < 15; ++b) {
+    float lo = 3.25f + (20.75f - 3.25f) * b / 14.f;
+    float lower = lo * lo;
+    float upper = b + 1 < 15 ? (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) * (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) : 1e8f;
+    if (d2 > lower && d2 < upper) dgBin = b;
+  }
+  int off = ri[i] - ri[j];
+  int clipped = min(max(off + 32, 0), 64);
+  int r0 = asym[i] == asym[j] ? clipped : 65;
+  bool sameEntity = entity[i] == entity[j];
+  int rc = min(max(sym[i] - sym[j] + 2, 0), 4);
+  int r2 = 67 + (sameEntity ? rc : 5);
+  const float* pr = prevPair + ij * 128;
+  float pv[4], s = 0.f;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) { pv[k] = pr[lane + 32 * k]; s += pv[k]; }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / 128.f, v = 0.f;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) { float d = pv[k] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / 128.f + 1e-5f);
+  auto step = [](float x) {
+    if constexpr (std::is_same_v<PT, float>) return x;
+    else return toF(fromF<PT>(x));
+  };
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    int c = lane + 32 * k;
+    float left = wLeft[ai * 128 + c] + bLeft[c];
+    float right = wRight[aj * 128 + c] + bRight[c];
+    float acc = step(left + right);
+    float dg = (dgBin >= 0 ? wDg[dgBin * 128 + c] : 0.f) + bDg[c];
+    acc = step(acc + dg);
+    float ln = (pv[k] - mean) * inv * lnScale[c] + lnOffset[c];
+    acc = step(acc + ln);
+    float rel = wRel[r0 * 128 + c] + (sameEntity ? wRel[66 * 128 + c] : 0.f) + wRel[r2 * 128 + c] + bRel[c];
+    pairSt<PT>(pair, ij * 128 + c, acc + rel);
+  }
+}
+__global__ void extraEmbedK(const int* __restrict__ codes, const float* __restrict__ hasDel,
+                            const float* __restrict__ delVal, const float* __restrict__ w,
+                            const float* __restrict__ b, float* __restrict__ out, size_t rows) {
+  __shared__ float sw[25 * 64], sb[64];
+  for (int i = threadIdx.x; i < 25 * 64; i += blockDim.x) sw[i] = w[i];
+  if (threadIdx.x < 64) sb[threadIdx.x] = b[threadIdx.x];
+  __syncthreads();
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * 25) return;
-  size_t r = t / 25; int c = (int)(t % 25);
-  out[t] = c < 23 ? (codes[r] == c ? 1.f : 0.f) : c == 23 ? hasDel[r] : delVal[r];
+  if (t >= rows * 64) return;
+  size_t r = t >> 6; int c = (int)(t & 63);
+  int code = codes[r];
+  float v = (code >= 0 && code < 23) ? sw[code * 64 + c] : 0.f;
+  v += hasDel[r] * sw[23 * 64 + c] + delVal[r] * sw[24 * 64 + c];
+  out[t] = v + sb[c];
 }
 __global__ void pairMaskK(const float* seqMask, float* out, int L) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,118 +269,63 @@ __global__ void pairMaskK(const float* seqMask, float* out, int L) {
 // a fold short of room (af2.cu): the chunked forms may engage, and no CUDA graph is captured, so a choice
 // made from the free memory cannot differ between a pass and its capture
 inline bool AF2_TIGHT = false;
-// rows [r0, r0 + cnt) of the pair features, for the in-place embedding below: the relative encoding,
-// the previous positions' distogram, and the sum that writes the rows
-__global__ void relposRowsK(const int* ri, const int* asym, const int* entity, const int* sym, float* out, int L,
-                            size_t r0, size_t cnt) {
-  size_t q = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= cnt) return;
-  size_t t = r0 + q; int i = (int)(t / L), j = (int)(t % L);
-  float* o = out + q * 73;
-  for (int c = 0; c < 73; ++c) o[c] = 0;
-  int off = ri[i] - ri[j];
-  int clipped = min(max(off + 32, 0), 64);
-  o[asym[i] == asym[j] ? clipped : 65] = 1;
-  bool sameEntity = entity[i] == entity[j];
-  o[66] = sameEntity ? 1.f : 0.f;
-  int rc = min(max(sym[i] - sym[j] + 2, 0), 4);
-  o[67 + (sameEntity ? rc : 5)] = 1;
-}
-__global__ void prevDgramRowsK(const float* pos37, const int* aatype, float* out, int L, size_t r0, size_t cnt) {
-  size_t q = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= cnt) return;
-  size_t t = r0 + q; int i = (int)(t / L), j = (int)(t % L);
-  auto pb = [&](int r, int k) { int a = aatype[r] == 7 ? 1 : 3; return pos37[((size_t)r * 37 + a) * 3 + k]; };
-  float d2 = 0;
-  for (int k = 0; k < 3; ++k) { float d = pb(i, k) - pb(j, k); d2 += d * d; }
-  for (int b = 0; b < 15; ++b) {
-    float lo = 3.25f + (20.75f - 3.25f) * b / 14.f;
-    float lower = lo * lo;
-    float upper = b + 1 < 15 ? (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) * (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) : 1e8f;
-    out[q * 15 + b] = (d2 > lower && d2 < upper) ? 1.f : 0.f;
-  }
-}
-// pair rows = left[i] + right[j], + the distogram term, + LN(the old row), + the relative term - the
-// whole form's additions in its order
-__global__ void embedRowsK(const float* left, const float* right, const float* dg, const float* ln, const float* rel,
-                           float* pair, int L, size_t r0, size_t cnt) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= cnt * 128) return;
-  int c = (int)(t % 128); size_t ij = r0 + t / 128; size_t i = ij / L, j = ij % L;
-  float v = left[i * 128 + c] + right[j * 128 + c];
-  v += dg[t]; v += ln[t]; v += rel[t];
-  pair[r0 * 128 + t] = v;
-}
 // prev: prevMsaRow [L, 256], prevPair [L, L, 128] (null: the pair itself, re-embedded in place), prevPos [L, 37, 3]
 inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos) {
   const std::string E = "evoformer/";
   int L = t.L, N = t.N;
   std::string f = "f" + std::to_string(pass) + "/";
   const int* aatype = Idev("aatype");
-  float* tf = scratch<float>("emb.tf", (size_t)L * 21);
-  targetFeatK<<<blocks((size_t)L * 21), 256, 0, STREAM>>>(aatype, tf, L);
   // msa = preprocess_1d(target)[None] + preprocess_msa(msa_feat); row 0 += LN(prev msa first row)
-  float* p1d = scratch<float>("emb.p1d", (size_t)L * 256);
-  linearB(tf, E + "preprocess_1d", -1, p1d, L, 21, 256);
-  linearB(W(f + "msa_feat"), E + "preprocess_msa", -1, t.msa, (size_t)N * L, 49, 256);
-  broadcastAddRowsK<<<blocks((size_t)N * L * 256), 256, 0, STREAM>>>(t.msa, p1d, (size_t)N * L, L, 256);
+  gemm(W(f + "msa_feat"), P(E + "preprocess_msa/weights", -1), t.msa, (size_t)N * L, 49, 256);
   float* prevRowLn = scratch<float>("emb.prevRow", (size_t)L * 256);
   layerNorm(prevMsaRow, prevRowLn, L, 256, E + "prev_msa_first_row_norm");
-  addK2<<<blocks((size_t)L * 256), 256, 0, STREAM>>>(t.msa, prevRowLn, (size_t)L * 256);
+  msaEmbedAddK<<<blocks((size_t)N * L * 256), 256, 0, STREAM>>>(
+    t.msa, P(E + "preprocess_msa/bias", -1), aatype, P(E + "preprocess_1d/weights", -1), P(E + "preprocess_1d/bias", -1),
+    prevRowLn, (size_t)N * L, L, 256);
   // pair = left[i] + right[j] + prev_pos_linear(dgram) + LN(prev pair) + relpos
-  float* left = scratch<float>("emb.left", (size_t)L * 128); float* right = scratch<float>("emb.right", (size_t)L * 128);
-  linearB(tf, E + "left_single", -1, left, L, 21, 128);
-  linearB(tf, E + "right_single", -1, right, L, 21, 128);
   size_t pairs = (size_t)L * L;
-  if (!prevPair) {
-    if (AF2_P16) { fprintf(stderr, "the in-place re-embedding has no bf16-pair form\n"); exit(1); }
-    // on a card short of room the recycled pair IS the pair, re-embedded in place a chunk of rows at a
-    // time - every term of a row reads only that row - so no second pair-sized tensor is kept
-    size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 128));
-    float* dg = scratch<float>("emb.dgram", per * 15); float* dgl = scratch<float>("emb.dgl", per * 128);
-    float* ln = scratch<float>("emb.prevln", per * 128);
-    float* rel = scratch<float>("emb.rel", per * 73); float* rell = scratch<float>("emb.rell", per * 128);
-    for (size_t r0 = 0; r0 < pairs; r0 += per) {
-      size_t r = std::min(per, pairs - r0);
-      prevDgramRowsK<<<blocks(r), 256, 0, STREAM>>>(prevPos, aatype, dg, L, r0, r);
-      linearB(dg, E + "prev_pos_linear", -1, dgl, r, 15, 128);
-      layerNorm(t.pair + r0 * 128, ln, r, 128, E + "prev_pair_norm");
-      relposRowsK<<<blocks(r), 256, 0, STREAM>>>(Idev("residue_index"), Idev("asym_id"), Idev("entity_id"), Idev("sym_id"),
-                                                 rel, L, r0, r);
-      linearB(rel, E + "~_relative_encoding/position_activations", -1, rell, r, 73, 128);
-      embedRowsK<<<blocks(r * 128), 256, 0, STREAM>>>(left, right, dgl, ln, rell, t.pair, L, r0, r);
-    }
-  } else {
-  WITH_PT(AF2_P16, pairOuterSumK<PT><<<blocks((size_t)L * L * 128), 256, 0, STREAM>>>(t.pair, left, right, L, 128));
-  float* dgram = scratch<float>("emb.dgram", pairs * 15);
-  prevDgramK<<<blocks(pairs), 256, 0, STREAM>>>(prevPos, aatype, dgram, L);
-  float* tmp = scratch<float>("emb.tmp", pairs * 128);
-  linearB(dgram, E + "prev_pos_linear", -1, tmp, pairs, 15, 128);
-  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * 128), 256, 0, STREAM>>>(t.pair, tmp, pairs * 128));
-  layerNorm(prevPair, tmp, pairs, 128, E + "prev_pair_norm");
-  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * 128), 256, 0, STREAM>>>(t.pair, tmp, pairs * 128));
-  float* rel = scratch<float>("emb.rel", pairs * 73);
-  relposK<<<blocks(pairs), 256, 0, STREAM>>>(Idev("residue_index"), Idev("asym_id"), Idev("entity_id"), Idev("sym_id"), rel, L);
-  linearB(rel, E + "~_relative_encoding/position_activations", -1, tmp, pairs, 73, 128);
-  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * 128), 256, 0, STREAM>>>(t.pair, tmp, pairs * 128));
-  }
+  if (!prevPair && AF2_P16) { fprintf(stderr, "the in-place re-embedding has no bf16-pair form\n"); exit(1); }
+  WITH_PT(AF2_P16, embedPairK<PT><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+    P(E + "left_single/weights", -1), P(E + "left_single/bias", -1),
+    P(E + "right_single/weights", -1), P(E + "right_single/bias", -1),
+    prevPos, aatype,
+    P(E + "prev_pos_linear/weights", -1), P(E + "prev_pos_linear/bias", -1),
+    prevPair ? prevPair : t.pair, P(E + "prev_pair_norm/scale", -1), P(E + "prev_pair_norm/offset", -1),
+    Idev("residue_index"), Idev("asym_id"), Idev("entity_id"), Idev("sym_id"),
+    P(E + "~_relative_encoding/position_activations/weights", -1), P(E + "~_relative_encoding/position_activations/bias", -1),
+    t.pair, L));
   // the extra MSA's activations
   size_t erows = (size_t)t.E * L;
-  float* ef = scratch<float>("emb.extraFeat", erows * 25);
-  extraFeatK<<<blocks(erows * 25), 256, 0, STREAM>>>(Idev(f + "extra_msa"), W(f + "extra_has_deletion"),
-                                                      W(f + "extra_deletion_value"), ef, erows);
-  linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
+  auto ones = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 1.f) return false; return true; };
+  auto zeros = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 0.f) return false; return true; };
+  auto tmplOnes = [&]() {
+    if (t.T == 0) return true;
+    if (M.flag("meta/multimer") || !M.has("t/mask")) return false;
+    const float* tm = M.f("t/mask");
+    for (size_t r = 0; r < (size_t)t.T * L; ++r) {
+      const float* m = tm + r * 37;
+      if (m[0] * m[1] * m[2] * m[4] != 1.f) return false;
+    }
+    return true;
+  };
+  t.msaOnes = ones(M.f(f + "msa_mask"), (size_t)N * L) && tmplOnes();     // (a template row's mask is the template's)
+  t.extraOnes = ones(M.f(f + "extra_msa_mask"), erows);
+  t.extraZeros = zeros(M.f(f + "extra_msa_mask"), erows);
+  if (!t.extraZeros) {
+    extraEmbedK<<<blocks(erows * 64), 256, 0, STREAM>>>(
+      Idev(f + "extra_msa"), W(f + "extra_has_deletion"), W(f + "extra_deletion_value"),
+      P(E + "extra_msa_activations/weights", -1), P(E + "extra_msa_activations/bias", -1), t.extra, erows);
+  }
   // the masks into fixed buffers: the stacks after this are replayed as one CUDA graph from pass 1 on,
   // and a graph's pointers do not change between passes
   float* mm = scratch<float>("mask.msa", (size_t)(N + t.T) * L); float* em = scratch<float>("mask.extra", erows);
   CK(cudaMemcpyAsync(mm, W(f + "msa_mask"), (size_t)N * L * 4, cudaMemcpyDeviceToDevice, STREAM));
-  CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
+  if (!t.extraZeros) CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
   t.msaMask = mm; t.extraMask = em;
-  auto ones = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 1.f) return false; return true; };
-  t.msaOnes = ones(M.f(f + "msa_mask"), (size_t)N * L) && t.T == 0;     // (a template row's mask is the template's)
-  t.extraOnes = ones(M.f(f + "extra_msa_mask"), erows);
-  t.pairOnes = ones(M.f("seq_mask"), L);
-  pairMaskK<<<blocks(pairs), 256, 0, STREAM>>>(W("seq_mask"), t.pairMask, L);
+  if (pass == 0) {
+    t.pairOnes = ones(M.f("seq_mask"), L);
+    pairMaskK<<<blocks(pairs), 256, 0, STREAM>>>(W("seq_mask"), t.pairMask, L);
+  }
 }
 
 // ---------------------------------------------------------------- the block's modules
@@ -275,6 +355,7 @@ __global__ void biasFromProjK(const float* proj, const float* pairMask, half* ou
   // transposed: the ending node's bias, b[h][q][k] = proj[k][q] (it attends along the first axis)
   if (transposed) { int x = i; i = j; j = x; }
   out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
+  if (j == L - 1) for (int pad = L; pad < stride; ++pad) out[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
 }
 inline const half* zeroBias(int H, int n, int stride) {        // a bias-free attention's bias, once
   static half* z = nullptr; static size_t have = 0;
@@ -343,16 +424,16 @@ inline void attentionCore(const half* xn, int Bt, int n, int C, const std::strin
 // node) where it lies: the strided flash kernel reads rows and positions at strides, and the output
 // lands in the residual's own layout, so nothing is transposed
 inline void attentionCoreAcross(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const half* bias,
-                                float* residual) {
+                                float* residual, const float* keyMask = nullptr) {
   size_t rows = (size_t)Bt * n;
   AttnW w = attnWeights(A, blk, C);
   int Wp = w.H * w.Dp, stride = (n + 7) / 8 * 8;
   half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
   ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
   // no bias (the column attention): the grid kernel takes none and loads no zeros; any other form wants them
-  if (!bias && !(FLASH_2R && w.Dp == 32 && (!flashRegStaged() || flash2R1Takes()))) bias = zeroBias(w.H, n, stride);
+  if (!bias && !(!keyMask && FLASH_2R && w.Dp == 32 && (!flashRegStaged() || flash2R1Takes()))) bias = zeroBias(w.H, n, stride);
   half* o = scratch<half>("fatt.o", rows * Wp);
-  flashGridStrided(qkvg, bias, stride, nullptr, o, n, w.H, w.Dp, Bt, 1.f / sqrtf((float)w.D),
+  flashGridStrided(qkvg, bias, stride, keyMask, o, n, w.H, w.Dp, Bt, 1.f / sqrtf((float)w.D),
                    (size_t)4 * Wp, (size_t)Bt * 4 * Wp, (size_t)Wp, (size_t)Bt * Wp);
   ltGemm(o, w.out, residual, false, rows, Wp, C, P(A + "/output_b", blk), false, 1.f);
 }
@@ -369,9 +450,6 @@ inline const half* pairBiasFast(const half* pn, int L, int C, int H, const float
   }
   ltGemm(pn, it->second, proj, false, pairs, C, H, nullptr, false, 0.f);
   half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
-  // the pad columns past L are read by the kernel's 16-byte loads beside the last real ones: a stale
-  // NaN there (the buffer is shared) poisons the row, so they must hold zeros
-  if (stride != L) CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));
   biasFromProjK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, pairMask, bias, L, H, stride, transposed);
   return bias;
 }
@@ -393,6 +471,7 @@ __global__ void biasFromProjRowsK(const float* proj, half* out, int L, int H, in
   float v = proj[headMajor ? (size_t)h * cnt + t / H : t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
   if (transposed) { size_t x = i; i = j; j = x; }
   out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
+  if (j == (size_t)L - 1) for (int pad = L; pad < stride; ++pad) out[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
 }
 // [C][H] f32 -> [C][16] f16, zero columns past H (gridInK's bias projection reads 16)
 __global__ void padHeadsK(const float* w, half* out, int C, int H) {
@@ -400,6 +479,16 @@ __global__ void padHeadsK(const float* w, half* out, int C, int H) {
   if (t >= C * 16) return;
   int k = t / 16, c = t % 16;
   out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
+}
+inline const half* paddedFeat2dWeight(const float* wf, int C, int H) {
+  static std::map<const float*, half*> wbCache;
+  auto it = wbCache.find(wf);
+  if (it == wbCache.end()) {
+    half* h = wpool<half>((size_t)C * 16);
+    padHeadsK<<<blocks((size_t)C * 16), 256, 0, STREAM>>>(wf, h, C, H);
+    it = wbCache.emplace(wf, h).first;
+  }
+  return it->second;
 }
 inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, int H, int D,
                             const float* msaMask) {
@@ -412,24 +501,14 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
     {
       if (H > 16) { fprintf(stderr, "msa row attention: %d heads, the fused pair bias takes 16\n", H); exit(1); }
       int stride = (L + 7) / 8 * 8;
-      static std::map<const float*, half*> wbCache;
-      const float* wf = P(R + "/feat_2d_weights", blk);
-      auto it = wbCache.find(wf);
-      if (it == wbCache.end()) {
-        half* h = wpool<half>((size_t)128 * 16);
-        padHeadsK<<<blocks((size_t)128 * 16), 256, 0, STREAM>>>(wf, h, 128, H);
-        it = wbCache.emplace(wf, h).first;
-      }
+      const half* wb = paddedFeat2dWeight(P(R + "/feat_2d_weights", blk), 128, H);
       half* b = scratch<half>("fbias.bias", (size_t)H * L * stride);
-      if (stride != L) CK(cudaMemsetAsync(b, 0, (size_t)H * L * stride * 2, STREAM));
       size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 16));
-      float* raw = scratch<float>("fbias.raw16", per * 16);
       const float *sc = P(R + "/feat_2d_norm/scale", blk), *of = P(R + "/feat_2d_norm/offset", blk);
       for (size_t r0 = 0; r0 < pairs; r0 += per) {
         size_t r = std::min(per, pairs - r0);
-        lnHeadsRaw<16>(pairAdvance(t.pair, r0 * 128), sc, of, it->second, raw, r);
-        biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, b, L, H, stride, false, r0, r,
-                                                             t.pairOnes ? nullptr : t.pairMask, true);
+        lnHeadsRaw<16>(pairAdvance(t.pair, r0 * 128), sc, of, wb, nullptr, r,
+                       b, L, H, stride, false, r0, t.pairOnes ? nullptr : t.pairMask);
       }
       bias = b;
     }
@@ -445,15 +524,24 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
                                                                                 P(R + "/query_norm/offset", blk));
       half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+      const std::string ln = S + "msa_column_attention/query_norm";
+      if (!t.msaOnes) {
+        half* oh = scratch<half>("fatt.o", rows * Wp);
+        flashGrid<half>(qkvg, bias, stride, msaMask, oh, L, w.H, w.Dp, 0, rowsN, false, 1.f / sqrtf((float)w.D));
+        half* xn2 = scratch<half>("fcol.xn", rows * C);
+        outLn256<B16, half, half>(oh, w.out, P(R + "/attention/output_b", blk), m16,
+                                  P(ln + "/scale", blk), P(ln + "/offset", blk), xn2, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xn2, rows };
+        return;
+      }
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
       msaFlash<false>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D));
       if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM)) {
         // the output projection writes the column attention's LayerNorm'd rows as well (outln.cuh): no LN pass there
-        const std::string ln = S + "msa_column_attention/query_norm";
-        half* xn = scratch<half>("fcol.xn", rows * C);
+        half* xn2 = scratch<half>("fcol.xn", rows * C);
         outLn256<B16, half>(o, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C), P(R + "/attention/output_b", blk), m16,
-                            P(ln + "/scale", blk), P(ln + "/offset", blk), xn, rows);
-        EMITTED_LN = EmittedLn{ ln, blk, msa, xn, rows };
+                            P(ln + "/scale", blk), P(ln + "/offset", blk), xn2, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xn2, rows };
         return;
       }
       ltGemm(o, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
@@ -513,12 +601,25 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
                                                                                 P(A + "/query_norm/offset", blk));
     half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
     ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+    const std::string ln = S + "msa_transition/input_layer_norm";
+    if (!t.msaOnes) {
+      float* m = scratch<float>(AF2_TIGHT ? "col.mask" : "mask.colMsa", rows);
+      if (AF2_TIGHT || blk == 0) swap01(msaMask, m, rowsN, L, 1);
+      const half* zbias = zeroBias(w.H, rowsN, stride);
+      half* oh = scratch<half>("fatt.o", rows * Wp);
+      flashGridStrided(qkvg, zbias, stride, m, oh, rowsN, w.H, w.Dp, L, 1.f / sqrtf((float)w.D),
+                       (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
+      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+      outLn256<B16, B16, half>(oh, w.out, P(A + "/attention/output_b", blk), m16,
+                               P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
+      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+      return;
+    }
     B16* o = scratch<B16>("fatt.o16", rows * Wp);
     msaFlash<true>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D),
                                                      (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
     // ...and its output projection writes the MSA transition's LayerNorm'd rows (outln.cuh), where room allows them whole
     if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
-      const std::string ln = S + "msa_transition/input_layer_norm";
       B16* xt = scratch<B16>("ftr.xnfull", rows * C);
       outLn256<B16, B16>(o, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C), P(A + "/attention/output_b", blk), m16,
                          P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
@@ -529,22 +630,22 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     });
     return;
   }
-  if (FAST && t.msaOnes) {
+  if (FAST) {
+    const float* mt = nullptr;
+    if (!t.msaOnes) {
+      float* m = scratch<float>(AF2_TIGHT ? "col.mask" : "mask.colMsa", rows);
+      if (AF2_TIGHT || blk == 0) swap01(msaMask, m, rowsN, L, 1);
+      mt = m;
+    }
     half* xn = scratch<half>("fcol.xn", rows * C);
     layerNormH(msa, xn, rows, C, A + "/query_norm", blk);
-    attentionCoreAcross(xn, L, rowsN, C, A + "/attention", blk, nullptr, msa);
+    attentionCoreAcross(xn, L, rowsN, C, A + "/attention", blk, nullptr, msa, mt);
     return;
   }
   float* tr = scratch<float>("col.tr", rows * C);
   float* mt = scratch<float>("col.mask", rows);
   swap01(msa, tr, rowsN, L, C);                 // [L, N, C]
   swap01(msaMask, mt, rowsN, L, 1);
-  if (FAST) {
-    half* xn = scratch<half>("fcol.xn", rows * C);
-    layerNormH(tr, xn, rows, C, A + "/query_norm", blk);
-    attentionCore(xn, L, rowsN, C, A + "/attention", blk, t.msaOnes ? nullptr : mt, nullptr, msa, true);
-    return;
-  }
   float* xn = scratch<float>("col.xn", rows * C);
   layerNorm(tr, xn, rows, C, A + "/query_norm", blk);
   float* out = scratch<float>("col.out", rows * C);
@@ -711,73 +812,106 @@ __global__ void opmToF8K(const half* in, __nv_fp8_e4m3* out, int rowsN, int Sp, 
 }
 #include "../../af3/src/triingemm.cuh"
 // The deep form's output projection read from the contraction's product where it lies, [i][a][j][b] (f16, scaled by
-// 2^-k): a block is 128 rows j of one i, the k = (a, b) chunks a apart (tgMain's strides), and the epilogue adds
+// 2^-k): a block is 128 flat (i, j) rows of the i-block, the k = (a, b) chunks a apart (tgMain's strides), and the epilogue adds
 // (bias + 2^k y) / (1e-3 + norm) into the pair - no permuted copy, no f32 product, no opmAddK
 template <class PT>
 __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, const half* __restrict__ W, const float* __restrict__ bias,
-    const float* __restrict__ norm, float* __restrict__ pair, int i0, int L, float up) {
+    const float* __restrict__ norm, float* __restrict__ pair, int i0, int bi, int L, float up, float invNorm = 0.f) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, wm = warp & 1, wn = warp >> 1;
-  const size_t i = (size_t)i0 + blockIdx.y, row0 = (size_t)blockIdx.x * 128;
+  const size_t row0 = (size_t)blockIdx.x * 128, pp = (size_t)bi * L;
   float acc[4][8][4] = {};
-  tgMain<1024>(Pm + (size_t)blockIdx.y * 32 * L * 32, W, row0, (size_t)L, smem, acc, 32, (size_t)L * 32);
+  tgMain<1024>(Pm, W, row0, pp, smem, acc, 32, (size_t)L * 32, (unsigned)L);
+  __syncthreads();
+  constexpr int LDY = 64 + 4;
+  float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
+  const int cl = (lane & 15) * 4, f = wn * 64 + cl;
+  const float4 b4 = *reinterpret_cast<const float4*>(bias + f);
 #pragma unroll
-  for (int mi = 0; mi < 4; ++mi)
+  for (int mi = 0; mi < 4; ++mi) {
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      size_t j = row0 + wm * 64 + mi * 16 + g + h * 8;
-      if (j >= (size_t)L) continue;
-      const size_t ij = i * L + j;
-      const float d = 1.f / (1e-3f + norm[ij]);
-#pragma unroll
-      for (int t = 0; t < 8; ++t) {
-        int f = wn * 64 + t * 8 + 2 * tig;
-        float v0 = (bias[f] + up * acc[mi][t][2 * h]) * d, v1 = (bias[f + 1] + up * acc[mi][t][2 * h + 1]) * d;
-        size_t at = ij * 128 + f;
-        if constexpr (std::is_same_v<PT, float>) { pair[at] += v0; pair[at + 1] += v1; }
-        else {
-          PT* p = reinterpret_cast<PT*>(pair) + at;
-          p[0] = fromF<PT>(toF(p[0]) + v0); p[1] = fromF<PT>(toF(p[1]) + v1);
-        }
-      }
+    for (int t = 0; t < 8; ++t) {
+      int c = t * 8 + 2 * tig;
+      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[mi][t][0], acc[mi][t][1]);
+      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[mi][t][2], acc[mi][t][3]);
     }
+    __syncwarp();
+#pragma unroll
+    for (int ep = 0; ep < 8; ++ep) {
+      int rl = ep * 2 + (lane >> 4);
+      size_t q = row0 + wm * 64 + mi * 16 + rl;
+      if (q >= pp) continue;
+      const size_t ij = (size_t)i0 * L + q;
+      const float d = norm ? 1.f / (1e-3f + norm[ij]) : invNorm;
+      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+      float4 v = pairLd4<PT>(pair, ij * 128 + f);
+      v.x += (b4.x + up * a4.x) * d; v.y += (b4.y + up * a4.y) * d;
+      v.z += (b4.z + up * a4.z) * d; v.w += (b4.w + up * a4.w) * d;
+      pairSt4<PT>(pair, ij * 128 + f, v);
+    }
+    __syncwarp();
+  }
+}
+inline std::pair<const half*, const float*> opmWeights(const std::string& Op, int blk, int C, int O = 32) {
+  struct OpmW { const half* wt; const float* bias; };
+  static std::map<std::pair<std::string, int>, OpmW> opmCache;
+  auto it = opmCache.find({Op, blk});
+  if (it == opmCache.end()) {
+    half* wt = wpool<half>((size_t)C * 2 * O);
+    tileColumns(PH(Op + "/left_projection/weights", blk), C, O, 0, O, 16, wt);
+    tileColumns(PH(Op + "/right_projection/weights", blk), C, O, 0, O, 16, wt + (size_t)C * O);
+    float* bb = wpool<float>(2 * O);
+    CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+    CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+    it = opmCache.emplace(std::make_pair(Op, blk), OpmW{wt, bb}).first;
+  }
+  return {it->second.wt, it->second.bias};
 }
 inline void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C,
                              const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
+  const bool isMsa = (msa == t.msa || msa == t.msa16);
+  if (!isMsa && t.extraZeros) {
+    WITH_PAIR_T(opmZeroMask128K<PT><<<blocks((size_t)L * L * 32), 256, 0, STREAM>>>(t.pair, P(Op + "/output_b", blk), (size_t)L * L));
+    return;
+  }
   if (FAST) {
     half* lt = scratch<half>("fopm.left", rows * O); half* rt = scratch<half>("fopm.right", rows * O);
     static const bool lnFused = !getenv("LOCALFOLD_LNGEMM") || atoi(getenv("LOCALFOLD_LNGEMM"));
+    bool ones = isMsa ? t.msaOnes : t.extraOnes;
     if ((lnFused || (MSA16 && msa == t.msa16)) && (C == 256 || C == 64)) {
       // the LayerNorm and both projections in one pass over the MSA (lnGemm): the LN'd MSA never written, read twice -
       // 5CAJ with its 7,907-row alignment 1382 -> 1354 ms of GPU a fold, 0.014 A. (The same kernel for the row
       // attention's q/k/v/gate, 1024 columns, loses - 130 ms against the LN's 31 and cuBLAS's 80: its two-tile warps
       // reach ~100 TFLOP/s where cuBLAS reaches 167, the transition's note below found the same)
-      half* wt = scratch<half>("fopm.wt", (size_t)C * 2 * O);
-      tileColumns(PH(Op + "/left_projection/weights", blk), C, O, 0, O, 16, wt);
-      tileColumns(PH(Op + "/right_projection/weights", blk), C, O, 0, O, 16, wt + (size_t)C * O);
-      float* bb = scratch<float>("fopm.bias", 2 * O);
-      CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
-      CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+      auto ow = opmWeights(Op, blk, C, O);
       const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
-      if (MSA16 && msa == t.msa16) withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt); });
-      else if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
-      else lnGemm<64>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      const float* msk = ones ? nullptr : msaMask;
+      if (MSA16 && msa == t.msa16) withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk); });
+      else if (C == 256) lnGemm<256>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
+      else lnGemm<64>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
     } else {
       half* xn = scratch<half>("fopm.xn", rows * C);
       layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
       ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
       ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
+      if (!ones) {
+        scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
+        scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
+      }
     }
-    bool ones = msa == t.msa || msa == t.msa16 ? t.msaOnes : t.extraOnes;
-    if (!ones) {
-      scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
-      scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
-    }
-    float* norm = scratch<float>("opm.norm", (size_t)L * L);
     const float one = 1.f, zero = 0.f;
-    CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+    float* norm = nullptr;
+    if (!ones) {
+      if (AF2_TIGHT) {
+        norm = scratch<float>("opm.norm", (size_t)L * L);
+        CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+      } else {
+        norm = scratch<float>(isMsa ? "mask.normMsa" : "mask.normExtra", (size_t)L * L);
+        if (blk == 0) CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+      }
+    }
     if (rowsN <= OPM_SHALLOW) {
       const half* W = PH(Op + "/output_w", blk);           // [O*O][128] f16
       // (8 more rows, the bias rows' - see below - on sm_12x with an f32 pair, and wherever the bias vector is past 2^17
@@ -797,6 +931,19 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O, inv);
       int K = O * rowsN;
       if (ones) {
+        int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
+        if (PAIR16) {   // (into an f32 block of rows, then added with the scaled bias into the bf16 pair: an f16 product
+                        // there moved 6MRR from a single sequence 1.898 -> 2.001 A, pLDDT 84.6 -> 81.1)
+          float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+          const float* ob = P(Op + "/output_b", blk);
+          for (int i0 = 0; i0 < L; i0 += Bi) {
+            int bi = std::min(Bi, L - i0);
+            ltGemm(Lt + (size_t)i0 * K, T, Yb, false, bi, K, L * 128, nullptr, false, 0.f);
+            addIntoPairK<__nv_bfloat16, float><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(
+              reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 128, ob, inv);
+          }
+          return;
+        }
         float* bt = scratch<float>("fopm.btile", (size_t)L * 128);
         tileBiasK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(P(Op + "/output_b", blk), bt, L, 128, inv);
         // aug (sm_12x): the bias as the GEMM's K-th row against a column of ones, where the epilogue's L * 128-long bias
@@ -810,17 +957,9 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
           opmAugBiasRowsK<<<blocks((size_t)8 * L * 128), 256, 0, STREAM>>>(bt, T + (size_t)K * L * 128, (size_t)L * 128);
           La = la; Ka = K + 8; gb = nullptr;
         }
-        int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
         for (int i0 = 0; i0 < L; i0 += Bi) {
           int bi = std::min(Bi, L - i0);
-          if (!PAIR16) ltGemm(La + (size_t)i0 * Ka, T, t.pair + (size_t)i0 * L * 128, false, bi, Ka, L * 128, gb, false, 1.f);
-          else {        // (into an f32 block of rows, then added into the bf16 pair: an f16 product there moved 6MRR
-                        // from a single sequence 1.898 -> 2.001 A, pLDDT 84.6 -> 81.1)
-            float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
-            ltGemm(La + (size_t)i0 * Ka, T, Yb, false, bi, Ka, L * 128, gb, false, 0.f);
-            addIntoPairK<__nv_bfloat16, float><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(
-              reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 128);
-          }
+          ltGemm(La + (size_t)i0 * Ka, T, t.pair + (size_t)i0 * L * 128, false, bi, Ka, L * 128, gb, false, 1.f);
         }
         return;
       }
@@ -828,9 +967,8 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
       for (int i0 = 0; i0 < L; i0 += Bi) {
         int bi = std::min(Bi, L - i0);
-        CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, L * 128, bi, K, &one, T, CUDA_R_16F, L * 128, Lt + (size_t)i0 * K,
-                        CUDA_R_16F, K, &zero, Y, CUDA_R_32F, L * 128, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false));
+        ltGemm(Lt + (size_t)i0 * K, T, Y, false, bi, K, L * 128, nullptr, false, 0.f);
+        WITH_PAIR_T(opmAdd128K<PT, true><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L));
       }
       return;
     }
@@ -872,13 +1010,13 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       else CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &down, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
                            CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       if (direct) {
-        WITH_PAIR_T(opmOutK<PT><<<dim3((L + 127) / 128, bi), 128, triInGemmSmem(), STREAM>>>(
-          Pm, PH(Op + "/output_w", blk), P(Op + "/output_b", blk), norm, t.pair, i0, L, up));
+        WITH_PAIR_T(opmOutK<PT><<<(unsigned)(((size_t)bi * L + 127) / 128), 128, triInGemmSmem(), STREAM>>>(
+          Pm, PH(Op + "/output_w", blk), P(Op + "/output_b", blk), norm, t.pair, i0, bi, L, up, 1.f / (1e-3f + (float)rowsN)));
         continue;
       }
       opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
       ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
-      WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false, up));
+      WITH_PAIR_T(opmAdd128K<PT><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, up, (float)rowsN));
     }
     return;
   }
@@ -906,7 +1044,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
                    &zero, Pm, L * O));
     opmPermuteK<float><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
     gemm(X, P(Op + "/output_w", blk), Y, (size_t)bi * L, O * O, 128);
-    opmAddK<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false);
+    opmAdd128K<float><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
   }
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
@@ -965,8 +1103,7 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
   using B16 = __nv_bfloat16;
   const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
   TriFused tw = triFusedWeights(T, blk, C);
-  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
-  tileTriIn(tw.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+  const half* wt = tw.wt;
   B16* b = scratch<B16>("trib.bbf", plane * C);
   int width = (int)std::max<size_t>(8, std::min<size_t>(Lp, AF2_CHUNK / C / Lp / 8 * 8));
   {
@@ -994,7 +1131,7 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
       if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, w, Lp, 1.f, b, Lp, plane, a, Lp, rm.size, prod, Lp, rm.size, C);
       else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, Lp, Lp, 1.f, a, w, rm.size, b, Lp, plane, prod, w, rm.size, C);
       triangleOutRun<128, 4, B16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
-                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), rm);
+                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), rm, tw.wout);
     }
   );
   releaseScratch({ "trib." });
@@ -1002,7 +1139,7 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
 // the triangle's whole-form buffers (both precisions'): what a pass already holds counts toward its room
 #define TRI_FAST_HELD { "ftri.a8", "ftri.b8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
-                                   bool outgoing) {
+                                   bool outgoing, bool pairOnes = false) {
   size_t pairs = (size_t)L * L;
   std::string T = S + (outgoing ? "triangle_multiplication_outgoing" : "triangle_multiplication_incoming");
   // on a card short of room, in blocks of the output, where the whole form would not fit with room to spare
@@ -1014,7 +1151,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
       if (fusedBlocks && FUSED_TRIANGLE && C == 128 && !getenv("AF2_TRI_F32") && af2Wide128() && L >= 80 &&
           fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8)))
-        triangleBlockedFused2(pair, pairMask, L, C, T, blk, outgoing);
+        triangleBlockedFused2(pair, pairOnes ? nullptr : pairMask, L, C, T, blk, outgoing);
       else triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
       return;
     }
@@ -1023,6 +1160,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // as cuda/af3 has them and as AlphaFold 2's own trunk runs (global_config.bfloat16): the output kernel then
   // stages half the product and takes its persistent form. AF2_TRI_F32=1 keeps the f32 product.
   static const bool triBf16 = !getenv("AF2_TRI_F32");
+  const float* maskIn = pairOnes ? nullptr : pairMask;
   // 🔴 ON AN SM WITH AN A100's SHARED MEMORY, cuda/af3's streaming kernels as AF3 runs them at 128 channels: the input
   // kernel at two row tiles a warp (biased), a bf16 contraction, and the output kernel streaming its weight 16 columns
   // a stage with the bias in its epilogue - where the narrow output kernel holds the whole weight at one block an SM.
@@ -1030,8 +1168,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && af2Wide128() && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
-    half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
-    tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    const half* wt = w.wt;
     // FP8 operands where the card has FP8 tensor instructions (fp8Tensor), as cuda/af3's triangle: both directions in the
     // outgoing layout (the incoming input kernel reading the pair transposed, RectMap's T), through an e4m3 GEMM into
     // the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
@@ -1047,11 +1184,11 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
         static bool attr = false;
         if (!attr) { smemAttr((triIn256K<128, 4, F8, 1, true, PT, 2>), (int)smem); attr = true; }
         triIn256K<128, 4, F8, 1, true, PT, 2><<<(unsigned)((cs8 + 127) / 128), 128, smem, STREAM>>>(
-          pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a8, b8, t2, L, np8, cs8, w.bias, rm));
+          pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a8, b8, t2, L, np8, cs8, w.bias, rm));
       if (outgoing) triContractTN(np8, cs8, C, 1.f, a8, b8, pb, true);
       else triContractTN(np8, cs8, C, 1.f, b8, a8, pb, true);
       triangleOutRun<128, 4, __nv_bfloat16>(pb, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
-                                            PH(T + "/output_projection/weights", blk), t2, pair, L, np8, P(T + "/output_projection/bias", blk));
+                                            PH(T + "/output_projection/weights", blk), t2, pair, L, np8, P(T + "/output_projection/bias", blk), {}, w.wout);
       return;
     }
     __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
@@ -1061,12 +1198,35 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       static bool attr = false;
       if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
       triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
-        pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+        pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
     if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
     else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
     triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
-                                          PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
+                                          PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), {}, w.wout);
+    return;
+  }
+  if (FAST && FUSED_TRIANGLE && C == 64 && fitsSmem(std::max(triIn256Smem<half>(64, 8), triangleOutSmem<64, 4, float, 32, float>()))) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    TriFused w = triFusedWeights(T, blk, C);
+    half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
+    half* t2 = scratch<half>("ftri.t2", plane * C);
+    const size_t smem = triIn256Smem<half>(64, 8);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((triIn256K<64, 4, half, 1, true, PT, 2>), (int)smem); attr = true; }
+      triIn256K<64, 4, half, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+        pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), w.wt, a, b, t2, L, Lp, plane, w.bias));
+    float* prod = scratch<float>("ftri.prod", plane * C);
+    const float one = 1.f, zero = 0.f;
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16F, Lp, plane, a, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    triangleOutRun<64, 4, float>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                 PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), {}, w.wout);
     return;
   }
   if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && triFusedFits<__nv_bfloat16>()) {
@@ -1074,7 +1234,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriFused w = triFusedWeights(T, blk, C);
     __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
-    triInRaw<__nv_bfloat16, true>(pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
+    triInRaw<__nv_bfloat16, true>(pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
                                   w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
     if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
@@ -1091,7 +1251,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriFused w = triFusedWeights(T, blk, C);
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
-    triInRaw<half, true>(pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), w.wpg,
+    triInRaw<half, true>(pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), w.wpg,
                          PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);   // (writes the padding)
     float* prod = scratch<float>("ftri.prod", plane * C);
     const float one = 1.f, zero = 0.f;
@@ -1112,8 +1272,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       fitsSmem(std::max(triIn256Smem<half>(128, 8), triangleOutSmem<128, 4, float, 32, float>()))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
-    half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
-    tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    const half* wt = w.wt;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
     constexpr int WI = 8;
@@ -1231,7 +1390,6 @@ inline void triangleAttentionChunked(float* pair, const float* pairMask, int L, 
     it = whCache.emplace(wf, h).first;
   }
   half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
-  if (stride != L) CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));
   size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / C));
   half* lnc = scratch<half>("ftatt.lnc", per * C);
   float* projc = scratch<float>("fbias.projc", per * H);
@@ -1271,7 +1429,8 @@ inline bool FUSED_GRID_AF2 = !getenv("LOCALFOLD_AF2_UNFUSED_GRID");
 // node, so no gather, no scatter and no LN'd copy of the pair. One pass where the q/k/v/gate are a 32nd of
 // the card (the bias written by the same kernel); else the bias first (LN + projection, chunked), then the
 // rows a chunk at a time.
-inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int C, const std::string& A, int blk,
+template <int C = 128>
+inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, const std::string& A, int blk,
                                   bool starting, bool pairOnes) {
   size_t pairs = (size_t)L * L;
   AttnW w = attnWeights(A + "/attention", blk, C);
@@ -1279,17 +1438,14 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   const bool tr = !starting;
   const float *lnS = P(A + "/query_norm/scale", blk), *lnO = P(A + "/query_norm/offset", blk);
   const float* ob = P(A + "/attention/output_b", blk);
-  static std::map<const float*, half*> wbCache;
-  const float* wf = P(A + "/feat_2d_weights", blk);
-  auto it = wbCache.find(wf);
-  if (it == wbCache.end()) {
-    half* h = wpool<half>((size_t)C * 16);
-    padHeadsK<<<blocks((size_t)C * 16), 256, 0, STREAM>>>(wf, h, C, H);
-    it = wbCache.emplace(wf, h).first;
+  const half* Wb = paddedFeat2dWeight(P(A + "/feat_2d_weights", blk), C, H);
+  size_t biasN = (size_t)H * L * stride;
+  half* bias = scratch<half>("fbias.bias", biasN);
+  static half* zeroedBias = nullptr; static size_t zeroedBiasN = 0;
+  if (stride != L && (bias != zeroedBias || biasN > zeroedBiasN)) {
+    CK(cudaMemsetAsync(bias, 0, biasN * 2, STREAM));                // the padding columns (once per buffer)
+    zeroedBias = bias; zeroedBiasN = biasN;
   }
-  const half* Wb = it->second;
-  half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
-  CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));                // the padding columns
   const float* mask = pairOnes ? nullptr : pairMask;
   float scale = 1.f / sqrtf((float)w.D);
   // FP8 attention where the card has it (cuda/af3's flash8Run): k and v written e4m3 by the projection
@@ -1309,7 +1465,7 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", pairs * 2 * Wp) : nullptr;
     // (sm_12x: V written straight into flash8's transposed form, no fp8VtK pass - the same bytes)
     uint8_t* vt8 = f8 && ccMajor() == 12 ? scratch<uint8_t>("attn.vt8", (size_t)L * Wp * ((L + 63) / 64 * 64)) : nullptr;
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8, ccMajor() == 12, vt8);
+    gridInRaw<C>(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8, ccMajor() == 12, vt8);
     half* o = scratch<half>("fatt.o", pairs * Wp);
     if (f8) flash8Run(qkvg, kv8, vt8 ? vt8 : kv8 + pairs * Wp, bias, stride, o, L, H, L, scale, nullptr, -1, vt8 != nullptr);
     else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
@@ -1319,17 +1475,15 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     // pair - on Colab's RTX PRO 6000 54 calls of cublasLt's globalKernel a 2,500-residue pass, and timing its other
     // candidates found none without it)
     if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
-    else gridOutRaw(o, w.out, ob, pair, L, 0, pairs, tr);
+    else gridOutRaw<C>(o, w.out, ob, pair, L, 0, pairs, tr);
     return;
   }
   {   // the bias, all of it before any row is attended (and before any is written): LN + the 16-column
-      // projection in one kernel (lnHeadsK), then laid out head-major
+      // projection in one kernel (lnHeadsK), laid out into `bias`
     size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 16));
-    float* raw = scratch<float>("fbias.raw16", per * 16);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      lnHeadsRaw<16>(pairAdvance(pair, r0 * C), lnS, lnO, Wb, raw, r);
-      biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, bias, L, H, stride, tr, r0, r, nullptr, true);   // lnHeadsK writes head-major
+      lnHeadsRaw<16, C>(pairAdvance(pair, r0 * C), lnS, lnO, Wb, nullptr, r, bias, L, H, stride, tr, r0, nullptr);
     }
   }
   size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 4 * Wp)));
@@ -1338,11 +1492,11 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", R * L * 2 * Wp) : nullptr;
   for (size_t b0 = 0; b0 < (size_t)L; b0 += R) {
     size_t bc = std::min(R, (size_t)L - b0), rows = bc * L;
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr, nullptr, nullptr, 0, 0, false, kv8, ccMajor() == 12);
+    gridInRaw<C>(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr, nullptr, nullptr, 0, 0, false, kv8, ccMajor() == 12);
     if (f8) flash8Run(qkvg, kv8, kv8 + rows * Wp, bias, stride, o, L, H, bc, scale, nullptr);
     else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
     if (!tr && !PAIR16 && ccMajor() != 12) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
-    else gridOutRaw(o, w.out, ob, pair, L, b0 * L, rows, tr);
+    else gridOutRaw<C>(o, w.out, ob, pair, L, b0 * L, rows, tr);
   }
 }
 inline void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
@@ -1350,8 +1504,12 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   size_t pairs = (size_t)L * L;
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3);
-  if (FAST && FUSED_GRID_AF2 && C == 128 && H * (D < 16 ? 16 : D) == 128 && H <= 16 && gridFusedFits()) {
-    triangleAttentionGrid(pair, pairMask, L, C, A, blk, starting, pairOnes);
+  if (FAST && FUSED_GRID_AF2 && C == 128 && H * (D < 16 ? 16 : D) == 128 && H <= 16 && gridFusedFits(128)) {
+    triangleAttentionGrid<128>(pair, pairMask, L, A, blk, starting, pairOnes);
+    return;
+  }
+  if (FAST && FUSED_GRID_AF2 && C == 64 && H * (D < 16 ? 16 : D) == 64 && H <= 16 && gridFusedFits(64)) {
+    triangleAttentionGrid<64>(pair, pairMask, L, A, blk, starting, pairOnes);
     return;
   }
   needF32Pair("af2 triangle attention (unfused)");
@@ -1386,6 +1544,72 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, pairs * C);
 }
 
+inline void warmStackWeights(bool extraZeros = false, bool multimer = false, bool monomerTemplates = false) {
+  if (!FAST) return;
+  if (multimer || monomerTemplates) {
+    const std::string TS = multimer ? "evoformer/template_embedding/single_template_embedding/template_embedding_iteration/"
+                                    : "evoformer/template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state/";
+    int nb = (int)dimW(TS + "pair_transition/transition1/weights", 0);
+    int Ht = (int)dimW(TS + "triangle_attention_starting_node/attention/query_w", 2);
+    int Ip = (int)dimW(TS + "pair_transition/transition1/weights", 2);
+    for (int b = 0; b < nb; ++b) {
+      triFusedWeights(TS + "triangle_multiplication_outgoing", b, 64);
+      triFusedWeights(TS + "triangle_multiplication_incoming", b, 64);
+      paddedFeat2dWeight(P(TS + "triangle_attention_starting_node/feat_2d_weights", b), 64, Ht);
+      paddedFeat2dWeight(P(TS + "triangle_attention_ending_node/feat_2d_weights", b), 64, Ht);
+      attnWeights(TS + "triangle_attention_starting_node/attention", b, 64);
+      attnWeights(TS + "triangle_attention_ending_node/attention", b, 64);
+      transitionW1Tiles<true>(PH(TS + "pair_transition/transition1/weights", b), 64, Ip, 16);
+    }
+    if (multimer) {
+      PH("evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/weights");
+      PH("evoformer/template_embedding/output_linear/weights");
+    } else {
+      PH("evoformer/template_embedding/attention/value_w");
+      PH("evoformer/template_embedding/attention/output_w");
+    }
+  }
+  int extraBlocks = (int)dimW("evoformer/extra_msa_stack/msa_transition/transition1/weights", 0);
+  int mainBlocks = (int)dimW("evoformer/evoformer_iteration/msa_transition/transition1/weights", 0);
+  for (int s = 0; s < 2; ++s) {
+    bool extra = s == 0;
+    const std::string S = extra ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
+    int nblk = extra ? extraBlocks : mainBlocks, C = extra ? 64 : 256;
+    int H = (int)dimW(S + "msa_row_attention_with_pair_bias/attention/query_w", 2);
+    int Ht = (int)dimW(S + "triangle_attention_starting_node/attention/query_w", 2);
+    int I = (int)dimW(S + "msa_transition/transition1/weights", 2);
+    int Ip = (int)dimW(S + "pair_transition/transition1/weights", 2);
+    for (int b = 0; b < nblk; ++b) {
+      if (!extra || !extraZeros) {
+        opmWeights(S + "outer_product_mean", b, C);
+        paddedFeat2dWeight(P(S + "msa_row_attention_with_pair_bias/feat_2d_weights", b), 128, H);
+        AttnW rw = attnWeights(S + "msa_row_attention_with_pair_bias/attention", b, C, extra);
+        if (extra) {
+          attnWeights(S + "msa_row_attention_with_pair_bias/attention", b, C, false);
+          transitionW1Tiles<true>(PH(S + "msa_transition/transition1/weights", b), 64, I, 16);
+        } else {
+          const half* w2 = augmentedWeight(S + "msa_transition/transition2/weights", b, P(S + "msa_transition/transition2/bias", b), I, C);
+          biasFor(P(S + "msa_transition/transition1/bias", b), I, true);
+          AttnW cw = attnWeights(S + "msa_column_attention/attention", b, C);
+          if (!MSA16_HALF) {
+            bf16Of(rw.out, (size_t)rw.H * rw.Dp * C);
+            bf16Of(cw.out, (size_t)cw.H * cw.Dp * C);
+            bf16Of(PH(S + "msa_transition/transition1/weights", b), (size_t)C * I);
+            bf16Of(w2, (size_t)(I + 8) * C);
+            biasForBf16(P(S + "msa_transition/transition1/bias", b), I);
+          }
+        }
+      }
+      triFusedWeights(S + "triangle_multiplication_outgoing", b, 128);
+      triFusedWeights(S + "triangle_multiplication_incoming", b, 128);
+      paddedFeat2dWeight(P(S + "triangle_attention_starting_node/feat_2d_weights", b), 128, Ht);
+      paddedFeat2dWeight(P(S + "triangle_attention_ending_node/feat_2d_weights", b), 128, Ht);
+      attnWeights(S + "triangle_attention_starting_node/attention", b, 128);
+      attnWeights(S + "triangle_attention_ending_node/attention", b, 128);
+      transitionW1Tiles<true>(PH(S + "pair_transition/transition1/weights", b), 128, Ip, 16);
+    }
+  }
+}
 // one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"
 inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
@@ -1394,15 +1618,18 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   std::string R = S + "msa_row_attention_with_pair_bias/attention/query_w";
   int H = (int)dimW(R, 2), D = (int)dimW(R, 3);
+  const bool skipMsa = extraStack && t.extraZeros;
   if (t.opmFirst) { PAIR16 = AF2_P16; outerProductMean(t, S, blk, msa, rowsN, C, mask); PAIR16 = false; }
-  PAIR16 = AF2_P16; msaRowAttention(t, S, blk, msa, rowsN, C, H, D, mask); PAIR16 = false;
-  if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
-  else msaColumnAttention(t, S, blk, msa, rowsN, C, H, D, mask);
-  transition(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
+  if (!skipMsa) {
+    PAIR16 = AF2_P16; msaRowAttention(t, S, blk, msa, rowsN, C, H, D, mask); PAIR16 = false;
+    if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
+    else msaColumnAttention(t, S, blk, msa, rowsN, C, H, D, mask);
+    transition(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
+  }
   PAIR16 = AF2_P16;
   if (!t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask);
-  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true);
-  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false);
+  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes);
+  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes);
   triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes);
   triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes);
   transition(t.pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
