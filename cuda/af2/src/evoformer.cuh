@@ -1065,22 +1065,50 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   }
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
-__global__ void triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const float* __restrict__ mask,
-                          float* __restrict__ a, float* __restrict__ b, int L, int C) {
+__global__ void __launch_bounds__(256, 6)
+triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const float* __restrict__ mask,
+          float* __restrict__ a, float* __restrict__ b, int L, int C) {
   __shared__ float A[32][33];
   __shared__ float B[32][33];
   size_t pairs = (size_t)L * L;
   size_t ij0 = (size_t)blockIdx.x * 32;
   int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
   int c = c0 + tx;
+  if (ij0 + 32 <= pairs && c0 + 32 <= C) {
+    float m[4], pa[4], ga[4], pb[4], gb[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      size_t ij = ij0 + ty + k * 8;
+      size_t base = ij * (2 * C) + c;
+      m[k] = __ldg(mask + ij);
+      pa[k] = __ldg(proj + base);
+      ga[k] = __ldg(gate + base);
+      pb[k] = __ldg(proj + base + C);
+      gb[k] = __ldg(gate + base + C);
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      A[ty + k * 8][tx] = pa[k] * m[k] / (1.f + __expf(-ga[k]));
+      B[ty + k * 8][tx] = pb[k] * m[k] / (1.f + __expf(-gb[k]));
+    }
+    __syncthreads();
+    size_t ij = ij0 + tx;
+#pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+      int co = c0 + ty + k;
+      a[(size_t)co * pairs + ij] = A[tx][ty + k];
+      b[(size_t)co * pairs + ij] = B[tx][ty + k];
+    }
+    return;
+  }
 #pragma unroll
   for (int k = 0; k < 32; k += 8) {
     size_t ij = ij0 + ty + k;
     if (ij < pairs && c < C) {
-      float m = mask[ij];
+      float m = __ldg(mask + ij);
       size_t base = ij * (2 * C) + c;
-      A[ty + k][tx] = proj[base] * m / (1.f + __expf(-gate[base]));
-      B[ty + k][tx] = proj[base + C] * m / (1.f + __expf(-gate[base + C]));
+      A[ty + k][tx] = __ldg(proj + base) * m / (1.f + __expf(-__ldg(gate + base)));
+      B[ty + k][tx] = __ldg(proj + base + C) * m / (1.f + __expf(-__ldg(gate + base + C)));
     }
   }
   __syncthreads();

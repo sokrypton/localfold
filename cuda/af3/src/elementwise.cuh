@@ -89,15 +89,31 @@ __global__ void channelMajorToRowsK(const float* x, float* y, size_t pairs, int 
   if (t < pairs * C) y[t] = x[(t % C) * pairs + t / C];
 }
 
-__global__ void channelMajorToRowsTileK(const float* __restrict__ x, float* __restrict__ y, size_t pairs, int C) {
+__global__ void __launch_bounds__(256, 8)
+channelMajorToRowsTileK(const float* __restrict__ x, float* __restrict__ y, size_t pairs, int C) {
   __shared__ float tile[32][33];
   size_t ij0 = (size_t)blockIdx.x * 32;
   int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
   size_t ij = ij0 + tx;
+  if (ij0 + 32 <= pairs && c0 + 32 <= C) {
+    float v0 = __ldg(x + (size_t)(c0 + ty) * pairs + ij);
+    float v1 = __ldg(x + (size_t)(c0 + ty + 8) * pairs + ij);
+    float v2 = __ldg(x + (size_t)(c0 + ty + 16) * pairs + ij);
+    float v3 = __ldg(x + (size_t)(c0 + ty + 24) * pairs + ij);
+    tile[ty][tx] = v0; tile[ty + 8][tx] = v1; tile[ty + 16][tx] = v2; tile[ty + 24][tx] = v3;
+    __syncthreads();
+    int c = c0 + tx;
+    size_t r = ij0 + ty;
+    y[r * C + c] = tile[tx][ty];
+    y[(r + 8) * C + c] = tile[tx][ty + 8];
+    y[(r + 16) * C + c] = tile[tx][ty + 16];
+    y[(r + 24) * C + c] = tile[tx][ty + 24];
+    return;
+  }
 #pragma unroll
   for (int k = 0; k < 32; k += 8) {
     int c = c0 + ty + k;
-    if (c < C && ij < pairs) tile[ty + k][tx] = x[(size_t)c * pairs + ij];
+    if (c < C && ij < pairs) tile[ty + k][tx] = __ldg(x + (size_t)c * pairs + ij);
   }
   __syncthreads();
   int c = c0 + tx;

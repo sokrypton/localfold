@@ -168,12 +168,13 @@ inline void swap01(const float* x, float* y, int A, int B, int C) {
 //   pairBias:   [H, n, n] or null - AF2's `nonbatched_bias`, shared by every batch row
 //   out:        [Bt, n, H*D] = softmax(q k^T / sqrt(D) + biases) v * sigmoid(g)
 template <int D>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(256, D <= 16 ? 4 : 3)
 attentionK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
            const float* __restrict__ g, const float* __restrict__ keyMask,
            const float* __restrict__ pairBias, float* __restrict__ out, int Bt, int n, int H, float scale) {
-  __shared__ float Ks[32][D + 1];
-  __shared__ float Vs[32][D + 1];
+  constexpr int LDK = (D + 4) & ~3;
+  __shared__ __align__(16) float Ks[32][LDK];
+  __shared__ __align__(16) float Vs[32][LDK];
   __shared__ float Ms[32];
   int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   unsigned nq = (unsigned)((n + 7) / 8);
@@ -190,59 +191,131 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
     if constexpr ((D & 3) == 0) {
 #pragma unroll
       for (int d = 0; d < D; d += 4) {
-        float4 q4 = *reinterpret_cast<const float4*>(qr + d);
+        float4 q4 = __ldg(reinterpret_cast<const float4*>(qr + d));
         qv[d] = q4.x * scale; qv[d + 1] = q4.y * scale; qv[d + 2] = q4.z * scale; qv[d + 3] = q4.w * scale;
       }
     } else {
 #pragma unroll
-      for (int d = 0; d < D; ++d) qv[d] = qr[d] * scale;
+      for (int d = 0; d < D; ++d) qv[d] = __ldg(qr + d) * scale;
     }
   }
   float m = -INFINITY, l = 0.f, o[D] = {};
   const float* pbRow = (validQ && pairBias) ? (pairBias + ((size_t)h * n + qi) * n) : nullptr;
   constexpr int D4 = D / 4;
   constexpr int THREADS_FOR_KV = 32 * D4;
+  const float* kBase = k + b * (size_t)n * W + h * D;
+  const float* vBase = v + b * (size_t)n * W + h * D;
+  const float* mBase = keyMask ? (keyMask + b * (size_t)n) : nullptr;
   for (int j0 = 0; j0 < n; j0 += 32) {
-    if constexpr ((D & 3) == 0 && THREADS_FOR_KV <= 256) {
-      if (tid < THREADS_FOR_KV) {
-        int kj = tid / D4, d4 = (tid % D4) * 4;
-        if (j0 + kj < n) {
-          size_t ko = (b * (size_t)n + (size_t)(j0 + kj)) * W + h * D + d4;
-          float4 k4 = *reinterpret_cast<const float4*>(k + ko);
-          float4 v4 = *reinterpret_cast<const float4*>(v + ko);
-          Ks[kj][d4] = k4.x; Ks[kj][d4 + 1] = k4.y; Ks[kj][d4 + 2] = k4.z; Ks[kj][d4 + 3] = k4.w;
-          Vs[kj][d4] = v4.x; Vs[kj][d4 + 1] = v4.y; Vs[kj][d4 + 2] = v4.z; Vs[kj][d4 + 3] = v4.w;
+    if (j0 + 32 <= n) {
+      if constexpr ((D & 3) == 0 && THREADS_FOR_KV <= 256) {
+        if (tid < THREADS_FOR_KV) {
+          int kj = tid / D4, d4 = (tid % D4) * 4;
+          size_t ko = (size_t)(j0 + kj) * W + d4;
+          *reinterpret_cast<float4*>(&Ks[kj][d4]) = __ldg(reinterpret_cast<const float4*>(kBase + ko));
+          *reinterpret_cast<float4*>(&Vs[kj][d4]) = __ldg(reinterpret_cast<const float4*>(vBase + ko));
+        }
+      } else {
+        for (int idx = tid; idx < 32 * D; idx += 256) {
+          int kj = idx / D, d = idx % D;
+          size_t ko = (size_t)(j0 + kj) * W + d;
+          Ks[kj][d] = __ldg(kBase + ko);
+          Vs[kj][d] = __ldg(vBase + ko);
         }
       }
+      if (mBase && tid < 32) Ms[tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
+      __syncthreads();
+      if (validQ) {
+        int j = j0 + lane;
+        float s = 0.f;
+        if constexpr ((D & 3) == 0) {
+#pragma unroll
+          for (int d = 0; d < D; d += 4) {
+            float4 kv = *reinterpret_cast<const float4*>(&Ks[lane][d]);
+            s += qv[d] * kv.x; s += qv[d + 1] * kv.y; s += qv[d + 2] * kv.z; s += qv[d + 3] * kv.w;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
+        }
+        if (mBase) s += Ms[lane];
+        if (pbRow) s += __ldg(pbRow + j);
+        s = fminf(fmaxf(s, -1e8f), 1e8f);
+        float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
+        l = l * c + p;
+        if constexpr ((D & 3) == 0) {
+#pragma unroll
+          for (int d = 0; d < D; d += 4) {
+            float4 vv = *reinterpret_cast<const float4*>(&Vs[lane][d]);
+            o[d]     = o[d]     * c + p * vv.x;
+            o[d + 1] = o[d + 1] * c + p * vv.y;
+            o[d + 2] = o[d + 2] * c + p * vv.z;
+            o[d + 3] = o[d + 3] * c + p * vv.w;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[lane][d];
+        }
+        m = mn;
+      }
+      __syncthreads();
     } else {
-      for (int idx = tid; idx < 32 * D; idx += 256) {
-        int kj = idx / D, d = idx % D;
-        if (j0 + kj < n) {
-          size_t ko = (b * (size_t)n + (size_t)(j0 + kj)) * W + h * D + d;
-          Ks[kj][d] = k[ko];
-          Vs[kj][d] = v[ko];
+      if constexpr ((D & 3) == 0 && THREADS_FOR_KV <= 256) {
+        if (tid < THREADS_FOR_KV) {
+          int kj = tid / D4, d4 = (tid % D4) * 4;
+          if (j0 + kj < n) {
+            size_t ko = (size_t)(j0 + kj) * W + d4;
+            *reinterpret_cast<float4*>(&Ks[kj][d4]) = __ldg(reinterpret_cast<const float4*>(kBase + ko));
+            *reinterpret_cast<float4*>(&Vs[kj][d4]) = __ldg(reinterpret_cast<const float4*>(vBase + ko));
+          }
+        }
+      } else {
+        for (int idx = tid; idx < 32 * D; idx += 256) {
+          int kj = idx / D, d = idx % D;
+          if (j0 + kj < n) {
+            size_t ko = (size_t)(j0 + kj) * W + d;
+            Ks[kj][d] = __ldg(kBase + ko);
+            Vs[kj][d] = __ldg(vBase + ko);
+          }
         }
       }
-    }
-    if (keyMask && tid < 32 && j0 + tid < n) {
-      Ms[tid] = 1e9f * (keyMask[b * (size_t)n + (size_t)(j0 + tid)] - 1.f);
-    }
-    __syncthreads();
-    int j = j0 + lane;
-    if (validQ && j < n) {
-      float s = 0.f;
+      if (mBase && tid < 32 && j0 + tid < n) Ms[tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
+      __syncthreads();
+      int j = j0 + lane;
+      if (validQ && j < n) {
+        float s = 0.f;
+        if constexpr ((D & 3) == 0) {
 #pragma unroll
-      for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
-      if (keyMask) s += Ms[lane];
-      if (pbRow) s += pbRow[j];
-      s = fminf(fmaxf(s, -1e8f), 1e8f);
-      float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-      l = l * c + p;
+          for (int d = 0; d < D; d += 4) {
+            float4 kv = *reinterpret_cast<const float4*>(&Ks[lane][d]);
+            s += qv[d] * kv.x; s += qv[d + 1] * kv.y; s += qv[d + 2] * kv.z; s += qv[d + 3] * kv.w;
+          }
+        } else {
 #pragma unroll
-      for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[lane][d];
-      m = mn;
+          for (int d = 0; d < D; ++d) s += qv[d] * Ks[lane][d];
+        }
+        if (mBase) s += Ms[lane];
+        if (pbRow) s += __ldg(pbRow + j);
+        s = fminf(fmaxf(s, -1e8f), 1e8f);
+        float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
+        l = l * c + p;
+        if constexpr ((D & 3) == 0) {
+#pragma unroll
+          for (int d = 0; d < D; d += 4) {
+            float4 vv = *reinterpret_cast<const float4*>(&Vs[lane][d]);
+            o[d]     = o[d]     * c + p * vv.x;
+            o[d + 1] = o[d + 1] * c + p * vv.y;
+            o[d + 2] = o[d + 2] * c + p * vv.z;
+            o[d + 3] = o[d + 3] * c + p * vv.w;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[lane][d];
+        }
+        m = mn;
+      }
+      __syncthreads();
     }
-    __syncthreads();
   }
   if (!validQ) return;
   float M_ = m;
@@ -263,7 +336,7 @@ attentionK(const float* __restrict__ q, const float* __restrict__ k, const float
     if (lane == d) x_lane = x0;
   }
   if (lane < D) {
-    float gate = 1.f / (1.f + __expf(-g[bq * W + h * D + lane]));
+    float gate = 1.f / (1.f + __expf(-__ldg(g + bq * W + h * D + lane)));
     out[bq * W + h * D + lane] = x_lane / l * gate;
   }
 }

@@ -132,11 +132,33 @@ inline float* perAtomConditioning(const std::string& ref, int rows) {
 
 // ---------------------------------------------------------------- the encoder's pieces
 // x[r] *= m[r % period]
-__global__ void scaleByRowK(float* x, const float* m, size_t rows, int C, size_t period) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (t < rows * C) x[t] *= m[(t / C) % period];
+__global__ void scaleByRowK(float* __restrict__ x, const float* __restrict__ m, size_t rows, int C, size_t period) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)x) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t < n4) {
+      size_t r = ((c4 & (c4 - 1)) == 0) ? (t >> (__ffs(c4) - 1)) : (n4 <= UINT32_MAX ? (unsigned)t / (unsigned)c4 : t / (size_t)c4);
+      size_t pr = r < period ? r : (r <= UINT32_MAX ? (unsigned)r % (unsigned)period : r % period);
+      float mv = __ldg(m + pr);
+      float4 xv = reinterpret_cast<const float4*>(x)[t];
+      reinterpret_cast<float4*>(x)[t] = make_float4(xv.x * mv, xv.y * mv, xv.z * mv, xv.w * mv);
+    }
+    return;
+  }
+  if (t < rows * C) x[t] *= m[(t / C) % period];
 }
-__global__ void reluK(const float* x, float* y, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = x[i] > 0 ? x[i] : 0;
+__global__ void reluK(const float* __restrict__ x, float* __restrict__ y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)x | (uintptr_t)y) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (i < n4) {
+      float4 xv = __ldg(reinterpret_cast<const float4*>(x) + i);
+      reinterpret_cast<float4*>(y)[i] = make_float4(xv.x > 0.f ? xv.x : 0.f, xv.y > 0.f ? xv.y : 0.f, xv.z > 0.f ? xv.z : 0.f, xv.w > 0.f ? xv.w : 0.f);
+    }
+    return;
+  }
+  if (i < n) y[i] = x[i] > 0 ? x[i] : 0;
 }
 __global__ void adaLnCombineK(const float* xn, const float* scale, const float* shift, float* out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -145,8 +167,20 @@ __global__ void adaLnCombineK(const float* xn, const float* scale, const float* 
 __global__ void mulSigmoidK(float* x, const float* g, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] *= sigm(g[i]);
 }
-__global__ void addBiasRowsK(float* y, const float* b, size_t rows, int C) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < rows * C) y[i] += b[i % C];
+__global__ void addBiasRowsK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (i < n4) {
+      int c = ((c4 & (c4 - 1)) == 0) ? (int)(i & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)i % (unsigned)c4) : (int)(i % c4));
+      float4 yv = reinterpret_cast<const float4*>(y)[i];
+      float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
+      reinterpret_cast<float4*>(y)[i] = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+    }
+    return;
+  }
+  if (i < rows * C) y[i] += __ldg(b + i % C);
 }
 // sigmoid(cond' W + b) * LN(x) + cond' Wshift, cond' = LN_scale_only(cond)
 inline void adaptiveLayerNorm(const float* x, const float* cond, float* out, size_t rows, int C, int condC,
@@ -158,7 +192,7 @@ inline void adaptiveLayerNorm(const float* x, const float* cond, float* out, siz
   layerNormSlow(x, xn, rows, C, nullptr, nullptr);
   layerNormSlow(cond, cn, rows, condC, W(w + "SingleCondLayerNormScale"), nullptr);
   linear<float, float>(cn, sc, rows, condC, C, w + "SingleCondScaleWeights");
-  addBiasRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(sc, W(w + "SingleCondScaleBias"), rows, C);
+  addBiasRowsK<<<blocks((C & 3) == 0 ? (rows * (C >> 2)) : (rows * C)), 256, 0, STREAM>>>(sc, W(w + "SingleCondScaleBias"), rows, C);
   linear<float, float>(cn, sh, rows, condC, C, w + "SingleCondBias");
   adaLnCombineK<<<blocks(rows * C), 256, 0, STREAM>>>(xn, sc, sh, out, rows * C);
 }
@@ -239,7 +273,7 @@ inline void adaCond(const float* cond, size_t rows, int C, int condC, const std:
   float* cn = scratch<float>("ada.cn", rows * condC);
   layerNormSlow(cond, cn, rows, condC, W(w + "SingleCondLayerNormScale"), nullptr);
   linear<float, float>(cn, scale, rows, condC, C, w + "SingleCondScaleWeights");
-  addBiasRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(scale, W(w + "SingleCondScaleBias"), rows, C);
+  addBiasRowsK<<<blocks((C & 3) == 0 ? (rows * (C >> 2)) : (rows * C)), 256, 0, STREAM>>>(scale, W(w + "SingleCondScaleBias"), rows, C);
   linear<float, float>(cn, shift, rows, condC, C, w + "SingleCondBias");
 }
 // The key side's scale and shift are per ATOM (a key row is a gathered query row), so they are
@@ -256,9 +290,9 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   adaCond(qCond, qRows, C, C, B + ".k", c.kScale, c.kShift);
   adaCond(qCond, qRows, C, C, B + ".ffw", c.ffwScale, c.ffwShift);
   linear<float, float>(qCond, c.zg, qRows, C, C, B + ".AdaptiveZeroCondWeights");
-  addBiasRowsK<<<blocks(qRows * C), 256, 0, STREAM>>>(c.zg, W(B + ".AdaptiveZeroCondBias"), qRows, C);
+  addBiasRowsK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.zg, W(B + ".AdaptiveZeroCondBias"), qRows, C);
   linear<float, float>(qCond, c.tg, qRows, C, C, B + ".ffwAdaptiveZeroCondWeights");
-  addBiasRowsK<<<blocks(qRows * C), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
+  addBiasRowsK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
   c.pairLogits = pairLogits;
   c.chained = M.flag(B + ".chainedAtomLayerNorm");
   return c;
@@ -595,8 +629,8 @@ __global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict
   for (int i = 0; i < KEYS / 16; ++i) {
     int key = i * 16 + (threadIdx.x >> 2), c = (threadIdx.x & 3) * 8, cs = c ^ ((key & 3) * 8);
     size_t gk = (size_t)ss * KEYS + key;
-    bool live = q2kMask[gk] != 0.f;
-    const half* src = kvAtomAll + (live ? (size_t)q2kIdx[gk] + (size_t)sample * q1 : 0) * W2 + h * D + c;
+    bool live = __ldg(q2kMask + gk) != 0.f;
+    const half* src = kvAtomAll + (live ? (size_t)__ldg(q2kIdx + gk) + (size_t)sample * q1 : 0) * W2 + h * D + c;
     cpAsync16(Ks + key * LD + cs, src, live);
     cpAsync16(Vs + key * LD + cs, src + Wd, live);
   }
@@ -605,23 +639,23 @@ __global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict
   size_t i0 = (size_t)s * queries + r0, i1 = (size_t)s * queries + r1;
   float qs = scale * LOG2E;
   auto q2 = [&](size_t i, int e, float2 qb) -> uint32_t {
-    float2 f = __half22float2(*reinterpret_cast<const half2*>(qg + i * W2 + h * D + e));
+    float2 f = __half22float2(__ldg(reinterpret_cast<const half2*>(qg + i * W2 + h * D + e)));
     return pack2((f.x + qb.x) * qs, (f.y + qb.y) * qs);
   };
   uint32_t qa[D / 16][4];
 #pragma unroll
   for (int ks = 0; ks < D / 16; ++ks) {
     int e = ks * 16 + tig * 2;
-    float2 qb0 = qBias ? *reinterpret_cast<const float2*>(qBias + h * D + e) : make_float2(0.f, 0.f);
-    float2 qb1 = qBias ? *reinterpret_cast<const float2*>(qBias + h * D + e + 8) : make_float2(0.f, 0.f);
+    float2 qb0 = qBias ? __ldg(reinterpret_cast<const float2*>(qBias + h * D + e)) : make_float2(0.f, 0.f);
+    float2 qb1 = qBias ? __ldg(reinterpret_cast<const float2*>(qBias + h * D + e + 8)) : make_float2(0.f, 0.f);
     qa[ks][0] = q2(i0, e, qb0); qa[ks][1] = q2(i1, e, qb0); qa[ks][2] = q2(i0, e + 8, qb1); qa[ks][3] = q2(i1, e + 8, qb1);
   }
   const float* pl0 = pairLogits + (((size_t)ss * heads + h) * queries + r0) * KEYS;
   const float* pl1 = pairLogits + (((size_t)ss * heads + h) * queries + r1) * KEYS;
   const float* kmBase = kMask + (size_t)ss * KEYS;
-  float qm0 = qMask[(size_t)ss * queries + r0], qm1 = qMask[(size_t)ss * queries + r1];
-  float2 b0 = *reinterpret_cast<const float2*>(pl0 + tig * 2), b1 = *reinterpret_cast<const float2*>(pl1 + tig * 2);
-  float2 km = *reinterpret_cast<const float2*>(kmBase + tig * 2);
+  float qm0 = __ldg(qMask + (size_t)ss * queries + r0), qm1 = __ldg(qMask + (size_t)ss * queries + r1);
+  float2 b0 = __ldg(reinterpret_cast<const float2*>(pl0 + tig * 2)), b1 = __ldg(reinterpret_cast<const float2*>(pl1 + tig * 2));
+  float2 km = __ldg(reinterpret_cast<const float2*>(kmBase + tig * 2));
   cpWait<0>();
   __syncthreads();
   float sv[KEYS / 8][4];
@@ -639,8 +673,8 @@ __global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict
     if (nt + 1 < KEYS / 8) {
       ldsm4(kb[cur ^ 1], Ks + ((nt + 1) * 8 + (lane & 7)) * LD + ((lane >> 3) ^ (lane & 3)) * 8);
       int nkey = (nt + 1) * 8 + tig * 2;
-      b0 = *reinterpret_cast<const float2*>(pl0 + nkey); b1 = *reinterpret_cast<const float2*>(pl1 + nkey);
-      km = *reinterpret_cast<const float2*>(kmBase + nkey);
+      b0 = __ldg(reinterpret_cast<const float2*>(pl0 + nkey)); b1 = __ldg(reinterpret_cast<const float2*>(pl1 + nkey));
+      km = __ldg(reinterpret_cast<const float2*>(kmBase + nkey));
     }
     mma16816(sv[nt], qa[0], kb[cur][0], kb[cur][1]);
     mma16816(sv[nt], qa[1], kb[cur][2], kb[cur][3]);
@@ -651,8 +685,8 @@ __global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict
 #pragma unroll
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
-    ga[et] = *reinterpret_cast<const half2*>(qg + i0 * W2 + Wd + h * D + e);
-    gb[et] = *reinterpret_cast<const half2*>(qg + i1 * W2 + Wd + h * D + e);
+    ga[et] = __ldg(reinterpret_cast<const half2*>(qg + i0 * W2 + Wd + h * D + e));
+    gb[et] = __ldg(reinterpret_cast<const half2*>(qg + i1 * W2 + Wd + h * D + e));
   }
   m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 1)); m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 2));
   m1 = fmaxf(m1, __shfl_xor_sync(~0u, m1, 1)); m1 = fmaxf(m1, __shfl_xor_sync(~0u, m1, 2));
@@ -994,14 +1028,27 @@ __global__ void sameRefSpaceMaskK(float* pl, const float* qUid, const float* tqM
   if (!(tqMask[qi] != 0 && tkMask[ki] != 0 && qUid[qi] == kUid[ki])) pl[t] = -1e9f;
 }
 // flat [(s,q,k)][blocks*heads] -> per block [s][h][q][k]
-__global__ void atomLogitsLayoutK(const float* flat, float* out, int block, int nblocks, int subsets,
+__global__ void atomLogitsLayoutK(const float* __restrict__ flat, float* __restrict__ out, int block, int nblocks, int subsets,
                                   int heads, int queries, int keys) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t total = (size_t)subsets * heads * queries * keys;
   if (t >= total) return;
-  int key = (int)(t % keys); size_t rest = t / keys; int q = (int)(rest % queries); rest /= queries;
-  int h = (int)(rest % heads); int s = (int)(rest / heads);
-  out[t] = flat[(((size_t)s * queries + q) * keys + key) * nblocks * heads + block * heads + h];
+  int key, q, h, s;
+  if (keys == 128 && queries == 32 && heads == 4) {
+    key = (int)(t & 127);
+    q = (int)((t >> 7) & 31);
+    h = (int)((t >> 12) & 3);
+    s = (int)(t >> 14);
+  } else if (total <= UINT32_MAX) {
+    unsigned u = (unsigned)t, uk = (unsigned)keys, uq = (unsigned)queries, uh = (unsigned)heads;
+    unsigned r = u / uk; key = (int)(u - r * uk);
+    unsigned rq = r / uq; q = (int)(r - rq * uq);
+    s = (int)(rq / uh); h = (int)(rq - (unsigned)s * uh);
+  } else {
+    key = (int)(t % keys); size_t rest = t / keys; q = (int)(rest % queries); rest /= queries;
+    h = (int)(rest % heads); s = (int)(rest / heads);
+  }
+  out[t] = __ldg(flat + (((size_t)s * queries + q) * keys + key) * nblocks * heads + block * heads + h);
 }
 // per token: mean over its real atoms of relu(projected)
 // (over `rows` token rows of every sample, the mask read per sample's token: row % tokens)
@@ -1199,7 +1246,7 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     // still reads the full conditioning
     o.qStart = scratch<float>(E + ".qStart", qRows * C);
     CK(cudaMemcpyAsync(o.qStart, o.qCond, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qStart, o.qMask, qRows, C, qRows);
+    scaleByRowK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(o.qStart, o.qMask, qRows, C, qRows);
   }
   if (trunkSingle) {
     int Cs = (int)M.meta(E + ".trunkSingleChannels");
@@ -1217,15 +1264,15 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     layerNormSlow(o.qCond, n, qRows, C, nullptr, nullptr);
     CK(cudaMemcpyAsync(o.qCond, n, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
-  scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qCond, o.qMask, qRows, C, qRows);
+  scaleByRowK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(o.qCond, o.qMask, qRows, C, qRows);
   o.kCond = scratch<float>(E + ".kCond", kRows * C);
   convert(q2k, o.qCond, o.kCond, C);
   o.kMask = scratch<float>(E + ".kMask", kRows);
   convert(q2k, o.qMask, o.kMask, 1);
   // the pair conditioning
   float* rq = scratch<float>("enc.rq", qRows * C); float* rk = scratch<float>("enc.rk", kRows * C);
-  reluK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qCond, rq, qRows * C);
-  reluK<<<blocks(kRows * C), 256, 0, STREAM>>>(o.kCond, rk, kRows * C);
+  reluK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(o.qCond, rq, qRows * C);
+  reluK<<<blocks((C & 3) == 0 ? (kRows * (C >> 2)) : (kRows * C)), 256, 0, STREAM>>>(o.kCond, rk, kRows * C);
   float* row = scratch<float>("enc.row", qRows * Cp); float* col = scratch<float>("enc.col", kRows * Cp);
   linear<float, float>(rq, row, qRows, C, Cp, E + ".singleToPairCondRow");
   linear<float, float>(rk, col, kRows, C, Cp, E + ".singleToPairCondCol");
@@ -1273,14 +1320,14 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   float* h1 = scratch<float>("enc.h1", pairRows * Cp); float* h2 = scratch<float>("enc.h2", pairRows * Cp);
   if (chai) {                 // chai's pair MLP: two layers, no relu on its input
     linear<float, float>(o.pair, h2, pairRows, Cp, Cp, E + ".pairMlp1");
-    reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
+    reluK<<<blocks((Cp & 3) == 0 ? (pairRows * (Cp >> 2)) : (pairRows * Cp)), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
     linear<float, float>(h1, o.pair, pairRows, Cp, Cp, E + ".pairMlp2", false, 1.f);
   } else {
-  reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(o.pair, h1, pairRows * Cp);
+  reluK<<<blocks((Cp & 3) == 0 ? (pairRows * (Cp >> 2)) : (pairRows * Cp)), 256, 0, STREAM>>>(o.pair, h1, pairRows * Cp);
   linear<float, float>(h1, h2, pairRows, Cp, Cp, E + ".pairMlp1");
-  reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
+  reluK<<<blocks((Cp & 3) == 0 ? (pairRows * (Cp >> 2)) : (pairRows * Cp)), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
   linear<float, float>(h1, h2, pairRows, Cp, Cp, E + ".pairMlp2");
-  reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
+  reluK<<<blocks((Cp & 3) == 0 ? (pairRows * (Cp >> 2)) : (pairRows * Cp)), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
   linear<float, float>(h1, o.pair, pairRows, Cp, Cp, E + ".pairMlp3", false, 1.f);
   }
   int nblocks = 0; while (M.has(E + ".blocks." + std::to_string(nblocks) + ".qProjection")) ++nblocks;

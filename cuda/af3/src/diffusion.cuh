@@ -1345,11 +1345,11 @@ maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, 
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* x = act + row * C;
-  size_t pr = row < q1 ? row : row % q1;
-  float m = qMask[pr];
+  size_t pr = row < q1 ? row : (row <= UINT32_MAX ? (unsigned)row % (unsigned)q1 : row % q1);
+  float m = __ldg(qMask + pr);
   auto val = [&](int c) {
-    float v = x[c];
-    if (prevY) v += toF(prevY[row * C + c]) * sigm(prevGate[pr * C + c]);
+    float v = __ldg(x + c);
+    if (prevY) v += toF(prevY[row * C + c]) * sigm(__ldg(prevGate + pr * C + c));
     return v * m;
   };
   if (C == 128) {
@@ -1365,8 +1365,8 @@ maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, 
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       int c = lane + 32 * k;
-      float l = (xv[k] - mean) * inv * scale[c] + (offset ? offset[c] : 0.f);
-      y0 += l * Wp[c * 3]; y1 += l * Wp[c * 3 + 1]; y2 += l * Wp[c * 3 + 2];
+      float l = (xv[k] - mean) * inv * __ldg(scale + c) + (offset ? __ldg(offset + c) : 0.f);
+      y0 += l * __ldg(Wp + c * 3); y1 += l * __ldg(Wp + c * 3 + 1); y2 += l * __ldg(Wp + c * 3 + 2);
     }
     for (int o = 16; o; o >>= 1) {
       y0 += __shfl_xor_sync(~0u, y0, o); y1 += __shfl_xor_sync(~0u, y1, o); y2 += __shfl_xor_sync(~0u, y2, o);
