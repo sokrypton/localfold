@@ -63,52 +63,138 @@ __global__ void distanceEmbedRowsK(float* z, const float* x, const int* rep, con
   for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
 }
 // row-attention pooling: pooled[i] = sum_j softmax_j(score[i, j]) z[i, j]   (a block per row, C <= 1024)
-__global__ void rowPoolK(const float* z, const float* score, float* pooled, int T, int C) {
+__global__ void rowPoolK(const float* __restrict__ z, const float* __restrict__ score, float* __restrict__ pooled, int T, int C) {
   int i = blockIdx.x;
   __shared__ float m, s;
+  __shared__ float sw[2048];
+  const float* sc = score + (size_t)i * T;
   if (threadIdx.x == 0) {
     float mx = -INFINITY;
-    for (int j = 0; j < T; ++j) mx = fmaxf(mx, score[(size_t)i * T + j]);
+    for (int j = 0; j < T; ++j) mx = fmaxf(mx, sc[j]);
     float sum = 0;
-    for (int j = 0; j < T; ++j) sum += expf(score[(size_t)i * T + j] - mx);
+    for (int j = 0; j < T; ++j) sum += expf(sc[j] - mx);
     m = mx; s = sum;
   }
   __syncthreads();
+  float mx = m, sum = s;
+  if (T <= 2048) {
+    for (int j = threadIdx.x; j < T; j += blockDim.x) sw[j] = expf(sc[j] - mx) / sum;
+    __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+      float acc = 0;
+      const float* zr = z + (size_t)i * T * C + c;
+      for (int j = 0; j < T; ++j) acc += sw[j] * zr[(size_t)j * C];
+      pooled[(size_t)i * C + c] = acc;
+    }
+    return;
+  }
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
     float acc = 0;
-    for (int j = 0; j < T; ++j) acc += expf(score[(size_t)i * T + j] - m) / s * z[((size_t)i * T + j) * C + c];
+    for (int j = 0; j < T; ++j) acc += expf(sc[j] - mx) / sum * z[((size_t)i * T + j) * C + c];
     pooled[(size_t)i * C + c] = acc;
   }
 }
-__global__ void gatherAtomsK(const float* tok, const int* atomToToken, float* out, int A, int C) {
+__global__ void gatherAtomsK(const float* __restrict__ tok, const int* __restrict__ atomToToken, float* __restrict__ out, int A, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)tok | (uintptr_t)out) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = (size_t)A * c4;
+    if (t < n4) {
+      int a = (int)(t / (size_t)c4), c = (int)(t % (size_t)c4);
+      reinterpret_cast<float4*>(out)[t] = __ldg(reinterpret_cast<const float4*>(tok + (size_t)atomToToken[a] * C) + c);
+    }
+    return;
+  }
   if (t < (size_t)A * C) out[t] = tok[(size_t)atomToToken[t / C] * C + t % C];
 }
 // per atom: logits over bins from its slot's table, then the expectation over [0, 1]
-__global__ void plddtAtomK(const float* s, const int* slot, const float* table, float* plddt, int A, int C, int bins) {
-  int a = blockIdx.x;
+__global__ void plddtAtomK(const float* __restrict__ s, const int* __restrict__ slot, const float* __restrict__ table,
+                           float* __restrict__ plddt, int A, int C, int bins) {
+  int a = blockIdx.x, tid = threadIdx.x;
+  __shared__ float shS[512];
   __shared__ float logit[64];
+  __shared__ float mxSh;
+  const float* sa = s + (size_t)a * C;
+  if (C <= 512) {
+    for (int c = tid; c < C; c += blockDim.x) shS[c] = __ldg(sa + c);
+    __syncthreads();
+  }
   const float* tb = table + (size_t)slot[a] * C * bins;
-  for (int b = threadIdx.x; b < bins; b += blockDim.x) {
-    float acc = 0;
-    for (int c = 0; c < C; ++c) acc += s[(size_t)a * C + c] * tb[(size_t)c * bins + b];
-    logit[b] = acc;
+  if (C == 384 && bins == 50) {
+    if (tid < 50) {
+      float acc = 0;
+      const float* tbb = tb + tid;
+      #pragma unroll 8
+      for (int c = 0; c < 384; ++c) acc += shS[c] * __ldg(tbb + c * 50);
+      logit[tid] = acc;
+    }
+  } else {
+    for (int b = tid; b < bins; b += blockDim.x) {
+      float acc = 0;
+      const float* tbb = tb + b;
+      if (C <= 512) {
+        #pragma unroll 4
+        for (int c = 0; c < C; ++c) acc += shS[c] * __ldg(tbb + (size_t)c * bins);
+      } else {
+        for (int c = 0; c < C; ++c) acc += sa[c] * tbb[(size_t)c * bins];
+      }
+      logit[b] = acc;
+    }
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    float mx = -INFINITY; for (int b = 0; b < bins; ++b) mx = fmaxf(mx, logit[b]);
+  if (tid == 0) {
+    float mx = -INFINITY;
+    for (int b = 0; b < bins; ++b) mx = fmaxf(mx, logit[b]);
+    mxSh = mx;
+  }
+  __syncthreads();
+  float mx = mxSh;
+  for (int b = tid; b < bins; b += blockDim.x) logit[b] = expf(logit[b] - mx);
+  __syncthreads();
+  if (tid == 0) {
     float tot = 0, e = 0;
-    for (int b = 0; b < bins; ++b) { float w = expf(logit[b] - mx); tot += w; e += w * (b + 0.5f) / bins; }
+    for (int b = 0; b < bins; ++b) { float w = logit[b]; tot += w; e += w * (b + 0.5f) / bins; }
     plddt[a] = e / tot;
   }
 }
 
 // PAE and the pTM terms from the logits, a thread a pair: pae = sum p_b centre_b, tm = sum p_b / (1 + (centre_b / d0)^2);
 // then a block a row: the row's mean tm over every column and over the other chains' columns (double)
-__global__ void paeK(const float* logits, float* pae, float* tm, size_t P, int bins, double width, double d0) {
+__global__ void paeK(const float* __restrict__ logits, float* __restrict__ pae, float* __restrict__ tm,
+                     size_t P, int bins, double width, double d0) {
+  __shared__ double shCentre[64], shDenom[64];
+  if (bins <= 64 && threadIdx.x < bins) {
+    int b = threadIdx.x;
+    double centre = width * (b + 0.5), r = centre / d0;
+    shCentre[b] = centre;
+    shDenom[b] = 1.0 / (1.0 + r * r);
+  }
+  __syncthreads();
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= P) return;
   const float* lg = logits + ij * bins;
+  if (bins == 64 && ((uintptr_t)lg & 15) == 0) {
+    const float4* lg4 = reinterpret_cast<const float4*>(lg);
+    float4 v[16];
+    float mx = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      float4 q = __ldg(lg4 + k);
+      v[k] = q;
+      mx = fmaxf(mx, fmaxf(fmaxf(q.x, q.y), fmaxf(q.z, q.w)));
+    }
+    double tot = 0, mean = 0, t = 0;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      int b0 = k * 4;
+      double w0 = exp((double)v[k].x - mx); tot += w0; mean += w0 * shCentre[b0 + 0]; t += w0 * shDenom[b0 + 0];
+      double w1 = exp((double)v[k].y - mx); tot += w1; mean += w1 * shCentre[b0 + 1]; t += w1 * shDenom[b0 + 1];
+      double w2 = exp((double)v[k].z - mx); tot += w2; mean += w2 * shCentre[b0 + 2]; t += w2 * shDenom[b0 + 2];
+      double w3 = exp((double)v[k].w - mx); tot += w3; mean += w3 * shCentre[b0 + 3]; t += w3 * shDenom[b0 + 3];
+    }
+    pae[ij] = (float)(mean / tot); tm[ij] = (float)(t / tot);
+    return;
+  }
   float mx = -INFINITY;
   for (int b = 0; b < bins; ++b) mx = fmaxf(mx, lg[b]);
   double tot = 0, mean = 0, t = 0;

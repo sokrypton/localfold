@@ -114,13 +114,41 @@ inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, 
 }
 
 // ---------------------------------------------------------------- the trunk, float32
-__global__ void triSplitInterleavedK(const float* proj, const float* gate, const float* mask, float* a, float* b,
+__global__ void triSplitInterleavedK(const float* __restrict__ proj, const float* __restrict__ gate,
+                                     const float* __restrict__ mask, float* __restrict__ a, float* __restrict__ b,
                                      size_t pairs, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= pairs * 2 * C) return;
-  int c2 = (int)(t % (2 * C)); size_t ij = t / (2 * C);
-  float v = proj[t] * mask[ij] / (1.f + expf(-gate[t]));
-  (c2 & 1 ? b : a)[(size_t)(c2 >> 1) * pairs + ij] = v;
+  __shared__ float tileA[32][33], tileB[32][33];
+  size_t r0 = (size_t)blockIdx.x * 32;
+  int c0 = (int)blockIdx.y * 32;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int cLoad = c0 + tx;
+  #pragma unroll
+  for (int ry = ty; ry < 32; ry += 8) {
+    size_t r = r0 + ry;
+    float va = 0.f, vb = 0.f;
+    if (r < pairs && cLoad < C) {
+      float m = __ldg(mask + r);
+      float2 pr = __ldg(reinterpret_cast<const float2*>(proj + r * 2 * C) + cLoad);
+      float2 gt = __ldg(reinterpret_cast<const float2*>(gate + r * 2 * C) + cLoad);
+      va = pr.x * m / (1.f + expf(-gt.x));
+      vb = pr.y * m / (1.f + expf(-gt.y));
+    }
+    tileA[ry][tx] = va;
+    tileB[ry][tx] = vb;
+  }
+  __syncthreads();
+  size_t rStore = r0 + tx;
+  if (rStore < pairs) {
+    #pragma unroll
+    for (int cy = ty; cy < 32; cy += 8) {
+      int c = c0 + cy;
+      if (c < C) {
+        size_t at = (size_t)c * pairs + rStore;
+        a[at] = tileA[tx][cy];
+        b[at] = tileB[tx][cy];
+      }
+    }
+  }
 }
 __global__ void fillK(float* out, float v, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -135,7 +163,8 @@ inline void triangle(float* pair, const float* mask, int L, int C, const std::st
   gemm(xn, F(Tn + "projection"), proj, P, C, 2 * C);
   gemm(xn, F(Tn + "gate"), gate, P, C, 2 * C);
   float* a = scratch<float>("tri.a", P * C); float* b = scratch<float>("tri.b", P * C);
-  triSplitInterleavedK<<<blocks(P * 2 * C), 256, 0, STREAM>>>(proj, gate, mask, a, b, P, C);
+  triSplitInterleavedK<<<dim3((unsigned)((P + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
+      proj, gate, mask, a, b, P, C);
   float* prod = scratch<float>("tri.prod", P * C);
   const float one = 1.f, zero = 0.f;
   // per channel (row-major [i][k] planes): outgoing out[i,j] = sum_k a[i,k] b[j,k]; incoming sum_k a[k,j] b[k,i]
@@ -144,13 +173,14 @@ inline void triangle(float* pair, const float* mask, int L, int C, const std::st
   else
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, L, &one, a, L, P, b, L, P, &zero, prod, L, P, C));
   float* rowsP = scratch<float>("tri.rows", P * C);
-  channelMajorToRowsK<<<blocks(P * C), 256, 0, STREAM>>>(prod, rowsP, P, C);
+  channelMajorToRowsTileK<<<dim3((unsigned)((P + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
+      prod, rowsP, P, C);
   layerNorm(rowsP, rowsP, P, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
   float* out = scratch<float>("tri.out", P * C);
   gemm(rowsP, F(Tn + "outputProjection"), out, P, C, C);
   float* g = scratch<float>("tri.g", P * C);
   gemm(xn, F(Tn + "gatingLinear"), g, P, C, C);
-  gateMulAddK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, g, P * C);
+  gateMulAddK<<<blocks((C & 3) == 0 ? P * (size_t)(C >> 2) : P * C), 256, 0, STREAM>>>(pair, out, g, P * C);
 }
 // the SwiGLU transition over any rows (the MSA encoder's MSA track too), residual added
 inline void rowsTransition(float* x, size_t P, int C, const std::string& Tn) {
@@ -164,7 +194,7 @@ inline void rowsTransition(float* x, size_t P, int C, const std::string& Tn) {
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
     gemm(xn + r0 * C, F(Tn + "transition1"), h, r, C, 2 * I);
-    swigluK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
+    swigluK<<<blocks((I & 3) == 0 ? r * (size_t)(I >> 2) : r * I), 256, 0, STREAM>>>(h, g, r, I);
     gemm(g, F(Tn + "transition2"), pair + r0 * C, r, I, C, 1.f);
   }
 }
@@ -468,12 +498,32 @@ inline bool parcaeRecycle() { return M.has("f/recycle/decay"); }
 // works on a bf16 copy of the pair - the triangle's input and output kernels and the transition read and write
 // half the bytes, the transition's second GEMM accumulating into it in bf16 - converted in before the run and out
 // after it (the recycle's own arithmetic on z stays f32). LOCALFOLD_PAIR_F32=1 keeps the f32 pair.
-__global__ void ef2ToBf16K(const float* in, __nv_bfloat16* out, size_t n) {
+__global__ void ef2ToBf16K(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)in & 15) == 0 && ((uintptr_t)out & 7) == 0) {
+    size_t n4 = n >> 2;
+    if (i < n4) {
+      float4 v = __ldg(reinterpret_cast<const float4*>(in) + i);
+      __nv_bfloat162 b0 = __floats2bfloat162_rn(v.x, v.y);
+      __nv_bfloat162 b1 = __floats2bfloat162_rn(v.z, v.w);
+      reinterpret_cast<uint2*>(out)[i] = make_uint2(*reinterpret_cast<uint32_t*>(&b0), *reinterpret_cast<uint32_t*>(&b1));
+    }
+    return;
+  }
   if (i < n) out[i] = __float2bfloat16(in[i]);
 }
-__global__ void ef2FromBf16K(const __nv_bfloat16* in, float* out, size_t n) {
+__global__ void ef2FromBf16K(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)in & 7) == 0 && ((uintptr_t)out & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (i < n4) {
+      uint2 u = __ldg(reinterpret_cast<const uint2*>(in) + i);
+      float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+      float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+      reinterpret_cast<float4*>(out)[i] = make_float4(f0.x, f0.y, f1.x, f1.y);
+    }
+    return;
+  }
   if (i < n) out[i] = __bfloat162float(in[i]);
 }
 inline bool ef2Pair16(int L, int C) {
@@ -492,11 +542,11 @@ inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std:
   if (!ef2Pair16(L, C)) { for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b); return; }
   size_t n = (size_t)L * L * C;
   __nv_bfloat16* p16 = scratch<__nv_bfloat16>("ef2.p16", n);
-  ef2ToBf16K<<<blocks(n), 256, 0, STREAM>>>(pair, p16, n);
+  ef2ToBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(pair, p16, n);
   PAIR16 = true;
   for (int b = from; b < to; ++b) trunkBlock(reinterpret_cast<float*>(p16), mask, L, C, prefix, b);
   PAIR16 = false;
-  ef2FromBf16K<<<blocks(n), 256, 0, STREAM>>>(p16, pair, n);
+  ef2FromBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(p16, pair, n);
 }
 
 inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check,

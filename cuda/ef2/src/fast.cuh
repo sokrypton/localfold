@@ -149,25 +149,35 @@ inline int FUSED_MIN_TOKENS = 80;
 // pg [P, 5C] = [projection 2C | gate 2C | gatingLinear C] (f16); a, b channel-major planes [C][Lp][Lp]
 // (the pad zero), interleaved: a = proj[2c] * mask * sigmoid(gate[2c]), b likewise at 2c + 1. A 32-pair x
 // 32-channel tile goes through shared memory so both the read and the write are coalesced.
-__global__ void triSplitHK(const half* pg, const float* mask, half* a, half* b, size_t pairs, int C, int L, int Lp) {
+__global__ void triSplitHK(const half* __restrict__ pg, const float* __restrict__ mask, half* __restrict__ a,
+                           half* __restrict__ b, size_t pairs, int C, int L, int Lp) {
   __shared__ float A[32][33], B[32][33];
   size_t r0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
   int tx = threadIdx.x, ty = threadIdx.y;
+  int cLoad = c0 + tx;
+  #pragma unroll
   for (int ry = ty; ry < 32; ry += 8) {
-    size_t r = r0 + ry; int c = c0 + tx;
+    size_t r = r0 + ry;
     float va = 0, vb = 0;
     if (r < pairs) {
-      const half* p = pg + r * 5 * C; float m = mask[r];
-      va = __half2float(p[2 * c]) * m / (1.f + __expf(-__half2float(p[2 * C + 2 * c])));
-      vb = __half2float(p[2 * c + 1]) * m / (1.f + __expf(-__half2float(p[2 * C + 2 * c + 1])));
+      const half* p = pg + r * 5 * C; float m = __ldg(mask + r);
+      half2 pr = __ldg(reinterpret_cast<const half2*>(p) + cLoad);
+      half2 gt = __ldg(reinterpret_cast<const half2*>(p + 2 * C) + cLoad);
+      float2 pf = __half22float2(pr), gf = __half22float2(gt);
+      va = pf.x * m / (1.f + __expf(-gf.x));
+      vb = pf.y * m / (1.f + __expf(-gf.y));
     }
     A[ry][tx] = va; B[ry][tx] = vb;
   }
   __syncthreads();
-  for (int cy = ty; cy < 32; cy += 8) {
-    size_t r = r0 + tx; int c = c0 + cy;
-    if (r < pairs) {
-      size_t at = (size_t)c * Lp * Lp + (r / L) * Lp + r % L;
+  size_t rStore = r0 + tx;
+  if (rStore < pairs) {
+    unsigned ur = (unsigned)rStore, uL = (unsigned)L, q = ur / uL;
+    size_t plane = (size_t)Lp * Lp;
+    size_t planeIdx = (size_t)q * Lp + (ur - q * uL);
+    #pragma unroll
+    for (int cy = ty; cy < 32; cy += 8) {
+      size_t at = (size_t)(c0 + cy) * plane + planeIdx;
       a[at] = __float2half(A[tx][cy]); b[at] = __float2half(B[tx][cy]);
     }
   }
@@ -202,7 +212,7 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
                                                                               F(Tn + "centerNormOffset"), L, Lp);
   float* out = scratch<float>("ftri.out", P * C);
   ltGemm(cn, Fh(Tn + "outputProjection"), out, false, P, C, C, nullptr, false, 0.f);
-  gateMulAddHK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, pg + 4 * C, P, C, 5 * C);
+  gateMulAddHK<<<blocks((C & 3) == 0 ? P * (size_t)(C >> 2) : P * C), 256, 0, STREAM>>>(pair, out, pg + 4 * C, P, C, 5 * C);
 }
 __global__ void swigluHK(const half* h, half* g, size_t rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

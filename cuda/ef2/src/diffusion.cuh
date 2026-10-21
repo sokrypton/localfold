@@ -24,8 +24,17 @@ __global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, 
   out[t] = c < C ? (z16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(z)[p * C + c]) : z[p * C + c])   // (EF2_Z16)
                  : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
 }
-__global__ void siluMulK(const float* a, const float* b, float* out, size_t n) {
+__global__ void siluMulK(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)a | (uintptr_t)b | (uintptr_t)out) & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 av = __ldg(reinterpret_cast<const float4*>(a) + t);
+      float4 bv = __ldg(reinterpret_cast<const float4*>(b) + t);
+      reinterpret_cast<float4*>(out)[t] = make_float4(siluF(av.x) * bv.x, siluF(av.y) * bv.y, siluF(av.z) * bv.z, siluF(av.w) * bv.w);
+    }
+    return;
+  }
   if (t < n) out[t] = siluF(a[t]) * b[t];
 }
 // TransitionLayer: x += out(silu(LN(x) @ a) * (LN(x) @ b)), over rows in chunks
@@ -39,7 +48,8 @@ inline void transitionLayer(float* x, size_t rows, int C, const std::string& B) 
     layerNorm(x + r0 * C, xn, r, C, F(B + "norm/scale"), F(B + "norm/offset"));
     gemm(xn, F(B + "aProjection"), a, r, C, Hd);
     gemm(xn, F(B + "bProjection"), b, r, C, Hd);
-    siluMulK<<<blocks(r * Hd), 256, 0, STREAM>>>(a, b, a, r * Hd);
+    size_t n = r * Hd;
+    siluMulK<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(a, b, a, n);
     gemm(a, F(B + "outProjection"), x + r0 * C, r, Hd, C, 1.f);
   }
 }
@@ -55,8 +65,19 @@ __global__ void fourierK(const float* w, const float* b, const float* level, flo
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = cosf(2.f * 3.14159265358979323846f * (level[0] * w[i] + b[i]));
 }
-__global__ void addRowK(float* x, const float* row, size_t rows, int C) {
+__global__ void addRowK(float* __restrict__ x, const float* __restrict__ row, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)x | (uintptr_t)row) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t < n4) {
+      int c = (int)((unsigned)t % (unsigned)c4);
+      float4 xv = reinterpret_cast<const float4*>(x)[t];
+      float4 rv = __ldg(reinterpret_cast<const float4*>(row) + c);
+      reinterpret_cast<float4*>(x)[t] = make_float4(xv.x + rv.x, xv.y + rv.y, xv.z + rv.z, xv.w + rv.w);
+    }
+    return;
+  }
   if (t < rows * C) x[t] += row[t % C];
 }
 __global__ void coordsInputK(const float* x, const float* level, float* out, int A) {   // [A, 6] = [x / denom | 0]
@@ -77,12 +98,54 @@ __global__ void adaCombineK(const float* an, const float* g, const float* gb, co
 // ...the LayerNorm (affine-free) and that combine in one pass: a block a row, its first warp taking the statistics
 // with layerNormK's arithmetic exactly, then all of the block writing the row (a warp a row put the whole combine on
 // T warps - 9 blocks at 68 tokens - and was slower than the two kernels)
-__global__ void adaLNK(const float* a, const float* g, const float* gb, const float* sh, float* out, size_t T, int C, int ld) {
+__global__ void adaLNK(const float* __restrict__ a, const float* __restrict__ g, const float* __restrict__ gb,
+                       const float* __restrict__ sh, float* __restrict__ out, size_t T, int C, int ld) {
+  __shared__ float4 sx4[256];
   __shared__ float stats[2];
+  float* sx = reinterpret_cast<float*>(sx4);
   size_t row = blockIdx.x;
   const float* xr = a + row * C;
-  if (threadIdx.x < 32) {
-    int lane = threadIdx.x;
+  int tid = threadIdx.x;
+  if (C == 768 && (((uintptr_t)xr | (uintptr_t)(g + row * ld) | (uintptr_t)gb | (uintptr_t)(sh + row * ld) | (uintptr_t)(out + row * 768)) & 15) == 0) {
+    float4 x4, g4, gb4, sh4;
+    if (tid < 192) {
+      x4 = __ldg(reinterpret_cast<const float4*>(xr) + tid);
+      g4 = __ldg(reinterpret_cast<const float4*>(g + row * ld) + tid);
+      gb4 = __ldg(reinterpret_cast<const float4*>(gb) + tid);
+      sh4 = __ldg(reinterpret_cast<const float4*>(sh + row * ld) + tid);
+      sx4[tid] = x4;
+    }
+    __syncthreads();
+    if (tid < 32) {
+      float s = 0;
+      #pragma unroll
+      for (int k = 0; k < 24; ++k) s += sx[k * 32 + tid];
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s * (1.f / 768.f), v = 0;
+      #pragma unroll
+      for (int k = 0; k < 24; ++k) { float d = sx[k * 32 + tid] - mean; v += d * d; }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      if (tid == 0) { stats[0] = mean; stats[1] = rsqrtf(v * (1.f / 768.f) + 1e-5f); }
+    }
+    __syncthreads();
+    if (tid < 192) {
+      float mean = stats[0], inv = stats[1];
+      float n0 = __fmul_rn(x4.x - mean, inv);
+      float n1 = __fmul_rn(x4.y - mean, inv);
+      float n2 = __fmul_rn(x4.z - mean, inv);
+      float n3 = __fmul_rn(x4.w - mean, inv);
+      reinterpret_cast<float4*>(out + row * 768)[tid] = make_float4(
+          __fadd_rn(n0 / (1.f + expf(-(g4.x + gb4.x))), sh4.x),
+          __fadd_rn(n1 / (1.f + expf(-(g4.y + gb4.y))), sh4.y),
+          __fadd_rn(n2 / (1.f + expf(-(g4.z + gb4.z))), sh4.z),
+          __fadd_rn(n3 / (1.f + expf(-(g4.w + gb4.w))), sh4.w));
+    }
+    return;
+  }
+  if (tid < 32) {
+    int lane = tid;
     float s = 0;
     for (int c = lane; c < C; c += 32) s += xr[c];
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
@@ -93,37 +156,129 @@ __global__ void adaLNK(const float* a, const float* g, const float* gb, const fl
   }
   __syncthreads();
   float mean = stats[0], inv = stats[1];
-  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+  for (int c = tid; c < C; c += blockDim.x) {
     float n = __fmul_rn(xr[c] - mean, inv);
     size_t gi = row * ld + c;
     out[row * C + c] = __fadd_rn(n / (1.f + expf(-(g[gi] + gb[c]))), sh[gi]);
   }
 }
 // a[t] += x[t] * sigmoid(g + gb): sigmoidMulK then addK in one pass, with their two roundings (no contraction)
-__global__ void gateAddK(float* a, const float* x, const float* g, const float* gb, size_t T, int C, int ld) {
+__global__ void gateAddK(float* __restrict__ a, const float* __restrict__ x, const float* __restrict__ g,
+                         const float* __restrict__ gb, size_t T, int C, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= T * C) return;
-  float o = __fmul_rn(x[t], 1.f / (1.f + expf(-(g[(t / C) * ld + t % C] + gb[t % C]))));
+  size_t n = T * (size_t)C;
+  if (t >= n) return;
+  size_t r; int c;
+  if (C == 768 && n <= UINT32_MAX) {
+    unsigned u = (unsigned)t, q = u / 768u;
+    r = q; c = (int)(u - q * 768u);
+  } else if (n <= UINT32_MAX) {
+    unsigned u = (unsigned)t, uc = (unsigned)C, q = u / uc;
+    r = q; c = (int)(u - q * uc);
+  } else {
+    r = t / C; c = (int)(t % C);
+  }
+  float o = __fmul_rn(__ldg(x + t), 1.f / (1.f + expf(-(__ldg(g + r * (size_t)ld + c) + __ldg(gb + c)))));
   a[t] = __fadd_rn(a[t], o);
 }
-__global__ void sigmoidMulK(float* x, const float* g, const float* gb, size_t T, int C, int ld) {   // x *= sigmoid(g (+ gb))
+__global__ void sigmoidMulK(float* __restrict__ x, const float* __restrict__ g, const float* __restrict__ gb, size_t T, int C, int ld) {   // x *= sigmoid(g (+ gb))
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (ld & 3) == 0 && (((uintptr_t)x | (uintptr_t)g | (uintptr_t)gb) & 15) == 0) {
+    int c4 = C >> 2, ld4 = ld >> 2;
+    size_t n4 = T * (size_t)c4;
+    if (t >= n4) return;
+    unsigned u = (unsigned)t, uc = (unsigned)c4, r = u / uc, c = u - r * uc;
+    float4 xv = reinterpret_cast<const float4*>(x)[t];
+    float4 gv = __ldg(reinterpret_cast<const float4*>(g) + (size_t)r * ld4 + c);
+    float4 gbv = gb ? __ldg(reinterpret_cast<const float4*>(gb) + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    reinterpret_cast<float4*>(x)[t] = make_float4(
+        xv.x / (1.f + expf(-(gv.x + gbv.x))),
+        xv.y / (1.f + expf(-(gv.y + gbv.y))),
+        xv.z / (1.f + expf(-(gv.z + gbv.z))),
+        xv.w / (1.f + expf(-(gv.w + gbv.w))));
+    return;
+  }
   if (t >= T * C) return;
   x[t] *= 1.f / (1.f + expf(-(g[(t / C) * ld + t % C] + (gb ? gb[t % C] : 0.f))));
 }
 // out[j] = x * scale[j] for each of n scales, [n, rows, C]
-__global__ void scaleCopiesK(const float* x, const float* scales, float* out, size_t rows, int C, int n) {
+__global__ void scaleCopiesK(const float* __restrict__ x, const float* __restrict__ scales, float* __restrict__ out,
+                             size_t rows, int C, int n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)x | (uintptr_t)scales | (uintptr_t)out) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t per4 = rows * (size_t)c4, total4 = (size_t)n * per4;
+    if (t >= total4) return;
+    unsigned u = (unsigned)t, uper = (unsigned)per4, uc = (unsigned)c4;
+    unsigned j = u / uper, r = u - j * uper, q = r / uc, c = r - q * uc;
+    float4 xv = __ldg(reinterpret_cast<const float4*>(x) + r);
+    float4 sv = __ldg(reinterpret_cast<const float4*>(scales) + (size_t)j * c4 + c);
+    reinterpret_cast<float4*>(out)[t] = make_float4(xv.x * sv.x, xv.y * sv.y, xv.z * sv.z, xv.w * sv.w);
+    return;
+  }
   if (t >= (size_t)n * rows * C) return;
   size_t per = rows * C; int j = (int)(t / per); size_t r = t % per;
   out[t] = x[r] * scales[(size_t)j * C + r % C];
 }
 // scores [H, T, T] + bias [H, T, T], softmax per row
 template <class B>
-__global__ void biasSoftmaxK(float* S, const B* bias, int T, float scale) {
+__global__ void biasSoftmaxK(float* __restrict__ S, const B* __restrict__ bias, int T, float scale) {
   size_t row = blockIdx.x;
   float* s = S + row * T; const B* b = bias + row * T;
   __shared__ float red[32];
+  if (T <= 1024) {
+    float sv[4];
+    float m = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < T) {
+        float v = s[j] * scale + (float)b[j];
+        sv[k] = v;
+        m = fmaxf(m, v);
+      }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -INFINITY;
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o));
+      if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    m = red[0];
+    float sum = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < T) {
+        float e = expf(sv[k] - m);
+        sv[k] = e;
+        sum += e;
+      }
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    float inv = 1.f / red[0];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int j = threadIdx.x + k * 256;
+      if (j < T) s[j] = sv[k] * inv;
+    }
+    return;
+  }
   float m = -INFINITY;
   for (int j = threadIdx.x; j < T; j += blockDim.x) { float v = s[j] * scale + (float)b[j]; s[j] = v; m = fmaxf(m, v); }
   for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
@@ -182,16 +337,49 @@ __global__ void pairToFlashBiasK(const float* pb, half* out, int T, int Hh, int 
   out[((size_t)h * T + i) * stride + j] = __float2half(pb[t] * 1.4426950408889634f);
 }
 // [T, 4C] f32 -> f16, the flash kernel's q | k | v | gate rows (the projection's columns in that order)
-__global__ void toHalfRowsK(const float* x, half* y, size_t n) {
+__global__ void toHalfRowsK(const float* __restrict__ x, half* __restrict__ y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)x & 15) == 0 && ((uintptr_t)y & 7) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 v = __ldg(reinterpret_cast<const float4*>(x) + t);
+      half2 h0 = __floats2half2_rn(v.x, v.y);
+      half2 h1 = __floats2half2_rn(v.z, v.w);
+      reinterpret_cast<uint2*>(y)[t] = make_uint2(*reinterpret_cast<uint32_t*>(&h0), *reinterpret_cast<uint32_t*>(&h1));
+    }
+    return;
+  }
   if (t < n) y[t] = __float2half(x[t]);
 }
-__global__ void halfToFloatK(const half* x, float* y, size_t n) {
+__global__ void halfToFloatK(const half* __restrict__ x, float* __restrict__ y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)x & 7) == 0 && ((uintptr_t)y & 15) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      uint2 u = __ldg(reinterpret_cast<const uint2*>(x) + t);
+      float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&u.x));
+      float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&u.y));
+      reinterpret_cast<float4*>(y)[t] = make_float4(f0.x, f0.y, f1.x, f1.y);
+    }
+    return;
+  }
   if (t < n) y[t] = __half2float(x[t]);
 }
-__global__ void gatherTokensK(const float* perToken, const int* atomToToken, const float* mask, float* q, int A, int C) {
+__global__ void gatherTokensK(const float* __restrict__ perToken, const int* __restrict__ atomToToken,
+                              const float* __restrict__ mask, float* __restrict__ q, int A, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)perToken | (uintptr_t)q) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = (size_t)A * c4;
+    if (t >= n4) return;
+    int a = (c4 == 32) ? (int)(t >> 5) : (int)(t / (size_t)c4);
+    int c = (c4 == 32) ? (int)(t & 31) : (int)(t % (size_t)c4);
+    int token = __ldg(mask + a) != 0.f ? __ldg(atomToToken + a) : 0;
+    float4 qv = reinterpret_cast<const float4*>(q)[t];
+    float4 pv = __ldg(reinterpret_cast<const float4*>(perToken + (size_t)token * C) + c);
+    reinterpret_cast<float4*>(q)[t] = make_float4(qv.x + pv.x, qv.y + pv.y, qv.z + pv.z, qv.w + pv.w);
+    return;
+  }
   if (t >= (size_t)A * C) return;
   int a = (int)(t / C), c = (int)(t % C);
   int token = mask[a] != 0.f ? atomToToken[a] : 0;
@@ -343,7 +531,7 @@ inline void conditioningSingle(const Denoiser& d, float* single) {
   fourierK<<<blocks(nf), 256, 0, STREAM>>>(F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), d.level, four, nf);
   layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
   gemm(four, F("diffusion/noiseProjection"), noise, 1, nf, Ct);
-  addRowK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(single, noise, T, Ct);
+  addRowK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(single, noise, T, Ct);
   for (int l = 0; l < 2; ++l) transitionLayer(single, T, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
 }
 
@@ -352,7 +540,7 @@ inline void singleProjections(const Denoiser& d) {
   int T = d.T, C = d.Ct, n = 2 * d.tokenBlocks;
   float* sn = scratch<float>("dn.sn0", (size_t)T * C);
   layerNorm(d.single, sn, T, C, nullptr, nullptr);
-  scaleCopiesK<<<blocks((size_t)n * T * C), 256, 0, STREAM>>>(sn, d.scales, d.snScaled, T, C, n);
+  scaleCopiesK<<<blocks((C & 3) == 0 ? (size_t)n * T * (C >> 2) : (size_t)n * T * C), 256, 0, STREAM>>>(sn, d.scales, d.snScaled, T, C, n);
   const float one = 1.f, zero = 0.f;
   cublasComputeType_t ct = GEMM16 ? CUBLAS_COMPUTE_32F_FAST_16F : FAST ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   CB(cublasGemmBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, T, C, &one, d.ptrs, CUDA_R_32F, C, d.ptrs + d.entries,
@@ -368,6 +556,7 @@ inline void adaLN(const Denoiser& d, const float* a, float* out, int e, const st
 
 inline void tokenBlock(const Denoiser& d, float* a, int b) {
   int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
+  size_t tcVec = (C & 3) == 0 ? (size_t)T * (C >> 2) : (size_t)T * C;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
   float* x = scratch<float>("tb.x", (size_t)T * C);
   adaLN(d, a, x, 4 * b, B + "attention/adaln/");
@@ -382,7 +571,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
     float* qkvg = scratch<float>("tb.qkvg", (size_t)T * 4 * C);
     gemm(x, W(wq), qkvg, T, C, 4 * C);
     half* qh = scratch<half>("tb.qkvgh", (size_t)(T + 128) * 4 * C);    // (padding: the last query block's rows)
-    toHalfRowsK<<<blocks((size_t)T * 4 * C), 256, 0, STREAM>>>(qkvg, qh, (size_t)T * 4 * C);
+    toHalfRowsK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(qkvg, qh, (size_t)T * 4 * C);
     mg::Shared* ohS = EF2_QROWS ? &mg::shared("ef2.tok.oh", (size_t)T * C * 2) : nullptr;
     half* oh = ohS ? (half*)ohS->local : scratch<half>("tb.oh", (size_t)T * C);
     if (EF2_QROWS) { FLASH_QLO = EF2_QLO; FLASH_QHI = EF2_QLO + EF2_QROWS; FLASH_BIAS_ROWS = EF2_QROWS; }
@@ -391,7 +580,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
     FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
     if (ohS) mg::allGather(*ohS, (size_t)EF2_QLO * C * 2, (size_t)EF2_QROWS * C * 2);   // (every rank's query rows)
     float* ctx = scratch<float>("tb.ctx", (size_t)T * C);
-    halfToFloatK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(oh, ctx, (size_t)T * C);
+    halfToFloatK<<<blocks(tcVec), 256, 0, STREAM>>>(oh, ctx, (size_t)T * C);
     gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
   } else {
   float* q = scratch<float>("tb.q", (size_t)T * C); float* kv = scratch<float>("tb.kv", (size_t)T * 2 * C);
@@ -408,7 +597,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   else biasSoftmaxK<<<(unsigned)(Hh * T), 256, 0, STREAM>>>(S, (const float*)d.biases[b], T, 1.f / sqrtf((float)D));
   CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, D, T, T, &one, kv + C, 2 * C, D, S, T, (long long)T * T,
                                &zero, ctx, C, D, Hh));
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
+  sigmoidMulK<<<blocks(tcVec), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
   }
   gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
@@ -417,7 +606,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
   float* w = scratch<float>("tb.wide", (size_t)T * 2 * Hd); float* g = scratch<float>("tb.gated", (size_t)T * Hd);
   gemm(x, F(B + "transition/swishWeights"), w, T, C, 2 * Hd);
-  swigluK<<<blocks((size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
+  swigluK<<<blocks((Hd & 3) == 0 ? (size_t)T * (Hd >> 2) : (size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
   gemm(g, F(B + "transition/outWeights"), o, T, Hd, C);
   gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
 }
@@ -437,23 +626,23 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   coordsInputK<<<blocks((size_t)A * 6), 256, 0, STREAM>>>(xNoisy, d.level, r6, A);
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
   gemm(r6, F("diffusionAtomEncoder/coordsLinear"), q, A, 6, Ca);
-  addK<<<blocks((size_t)A * Ca), 256, 0, STREAM>>>(q, d.atoms.c0, (size_t)A * Ca);
+  addK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(q, d.atoms.c0, (size_t)A * Ca);
   swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW);
   float* tok = scratch<float>("dn.tok", (size_t)A * Ct);
   gemm(q, F("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
-  reluK<<<blocks((size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
+  reluK<<<blocks((Ct & 3) == 0 ? (size_t)A * (Ct >> 2) : (size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
   float* a = scratch<float>("dn.a", (size_t)T * Ct);
   scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, T, Ct, Ct);
   float* sn = scratch<float>("dn.sn", (size_t)T * Ct); float* st = scratch<float>("dn.st", (size_t)T * Ct);
   layerNorm(single, sn, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   gemm(sn, F("diffusion/singleToToken"), st, T, Ct, Ct);
-  addK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(a, st, (size_t)T * Ct);
+  addK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(a, st, (size_t)T * Ct);
   for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, a, b);
   layerNorm(a, a, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
   gemm(a, F("diffusionAtomDecoder/tokenToAtom"), pt, T, Ct, Ca);
-  gatherTokensK<<<blocks((size_t)A * Ca), 256, 0, STREAM>>>(pt, Idev("atom_to_token"), ac.mask, q, A, Ca);
+  gatherTokensK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(pt, Idev("atom_to_token"), ac.mask, q, A, Ca);
   swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW);
   layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
   float* r = scratch<float>("dn.r", (size_t)A * 3);

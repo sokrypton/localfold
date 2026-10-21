@@ -162,7 +162,19 @@ __global__ void swigluK(const float* __restrict__ h, float* __restrict__ g, size
     size_t n4 = rows * (size_t)f4;
     if (t >= n4) return;
     size_t r; int c4;
-    if (n4 <= UINT32_MAX) {
+    if ((f4 & (f4 - 1)) == 0) {
+      c4 = (int)(t & (size_t)(f4 - 1));
+      r = t >> (__ffs(f4) - 1);
+    } else if (f4 == 768 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 768u;
+      r = q; c4 = (int)(u - q * 768u);
+    } else if (f4 == 640 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 640u;
+      r = q; c4 = (int)(u - q * 640u);
+    } else if (f4 == 480 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 480u;
+      r = q; c4 = (int)(u - q * 480u);
+    } else if (n4 <= UINT32_MAX) {
       unsigned u = (unsigned)t, uf = (unsigned)f4, q = u / uf;
       r = q; c4 = (int)(u - q * uf);
     } else {

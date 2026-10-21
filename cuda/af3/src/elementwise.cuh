@@ -89,8 +89,35 @@ __global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ 
   }
 }
 
-__global__ void gateMulAddHK(float* pair, const float* out, const half* gate, size_t pairs, int C, int ld) {
+__global__ void gateMulAddHK(float* __restrict__ pair, const float* __restrict__ out, const half* __restrict__ gate,
+                             size_t pairs, int C, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (ld & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out) & 15) == 0 && ((uintptr_t)gate & 7) == 0) {
+    int c4 = C >> 2, ld4 = ld >> 2;
+    size_t n4 = pairs * (size_t)c4;
+    if (t >= n4) return;
+    size_t r; int c;
+    if ((c4 & (c4 - 1)) == 0) {
+      c = (int)(t & (size_t)(c4 - 1));
+      r = t >> (__ffs(c4) - 1);
+    } else if (n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, uc = (unsigned)c4, q = u / uc;
+      r = q; c = (int)(u - q * uc);
+    } else {
+      r = t / c4; c = (int)(t % c4);
+    }
+    float4 p = reinterpret_cast<const float4*>(pair)[t];
+    float4 o = __ldg(reinterpret_cast<const float4*>(out) + t);
+    uint2 g2 = __ldg(reinterpret_cast<const uint2*>(gate) + r * (size_t)ld4 + c);
+    float2 g0 = __half22float2(*reinterpret_cast<const half2*>(&g2.x));
+    float2 g1 = __half22float2(*reinterpret_cast<const half2*>(&g2.y));
+    p.x += o.x / (1.f + __expf(-g0.x));
+    p.y += o.y / (1.f + __expf(-g0.y));
+    p.z += o.z / (1.f + __expf(-g1.x));
+    p.w += o.w / (1.f + __expf(-g1.y));
+    reinterpret_cast<float4*>(pair)[t] = p;
+    return;
+  }
   if (t >= pairs * C) return;
   size_t r = t / C; int c = (int)(t % C);
   pair[t] += out[t] / (1.f + __expf(-__half2float(gate[r * ld + c])));
@@ -136,16 +163,88 @@ channelMajorToRowsTileK(const float* __restrict__ x, float* __restrict__ y, size
   }
 }
 
-__global__ void centerNormHK(const float* prod, half* out, size_t pairs, int C, const float* scale, const float* offset,
-                             int L, int Lp) {
+__global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ out, size_t pairs, int C,
+                             const float* __restrict__ scale, const float* __restrict__ offset, int L, int Lp) {
   extern __shared__ float tile[];               // [C][33]
   size_t r0 = (size_t)blockIdx.x * 32;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+  size_t rLoad = r0 + lane;
+  size_t plane = (size_t)Lp * Lp;
+  size_t planeIdx = 0;
+  if (rLoad < pairs) {
+    unsigned ur = (unsigned)rLoad, uL = (unsigned)L, q = ur / uL;
+    planeIdx = (size_t)q * Lp + (ur - q * uL);
+  }
   for (int c = warp; c < C; c += nw) {
-    size_t r = r0 + lane;
-    tile[c * 33 + lane] = r < pairs ? prod[(size_t)c * Lp * Lp + (r / L) * Lp + r % L] : 0.f;
+    tile[c * 33 + lane] = rLoad < pairs ? __ldg(prod + (size_t)c * plane + planeIdx) : 0.f;
   }
   __syncthreads();
+  if (C == 256) {
+    float sc[8], of[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      int c = k * 32 + lane;
+      sc[k] = __ldg(scale + c);
+      of[k] = __ldg(offset + c);
+    }
+    for (int row = warp; row < 32; row += nw) {
+      size_t r = r0 + row;
+      if (r >= pairs) break;
+      float tv[8];
+      float s = 0;
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        float val = tile[(k * 32 + lane) * 33 + row];
+        tv[k] = val;
+        s += val;
+      }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s * (1.f / 256.f), v = 0;
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) { float d = tv[k] - mean; v += d * d; }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      float inv = rsqrtf(v * (1.f / 256.f) + 1e-5f);
+      half* outRow = out + r * 256;
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) outRow[k * 32 + lane] = __float2half((tv[k] - mean) * inv * sc[k] + of[k]);
+    }
+    return;
+  }
+  if (C == 128) {
+    float sc[4], of[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      int c = k * 32 + lane;
+      sc[k] = __ldg(scale + c);
+      of[k] = __ldg(offset + c);
+    }
+    for (int row = warp; row < 32; row += nw) {
+      size_t r = r0 + row;
+      if (r >= pairs) break;
+      float tv[4];
+      float s = 0;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float val = tile[(k * 32 + lane) * 33 + row];
+        tv[k] = val;
+        s += val;
+      }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s * (1.f / 128.f), v = 0;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) { float d = tv[k] - mean; v += d * d; }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      float inv = rsqrtf(v * (1.f / 128.f) + 1e-5f);
+      half* outRow = out + r * 128;
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) outRow[k * 32 + lane] = __float2half((tv[k] - mean) * inv * sc[k] + of[k]);
+    }
+    return;
+  }
   for (int row = warp; row < 32; row += nw) {
     size_t r = r0 + row;
     if (r >= pairs) break;
