@@ -736,6 +736,10 @@ class Worker:
                     # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
                     step = int(name[6:10])
                     steps = int(name[11:15]) if name[10] == "-" else total
+                    # 🔴 THE JOB'S STEP COUNT IS A LOWER BOUND, NOT THE COUNT: a model's schedule tail can add a step
+                    # (IntelliFold-2's scheduleTail 3, AF3's levels then a 0 - cuda/af3/src/sampler.cuh), so its 26th
+                    # frame of 25 steps read 1.028 and the bar went backwards to the result's 1.0
+                    steps = max(steps, step) if steps else steps
                     emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
                     if steps:
                         emit("progress", 0.3 + 0.7 * step / steps)

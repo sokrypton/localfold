@@ -248,6 +248,12 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
   }
   // the standard form: P[(i, c)][(j, e)] = sum_s l[s][i][c] r[s][j][e] a block of rows i at a time, permuted to
   // [(i, j)][(c, e)], then the output projection
+  // 🔴 STORED IN HALF UNSCALED, AND MEASURED SAFE - unlike AF2's (metal/af2's outerProductMean, cuda/af2's a04ed7e), which
+  // overflowed past ~2,000 extra rows. Scaling this sum by 2^-k changes nothing until it overflows, so a fold that differs
+  // between k = 0 and a small k is the overflow's mark: boltz2 on tools/fixtures/test.a3m at all 8,076 rows, and at 16,151
+  // (the alignment doubled, every row sum twice as large), reads byte for byte the same at k = 0, 1, 2 and 3; protenix2
+  // too at 8,076. AF2's own k (~rows / 64, 7 there) instead MOVED the fold - small entries pushed into float16's
+  // subnormals - so the AF2 fix copied here would cost precision for nothing
   size_t per = (size_t)L * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
