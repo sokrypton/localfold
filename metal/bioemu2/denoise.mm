@@ -151,7 +151,7 @@ static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
   return split * margin < unsplit;
 }
 static void couplingSplit(const float* a, float* q, const float* cqc, const int* atomTok, int samples, int T, int N,
-                          int Dt, int Ca, const std::string& p, const float* preQB = nullptr) {
+                          int Dt, int Ca, const std::string& p, const float* preQB = nullptr, bool preTok = false) {
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
   const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
@@ -166,8 +166,9 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
     copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
     copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
   }) : M.derived<half>("csQ2b:" + p, 2 * wq, [&](half* out) {
-    be2Run1d("be2_cs_wq2", 2 * wq, Be2CsWqArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)Dc, (uint)I,
-                                             (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
+    run("be2_cs_wq2", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((Ca + 31) / 32), 1}, 256,
+        Be2CsWqArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)Dc, (uint)I,
+                    (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
   });
   float* tstats = scratch<float>("be2.cs.tstats", RT * 3); half* xa = scratch<half>("be2.cs.xa", RT * Dt);
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
@@ -191,7 +192,8 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
     const size_t groups = (rows + 7) / 8;
     return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
   };
-  run("be2_cs_tok", rowsGrid(RT), 256, Be2CsTokArgs{a, cqc, tstats, xa, (u64)RT, (uint)T, (uint)Dt, (uint)ldc, 0});
+  if (!preTok)
+    run("be2_cs_tok", rowsGrid(RT), 256, Be2CsTokArgs{a, cqc, tstats, xa, (u64)RT, (uint)T, (uint)Dt, (uint)ldc, 0});
   { Gemm G{}; G.X = xa; G.tx = F16; G.W = w12; G.tw = F16; G.Y = P; G.ty = F32; G.rows = RT; G.in = Dt; G.out = 2 * I;
     G.label = "coupling P"; gemm(G); }
   run("be2_cs_atom", rowsGrid(RN), 256, Be2CsAtomArgs{q, tstats, cqc, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), atomTok,
@@ -232,31 +234,32 @@ static u64* pointerArray(const std::string& key, const std::vector<u64>& v) {
   }
   return r.dev;
 }
-// layers l0 .. l0 + n - 1's conditioning of every kind into out[kind] + j (Rc x outC); cnd has T + 1 rows (the last
-// zero: the padding atoms'), the atom and q kinds condition on all T + 1, the token and s kinds on T
-static void condGroup(const float* cnd, int T, int Dt, int layers, int l0, int n, const int outC[4], float* out[4]) {
-  half* cin = scratch<half>("be2.cg.cin", (size_t)n * (T + 1) * Dt);
+// layers l0 .. l0 + n - 1's conditioning of every kind into out[kind] + j (Rc x outC); cndP has K * (T + 1) rows (each
+// step's last row zero: the padding atoms'), cndT has K * T rows
+static void condGroup(const float* cndP, const float* cndT, int T, int K, int Dt, int layers, int l0, int n, const int outC[4], float* out[4]) {
+  half* cin = scratch<half>("be2.cg.cin", (size_t)n * K * (T + 1) * Dt);
   for (int k = 0; k < 4; ++k) {
-    const CondKind& K = COND_KINDS[k];
-    const int Rc = T + K.rowsExtra, O = outC[k];
-    const std::string l0n = std::string(K.l0), l2n = std::string(K.l2);
-    const float* w = stackedVectors(K.key, K, (l0n + "/weight").c_str(), layers, Dt);
-    const float* b = hasW(K.prefix(0) + l0n + "/bias") ? stackedVectors(K.key, K, (l0n + "/bias").c_str(), layers, Dt) : nullptr;
+    const CondKind& CK = COND_KINDS[k];
+    const int Rc = K * (T + CK.rowsExtra), O = outC[k];
+    const float* cnd = CK.rowsExtra ? cndP : cndT;
+    const std::string l0n = std::string(CK.l0), l2n = std::string(CK.l2);
+    const float* w = stackedVectors(CK.key, CK, (l0n + "/weight").c_str(), layers, Dt);
+    const float* b = hasW(CK.prefix(0) + l0n + "/bias") ? stackedVectors(CK.key, CK, (l0n + "/bias").c_str(), layers, Dt) : nullptr;
     const size_t rows = (size_t)n * Rc, groups = (rows + 7) / 8;
     run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
         Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, 0});
     std::vector<u64> X, Wp, Y;
     for (int j = 0; j < n; ++j) {
       X.push_back((u64)(cin + (size_t)j * Rc * Dt));
-      Wp.push_back((u64)M.h("w/" + K.prefix(l0 + j) + l2n + "/weight"));
+      Wp.push_back((u64)M.h("w/" + CK.prefix(l0 + j) + l2n + "/weight"));
       Y.push_back((u64)(out[k] + (size_t)j * Rc * O));
     }
-    const std::string pk = std::string("cg.") + K.key + "." + num(n);
+    const std::string pk = std::string("cg.") + CK.key + "." + num(n) + "." + num(K);
     Gemm G{}; G.ptrs = true; G.batch = n;
     G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16; G.transW = true;
     G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = Rc; G.in = Dt; G.out = O; G.label = "conditioning, layers batched";
-    if (hasW(K.prefix(0) + l2n + "/bias"))
-      G.bias = stackedVectors(K.key, K, (l2n + "/bias").c_str(), layers, O) + (size_t)l0 * O;
+    if (hasW(CK.prefix(0) + l2n + "/bias"))
+      G.bias = stackedVectors(CK.key, CK, (l2n + "/bias").c_str(), layers, O) + (size_t)l0 * O;
     gemm(G);
   }
 }
@@ -266,12 +269,21 @@ static void condGroup(const float* cnd, int T, int Dt, int layers, int l0, int n
 // T), each token to its own
 struct RowMaps { int samples = 0; int* atomTok = nullptr; int* tok = nullptr; };
 static RowMaps ROW_MAPS;
+static std::vector<float> SIGMA_SCHED;
+static int SIGMA_NEXT = 0, SIGMA_BATCH_I0 = -1, SIGMA_BATCH_K = 0, SIGMA_MAX_K = 1;
+static const float* SIGMA_SC0 = nullptr;
+void setSigmaSchedule(const float* sigmas, int n) {
+  if (sigmas && n > 0) SIGMA_SCHED.assign(sigmas, sigmas + n);
+  else SIGMA_SCHED.clear();
+  SIGMA_NEXT = 0; SIGMA_BATCH_I0 = -1; SIGMA_BATCH_K = 0; SIGMA_MAX_K = 1; SIGMA_SC0 = nullptr;
+}
 // 🔴 FORGOTTEN EVERY FOLD: the maps are this input's atoms' tokens, and a resident server's next job is another input -
 // keyed on the sample count alone, a second fold of the same count read the first one's (cuda/bioemu2's resident server
 // met this class of bug: its triangle mask remembered by address, docs/BIOEMU2.md)
 void forgetRowMaps() {
   if (ROW_MAPS.atomTok) { release(ROW_MAPS.atomTok); release(ROW_MAPS.tok); }
   ROW_MAPS = {};
+  setSigmaSchedule(nullptr, 0);
 }
 static const RowMaps& rowMaps(int samples, int T, int N) {
   if (ROW_MAPS.samples == samples && ROW_MAPS.atomTok) return ROW_MAPS;
@@ -293,26 +305,6 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const float cIn = 1.f / sqrtf(sigma * sigma + SIGMA_DATA * SIGMA_DATA), t = 0.25f * logf(sigma / SIGMA_DATA);
   float* r = scratch<float>("be2.dn.r", RN * 3);
   be2Run1d("be2_scale_masked", RN * 3, Be2ScaleMaskedArgs{x, Iin("atom_mask"), r, (u64)N, RN, cIn, 0});
-  // the single conditioning (shared)
-  const int F = dimW(sc + "fourier_embed/proj/bias", 0);
-  float* four = scratch<float>("be2.dn.four", F);
-  run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, t, (uint)F});
-  float* f768 = scratch<float>("be2.dn.f768", Dt);
-  if (HALF) {
-    half* fourh = scratch<half>("be2.dn.fourh", F);
-    layerNorm(four, fourh, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
-    Gemm G{}; G.X = fourh; G.tx = F16; G.W = M.h("w/" + sc + "fourier_to_single/weight"); G.tw = F16; G.transW = true; G.Y = f768; G.ty = F32;
-    G.rows = 1; G.in = F; G.out = Dt; G.label = "fourier_to_single"; gemm(G);
-  } else {
-    layerNorm(four, four, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
-    linT(four, sc + "fourier_to_single/weight", f768, 1, F, Dt);
-  }
-  // cond, and a ZERO row after its T: what a padding atom of the reference conditions on (c_to_q is 0 there)
-  float* cnd = scratch<float>("be2.dn.cond", (size_t)(T + 1) * Dt);
-  copy(cnd, d.sc0, (size_t)T * Dt * 4);
-  fill(cnd + (size_t)T * Dt, 0, (size_t)Dt * 4);
-  be2Run1d("be2_broadcast_add", (size_t)T * Dt, Be2BroadcastAddArgs{cnd, f768, (u64)T, (uint)Dt, 0});
-  for (int i = 0; i < 2; ++i) transition(cnd, cnd, T, Dt, sc + "transitions_" + num(i) + "/");
   // the atom stream's initial state
   float* q = scratch<float>("be2.dn.q", RN * Ca);
   be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{d.q0, q, (u64)N * Ca, RN * Ca});
@@ -352,21 +344,108 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const bool batchCond = HALF && BATCH_COND;
   const size_t perLayer = ((size_t)(T + 1) * (outC[0] + outC[2]) + (size_t)T * (outC[1] + outC[3])) * 4;
   const int G = batchCond ? (int)std::max<size_t>(1, std::min<size_t>(d.layers, ((size_t)64 << 20) / perLayer)) : 1;
-  float* cg[4] = {nullptr, nullptr, nullptr, nullptr};
-  if (batchCond)
-    for (int k = 0; k < 4; ++k)
-      cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * (T + COND_KINDS[k].rowsExtra) * outC[k]);
-  // (where couplingSplit runs, every layer's QB = [gR_hi | beta_hi; gR_lo | beta_lo] W_12 is sigma-only and shared by all
-  // G layers in the group: one pointer-array batched GEMM over G layers instead of 2 G separate GEMMs)
   const int I = dimW(SM + "layers/0/coupling/s_to_q_mixer/fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t R = (size_t)T + 1;
-  float* cgQB = (batchCond && csplit) ? scratch<float>("be2.cg.QB", (size_t)G * R * 4 * I) : nullptr;
+  // when all layers fit in one group and sample() gave its sigma schedule, batch K steps of sigma conditioning and
+  // coupling RB ahead so their GEMMs run on K * T and 2 * K * (T + 1) rows instead of a single step's
+  int curStep = -1, curK = 1, bi = 0;
+  if (batchCond && G == d.layers && !SIGMA_SCHED.empty()) {
+    if (SIGMA_SC0 != d.sc0) { SIGMA_SC0 = d.sc0; SIGMA_BATCH_I0 = -1; SIGMA_NEXT = 0; }
+    if (SIGMA_NEXT > 0 && SIGMA_SCHED[SIGMA_NEXT - 1] == sigma) curStep = SIGMA_NEXT - 1;
+    else if (SIGMA_NEXT < (int)SIGMA_SCHED.size() && SIGMA_SCHED[SIGMA_NEXT] == sigma) curStep = SIGMA_NEXT++;
+    else setSigmaSchedule(nullptr, 0);
+  }
+  const int F = dimW(sc + "fourier_embed/proj/bias", 0);
+  float* cnd = nullptr;
+  float* cg[4] = {nullptr, nullptr, nullptr, nullptr};
+  float* cgQB = nullptr;
+  if (curStep >= 0) {
+    const int steps = (int)SIGMA_SCHED.size();
+    const size_t stepBytes = (size_t)d.layers * (perLayer + (csplit ? R * 4 * I * 4 : 0));
+    const int envK = getenv("BE2_COND_STEPS") ? std::max(1, atoi(getenv("BE2_COND_STEPS")))
+                                              : std::max(1, std::min(steps, (int)(((size_t)448 << 20) / std::max<size_t>(stepBytes, 1))));
+    const int batches = std::max(1, (steps + envK - 1) / envK);
+    SIGMA_MAX_K = std::max(1, (steps + batches - 1) / batches);
+    for (int k = 0; k < 4; ++k)
+      cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * SIGMA_MAX_K * (T + COND_KINDS[k].rowsExtra) * outC[k]);
+    if (csplit) cgQB = scratch<float>("be2.cg.QB", (size_t)G * SIGMA_MAX_K * R * 4 * I);
+    if (SIGMA_BATCH_I0 < 0 || curStep < SIGMA_BATCH_I0 || curStep >= SIGMA_BATCH_I0 + SIGMA_BATCH_K) {
+      SIGMA_BATCH_I0 = curStep;
+      SIGMA_BATCH_K = std::min(SIGMA_MAX_K, steps - curStep);
+      const int K = SIGMA_BATCH_K;
+      float* four = scratch<float>("be2.dn.four", (size_t)K * F);
+      half* fourh = scratch<half>("be2.dn.fourh", (size_t)K * F);
+      float* f768 = scratch<float>("be2.dn.f768", (size_t)K * Dt);
+      for (int s = 0; s < K; ++s) {
+        const float ts = 0.25f * logf(SIGMA_SCHED[curStep + s] / SIGMA_DATA);
+        run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"),
+                                                  four + (size_t)s * F, ts, (uint)F});
+      }
+      layerNorm(four, fourh, K, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
+      { Gemm Gf{}; Gf.X = fourh; Gf.tx = F16; Gf.W = M.h("w/" + sc + "fourier_to_single/weight"); Gf.tw = F16; Gf.transW = true;
+        Gf.Y = f768; Gf.ty = F32; Gf.rows = K; Gf.in = F; Gf.out = Dt; Gf.label = "fourier_to_single"; gemm(Gf); }
+      float* cndT = scratch<float>("be2.dn.condT_k", (size_t)K * T * Dt);
+      be2Run1d("be2_repeat", (size_t)K * T * Dt, Be2RepeatArgs{d.sc0, cndT, (u64)T * Dt, (u64)K * T * Dt});
+      be2Run1d("be2_broadcast_add", (size_t)K * T * Dt, Be2BroadcastAddArgs{cndT, f768, (u64)K * T, (uint)Dt, (uint)T});
+      for (int i = 0; i < 2; ++i) transition(cndT, cndT, (size_t)K * T, Dt, sc + "transitions_" + num(i) + "/");
+      float* cndP = scratch<float>("be2.dn.condP_k", (size_t)K * (T + 1) * Dt);
+      fill(cndP, 0, (size_t)K * (T + 1) * Dt * 4);
+      copy2d(cndP, (size_t)(T + 1) * Dt * 4, cndT, (size_t)T * Dt * 4, (size_t)T * Dt * 4, K);
+      condGroup(cndP, cndT, T, K, Dt, d.layers, 0, G, outC, cg);
+      if (cgQB) {
+        const size_t RK = (size_t)K * R;
+        half* gR = scratch<half>("be2.cs.gR", (size_t)G * 4 * RK * Dc);
+        be2Run1d("be2_cs_gamma", (size_t)G * RK * Dc,
+                 Be2CsGammaArgs{cg[2], gR, nullptr, (u64)(G * RK * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)RK});
+        for (int part = 0; part < 2; ++part) {
+          std::vector<u64> X, Wp, Y;
+          for (int j = 0; j < G; ++j) {
+            const std::string p = SM + "layers/" + num(j) + "/coupling/s_to_q_mixer/";
+            X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * RK * Dc));
+            Wp.push_back((u64)swigluPairs(p, Dc, I));
+            Y.push_back((u64)(cgQB + (size_t)j * RK * 4 * I));
+          }
+          const std::string pk = "cg.qb." + num(G) + "." + num(K) + "." + num(part);
+          Gemm Gq{}; Gq.ptrs = true; Gq.batch = G;
+          Gq.X = pointerArray(pk + ".x", X); Gq.tx = F16; Gq.W = pointerArray(pk + ".w", Wp); Gq.tw = F16;
+          Gq.Y = pointerArray(pk + ".y", Y); Gq.ty = F32; Gq.rows = 2 * RK; Gq.in = Dc; Gq.out = 2 * I;
+          Gq.beta = part ? 1.f : 0.f; Gq.label = "coupling RB, layers batched";
+          gemm(Gq);
+        }
+      }
+    }
+    curK = SIGMA_BATCH_K;
+    bi = curStep - SIGMA_BATCH_I0;
+  } else {
+    float* four = scratch<float>("be2.dn.four", F);
+    run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, t, (uint)F});
+    float* f768 = scratch<float>("be2.dn.f768", Dt);
+    if (HALF) {
+      half* fourh = scratch<half>("be2.dn.fourh", F);
+      layerNorm(four, fourh, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
+      Gemm Gf{}; Gf.X = fourh; Gf.tx = F16; Gf.W = M.h("w/" + sc + "fourier_to_single/weight"); Gf.tw = F16; Gf.transW = true; Gf.Y = f768; Gf.ty = F32;
+      Gf.rows = 1; Gf.in = F; Gf.out = Dt; Gf.label = "fourier_to_single"; gemm(Gf);
+    } else {
+      layerNorm(four, four, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
+      linT(four, sc + "fourier_to_single/weight", f768, 1, F, Dt);
+    }
+    // cond, and a ZERO row after its T: what a padding atom of the reference conditions on (c_to_q is 0 there)
+    cnd = scratch<float>("be2.dn.cond", (size_t)(T + 1) * Dt);
+    copy(cnd, d.sc0, (size_t)T * Dt * 4);
+    fill(cnd + (size_t)T * Dt, 0, (size_t)Dt * 4);
+    be2Run1d("be2_broadcast_add", (size_t)T * Dt, Be2BroadcastAddArgs{cnd, f768, (u64)T, (uint)Dt, 0});
+    for (int i = 0; i < 2; ++i) transition(cnd, cnd, T, Dt, sc + "transitions_" + num(i) + "/");
+    if (batchCond)
+      for (int k = 0; k < 4; ++k)
+        cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * (T + COND_KINDS[k].rowsExtra) * outC[k]);
+    cgQB = (batchCond && csplit) ? scratch<float>("be2.cg.QB", (size_t)G * R * 4 * I) : nullptr;
+  }
   const float* pendTokH = nullptr; const float* pendTokGate = nullptr; int pendTokLdg = 0;
   for (int l = 0; l < d.layers; ++l) {
     const std::string L = SM + "layers/" + num(l) + "/";
-    if (batchCond && l % G == 0) {
+    if (batchCond && curStep < 0 && l % G == 0) {
       const int gn = std::min(G, d.layers - l);
-      condGroup(cnd, T, Dt, d.layers, l, gn, outC, cg);
+      condGroup(cnd, cnd, T, 1, Dt, d.layers, l, gn, outC, cg);
       if (cgQB) {
         half* gR = scratch<half>("be2.cs.gR", (size_t)gn * 4 * R * Dc);
         be2Run1d("be2_cs_gamma", (size_t)gn * R * Dc,
@@ -389,19 +468,20 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
       }
     }
     const int lj = l % G;
+    const size_t slot = (size_t)lj * curK + bi;
     const CondLayer atomL{L + "atom_block/transformer_layer/", ab, true, Ha};
     // (the atom stream's conditioning is its token's row of cond: computed on the T + 1 token rows)
-    float* condA = batchCond ? cg[0] + (size_t)lj * (T + 1) * outC[0] : layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
+    float* condA = batchCond ? cg[0] + slot * (T + 1) * outC[0] : layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
     condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
     const CondLayer tokL{L + "token_block/", tb, false, Ht};
-    float* condT = batchCond ? cg[1] + (size_t)lj * T * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
+    float* condT = batchCond ? cg[1] + slot * T * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
     const float* tokTrH = nullptr;
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, d.tbias ? d.tbias + tbn * l : nullptr, T,
               d.tbiasH ? d.tbiasH + tbn * l : nullptr, pendTokH, pendTokGate, pendTokLdg, HALF ? &tokTrH : nullptr);
     pendTokH = nullptr; pendTokGate = nullptr;
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     const std::string cp = L + "coupling/";
-    if (batchCond) { cqc = cg[2] + (size_t)lj * (T + 1) * outC[2]; csc = cg[3] + (size_t)lj * T * outC[3]; }
+    if (batchCond) { cqc = cg[2] + slot * (T + 1) * outC[2]; csc = cg[3] + slot * T * outC[3]; }
     else {
       layerNorm(cnd, cn, T + 1, Dt, Wf(cp + "q_coupling_cond_0/weight"), WfOpt(cp + "q_coupling_cond_0/bias"));
       silu(cn, cn, (size_t)(T + 1) * Dt);
@@ -419,14 +499,17 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
         return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
       };
       half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
+      float* tstats = csplit ? scratch<float>("be2.cs.tstats", RT * 3) : nullptr;
+      half* xa = csplit ? scratch<half>("be2.cs.xa", RT * Dt) : nullptr;
       run("be2_ada_ln_q2s", rowsGrid(RT), 256,
           Be2AdaLnQ2SArgs{q, a, Iin("token_center_atom_index"), csc, csc + Dc, maps.tok, qsh, (u64)RT,
                           (uint)T, (uint)N, (uint)Ca, (uint)Dt, (uint)(2 * Dc + Dt), (uint)(6 * Dt),
-                          tokTrH, tokTrH ? condT + 5 * Dt : nullptr});
+                          tokTrH, tokTrH ? condT + 5 * Dt : nullptr,
+                          csplit ? cqc : nullptr, tstats, xa, (uint)(2 * Dc + Ca), 0});
       // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: qsh is already formed from untouched q and
       // a before s_to_q updates q, and s_to_q reads untouched a before q_to_s updates a)
       if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/",
-                                cgQB ? cgQB + (size_t)lj * R * 4 * I : nullptr);
+                                cgQB ? cgQB + slot * R * 4 * I : nullptr, true);
       else {
         half* sqh = scratch<half>("be2.dn.sqh", RN * Dc);
         run("be2_ada_ln_s2q", rowsGrid(RN), 256,

@@ -58,8 +58,8 @@ void silu(const float* x, float* y, size_t n) { run1d("be2_unary", n, Be2UnaryAr
 static const float SWIGLU_SCALE = getenv("BE2_SWIGLU_SCALE") ? (float)atof(getenv("BE2_SWIGLU_SCALE")) : 64.f;   // (an arm, BE2_SWIGLU_SCALE)
 static const half* swigluWeight(const std::string& p, int C, int I) {
   return M.derived<half>("swiglu:" + p, (size_t)C * 2 * I, [&](half* out) {
-    be2Run1d("be2_swiglu_weight", ((size_t)C * 2 * I) >> 2, Be2SwigluWArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out,
-                                                                           (uint)C, (uint)I, 1.f / SWIGLU_SCALE, 0});
+    run("be2_swiglu_weight", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((C + 31) / 32), 1}, 256,
+        Be2SwigluWArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)C, (uint)I, 1.f / SWIGLU_SCALE, 0});
   });
 }
 const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }

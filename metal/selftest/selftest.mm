@@ -85,8 +85,8 @@ int main() {
     gemm(g);
     report("alpha, beta, bias, relu", relRms(ref, download(dY, R * O)), 1e-5);
   }
-  {   // SwiGLU in blocks of 8
-    size_t R = 333; int K = 128, Hd = 256;
+  for (size_t R : {size_t(333), size_t(68), size_t(16)}) {   // SwiGLU in blocks of 8 (tall tile + short tiles)
+    int K = 128, Hd = 256;
     auto X = randv(R * K), W = randv((size_t)K * 2 * Hd, 0.1f);       // W [K][2Hd]: a then b
     std::vector<float> Wp((size_t)K * 2 * Hd);
     for (int k = 0; k < K; ++k) for (int c = 0; c < 2 * Hd; ++c) {

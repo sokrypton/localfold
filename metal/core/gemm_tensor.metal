@@ -208,32 +208,13 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       }
       return;
     }
-    if constexpr (metal::is_same_v<TC, half> && metal::is_same_v<TACC, half>) {
-      _Pragma("clang loop unroll(full)")
-      for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
-        if (!c.is_valid_element(e)) continue;
-        const auto ix = c.get_multidimensional_index(e);
-        const int i = i0 + ix[0], j = j0 + ix[1];
-        if (j >= g.n || i >= g.m) continue;
-        const float4 v = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-        if (g.epilogue & 4096) {
-          const uint O = (uint)g.tgC, L = (uint)g.tgN;
-          const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
-          *(device half4*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = half4(g.alpha * v);
-        } else {
-          device half4* dp = (device half4*)(D + (ulong)i + (ulong)j * g.ldd);
-          *dp = lf_out4<half>(float4(*dp) * v);
-        }
-      }
-      return;
-    }
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
       if (!c.is_valid_element(e)) continue;
       const auto ix = c.get_multidimensional_index(e);
       const int i = i0 + ix[0], j = j0 + ix[1];
       if (j >= g.n || i >= g.m) continue;
-      if constexpr (metal::is_same_v<TC, half> && (EP & 64) == 0) {
+      if constexpr (metal::is_same_v<TC, half> && !metal::is_same_v<TACC, half> && (EP & 64) == 0) {
         if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
           // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
           device const float* sr = (device const float*)g.aux + (ulong)j * 8;
@@ -268,13 +249,15 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                         : (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + boff + i))
                                                   : *(device const float4*)((device const float*)g.bias + boff + i);
       device TC* dp = D + (ulong)i + (ulong)j * g.ldd;
-      if (g.epilogue & 64) {      // a gated residual: D = C + aux * sigmoid(v)
-        if (g.epilogue & 4) v += bv;
-        const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
-        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        const float4 r = cv + ax * fast::divide(1.f, 1.f + fast::exp(-v));
-        *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
-        continue;
+      if constexpr (!metal::is_same_v<TACC, half>) {
+        if (g.epilogue & 64) {      // a gated residual: D = C + aux * sigmoid(v)
+          if (g.epilogue & 4) v += bv;
+          const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
+          const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          const float4 r = cv + ax * fast::divide(1.f, 1.f + fast::exp(-v));
+          *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
+          continue;
+        }
       }
       if constexpr (metal::is_same_v<TC, float> && (EP & 64) == 0) {
         if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
@@ -300,7 +283,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if constexpr (metal::is_same_v<TC, half> && (EP & 64) == 0) {
         if (g.epilogue & 1048576) { // in-place multiply: D *= v
           const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv * float4(lf_out4<TC>(v)));
+          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv * v);
           continue;
         }
         if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
@@ -310,14 +293,16 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           continue;
         }
       }
-      if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
-        const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
-        const float s = 1e-3f + ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
-        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        *(device vec<TC, 4>*)dp = lf_out4<TC>(cv + (b128 + v) / s);
-        continue;
+      if constexpr (!metal::is_same_v<TACC, half>) {
+        if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
+          const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
+          const float s = 1e-3f + ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
+          const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv + (b128 + v) / s);
+          continue;
+        }
+        if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       }
-      if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       if (g.epilogue & 4) v += bv;
       if constexpr ((EP & 64) == 0) {
         if (g.epilogue & 2) v = max(v, 0.f);

@@ -36,7 +36,8 @@ struct Be2AdaLnArgs { DP(float) x; DP(float) y; CP(float) alpha; CP(float) beta;
                       float scale; DP(half) yh; CP(float) resH; CP(float) resGate; uint ldrg, pad0; };         // (yh: written in half instead of y)
 // the coupling's two inputs on the fast arm, normalised directly into half without materialising [q_centre | a] or [a_tok | q]
 struct Be2AdaLnQ2SArgs { CP(float) q; DP(float) a; CP(int) centre; CP(float) alpha; CP(float) beta; CP(int) map;
-                         DP(half) yh; u64 rows; uint T, N, Ca, Dt, ldc, ldrg; CP(float) resH; CP(float) resGate; };
+                         DP(half) yh; u64 rows; uint T, N, Ca, Dt, ldc, ldrg; CP(float) resH; CP(float) resGate;
+                         CP(float) cqc; DP(float) tstats; DP(half) xa; uint ldcq, pad0; };
 struct Be2AdaLnS2QArgs { CP(float) a; CP(float) q; CP(int) atomTok; CP(int) pad; CP(float) alpha; CP(float) beta; CP(int) map;
                          DP(half) yh; u64 rows; uint T, N, Dt, Ca, ldc, pad0; };
 // the vendor's fc1 / fc2 [I][C] (torch) as gemmSwiglu's one weight [C][2I]: blocks of 8, a_0..a_7 b_0..b_7 a_8.., b = fc2 / S

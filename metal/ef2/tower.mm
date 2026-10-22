@@ -49,9 +49,14 @@ static void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   layerNorm(x, xn, R, C, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"));
   towerLin(xn, B + "qkv/weights", qkv, R, C, 3 * C);
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
-  layerNorm(qkv, q, R, C, M.f(B + "q_norm/scale"), nullptr, 1e-5f, 3 * C, C);
-  layerNorm(qkv + C, k, R, C, M.f(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
-  run1d("ef2_rope", R * 32, RopeArgs{q, k, (uint)R, (uint)H, (uint)C, 0});
+  if (C % 64 == 0 && C <= 1152) {
+    run("ef2_qk_norm_rope", Grid{(uint32_t)((R + 7) / 8), 2, 1}, 256,
+        QkNormRopeArgs{qkv, M.f(B + "q_norm/scale"), M.f(B + "k_norm/scale"), q, k, (uint)R, (uint)C});
+  } else {
+    layerNorm(qkv, q, R, C, M.f(B + "q_norm/scale"), nullptr, 1e-5f, 3 * C, C);
+    layerNorm(qkv + C, k, R, C, M.f(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
+    run1d("ef2_rope", R * 32, RopeArgs{q, k, (uint)R, (uint)H, (uint)C, 0});
+  }
   // scores [H, R, R] = q_h k_h^T, softmax within a chain, ctx_h = S_h v_h (v in the packed qkv, stride 3C)
   float* S = scratch<float>("esmc.scores", (size_t)H * R * R);
   float* ctx = scratch<float>("esmc.ctx", R * C);

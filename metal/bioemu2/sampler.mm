@@ -83,6 +83,13 @@ std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings&
   float* dx = allocT<float>(per * batch); float* dd = allocT<float>(per * batch);
   float* dc = comp ? allocT<float>(per * batch) : nullptr;
   const int steps = (int)levels.size() - 1;
+  std::vector<float> stepSigmas(steps);
+  for (int i = 0; i < steps; ++i) {
+    const double sigma = levels[i], next = levels[i + 1];
+    const double gamma = next > s.gammaMin ? s.gamma0 : 0;
+    stepSigmas[i] = (float)(sigma * (1 + gamma));
+  }
+  setSigmaSchedule(stepSigmas.data(), steps);
   for (int i = 0; i < steps; ++i) {
     const double sigma = levels[i], next = levels[i + 1];
     const double gamma = next > s.gammaMin ? s.gamma0 : 0;
@@ -112,6 +119,7 @@ std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings&
       for (int k = 0; k < N * 3; ++k) x[p][k] = (float)(x[p][k] + f * (x[p][k] - den[p][k]));
     }
   }
+  setSigmaSchedule(nullptr, 0);
   release(dx); release(dd); if (dc) release(dc);
   if (centreEnd) for (auto& v : x) centreMasked(v, mask);
   else for (auto& v : x) for (int a = 0; a < N; ++a) if (!mask[a]) v[a * 3] = v[a * 3 + 1] = v[a * 3 + 2] = 0.f;
