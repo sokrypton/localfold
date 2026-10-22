@@ -19,20 +19,21 @@
 // deterministic. part: [2 statistics][4 simdgroups][64 rows], 512 floats
 // a thread's tile values at element e, read back from D where it just wrote them (cheaper than holding 16 float4s) - in
 // D's own type, so a half output (the half pair) is normalised as it was stored
-template <typename CT, typename TD>
+template <bool REG = false, typename CT, typename TD>
 inline float4 lf_ln_at(thread CT& cg, device const TD* D, constant GemmArgs& g, int i0, int j0, uint16_t e) {
+  if constexpr (REG) return float4((float)cg[e], (float)cg[e + 1], (float)cg[e + 2], (float)cg[e + 3]);
   const auto ix = cg.get_multidimensional_index(e);
   const int j = min(j0 + ix[1], g.n - 1);
   return float4(*(device const vec<TD, 4>*)(D + (ulong)(i0 + ix[0]) + (ulong)j * g.ldd));
 }
-template <int TN, typename CT, typename TD>
+template <int TN, bool REG = false, typename CT, typename TD>
 inline void lf_emit_ln(thread CT& cg, device const TD* D, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
   constexpr uint NS = TN / 64;
   static_assert(TN == 128 || TN == 256, "the emitted LayerNorm is probed for 64 x 128 and 32 x 256");
   const uint sg = tid / 32, first = sg & ~(NS - 1), lane = tid & 31;
   float s4[4] = {0, 0, 0, 0};
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) { const float4 v = lf_ln_at(cg, D, g, i0, j0, e); s4[((e >> 2) & 1) | ((e >> 4) & 2)] += v.x + v.y + v.z + v.w; }
+  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) { const float4 v = lf_ln_at<REG>(cg, D, g, i0, j0, e); s4[((e >> 2) & 1) | ((e >> 4) & 2)] += v.x + v.y + v.z + v.w; }
   int rowOf[4];
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < 64; e += 4) if (((e >> 3) & 3) == 0) rowOf[((e >> 2) & 1) | ((e >> 4) & 2)] = cg.get_multidimensional_index(e)[1];
@@ -52,7 +53,7 @@ inline void lf_emit_ln(thread CT& cg, device const TD* D, threadgroup float* par
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
     const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
-    const float4 d = lf_ln_at(cg, D, g, i0, j0, e) - mean[q];
+    const float4 d = lf_ln_at<REG>(cg, D, g, i0, j0, e) - mean[q];
     v4[q] += dot(d, d);
   }
   for (int q = 0; q < 4; ++q) {
@@ -76,7 +77,7 @@ inline void lf_emit_ln(thread CT& cg, device const TD* D, threadgroup float* par
     const int i = i0 + ix[0], j = j0 + ix[1];
     if (j >= g.n) continue;
     const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
-    const float4 x = (lf_ln_at(cg, D, g, i0, j0, e) - mean[q]) * inv[q];
+    const float4 x = (lf_ln_at<REG>(cg, D, g, i0, j0, e) - mean[q]) * inv[q];
     float4 y = x;
     if (sc) y *= *(device const float4*)(sc + i);
     if (of) y += *(device const float4*)(of + i);
@@ -217,18 +218,22 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if constexpr (metal::is_same_v<TC, half> && !metal::is_same_v<TACC, half> && (EP & 64) == 0) {
         if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
           // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
-          device const float* sr = (device const float*)g.aux + (ulong)j * 8;
-          const float inv = sr[0], dq = sr[2], sq = sr[3], sa = sr[5];
-          const int st = (int)sr[6];
-          device const float* qb = (device const float*)g.aux3 + (ulong)(uint)sr[7] * 2 * g.m;
+          device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)j * 8);
+          const float4 s0 = sr4[0], s1 = sr4[1];
+          const float inv = s0.x, dq = s0.z, sq = s0.w, sa = s1.y;
+          const int st = (int)s1.z;
+          device const float* qb = (device const float*)g.aux3 + (ulong)(uint)s1.w * 2 * g.m;
           device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
-          for (int t = 0; t < 2; ++t) {
-            const int x = i / 2 + t, pc = (x >> 3) * 16 + (x & 7);
-            const float pa = st >= 0 ? sa * pr[pc] : 0.f, pb = st >= 0 ? sa * pr[pc + 8] : 0.f;
-            const float ua = inv * (pa + sq * (float)c[e + t] + dq * qb[pc]) + qb[g.m + pc];
-            const float ub = inv * (pb + sq * (float)c[e + 2 + t] + dq * qb[pc + 8]) + qb[g.m + pc + 8];
-            D[(ulong)x + (ulong)j * g.ldd] = (TC)(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
-          }
+          const int x = i >> 1, pc = (i & ~15) | (x & 6);
+          const float2 pa = st >= 0 ? sa * *(device const float2*)(pr + pc) : float2(0.f);
+          const float2 pb = st >= 0 ? sa * *(device const float2*)(pr + pc + 8) : float2(0.f);
+          const float2 qa = *(device const float2*)(qb + pc), qb8 = *(device const float2*)(qb + pc + 8);
+          const float2 ba = *(device const float2*)(qb + g.m + pc), bb8 = *(device const float2*)(qb + g.m + pc + 8);
+          const float2 ca = float2((float)c[e], (float)c[e + 1]);
+          const float2 cb = float2((float)c[e + 2], (float)c[e + 3]);
+          const float2 ua = inv * (pa + sq * ca + dq * qa) + ba;
+          const float2 ub = inv * (pb + sq * cb + dq * qb8) + bb8;
+          *(device half2*)(D + (ulong)x + (ulong)j * g.ldd) = half2(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
           continue;
         }
       }
@@ -254,8 +259,9 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           if (g.epilogue & 4) v += bv;
           const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
           const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-          const float4 r = cv + ax * fast::divide(1.f, 1.f + fast::exp(-v));
-          *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
+          const vec<TC, 4> st = lf_out4<TC>(cv + ax * fast::divide(1.f, 1.f + fast::exp(-v)));
+          *(device vec<TC, 4>*)dp = st;
+          if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
           continue;
         }
       }
@@ -298,7 +304,9 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
           const float s = 1e-3f + ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
           const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv + (b128 + v) / s);
+          const vec<TC, 4> st = lf_out4<TC>(cv + (b128 + v) / s);
+          *(device vec<TC, 4>*)dp = st;
+          if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
           continue;
         }
         if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
@@ -308,9 +316,11 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         if (g.epilogue & 2) v = max(v, 0.f);
         if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
       }
-      *(device vec<TC, 4>*)dp = lf_out4<TC>(v);
+      const vec<TC, 4> st = lf_out4<TC>(v);
+      *(device vec<TC, 4>*)dp = st;
+      if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
     }
-    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const TC*)D, part, tid, g, i0, j0); }
+    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN, true>(c, (device const TC*)D, part, tid, g, i0, j0); }
     return;
   }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1 - or a half output's scale -, beta
@@ -498,10 +508,14 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     if (bv) v2 = float4(half4(v2 + *(device const float4*)(bv + i)));
     device vec<TP, 4>* dp = (device vec<TP, 4>*)(D + (ulong)i + (ulong)j * g.ldd);
     const float4 r = float4(*dp) + v2 * (1.f / (1.f + fast::exp(-v1)));
-    *dp = lf_out4<TP>(r);
+    const vec<TP, 4> st = lf_out4<TP>(r);
+    *dp = st;
+    if constexpr (metal::is_same_v<TP, half>) {
+      if (ln) { cg[e] = st.x; cg[e + 1] = st.y; cg[e + 2] = st.z; cg[e + 3] = st.w; }
+    }
   }
   threadgroup float part[512];
-  if (ln) lf_emit_ln<TN>(cg, (device const TP*)D, part, tid, g, i0, j0);
+  if (ln) lf_emit_ln<TN, metal::is_same_v<TP, half>>(cg, (device const TP*)D, part, tid, g, i0, j0);
 }
 // (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128; <64, 128, half> gemmt_dualh_64x128)
 

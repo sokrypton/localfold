@@ -85,8 +85,12 @@ static void pairWeightedAveraging(float* m, const float* z, int l) {
   }
   float* b = scratch<float>("be2.pwa.b", P * Hh);
   if (HALF) {
-    half* znh = scratch<half>("be2.pwa.znh", P * C);
-    layerNorm(z, znh, P, C, Wf(p + "norm_z/weight"), Wf(p + "norm_z/bias"));
+    const float* sc = Wf(p + "norm_z/weight"); const float* of = Wf(p + "norm_z/bias");
+    half* znh = takeEmitted(z, sc, of);
+    if (!znh) {
+      znh = scratch<half>("be2.ftri.xn", P * C);
+      layerNorm(z, znh, P, C, sc, of);
+    }
     Gemm G{}; G.X = znh; G.tx = F16; G.W = M.h("w/" + p + "proj_z/weight"); G.tw = F16; G.transW = true; G.Y = b; G.ty = F32;
     G.rows = P; G.in = C; G.out = Hh; G.label = "pwa proj_z"; gemm(G);
   } else {
@@ -134,25 +138,44 @@ static void outerProductMean(const float* m, float* z, int l) {
     gemm(g);
     be2Run1d("be2_opm_permute", ((size_t)n * T * Co * Co) >> 2, Be2OpmPermuteArgs{x, y, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
     float* zr = z + (size_t)i0 * T * C;
-    linT(y, p + "proj_o/weight", zr, (size_t)n * T, Co * Co, C, 1.f, 0, 0, false, Wf(p + "proj_o/bias"));
+    const std::string next = "msa/" + num(l) + "/triangleMultiplicationOutgoing/leftNormInput";
+    const float* nextSc = Wf(next + "Scale"); const float* nextOf = Wf(next + "Offset");
+    if (HALF && n == T) {
+      half* yh = scratch<half>("be2.opm.yh", (size_t)n * T * Co * Co);
+      toHalf(y, yh, (size_t)n * T * Co * Co);
+      half* lnOut = lnTarget((size_t)T * T, C);
+      Gemm o{}; o.X = yh; o.tx = F16; o.W = M.h("w/" + p + "proj_o/weight"); o.tw = F16; o.transW = true;
+      o.Y = zr; o.ty = F32; o.rows = (size_t)n * T; o.in = Co * Co; o.out = C; o.beta = 1.f;
+      o.bias = Wf(p + "proj_o/bias"); o.lnOut = lnOut; o.lnScale = nextSc; o.lnOffset = nextOf;
+      o.label = "opm proj_o";
+      if (gemm(o)) recordEmitted(z, nextSc, nextOf, lnOut);
+    } else {
+      linT(y, p + "proj_o/weight", zr, (size_t)n * T, Co * Co, C, 1.f, 0, 0, false, Wf(p + "proj_o/bias"));
+    }
   }
 }
 
-void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zInit, float* s, float* z) {
+void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zInit, float* s, float* z, bool nextFollows) {
   const int T = D_.T, S = D_.S, Cs = dimW(SE + "s_recycle/weight", 0), C = dimW(SE + "z_recycle/weight", 0);
   const size_t P = (size_t)T * T;
   // s = s_init + s_recycle(LN(s)); z = z_init + z_recycle(LN(z)), in place
   if (HALF) {
     half* snh = scratch<half>("be2.tp.snh", (size_t)T * Cs);
     layerNorm(s, snh, T, Cs, Wf(SE + "s_norm/weight"), Wf(SE + "s_norm/bias"));
-    copy(s, sInit, (size_t)T * Cs * 4);
-    Gemm G{}; G.X = snh; G.tx = F16; G.W = M.h("w/" + SE + "s_recycle/weight"); G.tw = F16; G.transW = true; G.Y = s; G.ty = F32;
-    G.rows = T; G.in = Cs; G.out = Cs; G.beta = 1.f; G.label = "s_recycle"; gemm(G);
-    half* znh = scratch<half>("be2.ftri.xn", P * C);
-    layerNorm(z, znh, P, C, Wf(SE + "z_norm/weight"), Wf(SE + "z_norm/bias"));
-    copy(z, zInit, P * C * 4);
-    Gemm Z{}; Z.X = znh; Z.tx = F16; Z.W = M.h("w/" + SE + "z_recycle/weight"); Z.tw = F16; Z.transW = true; Z.Y = z; Z.ty = F32;
-    Z.rows = P; Z.in = C; Z.out = C; Z.beta = 1.f; Z.label = "z_recycle"; gemm(Z);
+    Gemm G{}; G.X = snh; G.tx = F16; G.W = M.h("w/" + SE + "s_recycle/weight"); G.tw = F16; G.transW = true;
+    G.Y = s; G.Yin = sInit; G.ty = F32; G.rows = T; G.in = Cs; G.out = Cs; G.beta = 1.f; G.label = "s_recycle"; gemm(G);
+    const float* zsc = Wf(SE + "z_norm/weight"); const float* zof = Wf(SE + "z_norm/bias");
+    half* znh = takeEmitted(z, zsc, zof);
+    if (!znh) {
+      znh = scratch<half>("be2.ftri.xn", P * C);
+      layerNorm(z, znh, P, C, zsc, zof);
+    }
+    const std::string pwa0 = SE + "msa_module/layers/0/pair_weighted_averaging/norm_z/";
+    const float* nsc = Wf(pwa0 + "weight"); const float* nof = Wf(pwa0 + "bias");
+    Gemm Z{}; Z.X = znh; Z.tx = F16; Z.W = M.h("w/" + SE + "z_recycle/weight"); Z.tw = F16; Z.transW = true;
+    Z.Y = z; Z.Yin = zInit; Z.ty = F32; Z.rows = P; Z.in = C; Z.out = C; Z.beta = 1.f; Z.label = "z_recycle";
+    Z.lnOut = znh; Z.lnScale = nsc; Z.lnOffset = nof;
+    if (gemm(Z)) recordEmitted(z, nsc, nof, znh);
   } else {
     float* sn = scratch<float>("be2.tp.sn", (size_t)T * Cs);
     layerNorm(s, sn, T, Cs, Wf(SE + "s_norm/weight"), Wf(SE + "s_norm/bias"));
@@ -182,15 +205,31 @@ void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zI
     pairWeightedAveraging(m, z, l);
     transition(m, m, (size_t)S * T, Cm, mm + "layers/" + num(l) + "/msa_transition/");
     outerProductMean(m, z, l);
-    triangle(z, T, C, B + "triangleMultiplicationOutgoing/", true);
-    triangle(z, T, C, B + "triangleMultiplicationIncoming/", false);
-    pairTransition(z, P, C, B + "pairTransition/");
+    triangle(z, T, C, B + "triangleMultiplicationOutgoing/", true,
+             Wf(B + "triangleMultiplicationIncoming/leftNormInputScale"),
+             Wf(B + "triangleMultiplicationIncoming/leftNormInputOffset"));
+    triangle(z, T, C, B + "triangleMultiplicationIncoming/", false,
+             Wf(B + "pairTransition/inputLayerNormScale"),
+             Wf(B + "pairTransition/inputLayerNormOffset"));
+    const bool moreMsa = hasW("msa/" + num(l + 1) + "/pairTransition/transition1");
+    const std::string nextPwa = SE + "msa_module/layers/" + num(l + 1) + "/pair_weighted_averaging/norm_z/";
+    pairTransition(z, P, C, B + "pairTransition/",
+                   moreMsa ? Wf(nextPwa + "weight") : Wf("pairmixer/0/triangleMultiplicationOutgoing/leftNormInputScale"),
+                   moreMsa ? Wf(nextPwa + "bias") : Wf("pairmixer/0/triangleMultiplicationOutgoing/leftNormInputOffset"));
   }
   for (int l = 0; hasW("pairmixer/" + num(l) + "/pairTransition/transition1"); ++l) {
     const std::string B = "pairmixer/" + num(l) + "/";
-    triangle(z, T, C, B + "triangleMultiplicationOutgoing/", true);
-    triangle(z, T, C, B + "triangleMultiplicationIncoming/", false);
-    pairTransition(z, P, C, B + "pairTransition/");
+    triangle(z, T, C, B + "triangleMultiplicationOutgoing/", true,
+             Wf(B + "triangleMultiplicationIncoming/leftNormInputScale"),
+             Wf(B + "triangleMultiplicationIncoming/leftNormInputOffset"));
+    triangle(z, T, C, B + "triangleMultiplicationIncoming/", false,
+             Wf(B + "pairTransition/inputLayerNormScale"),
+             Wf(B + "pairTransition/inputLayerNormOffset"));
+    const bool morePm = hasW("pairmixer/" + num(l + 1) + "/pairTransition/transition1");
+    const std::string nextPm = "pairmixer/" + num(l + 1) + "/triangleMultiplicationOutgoing/leftNormInput";
+    pairTransition(z, P, C, B + "pairTransition/",
+                   morePm ? Wf(nextPm + "Scale") : (nextFollows ? Wf(SE + "z_norm/weight") : nullptr),
+                   morePm ? Wf(nextPm + "Offset") : (nextFollows ? Wf(SE + "z_norm/bias") : nullptr));
   }
 }
 

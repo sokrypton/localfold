@@ -52,16 +52,16 @@ struct ScatterMeanArgs { CP(float) v; CP(int) tokenStart; CP(int) tokenAtoms; CP
 struct TailInputsArgs { CP(float) aatype; CP(float) profile; CP(float) delMean; DP(float) out; uint T, C, K, ld; };
 
 // ---------------------------------------------------------------- the diffusion module
-struct JoinPairRelArgs { CP(float) z; RelIdx rel; DP(float) out; u64 p0, n; uint T, C; };
+struct JoinPairRelArgs { CP(float) z; RelIdx rel; DP(float) out; u64 p0, n; uint T, C; CP(float) scale; CP(float) offset; DP(half) outH; };
 struct SiluMulArgs { DP(float) a; CP(float) b; u64 n; };
 struct FourierArgs { CP(float) w; CP(float) b; CP(float) level; DP(float) out; uint n, pad; };
 struct AddRowArgs { CP(float) base; CP(float) row; DP(float) x; u64 rows; uint C, pad; };
 struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; uint A, pad; };
 struct AdaCombineArgs { DP(float) an; CP(float) g; CP(float) gb; CP(float) sh; DP(half) out; CP(float) resY; CP(float) resGate; uint T, C, ld, pad; };
 struct SigmoidMulArgs { DP(float) x; CP(float) g; CP(float) gb; DP(float) dst; uint T, C, ld, pad; };
-struct ScaleCopiesArgs { CP(float) x; CP(float) scales; DP(float) out; DP(half) outH; uint rows, C, n, pad; };
+struct ScaleCopiesArgs { CP(float) x; CP(float) scales; DP(float) out; DP(half) outH; uint rows, C, n, pad; CP(float) offsets; };
 struct BiasSoftmaxArgs { DP(float) S; CP(half) bias; uint T; float scale; };
-struct PairToHeadsArgs { CP(float) pb; DP(half) out; u64 P; uint H, T, stride, pad; };
+struct PairToHeadsArgs { CP(float) pb; DP(half) out; u64 P; uint H, T, stride, blocks; };
 struct GatherTokensArgs { CP(float) perToken; CP(int) atomToToken; CP(float) mask; DP(float) q; uint A, C; };
 struct EdmArgs { CP(float) xNoisy; CP(float) r; DP(float) out; CP(float) level; uint n, pad; };
 

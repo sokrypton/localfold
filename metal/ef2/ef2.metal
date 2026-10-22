@@ -554,8 +554,45 @@ kernel void ef2_tail_inputs(LF_ARGS(TailInputsArgs)) {
 }
 
 // ---------------------------------------------------------------- the diffusion module
-// rows [p0, p0 + n) of [z | rel_pos]
+// rows [p0, p0 + n) of [z | rel_pos] (or fused with zInputNorm into outH when outH is set)
 kernel void ef2_join_pair_rel(LF_ARGS(JoinPairRelArgs)) {
+  if (a.outH && a.C == 256) {
+    const uint row = (_tg.y * _ng.x + _tg.x) * 8 + (_tid >> 5), lane = _tid & 31;
+    if (row >= a.n) return;
+    const uint p = (uint)a.p0 + row, i = lf_udiv(p, a.T), j = p - i * a.T;
+    const int rb = 32, cb = 2, w = 2 * rb + 2;
+    const bool sameChain = a.rel.asym[i] == a.rel.asym[j], sameRes = a.rel.ri[i] == a.rel.ri[j], sameEnt = a.rel.ent[i] == a.rel.ent[j];
+    const int b0 = sameChain ? clamp(a.rel.ri[i] - a.rel.ri[j] + rb, 0, 2 * rb) : 2 * rb + 1;
+    const int b1 = sameChain && sameRes ? clamp(a.rel.ti[i] - a.rel.ti[j] + rb, 0, 2 * rb) : 2 * rb + 1;
+    const int b3 = sameChain ? 2 * cb + 1 : clamp(a.rel.sym[i] - a.rel.sym[j] + cb, 0, 2 * cb);
+    device const float4* zr = (device const float4*)(a.z + (ulong)p * 256);
+    device const float4* w0 = (device const float4*)(a.rel.Wt + (uint)b0 * 256);
+    device const float4* w1 = (device const float4*)(a.rel.Wt + (uint)(w + b1) * 256);
+    device const float4* w3 = (device const float4*)(a.rel.Wt + (uint)(2 * w + 1 + b3) * 256);
+    device const float4* we = sameEnt ? (device const float4*)(a.rel.Wt + (uint)(2 * w) * 256) : nullptr;
+    float4 r[4];
+    r[0] = zr[lane];
+    r[1] = zr[lane + 32];
+    r[2] = w0[lane] + w1[lane] + w3[lane] + (we ? we[lane] : float4(0.f));
+    r[3] = w0[lane + 32] + w1[lane + 32] + w3[lane + 32] + (we ? we[lane + 32] : float4(0.f));
+    float s = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 4; ++k) s += r[k].x + r[k].y + r[k].z + r[k].w;
+    const float mean = simd_sum(s) * (1.f / 512.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 4; ++k) { const float4 d = r[k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 512.f) + 1e-5f);
+    device const float4* sc4 = (device const float4*)a.scale;
+    device const float4* of4 = (device const float4*)a.offset;
+    device half4* yh4 = (device half4*)(a.outH + (ulong)row * 512);
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 4; ++k) {
+      const uint idx = lane + 32 * k;
+      yh4[idx] = half4((r[k] - mean) * inv * sc4[idx] + of4[idx]);
+    }
+    return;
+  }
   ulong t = LF_INDEX, C2_4 = a.C >> 1;
   if (t >= a.n * C2_4) return;
   uint pr = lf_udiv((uint)t, (uint)C2_4), c4 = (uint)t - pr * (uint)C2_4, c = c4 << 2;
@@ -663,7 +700,55 @@ kernel void ef2_sigmoid_mul(LF_ARGS(SigmoidMulArgs)) {     // dst += x * sigmoid
   float v = a.x[t] * lf_sigmoid(a.g[r * a.ld + c] + (a.gb ? a.gb[c] : 0.f));
   if (a.dst) a.dst[t] += v; else a.x[t] = v;
 }
-kernel void ef2_scale_copies(LF_ARGS(ScaleCopiesArgs)) {    // out[j] = x * scale[j], [n, rows, C]
+kernel void ef2_scale_copies(LF_ARGS(ScaleCopiesArgs)) {    // out[j] = x * scale[j], [n, rows, C] (or LN(x) * scale[j] + offset[j] when pad == 1)
+  if (a.pad == 1) {
+    const uint row = (_tg.y * _ng.x + _tg.x) * 8 + (_tid >> 5), lane = _tid & 31;
+    if (row >= a.rows) return;
+    if (a.C == 256) {
+      device const float4* xr = (device const float4*)(a.x + (ulong)row * 256);
+      float4 r0 = xr[lane], r1 = xr[lane + 32];
+      const float s = r0.x + r0.y + r0.z + r0.w + r1.x + r1.y + r1.z + r1.w;
+      const float mean = simd_sum(s) * (1.f / 256.f);
+      const float4 d0 = r0 - mean, d1 = r1 - mean;
+      const float inv = rsqrt(simd_sum(dot(d0, d0) + dot(d1, d1)) * (1.f / 256.f) + 1e-5f);
+      const float4 n0 = d0 * inv, n1 = d1 * inv;
+      for (uint j = 0; j < a.n; ++j) {
+        device const float4* sc4 = (device const float4*)(a.scales + (ulong)j * 256);
+        device const float4* of4 = a.offsets ? (device const float4*)(a.offsets + (ulong)j * 256) : nullptr;
+        device half4* yh4 = (device half4*)(a.outH + ((ulong)j * a.rows + row) * 256);
+        yh4[lane] = half4(n0 * sc4[lane] + (of4 ? of4[lane] : float4(0.f)));
+        yh4[lane + 32] = half4(n1 * sc4[lane + 32] + (of4 ? of4[lane + 32] : float4(0.f)));
+      }
+      return;
+    }
+    if (a.C == 768) {
+      device const float4* xr = (device const float4*)(a.x + (ulong)row * 768);
+      float4 xv[6]; float s = 0;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) { const float4 x = xr[lane + 32 * k]; xv[k] = x; s += x.x + x.y + x.z + x.w; }
+      const float mean = simd_sum(s) * (1.f / 768.f);
+      float v = 0;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+      const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) xv[k] = (xv[k] - mean) * inv;
+      for (uint j = 0; j < a.n; ++j) {
+        device const float4* sc4 = (device const float4*)(a.scales + (ulong)j * 768);
+        device half4* yh4 = (device half4*)(a.outH + ((ulong)j * a.rows + row) * 768);
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 6; ++k) { const uint idx = lane + 32 * k; yh4[idx] = half4(xv[k] * sc4[idx]); }
+      }
+      if (a.offsets) {
+        device const float4* sc4 = (device const float4*)(a.scales + (ulong)a.n * 768);
+        device const float4* of4 = (device const float4*)a.offsets;
+        device half4* yh4 = (device half4*)(a.outH + ((ulong)a.n * a.rows + row) * 768);
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 6; ++k) { const uint idx = lane + 32 * k; yh4[idx] = half4(xv[k] * sc4[idx] + of4[idx]); }
+      }
+      return;
+    }
+  }
   uint t = (uint)LF_INDEX, C4 = a.C >> 2, per4 = a.rows * C4;
   if (t >= a.n * per4) return;
   uint j = lf_udiv(t, per4), r4 = t - j * per4, c4 = r4 - lf_udiv(r4, C4) * C4;
@@ -695,24 +780,28 @@ kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg
   float inv = 1.f / tot;
   for (uint j = tid; j < a.T; j += 256) s[j] *= inv;
 }
-// [T * T, H] -> the attention's bias [H][T][stride] in log2 units (the stride padded even, its pad zero)
+// [blocks, T * T, H] -> the attention's bias [blocks, H, T, stride] in log2 units (the stride padded even, its pad zero)
 kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
   ulong t = LF_INDEX;
+  const uint B = max(a.blocks, 1u);
   if (a.H == 16) {
-    uint H4 = 4;
-    if (t >= a.P * H4) return;
-    uint p = (uint)(t >> 2), h0 = (uint)((t & 3) << 2), i = lf_udiv(p, a.T), j = p - i * a.T;
+    uint H4 = 4, per = (uint)a.P * H4;
+    if (t >= (ulong)B * per) return;
+    uint b = B > 1 ? lf_udiv((uint)t, per) : 0, rem = (uint)t - b * per;
+    uint p = rem >> 2, h0 = (rem & 3) << 2, i = lf_udiv(p, a.T), j = p - i * a.T;
     float4 v = ((device const float4*)a.pb)[t] * M_LOG2E_F;
-    ulong base = (ulong)i * a.stride + j, sH = (ulong)a.T * a.stride;
-    a.out[(ulong)(h0 + 0) * sH + base] = (half)v.x;
-    a.out[(ulong)(h0 + 1) * sH + base] = (half)v.y;
-    a.out[(ulong)(h0 + 2) * sH + base] = (half)v.z;
-    a.out[(ulong)(h0 + 3) * sH + base] = (half)v.w;
+    ulong base = (ulong)i * a.stride + j, sH = (ulong)a.T * a.stride, bOff = (ulong)b * a.H * sH;
+    a.out[bOff + (ulong)(h0 + 0) * sH + base] = (half)v.x;
+    a.out[bOff + (ulong)(h0 + 1) * sH + base] = (half)v.y;
+    a.out[bOff + (ulong)(h0 + 2) * sH + base] = (half)v.z;
+    a.out[bOff + (ulong)(h0 + 3) * sH + base] = (half)v.w;
     return;
   }
-  if (t >= a.P * a.H) return;
-  uint p = lf_udiv((uint)t, a.H), h = (uint)t - p * a.H, i = lf_udiv(p, a.T), j = p - i * a.T;
-  a.out[((ulong)h * a.T + i) * a.stride + j] = (half)(a.pb[t] * M_LOG2E_F);
+  uint per = (uint)a.P * a.H;
+  if (t >= (ulong)B * per) return;
+  uint b = B > 1 ? lf_udiv((uint)t, per) : 0, rem = (uint)t - b * per;
+  uint p = lf_udiv(rem, a.H), h = rem - p * a.H, i = lf_udiv(p, a.T), j = p - i * a.T;
+  a.out[(((ulong)b * a.H + h) * a.T + i) * a.stride + j] = (half)(a.pb[t] * M_LOG2E_F);
 }
 kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;

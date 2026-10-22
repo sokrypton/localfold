@@ -69,10 +69,15 @@ float swigluScale();      // (fc2's divisor in every derived SwiGLU weight: 64)
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual,
                    const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
-void pairTransition(float* z, size_t rows, int C, const std::string& p);
+void pairTransition(float* z, size_t rows, int C, const std::string& p,
+                    const float* nextScale = nullptr, const float* nextOffset = nullptr);
 // AF3's triangle multiplication on the bundle's layout (leftNormInput, projection / gate [C][2C], centerNorm,
 // outputProjection, gatingLinear), into z
-void triangle(float* z, int T, int C, const std::string& p, bool outgoing);
+void triangle(float* z, int T, int C, const std::string& p, bool outgoing,
+              const float* nextScale = nullptr, const float* nextOffset = nullptr);
+half* takeEmitted(const void* x, const float* scale, const float* offset);
+half* lnTarget(size_t P, int C, const half* inUse = nullptr);
+void recordEmitted(const void* x, const float* scale, const float* offset, half* buf);
 // the relative position encoding (p + "embed_rel_pos/weight" ...) over the tokens, into out (+= under add)
 void relPos(const std::string& p, float* out, int T, int C, bool add, int ldo = 0);
 
@@ -84,7 +89,7 @@ extern Dims D_;
 void atomFeatures(const std::string& p, float* c, size_t N);
 void pairGeometry(const std::string& p, float* pr, int N);
 void pairTail(const std::string& p, float* pr, const float* c, int N);
-void windowBias(const float* pr, const float* normW, const float* projZ, float* out, int N, int H);
+void windowBias(const float* pr, const float* normW, const float* projZ, float* out, int N, int H, int layers = 1);
 // ConditionedTransformerLayer (adaLN-Zero), in place on x [R][D]: `p` the layer's prefix, `att` its attention's;
 // windowed: the sliding-window atom attention over the windowed pair's bias, else the full token attention over [H][T][T].
 // The conditioning [Rc][6D] is reached through `map` (null: the identity); perSample rows a stacked sample
@@ -105,7 +110,7 @@ void inputEmbedder(float* sInputs, int Si, const Tap& tap);
 extern int* TOK_START;                 // each token's atoms: [start[t], start[t + 1])
 void buildTokenStarts(int T, int N);
 void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit, const Tap& tap);
-void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zInit, float* s, float* z);
+void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zInit, float* s, float* z, bool nextFollows = false);
 void distogram(const float* z, float* logits);
 // the contact probabilities [T * T] on the host: the distogram's mass up to 8 A
 std::vector<float> contactProbs(const float* logits, int T, int bins);

@@ -95,14 +95,39 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   const int Ha = dimW(ab(0) + "proj_z/weight", 0), Ht = dimW(tb(0) + "proj_z/weight", 0);
   const size_t wb = (size_t)N * WK * Ha, tbn = (size_t)Ht * P;
   d.wbias = allocT<float>(wb * d.layers);
-  for (int l = 0; l < d.layers; ++l) windowBias(d.p, Wf(ab(l) + "norm_z/weight"), Wf(ab(l) + "proj_z/weight"), d.wbias + wb * l, N, Ha);
+  const float* wbNorm = M.derived<float>("sm.wb.norm", (size_t)d.layers * 16, [&](float* out) {
+    for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * 16, Wf(ab(l) + "norm_z/weight"), 64);
+  });
+  const float* wbProj = M.derived<float>("sm.wb.proj", (size_t)d.layers * Ha * 16, [&](float* out) {
+    for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * Ha * 16, Wf(ab(l) + "proj_z/weight"), (size_t)Ha * 64);
+  });
+  windowBias(d.p, wbNorm, wbProj, d.wbias, N, Ha, d.layers);
   if (HALF) d.tbiasH = allocT<half>(tbn * d.layers); else d.tbias = allocT<float>(tbn * d.layers);
-  float* proj = scratch<float>("be2.tb.proj", P * Ht);
-  for (int l = 0; l < d.layers; ++l) {
-    layerNorm(d.z, zn, P, C, Wf(tb(l) + "norm_z/weight"), nullptr);
-    linT(zn, tb(l) + "proj_z/weight", proj, P, C, Ht);
-    run1d("be2_token_bias", P * Ht, Be2TokenBiasArgs{proj, HALF ? nullptr : d.tbias + tbn * l, (uint)T, (uint)Ht,
-                                                      HALF ? d.tbiasH + tbn * l : nullptr, (float)M_LOG2E, 0});
+  if (HALF && C == 128) {
+    const float* tbNorm = M.derived<float>("sm.tb.norm", (size_t)d.layers * C, [&](float* out) {
+      for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * C, Wf(tb(l) + "norm_z/weight"), (size_t)C * 4);
+    });
+    const half* tbProj = M.derived<half>("sm.tb.proj", (size_t)d.layers * Ht * C, [&](half* out) {
+      for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * Ht * C, M.h("w/" + tb(l) + "proj_z/weight"), (size_t)Ht * C * 2);
+    });
+    half* znh = scratch<half>("be2.tb.znh", (size_t)d.layers * P * C);
+    float* proj = scratch<float>("be2.tb.proj", (size_t)d.layers * P * Ht);
+    const size_t groups = (P + 7) / 8;
+    run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
+        Be2CondInArgs{d.z, tbNorm, nullptr, znh, (u64)P, (uint)P, (uint)C, 0, (uint)d.layers});
+    Gemm G{}; G.X = znh; G.tx = F16; G.sx = (int64_t)P * C; G.W = tbProj; G.tw = F16; G.transW = true; G.sw = (int64_t)Ht * C;
+    G.Y = proj; G.ty = F32; G.sy = (int64_t)P * Ht; G.rows = P; G.in = C; G.out = Ht; G.batch = d.layers; G.label = "tb proj_z";
+    gemm(G);
+    be2Run1d("be2_token_bias", (size_t)d.layers * P * Ht,
+             Be2TokenBiasArgs{proj, nullptr, (uint)T, (uint)Ht, d.tbiasH, (float)M_LOG2E, (uint)d.layers});
+  } else {
+    float* proj = scratch<float>("be2.tb.proj", P * Ht);
+    for (int l = 0; l < d.layers; ++l) {
+      layerNorm(d.z, zn, P, C, Wf(tb(l) + "norm_z/weight"), nullptr);
+      linT(zn, tb(l) + "proj_z/weight", proj, P, C, Ht);
+      run1d("be2_token_bias", P * Ht, Be2TokenBiasArgs{proj, HALF ? nullptr : d.tbias + tbn * l, (uint)T, (uint)Ht,
+                                                        HALF ? d.tbiasH + tbn * l : nullptr, (float)M_LOG2E, 1});
+    }
   }
   // the single conditioner's sigma-free half
   const std::string sc = SM + "single_conditioner/";
@@ -245,9 +270,10 @@ static void condGroup(const float* cndP, const float* cndT, int T, int K, int Dt
     const std::string l0n = std::string(CK.l0), l2n = std::string(CK.l2);
     const float* w = stackedVectors(CK.key, CK, (l0n + "/weight").c_str(), layers, Dt);
     const float* b = hasW(CK.prefix(0) + l0n + "/bias") ? stackedVectors(CK.key, CK, (l0n + "/bias").c_str(), layers, Dt) : nullptr;
-    const size_t rows = (size_t)n * Rc, groups = (rows + 7) / 8;
+    const bool loopLayers = Dt == 768 && Rc >= 256;
+    const size_t rows = loopLayers ? (size_t)Rc : (size_t)n * Rc, groups = (rows + 7) / 8;
     run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-        Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, 0});
+        Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, loopLayers ? (uint)n : 0});
     std::vector<u64> X, Wp, Y;
     for (int j = 0; j < n; ++j) {
       X.push_back((u64)(cin + (size_t)j * Rc * Dt));
@@ -284,6 +310,7 @@ void forgetRowMaps() {
   if (ROW_MAPS.atomTok) { release(ROW_MAPS.atomTok); release(ROW_MAPS.tok); }
   ROW_MAPS = {};
   setSigmaSchedule(nullptr, 0);
+  recordEmitted(nullptr, nullptr, nullptr, nullptr);
 }
 static const RowMaps& rowMaps(int samples, int T, int N) {
   if (ROW_MAPS.samples == samples && ROW_MAPS.atomTok) return ROW_MAPS;
@@ -376,11 +403,12 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
       float* four = scratch<float>("be2.dn.four", (size_t)K * F);
       half* fourh = scratch<half>("be2.dn.fourh", (size_t)K * F);
       float* f768 = scratch<float>("be2.dn.f768", (size_t)K * Dt);
-      for (int s = 0; s < K; ++s) {
-        const float ts = 0.25f * logf(SIGMA_SCHED[curStep + s] / SIGMA_DATA);
-        run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"),
-                                                  four + (size_t)s * F, ts, (uint)F});
-      }
+      std::vector<float> hostTs(K);
+      for (int s = 0; s < K; ++s) hostTs[s] = 0.25f * logf(SIGMA_SCHED[curStep + s] / SIGMA_DATA);
+      float* tsDev = scratch<float>("be2.dn.ts", K);
+      upload(tsDev, hostTs.data(), (size_t)K * 4);
+      run1d("be2_cos_embed", (size_t)K * F,
+            Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, 0.f, (uint)F, tsDev, (uint)K, 0});
       layerNorm(four, fourh, K, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
       { Gemm Gf{}; Gf.X = fourh; Gf.tx = F16; Gf.W = M.h("w/" + sc + "fourier_to_single/weight"); Gf.tw = F16; Gf.transW = true;
         Gf.Y = f768; Gf.ty = F32; Gf.rows = K; Gf.in = F; Gf.out = Dt; Gf.label = "fourier_to_single"; gemm(Gf); }
@@ -418,7 +446,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     bi = curStep - SIGMA_BATCH_I0;
   } else {
     float* four = scratch<float>("be2.dn.four", F);
-    run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, t, (uint)F});
+    run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, t, (uint)F, nullptr, 1, 0});
     float* f768 = scratch<float>("be2.dn.f768", Dt);
     if (HALF) {
       half* fourh = scratch<half>("be2.dn.fourh", F);

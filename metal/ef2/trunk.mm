@@ -77,7 +77,7 @@ static void transition(T* pair, size_t P, int C, const std::string& Tn, const st
   size_t rows = std::min(P, chunk);
   half* xn = scratch<half>("ftr.xn", rows * C);
   half* g = scratch<half>("ftr.g", rows * I);
-  const half* w1 = swigluPairs(Tn + "transition1", Fh(Tn + "transition1"), C, I);
+  const half* w1 = swigluPairsInPlace("f/" + Tn + "transition1", C, I);
   // (a row's norm is its own: the emitted input and the emitted output both go a chunk of rows at a time)
   half* in = takeEmitted(pair, Tn + "inputLayerNorm");
   half* lnOut = next.empty() ? nullptr : lnTarget(P, C, in);

@@ -48,7 +48,7 @@ kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.width * a.height) return;
   ulong y, x;      // (32-bit division where it fits: the 64-bit one is slow)
-  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = (uint)t / (uint)a.width; y = y32; x = (uint)t - y32 * (uint)a.width; }
+  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = lf_udiv((uint)t, (uint)a.width); y = y32; x = (uint)t - y32 * (uint)a.width; }
   else { y = t / a.width; x = t - y * a.width; }
   a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
 }
@@ -56,7 +56,7 @@ kernel void lf_copy2d16(LF_ARGS(Copy2DArgs)) {     // (pitches and width in 16-b
   ulong t = LF_INDEX;
   if (t >= a.width * a.height) return;
   ulong y, x;
-  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = (uint)t / (uint)a.width; y = y32; x = (uint)t - y32 * (uint)a.width; }
+  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = lf_udiv((uint)t, (uint)a.width); y = y32; x = (uint)t - y32 * (uint)a.width; }
   else { y = t / a.width; x = t - y * a.width; }
   ((device uint4*)a.dst)[y * a.dpitch + x] = ((device const uint4*)a.src)[y * a.spitch + x];
 }

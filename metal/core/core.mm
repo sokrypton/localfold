@@ -731,7 +731,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
                      (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) &&
-                     (tm == 64 || (tm == 32 && tn == 256) || ((a.epilogue & 1048576) && tm % 16 == 0 && tn % 32 == 0)) &&
+                     (tm == 64 || (tm == 32 && tn == 256) || ((a.epilogue & (16384 | 262144 | 1048576)) && tm % 16 == 0 && tn % 32 == 0)) &&
                      a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
                      (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0)
                              : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & (64 | 1048576)) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
@@ -746,7 +746,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if ((a.epilogue & 8192) && !vecEp) die("gemm: the outer product's normalised add needs the vector epilogue's alignment");
   if ((a.epilogue & 16384) && !vecEp) die("gemm: the gated residual needs the vector epilogue's alignment");
   if ((a.epilogue & 1048576) && !vecEp) die("gemm: the in-place multiply needs the vector epilogue's alignment");
-  if (vecEp && !(a.epilogue & 1048576) && tn < 64) tn = 64;
+  if (vecEp && !(a.epilogue & (16384 | 262144 | 1048576)) && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
   while (!plain && !tri && !vecEp && !swigluReg && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
@@ -867,7 +867,7 @@ bool gemm(const Gemm& g) {
 bool gemmGatedRows(const Gemm& g, const float* gate, int ldg, const int* map) {
   static const bool on = !getenv("LOCALFOLD_GATED_ROWS") || atoi(getenv("LOCALFOLD_GATED_ROWS")) != 0;
   const int ldy = g.ldy ? g.ldy : g.out;
-  if (!on || !tensorWanted() || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.rows <= 128 || g.out % 4 ||
+  if (!on || !tensorWanted() || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.out % 4 ||
       ldy % 4 || ldg % 4 || ((uint64_t)g.Y & 15) || ((uint64_t)gate & 15) || g.bias || g.beta != 0.f || g.lnOut || g.Yin)
     return false;
   GemmArgs a = gemmArgs(g);
@@ -940,7 +940,7 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
                       const float* gate, int ld, size_t period, float alpha, const char* label, bool preSigmoid) {
   static const bool on = !getenv("LOCALFOLD_GATE_RES") || atoi(getenv("LOCALFOLD_GATE_RES")) != 0;
-  if (!on || !tensorWanted() || prows <= 128 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
+  if (!on || !tensorWanted() || prows < 1 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
     return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)act;

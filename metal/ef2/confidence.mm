@@ -47,7 +47,8 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     half* stackH = scratch<half>("cf.stackH", P * C);
     toHalf(z, stackH, P * C);
     for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
-      trunkBlock(stackH, mask, T, C, "confidence/blocks", b);
+      trunkBlock(stackH, mask, T, C, "confidence/blocks", b,
+                 M.has("f/confidence/blocks/" + std::to_string(b + 1) + "/pairTransition/transition1"));
     releaseScratch({"ftri.", "ftr.", "eln."});
     float* stack = scratch<float>("cf.stack", P * C);
     toFloat(stackH, stack, P * C);
@@ -57,7 +58,8 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     float* stack = allocT<float>(P * C);
     copy(stack, z, P * C * 4);
     for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
-      trunkBlock(stack, mask, T, C, "confidence/blocks", b);
+      trunkBlock(stack, mask, T, C, "confidence/blocks", b,
+                 M.has("f/confidence/blocks/" + std::to_string(b + 1) + "/pairTransition/transition1"));
     add(z, stack, P * C);
     release(stack);
   }

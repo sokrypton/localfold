@@ -74,6 +74,7 @@ int oracleArm(const Opts& o, int Si) {
   check("s_init", "s_init", sInit, (size_t)T * Cs);
   check("z_init", "z_init", zInit, P * C);
   for (int k = 1; k <= o.passes; ++k) {
+    recordEmitted(nullptr, nullptr, nullptr, nullptr);
     float* s = k == 1 ? allocT<float>((size_t)T * Cs) : fresh("o/pass" + num(k - 1) + ".single");
     float* z = k == 1 ? allocT<float>(P * C) : fresh("o/pass" + num(k - 1) + ".pair");
     trunkPass(sInputs, Si, M.f("o/s_init"), M.f("o/z_init"), s, z);
@@ -141,7 +142,9 @@ int foldInput(const Opts& o) {
   mt::sync();
   printf("inputs %.1f ms\n", ms(t0)); t0 = now();
   if (o.profile) profileStart();
-  for (int k = 0; k < o.passes; ++k) trunkPass(sInputs, Si, sInit, zInit, s, z);
+  recordEmitted(nullptr, nullptr, nullptr, nullptr);
+  for (int k = 0; k < o.passes; ++k) trunkPass(sInputs, Si, sInit, zInit, s, z, k + 1 < o.passes);
+  recordEmitted(nullptr, nullptr, nullptr, nullptr);
   mt::sync();
   printf("trunk %.1f ms (%d passes)\n", ms(t0), o.passes); t0 = now();
   if (o.profile) profileReport("trunk", 2000);

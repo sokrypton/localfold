@@ -29,8 +29,8 @@ void pairTail(const std::string& p, float* pr, const float* c, int N) {
   run1d("be2_pair_tail", (size_t)N * WK, Be2PairTailArgs{pr, cq, ck, Wf(p + "p_mlp_1/weight"), Wf(p + "p_mlp_3/weight"),
                                                          Wf(p + "p_mlp_5/weight"), (uint)N, 0});
 }
-void windowBias(const float* pr, const float* normW, const float* projZ, float* out, int N, int H) {
-  run1d("be2_window_bias", (size_t)N * WK, Be2WindowBiasArgs{pr, normW, projZ, out, (uint)N, (uint)H});
+void windowBias(const float* pr, const float* normW, const float* projZ, float* out, int N, int H, int layers) {
+  run1d("be2_window_bias", (size_t)N * WK, Be2WindowBiasArgs{pr, normW, projZ, out, (uint)N, (uint)H, (uint)layers, 0});
 }
 
 // ---------------------------------------------------------------- the conditioned transformer layer
@@ -151,16 +151,26 @@ void inputEmbedder(float* sInputs, int Si, const Tap& tap) {
   pairTail(IE, pr, c, N);
   float* q = scratch<float>("be2.ie.q", (size_t)N * C);
   copy(q, c, (size_t)N * C * 4);
-  for (int i = 0; ; ++i) {
-    const std::string p = IE + "atom_encoder_layers_" + num(i) + "/transformer_layer/";
-    const std::string a = "attention/attention_layer/pair_bias_attn/";
-    if (!hasW(p + a + "proj_z/weight")) break;
-    const int H = dimW(p + a + "proj_z/weight", 0);
-    float* bias = scratch<float>("be2.ie.bias", (size_t)N * WK * H);
-    windowBias(pr, Wf(p + a + "norm_z/weight"), Wf(p + a + "proj_z/weight"), bias, N, H);
-    const CondLayer L{p, a, true, H};
-    float* cond = layerCond(L, c, N, C, C, "be2.cl.cond");
-    condLayer(L, q, N, C, cond, nullptr, bias, N);
+  int ieLayers = 0;
+  auto iePrefix = [&](int i) { return IE + "atom_encoder_layers_" + num(i) + "/transformer_layer/"; };
+  const std::string a = "attention/attention_layer/pair_bias_attn/";
+  while (hasW(iePrefix(ieLayers) + a + "proj_z/weight")) ++ieLayers;
+  if (ieLayers > 0) {
+    const int H = dimW(iePrefix(0) + a + "proj_z/weight", 0);
+    const size_t wb = (size_t)N * WK * H;
+    const float* wbNorm = M.derived<float>("ie.wb.norm", (size_t)ieLayers * 16, [&](float* out) {
+      for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * 16, Wf(iePrefix(i) + a + "norm_z/weight"), 64);
+    });
+    const float* wbProj = M.derived<float>("ie.wb.proj", (size_t)ieLayers * H * 16, [&](float* out) {
+      for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * H * 16, Wf(iePrefix(i) + a + "proj_z/weight"), (size_t)H * 64);
+    });
+    float* bias = scratch<float>("be2.ie.bias", wb * ieLayers);
+    windowBias(pr, wbNorm, wbProj, bias, N, H, ieLayers);
+    for (int i = 0; i < ieLayers; ++i) {
+      const CondLayer L{iePrefix(i), a, true, H};
+      float* cond = layerCond(L, c, N, C, C, "be2.cl.cond");
+      condLayer(L, q, N, C, cond, nullptr, bias + wb * i, N);
+    }
   }
   const int A = dimW(IE + "atom_to_token_trans_0/weight", 0);
   float* h = scratch<float>("be2.ie.h", (size_t)N * A);

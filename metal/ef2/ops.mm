@@ -33,9 +33,9 @@ const half* swigluPairs(const std::string& key, const half* w, int rows, int I) 
 // ...in the tensor's own memory (read by nothing else): interleaved in place a row per threadgroup, so the original
 // and its interleaving are never both held - the language model's 36 fc1 weights were 0.5 GB twice
 const half* swigluPairsInPlace(const std::string& name, int rows, int I) {
-  static std::set<std::string> done;
+  static std::set<std::pair<std::string, const half*>> done;
   half* w = const_cast<half*>(M.h(name));
-  if (done.insert(name).second) {
+  if (done.insert({name, w}).second) {
     if (I % 8 == 0 && I <= 8192)
       run("ef2_interleave8_inplace", Grid{(uint32_t)rows, 1, 1}, 256, Interleave8Args{w, w + I, w, (uint)rows, (uint)I, (uint)(2 * I), 0});
     else {

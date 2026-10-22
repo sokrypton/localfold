@@ -76,7 +76,7 @@ kernel void be2_pair_tail(LF_ARGS(Be2PairTailArgs)) {
   }
   for (int c = 0; c < 16; ++c) o[c] = p[c] + h[c];
 }
-// the windowed pair's bias: LN(pr) (scale, no offset) -> proj_z [H][16], heads first: out[w][h][i][j]
+// the windowed pair's bias: LN(pr) (scale, no offset) -> proj_z [H][16], heads first: out[l][w][h][i][j]
 kernel void be2_window_bias(LF_ARGS(Be2WindowBiasArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.N * BE2_WK) return;
@@ -85,10 +85,17 @@ kernel void be2_window_bias(LF_ARGS(Be2WindowBiasArgs)) {
   float mean = 0; for (int c = 0; c < 16; ++c) mean += x[c]; mean /= 16.f;
   float var = 0; for (int c = 0; c < 16; ++c) { float d = x[c] - mean; var += d * d; }
   float inv = rsqrt(var / 16.f + 1e-5f);
-  float n[16]; for (int c = 0; c < 16; ++c) n[c] = (x[c] - mean) * inv * a.normW[c];
-  for (uint h = 0; h < a.H; ++h) {
-    float s = 0; for (int c = 0; c < 16; ++c) s += a.projZ[h * 16 + c] * n[c];
-    a.out[(((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK + j] = s;
+  float d[16]; for (int c = 0; c < 16; ++c) d[c] = (x[c] - mean) * inv;
+  const uint L = max(a.layers, 1u);
+  const ulong wb = (ulong)a.N * BE2_WK * a.H;
+  for (uint l = 0; l < L; ++l) {
+    device const float* nw = a.normW + (ulong)l * 16;
+    device const float* pz = a.projZ + (ulong)l * a.H * 16;
+    float n[16]; for (int c = 0; c < 16; ++c) n[c] = d[c] * nw[c];
+    for (uint h = 0; h < a.H; ++h) {
+      float s = 0; for (int c = 0; c < 16; ++c) s += pz[h * 16 + c] * n[c];
+      a.out[(ulong)l * wb + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK + j] = s;
+    }
   }
 }
 // AttentionPairBiasSlidingWindow: a threadgroup per (window, head) of 128 threads, FOUR lanes a query, each over a
@@ -613,6 +620,48 @@ kernel void be2_cs_wq2(constant Be2CsWqArgs& a [[buffer(0)]], uint3 tg [[threadg
 kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
+  if (a.C == 128 && a.nLayers > 0) {
+    device const float4* x4 = (device const float4*)(a.c + row * 128);
+    const float4 val = x4[lane];
+    const float mean = simd_sum(val.x + val.y + val.z + val.w) * (1.f / 128.f);
+    const float4 d = val - mean;
+    const float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+    const float4 nv = d * inv;
+    for (uint j = 0; j < a.nLayers; ++j) {
+      device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 128);
+      ((device half4*)(a.out + ((ulong)j * a.Rc + row) * 128))[lane] = half4(nv * w4[lane]);
+    }
+    return;
+  }
+  if (a.C == 768 && a.nLayers > 0) {
+    device const float4* x4 = (device const float4*)(a.c + row * 768);
+    float4 xv[6]; float s = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const float4 val = x4[lane + 32 * k];
+      xv[k] = val; s += val.x + val.y + val.z + val.w;
+    }
+    const float mean = simd_sum(s) * (1.f / 768.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) xv[k] = (xv[k] - mean) * inv;
+    for (uint j = 0; j < a.nLayers; ++j) {
+      device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 768);
+      device const float4* b4 = a.b ? (device const float4*)(a.b + (ulong)(a.l0 + j) * 768) : nullptr;
+      device half4* out4 = (device half4*)(a.out + ((ulong)j * a.Rc + row) * 768);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const uint idx = lane + 32 * k;
+        float4 n = xv[k] * w4[idx];
+        if (b4) n += b4[idx];
+        out4[idx] = half4(n / (1.f + exp(-n)));
+      }
+    }
+    return;
+  }
   const uint j = lf_udiv((uint)row, a.Rc), r = (uint)row - j * a.Rc;
   device const float* x = a.c + (ulong)r * a.C;
   device const float* w = a.w + (ulong)(a.l0 + j) * a.C;
@@ -853,10 +902,14 @@ kernel void be2_contacts(LF_ARGS(Be2ContactArgs)) {
 }
 kernel void be2_token_bias(LF_ARGS(Be2TokenBiasArgs)) {
   ulong t = LF_INDEX;
-  if (t >= (ulong)a.T * a.T * a.H) return;
-  uint h = (uint)(t % a.H); ulong ij = t / a.H;
-  if (a.outh) a.outh[(ulong)h * a.T * a.T + ij] = (half)(a.proj[t] * a.mul);
-  else a.out[(ulong)h * a.T * a.T + ij] = a.proj[t];
+  const uint L = max(a.layers, 1u);
+  const ulong P = (ulong)a.T * a.T, per = P * a.H;
+  if (t >= (ulong)L * per) return;
+  BE2_SPLIT(t, (uint)per, l, rem);
+  uint h = rem % a.H, ij = rem / a.H;
+  const ulong dst = ((ulong)l * a.H + h) * P + ij;
+  if (a.outh) a.outh[dst] = (half)(a.proj[t] * a.mul);
+  else a.out[dst] = a.proj[t];
 }
 kernel void be2_trigate_weight(LF_ARGS(Be2TriGateWArgs)) {
   ulong t = LF_INDEX;
@@ -903,8 +956,12 @@ kernel void be2_edm_out(LF_ARGS(Be2EdmOutArgs)) {
   if (t < a.n) a.d[t] = a.skip * a.x[t] + a.cout * a.out[t];
 }
 kernel void be2_cos_embed(LF_ARGS(Be2CosEmbedArgs)) {
-  ulong k = LF_INDEX;
-  if (k < a.n) a.out[k] = cos(2.f * M_PI_F * (a.t * a.w[k] + a.b[k]));
+  ulong idx = LF_INDEX;
+  const uint K = max(a.K, 1u);
+  if (idx >= (ulong)K * a.n) return;
+  const uint s = K > 1 ? lf_udiv((uint)idx, a.n) : 0, k = (uint)idx - s * a.n;
+  const float tv = a.ts ? a.ts[s] : a.t;
+  a.out[idx] = cos(2.f * M_PI_F * (tv * a.w[k] + a.b[k]));
 }
 kernel void be2_broadcast_add(LF_ARGS(Be2BroadcastAddArgs)) {
   ulong t = LF_INDEX;

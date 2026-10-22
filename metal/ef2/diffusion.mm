@@ -14,18 +14,47 @@
 static constexpr int DIFFUSION_HALF_WINDOW = 64;
 
 // TransitionLayer: x += out(silu(LN(x) @ a) * (LN(x) @ b)), the SwiGLU in the first GEMM's epilogue
-static void transitionLayer(float* x, size_t rows, int C, const std::string& B) {
+static void transitionLayer(float* x, size_t rows, int C, const std::string& B,
+                            const half* inLn = nullptr, half* outLn = nullptr,
+                            const float* nextScale = nullptr, const float* nextOffset = nullptr) {
   int Hd = dimOf("f/" + B + "aProjection", 1);
   const half* w = swigluPairs2(B, Fh(B + "aProjection"), Fh(B + "bProjection"), C, Hd);
   size_t chunk = std::max<size_t>(64, ((size_t)32 << 20) / (3 * (size_t)Hd));
   size_t n = std::min(rows, chunk);
-  half* xn = scratch<half>("dtr.xn", n * C); half* g = scratch<half>("dtr.g", n * Hd);
+  half* xn = inLn ? nullptr : scratch<half>("dtr.xn", n * C); half* g = scratch<half>("dtr.g", n * Hd);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
-    layerNorm(x + r0 * C, xn, r, C, F(B + "norm/scale"), F(B + "norm/offset"));
-    gemmSwiglu(xn, w, g, r, C, Hd);
-    lin(g, "f/" + B + "outProjection", x + r0 * C, r, Hd, C, 1.f);
+    const half* xh = inLn ? inLn + r0 * C : xn;
+    if (!inLn) layerNorm(x + r0 * C, xn, r, C, F(B + "norm/scale"), F(B + "norm/offset"));
+    gemmSwiglu(xh, w, g, r, C, Hd);
+    if (outLn && HALF_GEMM) {
+      Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("f/" + B + "outProjection"); G.tw = F16; G.Y = x + r0 * C; G.ty = F32;
+      G.rows = r; G.in = Hd; G.out = C; G.beta = 1.f; G.label = "transition outProjection";
+      G.lnOut = outLn + r0 * C; G.lnScale = nextScale; G.lnOffset = nextOffset;
+      if (!gemm(G)) layerNorm(x + r0 * C, outLn + r0 * C, r, C, nextScale, nextOffset);
+    } else {
+      lin(g, "f/" + B + "outProjection", x + r0 * C, r, Hd, C, 1.f);
+    }
   }
+}
+
+static const float* pairBiasScales(int nb, int Cz) {
+  return M.derived<float>("ef2.pb.scales", (size_t)nb * Cz, [&](float* out) {
+    for (int b = 0; b < nb; ++b)
+      copy(out + (size_t)b * Cz, F("diffusion/tokenBlocks/" + std::to_string(b) + "/attention/pairNormScale"), (size_t)Cz * 4);
+  });
+}
+static const float* pairBiasOffsets(int nb, int Cz) {
+  return M.derived<float>("ef2.pb.offsets", (size_t)nb * Cz, [&](float* out) {
+    for (int b = 0; b < nb; ++b)
+      copy(out + (size_t)b * Cz, F("diffusion/tokenBlocks/" + std::to_string(b) + "/attention/pairNormOffset"), (size_t)Cz * 4);
+  });
+}
+static const half* pairBiasWeights(int nb, int Cz, int H) {
+  return M.derived<half>("ef2.pb.weights", (size_t)nb * Cz * H, [&](half* out) {
+    for (int b = 0; b < nb; ++b)
+      copy(out + (size_t)b * Cz * H, Fh("diffusion/tokenBlocks/" + std::to_string(b) + "/attention/pairBiasWeights"), (size_t)Cz * H * 2);
+  });
 }
 
 Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
@@ -37,31 +66,75 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
   size_t P = (size_t)T * T; int Cz = d.Cz;
   // the conditioning pair, row chunks of 64 MB: [z | rel_pos] -> LN -> zProjection, then two transitions
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (8 * (size_t)Cz));
-  float* joined = scratch<float>("dc.joined", chunk * 2 * Cz);
   half* jn = scratch<half>("dc.jn", chunk * 2 * Cz);
   float* pair = scratch<float>("dc.pair", P * Cz);
+  half* trLn = (HALF_GEMM && chunk == P && Cz == 256) ? scratch<half>("dc.trln", P * Cz) : nullptr;
+  bool haveTrLn = false;
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    run1d("ef2_join_pair_rel", (n * 2 * Cz) >> 2, JoinPairRelArgs{zTrunk, relIdx(), joined, p0, n, (uint)T, (uint)Cz});
-    layerNorm(joined, jn, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
-    lin(jn, "f/diffusion/zProjection", pair + p0 * Cz, n, 2 * Cz, Cz);
+    if (Cz == 256) {
+      run("ef2_join_pair_rel", grid1d((n + 7) / 8, 1), 256,
+          JoinPairRelArgs{zTrunk, relIdx(), nullptr, p0, n, (uint)T, (uint)Cz,
+                          F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"), jn});
+    } else {
+      float* joined = scratch<float>("dc.joined", chunk * 2 * Cz);
+      run1d("ef2_join_pair_rel", (n * 2 * Cz) >> 2,
+            JoinPairRelArgs{zTrunk, relIdx(), joined, p0, n, (uint)T, (uint)Cz, nullptr, nullptr, nullptr});
+      layerNorm(joined, jn, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+    }
+    if (trLn) {
+      Gemm G{}; G.X = jn; G.tx = F16; G.W = M.h("f/diffusion/zProjection"); G.tw = F16; G.Y = pair + p0 * Cz; G.ty = F32;
+      G.rows = n; G.in = 2 * Cz; G.out = Cz; G.label = "f/diffusion/zProjection";
+      G.lnOut = trLn; G.lnScale = F("diffusion/zTransitions/0/norm/scale"); G.lnOffset = F("diffusion/zTransitions/0/norm/offset");
+      haveTrLn = gemm(G);
+    } else {
+      lin(jn, "f/diffusion/zProjection", pair + p0 * Cz, n, 2 * Cz, Cz);
+    }
   }
-  for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
+  if (trLn && haveTrLn) {
+    transitionLayer(pair, P, Cz, "diffusion/zTransitions/0/", trLn, trLn,
+                    F("diffusion/zTransitions/1/norm/scale"), F("diffusion/zTransitions/1/norm/offset"));
+    transitionLayer(pair, P, Cz, "diffusion/zTransitions/1/", trLn);
+  } else {
+    for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
+  }
   // each token block's pair bias, [H, T, T] in half (the pair itself is not kept)
-  half* pn = scratch<half>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
   d.stride = (T + 7) / 8 * 8;
-  for (int b = 0; b < d.tokenBlocks; ++b) {
-    std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
+  const size_t perBias = (size_t)d.heads * T * d.stride;
+  d.biasBuf = allocT<half>((size_t)d.tokenBlocks * perBias);
+  for (int b = 0; b < d.tokenBlocks; ++b) d.biases.push_back(d.biasBuf + (size_t)b * perBias);
+  if (HALF_GEMM && Cz == 256) {
+    const int nb = d.tokenBlocks, H = d.heads;
+    half* pn = scratch<half>("dc.pn", (size_t)nb * chunk * Cz);
+    float* pb = scratch<float>("dc.pb", (size_t)nb * P * H);
+    const float* sc = pairBiasScales(nb, Cz);
+    const float* of = pairBiasOffsets(nb, Cz);
+    const half* pw = pairBiasWeights(nb, Cz, H);
     for (size_t p0 = 0; p0 < P; p0 += chunk) {
       size_t n = std::min(chunk, P - p0);
-      layerNorm(pair + p0 * Cz, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
-      lin(pn, "f/" + B + "pairBiasWeights", pb + p0 * d.heads, n, Cz, d.heads);
+      run("ef2_scale_copies", grid1d((n + 7) / 8, 1), 256,
+          ScaleCopiesArgs{pair + p0 * Cz, sc, nullptr, pn, (uint)n, (uint)Cz, (uint)nb, 1, of});
+      Gemm G{}; G.X = pn; G.tx = F16; G.sx = (int64_t)n * Cz; G.W = pw; G.tw = F16; G.sw = (int64_t)Cz * H;
+      G.Y = pb + p0 * H; G.ty = F32; G.sy = (int64_t)P * H; G.rows = n; G.in = Cz; G.out = H; G.batch = nb;
+      G.label = "pairBiasWeights";
+      gemm(G);
     }
-    half* h = allocT<half>((size_t)d.heads * T * d.stride);
-    run1d("ef2_pair_to_heads", d.heads == 16 ? P * 4 : P * d.heads, PairToHeadsArgs{pb, h, P, (uint)d.heads, (uint)T, (uint)d.stride, 0});
-    d.biases.push_back(h);
+    run1d("ef2_pair_to_heads", (size_t)nb * (H == 16 ? P * 4 : P * H),
+          PairToHeadsArgs{pb, d.biasBuf, P, (uint)H, (uint)T, (uint)d.stride, (uint)nb});
+  } else {
+    half* pn = scratch<half>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
+    for (int b = 0; b < d.tokenBlocks; ++b) {
+      std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
+      for (size_t p0 = 0; p0 < P; p0 += chunk) {
+        size_t n = std::min(chunk, P - p0);
+        layerNorm(pair + p0 * Cz, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
+        lin(pn, "f/" + B + "pairBiasWeights", pb + p0 * d.heads, n, Cz, d.heads);
+      }
+      run1d("ef2_pair_to_heads", d.heads == 16 ? P * 4 : P * d.heads,
+            PairToHeadsArgs{pb, d.biases[b], P, (uint)d.heads, (uint)T, (uint)d.stride, 1});
+    }
   }
-  releaseScratch({"dc.joined", "dc.jn", "dc.pair", "dc.pn", "dc.pb", "dtr."});
+  releaseScratch({"dc.joined", "dc.jn", "dc.trln", "dc.pair", "dc.pn", "dc.pb", "dtr."});
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
   {
     int Ca = d.atoms.ctx.C;
@@ -102,20 +175,23 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
     lin(sn, "f/diffusion/sProjection", d.sBase, T, d.Si, Ct);
     releaseScratch({"dc.sn"});
   }
-  d.single = allocT<float>((size_t)T * Ct); d.snScaled = allocT<float>((size_t)2 * nb * T * Ct);
-  d.G = allocT<float>((size_t)T * d.entries * Ct); d.scales = allocT<float>((size_t)2 * nb * Ct);
+  d.single = allocT<float>((size_t)T * Ct); d.snScaled = allocT<float>((size_t)(2 * nb + 1) * T * Ct);
+  d.G = allocT<float>((size_t)T * d.entries * Ct); d.scales = allocT<float>((size_t)(2 * nb + 1) * Ct);
   for (int b = 0; b < nb; ++b)
     for (int k = 0; k < 2; ++k)
       copy(d.scales + (size_t)(2 * b + k) * Ct, F("diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/") +
                                                    "adaln/singleScale"), Ct * 4);
+  copy(d.scales + (size_t)(2 * nb) * Ct, F("diffusion/stepNorm/scale"), Ct * 4);
   d.level = allocT<float>(4);
   return d;
 }
 void freeDenoiser(Denoiser& d) {
-  for (half* b : d.biases) release(b);
+  if (d.biasBuf) release(d.biasBuf);
+  else for (half* b : d.biases) release(b);
   for (void* p : {(void*)d.sBase, (void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.level, (void*)d.encMod, (void*)d.decMod}) release(p);
   freeAtoms(d.atoms);
   d.biases.clear();
+  d.biasBuf = nullptr;
 }
 
 // every token block's adaLN gate and shift projections (one batched GEMM over the 2nb scaled copies of LN(single), each
@@ -173,12 +249,24 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
   }
   run1d("ef2_add_row", (KT * Ct) >> 2, AddRowArgs{d.sBase, noise, single, (u64)KT, (uint)Ct, (uint)T});
   for (int l = 0; l < 2; ++l) transitionLayer(single, KT, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
-  float* sn = scratch<float>("dn.sn0", KT * Ct);
-  layerNorm(single, sn, KT, Ct, nullptr, nullptr);
-  half* snScaledH = K == 1 ? (half*)(void*)d.snScaled : (HALF_GEMM ? scratch<half>("dn.snsH", (size_t)n * KT * Ct) : nullptr);
-  float* snScaledF = K == 1 ? d.snScaled : (HALF_GEMM ? nullptr : scratch<float>("dn.snsF", (size_t)n * KT * Ct));
-  run1d("ef2_scale_copies", ((size_t)n * KT * Ct) >> 2,
-        ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : snScaledF, HALF_GEMM ? snScaledH : nullptr, (uint)KT, (uint)Ct, (uint)n, 0});
+  half* snScaledH = nullptr;
+  float* snScaledF = nullptr;
+  half* snStep = nullptr;
+  if (HALF_GEMM && Ct == 768) {
+    snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 1) * KT * Ct);
+    snStep = snScaledH + (size_t)n * KT * Ct;
+    run("ef2_scale_copies", grid1d((KT + 7) / 8, 1), 256,
+        ScaleCopiesArgs{single, d.scales, nullptr, snScaledH, (uint)KT, (uint)Ct, (uint)n, 1, F("diffusion/stepNorm/offset")});
+  } else {
+    float* sn = scratch<float>("dn.sn0", KT * Ct);
+    layerNorm(single, sn, KT, Ct, nullptr, nullptr);
+    snScaledH = K == 1 ? (half*)(void*)d.snScaled : (HALF_GEMM ? scratch<half>("dn.snsH", (size_t)n * KT * Ct) : nullptr);
+    snScaledF = K == 1 ? d.snScaled : (HALF_GEMM ? nullptr : scratch<float>("dn.snsF", (size_t)n * KT * Ct));
+    run1d("ef2_scale_copies", ((size_t)n * KT * Ct) >> 2,
+          ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : snScaledF, HALF_GEMM ? snScaledH : nullptr, (uint)KT, (uint)Ct, (uint)n, 0, nullptr});
+    snStep = scratch<half>("dn.sn", KT * Ct);
+    layerNorm(single, snStep, KT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
+  }
   Gemm g{};
   if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = snScaledF; g.half = true; }
   g.sx = (int64_t)KT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
@@ -187,8 +275,6 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
   Gemm o{}; o.X = single; o.W = outGateWeights(nb, Ct); o.tw = F16; o.half = true; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
   o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
   gemm(o);
-  half* snStep = scratch<half>("dn.sn", KT * Ct);
-  layerNorm(single, snStep, KT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   lin(snStep, "f/diffusion/singleToToken", sTok, KT, Ct, Ct);
 }
 // adaLN into half: sigmoid(gate + gateBias) * LN(a) + shift, the projections from G (optionally folding a preceding gated residual into a)
@@ -227,7 +313,7 @@ static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const
   pendingY = pendingGate = nullptr;
   int Hd = dimOf("f/" + B + "transition/outWeights", 0);
   half* g = scratch<half>("tb.gated", (size_t)T * Hd);
-  gemmSwiglu(x, swigluPairs(B + "transition/swishWeights", Fh(B + "transition/swishWeights"), C, Hd), g, T, C, Hd);
+  gemmSwiglu(x, swigluPairsInPlace("f/" + B + "transition/swishWeights", C, Hd), g, T, C, Hd);
   const float* gTr = G + (size_t)(4 * nb + 2 * b + 1) * C;
   if (!HALF_GEMM || !gemmGateResidual(g, Fh(B + "transition/outWeights"), a, T, T, Hd, C, gTr, ld, T, 1.f, "transition outWeights")) {
     lin(g, "f/" + B + "transition/outWeights", o, T, Hd, C);

@@ -11,8 +11,8 @@ struct Be2PairGeomArgs { CP(float) ref; CP(int) uid; CP(int) pad; CP(float) wPos
                          DP(float) pr; uint N, CP_; };
 struct Be2PairTokenAddArgs { CP(float) zp; CP(int) atomTok; CP(int) pad; DP(float) pr; uint N, T, CP_, pad0; };
 struct Be2PairTailArgs { DP(float) pr; CP(float) cq; CP(float) ck; CP(float) w1; CP(float) w3; CP(float) w5; uint N, pad0; };
-// LN(pr) (scale, no offset) -> proj_z: out[w][h][i][j]
-struct Be2WindowBiasArgs { CP(float) pr; CP(float) normW; CP(float) projZ; DP(float) out; uint N, H; };
+// LN(pr) (scale, no offset) -> proj_z: out[l][w][h][i][j]
+struct Be2WindowBiasArgs { CP(float) pr; CP(float) normW; CP(float) projZ; DP(float) out; uint N, H, layers, pad0; };
 // the sliding-window attention: a threadgroup per (window of a stacked sample, head), a thread per query; qkv [rows][3D]
 // (q at 0, k at D, v at 2D), out [rows][D]; N atoms a sample. The fast arm's _h takes qkvg [rows][4D] in half and gates
 // its half output in the epilogue
@@ -59,7 +59,7 @@ struct Be2CsWqArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I, off, K; 
 // the denoiser's conditioning a group of layers at a time (denoise.mm, condGroup): out[j][r] = silu(LN(c[r]) w[l0 + j] +
 // b[l0 + j]) in half - every layer conditions on the same rows, only its LayerNorm's affine is its own; w, b stacked
 // [layers][C] (b null: none). A simdgroup a row. Then the bias add over the batch: y[j][r][o] += bias[l0 + j][o]
-struct Be2CondInArgs { CP(float) c; CP(float) w; CP(float) b; DP(half) out; u64 rows; uint Rc, C, l0, pad0; };
+struct Be2CondInArgs { CP(float) c; CP(float) w; CP(float) b; DP(half) out; u64 rows; uint Rc, C, l0, nLayers; };
 struct Be2BatchBiasArgs { DP(float) y; CP(float) bias; u64 n; uint Rc, O, l0, pad0; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };
@@ -88,8 +88,8 @@ struct Be2OpmPackArgs { CP(float) proj; DP(float) a; DP(float) b; u64 R; uint Co
 struct Be2OpmPermuteArgs { CP(float) x; DP(float) y; uint bi, T, Co; float inv; };
 struct Be2SymmetriseArgs { CP(float) z; DP(float) zs; uint T, C; };
 struct Be2ContactArgs { CP(float) logits; DP(float) out; u64 pairs; uint bins, near; };
-struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) outh; float mul; uint pad0; };
-                                                    // [pairs][H] -> [H][pairs] (outh: in half, times mul - log2 e)
+struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) outh; float mul; uint layers; };
+                                                    // [layers][pairs][H] -> [layers][H][pairs] (outh: in half, times mul - log2 e)
 // the pair track's fast weights (metal/ef2's): the triangle's projection and gate [C][2C] (a, b interleaved by channel) as
 // gemmTriGate's one weight [C][4C], channel c's (pa ga pb gb) in blocks of 8; AF3's blocked transition1 [C][2I] as
 // gemmSwiglu's blocks of 8, the value half / S
@@ -101,7 +101,7 @@ struct Be2StackArgs { CP(half) a; CP(half) b; DP(half) out; u64 na, nb; };
 // ---------------------------------------------------------------- the denoiser
 struct Be2ScaleMaskedArgs { CP(float) x; CP(int) mask; DP(float) r; u64 N, n; float s; uint pad0; };
 struct Be2EdmOutArgs { CP(float) x; CP(float) out; DP(float) d; u64 n; float skip, cout; };
-struct Be2CosEmbedArgs { CP(float) w; CP(float) b; DP(float) out; float t; uint n; };
+struct Be2CosEmbedArgs { CP(float) w; CP(float) b; DP(float) out; float t; uint n; CP(float) ts; uint K, pad0; };
 struct Be2BroadcastAddArgs { DP(float) y; CP(float) v; u64 rows; uint C, pad0; };    // y[r] += v
 struct Be2ScaledAddArgs { DP(float) y; CP(float) x; u64 n; float s; uint pad0; };     // y += s x
 struct Be2RepeatArgs { CP(float) src; DP(float) dst; u64 elems, total; };          // dst = src, src, ...
