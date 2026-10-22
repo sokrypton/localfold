@@ -321,27 +321,30 @@ kernel void ef2_rms_modulate(constant RmsModArgs& a [[buffer(0)]], uint3 tg [[th
                              uint lane [[thread_index_in_simdgroup]]) {
   uint row = (tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
-  device const float* xr = a.x + (ulong)row * a.C;
-  float xv[8], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x * x; }
-  float inv = rsqrt(simd_sum(s) / a.C + RMS_EPS);
+  device float* xr = a.x + (ulong)row * a.C;
   device const float* m = a.mod + (ulong)row * 6 * a.C;
-  k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) {
-    float v = xv[k] * inv * (1.f + m[a.scale * a.C + c]) + m[a.shift * a.C + c];
+  device const float* dr = a.resD ? a.resD + (ulong)row * a.C : nullptr;
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) {
+    float x = xr[c];
+    if (dr) { x += m[a.resWhich * a.C + c] * dr[c]; xr[c] = x; }
+    s += x * x;
+  }
+  float inv = rsqrt(simd_sum(s) / a.C + RMS_EPS);
+  for (uint c = lane; c < a.C; c += 32) {
+    float v = xr[c] * inv * (1.f + m[a.scale * a.C + c]) + m[a.shift * a.C + c];
     if (a.yh) a.yh[(ulong)row * a.C + c] = (half)v;
     else a.y[(ulong)row * a.C + c] = v;
   }
 }
-// q and k (heads of 32, inside the packed [A, 3C] qkv): rms per head, rotate, narrow to bfloat16; v narrowed; a simdgroup an (atom, head)
+// q and k (heads of 32, inside the packed [A, ld] qkv): rms per head, rotate, narrow to bfloat16; v narrowed; a simdgroup an (atom, head)
 kernel void ef2_qkv_prepare(constant QkvPrepArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
   uint ah = (tg.y * ng.x + tg.x) * 8 + sg;
   if (ah >= a.A * a.heads) return;
   uint atom = lf_udiv(ah, a.heads), head = ah - atom * a.heads;
-  device float* row = a.qkv + (ulong)atom * 3 * a.C + head * 32;
+  device float* row = a.qkv + (ulong)atom * a.ld + head * 32;
   if (a.bf16) row[2 * a.C + lane] = lf_bf16(row[2 * a.C + lane]);
   float qv = row[lane], kv = row[a.C + lane];
   float invQ = rsqrt(simd_sum(qv * qv) / 32.f + RMS_EPS);
@@ -369,7 +372,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
   threadgroup float Qs[SWA_Q][32];
   threadgroup float Ks[SWA_KT][33];
   threadgroup float Vs[SWA_KT][32];
-  const int nValid = (int)a.nValid, hw = (int)a.halfWindow, C = (int)a.C;
+  const int nValid = (int)a.nValid, hw = (int)a.halfWindow, C = (int)a.C, ld = (int)a.ld;
   int head = tg.y;
   int r0 = tg.x * SWA_Q, r1 = min(nValid, r0 + SWA_Q) - 1;
   int klo = max(0, r0 - hw), khi = min(nValid - 1, r1 + hw);
@@ -377,7 +380,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
   float m[4], l[4], acc[4];
   for (int u = 0; u < 4; ++u) {
     m[u] = -INFINITY; l[u] = 0.f; acc[u] = 0.f;
-    device const float* q = a.qkv + (ulong)a.valid[min(rq + u, nValid - 1)] * 3 * C + head * 32;
+    device const float* q = a.qkv + (ulong)a.valid[min(rq + u, nValid - 1)] * ld + head * 32;
     Qs[4 * warp + u][lane] = q[lane] * a.scale;
   }
   for (int t0 = klo; t0 <= khi; t0 += SWA_KT) {
@@ -385,7 +388,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int e = tid; e < n * 8; e += 128) {
       int j = e >> 3, part = e & 7;
-      device const float* row = a.qkv + (ulong)a.valid[t0 + j] * 3 * C + head * 32 + part * 4;
+      device const float* row = a.qkv + (ulong)a.valid[t0 + j] * ld + head * 32 + part * 4;
       float4 k = *(device const float4*)(row + C), v = *(device const float4*)(row + 2 * C);
       Ks[j][part * 4] = k.x; Ks[j][part * 4 + 1] = k.y; Ks[j][part * 4 + 2] = k.z; Ks[j][part * 4 + 3] = k.w;
       *(threadgroup float4*)&Vs[j][part * 4] = v;
@@ -413,9 +416,17 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
         l[u] = l[u] * corr + simd_sum(p[u]); acc[u] *= corr; m[u] = mn;
       }
       int cnt = min(32, hi - j0 + 1);
-      for (int k = 0; k < cnt; ++k) {
-        float v = Vs[j0 + k][lane];
-        for (int u = 0; u < 4; ++u) acc[u] += simd_shuffle(p[u], (ushort)k) * v;
+      if (cnt == 32) {
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < 32; ++k) {
+          float v = Vs[j0 + k][lane];
+          for (int u = 0; u < 4; ++u) acc[u] += simd_shuffle(p[u], (ushort)k) * v;
+        }
+      } else {
+        for (int k = 0; k < cnt; ++k) {
+          float v = Vs[j0 + k][lane];
+          for (int u = 0; u < 4; ++u) acc[u] += simd_shuffle(p[u], (ushort)k) * v;
+        }
       }
     }
   }
@@ -425,8 +436,8 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
 kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.A * a.C) return;
-  uint atom = lf_udiv(t, a.C);
-  float v = a.ctx[t] * (a.mask[atom] != 0.f ? 1.f : 0.f) * lf_sigmoid(a.gate[t]);
+  uint atom = lf_udiv(t, a.C), c = t - atom * a.C;
+  float v = a.mask[atom] != 0.f ? a.ctx[t] * lf_sigmoid(a.gate[(ulong)atom * a.ld + c]) : 0.f;
   if (a.outH) a.outH[t] = (half)v;
   else a.ctx[t] = v;
 }
@@ -492,19 +503,23 @@ kernel void ef2_ada_ln(constant AdaCombineArgs& a [[buffer(0)]], uint3 tg [[thre
                        uint lane [[thread_index_in_simdgroup]]) {
   uint r = (tg.y * ng.x + tg.x) * 8 + sg;
   if (r >= a.T) return;
-  device const float* xr = a.an + (ulong)r * a.C;
-  float xv[24], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
+  device float* xr = a.an + (ulong)r * a.C;
+  device const float* ry = a.resY ? a.resY + (ulong)r * a.C : nullptr;
+  device const float* rg = a.resGate ? a.resGate + (ulong)r * a.ld : nullptr;
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) {
+    float x = xr[c];
+    if (ry) { x += ry[c] * lf_sigmoid(rg[c]); xr[c] = x; }
+    s += x;
+  }
   float mean = simd_sum(s) / a.C, v = 0;
-  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
+  for (uint c = lane; c < a.C; c += 32) { float d = xr[c] - mean; v += d * d; }
   float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
   device const float* gr = a.g + (ulong)r * a.ld;
   device const float* shr = a.sh + (ulong)r * a.ld;
   device half* yr = a.out + (ulong)r * a.C;
-  k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k)
-    yr[c] = (half)(((xv[k] - mean) * inv) * lf_sigmoid(gr[c] + a.gb[c]) + shr[c]);
+  for (uint c = lane; c < a.C; c += 32)
+    yr[c] = (half)(((xr[c] - mean) * inv) * lf_sigmoid(gr[c] + a.gb[c]) + shr[c]);
 }
 kernel void ef2_ada_combine(LF_ARGS(AdaCombineArgs)) {
   uint t = (uint)LF_INDEX;
@@ -641,10 +656,11 @@ kernel void ef2_plddt_atom(constant PlddtArgs& a [[buffer(0)]], uint3 tg [[threa
                            uint tid [[thread_index_in_threadgroup]]) {
   uint at = tg.x;
   threadgroup float logit[64];
+  device const float* s = a.s + (ulong)(uint)a.atomToToken[at] * a.C;
   device const float* tb = a.table + (ulong)a.slot[at] * a.C * a.bins;
   for (uint b = tid; b < a.bins; b += 64) {
     float acc = 0;
-    for (uint c = 0; c < a.C; ++c) acc += a.s[(ulong)at * a.C + c] * tb[(ulong)c * a.bins + b];
+    for (uint c = 0; c < a.C; ++c) acc += s[c] * tb[(ulong)c * a.bins + b];
     logit[b] = acc;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

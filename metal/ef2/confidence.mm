@@ -73,10 +73,9 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   std::vector<int> a2t(M.hostI("atom_to_token"), M.hostI("atom_to_token") + A), slot(A);
   for (int a = 0, k = 0; a < A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, slots - 1); }
   int* dSlot = uploadNew(slot.data(), A);
-  float* sa = scratch<float>("cf.sa", (size_t)A * Cs); float* pa = scratch<float>("cf.pa", A);
+  float* pa = scratch<float>("cf.pa", A);
   layerNorm(single, single, T, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
-  run1d("ef2_gather_atoms", (size_t)A * Cs, GatherAtomsArgs{single, Ii("atom_to_token"), sa, (uint)A, (uint)Cs});
-  run("ef2_plddt_atom", Grid{(uint32_t)A, 1, 1}, 64, PlddtArgs{sa, dSlot, F("confidence/plddtWeight"), pa, (uint)A, (uint)Cs, (uint)bins, 0});
+  run("ef2_plddt_atom", Grid{(uint32_t)A, 1, 1}, 64, PlddtArgs{single, Ii("atom_to_token"), dSlot, F("confidence/plddtWeight"), pa, (uint)A, (uint)Cs, (uint)bins, 0});
   // PAE logits (the released heads LayerNorm the pair in front of the projection)
   int pb = dimOf("f/confidence/pae", 1);
   float* paeL = scratch<float>("cf.pae", P * pb);

@@ -62,7 +62,8 @@ extern bool ATOM_BF16;
 extern int INPUTS_HALF_WINDOW;
 Atoms prepareAtoms(int A, const std::string& prefix);
 void freeAtoms(Atoms& at);
-void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocks, int halfWindow);
+void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocks, int halfWindow,
+              const float* preMod = nullptr);
 void inputsEmbedder(int T, int A, float* sInputs, int sWidth);
 
 // ---------------------------------------------------------------- the diffusion module and its sampler (diffusion.mm)
@@ -83,6 +84,7 @@ struct Denoiser {
   int stride;
   const float* sInputs;
   float* single; float* snScaled; float* G; float* scales; float* level;
+  float* encMod = nullptr; float* decMod = nullptr;
   int entries;
 };
 Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs);
