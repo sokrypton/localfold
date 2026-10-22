@@ -69,9 +69,17 @@ static half* takeEmitted(const void* x, const std::string& w, int blk) {
   return nullptr;
 }
 template <class T>
-static half* pairLn(const T* pair, size_t pairs, int C, const std::string& w, int blk, const char* scratchName) {
+static half* pairLn(const T* pair, size_t pairs, int C, const std::string& w, int blk, const char* scratchName,
+                    const std::string& nextW = "", int nextBlk = 0, const char* nextScratch = "ln.d2") {
   if (half* b = takeEmitted(pair, w, blk)) return b;
   half* xn = scratch<half>(scratchName, pairs * C);
+  if (!nextW.empty()) {
+    half* xn2 = scratch<half>(nextScratch, pairs * C);
+    layerNormDual(pair, xn, P(w + "/scale", blk), P(w + "/offset", blk),
+                  xn2, P(nextW + "/scale", nextBlk), P(nextW + "/offset", nextBlk), pairs, C);
+    emitLn(pair, nextW, nextBlk, xn2);
+    return xn;
+  }
   layerNormW(pair, xn, pairs, C, w, blk);
   return xn;
 }
@@ -198,9 +206,10 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
 // a pair bias [H][L][biasStride(L)] (log2 units, + 1e9 (mask - 1) where a mask is given, -inf past L) from LN(pair) W
 template <class T>
 static half* pairBias(const T* pair, int L, int C, const std::string& normW, const std::string& projW, int blk, int H,
-                      const float* pairMask, bool transposed, half** normed = nullptr) {
+                      const float* pairMask, bool transposed, half** normed = nullptr,
+                      const std::string& nextPairNorm = "", const char* nextScratch = "ln.d2") {
   size_t pairs = (size_t)L * L;
-  half* pn = pairLn(pair, pairs, C, normW, blk, "bias.pn");
+  half* pn = pairLn(pair, pairs, C, normW, blk, "bias.pn", nextPairNorm, blk, nextScratch);
   if (normed) *normed = pn;
   float* proj = scratch<float>("bias.proj", pairs * H);
   Gemm g{}; g.X = pn; g.tx = F16; g.W = PH(projW, blk); g.tw = F16; g.Y = proj; g.rows = pairs; g.in = C; g.out = H; g.label = "pair bias";
@@ -216,11 +225,12 @@ static half* pairBias(const T* pair, int L, int C, const std::string& normW, con
 // ---------------------------------------------------------------- the block's modules
 template <class T>
 static void msaRowAttention(Trunk& t, const std::string& S, int blk, T* msa, const T* pair, int rowsN, int C, const float* msaMask,
-                            bool ones, const std::string& nextNorm = "") {
+                            bool ones, const std::string& nextNorm = "", const std::string& nextPairNorm = "") {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string R = S + "msa_row_attention_with_pair_bias";
   int H = (int)dimW(R + "/attention/query_w", 2);
-  half* bias = pairBias(pair, L, 128, R + "/feat_2d_norm", R + "/feat_2d_weights", blk, H, t.pairOnes ? nullptr : t.pairMask, false);
+  half* bias = pairBias(pair, L, 128, R + "/feat_2d_norm", R + "/feat_2d_weights", blk, H, t.pairOnes ? nullptr : t.pairMask, false,
+                        nullptr, nextPairNorm, "ln.p2");
   half* xn = pairLn(msa, rows, C, R + "/query_norm", blk, "row.xn");
   attend(xn, rowsN, L, C, R + "/attention", blk, bias, ones ? nullptr : msaMask, L, 1, msa, false, nextNorm, blk);
 }
@@ -321,10 +331,11 @@ static void opmAdd(half* pair, const float* Y, const float* bias, const float* n
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] @ W + b) / (1e-3 + norm[i][j])
 template <class A>
 static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* msa, A* pair, int rowsN, int C, const float* msaMask,
-                             bool ones, const std::string& nextNorm = "", const std::string& nextNorm2 = "") {
+                             bool ones, const std::string& nextNorm = "", const std::string& nextNorm2 = "",
+                             const std::string& nextMsaNorm = "") {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
-  half* xn = pairLn(msa, rows, C, Op + "/layer_norm_input", blk, "opm.xn");
+  half* xn = pairLn(msa, rows, C, Op + "/layer_norm_input", blk, "opm.xn", nextMsaNorm, blk, "ln.m");
   half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
   for (int side = 0; side < 2; ++side) {
     std::string w = Op + (side ? "/right_projection" : "/left_projection");
@@ -511,9 +522,11 @@ static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair,
   bool moreMain = !extraStack && nextPairBlk >= 0;
   if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones,
                                    S + "msa_row_attention_with_pair_bias/feat_2d_norm",
-                                   S + "triangle_multiplication_outgoing/left_norm_input");
+                                   S + "triangle_multiplication_outgoing/left_norm_input",
+                                   S + "msa_row_attention_with_pair_bias/query_norm");
   msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones,
-                  S + (extraStack ? "msa_column_global_attention/query_norm" : "msa_column_attention/query_norm"));
+                  S + (extraStack ? "msa_column_global_attention/query_norm" : "msa_column_attention/query_norm"),
+                  t.opmFirst ? S + "triangle_multiplication_outgoing/left_norm_input" : "");
   if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask, S + "msa_transition/input_layer_norm");
   else msaColumnAttention(t, S, blk, msa, rowsN, C, mask, ones, S + "msa_transition/input_layer_norm");
   transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk,

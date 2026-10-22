@@ -298,29 +298,34 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   device const float* prod = a.prod;
   threadgroup float part[256];
-  threadgroup half T[32 * (8 * NK + 8)];
-  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
+  threadgroup half T[32 * (8 * NK + 4)];
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 4;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
   const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
-  const bool live = r0 + lane < a.pairs;
+  const bool live = r0 + lane < a.pairs, exact = C == 8 * NK;
   float v[NK];
   float s = 0.f;
-  for (uint k = 0; k < NK; ++k) if (k < nk) { v[k] = live ? prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < NK; ++k) if (exact || k < nk) { v[k] = live ? prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
   part[grp * 32 + lane] = s;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float S = 0.f;
+  _Pragma("clang loop unroll(full)")
   for (int g = 0; g < 8; ++g) S += part[g * 32 + lane];
   const float mean = S / C;
   float d2 = 0.f;
-  for (uint k = 0; k < NK; ++k) if (k < nk) { float d = v[k] - mean; d2 += d * d; }
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < NK; ++k) if (exact || k < nk) { float d = v[k] - mean; d2 += d * d; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   part[grp * 32 + lane] = d2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float V = 0.f;
+  _Pragma("clang loop unroll(full)")
   for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
   const float inv = rsqrt(V / C + a.eps);
-  for (uint k = 0; k < NK; ++k) if (k < nk) {
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
     uint c = grp + 8 * k;
     T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
   }
@@ -328,7 +333,11 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
   for (uint row = grp; row < 32; row += 8) {
     ulong r = r0 + row;
     if (r >= a.pairs) break;
-    for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
+    if ((C & 3) == 0) {
+      for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+    } else {
+      for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
+    }
   }
 }
 // ...from a half product (scaled; CenterNormArgs.prodh): PP pairs a lane - the product's reads twice as long, where the
@@ -343,48 +352,90 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
   threadgroup half T[R * (8 * NK + 4)];
   const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 4;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * R, plane = (ulong)a.Lp * a.Lp;
+  const bool exact = C == 8 * NK;
   ulong q[PP]; bool live[PP];
+  _Pragma("clang loop unroll(full)")
   for (uint p = 0; p < PP; ++p) {
     const uint rr = (uint)(r0 + PP * lane + p), ii = lf_udiv(rr, a.L);
     q[p] = (ulong)ii * a.Lp + (rr - ii * a.L);
     live[p] = r0 + PP * lane + p < a.pairs;
   }
   half v[PP][NK];
-  for (uint p = 0; p < PP; ++p) {
-    float s = 0.f;
-    for (uint k = 0; k < NK; ++k) if (k < nk) {
-      half h = live[p] ? prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.h;
-      v[p][k] = h;
-      s += (float)h;
+  if (PP == 2 && live[0] && live[1] && q[1] == q[0] + 1 && (q[0] & 1) == 0) {
+    float s0 = 0.f, s1 = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
+      half2 h = *(device const half2*)(prod + (ulong)(grp + 8 * k) * plane + q[0]);
+      v[0][k] = h.x; v[1][k] = h.y;
+      s0 += (float)h.x; s1 += (float)h.y;
     }
-    part[grp * R + PP * lane + p] = s;
+    part[grp * R + 2 * lane] = s0; part[grp * R + 2 * lane + 1] = s1;
+  } else {
+    _Pragma("clang loop unroll(full)")
+    for (uint p = 0; p < PP; ++p) {
+      float s = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
+        half h = live[p] ? prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.h;
+        v[p][k] = h;
+        s += (float)h;
+      }
+      part[grp * R + PP * lane + p] = s;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float mean[PP];
-  for (uint p = 0; p < PP; ++p) { float S = 0.f; for (int g = 0; g < 8; ++g) S += part[g * R + PP * lane + p]; mean[p] = S / C; }
+  _Pragma("clang loop unroll(full)")
+  for (uint p = 0; p < PP; ++p) { float S = 0.f; _Pragma("clang loop unroll(full)") for (int g = 0; g < 8; ++g) S += part[g * R + PP * lane + p]; mean[p] = S / C; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  _Pragma("clang loop unroll(full)")
   for (uint p = 0; p < PP; ++p) {
     float d2 = 0.f;
-    for (uint k = 0; k < NK; ++k) if (k < nk) { float d = (float)v[p][k] - mean[p]; d2 += d * d; }
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < NK; ++k) if (exact || k < nk) { float d = (float)v[p][k] - mean[p]; d2 += d * d; }
     part[grp * R + PP * lane + p] = d2;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  _Pragma("clang loop unroll(full)")
   for (uint p = 0; p < PP; ++p) {
     float V = 0.f;
+    _Pragma("clang loop unroll(full)")
     for (int g = 0; g < 8; ++g) V += part[g * R + PP * lane + p];
     const float inv = rsqrt(V / C + a.eps);
-    for (uint k = 0; k < NK; ++k) if (k < nk) {
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
       uint c = grp + 8 * k;
       T[(PP * lane + p) * ld + c] = (half)(((float)v[p][k] - mean[p]) * inv * a.scale[c] + a.offset[c]);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint row = grp; row < R; row += 8) {
-    ulong r = r0 + row;
-    if (r >= a.pairs) break;
-    for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+  if (exact) {
+    _Pragma("clang loop unroll(full)")
+    for (uint row = grp; row < R; row += 8) {
+      ulong r = r0 + row;
+      if (r >= a.pairs) break;
+      if constexpr (NK == 8) {
+        if (lane < 16) {
+          const uint c = 4 * lane;
+          *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+        }
+      } else {
+        _Pragma("clang loop unroll(full)")
+        for (uint k = 0; k < NK / 16; ++k) {
+          const uint c = 128 * k + 4 * lane;
+          *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+        }
+      }
+    }
+  } else {
+    for (uint row = grp; row < R; row += 8) {
+      ulong r = r0 + row;
+      if (r >= a.pairs) break;
+      for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+    }
   }
 }
+template [[host_name("lf_center_norm_8h2")]] kernel void lf_center_norm_h<8, 2>(constant CenterNormArgs&, uint3, uint3, uint);
 template [[host_name("lf_center_norm_16h2")]] kernel void lf_center_norm_h<16, 2>(constant CenterNormArgs&, uint3, uint3, uint);
 template [[host_name("lf_center_norm_32h1")]] kernel void lf_center_norm_h<32, 1>(constant CenterNormArgs&, uint3, uint3, uint);
 template [[host_name("lf_center_norm_16")]] kernel void lf_center_norm<16>(constant CenterNormArgs&, uint3, uint3, uint);

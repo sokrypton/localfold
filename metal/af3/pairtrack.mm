@@ -333,7 +333,7 @@ void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::st
 // attention over the tokens biased by the pair (LN, a projection to the heads), then the transition
 template <class T>
 static void singleTrackT(float* single, const T* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
-                         const float* extraBias) {
+                         const float* extraBias, const std::string& nextPairNorm = "") {
   const std::string A = B + ".singleAttention";
   // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the transition reads
   // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
@@ -343,7 +343,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
   const half* xs = sharedNorm(pair);
-  half* pln = xs ? (half*)xs : pairLn(pair, P, C, B + ".singlePairLogitsNorm");
+  half* pln = xs ? (half*)xs : pairLn(pair, P, C, B + ".singlePairLogitsNorm", nextPairNorm);
   float* raw = scratch<float>("st.raw", P * heads);
   if (xs) {
     Folded f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
@@ -385,13 +385,14 @@ static void pairformerBlockT(T* pair, float* single, const Masks& m, int n, int 
     // the single track reads the pair ENTERING the block, kept by the parallel updates
     parallelPairUpdates(pair, m, n, C, B, "oirct");
     // (folded, the pair's xhat is the block input's; otherwise the kept copy)
-    singleTrack(single, shared.xhat ? pair : scratch<T>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
+    singleTrackT(single, shared.xhat ? pair : scratch<T>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
     shared = {};
     return;
   }
   // (the transition emits the single track's pair norm and the next block's first, where the caller names that block)
-  pairUpdates(pair, m, n, C, B, B + ".singlePairLogitsNorm", nextB.empty() ? "" : nextB + ".triangleMultiplicationOutgoing.leftNormInput");
-  singleTrack(single, pair, m, n, C, Cs, B, extraBias);
+  const std::string nextNorm = nextB.empty() ? "" : nextB + ".triangleMultiplicationOutgoing.leftNormInput";
+  pairUpdates(pair, m, n, C, B, B + ".singlePairLogitsNorm", nextNorm);
+  singleTrackT(single, pair, m, n, C, Cs, B, extraBias, nextNorm);
 }
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B, const float* extraBias,
                      const std::string& nextB) {

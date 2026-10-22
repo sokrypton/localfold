@@ -212,6 +212,7 @@ kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [
                             uint tid [[thread_index_in_threadgroup]]) {
   const uint j0 = tg.x * 32, i0 = tg.y * 32, h = tg.z, tx = tid & 31, ty = tid >> 5;     // 32 x 8 threads
   if (!a.swap) {
+    _Pragma("clang loop unroll(full)")
     for (uint r = ty; r < 32; r += 8) {
       const uint i = i0 + r, j = j0 + tx;
       if (i < a.n && j < a.stride) {
@@ -222,11 +223,13 @@ kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [
     return;
   }
   threadgroup float tile[32][33];
+  _Pragma("clang loop unroll(full)")
   for (uint r = ty; r < 32; r += 8) {
     const uint sr = j0 + r, sc = i0 + tx;
     tile[r][tx] = sr < a.n && sc < a.n ? a.raw[((ulong)sr * a.n + sc) * a.ld + a.off + h] : 0.f;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  _Pragma("clang loop unroll(full)")
   for (uint r = ty; r < 32; r += 8) {
     const uint i = i0 + r, j = j0 + tx;
     if (i < a.n && j < a.stride) {
