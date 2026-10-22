@@ -161,48 +161,43 @@ kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]],
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong qa = base + w * BE2_WQ + i;
-  float q[HD];
+  float4 q[8], acc[8];
   const float scale = rsqrt((float)HD);
-  for (int d = 0; d < HD; d += 4) {
-    const float4 qv = (float4(*(device const half4*)(a.qkvg + qa * 4 * D + h * HD + d)) + *(device const float4*)(a.qBias + h * HD + d)) * scale;
-    q[d] = qv.x; q[d + 1] = qv.y; q[d + 2] = qv.z; q[d + 3] = qv.w;
+  _Pragma("clang loop unroll(full)")
+  for (int k = 0; k < 8; ++k) {
+    const int d = k << 2;
+    q[k] = (float4(*(device const half4*)(a.qkvg + qa * 4 * D + h * HD + d)) + *(device const float4*)(a.qBias + h * HD + d)) * scale;
+    acc[k] = float4(0.f);
   }
   device const float* b = a.bias + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK;
-  float mx = -INFINITY, sum = 0, acc[HD];
-  for (int d = 0; d < HD; ++d) acc[d] = 0;
+  float mx = -INFINITY, sum = 0;
   for (int jj = 0; jj < KS; ++jj) {
     const int j = jj * SPLIT + (int)part;
     float l = 0;
     _Pragma("clang loop unroll(full)")
-    for (int d = 0; d < HD; d += 4) {
-      const float4 kv = float4(*(threadgroup const half4*)(sk[j] + d));
-      l += q[d] * kv.x + q[d + 1] * kv.y + q[d + 2] * kv.z + q[d + 3] * kv.w;
-    }
+    for (int k = 0; k < 8; ++k) l += dot(q[k], float4(*(threadgroup const half4*)(sk[j] + (k << 2))));
     l = sm[j] ? l + b[j] : BE2_NEG_INF;
     float nm = max(mx, l), f = exp(mx - nm), e = exp(l - nm);
     sum = sum * f + e;
     _Pragma("clang loop unroll(full)")
-    for (int d = 0; d < HD; d += 4) {
-      const float4 vv = float4(*(threadgroup const half4*)(sv[j] + d));
-      acc[d] = acc[d] * f + e * vv.x;
-      acc[d + 1] = acc[d + 1] * f + e * vv.y;
-      acc[d + 2] = acc[d + 2] * f + e * vv.z;
-      acc[d + 3] = acc[d + 3] * f + e * vv.w;
-    }
+    for (int k = 0; k < 8; ++k) acc[k] = acc[k] * f + e * float4(*(threadgroup const half4*)(sv[j] + (k << 2)));
     mx = nm;
   }
   for (ushort o = 1; o < SPLIT; o <<= 1) {
     float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sum, o);
     float nm = max(mx, om), f = exp(mx - nm), fo = exp(om - nm);
     sum = sum * f + os * fo;
-    for (int d = 0; d < HD; ++d) { float oa = simd_shuffle_xor(acc[d], o); acc[d] = acc[d] * f + oa * fo; }
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 8; ++k) { const float4 oa = simd_shuffle_xor(acc[k], o); acc[k] = acc[k] * f + oa * fo; }
     mx = nm;
   }
   if (part == 0) {
     const float inv = 1.f / sum;
-    for (int d = 0; d < HD; d += 4) {
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 8; ++k) {
+      const int d = k << 2;
       const float4 gv = float4(*(device const half4*)(a.qkvg + qa * 4 * D + 3 * D + h * HD + d));
-      const float4 av = float4(acc[d], acc[d + 1], acc[d + 2], acc[d + 3]) * inv / (1.f + exp(-gv));
+      const float4 av = acc[k] * inv / (1.f + exp(-gv));
       *(device half4*)(a.out + qa * D + h * HD + d) = half4(av);
     }
   }
@@ -543,15 +538,19 @@ kernel void be2_cs_gamma(LF_ARGS(Be2CsGammaArgs)) {
   ulong i = LF_INDEX;
   if (i >= a.n) return;
   const uint Dc = a.Dt + a.Ca;
-  BE2_SPLIT(i, Dc, t, c);
+  BE2_SPLIT(i, Dc, lr, c);
+  BE2_SPLIT(lr, a.R, j, t);
   // (R = Qq - Qa / 6: the token half's gamma scaled by da / dq = -Ca / Dt (-1/6), since 768 da + 128 dq = 0)
-  float g = 1.f + a.cqc[(ulong)t * a.ldc + c];
+  device const float* row = a.cqc + ((ulong)j * a.R + t) * a.ldc;
+  float g = 1.f + row[c];
   if (c < a.Dt) g *= -(float)a.Ca / (float)a.Dt;
-  const float b = a.cqc[(ulong)t * a.ldc + Dc + c];
+  const float b = row[Dc + c];
   const half gh = (half)g, bh = (half)b;
-  const ulong ir = (ulong)(2 * t) * Dc + c, ib = (ulong)(2 * t + 1) * Dc + c, span = 2 * a.n;
-  a.gR[ir] = gh; a.gR[span + ir] = (half)(g - (float)gh);
-  a.gR[ib] = bh; a.gR[span + ib] = (half)(b - (float)bh);
+  const ulong span = (ulong)2 * a.R * Dc;
+  device half* dst = a.gR + (ulong)j * 2 * span;
+  const ulong ir = (ulong)(2 * t) * Dc + c, ib = (ulong)(2 * t + 1) * Dc + c;
+  dst[ir] = gh; dst[span + ir] = (half)(g - (float)gh);
+  dst[ib] = bh; dst[span + ib] = (half)(b - (float)bh);
 }
 kernel void be2_cs_wq2(LF_ARGS(Be2CsWqArgs)) {
   ulong t = LF_INDEX;
@@ -615,11 +614,17 @@ kernel void be2_batch_bias(LF_ARGS(Be2BatchBiasArgs)) {
 }
 kernel void be2_swiglu_weight(LF_ARGS(Be2SwigluWArgs)) {
   ulong t = LF_INDEX;
-  const uint W = 2 * a.I;
-  if (t >= (ulong)a.C * W) return;
-  BE2_SPLIT(t, W, k, col);
-  const uint m = col >> 4, q = col & 15, j = 8 * m + (q & 7);
-  a.out[t] = q < 8 ? a.w1[(ulong)j * a.C + k] : (half)((float)a.w2[(ulong)j * a.C + k] * a.invS);
+  const uint W4 = a.I >> 1;
+  if (t >= (ulong)a.C * W4) return;
+  BE2_SPLIT(t, W4, k, col4);
+  const uint m = col4 >> 2, q = col4 & 3, j = 8 * m + ((q & 1) << 2);
+  if (q < 2) {
+    ((device half4*)a.out)[t] = half4(a.w1[(ulong)j * a.C + k], a.w1[(ulong)(j + 1) * a.C + k],
+                                      a.w1[(ulong)(j + 2) * a.C + k], a.w1[(ulong)(j + 3) * a.C + k]);
+  } else {
+    ((device half4*)a.out)[t] = half4((float)a.w2[(ulong)j * a.C + k] * a.invS, (float)a.w2[(ulong)(j + 1) * a.C + k] * a.invS,
+                                      (float)a.w2[(ulong)(j + 2) * a.C + k] * a.invS, (float)a.w2[(ulong)(j + 3) * a.C + k] * a.invS);
+  }
 }
 // a token tensor's rows broadcast to its atoms (zero on padding atoms), samples stacked
 kernel void be2_tokens_to_atoms(LF_ARGS(Be2TokensToAtomsArgs)) {
@@ -741,12 +746,15 @@ kernel void be2_pwa_apply(LF_ARGS(Be2PwaApplyArgs)) {
   ulong t = LF_INDEX;
   const uint W = a.H * a.Ch;
   if (t >= a.S * a.T * W) return;
-  uint d = (uint)(t % a.Ch); ulong r = t / a.Ch; uint h = (uint)(r % a.H); r /= a.H; uint i = (uint)(r % a.T); ulong s = r / a.T;
+  BE2_SPLIT(t, a.Ch, r, d);
+  BE2_SPLIT(r, a.H, r2, h);
+  BE2_SPLIT(r2, a.T, s, i);
   device const float* w = a.w + ((ulong)h * a.T + i) * a.T;
-  device const float* v = a.v + s * a.T * W + h * a.Ch + d;
+  const uint hd = h * a.Ch + d;
+  device const float* v = a.v + (ulong)s * a.T * a.ldv + hd;
   float acc = 0;
-  for (uint j = 0; j < a.T; ++j) acc += w[j] * v[(ulong)j * W];
-  a.o[t] = acc;
+  for (uint j = 0; j < a.T; ++j) acc += w[j] * v[(ulong)j * a.ldv];
+  a.o[t] = acc * lf_sigmoid(a.g[((ulong)s * a.T + i) * a.ldv + hd]);
 }
 // OuterProductMeanVanilla's pack: proj [R = S T][2 Co] -> a, b [R][Co] (the first half and the second)
 kernel void be2_opm_pack(LF_ARGS(Be2OpmPackArgs)) {
@@ -759,12 +767,12 @@ kernel void be2_opm_pack(LF_ARGS(Be2OpmPackArgs)) {
 // x [(i, c)][(j, d)] for a block of bi rows of i -> y [(i, j)][(c, d)] / n (the mean over VALID rows)
 kernel void be2_opm_permute(LF_ARGS(Be2OpmPermuteArgs)) {
   ulong t = LF_INDEX;
-  const uint CC = a.Co * a.Co;
-  if (t >= (ulong)a.bi * a.T * CC) return;
-  BE2_SPLIT(t, CC, ij, cd);
+  const uint C4 = a.Co >> 2, CC4 = a.Co * C4;
+  if (t >= (ulong)a.bi * a.T * CC4) return;
+  BE2_SPLIT(t, CC4, ij, cd4);
   BE2_SPLIT(ij, a.T, i, j);
-  BE2_SPLIT(cd, a.Co, c, d);
-  a.y[t] = a.x[((ulong)i * a.Co + c) * ((ulong)a.T * a.Co) + (ulong)j * a.Co + d] * a.inv;
+  BE2_SPLIT(cd4, C4, c, d4);
+  ((device float4*)a.y)[t] = *(device const float4*)(a.x + ((ulong)i * a.Co + c) * ((ulong)a.T * a.Co) + (ulong)j * a.Co + (d4 << 2)) * a.inv;
 }
 kernel void be2_symmetrise(LF_ARGS(Be2SymmetriseArgs)) {
   ulong t = LF_INDEX;
@@ -791,26 +799,34 @@ kernel void be2_token_bias(LF_ARGS(Be2TokenBiasArgs)) {
 }
 kernel void be2_trigate_weight(LF_ARGS(Be2TriGateWArgs)) {
   ulong t = LF_INDEX;
-  const uint W = 4 * a.C;
-  if (t >= (ulong)a.rows * W) return;
-  BE2_SPLIT(t, W, r, col);
+  const uint W4 = a.C;
+  if (t >= (ulong)a.rows * W4) return;
+  BE2_SPLIT(t, W4, r, col4);
+  const uint col = col4 << 2;
   const uint kind = a.quarters ? (col % 128) / 32 : (col % 32) / 8;
   const uint c = a.quarters ? 32 * (col / 128) + col % 32 : 8 * (col / 32) + col % 8;
   const uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8 or quarters of 32: pa ga pb gb; a and b interleaved by channel)
-  a.out[t] = k < 2 ? a.proj[(ulong)r * 2 * a.C + 2 * c + k] : a.gate[(ulong)r * 2 * a.C + 2 * c + k - 2];
+  device const half* src = (k < 2 ? a.proj : a.gate) + (ulong)r * 2 * a.C + 2 * c + (k & 1);
+  ((device half4*)a.out)[t] = half4(src[0], src[2], src[4], src[6]);
 }
 kernel void be2_interleave8(LF_ARGS(Be2Interleave8Args)) {
   ulong t = LF_INDEX;
-  const uint W = 2 * a.I;
-  if (t >= (ulong)a.rows * W) return;
-  BE2_SPLIT(t, W, r, c);
-  const uint m = c >> 4, q = c & 15;
-  a.out[t] = q < 8 ? a.a[(ulong)r * a.lda + 8 * m + q] : (half)((float)a.b[(ulong)r * a.lda + 8 * m + q - 8] * a.invS);
+  const uint W4 = a.I >> 1;
+  if (t >= (ulong)a.rows * W4) return;
+  BE2_SPLIT(t, W4, r, c4);
+  const uint m = c4 >> 2, q = c4 & 3, off = 8 * m + ((q & 1) << 2);
+  if (q < 2) {
+    ((device half4*)a.out)[t] = *(device const half4*)(a.a + (ulong)r * a.lda + off);
+  } else {
+    const float4 v = float4(*(device const half4*)(a.b + (ulong)r * a.lda + off)) * a.invS;
+    ((device half4*)a.out)[t] = half4(v);
+  }
 }
 kernel void be2_stack(LF_ARGS(Be2StackArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.na) a.out[t] = a.a[t];
-  else if (t < a.na + a.nb) a.out[t] = a.b[t - a.na];
+  const ulong na4 = a.na >> 2, nb4 = a.nb >> 2;
+  if (t < na4) ((device half4*)a.out)[t] = ((device const half4*)a.a)[t];
+  else if (t < na4 + nb4) ((device half4*)a.out)[t] = ((device const half4*)a.b)[t - na4];
 }
 
 // ---------------------------------------------------------------- the denoiser

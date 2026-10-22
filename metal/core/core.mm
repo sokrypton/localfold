@@ -731,8 +731,9 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
                      (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) && (tm == 64 || (tm == 32 && tn == 256)) &&
-                     a.m % 4 == 0 && !a.ptrs &&
-                     al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
+                     a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
+                     (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0)
+                             : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   if ((a.epilogue & 4096) && !vecEp) die("gemm: the permuted store needs the vector epilogue's alignment");
   if ((a.epilogue & 131072) && !vecEp) die("gemm: the blocks-of-2 coupling combine needs the vector epilogue's alignment");

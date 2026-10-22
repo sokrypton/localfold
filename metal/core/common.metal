@@ -65,10 +65,10 @@ kernel void lf_pad_zero(LF_ARGS(PadZeroArgs)) {
   const uint i = (uint)LF_INDEX, np = a.np, n = a.n, w = np - n;
   const uint per = np * np - n * n;
   if ((ulong)i >= a.planes * per) return;
-  const uint pl = i / per, r = i - pl * per, tail = w * np;
+  const uint pl = lf_udiv(i, per), r = i - pl * per, tail = w * np;
   uint pos;
   if (r < tail) pos = n * np + r;                                    // rows n..np-1, whole
-  else { const uint k = r - tail, kr = k / w; pos = kr * np + n + (k - kr * w); }   // rows ..n-1, columns n..
+  else { const uint k = r - tail, kr = lf_udiv(k, w); pos = kr * np + n + (k - kr * w); }   // rows ..n-1, columns n..
   a.dst[(ulong)pl * np * np + pos] = 0.h;
 }
 
@@ -76,7 +76,7 @@ kernel void lf_tri_quarters(LF_ARGS(TriQuartersArgs)) {
   ulong i = LF_INDEX;
   const uint W4 = 4 * a.C;
   if (i >= a.rows * W4) return;
-  const uint nc = (uint)(i % W4), t = nc / 128, p = (nc % 128) / 32, ch = t * 32 + nc % 32;
+  const uint r = lf_udiv((uint)i, W4), nc = (uint)i - r * W4, t = nc / 128, p = (nc % 128) / 32, ch = t * 32 + nc % 32;
   const uint oc = (ch / 8) * 32 + p * 8 + ch % 8;
   a.dst[i] = a.src[i - nc + oc];
   if (a.srcf && i < W4) a.dstf[nc] = a.srcf[oc];

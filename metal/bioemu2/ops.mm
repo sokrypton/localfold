@@ -58,8 +58,8 @@ void silu(const float* x, float* y, size_t n) { run1d("be2_unary", n, Be2UnaryAr
 static const float SWIGLU_SCALE = getenv("BE2_SWIGLU_SCALE") ? (float)atof(getenv("BE2_SWIGLU_SCALE")) : 64.f;   // (an arm, BE2_SWIGLU_SCALE)
 static const half* swigluWeight(const std::string& p, int C, int I) {
   return M.derived<half>("swiglu:" + p, (size_t)C * 2 * I, [&](half* out) {
-    be2Run1d("be2_swiglu_weight", (size_t)C * 2 * I, Be2SwigluWArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out,
-                                                                     (uint)C, (uint)I, 1.f / SWIGLU_SCALE, 0});
+    be2Run1d("be2_swiglu_weight", ((size_t)C * 2 * I) >> 2, Be2SwigluWArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out,
+                                                                           (uint)C, (uint)I, 1.f / SWIGLU_SCALE, 0});
   });
 }
 const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }
@@ -156,8 +156,8 @@ static const float* onesMask(size_t n) {
 static const half* triGateWeight(const std::string& p, int C) {
   const bool q = triQuartersApply(C);
   return M.derived<half>((q ? "trigateQ:" : "trigate:") + p, (size_t)C * 4 * C, [&](half* out) {
-    be2Run1d("be2_trigate_weight", (size_t)C * 4 * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), out,
-                                                                       (uint)C, (uint)C, q ? 1u : 0u, 0});
+    be2Run1d("be2_trigate_weight", (size_t)C * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), out,
+                                                                  (uint)C, (uint)C, q ? 1u : 0u, 0});
   });
 }
 static void triangleFast(float* z, int T, int C, const std::string& p, bool outgoing) {
@@ -178,8 +178,8 @@ static void pairTransitionFast(float* z, size_t rows, int C, const std::string& 
   const int I = dimW(p + "transition1", 1) / 2;
   const half* w1 = M.derived<half>("swiglu8:" + p, (size_t)C * 2 * I, [&](half* out) {
     const half* t1 = M.h("w/" + p + "transition1");
-    be2Run1d("be2_interleave8", (size_t)C * 2 * I, Be2Interleave8Args{t1, t1 + I, out, (uint)C, (uint)I, (uint)(2 * I),
-                                                                        1.f / SWIGLU_SCALE});
+    be2Run1d("be2_interleave8", ((size_t)C * 2 * I) >> 2, Be2Interleave8Args{t1, t1 + I, out, (uint)C, (uint)I, (uint)(2 * I),
+                                                                             1.f / SWIGLU_SCALE});
   });
   const size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
   const size_t r1 = std::min(rows, chunk);

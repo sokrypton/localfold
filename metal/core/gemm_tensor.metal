@@ -195,9 +195,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         *(device vec<TC, 4>*)(D + (ulong)i + (ulong)j * g.ldd) = lf_out4<TC>(cv + gm * v);
         continue;
       }
+      const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
       const float4 bv = !(g.epilogue & 4) ? float4(0)
-                        : (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + i))
-                                                  : *(device const float4*)((device const float*)g.bias + i);
+                        : (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + boff + i))
+                                                  : *(device const float4*)((device const float*)g.bias + boff + i);
       device TC* dp = D + (ulong)i + (ulong)j * g.ldd;
       if (g.epilogue & 64) {      // a gated residual: D = C + aux * sigmoid(v)
         if (g.epilogue & 4) v += bv;

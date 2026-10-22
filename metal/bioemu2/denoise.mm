@@ -151,12 +151,10 @@ static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
   return split * margin < unsplit;
 }
 static void couplingSplit(const float* a, float* q, const float* cqc, const int* atomTok, int samples, int T, int N,
-                   int Dt, int Ca, const std::string& p) {
+                          int Dt, int Ca, const std::string& p, const float* preQB = nullptr) {
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
   const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
-  half* gR = scratch<half>("be2.cs.gR", 4 * R * Dc);
-  float* QB = scratch<float>("be2.cs.QB", R * 4 * I);
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
   // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
@@ -175,13 +173,19 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
   float* stats = scratch<float>("be2.cs.stats", RN * 8); half* xq = scratch<half>("be2.cs.xq", RN * Ca * 2);
   half* g = scratch<half>("be2.cs.g", RN * I);
-  be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gR, nullptr, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
-  // R | B [R][2][2I] in float - R = Qq - Qa / 6 (da = -dq / 6 exactly, as 768 da + 128 dq = 0: one vector where Qa and
-  // Qq were two, and the epilogue reads a quarter less) - even rows gR, odd rows beta, stacked into [2R][Dc] so R and B
-  // share a single 2R-row GEMM per hi/lo part (64x128 vector epilogue instead of two 80x32 staged GEMMs)
-  for (int part = 0; part < 2; ++part) {
-    Gemm G{}; G.X = gR + (size_t)part * 2 * R * Dc; G.tx = F16; G.W = w12; G.tw = F16; G.Y = QB; G.ty = F32; G.ldy = 2 * I;
-    G.rows = 2 * R; G.in = Dc; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = "coupling RB"; gemm(G);
+  const float* QB = preQB;
+  if (!QB) {
+    half* gR = scratch<half>("be2.cs.gR", 4 * R * Dc);
+    float* qbb = scratch<float>("be2.cs.QB", R * 4 * I);
+    be2Run1d("be2_cs_gamma", R * Dc, Be2CsGammaArgs{cqc, gR, nullptr, (u64)(R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
+    // R | B [R][2][2I] in float - R = Qq - Qa / 6 (da = -dq / 6 exactly, as 768 da + 128 dq = 0: one vector where Qa and
+    // Qq were two, and the epilogue reads a quarter less) - even rows gR, odd rows beta, stacked into [2R][Dc] so R and B
+    // share a single 2R-row GEMM per hi/lo part (64x128 vector epilogue instead of two 80x32 staged GEMMs)
+    for (int part = 0; part < 2; ++part) {
+      Gemm G{}; G.X = gR + (size_t)part * 2 * R * Dc; G.tx = F16; G.W = w12; G.tw = F16; G.Y = qbb; G.ty = F32; G.ldy = 2 * I;
+      G.rows = 2 * R; G.in = Dc; G.out = 2 * I; G.beta = part ? 1.f : 0.f; G.label = "coupling RB"; gemm(G);
+    }
+    QB = qbb;
   }
   auto rowsGrid = [](size_t rows) {
     const size_t groups = (rows + 7) / 8;
@@ -293,9 +297,16 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const int F = dimW(sc + "fourier_embed/proj/bias", 0);
   float* four = scratch<float>("be2.dn.four", F);
   run1d("be2_cos_embed", F, Be2CosEmbedArgs{Wf(sc + "fourier_embed/proj/weight"), Wf(sc + "fourier_embed/proj/bias"), four, t, (uint)F});
-  layerNorm(four, four, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
   float* f768 = scratch<float>("be2.dn.f768", Dt);
-  linT(four, sc + "fourier_to_single/weight", f768, 1, F, Dt);
+  if (HALF) {
+    half* fourh = scratch<half>("be2.dn.fourh", F);
+    layerNorm(four, fourh, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
+    Gemm G{}; G.X = fourh; G.tx = F16; G.W = M.h("w/" + sc + "fourier_to_single/weight"); G.tw = F16; G.transW = true; G.Y = f768; G.ty = F32;
+    G.rows = 1; G.in = F; G.out = Dt; G.label = "fourier_to_single"; gemm(G);
+  } else {
+    layerNorm(four, four, 1, F, Wf(sc + "norm_fourier/weight"), Wf(sc + "norm_fourier/bias"));
+    linT(four, sc + "fourier_to_single/weight", f768, 1, F, Dt);
+  }
   // cond, and a ZERO row after its T: what a padding atom of the reference conditions on (c_to_q is 0 there)
   float* cnd = scratch<float>("be2.dn.cond", (size_t)(T + 1) * Dt);
   copy(cnd, d.sc0, (size_t)T * Dt * 4);
@@ -326,15 +337,16 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const int Ha = 4, Ht = 16;
   const size_t P = (size_t)T * T, wb = (size_t)N * WK * Ha, tbn = (size_t)Ht * P;
   const int Dc = Dt + Ca;                                  // the coupling's width, 896
+  const bool csplit = HALF && gemmTensorOps() && splitPays(samples, T, N, Dt, Ca);
   float* cqc = scratch<float>("be2.dn.cqc", (size_t)(T + 1) * (2 * Dc + Ca));
   float* csc = scratch<float>("be2.dn.csc", (size_t)T * (2 * Dc + Dt));
-  float* sq = scratch<float>("be2.dn.sq", RN * Dc);
-  float* qs = scratch<float>("be2.dn.qs", RT * Dc);
-  float* dq = scratch<float>("be2.dn.dq", RN * Ca);
-  float* da = scratch<float>("be2.dn.da", RT * Dt);
+  float* sq = HALF ? nullptr : scratch<float>("be2.dn.sq", RN * Dc);
+  float* qs = HALF ? nullptr : scratch<float>("be2.dn.qs", RT * Dc);
+  float* dq = HALF ? nullptr : scratch<float>("be2.dn.dq", RN * Ca);
+  float* da = HALF ? nullptr : scratch<float>("be2.dn.da", RT * Dt);
   float* cn = scratch<float>("be2.dn.cn", (size_t)(T + 1) * Dt);
-  float* sqn = scratch<float>("be2.dn.sqn", RN * Dc);
-  float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
+  float* sqn = HALF ? nullptr : scratch<float>("be2.dn.sqn", RN * Dc);
+  float* qsn = HALF ? nullptr : scratch<float>("be2.dn.qsn", RT * Dc);
   // the conditioning in groups of layers (condGroup) - as many as fit 64 MiB, all 16 at 68 tokens
   const int outC[4] = {6 * Ca, 6 * Dt, 2 * Dc + Ca, 2 * Dc + Dt};
   const bool batchCond = HALF && BATCH_COND;
@@ -344,10 +356,38 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   if (batchCond)
     for (int k = 0; k < 4; ++k)
       cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * (T + COND_KINDS[k].rowsExtra) * outC[k]);
+  // (where couplingSplit runs, every layer's QB = [gR_hi | beta_hi; gR_lo | beta_lo] W_12 is sigma-only and shared by all
+  // G layers in the group: one pointer-array batched GEMM over G layers instead of 2 G separate GEMMs)
+  const int I = dimW(SM + "layers/0/coupling/s_to_q_mixer/fc1/weight", 0), ldc = 2 * Dc + Ca;
+  const size_t R = (size_t)T + 1;
+  float* cgQB = (batchCond && csplit) ? scratch<float>("be2.cg.QB", (size_t)G * R * 4 * I) : nullptr;
   const float* pendTokH = nullptr; const float* pendTokGate = nullptr; int pendTokLdg = 0;
   for (int l = 0; l < d.layers; ++l) {
     const std::string L = SM + "layers/" + num(l) + "/";
-    if (batchCond && l % G == 0) condGroup(cnd, T, Dt, d.layers, l, std::min(G, d.layers - l), outC, cg);
+    if (batchCond && l % G == 0) {
+      const int gn = std::min(G, d.layers - l);
+      condGroup(cnd, T, Dt, d.layers, l, gn, outC, cg);
+      if (cgQB) {
+        half* gR = scratch<half>("be2.cs.gR", (size_t)gn * 4 * R * Dc);
+        be2Run1d("be2_cs_gamma", (size_t)gn * R * Dc,
+                 Be2CsGammaArgs{cg[2], gR, nullptr, (u64)(gn * R * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)R});
+        for (int part = 0; part < 2; ++part) {
+          std::vector<u64> X, Wp, Y;
+          for (int j = 0; j < gn; ++j) {
+            const std::string p = SM + "layers/" + num(l + j) + "/coupling/s_to_q_mixer/";
+            X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * R * Dc));
+            Wp.push_back((u64)swigluPairs(p, Dc, I));
+            Y.push_back((u64)(cgQB + (size_t)j * R * 4 * I));
+          }
+          const std::string pk = "cg.qb." + num(gn) + "." + num(part);
+          Gemm G{}; G.ptrs = true; G.batch = gn;
+          G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16;
+          G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = 2 * R; G.in = Dc; G.out = 2 * I;
+          G.beta = part ? 1.f : 0.f; G.label = "coupling RB, layers batched";
+          gemm(G);
+        }
+      }
+    }
     const int lj = l % G;
     const CondLayer atomL{L + "atom_block/transformer_layer/", ab, true, Ha};
     // (the atom stream's conditioning is its token's row of cond: computed on the T + 1 token rows)
@@ -385,7 +425,8 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
                           tokTrH, tokTrH ? condT + 5 * Dt : nullptr});
       // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: qsh is already formed from untouched q and
       // a before s_to_q updates q, and s_to_q reads untouched a before q_to_s updates a)
-      if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
+      if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/",
+                                cgQB ? cgQB + (size_t)lj * R * 4 * I : nullptr);
       else {
         half* sqh = scratch<half>("be2.dn.sqh", RN * Dc);
         run("be2_ada_ln_s2q", rowsGrid(RN), 256,

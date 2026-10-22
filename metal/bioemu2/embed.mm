@@ -53,8 +53,8 @@ void adaLn(float* x, float* y, size_t rows, int C, const float* alpha, const flo
 // metal/core's flash attention reads (per position q, k, v, g, each heads x head width)
 static const half* qkvgWeight(const std::string& a, int D) {
   return M.derived<half>("qkvg:" + a, (size_t)4 * D * D, [&](half* out) {
-    run1d("be2_stack", (size_t)4 * D * D, Be2StackArgs{M.h("w/" + a + "proj_qkv/weight"), M.h("w/" + a + "proj_g/weight"), out,
-                                                       (u64)3 * D * D, (u64)D * D});
+    run1d("be2_stack", ((size_t)4 * D * D) >> 2, Be2StackArgs{M.h("w/" + a + "proj_qkv/weight"), M.h("w/" + a + "proj_g/weight"), out,
+                                                              (u64)3 * D * D, (u64)D * D});
   });
 }
 // the attention on the fast arm: adaLN into half, q|k|v|g in one GEMM, either be2_window_attention_h (windowed atoms:

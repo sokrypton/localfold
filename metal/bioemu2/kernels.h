@@ -79,8 +79,8 @@ struct Be2MsaEmbedArgs { DP(float) m; CP(int) msa; CP(int) hasDel; CP(float) del
                          CP(float) sp; u64 S; uint T, C; };
 // softmax over j of the [pairs][H] bias, heads first [H][T][T]; a simdgroup a row
 struct Be2PwaSoftmaxArgs { CP(float) b; DP(float) w; uint T, H; };
-// o[s][i][h][:] = sum_j w[h][i][j] v[s][j][h][:]
-struct Be2PwaApplyArgs { CP(float) w; CP(float) v; DP(float) o; u64 S; uint T, H, Ch, pad0; };
+// o[s][i][h][:] = sigmoid(g[s][i][h][:]) sum_j w[h][i][j] v[s][j][h][:]
+struct Be2PwaApplyArgs { CP(float) w; CP(float) v; CP(float) g; DP(float) o; u64 S; uint T, H, Ch, ldv; };
 // the outer product mean: proj [S][T][2 Co] packed into a, b [S][T Co] (its halves); then a GEMM over the rows gives
 // x [(i, c)][(j, d)] for a block of i, permuted into y [(i, j)][(c, d)] / n
 struct Be2OpmPackArgs { CP(float) proj; DP(float) a; DP(float) b; u64 R; uint Co, pad0; };

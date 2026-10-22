@@ -294,7 +294,7 @@ int foldMain(int argc, char** argv) {
   // the weights decoded on the device: the large matrices straight to float16 on the fast arm (a vector, a table, a norm
   // stays float32; anything an elementwise kernel reads as float gets a float32 copy on demand), every tensor float32
   // on the reference arm
-  auto asHalf = [](const std::string&, size_t elements) { return HALF && elements >= 65536; };
+  auto asHalf = [](const std::string&, size_t elements) { return HALF && elements >= 4096; };
   if (!bundle.empty()) M.loadBundle(bundle, "w", asHalf);
   else loadBlobAsBundle(blob, asHalf);
   mt::sync();
