@@ -182,13 +182,17 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           simdgroup_half8x8 ma, mb;
           thread auto& oa = ma.thread_elements();
           thread auto& ob = mb.thread_elements();
+          float2 bpa(0.f), bga(0.f), bpb(0.f), bgb(0.f);
+          if (g.epilogue & 4) {     // (the projection's and gate's biases, f32, in the same order: AF2's)
+            device const float* bias = (device const float*)g.bias + i0 + sc + b * 8 + sn1;
+            bpa = *(device const float2*)(bias);
+            bga = *(device const float2*)(bias + 8);
+            bpb = *(device const float2*)(bias + 16);
+            bgb = *(device const float2*)(bias + 24);
+          }
           _Pragma("clang loop unroll(full)")
           for (int t = 0; t < 2; ++t) {
-            float vpa = pa[t], vga = ga[t], vpb = pb[t], vgb = gb[t];
-            if (g.epilogue & 4) {     // (the projection's and gate's biases, f32, in the same order: AF2's)
-              device const float* bias = (device const float*)g.bias + i0 + sc + b * 8 + sn1 + t;
-              vpa += bias[0]; vga += bias[8]; vpb += bias[16]; vgb += bias[24];
-            }
+            float vpa = pa[t] + bpa[t], vga = ga[t] + bga[t], vpb = pb[t] + bpb[t], vgb = gb[t] + bgb[t];
             oa[t] = (half)(vpa * m / (1.f + exp(-vga)));
             ob[t] = (half)(vpb * m / (1.f + exp(-vgb)));
           }
@@ -200,11 +204,12 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
+    const bool eqN = g.tgNp == g.tgN;
     for (int t = tid; t < (TC_ / 4) * TR; t += 128) {      // channel-major, a channel's rows consecutive
       int cl = t / TR, jl = t % TR, jg = j0 + jl, c = i0 / 4 + cl;
       if (jg >= g.n || c >= g.tgC) continue;
-      uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);      // (no integer divider: prelude)
-      ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
+      uint p = (uint)(g.tgR0 + jg);
+      ulong q = eqN ? (ulong)p : (ulong)lf_udiv(p, (uint)g.tgN) * (uint)(g.tgNp - g.tgN) + p;
       outA[(ulong)c * g.tgPairs + q] = Sab[cl * TR + jl];
       outB[(ulong)c * g.tgPairs + q] = Sab[(TC_ / 4 + cl) * TR + jl];
     }
@@ -216,13 +221,14 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     thread auto& eb = acc[a][(b) + 1].thread_elements(); \
     simdgroup_matrix<TC, 8, 8> om; \
     thread auto& o = om.thread_elements(); \
+    float2 bva(0.f), bvb(0.f); \
+    if (g.epilogue & 4) { \
+      device const float* bp = (device const float*)g.bias + (i) + sn; \
+      bva = *(device const float2*)(bp); bvb = *(device const float2*)(bp + 8); \
+    } \
     _Pragma("clang loop unroll(full)") \
     for (int t = 0; t < 2; ++t) { \
-      float va = g.alpha * (float)ea[t], vb = g.alpha * (float)eb[t]; \
-      if (g.epilogue & 4) { \
-        const int col = (i) + sn + t; \
-        va += ((device const float*)g.bias)[col]; vb += ((device const float*)g.bias)[col + 8]; \
-      } \
+      float va = g.alpha * (float)ea[t] + bva[t], vb = g.alpha * (float)eb[t] + bvb[t]; \
       o[t] = (TC)(va / (1.f + exp(-va)) * vb); \
     } \
     simdgroup_store(om, D + (ulong)(j) * g.ldd + (i) / 2, (ulong)g.ldd); \
@@ -233,12 +239,15 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       if ((g.epilogue & ~6) == 0 && g.beta == 0.f) { \
         if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) { \
           if (g.epilogue || g.alpha != 1.f) { \
+            float2 bv2(0.f); \
+            if (g.epilogue & 4) { \
+              const ulong boff = (g.ptrs ? (ulong)z * g.m : 0) + (i) + sn; \
+              bv2 = (g.biasType & 255) == 2 ? float2(*(device const half2*)((device const half*)g.bias + boff)) \
+                                            : *(device const float2*)((device const float*)g.bias + boff); \
+            } \
             _Pragma("clang loop unroll(full)") \
             for (int t = 0; t < 2; ++t) { \
-              const int col = (i) + sn + t; \
-              const ulong boff = g.ptrs ? (ulong)z * g.m : 0; \
-              float v = g.alpha * (float)e[t]; \
-              if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col]; \
+              float v = g.alpha * (float)e[t] + bv2[t]; \
               if (g.epilogue & 2) v = max(v, 0.f); \
               e[t] = v; \
             } \
@@ -247,12 +256,15 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         } else { \
           simdgroup_matrix<TC, 8, 8> om; \
           thread auto& o = om.thread_elements(); \
+          float2 bv2(0.f); \
+          if (g.epilogue & 4) { \
+            const ulong boff = (g.ptrs ? (ulong)z * g.m : 0) + (i) + sn; \
+            bv2 = (g.biasType & 255) == 2 ? float2(*(device const half2*)((device const half*)g.bias + boff)) \
+                                          : *(device const float2*)((device const float*)g.bias + boff); \
+          } \
           _Pragma("clang loop unroll(full)") \
           for (int t = 0; t < 2; ++t) { \
-            const int col = (i) + sn + t; \
-            const ulong boff = g.ptrs ? (ulong)z * g.m : 0; \
-            float v = g.alpha * (float)e[t]; \
-            if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col]; \
+            float v = g.alpha * (float)e[t] + bv2[t]; \
             if (g.epilogue & 2) v = max(v, 0.f); \
             if constexpr (metal::is_same_v<TC, half>) { const half hv = (half)clamp(v, -65504.f, 65504.f); o[t] = hv; if constexpr ((EP & 128) != 0) e[t] = (float)hv; } \
             else { o[t] = (TC)v; if constexpr ((EP & 128) != 0) e[t] = v; } \

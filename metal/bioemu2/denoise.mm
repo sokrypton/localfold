@@ -210,11 +210,20 @@ static bool splitPays(int samples, int T, int N, int Dt, int Ca) {
   static const double margin = getenv("BE2_SPLIT_MARGIN") ? atof(getenv("BE2_SPLIT_MARGIN")) : 1.5;
   return split * margin < unsplit;
 }
+static const half* csPairs(const std::string& p, int Dc, int I) {
+  static const bool staged = getenv("BE2_CS_STAGED") && atoi(getenv("BE2_CS_STAGED")) != 0;
+  if (staged) return swigluPairs(p, Dc, I);
+  return M.derived<half>("csP2b:" + p, (size_t)Dc * 2 * I, [&](half* out) {
+    run("be2_cs_wq2", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((Dc + 31) / 32), 1}, 256,
+        Be2CsWqArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)Dc, (uint)I,
+                    0u, (uint)Dc, 1.f / swigluScale(), 1u});
+  });
+}
 static void couplingSplit(const float* a, float* q, const float* cqc, const int* atomTok, int samples, int T, int N,
                           int Dt, int Ca, const std::string& p, const float* preQB = nullptr, bool preTok = false) {
   const int Dc = Dt + Ca, I = dimW(p + "fc1/weight", 0), ldc = 2 * Dc + Ca;
   const size_t RN = (size_t)samples * N, RT = (size_t)samples * T, R = (size_t)T + 1;
-  const half* w12 = swigluPairs(p, Dc, I);             // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
+  const half* w12 = csPairs(p, Dc, I);                 // [Dc][2I]: rows 0..Dt W_a, Dt.. W_q
   // 🔴 Xq IS TWO HALVES, [hi | lo], against W_q stacked twice (K 128 -> 256, free here): in one half the split read
   // 9.7e-3 at sigma 1 and 2.7e-4 at 0.05 against webgpu/bioemu2's float32 arm, where unsplit reads 3.3e-3 and 4.0e-5;
   // hi | lo gives 3.1e-3 and 3.5e-5. Xa in one half costs nothing measurable (hi | lo there: 9.6e-3, 2.6e-4)
@@ -226,9 +235,8 @@ static void couplingSplit(const float* a, float* q, const float* cqc, const int*
     copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
     copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
   }) : M.derived<half>("csQ2b:" + p, 2 * wq, [&](half* out) {
-    run("be2_cs_wq2", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((Ca + 31) / 32), 1}, 256,
-        Be2CsWqArgs{M.h("w/" + p + "fc1/weight"), M.h("w/" + p + "fc2/weight"), out, (uint)Dc, (uint)I,
-                    (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
+    copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+    copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
   });
   float* tstats = scratch<float>("be2.cs.tstats", RT * 3); half* xa = scratch<half>("be2.cs.xa", RT * Dt);
   float* P = scratch<float>("be2.cs.P", RT * 2 * I);
@@ -465,7 +473,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
           for (int j = 0; j < G; ++j) {
             const std::string p = SM + "layers/" + num(j) + "/coupling/s_to_q_mixer/";
             X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * RK * Dc));
-            Wp.push_back((u64)swigluPairs(p, Dc, I));
+            Wp.push_back((u64)csPairs(p, Dc, I));
             Y.push_back((u64)(cgQB + (size_t)j * RK * 4 * I));
           }
           const std::string pk = "cg.qb." + num(G) + "." + num(K) + "." + num(part);
@@ -518,7 +526,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
           for (int j = 0; j < gn; ++j) {
             const std::string p = SM + "layers/" + num(l + j) + "/coupling/s_to_q_mixer/";
             X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * R * Dc));
-            Wp.push_back((u64)swigluPairs(p, Dc, I));
+            Wp.push_back((u64)csPairs(p, Dc, I));
             Y.push_back((u64)(cgQB + (size_t)j * R * 4 * I));
           }
           const std::string pk = "cg.qb." + num(gn) + "." + num(part);
@@ -707,17 +715,13 @@ void prepareWeights() {
       swigluPairs(tst, Dt, dimW(tst + "fc1/weight", 0));
       const std::string s2q = couplingPrefix(l) + "s_to_q_mixer/", q2s = couplingPrefix(l) + "q_to_s_mixer/";
       const int I = dimW(s2q + "fc1/weight", 0);
-      const half* w12 = swigluPairs(s2q, Dc, I);
+      swigluPairs(s2q, Dc, I);
       if (gemmTensorOps()) {
+        const half* w12 = csPairs(s2q, Dc, I);
         const size_t wq = (size_t)Ca * 2 * I;
-        if (staged) M.derived<half>("csQ2:" + s2q, 2 * wq, [&](half* out) {
+        M.derived<half>((staged ? "csQ2:" : "csQ2b:") + s2q, 2 * wq, [&](half* out) {
           copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
           copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
-        });
-        else M.derived<half>("csQ2b:" + s2q, 2 * wq, [&](half* out) {
-          run("be2_cs_wq2", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((Ca + 31) / 32), 1}, 256,
-              Be2CsWqArgs{M.h("w/" + s2q + "fc1/weight"), M.h("w/" + s2q + "fc2/weight"), out, (uint)Dc, (uint)I,
-                          (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
         });
       }
       swigluPairs(q2s, Dc, dimW(q2s + "fc1/weight", 0));

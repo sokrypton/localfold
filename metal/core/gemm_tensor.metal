@@ -166,8 +166,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       const float4 vpb = float4((float)c[e + 16], (float)c[e + 17], (float)c[e + 18], (float)c[e + 19]) + bpb;
       const float4 vgb = float4((float)c[e + 24], (float)c[e + 25], (float)c[e + 26], (float)c[e + 27]) + bgb;
       const float m = mask[g.tgR0 + jg];
-      const uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);
-      const ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
+      const uint p = (uint)(g.tgR0 + jg);
+      const ulong q = g.tgNp == g.tgN ? (ulong)p : (ulong)lf_udiv(p, (uint)g.tgN) * (uint)(g.tgNp - g.tgN) + p;
       const half4 ha = half4(fast::divide(vpa * m, 1.f + fast::exp(-vga)));
       const half4 hb = half4(fast::divide(vpb * m, 1.f + fast::exp(-vgb)));
       _Pragma("clang loop unroll(full)")
@@ -231,34 +231,68 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       }
       return;
     }
-    _Pragma("clang loop unroll(full)")
-    for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
-      if (!c.is_valid_element(e)) continue;
-      const auto ix = c.get_multidimensional_index(e);
-      const int i = i0 + ix[0], j = j0 + ix[1];
-      if (j >= g.n || i >= g.m) continue;
-      if constexpr (metal::is_same_v<TC, half> && !metal::is_same_v<TACC, half> && (EP & 64) == 0) {
-        if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
-          // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
+    if constexpr (metal::is_same_v<TC, half> && !metal::is_same_v<TACC, half> && (EP & 64) == 0) {
+      if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
+        // i / 2 and i / 2 + 1 here with their values; P and R | B also in blocks of 2
+        if constexpr (TM == 64 && TN == 128) {
+          const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+          const bool fullM = i0 + TN <= g.m;
+          const ushort4 bs(0, 4, 32, 36);
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < 4; ++r_idx) {
+            const uint16_t er = bs[r_idx];
+            const int j = j0 + c.get_multidimensional_index(er)[1];
+            if (j >= g.n) continue;
+            device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)j * 8);
+            const float4 s0 = sr4[0], s1 = sr4[1];
+            const float inv = s0.x, dq = s0.z, sq = s0.w, sa = s1.y;
+            const int st = (int)s1.z;
+            device const float* qb = (device const float*)g.aux3 + (ulong)(uint)s1.w * 2 * g.m;
+            device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              if (fullM || i < g.m) {
+                const uint16_t e = er + k * 8;
+                const float4 pv = st >= 0 ? sa * *(device const float4*)(pr + i) : float4(0.f);
+                const float4 qv = *(device const float4*)(qb + i);
+                const float4 bv = *(device const float4*)(qb + g.m + i);
+                const float4 cv = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                const float4 uv = inv * (pv + sq * cv + dq * qv) + bv;
+                *(device half2*)(D + (ulong)(i >> 1) + (ulong)j * g.ldd) = half2(fast::divide(uv.xy, 1.f + fast::exp(-uv.xy)) * uv.zw);
+              }
+            }
+          }
+          return;
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+          if (!c.is_valid_element(e)) continue;
+          const auto ix = c.get_multidimensional_index(e);
+          const int i = i0 + ix[0], j = j0 + ix[1];
+          if (j >= g.n || i >= g.m) continue;
           device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)j * 8);
           const float4 s0 = sr4[0], s1 = sr4[1];
           const float inv = s0.x, dq = s0.z, sq = s0.w, sa = s1.y;
           const int st = (int)s1.z;
           device const float* qb = (device const float*)g.aux3 + (ulong)(uint)s1.w * 2 * g.m;
           device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
-          const int x = i >> 1, pc = (i & ~15) | (x & 6);
-          const float2 pa = st >= 0 ? sa * *(device const float2*)(pr + pc) : float2(0.f);
-          const float2 pb = st >= 0 ? sa * *(device const float2*)(pr + pc + 8) : float2(0.f);
-          const float2 qa = *(device const float2*)(qb + pc), qb8 = *(device const float2*)(qb + pc + 8);
-          const float2 ba = *(device const float2*)(qb + g.m + pc), bb8 = *(device const float2*)(qb + g.m + pc + 8);
-          const float2 ca = float2((float)c[e], (float)c[e + 1]);
-          const float2 cb = float2((float)c[e + 2], (float)c[e + 3]);
-          const float2 ua = inv * (pa + sq * ca + dq * qa) + ba;
-          const float2 ub = inv * (pb + sq * cb + dq * qb8) + bb8;
-          *(device half2*)(D + (ulong)x + (ulong)j * g.ldd) = half2(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
-          continue;
+          const float4 pv = st >= 0 ? sa * *(device const float4*)(pr + i) : float4(0.f);
+          const float4 qv = *(device const float4*)(qb + i);
+          const float4 bv = *(device const float4*)(qb + g.m + i);
+          const float4 cv = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+          const float4 uv = inv * (pv + sq * cv + dq * qv) + bv;
+          *(device half2*)(D + (ulong)(i >> 1) + (ulong)j * g.ldd) = half2(fast::divide(uv.xy, 1.f + fast::exp(-uv.xy)) * uv.zw);
         }
+        return;
       }
+    }
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+      if (!c.is_valid_element(e)) continue;
+      const auto ix = c.get_multidimensional_index(e);
+      const int i = i0 + ix[0], j = j0 + ix[1];
+      if (j >= g.n || i >= g.m) continue;
       // (lf_gemm's order of operations, so the results match the staged path's bit for bit)
       float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
       if constexpr (metal::is_same_v<TC, float> && (EP & 64) == 0) {
@@ -356,37 +390,108 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   if constexpr ((EP & 2) != 0) {
     static_assert((EP & 1) == 0, "a plain product has no triangle gate");
     {
-      if (g.epilogue || g.alpha != 1.f) {
-        const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
-        _Pragma("clang loop unroll(full)")
-        for (uint16_t e = 0; e < c.get_capacity(); ++e)
-          if (c.is_valid_element(e)) {
-            const int col = i0 + c.get_multidimensional_index(e)[0];
-            float v = (float)c[e] * g.alpha;
-            if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
-            if (g.epilogue & 2) v = max(v, 0.f);
-            c[e] = (TACC)v;
-          }
-      }
-      if constexpr (metal::is_same_v<TC, TACC>) {
-        tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
-        auto mD = tD.slice(i0, j0);
-        c.store(mD);
-      } else if constexpr (metal::is_same_v<TC, half>) {   // (the tensor stores only its own type: through a half twin, saturating)
+      if constexpr (metal::is_same_v<TC, half> && !metal::is_same_v<TC, TACC>) {
         auto ch = op.template get_destination_cooperative_tensor<decltype(mX), decltype(mW), half>();
-        _Pragma("clang loop unroll(full)")
-        for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) ch[e] = (half)clamp((float)c[e], -65504.f, 65504.f);
+        if (!g.epilogue && g.alpha == 1.f) {
+          _Pragma("clang loop unroll(full)")
+          for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) ch[e] = (half)clamp((float)c[e], -65504.f, 65504.f);
+        } else if constexpr (TN % 32 == 0) {
+          const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+          if ((g.m & 3) == 0) {
+            const bool fullM = i0 + TN <= g.m, hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
+            const bool relu = (g.epilogue & 2) != 0;
+            _Pragma("clang loop unroll(full)")
+            for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+              if (!c.is_valid_element(e)) continue;
+              const int col = i0 + c.get_multidimensional_index(e)[0];
+              float4 v = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]) * g.alpha;
+              if (hasBias && (fullM || col < g.m))
+                v += halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
+                              : *(device const float4*)((device const float*)g.bias + boff + col);
+              if (relu) v = max(v, 0.f);
+              v = clamp(v, -65504.f, 65504.f);
+              ch[e] = (half)v.x; ch[e + 1] = (half)v.y; ch[e + 2] = (half)v.z; ch[e + 3] = (half)v.w;
+            }
+          } else {
+            _Pragma("clang loop unroll(full)")
+            for (uint16_t e = 0; e < c.get_capacity(); ++e)
+              if (c.is_valid_element(e)) {
+                const int col = i0 + c.get_multidimensional_index(e)[0];
+                float v = (float)c[e] * g.alpha;
+                if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
+                if (g.epilogue & 2) v = max(v, 0.f);
+                ch[e] = (half)clamp(v, -65504.f, 65504.f);
+              }
+          }
+        } else {
+          const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+          _Pragma("clang loop unroll(full)")
+          for (uint16_t e = 0; e < c.get_capacity(); ++e)
+            if (c.is_valid_element(e)) {
+              const int col = i0 + c.get_multidimensional_index(e)[0];
+              float v = (float)c[e] * g.alpha;
+              if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
+              if (g.epilogue & 2) v = max(v, 0.f);
+              ch[e] = (half)clamp(v, -65504.f, 65504.f);
+            }
+        }
         tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
         auto mD = tD.slice(i0, j0);
         ch.store(mD);
-      } else {   // (the tensor stores only its own type: a float accumulator into a half output an element at a time)
-        _Pragma("clang loop unroll(full)")
-        for (uint16_t e = 0; e < c.get_capacity(); ++e)
-          if (c.is_valid_element(e)) {
-            const auto ix = c.get_multidimensional_index(e);
-            const int i = i0 + ix[0], j = j0 + ix[1];
-            if (i < g.m && j < g.n) D[(ulong)i + (ulong)j * g.ldd] = metal::is_same_v<TC, half> ? (TC)clamp((float)c[e], -65504.f, 65504.f) : (TC)c[e];
+      } else {
+        if (g.epilogue || g.alpha != 1.f) {
+          const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+          if constexpr (TN % 32 == 0) {
+            if ((g.m & 3) == 0) {
+              const bool fullM = i0 + TN <= g.m, hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
+              const bool relu = (g.epilogue & 2) != 0;
+              _Pragma("clang loop unroll(full)")
+              for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+                if (!c.is_valid_element(e)) continue;
+                const int col = i0 + c.get_multidimensional_index(e)[0];
+                float4 v = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]) * g.alpha;
+                if (hasBias && (fullM || col < g.m))
+                  v += halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
+                                : *(device const float4*)((device const float*)g.bias + boff + col);
+                if (relu) v = max(v, 0.f);
+                c[e] = (TACC)v.x; c[e + 1] = (TACC)v.y; c[e + 2] = (TACC)v.z; c[e + 3] = (TACC)v.w;
+              }
+            } else {
+              _Pragma("clang loop unroll(full)")
+              for (uint16_t e = 0; e < c.get_capacity(); ++e)
+                if (c.is_valid_element(e)) {
+                  const int col = i0 + c.get_multidimensional_index(e)[0];
+                  float v = (float)c[e] * g.alpha;
+                  if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
+                  if (g.epilogue & 2) v = max(v, 0.f);
+                  c[e] = (TACC)v;
+                }
+            }
+          } else {
+            _Pragma("clang loop unroll(full)")
+            for (uint16_t e = 0; e < c.get_capacity(); ++e)
+              if (c.is_valid_element(e)) {
+                const int col = i0 + c.get_multidimensional_index(e)[0];
+                float v = (float)c[e] * g.alpha;
+                if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
+                if (g.epilogue & 2) v = max(v, 0.f);
+                c[e] = (TACC)v;
+              }
           }
+        }
+        if constexpr (metal::is_same_v<TC, TACC>) {
+          tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
+          auto mD = tD.slice(i0, j0);
+          c.store(mD);
+        } else {   // (the tensor stores only its own type: a float accumulator into a half output an element at a time)
+          _Pragma("clang loop unroll(full)")
+          for (uint16_t e = 0; e < c.get_capacity(); ++e)
+            if (c.is_valid_element(e)) {
+              const auto ix = c.get_multidimensional_index(e);
+              const int i = i0 + ix[0], j = j0 + ix[1];
+              if (i < g.m && j < g.n) D[(ulong)i + (ulong)j * g.ldd] = metal::is_same_v<TC, half> ? (TC)clamp((float)c[e], -65504.f, 65504.f) : (TC)c[e];
+            }
+        }
       }
     }
   } else {

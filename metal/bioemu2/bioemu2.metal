@@ -644,7 +644,7 @@ kernel void be2_cs_wq2(constant Be2CsWqArgs& a [[buffer(0)]], uint3 tg [[threadg
       const uint jr = c4 << 1;
       const half4 v = half4(tile1[jr][kr], tile1[jr + 1][kr], tile2[jr][kr], tile2[jr + 1][kr]);
       ((device half4*)a.out)[(ulong)k * W4 + col4] = v;
-      ((device half4*)a.out)[(ulong)(k + a.K) * W4 + col4] = v;
+      if (!a.pad0) ((device half4*)a.out)[(ulong)(k + a.K) * W4 + col4] = v;
     }
   }
 }
