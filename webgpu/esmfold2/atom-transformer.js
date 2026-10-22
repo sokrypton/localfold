@@ -129,6 +129,34 @@ export function createModulateShader({ atoms, channels }, shiftIndex, scaleIndex
   for (let s = LANES >> 1; s > 0; s >>= 1) {
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
+  if (channels === 2 * LANES) {
+    return `
+@group(0) @binding(0) var<storage, read> activation: array<f32>;
+@group(0) @binding(1) var<storage, read> modulation: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+var<workgroup> squares: array<f32, ${LANES}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let atom = group.x + group.y * ${GRID_WIDTH}u;
+  if (atom >= ${atoms}u) { return; }
+  let base = atom * ${channels}u;
+  let c0 = local.x;
+  let c1 = local.x + ${LANES}u;
+  let v0 = activation[base + c0];
+  let v1 = activation[base + c1];
+  squares[local.x] = v0 * v0 + v1 * v1;
+  workgroupBarrier();
+${steps.join("\n")}
+  let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let scaleBase = atom * ${channels * 6}u + ${scaleIndex * channels}u;
+  let shiftBase = atom * ${channels * 6}u + ${shiftIndex * channels}u;
+  output[base + c0] = v0 * inverse * (1.0 + modulation[scaleBase + c0]) + modulation[shiftBase + c0];
+  output[base + c1] = v1 * inverse * (1.0 + modulation[scaleBase + c1]) + modulation[shiftBase + c1];
+}`;
+  }
   return `
 @group(0) @binding(0) var<storage, read> activation: array<f32>;
 @group(0) @binding(1) var<storage, read> modulation: array<f32>;
@@ -155,6 +183,82 @@ ${steps.join("\n")}
   let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
   let scaleBase = atom * ${channels * 6}u + ${scaleIndex * channels}u;
   let shiftBase = atom * ${channels * 6}u + ${shiftIndex * channels}u;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let scale = modulation[scaleBase + c];
+    let shift = modulation[shiftBase + c];
+    output[base + c] = rowBuf[c] * inverse * (1.0 + scale) + shift;
+  }
+}`;
+}
+
+function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex, scaleIndex) {
+  const steps = [];
+  for (let s = LANES >> 1; s > 0; s >>= 1) {
+    steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
+  }
+  if (channels === 2 * LANES) {
+    return `
+@group(0) @binding(0) var<storage, read> delta: array<f32>;
+@group(0) @binding(1) var<storage, read> modulation: array<f32>;
+@group(0) @binding(2) var<storage, read_write> activation: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+var<workgroup> squares: array<f32, ${LANES}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let atom = group.x + group.y * ${GRID_WIDTH}u;
+  if (atom >= ${atoms}u) { return; }
+  let base = atom * ${channels}u;
+  let modBase = atom * ${channels * 6}u;
+  let gateBase = modBase + ${gateIndex * channels}u;
+  let c0 = local.x;
+  let c1 = local.x + ${LANES}u;
+  let v0 = activation[base + c0] + modulation[gateBase + c0] * delta[base + c0];
+  let v1 = activation[base + c1] + modulation[gateBase + c1] * delta[base + c1];
+  activation[base + c0] = v0;
+  activation[base + c1] = v1;
+  squares[local.x] = v0 * v0 + v1 * v1;
+  workgroupBarrier();
+${steps.join("\n")}
+  let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let scaleBase = modBase + ${scaleIndex * channels}u;
+  let shiftBase = modBase + ${shiftIndex * channels}u;
+  output[base + c0] = v0 * inverse * (1.0 + modulation[scaleBase + c0]) + modulation[shiftBase + c0];
+  output[base + c1] = v1 * inverse * (1.0 + modulation[scaleBase + c1]) + modulation[shiftBase + c1];
+}`;
+  }
+  return `
+@group(0) @binding(0) var<storage, read> delta: array<f32>;
+@group(0) @binding(1) var<storage, read> modulation: array<f32>;
+@group(0) @binding(2) var<storage, read_write> activation: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+var<workgroup> squares: array<f32, ${LANES}>;
+var<workgroup> rowBuf: array<f32, ${channels}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let atom = group.x + group.y * ${GRID_WIDTH}u;
+  if (atom >= ${atoms}u) { return; }
+  let base = atom * ${channels}u;
+  let modBase = atom * ${channels * 6}u;
+  let gateBase = modBase + ${gateIndex * channels}u;
+  var square = 0.0;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let v = activation[base + c] + modulation[gateBase + c] * delta[base + c];
+    activation[base + c] = v;
+    rowBuf[c] = v;
+    square += v * v;
+  }
+  squares[local.x] = square;
+  workgroupBarrier();
+${steps.join("\n")}
+  let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let scaleBase = modBase + ${scaleIndex * channels}u;
+  let shiftBase = modBase + ${shiftIndex * channels}u;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let scale = modulation[scaleBase + c];
     let shift = modulation[shiftBase + c];
@@ -555,6 +659,8 @@ export async function compileAtomStack(pipelines, shape) {
       createGatedResidualShader({ atoms, channels }, GATE_ATTENTION)),
     modulateFfn: pipelines.get(`${base}:mod-f`,
       createModulateShader({ atoms, channels }, SHIFT_FFN, SCALE_FFN)),
+    residualModulateFfn: pipelines.get(`${base}:res-mod-f`,
+      createResidualModulateShader({ atoms, channels }, GATE_ATTENTION, SHIFT_FFN, SCALE_FFN)),
     swiglu: pipelines.get(`${base}:swiglu`,
       createSwigluShader({ rows: atoms, model: channels, ffn: hidden })),
     ffnDown: linear("ffn-down", hidden, channels),
@@ -605,15 +711,20 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
   const perAtom = [Math.min(GRID_WIDTH, atoms), Math.ceil(atoms / GRID_WIDTH)];
   const perHead = [Math.min(GRID_WIDTH, atoms * heads), Math.ceil(atoms * heads / GRID_WIDTH)];
 
-  run("esmfold2.atom.silu", pipelines.silu,
-      [state.conditioning, scratch.siluCond], ...rows(atoms * channels));
+  if (weights.some((block) => block.modulation === undefined)) {
+    run("esmfold2.atom.silu", pipelines.silu,
+        [state.conditioning, scratch.siluCond], ...rows(atoms * channels));
+  }
 
   for (const block of weights) {
-    run("esmfold2.atom.adaln", pipelines.modulation,
-        [scratch.siluCond, block.adaln, scratch.modulation],
-        ...linearGrid(atoms, channels * 6));
+    const modulation = block.modulation ?? scratch.modulation;
+    if (block.modulation === undefined) {
+      run("esmfold2.atom.adaln", pipelines.modulation,
+          [scratch.siluCond, block.adaln, modulation],
+          ...linearGrid(atoms, channels * 6));
+    }
     run("esmfold2.atom.modulate-a", pipelines.modulateAttention,
-        [state.activation, scratch.modulation, scratch.normalised], ...perAtom);
+        [state.activation, modulation, scratch.normalised], ...perAtom);
     run("esmfold2.atom.qkv", pipelines.qkv,
         [scratch.normalised, block.qkv, scratch.qkv], ...linearGrid(atoms, channels * 3));
     run("esmfold2.atom.gate", pipelines.gate,
@@ -626,17 +737,14 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
          scratch.gate, scratch.context], ...perAtom);
     run("esmfold2.atom.attn-out", pipelines.attentionOut,
         [scratch.context, block.attnOut, scratch.delta], ...linearGrid(atoms, channels));
-    run("esmfold2.atom.residual-a", pipelines.residualAttention,
-        [scratch.delta, scratch.modulation, state.activation], ...rows(atoms * channels));
-
-    run("esmfold2.atom.modulate-f", pipelines.modulateFfn,
-        [state.activation, scratch.modulation, scratch.normalised], ...perAtom);
+    run("esmfold2.atom.res-mod-f", pipelines.residualModulateFfn,
+        [scratch.delta, modulation, state.activation, scratch.normalised], ...perAtom);
     run("esmfold2.atom.swiglu", pipelines.swiglu,
         [scratch.normalised, block.ffnUp, scratch.hidden], ...swigluGrid(atoms, hidden));
     run("esmfold2.atom.ffn-down", pipelines.ffnDown,
         [scratch.hidden, block.ffnDown, scratch.delta], ...linearGrid(atoms, channels));
     run("esmfold2.atom.residual-f", pipelines.residualFfn,
-        [scratch.delta, scratch.modulation, state.activation], ...rows(atoms * channels));
+        [scratch.delta, modulation, state.activation], ...rows(atoms * channels));
   }
 }
 

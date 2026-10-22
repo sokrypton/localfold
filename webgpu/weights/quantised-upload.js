@@ -146,6 +146,26 @@ fn zero_at(index: u32) -> f32 {
 }
 
 /** One element of this destination run, counted from its first. */
+fn decode_at(p: Params, absolute: u32, codeBase: u32, scaleBase: u32, groupBase: u32) -> f32 {
+  let group = absolute / GROUP;
+  let table = scaleBase + (group - groupBase);
+  let scale = scale_at(table);
+${codec.signed ? "" : "  let zero = zero_at(table);"}
+  let bit = (absolute % GROUP) * ${codec.bits}u;
+  // The code's first bit in the whole code buffer, read as one word or two:
+  // a code is at most eight bits wide, so it crosses at most one word boundary.
+  let start = (codeBase + (group - groupBase) * GROUP_BYTES) * 8u + bit;
+  let word = start >> 5u;
+  let shift = start & 31u;
+  var bits = codes[word] >> shift;
+  if (shift > ${32 - codec.bits}u) { bits = bits | (codes[word + 1u] << (32u - shift)); }
+  let code = bits & ${(1 << codec.bits) - 1}u;
+${codec.signed
+  ? `  // Two's complement in eight bits, and no zero point: see codecOf.
+  return f32(i32(code << 24u) >> 24u) * scale;`
+  : "  return f32(code) * scale + zero;"}
+}
+
 fn value_at(p: Params, within: u32) -> f32 {
   // 🔴 SELECTED, NOT SUBSCRIPTED. "p.codeBase[part]" is a dynamic index
   // into a vector, which WGSL puts in addressable memory - see CLAUDE.md, where
@@ -176,23 +196,7 @@ fn value_at(p: Params, within: u32) -> f32 {
     + (within % p.partRun);
   let absolute = bias + (d2 / p.inner) * p.outerStride
     + (d2 % p.inner) * p.innerStride;
-  let group = absolute / GROUP;
-  let table = scaleBase + (group - groupBase);
-  let scale = scale_at(table);
-${codec.signed ? "" : "  let zero = zero_at(table);"}
-  let bit = (absolute % GROUP) * ${codec.bits}u;
-  // The code's first bit in the whole code buffer, read as one word or two:
-  // a code is at most eight bits wide, so it crosses at most one word boundary.
-  let start = (codeBase + (group - groupBase) * GROUP_BYTES) * 8u + bit;
-  let word = start >> 5u;
-  let shift = start & 31u;
-  var bits = codes[word] >> shift;
-  if (shift > ${32 - codec.bits}u) { bits = bits | (codes[word + 1u] << (32u - shift)); }
-  let code = bits & ${(1 << codec.bits) - 1}u;
-${codec.signed
-  ? `  // Two's complement in eight bits, and no zero point: see codecOf.
-  return f32(i32(code << 24u) >> 24u) * scale;`
-  : "  return f32(code) * scale + zero;"}
+  return decode_at(p, absolute, codeBase, scaleBase, groupBase);
 }
 
 const GROUP: u32 = ${codec.group}u;
@@ -218,7 +222,54 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let params = table[low];
   let slots = ${destination === "f32" ? "params.count" : "(params.count + 1u) / 2u"};
   let first = (wg - params.padding[0].x) * REPLAY_RUN;
-  for (var k = 0u; k < REPLAY_RUN; k += ${LANES}u) {
+${destination !== "f32" && !accumulate ? `  if (params.parts == 1u && params.innerStride == 1u && (params.outerStride == 0u || params.outerStride == params.inner)) {
+    let cb = params.codeBase.x;
+    let sb = params.scaleBase.x;
+    let gb = params.groupBase.x;
+    let b0 = params.bias.x;
+    for (var k = 0u; k < REPLAY_RUN; k += ${LANES}u) {
+      let pair = first + k + lid.x;
+      let within = pair * 2u;
+      if (within < params.count) {
+        let abs0 = b0 + within;
+        let grp0 = abs0 / GROUP;
+        let tbl0 = sb + (grp0 - gb);
+        let scl0 = scale_at(tbl0);
+${codec.signed ? "" : "        let zro0 = zero_at(tbl0);"}
+        let bit0 = (abs0 % GROUP) * ${codec.bits}u;
+        let st0 = (cb + (grp0 - gb) * GROUP_BYTES) * 8u + bit0;
+        let wrd0 = st0 >> 5u;
+        let shf0 = st0 & 31u;
+        var bts0 = codes[wrd0] >> shf0;
+        if (shf0 > ${32 - codec.bits}u) { bts0 = bts0 | (codes[wrd0 + 1u] << (32u - shf0)); }
+        let cd0 = bts0 & ${(1 << codec.bits) - 1}u;
+        let val0 = ${codec.signed ? "f32(i32(cd0 << 24u) >> 24u) * scl0" : "f32(cd0) * scl0 + zro0"};
+        var val1 = 0.0;
+        if (within + 1u < params.count) {
+          let abs1 = abs0 + 1u;
+          let grp1 = abs1 / GROUP;
+          var scl1 = scl0;
+${codec.signed ? "" : "          var zro1 = zro0;"}
+          if (grp1 != grp0) {
+            let tbl1 = sb + (grp1 - gb);
+            scl1 = scale_at(tbl1);
+${codec.signed ? "" : "            zro1 = zero_at(tbl1);"}
+          }
+          let bit1 = (abs1 % GROUP) * ${codec.bits}u;
+          let st1 = (cb + (grp1 - gb) * GROUP_BYTES) * 8u + bit1;
+          let wrd1 = st1 >> 5u;
+          let shf1 = st1 & 31u;
+          var bts1 = codes[wrd1] >> shf1;
+          if (shf1 > ${32 - codec.bits}u) { bts1 = bts1 | (codes[wrd1 + 1u] << (32u - shf1)); }
+          let cd1 = bts1 & ${(1 << codec.bits) - 1}u;
+          val1 = ${codec.signed ? "f32(i32(cd1 << 24u) >> 24u) * scl1" : "f32(cd1) * scl1 + zro1"};
+        }
+        output[params.destWord + pair] = pack2x16float(vec2<f32>(val0, val1));
+      }
+    }
+    return;
+  }
+` : ""}  for (var k = 0u; k < REPLAY_RUN; k += ${LANES}u) {
     let slot = first + k + lid.x;
     if (slot < slots) { element(params, slot); }
   }

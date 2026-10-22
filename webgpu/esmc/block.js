@@ -139,7 +139,8 @@ export function linearGrid(rows, outer, rowTile = ROW_TILE) {
  */
 export function createLinearShader({ rows, inner, outer }, withResidual,
                                    weightPrecision = "f32", boundsTest = false,
-                                   rowTile = ROW_TILE, unroll = 4, kSplits = 1) {
+                                   rowTile = ROW_TILE, unroll = 4, kSplits = 1,
+                                   scaleInput = false) {
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown weight precision ${weightPrecision}`);
   }
@@ -200,11 +201,14 @@ export function createLinearShader({ rows, inner, outer }, withResidual,
     body.push(`      }`);
   }
 
+  const wBinding = scaleInput ? 2 : 1;
+  const resBinding = scaleInput ? 3 : 2;
+  const outBinding = (withResidual ? 3 : 2) + (scaleInput ? 1 : 0);
   return `${half ? "enable f16;\n" : ""}
 @group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
-${withResidual ? "@group(0) @binding(2) var<storage, read> residual: array<vec4<f32>>;" : ""}
-@group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> output: array<vec4<f32>>;
+${scaleInput ? "@group(0) @binding(1) var<storage, read> inputScale: array<f32>;\n" : ""}@group(0) @binding(${wBinding}) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+${withResidual ? `@group(0) @binding(${resBinding}) var<storage, read> residual: array<vec4<f32>>;` : ""}
+@group(0) @binding(${outBinding}) var<storage, read_write> output: array<vec4<f32>>;
 
 var<workgroup> staged: array<f32, ${rowTile * K_CHUNK}>;
 
@@ -224,7 +228,7 @@ ${split ? `  let k_start = group.z * ${span}u;
       let t = slot / ${K_CHUNK}u;
       let k = slot % ${K_CHUNK}u;
       let row = row_origin + t;
-      staged[slot] = select(0.0, input[row * ${inner}u + k0 + k],
+      staged[slot] = select(0.0, input[row * ${inner}u + k0 + k]${scaleInput ? " * inputScale[k0 + k]" : ""},
                             ${exactK ? `row < ${rows}u` : `row < ${rows}u && k0 + k < ${inner}u`});
     }
     workgroupBarrier();

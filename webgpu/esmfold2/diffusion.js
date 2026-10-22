@@ -129,22 +129,122 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * projections of the same normalised single: concatenating the matrices on the
  * host makes them one dispatch.
  */
-export function createAdaptiveCombineShader({ rows, channels }) {
+export function createAdaptiveCombineShader({ rows, channels }, epsilon = 1e-5) {
   return `
-@group(0) @binding(0) var<storage, read> normalisedActivation: array<f32>;
+@group(0) @binding(0) var<storage, read> activation: array<f32>;
 @group(0) @binding(1) var<storage, read> gateShift: array<f32>;
 @group(0) @binding(2) var<storage, read> gateBias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
+var<workgroup> sums: array<f32, ${LANES}>;
+var<workgroup> squares: array<f32, ${LANES}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row = group.x + group.y * ${GRID_WIDTH}u;
+  if (row >= ${rows}u) { return; }
+  let base = row * ${channels}u;
+  var total = 0.0;
+  var square = 0.0;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let value = activation[base + c];
+    total += value;
+    square += value * value;
+  }
+  sums[local.x] = total;
+  squares[local.x] = square;
+  workgroupBarrier();
+  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
+  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
+  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
+  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
+  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
+  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
+  let mean = sums[0] / ${channels}.0;
+  let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
+  let inverse = inverseSqrt(variance + ${epsilon});
+  let gsBase = row * ${channels * 2}u;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let normalised = (activation[base + c] - mean) * inverse;
+    let gate = gateShift[gsBase + c] + gateBias[c];
+    let shift = gateShift[gsBase + ${channels}u + c];
+    output[base + c] = normalised / (1.0 + exp(-gate)) + shift;
+  }
+}`;
+}
+
+function createBareLayerNormShader({ rows, channels }, epsilon = 1e-5) {
+  return `
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<f32>;
+
+var<workgroup> sums: array<f32, ${LANES}>;
+var<workgroup> squares: array<f32, ${LANES}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row = group.x + group.y * ${GRID_WIDTH}u;
+  if (row >= ${rows}u) { return; }
+  let base = row * ${channels}u;
+  var total = 0.0;
+  var square = 0.0;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let value = source[base + c];
+    total += value;
+    square += value * value;
+  }
+  sums[local.x] = total;
+  squares[local.x] = square;
+  workgroupBarrier();
+  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
+  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
+  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
+  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
+  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
+  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
+  let mean = sums[0] / ${channels}.0;
+  let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
+  let inverse = inverseSqrt(variance + ${epsilon});
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    destination[base + c] = (source[base + c] - mean) * inverse;
+  }
+}`;
+}
+
+function createSplitAddShader({ rows, outer, splits }) {
+  const vectors = rows * (outer / 4);
+  const terms = Array.from({ length: splits }, (_, z) => `partials[${z * vectors}u + slot]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec4<f32>>;
+
 @compute @workgroup_size(${LANES})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let i = id.x + id.y * ${GRID_WIDTH * LANES}u;
-  if (i >= ${rows * channels}u) { return; }
-  let row = i / ${channels}u;
-  let c = i % ${channels}u;
-  let gate = gateShift[row * ${channels * 2}u + c] + gateBias[c];
-  let shift = gateShift[row * ${channels * 2}u + ${channels}u + c];
-  output[i] = normalisedActivation[i] / (1.0 + exp(-gate)) + shift;
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${vectors}u) { return; }
+  output[slot] += ${terms};
+}`;
+}
+
+function createSplitGatedAddShader({ rows, outer, splits }) {
+  const vectors = rows * (outer / 4);
+  const vectorCols = outer / 4;
+  const terms = Array.from({ length: splits }, (_, z) => `partials[${z * vectors}u + slot]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> outGate: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> activation: array<vec4<f32>>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${vectors}u) { return; }
+  let delta = ${terms};
+  let gate = outGate[slot] + bias[slot % ${vectorCols}u];
+  activation[slot] += delta / (vec4<f32>(1.0) + exp(-gate));
 }`;
 }
 
@@ -230,14 +330,16 @@ export function createTokenAttentionShader({ tokens, channels, heads }) {
   const vecDim = headDim / 4;
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
-@group(0) @binding(1) var<storage, read> kv: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> context: array<f32>;
+@group(0) @binding(1) var<storage, read> queryBias: array<f32>;
+@group(0) @binding(2) var<storage, read> kv: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> gate: array<f32>;
+@group(0) @binding(5) var<storage, read_write> context: array<f32>;
 
 var<workgroup> staged_query: array<f32, ${headDim}>;
 var<workgroup> logits: array<f32, ${LANES}>;
 var<workgroup> reduce: array<f32, ${LANES}>;
-var<workgroup> accumulator: array<f32, ${headDim}>;
+${headDim <= LANES ? "" : `var<workgroup> accumulator: array<f32, ${headDim}>;`}
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -248,10 +350,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (token >= ${tokens}u) { return; }
   let lane = local.x;
 
-  for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
-    staged_query[d] = query[token * ${channels}u + head * ${headDim}u + d];
+${headDim <= LANES ? `  var acc = 0.0;
+  if (lane < ${headDim}u) {
+    let col = head * ${headDim}u + lane;
+    staged_query[lane] = query[token * ${channels}u + col] + queryBias[col];
+  }` : `  for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
+    let col = head * ${headDim}u + d;
+    staged_query[d] = query[token * ${channels}u + col] + queryBias[col];
     accumulator[d] = 0.0;
-  }
+  }`}
   workgroupBarrier();
 
   var running_max = -3.0e38;
@@ -322,14 +429,15 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
           total += logits[u] * kv[vBase + u * ${channels * 2}u];
         }
       }
-      accumulator[d] = accumulator[d] * rescale + total;
+      ${headDim <= LANES ? "acc = acc * rescale + total;" : "accumulator[d] = accumulator[d] * rescale + total;"}
     }
     workgroupBarrier();
   }
 
   let by = 1.0 / max(running_sum, 1.0e-30);
   for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
-    context[token * ${channels}u + head * ${headDim}u + d] = accumulator[d] * by;
+    let idx = token * ${channels}u + head * ${headDim}u + d;
+    context[idx] = (${headDim <= LANES ? "acc" : "accumulator[d]"} * by) / (1.0 + exp(-gate[idx]));
   }
 }`;
 }
@@ -685,8 +793,8 @@ export class Esmfold2DenoiserGpu {
         createBroadcastAddShader({ rows: tokens, channels: tokenChannels })),
       normOffset: get("token-norm-offset",
         createLayerNormShader({ rows: tokens, channels: tokenChannels }, true, epsilon)),
-      normScaleOnly: get("token-norm-scale",
-        createLayerNormShader({ rows: tokens, channels: tokenChannels }, false, epsilon)),
+      normBare: get("token-norm-bare",
+        createBareLayerNormShader({ rows: tokens, channels: tokenChannels }, epsilon)),
       // ...these read the narrowed weights; every other pipeline here
       // reads a norm, a bias or an atom stack's tensor and stays f32.
       squareResidual: get("square-residual",
@@ -696,18 +804,26 @@ export class Esmfold2DenoiserGpu {
         wide: get("wide",
           createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
                              false, weightPrecision, false, rowTile)),
+        wideScaled: get("wide-scaled",
+          createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
+                             false, weightPrecision, false, rowTile, 4, 1, true)),
         square: get("square",
           createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
                              false, weightPrecision, false, rowTile)),
         narrow: get("narrow",
           createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels },
                              false, weightPrecision, false, rowTile)),
+        addSingle: get("add-single", createAddShader(tokens * tokenChannels)),
         swiglu: get("swiglu",
           createSwigluShader({ rows: tokens, model: tokenChannels, ffn: hidden },
                              weightPrecision)),
+        gatedAdd: get("gated-add",
+          createGatedAddShader({ rows: tokens, channels: tokenChannels })),
       } : {
         wideSplit: get("wide-split", createLinearShader({ rows: tokens, inner: tokenChannels,
           outer: hidden }, false, weightPrecision, false, rowTile, 4, kSplits)),
+        wideScaledSplit: get("wide-scaled-split", createLinearShader({ rows: tokens,
+          inner: tokenChannels, outer: hidden }, false, weightPrecision, false, rowTile, 4, kSplits, true)),
         squareSplit: get("square-split", createLinearShader({ rows: tokens, inner: tokenChannels,
           outer: tokenChannels }, false, weightPrecision, false, rowTile, 4, kSplits)),
         narrowSplit: get("narrow-split", createLinearShader({ rows: tokens, inner: hidden,
@@ -716,20 +832,20 @@ export class Esmfold2DenoiserGpu {
           createSplitReduceShader({ rows: tokens, outer: hidden, splits: kSplits }, false)),
         reduceChannels: get("reduce-channels",
           createSplitReduceShader({ rows: tokens, outer: tokenChannels, splits: kSplits }, false)),
+        reduceAddSingle: get("reduce-add-single",
+          createSplitAddShader({ rows: tokens, outer: tokenChannels, splits: kSplits })),
+        reduceGatedAdd: get("reduce-gated-add",
+          createSplitGatedAddShader({ rows: tokens, outer: tokenChannels, splits: kSplits })),
         swigluSplit: get("swiglu-split", createLinearShader({ rows: tokens, inner: tokenChannels,
           outer: 2 * hidden }, false, weightPrecision, false, rowTile, 4, kSplits)),
         swigluReduce: get("swiglu-reduce",
           createSplitSwigluReduceShader({ rows: tokens, ffn: hidden, splits: kSplits })),
       }),
       gatedSingle: get("gated-single", createGatedProductShader(tokens * hidden)),
-      addSingle: get("add-single", createAddShader(tokens * tokenChannels)),
       adaptive: get("adaptive",
-        createAdaptiveCombineShader({ rows: tokens, channels: tokenChannels })),
+        createAdaptiveCombineShader({ rows: tokens, channels: tokenChannels }, epsilon)),
       attention: get("attention",
         createTokenAttentionShader({ tokens, channels: tokenChannels, heads: tokenHeads })),
-      sigmoidGate: get("sigmoid-gate", createSigmoidGateShader(tokens * tokenChannels)),
-      gatedAdd: get("gated-add",
-        createGatedAddShader({ rows: tokens, channels: tokenChannels })),
       tokenToAtom: get("token-to-atom",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: atomChannels }, false)),
       coordsProject: get("coords",
@@ -897,7 +1013,6 @@ export class Esmfold2DenoiserGpu {
     b.ranges = this.#upload("esmfold2.diff.ranges", ranges);
     b.atomToToken = this.#upload("esmfold2.diff.atom-to-token",
       Int32Array.from(features.atomToToken));
-    b.ones = this.#upload("esmfold2.diff.ones", new Float32Array(tokenChannels).fill(1));
     b.sInputs = this.#upload("esmfold2.diff.s-inputs", sInputs);
     b.joined = this.#alloc("esmfold2.diff.joined-coords", atoms * 6,
                            storage | GPUBufferUsage.COPY_DST);
@@ -1219,6 +1334,24 @@ export class Esmfold2DenoiserGpu {
     sNormScratch.release();
     this.allocations.splice(this.allocations.indexOf(sNormScratch), 1);
 
+    // ---- the atom stacks' adaLN modulations, which depend on cBase alone.
+    const siluCondScratch = this.#alloc("esmfold2.diff.atom-silu-cond", atoms * atomChannels);
+    const atomModPasses = [
+      ["atom-silu", pipelines.atomStack.silu,
+       [b.cBase, siluCondScratch], ...elementwise(atoms * atomChannels)],
+    ];
+    for (const block of [...encoderBlocks, ...decoderBlocks]) {
+      block.modulation = this.#alloc("esmfold2.diff.atom-mod", atoms * atomChannels * 6);
+      atomModPasses.push([
+        "atom-adaln", pipelines.atomStack.modulation,
+        [siluCondScratch, block.adaln, block.modulation],
+        ...linearGrid(atoms, atomChannels * 6),
+      ]);
+    }
+    await this.#now("esmfold2.diff.atom-modulation", atomModPasses);
+    siluCondScratch.release();
+    this.allocations.splice(this.allocations.indexOf(siluCondScratch), 1);
+
     // ---- the per-step scratch, allocated once so the program is a constant.
     const scratch = (label, elements) => this.#alloc(`esmfold2.diff.${label}`, elements);
     b.single = this.#alloc("esmfold2.diff.single", tokens * tokenChannels,
@@ -1236,7 +1369,6 @@ export class Esmfold2DenoiserGpu {
     b.kv = scratch("kv", tokens * tokenChannels * 2);
     b.gate = scratch("gate", tokens * tokenChannels);
     b.context = scratch("context", tokens * tokenChannels);
-    b.gatedContext = scratch("gated-context", tokens * tokenChannels);
     b.outGate = scratch("out-gate", tokens * tokenChannels);
     b.act = scratch("act", tokens * tokenChannels);
     b.tokenAct = scratch("token-act", tokens * tokenChannels);
@@ -1254,6 +1386,7 @@ export class Esmfold2DenoiserGpu {
       { atoms, channels: atomChannels, heads: atomHeads, hidden: atomHidden });
     const atomScratch = {};
     for (const [name, elements] of Object.entries(atomScratchSizes)) {
+      if (name === "siluCond" || name === "modulation") continue;
       atomScratch[name] = scratch(`atom.${name}`, elements);
     }
     this.buffers = b;
@@ -1270,6 +1403,24 @@ export class Esmfold2DenoiserGpu {
       record(`${label}.reduce`, outer === hidden ? pipelines.reduceHidden : pipelines.reduceChannels,
              [b.partials, output], ...elementwise(tokens * outer / 4));
     };
+    const gemmScaled = (label, kind, [input, scale, weights, output], outer) => {
+      const [x, y] = linearGrid(tokens, outer, rowTile);
+      if (kSplits === 1) return record(label, pipelines[`${kind}Scaled`], [input, scale, weights, output], x, y);
+      this.#record(label, pipelines[`${kind}ScaledSplit`], [input, scale, weights, b.partials], x, y, kSplits);
+      record(`${label}.reduce`, outer === hidden ? pipelines.reduceHidden : pipelines.reduceChannels,
+             [b.partials, output], ...elementwise(tokens * outer / 4));
+    };
+    const gemmGatedAdd = (label, kind, [input, weights], [outGate, bias, activation]) => {
+      const [x, y] = linearGrid(tokens, tokenChannels, rowTile);
+      if (kSplits === 1) {
+        record(label, pipelines[kind], [input, weights, b.delta], x, y);
+        return record(`${label}.add`, pipelines.gatedAdd, [b.delta, outGate, bias, activation],
+                      ...elementwise(tokens * tokenChannels));
+      }
+      this.#record(label, pipelines[`${kind}Split`], [input, weights, b.partials], x, y, kSplits);
+      record(`${label}.gated-add`, pipelines.reduceGatedAdd,
+             [b.partials, outGate, bias, activation], ...elementwise(tokens * tokenChannels / 4));
+    };
     this.program = [];
     this.program.push({ kind: "copy", from: b.singleBase, to: b.single,
                         bytes: tokens * tokenChannels * 4 });
@@ -1282,9 +1433,18 @@ export class Esmfold2DenoiserGpu {
       gemm("esmfold2.diff.s-b", "wide", [b.sNorm, block.bProjection, b.wideB], hidden);
       record("esmfold2.diff.s-gate", pipelines.gatedSingle, [b.wideA, b.wideB, b.wideG],
              ...elementwise(tokens * hidden));
-      gemm("esmfold2.diff.s-out", "narrow", [b.wideG, block.outProjection, b.delta], tokenChannels);
-      record("esmfold2.diff.s-add", pipelines.addSingle, [b.single, b.delta],
-             ...elementwise(tokens * tokenChannels));
+      const [sx, sy] = linearGrid(tokens, tokenChannels, rowTile);
+      if (kSplits === 1) {
+        record("esmfold2.diff.s-out", pipelines.narrow,
+               [b.wideG, block.outProjection, b.delta], sx, sy);
+        record("esmfold2.diff.s-add", pipelines.addSingle, [b.single, b.delta],
+               ...elementwise(tokens * tokenChannels));
+      } else {
+        this.#record("esmfold2.diff.s-out", pipelines.narrowSplit,
+                     [b.wideG, block.outProjection, b.partials], sx, sy, kSplits);
+        record("esmfold2.diff.s-out.add", pipelines.reduceAddSingle,
+               [b.partials, b.single], ...elementwise(tokens * tokenChannels / 4));
+      }
     }
 
     // 🔴 THE NOISY COORDINATES ENTER THE ACTIVATION AND NEVER THE CONDITIONING.
@@ -1309,43 +1469,36 @@ export class Esmfold2DenoiserGpu {
            [b.single, w.stepNormScale, w.stepNormOffset, b.sNorm], ...perRow(tokens));
     record("esmfold2.diff.step-project", pipelines.squareResidual,
            [b.sNorm, w.singleToToken, b.tokenAct, b.act], ...linearGrid(tokens, tokenChannels, rowTile));
+    record("esmfold2.diff.s-base-norm", pipelines.normBare,
+           [b.single, b.normSingle], ...perRow(tokens));
 
     for (let index = 0; index < tokenBlocks.length; index += 1) {
       const block = tokenBlocks[index];
       const attention = block.attention;
-      record("esmfold2.diff.attn-norm-act", pipelines.normScaleOnly,
-             [b.act, b.ones, b.normAct], ...perRow(tokens));
-      record("esmfold2.diff.attn-norm-single", pipelines.normScaleOnly,
-             [b.single, attention.adaln.singleScale, b.normSingle], ...perRow(tokens));
-      gemm("esmfold2.diff.attn-gate-shift", "wide", [b.normSingle, attention.adaln.gateShift, b.gateShift], tokenChannels * 2);
+      gemmScaled("esmfold2.diff.attn-gate-shift", "wide",
+                 [b.normSingle, attention.adaln.singleScale, attention.adaln.gateShift, b.gateShift],
+                 tokenChannels * 2);
       record("esmfold2.diff.attn-adaln", pipelines.adaptive,
-             [b.normAct, b.gateShift, attention.adaln.gateBias, b.modulated],
-             ...elementwise(tokens * tokenChannels));
+             [b.act, b.gateShift, attention.adaln.gateBias, b.modulated],
+             ...perRow(tokens));
       gemm("esmfold2.diff.attn-query", "square", [b.modulated, attention.queryWeights, b.query], tokenChannels);
-      record("esmfold2.diff.attn-query-bias", pipelines.broadcastAdd,
-             [attention.queryBias, b.query], ...elementwise(tokens * tokenChannels));
       gemm("esmfold2.diff.attn-kv", "wide", [b.modulated, attention.kvWeights, b.kv], tokenChannels * 2);
       gemm("esmfold2.diff.attn-gate", "square", [b.modulated, attention.gateWeights, b.gate], tokenChannels);
       record("esmfold2.diff.attend", pipelines.attention,
-             [b.query, b.kv, b.bias[index], b.context],
+             [b.query, attention.queryBias, b.kv, b.bias[index], b.gate, b.context],
              ...perRow(tokens * tokenHeads));
-      record("esmfold2.diff.attn-context-gate", pipelines.sigmoidGate,
-             [b.context, b.gate, b.gatedContext], ...elementwise(tokens * tokenChannels));
-      gemm("esmfold2.diff.attn-out", "square", [b.gatedContext, attention.outWeights, b.delta], tokenChannels);
       gemm("esmfold2.diff.attn-out-gate", "square", [b.single, attention.outGateWeights, b.outGate], tokenChannels);
-      record("esmfold2.diff.attn-add", pipelines.gatedAdd,
-             [b.delta, b.outGate, attention.outGateBias, b.act],
-             ...elementwise(tokens * tokenChannels));
+      gemmGatedAdd("esmfold2.diff.attn-out", "square",
+                   [b.context, attention.outWeights],
+                   [b.outGate, attention.outGateBias, b.act]);
 
       const transition = block.transition;
-      record("esmfold2.diff.ffn-norm-act", pipelines.normScaleOnly,
-             [b.act, b.ones, b.normAct], ...perRow(tokens));
-      record("esmfold2.diff.ffn-norm-single", pipelines.normScaleOnly,
-             [b.single, transition.adaln.singleScale, b.normSingle], ...perRow(tokens));
-      gemm("esmfold2.diff.ffn-gate-shift", "wide", [b.normSingle, transition.adaln.gateShift, b.gateShift], tokenChannels * 2);
+      gemmScaled("esmfold2.diff.ffn-gate-shift", "wide",
+                 [b.normSingle, transition.adaln.singleScale, transition.adaln.gateShift, b.gateShift],
+                 tokenChannels * 2);
       record("esmfold2.diff.ffn-adaln", pipelines.adaptive,
-             [b.normAct, b.gateShift, transition.adaln.gateBias, b.modulated],
-             ...elementwise(tokens * tokenChannels));
+             [b.act, b.gateShift, transition.adaln.gateBias, b.modulated],
+             ...perRow(tokens));
       if (kSplits === 1) {
         record("esmfold2.diff.ffn-swiglu", pipelines.swiglu,
                [b.modulated, transition.swishWeights, b.wideG], ...swigluGrid(tokens, hidden));
@@ -1356,11 +1509,10 @@ export class Esmfold2DenoiserGpu {
         record("esmfold2.diff.ffn-swiglu.reduce", pipelines.swigluReduce, [b.partials, b.wideG],
                ...elementwise(tokens * hidden / 4));
       }
-      gemm("esmfold2.diff.ffn-out", "narrow", [b.wideG, transition.outWeights, b.delta], tokenChannels);
       gemm("esmfold2.diff.ffn-out-gate", "square", [b.single, transition.outGateWeights, b.outGate], tokenChannels);
-      record("esmfold2.diff.ffn-add", pipelines.gatedAdd,
-             [b.delta, b.outGate, transition.outGateBias, b.act],
-             ...elementwise(tokens * tokenChannels));
+      gemmGatedAdd("esmfold2.diff.ffn-out", "narrow",
+                   [b.wideG, transition.outWeights],
+                   [b.outGate, transition.outGateBias, b.act]);
     }
 
     record("esmfold2.diff.token-norm", pipelines.normOffset,
