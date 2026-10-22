@@ -438,32 +438,38 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * pair. A 64 x 64 block on 256 lanes, 4 x 4 adjacent outputs a lane.
  */
 export function createAf3OpmVectorOutputShader({ biasAfterNorm = false } = {}) {
-  const BM = 64, BN = 64, BK = 16, AS = BM + 4;
-  const acc = [], reads = [], mul = [], stores = [];
+  const BM = 64, BN = 64, BK = 16, AS = BM + 2;
+  const acc = [], stores = [];
   for (let i = 0; i < 4; i += 1) {
-    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * 4u + ${i}u];`);
     acc.push(`  var acc_${i} = ${biasAfterNorm ? "vec4<f32>(0.0)" : "bias"};`);
-    mul.push(`      acc_${i} += a_${i} * b;`);
     stores.push(`  {
     let row = row_origin + ty * 4u + ${i}u;
     if (row < parameters.rows) {
       let pair = parameters.padding.x + row;
-      let at = pair * parameters.columns + column;
+      let at4 = (pair * parameters.columns + column) >> 2u;
       let count = counts[pair];
-${[0, 1, 2, 3].map((c) => biasAfterNorm
-    ? `      output[at + ${c}u] = acc_${i}.${"xyzw"[c]} / max(count, 1.0) + bias.${"xyzw"[c]};`
-    : `      output[at + ${c}u] = acc_${i}.${"xyzw"[c]} / (1.0e-3 + count);`).join("\n")}
+      output[at4] = ${biasAfterNorm
+        ? `acc_${i} / vec4<f32>(max(count, 1.0)) + bias`
+        : `acc_${i} / vec4<f32>(1.0e-3 + count)`};
     }
   }`);
   }
+  const innerSteps = Array.from({ length: BK }, (_, k) => `    {
+      let b = b_tile[${k * (BN / 4)}u + tx];
+      let a_base = ${k * AS}u + ty * 4u;
+      acc_0 += a_tile[a_base] * b;
+      acc_1 += a_tile[a_base + 1u] * b;
+      acc_2 += a_tile[a_base + 2u] * b;
+      acc_3 += a_tile[a_base + 3u] * b;
+    }`).join("\n");
   return `struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> counts: array<f32>;
 var<workgroup> a_tile: array<f32, ${AS * BK}>;
 var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
@@ -472,32 +478,30 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * ${BM}u;
   let column_origin = group.x * ${BN}u;
-  let tx = li % 16u;
-  let ty = li / 16u;
+  let tx = li & 15u;
+  let ty = li >> 4u;
   let column = column_origin + tx * 4u;
-  let b0 = parameters.bias_offset + column;
-  let bias = vec4<f32>(weights[b0], weights[b0 + 1u], weights[b0 + 2u], weights[b0 + 3u]);
+  let bias = weights[(parameters.bias_offset + column) >> 2u];
+  let a_m = li >> 2u;
+  let a_k4 = li & 3u;
+  let a_row = row_origin + a_m;
+  let a_valid = a_row < parameters.rows;
+  let a_src_base = a_row * (parameters.inner >> 2u) + a_k4;
+  let a_dst_base = (a_k4 * 4u) * ${AS}u + a_m;
+  let b_k = li >> 4u;
+  let b_cols4 = parameters.columns >> 2u;
+  let b_src_base = ((parameters.weight_offset + column_origin) >> 2u) + b_k * b_cols4 + (li & 15u);
 ${acc.join("\n")}
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
-    for (var e = li; e < ${BM * BK}u; e += 256u) {
-      let m = e / ${BK}u;
-      let row = row_origin + m;
-      var value = 0.0;
-      if (row < parameters.rows) { value = source[row * parameters.inner + k0 + e % ${BK}u]; }
-      a_tile[(e % ${BK}u) * ${AS}u + m] = value;
-    }
-    for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
-      let base = parameters.weight_offset + (k0 + e / ${BN / 4}u) * parameters.columns
-        + column_origin + (e % ${BN / 4}u) * 4u;
-      b_tile[e] = vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u],
-                            weights[base + 3u]);
-    }
+    var a_vec = vec4<f32>(0.0);
+    if (a_valid) { a_vec = source[a_src_base + (k0 >> 2u)]; }
+    a_tile[a_dst_base] = a_vec.x;
+    a_tile[a_dst_base + ${AS}u] = a_vec.y;
+    a_tile[a_dst_base + ${2 * AS}u] = a_vec.z;
+    a_tile[a_dst_base + ${3 * AS}u] = a_vec.w;
+    b_tile[li] = weights[b_src_base + k0 * b_cols4];
     workgroupBarrier();
-    for (var k = 0u; k < ${BK}u; k += 1u) {
-      let b = b_tile[k * ${BN / 4}u + tx];
-${reads.join("\n")}
-${mul.join("\n")}
-    }
+${innerSteps}
     workgroupBarrier();
   }
 ${stores.join("\n")}

@@ -261,7 +261,7 @@ export class Af3MsaStackGpu {
     // knob AF2's contraction answers to.
     const useOpmVector = opmTuning.opmVectorContract !== false
       && pairChannels % 64 === 0 && (outerChannels * outerChannels) % 16 === 0
-      && outerChannels % 4 === 0;
+      && outerChannels % 4 === 0 && opmOffsets.outputW % 4 === 0 && opmOffsets.outputB % 4 === 0;
     // ...the contraction GEMM in f16 arithmetic on the device's block where this stack's f16 policy is on, as AF2's
     // (webgpu/af2/evoformer/block.js: a k step's BK sequences' products summed in f16, then into f32). M5, stock
     // flags, 300 tokens x 1024 rows: see the commit that made it. `opmVectorArithmetic: "f32"` is the control.

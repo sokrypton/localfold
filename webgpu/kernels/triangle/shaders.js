@@ -743,11 +743,11 @@ ${contractStores}
           if (${pfx}_r2 < L) { staged.z = f16(${load(`${pfx}_r2`)} * 0.0625); }
         }
       }
-      ${tile}[${kLane} * 16u + ${lane}] = staged;
+      ${tile}[${kLane} * 17u + ${lane}] = staged;
     }`;
     const f16Inner = Array.from({ length: 16 }, (_, k) => `    {
-      let left = tile_a[${k * 16}u + local.y];
-      let right = tile_b[${k * 16}u + local.x];
+      let left = tile_a[${k * 17}u + local.y];
+      let right = tile_b[${k * 17}u + local.x];
       part_0 = fma(vec4<f16>(left.x), right, part_0);
       part_1 = fma(vec4<f16>(left.y), right, part_1);
       part_2 = fma(vec4<f16>(left.z), right, part_2);
@@ -769,9 +769,9 @@ ${contractStores}
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 ${channelChunked ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
-// [k][lane]: a's four rows a lane owns (lane + 16 r), and b's four columns
-var<workgroup> tile_a: array<vec4<f16>, 256>;
-var<workgroup> tile_b: array<vec4<f16>, 256>;
+// [k][lane]: a's four rows a lane owns (lane + 16 r), and b's four columns (stride 17 avoids 16-way bank conflicts)
+var<workgroup> tile_a: array<vec4<f16>, 272>;
+var<workgroup> tile_b: array<vec4<f16>, 272>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(

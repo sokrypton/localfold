@@ -182,6 +182,8 @@ export class Esmfold2TrunkGpu {
     // other five kernels together - and at this track's 256 channels the fused
     // kernel loses to the split by 2.89x. See webgpu/af3/trunk/transition.js.
     const transitionFactor = options.transitionFactor ?? 4;
+    // (this device's raced answers - the contraction's arithmetic among them - before anything compiles)
+    await settleGridAttendTiling(this.device);
     const tuning = deviceTuning(this.device);
     const splitConfig = deviceMatrixConfig(this.device, { element: "f16" });
     // ...and the block the staged GEMMs share, from the profile; see
@@ -236,7 +238,7 @@ export class Esmfold2TrunkGpu {
     // 🔴 AND WITHOUT MATRIX UNITS, THE VECTOR SPLIT - the same rule the AF3
     // pair track takes from splitTransitionConfig, and the reason: no stock
     // browser has matrix units, so this was the fused kernel for every visitor.
-    const pairTransitionSplit = splitConfig === null
+    const pairTransitionSplit = (splitConfig === null || tuning.matrixLinear === false)
       // ...multiplying in f16 where this trunk stages and accumulates in f16 (the table above): 1.66x on the GEMM
       // that is half this trunk on an Apple part - see vectorGemmBlockStorage in webgpu/af3/trunk/transition.js
       ? splitTransitionConfig(this.device, channels, {
@@ -248,8 +250,6 @@ export class Esmfold2TrunkGpu {
             tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
             ...narrowed }
         : false;
-    // (this device's raced answers - the contraction's arithmetic among them - before anything compiles)
-    await settleGridAttendTiling(this.device);
     const triangleContractArithmetic = stagedPrecision === "f16" && accumulatePrecision === "f16"
       && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32";
     const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`

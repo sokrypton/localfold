@@ -1278,7 +1278,7 @@ export function splitTransitionConfig(device, channels, { f32Only = false, arith
   // ...and the MATRIX split too, now, unless a prior refused it: past the
   // width rule below it was the ampere prior's alone, so a T4 with matrix
   // units ran IntelliFold-2's transition on the vector split.
-  const config = f32Only || tuning.pairTransitionSplit === false ? null
+  const config = f32Only || tuning.pairTransitionSplit === false || tuning.matrixLinear === false ? null
     : deviceMatrixConfig(device, { element: "f16" });
   // 🔴 THE VECTOR SPLIT IN f16 ARITHMETIC PAYS FROM AF3's 128 CHANNELS, where the f32 one starts at 192 - see
   // VECTOR_F16_SPLIT_MIN_CHANNELS. The width rule below is every other path's.
