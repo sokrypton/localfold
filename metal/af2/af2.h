@@ -49,7 +49,7 @@ struct Trunk {
   struct { half *msa = nullptr, *extra = nullptr, *pair = nullptr; } h;   // the evoformer's half activations, where used
 };
 void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos);
-void evoformerBlock(Trunk& t, bool extraStack, int blk);
+void evoformerBlock(Trunk& t, bool extraStack, int blk, const std::string& nextPairNorm = "", int nextPairBlk = 0);
 // the pair modules, shared with the template stacks
 // nextNorm: the next update's pair norm, emitted by this one's last GEMM where the matrix units run it
 void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,

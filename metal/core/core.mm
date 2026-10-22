@@ -958,11 +958,11 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
 static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
                    float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
-  if (!on || !tensorWanted() || rows <= 128 || out % 4 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
+  if (!on || !tensorWanted() || rows <= 128 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
-  a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192 | 4; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
+  a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
   ++D().stats.gemms;
   gemmTensorRun(tp, a, 1, true, "opm output, normalised add");
   return true;

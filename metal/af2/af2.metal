@@ -65,38 +65,78 @@ kernel void af2_pair_mask(LF_ARGS(PairMaskArgs)) {
 
 // ---------------------------------------------------------------- the Evoformer
 // out [H][L][stride]: rows padded with -inf to `stride` (a whole key tile: the attention's last tile masks through it)
-kernel void af2_bias_layout(LF_ARGS(BiasLayoutArgs)) {
-  uint t = (uint)LF_INDEX;
-  const uint S = a.stride;
-  if (t >= a.L * S * a.H) return;
-  uint hi = lf_udiv(t, S), j = t - hi * S, h = lf_udiv(hi, a.L), i = hi - h * a.L;
-  if (j >= a.L) { a.out[t] = -INFINITY; return; }
-  const uint si = a.transposed ? j : i, sj = a.transposed ? i : j, ij = si * a.L + sj;
-  float v = a.proj[ij * a.H + h] + (a.pairMask ? 1e9f * (a.pairMask[ij] - 1.f) : 0.f);
-  a.out[t] = (half)max(v * M_LOG2E_F, -6e4f);
+kernel void af2_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+  const uint j0 = tg.x * 32, i0 = tg.y * 32, h = tg.z, tx = tid & 31, ty = tid >> 5;
+  if (!a.transposed) {
+    for (uint r = ty; r < 32; r += 8) {
+      const uint i = i0 + r, j = j0 + tx;
+      if (i < a.L && j < a.stride) {
+        if (j >= a.L) a.out[((ulong)h * a.L + i) * a.stride + j] = -INFINITY;
+        else {
+          const uint ij = i * a.L + j;
+          float v = a.proj[ij * a.H + h] + (a.pairMask ? 1e9f * (a.pairMask[ij] - 1.f) : 0.f);
+          a.out[((ulong)h * a.L + i) * a.stride + j] = (half)max(v * M_LOG2E_F, -6e4f);
+        }
+      }
+    }
+    return;
+  }
+  threadgroup float tile[32][33];
+  for (uint r = ty; r < 32; r += 8) {
+    const uint sr = j0 + r, sc = i0 + tx;
+    if (sr < a.L && sc < a.L) {
+      const uint ij = sr * a.L + sc;
+      tile[r][tx] = a.proj[ij * a.H + h] + (a.pairMask ? 1e9f * (a.pairMask[ij] - 1.f) : 0.f);
+    } else tile[r][tx] = 0.f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = ty; r < 32; r += 8) {
+    const uint i = i0 + r, j = j0 + tx;
+    if (i < a.L && j < a.stride)
+      a.out[((ulong)h * a.L + i) * a.stride + j] = j < a.L ? (half)max(tile[tx][r] * M_LOG2E_F, -6e4f) : -INFINITY;
+  }
 }
-// gemmTriGate's weight from AF2's [a | b] halves: channel c's (pa ga pb gb) in blocks of 8, and their biases
+// gemmTriGate's weight from AF2's [a | b] halves: channel c's (pa ga pb gb) in blocks of 8 (or quarters), and their biases, 8 columns (uint4) a thread
 kernel void af2_trigate_weight(LF_ARGS(TriGateW2Args)) {
-  uint t = (uint)LF_INDEX, W = 4 * a.C;
-  if (t >= a.C * W) return;
-  uint r = lf_udiv(t, W), col = t - r * W, kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8;
+  uint t = (uint)LF_INDEX, W8 = a.C / 2, blockStride = a.C * W8;
+  if (t >= a.B * blockStride) return;
+  uint blk = lf_udiv(t, blockStride), rem = t - blk * blockStride;
+  uint r = lf_udiv(rem, W8), col8 = rem - r * W8, col = col8 * 8;
+  uint oc = col;
+  if (a.quarters) {
+    uint tq = col / 128, p = (col % 128) / 32, ch = tq * 32 + col % 32;
+    oc = (ch / 8) * 32 + p * 8 + ch % 8;
+  }
+  uint kind = (oc % 32) / 8, c = 8 * (oc / 32);
   uint side = kind == 0 || kind == 1 ? 0 : 1;         // pa ga: a's; pb gb: b's
   bool gate = kind == 1 || kind == 3;
-  a.w4[t] = gate ? a.gate[r * 2 * a.C + side * a.C + c] : a.proj[r * 2 * a.C + side * a.C + c];
-  if (r == 0) a.b4[col] = gate ? a.gb[side * a.C + c] : a.pb[side * a.C + c];
+  ulong wOff8 = (((ulong)blk * a.C + r) * 2 * a.C + side * a.C + c) / 8;
+  ((device uint4*)a.w4)[t] = ((device const uint4*)(gate ? a.gate : a.proj))[wOff8];
+  if (r == 0) {
+    ulong bOff = (ulong)blk * 2 * a.C + side * a.C + c;
+    device const float4* srcB = (device const float4*)((gate ? a.gb : a.pb) + bOff);
+    device float4* dstB = (device float4*)(a.b4 + (ulong)blk * 4 * a.C + col);
+    dstB[0] = srcB[0]; dstB[1] = srcB[1];
+  }
 }
-// q, k, v, gate [C][W] each -> [C][4W] (the attention's one projection)
+// q, k, v, gate [B][C][W] each -> [B][C][4W] (the attention's one projection) and its [B][4W] gate bias, 8 columns (uint4) a thread
 kernel void af2_qkvg_weight(LF_ARGS(QkvgWArgs)) {
-  uint t = (uint)LF_INDEX, W4 = 4 * a.W;
-  if (t >= a.C * W4) return;
-  uint c = lf_udiv(t, W4), col = t - c * W4, role = col / a.W, w = col - role * a.W;
-  device const half* src = role == 0 ? a.q : role == 1 ? a.k : role == 2 ? a.v : a.g;
-  a.out[t] = src[c * a.W + w];
-}
-kernel void af2_gate_bias(LF_ARGS(GateBiasArgs)) {      // [4W]: the gate's bias, zeros elsewhere
-  uint t = (uint)LF_INDEX;
-  if (t >= 4 * a.W) return;
-  a.out[t] = t >= 3 * a.W ? a.gb[t - 3 * a.W] : 0.f;
+  uint t = (uint)LF_INDEX, W8 = a.W / 8, W4_8 = 4 * W8, blockStride = a.C * W4_8;
+  if (t >= a.B * blockStride) return;
+  uint blk = lf_udiv(t, blockStride), rem = t - blk * blockStride;
+  uint c = lf_udiv(rem, W4_8), col8 = rem - c * W4_8, role = lf_udiv(col8, W8), w8 = col8 - role * W8;
+  device const uint4* src = (device const uint4*)(role == 0 ? a.q : role == 1 ? a.k : role == 2 ? a.v : a.g);
+  ((device uint4*)a.out)[t] = src[((ulong)blk * a.C + c) * W8 + w8];
+  if (c == 0) {
+    device float4* dstB = (device float4*)(a.b + ((ulong)blk * W4_8 + col8) * 8);
+    if (role == 3) {
+      device const float4* srcB = (device const float4*)(a.gb + ((ulong)blk * W8 + w8) * 8);
+      dstB[0] = srcB[0]; dstB[1] = srcB[1];
+    } else {
+      dstB[0] = float4(0.f); dstB[1] = float4(0.f);
+    }
+  }
 }
 kernel void af2_scale_rows_h(LF_ARGS(ScaleRowsHArgs)) {
   ulong t = LF_INDEX;
@@ -123,22 +163,46 @@ kernel void af2_opm_permute(LF_ARGS(OpmPermuteArgs)) {
   uint i = lf_udiv(r2, a.L), j = r2 - i * a.L;
   ((device uint4*)a.X)[t] = ((device const uint4*)a.Pm)[(((ulong)i * a.O + c) * ((ulong)a.L * a.O) + (ulong)j * a.O) / 8 + e8];
 }
-// pair[i][j] += (bias + Y) / (1e-3 + norm[i][j]), rows i0..
+// pair[i][j] += (bias + Y) / (1e-3 + norm[i][j]), rows i0.., 4 channels (float4) a thread (one 32-lane simdgroup a pair row)
 kernel void af2_opm_add(LF_ARGS(OpmAddArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= (ulong)a.bi * a.L * a.C) return;
-  uint ij = lf_udiv((uint)t, a.C), f = (uint)t - ij * a.C, ii = lf_udiv(ij, a.L), j = ij - ii * a.L;
-  ulong i = a.i0 + ii;
-  a.pair[(i * a.L + j) * a.C + f] += (a.bias[f] + a.Y[t]) / (1e-3f + a.norm[i * a.L + j]);
+  ulong t = LF_INDEX, rows = (ulong)a.bi * a.L, row = t >> 5;
+  if (row >= rows) return;
+  uint f4 = (uint)(t & 31);
+  ulong pairIdx = (ulong)a.i0 * a.L + row;
+  float d = 1e-3f + a.norm[pairIdx];
+  float4 b = ((device const float4*)a.bias)[f4];
+  float4 y = ((device const float4*)a.Y)[t];
+  device float4* p = (device float4*)a.pair + pairIdx * 32 + f4;
+  float4 r = *p + (b + y) / d;
+  *p = r;
+  if (a.lnOut) {
+    float mean = simd_sum(r.x + r.y + r.z + r.w) * (1.f / 128.f);
+    float4 diff = r - mean;
+    float inv = rsqrt(simd_sum(dot(diff, diff)) * (1.f / 128.f) + 1e-5f);
+    float4 n = diff * inv * ((device const float4*)a.lnScale)[f4] + ((device const float4*)a.lnOffset)[f4];
+    ((device half4*)a.lnOut)[pairIdx * 32 + f4] = half4(n);
+  }
 }
 // (the same into a half pair - the evoformer's half activations: summed in float, rounded once, saturating)
 kernel void af2_opm_add_h(LF_ARGS(OpmAddHArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= (ulong)a.bi * a.L * a.C) return;
-  uint ij = lf_udiv((uint)t, a.C), f = (uint)t - ij * a.C, ii = lf_udiv(ij, a.L), j = ij - ii * a.L;
-  ulong i = a.i0 + ii;
-  device half* p = a.pair + (i * a.L + j) * a.C + f;
-  *p = (half)clamp((float)*p + (a.bias[f] + a.Y[t]) / (1e-3f + a.norm[i * a.L + j]), -65504.f, 65504.f);
+  ulong t = LF_INDEX, rows = (ulong)a.bi * a.L, row = t >> 5;
+  if (row >= rows) return;
+  uint f4 = (uint)(t & 31);
+  ulong pairIdx = (ulong)a.i0 * a.L + row;
+  float d = 1e-3f + a.norm[pairIdx];
+  float4 b = ((device const float4*)a.bias)[f4];
+  float4 y = ((device const float4*)a.Y)[t];
+  device half4* p = (device half4*)a.pair + pairIdx * 32 + f4;
+  half4 h = half4(clamp(float4(*p) + (b + y) / d, -65504.f, 65504.f));
+  *p = h;
+  if (a.lnOut) {
+    float4 r = float4(h);
+    float mean = simd_sum(r.x + r.y + r.z + r.w) * (1.f / 128.f);
+    float4 diff = r - mean;
+    float inv = rsqrt(simd_sum(dot(diff, diff)) * (1.f / 128.f) + 1e-5f);
+    float4 n = diff * inv * ((device const float4*)a.lnScale)[f4] + ((device const float4*)a.lnOffset)[f4];
+    ((device half4*)a.lnOut)[pairIdx * 32 + f4] = half4(n);
+  }
 }
 // lt [s][i][c] -> [i][c][s] (scaled): the shallow outer product's left operand
 kernel void af2_opm_left(LF_ARGS(OpmLeftArgs)) {
@@ -449,16 +513,21 @@ kernel void af2_identity_rigid(LF_ARGS(IdentityRigidArgs)) {
   for (int k = 0; k < 12; ++k) x[k] = 0;
   x[0] = x[4] = x[8] = 1;
 }
-// points [L, H*3*P] (per head: x[0:P] y[P:2P] z[2P:3P]) -> global [L, H, P, 3]
+// points [L, ldp] (q_point [H*3*Pq] | k_point [H*3*Pq] | v_point [H*3*Pv]) -> global qp, kp, vp [L, H, P, 3]
 kernel void af2_points_global(LF_ARGS(PointsGlobalArgs)) {
   uint t = (uint)LF_INDEX;
-  if (t >= a.L * a.H * a.P) return;
-  uint p = t % a.P, r = t / a.P, h = r % a.H, i = r / a.H;
-  device const float* s = a.proj + (ulong)i * a.H * 3 * a.P + h * 3 * a.P;
+  uint Ptot = 2 * a.Pq + a.Pv;
+  if (t >= a.L * a.H * Ptot) return;
+  uint r = lf_udiv(t, Ptot), pt = t - r * Ptot, i = lf_udiv(r, a.H), h = r - i * a.H;
+  uint P = pt < 2 * a.Pq ? a.Pq : a.Pv;
+  uint p = pt < a.Pq ? pt : pt < 2 * a.Pq ? pt - a.Pq : pt - 2 * a.Pq;
+  uint off = pt < a.Pq ? 0 : pt < 2 * a.Pq ? a.H * 3 * a.Pq : 2 * a.H * 3 * a.Pq;
+  device const float* s = a.proj + (ulong)i * a.ldp + off + h * 3 * P;
   float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[i * 12 + k];
-  float loc[3] = {s[p], s[a.P + p], s[2 * a.P + p]}, g[3];
+  float loc[3] = {s[p], s[P + p], s[2 * P + p]}, g[3];
   rapply(rig, loc, g);
-  for (int k = 0; k < 3; ++k) a.out[(ulong)t * 3 + k] = g[k];
+  device float* dst = (pt < a.Pq ? a.qp : pt < 2 * a.Pq ? a.kp : a.vp) + (((ulong)i * a.H + h) * P + p) * 3;
+  for (int k = 0; k < 3; ++k) dst[k] = g[k];
 }
 // IPA logits -> weights, a simdgroup a (query, head): [q, h, k]
 kernel void af2_ipa_weights(constant IpaWeightsArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
@@ -466,8 +535,9 @@ kernel void af2_ipa_weights(constant IpaWeightsArgs& a [[buffer(0)]], uint3 tg [
                             uint lane [[thread_index_in_simdgroup]]) {
   uint wid = (tg.y * ng.x + tg.x) * 8 + sg;
   if (wid >= a.L * a.H) return;
-  uint h = wid % a.H, q = wid / a.H;
+  uint q = lf_udiv(wid, a.H), h = wid - q * a.H;
   device float* row = a.attn + ((ulong)q * a.H + h) * a.L;
+  device const float* qh = a.qs + (ulong)q * a.lds + h * a.Cs;
   float mx = -1e30f, w = a.pw[h];
   for (uint k = lane; k < a.L; k += 32) {
     float d2 = 0;
@@ -477,7 +547,8 @@ kernel void af2_ipa_weights(constant IpaWeightsArgs& a [[buffer(0)]], uint3 tg [
         d2 += d * d;
       }
     float s = -0.5f * w * d2, sc = 0;
-    for (uint c = 0; c < a.Cs; ++c) sc += a.qs[((ulong)q * a.H + h) * a.Cs + c] * a.ks[((ulong)k * a.H + h) * a.Cs + c];
+    device const float* kh = a.ks + (ulong)k * a.lds + h * a.Cs;
+    for (uint c = 0; c < a.Cs; ++c) sc += (qh[c] * a.qScale) * kh[c];
     s += sc + a.b2d[((ulong)q * a.L + k) * a.H + h];
     s -= 1e5f * (1.f - a.seqMask[q] * a.seqMask[k]);
     s *= sqrt(1.f / 3.f);
@@ -490,35 +561,82 @@ kernel void af2_ipa_weights(constant IpaWeightsArgs& a [[buffer(0)]], uint3 tg [
   sum = simd_sum(sum);
   for (uint k = lane; k < a.L; k += 32) row[k] /= sum;
 }
-// IPA's outputs, a threadgroup a (query, head): [result_scalar | point local x | y | z | norms | over 2d]
+// IPA's outputs, two threadgroups per query q (tg.y == 0: pair C2 across all 12 heads + points; tg.y == 1: scalars):
+// [result_scalar | point local x | y | z | norms | over 2d]
 kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint tid [[thread_index_in_threadgroup]]) {
-  uint q = tg.x / a.H, h = tg.x % a.H;
-  device const float* at = a.attn + ((ulong)q * a.H + h) * a.L;
-  uint Fw = a.H * a.Cs + 4 * a.H * a.Pv + a.H * a.C2;
+  const uint q = tg.x, H = a.H, Cs = a.Cs, Pv = a.Pv, C2 = a.C2;
+  const uint Fw = H * Cs + 4 * H * Pv + H * C2;
   device float* f = a.fin + (ulong)q * Fw;
-  for (uint c = tid; c < a.Cs; c += 128) {
-    float s = 0;
-    for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[((ulong)k * a.H + h) * a.Cs + c];
-    f[h * a.Cs + c] = s;
+  if (C2 == 128 && H == 12 && Pv == 8 && Cs == 16) {
+    if (tg.y == 0) {
+      if (tid < 128) {
+        uint c = tid;
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f,
+              s6 = 0.f, s7 = 0.f, s8 = 0.f, s9 = 0.f, s10 = 0.f, s11 = 0.f;
+        device const float* at = a.attn + (ulong)q * 12 * a.L;
+        for (uint k = 0; k < a.L; ++k) {
+          float v = a.act2d[((ulong)q * a.L + k) * 128 + c];
+          s0  += at[0 * a.L + k] * v; s1  += at[1 * a.L + k] * v; s2  += at[2 * a.L + k] * v; s3  += at[3 * a.L + k] * v;
+          s4  += at[4 * a.L + k] * v; s5  += at[5 * a.L + k] * v; s6  += at[6 * a.L + k] * v; s7  += at[7 * a.L + k] * v;
+          s8  += at[8 * a.L + k] * v; s9  += at[9 * a.L + k] * v; s10 += at[10 * a.L + k] * v; s11 += at[11 * a.L + k] * v;
+        }
+        device float* fp = f + 12 * 16 + 4 * 12 * 8 + c;
+        fp[0 * 128] = s0; fp[1 * 128] = s1; fp[2 * 128] = s2; fp[3 * 128] = s3;
+        fp[4 * 128] = s4; fp[5 * 128] = s5; fp[6 * 128] = s6; fp[7 * 128] = s7;
+        fp[8 * 128] = s8; fp[9 * 128] = s9; fp[10 * 128] = s10; fp[11 * 128] = s11;
+      } else if (tid < 128 + 96) {
+        uint hp = tid - 128, h = hp >> 3, p = hp & 7;
+        device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
+        float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
+        float g[3] = {0, 0, 0};
+        for (uint k = 0; k < a.L; ++k) {
+          float w = at[k];
+          device const float* vp = a.vp + (((ulong)k * 12 + h) * 8 + p) * 3;
+          g[0] += w * vp[0]; g[1] += w * vp[1]; g[2] += w * vp[2];
+        }
+        float loc[3];
+        rapplyInv(rig, g, loc);
+        uint base = 12 * 16, idx = h * 8 + p;
+        f[base + idx] = loc[0];
+        f[base + 96 + idx] = loc[1];
+        f[base + 192 + idx] = loc[2];
+        f[base + 288 + idx] = sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+      }
+    } else if (tid < 192) {
+      uint h = tid >> 4, c = tid & 15;
+      device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
+      float s = 0.f;
+      for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[(ulong)k * a.ldv + h * 16 + c];
+      f[h * 16 + c] = s;
+    }
+    return;
   }
-  float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
-  for (uint p = tid; p < a.Pv; p += 128) {
-    float g[3] = {0, 0, 0};
-    for (uint k = 0; k < a.L; ++k)
-      for (int x = 0; x < 3; ++x) g[x] += at[k] * a.vp[(((ulong)k * a.H + h) * a.Pv + p) * 3 + x];
-    float loc[3];
-    rapplyInv(rig, g, loc);
-    uint base = a.H * a.Cs, idx = h * a.Pv + p;
-    f[base + idx] = loc[0];
-    f[base + a.H * a.Pv + idx] = loc[1];
-    f[base + 2 * a.H * a.Pv + idx] = loc[2];
-    f[base + 3 * a.H * a.Pv + idx] = sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
-  }
-  for (uint c = tid; c < a.C2; c += 128) {
-    float s = 0;
-    for (uint k = 0; k < a.L; ++k) s += at[k] * a.act2d[((ulong)q * a.L + k) * a.C2 + c];
-    f[a.H * a.Cs + 4 * a.H * a.Pv + h * a.C2 + c] = s;
+  for (uint h = tg.y; h < H; h += 2) {
+    device const float* at = a.attn + ((ulong)q * H + h) * a.L;
+    for (uint c = tid; c < Cs; c += 256) {
+      float s = 0;
+      for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[(ulong)k * a.ldv + h * Cs + c];
+      f[h * Cs + c] = s;
+    }
+    float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
+    for (uint p = tid; p < Pv; p += 256) {
+      float g[3] = {0, 0, 0};
+      for (uint k = 0; k < a.L; ++k)
+        for (int x = 0; x < 3; ++x) g[x] += at[k] * a.vp[(((ulong)k * H + h) * Pv + p) * 3 + x];
+      float loc[3];
+      rapplyInv(rig, g, loc);
+      uint base = H * Cs, idx = h * Pv + p;
+      f[base + idx] = loc[0];
+      f[base + H * Pv + idx] = loc[1];
+      f[base + 2 * H * Pv + idx] = loc[2];
+      f[base + 3 * H * Pv + idx] = sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+    }
+    for (uint c = tid; c < C2; c += 256) {
+      float s = 0;
+      for (uint k = 0; k < a.L; ++k) s += at[k] * a.act2d[((ulong)q * a.L + k) * C2 + c];
+      f[H * Cs + 4 * H * Pv + h * C2 + c] = s;
+    }
   }
 }
 // the backbone update: QuatRigid's (qx qy qz tx ty tz), qw = 1, normalised; rigid = rigid @ update

@@ -125,16 +125,16 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
 // one attention block's q | k | v | gate as one [C][4W] f16 weight, and its bias (the gate's, zeros elsewhere)
 struct AttnW { const half* qkvg; const float* bias; int H, D; };
 static AttnW attnWeights(const std::string& A, int blk, int C) {
+  int B = blk < 0 ? 1 : (int)dimW(A + "/query_w", 0);
   int H = (int)dimW(A + "/query_w", blk < 0 ? 1 : 2), D = (int)dimW(A + "/query_w", blk < 0 ? 2 : 3), W = H * D;
-  std::string key = A + "#" + std::to_string(blk);
-  const half* w = M.derived<half>("qkvg:" + key, (size_t)C * 4 * W, [&](half* out) {
-    run1d("af2_qkvg_weight", (size_t)C * 4 * W, QkvgWArgs{PH(A + "/query_w", blk), PH(A + "/key_w", blk), PH(A + "/value_w", blk),
-                                                           PH(A + "/gating_w", blk), out, (uint)C, (uint)W});
+  size_t b = blk < 0 ? 0 : (size_t)blk;
+  half* w = M.derived<half>("qkvg:" + A, (size_t)B * C * 4 * W, [](half*) {});
+  float* bias = M.derived<float>("qkvgb:" + A, (size_t)B * 4 * W, [&](float* bOut) {
+    run1d("af2_qkvg_weight", (size_t)B * C * (W / 2),
+          QkvgWArgs{PH(A + "/query_w"), PH(A + "/key_w"), PH(A + "/value_w"), PH(A + "/gating_w"), P(A + "/gating_b"),
+                    w, bOut, (uint)C, (uint)W, (uint)B, 0});
   });
-  const float* b = M.derived<float>("qkvgb:" + key, (size_t)4 * W, [&](float* out) {
-    run1d("af2_gate_bias", (size_t)4 * W, GateBiasArgs{P(A + "/gating_b", blk), out, (uint)W, 0});
-  });
-  return {w, b, H, D};
+  return {w + b * C * 4 * W, bias + b * 4 * W, H, D};
 }
 // a pair bias's row stride: padded with -inf to a whole 64-key tile (af2_bias_layout; the attention's NT kernel, core.mm)
 static int biasStride(int L) { return (L + 63) / 64 * 64; }
@@ -192,7 +192,8 @@ static half* pairBias(const T* pair, int L, int C, const std::string& normW, con
   // (rows padded with -inf to a whole 64-key tile: biasStride(L), and the attention's NT kernel - core.mm)
   const int S = biasStride(L);
   half* b = scratch<half>("bias.b", (size_t)H * L * S);
-  run1d("af2_bias_layout", (size_t)H * L * S, BiasLayoutArgs{proj, pairMask, b, (uint)L, (uint)H, transposed ? 1u : 0u, (uint)S});
+  run("af2_bias_layout", Grid{(uint32_t)((S + 31) / 32), (uint32_t)((L + 31) / 32), (uint32_t)H}, 256,
+      BiasLayoutArgs{proj, pairMask, b, (uint)L, (uint)H, transposed ? 1u : 0u, (uint)S});
   return b;
 }
 
@@ -226,11 +227,11 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
   half* xn = scratch<half>("gcol.xn", rows * C);
   layerNormW(msa, xn, rows, C, A + "/query_norm", blk);
   // every sequence's key and value (shared by the heads): one GEMM against [key_w | value_w]
-  std::string key = A + "#" + std::to_string(blk);
-  const half* kvw = M.derived<half>("kv:" + key, (size_t)C * 2 * D, [&](half* out) {
-    copy2d(out, 2 * D * 2, PH(A + "/attention/key_w", blk), D * 2, D * 2, C);
-    copy2d(out + D, 2 * D * 2, PH(A + "/attention/value_w", blk), D * 2, D * 2, C);
-  });
+  int B = (int)dimW(A + "/attention/query_w", 0);
+  const half* kvw = M.derived<half>("kv:" + A, (size_t)B * C * 2 * D, [&](half* out) {
+    copy2d(out, 2 * D * 2, PH(A + "/attention/key_w"), D * 2, D * 2, (size_t)B * C);
+    copy2d(out + D, 2 * D * 2, PH(A + "/attention/value_w"), D * 2, D * 2, (size_t)B * C);
+  }) + (size_t)blk * C * 2 * D;
   float* kv = scratch<float>("gcol.kv", rows * 2 * D);
   { Gemm g{}; g.X = xn; g.tx = F16; g.W = kvw; g.tw = F16; g.Y = kv; g.rows = rows; g.in = C; g.out = 2 * D; g.label = "global kv"; gemm(g); }
   float* avg = scratch<float>("gcol.avg", (size_t)L * W);
@@ -243,12 +244,15 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
   linearWB(gated, A + "/attention/output_w", A + "/attention/output_b", blk, msa, rows, W, C, 1.f);
 }
 template <class X>
-static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk) {
+static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
+                        const std::string& nextNorm = "", int nextBlk = 0) {
   half* emittedIn = takeEmitted(x, T + "/input_layer_norm", blk);
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);
   size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)I)));
   half* xn = scratch<half>("tr.xn", chunk * C);
   half* mid = scratch<half>("tr.mid", chunk * I);
+  const bool emitNext = !nextNorm.empty() && C == 128;
+  bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
     const half* in = emittedIn ? emittedIn + r0 * C : xn;     // (the emitted norm read a chunk at a time)
@@ -256,21 +260,33 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk)
     Gemm g{}; g.X = in; g.tx = F16; g.W = PH(T + "/transition1/weights", blk); g.tw = F16; g.Y = mid; g.ty = F16;
     g.rows = r; g.in = C; g.out = I; g.bias = P(T + "/transition1/bias", blk); g.relu = true; g.label = "transition1";
     gemm(g);
+    if (emittedAll) {
+      Gemm G{}; G.X = mid; G.tx = F16; G.W = PH(T + "/transition2/weights", blk); G.tw = F16; G.Y = x + r0 * C; G.ty = dtOf<X>();
+      G.rows = r; G.in = I; G.out = C; G.bias = P(T + "/transition2/bias", blk); G.beta = 1.f; G.label = "transition2, next norm";
+      G.lnOut = lnTarget(rows, C, nullptr) + r0 * C; G.lnScale = P(nextNorm + "/scale", nextBlk); G.lnOffset = P(nextNorm + "/offset", nextBlk);
+      if (gemm(G)) continue;
+      if (r0) die("%s: the next norm emitted for some chunks and not others", T.c_str());
+      emittedAll = false;
+      continue;
+    }
     linearB(mid, T + "/transition2", blk, x + r0 * C, r, I, C, false, 1.f);
   }
+  if (emittedAll) emitted = {x, normKey(nextNorm, nextBlk), lnTarget(rows, C, nullptr)};
 }
 void transition(float* x, size_t rows, int C, const std::string& T, int blk) { transitionT(x, rows, C, T, blk); }
-// pair[(i0 + i)][j] += (bias + Y) / (1e-3 + norm), float or half
-static void opmAdd(float* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L) {
-  run1d("af2_opm_add", (size_t)bi * L * 128, OpmAddArgs{pair, Y, bias, norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+// pair[(i0 + i)][j] += (bias + Y) / (1e-3 + norm), float or half, optionally emitting the next norm
+static void opmAdd(float* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L,
+                   half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr) {
+  run1d("af2_opm_add", (size_t)bi * L * 32, OpmAddArgs{pair, Y, bias, norm, lnOut, lnScale, lnOffset, (u64)i0, (uint)bi, (uint)L, 128, 0});
 }
-static void opmAdd(half* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L) {
-  run1d("af2_opm_add_h", (size_t)bi * L * 128, OpmAddHArgs{pair, Y, bias, norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+static void opmAdd(half* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L,
+                   half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr) {
+  run1d("af2_opm_add_h", (size_t)bi * L * 32, OpmAddHArgs{pair, Y, bias, norm, lnOut, lnScale, lnOffset, (u64)i0, (uint)bi, (uint)L, 128, 0});
 }
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] @ W + b) / (1e-3 + norm[i][j])
 template <class A>
 static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* msa, A* pair, int rowsN, int C, const float* msaMask,
-                             bool ones) {
+                             bool ones, const std::string& nextNorm = "") {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   half* xn = scratch<half>("opm.xn", rows * C);
@@ -320,13 +336,24 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
       }
       return;
     }
-    float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
+    static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+    half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
+    const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
+    const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
+    bool allAdded = lnOut != nullptr;
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
+      if (gemmOpmOut(Lt + (size_t)i0 * K, T, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L,
+                     bi, K, L * 128, 1.f)) {
+        allAdded = false;
+        continue;
+      }
+      float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
       Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = Y; g.rows = bi; g.in = K; g.out = L * 128; g.label = "opm shallow";
       gemm(g);
-      opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
+      opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, lnOut, lnScale, lnOffset);
     }
+    if (allAdded) emitted = {pair, normKey(nextNorm, blk), lnOut};
     return;
   }
   // the standard form: P[(i, c)][(j, e)] = sum_s l[s][i][c] r[s][j][e] a block of rows i at a time, permuted to
@@ -364,24 +391,17 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
 // the pair (gemmGatedAdd)
 struct TriW { const half* w4; const float* b4; };
 static TriW triWeights(const std::string& T, int blk, int C) {
-  std::string key = T + "#" + std::to_string(blk);
-  if (triQuartersApply(C)) {    // (the matrix units' quarters, built once through a blocks-of-8 temporary)
-    half* w4 = M.derived<half>("tri4q:" + key, (size_t)C * 4 * C, [](half*) {});
-    float* b4 = M.derived<float>("tri4qb:" + key, (size_t)4 * C, [&](float* b) {
-      half* w8 = allocT<half>((size_t)C * 4 * C); float* b8 = allocT<float>((size_t)4 * C);
-      run1d("af2_trigate_weight", (size_t)C * 4 * C, TriGateW2Args{PH(T + "/projection/weights", blk), PH(T + "/gate/weights", blk),
-            P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), w8, b8, (uint)C, 0});
-      triQuarters(w8, w4, b8, b, C);
-      release(w8); release(b8);
-    });
-    return {w4, b4};
-  }
-  half* w4 = M.derived<half>("tri4:" + key, (size_t)C * 4 * C, [](half*) {});
-  float* b4 = M.derived<float>("tri4b:" + key, (size_t)4 * C, [&](float* b) {
-    run1d("af2_trigate_weight", (size_t)C * 4 * C, TriGateW2Args{PH(T + "/projection/weights", blk), PH(T + "/gate/weights", blk),
-          P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), w4, b, (uint)C, 0});
+  int B = blk < 0 ? 1 : (int)dimW(T + "/projection/weights", 0);
+  size_t b = blk < 0 ? 0 : (size_t)blk;
+  uint q = triQuartersApply(C) ? 1u : 0u;
+  std::string tag = (q ? "tri4q:" : "tri4:") + T;
+  half* w4 = M.derived<half>(tag, (size_t)B * C * 4 * C, [](half*) {});
+  float* b4 = M.derived<float>(tag + ":b", (size_t)B * 4 * C, [&](float* bOut) {
+    run1d("af2_trigate_weight", (size_t)B * C * (C / 2),
+          TriGateW2Args{PH(T + "/projection/weights"), PH(T + "/gate/weights"), P(T + "/projection/bias"),
+                        P(T + "/gate/bias"), w4, bOut, (uint)C, (uint)B, q, 0});
   });
-  return {w4, b4};
+  return {w4 + b * C * 4 * C, b4 + b * 4 * C};
 }
 template <class X>
 static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
@@ -429,25 +449,26 @@ void triangleAttention(float* pair, const float* pairMask, int L, int C, const s
 // one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"; over the float
 // activations, or their half copies where main.mm made them (Trunk::h)
 template <class T>
-static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair) {
+static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair,
+                            const std::string& nextPairNorm, int nextPairBlk) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
   int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   bool ones = extraStack ? t.extraOnes : t.msaOnes;
-  if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones);
+  if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones, S + "msa_row_attention_with_pair_bias/feat_2d_norm");
   msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones);
   if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
   else msaColumnAttention(t, S, blk, msa, rowsN, C, mask, ones);
   transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
-  if (!t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones);
+  if (!t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones, S + "triangle_multiplication_outgoing/left_norm_input");
   // (each update's last GEMM emitting the next one's norm)
   triangleMultiplicationT(pair, t.pairMask, t.L, 128, S, blk, true, S + "triangle_multiplication_incoming/left_norm_input");
   triangleMultiplicationT(pair, t.pairMask, t.L, 128, S, blk, false, S + "triangle_attention_starting_node/query_norm");
   triangleAttentionT(pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes, S + "triangle_attention_ending_node/query_norm");
   triangleAttentionT(pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes, S + "pair_transition/input_layer_norm");
-  transitionT(pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
+  transitionT(pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk, nextPairNorm, nextPairBlk);
 }
-void evoformerBlock(Trunk& t, bool extraStack, int blk) {
-  if (t.h.pair) evoformerBlockT(t, extraStack, blk, extraStack ? t.h.extra : t.h.msa, t.h.pair);
-  else evoformerBlockT(t, extraStack, blk, extraStack ? t.extra : t.msa, t.pair);
+void evoformerBlock(Trunk& t, bool extraStack, int blk, const std::string& nextPairNorm, int nextPairBlk) {
+  if (t.h.pair) evoformerBlockT(t, extraStack, blk, extraStack ? t.h.extra : t.h.msa, t.h.pair, nextPairNorm, nextPairBlk);
+  else evoformerBlockT(t, extraStack, blk, extraStack ? t.extra : t.msa, t.pair, nextPairNorm, nextPairBlk);
 }

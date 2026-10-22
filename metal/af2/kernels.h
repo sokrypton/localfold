@@ -16,13 +16,12 @@ struct PairMaskArgs { CP(float) seqMask; DP(float) out; uint L, pad; };
 // = proj[k][q] (the ending node)
 struct BiasLayoutArgs { CP(float) proj; CP(float) pairMask; DP(half) out; uint L, H, transposed, stride; };
 // the triangle's projection and gate (AF2's halves: a's C columns, then b's) as gemmTriGate's weight and bias
-struct TriGateW2Args { CP(half) proj; CP(half) gate; CP(float) pb; CP(float) gb; DP(half) w4; DP(float) b4; uint C, pad; };
-struct QkvgWArgs { CP(half) q; CP(half) k; CP(half) v; CP(half) g; DP(half) out; uint C, W; };
-struct GateBiasArgs { CP(float) gb; DP(float) out; uint W, pad; };
+struct TriGateW2Args { CP(half) proj; CP(half) gate; CP(float) pb; CP(float) gb; DP(half) w4; DP(float) b4; uint C, B, quarters, pad; };
+struct QkvgWArgs { CP(half) q; CP(half) k; CP(half) v; CP(half) g; CP(float) gb; DP(half) out; DP(float) b; uint C, W, B, pad; };
 struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
 struct OpmPermuteArgs { CP(half) Pm; DP(half) X; uint bi, L, O, pad; };
-struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; u64 i0; uint bi, L, C, pad; };
-struct OpmAddHArgs { DP(half) pair; CP(float) Y; CP(float) bias; CP(float) norm; u64 i0; uint bi, L, C, pad; };
+struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };
+struct OpmAddHArgs { DP(half) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };
 struct OpmLeftArgs { CP(half) lt; DP(half) out; uint S, L, O; float scale; };
 struct TileBiasArgs { CP(float) bias; DP(float) out; uint L, C; float scale; uint pad; };
 struct MaskNormArgs { CP(float) mask; DP(float) norm; uint S, L; };
@@ -39,11 +38,11 @@ struct TorsionFeatArgs { CP(int) aatype; CP(float) pos; CP(float) mask; DP(float
 
 // ---------------------------------------------------------------- the structure module and the heads
 struct IdentityRigidArgs { DP(float) r; uint L, pad; };
-struct PointsGlobalArgs { CP(float) proj; CP(float) rig; DP(float) out; uint L, H, P, pad; };
+struct PointsGlobalArgs { CP(float) proj; CP(float) rig; DP(float) qp; DP(float) kp; DP(float) vp; uint L, H, Pq, Pv, ldp, pad; };
 struct IpaWeightsArgs { CP(float) qs; CP(float) ks; CP(float) qp; CP(float) kp; CP(float) b2d; CP(float) pw; CP(float) seqMask;
-                        DP(float) attn; uint L, H, Cs, Pq; };
+                        DP(float) attn; uint L, H, Cs, Pq, lds; float qScale; };
 struct IpaOutputsArgs { CP(float) attn; CP(float) vs; CP(float) vp; CP(float) act2d; CP(float) rig; DP(float) fin;
-                        uint L, H, Cs, Pv, C2, pad; };
+                        uint L, H, Cs, Pv, C2, ldv; };
 struct RigidUpdateArgs { DP(float) rig; CP(float) upd; uint L, pad; };
 struct ReluCopyArgs { CP(float) x; DP(float) y; u64 n; };
 struct SoftplusArgs { CP(float) raw; DP(float) out; uint H; float base; };

@@ -173,17 +173,29 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
       if (extraBlocks && t.E) { t.h.extra = scratch<half>("evo.extra", en); toHalf(t.extra, t.h.extra, en); }
       for (float** p : {&t.msa, &t.pair, &t.extra}) { release(*p); *p = nullptr; }
     }
-    for (int b = 0; b < extraBlocks; ++b) evoformerBlock(t, true, b);
-    for (int b = 0; b < mainBlocks; ++b) evoformerBlock(t, false, b);
+    for (int b = 0; b < extraBlocks; ++b) {
+      std::string nextNorm = t.opmFirst ? "" : (b + 1 < extraBlocks
+        ? "evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm"
+        : (mainBlocks > 0 ? "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm" : ""));
+      evoformerBlock(t, true, b, nextNorm, b + 1 < extraBlocks ? b + 1 : 0);
+    }
+    for (int b = 0; b < mainBlocks; ++b) {
+      std::string nextNorm = (!t.opmFirst && b + 1 < mainBlocks)
+        ? "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm"
+        : "";
+      evoformerBlock(t, false, b, nextNorm, b + 1);
+    }
     if (t.h.pair) {
       releaseScratch({"att.", "bias.", "col.", "row.", "gcol.", "ln.", "opm.", "tri.", "tr."});
       t.msa = allocT<float>(mn); t.pair = allocT<float>(pairs * 128); t.extra = allocT<float>(en);
       toFloat(t.h.msa, t.msa, (size_t)L * 256);       // (the first row: the single and the recycled row read it)
       toFloat(t.h.pair, t.pair, pairs * 128);
+      linearB(t.h.msa, "evoformer/single_activations", -1, single, L, 256, 384);
       t.h = {};
       releaseScratch({"evo."});
+    } else {
+      linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     }
-    linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     so = structureModule(single, t.pair, L, positionScale);
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions
     copy(prevRow, t.msa, (size_t)L * 256 * 4);
