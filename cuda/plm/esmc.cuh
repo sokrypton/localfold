@@ -205,9 +205,13 @@ inline bool towerHalf(const std::string& name) {
 }
 // a RESIDENT int8 matrix (ESM-C 6B, tools/export_esmc6b.py): [out, in] codes with a float16 scale a row, expanded
 // to float16 in scratch for one GEMM - the tower is 6.4 GB as codes and 12.7 GB as float16, which no T4 holds
-__global__ void expandRowsInt8K(const signed char* q, const __half* scale, __half* w, size_t n, int block) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) w[t] = __float2half(__half2float(scale[t / block]) * (float)q[t]);
+__global__ void expandRowsInt8K(const signed char* __restrict__ q, const __half* __restrict__ scale,
+                                __half* __restrict__ w, int block) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+  if (col < block) {
+    size_t idx = (size_t)row * block + col;
+    w[idx] = __float2half(__half2float(__ldg(scale + row)) * (float)__ldg(q + idx));
+  }
 }
 inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
                       float alpha = 1.f) {
@@ -216,7 +220,7 @@ inline void towerGemm(const float* X, const std::string& w, float* Y, size_t row
     if (r.scales32) { fprintf(stderr, "c/%sT: the resident ESM-C tower reads int8 codes, a scale a row\n", w.c_str()); exit(1); }
     if (r.elements != (size_t)in * out || r.block != in) { fprintf(stderr, "c/%sT is not [%d, %d] a row a scale\n", w.c_str(), out, in); exit(1); }
     __half* w16 = scratch<__half>("tower.w16", r.elements);
-    expandRowsInt8K<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w16, r.elements, r.block);
+    expandRowsInt8K<<<dim3((unsigned)((in + 255) / 256), (unsigned)out), 256, 0, STREAM>>>(r.codes, r.scales, w16, in);
     __half* xh = scratch<__half>("gemmh.x", rows * in);
     toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
     CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, w16, CUDA_R_16F, in, xh, CUDA_R_16F, in, &beta,

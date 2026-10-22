@@ -150,35 +150,36 @@ inline int FUSED_MIN_TOKENS = 80;
 // (the pad zero), interleaved: a = proj[2c] * mask * sigmoid(gate[2c]), b likewise at 2c + 1. A 32-pair x
 // 32-channel tile goes through shared memory so both the read and the write are coalesced.
 __global__ void triSplitHK(const half* __restrict__ pg, const float* __restrict__ mask, half* __restrict__ a,
-                           half* __restrict__ b, size_t pairs, int C, int L, int Lp) {
-  __shared__ float A[32][33], B[32][33];
-  size_t r0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
+                           half* __restrict__ b, size_t plane, int C, int L, int Lp) {
+  __shared__ __half A[32][33], B[32][33];
+  size_t p0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
   int tx = threadIdx.x, ty = threadIdx.y;
   int cLoad = c0 + tx;
   #pragma unroll
   for (int ry = ty; ry < 32; ry += 8) {
-    size_t r = r0 + ry;
-    float va = 0, vb = 0;
-    if (r < pairs) {
-      const half* p = pg + r * 5 * C; float m = __ldg(mask + r);
-      half2 pr = __ldg(reinterpret_cast<const half2*>(p) + cLoad);
-      half2 gt = __ldg(reinterpret_cast<const half2*>(p + 2 * C) + cLoad);
-      float2 pf = __half22float2(pr), gf = __half22float2(gt);
-      va = pf.x * m / (1.f + __expf(-gf.x));
-      vb = pf.y * m / (1.f + __expf(-gf.y));
+    size_t pIdx = p0 + ry;
+    __half ha = __float2half(0.f), hb = __float2half(0.f);
+    if (pIdx < plane) {
+      unsigned up = (unsigned)pIdx, uLp = (unsigned)Lp, i = up / uLp, j = up - i * uLp;
+      if ((int)i < L && (int)j < L) {
+        size_t r = (size_t)i * L + j;
+        const half* p = pg + r * 5 * C; float m = __ldg(mask + r);
+        half2 pr = __ldg(reinterpret_cast<const half2*>(p) + cLoad);
+        half2 gt = __ldg(reinterpret_cast<const half2*>(p + 2 * C) + cLoad);
+        float2 pf = __half22float2(pr), gf = __half22float2(gt);
+        ha = __float2half(pf.x * m / (1.f + __expf(-gf.x)));
+        hb = __float2half(pf.y * m / (1.f + __expf(-gf.y)));
+      }
     }
-    A[ry][tx] = va; B[ry][tx] = vb;
+    A[ry][tx] = ha; B[ry][tx] = hb;
   }
   __syncthreads();
-  size_t rStore = r0 + tx;
-  if (rStore < pairs) {
-    unsigned ur = (unsigned)rStore, uL = (unsigned)L, q = ur / uL;
-    size_t plane = (size_t)Lp * Lp;
-    size_t planeIdx = (size_t)q * Lp + (ur - q * uL);
+  size_t pStore = p0 + tx;
+  if (pStore < plane) {
     #pragma unroll
     for (int cy = ty; cy < 32; cy += 8) {
-      size_t at = (size_t)(c0 + cy) * plane + planeIdx;
-      a[at] = __float2half(A[tx][cy]); b[at] = __float2half(B[tx][cy]);
+      size_t at = (size_t)(c0 + cy) * plane + pStore;
+      a[at] = A[tx][cy]; b[at] = B[tx][cy];
     }
   }
 }
@@ -192,13 +193,14 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
   half* xn = scratch<half>("ftri.xn", P * C);
   layerNormH(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
   half* pg = scratch<half>("ftri.pg", P * 5 * C);
-  ltGemm(xn, Fh(Tn + "projection"), pg, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
-  ltGemm(xn, Fh(Tn + "gate"), pg + 2 * C, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
-  ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
+  std::string pgg = concatColumns("f/" + Tn + "projGateGating~", C,
+                                  {{"f/" + Tn + "projection", 2 * C, false},
+                                   {"f/" + Tn + "gate", 2 * C, false},
+                                   {"f/" + Tn + "gatingLinear", C, false}});
+  ltGemm(xn, Wh(pgg), pg, true, P, C, 5 * C, nullptr, false, 0.f);
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  zeroPlanePad(a, L, Lp, C); zeroPlanePad(b, L, Lp, C);   // (the pad: at every use, common.cuh)
-  triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
+  triSplitHK<<<dim3((unsigned)((plane + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, plane, C, L, Lp);
   float* prod = scratch<float>("ftri.prod", plane * C);
   const float one = 1.f, zero = 0.f;
   if (outgoing)

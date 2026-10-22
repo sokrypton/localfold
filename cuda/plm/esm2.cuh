@@ -72,18 +72,57 @@ __global__ void biasGeluK(float* __restrict__ y, const float* __restrict__ b, si
   if (t < rows * C) { float v = y[t] + b[t % C]; y[t] = 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 }
 // rotary on q and k inside the packed [rows, 3C] buffer: channel d with d + 32 of each 64-wide head
-__global__ void ropeK(float* qkv, int rows, int heads, int C) {
+__device__ __constant__ float ESM2_INV_FREQ[32] = {
+  0x1.000000p+0f,  0x1.800000p-1f,  0x1.1fe000p-1f,  0x1.afc000p-2f,
+  0x1.43c000p-2f,  0x1.e5c000p-3f,  0x1.6c4000p-3f,  0x1.110000p-3f,
+  0x1.998000p-4f,  0x1.334000p-4f,  0x1.ccc000p-5f,  0x1.598000p-5f,
+  0x1.030000p-5f,  0x1.848000p-6f,  0x1.234000p-6f,  0x1.b50000p-7f,
+  0x1.47c000p-7f,  0x1.eb8000p-8f,  0x1.708000p-8f,  0x1.144000p-8f,
+  0x1.9e8000p-9f,  0x1.36c000p-9f,  0x1.d24000p-10f, 0x1.5d8000p-10f,
+  0x1.064000p-10f, 0x1.894000p-11f, 0x1.26c000p-11f, 0x1.ba4000p-12f,
+  0x1.4b8000p-12f, 0x1.f14000p-13f, 0x1.750000p-13f, 0x1.17c000p-13f
+};
+__device__ __forceinline__ void esm2SincosD(double angle, float* sOut, float* cOut) {
+  constexpr double INV_PIO2 = 0x1.45f306dc9c883p-1;
+  constexpr double PIO2_HI  = 0x1.921fb54442d18p+0;
+  constexpr double PIO2_LO  = 0x1.1a62633145c07p-54;
+  double kf = nearbyint(angle * INV_PIO2);
+  long long q = (long long)kf;
+  double r = fma(-kf, PIO2_HI, angle) - kf * PIO2_LO;
+  double r2 = r * r;
+  double s = (((((-0x1.ae64567f544e4p-26 * r2 + 0x1.71de3a556c734p-19) * r2
+                 - 0x1.a01a01a01a01ap-13) * r2 + 0x1.1111111111111p-7) * r2
+               - 0x1.5555555555555p-3) * r2) * r + r;
+  double c = (((((-0x1.27e4fb7789f5cp-22 * r2 + 0x1.a01a01a01a01ap-16) * r2
+                 - 0x1.6c16c16c16c17p-10) * r2 + 0x1.5555555555555p-5) * r2
+               - 0x1.0000000000000p-1) * r2) + 1.0;
+  double sinA = (q & 1) ? c : s;
+  double cosA = (q & 1) ? -s : c;
+  if (q & 2) { sinA = -sinA; cosA = -cosA; }
+  *sOut = (float)sinA;
+  *cOut = (float)cosA;
+}
+__global__ void esm2RopeTableK(float2* __restrict__ cosSin, int rows) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * heads * 32 * 2) return;
-  int d = t & 31, h = (t >> 5) % heads, row = (t / (32 * heads)) % rows, which = t / (32 * heads * rows);
-  // (the frequency ROUNDED TO FLOAT16, as chai's traced ESM2 stores rot_emb.inv_freq - an fp16 buffer - and the angle a
-  // float32 product: af3-any-model's _rope half_inv_freq, 1e-2 against the trace exact, 2e-5 rounded)
-  const float inv = __half2float(__float2half_rn(1.0f / powf(10000.0f, (float)(2 * d) / 64.0f)));
-  double s, c; sincos((double)((float)row * inv), &s, &c);
-  float* p = qkv + (size_t)row * 3 * C + which * C + h * 64 + d;
-  float a = p[0], b = p[32];
-  p[0] = a * (float)c - b * (float)s;
-  p[32] = a * (float)s + b * (float)c;
+  if (t >= rows * 32) return;
+  int d = t & 31, row = t >> 5;
+  float s, c;
+  esm2SincosD((double)((float)row * ESM2_INV_FREQ[d]), &s, &c);
+  cosSin[t] = make_float2(c, s);
+}
+__global__ void ropeK(float* __restrict__ qkv, const float2* __restrict__ cosSin, int rows, int heads, int C) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * heads * 32) return;
+  int d = t & 31, h = (t >> 5) % heads, row = t / (32 * heads);
+  float2 cs = __ldg(cosSin + row * 32 + d);
+  float* pq = qkv + (size_t)row * 3 * C + h * 64 + d;
+  float aq = pq[0], bq = pq[32];
+  pq[0] = aq * cs.x - bq * cs.y;
+  pq[32] = aq * cs.y + bq * cs.x;
+  float* pk = pq + C;
+  float ak = pk[0], bk = pk[32];
+  pk[0] = ak * cs.x - bk * cs.y;
+  pk[32] = ak * cs.y + bk * cs.x;
 }
 __global__ void softmaxK(float* __restrict__ S, int rows, float scale) {
   float* s = S + (size_t)blockIdx.x * rows;
@@ -147,8 +186,18 @@ __global__ void softmaxK(float* __restrict__ S, int rows, float scale) {
   float inv = 1.f / red[0];
   for (int j = threadIdx.x; j < rows; j += blockDim.x) s[j] *= inv;
 }
-__global__ void toHalfRowsK(const float* x, __half* y, size_t n) {
+__global__ void toHalfRowsK(const float* __restrict__ x, __half* __restrict__ y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)x & 15) == 0 && ((uintptr_t)y & 7) == 0) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 v = __ldg(reinterpret_cast<const float4*>(x) + t);
+      __half2 h0 = __floats2half2_rn(v.x, v.y);
+      __half2 h1 = __floats2half2_rn(v.z, v.w);
+      reinterpret_cast<uint2*>(y)[t] = make_uint2(*reinterpret_cast<uint32_t*>(&h0), *reinterpret_cast<uint32_t*>(&h1));
+    }
+    return;
+  }
   if (t < n) y[t] = __float2half(x[t]);
 }
 
@@ -181,7 +230,8 @@ inline void gemm(const float* X, const std::vector<std::string>& names, float* Y
   }
   if (col0 != out) { fprintf(stderr, "e/%s...: %d columns, not %d\n", names[0].c_str(), col0, out); exit(1); }
   __half* xh = scratch<__half>("esm2.xh", (size_t)rows * in);
-  toHalfRowsK<<<blocks((size_t)rows * in), 256, 0, STREAM>>>(X, xh, (size_t)rows * in);
+  size_t nIn = (size_t)rows * in;
+  toHalfRowsK<<<blocks((nIn & 3) == 0 ? (nIn >> 2) : nIn), 256, 0, STREAM>>>(X, xh, nIn);
   const float one = 1.f;
   CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, rows, in, &one, w, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta, Y,
                   CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -211,14 +261,19 @@ inline void embedChain(const Tower& t, const int* idsDevWrapped, int n, float* o
   float* ctx = scratch<float>("esm2.ctx", (size_t)R * C);
   float* h = scratch<float>("esm2.h", (size_t)R * t.ffn);
   float* S = scratch<float>("esm2.scores", (size_t)t.heads * R * R);
+  float2* cosSin = reinterpret_cast<float2*>(scratch<float>("esm2.rope", (size_t)R * 64));
+  esm2RopeTableK<<<blocks((size_t)R * 32), 256, 0, STREAM>>>(cosSin, R);
   embedK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(idsDevWrapped, Wf("esm2/embed/weights"), x, R, C, t.embedScale);
   const float one = 1.f, zero = 0.f;
+  size_t rcVec = (C & 3) == 0 ? (size_t)R * (C >> 2) : (size_t)R * C;
+  size_t r3cVec = (C & 3) == 0 ? (size_t)R * 3 * (C >> 2) : (size_t)R * 3 * C;
+  size_t rFfnVec = (t.ffn & 3) == 0 ? (size_t)R * (t.ffn >> 2) : (size_t)R * t.ffn;
   for (int l = 0; l < t.layers; ++l) {
     auto N = [&](const char* module, const char* leaf) { return blockName(l, module, leaf); };
     layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(N("attn_norm", "scale")), Wf(N("attn_norm", "offset")));
     gemm(xn, { N("q", "weights"), N("k", "weights"), N("v", "weights") }, qkv, R, C, 3 * C, 0.f);
-    biasK<<<blocks((size_t)R * 3 * C), 256, 0, STREAM>>>(qkv, qkvBias(l, C), R, 3 * C);
-    ropeK<<<blocks((size_t)R * t.heads * 64), 256, 0, STREAM>>>(qkv, R, t.heads, C);
+    biasK<<<blocks(r3cVec), 256, 0, STREAM>>>(qkv, qkvBias(l, C), R, 3 * C);
+    ropeK<<<blocks((size_t)R * t.heads * 32), 256, 0, STREAM>>>(qkv, cosSin, R, t.heads, C);
     // per head: S = K^T Q (col-major [keys, queries]), softmax over keys, ctx = V S
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, R, R, 64, &one, qkv + C, 3 * C, 64, qkv, 3 * C, 64, &zero,
                                  S, R, (long long)R * R, t.heads));
@@ -226,12 +281,12 @@ inline void embedChain(const Tower& t, const int* idsDevWrapped, int n, float* o
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, R, R, &one, qkv + 2 * C, 3 * C, 64, S, R,
                                  (long long)R * R, &zero, ctx, C, 64, t.heads));
     gemm(ctx, { N("attn_out", "weights") }, x, R, C, C, 1.f);
-    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(N("attn_out", "bias")), R, C);
+    biasK<<<blocks(rcVec), 256, 0, STREAM>>>(x, Wf(N("attn_out", "bias")), R, C);
     layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(N("ffn_norm", "scale")), Wf(N("ffn_norm", "offset")));
     gemm(xn, { N("fc1", "weights") }, h, R, C, t.ffn, 0.f);
-    biasGeluK<<<blocks((size_t)R * t.ffn), 256, 0, STREAM>>>(h, Wf(N("fc1", "bias")), R, t.ffn);
+    biasGeluK<<<blocks(rFfnVec), 256, 0, STREAM>>>(h, Wf(N("fc1", "bias")), R, t.ffn);
     gemm(h, { N("fc2", "weights") }, x, R, t.ffn, C, 1.f);
-    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(N("fc2", "bias")), R, C);
+    biasK<<<blocks(rcVec), 256, 0, STREAM>>>(x, Wf(N("fc2", "bias")), R, C);
   }
   // the final LayerNorm over the residues only (BOS and EOS dropped)
   layerNormK<<<(n + 7) / 8, 256, 0, STREAM>>>(x + C, out, n, C, Wf("esm2/final_norm/scale"), Wf("esm2/final_norm/offset"));

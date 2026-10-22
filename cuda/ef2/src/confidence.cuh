@@ -108,13 +108,14 @@ __global__ void gatherAtomsK(const float* __restrict__ tok, const int* __restric
   if (t < (size_t)A * C) out[t] = tok[(size_t)atomToToken[t / C] * C + t % C];
 }
 // per atom: logits over bins from its slot's table, then the expectation over [0, 1]
-__global__ void plddtAtomK(const float* __restrict__ s, const int* __restrict__ slot, const float* __restrict__ table,
+__global__ void plddtAtomK(const float* __restrict__ s, const int* __restrict__ atomToToken,
+                           const int* __restrict__ slot, const float* __restrict__ table,
                            float* __restrict__ plddt, int A, int C, int bins) {
   int a = blockIdx.x, tid = threadIdx.x;
   __shared__ float shS[512];
   __shared__ float logit[64];
   __shared__ float mxSh;
-  const float* sa = s + (size_t)a * C;
+  const float* sa = s + (size_t)(atomToToken ? __ldg(atomToToken + a) : a) * C;
   if (C <= 512) {
     for (int c = tid; c < C; c += blockDim.x) shS[c] = __ldg(sa + c);
     __syncthreads();
@@ -370,10 +371,9 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   CK(cudaMemcpy(a2t.data(), Idev("atom_to_token"), A * 4, cudaMemcpyDeviceToHost));
   for (int a = 0, k = 0; a < A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, slots - 1); }
   int* dSlot = upload(slot.data(), A);
-  float* sa = scratch<float>("cf.sa", (size_t)A * Cs); float* pa = scratch<float>("cf.pa", A);
-  gatherAtomsK<<<blocks((size_t)A * Cs), 256, 0, STREAM>>>(single, Idev("atom_to_token"), sa, A, Cs);
-  layerNorm(sa, sa, A, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
-  plddtAtomK<<<A, 64, 0, STREAM>>>(sa, dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
+  float* pa = scratch<float>("cf.pa", A);
+  layerNorm(single, single, T, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
+  plddtAtomK<<<A, 64, 0, STREAM>>>(single, Idev("atom_to_token"), dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
   // PAE logits
   float* paeL = paeL16 ? paeL16 : scratch<float>("cf.pae", P * pb);
   if (paeL16) {}

@@ -175,11 +175,16 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
     unsigned ur = (unsigned)rLoad, uL = (unsigned)L, q = ur / uL;
     planeIdx = (size_t)q * Lp + (ur - q * uL);
   }
-  for (int c = warp; c < C; c += nw) {
-    tile[c * 33 + lane] = rLoad < pairs ? __ldg(prod + (size_t)c * plane + planeIdx) : 0.f;
-  }
-  __syncthreads();
-  if (C == 256) {
+  if (C == 256 && blockDim.x == 256) {
+    if (rLoad < pairs) {
+      const float* pBase = prod + planeIdx;
+      #pragma unroll
+      for (int k = 0; k < 32; ++k) {
+        int c = k * 8 + warp;
+        tile[c * 33 + lane] = __ldg(pBase + (size_t)c * plane);
+      }
+    }
+    __syncthreads();
     float sc[8], of[8];
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
@@ -187,7 +192,9 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
       sc[k] = __ldg(scale + c);
       of[k] = __ldg(offset + c);
     }
-    for (int row = warp; row < 32; row += nw) {
+    #pragma unroll
+    for (int rk = 0; rk < 4; ++rk) {
+      int row = rk * 8 + warp;
       size_t r = r0 + row;
       if (r >= pairs) break;
       float tv[8];
@@ -212,7 +219,16 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
     }
     return;
   }
-  if (C == 128) {
+  if (C == 128 && blockDim.x == 256) {
+    if (rLoad < pairs) {
+      const float* pBase = prod + planeIdx;
+      #pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        int c = k * 8 + warp;
+        tile[c * 33 + lane] = __ldg(pBase + (size_t)c * plane);
+      }
+    }
+    __syncthreads();
     float sc[4], of[4];
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -220,7 +236,9 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
       sc[k] = __ldg(scale + c);
       of[k] = __ldg(offset + c);
     }
-    for (int row = warp; row < 32; row += nw) {
+    #pragma unroll
+    for (int rk = 0; rk < 4; ++rk) {
+      int row = rk * 8 + warp;
       size_t r = r0 + row;
       if (r >= pairs) break;
       float tv[4];
@@ -245,6 +263,10 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
     }
     return;
   }
+  for (int c = warp; c < C; c += nw) {
+    tile[c * 33 + lane] = rLoad < pairs ? __ldg(prod + (size_t)c * plane + planeIdx) : 0.f;
+  }
+  __syncthreads();
   for (int row = warp; row < 32; row += nw) {
     size_t r = r0 + row;
     if (r >= pairs) break;

@@ -98,18 +98,30 @@ __global__ void adaCombineK(const float* an, const float* g, const float* gb, co
 // ...the LayerNorm (affine-free) and that combine in one pass: a block a row, its first warp taking the statistics
 // with layerNormK's arithmetic exactly, then all of the block writing the row (a warp a row put the whole combine on
 // T warps - 9 blocks at 68 tokens - and was slower than the two kernels)
-__global__ void adaLNK(const float* __restrict__ a, const float* __restrict__ g, const float* __restrict__ gb,
-                       const float* __restrict__ sh, float* __restrict__ out, size_t T, int C, int ld) {
+__global__ void adaLNK(float* __restrict__ a, const float* __restrict__ g, const float* __restrict__ gb,
+                       const float* __restrict__ sh, float* __restrict__ out, size_t T, int C, int ld,
+                       const float* __restrict__ o = nullptr, const float* __restrict__ og = nullptr,
+                       const float* __restrict__ ogb = nullptr) {
   __shared__ float4 sx4[256];
   __shared__ float stats[2];
   float* sx = reinterpret_cast<float*>(sx4);
   size_t row = blockIdx.x;
-  const float* xr = a + row * C;
+  float* xr = a + row * C;
   int tid = threadIdx.x;
-  if (C == 768 && (((uintptr_t)xr | (uintptr_t)(g + row * ld) | (uintptr_t)gb | (uintptr_t)(sh + row * ld) | (uintptr_t)(out + row * 768)) & 15) == 0) {
+  if (C == 768 && (((uintptr_t)xr | (uintptr_t)(g + row * ld) | (uintptr_t)gb | (uintptr_t)(sh + row * ld) | (uintptr_t)(out + row * 768) | (uintptr_t)o | (uintptr_t)(og ? og + row * ld : nullptr) | (uintptr_t)ogb) & 15) == 0) {
     float4 x4, g4, gb4, sh4;
     if (tid < 192) {
       x4 = __ldg(reinterpret_cast<const float4*>(xr) + tid);
+      if (o) {
+        float4 o4 = __ldg(reinterpret_cast<const float4*>(o + row * 768) + tid);
+        float4 og4 = __ldg(reinterpret_cast<const float4*>(og + row * ld) + tid);
+        float4 ogb4 = __ldg(reinterpret_cast<const float4*>(ogb) + tid);
+        x4.x = __fadd_rn(x4.x, __fmul_rn(o4.x, 1.f / (1.f + expf(-(og4.x + ogb4.x)))));
+        x4.y = __fadd_rn(x4.y, __fmul_rn(o4.y, 1.f / (1.f + expf(-(og4.y + ogb4.y)))));
+        x4.z = __fadd_rn(x4.z, __fmul_rn(o4.z, 1.f / (1.f + expf(-(og4.z + ogb4.z)))));
+        x4.w = __fadd_rn(x4.w, __fmul_rn(o4.w, 1.f / (1.f + expf(-(og4.w + ogb4.w)))));
+        reinterpret_cast<float4*>(xr)[tid] = x4;
+      }
       g4 = __ldg(reinterpret_cast<const float4*>(g + row * ld) + tid);
       gb4 = __ldg(reinterpret_cast<const float4*>(gb) + tid);
       sh4 = __ldg(reinterpret_cast<const float4*>(sh + row * ld) + tid);
@@ -144,6 +156,13 @@ __global__ void adaLNK(const float* __restrict__ a, const float* __restrict__ g,
     }
     return;
   }
+  if (o) {
+    for (int c = tid; c < C; c += blockDim.x) {
+      float ov = __fmul_rn(o[row * C + c], 1.f / (1.f + expf(-(og[row * ld + c] + ogb[c]))));
+      xr[c] = __fadd_rn(xr[c], ov);
+    }
+    __syncthreads();
+  }
   if (tid < 32) {
     int lane = tid;
     float s = 0;
@@ -166,6 +185,22 @@ __global__ void adaLNK(const float* __restrict__ a, const float* __restrict__ g,
 __global__ void gateAddK(float* __restrict__ a, const float* __restrict__ x, const float* __restrict__ g,
                          const float* __restrict__ gb, size_t T, int C, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (ld & 3) == 0 && (((uintptr_t)a | (uintptr_t)x | (uintptr_t)g | (uintptr_t)gb) & 15) == 0) {
+    int c4 = C >> 2, ld4 = ld >> 2;
+    size_t n4 = T * (size_t)c4;
+    if (t >= n4) return;
+    unsigned u = (unsigned)t, uc = (unsigned)c4, r = (c4 == 192) ? (u / 192u) : (u / uc), c = u - r * uc;
+    float4 av = reinterpret_cast<const float4*>(a)[t];
+    float4 xv = __ldg(reinterpret_cast<const float4*>(x) + t);
+    float4 gv = __ldg(reinterpret_cast<const float4*>(g) + (size_t)r * ld4 + c);
+    float4 gbv = __ldg(reinterpret_cast<const float4*>(gb) + c);
+    reinterpret_cast<float4*>(a)[t] = make_float4(
+        __fadd_rn(av.x, __fmul_rn(xv.x, 1.f / (1.f + expf(-(gv.x + gbv.x))))),
+        __fadd_rn(av.y, __fmul_rn(xv.y, 1.f / (1.f + expf(-(gv.y + gbv.y))))),
+        __fadd_rn(av.z, __fmul_rn(xv.z, 1.f / (1.f + expf(-(gv.z + gbv.z))))),
+        __fadd_rn(av.w, __fmul_rn(xv.w, 1.f / (1.f + expf(-(gv.w + gbv.w))))));
+    return;
+  }
   size_t n = T * (size_t)C;
   if (t >= n) return;
   size_t r; int c;
@@ -407,9 +442,12 @@ struct Denoiser {
   // scaled by that adaLN's singleScale: snScaled [2 blocks, T, Ct]); 48+2b, 48+2b+1 its two out gates
   float* single; float* snScaled; float* G; float* scales; const void** ptrs; int entries;
   float* level;                   // NoiseLevel on the device
+  float* encMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomEncoder blocks [atomBlocks, A, 6*Ca]
+  float* decMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomDecoder blocks [atomBlocks, A, 6*Ca]
 };
 
 inline bool TOKEN_FLASH = true;   // --no-token-flash: the token blocks' attention through the [H, T, T] scores
+inline bool SAMPLER16 = true;     // --fast: the denoiser's GEMMs on f16 tensor cores (--no-sampler16: TF32)
 inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs, bool check) {
   Denoiser d{};
   d.T = T; d.A = A; d.Cz = (int)M.meta("meta/pairChannels"); d.Ct = (int)M.meta("meta/tokenChannels2");
@@ -496,6 +534,21 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   if ((size_t)P * Cz * 4 > ((size_t)128 << 20)) releaseScratch();     // the joined and projected pairs (a large input)
   }
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
+  {
+    struct Restore { bool was = GEMM16; ~Restore() { GEMM16 = was; } } restore;
+    GEMM16 = FAST && SAMPLER16;
+    int Ca = d.atoms.ctx.C, ab = d.atomBlocks;
+    size_t acVec = (Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca;
+    size_t modStride = (size_t)A * 6 * Ca;
+    d.encMod = dalloc(ab * modStride);
+    d.decMod = dalloc(ab * modStride);
+    float* sc = scratch<float>("atom.silu", (size_t)A * Ca);
+    siluK<<<blocks(acVec), 256, 0, STREAM>>>(d.atoms.c0, sc, (size_t)A * Ca);
+    for (int b = 0; b < ab; ++b) {
+      gemm(sc, F("diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln"), d.encMod + b * modStride, A, Ca, 6 * Ca);
+      gemm(sc, F("diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln"), d.decMod + b * modStride, A, Ca, 6 * Ca);
+    }
+  }
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
   d.single = dalloc((size_t)T * Ct); d.snScaled = dalloc((size_t)2 * nb * T * Ct);
@@ -548,10 +601,11 @@ inline void singleProjections(const Denoiser& d) {
                          d.entries, ct, FAST ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
 }
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift, the projections from G
-inline void adaLN(const Denoiser& d, const float* a, float* out, int e, const std::string& B) {
+inline void adaLN(const Denoiser& d, float* a, float* out, int e, const std::string& B,
+                  const float* o = nullptr, const float* og = nullptr, const float* ogb = nullptr) {
   int T = d.T, C = d.Ct, ld = d.entries * C;
   adaLNK<<<(unsigned)T, 256, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
-                                                      out, T, C, ld);
+                                          out, T, C, ld, o, og, ogb);
 }
 
 inline void tokenBlock(const Denoiser& d, float* a, int b) {
@@ -559,8 +613,14 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   size_t tcVec = (C & 3) == 0 ? (size_t)T * (C >> 2) : (size_t)T * C;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
   float* x = scratch<float>("tb.x", (size_t)T * C);
-  adaLN(d, a, x, 4 * b, B + "attention/adaln/");
   float* o = scratch<float>("tb.o", (size_t)T * C);
+  if (b == 0) {
+    adaLN(d, a, x, 4 * b, B + "attention/adaln/");
+  } else {
+    std::string Bp = "diffusion/tokenBlocks/" + std::to_string(b - 1) + "/";
+    adaLN(d, a, x, 4 * b, B + "attention/adaln/",
+          o, d.G + (size_t)(4 * nb + 2 * (b - 1) + 1) * C, F(Bp + "transition/outGateBias"));
+  }
   if (d.flashBias) {
     // q | k | v | gate in one GEMM (the weights' columns concatenated once), then cuda/af3's flash kernel:
     // the query bias, QK^T, the pair bias, the softmax, PV and the gate, no [H, T, T] scores at all
@@ -600,20 +660,20 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   sigmoidMulK<<<blocks(tcVec), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
   }
-  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
-  // the conditioned transition
-  adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/");
+  // the conditioned transition (fusing the attention's gateAdd in place)
+  adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/",
+        o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"));
   int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
   float* w = scratch<float>("tb.wide", (size_t)T * 2 * Hd); float* g = scratch<float>("tb.gated", (size_t)T * Hd);
   gemm(x, F(B + "transition/swishWeights"), w, T, C, 2 * Hd);
   swigluK<<<blocks((Hd & 3) == 0 ? (size_t)T * (Hd >> 2) : (size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
   gemm(g, F(B + "transition/outWeights"), o, T, Hd, C);
-  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
+  if (b + 1 == nb)
+    gateAddK<<<blocks(tcVec), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
 }
 
 // one denoiser call: x_noisy [A, 3] at the noise level in d.level -> x_denoised [A, 3]; nothing here
 // reads the host, so the sampler captures it once and replays it at every level
-inline bool SAMPLER16 = true;     // --fast: the denoiser's GEMMs on f16 tensor cores (--no-sampler16: TF32)
 inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoised, bool check = false) {
   struct Restore { bool was = GEMM16; ~Restore() { GEMM16 = was; } } restore;
   GEMM16 = FAST && SAMPLER16;
@@ -627,7 +687,7 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
   gemm(r6, F("diffusionAtomEncoder/coordsLinear"), q, A, 6, Ca);
   addK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(q, d.atoms.c0, (size_t)A * Ca);
-  swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW);
+  swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.encMod);
   float* tok = scratch<float>("dn.tok", (size_t)A * Ct);
   gemm(q, F("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
   reluK<<<blocks((Ct & 3) == 0 ? (size_t)A * (Ct >> 2) : (size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
@@ -643,7 +703,7 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
   gemm(a, F("diffusionAtomDecoder/tokenToAtom"), pt, T, Ct, Ca);
   gatherTokensK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(pt, Idev("atom_to_token"), ac.mask, q, A, Ca);
-  swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW);
+  swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod);
   layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
   float* r = scratch<float>("dn.r", (size_t)A * 3);
   gemm(q, F("diffusionAtomDecoder/outputLinear"), r, A, Ca, 3);
@@ -652,8 +712,9 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
 inline void freeDenoiser(Denoiser& d) {
   CK(cudaStreamSynchronize(STREAM));
   for (void* b : d.biases) CK(cudaFree(b));
-  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.ptrs, (void*)d.level})
-    CK(cudaFree(p));
+  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.ptrs, (void*)d.level,
+                  (void*)d.encMod, (void*)d.decMod})
+    if (p) CK(cudaFree(p));
   freeAtoms(d.atoms);
   d.biases.clear();
 }

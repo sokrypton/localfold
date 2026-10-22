@@ -383,10 +383,9 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   CK(cudaMemcpy(a2t.data(), Idev("atom_to_token"), A * 4, cudaMemcpyDeviceToHost));
   for (int a = 0, k = 0; a < A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, slots - 1); }
   int* dSlot = upload(slot.data(), A);
-  float* sa = scratch<float>("cf.sa", (size_t)A * Cs); float* pa = scratch<float>("cf.pa", A);
-  gatherAtomsK<<<blocks((size_t)A * Cs), 256, 0, STREAM>>>(single, Idev("atom_to_token"), sa, A, Cs);
-  layerNorm(sa, sa, A, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
-  plddtAtomK<<<A, 64, 0, STREAM>>>(sa, dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
+  float* pa = scratch<float>("cf.pa", A);
+  layerNorm(single, single, T, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
+  plddtAtomK<<<A, 64, 0, STREAM>>>(single, Idev("atom_to_token"), dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
   Confidence out;
   out.plddtAtom = download(pa, A);
   std::vector<float> mask_ = download(W("atom_mask"), A);
