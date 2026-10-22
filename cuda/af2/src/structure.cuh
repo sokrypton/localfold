@@ -351,19 +351,25 @@ __global__ void reluCopyK(const float* x, float* y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) y[t] = fmaxf(x[t], 0.f);
 }
-__global__ void addBiasIntoK(float* dst, const float* y, const float* bias, size_t rows, int C) {
+__global__ void addBiasIntoK(float* dst, float* y, const float* bias, size_t rows, int C) {
   if ((C & 3) == 0) {
     size_t c4 = (size_t)(C >> 2), t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (t4 < rows * c4) {
       float4 d = reinterpret_cast<const float4*>(dst)[t4];
       float4 v = reinterpret_cast<const float4*>(y)[t4];
       float4 b = reinterpret_cast<const float4*>(bias)[t4 % c4];
-      reinterpret_cast<float4*>(dst)[t4] = make_float4(d.x + v.x + b.x, d.y + v.y + b.y, d.z + v.z + b.z, d.w + v.w + b.w);
+      float4 s = make_float4(d.x + v.x + b.x, d.y + v.y + b.y, d.z + v.z + b.z, d.w + v.w + b.w);
+      reinterpret_cast<float4*>(dst)[t4] = s;
+      reinterpret_cast<float4*>(y)[t4] = make_float4(fmaxf(s.x, 0.f), fmaxf(s.y, 0.f), fmaxf(s.z, 0.f), fmaxf(s.w, 0.f));
     }
     return;
   }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) dst[t] += y[t] + bias[t % C];
+  if (t < rows * C) {
+    float s = dst[t] + y[t] + bias[t % C];
+    dst[t] = s;
+    y[t] = fmaxf(s, 0.f);
+  }
 }
 __global__ void __launch_bounds__(256, 6)
 addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const float* __restrict__ bias,
@@ -410,38 +416,39 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) out[row * C + c] = (rr[c] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
 }
-__global__ void ipaUnpackK(float* __restrict__ qs, float* __restrict__ ks, float* __restrict__ vs,
-                           const float* __restrict__ qpr, const float* __restrict__ kpr, const float* __restrict__ vpr,
+__global__ void ipaUnpackK(const float* __restrict__ proj, float* __restrict__ qs, float* __restrict__ ks, float* __restrict__ vs,
                            const float* __restrict__ bias, const float* __restrict__ rig,
                            float* __restrict__ qp, float* __restrict__ kp, float* __restrict__ vp,
                            int L, int Hh, int Cs, int Pq, int Pv, float qScale) {
-  int Ws = Hh * Cs, Wqp = Hh * 3 * Pq, pts = Hh * (2 * Pq + Pv), work = max(3 * Ws, pts);
+  int Ws = Hh * Cs, Wqp = Hh * 3 * Pq, Wvp = Hh * 3 * Pv, Wipa = 3 * Ws + 2 * Wqp + Wvp;
+  int pts = Hh * (2 * Pq + Pv), work = max(3 * Ws, pts);
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * work) return;
   int i = (int)(t / work), k = (int)(t % work);
+  const float* row = proj + (size_t)i * Wipa;
   if (k < 3 * Ws) {
-    float b = bias[k];
-    if (k < Ws) qs[(size_t)i * Ws + k] = (qs[(size_t)i * Ws + k] + b) * qScale;
-    else if (k < 2 * Ws) ks[(size_t)i * Ws + (k - Ws)] += b;
-    else vs[(size_t)i * Ws + (k - 2 * Ws)] += b;
+    float v = row[k] + bias[k];
+    if (k < Ws) qs[(size_t)i * Ws + k] = v * qScale;
+    else if (k < 2 * Ws) ks[(size_t)i * Ws + (k - Ws)] = v;
+    else vs[(size_t)i * Ws + (k - 2 * Ws)] = v;
   }
   if (k < pts) {
     const float* rg = rig + i * 12;
     if (k < Hh * Pq) {
       int h = k / Pq, p = k % Pq, off = h * 3 * Pq, boff = 3 * Ws + off;
-      const float* r = qpr + (size_t)i * Wqp + off;
+      const float* r = row + boff;
       float loc[3] = {r[p] + bias[boff + p], r[Pq + p] + bias[boff + Pq + p], r[2 * Pq + p] + bias[boff + 2 * Pq + p]}, g[3];
       rapply(rg, loc, g);
       for (int a = 0; a < 3; ++a) qp[((size_t)i * Hh * Pq + k) * 3 + a] = g[a];
     } else if (k < 2 * Hh * Pq) {
       int kpIdx = k - Hh * Pq, h = kpIdx / Pq, p = kpIdx % Pq, off = h * 3 * Pq, boff = 3 * Ws + Wqp + off;
-      const float* r = kpr + (size_t)i * Wqp + off;
+      const float* r = row + boff;
       float loc[3] = {r[p] + bias[boff + p], r[Pq + p] + bias[boff + Pq + p], r[2 * Pq + p] + bias[boff + 2 * Pq + p]}, g[3];
       rapply(rg, loc, g);
       for (int a = 0; a < 3; ++a) kp[((size_t)i * Hh * Pq + kpIdx) * 3 + a] = g[a];
     } else {
       int vpIdx = k - 2 * Hh * Pq, h = vpIdx / Pv, p = vpIdx % Pv, off = h * 3 * Pv, boff = 3 * Ws + 2 * Wqp + off;
-      const float* r = vpr + (size_t)i * (Hh * 3 * Pv) + off;
+      const float* r = row + boff;
       float loc[3] = {r[p] + bias[boff + p], r[Pv + p] + bias[boff + Pv + p], r[2 * Pv + p] + bias[boff + 2 * Pv + p]}, g[3];
       rapply(rg, loc, g);
       for (int a = 0; a < 3; ++a) vp[((size_t)i * Hh * Pv + vpIdx) * 3 + a] = g[a];
@@ -544,20 +551,16 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   float* ks = qs + (size_t)L * Ws;
   float* vs = qs + (size_t)2 * L * Ws;
   int ipaWork = std::max(3 * Ws, Hh * (2 * Pq + Pv));
-  struct IpaW { const float* ws; const float* wp; const float* b; };
+  struct IpaW { const float* w; const float* b; };
   static std::map<const float*, IpaW> ipaCache;
   const float* qsw = P(I + "q_scalar_projection/weights");
   auto ipaIt = ipaCache.find(qsw);
   if (ipaIt == ipaCache.end()) {
-    float* ws = wpool<float>((size_t)3 * C * Ws);
-    CK(cudaMemcpyAsync(ws, qsw, (size_t)C * Ws * 4, cudaMemcpyDeviceToDevice, STREAM));
-    CK(cudaMemcpyAsync(ws + (size_t)C * Ws, P(I + "k_scalar_projection/weights"), (size_t)C * Ws * 4, cudaMemcpyDeviceToDevice, STREAM));
-    CK(cudaMemcpyAsync(ws + (size_t)2 * C * Ws, P(I + "v_scalar_projection/weights"), (size_t)C * Ws * 4, cudaMemcpyDeviceToDevice, STREAM));
-    float* wp = wpool<float>((size_t)2 * C * Wqp);
-    CK(cudaMemcpyAsync(wp, P(I + "q_point_projection/point_projection/weights"), (size_t)C * Wqp * 4, cudaMemcpyDeviceToDevice, STREAM));
-    CK(cudaMemcpyAsync(wp + (size_t)C * Wqp, P(I + "k_point_projection/point_projection/weights"), (size_t)C * Wqp * 4, cudaMemcpyDeviceToDevice, STREAM));
+    float* w = wpool<float>((size_t)C * Wipa);
     float* b = wpool<float>(Wipa);
     auto col = [&](int off, int wcol, const std::string& name) {
+      CK(cudaMemcpy2DAsync(w + off, (size_t)Wipa * 4, P(name + "/weights"), (size_t)wcol * 4,
+                           (size_t)wcol * 4, C, cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(b + off, P(name + "/bias"), wcol * 4, cudaMemcpyDeviceToDevice, STREAM));
     };
     col(0, Ws, I + "q_scalar_projection");
@@ -566,9 +569,9 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     col(3 * Ws, Wqp, I + "q_point_projection/point_projection");
     col(3 * Ws + Wqp, Wqp, I + "k_point_projection/point_projection");
     col(3 * Ws + 2 * Wqp, Wvp, I + "v_point_projection/point_projection");
-    ipaIt = ipaCache.emplace(qsw, IpaW{ws, wp, b}).first;
+    ipaIt = ipaCache.emplace(qsw, IpaW{w, b}).first;
   }
-  float* proj = scratch<float>("sm.pproj", (size_t)L * (2 * Wqp + Wvp));
+  float* proj = scratch<float>("sm.pproj", (size_t)L * Wipa);
   float* qp = scratch<float>("sm.qp", (size_t)L * Hh * Pq * 3); float* kp = scratch<float>("sm.kp", (size_t)L * Hh * Pq * 3);
   float* vp = scratch<float>("sm.vp", (size_t)L * Hh * Pv * 3);
   float* attn = scratch<float>("sm.attn", (size_t)L * Hh * L);
@@ -578,18 +581,12 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   float* t1 = scratch<float>("sm.t1", (size_t)L * C); float* t2 = scratch<float>("sm.t2", (size_t)L * C);
   float* rq = scratch<float>("sm.rq", (size_t)L * 6);
   const float* seqMask = W("seq_mask");
-  const float one = 1.f, zero = 0.f;
   int layers = 8;
   for (int it = 0; it < layers; ++it) {
     // IPA
-    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Ws, L, C, &one, ipaIt->second.ws, Ws, (long long)C * Ws,
-                                 act, C, 0, &zero, qs, Ws, (long long)L * Ws, 3));
-    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Wqp, L, C, &one, ipaIt->second.wp, Wqp, (long long)C * Wqp,
-                                 act, C, 0, &zero, proj, Wqp, (long long)L * Wqp, 2));
-    gemm(act, P(I + "v_point_projection/point_projection/weights", -1), proj + (size_t)2 * L * Wqp, L, C, Wvp);
+    gemm(act, ipaIt->second.w, proj, L, C, Wipa);
     ipaUnpackK<<<blocks((size_t)L * ipaWork), 256, 0, STREAM>>>(
-      qs, ks, vs, proj, proj + (size_t)L * Wqp, proj + (size_t)2 * L * Wqp,
-      ipaIt->second.b, rig, qp, kp, vp, L, Hh, Cs, Pq, Pv, sqrtf(1.f / Cs));
+      proj, qs, ks, vs, ipaIt->second.b, rig, qp, kp, vp, L, Hh, Cs, Pq, Pv, sqrtf(1.f / Cs));
     ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
     // (the pair term apart, a block a query: see ipaPairTermK)
     const bool pairApart = act2d && Hh <= IPA_MAX_HEADS && C2 <= 1024;
@@ -623,12 +620,10 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   addBiasIntoK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, P(R + "input_projection_1/bias", -1), L, 128);
   for (int r = 0; r < 2; ++r) {
     std::string suffix = r == 0 ? "" : "_1";
-    reluCopyK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
     linearB(sb, R + "resblock1" + suffix, -1, sc2, L, 128, 128, true);
     gemm(sc2, P(R + "resblock2" + suffix + "/weights", -1), sb, L, 128, 128);
     addBiasIntoK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, P(R + "resblock2" + suffix + "/bias", -1), L, 128);
   }
-  reluCopyK<<<blocks((size_t)L * 32), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
   float* un = scratch<float>("sm.un", (size_t)L * 14);
   linearB(sb, R + "unnormalized_angles", -1, un, L, 128, 14);
   StructureOut o{act, rig, scratch<float>("sm.pos37", (size_t)L * 37 * 3), scratch<float>("sm.pos14", (size_t)L * 14 * 3),

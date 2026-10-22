@@ -300,206 +300,203 @@ inline void swap01(const float* x, float* y, int A, int B, int C) {
 //   keyMask:    [Bt, n] or null  - 1e9 * (mask - 1) on each key, AF2's `bias`
 //   pairBias:   [H, n, n] or null - AF2's `nonbatched_bias`, shared by every batch row
 //   out:        [Bt, n, H*D] = softmax(q k^T / sqrt(D) + biases) v * sigmoid(g)
-template <int D>
-__global__ void __launch_bounds__(256, D <= 16 ? 4 : 3)
+template <int D, int M = 1>
+__global__ void __launch_bounds__(256, (D * M <= 16) ? 4 : (D == 32 && M == 1 ? 3 : 2))
 attentionK(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
            const float* __restrict__ g, const float* __restrict__ gBias, const float* __restrict__ keyMask,
            const float* __restrict__ pairBias, float* __restrict__ out, int Bt, int n, int H, float scale) {
   constexpr int LDK = (D + 4) & ~3;
-  __shared__ __align__(16) float Qs[8][LDK];
+  __shared__ __align__(16) float Qs[8 * M][LDK];
   __shared__ __align__(16) float Ks[2][32][LDK];
   __shared__ __align__(16) float Vs[2][32][LDK];
   __shared__ float Ms[2][32];
   int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  unsigned nq = (unsigned)((n + 7) / 8);
+  unsigned nq = (unsigned)((n + 8 * M - 1) / (8 * M));
   size_t b = blockIdx.x / nq;
-  int qi0 = (int)(blockIdx.x - b * nq) * 8;
-  int qi = qi0 + warp;
+  if (b >= (size_t)Bt) return;
+  int qi0 = (int)(blockIdx.x - b * nq) * (8 * M);
   int h = (int)blockIdx.y;
   const int W = H * D;
-  const bool validQ = (b < (size_t)Bt && qi < n);
-  size_t bq = b * (size_t)n + (size_t)qi;
-  if (validQ && lane < D) {
-    Qs[warp][lane] = __ldg(q + bq * W + h * D + lane) * scale;
+  float m[M], l[M], o[M][D];
+#pragma unroll
+  for (int u = 0; u < M; ++u) {
+    int qi = qi0 + u * 8 + warp;
+    if (lane < D) {
+      size_t bq = b * (size_t)n + (size_t)qi;
+      Qs[u * 8 + warp][lane] = (qi < n) ? __ldg(q + bq * W + h * D + lane) * scale : 0.f;
+    }
+    m[u] = -INFINITY;
+    l[u] = 0.f;
+#pragma unroll
+    for (int d = 0; d < D; ++d) o[u][d] = 0.f;
   }
-  float m = -INFINITY, l = 0.f, o[D] = {};
-  const float* pbRow = (validQ && pairBias) ? (pairBias + ((size_t)h * n + qi) * n) : nullptr;
   constexpr int D4 = D / 4;
   constexpr int THREADS_FOR_KV = 32 * D4;
   const float* kBase = k + b * (size_t)n * W + h * D;
   const float* vBase = v + b * (size_t)n * W + h * D;
   const float* mBase = keyMask ? (keyMask + b * (size_t)n) : nullptr;
-  if constexpr ((D & 3) == 0 && D <= 32) {
-    const int jFull = n & ~31;
-    int kj = tid / D4, d4 = (tid % D4) * 4;
-    float pb_reg = 0.f;
-    if (jFull > 0) {
-      if (tid < THREADS_FOR_KV) {
-        size_t ko = (size_t)kj * W + d4;
-        cpAsync16(&Ks[0][kj][d4], kBase + ko, true);
-        cpAsync16(&Vs[0][kj][d4], vBase + ko, true);
+  const float* pbBase = pairBias ? (pairBias + ((size_t)h * n + qi0 + warp) * n) : nullptr;
+  const int jFull = n & ~31;
+  int kj = tid / D4, d4 = (tid % D4) * 4;
+  float pb_reg[M] = {};
+  if (jFull > 0) {
+    if (tid < THREADS_FOR_KV) {
+      size_t ko = (size_t)kj * W + d4;
+      cpAsync16(&Ks[0][kj][d4], kBase + ko, true);
+      cpAsync16(&Vs[0][kj][d4], vBase + ko, true);
+    }
+    if (mBase && tid < 32) Ms[0][tid] = 1e9f * (__ldg(mBase + tid) - 1.f);
+    if (pbBase) {
+#pragma unroll
+      for (int u = 0; u < M; ++u) {
+        if (qi0 + u * 8 + warp < n) pb_reg[u] = __ldg(pbBase + (size_t)u * 8 * n + lane);
       }
-      if (mBase && tid < 32) Ms[0][tid] = 1e9f * (__ldg(mBase + tid) - 1.f);
-      if (pbRow) pb_reg = __ldg(pbRow + lane);
+    }
+    cpCommit();
+    cpWait<0>();
+  }
+  __syncthreads();
+  int st = 0;
+  for (int j0 = 0; j0 < jFull; j0 += 32) {
+    float pbj[M];
+#pragma unroll
+    for (int u = 0; u < M; ++u) pbj[u] = pb_reg[u];
+    int jNext = j0 + 32;
+    int nst = st ^ 1;
+    if (jNext < jFull) {
+      if (tid < THREADS_FOR_KV) {
+        size_t ko = (size_t)(jNext + kj) * W + d4;
+        cpAsync16(&Ks[nst][kj][d4], kBase + ko, true);
+        cpAsync16(&Vs[nst][kj][d4], vBase + ko, true);
+      }
+      if (mBase && tid < 32) Ms[nst][tid] = 1e9f * (__ldg(mBase + jNext + tid) - 1.f);
+      if (pbBase) {
+#pragma unroll
+        for (int u = 0; u < M; ++u) {
+          if (qi0 + u * 8 + warp < n) pb_reg[u] = __ldg(pbBase + (size_t)u * 8 * n + jNext + lane);
+        }
+      }
       cpCommit();
+    }
+    float s[M] = {};
+#pragma unroll
+    for (int d = 0; d < D; d += 4) {
+      float4 kv = *reinterpret_cast<const float4*>(&Ks[st][lane][d]);
+#pragma unroll
+      for (int u = 0; u < M; ++u) {
+        float4 q4 = *reinterpret_cast<const float4*>(&Qs[u * 8 + warp][d]);
+        s[u] += q4.x * kv.x; s[u] += q4.y * kv.y; s[u] += q4.z * kv.z; s[u] += q4.w * kv.w;
+      }
+    }
+    float ms = mBase ? Ms[st][lane] : 0.f;
+    float c[M], p[M];
+#pragma unroll
+    for (int u = 0; u < M; ++u) {
+      if (mBase) s[u] += ms;
+      if (pbBase) s[u] += pbj[u];
+      s[u] = fminf(fmaxf(s[u], -1e8f), 1e8f);
+      float mn = fmaxf(m[u], s[u]);
+      c[u] = __expf(m[u] - mn);
+      p[u] = __expf(s[u] - mn);
+      l[u] = l[u] * c[u] + p[u];
+      m[u] = mn;
+    }
+#pragma unroll
+    for (int d = 0; d < D; d += 4) {
+      float4 vv = *reinterpret_cast<const float4*>(&Vs[st][lane][d]);
+#pragma unroll
+      for (int u = 0; u < M; ++u) {
+        o[u][d]     = o[u][d]     * c[u] + p[u] * vv.x;
+        o[u][d + 1] = o[u][d + 1] * c[u] + p[u] * vv.y;
+        o[u][d + 2] = o[u][d + 2] * c[u] + p[u] * vv.z;
+        o[u][d + 3] = o[u][d + 3] * c[u] + p[u] * vv.w;
+      }
+    }
+    if (jNext < jFull) {
       cpWait<0>();
+      __syncthreads();
+      st = nst;
+    }
+  }
+  if (jFull < n) {
+    int j0 = jFull;
+    int nst = st ^ 1;
+    if (tid < THREADS_FOR_KV && j0 + kj < n) {
+      size_t ko = (size_t)(j0 + kj) * W + d4;
+      *reinterpret_cast<float4*>(&Ks[nst][kj][d4]) = __ldg(reinterpret_cast<const float4*>(kBase + ko));
+      *reinterpret_cast<float4*>(&Vs[nst][kj][d4]) = __ldg(reinterpret_cast<const float4*>(vBase + ko));
+    }
+    if (mBase && tid < 32 && j0 + tid < n) Ms[nst][tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
+    int j = j0 + lane;
+    float pbj[M] = {};
+    if (pbBase && j < n) {
+#pragma unroll
+      for (int u = 0; u < M; ++u) {
+        if (qi0 + u * 8 + warp < n) pbj[u] = __ldg(pbBase + (size_t)u * 8 * n + j);
+      }
     }
     __syncthreads();
-    int st = 0;
-    for (int j0 = 0; j0 < jFull; j0 += 32) {
-      float pbj = pb_reg;
-      int jNext = j0 + 32;
-      int nst = st ^ 1;
-      if (jNext < jFull) {
-        if (tid < THREADS_FOR_KV) {
-          size_t ko = (size_t)(jNext + kj) * W + d4;
-          cpAsync16(&Ks[nst][kj][d4], kBase + ko, true);
-          cpAsync16(&Vs[nst][kj][d4], vBase + ko, true);
+    if (j < n) {
+      float s[M] = {};
+#pragma unroll
+      for (int d = 0; d < D; d += 4) {
+        float4 kv = *reinterpret_cast<const float4*>(&Ks[nst][lane][d]);
+#pragma unroll
+        for (int u = 0; u < M; ++u) {
+          float4 q4 = *reinterpret_cast<const float4*>(&Qs[u * 8 + warp][d]);
+          s[u] += q4.x * kv.x; s[u] += q4.y * kv.y; s[u] += q4.z * kv.z; s[u] += q4.w * kv.w;
         }
-        if (mBase && tid < 32) Ms[nst][tid] = 1e9f * (__ldg(mBase + jNext + tid) - 1.f);
-        if (pbRow) pb_reg = __ldg(pbRow + jNext + lane);
-        cpCommit();
       }
-      if (validQ) {
-        float s = 0.f;
+      float ms = mBase ? Ms[nst][lane] : 0.f;
+      float c[M], p[M];
 #pragma unroll
-        for (int d = 0; d < D; d += 4) {
-          float4 q4 = *reinterpret_cast<const float4*>(&Qs[warp][d]);
-          float4 kv = *reinterpret_cast<const float4*>(&Ks[st][lane][d]);
-          s += q4.x * kv.x; s += q4.y * kv.y; s += q4.z * kv.z; s += q4.w * kv.w;
-        }
-        if (mBase) s += Ms[st][lane];
-        if (pbRow) s += pbj;
-        s = fminf(fmaxf(s, -1e8f), 1e8f);
-        float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-        l = l * c + p;
-#pragma unroll
-        for (int d = 0; d < D; d += 4) {
-          float4 vv = *reinterpret_cast<const float4*>(&Vs[st][lane][d]);
-          o[d]     = o[d]     * c + p * vv.x;
-          o[d + 1] = o[d + 1] * c + p * vv.y;
-          o[d + 2] = o[d + 2] * c + p * vv.z;
-          o[d + 3] = o[d + 3] * c + p * vv.w;
-        }
-        m = mn;
+      for (int u = 0; u < M; ++u) {
+        if (mBase) s[u] += ms;
+        if (pbBase) s[u] += pbj[u];
+        s[u] = fminf(fmaxf(s[u], -1e8f), 1e8f);
+        float mn = fmaxf(m[u], s[u]);
+        c[u] = __expf(m[u] - mn);
+        p[u] = __expf(s[u] - mn);
+        l[u] = l[u] * c[u] + p[u];
+        m[u] = mn;
       }
-      if (jNext < jFull) {
-        cpWait<0>();
-        __syncthreads();
-        st = nst;
-      }
-    }
-    if (jFull < n) {
-      int j0 = jFull;
-      int nst = st ^ 1;
-      if (tid < THREADS_FOR_KV && j0 + kj < n) {
-        size_t ko = (size_t)(j0 + kj) * W + d4;
-        *reinterpret_cast<float4*>(&Ks[nst][kj][d4]) = __ldg(reinterpret_cast<const float4*>(kBase + ko));
-        *reinterpret_cast<float4*>(&Vs[nst][kj][d4]) = __ldg(reinterpret_cast<const float4*>(vBase + ko));
-      }
-      if (mBase && tid < 32 && j0 + tid < n) Ms[nst][tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
-      int j = j0 + lane;
-      float pbj = (pbRow && j < n) ? __ldg(pbRow + j) : 0.f;
-      __syncthreads();
-      if (validQ && j < n) {
-        float s = 0.f;
 #pragma unroll
-        for (int d = 0; d < D; d += 4) {
-          float4 q4 = *reinterpret_cast<const float4*>(&Qs[warp][d]);
-          float4 kv = *reinterpret_cast<const float4*>(&Ks[nst][lane][d]);
-          s += q4.x * kv.x; s += q4.y * kv.y; s += q4.z * kv.z; s += q4.w * kv.w;
-        }
-        if (mBase) s += Ms[nst][lane];
-        if (pbRow) s += pbj;
-        s = fminf(fmaxf(s, -1e8f), 1e8f);
-        float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-        l = l * c + p;
+      for (int d = 0; d < D; d += 4) {
+        float4 vv = *reinterpret_cast<const float4*>(&Vs[nst][lane][d]);
 #pragma unroll
-        for (int d = 0; d < D; d += 4) {
-          float4 vv = *reinterpret_cast<const float4*>(&Vs[nst][lane][d]);
-          o[d]     = o[d]     * c + p * vv.x;
-          o[d + 1] = o[d + 1] * c + p * vv.y;
-          o[d + 2] = o[d + 2] * c + p * vv.z;
-          o[d + 3] = o[d + 3] * c + p * vv.w;
+        for (int u = 0; u < M; ++u) {
+          o[u][d]     = o[u][d]     * c[u] + p[u] * vv.x;
+          o[u][d + 1] = o[u][d + 1] * c[u] + p[u] * vv.y;
+          o[u][d + 2] = o[u][d + 2] * c[u] + p[u] * vv.z;
+          o[u][d + 3] = o[u][d + 3] * c[u] + p[u] * vv.w;
         }
-        m = mn;
-      }
-    }
-  } else {
-    for (int j0 = 0; j0 < n; j0 += 32) {
-      if (j0 + 32 <= n) {
-        for (int idx = tid; idx < 32 * D; idx += 256) {
-          int kj = idx / D, d = idx % D;
-          size_t ko = (size_t)(j0 + kj) * W + d;
-          Ks[0][kj][d] = __ldg(kBase + ko);
-          Vs[0][kj][d] = __ldg(vBase + ko);
-        }
-        if (mBase && tid < 32) Ms[0][tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
-        __syncthreads();
-        if (validQ) {
-          int j = j0 + lane;
-          float s = 0.f;
-#pragma unroll
-          for (int d = 0; d < D; ++d) s += Qs[warp][d] * Ks[0][lane][d];
-          if (mBase) s += Ms[0][lane];
-          if (pbRow) s += __ldg(pbRow + j);
-          s = fminf(fmaxf(s, -1e8f), 1e8f);
-          float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-          l = l * c + p;
-#pragma unroll
-          for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[0][lane][d];
-          m = mn;
-        }
-        __syncthreads();
-      } else {
-        for (int idx = tid; idx < 32 * D; idx += 256) {
-          int kj = idx / D, d = idx % D;
-          if (j0 + kj < n) {
-            size_t ko = (size_t)(j0 + kj) * W + d;
-            Ks[0][kj][d] = __ldg(kBase + ko);
-            Vs[0][kj][d] = __ldg(vBase + ko);
-          }
-        }
-        if (mBase && tid < 32 && j0 + tid < n) Ms[0][tid] = 1e9f * (__ldg(mBase + j0 + tid) - 1.f);
-        __syncthreads();
-        int j = j0 + lane;
-        if (validQ && j < n) {
-          float s = 0.f;
-#pragma unroll
-          for (int d = 0; d < D; ++d) s += Qs[warp][d] * Ks[0][lane][d];
-          if (mBase) s += Ms[0][lane];
-          if (pbRow) s += __ldg(pbRow + j);
-          s = fminf(fmaxf(s, -1e8f), 1e8f);
-          float mn = fmaxf(m, s), c = __expf(m - mn), p = __expf(s - mn);
-          l = l * c + p;
-#pragma unroll
-          for (int d = 0; d < D; ++d) o[d] = o[d] * c + p * Vs[0][lane][d];
-          m = mn;
-        }
-        __syncthreads();
       }
     }
   }
-  if (!validQ) return;
-  float M_ = m;
 #pragma unroll
-  for (int off = 16; off; off >>= 1) M_ = fmaxf(M_, __shfl_xor_sync(~0u, M_, off));
-  float c = m == -INFINITY ? 0.f : __expf(m - M_);
-  l *= c;
+  for (int u = 0; u < M; ++u) {
+    int qi = qi0 + u * 8 + warp;
+    float M_ = m[u];
 #pragma unroll
-  for (int off = 16; off; off >>= 1) l += __shfl_xor_sync(~0u, l, off);
-  float x_lane = 0.f;
+    for (int off = 16; off; off >>= 1) M_ = fmaxf(M_, __shfl_xor_sync(~0u, M_, off));
+    float c = m[u] == -INFINITY ? 0.f : __expf(m[u] - M_);
+    float lu = l[u] * c;
 #pragma unroll
-  for (int d = 0; d < D; ++d) {
-    float x = o[d] * c;
+    for (int off = 16; off; off >>= 1) lu += __shfl_xor_sync(~0u, lu, off);
+    float x_lane = 0.f;
 #pragma unroll
-    for (int off = 16; off; off >>= 1) x += __shfl_xor_sync(~0u, x, off);
-    if (lane == d) x_lane = x;
-  }
-  if (lane < D) {
-    float gv = __ldg(g + bq * W + h * D + lane) + (gBias ? __ldg(gBias + h * D + lane) : 0.f);
-    float gate = 1.f / (1.f + __expf(-gv));
-    out[bq * W + h * D + lane] = x_lane / l * gate;
+    for (int d = 0; d < D; ++d) {
+      float x = o[u][d] * c;
+#pragma unroll
+      for (int off = 16; off; off >>= 1) x += __shfl_xor_sync(~0u, x, off);
+      if (lane == d) x_lane = x;
+    }
+    if (qi < n && lane < D) {
+      size_t bq = b * (size_t)n + (size_t)qi;
+      float gv = __ldg(g + bq * W + h * D + lane) + (gBias ? __ldg(gBias + h * D + lane) : 0.f);
+      float gate = 1.f / (1.f + __expf(-gv));
+      out[bq * W + h * D + lane] = x_lane / lu * gate;
+    }
   }
 }
 // q, k, v, g [rows, W] f32 -> qkvg [rows][4W] f16 (the flash kernel's layout, roles in that order)
@@ -540,13 +537,32 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
     halfToFloatK<<<blocks(rows * W), 256, 0, STREAM>>>(o, out, rows * W);
     return;
   }
-  unsigned nq = (unsigned)((n + 7) / 8);
-  dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
   float scale = 1.f / sqrtf((float)D);
-  if (D == 32) attentionK<32><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
-  else if (D == 8) attentionK<8><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
-  else if (D == 16) attentionK<16><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
-  else { fprintf(stderr, "attention: no kernel for head width %d\n", D); exit(1); }
+  if (D == 32) {
+    if (n >= 96) {
+      unsigned nq = (unsigned)((n + 15) / 16);
+      dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
+      attentionK<32, 2><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+    } else {
+      unsigned nq = (unsigned)((n + 7) / 8);
+      dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
+      attentionK<32, 1><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+    }
+  } else if (D == 16) {
+    unsigned nq = (unsigned)((n + 7) / 8);
+    dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
+    attentionK<16, 1><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+  } else if (D == 8) {
+    if (n >= 64) {
+      unsigned nq = (unsigned)((n + 31) / 32);
+      dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
+      attentionK<8, 4><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+    } else {
+      unsigned nq = (unsigned)((n + 7) / 8);
+      dim3 grid((unsigned)((size_t)Bt * nq), (unsigned)H);
+      attentionK<8, 1><<<grid, 256, 0, STREAM>>>(q, k, v, g, gBias, keyMask, pairBias, out, Bt, n, H, scale);
+    }
+  } else { fprintf(stderr, "attention: no kernel for head width %d\n", D); exit(1); }
 }
 // add the gate's bias [H*D] to g, a [rows, H*D] block with row stride `ld`
 __global__ void addStridedBiasK(float* __restrict__ g, const float* __restrict__ b, size_t rows, int W, int ld) {

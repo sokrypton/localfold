@@ -329,18 +329,39 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
 }
 
 // ---------------------------------------------------------------- the block's modules
+__global__ void packBatched4K(const float* __restrict__ qw, const float* __restrict__ kw,
+                              const float* __restrict__ vw, const float* __restrict__ gw,
+                              float* __restrict__ out, int nblk, size_t slice) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)nblk * slice) return;
+  int b = (int)(t / slice); size_t s = t % slice;
+  float* o = out + (size_t)b * 4 * slice;
+  o[s] = qw[t]; o[slice + s] = kw[t]; o[2 * slice + s] = vw[t]; o[3 * slice + s] = gw[t];
+}
 // gated self-attention with its own q/k/v/gate/output weights, over [Bt, n, C] rows
 inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::string& A, int blk, int H, int D,
                            const float* keyMask, const float* pairBias, float* out,
                            float* addInto = nullptr, int swapA = 0, int swapB = 0) {
   size_t rows = (size_t)Bt * n; int Wd = H * D;
-  float* q = scratch<float>("att.q", rows * Wd); float* k = scratch<float>("att.k", rows * Wd);
-  float* v = scratch<float>("att.v", rows * Wd); float* g = scratch<float>("att.g", rows * Wd);
-  float* o = scratch<float>("att.o", rows * Wd);
-  gemm(xn, P(A + "/query_w", blk), q, rows, C, Wd);
-  gemm(xn, P(A + "/key_w", blk), k, rows, C, Wd);
-  gemm(xn, P(A + "/value_w", blk), v, rows, C, Wd);
-  gemm(xn, P(A + "/gating_w", blk), g, rows, C, Wd);
+  size_t wSlice = (size_t)C * Wd, oSlice = rows * (size_t)Wd;
+  static std::map<const float*, const float*> qkvgWCache;
+  int b0 = blk < 0 ? -1 : 0;
+  const float* qw0 = P(A + "/query_w", b0);
+  auto it = qkvgWCache.find(qw0);
+  if (it == qkvgWCache.end()) {
+    int nblk = blk < 0 ? 1 : (int)dimW(A + "/query_w", 0);
+    float* w4 = wpool<float>((size_t)nblk * 4 * wSlice);
+    packBatched4K<<<blocks((size_t)nblk * wSlice), 256, 0, STREAM>>>(
+      qw0, P(A + "/key_w", b0), P(A + "/value_w", b0), P(A + "/gating_w", b0), w4, nblk, wSlice);
+    it = qkvgWCache.emplace(qw0, w4).first;
+  }
+  const float* w4 = it->second + (blk < 0 ? 0 : (size_t)blk * 4 * wSlice);
+  float* q = scratch<float>("att.qkvg", 4 * oSlice);
+  float *k = q + oSlice, *v = q + 2 * oSlice, *g = q + 3 * oSlice;
+  float* o = scratch<float>("att.o", oSlice);
+  const float one = 1.f, zero = 0.f;
+  CB(cublasSgemmStridedBatched(::H, CUBLAS_OP_N, CUBLAS_OP_N, Wd, (int)rows, C, &one,
+                               w4, Wd, (long long)wSlice, xn, C, 0, &zero, q, Wd, (long long)oSlice, 4));
   attention(D, q, k, v, g, keyMask, pairBias, o, Bt, n, H, P(A + "/gating_b", blk));
   gemm(o, P(A + "/output_w", blk), out, rows, Wd, C);
   if (addInto) {
@@ -762,6 +783,12 @@ __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, flo
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
   out[t] = scale == 1.f ? lt[((size_t)s * L + i) * O + c] : __float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale);
 }
+__global__ void opmLeftToICSF32K(const float* __restrict__ lt, float* __restrict__ out, int S, int L, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * L * O) return;
+  int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
+  out[t] = lt[((size_t)s * L + i) * O + c];
+}
 // (the bias-augmented shallow OPM, sm_12x) Lt [L][K] -> [L][K+8], ones at columns K and K+1 and zeros after; and the GEMM's
 // weight grown by 8 rows - the tiled bias as two f16 rows at K and K+1, zeros after - so the bias rides the GEMM itself
 __global__ void opmAugLeftK(const half* Lt, half* La, int L, int K) {
@@ -1045,6 +1072,23 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   const float one = 1.f, zero = 0.f;
   // norm[i, j] = sum_s mask[s, i] mask[s, j]
   CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+  if (rowsN <= 32) {
+    const float* W = P(Op + "/output_w", blk);
+    float* T = scratch<float>("opm.T", (size_t)O * rows * 128);
+    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, 128, (long long)O * 128,
+                                 rt, O, 0, &zero, T, 128, (long long)rows * 128, O));
+    float* Lt = scratch<float>("opm.Lt", rows * O);
+    opmLeftToICSF32K<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O);
+    int K = O * rowsN;
+    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
+    float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
+    for (int i0 = 0; i0 < L; i0 += Bi) {
+      int bi = std::min(Bi, L - i0);
+      gemm(Lt + (size_t)i0 * K, T, Y, bi, K, L * 128);
+      opmAdd128K<float><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
+    }
+    return;
+  }
   size_t per = (size_t)L * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   float* Pm = scratch<float>("opm.P", (size_t)Bi * per);
@@ -1055,18 +1099,28 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     // row-major P (bi*O x L*O) = left_blk^T right, as col-major P^T = right * left_blk^T
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, L * O, lt + (size_t)i0 * O, L * O,
                    &zero, Pm, L * O));
-    opmPermuteK<float><<<blocks((O & 3) == 0 ? (size_t)bi * per / 4 : (size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
+    if (O == 32) opmPermute32K<<<(unsigned)((size_t)bi * ((L + 3) >> 2)), 256, 0, STREAM>>>(Pm, X, bi, L);
+    else opmPermuteK<float><<<blocks((O & 3) == 0 ? (size_t)bi * per / 4 : (size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
     gemm(X, P(Op + "/output_w", blk), Y, (size_t)bi * L, O * O, 128);
     opmAdd128K<float><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
   }
+}
+__global__ void packBatched2K(const float* __restrict__ w0, const float* __restrict__ w1,
+                              float* __restrict__ out, int nblk, size_t slice) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)nblk * slice) return;
+  int b = (int)(t / slice); size_t s = t % slice;
+  float* o = out + (size_t)b * 2 * slice;
+  o[s] = w0[t]; o[slice + s] = w1[t];
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
 __global__ void __launch_bounds__(256, 8)
 triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const float* __restrict__ mask,
           float* __restrict__ a, float* __restrict__ b, int L, int C,
-          const float* __restrict__ projB = nullptr, const float* __restrict__ gateB = nullptr) {
+          const float* __restrict__ projB = nullptr, const float* __restrict__ gateB = nullptr, int ld = 0) {
   __shared__ float A[32][33];
   __shared__ float B[32][33];
+  if (!ld) ld = 2 * C;
   size_t pairs = (size_t)L * L;
   size_t ij0 = (size_t)blockIdx.x * 32;
   int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
@@ -1077,7 +1131,7 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       size_t ij = ij0 + ty + k * 8;
-      size_t base = ij * (2 * C) + c;
+      size_t base = ij * (size_t)ld + c;
       float m = __ldg(mask + ij);
       float pa = __ldg(proj + base) + pba, ga = __ldg(gate + base) + gba;
       float pb = __ldg(proj + base + C) + pbb, gb = __ldg(gate + base + C) + gbb;
@@ -1101,7 +1155,7 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
     size_t ij = ij0 + ty + k;
     if (ij < pairs && c < C) {
       float m = __ldg(mask + ij);
-      size_t base = ij * (2 * C) + c;
+      size_t base = ij * (size_t)ld + c;
       A[ty + k][tx] = (__ldg(proj + base) + pba) * m / (1.f + __expf(-(__ldg(gate + base) + gba)));
       B[ty + k][tx] = (__ldg(proj + base + C) + pbb) * m / (1.f + __expf(-(__ldg(gate + base + C) + gbb)));
     }
@@ -1394,14 +1448,28 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   }
   float* xn = scratch<float>("tri.xn", pairs * C);
   layerNorm(pair, xn, pairs, C, T + "/left_norm_input", blk);
-  float* proj = scratch<float>("tri.proj", pairs * 2 * C); float* gate = scratch<float>("tri.gate", pairs * 2 * C);
-  gemm(xn, P(T + "/projection/weights", blk), proj, pairs, C, 2 * C);
-  gemm(xn, P(T + "/gate/weights", blk), gate, pairs, C, 2 * C);
+  size_t wSlice = (size_t)C * 2 * C, oSlice = pairs * (size_t)2 * C;
+  static std::map<const float*, const float*> pgWCache;
+  int b0 = blk < 0 ? -1 : 0;
+  const float* pw0 = P(T + "/projection/weights", b0);
+  auto it = pgWCache.find(pw0);
+  if (it == pgWCache.end()) {
+    int nblk = blk < 0 ? 1 : (int)dimW(T + "/projection/weights", 0);
+    float* w2 = wpool<float>((size_t)nblk * 2 * wSlice);
+    packBatched2K<<<blocks((size_t)nblk * wSlice), 256, 0, STREAM>>>(
+      pw0, P(T + "/gate/weights", b0), w2, nblk, wSlice);
+    it = pgWCache.emplace(pw0, w2).first;
+  }
+  const float* w2 = it->second + (blk < 0 ? 0 : (size_t)blk * 2 * wSlice);
+  float* proj = scratch<float>("tri.pg", 2 * oSlice);
+  float* gate = proj + oSlice;
+  const float one = 1.f, zero = 0.f;
+  CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 2 * C, (int)pairs, C, &one,
+                               w2, 2 * C, (long long)wSlice, xn, C, 0, &zero, proj, 2 * C, (long long)oSlice, 2));
   float* a = scratch<float>("tri.a", pairs * C); float* b = scratch<float>("tri.b", pairs * C);
   triSplitK<<<dim3((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
     proj, gate, pairMask, a, b, L, C, P(T + "/projection/bias", blk), P(T + "/gate/bias", blk));
   float* prod = scratch<float>("tri.prod", pairs * C);
-  const float one = 1.f, zero = 0.f;
   // per channel (row-major [i][k] planes): outgoing act[i,j] = sum_k a[i,k] b[j,k] = a b^T;
   // incoming act[i,j] = sum_k a[k,j] b[k,i] = (b^T a)[i,j]
   if (outgoing)

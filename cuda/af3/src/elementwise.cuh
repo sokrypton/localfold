@@ -59,20 +59,24 @@ __global__ void symmetriseRowsK(const float* z, float* out, int T, int C, size_t
   out[t] = z[(i * T + j) * C + c] + z[(j * T + i) * C + c];
 }
 __global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ out, const float* __restrict__ gate, size_t n,
-                            const float* __restrict__ outB = nullptr, const float* __restrict__ gateB = nullptr, int C = 0) {
+                            const float* __restrict__ outB = nullptr, const float* __restrict__ gateB = nullptr, int C = 0, int ld = 0) {
+  if (!ld) ld = C;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if ((n & 3) == 0 && (C & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out | (uintptr_t)gate | (uintptr_t)outB | (uintptr_t)gateB) & 15) == 0) {
+  if ((n & 3) == 0 && (C & 3) == 0 && (ld & 3) == 0 && (((uintptr_t)pair | (uintptr_t)out | (uintptr_t)gate | (uintptr_t)outB | (uintptr_t)gateB) & 15) == 0) {
     size_t n4 = n >> 2;
     if (t < n4) {
+      int c4 = C ? (C >> 2) : 0, ld4 = ld ? (ld >> 2) : 0;
+      size_t r = 0; int c = 0;
+      if (c4) {
+        if ((c4 & (c4 - 1)) == 0) { c = (int)(t & (size_t)(c4 - 1)); r = t >> (__ffs(c4) - 1); }
+        else if (n4 <= UINT32_MAX) { unsigned u = (unsigned)t, uc = (unsigned)c4, q = u / uc; r = q; c = (int)(u - q * uc); }
+        else { r = t / c4; c = (int)(t % c4); }
+      }
       float4 p = reinterpret_cast<const float4*>(pair)[t];
       float4 o = __ldg(reinterpret_cast<const float4*>(out) + t);
-      float4 g = __ldg(reinterpret_cast<const float4*>(gate) + t);
-      if (outB || gateB) {
-        int c4 = C >> 2;
-        int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)t % (unsigned)c4) : (int)(t % c4));
-        if (outB) { float4 ob = __ldg(reinterpret_cast<const float4*>(outB) + c); o.x += ob.x; o.y += ob.y; o.z += ob.z; o.w += ob.w; }
-        if (gateB) { float4 gb = __ldg(reinterpret_cast<const float4*>(gateB) + c); g.x += gb.x; g.y += gb.y; g.z += gb.z; g.w += gb.w; }
-      }
+      float4 g = __ldg(reinterpret_cast<const float4*>(gate) + (ld != C ? r * (size_t)ld4 + c : t));
+      if (outB) { float4 ob = __ldg(reinterpret_cast<const float4*>(outB) + c); o.x += ob.x; o.y += ob.y; o.z += ob.z; o.w += ob.w; }
+      if (gateB) { float4 gb = __ldg(reinterpret_cast<const float4*>(gateB) + c); g.x += gb.x; g.y += gb.y; g.z += gb.z; g.w += gb.w; }
       p.x += o.x / (1.f + __expf(-g.x));
       p.y += o.y / (1.f + __expf(-g.y));
       p.z += o.z / (1.f + __expf(-g.z));
@@ -83,8 +87,9 @@ __global__ void gateMulAddK(float* __restrict__ pair, const float* __restrict__ 
   }
   if (t < n) {
     int c = C ? (int)(t % C) : 0;
+    size_t gIdx = (ld != C && C) ? (t / C) * (size_t)ld + c : t;
     float ov = out[t] + (outB ? __ldg(outB + c) : 0.f);
-    float gv = gate[t] + (gateB ? __ldg(gateB + c) : 0.f);
+    float gv = gate[gIdx] + (gateB ? __ldg(gateB + c) : 0.f);
     pair[t] += ov / (1.f + __expf(-gv));
   }
 }
@@ -163,7 +168,8 @@ channelMajorToRowsTileK(const float* __restrict__ x, float* __restrict__ y, size
   }
 }
 
-__global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ out, size_t pairs, int C,
+template <class TY = half>
+__global__ void centerNormHK(const float* __restrict__ prod, TY* __restrict__ out, size_t pairs, int C,
                              const float* __restrict__ scale, const float* __restrict__ offset, int L, int Lp) {
   extern __shared__ float tile[];               // [C][33]
   size_t r0 = (size_t)blockIdx.x * 32;
@@ -213,9 +219,13 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
       #pragma unroll
       for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
       float inv = rsqrtf(v * (1.f / 256.f) + 1e-5f);
-      half* outRow = out + r * 256;
+      TY* outRow = out + r * 256;
       #pragma unroll
-      for (int k = 0; k < 8; ++k) outRow[k * 32 + lane] = __float2half((tv[k] - mean) * inv * sc[k] + of[k]);
+      for (int k = 0; k < 8; ++k) {
+        float yv = (tv[k] - mean) * inv * sc[k] + of[k];
+        if constexpr (std::is_same_v<TY, half>) outRow[k * 32 + lane] = __float2half(yv);
+        else outRow[k * 32 + lane] = yv;
+      }
     }
     return;
   }
@@ -257,9 +267,13 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
       #pragma unroll
       for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
       float inv = rsqrtf(v * (1.f / 128.f) + 1e-5f);
-      half* outRow = out + r * 128;
+      TY* outRow = out + r * 128;
       #pragma unroll
-      for (int k = 0; k < 4; ++k) outRow[k * 32 + lane] = __float2half((tv[k] - mean) * inv * sc[k] + of[k]);
+      for (int k = 0; k < 4; ++k) {
+        float yv = (tv[k] - mean) * inv * sc[k] + of[k];
+        if constexpr (std::is_same_v<TY, half>) outRow[k * 32 + lane] = __float2half(yv);
+        else outRow[k * 32 + lane] = yv;
+      }
     }
     return;
   }
@@ -277,7 +291,11 @@ __global__ void centerNormHK(const float* __restrict__ prod, half* __restrict__ 
     for (int c = lane; c < C; c += 32) { float d = tile[c * 33 + row] - mean; v += d * d; }
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
     float inv = rsqrtf(v / C + 1e-5f);
-    for (int c = lane; c < C; c += 32) out[r * C + c] = __float2half((tile[c * 33 + row] - mean) * inv * scale[c] + offset[c]);
+    for (int c = lane; c < C; c += 32) {
+      float yv = (tile[c * 33 + row] - mean) * inv * scale[c] + offset[c];
+      if constexpr (std::is_same_v<TY, half>) out[r * C + c] = __float2half(yv);
+      else out[r * C + c] = yv;
+    }
   }
 }
 
@@ -389,6 +407,35 @@ __global__ void opmPermuteK(const T* __restrict__ in, T* __restrict__ out, int B
   int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
   int j = (int)(rest % n); int bi = (int)(rest / n);
   out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
+}
+// Coalesced shared-memory tile for O == 32: each warp loads 4 consecutive j rows (32 float4 = 512B) of one c,
+// then all 256 threads write 256 contiguous float4s per j.
+__global__ void __launch_bounds__(256, 3)
+opmPermute32K(const float* __restrict__ in, float* __restrict__ out, int Bi, int n) {
+  __shared__ float4 tile[4][32][8];
+  unsigned n4 = (unsigned)((n + 3) >> 2);
+  int bi = (int)(blockIdx.x / n4);
+  int j0 = (int)(blockIdx.x - (unsigned)bi * n4) << 2;
+  if (bi >= Bi) return;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int dj = lane >> 3, e4 = lane & 7;
+  const float4* in4 = reinterpret_cast<const float4*>(in);
+  float4* out4 = reinterpret_cast<float4*>(out);
+  if (j0 + dj < n) {
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      int c = warp + m * 8;
+      tile[dj][c][e4] = __ldg(in4 + ((size_t)bi * 32 + c) * ((size_t)n * 8) + (size_t)j0 * 8 + lane);
+    }
+  }
+  __syncthreads();
+  int sc = tid >> 3, se4 = tid & 7;
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    if (j0 + m < n) {
+      out4[((size_t)bi * n + j0 + m) * 256 + tid] = tile[m][sc][se4];
+    }
+  }
 }
 // eight halves (16 bytes) a thread: O is a multiple of 8, so a run of e never straddles a row
 __global__ void opmPermuteHK(const half* __restrict__ Pm, half* __restrict__ X, int bi, int L, int O) {

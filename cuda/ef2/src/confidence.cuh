@@ -75,8 +75,22 @@ confZNorm256K(const float* __restrict__ zIn, float* __restrict__ zOut,
     yr[c] = n + (rp + bond * __ldg(wBond + c) + __ldg(riRow + c) + __ldg(cjRow + c));
   }
 }
-__global__ void outerProductK(const float* a, const float* b, float* out, size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
+__global__ void outerProductK(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out,
+                              size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)a | (uintptr_t)b | (uintptr_t)out) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = n * (size_t)c4;
+    if (t >= n4) return;
+    size_t q = ((c4 & (c4 - 1)) == 0) ? (t >> (__ffs(c4) - 1)) : (t / c4);
+    int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (int)(t % c4);
+    size_t ij = p0 + q;
+    int i = (int)(ij / (size_t)T), j = (int)(ij % (size_t)T);
+    float4 av = __ldg(reinterpret_cast<const float4*>(a + (size_t)i * C) + c);
+    float4 bv = __ldg(reinterpret_cast<const float4*>(b + (size_t)j * C) + c);
+    reinterpret_cast<float4*>(out)[t] = make_float4(av.x * bv.x, av.y * bv.y, av.z * bv.z, av.w * bv.w);
+    return;
+  }
   if (t >= n * C) return;
   int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
   out[t] = a[(size_t)i * C + c] * b[(size_t)j * C + c];
@@ -85,7 +99,7 @@ __global__ void outerProductK(const float* a, const float* b, float* out, size_t
 // element a thread took the distance and walked every edge for each of the C channels (12 ms of a 1,044-token
 // confidence head's 194; C a multiple of 4)
 __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const float* edges, int nEdges,
-                               const float* table, int T, int C) {
+                               const float* table, int T, int C, __nv_bfloat16* z16Out = nullptr) {
   size_t ij = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5; int lane = threadIdx.x & 31;
   if (ij >= (size_t)T * T) return;
   int i = (int)(ij / T), j = (int)(ij % T);
@@ -96,7 +110,17 @@ __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const f
   for (int e0 = 0; e0 < nEdges; e0 += 32) bucket += __popc(__ballot_sync(~0u, e0 + lane < nEdges && d > edges[e0 + lane]));
   float4* row = reinterpret_cast<float4*>(z + ij * C);
   const float4* tb = reinterpret_cast<const float4*>(table + (size_t)bucket * C);
-  for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
+  uint2* row16 = z16Out ? reinterpret_cast<uint2*>(z16Out + ij * C) : nullptr;
+  for (int c = lane; c < C / 4; c += 32) {
+    float4 v = row[c], w = tb[c];
+    v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w;
+    row[c] = v;
+    if (row16) {
+      __nv_bfloat162 b0 = __floats2bfloat162_rn(v.x, v.y);
+      __nv_bfloat162 b1 = __floats2bfloat162_rn(v.z, v.w);
+      row16[c] = make_uint2(*reinterpret_cast<uint32_t*>(&b0), *reinterpret_cast<uint32_t*>(&b1));
+    }
+  }
 }
 // ...a chunk of pair positions [p0, p0 + n) of z (EF2_Z16's head, which builds its pair a chunk of rows at a time)
 __global__ void confZRowsK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
@@ -296,7 +320,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   // (tight only where the device lacks the room for the two pair-sized tensors the roomy form holds: parking
   // the residual on the host was 1.17 s of a 1,044-token fold on a 40 GB A100 - a 1.1 GB pinned allocation
   // and a copy each way - with 30 GB free; LOCALFOLD_BIG=1 still takes the parked form)
-  bool tight = shortPair(P, C) && !roomFor(2 * P * C * 4), inPlace = consume && tight;
+  bool tight = shortPair(P, C) && !roomFor(2 * P * C * 4), inPlace = consume;
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
   gemm(s, F("confidence/sToZ"), r, T, Si, C);
@@ -336,7 +360,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
         layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
         confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
       }
-      outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
+      outerProductK<<<blocks((C & 3) == 0 ? n * (size_t)(C >> 2) : n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
         (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), p0, n, T, C);
@@ -390,40 +414,50 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   float* prod = scratch<float>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prod, p0, n, T, C);
+    outerProductK<<<blocks((C & 3) == 0 ? n * (size_t)(C >> 2) : n * C), 256, 0, STREAM>>>(l, rr, prod, p0, n, T, C);
     gemm(prod, F("confidence/sToZProdOut"), z + p0 * C, n, C, C, 1.f);
   }
+  const bool p16Conf = !tight && !check && ef2Pair16(T, C);
+  __nv_bfloat16* p16 = p16Conf ? scratch<__nv_bfloat16>("ef2.p16", P * C) : nullptr;
   distanceEmbedK<<<blocks(P * 32), 256, 0, STREAM>>>(z, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
-    (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), T, C);
+    (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), T, C, p16);
   // z + trunk(z) - on a card short of room z waits in pinned host memory while the blocks run on it in place,
   // then comes back a chunk at a time and is added (the same sum: one more pair-sized tensor not on the card)
   float* mask = scratch<float>("trunk.mask", P);
   fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
-  float* stack = tight ? z : dalloc(P * C);
-  static float* heldBuf = nullptr; static size_t heldHave = 0;     // (pinned, kept for the process, grown as needed)
-  if (tight && heldHave < P * C) {
-    if (heldBuf) CK(cudaFreeHost(heldBuf));
-    if (cudaMallocHost(&heldBuf, P * C * 4) != cudaSuccess) {
-      fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", P * C * 4 / 1e9); exit(1);
-    }
-    heldHave = P * C;
-  }
-  float* held = tight ? heldBuf : nullptr;
-  if (tight) CK(cudaMemcpyAsync(held, z, P * C * 4, cudaMemcpyDeviceToHost, STREAM));
-  else CK(cudaMemcpyAsync(stack, z, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-  for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
-    trunkBlock(stack, mask, T, C, "confidence/blocks", b);
-  if (tight) {
-    releaseScratch({ "ftri.", "ftr.", "trib." });
-    float* back = scratch<float>("cf.back", chunk * C);
-    for (size_t p0 = 0; p0 < P; p0 += chunk) {
-      size_t n = std::min(chunk, P - p0);
-      CK(cudaMemcpyAsync(back, held + p0 * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
-      addK<<<blocks(n * C), 256, 0, STREAM>>>(z + p0 * C, back, n * C);
-    }
+  if (p16Conf) {
+    PAIR16 = true;
+    for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
+      trunkBlock(reinterpret_cast<float*>(p16), mask, T, C, "confidence/blocks", b);
+    PAIR16 = false;
+    size_t n = P * C;
+    ef2AddBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(z, p16, n);
   } else {
-    addK<<<blocks(P * C), 256, 0, STREAM>>>(z, stack, P * C);
-    CK(cudaFree(stack));
+    float* stack = tight ? z : scratch<float>("cf.stack", P * C);
+    static float* heldBuf = nullptr; static size_t heldHave = 0;     // (pinned, kept for the process, grown as needed)
+    if (tight && heldHave < P * C) {
+      if (heldBuf) CK(cudaFreeHost(heldBuf));
+      if (cudaMallocHost(&heldBuf, P * C * 4) != cudaSuccess) {
+        fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", P * C * 4 / 1e9); exit(1);
+      }
+      heldHave = P * C;
+    }
+    float* held = tight ? heldBuf : nullptr;
+    if (tight) CK(cudaMemcpyAsync(held, z, P * C * 4, cudaMemcpyDeviceToHost, STREAM));
+    else CK(cudaMemcpyAsync(stack, z, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
+      trunkBlock(stack, mask, T, C, "confidence/blocks", b);
+    if (tight) {
+      releaseScratch({ "ftri.", "ftr.", "trib." });
+      float* back = scratch<float>("cf.back", chunk * C);
+      for (size_t p0 = 0; p0 < P; p0 += chunk) {
+        size_t n = std::min(chunk, P - p0);
+        CK(cudaMemcpyAsync(back, held + p0 * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
+        addK<<<blocks(n * C), 256, 0, STREAM>>>(z + p0 * C, back, n * C);
+      }
+    } else {
+      addK<<<blocks(P * C), 256, 0, STREAM>>>(z, stack, P * C);
+    }
   }
   }
   // single by row-attention pooling
@@ -440,7 +474,8 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   std::vector<int> a2t(A), slot(A);
   CK(cudaMemcpy(a2t.data(), Idev("atom_to_token"), A * 4, cudaMemcpyDeviceToHost));
   for (int a = 0, k = 0; a < A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, slots - 1); }
-  int* dSlot = upload(slot.data(), A);
+  int* dSlot = scratch<int>("cf.slot", A);
+  CK(cudaMemcpyAsync(dSlot, slot.data(), (size_t)A * 4, cudaMemcpyHostToDevice, STREAM));
   float* pa = scratch<float>("cf.pa", A);
   layerNorm(single, single, T, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
   plddtAtomK<<<A, 64, 0, STREAM>>>(single, Idev("atom_to_token"), dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
@@ -491,7 +526,6 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     if (M.has("o/conf/ptm")) printf("  pTM %.6f against the oracle's %.6f\n", out.ptm, M.f("o/conf/ptm")[0]);
   }
   if (z && !inPlace) CK(cudaFree(z));
-  CK(cudaFree(dSlot));
   return out;
 }
 

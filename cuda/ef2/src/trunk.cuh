@@ -173,9 +173,14 @@ inline void triangle(float* pair, const float* mask, int L, int C, const std::st
   else
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, L, &one, a, L, P, b, L, P, &zero, prod, L, P, C));
   float* rowsP = scratch<float>("tri.rows", P * C);
-  channelMajorToRowsTileK<<<dim3((unsigned)((P + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
-      prod, rowsP, P, C);
-  layerNorm(rowsP, rowsP, P, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
+  if ((C == 256 || C == 128) && (size_t)C * 33 * 4 <= 48 * 1024) {
+    centerNormHK<float><<<(unsigned)((P + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(
+        prod, rowsP, P, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), L, L);
+  } else {
+    channelMajorToRowsTileK<<<dim3((unsigned)((P + 31) / 32), (unsigned)((C + 31) / 32)), dim3(32, 8), 0, STREAM>>>(
+        prod, rowsP, P, C);
+    layerNorm(rowsP, rowsP, P, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
+  }
   float* out = scratch<float>("tri.out", P * C);
   gemm(rowsP, F(Tn + "outputProjection"), out, P, C, C);
   float* g = scratch<float>("tri.g", P * C);
@@ -486,11 +491,68 @@ __global__ void decayUpdate16K(__nv_bfloat16* z, const float* y, const float* a,
   if (t >= rows * C) return;
   z[t] = __float2bfloat16(a[t % C] * __bfloat162float(z[t]) + y[t]);
 }
-// z = a * z + y, a per channel
-__global__ void decayUpdateK(float* z, const float* y, const float* a, size_t rows, int C) {
+// z = a * z + y, a per channel (optionally writing a bf16 copy z16Out for the following trunkBlocks)
+__global__ void decayUpdateK(float* __restrict__ z, const float* __restrict__ y, const float* __restrict__ a,
+                             size_t rows, int C, __nv_bfloat16* __restrict__ z16Out = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)z | (uintptr_t)y | (uintptr_t)a) & 15) == 0 && ((uintptr_t)z16Out & 7) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t >= n4) return;
+    int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (int)(t % c4);
+    float4 zv = reinterpret_cast<const float4*>(z)[t];
+    float4 yv = __ldg(reinterpret_cast<const float4*>(y) + t);
+    float4 av = __ldg(reinterpret_cast<const float4*>(a) + c);
+    float4 out = make_float4(av.x * zv.x + yv.x, av.y * zv.y + yv.y, av.z * zv.z + yv.z, av.w * zv.w + yv.w);
+    reinterpret_cast<float4*>(z)[t] = out;
+    if (z16Out) {
+      __nv_bfloat162 b0 = __floats2bfloat162_rn(out.x, out.y);
+      __nv_bfloat162 b1 = __floats2bfloat162_rn(out.z, out.w);
+      reinterpret_cast<uint2*>(z16Out)[t] = make_uint2(*reinterpret_cast<uint32_t*>(&b0), *reinterpret_cast<uint32_t*>(&b1));
+    }
+    return;
+  }
   if (t >= rows * C) return;
-  z[t] = a[t % C] * z[t] + y[t];
+  float v = a[t % C] * z[t] + y[t];
+  z[t] = v;
+  if (z16Out) z16Out[t] = __float2bfloat16(v);
+}
+// Fused bf16->f32 + add(zInit) + LayerNorm(recycle/norm) for C == 256, a warp per row
+__global__ void __launch_bounds__(256, 4)
+recycleNormBf16K(const __nv_bfloat16* __restrict__ p16, const float* __restrict__ zInit,
+                 float* __restrict__ out, size_t rows,
+                 const float* __restrict__ scale, const float* __restrict__ offset) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) return;
+  int lane = threadIdx.x & 31;
+  const __nv_bfloat16* pr = p16 + row * 256;
+  const float* zr = zInit + row * 256;
+  float xv[8];
+  float s = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    float v = __bfloat162float(__ldg(pr + c)) + __ldg(zr + c);
+    xv[k] = v;
+    s += v;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / 256.f, v = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float d = xv[k] - mean;
+    v += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / 256.f + 1e-5f);
+  float* yr = out + row * 256;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    yr[c] = (xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
+  }
 }
 inline bool parcaeRecycle() { return M.has("f/recycle/decay"); }
 // ---------------------------------------------------------------- the pair in bf16 through the blocks (EF2_P16)
@@ -526,12 +588,28 @@ __global__ void ef2FromBf16K(const __nv_bfloat16* __restrict__ in, float* __rest
   }
   if (i < n) out[i] = __bfloat162float(in[i]);
 }
+__global__ void ef2AddBf16K(float* __restrict__ y, const __nv_bfloat16* __restrict__ x, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && ((uintptr_t)y & 15) == 0 && ((uintptr_t)x & 7) == 0) {
+    size_t n4 = n >> 2;
+    if (i < n4) {
+      float4 yv = reinterpret_cast<const float4*>(y)[i];
+      uint2 u = __ldg(reinterpret_cast<const uint2*>(x) + i);
+      float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+      float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+      reinterpret_cast<float4*>(y)[i] = make_float4(yv.x + f0.x, yv.y + f0.y, yv.z + f1.x, yv.w + f1.y);
+    }
+    return;
+  }
+  if (i < n) y[i] += __bfloat162float(x[i]);
+}
 inline bool ef2Pair16(int L, int C) {
   static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
   return !off && FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Big() && bf16Mma() &&
          !shortPair((size_t)L * L, C);
 }
-inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std::string& prefix, int from, int to) {
+inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std::string& prefix, int from, int to,
+                        bool p16In = false, bool p16Out = true) {
   if (from >= to) return;
   if (EF2_Z16) {                 // (the pair already bf16: the blocks in place)
     PAIR16 = true;
@@ -542,11 +620,11 @@ inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std:
   if (!ef2Pair16(L, C)) { for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b); return; }
   size_t n = (size_t)L * L * C;
   __nv_bfloat16* p16 = scratch<__nv_bfloat16>("ef2.p16", n);
-  ef2ToBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(pair, p16, n);
+  if (!p16In) ef2ToBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(pair, p16, n);
   PAIR16 = true;
   for (int b = from; b < to; ++b) trunkBlock(reinterpret_cast<float*>(p16), mask, L, C, prefix, b);
   PAIR16 = false;
-  ef2FromBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(p16, pair, n);
+  if (p16Out) ef2FromBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(p16, pair, n);
 }
 
 inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check,
@@ -568,24 +646,41 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
               codaBlocks = (int)M.meta("meta/codaBlocks");
     if (deterministic) CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
     else truncNormalK<<<blocks(P * C), 256, 0, STREAM>>>(z, P * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull);
-    float* inject = scratch<float>("trunk.inject", P * C);
+    const bool p16 = ef2Pair16(T, C);
+    const bool p16Lm = p16 && lmBlocks > 0 && !lmHost && C == 256;
+    __nv_bfloat16* p16Buf = p16 ? scratch<__nv_bfloat16>("ef2.p16", P * C) : nullptr;
+    float* inject = p16Lm ? nullptr : scratch<float>("trunk.inject", P * C);
     size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
     float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
     for (int loop = 0; loop < loops; ++loop) {
-      if (lmHost) {                                 // (parked in host memory: copied in, then dropped out in place)
-        CK(cudaMemcpyAsync(inject, lmHost, P * C * 4, cudaMemcpyHostToDevice, STREAM));
-        if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(inject, inject, P * C, p, seed, 1000 + loop);
-      } else if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
-      else CK(cudaMemcpyAsync(inject, lmZ, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-      trunkBlocks(inject, mask, T, C, "lmEncoder/blocks", 0, lmBlocks);
-      addK<<<blocks(P * C), 256, 0, STREAM>>>(inject, zInitP, P * C);
+      if (p16Lm) {
+        size_t n = P * C;
+        if (p > 0.f) dropoutK<__nv_bfloat16><<<blocks(n), 256, 0, STREAM>>>(lmZ, p16Buf, n, p, seed, 1000 + loop);
+        else ef2ToBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(lmZ, p16Buf, n);
+        trunkBlocks(nullptr, mask, T, C, "lmEncoder/blocks", 0, lmBlocks, true, false);
+      } else {
+        if (lmHost) {                                 // (parked in host memory: copied in, then dropped out in place)
+          CK(cudaMemcpyAsync(inject, lmHost, P * C * 4, cudaMemcpyHostToDevice, STREAM));
+          if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(inject, inject, P * C, p, seed, 1000 + loop);
+        } else if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
+        else CK(cudaMemcpyAsync(inject, lmZ, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        trunkBlocks(inject, mask, T, C, "lmEncoder/blocks", 0, lmBlocks);
+        addK<<<blocks(P * C), 256, 0, STREAM>>>(inject, zInitP, P * C);
+      }
       for (size_t r0 = 0; r0 < P; r0 += chunk) {
         size_t r = std::min(chunk, P - r0);
-        layerNorm(inject + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        if (p16Lm) {
+          recycleNormBf16K<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(
+              p16Buf + r0 * C, zInitP + r0 * C, xn, r, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        } else {
+          layerNorm(inject + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        }
         gemm(xn, F("recycle/projection"), y, r, C, C);
-        decayUpdateK<<<blocks(r * C), 256, 0, STREAM>>>(z + r0 * C, y, F("recycle/decay"), r, C);
+        size_t rc = r * C;
+        decayUpdateK<<<blocks((C & 3) == 0 ? (rc >> 2) : rc), 256, 0, STREAM>>>(
+            z + r0 * C, y, F("recycle/decay"), r, C, (p16 && blocksN > 0) ? p16Buf + r0 * C : nullptr);
       }
-      trunkBlocks(z, mask, T, C, "blocks", 0, blocksN);
+      trunkBlocks(z, mask, T, C, "blocks", 0, blocksN, p16 && blocksN > 0, true);
     }
     auto dumpPair = [&](const char* env) {             // (comparison aids: the pair at a seam, raw float32)
       if (!getenv(env)) return;
@@ -593,13 +688,19 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
       FILE* f = fopen(getenv(env), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
     };
     dumpPair("EF2_SAVE_PRE_READOUT");
+    const bool p16Coda = p16 && codaBlocks > 0 && !getenv("EF2_SAVE_PRE_CODA");
     for (size_t r0 = 0; r0 < P; r0 += chunk) {          // the readout, a chunk of rows at a time, in place
       size_t r = std::min(chunk, P - r0);
       gemm(z + r0 * C, F("readout"), y, r, C, C);
-      CK(cudaMemcpyAsync(z + r0 * C, y, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      if (p16Coda) {
+        size_t rc = r * C;
+        ef2ToBf16K<<<blocks((rc & 3) == 0 ? (rc >> 2) : rc), 256, 0, STREAM>>>(y, p16Buf + r0 * C, rc);
+      } else {
+        CK(cudaMemcpyAsync(z + r0 * C, y, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      }
     }
     dumpPair("EF2_SAVE_PRE_CODA");
-    trunkBlocks(z, mask, T, C, "coda/blocks", 0, codaBlocks);
+    trunkBlocks(z, mask, T, C, "coda/blocks", 0, codaBlocks, p16Coda, true);
     return;
   }
   CK(cudaMemsetAsync(z, 0, P * C * (EF2_Z16 ? 2 : 4), STREAM));
