@@ -274,22 +274,29 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           const ulong j = (ulong)(j0 + sr + a * 8), i = (ulong)(i0 + sc + b * 8);
           thread auto& e = acc[a][b].thread_elements();
           simdgroup_matrix<TC, 8, 8> om, cm;
+          simdgroup_matrix<float, 8, 8> cfm;
           simdgroup_matrix<half, 8, 8> xm;
           const bool gated = g.epilogue & 64;
-          if (gated || g.beta != 0.f) simdgroup_load(cm, C + j * g.ldc + i, (ulong)g.ldc);
+          const bool cf32 = (g.biasType & 512) != 0;
+          if (gated || g.beta != 0.f) {
+            if (cf32) simdgroup_load(cfm, (device const float*)g.C + j * g.ldc + i, (ulong)g.ldc);
+            else simdgroup_load(cm, C + j * g.ldc + i, (ulong)g.ldc);
+          }
           if (gated) simdgroup_load(xm, (device const half*)g.aux + j * g.ldaux + i, (ulong)g.ldaux);
           thread auto& o = om.thread_elements();
           thread auto& c = cm.thread_elements();
+          thread auto& cf = cfm.thread_elements();
           thread auto& x = xm.thread_elements();
           _Pragma("clang loop unroll(full)")
           for (int t = 0; t < 2; ++t) {
             const int col = (int)i + sn2 + t;
             float v = g.alpha * (float)e[t];
+            const float cv = cf32 ? cf[t] : (float)c[t];
             if (gated) {
               if (g.epilogue & 4) v += ((device const float*)g.bias)[col];
-              v = (float)c[t] + (float)x[t] * (1.f / (1.f + exp(-v)));
+              v = cv + (float)x[t] * (1.f / (1.f + exp(-v)));
             } else {
-              if (g.beta != 0.f) v += g.beta * (float)c[t];
+              if (g.beta != 0.f) v += g.beta * cv;
               if (g.epilogue & 4) {
                 const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
                 v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col];
@@ -337,13 +344,14 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         int i = i0 + sc + b * 8 + sn + t;
         if (i >= g.m) continue;
         float v = g.alpha * e[t];
+        const float cv = (g.biasType & 512) ? ((device const float*)g.C)[(ulong)i + (ulong)j * g.ldc] : lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
         if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
           if (g.epilogue & 4) v += ((device const float*)g.bias)[i];      // (the gate's bias, f32: AF2's)
           v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * (1.f / (1.f + exp(-v)));
-          lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
+          lf_st(D, (ulong)i + (ulong)j * g.ldd, cv + v);
           continue;
         }
-        if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
+        if (g.beta != 0.f) v += g.beta * cv;
         if (g.epilogue & 4) {
           const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
           v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + i] : ((device const float*)g.bias)[boff + i];
