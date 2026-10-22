@@ -239,7 +239,7 @@ static void prepareTransformer(int n) {
   for (int b = 0; b < D.nblocks; ++b) {
     if (b % D.perSuper == 0) lin(pn, T + ".superBlocks." + num(b / D.perSuper) + ".pairLogitsProjection", flat, pairs, Cz, D.perSuper * heads);
     D.bias[b] = scratch<half>("dt.bias" + num(b), (size_t)heads * n * D.stride);
-    run("af3_bias_layout", Grid{(uint32_t)((D.stride + 31) / 32), (uint32_t)((n + 31) / 32), 1}, 256,
+    run("af3_bias_layout", Grid{(uint32_t)((D.stride + 31) / 32), (uint32_t)((n + 31) / 32), (uint32_t)heads}, 256,
           BiasLayoutArgs{flat, D.bias[b], (uint)n, (uint)D.stride, (uint)heads, 0, (uint)(D.perSuper * heads), (uint)((b % D.perSuper) * heads),
                          (float)M_LOG2E, 0});
   }
@@ -320,10 +320,12 @@ static void transformer(float* act, const float* cond, float level) {
     fill(x, 0, prows * C * 2); fill(o, 0, prows * Wd * 2); fill(tn, 0, prows * C * 2);
     zeroed = x; zeroedRows = prows;
   }
+  const float* pendY = nullptr; const float* pendGate = nullptr;
   for (int b = 0; b < D.nblocks; ++b) {
     std::string B = blockName(b);
     const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
-    adaLn(act, g, g + C, x, nullptr, rows, C, n, D.ldn);
+    adaLn(act, g, g + C, x, nullptr, rows, C, n, D.ldn, nullptr, nullptr, nullptr, false, pendY, pendGate, D.ldr);
+    pendY = nullptr; pendGate = nullptr;
     if (noResidual) copy(pre, act, rows * C * 4);
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = Dh; at.rows = NS; at.scale = 1.f / sqrtf((float)Dh);
@@ -340,9 +342,15 @@ static void transformer(float* act, const float* cond, float level) {
     if (!gemmGateResidual(o, Wh(B + ".Transition2"), act, prows, rows, Wd, C, z, D.ldr, n, ADA_RAW ? 2.f : 1.f,
                           "transformer output, gated residual")) {
       lin(o, B + ".Transition2", att, prows, Wd, C, 0.f, nullptr, ADA_RAW ? 2.f : 1.f);   // (chai's zero gate weights: 0.5 undone)
-      run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+      if (!noResidual) {
+        adaLn(act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn, nullptr, nullptr, nullptr, false, att, z, D.ldr);
+      } else {
+        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+        adaLn(pre, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
+      }
+    } else {
+      adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
     }
-    adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
     gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
     if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate
       half* u = scratch<half>("dt.up", rows * I);
@@ -352,7 +360,11 @@ static void transformer(float* act, const float* cond, float level) {
     if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, prows, rows, I, C, z + C, D.ldr, n, 1.f,
                           "transformer transition, gated residual")) {
       lin(gated, B + ".ffwTransition2", proj, prows, I, C);
-      run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, z + C, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+      if (!noResidual && b + 1 < D.nblocks) {
+        pendY = proj; pendGate = z + C;
+      } else {
+        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, z + C, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+      }
     }
   }
 }
@@ -379,7 +391,7 @@ static void prepareDecoder() {
   for (int b = 0; b < nblocks; ++b) D.decBlocks.push_back(prepareAtomBlock(Dd + ".blocks." + num(b), cond, qRows, D.decC, logits[b]));
   releaseScratch({"apl.", "ada."});
 }
-static float* atomDecoder(const float* tokenAct) {
+static float* atomDecoder(const half* tokenAct) {
   const std::string Dd = "diffusion.decoder";
   AtomShape sh = atomShape();
   int C = D.decC;
@@ -393,9 +405,11 @@ static float* atomDecoder(const float* tokenAct) {
   AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
               flag(Dd + ".blocks.0.diffusionNoResidual")};
   bool maskPerBlock = flag(Dd + ".blocks.0.maskAtomActPerBlock");
+  const float* pendY = nullptr; const float* pendGate = nullptr;
   for (size_t b = 0; b < D.decBlocks.size(); ++b) {
     if (maskPerBlock) scaleRows(act, D.enc.qMask, qRows, C, q1);
-    crossAttentionBlock(act, st, D.decBlocks[b], sh, C, D.decHeads, D.decD, Dd + ".blocks." + num(b));
+    crossAttentionBlock(act, st, D.decBlocks[b], sh, C, D.decHeads, D.decD, Dd + ".blocks." + num(b),
+                        &pendY, &pendGate, !maskPerBlock && b + 1 < D.decBlocks.size());
   }
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) die("decoder: the position update is not C x 3");
   float* upd = scratch<float>("dec.upd", qRows * 3);
@@ -447,22 +461,25 @@ static float* denoise(const float* x, float level) {
   encoderStep("diffusion.encoder", D.enc, scaled);
   stage("encoder");
   int Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
-  float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
+  size_t rows = (size_t)n * NS;
+  float* act = D.enc.tokenAct;
   {
-    float* sn = scratch<float>("dn.sn", (size_t)n * Cs);
+    half* sn = scratch<half>("dn.sn", (size_t)n * Cs);
     if (hasW("diffusion.singleCondEmbeddingNormScale"))
       ln(single, sn, n, Cs, "diffusion.singleCondEmbeddingNormScale", "diffusion.singleCondEmbeddingNormOffset");
-    else copy(sn, single, (size_t)n * Cs * 4);
-    lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, n, Cs, perToken);
+    else toHalf(single, sn, (size_t)n * Cs);
+    if (NS == 1) {
+      lin(sn, "diffusion.singleCondEmbeddingProjection", act, n, Cs, perToken, 1.f);
+    } else {
+      float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
+      lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, n, Cs, perToken);
+      run1d("af3_add_broadcast", rows * perToken, AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
+    }
   }
-  size_t rows = (size_t)n * NS;
-  float* act = scratch<float>("dn.act", rows * perToken);
-  copy(act, D.enc.tokenAct, rows * perToken * 4);
-  run1d("af3_add_broadcast", rows * perToken, AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
   stage("snproj");
   transformer(act, single, level);
   stage("transformer");
-  float* actn = scratch<float>("dn.actn", rows * perToken);
+  half* actn = scratch<half>("dn.actn", rows * perToken);
   ln(act, actn, rows, perToken, "diffusion.outputNormScale", "diffusion.outputNormOffset");
   float* upd = atomDecoder(actn);
   stage("decoder");

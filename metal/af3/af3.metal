@@ -29,10 +29,11 @@ kernel void af3_fold_bias(LF_ARGS(FoldBiasArgs)) {
   a.bias[o] = s;
 }
 kernel void af3_interleave8(LF_ARGS(Interleave8Args)) {
-  uint t = (uint)LF_INDEX, W = 2 * a.I;
-  if (t >= a.rows * W) return;
-  uint r = lf_udiv(t, W), c = t - r * W, m = c >> 4, q = c & 15;
-  a.out[t] = q < 8 ? a.a[r * a.lda + 8 * m + q] : a.b[r * a.lda + 8 * m + q - 8];
+  uint t = (uint)LF_INDEX, B2 = a.I >> 2;
+  if (t >= a.rows * B2) return;
+  uint r = lf_udiv(t, B2), c = t - r * B2, m = c >> 1;
+  device const uint4* src = (c & 1) ? (device const uint4*)(a.b + (ulong)r * a.lda) : (device const uint4*)(a.a + (ulong)r * a.lda);
+  ((device uint4*)a.out)[t] = src[m];
 }
 kernel void af3_trigate_weight(LF_ARGS(TriGateWArgs)) {
   uint t = (uint)LF_INDEX, W = 4 * a.C;
@@ -51,7 +52,9 @@ kernel void af3_scale_rows(LF_ARGS(ScaleRowsArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.C) return;
   uint r = lf_udiv((uint)t, a.C);
-  a.x[t] *= a.mask[r - lf_udiv(r, a.period) * a.period];
+  float v = a.x[t] * a.mask[r - lf_udiv(r, a.period) * a.period];
+  a.x[t] = v;
+  if (a.outH) a.outH[t] = (half)v;
 }
 kernel void af3_scale_rows_h(LF_ARGS(ScaleRowsHArgs)) {
   ulong t = LF_INDEX;
@@ -142,24 +145,29 @@ kernel void af3_scatter_rows(LF_ARGS(ScatterRowsArgs)) {
 // every head in turn (the later heads' lines cached)
 kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float tile[32][33];
-  const uint j0 = tg.x * 32, i0 = tg.y * 32, tx = tid & 31, ty = tid >> 5;     // 32 x 8 threads
-  for (uint h = 0; h < a.heads; ++h) {
-    // read: the source row s0 + r, column c0 + tx - (i, j) unswapped, (j, i) swapped
-    const uint s0 = a.swap ? j0 : i0, c0 = a.swap ? i0 : j0;
-    for (uint r = ty; r < 32; r += 8) {
-      const uint sr = s0 + r, sc = c0 + tx;
-      tile[r][tx] = sr < a.n && sc < a.n ? a.raw[((ulong)sr * a.n + sc) * a.ld + a.off + h] : 0.f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint j0 = tg.x * 32, i0 = tg.y * 32, h = tg.z, tx = tid & 31, ty = tid >> 5;     // 32 x 8 threads
+  if (!a.swap) {
     for (uint r = ty; r < 32; r += 8) {
       const uint i = i0 + r, j = j0 + tx;
       if (i < a.n && j < a.stride) {
-        // (the padding past n is -inf: a key tile reaching past the last key masks it through the bias alone)
-        a.bias[((ulong)h * a.n + i) * a.stride + j] = j < a.n ? (half)(a.scale * (a.swap ? tile[tx][r] : tile[r][tx])) : -INFINITY;
+        a.bias[((ulong)h * a.n + i) * a.stride + j] =
+          j < a.n ? (half)(a.scale * a.raw[((ulong)i * a.n + j) * a.ld + a.off + h]) : -INFINITY;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return;
+  }
+  threadgroup float tile[32][33];
+  for (uint r = ty; r < 32; r += 8) {
+    const uint sr = j0 + r, sc = i0 + tx;
+    tile[r][tx] = sr < a.n && sc < a.n ? a.raw[((ulong)sr * a.n + sc) * a.ld + a.off + h] : 0.f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = ty; r < 32; r += 8) {
+    const uint i = i0 + r, j = j0 + tx;
+    if (i < a.n && j < a.stride) {
+      // (the padding past n is -inf: a key tile reaching past the last key masks it through the bias alone)
+      a.bias[((ulong)h * a.n + i) * a.stride + j] = j < a.n ? (half)(a.scale * tile[tx][r]) : -INFINITY;
+    }
   }
 }
 
@@ -348,24 +356,59 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
-  device const float* x = a.x + row * a.C;
+  device float* x = a.x + row * a.C;
+  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   float s = 0.f;
-  for (uint c = lane; c < a.C; c += 32) s += x[c];
+  if (a.resY) {
+    device const float* ry = a.resY + row * a.C;
+    device const float* rg = a.resGate + gpr;
+    for (uint c = lane; c < a.C; c += 32) {
+      float val = x[c] + ry[c] * lf_sigmoid(rg[c]);
+      x[c] = val;
+      s += val;
+    }
+  } else {
+    for (uint c = lane; c < a.C; c += 32) s += x[c];
+  }
   float mean = simd_sum(s) / a.C, v = 0.f;
   for (uint c = lane; c < a.C; c += 32) { float d = x[c] - mean; v += d * d; }
   float inv = rsqrt(simd_sum(v) / a.C + a.eps);
-  ulong pr = (row % a.period) * a.ld;
+  float sk = 0.f;
   for (uint c = lane; c < a.C; c += 32) {
-    float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * ((x[c] - mean) * inv) + a.shift[pr + c];
+    float nrm = (x[c] - mean) * inv;
+    float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
     if (a.out) a.out[row * a.C + c] = (half)y;
     if (a.outF) a.outF[row * a.C + c] = y;
+    if (a.kOut) {
+      if (!a.chained) {
+        float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * nrm + a.kShift[pr + c];
+        a.kOut[row * a.C + c] = (half)ky;
+      } else sk += y;
+    }
+  }
+  if (a.kOut && a.chained) {
+    float meank = simd_sum(sk) / a.C, vk = 0.f;
+    for (uint c = lane; c < a.C; c += 32) {
+      float nrm = (x[c] - mean) * inv;
+      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
+      float d = y - meank; vk += d * d;
+    }
+    float invk = rsqrt(simd_sum(vk) / a.C + a.eps);
+    for (uint c = lane; c < a.C; c += 32) {
+      float nrm = (x[c] - mean) * inv;
+      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
+      float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * ((y - meank) * invk) + a.kShift[pr + c];
+      a.kOut[row * a.C + c] = (half)ky;
+    }
   }
 }
 kernel void af3_gather_rows(LF_ARGS(GatherRowsArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.chunks) return;
-  ulong r = t / a.chunks, c = t - r * a.chunks, g = r % a.count, k = r / a.count;
-  uint4 v = a.mask[g] != 0.f ? ((device const uint4*)a.in)[((ulong)a.idx[g] + k * a.srcRows) * a.chunks + c] : uint4(0);
+  uint u = (uint)t, chunks = a.chunks, r = lf_udiv(u, chunks), c = u - r * chunks;
+  uint cnt = (uint)a.count, k = lf_udiv(r, cnt), g = r - k * cnt;
+  uint4 v = a.mask[g] != 0.f ? ((device const uint4*)a.in)[((ulong)a.idx[g] + k * a.srcRows) * chunks + c] : uint4(0);
   ((device uint4*)a.out)[t] = v;
 }
 // a threadgroup a (subset, head): the subset's keys and values staged, a simdgroup a query at a time - lanes over the
@@ -378,12 +421,26 @@ kernel void af3_atom_attention(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg 
   threadgroup half Vs[MAXK * (MAXD + 2)];
   threadgroup float Qs[NSG][MAXD];
   threadgroup float Ps[NSG][MAXK];
-  const uint s = tg.x, h = tg.y, D = a.D, LD = D + 2, Wd = a.heads * D, W2 = 2 * Wd, ss = s % a.subsets;
+  const uint s = tg.x, h = tg.y, D = a.D, LD = D + 2, Wd = a.heads * D, W2 = 2 * Wd;
+  const uint ks = lf_udiv(s, a.subsets), ss = s - ks * a.subsets;
+  const ulong srcBase = (ulong)ks * a.subsets * a.queries;
   for (uint t = tid; t < a.keys * D; t += 32 * NSG) {
     uint key = t / D, e = t - key * D;
-    ulong row = (ulong)s * a.keys + key;
-    Ks[key * LD + e] = a.kv[row * W2 + h * D + e];
-    Vs[key * LD + e] = a.kv[row * W2 + Wd + h * D + e];
+    if (a.q2kIdx) {
+      uint g = ss * a.keys + key;
+      if (a.q2kMask[g] != 0.f) {
+        ulong row = srcBase + (uint)a.q2kIdx[g];
+        Ks[key * LD + e] = a.kv[row * W2 + h * D + e];
+        Vs[key * LD + e] = a.kv[row * W2 + Wd + h * D + e];
+      } else {
+        Ks[key * LD + e] = (half)0;
+        Vs[key * LD + e] = (half)0;
+      }
+    } else {
+      ulong row = (ulong)s * a.keys + key;
+      Ks[key * LD + e] = a.kv[row * W2 + h * D + e];
+      Vs[key * LD + e] = a.kv[row * W2 + Wd + h * D + e];
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float scale = rsqrt((float)D);
@@ -419,7 +476,10 @@ kernel void af3_atom_attention(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg 
 }
 kernel void af3_gated_residual(LF_ARGS(GatedResidualArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n) a.act[t] += a.y[t] * lf_sigmoid(a.gate[t % a.period]);
+  if (t >= a.n) return;
+  uint u = (uint)t, per = (uint)a.period, g = u - lf_udiv(u, per) * per;
+  float y = a.yh ? (float)a.yh[t] * a.scale : a.y[t];
+  a.act[t] += y * lf_sigmoid(a.gate[g]);
 }
 kernel void af3_mul_h(LF_ARGS(MulHArgs)) {
   ulong t = LF_INDEX;
@@ -428,8 +488,8 @@ kernel void af3_mul_h(LF_ARGS(MulHArgs)) {
 kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.C) return;
-  ulong q = t / a.C; uint c = (uint)(t - q * a.C);
-  ulong gq = q % a.q1, k = q / a.q1;
+  uint u = (uint)t, q = lf_udiv(u, a.C), c = u - q * a.C;
+  uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
   float v = 0.f;
   if (a.gmask[gq] != 0.f) {
     device const float* p = a.pos + ((ulong)a.idx[gq] + k * a.atoms) * 3;
@@ -440,8 +500,8 @@ kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
 kernel void af3_aggregate(LF_ARGS(AggregateArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.Cp) return;
-  ulong token = t / a.Cp; uint c = (uint)(t - token * a.Cp);
-  ulong k = token / a.tokens, g0 = (token % a.tokens) * a.dense;
+  uint u = (uint)t, token = lf_udiv(u, a.Cp), c = u - token * a.Cp;
+  uint k = lf_udiv(token, a.tokens), g0 = (token - k * a.tokens) * a.dense;
   float count = 0.f, sum = 0.f;
   for (uint at = 0; at < a.dense; ++at) {
     float m = a.atomMask[g0 + at];
@@ -535,9 +595,9 @@ kernel void af3_add_broadcast(LF_ARGS(AddBroadcastArgs)) {
 kernel void af3_broadcast_skip(LF_ARGS(BroadcastSkipArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * a.C) return;
-  ulong q = t / a.C; uint c = (uint)(t - q * a.C);
-  ulong gq = q % a.q1, k = q / a.q1;
-  float v = a.gmask[gq] != 0.f ? a.proj[((ulong)a.idx[gq] / a.dense + k * a.tokens) * a.C + c] : 0.f;
+  uint u = (uint)t, q = lf_udiv(u, a.C), c = u - q * a.C;
+  uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
+  float v = a.gmask[gq] != 0.f ? a.proj[((ulong)lf_udiv((uint)a.idx[gq], a.dense) + k * a.tokens) * a.C + c] : 0.f;
   a.act[t] = (v + a.skip[t]) * a.qMask[gq];
 }
 kernel void af3_mask_ln_project3(constant MaskLnProject3Args& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
@@ -546,7 +606,8 @@ kernel void af3_mask_ln_project3(constant MaskLnProject3Args& a [[buffer(0)]], u
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device const float* x = a.act + row * a.C;
-  float m = a.qMask[row % a.q1], s = 0.f;
+  uint r32 = (uint)row, q1 = (uint)a.q1;
+  float m = a.qMask[r32 - lf_udiv(r32, q1) * q1], s = 0.f;
   for (uint c = lane; c < a.C; c += 32) s += x[c] * m;
   float mean = simd_sum(s) / a.C, v = 0.f;
   for (uint c = lane; c < a.C; c += 32) { float d = x[c] * m - mean; v += d * d; }
@@ -561,11 +622,15 @@ kernel void af3_mask_ln_project3(constant MaskLnProject3Args& a [[buffer(0)]], u
 }
 kernel void af3_scale_positions(LF_ARGS(ScalePosArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.total * 3) a.y[t] = a.x[t] * a.mask[(t / 3) % a.atoms] * a.in;
+  if (t >= a.total * 3) return;
+  uint at = lf_udiv((uint)t, 3u), atoms = (uint)a.atoms;
+  a.y[t] = a.x[t] * a.mask[at - lf_udiv(at, atoms) * atoms] * a.in;
 }
 kernel void af3_denoise_out(LF_ARGS(DenoiseOutArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.total * 3) a.o[t] = (a.skip * a.x[t] + a.out * a.upd[t]) * a.mask[(t / 3) % a.atoms];
+  if (t >= a.total * 3) return;
+  uint at = lf_udiv((uint)t, 3u), atoms = (uint)a.atoms;
+  a.o[t] = (a.skip * a.x[t] + a.out * a.upd[t]) * a.mask[at - lf_udiv(at, atoms) * atoms];
 }
 
 // ---------------------------------------------------------------- the sampler
@@ -688,31 +753,49 @@ template <int D>
 kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int Q = 32, K = 128, LD = D + 8, DF = D / 8, KF = K / 8, D8 = D / 8;
-  threadgroup half Qs[Q * LD];
+  constexpr int Q = 32, K = 128, LD = D, DF = D / 8, KF = K / 8, D8 = D / 8;
   threadgroup half Ks[K * LD];
   threadgroup half Vs[K * LD];
-  const uint s = tg.x, h = tg.y, ss = s % a.subsets, Wd = a.heads * D, W2 = 2 * Wd;
+  const uint s = tg.x, h = tg.y, ks = lf_udiv(s, a.subsets), ss = s - ks * a.subsets, Wd = a.heads * D, W2 = 2 * Wd;
   const float qs = rsqrt((float)D) * M_LOG2E_F;
   for (uint e = tid; e < Q * D8; e += 128) {
     uint qi = e / D8, d = (e - qi * D8) * 8;
     device const half* src = a.qg + ((ulong)s * Q + qi) * W2 + h * D + d;
     float4 f0 = float4(*(device const half4*)src) + *(device const float4*)(a.qBias + h * D + d);
     float4 f1 = float4(*(device const half4*)(src + 4)) + *(device const float4*)(a.qBias + h * D + d + 4);
-    *(threadgroup half4*)(Qs + qi * LD + d) = half4(f0 * qs);
-    *(threadgroup half4*)(Qs + qi * LD + d + 4) = half4(f1 * qs);
-  }
-  for (uint e = tid; e < K * D8; e += 128) {
-    uint kj = e / D8, d = (e - kj * D8) * 8;
-    device const half* src = a.kv + ((ulong)s * K + kj) * W2 + h * D + d;
-    *(threadgroup half4*)(Ks + kj * LD + d) = *(device const half4*)src;
-    *(threadgroup half4*)(Ks + kj * LD + d + 4) = *(device const half4*)(src + 4);
-    *(threadgroup half4*)(Vs + kj * LD + d) = *(device const half4*)(src + Wd);
-    *(threadgroup half4*)(Vs + kj * LD + d + 4) = *(device const half4*)(src + Wd + 4);
+    *(threadgroup half4*)(Ks + qi * LD + d) = half4(f0 * qs);
+    *(threadgroup half4*)(Ks + qi * LD + d + 4) = half4(f1 * qs);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   simdgroup_half8x8 qf[DF];
-  _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Qs + (sg * 8) * LD + dk * 8, LD);
+  _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Ks + (sg * 8) * LD + dk * 8, LD);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong srcBase = (ulong)ks * a.subsets * Q;
+  for (uint e = tid; e < K * D8; e += 128) {
+    uint kj = e / D8, d = (e - kj * D8) * 8;
+    if (a.q2kIdx) {
+      uint g = ss * K + kj;
+      if (a.q2kMask[g] != 0.f) {
+        device const half* src = a.kv + (srcBase + (uint)a.q2kIdx[g]) * W2 + h * D + d;
+        *(threadgroup half4*)(Ks + kj * LD + d) = *(device const half4*)src;
+        *(threadgroup half4*)(Ks + kj * LD + d + 4) = *(device const half4*)(src + 4);
+        *(threadgroup half4*)(Vs + kj * LD + d) = *(device const half4*)(src + Wd);
+        *(threadgroup half4*)(Vs + kj * LD + d + 4) = *(device const half4*)(src + Wd + 4);
+      } else {
+        *(threadgroup half4*)(Ks + kj * LD + d) = half4(0);
+        *(threadgroup half4*)(Ks + kj * LD + d + 4) = half4(0);
+        *(threadgroup half4*)(Vs + kj * LD + d) = half4(0);
+        *(threadgroup half4*)(Vs + kj * LD + d + 4) = half4(0);
+      }
+    } else {
+      device const half* src = a.kv + ((ulong)s * K + kj) * W2 + h * D + d;
+      *(threadgroup half4*)(Ks + kj * LD + d) = *(device const half4*)src;
+      *(threadgroup half4*)(Ks + kj * LD + d + 4) = *(device const half4*)(src + 4);
+      *(threadgroup half4*)(Vs + kj * LD + d) = *(device const half4*)(src + Wd);
+      *(threadgroup half4*)(Vs + kj * LD + d + 4) = *(device const half4*)(src + Wd + 4);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   simdgroup_float8x8 sc[KF];
   _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) sc[j] = simdgroup_float8x8(0);
   _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j)

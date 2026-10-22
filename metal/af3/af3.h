@@ -44,7 +44,7 @@ void linW(const half* X, const half* w, half* Y, size_t rows, int in, int out, c
 void ln(const float* x, float* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
-void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period);
+void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period, half* outH = nullptr);
 void scale(float* x, size_t n, float s, bool relu = false);
 
 // derived weights: columns concatenated (a part [C][width], or stored [width][C] if transposed; no name: zeros)
@@ -155,10 +155,11 @@ struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMask
 // chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space
 void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
-                         const std::string& B);
+                         const std::string& B, const float** pendY = nullptr, const float** pendGate = nullptr, bool deferFfwRes = false);
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
-void adaLn(const float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
-           int ld = 0);
+void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
+           int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,
+           const float* resY = nullptr, const float* resGate = nullptr, int resLd = 0);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
 // how far a template.pdb record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at

@@ -46,8 +46,8 @@ void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, c
 void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset) {
   layerNorm(x, y, rows, C, scale.empty() ? nullptr : W(scale), offset.empty() ? nullptr : Wopt(offset));
 }
-void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period) {
-  run1d("af3_scale_rows", rows * C, ScaleRowsArgs{x, mask, rows, (uint)C, (uint)period});
+void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period, half* outH) {
+  run1d("af3_scale_rows", rows * C, ScaleRowsArgs{x, mask, outH, rows, (uint)C, (uint)period});
 }
 void scale(float* x, size_t n, float s, bool relu) { run1d("af3_scale", n, ScaleArgs{x, n, s, relu ? 1u : 0u}); }
 
@@ -70,7 +70,7 @@ const half* swigluPairs(const std::string& name, int rows, int I) {
   return M.derived<half>("swiglu:" + name, (size_t)rows * 2 * I, [&](half* out) {
     if (lenW(name) != (size_t)rows * 2 * I) die("%s has %zu elements, not %d x %d", name.c_str(), lenW(name), rows, 2 * I);
     const half* w = Wh(name);
-    run1d("af3_interleave8", (size_t)rows * 2 * I, Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
+    run1d("af3_interleave8", (size_t)rows * (I >> 2), Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
   });
 }
 Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra) {

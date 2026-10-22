@@ -18,7 +18,7 @@ struct FoldBiasArgs { CP(half) w; CP(float) offset; CP(float) extra; DP(float) b
 struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
 // x[r][c] (*)= scale
 struct ScaleArgs { DP(float) x; u64 n; float s; uint relu; };
-struct ScaleRowsArgs { DP(float) x; CP(float) mask; u64 rows; uint C, period; };      // x[r] *= mask[r % period]
+struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; u64 rows; uint C, period; };      // x[r] *= mask[r % period]
 struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
 struct CastArgs { CP(float) x; DP(half) y; u64 n; };
 
@@ -76,15 +76,16 @@ struct AtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float) kP
                       CP(float) tkMask; DP(float) pair; uint subsets, queries, keys, Cp, tokens, maskPadded; };
 // flat [(s, q, k)][blocks heads] -> block b's [s][h][q][k]
 struct AtomLogitsArgs { CP(float) flat; DP(float) out; uint block, nblocks, subsets, heads, queries, keys; };
-// the adaptive LayerNorm: ADA(scale) LN(x) + shift (scale, shift read at row % period), to half or float
-struct AdaLnArgs { CP(float) x; CP(float) scale; CP(float) shift; DP(half) out; DP(float) outF; u64 rows; uint C, period, ld, raw; float eps; uint pad; };
+// the adaptive LayerNorm: ADA(scale) LN(x) + shift (scale, shift read at row % period), to half or float (and kOut when paired)
+struct AdaLnArgs { DP(float) x; CP(float) scale; CP(float) shift; DP(half) out; DP(float) outF; CP(float) kScale; CP(float) kShift; DP(half) kOut;
+                   CP(float) resY; CP(float) resGate; u64 rows; uint C, period, ld, raw; float eps; uint chained, resLd, pad; };
 // rows of 16-byte chunks gathered: out[r] = mask[g] ? in[idx[g] + k srcRows] : 0, r = k count + g
 struct GatherRowsArgs { CP(uchar) in; CP(int) idx; CP(float) mask; DP(uchar) out; u64 rows, count, srcRows; uint chunks, pad; };
-// one subset's attention: 32 queries against 128 keys, q (+ bias) and the gate in qg [rows][2W], k and v in kv
-struct AtomAttnArgs { CP(half) qg; CP(float) qBias; CP(half) kv; CP(float) qMask; CP(float) kMask; CP(float) logits; DP(half) out;
+// one subset's attention: 32 queries against 128 keys, q (+ bias) and the gate in qg [rows][2W], k and v in kv (or kvAtom via q2kIdx/q2kMask)
+struct AtomAttnArgs { CP(half) qg; CP(float) qBias; CP(half) kv; CP(int) q2kIdx; CP(float) q2kMask; CP(float) qMask; CP(float) kMask; CP(float) logits; DP(half) out;
                       uint queries, keys, heads, D, subsets, keyMasked; };
 // act += y sigmoid(gate[t % period])
-struct GatedResidualArgs { DP(float) act; CP(float) y; CP(float) gate; u64 n, period; };
+struct GatedResidualArgs { DP(float) act; CP(float) y; CP(half) yh; CP(float) gate; u64 n, period; float scale, pad; };
 struct MulHArgs { DP(half) x; CP(half) y; u64 n; };
 // act[q] = qStart[q] + qMask[q] (positions gathered to q) W, W [3][C]
 struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(int) idx; CP(float) gmask; CP(float) Wp; CP(float) qMask; DP(float) act;
