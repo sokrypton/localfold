@@ -148,11 +148,12 @@ kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]],
   const ulong base = (ulong)smp * a.N;
   threadgroup half sk[BE2_WK][HD], sv[BE2_WK][HD];
   threadgroup uchar sm[BE2_WK];
-  for (uint e = tid; e < BE2_WK * HD; e += BE2_WQ * SPLIT) {
-    int j = e / HD, d = e % HD, ka = (int)(w * BE2_WQ) - BE2_CTX + j;
+  for (uint e4 = tid; e4 < BE2_WK * (HD / 4); e4 += BE2_WQ * SPLIT) {
+    int j = e4 >> 3, d = (e4 & 7) << 2, ka = (int)(w * BE2_WQ) - BE2_CTX + j;
     bool ok = ka >= 0 && ka < (int)a.N;
-    sk[j][d] = ok ? a.qkvg[(base + ka) * 4 * D + D + h * HD + d] : 0.h;
-    sv[j][d] = ok ? a.qkvg[(base + ka) * 4 * D + 2 * D + h * HD + d] : 0.h;
+    const ulong off = (base + ka) * 4 * D + h * HD + d;
+    *(threadgroup half4*)(sk[j] + d) = ok ? *(device const half4*)(a.qkvg + off + D) : half4(0.h);
+    *(threadgroup half4*)(sv[j] + d) = ok ? *(device const half4*)(a.qkvg + off + 2 * D) : half4(0.h);
   }
   if (tid < (uint)BE2_WK) {
     int ka = (int)(w * BE2_WQ) - BE2_CTX + (int)tid;
@@ -162,18 +163,32 @@ kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]],
   const ulong qa = base + w * BE2_WQ + i;
   float q[HD];
   const float scale = rsqrt((float)HD);
-  for (int d = 0; d < HD; ++d) q[d] = ((float)a.qkvg[qa * 4 * D + h * HD + d] + a.qBias[h * HD + d]) * scale;
+  for (int d = 0; d < HD; d += 4) {
+    const float4 qv = (float4(*(device const half4*)(a.qkvg + qa * 4 * D + h * HD + d)) + *(device const float4*)(a.qBias + h * HD + d)) * scale;
+    q[d] = qv.x; q[d + 1] = qv.y; q[d + 2] = qv.z; q[d + 3] = qv.w;
+  }
   device const float* b = a.bias + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK;
   float mx = -INFINITY, sum = 0, acc[HD];
   for (int d = 0; d < HD; ++d) acc[d] = 0;
   for (int jj = 0; jj < KS; ++jj) {
     const int j = jj * SPLIT + (int)part;
     float l = 0;
-    for (int d = 0; d < HD; ++d) l += q[d] * (float)sk[j][d];
+    _Pragma("clang loop unroll(full)")
+    for (int d = 0; d < HD; d += 4) {
+      const float4 kv = float4(*(threadgroup const half4*)(sk[j] + d));
+      l += q[d] * kv.x + q[d + 1] * kv.y + q[d + 2] * kv.z + q[d + 3] * kv.w;
+    }
     l = sm[j] ? l + b[j] : BE2_NEG_INF;
     float nm = max(mx, l), f = exp(mx - nm), e = exp(l - nm);
     sum = sum * f + e;
-    for (int d = 0; d < HD; ++d) acc[d] = acc[d] * f + e * (float)sv[j][d];
+    _Pragma("clang loop unroll(full)")
+    for (int d = 0; d < HD; d += 4) {
+      const float4 vv = float4(*(threadgroup const half4*)(sv[j] + d));
+      acc[d] = acc[d] * f + e * vv.x;
+      acc[d + 1] = acc[d + 1] * f + e * vv.y;
+      acc[d + 2] = acc[d + 2] * f + e * vv.z;
+      acc[d + 3] = acc[d + 3] * f + e * vv.w;
+    }
     mx = nm;
   }
   for (ushort o = 1; o < SPLIT; o <<= 1) {
@@ -185,9 +200,10 @@ kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]],
   }
   if (part == 0) {
     const float inv = 1.f / sum;
-    for (int d = 0; d < HD; ++d) {
-      const float g = (float)a.qkvg[qa * 4 * D + 3 * D + h * HD + d];
-      a.out[qa * D + h * HD + d] = (half)(acc[d] * inv * lf_sigmoid(g));
+    for (int d = 0; d < HD; d += 4) {
+      const float4 gv = float4(*(device const half4*)(a.qkvg + qa * 4 * D + 3 * D + h * HD + d));
+      const float4 av = float4(acc[d], acc[d + 1], acc[d + 2], acc[d + 3]) * inv / (1.f + exp(-gv));
+      *(device half4*)(a.out + qa * D + h * HD + d) = half4(av);
     }
   }
 }
@@ -251,21 +267,70 @@ kernel void be2_gated_add(LF_ARGS(Be2GatedAddArgs)) {
 kernel void be2_ada_ln(LF_ARGS(Be2AdaLnArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
-  device const float* xr = a.x + row * a.ldx;
-  float xv[28], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
-  s = simd_sum(s);
-  float mean = s / a.C, v = 0;
-  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
-  v = simd_sum(v);
-  float inv = rsqrt(v / a.C + 1e-5f);
   const ulong cr = a.map ? (ulong)a.map[row] : row;
+  device float* xr = a.x + row * a.ldx;
   device const float* al = a.alpha + cr * a.ldc;
   device const float* be = a.beta + cr * a.ldc;
-  k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) {
-    const float val = a.scale * ((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
+  if (a.yh && (a.C == 128 || a.C == 768)) {
+    device float4* x4 = (device float4*)xr;
+    device const float4* al4 = (device const float4*)al;
+    device const float4* be4 = (device const float4*)be;
+    device half4* yh4 = (device half4*)(a.yh + row * a.C);
+    if (a.C == 128) {
+      float4 x = x4[lane];
+      if (a.resH) {
+        x += ((device const float4*)(a.resGate + cr * a.ldrg))[lane] * ((device const float4*)(a.resH + row * 128))[lane];
+        x4[lane] = x;
+      }
+      const float mean = simd_sum(x.x + x.y + x.z + x.w) * (1.f / 128.f);
+      const float4 d = x - mean;
+      const float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+      yh4[lane] = half4(a.scale * (d * inv * (1.f + al4[lane]) + be4[lane]));
+    } else {
+      float4 xv[6]; float s = 0;
+      if (a.resH) {
+        device const float4* rh4 = (device const float4*)(a.resH + row * 768);
+        device const float4* rg4 = (device const float4*)(a.resGate + cr * a.ldrg);
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 6; ++k) {
+          const uint idx = lane + 32 * k;
+          const float4 x = x4[idx] + rg4[idx] * rh4[idx];
+          x4[idx] = x; xv[k] = x; s += x.x + x.y + x.z + x.w;
+        }
+      } else {
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 6; ++k) {
+          const float4 x = x4[lane + 32 * k];
+          xv[k] = x; s += x.x + x.y + x.z + x.w;
+        }
+      }
+      const float mean = simd_sum(s) * (1.f / 768.f);
+      float v = 0;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+      const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const uint idx = lane + 32 * k;
+        yh4[idx] = half4(a.scale * ((xv[k] - mean) * inv * (1.f + al4[idx]) + be4[idx]));
+      }
+    }
+    return;
+  }
+  float s = 0;
+  if (a.resH) {
+    device const float* rh = a.resH + row * a.C;
+    device const float* rg = a.resGate + cr * a.ldrg;
+    for (uint c = lane; c < a.C; c += 32) { const float x = xr[c] + rg[c] * rh[c]; xr[c] = x; s += x; }
+  } else {
+    for (uint c = lane; c < a.C; c += 32) s += xr[c];
+  }
+  const float mean = simd_sum(s) / a.C;
+  float v = 0;
+  for (uint c = lane; c < a.C; c += 32) { const float d = xr[c] - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
+  for (uint c = lane; c < a.C; c += 32) {
+    const float val = a.scale * ((xr[c] - mean) * inv * (1.f + al[c]) + be[c]);
     if (a.yh) a.yh[row * a.C + c] = (half)val; else a.y[row * a.C + c] = val;
   }
 }
@@ -274,25 +339,66 @@ kernel void be2_ada_ln_q2s(LF_ARGS(Be2AdaLnQ2SArgs)) {
   if (row >= a.rows) return;
   BE2_SPLIT(row, a.T, s, il);
   device const float* qr = a.q + ((ulong)s * a.N + a.centre[il]) * a.Ca;
-  device const float* ar = a.a + row * a.Dt;
+  device float* ar = a.a + row * a.Dt;
   const uint C = a.Ca + a.Dt;
-  float xv[28], sum = 0;
-  uint k = 0;
-  for (uint c = lane; c < C; c += 32, ++k) {
-    float x = c < a.Ca ? qr[c] : ar[c - a.Ca];
-    xv[k] = x; sum += x;
-  }
-  const float mean = simd_sum(sum) / C;
-  float v = 0;
-  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
-  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
   const ulong cr = a.map ? (ulong)a.map[row] : row;
   device const float* al = a.alpha + cr * a.ldc;
   device const float* be = a.beta + cr * a.ldc;
   device half* yr = a.yh + row * C;
-  k = 0;
-  for (uint c = lane; c < C; c += 32, ++k)
-    yr[c] = (half)((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
+  if (a.Ca == 128 && a.Dt == 768) {
+    float4 xv[7];
+    xv[0] = ((device const float4*)qr)[lane];
+    float sum = xv[0].x + xv[0].y + xv[0].z + xv[0].w;
+    device float4* ar4 = (device float4*)ar;
+    if (a.resH) {
+      device const float4* rh4 = (device const float4*)(a.resH + row * 768);
+      device const float4* rg4 = (device const float4*)(a.resGate + cr * a.ldrg);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const uint idx = lane + 32 * k;
+        const float4 x = ar4[idx] + rg4[idx] * rh4[idx];
+        ar4[idx] = x; xv[k + 1] = x; sum += x.x + x.y + x.z + x.w;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const float4 x = ar4[lane + 32 * k];
+        xv[k + 1] = x; sum += x.x + x.y + x.z + x.w;
+      }
+    }
+    const float mean = simd_sum(sum) * (1.f / 896.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 7; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 896.f) + 1e-5f);
+    device const float4* al4 = (device const float4*)al;
+    device const float4* be4 = (device const float4*)be;
+    device half4* yr4 = (device half4*)yr;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 7; ++k) {
+      const uint idx = lane + 32 * k;
+      yr4[idx] = half4((xv[k] - mean) * inv * (1.f + al4[idx]) + be4[idx]);
+    }
+    return;
+  }
+  if (a.resH) {
+    device const float* rh = a.resH + row * a.Dt;
+    device const float* rg = a.resGate + cr * a.ldrg;
+    for (uint c = lane; c < a.Dt; c += 32) ar[c] += rg[c] * rh[c];
+  }
+  float sum = 0;
+  for (uint c = lane; c < C; c += 32) sum += c < a.Ca ? qr[c] : ar[c - a.Ca];
+  const float mean = simd_sum(sum) / C;
+  float v = 0;
+  for (uint c = lane; c < C; c += 32) {
+    const float d = (c < a.Ca ? qr[c] : ar[c - a.Ca]) - mean;
+    v += d * d;
+  }
+  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
+  for (uint c = lane; c < C; c += 32) {
+    const float x = c < a.Ca ? qr[c] : ar[c - a.Ca];
+    yr[c] = (half)((x - mean) * inv * (1.f + al[c]) + be[c]);
+  }
 }
 kernel void be2_ada_ln_s2q(LF_ARGS(Be2AdaLnS2QArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
@@ -301,23 +407,53 @@ kernel void be2_ada_ln_s2q(LF_ARGS(Be2AdaLnS2QArgs)) {
   device const float* ar = a.pad[alIdx] ? a.a + ((ulong)s * a.T + a.atomTok[alIdx]) * a.Dt : nullptr;
   device const float* qr = a.q + row * a.Ca;
   const uint C = a.Dt + a.Ca;
-  float xv[28], sum = 0;
-  uint k = 0;
-  for (uint c = lane; c < C; c += 32, ++k) {
-    float x = c < a.Dt ? (ar ? ar[c] : 0.f) : qr[c - a.Dt];
-    xv[k] = x; sum += x;
-  }
-  const float mean = simd_sum(sum) / C;
-  float v = 0;
-  for (uint i = 0; i < k; ++i) { float d = xv[i] - mean; v += d * d; }
-  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
   const ulong cr = a.map ? (ulong)a.map[row] : row;
   device const float* al = a.alpha + cr * a.ldc;
   device const float* be = a.beta + cr * a.ldc;
   device half* yr = a.yh + row * C;
-  k = 0;
-  for (uint c = lane; c < C; c += 32, ++k)
-    yr[c] = (half)((xv[k] - mean) * inv * (1.f + al[c]) + be[c]);
+  if (a.Dt == 768 && a.Ca == 128) {
+    float4 xv[7]; float sum = 0;
+    if (ar) {
+      device const float4* ar4 = (device const float4*)ar;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const float4 x = ar4[lane + 32 * k];
+        xv[k] = x; sum += x.x + x.y + x.z + x.w;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) xv[k] = float4(0.f);
+    }
+    xv[6] = ((device const float4*)qr)[lane];
+    sum += xv[6].x + xv[6].y + xv[6].z + xv[6].w;
+    const float mean = simd_sum(sum) * (1.f / 896.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 7; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 896.f) + 1e-5f);
+    device const float4* al4 = (device const float4*)al;
+    device const float4* be4 = (device const float4*)be;
+    device half4* yr4 = (device half4*)yr;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 7; ++k) {
+      const uint idx = lane + 32 * k;
+      yr4[idx] = half4((xv[k] - mean) * inv * (1.f + al4[idx]) + be4[idx]);
+    }
+    return;
+  }
+  float sum = 0;
+  for (uint c = lane; c < C; c += 32) sum += c < a.Dt ? (ar ? ar[c] : 0.f) : qr[c - a.Dt];
+  const float mean = simd_sum(sum) / C;
+  float v = 0;
+  for (uint c = lane; c < C; c += 32) {
+    const float d = (c < a.Dt ? (ar ? ar[c] : 0.f) : qr[c - a.Dt]) - mean;
+    v += d * d;
+  }
+  const float inv = rsqrt(simd_sum(v) / C + 1e-5f);
+  for (uint c = lane; c < C; c += 32) {
+    const float x = c < a.Dt ? (ar ? ar[c] : 0.f) : qr[c - a.Dt];
+    yr[c] = (half)((x - mean) * inv * (1.f + al[c]) + be[c]);
+  }
 }
 // the coupling split's statistics and normalised halves (Be2CsTokArgs, Be2CsAtomArgs): webgpu/bioemu2's cs-tstats /
 // cs-xa and cs-astats / cs-xq, the parallel-variance form (never E[x^2] - mu^2)
@@ -325,28 +461,53 @@ kernel void be2_cs_tok(LF_ARGS(Be2CsTokArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.a + row * a.C;
-  float xv[24], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
+  const uint t = (uint)row - lf_udiv((uint)row, a.T) * a.T;
+  device const float* al = a.cqc + (ulong)t * a.ldc;
+  if (a.C == 768) {
+    device const float4* xr4 = (device const float4*)xr;
+    float4 xv[6]; float s = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const float4 x = xr4[lane + 32 * k];
+      xv[k] = x; s += x.x + x.y + x.z + x.w;
+    }
+    const float m = simd_sum(s) * (1.f / 768.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - m; v += dot(d, d); }
+    v = simd_sum(v);
+    const float sa = sqrt(v * (1.f / 768.f) + 1e-5f), invSa = 1.f / sa;
+    if (lane == 0) { a.tstats[row * 3] = m; a.tstats[row * 3 + 1] = v; a.tstats[row * 3 + 2] = sa; }
+    device const float4* al4 = (device const float4*)al;
+    device half4* xa4 = (device half4*)(a.xa + row * 768);
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const uint idx = lane + 32 * k;
+      xa4[idx] = half4((1.f + al4[idx]) * (xv[k] - m) * invSa);
+    }
+    return;
+  }
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) s += xr[c];
   const float m = simd_sum(s) / a.C;
-  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - m; v += d * d; }
+  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = xr[c] - m; v += d * d; }
   v = simd_sum(v);
   const float sa = sqrt(v / a.C + 1e-5f);
   if (lane == 0) { a.tstats[row * 3] = m; a.tstats[row * 3 + 1] = v; a.tstats[row * 3 + 2] = sa; }
-  const uint t = (uint)row - lf_udiv((uint)row, a.T) * a.T;
-  device const float* al = a.cqc + (ulong)t * a.ldc;
-  k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) a.xa[row * a.C + c] = (half)((1.f + al[c]) * (xv[k] - m) / sa);
+  for (uint c = lane; c < a.C; c += 32) a.xa[row * a.C + c] = (half)((1.f + al[c]) * (xr[c] - m) / sa);
 }
 kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.q + row * a.Ca;
-  float xv[4], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.Ca; c += 32, ++k) { float x = xr[c]; xv[k] = x; s += x; }
+  float4 x4 = a.Ca == 128 ? ((device const float4*)xr)[lane] : float4(0.f);
+  float s = 0;
+  if (a.Ca == 128) s = x4.x + x4.y + x4.z + x4.w;
+  else for (uint c = lane; c < a.Ca; c += 32) s += xr[c];
   const float mq = simd_sum(s) / a.Ca;
-  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - mq; v += d * d; }
+  float v = 0;
+  if (a.Ca == 128) { const float4 d = x4 - mq; v = dot(d, d); }
+  else for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
   const float ssq = simd_sum(v);
   const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
   const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
@@ -363,9 +524,16 @@ kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   }
   device const float* aq = a.cqc + (ulong)t * a.ldc + a.Dt;
   // (two halves, hi and the remainder: Xq in ONE half cost the split its precision - metal/bioemu2's denoise.mm)
-  k = 0;
-  for (uint c = lane; c < a.Ca; c += 32, ++k) {
-    const float val = (1.f + aq[c]) * (xv[k] - mq) / sq;
+  if (a.Ca == 128) {
+    const float4 val = (1.f + ((device const float4*)aq)[lane]) * (x4 - mq) / sq;
+    const half4 h = half4(val);
+    device half4* xq4 = (device half4*)(a.xq + row * 256);
+    xq4[lane] = h;
+    xq4[32 + lane] = half4(val - float4(h));
+    return;
+  }
+  for (uint c = lane; c < a.Ca; c += 32) {
+    const float val = (1.f + aq[c]) * (xr[c] - mq) / sq;
     const half h = (half)val;
     a.xq[row * 2 * a.Ca + c] = h;
     a.xq[row * 2 * a.Ca + a.Ca + c] = (half)(val - (float)h);
@@ -398,17 +566,40 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
   if (row >= a.rows) return;
   const uint j = lf_udiv((uint)row, a.Rc), r = (uint)row - j * a.Rc;
   device const float* x = a.c + (ulong)r * a.C;
-  float xv[24], s = 0;
-  uint k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) { float val = x[c]; xv[k] = val; s += val; }
-  const float mean = simd_sum(s) / a.C;
-  float v = 0; for (uint i = 0; i < k; ++i) { const float d = xv[i] - mean; v += d * d; }
-  const float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
   device const float* w = a.w + (ulong)(a.l0 + j) * a.C;
   device const float* b = a.b ? a.b + (ulong)(a.l0 + j) * a.C : nullptr;
-  k = 0;
-  for (uint c = lane; c < a.C; c += 32, ++k) {      // (lf_layernorm's order, then be2_unary's silu)
-    float n = (xv[k] - mean) * inv;
+  if (a.C == 768) {
+    device const float4* x4 = (device const float4*)x;
+    float4 xv[6]; float s = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const float4 val = x4[lane + 32 * k];
+      xv[k] = val; s += val.x + val.y + val.z + val.w;
+    }
+    const float mean = simd_sum(s) * (1.f / 768.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+    device const float4* w4 = (device const float4*)w;
+    device const float4* b4 = (device const float4*)b;
+    device half4* out4 = (device half4*)(a.out + row * 768);
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const uint idx = lane + 32 * k;
+      float4 n = (xv[k] - mean) * inv * w4[idx];
+      if (b4) n += b4[idx];
+      out4[idx] = half4(n / (1.f + exp(-n)));
+    }
+    return;
+  }
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) s += x[c];
+  const float mean = simd_sum(s) / a.C;
+  float v = 0; for (uint c = lane; c < a.C; c += 32) { const float d = x[c] - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
+  for (uint c = lane; c < a.C; c += 32) {      // (lf_layernorm's order, then be2_unary's silu)
+    float n = (x[c] - mean) * inv;
     n *= w[c];
     if (b) n += b[c];
     a.out[row * a.C + c] = (half)lf_silu(n);
@@ -603,8 +794,9 @@ kernel void be2_trigate_weight(LF_ARGS(Be2TriGateWArgs)) {
   const uint W = 4 * a.C;
   if (t >= (ulong)a.rows * W) return;
   BE2_SPLIT(t, W, r, col);
-  const uint kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8;
-  const uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8: pa ga pb gb; a and b interleaved by channel)
+  const uint kind = a.quarters ? (col % 128) / 32 : (col % 32) / 8;
+  const uint c = a.quarters ? 32 * (col / 128) + col % 32 : 8 * (col / 32) + col % 8;
+  const uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8 or quarters of 32: pa ga pb gb; a and b interleaved by channel)
   a.out[t] = k < 2 ? a.proj[(ulong)r * 2 * a.C + 2 * c + k] : a.gate[(ulong)r * 2 * a.C + 2 * c + k - 2];
 }
 kernel void be2_interleave8(LF_ARGS(Be2Interleave8Args)) {

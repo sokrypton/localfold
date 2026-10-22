@@ -65,20 +65,23 @@ static const half* swigluWeight(const std::string& p, int C, int I) {
 const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }
 float swigluScale() { return SWIGLU_SCALE; }
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual, const float* gate, int ldg,
-                   const int* map) {
+                   const int* map, const float** deferH) {
+  if (deferH) *deferH = nullptr;
   const int Co = dimW(p + "fc3/weight", 0);
   Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("w/" + p + "fc3/weight"); G.tw = F16; G.transW = true; G.Y = out; G.ty = F32;
   G.rows = rows; G.in = I; G.out = Co; G.alpha = SWIGLU_SCALE; G.beta = residual ? 1.f : 0.f; G.label = "transition fc3";
   if (!gate) { gemm(G); return; }
   if (gemmGatedRows(G, gate, ldg, map)) return;
-  float* h = scratch<float>("be2.fc3.h", rows * Co);       // (the gated residual's two passes)
+  float* h = scratch<float>(deferH ? "be2.fc3.dh" : "be2.fc3.h", rows * Co);
   G.Y = h; gemm(G);
+  if (deferH) { *deferH = h; return; }
   be2Run1d("be2_gated_add", (rows * Co) >> 2, Be2GatedAddArgs{out, h, gate, map, rows, (uint)Co, (uint)ldg});
 }
 // the fast arm's transition on an input already in half: fc1 | fc2 and the SwiGLU as one GEMM (gemmSwiglu: the product
 // in its epilogue, into half), then fc3 scaled back; a chunk of rows at a time
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual, const float* gate, int ldg,
-                    const int* map) {
+                    const int* map, const float** deferH) {
+  if (deferH) *deferH = nullptr;
   const int I = dimW(p + "fc1/weight", 0), Co = dimW(p + "fc3/weight", 0);
   if (dimW(p + "fc1/weight", 1) != C || dimW(p + "fc3/weight", 1) != I) die("BioEmu2: %s's shapes do not chain", p.c_str());
   const half* w12 = swigluWeight(p, C, I);
@@ -87,7 +90,8 @@ void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::s
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     const size_t r = std::min(chunk, rows - r0);
     gemmSwiglu(xh + r0 * C, w12, g, r, C, I);
-    if (gate) transitionFc3(g, out + r0 * Co, r, I, p, false, map ? gate : gate + r0 * ldg, ldg, map ? map + r0 : nullptr);
+    if (gate) transitionFc3(g, out + r0 * Co, r, I, p, false, map ? gate : gate + r0 * ldg, ldg, map ? map + r0 : nullptr,
+                            r == rows ? deferH : nullptr);
     else transitionFc3(g, out + r0 * Co, r, I, p, residual);
   }
 }
@@ -150,17 +154,10 @@ static const float* onesMask(size_t n) {
   return ONES;
 }
 static const half* triGateWeight(const std::string& p, int C) {
-  if (triQuartersApply(C))      // (the matrix units' quarters, built once through a blocks-of-8 temporary)
-    return M.derived<half>("trigateQ:" + p, (size_t)C * 4 * C, [&](half* out) {
-      half* w8 = allocT<half>((size_t)C * 4 * C);
-      be2Run1d("be2_trigate_weight", (size_t)C * 4 * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), w8,
-                                                                         (uint)C, (uint)C});
-      triQuarters(w8, out, nullptr, nullptr, C);
-      release(w8);
-    });
-  return M.derived<half>("trigate:" + p, (size_t)C * 4 * C, [&](half* out) {
+  const bool q = triQuartersApply(C);
+  return M.derived<half>((q ? "trigateQ:" : "trigate:") + p, (size_t)C * 4 * C, [&](half* out) {
     be2Run1d("be2_trigate_weight", (size_t)C * 4 * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), out,
-                                                                       (uint)C, (uint)C});
+                                                                       (uint)C, (uint)C, q ? 1u : 0u, 0});
   });
 }
 static void triangleFast(float* z, int T, int C, const std::string& p, bool outgoing) {

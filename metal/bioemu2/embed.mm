@@ -42,11 +42,11 @@ float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, cons
   linT(cn, L.p + "cond_2/weight", cond, Rc, Cc, 6 * D, 0.f, 0, 0, false, WfOpt(L.p + "cond_2/bias"));
   return cond;
 }
-void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
-           half* yh) {
+void adaLn(float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
+           half* yh, const float* resH, const float* resGate, int ldrg) {
   const size_t groups = (rows + 7) / 8;
   run("be2_ada_ln", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-      Be2AdaLnArgs{x, y, alpha, beta, map, rows, (uint)C, (uint)C, (uint)ldc, 1.f, yh});
+      Be2AdaLnArgs{x, y, alpha, beta, map, rows, (uint)C, (uint)C, (uint)ldc, 1.f, yh, resH, resGate, (uint)(ldrg ? ldrg : ldc), 0});
 }
 // cond: [6D] a row - alpha_a, beta_a, gamma_a, alpha_m, beta_m, gamma_m
 // the attention's q | k | v | g as one torch weight [4D][D] in half: proj_qkv's rows then proj_g's - the layout
@@ -59,12 +59,14 @@ static const half* qkvgWeight(const std::string& a, int D) {
 }
 // the attention on the fast arm: adaLN into half, q|k|v|g in one GEMM, either be2_window_attention_h (windowed atoms:
 // half K/V in 16 KB shared memory, sigmoid(g) in the epilogue) or metal/core's flash attention (tokens), and the
-// output projection from half into x with the gated residual in its epilogue where metal/core takes it
-static void attentionHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map,
-                          const float* bias, const half* biasH, int perSample) {
+// output projection from half into x with the gated residual in its epilogue where metal/core takes it (or returned for
+// the transition's adaLn to add in place before its norm)
+static const float* attentionHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map,
+                                  const float* bias, const half* biasH, int perSample,
+                                  const float* inResH, const float* inResGate, int inResLdg) {
   const std::string a = L.p + L.att;
   half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
-  adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh);
+  adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh, inResH, inResGate, inResLdg);
   half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)R * 4 * D);
   Gemm g{}; g.X = hh; g.tx = F16; g.W = qkvgWeight(a, D); g.tw = F16; g.transW = true; g.Y = qkvg; g.ty = F16;
   g.rows = R; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = L.windowed ? "atom qkvg" : "token qkvg";
@@ -83,13 +85,13 @@ static void attentionHalf(const CondLayer& L, float* x, int R, int D, const floa
   }
   Gemm G{}; G.X = o; G.tx = F16; G.W = M.h("w/" + a + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = x; G.ty = F32;
   G.rows = R; G.in = D; G.out = D; G.label = L.windowed ? "atom proj_o" : "token proj_o";
-  if (gemmGatedRows(G, cond + 2 * D, 6 * D, map)) return;
+  if (gemmGatedRows(G, cond + 2 * D, 6 * D, map)) return nullptr;
   float* h = scratch<float>("be2.cl.h", (size_t)R * D);
   G.Y = h; gemm(G);
-  be2Run1d("be2_gated_add", ((size_t)R * D) >> 2, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
+  return h;
 }
 // the attention half of a layer on the reference arm: adaLN, q|k|v and g, the attention, the gate, the output projection into h
-static void attentionF32(const CondLayer& L, const float* x, float* h, int R, int D, const float* cond, const int* map,
+static void attentionF32(const CondLayer& L, float* x, float* h, int R, int D, const float* cond, const int* map,
                          const float* bias, int perSample) {
   const std::string a = L.p + L.att;
   adaLn(x, h, R, D, cond, cond + D, 6 * D, map);
@@ -114,9 +116,10 @@ static void attentionF32(const CondLayer& L, const float* x, float* h, int R, in
   linT(o, a + "proj_o/weight", h, R, D, D);
 }
 void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
-               const half* biasH) {
+               const half* biasH, const float* inResH, const float* inResGate, int inResLdg, const float** outResH) {
+  const float* resH = nullptr;
   if (HALF && (L.windowed || biasH)) {
-    attentionHalf(L, x, R, D, cond, map, bias, biasH, perSample);
+    resH = attentionHalf(L, x, R, D, cond, map, bias, biasH, perSample, inResH, inResGate, inResLdg);
   } else {
     float* h = scratch<float>("be2.cl.h", (size_t)R * D);
     attentionF32(L, x, h, R, D, cond, map, bias, perSample);
@@ -124,8 +127,8 @@ void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, co
   }
   if (HALF) {
     half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
-    adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh);
-    transitionHalf(hh, x, R, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map);    // (x += gamma fc3(...))
+    adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh, resH, resH ? cond + 2 * D : nullptr, 6 * D);
+    transitionHalf(hh, x, R, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map, outResH);    // (x += gamma fc3(...))
   } else {
     float* h = scratch<float>("be2.cl.h", (size_t)R * D);
     float* t = scratch<float>("be2.cl.t", (size_t)R * D);

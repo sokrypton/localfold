@@ -31,11 +31,12 @@ struct Be2SigmoidMulArgs { CP(float) h; CP(float) g; DP(float) y; u64 n; };     
 // x[r][c] += gate[map(r) ldg + c] h[r][c] (map null: the identity)
 struct Be2GatedAddArgs { DP(float) x; CP(float) h; CP(float) gate; CP(int) map; u64 rows; uint C, ldg; };
 // adaLN: y = scale (LN(x) (1 + alpha) + beta), alpha / beta rows map(r) of the conditioning (stride ldc); a simdgroup a row
-struct Be2AdaLnArgs { CP(float) x; DP(float) y; CP(float) alpha; CP(float) beta; CP(int) map; u64 rows; uint C, ldx, ldc;
-                      float scale; DP(half) yh; };         // (yh: written in half instead of y)
+// (resH / resGate: an upstream x[r] += resGate[map(r) ldrg] resH[r] fused in place before the norm)
+struct Be2AdaLnArgs { DP(float) x; DP(float) y; CP(float) alpha; CP(float) beta; CP(int) map; u64 rows; uint C, ldx, ldc;
+                      float scale; DP(half) yh; CP(float) resH; CP(float) resGate; uint ldrg, pad0; };         // (yh: written in half instead of y)
 // the coupling's two inputs on the fast arm, normalised directly into half without materialising [q_centre | a] or [a_tok | q]
-struct Be2AdaLnQ2SArgs { CP(float) q; CP(float) a; CP(int) centre; CP(float) alpha; CP(float) beta; CP(int) map;
-                         DP(half) yh; u64 rows; uint T, N, Ca, Dt, ldc, pad0; };
+struct Be2AdaLnQ2SArgs { CP(float) q; DP(float) a; CP(int) centre; CP(float) alpha; CP(float) beta; CP(int) map;
+                         DP(half) yh; u64 rows; uint T, N, Ca, Dt, ldc, ldrg; CP(float) resH; CP(float) resGate; };
 struct Be2AdaLnS2QArgs { CP(float) a; CP(float) q; CP(int) atomTok; CP(int) pad; CP(float) alpha; CP(float) beta; CP(int) map;
                          DP(half) yh; u64 rows; uint T, N, Dt, Ca, ldc, pad0; };
 // the vendor's fc1 / fc2 [I][C] (torch) as gemmSwiglu's one weight [C][2I]: blocks of 8, a_0..a_7 b_0..b_7 a_8.., b = fc2 / S
@@ -91,7 +92,7 @@ struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) out
 // the pair track's fast weights (metal/ef2's): the triangle's projection and gate [C][2C] (a, b interleaved by channel) as
 // gemmTriGate's one weight [C][4C], channel c's (pa ga pb gb) in blocks of 8; AF3's blocked transition1 [C][2I] as
 // gemmSwiglu's blocks of 8, the value half / S
-struct Be2TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
+struct Be2TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C, quarters, pad0; };
 struct Be2Interleave8Args { CP(half) a; CP(half) b; DP(half) out; uint rows, I, lda; float invS; };
 // rows of two torch weights stacked into one [(r1 + r2)][C] half weight
 struct Be2StackArgs { CP(half) a; CP(half) b; DP(half) out; u64 na, nb; };

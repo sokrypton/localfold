@@ -344,6 +344,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   if (batchCond)
     for (int k = 0; k < 4; ++k)
       cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * (T + COND_KINDS[k].rowsExtra) * outC[k]);
+  const float* pendTokH = nullptr; const float* pendTokGate = nullptr; int pendTokLdg = 0;
   for (int l = 0; l < d.layers; ++l) {
     const std::string L = SM + "layers/" + num(l) + "/";
     if (batchCond && l % G == 0) condGroup(cnd, T, Dt, d.layers, l, std::min(G, d.layers - l), outC, cg);
@@ -354,8 +355,10 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
     const CondLayer tokL{L + "token_block/", tb, false, Ht};
     float* condT = batchCond ? cg[1] + (size_t)lj * T * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
+    const float* tokTrH = nullptr;
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, d.tbias ? d.tbias + tbn * l : nullptr, T,
-              d.tbiasH ? d.tbiasH + tbn * l : nullptr);
+              d.tbiasH ? d.tbiasH + tbn * l : nullptr, pendTokH, pendTokGate, pendTokLdg, HALF ? &tokTrH : nullptr);
+    pendTokH = nullptr; pendTokGate = nullptr;
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     const std::string cp = L + "coupling/";
     if (batchCond) { cqc = cg[2] + (size_t)lj * (T + 1) * outC[2]; csc = cg[3] + (size_t)lj * T * outC[3]; }
@@ -378,7 +381,8 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
       half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
       run("be2_ada_ln_q2s", rowsGrid(RT), 256,
           Be2AdaLnQ2SArgs{q, a, Iin("token_center_atom_index"), csc, csc + Dc, maps.tok, qsh, (u64)RT,
-                          (uint)T, (uint)N, (uint)Ca, (uint)Dt, (uint)(2 * Dc + Dt), 0});
+                          (uint)T, (uint)N, (uint)Ca, (uint)Dt, (uint)(2 * Dc + Dt), (uint)(6 * Dt),
+                          tokTrH, tokTrH ? condT + 5 * Dt : nullptr});
       // (q += gamma_q s_to_q and a += gamma_s q_to_s in the fc3s' epilogues: qsh is already formed from untouched q and
       // a before s_to_q updates q, and s_to_q reads untouched a before q_to_s updates a)
       if (csplit) couplingSplit(a, q, cqc, maps.atomTok, samples, T, N, Dt, Ca, cp + "s_to_q_mixer/");
@@ -389,7 +393,9 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
                             (uint)T, (uint)N, (uint)Dt, (uint)Ca, (uint)(2 * Dc + Ca), 0});
         transitionHalf(sqh, q, RN, Dc, cp + "s_to_q_mixer/", false, cqc + 2 * Dc, 2 * Dc + Ca, maps.atomTok);
       }
-      transitionHalf(qsh, a, RT, Dc, cp + "q_to_s_mixer/", false, csc + 2 * Dc, 2 * Dc + Dt, maps.tok);
+      transitionHalf(qsh, a, RT, Dc, cp + "q_to_s_mixer/", false, csc + 2 * Dc, 2 * Dc + Dt, maps.tok,
+                     batchCond && l + 1 < d.layers && (l + 1) % G != 0 ? &pendTokH : nullptr);
+      if (pendTokH) { pendTokGate = csc + 2 * Dc; pendTokLdg = 2 * Dc + Dt; }
     } else {
       be2Run1d("be2_tokens_to_atoms", RN * Dt, Be2TokensToAtomsArgs{a, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), sq, (u64)N,
                                                                  (uint)T, (uint)Dt, (uint)Dc, (uint)samples, 0.f, 0});

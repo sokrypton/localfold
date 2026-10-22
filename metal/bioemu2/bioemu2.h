@@ -61,13 +61,13 @@ void transition(const float* x, float* out, size_t rows, int C, const std::strin
 // (gate: out += gate[map(r)] fc3(...) - the adaLN-gated residual in fc3's epilogue where metal/core takes it, else fc3
 // and be2_gated_add; gate rows ldg apart)
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual,
-                    const float* gate = nullptr, int ldg = 0, const int* map = nullptr);
+                    const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr);
 // (its two halves, for the coupling split: the [C][2I] blocks-of-8 [fc1 | fc2 / 64] weight, and fc3 over the gated
 // product scaled back by 64)
 const half* swigluPairs(const std::string& p, int C, int I);
 float swigluScale();      // (fc2's divisor in every derived SwiGLU weight: 64)
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual,
-                   const float* gate = nullptr, int ldg = 0, const int* map = nullptr);
+                   const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
 void pairTransition(float* z, size_t rows, int C, const std::string& p);
 // AF3's triangle multiplication on the bundle's layout (leftNormInput, projection / gate [C][2C], centerNorm,
@@ -89,14 +89,16 @@ void windowBias(const float* pr, const float* normW, const float* projZ, float* 
 // windowed: the sliding-window atom attention over the windowed pair's bias, else the full token attention over [H][T][T].
 // The conditioning [Rc][6D] is reached through `map` (null: the identity); perSample rows a stacked sample
 // adaLN: y = LN(x) (1 + alpha) + beta, alpha / beta the conditioning's rows map(r) (stride ldc; map null: the identity)
-// (yh: the output in half instead - the fast arm's GEMM input, with no conversion pass between)
-void adaLn(const float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
-           half* yh = nullptr);
+// (yh: the output in half instead - the fast arm's GEMM input, with no conversion pass between; resH / resGate: an
+// upstream x += resGate resH fused in place before the norm)
+void adaLn(float* x, float* y, size_t rows, int C, const float* alpha, const float* beta, int ldc, const int* map,
+           half* yh = nullptr, const float* resH = nullptr, const float* resGate = nullptr, int ldrg = 0);
 struct CondLayer { std::string p, att; bool windowed; int heads; };
 float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, const char* name);
 // biasH: the token attention's bias in half, log2 units - the fast arm runs it on metal/core's flash attention
 void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
-               const half* biasH = nullptr);
+               const half* biasH = nullptr, const float* inResH = nullptr, const float* inResGate = nullptr, int inResLdg = 0,
+               const float** outResH = nullptr);
 void inputEmbedder(float* sInputs, int Si, const Tap& tap);
 
 // ---------------------------------------------------------------- the trunk (trunk.mm)
