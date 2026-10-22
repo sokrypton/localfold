@@ -93,8 +93,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   for (int a = 0; a < FR; ++a)
     _Pragma("clang loop unroll(full)")
     for (int b = 0; b < FC; ++b) acc[a][b] = ACC(0);
-  // (vector staging: the host's word)
-  const bool vec = (g.biasType & 256) != 0;
+  // (vector staging: the host's word, or for a pointer array this entry's own pointers' alignment)
+  const bool vec = (g.biasType & 256) && (!g.ptrs || (((ulong)A % (8 * sizeof(TA))) == 0 && ((ulong)B % (8 * sizeof(TB))) == 0));
   // a whole tile (the common case): staged without a bounds check an element (6% of a K-256 projection's time)
   const bool whole = vec && j0 + TR <= g.n && i0 + TC_ <= g.m && g.k % BK == 0;
   for (int k0 = 0; k0 < g.k; k0 += BK) {
@@ -263,25 +263,26 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       } \
     } \
     simdgroup_matrix<TC, 8, 8> om, cm; \
-    simdgroup_matrix<float, 8, 8> cfm; \
     simdgroup_matrix<half, 8, 8> xm; \
     const bool gated = (EP & 64) == 0 && (g.epilogue & 64); \
-    const bool cf32 = (g.biasType & 512) != 0; \
     const bool loadC = gated || g.beta != 0.f || ((EP & 64) != 0 && (g.epilogue & (8192 | 1048576))); \
-    if (loadC) { \
-      if (cf32) simdgroup_load(cfm, (device const float*)g.C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
-      else simdgroup_load(cm, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
+    if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) { \
+      if (loadC && !(g.biasType & 512)) simdgroup_load(cm, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
+    } else { \
+      if (loadC) simdgroup_load(cm, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
     } \
     if (gated) simdgroup_load(xm, (device const half*)g.aux + (ulong)(j) * g.ldaux + (i), (ulong)g.ldaux); \
     thread auto& o = om.thread_elements(); \
     thread auto& c = cm.thread_elements(); \
-    thread auto& cf = cfm.thread_elements(); \
     thread auto& x = xm.thread_elements(); \
     _Pragma("clang loop unroll(full)") \
     for (int t = 0; t < 2; ++t) { \
       const int col = (i) + sn + t; \
       float v = g.alpha * (float)e[t]; \
-      const float cv = loadC ? (cf32 ? cf[t] : (float)c[t]) : 0.f; \
+      float cv = loadC ? (float)c[t] : 0.f; \
+      if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) { \
+        if (loadC && (g.biasType & 512)) cv = ((device const float*)g.C)[(ulong)((j) + sm) * g.ldc + col]; \
+      } \
       if constexpr ((EP & 64) != 0) { \
         if constexpr (metal::is_same_v<TC, half>) { \
           if (g.epilogue & 1048576) v = cv * v; \
@@ -356,16 +357,70 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         }
         continue;
       }
-      if constexpr ((EP & 16) == 0 && (EP & 64) != 0 && metal::is_same_v<TC, half>) {
-        if ((g.epilogue & 4096) && (g.tgC & 7) == 0 && j + 8 <= g.n && i + 8 <= g.m) {
-          const uint O = (uint)g.tgC, L = (uint)g.tgN;
-          const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
-          simdgroup_matrix<half, 8, 8> om;
-          thread auto& o = om.thread_elements();
-          _Pragma("clang loop unroll(full)")
-          for (int t = 0; t < 2; ++t) o[t] = (half)clamp(g.alpha * (float)e[t], -65504.f, 65504.f);
-          simdgroup_store(om, D + (((ulong)ii * L + jj) * O + cc) * O + ee, (ulong)O);
-          continue;
+      if constexpr ((EP & 16) == 0 && (EP & 64) != 0) {
+        if constexpr (metal::is_same_v<TC, half>) {
+          if ((g.epilogue & 4096) && (g.tgC & 7) == 0 && j + 8 <= g.n && i + 8 <= g.m) {
+            const uint O = (uint)g.tgC, L = (uint)g.tgN;
+            const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
+            simdgroup_matrix<half, 8, 8> om;
+            thread auto& o = om.thread_elements();
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < 2; ++t) o[t] = (half)clamp(g.alpha * (float)e[t], -65504.f, 65504.f);
+            simdgroup_store(om, D + (((ulong)ii * L + jj) * O + cc) * O + ee, (ulong)O);
+            continue;
+          }
+        }
+        if constexpr (metal::is_same_v<TC, float>) {
+          if ((g.epilogue & 16384) && j + 8 <= g.n && j + 8 <= g.tgPairs && i + 8 <= g.m) {
+            simdgroup_matrix<float, 8, 8> om, cm;
+            simdgroup_load(cm, C + (ulong)j * g.ldc + i, (ulong)g.ldc);
+            thread auto& o = om.thread_elements();
+            thread auto& c = cm.thread_elements();
+            const uint jr = (uint)(j + sm), r = jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < 2; ++t) {
+              const float gp = ((device const float*)g.aux)[(ulong)r * g.ldaux + (i + sn + t)];
+              const float gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
+              o[t] = c[t] + g.alpha * (float)e[t] * gm;
+            }
+            simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+            continue;
+          }
+          if ((g.epilogue & 262144) && j + 8 <= g.n && i + 8 <= g.m) {
+            simdgroup_matrix<float, 8, 8> om, cm;
+            simdgroup_load(cm, C + (ulong)j * g.ldc + i, (ulong)g.ldc);
+            thread auto& o = om.thread_elements();
+            thread auto& c = cm.thread_elements();
+            device const int* mp = (device const int*)g.aux2;
+            const int jr = j + sm;
+            const ulong row = mp ? (ulong)(uint)mp[jr] : (ulong)jr;
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < 2; ++t) {
+              const float gm = ((device const float*)g.aux)[row * g.ldaux + (i + sn + t)];
+              o[t] = c[t] + gm * (g.alpha * (float)e[t]);
+            }
+            simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+            continue;
+          }
+          if ((g.epilogue & 524288) && (g.tgC & 7) == 0 && j + 8 <= g.n && j + 8 <= g.tgPairs && i + 8 <= g.m) {
+            const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
+            const uint k0 = lf_udiv((uint)j, N), r0 = (uint)j - k0 * N;
+            if (r0 + 8 <= N) {
+              const uint bs = lf_udiv((uint)i, W), col0 = (uint)i - bs * W;
+              simdgroup_matrix<float, 8, 8> om;
+              thread auto& o = om.thread_elements();
+              _Pragma("clang loop unroll(full)")
+              for (int t = 0; t < 2; ++t) {
+                const int ic = i + sn + t, col = (int)col0 + sn + t;
+                float v = g.alpha * (float)e[t];
+                if (g.epilogue & 4) v += ((device const float*)g.bias)[ic];
+                if (col < g.tgNp) v = 1.f / (1.f + exp(-v));
+                o[t] = v;
+              }
+              simdgroup_store(om, D + (((ulong)k0 * BS + bs) * N + r0) * W + col0, (ulong)W);
+              continue;
+            }
+          }
         }
       }
 #undef LF_STORE_8X8
@@ -418,7 +473,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             }
           }
           if (g.epilogue & 8192) {
-            const float cv = (g.biasType & 512) ? ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc] : lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
+            float cv = lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
+            if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) {
+              if (g.biasType & 512) cv = ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc];
+            }
             const float b128 = ((device const float*)g.bias)[ic & 127];
             const float s = 1e-3f + ((device const float*)g.aux)[(uint)jr * ((uint)g.m >> 7) + ((uint)ic >> 7)];
             v = cv + (b128 + v) / s;
@@ -427,15 +485,24 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             continue;
           }
         }
-        const float cv = (g.biasType & 512) ? ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc] : lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
         if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
           if (g.epilogue & 4) v += ((device const float*)g.bias)[ic];      // (the gate's bias, f32: AF2's)
+          float cv = lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
+          if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) {
+            if (g.biasType & 512) cv = ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc];
+          }
           v = cv + (float)((device const half*)g.aux)[(ulong)ic + (ulong)jr * g.ldaux] * (1.f / (1.f + exp(-v)));
           lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
           if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
           continue;
         }
-        if (g.beta != 0.f) v += g.beta * cv;
+        if (g.beta != 0.f) {
+          float cv = lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
+          if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) {
+            if (g.biasType & 512) cv = ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc];
+          }
+          v += g.beta * cv;
+        }
         if (g.epilogue & 4) {
           const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
           v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + ic] : ((device const float*)g.bias)[boff + ic];

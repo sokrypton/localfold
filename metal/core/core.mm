@@ -838,8 +838,8 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);
   if (tr % 16 || tc % 16 || tr < 16 || tc < 16) die("gemm: no %d x %d tile", tr, tc);
   auto esize = [](DT t) { return t == F32 ? 4 : 2; };
-  bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && a.sa % 8 == 0 && a.sb % 8 == 0 &&
-             a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0;
+  bool vec = a.lda % 8 == 0 && a.ldb % 8 == 0 &&
+             (a.ptrs || (a.sa % 8 == 0 && a.sb % 8 == 0 && a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0));
   if (vec) a.biasType |= 256;
   int bk = (tc >= 48 && tr >= 48) || (tc == 32 && tr >= 80) || tc >= 128 ? 16 : 32;
   if (const char* e = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(e);
