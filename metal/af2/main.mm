@@ -245,7 +245,7 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
         float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
         float* cp = scratch<float>("head.contact", pairs);
         linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
-        run1d("af2_symmetrise", pairs * 64, SymmetriseArgs{dh, dg, (uint)L, 64});
+        run1d("af2_symmetrise", pairs * 16, SymmetriseArgs{dh, dg, (uint)L, 64});
         run1d("af2_contact8", pairs, Contact8Args{dg, cp, pairs});
         std::vector<float> ch = download(cp, pairs);
         std::vector<unsigned char> c8(pairs);
@@ -289,7 +289,7 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
       float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
       float* cp = scratch<float>("head.contact", pairs);
       linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
-      run1d("af2_symmetrise", pairs * 64, SymmetriseArgs{dh, dg, (uint)L, 64});
+      run1d("af2_symmetrise", pairs * 16, SymmetriseArgs{dh, dg, (uint)L, 64});
       run1d("af2_contact8", pairs, Contact8Args{dg, cp, pairs});
       contact = download(cp, pairs);
     }

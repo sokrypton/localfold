@@ -25,7 +25,8 @@ half* biasLayout(const float* raw, const std::string& name, int n, int heads, in
 const half* triGateWeight(const std::string& pre, int C) {
   const bool q = triQuartersApply(C);
   return M.derived<half>((q ? "trigateQ:" : "trigate:") + pre, (size_t)C * 4 * C, [&](half* out) {
-    run1d("af3_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), out, 0, (uint)C, (uint)C, q ? 1u : 0u, 0});
+    run1d("af3_trigate_weight", (C & 1) ? (size_t)C * 4 * C : (size_t)C * C,
+          TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), out, 0, (uint)C, (uint)C, q ? 1u : 0u, 0});
   });
 }
 // LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate; AF3 interleaves a and b by channel) ->
@@ -43,12 +44,14 @@ static half* takeEmitted(const void* x, const std::string& norm) {
   emitted[0].x = emitted[1].x = nullptr;
   return nullptr;
 }
-template <class T> static half* pairLn(const T* pair, size_t P, int C, const std::string& norm) {
+template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm) {
   if (half* b = takeEmitted(pair, norm)) return b;
   half* xn = scratch<half>("pr.x", P * C);
   ln(pair, xn, P, C, norm + "Scale", norm + "Offset");
   return xn;
 }
+half* pairLn(const float* pair, size_t P, int C, const std::string& norm) { return pairLnT(pair, P, C, norm); }
+half* pairLn(const half* pair, size_t P, int C, const std::string& norm) { return pairLnT(pair, P, C, norm); }
 // Y += X W (+ bias): the residual into the pair (or the single) in its own type
 static void addLinW(const half* X, const half* w, float* Y, size_t rows, int in, int out, const float* bias, const char* label) {
   linW(X, w, Y, rows, in, out, 1.f, bias, 1.f, label);

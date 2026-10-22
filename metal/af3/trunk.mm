@@ -103,7 +103,9 @@ static void templateEmbedding(Trunk& t) {
     }
     if (hasW(P + "templateFeatureBias")) addBias(act, W(P + "templateFeatureBias"), pairs, Ct);
     if (outer) copy(before, act, pairs * Ct * 4);
-    for (int b = 0; b < nb; ++b) pairUpdates(act, t.masks, n, Ct, P + "blocks." + num(b));
+    for (int b = 0; b < nb; ++b)
+      pairUpdates(act, t.masks, n, Ct, P + "blocks." + num(b),
+                  b + 1 < nb ? P + "blocks." + num(b + 1) + ".triangleMultiplicationOutgoing.leftNormInput" : "");
     if (outer) add(act, before, pairs * Ct);
     ln(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");     // (a row read whole before it is written)
     if (flag("trunk.dialect.chaiTemplates") && M.has(S + "pseudoBetaMask2d"))      // chai: masked by its own coverage
@@ -142,7 +144,7 @@ static void embed(Trunk& t) {
   };
   half* pn = scratch<half>("emb.prevln", pairs * C);
   if (chai && t.pass == 0) {
-    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, nullptr, t.pair, (uint)n, (uint)C});
+    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, nullptr, t.pair, (uint)n, (uint)C});
     chaiRelEnc();
     ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", t.pair, pairs, C, C, 1.f);
@@ -151,10 +153,10 @@ static void embed(Trunk& t) {
     // its own normalised row - and the outer sum added in place; a copy of it and an f32 term were two pairs more)
     ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", t.pair, pairs, C, C);
-    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, t.pair, t.pair, (uint)n, (uint)C});
+    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, t.pair, t.pair, (uint)n, (uint)C});
   }
   if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
-  else run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
+  else run1d("af3_relenc", (C & 3) ? pairs * C : pairs * (C >> 2), RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
   const bool bonds = M.has("batch.bondMatrix") && hasW(E + "bondEmbedding"), types = hasW(E + "tokenBondsTypeEmbed");
   if (bonds || types)
     run1d("af3_bond_embed", pairs * C,
@@ -221,8 +223,8 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
   half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
   linH(xn, pre + ".leftProjection", lt, rows, Cm, O, Wopt(pre + ".leftProjectionBias"));      // (rf3's biases, before the mask)
   linH(xn, pre + ".rightProjection", rt, rows, Cm, O, Wopt(pre + ".rightProjectionBias"));
-  run1d("af3_scale_rows_h", rows * O, ScaleRowsHArgs{lt, t.msaMask, rows, (uint)O, 0});
-  run1d("af3_scale_rows_h", rows * O, ScaleRowsHArgs{rt, t.msaMask, rows, (uint)O, 0});
+  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, t.msaMask, rows, (uint)O, 0});
+  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{rt, t.msaMask, rows, (uint)O, 0});
   float* norm = scratch<float>("opm.norm", (size_t)L * L);
   run1d("af3_mask_norm", (size_t)L * L, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
   const half* Wout = Wh(pre + ".outputW");          // [O * O][C]
@@ -237,9 +239,13 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
     run1d("af3_opm_left", rows * O, OpmLeftArgs{lt, Lt, (uint)S, (uint)L, (uint)O, 1.f});
     int K = O * S;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * C)));
-    float* Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
+    float* Y = nullptr;
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
+      if (!after && C == 128 && gemmOpmOut(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
+                                           norm + (size_t)i0 * L, bi, K, L * C, 1.f))
+        continue;
+      if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
       Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = Y; g.rows = bi; g.in = K; g.out = L * C; g.label = "opm shallow";
       gemm(g);
       run1d("af3_opm_add", (size_t)bi * L * C, OpmAddArgs{t.pair, Y, W(pre + ".outputB"), norm, (u64)i0, (uint)bi, (uint)L, (uint)C, after});
@@ -257,7 +263,7 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
   size_t per = (size_t)L * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
-  float* Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
+  float* Y = nullptr;
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass; core.h)
@@ -267,6 +273,10 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
         g.ty = F16; g.rows = (size_t)bi * O; g.in = S; g.out = L * O; g.accFloat = true; g.label = "opm product"; gemm(g); }
       run1d("af3_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
+    if (!after && C == 128 && gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
+                                         norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f))
+      continue;
+    if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
     { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = C; g.label = "opm output"; gemm(g); }
     run1d("af3_opm_add", (size_t)bi * L * C, OpmAddArgs{t.pair, Y, W(pre + ".outputB"), norm, (u64)i0, (uint)bi, (uint)L, (uint)C, after});
   }
@@ -283,8 +293,7 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   half* xn = scratch<half>("msaatt.ln", rows * Cm);
   ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
   if (!parallelTransition.empty()) transition(t.msa, rows, Cm, parallelTransition, nullptr, "", "", "msatr.");
-  half* pln = scratch<half>("msaatt.pln", pairs * C);
-  ln(t.pair, pln, pairs, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+  half* pln = pairLn(t.pair, pairs, C, pre + ".pairNorm");
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
   lin(pln, pre + ".pairLogits", flat, pairs, C, heads);
   float* keyMask = scratch<float>("msaatt.keymask", n);
@@ -297,7 +306,7 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   run("af3_msa_weights", Grid{(uint32_t)(heads * n), 1, 1}, 256, MsaWeightsArgs{flat, keyMask, w, (uint)n, (uint)heads, (uint)ldw, 0});
   half* v = scratch<half>("msaatt.v", rows * Wd);
   linH(xn, pre + ".vProjection", v, rows, Cm, Wd);
-  if (chaiMask) run1d("af3_scale_rows_h", rows * Wd, ScaleRowsHArgs{v, t.msaMask, rows, (uint)Wd, 0});
+  if (chaiMask) run1d("af3_scale_rows_h", (Wd & 3) ? rows * Wd : rows * (Wd >> 2), ScaleRowsHArgs{v, t.msaMask, rows, (uint)Wd, 0});
   half* vh = scratch<half>("msaatt.vh", (size_t)S * ldw * Wd);
   const bool v8 = d % 8 == 0 && (size_t)S * ldw * Wd < ((size_t)1 << 32);     // (16 bytes a thread)
   if (v8) run1d("af3_msa_v_heads8", (size_t)S * ldw * Wd / 8, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
@@ -351,7 +360,7 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
     add(t.pair + (size_t)i0 * n * C, X, (size_t)bi * n * C);
   }
 }
-static void msaBlock(Trunk& t, int k) {
+static void msaBlock(Trunk& t, int k, int msaBlocks) {
   std::string B = "trunk.msaBlocks." + num(k);
   if (flag("trunk.dialect.groupedOuterProduct")) {
     // chai-1: z += grouped OPM(m); m += attention(m, z) + transition(m), both off the same m; then the pair track in two
@@ -367,7 +376,8 @@ static void msaBlock(Trunk& t, int k) {
   msaAttention(t, B + ".msaAttention1");
   transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition");
   if (updateFirst) outerProductMean(t, B + ".outerProductMean");
-  pairUpdates(t.pair, t.masks, t.n, t.C, B);
+  pairUpdates(t.pair, t.masks, t.n, t.C, B,
+              (k + 1 < msaBlocks && updateFirst) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.pairNorm" : "");
 }
 
 // ---------------------------------------------------------------- one pass
@@ -383,7 +393,7 @@ void runTrunk(Trunk& t) {
     zIn = scratch<float>("trunk.zBeforeMsa", pairs * t.C);
     copy(zIn, t.pair, pairs * t.C * 4);
   }
-  for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k);
+  for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k, msaBlocks);
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
@@ -437,7 +447,8 @@ void distogram(Trunk& t, float* logits) {
   size_t pairs = (size_t)t.n * t.n;
   float* h = scratch<float>("disto.half", pairs * bins);
   distogramHalf(t.pair, h, pairs, t.C, bins);
-  run1d("af3_symmetrise", pairs * bins, SymmetriseArgs{h, logits, (uint)t.n, (uint)bins, flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f, 0});
+  run1d("af3_symmetrise", (bins & 3) ? pairs * bins : pairs * (bins >> 2),
+        SymmetriseArgs{h, logits, (uint)t.n, (uint)bins, flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f, 0});
 }
 // the contact thresholds (shared/heads/contact-threshold.js), cut against this model's own distogram bins
 static float contactAngstroms(int a, int b) {

@@ -11,12 +11,27 @@ kernel void af2_target_feat(LF_ARGS(TargetFeatArgs)) {      // one-hot 20 (X as 
 }
 kernel void af2_broadcast_rows(LF_ARGS(BroadcastRowsArgs)) {   // msa[s, i] += row[i]
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    uint r = lf_udiv((uint)t, C4), c4 = (uint)t - r * C4, i = r - lf_udiv(r, a.L) * a.L;
+    ((device float4*)a.msa)[t] += ((device const float4*)a.row)[i * C4 + c4];
+    return;
+  }
   if (t >= a.rows * a.C) return;
   uint r = lf_udiv((uint)t, a.C), c = (uint)t - r * a.C, i = r - lf_udiv(r, a.L) * a.L;
   a.msa[t] += a.row[i * a.C + c];
 }
 kernel void af2_outer_sum(LF_ARGS(OuterSumArgs)) {      // pair = left[i] + right[j] (+ pair, where add)
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.L * a.L * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.L), j = ij - i * a.L;
+    float4 v = ((device const float4*)a.left)[i * C4 + c4] + ((device const float4*)a.right)[j * C4 + c4];
+    ((device float4*)a.pair)[t] = a.add ? v + ((device const float4*)a.pair)[t] : v;
+    return;
+  }
   if (t >= (ulong)a.L * a.L * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.L), j = ij - i * a.L;
   float v = a.left[i * a.C + c] + a.right[j * a.C + c];
@@ -140,6 +155,12 @@ kernel void af2_qkvg_weight(LF_ARGS(QkvgWArgs)) {
 }
 kernel void af2_scale_rows_h(LF_ARGS(ScaleRowsHArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    ((device half4*)a.x)[t] = half4(float4(((device const half4*)a.x)[t]) * a.mask[lf_udiv((uint)t, C4)]);
+    return;
+  }
   if (t >= a.rows * a.C) return;
   a.x[t] = (half)((float)a.x[t] * a.mask[lf_udiv((uint)t, a.C)]);
 }
@@ -727,6 +748,13 @@ kernel void af2_pae_tm(LF_ARGS(PaeTmArgs)) {
 }
 kernel void af2_symmetrise(LF_ARGS(SymmetriseArgs)) {   // y[i][j] = x[i][j] + x[j][i]
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.L * a.L * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.L), j = ij - i * a.L;
+    ((device float4*)a.y)[t] = ((device const float4*)a.x)[t] + ((device const float4*)a.x)[((ulong)j * a.L + i) * C4 + c4];
+    return;
+  }
   if (t >= (ulong)a.L * a.L * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.L), j = ij - i * a.L;
   a.y[t] = a.x[t] + a.x[((ulong)j * a.L + i) * a.C + c];

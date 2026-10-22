@@ -118,7 +118,7 @@ DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense
   float* dPde = scratch<float>("ddc.pdeC", pdeBins); upload(dPde, pdeC.data(), pdeBins * 4);
   float* dPae = scratch<float>("ddc.paeC", paeBins); upload(dPae, paeC.data(), paeBins * 4);
   float* dPer = scratch<float>("ddc.perBin", paeBins); upload(dPer, perBin.data(), paeBins * 4);
-  run1d("af3_symmetrise", pairs * C, SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
+  run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
   ln(sym, lnP, pairs, C, P + "pdeLnScale", P + "pdeLnOffset");
   lin(lnP, P + "pde", logits, pairs, C, pdeBins);
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, nullptr, dPde, pairs, (uint)pdeBins, 0, 1.f, 0});

@@ -17,7 +17,7 @@ static void boltz2Reembed(float* pair, float* single, const Trunk& t, const floa
   if (lenW(R + "relPosProject") != (size_t)139 * C) die("relPosProject is not 139 x %d", C);
   RelIdx r{M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
            M.i("batch.features.entityId"), M.i("batch.features.symId")};
-  run1d("af3_relenc", pairs * C, RelEncArgs{r, W(R + "relPosProject"), pair, (uint)n, (uint)C});
+  run1d("af3_relenc", (C & 3) ? pairs * C : pairs * (C >> 2), RelEncArgs{r, W(R + "relPosProject"), pair, (uint)n, (uint)C});
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
   lin(sIn, R + "leftTargetFeatProject", left, n, F, C);
@@ -35,7 +35,8 @@ static void boltz2Reembed(float* pair, float* single, const Trunk& t, const floa
   half* prod = scratch<half>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
   for (int i0 = 0; i0 < n; i0 += rowsPer) {
     int rr = std::min(rowsPer, n - i0);
-    run1d("af3_outer_prod", (size_t)rr * n * C, OuterProdArgs{p1, p2, prod, (uint)i0, (uint)rr, (uint)n, (uint)C});
+    run1d("af3_outer_prod", (C & 3) ? (size_t)rr * n * C : (size_t)rr * n * (C >> 2),
+          OuterProdArgs{p1, p2, prod, (uint)i0, (uint)rr, (uint)n, (uint)C});
     lin(prod, R + "sToZProdOut", pair + (size_t)i0 * n * C, (size_t)rr * n, C, C, 1.f);
   }
 }
@@ -166,7 +167,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   if (hasW(P + ".interHalfDistanceLogits") && !preSym) die("split PDE heads need the pre-symmetrised PDE");
   if (preSym) {      // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
     float* sym = scratch<float>("conf.sym", pairs * C);
-    run1d("af3_symmetrise", pairs * C, SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
+    run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
     head(sym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   } else head(pair, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, t.pairMask, dCentres, pairs, (uint)NB, preSym ? 0u : (uint)n, 1.f, 0});

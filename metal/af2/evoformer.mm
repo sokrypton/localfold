@@ -88,7 +88,7 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
   float* p1d = scratch<float>("emb.p1d", (size_t)L * 256);
   linearB(tf, E + "preprocess_1d", -1, p1d, L, 21, 256);
   linearB(In(f + "msa_feat"), E + "preprocess_msa", -1, t.msa, (size_t)N * L, 49, 256);
-  run1d("af2_broadcast_rows", (size_t)N * L * 256, BroadcastRowsArgs{t.msa, p1d, (u64)N * L, (uint)L, 256});
+  run1d("af2_broadcast_rows", (size_t)N * L * 64, BroadcastRowsArgs{t.msa, p1d, (u64)N * L, (uint)L, 256});
   float* prevRowLn = scratch<float>("emb.prevRow", (size_t)L * 256);
   layerNormW(prevMsaRow, prevRowLn, L, 256, E + "prev_msa_first_row_norm");
   add(t.msa, prevRowLn, (size_t)L * 256);
@@ -100,7 +100,7 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
   // (the recycled pair normalised in place - a row is read whole before it is written - and the outer sum added to it:
   // a copy of the last pass's pair and its norm were two f32 pairs more, 1.1 GB at 1044 residues)
   layerNormW(t.pair, t.pair, pairs, 128, E + "prev_pair_norm");
-  run1d("af2_outer_sum", pairs * 128, OuterSumArgs{t.pair, left, right, (uint)L, 128, 1, 0});
+  run1d("af2_outer_sum", pairs * 32, OuterSumArgs{t.pair, left, right, (uint)L, 128, 1, 0});
   float* dgram = scratch<float>("emb.dgram", pairs * 15);
   run1d("af2_prev_dgram", pairs, PrevDgramArgs{prevPos, aatype, dgram, (uint)L, 0});
   linearB(dgram, E + "prev_pos_linear", -1, t.pair, pairs, 15, 128, false, 1.f);
@@ -299,8 +299,8 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     gemm(g);
   }
   if (!ones) {
-    run1d("af2_scale_rows_h", rows * O, ScaleRowsHArgs{lt, msaMask, rows, (uint)O, 0});
-    run1d("af2_scale_rows_h", rows * O, ScaleRowsHArgs{rt, msaMask, rows, (uint)O, 0});
+    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{lt, msaMask, rows, (uint)O, 0});
+    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{rt, msaMask, rows, (uint)O, 0});
   }
   // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
   static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
