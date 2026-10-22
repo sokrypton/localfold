@@ -1137,11 +1137,32 @@ kernel void ef2_gather_atoms(LF_ARGS(GatherAtomsArgs)) {
 }
 // per atom: logits over bins from its slot's table, then the expectation over [0, 1]
 kernel void ef2_plddt_atom(constant PlddtArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                           uint tid [[thread_index_in_threadgroup]]) {
+                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
   uint at = tg.x;
-  threadgroup float logit[64];
   device const float* s = a.s + (ulong)(uint)a.atomToToken[at] * a.C;
   device const float* tb = a.table + (ulong)a.slot[at] * a.C * a.bins;
+  if (a.bins <= 64) {
+    threadgroup float red[4];
+    float lg = -INFINITY, mx = -INFINITY;
+    if (tid < a.bins) {
+      float acc = 0;
+      for (uint c = 0; c < a.C; ++c) acc += s[c] * tb[(ulong)c * a.bins + tid];
+      lg = acc; mx = acc;
+    }
+    mx = simd_max(mx);
+    if (lane == 0) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = max(red[0], red[1]);
+    float w = tid < a.bins ? exp(lg - mx) : 0.f;
+    float e = w * (float(tid) + 0.5f) / float(a.bins);
+    w = simd_sum(w); e = simd_sum(e);
+    if (lane == 0) { red[sg] = w; red[sg + 2] = e; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) a.plddt[at] = (red[2] + red[3]) / (red[0] + red[1]);
+    return;
+  }
+  threadgroup float logit[64];
   for (uint b = tid; b < a.bins; b += 64) {
     float acc = 0;
     for (uint c = 0; c < a.C; ++c) acc += s[c] * tb[(ulong)c * a.bins + b];

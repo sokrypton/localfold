@@ -1112,11 +1112,12 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Ks + (sg * 8) * LD + dk * 8, LD);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong srcBase = (ulong)ks * a.subsets * Q;
+  const bool fullK = a.keys == K;
   if (a.q2kIdx) {
     _Pragma("clang loop unroll(full)")
     for (uint e = tid; e < K * D8; e += 128) {
       uint kj = e / D8, d = (e - kj * D8) * 8, g = ss * a.keys + kj;
-      if (kj < a.keys && a.q2kMask[g] != 0.f) {
+      if ((fullK || kj < a.keys) && a.q2kMask[g] != 0.f) {
         device const half* src = a.kv + (srcBase + (uint)a.q2kIdx[g]) * W2 + h * D + d;
         *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
         *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
@@ -1129,7 +1130,7 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
     _Pragma("clang loop unroll(full)")
     for (uint e = tid; e < K * D8; e += 128) {
       uint kj = e / D8, d = (e - kj * D8) * 8;
-      if (kj < a.keys) {
+      if (fullK || kj < a.keys) {
         device const half* src = a.kv + ((ulong)s * a.keys + kj) * W2 + h * D + d;
         *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
         *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
@@ -1154,18 +1155,31 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   device const float* pl = a.logits + (((ulong)ss * a.heads + h) * Q + q) * a.keys;
   device const float* km = a.kMask + (ulong)ss * a.keys;
   float mx = -1e30f;
-  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
-    thread auto& e = sc[j].thread_elements();
-    _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
-      const uint k = j * 8 + sn + t;
-      if (k < a.keys) {
-        float kk = km[k];
-        float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kk)) : 1e9f * (qm - 1.f) * (kk - 1.f);
-        e[t] += (pl[k] + maskBias) * M_LOG2E_F;
-      } else {
-        e[t] = -1e30f;
+  if (fullK) {
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      const uint k = j * 8 + sn;
+      const float2 pv = *(device const float2*)(pl + k);
+      const float2 kv = *(device const float2*)(km + k);
+      const float2 mb = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kv)) : (1e9f * (qm - 1.f)) * (kv - 1.f);
+      e[0] += (pv.x + mb.x) * M_LOG2E_F;
+      e[1] += (pv.y + mb.y) * M_LOG2E_F;
+      mx = max(mx, max((float)e[0], (float)e[1]));
+    }
+  } else {
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+        const uint k = j * 8 + sn + t;
+        if (k < a.keys) {
+          float kk = km[k];
+          float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kk)) : 1e9f * (qm - 1.f) * (kk - 1.f);
+          e[t] += (pl[k] + maskBias) * M_LOG2E_F;
+        } else {
+          e[t] = -1e30f;
+        }
+        mx = max(mx, (float)e[t]);
       }
-      mx = max(mx, (float)e[t]);
     }
   }
   mx = max(mx, simd_shuffle_xor(mx, (ushort)1));

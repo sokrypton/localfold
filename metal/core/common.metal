@@ -297,17 +297,23 @@ template <int NK>
 kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   device const float* prod = a.prod;
-  threadgroup float part[256];
-  threadgroup half T[32 * (8 * NK + 4)];
-  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 4;
+  threadgroup half T[32 * 8 * NK];
+  threadgroup float* part = (threadgroup float*)T;
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8;
+  const bool exact = C == 8 * NK;
+  const uint ld = exact ? (8 * NK) : (C + 4);
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
   const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
-  const bool live = r0 + lane < a.pairs, exact = C == 8 * NK;
+  const bool live = r0 + lane < a.pairs;
   float v[NK];
   float s = 0.f;
   _Pragma("clang loop unroll(full)")
-  for (uint k = 0; k < NK; ++k) if (exact || k < nk) { v[k] = live ? prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
+  for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
+    uint c = exact ? (4 * grp + 32 * (k >> 2) + (k & 3)) : (grp + 8 * k);
+    v[k] = live ? prod[(ulong)c * plane + q] : 0.f;
+    s += v[k];
+  }
   part[grp * 32 + lane] = s;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float S = 0.f;
@@ -324,16 +330,38 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
   _Pragma("clang loop unroll(full)")
   for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
   const float inv = rsqrt(V / C + a.eps);
-  _Pragma("clang loop unroll(full)")
-  for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
-    uint c = grp + 8 * k;
-    T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (exact) {
+    const uint swiz = (lane & 15) << 2;
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < NK / 4; ++k) {
+      uint c0 = 4 * grp + 32 * k;
+      float4 sc = *(device const float4*)(a.scale + c0);
+      float4 of = *(device const float4*)(a.offset + c0);
+      *(threadgroup half4*)(T + lane * (8 * NK) + (c0 ^ swiz)) = half4(
+          (half)((v[4 * k + 0] - mean) * inv * sc.x + of.x),
+          (half)((v[4 * k + 1] - mean) * inv * sc.y + of.y),
+          (half)((v[4 * k + 2] - mean) * inv * sc.z + of.z),
+          (half)((v[4 * k + 3] - mean) * inv * sc.w + of.w));
+    }
+  } else {
+    for (uint k = 0; k < nk; ++k) {
+      uint c = grp + 8 * k;
+      T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint row = grp; row < 32; row += 8) {
     ulong r = r0 + row;
     if (r >= a.pairs) break;
-    if ((C & 3) == 0) {
+    if (exact) {
+      const uint swiz = (row & 15) << 2;
+      _Pragma("clang loop unroll(full)")
+      for (uint k = 0; k < NK / 16; ++k) {
+        const uint c = 128 * k + 4 * lane;
+        *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * (8 * NK) + (c ^ swiz));
+      }
+    } else if ((C & 3) == 0) {
       for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
     } else {
       for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
@@ -348,11 +376,12 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
                              uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   constexpr uint R = 32 * PP;
   device const half* prod = a.prodh;
-  threadgroup float part[8 * R];
-  threadgroup half T[R * (8 * NK + 4)];
-  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 4;
-  const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * R, plane = (ulong)a.Lp * a.Lp;
+  threadgroup half T[32 * 8 * NK];
+  threadgroup float* part = (threadgroup float*)T;
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8;
   const bool exact = C == 8 * NK;
+  const uint ld = exact ? (8 * NK) : (C + 4);
+  const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * R, plane = (ulong)a.Lp * a.Lp;
   ulong q[PP]; bool live[PP];
   _Pragma("clang loop unroll(full)")
   for (uint p = 0; p < PP; ++p) {
@@ -361,13 +390,17 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
     live[p] = r0 + PP * lane + p < a.pairs;
   }
   half v[PP][NK];
-  if (PP == 2 && live[0] && live[1] && q[1] == q[0] + 1 && (q[0] & 1) == 0) {
+  if (PP == 2 && exact && live[0] && live[1] && q[1] == q[0] + 1 && (q[0] & 1) == 0) {
     float s0 = 0.f, s1 = 0.f;
     _Pragma("clang loop unroll(full)")
-    for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
-      half2 h = *(device const half2*)(prod + (ulong)(grp + 8 * k) * plane + q[0]);
-      v[0][k] = h.x; v[1][k] = h.y;
-      s0 += (float)h.x; s1 += (float)h.y;
+    for (uint k = 0; k < NK / 4; ++k) {
+      _Pragma("clang loop unroll(full)")
+      for (uint j = 0; j < 4; ++j) {
+        uint c = 4 * grp + 32 * k + j;
+        half2 h = *(device const half2*)(prod + (ulong)c * plane + q[0]);
+        v[0][4 * k + j] = h.x; v[1][4 * k + j] = h.y;
+        s0 += (float)h.x; s1 += (float)h.y;
+      }
     }
     part[grp * R + 2 * lane] = s0; part[grp * R + 2 * lane + 1] = s1;
   } else {
@@ -376,7 +409,8 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
       float s = 0.f;
       _Pragma("clang loop unroll(full)")
       for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
-        half h = live[p] ? prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.h;
+        uint c = exact ? (4 * grp + 32 * (k >> 2) + (k & 3)) : (grp + 8 * k);
+        half h = live[p] ? prod[(ulong)c * plane + q[p]] : 0.h;
         v[p][k] = h;
         s += (float)h;
       }
@@ -396,42 +430,59 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
     part[grp * R + PP * lane + p] = d2;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  float inv[PP];
   _Pragma("clang loop unroll(full)")
   for (uint p = 0; p < PP; ++p) {
     float V = 0.f;
     _Pragma("clang loop unroll(full)")
     for (int g = 0; g < 8; ++g) V += part[g * R + PP * lane + p];
-    const float inv = rsqrt(V / C + a.eps);
-    _Pragma("clang loop unroll(full)")
-    for (uint k = 0; k < NK; ++k) if (exact || k < nk) {
-      uint c = grp + 8 * k;
-      T[(PP * lane + p) * ld + c] = (half)(((float)v[p][k] - mean[p]) * inv * a.scale[c] + a.offset[c]);
-    }
+    inv[p] = rsqrt(V / C + a.eps);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (exact) {
-    _Pragma("clang loop unroll(full)")
-    for (uint row = grp; row < R; row += 8) {
-      ulong r = r0 + row;
-      if (r >= a.pairs) break;
-      if constexpr (NK == 8) {
-        if (lane < 16) {
-          const uint c = 4 * lane;
-          *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
-        }
-      } else {
-        _Pragma("clang loop unroll(full)")
-        for (uint k = 0; k < NK / 16; ++k) {
-          const uint c = 128 * k + 4 * lane;
-          *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
-        }
+  _Pragma("clang loop unroll(full)")
+  for (uint p = 0; p < PP; ++p) {
+    if (p > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (exact) {
+      const uint swiz = (lane & 15) << 2;
+      _Pragma("clang loop unroll(full)")
+      for (uint k = 0; k < NK / 4; ++k) {
+        uint c0 = 4 * grp + 32 * k;
+        float4 sc = *(device const float4*)(a.scale + c0);
+        float4 of = *(device const float4*)(a.offset + c0);
+        *(threadgroup half4*)(T + lane * (8 * NK) + (c0 ^ swiz)) = half4(
+            (half)(((float)v[p][4 * k + 0] - mean[p]) * inv[p] * sc.x + of.x),
+            (half)(((float)v[p][4 * k + 1] - mean[p]) * inv[p] * sc.y + of.y),
+            (half)(((float)v[p][4 * k + 2] - mean[p]) * inv[p] * sc.z + of.z),
+            (half)(((float)v[p][4 * k + 3] - mean[p]) * inv[p] * sc.w + of.w));
+      }
+    } else {
+      for (uint k = 0; k < nk; ++k) {
+        uint c = grp + 8 * k;
+        T[lane * ld + c] = (half)(((float)v[p][k] - mean[p]) * inv[p] * a.scale[c] + a.offset[c]);
       }
     }
-  } else {
-    for (uint row = grp; row < R; row += 8) {
-      ulong r = r0 + row;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint row = grp; row < 32; row += 8) {
+      ulong r = r0 + PP * row + p;
       if (r >= a.pairs) break;
-      for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+      if (exact) {
+        const uint swiz = (row & 15) << 2;
+        if constexpr (NK == 8) {
+          if (lane < 16) {
+            const uint c = 4 * lane;
+            *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * (8 * NK) + (c ^ swiz));
+          }
+        } else {
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < NK / 16; ++k) {
+            const uint c = 128 * k + 4 * lane;
+            *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * (8 * NK) + (c ^ swiz));
+          }
+        }
+      } else {
+        for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+      }
     }
   }
 }

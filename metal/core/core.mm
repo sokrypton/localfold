@@ -795,13 +795,14 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   // instead, into one reused buffer (stream order keeps it), and the product on the matrix units.
   // LOCALFOLD_GEMM_X_HALF=0 the control
   static const bool xHalf = !getenv("LOCALFOLD_GEMM_X_HALF") || atoi(getenv("LOCALFOLD_GEMM_X_HALF")) != 0;
-  if (xHalf && ta_ == F16 && tb_ == F32 && halfMma && !a.ptrs && tensorWanted()) {
+  if (xHalf && ta_ == F16 && tb_ == F32 && halfMma && !a.ptrs) {
     const size_t span = (size_t)(batch - 1) * a.sb + (a.tb ? (size_t)(a.k - 1) * a.ldb + a.n : (size_t)(a.n - 1) * a.ldb + a.k);
     static half* xh = nullptr; static size_t xhCap = 0;
     if (span > xhCap) { if (xh) release(xh); xhCap = span + span / 4; xh = allocT<half>(xhCap); }
     toHalf((const float*)a.B, xh, span);
     a.B = (uint64_t)xh;
-    return gemmTensorRun(tc_, a, batch, accFloat, label);
+    tb_ = F16;
+    if (tensorWanted()) return gemmTensorRun(tc_, a, batch, accFloat, label);
   }
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
