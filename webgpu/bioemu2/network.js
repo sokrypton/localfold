@@ -269,18 +269,23 @@ export class Bioemu2Gpu {
     const wbPlane = 2 * L * DT;
     const wPlane = L * DT;
     // (LN's affine as the LayerNorm kernel applies it, (x - mean) inv, times w, plus b: then silu for all 4 kinds in one pass)
-    steps.push(await o.map("cond-affine", n * T * DT, [{ buffer: buffers.cin, write: true }, { buffer: xhat }, { buffer: lwb }],
-    `let c = i % 768u; let r = i / 768u; let t = r % U(0u); let l = U(1u) + r / U(0u);
-  let x = b1[t * 768u + c];
-  let wIdx = l * 768u + c;
-  let v0 = x * b2[wIdx] + b2[${wPlane}u + wIdx];
-  let v1 = x * b2[${wbPlane}u + wIdx] + b2[${wbPlane + wPlane}u + wIdx];
-  let v2 = x * b2[${2 * wbPlane}u + wIdx] + b2[${2 * wbPlane + wPlane}u + wIdx];
-  let v3 = x * b2[${3 * wbPlane}u + wIdx] + b2[${3 * wbPlane + wPlane}u + wIdx];
-  b0[i] = v0 / (1.0 + exp(-v0));
-  b0[${plane}u + i] = v1 / (1.0 + exp(-v1));
-  b0[${2 * plane}u + i] = v2 / (1.0 + exp(-v2));
-  b0[${3 * plane}u + i] = v3 / (1.0 + exp(-v3));`, [T, l0]));
+    const plane4 = plane / 4, wbPlane4 = wbPlane / 4, wPlane4 = wPlane / 4;
+    steps.push(await o.map("cond-affine", (n * T * DT) / 4, [
+      { buffer: buffers.cin, type: "vec4<f32>", write: true },
+      { buffer: xhat, type: "vec4<f32>" },
+      { buffer: lwb, type: "vec4<f32>" },
+    ],
+    `let c4 = i % 192u; let r = i / 192u; let t = r % U(0u); let l = U(1u) + r / U(0u);
+  let x = b1[t * 192u + c4];
+  let wIdx = l * 192u + c4;
+  let v0 = x * b2[wIdx] + b2[${wPlane4}u + wIdx];
+  let v1 = x * b2[${wbPlane4}u + wIdx] + b2[${wbPlane4 + wPlane4}u + wIdx];
+  let v2 = x * b2[${2 * wbPlane4}u + wIdx] + b2[${2 * wbPlane4 + wPlane4}u + wIdx];
+  let v3 = x * b2[${3 * wbPlane4}u + wIdx] + b2[${3 * wbPlane4 + wPlane4}u + wIdx];
+  b0[i] = v0 / (vec4<f32>(1.0) + exp(-v0));
+  b0[${plane4}u + i] = v1 / (vec4<f32>(1.0) + exp(-v1));
+  b0[${2 * plane4}u + i] = v2 / (vec4<f32>(1.0) + exp(-v2));
+  b0[${3 * plane4}u + i] = v3 / (vec4<f32>(1.0) + exp(-v3));`, [T, l0]));
     for (let kIdx = 0; kIdx < kinds.length; kIdx += 1) {
       const k = kinds[kIdx];
       const w2 = await this.stacked(`stack/${k.key}/${k.l2}/weight`, all.map((l) => `${k.prefix(l)}/${k.l2}/weight`), this.half);
@@ -298,21 +303,32 @@ export class Bioemu2Gpu {
     if (!buffers.gA) return out;
     // the coupling split's: gamma_a, gamma_q and beta a layer (row T the padding's identity), then R | B
     const R = T + 1;
-    steps.push(await o.map("cs-gamma-g", n * R * DC, [{ buffer: buffers.gA, write: true }, { buffer: buffers.gQ, write: true },
-      { buffer: buffers.beta, write: true }, { buffer: buffers.q }],
-    `let j = i / U(1u); let e = i % U(1u); let t = e / 896u; let c = e % 896u; let real = t < U(0u);
-  var al = 0.0; var be = 0.0;
-  if (real) { let at = (j * U(0u) + t) * 1920u; al = b3[at + c]; be = b3[at + 896u + c]; }
-  if (c < 768u) { b0[(j * U(2u) + t) * 768u + c] = 1.0 + al; } else { b1[(j * U(2u) + t) * 128u + c - 768u] = 1.0 + al; }
-  b2[i] = be;`, [T, R * DC, R]));
+    steps.push(await o.map("cs-gamma-g", (n * R * DC) / 4, [
+      { buffer: buffers.gA, type: "vec4<f32>", write: true },
+      { buffer: buffers.gQ, type: "vec4<f32>", write: true },
+      { buffer: buffers.beta, type: "vec4<f32>", write: true },
+      { buffer: buffers.q, type: "vec4<f32>" },
+      { buffer: buffers.gAQ, type: "vec4<f32>", write: true },
+    ],
+    `let j = i / U(1u); let e4 = i % U(1u); let t = e4 / 224u; let c4 = e4 % 224u; let real = t < U(0u);
+  var al = vec4<f32>(0.0); var be = vec4<f32>(0.0);
+  if (real) { let at4 = (j * U(0u) + t) * 480u; al = b3[at4 + c4]; be = b3[at4 + 224u + c4]; }
+  let g = vec4<f32>(1.0) + al;
+  if (c4 < 192u) {
+    b0[(j * U(2u) + t) * 192u + c4] = g;
+    b4[i] = g * (-1.0 / 6.0);
+  } else {
+    b1[(j * U(2u) + t) * 32u + c4 - 192u] = g;
+    b4[i] = g;
+  }
+  b2[i] = be;`, [T, R * (DC / 4), R]));
     const W = await this.stacked("stack/s_to_q_mixer/fc12", all.map((l) => `${layer(l)}/coupling/s_to_q_mixer`), this.half, true);
     const wl = W2 * DC;
-    // (R | B: R = Qq - Qa / 6 - couplingSplit's)
+    // (R | B: R = Qq - Qa / 6 - couplingSplit's, fused into a single DC=896 GEMM via gAQ)
     const qb = (k, a0, aStride, wOff, cOff, more = {}) => o.gemm({ m: R, n: W2, k, a: a0, b: W, c: buffers.QB, batches: [n, 1],
       A: { off: 0, s0: R * aStride, m: aStride, k: 1 }, B: { off: l0 * wl + wOff, s0: wl, n: DC, k: 1 },
       C: { off: cOff, s0: R * 2 * W2, m: 2 * W2, n: 1 }, ...more });
-    steps.push(await qb(DT, buffers.gA, DT, 0, 0, { alpha: -DA / DT }));
-    steps.push(await qb(DA, buffers.gQ, DA, DT, 0, { accumulate: true }));
+    steps.push(await qb(DC, buffers.gAQ, DC, 0, 0));
     steps.push(await qb(DC, buffers.beta, DC, 0, W2));
     for (let j = 0; j < n; j += 1) {
       out[j].pre = { W, wOff: (l0 + j) * wl, gA: o.view(buffers.gA, j * R * DT, R * DT), gQ: o.view(buffers.gQ, j * R * DA, R * DA),
@@ -929,6 +945,7 @@ export class Bioemu2Gpu {
       cin: o.buffer("cg.cin", 4 * G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),
       q: o.buffer("cg.q", G * T * 1920), s: o.buffer("cg.s", G * T * 2560),
       ...(split ? { gA: o.buffer("cg.gA", G * (T + 1) * DT), gQ: o.buffer("cg.gQ", G * (T + 1) * DA),
+                    gAQ: o.buffer("cg.gAQ", G * (T + 1) * 896),
                     beta: o.buffer("cg.beta", G * (T + 1) * 896), QB: o.buffer("cg.QB", G * (T + 1) * 2 * 3584) } : {}),
     };
     const xhat = batchCond ? o.buffer("cg.xhat", T * DT) : null;

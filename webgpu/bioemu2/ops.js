@@ -170,7 +170,7 @@ ${pair ? `${pair.decls}
 // a lane's acc_i_0 (tx) and acc_i_1 (tx + 16) are four gates and their four values, handed to pairOut together)
 fn bRow(v: u32) -> u32 { return ((v / 64u) % 2u) * ${pair.half}u + (v / 128u) * 64u + v % 64u; }
 ${pair.body}` : "fn bRow(v: u32) -> u32 { return v; }"}
-var<workgroup> ta: array<vec4<${E}>, ${BK * 17}>;    // [BK][64] k-major, padded to 17 vec4s to avoid bank conflicts
+  var<workgroup> ta: array<vec4<${E}>, ${BK * 17}>;    // [BK][BM] k-major, padded to 17 vec4s to avoid bank conflicts
 ${rpt === 5 ? `var<workgroup> ta4: array<${E}, ${BK * 17}>;` : ""}
 var<workgroup> tb: array<vec4<${EB}>, ${BK * 33}>;    // [BK][128], padded to 33 vec4s to avoid bank conflicts
 @compute @workgroup_size(256)
@@ -217,7 +217,88 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let fullB = rowB0 + 3u < p.n;
   let tbWrite0 = kkB * 33u + r4B;
   let tbWrite1 = (kkB + 1u) * 33u + r4B;` : ""}
-  for (var k0 = kStart; k0 < kEnd; k0 += ${BK}u) {
+  let kFastEnd = select(kStart, kStart + ((kEnd - kStart) & ~${BK - 1}u), inBatch && p.sAk == 1u);
+  for (var k0 = kStart; k0 < kFastEnd; k0 += ${BK}u) {
+    {
+      var v = vec4<f32>(0.0);
+      ${rpt === 5 ? "var v4 = 0.0;" : ""}
+      if (fullA) {
+        v = vec4<f32>(a[aBase0 + k0], a[aBase1 + k0], a[aBase2 + k0], a[aBase3 + k0]);
+        ${rpt === 5 ? "v4 = a[aBase4 + k0];" : ""}
+      } else {
+        if (rowA0 < p.m) { v.x = a[aBase0 + k0]; }
+        if (rowA0 + 1u < p.m) { v.y = a[aBase1 + k0]; }
+        if (rowA0 + 2u < p.m) { v.z = a[aBase2 + k0]; }
+        if (rowA0 + 3u < p.m) { v.w = a[aBase3 + k0]; }
+        ${rpt === 5 ? "if (rowA0 + 4u < p.m) { v4 = a[aBase4 + k0]; }" : ""}
+      }
+      ta[taWrite] = vec4<${E}>(v);
+      ${rpt === 5 ? `ta4[taWrite] = ${E}(v4);` : ""}
+    }
+    ${wordB ? `{
+      var lo = vec4<${EB}>(0.0);
+      var hi = vec4<${EB}>(0.0);
+      let bOff = k0 / 2u;
+      ${b16 ? `if (fullB) {
+        let p0 = bitcast<vec2<f16>>(b[bBase0 + bOff]);
+        let p1 = bitcast<vec2<f16>>(b[bBase1 + bOff]);
+        let p2 = bitcast<vec2<f16>>(b[bBase2 + bOff]);
+        let p3 = bitcast<vec2<f16>>(b[bBase3 + bOff]);
+        lo = vec4<f16>(p0.x, p1.x, p2.x, p3.x);
+        hi = vec4<f16>(p0.y, p1.y, p2.y, p3.y);
+      } else {
+        if (rowB0 < p.n) { let p0 = bitcast<vec2<f16>>(b[bBase0 + bOff]); lo.x = p0.x; hi.x = p0.y; }
+        if (rowB0 + 1u < p.n) { let p1 = bitcast<vec2<f16>>(b[bBase1 + bOff]); lo.y = p1.x; hi.y = p1.y; }
+        if (rowB0 + 2u < p.n) { let p2 = bitcast<vec2<f16>>(b[bBase2 + bOff]); lo.z = p2.x; hi.z = p2.y; }
+        if (rowB0 + 3u < p.n) { let p3 = bitcast<vec2<f16>>(b[bBase3 + bOff]); lo.w = p3.x; hi.w = p3.y; }
+      }` : `if (fullB) {
+        let p0 = unpack2x16float(b[bBase0 + bOff]);
+        let p1 = unpack2x16float(b[bBase1 + bOff]);
+        let p2 = unpack2x16float(b[bBase2 + bOff]);
+        let p3 = unpack2x16float(b[bBase3 + bOff]);
+        lo = vec4<f32>(p0.x, p1.x, p2.x, p3.x);
+        hi = vec4<f32>(p0.y, p1.y, p2.y, p3.y);
+      } else {
+        if (rowB0 < p.n) { let p0 = unpack2x16float(b[bBase0 + bOff]); lo.x = p0.x; hi.x = p0.y; }
+        if (rowB0 + 1u < p.n) { let p1 = unpack2x16float(b[bBase1 + bOff]); lo.y = p1.x; hi.y = p1.y; }
+        if (rowB0 + 2u < p.n) { let p2 = unpack2x16float(b[bBase2 + bOff]); lo.z = p2.x; hi.z = p2.y; }
+        if (rowB0 + 3u < p.n) { let p3 = unpack2x16float(b[bBase3 + bOff]); lo.w = p3.x; hi.w = p3.y; }
+      }`}
+      tb[tbWrite0] = lo;
+      tb[tbWrite1] = hi;
+    }` : `for (var e = 0u; e < ${32 * BK / 256}u; e += 1u) {
+      let slot = li + e * 256u;
+      let kk = slot % ${BK}u;
+      let r4 = slot / ${BK}u;
+      let k = k0 + kk;
+      let row0 = n0 + r4 * 4u;
+      let bAddr0 = baseB + bRow(row0) * p.sBn + k * p.sBk;
+      var v = vec4<f32>(0.0);
+      if (row0 + 3u < p.n) {
+        v = vec4<f32>(b[bAddr0], b[bAddr0 + p.sBn], b[bAddr0 + 2u * p.sBn], b[bAddr0 + 3u * p.sBn]);
+      } else {
+        if (row0 < p.n) { v.x = b[bAddr0]; }
+        if (row0 + 1u < p.n) { v.y = b[bAddr0 + p.sBn]; }
+        if (row0 + 2u < p.n) { v.z = b[bAddr0 + 2u * p.sBn]; }
+        if (row0 + 3u < p.n) { v.w = b[bAddr0 + 3u * p.sBn]; }
+      }
+      tb[kk * 33u + r4] = vec4<${EB}>(v);
+    }`}
+    workgroupBarrier();
+    ${Array.from({ length: BK }, (_, kk) => `{
+      let av = ta[${kk * 17}u + tm4];
+      ${rpt === 5 ? `let av4 = ta4[${kk * 17}u + tm4];` : ""}
+      let bv0 = vec4<f32>(tb[${kk * 33}u + tx]);
+      let bv1 = vec4<f32>(tb[${kk * 33 + 16}u + tx]);
+      acc_0_0 += av.x * bv0; acc_0_1 += av.x * bv1;
+      acc_1_0 += av.y * bv0; acc_1_1 += av.y * bv1;
+      acc_2_0 += av.z * bv0; acc_2_1 += av.z * bv1;
+      acc_3_0 += av.w * bv0; acc_3_1 += av.w * bv1;
+      ${rpt === 5 ? "acc_4_0 += av4 * bv0; acc_4_1 += av4 * bv1;" : ""}
+    }`).join("\n    ")}
+    workgroupBarrier();
+  }
+  for (var k0 = kFastEnd; k0 < kEnd; k0 += ${BK}u) {
     let fullK = inBatch && (k0 + ${BK}u <= kEnd);
     // 🔴 EVERY PANEL WRITE IS A WHOLE vec4, one lane's: lanes writing different components of one shared vec4 race -
     // a component store can be a read-modify-write of the vector, and it was (every stage wrong from s_inputs on, 0.61).
@@ -354,6 +435,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       ${gate ? `let gr = ${gate === "map" ? "gmap[m]" : "i32(m)"};
       if (gr >= 0) {
         let gBase = u32(gr) * p.gS + p.gOff;
+        if (p.bias == 0u && p.act == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n) {
+          let c0 = rowC + n0 + tn0;
+          let c1 = rowC + n0 + tn1;
+          let g0 = gBase + n0 + tn0;
+          let g1 = gBase + n0 + tn1;
+          c[c0] += gcond[g0] * r0.x;
+          c[c0 + 1u] += gcond[g0 + 1u] * r0.y;
+          c[c0 + 2u] += gcond[g0 + 2u] * r0.z;
+          c[c0 + 3u] += gcond[g0 + 3u] * r0.w;
+          c[c1] += gcond[g1] * r1.x;
+          c[c1 + 1u] += gcond[g1 + 1u] * r1.y;
+          c[c1 + 2u] += gcond[g1 + 2u] * r1.z;
+          c[c1 + 3u] += gcond[g1 + 3u] * r1.w;
+        } else {
         ${[0, 1, 2, 3, 4, 5, 6, 7].map((j) => {
           const nExpr = j < 4 ? `n0 + tn0 + ${j}u` : `n0 + tn1 + ${j - 4}u`;
           const valExpr = j < 4 ? `r0.${"xyzw"[j]}` : `r1.${"xyzw"[j - 4]}`;
@@ -369,7 +464,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           }
         }`;
         }).join("\n        ")}
-      }` : `${[0, 1, 2, 3, 4, 5, 6, 7].map((j) => {
+        }
+      }` : `if (p.split == 0u && p.bias == 0u && p.act == 0u && p.accumulate == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n) {
+        let c0 = rowC + n0 + tn0;
+        let c1 = rowC + n0 + tn1;
+        c[c0] = r0.x; c[c0 + 1u] = r0.y; c[c0 + 2u] = r0.z; c[c0 + 3u] = r0.w;
+        c[c1] = r1.x; c[c1 + 1u] = r1.y; c[c1 + 2u] = r1.z; c[c1 + 3u] = r1.w;
+      } else {
+      ${[0, 1, 2, 3, 4, 5, 6, 7].map((j) => {
         const nExpr = j < 4 ? `n0 + tn0 + ${j}u` : `n0 + tn1 + ${j - 4}u`;
         const valExpr = j < 4 ? `r0.${"xyzw"[j]}` : `r1.${"xyzw"[j - 4]}`;
         return `{
@@ -386,9 +488,91 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           c[at] = v;
         }
       }`;
-      }).join("\n      ")}`}
+      }).join("\n      ")}
+      }`}
     }
   }`).join("\n  ")}
+}`;
+}
+
+function lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg = 1 }) {
+  const K = width / 64;
+  const ks = Array.from({ length: K }, (_, k) => k);
+  const srcName = inPlace ? "y" : "x";
+  const wgSize = 64 * rowsPerWg;
+  return `
+struct P { rows: u32, width: u32, xStride: u32, yStride: u32, xOff: u32, yOff: u32,
+  hasW: u32, hasB: u32, modulate: u32, condStride: u32, alphaOff: u32, betaOff: u32, useMap: u32, eps: f32 };
+@group(0) @binding(0) var<uniform> p: P;
+${inPlace ? "" : "@group(0) @binding(1) var<storage, read> x: array<f32>;"}
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+${hasW ? "@group(0) @binding(3) var<storage, read> w: array<f32>;" : ""}
+${hasB ? "@group(0) @binding(4) var<storage, read> bv: array<f32>;" : ""}
+${modulate ? "@group(0) @binding(5) var<storage, read> cond: array<f32>;" : ""}
+${modulate && useMap ? "@group(0) @binding(6) var<storage, read> rowMap: array<i32>;" : ""}
+var<workgroup> red: array<f32, ${wgSize}>;
+@compute @workgroup_size(${wgSize})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) liRaw: u32) {
+  ${rowsPerWg > 1
+    ? `let sub = liRaw / 64u;
+  let li = liRaw % 64u;
+  let rb = sub * 64u;
+  let r = (wid.x + wid.y * 65535u) * ${rowsPerWg}u + sub;`
+    : `let li = liRaw;
+  let rb = 0u;
+  let r = wid.x + wid.y * 65535u;`}
+  let live = r < p.rows;
+  let row = min(r, p.rows - 1u);
+  let xb = row * ${width}u + li;
+  ${ks.map((k) => `let v_${k} = ${srcName}[xb + ${k * 64}u];`).join("\n  ")}
+  var s = 0.0;
+  ${ks.map((k) => `s += v_${k};`).join("\n  ")}
+  red[rb + li] = s;
+  workgroupBarrier();
+  if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  let mean = red[rb] / ${width}.0;
+  workgroupBarrier();
+  var q = 0.0;
+  ${ks.map((k) => `let d_${k} = v_${k} - mean; q += d_${k} * d_${k};`).join("\n  ")}
+  red[rb + li] = q;
+  workgroupBarrier();
+  if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  if (!live) { return; }
+  let inv = inverseSqrt(red[rb] / ${width}.0 + p.eps);
+  ${modulate ? `let crow = ${useMap ? "rowMap[row]" : "i32(row)"};
+  let cb = u32(max(crow, 0)) * p.condStride;
+  let caBase = cb + p.alphaOff + li;
+  let cbBase = cb + p.betaOff + li;` : ""}
+  let yb = row * ${width}u + li;
+  ${ks.map((k) => {
+    const off = `${k * 64}u`;
+    let expr = `d_${k} * inv`;
+    if (hasW) expr = `(${expr}) * w[li + ${off}]`;
+    if (hasB) expr = `(${expr}) + bv[li + ${off}]`;
+    if (modulate) {
+      return `{
+    var val = ${expr};
+    var al = 0.0;
+    var be = 0.0;
+    if (crow >= 0) {
+      al = cond[caBase + ${off}];
+      be = cond[cbBase + ${off}];
+    }
+    y[yb + ${off}] = val * (1.0 + al) + be;
+  }`;
+    }
+    return `y[yb + ${off}] = ${expr};`;
+  }).join("\n  ")}
 }`;
 }
 
@@ -741,9 +925,31 @@ export class Bioemu2Ops {
                                       batches: [1, parts], splitChunk: chunk,
                                       A: { ...A, s1: 0 }, B: { ...B, s1: 0 }, C: { off: 0, s0: 0, s1: m * n, m: n, n: 1 } });
       const g = spec.gate;
-      const reduce = await this.map(g ? (g.map ? "gemm-reduce-gm" : "gemm-reduce-g") : "gemm-reduce", m * n, [{ buffer: spec.c, write: true }, { buffer: partial },
-        { buffer: spec.bias ?? this.dummy }, ...(g ? [{ buffer: g.cond }, ...(g.map ? [{ buffer: g.map, type: "i32" }] : [])] : [])],
-      `let n = U(1u); let row = i / n; let col = i % n; let stride = U(0u);
+      const vec4Reduce = n % 4 === 0 && C.off % 4 === 0 && C.m === n && C.n === 1
+        && (!g || (g.stride % 4 === 0 && g.off % 4 === 0));
+      const reduce = vec4Reduce
+        ? await this.map(g ? (g.map ? "gemm-reduce-gm" : "gemm-reduce-g") : "gemm-reduce", (m * n) / 4,
+          [{ buffer: spec.c, type: "vec4<f32>", write: true }, { buffer: partial, type: "vec4<f32>" },
+           { buffer: spec.bias ?? this.dummy, type: "vec4<f32>" },
+           ...(g ? [{ buffer: g.cond, type: "vec4<f32>" }, ...(g.map ? [{ buffer: g.map, type: "i32" }] : [])] : [])],
+          `let n4 = U(1u); let row = i / n4; let col4 = i % n4; let stride4 = U(0u);
+  var v = b1[i];
+  if (U(2u) == 2u) {
+    v += b1[stride4 + i];
+  } else {
+    for (var s = 1u; s < U(2u); s += 1u) { v += b1[s * stride4 + i]; }
+  }
+  if (U(3u) != 0u) { v += b2[col4]; }
+  if (U(4u) == 1u) { v = max(v, vec4<f32>(0.0)); }
+  if (U(4u) == 2u) { v = vec4<f32>(1.0) / (vec4<f32>(1.0) + exp(-v)); }
+  let at4 = U(6u) + row * n4 + col4;
+  ${g ? `let gr = ${g.map ? "b4[row]" : "i32(row)"};
+  if (gr >= 0) { b0[at4] = b0[at4] + b3[u32(gr) * U(9u) + U(10u) + col4] * v; }` : `if (U(5u) != 0u) { v += b0[at4]; }
+  b0[at4] = v;`}`, [(m * n) / 4, n / 4, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
+            C.off / 4, C.m / 4, 1, (g?.stride ?? 0) / 4, (g?.off ?? 0) / 4])
+        : await this.map(g ? (g.map ? "gemm-reduce-gm" : "gemm-reduce-g") : "gemm-reduce", m * n, [{ buffer: spec.c, write: true }, { buffer: partial },
+          { buffer: spec.bias ?? this.dummy }, ...(g ? [{ buffer: g.cond }, ...(g.map ? [{ buffer: g.map, type: "i32" }] : [])] : [])],
+        `let n = U(1u); let row = i / n; let col = i % n; let stride = U(0u);
   var v = b1[i];
   if (U(2u) == 2u) {
     v += b1[stride + i];
@@ -757,7 +963,7 @@ export class Bioemu2Ops {
   ${g ? `let gr = ${g.map ? "b4[row]" : "i32(row)"};
   if (gr >= 0) { b0[at] = b0[at] + b3[u32(gr) * U(9u) + U(10u) + col] * v; }` : `if (U(5u) != 0u) { v += b0[at]; }
   b0[at] = v;`}`, [m * n, n, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
-        C.off, C.m, C.n, g?.stride ?? 0, g?.off ?? 0]);
+          C.off, C.m, C.n, g?.stride ?? 0, g?.off ?? 0]);
       first.label = `gemm ${m}x${n}x${k} split ${parts}`;
       return this.program([first, reduce]);
     }
@@ -774,12 +980,12 @@ export class Bioemu2Ops {
     u[26] = spec.biasS0 ?? 0;
     u[27] = spec.gate?.stride ?? 0;
     u[28] = spec.gate?.off ?? 0;
-    const rpt = v2 && m > 64 && m <= 80 ? 5 : 4;
-    const bm = rpt * 16;
-    const groups = Math.ceil(m / bm) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
     // (a half weight's panel staged in f16 where the device has shader-f16: b16Panels false is the control)
     const b16 = v2 && word && this.b16Panels !== false && this.device.features?.has?.("shader-f16") === true;
+    const rpt = v2 && m > 64 && m <= 80 ? 5 : 4;
+    const bm = rpt * 16;
+    const groups = Math.ceil(m / bm) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     const gate = spec.gate ? (spec.gate.map ? "map" : "plain") : null;
     const kind = `${v2 ? "gemm2" : "gemm"}${rpt === 5 ? "-m80" : ""}${word ? "-h" : ""}${b16 ? "-b16" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}${gate ? `-g${gate}` : ""}`;
     const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16, gate, rpt) : gemmSource(word), groups,
@@ -794,7 +1000,7 @@ export class Bioemu2Ops {
     const v2 = this.gemmVersion === 2;
     const tiles = Math.ceil(m / 64) * Math.ceil(n / (v2 ? 128 : 64)) * batches;
     const work = v2 ? 2 : 1;
-    const target = this.splitTarget ?? 80;
+    const target = this.splitTarget ?? 64;
     if (batches !== 1 || tiles * work >= target || k < 512) return 1;
     return Math.min(Math.floor(k / 128), Math.ceil(target / (tiles * work)));
   }
@@ -854,7 +1060,7 @@ ${qbBind}
 @group(0) @binding(${outBindIdx}) var<storage, read_write> out: array<f32>;
 var<workgroup> ks: array<vec4<f32>, 256>;     // [32 keys][32 dims]
 var<workgroup> vs: array<vec4<f32>, 256>;
-var<workgroup> ps: array<f32, 1024>;          // [32 queries][32 keys] this chunk's logits
+var<workgroup> ps: array<vec4<f32>, 256>;     // [32 queries][8 vec4 keys] this chunk's logits
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let flat = wid.x + wid.y * 65535u;
@@ -895,35 +1101,39 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       vs[slot] = vec4<f32>(kv[row + ${D}u], kv[row + ${D + 1}u], kv[row + ${D + 2}u], kv[row + ${D + 3}u]);`}
     }
     workgroupBarrier();
-    // this lane's 8 keys of the chunk
-    for (var jj = 0u; jj < 8u; jj += 1u) {
-      let j = sub * 8u + jj;
-      let jb = j * 8u;
-      let qk = ${[0, 1, 2, 3, 4, 5, 6, 7].map((d) => `dot(q_${d}, ks[jb + ${d}u])`).join(" + ")};
-      let key = c * 32u + j;
-      var v = qk * p.alpha + bias[biasRow + key];
-      if (mask[w * ${WQ}u + key] == 0) { v = -1.0e6; }
-      ps[qi * 32u + j] = v;
+    // this lane's 8 keys of the chunk (2 vec4 stores)
+    for (var g4 = 0u; g4 < 2u; g4 += 1u) {
+      let j0 = sub * 8u + g4 * 4u;
+      var pv = vec4<f32>(0.0);
+      ${[0, 1, 2, 3].map((k) => `{
+        let j = j0 + ${k}u;
+        let jb = j * 8u;
+        let qk = ${[0, 1, 2, 3, 4, 5, 6, 7].map((d) => `dot(q_${d}, ks[jb + ${d}u])`).join(" + ")};
+        let key = c * 32u + j;
+        var v = qk * p.alpha + bias[biasRow + key];
+        if (mask[w * ${WQ}u + key] == 0) { v = -1.0e6; }
+        pv.${"xyzw"[k]} = v;
+      }`).join("\n      ")}
+      ps[qi * 8u + sub * 2u + g4] = pv;
     }
     workgroupBarrier();
     // the online softmax over the chunk's 32 (every lane of a query alike), and this lane's 8 output dims
     var cm = m;
-    let pBase = qi * 32u;
-    for (var j = 0u; j < 32u; j += 4u) {
-      cm = max(max(cm, ps[pBase + j]), max(ps[pBase + j + 1u], max(ps[pBase + j + 2u], ps[pBase + j + 3u])));
+    let pBase4 = qi * 8u;
+    for (var j4 = 0u; j4 < 8u; j4 += 1u) {
+      let pv = ps[pBase4 + j4];
+      cm = max(cm, max(max(pv.x, pv.y), max(pv.z, pv.w)));
     }
     let rescale = exp(m - cm);
     l = l * rescale;
     o0 = o0 * rescale;
     o1 = o1 * rescale;
-    for (var j = 0u; j < 32u; j += 2u) {
-      let e0 = exp(ps[pBase + j] - cm);
-      let e1 = exp(ps[pBase + j + 1u] - cm);
-      l += e0 + e1;
-      let vb0 = j * 8u + sub * 2u;
-      let vb1 = vb0 + 8u;
-      o0 += e0 * vs[vb0] + e1 * vs[vb1];
-      o1 += e0 * vs[vb0 + 1u] + e1 * vs[vb1 + 1u];
+    for (var j4 = 0u; j4 < 8u; j4 += 1u) {
+      let ev = exp(ps[pBase4 + j4] - vec4<f32>(cm));
+      l += (ev.x + ev.y) + (ev.z + ev.w);
+      let vb0 = j4 * 32u + sub * 2u;
+      o0 += ev.x * vs[vb0] + ev.y * vs[vb0 + 8u] + ev.z * vs[vb0 + 16u] + ev.w * vs[vb0 + 24u];
+      o1 += ev.x * vs[vb0 + 1u] + ev.y * vs[vb0 + 9u] + ev.z * vs[vb0 + 17u] + ev.w * vs[vb0 + 25u];
     }
     m = cm;
     workgroupBarrier();
@@ -983,7 +1193,7 @@ ${gBind}
 ${hasQBias ? `@group(0) @binding(${qbBindIdx}) var<storage, read> qBias: array<f32>;` : ""}
 var<workgroup> ks: array<vec4<f32>, ${32 * V}>;     // [32 keys][hd]
 var<workgroup> vs: array<vec4<f32>, ${32 * V}>;
-var<workgroup> ps: array<f32, 1024>;              // [32 queries][32 keys]
+var<workgroup> ps: array<vec4<f32>, 256>;           // [32 queries][8 vec4 keys]
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let flat = wid.x + wid.y * 65535u;
@@ -1026,31 +1236,35 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       }
     }
     workgroupBarrier();
-    for (var jj = 0u; jj < 8u; jj += 1u) {
-      let j = sub * 8u + jj;
-      let kt = c * 32u + j;
-      var v = -3.0e38;
-      if (kt < p.T) {
-        let jb = j * ${V}u;
-        let qk = ${vIdx.map((d) => `dot(q_${d}, ks[jb + ${d}u])`).join(" + ")};
-        v = qk * p.alpha + bias[biasRow + kt];
-      }
-      ps[ql * 32u + j] = v;
+    for (var g4 = 0u; g4 < 2u; g4 += 1u) {
+      let j0 = sub * 8u + g4 * 4u;
+      var pv = vec4<f32>(-3.0e38);
+      ${[0, 1, 2, 3].map((k) => `{
+        let j = j0 + ${k}u;
+        let kt = c * 32u + j;
+        if (kt < p.T) {
+          let jb = j * ${V}u;
+          let qk = ${vIdx.map((d) => `dot(q_${d}, ks[jb + ${d}u])`).join(" + ")};
+          pv.${"xyzw"[k]} = qk * p.alpha + bias[biasRow + kt];
+        }
+      }`).join("\n      ")}
+      ps[ql * 8u + sub * 2u + g4] = pv;
     }
     workgroupBarrier();
     var cm = m;
-    let pBase = ql * 32u;
-    for (var j = 0u; j < 32u; j += 4u) {
-      cm = max(max(cm, ps[pBase + j]), max(ps[pBase + j + 1u], max(ps[pBase + j + 2u], ps[pBase + j + 3u])));
+    let pBase4 = ql * 8u;
+    for (var j4 = 0u; j4 < 8u; j4 += 1u) {
+      let pv = ps[pBase4 + j4];
+      cm = max(cm, max(max(pv.x, pv.y), max(pv.z, pv.w)));
     }
     let rescale = exp(m - cm);
     l = l * rescale;
     ${vlIdx.map((e) => `o_${e} = o_${e} * rescale;`).join("\n    ")}
-    for (var j = 0u; j < 32u; j += 1u) {
-      let w = exp(ps[pBase + j] - cm);
-      l += w;
-      let vb = j * ${V}u + sub * ${VL}u;
-      ${vlIdx.map((e) => `o_${e} += w * vs[vb + ${e}u];`).join("\n      ")}
+    for (var j4 = 0u; j4 < 8u; j4 += 1u) {
+      let ev = exp(ps[pBase4 + j4] - vec4<f32>(cm));
+      l += (ev.x + ev.y) + (ev.z + ev.w);
+      let vb = j4 * ${4 * V}u + sub * ${VL}u;
+      ${vlIdx.map((e) => `o_${e} += ev.x * vs[vb + ${e}u] + ev.y * vs[vb + ${V + e}u] + ev.z * vs[vb + ${2 * V + e}u] + ev.w * vs[vb + ${3 * V + e}u];`).join("\n      ")}
     }
     m = cm;
     workgroupBarrier();
@@ -1173,9 +1387,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`, rows, [q, a, centre, condS, qsh], u);
   }
 
-  /** Fused couplingSplit atom row statistics + Xq scaling (one 64-lane workgroup per atom row). */
+  /** Fused couplingSplit atom row statistics + Xq scaling (four 64-lane sub-rows per 256-lane workgroup). */
   csAtomPrep({ q, gQ, tstats, atomTokenS, astats, xq, rows, T }) {
     const u = new Uint32Array([rows, T, 0, 0]);
+    const rowsPerWg = 4;
     return this.step("cs-aprep", `
 struct P { rows: u32, T: u32, pad0: u32, pad1: u32 };
 @group(0) @binding(0) var<uniform> p: P;
@@ -1185,37 +1400,40 @@ struct P { rows: u32, T: u32, pad0: u32, pad1: u32 };
 @group(0) @binding(4) var<storage, read> atomTokenS: array<i32>;
 @group(0) @binding(5) var<storage, read_write> astats: array<f32>;
 @group(0) @binding(6) var<storage, read_write> xq: array<f32>;
-var<workgroup> red: array<f32, 64>;
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  let r = wid.x + wid.y * 65535u;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) liRaw: u32) {
+  let sub = liRaw / 64u;
+  let li = liRaw % 64u;
+  let rb = sub * 64u;
+  let r = (wid.x + wid.y * 65535u) * 4u + sub;
   let live = r < p.rows;
   let row = min(r, p.rows - 1u);
   let base = row * 128u;
   let q0 = q[base + li];
   let q1 = q[base + li + 64u];
-  red[li] = q0 + q1;
+  red[rb + li] = q0 + q1;
   workgroupBarrier();
-  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
-  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
-  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
-  let mq = red[0] / 128.0;
+  if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  let mq = red[rb] / 128.0;
   workgroupBarrier();
   let d0 = q0 - mq;
   let d1 = q1 - mq;
-  red[li] = d0 * d0 + d1 * d1;
+  red[rb + li] = d0 * d0 + d1 * d1;
   workgroupBarrier();
-  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
-  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
-  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
+  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
+  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
+  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
   if (!live) { return; }
-  let ssq = red[0];
+  let ssq = red[rb];
   let sq = sqrt(ssq / 128.0 + 1e-5);
   let st = atomTokenS[row];
   if (li == 0u) {
@@ -1242,7 +1460,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let invSq = 1.0 / sq;
   xq[base + li] = gQ[gBase] * d0 * invSq;
   xq[base + li + 64u] = gQ[gBase + 64u] * d1 * invSq;
-}`, rows, [q, gQ, tstats, atomTokenS, astats, xq], u);
+}`, Math.ceil(rows / rowsPerWg), [q, gQ, tstats, atomTokenS, astats, xq], u);
   }
 
   /** y = x . W^T (+ bias) for a torch (out, in) weight over `rows` rows. */
@@ -1259,6 +1477,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     f[13] = eps;
     // in place: x is y, read through the read_write binding (one buffer cannot be bound both ways in a dispatch)
     const inPlace = x === y;
+    if (xStride === width && yStride === width && xOff === 0 && yOff === 0 && width % 64 === 0 && width <= 1024) {
+      const hasW = Boolean(w);
+      const hasB = Boolean(b);
+      const modulate = Boolean(mod);
+      const useMap = Boolean(mod?.map);
+      const rowsPerWg = width <= 256 && rows >= 256 ? 4 : 1;
+      const key = `${inPlace ? "ln-inplace" : "ln"}-${width}-${hasW ? 1 : 0}-${hasB ? 1 : 0}-${modulate ? 1 : 0}-${useMap ? 1 : 0}-r${rowsPerWg}`;
+      const source = lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg });
+      const step = this.step(key, source, Math.ceil(rows / rowsPerWg), [
+        inPlace ? null : x,
+        y,
+        hasW ? w : null,
+        hasB ? b : null,
+        modulate ? mod.cond : null,
+        modulate && useMap ? mod.map : null,
+      ], u);
+      return Promise.resolve(step).then((s) => { s.label = inPlace ? "ln-inplace" : "ln"; return s; });
+    }
     const source = inPlace ? LN_SOURCE.replaceAll("x[xb + c]", "y[xb + c]")
       .replace("@group(0) @binding(1) var<storage, read> x: array<f32>;\n", "") : LN_SOURCE;
     return this.step(inPlace ? "ln-inplace" : "ln", source, rows, [inPlace ? null : x, y, w ?? this.dummy,
