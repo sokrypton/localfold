@@ -90,7 +90,7 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
     }
     run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, nullptr, xmh, resD, (uint)A, (uint)C, 3, 4, 2, 0});
     half* gh = scratch<half>("atom.gh", A * a.hidden);
-    gemmSwiglu(xmh, swigluPairs(B + "ffnUp", M.h(B + "ffnUp"), C, a.hidden), gh, A, C, a.hidden);
+    gemmSwiglu(xmh, swigluPairsInPlace(B + "ffnUp", C, a.hidden), gh, A, C, a.hidden);
     {
       Gemm G{}; G.X = gh; G.tx = F16; G.W = M.h(B + "ffnDown"); G.tw = F16; G.Y = x; G.ty = F32;
       G.rows = A; G.in = a.hidden; G.out = C; G.label = "atom ffnDown";

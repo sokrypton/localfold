@@ -30,10 +30,12 @@ static void towerLin(const half* X, const std::string& name, float* Y, size_t ro
 // fc1 with its gate and up columns interleaved for gemmSwiglu: in place once for a decoded tower, into scratch for a
 // resident one
 static const half* towerFc1(const std::string& name, int C, int ffn) {
+  if (M.isSwiglu(name)) return towerW(name);
   if (!M.isResident(name)) return swigluPairsInPlace(name, C, ffn);
   half* w = const_cast<half*>(towerW(name));
   if (ffn % 8 == 0 && ffn <= 8192) {
-    run("ef2_interleave8_inplace", Grid{(uint32_t)C, 1, 1}, 256, Interleave8Args{w, w + ffn, w, (uint)C, (uint)ffn, (uint)(2 * ffn), 0});
+    run(ffn <= 4096 ? "ef2_interleave8_inplace" : "ef2_interleave8_inplace_wide",
+        Grid{(uint32_t)C, 1, 1}, 256, Interleave8Args{w, w + ffn, w, (uint)C, (uint)ffn, (uint)(2 * ffn), 0});
     return w;
   }
   half* out = scratch<half>("tower.w16s", (size_t)C * 2 * ffn);
@@ -41,12 +43,10 @@ static const half* towerFc1(const std::string& name, int C, int ffn) {
   return out;
 }
 
-static void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
+static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int layer) {
   std::string B = "c/blocks/" + std::to_string(layer) + "/";
   size_t R = e.rows; int C = e.model, H = e.heads;
-  half* xn = scratch<half>("esmc.xn", R * C);
   float* qkv = scratch<float>("esmc.qkv", R * 3 * C);
-  layerNorm(x, xn, R, C, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"));
   towerLin(xn, B + "qkv/weights", qkv, R, C, 3 * C);
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   if (C % 64 == 0 && C <= 1152) {
@@ -59,24 +59,20 @@ static void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   }
   // scores [H, R, R] = q_h k_h^T, softmax within a chain, ctx_h = S_h v_h (v in the packed qkv, stride 3C)
   float* S = scratch<float>("esmc.scores", (size_t)H * R * R);
-  float* ctx = scratch<float>("esmc.ctx", R * C);
+  half* ctx = scratch<half>("esmc.ctx", R * C);
   {
     Gemm g{}; g.X = q; g.ldx = C; g.sx = 64; g.W = k; g.transW = true; g.ldw = C; g.sw = 64;
     g.Y = S; g.ldy = (int)R; g.sy = (int64_t)R * R; g.rows = R; g.in = 64; g.out = (int)R; g.batch = H; g.label = "esmc.scores";
     gemm(g);
   }
-  run("ef2_softmax_seq", grid1d((size_t)H * R, 1), 256, SoftmaxSeqArgs{S, seq, (uint)R, 0.125f});
+  run("ef2_softmax_seq", grid1d(((size_t)H * R + 7) / 8, 1), 256,
+      SoftmaxSeqArgs{S, seq, (uint)R, (uint)(H * R), 0.125f, 0});
   {
     Gemm g{}; g.X = S; g.ldx = (int)R; g.sx = (int64_t)R * R; g.W = qkv + 2 * C; g.ldw = 3 * C; g.sw = 64;
-    g.Y = ctx; g.ldy = C; g.sy = 64; g.rows = R; g.in = (int)R; g.out = 64; g.batch = H; g.label = "esmc.context";
+    g.Y = ctx; g.ty = F16; g.ldy = C; g.sy = 64; g.rows = R; g.in = (int)R; g.out = 64; g.batch = H; g.label = "esmc.context";
     gemm(g);
   }
-  if (!M.isResident(B + "attn_out/weights")) lin(ctx, B + "attn_out/weights", x, R, C, C, 1.f, nullptr, 1.f / e.residualScale);
-  else {
-    Gemm g{}; g.X = ctx; g.tx = F32; g.W = towerW(B + "attn_out/weights"); g.tw = F16; g.half = true; g.Y = x; g.ty = F32;
-    g.rows = R; g.in = C; g.out = C; g.beta = 1.f; g.alpha = 1.f / e.residualScale; g.label = "attn_out";
-    gemm(g);
-  }
+  towerLin(ctx, B + "attn_out/weights", x, R, C, C, 1.f / e.residualScale, 1.f);
   layerNorm(x, xn, R, C, M.f(B + "ffn_norm/scale"), M.f(B + "ffn_norm/offset"));
   half* g = scratch<half>("esmc.g", R * e.ffn);
   gemmSwiglu(xn, towerFc1(B + "fc1/weights", C, e.ffn), g, R, C, e.ffn);
@@ -95,6 +91,7 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
       for (auto& m : mix) m /= s; }
     float* acc = scratch<float>("shim.acc", R * P);
     half* xn = scratch<half>("shim.xn", R * C);
+    half* attnXn = scratch<half>("esmc.xn", R * C);
     // each hidden state's LayerNorm and projection, added into the mix by the GEMM itself (alpha mix_k, beta 1)
     auto mixIn = [&](int k, const float* state) {
       layerNorm(state, xn, R, C, M.f(shim("norm/scale")), M.f(shim("norm/offset")));
@@ -102,10 +99,12 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
     };
     float* x = scratch<float>("esmc.x", R * C);
     run1d("ef2_embed", R * C, EmbedArgs{ids, M.f("c/embed/weights"), x, (uint)R, (uint)C});
-    mixIn(0, x);
     for (int l = 0; l < e.layers; ++l) {
-      esmcBlock(e, x, seq, l);
-      if (l + 1 < e.layers) mixIn(l + 1, x);
+      std::string B = "c/blocks/" + std::to_string(l) + "/";
+      layerNormDual(x, xn, M.f(shim("norm/scale")), M.f(shim("norm/offset")),
+                    attnXn, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"), R, C);
+      lin(xn, shim("projection/weights"), acc, R, C, P, l ? 1.f : 0.f, nullptr, mix[l]);
+      esmcBlock(e, x, attnXn, seq, l);
     }
     float* last = scratch<float>("esmc.last", R * C);
     layerNorm(x, last, R, C, M.f("c/final_norm/scale"), nullptr);

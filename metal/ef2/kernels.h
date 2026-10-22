@@ -13,7 +13,7 @@ struct StackColsArgs { CP(half) a; CP(half) b; CP(half) c; DP(half) out; uint ro
 struct EmbedArgs { CP(int) ids; CP(float) table; DP(float) x; uint rows, C; };
 struct RopeArgs { DP(float) x; DP(float) y; uint rows, heads, ld, pad; };
 struct QkNormRopeArgs { CP(float) qkv; CP(float) qScale; CP(float) kScale; DP(float) q; DP(float) k; uint rows, C; };
-struct SoftmaxSeqArgs { DP(float) S; CP(int) seq; uint rows; float scale; };
+struct SoftmaxSeqArgs { DP(float) S; CP(int) seq; uint rows, total; float scale; uint pad; };
 struct ScatterRowsArgs { CP(float) rows; CP(int) tokenToRow; CP(float) zero; DP(float) out; uint T, C; };
 struct PairJoinArgs { CP(float) s; DP(half) out; uint T, i0, bi, C; };
 struct PairJoinFArgs { CP(float) s; DP(float) out; uint T, i0, bi, C; };   // (float: a tower whose a * a passes half's range)

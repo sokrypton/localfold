@@ -208,6 +208,8 @@ void layerNorm(const float* x, half* y, size_t rows, int C, const float* scale, 
                int ldx = 0, int ldy = 0);
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f,
                int ldx = 0, int ldy = 0);
+void layerNormDual(const float* x, half* y1, const float* s1, const float* o1, half* y2, const float* s2, const float* o2,
+                   size_t rows, int C, float eps = 1e-5f);
 // the triangle's centre LayerNorm: a channel-major product [C][Lp * Lp] (padded planes) to pair rows [L * L][C] in half
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset);
 // ...from the product in half, stored times prodScale (the triangle's contraction scaled to fit half: the norm is

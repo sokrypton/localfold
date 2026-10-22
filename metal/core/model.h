@@ -17,6 +17,7 @@ struct Tensor {
   int segment = -1;
   bool madeF32 = false;      // (a float32 copy made on demand from the float16 tensor)
   bool owned = false;        // (its own allocation: given back when it is retired)
+  bool swiglu = false;       // (decoded with its gate and up columns interleaved in blocks of 8 for gemmSwiglu)
 };
 class Model {
  public:
@@ -26,7 +27,9 @@ class Model {
   // expand() decodes it to float16 for one use (ESM-C 6B: 2.5-6.4 GB of codes, 12.3 GB as float16)
   void loadBundle(const std::string& dir, const std::string& prefix,
                   const std::function<bool(const std::string&, size_t)>& asHalf = nullptr,
-                  const std::function<bool(const std::string&, size_t)>& resident = nullptr);
+                  const std::function<bool(const std::string&, size_t)>& resident = nullptr,
+                  const std::function<bool(const std::string&)>& swiglu = nullptr);
+  bool isSwiglu(const std::string& name) const { return at(name).swiglu; }
   bool isResident(const std::string& name) const { return codes.count(name) > 0; }
   // a resident tensor decoded to float16 into `out` (its n elements, in the bundle's own layout)
   void expand(const std::string& name, half* out);

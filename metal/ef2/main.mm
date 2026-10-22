@@ -230,7 +230,11 @@ int foldMain(int argc, char** argv) {
     if (n.rfind("f/confidence/", 0) == 0 && n.rfind("f/confidence/blocks/", 0) != 0) return false;
     return elements >= 65536;
   };
-  M.loadBundle(foldBundle, "f", asHalf);
+  auto isSwiglu = [](const std::string& n) {
+    auto ends = [&](const char* s) { size_t k = strlen(s); return n.size() >= k && !n.compare(n.size() - k, k, s); };
+    return ends("/fc1/weights") || ends("/transition1") || ends("/swishWeights") || ends("/ffnUp");
+  };
+  M.loadBundle(foldBundle, "f", asHalf, nullptr, isSwiglu);
   // the tower's block matrices kept as their codes and expanded a GEMM at a time where the tower as float16 would pass
   // 4 GB (ESM-C 6B: 12.3 GB; 600M is 1.2) - LOCALFOLD_TOWER_RESIDENT=1 forces it, =0 refuses it
   auto residentTower = [](const std::string& n, size_t) {
@@ -241,7 +245,7 @@ int foldMain(int argc, char** argv) {
     return layers * 12 * width * width * 2 > 4e9;      // (qkv 3, attn_out 1, fc1 ~5.3, fc2 ~2.7: ~12 C^2 a block)
   };
   if (getenv("EF2_STARTUP")) { mt::sync(); printf("folding model up %.0f ms (%.2f GB)\n", ms(tStart), M.weightBytes() / 1e9); }
-  M.loadBundle(esmcBundle, "c", asHalf, residentTower);
+  M.loadBundle(esmcBundle, "c", asHalf, residentTower, isSwiglu);
   if (getenv("EF2_STARTUP") && M.residentBytes()) printf("tower: %.2f GB resident as codes\n", M.residentBytes() / 1e9);
   if (getenv("EF2_STARTUP")) { mt::sync(); printf("weights up %.0f ms\n", ms(tStart)); }
   if (!serveDir.empty()) {

@@ -135,11 +135,17 @@ kernel void lf_decode(constant DecodeArgs& a [[buffer(0)]], uint3 tg [[threadgro
     ulong i = d.first + o;
     float v = small ? lf_decode_at<uint>(a, d, (uint)i) : lf_decode_at<ulong>(a, d, i);
     if (d.flags & 1) v = (float)(half)v;
+    ulong dstO = o;
+    if (d.pad) {
+      uint W = 2 * d.pad, r = lf_udiv((uint)o, W), col = (uint)o - r * W;
+      uint c = col >= d.pad ? col - d.pad : col;
+      dstO = (ulong)r * W + ((c & ~7u) << 1) + (col >= d.pad ? 8u : 0u) + (c & 7u);
+    }
     if (d.out16) {
-      device half* p = (device half*)d.dst + o;
+      device half* p = (device half*)d.dst + dstO;
       *p = (d.flags & 2) ? (half)((float)*p + v) : (half)v;
     } else {
-      device float* p = (device float*)d.dst + o;
+      device float* p = (device float*)d.dst + dstO;
       *p = (d.flags & 2) ? *p + v : v;
     }
   }
@@ -188,11 +194,18 @@ kernel void lf_layernorm(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[thr
   for (int c = lane; c < C; c += 32) { float d = (x ? x[c] : (float)xh[c]) - mean; v += d * d; }
   float inv = rsqrt(simd_sum(v) / C + a.eps);
   for (int c = lane; c < C; c += 32) {
-    float n = ((x ? x[c] : (float)xh[c]) - mean) * inv;
+    float n0 = ((x ? x[c] : (float)xh[c]) - mean) * inv;
+    float n = n0;
     if (a.scale) n *= a.scale[c];
     if (a.offset) n += a.offset[c];
     if (a.yh) a.yh[row * a.ldy + c] = (half)n;
     else a.y[row * a.ldy + c] = n;
+    if (a.yh2) {
+      float n2 = n0;
+      if (a.scale2) n2 *= a.scale2[c];
+      if (a.offset2) n2 += a.offset2[c];
+      a.yh2[row * a.ldy + c] = (half)n2;
+    }
   }
 }
 // C a multiple of 4 up to 1536: the row held in registers, read once, four channels a load - MAXV of them a lane, the
@@ -223,7 +236,8 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   for (int k = 0; k < MAXV; ++k) {
     int c = lane + 32 * k;
     if (c >= C4) continue;
-    float4 n = (r[k] - mean) * inv;
+    float4 n0 = (r[k] - mean) * inv;
+    float4 n = n0;
     if (a.scale) n *= ((device const float4*)a.scale)[c];
     if (a.offset) n += ((device const float4*)a.offset)[c];
     if (a.yh) {
@@ -232,6 +246,13 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
     } else {
       if ((a.ldy & 3) == 0) ((device float4*)(a.y + row * a.ldy))[c] = n;
       else for (int e = 0; e < 4; ++e) a.y[row * a.ldy + 4 * c + e] = n[e];
+    }
+    if (a.yh2) {
+      float4 n2 = n0;
+      if (a.scale2) n2 *= ((device const float4*)a.scale2)[c];
+      if (a.offset2) n2 += ((device const float4*)a.offset2)[c];
+      if ((a.ldy & 3) == 0) ((device half4*)(a.yh2 + row * a.ldy))[c] = half4(n2);
+      else for (int e = 0; e < 4; ++e) a.yh2[row * a.ldy + 4 * c + e] = (half)n2[e];
     }
   }
 }

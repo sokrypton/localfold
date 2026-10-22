@@ -40,9 +40,10 @@ struct GatherArgs { CP(GatherPart) parts; };
 struct DecodeArgs { CP(uchar) raw; CP(DecodeEntry) table; };
 struct ConvArgs { CP(float) x; DP(half) y; u64 n; };          // f32 -> f16 / f16 -> f32
 struct ConvBackArgs { CP(half) x; DP(float) y; u64 n; };
-struct LayerNormArgs {      // a simdgroup a row; scale/offset may be null; x f32 or f16 (xh), y f32 or f16 (yh)
+struct LayerNormArgs {      // a simdgroup a row; scale/offset may be null; x f32 or f16 (xh), y f32 or f16 (yh), optional yh2
   CP(float) x; CP(half) xh; DP(float) y; DP(half) yh; CP(float) scale; CP(float) offset;
-  u64 rows; int C, ldx, ldy; float eps;
+  u64 rows; int C, ldx, ldy; float eps; int pad;
+  DP(half) yh2; CP(float) scale2; CP(float) offset2;
 };
 struct AddArgs { DP(float) y; CP(float) x; u64 n; float a; uint pad; };   // y += a x
 struct BiasArgs { DP(float) y; CP(float) b; u64 rows; int C; int act; };  // y += b per column, act 1 relu 2 gelu(erf)

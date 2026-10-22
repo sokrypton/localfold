@@ -910,7 +910,7 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
   // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
   // 404 ms a trunk pass)
-  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256 && rows <= 256)) &&
+  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256 && (tp == F16 || rows <= 512))) &&
       a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
     const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : 128;
     GemmArgs a{};
@@ -1148,9 +1148,10 @@ void attention(const Attention& t) {
 
 // ---------------------------------------------------------------- common kernels
 static void layerNormRun(const float* x, const half* xh, float* y, half* yh, size_t rows, int C, const float* scale,
-                         const float* offset, float eps, int ldx, int ldy) {
+                         const float* offset, float eps, int ldx, int ldy, half* yh2 = nullptr, const float* scale2 = nullptr,
+                         const float* offset2 = nullptr) {
   if (!rows) return;
-  LayerNormArgs a{x, xh, y, yh, scale, offset, rows, C, ldx ? ldx : C, ldy ? ldy : C, eps};
+  LayerNormArgs a{x, xh, y, yh, scale, offset, rows, C, ldx ? ldx : C, ldy ? ldy : C, eps, 0, yh2, scale2, offset2};
   // a simdgroup a row, eight a threadgroup
   size_t groups = (rows + 7) / 8;
   Grid g = groups <= 65535 ? Grid{(uint32_t)groups, 1, 1} : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
@@ -1168,6 +1169,10 @@ void layerNorm(const float* x, half* y, size_t rows, int C, const float* s, cons
 }
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {
   layerNormRun(nullptr, x, nullptr, y, rows, C, s, o, eps, ldx, ldy);
+}
+void layerNormDual(const float* x, half* y1, const float* s1, const float* o1, half* y2, const float* s2, const float* o2,
+                   size_t rows, int C, float eps) {
+  layerNormRun(x, nullptr, nullptr, y1, rows, C, s1, o1, eps, 0, 0, y2, s2, o2);
 }
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
   size_t P = (size_t)L * L;

@@ -188,7 +188,8 @@ void Model::dropFloatCopies(const std::string& prefix) {
 
 void Model::loadBundle(const std::string& dir, const std::string& prefix,
                        const std::function<bool(const std::string&, size_t)>& asHalf,
-                       const std::function<bool(const std::string&, size_t)>& resident) {
+                       const std::function<bool(const std::string&, size_t)>& resident,
+                       const std::function<bool(const std::string&)>& swiglu) {
   std::ifstream in(dir + "/manifest.json");
   if (!in) die("no %s/manifest.json", dir.c_str());
   Json m = Json::parse(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
@@ -224,9 +225,11 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
     } else die("%s: unsupported dtype %s", rec.name.c_str(), dtype.c_str());
     rec.out16 = asHalf && asHalf(rec.name, n);
     rec.e.out16 = rec.out16;
+    const bool sw = rec.out16 && swiglu && swiglu(rec.name) && shape.size() == 2 && shape[1] % 16 == 0;
+    if (sw) rec.e.pad = (uint)(shape[1] / 2);
     rec.resident = resident && rec.e.kind >= 2 && resident(rec.name, n);   // (codes only: a float tensor is decoded)
     if (rec.resident) {
-      Tensor x; x.shape = shape; x.n = n; x.segment = -1;
+      Tensor x; x.shape = shape; x.n = n; x.segment = -1; x.swiglu = sw;
       if (t.count(rec.name)) die("%s is in two bundles", rec.name.c_str());
       t[rec.name] = x;
       recs.push_back(rec);
@@ -236,7 +239,7 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
     at = (at + 15) / 16 * 16;
     rec.e.dst = at;
     at += n * (rec.out16 ? 2 : 4);
-    Tensor x; x.shape = shape; x.n = n; x.segment = -1;
+    Tensor x; x.shape = shape; x.n = n; x.segment = -1; x.swiglu = sw;
     if (t.count(rec.name)) die("%s is in two bundles", rec.name.c_str());
     t[rec.name] = x;
     recs.push_back(rec);

@@ -36,6 +36,38 @@ kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], u
   const uint r = tg.x, B8 = a.I >> 3;
   if (r >= a.rows) return;
   device uint4* row = (device uint4*)(a.out + (ulong)r * 2 * a.I);
+  if (B8 <= 256) {
+    uint4 va = 0, vb = 0;
+    if (tid < B8) {
+      va = row[tid];
+      vb = row[B8 + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+    if (tid < B8) {
+      row[2 * tid] = va;
+      row[2 * tid + 1] = vb;
+    }
+    return;
+  }
+  uint4 va0 = row[tid], vb0 = row[B8 + tid], va1 = 0, vb1 = 0;
+  const uint m1 = 256 + tid;
+  if (m1 < B8) {
+    va1 = row[m1];
+    vb1 = row[B8 + m1];
+  }
+  threadgroup_barrier(mem_flags::mem_none);
+  row[2 * tid] = va0;
+  row[2 * tid + 1] = vb0;
+  if (m1 < B8) {
+    row[2 * m1] = va1;
+    row[2 * m1 + 1] = vb1;
+  }
+}
+kernel void ef2_interleave8_inplace_wide(constant Interleave8Args& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]]) {
+  const uint r = tg.x, B8 = a.I >> 3;
+  if (r >= a.rows) return;
+  device uint4* row = (device uint4*)(a.out + (ulong)r * 2 * a.I);
   uint4 va[4], vb[4];
   _Pragma("clang loop unroll(full)")
   for (uint k = 0; k < 4; ++k) {
@@ -45,7 +77,7 @@ kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], u
       vb[k] = row[B8 + m];
     }
   }
-  threadgroup_barrier(mem_flags::mem_device);
+  threadgroup_barrier(mem_flags::mem_none);
   _Pragma("clang loop unroll(full)")
   for (uint k = 0; k < 4; ++k) {
     const uint m = k * 256 + tid;
@@ -127,30 +159,43 @@ kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg 
     }
   }
 }
-// softmax over a score row, keys of another chain (sequence id) excluded; a threadgroup a (head, query) row
+// softmax over a score row, keys of another chain (sequence id) excluded; a simdgroup a (head, query) row
 kernel void ef2_softmax_seq(constant SoftmaxSeqArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                            uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
+                            uint3 ng [[threadgroups_per_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  uint row = tg.y * ng.x + tg.x;
+  uint row = (tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.total) return;
   uint q = row - lf_udiv(row, a.rows) * a.rows;
   device float* s = a.S + (ulong)row * a.rows;
-  threadgroup float red[8];
   int sq = a.seq[q];
+  if (a.rows <= 256) {
+    float r[8], m = -INFINITY;
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 8; ++k) {
+      uint j = k * 32 + lane;
+      if (j < a.rows) { float v = a.seq[j] == sq ? s[j] * a.scale : -INFINITY; r[k] = v; m = max(m, v); }
+    }
+    m = simd_max(m);
+    float sum = 0;
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 8; ++k) {
+      if (k * 32 + lane < a.rows) { float e = exp(r[k] - m); r[k] = e; sum += e; }
+    }
+    float inv = 1.f / simd_sum(sum);
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 8; ++k) {
+      uint j = k * 32 + lane;
+      if (j < a.rows) s[j] = r[k] * inv;
+    }
+    return;
+  }
   float m = -INFINITY;
-  for (uint j = tid; j < a.rows; j += 256) { float v = a.seq[j] == sq ? s[j] * a.scale : -INFINITY; s[j] = v; m = max(m, v); }
+  for (uint j = lane; j < a.rows; j += 32) { float v = a.seq[j] == sq ? s[j] * a.scale : -INFINITY; s[j] = v; m = max(m, v); }
   m = simd_max(m);
-  if (lane == 0) red[sg] = m;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  m = red[0]; for (int k = 1; k < 8; ++k) m = max(m, red[k]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   float sum = 0;
-  for (uint j = tid; j < a.rows; j += 256) { float e = exp(s[j] - m); s[j] = e; sum += e; }
-  sum = simd_sum(sum);
-  if (lane == 0) red[sg] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float tot = 0; for (int k = 0; k < 8; ++k) tot += red[k];
-  float inv = 1.f / tot;
-  for (uint j = tid; j < a.rows; j += 256) s[j] *= inv;
+  for (uint j = lane; j < a.rows; j += 32) { float e = exp(s[j] - m); s[j] = e; sum += e; }
+  float inv = 1.f / simd_sum(sum);
+  for (uint j = lane; j < a.rows; j += 32) s[j] *= inv;
 }
 // the tower's rows onto the tokens; a token the tower never saw takes the shim at a zero state
 kernel void ef2_scatter_rows(LF_ARGS(ScatterRowsArgs)) {
