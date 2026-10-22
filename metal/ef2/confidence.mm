@@ -31,7 +31,7 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   half* prod = scratch<half>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    run1d("ef2_outer", n * C, OuterArgs{l, rr, prod, p0, n, (uint)T, (uint)C});
+    run1d("ef2_outer", (n * C) >> 2, OuterArgs{l, rr, prod, p0, n, (uint)T, (uint)C});
     Gemm g{}; g.X = prod; g.tx = F16; g.W = F("confidence/sToZProdOut"); g.tw = F32; g.Y = z + p0 * C; g.beta = 1.f;
     g.rows = n; g.in = C; g.out = C; g.label = "confidence prodOut";
     gemm(g);

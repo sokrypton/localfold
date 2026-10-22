@@ -7,6 +7,7 @@ struct RelIdx { CP(int) ri; CP(int) asym; CP(int) sym; CP(int) ent; CP(int) ti; 
 
 // a weight interleaved for gemmSwiglu: out [rows][2I] in blocks of 8 - a_0..a_7 b_0..b_7 a_8.. - from a and b rows lda apart
 struct Interleave8Args { CP(half) a; CP(half) b; DP(half) out; uint rows, I, lda, pad; };
+struct StackColsArgs { CP(half) a; CP(half) b; CP(half) c; DP(half) out; uint rows, ca, cb, cc; };
 
 // ---------------------------------------------------------------- the language model
 struct EmbedArgs { CP(int) ids; CP(float) table; DP(float) x; uint rows, C; };
@@ -18,8 +19,8 @@ struct PairJoinFArgs { CP(float) s; DP(float) out; uint T, i0, bi, C; };   // (f
 
 // ---------------------------------------------------------------- the trunk
 struct ZInitArgs { CP(float) rows; CP(float) cols; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) lmZ; DP(float) z; uint T, C; };
-// the triangle's projection and gate as gemmTriGate's one weight: channel c's (pa ga pb gb) in blocks of 8
-struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
+// the triangle's projection and gate as gemmTriGate's one weight: channel c's (pa ga pb gb) in blocks of 8 or quarters of 32
+struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C, quarters, pad; };
 struct FillFArgs { DP(float) out; u64 n; float v; uint pad; };
 // the released models' recycle (parcae): the initial state, the language model's pair dropped out, the decay update
 struct TruncNormalArgs { DP(float) z; u64 n; u64 seed; float std; uint pad; };
@@ -53,7 +54,7 @@ struct TailInputsArgs { CP(float) aatype; CP(float) profile; CP(float) delMean; 
 struct JoinPairRelArgs { CP(float) z; RelIdx rel; DP(float) out; u64 p0, n; uint T, C; };
 struct SiluMulArgs { DP(float) a; CP(float) b; u64 n; };
 struct FourierArgs { CP(float) w; CP(float) b; CP(float) level; DP(float) out; uint n, pad; };
-struct AddRowArgs { DP(float) x; CP(float) row; u64 rows; uint C, pad; };
+struct AddRowArgs { CP(float) base; CP(float) row; DP(float) x; u64 rows; uint C, pad; };
 struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; uint A, pad; };
 struct AdaCombineArgs { DP(float) an; CP(float) g; CP(float) gb; CP(float) sh; DP(half) out; CP(float) resY; CP(float) resGate; uint T, C, ld, pad; };
 struct SigmoidMulArgs { DP(float) x; CP(float) g; CP(float) gb; DP(float) dst; uint T, C, ld, pad; };

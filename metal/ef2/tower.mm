@@ -135,7 +135,7 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
     int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
     float* o = lmZ + (size_t)i0 * T * P;
     if (wide) {
-      run1d("ef2_pair_join_f", cells * P, PairJoinFArgs{s, joinF, (uint)T, (uint)i0, (uint)b, (uint)P});
+      run1d("ef2_pair_join_f", (cells * P) >> 2, PairJoinFArgs{s, joinF, (uint)T, (uint)i0, (uint)b, (uint)P});
       Gemm g{}; g.X = joinF; g.tx = F32; g.W = M.f(shim("pair_mlp_1/weights")); g.tw = F32; g.Y = hidF; g.ty = F32;
       g.rows = cells; g.in = 2 * P; g.out = P; g.bias = M.f(shim("pair_mlp_1/bias")); g.gelu = true; g.label = "lm.pair_mlp_1";
       gemm(g);
@@ -143,7 +143,7 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
       g2.rows = cells; g2.in = P; g2.out = P; g2.bias = M.f(shim("pair_mlp_2/bias")); g2.label = "lm.pair_mlp_2";
       gemm(g2);
     } else {
-      run1d("ef2_pair_join", cells * P, PairJoinArgs{s, join, (uint)T, (uint)i0, (uint)b, (uint)P});
+      run1d("ef2_pair_join", (cells * P) >> 2, PairJoinArgs{s, join, (uint)T, (uint)i0, (uint)b, (uint)P});
       linH(join, shim("pair_mlp_1/weights"), hid, cells, 2 * P, P, M.f(shim("pair_mlp_1/bias")), true);
       lin(hid, shim("pair_mlp_2/weights"), o, cells, P, P, 0.f, M.f(shim("pair_mlp_2/bias")));
     }

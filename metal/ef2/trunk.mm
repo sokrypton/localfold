@@ -24,15 +24,9 @@ void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* 
 // the triangle's projection and gate as one weight for gemmTriGate: channel c's (pa ga pb gb) in blocks of 8 - ESMFold2
 // interleaves a and b by channel (column 2c is a's, 2c + 1 b's)
 static const half* triGate(const std::string& Tn, int C) {
-  if (triQuartersApply(C))      // (the matrix units' quarters, built once through a blocks-of-8 temporary)
-    return M.derived<half>("trigateQ:" + Tn, (size_t)C * 4 * C, [&](half* out) {
-      half* w8 = allocT<half>((size_t)C * 4 * C);
-      run1d("ef2_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), w8, (uint)C, (uint)C});
-      triQuarters(w8, out, nullptr, nullptr, C);
-      release(w8);
-    });
-  return M.derived<half>("trigate:" + Tn, (size_t)C * 4 * C, [&](half* out) {
-    run1d("ef2_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), out, (uint)C, (uint)C});
+  const bool q = triQuartersApply(C);
+  return M.derived<half>((q ? "trigateQ:" : "trigate:") + Tn, (size_t)C * 4 * C, [&](half* out) {
+    run1d("ef2_trigate_weight", (size_t)C * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), out, (uint)C, (uint)C, q ? 1u : 0u, 0});
   });
 }
 // the pair's next LayerNorm where the previous update's GEMM already wrote it (Gemm::lnOut, gemmGatedAdd's): the pair,
@@ -344,7 +338,7 @@ std::vector<float> contactMap(const float* z, int T, int C) {
   float* zs = scratch<float>("dg.sym", per * C); float* dg = scratch<float>("dg.logits", per * Bn);
   for (size_t p0 = 0; p0 < P; p0 += per) {
     size_t n = std::min(per, P - p0);
-    run1d("ef2_sym_rows", n * C, SymRowsArgs{z, zs, p0, n, (uint)T, (uint)C});
+    run1d("ef2_sym_rows", (n * C) >> 2, SymRowsArgs{z, zs, p0, n, (uint)T, (uint)C});
     lin(zs, "f/distogram/weights", dg, n, C, Bn, 0.f, F("distogram/bias"));
     run1d("ef2_contacts", n, ContactsArgs{dg, Ii("contact_bins") + p0, probs + p0, n, (uint)bins, 0});
   }

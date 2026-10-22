@@ -42,7 +42,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
   float* pair = scratch<float>("dc.pair", P * Cz);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    run1d("ef2_join_pair_rel", n * 2 * Cz, JoinPairRelArgs{zTrunk, relIdx(), joined, p0, n, (uint)T, (uint)Cz});
+    run1d("ef2_join_pair_rel", (n * 2 * Cz) >> 2, JoinPairRelArgs{zTrunk, relIdx(), joined, p0, n, (uint)T, (uint)Cz});
     layerNorm(joined, jn, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
     lin(jn, "f/diffusion/zProjection", pair + p0 * Cz, n, 2 * Cz, Cz);
   }
@@ -58,7 +58,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
       lin(pn, "f/" + B + "pairBiasWeights", pb + p0 * d.heads, n, Cz, d.heads);
     }
     half* h = allocT<half>((size_t)d.heads * T * d.stride);
-    run1d("ef2_pair_to_heads", P * d.heads, PairToHeadsArgs{pb, h, P, (uint)d.heads, (uint)T, (uint)d.stride, 0});
+    run1d("ef2_pair_to_heads", d.heads == 16 ? P * 4 : P * d.heads, PairToHeadsArgs{pb, h, P, (uint)d.heads, (uint)T, (uint)d.stride, 0});
     d.biases.push_back(h);
   }
   releaseScratch({"dc.joined", "dc.jn", "dc.pair", "dc.pn", "dc.pb", "dtr."});
@@ -71,20 +71,37 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
     float* sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
     half* sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
     run1d("ef2_silu", n, SiluArgs{d.atoms.c0, sc, sch, n});
-    for (int b = 0; b < d.atomBlocks; ++b) {
-      std::string eb = "f/diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln";
-      std::string db = "f/diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln";
-      if (HALF_GEMM) {
-        lin(sch, eb, d.encMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
-        lin(sch, db, d.decMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
-      } else {
-        lin(sc, eb, d.encMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
-        lin(sc, db, d.decMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
+    if (HALF_GEMM) {
+      int nb = d.atomBlocks, k = 2 * nb;
+      uint64_t* ptrs = scratch<uint64_t>("atom.ptrs", 3 * k);
+      std::vector<uint64_t> hp(3 * k);
+      for (int b = 0; b < nb; ++b) {
+        hp[2 * b] = (uint64_t)M.h("f/diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln");
+        hp[2 * b + 1] = (uint64_t)M.h("f/diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln");
+        hp[k + 2 * b] = hp[k + 2 * b + 1] = (uint64_t)sch;
+        hp[2 * k + 2 * b] = (uint64_t)(d.encMod + (size_t)b * A * 6 * Ca);
+        hp[2 * k + 2 * b + 1] = (uint64_t)(d.decMod + (size_t)b * A * 6 * Ca);
+      }
+      upload(ptrs, hp.data(), 3 * k * 8);
+      Gemm G{}; G.X = ptrs + k; G.tx = F16; G.W = ptrs; G.tw = F16; G.Y = ptrs + 2 * k; G.ty = F32;
+      G.rows = A; G.in = Ca; G.out = 6 * Ca; G.batch = k; G.ptrs = true; G.label = "atom adaln";
+      gemm(G);
+    } else {
+      for (int b = 0; b < d.atomBlocks; ++b) {
+        lin(sc, "f/diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln", d.encMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
+        lin(sc, "f/diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln", d.decMod + (size_t)b * A * 6 * Ca, A, Ca, 6 * Ca);
       }
     }
   }
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
+  d.sBase = allocT<float>((size_t)T * Ct);
+  {
+    half* sn = scratch<half>("dc.sn", (size_t)T * d.Si);
+    layerNorm(d.sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
+    lin(sn, "f/diffusion/sProjection", d.sBase, T, d.Si, Ct);
+    releaseScratch({"dc.sn"});
+  }
   d.single = allocT<float>((size_t)T * Ct); d.snScaled = allocT<float>((size_t)2 * nb * T * Ct);
   d.G = allocT<float>((size_t)T * d.entries * Ct); d.scales = allocT<float>((size_t)2 * nb * Ct);
   for (int b = 0; b < nb; ++b)
@@ -96,7 +113,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
 }
 void freeDenoiser(Denoiser& d) {
   for (half* b : d.biases) release(b);
-  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.level, (void*)d.encMod, (void*)d.decMod}) release(p);
+  for (void* p : {(void*)d.sBase, (void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.level, (void*)d.encMod, (void*)d.decMod}) release(p);
   freeAtoms(d.atoms);
   d.biases.clear();
 }
@@ -110,8 +127,8 @@ static const half* adaWeights(int nb, int Ct) {
       for (int k = 0; k < 2; ++k) {
         std::string P = "diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/");
         half* o = w + (size_t)(2 * b + k) * Ct * 2 * Ct;
-        copy2d(o, 2 * Ct * 2, Fh(P + "adaln/gateWeights"), Ct * 2, Ct * 2, Ct);
-        copy2d(o + Ct, 2 * Ct * 2, Fh(P + "adaln/shiftWeights"), Ct * 2, Ct * 2, Ct);
+        run1d("ef2_stack_cols", (size_t)Ct * (Ct >> 1),
+              StackColsArgs{Fh(P + "adaln/gateWeights"), Fh(P + "adaln/shiftWeights"), nullptr, o, (uint)Ct, (uint)Ct, (uint)Ct, 0});
       }
   });
 }
@@ -135,17 +152,13 @@ static const float* outGateBiases(int nb, int Ct) {
 static const half* qkvgWeight(int b, int C) {
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
   return M.derived<half>("ef2.qkvg." + std::to_string(b), (size_t)C * 4 * C, [&](half* w) {
-    copy2d(w, 4 * C * 2, Fh(B + "queryWeights"), C * 2, C * 2, C);
-    copy2d(w + C, 4 * C * 2, Fh(B + "kvWeights"), 2 * C * 2, 2 * C * 2, C);
-    copy2d(w + 3 * C, 4 * C * 2, Fh(B + "gateWeights"), C * 2, C * 2, C);
+    run1d("ef2_stack_cols", (size_t)C * C,
+          StackColsArgs{Fh(B + "queryWeights"), Fh(B + "kvWeights"), Fh(B + "gateWeights"), w, (uint)C, (uint)C, (uint)(2 * C), (uint)C});
   });
 }
 
 static void conditioningSingle(const Denoiser& d) {
   int T = d.T, Ct = d.Ct;
-  half* sn = scratch<half>("dc.sn", (size_t)T * d.Si);
-  layerNorm(d.sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
-  lin(sn, "f/diffusion/sProjection", d.single, T, d.Si, Ct);
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", nf); float* noise = scratch<float>("dc.noise", Ct);
   run1d("ef2_fourier", nf, FourierArgs{F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), d.level, four, (uint)nf, 0});
@@ -157,7 +170,7 @@ static void conditioningSingle(const Denoiser& d) {
     layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
     lin(four, "f/diffusion/noiseProjection", noise, 1, nf, Ct);
   }
-  run1d("ef2_add_row", (size_t)T * Ct, AddRowArgs{d.single, noise, (u64)T, (uint)Ct, 0});
+  run1d("ef2_add_row", ((size_t)T * Ct) >> 2, AddRowArgs{d.sBase, noise, d.single, (u64)T, (uint)Ct, 0});
   for (int l = 0; l < 2; ++l) transitionLayer(d.single, T, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
 }
 static void singleProjections(const Denoiser& d) {
@@ -165,7 +178,7 @@ static void singleProjections(const Denoiser& d) {
   half* snScaledH = (half*)(void*)d.snScaled;
   float* sn = scratch<float>("dn.sn0", (size_t)T * C);
   layerNorm(d.single, sn, T, C, nullptr, nullptr);
-  run1d("ef2_scale_copies", (size_t)n * T * C,
+  run1d("ef2_scale_copies", ((size_t)n * T * C) >> 2,
         ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : d.snScaled, HALF_GEMM ? snScaledH : nullptr, (uint)T, (uint)C, (uint)n, 0});
   Gemm g{};
   if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = d.snScaled; g.half = true; }
@@ -238,7 +251,7 @@ static void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
     gemm(g);
   }
   float* a = scratch<float>("dn.a", (size_t)T * Ct);
-  run1d("ef2_scatter_mean", (size_t)T * Ct, ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, 0});
+  run1d("ef2_scatter_mean", ((size_t)T * Ct) >> 2, ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, 0});
   half* sn = scratch<half>("dn.sn", (size_t)T * Ct);
   layerNorm(d.single, sn, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   lin(sn, "f/diffusion/singleToToken", a, T, Ct, Ct, 1.f);
@@ -249,7 +262,7 @@ static void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
   lin(an, "f/diffusionAtomDecoder/tokenToAtom", pt, T, Ct, Ca);
-  run1d("ef2_gather_tokens", (size_t)A * Ca, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca});
+  run1d("ef2_gather_tokens", ((size_t)A * Ca) >> 2, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca});
   swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod);
   float* r = scratch<float>("dn.r", (size_t)A * 3);
   if (HALF_GEMM) {

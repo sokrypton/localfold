@@ -3,15 +3,16 @@
 // math (lf_udiv: no integer divider), simdgroup reductions, threadgroup tiles within 32 KB.
 
 // ---------------------------------------------------------------- relative positions (139 bins, summed rows)
-inline float relPosAt(constant RelIdx& r, uint i, uint j, uint c, uint C) {
+inline float4 relPosAt4(constant RelIdx& r, uint i, uint j, uint c, uint C) {
   const int rb = 32, cb = 2;
   bool sameChain = r.asym[i] == r.asym[j], sameRes = r.ri[i] == r.ri[j];
   int b0 = sameChain ? clamp(r.ri[i] - r.ri[j] + rb, 0, 2 * rb) : 2 * rb + 1;
   int b1 = sameChain && sameRes ? clamp(r.ti[i] - r.ti[j] + rb, 0, 2 * rb) : 2 * rb + 1;
   int b3 = sameChain ? 2 * cb + 1 : clamp(r.sym[i] - r.sym[j] + cb, 0, 2 * cb);
   const int w = 2 * rb + 2;
-  float v = r.Wt[(uint)b0 * C + c] + r.Wt[(uint)(w + b1) * C + c] + r.Wt[(uint)(2 * w + 1 + b3) * C + c];
-  if (r.ent[i] == r.ent[j]) v += r.Wt[(uint)(2 * w) * C + c];
+  float4 v = *(device const float4*)(r.Wt + (uint)b0 * C + c) + *(device const float4*)(r.Wt + (uint)(w + b1) * C + c) +
+             *(device const float4*)(r.Wt + (uint)(2 * w + 1 + b3) * C + c);
+  if (r.ent[i] == r.ent[j]) v += *(device const float4*)(r.Wt + (uint)(2 * w) * C + c);
   return v;
 }
 
@@ -21,6 +22,14 @@ kernel void ef2_interleave8(LF_ARGS(Interleave8Args)) {
   uint r = lf_udiv(t, B2), c = t - r * B2, m = c >> 1;
   device const uint4* src = (c & 1) ? (device const uint4*)(a.b + (ulong)r * a.lda) : (device const uint4*)(a.a + (ulong)r * a.lda);
   ((device uint4*)a.out)[t] = src[m];
+}
+kernel void ef2_stack_cols(LF_ARGS(StackColsArgs)) {
+  uint t = (uint)LF_INDEX, ca4 = a.ca >> 2, cb4 = a.cb >> 2, cc4 = a.cc >> 2, W4 = ca4 + cb4 + cc4;
+  if (t >= a.rows * W4) return;
+  uint r = lf_udiv(t, W4), c4 = t - r * W4;
+  ((device half4*)a.out)[t] = c4 < ca4 ? ((device const half4*)(a.a + (ulong)r * a.ca))[c4]
+                            : c4 < ca4 + cb4 ? ((device const half4*)(a.b + (ulong)r * a.cb))[c4 - ca4]
+                                             : ((device const half4*)(a.c + (ulong)r * a.cc))[c4 - ca4 - cb4];
 }
 kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]]) {
@@ -103,22 +112,22 @@ kernel void ef2_scatter_rows(LF_ARGS(ScatterRowsArgs)) {
 }
 // [a * b | a - b] for pair rows i0.. (half: the pair MLP's input)
 kernel void ef2_pair_join(LF_ARGS(PairJoinArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= (ulong)a.bi * a.T * a.C) return;
-  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C;
+  ulong t = LF_INDEX, C4 = a.C >> 2;
+  if (t >= (ulong)a.bi * a.T * C4) return;
+  uint ij = lf_udiv((uint)t, (uint)C4), c4 = (uint)t - ij * (uint)C4;
   uint ii = lf_udiv(ij, a.T), j = ij - ii * a.T, i = a.i0 + ii;
-  float x = a.s[i * a.C + c], y = a.s[j * a.C + c];
-  a.out[(ulong)ij * 2 * a.C + c] = (half)(x * y);
-  a.out[(ulong)ij * 2 * a.C + a.C + c] = (half)(x - y);
+  float4 x = ((device const float4*)(a.s + i * a.C))[c4], y = ((device const float4*)(a.s + j * a.C))[c4];
+  ((device half4*)(a.out + (ulong)ij * 2 * a.C))[c4] = half4(x * y);
+  ((device half4*)(a.out + (ulong)ij * 2 * a.C + a.C))[c4] = half4(x - y);
 }
 kernel void ef2_pair_join_f(LF_ARGS(PairJoinFArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= (ulong)a.bi * a.T * a.C) return;
-  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C;
+  ulong t = LF_INDEX, C4 = a.C >> 2;
+  if (t >= (ulong)a.bi * a.T * C4) return;
+  uint ij = lf_udiv((uint)t, (uint)C4), c4 = (uint)t - ij * (uint)C4;
   uint ii = lf_udiv(ij, a.T), j = ij - ii * a.T, i = a.i0 + ii;
-  float x = a.s[i * a.C + c], y = a.s[j * a.C + c];
-  a.out[(ulong)ij * 2 * a.C + c] = x * y;
-  a.out[(ulong)ij * 2 * a.C + a.C + c] = x - y;
+  float4 x = ((device const float4*)(a.s + i * a.C))[c4], y = ((device const float4*)(a.s + j * a.C))[c4];
+  ((device float4*)(a.out + (ulong)ij * 2 * a.C))[c4] = x * y;
+  ((device float4*)(a.out + (ulong)ij * 2 * a.C + a.C))[c4] = x - y;
 }
 
 // ---------------------------------------------------------------- the trunk
@@ -128,18 +137,24 @@ kernel void ef2_zinit(constant ZInitArgs& a [[buffer(0)]], uint3 tg [[threadgrou
   uint ij = tg.y * ng.x + tg.x;
   if (ij >= a.T * a.T) return;
   uint i = lf_udiv(ij, a.T), j = ij - i * a.T;
-  for (uint c = tid; c < a.C; c += 256) {
+  float b = a.bonds[ij];
+  for (uint c = tid * 4; c < a.C; c += 1024) {
     ulong t = (ulong)ij * a.C + c;
-    a.z[t] = a.rows[i * a.C + c] + a.cols[j * a.C + c] + relPosAt(a.rel, i, j, c, a.C) + a.bonds[ij] * a.wBond[c] +
-             (a.lmZ ? a.lmZ[t] : 0.f);
+    float4 v = *(device const float4*)(a.rows + i * a.C + c) + *(device const float4*)(a.cols + j * a.C + c) +
+               relPosAt4(a.rel, i, j, c, a.C) + b * *(device const float4*)(a.wBond + c);
+    if (a.lmZ) v += *(device const float4*)(a.lmZ + t);
+    *(device float4*)(a.z + t) = v;
   }
 }
 kernel void ef2_trigate_weight(LF_ARGS(TriGateWArgs)) {
-  uint t = (uint)LF_INDEX, W = 4 * a.C;
-  if (t >= a.rows * W) return;
-  uint r = lf_udiv(t, W), col = t - r * W, kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8;
-  uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8: pa ga pb gb; a and b interleaved by channel)
-  a.out[t] = k < 2 ? a.proj[r * 2 * a.C + 2 * c + k] : a.gate[r * 2 * a.C + 2 * c + k - 2];
+  uint t = (uint)LF_INDEX, W4 = a.C;
+  if (t >= a.rows * W4) return;
+  uint r = lf_udiv(t, W4), col = (t - r * W4) << 2;
+  uint kind = a.quarters ? (col % 128) / 32 : (col % 32) / 8;
+  uint c = a.quarters ? 32 * (col / 128) + col % 32 : 8 * (col / 32) + col % 8;
+  uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8 or quarters of 32: pa ga pb gb; a and b interleaved by channel)
+  device const half* src = (k < 2 ? a.proj : a.gate) + (ulong)r * 2 * a.C + 2 * c + (k & 1);
+  ((device half4*)a.out)[t] = half4(src[0], src[2], src[4], src[6]);
 }
 kernel void ef2_fill(LF_ARGS(FillFArgs)) {
   ulong t = LF_INDEX;
@@ -252,11 +267,11 @@ kernel void ef2_decay_update(LF_ARGS(DecayArgs)) {
 }
 // pair positions [p0, p0 + cnt) of z + z^T
 kernel void ef2_sym_rows(LF_ARGS(SymRowsArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= a.cnt * a.C) return;
-  uint pc = lf_udiv((uint)t, a.C), c = (uint)t - pc * a.C;
+  ulong t = LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.cnt * C4) return;
+  uint pc = lf_udiv((uint)t, (uint)C4), c4 = (uint)t - pc * (uint)C4;
   uint ij = (uint)a.p0 + pc, i = lf_udiv(ij, a.T), j = ij - i * a.T;
-  a.out[t] = a.z[(ulong)ij * a.C + c] + a.z[((ulong)j * a.T + i) * a.C + c];
+  ((device float4*)a.out)[t] = ((device const float4*)(a.z + (ulong)ij * a.C))[c4] + ((device const float4*)(a.z + ((ulong)j * a.T + i) * a.C))[c4];
 }
 // the softmax mass of each pair's first contact_bins bins
 kernel void ef2_contacts(LF_ARGS(ContactsArgs)) {
@@ -324,6 +339,19 @@ kernel void ef2_rms_modulate(constant RmsModArgs& a [[buffer(0)]], uint3 tg [[th
   device float* xr = a.x + (ulong)row * a.C;
   device const float* m = a.mod + (ulong)row * 6 * a.C;
   device const float* dr = a.resD ? a.resD + (ulong)row * a.C : nullptr;
+  if (a.yh && a.C == 128) {
+    device float4* x4 = (device float4*)xr;
+    float4 x = x4[lane];
+    if (dr) {
+      x += ((device const float4*)(m + a.resWhich * 128))[lane] * ((device const float4*)dr)[lane];
+      x4[lane] = x;
+    }
+    float inv = rsqrt(simd_sum(dot(x, x)) * (1.f / 128.f) + RMS_EPS);
+    float4 sc = ((device const float4*)(m + a.scale * 128))[lane];
+    float4 sh = ((device const float4*)(m + a.shift * 128))[lane];
+    ((device half4*)(a.yh + (ulong)row * 128))[lane] = half4(x * inv * (1.f + sc) + sh);
+    return;
+  }
   float s = 0;
   for (uint c = lane; c < a.C; c += 32) {
     float x = xr[c];
@@ -369,8 +397,8 @@ constant int SWA_KT = 96, SWA_Q = 16;
 kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float Qs[SWA_Q][32];
-  threadgroup float Ks[SWA_KT][33];
+  threadgroup float4 Qs[SWA_Q][8];
+  threadgroup float4 Ks[SWA_KT][9];
   threadgroup float Vs[SWA_KT][32];
   const int nValid = (int)a.nValid, hw = (int)a.halfWindow, C = (int)a.C, ld = (int)a.ld;
   int head = tg.y;
@@ -381,7 +409,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
   for (int u = 0; u < 4; ++u) {
     m[u] = -INFINITY; l[u] = 0.f; acc[u] = 0.f;
     device const float* q = a.qkv + (ulong)a.valid[min(rq + u, nValid - 1)] * ld + head * 32;
-    Qs[4 * warp + u][lane] = q[lane] * a.scale;
+    ((threadgroup float*)Qs[4 * warp + u])[lane] = q[lane] * a.scale;
   }
   for (int t0 = klo; t0 <= khi; t0 += SWA_KT) {
     int n = min(SWA_KT, khi - t0 + 1);
@@ -389,9 +417,8 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
     for (int e = tid; e < n * 8; e += 128) {
       int j = e >> 3, part = e & 7;
       device const float* row = a.qkv + (ulong)a.valid[t0 + j] * ld + head * 32 + part * 4;
-      float4 k = *(device const float4*)(row + C), v = *(device const float4*)(row + 2 * C);
-      Ks[j][part * 4] = k.x; Ks[j][part * 4 + 1] = k.y; Ks[j][part * 4 + 2] = k.z; Ks[j][part * 4 + 3] = k.w;
-      *(threadgroup float4*)&Vs[j][part * 4] = v;
+      Ks[j][part] = *(device const float4*)(row + C);
+      *(threadgroup float4*)&Vs[j][part * 4] = *(device const float4*)(row + 2 * C);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (rq > r1) continue;
@@ -400,9 +427,10 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
       int j = j0 + (int)lane, key = t0 + j;
       float s[4] = {0.f, 0.f, 0.f, 0.f};
       if (j <= hi) {
-        for (int d = 0; d < 32; ++d) {
-          float k = Ks[j][d];
-          for (int u = 0; u < 4; ++u) s[u] += Qs[4 * warp + u][d] * k;
+        #pragma clang loop unroll(full)
+        for (int p = 0; p < 8; ++p) {
+          float4 k4 = Ks[j][p];
+          for (int u = 0; u < 4; ++u) s[u] += dot(Qs[4 * warp + u][p], k4);
         }
       }
       float p[4];
@@ -434,12 +462,17 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
     if (rq + u <= r1) a.ctx[(ulong)a.valid[rq + u] * C + head * 32 + lane] = acc[u] / l[u];
 }
 kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
-  uint t = (uint)LF_INDEX;
-  if (t >= a.A * a.C) return;
-  uint atom = lf_udiv(t, a.C), c = t - atom * a.C;
-  float v = a.mask[atom] != 0.f ? a.ctx[t] * lf_sigmoid(a.gate[(ulong)atom * a.ld + c]) : 0.f;
-  if (a.outH) a.outH[t] = (half)v;
-  else a.ctx[t] = v;
+  uint t = (uint)LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.A * C4) return;
+  uint atom = lf_udiv(t, C4), c4 = t - atom * C4;
+  float4 v = float4(0.f);
+  if (a.mask[atom] != 0.f) {
+    float4 cx = ((device const float4*)a.ctx)[t];
+    float4 gt = *(device const float4*)(a.gate + (ulong)atom * a.ld + (c4 << 2));
+    v = cx * float4(lf_sigmoid(gt.x), lf_sigmoid(gt.y), lf_sigmoid(gt.z), lf_sigmoid(gt.w));
+  }
+  if (a.outH) ((device half4*)a.outH)[t] = half4(v);
+  else ((device float4*)a.ctx)[t] = v;
 }
 kernel void ef2_gated_add(LF_ARGS(GatedAddArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
@@ -449,15 +482,16 @@ kernel void ef2_gated_add(LF_ARGS(GatedAddArgs)) {
 }
 // the mean over each token's atoms, weighted by the mask, into the first C columns of rows ld apart
 kernel void ef2_scatter_mean(LF_ARGS(ScatterMeanArgs)) {
-  uint t = (uint)LF_INDEX;
-  if (t >= a.T * a.C) return;
-  uint token = lf_udiv(t, a.C), c = t - token * a.C;
-  float s = 0, w = 0;
+  uint t = (uint)LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.T * C4) return;
+  uint token = lf_udiv(t, C4), c4 = t - token * C4, c = c4 << 2;
+  float4 s = float4(0.f); float w = 0.f;
   for (int k = a.tokenStart[token]; k < a.tokenStart[token + 1]; ++k) {
     int at = a.tokenAtoms[k];
-    s += a.v[(ulong)at * a.C + c] * a.mask[at]; w += a.mask[at];
+    float m = a.mask[at];
+    s += *(device const float4*)(a.v + (ulong)at * a.C + c) * m; w += m;
   }
-  a.out[(ulong)token * a.ld + c] = s / max(w, 1e-9f);
+  *(device float4*)(a.out + (ulong)token * a.ld + c) = s / max(w, 1e-9f);
 }
 kernel void ef2_tail_inputs(LF_ARGS(TailInputsArgs)) {
   uint t = (uint)LF_INDEX, F = 2 * a.K + 1;
@@ -470,12 +504,12 @@ kernel void ef2_tail_inputs(LF_ARGS(TailInputsArgs)) {
 // ---------------------------------------------------------------- the diffusion module
 // rows [p0, p0 + n) of [z | rel_pos]
 kernel void ef2_join_pair_rel(LF_ARGS(JoinPairRelArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= a.n * 2 * a.C) return;
-  uint C2 = 2 * a.C, pr = lf_udiv((uint)t, C2), c = (uint)t - pr * C2;
+  ulong t = LF_INDEX, C2_4 = a.C >> 1;
+  if (t >= a.n * C2_4) return;
+  uint pr = lf_udiv((uint)t, (uint)C2_4), c4 = (uint)t - pr * (uint)C2_4, c = c4 << 2;
   uint p = (uint)a.p0 + pr;
-  if (c < a.C) a.out[t] = a.z[(ulong)p * a.C + c];
-  else { uint i = lf_udiv(p, a.T); a.out[t] = relPosAt(a.rel, i, p - i * a.T, c - a.C, a.C); }
+  if (c < a.C) ((device float4*)a.out)[t] = *(device const float4*)(a.z + (ulong)p * a.C + c);
+  else { uint i = lf_udiv(p, a.T); ((device float4*)a.out)[t] = relPosAt4(a.rel, i, p - i * a.T, c - a.C, a.C); }
 }
 kernel void ef2_silu_mul(LF_ARGS(SiluMulArgs)) {
   ulong t = LF_INDEX;
@@ -486,10 +520,10 @@ kernel void ef2_fourier(LF_ARGS(FourierArgs)) {
   if (i < a.n) a.out[i] = precise::cos(2.f * M_PI_F * (a.level[0] * a.w[i] + a.b[i]));
 }
 kernel void ef2_add_row(LF_ARGS(AddRowArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= a.rows * a.C) return;
-  uint r = lf_udiv((uint)t, a.C);
-  a.x[t] += a.row[(uint)t - r * a.C];
+  ulong t = LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.rows * C4) return;
+  uint r = lf_udiv((uint)t, (uint)C4);
+  ((device float4*)a.x)[t] = ((device const float4*)a.base)[t] + ((device const float4*)a.row)[(uint)t - r * (uint)C4];
 }
 kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / denom | 0]
   uint t = (uint)LF_INDEX;
@@ -506,6 +540,45 @@ kernel void ef2_ada_ln(constant AdaCombineArgs& a [[buffer(0)]], uint3 tg [[thre
   device float* xr = a.an + (ulong)r * a.C;
   device const float* ry = a.resY ? a.resY + (ulong)r * a.C : nullptr;
   device const float* rg = a.resGate ? a.resGate + (ulong)r * a.ld : nullptr;
+  if (a.C == 768 && (a.ld & 3) == 0) {
+    device float4* x4 = (device float4*)xr;
+    float s = 0;
+    if (ry) {
+      device const float4* ry4 = (device const float4*)ry;
+      device const float4* rg4 = (device const float4*)rg;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const uint idx = lane + 32 * k;
+        const float4 g4 = rg4[idx];
+        const float4 sig = float4(lf_sigmoid(g4.x), lf_sigmoid(g4.y), lf_sigmoid(g4.z), lf_sigmoid(g4.w));
+        const float4 x = x4[idx] + ry4[idx] * sig;
+        x4[idx] = x; s += x.x + x.y + x.z + x.w;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const float4 x = x4[lane + 32 * k];
+        s += x.x + x.y + x.z + x.w;
+      }
+    }
+    const float mean = simd_sum(s) * (1.f / 768.f);
+    float v = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) { const float4 d = x4[lane + 32 * k] - mean; v += dot(d, d); }
+    const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+    device const float4* gr4 = (device const float4*)(a.g + (ulong)r * a.ld);
+    device const float4* gb4 = (device const float4*)a.gb;
+    device const float4* shr4 = (device const float4*)(a.sh + (ulong)r * a.ld);
+    device half4* yr4 = (device half4*)(a.out + (ulong)r * 768);
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const uint idx = lane + 32 * k;
+      const float4 u = gr4[idx] + gb4[idx];
+      const float4 sig = float4(lf_sigmoid(u.x), lf_sigmoid(u.y), lf_sigmoid(u.z), lf_sigmoid(u.w));
+      yr4[idx] = half4(((x4[idx] - mean) * inv) * sig + shr4[idx]);
+    }
+    return;
+  }
   float s = 0;
   for (uint c = lane; c < a.C; c += 32) {
     float x = xr[c];
@@ -535,12 +608,12 @@ kernel void ef2_sigmoid_mul(LF_ARGS(SigmoidMulArgs)) {     // dst += x * sigmoid
   if (a.dst) a.dst[t] += v; else a.x[t] = v;
 }
 kernel void ef2_scale_copies(LF_ARGS(ScaleCopiesArgs)) {    // out[j] = x * scale[j], [n, rows, C]
-  uint t = (uint)LF_INDEX, per = a.rows * a.C;
-  if (t >= a.n * per) return;
-  uint j = lf_udiv(t, per), r = t - j * per, c = r - lf_udiv(r, a.C) * a.C;
-  float v = a.x[r] * a.scales[j * a.C + c];
-  if (a.outH) a.outH[t] = (half)v;
-  else a.out[t] = v;
+  uint t = (uint)LF_INDEX, C4 = a.C >> 2, per4 = a.rows * C4;
+  if (t >= a.n * per4) return;
+  uint j = lf_udiv(t, per4), r4 = t - j * per4, c4 = r4 - lf_udiv(r4, C4) * C4;
+  float4 v = ((device const float4*)a.x)[r4] * ((device const float4*)a.scales)[j * C4 + c4];
+  if (a.outH) ((device half4*)a.outH)[t] = half4(v);
+  else ((device float4*)a.out)[t] = v;
 }
 // scores [H, T, T] + bias [H, T, T] (half), softmax per row; a threadgroup a row
 kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
@@ -569,16 +642,28 @@ kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg
 // [T * T, H] -> the attention's bias [H][T][stride] in log2 units (the stride padded even, its pad zero)
 kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
   ulong t = LF_INDEX;
+  if (a.H == 16) {
+    uint H4 = 4;
+    if (t >= a.P * H4) return;
+    uint p = (uint)(t >> 2), h0 = (uint)((t & 3) << 2), i = lf_udiv(p, a.T), j = p - i * a.T;
+    float4 v = ((device const float4*)a.pb)[t] * M_LOG2E_F;
+    ulong base = (ulong)i * a.stride + j, sH = (ulong)a.T * a.stride;
+    a.out[(ulong)(h0 + 0) * sH + base] = (half)v.x;
+    a.out[(ulong)(h0 + 1) * sH + base] = (half)v.y;
+    a.out[(ulong)(h0 + 2) * sH + base] = (half)v.z;
+    a.out[(ulong)(h0 + 3) * sH + base] = (half)v.w;
+    return;
+  }
   if (t >= a.P * a.H) return;
   uint p = lf_udiv((uint)t, a.H), h = (uint)t - p * a.H, i = lf_udiv(p, a.T), j = p - i * a.T;
   a.out[((ulong)h * a.T + i) * a.stride + j] = (half)(a.pb[t] * M_LOG2E_F);
 }
 kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
-  uint t = (uint)LF_INDEX;
-  if (t >= a.A * a.C) return;
-  uint at = lf_udiv(t, a.C), c = t - at * a.C;
+  uint t = (uint)LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.A * C4) return;
+  uint at = lf_udiv(t, C4), c4 = t - at * C4;
   int token = a.mask[at] != 0.f ? a.atomToToken[at] : 0;
-  a.q[t] += a.perToken[(uint)token * a.C + c];
+  ((device float4*)a.q)[t] += ((device const float4*)(a.perToken + (uint)token * a.C))[c4];
 }
 kernel void ef2_edm_combine(LF_ARGS(EdmArgs)) {
   uint t = (uint)LF_INDEX;
@@ -591,15 +676,17 @@ kernel void ef2_conf_z(constant ConfZArgs& a [[buffer(0)]], uint3 tg [[threadgro
   uint ij = tg.y * ng.x + tg.x;
   if (ij >= a.T * a.T) return;
   uint i = lf_udiv(ij, a.T), j = ij - i * a.T;
-  for (uint c = tid; c < a.C; c += 256)
-    a.z[(ulong)ij * a.C + c] += relPosAt(a.rel, i, j, c, a.C) + a.bonds[ij] * a.wBond[c] + a.rows[i * a.C + c] + a.cols[j * a.C + c];
+  float b = a.bonds[ij];
+  for (uint c = tid * 4; c < a.C; c += 1024)
+    *(device float4*)(a.z + (ulong)ij * a.C + c) += relPosAt4(a.rel, i, j, c, a.C) + b * *(device const float4*)(a.wBond + c) +
+                                                    *(device const float4*)(a.rows + i * a.C + c) + *(device const float4*)(a.cols + j * a.C + c);
 }
 kernel void ef2_outer(LF_ARGS(OuterArgs)) {      // a_i * b_j, pair rows p0..
-  ulong t = LF_INDEX;
-  if (t >= a.n * a.C) return;
-  uint pr = lf_udiv((uint)t, a.C), c = (uint)t - pr * a.C;
+  ulong t = LF_INDEX, C4 = a.C >> 2;
+  if (t >= a.n * C4) return;
+  uint pr = lf_udiv((uint)t, (uint)C4), c4 = (uint)t - pr * (uint)C4;
   uint ij = (uint)a.p0 + pr, i = lf_udiv(ij, a.T), j = ij - i * a.T;
-  a.out[t] = (half)(a.a[i * a.C + c] * a.b[j * a.C + c]);
+  ((device half4*)a.out)[t] = half4(((device const float4*)(a.a + i * a.C))[c4] * ((device const float4*)(a.b + j * a.C))[c4]);
 }
 // a simdgroup a pair: its distance and bucket once, then the row four channels a lane
 kernel void ef2_distance_embed(constant DistEmbedArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],

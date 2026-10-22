@@ -53,8 +53,7 @@ void freeAtoms(Atoms& at) {
 static Grid rowsOf8(size_t rows) { return grid1d((rows + 7) / 8, 1); }
 static const half* swaQkvg(const std::string& B, int C) {
   return M.derived<half>("swa.qkvg:" + B, (size_t)C * 4 * C, [&](half* w) {
-    copy2d(w, 4 * C * 2, M.h(B + "qkv"), 3 * C * 2, 3 * C * 2, C);
-    copy2d(w + 3 * C, 4 * C * 2, M.h(B + "attnGate"), C * 2, C * 2, C);
+    run1d("ef2_stack_cols", (size_t)C * C, StackColsArgs{M.h(B + "qkv"), M.h(B + "attnGate"), nullptr, w, (uint)C, (uint)(3 * C), (uint)C, 0});
   });
 }
 static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sch, const std::string& B, int halfWindow,
@@ -79,7 +78,7 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
       run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 128,
           SwaArgs{qkvg, a.valid, ctx, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f), (uint)(4 * C), 0});
     half* ctxh = scratch<half>("atom.ctxh", A * C);
-    run1d("ef2_gate_live", A * C, GateLiveArgs{ctx, qkvg + 3 * C, a.mask, ctxh, (uint)A, (uint)C, (uint)(4 * C), 0});
+    run1d("ef2_gate_live", (A * C) >> 2, GateLiveArgs{ctx, qkvg + 3 * C, a.mask, ctxh, (uint)A, (uint)C, (uint)(4 * C), 0});
     const float* resD = nullptr;
     {
       Gemm G{}; G.X = ctxh; G.tx = F16; G.W = M.h(B + "attnOut"); G.tw = F16; G.Y = x; G.ty = F32;
@@ -114,7 +113,7 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
     run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 128,
         SwaArgs{qkv, a.valid, ctx, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f), (uint)(3 * C), 0});
   lin(xm, B + "attnGate", gate, A, C, C);
-  run1d("ef2_gate_live", A * C, GateLiveArgs{ctx, gate, a.mask, nullptr, (uint)A, (uint)C, (uint)C, 0});
+  run1d("ef2_gate_live", (A * C) >> 2, GateLiveArgs{ctx, gate, a.mask, nullptr, (uint)A, (uint)C, (uint)C, 0});
   lin(ctx, B + "attnOut", att, A, C, C);
   run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, nullptr, att, (uint)A, (uint)C, 3, 4, 2, 0});
   float* h = scratch<float>("atom.h", A * 2 * a.hidden); float* g = scratch<float>("atom.g", A * a.hidden);
@@ -127,10 +126,26 @@ void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& 
               const float* preMod) {
   size_t n = (size_t)a.A * a.C;
   float* sc = nullptr; half* sch = nullptr;
+  float* stackedMod = nullptr;
   if (!preMod) {
     sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
     sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
     run1d("ef2_silu", n, SiluArgs{cond, sc, sch, n});
+    if (HALF_GEMM) {
+      stackedMod = scratch<float>("atom.mod", (size_t)blocks * a.A * 6 * a.C);
+      uint64_t* ptrs = scratch<uint64_t>("atom.ptrs", 3 * blocks);
+      std::vector<uint64_t> hp(3 * blocks);
+      for (int b = 0; b < blocks; ++b) {
+        hp[b] = (uint64_t)M.h("f/" + prefix + "/blocks/" + std::to_string(b) + "/adaln");
+        hp[blocks + b] = (uint64_t)sch;
+        hp[2 * blocks + b] = (uint64_t)(stackedMod + (size_t)b * a.A * 6 * a.C);
+      }
+      upload(ptrs, hp.data(), 3 * blocks * 8);
+      Gemm G{}; G.X = ptrs + blocks; G.tx = F16; G.W = ptrs; G.tw = F16; G.Y = ptrs + 2 * blocks; G.ty = F32;
+      G.rows = a.A; G.in = a.C; G.out = 6 * a.C; G.batch = blocks; G.ptrs = true; G.label = "atom adaln";
+      gemm(G);
+      preMod = stackedMod;
+    }
   }
   for (int b = 0; b < blocks; ++b)
     swaBlock(a, x, sc, sch, "f/" + prefix + "/blocks/" + std::to_string(b) + "/", halfWindow,
@@ -147,7 +162,7 @@ void inputsEmbedder(int T, int A, float* sInputs, int sWidth) {
   float* tok = scratch<float>("embed.tok", (size_t)A * Ct);
   Gemm g{}; g.X = x; g.W = M.h("f/atom/toToken"); g.tw = F16; g.half = true; g.Y = tok; g.rows = A; g.in = C; g.out = Ct; g.relu = true;
   gemm(g);
-  run1d("ef2_scatter_mean", (size_t)T * Ct,
+  run1d("ef2_scatter_mean", ((size_t)T * Ct) >> 2,
         ScatterMeanArgs{tok, at.ctx.tokenStart, at.ctx.tokenAtoms, at.ctx.mask, sInputs, (uint)T, (uint)Ct, (uint)sWidth, 0});
   // the alignment's profile and mean deletion only where the checkpoint reads them (the experimental tier zeroes both)
   const bool msaFeatures = M.meta("meta/msaFeatures", 0) > 0;
