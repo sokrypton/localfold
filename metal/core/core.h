@@ -163,10 +163,10 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
 // (alpha scales X W before the bias is added: (bias + alpha X W) / (1e-3 + norm), af2_opm_add's order)
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
-                float lnEps = 1e-5f);
+                float lnEps = 1e-5f, half* lnOut2 = nullptr, const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr);
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
-                float lnEps = 1e-5f);
+                float lnEps = 1e-5f, half* lnOut2 = nullptr, const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 // BioEmu2's coupling split (metal/bioemu2's couplingSplit): gemmSwiglu's product over the ATOM half of the row only, Xq Wq
 // (Wq: that half's rows of the blocks-of-8 weight), its epilogue (32768, a float tile) the whole row's pre-activations

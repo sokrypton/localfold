@@ -6,6 +6,7 @@
 #include <cstring>
 
 bool derivedSource(const std::string& name) {
+  if (name.find(".msaAttention1.") != std::string::npos) return false;
   auto ends = [&](const char* tail) { size_t n = strlen(tail); return name.size() >= n && !name.compare(name.size() - n, n, tail); };
   for (const char* tail : {".qProjection", ".kProjection", ".vProjection", ".gatingQuery", "ransition1", ".projection", ".gate",
                            "SingleCondScaleWeights", "SingleCondBias", "AdaptiveZeroCondWeights"})
@@ -13,10 +14,14 @@ bool derivedSource(const std::string& name) {
   return false;
 }
 bool halfWeight(const std::string& name, size_t elements) {
-  if (elements >= 16384 || derivedSource(name)) return true;
+  if (elements >= 16384) return true;
+  if (derivedSource(name)) return false;
   auto ends = [&](const char* tail) { size_t n = strlen(tail); return name.size() >= n && !name.compare(name.size() - n, n, tail); };
   for (const char* tail : {".pairBiasProjection", ".singlePairLogitsProjection", ".gatingLinear", ".transition2",
-                           ".Transition2", ".ffwTransition2", ".pairLogits", ".pairLogitsProjection"})
+                           ".Transition2", ".ffwTransition2", ".pairLogits", ".pairLogitsProjection",
+                           ".leftProjection", ".rightProjection", ".leftSingle", ".rightSingle", ".extraMsaTargetFeat",
+                           ".templatePairEmbedding2", ".templatePairEmbedding3", ".templatePairEmbedding8",
+                           ".outputLinear", ".zProjection", ".aProjection", ".vProjection", ".gatingQuery"})
     if (ends(tail)) return true;
   if (!name.rfind("trunk.", 0) && ends(".outputProjection")) return true;
   return false;

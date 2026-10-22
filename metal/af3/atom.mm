@@ -21,10 +21,13 @@ void convert(const Gather& g, const float* src, float* out, int C, size_t srcRow
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period, int ld,
            const float* kScale, const float* kShift, half* kOut, bool chained, const float* resY, const float* resGate, int resLd,
            const half* resYh, float resScale, bool preSigmoid) {
-  run("af3_ada_ln", grid1d((rows + 7) / 8, 1), 256,
-      AdaLnArgs{x, scale, shift, out, outF, kScale, kShift, kOut, resY, resYh, resGate, rows, (uint)C, (uint)period, (uint)(ld ? ld : C),
+  const uint ldu = (uint)(ld ? ld : C), rld = (uint)(resLd ? resLd : C);
+  const bool k128 = !outF && C == 128 && (ldu & 3) == 0 && (rld & 3) == 0;
+  const bool k768 = !outF && !kOut && C == 768 && (ldu & 3) == 0 && (rld & 3) == 0;
+  run(k128 ? "af3_ada_ln_128" : k768 ? "af3_ada_ln_768" : "af3_ada_ln", grid1d((rows + 7) / 8, 1), 256,
+      AdaLnArgs{x, scale, shift, out, outF, kScale, kShift, kOut, resY, resYh, resGate, rows, (uint)C, (uint)period, ldu,
                 ((ADA_RAW || preSigmoid) ? 1u : 0u) | (preSigmoid ? 2u : 0u), ADA_RAW ? 0.1f : 1e-5f, chained ? 1u : 0u,
-                (uint)(resLd ? resLd : C), resScale});
+                rld, resScale});
 }
 
 // ---------------------------------------------------------------- the conditioning

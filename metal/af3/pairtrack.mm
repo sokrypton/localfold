@@ -42,17 +42,27 @@ void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit
 static half* takeEmitted(const void* x, const std::string& norm) {
   for (auto& e : emitted)
     if (e.x == x && e.norm == norm) { e.x = nullptr; return e.buf; }
-  emitted[0].x = emitted[1].x = nullptr;
+  for (auto& e : emitted)
+    if (e.x == x) e.x = nullptr;
   return nullptr;
 }
-template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm) {
+template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "") {
   if (half* b = takeEmitted(pair, norm)) return b;
   half* xn = scratch<half>("pr.x", P * C);
+  if constexpr (std::is_same<T, float>::value) {
+    if (!nextNorm.empty() && hasW(nextNorm + "Scale")) {
+      half* xn2 = scratch<half>("pr.x2", P * C);
+      layerNormDual(pair, xn, W(norm + "Scale"), Wopt(norm + "Offset"),
+                    xn2, W(nextNorm + "Scale"), Wopt(nextNorm + "Offset"), P, C);
+      emit(0, pair, nextNorm, xn2);
+      return xn;
+    }
+  }
   ln(pair, xn, P, C, norm + "Scale", norm + "Offset");
   return xn;
 }
-half* pairLn(const float* pair, size_t P, int C, const std::string& norm) { return pairLnT(pair, P, C, norm); }
-half* pairLn(const half* pair, size_t P, int C, const std::string& norm) { return pairLnT(pair, P, C, norm); }
+half* pairLn(const float* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm) { return pairLnT(pair, P, C, norm, nextNorm); }
+half* pairLn(const half* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm) { return pairLnT(pair, P, C, norm, nextNorm); }
 // Y += X W (+ bias): the residual into the pair (or the single) in its own type
 static void addLinW(const half* X, const half* w, float* Y, size_t rows, int in, int out, const float* bias, const char* label) {
   linW(X, w, Y, rows, in, out, 1.f, bias, 1.f, label);

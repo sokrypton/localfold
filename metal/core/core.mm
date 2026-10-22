@@ -732,7 +732,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
     if (a.m == 256) { tm = a.n <= 128 ? 16 : 32; tn = 256; }
-    else if (a.m == 128) { tm = 64; tn = 128; }
+    else if (a.m == 128 || ((a.epilogue & 8192) && a.m % 128 == 0)) { tm = 64; tn = 128; }
   }
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
@@ -759,7 +759,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one tile wide
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
-                      ((tm == 64 && tn == 128) || ((tm == 32 || tm == 16) && tn == 256)) && a.m == tn &&
+                      ((tm == 64 && tn == 128 && (a.m == 128 || ((a.epilogue & 8192) && a.m % 128 == 0))) ||
+                       ((tm == 32 || tm == 16) && tn == 256 && a.m == 256)) &&
                       !hacc && batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
@@ -983,7 +984,7 @@ bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int ou
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
   const int rows = bi * O, cols = L * O;
-  if (!on || !tensorWanted() || O % 4 || rows <= 128 || cols % 4 || ((uint64_t)X & 15)) return false;
+  if (!on || !tensorWanted() || O % 4 || rows < 1 || cols % 4 || ((uint64_t)X & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)rt; a.B = (uint64_t)lt; a.C = a.D = (uint64_t)X;
   a.m = cols; a.n = rows; a.k = S; a.lda = ldr; a.ldb = ldl; a.ldc = a.ldd = cols;
@@ -993,25 +994,31 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
   return true;
 }
 static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
-                   float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+                   float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
+                   half* lnOut2, const float* lnScale2, const float* lnOffset2) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
-  if (!on || !tensorWanted() || rows <= 128 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
+  if (!on || !tensorWanted() || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
-  if (lnOut) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
+  if (lnOut) {
+    a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps;
+    a.lnOut2 = (uint64_t)lnOut2; a.lnScale2 = (uint64_t)lnScale2; a.lnOffset2 = (uint64_t)lnOffset2;
+  }
   ++D().stats.gemms;
   gemmTensorRun(tp, a, 1, true, "opm output, normalised add");
   return true;
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
-  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps);
+                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
+                half* lnOut2, const float* lnScale2, const float* lnOffset2) {
+  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2);
 }
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
-  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps);
+                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
+                half* lnOut2, const float* lnScale2, const float* lnOffset2) {
+  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2);
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

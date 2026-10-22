@@ -68,8 +68,8 @@ const float* qkvgBias(const std::string& pre, int Wd);
 struct Masks { const float* pair; const float* seq; bool ones; };
 // (into: where the residual goes, when not the input itself - chai-1's parallel block)
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf);
-half* pairLn(const float* pair, size_t P, int C, const std::string& norm);
-half* pairLn(const half* pair, size_t P, int C, const std::string& norm);
+half* pairLn(const float* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
+half* pairLn(const half* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
               const std::string& nextNorm = "");
 const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight

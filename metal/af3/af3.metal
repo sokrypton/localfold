@@ -435,6 +435,86 @@ kernel void af3_sigmoid_atom(LF_ARGS(SigmoidAtomArgs)) {
   a.tg[t] = lf_sigmoid(a.tg[t]);
 }
 // a simdgroup a row, eight a threadgroup; two-pass variance
+kernel void af3_ada_ln_128(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.rows) return;
+  device float4* x4 = (device float4*)(a.x + row * 128);
+  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
+  const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
+  float4 xv = x4[lane];
+  if (a.resY || a.resYh) {
+    float4 ry = a.resY ? ((device const float4*)(a.resY + row * 128))[lane]
+                       : float4(((device const half4*)(a.resYh + row * 128))[lane]) * a.resScale;
+    float4 rg = ((device const float4*)(a.resGate + gpr))[lane];
+    xv += ry * (rawG ? rg : float4(lf_sigmoid(rg.x), lf_sigmoid(rg.y), lf_sigmoid(rg.z), lf_sigmoid(rg.w)));
+    x4[lane] = xv;
+  }
+  float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) / 128.f;
+  float4 d = xv - mean;
+  float inv = rsqrt(simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w) / 128.f + a.eps);
+  float4 nrm = d * inv;
+  float4 sv = ((device const float4*)(a.scale + pr))[lane];
+  float4 y = (rawS ? sv : float4(lf_sigmoid(sv.x), lf_sigmoid(sv.y), lf_sigmoid(sv.z), lf_sigmoid(sv.w))) * nrm +
+             (a.shift ? ((device const float4*)(a.shift + pr))[lane] : float4(0.f));
+  if (a.out) ((device half4*)(a.out + row * 128))[lane] = half4(y);
+  if (a.kOut) {
+    float4 ksc = ((device const float4*)(a.kScale + pr))[lane];
+    float4 ksv = rawS ? ksc : float4(lf_sigmoid(ksc.x), lf_sigmoid(ksc.y), lf_sigmoid(ksc.z), lf_sigmoid(ksc.w));
+    float4 ksh = ((device const float4*)(a.kShift + pr))[lane];
+    if (!a.chained) {
+      ((device half4*)(a.kOut + row * 128))[lane] = half4(ksv * nrm + ksh);
+    } else {
+      float meank = simd_sum(y.x + y.y + y.z + y.w) / 128.f;
+      float4 dk = y - meank;
+      float invk = rsqrt(simd_sum(dk.x * dk.x + dk.y * dk.y + dk.z * dk.z + dk.w * dk.w) / 128.f + a.eps);
+      ((device half4*)(a.kOut + row * 128))[lane] = half4(ksv * (dk * invk) + ksh);
+    }
+  }
+}
+kernel void af3_ada_ln_768(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.rows) return;
+  device float4* x4 = (device float4*)(a.x + row * 768);
+  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
+  const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
+  device const float4* sc4 = (device const float4*)(a.scale + pr);
+  device const float4* sh4 = a.shift ? (device const float4*)(a.shift + pr) : nullptr;
+  device half4* out4 = a.out ? (device half4*)(a.out + row * 768) : nullptr;
+  float4 xv[6]; float s = 0.f;
+  if (a.resY || a.resYh) {
+    device const float4* ry4 = a.resY ? (device const float4*)(a.resY + row * 768) : nullptr;
+    device const half4* ryh4 = a.resYh ? (device const half4*)(a.resYh + row * 768) : nullptr;
+    device const float4* rg4 = (device const float4*)(a.resGate + gpr);
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) {
+      uint idx = lane + i * 32;
+      float4 rg = rg4[idx];
+      float4 ry = ry4 ? ry4[idx] : float4(ryh4[idx]) * a.resScale;
+      float4 val = x4[idx] + ry * (rawG ? rg : float4(lf_sigmoid(rg.x), lf_sigmoid(rg.y), lf_sigmoid(rg.z), lf_sigmoid(rg.w)));
+      x4[idx] = val; xv[i] = val; s += val.x + val.y + val.z + val.w;
+    }
+  } else {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) { float4 val = x4[lane + i * 32]; xv[i] = val; s += val.x + val.y + val.z + val.w; }
+  }
+  float mean = simd_sum(s) / 768.f, v = 0.f;
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < 6; ++i) { float4 d = xv[i] - mean; v += dot(d, d); }
+  float inv = rsqrt(simd_sum(v) / 768.f + a.eps);
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < 6; ++i) {
+    uint idx = lane + i * 32;
+    float4 nrm = (xv[i] - mean) * inv;
+    float4 sv = sc4[idx];
+    float4 y = (rawS ? sv : float4(lf_sigmoid(sv.x), lf_sigmoid(sv.y), lf_sigmoid(sv.z), lf_sigmoid(sv.w))) * nrm +
+               (sh4 ? sh4[idx] : float4(0.f));
+    if (out4) out4[idx] = half4(y);
+  }
+}
 kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
@@ -443,76 +523,6 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
   uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
-  if (!a.outF && a.C == 128 && (a.ld & 3) == 0 && (a.resLd & 3) == 0) {
-    device float4* x4 = (device float4*)x;
-    float4 xv = x4[lane];
-    if (a.resY || a.resYh) {
-      float4 ry = a.resY ? ((device const float4*)(a.resY + row * 128))[lane]
-                         : float4(((device const half4*)(a.resYh + row * 128))[lane]) * a.resScale;
-      float4 rg = ((device const float4*)(a.resGate + gpr))[lane];
-      xv += ry * (rawG ? rg : float4(lf_sigmoid(rg.x), lf_sigmoid(rg.y), lf_sigmoid(rg.z), lf_sigmoid(rg.w)));
-      x4[lane] = xv;
-    }
-    float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) / 128.f;
-    float4 d = xv - mean;
-    float inv = rsqrt(simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w) / 128.f + a.eps);
-    float4 nrm = d * inv;
-    float4 sv = ((device const float4*)(a.scale + pr))[lane];
-    float4 y = (rawS ? sv : float4(lf_sigmoid(sv.x), lf_sigmoid(sv.y), lf_sigmoid(sv.z), lf_sigmoid(sv.w))) * nrm +
-               (a.shift ? ((device const float4*)(a.shift + pr))[lane] : float4(0.f));
-    if (a.out) ((device half4*)(a.out + row * 128))[lane] = half4(y);
-    if (a.kOut) {
-      float4 ksc = ((device const float4*)(a.kScale + pr))[lane];
-      float4 ksv = rawS ? ksc : float4(lf_sigmoid(ksc.x), lf_sigmoid(ksc.y), lf_sigmoid(ksc.z), lf_sigmoid(ksc.w));
-      float4 ksh = ((device const float4*)(a.kShift + pr))[lane];
-      if (!a.chained) {
-        ((device half4*)(a.kOut + row * 128))[lane] = half4(ksv * nrm + ksh);
-      } else {
-        float meank = simd_sum(y.x + y.y + y.z + y.w) / 128.f;
-        float4 dk = y - meank;
-        float invk = rsqrt(simd_sum(dk.x * dk.x + dk.y * dk.y + dk.z * dk.z + dk.w * dk.w) / 128.f + a.eps);
-        ((device half4*)(a.kOut + row * 128))[lane] = half4(ksv * (dk * invk) + ksh);
-      }
-    }
-    return;
-  }
-  if (!a.outF && !a.kOut && a.C == 768 && (a.ld & 3) == 0 && (a.resLd & 3) == 0) {
-    device float4* x4 = (device float4*)x;
-    device const float4* sc4 = (device const float4*)(a.scale + pr);
-    device const float4* sh4 = a.shift ? (device const float4*)(a.shift + pr) : nullptr;
-    device half4* out4 = a.out ? (device half4*)(a.out + row * 768) : nullptr;
-    float4 xv[6]; float s = 0.f;
-    if (a.resY || a.resYh) {
-      device const float4* ry4 = a.resY ? (device const float4*)(a.resY + row * 768) : nullptr;
-      device const half4* ryh4 = a.resYh ? (device const half4*)(a.resYh + row * 768) : nullptr;
-      device const float4* rg4 = (device const float4*)(a.resGate + gpr);
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 6; ++i) {
-        uint idx = lane + i * 32;
-        float4 rg = rg4[idx];
-        float4 ry = ry4 ? ry4[idx] : float4(ryh4[idx]) * a.resScale;
-        float4 val = x4[idx] + ry * (rawG ? rg : float4(lf_sigmoid(rg.x), lf_sigmoid(rg.y), lf_sigmoid(rg.z), lf_sigmoid(rg.w)));
-        x4[idx] = val; xv[i] = val; s += val.x + val.y + val.z + val.w;
-      }
-    } else {
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 6; ++i) { float4 val = x4[lane + i * 32]; xv[i] = val; s += val.x + val.y + val.z + val.w; }
-    }
-    float mean = simd_sum(s) / 768.f, v = 0.f;
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < 6; ++i) { float4 d = xv[i] - mean; v += dot(d, d); }
-    float inv = rsqrt(simd_sum(v) / 768.f + a.eps);
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < 6; ++i) {
-      uint idx = lane + i * 32;
-      float4 nrm = (xv[i] - mean) * inv;
-      float4 sv = sc4[idx];
-      float4 y = (rawS ? sv : float4(lf_sigmoid(sv.x), lf_sigmoid(sv.y), lf_sigmoid(sv.z), lf_sigmoid(sv.w))) * nrm +
-                 (sh4 ? sh4[idx] : float4(0.f));
-      if (out4) out4[idx] = half4(y);
-    }
-    return;
-  }
   float s = 0.f;
   if (a.resY || a.resYh) {
     device const float* ry = a.resY ? a.resY + row * a.C : nullptr;

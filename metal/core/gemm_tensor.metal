@@ -81,14 +81,14 @@ inline void lf_emit_ln(thread CT& cg, device const TD* D, threadgroup float* par
     const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
     const float4 x = (lf_ln_at<REG>(cg, D, g, i0, j0, e) - mean[q]) * inv[q];
     float4 y = x;
-    if (sc) y *= *(device const float4*)(sc + i);
-    if (of) y += *(device const float4*)(of + i);
-    *(device half4*)(out + (ulong)i + (ulong)j * TN) = half4(y);
+    if (sc) y *= *(device const float4*)(sc + ix[0]);
+    if (of) y += *(device const float4*)(of + ix[0]);
+    *(device half4*)(out + (ulong)i + (ulong)j * g.ldd) = half4(y);
     if (g.lnOut2) {
       float4 y2 = x;
-      if (g.lnScale2) y2 *= *(device const float4*)((device const float*)g.lnScale2 + i);
-      if (g.lnOffset2) y2 += *(device const float4*)((device const float*)g.lnOffset2 + i);
-      *(device half4*)((device half*)g.lnOut2 + (ulong)i + (ulong)j * TN) = half4(y2);
+      if (g.lnScale2) y2 *= *(device const float4*)((device const float*)g.lnScale2 + ix[0]);
+      if (g.lnOffset2) y2 += *(device const float4*)((device const float*)g.lnOffset2 + ix[0]);
+      *(device half4*)((device half*)g.lnOut2 + (ulong)i + (ulong)j * g.ldd) = half4(y2);
     }
   }
 }
