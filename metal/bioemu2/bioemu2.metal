@@ -146,67 +146,98 @@ kernel void be2_window_attention(constant Be2WindowAttnArgs& a [[buffer(0)]], ui
   if (part == 0) for (int d = 0; d < HD; ++d) a.out[qa * D + h * HD + d] = acc[d] / sum;
 }
 // the fast arm's sliding-window attention: qkvg [rows][4D] in half, K/V staged in half (16 KB, half the threadgroup limit)
-// with the key mask staged in sm[128], and the output gated by sigmoid(g) into half
+// with the key mask staged in smask[128], S = Q K^T and O = P V on 8 x 8 simdgroup matrices, and the output gated by sigmoid(g) into half
 kernel void be2_window_attention_h(constant Be2WindowAttnHArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                                   uint tid [[thread_index_in_threadgroup]]) {
-  constexpr int HD = 32, SPLIT = 4, KS = BE2_WK / SPLIT;
-  const uint wg = tg.x, h = tg.y, D = a.H * HD, NW = a.N / BE2_WQ, smp = wg / NW, w = wg % NW;
-  const uint i = tid / SPLIT, part = tid % SPLIT;
+                                   uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int Q = BE2_WQ, K = BE2_WK, HD = 32, DF = 4, KF = 16;
+  const uint wg = tg.x, h = tg.y, D = a.H * HD, NW = a.N / Q, smp = wg / NW, w = wg % NW;
   const ulong base = (ulong)smp * a.N;
-  threadgroup half sk[BE2_WK][HD], sv[BE2_WK][HD];
-  threadgroup uchar sm[BE2_WK];
-  for (uint e4 = tid; e4 < BE2_WK * (HD / 4); e4 += BE2_WQ * SPLIT) {
-    int j = e4 >> 3, d = (e4 & 7) << 2, ka = (int)(w * BE2_WQ) - BE2_CTX + j;
-    bool ok = ka >= 0 && ka < (int)a.N;
-    const ulong off = (base + ka) * 4 * D + h * HD + d;
-    *(threadgroup half4*)(sk[j] + d) = ok ? *(device const half4*)(a.qkvg + off + D) : half4(0.h);
-    *(threadgroup half4*)(sv[j] + d) = ok ? *(device const half4*)(a.qkvg + off + 2 * D) : half4(0.h);
+  threadgroup half Ks[K * HD], Vs[K * HD];
+  threadgroup uchar smask[K];
+  const float qs = rsqrt((float)HD);
+  _Pragma("clang loop unroll(full)")
+  for (uint e = tid; e < Q * DF; e += 128) {
+    uint qi = e >> 2, d = (e & 3) << 3;
+    device const half* src = a.qkvg + (base + w * Q + qi) * 4 * D + h * HD + d;
+    float4 f0 = float4(*(device const half4*)src) + *(device const float4*)(a.qBias + h * HD + d);
+    float4 f1 = float4(*(device const half4*)(src + 4)) + *(device const float4*)(a.qBias + h * HD + d + 4);
+    *(threadgroup half4*)(Ks + qi * HD + d) = half4(f0 * qs);
+    *(threadgroup half4*)(Ks + qi * HD + d + 4) = half4(f1 * qs);
   }
-  if (tid < (uint)BE2_WK) {
-    int ka = (int)(w * BE2_WQ) - BE2_CTX + (int)tid;
-    sm[tid] = ka >= 0 && ka < (int)a.N && a.pad[ka] ? 1 : 0;
+  if (tid < (uint)K) {
+    int ka = (int)(w * Q) - BE2_CTX + (int)tid;
+    smask[tid] = ka >= 0 && ka < (int)a.N && a.pad[ka] ? 1 : 0;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const ulong qa = base + w * BE2_WQ + i;
-  float4 q[8], acc[8];
-  const float scale = rsqrt((float)HD);
+  simdgroup_half8x8 qf[DF];
+  _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Ks + (sg * 8) * HD + dk * 8, HD);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   _Pragma("clang loop unroll(full)")
-  for (int k = 0; k < 8; ++k) {
-    const int d = k << 2;
-    q[k] = (float4(*(device const half4*)(a.qkvg + qa * 4 * D + h * HD + d)) + *(device const float4*)(a.qBias + h * HD + d)) * scale;
-    acc[k] = float4(0.f);
-  }
-  device const float* b = a.bias + (((ulong)w * a.H + h) * BE2_WQ + i) * BE2_WK;
-  float mx = -INFINITY, sum = 0;
-  for (int jj = 0; jj < KS; ++jj) {
-    const int j = jj * SPLIT + (int)part;
-    float l = 0;
-    _Pragma("clang loop unroll(full)")
-    for (int k = 0; k < 8; ++k) l += dot(q[k], float4(*(threadgroup const half4*)(sk[j] + (k << 2))));
-    l = sm[j] ? l + b[j] : BE2_NEG_INF;
-    float nm = max(mx, l), f = exp(mx - nm), e = exp(l - nm);
-    sum = sum * f + e;
-    _Pragma("clang loop unroll(full)")
-    for (int k = 0; k < 8; ++k) acc[k] = acc[k] * f + e * float4(*(threadgroup const half4*)(sv[j] + (k << 2)));
-    mx = nm;
-  }
-  for (ushort o = 1; o < SPLIT; o <<= 1) {
-    float om = simd_shuffle_xor(mx, o), os = simd_shuffle_xor(sum, o);
-    float nm = max(mx, om), f = exp(mx - nm), fo = exp(om - nm);
-    sum = sum * f + os * fo;
-    _Pragma("clang loop unroll(full)")
-    for (int k = 0; k < 8; ++k) { const float4 oa = simd_shuffle_xor(acc[k], o); acc[k] = acc[k] * f + oa * fo; }
-    mx = nm;
-  }
-  if (part == 0) {
-    const float inv = 1.f / sum;
-    _Pragma("clang loop unroll(full)")
-    for (int k = 0; k < 8; ++k) {
-      const int d = k << 2;
-      const float4 gv = float4(*(device const half4*)(a.qkvg + qa * 4 * D + 3 * D + h * HD + d));
-      const float4 av = acc[k] * inv / (1.f + exp(-gv));
-      *(device half4*)(a.out + qa * D + h * HD + d) = half4(av);
+  for (uint e = tid; e < K * DF; e += 128) {
+    int j = e >> 2, d = (e & 3) << 3, ka = (int)(w * Q) - BE2_CTX + j;
+    if (ka >= 0 && ka < (int)a.N) {
+      device const half* src = a.qkvg + (base + ka) * 4 * D + h * HD + d;
+      *(threadgroup uint4*)(Ks + j * HD + d) = *(device const uint4*)(src + D);
+      *(threadgroup uint4*)(Vs + j * HD + d) = *(device const uint4*)(src + 2 * D);
+    } else {
+      *(threadgroup uint4*)(Ks + j * HD + d) = uint4(0);
+      *(threadgroup uint4*)(Vs + j * HD + d) = uint4(0);
     }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 sc[KF];
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) sc[j] = simdgroup_float8x8(0);
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j)
+    _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) {
+      simdgroup_half8x8 kt;
+      simdgroup_load(kt, Ks + (j * 8) * HD + dk * 8, HD, ulong2(0, 0), true);
+      simdgroup_multiply_accumulate(sc[j], qf[dk], kt, sc[j]);
+    }
+  const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+  const uint qi = sg * 8 + sm;
+  device const float* b = a.bias + (((ulong)w * a.H + h) * Q + qi) * K;
+  float mx = -INFINITY;
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
+    thread auto& e = sc[j].thread_elements();
+    const int k = j * 8 + sn;
+    float2 bv = *(device const float2*)(b + k);
+    e[0] = smask[k] ? (e[0] + bv.x) * M_LOG2E_F : BE2_NEG_INF;
+    e[1] = smask[k + 1] ? (e[1] + bv.y) * M_LOG2E_F : BE2_NEG_INF;
+    mx = max(mx, max(e[0], e[1]));
+  }
+  mx = max(mx, simd_shuffle_xor(mx, (ushort)1));
+  mx = max(mx, simd_shuffle_xor(mx, (ushort)8));
+  simdgroup_half8x8 p[KF];
+  float sum = 0.f;
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
+    thread auto& e = sc[j].thread_elements();
+    thread auto& pe = p[j].thread_elements();
+    _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+      float v = exp2(e[t] - mx);
+      sum += v;
+      pe[t] = (half)v;
+    }
+  }
+  sum += simd_shuffle_xor(sum, (ushort)1);
+  sum += simd_shuffle_xor(sum, (ushort)8);
+  simdgroup_float8x8 o[DF];
+  _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) o[c] = simdgroup_float8x8(0);
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j)
+    _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) {
+      simdgroup_half8x8 vf;
+      simdgroup_load(vf, Vs + (j * 8) * HD + c * 8, HD);
+      simdgroup_multiply_accumulate(o[c], p[j], vf, o[c]);
+    }
+  const ulong qa = base + w * Q + qi;
+  device const half* g = a.qkvg + qa * 4 * D + 3 * D + h * HD;
+  device half* out = a.out + qa * D + h * HD;
+  const float inv = 1.f / sum;
+  _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) {
+    thread auto& oe = o[c].thread_elements();
+    const int d = c * 8 + sn;
+    half2 gv = *(device const half2*)(g + d);
+    *(device half2*)(out + d) = half2(half(oe[0] * inv * lf_sigmoid((float)gv.x)), half(oe[1] * inv * lf_sigmoid((float)gv.y)));
   }
 }
 // AttentionPairBias over all T tokens of each stacked sample: a thread per (sample, head, query), online softmax over

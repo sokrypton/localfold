@@ -36,7 +36,7 @@ const half* triGateWeight(const std::string& pre, int C) {
 // pair normalised, the norm's name and the buffer. pairLn of the same pair and norm takes its entry; a miss drops both
 // (whatever came between may have moved the pair). LOCALFOLD_LN_EMIT=0: none emitted, every norm its own pass
 struct Emitted { const void* x = nullptr; std::string norm; half* buf = nullptr; };
-static Emitted emitted[2];
+static Emitted emitted[3];
 static void emit(int k, const void* x, const std::string& norm, half* buf) { emitted[k] = {x, norm, buf}; }
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit(k, x, norm, buf); }
 static half* takeEmitted(const void* x, const std::string& norm) {

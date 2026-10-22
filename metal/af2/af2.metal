@@ -573,21 +573,46 @@ kernel void af2_ipa_weights(constant IpaWeightsArgs& a [[buffer(0)]], uint3 tg [
   device float* row = a.attn + ((ulong)q * a.H + h) * a.L;
   device const float* qh = a.qs + (ulong)q * a.lds + h * a.Cs;
   float mx = -1e30f, w = a.pw[h];
-  for (uint k = lane; k < a.L; k += 32) {
-    float d2 = 0;
-    for (uint p = 0; p < a.Pq; ++p)
-      for (int x = 0; x < 3; ++x) {
-        float d = a.qp[(((ulong)q * a.H + h) * a.Pq + p) * 3 + x] - a.kp[(((ulong)k * a.H + h) * a.Pq + p) * 3 + x];
-        d2 += d * d;
+  if (a.Cs == 16 && a.Pq == 4 && (a.lds & 3) == 0) {
+    device const float4* qh4 = (device const float4*)qh;
+    const float4 qv[4] = {qh4[0] * a.qScale, qh4[1] * a.qScale, qh4[2] * a.qScale, qh4[3] * a.qScale};
+    device const float* qpt = a.qp + ((ulong)q * a.H + h) * 12;
+    float qp[12];
+    _Pragma("clang loop unroll(full)") for (int i = 0; i < 12; ++i) qp[i] = qpt[i];
+    const float mq = a.seqMask[q], scale = sqrt(1.f / 3.f);
+    for (uint k = lane; k < a.L; k += 32) {
+      device const float* kpt = a.kp + ((ulong)k * a.H + h) * 12;
+      float d2 = 0;
+      _Pragma("clang loop unroll(full)") for (int i = 0; i < 12; ++i) { float d = qp[i] - kpt[i]; d2 += d * d; }
+      float s = -0.5f * w * d2, sc = 0;
+      device const float4* kh4 = (device const float4*)(a.ks + (ulong)k * a.lds + h * 16);
+      _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) {
+        float4 p = qv[i] * kh4[i];
+        sc += p.x; sc += p.y; sc += p.z; sc += p.w;
       }
-    float s = -0.5f * w * d2, sc = 0;
-    device const float* kh = a.ks + (ulong)k * a.lds + h * a.Cs;
-    for (uint c = 0; c < a.Cs; ++c) sc += (qh[c] * a.qScale) * kh[c];
-    s += sc + a.b2d[((ulong)q * a.L + k) * a.H + h];
-    s -= 1e5f * (1.f - a.seqMask[q] * a.seqMask[k]);
-    s *= sqrt(1.f / 3.f);
-    row[k] = s;
-    mx = max(mx, s);
+      s += sc + a.b2d[((ulong)q * a.L + k) * a.H + h];
+      s -= 1e5f * (1.f - mq * a.seqMask[k]);
+      s *= scale;
+      row[k] = s;
+      mx = max(mx, s);
+    }
+  } else {
+    for (uint k = lane; k < a.L; k += 32) {
+      float d2 = 0;
+      for (uint p = 0; p < a.Pq; ++p)
+        for (int x = 0; x < 3; ++x) {
+          float d = a.qp[(((ulong)q * a.H + h) * a.Pq + p) * 3 + x] - a.kp[(((ulong)k * a.H + h) * a.Pq + p) * 3 + x];
+          d2 += d * d;
+        }
+      float s = -0.5f * w * d2, sc = 0;
+      device const float* kh = a.ks + (ulong)k * a.lds + h * a.Cs;
+      for (uint c = 0; c < a.Cs; ++c) sc += (qh[c] * a.qScale) * kh[c];
+      s += sc + a.b2d[((ulong)q * a.L + k) * a.H + h];
+      s -= 1e5f * (1.f - a.seqMask[q] * a.seqMask[k]);
+      s *= sqrt(1.f / 3.f);
+      row[k] = s;
+      mx = max(mx, s);
+    }
   }
   mx = simd_max(mx);
   float sum = 0;
@@ -602,47 +627,45 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
   const uint q = tg.x, H = a.H, Cs = a.Cs, Pv = a.Pv, C2 = a.C2;
   const uint Fw = H * Cs + 4 * H * Pv + H * C2;
   device half* f = a.fin + (ulong)q * Fw;
-  if (C2 == 128 && H == 12 && Pv == 8 && Cs == 16) {
-    if (tg.y == 0) {
-      if (tid < 128) {
-        uint c = tid;
-        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f,
-              s6 = 0.f, s7 = 0.f, s8 = 0.f, s9 = 0.f, s10 = 0.f, s11 = 0.f;
-        device const float* at = a.attn + (ulong)q * 12 * a.L;
-        for (uint k = 0; k < a.L; ++k) {
-          float v = a.act2d[((ulong)q * a.L + k) * 128 + c];
-          s0  += at[0 * a.L + k] * v; s1  += at[1 * a.L + k] * v; s2  += at[2 * a.L + k] * v; s3  += at[3 * a.L + k] * v;
-          s4  += at[4 * a.L + k] * v; s5  += at[5 * a.L + k] * v; s6  += at[6 * a.L + k] * v; s7  += at[7 * a.L + k] * v;
-          s8  += at[8 * a.L + k] * v; s9  += at[9 * a.L + k] * v; s10 += at[10 * a.L + k] * v; s11 += at[11 * a.L + k] * v;
-        }
-        device half* fp = f + 12 * 16 + 4 * 12 * 8 + c;
-        fp[0 * 128] = (half)s0; fp[1 * 128] = (half)s1; fp[2 * 128] = (half)s2; fp[3 * 128] = (half)s3;
-        fp[4 * 128] = (half)s4; fp[5 * 128] = (half)s5; fp[6 * 128] = (half)s6; fp[7 * 128] = (half)s7;
-        fp[8 * 128] = (half)s8; fp[9 * 128] = (half)s9; fp[10 * 128] = (half)s10; fp[11 * 128] = (half)s11;
-      } else if (tid < 128 + 96) {
-        uint hp = tid - 128, h = hp >> 3, p = hp & 7;
-        device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
-        float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
-        float g[3] = {0, 0, 0};
-        for (uint k = 0; k < a.L; ++k) {
-          float w = at[k];
-          device const float* vp = a.vp + (((ulong)k * 12 + h) * 8 + p) * 3;
-          g[0] += w * vp[0]; g[1] += w * vp[1]; g[2] += w * vp[2];
-        }
-        float loc[3];
-        rapplyInv(rig, g, loc);
-        uint base = 12 * 16, idx = h * 8 + p;
-        f[base + idx] = (half)loc[0];
-        f[base + 96 + idx] = (half)loc[1];
-        f[base + 192 + idx] = (half)loc[2];
-        f[base + 288 + idx] = (half)sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+  if (C2 == 128 && H == 12 && Pv == 8 && Cs == 16 && (a.ldv & 3) == 0) {
+    if (tid < 128) {
+      const uint sg = tid >> 5, lane = tid & 31, h0 = sg * 3;
+      float4 s0(0.f), s1(0.f), s2(0.f);
+      device const float* at = a.attn + ((ulong)q * 12 + h0) * a.L;
+      for (uint k = 0; k < a.L; ++k) {
+        float4 v = ((device const float4*)(a.act2d + ((ulong)q * a.L + k) * 128))[lane];
+        s0 += at[0 * a.L + k] * v;
+        s1 += at[1 * a.L + k] * v;
+        s2 += at[2 * a.L + k] * v;
       }
-    } else if (tid < 192) {
-      uint h = tid >> 4, c = tid & 15;
+      device half* fp = f + 12 * 16 + 4 * 12 * 8 + h0 * 128;
+      ((device half4*)(fp + 0 * 128))[lane] = half4(s0);
+      ((device half4*)(fp + 1 * 128))[lane] = half4(s1);
+      ((device half4*)(fp + 2 * 128))[lane] = half4(s2);
+    } else if (tid < 128 + 96) {
+      uint hp = tid - 128, h = hp >> 3, p = hp & 7;
       device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
-      float s = 0.f;
-      for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[(ulong)k * a.ldv + h * 16 + c];
-      f[h * 16 + c] = (half)s;
+      float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
+      float g[3] = {0, 0, 0};
+      for (uint k = 0; k < a.L; ++k) {
+        float w = at[k];
+        device const float* vp = a.vp + (((ulong)k * 12 + h) * 8 + p) * 3;
+        g[0] += w * vp[0]; g[1] += w * vp[1]; g[2] += w * vp[2];
+      }
+      float loc[3];
+      rapplyInv(rig, g, loc);
+      uint base = 12 * 16, idx = h * 8 + p;
+      f[base + idx] = (half)loc[0];
+      f[base + 96 + idx] = (half)loc[1];
+      f[base + 192 + idx] = (half)loc[2];
+      f[base + 288 + idx] = (half)sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+    }
+    if (tid >= 208) {
+      uint st = tid - 208, h = st >> 2, c = (st & 3) << 2;
+      device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
+      float4 s(0.f);
+      for (uint k = 0; k < a.L; ++k) s += at[k] * *(device const float4*)(a.vs + (ulong)k * a.ldv + h * 16 + c);
+      *(device half4*)(f + h * 16 + c) = half4(s);
     }
     return;
   }

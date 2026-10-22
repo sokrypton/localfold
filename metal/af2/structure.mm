@@ -15,12 +15,13 @@ StructureOut structureModule(const float* single, const float* pair, int L, floa
   linearB(initialH, S + "initial_projection", -1, act, L, C, C);
   toHalf(act, actH, (size_t)L * C);
   float* act2d = scratch<float>("sm.act2d", pairs * C2);
-  layerNormW(pair, act2d, pairs, C2, S + "pair_layer_norm");
+  half* act2dH = scratch<half>("sm.act2dH", pairs * C2);
+  layerNormW(pair, act2d, act2dH, pairs, C2, S + "pair_layer_norm");
   int Hh = (int)dimW(I + "q_scalar_projection/weights", 1), Cs = (int)dimW(I + "q_scalar_projection/weights", 2);
   int Pq = (int)dimW(I + "q_point_projection/point_projection/weights", 2) / 3;
   int Pv = (int)dimW(I + "v_point_projection/point_projection/weights", 2) / 3;
   float* b2d = scratch<float>("sm.b2d", pairs * Hh);
-  linearB(act2d, I + "attention_2d", -1, b2d, pairs, C2, Hh);       // the same every iteration (shared weights)
+  linearB(act2dH, I + "attention_2d", -1, b2d, pairs, C2, Hh);       // the same every iteration (shared weights)
   float* pw = scratch<float>("sm.pw", Hh);
   run1d("af2_softplus_scale", Hh, SoftplusArgs{P(I + "trainable_point_weights"), pw, (uint)Hh, sqrtf(1.f / (Pq * 9.f / 2.f))});
   float* rig = scratch<float>("sm.rigid", (size_t)L * 12);
@@ -71,7 +72,7 @@ StructureOut structureModule(const float* single, const float* pair, int L, floa
           PointsGlobalArgs{ipaProj + 3 * Ws, rig, qp, kp, vp, (uint)L, (uint)Hh, (uint)Pq, (uint)Pv, (uint)Fipa, 0});
     run("af2_ipa_weights", grid1d(((size_t)L * Hh + 7) / 8, 1), 256,
         IpaWeightsArgs{ipaProj, ipaProj + Ws, qp, kp, b2d, pw, seqMask, attn, (uint)L, (uint)Hh, (uint)Cs, (uint)Pq, (uint)Fipa, qScale});
-    run("af2_ipa_outputs", Grid{(uint32_t)L, 2, 1}, 256,
+    run("af2_ipa_outputs", Grid{(uint32_t)L, (C2 == 128 && Hh == 12 && Pv == 8 && Cs == 16 && (Fipa & 3) == 0) ? 1u : 2u, 1}, 256,
         IpaOutputsArgs{attn, ipaProj + 2 * Ws, vp, act2d, rig, fin, (uint)L, (uint)Hh, (uint)Cs, (uint)Pv, (uint)C2, (uint)Fipa});
     linearB(fin, I + "output_projection", -1, act, L, Fw, C, false, 1.f);
     layerNormW(act, t1, t1H, L, C, F + "attention_layer_norm");
