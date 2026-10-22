@@ -61,11 +61,15 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     releaseScratch({"ftri.", "ftr.", "eln."});
     run1d("ef2_add_half", (P * C) >> 2, AddHalfArgs{z, stackH, (P * C) >> 2});
   } else {
+    const std::string firstLn = "confidence/blocks/0/triangleMultiplicationOutgoing/leftNormInput";
+    half* lnOut = C == 256 ? scratch<half>("ftri.xn", P * C) : nullptr;
     run("ef2_distance_embed", grid1d((P + 7) / 8, 1), 256,
         DistEmbedArgs{z, xDevice, Ii("distogram_atom_idx"), F("confidence/boundaries"), F("confidence/distanceEmbedding"),
-                      (uint)M.len("f/confidence/boundaries"), (uint)T, (uint)C, 0, nullptr, nullptr, nullptr, nullptr});
+                      (uint)M.len("f/confidence/boundaries"), (uint)T, (uint)C, 0,
+                      nullptr, lnOut, lnOut ? F(firstLn + "Scale") : nullptr, lnOut ? F(firstLn + "Offset") : nullptr});
     float* stack = allocT<float>(P * C);
     copy(stack, z, P * C * 4);
+    if (lnOut) emitTrunkLn(stack, firstLn, lnOut);
     for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
       trunkBlock(stack, mask, T, C, "confidence/blocks", b,
                  M.has("f/confidence/blocks/" + std::to_string(b + 1) + "/pairTransition/transition1"));

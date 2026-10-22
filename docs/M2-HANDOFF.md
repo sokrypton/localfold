@@ -41,7 +41,7 @@ While ~80% of those optimizations reduce memory traffic, dispatch count, or host
    # Build all native Metal binaries
    bash metal/build.sh selftest bench af3 af2 ef2 bioemu2
    ```
-   *(Note: When benchmarking a Metal binary copied to `/tmp`, always copy it back into `metal/<port>/localfold-<port>` before running `--sequence=...` or `--job=...` because `lf::standalone::main` locates repo assets relative to `dirname(argv[0])`.)*
+   *(Note: When benchmarking two Metal binaries side-by-side, place them in `metal/<port>/localfold-<port>-a` and `metal/<port>/localfold-<port>-b` rather than running from `/tmp` or overwriting `metal/<port>/localfold-<port>` on each run: `lf::standalone::main` locates repo assets relative to `dirname(argv[0])`, and overwriting a Mach-O executable in place triggers ~45 ms of macOS `amfid` code-signature re-verification.)*
 
 ---
 
@@ -155,7 +155,9 @@ Run each pair interleaved (`ABBA`) on warm caches:
 
 Once the M5 commits are verified on M2, the highest-leverage areas specifically for M2 are:
 1. **Metal `lf_gemm` (`metal/core/gemm.metal`) epilogue fusions for `Apple8`**:
-   - **Already ported & verified (`LOCALFOLD_GEMM_TENSOR=0`)**: `Gemm::yinFloat` (`biasType & 512`), `halfProductScale()` (`1/1024` saturating `half` triangle contraction + `lf_center_norm_16h2`/`32h1`), `gemmGatedRows` (`262144`), `gemmGateResidual` (`16384`), `gemmCondPermuted` (`524288`), `gemmMulH` (`1048576` with 8x8 `simdgroup_load`/`simdgroup_store`), `gemmOpmPermuted` (`4096` with 8x8 strided `simdgroup_store`), `gemmOpmOut` (`8192` with 8x8 `simdgroup_load`/`simdgroup_store`), and fast `om`-only 8x8 stores for `accFloat` `half` outputs.
-   - **Remaining opportunities**: emitted LayerNorm (`g.lnOut`) or dual triangle-output GEMM (`gemmGatedAddDual`) in `gemm.metal`.
+   - **Already ported & verified (`LOCALFOLD_GEMM_TENSOR=0`)**:
+     - `Gemm::yinFloat` (`biasType & 512`), `halfProductScale()` (`1/1024` saturating `half` triangle contraction + `lf_center_norm_16h2`/`32h1`), `gemmGatedRows` (`262144`), `gemmGateResidual` (`16384`), `gemmCondPermuted` (`524288`), `gemmMulH` (`1048576` with 8x8 `simdgroup_load`/`simdgroup_store`), `gemmOpmPermuted` (`4096` with 8x8 strided `simdgroup_store`), `gemmOpmOut` (`8192` with 8x8 `simdgroup_load`/`simdgroup_store`), and fast `om`-only 8x8 stores for `accFloat` `half` outputs (`0de9becb`).
+     - Emitted LayerNorm (`EP & 128` in `gemm.metal`) for `C = 64, 128, 256` and `gemmOpmOut`: enabled by default on `lf_gemm` at `C = 64` (where `tr = 64, tc = 64` is already `lf_gemm`'s native `4x4`-fragment square tile, cutting 60 dispatches in `af2` `extra_msa_stack` + `templates` and 36 dispatches in `af3` `templatePairStack`), and kept opt-in via `LOCALFOLD_LN_EMIT=2` at `C = 128, 256` (where widening `tc` to `128`/`256` on a 4-simdgroup `8x8` tile shrinks `tr` to `32`/`16` and rereads `X` 2x–4x across `K`).
+     - `precompile()` in `metal/core/core.mm` filters out `gemm_hh*` instances when `tensorWanted()` is true and `gemmt_*` instances when `tensorWanted()` is false, preventing cross-mode spec cache pollution (`-28%` to `-62%` startup compile time).
 2. **WebGPU `grid-attend-race.js` calibration on M2**:
    - Check `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js` on M2 to verify that the 4-way startup race consistently selects M2's winning arms (`gridAttendTiled=false`, `gridProjectArithmetic="f32"`, `attentionGroup=1`, and the fastest `triangleContractArithmetic`).

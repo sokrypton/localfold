@@ -332,7 +332,10 @@ struct Device {
       // without the units, where a cached list from an M5 names them)
       std::vector<std::pair<std::string, std::string>> groups[2];
       const bool tw = tensorOps && (!getenv("LOCALFOLD_GEMM_TENSOR") || atoi(getenv("LOCALFOLD_GEMM_TENSOR")) != 0);
-      for (auto& t : todo) if (!isTensor(t.first)) groups[0].push_back(t); else if (tw) groups[1].push_back(t);
+      for (auto& t : todo) {
+        if (isTensor(t.first)) { if (tw) groups[1].push_back(t); }
+        else if (!tw || t.first.compare(0, 7, "gemm_hh") != 0) groups[0].push_back(t);
+      }
       std::vector<std::thread> threads;
       for (int tensor = 0; tensor < 2; ++tensor) {
         const std::vector<std::pair<std::string, std::string>>* list = &groups[tensor];   // (groups outlives the threads)
@@ -734,6 +737,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
     if (a.m == 256) { tm = a.n <= 128 ? 16 : 32; tn = 256; }
     else if (a.m == 128 || ((a.epilogue & 8192) && a.m % 128 == 0)) { tm = 64; tn = 128; }
+    else if (a.m == 64) { tm = 64; tn = 64; }
   }
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
@@ -760,7 +764,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one tile wide
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
-                      ((tm == 64 && tn == 128 && (a.m == 128 || ((a.epilogue & 8192) && a.m % 128 == 0))) ||
+                      ((tm == 64 && tn == 64 && a.m == 64) ||
+                       (tm == 64 && tn == 128 && (a.m == 128 || ((a.epilogue & 8192) && a.m % 128 == 0))) ||
                        ((tm == 32 || tm == 16) && tn == 256 && a.m == 256)) &&
                       !hacc && batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
@@ -786,7 +791,6 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   if (a.m <= 0 || a.n <= 0 || batch <= 0) return false;
   ++D().stats.gemms;
   if (ta_ == F16 && tb_ == F16 && tensorWanted()) return gemmTensorRun(tc_, a, batch, accFloat, label);
-  a.lnOut = 0;
   // a float X the caller lets be staged in half (lf_gemm's hmma rounds it to half on the way in): rounded to half here
   // instead, into one reused buffer (stream order keeps it), and the product on the matrix units.
   // LOCALFOLD_GEMM_X_HALF=0 the control
@@ -799,6 +803,15 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
     a.B = (uint64_t)xh;
     return gemmTensorRun(tc_, a, batch, accFloat, label);
   }
+  static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+  static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
+  const bool lnEmit = a.lnOut && !(a.epilogue & (128 | 256 | 4096 | 16384 | 32768 | 262144 | 524288 | 1048576)) &&
+                      !a.ptrs && batch == 1 && !getenv("LOCALFOLD_GEMM_TILE") &&
+                      ((a.m == 64 && lnWanted) ||
+                       (lnSimd && (a.m == 128 || a.m == 256 || ((a.epilogue & 8192) && a.m % 128 == 0)))) &&
+                      a.ldd % 4 == 0 && a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
+                      a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
+  if (!lnEmit) a.lnOut = a.lnOut2 = 0;
   // the tile: TR rows along n by TC columns along m. A short n (up to 128) in ONE tile row - every weight read once -
   // rounded up to 16; the columns then as many as keep a simdgroup's accumulators at 16 or fewer
   int tr = 64, tc = 64;
@@ -821,20 +834,21 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   }
   if ((a.epilogue & 128) && tc < 32) tc = 32;
   if (a.epilogue & 256) tc = 64;
+  if (lnEmit) { tr = a.m == 256 ? 16 : a.m == 64 ? 64 : 32; tc = a.m == 256 ? 256 : a.m == 64 ? 64 : 128; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);
   if (tr % 16 || tc % 16 || tr < 16 || tc < 16) die("gemm: no %d x %d tile", tr, tc);
   auto esize = [](DT t) { return t == F32 ? 4 : 2; };
   bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && a.sa % 8 == 0 && a.sb % 8 == 0 &&
              a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0;
   if (vec) a.biasType |= 256;
-  int bk = (tc >= 48 && tr >= 48) || (tc == 32 && tr >= 80) ? 16 : 32;
+  int bk = (tc >= 48 && tr >= 48) || (tc == 32 && tr >= 80) || tc >= 128 ? 16 : 32;
   if (const char* e = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(e);
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
-  const bool hacc = !floatAcc && !accFloat && ta_ == F16 && tb_ == F16 && tc_ == F16;
+  const bool hacc = !lnEmit && !floatAcc && !accFloat && a.beta == 0.f && !(a.epilogue & (64 | 8192)) && ta_ == F16 && tb_ == F16 && tc_ == F16;
   const bool hmma = halfMma && !(ta_ == F16 && tb_ == F16);     // (half staging of an f32 operand)
   const bool extEp = (a.epilogue & (4096 | 8192 | 16384 | 262144 | 524288 | 1048576)) != 0;
   auto mtype = [](DT t) { return t == F32 ? "float" : "half"; };
-  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | (extEp ? 64 : 0) | GEMM_EXTRA_EP;
+  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | (extEp ? 64 : 0) | (lnEmit ? 128 : 0) | GEMM_EXTRA_EP;
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
                       std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " +
                       std::to_string(bk) + ", " + std::to_string(ep);
@@ -849,7 +863,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
     lab = b;
   }
   dispatchInstance(name, decl, &a, sizeof a, grid, 128, 0, lab.empty() ? nullptr : lab.c_str());
-  return false;
+  return lnEmit;
 }
 }  // namespace
 static GemmArgs gemmArgs(const Gemm& g) {
@@ -914,9 +928,9 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
   // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
   // 404 ms a trunk pass)
-  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256)) &&
+  if (dual && tensorWanted() && (out == 64 || out % 128 == 0) && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256)) &&
       a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
-    const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : 128;
+    const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : out == 64 ? 64 : 128;
     GemmArgs a{};
     a.A = (uint64_t)Wg; a.B = (uint64_t)Xg; a.C = a.D = (uint64_t)pair;
     a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -996,7 +1010,7 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
                    float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
                    half* lnOut2, const float* lnScale2, const float* lnOffset2) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
-  if (!on || (!tensorWanted() && lnOut) || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
+  if (!on || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -1005,8 +1019,8 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
     a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps;
     a.lnOut2 = (uint64_t)lnOut2; a.lnScale2 = (uint64_t)lnScale2; a.lnOffset2 = (uint64_t)lnOffset2;
   }
-  gemmRun(F16, F16, tp, a, 1, false, true, "opm output, normalised add");
-  return true;
+  bool emitted = gemmRun(F16, F16, tp, a, 1, false, true, "opm output, normalised add");
+  return !lnOut || emitted;
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
@@ -1181,6 +1195,10 @@ void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const
 void layerNormDual(const float* x, half* y1, const float* s1, const float* o1, half* y2, const float* s2, const float* o2,
                    size_t rows, int C, float eps) {
   layerNormRun(x, nullptr, nullptr, y1, rows, C, s1, o1, eps, 0, 0, y2, s2, o2);
+}
+void layerNormDual(const half* x, half* y1, const float* s1, const float* o1, half* y2, const float* s2, const float* o2,
+                   size_t rows, int C, float eps) {
+  layerNormRun(nullptr, x, nullptr, y1, rows, C, s1, o1, eps, 0, 0, y2, s2, o2);
 }
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
   size_t P = (size_t)L * L;

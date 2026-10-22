@@ -57,6 +57,7 @@ static void gemmCase(const char* what, size_t R, int K, int O, bool tx, bool tw,
 }
 
 int main() {
+  setenv("LOCALFOLD_LN_EMIT", "2", 0);
   setSource("selftest", PORT_SOURCE);
   printf("GEMM\n");
   for (auto [R, K, O] : std::vector<std::tuple<size_t, int, int>>{{37, 100, 70}, {300, 256, 512}, {1000, 128, 48}, {64, 1152, 3456}, {5, 6, 128}}) {
@@ -117,9 +118,8 @@ int main() {
     gemmGatedAdd(dX, dW, dA, dY, R, K, O);
     report("gated add", relRms(ref, download(dY, R * O)), 1e-3);
   }
-  {   // the next LayerNorm emitted by the epilogue (two norms of the same rows): Y += X W, then LN(Y) twice - where the
-      // matrix units take it (elsewhere gemm() says it did not, and the case is skipped)
-    size_t R = 300; int K = 256, O = 128;
+  for (int O : {128, 64, 256}) {   // the next LayerNorm emitted by the epilogue (two norms of the same rows): Y += X W, then LN(Y) twice
+    size_t R = 300; int K = 256;
     auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), Y0 = randv(R * O), s1 = randv(O), o1 = randv(O), s2 = randv(O), o2 = randv(O);
     std::vector<double> y(R * O), ref1(R * O), ref2(R * O);
     for (size_t r = 0; r < R; ++r) {
@@ -143,14 +143,18 @@ int main() {
     Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.rows = R; g.in = K; g.out = O; g.beta = 1.f;
     g.lnOut = dN1; g.lnScale = ds1; g.lnOffset = do1; g.lnOut2 = dN2; g.lnScale2 = ds2; g.lnOffset2 = do2;
     if (gemm(g)) {
-      report("emitted LayerNorm: the output", relRms(y, download(dY, R * O)), 1e-3);
+      char l0[64], l1[64], l2[64];
+      snprintf(l0, sizeof l0, "emitted LayerNorm (C %d): the output", O);
+      snprintf(l1, sizeof l1, "emitted LayerNorm (C %d): the first norm", O);
+      snprintf(l2, sizeof l2, "emitted LayerNorm (C %d): the second norm", O);
+      report(l0, relRms(y, download(dY, R * O)), 1e-3);
       auto h1 = download(dN1, R * O), h2 = download(dN2, R * O);
-      report("emitted LayerNorm: the first norm", relRms(ref1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
-      report("emitted LayerNorm: the second norm", relRms(ref2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
-    } else printf("  emitted LayerNorm: not taken here (no matrix units)\n");
+      report(l1, relRms(ref1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+      report(l2, relRms(ref2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+    } else { ++failures; printf("  emitted LayerNorm (C %d): FAIL (not taken)\n", O); }
   }
-  {   // ...and by the triangle's fused tail: pair += Xv Wv sigmoid(Xg Wg), then LN(pair)
-    size_t R = 300; int K = 128, O = 128;
+  for (int O : {128, 64, 256}) {   // ...and by the triangle's fused tail: pair += Xv Wv sigmoid(Xg Wg), then LN(pair)
+    size_t R = 300; int K = O;
     auto Xg = randv(R * K), Wg = randv((size_t)K * O, 0.1f), Xv = randv(R * K), Wv = randv((size_t)K * O, 0.1f), Y0 = randv(R * O);
     auto s1 = randv(O), o1 = randv(O);
     std::vector<double> y(R * O), ref(R * O);
@@ -174,10 +178,13 @@ int main() {
     float* dY = uploadNew(Y0.data(), Y0.size()); half* tmp = allocT<half>(R * O); half* dN = allocT<half>(R * O);
     float *ds1 = uploadNew(s1.data(), O), *do1 = uploadNew(o1.data(), O);
     if (gemmGatedAddDual(dXg, dWg, dXv, dWv, dY, R, K, O, nullptr, nullptr, tmp, nullptr, dN, ds1, do1)) {
-      report("emitted LayerNorm, the triangle's tail: the pair", relRms(y, download(dY, R * O)), 2e-3);
+      char l0[64], l1[64];
+      snprintf(l0, sizeof l0, "emitted LayerNorm (C %d), the triangle's tail: the pair", O);
+      snprintf(l1, sizeof l1, "emitted LayerNorm (C %d), the triangle's tail: the norm", O);
+      report(l0, relRms(y, download(dY, R * O)), 2e-3);
       auto h = download(dN, R * O);
-      report("emitted LayerNorm, the triangle's tail: the norm", relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
-    } else printf("  emitted LayerNorm, the triangle's tail: not taken here (no matrix units)\n");
+      report(l1, relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
+    } else { ++failures; printf("  emitted LayerNorm, the triangle's tail (C %d): FAIL (not taken)\n", O); }
   }
   {   // the same two over a half pair (AF3's pairformer stack): the residual summed in float, rounded once on its store,
       // the norm taken from the stored half values
@@ -212,15 +219,13 @@ int main() {
     auto f32 = [](const std::vector<half>& h) { return std::vector<float>(h.begin(), h.end()); };
     Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.ty = F16; g.rows = R; g.in = K; g.out = O; g.beta = 1.f;
     g.lnOut = dN; g.lnScale = ds1; g.lnOffset = do1;
-    if (gemm(g)) {
-      report("half pair, emitted LayerNorm: the output", relRms(y, f32(download(dY, R * O))), 1e-3);
-      report("half pair, emitted LayerNorm: the norm", relRms(ref, f32(download(dN, R * O))), 3e-3);
-    } else printf("  half pair, emitted LayerNorm: not taken here (no matrix units)\n");
+    bool em1 = gemm(g);
+    report("half pair, residual: the output", relRms(y, f32(download(dY, R * O))), 1e-3);
+    if (em1) report("half pair, emitted LayerNorm: the norm", relRms(ref, f32(download(dN, R * O))), 3e-3);
     upload(dY, toH(Y0).data(), R * O * 2);
-    if (gemmGatedAddDual(dX, dW, dXv, dWv, dY, R, K, O, nullptr, nullptr, tmp, nullptr, dN, ds1, do1)) {
-      report("half pair, the triangle's tail: the pair", relRms(y2, f32(download(dY, R * O))), 2e-3);
-      report("half pair, the triangle's tail: the norm", relRms(ref2, f32(download(dN, R * O))), 3e-3);
-    } else printf("  half pair, the triangle's tail: not taken here (no matrix units)\n");
+    bool em2 = gemmGatedAddDual(dX, dW, dXv, dWv, dY, R, K, O, nullptr, nullptr, tmp, nullptr, dN, ds1, do1);
+    report("half pair, the triangle's tail: the pair", relRms(y2, f32(download(dY, R * O))), 2e-3);
+    if (em2) report("half pair, the triangle's tail: the norm", relRms(ref2, f32(download(dN, R * O))), 3e-3);
   }
   if (halfProductScale()) {   // the triangle's product in half, scaled (core.mm's halfProductScale): the contraction's
       // scaled saturating store, then the centre LayerNorm from it, against the norm of the exact product
@@ -421,6 +426,29 @@ int main() {
       auto h = download(dPh, rows * C);
       report("outer product output add (half pair)", relRms(refH, std::vector<float>(h.begin(), h.end())), 3e-3);
     } else { ++failures; printf("  gemmOpmOut half: FAIL (not taken)\n"); }
+    auto sc = randv(C), of = randv(C), sc2 = randv(C), of2 = randv(C);
+    std::vector<double> refLn1(rows * C), refLn2(rows * C);
+    for (size_t r = 0; r < rows; ++r) {
+      double m = 0, var = 0;
+      for (int o = 0; o < C; ++o) m += (float)(half)refH[r * C + o];
+      m /= C;
+      for (int o = 0; o < C; ++o) { double d = (float)(half)refH[r * C + o] - m; var += d * d; }
+      double inv = 1 / sqrt(var / C + 1e-5);
+      for (int o = 0; o < C; ++o) {
+        refLn1[r * C + o] = ((float)(half)refH[r * C + o] - m) * inv * sc[o] + of[o];
+        refLn2[r * C + o] = ((float)(half)refH[r * C + o] - m) * inv * sc2[o] + of2[o];
+      }
+    }
+    upload(dPh, toH(P0).data(), P0.size() * 2);
+    half* dLn1 = allocT<half>(rows * C); half* dLn2 = allocT<half>(rows * C);
+    float *dsc = uploadNew(sc.data(), C), *dof = uploadNew(of.data(), C);
+    float *dsc2 = uploadNew(sc2.data(), C), *dof2 = uploadNew(of2.data(), C);
+    if (gemmOpmOut(dX, dW, dPh, db, dn, rows, in, C, 2.f, dLn1, dsc, dof, 1e-5f, dLn2, dsc2, dof2)) {
+      auto h1 = download(dLn1, rows * C), h2 = download(dLn2, rows * C);
+      report("outer product output add, emitted LN 1", relRms(refLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+      report("outer product output add, emitted LN 2", relRms(refLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+    } else { ++failures; printf("  gemmOpmOut emitted LN: FAIL (not taken)\n"); }
+    release(dLn1); release(dLn2); release(dsc); release(dof); release(dsc2); release(dof2);
     release(dlt); release(drt); release(dX); release(dW); release(db); release(dn); release(dPf); release(dPh);
   }
 

@@ -185,7 +185,7 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
     }
     attention(at);
   }
-  if (!nextNorm.empty() && (C == 128 || C == 256)) {     // (the residual's next norm emitted by the output projection)
+  if (!nextNorm.empty() && (C == 64 || C == 128 || C == 256)) {     // (the residual's next norm emitted by the output projection)
     half* lnOut = lnTarget(rows, C, xn);
     Gemm g{}; g.X = o; g.tx = F16; g.W = PH(A + "/output_w", blk); g.tw = F16; g.Y = residual; g.ty = dtOf<T>(); g.rows = rows; g.in = W; g.out = C;
     g.bias = P(A + "/output_b", blk); g.beta = 1.f; g.label = "attention output, next norm";
@@ -234,13 +234,13 @@ static void msaColumnAttention(Trunk& t, const std::string& S, int blk, T* msa, 
   attend(xn, L, rowsN, C, A + "/attention", blk, nullptr, ones ? nullptr : msaMask, 1, L, msa, true, nextNorm, blk);
 }
 template <class T>
-static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T* msa, int rowsN, int C, const float* msaMask) {
+static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T* msa, int rowsN, int C, const float* msaMask,
+                                     const std::string& nextNorm = "") {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_global_attention";
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3), W = H * D;
   if (H > 8 || D > 16 || C > 256) die("global attention: %d heads of %d over %d channels", H, D, C);
-  half* xn = scratch<half>("gcol.xn", rows * C);
-  layerNormW(msa, xn, rows, C, A + "/query_norm", blk);
+  half* xn = pairLn(msa, rows, C, A + "/query_norm", blk, "gcol.xn");
   // every sequence's key and value (shared by the heads): one GEMM against [key_w | value_w]
   int B = (int)dimW(A + "/attention/query_w", 0);
   const half* kvw = M.derived<half>("kv:" + A, (size_t)B * C * 2 * D, [&](half* out) {
@@ -256,6 +256,14 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
   linearWB(xn, A + "/attention/gating_w", A + "/attention/gating_b", blk, gate, rows, C, W, 0.f);
   half* gated = scratch<half>("gcol.gated", rows * W);
   run1d("af2_global_gate", (W & 3) ? rows * W : rows * (W >> 2), GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, 0});
+  if (!nextNorm.empty() && (C == 64 || C == 128 || C == 256)) {
+    half* lnOut = lnTarget(rows, C, xn);
+    Gemm g{}; g.X = gated; g.tx = F16; g.W = PH(A + "/attention/output_w", blk); g.tw = F16; g.Y = msa; g.ty = dtOf<T>();
+    g.rows = rows; g.in = W; g.out = C; g.bias = P(A + "/attention/output_b", blk); g.beta = 1.f;
+    g.label = "global output, next norm"; g.lnOut = lnOut; g.lnScale = P(nextNorm + "/scale", blk); g.lnOffset = P(nextNorm + "/offset", blk);
+    if (gemm(g)) emitLn(msa, nextNorm, blk, lnOut);
+    return;
+  }
   linearWB(gated, A + "/attention/output_w", A + "/attention/output_b", blk, msa, rows, W, C, 1.f);
 }
 template <class X>
@@ -268,7 +276,7 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
   size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)I)));
   half* xn = scratch<half>("tr.xn", chunk * C);
   half* mid = scratch<half>("tr.mid", chunk * I);
-  const bool emitNext = !nextNorm.empty() && (C == 128 || C == 256);
+  const bool emitNext = !nextNorm.empty() && (C == 64 || C == 128 || C == 256);
   const bool emitNext2 = emitNext && !nextNorm2.empty() && rows <= 16384;
   half* ln1 = emitNext ? (lnName1 ? scratch<half>(lnName1, rows * C) : lnTarget(rows, C, nullptr)) : nullptr;
   half* ln2 = emitNext2 ? scratch<half>("ln.m", rows * C) : nullptr;
@@ -297,7 +305,10 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
     if (ln2) emitLn(x, nextNorm2, nextBlk2, ln2);
   }
 }
-void transition(float* x, size_t rows, int C, const std::string& T, int blk) { transitionT(x, rows, C, T, blk); }
+void transition(float* x, size_t rows, int C, const std::string& T, int blk,
+                const std::string& nextNorm, int nextBlk) {
+  transitionT(x, rows, C, T, blk, nextNorm, nextBlk);
+}
 // pair[(i0 + i)][j] += (bias + Y) / (1e-3 + norm), float or half, optionally emitting the next norm
 static void opmAdd(float* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L,
                    half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr) {
@@ -336,7 +347,8 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   }
   const half* Wout = PH(Op + "/output_w", blk);        // [O * O][128]
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
+  static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
+  half* lnOut = (!nextNorm.empty() && lnEmit && (matrixUnits() || lnSimd)) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
   const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
   const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
   half* lnOut2 = (lnOut && !nextNorm2.empty() && L <= 512) ? scratch<half>("ln.p2", (size_t)L * L * 128) : nullptr;
@@ -500,13 +512,14 @@ static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair,
   if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones,
                                    S + "msa_row_attention_with_pair_bias/feat_2d_norm",
                                    S + "triangle_multiplication_outgoing/left_norm_input");
-  msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones, extraStack ? "" : S + "msa_column_attention/query_norm");
-  if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
+  msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones,
+                  S + (extraStack ? "msa_column_global_attention/query_norm" : "msa_column_attention/query_norm"));
+  if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask, S + "msa_transition/input_layer_norm");
   else msaColumnAttention(t, S, blk, msa, rowsN, C, mask, ones, S + "msa_transition/input_layer_norm");
   transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk,
-              (!extraStack && (!t.opmFirst || moreMain)) ? S + "outer_product_mean/layer_norm_input" : "",
+              (!t.opmFirst || moreMain || (extraStack && nextPairBlk > blk)) ? S + "outer_product_mean/layer_norm_input" : "",
               t.opmFirst ? blk + 1 : blk,
-              moreMain ? S + "msa_row_attention_with_pair_bias/query_norm" : "", blk + 1,
+              (moreMain || (extraStack && nextPairBlk > blk)) ? S + "msa_row_attention_with_pair_bias/query_norm" : "", blk + 1,
               t.opmFirst ? "ln.m1" : nullptr);
   if (!t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones, S + "triangle_multiplication_outgoing/left_norm_input");
   // (each update's last GEMM emitting the next one's norm)

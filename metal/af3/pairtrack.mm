@@ -49,14 +49,12 @@ static half* takeEmitted(const void* x, const std::string& norm) {
 template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "") {
   if (half* b = takeEmitted(pair, norm)) return b;
   half* xn = scratch<half>("pr.x", P * C);
-  if constexpr (std::is_same<T, float>::value) {
-    if (!nextNorm.empty() && hasW(nextNorm + "Scale")) {
-      half* xn2 = scratch<half>("pr.x2", P * C);
-      layerNormDual(pair, xn, W(norm + "Scale"), Wopt(norm + "Offset"),
-                    xn2, W(nextNorm + "Scale"), Wopt(nextNorm + "Offset"), P, C);
-      emit(0, pair, nextNorm, xn2);
-      return xn;
-    }
+  if (!nextNorm.empty() && hasW(nextNorm + "Scale")) {
+    half* xn2 = scratch<half>("pr.x2", P * C);
+    layerNormDual(pair, xn, W(norm + "Scale"), Wopt(norm + "Offset"),
+                  xn2, W(nextNorm + "Scale"), Wopt(nextNorm + "Offset"), P, C);
+    emit(0, pair, nextNorm, xn2);
+    return xn;
   }
   ln(pair, xn, P, C, norm + "Scale", norm + "Offset");
   return xn;
@@ -227,7 +225,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
   // both used to be a LayerNorm pass of their own past ~300 tokens)
   half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
-  const bool emitNext = !next1.empty() && !into && C == 128 && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
+  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128) && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);

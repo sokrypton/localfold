@@ -60,7 +60,8 @@ void triangleMultiplication(float* pair, const float* pairMask, int L, int C, co
                             const std::string& nextNorm = "");
 void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes,
                        const std::string& nextNorm = "");
-void transition(float* x, size_t rows, int C, const std::string& T, int blk);
+void transition(float* x, size_t rows, int C, const std::string& T, int blk,
+                const std::string& nextNorm = "", int nextBlk = 0);
 
 // templates (templates.mm)
 void templateEmbedding(float* pair, const float* pairMask, int L);

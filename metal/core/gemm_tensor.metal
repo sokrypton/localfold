@@ -29,16 +29,18 @@ inline float4 lf_ln_at(thread CT& cg, thread CT& cv, device const TD* D, constan
 }
 template <int TN, bool REG = false, int NR = 4, typename CT, typename TD>
 inline void lf_emit_ln(thread CT& cg, thread CT& cv, device const TD* D, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
-  constexpr uint NS = TN / 64;
-  static_assert(TN == 128 || TN == 256, "the emitted LayerNorm is probed for TN = 128 and 256");
+  constexpr uint NS = TN == 64 ? 2 : TN / 64;
+  static_assert(TN == 64 || TN == 128 || TN == 256, "the emitted LayerNorm is probed for TN = 64, 128 and 256");
   const uint sg = tid / 32, first = sg & ~(NS - 1), lane = tid & 31;
+  auto qOf = [](uint16_t e) { return TN == 64 ? (((e >> 2) & 1) | ((e >> 3) & 2)) : (((e >> 2) & 1) | ((e >> 4) & 2)); };
+  auto c0Of = [](uint16_t e) { return TN == 64 ? (((e >> 3) & 1) == 0) : (((e >> 3) & 3) == 0); };
   float s4[NR];
   for (int q = 0; q < NR; ++q) s4[q] = 0;
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) { const float4 v = lf_ln_at<REG>(cg, cv, D, g, i0, j0, e); s4[((e >> 2) & 1) | ((e >> 4) & 2)] += v.x + v.y + v.z + v.w; }
+  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) { const float4 v = lf_ln_at<REG>(cg, cv, D, g, i0, j0, e); s4[qOf(e)] += v.x + v.y + v.z + v.w; }
   int rowOf[NR];
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) if (((e >> 3) & 3) == 0) rowOf[((e >> 2) & 1) | ((e >> 4) & 2)] = cg.get_multidimensional_index(e)[1];
+  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) if (c0Of(e)) rowOf[qOf(e)] = cg.get_multidimensional_index(e)[1];
   for (int q = 0; q < NR; ++q) {
     s4[q] += simd_shuffle_xor(s4[q], 1);
     s4[q] += simd_shuffle_xor(s4[q], 8);
@@ -55,7 +57,7 @@ inline void lf_emit_ln(thread CT& cg, thread CT& cv, device const TD* D, threadg
   for (int q = 0; q < NR; ++q) v4[q] = 0;
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
-    const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
+    const int q = qOf(e);
     const float4 d = lf_ln_at<REG>(cg, cv, D, g, i0, j0, e) - mean[q];
     v4[q] += dot(d, d);
   }
@@ -79,7 +81,7 @@ inline void lf_emit_ln(thread CT& cg, thread CT& cv, device const TD* D, threadg
     const auto ix = cg.get_multidimensional_index(e);
     const int i = i0 + ix[0], j = j0 + ix[1];
     if (j >= g.n) continue;
-    const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
+    const int q = qOf(e);
     const float4 x = (lf_ln_at<REG>(cg, cv, D, g, i0, j0, e) - mean[q]) * inv[q];
     float4 y = x;
     if (sc) y *= *(device const float4*)(sc + ix[0]);
@@ -345,7 +347,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       *(device vec<TC, 4>*)dp = st;
       if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
     }
-    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN, true, (TM * TN) / 2048>(c, c, (device const TC*)D, part, tid, g, i0, j0); }
+    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN, true, (TM * (TN < 128 ? 128 : TN)) / 2048>(c, c, (device const TC*)D, part, tid, g, i0, j0); }
     return;
   }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1 - or a half output's scale -, beta
@@ -559,7 +561,7 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     }
   }
   threadgroup float part[512];
-  if (ln) lf_emit_ln<TN, metal::is_same_v<TP, half>, (TM * TN) / 2048>(cg, cv, (device const TP*)D, part, tid, g, i0, j0);
+  if (ln) lf_emit_ln<TN, metal::is_same_v<TP, half>, (TM * (TN < 128 ? 128 : TN)) / 2048>(cg, cv, (device const TP*)D, part, tid, g, i0, j0);
 }
 // (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128; <64, 128, half> gemmt_dualh_64x128)
 

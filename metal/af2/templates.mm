@@ -38,11 +38,12 @@ void templateEmbedding(float* pair, const float* pairMask, int L) {
     { Gemm g{}; g.X = qn; g.tx = F16; g.W = PH(S + "template_pair_embedding_8/weights"); g.tw = F16; g.Y = act; g.beta = 1.f;
       g.rows = pairs; g.in = Cz; g.out = C; g.label = "template query term"; gemm(g); }
     for (int b = 0; b < nb; ++b) {
-      triangleMultiplication(act, pairMask, L, C, IT, b, true);
-      triangleMultiplication(act, pairMask, L, C, IT, b, false);
-      triangleAttention(act, pairMask, L, C, IT, b, true, false);
-      triangleAttention(act, pairMask, L, C, IT, b, false, false);
-      transition(act, pairs, C, IT + "pair_transition", b);
+      triangleMultiplication(act, pairMask, L, C, IT, b, true, IT + "triangle_multiplication_incoming/left_norm_input");
+      triangleMultiplication(act, pairMask, L, C, IT, b, false, IT + "triangle_attention_starting_node/query_norm");
+      triangleAttention(act, pairMask, L, C, IT, b, true, false, IT + "triangle_attention_ending_node/query_norm");
+      triangleAttention(act, pairMask, L, C, IT, b, false, false, IT + "pair_transition/input_layer_norm");
+      transition(act, pairs, C, IT + "pair_transition", b,
+                 b + 1 < nb ? IT + "triangle_multiplication_outgoing/left_norm_input" : "", b + 1);
     }
     layerNormW(act, act, pairs, C, S + "output_layer_norm");     // (in place: a row is read whole before it is written)
     add(sum, act, pairs * C);
@@ -66,11 +67,12 @@ void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T) 
         TmplPairMonoArgs{Ii("t/aatype") + (size_t)k * L, In("t/positions") + (size_t)k * L * 37 * 3, In("t/mask") + (size_t)k * L * 37,
                          P(S + "embedding2d/weights"), P(S + "embedding2d/bias"), act, (uint)L, (uint)C});
     for (int b = 0; b < nb; ++b) {        // the MONOMER's order: both attentions, then both multiplications
-      triangleAttention(act, pairMask, L, C, PS, b, true, false);
-      triangleAttention(act, pairMask, L, C, PS, b, false, false);
-      triangleMultiplication(act, pairMask, L, C, PS, b, true);
-      triangleMultiplication(act, pairMask, L, C, PS, b, false);
-      transition(act, pairs, C, PS + "pair_transition", b);
+      triangleAttention(act, pairMask, L, C, PS, b, true, false, PS + "triangle_attention_ending_node/query_norm");
+      triangleAttention(act, pairMask, L, C, PS, b, false, false, PS + "triangle_multiplication_outgoing/left_norm_input");
+      triangleMultiplication(act, pairMask, L, C, PS, b, true, PS + "triangle_multiplication_incoming/left_norm_input");
+      triangleMultiplication(act, pairMask, L, C, PS, b, false, PS + "pair_transition/input_layer_norm");
+      transition(act, pairs, C, PS + "pair_transition", b,
+                 b + 1 < nb ? PS + "triangle_attention_starting_node/query_norm" : "", b + 1);
     }
     layerNormW(act, act, pairs, C, S + "output_layer_norm");     // (in place: a row is read whole before it is written)
   }

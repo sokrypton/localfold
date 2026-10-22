@@ -216,16 +216,24 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
     return;
   }
   fill(z, 0, P * C * 4);
+  const std::string firstLn = "blocks/0/triangleMultiplicationOutgoing/leftNormInput";
   for (int loop = 0; loop < loops; ++loop) {
     // z = LN(z) @ projection + z_init, a chunk of rows at a time
+    half* in = takeEmitted(z, "recycle/norm/");
+    half* lnOut = lnTarget(P, C, in);
+    bool all = true;
     for (size_t r0 = 0; r0 < P; r0 += chunk) {
       size_t r = std::min(chunk, P - r0);
-      layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
-      Gemm g{}; g.X = xn; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16; g.Y = z + r0 * C; g.Yin = zi + r0 * C;
+      const half* x = in ? in + r0 * C : xn;
+      if (!in) layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+      Gemm g{}; g.X = x; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16; g.Y = z + r0 * C; g.Yin = zi + r0 * C;
       g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
-      gemm(g);
+      g.lnOut = lnOut + r0 * C; g.lnScale = F(firstLn + "Scale"); g.lnOffset = F(firstLn + "Offset");
+      all = gemm(g) && all;
     }
-    for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
+    if (all) emitted = {z, firstLn, lnOut};
+    for (int b = 0; b < blocks; ++b)
+      trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks, loop + 1 < loops ? "recycle/norm/" : "");
   }
 }
 

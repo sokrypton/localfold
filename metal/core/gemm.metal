@@ -93,9 +93,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   for (int a = 0; a < FR; ++a)
     _Pragma("clang loop unroll(full)")
     for (int b = 0; b < FC; ++b) acc[a][b] = ACC(0);
-  // (vector staging: the host's word, or for a pointer array - whose pointers the host cannot see - the leading dimensions'
-  // (bit 512) and this entry's own pointers' alignment)
-  const bool vec = (g.biasType & 256) || ((g.biasType & 512) && ((ulong)A % (8 * sizeof(TA))) == 0 && ((ulong)B % (8 * sizeof(TB))) == 0);
+  // (vector staging: the host's word)
+  const bool vec = (g.biasType & 256) != 0;
   // a whole tile (the common case): staged without a bounds check an element (6% of a K-256 projection's time)
   const bool whole = vec && j0 + TR <= g.n && i0 + TC_ <= g.m && g.k % BK == 0;
   for (int k0 = 0; k0 < g.k; k0 += BK) {
@@ -255,8 +254,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             float v = g.alpha * (float)e[t]; \
             if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col]; \
             if (g.epilogue & 2) v = max(v, 0.f); \
-            if constexpr (metal::is_same_v<TC, half>) o[t] = (half)clamp(v, -65504.f, 65504.f); \
-            else o[t] = (TC)v; \
+            if constexpr (metal::is_same_v<TC, half>) { const half hv = (half)clamp(v, -65504.f, 65504.f); o[t] = hv; if constexpr ((EP & 128) != 0) e[t] = (float)hv; } \
+            else { o[t] = (TC)v; if constexpr ((EP & 128) != 0) e[t] = v; } \
           } \
           simdgroup_store(om, D + (ulong)(j) * g.ldd + (i), (ulong)g.ldd); \
         } \
@@ -305,12 +304,13 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f)); \
       } \
       if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) e[t] = v; \
-      else if constexpr (metal::is_same_v<TC, half>) o[t] = (half)clamp(v, -65504.f, 65504.f); \
-      else o[t] = (TC)v; \
+      else if constexpr (metal::is_same_v<TC, half>) { const half hv = (half)clamp(v, -65504.f, 65504.f); o[t] = hv; if constexpr ((EP & 128) != 0) e[t] = (float)hv; } \
+      else { o[t] = (TC)v; if constexpr ((EP & 128) != 0) e[t] = v; } \
     } \
     if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) simdgroup_store(acc[a][b], D + (ulong)(j) * g.ldd + (i), (ulong)g.ldd); \
     else simdgroup_store(om, D + (ulong)(j) * g.ldd + (i), (ulong)g.ldd); \
   } while (0)
+  bool stored8x8 = false;
   if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
     if (j0 + TR <= g.n && i0 + TC_ <= g.m) {
       if (g.epilogue & 128) {
@@ -326,10 +326,12 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         for (int a = 0; a < FR; ++a)
           _Pragma("clang loop unroll(full)")
           for (int b = 0; b < FC; ++b) LF_STORE_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
-        return;
+        if constexpr ((EP & 128) == 0) return;
+        stored8x8 = true;
       }
     }
   }
+  if (!stored8x8) {
   _Pragma("clang loop unroll(full)")
   for (int a = 0; a < FR; ++a)
     _Pragma("clang loop unroll(full)")
@@ -419,15 +421,18 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             const float cv = (g.biasType & 512) ? ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc] : lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
             const float b128 = ((device const float*)g.bias)[ic & 127];
             const float s = 1e-3f + ((device const float*)g.aux)[(uint)jr * ((uint)g.m >> 7) + ((uint)ic >> 7)];
-            lf_st(D, (ulong)ic + (ulong)jr * g.ldd, cv + (b128 + v) / s);
+            v = cv + (b128 + v) / s;
+            lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
+            if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
             continue;
           }
         }
         const float cv = (g.biasType & 512) ? ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc] : lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc);
         if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
           if (g.epilogue & 4) v += ((device const float*)g.bias)[ic];      // (the gate's bias, f32: AF2's)
-          v = (float)((device const half*)g.aux)[(ulong)ic + (ulong)jr * g.ldaux] * (1.f / (1.f + exp(-v)));
-          lf_st(D, (ulong)ic + (ulong)jr * g.ldd, cv + v);
+          v = cv + (float)((device const half*)g.aux)[(ulong)ic + (ulong)jr * g.ldaux] * (1.f / (1.f + exp(-v)));
+          lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
+          if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
           continue;
         }
         if (g.beta != 0.f) v += g.beta * cv;
@@ -438,8 +443,79 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (g.epilogue & 2) v = max(v, 0.f);
         if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
         lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
+        if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
       }
     }
+  }
+  if constexpr ((EP & 128) != 0) {
+    if (g.lnOut) {
+      threadgroup float* part = (threadgroup float*)tgm;
+      const bool leader = ((lane & 9) == 0);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        float s = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& e = acc[a][b].thread_elements();
+          s += (float)e[0] + (float)e[1];
+        }
+        s += simd_shuffle_xor(s, 1);
+        s += simd_shuffle_xor(s, 8);
+        if (leader) part[(sg & 1) * 64 + sr + a * 8 + sm] = s;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float mean[FR];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const int r = sr + a * 8 + sm;
+        mean[a] = (part[r] + part[64 + r]) * (1.f / (float)TC_);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const float m = mean[a];
+        float v = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& e = acc[a][b].thread_elements();
+          const float d0 = (float)e[0] - m, d1 = (float)e[1] - m;
+          v += d0 * d0 + d1 * d1;
+        }
+        v += simd_shuffle_xor(v, 1);
+        v += simd_shuffle_xor(v, 8);
+        if (leader) part[(sg & 1) * 64 + sr + a * 8 + sm] = v;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      device half* lnOut = (device half*)g.lnOut;
+      device const float* lnSc = (device const float*)g.lnScale;
+      device const float* lnOf = (device const float*)g.lnOffset;
+      device half* lnOut2 = (device half*)g.lnOut2;
+      device const float* lnSc2 = (device const float*)g.lnScale2;
+      device const float* lnOf2 = (device const float*)g.lnOffset2;
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const int r = sr + a * 8 + sm, jr = j0 + r;
+        if (jr >= g.n) continue;
+        const float m = mean[a];
+        const float inv = rsqrt((part[r] + part[64 + r]) * (1.f / (float)TC_) + g.lnEps);
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& e = acc[a][b].thread_elements();
+          const int col0 = sc + b * 8 + sn, ic0 = i0 + col0, sc0 = (g.epilogue & 8192) ? (col0 & 127) : col0;
+          const float n0 = ((float)e[0] - m) * inv, n1 = ((float)e[1] - m) * inv;
+          const float s0 = lnSc[sc0], s1 = lnSc[sc0 + 1];
+          const float o0 = lnOf ? lnOf[sc0] : 0.f, o1 = lnOf ? lnOf[sc0 + 1] : 0.f;
+          *(device half2*)(lnOut + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * s0 + o0), (half)(n1 * s1 + o1));
+          if (lnOut2) {
+            const float t0 = lnSc2[sc0], t1 = lnSc2[sc0 + 1];
+            const float p0 = lnOf2 ? lnOf2[sc0] : 0.f, p1 = lnOf2 ? lnOf2[sc0 + 1] : 0.f;
+            *(device half2*)(lnOut2 + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * t0 + p0), (half)(n1 * t1 + p1));
+          }
+        }
+      }
+    }
+  }
 }
 // (instantiated on first use by the runtime: lf_gemm<TA, TB, TC, TR, TC_, TRA, TRB>, host name lf_gemm_...)
 

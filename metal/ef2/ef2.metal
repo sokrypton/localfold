@@ -922,14 +922,17 @@ kernel void ef2_distance_embed(constant DistEmbedArgs& a [[buffer(0)]], uint3 tg
   for (uint e0 = 0; e0 < a.nEdges; e0 += 32) bucket += simd_sum((e0 + lane < a.nEdges && d > a.edges[e0 + lane]) ? 1 : 0);
   device float4* row = (device float4*)(a.z + (ulong)ij * a.C);
   device const float4* tb = (device const float4*)(a.table + (ulong)bucket * a.C);
-  if (a.zh && a.C == 256) {
+  if ((a.zh || a.lnOut) && a.C == 256) {
     float4 v0 = row[lane] + tb[lane], v1 = row[lane + 32] + tb[lane + 32];
     row[lane] = v0; row[lane + 32] = v1;
-    half4 h0 = half4(v0), h1 = half4(v1);
-    device half4* rh = (device half4*)(a.zh + (ulong)ij * 256);
-    rh[lane] = h0; rh[lane + 32] = h1;
+    float4 f0 = v0, f1 = v1;
+    if (a.zh) {
+      half4 h0 = half4(v0), h1 = half4(v1);
+      device half4* rh = (device half4*)(a.zh + (ulong)ij * 256);
+      rh[lane] = h0; rh[lane + 32] = h1;
+      f0 = float4(h0); f1 = float4(h1);
+    }
     if (a.lnOut) {
-      float4 f0 = float4(h0), f1 = float4(h1);
       float mean = simd_sum(f0.x + f0.y + f0.z + f0.w + f1.x + f1.y + f1.z + f1.w) * (1.f / 256.f);
       float4 d0 = f0 - mean, d1 = f1 - mean;
       float inv = rsqrt(simd_sum(dot(d0, d0) + dot(d1, d1)) * (1.f / 256.f) + 1e-5f);
