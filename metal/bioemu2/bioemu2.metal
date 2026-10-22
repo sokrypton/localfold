@@ -854,6 +854,23 @@ kernel void be2_pwa_softmax(LF_ARGS(Be2PwaSoftmaxArgs)) {
 }
 kernel void be2_pwa_apply(LF_ARGS(Be2PwaApplyArgs)) {
   ulong t = LF_INDEX;
+  if (((a.Ch | a.ldv) & 3) == 0) {
+    const uint Ch4 = a.Ch >> 2, W4 = a.H * Ch4;
+    if (t >= a.S * a.T * W4) return;
+    BE2_SPLIT(t, Ch4, r, d4);
+    BE2_SPLIT(r, a.H, r2, h);
+    BE2_SPLIT(r2, a.T, s, i);
+    device const float* w = a.w + ((ulong)h * a.T + i) * a.T;
+    const uint hd = (h * Ch4 + d4) << 2;
+    device const float* v = a.v + (ulong)s * a.T * a.ldv + hd;
+    float4 acc(0.f);
+    for (uint j = 0; j < a.T; ++j) acc += w[j] * *(device const float4*)(v + (ulong)j * a.ldv);
+    const float4 gv = *(device const float4*)(a.g + ((ulong)s * a.T + i) * a.ldv + hd);
+    const float4 res = acc * float4(lf_sigmoid(gv.x), lf_sigmoid(gv.y), lf_sigmoid(gv.z), lf_sigmoid(gv.w));
+    if (a.oh) ((device half4*)a.oh)[t] = half4(res);
+    else ((device float4*)a.o)[t] = res;
+    return;
+  }
   const uint W = a.H * a.Ch;
   if (t >= a.S * a.T * W) return;
   BE2_SPLIT(t, a.Ch, r, d);
@@ -864,7 +881,9 @@ kernel void be2_pwa_apply(LF_ARGS(Be2PwaApplyArgs)) {
   device const float* v = a.v + (ulong)s * a.T * a.ldv + hd;
   float acc = 0;
   for (uint j = 0; j < a.T; ++j) acc += w[j] * v[(ulong)j * a.ldv];
-  a.o[t] = acc * lf_sigmoid(a.g[((ulong)s * a.T + i) * a.ldv + hd]);
+  const float res = acc * lf_sigmoid(a.g[((ulong)s * a.T + i) * a.ldv + hd]);
+  if (a.oh) a.oh[t] = (half)res;
+  else a.o[t] = res;
 }
 // OuterProductMeanVanilla's pack: proj [R = S T][2 Co] -> a, b [R][Co] (the first half and the second)
 kernel void be2_opm_pack(LF_ARGS(Be2OpmPackArgs)) {
@@ -882,7 +901,33 @@ kernel void be2_opm_permute(LF_ARGS(Be2OpmPermuteArgs)) {
   BE2_SPLIT(t, CC4, ij, cd4);
   BE2_SPLIT(ij, a.T, i, j);
   BE2_SPLIT(cd4, C4, c, d4);
-  ((device float4*)a.y)[t] = *(device const float4*)(a.x + ((ulong)i * a.Co + c) * ((ulong)a.T * a.Co) + (ulong)j * a.Co + (d4 << 2)) * a.inv;
+  const float4 v = *(device const float4*)(a.x + ((ulong)i * a.Co + c) * ((ulong)a.T * a.Co) + (ulong)j * a.Co + (d4 << 2)) * a.inv;
+  if (a.yh) ((device half4*)a.yh)[t] = half4(v);
+  else ((device float4*)a.y)[t] = v;
+}
+// a simdgroup per pair (i, j) at Co = 32 and shallow S (<= 8): yh[(i, j)][(c, d)] = (sum_s a[s, i, c] b[s, j, d]) * inv
+kernel void be2_opm_direct_h(LF_ARGS(Be2OpmDirectHArgs)) {
+  const ulong ij = BE2_ROW; const uint lane = BE2_LANE;
+  if (ij >= (ulong)a.T * a.T) return;
+  const uint i = lf_udiv((uint)ij, a.T), j = (uint)ij - i * a.T;
+  device half* out = a.yh + ij * 1024 + lane;
+  if (a.S == 1) {
+    const float av0 = a.proj[(ulong)i * 64 + lane];
+    const float bv0 = a.proj[(ulong)j * 64 + 32 + lane];
+    _Pragma("clang loop unroll(full)")
+    for (uint c = 0; c < 32; ++c) out[c * 32] = (half)((simd_broadcast(av0, c) * bv0) * a.inv);
+    return;
+  }
+  float av[8], bv[8];
+  for (uint s = 0; s < a.S; ++s) {
+    av[s] = a.proj[((ulong)s * a.T + i) * 64 + lane];
+    bv[s] = a.proj[((ulong)s * a.T + j) * 64 + 32 + lane];
+  }
+  for (uint c = 0; c < 32; ++c) {
+    float acc = 0.f;
+    for (uint s = 0; s < a.S; ++s) acc = fma(simd_broadcast(av[s], c), bv[s], acc);
+    out[c * 32] = (half)(acc * a.inv);
+  }
 }
 kernel void be2_symmetrise(LF_ARGS(Be2SymmetriseArgs)) {
   ulong t = LF_INDEX;

@@ -88,8 +88,10 @@ static void templateEmbedding(Trunk& t) {
       lin(dense, P + "aProjection", act, pairs, width, Ct, 1.f);
     } else {
       run1d("af3_onehot", (size_t)n * 31, OnehotArgs{Ib(S + "aatype"), oh, (uint)n, 31});
-      lin(oh, P + "templatePairEmbedding2", row, n, 31, Ct);
-      lin(oh, P + "templatePairEmbedding3", col, n, 31, Ct);
+      half* ohh = scratch<half>("tmpl.ohh", (size_t)n * 31);
+      toHalf(oh, ohh, (size_t)n * 31);
+      lin(ohh, P + "templatePairEmbedding2", row, n, 31, Ct);
+      lin(ohh, P + "templatePairEmbedding3", col, n, 31, Ct);
       run1d("af3_add_row_col", pairs * Ct, AddRowColArgs{act, row, col, (uint)n, (uint)Ct});
       if (M.has(S + "distogramBin")) {
         int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
@@ -124,14 +126,17 @@ static void embed(Trunk& t) {
   int n = t.n, C = t.C; size_t pairs = (size_t)n * n;
   const std::string E = "trunk.embedder.";
   float* left = scratch<float>("emb.left", (size_t)n * C); float* right = scratch<float>("emb.right", (size_t)n * C);
-  const float* pairSource = t.targetFeat; int sourceWidth = t.F;
+  half* tfh = scratch<half>("emb.tfh", (size_t)n * t.F);
+  toHalf(t.targetFeat, tfh, (size_t)n * t.F);
   if (flag("trunk.dialect.pairInitFromSingle")) {        // OpenDDE: the pair from s_init
     float* sInit = scratch<float>("emb.sInit", (size_t)n * t.Cs);
-    lin(t.targetFeat, E + "singleActivations", sInit, n, t.F, t.Cs);
-    pairSource = sInit; sourceWidth = t.Cs;
+    lin(tfh, E + "singleActivations", sInit, n, t.F, t.Cs);
+    lin(sInit, E + "leftSingle", left, n, t.Cs, C);
+    lin(sInit, E + "rightSingle", right, n, t.Cs, C);
+  } else {
+    lin(tfh, E + "leftSingle", left, n, t.F, C);
+    lin(tfh, E + "rightSingle", right, n, t.F, C);
   }
-  lin(pairSource, E + "leftSingle", left, n, sourceWidth, C);
-  lin(pairSource, E + "rightSingle", right, n, sourceWidth, C);
   // pair = left[i] + right[j] + prevEmbedding(LN(prev pair)) - not zero on the first pass. chai-1's first pass recycles
   // z_init itself (left + right + its relative encoding)
   const bool chai = flag("trunk.dialect.recycleFromInit");
@@ -169,7 +174,7 @@ static void embed(Trunk& t) {
   templateEmbedding(t);
   if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
   auto buildSingle = [&]() {      // the single: target_feat projected, plus the recycled single's (chai's first: s_init's)
-    lin(t.targetFeat, E + "singleActivations", t.single, n, t.F, t.Cs);
+    lin(tfh, E + "singleActivations", t.single, n, t.F, t.Cs);
     half* sln = scratch<half>("emb.prevsln", (size_t)n * t.Cs);
     ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
     lin(sln, E + "prevSingleEmbedding", t.single, n, t.Cs, t.Cs, 1.f);
@@ -198,7 +203,7 @@ static void embed(Trunk& t) {
   }
   // the MSA: its features projected, plus the target's projection broadcast over the rows
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
-  lin(t.targetFeat, E + "extraMsaTargetFeat", fromTarget, n, t.F, t.Cm);
+  lin(tfh, E + "extraMsaTargetFeat", fromTarget, n, t.F, t.Cm);
   size_t rows = (size_t)t.S * n;
   int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
   if (msaWidth != 34 && msaWidth != 35) die("msa feature width %d", msaWidth);

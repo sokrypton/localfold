@@ -206,6 +206,7 @@ void transformerWeights();     // the token transformer's folded conditioning we
 // compacted - the sources and their derived copies were both held otherwise (~0.6 GB of AF3's)
 void prepareWeights();
 bool derivedSource(const std::string& name);     // a weight read only through a derived form: its own allocation at load
+bool halfWeight(const std::string& name, size_t elements);
 void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync between them)
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)

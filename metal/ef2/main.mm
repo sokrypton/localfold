@@ -227,8 +227,11 @@ int foldMain(int argc, char** argv) {
   // the weights, decoded on the device: every large tensor straight to float16, but the confidence head's own
   // projections, which stay float32
   auto asHalf = [](const std::string& n, size_t elements) {
+    if (n == "c/embed/weights" || n == "f/featuriser/relPos" || n == "f/msaEncoder/embed" ||
+        n.find("/outerProductMean/output") != std::string::npos)
+      return false;
     if (n.rfind("f/confidence/", 0) == 0 && n.rfind("f/confidence/blocks/", 0) != 0) return false;
-    return elements >= 65536;
+    return elements >= 2048;
   };
   auto isSwiglu = [](const std::string& n) {
     auto ends = [&](const char* s) { size_t k = strlen(s); return n.size() >= k && !n.compare(n.size() - k, k, s); };

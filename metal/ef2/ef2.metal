@@ -766,11 +766,16 @@ kernel void ef2_scale_copies(LF_ARGS(ScaleCopiesArgs)) {    // out[j] = x * scal
       }
       return;
     }
-    if (a.C == 768) {
+      if (a.C == 768) {
       device const float4* xr = (device const float4*)(a.x + (ulong)row * 768);
       float4 xv[6]; float s = 0;
       _Pragma("clang loop unroll(full)")
       for (int k = 0; k < 6; ++k) { const float4 x = xr[lane + 32 * k]; xv[k] = x; s += x.x + x.y + x.z + x.w; }
+      if (a.offsets) {
+        device half4* raw4 = (device half4*)(a.outH + ((ulong)(a.n + 1) * a.rows + row) * 768);
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 6; ++k) { const uint idx = lane + 32 * k; raw4[idx] = half4(xv[k]); }
+      }
       const float mean = simd_sum(s) * (1.f / 768.f);
       float v = 0;
       _Pragma("clang loop unroll(full)")

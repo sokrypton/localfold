@@ -55,7 +55,7 @@ void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit, const T
 }
 
 // ---------------------------------------------------------------- the MSA module
-static const half* pwaMgWeight(const std::string& p, int Cm, int HCh) {
+const half* pwaMgWeight(const std::string& p, int Cm, int HCh) {
   return M.derived<half>("pwamg:" + p, (size_t)2 * HCh * Cm, [&](half* out) {
     run1d("be2_stack", ((size_t)2 * HCh * Cm) >> 2, Be2StackArgs{M.h("w/" + p + "proj_m/weight"), M.h("w/" + p + "proj_g/weight"), out,
                                                                  (u64)HCh * Cm, (u64)HCh * Cm});
@@ -102,9 +102,17 @@ static void pairWeightedAveraging(float* m, const float* z, int l) {
   const size_t groups = ((size_t)Hh * T + 7) / 8;
   run("be2_pwa_softmax", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
       Be2PwaSoftmaxArgs{b, w, (uint)T, (uint)Hh});
-  float* o = scratch<float>("be2.pwa.o", R * HCh);
-  run1d("be2_pwa_apply", R * HCh, Be2PwaApplyArgs{w, v, g, o, (u64)S, (uint)T, (uint)Hh, (uint)Ch, (uint)ldv});
-  linT(o, p + "proj_o/weight", m, R, HCh, Cm, 1.f);
+  const size_t pwaItems = ((Ch | ldv) & 3) == 0 ? (R * HCh) >> 2 : R * HCh;
+  if (HALF) {
+    half* oh = scratch<half>("be2.pwa.oh", R * HCh);
+    run1d("be2_pwa_apply", pwaItems, Be2PwaApplyArgs{w, v, g, nullptr, oh, (u64)S, (uint)T, (uint)Hh, (uint)Ch, (uint)ldv});
+    Gemm G{}; G.X = oh; G.tx = F16; G.W = M.h("w/" + p + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = m; G.ty = F32;
+    G.rows = R; G.in = HCh; G.out = Cm; G.beta = 1.f; G.label = "pwa proj_o"; gemm(G);
+  } else {
+    float* o = scratch<float>("be2.pwa.o", R * HCh);
+    run1d("be2_pwa_apply", pwaItems, Be2PwaApplyArgs{w, v, g, o, nullptr, (u64)S, (uint)T, (uint)Hh, (uint)Ch, (uint)ldv});
+    linT(o, p + "proj_o/weight", m, R, HCh, Cm, 1.f);
+  }
 }
 // OuterProductMeanVanilla: the mean is over VALID ROWS (rows with any live entry), not per pair; a block of i at a time
 static void outerProductMean(const float* m, float* z, int l) {
@@ -123,26 +131,39 @@ static void outerProductMean(const float* m, float* z, int l) {
     layerNorm(m, mn, R, Cm, Wf(p + "norm/weight"), Wf(p + "norm/bias"));
     linT(mn, p + "proj_ab/weight", proj, R, Cm, 2 * Co);
   }
+  const size_t TC = (size_t)T * Co;
+  const int bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)32 << 20) / (4 * Co * TC)));
+  const std::string next = "msa/" + num(l) + "/triangleMultiplicationOutgoing/leftNormInput";
+  const float* nextSc = Wf(next + "Scale"); const float* nextOf = Wf(next + "Offset");
+  if (HALF && bi == T && Co == 32 && S >= 1 && S <= 8) {
+    const size_t P = (size_t)T * T, groups = (P + 7) / 8;
+    half* yh = scratch<half>("be2.opm.yh", P * 1024);
+    run("be2_opm_direct_h", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
+        Be2OpmDirectHArgs{proj, yh, (uint)S, (uint)T, 1.f / (float)D_.nValidRows, 0});
+    half* lnOut = lnTarget(P, C);
+    Gemm o{}; o.X = yh; o.tx = F16; o.W = M.h("w/" + p + "proj_o/weight"); o.tw = F16; o.transW = true;
+    o.Y = z; o.ty = F32; o.rows = P; o.in = 1024; o.out = C; o.beta = 1.f;
+    o.bias = Wf(p + "proj_o/bias"); o.lnOut = lnOut; o.lnScale = nextSc; o.lnOffset = nextOf;
+    o.label = "opm proj_o";
+    if (gemm(o)) recordEmitted(z, nextSc, nextOf, lnOut);
+    return;
+  }
   float* a = scratch<float>("be2.opm.a", R * Co); float* b = scratch<float>("be2.opm.b", R * Co);
   be2Run1d("be2_opm_pack", R * 2 * Co, Be2OpmPackArgs{proj, a, b, (u64)R, (uint)Co, 0});
   // a block of i at a time: x [(i, c)][(j, d)] is bi Co x T Co floats (32 MB of it)
-  const size_t TC = (size_t)T * Co;
-  const int bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)32 << 20) / (4 * Co * TC)));
   float* x = scratch<float>("be2.opm.x", (size_t)bi * Co * TC);
-  float* y = scratch<float>("be2.opm.y", (size_t)bi * T * Co * Co);
+  float* y = (HALF && bi == T) ? nullptr : scratch<float>("be2.opm.y", (size_t)bi * T * Co * Co);
   for (int i0 = 0; i0 < T; i0 += bi) {
     const int n = std::min(bi, T - i0);
     // x = a[:, block]^T b: a stored [S][T Co] is the transposed X, b [S][T Co] the weight (in = S rows, out = T Co)
     Gemm g{}; g.X = a + (size_t)i0 * Co; g.tx = F32; g.transX = true; g.ldx = (int)TC; g.W = b; g.tw = F32; g.ldw = (int)TC;
     g.Y = x; g.ty = F32; g.rows = (size_t)n * Co; g.in = S; g.out = (int)TC; g.label = "outer product";
     gemm(g);
-    be2Run1d("be2_opm_permute", ((size_t)n * T * Co * Co) >> 2, Be2OpmPermuteArgs{x, y, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
     float* zr = z + (size_t)i0 * T * C;
-    const std::string next = "msa/" + num(l) + "/triangleMultiplicationOutgoing/leftNormInput";
-    const float* nextSc = Wf(next + "Scale"); const float* nextOf = Wf(next + "Offset");
     if (HALF && n == T) {
       half* yh = scratch<half>("be2.opm.yh", (size_t)n * T * Co * Co);
-      toHalf(y, yh, (size_t)n * T * Co * Co);
+      be2Run1d("be2_opm_permute", ((size_t)n * T * Co * Co) >> 2,
+               Be2OpmPermuteArgs{x, nullptr, yh, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
       half* lnOut = lnTarget((size_t)T * T, C);
       Gemm o{}; o.X = yh; o.tx = F16; o.W = M.h("w/" + p + "proj_o/weight"); o.tw = F16; o.transW = true;
       o.Y = zr; o.ty = F32; o.rows = (size_t)n * T; o.in = Co * Co; o.out = C; o.beta = 1.f;
@@ -150,6 +171,8 @@ static void outerProductMean(const float* m, float* z, int l) {
       o.label = "opm proj_o";
       if (gemm(o)) recordEmitted(z, nextSc, nextOf, lnOut);
     } else {
+      be2Run1d("be2_opm_permute", ((size_t)n * T * Co * Co) >> 2,
+               Be2OpmPermuteArgs{x, y, nullptr, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
       linT(y, p + "proj_o/weight", zr, (size_t)n * T, Co * Co, C, 1.f, 0, 0, false, Wf(p + "proj_o/bias"));
     }
   }

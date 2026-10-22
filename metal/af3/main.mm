@@ -355,8 +355,7 @@ int foldMain(int argc, char** argv) {
   {   // the bundle read as published, through the family's weight walk
     lf::weights::Shapes S; S.shape = Model::bundleShapes(bundleDir);
     std::vector<std::string> lines = lf::weights::af3WeightLines(family, S);
-    M.loadBundleWalk(bundleDir, lines, "", [](const std::string&, size_t elements) { return elements >= 16384; },
-                     derivedSource);
+    M.loadBundleWalk(bundleDir, lines, "", halfWeight, derivedSource);
   }
   if (!esmBundle.empty()) M.loadBlobResident(esmBundle, "e", "esm2/blocks/");   // (its matrices resident as int8 codes)
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");      // (chai-1's adaptive LayerNorm: its folded weights are built now)

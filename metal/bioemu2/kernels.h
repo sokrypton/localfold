@@ -81,11 +81,12 @@ struct Be2MsaEmbedArgs { DP(float) m; CP(int) msa; CP(int) hasDel; CP(float) del
 // softmax over j of the [pairs][H] bias, heads first [H][T][T]; a simdgroup a row
 struct Be2PwaSoftmaxArgs { CP(float) b; DP(float) w; uint T, H; };
 // o[s][i][h][:] = sigmoid(g[s][i][h][:]) sum_j w[h][i][j] v[s][j][h][:]
-struct Be2PwaApplyArgs { CP(float) w; CP(float) v; CP(float) g; DP(float) o; u64 S; uint T, H, Ch, ldv; };
+struct Be2PwaApplyArgs { CP(float) w; CP(float) v; CP(float) g; DP(float) o; DP(half) oh; u64 S; uint T, H, Ch, ldv; };
 // the outer product mean: proj [S][T][2 Co] packed into a, b [S][T Co] (its halves); then a GEMM over the rows gives
 // x [(i, c)][(j, d)] for a block of i, permuted into y [(i, j)][(c, d)] / n
 struct Be2OpmPackArgs { CP(float) proj; DP(float) a; DP(float) b; u64 R; uint Co, pad0; };
-struct Be2OpmPermuteArgs { CP(float) x; DP(float) y; uint bi, T, Co; float inv; };
+struct Be2OpmPermuteArgs { CP(float) x; DP(float) y; DP(half) yh; uint bi, T, Co; float inv; };
+struct Be2OpmDirectHArgs { CP(float) proj; DP(half) yh; uint S, T; float inv, pad0; };
 struct Be2SymmetriseArgs { CP(float) z; DP(float) zs; uint T, C; };
 struct Be2ContactArgs { CP(float) logits; DP(float) out; u64 pairs; uint bins, near; };
 struct Be2TokenBiasArgs { CP(float) proj; DP(float) out; uint T, H; DP(half) outh; float mul; uint layers; };

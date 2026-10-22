@@ -12,6 +12,15 @@ bool derivedSource(const std::string& name) {
     if (ends(tail)) return true;
   return false;
 }
+bool halfWeight(const std::string& name, size_t elements) {
+  if (elements >= 16384 || derivedSource(name)) return true;
+  auto ends = [&](const char* tail) { size_t n = strlen(tail); return name.size() >= n && !name.compare(name.size() - n, n, tail); };
+  for (const char* tail : {".pairBiasProjection", ".singlePairLogitsProjection", ".gatingLinear", ".transition2",
+                           ".Transition2", ".ffwTransition2", ".pairLogits", ".pairLogitsProjection"})
+    if (ends(tail)) return true;
+  if (!name.rfind("trunk.", 0) && ends(".outputProjection")) return true;
+  return false;
+}
 static void retire(std::initializer_list<std::string> names) {
   for (auto& n : names) M.retire(n);
 }

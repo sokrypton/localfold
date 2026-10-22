@@ -252,9 +252,11 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
   half* snScaledH = nullptr;
   float* snScaledF = nullptr;
   half* snStep = nullptr;
+  half* snRaw = nullptr;
   if (HALF_GEMM && Ct == 768) {
-    snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 1) * KT * Ct);
+    snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 2) * KT * Ct);
     snStep = snScaledH + (size_t)n * KT * Ct;
+    snRaw = snScaledH + (size_t)(n + 1) * KT * Ct;
     run("ef2_scale_copies", grid1d((KT + 7) / 8, 1), 256,
         ScaleCopiesArgs{single, d.scales, nullptr, snScaledH, (uint)KT, (uint)Ct, (uint)n, 1, F("diffusion/stepNorm/offset")});
   } else {
@@ -267,14 +269,39 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
     snStep = scratch<half>("dn.sn", KT * Ct);
     layerNorm(single, snStep, KT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   }
-  Gemm g{};
-  if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = snScaledF; g.half = true; }
-  g.sx = (int64_t)KT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
-  g.Y = G; g.ldy = ld; g.sy = 2 * Ct; g.rows = KT; g.in = Ct; g.out = 2 * Ct; g.batch = n; g.label = "adaLN projections";
-  gemm(g);
-  Gemm o{}; o.X = single; o.W = outGateWeights(nb, Ct); o.tw = F16; o.half = true; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
-  o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
-  gemm(o);
+  if (HALF_GEMM && snRaw) {
+    uint64_t* ptrs = scratch<uint64_t>("dn.adaptrs", 9 * (size_t)n);
+    std::vector<uint64_t> hp(9 * (size_t)n);
+    for (int b = 0; b < nb; ++b)
+      for (int k = 0; k < 2; ++k) {
+        const int j = 2 * b + k;
+        const std::string P = "diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/");
+        hp[2 * j] = (uint64_t)Fh(P + "adaln/gateWeights");
+        hp[2 * j + 1] = (uint64_t)Fh(P + "adaln/shiftWeights");
+        hp[2 * n + 2 * j] = hp[2 * n + 2 * j + 1] = (uint64_t)(snScaledH + (size_t)j * KT * Ct);
+        hp[4 * n + 2 * j] = (uint64_t)(G + (size_t)(2 * j) * Ct);
+        hp[4 * n + 2 * j + 1] = (uint64_t)(G + (size_t)(2 * j + 1) * Ct);
+        hp[6 * n + j] = (uint64_t)Fh(P + "outGateWeights");
+        hp[7 * n + j] = (uint64_t)snRaw;
+        hp[8 * n + j] = (uint64_t)(G + (size_t)(4 * nb + j) * Ct);
+      }
+    upload(ptrs, hp.data(), hp.size() * 8);
+    Gemm g{}; g.X = ptrs + 2 * n; g.tx = F16; g.W = ptrs; g.tw = F16; g.Y = ptrs + 4 * n; g.ldy = ld;
+    g.rows = KT; g.in = Ct; g.out = Ct; g.batch = 2 * n; g.ptrs = true; g.label = "adaLN projections";
+    gemm(g);
+    Gemm o{}; o.X = ptrs + 7 * n; o.tx = F16; o.W = ptrs + 6 * n; o.tw = F16; o.Y = ptrs + 8 * n; o.ldy = ld;
+    o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = Ct; o.batch = n; o.ptrs = true; o.label = "out gates";
+    gemm(o);
+  } else {
+    Gemm g{};
+    if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = snScaledF; g.half = true; }
+    g.sx = (int64_t)KT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
+    g.Y = G; g.ldy = ld; g.sy = 2 * Ct; g.rows = KT; g.in = Ct; g.out = 2 * Ct; g.batch = n; g.label = "adaLN projections";
+    gemm(g);
+    Gemm o{}; o.X = single; o.W = outGateWeights(nb, Ct); o.tw = F16; o.half = true; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
+    o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
+    gemm(o);
+  }
   lin(snStep, "f/diffusion/singleToToken", sTok, KT, Ct, Ct);
 }
 // adaLN into half: sigmoid(gate + gateBias) * LN(a) + shift, the projections from G (optionally folding a preceding gated residual into a)
