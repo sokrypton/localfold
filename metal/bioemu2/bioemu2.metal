@@ -994,13 +994,15 @@ kernel void be2_contacts(LF_ARGS(Be2ContactArgs)) {
 kernel void be2_token_bias(LF_ARGS(Be2TokenBiasArgs)) {
   ulong t = LF_INDEX;
   const uint L = max(a.layers, 1u);
-  const ulong P = (ulong)a.T * a.T, per = P * a.H;
+  const uint stride = a.outh ? ((a.T + 63) & ~63u) : a.T;
+  const ulong P = (ulong)a.T * stride, per = P * a.H;
   if (t >= (ulong)L * per) return;
   BE2_SPLIT(t, (uint)per, l, rem);
-  uint h = rem % a.H, ij = rem / a.H;
-  const ulong dst = ((ulong)l * a.H + h) * P + ij;
-  if (a.outh) a.outh[dst] = (half)(a.proj[t] * a.mul);
-  else a.out[dst] = a.proj[t];
+  uint h = rem % a.H, pos = rem / a.H, i = lf_udiv(pos, stride), j = pos - i * stride;
+  const ulong dst = ((ulong)l * a.H + h) * P + pos;
+  if (a.outh) {
+    a.outh[dst] = j < a.T ? (half)(a.proj[(((ulong)l * a.T + i) * a.T + j) * a.H + h] * a.mul) : (half)-INFINITY;
+  } else a.out[dst] = a.proj[t];
 }
 kernel void be2_trigate_weight(LF_ARGS(Be2TriGateWArgs)) {
   ulong t = LF_INDEX;

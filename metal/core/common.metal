@@ -425,19 +425,21 @@ template [[host_name("lf_center_norm_wideh")]] kernel void lf_center_norm_wide_t
 // domain (the query carries scale log2e, the bias is log2-scaled already). A lane holds row sm of each 8 x 8 matrix,
 // columns sn and sn + 1; a row's four lanes differ in lane bits 0 and 3.
 #define LF_UNROLL _Pragma("clang loop unroll(full)")
-template <int D, int KT = 16, int QR = 1>
+template <int D, int KT = 16, int QR = 1, bool NT = false>
 kernel void lf_attention(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                          uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
   constexpr int QB = 32 * QR, LD = D + 8, DF = D / 8, D8 = D / 8, KF = KT / 8;
-  threadgroup half Qs[QB * LD];
-  threadgroup half Ks[KT * LD];
-  threadgroup half Vs[KT * LD];
+  constexpr int SMEM = QB * LD > 2 * KT * LD ? QB * LD : 2 * KT * LD;
+  threadgroup half smem[SMEM];
+  threadgroup half* Qs = smem;
+  threadgroup half* Ks = smem;
+  threadgroup half* Vs = smem + KT * LD;
   const int b = tg.y, h = tg.z, q0 = tg.x * QB, n = a.n, W = a.heads * D;
   device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
   const float qs = a.scale * M_LOG2E_F;
   // the queries (scaled, the query bias added), eight halves a load
-  for (int e = tid; e < QB * D8; e += 128) {
+  LF_UNROLL for (int e = tid; e < QB * D8; e += 128) {
     int qi = e / D8, d = (e - qi * D8) * 8, q = q0 + qi;
     half4 v0 = half4(0), v1 = half4(0);
     if (q < n) {
@@ -464,20 +466,36 @@ kernel void lf_attention(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgr
     const int q = min(q0 + (int)sg * 8 * QR + r * 8 + sm, n - 1);
     brow[r] = a.bias ? a.bias + ((long)h * n + q) * a.biasStride : nullptr;
   }
+  const bool sgActive = q0 + (int)sg * 8 * QR < n;
   for (int k0 = 0; k0 < n; k0 += KT) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = tid; e < KT * D8; e += 128) {
-      int kj = e / D8, d = (e - kj * D8) * 8, k = k0 + kj;
-      half4 k0v = half4(0), k1v = half4(0), v0 = half4(0), v1 = half4(0);
-      if (k < n) {
-        device const half* src = base + (long)k * a.posStride + d;
-        k0v = *(device const half4*)(src + W); k1v = *(device const half4*)(src + W + 4);
-        v0 = *(device const half4*)(src + 2 * W); v1 = *(device const half4*)(src + 2 * W + 4);
+    if constexpr (KT * D8 <= 64) {
+      const int e = (int)tid & 63;
+      if (e < KT * D8) {
+        const int kj = e / D8, d = (e - kj * D8) * 8, k = k0 + kj;
+        half4 v0 = half4(0), v1 = half4(0);
+        if (k < n) {
+          device const half* src = base + (long)k * a.posStride + (tid < 64 ? W : 2 * W) + d;
+          v0 = *(device const half4*)src; v1 = *(device const half4*)(src + 4);
+        }
+        threadgroup half* dst = (tid < 64 ? Ks : Vs) + kj * LD + d;
+        *(threadgroup half4*)dst = v0; *(threadgroup half4*)(dst + 4) = v1;
       }
-      *(threadgroup half4*)(Ks + kj * LD + d) = k0v; *(threadgroup half4*)(Ks + kj * LD + d + 4) = k1v;
-      *(threadgroup half4*)(Vs + kj * LD + d) = v0; *(threadgroup half4*)(Vs + kj * LD + d + 4) = v1;
+    } else {
+      LF_UNROLL for (int e = tid; e < KT * D8; e += 128) {
+        int kj = e / D8, d = (e - kj * D8) * 8, k = k0 + kj;
+        half4 k0v = half4(0), k1v = half4(0), v0 = half4(0), v1 = half4(0);
+        if (k < n) {
+          device const half* src = base + (long)k * a.posStride + d;
+          k0v = *(device const half4*)(src + W); k1v = *(device const half4*)(src + W + 4);
+          v0 = *(device const half4*)(src + 2 * W); v1 = *(device const half4*)(src + 2 * W + 4);
+        }
+        *(threadgroup half4*)(Ks + kj * LD + d) = k0v; *(threadgroup half4*)(Ks + kj * LD + d + 4) = k1v;
+        *(threadgroup half4*)(Vs + kj * LD + d) = v0; *(threadgroup half4*)(Vs + kj * LD + d + 4) = v1;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sgActive) continue;
     simdgroup_float8x8 s[QR][KF];
     LF_UNROLL for (int r = 0; r < QR; ++r) LF_UNROLL for (int j = 0; j < KF; ++j) s[r][j] = simdgroup_float8x8(0);
     LF_UNROLL for (int j = 0; j < KF; ++j)
@@ -486,44 +504,68 @@ kernel void lf_attention(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgr
         simdgroup_load(kt, Ks + (j * 8) * LD + dk * 8, LD, ulong2(0, 0), true);
         LF_UNROLL for (int r = 0; r < QR; ++r) simdgroup_multiply_accumulate(s[r][j], qf[r][dk], kt, s[r][j]);
       }
-    // the bias, the mask and the keys past n; each row's new maximum
-    const bool whole = k0 + KT <= n;
-    float mk[KF][2];
-    LF_UNROLL for (int j = 0; j < KF; ++j)
-      LF_UNROLL for (int t = 0; t < 2; ++t) {
-        int k = k0 + j * 8 + sn + t;
-        float v = 0.f;
-        if (!whole && k >= n) v = -1e30f;
-        else if (a.mask) v = a.mask[bq * a.maskB + (long)k * a.maskK] > 0.f ? 0.f : -1e9f;
-        mk[j][t] = v;
-      }
     simdgroup_half8x8 p[QR][KF];
-    const bool bias2 = (a.biasStride & 1) == 0;     // (the bias's rows padded even: a lane's two in one load)
-    LF_UNROLL for (int r = 0; r < QR; ++r) {
-      float rowMax = -1e30f;
-      LF_UNROLL for (int j = 0; j < KF; ++j) {
-        thread auto& e = s[r][j].thread_elements();
-        const int k = k0 + j * 8 + sn;
-        float2 bv = float2(0.f);
-        if (brow[r]) {
-          if (bias2 && (whole || k + 1 < n)) bv = float2(*(device const half2*)(brow[r] + k));
-          else { bv.x = whole || k < n ? (float)brow[r][k] : 0.f; bv.y = whole || k + 1 < n ? (float)brow[r][k + 1] : 0.f; }
+    if constexpr (NT) {
+      LF_UNROLL for (int r = 0; r < QR; ++r) {
+        float rowMax = -1e30f;
+        LF_UNROLL for (int j = 0; j < KF; ++j) {
+          thread auto& e = s[r][j].thread_elements();
+          const float2 bv = float2(*(device const half2*)(brow[r] + k0 + j * 8 + sn));
+          e[0] += bv.x; e[1] += bv.y;
+          rowMax = max(rowMax, max(e[0], e[1]));
         }
-        e[0] += mk[j][0] + bv.x; e[1] += mk[j][1] + bv.y;
-        rowMax = max(rowMax, max(e[0], e[1]));
+        rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)1));
+        rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)8));
+        float mn = max(m[r], rowMax), corr = fast::exp2(m[r] - mn), sum = 0.f;
+        LF_UNROLL for (int j = 0; j < KF; ++j) {
+          thread auto& e = s[r][j].thread_elements();
+          thread auto& pe = p[r][j].thread_elements();
+          LF_UNROLL for (int t = 0; t < 2; ++t) { float pv = fast::exp2(e[t] - mn); sum += pv; pe[t] = (half)pv; }
+        }
+        sum += simd_shuffle_xor(sum, (ushort)1);
+        sum += simd_shuffle_xor(sum, (ushort)8);
+        l[r] = l[r] * corr + sum; m[r] = mn;
+        LF_UNROLL for (int c = 0; c < DF; ++c) { thread auto& oe = o[r][c].thread_elements(); oe[0] *= corr; oe[1] *= corr; }
       }
-      rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)1));
-      rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)8));
-      float mn = max(m[r], rowMax), corr = exp2(m[r] - mn), sum = 0.f;
-      LF_UNROLL for (int j = 0; j < KF; ++j) {
-        thread auto& e = s[r][j].thread_elements();
-        thread auto& pe = p[r][j].thread_elements();
-        LF_UNROLL for (int t = 0; t < 2; ++t) { float pv = exp2(e[t] - mn); sum += pv; pe[t] = (half)pv; }
+    } else {
+      // the bias, the mask and the keys past n; each row's new maximum
+      const bool whole = k0 + KT <= n;
+      float mk[KF][2];
+      LF_UNROLL for (int j = 0; j < KF; ++j)
+        LF_UNROLL for (int t = 0; t < 2; ++t) {
+          int k = k0 + j * 8 + sn + t;
+          float v = 0.f;
+          if (!whole && k >= n) v = -1e30f;
+          else if (a.mask) v = a.mask[bq * a.maskB + (long)k * a.maskK] > 0.f ? 0.f : -1e9f;
+          mk[j][t] = v;
+        }
+      const bool bias2 = (a.biasStride & 1) == 0;     // (the bias's rows padded even: a lane's two in one load)
+      LF_UNROLL for (int r = 0; r < QR; ++r) {
+        float rowMax = -1e30f;
+        LF_UNROLL for (int j = 0; j < KF; ++j) {
+          thread auto& e = s[r][j].thread_elements();
+          const int k = k0 + j * 8 + sn;
+          float2 bv = float2(0.f);
+          if (brow[r]) {
+            if (bias2 && (whole || k + 1 < n)) bv = float2(*(device const half2*)(brow[r] + k));
+            else { bv.x = whole || k < n ? (float)brow[r][k] : 0.f; bv.y = whole || k + 1 < n ? (float)brow[r][k + 1] : 0.f; }
+          }
+          e[0] += mk[j][0] + bv.x; e[1] += mk[j][1] + bv.y;
+          rowMax = max(rowMax, max(e[0], e[1]));
+        }
+        rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)1));
+        rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)8));
+        float mn = max(m[r], rowMax), corr = fast::exp2(m[r] - mn), sum = 0.f;
+        LF_UNROLL for (int j = 0; j < KF; ++j) {
+          thread auto& e = s[r][j].thread_elements();
+          thread auto& pe = p[r][j].thread_elements();
+          LF_UNROLL for (int t = 0; t < 2; ++t) { float pv = fast::exp2(e[t] - mn); sum += pv; pe[t] = (half)pv; }
+        }
+        sum += simd_shuffle_xor(sum, (ushort)1);
+        sum += simd_shuffle_xor(sum, (ushort)8);
+        l[r] = l[r] * corr + sum; m[r] = mn;
+        LF_UNROLL for (int c = 0; c < DF; ++c) { thread auto& oe = o[r][c].thread_elements(); oe[0] *= corr; oe[1] *= corr; }
       }
-      sum += simd_shuffle_xor(sum, (ushort)1);
-      sum += simd_shuffle_xor(sum, (ushort)8);
-      l[r] = l[r] * corr + sum; m[r] = mn;
-      LF_UNROLL for (int c = 0; c < DF; ++c) { thread auto& oe = o[r][c].thread_elements(); oe[0] *= corr; oe[1] *= corr; }
     }
     LF_UNROLL for (int j = 0; j < KF; ++j)
       LF_UNROLL for (int c = 0; c < DF; ++c) {
@@ -553,3 +595,9 @@ template [[host_name("lf_attention_24")]] kernel void lf_attention<24>(constant 
 template [[host_name("lf_attention_32")]] kernel void lf_attention<32>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_48")]] kernel void lf_attention<48>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_64")]] kernel void lf_attention<64>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_8")]] kernel void lf_attention<8, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_16")]] kernel void lf_attention<16, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_24")]] kernel void lf_attention<24, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_32")]] kernel void lf_attention<32, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_48")]] kernel void lf_attention<48, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_nt_64")]] kernel void lf_attention<64, 16, 1, true>(constant AttnArgs&, uint3, uint, uint, uint);

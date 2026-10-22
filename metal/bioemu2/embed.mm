@@ -79,7 +79,8 @@ static const float* attentionHalf(const CondLayer& L, float* x, int R, int D, co
         Be2WindowAttnHArgs{qkvg, Wf(a + "proj_q_bias"), bias, Iin("atom_pad_mask"), o, (uint)perSample, (uint)L.heads});
   } else {
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = perSample; at.heads = L.heads; at.D = D / L.heads; at.rows = R / perSample;
-    at.scale = 1.f / sqrtf((float)(D / L.heads)); at.bias = biasH; at.biasStride = perSample; at.qBias = Wf(a + "proj_q_bias");
+    at.scale = 1.f / sqrtf((float)(D / L.heads)); at.bias = biasH; at.biasStride = (perSample + 63) & ~63; at.biasPadInf = true;
+    at.qBias = Wf(a + "proj_q_bias");
     // (every token is real here - no token padding - so no key mask; a padded input would need token_pad_mask as float)
     attention(at);
   }

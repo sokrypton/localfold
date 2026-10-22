@@ -350,7 +350,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
     linW(pln, f.w, raw, P, C, heads, 0.f, f.b, 1.f, "pair logits");
   } else lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
   if (extraBias) run1d("af3_add_bias_heads", P * heads, AddBiasHeadsArgs{raw, extraBias, P, (uint)heads, 0});   // (OpenDDE)
-  int stride = round8(n);
+  int stride = (n + 63) / 64 * 64;
   half* bias = biasLayout(raw, "st.bias", n, heads, stride, false);
   half* nrm = scratch<half>("st.nrm", (size_t)n * Cs);
   ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
@@ -363,7 +363,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   linW(nrm, qkvgWeight(A, Cs, Wd, false), qkvg, n, Cs, 4 * Wd, gateBias, "single qkvg");
   half* o = scratch<half>("st.o", (size_t)n * Wd);
   Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = d; at.rows = 1; at.scale = 1.f / sqrtf((float)d);
-  at.bias = bias; at.biasStride = stride; at.qBias = W(A + ".qBias");
+  at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
   lin(o, A + ".outputProjection", single, n, Wd, Cs, 1.f);

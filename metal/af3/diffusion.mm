@@ -227,7 +227,7 @@ static void prepareTransformer(int n) {
   transformerWeights();
   // every block's pair bias, from the (fold-constant) pair conditioning
   size_t pairs = (size_t)n * n;
-  D.stride = round8(n);
+  D.stride = (n + 63) / 64 * 64;
   half* pn = scratch<half>("dt.pn", pairs * Cz);
   ln(D.pairCond, pn, pairs, Cz, T + ".pairInputLayerNormScale", "");
   // (the pair conditioning's last reader: the encoder's and decoder's preparations ran before - given back before the
@@ -356,7 +356,7 @@ static void transformer(float* act, const float* cond, float level) {
     if (noResidual) copy(pre, act, rows * C * 4);
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = Dh; at.rows = NS; at.scale = 1.f / sqrtf((float)Dh);
-    at.bias = D.bias[b]; at.biasStride = D.stride; at.qBias = W(B + ".qBias");
+    at.bias = D.bias[b]; at.biasStride = D.stride; at.biasPadInf = true; at.qBias = W(B + ".qBias");
     if (!D.masks.ones) { at.mask = D.masks.seq; at.maskB = 0; at.maskK = 1; }
     if (hasW(B + ".queryLayerNormScale")) {     // rf3: q (its bias inside) and k normalised per token row
       run("af3_kq_norm", grid1d((rows + 7) / 8, 1), 256,

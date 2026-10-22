@@ -119,8 +119,8 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   auto ab = [](int l) { return SM + "layers/" + num(l) + "/atom_block/transformer_layer/attention/attention_layer/pair_bias_attn/"; };
   auto tb = [](int l) { return SM + "layers/" + num(l) + "/token_block/attention/pair_bias_attn/"; };
   while (hasW(ab(d.layers) + "proj_z/weight")) ++d.layers;
-  const int Ha = dimW(ab(0) + "proj_z/weight", 0), Ht = dimW(tb(0) + "proj_z/weight", 0);
-  const size_t wb = (size_t)N * WK * Ha, tbn = (size_t)Ht * P;
+  const int Ha = dimW(ab(0) + "proj_z/weight", 0), Ht = dimW(tb(0) + "proj_z/weight", 0), Tpad = (T + 63) & ~63;
+  const size_t wb = (size_t)N * WK * Ha, tbn = (size_t)Ht * P, tbnH = (size_t)Ht * T * Tpad;
   d.wbias = allocT<float>(wb * d.layers);
   const float* wbNorm = M.derived<float>("sm.wb.norm", (size_t)d.layers * 16, [&](float* out) {
     for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * 16, Wf(ab(l) + "norm_z/weight"), 64);
@@ -129,7 +129,7 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
     for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * Ha * 16, Wf(ab(l) + "proj_z/weight"), (size_t)Ha * 64);
   });
   windowBias(d.p, wbNorm, wbProj, d.wbias, N, Ha, d.layers);
-  if (HALF) d.tbiasH = allocT<half>(tbn * d.layers); else d.tbias = allocT<float>(tbn * d.layers);
+  if (HALF) d.tbiasH = allocT<half>(tbnH * d.layers); else d.tbias = allocT<float>(tbn * d.layers);
   if (HALF && (C == 128 || C == 256)) {
     const float* tbNorm = M.derived<float>("sm.tb.norm", (size_t)d.layers * C, [&](float* out) {
       for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * C, Wf(tb(l) + "norm_z/weight"), (size_t)C * 4);
@@ -145,15 +145,15 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
     Gemm G{}; G.X = znh; G.tx = F16; G.sx = (int64_t)P * C; G.W = tbProj; G.tw = F16; G.transW = true; G.sw = (int64_t)Ht * C;
     G.Y = proj; G.ty = F32; G.sy = (int64_t)P * Ht; G.rows = P; G.in = C; G.out = Ht; G.batch = d.layers; G.label = "tb proj_z";
     gemm(G);
-    be2Run1d("be2_token_bias", (size_t)d.layers * P * Ht,
+    be2Run1d("be2_token_bias", (size_t)d.layers * tbnH,
              Be2TokenBiasArgs{proj, nullptr, (uint)T, (uint)Ht, d.tbiasH, (float)M_LOG2E, (uint)d.layers});
   } else {
     float* proj = scratch<float>("be2.tb.proj", P * Ht);
     for (int l = 0; l < d.layers; ++l) {
       layerNorm(d.z, zn, P, C, Wf(tb(l) + "norm_z/weight"), nullptr);
       linT(zn, tb(l) + "proj_z/weight", proj, P, C, Ht);
-      run1d("be2_token_bias", P * Ht, Be2TokenBiasArgs{proj, HALF ? nullptr : d.tbias + tbn * l, (uint)T, (uint)Ht,
-                                                        HALF ? d.tbiasH + tbn * l : nullptr, (float)M_LOG2E, 1});
+      run1d("be2_token_bias", HALF ? tbnH : tbn, Be2TokenBiasArgs{proj, HALF ? nullptr : d.tbias + tbn * l, (uint)T, (uint)Ht,
+                                                        HALF ? d.tbiasH + tbnH * l : nullptr, (float)M_LOG2E, 1});
     }
   }
   // the single conditioner's sigma-free half
@@ -540,7 +540,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     float* condT = batchCond ? cg[1] + slot * T * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
     const float* tokTrH = nullptr;
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, d.tbias ? d.tbias + tbn * l : nullptr, T,
-              d.tbiasH ? d.tbiasH + tbn * l : nullptr, pendTokH, pendTokGate, pendTokLdg, HALF ? &tokTrH : nullptr);
+              d.tbiasH ? d.tbiasH + (size_t)Ht * T * ((T + 63) & ~63) * l : nullptr, pendTokH, pendTokGate, pendTokLdg, HALF ? &tokTrH : nullptr);
     pendTokH = nullptr; pendTokGate = nullptr;
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     const std::string cp = L + "coupling/";

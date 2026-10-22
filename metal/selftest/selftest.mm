@@ -501,6 +501,19 @@ int main() {
     auto h = download(dout, (size_t)B * n * W);
     char l[96]; snprintf(l, sizeof l, "B %d n %d H %d D %d%s%s%s", B, n, H, D, withBias ? " bias" : "", withMask ? " mask" : "", strided ? " strided" : "");
     report(l, relRms(ref, std::vector<float>(h.begin(), h.end())), 5e-3);
+    if (withBias && !withMask) {
+      int bs = (n + 63) / 64 * 64;
+      std::vector<half> bhp((size_t)H * n * bs, (half)-INFINITY);
+      for (int h0 = 0; h0 < H; ++h0) for (int q = 0; q < n; ++q) for (int k = 0; k < n; ++k)
+        bhp[((size_t)h0 * n + q) * bs + k] = bh[((size_t)h0 * n + q) * n + k];
+      half* dbp = uploadNew(bhp.data(), bhp.size());
+      Attention AN = A; AN.bias = dbp; AN.biasStride = bs; AN.biasPadInf = true;
+      attention(AN);
+      auto hn = download(dout, (size_t)B * n * W);
+      snprintf(l, sizeof l, "B %d n %d H %d D %d biasPadInf (qBias)", B, n, H, D);
+      report(l, relRms(ref, std::vector<float>(hn.begin(), hn.end())), 5e-3);
+      release(dbp);
+    }
   }
 
   printf("LayerNorm\n");

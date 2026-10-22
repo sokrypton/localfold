@@ -98,9 +98,9 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
   } else {
     for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
   }
-  // each token block's pair bias, [H, T, T] in half (the pair itself is not kept)
-  d.stride = (T + 7) / 8 * 8;
-  const size_t perBias = (size_t)d.heads * T * d.stride;
+  // each token block's pair bias, [H, T, stride] in half (padded to 64 keys with -inf; the pair itself is not kept)
+  d.stride = (T + 63) / 64 * 64;
+  const size_t Ppad = (size_t)T * d.stride, perBias = (size_t)d.heads * Ppad;
   d.biasBuf = allocT<half>((size_t)d.tokenBlocks * perBias);
   for (int b = 0; b < d.tokenBlocks; ++b) d.biases.push_back(d.biasBuf + (size_t)b * perBias);
   if (HALF_GEMM && Cz == 256) {
@@ -119,7 +119,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
       G.label = "pairBiasWeights";
       gemm(G);
     }
-    run1d("ef2_pair_to_heads", (size_t)nb * (H == 16 ? P * 4 : P * H),
+    run1d("ef2_pair_to_heads", (size_t)nb * (H == 16 ? Ppad * 4 : Ppad * H),
           PairToHeadsArgs{pb, d.biasBuf, P, (uint)H, (uint)T, (uint)d.stride, (uint)nb});
   } else {
     half* pn = scratch<half>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
@@ -130,7 +130,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
         layerNorm(pair + p0 * Cz, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
         lin(pn, "f/" + B + "pairBiasWeights", pb + p0 * d.heads, n, Cz, d.heads);
       }
-      run1d("ef2_pair_to_heads", d.heads == 16 ? P * 4 : P * d.heads,
+      run1d("ef2_pair_to_heads", d.heads == 16 ? Ppad * 4 : Ppad * d.heads,
             PairToHeadsArgs{pb, d.biases[b], P, (uint)d.heads, (uint)T, (uint)d.stride, 1});
     }
   }
@@ -345,7 +345,7 @@ static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const
   }
   half* ctx = scratch<half>("tb.ctx", (size_t)T * C);
   Attention at{}; at.qkvg = qkvg; at.out = ctx; at.n = T; at.heads = Hh; at.D = D; at.rows = 1; at.scale = 1.f / sqrtf((float)D);
-  at.bias = d.biases[b]; at.biasStride = d.stride; at.qBias = F(B + "attention/queryBias");
+  at.bias = d.biases[b]; at.biasStride = d.stride; at.biasPadInf = true; at.qBias = F(B + "attention/queryBias");
   attention(at);
   float* o = scratch<float>("tb.o", (size_t)T * C);
   const float* gAtt = G + (size_t)(4 * nb + 2 * b) * C;

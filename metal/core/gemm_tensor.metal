@@ -792,7 +792,7 @@ kernel void lf_attention_tensor2(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
 // NT: the bias is present and padded with -inf past n to a whole key tile (AttnArgs pad bit 1, the host's promise),
 // and no mask: the key tile's logits are S qs + B with no per-element branch - the tail's padding keys come out -inf
 // from the bias alone. The branch (tail || mask) in the element loop cost the tile 12% even where it never fires
-template <int D, int QS, int KT, class MQ, bool NT = false>
+template <int D, int QS, int KT, class MQ, bool NT = false, bool QBIAS = false>
 METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa, device const half* base) {
   using namespace mpp::tensor_ops;
   const int n = a.n, W = a.heads * D;
@@ -825,6 +825,12 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
   // the simdgroup's queries held as the first product's left input, loaded once rather than every key tile (1-2%)
   auto Q = opS.template get_left_input_cooperative_tensor<half, half, float>();
   Q.load(mQ);
+  if constexpr (QBIAS) {
+    device const float* qb = a.qBias + h * D;
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < Q.get_capacity(); ++e)
+      if (Q.is_valid_element(e)) Q[e] = (half)((float)Q[e] + qb[Q.get_multidimensional_index(e)[0]]);
+  }
   for (int k0 = 0; k0 < n; k0 += KT) {
     auto mK = tK.slice(0, k0); auto mV = tV.slice(0, k0);
     opS.run(Q, mK, S);
@@ -897,25 +903,11 @@ kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
                                  uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
   const int b = tg.y, h = tg.z, n = a.n, qa = tg.x * 4 * QS + sg * QS;
+  if (qa >= n) return;
   device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
   typedef dextents<int32_t, 2> E2;
-  if constexpr (QBIAS) {
-    threadgroup half Qs[4 * QS * D];
-    threadgroup half* Qm = Qs + sg * QS * D;
-    constexpr int D4 = D / 4;
-    for (int e = lane; e < QS * D4; e += 32) {
-      const int qi = e / D4, d = (e - qi * D4) * 4, q = qa + qi;
-      half4 v = half4(0);
-      if (q < n) v = half4(float4(*(device const half4*)(base + (long)q * a.posStride + d)) + *(device const float4*)(a.qBias + h * D + d));
-      *(threadgroup half4*)(Qm + qi * D + d) = v;
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    tensor<threadgroup half, E2, tensor_inline> tQ(Qm, E2(D, QS), array<int32_t, 2>{1, D});
-    lf_attn3_body<D, QS, KT>(a, tQ, b, h, qa, base);
-  } else {
-    tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, (int32_t)a.posStride});
-    lf_attn3_body<D, QS, KT, decltype(tQ.slice(0, qa)), NT>(a, tQ.slice(0, qa), b, h, qa, base);
-  }
+  tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, (int32_t)a.posStride});
+  lf_attn3_body<D, QS, KT, decltype(tQ.slice(0, qa)), NT, QBIAS>(a, tQ.slice(0, qa), b, h, qa, base);
 }
 // (instantiated on first use: lf_attention_tensor3<D, QS, KT, QBIAS>, host name gemmt_attn3[q]_<D>_<QS>x<KT>)
 

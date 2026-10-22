@@ -983,16 +983,16 @@ kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg
   float inv = 1.f / tot;
   for (uint j = tid; j < a.T; j += 256) s[j] *= inv;
 }
-// [blocks, T * T, H] -> the attention's bias [blocks, H, T, stride] in log2 units (the stride padded even, its pad zero)
+// [blocks, T * T, H] -> the attention's bias [blocks, H, T, stride] in log2 units (the stride padded to 64 with -inf)
 kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
   ulong t = LF_INDEX;
   const uint B = max(a.blocks, 1u);
   if (a.H == 16) {
-    uint H4 = 4, per = (uint)a.P * H4;
+    uint H4 = 4, per = a.T * a.stride * H4;
     if (t >= (ulong)B * per) return;
     uint b = B > 1 ? lf_udiv((uint)t, per) : 0, rem = (uint)t - b * per;
-    uint p = rem >> 2, h0 = (rem & 3) << 2, i = lf_udiv(p, a.T), j = p - i * a.T;
-    float4 v = ((device const float4*)a.pb)[t] * M_LOG2E_F;
+    uint pos = rem >> 2, h0 = (rem & 3) << 2, i = lf_udiv(pos, a.stride), j = pos - i * a.stride;
+    float4 v = j < a.T ? ((device const float4*)a.pb)[((ulong)b * a.P + (ulong)i * a.T + j) * H4 + (rem & 3)] * M_LOG2E_F : float4(-INFINITY);
     ulong base = (ulong)i * a.stride + j, sH = (ulong)a.T * a.stride, bOff = (ulong)b * a.H * sH;
     a.out[bOff + (ulong)(h0 + 0) * sH + base] = (half)v.x;
     a.out[bOff + (ulong)(h0 + 1) * sH + base] = (half)v.y;
@@ -1000,11 +1000,12 @@ kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
     a.out[bOff + (ulong)(h0 + 3) * sH + base] = (half)v.w;
     return;
   }
-  uint per = (uint)a.P * a.H;
+  uint per = a.T * a.stride * a.H;
   if (t >= (ulong)B * per) return;
   uint b = B > 1 ? lf_udiv((uint)t, per) : 0, rem = (uint)t - b * per;
-  uint p = lf_udiv(rem, a.H), h = rem - p * a.H, i = lf_udiv(p, a.T), j = p - i * a.T;
-  a.out[(((ulong)b * a.H + h) * a.T + i) * a.stride + j] = (half)(a.pb[t] * M_LOG2E_F);
+  uint pos = lf_udiv(rem, a.H), h = rem - pos * a.H, i = lf_udiv(pos, a.stride), j = pos - i * a.stride;
+  a.out[(((ulong)b * a.H + h) * a.T + i) * a.stride + j] =
+      j < a.T ? (half)(a.pb[((ulong)b * a.P + (ulong)i * a.T + j) * a.H + h] * M_LOG2E_F) : (half)-INFINITY;
 }
 kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
