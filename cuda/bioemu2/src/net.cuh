@@ -156,17 +156,41 @@ template <class TH> inline void linearPre(const TH* Xh, const TH* Wh, float* Y, 
   CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, Wh, t, in, Xh, t, in,
                   &beta, Y, CUDA_R_32F, ldy ? ldy : out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
-// two torch-layout weights stacked as one: [W1; W2] (rows), its half mirror - fc1 and fc2 as one GEMM
-template <class TH> inline const TH* stackedMirror(const float* w1, const float* w2, size_t n) {
+template <class TH>
+inline void linearBatchPre(const TH* Xh, long long strideX, const TH* Wh, long long strideW,
+                           float* Y, long long strideY, size_t rows, int in, int out, int batch) {
+  const float alpha = 1.f, beta = 0.f;
+  const cudaDataType t = std::is_same_v<TH, half> ? CUDA_R_16F : CUDA_R_16BF;
+  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha,
+                                Wh, t, in, strideW, Xh, t, in, strideX,
+                                &beta, Y, CUDA_R_32F, out, strideY, batch,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+inline void linearBatch(const float* X, long long strideX, const float* Wt, long long strideW,
+                        float* Y, long long strideY, size_t rows, int in, int out, int batch) {
+  const float alpha = 1.f, beta = 0.f;
+  CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha,
+                               Wt, in, strideW, X, in, strideX, &beta, Y, out, strideY, batch));
+}
+// two torch-layout weights stacked as one: [W1; W2] (rows), its mirror - fc1|fc2 or proj_qkv|proj_g as one GEMM
+template <class TH> inline const TH* stackedMirror2(const float* w1, size_t n1, const float* w2, size_t n2) {
   static std::map<const float*, TH*> m;
   auto it = m.find(w1);
   if (it != m.end()) return it->second;
-  TH* h = dallocT<TH>(2 * n);
-  size_t nt1 = ((n & 3) == 0 && (((uintptr_t)w1 & 15) == 0) && (((uintptr_t)h & 7) == 0)) ? (n >> 2) : n;
-  size_t nt2 = ((n & 3) == 0 && (((uintptr_t)w2 & 15) == 0) && (((uintptr_t)(h + n) & 7) == 0)) ? (n >> 2) : n;
-  if constexpr (std::is_same_v<TH, half>) { be2ToHalfK<<<blocks(nt1), 256, 0, STREAM>>>(w1, h, n); be2ToHalfK<<<blocks(nt2), 256, 0, STREAM>>>(w2, h + n, n); }
-  else { toBf16K<<<blocks(nt1), 256, 0, STREAM>>>(w1, h, n); toBf16K<<<blocks(nt2), 256, 0, STREAM>>>(w2, h + n, n); }
+  TH* h = dallocT<TH>(n1 + n2);
+  if constexpr (std::is_same_v<TH, float>) {
+    CK(cudaMemcpyAsync(h, w1, n1 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    CK(cudaMemcpyAsync(h + n1, w2, n2 * 4, cudaMemcpyDeviceToDevice, STREAM));
+  } else {
+    size_t nt1 = ((n1 & 3) == 0 && (((uintptr_t)w1 & 15) == 0) && (((uintptr_t)h & 7) == 0)) ? (n1 >> 2) : n1;
+    size_t nt2 = ((n2 & 3) == 0 && (((uintptr_t)w2 & 15) == 0) && (((uintptr_t)(h + n1) & 7) == 0)) ? (n2 >> 2) : n2;
+    if constexpr (std::is_same_v<TH, half>) { be2ToHalfK<<<blocks(nt1), 256, 0, STREAM>>>(w1, h, n1); be2ToHalfK<<<blocks(nt2), 256, 0, STREAM>>>(w2, h + n1, n2); }
+    else { toBf16K<<<blocks(nt1), 256, 0, STREAM>>>(w1, h, n1); toBf16K<<<blocks(nt2), 256, 0, STREAM>>>(w2, h + n1, n2); }
+  }
   return m[w1] = h;
+}
+template <class TH> inline const TH* stackedMirror(const float* w1, const float* w2, size_t n) {
+  return stackedMirror2<TH>(w1, n, w2, n);
 }
 template <class TH> __device__ __forceinline__ TH toH(float v) {
   if constexpr (std::is_same_v<TH, half>) return __float2half(fminf(fmaxf(v, -65504.f), 65504.f));
@@ -299,7 +323,7 @@ lnToCond4K(const float* __restrict__ cnd, TH* __restrict__ yAll, int T, Cond0Tab
     if ((m & 1) && row >= T) continue;
     const float* sc = tab.scale[m] + (size_t)l * C;
     const float* of = tab.offset[m] ? (tab.offset[m] + (size_t)l * C) : nullptr;
-    TH* yr = yAll + ((size_t)(l * 4 + m) * (size_t)(T + 1) + (size_t)row) * C;
+    TH* yr = yAll + ((size_t)(m * (int)gridDim.y + l) * (size_t)(T + 1) + (size_t)row) * C;
     #pragma unroll
     for (int k = 0; k < K; ++k) {
       int c = k * 32 + lane;
@@ -416,6 +440,39 @@ inline void addBiasRows(float* y, const float* b, size_t rows, int C, int ld = 0
               ? rows * (size_t)(C >> 2) : rows * C;
   biasRowsK<<<blocks(nt), 256, 0, STREAM>>>(y, b, rows, C, l);
 }
+__global__ void biasBatchRowsK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int l = (int)blockIdx.y;
+  if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = rows * (size_t)c4;
+    if (t >= n4) return;
+    int col4;
+    if (c4 == 192 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t; col4 = (int)(u - (u / 192u) * 192u);
+    } else if (c4 == 1152 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t; col4 = (int)(u - (u / 1152u) * 1152u);
+    } else if (c4 == 480 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t; col4 = (int)(u - (u / 480u) * 480u);
+    } else if (c4 == 640 && n4 <= UINT32_MAX) {
+      unsigned u = (unsigned)t; col4 = (int)(u - (u / 640u) * 640u);
+    } else {
+      col4 = (int)(t % (size_t)c4);
+    }
+    float4* yp = reinterpret_cast<float4*>(y) + (size_t)l * n4 + t;
+    float4 yv = *yp;
+    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + (size_t)l * c4 + col4);
+    *yp = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+    return;
+  }
+  if (t >= rows * C) return;
+  y[((size_t)l * rows + t / C) * C + (t % C)] += b[(size_t)l * C + (t % C)];
+}
+inline void addBiasBatchRows(float* y, const float* b, size_t rows, int C, int layers) {
+  if (!b) return;
+  size_t nt = ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) ? rows * (size_t)(C >> 2) : rows * C;
+  biasBatchRowsK<<<dim3(blocks(nt), (unsigned)layers), 256, 0, STREAM>>>(y, b, rows, C);
+}
 __global__ void siluK(const float* __restrict__ x, float* __restrict__ y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((n & 3) == 0 && (((uintptr_t)x | (uintptr_t)y) & 15) == 0) {
@@ -525,21 +582,30 @@ __global__ void adaLnK(const float* x, TY* y, size_t rows, int C, int ldx, const
     if constexpr (std::is_same_v<TY, float>) y[row * C + c] = v2; else y[row * C + c] = toH<TY>(v2);
   }
 }
-template <class TY, int K>
-__global__ void __launch_bounds__(256, (K <= 16 ? 4 : 2))
-adaLnRegK(const float* __restrict__ x, TY* __restrict__ y, size_t rows, int ldx,
+template <class TY, int K, bool GATED = false>
+__global__ void __launch_bounds__(256, (K <= 16 ? 4 : (GATED ? 1 : 2)))
+adaLnRegK(float* __restrict__ x, TY* __restrict__ y, size_t rows, int ldx,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
-          float scale, const int* __restrict__ map) {
+          float scale, const int* __restrict__ map,
+          const float* __restrict__ h = nullptr, const float* __restrict__ gate = nullptr) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   constexpr int C = K * 32;
-  const float* xr = x + row * ldx;
+  const size_t cr = map ? (size_t)__ldg(map + row) : row;
+  float* xr = x + row * ldx;
+  const float* hr = GATED ? (h + row * C) : nullptr;
+  const float* gr = GATED ? (gate + cr * ldc) : nullptr;
   float xv[K];
   float s = 0.f;
   #pragma unroll
   for (int k = 0; k < K; ++k) {
-    float v = __ldg(xr + k * 32 + lane);
+    int c = k * 32 + lane;
+    float v = __ldg(xr + c);
+    if constexpr (GATED) {
+      v += __ldg(gr + c) * __ldg(hr + c);
+      xr[c] = v;
+    }
     xv[k] = v;
     s += v;
   }
@@ -554,7 +620,6 @@ adaLnRegK(const float* __restrict__ x, TY* __restrict__ y, size_t rows, int ldx,
   #pragma unroll
   for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
   float inv = rsqrtf(var / C + 1e-5f);
-  const size_t cr = map ? (size_t)__ldg(map + row) : row;
   const float* ar = alpha + cr * ldc;
   const float* br = beta + cr * ldc;
   TY* yr = y + row * C;
@@ -571,10 +636,20 @@ inline void adaLn(const float* x, TY* y, size_t rows, int C, const float* alpha,
                   int ldx = 0, float scale = 1.f, const int* map = nullptr) {
   int lx = ldx ? ldx : C;
   unsigned g = (unsigned)((rows + 7) / 8);
-  if (C == 128) { adaLnRegK<TY, 4><<<g, 256, 0, STREAM>>>(x, y, rows, lx, alpha, beta, ldc, scale, map); return; }
-  if (C == 768) { adaLnRegK<TY, 24><<<g, 256, 0, STREAM>>>(x, y, rows, lx, alpha, beta, ldc, scale, map); return; }
-  if (C == 896) { adaLnRegK<TY, 28><<<g, 256, 0, STREAM>>>(x, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  float* xm = const_cast<float*>(x);
+  if (C == 128) { adaLnRegK<TY, 4><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  if (C == 768) { adaLnRegK<TY, 24><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  if (C == 896) { adaLnRegK<TY, 28><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
   adaLnK<TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, lx, alpha, beta, ldc, scale, map);
+}
+template <class TY = float>
+inline void adaLnGatedAdd(float* x, const float* h, const float* gate, TY* y, size_t rows, int C,
+                          const float* alpha, const float* beta, int ldc, const int* map = nullptr) {
+  unsigned g = (unsigned)((rows + 7) / 8);
+  if (C == 128) { adaLnRegK<TY, 4, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate); return; }
+  if (C == 768) { adaLnRegK<TY, 24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate); return; }
+  gatedAdd(x, h, gate, rows, C, ldc, map);
+  adaLn<TY>(x, y, rows, C, alpha, beta, ldc, 0, 1.f, map);
 }
 // Fused [tokensToAtoms(a) | q] (768 + 128 = 896) + adaLN directly into y (f32 or f16)
 template <class TY>

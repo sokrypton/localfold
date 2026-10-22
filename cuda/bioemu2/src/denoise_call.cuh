@@ -94,48 +94,60 @@ inline void denoise(const Denoiser& d, const float* x, float sigma, float* den, 
   const size_t Pn = (size_t)T * T, wb = (size_t)N * WK * 4, tbn = 16 * Pn;
   const int Dc = Dt + Ca;                                  // the coupling's width, 896
   float* tbias = d.tbias ? nullptr : scratch<float>("be2.dn.tbias", tbn);
-  float* cqc = scratch<float>("be2.dn.cqc", (size_t)(T + 1) * (2 * Dc + Ca));
-  float* csc = scratch<float>("be2.dn.csc", (size_t)T * (2 * Dc + Dt));
+  const size_t condAStride = (size_t)(T + 1) * (6 * Ca);
+  const size_t condTStride = (size_t)T * (6 * Dt);
+  const size_t cqcStride   = (size_t)(T + 1) * (2 * Dc + Ca);
+  const size_t cscStride   = (size_t)T * (2 * Dc + Dt);
+  float* condAAll = scratch<float>("be2.dn.condA", (size_t)d.layers * condAStride);
+  float* condTAll = scratch<float>("be2.dn.condT", (size_t)d.layers * condTStride);
+  float* cqcAll   = scratch<float>("be2.dn.cqc",   (size_t)d.layers * cqcStride);
+  float* cscAll   = scratch<float>("be2.dn.csc",   (size_t)d.layers * cscStride);
   float* dq = scratch<float>("be2.dn.dq", RN * Ca);
   float* da = scratch<float>("be2.dn.da", RT * Dt);
   const int* atomTokDev = Idev("token_idx_at_atom");
   const int* atomPadDev = Idev("atom_pad_mask");
   const int* centreDev = Idev("token_center_atom_index");
   const std::string cp = L + "coupling/";
+  const std::string ap = L + "atom_block/transformer_layer/", tp = L + "token_block/";
   Cond0Tables c0Tab{
-    {P(L + "atom_block/transformer_layer/cond_0/weight"),
-     P(L + "token_block/cond_0/weight"),
+    {P(ap + "cond_0/weight"),
+     P(tp + "cond_0/weight"),
      P(cp + "q_coupling_cond_0/weight"),
      P(cp + "s_coupling_cond_0/weight")},
-    {Popt(L + "atom_block/transformer_layer/cond_0/bias"),
-     Popt(L + "token_block/cond_0/bias"),
+    {Popt(ap + "cond_0/bias"),
+     Popt(tp + "cond_0/bias"),
      Popt(cp + "q_coupling_cond_0/bias"),
      Popt(cp + "s_coupling_cond_0/bias")}
   };
   const size_t cnhStride = (size_t)(T + 1) * Dt;
-  half* cnhAll = GEMM_HALF ? scratch<half>("be2.dn.cnhAll", (size_t)d.layers * 4 * cnhStride) : nullptr;
-  float* cnAll = GEMM_HALF ? nullptr : scratch<float>("be2.dn.cnAll", (size_t)d.layers * 4 * cnhStride);
+  const size_t streamStride = (size_t)d.layers * cnhStride;
   dim3 c0Grid((unsigned)((T + 1 + 7) / 8), (unsigned)d.layers);
-  if (GEMM_HALF) lnToCond4K<half><<<c0Grid, 256, 0, STREAM>>>(cnd, cnhAll, T, c0Tab);
-  else lnToCond4K<float><<<c0Grid, 256, 0, STREAM>>>(cnd, cnAll, T, c0Tab);
+  float* cnAll = scratch<float>("be2.dn.cnAll", 4 * streamStride);
+  lnToCond4K<float><<<c0Grid, 256, 0, STREAM>>>(cnd, cnAll, T, c0Tab);
+  linearBatch(cnAll + 0 * streamStride, (long long)cnhStride, P(ap + "cond_2/weight"),
+              (long long)(6 * Ca) * Dt, condAAll, (long long)condAStride, T + 1, Dt, 6 * Ca, d.layers);
+  linearBatch(cnAll + 1 * streamStride, (long long)cnhStride, P(tp + "cond_2/weight"),
+              (long long)(6 * Dt) * Dt, condTAll, (long long)condTStride, T, Dt, 6 * Dt, d.layers);
+  linearBatch(cnAll + 2 * streamStride, (long long)cnhStride, P(cp + "q_coupling_cond_2/weight"),
+              (long long)(2 * Dc + Ca) * Dt, cqcAll, (long long)cqcStride, T + 1, Dt, 2 * Dc + Ca, d.layers);
+  linearBatch(cnAll + 3 * streamStride, (long long)cnhStride, P(cp + "s_coupling_cond_2/weight"),
+              (long long)(2 * Dc + Dt) * Dt, cscAll, (long long)cscStride, T, Dt, 2 * Dc + Dt, d.layers);
+  addBiasBatchRows(condAAll, Popt(ap + "cond_2/bias"), T + 1, 6 * Ca, d.layers);
+  addBiasBatchRows(condTAll, Popt(tp + "cond_2/bias"), T, 6 * Dt, d.layers);
+  addBiasBatchRows(cqcAll, Popt(cp + "q_coupling_cond_2/bias"), T + 1, 2 * Dc + Ca, d.layers);
+  addBiasBatchRows(cscAll, Popt(cp + "s_coupling_cond_2/bias"), T, 2 * Dc + Dt, d.layers);
   for (int l = 0; l < d.layers; ++l) {
-    const CondLayer atomL{L + "atom_block/transformer_layer/", ab, l, true, 4};
-    // (the atom stream's conditioning is its token's row of cond: computed on the T token rows)
-    float* condA = GEMM_HALF ? layerCondPre<half>(atomL, cnhAll + (size_t)(l * 4 + 0) * cnhStride, T + 1, Dt, Ca, "be2.dn.condA")
-                             : layerCondPre<float>(atomL, cnAll + (size_t)(l * 4 + 0) * cnhStride, T + 1, Dt, Ca, "be2.dn.condA");
+    float* condA = condAAll + (size_t)l * condAStride;
+    float* condT = condTAll + (size_t)l * condTStride;
+    float* cqc   = cqcAll   + (size_t)l * cqcStride;
+    float* csc   = cscAll   + (size_t)l * cscStride;
+    const CondLayer atomL{ap, ab, l, true, 4};
     condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
     const float* bias = d.tbias ? d.tbias + tbn * l : tbias;
-    if (!d.tbias) tokenBias(d.z, PL(L + "token_block/" + tb + "norm_z/weight", l), PL(L + "token_block/" + tb + "proj_z/weight", l), tbias, T, 256, 16);
-    const CondLayer tokL{L + "token_block/", tb, l, false, 16};
-    float* condT = GEMM_HALF ? layerCondPre<half>(tokL, cnhAll + (size_t)(l * 4 + 1) * cnhStride, T, Dt, Dt, "be2.dn.condT")
-                             : layerCondPre<float>(tokL, cnAll + (size_t)(l * 4 + 1) * cnhStride, T, Dt, Dt, "be2.dn.condT");
+    if (!d.tbias) tokenBias(d.z, PL(tp + tb + "norm_z/weight", l), PL(tp + tb + "proj_z/weight", l), tbias, T, 256, 16);
+    const CondLayer tokL{tp, tb, l, false, 16};
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, bias, T);
-    // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     if (GEMM_HALF) {
-      linearPre<half>(cnhAll + (size_t)(l * 4 + 2) * cnhStride, halfMirror<half>(PL(cp + "q_coupling_cond_2/weight", l), (size_t)(2 * Dc + Ca) * Dt), cqc, T + 1, Dt, 2 * Dc + Ca);
-      if (const float* b = PLopt(cp + "q_coupling_cond_2/bias", l)) addBiasRows(cqc, b, T + 1, 2 * Dc + Ca);
-      linearPre<half>(cnhAll + (size_t)(l * 4 + 3) * cnhStride, halfMirror<half>(PL(cp + "s_coupling_cond_2/weight", l), (size_t)(2 * Dc + Dt) * Dt), csc, T, Dt, 2 * Dc + Dt);
-      if (const float* b = PLopt(cp + "s_coupling_cond_2/bias", l)) addBiasRows(csc, b, T, 2 * Dc + Dt);
       // s_to_q = [a broadcast | q]; q_to_s = [q centre | a], fused directly into adaLN
       half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
       adaLnS2QK<half><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, atomTokDev, atomPadDev, sqh, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
@@ -143,10 +155,6 @@ inline void denoise(const Denoiser& d, const float* x, float sigma, float* den, 
       adaLnQ2SK<half><<<(unsigned)((RT + 7) / 8), 256, 0, STREAM>>>(q, a, centreDev, qsh, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
       transitionHalf(nullptr, qsh, da, RT, Dc, cp + "q_to_s_mixer/", l, false, false, 0);
     } else {
-      linear(cnAll + (size_t)(l * 4 + 2) * cnhStride, PL(cp + "q_coupling_cond_2/weight", l), cqc, T + 1, Dt, 2 * Dc + Ca);
-      if (const float* b = PLopt(cp + "q_coupling_cond_2/bias", l)) addBiasRows(cqc, b, T + 1, 2 * Dc + Ca);
-      linear(cnAll + (size_t)(l * 4 + 3) * cnhStride, PL(cp + "s_coupling_cond_2/weight", l), csc, T, Dt, 2 * Dc + Dt);
-      if (const float* b = PLopt(cp + "s_coupling_cond_2/bias", l)) addBiasRows(csc, b, T, 2 * Dc + Dt);
       float* sqn = scratch<float>("be2.dn.sqn", RN * Dc); float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
       adaLnS2QK<float><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, atomTokDev, atomPadDev, sqn, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transition(sqn, dq, RN, Dc, cp + "s_to_q_mixer/", l, false, false);
