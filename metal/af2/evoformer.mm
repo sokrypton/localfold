@@ -23,6 +23,9 @@ void layerNormW(const float* x, float* y, size_t rows, int C, const std::string&
 void layerNormW(const float* x, half* y, size_t rows, int C, const std::string& w, int block) {
   layerNorm(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
 }
+void layerNormW(const float* x, float* y, half* yh, size_t rows, int C, const std::string& w, int block) {
+  layerNorm(x, y, yh, rows, C, P(w + "/scale", block), P(w + "/offset", block));
+}
 void layerNormW(const half* x, half* y, size_t rows, int C, const std::string& w, int block) {
   layerNorm(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
 }
@@ -38,20 +41,32 @@ static void linearWB(const half* X, const std::string& w, const std::string& b, 
   gemm(g);
 }
 // a named linear adding into a half residual (linearB's half twin: Y += X W + bias)
-static void linearB(const half* X, const std::string& w, int block, half* Y, size_t rows, int in, int out, bool relu, float beta) {
+void linearB(const half* X, const std::string& w, int block, half* Y, size_t rows, int in, int out, bool relu, float beta) {
   Gemm g{}; g.X = X; g.tx = F16; g.W = PH(w + "/weights", block); g.tw = F16; g.Y = Y; g.ty = F16; g.rows = rows; g.in = in;
-  g.out = out; g.bias = P(w + "/bias", block); g.relu = relu; g.beta = beta; g.label = w.c_str();
+  g.out = out; g.bias = P(w + "/bias", block); g.relu = relu; g.beta = beta; g.accFloat = true; g.label = w.c_str();
   gemm(g);
 }
 // the pair's next LayerNorm where the previous update's GEMM already wrote it (Gemm::lnOut, gemmGatedAddDual's): the
 // pair, the norm (its weight's name and block) and the buffer, taken by pairLn of the same; a miss drops it.
 // LOCALFOLD_LN_EMIT=0: none emitted
-static struct { const void* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
+static struct { const void* x = nullptr; std::string norm; half* buf = nullptr; } emitted[4];
+static void clearEmitted() { for (auto& e : emitted) e.x = nullptr; }
 static std::string normKey(const std::string& w, int blk) { return w + "#" + std::to_string(blk); }
+static void emitLn(const void* x, const std::string& w, int blk, half* buf) {
+  const std::string key = normKey(w, blk);
+  for (auto& e : emitted)
+    if (e.x == x && e.norm == key) { e.buf = buf; return; }
+  for (auto& e : emitted)
+    if (!e.x) { e = {x, key, buf}; return; }
+  emitted[0] = {x, key, buf};
+}
 static half* takeEmitted(const void* x, const std::string& w, int blk) {
-  const bool hit = emitted.x == x && emitted.norm == normKey(w, blk);
-  emitted.x = nullptr;
-  return hit ? emitted.buf : nullptr;
+  const std::string key = normKey(w, blk);
+  for (auto& e : emitted)
+    if (e.x == x && e.norm == key) { e.x = nullptr; return e.buf; }
+  for (auto& e : emitted)
+    if (e.x == x) e.x = nullptr;
+  return nullptr;
 }
 template <class T>
 static half* pairLn(const T* pair, size_t pairs, int C, const std::string& w, int blk, const char* scratchName) {
@@ -77,12 +92,13 @@ static bool allOnes(const float* d, size_t n) {
 // ---------------------------------------------------------------- the embedder
 // prev: prevMsaRow [L, 256], prevPos [L, 37, 3]; the previous pair is t.pair itself (zero before the first pass)
 void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
+  clearEmitted();
   const std::string E = "evoformer/";
   int L = t.L, N = t.N;
   std::string f = "f" + std::to_string(pass) + "/";
   t.normOf[0] = t.normOf[1] = nullptr;      // (the masks are written for this pass below)
   const int* aatype = Ii("aatype");
-  float* tf = scratch<float>("emb.tf", (size_t)L * 21);
+  half* tf = scratch<half>("emb.tf", (size_t)L * 21);
   run1d("af2_target_feat", (size_t)L * 21, TargetFeatArgs{aatype, tf, (uint)L, 0});
   // msa = preprocess_1d(target)[None] + preprocess_msa(msa_feat); row 0 += LN(prev msa first row)
   float* p1d = scratch<float>("emb.p1d", (size_t)L * 256);
@@ -101,16 +117,16 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
   // a copy of the last pass's pair and its norm were two f32 pairs more, 1.1 GB at 1044 residues)
   layerNormW(t.pair, t.pair, pairs, 128, E + "prev_pair_norm");
   run1d("af2_outer_sum", pairs * 32, OuterSumArgs{t.pair, left, right, (uint)L, 128, 1, 0});
-  float* dgram = scratch<float>("emb.dgram", pairs * 15);
+  half* dgram = scratch<half>("emb.dgram", pairs * 15);
   run1d("af2_prev_dgram", pairs, PrevDgramArgs{prevPos, aatype, dgram, (uint)L, 0});
   linearB(dgram, E + "prev_pos_linear", -1, t.pair, pairs, 15, 128, false, 1.f);
-  float* rel = scratch<float>("emb.rel", pairs * 73);
+  half* rel = scratch<half>("emb.rel", pairs * 73);
   run1d("af2_relpos", pairs, RelposArgs{Ii("residue_index"), Ii("asym_id"), Ii("entity_id"), Ii("sym_id"), rel, (uint)L, 0});
   linearB(rel, E + "~_relative_encoding/position_activations", -1, t.pair, pairs, 73, 128, false, 1.f);
   releaseScratch({"emb.rel", "emb.dgram"});
   // the extra MSA's activations
   size_t erows = (size_t)t.E * L;
-  float* ef = scratch<float>("emb.extraFeat", erows * 25);
+  half* ef = scratch<half>("emb.extraFeat", erows * 25);
   run1d("af2_extra_feat", erows * 25, ExtraFeatArgs{Ii(f + "extra_msa"), In(f + "extra_has_deletion"), In(f + "extra_deletion_value"), ef, erows});
   linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
   copy(t.msaMask, In(f + "msa_mask"), (size_t)N * L * 4);
@@ -169,12 +185,12 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
     }
     attention(at);
   }
-  if (!nextNorm.empty() && (C == 128 || (C == 256 && rows >= 128))) {     // (the residual's next norm emitted by the output projection)
+  if (!nextNorm.empty() && (C == 128 || C == 256)) {     // (the residual's next norm emitted by the output projection)
     half* lnOut = lnTarget(rows, C, xn);
     Gemm g{}; g.X = o; g.tx = F16; g.W = PH(A + "/output_w", blk); g.tw = F16; g.Y = residual; g.ty = dtOf<T>(); g.rows = rows; g.in = W; g.out = C;
     g.bias = P(A + "/output_b", blk); g.beta = 1.f; g.label = "attention output, next norm";
     g.lnOut = lnOut; g.lnScale = P(nextNorm + "/scale", nextBlk); g.lnOffset = P(nextNorm + "/offset", nextBlk);
-    if (gemm(g)) emitted = {residual, normKey(nextNorm, nextBlk), lnOut};
+    if (gemm(g)) emitLn(residual, nextNorm, nextBlk, lnOut);
     return;
   }
   linearWB(o, A + "/output_w", A + "/output_b", blk, residual, rows, W, C, 1.f);
@@ -205,8 +221,7 @@ static void msaRowAttention(Trunk& t, const std::string& S, int blk, T* msa, con
   std::string R = S + "msa_row_attention_with_pair_bias";
   int H = (int)dimW(R + "/attention/query_w", 2);
   half* bias = pairBias(pair, L, 128, R + "/feat_2d_norm", R + "/feat_2d_weights", blk, H, t.pairOnes ? nullptr : t.pairMask, false);
-  half* xn = scratch<half>("row.xn", rows * C);
-  layerNormW(msa, xn, rows, C, R + "/query_norm", blk);
+  half* xn = pairLn(msa, rows, C, R + "/query_norm", blk, "row.xn");
   attend(xn, rowsN, L, C, R + "/attention", blk, bias, ones ? nullptr : msaMask, L, 1, msa, false, nextNorm, blk);
 }
 template <class T>
@@ -245,13 +260,18 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
 }
 template <class X>
 static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
-                        const std::string& nextNorm = "", int nextBlk = 0) {
+                        const std::string& nextNorm = "", int nextBlk = 0,
+                        const std::string& nextNorm2 = "", int nextBlk2 = 0,
+                        const char* lnName1 = nullptr) {
   half* emittedIn = takeEmitted(x, T + "/input_layer_norm", blk);
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);
   size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)I)));
   half* xn = scratch<half>("tr.xn", chunk * C);
   half* mid = scratch<half>("tr.mid", chunk * I);
-  const bool emitNext = !nextNorm.empty() && (C == 128 || (C == 256 && rows >= 128));
+  const bool emitNext = !nextNorm.empty() && (C == 128 || C == 256);
+  const bool emitNext2 = emitNext && !nextNorm2.empty() && rows <= 16384;
+  half* ln1 = emitNext ? (lnName1 ? scratch<half>(lnName1, rows * C) : lnTarget(rows, C, nullptr)) : nullptr;
+  half* ln2 = emitNext2 ? scratch<half>("ln.m", rows * C) : nullptr;
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -263,7 +283,8 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
     if (emittedAll) {
       Gemm G{}; G.X = mid; G.tx = F16; G.W = PH(T + "/transition2/weights", blk); G.tw = F16; G.Y = x + r0 * C; G.ty = dtOf<X>();
       G.rows = r; G.in = I; G.out = C; G.bias = P(T + "/transition2/bias", blk); G.beta = 1.f; G.label = "transition2, next norm";
-      G.lnOut = lnTarget(rows, C, nullptr) + r0 * C; G.lnScale = P(nextNorm + "/scale", nextBlk); G.lnOffset = P(nextNorm + "/offset", nextBlk);
+      G.lnOut = ln1 + r0 * C; G.lnScale = P(nextNorm + "/scale", nextBlk); G.lnOffset = P(nextNorm + "/offset", nextBlk);
+      if (ln2) { G.lnOut2 = ln2 + r0 * C; G.lnScale2 = P(nextNorm2 + "/scale", nextBlk2); G.lnOffset2 = P(nextNorm2 + "/offset", nextBlk2); }
       if (gemm(G)) continue;
       if (r0) die("%s: the next norm emitted for some chunks and not others", T.c_str());
       emittedAll = false;
@@ -271,7 +292,10 @@ static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk,
     }
     linearB(mid, T + "/transition2", blk, x + r0 * C, r, I, C, false, 1.f);
   }
-  if (emittedAll) emitted = {x, normKey(nextNorm, nextBlk), lnTarget(rows, C, nullptr)};
+  if (emittedAll) {
+    emitLn(x, nextNorm, nextBlk, ln1);
+    if (ln2) emitLn(x, nextNorm2, nextBlk2, ln2);
+  }
 }
 void transition(float* x, size_t rows, int C, const std::string& T, int blk) { transitionT(x, rows, C, T, blk); }
 // pair[(i0 + i)][j] += (bias + Y) / (1e-3 + norm), float or half, optionally emitting the next norm
@@ -286,7 +310,7 @@ static void opmAdd(half* pair, const float* Y, const float* bias, const float* n
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] @ W + b) / (1e-3 + norm[i][j])
 template <class A>
 static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* msa, A* pair, int rowsN, int C, const float* msaMask,
-                             bool ones, const std::string& nextNorm = "") {
+                             bool ones, const std::string& nextNorm = "", const std::string& nextNorm2 = "") {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   half* xn = pairLn(msa, rows, C, Op + "/layer_norm_input", blk, "opm.xn");
@@ -311,6 +335,13 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     t.normOf[slot] = msaMask;
   }
   const half* Wout = PH(Op + "/output_w", blk);        // [O * O][128]
+  static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+  half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
+  const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
+  const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
+  half* lnOut2 = (lnOut && !nextNorm2.empty() && L <= 512) ? scratch<half>("ln.p2", (size_t)L * L * 128) : nullptr;
+  const float* lnScale2 = lnOut2 ? P(nextNorm2 + "/scale", blk) : nullptr;
+  const float* lnOffset2 = lnOut2 ? P(nextNorm2 + "/offset", blk) : nullptr;
   if (rowsN <= 128) {
     // the SHALLOW form for an alignment of few rows: the output projection folded into the right operand first -
     // T[c][(s, j)][f] = sum_e r[s][j][e] W[c O + e][f], a GEMM batched over c - then Y[i][(j, f)] = sum_{c, s}
@@ -319,11 +350,12 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     { Gemm g{}; g.X = rt; g.tx = F16; g.W = Wout; g.tw = F16; g.sw = (int64_t)O * 128; g.Y = T; g.ty = F16; g.sy = (int64_t)rows * 128;
       g.rows = rows; g.in = O; g.out = 128; g.batch = O; g.accFloat = true; g.label = "opm shallow T"; gemm(g); }
     half* Lt = scratch<half>("opm.Lt", rows * O);
-    const float inv = ones ? 1.f / (1e-3f + (float)rowsN) : 1.f;
+    const bool foldOnes = ones && (!lnOut || (L > 64 && L <= 128));
+    const float inv = foldOnes ? 1.f / (1e-3f + (float)rowsN) : 1.f;
     run1d("af2_opm_left", rows * O, OpmLeftArgs{lt, Lt, (uint)rowsN, (uint)L, (uint)O, inv});
     int K = O * rowsN;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
-    if (ones) {     // every row live: the norm is rowsN everywhere, folded into the GEMM (L scaled, the bias tiled)
+    if (foldOnes) {     // every row live: the norm is rowsN everywhere, folded into the GEMM (L scaled, the bias tiled)
       float* bt = scratch<float>("opm.btile", (size_t)L * 128);
       run1d("af2_tile_bias", (size_t)L * 128, TileBiasArgs{P(Op + "/output_b", blk), bt, (uint)L, 128, inv, 0});
       for (int i0 = 0; i0 < L; i0 += Bi) {
@@ -334,30 +366,27 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
       }
       return;
     }
-    static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-    half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
-    const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
-    const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
     bool allAdded = lnOut != nullptr;
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
+      half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * 128 : nullptr;
+      half* lnChunk2 = lnOut2 ? lnOut2 + (size_t)i0 * L * 128 : nullptr;
       if (gemmOpmOut(Lt + (size_t)i0 * K, T, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L,
-                     bi, K, L * 128, 1.f)) {
-        allAdded = false;
+                     bi, K, L * 128, 1.f, lnChunk, lnScale, lnOffset, 1e-5f, lnChunk2, lnScale2, lnOffset2)) {
         continue;
       }
+      allAdded = false;
       float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
       Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = Y; g.rows = bi; g.in = K; g.out = L * 128; g.label = "opm shallow";
       gemm(g);
       opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, lnOut, lnScale, lnOffset);
     }
-    if (allAdded) emitted = {pair, normKey(nextNorm, blk), lnOut};
+    if (allAdded) {
+      emitLn(pair, nextNorm, blk, lnOut);
+      if (lnOut2) emitLn(pair, nextNorm2, blk, lnOut2);
+    }
     return;
   }
-  static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
-  const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
-  const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
   // the standard form: P[(i, c)][(j, e)] = sum_s l[s][i][c] r[s][j][e] a block of rows i at a time, permuted to
   // [(i, j)][(c, e)], then the output projection
   size_t per = (size_t)L * O * O;
@@ -383,9 +412,9 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     }
     // (on the matrix units the add in the output GEMM's epilogue - no Y)
     half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * 128 : nullptr;
+    half* lnChunk2 = lnOut2 ? lnOut2 + (size_t)i0 * L * 128 : nullptr;
     if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128, up,
-                   lnChunk, lnScale, lnOffset)) {
-      if ((size_t)bi * L <= 128) allAdded = false;
+                   lnChunk, lnScale, lnOffset, 1e-5f, lnChunk2, lnScale2, lnOffset2)) {
       continue;
     }
     if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
@@ -393,7 +422,10 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
       g.label = "opm output"; gemm(g); }
     opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, lnOut, lnScale, lnOffset);
   }
-  if (allAdded) emitted = {pair, normKey(nextNorm, blk), lnOut};
+  if (allAdded) {
+    emitLn(pair, nextNorm, blk, lnOut);
+    if (lnOut2) emitLn(pair, nextNorm2, blk, lnOut2);
+  }
 }
 // the triangle multiplication: LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate, with AF2's
 // biases) -> the planes' batched product -> the centre norm -> the output projection -> the gate's GEMM adding into
@@ -432,7 +464,7 @@ static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C
   if (gemmGatedAddDual(xn, PH(T + "/gating_linear/weights", blk), cn, PH(T + "/output_projection/weights", blk), pair, pairs, C, C,
                        P(T + "/gating_linear/bias", blk), P(T + "/output_projection/bias", blk), outH, "triangle output and gated add",
                        lnOut, lnOut ? P(nextNorm + "/scale", blk) : nullptr, lnOut ? P(nextNorm + "/offset", blk) : nullptr))
-    emitted = {pair, normKey(nextNorm, blk), lnOut};
+    emitLn(pair, nextNorm, blk, lnOut);
 }
 void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
                             const std::string& nextNorm) {
@@ -464,11 +496,18 @@ static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair,
   int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   bool ones = extraStack ? t.extraOnes : t.msaOnes;
-  if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones, S + "msa_row_attention_with_pair_bias/feat_2d_norm");
+  bool moreMain = !extraStack && nextPairBlk >= 0;
+  if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones,
+                                   S + "msa_row_attention_with_pair_bias/feat_2d_norm",
+                                   S + "triangle_multiplication_outgoing/left_norm_input");
   msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones, extraStack ? "" : S + "msa_column_attention/query_norm");
   if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
   else msaColumnAttention(t, S, blk, msa, rowsN, C, mask, ones, S + "msa_transition/input_layer_norm");
-  transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk, !t.opmFirst && !extraStack ? S + "outer_product_mean/layer_norm_input" : "", blk);
+  transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk,
+              (!extraStack && (!t.opmFirst || moreMain)) ? S + "outer_product_mean/layer_norm_input" : "",
+              t.opmFirst ? blk + 1 : blk,
+              moreMain ? S + "msa_row_attention_with_pair_bias/query_norm" : "", blk + 1,
+              t.opmFirst ? "ln.m1" : nullptr);
   if (!t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones, S + "triangle_multiplication_outgoing/left_norm_input");
   // (each update's last GEMM emitting the next one's norm)
   triangleMultiplicationT(pair, t.pairMask, t.L, 128, S, blk, true, S + "triangle_multiplication_incoming/left_norm_input");
@@ -480,4 +519,25 @@ static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair,
 void evoformerBlock(Trunk& t, bool extraStack, int blk, const std::string& nextPairNorm, int nextPairBlk) {
   if (t.h.pair) evoformerBlockT(t, extraStack, blk, extraStack ? t.h.extra : t.h.msa, t.h.pair, nextPairNorm, nextPairBlk);
   else evoformerBlockT(t, extraStack, blk, extraStack ? t.extra : t.msa, t.pair, nextPairNorm, nextPairBlk);
+}
+void prepareWeights() {
+  for (int ex = 0; ex < 2; ++ex) {
+    const std::string S = ex ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
+    if (!M.has("w/" + S + "msa_transition/transition1/weights")) continue;
+    const int C = ex ? 64 : 256;
+    attnWeights(S + "msa_row_attention_with_pair_bias/attention", 0, C);
+    if (!ex) attnWeights(S + "msa_column_attention/attention", 0, C);
+    attnWeights(S + "triangle_attention_starting_node/attention", 0, 128);
+    attnWeights(S + "triangle_attention_ending_node/attention", 0, 128);
+    triWeights(S + "triangle_multiplication_outgoing", 0, 128);
+    triWeights(S + "triangle_multiplication_incoming", 0, 128);
+  }
+  for (const char* sub : {"template_embedding_iteration/", "template_pair_stack/__layer_stack_no_state/"}) {
+    const std::string IT = std::string("evoformer/template_embedding/single_template_embedding/") + sub;
+    if (!M.has("w/" + IT + "pair_transition/transition1/weights")) continue;
+    attnWeights(IT + "triangle_attention_starting_node/attention", 0, 64);
+    attnWeights(IT + "triangle_attention_ending_node/attention", 0, 64);
+    triWeights(IT + "triangle_multiplication_outgoing", 0, 64);
+    triWeights(IT + "triangle_multiplication_incoming", 0, 64);
+  }
 }

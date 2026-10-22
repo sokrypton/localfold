@@ -3,12 +3,12 @@
 #include "args.h"
 
 // ---------------------------------------------------------------- the embedder
-struct TargetFeatArgs { CP(int) aatype; DP(float) tf; uint L, pad; };
+struct TargetFeatArgs { CP(int) aatype; DP(half) tf; uint L, pad; };
 struct BroadcastRowsArgs { DP(float) msa; CP(float) row; u64 rows; uint L, C; };
 struct OuterSumArgs { DP(float) pair; CP(float) left; CP(float) right; uint L, C; uint add, pad; };   // add: pair += rather than =
-struct PrevDgramArgs { CP(float) pos37; CP(int) aatype; DP(float) out; uint L, pad; };
-struct RelposArgs { CP(int) ri; CP(int) asym; CP(int) entity; CP(int) sym; DP(float) out; uint L, pad; };
-struct ExtraFeatArgs { CP(int) codes; CP(float) hasDel; CP(float) delVal; DP(float) out; u64 rows; };
+struct PrevDgramArgs { CP(float) pos37; CP(int) aatype; DP(half) out; uint L, pad; };
+struct RelposArgs { CP(int) ri; CP(int) asym; CP(int) entity; CP(int) sym; DP(half) out; uint L, pad; };
+struct ExtraFeatArgs { CP(int) codes; CP(float) hasDel; CP(float) delVal; DP(half) out; u64 rows; };
 struct PairMaskArgs { CP(float) seqMask; DP(float) out; uint L, pad; };
 
 // ---------------------------------------------------------------- the Evoformer
@@ -32,19 +32,19 @@ struct GlobalGateArgs { CP(float) avg; CP(float) gate; DP(half) out; uint S, L, 
 struct TmplPairArgs { CP(int) aatype; CP(float) pos; CP(float) mask; CP(float) w0; CP(float) w1; CP(float) w2; CP(float) w3;
                       CP(float) w4; CP(float) w5; CP(float) w6; CP(float) w7; CP(float) bsum; DP(float) act; uint L, C; };
 struct TmplPairMonoArgs { CP(int) aatype; CP(float) pos; CP(float) mask; CP(float) w; CP(float) b; DP(float) act; uint L, C; };
-struct ReluScaleArgs { DP(float) x; u64 n; float s; uint pad; };
+struct ReluScaleArgs { CP(float) x; DP(half) y; u64 n; float s; uint pad; };
 struct PointAttnArgs { CP(float) q; CP(float) k; CP(float) v; DP(float) out; u64 pairs; uint T, H, D, pad; };
-struct TorsionFeatArgs { CP(int) aatype; CP(float) pos; CP(float) mask; DP(float) feat; DP(float) rowMask; uint L, pad; };
+struct TorsionFeatArgs { CP(int) aatype; CP(float) pos; CP(float) mask; DP(half) feat; DP(float) rowMask; uint L, pad; };
 
 // ---------------------------------------------------------------- the structure module and the heads
 struct IdentityRigidArgs { DP(float) r; uint L, pad; };
 struct PointsGlobalArgs { CP(float) proj; CP(float) rig; DP(float) qp; DP(float) kp; DP(float) vp; uint L, H, Pq, Pv, ldp, pad; };
 struct IpaWeightsArgs { CP(float) qs; CP(float) ks; CP(float) qp; CP(float) kp; CP(float) b2d; CP(float) pw; CP(float) seqMask;
                         DP(float) attn; uint L, H, Cs, Pq, lds; float qScale; };
-struct IpaOutputsArgs { CP(float) attn; CP(float) vs; CP(float) vp; CP(float) act2d; CP(float) rig; DP(float) fin;
+struct IpaOutputsArgs { CP(float) attn; CP(float) vs; CP(float) vp; CP(float) act2d; CP(float) rig; DP(half) fin;
                         uint L, H, Cs, Pv, C2, ldv; };
 struct RigidUpdateArgs { DP(float) rig; CP(float) upd; uint L, pad; };
-struct ReluCopyArgs { CP(float) x; DP(float) y; u64 n; };
+struct ReluCopyArgs { CP(float) x; DP(float) y; DP(half) yh; u64 n; };
 struct SoftplusArgs { CP(float) raw; DP(float) out; uint H; float base; };
 struct SidechainArgs { CP(float) unnorm; CP(float) rig; CP(int) aatype; CP(float) defaultFrames; CP(int) atom14Group;
                        CP(float) litPos; CP(float) atom14Mask; CP(int) atom37To14; CP(float) atom37Mask; CP(float) seqMask;

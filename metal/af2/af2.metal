@@ -7,7 +7,7 @@ kernel void af2_target_feat(LF_ARGS(TargetFeatArgs)) {      // one-hot 20 (X as 
   if (t >= a.L * 21) return;
   uint i = t / 21, c = t - i * 21;
   int aa = clamp(a.aatype[i], 0, 19);
-  a.tf[t] = (int)c == aa ? 1.f : 0.f;
+  a.tf[t] = (int)c == aa ? (half)1.f : (half)0.f;
 }
 kernel void af2_broadcast_rows(LF_ARGS(BroadcastRowsArgs)) {   // msa[s, i] += row[i]
   ulong t = LF_INDEX;
@@ -48,7 +48,7 @@ kernel void af2_prev_dgram(LF_ARGS(PrevDgramArgs)) {
   for (int b = 0; b < 15; ++b) {
     float lo = 3.25f + (20.75f - 3.25f) * b / 14.f, hi = 3.25f + (20.75f - 3.25f) * (b + 1) / 14.f;
     float upper = b + 1 < 15 ? hi * hi : 1e8f;
-    a.out[(ulong)t * 15 + b] = (d2 > lo * lo && d2 < upper) ? 1.f : 0.f;
+    a.out[(ulong)t * 15 + b] = (d2 > lo * lo && d2 < upper) ? (half)1.f : (half)0.f;
   }
 }
 // relpos [L, L, 73] one-hot, as _relative_encoding builds it
@@ -56,20 +56,20 @@ kernel void af2_relpos(LF_ARGS(RelposArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.L * a.L) return;
   uint i = lf_udiv(t, a.L), j = t - i * a.L;
-  device float* o = a.out + (ulong)t * 73;
-  for (int c = 0; c < 73; ++c) o[c] = 0;
+  device half* o = a.out + (ulong)t * 73;
+  for (int c = 0; c < 73; ++c) o[c] = (half)0.f;
   int clipped = clamp(a.ri[i] - a.ri[j] + 32, 0, 64);
-  o[a.asym[i] == a.asym[j] ? clipped : 65] = 1;
+  o[a.asym[i] == a.asym[j] ? clipped : 65] = (half)1.f;
   bool sameEntity = a.entity[i] == a.entity[j];
-  o[66] = sameEntity ? 1.f : 0.f;
+  o[66] = sameEntity ? (half)1.f : (half)0.f;
   int rc = clamp(a.sym[i] - a.sym[j] + 2, 0, 4);
-  o[67 + (sameEntity ? rc : 5)] = 1;
+  o[67 + (sameEntity ? rc : 5)] = (half)1.f;
 }
 kernel void af2_extra_feat(LF_ARGS(ExtraFeatArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.rows * 25) return;
   uint r = (uint)(t / 25), c = (uint)(t - (ulong)r * 25);
-  a.out[t] = c < 23 ? (a.codes[r] == (int)c ? 1.f : 0.f) : c == 23 ? a.hasDel[r] : a.delVal[r];
+  a.out[t] = (half)(c < 23 ? (a.codes[r] == (int)c ? 1.f : 0.f) : c == 23 ? a.hasDel[r] : a.delVal[r]);
 }
 kernel void af2_pair_mask(LF_ARGS(PairMaskArgs)) {
   uint t = (uint)LF_INDEX;
@@ -409,7 +409,7 @@ kernel void af2_template_pair_monomer(constant TmplPairMonoArgs& a [[buffer(0)]]
 }
 kernel void af2_relu_scale(LF_ARGS(ReluScaleArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n) a.x[t] = max(a.x[t] * a.s, 0.f);
+  if (t < a.n) a.y[t] = (half)max(a.x[t] * a.s, 0.f);
 }
 // the monomer's pointwise attention from the query pair over the templates (no gating, every template present)
 kernel void af2_point_attention(LF_ARGS(PointAttnArgs)) {
@@ -479,8 +479,8 @@ kernel void af2_template_torsion(LF_ARGS(TorsionFeatArgs)) {
     }
     tm[3 + c] = mm;
   }
-  device float* f = a.feat + (ulong)i * 57;
-  for (int k = 0; k < 22; ++k) f[k] = k == clamp(aaRaw, 0, 21) ? 1.f : 0.f;
+  device half* f = a.feat + (ulong)i * 57;
+  for (int k = 0; k < 22; ++k) f[k] = k == clamp(aaRaw, 0, 21) ? (half)1.f : (half)0.f;
   for (int t = 0; t < 7; ++t) {
     float e0[3], e1[3], e2[3], d[3];
     for (int k = 0; k < 3; ++k) { e0[k] = at[t][2][k] - at[t][1][k]; e1[k] = at[t][0][k] - at[t][2][k]; d[k] = at[t][3][k] - at[t][2][k]; }
@@ -494,9 +494,9 @@ kernel void af2_template_torsion(LF_ARGS(TorsionFeatArgs)) {
     if (t == 0 && i == 0) sn = cs = 0.f;     // (the first residue's pre-omega: defined as zero)
     if (t == 2) { sn = -sn; cs = -cs; }
     float alt = t >= 3 ? 1.f - 2.f * CHI_PI_PERIODIC[aa * 4 + t - 3] : 1.f;
-    f[22 + t * 2] = sn; f[22 + t * 2 + 1] = cs;
-    f[36 + t * 2] = sn * alt; f[36 + t * 2 + 1] = cs * alt;
-    f[50 + t] = tm[t];
+    f[22 + t * 2] = (half)sn; f[22 + t * 2 + 1] = (half)cs;
+    f[36 + t * 2] = (half)(sn * alt); f[36 + t * 2 + 1] = (half)(cs * alt);
+    f[50 + t] = (half)tm[t];
   }
   a.rowMask[i] = tm[2];
 }
@@ -506,8 +506,8 @@ kernel void af2_template_chi(LF_ARGS(TorsionFeatArgs)) {
   if (i >= a.L) return;
   int aaRaw = a.aatype[i], aa = clamp(aaRaw, 0, 20);
   device const float* p = a.pos + (ulong)i * 37 * 3; device const float* m = a.mask + (ulong)i * 37;
-  device float* f = a.feat + (ulong)i * 34;
-  for (int k = 0; k < 22; ++k) f[k] = k == clamp(aaRaw, 0, 21) ? 1.f : 0.f;
+  device half* f = a.feat + (ulong)i * 34;
+  for (int k = 0; k < 22; ++k) f[k] = k == clamp(aaRaw, 0, 21) ? (half)1.f : (half)0.f;
   for (int c = 0; c < 4; ++c) {
     float x[4][3]; float mm = CHI_ANGLES_MASK[aa * 4 + c];
     for (int q = 0; q < 4; ++q) { int idx = CHI_ATOM_INDICES[(aa * 4 + c) * 4 + q]; for (int k = 0; k < 3; ++k) x[q][k] = p[idx * 3 + k]; mm *= m[idx]; }
@@ -517,7 +517,7 @@ kernel void af2_template_chi(LF_ARGS(TorsionFeatArgs)) {
     float3 c1 = cross(v1, v2), c2 = cross(v3, v2), c3 = cross(c2, c1);
     float v2m = sqrt(max(dot(v2, v2), 1e-12f));
     float ang = precise::atan2(dot(c3, v2), v2m * dot(c1, c2));
-    f[22 + c] = precise::sin(ang) * mm; f[26 + c] = precise::cos(ang) * mm; f[30 + c] = mm;
+    f[22 + c] = (half)(precise::sin(ang) * mm); f[26 + c] = (half)(precise::cos(ang) * mm); f[30 + c] = (half)mm;
     if (c == 0) a.rowMask[i] = mm;
   }
 }
@@ -601,7 +601,7 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
                             uint tid [[thread_index_in_threadgroup]]) {
   const uint q = tg.x, H = a.H, Cs = a.Cs, Pv = a.Pv, C2 = a.C2;
   const uint Fw = H * Cs + 4 * H * Pv + H * C2;
-  device float* f = a.fin + (ulong)q * Fw;
+  device half* f = a.fin + (ulong)q * Fw;
   if (C2 == 128 && H == 12 && Pv == 8 && Cs == 16) {
     if (tg.y == 0) {
       if (tid < 128) {
@@ -615,10 +615,10 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
           s4  += at[4 * a.L + k] * v; s5  += at[5 * a.L + k] * v; s6  += at[6 * a.L + k] * v; s7  += at[7 * a.L + k] * v;
           s8  += at[8 * a.L + k] * v; s9  += at[9 * a.L + k] * v; s10 += at[10 * a.L + k] * v; s11 += at[11 * a.L + k] * v;
         }
-        device float* fp = f + 12 * 16 + 4 * 12 * 8 + c;
-        fp[0 * 128] = s0; fp[1 * 128] = s1; fp[2 * 128] = s2; fp[3 * 128] = s3;
-        fp[4 * 128] = s4; fp[5 * 128] = s5; fp[6 * 128] = s6; fp[7 * 128] = s7;
-        fp[8 * 128] = s8; fp[9 * 128] = s9; fp[10 * 128] = s10; fp[11 * 128] = s11;
+        device half* fp = f + 12 * 16 + 4 * 12 * 8 + c;
+        fp[0 * 128] = (half)s0; fp[1 * 128] = (half)s1; fp[2 * 128] = (half)s2; fp[3 * 128] = (half)s3;
+        fp[4 * 128] = (half)s4; fp[5 * 128] = (half)s5; fp[6 * 128] = (half)s6; fp[7 * 128] = (half)s7;
+        fp[8 * 128] = (half)s8; fp[9 * 128] = (half)s9; fp[10 * 128] = (half)s10; fp[11 * 128] = (half)s11;
       } else if (tid < 128 + 96) {
         uint hp = tid - 128, h = hp >> 3, p = hp & 7;
         device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
@@ -632,17 +632,17 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
         float loc[3];
         rapplyInv(rig, g, loc);
         uint base = 12 * 16, idx = h * 8 + p;
-        f[base + idx] = loc[0];
-        f[base + 96 + idx] = loc[1];
-        f[base + 192 + idx] = loc[2];
-        f[base + 288 + idx] = sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+        f[base + idx] = (half)loc[0];
+        f[base + 96 + idx] = (half)loc[1];
+        f[base + 192 + idx] = (half)loc[2];
+        f[base + 288 + idx] = (half)sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
       }
     } else if (tid < 192) {
       uint h = tid >> 4, c = tid & 15;
       device const float* at = a.attn + ((ulong)q * 12 + h) * a.L;
       float s = 0.f;
       for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[(ulong)k * a.ldv + h * 16 + c];
-      f[h * 16 + c] = s;
+      f[h * 16 + c] = (half)s;
     }
     return;
   }
@@ -651,7 +651,7 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
     for (uint c = tid; c < Cs; c += 256) {
       float s = 0;
       for (uint k = 0; k < a.L; ++k) s += at[k] * a.vs[(ulong)k * a.ldv + h * Cs + c];
-      f[h * Cs + c] = s;
+      f[h * Cs + c] = (half)s;
     }
     float rig[12]; for (int k = 0; k < 12; ++k) rig[k] = a.rig[q * 12 + k];
     for (uint p = tid; p < Pv; p += 256) {
@@ -661,15 +661,15 @@ kernel void af2_ipa_outputs(constant IpaOutputsArgs& a [[buffer(0)]], uint3 tg [
       float loc[3];
       rapplyInv(rig, g, loc);
       uint base = H * Cs, idx = h * Pv + p;
-      f[base + idx] = loc[0];
-      f[base + H * Pv + idx] = loc[1];
-      f[base + 2 * H * Pv + idx] = loc[2];
-      f[base + 3 * H * Pv + idx] = sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
+      f[base + idx] = (half)loc[0];
+      f[base + H * Pv + idx] = (half)loc[1];
+      f[base + 2 * H * Pv + idx] = (half)loc[2];
+      f[base + 3 * H * Pv + idx] = (half)sqrt(max(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
     }
     for (uint c = tid; c < C2; c += 256) {
       float s = 0;
       for (uint k = 0; k < a.L; ++k) s += at[k] * a.act2d[((ulong)q * a.L + k) * C2 + c];
-      f[H * Cs + 4 * H * Pv + h * C2 + c] = s;
+      f[H * Cs + 4 * H * Pv + h * C2 + c] = (half)s;
     }
   }
 }
@@ -691,7 +691,10 @@ kernel void af2_rigid_update(LF_ARGS(RigidUpdateArgs)) {
 }
 kernel void af2_relu_copy(LF_ARGS(ReluCopyArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n) a.y[t] = max(a.x[t], 0.f);
+  if (t >= a.n) return;
+  float v = max(a.x[t], 0.f);
+  if (a.yh) a.yh[t] = (half)v;
+  else a.y[t] = v;
 }
 kernel void af2_softplus_scale(LF_ARGS(SoftplusArgs)) {
   uint h = (uint)LF_INDEX;

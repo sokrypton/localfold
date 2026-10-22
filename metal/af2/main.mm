@@ -183,7 +183,7 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
       std::string nextNorm = (!t.opmFirst && b + 1 < mainBlocks)
         ? "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm"
         : "";
-      evoformerBlock(t, false, b, nextNorm, b + 1);
+      evoformerBlock(t, false, b, nextNorm, b + 1 < mainBlocks ? b + 1 : -1);
     }
     if (t.h.pair) {
       releaseScratch({"att.", "bias.", "col.", "row.", "gcol.", "ln.", "opm.", "tri.", "tr."});
@@ -202,8 +202,8 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
     copy(prevPos, so.pos37, (size_t)L * 37 * 3 * 4);
     // the heads, on this pass's representations
     const std::string PL = "predicted_lddt_head/";
-    float* a = scratch<float>("head.a", (size_t)L * 384); float* h1 = scratch<float>("head.h1", (size_t)L * 128);
-    float* h2 = scratch<float>("head.h2", (size_t)L * 128);
+    half* a = scratch<half>("head.a", (size_t)L * 384); half* h1 = scratch<half>("head.h1", (size_t)L * 128);
+    half* h2 = scratch<half>("head.h2", (size_t)L * 128);
     layerNormW(so.act, a, L, 384, PL + "input_layer_norm");
     linearB(a, PL + "act_0", -1, h1, L, 384, 128, true);
     linearB(h1, PL + "act_1", -1, h2, L, 128, 128, true);
@@ -370,10 +370,15 @@ int foldMain(int argc, char** argv) {
     }
     lf::weights::Shapes S; S.shape = Model::bundleShapes(bundleDir, deltaDir);
     std::vector<std::string> lines = lf::weights::af2WeightLines(manifest, S, deltaModel);
-    // the Evoformer's and the templates' matrices decoded straight to float16; everything else float32
-    M.loadBundleWalk(bundleDir, lines, deltaDir, [](const std::string& n, size_t elements) {
-      return elements >= 8192 && !n.rfind("w/evoformer/", 0);
+    // the Evoformer's, the templates', the structure module's and the heads' matrices decoded straight to float16
+    M.loadBundleWalk(bundleDir, lines, deltaDir, [](const std::string& n, size_t) {
+      auto ends = [&](const char* s) { size_t l = strlen(s); return n.size() >= l && !n.compare(n.size() - l, l, s); };
+      if (!ends("/weights") && !ends("_w")) return false;
+      if (ends("embedding2d/weights")) return false;
+      if (n.find("template_pair_embedding_") != std::string::npos && !ends("template_pair_embedding_8/weights")) return false;
+      return true;
     });
+    prepareWeights();
   }
   if (getenv("AF2_STARTUP")) { mt::sync(); printf("weights up %.0f ms\n", ms(tStart)); }
   // the fold's families of scratch (core.h shareScratch): a block's modules - its attentions (the pair bias and the MSA

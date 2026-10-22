@@ -30,9 +30,13 @@ void linearB(const float* X, const std::string& w, int block, float* Y, size_t r
              float beta = 0.f);
 void linearB(const half* X, const std::string& w, int block, float* Y, size_t rows, int in, int out, bool relu = false,
              float beta = 0.f);
+void linearB(const half* X, const std::string& w, int block, half* Y, size_t rows, int in, int out, bool relu = false,
+             float beta = 0.f);
 void layerNormW(const float* x, float* y, size_t rows, int C, const std::string& w, int block = -1);
 void layerNormW(const float* x, half* y, size_t rows, int C, const std::string& w, int block = -1);
+void layerNormW(const float* x, float* y, half* yh, size_t rows, int C, const std::string& w, int block = -1);
 void layerNormW(const half* x, half* y, size_t rows, int C, const std::string& w, int block = -1);
+void prepareWeights();
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows

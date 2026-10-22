@@ -199,7 +199,7 @@ kernel void lf_layernorm(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[thr
     if (a.scale) n *= a.scale[c];
     if (a.offset) n += a.offset[c];
     if (a.yh) a.yh[row * a.ldy + c] = (half)n;
-    else a.y[row * a.ldy + c] = n;
+    if (a.y) a.y[row * a.ldy + c] = n;
     if (a.yh2) {
       float n2 = n0;
       if (a.scale2) n2 *= a.scale2[c];
@@ -243,7 +243,8 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
     if (a.yh) {
       if ((a.ldy & 3) == 0) ((device half4*)(a.yh + row * a.ldy))[c] = half4(n);
       else for (int e = 0; e < 4; ++e) a.yh[row * a.ldy + 4 * c + e] = (half)n[e];
-    } else {
+    }
+    if (a.y) {
       if ((a.ldy & 3) == 0) ((device float4*)(a.y + row * a.ldy))[c] = n;
       else for (int e = 0; e < 4; ++e) a.y[row * a.ldy + 4 * c + e] = n[e];
     }

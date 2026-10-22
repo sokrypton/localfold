@@ -1174,6 +1174,9 @@ void layerNorm(const float* x, float* y, size_t rows, int C, const float* s, con
 void layerNorm(const float* x, half* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {
   layerNormRun(x, nullptr, nullptr, y, rows, C, s, o, eps, ldx, ldy);
 }
+void layerNorm(const float* x, float* y, half* yh, size_t rows, int C, const float* s, const float* o, float eps) {
+  layerNormRun(x, nullptr, y, yh, rows, C, s, o, eps, 0, 0);
+}
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {
   layerNormRun(nullptr, x, nullptr, y, rows, C, s, o, eps, ldx, ldy);
 }

@@ -47,8 +47,8 @@ void templateEmbedding(float* pair, const float* pairMask, int L) {
     layerNormW(act, act, pairs, C, S + "output_layer_norm");     // (in place: a row is read whole before it is written)
     add(sum, act, pairs * C);
   }
-  run1d("af2_relu_scale", pairs * C, ReluScaleArgs{sum, pairs * C, 1.f / T, 0});
-  linearB(sum, TE + "output_linear", -1, pair, pairs, C, Cz, false, 1.f);
+  run1d("af2_relu_scale", pairs * C, ReluScaleArgs{sum, qn, pairs * C, 1.f / T, 0});
+  linearB(qn, TE + "output_linear", -1, pair, pairs, C, Cz, false, 1.f);
   releaseScratch({"tmpl."});
 }
 
@@ -93,12 +93,12 @@ void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T) 
 void templateRows(int L, int T, bool multimer, float* rows, float* rowMask) {
   const std::string E = "evoformer/";
   int F = multimer ? 34 : 57;
-  float* feat = scratch<float>("trow.feat", (size_t)T * L * F);
+  half* feat = scratch<half>("trow.feat", (size_t)T * L * F);
   for (int k = 0; k < T; ++k)
     run1d(multimer ? "af2_template_chi" : "af2_template_torsion", L,
           TorsionFeatArgs{Ii("t/aatype") + (size_t)k * L, In("t/positions") + (size_t)k * L * 37 * 3, In("t/mask") + (size_t)k * L * 37,
                           feat + (size_t)k * L * F, rowMask + (size_t)k * L, (uint)L, 0});
-  float* hid = scratch<float>("trow.hid", (size_t)T * L * 256);
+  half* hid = scratch<half>("trow.hid", (size_t)T * L * 256);
   linearB(feat, E + "template_single_embedding", -1, hid, (size_t)T * L, F, 256, true);
   linearB(hid, E + "template_projection", -1, rows, (size_t)T * L, 256, 256);
 }

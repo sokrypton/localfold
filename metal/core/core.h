@@ -206,6 +206,7 @@ void layerNorm(const float* x, float* y, size_t rows, int C, const float* scale,
                int ldx = 0, int ldy = 0);
 void layerNorm(const float* x, half* y, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f,
                int ldx = 0, int ldy = 0);
+void layerNorm(const float* x, float* y, half* yh, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f);
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f,
                int ldx = 0, int ldy = 0);
 void layerNormDual(const float* x, half* y1, const float* s1, const float* o1, half* y2, const float* s2, const float* o2,
