@@ -1255,13 +1255,21 @@ const PRIORS = new Map([
     // overflowing; fold-af2.js at 200 residues holds its CA-CA gate and moves
     // mean pLDDT by 0.084.
     //
-    // 🔴 AND THIS IS ONE M2. "metal-3" spans parts with very different core
-    // counts, and this repository's own attentionQueriesPerLane spread - M2
-    // 0.21x, M4 Pro 0.45x, GB10 1.17-1.42x - is the standing warning that the
-    // badge does not predict the number. The direction here is mechanism (a
-    // GEMM with the model's deepest K onto units that exist) rather than a
-    // tuned constant, but re-sweep before trusting it on another Apple part.
-    opmMatrixContract: true,
+    // 🔴 THE f16 VECTOR GEMM (`vectorGemmBlock: { f16: "64x128x32" }`) BEATS THE
+    // 8x8x8 SUBGROUP-MATRIX PATH ON APPLE SILICON. When `opmMatrixContract: true`
+    // was set here, it was measured against the older per-pair contraction and
+    // output projection before `createOuterProductMeanVectorContractShader` and
+    // `createOuterProductMeanVectorOutputShader` (`64x128x32` in f16) existed.
+    // Whenever `chromium-experimental-subgroup-matrix` is active, `true` switches
+    // off the `64x128x32` vector GEMMs for the un-prefetched `64x64x16` 8x8x8
+    // subgroup-matrix path, which is 1.24-1.51x SLOWER across every shape
+    // (`profile-af2-block.js --sweep=opmMatrixContract=true,false`, interleaved):
+    //
+    //   length x rows   matrix -> vector block ms   contract ms       project-output ms
+    //   59  x 128          9.75 ->  8.84 (-9.3%)    0.420 -> 0.301    0.432 -> 0.349
+    //   200 x 128         58.99 -> 56.50 (-4.2%)    4.659 -> 3.197    4.526 -> 3.441
+    //   200 x 512 (extra) 65.48 -> 59.07 (-9.8%)   17.242 -> 12.002   5.190 -> 3.426
+    opmMatrixContract: false,
     // 🔴 THE MSA ROW ATTENTION'S PAIR BIAS WITH ITS LAYER NORM, WHICH THE A100 DECLINED AT 0.2-0.9% OF A BLOCK
     // (docs/AF2.md). Here the separate `pair-normalize` - a workgroup a pair row, twelve barriers for 128 channels -
     // is slow AND erratic: profile-af2-block.js, two rounds a shape, pair-normalize + pair-bias against the fused

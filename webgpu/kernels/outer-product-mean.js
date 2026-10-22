@@ -165,11 +165,11 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  if (lane == 0u) {
+    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = total / f32(n_ch);
+  }
   workgroupBarrier();
   let mean = row_stat[0];
   var squared = 0.0;
@@ -192,11 +192,11 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + p.layer_norm_epsilon); }
+  if (lane == 0u) {
+    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + p.layer_norm_epsilon);
+  }
   workgroupBarrier();
   let inverse_std = row_stat[0];
   if (n_ch <= 256u) {
@@ -1224,8 +1224,7 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
   const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
   const acc = [], inner = [], stores = [], biases = [], flush = [];
   for (let j = 0; j < TV; j += 1) {
-    biases.push(`  let bias_${j} = vec4<f32>(weights[b0 + ${4 * j}u], weights[b0 + ${4 * j + 1}u], `
-      + `weights[b0 + ${4 * j + 2}u], weights[b0 + ${4 * j + 3}u]);`);
+    biases.push(`  let bias_${j} = weights[b0 + ${j}u];`);
   }
   for (let i = 0; i < TM; i += 1) {
     for (let j = 0; j < TV; j += 1) {
@@ -1240,10 +1239,10 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
     if (row < parameters.rows) {
       let pair = parameters.padding.x + row;
       let pair_scale = scale[pair];
+      let row_out = pair * columns4 + column4;
 ${Array.from({ length: TV }, (_, j) => `      {
         let scaled = ${f16 ? `acc_${i}_${j} + bias_${j} * pair_scale` : `acc_${i}_${j} * pair_scale`};
-        let at = pair * parameters.columns + column + ${4 * j}u;
-${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} scaled.${"xyzw"[c]};`).join("\n")}
+        output[row_out + ${j}u] ${residual ? "+=" : "="} scaled;
       }`).join("\n")}
     }
   }`);
@@ -1290,7 +1289,7 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
   const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
-  let b_col_${s} = parameters.weight_offset + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * parameters.columns;`;
+  let b_col4_${s} = weight_offset4 + column_origin4 + (${eExpr} % ${BN / 4}u) + b_k_${s} * columns4;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let s0 = a_base_${s} + k0;
@@ -1323,8 +1322,8 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `    {
-      let base = b_col_${s} + k0 * parameters.columns;
-      b_tile[${eExpr}] = vec4<${T}>(vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u], weights[base + 3u]));
+      let base4 = b_col4_${s} + k0 * columns4;
+      b_tile[${eExpr}] = vec4<${T}>(weights[base4]);
     }`;
   }).join("\n");
   return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
@@ -1332,9 +1331,9 @@ ${[0, 1, 2, 3].map((c) => `        output[at + ${c}u] ${residual ? "+=" : "="} s
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> scale: array<f32>;
 var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
@@ -1342,11 +1341,13 @@ var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * ${BM}u;
-  let column_origin = group.x * ${BN}u;
+  let column_origin4 = group.x * ${BN / 4}u;
+  let columns4 = parameters.columns / 4u;
+  let weight_offset4 = parameters.weight_offset / 4u;
   let tx = li % 16u;
   let ty = li / 16u;
-  let column = column_origin + tx * ${TN}u;
-  let b0 = parameters.bias_offset + column;
+  let column4 = column_origin4 + tx * ${TV}u;
+  let b0 = parameters.bias_offset / 4u + column4;
 ${biases.join("\n")}
 ${acc.join("\n")}
 ${aPrecompute}
@@ -1437,7 +1438,7 @@ ${Array.from({ length: TV }, (_, j) => `      {
   }
   const storageType = vec4Align ? "vec4<f32>" : "f32";
   const load4 = (buf) => vec4Align
-    ? `${buf}[base / 4u]`
+    ? `${buf}[base]`
     : `vec4<f32>(${buf}[base], ${buf}[base + 1u], ${buf}[base + 2u], ${buf}[base + 3u])`;
   const aSteps = ((BM / 4) * BK) / 256;
   const bSteps = ((BN / 4) * BK) / 256;
@@ -1447,7 +1448,7 @@ ${Array.from({ length: TV }, (_, j) => `      {
   let a_mg_${s} = ${eExpr} % ${BM / 4}u;
   let a_r_${s} = row_origin + a_mg_${s} * 4u;
   let a_valid_${s} = a_r_${s} < parameters.rows;
-  let a_col_${s} = parameters.weight_offset + a_r_${s} + a_k_${s} * stride;
+  let a_col_${s} = ${vec4Align ? `(parameters.weight_offset + a_r_${s}) / 4u` : `parameters.weight_offset + a_r_${s}`} + a_k_${s} * stride;
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
   }).join("\n");
   const bPre = Array.from({ length: bSteps }, (_, s) => {
@@ -1455,7 +1456,7 @@ ${Array.from({ length: TV }, (_, j) => `      {
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
   let b_c_${s} = column_origin + (${eExpr} % ${BN / 4}u) * 4u;
   let b_valid_${s} = b_c_${s} < parameters.columns;
-  let b_col_${s} = b_c_${s} + b_k_${s} * stride;`;
+  let b_col_${s} = ${vec4Align ? `b_c_${s} / 4u` : `b_c_${s}`} + b_k_${s} * stride;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let k = k0 + a_k_${s};
@@ -1498,7 +1499,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let column = column_origin + tx * ${TN}u;
   // Both operands are [sequence][residue * C + channel]; a row of the GEMM is
   // one of the block's residues' channels, a column one of any residue's.
-  let stride = parameters.columns;
+  let stride = ${vec4Align ? "parameters.columns / 4u" : "parameters.columns"};
 ${acc.join("\n")}
 ${aPre}
 ${bPre}

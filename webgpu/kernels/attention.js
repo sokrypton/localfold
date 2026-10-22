@@ -196,11 +196,11 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  if (lane == 0u) {
+    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = total / f32(n_ch);
+  }
   workgroupBarrier();
   let mean = row_stat[0];
   var squared = 0.0;
@@ -223,20 +223,23 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + p.epsilon); }
+  if (lane == 0u) {
+    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + p.epsilon);
+  }
   workgroupBarrier();
   let inverse_std = row_stat[0];
 ${packOut ? `  let pairs = n_ch / 2u;
   let pair_base = row * pairs;
   if (n_ch <= 256u) {
-    for (var w = lane; w < pairs; w += 64u) {
-      let c = w * 2u;
-      let pair = pair_base + w;
-      ${storedPair(outputStorage, "output", "pair", value("c", "row_tile[c]"), value("c + 1u", "row_tile[c + 1u]"))}
+    if (lane < pairs) {
+      let c0 = lane * 2u;
+      ${storedPair(outputStorage, "output", "pair_base + lane", value("c0", "row_tile[c0]"), value("c0 + 1u", "row_tile[c0 + 1u]"))}
+    }
+    if (lane + 64u < pairs) {
+      let c1 = (lane + 64u) * 2u;
+      ${storedPair(outputStorage, "output", "pair_base + lane + 64u", value("c1", "row_tile[c1]"), value("c1 + 1u", "row_tile[c1 + 1u]"))}
     }
   } else {
     for (var w = lane; w < pairs; w += 64u) {
@@ -362,6 +365,9 @@ export function createAttentionProjectShader(
   const step = lanesY;
   const tileRows = lanesY * rowsPerLane;
   const rowVectors = tileRows / 4;
+  // Pad even rowVectors by 1 so lanes writing tile_source[local.x * sourceStride + local.y]
+  // do not hit a 16-way shared-memory bank conflict when rowVectors === 16.
+  const sourceStride = rowVectors | 1;
   const sourceTasks = step * rowVectors;
   const sourcePerLane = Math.ceil(sourceTasks / lanes);
 
@@ -401,7 +407,7 @@ export function createAttentionProjectShader(
   const inner = [];
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
+      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * sourceStride + g}u];`);
     }
     for (let v = 0; v < columnsPerLane; v += 1) {
       inner.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnsPerLane}u + ${k * lanesX * columnsPerLane + v}u];`);
@@ -413,15 +419,16 @@ export function createAttentionProjectShader(
     }
   }
 
-  const readSourceElem = (idx) => (sourceStorage === "f16" && (half || weight16)
-    ? (half
-      ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
-      : `f32(bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u])`)
+  const hasF16 = half || weight16;
+  const sourceElemType = sourceStorage === "f16" && hasF16 ? "f16" : storageArray(sourceStorage);
+  const readSourceElem = (idx) => (sourceStorage === "f16" && hasF16
+    ? (half ? `source[${idx}]` : `f32(source[${idx}])`)
     : narrow(storedElement(sourceStorage, "source", idx)));
   const readWeightElem = (idx) => (half && weight16
     ? `weights[${idx}]`
     : narrow(wf(`weights[${idx}]`)));
 
+  const stageSourcePre = [];
   const stageSource = [];
   const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
@@ -429,15 +436,18 @@ export function createAttentionProjectShader(
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
     const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
     const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
+    stageSourcePre.push(`  let s_rg_${n} = ${rowGroupExpr};
+  let s_kl_${n} = ${kLocalExpr};
+  let s_rb_${n} = group.y * ${tileRows}u + s_rg_${n} * 4u;
+  let s_full_${n} = s_rb_${n} + 3u < rows;
+  let s_base_${n} = s_rb_${n} * p.channels + s_kl_${n};
+  let s_slot_${n} = s_kl_${n} * ${sourceStride}u + s_rg_${n};`);
     stageSource.push(`    ${guard}{
-      let row_group = ${rowGroupExpr};
-      let k_local = ${kLocalExpr};
-      let c = c0 + k_local;
-      let row_base = group.y * ${tileRows}u + row_group * 4u;
+      let c = c0 + s_kl_${n};
       var staged = ${vector}(0.0);
       if (c < p.channels) {
-        let s0 = row_base * p.channels + c;
-        if (row_base + 3u < rows) {
+        let s0 = s_base_${n} + c0;
+        if (s_full_${n}) {
           staged = ${vector}(
             ${readSourceElem("s0")},
             ${readSourceElem("s0 + p.channels")},
@@ -445,13 +455,13 @@ export function createAttentionProjectShader(
             ${readSourceElem("s0 + p.channels * 3u")},
           );
         } else {
-          if (row_base < rows) { staged.x = ${readSourceElem("s0")}; }
-          if (row_base + 1u < rows) { staged.y = ${readSourceElem("s0 + p.channels")}; }
-          if (row_base + 2u < rows) { staged.z = ${readSourceElem("s0 + p.channels * 2u")}; }
-          if (row_base + 3u < rows) { staged.w = ${readSourceElem("s0 + p.channels * 3u")}; }
+          if (s_rb_${n} < rows) { staged.x = ${readSourceElem("s0")}; }
+          if (s_rb_${n} + 1u < rows) { staged.y = ${readSourceElem("s0 + p.channels")}; }
+          if (s_rb_${n} + 2u < rows) { staged.z = ${readSourceElem("s0 + p.channels * 2u")}; }
+          if (s_rb_${n} + 3u < rows) { staged.w = ${readSourceElem("s0 + p.channels * 3u")}; }
         }
       }
-      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+      tile_source[s_slot_${n}] = staged;
     }`);
   }
 
@@ -531,8 +541,8 @@ ${body.join("\n")}
   }`);
   }
 
-  return `${half || weight16 ? "enable f16;\n" : ""}${COMMON}
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
+  return `${hasF16 ? "enable f16;\n" : ""}${COMMON}
+@group(0) @binding(0) var<storage, read> source: array<${sourceElemType}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<${storageArray(outputStorage)}>;
@@ -541,7 +551,7 @@ ${body.join("\n")}
 @group(0) @binding(6) var<storage, read_write> gate: array<${storageArray(outputStorage)}>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * sourceStride}>;
 // One vec4 a cell: (query, key, value, gate), laid out per thread.
 var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnsPerLane}>;
 
@@ -557,6 +567,7 @@ ${paired
   ? `  let pair_origin = group.x * ${lanesX * (columnsPerLane / 2)}u + local.x;`
   : `  let column_origin = group.x * ${lanesX * columnsPerLane}u + local.x;`}
 ${bias.join("\n")}
+${stageSourcePre.join("\n")}
 ${declare.join("\n")}
 
   for (var c0 = 0u; c0 < p.channels; c0 += ${step}u) {
@@ -2331,6 +2342,9 @@ export function createAttentionOutputShader(
   const step = lanesY;
   const tileRows = lanesY * rowsPerLane;
   const rowVectors = tileRows / 4;
+  // Pad even rowVectors by 1 so lanes writing tile_source[local.x * sourceStride + local.y]
+  // do not hit a 16-way shared-memory bank conflict when rowVectors === 16.
+  const sourceStride = rowVectors | 1;
   const columnVectors = columnsPerLane / 4;
   const sourceTasks = step * rowVectors;
   const sourcePerLane = Math.ceil(sourceTasks / lanes);
@@ -2342,7 +2356,7 @@ export function createAttentionOutputShader(
   }
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      lines.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
+      lines.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * sourceStride + g}u];`);
     }
     for (let v = 0; v < columnVectors; v += 1) {
       lines.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnVectors}u + ${k * lanesX * columnVectors + v}u];`);
@@ -2354,15 +2368,17 @@ export function createAttentionOutputShader(
     }
   }
 
+  const sourceElemType = sourceStorage === "f16" && half ? "f16" : storageArray(sourceStorage);
   const readSourceElem = (idx) => {
     if (sourceStorage === "f16") {
       return half
-        ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
+        ? `source[${idx}]`
         : `unpack2x16float(source[(${idx}) >> 1u])[(${idx}) & 1u]`;
     }
     return narrow(`source[${idx}]`);
   };
 
+  const stageSourcePre = [];
   const stageSource = [];
   const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
@@ -2370,26 +2386,29 @@ export function createAttentionOutputShader(
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
     const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
     const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
+    stageSourcePre.push(`  let s_rg_${n} = ${rowGroupExpr};
+  let s_kl_${n} = ${kLocalExpr};
+  let s_rb_${n} = group.y * ${tileRows}u + s_rg_${n} * 4u;
+  let s_full_${n} = s_rb_${n} + 3u < rows;
+  let s_base_${n} = s_rb_${n} * projected + s_kl_${n};
+  let s_slot_${n} = s_kl_${n} * ${sourceStride}u + s_rg_${n};`);
     stageSource.push(`    ${guard}{
-      let row_group = ${rowGroupExpr};
-      let k_local = ${kLocalExpr};
-      let k = k0 + k_local;
-      let row_base = group.y * ${tileRows}u + row_group * 4u;
+      let k = k0 + s_kl_${n};
       var staged = ${vector}(0.0);
       if (k < projected) {
-        if (row_base + 3u < rows) {
-          let b0 = row_base * projected + k;
+        let b0 = s_base_${n} + k0;
+        if (s_full_${n}) {
           let b1 = b0 + projected;
           let b2 = b1 + projected;
           let b3 = b2 + projected;
           staged = ${vector}(${readSourceElem("b0")}, ${readSourceElem("b1")}, ${readSourceElem("b2")}, ${readSourceElem("b3")});
         } else {
-          if (row_base < rows) { staged.x = ${readSourceElem("row_base * projected + k")}; }
-          if (row_base + 1u < rows) { staged.y = ${readSourceElem("(row_base + 1u) * projected + k")}; }
-          if (row_base + 2u < rows) { staged.z = ${readSourceElem("(row_base + 2u) * projected + k")}; }
+          if (s_rb_${n} < rows) { staged.x = ${readSourceElem("b0")}; }
+          if (s_rb_${n} + 1u < rows) { staged.y = ${readSourceElem("b0 + projected")}; }
+          if (s_rb_${n} + 2u < rows) { staged.z = ${readSourceElem("b0 + projected * 2u")}; }
         }
       }
-      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+      tile_source[s_slot_${n}] = staged;
     }`);
   }
 
@@ -2447,13 +2466,13 @@ ${body.join("\n")}
   }
 
   return `${half ? "enable f16;\n" : ""}${COMMON}
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
+@group(0) @binding(0) var<storage, read> source: array<${sourceElemType}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * sourceStride}>;
 // Laid out per thread: a lane's own strided columns, contiguous where it reads.
 var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnVectors}>;
 
@@ -2466,6 +2485,7 @@ fn main(
   let projected = p.heads * p.head_dim;
   let linear_lane = local.y * ${lanesX}u + local.x;
   let channel_origin = group.x * ${lanesX * columnsPerLane}u + local.x;
+${stageSourcePre.join("\n")}
 ${declare.join("\n")}
 
   for (var k0 = 0u; k0 < projected; k0 += ${step}u) {

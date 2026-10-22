@@ -591,6 +591,9 @@ export function createLinearShader(
   const tileRows = lanesY * rowsPerLane;
   const tileColumns = lanesX * columnsPerLane;
   const rowVectors = tileRows / 4;
+  // Pad even rowVectors by 1 so lanes writing tile_source[local.x * sourceStride + local.y]
+  // do not hit a 16-way shared-memory bank conflict when rowVectors === 16 (32 4-byte banks).
+  const sourceStride = rowVectors | 1;
   const columnVectors = columnsPerLane / 4;
   // Each lane stages whole vec4s of both operands. A wide, shallow tile can
   // have fewer source vectors than lanes, so the last pass is guarded rather
@@ -627,7 +630,7 @@ export function createLinearShader(
   const inner = [];
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
-      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * rowVectors + g}u];`);
+      inner.push(`    let s_${k}_${g} = tile_source[local.y * ${rowsPerLane / 4}u + ${k * sourceStride + g}u];`);
     }
     for (let v = 0; v < columnVectors; v += 1) {
       inner.push(`    let w_${k}_${v} = tile_weight[local.x * ${columnVectors}u + ${k * lanesX * columnVectors + v}u];`);
@@ -653,10 +656,10 @@ export function createLinearShader(
     }
   }
 
-  const readSourceElem = (idx) => (sourceStorage === "f16" && (element === "f16" || weight16)
-    ? (element === "f16"
-      ? `bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u]`
-      : `f32(bitcast<vec2<f16>>(source[(${idx}) >> 1u])[(${idx}) & 1u])`)
+  const hasF16 = element === "f16" || weight16;
+  const sourceElemType = sourceStorage === "f16" && hasF16 ? "f16" : storageArray(sourceStorage);
+  const readSourceElem = (idx) => (sourceStorage === "f16" && hasF16
+    ? (element === "f16" ? `source[${idx}]` : `f32(source[${idx}])`)
     : cast(storedElement(sourceStorage, "source", idx)));
   const readWeightElem = (idx) => (element === weightPrecision
     ? `weights[${idx}]`
@@ -665,6 +668,7 @@ export function createLinearShader(
   // Staging the source: a lane takes four rows at one k, so its four global
   // reads are `inner` apart and CONSECUTIVE LANES take consecutive k - which is
   // what makes each of the four a coalesced run.
+  const stageSourcePre = [];
   const stageSource = [];
   const sameLanes = lanesX === step;
   for (let n = 0; n < sourcePerLane; n += 1) {
@@ -672,15 +676,18 @@ export function createLinearShader(
     const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
     const rowGroupExpr = sameLanes ? (n === 0 ? "local.y" : `(local.y + ${n * lanesY}u)`) : `(${task} / ${step}u)`;
     const kLocalExpr = sameLanes ? "local.x" : `(${task} % ${step}u)`;
+    stageSourcePre.push(`  let s_rg_${n} = ${rowGroupExpr};
+  let s_kl_${n} = ${kLocalExpr};
+  let s_rb_${n} = group.y * ${tileRows}u + s_rg_${n} * 4u;
+  let s_full_${n} = s_rb_${n} + 3u < parameters.rows;
+  let s_base_${n} = s_rb_${n} * parameters.inner + s_kl_${n};
+  let s_slot_${n} = s_kl_${n} * ${sourceStride}u + s_rg_${n};`);
     stageSource.push(`    ${guard}{
-      let row_group = ${rowGroupExpr};
-      let k_local = ${kLocalExpr};
-      let k = k0 + k_local;
-      let row_base = group.y * ${tileRows}u + row_group * 4u;
+      let k = k0 + s_kl_${n};
       var staged = ${vector}(0.0);
       if (k < parameters.inner) {
-        let s0 = row_base * parameters.inner + k;
-        if (row_base + 3u < parameters.rows) {
+        let s0 = s_base_${n} + k0;
+        if (s_full_${n}) {
           staged = ${vector}(
             ${readSourceElem("s0")},
             ${readSourceElem("s0 + parameters.inner")},
@@ -688,13 +695,13 @@ export function createLinearShader(
             ${readSourceElem("s0 + parameters.inner * 3u")},
           );
         } else {
-          if (row_base < parameters.rows) { staged.x = ${readSourceElem("s0")}; }
-          if (row_base + 1u < parameters.rows) { staged.y = ${readSourceElem("s0 + parameters.inner")}; }
-          if (row_base + 2u < parameters.rows) { staged.z = ${readSourceElem("s0 + parameters.inner * 2u")}; }
-          if (row_base + 3u < parameters.rows) { staged.w = ${readSourceElem("s0 + parameters.inner * 3u")}; }
+          if (s_rb_${n} < parameters.rows) { staged.x = ${readSourceElem("s0")}; }
+          if (s_rb_${n} + 1u < parameters.rows) { staged.y = ${readSourceElem("s0 + parameters.inner")}; }
+          if (s_rb_${n} + 2u < parameters.rows) { staged.z = ${readSourceElem("s0 + parameters.inner * 2u")}; }
+          if (s_rb_${n} + 3u < parameters.rows) { staged.w = ${readSourceElem("s0 + parameters.inner * 3u")}; }
         }
       }
-      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+      tile_source[s_slot_${n}] = staged;
     }`);
   }
 
@@ -773,7 +780,7 @@ ${values.join("\n")}
     rowNames.push(`  let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;`);
   }
 
-  return `${element === "f16" || weight16 ? "enable f16;\n" : ""}
+  return `${hasF16 ? "enable f16;\n" : ""}
 struct MatmulParameters {
   rows: u32,
   inner: u32,
@@ -783,13 +790,13 @@ struct MatmulParameters {
   activation: u32,
   padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
+@group(0) @binding(0) var<storage, read> source: array<${sourceElemType}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<${storageArray(outputStorage)}>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * sourceStride}>;
 // Laid out per thread: a lane's own strided columns, contiguous where it reads.
 var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnVectors}>;
 
@@ -801,6 +808,7 @@ fn main(
   let linear_lane = local.y * ${lanesX}u + local.x;
 ${originDeclaration}
 ${rowNames.join("\n")}
+${stageSourcePre.join("\n")}
 ${declare.join("\n")}
 
   for (var k0 = 0u; k0 < parameters.inner; k0 += ${step}u) {
@@ -886,11 +894,11 @@ fn main(
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = (partial[0] + partial[1]) / f32(n_ch); }
+  if (lane == 0u) {
+    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = total / f32(n_ch);
+  }
   workgroupBarrier();
   let mean = row_stat[0];
 
@@ -914,11 +922,11 @@ fn main(
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane < 4u) { partial[lane] += partial[lane + 4u]; }
-  workgroupBarrier();
-  if (lane < 2u) { partial[lane] += partial[lane + 2u]; }
-  workgroupBarrier();
-  if (lane == 0u) { row_stat[0] = inverseSqrt((partial[0] + partial[1]) / f32(n_ch) + parameters.epsilon); }
+  if (lane == 0u) {
+    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + parameters.epsilon);
+  }
   workgroupBarrier();
   let inverse_std = row_stat[0];
   if (n_ch <= 256u) {

@@ -324,7 +324,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
  * loops want constant bounds - see CLAUDE.md on what a runtime trip count costs
  * in a short body. The shape is in the pipeline cache key.
  */
-export const GLOBAL_ATTENTION_OUTPUT_ROWS = 4;
+export const GLOBAL_ATTENTION_OUTPUT_ROWS = 8;
 
 export function createGlobalAttentionOutputShader(channels, heads, headDim, residual = false) {
   for (const [name, value] of [["channels", channels], ["heads", heads], ["headDim", headDim]]) {
@@ -344,10 +344,12 @@ const GATES: u32 = ${gates}u;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
-// Four rows per workgroup, read once for every gate and every output channel.
-var<workgroup> staged: array<vec4<f32>, ${channels}>;
-// ...and the gated value per (head, head_dim), four rows at a time.
-var<workgroup> gated: array<vec4<f32>, ${gates}>;
+// Eight rows per workgroup (two vec4 per channel/gate), read once for every gate and output channel.
+var<workgroup> staged_a: array<vec4<f32>, ${channels}>;
+var<workgroup> staged_b: array<vec4<f32>, ${channels}>;
+// ...and the gated value per (head, head_dim), eight rows at a time.
+var<workgroup> gated_a: array<vec4<f32>, ${gates}>;
+var<workgroup> gated_b: array<vec4<f32>, ${gates}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -355,28 +357,42 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let total_rows = p.sequences * p.length;
   let r0 = (group.x + group.y * GRID_WIDTH) * ${GLOBAL_ATTENTION_OUTPUT_ROWS}u;
   if (r0 >= total_rows) { return; }
-  let r1 = r0 + 1u;
-  let r2 = r0 + 2u;
-  let r3 = r0 + 3u;
+  let r1 = r0 + 1u; let r2 = r0 + 2u; let r3 = r0 + 3u;
+  let r4 = r0 + 4u; let r5 = r0 + 5u; let r6 = r0 + 6u; let r7 = r0 + 7u;
   let local = local_id.x;
   let col0 = r0 % p.length; let seq0 = r0 / p.length;
   let col1 = r1 % p.length; let seq1 = r1 / p.length;
   let col2 = r2 % p.length; let seq2 = r2 / p.length;
   let col3 = r3 % p.length; let seq3 = r3 / p.length;
+  let col4 = r4 % p.length; let seq4 = r4 / p.length;
+  let col5 = r5 % p.length; let seq5 = r5 / p.length;
+  let col6 = r6 % p.length; let seq6 = r6 / p.length;
+  let col7 = r7 % p.length; let seq7 = r7 / p.length;
   // ...the normalised tensor is column-major; see the query kernel.
   let nr0 = (col0 * p.sequences + seq0) * ${channels}u;
   let nr1 = (col1 * p.sequences + seq1) * ${channels}u;
   let nr2 = (col2 * p.sequences + seq2) * ${channels}u;
   let nr3 = (col3 * p.sequences + seq3) * ${channels}u;
+  let nr4 = (col4 * p.sequences + seq4) * ${channels}u;
+  let nr5 = (col5 * p.sequences + seq5) * ${channels}u;
+  let nr6 = (col6 * p.sequences + seq6) * ${channels}u;
+  let nr7 = (col7 * p.sequences + seq7) * ${channels}u;
 
   for (var c = local; c < ${channels}u; c += 64u) {
-    if (r3 < total_rows) {
-      staged[c] = vec4<f32>(normalized[nr0 + c], normalized[nr1 + c], normalized[nr2 + c], normalized[nr3 + c]);
+    if (r7 < total_rows) {
+      staged_a[c] = vec4<f32>(normalized[nr0 + c], normalized[nr1 + c], normalized[nr2 + c], normalized[nr3 + c]);
+      staged_b[c] = vec4<f32>(normalized[nr4 + c], normalized[nr5 + c], normalized[nr6 + c], normalized[nr7 + c]);
     } else {
-      staged[c] = vec4<f32>(
+      staged_a[c] = vec4<f32>(
         normalized[nr0 + c],
         select(0.0, normalized[nr1 + c], r1 < total_rows),
         select(0.0, normalized[nr2 + c], r2 < total_rows),
+        select(0.0, normalized[nr3 + c], r3 < total_rows),
+      );
+      staged_b[c] = vec4<f32>(
+        select(0.0, normalized[nr4 + c], r4 < total_rows),
+        select(0.0, normalized[nr5 + c], r5 < total_rows),
+        select(0.0, normalized[nr6 + c], r6 < total_rows),
         0.0,
       );
     }
@@ -384,41 +400,83 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   for (var slot = local; slot < ${gates}u; slot += 64u) {
-    var gate = vec4<f32>(weights[p.gating_bias + slot]);
+    var gate_a = vec4<f32>(weights[p.gating_bias + slot]);
+    var gate_b = gate_a;
     let gw_base = p.gating_weight + slot;
-    for (var c = 0u; c < ${channels}u; c += 1u) {
-      gate += staged[c] * weights[gw_base + c * ${gates}u];
+    var c = 0u;
+    for (; c + 3u < ${channels}u; c += 4u) {
+      let w0 = weights[gw_base + c * ${gates}u];
+      let w1 = weights[gw_base + (c + 1u) * ${gates}u];
+      let w2 = weights[gw_base + (c + 2u) * ${gates}u];
+      let w3 = weights[gw_base + (c + 3u) * ${gates}u];
+      gate_a = (((gate_a + staged_a[c] * w0) + staged_a[c + 1u] * w1) + staged_a[c + 2u] * w2) + staged_a[c + 3u] * w3;
+      gate_b = (((gate_b + staged_b[c] * w0) + staged_b[c + 1u] * w1) + staged_b[c + 2u] * w2) + staged_b[c + 3u] * w3;
     }
-    var att: vec4<f32>;
-    if (r3 < total_rows) {
-      att = vec4<f32>(
+    for (; c < ${channels}u; c += 1u) {
+      let w = weights[gw_base + c * ${gates}u];
+      gate_a += staged_a[c] * w;
+      gate_b += staged_b[c] * w;
+    }
+    var att_a: vec4<f32>;
+    var att_b: vec4<f32>;
+    if (r7 < total_rows) {
+      att_a = vec4<f32>(
         attended[col0 * ${gates}u + slot],
         attended[col1 * ${gates}u + slot],
         attended[col2 * ${gates}u + slot],
         attended[col3 * ${gates}u + slot],
       );
+      att_b = vec4<f32>(
+        attended[col4 * ${gates}u + slot],
+        attended[col5 * ${gates}u + slot],
+        attended[col6 * ${gates}u + slot],
+        attended[col7 * ${gates}u + slot],
+      );
     } else {
-      att = vec4<f32>(
+      att_a = vec4<f32>(
         attended[col0 * ${gates}u + slot],
         select(0.0, attended[col1 * ${gates}u + slot], r1 < total_rows),
         select(0.0, attended[col2 * ${gates}u + slot], r2 < total_rows),
+        select(0.0, attended[col3 * ${gates}u + slot], r3 < total_rows),
+      );
+      att_b = vec4<f32>(
+        select(0.0, attended[col4 * ${gates}u + slot], r4 < total_rows),
+        select(0.0, attended[col5 * ${gates}u + slot], r5 < total_rows),
+        select(0.0, attended[col6 * ${gates}u + slot], r6 < total_rows),
         0.0,
       );
     }
-    gated[slot] = att / (vec4<f32>(1.0) + exp(-gate));
+    gated_a[slot] = att_a / (vec4<f32>(1.0) + exp(-gate_a));
+    gated_b[slot] = att_b / (vec4<f32>(1.0) + exp(-gate_b));
   }
   workgroupBarrier();
 
   for (var c_out = local; c_out < ${channels}u; c_out += 64u) {
-    var result = vec4<f32>(weights[p.output_bias + c_out]);
+    var result_a = vec4<f32>(weights[p.output_bias + c_out]);
+    var result_b = result_a;
     let ow_base = p.output_weight + c_out;
-    for (var slot = 0u; slot < ${gates}u; slot += 1u) {
-      result += gated[slot] * weights[ow_base + slot * ${channels}u];
+    var slot = 0u;
+    for (; slot + 3u < ${gates}u; slot += 4u) {
+      let w0 = weights[ow_base + slot * ${channels}u];
+      let w1 = weights[ow_base + (slot + 1u) * ${channels}u];
+      let w2 = weights[ow_base + (slot + 2u) * ${channels}u];
+      let w3 = weights[ow_base + (slot + 3u) * ${channels}u];
+      result_a = (((result_a + gated_a[slot] * w0) + gated_a[slot + 1u] * w1) + gated_a[slot + 2u] * w2) + gated_a[slot + 3u] * w3;
+      result_b = (((result_b + gated_b[slot] * w0) + gated_b[slot + 1u] * w1) + gated_b[slot + 2u] * w2) + gated_b[slot + 3u] * w3;
     }
-    output[r0 * ${channels}u + c_out] ${residual ? "+=" : "="} result.x;
-    if (r1 < total_rows) { output[r1 * ${channels}u + c_out] ${residual ? "+=" : "="} result.y; }
-    if (r2 < total_rows) { output[r2 * ${channels}u + c_out] ${residual ? "+=" : "="} result.z; }
-    if (r3 < total_rows) { output[r3 * ${channels}u + c_out] ${residual ? "+=" : "="} result.w; }
+    for (; slot < ${gates}u; slot += 1u) {
+      let w = weights[ow_base + slot * ${channels}u];
+      result_a += gated_a[slot] * w;
+      result_b += gated_b[slot] * w;
+    }
+    output[r0 * ${channels}u + c_out] ${residual ? "+=" : "="} result_a.x;
+    if (r1 < total_rows) { output[r1 * ${channels}u + c_out] ${residual ? "+=" : "="} result_a.y; }
+    if (r2 < total_rows) { output[r2 * ${channels}u + c_out] ${residual ? "+=" : "="} result_a.z; }
+    if (r3 < total_rows) { output[r3 * ${channels}u + c_out] ${residual ? "+=" : "="} result_a.w; }
+    if (r4 < total_rows) { output[r4 * ${channels}u + c_out] ${residual ? "+=" : "="} result_b.x; }
+    if (r5 < total_rows) { output[r5 * ${channels}u + c_out] ${residual ? "+=" : "="} result_b.y; }
+    if (r6 < total_rows) { output[r6 * ${channels}u + c_out] ${residual ? "+=" : "="} result_b.z; }
+    if (r7 < total_rows) { output[r7 * ${channels}u + c_out] ${residual ? "+=" : "="} result_b.w; }
   }
 }`;
 }
