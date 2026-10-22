@@ -86,6 +86,7 @@ struct Gemm {
   const void* W; DT tw = F32; int ldw = 0; bool transW = false;
   void* Y; DT ty = F32; int ldy = 0;
   const void* Yin = nullptr;                 // beta's input, if not Y itself (same type and leading dimension)
+  bool yinFloat = false;                     // Yin is float* even when ty == F16
   size_t rows; int in, out;
   float alpha = 1.f, beta = 0.f;
   const void* bias = nullptr; DT tbias = F32; bool relu = false, gelu = false;

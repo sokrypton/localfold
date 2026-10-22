@@ -23,9 +23,10 @@ inline int dimOf(const std::string& n, int k) { return (int)M.dim(n, k); }
 void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
          const float* bias = nullptr, float alpha = 1.f, const float* Yin = nullptr);
 void lin(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
-         const float* bias = nullptr, float alpha = 1.f);
+         const float* bias = nullptr, float alpha = 1.f, const float* Yin = nullptr);
 void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias = nullptr,
           bool gelu = false);
+void prepareWeights();
 extern bool HALF_GEMM;            // every float32 GEMM's operands rounded to half (the cuda port's TF32 / FAST_16F)
 RelIdx relIdx();
 // a weight interleaved for gemmSwiglu: [rows][2I] = [a | b] -> blocks of 8 (a_0..a_7 b_0..b_7 a_8..)
@@ -43,8 +44,14 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
 // ---------------------------------------------------------------- the trunk (trunk.mm)
 void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z);
 // nextFollows: block b + 1 runs next on this pair, nothing between (its first norm is emitted by this block)
-void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
-void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
+void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false,
+                const std::string& lastNext = "");
+void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false,
+                const std::string& lastNext = "");
+void emitTrunkLn(const void* x, const std::string& norm, half* buf);
+void prepareTrunkWeights();
+void prepareAtomWeights();
+void prepareDiffusionWeights();
 bool halfPairBlocks(int C);     // the blocks over a half pair here (matrix units; LOCALFOLD_HALF_PAIR=0 the control)
 // (z is given back and made again while the blocks run on a half copy: a new pointer)
 // the full ESMFold2's MSA encoder over z_init, in place (trunk.mm)

@@ -12,8 +12,9 @@ void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, in
   else { g.W = M.f(w); g.tw = F32; }
   gemm(g);
 }
-void lin(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, const float* bias, float alpha) {
-  Gemm g{}; g.X = X; g.tx = F16; g.W = M.h(w); g.tw = F16; g.Y = Y; g.ty = F32; g.rows = rows; g.in = in; g.out = out;
+void lin(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, const float* bias, float alpha,
+         const float* Yin) {
+  Gemm g{}; g.X = X; g.tx = F16; g.W = M.h(w); g.tw = F16; g.Y = Y; g.ty = F32; g.Yin = Yin; g.rows = rows; g.in = in; g.out = out;
   g.beta = beta; g.alpha = alpha; g.bias = bias; g.label = w.c_str();
   gemm(g);
 }

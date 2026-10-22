@@ -35,11 +35,18 @@ Atoms prepareAtoms(int A, const std::string& prefix) {
   float* cosT = allocT<float>((size_t)A * 16); float* sinT = allocT<float>((size_t)A * 16);
   run1d("ef2_rope_table", (size_t)A * 16, RopeTableArgs{In("ref_pos"), Ii("ref_space_uid"), cosT, sinT, (uint)A, 0});
   at.ctx.cosT = cosT; at.ctx.sinT = sinT;
-  float* feat = scratch<float>("atom.features", (size_t)A * ATOM_FEATURES);
-  run1d("ef2_atom_features", (size_t)A * ATOM_FEATURES,
-        AtomFeaturesArgs{In("ref_pos"), In("ref_charge"), at.ctx.mask, Ii("ref_element"), Ii("ref_atom_name_chars"), feat, (uint)A, 0});
   at.c0 = allocT<float>((size_t)A * C);
-  lin(feat, "f/" + prefix + "/linear", at.c0, A, ATOM_FEATURES, C);
+  if (HALF_GEMM) {
+    half* featH = scratch<half>("atom.features", (size_t)A * ATOM_FEATURES);
+    run1d("ef2_atom_features", (size_t)A * ATOM_FEATURES,
+          AtomFeaturesArgs{In("ref_pos"), In("ref_charge"), at.ctx.mask, Ii("ref_element"), Ii("ref_atom_name_chars"), nullptr, featH, (uint)A, 0});
+    lin(featH, "f/" + prefix + "/linear", at.c0, A, ATOM_FEATURES, C);
+  } else {
+    float* feat = scratch<float>("atom.features", (size_t)A * ATOM_FEATURES);
+    run1d("ef2_atom_features", (size_t)A * ATOM_FEATURES,
+          AtomFeaturesArgs{In("ref_pos"), In("ref_charge"), at.ctx.mask, Ii("ref_element"), Ii("ref_atom_name_chars"), feat, nullptr, (uint)A, 0});
+    lin(feat, "f/" + prefix + "/linear", at.c0, A, ATOM_FEATURES, C);
+  }
   layerNorm(at.c0, at.c0, A, C, F(prefix + "/norm/scale"), F(prefix + "/norm/offset"));
   return at;
 }
@@ -55,6 +62,15 @@ static const half* swaQkvg(const std::string& B, int C) {
   return M.derived<half>("swa.qkvg:" + B, (size_t)C * 4 * C, [&](half* w) {
     run1d("ef2_stack_cols", (size_t)C * C, StackColsArgs{M.h(B + "qkv"), M.h(B + "attnGate"), nullptr, w, (uint)C, (uint)(3 * C), (uint)C, 0});
   });
+}
+void prepareAtomWeights() {
+  const int C = (int)M.meta("meta/atomChannels", 0), nb = (int)M.meta("meta/atomBlocks", 0);
+  if (!C || !nb) return;
+  for (const char* pfx : {"f/atom/blocks/", "f/diffusionAtomEncoder/blocks/", "f/diffusionAtomDecoder/blocks/"})
+    for (int b = 0; b < nb; ++b) {
+      std::string B = std::string(pfx) + std::to_string(b) + "/";
+      if (M.has(B + "qkv")) swaQkvg(B, C);
+    }
 }
 static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sch, const std::string& B, int halfWindow,
                      const float* preMod) {

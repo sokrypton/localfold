@@ -328,7 +328,12 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
           continue;
         }
-        if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+        if (g.beta != 0.f) {
+          const float4 cv = (g.biasType & 512)
+                              ? *(device const float4*)((device const float*)g.C + (ulong)z * g.sc + (ulong)i + (ulong)j * g.ldc)
+                              : float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          v += g.beta * cv;
+        }
       }
       if (g.epilogue & 4) v += bv;
       if constexpr ((EP & 64) == 0) {
@@ -468,7 +473,12 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
         continue;
       }
-      if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
+      if (g.beta != 0.f) {
+        const float cv = (g.biasType & 512)
+                           ? ((device const float*)g.C)[(ulong)z * g.sc + (ulong)i + (ulong)j * g.ldc]
+                           : lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
+        v += g.beta * cv;
+      }
       if (g.epilogue & 4) {
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
         v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + i] : ((device const float*)g.bias)[boff + i];

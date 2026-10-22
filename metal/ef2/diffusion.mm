@@ -232,6 +232,24 @@ static const half* qkvgWeight(int b, int C) {
           StackColsArgs{Fh(B + "queryWeights"), Fh(B + "kvWeights"), Fh(B + "gateWeights"), w, (uint)C, (uint)C, (uint)(2 * C), (uint)C});
   });
 }
+void prepareDiffusionWeights() {
+  const int Cz = (int)M.meta("meta/pairChannels", 0), Ct = (int)M.meta("meta/tokenChannels2", 0),
+            H = (int)M.meta("meta/tokenHeads", 0), nb = (int)M.meta("meta/tokenBlocks", 0);
+  if (!Cz || !Ct || !nb) return;
+  for (const char* pfx : {"diffusion/zTransitions/", "diffusion/sTransitions/"})
+    for (int l = 0; l < 2; ++l) {
+      std::string B = std::string(pfx) + std::to_string(l) + "/";
+      if (M.has("f/" + B + "aProjection")) {
+        int C = dimOf("f/" + B + "aProjection", 0), Hd = dimOf("f/" + B + "aProjection", 1);
+        swigluPairs2(B, Fh(B + "aProjection"), Fh(B + "bProjection"), C, Hd);
+      }
+    }
+  pairBiasScales(nb, Cz);
+  pairBiasOffsets(nb, Cz);
+  pairBiasWeights(nb, Cz, H);
+  outGateBiases(nb, Ct);
+  for (int b = 0; b < nb; ++b) qkvgWeight(b, Ct);
+}
 
 static void conditioningSteps(const Denoiser& d, const float* levels, int K, float* single, float* G, float* sTok) {
   int T = d.T, Ct = d.Ct, nb = d.tokenBlocks, n = 2 * nb, ld = d.entries * Ct;
@@ -353,10 +371,16 @@ static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const
 static void denoiseStep(const Denoiser& d, const float* xNoisy, float* xDenoised, const float* level,
                         const float* G, const float* sTok) {
   int T = d.T, A = d.A, Ct = d.Ct; const AtomCtx& ac = d.atoms.ctx; int Ca = ac.C;
-  float* r6 = scratch<float>("dn.r6", (size_t)A * 6);
-  run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, r6, (uint)A, 0});
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
-  lin(r6, "f/diffusionAtomEncoder/coordsLinear", q, A, 6, Ca, 1.f, nullptr, 1.f, d.atoms.c0);     // + c0
+  if (HALF_GEMM) {
+    half* r6h = scratch<half>("dn.r6", (size_t)A * 6);
+    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, nullptr, r6h, (uint)A, 0});
+    lin(r6h, "f/diffusionAtomEncoder/coordsLinear", q, A, 6, Ca, 1.f, nullptr, 1.f, d.atoms.c0);     // + c0
+  } else {
+    float* r6 = scratch<float>("dn.r6", (size_t)A * 6);
+    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, r6, nullptr, (uint)A, 0});
+    lin(r6, "f/diffusionAtomEncoder/coordsLinear", q, A, 6, Ca, 1.f, nullptr, 1.f, d.atoms.c0);      // + c0
+  }
   swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.encMod);
   float* tok = scratch<float>("dn.tok", (size_t)A * Ct);
   {

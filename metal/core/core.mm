@@ -862,6 +862,7 @@ static GemmArgs gemmArgs(const Gemm& g) {
   a.alpha = g.alpha; a.beta = g.beta;
   a.ptrs = g.ptrs ? 1 : 0;
   if (g.bias) { a.bias = (uint64_t)g.bias; a.epilogue |= 4; a.biasType = g.tbias == F16 ? 2 : 0; }
+  if (g.yinFloat) a.biasType |= 512;
   if (g.relu) a.epilogue |= 2;
   if (g.gelu) a.epilogue |= 32;
   if (g.lnOut) { a.lnOut = (uint64_t)g.lnOut; a.lnScale = (uint64_t)g.lnScale; a.lnOffset = (uint64_t)g.lnOffset; a.lnEps = g.lnEps;

@@ -33,6 +33,7 @@ static const half* triGate(const std::string& Tn, int C) {
 // the norm's name (its Scale / Offset prefix) and the buffer, taken by the next update of the same; a miss drops it.
 // LOCALFOLD_LN_EMIT=0: none emitted
 static struct { const void* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
+void emitTrunkLn(const void* x, const std::string& norm, half* buf) { emitted = {x, norm, buf}; }
 static half* takeEmitted(const void* x, const std::string& norm) {
   const bool hit = emitted.x == x && emitted.norm == norm;
   emitted.x = nullptr;
@@ -90,25 +91,44 @@ static void transition(T* pair, size_t P, int C, const std::string& Tn, const st
     Gemm G{}; G.X = g; G.tx = F16; G.W = Fh(Tn + "transition2"); G.tw = F16; G.Y = pair + r0 * C;
     G.ty = std::is_same<T, half>::value ? F16 : F32; G.rows = r; G.in = I; G.out = C;
     G.beta = 1.f; G.label = lnOut ? "transition2, next norm" : "transition2";
-    if (lnOut) { G.lnOut = lnOut + r0 * C; G.lnScale = F(next + "Scale"); G.lnOffset = F(next + "Offset"); }
+    if (lnOut) {
+      const bool slash = next.back() == '/';
+      G.lnOut = lnOut + r0 * C;
+      G.lnScale = F(next + (slash ? "scale" : "Scale"));
+      G.lnOffset = F(next + (slash ? "offset" : "Offset"));
+    }
     all = gemm(G) && all;
   }
   if (all) emitted = {pair, next, lnOut};
 }
 template <class T>
-static void trunkBlockT(T* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
+static void trunkBlockT(T* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows,
+                        const std::string& lastNext = "") {
   std::string B = prefix + "/" + std::to_string(b) + "/";
   // (each update's last GEMM emitting the next one's norm - the next block's first where it follows directly)
   triangle(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true, B + "triangleMultiplicationIncoming/leftNormInput");
   triangle(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false, B + "pairTransition/inputLayerNorm");
   transition(pair, (size_t)L * L, C, B + "pairTransition/",
-             nextFollows ? prefix + "/" + std::to_string(b + 1) + "/triangleMultiplicationOutgoing/leftNormInput" : "");
+             nextFollows ? prefix + "/" + std::to_string(b + 1) + "/triangleMultiplicationOutgoing/leftNormInput" : lastNext);
 }
-void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
-  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows);
+void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows,
+                const std::string& lastNext) {
+  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows, lastNext);
 }
-void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
-  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows);
+void trunkBlock(half* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows,
+                const std::string& lastNext) {
+  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows, lastNext);
+}
+void prepareTrunkWeights() {
+  const int C = (int)M.meta("meta/pairChannels", 0);
+  if (!C) return;
+  for (const char* pfx : {"blocks", "lmEncoder/blocks", "coda/blocks", "confidence/blocks", "msaEncoder/blocks"}) {
+    for (int b = 0; M.has(std::string("f/") + pfx + "/" + std::to_string(b) + "/triangleMultiplicationOutgoing/projection"); ++b) {
+      std::string B = std::string(pfx) + "/" + std::to_string(b) + "/";
+      triGate(B + "triangleMultiplicationOutgoing/", C);
+      triGate(B + "triangleMultiplicationIncoming/", C);
+    }
+  }
 }
 bool halfPairBlocks(int C) {
   static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
@@ -171,17 +191,24 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
     z = nullptr;
     half* zh = scratch<half>("trunk.zh", P * C);
     fill(zh, 0, P * C * 2);
-    float* y = scratch<float>("trunk.y", chunk * C);
+    const std::string firstLn = "blocks/0/triangleMultiplicationOutgoing/leftNormInput";
     for (int loop = 0; loop < loops; ++loop) {
+      half* in = takeEmitted(zh, "recycle/norm/");
+      half* lnOut = lnTarget(P, C, in);
+      bool all = true;
       for (size_t r0 = 0; r0 < P; r0 += chunk) {
         size_t r = std::min(chunk, P - r0);
-        layerNorm(zh + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
-        Gemm g{}; g.X = xn; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16; g.Y = y; g.Yin = zi + r0 * C;
+        const half* x = in ? in + r0 * C : xn;
+        if (!in) layerNorm(zh + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        Gemm g{}; g.X = x; g.tx = F16; g.W = Fh("recycle/projection"); g.tw = F16;
+        g.Y = zh + r0 * C; g.ty = F16; g.Yin = zi + r0 * C; g.yinFloat = true;
         g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
-        gemm(g);
-        toHalf(y, zh + r0 * C, r * C);
+        g.lnOut = lnOut + r0 * C; g.lnScale = F(firstLn + "Scale"); g.lnOffset = F(firstLn + "Offset");
+        all = gemm(g) && all;
       }
-      for (int b = 0; b < blocks; ++b) trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks);
+      if (all) emitted = {zh, firstLn, lnOut};
+      for (int b = 0; b < blocks; ++b)
+        trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks, loop + 1 < loops ? "recycle/norm/" : "");
     }
     releaseScratch({"ftri.", "ftr.", "eln."});
     z = allocT<float>(P * C);

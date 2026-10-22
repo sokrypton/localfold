@@ -231,6 +231,7 @@ int foldMain(int argc, char** argv) {
         n.find("/outerProductMean/output") != std::string::npos)
       return false;
     if (n.rfind("f/confidence/", 0) == 0 && n.rfind("f/confidence/blocks/", 0) != 0) return false;
+    if (n == "f/diffusionAtomEncoder/coordsLinear" || n == "f/diffusionAtomDecoder/outputLinear") return true;
     return elements >= 2048;
   };
   auto isSwiglu = [](const std::string& n) {
@@ -238,6 +239,9 @@ int foldMain(int argc, char** argv) {
     return ends("/fc1/weights") || ends("/transition1") || ends("/swishWeights") || ends("/ffnUp");
   };
   M.loadBundle(foldBundle, "f", asHalf, nullptr, isSwiglu);
+  prepareTrunkWeights();
+  prepareAtomWeights();
+  prepareDiffusionWeights();
   // the tower's block matrices kept as their codes and expanded a GEMM at a time where the tower as float16 would pass
   // 4 GB (ESM-C 6B: 12.3 GB; 600M is 1.2) - LOCALFOLD_TOWER_RESIDENT=1 forces it, =0 refuses it
   auto residentTower = [](const std::string& n, size_t) {

@@ -16,9 +16,7 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   size_t P = (size_t)T * T;
   float* s = scratch<float>("cf.s", (size_t)T * Si);
   layerNorm(sInputs, s, T, Si, F("confidence/sInputsNorm/scale"), F("confidence/sInputsNorm/offset"));
-  float* z = allocT<float>(P * C);
-  layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-  release(zTrunk);      // (read no more: 1.1 GB at 1044 residues)
+  float* z = zTrunk;
   zTrunk = nullptr;
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
@@ -26,7 +24,14 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   lin(s, "f/confidence/sToZTranspose", c, T, Si, C);
   lin(s, "f/confidence/sToZProdIn1", l, T, Si, C);
   lin(s, "f/confidence/sToZProdIn2", rr, T, Si, C);
-  run("ef2_conf_z", grid1d(P, 1), 256, ConfZArgs{z, relIdx(), In("token_bonds"), F("featuriser/tokenBonds"), r, c, (uint)T, (uint)C});
+  if (C == 256) {
+    run("ef2_conf_z", grid1d((P + 7) / 8, 1), 256,
+        ConfZArgs{z, relIdx(), In("token_bonds"), F("featuriser/tokenBonds"), r, c, (uint)T, (uint)C,
+                  F("confidence/zNorm/scale"), F("confidence/zNorm/offset")});
+  } else {
+    layerNorm(z, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+    run("ef2_conf_z", grid1d(P, 1), 256, ConfZArgs{z, relIdx(), In("token_bonds"), F("featuriser/tokenBonds"), r, c, (uint)T, (uint)C, nullptr, nullptr});
+  }
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   half* prod = scratch<half>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
@@ -36,25 +41,29 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     g.rows = n; g.in = C; g.out = C; g.label = "confidence prodOut";
     gemm(g);
   }
-  run("ef2_distance_embed", grid1d((P + 7) / 8, 1), 256,
-      DistEmbedArgs{z, xDevice, Ii("distogram_atom_idx"), F("confidence/boundaries"), F("confidence/distanceEmbedding"),
-                    (uint)M.len("f/confidence/boundaries"), (uint)T, (uint)C, 0});
   // z + trunk(z)
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});
   // (over a half copy where the trunk's blocks run half: the stack's own pair 0.56 GB, not 1.1, beside the blocks' scratch)
   if (halfPairBlocks(C)) {
     half* stackH = scratch<half>("cf.stackH", P * C);
-    toHalf(z, stackH, P * C);
+    const std::string firstLn = "confidence/blocks/0/triangleMultiplicationOutgoing/leftNormInput";
+    half* lnOut = C == 256 ? scratch<half>("ftri.xn", P * C) : nullptr;
+    run("ef2_distance_embed", grid1d((P + 7) / 8, 1), 256,
+        DistEmbedArgs{z, xDevice, Ii("distogram_atom_idx"), F("confidence/boundaries"), F("confidence/distanceEmbedding"),
+                      (uint)M.len("f/confidence/boundaries"), (uint)T, (uint)C, 0,
+                      stackH, lnOut, lnOut ? F(firstLn + "Scale") : nullptr, lnOut ? F(firstLn + "Offset") : nullptr});
+    if (lnOut) emitTrunkLn(stackH, firstLn, lnOut);
+    else toHalf(z, stackH, P * C);
     for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
       trunkBlock(stackH, mask, T, C, "confidence/blocks", b,
                  M.has("f/confidence/blocks/" + std::to_string(b + 1) + "/pairTransition/transition1"));
     releaseScratch({"ftri.", "ftr.", "eln."});
-    float* stack = scratch<float>("cf.stack", P * C);
-    toFloat(stackH, stack, P * C);
-    add(z, stack, P * C);
-    releaseScratch({"cf.stack"});
+    run1d("ef2_add_half", (P * C) >> 2, AddHalfArgs{z, stackH, (P * C) >> 2});
   } else {
+    run("ef2_distance_embed", grid1d((P + 7) / 8, 1), 256,
+        DistEmbedArgs{z, xDevice, Ii("distogram_atom_idx"), F("confidence/boundaries"), F("confidence/distanceEmbedding"),
+                      (uint)M.len("f/confidence/boundaries"), (uint)T, (uint)C, 0, nullptr, nullptr, nullptr, nullptr});
     float* stack = allocT<float>(P * C);
     copy(stack, z, P * C * 4);
     for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)

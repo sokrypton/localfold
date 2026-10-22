@@ -39,7 +39,7 @@ struct ContactsArgs { CP(float) logits; CP(int) contactBins; DP(float) out; u64 
 struct QuantiseArgs { CP(float) x; DP(uchar) out; u64 n; float scale; uint pad; };
 
 // ---------------------------------------------------------------- the atoms
-struct AtomFeaturesArgs { CP(float) pos; CP(float) charge; CP(float) mask; CP(int) element; CP(int) nameChars; DP(float) out; uint A, pad; };
+struct AtomFeaturesArgs { CP(float) pos; CP(float) charge; CP(float) mask; CP(int) element; CP(int) nameChars; DP(float) out; DP(half) outH; uint A, pad; };
 struct RopeTableArgs { CP(float) pos; CP(int) uid; DP(float) cosT; DP(float) sinT; uint A, pad; };
 struct SiluArgs { CP(float) x; DP(float) y; DP(half) yh; u64 n; };
 struct SwigluArgs { CP(float) h; DP(float) g; uint rows, F; };
@@ -56,7 +56,7 @@ struct JoinPairRelArgs { CP(float) z; RelIdx rel; DP(float) out; u64 p0, n; uint
 struct SiluMulArgs { DP(float) a; CP(float) b; u64 n; };
 struct FourierArgs { CP(float) w; CP(float) b; CP(float) level; DP(float) out; uint n, pad; };
 struct AddRowArgs { CP(float) base; CP(float) row; DP(float) x; u64 rows; uint C, pad; };
-struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; uint A, pad; };
+struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; DP(half) outH; uint A, pad; };
 struct AdaCombineArgs { DP(float) an; CP(float) g; CP(float) gb; CP(float) sh; DP(half) out; CP(float) resY; CP(float) resGate; uint T, C, ld, pad; };
 struct SigmoidMulArgs { DP(float) x; CP(float) g; CP(float) gb; DP(float) dst; uint T, C, ld, pad; };
 struct ScaleCopiesArgs { CP(float) x; CP(float) scales; DP(float) out; DP(half) outH; uint rows, C, n, pad; CP(float) offsets; };
@@ -66,9 +66,12 @@ struct GatherTokensArgs { CP(float) perToken; CP(int) atomToToken; CP(float) mas
 struct EdmArgs { CP(float) xNoisy; CP(float) r; DP(float) out; CP(float) level; uint n, pad; };
 
 // ---------------------------------------------------------------- the confidence head
-struct ConfZArgs { DP(float) z; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) rows; CP(float) cols; uint T, C; };
+struct ConfZArgs { DP(float) z; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) rows; CP(float) cols; uint T, C;
+                   CP(float) scale; CP(float) offset; };
 struct OuterArgs { CP(float) a; CP(float) b; DP(half) out; u64 p0, n; uint T, C; };
-struct DistEmbedArgs { DP(float) z; CP(float) x; CP(int) rep; CP(float) edges; CP(float) table; uint nEdges, T, C, pad; };
+struct DistEmbedArgs { DP(float) z; CP(float) x; CP(int) rep; CP(float) edges; CP(float) table; uint nEdges, T, C, pad;
+                       DP(half) zh; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; };
+struct AddHalfArgs { DP(float) z; CP(half) h; u64 n4; };
 struct RowPoolArgs { CP(float) z; DP(float) score; DP(float) pooled; uint T, C; };
 struct GatherAtomsArgs { CP(float) tok; CP(int) atomToToken; DP(float) out; uint A, C; };
 struct PlddtArgs { CP(float) s; CP(int) atomToToken; CP(int) slot; CP(float) table; DP(float) plddt; uint A, C, bins, pad; };
