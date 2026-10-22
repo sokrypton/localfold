@@ -1334,6 +1334,7 @@ const PRIORS = new Map([
     attentionProjectHalfTile: "16x16x4x2",
     singleTransitionTile: 4,
     singleProjectRows: 4,
+    atomRowTile: { below: 4, atOrAbove: 4, crossover: 1 << 30 },
     // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
     // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
     // row 128 x 255 6.13 -> 5.05 ms, column 128 x 255 3.18 -> 2.55, column 512 x 255 48.4 -> 38.9, triangle 255 x 255

@@ -367,10 +367,14 @@ ${residual
 
 var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
 var<workgroup> gated: array<${stageVector}, ${groups * chunk}>;
-var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
-${variance === "fast" ? `var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;\n` : ""}\
-var<workgroup> row_mean: array<f32, ${tile}>;
-var<workgroup> row_inverse_std: array<f32, ${tile}>;
+${(() => {
+  const vecNorm = channels % WORKGROUP === 0 && WORKGROUP <= 128;
+  const reduceType = vecNorm ? vector : "f32";
+  return `var<workgroup> reduce_a: array<${reduceType}, ${WORKGROUP}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<${reduceType}, ${WORKGROUP}>;\n` : ""}\
+${vecNorm ? "" : `var<workgroup> row_mean: array<f32, ${tile}>;
+var<workgroup> row_inverse_std: array<f32, ${tile}>;`}`;
+})()}
 
 fn swish(value: ${vector}) -> ${vector} { return value / (${vector}(1.0) + exp(-value)); }
 
@@ -387,7 +391,59 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (base_row >= ROWS) { return; }
   let local = local_id.x;
 
-  // 🔴 THE LAYER NORM IS PER ROW AND STAYS THAT WAY. Its reduction is over
+${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {
+  const overSteps = (body) =>
+    Array.from({ length: channelsPerThread }, (_, s) => body(s)).join("\n    ");
+  return `  ${overSteps((s) => `let c_ln_${s} = local + ${s * WORKGROUP}u;
+  let scale_ln_${s} = ${w(`weights[W_SCALE + c_ln_${s}]`)};
+  let offset_ln_${s} = ${w(`weights[W_OFFSET + c_ln_${s}]`)};`)}
+  ${overGroups((g) => `{
+    ${overLanes((l) => `let row_${g}_${l} = min(base_row + ${g * lanes + l}u, ROWS - 1u);
+    let base_${g}_${l} = row_${g}_${l} * CHANNELS;`).join("\n    ")}
+    ${overSteps((s) => `var in_${s}_${g}: ${vector};
+    ${overLanes((l, at) => `in_${s}_${g}${at} = input[base_${g}_${l} + c_ln_${s}];`).join("\n    ")}`)}
+    var total_${g} = in_0_${g};
+    ${variance === "fast" ? `var sq_total_${g} = in_0_${g} * in_0_${g};` : ""}
+    ${Array.from({ length: channelsPerThread - 1 }, (_, idx) => {
+      const s = idx + 1;
+      return `total_${g} += in_${s}_${g};
+    ${variance === "fast" ? `sq_total_${g} += in_${s}_${g} * in_${s}_${g};` : ""}`;
+    }).join("\n    ")}
+    reduce_a[local] = total_${g};
+    ${variance === "fast" ? `reduce_b[local] = sq_total_${g};` : ""}
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) {
+        reduce_a[local] += reduce_a[local + stride];
+        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
+      }
+      workgroupBarrier();
+    }
+    let mean_${g} = reduce_a[0] / ${vector}(f32(CHANNELS));
+    ${variance === "fast"
+      ? `let variance_${g} = reduce_b[0] / ${vector}(f32(CHANNELS)) - mean_${g} * mean_${g};`
+      : `var centered_total_${g} = ${zero};
+    ${overSteps((s) => `{
+      let d_${s}_${g} = in_${s}_${g} - mean_${g};
+      in_${s}_${g} = d_${s}_${g};
+      centered_total_${g} += d_${s}_${g} * d_${s}_${g};
+    }`)}
+    workgroupBarrier();
+    reduce_a[local] = centered_total_${g};
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+      workgroupBarrier();
+    }
+    let variance_${g} = reduce_a[0] / ${vector}(f32(CHANNELS));`}
+    let inv_std_${g} = inverseSqrt(variance_${g} + ${vector}(EPSILON));
+    ${overSteps((s) => `{
+      let packed_${s}_${g} = (${variance === "fast" ? `in_${s}_${g} - mean_${g}` : `in_${s}_${g}`}) * inv_std_${g} * scale_ln_${s} + offset_ln_${s};
+      normalized[${g * channels}u + c_ln_${s}] = ${narrow(`packed_${s}_${g}`)};
+    }`)}
+    workgroupBarrier();
+  }`)}`;
+})() : `  // 🔴 THE LAYER NORM IS PER ROW AND STAYS THAT WAY. Its reduction is over
   // CHANNELS and the tile's rows do not share it, so this loop is sequential -
   // it is cheap next to the two matmuls, which are what the tile is for. What
   // it leaves behind is a mean and an inverse deviation per row, so that the
@@ -439,7 +495,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       normalized[g * CHANNELS + c] = ${narrow("packed")};
     }
   }
-  workgroupBarrier();
+  workgroupBarrier();`}
 
   // transition1 is (channels, intermediate * 2), so a column is strided by the
   // full doubled width. Gate half first, value half second.

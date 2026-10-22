@@ -795,18 +795,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  const conditionedNorm = (prefix, bindingsFor, mode = "fused") => `${normSubgroups
+  const conditionedNorm = (prefix, bindingsFor, mode = "fused") => {
+    const useVecNorm = !normSplit && mode === "fused" && !batchedGates
+      && channels % lanes === 0 && !normSubgroups;
+    const normReduceType = useVecNorm ? tileLanes : "f32";
+    return `${normSubgroups
     ? "enable subgroups;\nenable subgroup_size_control;\n" : ""}${common}
 const TILE: u32 = ${tile}u;
 ${bindingsFor(mode)}
 
 ${batchedGates ? "// cond_norm is gone: the projection that read it moved to zero-gates."
   : `var<workgroup> cond_norm: array<${stageLanes}, ${tileGroups * (mode === "split" ? normKSpan : condChannels)}>;`}
-var<workgroup> reduce_a: array<f32, ${lanes}>;
-var<workgroup> act_means: array<f32, ${tile}>;
-var<workgroup> act_inverses: array<f32, ${tile}>;
+var<workgroup> reduce_a: array<${normReduceType}, ${lanes}>;
+${useVecNorm ? "" : `var<workgroup> act_means: array<f32, ${tile}>;
+var<workgroup> act_inverses: array<f32, ${tile}>;`}
 
-fn reduce_sum(local: u32, value: f32) -> f32 {
+fn reduce_sum(local: u32, value: ${normReduceType}) -> ${normReduceType} {
 ${reduceBody}
 }
 
@@ -817,7 +821,35 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (base_token >= ${ROWS}) { return; }
   let local = local_id.x;
 
-${mode === "split" ? "" : `  // 🔴 TWO-PASS VARIANCE, and no scale or offset on the activation's own norm.
+${useVecNorm ? (() => {
+      const steps = channels / lanes;
+      const overSteps = (body) => Array.from({ length: steps }, (_, s) => body(s)).join("\n  ");
+      return `  ${overSteps((s) => `let c_${s} = local + ${s * lanes}u;`)}
+  ${overSteps((s) => overGroups((g) => `var act_${s}_${g} = ${tileLanes}(0.0);`))}
+  ${overGroups((g) => `{
+    ${Array.from({ length: tileWidth }, (_, l) => {
+      const t = g * tileWidth + l;
+      return `{
+      let token = min(base_token + ${t}u, ${ROWS} - 1u);
+      let base = token * C;
+      ${overSteps((s) => `act_${s}_${g}${lane(l)} = act[base + c_${s}];`)}
+    }`;
+    }).join("\n    ")}
+    var total_${g} = ${tileLanes}(0.0);
+    ${overSteps((s) => `total_${g} += act_${s}_${g};`)}
+    let act_mean_${g} = reduce_sum(local, total_${g}) / ${tileLanes}(f32(C));
+    workgroupBarrier();
+    var centred_${g} = ${tileLanes}(0.0);
+    ${overSteps((s) => `{
+      let d_${s}_${g} = act_${s}_${g} - act_mean_${g};
+      act_${s}_${g} = d_${s}_${g};
+      centred_${g} += d_${s}_${g} * d_${s}_${g};
+    }`)}
+    let act_inv_${g} = inverseSqrt(reduce_sum(local, centred_${g}) / ${tileLanes}(f32(C)) + ${tileLanes}(EPSILON));
+    ${overSteps((s) => `act_${s}_${g} *= act_inv_${g};`)}
+    ${g + 1 < tileGroups ? "workgroupBarrier();" : ""}
+  }`)}`;
+    })() : mode === "split" ? "" : `  // 🔴 TWO-PASS VARIANCE, and no scale or offset on the activation's own norm.
   // A token past the end is clamped rather than skipped: every lane has to
   // reach the barriers, and its lane of the vector is dropped at the write.
   for (var t = 0u; t < TILE; t += 1u) {
@@ -879,12 +911,11 @@ ${mode === "reduce" || batchedGates ? "" : `  // 🔴 THE NORMALISED CONDITIONIN
   // The token tile cannot do this - it goes the wrong way, halving the
   // workgroups - which is why adaln measured 1.85x SLOWER at tile 2 and why
   // this kernel needed the opposite fix from qkvg's.
-${!normSplit && mode === "fused" && !batchedGates && channels % lanes === 0
+${useVecNorm
   ? (() => {
       const steps = channels / lanes;
       const overSteps = (body) => Array.from({ length: steps }, (_, s) => body(s)).join("\n  ");
-      return `  ${overSteps((s) => `let c_${s} = local + ${s * lanes}u;`)}
-  ${overSteps((s) => overGroups((g) =>
+      return `  ${overSteps((s) => overGroups((g) =>
     `var scale_${s}_${g} = ${tileLanes}(${wf(`weights[W_${prefix}SingleCondScaleBias + c_${s}]`)});
   var shift_${s}_${g} = ${tileLanes}(0.0);`))}
   for (var d = 0u; d < C_COND; d += 1u) {
@@ -899,14 +930,12 @@ ${!normSplit && mode === "fused" && !batchedGates && channels % lanes === 0
     }`)}
   }
   ${overSteps((s) => `{
-    ${overGroups((g) => `let gated_${s}_${g} =
-      ${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale_${s}_${g}));`)}
+    ${overGroups((g) => `let out_${s}_${g} =
+      (${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale_${s}_${g}))) * act_${s}_${g} + shift_${s}_${g};`)}
     ${overTile((t) => `{
       let token = base_token + ${t}u;
       if (token < ${ROWS}) {
-        let normalized = (act[token * C + c_${s}] - act_means[${t}u]) * act_inverses[${t}u];
-        xbuf[token * C + c_${s}] =
-          gated_${s}_${group(t)}${lane(t)} * normalized + shift_${s}_${group(t)}${lane(t)};
+        xbuf[token * C + c_${s}] = out_${s}_${group(t)}${lane(t)};
       }
     }`)}
   }`)}`;
@@ -998,6 +1027,7 @@ ${mode === "split"
     }`)}`}
   }`}
 }`;
+  };
 
   // 🔴 THE TWO CALLERS BIND IN DIFFERENT ORDERS, so the bindings are a function
   // of the mode rather than one string. The split and reduce forms happen to be
