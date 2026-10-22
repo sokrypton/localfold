@@ -214,21 +214,24 @@ static void embed(Trunk& t) {
 
 // ---------------------------------------------------------------- the MSA stack
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] W + b) / (1e-3 + norm[i][j])
-static void outerProductMean(Trunk& t, const std::string& pre) {
+static void outerProductMean(Trunk& t, const std::string& pre, const std::string& nextNorm = "") {
   int L = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int O = metaI(pre + ".outerChannels");
-  size_t rows = (size_t)S * L;
+  size_t rows = (size_t)S * L, pairs = (size_t)L * L;
   half* xn = scratch<half>("opm.xn", rows * Cm);
   ln(t.msa, xn, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
   half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
   linH(xn, pre + ".leftProjection", lt, rows, Cm, O, Wopt(pre + ".leftProjectionBias"));      // (rf3's biases, before the mask)
   linH(xn, pre + ".rightProjection", rt, rows, Cm, O, Wopt(pre + ".rightProjectionBias"));
-  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, t.msaMask, rows, (uint)O, 0});
-  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{rt, t.msaMask, rows, (uint)O, 0});
-  float* norm = scratch<float>("opm.norm", (size_t)L * L);
-  run1d("af3_mask_norm", (size_t)L * L, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
+  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, rt, t.msaMask, rows, (uint)O, 0});
+  float* norm = scratch<float>("opm.norm", pairs);
+  run1d("af3_mask_norm", pairs, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
   const half* Wout = Wh(pre + ".outputW");          // [O * O][C]
   const uint after = flag("trunk.dialect.opmBiasAfterNorm") ? 1u : 0u;
+  static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+  half* lnOut = (!after && C == 128 && !nextNorm.empty() && lnEmit && matrixUnits()) ? scratch<half>("pr.x", pairs * C) : nullptr;
+  const float* lnScale = lnOut ? W(nextNorm + "Scale") : nullptr;
+  const float* lnOffset = lnOut ? Wopt(nextNorm + "Offset") : nullptr;
   if (S <= 128) {
     // the SHALLOW form: the output projection folded into the right operand first - T[c][(s, j)][f] = sum_e r[s][j][e]
     // W[c O + e][f], a GEMM batched over c - then Y[i][(j, f)] = sum_{c, s} l[s][i][c] T[(c, s)][(j, f)], K = O S
@@ -264,6 +267,7 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
   float* Y = nullptr;
+  bool allEmitted = lnOut != nullptr;
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass; core.h)
@@ -273,13 +277,18 @@ static void outerProductMean(Trunk& t, const std::string& pre) {
         g.ty = F16; g.rows = (size_t)bi * O; g.in = S; g.out = L * O; g.accFloat = true; g.label = "opm product"; gemm(g); }
       run1d("af3_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
+    half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * C : nullptr;
     if (!after && C == 128 && gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
-                                         norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f))
+                                         norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f, lnChunk, lnScale, lnOffset)) {
+      if ((size_t)bi * L <= 128) allEmitted = false;
       continue;
+    }
+    allEmitted = false;
     if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
     { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = C; g.label = "opm output"; gemm(g); }
     run1d("af3_opm_add", (size_t)bi * L * C, OpmAddArgs{t.pair, Y, W(pre + ".outputB"), norm, (u64)i0, (uint)bi, (uint)L, (uint)C, after});
   }
+  if (allEmitted) emitPairLn(0, t.pair, nextNorm, lnOut);
 }
 // AF3's MSA "attention": per head, weights softmax_j over LN(pair) projected (no queries or keys), averaging every
 // row's values; gated and projected back into the MSA
@@ -306,7 +315,7 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   run("af3_msa_weights", Grid{(uint32_t)(heads * n), 1, 1}, 256, MsaWeightsArgs{flat, keyMask, w, (uint)n, (uint)heads, (uint)ldw, 0});
   half* v = scratch<half>("msaatt.v", rows * Wd);
   linH(xn, pre + ".vProjection", v, rows, Cm, Wd);
-  if (chaiMask) run1d("af3_scale_rows_h", (Wd & 3) ? rows * Wd : rows * (Wd >> 2), ScaleRowsHArgs{v, t.msaMask, rows, (uint)Wd, 0});
+  if (chaiMask) run1d("af3_scale_rows_h", (Wd & 3) ? rows * Wd : rows * (Wd >> 2), ScaleRowsHArgs{v, nullptr, t.msaMask, rows, (uint)Wd, 0});
   half* vh = scratch<half>("msaatt.vh", (size_t)S * ldw * Wd);
   const bool v8 = d % 8 == 0 && (size_t)S * ldw * Wd < ((size_t)1 << 32);     // (16 bytes a thread)
   if (v8) run1d("af3_msa_v_heads8", (size_t)S * ldw * Wd / 8, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
@@ -372,10 +381,10 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
     return;
   }
   bool updateFirst = flag("trunk.dialect.msaUpdateBeforeOuterProduct");     // (OpenDDE, boltz2)
-  if (!updateFirst) outerProductMean(t, B + ".outerProductMean");
+  if (!updateFirst) outerProductMean(t, B + ".outerProductMean", B + ".msaAttention1.pairNorm");
   msaAttention(t, B + ".msaAttention1");
   transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition");
-  if (updateFirst) outerProductMean(t, B + ".outerProductMean");
+  if (updateFirst) outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput");
   pairUpdates(t.pair, t.masks, t.n, t.C, B,
               (k + 1 < msaBlocks && updateFirst) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.pairNorm" : "");
 }

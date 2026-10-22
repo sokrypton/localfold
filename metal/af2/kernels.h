@@ -18,7 +18,7 @@ struct BiasLayoutArgs { CP(float) proj; CP(float) pairMask; DP(half) out; uint L
 // the triangle's projection and gate (AF2's halves: a's C columns, then b's) as gemmTriGate's weight and bias
 struct TriGateW2Args { CP(half) proj; CP(half) gate; CP(float) pb; CP(float) gb; DP(half) w4; DP(float) b4; uint C, B, quarters, pad; };
 struct QkvgWArgs { CP(half) q; CP(half) k; CP(half) v; CP(half) g; CP(float) gb; DP(half) out; DP(float) b; uint C, W, B, pad; };
-struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
+struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C, pad; };
 struct OpmPermuteArgs { CP(half) Pm; DP(half) X; uint bi, L, O, pad; };
 struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };
 struct OpmAddHArgs { DP(half) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };

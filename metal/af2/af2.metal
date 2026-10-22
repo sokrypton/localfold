@@ -158,11 +158,15 @@ kernel void af2_scale_rows_h(LF_ARGS(ScaleRowsHArgs)) {
   if ((a.C & 3) == 0) {
     uint C4 = a.C >> 2;
     if (t >= a.rows * C4) return;
-    ((device half4*)a.x)[t] = half4(float4(((device const half4*)a.x)[t]) * a.mask[lf_udiv((uint)t, C4)]);
+    float m = a.mask[lf_udiv((uint)t, C4)];
+    ((device half4*)a.x)[t] = half4(float4(((device const half4*)a.x)[t]) * m);
+    if (a.y) ((device half4*)a.y)[t] = half4(float4(((device const half4*)a.y)[t]) * m);
     return;
   }
   if (t >= a.rows * a.C) return;
-  a.x[t] = (half)((float)a.x[t] * a.mask[lf_udiv((uint)t, a.C)]);
+  float m = a.mask[lf_udiv((uint)t, a.C)];
+  a.x[t] = (half)((float)a.x[t] * m);
+  if (a.y) a.y[t] = (half)((float)a.y[t] * m);
 }
 // norm[i][j] = sum_s mask[s][i] mask[s][j]
 kernel void af2_mask_norm(LF_ARGS(MaskNormArgs)) {
@@ -265,7 +269,7 @@ kernel void af2_global_attention(constant GlobalAttnArgs& a [[buffer(0)]], uint3
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float m[MAXH], l[MAXH], acc[MAXH][MAXD];
-  for (uint h = 0; h < MAXH; ++h) { m[h] = -1e30f; l[h] = 0.f; for (uint d = 0; d < MAXD; ++d) acc[h][d] = 0.f; }
+  for (uint h = 0; h < H; ++h) { m[h] = -1e30f; l[h] = 0.f; for (uint d = 0; d < D; ++d) acc[h][d] = 0.f; }
   for (uint s = tid; s < S; s += 256) {
     device const float* kv = a.kv + ((ulong)s * L + i) * 2 * D;
     float bias = 1e9f * (a.mask[s * L + i] - 1.f);
@@ -304,6 +308,15 @@ kernel void af2_global_attention(constant GlobalAttnArgs& a [[buffer(0)]], uint3
 // out[s, i, w] = avg[i, w] sigmoid(gate[s, i, w]) (half: the output projection's input)
 kernel void af2_global_gate(LF_ARGS(GlobalGateArgs)) {
   ulong t = LF_INDEX;
+  if ((a.W & 3) == 0) {
+    uint W4 = a.W >> 2;
+    if (t >= (ulong)a.S * a.L * W4) return;
+    uint r = lf_udiv((uint)t, W4), w4 = (uint)t - r * W4, i = r - lf_udiv(r, a.L) * a.L;
+    float4 av = ((device const float4*)a.avg)[(ulong)i * W4 + w4];
+    float4 gv = ((device const float4*)a.gate)[t];
+    ((device half4*)a.out)[t] = half4(av * (1.f / (1.f + exp(-gv))));
+    return;
+  }
   if (t >= (ulong)a.S * a.L * a.W) return;
   uint r = lf_udiv((uint)t, a.W), w = (uint)t - r * a.W, i = r - lf_udiv(r, a.L) * a.L;
   a.out[t] = (half)(a.avg[(ulong)i * a.W + w] * lf_sigmoid(a.gate[t]));

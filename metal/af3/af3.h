@@ -67,6 +67,7 @@ const float* qkvgBias(const std::string& pre, int Wd);
 // pairMask [n * n] (a real buffer; every update reads it), seqMask [n], `ones` every token real (no attention mask)
 struct Masks { const float* pair; const float* seq; bool ones; };
 // (into: where the residual goes, when not the input itself - chai-1's parallel block)
+void emitPairLn(int k, const void* x, const std::string& norm, half* buf);
 half* pairLn(const float* pair, size_t P, int C, const std::string& norm);
 half* pairLn(const half* pair, size_t P, int C, const std::string& norm);
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
@@ -150,7 +151,8 @@ struct EncoderOut {
   bool keyMasked, noResidual;
 };
 EncoderOut prepareEncoder(const std::string& E, const std::string& ref, const float* trunkSingle, const float* trunkPair);
-void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions);
+void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions, const float* atomMask = nullptr,
+                 float posScale = 1.f, const float* tokenBias = nullptr);
 std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
                                    const AtomShape& sh);
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);
@@ -162,7 +164,8 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
            int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,
-           const float* resY = nullptr, const float* resGate = nullptr, int resLd = 0);
+           const float* resY = nullptr, const float* resGate = nullptr, int resLd = 0, const half* resYh = nullptr,
+           float resScale = 1.f, bool preSigmoid = true);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
 // how far a template.pdb record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at

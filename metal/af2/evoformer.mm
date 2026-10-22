@@ -240,7 +240,7 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
   float* gate = scratch<float>("gcol.gate", rows * W);
   linearWB(xn, A + "/attention/gating_w", A + "/attention/gating_b", blk, gate, rows, C, W, 0.f);
   half* gated = scratch<half>("gcol.gated", rows * W);
-  run1d("af2_global_gate", rows * W, GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, 0});
+  run1d("af2_global_gate", (W & 3) ? rows * W : rows * (W >> 2), GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, 0});
   linearWB(gated, A + "/attention/output_w", A + "/attention/output_b", blk, msa, rows, W, C, 1.f);
 }
 template <class X>
@@ -299,8 +299,7 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     gemm(g);
   }
   if (!ones) {
-    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{lt, msaMask, rows, (uint)O, 0});
-    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{rt, msaMask, rows, (uint)O, 0});
+    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{lt, rt, msaMask, rows, (uint)O, 0});
   }
   // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
   static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
@@ -356,18 +355,23 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     if (allAdded) emitted = {pair, normKey(nextNorm, blk), lnOut};
     return;
   }
+  static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+  half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
+  const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
+  const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
   // the standard form: P[(i, c)][(j, e)] = sum_s l[s][i][c] r[s][j][e] a block of rows i at a time, permuted to
   // [(i, j)][(c, e)], then the output projection
   size_t per = (size_t)L * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
-  float* Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
+  float* Y = nullptr;
   // 🔴 THE SUM OVER THE ROWS SCALED BY 2^-k AS IT IS STORED IN HALF - exact, a power of two - and scaled back in the output
   // (cuda/af2's a04ed7e: unscaled, 7GYV's ColabFold alignment at 1,945 extra rows put an entry past 65,504 and NaN'd every
   // coordinate). 2^k ~ the row count / 64, its k: the largest entry there ~34 a row, so ~2,200 scaled; scaling all the way
   // to the mean reached float16's subnormals and moved 7GYV's fold
   int k = 0; while ((64 << k) < rowsN) ++k;
   const float down = ldexpf(1.f, -k), up = ldexpf(1.f, k);
+  bool allAdded = lnOut != nullptr;
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass)
@@ -379,12 +383,18 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
     // (on the matrix units the add in the output GEMM's epilogue - no Y)
-    if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128, up))
+    half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * 128 : nullptr;
+    if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128, up,
+                   lnChunk, lnScale, lnOffset)) {
+      if ((size_t)bi * L <= 128) allAdded = false;
       continue;
+    }
+    if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * 128);
     { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = 128; g.alpha = up;
       g.label = "opm output"; gemm(g); }
-    opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
+    opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, lnOut, lnScale, lnOffset);
   }
+  if (allAdded) emitted = {pair, normKey(nextNorm, blk), lnOut};
 }
 // the triangle multiplication: LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate, with AF2's
 // biases) -> the planes' batched product -> the centre norm -> the output projection -> the gate's GEMM adding into

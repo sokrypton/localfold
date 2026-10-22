@@ -44,7 +44,8 @@ struct Diffusion {
   // the transformer's conditioning for upcoming noise levels, batched (conditioningAhead): the sampler's plan of
   // levels, the levels held and their two GEMMs' outputs, slot k at k pn rows
   std::vector<float> plan; size_t planAt = 0;
-  std::vector<float> held; float *heldNorm = nullptr, *heldRaw = nullptr, *heldSingle = nullptr;
+  std::vector<float> held; float *heldNorm = nullptr, *heldRaw = nullptr, *heldSingle = nullptr, *heldSnProj = nullptr;
+  bool heldPermuted = false;
 };
 static Diffusion D;
 
@@ -132,8 +133,9 @@ static float* singleConditioning(float level) {
   int n = D.n, Cs = metaI(P + ".seqChannels");
   size_t nc = lenW(P + ".fourierWeight");
   float* e = scratch<float>("dc.emb", nc);
-  run1d("af3_fourier", nc, FourierArgs{W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (uint)nc, level});
-  float* en = scratch<float>("dc.embn", nc);
+  FourierArgs fa{W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (uint)nc, 1u, {level}};
+  run1d("af3_fourier", nc, fa);
+  half* en = scratch<half>("dc.embn", nc);
   ln(e, en, 1, (int)nc, P + ".noiseEmbeddingInitialNormScale", P + ".noiseEmbeddingInitialNormOffset");
   float* proj = scratch<float>("dc.noiseproj", Cs);
   lin(en, P + ".noiseEmbeddingInitialProjection", proj, 1, (int)nc, Cs);
@@ -155,14 +157,14 @@ static void singleConditioningBatch(const float* levels, size_t K, float* out) {
   const std::string P = "diffusion.conditioning";
   int n = D.n, Cs = metaI(P + ".seqChannels");
   size_t nc = lenW(P + ".fourierWeight");
-  float* e = scratch<float>("dc.emb", nc);
-  float* en = scratch<float>("dc.embn", nc);
+  float* e = scratch<float>("dc.emb", K * nc);
+  half* en = scratch<half>("dc.embn", K * nc);
   float* projs = scratch<float>("dc.noiseprojK", K * Cs);
-  for (size_t k = 0; k < K; ++k) {
-    run1d("af3_fourier", nc, FourierArgs{W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (uint)nc, levels[k]});
-    ln(e, en, 1, (int)nc, P + ".noiseEmbeddingInitialNormScale", P + ".noiseEmbeddingInitialNormOffset");
-    lin(en, P + ".noiseEmbeddingInitialProjection", projs + k * Cs, 1, (int)nc, Cs);
-  }
+  FourierArgs fa{W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (uint)nc, (uint)K, {}};
+  for (size_t k = 0; k < K; ++k) fa.levels[k] = levels[k];
+  run1d("af3_fourier", K * nc, fa);
+  ln(e, en, K, (int)nc, P + ".noiseEmbeddingInitialNormScale", P + ".noiseEmbeddingInitialNormOffset");
+  lin(en, P + ".noiseEmbeddingInitialProjection", projs, K, (int)nc, Cs);
   run1d("af3_single_batch_init", (Cs & 3) ? K * n * Cs : K * n * (Cs >> 2),
         SingleBatchInitArgs{D.singleBase, projs, out, (uint)K, (uint)n, (uint)Cs, 0});
   for (int t = 0; t < 2; ++t) plainTransition(out, K * n, Cs, P + ".singleTransitions." + num(t));
@@ -255,23 +257,38 @@ static void conditioningAhead(float level) {
   if (it == D.plan.end()) return;
   D.planAt = (size_t)(it - D.plan.begin());
   const std::string Tn = "diffusion.transformer";
-  const int n = D.n, Cc = metaI(Tn + ".condChannels");
-  const size_t pn = ((size_t)n + 15) / 16 * 16, per = pn * (D.ldn + D.ldr) * 4;
-  const size_t K = std::min<size_t>({16, ((size_t)256 << 20) / per, D.plan.size() - D.planAt});
+  const int n = D.n, Cc = metaI(Tn + ".condChannels"), C = metaI(Tn + ".channels");
+  const size_t pn = ((size_t)n + 15) / 16 * 16, per = (size_t)n * (D.ldn + D.ldr) * 4;
+  const size_t K = std::min<size_t>({16, ((size_t)512 << 20) / per, D.plan.size() - D.planAt});
   if (pn > 128 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
   D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
+  const size_t kn = K * n, pkn = (kn + 15) / 16 * 16;
+  D.heldSingle = scratch<float>("dt.heldSingle", kn * Cc);
+  singleConditioningBatch(D.held.data(), K, D.heldSingle);      // (the denoiser reads its slot too: heldSingleFor)
+  int Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
+  D.heldSnProj = scratch<float>("dt.heldSnProj", pkn * perToken);
+  half* sn = scratch<half>("dt.heldSn", pkn * Cs);
+  if (pkn > kn) fill(sn + kn * Cs, 0, (pkn - kn) * Cs * sizeof(half));
+  if (hasW("diffusion.singleCondEmbeddingNormScale"))
+    ln(D.heldSingle, sn, kn, Cs, "diffusion.singleCondEmbeddingNormScale", "diffusion.singleCondEmbeddingNormOffset");
+  else toHalf(D.heldSingle, sn, kn * Cs);
+  lin(sn, "diffusion.singleCondEmbeddingProjection", D.heldSnProj, pkn, Cs, perToken);
   D.heldNorm = scratch<float>("dt.heldNorm", K * pn * D.ldn);
   D.heldRaw = scratch<float>("dt.heldRaw", K * pn * D.ldr);
-  D.heldSingle = scratch<float>("dt.heldSingle", K * n * Cc);
   half* cn = scratch<half>("dt.heldCn", K * pn * Cc);
   half* ch = scratch<half>("dt.heldCh", K * pn * Cc);
-  if (pn != (size_t)n) { fill(cn, 0, K * pn * Cc * 2); fill(ch, 0, K * pn * Cc * 2); }
-  singleConditioningBatch(D.held.data(), K, D.heldSingle);      // (the denoiser reads its slot too: heldSingleFor)
-  for (size_t k = 0; k < K; ++k) {
-    const float* cond = D.heldSingle + k * n * Cc;
-    layerNorm(cond, cn + k * pn * Cc, n, Cc, nullptr, nullptr);
-    toHalf(cond, ch + k * pn * Cc, (size_t)n * Cc);
+  run("af3_cond_norm_cast", grid1d((pkn + 7) / 8, 1), 256,
+      CondNormCastArgs{D.heldSingle, cn, ch, 1u, (uint)kn, (uint)pkn, (uint)Cc});
+  if (gemmCondPermuted(ADA_RAW ? ch : cn, D.wNorm, D.heldNorm, pkn, kn, Cc, D.ldn, D.bNorm, n, 2 * C, ADA_RAW ? 0 : C,
+                       "transformer conditioning, ahead") &&
+      gemmCondPermuted(ch, D.wRaw, D.heldRaw, pkn, kn, Cc, D.ldr, D.bRaw, n, C, C,
+                       "transformer zero gates, ahead")) {
+    D.heldPermuted = true;
+    return;
   }
+  D.heldPermuted = false;
+  run("af3_cond_norm_cast", grid1d((K * pn + 7) / 8, 1), 256,
+      CondNormCastArgs{D.heldSingle, cn, ch, (uint)K, (uint)n, (uint)pn, (uint)Cc});
   linW(ADA_RAW ? ch : cn, D.wNorm, D.heldNorm, K * pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning, ahead");
   linW(ch, D.wRaw, D.heldRaw, K * pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates, ahead");
 }
@@ -284,21 +301,29 @@ static void transformer(float* act, const float* cond, float level) {
   // (the conditioning GEMMs too on 16-row tiles: [LN0(cond) | cond] in half, the padding rows zero)
   size_t pn = ((size_t)n + 15) / 16 * 16;
   float* gNorm; float* gRaw;
+  bool permuted = false;
   auto slot = std::find(D.held.begin(), D.held.end(), level);
   if (slot != D.held.end()) {
-    gNorm = D.heldNorm + (size_t)(slot - D.held.begin()) * pn * D.ldn;
-    gRaw = D.heldRaw + (size_t)(slot - D.held.begin()) * pn * D.ldr;
+    size_t idx = (size_t)(slot - D.held.begin());
+    size_t stepRows = D.heldPermuted ? (size_t)n : pn;
+    gNorm = D.heldNorm + idx * stepRows * D.ldn;
+    gRaw = D.heldRaw + idx * stepRows * D.ldr;
+    permuted = D.heldPermuted;
   } else {
     gNorm = scratch<float>("dt.gNorm", pn * D.ldn);
     gRaw = scratch<float>("dt.gRaw", pn * D.ldr);
     half* cn = scratch<half>("dt.cn", pn * Cc);
     half* ch = scratch<half>("dt.ch", pn * Cc);
-    static const void* zeroedC = nullptr;
-    if (pn != (size_t)n && zeroedC != cn) { fill(cn, 0, pn * Cc * 2); fill(ch, 0, pn * Cc * 2); zeroedC = cn; }
-    layerNorm(cond, cn, n, Cc, nullptr, nullptr);
-    toHalf(cond, ch, (size_t)n * Cc);
-    linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
-    linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
+    run("af3_cond_norm_cast", grid1d((pn + 7) / 8, 1), 256, CondNormCastArgs{cond, cn, ch, 1u, (uint)n, (uint)pn, (uint)Cc});
+    if (gemmCondPermuted(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, n, Cc, D.ldn, D.bNorm, n, 2 * C, ADA_RAW ? 0 : C,
+                         "transformer conditioning") &&
+        gemmCondPermuted(ch, D.wRaw, gRaw, pn, n, Cc, D.ldr, D.bRaw, n, C, C,
+                         "transformer zero gates")) {
+      permuted = true;
+    } else {
+      linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
+      linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
+    }
   }
   bool noResidual = flag(Tn + ".noResidual");
   float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
@@ -321,8 +346,12 @@ static void transformer(float* act, const float* cond, float level) {
   const float* pendY = nullptr; const float* pendGate = nullptr;
   for (int b = 0; b < D.nblocks; ++b) {
     std::string B = blockName(b);
-    const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
-    adaLn(act, g, g + C, x, nullptr, rows, C, n, D.ldn, nullptr, nullptr, nullptr, false, pendY, pendGate, D.ldr);
+    const int ldn = permuted ? 2 * C : D.ldn, ldr = permuted ? C : D.ldr;
+    const float* gAtt = permuted ? gNorm + (size_t)(2 * b) * n * 2 * C : gNorm + (size_t)b * 4 * C;
+    const float* gFfw = permuted ? gNorm + (size_t)(2 * b + 1) * n * 2 * C : gAtt + 2 * C;
+    const float* zAtt = permuted ? gRaw + (size_t)(2 * b) * n * C : gRaw + (size_t)b * 2 * C;
+    const float* zFfw = permuted ? gRaw + (size_t)(2 * b + 1) * n * C : zAtt + C;
+    adaLn(act, gAtt, gAtt + C, x, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, pendY, pendGate, ldr, nullptr, 1.f, permuted);
     pendY = nullptr; pendGate = nullptr;
     if (noResidual) copy(pre, act, rows * C * 4);
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
@@ -337,31 +366,33 @@ static void transformer(float* act, const float* cond, float level) {
     }
     attention(at);
     // (the gated residual in the output projection's epilogue where the matrix units take it: gemmGateResidual)
-    if (!gemmGateResidual(o, Wh(B + ".Transition2"), act, prows, rows, Wd, C, z, D.ldr, n, ADA_RAW ? 2.f : 1.f,
-                          "transformer output, gated residual")) {
+    if (!gemmGateResidual(o, Wh(B + ".Transition2"), act, prows, rows, Wd, C, zAtt, ldr, n, ADA_RAW ? 2.f : 1.f,
+                          "transformer output, gated residual", permuted)) {
       lin(o, B + ".Transition2", att, prows, Wd, C, 0.f, nullptr, ADA_RAW ? 2.f : 1.f);   // (chai's zero gate weights: 0.5 undone)
       if (!noResidual) {
-        adaLn(act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn, nullptr, nullptr, nullptr, false, att, z, D.ldr);
+        adaLn(act, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, att, zAtt, ldr, nullptr, 1.f, permuted);
       } else {
-        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
-        adaLn(pre, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
+        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, zAtt, rows, (uint)C, (uint)n, (uint)ldr, permuted ? 1u : 0u});
+        adaLn(pre, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, nullptr, nullptr, 0, nullptr, 1.f, permuted);
       }
     } else {
-      adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
+      adaLn(noResidual ? pre : act, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, nullptr, nullptr, 0, nullptr, 1.f, permuted);
     }
     gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
     if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate
-      half* u = scratch<half>("dt.up", rows * I);
-      linH(tn, B + ".ffwAToB", u, rows, C, I);
-      run1d("af3_mul_h", rows * I, MulHArgs{gated, u, rows * I});
+      if (!gemmMulH(tn, Wh(B + ".ffwAToB"), gated, prows, C, I, "transformer up-gate")) {
+        half* u = scratch<half>("dt.up", rows * I);
+        linH(tn, B + ".ffwAToB", u, rows, C, I);
+        run1d("af3_mul_h", rows * I, MulHArgs{gated, u, rows * I});
+      }
     }
-    if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, prows, rows, I, C, z + C, D.ldr, n, 1.f,
-                          "transformer transition, gated residual")) {
+    if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, prows, rows, I, C, zFfw, ldr, n, 1.f,
+                          "transformer transition, gated residual", permuted)) {
       lin(gated, B + ".ffwTransition2", proj, prows, I, C);
       if (!noResidual && b + 1 < D.nblocks) {
-        pendY = proj; pendGate = z + C;
+        pendY = proj; pendGate = zFfw;
       } else {
-        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, z + C, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
+        run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, zFfw, rows, (uint)C, (uint)n, (uint)ldr, permuted ? 1u : 0u});
       }
     }
   }
@@ -393,8 +424,8 @@ static float* atomDecoder(const half* tokenAct) {
   const std::string Dd = "diffusion.decoder";
   AtomShape sh = atomShape();
   int C = D.decC;
-  size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS, atoms = (size_t)sh.tokens * sh.dense;
-  Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2t = gatherOf("batch.queriesToTokenAtoms");
+  size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
+  Gather t2q = gatherOf("batch.tokenAtomsToQueries");
   float* proj = scratch<float>("dec.proj", (size_t)sh.tokens * NS * C);
   lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, (size_t)sh.tokens * NS, D.decPerToken, C);
   float* act = scratch<float>("dec.act", qRows * C);
@@ -415,9 +446,7 @@ static float* atomDecoder(const half* tokenAct) {
   run("af3_mask_ln_project3", grid1d((qRows + 7) / 8, 1), 256,
       MaskLnProject3Args{act, D.enc.qMask, W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"),
                          W(Dd + ".atomFeaturesToPositionUpdate"), upd, pendY, pendGate, qRows, q1, (uint)C, 0});
-  float* out = scratch<float>("dec.out", atoms * NS * 3);
-  convert(q2t, upd, out, 3, q1, NS);
-  return out;
+  return upd;
 }
 
 // ---------------------------------------------------------------- the denoiser
@@ -444,38 +473,35 @@ void reportStages() {
   for (auto& [k, v] : STAGE_MS) printf("  %-14s %8.1f ms\n", k.c_str(), v);
   STAGE_MS.clear();
 }
-static float* denoise(const float* x, float level) {
+static float* denoise(const float* x, float level, float* eulerX = nullptr, float eulerScale = 0.f, bool needOut = true) {
   stage(nullptr);
-  int n = D.n, dense = metaI("batch.dense");
-  size_t atoms = (size_t)n * dense, total = atoms * NS;
+  int n = D.n, dense = metaI("batch.dense"), Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
+  size_t atoms = (size_t)n * dense, total = atoms * NS, rows = (size_t)n * NS;
   float d = level * level + 256.f, skip = 256.f / d, outS = level * 16.f / sqrtf(d), in = 1.f / sqrtf(d);
   conditioningAhead(level);
   auto heldAt = std::find(D.held.begin(), D.held.end(), level);
-  float* single = heldAt != D.held.end() ? D.heldSingle + (size_t)(heldAt - D.held.begin()) * n * metaI("diffusion.conditioning.seqChannels")
-                                         : singleConditioning(level);
-  stage("conditioning");
-  const float* atomMask = M.f("batch.predDenseAtomMask");
-  float* scaled = scratch<float>("dn.scaled", total * 3);
-  run1d("af3_scale_positions", total * 3, ScalePosArgs{x, atomMask, scaled, total, atoms, in, 0});
-  encoderStep("diffusion.encoder", D.enc, scaled);
-  stage("encoder");
-  int Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
-  size_t rows = (size_t)n * NS;
-  float* act = D.enc.tokenAct;
-  {
-    half* sn = scratch<half>("dn.sn", (size_t)n * Cs);
+  float* single = nullptr;
+  float* snProj = nullptr;
+  if (heldAt != D.held.end()) {
+    size_t idx = (size_t)(heldAt - D.held.begin());
+    single = D.heldSingle + idx * n * metaI("diffusion.conditioning.seqChannels");
+    snProj = D.heldSnProj + idx * n * perToken;
+  } else {
+    single = singleConditioning(level);
+    size_t pn = ((size_t)n + 15) / 16 * 16;
+    half* sn = scratch<half>("dn.sn", pn * Cs);
+    if (pn > (size_t)n) fill(sn + (size_t)n * Cs, 0, (pn - n) * Cs * sizeof(half));
     if (hasW("diffusion.singleCondEmbeddingNormScale"))
       ln(single, sn, n, Cs, "diffusion.singleCondEmbeddingNormScale", "diffusion.singleCondEmbeddingNormOffset");
     else toHalf(single, sn, (size_t)n * Cs);
-    if (NS == 1) {
-      lin(sn, "diffusion.singleCondEmbeddingProjection", act, n, Cs, perToken, 1.f);
-    } else {
-      float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
-      lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, n, Cs, perToken);
-      run1d("af3_add_broadcast", (perToken & 3) ? rows * perToken : (rows * perToken) >> 2,
-            AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
-    }
+    snProj = scratch<float>("dn.snProj", pn * perToken);
+    lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, pn, Cs, perToken);
   }
+  stage("conditioning");
+  const float* atomMask = M.f("batch.predDenseAtomMask");
+  encoderStep("diffusion.encoder", D.enc, x, atomMask, in, snProj);
+  stage("encoder");
+  float* act = D.enc.tokenAct;
   stage("snproj");
   transformer(act, single, level);
   stage("transformer");
@@ -483,8 +509,12 @@ static float* denoise(const float* x, float level) {
   ln(act, actn, rows, perToken, "diffusion.outputNormScale", "diffusion.outputNormOffset");
   float* upd = atomDecoder(actn);
   stage("decoder");
-  float* out = scratch<float>("dn.out", total * 3);
-  run1d("af3_denoise_out", total * 3, DenoiseOutArgs{x, upd, atomMask, out, total, atoms, skip, outS});
+  Gather q2t = gatherOf("batch.queriesToTokenAtoms");
+  AtomShape sh = atomShape();
+  size_t q1 = (size_t)sh.subsets * sh.queries;
+  float* out = needOut ? scratch<float>("dn.out", total * 3) : nullptr;
+  run1d("af3_denoise_out", total * 3,
+        DenoiseOutArgs{x, upd, q2t.idx, q2t.mask, atomMask, out, eulerX, total, atoms, q1, skip, outS, eulerScale, 0});
   return out;
 }
 
@@ -576,12 +606,17 @@ static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_
     run("af3_centroid", Grid{(uint32_t)ns, 1, 1}, 1024, CentroidArgs{dX, dMask, dC, atoms});
     run1d("af3_augment", atoms * ns, AugmentArgs{dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12, dSeeds, atoms, atoms * ns, (uint)s,
                                                  (float)injected});
+    if (!secondOrder && exponential) {          // one call: the correction's D taken as this step's (see above)
+      float coef = (float)(std::pow(level / tHat, S) - 1);
+      const float* d1 = denoise(dIn, (float)tHat, dX, coef, (bool)onStep);
+      if (onStep) onStep(d1, s, T);
+      continue;
+    }
     copy(dNoisy, dIn, all3 * 4);
     const float* d1 = denoise(dIn, (float)tHat);
     if (onStep) onStep(d1, s, T);
-    if (!secondOrder) {                         // one call: the correction's D taken as this step's (see above)
-      if (exponential) run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d1, all3, (float)(std::pow(level / tHat, S) - 1), 0});
-      else run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)(S * dt)});
+    if (!secondOrder) {
+      run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)(S * dt)});
       continue;
     }
     if (exponential) {                          // the exponential Heun step (dG keeps D1 across the second call)
@@ -653,11 +688,14 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
       run("af3_centroid", Grid{(uint32_t)ns, 1, 1}, 1024, CentroidArgs{dX, dMask, dC, atoms});
       run1d("af3_augment", atoms * ns, AugmentArgs{dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12, dSeeds, atoms, atoms * ns,
                                                    (uint)step, (float)injected});
-      const float* d = denoise(dNoisy, tHat);
-      if (onStep) onStep(d, step, steps);
-      // Euler's x' = x + S (r - 1)(x - D), or the exponential x' = r^S x + (1 - r^S) D (r = level / tHat) - the
-      // same kernel, x + coef (x - D), coef r^S - 1
-      if (realign) {   // (boltz2: the noisy copy rigid-aligned onto the answer, each sample - rigid.cuh)
+      const double coef = SAMPLER.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
+      if (!realign) {
+        const float* d = denoise(dNoisy, tHat, dX, (float)coef, (bool)onStep);
+        if (onStep) onStep(d, step, steps);
+      } else {
+        const float* d = denoise(dNoisy, tHat);
+        if (onStep) onStep(d, step, steps);
+        // (boltz2: the noisy copy rigid-aligned onto the answer, each sample - rigid.cuh)
         std::vector<float> noisy = download(dNoisy, all3), answer = download(d, all3);
         for (int k = 0; k < ns; ++k) {
           std::vector<float> x(noisy.begin() + (size_t)k * n3, noisy.begin() + (size_t)(k + 1) * n3),
@@ -666,9 +704,8 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
           std::copy(x.begin(), x.end(), noisy.begin() + (size_t)k * n3);
         }
         upload(dNoisy, noisy.data(), all3 * sizeof(float));
+        run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)coef, 0});
       }
-      const double coef = SAMPLER.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
-      run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)coef, 0});
     }
     release(dRot);
   }

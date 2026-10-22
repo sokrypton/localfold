@@ -705,7 +705,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // float, scales, and saturates on the store: halfProductScale)
   const bool scaledHalf = tc_ == F16 && accFloat && a.alpha != 1.f;
   // (the coupling combine, 32768, reads its product in float: a half tile rounds Z before a sum that cancels)
-  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768));
+  const bool hacc = !floatAcc && ((tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768))) || (a.epilogue & 16384));
   const bool tri = a.epilogue & 256;
   const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || !hacc) && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
@@ -717,10 +717,10 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
   // 2.960 against 2.886). LOCALFOLD_GEMM_WIDE=0 the control
   static const bool wideWanted = !getenv("LOCALFOLD_GEMM_WIDE") || atoi(getenv("LOCALFOLD_GEMM_WIDE")) != 0;
-  if (wideWanted && plain && a.n > 128 && a.k <= 128 && a.m % 256 == 0) { tm = 32; tn = 256; }
+  if (wideWanted && (plain || (a.epilogue & (128 | 1048576))) && a.n > 128 && a.k <= 128 && a.m % 256 == 0) { tm = 32; tn = 256; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
   const bool triReg = tri && (a.epilogue & 512);
-  if (triReg) { tm = 64; tn = 128; }      // (the layout lf_tri_quarters wrote: 32 channels a tile)
+  if (triReg || (a.epilogue & 524288)) { tm = 64; tn = a.m >= 128 ? 128 : 64; }
   // the general epilogues in registers, 4 columns at a time (LOCALFOLD_GEMM_VEC=0 the control): where the tile is
   // 64 rows and everything the epilogue touches is 4-element aligned
   static const bool vecWanted = !getenv("LOCALFOLD_GEMM_VEC") || atoi(getenv("LOCALFOLD_GEMM_VEC")) != 0;
@@ -730,19 +730,25 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (a.lnOut && lnWanted && a.m == 256 && a.n > 128 && !tri && !getenv("LOCALFOLD_GEMM_TILE")) { tm = 32; tn = 256; }
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
-                     (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) && (tm == 64 || (tm == 32 && tn == 256)) &&
+                     (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) &&
+                     (tm == 64 || (tm == 32 && tn == 256) || ((a.epilogue & 1048576) && tm % 16 == 0 && tn % 32 == 0)) &&
                      a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
                      (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0)
-                             : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
+                             : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & (64 | 1048576)) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
+  const bool swigluReg = vecWanted && (a.epilogue & 128) && !(a.epilogue & ~(128 | 4)) &&
+                         a.m % 16 == 0 && a.ldd % 4 == 0 && a.D % 8 == 0 && (!(a.epilogue & 4) || a.bias % 16 == 0) &&
+                         tm % 16 == 0 && tn % 32 == 0;
   if ((a.epilogue & 4096) && !vecEp) die("gemm: the permuted store needs the vector epilogue's alignment");
   if ((a.epilogue & 131072) && !vecEp) die("gemm: the blocks-of-2 coupling combine needs the vector epilogue's alignment");
   if ((a.epilogue & 262144) && !vecEp) die("gemm: the gated rows need the vector epilogue's alignment");
+  if ((a.epilogue & 524288) && !vecEp) die("gemm: the conditioning permuted store needs the vector epilogue's alignment");
   if ((a.epilogue & 8192) && !vecEp) die("gemm: the outer product's normalised add needs the vector epilogue's alignment");
   if ((a.epilogue & 16384) && !vecEp) die("gemm: the gated residual needs the vector epilogue's alignment");
-  if (vecEp && tn < 64) tn = 64;
+  if ((a.epilogue & 1048576) && !vecEp) die("gemm: the in-place multiply needs the vector epilogue's alignment");
+  if (vecEp && !(a.epilogue & 1048576) && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
-  while (!plain && !tri && !vecEp && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
+  while (!plain && !tri && !vecEp && !swigluReg && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one 64 x 128 tile wide
@@ -751,7 +757,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
   if (!lnEmit) a.lnOut = a.lnOut2 = 0;
-  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0) | (triReg ? 16 : 0) | (lnEmit ? 64 : 0) | (vecEp ? 128 : 0);
+  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0) | (triReg ? 16 : 0) | (swigluReg ? 32 : 0) | (lnEmit ? 64 : 0) | (vecEp ? 128 : 0);
   const char* tcs = tc_ == F32 ? "float" : "half";
   std::string targs = std::string("half, half, ") + tcs + ", " + std::to_string(tm) + ", " + std::to_string(tn) + ", " +
                       (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(ep);
@@ -932,7 +938,7 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
   return gatedAddDual(Xg, Wg, Xv, Wv, pair, F16, rows, in, out, biasG, biasV, vTmp, label, lnOut, lnScale, lnOffset, lnEps);
 }
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
-                      const float* gate, int ld, size_t period, float alpha, const char* label) {
+                      const float* gate, int ld, size_t period, float alpha, const char* label, bool preSigmoid) {
   static const bool on = !getenv("LOCALFOLD_GATE_RES") || atoi(getenv("LOCALFOLD_GATE_RES")) != 0;
   if (!on || !tensorWanted() || prows <= 128 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
     return false;
@@ -940,8 +946,32 @@ bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, si
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)act;
   a.m = out; a.n = (int)prows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = alpha; a.epilogue = 16384; a.aux = (uint64_t)gate; a.ldaux = ld; a.tgN = (int)period; a.tgPairs = (int64_t)rows;
+  a.tgC = preSigmoid ? 1 : 0;
   ++D().stats.gemms;
   gemmTensorRun(F32, a, 1, false, label);
+  return true;
+}
+bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
+                      const float* bias, int period, int width, int sigCols, const char* label) {
+  if (!tensorWanted() || out % 64 || width % 4 || sigCols % 4 || ((uint64_t)Y & 15) || (bias && ((uint64_t)bias & 15)))
+    return false;
+  GemmArgs a{};
+  a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
+  a.m = out; a.n = (int)prows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
+  a.alpha = 1.f; a.epilogue = 524288 | (bias ? 4 : 0); a.bias = (uint64_t)bias;
+  a.tgPairs = (int64_t)validRows; a.tgN = period; a.tgC = width; a.tgNp = sigCols;
+  ++D().stats.gemms;
+  gemmTensorRun(F32, a, 1, false, label);
+  return true;
+}
+bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label) {
+  if (!tensorWanted() || out % 4 != 0 || ((uint64_t)Y & 15) != 0) return false;
+  GemmArgs a{};
+  a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
+  a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
+  a.alpha = 1.f; a.epilogue = 1048576;
+  ++D().stats.gemms;
+  gemmTensorRun(F16, a, 1, false, label);
   return true;
 }
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha) {
@@ -957,24 +987,25 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
   return true;
 }
 static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
-                   float alpha) {
+                   float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
   if (!on || !tensorWanted() || rows <= 128 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
+  if (lnOut) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
   ++D().stats.gemms;
   gemmTensorRun(tp, a, 1, true, "opm output, normalised add");
   return true;
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha) {
-  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha);
+                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps);
 }
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha) {
-  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha);
+                float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps);
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

@@ -19,10 +19,12 @@ void convert(const Gather& g, const float* src, float* out, int C, size_t srcRow
   run1d("af3_convert", (size_t)ns * g.count * C, ConvertArgs{g.idx, g.mask, src, out, srcRows, (uint)g.count, (uint)C, (uint)ns, 0});
 }
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period, int ld,
-           const float* kScale, const float* kShift, half* kOut, bool chained, const float* resY, const float* resGate, int resLd) {
+           const float* kScale, const float* kShift, half* kOut, bool chained, const float* resY, const float* resGate, int resLd,
+           const half* resYh, float resScale, bool preSigmoid) {
   run("af3_ada_ln", grid1d((rows + 7) / 8, 1), 256,
-      AdaLnArgs{x, scale, shift, out, outF, kScale, kShift, kOut, resY, resGate, rows, (uint)C, (uint)period, (uint)(ld ? ld : C),
-                ADA_RAW ? 1u : 0u, ADA_RAW ? 0.1f : 1e-5f, chained ? 1u : 0u, (uint)(resLd ? resLd : C), 0});
+      AdaLnArgs{x, scale, shift, out, outF, kScale, kShift, kOut, resY, resYh, resGate, rows, (uint)C, (uint)period, (uint)(ld ? ld : C),
+                ((ADA_RAW || preSigmoid) ? 1u : 0u) | (preSigmoid ? 2u : 0u), ADA_RAW ? 0.1f : 1e-5f, chained ? 1u : 0u,
+                (uint)(resLd ? resLd : C), resScale});
 }
 
 // ---------------------------------------------------------------- the conditioning
@@ -60,6 +62,7 @@ AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t
   adaCond(qCond, qRows, C, C, B + ".ffw", c.ffwScale, c.ffwShift);
   lin(qCond, B + ".AdaptiveZeroCondWeights", c.zg, qRows, C, C, 0.f, W(B + ".AdaptiveZeroCondBias"));
   lin(qCond, B + ".ffwAdaptiveZeroCondWeights", c.tg, qRows, C, C, 0.f, W(B + ".ffwAdaptiveZeroCondBias"));
+  run1d("af3_sigmoid_atom", qRows * C, SigmoidAtomArgs{c.qScale, c.kScale, c.ffwScale, c.zg, c.tg, qRows * C, ADA_RAW ? 1u : 0u, 0});
   c.pairLogits = pairLogits;
   c.chained = flag(B + ".chainedAtomLayerNorm");
   return c;
@@ -115,17 +118,21 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
       run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, attention, nullptr, bc.zg, qRows * C, q1 * C, 1.f, 0});
       adaLn(pre, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
     }
+  } else if (!st.noResidual) {
+    adaLn(act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1, 0, nullptr, nullptr, nullptr, false, nullptr, bc.zg, C, gathered, 2.f);
   } else {
     run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, nullptr, gathered, bc.zg, qRows * C, q1 * C, 2.f, 0});
-    adaLn(st.noResidual ? pre : act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
+    adaLn(pre, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
   }
   int I = C * 2;
   half* gated = scratch<half>("ab.gated", qRows * I);
   gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, qRows, C, I);
   if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate: silu(a) b u
-    half* u = scratch<half>("ab.up", qRows * I);
-    linH(tn, B + ".ffwAToB", u, qRows, C, I);
-    run1d("af3_mul_h", qRows * I, MulHArgs{gated, u, qRows * I});
+    if (!gemmMulH(tn, Wh(B + ".ffwAToB"), gated, qRows, C, I, "atom up-gate")) {
+      half* u = scratch<half>("ab.up", qRows * I);
+      linH(tn, B + ".ffwAToB", u, qRows, C, I);
+      run1d("af3_mul_h", qRows * I, MulHArgs{gated, u, qRows * I});
+    }
   }
   float* projected = scratch<float>("ab.projected", qRows * C);
   lin(gated, B + ".ffwTransition2", projected, qRows, I, C);
@@ -309,7 +316,8 @@ static const ChiralIndex& chiralIndex(size_t atoms) {
   return CHIRAL;
 }
 // The encoder's per-step part: the activation from (scaled) positions, the blocks, the per-token aggregation
-void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions) {
+void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions, const float* atomMask, float posScale,
+                 const float* tokenBias) {
   AtomShape sh = atomShape();
   int C = o.C;
   size_t atoms = (size_t)sh.tokens * sh.dense, q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
@@ -319,15 +327,21 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   bool chiral = atomPositions && hasW(E + ".atomChiralToFeatures");
   if (chiral) {
     // rf3's: the positions' projection and the chirality gradient's beside it, masked, added to the start
+    const float* scaledPos = atomPositions;
+    if (atomMask) {
+      float* scaled = scratch<float>("dn.scaled", atoms * NS * 3);
+      run1d("af3_scale_positions", atoms * NS * 3, ScalePosArgs{atomPositions, atomMask, scaled, atoms * NS, atoms, posScale, 0});
+      scaledPos = scaled;
+    }
     for (int k = 0; k < NS; ++k) copy(act + k * q1 * C, o.qStart, q1 * C * 4);
     float* gp = scratch<float>("enc.gp", qRows * 3);
-    convert(t2q, atomPositions, gp, 3, atoms, NS);
+    convert(t2q, scaledPos, gp, 3, atoms, NS);
     float* positional = scratch<float>("enc.positional", qRows * C);
     lin(gp, E + ".atomPositionsToFeatures", positional, qRows, 3, C);
     if (!M.has("chiral.centers")) die("this bundle reads chirality centres the input lacks: export it again");
     const ChiralIndex& ch = chiralIndex(atoms);
     float* grads = scratch<float>("enc.chiralGrads", atoms * NS * 3);
-    run1d("af3_chiral_grad", atoms * NS, ChiralGradArgs{atomPositions, M.i("chiral.centers"), M.f("chiral.angles"), ch.offsets, ch.entries,
+    run1d("af3_chiral_grad", atoms * NS, ChiralGradArgs{scaledPos, M.i("chiral.centers"), M.f("chiral.angles"), ch.offsets, ch.entries,
                                                         grads, atoms, (uint)NS, 0});
     float* gc = scratch<float>("enc.gc", qRows * 3);
     convert(t2q, grads, gc, 3, atoms, NS);
@@ -337,8 +351,8 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   } else if (atomPositions) {
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) die("encoder: the positions projection is not 3 x C");
     run1d("af3_encoder_start", (C & 3) ? qRows * C : qRows * (C >> 2),
-          EncoderStartArgs{o.qStart, atomPositions, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
-                           o.qMask, act, qRows, q1, atoms, (uint)C, 0});
+          EncoderStartArgs{o.qStart, atomPositions, atomMask, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
+                           o.qMask, act, qRows, q1, atoms, (uint)C, posScale});
   } else {
     for (int k = 0; k < NS; ++k) copy(act + k * q1 * C, o.qStart, q1 * C * 4);
   }
@@ -356,8 +370,8 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   lin(actH, E + ".projectAtomFeaturesForAggr", projected, qRows, C, o.perToken);
   o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);
   run1d("af3_aggregate", (o.perToken & 3) ? (size_t)sh.tokens * NS * o.perToken : (size_t)sh.tokens * NS * (o.perToken >> 2),
-        AggregateArgs{projected, q2t.idx, q2t.mask, M.f("batch.refMask"), o.tokenAct, (u64)sh.tokens * NS, q1, (uint)sh.tokens,
-                      (uint)sh.dense, (uint)o.perToken, 0});
+        AggregateArgs{projected, q2t.idx, q2t.mask, M.f("batch.refMask"), tokenBias, o.tokenAct, (u64)sh.tokens * NS, q1,
+                      (uint)sh.tokens, (uint)sh.dense, (uint)o.perToken, 0});
 }
 
 // ---------------------------------------------------------------- target_feat

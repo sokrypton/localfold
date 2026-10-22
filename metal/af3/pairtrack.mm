@@ -38,6 +38,7 @@ const half* triGateWeight(const std::string& pre, int C) {
 struct Emitted { const void* x = nullptr; std::string norm; half* buf = nullptr; };
 static Emitted emitted[2];
 static void emit(int k, const void* x, const std::string& norm, half* buf) { emitted[k] = {x, norm, buf}; }
+void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit(k, x, norm, buf); }
 static half* takeEmitted(const void* x, const std::string& norm) {
   for (auto& e : emitted)
     if (e.x == x && e.norm == norm) { e.x = nullptr; return e.buf; }

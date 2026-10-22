@@ -150,7 +150,11 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // residual, in the product's epilogue on the matrix units (the product over prows >= rows, padded; false: not run, the
 // caller's product and residual still to do). LOCALFOLD_GATE_RES=0 the control
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
-                      const float* gate, int ld, size_t period, float alpha, const char* label = nullptr);
+                      const float* gate, int ld, size_t period, float alpha, const char* label = nullptr,
+                      bool preSigmoid = false);
+bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
+                      const float* bias, int period, int width, int sigCols, const char* label = nullptr);
+bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label = nullptr);
 // (alpha: the product scaled as it is stored - AF2's deep alignments contract their rows scaled down by a power of two
 // to fit float16, and gemmOpmOut's alpha scales them back)
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha = 1.f);
@@ -158,9 +162,11 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
 // matrix units only (the vector epilogue, EP bit 8192); false: nothing run, the caller's own GEMM and add
 // (alpha scales X W before the bias is added: (bias + alpha X W) / (1e-3 + norm), af2_opm_add's order)
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha = 1.f);
+                float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
+                float lnEps = 1e-5f);
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
-                float alpha = 1.f);
+                float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
+                float lnEps = 1e-5f);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 // BioEmu2's coupling split (metal/bioemu2's couplingSplit): gemmSwiglu's product over the ATOM half of the row only, Xq Wq
 // (Wq: that half's rows of the blocks-of-8 weight), its epilogue (32768, a float tile) the whole row's pre-activations

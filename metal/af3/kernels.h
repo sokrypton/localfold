@@ -19,7 +19,7 @@ struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; u64 pad0; uint
 // x[r][c] (*)= scale
 struct ScaleArgs { DP(float) x; u64 n; float s; uint relu; };
 struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; CP(float) resY; CP(float) resGate; u64 pad0, rows; uint C, period; };      // x[r] *= mask[r % period]
-struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
+struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C, pad; };
 struct CastArgs { CP(float) x; DP(half) y; u64 n; };
 
 // ---------------------------------------------------------------- the embedder
@@ -78,7 +78,9 @@ struct AtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float) kP
 struct AtomLogitsArgs { CP(float) flat; DP(float) out; uint block, nblocks, subsets, heads, queries, keys; };
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift (scale, shift read at row % period), to half or float (and kOut when paired)
 struct AdaLnArgs { DP(float) x; CP(float) scale; CP(float) shift; DP(half) out; DP(float) outF; CP(float) kScale; CP(float) kShift; DP(half) kOut;
-                   CP(float) resY; CP(float) resGate; u64 rows; uint C, period, ld, raw; float eps; uint chained, resLd, pad; };
+                   CP(float) resY; CP(half) resYh; CP(float) resGate; u64 rows; uint C, period, ld, raw; float eps; uint chained, resLd;
+                   float resScale; };
+struct SigmoidAtomArgs { DP(float) qs; DP(float) ks; DP(float) fs; DP(float) zg; DP(float) tg; u64 n; uint raw, pad; };
 // rows of 16-byte chunks gathered: out[r] = mask[g] ? in[idx[g] + k srcRows] : 0, r = k count + g
 struct GatherRowsArgs { CP(uchar) in; CP(int) idx; CP(float) mask; DP(uchar) out; u64 rows, count, srcRows; uint chunks, pad; };
 // one subset's attention: 32 queries against 128 keys, q (+ bias) and the gate in qg [rows][2W], k and v in kv (or kvAtom via q2kIdx/q2kMask)
@@ -88,10 +90,11 @@ struct AtomAttnArgs { CP(half) qg; CP(float) qBias; CP(half) kv; CP(int) q2kIdx;
 struct GatedResidualArgs { DP(float) act; CP(float) y; CP(half) yh; CP(float) gate; u64 n, period; float scale, pad; };
 struct MulHArgs { DP(half) x; CP(half) y; u64 n; };
 // act[q] = qStart[q] + qMask[q] (positions gathered to q) W, W [3][C]
-struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(int) idx; CP(float) gmask; CP(float) Wp; CP(float) qMask; DP(float) act;
-                          u64 rows, q1, atoms; uint C, pad; };
+struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(float) atomMask; CP(int) idx; CP(float) gmask; CP(float) Wp;
+                          CP(float) qMask; DP(float) act; u64 rows, q1, atoms; uint C; float posScale; };
 // per token: the mean over its real atoms of relu(projected), gathered back to the token's atoms
-struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(float) atomMask; DP(float) out; u64 rows, q1; uint tokens, dense, Cp, pad; };
+struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(float) atomMask; CP(float) tokenBias; DP(float) out;
+                       u64 rows, q1; uint tokens, dense, Cp, pad; };
 // target_feat: [aatype one-hot 31 | profile 31 | deletion mean | atom features 384]
 struct TargetFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) atom; DP(float) out; uint tokens, pad; };
 // boltz2's: the atom columns plus six bias-free projections
@@ -104,8 +107,10 @@ struct TargetFeatSumArgs { DP(float) tf; CP(int) aatype; CP(float) profile; CP(f
 struct PairFeatArgs { CP(float) trunkPair; RelIdx r; DP(float) out; u64 p0, rows; uint n, Czt; };
 // out[r] = [a[r] | b[r]] with zero columns at p0 and p1 (-1: none)
 struct ConcatPadArgs { CP(float) a; CP(float) b; DP(float) out; uint rows, wa, wb; int p0, p1; uint pad; };
-struct FourierArgs { CP(float) w; CP(float) b; DP(float) out; uint n; float level; };
+struct FourierArgs { CP(float) w; CP(float) b; DP(float) out; uint n, K; float levels[16]; };
 struct SingleBatchInitArgs { CP(float) base; CP(float) projs; DP(float) out; uint K, n, Cs, pad; };
+// the transformer conditioning's per-row norms + cast: cn = LN0(cond), ch = half(cond), padded rows [n, pn) zeroed
+struct CondNormCastArgs { CP(float) cond; DP(half) cn; DP(half) ch; uint K, n, pn, Cc; };
 // out[k][off + c] = scale[k] w[k][c] (scale null: 1), rows ld wide
 struct FoldCondArgs { CP(float) scale; CP(half) w; DP(half) out; uint Cc, C, ld, off; };
 // act[r][c] += y[r][c] sigmoid(gate[(r % period) ld + c])
@@ -118,7 +123,8 @@ struct BroadcastSkipArgs { CP(float) proj; CP(int) idx; CP(float) gmask; CP(floa
 struct MaskLnProject3Args { CP(float) act; CP(float) qMask; CP(float) scale; CP(float) offset; CP(float) Wp; DP(float) upd;
                             CP(float) resY; CP(float) resGate; u64 rows, q1; uint C, pad; };
 struct ScalePosArgs { CP(float) x; CP(float) mask; DP(float) y; u64 total, atoms; float in; uint pad; };
-struct DenoiseOutArgs { CP(float) x; CP(float) upd; CP(float) mask; DP(float) o; u64 total, atoms; float skip, out; };
+struct DenoiseOutArgs { CP(float) x; CP(float) upd; CP(int) q2tIdx; CP(float) q2tMask; CP(float) mask; DP(float) o; DP(float) eulerX;
+                        u64 total, atoms, q1; float skip, out, eulerScale; uint pad; };
 // the sampler
 struct InitNoiseArgs { DP(float) x; CP(u64) seeds; u64 n3, total; float scale; uint pad; };
 struct CentroidArgs { CP(float) x; CP(float) mask; DP(float) c; u64 atoms; };

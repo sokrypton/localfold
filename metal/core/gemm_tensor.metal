@@ -156,44 +156,112 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
     }
     return;
   }
+  // EP bit 32, SwiGLU in registers: columns in blocks of 8 (16m..16m+7 are a_8m.., 16m+8..16m+15 their b); e and e + 4
+  // hold the same 4 columns on rows ix[1] and ix[1] + 8, while lane ^ 8 holds column ^ 8 (b for a) on the same rows.
+  // One butterfly shuffle pairs all 32 lanes: even-block lanes compute row ix[1], odd-block lanes compute row ix[1] + 8
+  if constexpr ((EP & 32) != 0) {
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < c.get_capacity(); e += 8) {
+      if (!c.is_valid_element(e)) continue;
+      const auto ix0 = c.get_multidimensional_index(e);
+      const auto ix1 = c.get_multidimensional_index(e + 4);
+      float4 v0 = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+      float4 v1 = g.alpha * float4((float)c[e + 4], (float)c[e + 5], (float)c[e + 6], (float)c[e + 7]);
+      if ((g.epilogue & 4) && i0 + ix0[0] < g.m) {
+        const float4 bv = *(device const float4*)((device const float*)g.bias + i0 + ix0[0]);
+        v0 += bv; v1 += bv;
+      }
+      const bool odd = (ix0[0] & 8) != 0;
+      const float4 partner = simd_shuffle_xor(odd ? v0 : v1, 8);
+      const float4 va = odd ? partner : v0;
+      const float4 vb = odd ? v1 : partner;
+      const int j = j0 + (odd ? ix1[1] : ix0[1]);
+      const int i = i0 + (ix0[0] & ~8);
+      if (j < g.n && i + 8 < g.m) {
+        const int outCol = (i >> 4) * 8 + (i & 7);
+        const float4 res = fast::divide(va, 1.f + fast::exp(-va)) * vb;
+        *(device vec<TC, 4>*)(D + (ulong)j * g.ldd + outCol) = lf_out4<TC>(res);
+      }
+    }
+    return;
+  }
   // EP bit 128, the general epilogues (alpha, beta, a bias, ReLU, GELU, the gated residual) in registers: a thread holds
   // 4 adjacent columns at e..e+3 (the 64 x 64 and 64 x 128 layouts probed on the M5), read and written 4 at a time -
   // the host's promise: the leading dimensions and pointers 4-element aligned, m a multiple of 4
   if constexpr ((EP & 128) != 0) {
-    static_assert((TM == 64 && (TN == 64 || TN == 128)) || (TM == 32 && TN == 256),
-                  "the vector epilogue is laid out for 64 x 64, 64 x 128 and 32 x 256 tiles");
+    static_assert((TM % 16 == 0 && TN % 32 == 0),
+                  "the vector epilogue requires 16-row by 32-column multiple tiles");
     static_assert((EP & 64) == 0 || (TM * TN == 8192 && !metal::is_same_v<TACC, half>), "the emitted LayerNorm: 64 x 128 or 32 x 256, float");
+    if constexpr (metal::is_same_v<TC, float> && metal::is_same_v<TACC, half>) {
+      _Pragma("clang loop unroll(full)")
+      for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+        if (!c.is_valid_element(e)) continue;
+        const auto ix = c.get_multidimensional_index(e);
+        const int i = i0 + ix[0], j = j0 + ix[1];
+        if (j >= g.tgPairs || i >= g.m) continue;
+        const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+        const uint r = (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+        const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
+        const float4 cv = *(device const float4*)(C + (ulong)i + (ulong)j * g.ldc);
+        const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+        *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = cv + v * gm;
+      }
+      return;
+    }
+    if constexpr (metal::is_same_v<TC, half> && metal::is_same_v<TACC, half>) {
+      _Pragma("clang loop unroll(full)")
+      for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+        if (!c.is_valid_element(e)) continue;
+        const auto ix = c.get_multidimensional_index(e);
+        const int i = i0 + ix[0], j = j0 + ix[1];
+        if (j >= g.n || i >= g.m) continue;
+        const float4 v = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+        if (g.epilogue & 4096) {
+          const uint O = (uint)g.tgC, L = (uint)g.tgN;
+          const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
+          *(device half4*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = half4(g.alpha * v);
+        } else {
+          device half4* dp = (device half4*)(D + (ulong)i + (ulong)j * g.ldd);
+          *dp = lf_out4<half>(float4(*dp) * v);
+        }
+      }
+      return;
+    }
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
       if (!c.is_valid_element(e)) continue;
       const auto ix = c.get_multidimensional_index(e);
       const int i = i0 + ix[0], j = j0 + ix[1];
       if (j >= g.n || i >= g.m) continue;
-      if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
-        // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
-        device const float* sr = (device const float*)g.aux + (ulong)j * 8;
-        const float inv = sr[0], dq = sr[2], sq = sr[3], sa = sr[5];
-        const int st = (int)sr[6];
-        device const float* qb = (device const float*)g.aux3 + (ulong)(uint)sr[7] * 2 * g.m;
-        device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
-        for (int t = 0; t < 2; ++t) {
-          const int x = i / 2 + t, pc = (x >> 3) * 16 + (x & 7);
-          const float pa = st >= 0 ? sa * pr[pc] : 0.f, pb = st >= 0 ? sa * pr[pc + 8] : 0.f;
-          const float ua = inv * (pa + sq * (float)c[e + t] + dq * qb[pc]) + qb[g.m + pc];
-          const float ub = inv * (pb + sq * (float)c[e + 2 + t] + dq * qb[pc + 8]) + qb[g.m + pc + 8];
-          D[(ulong)x + (ulong)j * g.ldd] = (TC)(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
+      if constexpr (metal::is_same_v<TC, half> && (EP & 64) == 0) {
+        if (g.epilogue & 131072) {   // the coupling combine on a blocks-of-2 weight (core.h's gemmCouplingCombine): gates
+          // i / 2 and i / 2 + 1 here with their values; P and R | B in gemmSwiglu's blocks of 8
+          device const float* sr = (device const float*)g.aux + (ulong)j * 8;
+          const float inv = sr[0], dq = sr[2], sq = sr[3], sa = sr[5];
+          const int st = (int)sr[6];
+          device const float* qb = (device const float*)g.aux3 + (ulong)(uint)sr[7] * 2 * g.m;
+          device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
+          for (int t = 0; t < 2; ++t) {
+            const int x = i / 2 + t, pc = (x >> 3) * 16 + (x & 7);
+            const float pa = st >= 0 ? sa * pr[pc] : 0.f, pb = st >= 0 ? sa * pr[pc + 8] : 0.f;
+            const float ua = inv * (pa + sq * (float)c[e + t] + dq * qb[pc]) + qb[g.m + pc];
+            const float ub = inv * (pb + sq * (float)c[e + 2 + t] + dq * qb[pc + 8]) + qb[g.m + pc + 8];
+            D[(ulong)x + (ulong)j * g.ldd] = (TC)(fast::divide(ua, 1.f + fast::exp(-ua)) * ub);
+          }
+          continue;
         }
-        continue;
       }
       // (lf_gemm's order of operations, so the results match the staged path's bit for bit)
       float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-      if (g.epilogue & 262144) {   // a gated residual by rows (core.h's gemmGatedRows): D = C + gate[map(j)][i] v
-        device const int* mp = (device const int*)g.aux2;
-        const ulong row = mp ? (ulong)(uint)mp[j] : (ulong)j;
-        const float4 gm = *(device const float4*)((device const float*)g.aux + row * g.ldaux + i);
-        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        *(device vec<TC, 4>*)(D + (ulong)i + (ulong)j * g.ldd) = lf_out4<TC>(cv + gm * v);
-        continue;
+      if constexpr (metal::is_same_v<TC, float> && (EP & 64) == 0) {
+        if (g.epilogue & 262144) {   // a gated residual by rows (core.h's gemmGatedRows): D = C + gate[map(j)][i] v
+          device const int* mp = (device const int*)g.aux2;
+          const ulong row = mp ? (ulong)(uint)mp[j] : (ulong)j;
+          const float4 gm = *(device const float4*)((device const float*)g.aux + row * g.ldaux + i);
+          const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          *(device vec<TC, 4>*)(D + (ulong)i + (ulong)j * g.ldd) = lf_out4<TC>(cv + gm * v);
+          continue;
+        }
       }
       const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
       const float4 bv = !(g.epilogue & 4) ? float4(0)
@@ -208,20 +276,39 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
         continue;
       }
-      if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
-        if (j >= g.tgPairs) continue;
-        const uint r = (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
-        const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
-        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        const float4 res = cv + v * (1.f / (1.f + exp(-gp)));   // (af3_gated_res_strided's)
-        *(device vec<TC, 4>*)dp = lf_out4<TC>(res);
-        continue;
+      if constexpr (metal::is_same_v<TC, float> && (EP & 64) == 0) {
+        if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
+          if (j >= g.tgPairs) continue;
+          const uint r = (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+          const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
+          const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv + v * gm);
+          continue;
+        }
+        if (g.epilogue & 524288) {  // conditioning permuted store: [k * n + r][bs * W + col] -> [(k * BS + bs) * n + r][col]
+          if (j >= g.tgPairs) continue;
+          if (g.epilogue & 4) v += bv;
+          const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
+          const uint k = lf_udiv((uint)j, N), r = (uint)j - k * N;
+          const uint bs = lf_udiv((uint)i, W), col = (uint)i - bs * W;
+          if ((int)col < g.tgNp) v = fast::divide(1.f, 1.f + fast::exp(-v));
+          *(device vec<TC, 4>*)(D + (((ulong)k * BS + bs) * N + r) * W + col) = lf_out4<TC>(v);
+          continue;
+        }
       }
-      if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
-        const uint O = (uint)g.tgC, L = (uint)g.tgN;
-        const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
-        *(device vec<TC, 4>*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = vec<TC, 4>(v);
-        continue;
+      if constexpr (metal::is_same_v<TC, half> && (EP & 64) == 0) {
+        if (g.epilogue & 1048576) { // in-place multiply: D *= v
+          const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+          *(device vec<TC, 4>*)dp = lf_out4<TC>(cv * float4(lf_out4<TC>(v)));
+          continue;
+        }
+        if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
+          const uint O = (uint)g.tgC, L = (uint)g.tgN;
+          const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
+          *(device vec<TC, 4>*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = vec<TC, 4>(v);
+          continue;
+        }
       }
       if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
         const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
@@ -232,8 +319,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       if (g.epilogue & 4) v += bv;
-      if (g.epilogue & 2) v = max(v, 0.f);
-      if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
+      if constexpr ((EP & 64) == 0) {
+        if (g.epilogue & 2) v = max(v, 0.f);
+        if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
+      }
       *(device vec<TC, 4>*)dp = lf_out4<TC>(v);
     }
     if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const TC*)D, part, tid, g, i0, j0); }
