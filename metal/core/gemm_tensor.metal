@@ -210,10 +210,9 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
         if (j >= g.tgPairs) continue;
         const uint r = (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
-        device const float* gp = (device const float*)g.aux + (ulong)r * g.ldaux + i;
+        const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
         const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        float4 res;
-        for (int t = 0; t < 4; ++t) res[t] = cv[t] + v[t] * (1.f / (1.f + exp(-gp[t])));   // (af3_gated_res_strided's)
+        const float4 res = cv + v * (1.f / (1.f + exp(-gp)));   // (af3_gated_res_strided's)
         *(device vec<TC, 4>*)dp = lf_out4<TC>(res);
         continue;
       }
@@ -334,13 +333,24 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       return;
     }
     if (g.epilogue & 128) {      // SwiGLU in blocks of 8: columns 16m..16m+7 are a_8m.., 16m+8..16m+15 their b
-      for (int t = tid; t < TM * (TN / 2); t += NT) {
-        const int jl = t / (TN / 2), h = t % (TN / 2), il = (h / 8) * 16 + h % 8;
-        const int j = j0 + jl, i = i0 + il;
+      constexpr int H4 = TN / 8;
+      _Pragma("clang loop unroll(full)")
+      for (int t = tid; t < TM * H4; t += NT) {
+        const int jl = t / H4, h4 = t % H4, il = (h4 >> 1) * 16 + (h4 & 1) * 4;
+        const int j = j0 + jl, i = i0 + il, outCol = (i0 >> 1) + h4 * 4;
         if (j >= g.n || i + 8 >= g.m) continue;
-        float va = g.alpha * (float)tile[jl * TN + il], vb = g.alpha * (float)tile[jl * TN + il + 8];
-        if (g.epilogue & 4) { va += ((device const float*)g.bias)[i]; vb += ((device const float*)g.bias)[i + 8]; }
-        lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, fast::divide(va, 1.f + fast::exp(-va)) * vb);
+        float4 va = g.alpha * float4(*(threadgroup const vec<TACC, 4>*)(tile + jl * TN + il));
+        float4 vb = g.alpha * float4(*(threadgroup const vec<TACC, 4>*)(tile + jl * TN + il + 8));
+        if (g.epilogue & 4) {
+          va += *(device const float4*)((device const float*)g.bias + i);
+          vb += *(device const float4*)((device const float*)g.bias + i + 8);
+        }
+        float4 res = fast::divide(va, 1.f + fast::exp(-va)) * vb;
+        if (i + 12 <= g.m && (g.ldd & 3) == 0 && ((ulong)D & 7) == 0) {
+          *(device vec<TC, 4>*)(D + (ulong)j * g.ldd + outCol) = vec<TC, 4>(res);
+        } else {
+          for (int k = 0; k < 4 && i + k + 8 < g.m; ++k) lf_st(D, (ulong)(outCol + k) + (ulong)j * g.ldd, res[k]);
+        }
       }
       return;
     }

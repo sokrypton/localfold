@@ -14,11 +14,11 @@ struct Interleave8Args { CP(half) a; CP(half) b; DP(half) out; uint rows, I, lda
 struct AffineHArgs { CP(half) x; DP(half) y; CP(float) scale; CP(float) offset; u64 n; uint C, pad; };
 struct FoldRowsArgs { CP(half) w; CP(float) scale; DP(half) out; uint in, out_, pad0, pad1; };
 struct FoldBiasArgs { CP(half) w; CP(float) offset; CP(float) extra; DP(float) bias; uint in, out_, pad0, pad1; };
-// the triangle's projection and gate (a and b interleaved by channel) as gemmTriGate's weight: (pa ga pb gb) in 8s
-struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
+// the triangle's projection and gate (a and b interleaved by channel) as gemmTriGate's weight: (pa ga pb gb) in 8s or 32s (quarters)
+struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; u64 pad0; uint rows, C, quarters, pad; };
 // x[r][c] (*)= scale
 struct ScaleArgs { DP(float) x; u64 n; float s; uint relu; };
-struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; u64 rows; uint C, period; };      // x[r] *= mask[r % period]
+struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; CP(float) resY; CP(float) resGate; u64 pad0, rows; uint C, period; };      // x[r] *= mask[r % period]
 struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
 struct CastArgs { CP(float) x; DP(half) y; u64 n; };
 
@@ -105,6 +105,7 @@ struct PairFeatArgs { CP(float) trunkPair; RelIdx r; DP(float) out; u64 p0, rows
 // out[r] = [a[r] | b[r]] with zero columns at p0 and p1 (-1: none)
 struct ConcatPadArgs { CP(float) a; CP(float) b; DP(float) out; uint rows, wa, wb; int p0, p1; uint pad; };
 struct FourierArgs { CP(float) w; CP(float) b; DP(float) out; uint n; float level; };
+struct SingleBatchInitArgs { CP(float) base; CP(float) projs; DP(float) out; uint K, n, Cs, pad; };
 // out[k][off + c] = scale[k] w[k][c] (scale null: 1), rows ld wide
 struct FoldCondArgs { CP(float) scale; CP(half) w; DP(half) out; uint Cc, C, ld, off; };
 // act[r][c] += y[r][c] sigmoid(gate[(r % period) ld + c])
@@ -114,8 +115,8 @@ struct AddBroadcastArgs { DP(float) x; CP(float) v; u64 n, total; };            
 struct BroadcastSkipArgs { CP(float) proj; CP(int) idx; CP(float) gmask; CP(float) skip; CP(float) qMask; DP(float) act; u64 rows, q1;
                            uint C, tokens, dense, pad; };
 // upd[row] = LN(act[row] qMask) W, W [C][3]
-struct MaskLnProject3Args { CP(float) act; CP(float) qMask; CP(float) scale; CP(float) offset; CP(float) Wp; DP(float) upd; u64 rows, q1;
-                            uint C, pad; };
+struct MaskLnProject3Args { CP(float) act; CP(float) qMask; CP(float) scale; CP(float) offset; CP(float) Wp; DP(float) upd;
+                            CP(float) resY; CP(float) resGate; u64 rows, q1; uint C, pad; };
 struct ScalePosArgs { CP(float) x; CP(float) mask; DP(float) y; u64 total, atoms; float in; uint pad; };
 struct DenoiseOutArgs { CP(float) x; CP(float) upd; CP(float) mask; DP(float) o; u64 total, atoms; float skip, out; };
 // the sampler

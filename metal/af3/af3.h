@@ -44,7 +44,8 @@ void linW(const half* X, const half* w, half* Y, size_t rows, int in, int out, c
 void ln(const float* x, float* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
-void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period, half* outH = nullptr);
+void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period, half* outH = nullptr,
+               const float* resY = nullptr, const float* resGate = nullptr);
 void scale(float* x, size_t n, float s, bool relu = false);
 
 // derived weights: columns concatenated (a part [C][width], or stored [width][C] if transposed; no name: zeros)

@@ -38,8 +38,10 @@ kernel void af3_interleave8(LF_ARGS(Interleave8Args)) {
 kernel void af3_trigate_weight(LF_ARGS(TriGateWArgs)) {
   uint t = (uint)LF_INDEX, W = 4 * a.C;
   if (t >= a.rows * W) return;
-  uint r = lf_udiv(t, W), col = t - r * W, kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8;
-  uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8: pa ga pb gb; a and b interleaved by channel)
+  uint r = lf_udiv(t, W), col = t - r * W;
+  uint kind = a.quarters ? ((col & 127) >> 5) : ((col & 31) >> 3);
+  uint c = a.quarters ? (32 * (col >> 7) + (col & 31)) : (8 * (col >> 5) + (col & 7));
+  uint k = kind == 1 ? 2 : kind == 2 ? 1 : kind;      // (blocks of 8 or 32: pa ga pb gb; a and b interleaved by channel)
   a.out[t] = k < 2 ? a.proj[r * 2 * a.C + 2 * c + k] : a.gate[r * 2 * a.C + 2 * c + k - 2];
 }
 kernel void af3_scale(LF_ARGS(ScaleArgs)) {
@@ -50,9 +52,25 @@ kernel void af3_scale(LF_ARGS(ScaleArgs)) {
 }
 kernel void af3_scale_rows(LF_ARGS(ScaleRowsArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    uint r = lf_udiv((uint)t, C4), c4 = (uint)t - r * C4, pr = r - lf_udiv(r, a.period) * a.period;
+    float4 v = ((device const float4*)a.x)[t];
+    if (a.resY) {
+      float4 ry = ((device const float4*)a.resY)[t];
+      float4 rg = ((device const float4*)a.resGate)[(ulong)pr * C4 + c4];
+      v += ry * (1.f / (1.f + exp(-rg)));
+    }
+    v *= a.mask[pr];
+    ((device float4*)a.x)[t] = v;
+    if (a.outH) ((device half4*)a.outH)[t] = half4(v);
+    return;
+  }
   if (t >= a.rows * a.C) return;
-  uint r = lf_udiv((uint)t, a.C);
-  float v = a.x[t] * a.mask[r - lf_udiv(r, a.period) * a.period];
+  uint r = lf_udiv((uint)t, a.C), c = (uint)t - r * a.C, pr = r - lf_udiv(r, a.period) * a.period;
+  float v = a.x[t] + (a.resY ? a.resY[t] * lf_sigmoid(a.resGate[(ulong)pr * a.C + c]) : 0.f);
+  v *= a.mask[pr];
   a.x[t] = v;
   if (a.outH) a.outH[t] = (half)v;
 }
@@ -359,6 +377,110 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
   device float* x = a.x + row * a.C;
   uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
+  if (!a.outF && a.C == 128) {
+    device const float* sc = a.scale + pr;
+    device const float* sh = a.shift ? a.shift + pr : nullptr;
+    device half* out = a.out + row * 128;
+    float xv[4], s = 0.f;
+    if (a.resY) {
+      device const float* ry = a.resY + row * 128;
+      device const float* rg = a.resGate + gpr;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) {
+        uint c = lane + i * 32;
+        float val = x[c] + ry[c] * lf_sigmoid(rg[c]);
+        x[c] = val;
+        xv[i] = val;
+        s += val;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) { float val = x[lane + i * 32]; xv[i] = val; s += val; }
+    }
+    float mean = simd_sum(s) * (1.f / 128.f), v = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) { float d = xv[i] - mean; v += d * d; }
+    float inv = rsqrt(simd_sum(v) * (1.f / 128.f) + a.eps);
+    float sk = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) {
+      uint c = lane + i * 32;
+      float nrm = (xv[i] - mean) * inv;
+      float sv = sc[c], y = (a.raw ? sv : lf_sigmoid(sv)) * nrm + (sh ? sh[c] : 0.f);
+      if (a.out) out[c] = (half)y;
+      if (a.kOut) {
+        if (!a.chained) {
+          float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * nrm + a.kShift[pr + c];
+          a.kOut[row * 128 + c] = (half)ky;
+        } else { xv[i] = y; sk += y; }
+      }
+    }
+    if (a.kOut && a.chained) {
+      float meank = simd_sum(sk) * (1.f / 128.f), vk = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) { float d = xv[i] - meank; vk += d * d; }
+      float invk = rsqrt(simd_sum(vk) * (1.f / 128.f) + a.eps);
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) {
+        uint c = lane + i * 32;
+        float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * ((xv[i] - meank) * invk) + a.kShift[pr + c];
+        a.kOut[row * 128 + c] = (half)ky;
+      }
+    }
+    return;
+  }
+  if (!a.outF && a.C == 768) {
+    device const float* sc = a.scale + pr;
+    device const float* sh = a.shift ? a.shift + pr : nullptr;
+    device half* out = a.out + row * 768;
+    float xv[24], s = 0.f;
+    if (a.resY) {
+      device const float* ry = a.resY + row * 768;
+      device const float* rg = a.resGate + gpr;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 24; ++i) {
+        uint c = lane + i * 32;
+        float val = x[c] + ry[c] * lf_sigmoid(rg[c]);
+        x[c] = val;
+        xv[i] = val;
+        s += val;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 24; ++i) { float val = x[lane + i * 32]; xv[i] = val; s += val; }
+    }
+    float mean = simd_sum(s) / 768.f, v = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 24; ++i) { float d = xv[i] - mean; v += d * d; }
+    float inv = rsqrt(simd_sum(v) / 768.f + a.eps);
+    float sk = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 24; ++i) {
+      uint c = lane + i * 32;
+      float nrm = (xv[i] - mean) * inv;
+      float sv = sc[c], y = (a.raw ? sv : lf_sigmoid(sv)) * nrm + (sh ? sh[c] : 0.f);
+      if (a.out) out[c] = (half)y;
+      if (a.kOut) {
+        if (!a.chained) {
+          float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * nrm + a.kShift[pr + c];
+          a.kOut[row * 768 + c] = (half)ky;
+        } else { xv[i] = y; sk += y; }
+      }
+    }
+    if (a.kOut && a.chained) {
+      float meank = simd_sum(sk) / 768.f, vk = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 24; ++i) { float d = xv[i] - meank; vk += d * d; }
+      float invk = rsqrt(simd_sum(vk) / 768.f + a.eps);
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 24; ++i) {
+        uint c = lane + i * 32;
+        float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * ((xv[i] - meank) * invk) + a.kShift[pr + c];
+        a.kOut[row * 768 + c] = (half)ky;
+      }
+    }
+    return;
+  }
   float s = 0.f;
   if (a.resY) {
     device const float* ry = a.resY + row * a.C;
@@ -377,7 +499,7 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
   float sk = 0.f;
   for (uint c = lane; c < a.C; c += 32) {
     float nrm = (x[c] - mean) * inv;
-    float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
+    float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + (a.shift ? a.shift[pr + c] : 0.f);
     if (a.out) a.out[row * a.C + c] = (half)y;
     if (a.outF) a.outF[row * a.C + c] = y;
     if (a.kOut) {
@@ -391,13 +513,13 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
     float meank = simd_sum(sk) / a.C, vk = 0.f;
     for (uint c = lane; c < a.C; c += 32) {
       float nrm = (x[c] - mean) * inv;
-      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
+      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + (a.shift ? a.shift[pr + c] : 0.f);
       float d = y - meank; vk += d * d;
     }
     float invk = rsqrt(simd_sum(vk) / a.C + a.eps);
     for (uint c = lane; c < a.C; c += 32) {
       float nrm = (x[c] - mean) * inv;
-      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + a.shift[pr + c];
+      float sc = a.scale[pr + c], y = (a.raw ? sc : lf_sigmoid(sc)) * nrm + (a.shift ? a.shift[pr + c] : 0.f);
       float ksc = a.kScale[pr + c], ky = (a.raw ? ksc : lf_sigmoid(ksc)) * ((y - meank) * invk) + a.kShift[pr + c];
       a.kOut[row * a.C + c] = (half)ky;
     }
@@ -487,6 +609,20 @@ kernel void af3_mul_h(LF_ARGS(MulHArgs)) {
 }
 kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    uint u = (uint)t, q = lf_udiv(u, C4), c4 = u - q * C4;
+    uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
+    float4 v = float4(0.f);
+    if (a.gmask[gq] != 0.f) {
+      device const float* p = a.pos + ((ulong)a.idx[gq] + k * a.atoms) * 3;
+      device const float4* Wp4 = (device const float4*)a.Wp;
+      v = p[0] * Wp4[c4] + p[1] * Wp4[C4 + c4] + p[2] * Wp4[2 * C4 + c4];
+    }
+    ((device float4*)a.act)[t] = ((device const float4*)a.qStart)[(ulong)gq * C4 + c4] + v * a.qMask[gq];
+    return;
+  }
   if (t >= a.rows * a.C) return;
   uint u = (uint)t, q = lf_udiv(u, a.C), c = u - q * a.C;
   uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
@@ -499,6 +635,25 @@ kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
 }
 kernel void af3_aggregate(LF_ARGS(AggregateArgs)) {
   ulong t = LF_INDEX;
+  if ((a.Cp & 3) == 0) {
+    uint Cp4 = a.Cp >> 2;
+    if (t >= a.rows * Cp4) return;
+    uint u = (uint)t, token = lf_udiv(u, Cp4), c4 = u - token * Cp4;
+    uint k = lf_udiv(token, a.tokens), g0 = (token - k * a.tokens) * a.dense;
+    float count = 0.f;
+    float4 sum = float4(0.f);
+    device const float4* proj4 = (device const float4*)a.projected;
+    for (uint at = 0; at < a.dense; ++at) {
+      float m = a.atomMask[g0 + at];
+      count += m;
+      if (m != 0.f && a.gmask[g0 + at] != 0.f) {
+        float4 v = proj4[((ulong)a.idx[g0 + at] + k * a.q1) * Cp4 + c4];
+        sum += max(v, float4(0.f));
+      }
+    }
+    ((device float4*)a.out)[t] = count > 0.f ? sum / count : float4(0.f);
+    return;
+  }
   if (t >= a.rows * a.Cp) return;
   uint u = (uint)t, token = lf_udiv(u, a.Cp), c = u - token * a.Cp;
   uint k = lf_udiv(token, a.tokens), g0 = (token - k * a.tokens) * a.dense;
@@ -576,6 +731,19 @@ kernel void af3_fourier(LF_ARGS(FourierArgs)) {
   float tr = 0.25f * log(a.level / 16.f);
   a.out[k] = cos(6.283185307179586f * (tr * a.w[k] + a.b[k]));
 }
+kernel void af3_single_batch_init(LF_ARGS(SingleBatchInitArgs)) {
+  uint t = (uint)LF_INDEX;
+  if ((a.Cs & 3) == 0) {
+    uint Cs4 = a.Cs >> 2;
+    if (t >= a.K * a.n * Cs4) return;
+    uint r = lf_udiv(t, Cs4), c4 = t - r * Cs4, k = lf_udiv(r, a.n), i = r - k * a.n;
+    ((device float4*)a.out)[t] = ((device const float4*)a.base)[(ulong)i * Cs4 + c4] + ((device const float4*)a.projs)[(ulong)k * Cs4 + c4];
+    return;
+  }
+  if (t >= a.K * a.n * a.Cs) return;
+  uint r = lf_udiv(t, a.Cs), c = t - r * a.Cs, k = lf_udiv(r, a.n), i = r - k * a.n;
+  a.out[t] = a.base[(ulong)i * a.Cs + c] + a.projs[(ulong)k * a.Cs + c];
+}
 kernel void af3_fold_cond(LF_ARGS(FoldCondArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.Cc * a.C) return;
@@ -590,10 +758,24 @@ kernel void af3_gated_res_strided(LF_ARGS(GatedResStridedArgs)) {
 }
 kernel void af3_add_broadcast(LF_ARGS(AddBroadcastArgs)) {
   ulong t = LF_INDEX;
+  if ((a.n & 3) == 0 && (a.total & 3) == 0) {
+    uint n4 = (uint)(a.n >> 2);
+    if (t < (a.total >> 2)) ((device float4*)a.x)[t] += ((device const float4*)a.v)[(uint)t - lf_udiv((uint)t, n4) * n4];
+    return;
+  }
   if (t < a.total) a.x[t] += a.v[t % a.n];
 }
 kernel void af3_broadcast_skip(LF_ARGS(BroadcastSkipArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    uint u = (uint)t, q = lf_udiv(u, C4), c4 = u - q * C4;
+    uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
+    float4 v = a.gmask[gq] != 0.f ? ((device const float4*)a.proj)[((ulong)lf_udiv((uint)a.idx[gq], a.dense) + k * a.tokens) * C4 + c4] : float4(0.f);
+    ((device float4*)a.act)[t] = (v + ((device const float4*)a.skip)[t]) * a.qMask[gq];
+    return;
+  }
   if (t >= a.rows * a.C) return;
   uint u = (uint)t, q = lf_udiv(u, a.C), c = u - q * a.C;
   uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
@@ -606,15 +788,53 @@ kernel void af3_mask_ln_project3(constant MaskLnProject3Args& a [[buffer(0)]], u
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device const float* x = a.act + row * a.C;
-  uint r32 = (uint)row, q1 = (uint)a.q1;
-  float m = a.qMask[r32 - lf_udiv(r32, q1) * q1], s = 0.f;
-  for (uint c = lane; c < a.C; c += 32) s += x[c] * m;
+  uint r32 = (uint)row, q1 = (uint)a.q1, prRow = r32 - lf_udiv(r32, q1) * q1;
+  if (a.C == 128) {
+    float m = a.qMask[prRow], xv[4], s = 0.f;
+    if (a.resY) {
+      device const float* ry = a.resY + row * 128;
+      device const float* rg = a.resGate + (ulong)prRow * 128;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) {
+        uint c = lane + i * 32;
+        float val = (x[c] + ry[c] * lf_sigmoid(rg[c])) * m;
+        xv[i] = val;
+        s += val;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 4; ++i) { float val = x[lane + i * 32] * m; xv[i] = val; s += val; }
+    }
+    float mean = simd_sum(s) * (1.f / 128.f), v = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) { float d = xv[i] - mean; v += d * d; }
+    float inv = rsqrt(simd_sum(v) * (1.f / 128.f) + 1e-5f);
+    float y0 = 0.f, y1 = 0.f, y2 = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) {
+      uint c = lane + i * 32;
+      float l = (xv[i] - mean) * inv * a.scale[c] + (a.offset ? a.offset[c] : 0.f);
+      y0 += l * a.Wp[c * 3]; y1 += l * a.Wp[c * 3 + 1]; y2 += l * a.Wp[c * 3 + 2];
+    }
+    y0 = simd_sum(y0); y1 = simd_sum(y1); y2 = simd_sum(y2);
+    if (lane == 0) { a.upd[row * 3] = y0; a.upd[row * 3 + 1] = y1; a.upd[row * 3 + 2] = y2; }
+    return;
+  }
+  float m = a.qMask[prRow], s = 0.f;
+  for (uint c = lane; c < a.C; c += 32) {
+    float xc = x[c] + (a.resY ? a.resY[row * a.C + c] * lf_sigmoid(a.resGate[(ulong)prRow * a.C + c]) : 0.f);
+    s += xc * m;
+  }
   float mean = simd_sum(s) / a.C, v = 0.f;
-  for (uint c = lane; c < a.C; c += 32) { float d = x[c] * m - mean; v += d * d; }
+  for (uint c = lane; c < a.C; c += 32) {
+    float xc = x[c] + (a.resY ? a.resY[row * a.C + c] * lf_sigmoid(a.resGate[(ulong)prRow * a.C + c]) : 0.f);
+    float d = xc * m - mean; v += d * d;
+  }
   float inv = rsqrt(simd_sum(v) / a.C + 1e-5f);
   float y0 = 0.f, y1 = 0.f, y2 = 0.f;
   for (uint c = lane; c < a.C; c += 32) {
-    float l = (x[c] * m - mean) * inv * a.scale[c] + (a.offset ? a.offset[c] : 0.f);
+    float xc = x[c] + (a.resY ? a.resY[row * a.C + c] * lf_sigmoid(a.resGate[(ulong)prRow * a.C + c]) : 0.f);
+    float l = (xc * m - mean) * inv * a.scale[c] + (a.offset ? a.offset[c] : 0.f);
     y0 += l * a.Wp[c * 3]; y1 += l * a.Wp[c * 3 + 1]; y2 += l * a.Wp[c * 3 + 2];
   }
   y0 = simd_sum(y0); y1 = simd_sum(y1); y2 = simd_sum(y2);
@@ -758,6 +978,7 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   threadgroup half Vs[K * LD];
   const uint s = tg.x, h = tg.y, ks = lf_udiv(s, a.subsets), ss = s - ks * a.subsets, Wd = a.heads * D, W2 = 2 * Wd;
   const float qs = rsqrt((float)D) * M_LOG2E_F;
+  _Pragma("clang loop unroll(full)")
   for (uint e = tid; e < Q * D8; e += 128) {
     uint qi = e / D8, d = (e - qi * D8) * 8;
     device const half* src = a.qg + ((ulong)s * Q + qi) * W2 + h * D + d;
@@ -771,28 +992,26 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Ks + (sg * 8) * LD + dk * 8, LD);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong srcBase = (ulong)ks * a.subsets * Q;
-  for (uint e = tid; e < K * D8; e += 128) {
-    uint kj = e / D8, d = (e - kj * D8) * 8;
-    if (a.q2kIdx) {
-      uint g = ss * K + kj;
+  if (a.q2kIdx) {
+    _Pragma("clang loop unroll(full)")
+    for (uint e = tid; e < K * D8; e += 128) {
+      uint kj = e / D8, d = (e - kj * D8) * 8, g = ss * K + kj;
       if (a.q2kMask[g] != 0.f) {
         device const half* src = a.kv + (srcBase + (uint)a.q2kIdx[g]) * W2 + h * D + d;
-        *(threadgroup half4*)(Ks + kj * LD + d) = *(device const half4*)src;
-        *(threadgroup half4*)(Ks + kj * LD + d + 4) = *(device const half4*)(src + 4);
-        *(threadgroup half4*)(Vs + kj * LD + d) = *(device const half4*)(src + Wd);
-        *(threadgroup half4*)(Vs + kj * LD + d + 4) = *(device const half4*)(src + Wd + 4);
+        *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
+        *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
       } else {
-        *(threadgroup half4*)(Ks + kj * LD + d) = half4(0);
-        *(threadgroup half4*)(Ks + kj * LD + d + 4) = half4(0);
-        *(threadgroup half4*)(Vs + kj * LD + d) = half4(0);
-        *(threadgroup half4*)(Vs + kj * LD + d + 4) = half4(0);
+        *(threadgroup uint4*)(Ks + kj * LD + d) = uint4(0);
+        *(threadgroup uint4*)(Vs + kj * LD + d) = uint4(0);
       }
-    } else {
+    }
+  } else {
+    _Pragma("clang loop unroll(full)")
+    for (uint e = tid; e < K * D8; e += 128) {
+      uint kj = e / D8, d = (e - kj * D8) * 8;
       device const half* src = a.kv + ((ulong)s * K + kj) * W2 + h * D + d;
-      *(threadgroup half4*)(Ks + kj * LD + d) = *(device const half4*)src;
-      *(threadgroup half4*)(Ks + kj * LD + d + 4) = *(device const half4*)(src + 4);
-      *(threadgroup half4*)(Vs + kj * LD + d) = *(device const half4*)(src + Wd);
-      *(threadgroup half4*)(Vs + kj * LD + d + 4) = *(device const half4*)(src + Wd + 4);
+      *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
+      *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

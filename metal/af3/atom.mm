@@ -336,8 +336,9 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
     add(act, positional, qRows * C);
   } else if (atomPositions) {
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) die("encoder: the positions projection is not 3 x C");
-    run1d("af3_encoder_start", qRows * C, EncoderStartArgs{o.qStart, atomPositions, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
-                                                          o.qMask, act, qRows, q1, atoms, (uint)C, 0});
+    run1d("af3_encoder_start", (C & 3) ? qRows * C : qRows * (C >> 2),
+          EncoderStartArgs{o.qStart, atomPositions, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
+                           o.qMask, act, qRows, q1, atoms, (uint)C, 0});
   } else {
     for (int k = 0; k < NS; ++k) copy(act + k * q1 * C, o.qStart, q1 * C * 4);
   }
@@ -346,15 +347,15 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   for (size_t b = 0; b < o.blocks.size(); ++b) {
     if (maskPerBlock) scaleRows(act, o.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, o.blocks[b], sh, C, o.heads, o.D, E + ".blocks." + num(b),
-                        &pendY, &pendGate, !maskPerBlock && b + 1 < o.blocks.size());
+                        &pendY, &pendGate, !maskPerBlock);
   }
   half* actH = scratch<half>("enc.actH", qRows * C);
-  scaleRows(act, o.qMask, qRows, C, q1, actH);
+  scaleRows(act, o.qMask, qRows, C, q1, actH, pendY, pendGate);
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
   lin(actH, E + ".projectAtomFeaturesForAggr", projected, qRows, C, o.perToken);
   o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);
-  run1d("af3_aggregate", (size_t)sh.tokens * NS * o.perToken,
+  run1d("af3_aggregate", (o.perToken & 3) ? (size_t)sh.tokens * NS * o.perToken : (size_t)sh.tokens * NS * (o.perToken >> 2),
         AggregateArgs{projected, q2t.idx, q2t.mask, M.f("batch.refMask"), o.tokenAct, (u64)sh.tokens * NS, q1, (uint)sh.tokens,
                       (uint)sh.dense, (uint)o.perToken, 0});
 }

@@ -163,10 +163,8 @@ static void singleConditioningBatch(const float* levels, size_t K, float* out) {
     ln(e, en, 1, (int)nc, P + ".noiseEmbeddingInitialNormScale", P + ".noiseEmbeddingInitialNormOffset");
     lin(en, P + ".noiseEmbeddingInitialProjection", projs + k * Cs, 1, (int)nc, Cs);
   }
-  for (size_t k = 0; k < K; ++k) {
-    copy(out + k * n * Cs, D.singleBase, (size_t)n * Cs * 4);
-    addBias(out + k * n * Cs, projs + k * Cs, n, Cs);
-  }
+  run1d("af3_single_batch_init", (Cs & 3) ? K * n * Cs : K * n * (Cs >> 2),
+        SingleBatchInitArgs{D.singleBase, projs, out, (uint)K, (uint)n, (uint)Cs, 0});
   for (int t = 0; t < 2; ++t) plainTransition(out, K * n, Cs, P + ".singleTransitions." + num(t));
   if (hasW(P + ".singleCondFinalNormScale")) {
     float* tmp = scratch<float>("dc.sfnormK", K * n * Cs);
@@ -400,8 +398,9 @@ static float* atomDecoder(const half* tokenAct) {
   float* proj = scratch<float>("dec.proj", (size_t)sh.tokens * NS * C);
   lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, (size_t)sh.tokens * NS, D.decPerToken, C);
   float* act = scratch<float>("dec.act", qRows * C);
-  run1d("af3_broadcast_skip", qRows * C, BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
-                                                          (uint)sh.tokens, (uint)sh.dense, 0});
+  run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),
+        BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
+                          (uint)sh.tokens, (uint)sh.dense, 0});
   AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
               flag(Dd + ".blocks.0.diffusionNoResidual")};
   bool maskPerBlock = flag(Dd + ".blocks.0.maskAtomActPerBlock");
@@ -409,13 +408,13 @@ static float* atomDecoder(const half* tokenAct) {
   for (size_t b = 0; b < D.decBlocks.size(); ++b) {
     if (maskPerBlock) scaleRows(act, D.enc.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, D.decBlocks[b], sh, C, D.decHeads, D.decD, Dd + ".blocks." + num(b),
-                        &pendY, &pendGate, !maskPerBlock && b + 1 < D.decBlocks.size());
+                        &pendY, &pendGate, !maskPerBlock);
   }
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) die("decoder: the position update is not C x 3");
   float* upd = scratch<float>("dec.upd", qRows * 3);
   run("af3_mask_ln_project3", grid1d((qRows + 7) / 8, 1), 256,
       MaskLnProject3Args{act, D.enc.qMask, W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"),
-                         W(Dd + ".atomFeaturesToPositionUpdate"), upd, qRows, q1, (uint)C, 0});
+                         W(Dd + ".atomFeaturesToPositionUpdate"), upd, pendY, pendGate, qRows, q1, (uint)C, 0});
   float* out = scratch<float>("dec.out", atoms * NS * 3);
   convert(q2t, upd, out, 3, q1, NS);
   return out;
@@ -473,7 +472,8 @@ static float* denoise(const float* x, float level) {
     } else {
       float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
       lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, n, Cs, perToken);
-      run1d("af3_add_broadcast", rows * perToken, AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
+      run1d("af3_add_broadcast", (perToken & 3) ? rows * perToken : (rows * perToken) >> 2,
+            AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
     }
   }
   stage("snproj");
