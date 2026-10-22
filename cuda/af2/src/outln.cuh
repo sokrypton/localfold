@@ -160,8 +160,132 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   }
 }
 template <class M, class TO, class TI = M>
+__global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, const TI* __restrict__ W,
+    const float* __restrict__ bias, M* __restrict__ msa, const float* __restrict__ lnS,
+    const float* __restrict__ lnO, TO* __restrict__ xn, size_t rows) {
+  using namespace oln;
+  constexpr int R16 = 16, NTH16 = 128;
+  constexpr size_t STG16 = (size_t)R16 * LDA * 2 + (size_t)KC * LDW * 2;
+  constexpr bool BF = std::is_same_v<M, __nv_bfloat16>;
+  constexpr bool BFI = std::is_same_v<TI, __nv_bfloat16>;
+  using M2 = std::conditional_t<BF, __nv_bfloat162, half2>;
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t row0 = (size_t)blockIdx.x * R16;
+  auto As = [&](int s) { return (TI*)(smem + s * STG16); };
+  auto Ws = [&](int s) { return (TI*)(smem + s * STG16) + R16 * LDA; };
+  M* V = (M*)smem;
+  auto issue = [&](int kc, int s) {
+    if (threadIdx.x < 64) {
+      const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
+      const size_t row = row0 + r;
+      cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int u = i * NTH16 + threadIdx.x, k = u >> 5, c = (u & 31) * 8;
+      cpAsync16(Ws(s) + swW(k, c), W + (size_t)(kc * KC + k) * C + c, true);
+    }
+    cpCommit();
+  };
+  issue(0, 0);
+  float acc[8][4] = {};
+  constexpr int KSTEPS = C / KC;
+#pragma unroll 1
+  for (int kc = 0; kc < KSTEPS; ++kc) {
+    const int st = kc & 1;
+    if (kc + 1 < KSTEPS) { issue(kc + 1, st ^ 1); cpWait<1>(); }
+    else {
+      cpWait<0>();
+      static_assert(R16 * LDV * 2 <= STG16, "all 16 rows of V fit in idle stage 0");
+#pragma unroll
+      for (int i = 0; i < R16 * C / 8 / NTH16; ++i) {
+        const int u = i * NTH16 + threadIdx.x, r = u >> 5, c = (u & 31) * 8;
+        const size_t row = row0 + r;
+        cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+      }
+      cpCommit();
+    }
+    __syncthreads();
+    const TI* A = As(st); const TI* Wt = Ws(st);
+    uint32_t a[2][4];
+    ldsm4(a[0], A + swA(lane & 15, (lane >> 4) * 8));
+    ldsm4(a[1], A + swA(lane & 15, 16 + (lane >> 4) * 8));
+#pragma unroll
+    for (int ks = 0; ks < KC / 16; ++ks) {
+      uint32_t f[2][4];
+      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), cl = warp * 64 + (lane >> 4) * 8;
+      ldsm4t(f[0], Wt + swW(kl, cl));
+#pragma unroll
+      for (int n2 = 0; n2 < 4; ++n2) {
+        const int cur = n2 & 1;
+        if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], Wt + swW(kl, cl + (n2 + 1) * 16));
+        if constexpr (BFI) { mma16816bf(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816bf(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
+        else { mma16816(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
+      }
+    }
+    if (kc + 1 < KSTEPS) __syncthreads();
+  }
+  const int c0 = lane * 8;
+  float sc[8], of[8];
+  *reinterpret_cast<float4*>(sc) = __ldg(reinterpret_cast<const float4*>(lnS + c0));
+  *reinterpret_cast<float4*>(sc + 4) = __ldg(reinterpret_cast<const float4*>(lnS + c0 + 4));
+  *reinterpret_cast<float4*>(of) = __ldg(reinterpret_cast<const float4*>(lnO + c0));
+  *reinterpret_cast<float4*>(of + 4) = __ldg(reinterpret_cast<const float4*>(lnO + c0 + 4));
+  cpWait<0>();
+  __syncthreads();
+#pragma unroll
+  for (int nt = 0; nt < 8; ++nt) {
+    const int col = warp * 64 + nt * 8 + tig * 2;
+    const float2 bf = __ldg(reinterpret_cast<const float2*>(bias + col));
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      M2* p = reinterpret_cast<M2*>(V + (g + 8 * h) * LDV + col);
+      const float2 rf = ld2f(reinterpret_cast<const M*>(p));
+      const float a = acc[nt][2 * h] + bf.x + rf.x, b = acc[nt][2 * h + 1] + bf.y + rf.y;
+      if constexpr (BF) *p = __floats2bfloat162_rn(a, b); else *p = __floats2half2_rn(a, b);
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r = warp + i * 4;
+    const size_t row = row0 + r;
+    if (row >= rows) break;
+    const uint4 ob = *reinterpret_cast<const uint4*>(V + r * LDV + c0);
+    *reinterpret_cast<uint4*>(msa + row * C + c0) = ob;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { const float2 f = ld2f(reinterpret_cast<const M*>(&ob) + 2 * e); v[2 * e] = f.x; v[2 * e + 1] = f.y; }
+    float s = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) s += v[e];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    const float mean = s / C;
+    float q = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) { const float d = v[e] - mean; q += d * d; }
+    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+    const float inv = rsqrtf(q / C + 1e-5f);
+    uint4 xo;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const float a = (v[2 * e] - mean) * inv * sc[2 * e] + of[2 * e];
+      const float b = (v[2 * e + 1] - mean) * inv * sc[2 * e + 1] + of[2 * e + 1];
+      if constexpr (std::is_same_v<TO, half>) reinterpret_cast<half2*>(&xo)[e] = __floats2half2_rn(a, b);
+      else reinterpret_cast<__nv_bfloat162*>(&xo)[e] = __floats2bfloat162_rn(a, b);
+    }
+    *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
+  }
+}
+template <class M, class TO, class TI = M>
 inline void outLn256(const TI* O, const TI* W, const float* bias, M* msa,
                      const float* lnS, const float* lnO, TO* xn, size_t rows) {
+  if (rows <= 2048) {
+    constexpr size_t smem16 = 2 * ((size_t)16 * oln::LDA * 2 + (size_t)oln::KC * oln::LDW * 2);
+    outLn16K<M, TO, TI><<<(unsigned)((rows + 15) / 16), 128, smem16, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
+    return;
+  }
   static bool attr = false;
   if (!attr) { smemAttr((outLnK<M, TO, TI>), (int)oln::SMEM); attr = true; }
   outLnK<M, TO, TI><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);

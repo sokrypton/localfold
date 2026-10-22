@@ -75,6 +75,59 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
                 const std::string& offset) {
   launchLayerNorm<TI, TO>(in, out, rows, C, W(scale), W(offset));
 }
+template <class TI, class TO, int C_CONST = 0>
+__global__ void __launch_bounds__(256, C_CONST >= 384 ? 4 : 8)
+layerNormDualK(const TI* __restrict__ in, TO* __restrict__ out0, TO* __restrict__ out1, size_t rows, int C,
+               const float* __restrict__ scale0, const float* __restrict__ offset0,
+               const float* __restrict__ scale1, const float* __restrict__ offset1) {
+  size_t row = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  if constexpr (C_CONST > 0) {
+    constexpr int K = C_CONST / 32;
+    const TI* x = in + row * C_CONST;
+    TO* y0 = out0 + row * C_CONST;
+    TO* y1 = out1 + row * C_CONST;
+    float xv[K], s = 0, ss = 0;
+#pragma unroll
+    for (int k = 0; k < K; ++k) xv[k] = toF(x[lane + k * 32]);
+#pragma unroll
+    for (int k = 0; k < K; ++k) { s += xv[k]; ss += xv[k] * xv[k]; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+    float mean = s / C_CONST, inv = rsqrtf(ss / C_CONST - mean * mean + 1e-5f);
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      int c = lane + k * 32;
+      float nrm = (xv[k] - mean) * inv;
+      y0[c] = fromF<TO>(nrm * __ldg(scale0 + c) + __ldg(offset0 + c));
+      y1[c] = fromF<TO>(nrm * __ldg(scale1 + c) + __ldg(offset1 + c));
+    }
+    return;
+  }
+  const TI* x = in + row * C;
+  TO* y0 = out0 + row * C;
+  TO* y1 = out1 + row * C;
+  float s = 0, ss = 0;
+  for (int c = lane; c < C; c += 32) { float v = toF(x[c]); s += v; ss += v * v; }
+  for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+  float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+  for (int c = lane; c < C; c += 32) {
+    float nrm = (toF(x[c]) - mean) * inv;
+    y0[c] = fromF<TO>(nrm * __ldg(scale0 + c) + __ldg(offset0 + c));
+    y1[c] = fromF<TO>(nrm * __ldg(scale1 + c) + __ldg(offset1 + c));
+  }
+}
+template <class TI, class TO>
+void layerNormDual2(const TI* in, TO* out0, TO* out1, size_t rows, int C,
+                    const std::string& scale0, const std::string& offset0,
+                    const std::string& scale1, const std::string& offset1) {
+  unsigned nb = (unsigned)((rows + 7) / 8);
+  const float *s0 = W(scale0), *o0 = W(offset0), *s1 = W(scale1), *o1 = W(offset1);
+  if (C == 64) layerNormDualK<TI, TO, 64><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, 64, s0, o0, s1, o1);
+  else if (C == 128) layerNormDualK<TI, TO, 128><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, 128, s0, o0, s1, o1);
+  else layerNormDualK<TI, TO, 0><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, C, s0, o0, s1, o1);
+}
 // gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
 // being [a | b] or [a | b | u], each I wide
 // (an experiment's arm: LOCALFOLD_SKIP_FUSED=transition|grid|triangle skips that fused 128-channel kernel at its call
@@ -84,13 +137,13 @@ inline bool skipFused(const char* what) {
   return !v.empty() && v.find(what) != std::string::npos;
 }
 template <class T, bool UP = false, int I_CONST = 0>
-__global__ void __launch_bounds__(I_CONST == 512 ? 64 : I_CONST == 1024 ? 128 : I_CONST == 1536 ? 192 : I_CONST == 3072 ? 384 : 256,
-                                  I_CONST == 512 ? 16 : I_CONST == 1024 ? 16 : I_CONST == 1536 ? 10 : I_CONST == 3072 ? 5 : 8)
+__global__ void __launch_bounds__(I_CONST == 512 ? 64 : (I_CONST == 256 || I_CONST == 1024) ? 128 : I_CONST == 1536 ? 192 : I_CONST == 3072 ? 384 : 256,
+                                  (I_CONST == 256 || I_CONST == 512 || I_CONST == 1024) ? 16 : I_CONST == 1536 ? 10 : I_CONST == 3072 ? 5 : 8)
 swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, int shift = 0) {
   const int II = I_CONST > 0 ? I_CONST : I, L = UP ? 3 * II : 2 * II;
   if constexpr (std::is_same_v<T, half>) {
     if constexpr (I_CONST == 256) {
-      size_t r = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+      size_t r = (size_t)blockIdx.x * 4 + (threadIdx.x >> 5);
       if (r >= rows) return;
       int i = ((int)threadIdx.x & 31) << 3;
       size_t t = r * 256 + i;
@@ -101,7 +154,7 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
-        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        float x = g.x * sigmH(g.x) * v.x, y = g.y * sigmH(g.y) * v.y;
         if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
         o2[k] = __floats2half2_rn(x, y);
       }
@@ -119,7 +172,7 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
-        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        float x = g.x * sigmH(g.x) * v.x, y = g.y * sigmH(g.y) * v.y;
         if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
         o2[k] = __floats2half2_rn(x, y);
       }
@@ -149,7 +202,7 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
-        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        float x = g.x * sigmH(g.x) * v.x, y = g.y * sigmH(g.y) * v.y;
         if constexpr (UP) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
         o2[k] = __floats2half2_rn(x, y);
       }
@@ -206,7 +259,7 @@ void swiglu(const T* wide, T* gated, size_t rows, int I, bool up = false) {
   auto launch = [&](auto upTag) {
     constexpr bool U = decltype(upTag)::value;
     if constexpr (std::is_same_v<T, half>) {
-      if (I == 256 && rows > 0) { swigluK<T, U, 256><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(wide, gated, rows, 256); return; }
+      if (I == 256 && rows > 0) { swigluK<T, U, 256><<<(unsigned)((rows + 3) / 4), 128, 0, STREAM>>>(wide, gated, rows, 256); return; }
       if (I == 512 && rows > 0) { swigluK<T, U, 512><<<(unsigned)rows, 64, 0, STREAM>>>(wide, gated, rows, 512); return; }
       if (I == 1024 && rows > 0) { swigluK<T, U, 1024><<<(unsigned)rows, 128, 0, STREAM>>>(wide, gated, rows, 1024); return; }
       if (I == 1536 && rows > 0) { swigluK<T, U, 1536><<<(unsigned)rows, 192, 0, STREAM>>>(wide, gated, rows, 1536); return; }

@@ -766,14 +766,15 @@ void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pa
 // the single track's pair logits, the pair read once and written head-major (the layout the
 // softmax reads) through shared memory.
 template <int C, int N, int WARPS, class PT = float>
-__global__ void __launch_bounds__(WARPS * 32, 3) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
+__global__ void __launch_bounds__(WARPS * 32, C <= 128 ? 4 : 3) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wp, float* __restrict__ out, size_t rows,
     half* __restrict__ biasOut = nullptr, int L = 0, int H = 0, int stride = 0, bool tr = false, size_t r0 = 0,
     const float* __restrict__ pairMask = nullptr, const float* __restrict__ rowBias = nullptr) {
   static_assert(N % 16 == 0, "the column loop takes 16 at a time");
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, LDO = R + 4;
+  static_assert((size_t)N * LDO * 4 <= (size_t)R * LDX * 2, "Os fits in Xs");
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = (half*)smem; half* Ws = Xs + R * LDX; float* Os = (float*)(Ws + C * LDW);
+  half* Xs = (half*)smem; half* Ws = Xs + R * LDX; float* Os = (float*)smem;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
   {
@@ -811,6 +812,7 @@ __global__ void __launch_bounds__(WARPS * 32, 3) lnHeadsK(const float* __restric
       mma16816(acc[2 * n2], xa[xcur], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[xcur], f[cur][2], f[cur][3]);
     }
   }
+  __syncthreads();
 #pragma unroll
   for (int nt = 0; nt < N / 8; ++nt) {
     int h = nt * 8 + tig * 2;
@@ -845,7 +847,7 @@ inline void lnHeadsRaw(const float* x, const float* scale, const float* offset, 
                        half* biasOut = nullptr, int L = 0, int H = 0, int stride = 0, bool tr = false, size_t r0 = 0,
                        const float* pairMask = nullptr, const float* rowBias = nullptr) {
   constexpr int WARPS = 8, R = 16 * WARPS;      // (raw pointers: AF2's pair-bias pass)
-  size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2 + (size_t)N * (R + 4) * 4;
+  size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2;
   WITH_PAIR_T(
     static bool attr = false;
     if (!attr) { smemAttr((lnHeadsK<C, N, WARPS, PT>), (int)smem); attr = true; }

@@ -99,6 +99,21 @@ __global__ void siluMulK(const float* __restrict__ a, const float* __restrict__ 
 inline void transitionLayer(float* x, size_t rows, int C, const std::string& B) {
   int Hd = (int)dimOf("f/" + B + "aProjection", 1);
   size_t chunk = std::max<size_t>(1, ((size_t)32 << 20) / (3 * (size_t)Hd));
+  if (GEMM16) {
+    std::string ab = concatColumns("f/" + B + "abProj~", C, {{"f/" + B + "aProjection", Hd, false},
+                                                             {"f/" + B + "bProjection", Hd, false}});
+    half* xnh = scratch<half>("dtr.xnh", std::min(rows, chunk) * C);
+    float* abOut = scratch<float>("dtr.ab", std::min(rows, chunk) * 2 * Hd);
+    half* gh = scratch<half>("dtr.gh", std::min(rows, chunk) * Hd);
+    for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+      size_t r = std::min(chunk, rows - r0);
+      layerNorm<half>(x + r0 * C, xnh, r, C, F(B + "norm/scale"), F(B + "norm/offset"));
+      gemmHPre(xnh, Wh(ab), abOut, r, C, 2 * Hd);
+      swigluK<half><<<blocks((Hd & 3) == 0 ? (r * (size_t)(Hd >> 2)) : (r * Hd)), 256, 0, STREAM>>>(abOut, gh, r, Hd);
+      gemmHPre(gh, Fh(B + "outProjection"), x + r0 * C, r, Hd, C, 1.f);
+    }
+    return;
+  }
   float* xn = scratch<float>("dtr.xn", std::min(rows, chunk) * C);
   float* a = scratch<float>("dtr.a", std::min(rows, chunk) * Hd); float* b = scratch<float>("dtr.b", std::min(rows, chunk) * Hd);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
@@ -140,11 +155,14 @@ __global__ void addRowK(float* __restrict__ x, const float* __restrict__ row, si
   }
   if (t < rows * C) x[t] = src[t] + row[t % C];
 }
-__global__ void coordsInputK(const float* x, const float* level, float* out, int A) {   // [A, 6] = [x / denom | 0]
+template <class TY = float>
+__global__ void coordsInputK(const float* x, const float* level, TY* out, int A) {   // [A, 6] = [x / denom | 0]
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= A * 6) return;
   int a = t / 6, k = t % 6;
-  out[t] = k < 3 ? x[a * 3 + k] * level[1] : 0.f;
+  float v = k < 3 ? x[a * 3 + k] * level[1] : 0.f;
+  if constexpr (std::is_same_v<TY, half>) out[t] = __float2half(v);
+  else out[t] = v;
 }
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift
 // (g and sh rows ld apart)
@@ -158,8 +176,9 @@ __global__ void adaCombineK(const float* an, const float* g, const float* gb, co
 // ...the LayerNorm (affine-free) and that combine in one pass: a block a row, its first warp taking the statistics
 // with layerNormK's arithmetic exactly, then all of the block writing the row (a warp a row put the whole combine on
 // T warps - 9 blocks at 68 tokens - and was slower than the two kernels)
+template <class TY = float>
 __global__ void adaLNK(float* __restrict__ a, const float* __restrict__ g, const float* __restrict__ gb,
-                       const float* __restrict__ sh, float* __restrict__ out, size_t T, int C, int ld,
+                       const float* __restrict__ sh, TY* __restrict__ out, size_t T, int C, int ld,
                        const float* __restrict__ o = nullptr, const float* __restrict__ og = nullptr,
                        const float* __restrict__ ogb = nullptr) {
   __shared__ float4 sx4[256];
@@ -168,7 +187,8 @@ __global__ void adaLNK(float* __restrict__ a, const float* __restrict__ g, const
   size_t row = blockIdx.x;
   float* xr = a + row * C;
   int tid = threadIdx.x;
-  if (C == 768 && (((uintptr_t)xr | (uintptr_t)(g + row * ld) | (uintptr_t)gb | (uintptr_t)(sh + row * ld) | (uintptr_t)(out + row * 768) | (uintptr_t)o | (uintptr_t)(og ? og + row * ld : nullptr) | (uintptr_t)ogb) & 15) == 0) {
+  constexpr uintptr_t outAlign = std::is_same_v<TY, half> ? 7 : 15;
+  if (C == 768 && (((uintptr_t)xr | (uintptr_t)(g + row * ld) | (uintptr_t)gb | (uintptr_t)(sh + row * ld) | (uintptr_t)o | (uintptr_t)(og ? og + row * ld : nullptr) | (uintptr_t)ogb) & 15) == 0 && ((uintptr_t)(out + row * 768) & outAlign) == 0) {
     float4 x4, g4, gb4, sh4;
     if (tid < 192) {
       x4 = __ldg(reinterpret_cast<const float4*>(xr) + tid);
@@ -208,11 +228,18 @@ __global__ void adaLNK(float* __restrict__ a, const float* __restrict__ g, const
       float n1 = __fmul_rn(x4.y - mean, inv);
       float n2 = __fmul_rn(x4.z - mean, inv);
       float n3 = __fmul_rn(x4.w - mean, inv);
-      reinterpret_cast<float4*>(out + row * 768)[tid] = make_float4(
-          __fadd_rn(n0 / (1.f + expf(-(g4.x + gb4.x))), sh4.x),
-          __fadd_rn(n1 / (1.f + expf(-(g4.y + gb4.y))), sh4.y),
-          __fadd_rn(n2 / (1.f + expf(-(g4.z + gb4.z))), sh4.z),
-          __fadd_rn(n3 / (1.f + expf(-(g4.w + gb4.w))), sh4.w));
+      float y0 = __fadd_rn(n0 / (1.f + expf(-(g4.x + gb4.x))), sh4.x);
+      float y1 = __fadd_rn(n1 / (1.f + expf(-(g4.y + gb4.y))), sh4.y);
+      float y2 = __fadd_rn(n2 / (1.f + expf(-(g4.z + gb4.z))), sh4.z);
+      float y3 = __fadd_rn(n3 / (1.f + expf(-(g4.w + gb4.w))), sh4.w);
+      if constexpr (std::is_same_v<TY, half>) {
+        __half2 h0 = __floats2half2_rn(y0, y1);
+        __half2 h1 = __floats2half2_rn(y2, y3);
+        reinterpret_cast<uint2*>(out + row * 768)[tid] =
+            make_uint2(*reinterpret_cast<const unsigned*>(&h0), *reinterpret_cast<const unsigned*>(&h1));
+      } else {
+        reinterpret_cast<float4*>(out + row * 768)[tid] = make_float4(y0, y1, y2, y3);
+      }
     }
     return;
   }
@@ -238,7 +265,9 @@ __global__ void adaLNK(float* __restrict__ a, const float* __restrict__ g, const
   for (int c = tid; c < C; c += blockDim.x) {
     float n = __fmul_rn(xr[c] - mean, inv);
     size_t gi = row * ld + c;
-    out[row * C + c] = __fadd_rn(n / (1.f + expf(-(g[gi] + gb[c]))), sh[gi]);
+    float val = __fadd_rn(n / (1.f + expf(-(g[gi] + gb[c]))), sh[gi]);
+    if constexpr (std::is_same_v<TY, half>) out[row * C + c] = __float2half(val);
+    else out[row * C + c] = val;
   }
 }
 // a[t] += x[t] * sigmoid(g + gb): sigmoidMulK then addK in one pass, with their two roundings (no contraction)
@@ -500,12 +529,97 @@ struct Denoiser {
   // every token block's projections of the single alone, one batched GEMM a step: entry e of G [T, 72 Ct]
   // (columns e Ct..): 4b+0..3 block b's attention gate, shift, transition gate, shift (from LN(single)
   // scaled by that adaLN's singleScale: snScaled [2 blocks, T, Ct]); 48+2b, 48+2b+1 its two out gates
-  float* single; float* snScaled; float* G; float* scales; const void** ptrs; int entries;
+  float* single; float* snScaled; half* snScaledH = nullptr;
+  float* G; float* scales; const void** ptrs; int entries;
+  const half* wAda = nullptr;     // [Ct, 4*nb*Ct] folded (singleScale * [gateWeights | shiftWeights])
+  const half* wOut = nullptr;     // [Ct, 2*nb*Ct] stacked outGateWeights
   float* level;                   // NoiseLevel on the device
   float* sBase = nullptr;         // precomputed LN(s_inputs; sInputNorm) @ sProjection [T, Ct]
   float* encMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomEncoder blocks [atomBlocks, A, 6*Ca]
   float* decMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomDecoder blocks [atomBlocks, A, 6*Ca]
 };
+
+// Build folded wAda [Ct, 4*nb*Ct] (row r scaled by singleScale_{m/2}[r]) and stacked wOut [Ct, 2*nb*Ct].
+__global__ void buildAdaOutWeightsK(const void* const* __restrict__ ptrs, half* __restrict__ wAda,
+                                    half* __restrict__ wOut, int Ct, int nb) {
+  int nAda = 4 * nb, nOut = 2 * nb;
+  const half* const* adaW = reinterpret_cast<const half* const*>(ptrs);
+  const float* const* adaSc = reinterpret_cast<const float* const*>(ptrs + nAda);
+  const half* const* outW = reinterpret_cast<const half* const*>(ptrs + 2 * nAda);
+  size_t totalAda = (size_t)Ct * nAda * Ct;
+  size_t totalOut = (size_t)Ct * nOut * Ct;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < totalAda; t += (size_t)gridDim.x * blockDim.x) {
+    int c = (int)(t % Ct);
+    size_t q = t / Ct;
+    int m = (int)(q % nAda);
+    int r = (int)(q / nAda);
+    float s = __ldg(adaSc[m] + r);
+    float w = __half2float(__ldg(adaW[m] + (size_t)r * Ct + c));
+    wAda[t] = __float2half(w * s);
+  }
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < totalOut; t += (size_t)gridDim.x * blockDim.x) {
+    int c = (int)(t % Ct);
+    size_t q = t / Ct;
+    int m = (int)(q % nOut);
+    int r = (int)(q / nOut);
+    wOut[t] = __ldg(outW[m] + (size_t)r * Ct + c);
+  }
+}
+
+// Fused LayerNorm(single) + stepNorm + raw half copy for C == 768 (1 warp per row):
+// writes snH [T, 768], snStepH [T, 768], singleH [T, 768] (only 3 copies instead of 26).
+__global__ void __launch_bounds__(256, 4)
+singlePrep3HK(const float* __restrict__ single, const float* __restrict__ stepScale,
+              const float* __restrict__ stepOffset, half* __restrict__ outH, int T) {
+  int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (row >= T) return;
+  int lane = threadIdx.x & 31;
+  const float4* sr4 = reinterpret_cast<const float4*>(single + (size_t)row * 768);
+  uint2* snDst4 = reinterpret_cast<uint2*>(outH + (size_t)row * 768);
+  uint2* stepDst4 = reinterpret_cast<uint2*>(outH + (size_t)(T + row) * 768);
+  uint2* rawDst4 = reinterpret_cast<uint2*>(outH + (size_t)(2 * T + row) * 768);
+  float4 xv[6];
+  float s = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 6; ++k) {
+    int idx = k * 32 + lane;
+    float4 v = __ldg(sr4 + idx);
+    xv[k] = v;
+    s += v.x + v.y + v.z + v.w;
+    __half2 h0 = __floats2half2_rn(v.x, v.y);
+    __half2 h1 = __floats2half2_rn(v.z, v.w);
+    rawDst4[idx] = make_uint2(*reinterpret_cast<const unsigned*>(&h0), *reinterpret_cast<const unsigned*>(&h1));
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(~0u, s, off);
+  float mean = s * (1.f / 768.f), var = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 6; ++k) {
+    float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+    var += dx * dx + dy * dy + dz * dz + dw * dw;
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) var += __shfl_xor_sync(~0u, var, off);
+  float inv = rsqrtf(var * (1.f / 768.f) + 1e-5f);
+  const float4* stepSc4 = reinterpret_cast<const float4*>(stepScale);
+  const float4* stepOf4 = reinterpret_cast<const float4*>(stepOffset);
+  #pragma unroll
+  for (int k = 0; k < 6; ++k) {
+    int idx = k * 32 + lane;
+    float n0 = (xv[k].x - mean) * inv;
+    float n1 = (xv[k].y - mean) * inv;
+    float n2 = (xv[k].z - mean) * inv;
+    float n3 = (xv[k].w - mean) * inv;
+    __half2 nh0 = __floats2half2_rn(n0, n1);
+    __half2 nh1 = __floats2half2_rn(n2, n3);
+    snDst4[idx] = make_uint2(*reinterpret_cast<const unsigned*>(&nh0), *reinterpret_cast<const unsigned*>(&nh1));
+    float4 sc = __ldg(stepSc4 + idx);
+    float4 of = __ldg(stepOf4 + idx);
+    __half2 sh0 = __floats2half2_rn(n0 * sc.x + of.x, n1 * sc.y + of.y);
+    __half2 sh1 = __floats2half2_rn(n2 * sc.z + of.z, n3 * sc.w + of.w);
+    stepDst4[idx] = make_uint2(*reinterpret_cast<const unsigned*>(&sh0), *reinterpret_cast<const unsigned*>(&sh1));
+  }
+}
 
 inline bool TOKEN_FLASH = true;   // --no-token-flash: the token blocks' attention through the [H, T, T] scores
 inline bool SAMPLER16 = true;     // --fast: the denoiser's GEMMs on f16 tensor cores (--no-sampler16: TF32)
@@ -605,28 +719,57 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   if ((size_t)P * Cz * 4 > ((size_t)128 << 20)) releaseScratch();     // the joined and projected pairs (a large input)
   }
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
+  int Ct = d.Ct, nb = d.tokenBlocks, Ca = d.atoms.ctx.C, ab = d.atomBlocks;
   {
     struct Restore { bool was = GEMM16; ~Restore() { GEMM16 = was; } } restore;
     GEMM16 = FAST && SAMPLER16;
     d.sBase = dalloc((size_t)T * d.Ct);
-    float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
-    layerNorm(sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
-    gemm(sn, F("diffusion/sProjection"), d.sBase, T, d.Si, d.Ct);
-    int Ca = d.atoms.ctx.C, ab = d.atomBlocks;
     size_t acVec = (Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca;
     size_t modStride = (size_t)A * 6 * Ca;
     d.encMod = dalloc(ab * modStride);
     d.decMod = dalloc(ab * modStride);
-    float* sc = scratch<float>("atom.silu", (size_t)A * Ca);
-    siluK<<<blocks(acVec), 256, 0, STREAM>>>(d.atoms.c0, sc, (size_t)A * Ca);
-    for (int b = 0; b < ab; ++b) {
-      gemm(sc, F("diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln"), d.encMod + b * modStride, A, Ca, 6 * Ca);
-      gemm(sc, F("diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln"), d.decMod + b * modStride, A, Ca, 6 * Ca);
+    if (GEMM16) {
+      float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
+      layerNorm(sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
+      gemm(sn, F("diffusion/sProjection"), d.sBase, T, d.Si, d.Ct);
+      half* sch = scratch<half>("atom.siluh", (size_t)A * Ca);
+      siluK<half><<<blocks(acVec), 256, 0, STREAM>>>(d.atoms.c0, sch, (size_t)A * Ca);
+      for (int b = 0; b < ab; ++b) {
+        gemmHPre(sch, Fh("diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln"), d.encMod + b * modStride, A, Ca, 6 * Ca);
+        gemmHPre(sch, Fh("diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln"), d.decMod + b * modStride, A, Ca, 6 * Ca);
+        for (const char* pfx : {"diffusionAtomEncoder/blocks/", "diffusionAtomDecoder/blocks/"}) {
+          std::string B = std::string(pfx) + std::to_string(b) + "/";
+          Wh(concatColumns("f/" + B + "qkvg~", Ca, {{"f/" + B + "qkv", 3 * Ca, false}, {"f/" + B + "attnGate", Ca, false}}));
+        }
+      }
+      for (int l = 0; l < 2; ++l) {
+        std::string B = "diffusion/sTransitions/" + std::to_string(l) + "/";
+        int Hd = (int)dimOf("f/" + B + "aProjection", 1);
+        Wh(concatColumns("f/" + B + "abProj~", Ct, {{"f/" + B + "aProjection", Hd, false}, {"f/" + B + "bProjection", Hd, false}}));
+      }
+      if (d.flashBias) {
+        for (int b = 0; b < nb; ++b) {
+          std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
+          Wh(concatColumns("f/" + B + "qkvg~", Ct, {{"f/" + B + "queryWeights", Ct, false},
+                                                    {"f/" + B + "kvWeights", 2 * Ct, false},
+                                                    {"f/" + B + "gateWeights", Ct, false}}));
+        }
+      }
+    } else {
+      float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
+      layerNorm(sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
+      gemm(sn, F("diffusion/sProjection"), d.sBase, T, d.Si, d.Ct);
+      float* sc = scratch<float>("atom.silu", (size_t)A * Ca);
+      siluK<float><<<blocks(acVec), 256, 0, STREAM>>>(d.atoms.c0, sc, (size_t)A * Ca);
+      for (int b = 0; b < ab; ++b) {
+        gemm(sc, F("diffusionAtomEncoder/blocks/" + std::to_string(b) + "/adaln"), d.encMod + b * modStride, A, Ca, 6 * Ca);
+        gemm(sc, F("diffusionAtomDecoder/blocks/" + std::to_string(b) + "/adaln"), d.decMod + b * modStride, A, Ca, 6 * Ca);
+      }
     }
   }
-  int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
   d.single = dalloc((size_t)T * Ct); d.snScaled = dalloc((size_t)2 * nb * T * Ct);
+  d.snScaledH = dallocT<half>((size_t)3 * T * Ct);
   d.G = dalloc((size_t)T * d.entries * Ct); d.scales = dalloc((size_t)2 * nb * Ct);
   std::vector<const void*> w(d.entries), x(d.entries), y(d.entries);
   for (int b = 0; b < nb; ++b) {
@@ -644,7 +787,49 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   for (int e = 0; e < d.entries; ++e) y[e] = d.G + (size_t)e * Ct;
   std::vector<const void*> all(w); all.insert(all.end(), x.begin(), x.end()); all.insert(all.end(), y.begin(), y.end());
   d.ptrs = (const void**)upload((const uintptr_t*)all.data(), all.size());
+  if (FAST && SAMPLER16 && Ct == 768) {
+    static half *cachedWAda = nullptr, *cachedWOut = nullptr;
+    static const bool hook = (FORGET_HOOKS.push_back([] { cachedWAda = cachedWOut = nullptr; }), true);
+    (void)hook;
+    if (!cachedWAda) {
+      cachedWAda = wpool<half>((size_t)Ct * 4 * nb * Ct);
+      cachedWOut = wpool<half>((size_t)Ct * 2 * nb * Ct);
+      std::vector<const void*> hp(10 * nb);
+      for (int b = 0; b < nb; ++b) {
+        std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
+        const char* part[2] = {"attention/", "transition/"};
+        for (int k = 0; k < 2; ++k) {
+          std::string P = B + part[k];
+          int m = 4 * b + 2 * k;
+          hp[m] = Fh(P + "adaln/gateWeights");
+          hp[m + 1] = Fh(P + "adaln/shiftWeights");
+          hp[4 * nb + m] = hp[4 * nb + m + 1] = F(P + "adaln/singleScale");
+          hp[8 * nb + 2 * b + k] = Fh(P + "outGateWeights");
+        }
+      }
+      const void** dhp = (const void**)upload((const uintptr_t*)hp.data(), hp.size());
+      buildAdaOutWeightsK<<<256, 256, 0, STREAM>>>(dhp, cachedWAda, cachedWOut, Ct, nb);
+      CK(cudaFreeAsync(dhp, STREAM));
+    }
+    d.wAda = cachedWAda;
+    d.wOut = cachedWOut;
+    int Hd = (int)dimOf("f/diffusion/tokenBlocks/0/transition/outWeights", 0), Ah = d.atoms.ctx.hidden;
+    const half* xh = (const half*)d.G;
+    gemmHPre(d.snScaledH, d.wAda, d.G, T, Ct, 4 * nb * Ct, 0.f, 1.f, Ct, d.entries * Ct);
+    gemmHPre(d.snScaledH, d.wOut, d.G, T, Ct, 2 * nb * Ct, 0.f, 1.f, Ct, d.entries * Ct);
+    gemmHPre(d.snScaledH, Fh("diffusion/singleToToken"), d.single, T, Ct, Ct);
+    if (d.flashBias) gemmHPre(d.snScaledH, Wh("f/diffusion/tokenBlocks/0/attention/qkvg~"), d.G, T, Ct, 4 * Ct);
+    gemmHPre(d.snScaledH, Fh("diffusion/tokenBlocks/0/transition/swishWeights"), d.G, T, Ct, 2 * Hd);
+    gemmHPre(xh, Fh("diffusion/tokenBlocks/0/transition/outWeights"), d.single, T, Hd, Ct);
+    gemmHPre(xh, Fh("diffusion/sTransitions/0/outProjection"), d.single, T, Hd, Ct, 1.f);
+    gemmHPre(d.snScaledH, Fh("diffusionAtomDecoder/tokenToAtom"), d.G, T, Ct, Ca);
+    gemmHPre(xh, Wh("f/diffusionAtomEncoder/blocks/0/qkvg~"), d.G, A, Ca, 4 * Ca);
+    gemmHPre(xh, Fh("diffusionAtomEncoder/blocks/0/attnOut"), d.G, A, Ca, Ca);
+    gemmHPre(xh, Fh("diffusionAtomEncoder/blocks/0/ffnUp"), d.G, A, Ca, 2 * Ah);
+    gemmHPre(xh, Fh("diffusionAtomEncoder/blocks/0/ffnDown"), d.G, A, Ah, Ca);
+  }
   d.level = dalloc(4);
+  CK(cudaStreamSynchronize(STREAM));
   return d;
 }
 
@@ -663,29 +848,130 @@ inline void conditioningSingle(const Denoiser& d, float* single) {
 // the single's projections for every token block, one batched GEMM
 inline void singleProjections(const Denoiser& d) {
   int T = d.T, C = d.Ct, n = 2 * d.tokenBlocks;
+  const float one = 1.f, zero = 0.f;
+  if (GEMM16 && C == 768 && d.wAda && d.wOut) {
+    singlePrep3HK<<<(unsigned)((T + 7) / 8), 256, 0, STREAM>>>(
+        d.single, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"), d.snScaledH, T);
+    gemmHPre(d.snScaledH, d.wAda, d.G, T, C, 2 * n * C, 0.f, 1.f, C, d.entries * C);
+    gemmHPre(d.snScaledH + (size_t)2 * T * C, d.wOut, d.G + (size_t)2 * n * C, T, C, n * C, 0.f, 1.f, C, d.entries * C);
+    return;
+  }
   float* sn = scratch<float>("dn.sn0", (size_t)T * C);
   layerNorm(d.single, sn, T, C, nullptr, nullptr);
   scaleCopiesK<<<blocks((C & 3) == 0 ? (size_t)n * T * (C >> 2) : (size_t)n * T * C), 256, 0, STREAM>>>(sn, d.scales, d.snScaled, T, C, n);
-  const float one = 1.f, zero = 0.f;
   cublasComputeType_t ct = GEMM16 ? CUBLAS_COMPUTE_32F_FAST_16F : FAST ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   CB(cublasGemmBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, T, C, &one, d.ptrs, CUDA_R_32F, C, d.ptrs + d.entries,
                          CUDA_R_32F, C, &zero, (void* const*)(d.ptrs + 2 * d.entries), CUDA_R_32F, d.entries * C,
                          d.entries, ct, FAST ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
 }
+template <bool HAS_O>
+__global__ void __launch_bounds__(192, 8)
+adaLNHalf768K(float* __restrict__ a, const float* __restrict__ g, const float* __restrict__ gb,
+              const float* __restrict__ sh, half* __restrict__ out, int ld,
+              const float* __restrict__ o = nullptr, const float* __restrict__ og = nullptr,
+              const float* __restrict__ ogb = nullptr) {
+  __shared__ float2 warpStat[6];
+  size_t row = blockIdx.x;
+  float* xr = a + row * 768;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  float4 x4 = __ldg(reinterpret_cast<const float4*>(xr) + tid);
+  if constexpr (HAS_O) {
+    float4 o4 = __ldg(reinterpret_cast<const float4*>(o + row * 768) + tid);
+    float4 og4 = __ldg(reinterpret_cast<const float4*>(og + row * ld) + tid);
+    float4 ogb4 = __ldg(reinterpret_cast<const float4*>(ogb) + tid);
+    x4.x = __fadd_rn(x4.x, __fmul_rn(o4.x, 1.f / (1.f + expf(-(og4.x + ogb4.x)))));
+    x4.y = __fadd_rn(x4.y, __fmul_rn(o4.y, 1.f / (1.f + expf(-(og4.y + ogb4.y)))));
+    x4.z = __fadd_rn(x4.z, __fmul_rn(o4.z, 1.f / (1.f + expf(-(og4.z + ogb4.z)))));
+    x4.w = __fadd_rn(x4.w, __fmul_rn(o4.w, 1.f / (1.f + expf(-(og4.w + ogb4.w)))));
+    reinterpret_cast<float4*>(xr)[tid] = x4;
+  }
+  float4 g4 = __ldg(reinterpret_cast<const float4*>(g + row * ld) + tid);
+  float4 gb4 = __ldg(reinterpret_cast<const float4*>(gb) + tid);
+  float4 sh4 = __ldg(reinterpret_cast<const float4*>(sh + row * ld) + tid);
+  float s = (x4.x + x4.y) + (x4.z + x4.w);
+  float s2 = (x4.x * x4.x + x4.y * x4.y) + (x4.z * x4.z + x4.w * x4.w);
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    s += __shfl_xor_sync(~0u, s, off);
+    s2 += __shfl_xor_sync(~0u, s2, off);
+  }
+  if (lane == 0) warpStat[warp] = make_float2(s, s2);
+  __syncthreads();
+  float2 w0 = warpStat[0], w1 = warpStat[1], w2 = warpStat[2], w3 = warpStat[3], w4 = warpStat[4], w5 = warpStat[5];
+  float mean = ((w0.x + w1.x) + (w2.x + w3.x) + (w4.x + w5.x)) * (1.f / 768.f);
+  float var = fmaxf(((w0.y + w1.y) + (w2.y + w3.y) + (w4.y + w5.y)) * (1.f / 768.f) - mean * mean, 0.f);
+  float inv = rsqrtf(var + 1e-5f);
+  float y0 = __fadd_rn(((x4.x - mean) * inv) / (1.f + expf(-(g4.x + gb4.x))), sh4.x);
+  float y1 = __fadd_rn(((x4.y - mean) * inv) / (1.f + expf(-(g4.y + gb4.y))), sh4.y);
+  float y2 = __fadd_rn(((x4.z - mean) * inv) / (1.f + expf(-(g4.z + gb4.z))), sh4.z);
+  float y3 = __fadd_rn(((x4.w - mean) * inv) / (1.f + expf(-(g4.w + gb4.w))), sh4.w);
+  __half2 h0 = __floats2half2_rn(y0, y1);
+  __half2 h1 = __floats2half2_rn(y2, y3);
+  reinterpret_cast<uint2*>(out + row * 768)[tid] =
+      make_uint2(*reinterpret_cast<const unsigned*>(&h0), *reinterpret_cast<const unsigned*>(&h1));
+}
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift, the projections from G
-inline void adaLN(const Denoiser& d, float* a, float* out, int e, const std::string& B,
+template <class TY = float>
+inline void adaLN(const Denoiser& d, float* a, TY* out, int e, const std::string& B,
                   const float* o = nullptr, const float* og = nullptr, const float* ogb = nullptr) {
   int T = d.T, C = d.Ct, ld = d.entries * C;
-  adaLNK<<<(unsigned)T, 256, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
-                                          out, T, C, ld, o, og, ogb);
+  if constexpr (std::is_same_v<TY, half>) {
+    if (C == 768) {
+      if (o)
+        adaLNHalf768K<true><<<(unsigned)T, 192, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
+                                                             out, ld, o, og, ogb);
+      else
+        adaLNHalf768K<false><<<(unsigned)T, 192, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
+                                                              out, ld);
+      return;
+    }
+  }
+  adaLNK<TY><<<(unsigned)T, 256, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
+                                              out, T, C, ld, o, og, ogb);
 }
 
 inline void tokenBlock(const Denoiser& d, float* a, int b) {
   int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
   size_t tcVec = (C & 3) == 0 ? (size_t)T * (C >> 2) : (size_t)T * C;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
-  float* x = scratch<float>("tb.x", (size_t)T * C);
   float* o = scratch<float>("tb.o", (size_t)T * C);
+  if (GEMM16 && d.flashBias) {
+    half* xh = scratch<half>("tb.xh", (size_t)T * C);
+    if (b == 0) {
+      adaLN<half>(d, a, xh, 4 * b, B + "attention/adaln/");
+    } else {
+      std::string Bp = "diffusion/tokenBlocks/" + std::to_string(b - 1) + "/";
+      adaLN<half>(d, a, xh, 4 * b, B + "attention/adaln/",
+                  o, d.G + (size_t)(4 * nb + 2 * (b - 1) + 1) * C, F(Bp + "transition/outGateBias"));
+    }
+    std::string wq = concatColumns("f/" + B + "attention/qkvg~", C, {{"f/" + B + "attention/queryWeights", C, false},
+                                                                     {"f/" + B + "attention/kvWeights", 2 * C, false},
+                                                                     {"f/" + B + "attention/gateWeights", C, false}});
+    float* qkvg = scratch<float>("tb.qkvg", (size_t)T * 4 * C);
+    gemmHPre(xh, Wh(wq), qkvg, T, C, 4 * C);
+    half* qh = scratch<half>("tb.qkvgh", (size_t)(T + 128) * 4 * C);    // (padding: the last query block's rows)
+    toHalfRowsK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(qkvg, qh, (size_t)T * 4 * C);
+    mg::Shared* ohS = EF2_QROWS ? &mg::shared("ef2.tok.oh", (size_t)T * C * 2) : nullptr;
+    half* oh = ohS ? (half*)ohS->local : scratch<half>("tb.oh", (size_t)T * C);
+    if (EF2_QROWS) { FLASH_QLO = EF2_QLO; FLASH_QHI = EF2_QLO + EF2_QROWS; FLASH_BIAS_ROWS = EF2_QROWS; }
+    flashGrid<half>(qh, (const half*)d.biases[b], d.stride, nullptr, oh, T, Hh, D, 0, 1, false, 1.f / sqrtf((float)D),
+                    F(B + "attention/queryBias"));
+    FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
+    if (ohS) mg::allGather(*ohS, (size_t)EF2_QLO * C * 2, (size_t)EF2_QROWS * C * 2);   // (every rank's query rows)
+    gemmHPre(oh, Fh(B + "attention/outWeights"), o, T, C, C);
+    adaLN<half>(d, a, xh, 4 * b + 2, B + "transition/adaln/",
+                o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"));
+    int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
+    float* w = scratch<float>("tb.wide", (size_t)T * 2 * Hd);
+    half* gh = scratch<half>("tb.gatedh", (size_t)T * Hd);
+    gemmHPre(xh, Fh(B + "transition/swishWeights"), w, T, C, 2 * Hd);
+    swigluK<half><<<blocks((Hd & 3) == 0 ? (size_t)T * (Hd >> 2) : (size_t)T * Hd), 256, 0, STREAM>>>(w, gh, T, Hd);
+    gemmHPre(gh, Fh(B + "transition/outWeights"), o, T, Hd, C);
+    if (b + 1 == nb)
+      gateAddK<<<blocks(tcVec), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
+    return;
+  }
+  float* x = scratch<float>("tb.x", (size_t)T * C);
   if (b == 0) {
     adaLN(d, a, x, 4 * b, B + "attention/adaln/");
   } else {
@@ -755,25 +1041,44 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   singleProjections(d);
   if (check) checkOracle("diffusion conditioning single", single, (size_t)T * Ct, "o/cond/single");
   float* r6 = scratch<float>("dn.r6", (size_t)A * 6);
-  coordsInputK<<<blocks((size_t)A * 6), 256, 0, STREAM>>>(xNoisy, d.level, r6, A);
+  coordsInputK<float><<<blocks((size_t)A * 6), 256, 0, STREAM>>>(xNoisy, d.level, r6, A);
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
   gemm(r6, F("diffusionAtomEncoder/coordsLinear"), q, A, 6, Ca);
   addK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(q, d.atoms.c0, (size_t)A * Ca);
   swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.encMod);
   float* tok = scratch<float>("dn.tok", (size_t)A * Ct);
-  gemm(q, F("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
-  reluK<<<blocks((Ct & 3) == 0 ? (size_t)A * (Ct >> 2) : (size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
+  float* st = scratch<float>("dn.st", (size_t)T * Ct);
   float* a = scratch<float>("dn.a", (size_t)T * Ct);
-  scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, T, Ct, Ct);
-  float* sn = scratch<float>("dn.sn", (size_t)T * Ct); float* st = scratch<float>("dn.st", (size_t)T * Ct);
-  layerNorm(single, sn, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
-  gemm(sn, F("diffusion/singleToToken"), st, T, Ct, Ct);
-  addK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(a, st, (size_t)T * Ct);
+  if (GEMM16) {
+    gemmH(q, Fh("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
+    if (Ct == 768 && d.wAda) {
+      const half* snStepH = d.snScaledH + (size_t)T * Ct;
+      gemmHPre(snStepH, Fh("diffusion/singleToToken"), st, T, Ct, Ct);
+    } else {
+      half* snh = scratch<half>("dn.snh", (size_t)T * Ct);
+      layerNorm<half>(single, snh, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
+      gemmHPre(snh, Fh("diffusion/singleToToken"), st, T, Ct, Ct);
+    }
+    scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, T, Ct, Ct, true, st);
+  } else {
+    gemm(q, F("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
+    reluK<<<blocks((Ct & 3) == 0 ? (size_t)A * (Ct >> 2) : (size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
+    scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, T, Ct, Ct);
+    float* sn = scratch<float>("dn.sn", (size_t)T * Ct);
+    layerNorm(single, sn, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
+    gemm(sn, F("diffusion/singleToToken"), st, T, Ct, Ct);
+    addK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(a, st, (size_t)T * Ct);
+  }
   for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, a, b);
-  layerNorm(a, a, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
-  // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
-  gemm(a, F("diffusionAtomDecoder/tokenToAtom"), pt, T, Ct, Ca);
+  if (GEMM16) {
+    half* ah = scratch<half>("dn.ah", (size_t)T * Ct);
+    layerNorm<half>(a, ah, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
+    gemmHPre(ah, Fh("diffusionAtomDecoder/tokenToAtom"), pt, T, Ct, Ca);
+  } else {
+    layerNorm(a, a, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
+    gemm(a, F("diffusionAtomDecoder/tokenToAtom"), pt, T, Ct, Ca);
+  }
   gatherTokensK<<<blocks((Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca), 256, 0, STREAM>>>(pt, Idev("atom_to_token"), ac.mask, q, A, Ca);
   swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod);
   layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
@@ -784,8 +1089,8 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
 inline void freeDenoiser(Denoiser& d) {
   CK(cudaStreamSynchronize(STREAM));
   for (void* b : d.biases) CK(cudaFree(b));
-  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.ptrs, (void*)d.level,
-                  (void*)d.sBase, (void*)d.encMod, (void*)d.decMod})
+  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.snScaledH, (void*)d.G, (void*)d.scales, (void*)d.ptrs,
+                  (void*)d.level, (void*)d.sBase, (void*)d.encMod, (void*)d.decMod})
     if (p) CK(cudaFree(p));
   freeAtoms(d.atoms);
   d.biases.clear();

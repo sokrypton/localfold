@@ -39,9 +39,10 @@ __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out,
   for (int a = 0; a < 3; ++a) out[t * 3 + a] = g[a];
 }
 // IPA logits -> attention weights, a warp a (query, head): logits[q, k, h] then softmax over k
-__global__ void ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const float* __restrict__ qp,
-                            const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
-                            const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
+__global__ void __launch_bounds__(256, 4)
+ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const float* __restrict__ qp,
+            const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
+            const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
   __shared__ float srow[8][512];
   size_t wid = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -50,18 +51,18 @@ __global__ void ipaWeightsK(const float* __restrict__ qs, const float* __restric
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
   float* sr = L <= 512 ? srow[warp] : row;
   float mx = -INFINITY;
-  float w = pw[h];
+  float w = __ldg(pw + h);
   // the query's scalars and points held in registers, read once (they were read again for every key); the
   // keys' scalars as float4s where 16-byte aligned - the same products in the same order
   if (Cs == 16 && Pq == 4) {
     const float4* qsh = reinterpret_cast<const float4*>(qs + ((size_t)q * Hh + h) * 16);
-    float4 qv0 = qsh[0], qv1 = qsh[1], qv2 = qsh[2], qv3 = qsh[3];
+    float4 qv0 = __ldg(qsh), qv1 = __ldg(qsh + 1), qv2 = __ldg(qsh + 2), qv3 = __ldg(qsh + 3);
     const float4* qph = reinterpret_cast<const float4*>(qp + ((size_t)q * Hh + h) * 12);
-    float4 qp0 = qph[0], qp1 = qph[1], qp2 = qph[2];
-    float sq = seqMask[q];
+    float4 qp0 = __ldg(qph), qp1 = __ldg(qph + 1), qp2 = __ldg(qph + 2);
+    float sq = __ldg(seqMask + q);
     for (int k = lane; k < L; k += 32) {
       const float4* kpk = reinterpret_cast<const float4*>(kp + ((size_t)k * Hh + h) * 12);
-      float4 kp0 = kpk[0], kp1 = kpk[1], kp2 = kpk[2];
+      float4 kp0 = __ldg(kpk), kp1 = __ldg(kpk + 1), kp2 = __ldg(kpk + 2);
       float d2 = 0;
       float dx, dy, dz;
       dx = qp0.x - kp0.x; dy = qp0.y - kp0.y; dz = qp0.z - kp0.z; d2 += dx * dx + dy * dy + dz * dz;
@@ -70,13 +71,13 @@ __global__ void ipaWeightsK(const float* __restrict__ qs, const float* __restric
       dx = qp2.y - kp2.y; dy = qp2.z - kp2.z; dz = qp2.w - kp2.w; d2 += dx * dx + dy * dy + dz * dz;
       const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * 16);
       float sc = 0;
-      float4 v0 = ksk[0]; sc += qv0.x * v0.x; sc += qv0.y * v0.y; sc += qv0.z * v0.z; sc += qv0.w * v0.w;
-      float4 v1 = ksk[1]; sc += qv1.x * v1.x; sc += qv1.y * v1.y; sc += qv1.z * v1.z; sc += qv1.w * v1.w;
-      float4 v2 = ksk[2]; sc += qv2.x * v2.x; sc += qv2.y * v2.y; sc += qv2.z * v2.z; sc += qv2.w * v2.w;
-      float4 v3 = ksk[3]; sc += qv3.x * v3.x; sc += qv3.y * v3.y; sc += qv3.z * v3.z; sc += qv3.w * v3.w;
+      float4 v0 = __ldg(ksk); sc += qv0.x * v0.x; sc += qv0.y * v0.y; sc += qv0.z * v0.z; sc += qv0.w * v0.w;
+      float4 v1 = __ldg(ksk + 1); sc += qv1.x * v1.x; sc += qv1.y * v1.y; sc += qv1.z * v1.z; sc += qv1.w * v1.w;
+      float4 v2 = __ldg(ksk + 2); sc += qv2.x * v2.x; sc += qv2.y * v2.y; sc += qv2.z * v2.z; sc += qv2.w * v2.w;
+      float4 v3 = __ldg(ksk + 3); sc += qv3.x * v3.x; sc += qv3.y * v3.y; sc += qv3.z * v3.z; sc += qv3.w * v3.w;
       float s = -0.5f * w * d2;
-      s += sc + b2d[((size_t)q * L + k) * Hh + h];
-      s -= 1e5f * (1.f - sq * seqMask[k]);
+      s += sc + __ldg(b2d + ((size_t)q * L + k) * Hh + h);
+      s -= 1e5f * (1.f - sq * __ldg(seqMask + k));
       s *= sqrtf(1.f / 3.f);
       sr[k] = s;
       mx = fmaxf(mx, s);
@@ -88,43 +89,17 @@ __global__ void ipaWeightsK(const float* __restrict__ qs, const float* __restric
     for (int k = lane; k < L; k += 32) row[k] = sr[k] / sum;
     return;
   }
-  constexpr int CS_MAX = 32, PQ_MAX = 8;
-  const bool fast = Cs <= CS_MAX && Pq <= PQ_MAX && Cs % 4 == 0;
-  float qv[CS_MAX], qpt[PQ_MAX * 3];
-  if (fast) {
-#pragma unroll
-    for (int c = 0; c < CS_MAX; ++c) qv[c] = c < Cs ? qs[((size_t)q * Hh + h) * Cs + c] : 0.f;
-#pragma unroll
-    for (int e = 0; e < PQ_MAX * 3; ++e) qpt[e] = e < Pq * 3 ? qp[((size_t)q * Hh + h) * Pq * 3 + e] : 0.f;
-  }
   for (int k = lane; k < L; k += 32) {
-    float d2 = 0;
-    float sc = 0;
-    if (fast) {
-      const float* kpk = kp + ((size_t)k * Hh + h) * Pq * 3;
-#pragma unroll
-      for (int p = 0; p < PQ_MAX; ++p)
-        if (p < Pq)
-#pragma unroll
-          for (int a = 0; a < 3; ++a) { float d = qpt[p * 3 + a] - kpk[p * 3 + a]; d2 += d * d; }
-      const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * Cs);
-#pragma unroll
-      for (int c4 = 0; c4 < CS_MAX / 4; ++c4)
-        if (c4 * 4 < Cs) {
-          float4 v = ksk[c4];
-          sc += qv[c4 * 4] * v.x; sc += qv[c4 * 4 + 1] * v.y; sc += qv[c4 * 4 + 2] * v.z; sc += qv[c4 * 4 + 3] * v.w;
-        }
-    } else {
-      for (int p = 0; p < Pq; ++p)
-        for (int a = 0; a < 3; ++a) {
-          float d = qp[(((size_t)q * Hh + h) * Pq + p) * 3 + a] - kp[(((size_t)k * Hh + h) * Pq + p) * 3 + a];
-          d2 += d * d;
-        }
-      for (int c = 0; c < Cs; ++c) sc += qs[((size_t)q * Hh + h) * Cs + c] * ks[((size_t)k * Hh + h) * Cs + c];
-    }
+    float d2 = 0, sc = 0;
+    for (int p = 0; p < Pq; ++p)
+      for (int a = 0; a < 3; ++a) {
+        float d = __ldg(qp + (((size_t)q * Hh + h) * Pq + p) * 3 + a) - __ldg(kp + (((size_t)k * Hh + h) * Pq + p) * 3 + a);
+        d2 += d * d;
+      }
+    for (int c = 0; c < Cs; ++c) sc += __ldg(qs + ((size_t)q * Hh + h) * Cs + c) * __ldg(ks + ((size_t)k * Hh + h) * Cs + c);
     float s = -0.5f * w * d2;
-    s += sc + b2d[((size_t)q * L + k) * Hh + h];
-    s -= 1e5f * (1.f - seqMask[q] * seqMask[k]);
+    s += sc + __ldg(b2d + ((size_t)q * L + k) * Hh + h);
+    s -= 1e5f * (1.f - __ldg(seqMask + q) * __ldg(seqMask + k));
     s *= sqrtf(1.f / 3.f);
     row[k] = s;
     mx = fmaxf(mx, s);
@@ -249,13 +224,13 @@ __global__ void ipaPairTermK(const float* __restrict__ attn, const float* __rest
       int kt = min(IPA_KT, L - k0);
       for (int t = c; t < 12 * kt; t += 128) {
         int h = t / kt, k = t - h * kt;
-        as[h][k] = attn[((size_t)q * 12 + h) * L + k0 + k];
+        as[h][k] = __ldg(attn + ((size_t)q * 12 + h) * L + k0 + k);
       }
       __syncthreads();
       const float* a2d = act2d + ((size_t)q * L + k0) * 128 + c;
 #pragma unroll 8
       for (int k = 0; k < kt; ++k) {
-        float v = a2d[(size_t)k * 128];
+        float v = __ldg(a2d + (size_t)k * 128);
 #pragma unroll
         for (int h = 0; h < 12; ++h) acc[h] += as[h][k] * v;
       }

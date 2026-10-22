@@ -149,12 +149,13 @@ inline void linear(const float* X, const float* Wt, float* Y, size_t rows, int i
 }
 // ...from an input already in f16 / bf16 (written so by the kernel that made it: halfLn, adaLnTo, sigmoidMulTo,
 // swigluTo), so no conversion pass runs between
-template <class TH> inline void linearPre(const TH* Xh, const TH* Wh, float* Y, size_t rows, int in, int out,
-                                          float beta = 0.f, int ldy = 0) {
-  const float alpha = 1.f;
+template <class TH, class TY = float>
+inline void linearPre(const TH* Xh, const TH* Wh, TY* Y, size_t rows, int in, int out,
+                      float beta = 0.f, int ldy = 0, float alpha = 1.f) {
   const cudaDataType t = std::is_same_v<TH, half> ? CUDA_R_16F : CUDA_R_16BF;
+  const cudaDataType ty = std::is_same_v<TY, float> ? CUDA_R_32F : (std::is_same_v<TY, half> ? CUDA_R_16F : CUDA_R_16BF);
   CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, Wh, t, in, Xh, t, in,
-                  &beta, Y, CUDA_R_32F, ldy ? ldy : out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                  &beta, Y, ty, ldy ? ldy : out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 template <class TH>
 inline void linearBatchPre(const TH* Xh, long long strideX, const TH* Wh, long long strideW,
@@ -219,6 +220,11 @@ template <class TY> __device__ __forceinline__ void storeVec4(TY* dst, int c4, f
 
 // ---------------------------------------------------------------- elementwise
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
+__device__ __forceinline__ float fastSigm(float x) {
+  float t; asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x));
+  return 0.5f * t + 0.5f;
+}
+__device__ __forceinline__ float fastSiluF(float x) { return x * fastSigm(x); }
 // LayerNorm into f16/f32 (scale/offset may be null), with optional fused SiLU, a warp a row
 template <class TH, bool APPLY_SILU = false>
 __global__ void lnToK(const float* __restrict__ x, TH* __restrict__ y, size_t rows, int C,
@@ -353,7 +359,63 @@ inline void lnTo(const float* x, TH* y, size_t rows, int C, const float* scale, 
   if (C == 896) { lnToRegK<TH, 28, APPLY_SILU><<<g, 256, 0, STREAM>>>(x, y, rows, scale, offset, lx); return; }
   lnToK<TH, APPLY_SILU><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, lx);
 }
-// the SwiGLU's product from fc1|fc2's [rows, 2I] f16 output, into fc3's bf16 input
+// the SwiGLU's product from fc1|fc2's [rows, 2I] f16 output, into fc3's bf16 input.
+// When fc1 and fc2 rows are interleaved in groups of 4 rows in w12 (interleavedSwigluMirror),
+// each pair of uint4s (16 halfs) in h12 holds [a0..a3, b0..b3, a4..a7, b4..b7], so swigluInterleaved8K
+// is a flat 1D stream kernel with zero row/col division or modulo.
+__global__ void interleave4ToHalfK(const float* __restrict__ w1, const float* __restrict__ w2,
+                                   half* __restrict__ out, size_t groups, int C) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = groups * 2 * (size_t)C;
+  if (idx >= total) return;
+  size_t g2 = idx / (size_t)C;
+  int c4 = (int)(idx - g2 * (size_t)C);
+  size_t g = g2 >> 1;
+  const float* src = (g2 & 1) ? w2 : w1;
+  float4 v = __ldg(reinterpret_cast<const float4*>(src) + g * (size_t)C + c4);
+  __half2 h0 = __floats2half2_rn(v.x, v.y);
+  __half2 h1 = __floats2half2_rn(v.z, v.w);
+  uint2 u;
+  u.x = *reinterpret_cast<const unsigned*>(&h0);
+  u.y = *reinterpret_cast<const unsigned*>(&h1);
+  reinterpret_cast<uint2*>(out)[idx] = u;
+}
+inline const half* interleavedSwigluMirror(const float* w1, const float* w2, int I, int C) {
+  static std::map<const float*, half*> m;
+  auto it = m.find(w1);
+  if (it != m.end()) return it->second;
+  size_t n = (size_t)I * C;
+  half* h = dallocT<half>(2 * n);
+  size_t groups = (size_t)(I >> 2);
+  size_t totalVec4 = groups * 2 * (size_t)C;
+  interleave4ToHalfK<<<blocks(totalVec4), 256, 0, STREAM>>>(w1, w2, h, groups, C);
+  return m[w1] = h;
+}
+__global__ void swigluInterleaved8K(const uint4* __restrict__ h12, uint4* __restrict__ g, size_t n8) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n8) return;
+  constexpr float invS = 1.f / 64.f;
+  uint4 u0 = __ldg(h12 + 2 * t);
+  uint4 u1 = __ldg(h12 + 2 * t + 1);
+  float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&u0.x));
+  float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&u0.y));
+  float2 b0 = __half22float2(*reinterpret_cast<const __half2*>(&u0.z));
+  float2 b1 = __half22float2(*reinterpret_cast<const __half2*>(&u0.w));
+  float2 a2 = __half22float2(*reinterpret_cast<const __half2*>(&u1.x));
+  float2 a3 = __half22float2(*reinterpret_cast<const __half2*>(&u1.y));
+  float2 b2 = __half22float2(*reinterpret_cast<const __half2*>(&u1.z));
+  float2 b3 = __half22float2(*reinterpret_cast<const __half2*>(&u1.w));
+  __half2 o0 = __floats2half2_rn(fastSiluF(a0.x) * (b0.x * invS), fastSiluF(a0.y) * (b0.y * invS));
+  __half2 o1 = __floats2half2_rn(fastSiluF(a1.x) * (b1.x * invS), fastSiluF(a1.y) * (b1.y * invS));
+  __half2 o2 = __floats2half2_rn(fastSiluF(a2.x) * (b2.x * invS), fastSiluF(a2.y) * (b2.y * invS));
+  __half2 o3 = __floats2half2_rn(fastSiluF(a3.x) * (b3.x * invS), fastSiluF(a3.y) * (b3.y * invS));
+  uint4 out;
+  out.x = *reinterpret_cast<const unsigned*>(&o0);
+  out.y = *reinterpret_cast<const unsigned*>(&o1);
+  out.z = *reinterpret_cast<const unsigned*>(&o2);
+  out.w = *reinterpret_cast<const unsigned*>(&o3);
+  g[t] = out;
+}
 __global__ void swigluToK(const half* __restrict__ h12, __nv_bfloat16* __restrict__ g, size_t rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((I & 7) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) {
@@ -630,7 +692,7 @@ __global__ void adaLnK(const float* x, TY* y, size_t rows, int C, int ldx, const
   }
 }
 template <class TY, int K, bool GATED = false>
-__global__ void __launch_bounds__(256, (K <= 16 ? 4 : 2))
+__global__ void __launch_bounds__(128, (K <= 16 ? 8 : 4))
 adaLnRegK(float* __restrict__ x, TY* __restrict__ y, size_t rows, int ldx,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
           float scale, const int* __restrict__ map,
@@ -691,26 +753,27 @@ template <class TY = float>
 inline void adaLn(const float* x, TY* y, size_t rows, int C, const float* alpha, const float* beta, int ldc,
                   int ldx = 0, float scale = 1.f, const int* map = nullptr) {
   int lx = ldx ? ldx : C;
-  unsigned g = (unsigned)((rows + 7) / 8);
+  unsigned g4 = (unsigned)((rows + 3) / 4);
   float* xm = const_cast<float*>(x);
-  if (C == 128) { adaLnRegK<TY, 4><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
-  if (C == 768) { adaLnRegK<TY, 24><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
-  if (C == 896) { adaLnRegK<TY, 28><<<g, 256, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
-  adaLnK<TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, lx, alpha, beta, ldc, scale, map);
+  if (C == 128) { adaLnRegK<TY, 4><<<g4, 128, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  if (C == 768) { adaLnRegK<TY, 24><<<g4, 128, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  if (C == 896) { adaLnRegK<TY, 28><<<g4, 128, 0, STREAM>>>(xm, y, rows, lx, alpha, beta, ldc, scale, map); return; }
+  unsigned g8 = (unsigned)((rows + 7) / 8);
+  adaLnK<TY><<<g8, 256, 0, STREAM>>>(x, y, rows, C, lx, alpha, beta, ldc, scale, map);
 }
 template <class TY = float>
 inline void adaLnGatedAdd(float* x, const float* h, const float* gate, TY* y, size_t rows, int C,
                           const float* alpha, const float* beta, int ldc, const int* map = nullptr, int ldg = 0) {
   int lg = ldg ? ldg : ldc;
-  unsigned g = (unsigned)((rows + 7) / 8);
-  if (C == 128) { adaLnRegK<TY, 4, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
-  if (C == 768) { adaLnRegK<TY, 24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
+  unsigned g4 = (unsigned)((rows + 3) / 4);
+  if (C == 128) { adaLnRegK<TY, 4, true><<<g4, 128, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
+  if (C == 768) { adaLnRegK<TY, 24, true><<<g4, 128, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
   gatedAdd(x, h, gate, rows, C, lg, map);
   adaLn<TY>(x, y, rows, C, alpha, beta, ldc, 0, 1.f, map);
 }
 // Fused q += gateA * tAtom (in place) + [tokensToAtoms(a) | q] (768 + 128 = 896) + adaLN directly into y (f32 or f16)
 template <class TY>
-__global__ void __launch_bounds__(256, 2)
+__global__ void __launch_bounds__(128, 4)
 adaLnS2QK(const float* __restrict__ a, float* __restrict__ q,
           const float* __restrict__ tAtom, const float* __restrict__ gateA, int ldgA,
           const int* __restrict__ atomTok, const int* __restrict__ atomPad,
@@ -721,7 +784,8 @@ adaLnS2QK(const float* __restrict__ a, float* __restrict__ q,
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   constexpr int K4 = 7, C = 896;
-  int s = (int)(row / (size_t)N), al = (int)(row - (size_t)s * N);
+  unsigned urow = (unsigned)row, uN = (unsigned)N;
+  int s = (int)(urow / uN), al = (int)(urow - (unsigned)s * uN);
   int pad = __ldg(atomPad + al);
   int tokIdx = pad ? __ldg(atomTok + al) : 0;
   const size_t cr = map ? (size_t)__ldg(map + row) : row;
@@ -773,7 +837,7 @@ adaLnS2QK(const float* __restrict__ a, float* __restrict__ q,
 }
 // Fused a += gateT * tTok (in place) + [centreAtoms(q + gateA * tAtom) | a] (128 + 768 = 896) + adaLN directly into y (f32 or f16)
 template <class TY>
-__global__ void __launch_bounds__(256, 2)
+__global__ void __launch_bounds__(128, 4)
 adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ tAtom,
           const float* __restrict__ gateA, int ldgA, const int* __restrict__ atomTok,
           float* __restrict__ a, const float* __restrict__ tTok,
@@ -781,12 +845,39 @@ adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ tAtom,
           const int* __restrict__ centre,
           TY* __restrict__ y, size_t rows, int N, int T,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
-          const int* __restrict__ map) {
+          const int* __restrict__ map,
+          half* __restrict__ uvb = nullptr, float4* __restrict__ tokStats = nullptr,
+          const float* __restrict__ s2qAlpha = nullptr, const float* __restrict__ s2qBeta = nullptr, int ldcS2Q = 0) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
-  if (row >= rows) return;
+  size_t rMax = uvb ? (rows + (size_t)(2 * (T + 1))) : rows;
+  if (row >= rMax) return;
+  if (uvb && row >= rows) {
+    half* yr = uvb + row * 768;
+    int extra = (int)(row - rows);
+    if (extra < T + 1) {
+      const float4* alr4 = reinterpret_cast<const float4*>(s2qAlpha + (size_t)extra * ldcS2Q);
+      #pragma unroll
+      for (int k = 0; k < 6; ++k) {
+        int c4 = k * 32 + lane;
+        float4 av = __ldg(alr4 + c4);
+        storeVec4<half>(yr, c4, 1.f + av.x, 1.f + av.y, 1.f + av.z, 1.f + av.w);
+      }
+    } else {
+      int cr = extra - (T + 1);
+      const float4* ber4 = reinterpret_cast<const float4*>(s2qBeta + (size_t)cr * ldcS2Q);
+      #pragma unroll
+      for (int k = 0; k < 6; ++k) {
+        int c4 = k * 32 + lane;
+        float4 bv = __ldg(ber4 + c4);
+        storeVec4<half>(yr, c4, bv.x, bv.y, bv.z, bv.w);
+      }
+    }
+    return;
+  }
   constexpr int K4 = 7, C = 896;
-  int s = (int)(row / (size_t)T), il = (int)(row - (size_t)s * T);
+  unsigned urow = (unsigned)row, uT = (unsigned)T;
+  int s = (int)(urow / uT), il = (int)(urow - (unsigned)s * uT);
   int caIdx = __ldg(centre + il);
   size_t caRow = (size_t)s * N + caIdx;
   int caTok = __ldg(atomTok + caIdx);
@@ -799,14 +890,15 @@ adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ tAtom,
   const float4* ttr4 = reinterpret_cast<const float4*>(tTok + row * 768);
   const float4* gtr4 = reinterpret_cast<const float4*>(gateT + cr * ldgT);
   float4 xv[K4];
-  float sum = 0.f;
+  float sumQ = 0.f;
   {
     float4 qv = __ldg(qr4 + lane), tav = __ldg(tar4 + lane), gav = __ldg(gar4 + lane);
     float4 v = make_float4(qv.x + gav.x * tav.x, qv.y + gav.y * tav.y,
                            qv.z + gav.z * tav.z, qv.w + gav.w * tav.w);
     xv[0] = v;
-    sum += (v.x + v.y) + (v.z + v.w);
+    sumQ = (v.x + v.y) + (v.z + v.w);
   }
+  float sumA = 0.f;
   #pragma unroll
   for (int k = 0; k < 6; ++k) {
     int c4 = k * 32 + lane;
@@ -815,10 +907,38 @@ adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ tAtom,
                            av.z + gtv.z * ttv.z, av.w + gtv.w * ttv.w);
     ar4[c4] = v;
     xv[1 + k] = v;
-    sum += (v.x + v.y) + (v.z + v.w);
+    sumA += (v.x + v.y) + (v.z + v.w);
   }
+  float sum = sumQ + sumA;
   #pragma unroll
-  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  for (int o = 16; o; o >>= 1) {
+    sum += __shfl_xor_sync(~0u, sum, o);
+    if (uvb) sumA += __shfl_xor_sync(~0u, sumA, o);
+  }
+  if (uvb) {
+    float meanA = sumA * (1.f / 768.f), varA = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+      float dx = xv[1 + k].x - meanA, dy = xv[1 + k].y - meanA, dz = xv[1 + k].z - meanA, dw = xv[1 + k].w - meanA;
+      varA += (dx * dx + dy * dy) + (dz * dz + dw * dw);
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) varA += __shfl_xor_sync(~0u, varA, o);
+    float invA = rsqrtf(varA * (1.f / 896.f) + 1e-5f);
+    if (lane == 0) tokStats[row] = make_float4(meanA, varA, invA, 0.f);
+    const float4* alr4 = reinterpret_cast<const float4*>(s2qAlpha + (size_t)il * ldcS2Q);
+    half* uvbR = uvb + row * 768;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+      int c4 = k * 32 + lane;
+      float4 av = __ldg(alr4 + c4);
+      storeVec4<half>(uvbR, c4,
+                      (xv[1 + k].x - meanA) * invA * (1.f + av.x),
+                      (xv[1 + k].y - meanA) * invA * (1.f + av.y),
+                      (xv[1 + k].z - meanA) * invA * (1.f + av.z),
+                      (xv[1 + k].w - meanA) * invA * (1.f + av.w));
+    }
+  }
   float mean = sum / C, var = 0.f;
   #pragma unroll
   for (int k = 0; k < K4; ++k) {
@@ -911,8 +1031,9 @@ inline void transitionHalf(const float* x, const half* xh, float* out, size_t ro
   auto w = [&](const std::string& n) { return layer < 0 ? P(p + n) : PL(p + n, layer); };
   const int I = layer < 0 ? dimP(p + "fc1/weight", 0) : dimP(p + "fc1/weight", 1);
   const int Co = layer < 0 ? dimP(p + "fc3/weight", 0) : dimP(p + "fc3/weight", 1);
-  const half* w12 = stackedMirror<half>(w("fc1/weight"), w("fc2/weight"), (size_t)I * C);
-  const __nv_bfloat16* w3 = halfMirror<__nv_bfloat16>(w("fc3/weight"), (size_t)Co * I);
+  const bool useInterleaved8 = ((I & 7) == 0 && (C & 3) == 0);
+  const half* w12 = useInterleaved8 ? interleavedSwigluMirror(w("fc1/weight"), w("fc2/weight"), I, C)
+                                    : stackedMirror<half>(w("fc1/weight"), w("fc2/weight"), (size_t)I * C);
   // (a chunk sized for the L2 - 16 MB of widened rows - measured 8% SLOWER at 494 tokens than this: the GEMMs lose more
   // to their smaller M than the SwiGLU gains from the cache)
   size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (4 * (size_t)I * 2));
@@ -940,11 +1061,238 @@ inline void transitionHalf(const float* x, const half* xh, float* out, size_t ro
         if (mx > worst) { worst = mx; printf("fc1|fc2 max %g (%s)\n", mx, p.c_str()); }
       }
     }
-    size_t nSw = ((I & 7) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) ? r * (size_t)(I >> 3)
-               : ((I & 3) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 7) == 0) ? r * (size_t)(I >> 2) : r * I;
-    swigluToK<<<blocks(nSw), 256, 0, STREAM>>>(h12, g, r, I);
-    linearPre<__nv_bfloat16>(g, w3, out + r0 * Co, r, I, Co, residual ? 1.f : 0.f);
+    if (useInterleaved8 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) {
+      size_t n8 = r * (size_t)(I >> 3);
+      swigluInterleaved8K<<<blocks(n8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(h12),
+                                                          reinterpret_cast<uint4*>(g), n8);
+      const half* w3h = halfMirror<half>(w("fc3/weight"), (size_t)Co * I);
+      linearPre<half>(reinterpret_cast<const half*>(g), w3h, out + r0 * Co, r, I, Co, residual ? 1.f : 0.f, 0, 64.f);
+    } else {
+      size_t nSw = ((I & 7) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) ? r * (size_t)(I >> 3)
+                 : ((I & 3) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 7) == 0) ? r * (size_t)(I >> 2) : r * I;
+      swigluToK<<<blocks(nSw), 256, 0, STREAM>>>(h12, g, r, I);
+      const __nv_bfloat16* w3 = halfMirror<__nv_bfloat16>(w("fc3/weight"), (size_t)Co * I);
+      linearPre<__nv_bfloat16>(g, w3, out + r0 * Co, r, I, Co, residual ? 1.f : 0.f);
+    }
   }
+}
+// Factored s_to_q_mixer on GEMM_HALF: decomposes sqh [RN, 896] = [tokensToAtoms(a) (768) | q (128)] so the 768 token
+// columns are projected once per token row [RT + 2*(T+1), 768] instead of once per atom row [RN, 768] (6x fewer rows),
+// while the 128 atom columns are projected on [RN, 128], and combined in swigluS2QInterleaved8K.
+__global__ void __launch_bounds__(128, 4)
+prepS2QTokK(const float* __restrict__ a, half* __restrict__ uvb, float4* __restrict__ tokStats,
+            int RT, int T, const float* __restrict__ alpha, const float* __restrict__ beta, int ldc) {
+  int row = (int)blockIdx.x * 4 + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  int Rtok = RT + 2 * (T + 1);
+  if (row >= Rtok) return;
+  constexpr int K4 = 6, C = 768;
+  half* yr = uvb + (size_t)row * C;
+  if (row < RT) {
+    unsigned urow = (unsigned)row, uT = (unsigned)T;
+    int s = (int)(urow / uT), t = (int)(urow - (unsigned)s * uT);
+    const float4* ar4 = reinterpret_cast<const float4*>(a + (size_t)row * C);
+    float4 xv[K4];
+    float sum = 0.f;
+    #pragma unroll
+    for (int k = 0; k < K4; ++k) {
+      float4 v = __ldg(ar4 + k * 32 + lane);
+      xv[k] = v;
+      sum += (v.x + v.y) + (v.z + v.w);
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    float mean = sum * (1.f / 768.f), var = 0.f;
+    #pragma unroll
+    for (int k = 0; k < K4; ++k) {
+      float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+      var += (dx * dx + dy * dy) + (dz * dz + dw * dw);
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
+    float inv = rsqrtf(var * (1.f / 896.f) + 1e-5f);
+    if (lane == 0) tokStats[row] = make_float4(mean, var, inv, 0.f);
+    const float4* alr4 = reinterpret_cast<const float4*>(alpha + (size_t)t * ldc);
+    #pragma unroll
+    for (int k = 0; k < K4; ++k) {
+      int c4 = k * 32 + lane;
+      float4 av = __ldg(alr4 + c4);
+      storeVec4<half>(yr, c4,
+                      (xv[k].x - mean) * inv * (1.f + av.x),
+                      (xv[k].y - mean) * inv * (1.f + av.y),
+                      (xv[k].z - mean) * inv * (1.f + av.z),
+                      (xv[k].w - mean) * inv * (1.f + av.w));
+    }
+  } else if (row < RT + (T + 1)) {
+    int cr = row - RT;
+    const float4* alr4 = reinterpret_cast<const float4*>(alpha + (size_t)cr * ldc);
+    #pragma unroll
+    for (int k = 0; k < K4; ++k) {
+      int c4 = k * 32 + lane;
+      float4 av = __ldg(alr4 + c4);
+      storeVec4<half>(yr, c4, 1.f + av.x, 1.f + av.y, 1.f + av.z, 1.f + av.w);
+    }
+  } else {
+    int cr = row - (RT + (T + 1));
+    const float4* ber4 = reinterpret_cast<const float4*>(beta + (size_t)cr * ldc);
+    #pragma unroll
+    for (int k = 0; k < K4; ++k) {
+      int c4 = k * 32 + lane;
+      float4 bv = __ldg(ber4 + c4);
+      storeVec4<half>(yr, c4, bv.x, bv.y, bv.z, bv.w);
+    }
+  }
+}
+__global__ void __launch_bounds__(128, 4)
+prepS2QAtomK(float* __restrict__ q, const float* __restrict__ tAtom, const float* __restrict__ gateA, int ldgA,
+             const int* __restrict__ atomTok, const int* __restrict__ atomPad,
+             const float4* __restrict__ tokStats, half* __restrict__ sqhAtom, float2* __restrict__ atomScale,
+             size_t rows, int N, int T, const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
+             const int* __restrict__ map) {
+  size_t row = (size_t)blockIdx.x * 4 + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  unsigned urow = (unsigned)row, uN = (unsigned)N;
+  int s = (int)(urow / uN), al = (int)(urow - (unsigned)s * uN);
+  int pad = __ldg(atomPad + al);
+  int tokIdx = pad ? __ldg(atomTok + al) : 0;
+  const size_t cr = map ? (size_t)__ldg(map + row) : row;
+  float4* qr4 = reinterpret_cast<float4*>(q + row * 128);
+  const float4* tar4 = reinterpret_cast<const float4*>(tAtom + row * 128);
+  const float4* gar4 = reinterpret_cast<const float4*>(gateA + cr * ldgA);
+  float4 qv = __ldg(qr4 + lane), tav = __ldg(tar4 + lane), gav = __ldg(gar4 + lane);
+  float4 v = make_float4(qv.x + gav.x * tav.x, qv.y + gav.y * tav.y,
+                         qv.z + gav.z * tav.z, qv.w + gav.w * tav.w);
+  qr4[lane] = v;
+  float s_q = (v.x + v.y) + (v.z + v.w);
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s_q += __shfl_xor_sync(~0u, s_q, o);
+  float4 st = pad ? __ldg(tokStats + (size_t)s * T + tokIdx) : make_float4(0.f, 0.f, 1.f, 0.f);
+  float mu_a = st.x, V_a = st.y, inv_a = st.z;
+  float mean = (s_q + (pad ? 768.f * mu_a : 0.f)) * (1.f / 896.f);
+  float dx = v.x - mean, dy = v.y - mean, dz = v.z - mean, dw = v.w - mean;
+  float v_q = (dx * dx + dy * dy) + (dz * dz + dw * dw);
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v_q += __shfl_xor_sync(~0u, v_q, o);
+  float dmu = mu_a - mean;
+  float var = v_q + (pad ? (V_a + 768.f * dmu * dmu) : (768.f * mean * mean));
+  float inv = rsqrtf(var * (1.f / 896.f) + 1e-5f);
+  if (lane == 0) atomScale[row] = make_float2(pad ? (inv / inv_a) : 0.f, (pad ? dmu : -mean) * inv);
+  const float4* alr4 = reinterpret_cast<const float4*>(alpha + cr * ldc + 768);
+  const float4* ber4 = reinterpret_cast<const float4*>(beta + cr * ldc + 768);
+  float4 av = __ldg(alr4 + lane);
+  float4 bv = __ldg(ber4 + lane);
+  storeVec4<half>(sqhAtom + row * 128, lane,
+                  dx * inv * (1.f + av.x) + bv.x,
+                  dy * inv * (1.f + av.y) + bv.y,
+                  dz * inv * (1.f + av.z) + bv.z,
+                  dw * inv * (1.f + av.w) + bv.w);
+}
+__global__ void __launch_bounds__(256, 3)
+swigluS2QInterleaved8K(const uint4* __restrict__ h12Atom, const uint4* __restrict__ h12Tok,
+                       const float2* __restrict__ atomScale, const int* __restrict__ atomTok,
+                       const int* __restrict__ atomPad, uint4* __restrict__ g,
+                       int S, int N, int T, int RT, int i8) {
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned nBase = (unsigned)N * (unsigned)i8;
+  if (t >= nBase) return;
+  unsigned al, c8;
+  if (i8 == 448) { al = t / 448u; c8 = t - al * 448u; }
+  else { unsigned ui = (unsigned)i8; al = t / ui; c8 = t - al * ui; }
+  int pad = __ldg(atomPad + al);
+  int tokIdx = pad ? __ldg(atomTok + al) : 0;
+  int cr = pad ? tokIdx : T;
+  size_t vOff = (size_t)(RT + cr) * i8 + c8;
+  size_t bOff = (size_t)(RT + (T + 1) + cr) * i8 + c8;
+  uint4 v0 = __ldg(h12Tok + 2 * vOff), v1 = __ldg(h12Tok + 2 * vOff + 1);
+  uint4 b0 = __ldg(h12Tok + 2 * bOff), b1 = __ldg(h12Tok + 2 * bOff + 1);
+  auto h2f = [](unsigned x) -> float2 { return __half22float2(*reinterpret_cast<const __half2*>(&x)); };
+  float2 vf0 = h2f(v0.x), vf1 = h2f(v0.y), vf2 = h2f(v0.z), vf3 = h2f(v0.w);
+  float2 vf4 = h2f(v1.x), vf5 = h2f(v1.y), vf6 = h2f(v1.z), vf7 = h2f(v1.w);
+  float2 bf0 = h2f(b0.x), bf1 = h2f(b0.y), bf2 = h2f(b0.z), bf3 = h2f(b0.w);
+  float2 bf4 = h2f(b1.x), bf5 = h2f(b1.y), bf6 = h2f(b1.z), bf7 = h2f(b1.w);
+  for (int s = 0; s < S; ++s) {
+    size_t r = (size_t)s * N + al;
+    size_t idx = r * i8 + c8;
+    float2 k12 = __ldg(atomScale + r);
+    float k1 = k12.x, k2 = k12.y;
+    uint4 a0 = __ldg(h12Atom + 2 * idx);
+    uint4 a1 = __ldg(h12Atom + 2 * idx + 1);
+    uint4 u0 = make_uint4(0, 0, 0, 0), u1 = make_uint4(0, 0, 0, 0);
+    if (pad) {
+      size_t uOff = (size_t)(s * T + tokIdx) * i8 + c8;
+      u0 = __ldg(h12Tok + 2 * uOff);
+      u1 = __ldg(h12Tok + 2 * uOff + 1);
+    }
+    auto comb = [&](unsigned ax, unsigned ux, float2 vf, float2 bf) -> float2 {
+      float2 af = h2f(ax), uf = h2f(ux);
+      return make_float2(af.x + k1 * uf.x + k2 * vf.x + bf.x,
+                         af.y + k1 * uf.y + k2 * vf.y + bf.y);
+    };
+    float2 x0 = comb(a0.x, u0.x, vf0, bf0), x1 = comb(a0.y, u0.y, vf1, bf1);
+    float2 y0 = comb(a0.z, u0.z, vf2, bf2), y1 = comb(a0.w, u0.w, vf3, bf3);
+    float2 x2 = comb(a1.x, u1.x, vf4, bf4), x3 = comb(a1.y, u1.y, vf5, bf5);
+    float2 y2 = comb(a1.z, u1.z, vf6, bf6), y3 = comb(a1.w, u1.w, vf7, bf7);
+    constexpr float invS = 1.f / 64.f;
+    __half2 o0 = __floats2half2_rn(fastSiluF(x0.x) * (y0.x * invS), fastSiluF(x0.y) * (y0.y * invS));
+    __half2 o1 = __floats2half2_rn(fastSiluF(x1.x) * (y1.x * invS), fastSiluF(x1.y) * (y1.y * invS));
+    __half2 o2 = __floats2half2_rn(fastSiluF(x2.x) * (y2.x * invS), fastSiluF(x2.y) * (y2.y * invS));
+    __half2 o3 = __floats2half2_rn(fastSiluF(x3.x) * (y3.x * invS), fastSiluF(x3.y) * (y3.y * invS));
+    uint4 out;
+    out.x = *reinterpret_cast<const unsigned*>(&o0);
+    out.y = *reinterpret_cast<const unsigned*>(&o1);
+    out.z = *reinterpret_cast<const unsigned*>(&o2);
+    out.w = *reinterpret_cast<const unsigned*>(&o3);
+    g[idx] = out;
+  }
+}
+inline void s2qMixerHalf(const float* a, float* q, const float* tAtom, const float* gateA, int ldgA,
+                         const int* atomTok, const int* atomPad, float* dq, size_t RN, int N, int T, size_t RT,
+                         const float* alpha, const float* beta, int ldc, const int* map,
+                         const std::string& p, int layer,
+                         const half* preUvb = nullptr, const float4* preTokStats = nullptr) {
+  auto w = [&](const std::string& n) { return layer < 0 ? P(p + n) : PL(p + n, layer); };
+  const int C = 896;
+  const int I = layer < 0 ? dimP(p + "fc1/weight", 0) : dimP(p + "fc1/weight", 1);
+  const int Co = layer < 0 ? dimP(p + "fc3/weight", 0) : dimP(p + "fc3/weight", 1);
+  size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (4 * (size_t)I * 2));
+  if ((I & 7) != 0 || RN > chunk) {
+    half* sqh = scratch<half>("be2.dn.sqh", RN * C);
+    adaLnS2QK<half><<<(unsigned)((RN + 3) / 4), 128, 0, STREAM>>>(a, q, tAtom, gateA, ldgA, atomTok, atomPad,
+                                                                  sqh, RN, N, T, alpha, beta, ldc, map);
+    transitionHalf(nullptr, sqh, dq, RN, C, p, layer, false, false, 0);
+    return;
+  }
+  const half* w12 = interleavedSwigluMirror(w("fc1/weight"), w("fc2/weight"), I, C);
+  const half* w3 = halfMirror<half>(w("fc3/weight"), (size_t)Co * I);
+  const int Rtok = (int)RT + 2 * (T + 1);
+  const half* uvb = preUvb;
+  const float4* tokStats = preTokStats;
+  if (!uvb || !tokStats) {
+    half* uvbBuf = scratch<half>("be2.s2q.uvb", (size_t)Rtok * 768);
+    float4* tsBuf = scratch<float4>("be2.s2q.tstat", RT);
+    prepS2QTokK<<<(unsigned)((Rtok + 3) / 4), 128, 0, STREAM>>>(a, uvbBuf, tsBuf, (int)RT, T, alpha, beta, ldc);
+    uvb = uvbBuf;
+    tokStats = tsBuf;
+  }
+  half* sqhAtom = scratch<half>("be2.s2q.sqha", RN * 128);
+  float2* atomScale = scratch<float2>("be2.s2q.ascl", RN);
+  prepS2QAtomK<<<(unsigned)((RN + 3) / 4), 128, 0, STREAM>>>(q, tAtom, gateA, ldgA, atomTok, atomPad,
+                                                             tokStats, sqhAtom, atomScale, RN, N, T, alpha, beta, ldc, map);
+  half* h12Tok = scratch<half>("be2.s2q.h12t", (size_t)Rtok * 2 * I);
+  half* h12Atom = scratch<half>("be2.tr.h12", RN * 2 * I);
+  half* g = scratch<half>("be2.tr.g", RN * I);
+  const float one = 1.f, zero = 0.f;
+  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, 2 * I, Rtok, 768, &one, w12, CUDA_R_16F, C, uvb, CUDA_R_16F, 768,
+                  &zero, h12Tok, CUDA_R_16F, 2 * I, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, 2 * I, (int)RN, 128, &one, w12 + 768, CUDA_R_16F, C, sqhAtom, CUDA_R_16F, 128,
+                  &zero, h12Atom, CUDA_R_16F, 2 * I, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  size_t nBase = (size_t)N * (size_t)(I >> 3);
+  swigluS2QInterleaved8K<<<blocks(nBase), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(h12Atom),
+                                                            reinterpret_cast<const uint4*>(h12Tok),
+                                                            atomScale, atomTok, atomPad,
+                                                            reinterpret_cast<uint4*>(g), (int)(RN / N), N, T, (int)RT, I >> 3);
+  linearPre<half>(g, w3, dq, RN, I, Co, 0.f, 0, 64.f);
 }
 inline void transition(const float* x, float* out, size_t rows, int C, const std::string& p, int layer = -1,
                        bool residual = true, bool norm = true, int ldx = 0) {

@@ -37,8 +37,21 @@ void triIn256Form(const float* pair, const float* mask, const std::string& Tn, T
   size_t pp = rm.J ? rm.size : (size_t)np * np, smem = XROUNDS == 1 ? std::max((size_t)R * (C + 8) * 2, triIn256Smem<TA>(C, WARPS * MT)) : triIn256Smem<TA>(C, WARPS, XROUNDS);
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
-  half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
-  tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
+  static std::map<std::string, half*> wtCache;
+  static const bool wtHook = (FORGET_HOOKS.push_back([] { wtCache.clear(); }), true);
+  (void)wtHook;
+  half* wt = nullptr;
+  auto it = wtCache.find(Tn);
+  if (it != wtCache.end()) {
+    wt = it->second;
+  } else if (roomFor((size_t)512 << 20)) {
+    wt = wpool<half>(triInTileHalves(C));
+    tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
+    wtCache[Tn] = wt;
+  } else {
+    wt = scratch<half>("ftri.wt", triInTileHalves(C));
+    tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
+  }
   WITH_PAIR_T(                    // (the pair f32, or bf16 under PAIR16: see trunk.cuh's EF2_P16)
     static bool attr = false;
     if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS, false, PT, MT>), (int)smem); attr = true; }

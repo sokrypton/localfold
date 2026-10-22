@@ -1556,8 +1556,19 @@ template <class K> void smemAttrNamed(K kernel, size_t bytes, const char* name) 
   CK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
 }
 #define smemAttr(kernel, bytes) smemAttrNamed(kernel, (size_t)(bytes), #kernel)
-__global__ void toHalfK(const float* x, half* y, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]);
+__global__ void toHalfK(const float* __restrict__ x, half* __restrict__ y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)x & 15) == 0) && (((uintptr_t)y & 7) == 0)) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 v = __ldg(reinterpret_cast<const float4*>(x) + t);
+      half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+      uint2 u; u.x = *reinterpret_cast<uint32_t*>(&a); u.y = *reinterpret_cast<uint32_t*>(&b);
+      reinterpret_cast<uint2*>(y)[t] = u;
+    }
+    return;
+  }
+  if (t < n) y[t] = __float2half(x[t]);
 }
 inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / t); }
 
@@ -1971,9 +1982,19 @@ inline void warmSegmentHalf(int seg) {
       return;
     }
 }
-__global__ void toBf16WK(const float* in, __nv_bfloat16* out, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = __float2bfloat16(in[i]);
+__global__ void toBf16WK(const float* __restrict__ in, __nv_bfloat16* __restrict__ out, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 3) == 0 && (((uintptr_t)in & 15) == 0) && (((uintptr_t)out & 7) == 0)) {
+    size_t n4 = n >> 2;
+    if (t < n4) {
+      float4 v = __ldg(reinterpret_cast<const float4*>(in) + t);
+      __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y), b = __floats2bfloat162_rn(v.z, v.w);
+      uint2 u; u.x = *reinterpret_cast<uint32_t*>(&a); u.y = *reinterpret_cast<uint32_t*>(&b);
+      reinterpret_cast<uint2*>(out)[t] = u;
+    }
+    return;
+  }
+  if (t < n) out[t] = __float2bfloat16(in[t]);
 }
 // a weight's bf16 copy (a GEMM whose operands and output are bf16: a product accumulated straight into a bf16 pair)
 inline const __nv_bfloat16* Wbf(const std::string& k) {
@@ -1998,7 +2019,8 @@ inline const __nv_bfloat16* Wbf(const std::string& k) {
   CK(cudaStreamIsCapturing(STREAM, &cap));
   __nv_bfloat16* b = cap == cudaStreamCaptureStatusNone ? poolAllocT<__nv_bfloat16>(n) : dallocT<__nv_bfloat16>(n);
   if (cap == cudaStreamCaptureStatusNone) pooled.insert(b);
-  toBf16WK<<<blocks(n), 256, 0, STREAM>>>(f, b, n);
+  size_t nbf = ((n & 3) == 0 && (((uintptr_t)f & 15) == 0) && (((uintptr_t)b & 7) == 0)) ? (n >> 2) : n;
+  toBf16WK<<<blocks(nbf), 256, 0, STREAM>>>(f, b, n);
   return cache[k] = b;
 }
 inline const half* Wh(const std::string& k) {
@@ -2014,7 +2036,8 @@ inline const half* Wh(const std::string& k) {
   CK(cudaStreamIsCapturing(STREAM, &cap));
   half* h = cap == cudaStreamCaptureStatusNone ? poolAllocT<half>(n) : dallocT<half>(n);
   if (cap == cudaStreamCaptureStatusNone) WH_POOL.insert(h);
-  toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
+  size_t nh = ((n & 3) == 0 && (((uintptr_t)f & 15) == 0) && (((uintptr_t)h & 7) == 0)) ? (n >> 2) : n;
+  toHalfK<<<blocks(nh), 256, 0, STREAM>>>(f, h, n);
   // a concatenation's f32 copy given back at the next phase boundary (buildConcat makes it again if
   // asked) - AF3's peak 7.06 -> 6.57 GB at 262 tokens. Queued, not freed here: a cudaFree drains the
   // device, and one per weight was 27 ms of a cold 464 ms trunk

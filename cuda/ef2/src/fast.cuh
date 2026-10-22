@@ -5,77 +5,7 @@
 #include "ops.cuh"
 #include "../../af3/src/fusedtransition.cuh"     // cuda/af3's fused kernels, templated on the width
 
-inline cublasLtHandle_t LT = nullptr;
-// weights re-laid for --fast (one set a block) live for the process: carved out of 64 MiB chunks rather
-// than a cudaMalloc each - hundreds of them, each a host round trip, were most of a first pass's warm-up
-template <class T> T* wpool(size_t n) {
-  static char* chunk = nullptr; static size_t used = 0, have = 0;
-  size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
-  if (used + bytes > have) {
-    have = std::max<size_t>(bytes, (size_t)64 << 20);
-    CK(devMalloc(&chunk, have)); used = 0;
-  }
-  T* p = (T*)(chunk + used); used += bytes; return p;
-}
-struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool ok; };
-inline std::map<const float*, half*> BIAS_HALF;     // f16 copies of biases (forgotten with the derived weights)
-inline const bool BIAS_HALF_HOOK = (FORGET_HOOKS.push_back([] { BIAS_HALF.clear(); }), true);
-inline const void* biasFor(const float* bias, int n, bool asHalf) {
-  if (!bias || !asHalf) return bias;
-  auto& copies = BIAS_HALF;
-  auto it = copies.find(bias);
-  if (it != copies.end()) return it->second;
-  half* h = wpool<half>(n);
-  toHalfK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
-  return copies[bias] = h;
-}
-inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
-                   bool relu, float beta, int ldx = 0, int ldy = 0) {
-  if (ldx == 0) ldx = in;
-  if (ldy == 0) ldy = out;
-  if (!LT) CB(cublasLtCreate(&LT));
-  const void* bias = biasFor(biasF, out, yHalf);
-  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int>, LtPlan> plans;
-  int epi = bias ? (relu ? 2 : 1) : (relu ? 3 : 0);
-  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy);
-  auto it = plans.find(key);
-  if (it == plans.end()) {
-    LtPlan p{};
-    CB(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    cublasLtEpilogue_t e = epi == 1 ? CUBLASLT_EPILOGUE_BIAS : epi == 2 ? CUBLASLT_EPILOGUE_RELU_BIAS
-                         : epi == 3 ? CUBLASLT_EPILOGUE_RELU : CUBLASLT_EPILOGUE_DEFAULT;
-    CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
-    // (the bias takes the output's type: this cuBLASLt refuses an f32 bias beside an f16 output, so an
-    // f16 copy of it is handed over below)
-    // col-major: C^T (out x rows) = W^T (out x in) X^T (in x rows)
-    CB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, out, in, out));
-    CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, in, (uint64_t)rows, ldx));
-    CB(cublasLtMatrixLayoutCreate(&p.c, yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, ldy));
-    cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
-    size_t ws = 0;
-    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
-    // no split-K with a separate reduction: with a bias and a beta it ran as a second kernel over the
-    // whole output (cublasLt's epilogue globalKernel, ~5% of a 261-residue pass)
-    uint32_t noReduction = CUBLASLT_REDUCTION_SCHEME_NONE;
-    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &noReduction, sizeof(noReduction)));
-    cublasLtMatmulHeuristicResult_t res[1]; int got = 0;
-    // the bias pointer is part of the descriptor, set per call below; the heuristic needs it present
-    if (bias) CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(LT, p.op, p.a, p.b, p.c, p.c, pref, 1, res, &got);
-    if (hs != CUBLAS_STATUS_SUCCESS) {
-      fprintf(stderr, "cuBLASLt heuristic %d for %zu x %d x %d, f16 out %d, epilogue %d\n", (int)hs, rows, in, out, yHalf, epi);
-      exit(1);
-    }
-    CB(cublasLtMatmulPreferenceDestroy(pref));
-    if (got == 0) { fprintf(stderr, "no cuBLASLt algorithm for %zu x %d x %d\n", rows, in, out); exit(1); }
-    p.algo = res[0].algo; p.ok = true;
-    it = plans.emplace(key, p).first;
-  }
-  LtPlan& p = it->second;
-  if (bias) CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-  const float one = 1.f;
-  CB(cublasLtMatmul(LT, p.op, &one, Wt, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, nullptr, 0, STREAM));
-}
+// (ltGemm and wpool are defined in ops.cuh)
 
 // (the same at a width known at compile time: layerNormVK, elementwise.cuh)
 // any width, a warp a row (MSA Pairformer's 464-wide MSA track, which no vector width divides)
@@ -137,8 +67,7 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const float*
   else if (C == 464) layerNormRegHK<464><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else layerNormAnyHK<<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
-// a folding-bundle tensor's f16 copy (the file's half mirror)
-inline const half* Fh(const std::string& name) { return Wh("f/" + name); }
+// (Fh is defined in ops.cuh)
 
 inline bool FUSED = true;     // cuda/af3's fused triangle input (--no-fused: the unfused f16 path)
 // ...from 80 tokens only: below, its few row tiles each stream the whole 256 x 1280 weight and leave the

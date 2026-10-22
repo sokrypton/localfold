@@ -13,6 +13,7 @@ inline bool GEMM16 = false;
 // "f/<bundle name>" (the folding bundle) or "c/<bundle name>" (ESM-C); dims from "#k"
 inline size_t dimOf(const std::string& key, int k) { return (size_t)M.meta(key + "#" + std::to_string(k)); }
 inline const float* F(const std::string& name) { return W("f/" + name); }
+inline const half* Fh(const std::string& name) { return Wh("f/" + name); }
 // the shim ("lm/...") is per folding model and the tower is shared: a folding bundle that carries its own
 // shim is read first (the full ESMFold2's differs from ESMFold2-Fast's in all twelve tensors)
 inline std::string shimKey(const std::string& name) {
@@ -36,11 +37,90 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
 }
 
 // the same with an f16 weight (W's mirror) and f32 X and Y: X narrowed to f16, tensor cores, f32 accumulation
+inline cublasLtHandle_t LT = nullptr;
+template <class T> T* wpool(size_t n) {
+  static char* chunk = nullptr; static size_t used = 0, have = 0;
+  size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
+  if (used + bytes > have) {
+    have = std::max<size_t>(bytes, (size_t)64 << 20);
+    CK(devMalloc(&chunk, have)); used = 0;
+  }
+  T* p = (T*)(chunk + used); used += bytes; return p;
+}
+struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool ok; };
+inline std::map<const float*, half*> BIAS_HALF;     // f16 copies of biases (forgotten with the derived weights)
+inline const bool BIAS_HALF_HOOK = (FORGET_HOOKS.push_back([] { BIAS_HALF.clear(); }), true);
+inline const void* biasFor(const float* bias, int n, bool asHalf) {
+  if (!bias || !asHalf) return bias;
+  auto& copies = BIAS_HALF;
+  auto it = copies.find(bias);
+  if (it != copies.end()) return it->second;
+  half* h = wpool<half>(n);
+  toHalfK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
+  return copies[bias] = h;
+}
+inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
+                   bool relu, float beta, int ldx = 0, int ldy = 0) {
+  if (ldx == 0) ldx = in;
+  if (ldy == 0) ldy = out;
+  if (!LT) CB(cublasLtCreate(&LT));
+  const void* bias = biasFor(biasF, out, yHalf);
+  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int>, LtPlan> plans;
+  int epi = bias ? (relu ? 2 : 1) : (relu ? 3 : 0);
+  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy);
+  auto it = plans.find(key);
+  if (it == plans.end()) {
+    LtPlan p{};
+    CB(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasLtEpilogue_t e = epi == 1 ? CUBLASLT_EPILOGUE_BIAS : epi == 2 ? CUBLASLT_EPILOGUE_RELU_BIAS
+                         : epi == 3 ? CUBLASLT_EPILOGUE_RELU : CUBLASLT_EPILOGUE_DEFAULT;
+    CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
+    CB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, out, in, out));
+    CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, in, (uint64_t)rows, ldx));
+    CB(cublasLtMatrixLayoutCreate(&p.c, yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, ldy));
+    cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
+    size_t ws = 0;
+    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+    uint32_t noReduction = CUBLASLT_REDUCTION_SCHEME_NONE;
+    CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &noReduction, sizeof(noReduction)));
+    cublasLtMatmulHeuristicResult_t res[1]; int got = 0;
+    if (bias) CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(LT, p.op, p.a, p.b, p.c, p.c, pref, 1, res, &got);
+    if (hs != CUBLAS_STATUS_SUCCESS) {
+      fprintf(stderr, "cuBLASLt heuristic %d for %zu x %d x %d, f16 out %d, epilogue %d\n", (int)hs, rows, in, out, yHalf, epi);
+      exit(1);
+    }
+    CB(cublasLtMatmulPreferenceDestroy(pref));
+    if (got == 0) { fprintf(stderr, "no cuBLASLt algorithm for %zu x %d x %d\n", rows, in, out); exit(1); }
+    p.algo = res[0].algo; p.ok = true;
+    it = plans.emplace(key, p).first;
+  }
+  LtPlan& p = it->second;
+  if (bias) CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+  const float one = 1.f;
+  CB(cublasLtMatmul(LT, p.op, &one, Wt, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, nullptr, 0, STREAM));
+}
 inline void gemmHPre(const half* xh, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
-                     float alpha = 1.f) {
+                     float alpha = 1.f, int ldx = 0, int ldy = 0) {
+  if (alpha == 1.f && (out & 7) == 0 && (in & 7) == 0) {
+    ltGemm(xh, Wt, Y, false, rows, in, out, nullptr, false, beta, ldx, ldy);
+    return;
+  }
   const float one = alpha;
-  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta,
-                  Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F,
+                  ldx ? ldx : in, &beta, Y, CUDA_R_32F, ldy ? ldy : out, CUBLAS_COMPUTE_32F,
+                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+inline void gemmHPreOutH(const half* xh, const half* Wt, half* Y, size_t rows, int in, int out, float beta = 0.f,
+                         float alpha = 1.f, int ldx = 0, int ldy = 0) {
+  if (alpha == 1.f && (out & 7) == 0 && (in & 7) == 0) {
+    ltGemm(xh, Wt, Y, true, rows, in, out, nullptr, false, beta, ldx, ldy);
+    return;
+  }
+  const float one = alpha;
+  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F,
+                  ldx ? ldx : in, &beta, Y, CUDA_R_16F, ldy ? ldy : out, CUBLAS_COMPUTE_32F,
+                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
                   float alpha = 1.f) {

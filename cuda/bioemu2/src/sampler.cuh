@@ -89,17 +89,6 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
   std::vector<float> mask(N);
   { const int* m = M.i("atom_mask"); for (int a = 0; a < N; ++a) mask[a] = m[a] ? 1.f : 0.f; }
   const std::vector<float> levels = schedule(s);
-  std::vector<std::mt19937_64> rng;
-  for (int p = 0; p < n; ++p) rng.emplace_back(seed * 1000003ull + (uint64_t)p);
-  std::normal_distribution<double> Nd(0, 1);
-  std::vector<std::vector<float>> x(n, std::vector<float>((size_t)N * 3)), den(n, std::vector<float>((size_t)N * 3));
-  for (int p = 0; p < n; ++p) for (auto& v : x[p]) v = (float)(levels[0] * Nd(rng[p]));
-  const bool comp = !companions.empty();
-  const size_t per = (size_t)N * 3;
-  // the particles go through the denoiser together, `batch` at a time (all of them where there is the room)
-  const int batch = std::max(1, std::min(n, BATCH_SAMPLES));
-  float* dx = dalloc(per * batch); float* dd = dalloc(per * batch); float* dc = comp ? dalloc(per * batch) : nullptr;
-  std::vector<float> hx(per * batch), hd(per * batch), hc(comp ? per * batch : 0);
   const int steps = (int)levels.size() - 1;
   std::vector<float> hTEmb(steps);
   for (int i = 0; i < steps; ++i) {
@@ -108,43 +97,94 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
     const double t = sigma * (1 + gamma);
     hTEmb[i] = 0.25f * logf((float)t / SIGMA_DATA);
   }
+  static const float* cachedSc0 = nullptr;
+  static int cachedT = 0, cachedLayers = 0;
+  static float cachedDynGate = -1.f;
+  static std::vector<float> cachedTEmb;
+  const bool sameCond = (steps > 0 && cachedSc0 == d.sc0 && cachedT == d.T &&
+                         cachedLayers == d.layers && cachedDynGate == d.dynGate && cachedTEmb == hTEmb);
+  float* cndAll = sameCond ? scratch<float>("be2.sc.cndAll", (size_t)steps * (d.T + 1) * 768)
+                           : precomputeAllSingleCond(d, hTEmb);
   const int Ca = 128, Dt = 768, Dc = Dt + Ca;
-  int condBatch = std::min(20, std::max(1, steps));
+  int condBatch = std::max(1, steps);
   const int rowsT1 = condBatch == 1 ? d.T : (d.T + 1);
   const size_t condAStride = (size_t)(d.T + 1) * (6 * Ca);
   const size_t condTStride = (size_t)rowsT1 * (6 * Dt);
   const size_t cqcStride   = (size_t)(d.T + 1) * (2 * Dc + Ca);
   const size_t cscStride   = (size_t)rowsT1 * (2 * Dc + Dt);
   const size_t perStepCondBytes = (size_t)d.layers * (condAStride + condTStride + cqcStride + cscStride) * 4;
-  while (condBatch > 1 && !roomFor((size_t)condBatch * perStepCondBytes)) condBatch >>= 1;
+  while (condBatch > 1 && !roomFor((size_t)condBatch * perStepCondBytes + (1ull << 30))) condBatch >>= 1;
   float* condAAll = scratch<float>("be2.dn.condA", (size_t)d.layers * condBatch * condAStride);
   float* condTAll = scratch<float>("be2.dn.condT", (size_t)d.layers * condBatch * condTStride);
   float* cqcAll   = scratch<float>("be2.dn.cqc",   (size_t)d.layers * condBatch * cqcStride);
   float* cscAll   = scratch<float>("be2.dn.csc",   (size_t)d.layers * condBatch * cscStride);
-  static const float* cachedSc0 = nullptr;
-  static int cachedT = 0, cachedLayers = 0;
-  static float cachedDynGate = -1.f;
-  static std::vector<float> cachedTEmb;
-  const bool reuseAllCond = (condBatch == steps && steps > 0 && cachedSc0 == d.sc0 && cachedT == d.T &&
-                             cachedLayers == d.layers && cachedDynGate == d.dynGate && cachedTEmb == hTEmb);
-  float* cndAll = reuseAllCond ? nullptr : precomputeAllSingleCond(d, hTEmb);
+  const bool reuseAllCond = (condBatch == steps && sameCond);
   int curCondBase = reuseAllCond ? 0 : -1;
   int curCondB = reuseAllCond ? steps : 0;
-  if (condBatch == steps && !reuseAllCond && steps > 0) {
-    computeStepCondBatch(d, cndAll, steps, condAAll, condTAll, cqcAll, cscAll);
+  if (steps > 0 && !reuseAllCond) {
     curCondBase = 0;
-    curCondB = steps;
-    cachedSc0 = d.sc0;
-    cachedT = d.T;
-    cachedLayers = d.layers;
-    cachedDynGate = d.dynGate;
-    cachedTEmb = hTEmb;
+    curCondB = std::min(condBatch, steps);
+    computeStepCondBatch(d, cndAll, curCondB, condAAll, condTAll, cqcAll, cscAll);
+    if (condBatch == steps) {
+      cachedSc0 = d.sc0;
+      cachedT = d.T;
+      cachedLayers = d.layers;
+      cachedDynGate = d.dynGate;
+      cachedTEmb = hTEmb;
+    }
   }
+  const bool comp = !companions.empty();
+  const size_t per = (size_t)N * 3;
+  // the particles go through the denoiser together, `batch` at a time (all of them where there is the room)
+  const int batch = std::max(1, std::min(n, BATCH_SAMPLES));
+  float* dx = scratch<float>("be2.smp.dx", per * batch);
+  float* dd = scratch<float>("be2.smp.dd", per * batch);
+  float* dc = comp ? scratch<float>("be2.smp.dc", per * batch) : nullptr;
+  static float* pinnedBuf = nullptr;
+  static size_t pinnedCap = 0;
+  size_t needPinned = per * batch * (comp ? 3 : 2);
+  if (needPinned > pinnedCap) {
+    if (pinnedBuf) CK(cudaFreeHost(pinnedBuf));
+    CK(cudaHostAlloc(&pinnedBuf, needPinned * sizeof(float), cudaHostAllocDefault));
+    pinnedCap = needPinned;
+  }
+  float* hx = pinnedBuf;
+  float* hd = pinnedBuf + per * batch;
+  float* hc = comp ? (pinnedBuf + 2 * per * batch) : nullptr;
+
+  std::vector<std::mt19937_64> rng;
+  for (int p = 0; p < n; ++p) rng.emplace_back(seed * 1000003ull + (uint64_t)p);
+  std::normal_distribution<double> Nd(0, 1);
+  std::vector<std::vector<float>> x(n, std::vector<float>((size_t)N * 3)), den(n, std::vector<float>((size_t)N * 3));
+  for (int p = 0; p < n; ++p) for (auto& v : x[p]) v = (float)(levels[0] * Nd(rng[p]));
+
+  std::vector<std::array<double, 9>> nextR(n);
+  std::vector<std::array<double, 3>> nextSh(n);
+  std::vector<std::vector<float>> nextNoise(n, std::vector<float>(per));
+  bool compReady = false;
+  auto genStepRng = [&](int stepIdx) {
+    const double sigma = levels[stepIdx], next = levels[stepIdx + 1];
+    const double gamma = next > s.gammaMin ? s.gamma0 : 0;
+    const double t = sigma * (1 + gamma);
+    const double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
+    const bool preComp = comp && !(hook && hook->resample);
+    for (int p = 0; p < n; ++p) {
+      randomRigid(rng[p], nextR[p].data(), nextSh[p].data());
+      float* np = nextNoise[p].data();
+      for (int a = 0; a < N * 3; ++a) np[a] = (float)(eps * Nd(rng[p]));
+      if (preComp) {
+        augment(companions[p], mask, nextR[p].data(), nextSh[p].data());
+        if (batch >= n) std::copy(companions[p].begin(), companions[p].end(), hc + per * p);
+      }
+    }
+    compReady = preComp;
+  };
+  if (steps > 0) genStepRng(0);
+
   for (int i = 0; i < steps; ++i) {
     const double sigma = levels[i], next = levels[i + 1];
     const double gamma = next > s.gammaMin ? s.gamma0 : 0;
     const double t = sigma * (1 + gamma);
-    const double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
     if (i < curCondBase || i >= curCondBase + curCondB) {
       curCondBase = i;
       curCondB = std::min(condBatch, steps - i);
@@ -153,24 +193,25 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
     }
     const StepCond stepCond{condAAll, condTAll, cqcAll, cscAll, curCondB, i - curCondBase};
     for (int p = 0; p < n; ++p) {
-      double R[9], sh[3];
-      randomRigid(rng[p], R, sh);
-      augment(x[p], mask, R, sh);
-      if (comp) augment(companions[p], mask, R, sh);
-      for (int a = 0; a < N * 3; ++a) x[p][a] += (float)(eps * Nd(rng[p]));
+      augment(x[p], mask, nextR[p].data(), nextSh[p].data());
+      if (comp && !compReady) augment(companions[p], mask, nextR[p].data(), nextSh[p].data());
+      const float* np = nextNoise[p].data();
+      for (int a = 0; a < N * 3; ++a) x[p][a] += np[a];
     }
     for (int p0 = 0; p0 < n; p0 += batch) {
       const int b = std::min(batch, n - p0);
       for (int k = 0; k < b; ++k) {
-        std::copy(x[p0 + k].begin(), x[p0 + k].end(), hx.begin() + per * k);
-        if (comp) std::copy(companions[p0 + k].begin(), companions[p0 + k].end(), hc.begin() + per * k);
+        std::copy(x[p0 + k].begin(), x[p0 + k].end(), hx + per * k);
+        if (comp && !(compReady && batch >= n))
+          std::copy(companions[p0 + k].begin(), companions[p0 + k].end(), hc + per * k);
       }
-      CK(cudaMemcpyAsync(dx, hx.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
-      if (comp) CK(cudaMemcpyAsync(dc, hc.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
+      CK(cudaMemcpyAsync(dx, hx, per * b * 4, cudaMemcpyHostToDevice, STREAM));
+      if (comp) CK(cudaMemcpyAsync(dc, hc, per * b * 4, cudaMemcpyHostToDevice, STREAM));
       denoise(d, dx, (float)t, dd, dc, b, &stepCond);
-      CK(cudaMemcpyAsync(hd.data(), dd, per * b * 4, cudaMemcpyDeviceToHost, STREAM));
+      CK(cudaMemcpyAsync(hd, dd, per * b * 4, cudaMemcpyDeviceToHost, STREAM));
+      if (p0 + batch >= n && i + 1 < steps) genStepRng(i + 1);
       CK(cudaStreamSynchronize(STREAM));
-      for (int k = 0; k < b; ++k) std::copy(hd.begin() + per * k, hd.begin() + per * (k + 1), den[p0 + k].begin());
+      for (int k = 0; k < b; ++k) std::copy(hd + per * k, hd + per * (k + 1), den[p0 + k].begin());
     }
     if (hook && hook->guide) hook->guide(i, next, t, den);
     for (int p = 0; p < n; ++p) {
@@ -181,7 +222,6 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
     }
     if (hook && hook->resample) hook->resample(i, x, companions);
   }
-  CK(cudaFree(dx)); CK(cudaFree(dd)); if (dc) CK(cudaFree(dc));
   if (centreEnd) for (auto& v : x) centreMasked(v, mask);
   else for (auto& v : x) for (int a = 0; a < N; ++a) if (!mask[a]) v[a * 3] = v[a * 3 + 1] = v[a * 3 + 2] = 0.f;
   return x;

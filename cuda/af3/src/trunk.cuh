@@ -1000,13 +1000,13 @@ inline const int OPM_SHALLOW = getenv("LOCALFOLD_OPM_SHALLOW") ? atoi(getenv("LO
 // T: the projections and the contraction's inputs (f16 on the fast path, tensor cores, f32
 // accumulation); the contraction's output, the mask normaliser and the residual stay f32.
 template <class T>
-void outerProductMean(Trunk& t, const std::string& pre) {
+void outerProductMean(Trunk& t, const std::string& pre, T* lnGiven = nullptr) {
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   const int qlo = sharded(t) ? t.shardLo : 0, qhi = sharded(t) ? t.shardLo + t.shardRows : n;   // (the rows written)
   int O = (int)M.meta(pre + ".outerChannels");
   size_t rows = (size_t)S * n;
-  T* ln = scratch<T>("opm.ln", rows * Cm);
-  layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+  T* ln = lnGiven ? lnGiven : scratch<T>("opm.ln", rows * Cm);
+  if (!lnGiven) layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
   T* lr = scratch<T>("opm.lr", 2 * rows * O); T* L = lr; T* R = lr + rows * O;
   {
     std::string w = concatColumns(pre + ".lr~stack", 1, {{pre + ".leftProjection", Cm * O, false},
@@ -1301,7 +1301,7 @@ __global__ void msaFromHeadsV(const T* o, const T* gate, T* out, int S, int n, i
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       float2 of = __half22float2(op2[k]), gf = __half22float2(gp2[k]);
-      rp2[k] = __floats2half2_rn(of.x * (1.f / (1.f + expf(-gf.x))), of.y * (1.f / (1.f + expf(-gf.y))));
+      rp2[k] = __floats2half2_rn(of.x * sigmH(gf.x), of.y * sigmH(gf.y));
     }
   } else {
     const T* op = reinterpret_cast<const T*>(&ov); const T* gp = reinterpret_cast<const T*>(&gv);
@@ -1441,7 +1441,7 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
 // msa + transition(msa) + pwa(msa); af3-any-model 7cc3165) - run in place once the whole MSA's LayerNorm is taken,
 // before any of the averaging is added
 template <class T>
-void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelTransition = "") {
+void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelTransition = "", T* lnGiven = nullptr) {
   if (sharded(t)) {
     if (!parallelTransition.empty()) { fprintf(stderr, "a sharded pair: not chai-1's MSA update\n"); exit(1); }
     msaAttentionSharded<T>(t, pre); return;
@@ -1449,8 +1449,8 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int heads = (int)M.meta(pre + ".heads"), d = (int)M.meta(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
-  T* ln = scratch<T>("msaatt.ln", rows * Cm);
-  layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  T* ln = lnGiven ? lnGiven : scratch<T>("msaatt.ln", rows * Cm);
+  if (!lnGiven) layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
   if (!parallelTransition.empty()) transition<T>(t.msa, rows, Cm, 4, parallelTransition);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
   bool headMajor = false;
@@ -1543,8 +1543,17 @@ void msaBlock(Trunk& t, int k) {
   }
   // the outer product off the pre-update MSA (AF3), or off the updated one (OpenDDE, boltz2)
   bool updateFirst = M.flag("trunk.dialect.msaUpdateBeforeOuterProduct");
-  if (!updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
-  msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
+  T *lnOpm = nullptr, *lnAtt = nullptr;
+  if (!updateFirst && !sharded(t) && !shortPair((size_t)t.n * t.n, t.C)) {
+    size_t rows = (size_t)t.S * t.n;
+    lnOpm = scratch<T>("opm.ln", rows * t.Cm);
+    lnAtt = scratch<T>("msaatt.ln", rows * t.Cm);
+    layerNormDual2<float, T>(t.msa, lnOpm, lnAtt, rows, t.Cm,
+                             B + ".outerProductMean.layerNormInputScale", B + ".outerProductMean.layerNormInputOffset",
+                             B + ".msaAttention1.actNormScale", B + ".msaAttention1.actNormOffset");
+  }
+  if (!updateFirst) { outerProductMean<T>(t, B + ".outerProductMean", lnOpm); stage("msa.opm"); }
+  msaAttention<T>(t, B + ".msaAttention1", "", lnAtt); stage("msa.attention");
   transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
   if (updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   PAIR16 = t.p16;
@@ -1562,7 +1571,7 @@ __global__ void logitsLayoutK(const float* flat, float* out, size_t pairs, int h
   if (t < pairs * heads) out[t] = flat[(t % pairs) * heads + t / pairs];
 }
 template <class T, int MAX_K = 8>
-__global__ void __launch_bounds__(256, MAX_K <= 4 ? 8 : MAX_K <= 12 ? 6 : 4)
+__global__ void __launch_bounds__(256, MAX_K <= 4 ? 8 : MAX_K <= 8 ? 6 : 4)
 singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
                    const float* __restrict__ seqMask, T* __restrict__ P,
                    size_t totalRows, int n, float scale, int ld = 0) {
@@ -1577,29 +1586,26 @@ singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ p
 #pragma unroll
   for (int k = 0; k < MAX_K; ++k) {
     int j = lane + k * 32;
-    if (j < n) {
-      float v = __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f);
-      rv[k] = v;
-      mx = fmaxf(mx, v);
-    }
+    float v = j < n ? __ldg(L + j) * scale + __ldg(B + j) + 1e9f * (__ldg(seqMask + j) - 1.f) : -INFINITY;
+    rv[k] = v;
+    mx = fmaxf(mx, v);
   }
   for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
   float sum = 0.f;
 #pragma unroll
   for (int k = 0; k < MAX_K; ++k) {
     int j = lane + k * 32;
-    if (j < n) {
-      float e = expf(rv[k] - mx);
-      rv[k] = e;
-      sum += e;
-    }
+    float e = j < n ? expf(rv[k] - mx) : 0.f;
+    rv[k] = e;
+    sum += e;
   }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
   float inv = 1.f / sum;
+  T* Pr = P + rowId * ld;
 #pragma unroll
   for (int k = 0; k < MAX_K; ++k) {
     int j = lane + k * 32;
-    if (j < ld) P[rowId * ld + j] = j < n ? fromF<T>(rv[k] * inv) : fromF<T>(0.f);
+    if (j < ld) Pr[j] = fromF<T>(rv[k] * inv);
   }
 }
 
@@ -1699,6 +1705,10 @@ inline void launchSingleSoftmax(const float* logits, const float* pairLogits, co
     singleSoftmaxWarpK<T, 4><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
   else if (maxCol <= 256)
     singleSoftmaxWarpK<T, 8><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+  else if (maxCol <= 384)
+    singleSoftmaxWarpK<T, 12><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
+  else if (maxCol <= 512)
+    singleSoftmaxWarpK<T, 16><<<g, 256, 0, STREAM>>>(logits, pairLogits, seqMask, P, totalRows, n, scale, ld);
   else
     singleSoftmaxK<T><<<(unsigned)totalRows, 128, (n > 512 && n <= 4096 ? n * sizeof(float) : 0), STREAM>>>(logits, pairLogits, seqMask, P, n, scale, ld);
 }
@@ -1745,7 +1755,7 @@ __global__ void gateK(T* o, const T* qkvg, int n, int Wd, float gateBias = 0.f) 
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         float2 x = __half22float2(o2[k]), g = __half22float2(g2[k]);
-        o2[k] = __floats2half2_rn(x.x * sigm(g.x + gateBias), x.y * sigm(g.y + gateBias));
+        o2[k] = __floats2half2_rn(x.x * sigmH(g.x + gateBias), x.y * sigmH(g.y + gateBias));
       }
       reinterpret_cast<uint4*>(o)[idx] = ov;
       return;

@@ -286,8 +286,21 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   // trunk at 988 tokens 2556 -> 2485 ms (-2.8%), at 494 601 -> 598, at 261 194 -> 193, byte-identical on all three
   const size_t budget = roomFor((size_t)1 << 30, {"ftr.g", "ftr.gbf"}) ? (size_t)1 << 30 : (size_t)64 << 20;
   size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), budget / (2 * (size_t)I));
-  half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
-  tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
+  static std::map<std::string, half*> w1tCache;
+  static const bool w1tHook = (FORGET_HOOKS.push_back([] { w1tCache.clear(); }), true);
+  (void)w1tHook;
+  half* w1t = nullptr;
+  auto it = w1tCache.find(Tn);
+  if (it != w1tCache.end()) {
+    w1t = it->second;
+  } else if (roomFor((size_t)512 << 20)) {
+    w1t = wpool<half>((size_t)2 * C * I);
+    tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
+    w1tCache[Tn] = w1t;
+  } else {
+    w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
+    tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
+  }
   if (PAIR16) {
     // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the pair
     using B16 = __nv_bfloat16;
@@ -719,8 +732,14 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
         ef2ToBf16K<<<blocks(r * C), 256, 0, STREAM>>>(zc, z16 + r0 * C, r * C);
         continue;
       }
-      layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
-      gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
+      if (FAST && !check) {
+        half* xnh = reinterpret_cast<half*>(xn);
+        layerNorm<half>(z + r0 * C, xnh, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        gemmHPre(xnh, Fh("recycle/projection"), z + r0 * C, r, C, C);
+      } else {
+        layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
+      }
     }
     if (zInitP && EF2_Z16) { fprintf(stderr, "a bf16 trunk pair takes the streamed z_init\n"); exit(1); }
     if (zInitP) addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);

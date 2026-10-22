@@ -189,6 +189,7 @@ __global__ void adaLnCombineK(const float* xn, const float* scale, const float* 
 __global__ void mulSigmoidK(float* x, const float* g, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] *= sigm(g[i]);
 }
+template <bool SIGM = false>
 __global__ void addBiasRowsK(float* __restrict__ y, const float* __restrict__ b, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((C & 3) == 0 && (((uintptr_t)y | (uintptr_t)b) & 15) == 0) {
@@ -198,11 +199,17 @@ __global__ void addBiasRowsK(float* __restrict__ y, const float* __restrict__ b,
       int c = ((c4 & (c4 - 1)) == 0) ? (int)(i & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)i % (unsigned)c4) : (int)(i % c4));
       float4 yv = reinterpret_cast<const float4*>(y)[i];
       float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
-      reinterpret_cast<float4*>(y)[i] = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+      float4 r = make_float4(yv.x + bv.x, yv.y + bv.y, yv.z + bv.z, yv.w + bv.w);
+      if constexpr (SIGM) r = make_float4(sigm(r.x), sigm(r.y), sigm(r.z), sigm(r.w));
+      reinterpret_cast<float4*>(y)[i] = r;
     }
     return;
   }
-  if (i < rows * C) y[i] += __ldg(b + i % C);
+  if (i < rows * C) {
+    float r = y[i] + __ldg(b + i % C);
+    if constexpr (SIGM) r = sigm(r);
+    y[i] = r;
+  }
 }
 // sigmoid(cond' W + b) * LN(x) + cond' Wshift, cond' = LN_scale_only(cond)
 inline void adaptiveLayerNorm(const float* x, const float* cond, float* out, size_t rows, int C, int condC,
@@ -295,7 +302,7 @@ inline void adaCond(const float* cond, size_t rows, int C, int condC, const std:
   float* cn = scratch<float>("ada.cn", rows * condC);
   layerNormSlow(cond, cn, rows, condC, W(w + "SingleCondLayerNormScale"), nullptr);
   linear<float, float>(cn, scale, rows, condC, C, w + "SingleCondScaleWeights");
-  addBiasRowsK<<<blocks((C & 3) == 0 ? (rows * (C >> 2)) : (rows * C)), 256, 0, STREAM>>>(scale, W(w + "SingleCondScaleBias"), rows, C);
+  addBiasRowsK<true><<<blocks((C & 3) == 0 ? (rows * (C >> 2)) : (rows * C)), 256, 0, STREAM>>>(scale, W(w + "SingleCondScaleBias"), rows, C);
   linear<float, float>(cn, shift, rows, condC, C, w + "SingleCondBias");
 }
 // The key side's scale and shift are per ATOM (a key row is a gathered query row), so they are
@@ -312,9 +319,9 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   adaCond(qCond, qRows, C, C, B + ".k", c.kScale, c.kShift);
   adaCond(qCond, qRows, C, C, B + ".ffw", c.ffwScale, c.ffwShift);
   linear<float, float>(qCond, c.zg, qRows, C, C, B + ".AdaptiveZeroCondWeights");
-  addBiasRowsK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.zg, W(B + ".AdaptiveZeroCondBias"), qRows, C);
+  addBiasRowsK<true><<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.zg, W(B + ".AdaptiveZeroCondBias"), qRows, C);
   linear<float, float>(qCond, c.tg, qRows, C, C, B + ".ffwAdaptiveZeroCondWeights");
-  addBiasRowsK<<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
+  addBiasRowsK<true><<<blocks((C & 3) == 0 ? (qRows * (C >> 2)) : (qRows * C)), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
   c.pairLogits = pairLogits;
   c.chained = M.flag(B + ".chainedAtomLayerNorm");
   return c;
@@ -335,7 +342,7 @@ __device__ __forceinline__ void store4(half* p, float a, float b, float c, float
 
 // sigmoid(scale) * LN(x) + shift, LN without affine (and optional act += y * sigmoid(gate) after reading x)
 template <class TO, bool RAW = false, class TY = float>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(128, 12)
 adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float* __restrict__ shift,
        TO* __restrict__ out, size_t rows, int C, size_t period,
        float* __restrict__ act = nullptr, const TY* __restrict__ y = nullptr, const float* __restrict__ gate = nullptr) {
@@ -347,21 +354,20 @@ adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float
   if (C == 128) {
     int c0 = lane * 4;
     float4 xv = __ldg(reinterpret_cast<const float4*>(xr + c0));
+    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0));
+    float4 sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
     float s = xv.x + xv.y + xv.z + xv.w;
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s * (1.f / 128.f);
     float v = (xv.x - mean) * (xv.x - mean) + (xv.y - mean) * (xv.y - mean) + (xv.z - mean) * (xv.z - mean) + (xv.w - mean) * (xv.w - mean);
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
     float inv = rsqrtf(v * (1.f / 128.f) + ADA_EPS);
-    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0));
-    float4 sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
-    sc.x = ADA(sc.x); sc.y = ADA(sc.y); sc.z = ADA(sc.z); sc.w = ADA(sc.w);
     store4(out + row * 128 + c0, sc.x * ((xv.x - mean) * inv) + sh.x, sc.y * ((xv.y - mean) * inv) + sh.y,
            sc.z * ((xv.z - mean) * inv) + sh.z, sc.w * ((xv.w - mean) * inv) + sh.w);
     if (act) {
       float4 yy = load4(y + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(gate + pr + c0));
-      *(float4*)(act + row * 128 + c0) = make_float4(xv.x + yy.x * sigm(g.x), xv.y + yy.y * sigm(g.y),
-                                                     xv.z + yy.z * sigm(g.z), xv.w + yy.w * sigm(g.w));
+      *(float4*)(act + row * 128 + c0) = make_float4(xv.x + yy.x * g.x, xv.y + yy.y * g.y,
+                                                     xv.z + yy.z * g.z, xv.w + yy.w * g.w);
     }
     return;
   }
@@ -374,19 +380,19 @@ adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float
   float inv = rsqrtf(v / C + ADA_EPS);
   for (int c = lane; c < C; c += 32) {
     size_t k = pr + c; float xv = xr[c];
-    out[row * C + c] = fromF<TO>(ADA(scale[k]) * ((xv - mean) * inv) + shift[k]);
-    if (act) act[row * C + c] = xv + toF(y[row * C + c]) * sigm(gate[k]);
+    out[row * C + c] = fromF<TO>(scale[k] * ((xv - mean) * inv) + shift[k]);
+    if (act) act[row * C + c] = xv + toF(y[row * C + c]) * gate[k];
   }
 }
 template <class TO, class TY = float>
 inline void adaLn(const float* x, const float* scale, const float* shift, TO* out, size_t rows, int C,
                   size_t period, float* act = nullptr, const TY* y = nullptr, const float* gate = nullptr) {
-  if (ADA_RAW) adaLnK<TO, true, TY><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period, act, y, gate);
-  else adaLnK<TO, false, TY><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period, act, y, gate);
+  if (ADA_RAW) adaLnK<TO, true, TY><<<(unsigned)((rows + 3) / 4), 128, 0, STREAM>>>(x, scale, shift, out, rows, C, period, act, y, gate);
+  else adaLnK<TO, false, TY><<<(unsigned)((rows + 3) / 4), 128, 0, STREAM>>>(x, scale, shift, out, rows, C, period, act, y, gate);
 }
 // Chained adaptive LN (o1 = adaLN_q(x), o2 = adaLN_k(adaLN_q_f32(x))) in one pass for C == 128
 template <class TO, bool RAW = false, class TY = TO>
-__global__ void __launch_bounds__(256, 8)
+__global__ void __launch_bounds__(128, 12)
 adaLnChained128K(float* __restrict__ x, const float* __restrict__ s1, const float* __restrict__ h1,
                  const float* __restrict__ s2, const float* __restrict__ h2,
                  TO* __restrict__ o1, TO* __restrict__ o2, size_t rows, size_t period,
@@ -401,33 +407,31 @@ adaLnChained128K(float* __restrict__ x, const float* __restrict__ s1, const floa
   float4 v = *(const float4*)(x + row * 128 + c0);
   if (prevY) {
     float4 yy = load4(prevY + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(prevGate + k));
-    v.x += yy.x * sigm(g.x); v.y += yy.y * sigm(g.y); v.z += yy.z * sigm(g.z); v.w += yy.w * sigm(g.w);
+    v.x += yy.x * g.x; v.y += yy.y * g.y; v.z += yy.z * g.z; v.w += yy.w * g.w;
     if (rowMask) { float m = __ldg(rowMask + pr); v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
     *(float4*)(x + row * 128 + c0) = v;
   }
+  float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
   float s = v.x + v.y + v.z + v.w;
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s * (1.f / 128.f), q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
   for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
   float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
-  float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
-  a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
   float q0 = a.x * ((v.x - mean) * inv) + b.x, q1 = a.y * ((v.y - mean) * inv) + b.y,
         q2 = a.z * ((v.z - mean) * inv) + b.z, q3 = a.w * ((v.w - mean) * inv) + b.w;
   store4(o1 + row * 128 + c0, q0, q1, q2, q3);
+  float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
   float sq = q0 + q1 + q2 + q3;
   for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
   float mean2 = sq * (1.f / 128.f), v2 = (q0 - mean2) * (q0 - mean2) + (q1 - mean2) * (q1 - mean2) + (q2 - mean2) * (q2 - mean2) + (q3 - mean2) * (q3 - mean2);
   for (int o = 16; o; o >>= 1) v2 += __shfl_xor_sync(~0u, v2, o);
   float inv2 = rsqrtf(v2 * (1.f / 128.f) + ADA_EPS);
-  float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
-  c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
   store4(o2 + row * 128 + c0, c2.x * ((q0 - mean2) * inv2) + d.x, c2.y * ((q1 - mean2) * inv2) + d.y,
          c2.z * ((q2 - mean2) * inv2) + d.z, c2.w * ((q3 - mean2) * inv2) + d.w);
 }
 
 template <class TO, bool RAW = false, class TY = TO>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(128, 12)
 adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __restrict__ h1,
         const float* __restrict__ s2, const float* __restrict__ h2, TO* __restrict__ o1, TO* __restrict__ o2,
         size_t rows, int C, size_t period,
@@ -443,21 +447,19 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
     float4 v = *(const float4*)(xr + lane * 4);
     if (prevY) {
       float4 yy = load4(prevY + row * 128 + lane * 4), g = __ldg(reinterpret_cast<const float4*>(prevGate + k));
-      v.x += yy.x * sigm(g.x); v.y += yy.y * sigm(g.y); v.z += yy.z * sigm(g.z); v.w += yy.w * sigm(g.w);
+      v.x += yy.x * g.x; v.y += yy.y * g.y; v.z += yy.z * g.z; v.w += yy.w * g.w;
       if (rowMask) { float m = __ldg(rowMask + pr); v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
       *(float4*)(xr + lane * 4) = v;
     }
+    float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
+    float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
     float sum = v.x + v.y + v.z + v.w;
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum * (1.f / 128.f), q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
     float n0 = (v.x - mean) * inv, n1 = (v.y - mean) * inv, n2 = (v.z - mean) * inv, n3 = (v.w - mean) * inv;
-    float4 a = __ldg(reinterpret_cast<const float4*>(s1 + k)), b = __ldg(reinterpret_cast<const float4*>(h1 + k));
-    a.x = ADA(a.x); a.y = ADA(a.y); a.z = ADA(a.z); a.w = ADA(a.w);
     store4(o1 + row * 128 + lane * 4, a.x * n0 + b.x, a.y * n1 + b.y, a.z * n2 + b.z, a.w * n3 + b.w);
-    float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + k)), d = __ldg(reinterpret_cast<const float4*>(h2 + k));
-    c2.x = ADA(c2.x); c2.y = ADA(c2.y); c2.z = ADA(c2.z); c2.w = ADA(c2.w);
     store4(o2 + row * 128 + lane * 4, c2.x * n0 + d.x, c2.y * n1 + d.y, c2.z * n2 + d.z, c2.w * n3 + d.w);
     return;
   }
@@ -465,7 +467,7 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
   for (int c = lane; c < C; c += 32) {
     float v = xr[c];
     if (prevY) {
-      v += toF(prevY[row * C + c]) * sigm(prevGate[pr * C + c]);
+      v += toF(prevY[row * C + c]) * prevGate[pr * C + c];
       if (rowMask) v *= rowMask[pr];
       xr[c] = v;
     }
@@ -478,8 +480,8 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
   float inv = rsqrtf(v / C + ADA_EPS);
   for (int c = lane; c < C; c += 32) {
     size_t k = pr * C + c; float n = (xr[c] - mean) * inv;
-    o1[row * C + c] = fromF<TO>(ADA(s1[k]) * n + h1[k]);
-    o2[row * C + c] = fromF<TO>(ADA(s2[k]) * n + h2[k]);
+    o1[row * C + c] = fromF<TO>(s1[k] * n + h1[k]);
+    o2[row * C + c] = fromF<TO>(s2[k] * n + h2[k]);
   }
 }
 struct AtomStep {
@@ -514,7 +516,7 @@ __global__ void gatherAdaLnK(const float* __restrict__ act, const int* __restric
 }
 // act += y * sigmoid(gate); out = sigmoid(scale) * LN(act) + shift; warp per row
 template <class TO, bool RAW = false, class TY = TO>
-__global__ void __launch_bounds__(256, 8)
+__global__ void __launch_bounds__(128, 12)
 gatedAddAdaLnRowsK(float* __restrict__ act, const TY* __restrict__ y, const float* __restrict__ gate,
                    const float* __restrict__ scale, const float* __restrict__ shift,
                    TO* __restrict__ out, size_t rows, int C, size_t period) {
@@ -527,27 +529,26 @@ gatedAddAdaLnRowsK(float* __restrict__ act, const TY* __restrict__ y, const floa
   if (C == 128) {
     int c0 = lane * 4;
     float4 x = *(const float4*)(a + c0), yy = load4(y + row * 128 + c0), g = __ldg(reinterpret_cast<const float4*>(gate + pr + c0));
-    x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
+    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0)), sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
+    x.x += yy.x * g.x; x.y += yy.y * g.y; x.z += yy.z * g.z; x.w += yy.w * g.w;
     *(float4*)(a + c0) = x;
     float sum = x.x + x.y + x.z + x.w;
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum * (1.f / 128.f), q = (x.x - mean) * (x.x - mean) + (x.y - mean) * (x.y - mean) + (x.z - mean) * (x.z - mean) + (x.w - mean) * (x.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     float inv = rsqrtf(q * (1.f / 128.f) + ADA_EPS);
-    float4 sc = __ldg(reinterpret_cast<const float4*>(scale + pr + c0)), sh = __ldg(reinterpret_cast<const float4*>(shift + pr + c0));
-    sc.x = ADA(sc.x); sc.y = ADA(sc.y); sc.z = ADA(sc.z); sc.w = ADA(sc.w);
     store4(out + row * 128 + c0, sc.x * ((x.x - mean) * inv) + sh.x, sc.y * ((x.y - mean) * inv) + sh.y,
            sc.z * ((x.z - mean) * inv) + sh.z, sc.w * ((x.w - mean) * inv) + sh.w);
     return;
   }
-  for (int c = lane; c < C; c += 32) { float v = a[c] + toF(y[row * C + c]) * sigm(gate[pr + c]); a[c] = v; s += v; }
+  for (int c = lane; c < C; c += 32) { float v = a[c] + toF(y[row * C + c]) * gate[pr + c]; a[c] = v; s += v; }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   __syncwarp();
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = a[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   float inv = rsqrtf(v / C + ADA_EPS);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(ADA(scale[pr + c]) * ((a[c] - mean) * inv) + shift[pr + c]);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(scale[pr + c] * ((a[c] - mean) * inv) + shift[pr + c]);
 }
 template <class TY = float>
 __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_t n, size_t period,
@@ -558,7 +559,7 @@ __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_
     size_t g4 = i4 < p4 ? i4 : (i4 < (1ull << 32) ? (unsigned)i4 % (unsigned)p4 : i4 % p4);
     float4 xv = reinterpret_cast<const float4*>(x)[i4], yv = load4(y + (i4 << 2)),
            gv = reinterpret_cast<const float4*>(gate)[g4];
-    xv.x += yv.x * sigm(gv.x); xv.y += yv.y * sigm(gv.y); xv.z += yv.z * sigm(gv.z); xv.w += yv.w * sigm(gv.w);
+    xv.x += yv.x * gv.x; xv.y += yv.y * gv.y; xv.z += yv.z * gv.z; xv.w += yv.w * gv.w;
     if (rowMask) {
       size_t r = C == 128 ? (g4 >> 5) : (g4 * 4) / (unsigned)C;
       float m = rowMask[r];
@@ -570,7 +571,7 @@ __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) {
     size_t g = i < period ? i : i % period;
-    float v = x[i] + toF(y[i]) * sigm(gate[g]);
+    float v = x[i] + toF(y[i]) * gate[g];
     if (rowMask) v *= rowMask[g / (unsigned)C];
     x[i] = v;
   }
@@ -675,31 +676,22 @@ __global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict
     float2 qb1 = qBias ? __ldg(reinterpret_cast<const float2*>(qBias + h * D + e + 8)) : make_float2(0.f, 0.f);
     qa[ks][0] = q2(i0, e, qb0); qa[ks][1] = q2(i1, e, qb0); qa[ks][2] = q2(i0, e + 8, qb1); qa[ks][3] = q2(i1, e + 8, qb1);
   }
-  const float* pl0 = pairLogits + (((size_t)ss * heads + h) * queries + r0) * KEYS;
-  const float* pl1 = pairLogits + (((size_t)ss * heads + h) * queries + r1) * KEYS;
-  const float* kmBase = kMask + (size_t)ss * KEYS;
-  float qm0 = __ldg(qMask + (size_t)ss * queries + r0), qm1 = __ldg(qMask + (size_t)ss * queries + r1);
-  float2 b0 = __ldg(reinterpret_cast<const float2*>(pl0 + tig * 2)), b1 = __ldg(reinterpret_cast<const float2*>(pl1 + tig * 2));
-  float2 km = __ldg(reinterpret_cast<const float2*>(kmBase + tig * 2));
+  const float4* pl4 = reinterpret_cast<const float4*>(pairLogits) + (((size_t)ss * heads + h) * 32 + warp * 16) * 32 + lane;
+  float4 b4 = __ldg(pl4);
   cpWait<0>();
   __syncthreads();
   float sv[KEYS / 8][4];
   float m0 = -1e30f, m1 = -1e30f;
   uint32_t kb[2][4];
   ldsm4(kb[0], Ks + (lane & 7) * LD + ((lane >> 3) ^ (lane & 3)) * 8);
-  auto mb = [&](float qm, float k) {
-    return keyMasked ? -1e9f * ((1.f - qm) + (1.f - k)) : 1e9f * (qm - 1.f) * (k - 1.f);
-  };
 #pragma unroll
   for (int nt = 0; nt < KEYS / 8; ++nt) {
     const int cur = nt & 1;
-    sv[nt][0] = (b0.x + mb(qm0, km.x)) * LOG2E; sv[nt][1] = (b0.y + mb(qm0, km.y)) * LOG2E;
-    sv[nt][2] = (b1.x + mb(qm1, km.x)) * LOG2E; sv[nt][3] = (b1.y + mb(qm1, km.y)) * LOG2E;
+    sv[nt][0] = b4.x; sv[nt][1] = b4.y;
+    sv[nt][2] = b4.z; sv[nt][3] = b4.w;
     if (nt + 1 < KEYS / 8) {
       ldsm4(kb[cur ^ 1], Ks + ((nt + 1) * 8 + (lane & 7)) * LD + ((lane >> 3) ^ (lane & 3)) * 8);
-      int nkey = (nt + 1) * 8 + tig * 2;
-      b0 = __ldg(reinterpret_cast<const float2*>(pl0 + nkey)); b1 = __ldg(reinterpret_cast<const float2*>(pl1 + nkey));
-      km = __ldg(reinterpret_cast<const float2*>(kmBase + nkey));
+      b4 = __ldg(pl4 + (nt + 1) * 32);
     }
     mma16816(sv[nt], qa[0], kb[cur][0], kb[cur][1]);
     mma16816(sv[nt], qa[1], kb[cur][2], kb[cur][3]);
@@ -856,10 +848,10 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   const size_t R = part ? (size_t)nS * sh.queries : qRows;
   auto at = [](const float* p, size_t k) { return p ? p + k : p; };      // (a null tensor stays null)
   float* act = actAll + r0 * C;
-  float* projected = scratch<float>("ab.projected", qRows * C) + r0 * C;
+  T* projected = scratch<T>("ab.projected", qRows * C) + r0 * C;
   const float *qScale = at(bc.qScale, r0 * C), *qShift = at(bc.qShift, r0 * C), *kScale = at(bc.kScale, r0 * C), *kShift = at(bc.kShift, r0 * C);
   const float *zg = at(bc.zg, r0 * C), *ffwScale = at(bc.ffwScale, r0 * C), *ffwShift = at(bc.ffwShift, r0 * C), *tg = at(bc.tg, r0 * C);
-  const float *prevGate = at(prevGateAll, r0 * C), *prevY = prevGate ? projected : nullptr;
+  const float *prevGate = at(prevGateAll, r0 * C); const T *prevY = prevGate ? projected : nullptr;
   const float *prevMask = at(prevMaskAll, r0), *postMask = at(postMaskAll, r0);
   const float* pairLogits = at(bc.pairLogits, (size_t)(part ? ATOM_S0 : 0) * heads * sh.queries * sh.keys);
   const float *qMask = at(st.qMask, r0), *kMask = at(st.kMask, k0);
@@ -869,10 +861,10 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   T* xk = xqBase + qRows * C + r0 * C;
   if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
     if (C == 128) {
-      if (ADA_RAW) adaLnChained128K<T, true, float><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
-      else adaLnChained128K<T, false, float><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
+      if (ADA_RAW) adaLnChained128K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
+      else adaLnChained128K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
     } else {
-      if (prevY) addSigmoidGated(act, prevY, prevGate, R * C, q1 * C, prevMask, C);
+      if (prevY) addSigmoidGated<T>(act, prevY, prevGate, R * C, q1 * C, prevMask, C);
       float* xqF = scratch<float>("ab.xqF", qRows * C) + r0 * C;
       adaLn<float>(act, qScale, qShift, xqF, R, C, q1);
       if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(R * C), 256, 0, STREAM>>>(xqF, xq, R * C);
@@ -880,9 +872,9 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
       adaLn<T>(xqF, kScale, kShift, xk, R, C, q1);
     }
   } else {
-    if (ADA_RAW) adaLn2K<T, true, float><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale,
+    if (ADA_RAW) adaLn2K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale,
                                                                             kShift, xq, xk, R, C, q1, prevY, prevGate, prevMask);
-    else adaLn2K<T, false, float><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk,
+    else adaLn2K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk,
                                                                 R, C, q1, prevY, prevGate, prevMask);
   }
   T* qgBase = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd);
@@ -930,9 +922,9 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   if (st.noResidual) {
     adaLn<T, T>(act, ffwScale, ffwShift, tn, R, C, q1, act, attention, zg);
   } else {
-    if (ADA_RAW) gatedAddAdaLnRowsK<T, true, T><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
+    if (ADA_RAW) gatedAddAdaLnRowsK<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
                                                                           tn, R, C, q1);
-    else gatedAddAdaLnRowsK<T, false, T><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
+    else gatedAddAdaLnRowsK<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
                                                                           tn, R, C, q1);
   }
   int I = C * 2;
@@ -941,8 +933,8 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   T* gated = scratch<T>("ab.gated", qRows * I) + r0 * I;
   linear<T, T>(tn, wide, R, C, up ? 3 * I : 2 * I, w1);
   swiglu<T>(wide, gated, R, I, up);
-  linear<T, float>(gated, projected, R, I, C, B + ".ffwTransition2");
-  if (!deferAdd) addSigmoidGated(act, projected, tg, R * C, q1 * C, postMask, C);
+  linear<T, T>(gated, projected, R, I, C, B + ".ffwTransition2");
+  if (!deferAdd) addSigmoidGated<T>(act, projected, tg, R * C, q1 * C, postMask, C);
 }
 inline bool ATOM_HALF = false;        // the atom blocks' GEMMs in f16 (set by --fast)
 inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
@@ -1229,6 +1221,41 @@ inline std::vector<float*> atomPairLogits(const std::string& P, const float* pai
   return out;
 }
 
+__global__ void packAtomPairLogitsMMAK(const float* __restrict__ pl, const float* __restrict__ qMask,
+                                       const float* __restrict__ kMask, float4* __restrict__ out,
+                                       int subsets, int heads, bool keyMasked) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)subsets * heads * 32 * 32;
+  if (idx >= total) return;
+  int lane = (int)(idx & 31), g = lane >> 2, tig = lane & 3;
+  size_t rest = idx >> 5;
+  int nt = (int)(rest & 15); rest >>= 4;
+  int warp = (int)(rest & 1); rest >>= 1;
+  int h = (int)(rest % (unsigned)heads), ss = (int)(rest / (unsigned)heads);
+  int r0 = warp * 16 + g, r1 = r0 + 8, nkey = nt * 8 + tig * 2;
+  const float* pl0 = pl + (((size_t)ss * heads + h) * 32 + r0) * 128 + nkey;
+  const float* pl1 = pl + (((size_t)ss * heads + h) * 32 + r1) * 128 + nkey;
+  float2 b0 = __ldg(reinterpret_cast<const float2*>(pl0)), b1 = __ldg(reinterpret_cast<const float2*>(pl1));
+  float2 km = __ldg(reinterpret_cast<const float2*>(kMask + (size_t)ss * 128 + nkey));
+  float qm0 = __ldg(qMask + (size_t)ss * 32 + r0), qm1 = __ldg(qMask + (size_t)ss * 32 + r1);
+  auto mb = [&](float qm, float k) {
+    return keyMasked ? -1e9f * ((1.f - qm) + (1.f - k)) : 1e9f * (qm - 1.f) * (k - 1.f);
+  };
+  out[idx] = make_float4((b0.x + mb(qm0, km.x)) * LOG2E, (b0.y + mb(qm0, km.y)) * LOG2E,
+                         (b1.x + mb(qm1, km.x)) * LOG2E, (b1.y + mb(qm1, km.y)) * LOG2E);
+}
+inline void packAtomPairLogitsMMA(const std::vector<float*>& logits, const float* qMask, const float* kMask,
+                                  int subsets, int heads, int D, int queries, int keys, bool keyMasked) {
+  if (!ATOM_HALF || D != 32 || queries != 32 || keys != 128 || logits.empty()) return;
+  size_t per = (size_t)subsets * heads * 32 * 128;
+  float* tmp = scratch<float>("apl.flat", per);
+  for (float* pl : logits) {
+    packAtomPairLogitsMMAK<<<blocks(per / 4), 256, 0, STREAM>>>(
+      pl, qMask, kMask, reinterpret_cast<float4*>(tmp), subsets, heads, keyMasked);
+    CK(cudaMemcpyAsync(pl, tmp, per * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
+  }
+}
+
 // The encoder's per-fold part, and the decoder's: everything but the activation.
 struct EncoderOut {
   float* tokenAct;        // [tokens][perToken]
@@ -1364,10 +1391,11 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
       sameRefSpaceMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, qUid, tq.mask, kUid, tk.mask, sh.subsets, o.heads, sh.queries,
                                                          sh.keys);
   }
-  for (int b = 0; b < nblocks; ++b)
-    o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = M.flag(E + ".blocks.0.keyMaskedAtomAttention");
   o.noResidual = M.flag(E + ".blocks.0.diffusionNoResidual");
+  packAtomPairLogitsMMA(logits, o.qMask, o.kMask, sh.subsets, o.heads, o.D, sh.queries, sh.keys, o.keyMasked);
+  for (int b = 0; b < nblocks; ++b)
+    o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));
   return o;
 }
 // rf3's chirality signal: per atom, d/dx of sum over its centres of (improper dihedral - ideal)^2,

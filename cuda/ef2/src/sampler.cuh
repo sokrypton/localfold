@@ -62,31 +62,39 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
   std::normal_distribution<double> N(0, 1);
   std::vector<double> sched = noiseSchedule(s, d.sigma);
   std::vector<float> mask = download(d.atoms.ctx.mask, A);
-  std::vector<float> x(A * 3), xd(A * 3);
+  std::vector<float> x(A * 3), xd(A * 3), noise(A * 3), nextNoise(A * 3);
   for (auto& v : x) v = (float)(sched[0] * N(rng));
-  float* dx = dalloc((size_t)A * 3); float* dd = dalloc((size_t)A * 3);
+  float* dx = scratch<float>("samp.dx", (size_t)A * 3);
+  float* dd = scratch<float>("samp.dd", (size_t)A * 3);
   int steps = (int)sched.size() - 1;
   cudaGraphExec_t graph = nullptr;
+  double R[9], sh[3], nextR[9], nextSh[3];
+  auto drawStep = [&](int idx, double* rot, double* shift, std::vector<float>& ns) {
+    double sig = sched[idx], nxt = sched[idx + 1], gam = s.churn && nxt > s.gammaMin ? s.gamma0 : 0;
+    double q[4]; for (auto& v : q) v = N(rng);
+    double qn = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    double qr = q[0] / qn, qi = q[1] / qn, qj = q[2] / qn, qk = q[3] / qn;
+    rot[0] = 1 - 2 * (qj * qj + qk * qk); rot[1] = 2 * (qi * qj - qk * qr); rot[2] = 2 * (qi * qk + qj * qr);
+    rot[3] = 2 * (qi * qj + qk * qr); rot[4] = 1 - 2 * (qi * qi + qk * qk); rot[5] = 2 * (qj * qk - qi * qr);
+    rot[6] = 2 * (qi * qk - qj * qr); rot[7] = 2 * (qj * qk + qi * qr); rot[8] = 1 - 2 * (qi * qi + qj * qj);
+    shift[0] = N(rng); shift[1] = N(rng); shift[2] = N(rng);
+    double t = sig * (1 + gam);
+    double eps = s.noiseScale * sqrt(std::max(t * t - sig * sig, 0.0));
+    for (int k = 0; k < A * 3; ++k) ns[k] = (float)(eps * N(rng));
+  };
+  if (steps > 0) drawStep(0, R, sh, noise);
   for (int i = 0; i < steps; ++i) {
     double sigma = sched[i], next = sched[i + 1], gamma = s.churn && next > s.gammaMin ? s.gamma0 : 0;
     // centre, a uniform random rotation (a normalised Gaussian quaternion), a N(0, 1) translation
     double tot = 0, c[3] = {0, 0, 0};
     for (int a = 0; a < A; ++a) { tot += mask[a]; for (int k = 0; k < 3; ++k) c[k] += mask[a] * x[a * 3 + k]; }
     for (int k = 0; k < 3; ++k) c[k] /= std::max(tot, 1.0);
-    double q[4]; for (auto& v : q) v = N(rng);
-    double qn = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-    double qr = q[0] / qn, qi = q[1] / qn, qj = q[2] / qn, qk = q[3] / qn;
-    double R[9] = {1 - 2 * (qj * qj + qk * qk), 2 * (qi * qj - qk * qr), 2 * (qi * qk + qj * qr),
-                   2 * (qi * qj + qk * qr), 1 - 2 * (qi * qi + qk * qk), 2 * (qj * qk - qi * qr),
-                   2 * (qi * qk - qj * qr), 2 * (qj * qk + qi * qr), 1 - 2 * (qi * qi + qj * qj)};
-    double sh[3] = {N(rng), N(rng), N(rng)};
     for (int a = 0; a < A; ++a) {
       double p[3] = {x[a * 3] - c[0], x[a * 3 + 1] - c[1], x[a * 3 + 2] - c[2]};
-      for (int k = 0; k < 3; ++k) x[a * 3 + k] = (float)(p[0] * R[0 * 3 + k] + p[1] * R[1 * 3 + k] + p[2] * R[2 * 3 + k] + sh[k]);
+      for (int k = 0; k < 3; ++k)
+        x[a * 3 + k] = (float)(p[0] * R[0 * 3 + k] + p[1] * R[1 * 3 + k] + p[2] * R[2 * 3 + k] + sh[k]) + noise[a * 3 + k];
     }
     double t = sigma * (1 + gamma);
-    double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
-    for (auto& v : x) v += (float)(eps * N(rng));
     CK(cudaMemcpyAsync(dx, x.data(), (size_t)A * 12, cudaMemcpyHostToDevice, STREAM));
     setLevel(d, (float)t);
     // the first step runs as it is (every scratch buffer and cuBLAS plan made), the second is captured
@@ -105,6 +113,12 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
     }
     if (FRAME_HOOK) FRAME_HOOK(dd, i + 1, steps);
     CK(cudaMemcpyAsync(xd.data(), dd, (size_t)A * 12, cudaMemcpyDeviceToHost, STREAM));
+    if (i + 1 < steps) {
+      drawStep(i + 1, nextR, nextSh, nextNoise);
+      memcpy(R, nextR, sizeof(R));
+      memcpy(sh, nextSh, sizeof(sh));
+      noise.swap(nextNoise);
+    }
     CK(cudaStreamSynchronize(STREAM));
     rigidAlign(x, xd, mask, A);
     // (Euler's x + f (x - d) is the exponential step's r^S x + (1 - r^S) d at f = r^S - 1)
@@ -112,7 +126,6 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
     for (int k = 0; k < A * 3; ++k) x[k] = (float)(x[k] + f * (x[k] - xd[k]));
   }
   if (graph) CK(cudaGraphExecDestroy(graph));
-  CK(cudaFree(dx)); CK(cudaFree(dd));
   if (stepsRun) *stepsRun = steps;
   return x;
 }

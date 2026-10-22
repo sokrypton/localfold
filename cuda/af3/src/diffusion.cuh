@@ -86,8 +86,21 @@ __global__ void fourierBatchK(const float* levels, const float* w, const float* 
   out[t] = cosf(6.283185307179586f * (tr * w[k] + b[k]));
 }
 // out[s][i][c] = base[i][c] + v[s][c]
-__global__ void baseplusK(const float* base, const float* v, float* out, int S, int n, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (t >= (size_t)S * n * C) return;
+__global__ void baseplusK(const float* __restrict__ base, const float* __restrict__ v, float* __restrict__ out, int S, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((C & 3) == 0 && (((uintptr_t)base | (uintptr_t)v | (uintptr_t)out) & 15) == 0) {
+    int c4 = C >> 2;
+    size_t n4 = (size_t)S * n * c4;
+    if (t >= n4) return;
+    size_t si = t / (size_t)c4;
+    int col4 = (int)(t - si * (size_t)c4);
+    int s = (int)(si / (size_t)n), i = (int)(si - (size_t)s * n);
+    float4 bv = __ldg(reinterpret_cast<const float4*>(base) + (size_t)i * c4 + col4);
+    float4 vv = __ldg(reinterpret_cast<const float4*>(v) + (size_t)s * c4 + col4);
+    reinterpret_cast<float4*>(out)[t] = make_float4(bv.x + vv.x, bv.y + vv.y, bv.z + vv.z, bv.w + vv.w);
+    return;
+  }
+  if (t >= (size_t)S * n * C) return;
   int c = (int)(t % C); size_t si = t / C; int s = (int)(si / n), i = (int)(si % n);
   out[t] = base[(size_t)i * C + c] + v[(size_t)s * C + c];
 }
@@ -149,17 +162,13 @@ inline const int* denseRank(const std::string& key) {
 inline void pairFinalNorm(float* x, size_t rows) {
   const std::string P = "diffusion.conditioning";
   int Cz = (int)M.meta(P + ".pairChannels");
-  float* tmp = scratch<float>("dc.fnorm", rows * Cz);
-  layerNormSlow(x, tmp, rows, Cz, W(P + ".pairCondFinalNormScale"), W(P + ".pairCondFinalNormOffset"));
-  CK(cudaMemcpyAsync(x, tmp, rows * Cz * 4, cudaMemcpyDeviceToDevice, STREAM));
+  layerNormSlow(x, x, rows, Cz, W(P + ".pairCondFinalNormScale"), W(P + ".pairCondFinalNormOffset"));
 }
 inline void singleFinalNorm(float* x, size_t rows) {
   const std::string P = "diffusion.conditioning";
   if (!hasW(P + ".singleCondFinalNormScale")) return;
   int Cs = (int)M.meta(P + ".seqChannels");
-  float* tmp = scratch<float>("dc.sfnorm", rows * Cs);
-  layerNormSlow(x, tmp, rows, Cs, W(P + ".singleCondFinalNormScale"), W(P + ".singleCondFinalNormOffset"));
-  CK(cudaMemcpyAsync(x, tmp, rows * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  layerNormSlow(x, x, rows, Cs, W(P + ".singleCondFinalNormScale"), W(P + ".singleCondFinalNormOffset"));
 }
 inline void singleCondEmbeddingNorm(const float* in, float* out, size_t rows, int Cs) {
   if (!hasW("diffusion.singleCondEmbeddingNormScale")) {     // chai
@@ -279,8 +288,7 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
   float* proj = scratch<float>("dc.noiseproj", Cs);
   linear<float, float>(en, proj, 1, (int)nc, Cs, P + ".noiseEmbeddingInitialProjection");
   float* single = scratch<float>("dc.single", (size_t)n * Cs);
-  CK(cudaMemcpyAsync(single, DCACHE.singleBase, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
-  addVectorK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, proj, n, Cs);
+  baseplusK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(DCACHE.singleBase, proj, single, 1, n, Cs);
   for (int k = 0; k < 2; ++k) plainTransition(single, n, Cs, 2, P + ".singleTransitions." + std::to_string(k));
   singleFinalNorm(single, n);
   return { single, DCACHE.pair };
@@ -561,11 +569,12 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
     int c = threadIdx.x * 8;
     float4 x0 = *(const float4*)(act + (size_t)r * 768 + c);
     float4 x1 = *(const float4*)(act + (size_t)r * 768 + c + 4);
-    uint4 sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
-    uint4 sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
+    uint4 sc8, sh8;
     if (y) {
       uint4 yy8 = __ldg(reinterpret_cast<const uint4*>(y + (size_t)r * 768 + c));
       uint4 g8 = __ldg(reinterpret_cast<const uint4*>(gate + (size_t)pr * ldg + c));
+      sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
+      sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
       const half2* y2 = (const half2*)&yy8; const half2* g2 = (const half2*)&g8;
       float2 y0 = __half22float2(y2[0]), y1 = __half22float2(y2[1]), y2_ = __half22float2(y2[2]), y3 = __half22float2(y2[3]);
       float2 g0 = __half22float2(g2[0]), g1 = __half22float2(g2[1]), g2_ = __half22float2(g2[2]), g3 = __half22float2(g2[3]);
@@ -574,17 +583,21 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
       *(float4*)(act + (size_t)r * 768 + c) = u0;
       *(float4*)(act + (size_t)r * 768 + c + 4) = u1;
       if (!noRes) { x0 = u0; x1 = u1; }
+    } else {
+      sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
+      sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
     }
-    const half2* sc2 = (const half2*)&sc8; const half2* sh2 = (const half2*)&sh8;
-    float2 sc0 = __half22float2(sc2[0]), sc1 = __half22float2(sc2[1]), sc2_ = __half22float2(sc2[2]), sc3 = __half22float2(sc2[3]);
-    float2 sh0 = __half22float2(sh2[0]), sh1 = __half22float2(sh2[1]), sh2_ = __half22float2(sh2[2]), sh3 = __half22float2(sh2[3]);
     float s = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w);
     float ss = (x0.x * x0.x + x0.y * x0.y + x0.z * x0.z + x0.w * x0.w) +
                (x1.x * x1.x + x1.y * x1.y + x1.z * x1.z + x1.w * x1.w);
     for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
     if ((threadIdx.x & 31) == 0) red3[threadIdx.x >> 5] = make_float2(s, ss);
-    sc0 = make_float2(ADA(sc0.x), ADA(sc0.y)); sc1 = make_float2(ADA(sc1.x), ADA(sc1.y));
-    sc2_ = make_float2(ADA(sc2_.x), ADA(sc2_.y)); sc3 = make_float2(ADA(sc3.x), ADA(sc3.y));
+    const half2* sc2 = (const half2*)&sc8; const half2* sh2 = (const half2*)&sh8;
+    float2 sc0 = __half22float2(sc2[0]), sc1 = __half22float2(sc2[1]), sc2_ = __half22float2(sc2[2]), sc3 = __half22float2(sc2[3]);
+    float2 sh0 = __half22float2(sh2[0]), sh1 = __half22float2(sh2[1]), sh2_ = __half22float2(sh2[2]), sh3 = __half22float2(sh2[3]);
+    auto adaH = [](float v) { return RAW ? v : sigmH(v); };
+    sc0 = make_float2(adaH(sc0.x), adaH(sc0.y)); sc1 = make_float2(adaH(sc1.x), adaH(sc1.y));
+    sc2_ = make_float2(adaH(sc2_.x), adaH(sc2_.y)); sc3 = make_float2(adaH(sc3.x), adaH(sc3.y));
     __syncthreads();
     float2 r0 = red3[0], r1 = red3[1], r2 = red3[2];
     float invC = 1.f / 768.f, mean = (r0.x + r1.x + r2.x) * invC;
@@ -954,7 +967,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
   // per block: the f32 [h][i][j] logits for the precise path, or (f16 path) only the flash
   // kernel's form - f16, scaled by log2(e), rows padded to 8 - which is half the bytes and all the
   // f16 path reads (the f32 set was 6.7 GB at 2088 tokens)
-  tc.stride = (n + 7) / 8 * 8;
+  tc.stride = n <= 192 ? (n + 31) / 32 * 32 : (n + 7) / 8 * 8;
   tc.pairLogits.assign(tc.nblocks, nullptr);
   tc.biasHalf.assign(tc.nblocks, nullptr);
   for (int b = 0; b < tc.nblocks; ++b) {
@@ -1356,7 +1369,7 @@ __global__ void broadcastSkipK(const float* __restrict__ proj, const int* __rest
 }
 // upd[row] = LN(act[row] * qMask) W, W (C, 3): scaleByRowK, layerNormSlowK and linear in one pass
 template <class TY = float>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(128, 12)
 maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, size_t q1, size_t rows, int C,
                 const float* __restrict__ scale, const float* __restrict__ offset, const float* __restrict__ Wp,
                 float* __restrict__ upd, const TY* __restrict__ prevY = nullptr, const float* __restrict__ prevGate = nullptr) {
@@ -1368,7 +1381,7 @@ maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, 
   float m = __ldg(qMask + pr);
   auto val = [&](int c) {
     float v = __ldg(x + c);
-    if (prevY) v += toF(prevY[row * C + c]) * sigm(__ldg(prevGate + pr * C + c));
+    if (prevY) v += toF(prevY[row * C + c]) * __ldg(prevGate + pr * C + c);
     return v * m;
   };
   if (C == 128) {
@@ -1438,6 +1451,8 @@ inline DecoderCache prepareDecoder(const EncoderOut& enc) {
       sameRefSpaceMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, enc.qUid, tq.mask, enc.kUid, tk.mask, sh.subsets, d.heads,
                                                          sh.queries, sh.keys);
   }
+  packAtomPairLogitsMMA(logits, enc.qMask, enc.kMask, sh.subsets, d.heads, d.D, sh.queries, sh.keys,
+                        M.flag(Dd + ".blocks.0.keyMaskedAtomAttention"));
   for (int b = 0; b < nblocks; ++b)
     d.blocks.push_back(prepareAtomBlock(Dd + ".blocks." + std::to_string(b), cond, qRows, d.C, logits[b]));
   return d;
@@ -1464,12 +1479,20 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
     crossAttentionBlock(act, st, d.blocks[b], sh, C, d.heads, d.D, Dd + ".blocks." + std::to_string(b),
                         b > 0 ? d.blocks[b - 1].tg : nullptr, maskPerBlock ? enc.qMask : nullptr, true, nullptr);
   }
-  const float* prevProj = d.blocks.empty() ? nullptr : scratch<float>("ab.projected", qRows * C) + r0 * C;
   float* upd = scratch<float>("dec.upd", qRows * 3);
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) { fprintf(stderr, "decoder: position update is not C x 3\n"); exit(1); }
-  maskLnProject3K<float><<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
-    W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
-    prevProj, prevProj ? d.blocks.back().tg + r0 * C : nullptr);
+  const float* prevGate = d.blocks.empty() ? nullptr : d.blocks.back().tg + r0 * C;
+  if (ATOM_HALF) {
+    const half* prevProj = d.blocks.empty() ? nullptr : scratch<half>("ab.projected", qRows * C) + r0 * C;
+    maskLnProject3K<half><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
+      W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
+      prevProj, prevGate);
+  } else {
+    const float* prevProj = d.blocks.empty() ? nullptr : scratch<float>("ab.projected", qRows * C) + r0 * C;
+    maskLnProject3K<float><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
+      W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
+      prevProj, prevGate);
+  }
   float* out = scratch<float>("dec.out", atoms * NS * 3);
   convert(q2t, upd, out, 3, q1, NS);
   return out;

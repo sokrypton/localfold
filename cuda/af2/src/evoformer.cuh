@@ -121,8 +121,8 @@ __global__ void pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __re
   if (i + 3 < n) *reinterpret_cast<float4*>(out + i) = pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(in), i);
   else for (size_t k = i; k < n; ++k) out[k] = __bfloat162float(in[k]);
 }
-template <class PT, bool FAST_INV = false>
-__global__ void opmAdd128K(float* __restrict__ pair, const float* __restrict__ x, const float* __restrict__ bias,
+template <class PT, bool FAST_INV = false, class TX = float>
+__global__ void opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __restrict__ bias,
                            const float* __restrict__ norm, size_t i0, int Bi, int L, float xs = 1.f, float normVal = 0.f) {
   __shared__ float sb[128];
   if (threadIdx.x < 128) sb[threadIdx.x] = bias[threadIdx.x];
@@ -131,8 +131,16 @@ __global__ void opmAdd128K(float* __restrict__ pair, const float* __restrict__ x
   if (t >= (size_t)Bi * L * 32) return;
   int f = (int)((t & 31) << 2);
   size_t p = i0 * L + (t >> 5);
-  float denom = 1e-3f + (norm ? norm[p] : normVal);
-  float4 x4 = *reinterpret_cast<const float4*>(x + (t << 2));
+  float denom = 1e-3f + (norm ? __ldg(norm + p) : normVal);
+  float4 x4;
+  if constexpr (std::is_same_v<TX, float>) {
+    x4 = *reinterpret_cast<const float4*>(x + (t << 2));
+  } else {
+    uint2 u = *reinterpret_cast<const uint2*>(x + (t << 2));
+    float2 a = __half22float2(*reinterpret_cast<const half2*>(&u.x));
+    float2 c = __half22float2(*reinterpret_cast<const half2*>(&u.y));
+    x4 = make_float4(a.x, a.y, c.x, c.y);
+  }
   float4 b4 = *reinterpret_cast<const float4*>(sb + f);
   float4 p4 = pairLd4<PT>(pair, (p << 7) + f);
   if constexpr (FAST_INV) {
@@ -974,10 +982,20 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       int K = O * rowsN;
       if (ones) {
         int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
-        if (PAIR16) {   // (into an f32 block of rows, then added with the scaled bias into the bf16 pair: an f16 product
-                        // there moved 6MRR from a single sequence 1.898 -> 2.001 A, pLDDT 84.6 -> 81.1)
-          float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+        if (PAIR16) {   // (into an f32 block of rows for a single unaligned sequence, where an f16 product moved 6MRR
+                        // 1.898 -> 2.001 A; f16 when templates or MSA rows are present and L >= 128)
           const float* ob = P(Op + "/output_b", blk);
+          if ((rowsN > 1 || M.meta("meta/templates", 0) > 0) && L >= 128) {
+            half* Yb = scratch<half>("fopm.Y", (size_t)Bi * L * 128);
+            for (int i0 = 0; i0 < L; i0 += Bi) {
+              int bi = std::min(Bi, L - i0);
+              ltGemm(Lt + (size_t)i0 * K, T, Yb, true, bi, K, L * 128, nullptr, false, 0.f);
+              addIntoPairK<__nv_bfloat16, half><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(
+                reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 32 * 4, ob, inv);
+            }
+            return;
+          }
+          float* Yb = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
           for (int i0 = 0; i0 < L; i0 += Bi) {
             int bi = std::min(Bi, L - i0);
             ltGemm(Lt + (size_t)i0 * K, T, Yb, false, bi, K, L * 128, nullptr, false, 0.f);
@@ -1006,6 +1024,15 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
         return;
       }
       int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
+      if (L >= 128) {
+        half* Y = scratch<half>("fopm.Y", (size_t)Bi * L * 128);
+        for (int i0 = 0; i0 < L; i0 += Bi) {
+          int bi = std::min(Bi, L - i0);
+          ltGemm(Lt + (size_t)i0 * K, T, Y, true, bi, K, L * 128, nullptr, false, 0.f);
+          WITH_PAIR_T(opmAdd128K<PT, true, half><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L));
+        }
+        return;
+      }
       float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
       for (int i0 = 0; i0 < L; i0 += Bi) {
         int bi = std::min(Bi, L - i0);
@@ -1316,8 +1343,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
-    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
-    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
+    triContractBf16(outgoing, Lp, plane, C, 1.f, a, b, prod);
     triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
                                           PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), {}, w.wout);
     return;
@@ -1353,8 +1379,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     triInRaw<__nv_bfloat16, true>(pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
                                   w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
-    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
-    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
+    triContractBf16(outgoing, Lp, plane, C, 1.f, a, b, prod);
     triOutRaw<__nv_bfloat16, true>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
                                    PH(T + "/output_projection/weights", blk), P(T + "/output_projection/bias", blk), t2, pair, L, Lp,
                                    plane);
@@ -1756,8 +1781,10 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   }
   PAIR16 = AF2_P16;
   if (!t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask);
+  TRI_LT_TILE = (t.N + t.T > 1 || M.meta("meta/templates", 0) > 0);
   triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes);
   triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes);
+  TRI_LT_TILE = true;
   triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes);
   triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes);
   transition(t.pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);

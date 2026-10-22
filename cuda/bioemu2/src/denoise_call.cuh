@@ -288,21 +288,24 @@ inline void denoise(const Denoiser& d, const float* x, float sigma, float* den, 
               l > 0 ? da : nullptr, preGateA, 2 * Dc + Dt);
     if (GEMM_HALF) {
       // s_to_q = [a broadcast | q]; q_to_s = [q centre | a], fused with post-transition gatedAdd directly into adaLN
-      half* sqh = scratch<half>("be2.dn.sqh", RN * Dc); half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
-      adaLnQ2SK<half><<<(unsigned)((RT + 7) / 8), 256, 0, STREAM>>>(q, tAtom, condA + 5 * Ca, 6 * Ca, atomTokDev,
-                                                                    a, tTok, condT + 5 * Dt, 6 * Dt, centreDev,
-                                                                    qsh, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
-      adaLnS2QK<half><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, tAtom, condA + 5 * Ca, 6 * Ca,
-                                                                    atomTokDev, atomPadDev,
-                                                                    sqh, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
-      transitionHalf(nullptr, sqh, dq, RN, Dc, cp + "s_to_q_mixer/", l, false, false, 0);
+      const int Rtok = (int)RT + 2 * (T + 1);
+      half* qsh = scratch<half>("be2.dn.qsh", RT * Dc);
+      half* uvb = scratch<half>("be2.s2q.uvb", (size_t)Rtok * 768);
+      float4* tokStats = scratch<float4>("be2.s2q.tstat", RT);
+      adaLnQ2SK<half><<<(unsigned)((Rtok + 3) / 4), 128, 0, STREAM>>>(q, tAtom, condA + 5 * Ca, 6 * Ca, atomTokDev,
+                                                                      a, tTok, condT + 5 * Dt, 6 * Dt, centreDev,
+                                                                      qsh, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok,
+                                                                      uvb, tokStats, cqc, cqc + Dc, 2 * Dc + Ca);
+      s2qMixerHalf(a, q, tAtom, condA + 5 * Ca, 6 * Ca, atomTokDev, atomPadDev,
+                   dq, RN, N, T, RT, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok, cp + "s_to_q_mixer/", l,
+                   uvb, tokStats);
       transitionHalf(nullptr, qsh, da, RT, Dc, cp + "q_to_s_mixer/", l, false, false, 0);
     } else {
       float* sqn = scratch<float>("be2.dn.sqn", RN * Dc); float* qsn = scratch<float>("be2.dn.qsn", RT * Dc);
-      adaLnQ2SK<float><<<(unsigned)((RT + 7) / 8), 256, 0, STREAM>>>(q, tAtom, condA + 5 * Ca, 6 * Ca, atomTokDev,
+      adaLnQ2SK<float><<<(unsigned)((RT + 3) / 4), 128, 0, STREAM>>>(q, tAtom, condA + 5 * Ca, 6 * Ca, atomTokDev,
                                                                      a, tTok, condT + 5 * Dt, 6 * Dt, centreDev,
                                                                      qsn, RT, N, T, csc, csc + Dc, 2 * Dc + Dt, maps.tok);
-      adaLnS2QK<float><<<(unsigned)((RN + 7) / 8), 256, 0, STREAM>>>(a, q, tAtom, condA + 5 * Ca, 6 * Ca,
+      adaLnS2QK<float><<<(unsigned)((RN + 3) / 4), 128, 0, STREAM>>>(a, q, tAtom, condA + 5 * Ca, 6 * Ca,
                                                                      atomTokDev, atomPadDev,
                                                                      sqn, RN, N, T, cqc, cqc + Dc, 2 * Dc + Ca, maps.atomTok);
       transition(sqn, dq, RN, Dc, cp + "s_to_q_mixer/", l, false, false);

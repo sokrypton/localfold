@@ -386,6 +386,12 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
 template <int C, class PT = float>
 inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* lnO, const half* Wt, const float* bias, int N,
                    int split, half* out0, half* out1, const float* mask = nullptr) {
+  if (rows <= 4096) {
+    constexpr int WARPS = 2, MT = 1, R = 16 * WARPS * MT;
+    constexpr size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * 16 * 2;
+    lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1, mask);
+    return;
+  }
   constexpr int WARPS = 4;
   auto at = [&](auto mt) {
     constexpr int MT = decltype(mt)::value, R = 16 * WARPS * MT;
