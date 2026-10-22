@@ -314,6 +314,115 @@ int main() {
     report("triangle gate a, bias", relRms(refA, std::vector<float>(a.begin(), a.end())), 5e-3);
     report("triangle gate b, bias", relRms(refB, std::vector<float>(b.begin(), b.end())), 5e-3);
   }
+  {   // gated rows (BioEmu2 adaLN residual): Y[r][o] += gate[map ? map[r] : r][o] * (alpha X W)[r][o]
+    size_t R = 213, G = 48; int K = 128, O = 256, ldg = 512;
+    auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), gate = randv(G * ldg), Y0 = randv(R * O);
+    std::vector<int> mp(R);
+    for (size_t r = 0; r < R; ++r) mp[r] = (int)((r * 13 + 5) % G);
+    std::vector<double> ref(R * O);
+    for (size_t r = 0; r < R; ++r) for (int o = 0; o < O; ++o) {
+      double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+      ref[r * O + o] = Y0[r * O + o] + (double)gate[(size_t)mp[r] * ldg + o] * (0.75 * s);
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
+    float* dg = uploadNew(gate.data(), gate.size()); float* dY = uploadNew(Y0.data(), Y0.size());
+    int* dm = uploadNew(mp.data(), mp.size());
+    Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.ty = F32; g.rows = R; g.in = K; g.out = O; g.alpha = 0.75f;
+    if (gemmGatedRows(g, dg, ldg, dm)) report("gated rows (mapped)", relRms(ref, download(dY, R * O)), 1e-3);
+    else { ++failures; printf("  gated rows (mapped): FAIL (not taken)\n"); }
+    release(dX); release(dW); release(dg); release(dY); release(dm);
+  }
+  for (bool pre : {false, true}) {   // gated residual (AF3 diffusion transformer): act[r][o] += (alpha X W)[r][o] * (pre ? g : sigmoid(g))
+    size_t rows = 195, prows = 208, period = 65; int K = 128, O = 256, ld = 512;
+    auto X = randv(prows * K), W = randv((size_t)K * O, 0.1f), gate = randv(period * ld), A0 = randv(prows * O);
+    std::vector<double> ref(A0.begin(), A0.end());
+    for (size_t r = 0; r < rows; ++r) for (int o = 0; o < O; ++o) {
+      double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+      double gp = gate[(r % period) * ld + o];
+      double gm = pre ? gp : 1.0 / (1.0 + exp(-gp));
+      ref[r * O + o] += (0.5 * s) * gm;
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
+    float* dg = uploadNew(gate.data(), gate.size()); float* dA = uploadNew(A0.data(), A0.size());
+    if (gemmGateResidual(dX, dW, dA, prows, rows, K, O, dg, ld, period, 0.5f, "gate res", pre))
+      report(pre ? "gate residual (pre-sigmoid)" : "gate residual (sigmoid)", relRms(ref, download(dA, prows * O)), 1e-3);
+    else { ++failures; printf("  gate residual: FAIL (not taken)\n"); }
+    release(dX); release(dW); release(dg); release(dA);
+  }
+  {   // conditioning permuted store (AF3 diffusion conditioning)
+    size_t valid = 135, prows = 144; int period = 45, K = 128, W = 128, BS = 3, O = BS * W, sigCols = 64;
+    auto X = randv(prows * K), Wgt = randv((size_t)K * O, 0.1f), bias = randv(O);
+    std::vector<double> ref(valid * O, 0);
+    for (size_t j = 0; j < valid; ++j) for (int i = 0; i < O; ++i) {
+      double s = bias[i];
+      for (int k = 0; k < K; ++k) s += (double)(float)(half)X[j * K + k] * (float)(half)Wgt[(size_t)k * O + i];
+      size_t kk = j / period, r = j % period, bs = i / W, col = i % W;
+      if ((int)col < sigCols) s = 1.0 / (1.0 + exp(-s));
+      ref[((kk * BS + bs) * period + r) * W + col] = s;
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(Wgt).data(), Wgt.size());
+    float* db = uploadNew(bias.data(), bias.size()); float* dY = allocT<float>(valid * O);
+    if (gemmCondPermuted(dX, dW, dY, prows, valid, K, O, db, period, W, sigCols))
+      report("conditioning permuted store", relRms(ref, download(dY, valid * O)), 1e-3);
+    else { ++failures; printf("  conditioning permuted store: FAIL (not taken)\n"); }
+    release(dX); release(dW); release(db); release(dY);
+  }
+  {   // in-place half multiply: Y[r][o] *= (X W)[r][o]
+    size_t R = 195; int K = 128, O = 128;
+    auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), Y0 = randv(R * O);
+    std::vector<double> ref(R * O);
+    for (size_t r = 0; r < R; ++r) for (int o = 0; o < O; ++o) {
+      double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+      ref[r * O + o] = (double)(float)(half)Y0[r * O + o] * s;
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
+    half* dY = uploadNew(toH(Y0).data(), Y0.size());
+    if (gemmMulH(dX, dW, dY, R, K, O)) {
+      auto h = download(dY, R * O);
+      report("in-place half multiply (gemmMulH)", relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
+    } else { ++failures; printf("  gemmMulH: FAIL (not taken)\n"); }
+    release(dX); release(dW); release(dY);
+  }
+  {   // outer product permuted + normalised output add (float and half pair)
+    int bi = 12, L = 19, O = 16, S = 32, C = 128;
+    int ldl = L * O, ldr = L * O;
+    auto lt = randv((size_t)S * ldl, 0.3f), rt = randv((size_t)S * ldr, 0.3f);
+    std::vector<double> refP((size_t)bi * L * O * O);
+    for (int i = 0; i < bi; ++i) for (int j = 0; j < L; ++j) for (int c = 0; c < O; ++c) for (int e = 0; e < O; ++e) {
+      double s = 0;
+      for (int k = 0; k < S; ++k) s += (double)(float)(half)lt[(size_t)k * ldl + i * O + c] * (float)(half)rt[(size_t)k * ldr + j * O + e];
+      refP[(((size_t)i * L + j) * O + c) * O + e] = 0.5 * s;
+    }
+    half* dlt = uploadNew(toH(lt).data(), lt.size()); half* drt = uploadNew(toH(rt).data(), rt.size());
+    half* dX = allocT<half>((size_t)bi * L * O * O);
+    if (gemmOpmPermuted(dlt, ldl, drt, ldr, dX, bi, L, O, S, 0.5f)) {
+      auto h = download(dX, (size_t)bi * L * O * O);
+      report("outer product permuted (gemmOpmPermuted)", relRms(refP, std::vector<float>(h.begin(), h.end())), 2e-3);
+    } else { ++failures; printf("  gemmOpmPermuted: FAIL (not taken)\n"); }
+    size_t rows = (size_t)bi * L; int in = O * O;
+    auto W = randv((size_t)in * C, 0.1f), bias = randv(128), norm = randv(rows, 0.5f), P0 = randv(rows * C);
+    for (auto& v : norm) v = std::abs(v) + 1.f;
+    std::vector<double> refF(rows * C), refH(rows * C);
+    auto xh = download(dX, rows * in);
+    for (size_t r = 0; r < rows; ++r) for (int o = 0; o < C; ++o) {
+      double s = 0;
+      for (int k = 0; k < in; ++k) s += (double)(float)xh[r * in + k] * (float)(half)W[(size_t)k * C + o];
+      double add = (bias[o & 127] + 2.0 * s) / (1e-3 + norm[r]);
+      refF[r * C + o] = P0[r * C + o] + add;
+      refH[r * C + o] = (double)(float)(half)P0[r * C + o] + add;
+    }
+    half* dW = uploadNew(toH(W).data(), W.size()); float* db = uploadNew(bias.data(), bias.size());
+    float* dn = uploadNew(norm.data(), norm.size());
+    float* dPf = uploadNew(P0.data(), P0.size()); half* dPh = uploadNew(toH(P0).data(), P0.size());
+    if (gemmOpmOut(dX, dW, dPf, db, dn, rows, in, C, 2.f))
+      report("outer product output add (float pair)", relRms(refF, download(dPf, rows * C)), 1e-3);
+    else { ++failures; printf("  gemmOpmOut float: FAIL (not taken)\n"); }
+    if (gemmOpmOut(dX, dW, dPh, db, dn, rows, in, C, 2.f)) {
+      auto h = download(dPh, rows * C);
+      report("outer product output add (half pair)", relRms(refH, std::vector<float>(h.begin(), h.end())), 3e-3);
+    } else { ++failures; printf("  gemmOpmOut half: FAIL (not taken)\n"); }
+    release(dlt); release(drt); release(dX); release(dW); release(db); release(dn); release(dPf); release(dPh);
+  }
 
   printf("attention\n");
   for (auto cfg : std::vector<std::tuple<int, int, int, int, bool, bool, bool>>{

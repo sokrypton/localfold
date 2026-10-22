@@ -155,6 +155,7 @@ Run each pair interleaved (`ABBA`) on warm caches:
 
 Once the M5 commits are verified on M2, the highest-leverage areas specifically for M2 are:
 1. **Metal `lf_gemm` (`metal/core/gemm.metal`) epilogue fusions for `Apple8`**:
-   - Right now, emitted LayerNorm (`g.lnOut`), dual triangle-output GEMM (`g.W2`), and butterfly register SwiGLU (`e40`) only exist in `gemm_tensor.metal` (`Apple10`). Porting butterfly SwiGLU or `yinFloat` to `gemm.metal` directly speeds up M1/M2/M3/M4 Macs on `lf_gemm`.
+   - **Already ported & verified (`LOCALFOLD_GEMM_TENSOR=0`)**: `Gemm::yinFloat` (`biasType & 512`), `halfProductScale()` (`1/1024` saturating `half` triangle contraction + `lf_center_norm_16h2`/`32h1`), `gemmGatedRows` (`262144`), `gemmGateResidual` (`16384`), `gemmCondPermuted` (`524288`), `gemmMulH` (`1048576` with 8x8 `simdgroup_load`/`simdgroup_store`), `gemmOpmPermuted` (`4096` with 8x8 strided `simdgroup_store`), `gemmOpmOut` (`8192` with 8x8 `simdgroup_load`/`simdgroup_store`), and fast `om`-only 8x8 stores for `accFloat` `half` outputs.
+   - **Remaining opportunities**: emitted LayerNorm (`g.lnOut`) or dual triangle-output GEMM (`gemmGatedAddDual`) in `gemm.metal`.
 2. **WebGPU `grid-attend-race.js` calibration on M2**:
    - Check `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js` on M2 to verify that the 4-way startup race consistently selects M2's winning arms (`gridAttendTiled=false`, `gridProjectArithmetic="f32"`, `attentionGroup=1`, and the fastest `triangleContractArithmetic`).

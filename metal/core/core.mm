@@ -331,7 +331,8 @@ struct Device {
       // (the tensor instances in libraries of their own: another source, another language version - and none on a GPU
       // without the units, where a cached list from an M5 names them)
       std::vector<std::pair<std::string, std::string>> groups[2];
-      for (auto& t : todo) if (!isTensor(t.first)) groups[0].push_back(t); else if (tensorOps) groups[1].push_back(t);
+      const bool tw = tensorOps && (!getenv("LOCALFOLD_GEMM_TENSOR") || atoi(getenv("LOCALFOLD_GEMM_TENSOR")) != 0);
+      for (auto& t : todo) if (!isTensor(t.first)) groups[0].push_back(t); else if (tw) groups[1].push_back(t);
       std::vector<std::thread> threads;
       for (int tensor = 0; tensor < 2; ++tensor) {
         const std::vector<std::pair<std::string, std::string>>* list = &groups[tensor];   // (groups outlives the threads)
@@ -831,8 +832,9 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
   const bool hacc = !floatAcc && !accFloat && ta_ == F16 && tb_ == F16 && tc_ == F16;
   const bool hmma = halfMma && !(ta_ == F16 && tb_ == F16);     // (half staging of an f32 operand)
+  const bool extEp = (a.epilogue & (4096 | 8192 | 16384 | 262144 | 524288 | 1048576)) != 0;
   auto mtype = [](DT t) { return t == F32 ? "float" : "half"; };
-  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | GEMM_EXTRA_EP;
+  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | (extEp ? 64 : 0) | GEMM_EXTRA_EP;
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
                       std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " +
                       std::to_string(bk) + ", " + std::to_string(ep);
@@ -876,7 +878,7 @@ bool gemm(const Gemm& g) {
 bool gemmGatedRows(const Gemm& g, const float* gate, int ldg, const int* map) {
   static const bool on = !getenv("LOCALFOLD_GATED_ROWS") || atoi(getenv("LOCALFOLD_GATED_ROWS")) != 0;
   const int ldy = g.ldy ? g.ldy : g.out;
-  if (!on || !tensorWanted() || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.out % 4 ||
+  if (!on || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.out % 4 ||
       ldy % 4 || ldg % 4 || ((uint64_t)g.Y & 15) || ((uint64_t)gate & 15) || g.bias || g.beta != 0.f || g.lnOut || g.Yin)
     return false;
   GemmArgs a = gemmArgs(g);
@@ -948,57 +950,53 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
                       const float* gate, int ld, size_t period, float alpha, const char* label, bool preSigmoid) {
   static const bool on = !getenv("LOCALFOLD_GATE_RES") || atoi(getenv("LOCALFOLD_GATE_RES")) != 0;
-  if (!on || !tensorWanted() || prows < 1 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
+  if (!on || prows < 1 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15))
     return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)act;
   a.m = out; a.n = (int)prows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = alpha; a.epilogue = 16384; a.aux = (uint64_t)gate; a.ldaux = ld; a.tgN = (int)period; a.tgPairs = (int64_t)rows;
   a.tgC = preSigmoid ? 1 : 0;
-  ++D().stats.gemms;
-  gemmTensorRun(F32, a, 1, false, label);
+  gemmRun(F16, F16, F32, a, 1, false, false, label);
   return true;
 }
 bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
                       const float* bias, int period, int width, int sigCols, const char* label) {
-  if (!tensorWanted() || out % 64 || width % 4 || sigCols % 4 || ((uint64_t)Y & 15) || (bias && ((uint64_t)bias & 15)))
+  if (out % 64 || width % 4 || sigCols % 4 || ((uint64_t)Y & 15) || (bias && ((uint64_t)bias & 15)))
     return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
   a.m = out; a.n = (int)prows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = 1.f; a.epilogue = 524288 | (bias ? 4 : 0); a.bias = (uint64_t)bias;
   a.tgPairs = (int64_t)validRows; a.tgN = period; a.tgC = width; a.tgNp = sigCols;
-  ++D().stats.gemms;
-  gemmTensorRun(F32, a, 1, false, label);
+  gemmRun(F16, F16, F32, a, 1, false, false, label);
   return true;
 }
 bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label) {
-  if (!tensorWanted() || out % 4 != 0 || ((uint64_t)Y & 15) != 0) return false;
+  if (out % 4 != 0 || ((uint64_t)Y & 15) != 0) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.alpha = 1.f; a.epilogue = 1048576;
-  ++D().stats.gemms;
-  gemmTensorRun(F16, a, 1, false, label);
+  gemmRun(F16, F16, F16, a, 1, false, false, label);
   return true;
 }
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
   const int rows = bi * O, cols = L * O;
-  if (!on || !tensorWanted() || O % 4 || rows < 1 || cols % 4 || ((uint64_t)X & 15)) return false;
+  if (!on || O % 4 || rows < 1 || cols % 4 || ((uint64_t)X & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)rt; a.B = (uint64_t)lt; a.C = a.D = (uint64_t)X;
   a.m = cols; a.n = rows; a.k = S; a.lda = ldr; a.ldb = ldl; a.ldc = a.ldd = cols;
   a.ta = 0; a.tb = 1; a.alpha = alpha; a.epilogue = 4096; a.tgC = O; a.tgN = L;
-  ++D().stats.gemms;
-  gemmTensorRun(F16, a, 1, true, "opm product, permuted");
+  gemmRun(F16, F16, F16, a, 1, false, true, "opm product, permuted");
   return true;
 }
 static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
                    float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
                    half* lnOut2, const float* lnScale2, const float* lnOffset2) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
-  if (!on || !tensorWanted() || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
+  if (!on || (!tensorWanted() && lnOut) || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -1007,8 +1005,7 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
     a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps;
     a.lnOut2 = (uint64_t)lnOut2; a.lnScale2 = (uint64_t)lnScale2; a.lnOffset2 = (uint64_t)lnOffset2;
   }
-  ++D().stats.gemms;
-  gemmTensorRun(tp, a, 1, true, "opm output, normalised add");
+  gemmRun(F16, F16, tp, a, 1, false, true, "opm output, normalised add");
   return true;
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
@@ -1264,7 +1261,7 @@ void profileStart() {
 // the peak 27x under half's 65504 (a GEMM's saturating store past it)
 float halfProductScale() {
   static const bool wanted = !getenv("LOCALFOLD_HALF_PROD") || atoi(getenv("LOCALFOLD_HALF_PROD")) != 0;
-  return wanted && matrixUnits() ? 1.f / 1024.f : 0.f;
+  return wanted ? 1.f / 1024.f : 0.f;
 }
 void profileReport(const char* stage, int top) {
   Device& d = D();
