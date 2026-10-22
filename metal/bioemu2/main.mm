@@ -297,9 +297,15 @@ int foldMain(int argc, char** argv) {
   // the weights decoded on the device: the large matrices straight to float16 on the fast arm (a vector, a table, a norm
   // stays float32; anything an elementwise kernel reads as float gets a float32 copy on demand), every tensor float32
   // on the reference arm
-  auto asHalf = [](const std::string&, size_t elements) { return HALF && elements >= 4096; };
+  auto asHalf = [](const std::string& name, size_t elements) {
+    if (!HALF) return false;
+    if (name.size() >= 5 && !name.compare(name.size() - 5, 5, "/bias")) return false;
+    if (name.find("msa_proj/weight") != std::string::npos) return false;
+    return elements >= 4096 || (elements >= 1024 && name.find("proj_z/weight") != std::string::npos);
+  };
   if (!bundle.empty()) M.loadBundle(bundle, "w", asHalf);
   else loadBlobAsBundle(blob, asHalf);
+  if (compareWith.empty()) prepareWeights();
   mt::sync();
   printf("weights up in %.2f s (%.2f GB)\n", now() - tStart, M.weightBytes() / 1e9);
   if (!serveDir.empty()) {

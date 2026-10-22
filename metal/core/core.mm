@@ -912,7 +912,7 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
   // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
   // 404 ms a trunk pass)
-  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256 && (tp == F16 || rows <= 512))) &&
+  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256)) &&
       a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
     const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : 128;
     GemmArgs a{};

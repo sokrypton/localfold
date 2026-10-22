@@ -41,6 +41,15 @@ void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, i
           const float* bias) {
   linear(X, w, Y, rows, in, out, beta, ldx, ldy, true, wide, bias);
 }
+bool linT(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, const float* bias,
+          half* lnOut, const float* lnScale, const float* lnOffset) {
+  const int d0 = dimW(w, 0), d1 = dimW(w, 1);
+  if (d0 != out || d1 != in) die("BioEmu2: %s is [%d, %d], read as (out, in) [%d, %d]", w.c_str(), d0, d1, out, in);
+  Gemm g{}; g.X = X; g.tx = F16; g.W = M.h("w/" + w); g.tw = F16; g.transW = true; g.Y = Y; g.ty = F32;
+  g.rows = rows; g.in = in; g.out = out; g.beta = beta; g.label = w.c_str(); g.bias = bias;
+  g.lnOut = lnOut; g.lnScale = lnScale; g.lnOffset = lnOffset;
+  return gemm(g);
+}
 void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta, int ldx, int ldy, bool wide) {
   linear(X, w, Y, rows, in, out, beta, ldx, ldy, false, wide);
 }
@@ -65,22 +74,37 @@ static const half* swigluWeight(const std::string& p, int C, int I) {
 const half* swigluPairs(const std::string& p, int C, int I) { return swigluWeight(p, C, I); }
 float swigluScale() { return SWIGLU_SCALE; }
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual, const float* gate, int ldg,
-                   const int* map, const float** deferH) {
+                   const int* map, const float** deferH, const float* nextScale, const float* nextOffset,
+                   const float* nextScale2, const float* nextOffset2) {
   if (deferH) *deferH = nullptr;
   const int Co = dimW(p + "fc3/weight", 0);
   Gemm G{}; G.X = g; G.tx = F16; G.W = M.h("w/" + p + "fc3/weight"); G.tw = F16; G.transW = true; G.Y = out; G.ty = F32;
   G.rows = rows; G.in = I; G.out = Co; G.alpha = SWIGLU_SCALE; G.beta = residual ? 1.f : 0.f; G.label = "transition fc3";
-  if (!gate) { gemm(G); return; }
-  if (gemmGatedRows(G, gate, ldg, map)) return;
+  if (!gate) {
+    half* lnOut = nextScale ? scratch<half>("be2.tr.ln1", rows * Co) : nullptr;
+    half* lnOut2 = nextScale2 ? scratch<half>("be2.msa.mnh", rows * Co) : nullptr;
+    G.lnOut = lnOut; G.lnScale = nextScale; G.lnOffset = nextOffset;
+    G.lnOut2 = lnOut2; G.lnScale2 = nextScale2; G.lnOffset2 = nextOffset2;
+    const bool emittedLn = gemm(G);
+    forgetEmitted(out);
+    if (emittedLn) {
+      if (lnOut) recordEmitted(out, nextScale, nextOffset, lnOut);
+      if (lnOut2) recordEmitted(out, nextScale2, nextOffset2, lnOut2);
+    }
+    return;
+  }
+  if (gemmGatedRows(G, gate, ldg, map)) { forgetEmitted(out); return; }
   float* h = scratch<float>(deferH ? "be2.fc3.dh" : "be2.fc3.h", rows * Co);
   G.Y = h; gemm(G);
   if (deferH) { *deferH = h; return; }
   be2Run1d("be2_gated_add", (rows * Co) >> 2, Be2GatedAddArgs{out, h, gate, map, rows, (uint)Co, (uint)ldg});
+  forgetEmitted(out);
 }
 // the fast arm's transition on an input already in half: fc1 | fc2 and the SwiGLU as one GEMM (gemmSwiglu: the product
 // in its epilogue, into half), then fc3 scaled back; a chunk of rows at a time
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual, const float* gate, int ldg,
-                    const int* map, const float** deferH) {
+                    const int* map, const float** deferH, const float* nextScale, const float* nextOffset,
+                    const float* nextScale2, const float* nextOffset2) {
   if (deferH) *deferH = nullptr;
   const int I = dimW(p + "fc1/weight", 0), Co = dimW(p + "fc3/weight", 0);
   if (dimW(p + "fc1/weight", 1) != C || dimW(p + "fc3/weight", 1) != I) die("BioEmu2: %s's shapes do not chain", p.c_str());
@@ -92,18 +116,26 @@ void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::s
     gemmSwiglu(xh + r0 * C, w12, g, r, C, I);
     if (gate) transitionFc3(g, out + r0 * Co, r, I, p, false, map ? gate : gate + r0 * ldg, ldg, map ? map + r0 : nullptr,
                             r == rows ? deferH : nullptr);
-    else transitionFc3(g, out + r0 * Co, r, I, p, residual);
+    else transitionFc3(g, out + r0 * Co, r, I, p, residual, nullptr, 0, nullptr, nullptr,
+                       r == rows ? nextScale : nullptr, r == rows ? nextOffset : nullptr,
+                       r == rows ? nextScale2 : nullptr, r == rows ? nextOffset2 : nullptr);
   }
 }
 
 // out = fc3(silu(fc1 x') fc2 x'), a chunk of rows at a time (the widened rows are 2I a row)
-void transition(const float* x, float* out, size_t rows, int C, const std::string& p, bool residual, bool norm, int ldx) {
+void transition(const float* x, float* out, size_t rows, int C, const std::string& p, bool residual, bool norm, int ldx,
+                const float* nextScale, const float* nextOffset, const float* nextScale2, const float* nextOffset2) {
   if (HALF) {
-    half* xh = scratch<half>("be2.tr.xh", rows * C);
-    if (norm) layerNorm(x, xh, rows, C, Wf(p + "norm/weight"), Wf(p + "norm/bias"), 1e-5f, ldx ? ldx : C, C);
-    else if (!ldx || ldx == C) toHalf(x, xh, rows * C);
-    else die("BioEmu2: a strided transition input without a norm");
-    transitionHalf(xh, out, rows, C, p, residual);
+    const float* sc = norm ? Wf(p + "norm/weight") : nullptr;
+    const float* of = norm ? Wf(p + "norm/bias") : nullptr;
+    half* xh = (norm && (!ldx || ldx == C)) ? takeEmitted(x, sc, of) : nullptr;
+    if (!xh) {
+      xh = scratch<half>("be2.tr.xh", rows * C);
+      if (norm) layerNorm(x, xh, rows, C, sc, of, 1e-5f, ldx ? ldx : C, C);
+      else if (!ldx || ldx == C) toHalf(x, xh, rows * C);
+      else die("BioEmu2: a strided transition input without a norm");
+    }
+    transitionHalf(xh, out, rows, C, p, residual, nullptr, 0, nullptr, nullptr, nextScale, nextOffset, nextScale2, nextOffset2);
     return;
   }
   const int I = dimW(p + "fc1/weight", 0), Co = dimW(p + "fc3/weight", 0);    // (a mixer narrows: 896 -> 128)
@@ -153,24 +185,38 @@ static const float* onesMask(size_t n) {
   }
   return ONES;
 }
-static const half* triGateWeight(const std::string& p, int C) {
+const half* triGateWeight(const std::string& p, int C) {
   const bool q = triQuartersApply(C);
   return M.derived<half>((q ? "trigateQ:" : "trigate:") + p, (size_t)C * 4 * C, [&](half* out) {
     be2Run1d("be2_trigate_weight", (size_t)C * C, Be2TriGateWArgs{M.h("w/" + p + "projection"), M.h("w/" + p + "gate"), out,
                                                                   (uint)C, (uint)C, q ? 1u : 0u, 0});
   });
 }
-static struct { const void* x = nullptr; const float* scale = nullptr; const float* offset = nullptr; half* buf = nullptr; } emitted;
-half* takeEmitted(const void* x, const float* scale, const float* offset) {
-  const bool hit = emitted.x == x && emitted.scale == scale && emitted.offset == offset;
-  emitted.x = nullptr;
-  return hit ? emitted.buf : nullptr;
+const half* pairTransitionWeight(const std::string& p, int C, int I) {
+  return M.derived<half>("swiglu8:" + p, (size_t)C * 2 * I, [&](half* out) {
+    const half* t1 = M.h("w/" + p + "transition1");
+    be2Run1d("be2_interleave8", ((size_t)C * 2 * I) >> 2, Be2Interleave8Args{t1, t1 + I, out, (uint)C, (uint)I, (uint)(2 * I),
+                                                                             1.f / SWIGLU_SCALE});
+  });
 }
-half* lnTarget(size_t P, int C, const half* inUse) {
-  return inUse ? (half*)inUse : scratch<half>("be2.ftri.xn", P * C);
+static struct { const void* x = nullptr; const float* scale = nullptr; const float* offset = nullptr; half* buf = nullptr; } emitted[4];
+half* takeEmitted(const void* x, const float* scale, const float* offset) {
+  for (auto& e : emitted) {
+    if (e.x == x && e.scale == scale && e.offset == offset) { e.x = nullptr; return e.buf; }
+  }
+  return nullptr;
+}
+half* lnTarget(size_t P, int C, const half* inUse, const char* tag) {
+  return inUse ? (half*)inUse : scratch<half>(tag, P * C);
+}
+void forgetEmitted(const void* x) {
+  for (auto& e : emitted) if (!x || e.x == x) e = {};
 }
 void recordEmitted(const void* x, const float* scale, const float* offset, half* buf) {
-  emitted = {x, scale, offset, buf};
+  if (!x) { forgetEmitted(); return; }
+  for (auto& e : emitted) if (e.x == x && e.scale == scale && e.offset == offset) { e.buf = buf; return; }
+  for (auto& e : emitted) if (!e.x) { e = {x, scale, offset, buf}; return; }
+  emitted[0] = {x, scale, offset, buf};
 }
 static void triangleFast(float* z, int T, int C, const std::string& p, bool outgoing,
                          const float* nextScale, const float* nextOffset) {
@@ -189,6 +235,7 @@ static void triangleFast(float* z, int T, int C, const std::string& p, bool outg
                            halfProductScale() ? nullptr : scratch<half>("be2.ftri.cn", P * C),
                            outgoing ? "triangle out contraction" : "triangle in contraction");
   half* lnOut = nextScale ? lnTarget(P, C, xn) : nullptr;
+  forgetEmitted(z);
   if (gemmGatedAddDual(xn, M.h("w/" + p + "gatingLinear"), mid.cn, M.h("w/" + p + "outputProjection"), z, P, C, C, nullptr, nullptr,
                        mid.outH, "triangle output and gated add", lnOut, nextScale, nextOffset))
     recordEmitted(z, nextScale, nextOffset, lnOut);
@@ -196,11 +243,7 @@ static void triangleFast(float* z, int T, int C, const std::string& p, bool outg
 static void pairTransitionFast(float* z, size_t rows, int C, const std::string& p,
                                const float* nextScale, const float* nextOffset) {
   const int I = dimW(p + "transition1", 1) / 2;
-  const half* w1 = M.derived<half>("swiglu8:" + p, (size_t)C * 2 * I, [&](half* out) {
-    const half* t1 = M.h("w/" + p + "transition1");
-    be2Run1d("be2_interleave8", ((size_t)C * 2 * I) >> 2, Be2Interleave8Args{t1, t1 + I, out, (uint)C, (uint)I, (uint)(2 * I),
-                                                                             1.f / SWIGLU_SCALE});
-  });
+  const half* w1 = pairTransitionWeight(p, C, I);
   const size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
   const size_t r1 = std::min(rows, chunk);
   half* xn = scratch<half>("be2.ftr.xn", r1 * C);
@@ -219,6 +262,7 @@ static void pairTransitionFast(float* z, size_t rows, int C, const std::string& 
     if (lnOut) { G.lnOut = lnOut + r0 * C; G.lnScale = nextScale; G.lnOffset = nextOffset; }
     all = gemm(G) && all;
   }
+  forgetEmitted(z);
   if (all) recordEmitted(z, nextScale, nextOffset, lnOut);
 }
 

@@ -47,8 +47,11 @@ template <class A> void be2Run1d(const char* kernel, size_t n, const A& a) {
 // HALF (the fast arm, the default; --f32 is the reference): float16 weights, X rounded as it is staged, float accumulation -
 // `wide` keeps an input that may pass float16's range in float
 extern bool HALF;
+void prepareWeights();
 void linT(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
           bool wide = false, const float* bias = nullptr);     // (bias: added in the GEMM's epilogue)
+bool linT(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+          const float* bias = nullptr, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr);
 void linA(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f, int ldx = 0, int ldy = 0,
           bool wide = false);
 void relu(const float* x, float* y, size_t n);
@@ -56,18 +59,27 @@ void silu(const float* x, float* y, size_t n);
 // the vendor's SwiGLU transition (fc1 / fc2 / fc3, torch): out (+)= fc3(silu(fc1 x') fc2 x'), x' = LN(x) under `norm`
 // (p + "norm/weight", "norm/bias"); ldx: x's row stride
 void transition(const float* x, float* out, size_t rows, int C, const std::string& p, bool residual = true, bool norm = true,
-                int ldx = 0);
+                int ldx = 0, const float* nextScale = nullptr, const float* nextOffset = nullptr,
+                const float* nextScale2 = nullptr, const float* nextOffset2 = nullptr);
 // ...on the fast arm, from an input already in half (an adaLN that wrote it so): no norm
 // (gate: out += gate[map(r)] fc3(...) - the adaLN-gated residual in fc3's epilogue where metal/core takes it, else fc3
 // and be2_gated_add; gate rows ldg apart)
 void transitionHalf(const half* xh, float* out, size_t rows, int C, const std::string& p, bool residual,
-                    const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr);
+                    const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr,
+                    const float* nextScale = nullptr, const float* nextOffset = nullptr,
+                    const float* nextScale2 = nullptr, const float* nextOffset2 = nullptr);
 // (its two halves, for the coupling split: the [C][2I] blocks-of-8 [fc1 | fc2 / 64] weight, and fc3 over the gated
 // product scaled back by 64)
 const half* swigluPairs(const std::string& p, int C, int I);
+const half* triGateWeight(const std::string& p, int C);
+const half* pairTransitionWeight(const std::string& p, int C, int I);
+const half* pwaMgWeight(const std::string& p, int Cm, int HCh);
+const half* qkvgWeight(const std::string& a, int D);
 float swigluScale();      // (fc2's divisor in every derived SwiGLU weight: 64)
 void transitionFc3(const half* g, float* out, size_t rows, int I, const std::string& p, bool residual,
-                   const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr);
+                   const float* gate = nullptr, int ldg = 0, const int* map = nullptr, const float** deferH = nullptr,
+                   const float* nextScale = nullptr, const float* nextOffset = nullptr,
+                   const float* nextScale2 = nullptr, const float* nextOffset2 = nullptr);
 // AF3's pair transition (inputLayerNorm, transition1 [C][2I] blocked [gate | value], transition2 [I][C]), into z
 void pairTransition(float* z, size_t rows, int C, const std::string& p,
                     const float* nextScale = nullptr, const float* nextOffset = nullptr);
@@ -76,8 +88,9 @@ void pairTransition(float* z, size_t rows, int C, const std::string& p,
 void triangle(float* z, int T, int C, const std::string& p, bool outgoing,
               const float* nextScale = nullptr, const float* nextOffset = nullptr);
 half* takeEmitted(const void* x, const float* scale, const float* offset);
-half* lnTarget(size_t P, int C, const half* inUse = nullptr);
+half* lnTarget(size_t P, int C, const half* inUse = nullptr, const char* tag = "be2.ftri.xn");
 void recordEmitted(const void* x, const float* scale, const float* offset, half* buf);
+void forgetEmitted(const void* x = nullptr);
 // the relative position encoding (p + "embed_rel_pos/weight" ...) over the tokens, into out (+= under add)
 void relPos(const std::string& p, float* out, int T, int C, bool add, int ldo = 0);
 

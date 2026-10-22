@@ -633,6 +633,21 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
     }
     return;
   }
+  if (a.C == 256 && a.nLayers > 0) {
+    device const float4* x4 = (device const float4*)(a.c + row * 256);
+    const float4 v0 = x4[lane], v1 = x4[lane + 32], vs = v0 + v1;
+    const float mean = simd_sum(vs.x + vs.y + vs.z + vs.w) * (1.f / 256.f);
+    const float4 d0 = v0 - mean, d1 = v1 - mean;
+    const float inv = rsqrt(simd_sum(dot(d0, d0) + dot(d1, d1)) * (1.f / 256.f) + 1e-5f);
+    const float4 n0 = d0 * inv, n1 = d1 * inv;
+    for (uint j = 0; j < a.nLayers; ++j) {
+      device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 256);
+      device half4* o4 = (device half4*)(a.out + ((ulong)j * a.Rc + row) * 256);
+      o4[lane] = half4(n0 * w4[lane]);
+      o4[lane + 32] = half4(n1 * w4[lane + 32]);
+    }
+    return;
+  }
   if (a.C == 768 && a.nLayers > 0) {
     device const float4* x4 = (device const float4*)(a.c + row * 768);
     float4 xv[6]; float s = 0;

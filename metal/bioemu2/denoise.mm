@@ -61,10 +61,23 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   float* cat = scratch<float>("be2.sc.cat", P * 2 * C);
   copy2d(cat, (size_t)2 * C * 4, zTrunk, (size_t)C * 4, (size_t)C * 4, P);
   relPos("rel_pos/", cat + C, T, C, false, 2 * C);
-  layerNorm(cat, cat, P, 2 * C, Wf(pc + "dim_pairwise_init_proj_0/weight"), Wf(pc + "dim_pairwise_init_proj_0/bias"));
   d.z = allocT<float>(P * C);
-  linT(cat, pc + "dim_pairwise_init_proj_1/weight", d.z, P, 2 * C, C);
-  for (int i = 0; i < 2; ++i) transition(d.z, d.z, P, C, pc + "transitions_" + num(i) + "/");
+  if (HALF) {
+    half* cath = scratch<half>("be2.sc.cath", P * 2 * C);
+    layerNorm(cat, cath, P, 2 * C, Wf(pc + "dim_pairwise_init_proj_0/weight"), Wf(pc + "dim_pairwise_init_proj_0/bias"));
+    const std::string nk = pc + "transitions_0/norm/";
+    half* ln0 = scratch<half>("be2.sc.ln0", P * C);
+    if (linT(cath, pc + "dim_pairwise_init_proj_1/weight", d.z, P, 2 * C, C, 0.f, nullptr, ln0, Wf(nk + "weight"), Wf(nk + "bias")))
+      recordEmitted(d.z, Wf(nk + "weight"), Wf(nk + "bias"), ln0);
+  } else {
+    layerNorm(cat, cat, P, 2 * C, Wf(pc + "dim_pairwise_init_proj_0/weight"), Wf(pc + "dim_pairwise_init_proj_0/bias"));
+    linT(cat, pc + "dim_pairwise_init_proj_1/weight", d.z, P, 2 * C, C);
+  }
+  for (int i = 0; i < 2; ++i) {
+    const std::string nk = i == 0 ? pc + "transitions_1/norm/" : "";
+    transition(d.z, d.z, P, C, pc + "transitions_" + num(i) + "/", true, true, 0,
+               nk.empty() ? nullptr : Wf(nk + "weight"), nk.empty() ? nullptr : Wf(nk + "bias"));
+  }
   // the atoms
   const std::string af = SM + "atom_feature_embedder/";
   const int Ca = dimW(af + "proj_atom_continuous/weight", 0);
@@ -74,16 +87,30 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   copy(d.q0, c, (size_t)N * Ca * 4);
   d.p = allocT<float>((size_t)N * WK * 16);
   pairGeometry(af, d.p, N);
-  float* sn = scratch<float>("be2.sc.sn", (size_t)T * Cs);
-  layerNorm(sTrunk, sn, T, Cs, Wf(af + "s_to_c_trans_0/weight"), Wf(af + "s_to_c_trans_0/bias"));
   float* s2c = scratch<float>("be2.sc.s2c", (size_t)T * Ca);
-  linT(sn, af + "s_to_c_trans_1/weight", s2c, T, Cs, Ca);
+  half* sn2h = HALF ? scratch<half>("be2.sc.sn2h", (size_t)T * Cs) : nullptr;
+  if (HALF) {
+    half* snh = scratch<half>("be2.sc.snh", (size_t)T * Cs);
+    layerNormDual(sTrunk, snh, Wf(af + "s_to_c_trans_0/weight"), Wf(af + "s_to_c_trans_0/bias"),
+                  sn2h, Wf(SM + "s_trunk_to_a_0/weight"), Wf(SM + "s_trunk_to_a_0/bias"), T, Cs);
+    linT(snh, af + "s_to_c_trans_1/weight", s2c, T, Cs, Ca);
+  } else {
+    float* sn = scratch<float>("be2.sc.sn", (size_t)T * Cs);
+    layerNorm(sTrunk, sn, T, Cs, Wf(af + "s_to_c_trans_0/weight"), Wf(af + "s_to_c_trans_0/bias"));
+    linT(sn, af + "s_to_c_trans_1/weight", s2c, T, Cs, Ca);
+  }
   be2Run1d("be2_tokens_to_atoms", (size_t)N * Ca, Be2TokensToAtomsArgs{s2c, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), c, (u64)N,
                                                                     (uint)T, (uint)Ca, (uint)Ca, 1, 1.f, 0});
   float* zn = scratch<float>("be2.sc.zn", P * C);
-  layerNorm(zTrunk, zn, P, C, Wf(af + "z_to_p_trans_0/weight"), Wf(af + "z_to_p_trans_0/bias"));
   float* z2p = scratch<float>("be2.sc.z2p", P * 16);
-  linT(zn, af + "z_to_p_trans_1/weight", z2p, P, C, 16);
+  if (HALF) {
+    half* znh = scratch<half>("be2.sc.znh", P * C);
+    layerNorm(zTrunk, znh, P, C, Wf(af + "z_to_p_trans_0/weight"), Wf(af + "z_to_p_trans_0/bias"));
+    linT(znh, af + "z_to_p_trans_1/weight", z2p, P, C, 16);
+  } else {
+    layerNorm(zTrunk, zn, P, C, Wf(af + "z_to_p_trans_0/weight"), Wf(af + "z_to_p_trans_0/bias"));
+    linT(zn, af + "z_to_p_trans_1/weight", z2p, P, C, 16);
+  }
   run1d("be2_pair_token_add", (size_t)N * WK, Be2PairTokenAddArgs{z2p, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), d.p,
                                                                    (uint)N, (uint)T, 16, 0});
   pairTail(af, d.p, c, N);
@@ -103,7 +130,7 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   });
   windowBias(d.p, wbNorm, wbProj, d.wbias, N, Ha, d.layers);
   if (HALF) d.tbiasH = allocT<half>(tbn * d.layers); else d.tbias = allocT<float>(tbn * d.layers);
-  if (HALF && C == 128) {
+  if (HALF && (C == 128 || C == 256)) {
     const float* tbNorm = M.derived<float>("sm.tb.norm", (size_t)d.layers * C, [&](float* out) {
       for (int l = 0; l < d.layers; ++l) copy(out + (size_t)l * C, Wf(tb(l) + "norm_z/weight"), (size_t)C * 4);
     });
@@ -135,15 +162,23 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
   float* si = scratch<float>("be2.sc.si", (size_t)T * Wi);
   copy2d(si, (size_t)Wi * 4, sTrunk, (size_t)Cs * 4, (size_t)Cs * 4, T);
   copy2d(si + Cs, (size_t)Wi * 4, sInputs, (size_t)Si * 4, (size_t)Si * 4, T);
-  layerNorm(si, si, T, Wi, Wf(sc + "norm_single/weight"), Wf(sc + "norm_single/bias"));
   d.sc0 = allocT<float>((size_t)T * Dt);
-  linT(si, sc + "single_embed/weight", d.sc0, T, Wi, Dt);
-  addBias(d.sc0, Wf(sc + "single_embed/bias"), T, Dt);
+  if (HALF) {
+    half* sih = scratch<half>("be2.sc.sih", (size_t)T * Wi);
+    layerNorm(si, sih, T, Wi, Wf(sc + "norm_single/weight"), Wf(sc + "norm_single/bias"));
+    linT(sih, sc + "single_embed/weight", d.sc0, T, Wi, Dt, 0.f, Wf(sc + "single_embed/bias"));
+  } else {
+    layerNorm(si, si, T, Wi, Wf(sc + "norm_single/weight"), Wf(sc + "norm_single/bias"));
+    linT(si, sc + "single_embed/weight", d.sc0, T, Wi, Dt, 0.f, 0, 0, false, Wf(sc + "single_embed/bias"));
+  }
   if (M.meta("meta/is_dynamics_conditioned", 0) != 0) setDynamics(d, (float)M.meta("meta/dt"), Fin("coords_cond"));
-  float* sn2 = scratch<float>("be2.sc.sn2", (size_t)T * Cs);
-  layerNorm(sTrunk, sn2, T, Cs, Wf(SM + "s_trunk_to_a_0/weight"), Wf(SM + "s_trunk_to_a_0/bias"));
   d.a0 = allocT<float>((size_t)T * Dt);
-  linT(sn2, SM + "s_trunk_to_a_1/weight", d.a0, T, Cs, Dt);
+  if (HALF) linT(sn2h, SM + "s_trunk_to_a_1/weight", d.a0, T, Cs, Dt);
+  else {
+    float* sn2 = scratch<float>("be2.sc.sn2", (size_t)T * Cs);
+    layerNorm(sTrunk, sn2, T, Cs, Wf(SM + "s_trunk_to_a_0/weight"), Wf(SM + "s_trunk_to_a_0/bias"));
+    linT(sn2, SM + "s_trunk_to_a_1/weight", d.a0, T, Cs, Dt);
+  }
   return d;
 }
 void freeDenoiser(Denoiser& d) {
@@ -580,4 +615,112 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   linT(h, ro + "to_out_1/weight", out, RN, Hd, 3);
   const float s2 = sigma * sigma, sd2 = SIGMA_DATA * SIGMA_DATA;
   run1d("be2_edm_out", RN * 3, Be2EdmOutArgs{x, out, den, RN * 3, sd2 / (s2 + sd2), sigma * SIGMA_DATA / sqrtf(sd2 + s2)});
+}
+
+void prepareWeights() {
+  if (!HALF) return;
+  const std::string IE = "input_embedder/atom_attention_encoder/";
+  const std::string ieA = "attention/attention_layer/pair_bias_attn/";
+  auto iePrefix = [&](int i) { return IE + "atom_encoder_layers_" + num(i) + "/transformer_layer/"; };
+  int ieLayers = 0;
+  while (hasW(iePrefix(ieLayers) + ieA + "proj_z/weight")) ++ieLayers;
+  if (ieLayers > 0) {
+    const int Ca = dimW(IE + "proj_atom_continuous/weight", 0);
+    const int Ha = dimW(iePrefix(0) + ieA + "proj_z/weight", 0);
+    M.derived<float>("ie.wb.norm", (size_t)ieLayers * 16, [&](float* out) {
+      for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * 16, Wf(iePrefix(i) + ieA + "norm_z/weight"), 64);
+    });
+    M.derived<float>("ie.wb.proj", (size_t)ieLayers * Ha * 16, [&](float* out) {
+      for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * Ha * 16, Wf(iePrefix(i) + ieA + "proj_z/weight"), (size_t)Ha * 64);
+    });
+    for (int i = 0; i < ieLayers; ++i) {
+      qkvgWeight(iePrefix(i) + ieA, Ca);
+      const std::string st = iePrefix(i) + "transition/";
+      swigluPairs(st, Ca, dimW(st + "fc1/weight", 0));
+    }
+  }
+  const int C = dimW("sequence_embedder/z_init_1/weight", 0);
+  const std::string mm = "sequence_embedder/msa_module/";
+  for (int l = 0; hasW("msa/" + num(l) + "/pairTransition/transition1"); ++l) {
+    const std::string p = "msa/" + num(l) + "/";
+    const std::string pwa = mm + "layers/" + num(l) + "/pair_weighted_averaging/";
+    const std::string mtr = mm + "layers/" + num(l) + "/msa_transition/";
+    const int Cm = dimW(pwa + "proj_m/weight", 1), HCh = dimW(pwa + "proj_o/weight", 1);
+    pwaMgWeight(pwa, Cm, HCh);
+    swigluPairs(mtr, Cm, dimW(mtr + "fc1/weight", 0));
+    for (const char* d : {"Outgoing/", "Incoming/"}) {
+      const std::string tp = p + "triangleMultiplication" + d;
+      triGateWeight(tp, C);
+    }
+    pairTransitionWeight(p + "pairTransition/", C, dimW(p + "pairTransition/transition1", 1) / 2);
+  }
+  for (int l = 0; hasW("pairmixer/" + num(l) + "/pairTransition/transition1"); ++l) {
+    const std::string p = "pairmixer/" + num(l) + "/";
+    for (const char* d : {"Outgoing/", "Incoming/"}) {
+      const std::string tp = p + "triangleMultiplication" + d;
+      triGateWeight(tp, C);
+    }
+    pairTransitionWeight(p + "pairTransition/", C, dimW(p + "pairTransition/transition1", 1) / 2);
+  }
+  const std::string pc = SM + "pairwise_conditioner/", sc = SM + "single_conditioner/", af = SM + "atom_feature_embedder/";
+  const int Ca = dimW(af + "proj_atom_continuous/weight", 0), Dt = dimW(sc + "single_embed/weight", 0);
+  const int Dc = Dt + Ca;
+  for (int i = 0; i < 2; ++i) {
+    const std::string tp = pc + "transitions_" + num(i) + "/", ts = sc + "transitions_" + num(i) + "/";
+    swigluPairs(tp, C, dimW(tp + "fc1/weight", 0));
+    swigluPairs(ts, Dt, dimW(ts + "fc1/weight", 0));
+  }
+  auto ab = [](int l) { return SM + "layers/" + num(l) + "/atom_block/transformer_layer/attention/attention_layer/pair_bias_attn/"; };
+  auto tb = [](int l) { return SM + "layers/" + num(l) + "/token_block/attention/pair_bias_attn/"; };
+  int layers = 0;
+  while (hasW(ab(layers) + "proj_z/weight")) ++layers;
+  if (layers > 0) {
+    const int Ha = dimW(ab(0) + "proj_z/weight", 0), Ht = dimW(tb(0) + "proj_z/weight", 0);
+    M.derived<float>("sm.wb.norm", (size_t)layers * 16, [&](float* out) {
+      for (int l = 0; l < layers; ++l) copy(out + (size_t)l * 16, Wf(ab(l) + "norm_z/weight"), 64);
+    });
+    M.derived<float>("sm.wb.proj", (size_t)layers * Ha * 16, [&](float* out) {
+      for (int l = 0; l < layers; ++l) copy(out + (size_t)l * Ha * 16, Wf(ab(l) + "proj_z/weight"), (size_t)Ha * 64);
+    });
+    if (C == 128 || C == 256) {
+      M.derived<float>("sm.tb.norm", (size_t)layers * C, [&](float* out) {
+        for (int l = 0; l < layers; ++l) copy(out + (size_t)l * C, Wf(tb(l) + "norm_z/weight"), (size_t)C * 4);
+      });
+      M.derived<half>("sm.tb.proj", (size_t)layers * Ht * C, [&](half* out) {
+        for (int l = 0; l < layers; ++l) copy(out + (size_t)l * Ht * C, M.h("w/" + tb(l) + "proj_z/weight"), (size_t)Ht * C * 2);
+      });
+    }
+    const int outC[4] = {6 * Ca, 6 * Dt, 2 * Dc + Ca, 2 * Dc + Dt};
+    for (int k = 0; k < 4; ++k) {
+      const CondKind& CK = COND_KINDS[k];
+      const std::string l0n = std::string(CK.l0), l2n = std::string(CK.l2);
+      stackedVectors(CK.key, CK, (l0n + "/weight").c_str(), layers, Dt);
+      if (hasW(CK.prefix(0) + l0n + "/bias")) stackedVectors(CK.key, CK, (l0n + "/bias").c_str(), layers, Dt);
+      if (hasW(CK.prefix(0) + l2n + "/bias")) stackedVectors(CK.key, CK, (l2n + "/bias").c_str(), layers, outC[k]);
+    }
+    static const bool staged = getenv("BE2_CS_STAGED") && atoi(getenv("BE2_CS_STAGED")) != 0;
+    for (int l = 0; l < layers; ++l) {
+      qkvgWeight(ab(l), Ca);
+      const std::string ast = atomPrefix(l) + "transition/", tst = tokPrefix(l) + "transition/";
+      swigluPairs(ast, Ca, dimW(ast + "fc1/weight", 0));
+      qkvgWeight(tb(l), Dt);
+      swigluPairs(tst, Dt, dimW(tst + "fc1/weight", 0));
+      const std::string s2q = couplingPrefix(l) + "s_to_q_mixer/", q2s = couplingPrefix(l) + "q_to_s_mixer/";
+      const int I = dimW(s2q + "fc1/weight", 0);
+      const half* w12 = swigluPairs(s2q, Dc, I);
+      if (gemmTensorOps()) {
+        const size_t wq = (size_t)Ca * 2 * I;
+        if (staged) M.derived<half>("csQ2:" + s2q, 2 * wq, [&](half* out) {
+          copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+          copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+        });
+        else M.derived<half>("csQ2b:" + s2q, 2 * wq, [&](half* out) {
+          run("be2_cs_wq2", Grid{(uint32_t)((I + 31) / 32), (uint32_t)((Ca + 31) / 32), 1}, 256,
+              Be2CsWqArgs{M.h("w/" + s2q + "fc1/weight"), M.h("w/" + s2q + "fc2/weight"), out, (uint)Dc, (uint)I,
+                          (uint)Dt, (uint)Ca, 1.f / swigluScale(), 0});
+        });
+      }
+      swigluPairs(q2s, Dc, dimW(q2s + "fc1/weight", 0));
+    }
+  }
 }

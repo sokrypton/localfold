@@ -51,7 +51,7 @@ void adaLn(float* x, float* y, size_t rows, int C, const float* alpha, const flo
 // cond: [6D] a row - alpha_a, beta_a, gamma_a, alpha_m, beta_m, gamma_m
 // the attention's q | k | v | g as one torch weight [4D][D] in half: proj_qkv's rows then proj_g's - the layout
 // metal/core's flash attention reads (per position q, k, v, g, each heads x head width)
-static const half* qkvgWeight(const std::string& a, int D) {
+const half* qkvgWeight(const std::string& a, int D) {
   return M.derived<half>("qkvg:" + a, (size_t)4 * D * D, [&](half* out) {
     run1d("be2_stack", ((size_t)4 * D * D) >> 2, Be2StackArgs{M.h("w/" + a + "proj_qkv/weight"), M.h("w/" + a + "proj_g/weight"), out,
                                                               (u64)3 * D * D, (u64)D * D});

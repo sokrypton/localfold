@@ -29,7 +29,12 @@ void buildTokenStarts(int T, int N) {
 
 void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit, const Tap& tap) {
   const int T = D_.T, Cs = dimW(SE + "s_init/weight", 0), C = dimW(SE + "z_init_1/weight", 0);
-  linT(sInputs, SE + "s_init/weight", sInit, T, Si, Cs);
+  half* sih = nullptr;
+  if (HALF) {
+    sih = scratch<half>("be2.msa.sih", (size_t)T * Si);
+    toHalf(sInputs, sih, (size_t)T * Si);
+    linT(sih, SE + "s_init/weight", sInit, T, Si, Cs);
+  } else linT(sInputs, SE + "s_init/weight", sInit, T, Si, Cs);
   {   // s_init += method_conditioning.embedding[method] (no token padding here)
     const int* meth = M.hostI("method_feature");
     const float* emb = M.hostF("w/" + SE + "method_conditioning/embedding/weight");
@@ -40,8 +45,13 @@ void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit, const T
     release(d);
   }
   float* rows = scratch<float>("be2.zi.rows", (size_t)T * C); float* cols = scratch<float>("be2.zi.cols", (size_t)T * C);
-  linT(sInputs, SE + "z_init_1/weight", rows, T, Si, C);
-  linT(sInputs, SE + "z_init_2/weight", cols, T, Si, C);
+  if (HALF) {
+    linT(sih, SE + "z_init_1/weight", rows, T, Si, C);
+    linT(sih, SE + "z_init_2/weight", cols, T, Si, C);
+  } else {
+    linT(sInputs, SE + "z_init_1/weight", rows, T, Si, C);
+    linT(sInputs, SE + "z_init_2/weight", cols, T, Si, C);
+  }
   const std::string cc = SE + "contact_conditioning/";
   if (dimW(cc + "encoder/weight", 1) != 3 + 1 + C) die("BioEmu2: the contact encoder reads %d, not %d", dimW(cc + "encoder/weight", 1), 4 + C);
   run1d("be2_z_init_terms", (size_t)T * T * C,
@@ -69,8 +79,12 @@ static void pairWeightedAveraging(float* m, const float* z, int l) {
   const size_t R = (size_t)S * T, P = (size_t)T * T;
   const float* v = nullptr; const float* g = nullptr; int ldv = HCh;
   if (HALF) {
-    half* mnh = scratch<half>("be2.pwa.mnh", R * Cm);
-    layerNorm(m, mnh, R, Cm, Wf(p + "norm_m/weight"), Wf(p + "norm_m/bias"));
+    const float* msc = Wf(p + "norm_m/weight"); const float* mof = Wf(p + "norm_m/bias");
+    half* mnh = takeEmitted(m, msc, mof);
+    if (!mnh) {
+      mnh = scratch<half>("be2.pwa.mnh", R * Cm);
+      layerNorm(m, mnh, R, Cm, msc, mof);
+    }
     float* vg = scratch<float>("be2.pwa.vg", R * 2 * HCh);
     Gemm G{}; G.X = mnh; G.tx = F16; G.W = pwaMgWeight(p, Cm, HCh); G.tw = F16; G.transW = true; G.Y = vg; G.ty = F32;
     G.rows = R; G.in = Cm; G.out = 2 * HCh; G.label = "pwa proj_mg"; gemm(G);
@@ -106,8 +120,15 @@ static void pairWeightedAveraging(float* m, const float* z, int l) {
   if (HALF) {
     half* oh = scratch<half>("be2.pwa.oh", R * HCh);
     run1d("be2_pwa_apply", pwaItems, Be2PwaApplyArgs{w, v, g, nullptr, oh, (u64)S, (uint)T, (uint)Hh, (uint)Ch, (uint)ldv});
+    const std::string nextMsa = SE + "msa_module/layers/" + num(l) + "/msa_transition/norm/";
+    const float* nmSc = Wf(nextMsa + "weight"); const float* nmOf = Wf(nextMsa + "bias");
+    half* mLnOut = scratch<half>("be2.tr.xh", R * Cm);
     Gemm G{}; G.X = oh; G.tx = F16; G.W = M.h("w/" + p + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = m; G.ty = F32;
-    G.rows = R; G.in = HCh; G.out = Cm; G.beta = 1.f; G.label = "pwa proj_o"; gemm(G);
+    G.rows = R; G.in = HCh; G.out = Cm; G.beta = 1.f; G.label = "pwa proj_o";
+    G.lnOut = mLnOut; G.lnScale = nmSc; G.lnOffset = nmOf;
+    const bool emittedM = gemm(G);
+    forgetEmitted(m);
+    if (emittedM) recordEmitted(m, nmSc, nmOf, mLnOut);
   } else {
     float* o = scratch<float>("be2.pwa.o", R * HCh);
     run1d("be2_pwa_apply", pwaItems, Be2PwaApplyArgs{w, v, g, o, nullptr, (u64)S, (uint)T, (uint)Hh, (uint)Ch, (uint)ldv});
@@ -122,8 +143,12 @@ static void outerProductMean(const float* m, float* z, int l) {
   const size_t R = (size_t)S * T;
   float* proj = scratch<float>("be2.opm.proj", R * 2 * Co);
   if (HALF) {
-    half* mnh = scratch<half>("be2.opm.mnh", R * Cm);
-    layerNorm(m, mnh, R, Cm, Wf(p + "norm/weight"), Wf(p + "norm/bias"));
+    const float* msc = Wf(p + "norm/weight"); const float* mof = Wf(p + "norm/bias");
+    half* mnh = takeEmitted(m, msc, mof);
+    if (!mnh) {
+      mnh = scratch<half>("be2.opm.mnh", R * Cm);
+      layerNorm(m, mnh, R, Cm, msc, mof);
+    }
     Gemm G{}; G.X = mnh; G.tx = F16; G.W = M.h("w/" + p + "proj_ab/weight"); G.tw = F16; G.transW = true; G.Y = proj; G.ty = F32;
     G.rows = R; G.in = Cm; G.out = 2 * Co; G.label = "opm proj_ab"; gemm(G);
   } else {
@@ -145,7 +170,9 @@ static void outerProductMean(const float* m, float* z, int l) {
     o.Y = z; o.ty = F32; o.rows = P; o.in = 1024; o.out = C; o.beta = 1.f;
     o.bias = Wf(p + "proj_o/bias"); o.lnOut = lnOut; o.lnScale = nextSc; o.lnOffset = nextOf;
     o.label = "opm proj_o";
-    if (gemm(o)) recordEmitted(z, nextSc, nextOf, lnOut);
+    const bool emittedZ = gemm(o);
+    forgetEmitted(z);
+    if (emittedZ) recordEmitted(z, nextSc, nextOf, lnOut);
     return;
   }
   float* a = scratch<float>("be2.opm.a", R * Co); float* b = scratch<float>("be2.opm.b", R * Co);
@@ -169,7 +196,9 @@ static void outerProductMean(const float* m, float* z, int l) {
       o.Y = zr; o.ty = F32; o.rows = (size_t)n * T; o.in = Co * Co; o.out = C; o.beta = 1.f;
       o.bias = Wf(p + "proj_o/bias"); o.lnOut = lnOut; o.lnScale = nextSc; o.lnOffset = nextOf;
       o.label = "opm proj_o";
-      if (gemm(o)) recordEmitted(z, nextSc, nextOf, lnOut);
+      const bool emittedZ = gemm(o);
+      forgetEmitted(z);
+      if (emittedZ) recordEmitted(z, nextSc, nextOf, lnOut);
     } else {
       be2Run1d("be2_opm_permute", ((size_t)n * T * Co * Co) >> 2,
                Be2OpmPermuteArgs{x, y, nullptr, (uint)n, (uint)T, (uint)Co, 1.f / (float)D_.nValidRows});
@@ -198,7 +227,9 @@ void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zI
     Gemm Z{}; Z.X = znh; Z.tx = F16; Z.W = M.h("w/" + SE + "z_recycle/weight"); Z.tw = F16; Z.transW = true;
     Z.Y = z; Z.Yin = zInit; Z.ty = F32; Z.rows = P; Z.in = C; Z.out = C; Z.beta = 1.f; Z.label = "z_recycle";
     Z.lnOut = znh; Z.lnScale = nsc; Z.lnOffset = nof;
-    if (gemm(Z)) recordEmitted(z, nsc, nof, znh);
+    const bool emittedZ = gemm(Z);
+    forgetEmitted(z);
+    if (emittedZ) recordEmitted(z, nsc, nof, znh);
   } else {
     float* sn = scratch<float>("be2.tp.sn", (size_t)T * Cs);
     layerNorm(s, sn, T, Cs, Wf(SE + "s_norm/weight"), Wf(SE + "s_norm/bias"));
@@ -220,13 +251,20 @@ void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zI
     Gemm G{}; G.X = sih; G.tx = F16; G.W = M.h("w/" + mm + "s_proj/weight"); G.tw = F16; G.transW = true; G.Y = sp; G.ty = F32;
     G.rows = T; G.in = Si; G.out = Cm; G.label = "s_proj"; gemm(G);
   } else linT(sInputs, mm + "s_proj/weight", sp, T, Si, Cm);
+  forgetEmitted(m);
   run1d("be2_msa_embed", (size_t)S * T * Cm, Be2MsaEmbedArgs{m, Iin("msa"), Iin("has_deletion"), Fin("deletion_value"),
                                                               Iin("msa_paired"), Wf(mm + "msa_proj/weight"), sp, (u64)S,
                                                               (uint)T, (uint)Cm});
   for (int l = 0; hasW("msa/" + num(l) + "/pairTransition/transition1"); ++l) {
     const std::string B = "msa/" + num(l) + "/";
+    const bool moreMsa = hasW("msa/" + num(l + 1) + "/pairTransition/transition1");
     pairWeightedAveraging(m, z, l);
-    transition(m, m, (size_t)S * T, Cm, mm + "layers/" + num(l) + "/msa_transition/");
+    const std::string opmNorm = mm + "layers/" + num(l) + "/outer_product_mean/norm/";
+    const std::string nextPwaM = mm + "layers/" + num(l + 1) + "/pair_weighted_averaging/norm_m/";
+    transition(m, m, (size_t)S * T, Cm, mm + "layers/" + num(l) + "/msa_transition/", true, true, 0,
+               Wf(opmNorm + "weight"), Wf(opmNorm + "bias"),
+               moreMsa ? Wf(nextPwaM + "weight") : nullptr,
+               moreMsa ? Wf(nextPwaM + "bias") : nullptr);
     outerProductMean(m, z, l);
     triangle(z, T, C, B + "triangleMultiplicationOutgoing/", true,
              Wf(B + "triangleMultiplicationIncoming/leftNormInputScale"),
@@ -234,7 +272,6 @@ void trunkPass(const float* sInputs, int Si, const float* sInit, const float* zI
     triangle(z, T, C, B + "triangleMultiplicationIncoming/", false,
              Wf(B + "pairTransition/inputLayerNormScale"),
              Wf(B + "pairTransition/inputLayerNormOffset"));
-    const bool moreMsa = hasW("msa/" + num(l + 1) + "/pairTransition/transition1");
     const std::string nextPwa = SE + "msa_module/layers/" + num(l + 1) + "/pair_weighted_averaging/norm_z/";
     pairTransition(z, P, C, B + "pairTransition/",
                    moreMsa ? Wf(nextPwa + "weight") : Wf("pairmixer/0/triangleMultiplicationOutgoing/leftNormInputScale"),
@@ -263,8 +300,7 @@ void distogram(const float* z, float* logits) {
   float* zs = scratch<float>("be2.dg.zs", P * C);
   run1d("be2_symmetrise", P * C, Be2SymmetriseArgs{z, zs, (uint)T, (uint)C});
   // (wide: the RAW pair - its RMS is ~4.6e3 at 6MRR, and z + z^T passes float16's 65,504 - rounded to half it is inf)
-  linT(zs, "distogram_module/distogram/weight", logits, P, C, B, 0.f, 0, 0, true);
-  addBias(logits, Wf("distogram_module/distogram/bias"), P, B);
+  linT(zs, "distogram_module/distogram/weight", logits, P, C, B, 0.f, 0, 0, true, Wf("distogram_module/distogram/bias"));
 }
 // Boltz's 64 bins over 2-22 A: the bins whose lower edges (linspace(2, 22, 63)) are at most 8 A
 std::vector<float> contactProbs(const float* logits, int T, int B) {
