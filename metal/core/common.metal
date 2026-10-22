@@ -313,8 +313,8 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
   constexpr uint R = 32 * PP;
   device const half* prod = a.prodh;
   threadgroup float part[8 * R];
-  threadgroup half T[R * (8 * NK + 8)];
-  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
+  threadgroup half T[R * (8 * NK + 4)];
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 4;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * R, plane = (ulong)a.Lp * a.Lp;
   ulong q[PP]; bool live[PP];
   for (uint p = 0; p < PP; ++p) {
@@ -322,10 +322,14 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
     q[p] = (ulong)ii * a.Lp + (rr - ii * a.L);
     live[p] = r0 + PP * lane + p < a.pairs;
   }
-  float v[PP][NK];
+  half v[PP][NK];
   for (uint p = 0; p < PP; ++p) {
     float s = 0.f;
-    for (uint k = 0; k < NK; ++k) if (k < nk) { v[p][k] = live[p] ? (float)prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.f; s += v[p][k]; }
+    for (uint k = 0; k < NK; ++k) if (k < nk) {
+      half h = live[p] ? prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.h;
+      v[p][k] = h;
+      s += (float)h;
+    }
     part[grp * R + PP * lane + p] = s;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -334,7 +338,7 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint p = 0; p < PP; ++p) {
     float d2 = 0.f;
-    for (uint k = 0; k < NK; ++k) if (k < nk) { float d = v[p][k] - mean[p]; d2 += d * d; }
+    for (uint k = 0; k < NK; ++k) if (k < nk) { float d = (float)v[p][k] - mean[p]; d2 += d * d; }
     part[grp * R + PP * lane + p] = d2;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -344,7 +348,7 @@ kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg 
     const float inv = rsqrt(V / C + a.eps);
     for (uint k = 0; k < NK; ++k) if (k < nk) {
       uint c = grp + 8 * k;
-      T[(PP * lane + p) * ld + c] = (half)((v[p][k] - mean[p]) * inv * a.scale[c] + a.offset[c]);
+      T[(PP * lane + p) * ld + c] = (half)(((float)v[p][k] - mean[p]) * inv * a.scale[c] + a.offset[c]);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

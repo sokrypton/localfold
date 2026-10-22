@@ -1102,8 +1102,8 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   if (a.q2kIdx) {
     _Pragma("clang loop unroll(full)")
     for (uint e = tid; e < K * D8; e += 128) {
-      uint kj = e / D8, d = (e - kj * D8) * 8, g = ss * K + kj;
-      if (a.q2kMask[g] != 0.f) {
+      uint kj = e / D8, d = (e - kj * D8) * 8, g = ss * a.keys + kj;
+      if (kj < a.keys && a.q2kMask[g] != 0.f) {
         device const half* src = a.kv + (srcBase + (uint)a.q2kIdx[g]) * W2 + h * D + d;
         *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
         *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
@@ -1116,9 +1116,14 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
     _Pragma("clang loop unroll(full)")
     for (uint e = tid; e < K * D8; e += 128) {
       uint kj = e / D8, d = (e - kj * D8) * 8;
-      device const half* src = a.kv + ((ulong)s * K + kj) * W2 + h * D + d;
-      *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
-      *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
+      if (kj < a.keys) {
+        device const half* src = a.kv + ((ulong)s * a.keys + kj) * W2 + h * D + d;
+        *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
+        *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
+      } else {
+        *(threadgroup uint4*)(Ks + kj * LD + d) = uint4(0);
+        *(threadgroup uint4*)(Vs + kj * LD + d) = uint4(0);
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1133,16 +1138,20 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
   const uint q = sg * 8 + sm;
   const float qm = a.qMask[(ulong)ss * Q + q];
-  device const float* pl = a.logits + (((ulong)ss * a.heads + h) * Q + q) * K;
-  device const float* km = a.kMask + (ulong)ss * K;
+  device const float* pl = a.logits + (((ulong)ss * a.heads + h) * Q + q) * a.keys;
+  device const float* km = a.kMask + (ulong)ss * a.keys;
   float mx = -1e30f;
   _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
     thread auto& e = sc[j].thread_elements();
     _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
-      const int k = j * 8 + sn + t;
-      float kk = km[k];
-      float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kk)) : 1e9f * (qm - 1.f) * (kk - 1.f);
-      e[t] += (pl[k] + maskBias) * M_LOG2E_F;
+      const uint k = j * 8 + sn + t;
+      if (k < a.keys) {
+        float kk = km[k];
+        float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kk)) : 1e9f * (qm - 1.f) * (kk - 1.f);
+        e[t] += (pl[k] + maskBias) * M_LOG2E_F;
+      } else {
+        e[t] = -1e30f;
+      }
       mx = max(mx, (float)e[t]);
     }
   }

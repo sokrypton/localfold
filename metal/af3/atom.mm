@@ -103,7 +103,7 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   }
   half* gathered = scratch<half>("ab.gathered", qRows * Wd);
   static const bool scalarAttention = getenv("AF3_SCALAR_ATOM_ATTENTION") != nullptr;      // (the control arm)
-  const bool mma = !scalarAttention && sh.queries == 32 && sh.keys == 128 && (D == 16 || D == 32);
+  const bool mma = !scalarAttention && sh.queries == 32 && sh.keys <= 128 && (D == 16 || D == 32);
   run(mma ? (D == 16 ? "af3_atom_attention_mma16" : "af3_atom_attention_mma32") : "af3_atom_attention",
       Grid{(uint32_t)(sh.subsets * NS), (uint32_t)heads, 1}, 128,
       AtomAttnArgs{qg, qBias, kvAtom, st.queriesToKeys.idx, st.queriesToKeys.mask, st.qMask, st.kMask, bc.pairLogits, gathered,

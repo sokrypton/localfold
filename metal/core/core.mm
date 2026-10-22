@@ -713,11 +713,14 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against
   // 1.20 at 64 x 64; 4096 square 12.0 TFLOP/s against 9.5). Measured on an M5 (8-core GPU), interleaved.
   int tm = a.n <= 128 ? (a.n + 15) / 16 * 16 : 64, tn = a.n <= 128 ? (a.m >= 40 * 64 ? 64 : 32) : (a.m >= 128 ? 128 : 64);
+  if (a.n > 128 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 8) { tm = 32; tn = a.m >= 256 ? 128 : 64; }
   // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
   // 2.960 against 2.886). LOCALFOLD_GEMM_WIDE=0 the control
   static const bool wideWanted = !getenv("LOCALFOLD_GEMM_WIDE") || atoi(getenv("LOCALFOLD_GEMM_WIDE")) != 0;
-  if (wideWanted && (plain || (a.epilogue & (128 | 1048576))) && a.n > 128 && a.k <= 128 && a.m % 256 == 0) { tm = 32; tn = 256; }
+  if (wideWanted && (plain || (a.epilogue & (128 | 1048576))) && a.n > 128 && a.k <= 128 && a.m % 256 == 0 &&
+      (a.m / 256) * ((a.n + 31) / 32) >= 8) { tm = 32; tn = 256; }
+  else if (wideWanted && (plain || (a.epilogue & 128)) && a.n > 80 && a.n <= 128 && a.m >= 1024 && a.m % 128 == 0) { tm = 32; tn = 128; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
   const bool triReg = tri && (a.epilogue & 512);
   if (triReg || (a.epilogue & 524288)) { tm = 64; tn = a.m >= 128 ? 128 : 64; }
@@ -725,13 +728,16 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 64 rows and everything the epilogue touches is 4-element aligned
   static const bool vecWanted = !getenv("LOCALFOLD_GEMM_VEC") || atoi(getenv("LOCALFOLD_GEMM_VEC")) != 0;
   auto al4 = [](uint64_t p, int64_t ld) { return p % 16 == 0 && ld % 4 == 0; };
-  // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 tiles, a whole row each)
+  // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 or 16 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  if (a.lnOut && lnWanted && a.m == 256 && a.n > 128 && !tri && !getenv("LOCALFOLD_GEMM_TILE")) { tm = 32; tn = 256; }
+  if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
+    if (a.m == 256) { tm = a.n <= 128 ? 16 : 32; tn = 256; }
+    else if (a.m == 128) { tm = 64; tn = 128; }
+  }
   const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) &&
                      (!(a.epilogue & 32768) || (a.epilogue & 131072)) &&
                      (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) &&
-                     (tm == 64 || (tm == 32 && tn == 256) || ((a.epilogue & (16384 | 262144 | 1048576)) && tm % 16 == 0 && tn % 32 == 0)) &&
+                     (tm == 64 || ((tm == 32 || tm == 16) && tn == 256) || (!(a.epilogue & 32768) && tm % 16 == 0 && tn % 32 == 0)) &&
                      a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
                      (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0)
                              : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & (64 | 1048576)) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
@@ -746,13 +752,14 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if ((a.epilogue & 8192) && !vecEp) die("gemm: the outer product's normalised add needs the vector epilogue's alignment");
   if ((a.epilogue & 16384) && !vecEp) die("gemm: the gated residual needs the vector epilogue's alignment");
   if ((a.epilogue & 1048576) && !vecEp) die("gemm: the in-place multiply needs the vector epilogue's alignment");
-  if (vecEp && !(a.epilogue & (16384 | 262144 | 1048576)) && tn < 64) tn = 64;
+  if (vecEp && tm <= 64 && !(a.epilogue & (16384 | 262144 | 1048576)) && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
   while (!plain && !tri && !vecEp && !swigluReg && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
-  // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one 64 x 128 tile wide
-  const bool lnEmit = a.lnOut && lnWanted && vecEp && ((tm == 64 && tn == 128) || (tm == 32 && tn == 256)) && a.m == tn &&
+  // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one tile wide
+  const bool lnEmit = a.lnOut && lnWanted && vecEp &&
+                      ((tm == 64 && tn == 128) || ((tm == 32 || tm == 16) && tn == 256)) && a.m == tn &&
                       !hacc && batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
@@ -903,23 +910,22 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
   // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
   // 404 ms a trunk pass)
-  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && in <= 128 && a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
+  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256 && rows <= 256)) &&
+      a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
+    const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : 128;
     GemmArgs a{};
     a.A = (uint64_t)Wg; a.B = (uint64_t)Xg; a.C = a.D = (uint64_t)pair;
     a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
     a.alpha = 1.f; a.epilogue = biasG ? 4 : 0; a.bias = (uint64_t)biasG;
     a.aux = (uint64_t)Xv; a.ldaux = in; a.aux2 = (uint64_t)Wv; a.aux3 = (uint64_t)biasV;
-    const bool ln = lnOut && lnWanted && out == 128 && a16(lnOut) && a16(lnScale) && a16(lnOffset);
+    const bool ln = lnOut && lnWanted && out == tn && a16(lnOut) && a16(lnScale) && a16(lnOffset);
     if (ln) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
     ++D().stats.gemms;
-    if (tp == F16)
-      dispatchInstance("gemmt_dualh_64x128",
-                       "template [[host_name(\"gemmt_dualh_64x128\")]] kernel void lf_gemm_tensor_dual<64, 128, half>(constant GemmArgs&, uint3, uint);",
-                       &a, sizeof a, Grid{(uint32_t)(out / 128), (uint32_t)((rows + 63) / 64), 1}, 128, 0,
-                       label ? label : "gated add, dual");
-    else dispatchInstance("gemmt_dual_64x128",
-                     "template [[host_name(\"gemmt_dual_64x128\")]] kernel void lf_gemm_tensor_dual<64, 128>(constant GemmArgs&, uint3, uint);",
-                     &a, sizeof a, Grid{(uint32_t)(out / 128), (uint32_t)((rows + 63) / 64), 1}, 128, 0,
+    std::string tile = std::to_string(tm) + "x" + std::to_string(tn);
+    std::string targs = std::to_string(tm) + ", " + std::to_string(tn) + (tp == F16 ? ", half" : "");
+    std::string name = std::string(tp == F16 ? "gemmt_dualh_" : "gemmt_dual_") + tile;
+    std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor_dual<" + targs + ">(constant GemmArgs&, uint3, uint);";
+    dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)(out / tn), (uint32_t)((rows + tm - 1) / tm), 1}, 128, 0,
                      label ? label : "gated add, dual");
     return ln;
   }
@@ -1178,8 +1184,9 @@ void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int
 // (a block of a quarter of the channels: the room ahead of the planes is a quarter of them, and the contraction four
 // batched GEMMs where it was one - the same products, each channel's its own)
 // (LOCALFOLD_TRI_BLOCKS: the number of blocks, 1 the control - one GEMM, the planes' room ahead of them all of them)
-static int triBlock(int C) {
-  static const int blocks = getenv("LOCALFOLD_TRI_BLOCKS") ? std::max(1, atoi(getenv("LOCALFOLD_TRI_BLOCKS"))) : 4;
+static int triBlock(int C, int Lp) {
+  static const int env = getenv("LOCALFOLD_TRI_BLOCKS") ? std::max(1, atoi(getenv("LOCALFOLD_TRI_BLOCKS"))) : 0;
+  const int blocks = env ? env : ((size_t)C * Lp * Lp * 2 <= (32 << 20) ? 1 : 4);
   return (C + blocks - 1) / blocks;
 }
 int qkvgBlockRows(size_t perRow, int rows) {
@@ -1189,18 +1196,16 @@ int qkvgBlockRows(size_t perRow, int rows) {
   return (rows + blocks - 1) / blocks;
 }
 size_t triBytes(int C, int Lp) {
-  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C);
+  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C, Lp);
   return plane * 2 * (2 * (size_t)C + (halfProductScale() ? cc : 2 * cc));
 }
 half* triPlanes(void* big, int L, int C, int Lp) {
-  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C);
-  half* a = (half*)big + plane * (halfProductScale() ? cc : 2 * cc);
-  padZero(a, 2 * (size_t)C, L, Lp);       // (the planes' padding, written by nothing else, and the buffer shared)
-  return a;
+  const size_t plane = (size_t)Lp * Lp, cc = triBlock(C, Lp);
+  return (half*)big + plane * (halfProductScale() ? cc : 2 * cc);
 }
 TriMid triContract(void* big, int L, int C, bool outgoing, float alpha, const float* scale, const float* offset, half* spare,
                    const char* label) {
-  const int Lp = (L + 7) / 8 * 8, cc = triBlock(C);
+  const int Lp = (L + 7) / 8 * 8, cc = triBlock(C, Lp);
   const size_t plane = (size_t)Lp * Lp;
   const float hs = halfProductScale();
   const size_t pw = hs ? 1 : 2;           // half planes a channel's product takes
@@ -1209,7 +1214,7 @@ TriMid triContract(void* big, int L, int C, bool outgoing, float alpha, const fl
   // at pw (k + 1) cc planes, where the planes it reads begin (pw cc + 2 k cc): a block never writes what it reads
   for (int c0 = 0; c0 < C; c0 += cc) {
     const half* ak = a + 2 * plane * c0; const half* bk = ak + plane;
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
+    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = L; g.in = L; g.out = L; g.ldx = g.ldw = g.ldy = Lp;
     g.sx = g.sw = (int64_t)(2 * plane); g.sy = (int64_t)plane; g.batch = std::min(cc, C - c0);
     g.Y = (half*)big + plane * pw * c0; g.alpha = alpha * (hs ? hs : 1.f); g.accFloat = hs != 0.f; g.label = label;
     if (outgoing) { g.X = ak; g.W = bk; g.transW = true; }
