@@ -290,48 +290,54 @@ struct Cond0Tables {
 // normalizes cnd[row, :] once per (row, l) and writes all 4 SiLU(LN(cnd)) outputs.
 template <class TH>
 __global__ void __launch_bounds__(256, 2)
-lnToCond4K(const float* __restrict__ cnd, TH* __restrict__ yAll, int T, Cond0Tables tab) {
+lnToCond4K(const float* __restrict__ cnd, TH* __restrict__ yAll, int T, int rows, Cond0Tables tab) {
   int row = (int)blockIdx.x * 8 + (threadIdx.x >> 5);
   int lane = threadIdx.x & 31;
   int l = (int)blockIdx.y;
-  if (row > T) return;
-  constexpr int K = 24, C = 768;
-  const float* xr = cnd + (size_t)row * C;
-  float xv[K];
+  if (row >= rows) return;
+  int rLocal = row % (T + 1);
+  constexpr int K4 = 6, C = 768;
+  const float4* xr4 = reinterpret_cast<const float4*>(cnd + (size_t)row * C);
+  float4 xv[K4];
   float s = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float v = __ldg(xr + k * 32 + lane);
+  for (int k = 0; k < K4; ++k) {
+    float4 v = __ldg(xr4 + k * 32 + lane);
     xv[k] = v;
-    s += v;
+    s += (v.x + v.y) + (v.z + v.w);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / C, var = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float d = xv[k] - mean;
-    var += d * d;
+  for (int k = 0; k < K4; ++k) {
+    float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+    var += (dx * dx + dy * dy) + (dz * dz + dw * dw);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
   float inv = rsqrtf(var / C + 1e-5f);
   #pragma unroll
-  for (int k = 0; k < K; ++k) xv[k] = (xv[k] - mean) * inv;
+  for (int k = 0; k < K4; ++k) {
+    xv[k] = make_float4((xv[k].x - mean) * inv, (xv[k].y - mean) * inv,
+                        (xv[k].z - mean) * inv, (xv[k].w - mean) * inv);
+  }
   #pragma unroll
   for (int m = 0; m < 4; ++m) {
-    if ((m & 1) && row >= T) continue;
-    const float* sc = tab.scale[m] + (size_t)l * C;
-    const float* of = tab.offset[m] ? (tab.offset[m] + (size_t)l * C) : nullptr;
-    TH* yr = yAll + ((size_t)(m * (int)gridDim.y + l) * (size_t)(T + 1) + (size_t)row) * C;
+    if ((m & 1) && rLocal >= T) continue;
+    const float4* sc4 = reinterpret_cast<const float4*>(tab.scale[m] + (size_t)l * C);
+    const float4* of4 = tab.offset[m] ? reinterpret_cast<const float4*>(tab.offset[m] + (size_t)l * C) : nullptr;
+    TH* yr = yAll + ((size_t)(m * (int)gridDim.y + l) * (size_t)rows + (size_t)row) * C;
     #pragma unroll
-    for (int k = 0; k < K; ++k) {
-      int c = k * 32 + lane;
-      float n = xv[k] * __ldg(sc + c);
-      if (of) n += __ldg(of + c);
-      n = siluF(n);
-      if constexpr (std::is_same_v<TH, float>) yr[c] = n;
-      else yr[c] = toH<TH>(n);
+    for (int k = 0; k < K4; ++k) {
+      int c4 = k * 32 + lane;
+      float4 sv = __ldg(sc4 + c4);
+      float4 ov = of4 ? __ldg(of4 + c4) : make_float4(0.f, 0.f, 0.f, 0.f);
+      storeVec4<TH>(yr, c4,
+                    siluF(xv[k].x * sv.x + ov.x),
+                    siluF(xv[k].y * sv.y + ov.y),
+                    siluF(xv[k].z * sv.z + ov.z),
+                    siluF(xv[k].w * sv.w + ov.w));
     }
   }
 }
@@ -350,6 +356,47 @@ inline void lnTo(const float* x, TH* y, size_t rows, int C, const float* scale, 
 // the SwiGLU's product from fc1|fc2's [rows, 2I] f16 output, into fc3's bf16 input
 __global__ void swigluToK(const half* __restrict__ h12, __nv_bfloat16* __restrict__ g, size_t rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((I & 7) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) {
+    int i8 = I >> 3;
+    size_t n8 = rows * (size_t)i8;
+    if (t >= n8) return;
+    size_t r; int c8;
+    if ((i8 & (i8 - 1)) == 0) {
+      c8 = (int)(t & (size_t)(i8 - 1));
+      r = t >> (__ffs(i8) - 1);
+    } else if (i8 == 384 && n8 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 384u; r = q; c8 = (int)(u - q * 384u);
+    } else if (i8 == 336 && n8 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 336u; r = q; c8 = (int)(u - q * 336u);
+    } else if (i8 == 192 && n8 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, q = u / 192u; r = q; c8 = (int)(u - q * 192u);
+    } else if (n8 <= UINT32_MAX) {
+      unsigned u = (unsigned)t, ui = (unsigned)i8, q = u / ui; r = q; c8 = (int)(u - q * ui);
+    } else {
+      r = t / i8; c8 = (int)(t % i8);
+    }
+    const uint4* hr = reinterpret_cast<const uint4*>(h12 + r * 2 * I);
+    uint4 a4 = __ldg(hr + c8), b4 = __ldg(hr + i8 + c8);
+    float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&a4.x));
+    float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&a4.y));
+    float2 a2 = __half22float2(*reinterpret_cast<const __half2*>(&a4.z));
+    float2 a3 = __half22float2(*reinterpret_cast<const __half2*>(&a4.w));
+    float2 b0 = __half22float2(*reinterpret_cast<const __half2*>(&b4.x));
+    float2 b1 = __half22float2(*reinterpret_cast<const __half2*>(&b4.y));
+    float2 b2 = __half22float2(*reinterpret_cast<const __half2*>(&b4.z));
+    float2 b3 = __half22float2(*reinterpret_cast<const __half2*>(&b4.w));
+    __nv_bfloat162 o0 = __floats2bfloat162_rn(siluF(a0.x) * b0.x, siluF(a0.y) * b0.y);
+    __nv_bfloat162 o1 = __floats2bfloat162_rn(siluF(a1.x) * b1.x, siluF(a1.y) * b1.y);
+    __nv_bfloat162 o2 = __floats2bfloat162_rn(siluF(a2.x) * b2.x, siluF(a2.y) * b2.y);
+    __nv_bfloat162 o3 = __floats2bfloat162_rn(siluF(a3.x) * b3.x, siluF(a3.y) * b3.y);
+    uint4 out;
+    out.x = *reinterpret_cast<const unsigned*>(&o0);
+    out.y = *reinterpret_cast<const unsigned*>(&o1);
+    out.z = *reinterpret_cast<const unsigned*>(&o2);
+    out.w = *reinterpret_cast<const unsigned*>(&o3);
+    reinterpret_cast<uint4*>(g)[t] = out;
+    return;
+  }
   if ((I & 3) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 7) == 0) {
     int i4 = I >> 2;
     size_t n4 = rows * (size_t)i4;
@@ -583,52 +630,61 @@ __global__ void adaLnK(const float* x, TY* y, size_t rows, int C, int ldx, const
   }
 }
 template <class TY, int K, bool GATED = false>
-__global__ void __launch_bounds__(256, (K <= 16 ? 4 : (GATED ? 1 : 2)))
+__global__ void __launch_bounds__(256, (K <= 16 ? 4 : 2))
 adaLnRegK(float* __restrict__ x, TY* __restrict__ y, size_t rows, int ldx,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
           float scale, const int* __restrict__ map,
-          const float* __restrict__ h = nullptr, const float* __restrict__ gate = nullptr) {
+          const float* __restrict__ h = nullptr, const float* __restrict__ gate = nullptr, int ldg = 0) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
-  constexpr int C = K * 32;
+  constexpr int C = K * 32, K4 = K / 4;
   const size_t cr = map ? (size_t)__ldg(map + row) : row;
-  float* xr = x + row * ldx;
-  const float* hr = GATED ? (h + row * C) : nullptr;
-  const float* gr = GATED ? (gate + cr * ldc) : nullptr;
-  float xv[K];
+  float4* xr4 = reinterpret_cast<float4*>(x + row * ldx);
+  const float4* hr4 = GATED ? reinterpret_cast<const float4*>(h + row * C) : nullptr;
+  const float4* gr4 = GATED ? reinterpret_cast<const float4*>(gate + cr * (ldg ? ldg : ldc)) : nullptr;
+  float4 xv[K4];
   float s = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    int c = k * 32 + lane;
-    float v = __ldg(xr + c);
+  for (int k = 0; k < K4; ++k) {
+    int c4 = k * 32 + lane;
+    float4 v = __ldg(xr4 + c4);
     if constexpr (GATED) {
-      v += __ldg(gr + c) * __ldg(hr + c);
-      xr[c] = v;
+      float4 gv = __ldg(gr4 + c4);
+      float4 hv = __ldg(hr4 + c4);
+      v.x += gv.x * hv.x;
+      v.y += gv.y * hv.y;
+      v.z += gv.z * hv.z;
+      v.w += gv.w * hv.w;
+      xr4[c4] = v;
     }
     xv[k] = v;
-    s += v;
+    s += (v.x + v.y) + (v.z + v.w);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   float mean = s / C, var = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float d = xv[k] - mean;
-    var += d * d;
+  for (int k = 0; k < K4; ++k) {
+    float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+    var += (dx * dx + dy * dy) + (dz * dz + dw * dw);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
   float inv = rsqrtf(var / C + 1e-5f);
-  const float* ar = alpha + cr * ldc;
-  const float* br = beta + cr * ldc;
+  const float4* ar4 = reinterpret_cast<const float4*>(alpha + cr * ldc);
+  const float4* br4 = reinterpret_cast<const float4*>(beta + cr * ldc);
   TY* yr = y + row * C;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    int c = k * 32 + lane;
-    const float v2 = scale * ((xv[k] - mean) * inv * (1.f + __ldg(ar + c)) + __ldg(br + c));
-    if constexpr (std::is_same_v<TY, float>) yr[c] = v2;
-    else yr[c] = toH<TY>(v2);
+  for (int k = 0; k < K4; ++k) {
+    int c4 = k * 32 + lane;
+    float4 av = __ldg(ar4 + c4);
+    float4 bv = __ldg(br4 + c4);
+    storeVec4<TY>(yr, c4,
+                  scale * ((xv[k].x - mean) * inv * (1.f + av.x) + bv.x),
+                  scale * ((xv[k].y - mean) * inv * (1.f + av.y) + bv.y),
+                  scale * ((xv[k].z - mean) * inv * (1.f + av.z) + bv.z),
+                  scale * ((xv[k].w - mean) * inv * (1.f + av.w) + bv.w));
   }
 }
 template <class TY = float>
@@ -644,17 +700,19 @@ inline void adaLn(const float* x, TY* y, size_t rows, int C, const float* alpha,
 }
 template <class TY = float>
 inline void adaLnGatedAdd(float* x, const float* h, const float* gate, TY* y, size_t rows, int C,
-                          const float* alpha, const float* beta, int ldc, const int* map = nullptr) {
+                          const float* alpha, const float* beta, int ldc, const int* map = nullptr, int ldg = 0) {
+  int lg = ldg ? ldg : ldc;
   unsigned g = (unsigned)((rows + 7) / 8);
-  if (C == 128) { adaLnRegK<TY, 4, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate); return; }
-  if (C == 768) { adaLnRegK<TY, 24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate); return; }
-  gatedAdd(x, h, gate, rows, C, ldc, map);
+  if (C == 128) { adaLnRegK<TY, 4, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
+  if (C == 768) { adaLnRegK<TY, 24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, alpha, beta, ldc, 1.f, map, h, gate, lg); return; }
+  gatedAdd(x, h, gate, rows, C, lg, map);
   adaLn<TY>(x, y, rows, C, alpha, beta, ldc, 0, 1.f, map);
 }
-// Fused [tokensToAtoms(a) | q] (768 + 128 = 896) + adaLN directly into y (f32 or f16)
+// Fused q += gateA * tAtom (in place) + [tokensToAtoms(a) | q] (768 + 128 = 896) + adaLN directly into y (f32 or f16)
 template <class TY>
 __global__ void __launch_bounds__(256, 2)
-adaLnS2QK(const float* __restrict__ a, const float* __restrict__ q,
+adaLnS2QK(const float* __restrict__ a, float* __restrict__ q,
+          const float* __restrict__ tAtom, const float* __restrict__ gateA, int ldgA,
           const int* __restrict__ atomTok, const int* __restrict__ atomPad,
           TY* __restrict__ y, size_t rows, int N, int T,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
@@ -662,53 +720,64 @@ adaLnS2QK(const float* __restrict__ a, const float* __restrict__ q,
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
-  constexpr int K = 28, C = 896;
+  constexpr int K4 = 7, C = 896;
   int s = (int)(row / (size_t)N), al = (int)(row - (size_t)s * N);
   int pad = __ldg(atomPad + al);
   int tokIdx = pad ? __ldg(atomTok + al) : 0;
-  const float* ar = a + ((size_t)s * T + tokIdx) * 768;
-  const float* qr = q + row * 128;
-  float xv[K];
+  const size_t cr = map ? (size_t)__ldg(map + row) : row;
+  const float4* ar4 = reinterpret_cast<const float4*>(a + ((size_t)s * T + tokIdx) * 768);
+  float4* qr4 = reinterpret_cast<float4*>(q + row * 128);
+  const float4* tar4 = reinterpret_cast<const float4*>(tAtom + row * 128);
+  const float4* gar4 = reinterpret_cast<const float4*>(gateA + cr * ldgA);
+  float4 xv[K4];
   float sum = 0.f;
   #pragma unroll
-  for (int k = 0; k < 24; ++k) {
-    float v = pad ? __ldg(ar + k * 32 + lane) : 0.f;
+  for (int k = 0; k < 6; ++k) {
+    float4 v = pad ? __ldg(ar4 + k * 32 + lane) : make_float4(0.f, 0.f, 0.f, 0.f);
     xv[k] = v;
-    sum += v;
+    sum += (v.x + v.y) + (v.z + v.w);
   }
-  #pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    float v = __ldg(qr + k * 32 + lane);
-    xv[24 + k] = v;
-    sum += v;
+  {
+    float4 qv = __ldg(qr4 + lane), tav = __ldg(tar4 + lane), gav = __ldg(gar4 + lane);
+    float4 v = make_float4(qv.x + gav.x * tav.x, qv.y + gav.y * tav.y,
+                           qv.z + gav.z * tav.z, qv.w + gav.w * tav.w);
+    qr4[lane] = v;
+    xv[6] = v;
+    sum += (v.x + v.y) + (v.z + v.w);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
   float mean = sum / C, var = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float d = xv[k] - mean;
-    var += d * d;
+  for (int k = 0; k < K4; ++k) {
+    float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+    var += (dx * dx + dy * dy) + (dz * dz + dw * dw);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
   float inv = rsqrtf(var / C + 1e-5f);
-  const size_t cr = map ? (size_t)__ldg(map + row) : row;
-  const float* alr = alpha + cr * ldc;
-  const float* ber = beta + cr * ldc;
+  const float4* alr4 = reinterpret_cast<const float4*>(alpha + cr * ldc);
+  const float4* ber4 = reinterpret_cast<const float4*>(beta + cr * ldc);
   TY* yr = y + row * C;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    int c = k * 32 + lane;
-    const float v2 = (xv[k] - mean) * inv * (1.f + __ldg(alr + c)) + __ldg(ber + c);
-    if constexpr (std::is_same_v<TY, float>) yr[c] = v2;
-    else yr[c] = toH<TY>(v2);
+  for (int k = 0; k < K4; ++k) {
+    int c4 = k * 32 + lane;
+    float4 av = __ldg(alr4 + c4);
+    float4 bv = __ldg(ber4 + c4);
+    storeVec4<TY>(yr, c4,
+                  (xv[k].x - mean) * inv * (1.f + av.x) + bv.x,
+                  (xv[k].y - mean) * inv * (1.f + av.y) + bv.y,
+                  (xv[k].z - mean) * inv * (1.f + av.z) + bv.z,
+                  (xv[k].w - mean) * inv * (1.f + av.w) + bv.w);
   }
 }
-// Fused [centreAtoms(q) | a] (128 + 768 = 896) + adaLN directly into y (f32 or f16)
+// Fused a += gateT * tTok (in place) + [centreAtoms(q + gateA * tAtom) | a] (128 + 768 = 896) + adaLN directly into y (f32 or f16)
 template <class TY>
 __global__ void __launch_bounds__(256, 2)
-adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ a,
+adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ tAtom,
+          const float* __restrict__ gateA, int ldgA, const int* __restrict__ atomTok,
+          float* __restrict__ a, const float* __restrict__ tTok,
+          const float* __restrict__ gateT, int ldgT,
           const int* __restrict__ centre,
           TY* __restrict__ y, size_t rows, int N, int T,
           const float* __restrict__ alpha, const float* __restrict__ beta, int ldc,
@@ -716,46 +785,62 @@ adaLnQ2SK(const float* __restrict__ q, const float* __restrict__ a,
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
-  constexpr int K = 28, C = 896;
+  constexpr int K4 = 7, C = 896;
   int s = (int)(row / (size_t)T), il = (int)(row - (size_t)s * T);
   int caIdx = __ldg(centre + il);
-  const float* qr = q + ((size_t)s * N + caIdx) * 128;
-  const float* ar = a + row * 768;
-  float xv[K];
+  size_t caRow = (size_t)s * N + caIdx;
+  int caTok = __ldg(atomTok + caIdx);
+  size_t caCr = caTok >= 0 ? (size_t)caTok : (size_t)T;
+  const size_t cr = map ? (size_t)__ldg(map + row) : row;
+  const float4* qr4 = reinterpret_cast<const float4*>(q + caRow * 128);
+  const float4* tar4 = reinterpret_cast<const float4*>(tAtom + caRow * 128);
+  const float4* gar4 = reinterpret_cast<const float4*>(gateA + caCr * ldgA);
+  float4* ar4 = reinterpret_cast<float4*>(a + row * 768);
+  const float4* ttr4 = reinterpret_cast<const float4*>(tTok + row * 768);
+  const float4* gtr4 = reinterpret_cast<const float4*>(gateT + cr * ldgT);
+  float4 xv[K4];
   float sum = 0.f;
-  #pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    float v = __ldg(qr + k * 32 + lane);
-    xv[k] = v;
-    sum += v;
+  {
+    float4 qv = __ldg(qr4 + lane), tav = __ldg(tar4 + lane), gav = __ldg(gar4 + lane);
+    float4 v = make_float4(qv.x + gav.x * tav.x, qv.y + gav.y * tav.y,
+                           qv.z + gav.z * tav.z, qv.w + gav.w * tav.w);
+    xv[0] = v;
+    sum += (v.x + v.y) + (v.z + v.w);
   }
   #pragma unroll
-  for (int k = 0; k < 24; ++k) {
-    float v = __ldg(ar + k * 32 + lane);
-    xv[4 + k] = v;
-    sum += v;
+  for (int k = 0; k < 6; ++k) {
+    int c4 = k * 32 + lane;
+    float4 av = __ldg(ar4 + c4), ttv = __ldg(ttr4 + c4), gtv = __ldg(gtr4 + c4);
+    float4 v = make_float4(av.x + gtv.x * ttv.x, av.y + gtv.y * ttv.y,
+                           av.z + gtv.z * ttv.z, av.w + gtv.w * ttv.w);
+    ar4[c4] = v;
+    xv[1 + k] = v;
+    sum += (v.x + v.y) + (v.z + v.w);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
   float mean = sum / C, var = 0.f;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    float d = xv[k] - mean;
-    var += d * d;
+  for (int k = 0; k < K4; ++k) {
+    float dx = xv[k].x - mean, dy = xv[k].y - mean, dz = xv[k].z - mean, dw = xv[k].w - mean;
+    var += (dx * dx + dy * dy) + (dz * dz + dw * dw);
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
   float inv = rsqrtf(var / C + 1e-5f);
-  const size_t cr = map ? (size_t)__ldg(map + row) : row;
-  const float* alr = alpha + cr * ldc;
-  const float* ber = beta + cr * ldc;
+  const float4* alr4 = reinterpret_cast<const float4*>(alpha + cr * ldc);
+  const float4* ber4 = reinterpret_cast<const float4*>(beta + cr * ldc);
   TY* yr = y + row * C;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    int c = k * 32 + lane;
-    const float v2 = (xv[k] - mean) * inv * (1.f + __ldg(alr + c)) + __ldg(ber + c);
-    if constexpr (std::is_same_v<TY, float>) yr[c] = v2;
-    else yr[c] = toH<TY>(v2);
+  for (int k = 0; k < K4; ++k) {
+    int c4 = k * 32 + lane;
+    float4 av = __ldg(alr4 + c4);
+    float4 bv = __ldg(ber4 + c4);
+    storeVec4<TY>(yr, c4,
+                  (xv[k].x - mean) * inv * (1.f + av.x) + bv.x,
+                  (xv[k].y - mean) * inv * (1.f + av.y) + bv.y,
+                  (xv[k].z - mean) * inv * (1.f + av.z) + bv.z,
+                  (xv[k].w - mean) * inv * (1.f + av.w) + bv.w);
   }
 }
 // rows of a token tensor broadcast to atoms (zero on padding atoms); and each token's centre atom (zero on
@@ -855,7 +940,8 @@ inline void transitionHalf(const float* x, const half* xh, float* out, size_t ro
         if (mx > worst) { worst = mx; printf("fc1|fc2 max %g (%s)\n", mx, p.c_str()); }
       }
     }
-    size_t nSw = ((I & 3) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 7) == 0) ? r * (size_t)(I >> 2) : r * I;
+    size_t nSw = ((I & 7) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 15) == 0) ? r * (size_t)(I >> 3)
+               : ((I & 3) == 0 && (((uintptr_t)h12 | (uintptr_t)g) & 7) == 0) ? r * (size_t)(I >> 2) : r * I;
     swigluToK<<<blocks(nSw), 256, 0, STREAM>>>(h12, g, r, I);
     linearPre<__nv_bfloat16>(g, w3, out + r0 * Co, r, I, Co, residual ? 1.f : 0.f);
   }

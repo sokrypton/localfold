@@ -24,6 +24,64 @@ __global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, 
   out[t] = c < C ? (z16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(z)[p * C + c]) : z[p * C + c])   // (EF2_Z16)
                  : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
 }
+// Fused [z | rel_pos] + LayerNorm(zInputNorm) for C == 256 (2C == 512), a warp per pair row
+__global__ void __launch_bounds__(256, 4)
+joinPairRelNorm256K(const float* __restrict__ z, RelIdx rel, float* __restrict__ out,
+                    const float* __restrict__ scale, const float* __restrict__ offset,
+                    size_t p0, size_t n, int T, bool z16 = false) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= n) return;
+  int lane = threadIdx.x & 31;
+  size_t p = p0 + row;
+  int i = (int)(p / (size_t)T), j = (int)(p % (size_t)T);
+  const int rb = 32, cb = 2, w = 2 * rb + 2;
+  auto clip = [](int v, int hi) { return v < 0 ? 0 : v > hi ? hi : v; };
+  int ai = __ldg(rel.asym + i), aj = __ldg(rel.asym + j);
+  int ri = __ldg(rel.ri + i), rj = __ldg(rel.ri + j);
+  bool sameChain = ai == aj, sameRes = ri == rj, sameEnt = __ldg(rel.ent + i) == __ldg(rel.ent + j);
+  int b0 = sameChain ? clip(ri - rj + rb, 2 * rb) : 2 * rb + 1;
+  int b1 = sameChain && sameRes ? clip(__ldg(rel.ti + i) - __ldg(rel.ti + j) + rb, 2 * rb) : 2 * rb + 1;
+  int b3 = sameChain ? 2 * cb + 1 : clip(__ldg(rel.sym + i) - __ldg(rel.sym + j) + cb, 2 * cb);
+  const float* w0 = rel.Wt + (size_t)b0 * 256;
+  const float* w1 = rel.Wt + (size_t)(w + b1) * 256;
+  const float* w2 = rel.Wt + (size_t)(2 * w) * 256;
+  const float* w3 = rel.Wt + (size_t)(2 * w + 1 + b3) * 256;
+  float xv[16];
+  float s = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    float v = z16 ? __bfloat162float(__ldg(reinterpret_cast<const __nv_bfloat16*>(z) + p * 256 + c))
+                  : __ldg(z + p * 256 + c);
+    xv[k] = v;
+    s += v;
+  }
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    float v = __ldg(w0 + c) + __ldg(w1 + c) + __ldg(w3 + c);
+    if (sameEnt) v += __ldg(w2 + c);
+    xv[8 + k] = v;
+    s += v;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / 512.f, v = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    float d = xv[k] - mean;
+    v += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / 512.f + 1e-5f);
+  float* yr = out + row * 512;
+  #pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    int c = k * 32 + lane;
+    yr[c] = (xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
+  }
+}
 __global__ void siluMulK(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((n & 3) == 0 && (((uintptr_t)a | (uintptr_t)b | (uintptr_t)out) & 15) == 0) {
@@ -65,20 +123,22 @@ __global__ void fourierK(const float* w, const float* b, const float* level, flo
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = cosf(2.f * 3.14159265358979323846f * (level[0] * w[i] + b[i]));
 }
-__global__ void addRowK(float* __restrict__ x, const float* __restrict__ row, size_t rows, int C) {
+__global__ void addRowK(float* __restrict__ x, const float* __restrict__ row, size_t rows, int C,
+                        const float* __restrict__ base = nullptr) {
+  const float* src = base ? base : x;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if ((C & 3) == 0 && (((uintptr_t)x | (uintptr_t)row) & 15) == 0) {
+  if ((C & 3) == 0 && (((uintptr_t)x | (uintptr_t)src | (uintptr_t)row) & 15) == 0) {
     int c4 = C >> 2;
     size_t n4 = rows * (size_t)c4;
     if (t < n4) {
       int c = (int)((unsigned)t % (unsigned)c4);
-      float4 xv = reinterpret_cast<const float4*>(x)[t];
+      float4 xv = __ldg(reinterpret_cast<const float4*>(src) + t);
       float4 rv = __ldg(reinterpret_cast<const float4*>(row) + c);
       reinterpret_cast<float4*>(x)[t] = make_float4(xv.x + rv.x, xv.y + rv.y, xv.z + rv.z, xv.w + rv.w);
     }
     return;
   }
-  if (t < rows * C) x[t] += row[t % C];
+  if (t < rows * C) x[t] = src[t] + row[t % C];
 }
 __global__ void coordsInputK(const float* x, const float* level, float* out, int A) {   // [A, 6] = [x / denom | 0]
   int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -442,6 +502,7 @@ struct Denoiser {
   // scaled by that adaLN's singleScale: snScaled [2 blocks, T, Ct]); 48+2b, 48+2b+1 its two out gates
   float* single; float* snScaled; float* G; float* scales; const void** ptrs; int entries;
   float* level;                   // NoiseLevel on the device
+  float* sBase = nullptr;         // precomputed LN(s_inputs; sInputNorm) @ sProjection [T, Ct]
   float* encMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomEncoder blocks [atomBlocks, A, 6*Ca]
   float* decMod = nullptr;        // precomputed silu(c0) @ adaln for diffusionAtomDecoder blocks [atomBlocks, A, 6*Ca]
 };
@@ -488,8 +549,13 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
     const size_t pBeg = shardedQ ? (size_t)EF2_QLO * T : 0, pEnd = shardedQ ? (size_t)(EF2_QLO + EF2_QROWS) * T : P;
     for (size_t p0 = pBeg; p0 < pEnd; p0 += chunk) {
       size_t n = std::min(chunk, pEnd - p0);
-      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
-      layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+      if (Cz == 256) {
+        joinPairRelNorm256K<<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(
+            zTrunk, relIdx(), joined, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"), p0, n, T, EF2_Z16);
+      } else {
+        joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
+        layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+      }
       gemm(joined, F("diffusion/zProjection"), rows, n, 2 * Cz, Cz);
       for (int l = 0; l < 2; ++l) transitionLayer(rows, n, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
       for (int b = 0; b < d.tokenBlocks; ++b) {
@@ -507,8 +573,13 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   float* pair = scratch<float>("dc.pair", P * Cz);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
-    layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+    if (Cz == 256) {
+      joinPairRelNorm256K<<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(
+          zTrunk, relIdx(), joined, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"), p0, n, T, EF2_Z16);
+    } else {
+      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
+      layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+    }
     gemm(joined, F("diffusion/zProjection"), pair + p0 * Cz, n, 2 * Cz, Cz);
   }
   for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
@@ -537,6 +608,10 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   {
     struct Restore { bool was = GEMM16; ~Restore() { GEMM16 = was; } } restore;
     GEMM16 = FAST && SAMPLER16;
+    d.sBase = dalloc((size_t)T * d.Ct);
+    float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
+    layerNorm(sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
+    gemm(sn, F("diffusion/sProjection"), d.sBase, T, d.Si, d.Ct);
     int Ca = d.atoms.ctx.C, ab = d.atomBlocks;
     size_t acVec = (Ca & 3) == 0 ? (size_t)A * (Ca >> 2) : (size_t)A * Ca;
     size_t modStride = (size_t)A * 6 * Ca;
@@ -576,15 +651,12 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
 // single [T, Ct] at noise level t
 inline void conditioningSingle(const Denoiser& d, float* single) {
   int T = d.T, Ct = d.Ct;
-  float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
-  layerNorm(d.sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
-  gemm(sn, F("diffusion/sProjection"), single, T, d.Si, Ct);
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", nf); float* noise = scratch<float>("dc.noise", Ct);
   fourierK<<<blocks(nf), 256, 0, STREAM>>>(F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), d.level, four, nf);
   layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
   gemm(four, F("diffusion/noiseProjection"), noise, 1, nf, Ct);
-  addRowK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(single, noise, T, Ct);
+  addRowK<<<blocks((Ct & 3) == 0 ? (size_t)T * (Ct >> 2) : (size_t)T * Ct), 256, 0, STREAM>>>(single, noise, T, Ct, d.sBase);
   for (int l = 0; l < 2; ++l) transitionLayer(single, T, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
 }
 
@@ -713,7 +785,7 @@ inline void freeDenoiser(Denoiser& d) {
   CK(cudaStreamSynchronize(STREAM));
   for (void* b : d.biases) CK(cudaFree(b));
   for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.ptrs, (void*)d.level,
-                  (void*)d.encMod, (void*)d.decMod})
+                  (void*)d.sBase, (void*)d.encMod, (void*)d.decMod})
     if (p) CK(cudaFree(p));
   freeAtoms(d.atoms);
   d.biases.clear();

@@ -111,16 +111,24 @@ inline void languageModel(const Esmc& e, const int* ids, const int* seq, const i
     for (size_t i = 0; i < mix.size(); ++i) mx = std::max(mx, cmb[i]);
     for (size_t i = 0; i < mix.size(); ++i) { mix[i] = expf(cmb[i] - mx); s += mix[i]; }
     for (auto& m : mix) m /= s; }
-  float* acc = scratch<float>("shim.acc", R * P); CK(cudaMemsetAsync(acc, 0, R * P * 4, STREAM));
-  float* xn = scratch<float>("shim.xn", R * C); float* proj = scratch<float>("shim.proj", R * P);
+  float* acc = scratch<float>("shim.acc", R * P);
+  if (!FAST) CK(cudaMemsetAsync(acc, 0, R * P * 4, STREAM));
+  float* xn = scratch<float>("shim.xn", R * C);
+  float* proj = FAST ? nullptr : scratch<float>("shim.proj", R * P);
+  const float* lmScale = Cw("lm/norm/scale");
+  const float* lmOffset = Cw("lm/norm/offset");
   auto mixIn = [&](int k, const float* state) {
     if (onState) onState(k, state);
-    layerNorm(state, xn, R, C, Cw("lm/norm/scale"), Cw("lm/norm/offset"));
-    gemm(xn, Cw("lm/projection/weights"), proj, R, C, P);
-    size_t n = R * P;
-    axpyK<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(acc, proj, mix[k], n);
+    if (k == e.layers) layerNorm(state, xn, R, C, lmScale, lmOffset);
+    if (FAST) {
+      gemm(xn, Cw("lm/projection/weights"), acc, R, C, P, k == 0 ? 0.f : 1.f, 0, 0, mix[k]);
+    } else {
+      gemm(xn, Cw("lm/projection/weights"), proj, R, C, P);
+      size_t n = R * P;
+      axpyK<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(acc, proj, mix[k], n);
+    }
   };
-  esmcTower(e, ids, seq, mixIn);
+  esmcTower(e, ids, seq, mixIn, xn, lmScale, lmOffset);
   gemm(acc, Cw("lm/downproject/weights"), single, R, P, P);
   addBias(single, Cw("lm/downproject/bias"), R, P);
   }

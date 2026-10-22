@@ -17,6 +17,64 @@ __global__ void confZK(float* z, RelIdx rel, Bonds bonds, const float* wBond, co
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
   z[t] += relPosAt(rel, i, j, c, C) + bondAt(bonds, i, j) * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
 }
+// Fused LayerNorm(zTrunk; zNorm) + confZK / confZRowsK for C == 256, a warp per pair row
+__global__ void __launch_bounds__(256, 2)
+confZNorm256K(const float* __restrict__ zIn, float* __restrict__ zOut,
+              const float* __restrict__ scale, const float* __restrict__ offset,
+              RelIdx rel, Bonds bonds, const float* __restrict__ wBond,
+              const float* __restrict__ rows, const float* __restrict__ cols,
+              size_t p0, size_t n, int T, bool z16 = false) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= n) return;
+  int lane = threadIdx.x & 31;
+  size_t ij = p0 + row;
+  int i = (int)(ij / (size_t)T), j = (int)(ij % (size_t)T);
+  const int rb = 32, cb = 2, w = 2 * rb + 2;
+  auto clip = [](int v, int hi) { return v < 0 ? 0 : v > hi ? hi : v; };
+  int ai = __ldg(rel.asym + i), aj = __ldg(rel.asym + j);
+  int ri = __ldg(rel.ri + i), rj = __ldg(rel.ri + j);
+  bool sameChain = ai == aj, sameRes = ri == rj, sameEnt = __ldg(rel.ent + i) == __ldg(rel.ent + j);
+  int b0 = sameChain ? clip(ri - rj + rb, 2 * rb) : 2 * rb + 1;
+  int b1 = sameChain && sameRes ? clip(__ldg(rel.ti + i) - __ldg(rel.ti + j) + rb, 2 * rb) : 2 * rb + 1;
+  int b3 = sameChain ? 2 * cb + 1 : clip(__ldg(rel.sym + i) - __ldg(rel.sym + j) + cb, 2 * cb);
+  const float* w0 = rel.Wt + (size_t)b0 * 256;
+  const float* w1 = rel.Wt + (size_t)(w + b1) * 256;
+  const float* w2 = rel.Wt + (size_t)(2 * w) * 256;
+  const float* w3 = rel.Wt + (size_t)(2 * w + 1 + b3) * 256;
+  float bond = bondAt(bonds, i, j);
+  float xv[8];
+  float s = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    float v = z16 ? __bfloat162float(__ldg(reinterpret_cast<const __nv_bfloat16*>(zIn) + row * 256 + c))
+                  : __ldg(zIn + row * 256 + c);
+    xv[k] = v;
+    s += v;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / 256.f, v = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float d = xv[k] - mean;
+    v += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / 256.f + 1e-5f);
+  float* yr = zOut + row * 256;
+  const float* riRow = rows + (size_t)i * 256;
+  const float* cjRow = cols + (size_t)j * 256;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    float n = (xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
+    float rp = __ldg(w0 + c) + __ldg(w1 + c) + __ldg(w3 + c);
+    if (sameEnt) rp += __ldg(w2 + c);
+    yr[c] = n + (rp + bond * __ldg(wBond + c) + __ldg(riRow + c) + __ldg(cjRow + c));
+  }
+}
 __global__ void outerProductK(const float* a, const float* b, float* out, size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n * C) return;
@@ -269,9 +327,15 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
       size_t n = std::min(per, P - p0);
       const B16* src = stack + p0 * C;
       if (!kept) { CK(cudaMemcpyAsync(stage, reinterpret_cast<const B16*>(PARK_HOST) + p0 * C, n * C * 2, cudaMemcpyHostToDevice, STREAM)); src = stage; }
-      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(src, xn, n * C);
-      layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
+      if (C == 256) {
+        confZNorm256K<<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(
+            reinterpret_cast<const float*>(src), zc, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"),
+            relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, true);
+      } else {
+        ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(src, xn, n * C);
+        layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+        confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, p0, n, T, C);
+      }
       outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, p0, n, T, C);
       gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
       distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
@@ -314,8 +378,14 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   }
   float* z = !zTrunk ? nullptr : inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
   if (zTrunk) {
-  layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
-  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, T, C);
+  if (C == 256) {
+    confZNorm256K<<<(unsigned)((P + 7) / 8), 256, 0, STREAM>>>(
+        zTrunk, z, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"),
+        relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, 0, P, T, false);
+  } else {
+    layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+    confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), BONDS, F("featuriser/tokenBonds"), r, c, T, C);
+  }
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
   float* prod = scratch<float>("cf.prod", chunk * C);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {

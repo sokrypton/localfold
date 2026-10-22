@@ -437,10 +437,12 @@ inline float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int 
 // the layer on x [R, D] (samples stacked, `perSample` rows each), its conditioning rows `cond` reached through `map`
 // GEMM_HALF: every GEMM input written in f16 by the kernel before it (adaLN, the gated attention output)
 inline void condLayerHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias,
-                          int perSample) {
+                          int perSample, float* tOut = nullptr,
+                          const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0) {
   const std::string a = L.att;
   half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
-  adaLn<half>(x, hh, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
+  if (preH) adaLnGatedAdd<half>(x, preH, preGate, hh, R, D, cond, cond + D, 6 * D, map, preLdg);
+  else adaLn<half>(x, hh, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
   float* qkvg = scratch<float>("be2.cl.qkv", (size_t)R * 4 * D);
   const half* wQkvg = stackedMirror2<half>(lw(L, a + "proj_qkv/weight"), (size_t)3 * D * D,
                                            lw(L, a + "proj_g/weight"), (size_t)D * D);
@@ -454,15 +456,17 @@ inline void condLayerHalf(const CondLayer& L, float* x, int R, int D, const floa
   float* h = scratch<float>("be2.cl.h", (size_t)R * D);
   linearPre<half>(hh, halfMirror<half>(lw(L, a + "proj_o/weight"), (size_t)D * D), h, R, D, D);
   adaLnGatedAdd<half>(x, h, cond + 2 * D, hh, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
-  float* t = scratch<float>("be2.cl.t", (size_t)R * D);
+  float* t = tOut ? tOut : scratch<float>("be2.cl.t", (size_t)R * D);
   transitionHalf(nullptr, hh, t, R, D, L.p + "transition/", L.l, false, false, 0);
-  gatedAdd(x, t, cond + 5 * D, R, D, 6 * D, map);
+  if (!tOut) gatedAdd(x, t, cond + 5 * D, R, D, 6 * D, map);
 }
 inline void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias,
-                      int perSample) {
-  if (GEMM_HALF) { condLayerHalf(L, x, R, D, cond, map, bias, perSample); return; }
+                      int perSample, float* tOut = nullptr,
+                      const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0) {
+  if (GEMM_HALF) { condLayerHalf(L, x, R, D, cond, map, bias, perSample, tOut, preH, preGate, preLdg); return; }
   float* h = scratch<float>("be2.cl.h", (size_t)R * D);
-  adaLn(x, h, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
+  if (preH) adaLnGatedAdd<float>(x, preH, preGate, h, R, D, cond, cond + D, 6 * D, map, preLdg);
+  else adaLn(x, h, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
   float* qkvg = scratch<float>("be2.cl.qkv", (size_t)R * 4 * D);
   float* o = scratch<float>("be2.cl.o", (size_t)R * D);
   const std::string a = L.att;
@@ -478,9 +482,9 @@ inline void condLayer(const CondLayer& L, float* x, int R, int D, const float* c
   }
   linear(o, lw(L, a + "proj_o/weight"), h, R, D, D);
   adaLnGatedAdd<float>(x, h, cond + 2 * D, o, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map);
-  float* t = scratch<float>("be2.cl.t", (size_t)R * D);
+  float* t = tOut ? tOut : scratch<float>("be2.cl.t", (size_t)R * D);
   transition(o, t, R, D, L.p + "transition/", L.l, false, false);
-  gatedAdd(x, t, cond + 5 * D, R, D, 6 * D, map);
+  if (!tOut) gatedAdd(x, t, cond + 5 * D, R, D, 6 * D, map);
 }
 // ...on its own conditioning, a row of c a row of x (the input embedder's)
 inline void condLayer(const CondLayer& L, float* x, int R, int D, const float* c, int Cc, const float* bias) {

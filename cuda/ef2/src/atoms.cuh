@@ -104,15 +104,17 @@ __global__ void siluK(const float* __restrict__ x, float* __restrict__ y, size_t
   }
   if (t < n) y[t] = siluF(x[t]);
 }
-// rms(x) * (1 + mod[scale]) + mod[shift], a warp a row (C = 128); optionally fuses x += mod[gateWhich] * d first
+// rms(x) * (1 + mod[scale]) + mod[shift], a warp a row (C = 128); optionally fuses x += dMod[gateWhich] * d first
 __global__ void rmsModulateK(float* __restrict__ x, const float* __restrict__ mod, float* __restrict__ y,
                              int rows, int C, int shift, int scale,
-                             const float* __restrict__ d = nullptr, int gateWhich = 0) {
+                             const float* __restrict__ d = nullptr, int gateWhich = 0,
+                             const float* __restrict__ dMod = nullptr) {
   int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
   if (row >= rows) return;
   float* xr = x + (size_t)row * C;
   float* yr = y + (size_t)row * C;
   const float* m = mod + (size_t)row * 6 * C;
+  const float* dm = (dMod ? dMod : mod) + (size_t)row * 6 * C;
   const float* dr = d ? d + (size_t)row * C : nullptr;
   if (C == 128) {
     float xv[4];
@@ -122,7 +124,7 @@ __global__ void rmsModulateK(float* __restrict__ x, const float* __restrict__ mo
       int c = k * 32 + lane;
       float v = __ldg(xr + c);
       if (dr) {
-        v += __ldg(m + gateWhich * 128 + c) * __ldg(dr + c);
+        v += __ldg(dm + gateWhich * 128 + c) * __ldg(dr + c);
         xr[c] = v;
       }
       xv[k] = v;
@@ -141,7 +143,7 @@ __global__ void rmsModulateK(float* __restrict__ x, const float* __restrict__ mo
   float s = 0;
   for (int c = lane; c < C; c += 32) {
     float v = xr[c];
-    if (dr) { v += m[gateWhich * C + c] * dr[c]; xr[c] = v; }
+    if (dr) { v += dm[gateWhich * C + c] * dr[c]; xr[c] = v; }
     s += v * v;
   }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
@@ -326,7 +328,8 @@ inline void dumpOnce(const char* name, const float* d, size_t n) {
   fwrite(h.data(), 4, h.size(), f); fclose(f);
 }
 inline void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::string& B, int halfWindow,
-                     const float* preMod = nullptr, const float* preSilu = nullptr) {
+                     const float* preMod = nullptr, const float* preSilu = nullptr,
+                     const float* prevMod = nullptr, bool fuseOut = false) {
   size_t A = a.A; int C = a.C;
   size_t acVec = (C & 3) == 0 ? A * (size_t)(C >> 2) : A * C;
   const float* mod = preMod;
@@ -342,7 +345,9 @@ inline void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::s
     mod = modBuf;
   }
   float* xm = scratch<float>("atom.xm", A * C);
-  rmsModulateK<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(x, mod, xm, (int)A, C, 0, 1);
+  float* att = scratch<float>("atom.att", A * C);
+  rmsModulateK<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(x, mod, xm, (int)A, C, 0, 1,
+                                                            prevMod ? att : nullptr, 5, prevMod);
   float* qkv = scratch<float>("atom.qkv", A * 3 * C);
   gemm(xm, F(B + "qkv"), qkv, A, C, 3 * C);
   dumpOnce("mod", mod, A * 6 * C); dumpOnce("xm", xm, A * C); dumpOnce("qkv_raw", qkv, A * 3 * C);
@@ -357,14 +362,13 @@ inline void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::s
   gemm(xm, F(B + "attnGate"), gate, A, C, C);
   dumpOnce("ctx", ctx, A * C);
   gateLiveK<<<blocks(acVec), 256, 0, STREAM>>>(ctx, gate, a.mask, A, C);
-  float* att = scratch<float>("atom.att", A * C);
   gemm(ctx, F(B + "attnOut"), att, A, C, C);
   rmsModulateK<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(x, mod, xm, (int)A, C, 3, 4, att, 2);
   float* h = scratch<float>("atom.h", A * 2 * a.hidden); float* g = scratch<float>("atom.g", A * a.hidden);
   gemm(xm, F(B + "ffnUp"), h, A, C, 2 * a.hidden);
   swigluK<<<blocks((a.hidden & 3) == 0 ? A * (size_t)(a.hidden >> 2) : A * a.hidden), 256, 0, STREAM>>>(h, g, A, a.hidden);
   gemm(g, F(B + "ffnDown"), att, A, a.hidden, C);
-  gatedAddK<<<blocks(acVec), 256, 0, STREAM>>>(x, mod, att, (int)A, C, 5);
+  if (!fuseOut) gatedAddK<<<blocks(acVec), 256, 0, STREAM>>>(x, mod, att, (int)A, C, 5);
 }
 inline void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocksN, int halfWindow,
                      const float* preModStack = nullptr) {
@@ -377,9 +381,13 @@ inline void swaStack(const AtomCtx& a, float* x, const float* cond, const std::s
     sc = scBuf;
   }
   size_t modStride = (size_t)a.A * 6 * a.C;
-  for (int b = 0; b < blocksN; ++b)
+  bool canFuse = preModStack != nullptr && !getenv("EF2_DUMPDIR");
+  for (int b = 0; b < blocksN; ++b) {
+    const float* curMod = preModStack ? preModStack + b * modStride : nullptr;
+    const float* prevMod = (canFuse && b > 0) ? (preModStack + (b - 1) * modStride) : nullptr;
     swaBlock(a, x, cond, prefix + "/blocks/" + std::to_string(b) + "/", halfWindow,
-             preModStack ? preModStack + b * modStride : nullptr, sc);
+             curMod, sc, prevMod, canFuse && (b + 1 < blocksN));
+  }
 }
 
 __global__ void reluK(float* __restrict__ x, size_t n) {

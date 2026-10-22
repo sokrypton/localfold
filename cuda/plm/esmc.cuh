@@ -101,95 +101,75 @@ qkNormRopeK(const float* __restrict__ qkv, float* __restrict__ qOut, float* __re
     yr[c1] = a * cs.y + b * cs.x;
   }
 }
-// softmax over a score row, keys of another chain (sequence id) excluded
-__global__ void softmaxSeqK(float* __restrict__ S, const int* __restrict__ seq, int rows, float scale) {
-  size_t row = (size_t)blockIdx.x;          // (head, query)
+// softmax over a score row, keys of another chain (sequence id) excluded; one warp (32 lanes) per (head, query) row
+template <int MAX_K>
+__global__ void __launch_bounds__(128, 4)
+softmaxSeqRegK(float* __restrict__ S, const int* __restrict__ seq, int rows, int totalRows, float scale) {
+  size_t row = (size_t)blockIdx.x * 4 + (threadIdx.x >> 5);
+  if (row >= (size_t)totalRows) return;
+  int lane = threadIdx.x & 31;
   int q = (int)(row % (size_t)rows);
   int sq = __ldg(seq + q);
   float* s = S + row * rows;
-  __shared__ float red[32];
-  if (rows <= 1024) {
-    float sv[4];
-    float m = -INFINITY;
-    #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      int j = threadIdx.x + k * 256;
-      if (j < rows) {
-        float v = __ldg(seq + j) == sq ? s[j] * scale : -INFINITY;
-        sv[k] = v;
-        m = fmaxf(m, v);
-      }
-    }
-    #pragma unroll
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-      float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -INFINITY;
-      #pragma unroll
-      for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o));
-      if (threadIdx.x == 0) red[0] = v;
-    }
-    __syncthreads();
-    m = red[0];
-    float sum = 0;
-    #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      int j = threadIdx.x + k * 256;
-      if (j < rows) {
-        float e = expf(sv[k] - m);
-        sv[k] = e;
-        sum += e;
-      }
-    }
-    #pragma unroll
-    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-      float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
-      #pragma unroll
-      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-      if (threadIdx.x == 0) red[0] = v;
-    }
-    __syncthreads();
-    float inv = 1.f / red[0];
-    #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      int j = threadIdx.x + k * 256;
-      if (j < rows) s[j] = sv[k] * inv;
-    }
-    return;
-  }
+  float sv[MAX_K];
   float m = -INFINITY;
-  for (int j = threadIdx.x; j < rows; j += blockDim.x) {
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < rows) {
+      float v = __ldg(seq + j) == sq ? s[j] * scale : -INFINITY;
+      sv[k] = v;
+      m = fmaxf(m, v);
+    }
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+  float sum = 0.f;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < rows) {
+      float e = expf(sv[k] - m);
+      sv[k] = e;
+      sum += e;
+    }
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  float inv = 1.f / sum;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int j = lane + k * 32;
+    if (j < rows) s[j] = sv[k] * inv;
+  }
+}
+__global__ void softmaxSeqK(float* __restrict__ S, const int* __restrict__ seq, int rows, int totalRows, float scale) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= (size_t)totalRows) return;
+  int lane = threadIdx.x & 31;
+  int q = (int)(row % (size_t)rows);
+  int sq = __ldg(seq + q);
+  float* s = S + row * rows;
+  float m = -INFINITY;
+  for (int j = lane; j < rows; j += 32) {
     float v = __ldg(seq + j) == sq ? s[j] * scale : -INFINITY;
     s[j] = v; m = fmaxf(m, v);
   }
+  #pragma unroll
   for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
-  __syncthreads();
-  if (threadIdx.x < 32) {
-    float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY;
-    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o));
-    if (threadIdx.x == 0) red[0] = v;
-  }
-  __syncthreads();
-  m = red[0];
-  __syncthreads();
-  float sum = 0;
-  for (int j = threadIdx.x; j < rows; j += blockDim.x) { float e = expf(s[j] - m); s[j] = e; sum += e; }
+  float sum = 0.f;
+  for (int j = lane; j < rows; j += 32) { float e = expf(s[j] - m); s[j] = e; sum += e; }
+  #pragma unroll
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = sum;
-  __syncthreads();
-  if (threadIdx.x < 32) {
-    float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-    if (threadIdx.x == 0) red[0] = v;
-  }
-  __syncthreads();
-  float inv = 1.f / red[0];
-  for (int j = threadIdx.x; j < rows; j += blockDim.x) s[j] *= inv;
+  float inv = 1.f / sum;
+  for (int j = lane; j < rows; j += 32) s[j] *= inv;
+}
+inline void softmaxSeq(float* S, const int* seq, int rows, int totalRows, float scale) {
+  unsigned g4 = (unsigned)((totalRows + 3) / 4);
+  if (rows <= 128) softmaxSeqRegK<4><<<g4, 128, 0, STREAM>>>(S, seq, rows, totalRows, scale);
+  else if (rows <= 256) softmaxSeqRegK<8><<<g4, 128, 0, STREAM>>>(S, seq, rows, totalRows, scale);
+  else if (rows <= 512) softmaxSeqRegK<16><<<g4, 128, 0, STREAM>>>(S, seq, rows, totalRows, scale);
+  else softmaxSeqK<<<(unsigned)((totalRows + 7) / 8), 256, 0, STREAM>>>(S, seq, rows, totalRows, scale);
 }
 
 struct Esmc { int rows, model, heads, ffn, layers, pair; float residualScale = 1.f; };
@@ -213,18 +193,26 @@ __global__ void expandRowsInt8K(const signed char* __restrict__ q, const __half*
     w[idx] = __float2half(__half2float(__ldg(scale + row)) * (float)__ldg(q + idx));
   }
 }
-inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
-                      float alpha = 1.f) {
+inline void towerGemmPre(const half* xh, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+                         float alpha = 1.f) {
   if (M.isResident("c/" + w + "T")) {
     ResidentInt8 r = M.residentInt8("c/" + w + "T");
     if (r.scales32) { fprintf(stderr, "c/%sT: the resident ESM-C tower reads int8 codes, a scale a row\n", w.c_str()); exit(1); }
     if (r.elements != (size_t)in * out || r.block != in) { fprintf(stderr, "c/%sT is not [%d, %d] a row a scale\n", w.c_str(), out, in); exit(1); }
     __half* w16 = scratch<__half>("tower.w16", r.elements);
     expandRowsInt8K<<<dim3((unsigned)((in + 255) / 256), (unsigned)out), 256, 0, STREAM>>>(r.codes, r.scales, w16, in);
-    __half* xh = scratch<__half>("gemmh.x", rows * in);
-    toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
     CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, w16, CUDA_R_16F, in, xh, CUDA_R_16F, in, &beta,
                     Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    return;
+  }
+  gemmHPre(xh, Wh("c/" + w), Y, rows, in, out, beta, alpha);
+}
+inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+                      float alpha = 1.f) {
+  if (M.isResident("c/" + w + "T")) {
+    __half* xh = scratch<__half>("gemmh.x", rows * in);
+    toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
+    towerGemmPre(xh, w, Y, rows, in, out, beta, alpha);
     return;
   }
   // (alpha: the residual scale, on every path - it was the resident one's alone, and 300M's 0.9129 then exited here)
@@ -232,13 +220,21 @@ inline void towerGemm(const float* X, const std::string& w, float* Y, size_t row
   else gemm(X, Cw(w), Y, rows, in, out, beta, 0, 0, alpha);
 }
 
-inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer, const float2* cosSin = nullptr) {
+inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer, const float2* cosSin = nullptr,
+                      bool preAttnNorm = false) {
   std::string B = "blocks/" + std::to_string(layer) + "/";
   size_t R = e.rows; int C = e.model;
-  float* xn = scratch<float>("esmc.xn", R * C);
+  bool useHalf = (FAST && TOWER16) || M.isResident("c/" + B + "qkv/weightsT");
   float* qkv = scratch<float>("esmc.qkv", R * 3 * C);
-  layerNorm(x, xn, R, C, Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
-  towerGemm(xn, B + "qkv/weights", qkv, R, C, 3 * C);
+  if (useHalf) {
+    half* xnh = scratch<half>("esmc.xnh", R * C);
+    if (!preAttnNorm) layerNorm<half>(x, xnh, R, C, Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
+    towerGemmPre(xnh, B + "qkv/weights", qkv, R, C, 3 * C);
+  } else {
+    float* xn = scratch<float>("esmc.xn", R * C);
+    if (!preAttnNorm) layerNorm<float>(x, xn, R, C, Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
+    towerGemm(xn, B + "qkv/weights", qkv, R, C, 3 * C);
+  }
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   const float* qScale = Cw(B + "q_norm/scale");
   const float* kScale = Cw(B + "k_norm/scale");
@@ -265,32 +261,56 @@ inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer, const 
       const int g = std::min(hg, e.heads - h0);
       CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)R, (int)R, 64, &one, k + h0 * 64, C, 64, q + h0 * 64, C, 64, &zero,
                                    S, (int)R, (long long)R * R, g));
-      softmaxSeqK<<<(unsigned)(g * R), 256, 0, STREAM>>>(S, seq, (int)R, 0.125f);
+      softmaxSeq(S, seq, (int)R, (int)(g * R), 0.125f);
       CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, (int)R, (int)R, &one, qkv + 2 * C + h0 * 64, 3 * C, 64, S,
                                    (int)R, (long long)R * R, &zero, ctx + h0 * 64, C, 64, g));
     }
   }
   towerGemm(ctx, B + "attn_out/weights", x, R, C, C, 1.f, 1.f / e.residualScale);   // x + f(x) / sqrt(layers / 36)
-  layerNorm(x, xn, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));
-  float* h = scratch<float>("esmc.h", R * 2 * e.ffn); float* g = scratch<float>("esmc.g", R * e.ffn);
-  towerGemm(xn, B + "fc1/weights", h, R, C, 2 * e.ffn);
-  swigluK<<<blocks((e.ffn & 3) == 0 ? R * (size_t)(e.ffn >> 2) : R * e.ffn), 256, 0, STREAM>>>(h, g, R, e.ffn);
-  towerGemm(g, B + "fc2/weights", x, R, e.ffn, C, 1.f, 1.f / e.residualScale);
+  float* h = scratch<float>("esmc.h", R * 2 * e.ffn);
+  if (useHalf) {
+    half* xnh = scratch<half>("esmc.xnh", R * C);
+    layerNorm<half>(x, xnh, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));
+    towerGemmPre(xnh, B + "fc1/weights", h, R, C, 2 * e.ffn);
+    half* gh = scratch<half>("esmc.gh", R * e.ffn);
+    swigluK<half><<<blocks((e.ffn & 3) == 0 ? R * (size_t)(e.ffn >> 2) : R * e.ffn), 256, 0, STREAM>>>(h, gh, R, e.ffn);
+    towerGemmPre(gh, B + "fc2/weights", x, R, e.ffn, C, 1.f, 1.f / e.residualScale);
+  } else {
+    float* xn = scratch<float>("esmc.xn", R * C);
+    float* g = scratch<float>("esmc.g", R * e.ffn);
+    layerNorm<float>(x, xn, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));
+    towerGemm(xn, B + "fc1/weights", h, R, C, 2 * e.ffn);
+    swigluK<float><<<blocks((e.ffn & 3) == 0 ? R * (size_t)(e.ffn >> 2) : R * e.ffn), 256, 0, STREAM>>>(h, g, R, e.ffn);
+    towerGemm(g, B + "fc2/weights", x, R, e.ffn, C, 1.f, 1.f / e.residualScale);
+  }
 }
 
 // the tower over ids [rows] (seq: each row's chain, attention stays within one): every hidden state handed to
 // onState(k, x) - k 0 the embedding, k 1..layers-1 the blocks', k layers the last block's after final_norm
-inline void esmcTower(const Esmc& e, const int* ids, const int* seq, const std::function<void(int, const float*)>& onState) {
+inline void esmcTower(const Esmc& e, const int* ids, const int* seq, const std::function<void(int, const float*)>& onState,
+                      float* shimXn = nullptr, const float* shimScale = nullptr, const float* shimOffset = nullptr) {
   size_t R = e.rows; int C = e.model;
   float* x = scratch<float>("esmc.x", R * C);
   embedK<<<blocks((C & 3) == 0 ? R * (size_t)(C >> 2) : R * C), 256, 0, STREAM>>>(ids, W("c/embed/weights"), x, (int)R, C);
-  onState(0, x);
+  bool useHalf = (FAST && TOWER16) || M.isResident("c/blocks/0/qkv/weightsT");
   float2* cosSin = reinterpret_cast<float2*>(scratch<float>("esmc.rope", R * 64));
   esmcRopeTableK<<<blocks(R * 32), 256, 0, STREAM>>>(cosSin, (int)R);
   float* last = scratch<float>("esmc.last", R * C);
   for (int l = 0; l < e.layers; ++l) {
-    esmcBlock(e, x, seq, l, cosSin);
-    if (l + 1 < e.layers) onState(l + 1, x);
+    if (shimXn) {
+      std::string B = "blocks/" + std::to_string(l) + "/";
+      if (useHalf) {
+        half* xnh = scratch<half>("esmc.xnh", R * C);
+        layerNormDual<half>(x, shimXn, xnh, R, C, shimScale, shimOffset,
+                            Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
+      } else {
+        float* xn = scratch<float>("esmc.xn", R * C);
+        layerNormDual<float>(x, shimXn, xn, R, C, shimScale, shimOffset,
+                             Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
+      }
+    }
+    onState(l, x);
+    esmcBlock(e, x, seq, l, cosSin, shimXn != nullptr);
   }
   layerNorm(x, last, R, C, W("c/final_norm/scale"), nullptr);
   onState(e.layers, last);

@@ -101,11 +101,57 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
   float* dx = dalloc(per * batch); float* dd = dalloc(per * batch); float* dc = comp ? dalloc(per * batch) : nullptr;
   std::vector<float> hx(per * batch), hd(per * batch), hc(comp ? per * batch : 0);
   const int steps = (int)levels.size() - 1;
+  std::vector<float> hTEmb(steps);
+  for (int i = 0; i < steps; ++i) {
+    const double sigma = levels[i], next = levels[i + 1];
+    const double gamma = next > s.gammaMin ? s.gamma0 : 0;
+    const double t = sigma * (1 + gamma);
+    hTEmb[i] = 0.25f * logf((float)t / SIGMA_DATA);
+  }
+  const int Ca = 128, Dt = 768, Dc = Dt + Ca;
+  int condBatch = std::min(20, std::max(1, steps));
+  const int rowsT1 = condBatch == 1 ? d.T : (d.T + 1);
+  const size_t condAStride = (size_t)(d.T + 1) * (6 * Ca);
+  const size_t condTStride = (size_t)rowsT1 * (6 * Dt);
+  const size_t cqcStride   = (size_t)(d.T + 1) * (2 * Dc + Ca);
+  const size_t cscStride   = (size_t)rowsT1 * (2 * Dc + Dt);
+  const size_t perStepCondBytes = (size_t)d.layers * (condAStride + condTStride + cqcStride + cscStride) * 4;
+  while (condBatch > 1 && !roomFor((size_t)condBatch * perStepCondBytes)) condBatch >>= 1;
+  float* condAAll = scratch<float>("be2.dn.condA", (size_t)d.layers * condBatch * condAStride);
+  float* condTAll = scratch<float>("be2.dn.condT", (size_t)d.layers * condBatch * condTStride);
+  float* cqcAll   = scratch<float>("be2.dn.cqc",   (size_t)d.layers * condBatch * cqcStride);
+  float* cscAll   = scratch<float>("be2.dn.csc",   (size_t)d.layers * condBatch * cscStride);
+  static const float* cachedSc0 = nullptr;
+  static int cachedT = 0, cachedLayers = 0;
+  static float cachedDynGate = -1.f;
+  static std::vector<float> cachedTEmb;
+  const bool reuseAllCond = (condBatch == steps && steps > 0 && cachedSc0 == d.sc0 && cachedT == d.T &&
+                             cachedLayers == d.layers && cachedDynGate == d.dynGate && cachedTEmb == hTEmb);
+  float* cndAll = reuseAllCond ? nullptr : precomputeAllSingleCond(d, hTEmb);
+  int curCondBase = reuseAllCond ? 0 : -1;
+  int curCondB = reuseAllCond ? steps : 0;
+  if (condBatch == steps && !reuseAllCond && steps > 0) {
+    computeStepCondBatch(d, cndAll, steps, condAAll, condTAll, cqcAll, cscAll);
+    curCondBase = 0;
+    curCondB = steps;
+    cachedSc0 = d.sc0;
+    cachedT = d.T;
+    cachedLayers = d.layers;
+    cachedDynGate = d.dynGate;
+    cachedTEmb = hTEmb;
+  }
   for (int i = 0; i < steps; ++i) {
     const double sigma = levels[i], next = levels[i + 1];
     const double gamma = next > s.gammaMin ? s.gamma0 : 0;
     const double t = sigma * (1 + gamma);
     const double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
+    if (i < curCondBase || i >= curCondBase + curCondB) {
+      curCondBase = i;
+      curCondB = std::min(condBatch, steps - i);
+      computeStepCondBatch(d, cndAll + (size_t)i * (d.T + 1) * Dt, curCondB,
+                           condAAll, condTAll, cqcAll, cscAll);
+    }
+    const StepCond stepCond{condAAll, condTAll, cqcAll, cscAll, curCondB, i - curCondBase};
     for (int p = 0; p < n; ++p) {
       double R[9], sh[3];
       randomRigid(rng[p], R, sh);
@@ -121,7 +167,7 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
       }
       CK(cudaMemcpyAsync(dx, hx.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
       if (comp) CK(cudaMemcpyAsync(dc, hc.data(), per * b * 4, cudaMemcpyHostToDevice, STREAM));
-      denoise(d, dx, (float)t, dd, dc, b);
+      denoise(d, dx, (float)t, dd, dc, b, &stepCond);
       CK(cudaMemcpyAsync(hd.data(), dd, per * b * 4, cudaMemcpyDeviceToHost, STREAM));
       CK(cudaStreamSynchronize(STREAM));
       for (int k = 0; k < b; ++k) std::copy(hd.begin() + per * k, hd.begin() + per * (k + 1), den[p0 + k].begin());

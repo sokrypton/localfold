@@ -36,13 +36,17 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
 }
 
 // the same with an f16 weight (W's mirror) and f32 X and Y: X narrowed to f16, tensor cores, f32 accumulation
+inline void gemmHPre(const half* xh, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
+                     float alpha = 1.f) {
+  const float one = alpha;
+  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta,
+                  Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
 inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
                   float alpha = 1.f) {
   half* xh = scratch<half>("gemmh.x", rows * in);
   toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
-  const float one = alpha;
-  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta,
-                  Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  gemmHPre(xh, Wt, Y, rows, in, out, beta, alpha);
 }
 
 // ---------------------------------------------------------------- elementwise
@@ -79,7 +83,8 @@ inline void addBias(float* y, const float* b, size_t rows, int C) {
   addBiasK<<<blocks(n), 256, 0, STREAM>>>(y, b, rows, C);
 }
 // LayerNorm over the last axis, a warp a row; offset may be null, scale may be null (affine-free)
-__global__ void layerNormK(const float* x, float* y, size_t rows, int C, const float* scale, const float* offset,
+template <class TY = float>
+__global__ void layerNormK(const float* x, TY* y, size_t rows, int C, const float* scale, const float* offset,
                            float eps, int ldx, int ldy) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -96,18 +101,19 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
     float n = (xr[c] - mean) * inv;
     if (scale) n *= scale[c];
     if (offset) n += offset[c];
-    y[row * ldy + c] = n;
+    if constexpr (std::is_same_v<TY, half>) y[row * ldy + c] = __float2half(n);
+    else y[row * ldy + c] = n;
   }
 }
-template <int MAX_K, bool EXACT>
+template <int MAX_K, bool EXACT, class TY = float>
 __global__ void __launch_bounds__(256, (MAX_K <= 16 && EXACT) ? 4 : 2)
-layerNormRegK(const float* __restrict__ x, float* __restrict__ y, size_t rows, int C,
+layerNormRegK(const float* __restrict__ x, TY* __restrict__ y, size_t rows, int C,
               const float* __restrict__ scale, const float* __restrict__ offset, float eps, int ldx, int ldy) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* xr = x + row * ldx;
-  float* yr = y + row * ldy;
+  TY* yr = y + row * ldy;
   float xv[MAX_K];
   float s = 0;
   #pragma unroll
@@ -136,33 +142,96 @@ layerNormRegK(const float* __restrict__ x, float* __restrict__ y, size_t rows, i
       float n = (xv[k] - mean) * inv;
       if (scale) n *= __ldg(scale + c);
       if (offset) n += __ldg(offset + c);
-      yr[c] = n;
+      if constexpr (std::is_same_v<TY, half>) yr[c] = __float2half(n);
+      else yr[c] = n;
     }
   }
 }
-inline void layerNorm(const float* x, float* y, size_t rows, int C, const float* scale, const float* offset,
+template <int MAX_K, class TY2 = float>
+__global__ void __launch_bounds__(256, 2)
+layerNormDualRegK(const float* __restrict__ x, float* __restrict__ y1, TY2* __restrict__ y2, size_t rows,
+                  const float* __restrict__ scale1, const float* __restrict__ offset1,
+                  const float* __restrict__ scale2, const float* __restrict__ offset2, float eps) {
+  constexpr int C = MAX_K * 32;
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float* yr1 = y1 + row * C;
+  TY2* yr2 = y2 + row * C;
+  float xv[MAX_K];
+  float s = 0;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int c = k * 32 + lane;
+    float val = __ldg(xr + c);
+    xv[k] = val;
+    s += val;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / (float)C, v = 0;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    float d = xv[k] - mean;
+    v += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / (float)C + eps);
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    int c = k * 32 + lane;
+    float n = (xv[k] - mean) * inv;
+    float n1 = n * __ldg(scale1 + c) + __ldg(offset1 + c);
+    float n2 = n * __ldg(scale2 + c) + __ldg(offset2 + c);
+    yr1[c] = n1;
+    if constexpr (std::is_same_v<TY2, half>) yr2[c] = __float2half(n2);
+    else yr2[c] = n2;
+  }
+}
+template <class TY = float>
+inline void layerNorm(const float* x, TY* y, size_t rows, int C, const float* scale, const float* offset,
                       float eps = 1e-5f, int ldx = 0, int ldy = 0) {
   unsigned g = (unsigned)((rows + 7) / 8);
   int lx = ldx ? ldx : C, ly = ldy ? ldy : C;
   switch (C) {
-    case 128:  layerNormRegK<4,  true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 256:  layerNormRegK<8,  true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 384:  layerNormRegK<12, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 512:  layerNormRegK<16, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 768:  layerNormRegK<24, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 960:  layerNormRegK<30, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
-    case 1152: layerNormRegK<36, true><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 128:  layerNormRegK<4,  true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 256:  layerNormRegK<8,  true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 384:  layerNormRegK<12, true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 512:  layerNormRegK<16, true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 768:  layerNormRegK<24, true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 960:  layerNormRegK<30, true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
+    case 1152: layerNormRegK<36, true, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly); return;
     default:
-      if (C <= 512) layerNormRegK<16, false><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
-      else layerNormK<<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
+      if (C <= 512) layerNormRegK<16, false, TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
+      else layerNormK<TY><<<g, 256, 0, STREAM>>>(x, y, rows, C, scale, offset, eps, lx, ly);
   }
+}
+template <class TY2 = float>
+inline void layerNormDual(const float* x, float* y1, TY2* y2, size_t rows, int C,
+                          const float* scale1, const float* offset1,
+                          const float* scale2, const float* offset2, float eps = 1e-5f) {
+  unsigned g = (unsigned)((rows + 7) / 8);
+  if (C == 960) {
+    layerNormDualRegK<30, TY2><<<g, 256, 0, STREAM>>>(x, y1, y2, rows, scale1, offset1, scale2, offset2, eps);
+    return;
+  }
+  if (C == 1152) {
+    layerNormDualRegK<36, TY2><<<g, 256, 0, STREAM>>>(x, y1, y2, rows, scale1, offset1, scale2, offset2, eps);
+    return;
+  }
+  layerNorm<float>(x, y1, rows, C, scale1, offset1, eps);
+  layerNorm<TY2>(x, y2, rows, C, scale2, offset2, eps);
 }
 __device__ __forceinline__ float siluF(float x) { return x / (1.f + expf(-x)); }
 __device__ __forceinline__ float geluF(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678118654752f)); }
 
-__global__ void swigluK(const float* __restrict__ h, float* __restrict__ g, size_t rows, int F) {
+template <class TY = float>
+__global__ void swigluK(const float* __restrict__ h, TY* __restrict__ g, size_t rows, int F) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if ((F & 3) == 0 && (((uintptr_t)h | (uintptr_t)g) & 15) == 0) {
+  constexpr uintptr_t gAlign = std::is_same_v<TY, half> ? 7 : 15;
+  if ((F & 3) == 0 && ((uintptr_t)h & 15) == 0 && ((uintptr_t)g & gAlign) == 0) {
     int f4 = F >> 2;
     size_t n4 = rows * (size_t)f4;
     if (t >= n4) return;
@@ -187,12 +256,22 @@ __global__ void swigluK(const float* __restrict__ h, float* __restrict__ g, size
     }
     const float4* hr = reinterpret_cast<const float4*>(h + r * 2 * F);
     float4 a = __ldg(hr + c4), b = __ldg(hr + f4 + c4);
-    reinterpret_cast<float4*>(g)[t] = make_float4(siluF(a.x) * b.x, siluF(a.y) * b.y, siluF(a.z) * b.z, siluF(a.w) * b.w);
+    float o0 = siluF(a.x) * b.x, o1 = siluF(a.y) * b.y, o2 = siluF(a.z) * b.z, o3 = siluF(a.w) * b.w;
+    if constexpr (std::is_same_v<TY, half>) {
+      __half2 h0 = __floats2half2_rn(o0, o1);
+      __half2 h1 = __floats2half2_rn(o2, o3);
+      reinterpret_cast<uint2*>(g)[t] = make_uint2(*reinterpret_cast<const unsigned*>(&h0),
+                                                  *reinterpret_cast<const unsigned*>(&h1));
+    } else {
+      reinterpret_cast<float4*>(g)[t] = make_float4(o0, o1, o2, o3);
+    }
     return;
   }
   if (t >= rows * F) return;
   size_t r = t / F; int c = (int)(t % F);
-  g[t] = siluF(h[r * 2 * F + c]) * h[r * 2 * F + F + c];
+  float v = siluF(h[r * 2 * F + c]) * h[r * 2 * F + F + c];
+  if constexpr (std::is_same_v<TY, half>) g[t] = __float2half(v);
+  else g[t] = v;
 }
 
 // ---------------------------------------------------------------- checks
