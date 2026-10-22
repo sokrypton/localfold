@@ -220,9 +220,11 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   float4 r[MAXV];
   float s = 0;
   const bool aligned = (a.ldx & 3) == 0;
+  const bool full = C4 == MAXV * 32;
+  _Pragma("clang loop unroll(full)")
   for (int k = 0; k < MAXV; ++k) {
     int c = lane + 32 * k;
-    if (c < C4) {
+    if (full || c < C4) {
       if (a.x) r[k] = aligned ? ((device const float4*)(a.x + row * a.ldx))[c]
                               : float4(a.x[row * a.ldx + 4 * c], a.x[row * a.ldx + 4 * c + 1], a.x[row * a.ldx + 4 * c + 2], a.x[row * a.ldx + 4 * c + 3]);
       else r[k] = float4(((device const half4*)(a.xh + row * a.ldx))[c]);
@@ -230,36 +232,39 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
     }
   }
   float mean = simd_sum(s) / a.C, v = 0;
+  _Pragma("clang loop unroll(full)")
   for (int k = 0; k < MAXV; ++k)
-    if (lane + 32 * k < (uint)C4) { float4 d = r[k] - mean; v += dot(d, d); }
+    if (full || lane + 32 * k < (uint)C4) { float4 d = r[k] - mean; v += dot(d, d); }
   float inv = rsqrt(simd_sum(v) / a.C + a.eps);
+  const bool outAligned = (a.ldy & 3) == 0;
+  _Pragma("clang loop unroll(full)")
   for (int k = 0; k < MAXV; ++k) {
     int c = lane + 32 * k;
-    if (c >= C4) continue;
+    if (!full && c >= C4) continue;
     float4 n0 = (r[k] - mean) * inv;
     float4 n = n0;
     if (a.scale) n *= ((device const float4*)a.scale)[c];
     if (a.offset) n += ((device const float4*)a.offset)[c];
     if (a.yh) {
-      if ((a.ldy & 3) == 0) ((device half4*)(a.yh + row * a.ldy))[c] = half4(n);
+      if (outAligned) ((device half4*)(a.yh + row * a.ldy))[c] = half4(n);
       else for (int e = 0; e < 4; ++e) a.yh[row * a.ldy + 4 * c + e] = (half)n[e];
     }
     if (a.y) {
-      if ((a.ldy & 3) == 0) ((device float4*)(a.y + row * a.ldy))[c] = n;
+      if (outAligned) ((device float4*)(a.y + row * a.ldy))[c] = n;
       else for (int e = 0; e < 4; ++e) a.y[row * a.ldy + 4 * c + e] = n[e];
     }
     if (a.yh2) {
       float4 n2 = n0;
       if (a.scale2) n2 *= ((device const float4*)a.scale2)[c];
       if (a.offset2) n2 += ((device const float4*)a.offset2)[c];
-      if ((a.ldy & 3) == 0) ((device half4*)(a.yh2 + row * a.ldy))[c] = half4(n2);
+      if (outAligned) ((device half4*)(a.yh2 + row * a.ldy))[c] = half4(n2);
       else for (int e = 0; e < 4; ++e) a.yh2[row * a.ldy + 4 * c + e] = (half)n2[e];
     }
   }
 }
 
 #define LF_LN4(V) template [[host_name("lf_layernorm4_" #V)]] kernel void lf_layernorm4<V>(constant LayerNormArgs&, uint3, uint3, uint, uint);
-LF_LN4(1) LF_LN4(2) LF_LN4(4) LF_LN4(8) LF_LN4(12)
+LF_LN4(1) LF_LN4(2) LF_LN4(3) LF_LN4(4) LF_LN4(6) LF_LN4(8) LF_LN4(9) LF_LN4(12)
 
 // ---------------------------------------------------------------- conversions and elementwise (four a thread)
 kernel void lf_to_half(LF_ARGS(ConvArgs)) {

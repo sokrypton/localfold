@@ -57,21 +57,9 @@ static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int lay
     layerNorm(qkv + C, k, R, C, M.f(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
     run1d("ef2_rope", R * 32, RopeArgs{q, k, (uint)R, (uint)H, (uint)C, 0});
   }
-  // scores [H, R, R] = q_h k_h^T, softmax within a chain, ctx_h = S_h v_h (v in the packed qkv, stride 3C)
-  float* S = scratch<float>("esmc.scores", (size_t)H * R * R);
   half* ctx = scratch<half>("esmc.ctx", R * C);
-  {
-    Gemm g{}; g.X = q; g.ldx = C; g.sx = 64; g.W = k; g.transW = true; g.ldw = C; g.sw = 64;
-    g.Y = S; g.ldy = (int)R; g.sy = (int64_t)R * R; g.rows = R; g.in = 64; g.out = (int)R; g.batch = H; g.label = "esmc.scores";
-    gemm(g);
-  }
-  run("ef2_softmax_seq", grid1d(((size_t)H * R + 7) / 8, 1), 256,
-      SoftmaxSeqArgs{S, seq, (uint)R, (uint)(H * R), 0.125f, 0});
-  {
-    Gemm g{}; g.X = S; g.ldx = (int)R; g.sx = (int64_t)R * R; g.W = qkv + 2 * C; g.ldw = 3 * C; g.sw = 64;
-    g.Y = ctx; g.ty = F16; g.ldy = C; g.sy = 64; g.rows = R; g.in = (int)R; g.out = 64; g.batch = H; g.label = "esmc.context";
-    gemm(g);
-  }
+  run("ef2_esmc_attend", Grid{(uint32_t)((R + 31) / 32), (uint32_t)H, 1}, 128,
+      EsmcAttendArgs{q, k, qkv + 2 * C, seq, ctx, (uint)R, (uint)C, (uint)(3 * C), 0});
   towerLin(ctx, B + "attn_out/weights", x, R, C, C, 1.f / e.residualScale, 1.f);
   layerNorm(x, xn, R, C, M.f(B + "ffn_norm/scale"), M.f(B + "ffn_norm/offset"));
   half* g = scratch<half>("esmc.g", R * e.ffn);

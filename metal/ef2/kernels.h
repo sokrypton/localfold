@@ -14,6 +14,7 @@ struct EmbedArgs { CP(int) ids; CP(float) table; DP(float) x; uint rows, C; };
 struct RopeArgs { DP(float) x; DP(float) y; uint rows, heads, ld, pad; };
 struct QkNormRopeArgs { CP(float) qkv; CP(float) qScale; CP(float) kScale; DP(float) q; DP(float) k; uint rows, C; };
 struct SoftmaxSeqArgs { DP(float) S; CP(int) seq; uint rows, total; float scale; uint pad; };
+struct EsmcAttendArgs { CP(float) q; CP(float) k; CP(float) v; CP(int) seq; DP(half) ctx; uint rows, C, ldv, pad; };
 struct ScatterRowsArgs { CP(float) rows; CP(int) tokenToRow; CP(float) zero; DP(float) out; uint T, C; };
 struct PairJoinArgs { CP(float) s; DP(half) out; uint T, i0, bi, C; };
 struct PairJoinFArgs { CP(float) s; DP(float) out; uint T, i0, bi, C; };   // (float: a tower whose a * a passes half's range)
@@ -45,7 +46,7 @@ struct SiluArgs { CP(float) x; DP(float) y; DP(half) yh; u64 n; };
 struct SwigluArgs { CP(float) h; DP(float) g; uint rows, F; };
 struct RmsModArgs { DP(float) x; CP(float) mod; DP(float) y; DP(half) yh; CP(float) resD; uint rows, C, shift, scale, resWhich, pad; };
 struct QkvPrepArgs { DP(float) qkv; CP(float) cosT; CP(float) sinT; uint A, C, heads, bf16, ld, pad; };
-struct SwaArgs { CP(float) qkv; CP(int) valid; DP(float) ctx; uint nValid, C, halfWindow; float scale; uint ld, pad; };
+struct SwaArgs { CP(float) qkv; CP(int) valid; DP(float) ctx; uint nValid, C, halfWindow; float scale; uint ld, pad; DP(half) outH; };
 struct GateLiveArgs { DP(float) ctx; CP(float) gate; CP(float) mask; DP(half) outH; uint A, C, ld, pad; };
 struct GatedAddArgs { DP(float) x; CP(float) mod; CP(float) d; uint A, C, which, pad; };
 struct ScatterMeanArgs { CP(float) v; CP(int) tokenStart; CP(int) tokenAtoms; CP(float) mask; DP(float) out; uint T, C, ld, pad; CP(float) add; };

@@ -1176,8 +1176,9 @@ static void layerNormRun(const float* x, const half* xh, float* y, half* yh, siz
   Grid g = groups <= 65535 ? Grid{(uint32_t)groups, 1, 1} : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
   int v = (C / 4 + 31) / 32;
   const bool wide = getenv("LOCALFOLD_LN_WIDE") != nullptr;     // (the control: every row in the widest kernel)
-  const char* k = C % 4 || C > 1536 ? "lf_layernorm" : wide || v > 8 ? "lf_layernorm4_12" : v > 4 ? "lf_layernorm4_8"
-                : v > 2 ? "lf_layernorm4_4" : v > 1 ? "lf_layernorm4_2" : "lf_layernorm4_1";
+  const char* k = C % 4 || C > 1536 ? "lf_layernorm" : wide || v > 9 ? "lf_layernorm4_12" : v > 8 ? "lf_layernorm4_9"
+                : v > 6 ? "lf_layernorm4_8" : v > 4 ? "lf_layernorm4_6" : v > 3 ? "lf_layernorm4_4"
+                : v > 2 ? "lf_layernorm4_3" : v > 1 ? "lf_layernorm4_2" : "lf_layernorm4_1";
   dispatch(k, &a, sizeof a, g, 256, 0, "layernorm");
 }
 void layerNorm(const float* x, float* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {

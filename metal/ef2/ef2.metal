@@ -197,6 +197,105 @@ kernel void ef2_softmax_seq(constant SoftmaxSeqArgs& a [[buffer(0)]], uint3 tg [
   float inv = 1.f / simd_sum(sum);
   for (uint j = lane; j < a.rows; j += 32) s[j] *= inv;
 }
+// fused ESM-C self-attention (D = 64, scale = 1/8, chain mask seq[q] == seq[k]): 4 simdgroups (32 queries) per threadgroup
+kernel void ef2_esmc_attend(constant EsmcAttendArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tile[32][68];
+  threadgroup int k_seq[32];
+  const uint r0 = tg.x * 32, h = tg.y, C = a.C;
+  const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+  const uint qi = r0 + sg * 8 + sm;
+  const int sq = qi < a.rows ? a.seq[qi] : -1;
+  _Pragma("clang loop unroll(full)")
+  for (uint e = tid; e < 32 * 16; e += 128) {
+    uint r = e >> 4, c4 = (e & 15) << 2;
+    float4 v = (r0 + r < a.rows) ? *(device const float4*)(a.q + (ulong)(r0 + r) * C + h * 64 + c4) * 0.125f : float4(0.f);
+    *(threadgroup float4*)&tile[r][c4] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 qf[8], o[8];
+  _Pragma("clang loop unroll(full)")
+  for (int dk = 0; dk < 8; ++dk) {
+    simdgroup_load(qf[dk], &tile[sg * 8][dk * 8], 68);
+    o[dk] = simdgroup_float8x8(0);
+  }
+  float m = -INFINITY, l = 0.f;
+  for (uint k0 = 0; k0 < a.rows; k0 += 32) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) k_seq[tid] = (k0 + tid < a.rows) ? a.seq[k0 + tid] : -2;
+    _Pragma("clang loop unroll(full)")
+    for (uint e = tid; e < 32 * 16; e += 128) {
+      uint r = e >> 4, c4 = (e & 15) << 2;
+      float4 v = (k0 + r < a.rows) ? *(device const float4*)(a.k + (ulong)(k0 + r) * C + h * 64 + c4) : float4(0.f);
+      *(threadgroup float4*)&tile[r][c4] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 sc[4];
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) sc[j] = simdgroup_float8x8(0);
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j)
+      _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 8; ++dk) {
+        simdgroup_float8x8 kt;
+        simdgroup_load(kt, &tile[j * 8][dk * 8], 68, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(sc[j], qf[dk], kt, sc[j]);
+      }
+    float mx = m;
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+        uint kj = j * 8 + sn + t;
+        bool ok = (k0 + kj < a.rows) && (qi < a.rows) && (k_seq[kj] == sq);
+        float v = ok ? e[t] : -INFINITY;
+        e[t] = v;
+        mx = max(mx, v);
+      }
+    }
+    mx = max(mx, simd_shuffle_xor(mx, (ushort)1));
+    mx = max(mx, simd_shuffle_xor(mx, (ushort)8));
+    float corr = (m == -INFINITY || mx == -INFINITY) ? 0.f : exp(m - mx);
+    float row_sum = 0.f;
+    simdgroup_float8x8 p[4];
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      thread auto& pe = p[j].thread_elements();
+      _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+        float v = (mx == -INFINITY || e[t] == -INFINITY) ? 0.f : exp(e[t] - mx);
+        pe[t] = v;
+        row_sum += v;
+      }
+    }
+    row_sum += simd_shuffle_xor(row_sum, (ushort)1);
+    row_sum += simd_shuffle_xor(row_sum, (ushort)8);
+    l = l * corr + row_sum;
+    m = mx;
+    _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 8; ++dk) {
+      thread auto& oe = o[dk].thread_elements();
+      oe[0] *= corr; oe[1] *= corr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint e = tid; e < 32 * 16; e += 128) {
+      uint r = e >> 4, c4 = (e & 15) << 2;
+      float4 v = (k0 + r < a.rows) ? *(device const float4*)(a.v + (ulong)(k0 + r) * a.ldv + h * 64 + c4) : float4(0.f);
+      *(threadgroup float4*)&tile[r][c4] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j)
+      _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 8; ++dk) {
+        simdgroup_float8x8 vf;
+        simdgroup_load(vf, &tile[j * 8][dk * 8], 68);
+        simdgroup_multiply_accumulate(o[dk], p[j], vf, o[dk]);
+      }
+  }
+  if (qi < a.rows) {
+    float inv = l > 0.f ? 1.f / l : 0.f;
+    device half* out = a.ctx + (ulong)qi * C + h * 64;
+    _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 8; ++dk) {
+      thread auto& oe = o[dk].thread_elements();
+      *(device half2*)(out + dk * 8 + sn) = half2(half(oe[0] * inv), half(oe[1] * inv));
+    }
+  }
+}
 // the tower's rows onto the tokens; a token the tower never saw takes the shim at a zero state
 kernel void ef2_scatter_rows(LF_ARGS(ScatterRowsArgs)) {
   uint t = (uint)LF_INDEX;
@@ -489,73 +588,124 @@ kernel void ef2_qkv_prepare(constant QkvPrepArgs& a [[buffer(0)]], uint3 tg [[th
 // itself among them. A threadgroup takes 16 consecutive valid queries of one head (four simdgroups, four queries each)
 // and walks the union of their windows in tiles of 96 keys; online softmax, a lane a key for the scores, a lane a
 // channel for the output
-constant int SWA_KT = 96, SWA_Q = 16;
+constant int SWA_KT = 32, SWA_Q = 16;
 kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float4 Qs[SWA_Q][8];
-  threadgroup float4 Ks[SWA_KT][9];
-  threadgroup float Vs[SWA_KT][32];
+  threadgroup float Ks[SWA_KT][36];
+  threadgroup float Vs[SWA_KT][36];
   const int nValid = (int)a.nValid, hw = (int)a.halfWindow, C = (int)a.C, ld = (int)a.ld;
-  int head = tg.y;
-  int r0 = tg.x * SWA_Q, r1 = min(nValid, r0 + SWA_Q) - 1;
-  int klo = max(0, r0 - hw), khi = min(nValid - 1, r1 + hw);
-  int rq = r0 + 4 * (int)warp;
-  float m[4], l[4], acc[4];
-  for (int u = 0; u < 4; ++u) {
-    m[u] = -INFINITY; l[u] = 0.f; acc[u] = 0.f;
-    device const float* q = a.qkv + (ulong)a.valid[min(rq + u, nValid - 1)] * ld + head * 32;
-    ((threadgroup float*)Qs[4 * warp + u])[lane] = q[lane] * a.scale;
+  const int head = tg.y;
+  const int r0 = tg.x * SWA_Q, r1 = min(nValid, r0 + SWA_Q) - 1;
+  const int klo = max(0, r0 - hw), khi = min(nValid - 1, r1 + hw);
+  const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+  const int rq = r0 + 8 * (int)warp, q_idx = rq + sm;
+  _Pragma("clang loop unroll(full)")
+  for (int e = tid; e < SWA_Q * 8; e += 64) {
+    int u = e >> 3, part = (e & 7) << 2;
+    device const float* q = a.qkv + (ulong)a.valid[min(r0 + u, nValid - 1)] * ld + head * 32 + part;
+    *(threadgroup float4*)&Ks[u][part] = *(device const float4*)q * a.scale;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 qf[4], o[4];
+  _Pragma("clang loop unroll(full)")
+  for (int dk = 0; dk < 4; ++dk) {
+    simdgroup_load(qf[dk], &Ks[warp * 8][dk * 8], 36);
+    o[dk] = simdgroup_float8x8(0);
+  }
+  float m = -INFINITY, l = 0.f;
   for (int t0 = klo; t0 <= khi; t0 += SWA_KT) {
     int n = min(SWA_KT, khi - t0 + 1);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = tid; e < n * 8; e += 128) {
-      int j = e >> 3, part = e & 7;
-      device const float* row = a.qkv + (ulong)a.valid[t0 + j] * ld + head * 32 + part * 4;
-      Ks[j][part] = *(device const float4*)(row + C);
-      *(threadgroup float4*)&Vs[j][part * 4] = *(device const float4*)(row + 2 * C);
+    _Pragma("clang loop unroll(full)")
+    for (int e = tid; e < SWA_KT * 8; e += 64) {
+      int j = e >> 3, part = (e & 7) << 2;
+      if (j < n) {
+        device const float* row = a.qkv + (ulong)a.valid[t0 + j] * ld + head * 32 + part;
+        *(threadgroup float4*)&Ks[j][part] = *(device const float4*)(row + C);
+        *(threadgroup float4*)&Vs[j][part] = *(device const float4*)(row + 2 * C);
+      } else {
+        *(threadgroup float4*)&Ks[j][part] = float4(0.f);
+        *(threadgroup float4*)&Vs[j][part] = float4(0.f);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (rq > r1) continue;
-    int lo = max(rq - hw, t0) - t0, hi = min(min(rq + 3, r1) + hw, t0 + n - 1) - t0;
-    for (int j0 = lo; j0 <= hi; j0 += 32) {
-      int j = j0 + (int)lane, key = t0 + j;
-      float s[4] = {0.f, 0.f, 0.f, 0.f};
-      if (j <= hi) {
-        #pragma clang loop unroll(full)
-        for (int p = 0; p < 8; ++p) {
-          float4 k4 = Ks[j][p];
-          for (int u = 0; u < 4; ++u) s[u] += dot(Qs[4 * warp + u][p], k4);
+    int lo = max(rq - hw, t0) - t0, hi = min(min(rq + 7, r1) + hw, t0 + n - 1) - t0;
+    if (lo > hi) continue;
+    simdgroup_float8x8 sc[4];
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) sc[j] = simdgroup_float8x8(0);
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      if (j * 8 <= hi && j * 8 + 7 >= lo) {
+        _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 4; ++dk) {
+          simdgroup_float8x8 kt;
+          simdgroup_load(kt, &Ks[j * 8][dk * 8], 36, ulong2(0, 0), true);
+          simdgroup_multiply_accumulate(sc[j], qf[dk], kt, sc[j]);
         }
       }
-      float p[4];
-      for (int u = 0; u < 4; ++u) {
-        bool ok = j <= hi && abs(key - (rq + u)) <= hw;
-        float v = ok ? s[u] : -INFINITY;
-        float mn = max(m[u], simd_max(v));
-        if (mn == -INFINITY) { p[u] = 0.f; continue; }
-        float corr = exp(m[u] - mn);
-        p[u] = ok ? exp(v - mn) : 0.f;
-        l[u] = l[u] * corr + simd_sum(p[u]); acc[u] *= corr; m[u] = mn;
+    }
+    float mx = m;
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+        int j_local = j * 8 + sn + t, key = t0 + j_local;
+        bool ok = (j_local <= hi) && (q_idx <= r1) && (abs(key - q_idx) <= hw);
+        float v = ok ? e[t] : -INFINITY;
+        e[t] = v;
+        mx = max(mx, v);
       }
-      int cnt = min(32, hi - j0 + 1);
-      if (cnt == 32) {
-        #pragma clang loop unroll(full)
-        for (int k = 0; k < 32; ++k) {
-          float v = Vs[j0 + k][lane];
-          for (int u = 0; u < 4; ++u) acc[u] += simd_shuffle(p[u], (ushort)k) * v;
-        }
-      } else {
-        for (int k = 0; k < cnt; ++k) {
-          float v = Vs[j0 + k][lane];
-          for (int u = 0; u < 4; ++u) acc[u] += simd_shuffle(p[u], (ushort)k) * v;
+    }
+    mx = max(mx, simd_shuffle_xor(mx, (ushort)1));
+    mx = max(mx, simd_shuffle_xor(mx, (ushort)8));
+    float corr = (m == -INFINITY || mx == -INFINITY) ? 0.f : exp(m - mx);
+    float row_sum = 0.f;
+    simdgroup_float8x8 p[4];
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      thread auto& e = sc[j].thread_elements();
+      thread auto& pe = p[j].thread_elements();
+      _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
+        float v = (e[t] == -INFINITY) ? 0.f : exp(e[t] - mx);
+        pe[t] = v;
+        row_sum += v;
+      }
+    }
+    row_sum += simd_shuffle_xor(row_sum, (ushort)1);
+    row_sum += simd_shuffle_xor(row_sum, (ushort)8);
+    l = l * corr + row_sum;
+    m = mx;
+    _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 4; ++dk) {
+      thread auto& oe = o[dk].thread_elements();
+      oe[0] *= corr; oe[1] *= corr;
+    }
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) {
+      if (j * 8 <= hi && j * 8 + 7 >= lo) {
+        _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 4; ++dk) {
+          simdgroup_float8x8 vf;
+          simdgroup_load(vf, &Vs[j * 8][dk * 8], 36);
+          simdgroup_multiply_accumulate(o[dk], p[j], vf, o[dk]);
         }
       }
     }
   }
-  for (int u = 0; u < 4; ++u)
-    if (rq + u <= r1) a.ctx[(ulong)a.valid[rq + u] * C + head * 32 + lane] = acc[u] / l[u];
+  if (q_idx <= r1) {
+    ulong atom = (ulong)a.valid[q_idx];
+    float inv = l > 0.f ? 1.f / l : 0.f;
+    if (a.outH) {
+      device const float* g = a.qkv + atom * ld + 3 * C + head * 32;
+      device half* out = a.outH + atom * C + head * 32;
+      _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 4; ++dk) {
+        thread auto& oe = o[dk].thread_elements();
+        float2 gv = *(device const float2*)(g + dk * 8 + sn);
+        *(device half2*)(out + dk * 8 + sn) = half2(half(oe[0] * inv * lf_sigmoid(gv.x)), half(oe[1] * inv * lf_sigmoid(gv.y)));
+      }
+    } else {
+      device float* out = a.ctx + atom * C + head * 32;
+      _Pragma("clang loop unroll(full)") for (int dk = 0; dk < 4; ++dk) {
+        thread auto& oe = o[dk].thread_elements();
+        *(device float2*)(out + dk * 8 + sn) = float2(oe[0] * inv, oe[1] * inv);
+      }
+    }
+  }
 }
 kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;

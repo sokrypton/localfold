@@ -63,7 +63,7 @@ std::vector<float> contactMap(const float* z, int T, int C);
 
 // ---------------------------------------------------------------- the atoms (atoms.mm)
 struct AtomCtx { int A, C, heads, hidden; const float* mask; const float* cosT; const float* sinT;
-                 const int* valid; int nValid; const int* tokenStart; const int* tokenAtoms; };
+                 const int* valid; int nValid; const int* tokenStart; const int* tokenAtoms; half* ctxh; };
 struct Atoms { AtomCtx ctx; float* c0; };
 extern bool ATOM_BF16;
 extern int INPUTS_HALF_WINDOW;
