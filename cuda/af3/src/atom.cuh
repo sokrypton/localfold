@@ -335,7 +335,7 @@ __device__ __forceinline__ void store4(half* p, float a, float b, float c, float
 
 // sigmoid(scale) * LN(x) + shift, LN without affine (and optional act += y * sigmoid(gate) after reading x)
 template <class TO, bool RAW = false, class TY = float>
-__global__ void __launch_bounds__(256, 8)
+__global__ void __launch_bounds__(256, 6)
 adaLnK(const float* __restrict__ x, const float* __restrict__ scale, const float* __restrict__ shift,
        TO* __restrict__ out, size_t rows, int C, size_t period,
        float* __restrict__ act = nullptr, const TY* __restrict__ y = nullptr, const float* __restrict__ gate = nullptr) {
@@ -427,7 +427,7 @@ adaLnChained128K(float* __restrict__ x, const float* __restrict__ s1, const floa
 }
 
 template <class TO, bool RAW = false, class TY = TO>
-__global__ void __launch_bounds__(256, 8)
+__global__ void __launch_bounds__(256, 6)
 adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __restrict__ h1,
         const float* __restrict__ s2, const float* __restrict__ h2, TO* __restrict__ o1, TO* __restrict__ o2,
         size_t rows, int C, size_t period,

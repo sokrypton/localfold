@@ -1562,7 +1562,7 @@ __global__ void logitsLayoutK(const float* flat, float* out, size_t pairs, int h
   if (t < pairs * heads) out[t] = flat[(t % pairs) * heads + t / pairs];
 }
 template <class T, int MAX_K = 8>
-__global__ void __launch_bounds__(256, MAX_K <= 9 ? 8 : MAX_K <= 12 ? 6 : 4)
+__global__ void __launch_bounds__(256, MAX_K <= 4 ? 8 : MAX_K <= 12 ? 6 : 4)
 singleSoftmaxWarpK(const float* __restrict__ logits, const float* __restrict__ pairLogits,
                    const float* __restrict__ seqMask, T* __restrict__ P,
                    size_t totalRows, int n, float scale, int ld = 0) {

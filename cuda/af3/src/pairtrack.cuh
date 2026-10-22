@@ -84,8 +84,8 @@ inline bool skipFused(const char* what) {
   return !v.empty() && v.find(what) != std::string::npos;
 }
 template <class T, bool UP = false, int I_CONST = 0>
-__global__ void __launch_bounds__(I_CONST == 512 ? 64 : I_CONST == 1024 ? 128 : I_CONST == 1536 ? 192 : 256,
-                                  I_CONST == 512 ? 16 : I_CONST == 1024 ? 16 : I_CONST == 1536 ? 10 : 8)
+__global__ void __launch_bounds__(I_CONST == 512 ? 64 : I_CONST == 1024 ? 128 : I_CONST == 1536 ? 192 : I_CONST == 3072 ? 384 : 256,
+                                  I_CONST == 512 ? 16 : I_CONST == 1024 ? 16 : I_CONST == 1536 ? 10 : I_CONST == 3072 ? 5 : 8)
 swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, int shift = 0) {
   const int II = I_CONST > 0 ? I_CONST : I, L = UP ? 3 * II : 2 * II;
   if constexpr (std::is_same_v<T, half>) {
@@ -108,7 +108,7 @@ swigluK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int I, i
       *(uint4*)(gated + t) = o;
       return;
     }
-    if constexpr (I_CONST == 512 || I_CONST == 1024 || I_CONST == 1536 || I_CONST == 2048) {
+    if constexpr (I_CONST == 512 || I_CONST == 1024 || I_CONST == 1536 || I_CONST == 2048 || I_CONST == 3072) {
       size_t r = blockIdx.x;
       int i = (int)threadIdx.x << 3;
       size_t t = r * I_CONST + i;
@@ -211,6 +211,7 @@ void swiglu(const T* wide, T* gated, size_t rows, int I, bool up = false) {
       if (I == 1024 && rows > 0) { swigluK<T, U, 1024><<<(unsigned)rows, 128, 0, STREAM>>>(wide, gated, rows, 1024); return; }
       if (I == 1536 && rows > 0) { swigluK<T, U, 1536><<<(unsigned)rows, 192, 0, STREAM>>>(wide, gated, rows, 1536); return; }
       if (I == 2048 && rows > 0) { swigluK<T, U, 2048><<<(unsigned)rows, 256, 0, STREAM>>>(wide, gated, rows, 2048); return; }
+      if (I == 3072 && rows > 0) { swigluK<T, U, 3072><<<(unsigned)rows, 384, 0, STREAM>>>(wide, gated, rows, 3072); return; }
       if (I >= 8 && (I & (I - 1)) == 0) {
         swigluK<T, U, -1><<<blocks(work, bs), bs, 0, STREAM>>>(wide, gated, rows, I, __builtin_ctz(I >> 3)); return;
       }

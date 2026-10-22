@@ -550,7 +550,8 @@ __global__ void gatedAddAdaLnWarpK(float* act, const float* y, const float* gate
 // A block a row, one float4 a thread (C/4 threads), the row held in registers. TI: y, gate,
 // scale and shift (f16 on the fast path - half the bytes of a kernel that is all bytes).
 template <class TO, class TI, bool RAW = false, int NW = 0>
-__global__ void __launch_bounds__((NW == 6 && std::is_same_v<TO, half> && std::is_same_v<TI, half>) ? 96 : (NW ? NW * 32 : 1024), (NW == 6 || NW == 3) ? 8 : 1)
+__global__ void __launch_bounds__((NW == 6 && std::is_same_v<TO, half> && std::is_same_v<TI, half>) ? 96 : (NW ? NW * 32 : 1024),
+                                  (NW == 6 || NW == 3) ? 8 : 1)
 gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* __restrict__ gate, int ldg,
                   const TI* __restrict__ scale, const TI* __restrict__ shift, int lds, TO* __restrict__ out,
                   int C, int period, bool noRes = false) {
@@ -574,16 +575,16 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
       *(float4*)(act + (size_t)r * 768 + c + 4) = u1;
       if (!noRes) { x0 = u0; x1 = u1; }
     }
+    const half2* sc2 = (const half2*)&sc8; const half2* sh2 = (const half2*)&sh8;
+    float2 sc0 = __half22float2(sc2[0]), sc1 = __half22float2(sc2[1]), sc2_ = __half22float2(sc2[2]), sc3 = __half22float2(sc2[3]);
+    float2 sh0 = __half22float2(sh2[0]), sh1 = __half22float2(sh2[1]), sh2_ = __half22float2(sh2[2]), sh3 = __half22float2(sh2[3]);
     float s = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w);
     float ss = (x0.x * x0.x + x0.y * x0.y + x0.z * x0.z + x0.w * x0.w) +
                (x1.x * x1.x + x1.y * x1.y + x1.z * x1.z + x1.w * x1.w);
     for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
     if ((threadIdx.x & 31) == 0) red3[threadIdx.x >> 5] = make_float2(s, ss);
-    const half2* sc2 = (const half2*)&sc8; const half2* sh2 = (const half2*)&sh8;
-    float2 sc0 = __half22float2(sc2[0]), sc1 = __half22float2(sc2[1]), sc2_ = __half22float2(sc2[2]), sc3 = __half22float2(sc2[3]);
-    float2 sh0 = __half22float2(sh2[0]), sh1 = __half22float2(sh2[1]), sh2_ = __half22float2(sh2[2]), sh3 = __half22float2(sh2[3]);
-    sc0.x = ADA(sc0.x); sc0.y = ADA(sc0.y); sc1.x = ADA(sc1.x); sc1.y = ADA(sc1.y);
-    sc2_.x = ADA(sc2_.x); sc2_.y = ADA(sc2_.y); sc3.x = ADA(sc3.x); sc3.y = ADA(sc3.y);
+    sc0 = make_float2(ADA(sc0.x), ADA(sc0.y)); sc1 = make_float2(ADA(sc1.x), ADA(sc1.y));
+    sc2_ = make_float2(ADA(sc2_.x), ADA(sc2_.y)); sc3 = make_float2(ADA(sc3.x), ADA(sc3.y));
     __syncthreads();
     float2 r0 = red3[0], r1 = red3[1], r2 = red3[2];
     float invC = 1.f / 768.f, mean = (r0.x + r1.x + r2.x) * invC;
