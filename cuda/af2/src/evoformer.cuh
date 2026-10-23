@@ -406,9 +406,13 @@ inline const half* zeroBias(int H, int n, int stride) {        // a bias-free at
 template <bool NB, class B16>
 inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int n, int heads, size_t rows, float scale,
                      size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
-  if (flashRegStaged())     // (a T4: the one-stage register-staged form, its tiles as flash2R1Strided's)
-    flashGrid2RRun<32, 2, NB ? 48 : 32, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
-  else if (FLASH_SPEC && !NB && flash2RWideKeysFor(n))
+  if constexpr (std::is_same_v<B16, half>) {
+    if (flashRegStaged()) {   // (a T4: the one-stage register-staged form, its tiles as flash2R1Strided's; MSA16_HALF is true there)
+      flashGrid2RRun<32, 2, NB ? 48 : 32, 2, 2, NB, true, B16>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+      return;
+    }
+  }
+  if (FLASH_SPEC && !NB && flash2RWideKeysFor(n))
     flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC)
     flashGrid2RRun<32, 2, 48, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
@@ -561,10 +565,14 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       if (!t.msaOnes) {
         half* oh = scratch<half>("fatt.o", rows * Wp);
         flashGrid<half>(qkvg, bias, stride, msaMask, oh, L, w.H, w.Dp, 0, rowsN, false, 1.f / sqrtf((float)w.D));
-        half* xn2 = scratch<half>("fcol.xn", rows * C);
-        outLn256<B16, half, half>(oh, w.out, P(R + "/attention/output_b", blk), m16,
-                                  P(ln + "/scale", blk), P(ln + "/offset", blk), xn2, rows);
-        EMITTED_LN = EmittedLn{ ln, blk, msa, xn2, rows };
+        if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM)) {
+          half* xn2 = scratch<half>("fcol.xn", rows * C);
+          outLn256<B16, half, half>(oh, w.out, P(R + "/attention/output_b", blk), m16,
+                                    P(ln + "/scale", blk), P(ln + "/offset", blk), xn2, rows);
+          EMITTED_LN = EmittedLn{ ln, blk, msa, xn2, rows };
+          return;
+        }
+        ltGemm(oh, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
         return;
       }
       B16* o = scratch<B16>("fatt.o16", rows * Wp);
@@ -650,10 +658,14 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
       half* oh = scratch<half>("fatt.o", rows * Wp);
       flashGridStrided(qkvg, zbias, stride, m, oh, rowsN, w.H, w.Dp, L, 1.f / sqrtf((float)w.D),
                        (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
-      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
-      outLn256<B16, B16, half>(oh, w.out, P(A + "/attention/output_b", blk), m16,
-                               P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
-      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+      if (BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+        B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+        outLn256<B16, B16, half>(oh, w.out, P(A + "/attention/output_b", blk), m16,
+                                 P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
+        EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+        return;
+      }
+      ltGemm(oh, msaWeight<B16>(w.out, (size_t)Wp * C), m16, !BF, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, BF);
       return;
     }
     B16* o = scratch<B16>("fatt.o16", rows * Wp);
@@ -1320,7 +1332,8 @@ inline bool af2Wide128() {
     if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
     int dev, perSm = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-    return perSm >= 96 * 1024 && ccMajor() >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
+    size_t lim = getenv("LOCALFOLD_SMEM_LIMIT") ? smemLimit() : (size_t)perSm;
+    return lim >= 96 * 1024 && ccMajor() >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
   }();
   return wide128;
 }
@@ -1493,21 +1506,23 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     return;
   }
   // a T4, where neither fused form above fits (the output kernel holds the whole 128 x 128 weight, 71 KB):
-  // cuda/af3's streaming triangle kernels at 128 channels, biased, the weight 16 columns a stage (~35 KB),
-  // the contraction f16 into f32 (no bf16 MMA there)
+  // cuda/af3's streaming triangle kernels at 128 channels, biased, the weight 16 columns a stage, MT=2 (two 16-row
+  // tiles a warp, 128 rows a block; XROUNDS=2 on sm_75 -> 25.0 KB, 2 blocks/SM in 64 KB), and the contraction f16
+  // into f32 (no bf16 MMA there) cleanly into triangleOutRun (32.0 KB, 2 blocks/SM in 64 KB)
+  constexpr int XR = LF_REG_STAGES ? 2 : 1;
   if (FAST && FUSED_TRIANGLE && C == 128 && L >= 80 &&
-      fitsSmem(std::max(triIn256Smem<half>(128, 8), triangleOutSmem<128, 4, float, 32, float>()))) {
+      fitsSmem(std::max(triIn256Smem<half>(128, 4, XR, 2), triangleOutSmem<128, 4, float, 32, float>()))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
     const half* wt = w.wt;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
-    constexpr int WI = 8;
+    const size_t smem = triIn256Smem<half>(128, 4, XR, 2);
     WITH_PAIR_T(
       static bool attr = false;
-      if (!attr) { smemAttr((triIn256K<128, WI, half, 1, true, PT>), (int)triIn256Smem<half>(128, WI)); attr = true; }
-      triIn256K<128, WI, half, 1, true, PT><<<(unsigned)((plane + 16 * WI - 1) / (16 * WI)), 32 * WI, triIn256Smem<half>(128, WI), STREAM>>>(
-        pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+      if (!attr) { smemAttr((triIn256K<128, 4, half, XR, true, PT, 2>), (int)smem); attr = true; }
+      triIn256K<128, 4, half, XR, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+        pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
     float* prod = scratch<float>("ftri.prod", plane * C);
     const float one = 1.f, zero = 0.f;
     if (outgoing)
@@ -1517,7 +1532,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
                                     plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     triangleOutRun<128, 4, float>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
-                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
+                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), {}, w.wout);
     return;
   }
   needF32Pair("af2 triangle multiplication (unfused)");

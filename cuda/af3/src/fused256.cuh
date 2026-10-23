@@ -197,15 +197,15 @@ template <int C, int WARPS, class TT = float, int NC = 32, class TP = float>
 __host__ __device__ constexpr size_t triangleOutSmem() {
   constexpr int R = 16 * WARPS;
   constexpr bool VEC = sizeof(TT) == 2 && sizeof(TP) == 2;      // (triangleOutK's 16-byte product loads)
-  constexpr size_t tile = (size_t)C * (R + (VEC ? 8 : 1)) * sizeof(TT), stages = (size_t)2 * C * NC * 2 + (size_t)R * (NC + 4) * 4;
-  return (tile > stages ? tile : stages) + 2 * (size_t)R * 4 + 2 * (size_t)C * 4;
+  constexpr size_t tile = (size_t)C * (R + (VEC ? 8 : 0)) * sizeof(TT), stages = (size_t)2 * C * NC * 2 + (size_t)R * (NC + 4) * 4;
+  return (tile > stages ? tile : stages) + (VEC ? 2 * (size_t)R * 4 + 2 * (size_t)C * 4 : 0);
 }
 // TP: the product's type in memory - f32, or bf16 (ESMFold2's: the contraction writes half the bytes and
 // this reads half; the tile is bf16 either way)
 template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false, class PT = float,
-          int MINB = (C <= 128 && WARPS == 4 && NC == 16) ? 4 : (C == 256 && WARPS == 4 && NC == 16) ? 3 : 1>
+          int MINB = (C <= 128 && WARPS == 4 && NC == 16) ? 4 : (C == 256 && WARPS == 4 && NC == 16) ? 3 : (C <= 128 && WARPS == 4) ? 2 : 1>
 #if LF_REG_STAGES
-__global__ void __launch_bounds__(WARPS * 32, (C <= 128 && WARPS == 4 && NC == 16) ? 2 : 1)
+__global__ void __launch_bounds__(WARPS * 32, (C <= 128 && WARPS == 4) ? 2 : 1)
 #else
 __global__ void __launch_bounds__(WARPS * 32, MINB)
 #endif
@@ -219,15 +219,19 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
   // scoreboard 41% of the kernel's stalls, on those loads); a padding row computes and stores nothing
   constexpr bool VEC = sizeof(TT) == 2 && sizeof(TP) == 2;
   static_assert(!VEC || std::is_same_v<TT, TP>, "the tile takes the product's bytes as they are");
-  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + (VEC ? 8 : 1), KS = C / 16;
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + (VEC ? 8 : 0), KS = C / 16;
+  static_assert(VEC || (R & 31) == 0, "the unpadded tile's XOR swizzle permutes 32-row banks");
   constexpr size_t STAGE = (size_t)C * NC * 2;
-  constexpr size_t PS = triangleOutSmem<C, WARPS, TT, NC, TP>() - 2 * (size_t)R * 4 - 2 * (size_t)C * 4;
+  constexpr size_t PS = triangleOutSmem<C, WARPS, TT, NC, TP>() - (VEC ? 2 * (size_t)R * 4 + 2 * (size_t)C * 4 : 0);
   extern __shared__ __align__(16) unsigned char smem[];
   TT* Ps = (TT*)smem;                                         // [C][LDP], then the weight stages
-  float* stat = (float*)(smem + PS);                          // [R] mean, [R] 1/sd
-  // the centre norm's scale and offset, staged once (they were 128 scalar loads a thread from global memory)
-  float* nsc = stat + 2 * R;                                  // [C] scale, [C] offset
-  for (int c = threadIdx.x; c < C; c += NTH) { nsc[c] = cnScale[c]; nsc[C + c] = cnOffset[c]; }
+  float* stat = VEC ? (float*)(smem + PS) : nullptr;          // [R] mean, [R] 1/sd (VEC; !VEC keeps them in registers per warp)
+  // the centre norm's scale and offset, staged once for VEC (when !VEC, Ps is 32.0 KB at C=128 so two blocks fit a 64 KB T4 SM)
+  float* nsc = VEC ? stat + 2 * R : nullptr;                  // [C] scale, [C] offset
+  if constexpr (VEC) {
+    for (int c = threadIdx.x; c < C; c += NTH) { nsc[c] = cnScale[c]; nsc[C + c] = cnOffset[c]; }
+  }
+  auto pIdx = [&](int c, int r) { return c * LDP + (VEC ? r : (r ^ (c & 31))); };
   auto Ws = [&](int s) { return (half*)(smem + s * STAGE); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t P = (size_t)L * L, plane = rm.J ? rm.size : (size_t)Lp * Lp, stride = rm.J && rm.stride ? rm.stride : plane;
@@ -258,7 +262,7 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     bool live = row < P;
     const TP* src = prod + (live ? padded(row) : 0);
 #pragma unroll 32
-    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * stride] : 0.f);
+    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[pIdx(c, r)] = TT(live ? (float)src[(size_t)c * stride] : 0.f);
   }
   __syncthreads();
   // the centre norm's mean and 1/sd, a warp a row; at VEC's LDP (R + 8) a warp's reads across one row
@@ -276,6 +280,8 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     if (lane == 0) { stat[r] = mean; stat[R + r] = rsqrtf(q / C + 1e-5f); }
   };
+  int ra = warp * 16 + g, rb = ra + 8;
+  float ma = 0.f, ia = 0.f, mb = 0.f, ib = 0.f;
   if constexpr (VEC) {
     for (int r = 2 * warp; r < R; r += 2 * WARPS) {
       float va[C / 32], vb[C / 32];
@@ -286,15 +292,24 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
       }
       rowStats(r, va); rowStats(r + 1, vb);
     }
+    __syncthreads();
+    ma = stat[ra]; ia = stat[R + ra]; mb = stat[rb]; ib = stat[R + rb];
   } else {
-    for (int r = warp; r < R; r += WARPS) {
-      float v[C / 32];
+    for (int m = 0; m < 16; ++m) {
+      int r = warp * 16 + m;
+      float s = 0.f, v[C / 32];
 #pragma unroll
-      for (int k = 0; k < C / 32; ++k) v[k] = (float)Ps[(lane + 32 * k) * LDP + r];
-      rowStats(r, v);
+      for (int k = 0; k < C / 32; ++k) { int c = lane + 32 * k; v[k] = (float)Ps[pIdx(c, r)]; s += v[k]; }
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s / C, q = 0.f;
+#pragma unroll
+      for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
+      for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+      float inv = rsqrtf(q / C + 1e-5f);
+      if (g == m) { ma = mean; ia = inv; }
+      if (g + 8 == m) { mb = mean; ib = inv; }
     }
   }
-  __syncthreads();
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
   // (the gate computed here instead of read - sigmoid(LN(pair row) Wg) on a second set of A fragments, the input kernel
   // writing no t2 - was measured on the A100: the input kernel -1% (256 channels) / -17% (128), this one +31% / +41%,
@@ -302,9 +317,10 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
   // (the centre norm's scale folded into Wout's rows and its offset into an output bias, the tile then read by
   // ldmatrix.trans - four 8x8 matrices an instruction for these 2-byte loads and the scale/offset reads - was measured:
   // -1% of this kernel at 988 tokens in AF3, +3.7% in ESMFold2's 256-channel one; not taken)
-  int ra = warp * 16 + g, rb = ra + 8;
-  float ma = stat[ra], ia = stat[R + ra], mb = stat[rb], ib = stat[R + rb];
-  auto nrm = [&](int r, float m, float inv, int k) { return ((float)Ps[k * LDP + r] - m) * inv * nsc[k] + nsc[C + k]; };
+  auto nrm = [&](int r, float m, float inv, int k) {
+    float sc = VEC ? nsc[k] : __ldg(cnScale + k), of = VEC ? nsc[C + k] : __ldg(cnOffset + k);
+    return ((float)Ps[pIdx(k, r)] - m) * inv * sc + of;
+  };
   uint32_t xa[KS][4];
 #pragma unroll
   for (int ks0 = 0; ks0 < KS; ks0 += 8) {
@@ -453,11 +469,16 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
 // in ROUNDS (xrounds > 1), one round's 16 * warps / xrounds rows share smem + 2 * STAGE with Ta/Tb/Ys
 // (Xs is consumed during the prologue's round loop before the main step loop ever writes Ta/Tb/Ys),
 // keeping triIn256Smem(256, 16, 8) at 49,664 B (<= 64 KB on T4 sm_75, and 2 blocks/SM in 100 KB on sm_89/sm_120)
-template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int xrounds = 1) {
-  size_t rows = (size_t)16 * warps / xrounds * (C + 8) * 2;
-  size_t ab = (size_t)2 * 8 * (16 * warps + 8) * sizeof(TA), t2s = (size_t)warps * 16 * 32 * 2;
+template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int xrounds = 1, int mt = 1) {
+  size_t stage = (size_t)2 * C * 16 * 2;
+  size_t rows = (size_t)16 * (warps * mt / xrounds) * (C + 8) * 2;
+  size_t ab = (size_t)2 * 8 * (16 * warps * mt + 8) * sizeof(TA), t2s = (size_t)warps * 16 * 32 * 2;
   size_t tail = ab > t2s ? ab : t2s;
-  size_t stages = (size_t)2 * 2 * C * 16 * 2 + (xrounds > 1 && rows > tail ? rows : tail);
+  if (mt > 1 && xrounds == mt) {
+    size_t pro = stage + rows, main = 2 * stage + tail;
+    return pro > main ? pro : main;
+  }
+  size_t stages = 2 * stage + (xrounds > 1 && rows > tail ? rows : tail);
   return xrounds == 1 && rows > stages ? rows : stages;
 }
 // Wt: tileTriIn's layout at 16 columns a tile
@@ -471,10 +492,10 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 // shared memory then feeds MT MMAs where it fed one - the kernel was shared-memory bound (Nsight Compute at 988
 // tokens: the LSU's shared wavefronts 68% of peak, the tensor pipe 57%). Each output's k order is unchanged.
 template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float, int MT = 1,
-          int MINB = ((C == 128 && WARPS == 4 && XROUNDS == 1 && MT == 2) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
+          int MINB = ((C == 128 && WARPS == 4 && MT == 2) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
                    : (C == 256 && WARPS == 8 && XROUNDS == 1 && MT == 1) ? 2 : 1>
 #if LF_REG_STAGES
-__global__ void __launch_bounds__(WARPS * 32, (C == 128 && WARPS == 4 && XROUNDS == 1 && MT == 2) ? 2 : 1)
+__global__ void __launch_bounds__(WARPS * 32, (C == 128 && WARPS == 4 && MT == 2) ? 2 : 1)
 #else
 __global__ void __launch_bounds__(WARPS * 32, MINB)
 #endif
@@ -494,7 +515,7 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
   // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
   // both are conflict-free - 87.9 -> 84.7 ms of ESMFold2's 5CAJ trunk, byte-identical
-  static_assert(MT == 1 || XROUNDS == 1, "row tiles a warp, or rounds - not both");
+  static_assert(MT == 1 || XROUNDS == 1 || XROUNDS == MT, "row tiles a warp, or rounds");
   constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS * MT, NTH = 32 * WARPS, LDX = C + 8, LDW = NC, KS = C / 16, LDT = R + 8;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
@@ -515,7 +536,7 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     unsigned u = q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE);
+  half* Xs = XROUNDS == 1 ? (half*)smem : (MT > 1 && XROUNDS == MT) ? (half*)(smem + STAGE) : (half*)(smem + 2 * STAGE);
   auto W0 = [&](int s) { return (half*)(smem + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
   TA* Ta = (TA*)(smem + 2 * STAGE);
@@ -560,6 +581,17 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     }
     __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
     issue(stepOf(0), 0);
+  } else if constexpr (MT > 1 && XROUNDS == MT) {
+    constexpr int XR = 16 * WARPS;
+    issue(stepOf(0), 0);                // stage 0 sits at smem[0 .. STAGE); Xs sits at smem + STAGE (25.0 KB total at C=128)
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + ((r >> 4) * MT + mt) * 16 + (r & 15)); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+      __syncthreads();
+#pragma unroll
+      for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+      __syncthreads();                  // the round's fragments are in registers: the next round or stage 1 takes Xs
+    }
   } else {
     static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
     constexpr int XR = R / XROUNDS;

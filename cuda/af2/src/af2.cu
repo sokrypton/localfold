@@ -392,7 +392,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 #else
       MSA16_HALF = major < 8;
 #endif
-      MSA16 = FAST && !check && (t.msaOnes || (!MSA16_HALF && !AF2_TIGHT && fitsSmem(oln::SMEM))) &&
+      MSA16 = FAST && !check && (t.msaOnes || MSA16_HALF || (!AF2_TIGHT && fitsSmem(oln::SMEM))) &&
               (MSA16_HALF || !flashRegStaged()) && !getenv("LOCALFOLD_MSA_F32") &&
               dimW(q, 2) * dimW(q, 3) == 256 && dimW(q, 3) == 32 && dimW(qc, 3) == 32;
       if (MSA16) {

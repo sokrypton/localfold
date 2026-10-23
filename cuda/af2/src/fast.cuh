@@ -522,7 +522,7 @@ inline TriFused triFusedWeights(const std::string& T, int blk, int C) {
   interleaveTriK<<<blocks((size_t)C * 4 * C), 256, 0, STREAM>>>(P(T + "/projection/weights", blk), P(T + "/gate/weights", blk),
     P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), P(T + "/gating_linear/bias", blk), w, b, C);
   tileTriIn(w, PH(T + "/gating_linear/weights", blk), C, 16, wt);
-  int outNc = (C == 64 || getenv("LOCALFOLD_TRIOUT_F32")) ? 32 : 16;
+  int outNc = (C == 64 || ccMajor() < 8 || getenv("AF2_TRI_F32") || getenv("LOCALFOLD_TRIOUT_F32")) ? 32 : 16;
   tileColumns(PH(T + "/output_projection/weights", blk), C, C, 0, C, outNc, wout);
   return cache[{T, blk}] = TriFused{w, b, wt, wout};
 }
