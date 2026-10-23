@@ -60,7 +60,9 @@ kernel void af3_scale(LF_ARGS(ScaleArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.n) return;
   float v = a.x[t] * a.s;
-  a.x[t] = a.relu ? max(v, 0.f) : v;
+  v = a.relu ? max(v, 0.f) : v;
+  if (a.outH) a.outH[t] = (half)v;
+  else a.x[t] = v;
 }
 kernel void af3_scale_rows(LF_ARGS(ScaleRowsArgs)) {
   ulong t = LF_INDEX;
@@ -181,11 +183,50 @@ kernel void af3_onehot(LF_ARGS(OnehotArgs)) {
   uint r = lf_udiv(t, a.classes), c = t - r * a.classes;
   a.out[t] = a.idx[r] == (int)c ? 1.f : 0.f;
 }
-kernel void af3_add_row_col(LF_ARGS(AddRowColArgs)) {      // act[i][j] += row[j] + col[i]
+kernel void af3_add_row_col(LF_ARGS(AddRowColArgs)) {      // act[i][j] = (query[i][j] +) row[j] + col[i] (+ bias)
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.n * a.n * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    float4 v = (a.query ? ((device const float4*)a.query)[t] : ((device const float4*)a.act)[t]) +
+               ((device const float4*)a.row)[j * C4 + c4] + ((device const float4*)a.col)[i * C4 + c4];
+    if (a.bias) v += ((device const float4*)a.bias)[c4];
+    ((device float4*)a.act)[t] = v;
+    return;
+  }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
-  a.act[t] += a.row[j * a.C + c] + a.col[i * a.C + c];
+  float v = (a.query ? a.query[t] : a.act[t]) + a.row[j * a.C + c] + a.col[i * a.C + c] + (a.bias ? a.bias[c] : 0.f);
+  a.act[t] = v;
+}
+kernel void af3_template_sparse_proj(LF_ARGS(SparseProjArgs)) {
+  ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.pairs * C4) return;
+    uint p = lf_udiv((uint)t, C4), c4 = (uint)t - p * C4;
+    float4 v = a.query ? ((device const float4*)a.query)[t] : ((device const float4*)a.act)[t];
+    device const int* idx = a.idx + (ulong)p * a.K;
+    device const float* val = a.val + (ulong)p * a.K;
+    device const half4* W4 = (device const half4*)a.W;
+    for (uint k = 0; k < a.K; ++k) {
+      int col = idx[k];
+      if (col >= 0 && (uint)col < a.width) v += (float)(half)val[k] * float4(W4[(uint)col * C4 + c4]);
+    }
+    if (a.bias) v += ((device const float4*)a.bias)[c4];
+    ((device float4*)a.act)[t] = v;
+    return;
+  }
+  if (t >= a.pairs * a.C) return;
+  uint p = lf_udiv((uint)t, a.C), c = (uint)t - p * a.C;
+  float v = a.query ? a.query[t] : a.act[t];
+  for (uint k = 0; k < a.K; ++k) {
+    int col = a.idx[(ulong)p * a.K + k];
+    if (col >= 0 && (uint)col < a.width) v += (float)(half)a.val[(ulong)p * a.K + k] * (float)a.W[(uint)col * a.C + c];
+  }
+  if (a.bias) v += a.bias[c];
+  a.act[t] = v;
 }
 kernel void af3_template_geometry(LF_ARGS(TmplGeomArgs)) {
   ulong t = LF_INDEX;
@@ -1291,12 +1332,14 @@ kernel void af3_expectation(LF_ARGS(ExpectationArgs)) {
   if (a.symmetricN) { ulong i = r / a.symmetricN, j = r - i * a.symmetricN; rt = j * a.symmetricN + i; }
   float mx = -1e30f;
   for (uint b = 0; b < a.bins; ++b) mx = max(mx, a.logits[r * a.bins + b] + (a.symmetricN ? a.logits[rt * a.bins + b] : 0.f));
-  float total = 0.f, weighted = 0.f;
+  float total = 0.f, weighted = 0.f, weighted2 = 0.f;
   for (uint b = 0; b < a.bins; ++b) {
     float p = exp(a.logits[r * a.bins + b] + (a.symmetricN ? a.logits[rt * a.bins + b] : 0.f) - mx);
     total += p; weighted += p * a.centres[b];
+    if (a.out2) weighted2 += p * a.centres2[b];
   }
   a.out[r] = weighted / total * a.scale * (a.mask ? a.mask[r] : 1.f);
+  if (a.out2) a.out2[r] = weighted2 / total * a.scale;
 }
 kernel void af3_inter_chain(LF_ARGS(InterChainArgs)) {
   ulong t = LF_INDEX;
@@ -1578,7 +1621,10 @@ kernel void af3_gather_parent(LF_ARGS(GatherParentArgs)) {
 }
 kernel void af3_silu(LF_ARGS(SiluInPlaceArgs)) {
   ulong t = LF_INDEX;
-  if (t < a.n) a.x[t] = lf_silu(a.x[t]);
+  if (t >= a.n) return;
+  float v = lf_silu(a.x[t]);
+  if (a.outH) a.outH[t] = (half)v;
+  else a.x[t] = v;
 }
 kernel void af3_single_struct(LF_ARGS(SingleStructArgs)) {
   ulong t = LF_INDEX;
@@ -1713,7 +1759,8 @@ kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
   if (total <= 0xffffffffull) {
     uint r = lf_udiv((uint)t, a.K); k = (uint)t - r * a.K; uint r2 = lf_udiv(r, a.n); i = r - r2 * a.n; g = lf_udiv(r2, a.S); s = r2 - g * a.S;
   } else { k = (uint)(t % a.K); ulong r = t / a.K; i = (uint)(r % a.n); r /= a.n; s = (uint)(r % a.S); g = (uint)(r / a.S); }
-  a.out[t] = a.x[(((ulong)s * a.n + i) * a.G + g) * a.K + k];
+  ulong row = (ulong)s * a.n + i;
+  a.out[t] = a.x[(row * a.G + g) * a.K + k] * (a.mask ? a.mask[row] : 1.f);
 }
 kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
   ulong t = LF_INDEX;

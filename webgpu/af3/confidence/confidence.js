@@ -165,7 +165,16 @@ const headOrderFor = (weights) => [
     ? [] : ["interHalfDistanceLogits", "paeInterLogits"]),
 ];
 
+const packedByWeights = new WeakMap();
+
 function pack(weights, order, label) {
+  let forWeights = packedByWeights.get(weights);
+  if (forWeights === undefined) {
+    forWeights = new Map();
+    packedByWeights.set(weights, forWeights);
+  }
+  const cached = forWeights.get(label);
+  if (cached !== undefined) return cached;
   const offsets = {};
   let total = 0;
   for (const name of order) {
@@ -175,7 +184,9 @@ function pack(weights, order, label) {
   }
   const data = new Float32Array(total);
   for (const name of order) data.set(weights[name], offsets[name]);
-  return { data, offsets };
+  const packed = { data, offsets };
+  forWeights.set(label, packed);
+  return packed;
 }
 
 /** Bin centres for an error head: `bins - 1` edges, plus a catch-all. */

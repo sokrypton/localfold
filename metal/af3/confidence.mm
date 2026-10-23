@@ -9,21 +9,23 @@
 static void boltz2Reembed(float* pair, float* single, const Trunk& t, const float* pseudoBeta, int C, int Cs, int F) {
   const std::string R = "confidence.reembed.";
   int n = t.n; size_t pairs = (size_t)n * n;
-  float* sIn = scratch<float>("conf.sInputs", (size_t)n * F);
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  half* sIn = scratch<half>("conf.sInputs", np * F);
+  if (np > (size_t)n) fill(sIn + (size_t)n * F, 0, (np - n) * F * sizeof(half));
   ln(t.targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
   ln(t.single, single, n, Cs, R + "sNormScale", R + "sNormOffset");
-  lin(sIn, R + "sInputToS", single, n, F, Cs, 1.f);
+  lin(sIn, R + "sInputToS", single, np, F, Cs, 1.f);
   ln(t.pair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
   if (lenW(R + "relPosProject") != (size_t)139 * C) die("relPosProject is not 139 x %d", C);
   RelIdx r{M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
            M.i("batch.features.entityId"), M.i("batch.features.symId")};
   run1d("af3_relenc", (C & 3) ? pairs * C : pairs * (C >> 2), RelEncArgs{r, W(R + "relPosProject"), pair, (uint)n, (uint)C});
-  float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
-  float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
-  lin(sIn, R + "leftTargetFeatProject", left, n, F, C);
-  lin(sIn, R + "rightTargetFeatProject", right, n, F, C);
-  lin(sIn, R + "sToZProdIn1", p1, n, F, C);
-  lin(sIn, R + "sToZProdIn2", p2, n, F, C);
+  float* left = scratch<float>("conf.left", np * C); float* right = scratch<float>("conf.right", np * C);
+  float* p1 = scratch<float>("conf.p1", np * C); float* p2 = scratch<float>("conf.p2", np * C);
+  lin(sIn, R + "leftTargetFeatProject", left, np, F, C);
+  lin(sIn, R + "rightTargetFeatProject", right, np, F, C);
+  lin(sIn, R + "sToZProdIn1", p1, np, F, C);
+  lin(sIn, R + "sToZProdIn2", p2, np, F, C);
   if (lenW(R + "distogramFeatProject") != (size_t)64 * C) die("the reembed distogram is not 64 bins");
   int* bins = scratch<int>("conf.bin", pairs);
   run1d("af3_reembed_bin", pairs, ReembedBinArgs{pseudoBeta, bins, (uint)n, 0});
@@ -76,9 +78,12 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
     maskedGlobalNorm(tfn, t.seqMask, n, F, 449);
     tf = tfn;
   }
-  float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
-  lin(tf, P + ".leftTargetFeatProject", left, n, F, C);
-  lin(tf, P + ".rightTargetFeatProject", right, n, F, C);
+  float* left = scratch<float>("conf.left", np * C); float* right = scratch<float>("conf.right", np * C);
+  half* tfH = scratch<half>("conf.tfH", np * F);
+  if (np > (size_t)n) fill(tfH + (size_t)n * F, 0, (np - n) * F * sizeof(half));
+  toHalf(tf, tfH, (size_t)n * F);
+  lin(tfH, P + ".leftTargetFeatProject", left, np, F, C);
+  lin(tfH, P + ".rightTargetFeatProject", right, np, F, C);
   // (rf3: its two dropped s_inputs columns at -mean/std through their own rows, the same on every token: cuda/af3)
   if (flag("trunk.dialect.confidenceGlobalNorm") && hasW(P + ".leftTargetFeatProjectAbsent")) {
     if (lenW(P + ".leftTargetFeatProjectAbsent") != (size_t)2 * C) die("rf3's absent target_feat rows are not 2 x %d", C);
@@ -156,25 +161,34 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   float* inter = hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits") ? scratch<float>("conf.inter", pairs * NB) : nullptr;
   const int* asym = M.i("batch.asymId");
   // a head's logits: LN(x) W (a head LayerNorm the bundle does not carry is none), with boltz2's inter-chain half
+  auto headFromLn = [&](const half* xLn, const std::string& w, const std::string& interW) {
+    lin(xLn, P + "." + w, logits, pairs, C, NB);
+    if (!hasW(P + "." + interW)) return;
+    lin(xLn, P + "." + interW, inter, pairs, C, NB);
+    run1d("af3_inter_chain", pairs * NB, InterChainArgs{logits, inter, asym, (uint)n, (uint)NB});
+  };
   auto head = [&](const float* x, const std::string& norm, const std::string& w, const std::string& interW) {
     if (hasW(P + "." + norm + "Scale")) ln(x, lnPair, pairs, C, P + "." + norm + "Scale", P + "." + norm + "Offset");
     else toHalf(x, lnPair, pairs * C);
-    lin(lnPair, P + "." + w, logits, pairs, C, NB);
-    if (!hasW(P + "." + interW)) return;
-    lin(lnPair, P + "." + interW, inter, pairs, C, NB);
-    run1d("af3_inter_chain", pairs * NB, InterChainArgs{logits, inter, asym, (uint)n, (uint)NB});
+    headFromLn(lnPair, w, interW);
   };
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
   bool preSym = flag("trunk.dialect.preSymmetrisedPde");
   if (hasW(P + ".interHalfDistanceLogits") && !preSym) die("split PDE heads need the pre-symmetrised PDE");
+  half* lnPae = nullptr;
   if (preSym) {      // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
     float* sym = scratch<float>("conf.sym", pairs * C);
     run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
     head(sym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+  } else if (hasW(P + ".logitsLnScale") && hasW(P + ".paeLogitsLnScale")) {
+    lnPae = scratch<half>("conf.lnPae", pairs * C);
+    layerNormDual(pair, lnPair, W(P + ".logitsLnScale"), W(P + ".logitsLnOffset"),
+                  lnPae, W(P + ".paeLogitsLnScale"), W(P + ".paeLogitsLnOffset"), pairs, C);
+    headFromLn(lnPair, "leftHalfDistanceLogits", "interHalfDistanceLogits");
   } else head(pair, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
-  run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, t.pairMask, dCentres, pairs, (uint)NB, preSym ? 0u : (uint)n, 1.f, 0});
-  head(pair, "paeLogitsLn", "paeLogits", "paeInterLogits");
-  run1d("af3_expectation", pairs, ExpectationArgs{logits, pae, t.pairMask, dCentres, pairs, (uint)NB, 0, 1.f, 0});
+  run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, t.pairMask, dCentres, nullptr, nullptr, pairs, (uint)NB, preSym ? 0u : (uint)n, 1.f, 0});
+  if (lnPae) headFromLn(lnPae, "paeLogits", "paeInterLogits");
+  else head(pair, "paeLogitsLn", "paeLogits", "paeInterLogits");
   ConfidenceOut out;
   {   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's mean over what it selects
     std::vector<float> seq = download(t.seqMask, n);
@@ -186,7 +200,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
     float* dPerBin = scratch<float>("conf.perBin", NB);
     upload(dPerBin, perBin.data(), NB * 4);
     float* dTerm = scratch<float>("conf.tmTerm", pairs);
-    run1d("af3_expectation", pairs, ExpectationArgs{logits, dTerm, nullptr, dPerBin, pairs, (uint)NB, 0, 1.f, 0});
+    run1d("af3_expectation", pairs, ExpectationArgs{logits, pae, t.pairMask, dCentres, dTerm, dPerBin, pairs, (uint)NB, 0, 1.f, 0});
     std::vector<float> term = download(dTerm, pairs);
     auto reduce = [&](bool interOnly) {
       double best = -1e30; bool any = false;
@@ -237,7 +251,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
     run1d("af3_plddt37", (size_t)n * dense * PB, Plddt37Args{p37, dIdx, pl, (uint)n, (uint)dense, (uint)PB, 0});
   } else lin(sln, P + ".plddtLogits", pl, np, Cs, dense * PB);
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
-  run1d("af3_expectation", (size_t)n * dense, ExpectationArgs{pl, plddt, nullptr, dpc, (u64)n * dense, (uint)PB, 0, 100.f, 0});
+  run1d("af3_expectation", (size_t)n * dense, ExpectationArgs{pl, plddt, nullptr, dpc, nullptr, nullptr, (u64)n * dense, (uint)PB, 0, 100.f, 0});
   out.plddt = download(plddt, (size_t)n * dense);
   if (flag("trunk.dialect.perAtomHeadsByRank")) {   // (each atom's by its rank among the token's real atoms: cuda/af3)
     const int* chars = M.hostI("batch.refAtomNameChars");

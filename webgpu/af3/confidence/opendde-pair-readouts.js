@@ -389,13 +389,13 @@ export async function openddeAtomReadouts(device, input, weights) {
 
     device.pushErrorScope("validation");
     const encoder = device.createCommandEncoder({ label: "opendde-confidence-atoms" });
+    const pass = encoder.beginComputePass({ label: "opendde-confidence-atoms" });
     arms.forEach((arm, index) => {
       const buffers = [single, layoutBuffer,
         resident(`opendde-conf.${arm.name}-scale`, () => arm.scale),
         resident(`opendde-conf.${arm.name}-offset`, () => arm.offset),
         resident(`opendde-conf.${arm.name}-table`, () => arm.table),
         outputs[index]];
-      const pass = encoder.beginComputePass({ label: `opendde-conf.${arm.name}` });
       pass.setPipeline(compiled[index]);
       pass.setBindGroup(0, device.createBindGroup({
         layout: compiled[index].getBindGroupLayout(0),
@@ -404,7 +404,9 @@ export async function openddeAtomReadouts(device, input, weights) {
         })),
       }));
       pass.dispatchWorkgroups(Math.min(atoms, GRID_WIDTH), Math.ceil(atoms / GRID_WIDTH));
-      pass.end();
+    });
+    pass.end();
+    arms.forEach((unused, index) => {
       encoder.copyBufferToBuffer(outputs[index].buffer, 0, readbacks[index].buffer, 0, atoms * 4);
     });
     device.queue.submit([encoder.finish()]);
@@ -416,9 +418,9 @@ export async function openddeAtomReadouts(device, input, weights) {
       allocation.buffer.unmap();
       return copy;
     };
-    const plddt = await read(readbacks[0]);
+    const [plddt, resolved] = await Promise.all(readbacks.map(read));
     for (let index = 0; index < plddt.length; index += 1) plddt[index] *= 100;
-    return { plddt, resolved: await read(readbacks[1]) };
+    return { plddt, resolved };
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
   }
@@ -476,6 +478,7 @@ export async function openddePairReadouts(device, input, weights) {
 
     device.pushErrorScope("validation");
     const encoder = device.createCommandEncoder({ label: "opendde-confidence-readouts" });
+    const pass = encoder.beginComputePass({ label: "opendde-confidence-readouts" });
     arms.forEach((arm, index) => {
       const buffers = [pair,
         resident(`opendde-conf.${arm.name}-scale`, () => arm.scale),
@@ -483,7 +486,6 @@ export async function openddePairReadouts(device, input, weights) {
         resident(`opendde-conf.${arm.name}-projection`, () => arm.projection),
         outputs[index],
         ...(arm.tm ? [tmOut] : [])];
-      const pass = encoder.beginComputePass({ label: `opendde-conf.${arm.name}` });
       pass.setPipeline(compiled[index]);
       pass.setBindGroup(0, device.createBindGroup({
         layout: compiled[index].getBindGroupLayout(0),
@@ -492,7 +494,9 @@ export async function openddePairReadouts(device, input, weights) {
         })),
       }));
       pass.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
-      pass.end();
+    });
+    pass.end();
+    arms.forEach((arm, index) => {
       encoder.copyBufferToBuffer(outputs[index].buffer, 0, readbacks[index].buffer, 0, rows * 4);
       if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, tmBack.buffer, 0, rows * 4);
     });
@@ -505,8 +509,11 @@ export async function openddePairReadouts(device, input, weights) {
       allocation.buffer.unmap();
       return copy;
     };
-    return { pae: await read(readbacks[0]), pde: await read(readbacks[1]),
-             ...(tmBack === null ? {} : { tm: await read(tmBack) }) };
+    const [pae, pde, tm] = await Promise.all([
+      read(readbacks[0]), read(readbacks[1]),
+      ...(tmBack === null ? [] : [read(tmBack)]),
+    ]);
+    return { pae, pde, ...(tm === undefined ? {} : { tm }) };
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
   }
@@ -520,6 +527,7 @@ export async function openddePairReadouts(device, input, weights) {
  */
 /** `out[row, o] = sum_i in[row, i] * weight[i, o]`, the weight (in, out). */
 function createProjectRowsShader({ rows, inChannels, outChannels }) {
+  const stageRow = outChannels % 64 === 0 && inChannels <= 1024;
   return `
 const ROWS: u32 = ${rows}u;
 const IN: u32 = ${inChannels}u;
@@ -528,7 +536,26 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+${stageRow ? `var<workgroup> row_buf: array<f32, ${inChannels}>;
 @compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let base_slot = (group.x + group.y * GRID_WIDTH) * 64u;
+  if (base_slot >= ROWS * OUT) { return; }
+  let lane = local.x;
+  let slot = base_slot + lane;
+  let row = base_slot / OUT;
+  for (var c = lane; c < IN; c += 64u) {
+    row_buf[c] = source[row * IN + c];
+  }
+  workgroupBarrier();
+  let o = slot % OUT;
+  var sum = 0.0;
+  for (var c = 0u; c < IN; c += 1u) {
+    sum += row_buf[c] * weight[c * OUT + o];
+  }
+  out[slot] = sum;
+}` : `@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let slot = id.x + id.y * GRID_WIDTH * 64u;
   if (slot >= ROWS * OUT) { return; }
@@ -539,17 +566,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     sum += source[row * IN + c] * weight[c * OUT + o];
   }
   out[slot] = sum;
-}`;
+}`}`;
 }
 
 export async function openddePairInit(device, input, weights, allocator) {
   const { tokens, channels } = input;
   const pairs = tokens * tokens;
   const pipelines = pipelineCacheForDevice(device);
-  const pipeline = await pipelines.get(
-    `opendde-conf-pairinit:${tokens}:${channels}:${weights.distanceBins}`,
-    createPairInitShader({ tokens, channels, bins: weights.distanceBins,
-                           binStart: input.binStart, binStep: input.binStep }));
+  const inChannels = input.singleInputChannels;
+  const [pipeline, project] = await Promise.all([
+    pipelines.get(
+      `opendde-conf-pairinit:${tokens}:${channels}:${weights.distanceBins}`,
+      createPairInitShader({ tokens, channels, bins: weights.distanceBins,
+                             binStart: input.binStart, binStep: input.binStep })),
+    input.singleInputs === undefined ? undefined
+      : pipelines.get(`opendde-conf-project:${tokens}:${inChannels}:${channels}`,
+                      createProjectRowsShader({ rows: tokens, inChannels, outChannels: channels })),
+  ]);
 
   const storage = GPUBufferUsage.STORAGE;
   const scratch = [];
@@ -562,48 +595,42 @@ export async function openddePairInit(device, input, weights, allocator) {
     pairs * channels * 4, storage | GPUBufferUsage.COPY_SRC);
   const resident = (label, build) =>
     ({ buffer: residentWeightBuffer(device, weights, label, build) });
+  device.pushErrorScope("validation");
+  const encoder = device.createCommandEncoder({ label: "opendde-confidence-pair-init" });
   // 🔴 s1 AND s2 ON THE DEVICE when the caller hands over the single inputs.
   // They were two JavaScript matmuls - `tokens x 449 -> 384`, and on OpenDDE's
   // structural tokens that is 495 of them at 255 residues - uploaded here
   // straight after. Same weights, same k order, accumulated in f32.
-  const projectedSingles = async () => {
-    if (input.singleInputs === undefined) {
-      return [up("opendde-conf.s1", input.s1), up("opendde-conf.s2", input.s2)];
-    }
-    const inChannels = input.singleInputChannels;
-    const project = await pipelines.get(`opendde-conf-project:${tokens}:${inChannels}:${channels}`,
-      createProjectRowsShader({ rows: tokens, inChannels, outChannels: channels }));
+  let singles;
+  if (input.singleInputs === undefined) {
+    singles = [up("opendde-conf.s1", input.s1), up("opendde-conf.s2", input.s2)];
+  } else {
     const source = up("opendde-conf.single-inputs", input.singleInputs);
-    const encoder = device.createCommandEncoder({ label: "opendde-conf.s-project" });
-    const outputs = [["s1", weights.s1], ["s2", weights.s2]].map(([name, matrix]) => {
+    const sPass = encoder.beginComputePass({ label: "opendde-conf.s-project" });
+    sPass.setPipeline(project);
+    const groups = Math.ceil(tokens * channels / 64);
+    singles = [["s1", weights.s1], ["s2", weights.s2]].map(([name, matrix]) => {
       const target = allocator.allocate(`opendde-conf.${name}`, tokens * channels * 4, storage);
       scratch.push(target);
-      const pass = encoder.beginComputePass({ label: `opendde-conf.${name}` });
-      pass.setPipeline(project);
-      pass.setBindGroup(0, device.createBindGroup({
+      sPass.setBindGroup(0, device.createBindGroup({
         layout: project.getBindGroupLayout(0),
         entries: [source, resident(`opendde-conf.w-${name}`, () => matrix), target]
           .map((allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
-      const groups = Math.ceil(tokens * channels / 64);
-      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-      pass.end();
+      sPass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       return target;
     });
-    device.queue.submit([encoder.finish()]);
-    return outputs;
-  };
+    sPass.end();
+  }
   const buffers = [
     input.pairBuffer !== undefined
       ? { buffer: input.pairBuffer } : up("opendde-conf.trunk-pair", input.pair),
-    ...(await projectedSingles()),
+    ...singles,
     up("opendde-conf.coordinates", input.coordinates),
     resident("opendde-conf.distance", () => weights.distance),
     resident("opendde-conf.distance-raw", () => weights.distanceRaw),
     out,
   ];
-  device.pushErrorScope("validation");
-  const encoder = device.createCommandEncoder({ label: "opendde-confidence-pair-init" });
   const pass = encoder.beginComputePass({ label: "opendde-conf.pair-init" });
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, device.createBindGroup({

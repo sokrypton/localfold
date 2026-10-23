@@ -186,25 +186,21 @@ export async function openddeConfidence(device, input, weights, dialect, options
   // each at 130 structural tokens - under a comment calling this head's host
   // half "the cheap half". `--host-readouts` is what
   // check-opendde-confidence.js compares against.
-  const pairReadouts = options.hostReadouts === true
-    ? hostPairReadouts(refined.pair, tokens, c, weights, input.tmTokens)
-    : await openddePairReadouts(device, { pairBuffer: built.allocation.buffer,
-                                          tokens, channels: c,
-                                          tmTokens: input.tmTokens }, weights);
-  built?.release();
-
-  // pLDDT and resolved: per ATOM, against the matrix its dense SLOT names.
-  //
-  // 🔴 ON THE GPU, AND THE HOST PATH IS THE REFERENCE. At 130 structural tokens
-  // and 24 dense slots these two are 3120 atoms x 384 channels x {50, 2} bins
-  // with a LayerNorm each, and they measured 148 ms inside a fold.
   const atoms = input.atomCount;
-  const atomReadouts = options.hostReadouts === true
-    ? hostAtomReadouts(refined.single, atoms, cs, input, weights)
-    : await openddeAtomReadouts(device, {
-      single: refined.single, atoms, channels: cs,
-      atomToToken: input.atomToToken, atomToSlot: input.atomToSlot,
-    }, weights);
+  const [pairReadouts, atomReadouts] = await Promise.all([
+    options.hostReadouts === true
+      ? hostPairReadouts(refined.pair, tokens, c, weights, input.tmTokens)
+      : openddePairReadouts(device, { pairBuffer: built.allocation.buffer,
+                                      tokens, channels: c,
+                                      tmTokens: input.tmTokens }, weights),
+    options.hostReadouts === true
+      ? hostAtomReadouts(refined.single, atoms, cs, input, weights)
+      : openddeAtomReadouts(device, {
+        single: refined.single, atoms, channels: cs,
+        atomToToken: input.atomToToken, atomToSlot: input.atomToSlot,
+      }, weights),
+  ]);
+  built?.release();
 
   // 🔴 THE REDUCTIONS ARE OpenDDE's OWN BINS. pLDDT is 50 bins over [0, 1] and
   // is scaled by 100; PAE and PDE are 64 over [0, 32]. Reading any of them on

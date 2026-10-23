@@ -74,7 +74,27 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let E_NEXT: u32 = 6u * C;
   let E_ROLE: u32 = 8u * C;
 
-  for (var d = local; d < C; d += 64u) {
+  ${channels % 64 === 0 ? `const STEPS: u32 = ${channels / 64}u;
+  var totals: array<f32, ${channels / 64}>;
+  for (var s = 0u; s < STEPS; s += 1u) {
+    totals[s] = source[local + s * 64u];
+  }
+  for (var c = 0u; c < C; c += 1u) {
+    let sc = source[c];
+    let w_base = matrix + c * C + local;
+    for (var s = 0u; s < STEPS; s += 1u) {
+      totals[s] += sc * projection[w_base + s * 64u];
+    }
+  }
+  for (var s = 0u; s < STEPS; s += 1u) {
+    let d = local + s * 64u;
+    out[row * C + d] = totals[s]
+      + embeddings[E_SAME + same_parent * C + d]
+      + embeddings[E_TWIN + twin * C + d]
+      + embeddings[E_PREV + prev_bb * C + d]
+      + embeddings[E_NEXT + next_bb * C + d]
+      + embeddings[E_ROLE + role_pair * C + d];
+  }` : `for (var d = local; d < C; d += 64u) {
     var total = source[d];
     for (var c = 0u; c < C; c += 1u) {
       total += source[c] * projection[matrix + c * C + d];
@@ -85,7 +105,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       + embeddings[E_NEXT + next_bb * C + d]
       + embeddings[E_ROLE + role_pair * C + d];
     out[row * C + d] = total;
-  }
+  }`}
 }`;
 }
 
@@ -192,6 +212,30 @@ export function packStructuralFeatures(features, tokens) {
   return packed;
 }
 
+const packedByWeights = new WeakMap();
+function packedExpanderWeights(weights, channels, singleChannels, hidden) {
+  let cached = packedByWeights.get(weights);
+  if (cached !== undefined) return cached;
+  const tables = new Float32Array(16 * channels);
+  tables.set(weights.sameParentEmbedding, 0);
+  tables.set(weights.sameResidueTwinEmbedding, 2 * channels);
+  tables.set(weights.prevBbChainEmbedding, 4 * channels);
+  tables.set(weights.nextBbChainEmbedding, 6 * channels);
+  tables.set(weights.rolePairTypeEmbedding, 8 * channels);
+  const singleWeights = new Float32Array(
+    2 * singleChannels + singleChannels * hidden + hidden * singleChannels
+    + weights.singleRoleEmbedding.length);
+  let at = 0;
+  for (const part of [weights.singleSplitNormScale, weights.singleSplitNormOffset,
+                      weights.singleSplit1, weights.singleSplit2,
+                      weights.singleRoleEmbedding]) {
+    singleWeights.set(part, at); at += part.length;
+  }
+  cached = { tables, singleWeights };
+  packedByWeights.set(weights, cached);
+  return cached;
+}
+
 export class Af3StructuralExpanderGpu {
   constructor(device) {
     this.device = device;
@@ -223,17 +267,12 @@ export class Af3StructuralExpanderGpu {
                            createSingleExpandShader(tokens, residueTokens, singleChannels, hidden)),
       ]);
 
+      const { tables, singleWeights } = packedExpanderWeights(
+        weights, channels, singleChannels, hidden);
       const parent = up("expand.parent", layout.parent);
       const role = up("expand.role", layout.role);
       const packed = up("expand.features", packStructuralFeatures(features, tokens));
       const projection = up("expand.projection", weights.pairBlockProj);
-      // The five tables, back to back in the order the shader indexes them.
-      const tables = new Float32Array(16 * channels);
-      tables.set(weights.sameParentEmbedding, 0);
-      tables.set(weights.sameResidueTwinEmbedding, 2 * channels);
-      tables.set(weights.prevBbChainEmbedding, 4 * channels);
-      tables.set(weights.nextBbChainEmbedding, 6 * channels);
-      tables.set(weights.rolePairTypeEmbedding, 8 * channels);
       const embeddingBuffer = up("expand.embeddings", tables);
       // The trunk's last pair when the caller still holds it on the device.
       const pairIn = embeddings.pairBuffer !== undefined ? { buffer: embeddings.pairBuffer }
@@ -242,15 +281,6 @@ export class Af3StructuralExpanderGpu {
         "expand.pair-out", tokens * tokens * channels * 4,
         storage | GPUBufferUsage.COPY_SRC));
 
-      const singleWeights = new Float32Array(
-        2 * singleChannels + singleChannels * hidden + hidden * singleChannels
-        + weights.singleRoleEmbedding.length);
-      let at = 0;
-      for (const part of [weights.singleSplitNormScale, weights.singleSplitNormOffset,
-                          weights.singleSplit1, weights.singleSplit2,
-                          weights.singleRoleEmbedding]) {
-        singleWeights.set(part, at); at += part.length;
-      }
       const singleIn = up("expand.single-in", embeddings.single);
       const singleWeightBuffer = up("expand.single-weights", singleWeights);
       const singleOut = keep(this.allocator.allocate(
@@ -258,8 +288,8 @@ export class Af3StructuralExpanderGpu {
         storage | GPUBufferUsage.COPY_SRC));
 
       const encoder = this.device.createCommandEncoder({ label: "opendde-expand" });
+      const pass = encoder.beginComputePass();
       const dispatch = (pipeline, buffers, groups) => {
-        const pass = encoder.beginComputePass();
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -268,12 +298,12 @@ export class Af3StructuralExpanderGpu {
           })),
         }));
         pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-        pass.end();
       };
       dispatch(pairPipeline,
                [pairIn, parent, role, packed, projection, embeddingBuffer, pairOut],
                tokens * tokens);
       dispatch(singlePipeline, [singleIn, parent, role, singleWeightBuffer, singleOut], tokens);
+      pass.end();
 
       // 🔴 THE EXPANDED PAIR MAY STAY WHERE IT IS. Its only reader is the
       // structural refiner, which is a pairformer stack that takes a buffer -

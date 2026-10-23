@@ -21,7 +21,9 @@ bool halfWeight(const std::string& name, size_t elements) {
                            ".Transition2", ".ffwTransition2", ".pairLogits", ".pairLogitsProjection",
                            ".leftProjection", ".rightProjection", ".leftSingle", ".rightSingle", ".extraMsaTargetFeat",
                            ".templatePairEmbedding2", ".templatePairEmbedding3", ".templatePairEmbedding8",
-                           ".outputLinear", ".zProjection", ".aProjection", ".vProjection", ".gatingQuery"})
+                           ".outputLinear", ".zProjection", ".aProjection", ".vProjection", ".gatingQuery",
+                           ".paeLogits", ".leftHalfDistanceLogits", ".interHalfDistanceLogits", ".paeInterLogits",
+                           ".pde", ".pae"})
     if (ends(tail)) return true;
   if (!name.rfind("trunk.", 0) && ends(".outputProjection")) return true;
   return false;

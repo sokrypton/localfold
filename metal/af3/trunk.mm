@@ -82,21 +82,21 @@ static void templateEmbedding(Trunk& t) {
     std::string S = "template." + num(k) + ".";
     float repeat = (float)M.meta(S + "repeat");
     if (repeat == 0.f) continue;                // a slot weighed zero (boltz2's empty ones)
-    copy(act, query, pairs * Ct * 4);
     if (fused) {
       int K = metaI(S + "featuresK");
       if (M.len(S + "featuresIdx") != pairs * K) die("%sfeatures: %zu entries, not %zu x %d", S.c_str(), M.len(S + "featuresIdx"), pairs, K);
-      float* dense = scratch<float>("tmpl.features", pairs * width);
-      fill(dense, 0, pairs * width * 4);
-      run1d("af3_scatter_rows", pairs * K, ScatterRowsArgs{Ib(S + "featuresIdx"), Fb(S + "featuresVal"), dense, pairs, (uint)K, (uint)width});
-      lin(dense, P + "aProjection", act, pairs, width, Ct, 1.f);
+      if (lenW(P + "aProjection") != (size_t)width * Ct) die("%saProjection is not %d x %d", P.c_str(), width, Ct);
+      run1d("af3_template_sparse_proj", (Ct & 3) ? pairs * Ct : pairs * (Ct >> 2),
+            SparseProjArgs{act, query, Ib(S + "featuresIdx"), Fb(S + "featuresVal"), Wh(P + "aProjection"),
+                           Wopt(P + "templateFeatureBias"), pairs, (uint)K, (uint)width, (uint)Ct, 0});
     } else {
       run1d("af3_onehot", (size_t)n * 31, OnehotArgs{Ib(S + "aatype"), oh, (uint)n, 31});
       half* ohh = scratch<half>("tmpl.ohh", (size_t)n * 31);
       toHalf(oh, ohh, (size_t)n * 31);
       lin(ohh, P + "templatePairEmbedding2", row, n, 31, Ct);
       lin(ohh, P + "templatePairEmbedding3", col, n, 31, Ct);
-      run1d("af3_add_row_col", pairs * Ct, AddRowColArgs{act, row, col, (uint)n, (uint)Ct});
+      run1d("af3_add_row_col", (Ct & 3) ? pairs * Ct : pairs * (Ct >> 2),
+            AddRowColArgs{act, query, row, col, Wopt(P + "templateFeatureBias"), (uint)n, (uint)Ct});
       if (M.has(S + "distogramBin")) {
         int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
         if (M.len(S + "distogramBin") != pairs || metaI(S + "distogramBins") != bins) die("%sdistogram: the wrong shape", S.c_str());
@@ -107,7 +107,6 @@ static void templateEmbedding(Trunk& t) {
                            pairs, (uint)Ct, 0});
       }
     }
-    if (hasW(P + "templateFeatureBias")) addBias(act, W(P + "templateFeatureBias"), pairs, Ct);
     if (outer) copy(before, act, pairs * Ct * 4);
     for (int b = 0; b < nb; ++b)
       pairUpdates(act, t.masks, n, Ct, P + "blocks." + num(b),
@@ -120,8 +119,9 @@ static void templateEmbedding(Trunk& t) {
   }
   // divided by template.templates, then relu: every slot for AF3, the templates PRESENT for chai-1 and boltz2 (the
   // featuriser's divisor, cuda/featurise/af3_export.h - by four, boltz2's one template reached the trunk at a quarter)
-  scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);
-  lin(summed, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
+  half* summedH = scratch<half>("tmpl.summedH", pairs * Ct);
+  scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true, summedH);
+  lin(summedH, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
   if (reclaim) releaseScratch({"tmpl."});
 }
 
@@ -391,11 +391,9 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
   float* L = scratch<float>("gopm.left", rows * O); float* R = scratch<float>("gopm.right", rows * O);
   linF(lnM, pre + ".leftProjection", L, rows, Cm, O);
   linF(lnM, pre + ".rightProjection", R, rows, Cm, O);
-  scaleRows(L, t.msaMask, rows, O, rows);
-  scaleRows(R, t.msaMask, rows, O, rows);
   float* Lg = scratch<float>("gopm.lg", rows * O); float* Rg = scratch<float>("gopm.rg", rows * O);
-  run1d("af3_group_major", rows * O, GroupMajorArgs{L, Lg, (uint)S, (uint)n, (uint)G, (uint)K});
-  run1d("af3_group_major", rows * O, GroupMajorArgs{R, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
+  run1d("af3_group_major", rows * O, GroupMajorArgs{L, t.msaMask, Lg, (uint)S, (uint)n, (uint)G, (uint)K});
+  run1d("af3_group_major", rows * O, GroupMajorArgs{R, t.msaMask, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, ((size_t)16 << 20) / ((size_t)n * per * 2 + (size_t)n * C)));
   float* Pm = scratch<float>("gopm.P", (size_t)Bi * n * per); float* Pp = scratch<float>("gopm.Pp", (size_t)Bi * n * per);
   float* Pn = scratch<float>("gopm.Pn", (size_t)Bi * n * per);

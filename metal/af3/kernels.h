@@ -17,7 +17,7 @@ struct FoldBiasArgs { CP(half) w; CP(float) offset; CP(float) extra; DP(float) b
 // the triangle's projection and gate (a and b interleaved by channel) as gemmTriGate's weight: (pa ga pb gb) in 8s or 32s (quarters)
 struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; u64 pad0; uint rows, C, quarters, pad; };
 // x[r][c] (*)= scale
-struct ScaleArgs { DP(float) x; u64 n; float s; uint relu; };
+struct ScaleArgs { DP(float) x; DP(half) outH; u64 n; float s; uint relu; };
 struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; CP(float) resY; CP(float) resGate; u64 pad0, rows; uint C, period; };      // x[r] *= mask[r % period]
 struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C, pad; };
 struct CastArgs { CP(float) x; DP(half) y; u64 n; };
@@ -36,10 +36,11 @@ struct MsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) W; CP(float) fromTa
                       u64 count; uint n, C, width, pairedQuery; };
 // the template stack's inputs
 struct OnehotArgs { CP(int) idx; DP(float) out; uint n, classes; };
-struct AddRowColArgs { DP(float) act; CP(float) row; CP(float) col; uint n, C; };
+struct AddRowColArgs { DP(float) act; CP(float) query; CP(float) row; CP(float) col; CP(float) bias; uint n, C; };
 struct TmplGeomArgs { DP(float) act; CP(int) bin; CP(float) pb; CP(float) uv; CP(float) bb; CP(float) W0; CP(float) W1; CP(float) W4;
                       CP(float) W5; CP(float) W6; CP(float) W7; u64 pairs; uint C, pad; };
 struct ScatterRowsArgs { CP(int) idx; CP(float) val; DP(float) dense; u64 rows; uint K, width; };
+struct SparseProjArgs { DP(float) act; CP(float) query; CP(int) idx; CP(float) val; CP(half) W; CP(float) bias; u64 pairs; uint K, width, C, pad; };
 
 // ---------------------------------------------------------------- attention biases
 // raw [pairs][heads] f32 -> bias [heads][n][stride] f16, times scale (log2 e), (i, j) read at (j, i) with swap
@@ -144,7 +145,8 @@ struct ConfBinArgs { CP(float) beta; DP(int) bin; DP(float) sq; uint n, bins; fl
 struct ConfPairInitArgs { DP(float) pair; CP(float) left; CP(float) right; CP(int) bin; CP(float) sq; CP(float) pairMask; CP(float) Wd;
                           CP(float) Wdist; uint n, C, caBins, unmasked; };
 // the expectation over bins of softmax(logits) . centres (symmetricN: logits[ij] + logits[ji]), times scale (mask)
-struct ExpectationArgs { CP(float) logits; DP(float) out; CP(float) mask; CP(float) centres; u64 rows; uint bins, symmetricN; float scale; uint pad; };
+struct ExpectationArgs { CP(float) logits; DP(float) out; CP(float) mask; CP(float) centres; DP(float) out2; CP(float) centres2;
+                         u64 rows; uint bins, symmetricN; float scale; uint pad; };
 struct InterChainArgs { DP(float) logits; CP(float) inter; CP(int) asym; uint n, bins; };
 struct ClampArgs { DP(float) x; u64 n; float limit; uint pad; };
 // boltz2's re-embedded confidence pair: its own 64-bin distance embedding (2..22 A), the bond and bond-order terms
@@ -170,7 +172,7 @@ struct ApplyNormArgs { DP(float) x; CP(float) stat; u64 n; };
 // ---------------------------------------------------------------- OpenDDE's structural tokens
 // out[i] = src[parent[i]] (+ roleEmb[role[i]])
 struct GatherParentArgs { CP(float) src; CP(int) parent; CP(int) role; CP(float) roleEmb; DP(float) out; uint n, C; };
-struct SiluInPlaceArgs { DP(float) x; u64 n; };
+struct SiluInPlaceArgs { DP(float) x; DP(half) outH; u64 n; };
 struct SingleStructArgs { DP(float) out; CP(float) a; CP(float) b; CP(int) role; CP(float) roleEmb; uint n, C; };
 // the residue pair under each structural pair, in matrix-group order (half: the GEMMs' input)
 struct GatherPairSortedArgs { CP(float) pair; CP(int) order; CP(int) parent; DP(half) out; u64 rows; uint n, nRes, C, pad; };
@@ -209,7 +211,7 @@ struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int
                           pairedRows; };   // (source: batch.msaSource, each row's database; null reads UNIREF90)
 struct ChaiChainHitArgs { CP(int) rows; CP(float) msaMask; CP(int) asym; DP(int) hit; u64 count; uint n, chains; };
 // the grouped outer product: [S][n][G K] -> [G][S][n][K]; P_g [(i, k)][(j, l)] (bi rows i) -> [(i, j)][(g, k, l)]
-struct GroupMajorArgs { CP(float) x; DP(float) out; uint S, n, G, K; };
+struct GroupMajorArgs { CP(float) x; CP(float) mask; DP(float) out; uint S, n, G, K; };
 struct GroupedPermuteArgs { CP(float) P; DP(float) out; uint bi, n, G, K; };
 struct ScaleHArgs { CP(half) x; DP(float) y; u64 n; float s; uint pad; };       // y = s x (chai's missing output projection)
 // chai-1's atom-pair term: [one_hot(#(|d|^2 > e^2), 12; 11 across reference spaces) | 1 / (1 + |d|^2) | valid] through a

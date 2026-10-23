@@ -90,7 +90,11 @@ const TEMPLATE_EMBED_ROWS = 4;
 import { fusedTemplateFeatures, emptyTemplateColumns, SPARSE_PAD, sparseTemplateFeatures, fusedTemplateFeaturesSparse } from "../../../shared/af3/featurise/template-fused-features.js";
 export { fusedTemplateFeatures, emptyTemplateColumns, SPARSE_PAD, sparseTemplateFeatures, fusedTemplateFeaturesSparse } from "../../../shared/af3/featurise/template-fused-features.js";
 
+const packedByWeights = new WeakMap();
+
 export function packTemplateWeights(weights) {
+  const cached = packedByWeights.get(weights);
+  if (cached !== undefined) return cached;
   const offsets = {};
   let total = 0;
   for (const name of (weights.fused ? FUSED_ORDER : ORDER)) {
@@ -102,7 +106,9 @@ export function packTemplateWeights(weights) {
   for (const name of (weights.fused ? FUSED_ORDER : ORDER)) {
     data.set(weights[name], offsets[name]);
   }
-  return { data, offsets };
+  const packed = { data, offsets };
+  packedByWeights.set(weights, packed);
+  return packed;
 }
 
 export function createTemplateShaders(shape, offsets, epsilon, variance) {

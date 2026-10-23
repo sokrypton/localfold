@@ -49,7 +49,7 @@ void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, co
 void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period, half* outH, const float* resY, const float* resGate) {
   run1d("af3_scale_rows", (C & 3) ? rows * C : rows * (C >> 2), ScaleRowsArgs{x, mask, outH, resY, resGate, 0, rows, (uint)C, (uint)period});
 }
-void scale(float* x, size_t n, float s, bool relu) { run1d("af3_scale", n, ScaleArgs{x, n, s, relu ? 1u : 0u}); }
+void scale(float* x, size_t n, float s, bool relu, half* outH) { run1d("af3_scale", n, ScaleArgs{x, outH, n, s, relu ? 1u : 0u}); }
 
 const half* concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
   size_t total = 0;
