@@ -796,7 +796,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 
   const conditionedNorm = (prefix, bindingsFor, mode = "fused") => {
-    const useVecNorm = !normSplit && mode === "fused" && !batchedGates
+    const useVecNorm = !normSplit && mode === "fused"
       && channels % lanes === 0 && !normSubgroups;
     const normReduceType = useVecNorm ? tileLanes : "f32";
     return `${normSubgroups
@@ -915,7 +915,28 @@ ${useVecNorm
   ? (() => {
       const steps = channels / lanes;
       const overSteps = (body) => Array.from({ length: steps }, (_, s) => body(s)).join("\n  ");
-      return `  ${overSteps((s) => overGroups((g) =>
+      return batchedGates
+        ? `  ${overSteps((s) => `{
+    ${overGroups((g) => `var scale_${s}_${g} = ${tileLanes}(0.0);
+    var shift_${s}_${g} = ${tileLanes}(0.0);`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      if (token < ${ROWS}) {
+        let at = ${perToken("token")} * 2u * C + c_${s};
+        scale_${s}_${group(t)}${lane(t)} = scale_shift[at];
+        shift_${s}_${group(t)}${lane(t)} = scale_shift[at + C];
+      }
+    }`)}
+    ${overGroups((g) => `let out_${s}_${g} =
+      (${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale_${s}_${g}))) * act_${s}_${g} + shift_${s}_${g};`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      if (token < ${ROWS}) {
+        xbuf[token * C + c_${s}] = out_${s}_${group(t)}${lane(t)};
+      }
+    }`)}
+  }`)}`
+        : `  ${overSteps((s) => overGroups((g) =>
     `var scale_${s}_${g} = ${tileLanes}(${wf(`weights[W_${prefix}SingleCondScaleBias + c_${s}]`)});
   var shift_${s}_${g} = ${tileLanes}(0.0);`))}
   for (var d = 0u; d < C_COND; d += 1u) {
@@ -1271,7 +1292,12 @@ ${subgroups ? `  let wide_sum = subgroupAdd(local_sum);
   // ffw-adaln measured 0.54x when a raised tile reached them.
   const { tileWidth, tileGroups, tileLanes, stageLanes, up, lane, group, overTile, overGroups } =
     tilingFor(attnOutTile);
-  const attentionOutputFor = (mode) => `${common}
+  const attentionOutputFor = (mode) => {
+    const span = mode === "split" ? attnKSpan : width;
+    const attnChunk = span % channelChunk === 0 ? channelChunk : span;
+    const stageSpan = mode === "split" || batchedGates
+      ? attnChunk : Math.max(attnChunk, condChannels);
+    return `${common}
 const TILE: u32 = ${attnOutTile}u;
 ${mode === "split"
   ? `@group(0) @binding(0) var<storage, read> gathered: array<f32>;
@@ -1322,8 +1348,7 @@ ${batchedGates
 // epilogue. Staging the WHOLE width in every part was the first version and it
 // made the split a LOSS: 2.11 -> 3.67 ms, because the gate and the logistic
 // are outside the projection loop and were being repeated four times.
-var<workgroup> gated: array<${stageLanes}, ${tileGroups * (mode === "split"
-  ? attnKSpan : (batchedGates ? width : Math.max(width, condChannels)))}>;
+var<workgroup> gated: array<${stageLanes}, ${tileGroups * stageSpan}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -1349,30 +1374,33 @@ ${mode === "reduce"
     }`)}
   }`
   : `${mode === "split" ? `  let w_start = group.z * ${attnKSpan}u;` : `  let w_start = 0u;`}
-  for (var w = local; w < ${mode === "split" ? `${attnKSpan}u` : "WIDTH"}; w += ${lanes}u) {
-    let w_idx = w_start + w;
-    ${overGroups((g) => `{
-      var gv = ${stageLanes}(0.0);
-      ${Array.from({ length: tileWidth }, (_, l) => {
-        const t = g * tileWidth + l;
-        return `{
-        let token = base_token + ${t}u;
-        if (token < ${ROWS}) {
-          let index = token * WIDTH + w_idx;
-          let value = gathered[index] * logistic(gate[index]);
-          gv${lane(l)} = ${stage16 ? "f16(value)" : "value"};
-        }
-      }`;
-      }).join("\n      ")}
-      gated[${g * (mode === "split" ? attnKSpan : width)}u + w] = gv;
-    }`)}
-  }
-  workgroupBarrier();
-  let w_t2_base = W_Transition2 + w_start * C + c;
-  for (var w = 0u; w < ${mode === "split" ? `${attnKSpan}u` : "WIDTH"}; w += 1u) {
-    // ...read once, used by every token of the tile.
-    let weight = ${wf(`weights[w_t2_base + w * C]`)};
-    ${overGroups((g) => `projected${g} += ${up(`gated[${g * (mode === "split" ? attnKSpan : width)}u + w]`)} * weight;`)}
+  for (var w0 = 0u; w0 < ${span}u; w0 += ${attnChunk}u) {
+    workgroupBarrier();
+    for (var w = local; w < ${attnChunk}u; w += ${lanes}u) {
+      let w_idx = w_start + w0 + w;
+      ${overGroups((g) => `{
+        var gv = ${stageLanes}(0.0);
+        ${Array.from({ length: tileWidth }, (_, l) => {
+          const t = g * tileWidth + l;
+          return `{
+          let token = base_token + ${t}u;
+          if (token < ${ROWS}) {
+            let index = token * WIDTH + w_idx;
+            let value = gathered[index] * logistic(gate[index]);
+            gv${lane(l)} = ${stage16 ? "f16(value)" : "value"};
+          }
+        }`;
+        }).join("\n        ")}
+        gated[${g * attnChunk}u + w] = gv;
+      }`)}
+    }
+    workgroupBarrier();
+    let w_t2_base = W_Transition2 + (w_start + w0) * C + c;
+    for (var w = 0u; w < ${attnChunk}u; w += 1u) {
+      // ...read once, used by every token of the tile.
+      let weight = ${wf(`weights[w_t2_base + w * C]`)};
+      ${overGroups((g) => `projected${g} += ${up(`gated[${g * attnChunk}u + w]`)} * weight;`)}
+    }
   }`}
 ${mode === "split" ? `  ${overTile((t) => `{
     let token = base_token + ${t}u;
@@ -1435,6 +1463,7 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   }`)}
 `}
 }`;
+  };
   return {
     attentionOutput: attentionOutputFor(attnKSplits > 1 ? "split" : "fused"),
     attentionOutputReduce: attnKSplits > 1 ? attentionOutputFor("reduce") : null };
@@ -1748,6 +1777,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // one workgroup read and one vector multiply-add where there were outTile of
   // each. See webgpu/af3/trunk/transition.js, which is the same kernel shape.
   const outVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[Math.min(4, outTile)];
+  const outStageVector = stage16 ? outVector?.replace("f32", "f16") : outVector;
+  const outUp = (e) => (stage16 ? `${outVector}(${e})` : e);
   const outWidth = Math.min(4, outTile);
   const outGroups = outTile / outWidth;
   if (outVector === undefined || !Number.isInteger(outGroups)) {
@@ -1819,7 +1850,7 @@ ${batchedGates
 // second array would have taken this kernel from 6 KiB to 12 - two workgroups
 // a core against five - which is the trade this repository has lost to four
 // times.
-var<workgroup> wt: array<${outVector}, ${outGroups * Math.max(outChunk, condChannels)}>;
+var<workgroup> wt: array<${outStageVector}, ${outGroups * Math.max(outChunk, condChannels)}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -1852,12 +1883,12 @@ ${mode === "reduce"
     for (var i = local; i < OUT_CHUNK; i += ${lanes}u) {
       let idx_i = chunk0 + i;
       ${overOutGroups((g) => `{
-        var wv = ${outVector}(0.0);
+        var wv = ${outStageVector}(0.0);
         ${Array.from({ length: outWidth }, (_, l) => {
           const t = g * outWidth + l;
           return `{
           let token = base_token + ${t}u;
-          if (token < ${ROWS}) { wv${outLane(l)} = gated[token * INTERMEDIATE + idx_i]; }
+          if (token < ${ROWS}) { wv${outLane(l)} = ${stage16 ? "f16(gated[token * INTERMEDIATE + idx_i])" : "gated[token * INTERMEDIATE + idx_i]"}; }
         }`;
         }).join("\n        ")}
         wt[${g * outChunk}u + i] = wv;
@@ -1869,7 +1900,7 @@ ${mode === "reduce"
     for (var i = 0u; i < OUT_CHUNK; i += 1u) {
       // ...read once, used by every token of the tile.
       let weight = ${wf(`weights[w_t2_base + i * C]`)};
-      ${overOutGroups((g) => `acc${g} += wt[${g * outChunk}u + i] * weight;`)}
+      ${overOutGroups((g) => `acc${g} += ${outUp(`wt[${g * outChunk}u + i]`)} * weight;`)}
     }
   }
 
@@ -1901,12 +1932,12 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   workgroupBarrier();
   for (var d = local; d < C_COND; d += ${lanes}u) {
     ${overOutGroups((g) => `{
-      var cv = ${outVector}(0.0);
+      var cv = ${outStageVector}(0.0);
       ${Array.from({ length: outWidth }, (_, l) => {
         const t = g * outWidth + l;
         return `{
         let token = base_token + ${t}u;
-        if (token < ${ROWS}) { cv${outLane(l)} = cond[${perToken("token")} * C_COND + d]; }
+        if (token < ${ROWS}) { cv${outLane(l)} = ${stage16 ? `f16(cond[${perToken("token")} * C_COND + d])` : `cond[${perToken("token")} * C_COND + d]`}; }
       }`;
       }).join("\n      ")}
       wt[${g * condChannels}u + d] = cv;
@@ -1918,7 +1949,7 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   let w_z_base = W_ffwAdaptiveZeroCondWeights + c;
   for (var d = 0u; d < C_COND; d += 1u) {
     let w = ${wf(`weights[w_z_base + d * C]`)};
-    ${overOutGroups((g) => `zero${g} += wt[${g * condChannels}u + d] * w;`)}
+    ${overOutGroups((g) => `zero${g} += ${outUp(`wt[${g * condChannels}u + d]`)} * w;`)}
   }
 `}
   ${overOutGroups((g) => `let contribution${g} = acc${g}
@@ -2554,6 +2585,9 @@ export class Af3DiffusionTransformerGpu {
     const wantedAttnOutTile = deviceTile?.attnOutCrossover !== undefined
       ? (tokens < deviceTile.attnOutCrossover ? deviceTile.below : deviceTile.atOrAbove)
       : tile;
+    const wantedOutTile = deviceTile?.outCrossover !== undefined
+      ? (tokens < deviceTile.outCrossover ? deviceTile.below : deviceTile.atOrAbove)
+      : tile;
     const qkvgTile = splitting
       ? Math.min(weights.qkvgTile ?? splitRule.tile, fits(channels))
       : Math.min(weights.qkvgTile ?? wantedQkvgTile, fits(channels));
@@ -2603,7 +2637,7 @@ export class Af3DiffusionTransformerGpu {
     // splitRule.tile for exactly this reason.
     const outTile = weights.outTile ?? (splitting && outKSplits > 1
       ? Math.min(splitRule.outTile ?? splitRule.tile, fits(outChunk))
-      : Math.min(wantedTile, tile, fits(outChunk)));
+      : Math.min(wantedOutTile, fits(outChunk)));
     // ...and the same for attention-output, whose staging is the width, or one
     // part's span when it is split.
     const attnOutTile = weights.attnOutTile ?? (splitting && attnKSplits > 1

@@ -532,9 +532,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[rb] = ((red[rb] + red[rb + 4u]) + (red[rb + 2u] + red[rb + 6u]))
+      + ((red[rb + 1u] + red[rb + 5u]) + (red[rb + 3u] + red[rb + 7u]));
+  }
+  workgroupBarrier();
   let mean = red[rb] / ${width}.0;
   workgroupBarrier();
   var q = 0.0;
@@ -544,9 +546,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[rb] = ((red[rb] + red[rb + 4u]) + (red[rb + 2u] + red[rb + 6u]))
+      + ((red[rb + 1u] + red[rb + 5u]) + (red[rb + 3u] + red[rb + 7u]));
+  }
+  workgroupBarrier();
   if (!live) { return; }
   let inv = inverseSqrt(red[rb] / ${width}.0 + p.eps);
   ${modulate ? `let crow = ${useMap ? "rowMap[row]" : "i32(row)"};
@@ -605,9 +609,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   let mean = red[0] / f32(p.width);
   workgroupBarrier();
   var q = 0.0;
@@ -617,9 +623,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   let inv = inverseSqrt(red[0] / f32(p.width) + p.eps);
   if (!live) { return; }
   var crow = -1;
@@ -685,9 +693,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] = max(red[li], red[li + 32u]); } workgroupBarrier();
   if (li < 16u) { red[li] = max(red[li], red[li + 16u]); } workgroupBarrier();
   if (li < 8u) { red[li] = max(red[li], red[li + 8u]); } workgroupBarrier();
-  if (li < 4u) { red[li] = max(red[li], red[li + 4u]); } workgroupBarrier();
-  if (li < 2u) { red[li] = max(red[li], red[li + 2u]); } workgroupBarrier();
-  if (li == 0u) { red[0] = max(red[0], red[1]); } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = max(max(max(red[0], red[4]), max(red[2], red[6])), max(max(red[1], red[5]), max(red[3], red[7])));
+  }
+  workgroupBarrier();
   let top = red[0];
   workgroupBarrier();
   var s = 0.0;
@@ -702,9 +711,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   let total = red[0];
   if (!live) { return; }
   for (var j = li; j < p.len; j += 64u) {

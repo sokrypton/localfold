@@ -1328,7 +1328,7 @@ const PRIORS = new Map([
     // up with them: bench-head.js at 128 tokens, ffw-wide 13.12 -> 6.89 ms, qkvg 9.59 -> 6.20, attention-output 3.42 -> 3.06.
     diffusionTokenTile: {
       below: 4, atOrAbove: 8, crossover: 256,
-      qkvgCrossover: 64, wideCrossover: 64, attnOutCrossover: 96,
+      qkvgCrossover: 64, wideCrossover: 64, attnOutCrossover: 96, outCrossover: 96,
     },
     // 🔴 THE VECTOR SPLIT TRANSITION'S BLOCK, MEASURED ON AN M5 UNDER STOCK FLAGS - the GEMM every Apple visitor runs on
     // a pair track of 192 channels and up (ESMFold2, protenix2, OpenDDE, IntelliFold-2). The A100's 64 x 64 x 16 gives a

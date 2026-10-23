@@ -388,9 +388,12 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
     if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
     if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
-    if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
-    if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
-    if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
+    if (lane == 0u) {
+      let m0 = max(max(reduce[0], reduce[4]), max(reduce[1], reduce[5]));
+      let m1 = max(max(reduce[2], reduce[6]), max(reduce[3], reduce[7]));
+      reduce[0] = max(m0, m1);
+    }
+    workgroupBarrier();
     let block_max = reduce[0];
     workgroupBarrier();
     let next_max = max(running_max, block_max);
@@ -404,12 +407,13 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
     if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
     if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
-    if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
-    if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
-    if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
+    if (lane == 0u) {
+      reduce[0] = ((reduce[0] + reduce[4]) + (reduce[2] + reduce[6]))
+                + ((reduce[1] + reduce[5]) + (reduce[3] + reduce[7]));
+    }
+    workgroupBarrier();
     running_sum = running_sum * rescale + reduce[0];
     running_max = next_max;
-    workgroupBarrier();
     for (var d = lane; d < ${headDim}u; d += ${LANES}u) {
       var total = 0.0;
       let val_col = ${channels}u + head * ${headDim}u + d;

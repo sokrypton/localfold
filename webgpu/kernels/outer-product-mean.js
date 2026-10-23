@@ -658,11 +658,14 @@ export function createOuterProductMeanContractShader(cOuter, precision = "f32") 
   const acc = half ? "vec4<f16>" : "vec4<f32>";
   const stage = half ? "vec4<f16>" : "vec4<f32>";
   const narrow = (value) => (half ? `f16(${value})` : value);
+  const exactVec = cOuter % 4 === 0;
+  const ioType = exactVec ? "vec4<f32>" : "f32";
+  const vecCast = (value) => (half ? `vec4<f16>(${value})` : value);
   return `${half ? "enable f16;\n" : ""}${OPM_PAIR_BLOCK}
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(0) var<storage, read> left: array<${ioType}>;
+@group(0) @binding(1) var<storage, read> right: array<${ioType}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outer: array<${ioType}>;
 @group(0) @binding(4) var<uniform> blk: PairBlock;
 
 const OPM_CHUNK: u32 = ${chunk}u;
@@ -707,13 +710,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       var l = ${stage}(0.0);
       var r = ${stage}(0.0);
       if (s < p.sequences) {
-        for (var c = 0u; c < 4u; c += 1u) {
+${exactVec
+  ? `        let row_s = s * p.length;
+        l = ${vecCast("left[(row_s + i) * VECTORS + v]")};
+        r = ${vecCast("right[(row_s + j) * VECTORS + v]")};`
+  : `        for (var c = 0u; c < 4u; c += 1u) {
           let o = v * 4u + c;
           if (o < C_OUTER) {
             l[c] = ${narrow("left[(s * p.length + i) * C_OUTER + o]")};
             r[c] = ${narrow("right[(s * p.length + j) * C_OUTER + o]")};
           }
-        }
+        }`}
       }
       left_tile[index] = l;
       right_tile[index] = r;
@@ -738,10 +745,10 @@ ${half ? `    ${overBlocks((slot) => `var chunk${slot}_0 = vec4<f16>(0.0);
       let base = t * VECTORS;
       ${overBlocks((slot) => `let lv${slot} = left_tile[base + left_block${slot}];
       let rv${slot} = right_tile[base + right_block${slot}];
-      ${half ? "chunk" : "acc"}${slot}_0 += lv${slot}[0] * rv${slot};
-      ${half ? "chunk" : "acc"}${slot}_1 += lv${slot}[1] * rv${slot};
-      ${half ? "chunk" : "acc"}${slot}_2 += lv${slot}[2] * rv${slot};
-      ${half ? "chunk" : "acc"}${slot}_3 += lv${slot}[3] * rv${slot};`)}
+      ${half ? "chunk" : "acc"}${slot}_0 += lv${slot}.x * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_1 += lv${slot}.y * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_2 += lv${slot}.z * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_3 += lv${slot}.w * rv${slot};`)}
     }
 ${half ? `    ${overBlocks((slot) => `acc${slot}_0 += vec4<f32>(chunk${slot}_0);
     acc${slot}_1 += vec4<f32>(chunk${slot}_1);
@@ -749,7 +756,15 @@ ${half ? `    ${overBlocks((slot) => `acc${slot}_0 += vec4<f32>(chunk${slot}_0);
     acc${slot}_3 += vec4<f32>(chunk${slot}_3);`)}` : ""}
   }
 
-  ${overBlocks((slot) => `if (live${slot}) {
+  ${overBlocks((slot) => exactVec
+    ? `if (live${slot}) {
+      let out_base = local_pair * (BLOCKS * 4u) + (left_block${slot} * 4u) * VECTORS + right_block${slot};
+      outer[out_base] = acc${slot}_0;
+      outer[out_base + VECTORS] = acc${slot}_1;
+      outer[out_base + VECTORS * 2u] = acc${slot}_2;
+      outer[out_base + VECTORS * 3u] = acc${slot}_3;
+    }`
+    : `if (live${slot}) {
       for (var a = 0u; a < 4u; a += 1u) {
         let cl = left_block${slot} * 4u + a;
         if (cl < C_OUTER) {
@@ -952,12 +967,9 @@ ${Array.from({ length: chunk.width }, (_, lane) => {
     workgroupBarrier();
     if (local < 8u) { reduce${index}[local] += reduce${index}[local + 8u]; }
     workgroupBarrier();
-    if (local < 4u) { reduce${index}[local] += reduce${index}[local + 4u]; }
-    workgroupBarrier();
-    if (local < 2u) { reduce${index}[local] += reduce${index}[local + 2u]; }
-    workgroupBarrier();
     if (local == 0u) {
-      let total${index} = reduce${index}[0] + reduce${index}[1];
+      let total${index} = ((reduce${index}[0] + reduce${index}[4]) + (reduce${index}[2] + reduce${index}[6]))
+        + ((reduce${index}[1] + reduce${index}[5]) + (reduce${index}[3] + reduce${index}[7]));
 ${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first + lane}u] = `
       + `1.0 / (p.normalization_epsilon + ${at(`total${index}`, chunk, lane)});`).join("\n")}
     }
@@ -970,15 +982,37 @@ ${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first +
   // the whole CELLS x c_z output matrix once, 512 KiB at AlphaFold's widths, and
   // divides it among P pairs. Doubling P halves the traffic, which is why the
   // measured curve is 70.9 / 43.2 / 30.2 ms at P = 1, 2, 4.
-  for (var z = local; z < p.c_z; z += 64u) {
-${overChunks((chunk, index) => `    var acc${index} = ${vector(chunk.width)}(weights[p.output_bias + z]);`)}
+  if (p.c_z == 128u) {
+    let z0 = local;
+    let z1 = local + 64u;
+${overChunks((chunk, index) => `    var acc${index}_0 = ${vector(chunk.width)}(weights[p.output_bias + z0]);
+    var acc${index}_1 = ${vector(chunk.width)}(weights[p.output_bias + z1]);`)}
+    var w_off = p.output_weight + z0;
     for (var cell = 0u; cell < CELLS; cell += 1u) {
-      let w = weights[p.output_weight + cell * p.c_z + z];
-${overChunks((chunk, index) => `      acc${index} += staged${index}[cell] * w;`)}
+      let w0 = weights[w_off];
+      let w1 = weights[w_off + 64u];
+${overChunks((chunk, index) => `      let s${index} = staged${index}[cell];
+      acc${index}_0 += s${index} * w0;
+      acc${index}_1 += s${index} * w1;`)}
+      w_off += 128u;
     }
 ${overPairs((n, chunk, index, lane) => `    if (live${n}) {
-      output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at(`acc${index}`, chunk, lane)} * scales[${n}u];
+      let sc${n} = scales[${n}u];
+      let out_base${n} = pair${n} * 128u;
+      output[out_base${n} + z0] ${residual ? "+=" : "="} ${at(`acc${index}_0`, chunk, lane)} * sc${n};
+      output[out_base${n} + z1] ${residual ? "+=" : "="} ${at(`acc${index}_1`, chunk, lane)} * sc${n};
     }`)}
+  } else {
+    for (var z = local; z < p.c_z; z += 64u) {
+${overChunks((chunk, index) => `      var acc${index} = ${vector(chunk.width)}(weights[p.output_bias + z]);`)}
+      for (var cell = 0u; cell < CELLS; cell += 1u) {
+        let w = weights[p.output_weight + cell * p.c_z + z];
+${overChunks((chunk, index) => `        acc${index} += staged${index}[cell] * w;`)}
+      }
+${overPairs((n, chunk, index, lane) => `      if (live${n}) {
+        output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at(`acc${index}`, chunk, lane)} * scales[${n}u];
+      }`)}
+    }
   }
 }`;
 }
@@ -1221,8 +1255,8 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
   // (a lane owns TM adjacent rows and TN adjacent columns of the block - 4 x 4 at the default; see
   // webgpu/kernels/vector-gemm-block.js)
   const { rows: BM, columns: BN, inner: BK } = block;
-  const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
-  const acc = [], inner = [], stores = [], biases = [], flush = [];
+  const AS = BM + 4, TM = BM / 16, TN = BN / 16, TV = TN / 4;
+  const acc = [], stores = [], biases = [], flush = [];
   for (let j = 0; j < TV; j += 1) {
     biases.push(`  let bias_${j} = weights[b0 + ${j}u];`);
   }
@@ -1230,8 +1264,7 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
     for (let j = 0; j < TV; j += 1) {
       acc.push(`  var acc_${i}_${j} = ${f16 ? "vec4<f32>(0.0)" : `bias_${j}`};`);
       if (f16) {
-        acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
       }
     }
     stores.push(`  {
@@ -1247,44 +1280,43 @@ ${Array.from({ length: TV }, (_, j) => `      {
     }
   }`);
   }
-  for (let k = 0; k < BK; k += 1) {
-    for (let j = 0; j < TV; j += 1) {
-      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`);
-    }
-    for (let v = 0; v < MV; v += 1) {
-      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
-    }
+  const innerSteps = Array.from({ length: BK }, (_, k) => {
+    const bLoads = Array.from({ length: TV }, (_, j) =>
+      `      let b_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`).join("\n");
+    const aLoads = Array.from({ length: TM }, (_, i) =>
+      `      let a_${i} = a_tile[a_base + ${i}u];`).join("\n");
+    const mads = [];
     for (let i = 0; i < TM; i += 1) {
-      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
       for (let j = 0; j < TV; j += 1) {
         if (f16) {
-          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+          mads.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
         } else {
-          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+          mads.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
         }
       }
     }
-  }
-  const aSteps = ((BM / 4) * BK) / 256;
+    return `    {
+      let a_base = ${k * AS}u + ty * ${TM}u;
+${aLoads}
+${bLoads}
+${mads.join("\n")}
+    }`;
+  }).join("\n");
+  const partInit = f16 ? Array.from({ length: TM }, (_, i) =>
+    Array.from({ length: TV }, (__, j) => `    var part_${i}_${j} = vec4<f16>(0.0);`).join("\n")).join("\n") : "";
+  const k4PerStep = BK / 4;
+  const aSteps = (BM * k4PerStep) / 256;
   const bSteps = ((BN / 4) * BK) / 256;
   const aPrecompute = Array.from({ length: aSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
-    return `  let a_mg_${s} = ${eExpr} / ${BK}u;
-  let a_k_${s} = ${eExpr} % ${BK}u;
-  let a_r0_${s} = row_origin + a_mg_${s} * 4u;
-  let a_full_${s} = a_r0_${s} + 3u < parameters.rows;
-  let a_base_${s} = a_r0_${s} * parameters.inner + a_k_${s};
-  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};${f16 ? `
-  var a_scale_${s} = vec4<f32>(0.0);
-  if (a_full_${s}) {
-    let sp = parameters.padding.x + a_r0_${s};
-    a_scale_${s} = vec4<f32>(scale[sp], scale[sp + 1u], scale[sp + 2u], scale[sp + 3u]);
-  } else {
-    if (a_r0_${s} < parameters.rows) { a_scale_${s}.x = scale[parameters.padding.x + a_r0_${s}]; }
-    if (a_r0_${s} + 1u < parameters.rows) { a_scale_${s}.y = scale[parameters.padding.x + a_r0_${s} + 1u]; }
-    if (a_r0_${s} + 2u < parameters.rows) { a_scale_${s}.z = scale[parameters.padding.x + a_r0_${s} + 2u]; }
-    if (a_r0_${s} + 3u < parameters.rows) { a_scale_${s}.w = scale[parameters.padding.x + a_r0_${s} + 3u]; }
-  }` : ""}`;
+    return `  let a_m_${s} = ${eExpr} / ${k4PerStep}u;
+  let a_k4_${s} = ${eExpr} % ${k4PerStep}u;
+  let a_row_${s} = row_origin + a_m_${s};
+  let a_valid_${s} = a_row_${s} < parameters.rows;
+  let a_src_${s} = a_row_${s} * (parameters.inner >> 2u) + a_k4_${s};
+  let a_dst_${s} = (a_k4_${s} * 4u) * ${AS}u + a_m_${s};${f16 ? `
+  var a_scale_${s} = 0.0;
+  if (a_valid_${s}) { a_scale_${s} = scale[parameters.padding.x + a_row_${s}]; }` : ""}`;
   }).join("\n");
   const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
@@ -1292,32 +1324,12 @@ ${Array.from({ length: TV }, (_, j) => `      {
   let b_col4_${s} = weight_offset4 + column_origin4 + (${eExpr} % ${BN / 4}u) + b_k_${s} * columns4;`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
-      let s0 = a_base_${s} + k0;
-      var value = vec4<${T}>(0.0);
-      if (a_full_${s}) {
-        let raw = vec4<f32>(
-          source[s0],
-          source[s0 + parameters.inner],
-          source[s0 + parameters.inner * 2u],
-          source[s0 + parameters.inner * 3u],
-        );
-        value = vec4<${T}>(${f16 ? `raw * a_scale_${s}` : "raw"});
-      } else {
-        let r0 = a_r0_${s};
-        if (r0 < parameters.rows) {
-          value.x = ${T}(source[s0]${f16 ? ` * a_scale_${s}.x` : ""});
-        }
-        if (r0 + 1u < parameters.rows) {
-          value.y = ${T}(source[s0 + parameters.inner]${f16 ? ` * a_scale_${s}.y` : ""});
-        }
-        if (r0 + 2u < parameters.rows) {
-          value.z = ${T}(source[s0 + parameters.inner * 2u]${f16 ? ` * a_scale_${s}.z` : ""});
-        }
-        if (r0 + 3u < parameters.rows) {
-          value.w = ${T}(source[s0 + parameters.inner * 3u]${f16 ? ` * a_scale_${s}.w` : ""});
-        }
-      }
-      a_tile[a_idx_${s}] = value;
+      var a_vec = vec4<f32>(0.0);
+      if (a_valid_${s}) { a_vec = source[a_src_${s} + (k0 >> 2u)]${f16 ? ` * a_scale_${s}` : ""}; }
+      a_tile[a_dst_${s}] = ${T}(a_vec.x);
+      a_tile[a_dst_${s} + ${AS}u] = ${T}(a_vec.y);
+      a_tile[a_dst_${s} + ${2 * AS}u] = ${T}(a_vec.z);
+      a_tile[a_dst_${s} + ${3 * AS}u] = ${T}(a_vec.w);
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
@@ -1330,24 +1342,24 @@ ${Array.from({ length: TV }, (_, j) => `      {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> scale: array<f32>;
-var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
+var<workgroup> a_tile: array<${T}, ${AS * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * ${BM}u;
   let column_origin4 = group.x * ${BN / 4}u;
-  let columns4 = parameters.columns / 4u;
-  let weight_offset4 = parameters.weight_offset / 4u;
-  let tx = li % 16u;
-  let ty = li / 16u;
+  let columns4 = parameters.columns >> 2u;
+  let weight_offset4 = parameters.weight_offset >> 2u;
+  let tx = li & 15u;
+  let ty = li >> 4u;
   let column4 = column_origin4 + tx * ${TV}u;
-  let b0 = parameters.bias_offset / 4u + column4;
+  let b0 = (parameters.bias_offset >> 2u) + column4;
 ${biases.join("\n")}
 ${acc.join("\n")}
 ${aPrecompute}
@@ -1356,7 +1368,8 @@ ${bPrecompute}
 ${aStage}
 ${bStage}
     workgroupBarrier();
-${inner.join("\n")}
+${partInit}
+${innerSteps}
 ${flush.join("\n")}
     workgroupBarrier();
   }
@@ -1391,13 +1404,12 @@ export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAU
   const vec4Align = cOuter % 4 === 0;
   const { rows: BM, columns: BN, inner: BK } = block;
   const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
-  const acc = [], inner = [], stores = [], flush = [];
+  const acc = [], stores = [], flush = [];
   for (let i = 0; i < TM; i += 1) {
     for (let j = 0; j < TV; j += 1) {
       acc.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       if (f16) {
-        acc.push(`  var part_${i}_${j} = vec4<f16>(0.0);`);
-        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j}); part_${i}_${j} = vec4<f16>(0.0);`);
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
       }
     }
     stores.push(`  {
@@ -1418,24 +1430,30 @@ ${Array.from({ length: TV }, (_, j) => `      {
     }
   }`);
   }
-  for (let k = 0; k < BK; k += 1) {
-    for (let j = 0; j < TV; j += 1) {
-      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`);
-    }
-    for (let v = 0; v < MV; v += 1) {
-      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
-    }
+  const innerSteps = Array.from({ length: BK }, (_, k) => {
+    const bLoads = Array.from({ length: TV }, (_, j) =>
+      `      let b_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`).join("\n");
+    const aLoads = Array.from({ length: MV }, (_, v) =>
+      `      let a_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`).join("\n");
+    const mads = [];
     for (let i = 0; i < TM; i += 1) {
-      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      const ai = `a_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
       for (let j = 0; j < TV; j += 1) {
         if (f16) {
-          inner.push(`    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+          mads.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
         } else {
-          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+          mads.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
         }
       }
     }
-  }
+    return `    {
+${aLoads}
+${bLoads}
+${mads.join("\n")}
+    }`;
+  }).join("\n");
+  const partInit = f16 ? Array.from({ length: TM }, (_, i) =>
+    Array.from({ length: TV }, (__, j) => `    var part_${i}_${j} = vec4<f16>(0.0);`).join("\n")).join("\n") : "";
   const storageType = vec4Align ? "vec4<f32>" : "f32";
   const load4 = (buf) => vec4Align
     ? `${buf}[base]`
@@ -1507,7 +1525,8 @@ ${bPre}
 ${aStage}
 ${bStage}
     workgroupBarrier();
-${inner.join("\n")}
+${partInit}
+${innerSteps}
 ${flush.join("\n")}
     workgroupBarrier();
   }
