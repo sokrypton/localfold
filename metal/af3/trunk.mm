@@ -60,12 +60,13 @@ static void templateEmbedding(Trunk& t) {
   // query's normalised input given back once it is projected, each pass's output normalised in place - 1.4 -> 0.84 GB
   // of the stage's own (docs/CUDA-TO-METAL.md, 2). (The query held in half saved 0.14 GB more and moved AF3's kitchen
   // sink 74.50 -> 75.24 pLDDT, past the gate's bar: float.)
+  const bool reclaim = pairs * Cq * 4 >= (64u << 20) || getenv("LOCALFOLD_PEAK") || getenv("LOCALFOLD_SCRIBBLE");
   float* query = scratch<float>("tmpl.query", pairs * Ct);
   {
     half* qn = scratch<half>("tmpl.qn", pairs * Cq);
     ln(t.pair, qn, pairs, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
     lin(qn, P + (fused ? "zProjection" : "templatePairEmbedding8"), query, pairs, Cq, Ct);
-    releaseScratch({"tmpl.qn"});
+    if (reclaim) releaseScratch({"tmpl.qn"});
   }
   float* act = scratch<float>("tmpl.act", pairs * Ct);
   float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
@@ -118,7 +119,7 @@ static void templateEmbedding(Trunk& t) {
   // featuriser's divisor, cuda/featurise/af3_export.h - by four, boltz2's one template reached the trunk at a quarter)
   scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);
   lin(summed, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
-  releaseScratch({"tmpl."});
+  if (reclaim) releaseScratch({"tmpl."});
 }
 
 // ---------------------------------------------------------------- the embedder
@@ -431,10 +432,11 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
 // ---------------------------------------------------------------- one pass
 void runTrunk(Trunk& t) {
   size_t pairs = (size_t)t.n * t.n;
+  const bool reclaim = pairs * t.C * 4 >= (64u << 20) || getenv("LOCALFOLD_PEAK") || getenv("LOCALFOLD_SCRIBBLE");
   // the recycled state: the last pass's pair and single (zero before the first)
   if (t.pass > 0) copy(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4);     // (the pair is recycled in place: embed())
   embed(t);
-  releaseScratch({"emb."});
+  if (reclaim) releaseScratch({"emb."});
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + num(msaBlocks) + ".pairChannels")) ++msaBlocks;
   float* zIn = nullptr;
   if (flag("trunk.dialect.msaDoubleAddPair")) {     // boltz2 adds the pre-MSA pair back
@@ -445,35 +447,35 @@ void runTrunk(Trunk& t) {
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
-  releaseScratch({"msaatt.", "msatr.", "opm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
+  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
-  // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Where the matrix units run (their
-  // kernels take a half residual); every residual is summed in float and rounded once, every norm reads the half
-  // values. LOCALFOLD_HALF_PAIR=0 the control.
+  // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Every residual is summed in
+  // float and rounded once, every norm reads the half values. LOCALFOLD_HALF_PAIR=0 the control.
   // (Pair values seen: up to ~13000 - openbind0 - against half's 65504; the stores saturate rather than overflow.)
   static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
   // (the f32 pair given back while the stack runs on the half one, and made again once the pair track's scratch is:
   // the trunk's top stage, 1044 tokens 4.30 -> 3.74 GB)
   t.pairHalfExact = false;
-  if (halfWanted && matrixUnits() && t.C % 8 == 0) {
+  if (halfWanted && t.C % 8 == 0) {
     half* zh = scratch<half>("trunk.zh", pairs * t.C);
     toHalf(t.pair, zh, pairs * t.C);
-    release(t.pair);
-    t.pair = nullptr;
+    if (reclaim) { release(t.pair); t.pair = nullptr; }
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(zh, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
-    releaseScratch({"pr.", "grid.", "tr.", "st."});
-    t.pair = allocT<float>(pairs * t.C);
+    if (reclaim) {
+      releaseScratch({"pr.", "grid.", "tr.", "st."});
+      t.pair = allocT<float>(pairs * t.C);
+    }
     toFloat(zh, t.pair, pairs * t.C);
-    releaseScratch({"trunk.zh"});
+    if (reclaim) releaseScratch({"trunk.zh"});
     t.pairHalfExact = true;
   } else
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
-  releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
+  if (reclaim) releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 
 // ---------------------------------------------------------------- the distogram

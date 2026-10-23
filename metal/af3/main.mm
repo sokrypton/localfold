@@ -132,11 +132,14 @@ ConfidenceOut structuralConfidence(const Structural& st, const float* coords, st
 }
 
 // the fit check's factors (bytes at the peak per byte of the f32 pair and of the f32 MSA), measured on the M5 at 1044
-// tokens with four templates and with a 1024-row alignment: 4.97 and 3.2 where the stacks run half (matrix units), 5.27
-// where they run float (an M2's path, measured with LOCALFOLD_GEMM_TENSOR=0) - each rounded up. (Below ~600 tokens the
-// fold's fixed costs dominate and the estimate reads up to 5% under; it is the long folds it decides.)
+// tokens with four templates and with a 1024-row alignment: 4.97 and 3.2 where the stacks run half, 5.27 where they run
+// float (LOCALFOLD_HALF_PAIR=0) - each rounded up. (Below ~600 tokens the fold's fixed costs dominate and the estimate
+// reads up to 5% under; it is the long folds it decides.)
 static const double AF3_MSA_FACTOR = 3.2, AF3_PAIR_SLOW = 5.4;
-static double af3PairFactor() { return matrixUnits() ? 5.1 : AF3_PAIR_SLOW; }
+static double af3PairFactor() {
+  static const bool halfPair = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  return halfPair ? 5.1 : AF3_PAIR_SLOW;
+}
 int foldInput(const std::string& dir, Options o) {
   double t0 = now();
   M.loadInput(dir);

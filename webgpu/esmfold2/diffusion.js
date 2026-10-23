@@ -105,9 +105,11 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
-  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
-  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
-  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
+  if (local.x == 0u) {
+    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();
   let mean = sums[0] / ${width}.0;
   let inverse = inverseSqrt(max(squares[0] / ${width}.0 - mean * mean, 0.0) + ${epsilon});
   for (var c = local.x; c < ${width}u; c += ${LANES}u) {
@@ -158,9 +160,11 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
-  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
-  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
-  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
+  if (local.x == 0u) {
+    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
   let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
   let inverse = inverseSqrt(variance + ${epsilon});
@@ -201,9 +205,11 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
-  if (local.x < 4u) { sums[local.x] += sums[local.x + 4u]; squares[local.x] += squares[local.x + 4u]; } workgroupBarrier();
-  if (local.x < 2u) { sums[local.x] += sums[local.x + 2u]; squares[local.x] += squares[local.x + 2u]; } workgroupBarrier();
-  if (local.x == 0u) { sums[0] += sums[1]; squares[0] += squares[1]; } workgroupBarrier();
+  if (local.x == 0u) {
+    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
   let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
   let inverse = inverseSqrt(variance + ${epsilon});
@@ -1239,7 +1245,7 @@ export class Esmfold2DenoiserGpu {
     const scratchA = this.#alloc("esmfold2.diff.pair-a", chunk * pairChannels * multiplier);
     const scratchB = this.#alloc("esmfold2.diff.pair-b", chunk * pairChannels * multiplier);
     const scratchG = this.#alloc("esmfold2.diff.pair-g", chunk * pairChannels * multiplier);
-    const scratchD = this.#alloc("esmfold2.diff.pair-d", chunk * pairChannels);
+    const scratchD = scratchNorm;
     const zInputNormScale = upload("z-input-norm-scale", condition.zInputNormScale);
     const zInputNormOffset = upload("z-input-norm-offset", condition.zInputNormOffset);
     const zProjection = upload("z-projection", condition.zProjection);
@@ -1291,7 +1297,7 @@ export class Esmfold2DenoiserGpu {
     // are 56 MiB of chunk-sized buffers standing beside the twelve per-block
     // pair biases that are allocated next. This allocator does not pool -
     // release DESTROYS - so where a release sits is where the peak is.
-    for (const allocation of [scratchA, scratchB, scratchG, scratchD]) {
+    for (const allocation of [scratchA, scratchB, scratchG]) {
       allocation.release();
       this.allocations.splice(this.allocations.indexOf(allocation), 1);
     }
@@ -1356,41 +1362,41 @@ export class Esmfold2DenoiserGpu {
 
     // ---- the per-step scratch, allocated once so the program is a constant.
     const scratch = (label, elements) => this.#alloc(`esmfold2.diff.${label}`, elements);
-    b.single = this.#alloc("esmfold2.diff.single", tokens * tokenChannels,
-                           storage | GPUBufferUsage.COPY_DST);
-    b.sNorm = scratch("s-norm", tokens * tokenChannels);
-    b.wideA = scratch("wide-a", tokens * hidden);
-    b.wideB = scratch("wide-b", tokens * hidden);
-    b.wideG = scratch("wide-g", tokens * hidden);
-    b.delta = scratch("delta", tokens * tokenChannels);
-    b.normAct = scratch("norm-act", tokens * tokenChannels);
-    b.normSingle = scratch("norm-single", tokens * tokenChannels);
-    b.gateShift = scratch("gate-shift", tokens * tokenChannels * 2);
-    b.modulated = scratch("modulated", tokens * tokenChannels);
-    b.query = scratch("query", tokens * tokenChannels);
-    b.kv = scratch("kv", tokens * tokenChannels * 2);
-    b.gate = scratch("gate", tokens * tokenChannels);
-    b.context = scratch("context", tokens * tokenChannels);
-    b.outGate = scratch("out-gate", tokens * tokenChannels);
-    b.act = scratch("act", tokens * tokenChannels);
-    b.tokenAct = scratch("token-act", tokens * tokenChannels);
-    b.projected = scratch("projected", atoms * tokenChannels);
-    b.perToken = scratch("per-token", tokens * atomChannels);
-    b.atomAct = scratch("atom-act", atoms * atomChannels);
-    b.decoderAct = scratch("decoder-act", atoms * atomChannels);
-    b.atomNormed = scratch("atom-normed", atomChannels * atoms);
-    b.update = this.#alloc("esmfold2.diff.update", atoms * 3,
-                           storage | GPUBufferUsage.COPY_SRC);
-    b.readback = this.#alloc("esmfold2.diff.readback", atoms * 3,
-                             GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-    if (pipelines.kSplits > 1) b.partials = scratch("partials", pipelines.kSplits * tokens * 2 * hidden);
     const atomScratchSizes = atomStackScratch(
-      { atoms, channels: atomChannels, heads: atomHeads, hidden: atomHidden });
+      { atoms, channels: atomChannels, heads: atomHeads, hidden: atomHidden, tokenChannels });
     const atomScratch = {};
     for (const [name, elements] of Object.entries(atomScratchSizes)) {
       if (name === "siluCond" || name === "modulation") continue;
       atomScratch[name] = scratch(`atom.${name}`, elements);
     }
+    b.single = this.#alloc("esmfold2.diff.single", tokens * tokenChannels,
+                           storage | GPUBufferUsage.COPY_DST);
+    b.wideA = scratch("wide-a", tokens * Math.max(hidden, tokenChannels * 2));
+    b.wideB = scratch("wide-b", tokens * Math.max(hidden, tokenChannels * 2));
+    b.wideG = scratch("wide-g", tokens * hidden);
+    b.gateShift = b.wideA;
+    b.kv = b.wideB;
+    b.normSingle = scratch("norm-single", tokens * tokenChannels);
+    b.modulated = scratch("modulated", tokens * tokenChannels);
+    b.sNorm = b.modulated;
+    b.normAct = b.modulated;
+    b.query = scratch("query", tokens * tokenChannels);
+    b.tokenAct = b.query;
+    b.delta = b.query;
+    b.gate = scratch("gate", tokens * tokenChannels);
+    b.outGate = b.gate;
+    b.context = scratch("context", tokens * Math.max(tokenChannels, atomChannels));
+    b.perToken = b.context;
+    b.act = scratch("act", tokens * tokenChannels);
+    b.projected = atomScratch.qkv;
+    b.atomAct = scratch("atom-act", atoms * atomChannels);
+    b.decoderAct = scratch("decoder-act", atoms * atomChannels);
+    b.atomNormed = b.atomAct;
+    b.update = this.#alloc("esmfold2.diff.update", atoms * 3,
+                           storage | GPUBufferUsage.COPY_SRC);
+    b.readback = this.#alloc("esmfold2.diff.readback", atoms * 3,
+                             GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    if (pipelines.kSplits > 1) b.partials = scratch("partials", pipelines.kSplits * tokens * 2 * hidden);
     this.buffers = b;
 
     // ---- and the program itself.

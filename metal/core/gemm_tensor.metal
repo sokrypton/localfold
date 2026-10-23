@@ -1,14 +1,33 @@
 // metal/core's GEMM on the matrix units (Apple10, the M5's "neural accelerators"): Metal 4's tensor operations
 // (MetalPerformancePrimitives' matmul2d), the same arguments and the same epilogues as gemm.metal's lf_gemm. Compiled
 // at Metal Shading Language 4.0 in a library of its own (core.mm: tensor instances) and chosen at run time - an older
-// GPU or OS keeps lf_gemm. (args.h and gemm.metal are prepended by metal/build.sh: lf_erf, lf_udiv, lf_ldf, lf_st)
+// GPU or OS keeps lf_gemm. (args.h is prepended by metal/build.sh)
 //
 // The product is matmul2d's, into a cooperative tensor of the accumulator's type (half where EP bit 8 asks, as lf_gemm's
 // all-half instances accumulate, else float). A plain product - a bias, a ReLU, alpha 1 and beta 0, the output in the
 // accumulator's type or converted on the way out - is adjusted in place and stored from the tensor; every other epilogue stages the tile in
 // threadgroup memory and applies lf_gemm's arithmetic to it an element at a time, coalesced along the output's row.
+#include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+inline float lf_erf(float x) {     // (Abramowitz and Stegun 7.1.26, |error| < 1.5e-7: Metal has no erf)
+  float s = sign(x), t = 1.f / (1.f + 0.3275911f * fabs(x));
+  return s * (1.f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x));
+}
+inline uint lf_udiv(uint a, uint d) {
+  if (a >= (1u << 24)) return a / d;
+  uint q = (uint)((float)a * (1.f / (float)d));
+  if (q * d > a) --q;
+  else if ((q + 1) * d <= a) ++q;
+  return q;
+}
+inline float lf_ld(device const float* p, ulong i) { return p[i]; }
+inline float lf_ld(device const half* p, ulong i) { return (float)p[i]; }
+inline void lf_st(device float* p, ulong i, float v) { p[i] = v; }
+inline void lf_st(device half* p, ulong i, float v) { p[i] = (half)v; }
+inline float lf_ldf(device const float* p) { return *p; }
+inline float lf_ldf(device const half* p) { return (float)*p; }
 
 // the next LayerNorm, emitted by a tile's epilogue that holds whole rows (EP bit 64; lf_gemm_tensor_dual's lnOut): a
 // 64 x 128 or a 32 x 256 float destination over 4 simdgroups, its new values read back from D where each

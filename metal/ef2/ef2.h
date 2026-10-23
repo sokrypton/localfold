@@ -52,7 +52,7 @@ void emitTrunkLn(const void* x, const std::string& norm, half* buf);
 void prepareTrunkWeights();
 void prepareAtomWeights();
 void prepareDiffusionWeights();
-bool halfPairBlocks(int C);     // the blocks over a half pair here (matrix units; LOCALFOLD_HALF_PAIR=0 the control)
+bool halfPairBlocks(int C);     // the blocks over a half pair here (LOCALFOLD_HALF_PAIR=0 the control)
 // (z is given back and made again while the blocks run on a half copy: a new pointer)
 // the full ESMFold2's MSA encoder over z_init, in place (trunk.mm)
 void msaEncode(float* zi, const float* sInputs, int T, int C, int Si, uint64_t seed);

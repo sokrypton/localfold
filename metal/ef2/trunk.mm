@@ -76,12 +76,12 @@ static void transition(T* pair, size_t P, int C, const std::string& Tn, const st
   int I = dimOf("f/" + Tn + "transition2", 0);
   size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
   size_t rows = std::min(P, chunk);
-  half* xn = scratch<half>("ftr.xn", rows * C);
-  half* g = scratch<half>("ftr.g", rows * I);
-  const half* w1 = swigluPairsInPlace("f/" + Tn + "transition1", C, I);
   // (a row's norm is its own: the emitted input and the emitted output both go a chunk of rows at a time)
   half* in = takeEmitted(pair, Tn + "inputLayerNorm");
   half* lnOut = next.empty() ? nullptr : lnTarget(P, C, in);
+  half* xn = in ? nullptr : scratch<half>("ftr.xn", rows * C);
+  half* g = scratch<half>("ftr.g", rows * I);
+  const half* w1 = swigluPairsInPlace("f/" + Tn + "transition1", C, I);
   bool all = lnOut != nullptr;
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
@@ -132,7 +132,7 @@ void prepareTrunkWeights() {
 }
 bool halfPairBlocks(int C) {
   static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
-  return halfWanted && matrixUnits() && C % 8 == 0;
+  return halfWanted && C % 8 == 0;
 }
 
 void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const float* lmZ, uint64_t seed) {
@@ -140,8 +140,8 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});          // every token is real
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
-  half* xn = scratch<half>("trunk.xn", chunk * C);
   if (M.has("f/recycle/decay")) {
+    half* xn = scratch<half>("trunk.xn", chunk * C);
     // the released models (ESMFold2, ESMFold2-Fast), cuda/ef2's trunk.cuh: z starts as noise; each pass refines a
     // dropped-out copy of the language model's pair through its own pair-only blocks, injects z_init plus that,
     // LayerNorm'd and projected, into a per-channel decay of z, and runs the trunk; after the last pass the readout and
@@ -195,6 +195,7 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
     for (int loop = 0; loop < loops; ++loop) {
       half* in = takeEmitted(zh, "recycle/norm/");
       half* lnOut = lnTarget(P, C, in);
+      half* xn = in ? nullptr : scratch<half>("frec.xn", chunk * C);
       bool all = true;
       for (size_t r0 = 0; r0 < P; r0 += chunk) {
         size_t r = std::min(chunk, P - r0);
@@ -210,7 +211,7 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
       for (int b = 0; b < blocks; ++b)
         trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks, loop + 1 < loops ? "recycle/norm/" : "");
     }
-    releaseScratch({"ftri.", "ftr.", "eln."});
+    releaseScratch({"ftri.", "ftr.", "frec.", "eln."});
     z = allocT<float>(P * C);
     toFloat(zh, z, P * C);
     return;
@@ -221,6 +222,7 @@ void foldingTrunk(int T, int C, const float* zi, float*& z, int loops, const flo
     // z = LN(z) @ projection + z_init, a chunk of rows at a time
     half* in = takeEmitted(z, "recycle/norm/");
     half* lnOut = lnTarget(P, C, in);
+    half* xn = in ? nullptr : scratch<half>("frec.xn", chunk * C);
     bool all = true;
     for (size_t r0 = 0; r0 < P; r0 += chunk) {
       size_t r = std::min(chunk, P - r0);

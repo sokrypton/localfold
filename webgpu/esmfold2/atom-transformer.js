@@ -126,9 +126,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createModulateShader({ atoms, channels }, shiftIndex, scaleIndex) {
   const steps = [];
-  for (let s = LANES >> 1; s > 0; s >>= 1) {
+  for (let s = LANES >> 1; s >= 8; s >>= 1) {
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
+  steps.push(`  if (local.x == 0u) {
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+               + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();`);
   if (channels === 2 * LANES) {
     return `
 @group(0) @binding(0) var<storage, read> activation: array<f32>;
@@ -193,9 +198,14 @@ ${steps.join("\n")}
 
 function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex, scaleIndex) {
   const steps = [];
-  for (let s = LANES >> 1; s > 0; s >>= 1) {
+  for (let s = LANES >> 1; s >= 8; s >>= 1) {
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
+  steps.push(`  if (local.x == 0u) {
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+               + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();`);
   if (channels === 2 * LANES) {
     return `
 @group(0) @binding(0) var<storage, read> delta: array<f32>;
@@ -310,8 +320,17 @@ export function createSwaPrepareShader({ atoms, channels, heads }, precision) {
   const half = headDim >> 1;
   const narrow = precision === "bf16" ? "bf16" : "";
   const reduceSteps = [];
-  for (let s = headDim >> 1; s > 0; s >>= 1) {
+  for (let s = headDim >> 1; s >= (headDim >= 8 ? 8 : 1); s >>= 1) {
     reduceSteps.push(`  if (d < ${s}u) { squaresQ[d] += squaresQ[d + ${s}u]; squaresK[d] += squaresK[d + ${s}u]; } workgroupBarrier();`);
+  }
+  if (headDim >= 8) {
+    reduceSteps.push(`  if (d == 0u) {
+    squaresQ[0] = ((squaresQ[0] + squaresQ[4]) + (squaresQ[2] + squaresQ[6]))
+                + ((squaresQ[1] + squaresQ[5]) + (squaresQ[3] + squaresQ[7]));
+    squaresK[0] = ((squaresK[0] + squaresK[4]) + (squaresK[2] + squaresK[6]))
+                + ((squaresK[1] + squaresK[5]) + (squaresK[3] + squaresK[7]));
+  }
+  workgroupBarrier();`);
   }
   return `${precision === "bf16" ? BFLOAT16 : ""}
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
@@ -507,13 +526,16 @@ ${(() => {
     workgroupBarrier();
 ${(() => {
   const steps = [];
-  for (let s = headDim >> 1; s > 0; s >>= 1) {
+  for (let s = headDim >> 1; s >= (headDim >= 8 ? 8 : 1); s >>= 1) {
     steps.push(`    if (d < ${s}u) { reduce[local.x] += reduce[local.x + ${s}u]; } workgroupBarrier();`);
   }
   return steps.join("\n");
 })()}
     if (d == 0u) {
-      let chunkSum = reduce[head * ${headDim}u];
+      let chunkSum = ${headDim >= 8
+        ? `((reduce[local.x] + reduce[local.x + 4u]) + (reduce[local.x + 2u] + reduce[local.x + 6u]))
+                   + ((reduce[local.x + 1u] + reduce[local.x + 5u]) + (reduce[local.x + 3u] + reduce[local.x + 7u]))`
+        : `reduce[head * ${headDim}u]`};
       headSum[head] = headSum[head] * rescale + chunkSum;
       headPeak[head] = peak;
     }
@@ -677,19 +699,16 @@ export async function compileAtomStack(pipelines, shape) {
 }
 
 /** The scratch a stack needs, in elements. */
-export function atomStackScratch({ atoms, channels, heads, hidden }) {
+export function atomStackScratch({ atoms, channels, heads, hidden, tokenChannels = 0 }) {
   return {
     siluCond: atoms * channels,
     modulation: atoms * channels * 6,
     normalised: atoms * channels,
-    qkv: atoms * channels * 3,
+    qkv: atoms * Math.max(channels * 3, hidden, tokenChannels),
     query: atoms * channels,
     key: atoms * channels,
     value: atoms * channels,
     gate: atoms * channels,
-    context: atoms * channels,
-    delta: atoms * channels,
-    hidden: atoms * hidden,
   };
 }
 
@@ -708,6 +727,9 @@ export function atomStackScratch({ atoms, channels, heads, hidden }) {
  */
 export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
   const { atoms, channels, heads, hidden } = pipelines.shape;
+  const context = scratch.context ?? scratch.normalised;
+  const delta = scratch.delta ?? scratch.query;
+  const hiddenBuf = scratch.hidden ?? scratch.qkv;
   const rows = (elements) => {
     const groups = Math.ceil(elements / LANES);
     return [Math.min(GRID_WIDTH, groups), Math.ceil(groups / GRID_WIDTH)];
@@ -738,17 +760,17 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
         ...perHead);
     run("esmfold2.atom.attend", pipelines.attend,
         [scratch.query, scratch.key, scratch.value, state.bounds, state.valid,
-         scratch.gate, scratch.context], ...perAtom);
+         scratch.gate, context], ...perAtom);
     run("esmfold2.atom.attn-out", pipelines.attentionOut,
-        [scratch.context, block.attnOut, scratch.delta], ...linearGrid(atoms, channels));
+        [context, block.attnOut, delta], ...linearGrid(atoms, channels));
     run("esmfold2.atom.res-mod-f", pipelines.residualModulateFfn,
-        [scratch.delta, modulation, state.activation, scratch.normalised], ...perAtom);
+        [delta, modulation, state.activation, scratch.normalised], ...perAtom);
     run("esmfold2.atom.swiglu", pipelines.swiglu,
-        [scratch.normalised, block.ffnUp, scratch.hidden], ...swigluGrid(atoms, hidden));
+        [scratch.normalised, block.ffnUp, hiddenBuf], ...swigluGrid(atoms, hidden));
     run("esmfold2.atom.ffn-down", pipelines.ffnDown,
-        [scratch.hidden, block.ffnDown, scratch.delta], ...linearGrid(atoms, channels));
+        [hiddenBuf, block.ffnDown, delta], ...linearGrid(atoms, channels));
     run("esmfold2.atom.residual-f", pipelines.residualFfn,
-        [scratch.delta, modulation, state.activation], ...rows(atoms * channels));
+        [delta, modulation, state.activation], ...rows(atoms * channels));
   }
 }
 
@@ -809,7 +831,7 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
     };
     const scratch = {};
     for (const [name, elements] of Object.entries(
-      atomStackScratch({ atoms, channels, heads, hidden }))) {
+      atomStackScratch({ atoms, channels, heads, hidden, tokenChannels }))) {
       scratch[name] = keep(allocator.allocate(`esmfold2.embed.${name}`,
         Math.max(16, elements * 4), storage));
     }
@@ -819,8 +841,7 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       return { adaln: at("adaln"), qkv: at("qkv"), attnGate: at("attnGate"),
                attnOut: at("attnOut"), ffnUp: at("ffnUp"), ffnDown: at("ffnDown") };
     });
-    const projected = keep(allocator.allocate("esmfold2.embed.projected",
-      atoms * tokenChannels * 4, storage));
+    const projected = scratch.qkv;
     const tokenAct = keep(allocator.allocate("esmfold2.embed.token-act",
       tokens * tokenChannels * 4, storage | GPUBufferUsage.COPY_SRC));
     const ranged = keep(allocator.upload("esmfold2.embed.ranges", ranges, storage));

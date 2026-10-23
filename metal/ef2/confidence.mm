@@ -41,6 +41,7 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     g.rows = n; g.in = C; g.out = C; g.label = "confidence prodOut";
     gemm(g);
   }
+  releaseScratch({"cf.prod", "cf.s", "cf.r", "cf.c", "cf.l", "cf.rr"});
   // z + trunk(z)
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});

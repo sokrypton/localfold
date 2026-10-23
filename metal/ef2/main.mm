@@ -27,14 +27,15 @@ void mem(const char* at) {
 }
 
 // the fit check's factors, measured on the M5 at 522 and 1044 residues: the language model's stage holds the tower and
-// its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (where its blocks run half on the
-// matrix units 3.56 a pair byte since each update emits its next norm over its own input - 4.06 with a second buffer for
-// it -, 5.14 where they run float: LOCALFOLD_GEMM_TENSOR=0) - the larger stage is the peak
+// its f32 pair (1.25 a pair byte and 0.1 GB), the trunk's has given the tower back (where its blocks run half 3.56 a pair
+// byte since each update emits its next norm over its own input - 4.06 with a second buffer for it -, 5.14 where they run
+// float: LOCALFOLD_HALF_PAIR=0) - the larger stage is the peak
 static const double EF2_PAIR_SLOW = 5.3;
 static double ef2Peak(double held, double tower, double pair, bool parcae) {
   // (the released models' recycle: the float pair's blocks, and two pairs more - the language model's, kept for every
   // pass, and its injection - not measured, counted)
-  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (parcae ? EF2_PAIR_SLOW + 2 : matrixUnits() ? 3.7 : EF2_PAIR_SLOW) * pair);
+  static const bool halfPair = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  return std::max(held + 1.25 * pair + 0.1e9, held - tower + (parcae ? EF2_PAIR_SLOW + 2 : halfPair ? 3.7 : EF2_PAIR_SLOW) * pair);
 }
 bool KEEP_TOWER = false;      // (--serve: the next job reads it again)
 int foldInput(const Opts& o) {
@@ -119,7 +120,7 @@ int foldInput(const Opts& o) {
   printf("trunk %.1f ms\n", ms(t0));
   mem("trunk");
   release(zi);
-  releaseScratch({"ftri.", "ftr.", "eln.", "trunk.", "zi."});     // (eln.: the emitted norm, held through the sampler before)
+  releaseScratch({"ftri.", "ftr.", "frec.", "eln.", "trunk.", "zi."});     // (eln.: the emitted norm, held through the sampler before)
   if (getenv("EF2_SAVE_PAIR")) {
     auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
   }
@@ -224,6 +225,7 @@ int foldMain(int argc, char** argv) {
   if (o.profile && !profiling()) setenv("LOCALFOLD_PROFILE", "1", 1);
   double tStart = now();
   setSource("ef2", PORT_SOURCE);
+  shareScratch({{"ftri.big", "tri"}, {"ftr.g", "tr"}, {"frec.", "rec"}}, {});
   // the weights, decoded on the device: every large tensor straight to float16, but the confidence head's own
   // projections, which stay float32
   auto asHalf = [](const std::string& n, size_t elements) {

@@ -103,10 +103,13 @@ std::string pdbText(const std::vector<float>& pos, const std::vector<float>& pld
 
 // the fit check's factors (bytes at the peak per byte of the f32 pair, and of the f32 MSA and extra MSA together), measured
 // on the M5 at 1044 residues - the multimer with four templates, the monomer with 512 + 1024 rows: 4.59 and 2.16 where the
-// evoformer runs half (matrix units), PAIR_SLOW where it runs float (LOCALFOLD_GEMM_TENSOR=0) - rounded up. (Below ~600
-// residues the fold's fixed costs dominate and the estimate reads up to 10% under; it is the long folds it decides.)
+// evoformer runs half, PAIR_SLOW where it runs float (LOCALFOLD_HALF_PAIR=0) - rounded up. (Below ~600 residues the fold's
+// fixed costs dominate and the estimate reads up to 10% under; it is the long folds it decides.)
 static const double AF2_MSA_FACTOR = 2.2, AF2_PAIR_SLOW = 4.7;   // (the float path measured 4.14 over one pass)
-static double af2PairFactor() { return matrixUnits() ? 4.7 : AF2_PAIR_SLOW; }
+static double af2PairFactor() {
+  static const bool halfPair = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  return halfPair ? 4.7 : AF2_PAIR_SLOW;
+}
 int foldInput(const std::string& dir, const std::string& out, int recycles) {
   double t0 = now();
   Trunk t{};
@@ -154,24 +157,25 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
     if (pass == 0 && profiling()) profileStart();
     // the last pass's structure module and heads given back (the recycled state is copied out of them): kept, their
     // slots stayed grown to their sizes and the next evoformer's buffers landed in them - 1044 residues 3.31 -> 2.76 GB
-    if (pass > 0) releaseScratch({"sm.", "head."});
+    size_t mn = (size_t)(t.N + t.T) * L * 256, en = (size_t)std::max(t.E, 1) * L * 64;
+    const bool reclaim = (mn + pairs * 128 + en) * 4 >= (64u << 20) || getenv("LOCALFOLD_PEAK") || getenv("LOCALFOLD_SCRIBBLE");
+    if (pass > 0 && reclaim) releaseScratch({"sm.", "head."});
     embed(t, pass, prevRow, prevPos);
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
     else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
     if (t.T > 0) templateRows(L, t.T, multimer, t.msa + (size_t)t.N * L * 256, t.msaMask + (size_t)t.N * L);
     // The evoformer over half activations: its residual updates are GEMMs that read and write the MSA and the pair, and
-    // half moves half the bytes. Where the matrix units run (their kernels take a half residual); every residual is
-    // summed in float and rounded once, every norm reads the half values. The heads read the pair and the MSA's first row
-    // back in float. LOCALFOLD_HALF_PAIR=0 the control. (Seen: the MSA to ~500, the pair to ~1300, half's limit 65504.)
+    // half moves half the bytes. Every residual is summed in float and rounded once, every norm reads the half values.
+    // The heads read the pair and the MSA's first row back in float. LOCALFOLD_HALF_PAIR=0 the control. (Seen: the MSA
+    // to ~500, the pair to ~1300, half's limit 65504.)
     static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
     // (and the float MSA, extra MSA and pair given back while the half ones are in use - made again once the blocks'
     // scratch is: the embedder writes every row of the MSAs again)
-    size_t mn = (size_t)(t.N + t.T) * L * 256, en = (size_t)std::max(t.E, 1) * L * 64;
-    if (halfWanted && matrixUnits()) {
+    if (halfWanted) {
       t.h.msa = scratch<half>("evo.msa", mn); toHalf(t.msa, t.h.msa, mn);
       t.h.pair = scratch<half>("evo.pair", pairs * 128); toHalf(t.pair, t.h.pair, pairs * 128);
       if (extraBlocks && t.E) { t.h.extra = scratch<half>("evo.extra", en); toHalf(t.extra, t.h.extra, en); }
-      for (float** p : {&t.msa, &t.pair, &t.extra}) { release(*p); *p = nullptr; }
+      if (reclaim) for (float** p : {&t.msa, &t.pair, &t.extra}) { release(*p); *p = nullptr; }
     }
     for (int b = 0; b < extraBlocks; ++b) {
       std::string nextNorm = t.opmFirst ? "" : (b + 1 < extraBlocks
@@ -186,13 +190,15 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
       evoformerBlock(t, false, b, nextNorm, b + 1 < mainBlocks ? b + 1 : -1);
     }
     if (t.h.pair) {
-      releaseScratch({"att.", "bias.", "col.", "row.", "gcol.", "ln.", "opm.", "tri.", "tr."});
-      t.msa = allocT<float>(mn); t.pair = allocT<float>(pairs * 128); t.extra = allocT<float>(en);
+      if (reclaim) {
+        releaseScratch({"att.", "bias.", "col.", "row.", "gcol.", "ln.", "opm.", "tri.", "tr."});
+        t.msa = allocT<float>(mn); t.pair = allocT<float>(pairs * 128); t.extra = allocT<float>(en);
+      }
       toFloat(t.h.msa, t.msa, (size_t)L * 256);       // (the first row: the single and the recycled row read it)
       toFloat(t.h.pair, t.pair, pairs * 128);
       linearB(t.h.msa, "evoformer/single_activations", -1, single, L, 256, 384);
       t.h = {};
-      releaseScratch({"evo."});
+      if (reclaim) releaseScratch({"evo."});
     } else {
       linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     }

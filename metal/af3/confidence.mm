@@ -112,7 +112,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   // LOCALFOLD_CONF_HALF_PAIR=0: this head's control alone
   static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
                                  (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
-  if (halfWanted && matrixUnits() && C % 8 == 0) {
+  if (halfWanted && C % 8 == 0) {
     half* zh = scratch<half>("conf.zh", pairs * C);
     toHalf(pair, zh, pairs * C);
     releaseScratch({"conf.pair"});
