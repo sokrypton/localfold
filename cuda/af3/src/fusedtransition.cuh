@@ -59,7 +59,7 @@ inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
 // NST 1: ONE weight stage, a barrier before each chunk's store into it - for a T4, whose register-staged prefetch (LF_REG_STAGES)
 // holds the next chunk in registers anyway: the second stage was 12 KB that kept its 64 KB SM to ONE block (4 warps)
 template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, class PT = float, int NST = 2,
-          int MINB = (C == 128 && WARPS == 4 && MT == 1 && NC == 16 && NST == 2) ? 3 : 1>
+          int MINB = ((C == 128 || C == 64) && WARPS == 4 && MT == 1 && NC == 16 && NST == 2) ? 3 : 1>
 __global__ void __launch_bounds__(WARPS * 32, MINB) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
@@ -431,7 +431,9 @@ inline bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
 // biases); false if the shape is not this kernel's or the device cannot hold its blocks
 // whether fusedTransitionRaw has a form for this shape on this device (the two-tile form, else the one-tile at 4 warps)
 inline bool fusedTransitionFits(size_t rows, int C, int I) {
-  if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
+  if (!FUSED_TRANSITION) return false;
+  if (C == 64) return (I % 16 == 0) && fitsSmem((size_t)16 * 4 * (64 + 8) * 2 + 2 * ftStage<64, 16, true>());
+  if (C != 128 || I % FT_NC) return false;
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) return true;
   return fitsSmem((size_t)16 * 4 * (128 + 8) * 2 + 2 * ftStage<128>());
 }
@@ -439,6 +441,10 @@ template <bool RELU = false>
 inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float* lnScale, const float* lnOffset,
                                const half* W1, const half* W2, const float* b1 = nullptr, const float* b2 = nullptr) {
   if (!fusedTransitionFits(rows, C, I)) return false;
+  if (C == 64) {
+    fusedTransitionAt<4, RELU, 1, 16, 2, 64>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    return true;
+  }
   // two 16-row tiles a warp on 4 warps (128-row blocks, 68 KB): 1.14x the 8-warp one-tile form at 1,044
   // tokens (--bench-trans), bit-identical; where it does not fit (a T4) or the input is small, the one-tile forms
   // AF2's (ReLU) on sm_12x: one tile a warp on SIXTEEN warps, 256 rows a block (94 KB), each weight stage spread over

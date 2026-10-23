@@ -277,6 +277,54 @@ __global__ void centerNormHK(const float* __restrict__ prod, TY* __restrict__ ou
     }
     return;
   }
+  if (C == 64 && blockDim.x == 256) {
+    if (rLoad < pairs) {
+      const float* pBase = prod + planeIdx;
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int c = k * 8 + warp;
+        tile[c * 33 + lane] = __ldg(pBase + (size_t)c * plane);
+      }
+    }
+    __syncthreads();
+    float sc[2], of[2];
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      int c = k * 32 + lane;
+      sc[k] = __ldg(scale + c);
+      of[k] = __ldg(offset + c);
+    }
+    #pragma unroll
+    for (int rk = 0; rk < 4; ++rk) {
+      int row = rk * 8 + warp;
+      size_t r = r0 + row;
+      if (r >= pairs) break;
+      float tv[2];
+      float s = 0;
+      #pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        float val = tile[(k * 32 + lane) * 33 + row];
+        tv[k] = val;
+        s += val;
+      }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s * (1.f / 64.f), v = 0;
+      #pragma unroll
+      for (int k = 0; k < 2; ++k) { float d = tv[k] - mean; v += d * d; }
+      #pragma unroll
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      float inv = rsqrtf(v * (1.f / 64.f) + 1e-5f);
+      TY* outRow = out + r * 64;
+      #pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        float yv = (tv[k] - mean) * inv * sc[k] + of[k];
+        if constexpr (std::is_same_v<TY, half>) outRow[k * 32 + lane] = __float2half(yv);
+        else outRow[k * 32 + lane] = yv;
+      }
+    }
+    return;
+  }
   for (int c = warp; c < C; c += nw) {
     tile[c * 33 + lane] = rLoad < pairs ? __ldg(prod + (size_t)c * plane + planeIdx) : 0.f;
   }

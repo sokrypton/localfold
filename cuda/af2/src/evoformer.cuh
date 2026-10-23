@@ -418,11 +418,11 @@ inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int
 // layout -> flash attention -> the output projection with its bias, added into `residual` (transposed
 // back first when `transposedBack`, xn being [n, Bt] of the residual's [Bt, n])
 // y[q * A + b] += x[(b - b0) * B + q] for rows b in [b0, b0 + cnt): a chunk of transposedBack's swapAdd
-__global__ void swapAddRowsK(float* y, const float* x, int A, int B, int C, size_t b0, size_t cnt) {
+__global__ void swapAddRowsK(float* __restrict__ y, const float* __restrict__ x, int A, int B, int C, size_t b0, size_t cnt) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * B * C) return;
-  int c = (int)(t % C); size_t r = t / C; size_t q = r % B, b = b0 + r / B;
-  y[(q * A + b) * C + c] += x[t];
+  int c = (int)(t % C); size_t r = t / C; size_t db = r % cnt, q = r / cnt, b = b0 + db;
+  y[(q * A + b) * C + c] += __ldg(x + (db * B + q) * C + c);
 }
 inline void attentionCore(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const float* keyMask,
                           const half* bias, float* residual, bool transposedBack) {
@@ -631,16 +631,18 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     if (takeEmittedLn(A + "/query_norm", blk, msa, rows) != xn)
       layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
                                                                                 P(A + "/query_norm/offset", blk));
-    half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
-    ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
     const std::string ln = S + "msa_transition/input_layer_norm";
-    if (rowsN == 1 && t.msaOnes && BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+    if (L > 262 && rowsN == 1 && t.msaOnes && BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+      half* vg = scratch<half>("fatt.qkvg", (rows + 128) * 2 * Wp);
+      ltGemm(xn, attnVgWeight(w, C), vg, true, rows, C, 2 * Wp, w.qkvgBias + 2 * Wp, false, 0.f);
       B16* xt = scratch<B16>("ftr.xnfull", rows * C);
-      outLn256<B16, B16, B16, true>((const B16*)qkvg, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C),
+      outLn256<B16, B16, B16, true>((const B16*)vg, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C),
                                     P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
       EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
       return;
     }
+    half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+    ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
     if (!t.msaOnes) {
       float* m = scratch<float>(AF2_TIGHT ? "col.mask" : "mask.colMsa", rows);
       if (AF2_TIGHT || blk == 0) swap01(msaMask, m, rowsN, L, 1);
@@ -825,6 +827,70 @@ __global__ void tileBiasK(const float* bias, float* out, int L, int C, float sca
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < (size_t)L * C) out[t] = bias[t % C] * scale;
 }
+__global__ void opmLeftToICSBf16K(const half* __restrict__ lt, __nv_bfloat16* __restrict__ La, int S, int L, int O, float scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int K = S * O, Ka = 4 * K + 8;
+  size_t total = (size_t)L * (K + 2);
+  if (t >= total) return;
+  int idx = (int)(t % (K + 2)), i = (int)(t / (K + 2));
+  __nv_bfloat16* row = La + (size_t)i * Ka;
+  if (idx < K) {
+    int s = idx % S, c = idx / S;
+    float v = __half2float(__float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale));
+    __nv_bfloat16 l0 = __float2bfloat16(v);
+    __nv_bfloat16 l1 = __float2bfloat16(v - __bfloat162float(l0));
+    __nv_bfloat162 p = __halves2bfloat162(l0, l1);
+    uint32_t u = *reinterpret_cast<uint32_t*>(&p);
+    *reinterpret_cast<uint2*>(row + 4 * idx) = make_uint2(u, u);
+  } else if (idx == K) {
+    __nv_bfloat16 one = __float2bfloat16(1.f), zero = __float2bfloat16(0.f);
+    __nv_bfloat162 p0 = __halves2bfloat162(one, one), p1 = __halves2bfloat162(one, zero);
+    *reinterpret_cast<uint2*>(row + 4 * K) = make_uint2(*reinterpret_cast<uint32_t*>(&p0), *reinterpret_cast<uint32_t*>(&p1));
+  } else {
+    *reinterpret_cast<uint2*>(row + 4 * K + 4) = make_uint2(0, 0);
+  }
+}
+__global__ void opmPackTbfK(const half* __restrict__ T, const float* __restrict__ ob, float scale,
+                            __nv_bfloat16* __restrict__ Tbf, int K, size_t M) {
+  size_t m4 = M >> 2;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)(K + 1) * m4) return;
+  size_t col4 = t % m4;
+  int k = (int)(t / m4);
+  size_t m = col4 << 2;
+  if (k < K) {
+    uint2 h4 = __ldg(reinterpret_cast<const uint2*>(T + (size_t)k * M + m));
+    float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&h4.x));
+    float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&h4.y));
+    __nv_bfloat162 hi0 = __floats2bfloat162_rn(f0.x, f0.y), hi1 = __floats2bfloat162_rn(f1.x, f1.y);
+    float2 hi0f = __bfloat1622float2(hi0), hi1f = __bfloat1622float2(hi1);
+    __nv_bfloat162 lo0 = __floats2bfloat162_rn(f0.x - hi0f.x, f0.y - hi0f.y);
+    __nv_bfloat162 lo1 = __floats2bfloat162_rn(f1.x - hi1f.x, f1.y - hi1f.y);
+    uint2 uHi = make_uint2(*reinterpret_cast<uint32_t*>(&hi0), *reinterpret_cast<uint32_t*>(&hi1));
+    uint2 uLo = make_uint2(*reinterpret_cast<uint32_t*>(&lo0), *reinterpret_cast<uint32_t*>(&lo1));
+    size_t r0 = (size_t)(4 * k) * m4 + col4;
+    reinterpret_cast<uint2*>(Tbf)[r0] = uHi;
+    reinterpret_cast<uint2*>(Tbf)[r0 + m4] = uHi;
+    reinterpret_cast<uint2*>(Tbf)[r0 + 2 * m4] = uLo;
+    reinterpret_cast<uint2*>(Tbf)[r0 + 3 * m4] = uLo;
+  } else {
+    float4 b4 = __ldg(reinterpret_cast<const float4*>(ob + (m & 127)));
+    b4.x *= scale; b4.y *= scale; b4.z *= scale; b4.w *= scale;
+    __nv_bfloat162 b0_0 = __floats2bfloat162_rn(b4.x, b4.y), b0_1 = __floats2bfloat162_rn(b4.z, b4.w);
+    float2 f0_0 = __bfloat1622float2(b0_0), f0_1 = __bfloat1622float2(b0_1);
+    float4 r1 = make_float4(b4.x - f0_0.x, b4.y - f0_0.y, b4.z - f0_1.x, b4.w - f0_1.y);
+    __nv_bfloat162 b1_0 = __floats2bfloat162_rn(r1.x, r1.y), b1_1 = __floats2bfloat162_rn(r1.z, r1.w);
+    float2 f1_0 = __bfloat1622float2(b1_0), f1_1 = __bfloat1622float2(b1_1);
+    __nv_bfloat162 b2_0 = __floats2bfloat162_rn(r1.x - f1_0.x, r1.y - f1_0.y);
+    __nv_bfloat162 b2_1 = __floats2bfloat162_rn(r1.z - f1_1.x, r1.w - f1_1.y);
+    size_t rb = (size_t)(4 * K) * m4 + col4;
+    reinterpret_cast<uint2*>(Tbf)[rb] = make_uint2(*reinterpret_cast<uint32_t*>(&b0_0), *reinterpret_cast<uint32_t*>(&b0_1));
+    reinterpret_cast<uint2*>(Tbf)[rb + m4] = make_uint2(*reinterpret_cast<uint32_t*>(&b1_0), *reinterpret_cast<uint32_t*>(&b1_1));
+    reinterpret_cast<uint2*>(Tbf)[rb + 2 * m4] = make_uint2(*reinterpret_cast<uint32_t*>(&b2_0), *reinterpret_cast<uint32_t*>(&b2_1));
+    uint2 z = make_uint2(0, 0);
+    for (int r = 3; r < 8; ++r) reinterpret_cast<uint2*>(Tbf)[rb + r * m4] = z;
+  }
+}
 // The outer product mean's SHALLOW form, for an alignment of few rows: the output projection folded into the
 // right operand first - T[c][s][j][f] = sum_e R[s][j][e] W[c O + e][f], a batched GEMM over c (W's rows for one
 // c are contiguous) - then Y[i][j][f] = sum_{c,s} L[s][i][c] T[c][s][j][f], one GEMM with K = O x S. Its work
@@ -945,7 +1011,8 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       auto ow = opmWeights(Op, blk, C, O);
       const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
       const float* msk = ones ? nullptr : msaMask;
-      if (MSA16 && msa == t.msa16) withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk); });
+      if (MSA16 && msa == t.msa16)
+        withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk); });
       else if (C == 256) lnGemm<256>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
       else lnGemm<64>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
     } else {
@@ -980,13 +1047,25 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, CUDA_R_16F, 128, (long long)O * 128,
                                     rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      const float inv = ones ? 1.f / (1e-3f + (float)rowsN) : 1.f;
+      int K = O * rowsN;
+      if (ones && PAIR16 && rowsN <= 4 && (size_t)L * L * 512 > ((size_t)36 << 20)) {
+        int Ka = 4 * K + 8;
+        size_t M = (size_t)L * 128;
+        if (!AF2_TIGHT || roomFor(((size_t)L * Ka + (size_t)Ka * M) * 2, { "fopm.La", "fopm.Y" })) {
+          __nv_bfloat16* La = scratch<__nv_bfloat16>("fopm.La", (size_t)L * Ka);
+          __nv_bfloat16* Tbf = scratch<__nv_bfloat16>("fopm.Y", (size_t)Ka * M);
+          opmLeftToICSBf16K<<<blocks((size_t)L * (K + 2)), 256, 0, STREAM>>>(lt, La, rowsN, L, O, inv);
+          opmPackTbfK<<<blocks((size_t)(K + 1) * (M >> 2)), 256, 0, STREAM>>>(T, P(Op + "/output_b", blk), inv, Tbf, K, M);
+          ltGemm(La, Tbf, reinterpret_cast<__nv_bfloat16*>(t.pair), false, L, Ka, L * 128, nullptr, false, 1.f, 0, 0, true);
+          return;
+        }
+      }
       half* Lt = scratch<half>("fopm.Lt", rows * O);
       // with every MSA row live the norm is rowsN at every pair, so (Y + b) / (1e-3 + norm) folds into the
       // GEMM: L scaled by the constant, the bias tiled and scaled, accumulated straight into the pair (no
       // f32 Y written and read back, no opmAddK: 1.06 s of a 2,088-residue fold)
-      const float inv = ones ? 1.f / (1e-3f + (float)rowsN) : 1.f;
       opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O, inv);
-      int K = O * rowsN;
       if (ones) {
         int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
         if (PAIR16) {   // (into an f32 block of rows for a single unaligned sequence, where an f16 product moved 6MRR
@@ -1751,6 +1830,7 @@ inline void warmStackWeights(bool extraZeros = false, bool multimer = false, boo
           const half* w2 = augmentedWeight(S + "msa_transition/transition2/weights", b, P(S + "msa_transition/transition2/bias", b), I, C);
           biasFor(P(S + "msa_transition/transition1/bias", b), I, true);
           AttnW cw = attnWeights(S + "msa_column_attention/attention", b, C);
+          attnVgWeight(cw, C);
           if (!MSA16_HALF) {
             bf16Of(rw.out, (size_t)rw.H * rw.Dp * C);
             bf16Of(cw.out, (size_t)cw.H * cw.Dp * C);

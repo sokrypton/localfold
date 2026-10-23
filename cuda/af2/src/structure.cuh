@@ -267,11 +267,23 @@ __global__ void ipaPairTermK(const float* __restrict__ attn, const float* __rest
   }
 }
 // a pair position's LayerNorm statistics, by layerNormK's own arithmetic (two passes, a warp a row)
-__global__ void lnStatsK(const float* x, float2* stats, size_t rows, int C) {
+__global__ void lnStatsK(const float* __restrict__ x, float2* __restrict__ stats, size_t rows, int C) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* xr = x + row * C;
+  if (C == 128) {
+    float xv[4], s = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { float val = __ldg(xr + lane + 32 * k); xv[k] = val; s += val; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s * (1.f / 128.f), v = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { float d = xv[k] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    if (lane == 0) stats[row] = make_float2(mean, rsqrtf(v * (1.f / 128.f) + 1e-5f));
+    return;
+  }
   float s = 0;
   for (int c = lane; c < C; c += 32) s += xr[c];
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);

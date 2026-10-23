@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     if constexpr (VG) {
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
-      const half* vg = reinterpret_cast<const half*>(O) + (row * 4 + 2) * C + kc * KC + c;
+      const half* vg = reinterpret_cast<const half*>(O) + row * 2 * C + kc * KC + c;
       uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
       uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
       const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);
@@ -197,7 +197,7 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
       if constexpr (VG) {
-        const half* vg = reinterpret_cast<const half*>(O) + (row * 4 + 2) * C + kc * KC + c;
+        const half* vg = reinterpret_cast<const half*>(O) + row * 2 * C + kc * KC + c;
         uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
         uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
         const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);

@@ -327,22 +327,22 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gaOutK(const half* __restrict__
 
 // the whole of it: msa [N][L][64] += MSAColumnGlobalAttention(msa); A the module's weight prefix
 inline void globalAttentionFused(float* msa, const float* msaMask, int L, int N, const std::string& A, int blk) {
-  constexpr int WARPS = 4, ROWS = 128;
+  constexpr int WARPS = 4, ROWS = 64, ROWS_OUT = 32;
   float* kv = scratch<float>("gaf.kv", (size_t)L * N * 2 * ga::D);
   half* gate = scratch<half>("gaf.gate", (size_t)N * L * ga::H * ga::D);
-  const int Y = (N + ROWS - 1) / ROWS;
+  const int Y = (N + ROWS - 1) / ROWS, YOut = (N + ROWS_OUT - 1) / ROWS_OUT;
   float* qsum = scratch<float>("gaf.qsum", ((size_t)L * ga::C + L) * Y);
   float* msum = qsum + (size_t)L * ga::C;
   float* q = scratch<float>("gaf.q", (size_t)L * ga::H * ga::D);
   float* avg = scratch<float>("gaf.avg", (size_t)L * ga::H * ga::D);
-  dim3 grid((L + 15) / 16, Y);
+  dim3 grid((L + 15) / 16, Y), gridOut((L + 15) / 16, YOut);
   gaInK<WARPS><<<grid, WARPS * 32, 0, STREAM>>>(msa, msaMask, P(A + "/query_norm/scale", blk), P(A + "/query_norm/offset", blk),
       PH(A + "/attention/key_w", blk), PH(A + "/attention/value_w", blk), PH(A + "/attention/gating_w", blk),
       P(A + "/attention/gating_b", blk), kv, gate, qsum, msum, L, N, ROWS);
   gaQueryK<<<L, ga::C, 0, STREAM>>>(qsum, L, Y, P(A + "/attention/query_w", blk), q);
   gaAttnK<<<L, 256, 0, STREAM>>>(kv, msaMask, q, avg, L, N);
-  gaOutK<WARPS><<<grid, WARPS * 32, 0, STREAM>>>(gate, avg, PH(A + "/attention/output_w", blk), P(A + "/attention/output_b", blk),
-                                                 msa, L, N, ROWS);
+  gaOutK<WARPS><<<gridOut, WARPS * 32, 0, STREAM>>>(gate, avg, PH(A + "/attention/output_w", blk), P(A + "/attention/output_b", blk),
+                                                     msa, L, N, ROWS_OUT);
 }
 
 // The extra stack's row attention, its two projections fused the same way (C = 64, 8 heads of 8, unpadded):

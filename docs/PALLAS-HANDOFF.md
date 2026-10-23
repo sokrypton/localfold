@@ -199,7 +199,7 @@ Upstream PRs:
 | ColabFold + `colabfold-kernels` 0.8.0 (`~/.venv-colabfold-k08`) | 0.160 | 0.432 | 1.408 | 6.660 | 1.564 | 0.121 A |
 | **ColabFold + `colabfold-kernels` (`~/.venv-cfk-dev`, PRs #6 & #13)** | **0.088** | **0.324** | **1.160** | **5.616** | **1.172** | **0.122 A** |
 | LocalFold CUDA baseline (`973308d3`) | 0.065 - 0.089 | 0.316 | 1.145 | 5.590 | 1.103 | 0.000 A |
-| **LocalFold CUDA + single-seq `outLn256<..., VG=true>`** | **0.065** | **0.313** | **1.126** | **5.506** | **1.097** | **0.000 A** |
+| **LocalFold CUDA (`opus-55-opt`)** | **0.065** | **0.313** | **1.100** | **5.390** | **1.077** | **0.013 A** |
 
 ### What bought what
 
@@ -216,6 +216,14 @@ Upstream PRs:
    - Wired `fused_ops.global_attention` into `GlobalAttention` & `MSAColumnGlobalAttention` and fused `output_projection` + next-module `LayerNorm` across `MSARowAttentionWithPairBias -> MSAColumnAttention -> Transition` in `EvoformerIteration` (`modules.py`).
    - Fused `Transition` `transition1` bias + ReLU epilogue on large 256-channel MSA tensors (`act.shape[0] * act.shape[1] > 16_384`) via `jax.lax.cond` (`modules.py`): works around XLA `GemmFusion`'s refusal to fuse `broadcast(dynamic-slice(b1))` inside `hk.scan`, eliminating the standalone `loop_maximum_fusion` kernel over the `[S*L, 1024]` intermediate (`-20 ms` on `r261msa`, `1,192 -> 1,172 ms`).
    - Hoisted `InvariantPointAttention` 2D pair bias and inference-only `MultiRigidSidechain` out of the 8-layer `StructureModule` `hk.scan` (`folding.py`, `r68: 112 -> 88 ms`).
-3. **Pallas -> LocalFold CUDA transfer (`cuda/af2/src/outln.cuh`, `cuda/af2/src/evoformer.cuh`):**
-   - Added `VG=true` mode to `outLn256` (`outLn16K` / `outLnK`) for `rowsN == 1 && t.msaOnes` in `msaColumnAttention`, computing `v * sigm(g)` directly from `qkvg` in registers while staging `A` into shared memory and skipping `msaFlash<true>` (192 launches/fold saved; `r68: 89 -> 64.5 ms`, `r261: 316 -> 312.6 ms`, `r522: 1145 -> 1125.9 ms`, `r1044: 5579 -> 5505.5 ms`).
+3. **LocalFold CUDA optimizations (`cuda/af2/src/`, `cuda/af3/src/`):**
+   - Added `VG=true` mode to `outLn256` (`outLn16K` / `outLnK`) + 2-slot `(v, g)` weight slice (`attnVgWeight`) for `rowsN == 1 && t.msaOnes` in `msaColumnAttention`, computing `v * sigm(g)` directly from `qkvg` in registers while skipping `msaFlash<true>` (`r68: 89 -> 64.5 ms`, `r261: 316 -> 312.6 ms`, `r522: 1145 -> 1125.9 ms`, `r1044: 5579 -> 5505.5 ms`).
+   - Shallow `outerProductMean` (`rowsN <= OPM_SHALLOW`) in-place `bf16` hi+lo accumulation (`opmLeftToICSBf16K`, `opmPackTbfK` in `evoformer.cuh`): decomposes `fp16` `Lt` and `T` into exact 2-part `bf16` `(hi, lo)` pairs (`0 ULP` decomposition error) and accumulates directly into `t.pair` (`__nv_bfloat16`) via `ltGemm(..., beta = 1.0f, bf16 = true)` when `L * L * 512 > 36 MB` (`L >= 272`, exceeding A100's 40 MB L2), eliminating the `140 MB` (`r522`) / `558 MB` (`r1044`) `float32` `Yb` staging buffer and `addIntoPairK` launches (`r522: 1148.5 -> 1099.7 ms`, `-48.8 ms`; `r1044: 5582.5 -> 5390.1 ms`, `-192.4 ms`).
+   - Enabled `fusedTransitionK<64>` (`fusedtransition.cuh`) for 64-channel transitions (`extra_msa_stack` and `template_pair_stack`), replacing unfused `layerNormVK<64>` + 2x `ltGemm` (`32.15 ms -> 10.62 ms` across 4 folds on `r261msa`, **3.0x faster**) and improving template stack accuracy (`data-1brs-t fast` atom relRMS `7.06e-4 -> 4.77e-4`, `data-5caj-t fast` `3.05e-3 -> 2.11e-3`).
+   - Tuned `flashGrid2R<8>` (`minBlocks = 4` in `flash.cuh`) and `globalAttentionFused` (`ROWS = 64, ROWS_OUT = 32` in `globalattn.cuh`) (`r261msa: 1093.4 -> 1076.5 ms`).
+   - Integrated all 4 BindCraft2 CUDA optimizations from [`sokrypton/localfold#1`](https://github.com/sokrypton/localfold/pull/1) (`BC2_CUDA_NOTES.md`):
+     1. `flashGridHalf` (`flash.cuh`): unpadded XOR-swizzled shared memory (`fa2Ldk<D>()` / `fa2Kv<D>()`) + running-pointer `kvCur` / `bCur` tile advance (`5caj-template: 83.9 -> 78.4 ms`, `1brs-multimer-template: 208.1 -> 193.0 ms`).
+     2. Single-pass register-cached warp LayerNorm (`layerNormTK` in `fast.cuh`, `lnStatsK` in `structure.cuh`) and `layerNormVK<384>` dispatch in `layerNormH`.
+     3. Unrolled register-cached `C == 64` shared-memory transpose specialization in `centerNormHK` (`elementwise.cuh`).
+     4. Destination-contiguous indexing in `swapAddK` (`fast.cuh`) and `swapAddRowsK` (`evoformer.cuh`).
 

@@ -217,14 +217,47 @@ inline AttnW attnWeights(const std::string& A, int blk, int C, bool narrow = fal
   w.qkvg = qk; w.qkvgBias = gb; w.out = ow;
   return cache[{A, blk, narrow}] = w;
 }
+__global__ void __launch_bounds__(256, 8)
+sliceVgWeightK(const half* __restrict__ qkvg, half* __restrict__ vg, int C, int Wp2) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned w4 = (unsigned)(Wp2 >> 2);
+  if (t >= (size_t)C * w4) return;
+  unsigned u = (unsigned)t, c = u / w4, col4 = u - c * w4;
+  reinterpret_cast<uint2*>(vg)[t] = __ldg(reinterpret_cast<const uint2*>(qkvg) + (size_t)c * 2 * w4 + w4 + col4);
+}
+inline const half* attnVgWeight(const AttnW& w, int C) {
+  static std::map<const half*, half*> cache;
+  auto it = cache.find(w.qkvg);
+  if (it != cache.end()) return it->second;
+  int Wp2 = 2 * w.H * w.Dp;
+  half* vg = wpool<half>((size_t)C * Wp2);
+  sliceVgWeightK<<<blocks((size_t)C * (Wp2 >> 2)), 256, 0, STREAM>>>(w.qkvg, vg, C, Wp2);
+  biasFor(w.qkvgBias + Wp2, Wp2, true);
+  return cache[w.qkvg] = vg;
+}
 
 // ---------------------------------------------------------------- f16 elementwise
 template <class TO>
-__global__ void layerNormTK(const float* x, TO* y, size_t rows, int C, const float* scale, const float* offset) {
+__global__ void layerNormTK(const float* __restrict__ x, TO* __restrict__ y, size_t rows, int C,
+                            const float* __restrict__ scale, const float* __restrict__ offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* xr = x + row * C;
+  if (C <= 384) {
+    float xv[12], s = 0.f;
+    int k = 0;
+    for (int c = lane; c < C; c += 32, ++k) { float val = __ldg(xr + c); xv[k] = val; s += val; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / C, v = 0.f;
+    k = 0;
+    for (int c = lane; c < C; c += 32, ++k) { float d = xv[k] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    float inv = rsqrtf(v / C + 1e-5f);
+    k = 0;
+    for (int c = lane; c < C; c += 32, ++k) y[row * C + c] = (TO)((xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c));
+    return;
+  }
   float s = 0;
   for (int c = lane; c < C; c += 32) s += xr[c];
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
@@ -241,6 +274,7 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::s
   if (C == 64) layerNormVK<64><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 128) layerNormVK<128><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 384) layerNormVK<384><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else layerNormTK<half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 // LN(x) W + b in one kernel (the LN'd rows never written): R = 16 WARPS MT rows a block LayerNorm'd into shared
@@ -406,11 +440,11 @@ inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* l
   else at(std::integral_constant<int, 1>{});
 }
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
-__global__ void swapAddK(float* y, const float* x, int A, int B, int C) {     // y[b][a] += x[a][b]
+__global__ void swapAddK(float* __restrict__ y, const float* __restrict__ x, int A, int B, int C) {     // y[b][a] += x[a][b]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)A * B * C) return;
-  int c = (int)(t % C); size_t r = t / C; int b = (int)(r % B), a = (int)(r / B);
-  y[((size_t)b * A + a) * C + c] += x[t];
+  int c = (int)(t % C); size_t r = t / C; int a = (int)(r % A), b = (int)(r / A);
+  y[t] += __ldg(x + ((size_t)a * B + b) * C + c);
 }
 // o [rows, H*Dp] f16 from the flash kernel, a padded head's first D columns kept: the output projection
 // reads the padded layout directly (its weight has zero rows there), so nothing is copied

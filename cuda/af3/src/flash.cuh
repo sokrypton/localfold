@@ -201,8 +201,14 @@ __device__ __forceinline__ void ldsm4t(uint32_t* r, const void* p) {
 }
 
 constexpr int FA_BK = 64;
+template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 || D == 8 ? D : D + 8; }
+template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
+  if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
+  else if constexpr (D == 8) return r * 8 + c;
+  else return r * (D + 8) + c;
+}
 template <int D, int WARPS, int BK = FA_BK> __host__ __device__ constexpr size_t faStage() {
-  return (size_t)2 * BK * (D + 8) * 2 + (size_t)(16 * WARPS) * (BK + 8) * 2 + BK * 4;
+  return (size_t)2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * WARPS) * (BK + 8) * 2 + BK * 4;
 }
 
 // mask[r * n + j] (rows) or mask[j * n + r] (columns): the KEY's mask, the pair mask
@@ -241,7 +247,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     int qlo = 0, int qhi = 0, int biasRows = 0) {
   // [qlo, qhi): the queries this launch computes (qhi 0: all n) - several GPUs, each its own query rows; biasRows: the
   // rows a head's bias plane holds (0: n), its first being query qlo's
-  constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
+  constexpr int BQ = 16 * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * 32;
   static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
   constexpr size_t STAGE = faStage<D, WARPS, BK>();
   extern __shared__ __align__(16) unsigned char smem[];
@@ -272,42 +278,41 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
   const half* biasHead = bias + (size_t)h * (biasRows ? biasRows : n) * biasStride - (size_t)qlo * biasStride;
-  // per-thread source offsets, advanced by a constant each tile (the bounds matter only on the
+  // per-thread running pointers, advanced by a constant each tile (the bounds matter only on the
   // last tile, which the `last` flag takes through the checked path)
   constexpr int KV_PER = (KV_CHUNKS + NT - 1) / NT, B_PER = B_CHUNKS / NT;
-  using SrcOff = std::conditional_t<STRIDED, size_t, int>;
-  SrcOff kvBase[KV_PER]; int kvMeta[KV_PER];
+  const half* kvCur[KV_PER]; int kvMeta[KV_PER];
 #pragma unroll
   for (int k = 0; k < KV_PER; ++k) {
     int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
     int kj = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 0x7FFF;
-    kvMeta[k] = (jj * LDK + c) | (kj << 16);
-    kvBase[k] = (SrcOff)pos(jj) + Wd + c;
+    kvMeta[k] = fa2Kv<D>(jj, c) | (kj << 16);
+    kvCur[k] = base + pos(jj) + Wd + c;
   }
-  int bBase[B_PER], bMeta[B_PER];
+  const half* bCur[B_PER]; int bMeta[B_PER];
 #pragma unroll
   for (int k = 0; k < B_PER; ++k) {
     int u = k * NT + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
     bMeta[k] = (qi * LDB + c) | ((i < QN ? c : 0x7FFF) << 16);
-    bBase[k] = (i < QN ? i : qlo) * biasStride + c;
+    bCur[k] = biasHead + (size_t)(i < QN ? i : qlo) * biasStride + c;
   }
+  const size_t kvStep = pos(BK);
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     bool last = j0 + BK > n;
     if (!last) {
-      const half* kvp = base + pos(j0);
-      const half* bp = biasHead + j0;
 #pragma unroll
       for (int k = 0; k < KV_PER; ++k) {
         if (k + 1 < KV_PER || KV_CHUNKS % NT == 0 || (kvMeta[k] >> 16) < 0x7FFF) {
-          const half* src = kvp + kvBase[k];
-          cpAsync16(K + (kvMeta[k] & 0xFFFF), src, true);
-          cpAsync16(V + (kvMeta[k] & 0xFFFF), src + Wd, true);
+          cpAsync16(K + (kvMeta[k] & 0xFFFF), kvCur[k], true);
+          cpAsync16(V + (kvMeta[k] & 0xFFFF), kvCur[k] + Wd, true);
         }
+        kvCur[k] += kvStep;
       }
 #pragma unroll
       for (int k = 0; k < B_PER; ++k) {
-        cpAsync16(B + (bMeta[k] & 0xFFFF), bp + bBase[k], (bMeta[k] >> 16) < 0x7FFF);
+        cpAsync16(B + (bMeta[k] & 0xFFFF), bCur[k], (bMeta[k] >> 16) < 0x7FFF);
+        bCur[k] += BK;
       }
       if (MASKED && threadIdx.x < BK) {
         int j = j0 + threadIdx.x;
@@ -321,7 +326,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
       int kj = kvMeta[k] >> 16, koff = kvMeta[k] & 0xFFFF;
       if (kj >= 0x7FFF) continue;
       bool ok = j0 + kj < n;
-      const half* src = ok ? base + kvBase[k] + pos(j0) : base;
+      const half* src = ok ? kvCur[k] : base;
       cpAsync16(K + koff, src, ok);
       cpAsync16(V + koff, src + Wd, ok);
     }
@@ -329,7 +334,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     for (int k = 0; k < B_PER; ++k) {
       int bc = bMeta[k] >> 16, boff = bMeta[k] & 0xFFFF;
       bool ok = bc < 0x7FFF && j0 + bc < n;
-      cpAsync16(B + boff, ok ? biasHead + (size_t)bBase[k] + j0 : bias, ok);
+      cpAsync16(B + boff, ok ? bCur[k] : bias, ok);
     }
     if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
@@ -360,17 +365,19 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
       for (int k = 0; k < KV_PER; ++k) {
         int kj = kvMeta[k] >> 16;
-        if (kj >= 0x7FFF) continue;
+        if (kj >= 0x7FFF) { if (!last) kvCur[k] += kvStep; continue; }
         bool ok = !last || j0 + kj < n;
-        const half* src = base + kvBase[k] + (ok ? pos(j0) : 0);
+        const half* src = ok ? kvCur[k] : base;
         kr[k][0] = ok ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
         kr[k][1] = ok ? *reinterpret_cast<const uint4*>(src + Wd) : make_uint4(0, 0, 0, 0);
+        if (!last) kvCur[k] += kvStep;
       }
 #pragma unroll
       for (int k = 0; k < B_PER; ++k) {
         int bc = bMeta[k] >> 16;
         bool ok = bc < 0x7FFF && (!last || j0 + bc < n);
-        brg[k] = ok ? *reinterpret_cast<const uint4*>(biasHead + (size_t)bBase[k] + j0) : make_uint4(0, 0, 0, 0);
+        brg[k] = ok ? *reinterpret_cast<const uint4*>(bCur[k]) : make_uint4(0, 0, 0, 0);
+        if (!last) bCur[k] += BK;
       }
       if (MASKED && threadIdx.x < BK) {
         int j = j0 + threadIdx.x;
@@ -463,13 +470,13 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
                 if constexpr (D % 32 != 0) {
                   if (k2 * 2 + 1 >= D / 16) {
                     uint32_t kb[2];
-                    ldsm2(kb, K + ((nt + s) * 8 + (lane & 7)) * LDK + k2 * 32 + ((lane >> 3) & 1) * 8);
+                    ldsm2(kb, K + fa2Kv<D>((nt + s) * 8 + (lane & 7), k2 * 32 + ((lane >> 3) & 1) * 8));
                     mma16816h(sh[nt + s], qa[k2 * 2], kb[0], kb[1]);
                     continue;
                   }
                 }
                 uint32_t kb[4];
-                ldsm4(kb, K + ((nt + s) * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+                ldsm4(kb, K + fa2Kv<D>((nt + s) * 8 + (lane & 7), k2 * 32 + (lane >> 3) * 8));
                 mma16816h(sh[nt + s], qa[k2 * 2], kb[0], kb[1]);
                 if (k2 * 2 + 1 < D / 16) mma16816h(sh[nt + s], qa[k2 * 2 + 1], kb[2], kb[3]);
               }
@@ -484,7 +491,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
         t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
         // (the new maxima rounded to f16 values: the exponents subtract exactly these, and the rescale uses them)
         uint32_t vb[2][4];
-        ldsm4t(vb[0], V + (((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (lane >> 4) * 8);
+        ldsm4t(vb[0], V + fa2Kv<D>(((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
         float n0, n1;
         if (tile == 0) {
           n0 = __half2float(__float2half(t0)); n1 = __half2float(__float2half(t1));
@@ -506,8 +513,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
           for (int et = 0; et < D / 8; et += 2) {
             const int cur = (t * (D / 16) + (et >> 1)) & 1;
-            if (et + 2 < D / 8) ldsm4t(vb[cur ^ 1], V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + 2 + (lane >> 4)) * 8);
-            else if (t + 1 < BK / 16) ldsm4t(vb[cur ^ 1], V + ((t + 1) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (lane >> 4) * 8);
+            if (et + 2 < D / 8) ldsm4t(vb[cur ^ 1], V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + 2 + (lane >> 4)) * 8));
+            else if (t + 1 < BK / 16) ldsm4t(vb[cur ^ 1], V + fa2Kv<D>((t + 1) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
             mma16816(o[et], pa, vb[cur][0], vb[cur][1]);
             mma16816(o[et + 1], pa, vb[cur][2], vb[cur][3]);
           }
@@ -566,13 +573,13 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
                 if constexpr (D % 32 != 0) {
                   if (k2 * 2 + 1 >= D / 16) {
                     uint32_t kb[2];
-                    ldsm2(kb, K + ((nt + s) * 8 + (lane & 7)) * LDK + k2 * 32 + ((lane >> 3) & 1) * 8);
+                    ldsm2(kb, K + fa2Kv<D>((nt + s) * 8 + (lane & 7), k2 * 32 + ((lane >> 3) & 1) * 8));
                     mma16816(sv[nt + s], qa[k2 * 2], kb[0], kb[1]);
                     continue;
                   }
                 }
                 uint32_t kb[4];
-                ldsm4(kb, K + ((nt + s) * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+                ldsm4(kb, K + fa2Kv<D>((nt + s) * 8 + (lane & 7), k2 * 32 + (lane >> 3) * 8));
                 mma16816(sv[nt + s], qa[k2 * 2], kb[0], kb[1]);
                 if (k2 * 2 + 1 < D / 16) mma16816(sv[nt + s], qa[k2 * 2 + 1], kb[2], kb[3]);
               }
@@ -593,7 +600,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
         t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
         t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
         uint32_t vb[2][4];
-        ldsm4t(vb[0], V + (((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (lane >> 4) * 8);
+        ldsm4t(vb[0], V + fa2Kv<D>(((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
         float n0, n1;
         if (tile == 0) {
           n0 = t0; n1 = t1;
@@ -618,8 +625,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
           for (int et = 0; et < D / 8; et += 2) {
             const int cur = (t * (D / 16) + (et >> 1)) & 1;
-            if (et + 2 < D / 8) ldsm4t(vb[cur ^ 1], V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + 2 + (lane >> 4)) * 8);
-            else if (t + 1 < BK / 16) ldsm4t(vb[cur ^ 1], V + ((t + 1) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (lane >> 4) * 8);
+            if (et + 2 < D / 8) ldsm4t(vb[cur ^ 1], V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + 2 + (lane >> 4)) * 8));
+            else if (t + 1 < BK / 16) ldsm4t(vb[cur ^ 1], V + fa2Kv<D>((t + 1) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
             mma16816(o[et], pa, vb[cur][0], vb[cur][1]);
             mma16816(o[et + 1], pa, vb[cur][2], vb[cur][3]);
           }
@@ -1057,12 +1064,6 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // 1,044 tokens, 0.204 -> 0.191 at 300, bit-identical. Otherwise D + 8 as before. (The same swizzle on the
 // bias tile - 128-byte rows, chunk ^ row & 7 - was measured 3.6% slower: wider rows, more address math.)
 // At D 8 (AF2's extra stack) a row is one 16-byte chunk, unpadded: eight rows are 128 contiguous bytes, conflict-free
-template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 || D == 8 ? D : D + 8; }
-template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
-  if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
-  else if constexpr (D == 8) return r * 8 + c;
-  else return r * (D + 8) + c;
-}
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
   return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
@@ -1075,7 +1076,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // (an FP8 part runs flash8 below instead, through the pair track: e4m3 MMAs, half of these)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
-__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && WARPS * MT <= 4 && BK <= 48 && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D == 8 && BK <= 64) ? 4 : (!ONE && WARPS * RR == 4 && WARPS * MT <= 4 && BK <= 48 && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, OT* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
