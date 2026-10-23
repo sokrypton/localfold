@@ -439,7 +439,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         if constexpr (TM == 64 && TN == 128) {
           const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
           const bool fullM = i0 + TN <= g.m;
-          const int jLim = min(g.n, g.tgPairs);
+          const int jLim = min(g.n, (int)g.tgPairs);
           const ushort4 bs(0, 4, 32, 36);
           _Pragma("clang loop unroll(full)")
           for (int r_idx = 0; r_idx < 4; ++r_idx) {
@@ -485,7 +485,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
         if constexpr (TM == 64 && TN == 128) {
           const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
-          const int jLim = min(g.n, g.tgPairs);
+          const int jLim = min(g.n, (int)g.tgPairs);
           uint bs_col[4], col_off[4];
           float4 bv[4];
           _Pragma("clang loop unroll(full)")

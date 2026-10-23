@@ -420,7 +420,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     }
     if constexpr ((EP & 16) == 0 && metal::is_same_v<TC, float>) {
       if ((g.epilogue & 16384) && i0 + TC_ <= g.m) {
-        const int jLim = min(g.n, g.tgPairs);
+        const int jLim = min(g.n, (int)g.tgPairs);
         _Pragma("clang loop unroll(full)")
         for (int a = 0; a < FR; ++a) {
           const int j = j0 + sr + a * 8;
@@ -462,7 +462,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       if ((g.epilogue & 524288) && (g.tgC & 7) == 0 && i0 + TC_ <= g.m) {
         const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
-        const int jLim = min(g.n, g.tgPairs);
+        const int jLim = min(g.n, (int)g.tgPairs);
         uint bs_col[FC], col_off[FC];
         float2 bv[FC];
         _Pragma("clang loop unroll(full)")
