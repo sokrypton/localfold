@@ -92,7 +92,9 @@ struct GatedResidualArgs { DP(float) act; CP(float) y; CP(half) yh; CP(float) ga
 struct MulHArgs { DP(half) x; CP(half) y; u64 n; };
 // act[q] = qStart[q] + qMask[q] (positions gathered to q) W, W [3][C]
 struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(float) atomMask; CP(int) idx; CP(float) gmask; CP(float) Wp;
-                          CP(float) qMask; DP(float) act; u64 rows, q1, atoms; uint C; float posScale; };
+                          CP(float) qMask; DP(float) act; u64 rows, q1, atoms; uint C; float posScale;
+                          CP(float) qScale; CP(float) qShift; DP(half) xq; CP(float) kScale; CP(float) kShift; DP(half) xk;
+                          float eps; uint chained; };
 // per token: the mean over its real atoms of relu(projected), gathered back to the token's atoms
 struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(float) atomMask; CP(float) tokenBias; DP(float) out;
                        u64 rows, q1; uint tokens, dense, Cp, pad; };
@@ -119,7 +121,9 @@ struct GatedResStridedArgs { DP(float) act; CP(float) y; CP(float) gate; u64 row
 struct AddBroadcastArgs { DP(float) x; CP(float) v; u64 n, total; };            // x[t] += v[t % n]
 // the decoder's start: act[q] = (the query's token's projection + skip[q]) qMask
 struct BroadcastSkipArgs { CP(float) proj; CP(int) idx; CP(float) gmask; CP(float) skip; CP(float) qMask; DP(float) act; u64 rows, q1;
-                           uint C, tokens, dense, pad; };
+                           uint C, tokens, dense, pad;
+                           CP(float) qScale; CP(float) qShift; DP(half) xq; CP(float) kScale; CP(float) kShift; DP(half) xk;
+                           float eps; uint chained; };
 // upd[row] = LN(act[row] qMask) W, W [C][3]
 struct MaskLnProject3Args { CP(float) act; CP(float) qMask; CP(float) scale; CP(float) offset; CP(float) Wp; DP(float) upd;
                             CP(float) resY; CP(float) resGate; u64 rows, q1; uint C, pad; };

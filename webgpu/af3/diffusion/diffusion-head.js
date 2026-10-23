@@ -332,9 +332,12 @@ export class Af3DiffusionHeadGpu {
     this.#conditioner = undefined;
     this.#encoder?.allocator.destroyPooled();
     this.#encoder = undefined;
+    this.#decoder?.allocator.destroyPooled();
     this.#decoder = undefined;
     this.#projections?.destroyPooled();
     this.#projections = undefined;
+    this.#normaliseOnlyBindGroup = undefined;
+    this.#normaliseProjectBindGroup = undefined;
     this.#releaseChain();
   }
 
@@ -463,6 +466,8 @@ export class Af3DiffusionHeadGpu {
   }
 
   #transformerWeightsFor;
+  #normaliseOnlyBindGroup;
+  #normaliseProjectBindGroup;
 
   constructor(device, options = {}) {
     this.device = device;
@@ -492,16 +497,24 @@ export class Af3DiffusionHeadGpu {
       NORMALISE_ONLY(rows, channels, lanes));
     const scaleBuffer = residentWeightBuffer(this.device, scale, "cond.output-norm",
                                              () => scale);
+    let bg = this.#normaliseOnlyBindGroup;
+    if (bg?.pipeline !== pipeline || bg.input !== input || bg.scale !== scaleBuffer || bg.into !== into) {
+      bg = {
+        pipeline, input, scale: scaleBuffer, into,
+        bindGroup: this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [input, scaleBuffer, into].map((buffer, binding) => ({
+            binding, resource: { buffer },
+          })),
+        }),
+      };
+      this.#normaliseOnlyBindGroup = bg;
+    }
     validation.begin();
     const encoder = this.device.createCommandEncoder({ label: "af3-output-norm" });
     const pass = encoder.beginComputePass({ label: "output-norm" });
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [input, scaleBuffer, into].map((buffer, binding) => ({
-        binding, resource: { buffer },
-      })),
-    }));
+    pass.setBindGroup(0, bg.bindGroup);
     pass.dispatchWorkgroups(rows);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
@@ -581,13 +594,24 @@ export class Af3DiffusionHeadGpu {
       const encoder = this.device.createCommandEncoder({ label: "af3-normalise-project" });
       const pass = encoder.beginComputePass({ label: "normalise-project" });
       pass.setPipeline(pipeline);
-      pass.setBindGroup(0, this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [inputBuffer, scaleBuffer, weightBuffer, output,
-                  ...(hasAddend ? [{ buffer: addend }] : [])].map((a, binding) => ({
-          binding, resource: { buffer: a.buffer },
-        })),
-      }));
+      let bg = this.#normaliseProjectBindGroup;
+      if (bg?.pipeline !== pipeline || bg.inBuf !== inputBuffer.buffer
+          || bg.scBuf !== scaleBuffer.buffer || bg.wBuf !== weightBuffer.buffer
+          || bg.outBuf !== output.buffer || bg.addBuf !== addend) {
+        bg = {
+          pipeline, inBuf: inputBuffer.buffer, scBuf: scaleBuffer.buffer,
+          wBuf: weightBuffer.buffer, outBuf: output.buffer, addBuf: addend,
+          bindGroup: this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [inputBuffer, scaleBuffer, weightBuffer, output,
+                      ...(hasAddend ? [{ buffer: addend }] : [])].map((a, binding) => ({
+              binding, resource: { buffer: a.buffer },
+            })),
+          }),
+        };
+        this.#normaliseProjectBindGroup = bg;
+      }
+      pass.setBindGroup(0, bg.bindGroup);
       pass.dispatchWorkgroups(rows);
       pass.end();
       if (into === undefined) {
@@ -665,6 +689,12 @@ export class Af3DiffusionHeadGpu {
     // Pooled, because every stage returns while its work is in flight and a non-pooling release()
     // destroys a buffer the queue may still read; the pools are dropped at the end of the call.
     const conditioner = (this.#conditioner ??= new Af3DiffusionConditioningGpu(this.device, { pool: true }));
+    if (cachedPair === undefined) {
+      // A new trunk means a new fold: drop the encoder's device-side cache too,
+      // or the next call reuses the previous molecule's conditioning.
+      this.#encoderStatic = undefined;
+      this.#releasePersistent();
+    }
     // The pair conditioning's home on the device, on a fold's first call -
     // unless the caller supplied its own (OpenDDE), which stays a host array.
     let pairOutput;
@@ -688,15 +718,10 @@ export class Af3DiffusionHeadGpu {
         features: input.features, dialect: input.dialect,
       }, weights.conditioning, {
         reusePair: cachedPair,
+        staticCache: this.#encoderBuffers,
         outputs: { single: chain.condSingle, ...(pairOutput !== undefined ? { pair: pairOutput } : {}) },
         validation: deferred,
       }));
-    if (cachedPair === undefined) {
-      // A new trunk means a new fold: drop the encoder's device-side cache too,
-      // or the next call reuses the previous molecule's conditioning.
-      this.#encoderStatic = undefined;
-      this.#releasePersistent();
-    }
     // Keyed on the host array, or on the trunk's device buffer when a pair too
     // large for the host never got one (see HOST_PAIR_MAX_BYTES in fold.js).
     this.#conditioningPair = { trunkPair: input.trunkPair ?? input.trunkPairBuffer,
@@ -773,26 +798,26 @@ export class Af3DiffusionHeadGpu {
     await stage("output-norm", () => this.#normaliseOnly(transformed.outputBuffer,
       chain.normalised, tokens, weights.perTokenChannels, headNorms(weights).output, deferred));
 
-    const atomDecoder = (this.#decoder ??= new Af3AtomDecoderGpu(this.device));
+    const atomDecoder = (this.#decoder ??= new Af3AtomDecoderGpu(this.device, { pool: true }));
     const decoded = await stage("atom-decoder", () =>
       atomDecoder.run(undefined, encoded, input, weights.decoder,
         { staticCache: this.#decoderBuffers,
-          deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised } }));
+          deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised },
+          validation: deferred }));
     // 🔴 SETTLED HERE AND NOWHERE EARLIER. The decoder's readback is the one
     // boundary a denoiser step already synchronises at, so every scope the
     // chain opened is read for free; opening and awaiting them per stage is
     // exactly the round trip this chain exists to remove.
     await deferred.settle();
-    // 🔴 AND THE POOLS ARE DROPPED AT THE END OF EVERY STEP. They exist so
-    // that a stage can return while its work is still in flight - a
-    // non-pooling release() DESTROYS, and destroying a buffer the queue is
-    // still reading is the error this whole chain would otherwise walk into.
-    // What they must not do is carry every stage's working set into the next
-    // step. By this line the decoder's readback and the settle above have both
-    // drained the queue, so there is nothing in flight and nothing to protect.
-    this.#conditioner?.allocator.destroyPooled();
-    this.#encoder?.allocator.destroyPooled();
-    this.#projections?.destroyPooled();
+    if (cachedPair === undefined) {
+      // Step 0's pair conditioning allocated one-off pair scratch (cond.trunk-pair,
+      // cond.features); drop it now that step 0 has drained. Subsequent steps
+      // allocate identical per-step buffers and reuse the pool until dispose().
+      this.#conditioner?.allocator.destroyPooled();
+      this.#encoder?.allocator.destroyPooled();
+      this.#decoder?.allocator.destroyPooled();
+      this.#projections?.destroyPooled();
+    }
 
     // 🔴 A BLEND, NOT A PREDICTION.
     const output = new Float32Array(input.positionsNoisy.length);

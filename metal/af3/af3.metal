@@ -612,6 +612,23 @@ kernel void af3_ada_ln_768(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
   device const float4* sc4 = (device const float4*)(a.scale + pr);
+  if (!a.resY && !a.resYh && a.shift && a.out && rawS) {
+    device const float4* sh4 = (device const float4*)(a.shift + pr);
+    device half4* out4 = (device half4*)(a.out + row * 768);
+    float4 xv[6]; float s = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) { float4 val = x4[lane + i * 32]; xv[i] = val; s += val.x + val.y + val.z + val.w; }
+    float mean = simd_sum(s) / 768.f, v = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) { float4 d = xv[i] - mean; v += dot(d, d); }
+    float inv = rsqrt(simd_sum(v) / 768.f + a.eps);
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) {
+      uint idx = lane + i * 32;
+      out4[idx] = half4(sc4[idx] * ((xv[i] - mean) * inv) + sh4[idx]);
+    }
+    return;
+  }
   device const float4* sh4 = a.shift ? (device const float4*)(a.shift + pr) : nullptr;
   device half4* out4 = a.out ? (device half4*)(a.out + row * 768) : nullptr;
   float4 xv[6]; float s = 0.f;
@@ -784,6 +801,46 @@ kernel void af3_mul_h(LF_ARGS(MulHArgs)) {
 }
 kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
   ulong t = LF_INDEX;
+  if (a.C == 128) {
+    if (t >= a.rows * 32) return;
+    uint u = (uint)t, q = u >> 5, c4 = u & 31;
+    uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
+    float4 v = float4(0.f);
+    if (a.gmask[gq] != 0.f) {
+      uint at = (uint)a.idx[gq];
+      device const float* p = a.pos + ((ulong)at + k * a.atoms) * 3;
+      float s = a.atomMask ? a.atomMask[at] * a.posScale : a.posScale;
+      float p0 = p[0] * s, p1 = p[1] * s, p2 = p[2] * s;
+      device const float4* Wp4 = (device const float4*)a.Wp;
+      float4 w0 = Wp4[c4], w1 = Wp4[32 + c4], w2 = Wp4[64 + c4];
+      v = float4(((p0 * w0.x) + p1 * w1.x) + p2 * w2.x,
+                 ((p0 * w0.y) + p1 * w1.y) + p2 * w2.y,
+                 ((p0 * w0.z) + p1 * w1.z) + p2 * w2.z,
+                 ((p0 * w0.w) + p1 * w1.w) + p2 * w2.w);
+    }
+    float4 xv = ((device const float4*)a.qStart)[(ulong)gq * 32 + c4] + v * a.qMask[gq];
+    ((device float4*)a.act)[t] = xv;
+    if (a.xq) {
+      float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) / 128.f;
+      float4 d = xv - mean;
+      float inv = rsqrt(simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w) / 128.f + a.eps);
+      float4 nrm = d * inv;
+      ulong pr = (ulong)gq * 128;
+      float4 y = ((device const float4*)(a.qScale + pr))[c4] * nrm + ((device const float4*)(a.qShift + pr))[c4];
+      ((device half4*)a.xq)[t] = half4(y);
+      float4 ksv = ((device const float4*)(a.kScale + pr))[c4];
+      float4 ksh = ((device const float4*)(a.kShift + pr))[c4];
+      if (!a.chained) {
+        ((device half4*)a.xk)[t] = half4(ksv * nrm + ksh);
+      } else {
+        float meank = simd_sum(y.x + y.y + y.z + y.w) / 128.f;
+        float4 dk = y - meank;
+        float invk = rsqrt(simd_sum(dk.x * dk.x + dk.y * dk.y + dk.z * dk.z + dk.w * dk.w) / 128.f + a.eps);
+        ((device half4*)a.xk)[t] = half4(ksv * (dk * invk) + ksh);
+      }
+    }
+    return;
+  }
   if ((a.C & 3) == 0) {
     uint C4 = a.C >> 2;
     if (t >= a.rows * C4) return;
@@ -1010,6 +1067,34 @@ kernel void af3_add_broadcast(LF_ARGS(AddBroadcastArgs)) {
 }
 kernel void af3_broadcast_skip(LF_ARGS(BroadcastSkipArgs)) {
   ulong t = LF_INDEX;
+  if (a.C == 128) {
+    if (t >= a.rows * 32) return;
+    uint u = (uint)t, q = u >> 5, c4 = u & 31;
+    uint q1 = (uint)a.q1, k = lf_udiv(q, q1), gq = q - k * q1;
+    float4 v = a.gmask[gq] != 0.f ? ((device const float4*)a.proj)[((ulong)lf_udiv((uint)a.idx[gq], a.dense) + k * a.tokens) * 32 + c4] : float4(0.f);
+    float4 xv = (v + ((device const float4*)a.skip)[t]) * a.qMask[gq];
+    ((device float4*)a.act)[t] = xv;
+    if (a.xq) {
+      float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) / 128.f;
+      float4 d = xv - mean;
+      float inv = rsqrt(simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w) / 128.f + a.eps);
+      float4 nrm = d * inv;
+      ulong pr = (ulong)gq * 128;
+      float4 y = ((device const float4*)(a.qScale + pr))[c4] * nrm + ((device const float4*)(a.qShift + pr))[c4];
+      ((device half4*)a.xq)[t] = half4(y);
+      float4 ksv = ((device const float4*)(a.kScale + pr))[c4];
+      float4 ksh = ((device const float4*)(a.kShift + pr))[c4];
+      if (!a.chained) {
+        ((device half4*)a.xk)[t] = half4(ksv * nrm + ksh);
+      } else {
+        float meank = simd_sum(y.x + y.y + y.z + y.w) / 128.f;
+        float4 dk = y - meank;
+        float invk = rsqrt(simd_sum(dk.x * dk.x + dk.y * dk.y + dk.z * dk.z + dk.w * dk.w) / 128.f + a.eps);
+        ((device half4*)a.xk)[t] = half4(ksv * (dk * invk) + ksh);
+      }
+    }
+    return;
+  }
   if ((a.C & 3) == 0) {
     uint C4 = a.C >> 2;
     if (t >= a.rows * C4) return;

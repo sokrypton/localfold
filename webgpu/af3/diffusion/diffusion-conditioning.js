@@ -37,7 +37,10 @@
  */
 import { createAddShader } from "../../runtime/execution.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
 import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
+
+const STATIC_UPLOADS = new WeakMap();
 import { residentWeightBuffer } from "../../runtime/resident.js";
 import { deviceTuning, shapedKnob } from "../../runtime/device-profile.js";
 import { singleCondPadding, singleCondPaddingWgsl } from "../../../shared/af3/dialect.js";
@@ -833,6 +836,32 @@ export class Af3DiffusionConditioningGpu {
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
       const up = (label, data) => keep(this.allocator.upload(label, data, storage));
+      const staticCache = options.staticCache;
+      const uploaded = staticCache === undefined ? undefined
+        : (STATIC_UPLOADS.get(staticCache) ?? new Map());
+      if (staticCache !== undefined) STATIC_UPLOADS.set(staticCache, uploaded);
+      const persistentUpload = (label, data) => {
+        if (staticCache === undefined) return up(label, data);
+        const found = staticCache[label];
+        if (found !== undefined && uploaded.get(label) === data) return { buffer: found };
+        const size = Math.ceil(data.byteLength / 4) * 4;
+        let buffer = found;
+        if (buffer !== undefined && buffer.size !== size) {
+          buffer.destroy();
+          noteDestroy(this.device, buffer.size, label);
+          buffer = undefined;
+        }
+        if (buffer === undefined) {
+          noteAllocation(this.device, label, size);
+          buffer = this.device.createBuffer({
+            label, size, usage: storage | GPUBufferUsage.COPY_DST,
+          });
+          staticCache[label] = buffer;
+        }
+        this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
+        uploaded.set(label, data);
+        return { buffer };
+      };
       // 🔴 EVERY LINE GUARDED BY `onlyIfNew` IS PAIR-TRACK WORK A REUSED PAIR
       // MAKES POINTLESS - and `cond.trunk-pair` alone is tokens^2 x 128 floats
       // written across the bus, 1.8 MB at 59 tokens and 34 MB at 256, once per
@@ -844,8 +873,8 @@ export class Af3DiffusionConditioningGpu {
       // that had just been read back for the purpose.
       const trunkPair = onlyIfNew(() => (input.trunkPairBuffer !== undefined
         ? { buffer: input.trunkPairBuffer } : up("cond.trunk-pair", input.trunkPair)));
-      const trunkSingle = up("cond.trunk-single", input.trunkSingle);
-      const targetFeat = up("cond.target", input.targetFeat);
+      const trunkSingle = persistentUpload("cond.trunk-single", input.trunkSingle);
+      const targetFeat = persistentUpload("cond.target", input.targetFeat);
       const features = onlyIfNew(() => {
         const featureData = new Int32Array(5 * tokens);
         featureNames.forEach((name, index) => {

@@ -418,6 +418,104 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       }
       return;
     }
+    if constexpr ((EP & 16) == 0 && metal::is_same_v<TC, float>) {
+      if ((g.epilogue & 16384) && i0 + TC_ <= g.m) {
+        const int jLim = min(g.n, g.tgPairs);
+        _Pragma("clang loop unroll(full)")
+        for (int a = 0; a < FR; ++a) {
+          const int j = j0 + sr + a * 8;
+          if (j >= jLim) continue;
+          const uint jr = (uint)(j + sm);
+          const uint r = jr < (uint)g.tgN ? jr : jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
+          device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+          if (j + 8 <= jLim) {
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b) {
+              const int i = i0 + sc + b * 8;
+              thread auto& e = acc[a][b].thread_elements();
+              simdgroup_matrix<float, 8, 8> om, cm;
+              simdgroup_load(cm, C + (ulong)j * g.ldc + i, (ulong)g.ldc);
+              thread auto& o = om.thread_elements();
+              thread auto& c = cm.thread_elements();
+              const float2 gp = *(device const float2*)(gp0 + i + sn);
+              const float2 gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
+              o[0] = c[0] + g.alpha * (float)e[0] * gm.x;
+              o[1] = c[1] + g.alpha * (float)e[1] * gm.y;
+              simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+            }
+          } else if ((int)jr < jLim) {
+            device const float* cp0 = C + (ulong)jr * g.ldc;
+            device float* dp0 = D + (ulong)jr * g.ldd;
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b) {
+              const int i = i0 + sc + b * 8 + sn;
+              thread auto& e = acc[a][b].thread_elements();
+              const float2 gp = *(device const float2*)(gp0 + i);
+              const float2 gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
+              const float2 cv = *(device const float2*)(cp0 + i);
+              *(device float2*)(dp0 + i) = cv + g.alpha * float2((float)e[0], (float)e[1]) * gm;
+            }
+          }
+        }
+        return;
+      }
+      if ((g.epilogue & 524288) && (g.tgC & 7) == 0 && i0 + TC_ <= g.m) {
+        const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
+        const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+        const int jLim = min(g.n, g.tgPairs);
+        uint bs_col[FC], col_off[FC];
+        float2 bv[FC];
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          const uint i = (uint)(i0 + sc + b * 8);
+          const uint bsk = lf_udiv(i, W);
+          bs_col[b] = bsk;
+          col_off[b] = i - bsk * W;
+          if (g.epilogue & 4)
+            bv[b] = (g.biasType & 255) == 2 ? float2(*(device const half2*)((device const half*)g.bias + boff + i + sn))
+                                            : *(device const float2*)((device const float*)g.bias + boff + i + sn);
+          else bv[b] = float2(0.f);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int a = 0; a < FR; ++a) {
+          const int j = j0 + sr + a * 8;
+          if (j >= jLim) continue;
+          const uint k0 = lf_udiv((uint)j, N), r0 = (uint)j - k0 * N;
+          if (j + 8 <= jLim && r0 + 8 <= N) {
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b) {
+              thread auto& e = acc[a][b].thread_elements();
+              simdgroup_matrix<float, 8, 8> om;
+              thread auto& o = om.thread_elements();
+              const uint col0 = col_off[b];
+              _Pragma("clang loop unroll(full)")
+              for (int t = 0; t < 2; ++t) {
+                float v = g.alpha * (float)e[t];
+                if (g.epilogue & 4) v += bv[b][t];
+                if ((int)col0 + sn + t < g.tgNp) v = 1.f / (1.f + exp(-v));
+                o[t] = v;
+              }
+              simdgroup_store(om, D + (((ulong)k0 * BS + bs_col[b]) * N + r0) * W + col0, (ulong)W);
+            }
+          } else {
+            const int jr = j + sm;
+            if (jr >= jLim) continue;
+            const uint kr = lf_udiv((uint)jr, N), rr = (uint)jr - kr * N;
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b) {
+              thread auto& e = acc[a][b].thread_elements();
+              const uint col0 = col_off[b];
+              float2 v = g.alpha * float2((float)e[0], (float)e[1]);
+              if (g.epilogue & 4) v += bv[b];
+              if ((int)col0 + sn < g.tgNp) v.x = 1.f / (1.f + exp(-v.x));
+              if ((int)col0 + sn + 1 < g.tgNp) v.y = 1.f / (1.f + exp(-v.y));
+              *(device float2*)(D + (((ulong)kr * BS + bs_col[b]) * N + rr) * W + col0 + sn) = v;
+            }
+          }
+        }
+        return;
+      }
+    }
   }
   _Pragma("clang loop unroll(full)")
   for (int a = 0; a < FR; ++a) {

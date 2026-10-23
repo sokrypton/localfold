@@ -74,7 +74,7 @@ AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t
 
 // ---------------------------------------------------------------- one cross-attention block, in place on act
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
-                         const std::string& B, const float** pendY, const float** pendGate, bool deferFfwRes) {
+                         const std::string& B, const float** pendY, const float** pendGate, bool deferFfwRes, bool precomputedQk) {
   size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
   int Wd = heads * D;
   if (D > 32 || sh.keys > 128) die("atom attention: %d keys of a head %d wide", sh.keys, D);
@@ -83,15 +83,17 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   float* pre = nullptr;
   if (st.noResidual) { pre = scratch<float>("ab.pre", qRows * C); copy(pre, act, qRows * C * 4); }
   half* xq = scratch<half>("ab.xq", qRows * C); half* xk = scratch<half>("ab.xk", qRows * C);
-  if (C <= 768) {
-    adaLn(act, bc.qScale, bc.qShift, xq, nullptr, qRows, C, q1, 0, bc.kScale, bc.kShift, xk, bc.chained, py, pg, C);
-  } else if (bc.chained) {  // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first (OpenDDE, protenix2)
-    float* xqF = scratch<float>("ab.xqF", qRows * C);
-    adaLn(act, bc.qScale, bc.qShift, xq, xqF, qRows, C, q1);
-    adaLn(xqF, bc.kScale, bc.kShift, xk, nullptr, qRows, C, q1);
-  } else {
-    adaLn(act, bc.qScale, bc.qShift, xq, nullptr, qRows, C, q1);
-    adaLn(act, bc.kScale, bc.kShift, xk, nullptr, qRows, C, q1);
+  if (!precomputedQk) {
+    if (C <= 768) {
+      adaLn(act, bc.qScale, bc.qShift, xq, nullptr, qRows, C, q1, 0, bc.kScale, bc.kShift, xk, bc.chained, py, pg, C);
+    } else if (bc.chained) {  // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first (OpenDDE, protenix2)
+      float* xqF = scratch<float>("ab.xqF", qRows * C);
+      adaLn(act, bc.qScale, bc.qShift, xq, xqF, qRows, C, q1);
+      adaLn(xqF, bc.kScale, bc.kShift, xk, nullptr, qRows, C, q1);
+    } else {
+      adaLn(act, bc.qScale, bc.qShift, xq, nullptr, qRows, C, q1);
+      adaLn(act, bc.kScale, bc.kShift, xk, nullptr, qRows, C, q1);
+    }
   }
   half* qg = scratch<half>("ab.qg", qRows * 2 * Wd); half* kvAtom = scratch<half>("ab.kvAtom", qRows * 2 * Wd);
   linW(xq, concatColumns(B + ".qg", C, {{B + ".qProjection", Wd, false}, {B + ".gatingQuery", Wd, false}}), qg, qRows, C, 2 * Wd,
@@ -362,18 +364,26 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
     add(act, positional, qRows * C);
   } else if (atomPositions) {
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) die("encoder: the positions projection is not 3 x C");
+    const bool fuse0 = C == 128 && !maskPerBlock && !o.noResidual && !o.blocks.empty();
+    half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
+    half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
+    const AtomBlockCache* b0 = fuse0 ? &o.blocks[0] : nullptr;
     run1d("af3_encoder_start", (C & 3) ? qRows * C : qRows * (C >> 2),
           EncoderStartArgs{o.qStart, atomPositions, atomMask, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
-                           o.qMask, act, qRows, q1, atoms, (uint)C, posScale});
+                           o.qMask, act, qRows, q1, atoms, (uint)C, posScale,
+                           b0 ? b0->qScale : nullptr, b0 ? b0->qShift : nullptr, xq0,
+                           b0 ? b0->kScale : nullptr, b0 ? b0->kShift : nullptr, xk0,
+                           ADA_RAW ? 0.1f : 1e-5f, b0 && b0->chained ? 1u : 0u});
   } else {
     for (int k = 0; k < NS; ++k) copy(act + k * q1 * C, o.qStart, q1 * C * 4);
   }
   AtomStep st{gatherOf("batch.queriesToKeys"), o.qMask, o.kMask, o.keyMasked, o.noResidual};
   const float* pendY = nullptr; const float* pendGate = nullptr;
+  const bool fusedStart = atomPositions && !chiral && C == 128 && !maskPerBlock && !o.noResidual && !o.blocks.empty();
   for (size_t b = 0; b < o.blocks.size(); ++b) {
     if (maskPerBlock) scaleRows(act, o.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, o.blocks[b], sh, C, o.heads, o.D, E + ".blocks." + num(b),
-                        &pendY, &pendGate, !maskPerBlock);
+                        &pendY, &pendGate, !maskPerBlock, b == 0 && fusedStart);
   }
   half* actH = scratch<half>("enc.actH", qRows * C);
   scaleRows(act, o.qMask, qRows, C, q1, actH, pendY, pendGate);

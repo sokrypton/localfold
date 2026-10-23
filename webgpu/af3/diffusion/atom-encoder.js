@@ -742,7 +742,7 @@ export function createAtomBlockShaders(common, shape) {
     ?? (rowRule === undefined
       ? outputRowTileFor(queryRows, shape.workgroupTarget ?? 256)
       : (queryRows < rowRule.crossover ? rowRule.below : rowRule.atOrAbove));
-  const { channels, keys } = shape;
+  const { channels, keys, perTokenChannels } = shape;
   // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
   // OpenDDE. See the note at `attendFor`.
   const keyMasked = shape.keyMaskedAtomAttention === true;
@@ -1659,7 +1659,62 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // Project to the token width, gather back to token-atom layout, relu,
   // and average over each token's REAL atoms only.
-  const aggregate = `${common}
+  const aggregate = perTokenChannels % 64 === 0 && channels <= 256 ? (() => {
+    const groupsPerToken = perTokenChannels / 64;
+    return `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read> atom_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> weights: array<f32>;
+@group(0) @binding(5) var<storage, read_write> token_act: array<f32>;
+
+var<workgroup> staged_atom: array<f32, ${channels}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let group_idx = group.x + group.y * GRID_WIDTH;
+  let local = local_id.x;
+  let token = group_idx / ${groupsPerToken}u;
+  let col_group = group_idx % ${groupsPerToken}u;
+  let valid = token < TOKENS;
+  let valid_tok = min(token, TOKENS - 1u);
+  let c = col_group * 64u + local;
+
+  var count = 0.0;
+  var total = 0.0;
+  for (var atom = 0u; atom < DENSE; atom += 1u) {
+    let dense_slot = valid_tok * DENSE + atom;
+    let am = select(0.0, atom_mask[dense_slot], valid);
+    count += am;
+    let live = am != 0.0 && gathers[G_QTA_MASK + dense_slot] != 0;
+    var qm = 0.0;
+    if (live) {
+      let source = u32(max(gathers[G_QTA_IDX + dense_slot], 0));
+      qm = queries_mask[source];
+      let s_base = source * C;
+      for (var d = local; d < C; d += 64u) {
+        staged_atom[d] = act[s_base + d];
+      }
+    }
+    workgroupBarrier();
+    if (live) {
+      var value = 0.0;
+      for (var d = 0u; d < C; d += 1u) {
+        value += staged_atom[d] * qm
+          * weights[P_projectAtomFeaturesForAggr + d * C_TOKEN + c];
+      }
+      total += relu(value);
+    }
+    workgroupBarrier();
+  }
+  if (!valid) { return; }
+  var scaled = 0.0;
+  if (count > 0.0) { scaled = total / count; }
+  token_act[token * C_TOKEN + c] = scaled;
+}`;
+  })() : `${common}
 @group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> queries_mask: array<f32>;
 @group(0) @binding(2) var<storage, read> gathers: array<i32>;
@@ -2183,13 +2238,22 @@ export class Af3AtomEncoderGpu {
       const trunkSingleProjected = persistent("atom.trunk-single-p", tokens * channels * 4);
       const trunkPairProjected = persistent("atom.trunk-pair-p",
         tokens * tokens * pairChannels * 4);
+      const reuseStatic = options.reuseStatic;
+      // 🔴 AND `outputs` DECIDES WHETHER THE OTHER TWO EXIST. `tokenAct` and
+      // the skip connection are the encoder's only per-step results, and both
+      // are read by the next stage on the DEVICE - the transformer's input and
+      // the decoder's. A sampler was draining the pipeline once a step to copy
+      // them to the host and write them straight back.
+      const outputs = options.outputs;
       const queriesCond = persistent("atom.q-cond", queryRows * channels * 4,
         GPUBufferUsage.COPY_SRC);
       const queriesMask = persistent("atom.q-mask", queryRows * 4, GPUBufferUsage.COPY_SRC);
       const keysCond = persistent("atom.k-cond", keyRows * channels * 4,
         GPUBufferUsage.COPY_SRC);
       const keysMask = persistent("atom.k-mask", keyRows * 4, GPUBufferUsage.COPY_SRC);
-      const act = alloc("atom.act", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
+      const act = outputs?.skipConnection !== undefined
+        ? { buffer: outputs.skipConnection }
+        : alloc("atom.act", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
       const pair = persistent("atom.pair", pairRows * pairChannels * 4,
         GPUBufferUsage.COPY_SRC);
       const logits = persistent("atom.logits", weights.blocks.length * subsets * heads
@@ -2216,18 +2280,9 @@ export class Af3AtomEncoderGpu {
       // `attend` writes `gathered` (identical byte size `queryRows * width * 4`)
       // afterwards and `output` consumes it before the next block's `project-keys`.
       const gathered = kAtoms;
-      const tokenAct = alloc("atom.token-act", tokens * perTokenChannels * 4,
-        GPUBufferUsage.COPY_SRC);
-
-      // 🔴 READ BEFORE THE READBACKS ARE SIZED, NOT AFTER THE PASSES ARE
-      // ENCODED: it decides which of them exist at all.
-      const reuseStatic = options.reuseStatic;
-      // 🔴 AND `outputs` DECIDES WHETHER THE OTHER TWO EXIST. `tokenAct` and
-      // the skip connection are the encoder's only per-step results, and both
-      // are read by the next stage on the DEVICE - the transformer's input and
-      // the decoder's. A sampler was draining the pipeline once a step to copy
-      // them to the host and write them straight back.
-      const outputs = options.outputs;
+      const tokenAct = outputs?.tokenAct !== undefined
+        ? { buffer: outputs.tokenAct }
+        : alloc("atom.token-act", tokens * perTokenChannels * 4, GPUBufferUsage.COPY_SRC);
       // The five static readbacks exist only when a host caller has no other
       // way to see them: not when the head still holds them, and not when it
       // is taking the device buffers directly.
@@ -2399,14 +2454,14 @@ export class Af3AtomEncoderGpu {
           aggregateGroups[0], aggregateGroups[1]);
       endPass();
 
-      encoder.copyBufferToBuffer(
-        tokenAct.buffer, 0,
-        outputs === undefined ? readbacks.tokenAct.buffer : outputs.tokenAct, 0,
-        tokens * perTokenChannels * 4);
-      encoder.copyBufferToBuffer(
-        act.buffer, 0,
-        outputs === undefined ? readbacks.skipConnection.buffer : outputs.skipConnection, 0,
-        queryRows * channels * 4);
+      if (outputs === undefined) {
+        encoder.copyBufferToBuffer(
+          tokenAct.buffer, 0, readbacks.tokenAct.buffer, 0,
+          tokens * perTokenChannels * 4);
+        encoder.copyBufferToBuffer(
+          act.buffer, 0, readbacks.skipConnection.buffer, 0,
+          queryRows * channels * 4);
+      }
       // 🔴 FIVE OF THE SEVEN READBACKS ARE THE SAME EVERY CALL. pairCond,
       // queriesCond, keysCond and the two masks are built from the reference
       // conformers, the gathers and the trunk - not from the noisy positions

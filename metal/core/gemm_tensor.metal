@@ -271,6 +271,33 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         }
         return;
       }
+      if constexpr (TM == 32 && TN == 64) {
+        const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+        const bool fullM = i0 + TN <= g.m;
+        _Pragma("clang loop unroll(full)")
+        for (int r_idx = 0; r_idx < 2; ++r_idx) {
+          const uint16_t er = (uint16_t)(r_idx * 4);
+          const int j = j0 + c.get_multidimensional_index(er)[1];
+          if (j >= g.tgPairs) continue;
+          const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+          device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+          device const float* cp0 = C + (ulong)j * g.ldc;
+          device float* dp0 = D + (ulong)j * g.ldd;
+          _Pragma("clang loop unroll(full)")
+          for (int k = 0; k < 2; ++k) {
+            const int i = col0 + k * 32;
+            if (fullM || i < g.m) {
+              const uint16_t e = er + k * 8;
+              const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+              const float4 gp = *(device const float4*)(gp0 + i);
+              const float4 cv = *(device const float4*)(cp0 + i);
+              const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+              *(device float4*)(dp0 + i) = cv + v * gm;
+            }
+          }
+        }
+        return;
+      }
       _Pragma("clang loop unroll(full)")
       for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
         if (!c.is_valid_element(e)) continue;
@@ -409,6 +436,35 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         return;
       }
       if (g.epilogue & 16384) {   // the diffusion's gated residual: D = C + v sigmoid(aux[(j mod tgN) ldaux + i]), j < tgPairs
+        if constexpr (TM == 64 && TN == 128) {
+          const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+          const bool fullM = i0 + TN <= g.m;
+          const int jLim = min(g.n, g.tgPairs);
+          const ushort4 bs(0, 4, 32, 36);
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < 4; ++r_idx) {
+            const uint16_t er = bs[r_idx];
+            const int j = j0 + c.get_multidimensional_index(er)[1];
+            if (j >= jLim) continue;
+            const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+            device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+            device const float* cp0 = C + (ulong)j * g.ldc;
+            device float* dp0 = D + (ulong)j * g.ldd;
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              if (fullM || i < g.m) {
+                const uint16_t e = er + k * 8;
+                const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                const float4 gp = *(device const float4*)(gp0 + i);
+                const float4 cv = *(device const float4*)(cp0 + i);
+                const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+                *(device float4*)(dp0 + i) = cv + v * gm;
+              }
+            }
+          }
+          return;
+        }
         _Pragma("clang loop unroll(full)")
         for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
           if (!c.is_valid_element(e)) continue;
@@ -427,6 +483,46 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if (g.epilogue & 524288) {  // conditioning permuted store: [k * n + r][bs * W + col] -> [(k * BS + bs) * n + r][col]
         const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+        if constexpr (TM == 64 && TN == 128) {
+          const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+          const int jLim = min(g.n, g.tgPairs);
+          uint bs_col[4], col_off[4];
+          float4 bv[4];
+          _Pragma("clang loop unroll(full)")
+          for (int k = 0; k < 4; ++k) {
+            const int i = col0 + k * 32;
+            if (i < g.m) {
+              const uint bsk = lf_udiv((uint)i, W);
+              bs_col[k] = bsk;
+              col_off[k] = (uint)i - bsk * W;
+              if (g.epilogue & 4)
+                bv[k] = (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + boff + i))
+                                                : *(device const float4*)((device const float*)g.bias + boff + i);
+              else bv[k] = float4(0.f);
+            }
+          }
+          const ushort4 rbs(0, 4, 32, 36);
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < 4; ++r_idx) {
+            const uint16_t er = rbs[r_idx];
+            const int j = j0 + c.get_multidimensional_index(er)[1];
+            if (j >= jLim) continue;
+            const uint kr = lf_udiv((uint)j, N), rr = (uint)j - kr * N;
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              if (i < g.m) {
+                const uint16_t e = er + k * 8;
+                float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                if (g.epilogue & 4) v += bv[k];
+                const uint col = col_off[k];
+                if ((int)col < g.tgNp) v = fast::divide(1.f, 1.f + fast::exp(-v));
+                *(device float4*)(D + (((ulong)kr * BS + bs_col[k]) * N + rr) * W + col) = v;
+              }
+            }
+          }
+          return;
+        }
         _Pragma("clang loop unroll(full)")
         for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
           if (!c.is_valid_element(e)) continue;

@@ -341,7 +341,9 @@ static void transformer(float* act, const float* cond, float level) {
   float* proj = scratch<float>("dt.proj", prows * C);
   static const void* zeroed = nullptr; static size_t zeroedRows = 0;
   if (prows != rows && (zeroed != x || zeroedRows != prows)) {
-    fill(x, 0, prows * C * 2); fill(o, 0, prows * Wd * 2); fill(tn, 0, prows * C * 2);
+    fill(x + rows * C, 0, (prows - rows) * C * 2);
+    fill(o + rows * Wd, 0, (prows - rows) * Wd * 2);
+    fill(tn + rows * C, 0, (prows - rows) * C * 2);
     zeroed = x; zeroedRows = prows;
   }
   const float* pendY = nullptr; const float* pendGate = nullptr;
@@ -431,17 +433,24 @@ static float* atomDecoder(const half* tokenAct) {
   float* proj = scratch<float>("dec.proj", prows * C);
   lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, prows, D.decPerToken, C);
   float* act = scratch<float>("dec.act", qRows * C);
-  run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),
-        BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
-                          (uint)sh.tokens, (uint)sh.dense, 0});
   AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
               flag(Dd + ".blocks.0.diffusionNoResidual")};
   bool maskPerBlock = flag(Dd + ".blocks.0.maskAtomActPerBlock");
+  const bool fuse0 = C == 128 && !maskPerBlock && !st.noResidual && !D.decBlocks.empty();
+  half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
+  half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
+  const AtomBlockCache* b0 = fuse0 ? &D.decBlocks[0] : nullptr;
+  run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),
+        BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
+                          (uint)sh.tokens, (uint)sh.dense, 0,
+                          b0 ? b0->qScale : nullptr, b0 ? b0->qShift : nullptr, xq0,
+                          b0 ? b0->kScale : nullptr, b0 ? b0->kShift : nullptr, xk0,
+                          ADA_RAW ? 0.1f : 1e-5f, b0 && b0->chained ? 1u : 0u});
   const float* pendY = nullptr; const float* pendGate = nullptr;
   for (size_t b = 0; b < D.decBlocks.size(); ++b) {
     if (maskPerBlock) scaleRows(act, D.enc.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, D.decBlocks[b], sh, C, D.decHeads, D.decD, Dd + ".blocks." + num(b),
-                        &pendY, &pendGate, !maskPerBlock);
+                        &pendY, &pendGate, !maskPerBlock, b == 0 && fuse0);
   }
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) die("decoder: the position update is not C x 3");
   float* upd = scratch<float>("dec.upd", qRows * 3);
@@ -492,7 +501,11 @@ static float* denoise(const float* x, float level, float* eulerX = nullptr, floa
     single = singleConditioning(level);
     size_t pn = ((size_t)n + 15) / 16 * 16;
     half* sn = scratch<half>("dn.sn", pn * Cs);
-    if (pn > (size_t)n) fill(sn + (size_t)n * Cs, 0, (pn - n) * Cs * sizeof(half));
+    static const half* zeroedSn = nullptr; static size_t zeroedSnRows = 0;
+    if (pn > (size_t)n && (sn != zeroedSn || pn != zeroedSnRows)) {
+      fill(sn + (size_t)n * Cs, 0, (pn - n) * Cs * sizeof(half));
+      zeroedSn = sn; zeroedSnRows = pn;
+    }
     if (hasW("diffusion.singleCondEmbeddingNormScale"))
       ln(single, sn, n, Cs, "diffusion.singleCondEmbeddingNormScale", "diffusion.singleCondEmbeddingNormOffset");
     else toHalf(single, sn, (size_t)n * Cs);

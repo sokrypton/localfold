@@ -160,7 +160,8 @@ struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMask
 // chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space
 void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
-                         const std::string& B, const float** pendY = nullptr, const float** pendGate = nullptr, bool deferFfwRes = false);
+                         const std::string& B, const float** pendY = nullptr, const float** pendGate = nullptr, bool deferFfwRes = false,
+                         bool precomputedQk = false);
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
            int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,

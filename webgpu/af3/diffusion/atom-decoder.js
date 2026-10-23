@@ -61,7 +61,7 @@ export function packDecoderPairWeights(weights) {
 }
 
 export function createAtomDecoderShaders(shape, pairOffsets, blockOffsets) {
-  const { channels } = shape;
+  const { channels, perTokenChannels } = shape;
   const common = createAtomCommon(shape, pairOffsets, blockOffsets);
 
   // The decoder's own head biases, from the encoder's pair representation.
@@ -113,7 +113,47 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // The starting activation: token features broadcast to atoms, gathered into
   // queries layout, plus the encoder's skip connection, then masked.
-  const start = `${common}
+  const start = channels <= 256 && channels % 64 === 0 ? `${common}
+@group(0) @binding(0) var<storage, read> token_act: array<f32>;
+@group(0) @binding(1) var<storage, read> skip: array<f32>;
+@group(0) @binding(2) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(3) var<storage, read> gathers: array<i32>;
+@group(0) @binding(4) var<storage, read> weights: array<f32>;
+@group(0) @binding(5) var<storage, read_write> act: array<f32>;
+
+var<workgroup> staged_tok: array<f32, ${perTokenChannels}>;
+
+@compute @workgroup_size(${channels})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  let c = local_id.x;
+  let valid = row < QUERY_ROWS;
+  var live = false;
+  var token = 0u;
+  if (valid) {
+    live = gathers[G_TA_MASK + row] != 0;
+    let slot = u32(max(gathers[G_TA_IDX + row], 0));
+    token = slot / DENSE;
+  }
+  if (live) {
+    let tBase = token * C_TOKEN;
+    for (var d = c; d < C_TOKEN; d += C) {
+      staged_tok[d] = token_act[tBase + d];
+    }
+  }
+  workgroupBarrier();
+  if (!valid) { return; }
+
+  var value = 0.0;
+  if (live) {
+    for (var d = 0u; d < C_TOKEN; d += 1u) {
+      value += staged_tok[d]
+        * weights[P_projectTokenFeaturesForBroadcast + d * C + c];
+    }
+  }
+  act[row * C + c] = (value + skip[row * C + c]) * queries_mask[row];
+}` : `${common}
 @group(0) @binding(0) var<storage, read> token_act: array<f32>;
 @group(0) @binding(1) var<storage, read> skip: array<f32>;
 @group(0) @binding(2) var<storage, read> queries_mask: array<f32>;
@@ -230,9 +270,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 export class Af3AtomDecoderGpu {
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device);
+    this.allocator = new GpuBufferAllocator(device, Boolean(options.pool));
     this.pipelines = pipelineCacheForDevice(device);
   }
 
@@ -484,7 +524,9 @@ export class Af3AtomDecoderGpu {
       const readback = keep(this.allocator.allocate("dec.rb", tokens * dense * 3 * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
-      this.device.pushErrorScope("validation");
+      const deferred = options.validation;
+      if (deferred === undefined) this.device.pushErrorScope("validation");
+      else deferred.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-atom-decoder" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
@@ -515,10 +557,11 @@ export class Af3AtomDecoderGpu {
         const pr = lin(pairRows);
         run("pair-logits", compiled.pairLogits, [pairCond, pairWeights, logits], pr[0], pr[1]);
       }
-      // ...and the grid follows: one invocation per (row, channel).
       const qr = lin(queryRows * channels);
+      const startGroups = channels <= 256 && channels % 64 === 0 ? spread(queryRows) : qr;
       run("start", compiled.start,
-          [tokenActBuffer, skip, queriesMask, gatherBuffer, pairWeights, act], qr[0], qr[1]);
+          [tokenActBuffer, skip, queriesMask, gatherBuffer, pairWeights, act],
+          startGroups[0], startGroups[1]);
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
@@ -573,8 +616,12 @@ export class Af3AtomDecoderGpu {
 
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
-      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      if (deferred !== undefined) {
+        deferred.end("atom decoder");
+      } else {
+        const error = await this.device.popErrorScope();
+        if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      }
       await readback.buffer.mapAsync(GPUMapMode.READ);
       const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
       readback.buffer.unmap();
