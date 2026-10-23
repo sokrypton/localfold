@@ -297,7 +297,7 @@ int main() {
       // scaled saturating store, then the centre LayerNorm from it, against the norm of the exact product
     const float hs = halfProductScale();
     int n = 37, np = 40, K = 256; size_t plane = (size_t)np * np;
-    for (int C : {128, 256, 100}) {
+    for (int C : {128, 256, 384, 512, 100}) {
       auto A = randv((size_t)C * plane, 30.f), B = randv((size_t)C * plane, 30.f), sc = randv(C), of = randv(C);
       for (int c = 0; c < C; ++c) for (int i = n; i < np; ++i) for (int k = 0; k < np; ++k) A[(size_t)c * plane + (size_t)i * np + k] = B[(size_t)c * plane + (size_t)i * np + k] = 0;
       std::vector<double> prod((size_t)C * plane, 0), ref((size_t)n * n * C);

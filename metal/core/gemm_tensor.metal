@@ -93,32 +93,45 @@ inline void lf_emit_ln(thread CT& cg, thread CT& cv, device const TD* D, threadg
     inv[q] = rsqrt(t / TN + g.lnEps);
   }
   device half* out = (device half*)g.lnOut;
+  device half* out2 = (device half*)g.lnOut2;
   device const float* sc = (device const float*)g.lnScale; device const float* of = (device const float*)g.lnOffset;
+  device const float* sc2 = (device const float*)g.lnScale2; device const float* of2 = (device const float*)g.lnOffset2;
   constexpr int NC = TN == 64 ? 2 : 4;
-  float4 sc4[NC], of4[NC];
+  constexpr int CSTEP = TN == 256 ? 64 : 32;
+  const int col0 = cg.get_multidimensional_index((uint16_t)0)[0];
+  float4 sc4[NC], of4[NC], sc2_4[NC], of2_4[NC];
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < NC; ++k) {
-    const int col = cg.get_multidimensional_index((uint16_t)(k * 8))[0];
+    const int col = col0 + k * CSTEP;
     sc4[k] = sc ? *(device const float4*)(sc + col) : float4(1.f);
     of4[k] = of ? *(device const float4*)(of + col) : float4(0.f);
+    if (out2) {
+      sc2_4[k] = sc2 ? *(device const float4*)(sc2 + col) : float4(1.f);
+      of2_4[k] = of2 ? *(device const float4*)(of2 + col) : float4(0.f);
+    }
   }
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
-    if (!cg.is_valid_element(e)) continue;
-    const auto ix = cg.get_multidimensional_index(e);
-    const int i = i0 + ix[0], j = j0 + ix[1];
+  for (int q = 0; q < NR; ++q) {
+    const int j = j0 + rowOf[q];
     if (j >= g.n) continue;
-    const int q = qOf(e), k = TN == 64 ? ((e >> 3) & 1) : ((e >> 3) & 3);
-    const float4 x = (lf_ln_at<REG>(cg, cv, D, g, i0, j0, e) - mean[q]) * inv[q];
-    float4 y = x;
-    if (sc) y *= sc4[k];
-    if (of) y += of4[k];
-    *(device half4*)(out + (ulong)i + (ulong)j * g.ldd) = half4(y);
-    if (g.lnOut2) {
-      float4 y2 = x;
-      if (g.lnScale2) y2 *= *(device const float4*)((device const float*)g.lnScale2 + ix[0]);
-      if (g.lnOffset2) y2 += *(device const float4*)((device const float*)g.lnOffset2 + ix[0]);
-      *(device half4*)((device half*)g.lnOut2 + (ulong)i + (ulong)j * g.ldd) = half4(y2);
+    const uint16_t e0 = (NR == 4 && TN == 64) ? (uint16_t)((q & 1) * 4 + (q >> 1) * 16)
+                                              : (uint16_t)((q & 1) * 4 + (q >> 1) * 32);
+    const ulong rowOff = (ulong)j * g.ldd + (ulong)i0 + (ulong)col0;
+    const float mq = mean[q], ivq = inv[q];
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < NC; ++k) {
+      const uint16_t e = (uint16_t)(e0 + k * 8);
+      const float4 x = (lf_ln_at<REG>(cg, cv, D, g, i0, j0, e) - mq) * ivq;
+      float4 y = x;
+      if (sc) y *= sc4[k];
+      if (of) y += of4[k];
+      *(device half4*)(out + rowOff + k * CSTEP) = half4(y);
+      if (out2) {
+        float4 y2 = x;
+        if (sc2) y2 *= sc2_4[k];
+        if (of2) y2 += of2_4[k];
+        *(device half4*)(out2 + rowOff + k * CSTEP) = half4(y2);
+      }
     }
   }
 }
@@ -806,6 +819,123 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           *(device half4*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = half4(v);
         }
         return;
+      }
+      if constexpr ((TM == 64 && TN == 128) || (TM == 32 && TN == 256)) {
+        if ((g.m & 3) == 0) {
+          constexpr int CSTEP = TN == 256 ? 64 : 32;
+          const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+          const bool fullM = i0 + TN <= g.m;
+          const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
+          const bool hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
+          float4 b4[4] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
+          if (hasBias && !(g.epilogue & 8192)) {
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int col = col0 + k * CSTEP;
+              if (fullM || col < g.m)
+                b4[k] = halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
+                                 : *(device const float4*)((device const float*)g.bias + boff + col);
+            }
+          }
+          const ushort4 bs(0, 4, 32, 36);
+          if (g.epilogue & 8192) {
+            const uint opmC = (uint)g.tgN;
+            float4 bCol4[4] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
+            uint jTok4[4];
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const uint u = (uint)(col0 + k * CSTEP);
+              const uint jTok = opmC == 128 ? (u >> 7) : opmC == 256 ? (u >> 8) : lf_udiv(u, opmC);
+              jTok4[k] = jTok;
+              if (fullM || (int)u < g.m) bCol4[k] = *(device const float4*)((device const float*)g.bias + (u - jTok * opmC));
+            }
+            const bool sameTok = (jTok4[0] == jTok4[3]);
+            device const float* auxF = (device const float*)g.aux;
+            const bool tgC = g.tgC != 0;
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < 4; ++r_idx) {
+              const uint16_t e0 = bs[r_idx];
+              const int j = j0 + c.get_multidimensional_index(e0)[1];
+              if (j >= g.n) continue;
+              device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
+              device const TC* cp0 = C + (ulong)j * g.ldc + (ulong)col0;
+              const uint rowBase = (uint)j * (uint)g.tgNp;
+              const float nv0 = sameTok ? auxF[rowBase + jTok4[0]] : 0.f;
+              const float inv0 = sameTok ? (tgC ? 1.f / max(nv0, 1.f) : 1.f / (1e-3f + nv0)) : 0.f;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const int col = col0 + k * CSTEP;
+                if (!fullM && col >= g.m) continue;
+                const uint16_t e = (uint16_t)(e0 + k * 8);
+                const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                const float4 cv = float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                const float nv = sameTok ? nv0 : auxF[rowBase + jTok4[k]];
+                const vec<TC, 4> st = sameTok
+                  ? lf_out4<TC>(cv + (tgC ? v * inv0 + bCol4[k] : (bCol4[k] + v) * inv0))
+                  : lf_out4<TC>(cv + (tgC ? v / max(nv, 1.f) + bCol4[k] : (bCol4[k] + v) / (1e-3f + nv)));
+                *(device vec<TC, 4>*)(dp0 + k * CSTEP) = st;
+                if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
+              }
+            }
+          } else if (g.epilogue & 64) {
+            device const half* auxH = (device const half*)g.aux;
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < 4; ++r_idx) {
+              const uint16_t e0 = bs[r_idx];
+              const int j = j0 + c.get_multidimensional_index(e0)[1];
+              if (j >= g.n) continue;
+              device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
+              device const TC* cp0 = C + (ulong)j * g.ldc + (ulong)col0;
+              device const half* ap0 = auxH + (ulong)j * g.ldaux + (ulong)col0;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const int col = col0 + k * CSTEP;
+                if (!fullM && col >= g.m) continue;
+                const uint16_t e = (uint16_t)(e0 + k * 8);
+                const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]) + b4[k];
+                const float4 ax = float4(*(device const half4*)(ap0 + k * CSTEP));
+                const float4 cv = float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                const vec<TC, 4> st = lf_out4<TC>(cv + ax * fast::divide(1.f, 1.f + fast::exp(-v)));
+                *(device vec<TC, 4>*)(dp0 + k * CSTEP) = st;
+                if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
+              }
+            }
+          } else {
+            const bool hasBeta = g.beta != 0.f, floatC = (g.biasType & 512) != 0;
+            const bool relu = (EP & 64) == 0 && (g.epilogue & 2) != 0;
+            const bool gelu = (EP & 64) == 0 && (g.epilogue & 32) != 0;
+            device const float* cfBase = (device const float*)g.C + (ulong)z * g.sc;
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < 4; ++r_idx) {
+              const uint16_t e0 = bs[r_idx];
+              const int j = j0 + c.get_multidimensional_index(e0)[1];
+              if (j >= g.n) continue;
+              device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
+              device const TC* cp0 = C + (ulong)j * g.ldc + (ulong)col0;
+              device const float* cfp0 = cfBase + (ulong)j * g.ldc + (ulong)col0;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const int col = col0 + k * CSTEP;
+                if (!fullM && col >= g.m) continue;
+                const uint16_t e = (uint16_t)(e0 + k * 8);
+                float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                if (hasBeta) {
+                  const float4 cv = floatC ? *(device const float4*)(cfp0 + k * CSTEP)
+                                           : float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                  v += g.beta * cv;
+                }
+                if (hasBias) v += b4[k];
+                if (relu) v = max(v, 0.f);
+                if (gelu) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
+                const vec<TC, 4> st = lf_out4<TC>(v);
+                *(device vec<TC, 4>*)(dp0 + k * CSTEP) = st;
+                if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
+              }
+            }
+          }
+          if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN, true, (TM * (TN < 128 ? 128 : TN)) / 2048>(c, c, (device const TC*)D, part, tid, g, i0, j0); }
+          return;
+        }
       }
     }
     _Pragma("clang loop unroll(full)")

@@ -358,36 +358,43 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let local = local_id.x;
 
   var total = 0.0;
-  for (var c = local; c < WIDTH; c += 64u) { total += feature(token, c); }
+  for (var c = local; c < WIDTH; c += 64u) {
+    let f = feature(token, c);
+    normalised[c] = f;
+    total += f;
+  }
   let mean = reduce_sum(local, total) / f32(WIDTH);
   workgroupBarrier();
   var centred = 0.0;
   for (var c = local; c < WIDTH; c += 64u) {
-    let d = feature(token, c) - mean;
+    let d = normalised[c] - mean;
     centred += d * d;
   }
   let inverse_std = inverseSqrt(reduce_sum(local, centred) / f32(WIDTH) + EPSILON);
-  workgroupBarrier();
   for (var c = local; c < WIDTH; c += 64u) {
-    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c] + scale[WIDTH + c];
+    normalised[c] = (normalised[c] - mean) * inverse_std * scale[c] + scale[WIDTH + c];
   }
 
   // The noise embedding is one row, shared by every token: normalise and
   // project it here rather than in its own pass.
   var noise_total = 0.0;
-  for (var c = local; c < NOISE_CHANNELS; c += 64u) { noise_total += noise[c]; }
+  for (var c = local; c < NOISE_CHANNELS; c += 64u) {
+    let nv = noise[c];
+    noise_norm[c] = nv;
+    noise_total += nv;
+  }
+  workgroupBarrier();
   let noise_mean = reduce_sum(local, noise_total) / f32(NOISE_CHANNELS);
   workgroupBarrier();
   var noise_centred = 0.0;
   for (var c = local; c < NOISE_CHANNELS; c += 64u) {
-    let d = noise[c] - noise_mean;
+    let d = noise_norm[c] - noise_mean;
     noise_centred += d * d;
   }
   let noise_inverse = inverseSqrt(reduce_sum(local, noise_centred)
     / f32(NOISE_CHANNELS) + EPSILON);
-  workgroupBarrier();
   for (var c = local; c < NOISE_CHANNELS; c += 64u) {
-    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse
+    noise_norm[c] = (noise_norm[c] - noise_mean) * noise_inverse
       * noise_weights[W_NOISE_SCALE + c] + noise_weights[W_NOISE_OFFSET + c];
   }
   workgroupBarrier();
@@ -559,7 +566,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     joint_squares += d * d;
   }
   let joint_inverse = inverseSqrt(total_of(lane, joint_squares) / f32(WIDTH) + EPSILON);
-  workgroupBarrier();
   for (var c = lane; c < WIDTH; c += LANES) {
     concatenated[c] = (concatenated[c] - joint_mean) * joint_inverse * scale[c]
       + scale[WIDTH + c];

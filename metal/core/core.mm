@@ -1287,7 +1287,7 @@ void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float*
 void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
   size_t P = (size_t)L * L;
   const char* k = C % 8 || C > 256 ? "lf_center_norm_wideh" : C > 128 ? "lf_center_norm_32h1" : C > 64 ? "lf_center_norm_16h2" : "lf_center_norm_8h2";
-  const int per = (C <= 128 && C % 8 == 0) || ((C & 127) == 0 && C <= 512 && C > 256) ? 64 : 32;
+  const int per = (C <= 128 && C % 8 == 0) ? 64 : 32;
   run(k, grid1d((P + per - 1) / per, 1), 256,
       CenterNormArgs{nullptr, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset, prod, 1e-5f * prodScale * prodScale, 0});
 }

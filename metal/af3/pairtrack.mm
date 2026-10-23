@@ -70,9 +70,9 @@ static void addLinW(const half* X, const half* w, half* Y, size_t rows, int in, 
   g.beta = 1.f; g.bias = bias; g.label = label;
   gemm(g);
 }
-template <class T> static void addLin(const half* X, const std::string& w, T* Y, size_t rows, int in, int out, const float* bias = nullptr) {
+template <class T> static void addLin(const half* X, const std::string& w, T* Y, size_t rows, int in, int out, const float* bias = nullptr, const char* label = nullptr) {
   if (lenW(w) != (size_t)in * out) die("%s has %zu elements, not %d x %d", w.c_str(), lenW(w), in, out);
-  addLinW(X, Wh(w), Y, rows, in, out, bias, w.c_str());
+  addLinW(X, Wh(w), Y, rows, in, out, bias, label ? label : w.c_str());
 }
 template <class T> constexpr DT dtOf() { return std::is_same<T, half>::value ? F16 : F32; }
 // chai-1's parallel updates all read one input, so its affine-free LayerNorm is taken once a block (parallelPairUpdates)
@@ -202,7 +202,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
     g.beta = 1.f; g.bias = Wopt(pre + ".outputProjectionBias"); g.label = "grid output, next norm";
     g.lnOut = lnOut; g.lnScale = W(nextNorm + "Scale"); g.lnOffset = Wopt(nextNorm + "Offset");
     if (gemm(g)) emit(0, pair, nextNorm, lnOut);
-  } else addLin(o, pre + ".outputProjection", into ? into : pair, P, Wd, C, Wopt(pre + ".outputProjectionBias"));
+  } else addLin(o, pre + ".outputProjection", into ? into : pair, P, Wd, C, Wopt(pre + ".outputProjectionBias"), "grid output");
 }
 void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into,
                    bool untransposed, const std::string& nextNorm) {
@@ -277,7 +277,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
       emittedAll = false;       // (the GEMM took no emission - every chunk falls back alike)
       continue;
     }
-    addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C);
+    addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C, nullptr, "transition2");
   }
   if (emittedAll) { emit(0, x, next1, scratch<half>("pr.x", rows * C)); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
 }

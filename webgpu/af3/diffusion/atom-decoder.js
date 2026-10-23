@@ -236,14 +236,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       + weights[P_atomFeaturesLayerNormOffset + c];
   }
 
-  for (var axis = 0u; axis < 3u; axis += 1u) {
-    var value = 0.0;
-    for (var c = 0u; c < C; c += 1u) {
-      value += norm_act[c]
-        * weights[P_atomFeaturesToPositionUpdate + c * 3u + axis];
-    }
-    update[slot * 3u + axis] = value;
+  var v0 = 0.0;
+  var v1 = 0.0;
+  var v2 = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    let n_c = norm_act[c];
+    let wBase = P_atomFeaturesToPositionUpdate + c * 3u;
+    v0 += n_c * weights[wBase];
+    v1 += n_c * weights[wBase + 1u];
+    v2 += n_c * weights[wBase + 2u];
   }
+  update[slot * 3u] = v0;
+  update[slot * 3u + 1u] = v1;
+  update[slot * 3u + 2u] = v2;
 }`;
 
   // 🔴 THE PADDING, RE-ZEROED BETWEEN BLOCKS - intellifold2 and chai1 only.

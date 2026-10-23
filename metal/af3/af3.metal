@@ -304,8 +304,8 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
                           uint tid [[thread_index_in_threadgroup]]) {
   const uint j0 = tg.x * 8, i0 = tg.y * 8;
   if (i0 >= a.n || j0 >= a.n) return;
-  threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
-  threadgroup half4 Ws2[256];        // second 8-head block when H > 8 (2.0 KB)
+  threadgroup half4 Ws[1024];        // up to 512 * 2 half4s (8.0 KB)
+  threadgroup half4 Ws2[1024];       // second 8-head block when H > 8 (8.0 KB)
   threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
   if (a.C <= 128 || (a.C == 256 && a.H <= 4)) {
     if (a.H <= 8) {
@@ -421,27 +421,47 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
       }
     }
   } else if (a.H <= 8) {
+    for (uint t = tid; t < a.C * 2; t += 256) {
+      Ws[t] = (a.H == 8 || (t & 1) == 0) ? *(device const half4*)(a.W + (t >> 1) * a.H + (t & 1) * 4) : half4(0.h);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
     const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
     device const half4* p0_base = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C);
     device const half4* p1_base = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C);
     float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
-    for (uint c0 = 0; c0 < a.C; c0 += 128) {
-      if (c0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
-      Ws[tid] = (a.H == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + (tid & 1) * 4) : half4(0.h);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const uint c4_base = (c0 >> 2) + tx * 4;
-      _Pragma("clang loop unroll(full)")
-      for (uint u = 0; u < 4; ++u) {
-        float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
-        float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
-        uint c = (tx * 4 + u) * 4;
+    if (valid0 && valid1) {
+      for (uint c0 = 0; c0 < a.C; c0 += 128) {
+        const uint c4_base = (c0 >> 2) + tx * 4;
         _Pragma("clang loop unroll(full)")
-        for (uint k = 0; k < 4; ++k) {
-          float xv0 = x0[k], xv1 = x1[k];
-          float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
-          acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
-          acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+        for (uint u = 0; u < 4; ++u) {
+          float4 x0 = float4(p0_base[c4_base + u]);
+          float4 x1 = float4(p1_base[c4_base + u]);
+          uint c = c0 + (tx * 4 + u) * 4;
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < 4; ++k) {
+            float xv0 = x0[k], xv1 = x1[k];
+            float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
+            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+          }
+        }
+      }
+    } else {
+      for (uint c0 = 0; c0 < a.C; c0 += 128) {
+        const uint c4_base = (c0 >> 2) + tx * 4;
+        _Pragma("clang loop unroll(full)")
+        for (uint u = 0; u < 4; ++u) {
+          float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+          float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+          uint c = c0 + (tx * 4 + u) * 4;
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < 4; ++k) {
+            float xv0 = x0[k], xv1 = x1[k];
+            float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
+            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+          }
         }
       }
     }
@@ -472,33 +492,66 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
     }
   } else {
     const uint remH = a.H - 8u;
+    if (remH <= 4) {
+      for (uint t = tid; t < a.C * 2; t += 256) {
+        Ws[t] = *(device const half4*)(a.W + (t >> 1) * a.H + (t & 1) * 4);
+      }
+      for (uint t = tid; t < a.C; t += 256) {
+        Ws2[t] = *(device const half4*)(a.W + t * a.H + 8);
+      }
+    } else {
+      for (uint t = tid; t < a.C * 2; t += 256) {
+        Ws[t] = *(device const half4*)(a.W + (t >> 1) * a.H + (t & 1) * 4);
+        Ws2[t] = *(device const half4*)(a.W + (t >> 1) * a.H + 8 + (t & 1) * 4);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
     const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
     device const half4* p0_base = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C);
     device const half4* p1_base = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C);
     float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
     float4 acc0_2(0.f), acc0_3(0.f), acc1_2(0.f), acc1_3(0.f);
-    for (uint c0 = 0; c0 < a.C; c0 += 128) {
-      if (c0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
-      Ws[tid] = *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + (tid & 1) * 4);
-      Ws2[tid] = (remH == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + 8 + (tid & 1) * 4) : half4(0.h);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const uint c4_base = (c0 >> 2) + tx * 4;
-      _Pragma("clang loop unroll(full)")
-      for (uint u = 0; u < 4; ++u) {
-        float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
-        float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
-        uint c = (tx * 4 + u) * 4;
+    if (remH <= 4) {
+      for (uint c0 = 0; c0 < a.C; c0 += 128) {
+        const uint c4_base = (c0 >> 2) + tx * 4;
         _Pragma("clang loop unroll(full)")
-        for (uint k = 0; k < 4; ++k) {
-          float xv0 = x0[k], xv1 = x1[k];
-          uint wi = (c + k) * 2;
-          float4 wa = float4(Ws[wi]), wb = float4(Ws[wi + 1]);
-          acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
-          acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
-          float4 wc = float4(Ws2[wi]), wd = float4(Ws2[wi + 1]);
-          acc0_2 += xv0 * wc; acc0_3 += xv0 * wd;
-          acc1_2 += xv1 * wc; acc1_3 += xv1 * wd;
+        for (uint u = 0; u < 4; ++u) {
+          float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+          float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+          uint c = c0 + (tx * 4 + u) * 4;
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < 4; ++k) {
+            float xv0 = x0[k], xv1 = x1[k];
+            uint wi = (c + k) * 2;
+            float4 wa = float4(Ws[wi]), wb = float4(Ws[wi + 1]);
+            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+            float4 wc = float4(Ws2[c + k]);
+            acc0_2 += xv0 * wc;
+            acc1_2 += xv1 * wc;
+          }
+        }
+      }
+    } else {
+      for (uint c0 = 0; c0 < a.C; c0 += 128) {
+        const uint c4_base = (c0 >> 2) + tx * 4;
+        _Pragma("clang loop unroll(full)")
+        for (uint u = 0; u < 4; ++u) {
+          float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+          float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+          uint c = c0 + (tx * 4 + u) * 4;
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < 4; ++k) {
+            float xv0 = x0[k], xv1 = x1[k];
+            uint wi = (c + k) * 2;
+            float4 wa = float4(Ws[wi]), wb = float4(Ws[wi + 1]);
+            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+            float4 wc = float4(Ws2[wi]), wd = float4(Ws2[wi + 1]);
+            acc0_2 += xv0 * wc; acc0_3 += xv0 * wd;
+            acc1_2 += xv1 * wc; acc1_3 += xv1 * wd;
+          }
         }
       }
     }

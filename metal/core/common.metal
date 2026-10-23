@@ -586,109 +586,83 @@ template [[host_name("lf_center_norm_16")]] kernel void lf_center_norm<16>(const
 template [[host_name("lf_center_norm_32")]] kernel void lf_center_norm<32>(constant CenterNormArgs&, uint3, uint3, uint);
 // ...for any width (OpenDDE's 384, IntelliFold-2's 512): the channels read once into registers when C % 128 == 0 && C <= 512,
 // and transposed in 128-channel chunks through an 8 KB half tile so global output writes are coalesced half4 stores
+template <uint N_CHUNKS>
+inline void lf_center_norm_wide_h_chunks(constant CenterNormArgs& a, device const half* prod,
+                                         threadgroup half* T, ulong r0, ulong q, ulong plane, bool live, uint lane, uint grp) {
+  threadgroup float* part = (threadgroup float*)T;
+  threadgroup float* part2 = part + 256;
+  constexpr uint C = N_CHUNKS * 128;
+  const float K = live ? (float)prod[q] : 0.f;
+  half4 p_reg[N_CHUNKS * 4];
+  float s1 = 0.f, s2 = 0.f;
+  _Pragma("clang loop unroll(full)")
+  for (uint ch = 0; ch < N_CHUNKS; ++ch) {
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 4; ++k) {
+      const uint cBase = (ch << 7) + (k << 5) + (grp << 2);
+      const half4 v = live ? half4(prod[(ulong)(cBase + 0) * plane + q], prod[(ulong)(cBase + 1) * plane + q],
+                                   prod[(ulong)(cBase + 2) * plane + q], prod[(ulong)(cBase + 3) * plane + q]) : half4(0.h);
+      p_reg[ch * 4 + k] = v;
+      const float4 d = float4(v) - K;
+      s1 += d.x + d.y + d.z + d.w;
+      s2 += dot(d, d);
+    }
+  }
+  part[grp * 32 + lane] = s1;
+  part2[grp * 32 + lane] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float S1 = 0.f, S2 = 0.f;
+  _Pragma("clang loop unroll(full)")
+  for (int g = 0; g < 8; ++g) {
+    S1 += part[g * 32 + lane];
+    S2 += part2[g * 32 + lane];
+  }
+  const float m1 = S1 / (float)C, mean = K + m1;
+  const float inv = rsqrt(max(S2 / (float)C - m1 * m1, 0.f) + a.eps);
+  const uint swizL = (lane & 15) << 2;
+  _Pragma("clang loop unroll(full)")
+  for (uint ch = 0; ch < N_CHUNKS; ++ch) {
+    const uint c0 = ch << 7;
+    half4 out4[4];
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 4; ++k) {
+      const uint cOff = (k << 5) + (grp << 2), cBase = c0 + cOff;
+      const float4 sc = *(device const float4*)(a.scale + cBase);
+      const float4 of = *(device const float4*)(a.offset + cBase);
+      out4[k] = half4((float4(p_reg[ch * 4 + k]) - mean) * inv * sc + of);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 4; ++k) {
+      const uint cOff = (k << 5) + (grp << 2);
+      *(threadgroup half4*)(T + lane * 128 + (cOff ^ swizL)) = out4[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint row = grp; row < 32; row += 8) {
+      const ulong r = r0 + row;
+      if (r >= a.pairs) break;
+      const uint swizR = (row & 15) << 2;
+      const uint c = 4 * lane;
+      *(device half4*)(a.out + r * C + c0 + c) = *(threadgroup const half4*)(T + row * 128 + (c ^ swizR));
+    }
+  }
+}
 template <typename TP>
 kernel void lf_center_norm_wide_t(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                 uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup half T[32 * 128];
   threadgroup float* part = (threadgroup float*)T;
-  threadgroup float* part2 = part + 512;
+  threadgroup float* part2 = part + 256;
   device const TP* prod = sizeof(TP) == 2 ? (device const TP*)a.prodh : (device const TP*)a.prod;
   const uint lane = tid & 31, grp = tid >> 5, C = a.C;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
   const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
   const bool live = r0 + lane < a.pairs;
-  if (sizeof(TP) == 2 && (C & 127) == 0 && C <= 512) {
-    const ulong r64 = (ulong)(tg.y * ng.x + tg.x) * 64;
-    ulong q2[2]; bool lv[2];
-    _Pragma("clang loop unroll(full)")
-    for (uint p = 0; p < 2; ++p) {
-      const uint rrp = (uint)(r64 + 2 * lane + p), iip = lf_udiv(rrp, a.L);
-      q2[p] = (ulong)iip * a.Lp + (rrp - iip * a.L);
-      lv[p] = r64 + 2 * lane + p < a.pairs;
-    }
-    const bool pair2 = lv[0] && lv[1] && q2[1] == q2[0] + 1 && (q2[0] & 1) == 0;
-    float K0 = lv[0] ? (float)prod[q2[0]] : 0.f;
-    float K1 = lv[1] ? (float)prod[q2[1]] : 0.f;
-    float s1_0 = 0.f, s2_0 = 0.f, s1_1 = 0.f, s2_1 = 0.f;
-    if (pair2) {
-      for (uint c = grp; c < C; c += 8) {
-        half2 h = *(device const half2*)(prod + (ulong)c * plane + q2[0]);
-        float d0 = (float)h.x - K0, d1 = (float)h.y - K1;
-        s1_0 += d0; s2_0 += d0 * d0;
-        s1_1 += d1; s2_1 += d1 * d1;
-      }
-    } else {
-      for (uint c = grp; c < C; c += 8) {
-        float d0 = (lv[0] ? (float)prod[(ulong)c * plane + q2[0]] : 0.f) - K0;
-        float d1 = (lv[1] ? (float)prod[(ulong)c * plane + q2[1]] : 0.f) - K1;
-        s1_0 += d0; s2_0 += d0 * d0;
-        s1_1 += d1; s2_1 += d1 * d1;
-      }
-    }
-    part[grp * 64 + 2 * lane] = s1_0; part[grp * 64 + 2 * lane + 1] = s1_1;
-    part2[grp * 64 + 2 * lane] = s2_0; part2[grp * 64 + 2 * lane + 1] = s2_1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float mean[2], inv[2];
-    _Pragma("clang loop unroll(full)")
-    for (uint p = 0; p < 2; ++p) {
-      float S1 = 0.f, S2 = 0.f;
-      _Pragma("clang loop unroll(full)")
-      for (int g = 0; g < 8; ++g) {
-        S1 += part[g * 64 + 2 * lane + p];
-        S2 += part2[g * 64 + 2 * lane + p];
-      }
-      float m1 = S1 / C;
-      mean[p] = (p == 0 ? K0 : K1) + m1;
-      inv[p] = rsqrt(max(S2 / C - m1 * m1, 0.f) + a.eps);
-    }
-    const uint swizL = (lane & 15) << 2;
-    const uint nChunks = C >> 7;
-    for (uint ch = 0; ch < nChunks; ++ch) {
-      uint c0 = ch << 7;
-      half4 out4[2][4];
-      _Pragma("clang loop unroll(full)")
-      for (uint k = 0; k < 4; ++k) {
-        uint cOff = (k << 5) + (grp << 2), cBase = c0 + cOff;
-        float4 sc = *(device const float4*)(a.scale + cBase);
-        float4 of = *(device const float4*)(a.offset + cBase);
-        float4 p0v, p1v;
-        if (pair2) {
-          half2 h0 = *(device const half2*)(prod + (ulong)(cBase + 0) * plane + q2[0]);
-          half2 h1 = *(device const half2*)(prod + (ulong)(cBase + 1) * plane + q2[0]);
-          half2 h2 = *(device const half2*)(prod + (ulong)(cBase + 2) * plane + q2[0]);
-          half2 h3 = *(device const half2*)(prod + (ulong)(cBase + 3) * plane + q2[0]);
-          p0v = float4((float)h0.x, (float)h1.x, (float)h2.x, (float)h3.x);
-          p1v = float4((float)h0.y, (float)h1.y, (float)h2.y, (float)h3.y);
-        } else {
-          p0v = lv[0] ? float4((float)prod[(ulong)(cBase + 0) * plane + q2[0]], (float)prod[(ulong)(cBase + 1) * plane + q2[0]],
-                               (float)prod[(ulong)(cBase + 2) * plane + q2[0]], (float)prod[(ulong)(cBase + 3) * plane + q2[0]]) : float4(0.f);
-          p1v = lv[1] ? float4((float)prod[(ulong)(cBase + 0) * plane + q2[1]], (float)prod[(ulong)(cBase + 1) * plane + q2[1]],
-                               (float)prod[(ulong)(cBase + 2) * plane + q2[1]], (float)prod[(ulong)(cBase + 3) * plane + q2[1]]) : float4(0.f);
-        }
-        out4[0][k] = half4((p0v - mean[0]) * inv[0] * sc + of);
-        out4[1][k] = half4((p1v - mean[1]) * inv[1] * sc + of);
-      }
-      _Pragma("clang loop unroll(full)")
-      for (uint p = 0; p < 2; ++p) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        _Pragma("clang loop unroll(full)")
-        for (uint k = 0; k < 4; ++k) {
-          uint cOff = (k << 5) + (grp << 2);
-          *(threadgroup half4*)(T + lane * 128 + (cOff ^ swizL)) = out4[p][k];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        _Pragma("clang loop unroll(full)")
-        for (uint row = grp; row < 32; row += 8) {
-          ulong r = r64 + 2 * row + p;
-          if (r >= a.pairs) break;
-          const uint swizR = (row & 15) << 2;
-          const uint c = 4 * lane;
-          *(device half4*)(a.out + r * C + c0 + c) = *(threadgroup const half4*)(T + row * 128 + (c ^ swizR));
-        }
-      }
-    }
-    return;
+  if constexpr (sizeof(TP) == 2) {
+    if (C == 384) { lf_center_norm_wide_h_chunks<3>(a, (device const half*)prod, T, r0, q, plane, live, lane, grp); return; }
+    if (C == 512) { lf_center_norm_wide_h_chunks<4>(a, (device const half*)prod, T, r0, q, plane, live, lane, grp); return; }
   }
   // the statistics in ONE read of the product (the output is the second): sums shifted by the pair's channel 0, so the
   // variance is no difference of large numbers - mean = K + s1 / C, var = s2 / C - (s1 / C)^2
