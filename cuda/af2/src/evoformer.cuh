@@ -1507,21 +1507,20 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   }
   // a T4, where neither fused form above fits (the output kernel holds the whole 128 x 128 weight, 71 KB):
   // cuda/af3's streaming triangle kernels at 128 channels, biased, the weight 16 columns a stage, MT=2 (two 16-row
-  // tiles a warp, 128 rows a block; XROUNDS=2 on sm_75 -> 25.0 KB, 2 blocks/SM in 64 KB), and the contraction f16
+  // tiles a warp, 128 rows a block; XROUNDS=2 -> 25.0 KB, 2 blocks/SM in 64 KB), and the contraction f16
   // into f32 (no bf16 MMA there) cleanly into triangleOutRun (32.0 KB, 2 blocks/SM in 64 KB)
-  constexpr int XR = LF_REG_STAGES ? 2 : 1;
   if (FAST && FUSED_TRIANGLE && C == 128 && L >= 80 &&
-      fitsSmem(std::max(triIn256Smem<half>(128, 4, XR, 2), triangleOutSmem<128, 4, float, 32, float>()))) {
+      fitsSmem(std::max(triIn256Smem<half>(128, 4, 2, 2), triangleOutSmem<128, 4, float, 32, float>()))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
     const half* wt = w.wt;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
-    const size_t smem = triIn256Smem<half>(128, 4, XR, 2);
+    const size_t smem = triIn256Smem<half>(128, 4, 2, 2);
     WITH_PAIR_T(
       static bool attr = false;
-      if (!attr) { smemAttr((triIn256K<128, 4, half, XR, true, PT, 2>), (int)smem); attr = true; }
-      triIn256K<128, 4, half, XR, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+      if (!attr) { smemAttr((triIn256K<128, 4, half, 2, true, PT, 2>), (int)smem); attr = true; }
+      triIn256K<128, 4, half, 2, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
     float* prod = scratch<float>("ftri.prod", plane * C);
     const float one = 1.f, zero = 0.f;

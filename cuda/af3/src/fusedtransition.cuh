@@ -463,12 +463,10 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   }
   // a part without cp.async (a T4: register-staged, LF_REG_STAGES): ONE weight stage, so two 64-row blocks of the one-tile
   // form fit its 64 KB SM (29 KB each) where every two-stage form held one block - 4 warps an SM
-#if LF_REG_STAGES
   if (FT_ONE_STAGE && ccMajor() < 8 && (rows + 63) / 64 >= MIN_BLOCKS && fitsSmem((size_t)64 * (128 + 8) * 2 + ftStage<128, 16, RELU>())) {
     fusedTransitionAt<4, RELU, 1, 16, 1>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     return true;
   }
-#endif
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16, RELU>())) {
     static const bool oneTile = [] {
       if (const char* e = getenv("LOCALFOLD_FT_FORM")) return atoi(e) == 1;
