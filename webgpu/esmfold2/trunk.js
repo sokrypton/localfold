@@ -319,6 +319,7 @@ export class Esmfold2TrunkGpu {
           chunkRows: pipelines.transitionSplit.chunkRows,
           precision: pipelines.transitionSplit.storage,
           offsets: transitionOffsets,
+          scratch,
           label: "esmfold2-trunk.transition",
         }, keep);
       const projectMatrix = pipelines.projectMatrix === undefined ? undefined
@@ -337,7 +338,7 @@ export class Esmfold2TrunkGpu {
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
         // eslint-disable-next-line no-await-in-loop
-        await options.beforeBlock?.(index);
+        if (options.beforeBlock !== undefined) await options.beforeBlock(index);
         const pending = [];
         validation.begin();
         // eslint-disable-next-line no-await-in-loop
@@ -363,16 +364,18 @@ export class Esmfold2TrunkGpu {
         // nothing. They resolve in submission order, so the count cannot go
         // backwards. AF3's pairformer has done this since it had a status line,
         // and it took it from AF2's evoformer stack.
-        const submitted = index + 1;
-        void this.device.queue.onSubmittedWorkDone()
-          .then(() => options.onBlockDone?.(submitted, blocks.length));
+        if (options.onBlockDone !== undefined) {
+          const submitted = index + 1;
+          void this.device.queue.onSubmittedWorkDone()
+            .then(() => options.onBlockDone(submitted, blocks.length));
+        }
         if (options.wait !== false && ((index + 1) % submissionWindow === 0 || index === blocks.length - 1)) {
           await this.device.queue.onSubmittedWorkDone();
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
         // GPU promise, which is a microtask - so a page that only moved a
         // progress bar here would write it and never paint it.
-        await options.onBlock?.(index);
+        if (options.onBlock !== undefined) await options.onBlock(index);
       }
       if (options.wait !== false) await validation.settle();
       else void validation.settle();
@@ -381,6 +384,8 @@ export class Esmfold2TrunkGpu {
       // note in webgpu/af3/trunk/pairformer-block.js: this allocator does not
       // pool, so releasing DESTROYS and the peak actually moves.
       for (const allocation of scratch) allocation.release();
+      transitionSplit?.normalized?.release?.();
+      transitionSplit?.wide?.release?.();
       biasBuffer?.release();
       if (options.readback === false) {
         return { pair: undefined,

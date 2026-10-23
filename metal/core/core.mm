@@ -334,7 +334,7 @@ struct Device {
       const bool tw = tensorOps && (!getenv("LOCALFOLD_GEMM_TENSOR") || atoi(getenv("LOCALFOLD_GEMM_TENSOR")) != 0);
       for (auto& t : todo) {
         if (isTensor(t.first)) { if (tw) groups[1].push_back(t); }
-        else if (!tw || t.first.compare(0, 7, "gemm_hh") != 0) groups[0].push_back(t);
+        else if (!tw || (t.first.compare(0, 7, "gemm_hh") != 0 && t.first.compare(0, 9, "gemm_dual") != 0)) groups[0].push_back(t);
       }
       std::vector<std::thread> threads;
       for (int step = 0; step < 2; ++step) {
@@ -916,7 +916,7 @@ static bool gatedAdd(const half* X, const half* W, const half* aux, void* pair, 
   a.aux = (uint64_t)aux; a.ldaux = out;
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
   if (lnOut) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
-  return gemmRun(F16, F16, tp, a, 1, false, false, "gated add");
+  return gemmRun(F16, F16, tp, a, 1, false, tp == F16, "gated add");
 }
 bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out, const float* bias,
                   half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
@@ -950,6 +950,29 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
     std::string name = std::string(tp == F16 ? "gemmt_dualh_" : "gemmt_dual_") + tile;
     std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor_dual<" + targs + ">(constant GemmArgs&, uint3, uint);";
     dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)(out / tn), (uint32_t)((rows + tm - 1) / tm), 1}, 128, 0,
+                     label ? label : "gated add, dual");
+    return ln;
+  }
+  const int lnMode = getenv("LOCALFOLD_LN_EMIT") ? atoi(getenv("LOCALFOLD_LN_EMIT")) : 1;
+  if (dual && !tensorWanted() && out % 64 == 0 && in % 16 == 0 && in <= 256 && !(out > 128 && lnOut && lnMode >= 2) &&
+      a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
+    const bool ln = lnOut && lnWanted && (out == 64 || (out == 128 && lnMode != 0)) && a16(lnOut) && a16(lnScale) && a16(lnOffset);
+    const int tr = 32, tc = (ln && out == 128) ? 128 : 64;
+    const int sgr = tc == 128 ? 1 : 2, sgc = tc == 128 ? 4 : 2;
+    GemmArgs a{};
+    a.A = (uint64_t)Wg; a.B = (uint64_t)Xg; a.C = a.D = (uint64_t)pair;
+    a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
+    a.alpha = 1.f; a.epilogue = biasG ? 4 : 0; a.bias = (uint64_t)biasG;
+    a.aux = (uint64_t)Xv; a.ldaux = in; a.aux2 = (uint64_t)Wv; a.aux3 = (uint64_t)biasV;
+    if (ln) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
+    ++D().stats.gemms;
+    std::string tile = std::to_string(tr) + "x" + std::to_string(tc) + (ln ? "_ln" : "");
+    std::string tcType = tp == F16 ? "half" : "float";
+    std::string targs = tcType + ", " + std::to_string(tr) + ", " + std::to_string(tc) + ", " +
+                        std::to_string(sgr) + ", " + std::to_string(sgc) + ", " + (ln ? "true" : "false");
+    std::string name = std::string(tp == F16 ? "gemm_dualh_" : "gemm_dual_") + tile;
+    std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_dual<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
+    dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)(out / tc), (uint32_t)((rows + tr - 1) / tr), 1}, 128, 0,
                      label ? label : "gated add, dual");
     return ln;
   }
@@ -1121,11 +1144,11 @@ void attention(const Attention& t) {
     // the version: LOCALFOLD_ATTN_V2 unset - v3 from 48 keys (where the tensor kernels are on); 0 - v1; 1 or 2 - v2
     // (no q bias: v1 there); 3 - v3
     const int mode = v2 ? atoi(v2) : -1;
-    const bool tensorOn = !e || strcmp(e, "0") != 0;
+    const bool tensorOn = e ? strcmp(e, "0") != 0 : tensorWanted();
     int ver = mode < 0 ? (tensorOn && t.n >= 48 ? 3 : 1) : mode == 0 ? 1 : mode < 3 ? 2 : 3;
     if (ver == 2 && t.qBias) ver = 1;
     const bool two = ver > 1;
-    const bool on = e ? strcmp(e, "0") != 0 : two || (t.n >= ATTN_TENSOR_MIN_N && t.D >= 32);
+    const bool on = e ? strcmp(e, "0") != 0 : tensorOn && (two || (t.n >= ATTN_TENSOR_MIN_N && t.D >= 32));
     if (on) {
       int TQB = 64, TKT = 32;
       if (two) { TQB = 16; TKT = (t.n % 64 == 0 || t.n % 64 > 32) && !(ver == 3 && t.D == 16) ? 64 : 32; }   // (v2's first number: queries a simdgroup)

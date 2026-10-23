@@ -827,8 +827,13 @@ export class Af3TemplateEmbedderGpu {
       if (pairBuffer !== undefined) options.validation.begin();
       else this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-template" });
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
       const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = batchPasses
+          ? (openPass ??= encoder.beginComputePass({ label: `${label.split(".")[0]}.block` }))
+          : encoder.beginComputePass({ label });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -843,7 +848,7 @@ export class Af3TemplateEmbedderGpu {
           })),
         }));
         pass.dispatchWorkgroups(x, y, z);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const linear = spread(Math.ceil(pairs / 64));
@@ -906,6 +911,7 @@ export class Af3TemplateEmbedderGpu {
               : [pair, slotBuffers[slot].aatype, weightBuffer, act,
                  slotBuffers[slot].geometry], perEmbed[0], perEmbed[1]);
         if (outerResidual) {
+          endPass();
           encoder.copyBufferToBuffer(act.buffer, 0, beforeStack.buffer, 0,
                                      pairs * CHANNELS * 4);
         }
@@ -928,6 +934,7 @@ export class Af3TemplateEmbedderGpu {
               : [act, weightBuffer, summed, slotBuffers[slot].repeat],
             linear[0], linear[1]);
       }
+      endPass();
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
       // 🔴 NO DRAIN ON THE DEVICE PATH. Releasing after a submit is safe on

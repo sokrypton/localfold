@@ -209,15 +209,6 @@ export class Af3MsaStackGpu {
       ? undefined : allocateGridProjectMatrix(this.allocator, {
         ...pipelines.gridProjectMatrix, label: "af3-msa.grid-project",
       }, keep);
-    const transitionSplit = pipelines.transitionSplit === undefined || compileOnly
-      ? undefined : allocateTransitionSplit(this.allocator, {
-        rows: n * n, channels: pairChannels,
-        factor: weightLength(sample.pairTransition, "transition2") / (pairChannels * pairChannels),
-        chunkRows: pipelines.transitionSplit.chunkRows,
-        precision: pipelines.transitionSplit.storage,
-        offsets: packTransitionWeights(sample.pairTransition).offsets,
-        label: "af3-msa.transition",
-      }, keep);
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track.js.
     const compile = (key, source) => this.pipelines.get(key, source);
     const compiling = [];
@@ -348,13 +339,28 @@ export class Af3MsaStackGpu {
           pipelines.pairScratchBytes(index,
   storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
+      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+        : allocateTransitionSplit(this.allocator, {
+          rows: n * n, channels: pairChannels,
+          factor: weightLength(sample.pairTransition, "transition2") / (pairChannels * pairChannels),
+          chunkRows: pipelines.transitionSplit.chunkRows,
+          precision: pipelines.transitionSplit.storage,
+          offsets: packTransitionWeights(sample.pairTransition).offsets,
+          scratch,
+          label: "af3-msa.transition",
+        }, keep);
       const biasBuffer = keep(this.allocator.allocate(
         "af3-msa.bias", (pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
-      const left = keep(this.allocator.allocate("af3-msa.left", rows * outerChannels * 4, storage));
-      const right = keep(this.allocator.allocate("af3-msa.right", rows * outerChannels * 4, storage));
+      const reuseScratch = (slot, bytes, label) => (slot !== undefined && slot.byteLength >= bytes
+        ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
+        : keep(this.allocator.allocate(label, bytes, storage)));
+      // Pair-track scratch[1..3] and biasBuffer are idle during outerProduct() and updateMsa(),
+      // and scratch[0] is idle during updateMsa(), so alias them whenever their byteLength suffices.
+      const left = reuseScratch(scratch[2], rows * outerChannels * 4, "af3-msa.left");
+      const right = reuseScratch(scratch[3], rows * outerChannels * 4, "af3-msa.right");
       // ...the outer product's denominator, computed once per pass rather than
       // carried through its contraction; see outer-product-mean.js.
-      const opmCounts = keep(this.allocator.allocate("af3-msa.opm-counts", pairs * 4, storage));
+      const opmCounts = reuseScratch(biasBuffer, pairs * 4, "af3-msa.opm-counts");
       // ...and the two-GEMM contraction's [pair][cell] intermediate, a block of
       // whole rows of i at a time, with one pair of uniforms per block.
       let opmVector;
@@ -362,8 +368,8 @@ export class Af3MsaStackGpu {
         const cells = outerChannels * outerChannels;
         const blockPairs = af3OpmVectorBlockPairs(n, outerChannels, OPM_VECTOR_BYTES);
         const blockRows = blockPairs / n;
-        const intermediate = keep(this.allocator.allocate(
-          "af3-msa.opm-outer", blockPairs * cells * 4, storage));
+        const intermediate = reuseScratch(
+          scratch[1], blockPairs * cells * 4, "af3-msa.opm-outer");
         const steps = [];
         for (let i0 = 0; i0 < n; i0 += blockRows) {
           const count = Math.min(blockRows, n - i0);
@@ -380,12 +386,13 @@ export class Af3MsaStackGpu {
         opmVector = { intermediate, steps };
       }
       const keyMask = keep(this.allocator.allocate("af3-msa.key-mask", n * 4, storage));
-      const attention = keep(this.allocator.allocate(
-        "af3-msa.attention", msaHeads * pairs * 4, storage));
+      const attention = reuseScratch(scratch[1], msaHeads * pairs * 4, "af3-msa.attention");
+      const msaScratchBytes = rows * Math.max(msaWidth, msaChannels) * 4;
+      const msaSlots = [scratch[0], scratch[2], scratch[3]];
       const msaScratch = [];
       for (let index = 0; index < 3; index += 1) {
-        msaScratch.push(keep(this.allocator.allocate(
-          `af3-msa.msa-scratch${index}`, rows * Math.max(msaWidth, msaChannels) * 4, storage)));
+        msaScratch.push(reuseScratch(
+          msaSlots[index], msaScratchBytes, `af3-msa.msa-scratch${index}`));
       }
 
 
@@ -404,11 +411,18 @@ export class Af3MsaStackGpu {
         });
         options.onBlock?.(index);
       }
+      const releaseScratch = () => {
+        for (const allocation of [
+          ...scratch, ...msaScratch, biasBuffer, attention, left, right,
+          opmCounts, opmVector?.intermediate, keyMask,
+          transitionSplit?.normalized, transitionSplit?.wide,
+        ]) {
+          allocation?.release?.();
+        }
+      };
       if (onDevice) {
         // Released on queue ordering, as the pairformer releases its own.
-        for (const allocation of [...scratch, ...msaScratch, biasBuffer, attention]) {
-          allocation.release();
-        }
+        releaseScratch();
         return { elapsedMilliseconds: performance.now() - start,
                  memory: this.allocator.snapshot() };
       }
@@ -419,9 +433,7 @@ export class Af3MsaStackGpu {
       // stack is 19.5 MiB at 200 tokens of the peak this stage HOLDS. The
       // drain is free here: the mapAsync two lines down is one anyway.
       await this.device.queue.onSubmittedWorkDone();
-      for (const allocation of [...scratch, ...msaScratch, biasBuffer, attention]) {
-        allocation.release();
-      }
+      releaseScratch();
       const readbackPair = keep(this.allocator.allocate(
         "af3-msa.readback-pair", pairs * pairChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
@@ -522,8 +534,13 @@ export class Af3MsaStackGpu {
     if (context.validation !== undefined) context.validation.begin();
     else this.device.pushErrorScope("validation");
     const encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });
+    const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+    let openPass = null;
+    const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
-      const pass = encoder.beginComputePass({ label });
+      const pass = batchPasses
+        ? (openPass ??= encoder.beginComputePass({ label: `${label.split(".")[0]}.block` }))
+        : encoder.beginComputePass({ label });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -542,7 +559,7 @@ export class Af3MsaStackGpu {
         })),
       }));
       pass.dispatchWorkgroups(x, y, z);
-      pass.end();
+      if (!batchPasses) pass.end();
     };
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
@@ -644,6 +661,7 @@ export class Af3MsaStackGpu {
       weights: pairTrackWeights,
     });
 
+    endPass();
     this.device.queue.submit([encoder.finish()]);
     // 🔴 A DRAIN PER BLOCK ONLY ON THE HOST PATH. Releasing the block's weights
     // after the submit is safe on queue ordering - the pairformer has done it

@@ -635,15 +635,6 @@ export class Af3PairformerStackGpu {
         : allocateGridProjectMatrix(this.allocator, {
           ...pipelines.gridProjectMatrix, label: "af3-block.grid-project",
         }, keep);
-      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
-        : allocateTransitionSplit(this.allocator, {
-          rows: n * n, channels: pairChannels,
-          factor: weightLength(blocks[0].pairTransition, "transition2") / (pairChannels * pairChannels),
-          chunkRows: pipelines.transitionSplit.chunkRows,
-          precision: pipelines.transitionSplit.storage,
-          offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
-          label: "af3-block.transition",
-        }, keep);
       // 🔴 THE ATTENTION'S WIDTH, NOT THE CHANNEL COUNT - the same rule the
       // template stack needed. The grid projection writes `heads * dimension`
       // per pair per role, and in every TRUNK shipped here that equals the
@@ -663,20 +654,36 @@ export class Af3PairformerStackGpu {
           pipelines.pairScratchBytes(index,
   storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
+      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+        : allocateTransitionSplit(this.allocator, {
+          rows: n * n, channels: pairChannels,
+          factor: weightLength(blocks[0].pairTransition, "transition2") / (pairChannels * pairChannels),
+          chunkRows: pipelines.transitionSplit.chunkRows,
+          precision: pipelines.transitionSplit.storage,
+          offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
+          scratch,
+          label: "af3-block.transition",
+        }, keep);
       // Uploaded once for the stack, not per block: it is the same tensor for
       // all four of the refiner's blocks.
       const extraPairBias = extraPairBiasData === undefined ? undefined
         : keep(this.allocator.upload("af3-block.extra-pair-bias", extraPairBiasData, storage));
       const biasBuffer = keep(this.allocator.allocate(
         "af3-block.bias", (pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
-      const pairLogits = keep(this.allocator.allocate(
-        "af3-block.pair-logits", heads * pairs * 4, storage));
+      const reuseScratch = (slot, bytes, label) => (slot !== undefined && slot.byteLength >= bytes
+        ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
+        : keep(this.allocator.allocate(label, bytes, storage)));
+      // Pair-track scratch and grid bias are idle during the single track, so
+      // pairLogits aliases scratch[0] and singleScratch[0..4] alias
+      // [scratch[1..3], biasBuffer, scratch[4]] whenever their byteLength suffices.
+      const pairLogits = reuseScratch(scratch[0], heads * pairs * 4, "af3-block.pair-logits");
       const singleWidth = heads * blocks[0].singleAttention.dimension;
+      const singleScratchBytes = Math.max(n * singleWidth, n * singleChannels) * 4;
+      const singleSlots = [scratch[1], scratch[2], scratch[3], biasBuffer, scratch[4]];
       const singleScratch = [];
       for (let index = 0; index < 5; index += 1) {
-        singleScratch.push(keep(this.allocator.allocate(
-          `af3-block.single-scratch${index}`,
-          Math.max(n * singleWidth, n * singleChannels) * 4, storage)));
+        singleScratch.push(reuseScratch(
+          singleSlots[index], singleScratchBytes, `af3-block.single-scratch${index}`));
       }
 
       // 🔴 SUBMISSION RUNS AHEAD OF THE DEVICE, ON PURPOSE. Every block used to
@@ -767,7 +774,7 @@ export class Af3PairformerStackGpu {
         // GPU promise, which is a microtask - so a page that only updates a
         // progress bar here would write it and never paint it. Awaiting lets
         // the caller hand control back to the event loop for a frame.
-        await options.onBlock?.(index);
+        if (options.onBlock !== undefined) await options.onBlock(index);
       }
       if (!deferReadback) await validation.settle();
 
@@ -779,8 +786,11 @@ export class Af3PairformerStackGpu {
       // means the device is idle, so releasing the scratch here is safe and
       // this allocator does not pool: release DESTROYS, which is what makes
       // the peak move.
-      for (const allocation of [...scratch, ...singleScratch, biasBuffer, pairLogits]) {
-        allocation.release();
+      for (const allocation of [
+        ...scratch, ...singleScratch, biasBuffer, pairLogits,
+        transitionSplit?.normalized, transitionSplit?.wide,
+      ]) {
+        allocation?.release?.();
       }
       // Released on queue ordering on the deferred path, as every block's
       // weights already are; the caller's readback is the drain.

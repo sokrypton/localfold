@@ -750,3 +750,226 @@ kernel void lf_gemm_x(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgrou
       simdgroup_store(o, D + (long)(j0 + sr + a * 8) * g.ldd + i0 + sc + b * 8, (ulong)g.ldd);
     }
 }
+
+// Dual gated residual GEMM for simdgroup_matrix (Apple8/Apple9): D += (Xv @ Wv + biasV) * sigmoid(Xg @ Wg + biasG),
+// optionally emitting LayerNorm(D) into g.lnOut when TC_ covers all columns (g.m == TC_).
+// Runs Xv @ Wv first into threadgroup Vs (single accumulator set acc[FR][FC], <= 14.25 KB threadgroup memory),
+// then Xg @ Wg into acc[FR][FC], fusing the gated residual and optional LayerNorm without a global vTmp round-trip.
+template <typename TC, int TR, int TC_, int SGR, int SGC, bool LN>
+kernel void lf_gemm_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int BK = 16, PAD = 8, XROW = BK + PAD, WROW = TC_ + PAD;
+  constexpr int WR = TR / SGR, WC = TC_ / SGC, FR = WR / 8, FC = WC / 8;
+  threadgroup half Xs[TR * XROW];
+  threadgroup half Ws[BK * WROW];
+  threadgroup half Vs[TR * WROW];
+  device const half* Wg = (device const half*)g.A;
+  device const half* Xg = (device const half*)g.B;
+  device const half* Xv = (device const half*)g.aux;
+  device const half* Wv = (device const half*)g.aux2;
+  device const TC* C = (device const TC*)g.C;
+  device TC* D = (device TC*)g.D;
+  const int j0 = grp.y * TR, i0 = grp.x * TC_;
+  if (j0 >= g.n || i0 >= g.m) return;
+  const int sr = (sg / SGC) * WR, sc = (sg % SGC) * WC;
+  const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+  const int xr = tid >> 2, xc = (tid & 3) * 4;
+  const int wr = tid >> 3, wc = (tid & 7) * (TC_ / 8);
+  const bool xValid = j0 + xr < g.n;
+
+  simdgroup_float8x8 acc[FR][FC];
+  _Pragma("clang loop unroll(full)")
+  for (int a = 0; a < FR; ++a)
+    _Pragma("clang loop unroll(full)")
+    for (int b = 0; b < FC; ++b) acc[a][b] = simdgroup_float8x8(0.f);
+
+  for (int k0 = 0; k0 < g.k; k0 += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    *(threadgroup half4*)(Xs + xr * XROW + xc) = xValid ? *(device const half4*)(Xv + (ulong)(j0 + xr) * g.ldaux + k0 + xc) : half4(0);
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < TC_ / 64; ++u)
+      *(threadgroup uint4*)(Ws + wr * WROW + wc + u * 8) = *(device const uint4*)(Wv + (ulong)(k0 + wr) * g.lda + i0 + wc + u * 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (int kk = 0; kk < BK; kk += 8) {
+      simdgroup_half8x8 xm[FR], wm[FC];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) simdgroup_load(xm[a], Xs + (sr + a * 8) * XROW + kk, XROW);
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < FC; ++b) simdgroup_load(wm[b], Ws + kk * WROW + sc + b * 8, WROW);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a)
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
+    }
+  }
+  device const float* biasV = (device const float*)g.aux3;
+  _Pragma("clang loop unroll(full)")
+  for (int b = 0; b < FC; ++b) {
+    const float2 bv = biasV ? *(device const float2*)(biasV + i0 + sc + b * 8 + sn) : float2(0.f);
+    _Pragma("clang loop unroll(full)")
+    for (int a = 0; a < FR; ++a) {
+      simdgroup_half8x8 vm;
+      thread auto& ev = acc[a][b].thread_elements();
+      thread auto& v = vm.thread_elements();
+      v[0] = (half)clamp(ev[0] + bv[0], -65504.f, 65504.f);
+      v[1] = (half)clamp(ev[1] + bv[1], -65504.f, 65504.f);
+      simdgroup_store(vm, Vs + (sr + a * 8) * WROW + sc + b * 8, WROW);
+      acc[a][b] = simdgroup_float8x8(0.f);
+    }
+  }
+
+  for (int k0 = 0; k0 < g.k; k0 += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    *(threadgroup half4*)(Xs + xr * XROW + xc) = xValid ? *(device const half4*)(Xg + (ulong)(j0 + xr) * g.ldb + k0 + xc) : half4(0);
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < TC_ / 64; ++u)
+      *(threadgroup uint4*)(Ws + wr * WROW + wc + u * 8) = *(device const uint4*)(Wg + (ulong)(k0 + wr) * g.lda + i0 + wc + u * 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (int kk = 0; kk < BK; kk += 8) {
+      simdgroup_half8x8 xm[FR], wm[FC];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) simdgroup_load(xm[a], Xs + (sr + a * 8) * XROW + kk, XROW);
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < FC; ++b) simdgroup_load(wm[b], Ws + kk * WROW + sc + b * 8, WROW);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a)
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
+    }
+  }
+
+  device const float* biasG = (device const float*)g.bias;
+  float2 bg2[FC];
+  _Pragma("clang loop unroll(full)")
+  for (int b = 0; b < FC; ++b) {
+    const int col0 = i0 + sc + b * 8 + sn;
+    bg2[b] = biasG ? *(device const float2*)(biasG + col0) : float2(0.f);
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int a = 0; a < FR; ++a) {
+    const int j = j0 + sr + a * 8;
+    if (j >= g.n) continue;
+    if (j + 8 <= g.n) {
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < FC; ++b) {
+        const int i = i0 + sc + b * 8;
+        simdgroup_matrix<TC, 8, 8> om;
+        simdgroup_half8x8 vm;
+        simdgroup_load(om, C + (ulong)j * g.ldc + i, (ulong)g.ldc);
+        simdgroup_load(vm, Vs + (sr + a * 8) * WROW + sc + b * 8, WROW);
+        thread auto& o = om.thread_elements();
+        thread auto& eg = acc[a][b].thread_elements();
+        thread auto& ev = vm.thread_elements();
+        _Pragma("clang loop unroll(full)")
+        for (int t = 0; t < 2; ++t) {
+          const float gval = eg[t] + bg2[b][t];
+          const float res = (float)o[t] + (float)ev[t] * (1.f / (1.f + exp(-gval)));
+          if constexpr (metal::is_same_v<TC, half>) {
+            const half hv = (half)clamp(res, -65504.f, 65504.f);
+            o[t] = hv;
+            if constexpr (LN) eg[t] = (float)hv;
+          } else {
+            o[t] = res;
+            if constexpr (LN) eg[t] = res;
+          }
+        }
+        simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+      }
+      continue;
+    }
+    const int jr = j + sm;
+    if (jr >= g.n) continue;
+    _Pragma("clang loop unroll(full)")
+    for (int b = 0; b < FC; ++b) {
+      const int i = i0 + sc + b * 8;
+      simdgroup_half8x8 vm;
+      simdgroup_load(vm, Vs + (sr + a * 8) * WROW + sc + b * 8, WROW);
+      thread auto& eg = acc[a][b].thread_elements();
+      thread auto& ev = vm.thread_elements();
+      _Pragma("clang loop unroll(full)")
+      for (int t = 0; t < 2; ++t) {
+        const int ic = i + sn + t;
+        const float gval = eg[t] + bg2[b][t];
+        const float res = lf_ldf(C + (ulong)jr * g.ldc + ic) + (float)ev[t] * (1.f / (1.f + exp(-gval)));
+        if constexpr (metal::is_same_v<TC, half>) {
+          const half hv = (half)clamp(res, -65504.f, 65504.f);
+          D[(ulong)jr * g.ldd + ic] = hv;
+          if constexpr (LN) eg[t] = (float)hv;
+        } else {
+          D[(ulong)jr * g.ldd + ic] = res;
+          if constexpr (LN) eg[t] = res;
+        }
+      }
+    }
+  }
+  if constexpr (LN) {
+    if (g.lnOut) {
+      threadgroup float* part = (threadgroup float*)Xs;
+      const bool leader = ((lane & 9) == 0);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        float s = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& eg = acc[a][b].thread_elements();
+          s += eg[0] + eg[1];
+        }
+        s += simd_shuffle_xor(s, 1);
+        s += simd_shuffle_xor(s, 8);
+        if (leader) part[(sg % SGC) * TR + sr + a * 8 + sm] = s;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float mean[FR];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const int r = sr + a * 8 + sm;
+        float sum = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int c = 0; c < SGC; ++c) sum += part[c * TR + r];
+        mean[a] = sum * (1.f / (float)TC_);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const float m = mean[a];
+        float v = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& eg = acc[a][b].thread_elements();
+          const float d0 = eg[0] - m, d1 = eg[1] - m;
+          v += d0 * d0 + d1 * d1;
+        }
+        v += simd_shuffle_xor(v, 1);
+        v += simd_shuffle_xor(v, 8);
+        if (leader) part[(sg % SGC) * TR + sr + a * 8 + sm] = v;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      device half* lnOut = (device half*)g.lnOut;
+      device const float* lnSc = (device const float*)g.lnScale;
+      device const float* lnOf = (device const float*)g.lnOffset;
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const int r = sr + a * 8 + sm, jr = j0 + r;
+        if (jr >= g.n) continue;
+        const float m = mean[a];
+        float vsum = 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int c = 0; c < SGC; ++c) vsum += part[c * TR + r];
+        const float inv = rsqrt(vsum * (1.f / (float)TC_) + g.lnEps);
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          thread auto& eg = acc[a][b].thread_elements();
+          const int col0 = sc + b * 8 + sn, ic0 = i0 + col0;
+          const float n0 = (eg[0] - m) * inv, n1 = (eg[1] - m) * inv;
+          const float s0 = lnSc[col0], s1 = lnSc[col0 + 1];
+          const float o0 = lnOf ? lnOf[col0] : 0.f, o1 = lnOf ? lnOf[col0 + 1] : 0.f;
+          *(device half2*)(lnOut + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * s0 + o0), (half)(n1 * s1 + o1));
+        }
+      }
+    }
+  }
+}

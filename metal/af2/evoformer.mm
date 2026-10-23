@@ -171,27 +171,35 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
   // q|k|v|g a block of batch rows at a time, 256 MB of them: a triangle attention's whole pair's was 1.1 GB at 1044
   // residues, and an alignment's as much. A batch row attends over its own n positions only, so the blocks are the same
   // arithmetic; below ~500 residues (and most alignments) one block is everything
-  const size_t perRow = (size_t)n * 4 * W * 2;
+  const size_t perRow = (size_t)n * (n == 1 ? 2 : 4) * W * 2;
   const int rb = qkvgBlockRows(perRow, Bt);
   half* qkvg = scratch<half>("att.qkvg", (size_t)rb * perRow / 2);
   half* o = scratch<half>("att.o", rows * W);
-  for (int r0 = 0; r0 < Bt; r0 += rb) {
-    const int r = std::min(rb, Bt - r0);
-    // (across: batch rows r0.. are r rows at each of the n positions, a GEMM batched over them)
-    Gemm g{}; g.W = w.qkvg; g.tw = F16; g.tx = F16; g.Y = qkvg; g.ty = F16; g.in = C; g.out = 4 * W; g.bias = w.bias;
+  if (n == 1) {
+    Gemm g{}; g.X = xn; g.tx = F16; g.W = w.qkvg + 2 * W; g.ldw = 4 * W; g.tw = F16;
+    g.Y = qkvg; g.ty = F16; g.rows = Bt; g.in = C; g.out = 2 * W; g.bias = w.bias + 2 * W;
     g.label = "attention qkvg";
-    if (!across || r == Bt) { g.X = xn + (size_t)r0 * n * C; g.rows = (size_t)r * n; }
-    else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)Bt * C; g.sy = (int64_t)r * 4 * W; g.batch = n; }
     gemm(g);
-    Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = w.H; at.D = w.D; at.rows = r; at.scale = 1.f / sqrtf((float)w.D);
-    at.bias = bias; at.biasStride = bias ? biasStride(n) : n; at.biasPadInf = bias != nullptr;
-    at.mask = mask; at.maskB = maskB; at.maskK = maskK; at.r0 = r0;
-    if (!across) at.out = o + (size_t)r0 * n * W;
-    else {
-      at.rowStride = 4 * W; at.posStride = (int64_t)r * 4 * W;
-      at.out = o + (size_t)r0 * W; at.outRowStride = W; at.outPosStride = (int64_t)Bt * W;
+    run1d("af2_vg_gate", (W & 3) ? rows * W : rows * (W >> 2), VgGateArgs{qkvg, o, (uint)Bt, (uint)W});
+  } else {
+    for (int r0 = 0; r0 < Bt; r0 += rb) {
+      const int r = std::min(rb, Bt - r0);
+      // (across: batch rows r0.. are r rows at each of the n positions, a GEMM batched over them)
+      Gemm g{}; g.W = w.qkvg; g.tw = F16; g.tx = F16; g.Y = qkvg; g.ty = F16; g.in = C; g.out = 4 * W; g.bias = w.bias;
+      g.label = "attention qkvg";
+      if (!across || r == Bt) { g.X = xn + (size_t)r0 * n * C; g.rows = (size_t)r * n; }
+      else { g.X = xn + (size_t)r0 * C; g.rows = r; g.ldx = C; g.sx = (int64_t)Bt * C; g.sy = (int64_t)r * 4 * W; g.batch = n; }
+      gemm(g);
+      Attention at{}; at.qkvg = qkvg; at.n = n; at.heads = w.H; at.D = w.D; at.rows = r; at.scale = 1.f / sqrtf((float)w.D);
+      at.bias = bias; at.biasStride = bias ? biasStride(n) : n; at.biasPadInf = bias != nullptr;
+      at.mask = mask; at.maskB = maskB; at.maskK = maskK; at.r0 = r0;
+      if (!across) at.out = o + (size_t)r0 * n * W;
+      else {
+        at.rowStride = 4 * W; at.posStride = (int64_t)r * 4 * W;
+        at.out = o + (size_t)r0 * W; at.outRowStride = W; at.outPosStride = (int64_t)Bt * W;
+      }
+      attention(at);
     }
-    attention(at);
   }
   if (!nextNorm.empty() && (C == 64 || C == 128 || C == 256)) {     // (the residual's next norm emitted by the output projection)
     half* lnOut = lnTarget(rows, C, xn);
@@ -257,21 +265,27 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T*
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3), W = H * D;
   if (H > 8 || D > 16 || C > 256) die("global attention: %d heads of %d over %d channels", H, D, C);
   half* xn = pairLn(msa, rows, C, A + "/query_norm", blk, "gcol.xn");
-  // every sequence's key and value (shared by the heads): one GEMM against [key_w | value_w]
-  int B = (int)dimW(A + "/attention/query_w", 0);
-  const half* kvw = M.derived<half>("kv:" + A, (size_t)B * C * 2 * D, [&](half* out) {
-    copy2d(out, 2 * D * 2, PH(A + "/attention/key_w"), D * 2, D * 2, (size_t)B * C);
-    copy2d(out + D, 2 * D * 2, PH(A + "/attention/value_w"), D * 2, D * 2, (size_t)B * C);
-  }) + (size_t)blk * C * 2 * D;
-  float* kv = scratch<float>("gcol.kv", rows * 2 * D);
-  { Gemm g{}; g.X = xn; g.tx = F16; g.W = kvw; g.tw = F16; g.Y = kv; g.rows = rows; g.in = C; g.out = 2 * D; g.label = "global kv"; gemm(g); }
-  float* avg = scratch<float>("gcol.avg", (size_t)L * W);
-  run("af2_global_attention", Grid{(uint32_t)L, 1, 1}, 256,
-      GlobalAttnArgs{xn, kv, msaMask, PH(A + "/attention/query_w", blk), avg, (uint)rowsN, (uint)L, (uint)C, (uint)H, (uint)D, 0});
+  float* avg = scratch<float>("gcol.avg", (size_t)L * (rowsN == 1 ? D : W));
+  if (rowsN == 1) {
+    Gemm g{}; g.X = xn; g.tx = F16; g.W = PH(A + "/attention/value_w", blk); g.tw = F16; g.Y = avg;
+    g.rows = L; g.in = C; g.out = D; g.label = "global kv"; gemm(g);
+  } else {
+    // every sequence's key and value (shared by the heads): one GEMM against [key_w | value_w]
+    int B = (int)dimW(A + "/attention/query_w", 0);
+    const half* kvw = M.derived<half>("kv:" + A, (size_t)B * C * 2 * D, [&](half* out) {
+      copy2d(out, 2 * D * 2, PH(A + "/attention/key_w"), D * 2, D * 2, (size_t)B * C);
+      copy2d(out + D, 2 * D * 2, PH(A + "/attention/value_w"), D * 2, D * 2, (size_t)B * C);
+    }) + (size_t)blk * C * 2 * D;
+    float* kv = scratch<float>("gcol.kv", rows * 2 * D);
+    { Gemm g{}; g.X = xn; g.tx = F16; g.W = kvw; g.tw = F16; g.Y = kv; g.rows = rows; g.in = C; g.out = 2 * D; g.label = "global kv"; gemm(g); }
+    run("af2_global_attention", Grid{(uint32_t)L, 1, 1}, 256,
+        GlobalAttnArgs{xn, kv, msaMask, PH(A + "/attention/query_w", blk), avg, (uint)rowsN, (uint)L, (uint)C, (uint)H, (uint)D, 0});
+  }
   float* gate = scratch<float>("gcol.gate", rows * W);
   linearWB(xn, A + "/attention/gating_w", A + "/attention/gating_b", blk, gate, rows, C, W, 0.f);
   half* gated = scratch<half>("gcol.gated", rows * W);
-  run1d("af2_global_gate", (W & 3) ? rows * W : rows * (W >> 2), GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, 0});
+  run1d("af2_global_gate", (W & 3) ? rows * W : rows * (W >> 2),
+        GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, rowsN == 1 ? (uint)D : 0u});
   if (!nextNorm.empty() && (C == 64 || C == 128 || C == 256)) {
     half* lnOut = lnTarget(rows, C, xn);
     Gemm g{}; g.X = gated; g.tx = F16; g.W = PH(A + "/attention/output_w", blk); g.tw = F16; g.Y = msa; g.ty = dtOf<T>();

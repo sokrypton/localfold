@@ -1221,13 +1221,16 @@ export function transitionSplitChunkRows(rows, channels, factor, limits = {}) {
  * different `rows` in the matmul uniform and there are at most two of them.
  */
 export function allocateTransitionSplit(allocator, shape, keep = (a) => a) {
-  const { rows, channels, factor, chunkRows, precision = "f16", offsets, label = "transition" } = shape;
+  const { rows, channels, factor, chunkRows, precision = "f16", offsets, label = "transition", scratch } = shape;
   const intermediate = channels * factor;
   const width = precision === "f16" ? 2 : 4;
-  const normalized = keep(allocator.allocate(
-    `${label}.normalized`, chunkRows * channels * width, GPUBufferUsage.STORAGE));
-  const wide = keep(allocator.allocate(
-    `${label}.wide`, chunkRows * intermediate * 2 * width, GPUBufferUsage.STORAGE));
+  const normBytes = chunkRows * channels * width;
+  const wideBytes = chunkRows * intermediate * 2 * width;
+  const reuse = (slot, bytes, name) => (slot !== undefined && slot.byteLength >= bytes
+    ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
+    : keep(allocator.allocate(`${label}.${name}`, bytes, GPUBufferUsage.STORAGE)));
+  const normalized = reuse(scratch?.[0], normBytes, "normalized");
+  const wide = reuse(scratch?.[1], wideBytes, "wide");
   const parameters = new Map();
   for (const count of new Set([chunkRows, rows % chunkRows].filter((c) => c > 0))) {
     parameters.set(count, {

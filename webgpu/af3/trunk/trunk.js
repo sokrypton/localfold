@@ -405,11 +405,12 @@ export class Af3TrunkGpu {
           ...options, scratchAllocator,
           pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
           deferReadback: true, validation,
-          onBlock: (index) => options.onPairformerBlock?.(index,
-                                                          weights.pairformerBlocks.length),
+          onBlock: options.onPairformerBlock === undefined ? undefined
+            : (index) => options.onPairformerBlock(index, weights.pairformerBlocks.length),
           // ...and the one that says the device GOT there, which is what a status
           // line should show. See the note in pairformer-block.js.
-          onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
+          onBlockDone: options.onPairformerBlockDone === undefined ? undefined
+            : (completed, total) => options.onPairformerBlockDone(completed, total),
         }));
       // 🔴 THE SCRATCH IS DONE WITH ONCE THE PAIRFORMER IS, SO IT GOES NOW. The
       // pool lived to the end of the pass, which put five pair-sized buffers

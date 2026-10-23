@@ -413,18 +413,37 @@ kernel void af2_global_attention(constant GlobalAttnArgs& a [[buffer(0)]], uint3
 // out[s, i, w] = avg[i, w] sigmoid(gate[s, i, w]) (half: the output projection's input)
 kernel void af2_global_gate(LF_ARGS(GlobalGateArgs)) {
   ulong t = LF_INDEX;
-  if ((a.W & 3) == 0) {
-    uint W4 = a.W >> 2;
+  if ((a.W & 3) == 0 && (a.pad & 3) == 0) {
+    uint W4 = a.W >> 2, A4 = a.pad ? (a.pad >> 2) : W4;
     if (t >= (ulong)a.S * a.L * W4) return;
     uint r = lf_udiv((uint)t, W4), w4 = (uint)t - r * W4, i = r - lf_udiv(r, a.L) * a.L;
-    float4 av = ((device const float4*)a.avg)[(ulong)i * W4 + w4];
+    uint a4 = a.pad ? w4 - lf_udiv(w4, A4) * A4 : w4;
+    float4 av = ((device const float4*)a.avg)[(ulong)i * A4 + a4];
     float4 gv = ((device const float4*)a.gate)[t];
     ((device half4*)a.out)[t] = half4(av * (1.f / (1.f + exp(-gv))));
     return;
   }
   if (t >= (ulong)a.S * a.L * a.W) return;
   uint r = lf_udiv((uint)t, a.W), w = (uint)t - r * a.W, i = r - lf_udiv(r, a.L) * a.L;
-  a.out[t] = (half)(a.avg[(ulong)i * a.W + w] * lf_sigmoid(a.gate[t]));
+  uint aw = a.pad ? w % a.pad : w, astr = a.pad ? a.pad : a.W;
+  a.out[t] = (half)(a.avg[(ulong)i * astr + aw] * lf_sigmoid(a.gate[t]));
+}
+// out[r, w] = v[r, w] * sigmoid(g[r, w]) for single-key (n == 1) attention where vg is [rows, 2 * W]
+kernel void af2_vg_gate(LF_ARGS(VgGateArgs)) {
+  ulong t = LF_INDEX;
+  if ((a.W & 3) == 0) {
+    uint W4 = a.W >> 2;
+    if (t >= (ulong)a.rows * W4) return;
+    uint r = lf_udiv((uint)t, W4), w4 = (uint)t - r * W4;
+    device const half4* vg = (device const half4*)(a.vg + (ulong)r * 2 * a.W);
+    float4 v = float4(vg[w4]), g = float4(vg[W4 + w4]);
+    ((device half4*)a.out)[t] = half4(v * (1.f / (1.f + exp(-g))));
+    return;
+  }
+  if (t >= (ulong)a.rows * a.W) return;
+  uint r = lf_udiv((uint)t, a.W), w = (uint)t - r * a.W;
+  device const half* vg = a.vg + (ulong)r * 2 * a.W;
+  a.out[t] = (half)((float)vg[w] * lf_sigmoid((float)vg[a.W + w]));
 }
 
 // ---------------------------------------------------------------- templates

@@ -28,6 +28,7 @@ struct TileBiasArgs { CP(float) bias; DP(float) out; uint L, C; float scale; uin
 struct MaskNormArgs { CP(float) mask; DP(float) norm; uint S, L; };
 struct GlobalAttnArgs { CP(half) xn; CP(float) kv; CP(float) mask; CP(half) qw; DP(float) avg; uint S, L, C, H, D, pad; };
 struct GlobalGateArgs { CP(float) avg; CP(float) gate; DP(half) out; uint S, L, W, pad; };
+struct VgGateArgs { CP(half) vg; DP(half) out; uint rows, W; };
 
 // ---------------------------------------------------------------- templates
 struct TmplPairArgs { CP(int) aatype; CP(float) pos; CP(float) mask; CP(float) w0; CP(float) w1; CP(float) w2; CP(float) w3;
