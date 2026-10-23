@@ -726,11 +726,14 @@ inline float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int 
 // GEMM_HALF: every GEMM input written in f16 by the kernel before it (adaLN, the gated attention output)
 inline void condLayerHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias,
                           int perSample, float* tOut = nullptr,
-                          const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0) {
+                          const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0,
+                          half* preAdaLn = nullptr) {
   const std::string a = L.att;
-  half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
-  if (preH) adaLnGatedAdd<half>(x, preH, preGate, hh, R, D, cond, cond + D, 6 * D, map, preLdg);
-  else adaLn<half>(x, hh, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
+  half* hh = preAdaLn ? preAdaLn : scratch<half>("be2.cl.hh", (size_t)R * D);
+  if (!preAdaLn) {
+    if (preH) adaLnGatedAdd<half>(x, preH, preGate, hh, R, D, cond, cond + D, 6 * D, map, preLdg);
+    else adaLn<half>(x, hh, R, D, cond, cond + D, 6 * D, 0, 1.f, map);
+  }
   half* qkvg = scratch<half>("be2.cl.qkvh", (size_t)R * 4 * D);
   const half* wQkvg = stackedMirror2<half>(lw(L, a + "proj_qkv/weight"), (size_t)3 * D * D,
                                            lw(L, a + "proj_g/weight"), (size_t)D * D);
@@ -752,8 +755,9 @@ inline void condLayerHalf(const CondLayer& L, float* x, int R, int D, const floa
 }
 inline void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias,
                       int perSample, float* tOut = nullptr,
-                      const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0) {
-  if (GEMM_HALF) { condLayerHalf(L, x, R, D, cond, map, bias, perSample, tOut, preH, preGate, preLdg); return; }
+                      const float* preH = nullptr, const float* preGate = nullptr, int preLdg = 0,
+                      half* preAdaLn = nullptr) {
+  if (GEMM_HALF) { condLayerHalf(L, x, R, D, cond, map, bias, perSample, tOut, preH, preGate, preLdg, preAdaLn); return; }
   float* h = scratch<float>("be2.cl.h", (size_t)R * D);
   if (preH) adaLnGatedAdd<float>(x, preH, preGate, h, R, D, cond, cond + D, 6 * D, map, preLdg);
   else adaLn(x, h, R, D, cond, cond + D, 6 * D, 0, 1.f, map);

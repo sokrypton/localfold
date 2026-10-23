@@ -36,13 +36,14 @@ inline void buildTokenStarts(int T, int N) {
   if (TOK_START) CK(cudaFree(TOK_START));
   TOK_START = upload(start.data(), start.size());
 }
-// scatter_mean_atoms_to_tokens: per token, the mean over its real atoms (+1e-6 in the count)
-__global__ void meanAtomsK(const float* x, const int* start, float* out, int T, int C, int ldo) {
+// scatter_mean_atoms_to_tokens: per token, the mean over its real atoms (+1e-6 in the count), with fused ReLU on x
+__global__ void meanAtomsReluK(const float* __restrict__ x, const int* __restrict__ start,
+                               float* __restrict__ out, int T, int C, int ldo) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * C) return;
   int i = (int)(t / C), c = (int)(t % C);
-  float s = 0; int n = start[i + 1] - start[i];
-  for (int a = start[i]; a < start[i + 1]; ++a) s += x[(size_t)a * C + c];
+  float s = 0; int a0 = start[i], a1 = start[i + 1], n = a1 - a0;
+  for (int a = a0; a < a1; ++a) s += fmaxf(__ldg(x + (size_t)a * C + c), 0.f);
   out[(size_t)i * ldo + c] = s / ((float)n + 1e-6f);
 }
 // the rest of s_inputs after the atom half: one-hot res_type (33), profile (33), deletion_mean, one-hot pocket (4)
@@ -70,29 +71,43 @@ inline void inputEmbedder(float* sInputs, int Si, const std::function<void(const
   pairTail(IE, pr, c, N);
   float* q = scratch<float>("be2.ie.q", (size_t)N * C);
   CK(cudaMemcpyAsync(q, c, (size_t)N * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-  float* bias = scratch<float>("be2.ie.bias", (size_t)N * WK * 4);
+  const std::string a = "attention/attention_layer/pair_bias_attn/";
+  const int Ha = dimP(IE + "atom_encoder_layers_0/transformer_layer/" + a + "proj_z/weight", 0);
+  const size_t wb = (size_t)N * WK * Ha;
+  float* biasAll = scratch<float>("be2.ie.bias", 3 * wb);
+  WinBiasPtrs wbPtrs{};
   for (int i = 0; i < 3; ++i) {
     std::string p = IE + "atom_encoder_layers_" + std::to_string(i) + "/transformer_layer/";
-    std::string a = "attention/attention_layer/pair_bias_attn/";
-    windowBias(pr, P(p + a + "norm_z/weight"), P(p + a + "proj_z/weight"), bias, N, dimP(p + a + "proj_z/weight", 0));
-    condLayer({p, a, -1, true, dimP(p + a + "proj_z/weight", 0)}, q, N, C, c, C, bias);
+    wbPtrs.normW[i] = P(p + a + "norm_z/weight");
+    wbPtrs.projZ[i] = P(p + a + "proj_z/weight");
+  }
+  windowBiasBatch(pr, wbPtrs, biasAll, N, Ha, 3);
+  for (int i = 0; i < 3; ++i) {
+    std::string p = IE + "atom_encoder_layers_" + std::to_string(i) + "/transformer_layer/";
+    condLayer({p, a, -1, true, Ha}, q, N, C, c, C, biasAll + i * wb);
   }
   const int A = dimP(IE + "atom_to_token_trans_0/weight", 0);
   float* h = scratch<float>("be2.ie.h", (size_t)N * A);
   linear(q, P(IE + "atom_to_token_trans_0/weight"), h, N, C, A);
-  size_t na = (size_t)N * A;
-  reluK<<<blocks(((na & 3) == 0 && (((uintptr_t)h & 15) == 0)) ? (na >> 2) : na), 256, 0, STREAM>>>(h, h, na);
-  meanAtomsK<<<blocks((size_t)T * A), 256, 0, STREAM>>>(h, TOK_START, sInputs, T, A, Si);
+  meanAtomsReluK<<<blocks((size_t)T * A), 256, 0, STREAM>>>(h, TOK_START, sInputs, T, A, Si);
   sInputsTailK<<<blocks((size_t)T * 71), 256, 0, STREAM>>>(sInputs, Idev("res_type"), Fdev("profile"),
       Fdev("deletion_mean"), Idev("pocket_feature"), T, A, Si);
   if (tap) tap("s_inputs", sInputs, (size_t)T * Si);
 }
 
 // ---------------------------------------------------------------- z_init
-// method pair (both axes), token bonds and contact conditioning added to z [P, C] (C = 256)
+__global__ void addMethodEmbK(float* __restrict__ sInit, const int* __restrict__ meth,
+                              const float* __restrict__ emb, int T, int Cs) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)T * Cs) return;
+  int i = (int)(t / Cs), c = (int)(t % Cs);
+  sInit[t] += __ldg(emb + (size_t)__ldg(meth + i) * Cs + c);
+}
+// method pair (both axes), token bonds, contact conditioning, and relative position encoding written to z [P, C] (C = 256)
 __global__ void zInitTermsK(float* z, const float* rows, const float* cols, const int* meth, const float* methPair,
                             const float* bonds, const float* wBond, const int* cls, const float* thr, const float* enc,
                             const float* encB, const float* unspec, const float* unsel, const float* fw, const float* fb,
+                            RelTables relW, const int* asym, const int* ent, const int* res, const int* sym,
                             int T, int C) {
   __shared__ float shCos[256];
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -125,21 +140,22 @@ __global__ void zInitTermsK(float* z, const float* rows, const float* cols, cons
     }
     v += e;
   }
+  const int rmax = 32, smax = 2;
+  auto clip = [](int val, int lo, int hi) { return val < lo ? lo : val > hi ? hi : val; };
+  bool sameChain = asym[i] == asym[j], sameRes = res[i] == res[j], sameEnt = ent[i] == ent[j];
+  int dRes = sameChain ? clip(res[i] - res[j] + rmax, 0, 2 * rmax) : 2 * rmax + 1;
+  int dTok = sameChain && sameRes ? clip(i - j + rmax, 0, 2 * rmax) : 2 * rmax + 1;
+  int dChain = sameEnt ? clip(sym[i] - sym[j] + smax, 0, 2 * smax) : 2 * smax + 1;
+  v += relW.pos[(size_t)dRes * C + c] + relW.tok[(size_t)dTok * C + c] + (sameEnt ? relW.ent[c] : 0.f)
+       + relW.chain[(size_t)dChain * C + c];
   z[t] = v;
 }
 inline void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit,
                       const std::function<void(const char*, const float*, size_t)>& tap) {
   const int T = D_.T, Cs = dimP(SE + "s_init/weight", 0), C = dimP(SE + "z_init_1/weight", 0);
   linear(sInputs, P(SE + "s_init/weight"), sInit, T, Si, Cs);
-  // s_init += method_conditioning.embedding[method] (no token padding here)
-  {
-    std::vector<int> meth(M.i("method_feature"), M.i("method_feature") + T);
-    const float* emb = P(SE + "method_conditioning/embedding/weight");
-    for (int i = 0; i < T; ++i) {
-      const float one = 1.f;
-      CB(cublasSaxpy(H, Cs, &one, emb + (size_t)meth[i] * Cs, 1, sInit + (size_t)i * Cs, 1));
-    }
-  }
+  addMethodEmbK<<<blocks((size_t)T * Cs), 256, 0, STREAM>>>(
+      sInit, Idev("method_feature"), P(SE + "method_conditioning/embedding/weight"), T, Cs);
   float* rows = scratch<float>("be2.zi.rows", (size_t)T * C); float* cols = scratch<float>("be2.zi.cols", (size_t)T * C);
   linear(sInputs, P(SE + "z_init_1/weight"), rows, T, Si, C);
   linear(sInputs, P(SE + "z_init_2/weight"), cols, T, Si, C);
@@ -148,8 +164,9 @@ inline void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit,
       P(SE + "method_conditioning/pair_embedding/weight"), Fdev("token_bonds"), P(SE + "token_bonds/weight"),
       Idev("contact_class"), Fdev("contact_threshold"), P(cc + "encoder/weight"), P(cc + "encoder/bias"),
       P(cc + "encoding_unspecified"), P(cc + "encoding_unselected"), P(cc + "fourier_embedding/proj/weight"),
-      P(cc + "fourier_embedding/proj/bias"), T, C);
-  relPos(SE + "rel_pos/", zInit, T, C, true);
+      P(cc + "fourier_embedding/proj/bias"),
+      relTables(SE + "rel_pos/"), Idev("asym_id"), Idev("entity_id"), Idev("residue_index"), Idev("sym_id"),
+      T, C);
   if (tap) { tap("s_init", sInit, (size_t)T * Cs); tap("z_init", zInit, (size_t)T * T * C); }
 }
 
@@ -263,6 +280,64 @@ __global__ void pwaSoftmaxK(const float* __restrict__ b, float* __restrict__ w, 
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   for (int j = lane; j < T; j += 32) w[row * T + j] = expf(b[((size_t)i * T + j) * H + h] - mx) / s;
 }
+// Fused LayerNorm(z, 256) + proj_z [8, 256] -> b [Pn, 8], a warp per pair row.
+// Eliminates materializing zn [Pn, 256] (500 MB read+write per MSA layer at T=494, 8 GB per fold).
+__global__ void __launch_bounds__(256, 4)
+pwaNormProjK(const float* __restrict__ z, const float* __restrict__ scale, const float* __restrict__ bias,
+             const float* __restrict__ projW, float* __restrict__ b, size_t Pn) {
+  constexpr int C = 256, H = 8;
+  __shared__ float sScale[C];
+  __shared__ float sBias[C];
+  __shared__ float sW[H][C];
+  int tx = threadIdx.x;
+  sScale[tx] = __ldg(scale + tx);
+  sBias[tx] = __ldg(bias + tx);
+  #pragma unroll
+  for (int h = 0; h < H; ++h) sW[h][tx] = __ldg(projW + h * C + tx);
+  __syncthreads();
+  size_t row = (size_t)blockIdx.x * 8 + (tx >> 5);
+  int lane = tx & 31;
+  if (row >= Pn) return;
+  const float* zr = z + row * C;
+  float xv[8];
+  float sum = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float v = __ldg(zr + k * 32 + lane);
+    xv[k] = v;
+    sum += v;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  float mean = sum * (1.f / 256.f), var = 0.f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float d = xv[k] - mean;
+    var += d * d;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
+  float inv = rsqrtf(var * (1.f / 256.f) + 1e-5f);
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    int c = k * 32 + lane;
+    xv[k] = (xv[k] - mean) * inv * sScale[c] + sBias[c];
+  }
+  float dot[H];
+  #pragma unroll
+  for (int h = 0; h < H; ++h) {
+    float s = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) s += xv[k] * sW[h][k * 32 + lane];
+    dot[h] = s;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) {
+    #pragma unroll
+    for (int h = 0; h < H; ++h) dot[h] += __shfl_xor_sync(~0u, dot[h], o);
+  }
+  if (lane < H) b[row * H + lane] = dot[lane];
+}
 inline void pairWeightedAveraging(float* m, const float* z, int l) {
   const int T = D_.T, S = D_.S, Cm = 128, C = 256, Hh = 8, Ch = 32;
   const std::string p = SE + "msa_module/layers/pair_weighted_averaging/";
@@ -273,18 +348,23 @@ inline void pairWeightedAveraging(float* m, const float* z, int l) {
   float* v = scratch<float>("be2.pwa.v", R * Hh * Ch); float* g = scratch<float>("be2.pwa.g", R * Hh * Ch);
   linear(mn, w("proj_m/weight"), v, R, Cm, Hh * Ch);
   linear(mn, w("proj_g/weight"), g, R, Cm, Hh * Ch);
-  float* zn = scratch<float>("be2.pwa.zn", Pn * C);
-  layerNorm(z, zn, Pn, C, w("norm_z/weight"), w("norm_z/bias"));
   float* b = scratch<float>("be2.pwa.b", Pn * Hh);
-  linear(zn, w("proj_z/weight"), b, Pn, C, Hh);
+  pwaNormProjK<<<(unsigned)((Pn + 7) / 8), 256, 0, STREAM>>>(z, w("norm_z/weight"), w("norm_z/bias"), w("proj_z/weight"), b, Pn);
   float* wts = scratch<float>("be2.pwa.w", (size_t)Hh * Pn);
   pwaSoftmaxK<<<(unsigned)(((size_t)Hh * T + 7) / 8), 256, 0, STREAM>>>(b, wts, T, Hh);
   float* o = scratch<float>("be2.pwa.o", R * Hh * Ch);
   const float one = 1.f, zero = 0.f;
   // o[s, i, h, :] = sum_j w[h, i, j] v[s, j, h, :], a batch over the rows s for each head
-  for (int h = 0; h < Hh; ++h)
-    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Ch, T, T, &one, v + h * Ch, Hh * Ch, (long long)T * Hh * Ch,
-                                 wts + (size_t)h * Pn, T, 0, &zero, o + h * Ch, Hh * Ch, (long long)T * Hh * Ch, S));
+  // When S == 1, all 8 heads have constant stride (strideA = Ch, strideB = Pn, strideC = Ch), so issue 1 batched GEMM.
+  if (S == 1) {
+    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Ch, T, T, &one,
+                                 v, Hh * Ch, Ch, wts, T, (long long)Pn, &zero,
+                                 o, Hh * Ch, Ch, Hh));
+  } else {
+    for (int h = 0; h < Hh; ++h)
+      CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, Ch, T, T, &one, v + h * Ch, Hh * Ch, (long long)T * Hh * Ch,
+                                   wts + (size_t)h * Pn, T, 0, &zero, o + h * Ch, Hh * Ch, (long long)T * Hh * Ch, S));
+  }
   size_t nrg = R * Hh * Ch;
   sigmoidMulK<<<blocks(((nrg & 3) == 0 && (((uintptr_t)o | (uintptr_t)g) & 15) == 0) ? (nrg >> 2) : nrg), 256, 0, STREAM>>>(o, g, o, nrg);
   linear(o, w("proj_o/weight"), m, R, Hh * Ch, Cm, 1.f);
@@ -297,11 +377,14 @@ __global__ void opmPackK(const float* proj, float* a, float* b, size_t R, int T,
   (c < Co ? a : b)[r * Co + (c % Co)] = proj[t];
 }
 // x [(i, c), (j, d)] for a block of i -> y [(i, j), (c, d)] / n
-__global__ void opmPermuteRowsK(const float* x, float* y, int bi, int T, int Co, float inv) {
+template <class TY = float>
+__global__ void opmPermuteRowsK(const float* __restrict__ x, TY* __restrict__ y, int bi, int T, int Co, float inv) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)bi * T * Co * Co) return;
   int d = (int)(t % Co); size_t r = t / Co; int c = (int)(r % Co); r /= Co; int j = (int)(r % T); int i = (int)(r / T);
-  y[t] = x[((size_t)i * Co + c) * ((size_t)T * Co) + (size_t)j * Co + d] * inv;
+  float v = x[((size_t)i * Co + c) * ((size_t)T * Co) + (size_t)j * Co + d] * inv;
+  if constexpr (std::is_same_v<TY, float>) y[t] = v;
+  else y[t] = toH<TY>(v);
 }
 inline void outerProductMean(const float* m, float* z, int l) {
   const int T = D_.T, S = D_.S, Cm = 128, C = 256;
@@ -318,8 +401,22 @@ inline void outerProductMean(const float* m, float* z, int l) {
   const size_t TC = (size_t)T * Co;
   int bi = (int)std::max<size_t>(1, std::min<size_t>(T, ((size_t)32 << 20) / (Co * TC)));
   float* x = scratch<float>("be2.opm.x", (size_t)bi * Co * TC);
-  float* y = scratch<float>("be2.opm.y", (size_t)bi * T * Co * Co);
   const float one = 1.f, zero = 0.f, inv = 1.f / (float)D_.nValidRows;
+  if (FAST) {
+    half* yh = reinterpret_cast<half*>(scratch<__nv_bfloat16>("ftri.a", (size_t)bi * T * Co * Co));
+    const half* wProjO = halfMirror<half>(w("proj_o/weight"), (size_t)C * Co * Co);
+    for (int i0 = 0; i0 < T; i0 += bi) {
+      int n = std::min(bi, T - i0);
+      CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, (int)TC, n * Co, S, &one, b, (int)TC, a + (size_t)i0 * Co, (int)TC, &zero,
+                     x, (int)TC));
+      opmPermuteRowsK<half><<<blocks((size_t)n * T * Co * Co), 256, 0, STREAM>>>(x, yh, n, T, Co, inv);
+      float* zr = z + (size_t)i0 * T * C;
+      linearPre<half>(yh, wProjO, zr, (size_t)n * T, Co * Co, C, 1.f);
+      addBiasRows(zr, w("proj_o/bias"), (size_t)n * T, C);
+    }
+    return;
+  }
+  float* y = scratch<float>("be2.opm.y", (size_t)bi * T * Co * Co);
   for (int i0 = 0; i0 < T; i0 += bi) {
     int n = std::min(bi, T - i0);
     // x(jd, ic) column-major = sum_s b[s][jd] a[s][ic]
@@ -345,10 +442,17 @@ inline void trunkPass(const float* sInputs, int Si, const float* sInit, const fl
   layerNorm(s, sn, T, Cs, P(SE + "s_norm/weight"), P(SE + "s_norm/bias"));
   CK(cudaMemcpyAsync(s, sInit, (size_t)T * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   linear(sn, P(SE + "s_recycle/weight"), s, T, Cs, Cs, 1.f);
-  float* zn = scratch<float>("be2.tri.zn", Pn * C);       // (shares the triangle's: spent before it runs)
-  layerNorm(z, zn, Pn, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
-  CK(cudaMemcpyAsync(z, zInit, Pn * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-  linear(zn, P(SE + "z_recycle/weight"), z, Pn, C, C, 1.f);
+  if (FAST) {
+    half* znh = reinterpret_cast<half*>(scratch<__nv_bfloat16>("ftri.a", Pn * C));
+    lnTo<half>(z, znh, Pn, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
+    CK(cudaMemcpyAsync(z, zInit, Pn * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    linearPre<half>(znh, halfMirror<half>(P(SE + "z_recycle/weight"), (size_t)C * C), z, Pn, C, C, 1.f);
+  } else {
+    float* zn = scratch<float>("be2.tri.zn", Pn * C);       // (shares the triangle's: spent before it runs)
+    layerNorm(z, zn, Pn, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
+    CK(cudaMemcpyAsync(z, zInit, Pn * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    linear(zn, P(SE + "z_recycle/weight"), z, Pn, C, C, 1.f);
+  }
   // the MSA module
   float* m = scratch<float>("be2.msa.m", (size_t)S * T * Cm);
   float* sp = scratch<float>("be2.msa.sp", (size_t)T * Cm);
@@ -359,7 +463,8 @@ inline void trunkPass(const float* sInputs, int Si, const float* sInit, const fl
   const int msaLayers = dimP(ml + "z_transition/fc1/weight", 0);
   for (int l = 0; l < msaLayers; ++l) {
     pairWeightedAveraging(m, z, l);
-    transition(m, m, (size_t)S * T, Cm, ml + "msa_transition/", l);
+    if (FAST && S > 4) transitionHalf(m, nullptr, m, (size_t)S * T, Cm, ml + "msa_transition/", l, true, true, 0);
+    else transition(m, m, (size_t)S * T, Cm, ml + "msa_transition/", l);
     outerProductMean(m, z, l);
     TRIMUL(z, ml + "tri_mul_out/", l, true);
     TRIMUL(z, ml + "tri_mul_in/", l, false);

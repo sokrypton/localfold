@@ -34,6 +34,15 @@ inline const float* Popt(const std::string& n) { return hasP(n) ? P(n) : nullptr
 // 6MRR (f16 stops at 65,504, and the fold came back NaN), so fc3 takes bf16 - f32's range, 8 bits of mantissa
 // (`wide`).
 inline bool GEMM_HALF = false;
+template <class T> inline T* wpool(size_t n) {
+  static char* chunk = nullptr; static size_t used = 0, have = 0;
+  size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
+  if (used + bytes > have) {
+    have = std::max<size_t>(bytes, (size_t)256 << 20);
+    CK(devMalloc(&chunk, have)); used = 0;
+  }
+  T* p = (T*)(chunk + used); used += bytes; return p;
+}
 template <class TH> inline std::map<const float*, TH*>& mirrors() { static std::map<const float*, TH*> m; return m; }
 __global__ void be2ToHalfK(const float* __restrict__ x, half* __restrict__ y, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,7 +82,7 @@ template <class TH> inline const TH* halfMirror(const float* w, size_t n) {
   auto& m = mirrors<TH>();
   auto it = m.find(w);
   if (it != m.end()) return it->second;
-  TH* h = dallocT<TH>(n);
+  TH* h = wpool<TH>(n);
   size_t nt = ((n & 3) == 0 && (((uintptr_t)w & 15) == 0) && (((uintptr_t)h & 7) == 0)) ? (n >> 2) : n;
   if constexpr (std::is_same_v<TH, half>) be2ToHalfK<<<blocks(nt), 256, 0, STREAM>>>(w, h, n);
   else toBf16K<<<blocks(nt), 256, 0, STREAM>>>(w, h, n);
@@ -178,7 +187,7 @@ template <class TH> inline const TH* stackedMirror2(const float* w1, size_t n1, 
   static std::map<const float*, TH*> m;
   auto it = m.find(w1);
   if (it != m.end()) return it->second;
-  TH* h = dallocT<TH>(n1 + n2);
+  TH* h = wpool<TH>(n1 + n2);
   if constexpr (std::is_same_v<TH, float>) {
     CK(cudaMemcpyAsync(h, w1, n1 * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaMemcpyAsync(h + n1, w2, n2 * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -385,7 +394,7 @@ inline const half* interleavedSwigluMirror(const float* w1, const float* w2, int
   auto it = m.find(w1);
   if (it != m.end()) return it->second;
   size_t n = (size_t)I * C;
-  half* h = dallocT<half>(2 * n);
+  half* h = wpool<half>(2 * n);
   size_t groups = (size_t)(I >> 2);
   size_t totalVec4 = groups * 2 * (size_t)C;
   interleave4ToHalfK<<<blocks(totalVec4), 256, 0, STREAM>>>(w1, w2, h, groups, C);

@@ -188,6 +188,65 @@ __global__ void windowBiasK(const float* __restrict__ pr, const float* __restric
 inline void windowBias(const float* pr, const float* normW, const float* projZ, float* out, int N, int H) {
   windowBiasK<<<blocks((size_t)N * WK), 256, 0, STREAM>>>(pr, normW, projZ, out, N, H);
 }
+struct WinBiasPtrs {
+  const float* normW[16];
+  const float* projZ[16];
+};
+// Batched windowBias across `layers` (up to 16, H == 4, CP == 16): normalizes pr[t, 0..15] ONCE in registers and
+// projects all `layers` using shared-memory cached normW [layers, 16] and projZ [layers, 4, 16].
+__global__ void windowBiasBatchK(const float* __restrict__ pr, WinBiasPtrs ptrs,
+                                 float* __restrict__ out, int N, int H, int layers) {
+  constexpr int CP = 16;
+  __shared__ float sNorm[16][CP];
+  __shared__ float sProj[16][4 * CP];
+  for (int idx = threadIdx.x; idx < layers * CP; idx += blockDim.x) {
+    int l = idx / CP, c = idx % CP;
+    sNorm[l][c] = __ldg(ptrs.normW[l] + c);
+  }
+  for (int idx = threadIdx.x; idx < layers * H * CP; idx += blockDim.x) {
+    int l = idx / (H * CP), hc = idx % (H * CP);
+    sProj[l][hc] = __ldg(ptrs.projZ[l] + hc);
+  }
+  __syncthreads();
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)N * WK) return;
+  int j = (int)(t & (WK - 1)); size_t qa = t / WK; int w = (int)(qa / WQ), i = (int)(qa % WQ);
+  const float4* x4 = reinterpret_cast<const float4*>(pr + t * CP);
+  float4 v0 = __ldg(x4 + 0), v1 = __ldg(x4 + 1), v2 = __ldg(x4 + 2), v3 = __ldg(x4 + 3);
+  float mean = (v0.x + v0.y + v0.z + v0.w + v1.x + v1.y + v1.z + v1.w
+              + v2.x + v2.y + v2.z + v2.w + v3.x + v3.y + v3.z + v3.w) * (1.f / 16.f);
+  float x[CP] = {v0.x - mean, v0.y - mean, v0.z - mean, v0.w - mean,
+                 v1.x - mean, v1.y - mean, v1.z - mean, v1.w - mean,
+                 v2.x - mean, v2.y - mean, v2.z - mean, v2.w - mean,
+                 v3.x - mean, v3.y - mean, v3.z - mean, v3.w - mean};
+  float var = 0.f;
+  #pragma unroll
+  for (int c = 0; c < CP; ++c) var += x[c] * x[c];
+  float inv = rsqrtf(var * (1.f / 16.f) + 1e-5f);
+  #pragma unroll
+  for (int c = 0; c < CP; ++c) x[c] *= inv;
+  const size_t wb = (size_t)N * WK * H;
+  for (int l = 0; l < layers; ++l) {
+    float n[CP];
+    #pragma unroll
+    for (int c = 0; c < CP; ++c) n[c] = x[c] * sNorm[l][c];
+    float* outL = out + (size_t)l * wb;
+    for (int h = 0; h < H; ++h) {
+      float s = 0.f;
+      #pragma unroll
+      for (int c = 0; c < CP; ++c) s += sProj[l][h * CP + c] * n[c];
+      outL[(((size_t)w * H + h) * WQ + i) * WK + j] = s;
+    }
+  }
+}
+inline void windowBiasBatch(const float* pr, const WinBiasPtrs& ptrs, float* out, int N, int H, int layers) {
+  if (H == 4 && layers <= 16) {
+    windowBiasBatchK<<<blocks((size_t)N * WK), 256, 0, STREAM>>>(pr, ptrs, out, N, H, layers);
+    return;
+  }
+  const size_t wb = (size_t)N * WK * H;
+  for (int l = 0; l < layers; ++l) windowBias(pr, ptrs.normW[l], ptrs.projZ[l], out + (size_t)l * wb, N, H);
+}
 // the token pair's bias: LN(z) (scale, no offset) -> proj_z [H, C], heads first: out[h][i][j]
 __global__ void tokenBiasK(const float* zn, const float* biasHC, float* out, int T, int H) {
   // zn is already projected: [T*T, H]
@@ -203,6 +262,48 @@ inline void tokenBias(const float* z, const float* normW, const float* projZ, fl
   float* proj = scratch<float>("be2.tb.proj", P2 * H);
   linear(zn, projZ, proj, P2, C, H);
   tokenBiasK<<<blocks(P2 * H), 256, 0, STREAM>>>(proj, nullptr, out, T, H);
+}
+// Fused 16-layer tokenBias under GEMM_HALF: since norm_z has no bias offset, LN_l(z)_{ij,c} = z_hat_{ij,c} * norm_z[l, c].
+// Pre-multiplying W_tb[l*H + h, c] = proj_z[l, h, c] * norm_z[l, c] lets us normalize d.z ONCE (affine-free into half)
+// and project all 16 layers * 16 heads = 256 outputs in ONE [P, 256] x [256, 256] GEMM instead of 16 N=16 GEMMs.
+__global__ void tokenBiasScaleProjHalfK(const float* __restrict__ normZ, const float* __restrict__ projZ,
+                                        half* __restrict__ out, int layers, int H, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)layers * H * C) return;
+  int c = (int)(t % C); size_t lh = t / C; int l = (int)(lh / H);
+  out[t] = __float2half(projZ[t] * normZ[(size_t)l * C + c]);
+}
+__global__ void tokenBiasBatchK(const float* __restrict__ proj, float* __restrict__ out, size_t P2, int LH) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= P2 * LH) return;
+  int lh = (int)(t % LH); size_t ij = t / LH;
+  out[(size_t)lh * P2 + ij] = proj[t];
+}
+inline void tokenBiasAll(const float* z, const float* normWAll, const float* projZAll,
+                         float* out, int T, int C, int H, int layers) {
+  size_t P2 = (size_t)T * T;
+  if (!GEMM_HALF) {
+    size_t tbn = (size_t)H * P2;
+    for (int l = 0; l < layers; ++l)
+      tokenBias(z, normWAll + (size_t)l * C, projZAll + (size_t)l * H * C, out + (size_t)l * tbn, T, C, H);
+    return;
+  }
+  const int LH = layers * H;
+  static std::map<const float*, half*> wCache;
+  half* wh = nullptr;
+  auto it = wCache.find(projZAll);
+  if (it != wCache.end()) {
+    wh = it->second;
+  } else {
+    wh = wpool<half>((size_t)LH * C);
+    tokenBiasScaleProjHalfK<<<blocks((size_t)LH * C), 256, 0, STREAM>>>(normWAll, projZAll, wh, layers, H, C);
+    wCache[projZAll] = wh;
+  }
+  half* znh = scratch<half>("be2.tb.znh", P2 * C);
+  lnTo<half>(z, znh, P2, C, nullptr, nullptr);
+  float* proj = scratch<float>("be2.tb.projAll", P2 * LH);
+  linearPre<half>(znh, wh, proj, P2, C, LH);
+  tokenBiasBatchK<<<blocks(P2 * LH), 256, 0, STREAM>>>(proj, out, P2, LH);
 }
 
 
