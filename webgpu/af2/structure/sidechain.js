@@ -80,19 +80,11 @@ export class SidechainAnglesGpu {
       const weights = upload("sidechain.weights", packed);
       const inputElements = length * inputChannels;
       const hiddenElements = length * hiddenChannels;
-      const reluSource = allocate("sidechain.relu-source", inputElements);
-      const reluInitial = allocate("sidechain.relu-initial", inputElements);
-      const projection = allocate("sidechain.projection", hiddenElements);
-      const initialProjection = allocate("sidechain.initial-projection", hiddenElements);
+      const reluInput = allocate("sidechain.relu-input", inputElements);
       let act = allocate("sidechain.act-0", hiddenElements);
-      const temporaries = [0, 1].map((block) => ({
-        relu1: allocate(`sidechain.block-${block}.relu-1`, hiddenElements),
-        linear1: allocate(`sidechain.block-${block}.linear-1`, hiddenElements),
-        relu2: allocate(`sidechain.block-${block}.relu-2`, hiddenElements),
-        linear2: allocate(`sidechain.block-${block}.linear-2`, hiddenElements),
-        output: allocate(`sidechain.block-${block}.output`, hiddenElements),
-      }));
-      const reluFinal = allocate("sidechain.relu-final", hiddenElements);
+      let nextAct = allocate("sidechain.act-1", hiddenElements);
+      const temp0 = allocate("sidechain.temp-0", hiddenElements);
+      const temp1 = allocate("sidechain.temp-1", hiddenElements);
       const unnormalized = allocate("sidechain.unnormalized", length * 14,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const angles = allocate("sidechain.angles", length * 14, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -108,36 +100,39 @@ export class SidechainAnglesGpu {
         linearParams("sidechain.angle-params", hiddenChannels, 14, offsets[12], offsets[13]),
       ];
       const encoder = this.device.createCommandEncoder({ label: "sidechain-angles" });
+      const compute = encoder.beginComputePass({ label: "sidechain-angles" });
       const pass = (pipeline, buffers, x, y = 1) => {
-        const compute = encoder.beginComputePass(); compute.setPipeline(pipeline);
+        compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
         }));
-        compute.dispatchWorkgroups(x, y); compute.end();
+        compute.dispatchWorkgroups(x, y);
       };
-      pass(relu, [source, reluSource], Math.ceil(inputElements / 64));
-      pass(relu, [initial, reluInitial], Math.ceil(inputElements / 64));
-      pass(linear, [reluSource, weights, params[0], projection],
+      pass(relu, [source, reluInput], Math.ceil(inputElements / 64));
+      pass(linear, [reluInput, weights, params[0], nextAct],
         Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
-      pass(linear, [reluInitial, weights, params[1], initialProjection],
+      pass(relu, [initial, reluInput], Math.ceil(inputElements / 64));
+      pass(linear, [reluInput, weights, params[1], temp0],
         Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
-      pass(add, [projection, initialProjection, act], Math.ceil(hiddenElements / 64));
+      pass(add, [nextAct, temp0, act], Math.ceil(hiddenElements / 64));
       for (let block = 0; block < 2; block += 1) {
-        const temp = temporaries[block];
-        pass(relu, [act, temp.relu1], Math.ceil(hiddenElements / 64));
-        pass(linear, [temp.relu1, weights, params[2 + block * 2], temp.linear1],
+        pass(relu, [act, temp0], Math.ceil(hiddenElements / 64));
+        pass(linear, [temp0, weights, params[2 + block * 2], temp1],
           Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
-        pass(relu, [temp.linear1, temp.relu2], Math.ceil(hiddenElements / 64));
-        pass(linear, [temp.relu2, weights, params[3 + block * 2], temp.linear2],
+        pass(relu, [temp1, temp0], Math.ceil(hiddenElements / 64));
+        pass(linear, [temp0, weights, params[3 + block * 2], temp1],
           Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
-        pass(add, [act, temp.linear2, temp.output], Math.ceil(hiddenElements / 64));
-        act = temp.output;
+        pass(add, [act, temp1, nextAct], Math.ceil(hiddenElements / 64));
+        const prev = act;
+        act = nextAct;
+        nextAct = prev;
       }
-      pass(relu, [act, reluFinal], Math.ceil(hiddenElements / 64));
-      pass(linear, [reluFinal, weights, params[6], unnormalized],
+      pass(relu, [act, temp0], Math.ceil(hiddenElements / 64));
+      pass(linear, [temp0, weights, params[6], unnormalized],
         Math.ceil(14 / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
       pass(angleNormalize, [unnormalized, angles], Math.ceil(length * 7 / 64));
+      compute.end();
       const readbacks = [unnormalized, angles].map((value, index) => {
         const output = allocate(`sidechain.readback-${index}`, value.byteLength / 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);

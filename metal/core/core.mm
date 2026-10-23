@@ -723,8 +723,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 1.20 at 64 x 64; 4096 square 12.0 TFLOP/s against 9.5). Measured on an M5 (8-core GPU), interleaved.
   int tm = a.n <= 128 ? (a.n + 15) / 16 * 16 : 64, tn = a.n <= 128 ? (a.m >= 40 * 64 ? 64 : 32) : (a.m >= 128 ? 128 : 64);
   if ((a.epilogue & 16384) && a.n > 64 && a.n <= 128 && a.m <= 1024 && a.m % 64 == 0) { tm = 32; tn = 64; }
+  else if (a.n > 64 && a.n <= 128 && a.n % 16 != 0 && a.k <= 64 && batch == 1) { tm = 32; tn = 64; }
   if (a.n > 128 && tm == 64 && (((a.n + 63) & ~63) - a.n) * 12 > a.n && (((a.n + 31) & ~31) - a.n) * 2 < (((a.n + 63) & ~63) - a.n)) tm = 32;
-  if (a.n > 128 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 16) { tm = 32; tn = a.m >= 256 ? 128 : 64; }
+  if (a.n > 64 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 16 && batch == 1) {
+    tm = a.m <= 64 ? 16 : 32; tn = a.m >= 256 ? 128 : (a.m >= 64 ? 64 : 32);
+  }
   // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
   // 2.960 against 2.886). LOCALFOLD_GEMM_WIDE=0 the control
@@ -837,7 +840,9 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   }
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   if ((a.epilogue & 16384) && a.n > 64 && a.n <= 128 && a.m <= 1024 && a.m % 48 == 0) { tr = 16; tc = 48; }
-  else if (a.n > 128 && tr == 64 && a.m >= 128 && groups(32) < 64) { tr = 32; tc = 32; }
+  else if (a.n > 64 && tr > 32 && (groups(32) < 64 || (a.n <= 128 && a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
+    tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
+  }
   else while (tc > 16 && groups(tc) < 64) tc /= 2;
   // ...and 48-column tiles likewise (not SwiGLU's, coupling combine's, or the triangle gate's, whose epilogues pair 8-column blocks)
   if (tc == 64 && !(a.epilogue & (128 | 256 | 32768))) {

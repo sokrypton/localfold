@@ -227,9 +227,18 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) die("%s.transition1 has %zu elements, not %d x 2I", pre.c_str(), w1, C);
   int I = (int)(w1 / (2 * (size_t)C));
+  const bool padSt = rows <= 128 && (rows & 15) && !strcmp(scratchPrefix, "st.") && !sharedNorm(x);
+  size_t rp = padSt ? ((rows + 15) & ~(size_t)15) : rows;
   size_t chunk = std::min(rows, std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I)));
-  half* xn = scratch<half>(std::string(scratchPrefix) + "xn", chunk * C);
-  half* g = scratch<half>(std::string(scratchPrefix) + "g", chunk * I);
+  half* xn = scratch<half>(std::string(scratchPrefix) + "xn", std::max(chunk, rp) * C);
+  half* g = scratch<half>(std::string(scratchPrefix) + "g", std::max(chunk, rp) * I);
+  if (padSt) {
+    static const half* zeroedXn = nullptr; static size_t zeroedRows = 0;
+    if (xn != zeroedXn || rows != zeroedRows) {
+      fill(xn + rows * C, 0, (rp - rows) * C * sizeof(half));
+      zeroedXn = xn; zeroedRows = rows;
+    }
+  }
   const half* wp = swigluPairs(pre + ".transition1", C, I);
   // the input norm the previous update emitted, whole, read a chunk at a time - and the next norms emitted a chunk at a
   // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
@@ -239,6 +248,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
+    size_t rg = (padSt && r == rows) ? rp : r;
     half* in = inAll ? inAll + r0 * C : nullptr;
     const half* xs = in ? nullptr : sharedNorm(x);
     if (xs && foldTransition()) {     // (chai's shared input norm: this norm's affine folded into the SwiGLU's weights)
@@ -251,7 +261,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
         in = xn;
       }
       if (!in) { ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset"); in = xn; }
-      gemmSwiglu(in, wp, g, r, C, I);
+      gemmSwiglu(in, wp, g, rg, C, I);
     }
     // the pair's next norms (next1 into pr.x, next2 into pr.x2 - both free once the SwiGLU has read its input)
     if (emittedAll) {
@@ -267,7 +277,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
       emittedAll = false;       // (the GEMM took no emission - every chunk falls back alike)
       continue;
     }
-    addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, r, I, C);
+    addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C);
   }
   if (emittedAll) { emit(0, x, next1, scratch<half>("pr.x", rows * C)); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
 }
@@ -348,37 +358,61 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the transition reads
   // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
   const bool parallel = flag("trunk.dialect.parallelPairformer");
+  const size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
   float* s0 = nullptr;
-  if (parallel) { s0 = scratch<float>("st.s0", (size_t)n * Cs); copy(s0, single, (size_t)n * Cs * 4); }
+  if (parallel) {
+    s0 = scratch<float>("st.s0", np * Cs);
+    copy(s0, single, (size_t)n * Cs * 4);
+    if (np > (size_t)n) fill(s0 + (size_t)n * Cs, 0, (np - n) * Cs * 4);
+  }
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
   const half* xs = sharedNorm(pair);
   half* pln = xs ? (half*)xs : pairLn(pair, P, C, B + ".singlePairLogitsNorm", nextPairNorm);
-  float* raw = scratch<float>("st.raw", P * heads);
-  if (xs) {
-    Folded f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
-    linW(pln, f.w, raw, P, C, heads, 0.f, f.b, 1.f, "pair logits");
-  } else lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
-  if (extraBias) run1d("af3_add_bias_heads", P * heads, AddBiasHeadsArgs{raw, extraBias, P, (uint)heads, 0});   // (OpenDDE)
   int stride = (n + 63) / 64 * 64;
-  half* bias = biasLayout(raw, "st.bias", n, heads, stride, false);
-  half* nrm = scratch<half>("st.nrm", (size_t)n * Cs);
+  static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
+  half* bias = nullptr;
+  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 16)) {
+    Folded f;
+    if (xs) f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
+    bias = scratch<half>("st.bias", (size_t)heads * n * stride);
+    run("af3_pair_bias", Grid{(uint32_t)((n + 7) / 8), (uint32_t)((n + 7) / 8), 1}, 256,
+        PairBiasArgs{pln, xs ? f.w : Wh(B + ".singlePairLogitsProjection"), xs ? f.b : nullptr, extraBias, bias,
+                     (uint)n, (uint)C, (uint)heads, 0u, (uint)stride, 0});
+  } else {
+    float* raw = scratch<float>("st.raw", P * heads);
+    if (xs) {
+      Folded f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
+      linW(pln, f.w, raw, P, C, heads, 0.f, f.b, 1.f, "pair logits");
+    } else lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
+    if (extraBias) run1d("af3_add_bias_heads", P * heads, AddBiasHeadsArgs{raw, extraBias, P, (uint)heads, 0});   // (OpenDDE)
+    bias = biasLayout(raw, "st.bias", n, heads, stride, false);
+  }
+  half* nrm = scratch<half>("st.nrm", np * Cs);
+  half* qkvg = scratch<half>("st.qkvg", np * 4 * Wd);
+  half* o = scratch<half>("st.o", np * Wd);
+  if (np > (size_t)n) {
+    static const half *zeroedNrm = nullptr, *zeroedO = nullptr; static int zeroedN = 0;
+    if (nrm != zeroedNrm || o != zeroedO || n != zeroedN) {
+      fill(nrm + (size_t)n * Cs, 0, (np - n) * Cs * sizeof(half));
+      fill(o + (size_t)n * Wd, 0, (np - n) * Wd * sizeof(half));
+      zeroedNrm = nrm; zeroedO = o; zeroedN = n;
+    }
+  }
   ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
-  half* qkvg = scratch<half>("st.qkvg", (size_t)n * 4 * Wd);
   const float* gateBias = !parallel ? nullptr : M.derived<float>("gateOne:" + num(Wd), (size_t)4 * Wd, [&](float* b) {
     std::vector<float> v((size_t)4 * Wd, 0.f);
     for (int k = 3 * Wd; k < 4 * Wd; ++k) v[k] = 1.f;
     upload(b, v.data(), v.size() * 4);
   });
-  linW(nrm, qkvgWeight(A, Cs, Wd, false), qkvg, n, Cs, 4 * Wd, gateBias, "single qkvg");
-  half* o = scratch<half>("st.o", (size_t)n * Wd);
+  linW(nrm, qkvgWeight(A, Cs, Wd, false), qkvg, np, Cs, 4 * Wd, gateBias, "single qkvg");
   Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = d; at.rows = 1; at.scale = 1.f / sqrtf((float)d);
   at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
-  lin(o, A + ".outputProjection", single, n, Wd, Cs, 1.f);
-  if (parallel) transition(s0, n, Cs, B + ".singleTransition", single);
-  else transition(single, n, Cs, B + ".singleTransition");
+  lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
+  if (parallel) transition(s0, n, Cs, B + ".singleTransition", single, "", "", "st.");
+  else transition(single, n, Cs, B + ".singleTransition", nullptr, "", "", "st.");
 }
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias) {

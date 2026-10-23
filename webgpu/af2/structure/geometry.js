@@ -38,7 +38,7 @@ fn quaternion_rotation(q: vec4<f32>) -> Rotation {
   );
 }
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let residue = id.x;
   if (residue >= arrayLength(&aatype)) { return; }
@@ -133,14 +133,16 @@ export class AtomGeometryGpu {
       const atom14 = allocate("geometry.atom14", input.length * 14 * 3, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const atom37 = allocate("geometry.atom37", input.length * 37 * 3, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "atom-geometry" });
+      const compute = encoder.beginComputePass({ label: "atom-geometry" });
       const pass = (pipeline, buffers, x) => {
-        const compute = encoder.beginComputePass(); compute.setPipeline(pipeline);
+        compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })) }));
-        compute.dispatchWorkgroups(x); compute.end();
+        compute.dispatchWorkgroups(x);
       };
-      pass(atom14Pipeline, [affine, angles, aatype, frames, groups, positions, atom14Mask, atom14], input.length);
+      pass(atom14Pipeline, [affine, angles, aatype, frames, groups, positions, atom14Mask, atom14], Math.ceil(input.length / 64));
       pass(atom37Pipeline, [atom14, mapping, atom37Mask, atom37], Math.ceil(input.length * 37 * 3 / 64));
+      compute.end();
       const readbacks = [atom14, atom37].map((value, index) => {
         const result = allocate(`geometry.readback-${index}`, value.byteLength / 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);

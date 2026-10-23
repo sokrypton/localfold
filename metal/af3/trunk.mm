@@ -17,10 +17,13 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   t.Cm = metaI("trunk.embedder.msaChannels"); t.F = metaI("trunk.embedder.targetFeatWidth");
   t.S = std::min((int)M.meta("batch.sequences"), msaCap);
   size_t pairs = (size_t)t.n * t.n;
-  t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>((size_t)t.n * t.Cs);
+  size_t np = t.n <= 128 ? (size_t)((t.n + 15) & ~15) : (size_t)t.n;
+  t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>(np * t.Cs);
   t.msa = allocT<float>((size_t)t.S * t.n * t.Cm);
   fill(t.pair, 0, pairs * t.C * 4);     // (the recycled pair before the first pass: read in place, embed())
-  t.prevSingle = allocT<float>((size_t)t.n * t.Cs);
+  fill(t.single, 0, np * t.Cs * 4);
+  t.prevSingle = allocT<float>(np * t.Cs);
+  fill(t.prevSingle, 0, np * t.Cs * 4);
   t.targetFeat = allocT<float>((size_t)t.n * t.F);
   copy(t.targetFeat, targetFeat, (size_t)t.n * t.F * 4);
   std::vector<float> seq(M.hostF("batch.seqMask"), M.hostF("batch.seqMask") + t.n), pm(pairs);
@@ -221,7 +224,7 @@ static void embed(Trunk& t) {
 // ---------------------------------------------------------------- the MSA stack
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] W + b) / (1e-3 + norm[i][j])
 static void outerProductMean(Trunk& t, const std::string& pre, const std::string& nextNorm = "", const std::string& nextNorm2 = "",
-                             const std::string& dualMsaNorm = "") {
+                             const std::string& dualMsaNorm = "", bool computeMaskNorm = true) {
   int L = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int O = metaI(pre + ".outerChannels");
   size_t rows = (size_t)S * L, pairs = (size_t)L * L;
@@ -237,8 +240,8 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   linH(xn, pre + ".leftProjection", lt, rows, Cm, O, Wopt(pre + ".leftProjectionBias"));      // (rf3's biases, before the mask)
   linH(xn, pre + ".rightProjection", rt, rows, Cm, O, Wopt(pre + ".rightProjectionBias"));
   run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, rt, t.msaMask, rows, (uint)O, 0});
-  float* norm = scratch<float>("opm.norm", pairs);
-  run1d("af3_mask_norm", pairs, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
+  float* norm = scratch<float>("mnorm.opm", pairs);
+  if (computeMaskNorm) run1d("af3_mask_norm", pairs, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
   const half* Wout = Wh(pre + ".outputW");          // [O * O][C]
   const uint after = flag("trunk.dialect.opmBiasAfterNorm") ? 1u : 0u;
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
@@ -420,11 +423,11 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
   bool updateFirst = flag("trunk.dialect.msaUpdateBeforeOuterProduct");     // (OpenDDE, boltz2)
   if (!updateFirst)
     outerProductMean(t, B + ".outerProductMean", B + ".msaAttention1.pairNorm",
-                     B + ".triangleMultiplicationOutgoing.leftNormInput", B + ".msaAttention1.actNorm");
+                     B + ".triangleMultiplicationOutgoing.leftNormInput", B + ".msaAttention1.actNorm", k == 0);
   msaAttention(t, B + ".msaAttention1", "", !updateFirst ? B + ".triangleMultiplicationOutgoing.leftNormInput" : "",
                B + ".msaTransition.inputLayerNorm", !updateFirst);
   transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition", nullptr, "", "", "msatr.");
-  if (updateFirst) outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput");
+  if (updateFirst) outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput", "", "", k == 0);
   pairUpdates(t.pair, t.masks, t.n, t.C, B,
               (k + 1 < msaBlocks && updateFirst) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.pairNorm" : "");
 }
@@ -447,7 +450,7 @@ void runTrunk(Trunk& t) {
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
-  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
+  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
   // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Every residual is summed in

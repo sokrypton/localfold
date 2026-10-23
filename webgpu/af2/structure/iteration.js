@@ -249,15 +249,14 @@ export class StructurePostAttentionGpu {
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "structure-post-attention" });
       this.device.pushErrorScope("validation");
+      const compute = encoder.beginComputePass({ label: "structure-post-attention" });
       const pass = (pipeline, buffers, x, y = 1) => {
-        const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
         }));
         compute.dispatchWorkgroups(x, y);
-        compute.end();
       };
       pass(addNormalize, [source, attention, weights, attentionNormParams, normalized], input.length);
       pass(linear, [normalized, weights, transitionParams[0], transition0],
@@ -270,6 +269,7 @@ export class StructurePostAttentionGpu {
       pass(linear, [output, weights, affineParams, affineUpdate],
         Math.ceil(6 / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
       pass(affinePipeline, [affine, affineUpdate, affineOutput], Math.ceil(input.length / 64));
+      compute.end();
       const actReadback = allocate("structure.act-readback", elements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       const affineReadback = allocate(
         "structure.affine-readback", input.length * 7, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,

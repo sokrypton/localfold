@@ -74,15 +74,14 @@ export class StructureInitializeGpu {
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const affine = allocate("structure-init.affine", length * 7, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "structure-initialize" });
+      const compute = encoder.beginComputePass({ label: "structure-initialize" });
       const pass = (pipeline, buffers, x, y = 1) => {
-        const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
         }));
         compute.dispatchWorkgroups(x, y);
-        compute.end();
       };
       pass(linear, [source, weights, singleParams, single],
         Math.ceil(structureChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
@@ -90,6 +89,7 @@ export class StructureInitializeGpu {
       pass(linear, [normalized, weights, initialParams, activations],
         Math.ceil(structureChannels / TRANSITION_TILE_COLUMNS), Math.ceil(length / TRANSITION_TILE_ROWS));
       pass(affineInit, [affine], Math.ceil(length / 64));
+      compute.end();
       const readbacks = [single, normalized, activations, affine].map((value, index) => {
         const buffer = allocate(`structure-init.readback-${index}`, value.byteLength / 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);

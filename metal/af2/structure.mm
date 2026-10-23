@@ -6,13 +6,16 @@
 StructureOut structureModule(const float* single, const float* pair, int L, float positionScale) {
   const std::string S = "structure_module/", F = S + "fold_iteration/", I = F + "invariant_point_attention/";
   const int C = 384, C2 = 128;
+  const int LP = L <= 128 ? (L + 15) & ~15 : L;
   size_t pairs = (size_t)L * L;
-  float* initial = scratch<float>("sm.initial", (size_t)L * C);
-  half* initialH = scratch<half>("sm.initialH", (size_t)L * C);
+  float* initial = scratch<float>("sm.initial", (size_t)LP * C);
+  half* initialH = scratch<half>("sm.initialH", (size_t)LP * C);
+  if (LP > L) fill(initialH + (size_t)L * C, 0, (size_t)(LP - L) * C * sizeof(half));
   layerNormW(single, initial, initialH, L, C, S + "single_layer_norm");
-  float* act = scratch<float>("sm.act", (size_t)L * C);
-  half* actH = scratch<half>("sm.actH", (size_t)L * C);
-  linearB(initialH, S + "initial_projection", -1, act, L, C, C);
+  float* act = scratch<float>("sm.act", (size_t)LP * C);
+  half* actH = scratch<half>("sm.actH", (size_t)LP * C);
+  if (LP > L) fill(actH + (size_t)L * C, 0, (size_t)(LP - L) * C * sizeof(half));
+  linearB(initialH, S + "initial_projection", -1, act, LP, C, C);
   toHalf(act, actH, (size_t)L * C);
   float* act2d = scratch<float>("sm.act2d", pairs * C2);
   half* act2dH = scratch<half>("sm.act2dH", pairs * C2);
@@ -27,16 +30,20 @@ StructureOut structureModule(const float* single, const float* pair, int L, floa
   float* rig = scratch<float>("sm.rigid", (size_t)L * 12);
   run1d("af2_identity_rigid", L, IdentityRigidArgs{rig, (uint)L, 0});
   const int Ws = Hh * Cs, Wpq = Hh * 3 * Pq, Wpv = Hh * 3 * Pv, Fipa = 3 * Ws + 2 * Wpq + Wpv, Ptot = 2 * Pq + Pv;
-  float* ipaProj = scratch<float>("sm.ipaProj", (size_t)L * Fipa);
+  float* ipaProj = scratch<float>("sm.ipaProj", (size_t)LP * Fipa);
   float* qp = scratch<float>("sm.qp", (size_t)L * Hh * Pq * 3); float* kp = scratch<float>("sm.kp", (size_t)L * Hh * Pq * 3);
   float* vp = scratch<float>("sm.vp", (size_t)L * Hh * Pv * 3);
   float* attn = scratch<float>("sm.attn", (size_t)L * Hh * L);
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
-  half* fin = scratch<half>("sm.final", (size_t)L * Fw);
-  float* t1 = scratch<float>("sm.t1", (size_t)L * C); half* t1H = scratch<half>("sm.t1H", (size_t)L * C);
-  half* t2 = scratch<half>("sm.t2", (size_t)L * C);
-  half* upd = scratch<half>("sm.upd", (size_t)L * C);
-  float* rq = scratch<float>("sm.rq", (size_t)L * 6);
+  half* fin = scratch<half>("sm.final", (size_t)LP * Fw);
+  float* t1 = scratch<float>("sm.t1", (size_t)LP * C); half* t1H = scratch<half>("sm.t1H", (size_t)LP * C);
+  half* t2 = scratch<half>("sm.t2", (size_t)LP * C);
+  half* upd = scratch<half>("sm.upd", (size_t)LP * C);
+  float* rq = scratch<float>("sm.rq", (size_t)LP * 6);
+  if (LP > L) {
+    fill(fin + (size_t)L * Fw, 0, (size_t)(LP - L) * Fw * sizeof(half));
+    fill(t1H + (size_t)L * C, 0, (size_t)(LP - L) * C * sizeof(half));
+  }
   const float* seqMask = In("seq_mask");
   const float qScale = sqrtf(1.f / Cs);
   const half* ipaW = M.derived<half>("ipa.w", (size_t)C * Fipa, [&](half* out) {
@@ -66,7 +73,7 @@ StructureOut structureModule(const float* single, const float* pair, int L, floa
     part("v_point_projection/point_projection", Wpv);
   });
   for (int it = 0; it < 8; ++it) {
-    { Gemm g{}; g.X = actH; g.tx = F16; g.W = ipaW; g.tw = F16; g.Y = ipaProj; g.rows = L; g.in = C;
+    { Gemm g{}; g.X = actH; g.tx = F16; g.W = ipaW; g.tw = F16; g.Y = ipaProj; g.rows = LP; g.in = C;
       g.out = Fipa; g.bias = ipaB; g.label = "ipa qkv"; gemm(g); }
     run1d("af2_points_global", (size_t)L * Hh * Ptot,
           PointsGlobalArgs{ipaProj + 3 * Ws, rig, qp, kp, vp, (uint)L, (uint)Hh, (uint)Pq, (uint)Pv, (uint)Fipa, 0});
@@ -74,33 +81,37 @@ StructureOut structureModule(const float* single, const float* pair, int L, floa
         IpaWeightsArgs{ipaProj, ipaProj + Ws, qp, kp, b2d, pw, seqMask, attn, (uint)L, (uint)Hh, (uint)Cs, (uint)Pq, (uint)Fipa, qScale});
     run("af2_ipa_outputs", Grid{(uint32_t)L, (C2 == 128 && Hh == 12 && Pv == 8 && Cs == 16 && (Fipa & 3) == 0) ? 1u : 2u, 1}, 256,
         IpaOutputsArgs{attn, ipaProj + 2 * Ws, vp, act2d, rig, fin, (uint)L, (uint)Hh, (uint)Cs, (uint)Pv, (uint)C2, (uint)Fipa});
-    linearB(fin, I + "output_projection", -1, act, L, Fw, C, false, 1.f);
+    linearB(fin, I + "output_projection", -1, act, LP, Fw, C, false, 1.f);
     layerNormW(act, t1, t1H, L, C, F + "attention_layer_norm");
     // the transition: three layers, ReLU between, a residual round them
-    linearB(t1H, F + "transition", -1, t2, L, C, C, true);
-    linearB(t2, F + "transition_1", -1, upd, L, C, C, true);
-    linearB(upd, F + "transition_2", -1, t1, L, C, C, false, 1.f);
+    linearB(t1H, F + "transition", -1, t2, LP, C, C, true);
+    linearB(t2, F + "transition_1", -1, upd, LP, C, C, true);
+    linearB(upd, F + "transition_2", -1, t1, LP, C, C, false, 1.f);
     layerNormW(t1, act, actH, L, C, F + "transition_layer_norm");
-    linearB(actH, F + "quat_rigid/rigid", -1, rq, L, C, 6);
+    linearB(actH, F + "quat_rigid/rigid", -1, rq, LP, C, 6);
     run1d("af2_rigid_update", L, RigidUpdateArgs{rig, rq, (uint)L, 0});
   }
   // the side chains, from the last iteration
   const std::string R = F + "rigid_sidechain/";
-  half* ra = scratch<half>("sm.ra", (size_t)L * C); float* sc = scratch<float>("sm.sc", (size_t)L * 128);
-  half* sb = scratch<half>("sm.sb", (size_t)L * 128); half* sc2 = scratch<half>("sm.sc2", (size_t)L * 128);
+  half* ra = scratch<half>("sm.ra", (size_t)LP * C); float* sc = scratch<float>("sm.sc", (size_t)LP * 128);
+  half* sb = scratch<half>("sm.sb", (size_t)LP * 128); half* sc2 = scratch<half>("sm.sc2", (size_t)LP * 128);
+  if (LP > L) {
+    fill(ra + (size_t)L * C, 0, (size_t)(LP - L) * C * sizeof(half));
+    fill(sb + (size_t)L * 128, 0, (size_t)(LP - L) * 128 * sizeof(half));
+  }
   run1d("af2_relu_copy", (size_t)L * C, ReluCopyArgs{act, nullptr, ra, (u64)L * C});
-  linearB(ra, R + "input_projection", -1, sc, L, C, 128);
+  linearB(ra, R + "input_projection", -1, sc, LP, C, 128);
   run1d("af2_relu_copy", (size_t)L * C, ReluCopyArgs{initial, nullptr, ra, (u64)L * C});
-  linearB(ra, R + "input_projection_1", -1, sc, L, C, 128, false, 1.f);
+  linearB(ra, R + "input_projection_1", -1, sc, LP, C, 128, false, 1.f);
   for (int r = 0; r < 2; ++r) {
     std::string suffix = r == 0 ? "" : "_1";
     run1d("af2_relu_copy", (size_t)L * 128, ReluCopyArgs{sc, nullptr, sb, (u64)L * 128});
-    linearB(sb, R + "resblock1" + suffix, -1, sc2, L, 128, 128, true);
-    linearB(sc2, R + "resblock2" + suffix, -1, sc, L, 128, 128, false, 1.f);
+    linearB(sb, R + "resblock1" + suffix, -1, sc2, LP, 128, 128, true);
+    linearB(sc2, R + "resblock2" + suffix, -1, sc, LP, 128, 128, false, 1.f);
   }
   run1d("af2_relu_copy", (size_t)L * 128, ReluCopyArgs{sc, nullptr, sb, (u64)L * 128});
-  float* un = scratch<float>("sm.un", (size_t)L * 14);
-  linearB(sb, R + "unnormalized_angles", -1, un, L, 128, 14);
+  float* un = scratch<float>("sm.un", (size_t)LP * 14);
+  linearB(sb, R + "unnormalized_angles", -1, un, LP, 128, 14);
   StructureOut o{act, rig, scratch<float>("sm.pos37", (size_t)L * 37 * 3), scratch<float>("sm.pos14", (size_t)L * 14 * 3),
                  scratch<float>("sm.angles", (size_t)L * 14)};
   run1d("af2_sidechains", L, SidechainArgs{un, rig, Ii("aatype"), In("c/rigid_group_default_frame"), M.i("c/atom14_to_rigid_group"),

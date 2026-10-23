@@ -546,19 +546,18 @@ export class InvariantPointAttentionGpu {
       const output = allocate("ipa.output", input.length * input.channels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "invariant-point-attention" });
       this.device.pushErrorScope("validation");
+      const compute = encoder.beginComputePass({ label: "invariant-point-attention" });
       const linearGrid = (elements, workgroupSize = 64) => {
         const groups = Math.ceil(elements / workgroupSize);
         return [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       };
       const pass = (pipeline, buffers, x, y = 1) => {
-        const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
         }));
         compute.dispatchWorkgroups(x, y);
-        compute.end();
       };
       const linear = (paramsValue, result, columns) =>
         pass(pipelines[1], [source, weights, paramsValue, result],
@@ -586,6 +585,7 @@ export class InvariantPointAttentionGpu {
         Math.ceil(input.length * input.heads * input.pairChannels / 64));
       pass(pipelines[1], [features, weights, shared.outputParams, output],
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+      compute.end();
       const outputElements = output.byteLength / 4;
       const readback = allocate("ipa.readback", outputElements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, output.byteLength);
