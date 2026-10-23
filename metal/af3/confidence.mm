@@ -29,7 +29,7 @@ static void boltz2Reembed(float* pair, float* single, const Trunk& t, const floa
   if (lenW(R + "distogramFeatProject") != (size_t)64 * C) die("the reembed distogram is not 64 bins");
   int* bins = scratch<int>("conf.bin", pairs);
   run1d("af3_reembed_bin", pairs, ReembedBinArgs{pseudoBeta, bins, (uint)n, 0});
-  run1d("af3_reembed_pair", pairs * C,
+  run1d("af3_reembed_pair", (C & 3) ? pairs * C : pairs * (C >> 2),
         ReembedPairArgs{pair, left, right, bins, t.pairMask, W(R + "distogramFeatProject"), M.has("batch.bondMatrix") ? M.f("batch.bondMatrix") : nullptr,
                         M.has("batch.bondOrderMatrix") ? M.f("batch.bondOrderMatrix") : nullptr, W(R + "tokenBondsProject"),
                         W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), (uint)n, (uint)C});
@@ -54,22 +54,32 @@ static void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C,
   run1d("af3_apply_norm", rows * C, ApplyNormArgs{x, stat, rows * C});
 }
 
-ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
+ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample) {
   const std::string P = "confidence";
   int n = t.n, C = metaI(P + ".pairChannels"), Cs = metaI(P + ".singleChannels"), F = metaI(P + ".targetFeatWidth");
   int dense = metaI("batch.dense");
   size_t pairs = (size_t)n * n;
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
   size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
-  float* pair = scratch<float>("conf.pair", pairs * C);
+  // The blocks over a half pair, as the trunk's stack (trunk.mm runTrunk; LOCALFOLD_HALF_PAIR=0 the control): the f32
+  // pair given back while the pair track holds its scratch - the fold's top stage (1044 tokens 4.76 -> 4.48 GB).
+  // LOCALFOLD_CONF_HALF_PAIR=0: this head's control alone
+  static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
+                                 (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
+  const bool useHalf = halfWanted && C % 8 == 0;
+  const bool reembed = flag("trunk.dialect.reembedConfidencePair");
+  const bool globalNorm = flag("trunk.dialect.confidenceGlobalNorm");
+  const bool directHalfInit = useHalf && !reembed && !globalNorm;
+  float* pair = directHalfInit ? nullptr : scratch<float>("conf.pair", pairs * C);
+  half* zh = directHalfInit ? scratch<half>("conf.zh", pairs * C) : nullptr;
   float* single = scratch<float>("conf.single", np * Cs);
   if (np > (size_t)n) fill(single + (size_t)n * Cs, 0, (np - n) * Cs * 4);
-  if (flag("trunk.dialect.reembedConfidencePair")) boltz2Reembed(pair, single, t, pseudoBeta, C, Cs, F);
+  if (reembed) boltz2Reembed(pair, single, t, pseudoBeta, C, Cs, F);
   else {
-  copy(pair, t.pair, pairs * C * 4);
+  if (!directHalfInit) copy(pair, t.pair, pairs * C * 4);
   copy(single, t.single, (size_t)n * Cs * 4);
   const float* tf = t.targetFeat;
-  if (flag("trunk.dialect.confidenceGlobalNorm")) {
+  if (globalNorm) {
     // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the vendor's 449 columns)
     float* tfn = scratch<float>("conf.targetFeat", (size_t)n * F);
     copy(tfn, t.targetFeat, (size_t)n * F * 4);
@@ -85,7 +95,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   lin(tfH, P + ".leftTargetFeatProject", left, np, F, C);
   lin(tfH, P + ".rightTargetFeatProject", right, np, F, C);
   // (rf3: its two dropped s_inputs columns at -mean/std through their own rows, the same on every token: cuda/af3)
-  if (flag("trunk.dialect.confidenceGlobalNorm") && hasW(P + ".leftTargetFeatProjectAbsent")) {
+  if (globalNorm && hasW(P + ".leftTargetFeatProjectAbsent")) {
     if (lenW(P + ".leftTargetFeatProjectAbsent") != (size_t)2 * C) die("rf3's absent target_feat rows are not 2 x %d", C);
     std::vector<float> stat = download(scratch<float>("conf.gnStat", 2), 2);
     std::vector<float> wl = download(W(P + ".leftTargetFeatProjectAbsent"), (size_t)2 * C);
@@ -104,29 +114,30 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   if (bins != (chai ? 16 : caDgram ? 40 : 39)) die("the confidence distogram has %d bins", bins);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
   run1d("af3_conf_bin", pairs, ConfBinArgs{pseudoBeta, binOf, sqOf, (uint)n, (uint)bins, 3.25f, 50.75f, caDgram ? 1u : 0u, chai ? 1u : 0u});
-  run1d("af3_conf_pair_init", pairs * C, ConfPairInitArgs{pair, left, right, binOf, sqOf, t.pairMask, W(P + ".distogramFeatProject"),
-                                                          Wopt(P + ".distanceFeatProject"), (uint)n, (uint)C, caDgram ? 1u : 0u, chai ? 1u : 0u});
+  run1d("af3_conf_pair_init", (C & 3) ? pairs * C : pairs * (C >> 2),
+        ConfPairInitArgs{pair, directHalfInit ? t.pair : nullptr, zh, left, right, binOf, sqOf, t.pairMask,
+                         W(P + ".distogramFeatProject"), Wopt(P + ".distanceFeatProject"), (uint)n, (uint)C,
+                         caDgram ? 1u : 0u, chai ? 1u : 0u});
   if (hasW(P + ".inputSingleNormScale")) {     // the trunk single clamped to +-512 and LayerNormed first (protenix2)
     run1d("af3_clamp", (size_t)n * Cs, ClampArgs{single, (u64)n * Cs, 512.f, 0});
-    float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
-    ln(single, sn, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
-    copy(single, sn, (size_t)n * Cs * 4);
+    ln(single, single, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
   }
   }
   int nb = 0; while (M.has(P + ".blocks." + num(nb) + ".singleChannels")) ++nb;
-  // The blocks over a half pair, as the trunk's stack (trunk.mm runTrunk; LOCALFOLD_HALF_PAIR=0 the control): the f32
-  // pair given back while the pair track holds its scratch - the fold's top stage (1044 tokens 4.76 -> 4.48 GB).
-  // LOCALFOLD_CONF_HALF_PAIR=0: this head's control alone
-  static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
-                                 (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
-  if (halfWanted && C % 8 == 0) {
-    half* zh = scratch<half>("conf.zh", pairs * C);
-    toHalf(pair, zh, pairs * C);
-    releaseScratch({"conf.pair"});
+  if (useHalf) {
+    if (!zh) {
+      zh = scratch<half>("conf.zh", pairs * C);
+      toHalf(pair, zh, pairs * C);
+      releaseScratch({"conf.pair"});
+      pair = nullptr;
+    }
     // the trunk's pair, read no more here, parked in half where that is exact (it came out of the half stack) and
-    // made again for the next sample's head: 1044 tokens 4.48 -> 4.20 GB
+    // made again for the next sample's head (or released on the last sample): 1044 tokens 4.48 -> 4.20 GB
     half* parked = nullptr;
-    if (t.pairHalfExact) {
+    if (lastSample) {
+      release(t.pair);
+      t.pair = nullptr;
+    } else if (t.pairHalfExact) {
       parked = scratch<half>("confTrunk.pair", pairs * t.C);
       toHalf(t.pair, parked, pairs * t.C);
       release(t.pair);
@@ -135,17 +146,16 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
     for (int k = 0; k < nb; ++k)
       pairformerBlock(zh, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
     releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
-    pair = scratch<float>("conf.pair", pairs * C);
-    toFloat(zh, pair, pairs * C);
-    releaseScratch({"conf.zh"});
     if (parked) {
       t.pair = allocT<float>(pairs * t.C);
       toFloat(parked, t.pair, pairs * t.C);
       releaseScratch({"confTrunk."});
     }
-  } else
+  } else {
+    if (lastSample) { release(t.pair); t.pair = nullptr; }
     for (int k = 0; k < nb; ++k)
       pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
+  }
   // the pair track's scratch given back before the heads' (it was the fold's peak: 1044 tokens 5.33 GB, its 2.5 beside
   // the heads' norm and logits)
   releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
@@ -156,7 +166,8 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   centres[NB - 1] = (float)(centres[NB - 2] + step);
   float* dCentres = scratch<float>("conf.centres", NB);
   upload(dCentres, centres.data(), NB * 4);
-  half* lnPair = scratch<half>("conf.ln", pairs * C);
+  half* lnPair = nullptr;
+  auto getLnPair = [&]() { return lnPair ? lnPair : (lnPair = scratch<half>("conf.ln", pairs * C)); };
   float* logits = scratch<float>("conf.logits", pairs * NB);
   float* inter = hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits") ? scratch<float>("conf.inter", pairs * NB) : nullptr;
   const int* asym = M.i("batch.asymId");
@@ -167,10 +178,19 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
     lin(xLn, P + "." + interW, inter, pairs, C, NB);
     run1d("af3_inter_chain", pairs * NB, InterChainArgs{logits, inter, asym, (uint)n, (uint)NB});
   };
-  auto head = [&](const float* x, const std::string& norm, const std::string& w, const std::string& interW) {
-    if (hasW(P + "." + norm + "Scale")) ln(x, lnPair, pairs, C, P + "." + norm + "Scale", P + "." + norm + "Offset");
-    else toHalf(x, lnPair, pairs * C);
-    headFromLn(lnPair, w, interW);
+  auto head = [&](const float* x, const half* xh, const std::string& norm, const std::string& w, const std::string& interW) {
+    if (hasW(P + "." + norm + "Scale")) {
+      half* dst = getLnPair();
+      if (xh) ln(xh, dst, pairs, C, P + "." + norm + "Scale", P + "." + norm + "Offset");
+      else ln(x, dst, pairs, C, P + "." + norm + "Scale", P + "." + norm + "Offset");
+      headFromLn(dst, w, interW);
+    } else if (xh) {
+      headFromLn(xh, w, interW);
+    } else {
+      half* dst = getLnPair();
+      toHalf(x, dst, pairs * C);
+      headFromLn(dst, w, interW);
+    }
   };
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
   bool preSym = flag("trunk.dialect.preSymmetrisedPde");
@@ -178,17 +198,22 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   half* lnPae = nullptr;
   if (preSym) {      // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
     float* sym = scratch<float>("conf.sym", pairs * C);
-    run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
-    head(sym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+    run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, zh, sym, (uint)n, (uint)C, 1.f, 0});
+    head(sym, nullptr, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   } else if (hasW(P + ".logitsLnScale") && hasW(P + ".paeLogitsLnScale")) {
+    half* dst = getLnPair();
     lnPae = scratch<half>("conf.lnPae", pairs * C);
-    layerNormDual(pair, lnPair, W(P + ".logitsLnScale"), W(P + ".logitsLnOffset"),
-                  lnPae, W(P + ".paeLogitsLnScale"), W(P + ".paeLogitsLnOffset"), pairs, C);
-    headFromLn(lnPair, "leftHalfDistanceLogits", "interHalfDistanceLogits");
-  } else head(pair, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+    if (zh)
+      layerNormDual(zh, dst, W(P + ".logitsLnScale"), W(P + ".logitsLnOffset"),
+                    lnPae, W(P + ".paeLogitsLnScale"), W(P + ".paeLogitsLnOffset"), pairs, C);
+    else
+      layerNormDual(pair, dst, W(P + ".logitsLnScale"), W(P + ".logitsLnOffset"),
+                    lnPae, W(P + ".paeLogitsLnScale"), W(P + ".paeLogitsLnOffset"), pairs, C);
+    headFromLn(dst, "leftHalfDistanceLogits", "interHalfDistanceLogits");
+  } else head(pair, zh, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, t.pairMask, dCentres, nullptr, nullptr, pairs, (uint)NB, preSym ? 0u : (uint)n, 1.f, 0});
   if (lnPae) headFromLn(lnPae, "paeLogits", "paeInterLogits");
-  else head(pair, "paeLogitsLn", "paeLogits", "paeInterLogits");
+  else head(pair, zh, "paeLogitsLn", "paeLogits", "paeInterLogits");
   ConfidenceOut out;
   {   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's mean over what it selects
     std::vector<float> seq = download(t.seqMask, n);

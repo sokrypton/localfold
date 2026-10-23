@@ -91,9 +91,9 @@ struct Options {
 
 // OpenDDE's head on the structural tokens, mapped back to the residues: atoms through residueAtomGather, pairs through
 // each residue's representative (backbone) subtoken. xk (the structural atoms) is replaced by the residues' atoms.
-ConfidenceOut structuralConfidence(const Structural& st, const float* coords, std::vector<float>& xk, int nRes, int dense,
-                                   const std::vector<int>& resAsym) {
-  DdeConfidence dc = ddeConfidence(st, coords, dense, nRes);
+ConfidenceOut structuralConfidence(Structural& st, const float* coords, std::vector<float>& xk, int nRes, int dense,
+                                   const std::vector<int>& resAsym, bool lastSample) {
+  DdeConfidence dc = ddeConfidence(st, coords, dense, nRes, lastSample);
   int nD = st.n;
   const int* gather = M.hostI("structural.residueAtomGather"); const int* rep = M.hostI("structural.residueRepToken");
   ConfidenceOut ck;
@@ -215,6 +215,8 @@ int foldInput(const std::string& dir, Options o) {
     printf("\n");
   }
   std::vector<float> contact = contactProbabilities(t);
+  for (float** p : {&t.msa, &t.prevSingle, &t.msaMask, &t.deletion}) if (*p) { release(*p); *p = nullptr; }
+  if (t.msaRows) { release(t.msaRows); t.msaRows = nullptr; }
   mt::sync();
   double trunkMs = ms(f0);
   // OpenDDE: the expander and refiner, then the diffusion and its confidence head on the structural tokens (the
@@ -267,7 +269,9 @@ int foldInput(const std::string& dir, Options o) {
       float* dBeta = scratch<float>("main.beta", beta.size());
       upload(dBeta, beta.data(), beta.size() * 4);
       if (profiling()) profileStart();
-      ConfidenceOut ck = structural ? structuralConfidence(st, dBeta, xk, t.n, dense, resAsym) : confidenceHead(t, dBeta);
+      const bool lastSample = c0 + k + 1 == runs.size();
+      ConfidenceOut ck = structural ? structuralConfidence(st, dBeta, xk, t.n, dense, resAsym, lastSample)
+                                    : confidenceHead(t, dBeta, lastSample);
       if (profiling()) profileReport("confidence", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
       confMs += ms(s1);
       Scores ss = structureScores(xk);

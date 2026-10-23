@@ -716,12 +716,17 @@ kernel void af3_symmetrise(LF_ARGS(SymmetriseArgs)) {
     uint C4 = a.C >> 2;
     if (t >= (ulong)a.L * a.L * C4) return;
     uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.L), j = ij - i * a.L;
-    ((device float4*)a.y)[t] = (((device const float4*)a.x)[t] + ((device const float4*)a.x)[((ulong)j * a.L + i) * C4 + c4]) * a.scale;
+    ulong ji4 = ((ulong)j * a.L + i) * C4 + c4;
+    float4 v = a.xh ? float4(((device const half4*)a.xh)[t]) + float4(((device const half4*)a.xh)[ji4])
+                    : ((device const float4*)a.x)[t] + ((device const float4*)a.x)[ji4];
+    ((device float4*)a.y)[t] = v * a.scale;
     return;
   }
   if (t >= (ulong)a.L * a.L * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.L), j = ij - i * a.L;
-  a.y[t] = (a.x[t] + a.x[((ulong)j * a.L + i) * a.C + c]) * a.scale;
+  ulong jic = ((ulong)j * a.L + i) * a.C + c;
+  float v = a.xh ? (float)a.xh[t] + (float)a.xh[jic] : a.x[t] + a.x[jic];
+  a.y[t] = v * a.scale;
 }
 kernel void af3_contact_bins(LF_ARGS(ContactBinsArgs)) {
   uint t = (uint)LF_INDEX;
@@ -1649,13 +1654,28 @@ kernel void af3_conf_bin(LF_ARGS(ConfBinArgs)) {
 }
 kernel void af3_conf_pair_init(LF_ARGS(ConfPairInitArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.n * a.n * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    float4 v = ((device const float4*)a.left)[j * C4 + c4] + ((device const float4*)a.right)[i * C4 + c4];
+    int bin = a.bin[ij];
+    if (bin >= 0) v += ((device const float4*)a.Wd)[bin * C4 + c4] * (a.unmasked ? 1.f : a.pairMask[ij]);
+    if (!a.caBins && a.Wdist) v += sqrt(a.sq[ij] + 1e-10f) * ((device const float4*)a.Wdist)[c4];
+    float4 p = (a.srcPair ? ((device const float4*)a.srcPair)[t] : ((device const float4*)a.pair)[t]) + v;
+    if (a.outH) ((device half4*)a.outH)[t] = half4(p);
+    else ((device float4*)a.pair)[t] = p;
+    return;
+  }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
   float v = a.left[j * a.C + c] + a.right[i * a.C + c];
   int bin = a.bin[ij];
   if (bin >= 0) v += a.Wd[bin * a.C + c] * (a.unmasked ? 1.f : a.pairMask[ij]);
   if (!a.caBins && a.Wdist) v += sqrt(a.sq[ij] + 1e-10f) * a.Wdist[c];
-  a.pair[t] += v;
+  float p = (a.srcPair ? a.srcPair[t] : a.pair[t]) + v;
+  if (a.outH) a.outH[t] = (half)p;
+  else a.pair[t] = p;
 }
 kernel void af3_expectation(LF_ARGS(ExpectationArgs)) {
   ulong r = LF_INDEX;
@@ -1848,6 +1868,20 @@ kernel void af3_reembed_bin(LF_ARGS(ReembedBinArgs)) {
 }
 kernel void af3_reembed_pair(LF_ARGS(ReembedPairArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.n * a.n * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    int o = a.orders ? (int)a.orders[ij] : 0;
+    if (o < 0 || o >= 7) o = 0;
+    ((device float4*)a.pair)[t] += ((device const float4*)a.right)[i * C4 + c4] +
+                                   ((device const float4*)a.left)[j * C4 + c4] +
+                                   ((device const float4*)a.Wd)[a.bin[ij] * C4 + c4] * a.pairMask[ij] +
+                                   (a.bonds ? a.bonds[ij] * ((device const float4*)a.wBond)[c4] : float4(0.f)) +
+                                   ((device const float4*)a.wBondType)[o * C4 + c4] +
+                                   ((device const float4*)a.unspecified)[c4];
+    return;
+  }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
   int o = a.orders ? (int)a.orders[ij] : 0;
@@ -2030,6 +2064,14 @@ kernel void af3_single_struct(LF_ARGS(SingleStructArgs)) {
 }
 kernel void af3_gather_pair_sorted(LF_ARGS(GatherPairSortedArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    ulong r = t / C4; uint c4 = (uint)(t - r * C4);
+    int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
+    ((device half4*)a.out)[t] = half4(((device const float4*)a.pair)[((ulong)a.parent[i] * a.nRes + a.parent[j]) * C4 + c4]);
+    return;
+  }
   if (t >= a.rows * a.C) return;
   ulong r = t / a.C; uint c = (uint)(t - r * a.C);
   int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
@@ -2037,12 +2079,30 @@ kernel void af3_gather_pair_sorted(LF_ARGS(GatherPairSortedArgs)) {
 }
 kernel void af3_scatter_pair(LF_ARGS(ScatterPairArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.rows * C4) return;
+    ulong r = t / C4; uint c4 = (uint)(t - r * C4);
+    int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
+    float4 v = ((device const float4*)a.trunkPair)[((ulong)a.parent[i] * a.nRes + a.parent[j]) * C4 + c4] +
+               ((device const float4*)a.projected)[t] +
+               ((device const float4*)a.eSame)[a.sameParent[ij] * C4 + c4] +
+               ((device const float4*)a.eTwin)[a.twin[ij] * C4 + c4] +
+               ((device const float4*)a.ePrev)[a.prev[ij] * C4 + c4] +
+               ((device const float4*)a.eNext)[a.next[ij] * C4 + c4] +
+               ((device const float4*)a.eType)[a.type[ij] * C4 + c4];
+    if (a.outH) ((device half4*)a.outH)[(ulong)ij * C4 + c4] = half4(v);
+    else ((device float4*)a.pair)[(ulong)ij * C4 + c4] = v;
+    return;
+  }
   if (t >= a.rows * a.C) return;
   ulong r = t / a.C; uint c = (uint)(t - r * a.C);
   int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
-  a.pair[(ulong)ij * a.C + c] = a.trunkPair[((ulong)a.parent[i] * a.nRes + a.parent[j]) * a.C + c] + a.projected[t] +
-                                a.eSame[a.sameParent[ij] * a.C + c] + a.eTwin[a.twin[ij] * a.C + c] + a.ePrev[a.prev[ij] * a.C + c] +
-                                a.eNext[a.next[ij] * a.C + c] + a.eType[a.type[ij] * a.C + c];
+  float v = a.trunkPair[((ulong)a.parent[i] * a.nRes + a.parent[j]) * a.C + c] + a.projected[t] +
+            a.eSame[a.sameParent[ij] * a.C + c] + a.eTwin[a.twin[ij] * a.C + c] + a.ePrev[a.prev[ij] * a.C + c] +
+            a.eNext[a.next[ij] * a.C + c] + a.eType[a.type[ij] * a.C + c];
+  if (a.outH) a.outH[(ulong)ij * a.C + c] = (half)v;
+  else a.pair[(ulong)ij * a.C + c] = v;
 }
 kernel void af3_attn_bias(LF_ARGS(AttnBiasArgs)) {
   ulong ij = LF_INDEX;
@@ -2055,6 +2115,24 @@ kernel void af3_add_bias_heads(LF_ARGS(AddBiasHeadsArgs)) {
 }
 kernel void af3_dde_pair_init(LF_ARGS(DdePairInitArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.n * a.n * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    float sq = 0.f;
+    for (int k = 0; k < 3; ++k) { float d = a.coords[i * 3 + k] - a.coords[j * 3 + k]; sq += d * d; }
+    float distance = sqrt(max(1e-10f, sq));
+    int bin = (int)floor((distance - 3.25f) / 1.25f);
+    if (distance < 3.25f) bin = -1;
+    if (bin >= (int)a.bins) bin = a.bins - 1;
+    float4 v = ((device const float4*)a.s1)[j * C4 + c4] + ((device const float4*)a.s2)[i * C4 + c4] +
+               (bin >= 0 ? ((device const float4*)a.Wd)[bin * C4 + c4] : float4(0.f)) +
+               distance * ((device const float4*)a.Wraw)[c4];
+    float4 p = (a.srcPair ? ((device const float4*)a.srcPair)[t] : ((device const float4*)a.pair)[t]) + v;
+    if (a.outH) ((device half4*)a.outH)[t] = half4(p);
+    else ((device float4*)a.pair)[t] = p;
+    return;
+  }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
   float sq = 0.f;
@@ -2063,7 +2141,10 @@ kernel void af3_dde_pair_init(LF_ARGS(DdePairInitArgs)) {
   int bin = (int)floor((distance - 3.25f) / 1.25f);
   if (distance < 3.25f) bin = -1;
   if (bin >= (int)a.bins) bin = a.bins - 1;
-  a.pair[t] += a.s1[j * a.C + c] + a.s2[i * a.C + c] + (bin >= 0 ? a.Wd[bin * a.C + c] : 0.f) + distance * a.Wraw[c];
+  float v = a.s1[j * a.C + c] + a.s2[i * a.C + c] + (bin >= 0 ? a.Wd[bin * a.C + c] : 0.f) + distance * a.Wraw[c];
+  float p = (a.srcPair ? a.srcPair[t] : a.pair[t]) + v;
+  if (a.outH) a.outH[t] = (half)p;
+  else a.pair[t] = p;
 }
 kernel void af3_slot_major(LF_ARGS(SlotMajorArgs)) {
   ulong t = LF_INDEX;

@@ -85,7 +85,8 @@ void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& p
                  const std::string& next2 = "");
 // chai-1's parallel pair track: every update reads the stage's input and adds into the pair (z = z0 + f1(z0) + ...);
 // `which` a string of updates in order - o, i (the triangles), r, c (the grid attentions), t (the transition)
-void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
+void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which,
+                         bool emitNextXhat = false);
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias = nullptr);
 // nextB: the block that follows directly, nothing touching the pair between (its first norm emitted by this one)
@@ -101,7 +102,8 @@ void transition(half* x, size_t rows, int C, const std::string& pre, half* into 
                 const std::string& next2 = "", const char* scratchPrefix = "tr.");
 void pairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
                  const std::string& next2 = "");
-void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
+void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which,
+                         bool emitNextXhat = false);
 void singleTrack(float* single, const half* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias = nullptr);
 void pairformerBlock(half* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
@@ -219,11 +221,11 @@ void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync b
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
-ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta);
+ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample = false);
 
 // ---------------------------------------------------------------- OpenDDE's structural tokens (structural.mm)
 struct Structural { int n; float *single, *pair, *targetFeat, *bias, *seqMask, *pairMask; Masks masks; };
-Structural expandStructural(const Trunk& t);     // reads the residue batch: before sbatch.* is swapped in
+Structural expandStructural(Trunk& t);     // reads the residue batch: before sbatch.* is swapped in
 void freeStructural(Structural& s);
 struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
-DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense, int tmTokens);
+DdeConfidence ddeConfidence(Structural& st, const float* coords, int dense, int tmTokens, bool lastSample = false);

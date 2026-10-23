@@ -19,7 +19,7 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   size_t pairs = (size_t)t.n * t.n;
   size_t np = t.n <= 128 ? (size_t)((t.n + 15) & ~15) : (t.n <= 256 ? (size_t)((t.n + 31) & ~31) : (size_t)t.n);
   t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>(np * t.Cs);
-  t.msa = allocT<float>((size_t)t.S * t.n * t.Cm);
+  t.msa = nullptr;
   fill(t.pair, 0, pairs * t.C * 4);     // (the recycled pair before the first pass: read in place, embed())
   fill(t.single, 0, np * t.Cs * 4);
   t.prevSingle = allocT<float>(np * t.Cs);
@@ -186,6 +186,7 @@ static void embed(Trunk& t) {
     ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
     lin(sln, E + "prevSingleEmbedding", t.single, np, t.Cs, t.Cs, 1.f);
   };
+  if (!t.msa) t.msa = allocT<float>((size_t)t.S * n * t.Cm);
   if (flag("trunk.dialect.chaiMsaFeatures")) {
     // chai-1: the single first, then the MSA's 41 features through a biased linear plus the single's projection
     buildSingle();
@@ -349,11 +350,14 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   half* pln = pairLn(t.pair, pairs, C, pre + ".pairNorm", nextPairNorm);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
   lin(pln, pre + ".pairLogits", flat, pairs, C, heads);
-  float* keyMask = scratch<float>("msaatt.keymask", n);
   // chai: the logits masked by the TOKEN mask, not by the alignment's coverage; the values zeroed instead
   const bool chaiMask = flag("trunk.dialect.chaiMsaFeatures");
-  if (chaiMask) copy(keyMask, t.seqMask, (size_t)n * 4);
-  else run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, keyMask, (uint)S, (uint)n});
+  const float* keyMask = t.seqMask;
+  if (!chaiMask) {
+    float* km = scratch<float>("msaatt.keymask", n);
+    run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, km, (uint)S, (uint)n});
+    keyMask = km;
+  }
   int ldw = (n + 7) / 8 * 8;
   half* w = scratch<half>("msaatt.w", (size_t)heads * n * ldw);
   run("af3_msa_weights", Grid{(uint32_t)(heads * n), 1, 1}, 256, MsaWeightsArgs{flat, keyMask, w, (uint)n, (uint)heads, (uint)ldw, 0});
@@ -420,9 +424,9 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
     // chai-1: z += grouped OPM(m); m += attention(m, z) + transition(m), both off the same m; then the pair track in two
     // parallel stages
     groupedOuterProduct(t, B + ".outerProductMean");
-    msaAttention(t, B + ".msaAttention1", B + ".msaTransition");
-    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "oit");
-    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "rc");
+    msaAttention(t, B + ".msaAttention1", B + ".msaTransition", "__xhat__");
+    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "oit", true);
+    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "rc", false);
     return;
   }
   bool updateFirst = flag("trunk.dialect.msaUpdateBeforeOuterProduct");     // (OpenDDE, boltz2)
@@ -456,8 +460,11 @@ void runTrunk(Trunk& t) {
   for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k, msaBlocks);
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
-  // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
-  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "gopm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st.", "par."});
+  // (and the MSA stack's pair-track scratch and MSA tensor: the stack's half pair is made beside the f32 one before its blocks make theirs)
+  if (reclaim) {
+    if (t.msa) { release(t.msa); t.msa = nullptr; }
+    releaseScratch({"msaatt.", "msatr.", "opm.", "gopm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st.", "par."});
+  }
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
   // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Every residual is summed in
@@ -508,7 +515,7 @@ void distogram(Trunk& t, float* logits) {
   float* h = scratch<float>("disto.half", pairs * bins);
   distogramHalf(t.pair, h, pairs, t.C, bins);
   run1d("af3_symmetrise", (bins & 3) ? pairs * bins : pairs * (bins >> 2),
-        SymmetriseArgs{h, logits, (uint)t.n, (uint)bins, flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f, 0});
+        SymmetriseArgs{h, nullptr, logits, (uint)t.n, (uint)bins, flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f, 0});
 }
 // the contact thresholds (shared/heads/contact-threshold.js), cut against this model's own distogram bins
 static float contactAngstroms(int a, int b) {

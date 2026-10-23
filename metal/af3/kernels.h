@@ -62,7 +62,7 @@ struct OpmPermuteArgs { CP(half) Pm; DP(half) X; uint bi, L, O, pad; };
 struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; u64 i0; uint bi, L, C, after; };
 
 // ---------------------------------------------------------------- the distogram
-struct SymmetriseArgs { CP(float) x; DP(float) y; uint L, C; float scale; uint pad; };    // y = (x + x^T) scale
+struct SymmetriseArgs { CP(float) x; CP(half) xh; DP(float) y; uint L, C; float scale; uint pad; };    // y = (x + x^T) scale
 struct ContactBinsArgs { CP(int) classes; CP(int) table; DP(int) out; uint n, pad; };
 struct ContactProbsArgs { CP(float) logits; CP(int) bins; CP(float) pairMask; DP(float) out; u64 pairs; uint nb, pad; };
 
@@ -143,9 +143,9 @@ struct EulerArgs { DP(float) x; CP(float) noisy; CP(float) den; u64 n; float sca
 // ---------------------------------------------------------------- the confidence head
 // each pair's distogram bin (-1: none) and squared distance, once a pair
 struct ConfBinArgs { CP(float) beta; DP(int) bin; DP(float) sq; uint n, bins; float dmin, dmax; uint caBins, chaiBins; };
-// pair[i][j] += left[j] + right[i] + Wd[bin] mask (+ protenix2's distance term)
-struct ConfPairInitArgs { DP(float) pair; CP(float) left; CP(float) right; CP(int) bin; CP(float) sq; CP(float) pairMask; CP(float) Wd;
-                          CP(float) Wdist; uint n, C, caBins, unmasked; };
+// pair[i][j] += left[j] + right[i] + Wd[bin] mask (+ protenix2's distance term); reads srcPair and/or writes outH when set
+struct ConfPairInitArgs { DP(float) pair; CP(float) srcPair; DP(half) outH; CP(float) left; CP(float) right; CP(int) bin; CP(float) sq;
+                          CP(float) pairMask; CP(float) Wd; CP(float) Wdist; uint n, C, caBins, unmasked; };
 // the expectation over bins of softmax(logits) . centres (symmetricN: logits[ij] + logits[ji]), times scale (mask)
 struct ExpectationArgs { CP(float) logits; DP(float) out; CP(float) mask; CP(float) centres; DP(float) out2; CP(float) centres2;
                          u64 rows; uint bins, symmetricN; float scale; uint pad; };
@@ -178,15 +178,16 @@ struct SiluInPlaceArgs { DP(float) x; DP(half) outH; u64 n; };
 struct SingleStructArgs { DP(float) out; CP(float) a; CP(float) b; CP(int) role; CP(float) roleEmb; uint n, C; };
 // the residue pair under each structural pair, in matrix-group order (half: the GEMMs' input)
 struct GatherPairSortedArgs { CP(float) pair; CP(int) order; CP(int) parent; DP(half) out; u64 rows; uint n, nRes, C, pad; };
-// pair[ij] = the residue pair + projected + the five boolean features' embeddings
-struct ScatterPairArgs { DP(float) pair; CP(float) trunkPair; CP(int) parent; CP(float) projected; CP(int) order; CP(int) sameParent;
+// pair[ij] = the residue pair + projected + the five boolean features' embeddings (to half outH when set)
+struct ScatterPairArgs { DP(float) pair; DP(half) outH; CP(float) trunkPair; CP(int) parent; CP(float) projected; CP(int) order; CP(int) sameParent;
                          CP(int) twin; CP(int) prev; CP(int) next; CP(int) type; CP(float) eSame; CP(float) eTwin; CP(float) ePrev;
                          CP(float) eNext; CP(float) eType; u64 rows; uint n, nRes, C, pad; };
 struct AttnBiasArgs { DP(float) bias; CP(int) sameParent; CP(int) twin; CP(int) prev; CP(int) next; CP(int) type; CP(float) bSame;
                       CP(float) bTwin; CP(float) bPrev; CP(float) bNext; CP(float) bType; u64 pairs; };
 struct AddBiasHeadsArgs { DP(float) raw; CP(float) bias; u64 pairs; uint heads, pad; };          // raw[ij][h] += bias[ij]
 // OpenDDE's confidence pair: + s1[j] + s2[i] + the distance's bin embedding and its raw projection
-struct DdePairInitArgs { DP(float) pair; CP(float) s1; CP(float) s2; CP(float) coords; CP(float) Wd; CP(float) Wraw; uint n, C, bins, pad; };
+struct DdePairInitArgs { DP(float) pair; CP(float) srcPair; DP(half) outH; CP(float) s1; CP(float) s2; CP(float) coords; CP(float) Wd;
+                         CP(float) Wraw; uint n, C, bins, pad; };
 // plddt_weight [slot][c][bin] -> [c][slot bins + bin]
 struct SlotMajorArgs { CP(float) w; DP(half) out; uint slots, C, bins, pad; };
 

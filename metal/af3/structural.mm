@@ -8,7 +8,7 @@
 static const int ROLES = 7;
 
 // The expander and the refiner. Reads the residue batch (call before the structural batch is swapped in).
-Structural expandStructural(const Trunk& t) {
+Structural expandStructural(Trunk& t) {
   const std::string E = "expander.";
   Structural s{};
   s.n = (int)M.meta("sbatch.tokens");
@@ -47,10 +47,14 @@ Structural expandStructural(const Trunk& t) {
     for (size_t ij = 0; ij < pairs; ++ij) order[at[hr[ij / n] * ROLES + hr[ij % n]]++] = (int)ij; }
   int* dOrder = uploadNew(order.data(), pairs);
   if (lenW(E + "pairBlockProj") != (size_t)ROLES * ROLES * C * C) die("pairBlockProj is not 49 x C x C");
-  s.pair = allocT<float>(pairs * C);
+  static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  const bool useHalf = halfWanted && C % 8 == 0;
+  half* zh = useHalf ? scratch<half>("sx.zh", pairs * C) : nullptr;
+  s.pair = useHalf ? nullptr : allocT<float>(pairs * C);
   half* gathered = scratch<half>("sx.gathered", pairs * C);
   float* projected = scratch<float>("sx.projected", pairs * C);
-  run1d("af3_gather_pair_sorted", pairs * C, GatherPairSortedArgs{t.pair, dOrder, parent, gathered, pairs, (uint)n, (uint)nRes, (uint)C, 0});
+  run1d("af3_gather_pair_sorted", (C & 3) ? pairs * C : pairs * (C >> 2),
+        GatherPairSortedArgs{t.pair, dOrder, parent, gathered, pairs, (uint)n, (uint)nRes, (uint)C, 0});
   const half* Wp = Wh(E + "pairBlockProj");
   for (int k = 0; k < ROLES * ROLES; ++k) {
     size_t lo = start[k], hi = start[k + 1];
@@ -58,15 +62,17 @@ Structural expandStructural(const Trunk& t) {
   }
   const int *sp = M.i("structural.sameParent"), *tw = M.i("structural.twin"), *pv = M.i("structural.prevBackbone"),
             *nx = M.i("structural.nextBackbone"), *ty = M.i("structural.rolePairType");
-  run1d("af3_scatter_pair", pairs * C,
-        ScatterPairArgs{s.pair, t.pair, parent, projected, dOrder, sp, tw, pv, nx, ty, W(E + "sameParentEmbedding"),
+  run1d("af3_scatter_pair", (C & 3) ? pairs * C : pairs * (C >> 2),
+        ScatterPairArgs{s.pair, zh, t.pair, parent, projected, dOrder, sp, tw, pv, nx, ty, W(E + "sameParentEmbedding"),
                         W(E + "sameResidueTwinEmbedding"), W(E + "prevBbChainEmbedding"), W(E + "nextBbChainEmbedding"),
                         W(E + "rolePairTypeEmbedding"), pairs, (uint)n, (uint)nRes, (uint)C, 0});
   s.bias = allocT<float>(pairs);
   run1d("af3_attn_bias", pairs, AttnBiasArgs{s.bias, sp, tw, pv, nx, ty, W(E + "attnBiasSameParent"), W(E + "attnBiasSameResidueTwin"),
                                              W(E + "attnBiasPrevBbChain"), W(E + "attnBiasNextBbChain"), W(E + "attnBiasRolePairType"), pairs});
   release(dOrder);
-  releaseScratch({"sx."});
+  releaseScratch({"sx.parentSingle", "sx.ln", "sx.hidden", "sx.hiddenH", "sx.proj", "sx.gathered", "sx.projected"});
+  freeTrunk(t);
+  t.n = nRes;
   // the masks, from the structural batch's own seq mask
   std::vector<float> seq(M.hostF("sbatch.seqMask"), M.hostF("sbatch.seqMask") + n), pm(pairs);
   bool ones = true;
@@ -75,11 +81,7 @@ Structural expandStructural(const Trunk& t) {
   s.masks = {s.pairMask, s.seqMask, ones};
   // the refiner: four pairformer blocks, each adding the expander's attention bias
   int nb = 0; while (M.has("refiner.blocks." + num(nb) + ".singleChannels")) ++nb;
-  static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
-  if (halfWanted && C % 8 == 0) {
-    half* zh = scratch<half>("sx.zh", pairs * C);
-    toHalf(s.pair, zh, pairs * C);
-    release(s.pair);
+  if (useHalf) {
     for (int k = 0; k < nb; ++k)
       pairformerBlock(zh, s.single, s.masks, n, C, Cs, "refiner.blocks." + num(k), s.bias, k + 1 < nb ? "refiner.blocks." + num(k + 1) : "");
     releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
@@ -102,7 +104,7 @@ void freeStructural(Structural& s) {
 // ---------------------------------------------------------------- OpenDDE's confidence head
 // the structural tokens' coordinates, refined pair and single, s_inputs: pLDDT per structural atom slot, PAE, PDE and
 // the TM term per structural pair (d0 from `tmTokens`, the residue count pTM is reported over)
-DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense, int tmTokens) {
+DdeConfidence ddeConfidence(Structural& st, const float* coords, int dense, int tmTokens, bool lastSample) {
   const std::string P = "ddeConfidence.";
   int n = st.n, C = metaI(P + "pairChannels"), Cs = metaI(P + "singleChannels"), F = metaI(P + "singleInputChannels");
   int bins = metaI(P + "distanceBins"), paeBins = metaI(P + "paeBins"), pdeBins = metaI(P + "pdeBins");
@@ -110,40 +112,36 @@ DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense
   if (slots != dense) die("plddt_weight has %d slots, the batch %d", slots, dense);
   size_t pairs = (size_t)n * n;
   size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
-  float* single = scratch<float>("ddc.single", np * Cs);
-  copy(single, st.single, (size_t)n * Cs * 4);
-  run1d("af3_clamp", (size_t)n * Cs, ClampArgs{single, (u64)n * Cs, 512.f, 0});
-  float* sn = scratch<float>("ddc.singleNorm", np * Cs);
+  float* sn = scratch<float>("ddc.single", np * Cs);
   if (np > (size_t)n) fill(sn + (size_t)n * Cs, 0, (np - n) * Cs * 4);
-  ln(single, sn, n, Cs, P + "inputStrunkLnScale", P + "inputStrunkLnOffset");
-  float* pair = scratch<float>("ddc.pair", pairs * C);
-  copy(pair, st.pair, pairs * C * 4);
+  copy(sn, st.single, (size_t)n * Cs * 4);
+  run1d("af3_clamp", (size_t)n * Cs, ClampArgs{sn, (u64)n * Cs, 512.f, 0});
+  ln(sn, sn, n, Cs, P + "inputStrunkLnScale", P + "inputStrunkLnOffset");
+  static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
+                                 (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
+  const bool useHalf = halfWanted && C % 8 == 0;
+  float* pair = useHalf ? nullptr : scratch<float>("ddc.pair", pairs * C);
+  half* zh = useHalf ? scratch<half>("ddc.zh", pairs * C) : nullptr;
+  if (!useHalf) copy(pair, st.pair, pairs * C * 4);
   half* tfH = scratch<half>("ddc.tfH", np * F);
   if (np > (size_t)n) fill(tfH + (size_t)n * F, 0, (np - n) * F * sizeof(half));
   toHalf(st.targetFeat, tfH, (size_t)n * F);
   float* s1 = scratch<float>("ddc.s1", np * C); float* s2 = scratch<float>("ddc.s2", np * C);
   lin(tfH, P + "s1", s1, np, F, C);
   lin(tfH, P + "s2", s2, np, F, C);
-  run1d("af3_dde_pair_init", pairs * C, DdePairInitArgs{pair, s1, s2, coords, W(P + "distance"), W(P + "distanceRaw"), (uint)n, (uint)C,
-                                                        (uint)bins, 0});
+  run1d("af3_dde_pair_init", (C & 3) ? pairs * C : pairs * (C >> 2),
+        DdePairInitArgs{pair, useHalf ? st.pair : nullptr, zh, s1, s2, coords, W(P + "distance"), W(P + "distanceRaw"),
+                        (uint)n, (uint)C, (uint)bins, 0});
+  if (lastSample && st.pair) { release(st.pair); st.pair = nullptr; }
   int nb = 0; while (M.has(P + "blocks." + num(nb) + ".singleChannels")) ++nb;
-  static const bool halfWanted = (!getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0) &&
-                                 (!getenv("LOCALFOLD_CONF_HALF_PAIR") || atoi(getenv("LOCALFOLD_CONF_HALF_PAIR")) != 0);
-  if (halfWanted && C % 8 == 0) {
-    half* zh = scratch<half>("ddc.zh", pairs * C);
-    toHalf(pair, zh, pairs * C);
-    releaseScratch({"ddc.pair"});
+  if (useHalf) {
     for (int k = 0; k < nb; ++k)
       pairformerBlock(zh, sn, st.masks, n, C, Cs, P + "blocks." + num(k), st.bias, k + 1 < nb ? P + "blocks." + num(k + 1) : "");
-    releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
-    pair = scratch<float>("ddc.pair", pairs * C);
-    toFloat(zh, pair, pairs * C);
-    releaseScratch({"ddc.zh"});
   } else {
     for (int k = 0; k < nb; ++k)
       pairformerBlock(pair, sn, st.masks, n, C, Cs, P + "blocks." + num(k), st.bias, k + 1 < nb ? P + "blocks." + num(k + 1) : "");
-    releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
   }
+  releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
   // PAE from the pair, PDE from the symmetrised pair; 64 bins over [0, 32]
   int NB = std::max(paeBins, pdeBins);
   half* lnP = scratch<half>("ddc.ln", pairs * C);
@@ -158,11 +156,12 @@ DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense
   float* dPde = scratch<float>("ddc.pdeC", pdeBins); upload(dPde, pdeC.data(), pdeBins * 4);
   float* dPae = scratch<float>("ddc.paeC", paeBins); upload(dPae, paeC.data(), paeBins * 4);
   float* dPer = scratch<float>("ddc.perBin", paeBins); upload(dPer, perBin.data(), paeBins * 4);
-  run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, sym, (uint)n, (uint)C, 1.f, 0});
+  run1d("af3_symmetrise", (C & 3) ? pairs * C : pairs * (C >> 2), SymmetriseArgs{pair, zh, sym, (uint)n, (uint)C, 1.f, 0});
   ln(sym, lnP, pairs, C, P + "pdeLnScale", P + "pdeLnOffset");
   lin(lnP, P + "pde", logits, pairs, C, pdeBins);
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pde, nullptr, dPde, nullptr, nullptr, pairs, (uint)pdeBins, 0, 1.f, 0});
-  ln(pair, lnP, pairs, C, P + "paeLnScale", P + "paeLnOffset");
+  if (zh) ln(zh, lnP, pairs, C, P + "paeLnScale", P + "paeLnOffset");
+  else ln(pair, lnP, pairs, C, P + "paeLnScale", P + "paeLnOffset");
   lin(lnP, P + "pae", logits, pairs, C, paeBins);
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pae, nullptr, dPae, tm, dPer, pairs, (uint)paeBins, 0, 1.f, 0});
   DdeConfidence out;

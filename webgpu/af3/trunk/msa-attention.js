@@ -115,15 +115,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // thread a pair now normalises once and writes all HEADS logits, masked,
   // into `attention`, which the softmax then reads in place. Each logit is the
   // same expression summed in the same order, so this is bit-identical.
+  const stageLogitWeights = (2 + heads) * pairChannels * 4 <= 16384;
   const attentionLogits = `${common}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> key_mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> attention: array<f32>;
-
+${stageLogitWeights ? `
+var<workgroup> w_scale: array<f32, ${pairChannels}>;
+var<workgroup> w_offset: array<f32, ${pairChannels}>;
+var<workgroup> w_logits: array<f32, ${pairChannels * heads}>;
+` : ""}
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let pair_index = id.x + id.y * GRID_WIDTH * 64u;
+fn main(@builtin(global_invocation_id) id: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+${stageLogitWeights ? `  for (var c = lane; c < C_Z; c += 64u) {
+    w_scale[c] = weights[W_PAIR_SCALE + c];
+    w_offset[c] = weights[W_PAIR_OFFSET + c];
+  }
+  for (var idx = lane; idx < C_Z * HEADS; idx += 64u) {
+    w_logits[idx] = weights[W_PAIR_LOGITS + idx];
+  }
+  workgroupBarrier();
+` : ""}  let pair_index = id.x + id.y * GRID_WIDTH * 64u;
   if (pair_index >= TOKENS * TOKENS) { return; }
   let i = pair_index / TOKENS;
   let j = pair_index % TOKENS;
@@ -140,10 +154,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let inverse_std = inverseSqrt(variance + EPSILON);
   ${Array.from({ length: heads }, (_, h) => `var logit_${h} = 0.0;`).join("\n  ")}
   for (var c = 0u; c < C_Z; c += 1u) {
-    let value = (pair[base + c] - mean) * inverse_std * weights[W_PAIR_SCALE + c]
-      + weights[W_PAIR_OFFSET + c];
-    let w_base = W_PAIR_LOGITS + c * HEADS;
-    ${Array.from({ length: heads }, (_, h) => `logit_${h} += value * weights[w_base + ${h}u];`).join("\n    ")}
+    let value = (pair[base + c] - mean) * inverse_std * ${stageLogitWeights ? "w_scale[c]" : "weights[W_PAIR_SCALE + c]"}
+      + ${stageLogitWeights ? "w_offset[c]" : "weights[W_PAIR_OFFSET + c]"};
+    let w_base = ${stageLogitWeights ? "c * HEADS" : "W_PAIR_LOGITS + c * HEADS"};
+    ${Array.from({ length: heads }, (_, h) => `logit_${h} += value * ${stageLogitWeights ? `w_logits[w_base + ${h}u]` : `weights[w_base + ${h}u]`};`).join("\n    ")}
   }
   let mask_bias = 1.0e9 * (key_mask[j] - 1.0);
   ${Array.from({ length: heads }, (_, h) => `attention[(${h}u * TOKENS + i) * TOKENS + j] = logit_${h} + mask_bias;`).join("\n  ")}
@@ -191,7 +205,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     workgroupBarrier();
   }
   let total = reduce[0];
-  workgroupBarrier();
 
   for (var j = local; j < TOKENS; j += 64u) {
     attention[slot * TOKENS + j] = logits[j] / total;
@@ -227,6 +240,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var squares = 0.0;
   for (var c = local; c < C_M; c += 64u) {
     let value = msa[base + c];
+    normalized[c] = value;
     total += value;
     squares += value * value;
   }
@@ -246,7 +260,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     : `workgroupBarrier();
   var centred = 0.0;
   for (var c = local; c < C_M; c += 64u) {
-    let d = msa[base + c] - mean;
+    let d = normalized[c] - mean;
     centred += d * d;
   }
   reduce_a[local] = centred;
@@ -259,7 +273,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();
   for (var c = local; c < C_M; c += 64u) {
-    normalized[c] = (msa[base + c] - mean) * inverse_std * weights[W_ACT_SCALE + c]
+    normalized[c] = (normalized[c] - mean) * inverse_std * weights[W_ACT_SCALE + c]
       + weights[W_ACT_OFFSET + c];
   }
   workgroupBarrier();
@@ -309,6 +323,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     var squares = 0.0;
     for (var c = local; c < C_M; c += 64u) {
       let value = msa[base + c];
+      normalized[r * C_M + c] = value;
       total += value;
       squares += value * value;
     }
@@ -333,11 +348,10 @@ ${variance === "fast" ? `  if (local < PROJECT_ROWS) {
   workgroupBarrier();` : `  if (local < PROJECT_ROWS) { stats[local] = vec2<f32>(reduce_a[local * 64u] / f32(C_M), 0.0); }
   workgroupBarrier();
   for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
-    let base = min(row0 + r, ROWS - 1u) * C_M;
     let mean = stats[r].x;
     var centred = 0.0;
     for (var c = local; c < C_M; c += 64u) {
-      let d = msa[base + c] - mean;
+      let d = normalized[r * C_M + c] - mean;
       centred += d * d;
     }
     reduce_a[r * 64u + local] = centred;
@@ -355,9 +369,8 @@ ${variance === "fast" ? `  if (local < PROJECT_ROWS) {
   }
   workgroupBarrier();`}
   for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
-    let base = min(row0 + r, ROWS - 1u) * C_M;
     for (var c = local; c < C_M; c += 64u) {
-      normalized[r * C_M + c] = (msa[base + c] - stats[r].x) * stats[r].y * weights[W_ACT_SCALE + c]
+      normalized[r * C_M + c] = (normalized[r * C_M + c] - stats[r].x) * stats[r].y * weights[W_ACT_SCALE + c]
         + weights[W_ACT_OFFSET + c];
     }
   }

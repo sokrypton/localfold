@@ -49,10 +49,11 @@ static half* takeEmitted(const void* x, const std::string& norm) {
 template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "") {
   if (half* b = takeEmitted(pair, norm)) return b;
   half* xn = scratch<half>("pr.x", P * C);
-  if (!nextNorm.empty() && hasW(nextNorm + "Scale")) {
-    half* xn2 = scratch<half>("pr.x2", P * C);
+  if (!nextNorm.empty() && (nextNorm == "__xhat__" || hasW(nextNorm + "Scale"))) {
+    const bool xh = nextNorm == "__xhat__";
+    half* xn2 = scratch<half>(xh ? "par.xhat" : "pr.x2", P * C);
     layerNormDual(pair, xn, W(norm + "Scale"), Wopt(norm + "Offset"),
-                  xn2, W(nextNorm + "Scale"), Wopt(nextNorm + "Offset"), P, C);
+                  xn2, xh ? nullptr : W(nextNorm + "Scale"), xh ? nullptr : Wopt(nextNorm + "Offset"), P, C);
     emit(0, pair, nextNorm, xn2);
     return xn;
   }
@@ -244,7 +245,9 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
   // both used to be a LayerNorm pass of their own past ~300 tokens)
   half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
-  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
+  const bool xh1 = next1 == "__xhat__";
+  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128 || C == 256) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
+  half* ln1Buf = emitNext ? ((xh1 && shared.xhat != scratch<half>("par.xhat", rows * C)) ? scratch<half>("par.xhat", rows * C) : scratch<half>("pr.x", rows * C)) : nullptr;
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -267,7 +270,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
     if (emittedAll) {
       Gemm G{}; G.X = g; G.tx = F16; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x + r0 * C; G.ty = dtOf<T>(); G.rows = r;
       G.in = I; G.out = C; G.beta = 1.f; G.label = "transition2, next norms";
-      G.lnOut = scratch<half>("pr.x", rows * C) + r0 * C; G.lnScale = W(next1 + "Scale"); G.lnOffset = Wopt(next1 + "Offset");
+      G.lnOut = ln1Buf + r0 * C; G.lnScale = xh1 ? nullptr : W(next1 + "Scale"); G.lnOffset = xh1 ? nullptr : Wopt(next1 + "Offset");
       if (!next2.empty()) {
         G.lnOut2 = scratch<half>("pr.x2", rows * C) + r0 * C; G.lnScale2 = W(next2 + "Scale"); G.lnOffset2 = Wopt(next2 + "Offset");
       }
@@ -279,7 +282,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
     }
     addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C, nullptr, "transition2");
   }
-  if (emittedAll) { emit(0, x, next1, scratch<half>("pr.x", rows * C)); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
+  if (emittedAll) { emit(0, x, next1, ln1Buf); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
 }
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
                 const std::string& next2, const char* scratchPrefix) {
@@ -314,7 +317,8 @@ void pairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pr
 // then), every later one reads the kept input and adds its residual into the pair; the ending-node attention's residual
 // untransposed
 template <class T>
-static void parallelPairUpdatesT(T* pair, const Masks& m, int n, int C, const std::string& pre, const char* which) {
+static void parallelPairUpdatesT(T* pair, const Masks& m, int n, int C, const std::string& pre, const char* which,
+                                 bool emitNextXhat) {
   bool swap = flag("trunk.dialect.swapTransposedBias"), divide = flag("trunk.dialect.triangleMulDivideByLength");
   size_t P = (size_t)n * n;
   static const bool fold = !getenv("LOCALFOLD_FOLD_NORM") || atoi(getenv("LOCALFOLD_FOLD_NORM")) != 0;
@@ -323,30 +327,36 @@ static void parallelPairUpdatesT(T* pair, const Masks& m, int n, int C, const st
   // xhat is the block's input whatever the updates before have added)
   T* base = fold ? pair : scratch<T>("par.base", P * C);
   if (fold) {
-    shared.xhat = scratch<half>("par.xhat", P * C);
-    layerNorm(pair, shared.xhat, P, C, nullptr, nullptr);
+    if (half* em = takeEmitted(pair, "__xhat__")) shared.xhat = em;
+    else {
+      shared.xhat = scratch<half>("par.xhat", P * C);
+      layerNorm(pair, shared.xhat, P, C, nullptr, nullptr);
+    }
     shared.src[0] = pair;
   } else copy(base, pair, P * C * sizeof(T));
   bool first = true;
   for (const char* u = which; *u; ++u) {
-    bool inPlace = first && *u != 'c';
+    bool inPlace = fold || (first && *u != 'c');
     first = false;
     T* in = inPlace ? pair : base;
     T* into = inPlace ? nullptr : pair;
+    const bool last = u[1] == '\0';
     switch (*u) {
       case 'o': triangle(in, m, n, C, pre + ".triangleMultiplicationOutgoing", true, divide, into); break;
       case 'i': triangle(in, m, n, C, pre + ".triangleMultiplicationIncoming", false, divide, into); break;
       case 'r': gridAttention(in, m, n, C, pre + ".pairAttention1", false, swap, into); break;
       case 'c': gridAttention(in, m, n, C, pre + ".pairAttention2", true, swap, into, true); break;
-      case 't': transition(in, P, C, pre + ".pairTransition", into); break;
+      case 't': transition(in, P, C, pre + ".pairTransition", into, (fold && last && emitNextXhat) ? "__xhat__" : ""); break;
     }
   }
 }
-void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which) {
-  parallelPairUpdatesT(pair, m, n, C, pre, which);
+void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which,
+                         bool emitNextXhat) {
+  parallelPairUpdatesT(pair, m, n, C, pre, which, emitNextXhat);
 }
-void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which) {
-  parallelPairUpdatesT(pair, m, n, C, pre, which);
+void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which,
+                         bool emitNextXhat) {
+  parallelPairUpdatesT(pair, m, n, C, pre, which, emitNextXhat);
 }
 
 // ---------------------------------------------------------------- the single track
@@ -428,7 +438,7 @@ static void pairformerBlockT(T* pair, float* single, const Masks& m, int n, int 
                              const std::string& nextB) {
   if (flag("trunk.dialect.parallelPairformer")) {
     // the single track reads the pair ENTERING the block, kept by the parallel updates
-    parallelPairUpdates(pair, m, n, C, B, "oirct");
+    parallelPairUpdates(pair, m, n, C, B, "oirct", !nextB.empty());
     // (folded, the pair's xhat is the block input's; otherwise the kept copy)
     singleTrackT(single, shared.xhat ? pair : scratch<T>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
     shared = {};

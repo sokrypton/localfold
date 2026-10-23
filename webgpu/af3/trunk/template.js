@@ -255,6 +255,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   stage_rows(first, lane);
   for (var e = lane; e < CHANNELS; e += 64u) {
 ${projectRows("W_EMBED8")}
+    let w1 = weights[W_EMBED1 + e];
+    let w4 = weights[W_EMBED4 + e];
+    let w5 = weights[W_EMBED5 + e];
+    let w6 = weights[W_EMBED6 + e];
+    let w7 = weights[W_EMBED7 + e];
     for (var r = 0u; r < EMBED_ROWS; r += 1u) {
       let row = first + r;
       if (row >= PAIRS) { break; }
@@ -280,11 +285,11 @@ ${projectRows("W_EMBED8")}
       if (bin > 0u) {
         value += weights[W_EMBED0 + (bin - 1u) * CHANNELS + e];
       }
-      value += geometry[g + 1u] * weights[W_EMBED1 + e];
-      value += geometry[g + 2u] * weights[W_EMBED4 + e];
-      value += geometry[g + 3u] * weights[W_EMBED5 + e];
-      value += geometry[g + 4u] * weights[W_EMBED6 + e];
-      value += geometry[g + 5u] * weights[W_EMBED7 + e];
+      value += geometry[g + 1u] * w1;
+      value += geometry[g + 2u] * w4;
+      value += geometry[g + 3u] * w5;
+      value += geometry[g + 4u] * w6;
+      value += geometry[g + 5u] * w7;
 
       act[row * CHANNELS + e] = value;
     }
@@ -313,12 +318,21 @@ ${projectRows("W_EMBED8")}
 @group(0) @binding(3) var<storage, read> repeat: array<f32>;
 ${outerResidual ? "@group(0) @binding(4) var<storage, read> before: array<f32>;" : ""}
 
+var<workgroup> w_scale: array<f32, ${CHANNELS}>;
+var<workgroup> w_offset: array<f32, ${CHANNELS}>;
+
 fn value_at(index: u32) -> f32 {
 ${outerResidual ? "  return act[index] + before[index];" : "  return act[index];"}
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(@builtin(global_invocation_id) id: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+  for (var c = lane; c < CHANNELS; c += 64u) {
+    w_scale[c] = weights[W_OUT_SCALE + c];
+    w_offset[c] = weights[W_OUT_OFFSET + c];
+  }
+  workgroupBarrier();
   let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= PAIRS) { return; }
   let base = row * CHANNELS;
@@ -333,10 +347,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let mean = total / f32(CHANNELS);
   ${varianceCode("CHANNELS", "value_at(base + c)")}
   let inverse_std = inverseSqrt(variance + EPSILON);
+  let rep = repeat[0];
 
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    summed[base + c] += ((value_at(base + c) - mean) * inverse_std * weights[W_OUT_SCALE + c]
-      + weights[W_OUT_OFFSET + c]) * repeat[0];
+    summed[base + c] += ((value_at(base + c) - mean) * inverse_std * w_scale[c]
+      + w_offset[c]) * rep;
   }
 }`;
 
