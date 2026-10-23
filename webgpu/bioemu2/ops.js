@@ -1765,6 +1765,18 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     this.partials = undefined;
   }
 
+  free(...buffers) {
+    for (const b of buffers) {
+      if (!b) continue;
+      b.destroy();
+      const idx = this.allocated.indexOf(b);
+      if (idx >= 0) {
+        this.allocated.splice(idx, 1);
+        this.bytes -= b.size;
+      }
+    }
+  }
+
   destroyWeights() {
     this.destroy();
     for (const b of this.weightBuffers) b.destroy();

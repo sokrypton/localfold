@@ -114,13 +114,18 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
                    (uint)sh.queries, (uint)sh.keys, (uint)heads, (uint)D, (uint)sh.subsets, st.keyMasked ? 1u : 0u});
   half* tn = scratch<half>("ab.tn", qRows * C);
   if (hasW(B + ".Transition2")) {
-    float* attention = scratch<float>("ab.attention", qRows * C);
-    lin(gathered, B + ".Transition2", attention, qRows, Wd, C);
-    if (!st.noResidual) {
-      adaLn(act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1, 0, nullptr, nullptr, nullptr, false, attention, bc.zg, C);
+    if (!gemmGateResidual(gathered, Wh(B + ".Transition2"), act, qRows, qRows, Wd, C, bc.zg, C, q1, 1.f,
+                          "atom output, gated residual", true)) {
+      float* attention = scratch<float>("ab.attention", qRows * C);
+      lin(gathered, B + ".Transition2", attention, qRows, Wd, C);
+      if (!st.noResidual) {
+        adaLn(act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1, 0, nullptr, nullptr, nullptr, false, attention, bc.zg, C);
+      } else {
+        run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, attention, nullptr, bc.zg, qRows * C, q1 * C, 1.f, 0});
+        adaLn(pre, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
+      }
     } else {
-      run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, attention, nullptr, bc.zg, qRows * C, q1 * C, 1.f, 0});
-      adaLn(pre, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
+      adaLn(st.noResidual ? pre : act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
     }
   } else if (!st.noResidual) {
     adaLn(act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1, 0, nullptr, nullptr, nullptr, false, nullptr, bc.zg, C, gathered, 2.f);
@@ -138,12 +143,15 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
       run1d("af3_mul_h", qRows * I, MulHArgs{gated, u, qRows * I});
     }
   }
-  float* projected = scratch<float>("ab.projected", qRows * C);
-  lin(gated, B + ".ffwTransition2", projected, qRows, I, C);
-  if (deferFfwRes && !st.noResidual && C <= 768 && pendY && pendGate) {
-    *pendY = projected; *pendGate = bc.tg;
-  } else {
-    run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, projected, nullptr, bc.tg, qRows * C, q1 * C, 1.f, 0});
+  if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, qRows, qRows, I, C, bc.tg, C, q1, 1.f,
+                        "atom transition, gated residual", true)) {
+    float* projected = scratch<float>("ab.projected", qRows * C);
+    lin(gated, B + ".ffwTransition2", projected, qRows, I, C);
+    if (deferFfwRes && !st.noResidual && C <= 768 && pendY && pendGate) {
+      *pendY = projected; *pendGate = bc.tg;
+    } else {
+      run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, projected, nullptr, bc.tg, qRows * C, q1 * C, 1.f, 0});
+    }
   }
 }
 

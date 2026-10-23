@@ -64,14 +64,15 @@ const half* qkvgWeight(const std::string& a, int D) {
 static const float* attentionHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map,
                                   const float* bias, const half* biasH, int perSample,
                                   const float* inResH, const float* inResGate, int inResLdg) {
+  const int pR = L.windowed ? R : (R <= 128 ? ((R + 15) & ~15) : ((R + 31) & ~31));
   const std::string a = L.p + L.att;
-  half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
+  half* hh = scratch<half>(L.windowed ? "be2.cl.hh" : "be2.cl.thh", (size_t)pR * D);
   adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh, inResH, inResGate, inResLdg);
-  half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)R * 4 * D);
+  half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)pR * 4 * D);
   Gemm g{}; g.X = hh; g.tx = F16; g.W = qkvgWeight(a, D); g.tw = F16; g.transW = true; g.Y = qkvg; g.ty = F16;
-  g.rows = R; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = L.windowed ? "atom qkvg" : "token qkvg";
+  g.rows = pR; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = L.windowed ? "atom qkvg" : "token qkvg";
   gemm(g);
-  half* o = scratch<half>("be2.cl.oh", (size_t)R * D);
+  half* o = scratch<half>(L.windowed ? "be2.cl.oh" : "be2.cl.toh", (size_t)pR * D);
   if (L.windowed) {
     if (D / L.heads != 32) die("BioEmu2: an atom head of %d (this port is written for 32)", D / L.heads);
     if (R % WQ || perSample % WQ) die("BioEmu2: %d atom rows are not whole windows", R);
@@ -85,9 +86,9 @@ static const float* attentionHalf(const CondLayer& L, float* x, int R, int D, co
     attention(at);
   }
   Gemm G{}; G.X = o; G.tx = F16; G.W = M.h("w/" + a + "proj_o/weight"); G.tw = F16; G.transW = true; G.Y = x; G.ty = F32;
-  G.rows = R; G.in = D; G.out = D; G.label = L.windowed ? "atom proj_o" : "token proj_o";
+  G.rows = pR; G.in = D; G.out = D; G.label = L.windowed ? "atom proj_o" : "token proj_o";
   if (gemmGatedRows(G, cond + 2 * D, 6 * D, map)) return nullptr;
-  float* h = scratch<float>("be2.cl.h", (size_t)R * D);
+  float* h = scratch<float>("be2.cl.h", (size_t)pR * D);
   G.Y = h; gemm(G);
   return h;
 }
@@ -127,9 +128,10 @@ void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, co
     be2Run1d("be2_gated_add", ((size_t)R * D) >> 2, Be2GatedAddArgs{x, h, cond + 2 * D, map, (size_t)R, (uint)D, (uint)(6 * D)});
   }
   if (HALF) {
-    half* hh = scratch<half>("be2.cl.hh", (size_t)R * D);
+    const int pR = L.windowed ? R : (R <= 128 ? ((R + 15) & ~15) : ((R + 31) & ~31));
+    half* hh = scratch<half>(L.windowed ? "be2.cl.hh" : "be2.cl.thh", (size_t)pR * D);
     adaLn(x, nullptr, R, D, cond + 3 * D, cond + 4 * D, 6 * D, map, hh, resH, resH ? cond + 2 * D : nullptr, 6 * D);
-    transitionHalf(hh, x, R, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map, outResH);    // (x += gamma fc3(...))
+    transitionHalf(hh, x, pR, D, L.p + "transition/", false, cond + 5 * D, 6 * D, map, outResH);    // (x += gamma fc3(...))
   } else {
     float* h = scratch<float>("be2.cl.h", (size_t)R * D);
     float* t = scratch<float>("be2.cl.t", (size_t)R * D);

@@ -155,8 +155,8 @@ export async function foldBioemu2(device, read, features, options = {}) {
         await trunk.pass((done, total) => progress("trunk", pass * total + done, passes * total));
       }
     });
-    trunk.trunkAllocator?.destroyPooled();
     const sTrunk = await net.ops.read(trunk.s);
+    trunk.free();
     const { contact, logits } = await clock("distogram", () => net.distogram(g, trunk.z));
     options.onContacts?.(contact);
     const N = g.N;
@@ -170,6 +170,7 @@ export async function foldBioemu2(device, read, features, options = {}) {
     const frames = [];
     const dn = await clock("denoiser-compile", () => net.denoiserProgram(g, sIn, sTrunk, trunk.z, {
       samples, ...(propagation ? { dt: propagation.lagNs * 1000, dynamics: true } : {}) }));
+    net.ops.free(trunk.z, dn.context.z, g.tokenInts, g.atomToken);
     const t0 = performance.now();
     let calls = 0;
     const denoise = async (x, sigma) => { calls += 1; return dn.denoise(x, sigma); };

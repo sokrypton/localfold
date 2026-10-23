@@ -722,7 +722,9 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against
   // 1.20 at 64 x 64; 4096 square 12.0 TFLOP/s against 9.5). Measured on an M5 (8-core GPU), interleaved.
   int tm = a.n <= 128 ? (a.n + 15) / 16 * 16 : 64, tn = a.n <= 128 ? (a.m >= 40 * 64 ? 64 : 32) : (a.m >= 128 ? 128 : 64);
-  if (a.n > 128 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 8) { tm = 32; tn = a.m >= 256 ? 128 : 64; }
+  if ((a.epilogue & 16384) && a.n > 64 && a.n <= 128 && a.m <= 1024 && a.m % 64 == 0) { tm = 32; tn = 64; }
+  if (a.n > 128 && tm == 64 && (((a.n + 63) & ~63) - a.n) * 12 > a.n && (((a.n + 31) & ~31) - a.n) * 2 < (((a.n + 63) & ~63) - a.n)) tm = 32;
+  if (a.n > 128 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 16) { tm = 32; tn = a.m >= 256 ? 128 : 64; }
   // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
   // 2.960 against 2.886). LOCALFOLD_GEMM_WIDE=0 the control
@@ -732,7 +734,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   else if (wideWanted && (plain || (a.epilogue & 128)) && a.n > 80 && a.n <= 128 && a.m >= 1024 && a.m % 128 == 0) { tm = 32; tn = 128; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
   const bool triReg = tri && (a.epilogue & 512);
-  if (triReg || (a.epilogue & 524288)) { tm = 64; tn = a.m >= 128 ? 128 : 64; }
+  if (triReg || (a.epilogue & (32768 | 524288))) { tm = 64; tn = a.m >= 128 ? 128 : 64; }
   // the general epilogues in registers, 4 columns at a time (LOCALFOLD_GEMM_VEC=0 the control): where the tile is
   // 64 rows and everything the epilogue touches is 4-element aligned
   static const bool vecWanted = !getenv("LOCALFOLD_GEMM_VEC") || atoi(getenv("LOCALFOLD_GEMM_VEC")) != 0;
@@ -826,13 +828,17 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   // narrower weights keep 32, whose extra threadgroups win there: 0.102 against 0.118 ms on 768 x 80 x 768)
   if (a.n <= 128) { tr = (a.n + 15) / 16 * 16; tc = tr <= 64 || (tr <= 80 && a.m >= 40 * 64) ? 64 : 32; }
   else if (a.m <= 48) { tr = 64; tc = 32; }
-  // 48-row tiles where 64 would waste over a tenth of the rows on padding and 48 wastes less
+  // 48- or 32-row tiles where 64 would waste rows on padding and a shorter tile wastes less
   if (a.n > 128 && tr == 64) {
-    long pad64 = (long)((a.n + 63) / 64) * 64 - a.n, pad48 = (long)((a.n + 47) / 48) * 48 - a.n;
+    long pad64 = (long)((a.n + 63) / 64) * 64 - a.n, pad48 = (long)((a.n + 47) / 48) * 48 - a.n,
+         pad32 = (long)((a.n + 31) / 32) * 32 - a.n;
     if (pad64 * 10 > a.n && pad48 < pad64) tr = 48;
+    else if (pad64 * 12 > a.n && pad32 * 2 < pad64) tr = 32;
   }
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
-  while (tc > 16 && groups(tc) < 64) tc /= 2;
+  if ((a.epilogue & 16384) && a.n > 64 && a.n <= 128 && a.m <= 1024 && a.m % 48 == 0) { tr = 16; tc = 48; }
+  else if (a.n > 128 && tr == 64 && a.m >= 128 && groups(32) < 64) { tr = 32; tc = 32; }
+  else while (tc > 16 && groups(tc) < 64) tc /= 2;
   // ...and 48-column tiles likewise (not SwiGLU's, coupling combine's, or the triangle gate's, whose epilogues pair 8-column blocks)
   if (tc == 64 && !(a.epilogue & (128 | 256 | 32768))) {
     long pad64 = (long)((a.m + 63) / 64) * 64 - a.m, pad48 = (long)((a.m + 47) / 48) * 48 - a.m;
