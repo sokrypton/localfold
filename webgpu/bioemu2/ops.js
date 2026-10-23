@@ -142,7 +142,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
  * or 4, the error back to metal/bioemu2's fast arm's and the speed with it (267, 278 ms). This arm keeps float32
  * activations and only the weights in half, which is why it is the more accurate of the two ports.
  */
-function gemm2Source(wordB, pair = null, b16 = false, gate = null, rpt = 4) {
+function gemm2Source(wordB, pair = null, b16 = false, gate = null, rpt = 4, exactK = false) {
   const BK = 16;
   const BM = rpt * 16;
   const E = "f32";
@@ -298,7 +298,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }`).join("\n    ")}
     workgroupBarrier();
   }
-  for (var k0 = kFastEnd; k0 < kEnd; k0 += ${BK}u) {
+  ${exactK ? "" : `for (var k0 = kFastEnd; k0 < kEnd; k0 += ${BK}u) {
     let fullK = inBatch && (k0 + ${BK}u <= kEnd);
     // 🔴 EVERY PANEL WRITE IS A WHOLE vec4, one lane's: lanes writing different components of one shared vec4 race -
     // a component store can be a read-modify-write of the vector, and it was (every stage wrong from s_inputs on, 0.61).
@@ -418,7 +418,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       ${rpt === 5 ? "acc_4_0 += av4 * bv0; acc_4_1 += av4 * bv1;" : ""}
     }`).join("\n    ")}
     workgroupBarrier();
-  }
+  }`}
   if (!inBatch) { return; }
   ${pair ? (pair.rows4 && rpt === 4
     ? `if (n0 + tn1 < p.n) { pairOut4(m0 + tm, (n0 / 2u) + tn0, acc_0_0 * p.alpha, acc_0_1 * p.alpha, acc_1_0 * p.alpha, acc_1_1 * p.alpha, acc_2_0 * p.alpha, acc_2_1 * p.alpha, acc_3_0 * p.alpha, acc_3_1 * p.alpha); }\n  return;`
@@ -430,7 +430,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   ${gate ? `var prev_gr = -2;
   var gv0 = vec4<f32>(0.0);
   var gv1 = vec4<f32>(0.0);
-  let fastGate = p.bias == 0u && p.act == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n;` : ""}
+  let fastGate = p.bias == 0u && p.act == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n;` : `let fastPlain = p.split == 0u && p.act == 0u && p.accumulate == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n;
+  var bv0 = vec4<f32>(0.0);
+  var bv1 = vec4<f32>(0.0);
+  if (fastPlain && p.bias != 0u) {
+    let bOff0 = p.biasOff + b0 * p.biasS0 + n0 + tn0;
+    let bOff1 = p.biasOff + b0 * p.biasS0 + n0 + tn1;
+    bv0 = vec4<f32>(bias[bOff0], bias[bOff0 + 1u], bias[bOff0 + 2u], bias[bOff0 + 3u]);
+    bv1 = vec4<f32>(bias[bOff1], bias[bOff1 + 1u], bias[bOff1 + 2u], bias[bOff1 + 3u]);
+  }`}
   ${rows.map((i) => `{
     let m = m0 + tm + ${i}u;
     if (m < p.m) {
@@ -475,11 +483,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         }`;
         }).join("\n        ")}
         }
-      }` : `if (p.split == 0u && p.bias == 0u && p.act == 0u && p.accumulate == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n) {
+      }` : `if (fastPlain) {
         let c0 = rowC + n0 + tn0;
         let c1 = rowC + n0 + tn1;
-        c[c0] = r0.x; c[c0 + 1u] = r0.y; c[c0 + 2u] = r0.z; c[c0 + 3u] = r0.w;
-        c[c1] = r1.x; c[c1 + 1u] = r1.y; c[c1 + 2u] = r1.z; c[c1 + 3u] = r1.w;
+        let o0 = select(r0, r0 + bv0, p.bias != 0u);
+        let o1 = select(r1, r1 + bv1, p.bias != 0u);
+        c[c0] = o0.x; c[c0 + 1u] = o0.y; c[c0 + 2u] = o0.z; c[c0 + 3u] = o0.w;
+        c[c1] = o1.x; c[c1 + 1u] = o1.y; c[c1 + 2u] = o1.z; c[c1 + 3u] = o1.w;
       } else {
       ${[0, 1, 2, 3, 4, 5, 6, 7].map((j) => {
         const nExpr = j < 4 ? `n0 + tn0 + ${j}u` : `n0 + tn1 + ${j - 4}u`;
@@ -505,21 +515,27 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`;
 }
 
-function lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg = 1 }) {
+function lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg = 1, preReduce = null, addBroadcast = false }) {
   const K = width / 64;
   const ks = Array.from({ length: K }, (_, k) => k);
   const srcName = inPlace ? "y" : "x";
   const wgSize = 64 * rowsPerWg;
+  const writeX = !inPlace && Boolean(preReduce || addBroadcast);
   return `
 struct P { rows: u32, width: u32, xStride: u32, yStride: u32, xOff: u32, yOff: u32,
-  hasW: u32, hasB: u32, modulate: u32, condStride: u32, alphaOff: u32, betaOff: u32, useMap: u32, eps: f32 };
+  hasW: u32, hasB: u32, modulate: u32, condStride: u32, alphaOff: u32, betaOff: u32, useMap: u32, eps: f32,
+  gStride: u32, gOff: u32 };
 @group(0) @binding(0) var<uniform> p: P;
-${inPlace ? "" : "@group(0) @binding(1) var<storage, read> x: array<f32>;"}
+${inPlace ? "" : `@group(0) @binding(1) var<storage, ${writeX ? "read_write" : "read"}> x: array<f32>;`}
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 ${hasW ? "@group(0) @binding(3) var<storage, read> w: array<f32>;" : ""}
 ${hasB ? "@group(0) @binding(4) var<storage, read> bv: array<f32>;" : ""}
 ${modulate ? "@group(0) @binding(5) var<storage, read> cond: array<f32>;" : ""}
 ${modulate && useMap ? "@group(0) @binding(6) var<storage, read> rowMap: array<i32>;" : ""}
+${preReduce ? "@group(0) @binding(7) var<storage, read> partial: array<f32>;" : ""}
+${preReduce?.hasGate && !preReduce.sameGateCond ? "@group(0) @binding(8) var<storage, read> gcond: array<f32>;" : ""}
+${addBroadcast ? `@group(0) @binding(7) var<storage, read> src0: array<f32>;
+@group(0) @binding(8) var<storage, read> bcast: array<f32>;` : ""}
 var<workgroup> red: array<f32, ${wgSize}>;
 @compute @workgroup_size(${wgSize})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) liRaw: u32) {
@@ -534,7 +550,32 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let live = r < p.rows;
   let row = min(r, p.rows - 1u);
   let xb = row * ${width}u + li;
-  ${ks.map((k) => `let v_${k} = ${srcName}[xb + ${k * 64}u];`).join("\n  ")}
+  ${modulate ? `let crow = ${useMap ? "rowMap[row]" : "i32(row)"};` : ""}
+  ${preReduce?.hasGate ? `let gBase = u32(max(crow, 0)) * p.gStride + p.gOff + li;` : ""}
+  ${ks.map((k) => {
+    const off = `${k * 64}u`;
+    if (addBroadcast) {
+      return `let v_${k} = src0[xb + ${off}] + bcast[li + ${off}];
+  if (live) { x[xb + ${off}] = v_${k}; }`;
+    }
+    if (preReduce) {
+      const sumP = Array.from({ length: preReduce.parts }, (_, s) =>
+        s === 0 ? `var p_${k} = partial[xb + ${off}];` : `p_${k} += partial[${s}u * p.rows * ${width}u + xb + ${off}];`,
+      ).join(" ");
+      if (preReduce.hasGate) {
+        const gc = preReduce.sameGateCond ? "cond" : "gcond";
+        return `${sumP}
+  if (crow >= 0 && live) {
+    x[xb + ${off}] = x[xb + ${off}] + ${gc}[gBase + ${off}] * p_${k};
+  }`;
+      }
+      return `${sumP}
+  if (live) { x[xb + ${off}] = p_${k} + x[xb + ${off}]; }`;
+    }
+    return `let v_${k} = ${srcName}[xb + ${off}];`;
+  }).join("\n  ")}
+  ${preReduce ? `workgroupBarrier();
+  ${ks.map((k) => `let v_${k} = x[xb + ${k * 64}u];`).join("\n  ")}` : ""}
   var s = 0.0;
   ${ks.map((k) => `s += v_${k};`).join("\n  ")}
   red[rb + li] = s;
@@ -563,8 +604,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   workgroupBarrier();
   if (!live) { return; }
   let inv = inverseSqrt(red[rb] / ${width}.0 + p.eps);
-  ${modulate ? `let crow = ${useMap ? "rowMap[row]" : "i32(row)"};
-  let cb = u32(max(crow, 0)) * p.condStride;
+  ${modulate ? `let cb = u32(max(crow, 0)) * p.condStride;
   let caBase = cb + p.alphaOff + li;
   let cbBase = cb + p.betaOff + li;` : ""}
   let yb = row * ${width}u + li;
@@ -892,7 +932,7 @@ export class Bioemu2Ops {
         .filter((e) => e.resource.buffer !== null && e.resource.buffer !== undefined)];
     const bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
     const [x, y] = fold2(groups);
-    return { pipeline, bindGroup, x, y, key };
+    return { pipeline, bindGroup, x, y, key, buffers };
   }
 
   /**
@@ -986,7 +1026,11 @@ export class Bioemu2Ops {
   b0[at] = v;`}`, [m * n, n, parts, spec.bias ? 1 : 0, { relu: 1, sigmoid: 2 }[spec.act] ?? 0, spec.accumulate ? 1 : 0,
           C.off, C.m, C.n, g?.stride ?? 0, g?.off ?? 0]);
       first.label = `gemm ${m}x${n}x${k} split ${parts}`;
-      return this.program([first, reduce]);
+      const prog = this.program([first, reduce]);
+      if (!spec.bias && !spec.act && C.off === 0 && C.m === n && C.n === 1 && (g || spec.accumulate)) {
+        prog.splitReduce = { first, partial, parts, m, n, c: spec.c, accumulate: Boolean(spec.accumulate), gate: g };
+      }
+      return prog;
     }
     const u = new Uint32Array(32);
     const f = new Float32Array(u.buffer);
@@ -1007,9 +1051,10 @@ export class Bioemu2Ops {
     const rpt = v2 && !spec.pair?.rows4 && m <= 160 && Math.ceil(m / 80) < Math.ceil(m / 64) ? 5 : 4;
     const bm = rpt * 16;
     const groups = Math.ceil(m / bm) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
+    const exactK = v2 && groups <= MAX_X && k % 16 === 0 && (spec.splitChunk ?? 0) % 16 === 0 && A.k === 1;
     const gate = spec.gate ? (spec.gate.map ? "map" : "plain") : null;
-    const kind = `${v2 ? "gemm2" : "gemm"}${rpt === 5 ? "-m80" : ""}${word ? "-h" : ""}${b16 ? "-b16" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}${gate ? `-g${gate}` : ""}`;
-    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16, gate, rpt) : gemmSource(word), groups,
+    const kind = `${v2 ? "gemm2" : "gemm"}${rpt === 5 ? "-m80" : ""}${word ? "-h" : ""}${b16 ? "-b16" : ""}${exactK ? "-ek" : ""}${spec.pair ? `-pair-${spec.pair.key}` : ""}${gate ? `-g${gate}` : ""}`;
+    const step = await this.step(kind, v2 ? gemm2Source(word, spec.pair, b16, gate, rpt, exactK) : gemmSource(word), groups,
                                  [spec.a, spec.b, spec.c, spec.bias ?? this.dummy, ...(spec.pair?.buffers ?? []),
                                   ...(spec.gate ? [spec.gate.cond, ...(spec.gate.map ? [spec.gate.map] : [])] : [])], u);
     step.label = spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? ` [${B0}x${B1}]` : ""}`;
@@ -1625,7 +1670,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                        A: { off: xOff, m: xStride, k: 1 }, B: { off: wOff, n: inC, k: 1 }, C: { off: yOff, m: yStride, n: 1 } });
   }
 
-  layerNorm({ x, y, rows, width, w, b, xStride = width, yStride = width, xOff = 0, yOff = 0, mod, eps = 1e-5 }) {
+  layerNorm({ x, y, rows, width, w, b, xStride = width, yStride = width, xOff = 0, yOff = 0, mod, eps = 1e-5, steps = null, addBroadcast = null }) {
     const u = new Uint32Array(16);
     const f = new Float32Array(u.buffer);
     u.set([rows, width, xStride, yStride, xOff, yOff, w ? 1 : 0, b ? 1 : 0, mod ? 1 : 0,
@@ -1638,9 +1683,40 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       const hasB = Boolean(b);
       const modulate = Boolean(mod);
       const useMap = Boolean(mod?.map);
+      let sr = null;
+      if (!inPlace && !addBroadcast && steps?.length > 0) {
+        const rawBuf = (buf) => buf?.view ? buf.buffer : buf;
+        const touches = (s, target) => target && (s.buffers ?? []).some((buf) => buf && rawBuf(buf) === rawBuf(target));
+        for (let idx = steps.length - 1; idx >= 0; idx -= 1) {
+          const prev = steps[idx]?.splitReduce;
+          if (prev && prev.c === x && prev.m === rows && prev.n === width
+            && (!prev.gate || (modulate && Boolean(prev.gate.map) === useMap && (!useMap || prev.gate.map === mod.map)))) {
+            let safe = true;
+            for (let j = idx + 1; j < steps.length; j += 1) {
+              if (touches(steps[j], x) || touches(steps[j], prev.partial) || touches(steps[j], prev.gate?.cond)) {
+                safe = false;
+                break;
+              }
+            }
+            if (safe) {
+              sr = prev;
+              steps[idx] = prev.first;
+            }
+            break;
+          }
+          if (touches(steps[idx], x)) break;
+        }
+      }
+      if (sr?.gate) {
+        u[14] = sr.gate.stride;
+        u[15] = sr.gate.off;
+      }
+      const sameGateCond = Boolean(sr?.gate && sr.gate.cond === mod?.cond);
+      const preReduce = sr ? { parts: sr.parts, hasGate: Boolean(sr.gate), sameGateCond } : null;
       const rowsPerWg = width <= 256 && rows >= 256 ? 4 : 1;
-      const key = `${inPlace ? "ln-inplace" : "ln"}-${width}-${hasW ? 1 : 0}-${hasB ? 1 : 0}-${modulate ? 1 : 0}-${useMap ? 1 : 0}-r${rowsPerWg}`;
-      const source = lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg });
+      const preKey = addBroadcast ? "-ab" : (preReduce ? `-pr${preReduce.parts}${preReduce.hasGate ? (sameGateCond ? "gs" : "g") : ""}` : "");
+      const key = `${inPlace ? "ln-inplace" : "ln"}-${width}-${hasW ? 1 : 0}-${hasB ? 1 : 0}-${modulate ? 1 : 0}-${useMap ? 1 : 0}-r${rowsPerWg}${preKey}`;
+      const source = lnFastSource({ width, hasW, hasB, modulate, useMap, inPlace, rowsPerWg, preReduce, addBroadcast: Boolean(addBroadcast) });
       const step = this.step(key, source, Math.ceil(rows / rowsPerWg), [
         inPlace ? null : x,
         y,
@@ -1648,6 +1724,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         hasB ? b : null,
         modulate ? mod.cond : null,
         modulate && useMap ? mod.map : null,
+        addBroadcast ? addBroadcast.src : (sr ? sr.partial : null),
+        addBroadcast ? addBroadcast.bcast : (sr?.gate && !sameGateCond ? sr.gate.cond : null),
       ], u);
       return Promise.resolve(step).then((s) => { s.label = inPlace ? "ln-inplace" : "ln"; return s; });
     }
@@ -1689,6 +1767,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     const flat = steps.flatMap((s) => (s.steps ? s.steps : [s]));
     return {
       steps: flat,
+      buffers: flat.flatMap((s) => s.buffers ?? []),
       run: (pass) => {
         for (const s of flat) {
           pass.setPipeline(s.pipeline);

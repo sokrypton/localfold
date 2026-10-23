@@ -46,8 +46,13 @@ void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit, const T
   }
   float* rows = scratch<float>("be2.zi.rows", (size_t)T * C); float* cols = scratch<float>("be2.zi.cols", (size_t)T * C);
   if (HALF) {
-    linT(sih, SE + "z_init_1/weight", rows, T, Si, C);
-    linT(sih, SE + "z_init_2/weight", cols, T, Si, C);
+    Gemm G{}; G.ptrs = true; G.batch = 2;
+    G.X = pointerArray("zi.x", {(u64)sih, (u64)sih}); G.tx = F16;
+    G.W = pointerArray("zi.w", {(u64)M.h("w/" + SE + "z_init_1/weight"), (u64)M.h("w/" + SE + "z_init_2/weight")});
+    G.tw = F16; G.transW = true;
+    G.Y = pointerArray("zi.y", {(u64)rows, (u64)cols}); G.ty = F32;
+    G.rows = T; G.in = Si; G.out = C; G.label = "z_init_12";
+    gemm(G);
   } else {
     linT(sInputs, SE + "z_init_1/weight", rows, T, Si, C);
     linT(sInputs, SE + "z_init_2/weight", cols, T, Si, C);

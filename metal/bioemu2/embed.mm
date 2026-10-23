@@ -24,8 +24,21 @@ void pairTail(const std::string& p, float* pr, const float* c, int N) {
   float* rc = scratch<float>("be2.pt.relu", (size_t)N * C);
   relu(c, rc, (size_t)N * C);
   float* cq = scratch<float>("be2.pt.cq", (size_t)N * CP); float* ck = scratch<float>("be2.pt.ck", (size_t)N * CP);
-  linT(rc, p + "c_to_p_trans_q_1/weight", cq, N, C, CP);
-  linT(rc, p + "c_to_p_trans_k_1/weight", ck, N, C, CP);
+  if (HALF && C >= 16 && CP >= 16) {
+    half* rch = scratch<half>("be2.pt.rch", (size_t)N * C);
+    toHalf(rc, rch, (size_t)N * C);
+    const std::string pk = "pt.qk." + p;
+    Gemm G{}; G.ptrs = true; G.batch = 2;
+    G.X = pointerArray(pk + ".x", {(u64)rch, (u64)rch}); G.tx = F16;
+    G.W = pointerArray(pk + ".w", {(u64)M.h("w/" + p + "c_to_p_trans_q_1/weight"), (u64)M.h("w/" + p + "c_to_p_trans_k_1/weight")});
+    G.tw = F16; G.transW = true;
+    G.Y = pointerArray(pk + ".y", {(u64)cq, (u64)ck}); G.ty = F32;
+    G.rows = N; G.in = C; G.out = CP; G.label = "c_to_p_trans_qk";
+    gemm(G);
+  } else {
+    linT(rc, p + "c_to_p_trans_q_1/weight", cq, N, C, CP);
+    linT(rc, p + "c_to_p_trans_k_1/weight", ck, N, C, CP);
+  }
   run1d("be2_pair_tail", (size_t)N * WK, Be2PairTailArgs{pr, cq, ck, Wf(p + "p_mlp_1/weight"), Wf(p + "p_mlp_3/weight"),
                                                          Wf(p + "p_mlp_5/weight"), (uint)N, 0});
 }
@@ -35,10 +48,22 @@ void windowBias(const float* pr, const float* normW, const float* projZ, float* 
 
 // ---------------------------------------------------------------- the conditioned transformer layer
 float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, const char* name) {
+  float* cond = scratch<float>(name, (size_t)Rc * 6 * D);
+  if (HALF && (Cc == 128 || Cc == 768)) {
+    const int pR = Rc <= 128 ? ((Rc + 15) & ~15) : ((Rc + 31) & ~31);
+    half* cnh = scratch<half>("be2.cl.cnh", (size_t)pR * Cc);
+    if (pR > Rc) fill(cnh + (size_t)Rc * Cc, 0, (size_t)(pR - Rc) * Cc * 2);
+    const size_t groups = ((size_t)Rc + 7) / 8;
+    run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
+        Be2CondInArgs{c, Wf(L.p + "cond_0/weight"), WfOpt(L.p + "cond_0/bias"), cnh, (u64)Rc, (uint)Rc, (uint)Cc, 0, 1});
+    linT(cnh, L.p + "cond_2/weight", cond, pR, Cc, 6 * D);
+    if (const float* b2 = WfOpt(L.p + "cond_2/bias"))
+      be2Run1d("be2_batch_bias", (size_t)Rc * 6 * D, Be2BatchBiasArgs{cond, b2, (u64)Rc * 6 * D, (uint)Rc, (uint)(6 * D), 0, 0});
+    return cond;
+  }
   float* cn = scratch<float>("be2.cl.cn", (size_t)Rc * Cc);
   layerNorm(c, cn, Rc, Cc, Wf(L.p + "cond_0/weight"), WfOpt(L.p + "cond_0/bias"));
   silu(cn, cn, (size_t)Rc * Cc);
-  float* cond = scratch<float>(name, (size_t)Rc * 6 * D);
   linT(cn, L.p + "cond_2/weight", cond, Rc, Cc, 6 * D, 0.f, 0, 0, false, WfOpt(L.p + "cond_2/bias"));
   return cond;
 }
@@ -63,11 +88,11 @@ const half* qkvgWeight(const std::string& a, int D) {
 // the transition's adaLn to add in place before its norm)
 static const float* attentionHalf(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map,
                                   const float* bias, const half* biasH, int perSample,
-                                  const float* inResH, const float* inResGate, int inResLdg) {
+                                  const float* inResH, const float* inResGate, int inResLdg, bool preNorm) {
   const int pR = L.windowed ? R : (R <= 128 ? ((R + 15) & ~15) : ((R + 31) & ~31));
   const std::string a = L.p + L.att;
   half* hh = scratch<half>(L.windowed ? "be2.cl.hh" : "be2.cl.thh", (size_t)pR * D);
-  adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh, inResH, inResGate, inResLdg);
+  if (!preNorm) adaLn(x, nullptr, R, D, cond, cond + D, 6 * D, map, hh, inResH, inResGate, inResLdg);
   half* qkvg = scratch<half>("be2.cl.qkvg", (size_t)pR * 4 * D);
   Gemm g{}; g.X = hh; g.tx = F16; g.W = qkvgWeight(a, D); g.tw = F16; g.transW = true; g.Y = qkvg; g.ty = F16;
   g.rows = pR; g.in = D; g.out = 4 * D; g.accFloat = true; g.label = L.windowed ? "atom qkvg" : "token qkvg";
@@ -118,10 +143,10 @@ static void attentionF32(const CondLayer& L, float* x, float* h, int R, int D, c
   linT(o, a + "proj_o/weight", h, R, D, D);
 }
 void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
-               const half* biasH, const float* inResH, const float* inResGate, int inResLdg, const float** outResH) {
+               const half* biasH, const float* inResH, const float* inResGate, int inResLdg, const float** outResH, bool preNorm) {
   const float* resH = nullptr;
   if (HALF && (L.windowed || biasH)) {
-    resH = attentionHalf(L, x, R, D, cond, map, bias, biasH, perSample, inResH, inResGate, inResLdg);
+    resH = attentionHalf(L, x, R, D, cond, map, bias, biasH, perSample, inResH, inResGate, inResLdg, preNorm);
   } else {
     float* h = scratch<float>("be2.cl.h", (size_t)R * D);
     attentionF32(L, x, h, R, D, cond, map, bias, perSample);
@@ -169,10 +194,46 @@ void inputEmbedder(float* sInputs, int Si, const Tap& tap) {
     });
     float* bias = scratch<float>("be2.ie.bias", wb * ieLayers);
     windowBias(pr, wbNorm, wbProj, bias, N, H, ieLayers);
-    for (int i = 0; i < ieLayers; ++i) {
-      const CondLayer L{iePrefix(i), a, true, H};
-      float* cond = layerCond(L, c, N, C, C, "be2.cl.cond");
-      condLayer(L, q, N, C, cond, nullptr, bias + wb * i, N);
+    if (HALF && C == 128) {
+      const float* cw0 = M.derived<float>("ie.cond.w0", (size_t)ieLayers * C, [&](float* out) {
+        for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * C, Wf(iePrefix(i) + "cond_0/weight"), (size_t)C * 4);
+      });
+      const float* cb0 = hasW(iePrefix(0) + "cond_0/bias") ? M.derived<float>("ie.cond.b0", (size_t)ieLayers * C, [&](float* out) {
+        for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * C, Wf(iePrefix(i) + "cond_0/bias"), (size_t)C * 4);
+      }) : nullptr;
+      const float* cb2 = hasW(iePrefix(0) + "cond_2/bias") ? M.derived<float>("ie.cond.b2", (size_t)ieLayers * 6 * C, [&](float* out) {
+        for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * 6 * C, Wf(iePrefix(i) + "cond_2/bias"), (size_t)6 * C * 4);
+      }) : nullptr;
+      half* cnh = scratch<half>("be2.ie.cnh", (size_t)ieLayers * N * C);
+      const size_t groups = ((size_t)N + 7) / 8;
+      run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
+          Be2CondInArgs{c, cw0, cb0, cnh, (u64)N, (uint)N, (uint)C, 0, (uint)ieLayers});
+      float* condAll = scratch<float>("be2.ie.condAll", (size_t)ieLayers * N * 6 * C);
+      std::vector<u64> X(ieLayers), Wp(ieLayers), Y(ieLayers);
+      for (int i = 0; i < ieLayers; ++i) {
+        X[i] = (u64)(cnh + (size_t)i * N * C);
+        Wp[i] = (u64)M.h("w/" + iePrefix(i) + "cond_2/weight");
+        Y[i] = (u64)(condAll + (size_t)i * N * 6 * C);
+      }
+      Gemm Gc{}; Gc.ptrs = true; Gc.batch = ieLayers;
+      Gc.X = pointerArray("ie.cond.x", X); Gc.tx = F16;
+      Gc.W = pointerArray("ie.cond.w", Wp); Gc.tw = F16; Gc.transW = true;
+      Gc.Y = pointerArray("ie.cond.y", Y); Gc.ty = F32;
+      Gc.rows = N; Gc.in = C; Gc.out = 6 * C; Gc.label = "ie cond_2 batched";
+      gemm(Gc);
+      if (cb2)
+        be2Run1d("be2_batch_bias", (size_t)ieLayers * N * 6 * C,
+                 Be2BatchBiasArgs{condAll, cb2, (u64)ieLayers * N * 6 * C, (uint)N, (uint)(6 * C), 0, 0});
+      for (int i = 0; i < ieLayers; ++i) {
+        const CondLayer L{iePrefix(i), a, true, H};
+        condLayer(L, q, N, C, condAll + (size_t)i * N * 6 * C, nullptr, bias + wb * i, N);
+      }
+    } else {
+      for (int i = 0; i < ieLayers; ++i) {
+        const CondLayer L{iePrefix(i), a, true, H};
+        float* cond = layerCond(L, c, N, C, C, "be2.cl.cond");
+        condLayer(L, q, N, C, cond, nullptr, bias + wb * i, N);
+      }
     }
   }
   const int A = dimW(IE + "atom_to_token_trans_0/weight", 0);

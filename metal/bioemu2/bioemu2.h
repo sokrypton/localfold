@@ -116,7 +116,7 @@ float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, cons
 // biasH: the token attention's bias in half, log2 units - the fast arm runs it on metal/core's flash attention
 void condLayer(const CondLayer& L, float* x, int R, int D, const float* cond, const int* map, const float* bias, int perSample,
                const half* biasH = nullptr, const float* inResH = nullptr, const float* inResGate = nullptr, int inResLdg = 0,
-               const float** outResH = nullptr);
+               const float** outResH = nullptr, bool preNorm = false);
 void inputEmbedder(float* sInputs, int Si, const Tap& tap);
 
 // ---------------------------------------------------------------- the trunk (trunk.mm)

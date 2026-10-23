@@ -232,12 +232,12 @@ export class Bioemu2Gpu {
    * SwiGLU transition over `rows` x `width` (hidden `hidden`): x [+]= fc3(silu(fc1 h) * fc2 h), where h is
    * `input` (already normalised/modulated when `norm` is false) - returned steps write `out`.
    */
-  async transition(steps, prefix, { input, rows, width, hidden, out, scratch, norm, accumulate = false, gate }) {
+  async transition(steps, prefix, { input, rows, width, hidden, out, scratch, norm, accumulate = false, gate, addBroadcast = null }) {
     const o = this.ops;
     let src = input;
     if (norm) {
       scratch.ln ??= o.buffer("tr.ln", rows * width);
-      steps.push(await o.layerNorm({ x: input, y: scratch.ln, rows, width,
+      steps.push(await o.layerNorm({ x: input, y: scratch.ln, rows, width, steps, addBroadcast,
         w: await this.w(`${prefix}/norm/weight`, { half: false }), b: await this.w(`${prefix}/norm/bias`, { half: false }) }));
       src = scratch.ln;
     }
@@ -373,7 +373,7 @@ export class Bioemu2Gpu {
     const pad = N + 2 * CTX;
     const att = `${prefix}/attention/attention_layer/pair_bias_attn`;
     const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta, map });
-    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D) }));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D), steps }));
     const qBias = await this.w(`${att}/proj_q_bias`, { half: false });
     if (this.options.fuseWindow !== false && hd === 32 && W_Q === 32 && W_K === 128) {
       steps.push(await o.linear({ x: s.h, w: await this.qkvg(att), y: s.qkv, rows: R, inC: D, outC: 4 * D }));
@@ -410,7 +410,7 @@ export class Bioemu2Gpu {
     // (x += gamma_a proj_o(...) and x += gamma_m transition(...) in their GEMMs' epilogues - ops.gemm's gate)
     steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: x, rows: R, inC: D, outC: D,
                                 gate: { cond, stride: 6 * D, off: 2 * D, map } }));
-    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D), steps }));
     await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: x,
                                                          scratch: s, norm: false, gate: { cond, stride: 6 * D, off: 5 * D, map } });
   }
@@ -427,7 +427,7 @@ export class Bioemu2Gpu {
     const R = S * T;
     const att = `${prefix}/attention/pair_bias_attn`;
     const mod = (alpha, beta) => ({ cond, stride: 6 * D, alpha, beta, map });
-    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D) }));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(0, D), steps }));
     const qBias = await this.w(`${att}/proj_q_bias`, { half: false });
     if (this.options.fuseTokenAttention !== false && hd % 16 === 0) {
       steps.push(await o.linear({ x: s.h, w: await this.qkvg(att), y: s.qkv, rows: R, inC: D, outC: 4 * D }));
@@ -453,7 +453,7 @@ export class Bioemu2Gpu {
     // (x += gamma_a proj_o(...) and x += gamma_m transition(...) in their GEMMs' epilogues - ops.gemm's gate)
     steps.push(await o.linear({ x: s.o, w: await this.w(`${att}/proj_o/weight`), y: x, rows: R, inC: D, outC: D,
                                 gate: { cond, stride: 6 * D, off: 2 * D, map } }));
-    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D) }));
+    steps.push(await o.layerNorm({ x, y: s.h, rows: R, width: D, mod: mod(3 * D, 4 * D), steps }));
     await this.transition(steps, `${prefix}/transition`, { input: s.h, rows: R, width: D, hidden: 4 * D, out: x,
                                                          scratch: s, norm: false, gate: { cond, stride: 6 * D, off: 5 * D, map } });
   }
@@ -989,11 +989,9 @@ export class Bioemu2Gpu {
 
     const steps = [];
     // the single conditioning (shared); q and a per sample from r = x c_in on real atoms
-    steps.push(await o.map("cond-init", T * DT, [{ buffer: cond, write: true }, { buffer: s0Buf }, { buffer: fvec }],
-      "b0[i] = b1[i] + b2[i % 768u];"));
     for (let i = 0; i < 2; i += 1) {
       await this.transition(steps, `${sc}/transitions_${i}`, { input: cond, rows: T, width: DT, hidden: 2 * DT, out: cond,
-                                                             scratch: sC, norm: true, accumulate: true });
+        scratch: sC, norm: true, accumulate: true, addBroadcast: i === 0 ? { src: s0Buf, bcast: fvec } : null });
     }
     steps.push(await o.map(dynamics ? "q-init-dyn" : "q-init", S * N * DA, [{ buffer: q, write: true }, { buffer: q0Buf }, { buffer: X },
       { buffer: scalars }, { buffer: rToQ }, { buffer: atomMask, type: "i32" }, { buffer: companion }, { buffer: condToQ }],
@@ -1006,7 +1004,7 @@ export class Bioemu2Gpu {
     `let r = i / 768u; let c = i % 768u; let sm = r / U(0u); let t = r % U(0u); let at = sm * U(1u) + u32(b5[t]); let s = b3[0];
   b0[i] = b1[t * 768u + c] + s * (b2[at * 3u] * b4[c * 3u] + b2[at * 3u + 1u] * b4[c * 3u + 1u] + b2[at * 3u + 2u] * b4[c * 3u + 2u]);`,
     [T, N]));
-    if (batchCond) steps.push(await o.layerNorm({ x: cond, y: xhat, rows: T, width: DT }));
+    if (batchCond) steps.push(await o.layerNorm({ x: cond, y: xhat, rows: T, width: DT, steps }));
     let group = [];
     for (let l = 0; l < LAYERS; l += 1) {
       const L = `${P}/layers/${l}`;
@@ -1073,6 +1071,14 @@ export class Bioemu2Gpu {
       X, scalars, out, rows: S * N }));
     const program = o.program(steps);
     const fourier = sch;
+    const scalarsData = new Float32Array(8);
+    const four = new Float32Array(256);
+    const fvCache = new Map();
+    const fProjW = fourier["fourier_embed/proj/weight"];
+    const fProjB = fourier["fourier_embed/proj/bias"];
+    const fNormW = fourier["norm_fourier/weight"];
+    const fNormB = fourier["norm_fourier/bias"];
+    const fSingleW = fourier["fourier_to_single/weight"];
     return {
       X, out, companion, program, N, T, samples: S, context: { z: zc, q0, p: pr },
       /** One denoiser call: S samples' noisy coordinates (S x N x 3, padded, sample-major) at sigma -> denoised. */
@@ -1081,14 +1087,20 @@ export class Bioemu2Gpu {
         const cSkip = SIGMA_DATA * SIGMA_DATA / (sigma * sigma + SIGMA_DATA * SIGMA_DATA);
         const cOut = sigma * SIGMA_DATA / Math.sqrt(SIGMA_DATA * SIGMA_DATA + sigma * sigma);
         // r = x c_in on real atoms: the mask is applied where X is read (q-init's b5, a-init reads centres)
-        o.write(scalars, new Float32Array([cIn, sigma, cSkip, cOut, 0, 0, 0, 0]));
-        const t = 0.25 * Math.log(sigma / SIGMA_DATA);
-        const four = new Float32Array(256);
-        for (let k = 0; k < 256; k += 1) {
-          four[k] = Math.cos(2 * Math.PI * (t * fourier["fourier_embed/proj/weight"][k] + fourier["fourier_embed/proj/bias"][k]));
+        scalarsData[0] = cIn;
+        scalarsData[1] = sigma;
+        scalarsData[2] = cSkip;
+        scalarsData[3] = cOut;
+        o.write(scalars, scalarsData);
+        let fv = fvCache.get(sigma);
+        if (!fv) {
+          const t = 0.25 * Math.log(sigma / SIGMA_DATA);
+          for (let k = 0; k < 256; k += 1) {
+            four[k] = Math.cos(2 * Math.PI * (t * fProjW[k] + fProjB[k]));
+          }
+          fv = linearRows(lnRows(four, 1, 256, fNormW, fNormB), 1, 256, fSingleW, DT);
+          fvCache.set(sigma, fv);
         }
-        const fv = linearRows(lnRows(four, 1, 256, fourier["norm_fourier/weight"], fourier["norm_fourier/bias"]), 1, 256,
-                              fourier["fourier_to_single/weight"], DT);
         o.write(fvec, fv);
         o.write(X, x);
         o.run(program);

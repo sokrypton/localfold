@@ -354,9 +354,11 @@ void setSigmaSchedule(const float* sigmas, int n) {
 // 🔴 FORGOTTEN EVERY FOLD: the maps are this input's atoms' tokens, and a resident server's next job is another input -
 // keyed on the sample count alone, a second fold of the same count read the first one's (cuda/bioemu2's resident server
 // met this class of bug: its triangle mask remembered by address, docs/BIOEMU2.md)
+static struct { void* ptr = nullptr; size_t bytes = 0; } TAIL_ZEROED[4];
 void forgetRowMaps() {
   if (ROW_MAPS.atomTok) { release(ROW_MAPS.atomTok); release(ROW_MAPS.tok); }
   ROW_MAPS = {};
+  for (auto& z : TAIL_ZEROED) z = {};
   setSigmaSchedule(nullptr, 0);
   recordEmitted(nullptr, nullptr, nullptr, nullptr);
 }
@@ -382,34 +384,6 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   // the atom and token streams' initial states
   float* q = scratch<float>("be2.dn.q", RN * Ca);
   float* a = scratch<float>("be2.dn.a", pRT * Dt);
-  if (pRT > RT) fill(a + RT * Dt, 0, (pRT - RT) * Dt * 4);
-  if ((Ca & 3) == 0 && (Dt & 3) == 0) {
-    be2Run1d("be2_q_init", (RN * Ca) >> 2,
-             Be2QInitArgs{x, Iin("atom_mask"), d.q0, Wf(af + "r_to_q_trans/weight"), cond, d.coordsCond,
-                          d.dyn ? Wf(af + "cond_to_q_trans/weight") : nullptr, q, (u64)RN, (uint)N, (uint)Ca, cIn, d.dynGate});
-    be2Run1d("be2_a_init", (RT * Dt) >> 2,
-             Be2AInitArgs{x, Iin("atom_mask"), Iin("token_center_atom_index"), d.a0, Wf(SM + "r_token_to_a/weight"), a,
-                          (u64)RT, (uint)T, (uint)N, (uint)Dt, cIn, 0});
-  } else {
-    float* r = scratch<float>("be2.dn.r", RN * 3);
-    be2Run1d("be2_scale_masked", RN * 3, Be2ScaleMaskedArgs{x, Iin("atom_mask"), r, (u64)N, RN, cIn, 0});
-    be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{d.q0, q, (u64)N * Ca, RN * Ca});
-    linT(r, af + "r_to_q_trans/weight", q, RN, 3, Ca, 1.f);
-    if (d.dyn) {
-      float* cq = scratch<float>("be2.dn.cq", RN * Ca);
-      if (cond) linT(cond, af + "cond_to_q_trans/weight", cq, RN, 3, Ca);
-      else {
-        float* one = scratch<float>("be2.dn.cq1", (size_t)N * Ca);
-        linT(d.coordsCond, af + "cond_to_q_trans/weight", one, N, 3, Ca);
-        be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{one, cq, (u64)N * Ca, RN * Ca});
-      }
-      run1d("be2_scaled_add", RN * Ca, Be2ScaledAddArgs{q, cq, RN * Ca, d.dynGate, 0});
-    }
-    be2Run1d("be2_repeat", RT * Dt, Be2RepeatArgs{d.a0, a, (u64)T * Dt, RT * Dt});
-    float* rc = scratch<float>("be2.dn.rc", RT * 3);
-    be2Run1d("be2_centre_atoms", RT * 3, Be2CentreAtomsArgs{r, Iin("token_center_atom_index"), rc, (uint)T, (uint)N, 3, 3, (uint)samples, 0});
-    linT(rc, SM + "r_token_to_a/weight", a, RT, 3, Dt, 1.f);
-  }
   // the layers
   const std::string ab = "attention/attention_layer/pair_bias_attn/", tb = "attention/pair_bias_attn/";
   const int Ha = 4, Ht = 16;
@@ -529,52 +503,106 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
         cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * padRows(T + COND_KINDS[k].rowsExtra) * outC[k]);
     cgQB = (batchCond && csplit) ? scratch<float>("be2.cg.QB", (size_t)G * pR1 * 4 * I) : nullptr;
   }
+  auto runCondGroup = [&](int l) {
+    const int gn = std::min(G, d.layers - l);
+    const size_t pR1 = padRows(R);
+    condGroup(cnd, cnd, T, 1, Dt, d.layers, l, gn, outC, cg);
+    if (cgQB) {
+      half* gR = scratch<half>("be2.cs.gR", (size_t)gn * 4 * pR1 * Dc);
+      be2Run1d("be2_cs_gamma", (size_t)gn * pR1 * Dc,
+               Be2CsGammaArgs{cg[2], gR, nullptr, (u64)(gn * pR1 * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)pR1});
+      for (int part = 0; part < 2; ++part) {
+        std::vector<u64> X, Wp, Y;
+        for (int j = 0; j < gn; ++j) {
+          const std::string p = SM + "layers/" + num(l + j) + "/coupling/s_to_q_mixer/";
+          X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * pR1 * Dc));
+          Wp.push_back((u64)csPairs(p, Dc, I));
+          Y.push_back((u64)(cgQB + (size_t)j * pR1 * 4 * I));
+        }
+        const std::string pk = "cg.qb." + num(gn) + "." + num(part);
+        Gemm G{}; G.ptrs = true; G.batch = gn;
+        G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16;
+        G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = 2 * pR1; G.in = Dc; G.out = 2 * I;
+        G.beta = part ? 1.f : 0.f; G.label = "coupling RB, layers batched";
+        gemm(G);
+      }
+    }
+  };
+  if (batchCond && curStep < 0 && d.layers > 0) runCondGroup(0);
   if (HALF && pRT > RT) {
-    half* thh = scratch<half>("be2.cl.thh", pRT * Dt); fill(thh + RT * Dt, 0, (pRT - RT) * Dt * 2);
-    half* toh = scratch<half>("be2.cl.toh", pRT * Dt); fill(toh + RT * Dt, 0, (pRT - RT) * Dt * 2);
-    half* qsh = scratch<half>("be2.dn.qsh", pRT * Dc); fill(qsh + RT * Dc, 0, (pRT - RT) * Dc * 2);
-    if (csplit) { half* xa = scratch<half>("be2.cs.xa", pRT * Dt); fill(xa + RT * Dt, 0, (pRT - RT) * Dt * 2); }
+    auto zeroTailOnce = [](int slot, half* ptr, size_t off, size_t bytes) {
+      void* tail = ptr + off;
+      if (TAIL_ZEROED[slot].ptr != tail || TAIL_ZEROED[slot].bytes != bytes) {
+        fill(tail, 0, bytes);
+        TAIL_ZEROED[slot] = {tail, bytes};
+      }
+    };
+    half* thh = scratch<half>("be2.cl.thh", pRT * Dt); zeroTailOnce(0, thh, RT * Dt, (pRT - RT) * Dt * 2);
+    half* toh = scratch<half>("be2.cl.toh", pRT * Dt); zeroTailOnce(1, toh, RT * Dt, (pRT - RT) * Dt * 2);
+    half* qsh = scratch<half>("be2.dn.qsh", pRT * Dc); zeroTailOnce(2, qsh, RT * Dc, (pRT - RT) * Dc * 2);
+    if (csplit) { half* xa = scratch<half>("be2.cs.xa", pRT * Dt); zeroTailOnce(3, xa, RT * Dt, (pRT - RT) * Dt * 2); }
+  }
+  const bool fusedInit = HALF && batchCond && d.layers > 0 && Ca == 128 && Dt == 768 && d.tbiasH != nullptr;
+  if ((Ca & 3) == 0 && (Dt & 3) == 0) {
+    const size_t slotR0 = (size_t)bi * R, slotT0 = (size_t)bi * T;
+    const float* condA0 = fusedInit ? cg[0] + slotR0 * outC[0] : nullptr;
+    const float* condT0 = fusedInit ? cg[1] + slotT0 * outC[1] : nullptr;
+    half* hh0 = fusedInit ? scratch<half>("be2.cl.hh", RN * Ca) : nullptr;
+    half* thh0 = fusedInit ? scratch<half>("be2.cl.thh", pRT * Dt) : nullptr;
+    be2Run1d("be2_q_init", (RN * Ca) >> 2,
+             Be2QInitArgs{x, Iin("atom_mask"), d.q0, Wf(af + "r_to_q_trans/weight"), cond, d.coordsCond,
+                          d.dyn ? Wf(af + "cond_to_q_trans/weight") : nullptr, q, (u64)RN, (uint)N, (uint)Ca, cIn, d.dynGate,
+                          condA0, condA0 ? condA0 + Ca : nullptr, maps.atomTok, hh0, (uint)(6 * Ca), 0});
+    if (Dt == 768) {
+      const size_t aGroups = (pRT + 7) / 8;
+      run("be2_a_init", Grid{(uint32_t)std::min<size_t>(aGroups, 65535), (uint32_t)((aGroups + 65534) / 65535), 1}, 256,
+          Be2AInitArgs{x, Iin("atom_mask"), Iin("token_center_atom_index"), d.a0, Wf(SM + "r_token_to_a/weight"), a,
+                       (u64)RT, (uint)T, (uint)N, (uint)Dt, cIn, (uint)pRT,
+                       condT0, condT0 ? condT0 + Dt : nullptr, maps.tok, thh0, (uint)(6 * Dt), 0});
+    } else {
+      if (pRT > RT) fill(a + RT * Dt, 0, (pRT - RT) * Dt * 4);
+      be2Run1d("be2_a_init", (RT * Dt) >> 2,
+               Be2AInitArgs{x, Iin("atom_mask"), Iin("token_center_atom_index"), d.a0, Wf(SM + "r_token_to_a/weight"), a,
+                            (u64)RT, (uint)T, (uint)N, (uint)Dt, cIn, 0, nullptr, nullptr, nullptr, nullptr, 0, 0});
+    }
+  } else {
+    if (pRT > RT) fill(a + RT * Dt, 0, (pRT - RT) * Dt * 4);
+    float* r = scratch<float>("be2.dn.r", RN * 3);
+    be2Run1d("be2_scale_masked", RN * 3, Be2ScaleMaskedArgs{x, Iin("atom_mask"), r, (u64)N, RN, cIn, 0});
+    be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{d.q0, q, (u64)N * Ca, RN * Ca});
+    linT(r, af + "r_to_q_trans/weight", q, RN, 3, Ca, 1.f);
+    if (d.dyn) {
+      float* cq = scratch<float>("be2.dn.cq", RN * Ca);
+      if (cond) linT(cond, af + "cond_to_q_trans/weight", cq, RN, 3, Ca);
+      else {
+        float* one = scratch<float>("be2.dn.cq1", (size_t)N * Ca);
+        linT(d.coordsCond, af + "cond_to_q_trans/weight", one, N, 3, Ca);
+        be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{one, cq, (u64)N * Ca, RN * Ca});
+      }
+      run1d("be2_scaled_add", RN * Ca, Be2ScaledAddArgs{q, cq, RN * Ca, d.dynGate, 0});
+    }
+    be2Run1d("be2_repeat", RT * Dt, Be2RepeatArgs{d.a0, a, (u64)T * Dt, RT * Dt});
+    float* rc = scratch<float>("be2.dn.rc", RT * 3);
+    be2Run1d("be2_centre_atoms", RT * 3, Be2CentreAtomsArgs{r, Iin("token_center_atom_index"), rc, (uint)T, (uint)N, 3, 3, (uint)samples, 0});
+    linT(rc, SM + "r_token_to_a/weight", a, RT, 3, Dt, 1.f);
   }
   const float* pendTokH = nullptr; const float* pendTokGate = nullptr; int pendTokLdg = 0;
   for (int l = 0; l < d.layers; ++l) {
     const std::string L = SM + "layers/" + num(l) + "/";
-    if (batchCond && curStep < 0 && l % G == 0) {
-      const int gn = std::min(G, d.layers - l);
-      const size_t pR1 = padRows(R);
-      condGroup(cnd, cnd, T, 1, Dt, d.layers, l, gn, outC, cg);
-      if (cgQB) {
-        half* gR = scratch<half>("be2.cs.gR", (size_t)gn * 4 * pR1 * Dc);
-        be2Run1d("be2_cs_gamma", (size_t)gn * pR1 * Dc,
-                 Be2CsGammaArgs{cg[2], gR, nullptr, (u64)(gn * pR1 * Dc), (uint)Dt, (uint)Ca, (uint)ldc, (uint)pR1});
-        for (int part = 0; part < 2; ++part) {
-          std::vector<u64> X, Wp, Y;
-          for (int j = 0; j < gn; ++j) {
-            const std::string p = SM + "layers/" + num(l + j) + "/coupling/s_to_q_mixer/";
-            X.push_back((u64)(gR + ((size_t)j * 2 + part) * 2 * pR1 * Dc));
-            Wp.push_back((u64)csPairs(p, Dc, I));
-            Y.push_back((u64)(cgQB + (size_t)j * pR1 * 4 * I));
-          }
-          const std::string pk = "cg.qb." + num(gn) + "." + num(part);
-          Gemm G{}; G.ptrs = true; G.batch = gn;
-          G.X = pointerArray(pk + ".x", X); G.tx = F16; G.W = pointerArray(pk + ".w", Wp); G.tw = F16;
-          G.Y = pointerArray(pk + ".y", Y); G.ty = F32; G.rows = 2 * pR1; G.in = Dc; G.out = 2 * I;
-          G.beta = part ? 1.f : 0.f; G.label = "coupling RB, layers batched";
-          gemm(G);
-        }
-      }
-    }
+    if (batchCond && curStep < 0 && l > 0 && l % G == 0) runCondGroup(l);
     const int lj = l % G;
     const size_t slotR = (size_t)lj * padRows((size_t)curK * R) + (size_t)bi * R;
     const size_t slotT = (size_t)lj * padRows((size_t)curK * T) + (size_t)bi * T;
     const CondLayer atomL{L + "atom_block/transformer_layer/", ab, true, Ha};
     // (the atom stream's conditioning is its token's row of cond: computed on the T + 1 token rows)
     float* condA = batchCond ? cg[0] + slotR * outC[0] : layerCond(atomL, cnd, T + 1, Dt, Ca, "be2.dn.condA");
-    condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N);
+    condLayer(atomL, q, (int)RN, Ca, condA, maps.atomTok, d.wbias + wb * l, N, nullptr, nullptr, nullptr, 0, nullptr, l == 0 && fusedInit);
     const CondLayer tokL{L + "token_block/", tb, false, Ht};
     float* condT = batchCond ? cg[1] + slotT * outC[1] : layerCond(tokL, cnd, T, Dt, Dt, "be2.dn.condT");
     const float* tokTrH = nullptr;
     condLayer(tokL, a, (int)RT, Dt, condT, maps.tok, d.tbias ? d.tbias + tbn * l : nullptr, T,
-              d.tbiasH ? d.tbiasH + (size_t)Ht * T * ((T + 63) & ~63) * l : nullptr, pendTokH, pendTokGate, pendTokLdg, HALF ? &tokTrH : nullptr);
+              d.tbiasH ? d.tbiasH + (size_t)Ht * T * ((T + 63) & ~63) * l : nullptr, pendTokH, pendTokGate, pendTokLdg,
+              HALF ? &tokTrH : nullptr, l == 0 && fusedInit);
     pendTokH = nullptr; pendTokGate = nullptr;
     // the coupling's conditioning, both on the token rows (the atom side's input is cond broadcast to atoms)
     const std::string cp = L + "coupling/";
@@ -666,6 +694,19 @@ void prepareWeights() {
     M.derived<float>("ie.wb.proj", (size_t)ieLayers * Ha * 16, [&](float* out) {
       for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * Ha * 16, Wf(iePrefix(i) + ieA + "proj_z/weight"), (size_t)Ha * 64);
     });
+    if (Ca == 128) {
+      M.derived<float>("ie.cond.w0", (size_t)ieLayers * Ca, [&](float* out) {
+        for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * Ca, Wf(iePrefix(i) + "cond_0/weight"), (size_t)Ca * 4);
+      });
+      if (hasW(iePrefix(0) + "cond_0/bias"))
+        M.derived<float>("ie.cond.b0", (size_t)ieLayers * Ca, [&](float* out) {
+          for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * Ca, Wf(iePrefix(i) + "cond_0/bias"), (size_t)Ca * 4);
+        });
+      if (hasW(iePrefix(0) + "cond_2/bias"))
+        M.derived<float>("ie.cond.b2", (size_t)ieLayers * 6 * Ca, [&](float* out) {
+          for (int i = 0; i < ieLayers; ++i) copy(out + (size_t)i * 6 * Ca, Wf(iePrefix(i) + "cond_2/bias"), (size_t)6 * Ca * 4);
+        });
+    }
     for (int i = 0; i < ieLayers; ++i) {
       qkvgWeight(iePrefix(i) + ieA, Ca);
       const std::string st = iePrefix(i) + "transition/";

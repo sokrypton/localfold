@@ -565,17 +565,39 @@ kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   const ulong row = BE2_ROW; const uint lane = BE2_LANE;
   if (row >= a.rows) return;
   device const float* xr = a.q + row * a.Ca;
-  float4 x4 = a.Ca == 128 ? ((device const float4*)xr)[lane] : float4(0.f);
+  const int t = a.atomTok[row];
+  device const float* aq = a.cqc + (ulong)t * a.ldc + a.Dt;
+  if (a.Ca == 128) {
+    const float4 x4 = ((device const float4*)xr)[lane];
+    const float mq = simd_sum(x4.x + x4.y + x4.z + x4.w) * (1.f / 128.f);
+    const float4 d = x4 - mq;
+    const float ssq = simd_sum(dot(d, d));
+    const float sq = sqrt(ssq * (1.f / 128.f) + 1e-5f);
+    const float4 val = (1.f + ((device const float4*)aq)[lane]) * d / sq;
+    const half4 h = half4(val);
+    device half4* xq4 = (device half4*)(a.xq + row * 256);
+    xq4[lane] = h;
+    xq4[32 + lane] = half4(val - float4(h));
+    if (lane == 0) {
+      const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
+      const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
+      float ma = 0, ssa = 0, sa = 0;
+      if (st >= 0) { ma = a.tstats[st * 3]; ssa = a.tstats[st * 3 + 1]; sa = a.tstats[st * 3 + 2]; }
+      const float W = (float)(a.Dt + 128);
+      const float mu = ((float)a.Dt * ma + 128.f * mq) / W, da = ma - mu, dq = mq - mu;
+      const float var = (ssa + ssq + (float)a.Dt * da * da + 128.f * dq * dq) / W;
+      device float* o = a.stats + row * 8;
+      o[0] = rsqrt(var + 1e-5f); o[1] = da; o[2] = dq; o[3] = sq; o[4] = mq; o[5] = sa; o[6] = (float)st; o[7] = (float)t;
+    }
+    return;
+  }
   float s = 0;
-  if (a.Ca == 128) s = x4.x + x4.y + x4.z + x4.w;
-  else for (uint c = lane; c < a.Ca; c += 32) s += xr[c];
+  for (uint c = lane; c < a.Ca; c += 32) s += xr[c];
   const float mq = simd_sum(s) / a.Ca;
   float v = 0;
-  if (a.Ca == 128) { const float4 d = x4 - mq; v = dot(d, d); }
-  else for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
+  for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
   const float ssq = simd_sum(v);
   const float sq = sqrt(ssq / a.Ca + 1e-5f);
-  const int t = a.atomTok[row];
   if (lane == 0) {
     const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
     const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
@@ -586,16 +608,6 @@ kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
     const float var = (ssa + ssq + (float)a.Dt * da * da + (float)a.Ca * dq * dq) / W;
     device float* o = a.stats + row * 8;
     o[0] = rsqrt(var + 1e-5f); o[1] = da; o[2] = dq; o[3] = sq; o[4] = mq; o[5] = sa; o[6] = (float)st; o[7] = (float)t;
-  }
-  device const float* aq = a.cqc + (ulong)t * a.ldc + a.Dt;
-  // (two halves, hi and the remainder: Xq in ONE half cost the split its precision - metal/bioemu2's denoise.mm)
-  if (a.Ca == 128) {
-    const float4 val = (1.f + ((device const float4*)aq)[lane]) * (x4 - mq) / sq;
-    const half4 h = half4(val);
-    device half4* xq4 = (device half4*)(a.xq + row * 256);
-    xq4[lane] = h;
-    xq4[32 + lane] = half4(val - float4(h));
-    return;
   }
   for (uint c = lane; c < a.Ca; c += 32) {
     const float val = (1.f + aq[c]) * (xr[c] - mq) / sq;
@@ -660,7 +672,13 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
     const float4 nv = d * inv;
     for (uint j = 0; j < a.nLayers; ++j) {
       device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 128);
-      ((device half4*)(a.out + ((ulong)j * a.Rc + row) * 128))[lane] = half4(nv * w4[lane]);
+      float4 n = nv * w4[lane];
+      if (a.b) {
+        device const float4* b4 = (device const float4*)(a.b + (ulong)(a.l0 + j) * 128);
+        n += b4[lane];
+        n = n / (1.f + exp(-n));
+      }
+      ((device half4*)(a.out + ((ulong)j * a.Rc + row) * 128))[lane] = half4(n);
     }
     return;
   }
@@ -1072,8 +1090,63 @@ kernel void be2_q_init(LF_ARGS(Be2QInitArgs)) {
     }
   }
   ((device float4*)a.q)[t] = v;
+  if (a.yh && a.Ca == 128) {
+    const float mean = simd_sum(v.x + v.y + v.z + v.w) * (1.f / 128.f);
+    const float4 d = v - mean;
+    const float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+    const ulong cr = a.map ? (ulong)a.map[row] : (ulong)row;
+    device const float4* al4 = (device const float4*)(a.alpha + cr * a.ldc);
+    device const float4* be4 = (device const float4*)(a.beta + cr * a.ldc);
+    ((device half4*)(a.yh + (ulong)row * 128))[c4] = half4(d * inv * (1.f + al4[c4]) + be4[c4]);
+  }
 }
 kernel void be2_a_init(LF_ARGS(Be2AInitArgs)) {
+  if (a.Dt == 768 && a.pRT > 0) {
+    const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+    if (row >= (ulong)a.pRT) return;
+    device float4* dst4 = (device float4*)(a.a + row * 768);
+    if (row >= a.rows) {
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) dst4[lane + 32 * k] = float4(0.f);
+      return;
+    }
+    const uint smp = lf_udiv((uint)row, a.T), tok = (uint)row - smp * a.T;
+    const uint ca = (uint)a.centre[tok];
+    const ulong xoff = ((ulong)smp * a.N + ca) * 3;
+    const float3 r = a.mask[ca] ? a.cIn * float3(a.x[xoff], a.x[xoff + 1], a.x[xoff + 2]) : float3(0.f);
+    device const float4* a04 = (device const float4*)(a.a0 + (ulong)tok * 768);
+    float4 xv[6]; float s = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 6; ++k) {
+      const uint idx = lane + 32 * k, c = idx << 2;
+      float4 v = a04[idx];
+      _Pragma("clang loop unroll(full)")
+      for (uint j = 0; j < 4; ++j) {
+        device const float* wa = a.wA + (c + j) * 3;
+        v[j] += r.x * wa[0] + r.y * wa[1] + r.z * wa[2];
+      }
+      dst4[idx] = v;
+      xv[k] = v;
+      s += v.x + v.y + v.z + v.w;
+    }
+    if (a.yh) {
+      const float mean = simd_sum(s) * (1.f / 768.f);
+      float v = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) { const float4 d = xv[k] - mean; v += dot(d, d); }
+      const float inv = rsqrt(simd_sum(v) * (1.f / 768.f) + 1e-5f);
+      const ulong cr = a.map ? (ulong)a.map[row] : row;
+      device const float4* al4 = (device const float4*)(a.alpha + cr * a.ldc);
+      device const float4* be4 = (device const float4*)(a.beta + cr * a.ldc);
+      device half4* yh4 = (device half4*)(a.yh + row * 768);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 6; ++k) {
+        const uint idx = lane + 32 * k;
+        yh4[idx] = half4((xv[k] - mean) * inv * (1.f + al4[idx]) + be4[idx]);
+      }
+    }
+    return;
+  }
   ulong t = LF_INDEX;
   const uint C4 = a.Dt >> 2;
   if (t >= a.rows * C4) return;
