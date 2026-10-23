@@ -108,7 +108,7 @@ struct TargetFeatSumArgs { DP(float) tf; CP(int) aatype; CP(float) profile; CP(f
 struct PairFeatArgs { CP(float) trunkPair; RelIdx r; DP(float) out; u64 p0, rows; uint n, Czt; };
 // out[r] = [a[r] | b[r]] with zero columns at p0 and p1 (-1: none)
 struct ConcatPadArgs { CP(float) a; CP(float) b; DP(float) out; uint rows, wa, wb; int p0, p1; uint pad; };
-struct FourierArgs { CP(float) w; CP(float) b; DP(float) out; uint n, K; float levels[16]; };
+struct FourierArgs { CP(float) w; CP(float) b; DP(float) out; uint n, K; float levels[32]; };
 struct SingleBatchInitArgs { CP(float) base; CP(float) projs; DP(float) out; uint K, n, Cs, pad; };
 // the transformer conditioning's per-row norms + cast: cn = LN0(cond), ch = half(cond), padded rows [n, pn) zeroed
 struct CondNormCastArgs { CP(float) cond; DP(half) cn; DP(half) ch; uint K, n, pn, Cc; };

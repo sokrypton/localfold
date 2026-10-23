@@ -167,16 +167,20 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
     }
   }
   int Ct = d.Ct, nb = d.tokenBlocks;
+  size_t prows = ((size_t)T + 15) / 16 * 16;
   d.entries = 6 * nb;
   d.sBase = allocT<float>((size_t)T * Ct);
   {
-    half* sn = scratch<half>("dc.sn", (size_t)T * d.Si);
+    half* sn = scratch<half>("dc.sn", prows * d.Si);
+    if (prows > (size_t)T) fill(sn + (size_t)T * d.Si, 0, (prows - (size_t)T) * d.Si * sizeof(half));
     layerNorm(d.sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
-    lin(sn, "f/diffusion/sProjection", d.sBase, T, d.Si, Ct);
-    releaseScratch({"dc.sn"});
+    float* sb = prows > (size_t)T ? scratch<float>("dc.sb", prows * Ct) : d.sBase;
+    lin(sn, "f/diffusion/sProjection", sb, prows, d.Si, Ct);
+    if (sb != d.sBase) copy(d.sBase, sb, (size_t)T * Ct * sizeof(float));
+    releaseScratch({"dc.sn", "dc.sb"});
   }
-  d.single = allocT<float>((size_t)T * Ct); d.snScaled = allocT<float>((size_t)(2 * nb + 1) * T * Ct);
-  d.G = allocT<float>((size_t)T * d.entries * Ct); d.scales = allocT<float>((size_t)(2 * nb + 1) * Ct);
+  d.single = allocT<float>(prows * Ct); d.snScaled = allocT<float>((size_t)(2 * nb + 1) * prows * Ct);
+  d.G = allocT<float>(prows * d.entries * Ct); d.scales = allocT<float>((size_t)(2 * nb + 1) * Ct);
   for (int b = 0; b < nb; ++b)
     for (int k = 0; k < 2; ++k)
       copy(d.scales + (size_t)(2 * b + k) * Ct, F("diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/") +
@@ -253,7 +257,7 @@ void prepareDiffusionWeights() {
 
 static void conditioningSteps(const Denoiser& d, const float* levels, int K, float* single, float* G, float* sTok) {
   int T = d.T, Ct = d.Ct, nb = d.tokenBlocks, n = 2 * nb, ld = d.entries * Ct;
-  size_t KT = (size_t)K * T;
+  size_t KT = (size_t)K * T, pKT = KT <= 128 ? (KT + 15) / 16 * 16 : (KT + 63) / 64 * 64;
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", (size_t)K * nf); float* noise = scratch<float>("dc.noise", (size_t)K * Ct);
   run1d("ef2_fourier", (size_t)K * nf, FourierArgs{F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), levels, four, (uint)nf, (uint)K});
@@ -265,28 +269,29 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
     layerNorm(four, four, K, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
     lin(four, "f/diffusion/noiseProjection", noise, K, nf, Ct);
   }
+  if (pKT > KT) fill(single + KT * Ct, 0, (pKT - KT) * Ct * sizeof(float));
   run1d("ef2_add_row", (KT * Ct) >> 2, AddRowArgs{d.sBase, noise, single, (u64)KT, (uint)Ct, (uint)T});
-  for (int l = 0; l < 2; ++l) transitionLayer(single, KT, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
+  for (int l = 0; l < 2; ++l) transitionLayer(single, pKT, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
   half* snScaledH = nullptr;
   float* snScaledF = nullptr;
   half* snStep = nullptr;
   half* snRaw = nullptr;
   if (HALF_GEMM && Ct == 768) {
-    snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 2) * KT * Ct);
-    snStep = snScaledH + (size_t)n * KT * Ct;
-    snRaw = snScaledH + (size_t)(n + 1) * KT * Ct;
-    size_t sgs = KT <= 256 ? 2 : 8;
-    run("ef2_scale_copies", grid1d((KT + sgs - 1) / sgs, 1), (int)(sgs * 32),
-        ScaleCopiesArgs{single, d.scales, nullptr, snScaledH, (uint)KT, (uint)Ct, (uint)n, 1, F("diffusion/stepNorm/offset")});
+    snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 2) * pKT * Ct);
+    snStep = snScaledH + (size_t)n * pKT * Ct;
+    snRaw = snScaledH + (size_t)(n + 1) * pKT * Ct;
+    size_t sgs = pKT <= 256 ? 2 : 8;
+    run("ef2_scale_copies", grid1d((pKT + sgs - 1) / sgs, 1), (int)(sgs * 32),
+        ScaleCopiesArgs{single, d.scales, nullptr, snScaledH, (uint)pKT, (uint)Ct, (uint)n, 1, F("diffusion/stepNorm/offset")});
   } else {
-    float* sn = scratch<float>("dn.sn0", KT * Ct);
-    layerNorm(single, sn, KT, Ct, nullptr, nullptr);
-    snScaledH = K == 1 ? (half*)(void*)d.snScaled : (HALF_GEMM ? scratch<half>("dn.snsH", (size_t)n * KT * Ct) : nullptr);
-    snScaledF = K == 1 ? d.snScaled : (HALF_GEMM ? nullptr : scratch<float>("dn.snsF", (size_t)n * KT * Ct));
-    run1d("ef2_scale_copies", ((size_t)n * KT * Ct) >> 2,
-          ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : snScaledF, HALF_GEMM ? snScaledH : nullptr, (uint)KT, (uint)Ct, (uint)n, 0, nullptr});
-    snStep = scratch<half>("dn.sn", KT * Ct);
-    layerNorm(single, snStep, KT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
+    float* sn = scratch<float>("dn.sn0", pKT * Ct);
+    layerNorm(single, sn, pKT, Ct, nullptr, nullptr);
+    snScaledH = K == 1 ? (half*)(void*)d.snScaled : (HALF_GEMM ? scratch<half>("dn.snsH", (size_t)n * pKT * Ct) : nullptr);
+    snScaledF = K == 1 ? d.snScaled : (HALF_GEMM ? nullptr : scratch<float>("dn.snsF", (size_t)n * pKT * Ct));
+    run1d("ef2_scale_copies", ((size_t)n * pKT * Ct) >> 2,
+          ScaleCopiesArgs{sn, d.scales, HALF_GEMM ? nullptr : snScaledF, HALF_GEMM ? snScaledH : nullptr, (uint)pKT, (uint)Ct, (uint)n, 0, nullptr});
+    snStep = scratch<half>("dn.sn", pKT * Ct);
+    layerNorm(single, snStep, pKT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   }
   if (HALF_GEMM && snRaw) {
     uint64_t* ptrs = scratch<uint64_t>("dn.adaptrs", 9 * (size_t)n);
@@ -297,7 +302,7 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
         const std::string P = "diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/");
         hp[2 * j] = (uint64_t)Fh(P + "adaln/gateWeights");
         hp[2 * j + 1] = (uint64_t)Fh(P + "adaln/shiftWeights");
-        hp[2 * n + 2 * j] = hp[2 * n + 2 * j + 1] = (uint64_t)(snScaledH + (size_t)j * KT * Ct);
+        hp[2 * n + 2 * j] = hp[2 * n + 2 * j + 1] = (uint64_t)(snScaledH + (size_t)j * pKT * Ct);
         hp[4 * n + 2 * j] = (uint64_t)(G + (size_t)(2 * j) * Ct);
         hp[4 * n + 2 * j + 1] = (uint64_t)(G + (size_t)(2 * j + 1) * Ct);
         hp[6 * n + j] = (uint64_t)Fh(P + "outGateWeights");
@@ -306,22 +311,22 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
       }
     upload(ptrs, hp.data(), hp.size() * 8);
     Gemm g{}; g.X = ptrs + 2 * n; g.tx = F16; g.W = ptrs; g.tw = F16; g.Y = ptrs + 4 * n; g.ldy = ld;
-    g.rows = KT; g.in = Ct; g.out = Ct; g.batch = 2 * n; g.ptrs = true; g.label = "adaLN projections";
+    g.rows = pKT; g.in = Ct; g.out = Ct; g.batch = 2 * n; g.ptrs = true; g.label = "adaLN projections";
     gemm(g);
     Gemm o{}; o.X = ptrs + 7 * n; o.tx = F16; o.W = ptrs + 6 * n; o.tw = F16; o.Y = ptrs + 8 * n; o.ldy = ld;
-    o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = Ct; o.batch = n; o.ptrs = true; o.label = "out gates";
+    o.bias = outGateBiases(nb, Ct); o.rows = pKT; o.in = Ct; o.out = Ct; o.batch = n; o.ptrs = true; o.label = "out gates";
     gemm(o);
   } else {
     Gemm g{};
     if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = snScaledF; g.half = true; }
-    g.sx = (int64_t)KT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
-    g.Y = G; g.ldy = ld; g.sy = 2 * Ct; g.rows = KT; g.in = Ct; g.out = 2 * Ct; g.batch = n; g.label = "adaLN projections";
+    g.sx = (int64_t)pKT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
+    g.Y = G; g.ldy = ld; g.sy = 2 * Ct; g.rows = pKT; g.in = Ct; g.out = 2 * Ct; g.batch = n; g.label = "adaLN projections";
     gemm(g);
     Gemm o{}; o.X = single; o.W = outGateWeights(nb, Ct); o.tw = F16; o.half = true; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
-    o.bias = outGateBiases(nb, Ct); o.rows = KT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
+    o.bias = outGateBiases(nb, Ct); o.rows = pKT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
     gemm(o);
   }
-  lin(snStep, "f/diffusion/singleToToken", sTok, KT, Ct, Ct);
+  lin(snStep, "f/diffusion/singleToToken", sTok, pKT, Ct, Ct);
 }
 // adaLN into half: sigmoid(gate + gateBias) * LN(a) + shift, the projections from G (optionally folding a preceding gated residual into a)
 static void adaLN(const Denoiser& d, const float* G, float* a, half* out, int e, const std::string& B,
@@ -332,25 +337,32 @@ static void adaLN(const Denoiser& d, const float* G, float* a, half* out, int e,
 }
 static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const float*& pendingY, const float*& pendingGate) {
   int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
+  size_t prows = ((size_t)T + 15) / 16 * 16;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
-  half* x = scratch<half>("tb.x", (size_t)T * C);
+  half* x = scratch<half>("tb.x", prows * C);
+  half* qkvg = scratch<half>("tb.qkvg", prows * 4 * C);
+  half* ctx = scratch<half>("tb.ctx", prows * C);
+  static const void* zeroed = nullptr; static size_t zeroedRows = 0;
+  if (prows != (size_t)T && (zeroed != x || zeroedRows != prows)) {
+    fill(x, 0, prows * C * sizeof(half));
+    fill(ctx, 0, prows * C * sizeof(half));
+    zeroed = x; zeroedRows = prows;
+  }
   adaLN(d, G, a, x, 4 * b, B + "attention/adaln/", pendingY, pendingGate);
   pendingY = pendingGate = nullptr;
   // q | k | v | gate in one GEMM (half, the attention's layout), then the flash kernel: the query bias, QK^T, the pair
   // bias, the softmax, PV and the gate - no [H, T, T] scores
-  half* qkvg = scratch<half>("tb.qkvg", (size_t)T * 4 * C);
   {
-    Gemm g{}; g.X = x; g.tx = F16; g.W = qkvgWeight(b, C); g.tw = F16; g.Y = qkvg; g.ty = F16; g.rows = T; g.in = C; g.out = 4 * C;
+    Gemm g{}; g.X = x; g.tx = F16; g.W = qkvgWeight(b, C); g.tw = F16; g.Y = qkvg; g.ty = F16; g.rows = prows; g.in = C; g.out = 4 * C;
     g.accFloat = true; g.label = "token qkvg";
     gemm(g);
   }
-  half* ctx = scratch<half>("tb.ctx", (size_t)T * C);
   Attention at{}; at.qkvg = qkvg; at.out = ctx; at.n = T; at.heads = Hh; at.D = D; at.rows = 1; at.scale = 1.f / sqrtf((float)D);
   at.bias = d.biases[b]; at.biasStride = d.stride; at.biasPadInf = true; at.qBias = F(B + "attention/queryBias");
   attention(at);
-  float* o = scratch<float>("tb.o", (size_t)T * C);
+  float* o = scratch<float>("tb.o", prows * C);
   const float* gAtt = G + (size_t)(4 * nb + 2 * b) * C;
-  if (!HALF_GEMM || !gemmGateResidual(ctx, Fh(B + "attention/outWeights"), a, T, T, C, C, gAtt, ld, T, 1.f, "token outWeights")) {
+  if (!HALF_GEMM || !gemmGateResidual(ctx, Fh(B + "attention/outWeights"), a, prows, T, C, C, gAtt, ld, T, 1.f, "token outWeights")) {
     lin(ctx, "f/" + B + "attention/outWeights", o, T, C, C);
     pendingY = o; pendingGate = gAtt;
   }
@@ -358,10 +370,10 @@ static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const
   adaLN(d, G, a, x, 4 * b + 2, B + "transition/adaln/", pendingY, pendingGate);
   pendingY = pendingGate = nullptr;
   int Hd = dimOf("f/" + B + "transition/outWeights", 0);
-  half* g = scratch<half>("tb.gated", (size_t)T * Hd);
-  gemmSwiglu(x, swigluPairsInPlace("f/" + B + "transition/swishWeights", C, Hd), g, T, C, Hd);
+  half* g = scratch<half>("tb.gated", prows * Hd);
+  gemmSwiglu(x, swigluPairsInPlace("f/" + B + "transition/swishWeights", C, Hd), g, prows, C, Hd);
   const float* gTr = G + (size_t)(4 * nb + 2 * b + 1) * C;
-  if (!HALF_GEMM || !gemmGateResidual(g, Fh(B + "transition/outWeights"), a, T, T, Hd, C, gTr, ld, T, 1.f, "transition outWeights")) {
+  if (!HALF_GEMM || !gemmGateResidual(g, Fh(B + "transition/outWeights"), a, prows, T, Hd, C, gTr, ld, T, 1.f, "transition outWeights")) {
     lin(g, "f/" + B + "transition/outWeights", o, T, Hd, C);
     if (b + 1 < nb) { pendingY = o; pendingGate = gTr; }
     else run1d("ef2_sigmoid_mul", (size_t)T * C, SigmoidMulArgs{o, gTr, nullptr, a, (uint)T, (uint)C, (uint)ld, 0});
@@ -396,11 +408,13 @@ static void denoiseStep(const Denoiser& d, const float* xNoisy, float* xDenoised
   run1d("ef2_scatter_mean", ((size_t)T * Ct) >> 2, ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, 0, sTok});
   const float* pendingY = nullptr; const float* pendingGate = nullptr;
   for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, G, a, b, pendingY, pendingGate);
-  half* an = scratch<half>("dn.an", (size_t)T * Ct);
+  size_t prows = ((size_t)T + 15) / 16 * 16;
+  half* an = scratch<half>("dn.an", prows * Ct);
+  if (prows > (size_t)T) fill(an + (size_t)T * Ct, 0, (prows - (size_t)T) * Ct * sizeof(half));
   layerNorm(a, an, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
-  float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
-  lin(an, "f/diffusionAtomDecoder/tokenToAtom", pt, T, Ct, Ca);
+  float* pt = scratch<float>("dn.pt", prows * Ca);
+  lin(an, "f/diffusionAtomDecoder/tokenToAtom", pt, prows, Ct, Ca);
   run1d("ef2_gather_tokens", ((size_t)A * Ca) >> 2, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca});
   swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod);
   if (Ca == 128) {
@@ -428,7 +442,7 @@ static void setLevel(const Denoiser& d, float t) {
 }
 void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised) {
   setLevel(d, t);
-  float* sTok = scratch<float>("dn.sTok", (size_t)d.T * d.Ct);
+  float* sTok = scratch<float>("dn.sTok", (((size_t)d.T + 15) / 16 * 16) * d.Ct);
   conditioningSteps(d, d.level, 1, d.single, d.G, sTok);
   denoiseStep(d, xNoisy, xDenoised, d.level, d.G, sTok);
 }
@@ -556,9 +570,10 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
                                       : std::max(1, std::min(steps, (int)(((size_t)320 << 20) / std::max<size_t>(stepBytes, 1))));
   int batches = std::max(1, (steps + maxK - 1) / maxK);
   int batchK = std::max(1, (steps + batches - 1) / batches);
-  float* bSingle = batchK == 1 ? d.single : scratch<float>("dn.bsingle", (size_t)batchK * d.T * d.Ct);
-  float* bG = batchK == 1 ? d.G : scratch<float>("dn.bG", (size_t)batchK * d.T * d.entries * d.Ct);
-  float* bSTok = scratch<float>("dn.bsTok", (size_t)batchK * d.T * d.Ct);
+  size_t bKT = (size_t)batchK * d.T, pBatchRows = bKT <= 128 ? (bKT + 15) / 16 * 16 : (bKT + 63) / 64 * 64;
+  float* bSingle = batchK == 1 ? d.single : scratch<float>("dn.bsingle", pBatchRows * d.Ct);
+  float* bG = batchK == 1 ? d.G : scratch<float>("dn.bG", pBatchRows * d.entries * d.Ct);
+  float* bSTok = scratch<float>("dn.bsTok", pBatchRows * d.Ct);
   for (int i = 0; i < steps; ++i) {
     if (i % batchK == 0) {
       int k = std::min(batchK, steps - i);

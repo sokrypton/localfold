@@ -259,10 +259,11 @@ static void conditioningAhead(float level) {
   const std::string Tn = "diffusion.transformer";
   const int n = D.n, Cc = metaI(Tn + ".condChannels"), C = metaI(Tn + ".channels");
   const size_t pn = ((size_t)n + 15) / 16 * 16, per = (size_t)n * (D.ldn + D.ldr) * 4;
-  const size_t K = std::min<size_t>({16, ((size_t)512 << 20) / per, D.plan.size() - D.planAt});
+  const size_t rem = D.plan.size() - D.planAt, maxK = std::max<size_t>(1, std::min<size_t>(32, ((size_t)768 << 20) / std::max<size_t>(per, 1)));
+  const size_t batches = std::max<size_t>(1, (rem + maxK - 1) / maxK), K = std::min<size_t>(rem, (rem + batches - 1) / batches);
   if (pn > 128 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
   D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
-  const size_t kn = K * n, pkn = (kn + 15) / 16 * 16;
+  const size_t kn = K * n, pkn = (kn + 63) / 64 * 64, cRows = std::max(K * pn, pkn);
   D.heldSingle = scratch<float>("dt.heldSingle", kn * Cc);
   singleConditioningBatch(D.held.data(), K, D.heldSingle);      // (the denoiser reads its slot too: heldSingleFor)
   int Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
@@ -275,8 +276,8 @@ static void conditioningAhead(float level) {
   lin(sn, "diffusion.singleCondEmbeddingProjection", D.heldSnProj, pkn, Cs, perToken);
   D.heldNorm = scratch<float>("dt.heldNorm", K * pn * D.ldn);
   D.heldRaw = scratch<float>("dt.heldRaw", K * pn * D.ldr);
-  half* cn = scratch<half>("dt.heldCn", K * pn * Cc);
-  half* ch = scratch<half>("dt.heldCh", K * pn * Cc);
+  half* cn = scratch<half>("dt.heldCn", cRows * Cc);
+  half* ch = scratch<half>("dt.heldCh", cRows * Cc);
   run("af3_cond_norm_cast", grid1d((pkn + 7) / 8, 1), 256,
       CondNormCastArgs{D.heldSingle, cn, ch, 1u, (uint)kn, (uint)pkn, (uint)Cc});
   if (gemmCondPermuted(ADA_RAW ? ch : cn, D.wNorm, D.heldNorm, pkn, kn, Cc, D.ldn, D.bNorm, n, 2 * C, ADA_RAW ? 0 : C,

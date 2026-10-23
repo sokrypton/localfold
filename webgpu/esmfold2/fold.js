@@ -936,6 +936,10 @@ export async function foldEsmfold2(device, options) {
         pair.release();
         held.splice(held.indexOf(pair), 1);
       },
+      releaseRelPos: () => {
+        relPos.release();
+        held.splice(held.indexOf(relPos), 1);
+      },
     }));
 
     // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM - CB, or CA for glycine,
@@ -995,8 +999,10 @@ export async function foldEsmfold2(device, options) {
     // peak at 1448 tokens, inside the head's block stack.
     const memory = allocator.snapshot();
     denoiser.release();
-    relPos.release();
-    held.splice(held.indexOf(relPos), 1);
+    if (held.includes(relPos)) {
+      relPos.release();
+      held.splice(held.indexOf(relPos), 1);
+    }
     let confidence;
     if (options.confidenceWeights != null) {
       const rep = representativeAtoms(features, tokens);

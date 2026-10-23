@@ -45,9 +45,9 @@ static const half* towerFc1(const std::string& name, int C, int ffn) {
 
 static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int layer) {
   std::string B = "c/blocks/" + std::to_string(layer) + "/";
-  size_t R = e.rows; int C = e.model, H = e.heads;
-  float* qkv = scratch<float>("esmc.qkv", R * 3 * C);
-  towerLin(xn, B + "qkv/weights", qkv, R, C, 3 * C);
+  size_t R = e.rows, prows = (R + 15) / 16 * 16; int C = e.model, H = e.heads;
+  float* qkv = scratch<float>("esmc.qkv", prows * 3 * C);
+  towerLin(xn, B + "qkv/weights", qkv, prows, C, 3 * C);
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   if (C % 64 == 0 && C <= 1152) {
     run("ef2_qk_norm_rope", Grid{(uint32_t)((R + 7) / 8), 2, 1}, 256,
@@ -57,19 +57,19 @@ static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int lay
     layerNorm(qkv + C, k, R, C, M.f(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
     run1d("ef2_rope", R * 32, RopeArgs{q, k, (uint)R, (uint)H, (uint)C, 0});
   }
-  half* ctx = scratch<half>("esmc.ctx", R * C);
+  half* ctx = scratch<half>("esmc.ctx", prows * C);
   run("ef2_esmc_attend", Grid{(uint32_t)((R + 31) / 32), (uint32_t)H, 1}, 128,
       EsmcAttendArgs{q, k, qkv + 2 * C, seq, ctx, (uint)R, (uint)C, (uint)(3 * C), 0});
-  towerLin(ctx, B + "attn_out/weights", x, R, C, C, 1.f / e.residualScale, 1.f);
+  towerLin(ctx, B + "attn_out/weights", x, prows, C, C, 1.f / e.residualScale, 1.f);
   layerNorm(x, xn, R, C, M.f(B + "ffn_norm/scale"), M.f(B + "ffn_norm/offset"));
-  half* g = scratch<half>("esmc.g", R * e.ffn);
-  gemmSwiglu(xn, towerFc1(B + "fc1/weights", C, e.ffn), g, R, C, e.ffn);
-  towerLin(g, B + "fc2/weights", x, R, e.ffn, C, 1.f / e.residualScale, 1.f);
+  half* g = scratch<half>("esmc.g", prows * e.ffn);
+  gemmSwiglu(xn, towerFc1(B + "fc1/weights", C, e.ffn), g, prows, C, e.ffn);
+  towerLin(g, B + "fc2/weights", x, prows, e.ffn, C, 1.f / e.residualScale, 1.f);
 }
 
 void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tokenToRow, int T, float* lmZ) {
-  size_t R = e.rows; int C = e.model, P = e.pair;
-  float* single = scratch<float>("shim.single", std::max<size_t>(R, 1) * P);
+  size_t R = e.rows, prows = (R + 15) / 16 * 16; int C = e.model, P = e.pair;
+  float* single = scratch<float>("shim.single", std::max<size_t>(prows, 1) * P);
   if (R > 0) {
     // the mix weights, a softmax of a constant
     std::vector<float> mix(M.len(shim("combine")));
@@ -77,12 +77,19 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
       for (size_t i = 0; i < mix.size(); ++i) mx = std::max(mx, cmb[i]);
       for (size_t i = 0; i < mix.size(); ++i) { mix[i] = expf(cmb[i] - mx); s += mix[i]; }
       for (auto& m : mix) m /= s; }
-    float* acc = scratch<float>("shim.acc", R * P);
-    half* attnXn = scratch<half>("esmc.xn", R * C);
-    float* x = scratch<float>("esmc.x", R * C);
+    float* acc = scratch<float>("shim.acc", prows * P);
+    half* attnXn = scratch<half>("esmc.xn", prows * C);
+    half* ctx = scratch<half>("esmc.ctx", prows * C);
+    float* x = scratch<float>("esmc.x", prows * C);
+    if (prows > R) {
+      fill(x + R * C, 0, (prows - R) * C * sizeof(float));
+      fill(attnXn + R * C, 0, (prows - R) * C * sizeof(half));
+      fill(ctx + R * C, 0, (prows - R) * C * sizeof(half));
+    }
     run1d("ef2_embed", R * C, EmbedArgs{ids, M.f("c/embed/weights"), x, (uint)R, (uint)C});
     if (C <= 1152 && (C & 3) == 0) {
-      float* mixXn = scratch<float>("shim.mixXn", R * C);
+      float* mixXn = scratch<float>("shim.mixXn", prows * C);
+      if (prows > R) fill(mixXn + R * C, 0, (prows - R) * C * sizeof(float));
       const float* ss = M.f(shim("norm/scale"));
       const float* so = M.f(shim("norm/offset"));
       size_t sgs = R <= 256 ? 2 : 8;
@@ -97,26 +104,27 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
       run("ef2_shim_norm_acc", gRows, (int)(sgs * 32),
           ShimNormAccArgs{x, ss, so, nullptr, nullptr, M.f("c/final_norm/scale"),
                           mixXn, attnXn, (uint)R, (uint)C, 0u, mix[e.layers]});
-      lin(attnXn, shim("projection/weights"), acc, R, C, P);
+      lin(attnXn, shim("projection/weights"), acc, prows, C, P);
     } else {
-      half* xn = scratch<half>("shim.xn", R * C);
+      half* xn = scratch<half>("shim.xn", prows * C);
+      if (prows > R) fill(xn + R * C, 0, (prows - R) * C * sizeof(half));
       // each hidden state's LayerNorm and projection, added into the mix by the GEMM itself (alpha mix_k, beta 1)
       auto mixIn = [&](int k, const float* state) {
         layerNorm(state, xn, R, C, M.f(shim("norm/scale")), M.f(shim("norm/offset")));
-        lin(xn, shim("projection/weights"), acc, R, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
+        lin(xn, shim("projection/weights"), acc, prows, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
       };
       for (int l = 0; l < e.layers; ++l) {
         std::string B = "c/blocks/" + std::to_string(l) + "/";
         layerNormDual(x, xn, M.f(shim("norm/scale")), M.f(shim("norm/offset")),
                       attnXn, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"), R, C);
-        lin(xn, shim("projection/weights"), acc, R, C, P, l ? 1.f : 0.f, nullptr, mix[l]);
+        lin(xn, shim("projection/weights"), acc, prows, C, P, l ? 1.f : 0.f, nullptr, mix[l]);
         esmcBlock(e, x, attnXn, seq, l);
       }
-      float* last = scratch<float>("esmc.last", R * C);
+      float* last = scratch<float>("esmc.last", prows * C);
       layerNorm(x, last, R, C, M.f("c/final_norm/scale"), nullptr);
       mixIn(e.layers, last);
     }
-    lin(acc, shim("downproject/weights"), single, R, P, P, 0.f, M.f(shim("downproject/bias")));
+    lin(acc, shim("downproject/weights"), single, prows, P, P, 0.f, M.f(shim("downproject/bias")));
   }
   // a non-protein token's state is zero: LN(0) is the offset, the mix sums to one
   float* zero = scratch<float>("shim.zero", P);

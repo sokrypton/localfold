@@ -976,7 +976,7 @@ export class Esmfold2DenoiserGpu {
   #warming;
 
   async prepare({ shape, weights, features, sInputs, pair, relPos, reuseRelPos = false,
-                  releasePair }) {
+                  releasePair, releaseRelPos }) {
     const { tokens, atoms, pairChannels, singleInputs, tokenChannels, tokenHeads,
             multiplier, atomChannels, atomHeads, atomBlocks, atomHidden, window } = shape;
     const pairs = tokens * tokens;
@@ -1021,7 +1021,6 @@ export class Esmfold2DenoiserGpu {
     b.ranges = this.#upload("esmfold2.diff.ranges", ranges);
     b.atomToToken = this.#upload("esmfold2.diff.atom-to-token",
       Int32Array.from(features.atomToToken));
-    b.sInputs = this.#upload("esmfold2.diff.s-inputs", sInputs);
     b.joined = this.#alloc("esmfold2.diff.joined-coords", atoms * 6,
                            storage | GPUBufferUsage.COPY_DST);
     b.noise = this.#alloc("esmfold2.diff.noise", tokenChannels,
@@ -1297,50 +1296,73 @@ export class Esmfold2DenoiserGpu {
     // are 56 MiB of chunk-sized buffers standing beside the twelve per-block
     // pair biases that are allocated next. This allocator does not pool -
     // release DESTROYS - so where a release sits is where the peak is.
-    for (const allocation of [scratchA, scratchB, scratchG]) {
+    const condTemps = [
+      scratchA, scratchB, scratchG,
+      zInputNormScale, zInputNormOffset, zProjection,
+      ...zTransitions.flatMap((t) => [
+        t.normScale, t.normOffset, t.aProjection, t.bProjection, t.outProjection,
+      ]),
+    ];
+    for (const allocation of condTemps) {
       allocation.release();
       this.allocations.splice(this.allocations.indexOf(allocation), 1);
     }
 
     b.bias = weights.tokenBlocks.map((_, index) =>
       this.#alloc(`esmfold2.diff.bias.${index}`, pairs * tokenHeads));
+    const biasTemps = [scratchNorm];
+    const biasPasses = [];
     for (let index = 0; index < weights.tokenBlocks.length; index += 1) {
       const block = weights.tokenBlocks[index].attention;
       const scale = upload(`b${index}.pair-norm-scale`, block.pairNormScale);
       const offset = upload(`b${index}.pair-norm-offset`, block.pairNormOffset);
       const projection = upload(`b${index}.pair-bias`, block.pairBiasWeights);
+      biasTemps.push(scale, offset, projection);
       for (let start = 0; start < pairs; start += chunk) {
         const rows = Math.min(chunk, pairs - start);
         const p = pipelines.pair[rows];
-        await this.#now(`esmfold2.diff.bias.${index}`, [
+        biasPasses.push(
           ["bias-norm", p.norm,
            [slice(b.pairCond, start, rows, pairChannels), scale, offset, scratchNorm],
            ...perRow(rows)],
           ["bias-project", p.bias,
            [scratchNorm, projection, slice(b.bias[index], start, rows, tokenHeads)],
            ...linearGrid(rows, tokenHeads)],
-        ], false);
+        );
       }
     }
-    await this.device.queue.onSubmittedWorkDone();
-    scratchNorm.release();
-    this.allocations.splice(this.allocations.indexOf(scratchNorm), 1);
+    await this.#now("esmfold2.diff.bias", biasPasses);
+    if (reuseRelPos) {
+      releaseRelPos?.();
+    } else {
+      biasTemps.push(b.pairCond);
+    }
+    b.pairCond = undefined;
+    for (const allocation of biasTemps) {
+      allocation.release();
+      this.allocations.splice(this.allocations.indexOf(allocation), 1);
+    }
 
     // ---- the single conditioning's noise-independent half, once.
     b.singleBase = this.#alloc("esmfold2.diff.single-base", tokens * tokenChannels,
                                storage | GPUBufferUsage.COPY_SRC);
+    const sInputsBuf = this.#upload("esmfold2.diff.s-inputs", sInputs);
+    const sInputNormScale = upload("s-input-norm-scale", condition.sInputNormScale);
+    const sInputNormOffset = upload("s-input-norm-offset", condition.sInputNormOffset);
+    const sProjection = upload("s-projection", condition.sProjection);
     const sNormScratch = this.#alloc("esmfold2.diff.s-input-norm", tokens * singleInputs);
     await this.#now("esmfold2.diff.single-base", [
       ["s-input-norm", pipelines.sInputNorm,
-       [b.sInputs, upload("s-input-norm-scale", condition.sInputNormScale),
-        upload("s-input-norm-offset", condition.sInputNormOffset), sNormScratch],
+       [sInputsBuf, sInputNormScale, sInputNormOffset, sNormScratch],
        ...perRow(tokens)],
       ["s-project", pipelines.sProject,
-       [sNormScratch, upload("s-projection", condition.sProjection), b.singleBase],
+       [sNormScratch, sProjection, b.singleBase],
        ...linearGrid(tokens, tokenChannels)],
     ]);
-    sNormScratch.release();
-    this.allocations.splice(this.allocations.indexOf(sNormScratch), 1);
+    for (const allocation of [sInputsBuf, sInputNormScale, sInputNormOffset, sProjection, sNormScratch]) {
+      allocation.release();
+      this.allocations.splice(this.allocations.indexOf(allocation), 1);
+    }
 
     // ---- the atom stacks' adaLN modulations, which depend on cBase alone.
     const siluCondScratch = this.#alloc("esmfold2.diff.atom-silu-cond", atoms * atomChannels);
