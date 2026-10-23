@@ -397,6 +397,53 @@ int main() {
     else { ++failures; printf("  gate residual: FAIL (not taken)\n"); }
     release(dX); release(dW); release(dg); release(dA);
   }
+  for (bool chained : {false, true}) {   // gated residual + emitted periodic adaLN (128 wide, unchained & chained)
+    size_t rows = 195, period = 65; int K = 128, O = 128, ld = 256;
+    auto X = randv(rows * K), W = randv((size_t)K * O, 0.1f), gate = randv(period * ld), A0 = randv(rows * O);
+    auto sc1 = randv(period * O), of1 = randv(period * O), sc2 = randv(period * O), of2 = randv(period * O);
+    std::vector<double> ref(A0.begin(), A0.end()), refLn1(rows * O), refLn2(rows * O);
+    for (size_t r = 0; r < rows; ++r) {
+      double m = 0, var = 0;
+      for (int o = 0; o < O; ++o) {
+        double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+        ref[r * O + o] += (0.5 * s) * gate[(r % period) * ld + o];
+        m += ref[r * O + o];
+      }
+      m /= O;
+      for (int o = 0; o < O; ++o) { double d = ref[r * O + o] - m; var += d * d; }
+      double inv = 1.0 / sqrt(var / O + 1e-5);
+      size_t pr = (r % period) * O;
+      double m2 = 0, var2 = 0;
+      for (int o = 0; o < O; ++o) {
+        double nrm = (ref[r * O + o] - m) * inv;
+        double y1 = nrm * sc1[pr + o] + of1[pr + o];
+        refLn1[r * O + o] = y1;
+        if (!chained) refLn2[r * O + o] = nrm * sc2[pr + o] + of2[pr + o];
+        else m2 += y1;
+      }
+      if (chained) {
+        m2 /= O;
+        for (int o = 0; o < O; ++o) { double d = refLn1[r * O + o] - m2; var2 += d * d; }
+        double inv2 = 1.0 / sqrt(var2 / O + 1e-5);
+        for (int o = 0; o < O; ++o) refLn2[r * O + o] = (refLn1[r * O + o] - m2) * inv2 * sc2[pr + o] + of2[pr + o];
+      }
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
+    float* dg = uploadNew(gate.data(), gate.size()); float* dA = uploadNew(A0.data(), A0.size());
+    float *dsc1 = uploadNew(sc1.data(), sc1.size()), *dof1 = uploadNew(of1.data(), of1.size());
+    float *dsc2 = uploadNew(sc2.data(), sc2.size()), *dof2 = uploadNew(of2.data(), of2.size());
+    half *dLn1 = allocT<half>(rows * O), *dLn2 = allocT<half>(rows * O);
+    bool emitted = false;
+    gemmGateResidual(dX, dW, dA, rows, rows, K, O, dg, ld, period, 0.5f, "gate res ln", true,
+                     dLn1, dsc1, dof1, 1e-5f, dLn2, dsc2, dof2, chained, &emitted);
+    report(chained ? "gate residual + adaLN (chained): act" : "gate residual + adaLN: act", relRms(ref, download(dA, rows * O)), 1e-3);
+    if (emitted) {
+      auto h1 = download(dLn1, rows * O), h2 = download(dLn2, rows * O);
+      report(chained ? "gate residual + adaLN (chained): ln1" : "gate residual + adaLN: ln1", relRms(refLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+      report(chained ? "gate residual + adaLN (chained): ln2" : "gate residual + adaLN: ln2", relRms(refLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+    }
+    release(dX); release(dW); release(dg); release(dA); release(dsc1); release(dof1); release(dsc2); release(dof2); release(dLn1); release(dLn2);
+  }
   {   // conditioning permuted store (AF3 diffusion conditioning)
     size_t valid = 135, prows = 144; int period = 45, K = 128, W = 128, BS = 3, O = BS * W, sigCols = 64;
     auto X = randv(prows * K), Wgt = randv((size_t)K * O, 0.1f), bias = randv(O);

@@ -138,18 +138,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let mean = total / f32(C_Z);
   ${varianceCode("C_Z", "pair[base + c]")}
   let inverse_std = inverseSqrt(variance + EPSILON);
-  var logit: array<f32, ${heads}>;
-  for (var head = 0u; head < HEADS; head += 1u) { logit[head] = 0.0; }
+  ${Array.from({ length: heads }, (_, h) => `var logit_${h} = 0.0;`).join("\n  ")}
   for (var c = 0u; c < C_Z; c += 1u) {
     let value = (pair[base + c] - mean) * inverse_std * weights[W_PAIR_SCALE + c]
       + weights[W_PAIR_OFFSET + c];
-    for (var head = 0u; head < HEADS; head += 1u) {
-      logit[head] += value * weights[W_PAIR_LOGITS + c * HEADS + head];
-    }
+    let w_base = W_PAIR_LOGITS + c * HEADS;
+    ${Array.from({ length: heads }, (_, h) => `logit_${h} += value * weights[w_base + ${h}u];`).join("\n    ")}
   }
-  for (var head = 0u; head < HEADS; head += 1u) {
-    attention[(head * TOKENS + i) * TOKENS + j] = logit[head] + 1.0e9 * (key_mask[j] - 1.0);
-  }
+  let mask_bias = 1.0e9 * (key_mask[j] - 1.0);
+  ${Array.from({ length: heads }, (_, h) => `attention[(${h}u * TOKENS + i) * TOKENS + j] = logit_${h} + mask_bias;`).join("\n  ")}
 }`;
 
   // ...and the softmax over j, one workgroup per (head, i), on those logits.
@@ -166,13 +163,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (slot >= HEADS * TOKENS) { return; }
   let local = local_id.x;
 
-  for (var j = local; j < TOKENS; j += 64u) {
-    logits[j] = attention[slot * TOKENS + j];
-  }
-  workgroupBarrier();
-
   var local_max = -3.0e38;
-  for (var j = local; j < TOKENS; j += 64u) { local_max = max(local_max, logits[j]); }
+  for (var j = local; j < TOKENS; j += 64u) {
+    let l = attention[slot * TOKENS + j];
+    logits[j] = l;
+    local_max = max(local_max, l);
+  }
   reduce[local] = local_max;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride >>= 1u) {

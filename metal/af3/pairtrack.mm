@@ -96,7 +96,7 @@ static void triangleT(T* pair, const Masks& m, int n, int C, const std::string& 
   half* xn = xs ? (half*)xs : pairLn(pair, P, C, pre + ".leftNormInput");
   Folded tg, gl;
   if (xs) {
-    tg = foldNorm("tg:" + pre, triGateWeight(pre, C), C, 4 * C, pre + ".leftNormInput", nullptr);
+    tg = foldNorm("tg:" + pre, triGateWeight(pre, C), C, 4 * C, pre + ".leftNormInput", nullptr, true);
     gl = foldNorm("gl:" + pre, Wh(pre + ".gatingLinear"), C, C, pre + ".leftNormInput", nullptr);
   }
   // the planes, their contraction, the centre norm and the gated add's value in pr.big (core's triContract: 0.63 GB at
@@ -138,13 +138,13 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
   Folded fb, fq;
   if (xs) {
     fb = foldNorm("gb:" + pre, Wh(pre + ".pairBiasProjection"), C, heads, pre + ".actNorm", nullptr);
-    fq = foldNorm("gq:" + pre, qkvgWeight(pre, C, Wd, true), C, 4 * Wd, pre + ".actNorm", qkvgBias(pre, Wd));
+    fq = foldNorm("gq:" + pre, qkvgWeight(pre, C, Wd, true), C, 4 * Wd, pre + ".actNorm", qkvgBias(pre, Wd), true);
   }
   // (rows padded to a whole 64-key tile with -inf, so the attention's last key tile needs no per-element mask)
   int stride = (n + 63) / 64 * 64;
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
-  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
+  if (fusedPairBias && (C == 64 || (C % 128 == 0 && C <= 512)) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
     bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
     run("af3_pair_bias", Grid{(uint32_t)((n + 7) / 8), (uint32_t)((n + 7) / 8), 1}, 256,
         PairBiasArgs{xn, xs ? fb.w : Wh(pre + ".pairBiasProjection"), xs ? fb.b : nullptr, nullptr, bias,
@@ -244,7 +244,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
   // both used to be a LayerNorm pass of their own past ~300 tokens)
   half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
-  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128) && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
+  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"));
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -252,7 +252,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
     half* in = inAll ? inAll + r0 * C : nullptr;
     const half* xs = in ? nullptr : sharedNorm(x);
     if (xs && foldTransition()) {     // (chai's shared input norm: this norm's affine folded into the SwiGLU's weights)
-      Folded f = foldNorm("tr:" + pre, wp, C, 2 * I, pre + ".inputLayerNorm", nullptr);
+      Folded f = foldNorm("tr:" + pre, wp, C, 2 * I, pre + ".inputLayerNorm", nullptr, true);
       gemmSwiglu(xs + r0 * C, f.w, g, r, C, I, f.b);
     } else {
       if (xs) {      // (the control: the affine on its rows)
@@ -372,7 +372,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   int stride = (n + 63) / 64 * 64;
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
-  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
+  if (fusedPairBias && (C == 64 || (C % 128 == 0 && C <= 512)) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
     Folded f;
     if (xs) f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
     bias = scratch<half>("st.bias", (size_t)heads * n * stride);

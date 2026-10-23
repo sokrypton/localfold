@@ -17,12 +17,30 @@ kernel void af3_affine_h(LF_ARGS(AffineHArgs)) {
 }
 kernel void af3_fold_rows(LF_ARGS(FoldRowsArgs)) {
   uint t = (uint)LF_INDEX;
+  if ((a.out_ & 3) == 0) {
+    uint out4 = a.out_ >> 2;
+    if (t >= a.in * out4) return;
+    uint k = lf_udiv(t, out4);
+    ((device half4*)a.out)[t] = half4(a.scale[k] * float4(((device const half4*)a.w)[t]));
+    return;
+  }
   if (t >= a.in * a.out_) return;
   uint k = lf_udiv(t, a.out_);
   a.out[t] = (half)(a.scale[k] * (float)a.w[t]);
 }
 kernel void af3_fold_bias(LF_ARGS(FoldBiasArgs)) {
   uint o = (uint)LF_INDEX;
+  if ((a.out_ & 3) == 0) {
+    uint out4 = a.out_ >> 2;
+    if (o >= out4) return;
+    float4 s = a.extra ? ((device const float4*)a.extra)[o] : float4(0.f);
+    if (a.offset) {
+      device const half4* w4 = (device const half4*)a.w + o;
+      for (uint k = 0; k < a.in; ++k) s += a.offset[k] * float4(w4[(ulong)k * out4]);
+    }
+    ((device float4*)a.bias)[o] = s;
+    return;
+  }
   if (o >= a.out_) return;
   float s = a.extra ? a.extra[o] : 0.f;
   if (a.offset) for (uint k = 0; k < a.in; ++k) s += a.offset[k] * (float)a.w[(ulong)k * a.out_ + o];
@@ -288,7 +306,7 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
   if (i0 >= a.n || j0 >= a.n) return;
   threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
   threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
-  if (a.C <= 128) {
+  if (a.C <= 128 || (a.C == 256 && a.H <= 4)) {
     if (a.H <= 8) {
       if (tid < a.C * (a.H <= 4 ? 1u : 2u)) Ws[tid] = *(device const half4*)(a.W + tid * 4);
     } else if (tid < a.C * 2) {
@@ -305,7 +323,7 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
   const bool valid0 = sr0 < a.n && sc < a.n;
   const bool valid1 = sr1 < a.n && sc < a.n;
 
-  if (a.H <= 4 && a.C <= 128) {
+  if (a.H <= 4 && a.C <= 256) {
     const uint c4_per_lane = a.C >> 5; // 4 when C=128, 2 when C=64
     const uint c4_base = tx * c4_per_lane;
     device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C) + c4_base;
@@ -680,8 +698,9 @@ kernel void af3_ada_ln_128(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
                        : float4(((device const half4*)(a.resYh + row * 128))[lane]) * a.resScale;
     float4 rg = ((device const float4*)(a.resGate + gpr))[lane];
     xv += ry * (rawG ? rg : float4(lf_sigmoid(rg.x), lf_sigmoid(rg.y), lf_sigmoid(rg.z), lf_sigmoid(rg.w)));
-    x4[lane] = xv;
   }
+  if (a.rowMask) xv *= a.rowMask[prRow];
+  if (a.resY || a.resYh || a.rowMask) x4[lane] = xv;
   float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) / 128.f;
   float4 d = xv - mean;
   float inv = rsqrt(simd_sum(d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w) / 128.f + a.eps);
@@ -807,6 +826,7 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
   float s = 0.f;
+  const float rm = a.rowMask ? a.rowMask[prRow] : 1.f;
   if (a.resY || a.resYh) {
     device const float* ry = a.resY ? a.resY + row * a.C : nullptr;
     device const half* ryh = a.resYh ? a.resYh + row * a.C : nullptr;
@@ -814,9 +834,12 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
     for (uint c = lane; c < a.C; c += 32) {
       float yv = ry ? ry[c] : (float)ryh[c] * a.resScale;
       float val = x[c] + yv * (rawG ? rg[c] : lf_sigmoid(rg[c]));
+      if (a.rowMask) val *= rm;
       x[c] = val;
       s += val;
     }
+  } else if (a.rowMask) {
+    for (uint c = lane; c < a.C; c += 32) { float val = x[c] * rm; x[c] = val; s += val; }
   } else {
     for (uint c = lane; c < a.C; c += 32) s += x[c];
   }
@@ -922,7 +945,9 @@ kernel void af3_atom_attention(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg 
       float acc = 0.f;
       for (uint key = 0; key < a.keys; ++key) acc += Ps[sg][key] * (float)Vs[key * LD + e];
       float g = (float)a.qg[qrow * W2 + Wd + h * D + e];
-      a.out[qrow * Wd + h * D + e] = (half)(acc * inv * lf_sigmoid(g));
+      half yh = (half)(acc * inv * lf_sigmoid(g));
+      if (a.act) a.act[qrow * Wd + h * D + e] += (float)yh * 2.f * a.zg[((ulong)ss * a.queries + qi) * Wd + h * D + e];
+      else a.out[qrow * Wd + h * D + e] = yh;
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1611,8 +1636,21 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
     }
   const ulong qrow = (ulong)s * Q + q;
   device const half* g = a.qg + qrow * W2 + Wd + h * D;
-  device half* out = a.out + qrow * Wd + h * D;
   const float inv = 1.f / sum;
+  if (a.act) {
+    device float* actOut = a.act + qrow * Wd + h * D;
+    device const float* zg = a.zg + ((ulong)ss * Q + q) * Wd + h * D;
+    _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) {
+      thread auto& oe = o[c].thread_elements();
+      const int d = c * 8 + sn;
+      half2 gv = *(device const half2*)(g + d);
+      half2 yh(half(oe[0] * inv * lf_sigmoid((float)gv.x)), half(oe[1] * inv * lf_sigmoid((float)gv.y)));
+      float2 zv = *(device const float2*)(zg + d);
+      *(device float2*)(actOut + d) += float2(yh) * 2.f * zv;
+    }
+    return;
+  }
+  device half* out = a.out + qrow * Wd + h * D;
   _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) {
     thread auto& oe = o[c].thread_elements();
     const int d = c * 8 + sn;

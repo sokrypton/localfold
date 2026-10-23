@@ -43,18 +43,53 @@ static void attentionWeight(const std::string& A, int C, bool transposedQkg) {
   retire({A + ".qProjection", A + ".kProjection", A + ".vProjection", A + ".gatingQuery"});
 }
 // a pairformer / MSA / template block's pair track, and its single track where it has one
-static void blockWeights(const std::string& pre) {
+static void blockWeights(const std::string& pre, bool foldParallel) {
   int C = (int)lenW(pre + ".triangleMultiplicationOutgoing.leftNormInputScale");
   for (const char* dir : {".triangleMultiplicationOutgoing", ".triangleMultiplicationIncoming"}) {
-    triGateWeight(pre + dir, C);
-    retire({pre + dir + ".projection", pre + dir + ".gate"});
+    std::string d = pre + dir;
+    const half* tw = triGateWeight(d, C);
+    retire({d + ".projection", d + ".gate"});
+    if (foldParallel) {
+      foldNorm("tg:" + d, tw, C, 4 * C, d + ".leftNormInput", nullptr, true);
+      foldNorm("gl:" + d, Wh(d + ".gatingLinear"), C, C, d + ".leftNormInput", nullptr);
+    }
   }
-  for (const char* a : {".pairAttention1", ".pairAttention2"}) attentionWeight(pre + a, C, true);
-  transitionWeight(pre + ".pairTransition");
+  for (const char* a : {".pairAttention1", ".pairAttention2"}) {
+    std::string A = pre + a;
+    int Wd = (int)(lenW(A + ".vProjection") / C);
+    const half* qw = qkvgWeight(A, C, Wd, true);
+    retire({A + ".qProjection", A + ".kProjection", A + ".vProjection", A + ".gatingQuery"});
+    if (foldParallel) {
+      int heads = metaI(A + ".heads");
+      foldNorm("gb:" + A, Wh(A + ".pairBiasProjection"), C, heads, A + ".actNorm", nullptr);
+      foldNorm("gq:" + A, qw, C, 4 * Wd, A + ".actNorm", qkvgBias(A, Wd), true);
+    }
+    if (!pre.compare(0, 11, "confidence.") && hasW(A + ".outputProjectionTransposed")) {
+      M.derived<half>("dual:" + A, (size_t)Wd * C, [&](half* out) {
+        float* sum = allocT<float>((size_t)Wd * C);
+        copy(sum, W(A + ".outputProjection"), (size_t)Wd * C * 4);
+        add(sum, W(A + ".outputProjectionTransposed"), (size_t)Wd * C);
+        toHalf(sum, out, (size_t)Wd * C);
+        release(sum);
+      });
+    }
+  }
+  if (hasW(pre + ".pairTransition.transition1")) {
+    std::string T = pre + ".pairTransition";
+    int I = (int)(lenW(T + ".transition1") / (2 * (size_t)C));
+    const half* sw = swigluPairs(T + ".transition1", C, I);
+    retire({T + ".transition1"});
+    static const bool ft = !getenv("LOCALFOLD_FOLD_TRANSITION") || atoi(getenv("LOCALFOLD_FOLD_TRANSITION")) != 0;
+    if (foldParallel && ft) foldNorm("tr:" + T, sw, C, 2 * I, T + ".inputLayerNorm", nullptr, true);
+  }
   transitionWeight(pre + ".msaTransition");
   if (hasW(pre + ".singleAttention.qProjection")) {
     attentionWeight(pre + ".singleAttention", (int)lenW(pre + ".singleAttention.layerNormScale"), false);
     transitionWeight(pre + ".singleTransition");
+    if (foldParallel && hasW(pre + ".singlePairLogitsProjection")) {
+      int heads = metaI(pre + ".singleAttention.heads");
+      foldNorm("sp:" + pre, Wh(pre + ".singlePairLogitsProjection"), C, heads, pre + ".singlePairLogitsNorm", nullptr);
+    }
   }
 }
 static void atomBlocks(const std::string& E) {
@@ -71,9 +106,14 @@ static void atomBlocks(const std::string& E) {
 }
 
 void prepareWeights() {
+  const bool parallel = flag("trunk.dialect.parallelPairformer") &&
+                        (!getenv("LOCALFOLD_FOLD_NORM") || atoi(getenv("LOCALFOLD_FOLD_NORM")) != 0);
   for (const char* stack : {"trunk.pairformerBlocks.", "trunk.msaBlocks.", "trunk.template.blocks.", "confidence.blocks.",
-                            "refiner.blocks.", "ddeConfidence.blocks."})
-    for (int k = 0; M.has(stack + num(k) + ".triangleMultiplicationOutgoing.projection"); ++k) blockWeights(stack + num(k));
+                            "refiner.blocks.", "ddeConfidence.blocks."}) {
+    const bool foldStack = parallel && strcmp(stack, "trunk.template.blocks.") != 0;
+    for (int k = 0; M.has(stack + num(k) + ".triangleMultiplicationOutgoing.projection"); ++k)
+      blockWeights(stack + num(k), foldStack);
+  }
   for (const char* E : {"targetFeat.encoder", "diffusion.encoder", "diffusion.decoder"}) atomBlocks(E);
   // the diffusion conditioning's plain transitions
   const std::string P = "diffusion.conditioning";

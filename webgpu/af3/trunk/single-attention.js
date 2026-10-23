@@ -381,6 +381,7 @@ ${overThread((b) => `  q[out_base + ${b * projectLanes}u] = q_total_${b};
 @group(0) @binding(4) var<storage, read> seq_mask: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gathered: array<f32>;
 
+var<workgroup> staged_q: array<f32, ${dimension}>;
 var<workgroup> logits: array<f32, ${n}>;
 var<workgroup> reduce: array<f32, 64>;
 
@@ -393,20 +394,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let i = slot / HEADS;
   let local = local_id.x;
   let query_base = i * WIDTH + head * DIMENSION;
-
-  for (var j = local; j < N; j += 64u) {
-    let key_base = j * WIDTH + head * DIMENSION;
-    var dot = 0.0;
-    for (var d = 0u; d < DIMENSION; d += 1u) {
-      dot += q[query_base + d] * k[key_base + d];
-    }
-    logits[j] = dot * SCALE + pair_logits[head * N * N + i * N + j]
-      + 1.0e9 * (seq_mask[j] - 1.0);
+  for (var d = local; d < DIMENSION; d += 64u) {
+    staged_q[d] = q[query_base + d];
   }
   workgroupBarrier();
 
   var local_max = -3.0e38;
-  for (var j = local; j < N; j += 64u) { local_max = max(local_max, logits[j]); }
+  for (var j = local; j < N; j += 64u) {
+    let key_base = j * WIDTH + head * DIMENSION;
+    var dot = 0.0;
+    for (var d = 0u; d < DIMENSION; d += 1u) {
+      dot += staged_q[d] * k[key_base + d];
+    }
+    let l = dot * SCALE + pair_logits[head * N * N + i * N + j]
+      + 1.0e9 * (seq_mask[j] - 1.0);
+    logits[j] = l;
+    local_max = max(local_max, l);
+  }
   reduce[local] = local_max;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride >>= 1u) {

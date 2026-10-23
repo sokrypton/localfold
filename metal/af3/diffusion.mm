@@ -436,10 +436,10 @@ static float* atomDecoder(const half* tokenAct) {
   float* proj = scratch<float>("dec.proj", prows * C);
   lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, prows, D.decPerToken, C);
   float* act = scratch<float>("dec.act", qRows * C);
-  AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
-              flag(Dd + ".blocks.0.diffusionNoResidual")};
   bool maskPerBlock = flag(Dd + ".blocks.0.maskAtomActPerBlock");
-  const bool fuse0 = C == 128 && !maskPerBlock && !D.decBlocks.empty();
+  AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
+              flag(Dd + ".blocks.0.diffusionNoResidual"), maskPerBlock};
+  const bool fuse0 = C == 128 && !D.decBlocks.empty();
   half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
   half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
   half* tn0 = (fuse0 && st.noResidual) ? scratch<half>("ab.tn", qRows * C) : nullptr;
@@ -452,10 +452,12 @@ static float* atomDecoder(const half* tokenAct) {
                           qRows, q1, (uint)C, (uint)sh.tokens, (uint)sh.dense, 0,
                           ADA_RAW ? 0.1f : 1e-5f, b0 && b0->chained ? 1u : 0u});
   const float* pendY = nullptr; const float* pendGate = nullptr;
+  bool preQk = fuse0;
   for (size_t b = 0; b < D.decBlocks.size(); ++b) {
-    if (maskPerBlock) scaleRows(act, D.enc.qMask, qRows, C, q1);
+    bool nextQk = false;
     crossAttentionBlock(act, st, D.decBlocks[b], sh, C, D.decHeads, D.decD, Dd + ".blocks." + num(b),
-                        &pendY, &pendGate, !maskPerBlock, b == 0 && fuse0);
+                        &pendY, &pendGate, true, preQk, b + 1 < D.decBlocks.size() ? &D.decBlocks[b + 1] : nullptr, &nextQk);
+    preQk = nextQk;
   }
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) die("decoder: the position update is not C x 3");
   float* upd = scratch<float>("dec.upd", qRows * 3);

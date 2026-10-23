@@ -337,7 +337,12 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   int heads = metaI(pre + ".heads"), d = metaI(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
   half* xn = scratch<half>("msaatt.ln", rows * Cm);
-  if (!preNormed) ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  if (!preNormed && !parallelTransition.empty()) {
+    half* txn = scratch<half>("msatr.xn", rows * Cm);
+    layerNormDual(t.msa, xn, W(pre + ".actNormScale"), Wopt(pre + ".actNormOffset"),
+                  txn, W(parallelTransition + ".inputLayerNormScale"), Wopt(parallelTransition + ".inputLayerNormOffset"), rows, Cm);
+    emitPairLn(2, t.msa, parallelTransition + ".inputLayerNorm", txn);
+  } else if (!preNormed) ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
   if (!parallelTransition.empty()) transition(t.msa, rows, Cm, parallelTransition, nullptr, "", "", "msatr.");
   half* pln = pairLn(t.pair, pairs, C, pre + ".pairNorm", nextPairNorm);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
@@ -377,9 +382,9 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
 // chai-1's GROUPED outer product: L, R = LN(m) Wl, Wr reshaped [S][n][G][K], masked; P[i,j,g,k,l] = sum_s L[s,i,g,k]
 // R[s,j,g,l] - NOT divided by any count; P = LN(P; eps 0.1) over its G K K; pair += P Wout + b. float32 throughout: the
 // sum grows with the alignment's depth before the norm
-static void linF(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr) {
+static void linF(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr, float beta = 0.f) {
   if (lenW(w) != (size_t)in * out) die("%s has %zu elements, not %d x %d", w.c_str(), lenW(w), in, out);
-  Gemm g{}; g.X = X; g.W = W(w); g.Y = Y; g.rows = rows; g.in = in; g.out = out; g.bias = bias; g.label = w.c_str();
+  Gemm g{}; g.X = X; g.W = W(w); g.Y = Y; g.rows = rows; g.in = in; g.out = out; g.bias = bias; g.beta = beta; g.label = w.c_str();
   gemm(g);
 }
 static void groupedOuterProduct(Trunk& t, const std::string& pre) {
@@ -396,8 +401,6 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
   run1d("af3_group_major", rows * O, GroupMajorArgs{R, t.msaMask, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, ((size_t)16 << 20) / ((size_t)n * per * 2 + (size_t)n * C)));
   float* Pm = scratch<float>("gopm.P", (size_t)Bi * n * per); float* Pp = scratch<float>("gopm.Pp", (size_t)Bi * n * per);
-  float* Pn = scratch<float>("gopm.Pn", (size_t)Bi * n * per);
-  float* X = scratch<float>("gopm.X", (size_t)Bi * n * C);
   for (int i0 = 0; i0 < n; i0 += Bi) {
     int bi = std::min(Bi, n - i0);
     // per group: P_g [(i, k)][(j, l)] = sum_s Lg[s][(i, k)] Rg[s][(j, l)]
@@ -405,9 +408,8 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
       g.sw = (int64_t)S * n * K; g.Y = Pm; g.sy = (int64_t)bi * K * n * K; g.rows = (size_t)bi * K; g.in = S; g.out = n * K; g.batch = G;
       g.label = "grouped opm"; gemm(g); }
     run1d("af3_grouped_permute", (size_t)bi * n * per, GroupedPermuteArgs{Pm, Pp, (uint)bi, (uint)n, (uint)G, (uint)K});
-    layerNorm(Pp, Pn, (size_t)bi * n, per, W(pre + ".productNormScale"), W(pre + ".productNormOffset"), 0.1f);
-    linF(Pn, pre + ".outputW", X, (size_t)bi * n, per, C, W(pre + ".outputB"));
-    add(t.pair + (size_t)i0 * n * C, X, (size_t)bi * n * C);
+    layerNorm(Pp, Pm, (size_t)bi * n, per, W(pre + ".productNormScale"), W(pre + ".productNormOffset"), 0.1f);
+    linF(Pm, pre + ".outputW", t.pair + (size_t)i0 * n * C, (size_t)bi * n, per, C, W(pre + ".outputB"), 1.f);
   }
 }
 static void msaBlock(Trunk& t, int k, int msaBlocks) {
@@ -451,7 +453,7 @@ void runTrunk(Trunk& t) {
   if (zIn) add(t.pair, zIn, pairs * t.C);
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   // (and the MSA stack's pair-track scratch: the stack's half pair is made beside the f32 one before its blocks make theirs)
-  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st."});
+  if (reclaim) releaseScratch({"msaatt.", "msatr.", "opm.", "gopm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st.", "par."});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
   // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Every residual is summed in
@@ -469,7 +471,7 @@ void runTrunk(Trunk& t) {
       pairformerBlock(zh, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
     if (reclaim) {
-      releaseScratch({"pr.", "grid.", "tr.", "st."});
+      releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
       t.pair = allocT<float>(pairs * t.C);
     }
     toFloat(zh, t.pair, pairs * t.C);
@@ -479,7 +481,7 @@ void runTrunk(Trunk& t) {
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
-  if (reclaim) releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
+  if (reclaim) releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 
 // ---------------------------------------------------------------- the distogram

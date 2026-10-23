@@ -60,7 +60,8 @@ const half* qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg
 // own column order, so a derived (interleaved, quartered) weight folds as it is: LN(x) w = xhat (diag(scale) w) +
 // offset w. extra: a bias w already had (or null). Derived once, under key
 struct Folded { const half* w = nullptr; const float* b = nullptr; };
-Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra);
+Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra,
+                bool inPlace = false);
 const float* qkvgBias(const std::string& pre, int Wd);
 
 // ---------------------------------------------------------------- the pair track (pairtrack.mm)
@@ -156,18 +157,18 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
 std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
                                    const AtomShape& sh);
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);
-struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMasked, noResidual; };
+struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMasked, noResidual, maskPerBlock = false; };
 // chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space
 void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
                          const std::string& B, const float** pendY = nullptr, const float** pendGate = nullptr, bool deferFfwRes = false,
-                         bool precomputedQk = false);
+                         bool precomputedQk = false, const AtomBlockCache* nextBc = nullptr, bool* emittedNextQk = nullptr);
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
            int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,
            const float* resY = nullptr, const float* resGate = nullptr, int resLd = 0, const half* resYh = nullptr,
            float resScale = 1.f, bool preSigmoid = true, const float* fScale = nullptr, const float* fShift = nullptr,
-           half* fOut = nullptr);
+           half* fOut = nullptr, const float* rowMask = nullptr);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
 // how far a template.pdb record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at

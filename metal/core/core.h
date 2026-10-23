@@ -152,7 +152,10 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // caller's product and residual still to do). LOCALFOLD_GATE_RES=0 the control
 bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, size_t rows, int in, int out,
                       const float* gate, int ld, size_t period, float alpha, const char* label = nullptr,
-                      bool preSigmoid = false);
+                      bool preSigmoid = false, half* lnOut = nullptr, const float* lnScale = nullptr,
+                      const float* lnOffset = nullptr, float lnEps = 1e-5f, half* lnOut2 = nullptr,
+                      const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr, bool chained = false,
+                      bool* lnEmitted = nullptr);
 bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
                       const float* bias, int period, int width, int sigCols, const char* label = nullptr);
 bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label = nullptr);

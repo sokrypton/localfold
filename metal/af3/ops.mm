@@ -73,13 +73,25 @@ const half* swigluPairs(const std::string& name, int rows, int I) {
     run1d("af3_interleave8", (size_t)rows * (I >> 2), Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
   });
 }
-Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra) {
+Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra, bool inPlace) {
   Folded f;
+  if (inPlace) {
+    f.b = M.derived<float>("foldb:" + key, (size_t)out, [&](float* o) {
+      run1d("af3_fold_bias", (out & 3) ? (size_t)out : (size_t)(out >> 2),
+            FoldBiasArgs{w, Wopt(norm + "Offset"), extra, o, (uint)in, (uint)out, 0, 0});
+      run1d("af3_fold_rows", (out & 3) ? (size_t)in * out : (size_t)in * (out >> 2),
+            FoldRowsArgs{w, W(norm + "Scale"), (half*)w, (uint)in, (uint)out, 0, 0});
+    });
+    f.w = w;
+    return f;
+  }
   f.w = M.derived<half>("fold:" + key, (size_t)in * out, [&](half* o) {
-    run1d("af3_fold_rows", (size_t)in * out, FoldRowsArgs{w, W(norm + "Scale"), o, (uint)in, (uint)out, 0, 0});
+    run1d("af3_fold_rows", (out & 3) ? (size_t)in * out : (size_t)in * (out >> 2),
+          FoldRowsArgs{w, W(norm + "Scale"), o, (uint)in, (uint)out, 0, 0});
   });
   f.b = M.derived<float>("foldb:" + key, (size_t)out, [&](float* o) {
-    run1d("af3_fold_bias", (size_t)out, FoldBiasArgs{w, Wopt(norm + "Offset"), extra, o, (uint)in, (uint)out, 0, 0});
+    run1d("af3_fold_bias", (out & 3) ? (size_t)out : (size_t)(out >> 2),
+          FoldBiasArgs{w, Wopt(norm + "Offset"), extra, o, (uint)in, (uint)out, 0, 0});
   });
   return f;
 }

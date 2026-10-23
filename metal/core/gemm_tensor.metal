@@ -242,35 +242,172 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   if constexpr ((EP & 128) != 0) {
     static_assert((TM % 16 == 0 && TN % 32 == 0),
                   "the vector epilogue requires 16-row by 32-column multiple tiles");
-    static_assert((EP & 64) == 0 || ((TM * TN == 8192 || TM * TN == 4096) && !metal::is_same_v<TACC, half>), "the emitted LayerNorm: 64 x 128, 32 x 128, 32 x 256, or 16 x 256, float");
+    static_assert((EP & 64) == 0 || ((TM * TN == 8192 || TM * TN == 4096) && (!metal::is_same_v<TACC, half> || (TM == 64 && TN == 128))),
+                  "the emitted LayerNorm: 64 x 128, 32 x 256, or 16 x 256");
     if constexpr (metal::is_same_v<TC, float> && metal::is_same_v<TACC, half>) {
       if constexpr (TM == 64 && TN == 128) {
+        constexpr int NR = 4;
         const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
         const bool fullM = i0 + TN <= g.m;
+        const int jLim = min(g.n, (int)g.tgPairs);
         const ushort4 bs(0, 4, 32, 36);
-        _Pragma("clang loop unroll(full)")
-        for (int r_idx = 0; r_idx < 4; ++r_idx) {
-          const uint16_t er = bs[r_idx];
-          const int j = j0 + c.get_multidimensional_index(er)[1];
-          if (j >= g.tgPairs) continue;
-          const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
-          device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
-          device const float* cp0 = C + (ulong)j * g.ldc;
-          device float* dp0 = D + (ulong)j * g.ldd;
+        if constexpr ((EP & 64) == 0) {
           _Pragma("clang loop unroll(full)")
-          for (int k = 0; k < 4; ++k) {
-            const int i = col0 + k * 32;
-            if (fullM || i < g.m) {
-              const uint16_t e = er + k * 8;
-              const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-              const float4 gp = *(device const float4*)(gp0 + i);
-              const float4 cv = *(device const float4*)(cp0 + i);
-              const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-              *(device float4*)(dp0 + i) = cv + v * gm;
+          for (int r_idx = 0; r_idx < NR; ++r_idx) {
+            const uint16_t er = bs[r_idx];
+            const int j = j0 + c.get_multidimensional_index(er)[1];
+            if (j >= jLim) continue;
+            const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+            device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+            device const float* cp0 = C + (ulong)j * g.ldc;
+            device float* dp0 = D + (ulong)j * g.ldd;
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              if (fullM || i < g.m) {
+                const uint16_t e = er + k * 8;
+                const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                const float4 gp = *(device const float4*)(gp0 + i);
+                const float4 cv = *(device const float4*)(cp0 + i);
+                const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+                *(device float4*)(dp0 + i) = cv + v * gm;
+              }
             }
           }
+          return;
+        } else {
+          threadgroup float part[512];
+          const uint sg = tid >> 5, first = sg & ~1u, lane = tid & 31;
+          float4 xv[NR][4];
+          int j_row[NR];
+          uint r_row[NR];
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < NR; ++r_idx) {
+            const uint16_t er = bs[r_idx];
+            const int j = j0 + c.get_multidimensional_index(er)[1];
+            j_row[r_idx] = j;
+            float s = 0.f;
+            if (j < jLim) {
+              const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+              r_row[r_idx] = r;
+              device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+              device const float* cp0 = C + (ulong)j * g.ldc;
+              device float* dp0 = D + (ulong)j * g.ldd;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const int i = col0 + k * 32;
+                const uint16_t e = er + k * 8;
+                const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+                const float4 gp = *(device const float4*)(gp0 + i);
+                const float4 cv = *(device const float4*)(cp0 + i);
+                const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+                const float4 res = cv + v * gm;
+                *(device float4*)(dp0 + i) = res;
+                xv[r_idx][k] = res;
+                s += res.x + res.y + res.z + res.w;
+              }
+            }
+            s += simd_shuffle_xor(s, 1);
+            s += simd_shuffle_xor(s, 8);
+            if ((lane & 9) == 0) part[(0 * 4 + sg) * 64 + (j - j0)] = s;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float mean[NR];
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < NR; ++r_idx) {
+            const int rtile = j_row[r_idx] - j0;
+            const float m = (part[(0 * 4 + first) * 64 + rtile] + part[(0 * 4 + first + 1) * 64 + rtile]) * (1.f / 128.f);
+            mean[r_idx] = m;
+            float v = 0.f;
+            if (j_row[r_idx] < jLim) {
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) { const float4 d = xv[r_idx][k] - m; v += dot(d, d); }
+            }
+            v += simd_shuffle_xor(v, 1);
+            v += simd_shuffle_xor(v, 8);
+            if ((lane & 9) == 0) part[(1 * 4 + sg) * 64 + rtile] = v;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float4 yv[NR][4];
+          float sk_row[NR];
+          _Pragma("clang loop unroll(full)")
+          for (int r_idx = 0; r_idx < NR; ++r_idx) {
+            sk_row[r_idx] = 0.f;
+            const int j = j_row[r_idx];
+            if (j >= jLim) continue;
+            const int rtile = j - j0;
+            const float inv = rsqrt((part[(1 * 4 + first) * 64 + rtile] + part[(1 * 4 + first + 1) * 64 + rtile]) * (1.f / 128.f) + g.lnEps);
+            const ulong pr = (ulong)r_row[r_idx] * 128;
+            device const float* sc0 = (device const float*)g.lnScale + pr;
+            device const float* of0 = g.lnOffset ? (device const float*)g.lnOffset + pr : nullptr;
+            device half* out0 = (device half*)g.lnOut + (ulong)j * 128;
+            device const float* ksc0 = g.lnOut2 ? (device const float*)g.lnScale2 + pr : nullptr;
+            device const float* kof0 = (g.lnOut2 && g.lnOffset2) ? (device const float*)g.lnOffset2 + pr : nullptr;
+            device half* kout0 = g.lnOut2 ? (device half*)g.lnOut2 + (ulong)j * 128 : nullptr;
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              const float4 nrm = (xv[r_idx][k] - mean[r_idx]) * inv;
+              const float4 y = *(device const float4*)(sc0 + i) * nrm + (of0 ? *(device const float4*)(of0 + i) : float4(0.f));
+              *(device half4*)(out0 + i) = half4(y);
+              if (g.lnOut2) {
+                if (!g.lnPad) {
+                  const float4 ky = *(device const float4*)(ksc0 + i) * nrm + (kof0 ? *(device const float4*)(kof0 + i) : float4(0.f));
+                  *(device half4*)(kout0 + i) = half4(ky);
+                } else {
+                  yv[r_idx][k] = y;
+                  sk_row[r_idx] += y.x + y.y + y.z + y.w;
+                }
+              }
+            }
+          }
+          if (g.lnOut2 && g.lnPad) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < NR; ++r_idx) {
+              float s = sk_row[r_idx];
+              s += simd_shuffle_xor(s, 1);
+              s += simd_shuffle_xor(s, 8);
+              if ((lane & 9) == 0) part[(0 * 4 + sg) * 64 + (j_row[r_idx] - j0)] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float meank[NR];
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < NR; ++r_idx) {
+              const int rtile = j_row[r_idx] - j0;
+              const float mk = (part[(0 * 4 + first) * 64 + rtile] + part[(0 * 4 + first + 1) * 64 + rtile]) * (1.f / 128.f);
+              meank[r_idx] = mk;
+              float vk = 0.f;
+              if (j_row[r_idx] < jLim) {
+                _Pragma("clang loop unroll(full)")
+                for (int k = 0; k < 4; ++k) { const float4 dk = yv[r_idx][k] - mk; vk += dot(dk, dk); }
+              }
+              vk += simd_shuffle_xor(vk, 1);
+              vk += simd_shuffle_xor(vk, 8);
+              if ((lane & 9) == 0) part[(1 * 4 + sg) * 64 + rtile] = vk;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < NR; ++r_idx) {
+              const int j = j_row[r_idx];
+              if (j >= jLim) continue;
+              const int rtile = j - j0;
+              const float invk = rsqrt((part[(1 * 4 + first) * 64 + rtile] + part[(1 * 4 + first + 1) * 64 + rtile]) * (1.f / 128.f) + g.lnEps);
+              const ulong pr = (ulong)r_row[r_idx] * 128;
+              device const float* ksc0 = (device const float*)g.lnScale2 + pr;
+              device const float* kof0 = g.lnOffset2 ? (device const float*)g.lnOffset2 + pr : nullptr;
+              device half* kout0 = (device half*)g.lnOut2 + (ulong)j * 128;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const int i = col0 + k * 32;
+                const float4 ky = *(device const float4*)(ksc0 + i) * ((yv[r_idx][k] - meank[r_idx]) * invk) +
+                                  (kof0 ? *(device const float4*)(kof0 + i) : float4(0.f));
+                *(device half4*)(kout0 + i) = half4(ky);
+              }
+            }
+          }
+          return;
         }
-        return;
       }
       if constexpr (TM == 32 && TN == 64) {
         const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
@@ -617,9 +754,9 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       }
       const vec<TC, 4> st = lf_out4<TC>(v);
       *(device vec<TC, 4>*)dp = st;
-      if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
+      if constexpr ((EP & 64) != 0 && !metal::is_same_v<TACC, half>) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
     }
-    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN, true, (TM * (TN < 128 ? 128 : TN)) / 2048>(c, c, (device const TC*)D, part, tid, g, i0, j0); }
+    if constexpr ((EP & 64) != 0 && !metal::is_same_v<TACC, half>) { threadgroup float part[512]; lf_emit_ln<TN, true, (TM * (TN < 128 ? 128 : TN)) / 2048>(c, c, (device const TC*)D, part, tid, g, i0, j0); }
     return;
   }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1 - or a half output's scale -, beta
