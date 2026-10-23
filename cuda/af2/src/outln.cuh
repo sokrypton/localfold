@@ -29,7 +29,7 @@ __device__ __forceinline__ void mma16816bf(float* d, const uint32_t* a, uint32_t
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #endif
 }
-template <class M, class TO, class TI = M>
+template <class M, class TO, class TI = M, bool VG = false>
 __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, const TI* __restrict__ W,
     const float* __restrict__ bias, M* __restrict__ msa, const float* __restrict__ lnS,
     const float* __restrict__ lnO, TO* __restrict__ xn, size_t rows) {
@@ -37,6 +37,7 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   constexpr bool BF = std::is_same_v<M, __nv_bfloat16>;
   constexpr bool BFI = std::is_same_v<TI, __nv_bfloat16>;
   using M2 = std::conditional_t<BF, __nv_bfloat162, half2>;
+  using TI2 = std::conditional_t<BFI, __nv_bfloat162, half2>;
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, rg = warp & 3, chh = warp >> 2;
   const size_t row0 = (size_t)blockIdx.x * R;
@@ -45,7 +46,22 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   M* V = (M*)smem;
   constexpr int WPT = KC * C / 8 / NTH;
   auto issue = [&](int kc, int s) {
-    {   // A: 64 rows x 32 k, one 16-byte piece a thread
+    if constexpr (VG) {
+      const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
+      const size_t row = row0 + r;
+      const half* vg = reinterpret_cast<const half*>(O) + (row * 4 + 2) * C + kc * KC + c;
+      uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
+      uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
+      const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);
+      TI2 o4[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 vf = __half22float2(vh[i]), gf = __half22float2(gh[i]);
+        float x = vf.x * sigm(gf.x), y = vf.y * sigm(gf.y);
+        if constexpr (BFI) o4[i] = __floats2bfloat162_rn(x, y); else o4[i] = __floats2half2_rn(x, y);
+      }
+      *reinterpret_cast<uint4*>(As(s) + swA(r, c)) = *reinterpret_cast<const uint4*>(o4);
+    } else {   // A: 64 rows x 32 k, one 16-byte piece a thread
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
       cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
@@ -159,7 +175,7 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
   }
 }
-template <class M, class TO, class TI = M>
+template <class M, class TO, class TI = M, bool VG = false>
 __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, const TI* __restrict__ W,
     const float* __restrict__ bias, M* __restrict__ msa, const float* __restrict__ lnS,
     const float* __restrict__ lnO, TO* __restrict__ xn, size_t rows) {
@@ -169,6 +185,7 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
   constexpr bool BF = std::is_same_v<M, __nv_bfloat16>;
   constexpr bool BFI = std::is_same_v<TI, __nv_bfloat16>;
   using M2 = std::conditional_t<BF, __nv_bfloat162, half2>;
+  using TI2 = std::conditional_t<BFI, __nv_bfloat162, half2>;
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t row0 = (size_t)blockIdx.x * R16;
@@ -179,7 +196,22 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
     if (threadIdx.x < 64) {
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
-      cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+      if constexpr (VG) {
+        const half* vg = reinterpret_cast<const half*>(O) + (row * 4 + 2) * C + kc * KC + c;
+        uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
+        uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
+        const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);
+        TI2 o4[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          float2 vf = __half22float2(vh[i]), gf = __half22float2(gh[i]);
+          float x = vf.x * sigm(gf.x), y = vf.y * sigm(gf.y);
+          if constexpr (BFI) o4[i] = __floats2bfloat162_rn(x, y); else o4[i] = __floats2half2_rn(x, y);
+        }
+        *reinterpret_cast<uint4*>(As(s) + swA(r, c)) = *reinterpret_cast<const uint4*>(o4);
+      } else {
+        cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+      }
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -278,17 +310,17 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
     *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
   }
 }
-template <class M, class TO, class TI = M>
+template <class M, class TO, class TI = M, bool VG = false>
 inline void outLn256(const TI* O, const TI* W, const float* bias, M* msa,
                      const float* lnS, const float* lnO, TO* xn, size_t rows) {
   if (rows <= 2048) {
     constexpr size_t smem16 = 2 * ((size_t)16 * oln::LDA * 2 + (size_t)oln::KC * oln::LDW * 2);
-    outLn16K<M, TO, TI><<<(unsigned)((rows + 15) / 16), 128, smem16, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
+    outLn16K<M, TO, TI, VG><<<(unsigned)((rows + 15) / 16), 128, smem16, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
     return;
   }
   static bool attr = false;
-  if (!attr) { smemAttr((outLnK<M, TO, TI>), (int)oln::SMEM); attr = true; }
-  outLnK<M, TO, TI><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
+  if (!attr) { smemAttr((outLnK<M, TO, TI, VG>), (int)oln::SMEM); attr = true; }
+  outLnK<M, TO, TI, VG><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
 }
 // the LN'd rows a projection emitted for the next module: that module's LN prefix, its block, the MSA it normalised
 struct EmittedLn { std::string ln; int blk = -1; const void* msa = nullptr; void* xn = nullptr; size_t rows = 0; };

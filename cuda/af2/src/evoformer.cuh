@@ -634,6 +634,13 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
     ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
     const std::string ln = S + "msa_transition/input_layer_norm";
+    if (rowsN == 1 && t.msaOnes && BF && C == oln::C && Wp == oln::C && fitsSmem(oln::SMEM) && (!AF2_TIGHT || roomFor(rows * C * 2, { "ftr.xnfull" }))) {
+      B16* xt = scratch<B16>("ftr.xnfull", rows * C);
+      outLn256<B16, B16, B16, true>((const B16*)qkvg, (const B16*)msaWeight<B16>(w.out, (size_t)Wp * C),
+                                    P(A + "/attention/output_b", blk), m16, P(ln + "/scale", blk), P(ln + "/offset", blk), xt, rows);
+      EMITTED_LN = EmittedLn{ ln, blk, msa, xt, rows };
+      return;
+    }
     if (!t.msaOnes) {
       float* m = scratch<float>(AF2_TIGHT ? "col.mask" : "mask.colMsa", rows);
       if (AF2_TIGHT || blk == 0) swap01(msaMask, m, rowsN, L, 1);
