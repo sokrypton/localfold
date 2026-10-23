@@ -135,16 +135,26 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
   size_t P = (size_t)n * n;
   const half* xs = sharedNorm(pair);
   half* xn = xs ? (half*)xs : pairLn(pair, P, C, pre + ".actNorm");
-  float* raw = scratch<float>("grid.raw", P * heads);
   Folded fb, fq;
   if (xs) {
     fb = foldNorm("gb:" + pre, Wh(pre + ".pairBiasProjection"), C, heads, pre + ".actNorm", nullptr);
     fq = foldNorm("gq:" + pre, qkvgWeight(pre, C, Wd, true), C, 4 * Wd, pre + ".actNorm", qkvgBias(pre, Wd));
-    linW(xn, fb.w, raw, P, C, heads, 0.f, fb.b, 1.f, "grid bias projection");
-  } else lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
+  }
   // (rows padded to a whole 64-key tile with -inf, so the attention's last key tile needs no per-element mask)
   int stride = (n + 63) / 64 * 64;
-  half* bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
+  static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
+  half* bias = nullptr;
+  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8)) {
+    bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
+    run("af3_pair_bias", Grid{(uint32_t)((n + 7) / 8), (uint32_t)((n + 7) / 8), 1}, 256,
+        PairBiasArgs{xn, xs ? fb.w : Wh(pre + ".pairBiasProjection"), xs ? fb.b : nullptr, nullptr, bias,
+                     (uint)n, (uint)C, (uint)heads, (tr && swap) ? 1u : 0u, (uint)stride, 0});
+  } else {
+    float* raw = scratch<float>("grid.raw", P * heads);
+    if (xs) linW(xn, fb.w, raw, P, C, heads, 0.f, fb.b, 1.f, "grid bias projection");
+    else lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
+    bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
+  }
   // q|k|v|g a block of rows at a time (tr: of columns), 256 MB of them: the whole pair's was 1.1 GB at 1044 tokens, the
   // largest buffer of a fold. A row's attention reads its own n positions and nothing else, so the blocks are the
   // same arithmetic; below ~500 tokens one block is the whole pair

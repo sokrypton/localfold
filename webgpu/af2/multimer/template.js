@@ -146,8 +146,68 @@ export const TEMPLATE_INPUT_SHADER = `${COMMON}
 @group(0) @binding(5) var<storage, read> aatype_row: array<f32>;
 @group(0) @binding(6) var<storage, read> aatype_column: array<f32>;
 @group(0) @binding(7) var<storage, read> geometry: array<f32>;
+var<workgroup> shared_row: array<f32, 128>;
+var<workgroup> stats: array<f32, 2>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>
+) {
+  let scale = 0u;
+  let offset = p.pair_channels;
+  let query = 2u * p.pair_channels;
+  let query_bias = query + p.pair_channels * p.template_channels;
+  if (p.template_channels == 64u && p.pair_channels == 128u) {
+    let entry = group.x + group.y * GRID_WIDTH;
+    if (entry >= p.length * p.length) { return; }
+    let channel = local.x;
+    let index = entry * 64u + channel;
+    let base = entry * 128u;
+    shared_row[local.x] = pair[base + local.x];
+    shared_row[local.x + 64u] = pair[base + local.x + 64u];
+    workgroupBarrier();
+    if (local.x == 0u) {
+      var mean = 0.0;
+      for (var c = 0u; c < 128u; c += 1u) { mean += shared_row[c]; }
+      mean = mean / 128.0;
+      var variance = 0.0;
+      for (var c = 0u; c < 128u; c += 1u) {
+        let centred = shared_row[c] - mean;
+        variance += centred * centred;
+      }
+      stats[0] = mean;
+      stats[1] = inverseSqrt(variance / 128.0 + p.layer_norm_epsilon);
+    }
+    workgroupBarrier();
+    let mean = stats[0];
+    let inverse = stats[1];
+    let c0 = local.x;
+    let c1 = local.x + 64u;
+    shared_row[c0] = (shared_row[c0] - mean) * inverse * weights[scale + c0] + weights[offset + c0];
+    shared_row[c1] = (shared_row[c1] - mean) * inverse * weights[scale + c1] + weights[offset + c1];
+    workgroupBarrier();
+    var value = constant[channel] + weights[query_bias + channel];
+    for (var c = 0u; c < 128u; c += 1u) {
+      value += shared_row[c] * weights[query + c * 64u + channel];
+    }
+    let i = entry / p.length;
+    let j = entry % p.length;
+    value += aatype_row[j * 64u + channel];
+    value += aatype_column[i * 64u + channel];
+    let g = entry * GEOMETRY_STRIDE;
+    let w0 = query_bias + 64u;
+    let w1 = w0 + DGRAM_BINS * 64u;
+    let bin = u32(geometry[g]);
+    if (bin > 0u) {
+      value += weights[w0 + (bin - 1u) * 64u + channel];
+    }
+    for (var f = 0u; f < 5u; f += 1u) {
+      value += geometry[g + 1u + f] * weights[w1 + f * 64u + channel];
+    }
+    output[index] = value;
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.length * p.template_channels) { return; }
   let channel = index % p.template_channels;
@@ -162,11 +222,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     variance += centred * centred;
   }
   let inverse = inverseSqrt(variance / f32(p.pair_channels) + p.layer_norm_epsilon);
-  // weights: [scale (128), offset (128), queryWeight (128 x 64), queryBias (64)]
-  let scale = 0u;
-  let offset = p.pair_channels;
-  let query = 2u * p.pair_channels;
-  let query_bias = query + p.pair_channels * p.template_channels;
   var value = constant[channel] + weights[query_bias + channel];
   for (var c = 0u; c < p.pair_channels; c += 1u) {
     let normalized = (pair[base + c] - mean) * inverse * weights[scale + c] + weights[offset + c];
@@ -206,8 +261,54 @@ export const TEMPLATE_OUTPUT_SHADER = `${COMMON}
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> pair: array<f32>;
+var<workgroup> shared_act: array<f32, 64>;
+var<workgroup> out_stats: array<f32, 2>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>
+) {
+  let scale = 0u;
+  let offset = p.template_channels;
+  let out_weight = 2u * p.template_channels;
+  let out_bias = out_weight + p.template_channels * p.pair_channels;
+  if (p.pair_channels == 128u && p.template_channels <= 64u) {
+    let group_index = group.x + group.y * GRID_WIDTH;
+    let entry = group_index / 2u;
+    if (entry >= p.length * p.length) { return; }
+    let channel = (group_index % 2u) * 64u + local.x;
+    let index = entry * 128u + channel;
+    let base = entry * p.template_channels;
+    if (local.x < p.template_channels) {
+      shared_act[local.x] = act[base + local.x];
+    }
+    workgroupBarrier();
+    if (local.x == 0u) {
+      var mean = 0.0;
+      for (var c = 0u; c < p.template_channels; c += 1u) { mean += shared_act[c]; }
+      mean = mean / f32(p.template_channels);
+      var variance = 0.0;
+      for (var c = 0u; c < p.template_channels; c += 1u) {
+        let centred = shared_act[c] - mean;
+        variance += centred * centred;
+      }
+      out_stats[0] = mean;
+      out_stats[1] = inverseSqrt(variance / f32(p.template_channels) + p.layer_norm_epsilon);
+    }
+    workgroupBarrier();
+    if (local.x < p.template_channels) {
+      let normalized = (shared_act[local.x] - out_stats[0]) * out_stats[1] * weights[scale + local.x] + weights[offset + local.x];
+      shared_act[local.x] = max(normalized / f32(p.templates), 0.0);
+    }
+    workgroupBarrier();
+    var value = weights[out_bias + channel];
+    for (var c = 0u; c < p.template_channels; c += 1u) {
+      value += shared_act[c] * weights[out_weight + c * 128u + channel];
+    }
+    pair[index] = pair[index] + value;
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.length * p.pair_channels) { return; }
   let channel = index % p.pair_channels;
@@ -222,11 +323,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     variance += centred * centred;
   }
   let inverse = inverseSqrt(variance / f32(p.template_channels) + p.layer_norm_epsilon);
-  // weights: [scale (64), offset (64), outWeight (64 x 128), outBias (128)]
-  let scale = 0u;
-  let offset = p.template_channels;
-  let out_weight = 2u * p.template_channels;
-  let out_bias = out_weight + p.template_channels * p.pair_channels;
   var value = weights[out_bias + channel];
   for (var c = 0u; c < p.template_channels; c += 1u) {
     let normalized = (act[base + c] - mean) * inverse * weights[scale + c] + weights[offset + c];

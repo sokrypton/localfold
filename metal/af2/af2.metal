@@ -112,6 +112,111 @@ kernel void af2_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [
       a.out[((ulong)h * a.L + i) * a.stride + j] = j < a.L ? (half)max(tile[tx][r] * M_LOG2E_F, -6e4f) : -INFINITY;
   }
 }
+// Fused pair-bias projection + layout: 8 lanes cooperate per pair row to read pn [L*L, C] 100% coalesced (32B/lane),
+// multiply by Ws [C, H] in shared memory, reduce via simd_shuffle_xors, transpose/pad in shared memory, and write out [H][L][stride].
+kernel void af2_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+  const uint j0 = tg.x * 8, i0 = tg.y * 8;
+  if (i0 >= a.L || j0 >= a.L) return;
+  threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
+  threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
+  if (tid < a.C * (a.H <= 4 ? 1u : 2u)) Ws[tid] = *(device const half4*)(a.W + tid * 4);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sr_base = a.transposed ? j0 : i0;
+  const uint sc_base = a.transposed ? i0 : j0;
+  const uint tx = tid & 7, g = tid >> 3; // g in 0..31
+  const uint r0 = g >> 3, r1 = r0 + 4, m = g & 7;
+  const uint sr0 = sr_base + r0, sr1 = sr_base + r1, sc = sc_base + m;
+  const bool valid0 = sr0 < a.L && sc < a.L;
+  const bool valid1 = sr1 < a.L && sc < a.L;
+
+  const uint c4_per_lane = a.C >> 5; // 4 when C=128, 2 when C=64
+  const uint c4_base = tx * c4_per_lane;
+  device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.L + sc) * a.C) + c4_base;
+  device const half4* p1 = (device const half4*)(a.pn + ((ulong)sr1 * a.L + sc) * a.C) + c4_base;
+
+  if (a.H <= 4) {
+    float4 acc0(0.f), acc1(0.f);
+    for (uint u = 0; u < c4_per_lane; ++u) {
+      float4 x0 = valid0 ? float4(p0[u]) : float4(0.f);
+      float4 x1 = valid1 ? float4(p1[u]) : float4(0.f);
+      uint c = (c4_base + u) * 4;
+      float4 w0 = float4(Ws[c]);
+      float4 w1 = float4(Ws[c + 1]);
+      float4 w2 = float4(Ws[c + 2]);
+      float4 w3 = float4(Ws[c + 3]);
+      acc0 += x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+      acc1 += x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
+    }
+    float4 v = (tx < 4 ? acc0 : acc1) + simd_shuffle_xor(tx < 4 ? acc1 : acc0, (ushort)4);
+    v += simd_shuffle_xor(v, (ushort)2);
+    v += simd_shuffle_xor(v, (ushort)1);
+    if (tx == 0 || tx == 4) {
+      const uint r = tx == 0 ? r0 : r1;
+      const uint sr = sr_base + r;
+      const bool val_pair = tx == 0 ? valid0 : valid1;
+      const uint row_i = a.transposed ? m : r, col_j = a.transposed ? r : m;
+      const bool vj = (j0 + col_j) < a.L;
+      const float mb = (a.pairMask && val_pair) ? 1e9f * (a.pairMask[sr * a.L + sc] - 1.f) : 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (uint h = 0; h < 4; ++h) {
+        tile[(h * 8 + row_i) * 16 + col_j] = vj ? (half)max((v[h] + mb) * M_LOG2E_F, -6e4f) : (half)(-INFINITY);
+      }
+    }
+  } else {
+    float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
+    for (uint u = 0; u < c4_per_lane; ++u) {
+      float4 x0 = valid0 ? float4(p0[u]) : float4(0.f);
+      float4 x1 = valid1 ? float4(p1[u]) : float4(0.f);
+      uint c = (c4_base + u) * 4;
+      _Pragma("clang loop unroll(full)")
+      for (uint k = 0; k < 4; ++k) {
+        float xv0 = x0[k], xv1 = x1[k];
+        float4 wa = float4(Ws[(c + k) * 2]);
+        float4 wb = float4(Ws[(c + k) * 2 + 1]);
+        acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+        acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+      }
+    }
+    float4 v0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
+    float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
+    v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
+    v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
+    if (tx == 0 || tx == 4) {
+      const uint h_base = tx;
+      const uint row_i0 = a.transposed ? m : r0, col_j0 = a.transposed ? r0 : m;
+      const uint row_i1 = a.transposed ? m : r1, col_j1 = a.transposed ? r1 : m;
+      const bool vj0 = (j0 + col_j0) < a.L;
+      const bool vj1 = (j0 + col_j1) < a.L;
+      const float mb0 = (a.pairMask && valid0) ? 1e9f * (a.pairMask[sr0 * a.L + sc] - 1.f) : 0.f;
+      const float mb1 = (a.pairMask && valid1) ? 1e9f * (a.pairMask[sr1 * a.L + sc] - 1.f) : 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (uint t = 0; t < 4; ++t) {
+        uint h = h_base + t;
+        tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)max((v0[t] + mb0) * M_LOG2E_F, -6e4f) : (half)(-INFINITY);
+        tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)max((v1[t] + mb1) * M_LOG2E_F, -6e4f) : (half)(-INFINITY);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (tid < a.H * 8) {
+    uint h = tid >> 3, row_i = tid & 7, i = i0 + row_i;
+    if (i < a.L) {
+      *(device uint4*)(a.out + ((ulong)h * a.L + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + (h * 8 + row_i) * 16);
+    }
+  }
+  if (j0 + 8 >= a.L) {
+    uint sub = tid & 63, h = sub >> 3, i = i0 + (sub & 7);
+    if (h < a.H && i < a.L) {
+      for (uint jp = j0 + 8 + (tid >> 6) * 8; jp < a.stride; jp += 32) {
+        device half4* dst = (device half4*)(a.out + ((ulong)h * a.L + i) * a.stride + jp);
+        dst[0] = half4(-INFINITY); dst[1] = half4(-INFINITY);
+      }
+    }
+  }
+}
 // gemmTriGate's weight from AF2's [a | b] halves: channel c's (pa ga pb gb) in blocks of 8 (or quarters), and their biases, 8 columns (uint4) a thread
 kernel void af2_trigate_weight(LF_ARGS(TriGateW2Args)) {
   uint t = (uint)LF_INDEX, W8 = a.C / 2, blockStride = a.C * W8;

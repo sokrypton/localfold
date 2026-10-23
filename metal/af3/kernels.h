@@ -44,6 +44,7 @@ struct ScatterRowsArgs { CP(int) idx; CP(float) val; DP(float) dense; u64 rows; 
 // ---------------------------------------------------------------- attention biases
 // raw [pairs][heads] f32 -> bias [heads][n][stride] f16, times scale (log2 e), (i, j) read at (j, i) with swap
 struct BiasLayoutArgs { CP(float) raw; DP(half) bias; uint n, stride, heads, swap, ld, off; float scale; uint pad; };   // raw [pairs][ld], heads from off
+struct PairBiasArgs { CP(half) pn; CP(half) W; CP(float) wBias; CP(float) extraBias; DP(half) out; uint n, C, H, swap, stride, pad; };
 
 // ---------------------------------------------------------------- the MSA stack
 struct KeyMaskArgs { CP(float) msaMask; DP(float) keyMask; uint S, n; };

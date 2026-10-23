@@ -211,12 +211,18 @@ static half* pairBias(const T* pair, int L, int C, const std::string& normW, con
   size_t pairs = (size_t)L * L;
   half* pn = pairLn(pair, pairs, C, normW, blk, "bias.pn", nextPairNorm, blk, nextScratch);
   if (normed) *normed = pn;
-  float* proj = scratch<float>("bias.proj", pairs * H);
-  Gemm g{}; g.X = pn; g.tx = F16; g.W = PH(projW, blk); g.tw = F16; g.Y = proj; g.rows = pairs; g.in = C; g.out = H; g.label = "pair bias";
-  gemm(g);
   // (rows padded with -inf to a whole 64-key tile: biasStride(L), and the attention's NT kernel - core.mm)
   const int S = biasStride(L);
   half* b = scratch<half>("bias.b", (size_t)H * L * S);
+  static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
+  if (fusedPairBias && C <= 128 && (C & 31) == 0 && (H == 4 || H == 8)) {
+    run("af2_pair_bias", Grid{(uint32_t)((L + 7) / 8), (uint32_t)((L + 7) / 8), 1}, 256,
+        PairBiasArgs{pn, PH(projW, blk), pairMask, b, (uint)L, (uint)C, (uint)H, transposed ? 1u : 0u, (uint)S, 0});
+    return b;
+  }
+  float* proj = scratch<float>("bias.proj", pairs * H);
+  Gemm g{}; g.X = pn; g.tx = F16; g.W = PH(projW, blk); g.tw = F16; g.Y = proj; g.rows = pairs; g.in = C; g.out = H; g.label = "pair bias";
+  gemm(g);
   run("af2_bias_layout", Grid{(uint32_t)((S + 31) / 32), (uint32_t)((L + 31) / 32), (uint32_t)H}, 256,
       BiasLayoutArgs{proj, pairMask, b, (uint)L, (uint)H, transposed ? 1u : 0u, (uint)S});
   return b;

@@ -481,11 +481,11 @@ export function createAttentionProjectShader(
     }`);
   }
 
-  const q = (r, v) => `${widen(`acc_${r}_${v}.x`)} * inverseSqrt(f32(p.head_dim))`;
+  const q = (r, v) => `${widen(`acc_${r}_${v}.x`)} * q_scale`;
   const k = (r, v) => widen(`acc_${r}_${v}.y`);
   const val = (r, v) => widen(`acc_${r}_${v}.z`);
   const g = (r, v) => `1.0 / (1.0 + exp(-${widen(`acc_${r}_${v}.w`)}))`;
-  const store = [];
+  const store = [`  let q_scale = inverseSqrt(f32(p.head_dim));`];
   for (let r = 0; r < rowsPerLane; r += 1) {
     const body = [];
     // 🔴 THE VALUE REJOINS ITS SIBLINGS WHENEVER IT CAN, so the shader the page
@@ -1372,7 +1372,16 @@ ${Array.from({ length: vectors }, (_, t) =>
   const inner = lazy ?? [
     `    for (var slot = 0u; slot < KEY_CHUNK; slot += ${group}u) {`,
     `      if (k0 + slot >= p.queries) { break; }`,
-    ...indices.flatMap((g) => [
+    ...indices.flatMap((g) => (g === 0 ? [
+      `      let key_at0 = k0 + slot;`,
+      `      let staged0 = slot * HD4;`,
+      scoreOf(0, `staged0`),
+      `      var logit0 = ${scaled(`score0`)} + 1e9 * (mask[${maskExpr(`key_at0`)}] - 1.0);`,
+      `      if (has_bias) {`,
+      `        logit0 += pair_bias[pair_bias_row + key_at0];`,
+      `      }`,
+      `      logit0 = clamp(logit0, -1e8, 1e8);`,
+    ] : [
       `      let key_at${g} = k0 + slot + ${g}u;`,
       `      let live${g} = key_at${g} < p.queries;`,
       `      let k_clamped${g} = min(key_at${g}, p.queries - 1u);`,
@@ -1383,12 +1392,14 @@ ${Array.from({ length: vectors }, (_, t) =>
       `        logit${g} += pair_bias[pair_bias_row + k_clamped${g}];`,
       `      }`,
       `      logit${g} = select(-1e30, clamp(logit${g}, -1e8, 1e8), live${g});`,
-    ]),
+    ])),
     `      let group_max = ${indices.map((g) => `logit${g}`).reduce((a, b) => `max(${a}, ${b})`)};`,
     `      let new_max = max(running_max, group_max);`,
     `      let previous_scale = exp(running_max - new_max);`,
     `      running_max = new_max;`,
-    ...indices.map((g) => `      let w${g} = select(0.0, exp(logit${g} - new_max), live${g});`),
+    ...indices.map((g) => (g === 0
+      ? `      let w0 = exp(logit0 - new_max);`
+      : `      let w${g} = select(0.0, exp(logit${g} - new_max), live${g});`)),
     `      running_sum = running_sum * previous_scale + ${indices.map((g) => `w${g}`).join(" + ")};`,
     ...Array.from({ length: vectors }, (_, t) =>
       `      acc${t} = acc${t} * ${narrow("previous_scale")}${indices.map((g) => ` + ${narrow(`w${g}`)} * ${chunkRead(`staged${g} + ${t}u`)}`).join("")};`),
@@ -2457,9 +2468,10 @@ export function createAttentionOutputShader(
     store.push(`  {
     let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;
     if (row_${r} < rows) {
-      let b_${r} = row_${r} / p.queries;
-      let q_${r} = row_${r} % p.queries;
-      let output_row_${r} = select(row_${r}, q_${r} * p.batch + b_${r}, p.transpose != 0u);
+      var output_row_${r} = row_${r};
+      if (p.transpose != 0u) {
+        output_row_${r} = (row_${r} % p.queries) * p.batch + (row_${r} / p.queries);
+      }
 ${body.join("\n")}
     }
   }`);

@@ -238,6 +238,110 @@ kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [
     }
   }
 }
+// Fused pair-bias projection + layout for H in {4, 8} and C in {64, 128}: 8 lanes cooperate per pair row to read
+// pn [n*n, C] coalesced (32B/lane), multiply by Ws [C, H] in shared memory, reduce via simd_shuffle_xors, transpose/pad
+// in shared memory, and write out [H][n][stride] in log2 units.
+kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+  const uint j0 = tg.x * 8, i0 = tg.y * 8;
+  if (i0 >= a.n || j0 >= a.n) return;
+  threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
+  threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
+  if (tid < a.C * (a.H <= 4 ? 1u : 2u)) Ws[tid] = *(device const half4*)(a.W + tid * 4);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sr_base = a.swap ? j0 : i0;
+  const uint sc_base = a.swap ? i0 : j0;
+  const uint tx = tid & 7, g = tid >> 3; // g in 0..31
+  const uint r0 = g >> 3, r1 = r0 + 4, m = g & 7;
+  const uint sr0 = sr_base + r0, sr1 = sr_base + r1, sc = sc_base + m;
+  const bool valid0 = sr0 < a.n && sc < a.n;
+  const bool valid1 = sr1 < a.n && sc < a.n;
+
+  const uint c4_per_lane = a.C >> 5; // 4 when C=128, 2 when C=64
+  const uint c4_base = tx * c4_per_lane;
+  device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C) + c4_base;
+  device const half4* p1 = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C) + c4_base;
+
+  if (a.H <= 4) {
+    float4 acc0(0.f), acc1(0.f);
+    for (uint u = 0; u < c4_per_lane; ++u) {
+      float4 x0 = valid0 ? float4(p0[u]) : float4(0.f);
+      float4 x1 = valid1 ? float4(p1[u]) : float4(0.f);
+      uint c = (c4_base + u) * 4;
+      float4 w0 = float4(Ws[c]), w1 = float4(Ws[c + 1]), w2 = float4(Ws[c + 2]), w3 = float4(Ws[c + 3]);
+      acc0 += x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+      acc1 += x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
+    }
+    float4 v = (tx < 4 ? acc0 : acc1) + simd_shuffle_xor(tx < 4 ? acc1 : acc0, (ushort)4);
+    v += simd_shuffle_xor(v, (ushort)2);
+    v += simd_shuffle_xor(v, (ushort)1);
+    if (tx == 0 || tx == 4) {
+      const uint r = tx == 0 ? r0 : r1;
+      const uint sr = sr_base + r;
+      const bool val_pair = tx == 0 ? valid0 : valid1;
+      const uint row_i = a.swap ? m : r, col_j = a.swap ? r : m;
+      const bool vj = (j0 + col_j) < a.n;
+      const float eb = (a.extraBias && val_pair) ? a.extraBias[sr * a.n + sc] : 0.f;
+      const float4 wb = a.wBias ? *(device const float4*)a.wBias : float4(0.f);
+      _Pragma("clang loop unroll(full)")
+      for (uint h = 0; h < 4; ++h) {
+        tile[(h * 8 + row_i) * 16 + col_j] = vj ? (half)((v[h] + wb[h] + eb) * M_LOG2E_F) : (half)(-INFINITY);
+      }
+    }
+  } else {
+    float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
+    for (uint u = 0; u < c4_per_lane; ++u) {
+      float4 x0 = valid0 ? float4(p0[u]) : float4(0.f);
+      float4 x1 = valid1 ? float4(p1[u]) : float4(0.f);
+      uint c = (c4_base + u) * 4;
+      _Pragma("clang loop unroll(full)")
+      for (uint k = 0; k < 4; ++k) {
+        float xv0 = x0[k], xv1 = x1[k];
+        float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
+        acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+        acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+      }
+    }
+    float4 v0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
+    float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
+    v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
+    v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
+    if (tx == 0 || tx == 4) {
+      const uint h_base = tx;
+      const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
+      const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
+      const bool vj0 = (j0 + col_j0) < a.n;
+      const bool vj1 = (j0 + col_j1) < a.n;
+      const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
+      const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
+      const float4 wb = a.wBias ? *(device const float4*)(a.wBias + h_base) : float4(0.f);
+      _Pragma("clang loop unroll(full)")
+      for (uint t = 0; t < 4; ++t) {
+        uint h = h_base + t;
+        tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)((v0[t] + wb[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
+        tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)((v1[t] + wb[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (tid < a.H * 8) {
+    uint h = tid >> 3, row_i = tid & 7, i = i0 + row_i;
+    if (i < a.n) {
+      *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + (h * 8 + row_i) * 16);
+    }
+  }
+  if (j0 + 8 >= a.n) {
+    uint sub = tid & 63, h = sub >> 3, i = i0 + (sub & 7);
+    if (h < a.H && i < a.n) {
+      for (uint jp = j0 + 8 + (tid >> 6) * 8; jp < a.stride; jp += 32) {
+        device half4* dst = (device half4*)(a.out + ((ulong)h * a.n + i) * a.stride + jp);
+        dst[0] = half4(-INFINITY); dst[1] = half4(-INFINITY);
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------- the MSA stack
 kernel void af3_key_mask(LF_ARGS(KeyMaskArgs)) {

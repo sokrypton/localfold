@@ -96,12 +96,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[output_base + 2u] = global.z;
 }`;
 
+const PAIR_BIAS_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> pair: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.heads * p.length * p.length) { return; }
+  let key_index = index % p.length;
+  let query = (index / p.length) % p.length;
+  let head = index / (p.length * p.length);
+  var pair_bias = weights[p.attention_2d_bias + head];
+  let pair_base = (query * p.length + key_index) * p.pair_channels;
+  for (var c = 0u; c < p.pair_channels; c += 1u) {
+    pair_bias += pair[pair_base + c] * weights[p.attention_2d_weight + c * p.heads + head];
+  }
+  output[index] = pair_bias;
+}`;
+
 const LOGITS_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> query_scalar: array<f32>;
 @group(0) @binding(1) var<storage, read> kv_scalar: array<f32>;
 @group(0) @binding(2) var<storage, read> query_point: array<f32>;
 @group(0) @binding(3) var<storage, read> kv_point: array<f32>;
-@group(0) @binding(4) var<storage, read> pair: array<f32>;
+@group(0) @binding(4) var<storage, read> pair_bias: array<f32>;
 @group(0) @binding(5) var<storage, read> mask: array<f32>;
 @group(0) @binding(6) var<storage, read> weights: array<f32>;
 @group(0) @binding(7) var<uniform> p: Parameters;
@@ -134,12 +155,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let point_weight = p.point_factor * log(1.0 + exp(weights[p.trainable_point_weights + head]));
   result -= 0.5 * point_weight * distance;
-  var pair_bias = weights[p.attention_2d_bias + head];
-  let pair_base = (query * p.length + key_index) * p.pair_channels;
-  for (var c = 0u; c < p.pair_channels; c += 1u) {
-    pair_bias += pair[pair_base + c] * weights[p.attention_2d_weight + c * p.heads + head];
-  }
-  result += p.attention_2d_factor * pair_bias;
+  result += p.attention_2d_factor * pair_bias[index];
   result -= 1e5 * (1.0 - mask[query] * mask[key_index]);
   output[index] = result;
 }`;
@@ -148,16 +164,20 @@ const SOFTMAX_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<uniform> p: Parameters;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x;
+  let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= p.heads * p.length) { return; }
   let base = row * p.length;
   var maximum = -1e30;
   for (var k = 0u; k < p.length; k += 1u) { maximum = max(maximum, logits[base + k]); }
   var sum = 0.0;
-  for (var k = 0u; k < p.length; k += 1u) { sum += exp(logits[base + k] - maximum); }
-  for (var k = 0u; k < p.length; k += 1u) { output[base + k] = exp(logits[base + k] - maximum) / sum; }
+  for (var k = 0u; k < p.length; k += 1u) {
+    let w = exp(logits[base + k] - maximum);
+    output[base + k] = w;
+    sum += w;
+  }
+  for (var k = 0u; k < p.length; k += 1u) { output[base + k] = output[base + k] / sum; }
 }`;
 
 const SCALAR_FEATURE_SHADER = `${COMMON}
@@ -232,10 +252,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let channel = index % p.pair_channels;
   let head = (index / p.pair_channels) % p.heads;
   let query = index / (p.pair_channels * p.heads);
+  let att_base = (head * p.length + query) * p.length;
+  let pair_row_base = query * p.length * p.pair_channels + channel;
   var result = 0.0;
   for (var key_index = 0u; key_index < p.length; key_index += 1u) {
-    result += attention[(head * p.length + query) * p.length + key_index]
-      * pair[(query * p.length + key_index) * p.pair_channels + channel];
+    result += attention[att_base + key_index]
+      * pair[pair_row_base + key_index * p.pair_channels];
   }
   let offset = p.heads * p.scalar_v + 4u * p.heads * p.point_v;
   features[query * p.feature_channels + offset + head * p.pair_channels + channel] = result;
@@ -308,6 +330,7 @@ export class InvariantPointAttentionGpu {
       this.pipelines.get("ipa:scalar-feature", SCALAR_FEATURE_SHADER),
       this.pipelines.get("ipa:point-feature", POINT_FEATURE_SHADER),
       this.pipelines.get("ipa:pair-feature", PAIR_FEATURE_SHADER),
+      this.pipelines.get("ipa:pair-bias", PAIR_BIAS_SHADER),
     ]);
     const packed = packWeights(input);
     const allocations = [];
@@ -327,11 +350,12 @@ export class InvariantPointAttentionGpu {
       const params = upload("ipa.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
       const mask = upload("ipa.mask", input.mask);
       const pair = allocate("ipa.pair-normalized", input.length * input.length * input.pairChannels);
+      const pairBias = allocate("ipa.pair-bias", input.heads * input.length * input.length);
       const linearParams = (label, columns, weight, bias) =>
         upload(label, new Uint32Array([input.length, input.channels, columns, weight, bias, 0, 0, 0]),
           GPUBufferUsage.UNIFORM);
       prepared = new PreparedInvariantPointAttention({
-        pipelines, packed, weights, params, mask, pair,
+        pipelines, packed, weights, params, mask, pair, pairBias,
         queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns, featureChannels,
         qScalarParams: linearParams("ipa.q-scalar-params", queryScalarColumns, packed.offsets[2], packed.offsets[3]),
         kvScalarParams: linearParams("ipa.kv-scalar-params", kvScalarColumns, packed.offsets[4], packed.offsets[5]),
@@ -379,6 +403,14 @@ export class InvariantPointAttentionGpu {
         // group.x + group.y * GRID_WIDTH and has done all along.
         const rows = input.length * input.length;
         compute.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+        compute.setPipeline(pipelines[8]);
+        compute.setBindGroup(0, this.device.createBindGroup({
+          layout: pipelines[8] .getBindGroupLayout(0),
+          entries: [pair, weights, params, pairBias].map((buffer, binding) =>
+            ({ binding, resource: { buffer: buffer.buffer } })),
+        }));
+        const biasGroups = Math.ceil((input.heads * rows) / 64);
+        compute.dispatchWorkgroups(Math.min(biasGroups, GRID_WIDTH), Math.ceil(biasGroups / GRID_WIDTH));
         compute.end();
         this.device.pushErrorScope("validation");
         this.device.queue.submit([encoder.finish()]);
@@ -440,7 +472,7 @@ export class InvariantPointAttentionGpu {
    * read back, which is the whole point - see the note in structure/core.js.
    */
   encode(compute, input, shared, scratch, source, affine, output) {
-    const { pipelines, weights, params, mask, pair } = shared;
+    const { pipelines, weights, params, mask, pair, pairBias } = shared;
     const dispatch = (pipeline, buffers, x, y = 1) => {
       compute.setPipeline(pipeline);
       compute.setBindGroup(0, this.device.createBindGroup({
@@ -467,9 +499,10 @@ export class InvariantPointAttentionGpu {
     const attentionElements = input.heads * input.length * input.length;
     const logitsGrid = linearGrid(attentionElements);
     dispatch(pipelines[3],
-      [scratch.queryScalar, scratch.kvScalar, scratch.queryPoint, scratch.kvPoint, pair, mask, weights, params,
+      [scratch.queryScalar, scratch.kvScalar, scratch.queryPoint, scratch.kvPoint, pairBias, mask, weights, params,
         scratch.logits], logitsGrid[0], logitsGrid[1]);
-    dispatch(pipelines[4], [scratch.logits, params, scratch.attention], input.heads * input.length);
+    const softmaxGrid = linearGrid(input.heads * input.length);
+    dispatch(pipelines[4], [scratch.logits, params, scratch.attention], softmaxGrid[0], softmaxGrid[1]);
     dispatch(pipelines[5], [scratch.attention, scratch.kvScalar, params, scratch.features],
       Math.ceil(input.length * input.heads * input.scalarV / 64));
     dispatch(pipelines[6], [scratch.attention, scratch.kvPoint, affine, params, scratch.features],
@@ -484,7 +517,7 @@ export class InvariantPointAttentionGpu {
     const shared = input.prepared ?? await this.prepare(input);
     const ownsShared = input.prepared === undefined;
     const {
-      pipelines, weights, params, mask, pair, featureChannels,
+      pipelines, weights, params, mask, pair, pairBias, featureChannels,
       queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns,
     } = shared;
     const allocations = [];
@@ -541,9 +574,10 @@ export class InvariantPointAttentionGpu {
       // ...FOLDED. heads * L * L elements over 64 lanes passes 65535 workgroups
       // at about 590 residues, which is inside the range this page will fold.
       const logitsGrid = linearGrid(attentionElements);
-      pass(pipelines[3], [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
+      pass(pipelines[3], [queryScalar, kvScalar, queryPoint, kvPoint, pairBias, mask, weights, params, logits],
         logitsGrid[0], logitsGrid[1]);
-      pass(pipelines[4], [logits, params, attention], input.heads * input.length);
+      const softmaxGrid = linearGrid(input.heads * input.length);
+      pass(pipelines[4], [logits, params, attention], softmaxGrid[0], softmaxGrid[1]);
       pass(pipelines[5], [attention, kvScalar, params, features],
         Math.ceil(input.length * input.heads * input.scalarV / 64));
       pass(pipelines[6], [attention, kvPoint, affine, params, features],

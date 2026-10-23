@@ -111,8 +111,28 @@ struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_cha
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_src: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>
+) {
+  if (p.projected == 64u && p.template_channels <= 64u) {
+    let row = group.x + group.y * GRID_WIDTH;
+    if (row >= p.pairs) { return; }
+    let channel = local.x;
+    if (local.x < p.template_channels) {
+      shared_src[local.x] = source[row * p.template_channels + local.x];
+    }
+    workgroupBarrier();
+    var result = 0.0;
+    for (var c = 0u; c < p.template_channels; c += 1u) {
+      result += shared_src[c] * weights[c * 64u + channel];
+    }
+    output[row * 64u + channel] = result;
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.pairs * p.projected) { return; }
   let row = index / p.projected;
@@ -132,8 +152,29 @@ struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_cha
 @group(0) @binding(2) var<storage, read> output_bias: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_src: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>
+) {
+  if (p.pair_channels == 128u && p.projected <= 64u) {
+    let group_index = group.x + group.y * GRID_WIDTH;
+    let row = group_index / 2u;
+    if (row >= p.pairs) { return; }
+    let channel = (group_index % 2u) * 64u + local.x;
+    if (local.x < p.projected) {
+      shared_src[local.x] = source[row * p.projected + local.x];
+    }
+    workgroupBarrier();
+    var result = output_bias[channel];
+    for (var c = 0u; c < p.projected; c += 1u) {
+      result += shared_src[c] * output_weight[c * 128u + channel];
+    }
+    output[row * 128u + channel] = result;
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.pairs * p.pair_channels) { return; }
   let row = index / p.pair_channels;
