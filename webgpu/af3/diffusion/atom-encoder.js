@@ -503,20 +503,39 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let corner = packed & 3u;
     let ideal = angles[centre];
     if (ideal == 0.0) { continue; }
-    var p = array<vec3<f32>, 4>(
-      point_of(centers[centre * 4u]), point_of(centers[centre * 4u + 1u]),
-      point_of(centers[centre * 4u + 2u]), point_of(centers[centre * 4u + 3u]));
-    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
-      let keep = p[corner][axis];
-      p[corner][axis] = keep + CHIRAL_STEP;
-      let up = improper(p[0], p[1], p[2], p[3]) - ideal;
-      p[corner][axis] = keep - CHIRAL_STEP;
-      let down = improper(p[0], p[1], p[2], p[3]) - ideal;
-      p[corner][axis] = keep;
+    let cbase = centre * 4u;
+    let p0 = point_of(centers[cbase]);
+    let p1 = point_of(centers[cbase + 1u]);
+    let p2 = point_of(centers[cbase + 2u]);
+    let p3 = point_of(centers[cbase + 3u]);
+    let c0 = corner == 0u;
+    let c1 = corner == 1u;
+    let c2 = corner == 2u;
+    let c3 = corner == 3u;
+    let pc = select(select(select(p3, p2, c2), p1, c1), p0, c0);
+    {
+      let u = vec3<f32>(pc.x + CHIRAL_STEP, pc.y, pc.z);
+      let up = improper(select(p0, u, c0), select(p1, u, c1), select(p2, u, c2), select(p3, u, c3)) - ideal;
+      let d = vec3<f32>(pc.x - CHIRAL_STEP, pc.y, pc.z);
+      let down = improper(select(p0, d, c0), select(p1, d, c1), select(p2, d, c2), select(p3, d, c3)) - ideal;
       let derivative = (up * up - down * down) / (2.0 * CHIRAL_STEP);
-      // A non-finite difference is a degenerate centre and contributes nothing,
-      // which is the reference's own nan_to_num.
-      if (derivative == derivative) { total[axis] = total[axis] + derivative; }
+      if (derivative == derivative) { total.x = total.x + derivative; }
+    }
+    {
+      let u = vec3<f32>(pc.x, pc.y + CHIRAL_STEP, pc.z);
+      let up = improper(select(p0, u, c0), select(p1, u, c1), select(p2, u, c2), select(p3, u, c3)) - ideal;
+      let d = vec3<f32>(pc.x, pc.y - CHIRAL_STEP, pc.z);
+      let down = improper(select(p0, d, c0), select(p1, d, c1), select(p2, d, c2), select(p3, d, c3)) - ideal;
+      let derivative = (up * up - down * down) / (2.0 * CHIRAL_STEP);
+      if (derivative == derivative) { total.y = total.y + derivative; }
+    }
+    {
+      let u = vec3<f32>(pc.x, pc.y, pc.z + CHIRAL_STEP);
+      let up = improper(select(p0, u, c0), select(p1, u, c1), select(p2, u, c2), select(p3, u, c3)) - ideal;
+      let d = vec3<f32>(pc.x, pc.y, pc.z - CHIRAL_STEP);
+      let down = improper(select(p0, d, c0), select(p1, d, c1), select(p2, d, c2), select(p3, d, c3)) - ideal;
+      let derivative = (up * up - down * down) / (2.0 * CHIRAL_STEP);
+      if (derivative == derivative) { total.z = total.z + derivative; }
     }
   }
   gradients[atom * 3u] = total.x;
@@ -1772,13 +1791,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // are the same arithmetic on real atoms - and NOT on the padded slots the
   // gather zeroes, which the reference normalises along with the rest because
   // its `x_k` is already in keys layout.
-  const kqNorm = shape.kqNorm !== true ? null : `${common}
+  const kqNorm = shape.kqNorm !== true ? null : (() => {
+    const width = shape.heads * shape.dimension;
+    const kqSteps = width % 64 === 0 && width / 64 <= 8 ? width / 64 : 0;
+    const overKqSteps = (body) => Array.from({ length: kqSteps }, (_, s) => body(s)).join("\n  ");
+    const unrollReduce = [32, 16, 8, 4, 2, 1].map((stride) =>
+      `  if (local < ${stride}u) { partial_sum[local] += partial_sum[local + ${stride}u]; }\n  workgroupBarrier();`
+    ).join("\n");
+    return `${common}
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> k: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 
 var<workgroup> partial_sum: array<f32, 64>;
-var<workgroup> partial_squares: array<f32, 64>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -1792,16 +1817,37 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let w_scale = select(W_keyLayerNormScale, W_queryLayerNormScale, is_query);
   let w_offset = select(W_keyLayerNormOffset, W_queryLayerNormOffset, is_query);
 
+${kqSteps > 0 ? `  ${overKqSteps((s) => `let w_${s} = local + ${s * 64}u;\n  var x_${s}: f32;`)}
+  if (is_query) {
+    ${overKqSteps((s) => `x_${s} = q[base + w_${s}];`)}
+  } else {
+    ${overKqSteps((s) => `x_${s} = k[base + w_${s}];`)}
+  }
   var total = 0.0;
+  ${overKqSteps((s) => `total += x_${s};`)}
+  partial_sum[local] = total;
+  workgroupBarrier();
+${unrollReduce}
+  let mean = partial_sum[0] / f32(WIDTH);
+  workgroupBarrier();
+  var squares = 0.0;
+  ${overKqSteps((s) => `let d_${s} = x_${s} - mean;\n  squares += d_${s} * d_${s};`)}
+  partial_sum[local] = squares;
+  workgroupBarrier();
+${unrollReduce}
+  let inverse_std = inverseSqrt(partial_sum[0] / f32(WIDTH) + EPSILON);
+  ${overKqSteps((s) => `let y_${s} = d_${s} * inverse_std * weights[w_scale + w_${s}] + weights[w_offset + w_${s}];`)}
+  if (is_query) {
+    ${overKqSteps((s) => `q[base + w_${s}] = y_${s};`)}
+  } else {
+    ${overKqSteps((s) => `k[base + w_${s}] = y_${s};`)}
+  }` : `  var total = 0.0;
   for (var w = local; w < WIDTH; w += 64u) {
     total += select(k[base + w], q[base + w], is_query);
   }
   partial_sum[local] = total;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { partial_sum[local] += partial_sum[local + stride]; }
-    workgroupBarrier();
-  }
+${unrollReduce}
   let mean = partial_sum[0] / f32(WIDTH);
   workgroupBarrier();
   var squares = 0.0;
@@ -1809,20 +1855,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let d = select(k[base + w], q[base + w], is_query) - mean;
     squares += d * d;
   }
-  partial_squares[local] = squares;
+  partial_sum[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { partial_squares[local] += partial_squares[local + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial_squares[0] / f32(WIDTH) + EPSILON);
-  workgroupBarrier();
+${unrollReduce}
+  let inverse_std = inverseSqrt(partial_sum[0] / f32(WIDTH) + EPSILON);
   for (var w = local; w < WIDTH; w += 64u) {
     let value = (select(k[base + w], q[base + w], is_query) - mean) * inverse_std
       * weights[w_scale + w] + weights[w_offset + w];
     if (is_query) { q[base + w] = value; } else { k[base + w] = value; }
-  }
+  }`}
 }`;
+  })();
 
   return { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
            attendFor, output, maskAct, aggregate, kqNorm, outputRowTile };

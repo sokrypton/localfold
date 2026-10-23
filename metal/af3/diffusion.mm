@@ -330,7 +330,6 @@ static void transformer(float* act, const float* cond, float level) {
     }
   }
   bool noResidual = flag(Tn + ".noResidual");
-  float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
   // the GEMMs run on the rows rounded up to 16: a ragged last tile takes the GEMM's bounds-checked paths (68 rows: 0.31
   // against 0.22 ms for a 768 x 3072 projection). The padding rows compute values nobody reads (zero in, finite out)
   size_t prows = (rows + 15) / 16 * 16;
@@ -357,15 +356,17 @@ static void transformer(float* act, const float* cond, float level) {
     const float* gFfw = permuted ? gNorm + (size_t)(2 * b + 1) * n * 2 * C : gAtt + 2 * C;
     const float* zAtt = permuted ? gRaw + (size_t)(2 * b) * n * C : gRaw + (size_t)b * 2 * C;
     const float* zFfw = permuted ? gRaw + (size_t)(2 * b + 1) * n * C : zAtt + C;
-    adaLn(act, gAtt, gAtt + C, x, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, pendY, pendGate, ldr, nullptr, 1.f, permuted);
+    adaLn(act, gAtt, gAtt + C, x, nullptr, rows, C, n, ldn,
+          noResidual ? gFfw : nullptr, noResidual ? gFfw + C : nullptr, noResidual ? tn : nullptr,
+          false, pendY, pendGate, ldr, nullptr, 1.f, permuted);
     pendY = nullptr; pendGate = nullptr;
-    if (noResidual) copy(pre, act, rows * C * 4);
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = Dh; at.rows = NS; at.scale = 1.f / sqrtf((float)Dh);
     at.bias = D.bias[b]; at.biasStride = D.stride; at.biasPadInf = true; at.qBias = W(B + ".qBias");
     if (!D.masks.ones) { at.mask = D.masks.seq; at.maskB = 0; at.maskK = 1; }
     if (hasW(B + ".queryLayerNormScale")) {     // rf3: q (its bias inside) and k normalised per token row
-      run("af3_kq_norm", grid1d((rows + 7) / 8, 1), 256,
+      uint32_t sgs = 2 * rows <= 512 ? 2 : 8;
+      run("af3_kq_norm", grid1d((2 * rows + sgs - 1) / sgs, 1), sgs * 32,
           KqNormArgs{qkvg, qkvg + Wd, W(B + ".qBias"), W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
                      W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), rows, (uint)(4 * Wd), (uint)(4 * Wd), (uint)Wd, 0});
       at.qBias = nullptr;
@@ -379,10 +380,9 @@ static void transformer(float* act, const float* cond, float level) {
         adaLn(act, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, att, zAtt, ldr, nullptr, 1.f, permuted);
       } else {
         run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, zAtt, rows, (uint)C, (uint)n, (uint)ldr, permuted ? 1u : 0u});
-        adaLn(pre, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, nullptr, nullptr, 0, nullptr, 1.f, permuted);
       }
-    } else {
-      adaLn(noResidual ? pre : act, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, nullptr, nullptr, 0, nullptr, 1.f, permuted);
+    } else if (!noResidual) {
+      adaLn(act, gFfw, gFfw + C, tn, nullptr, rows, C, n, ldn, nullptr, nullptr, nullptr, false, nullptr, nullptr, 0, nullptr, 1.f, permuted);
     }
     gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
     if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate
@@ -395,7 +395,7 @@ static void transformer(float* act, const float* cond, float level) {
     if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, prows, rows, I, C, zFfw, ldr, n, 1.f,
                           "transformer transition, gated residual", permuted)) {
       lin(gated, B + ".ffwTransition2", proj, prows, I, C);
-      if (!noResidual && b + 1 < D.nblocks) {
+      if (b + 1 < D.nblocks) {
         pendY = proj; pendGate = zFfw;
       } else {
         run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, proj, zFfw, rows, (uint)C, (uint)n, (uint)ldr, permuted ? 1u : 0u});
@@ -439,15 +439,17 @@ static float* atomDecoder(const half* tokenAct) {
   AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
               flag(Dd + ".blocks.0.diffusionNoResidual")};
   bool maskPerBlock = flag(Dd + ".blocks.0.maskAtomActPerBlock");
-  const bool fuse0 = C == 128 && !maskPerBlock && !st.noResidual && !D.decBlocks.empty();
+  const bool fuse0 = C == 128 && !maskPerBlock && !D.decBlocks.empty();
   half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
   half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
+  half* tn0 = (fuse0 && st.noResidual) ? scratch<half>("ab.tn", qRows * C) : nullptr;
   const AtomBlockCache* b0 = fuse0 ? &D.decBlocks[0] : nullptr;
   run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),
-        BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
-                          (uint)sh.tokens, (uint)sh.dense, 0,
+        BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act,
                           b0 ? b0->qScale : nullptr, b0 ? b0->qShift : nullptr, xq0,
                           b0 ? b0->kScale : nullptr, b0 ? b0->kShift : nullptr, xk0,
+                          tn0 ? b0->ffwScale : nullptr, tn0 ? b0->ffwShift : nullptr, tn0,
+                          qRows, q1, (uint)C, (uint)sh.tokens, (uint)sh.dense, 0,
                           ADA_RAW ? 0.1f : 1e-5f, b0 && b0->chained ? 1u : 0u});
   const float* pendY = nullptr; const float* pendGate = nullptr;
   for (size_t b = 0; b < D.decBlocks.size(); ++b) {

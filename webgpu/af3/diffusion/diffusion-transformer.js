@@ -795,7 +795,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
+  const fuseFfwAdaln = shape.noResidual === true && batchedGates;
   const conditionedNorm = (prefix, bindingsFor, mode = "fused") => {
+    const dualOut = fuseFfwAdaln && prefix === "" && mode === "fused";
     const useVecNorm = !normSplit && mode === "fused"
       && channels % lanes === 0 && !normSubgroups;
     const normReduceType = useVecNorm ? tileLanes : "f32";
@@ -915,7 +917,36 @@ ${useVecNorm
   ? (() => {
       const steps = channels / lanes;
       const overSteps = (body) => Array.from({ length: steps }, (_, s) => body(s)).join("\n  ");
-      return batchedGates
+      return dualOut
+        ? `  ${overSteps((s) => `{
+    ${overGroups((g) => `var scale_${s}_${g} = ${tileLanes}(0.0);
+    var shift_${s}_${g} = ${tileLanes}(0.0);
+    var ffw_scale_${s}_${g} = ${tileLanes}(0.0);
+    var ffw_shift_${s}_${g} = ${tileLanes}(0.0);`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      if (token < ${ROWS}) {
+        let at = ${perToken("token")} * 2u * C + c_${s};
+        scale_${s}_${group(t)}${lane(t)} = scale_shift[at];
+        shift_${s}_${group(t)}${lane(t)} = scale_shift[at + C];
+        ffw_scale_${s}_${group(t)}${lane(t)} = ffw_scale_shift[at];
+        ffw_shift_${s}_${group(t)}${lane(t)} = ffw_scale_shift[at + C];
+      }
+    }`)}
+    ${overGroups((g) => `let out_${s}_${g} =
+      (${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale_${s}_${g}))) * act_${s}_${g} + shift_${s}_${g};
+    let ffw_out_${s}_${g} =
+      (${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-ffw_scale_${s}_${g}))) * act_${s}_${g} + ffw_shift_${s}_${g};`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      if (token < ${ROWS}) {
+        let out_at = token * C + c_${s};
+        xbuf[out_at] = out_${s}_${group(t)}${lane(t)};
+        ffw_xbuf[out_at] = ffw_out_${s}_${group(t)}${lane(t)};
+      }
+    }`)}
+  }`)}`
+        : batchedGates
         ? `  ${overSteps((s) => `{
     ${overGroups((g) => `var scale_${s}_${g} = ${tileLanes}(0.0);
     var shift_${s}_${g} = ${tileLanes}(0.0);`)}
@@ -980,7 +1011,7 @@ ${useVecNorm
       // arms and never folded one. See tools/gpu/check-difftx-splits.js.
       `var scale${g} = ${tileLanes}(${mode === "fused" && !batchedGates
         ? wf(`weights[W_${prefix}SingleCondScaleBias + c]`) : "0.0"});
-    var shift${g} = ${tileLanes}(0.0);`)}
+    var shift${g} = ${tileLanes}(0.0);${dualOut ? `\n    var ffw_scale${g} = ${tileLanes}(0.0);\n    var ffw_shift${g} = ${tileLanes}(0.0);` : ""}`)}
 ${batchedGates
   ? `    // 🔴 BOTH ALREADY COMPUTED, FOR EVERY BLOCK, IN ONE DISPATCH. The
     // projection that stood here - C_COND x C against a conditioning that does
@@ -995,7 +1026,7 @@ ${batchedGates
       if (token < ${ROWS}) {
         let at = ${perToken("token")} * 2u * C + c;
         scale${group(t)}${lane(t)} = scale_shift[at];
-        shift${group(t)}${lane(t)} = scale_shift[at + C];
+        shift${group(t)}${lane(t)} = scale_shift[at + C];${dualOut ? `\n        ffw_scale${group(t)}${lane(t)} = ffw_scale_shift[at];\n        ffw_shift${group(t)}${lane(t)} = ffw_scale_shift[at + C];` : ""}
       }
     }`)}`
   : mode === "reduce"
@@ -1037,13 +1068,13 @@ ${mode === "split"
       }
     }`)}`
   : `    ${overGroups((g) => `let gated${g} =
-      ${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale${g}));`)}
+      ${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-scale${g}));${dualOut ? `\n    let ffw_gated${g} =\n      ${tileLanes}(1.0) / (${tileLanes}(1.0) + exp(-ffw_scale${g}));` : ""}`)}
     ${overTile((t) => `{
       let token = base_token + ${t}u;
       if (token < ${ROWS}) {
         let normalized = (act[token * C + c] - act_means[${t}u]) * act_inverses[${t}u];
         xbuf[token * C + c] =
-          gated${group(t)}${lane(t)} * normalized + shift${group(t)}${lane(t)};
+          gated${group(t)}${lane(t)} * normalized + shift${group(t)}${lane(t)};${dualOut ? `\n        ffw_xbuf[token * C + c] =\n          ffw_gated${group(t)}${lane(t)} * normalized + ffw_shift${group(t)}${lane(t)};` : ""}
       }
     }`)}`}
   }`}
@@ -1065,7 +1096,12 @@ ${mode === "split"
   const normBindings = (fused) => (mode) => (
     mode === "split" ? splitBindings : mode === "reduce" ? reduceBindings : fused);
 
-  const adalnBindings = normBindings(batchedGates ? `@group(0) @binding(0) var<storage, read> act: array<f32>;
+  const adalnBindings = normBindings(fuseFfwAdaln ? `@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> scale_shift: array<f32>;
+@group(0) @binding(2) var<storage, read> ffw_scale_shift: array<f32>;
+@group(0) @binding(3) var<storage, read_write> xbuf: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ffw_xbuf: array<f32>;`
+    : batchedGates ? `@group(0) @binding(0) var<storage, read> act: array<f32>;
 // 🔴 THREE BINDINGS, NOT FOUR. The projection was this kernel's ONLY read of
 // the weights; hoisted, that binding goes unread and an auto layout DROPS it,
 // so a positional bind group of four fails. Same trap as ffw-out-reduce's.
@@ -1977,13 +2013,15 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   // it runs AFTER the projection and BEFORE the key_dim scaling - which this
   // port applies inside `attend`, so a pass between qkvg and attend is exactly
   // the right seam. One workgroup a token row, both tensors in one dispatch.
-  const kqNorm = shape.kqNorm !== true ? null : `${common}
+  const kqNorm = shape.kqNorm !== true ? null : (() => {
+    const kqSteps = width % lanes === 0 && width / lanes <= 8 ? width / lanes : 0;
+    const overKqSteps = (body) => Array.from({ length: kqSteps }, (_, s) => body(s)).join("\n  ");
+    return `${common}
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
 @group(0) @binding(1) var<storage, read_write> k: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
 
-var<workgroup> partial_sum: array<f32, ${lanes}>;
-var<workgroup> partial_squares: array<f32, ${lanes}>;
+var<workgroup> partial_sum: array<vec2<f32>, ${lanes}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -1992,44 +2030,47 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (row >= ${ROWS}) { return; }
   let local = local_id.x;
   let base = row * WIDTH;
-${["q", "k"].map((side) => {
-    const S = side === "q" ? "W_queryLayerNormScale" : "W_keyLayerNormScale";
-    const O = side === "q" ? "W_queryLayerNormOffset" : "W_keyLayerNormOffset";
-    return `  {
-    var total = 0.0;
-    for (var w = local; w < WIDTH; w += ${lanes}u) { total += ${side}[base + w]; }
-    partial_sum[local] = total;
-    workgroupBarrier();
-    for (var stride = ${lanes >> 1}u; stride > 0u; stride >>= 1u) {
-      if (local < stride) { partial_sum[local] += partial_sum[local + stride]; }
-      workgroupBarrier();
-    }
-    let mean = partial_sum[0] / f32(WIDTH);
-    workgroupBarrier();
-    // Two-pass, because \`use_fast_variance=False\`: the sum of squares form is
-    // a different number in float32 and this LayerNorm's output feeds a
-    // softmax's logits.
-    var squares = 0.0;
-    for (var w = local; w < WIDTH; w += ${lanes}u) {
-      let d = ${side}[base + w] - mean;
-      squares += d * d;
-    }
-    partial_squares[local] = squares;
-    workgroupBarrier();
-    for (var stride = ${lanes >> 1}u; stride > 0u; stride >>= 1u) {
-      if (local < stride) { partial_squares[local] += partial_squares[local + stride]; }
-      workgroupBarrier();
-    }
-    let inverse_std = inverseSqrt(partial_squares[0] / f32(WIDTH) + EPSILON);
-    workgroupBarrier();
-    for (var w = local; w < WIDTH; w += ${lanes}u) {
-      ${side}[base + w] = (${side}[base + w] - mean) * inverse_std
-        * f32(weights[${S} + w]) + f32(weights[${O} + w]);
-    }
-    workgroupBarrier();
-  }`;
-  }).join("\n")}
+${kqSteps > 0 ? `  ${overKqSteps((s) => `let w_${s} = local + ${s * lanes}u;\n  let qv_${s} = q[base + w_${s}];\n  let kv_${s} = k[base + w_${s}];`)}
+  var total = vec2<f32>(0.0);
+  ${overKqSteps((s) => `total += vec2<f32>(qv_${s}, kv_${s});`)}
+  partial_sum[local] = total;
+  workgroupBarrier();
+${unrollStrides("partial_sum")}
+  let mean = partial_sum[0] / f32(WIDTH);
+  workgroupBarrier();
+  var squares = vec2<f32>(0.0);
+  ${overKqSteps((s) => `let dq_${s} = qv_${s} - mean.x;\n  let dk_${s} = kv_${s} - mean.y;\n  squares += vec2<f32>(dq_${s} * dq_${s}, dk_${s} * dk_${s});`)}
+  partial_sum[local] = squares;
+  workgroupBarrier();
+${unrollStrides("partial_sum")}
+  let inverse_std = inverseSqrt(partial_sum[0] / f32(WIDTH) + vec2<f32>(EPSILON));
+  ${overKqSteps((s) => `q[base + w_${s}] = dq_${s} * inverse_std.x * f32(weights[W_queryLayerNormScale + w_${s}]) + f32(weights[W_queryLayerNormOffset + w_${s}]);\n  k[base + w_${s}] = dk_${s} * inverse_std.y * f32(weights[W_keyLayerNormScale + w_${s}]) + f32(weights[W_keyLayerNormOffset + w_${s}]);`)}` : `  var total = vec2<f32>(0.0);
+  for (var w = local; w < WIDTH; w += ${lanes}u) {
+    total += vec2<f32>(q[base + w], k[base + w]);
+  }
+  partial_sum[local] = total;
+  workgroupBarrier();
+${unrollStrides("partial_sum")}
+  let mean = partial_sum[0] / f32(WIDTH);
+  workgroupBarrier();
+  var squares = vec2<f32>(0.0);
+  for (var w = local; w < WIDTH; w += ${lanes}u) {
+    let dq = q[base + w] - mean.x;
+    let dk = k[base + w] - mean.y;
+    squares += vec2<f32>(dq * dq, dk * dk);
+  }
+  partial_sum[local] = squares;
+  workgroupBarrier();
+${unrollStrides("partial_sum")}
+  let inverse_std = inverseSqrt(partial_sum[0] / f32(WIDTH) + vec2<f32>(EPSILON));
+  for (var w = local; w < WIDTH; w += ${lanes}u) {
+    q[base + w] = (q[base + w] - mean.x) * inverse_std.x
+      * f32(weights[W_queryLayerNormScale + w]) + f32(weights[W_queryLayerNormOffset + w]);
+    k[base + w] = (k[base + w] - mean.y) * inverse_std.y
+      * f32(weights[W_keyLayerNormScale + w]) + f32(weights[W_keyLayerNormOffset + w]);
+  }`}
 }`;
+  })();
 
   const copyAct = shape.noResidual !== true ? null : `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -3251,7 +3292,7 @@ export class Af3DiffusionTransformerGpu {
           const runBlock = (label, pipeline, buffers, x, y = 1, z = 1) =>
             run(label, pipeline, buffers, x, y, `${label}:${at}`, z);
           const logits = logitsFor(at);
-          if (noResidual) {
+          if (noResidual && !batchedGates) {
             const copyGroups = Math.ceil((rows * channels) / (shape.lanes ?? 256));
             runBlock("copy-act", compiled.copyAct, [actBuffer, preBuffer],
                 Math.min(copyGroups, GRID_WIDTH), Math.ceil(copyGroups / GRID_WIDTH));
@@ -3274,7 +3315,9 @@ export class Af3DiffusionTransformerGpu {
             // an auto layout drops that binding once it is hoisted.
             runBlock("adaln", compiled.adaln,
                 batchedGates
-                  ? [actBuffer, adalnSlice(at), xBuffer]
+                  ? (noResidual
+                      ? [actBuffer, adalnSlice(at), ffwAdalnSlice(at), xBuffer, preBuffer]
+                      : [actBuffer, adalnSlice(at), xBuffer])
                   : [actBuffer, condNormalised, blockWeights, xBuffer],
                 Math.ceil(rows / tile), sources.normSplits);
           }
@@ -3338,7 +3381,7 @@ export class Af3DiffusionTransformerGpu {
             runBlock("ffw-adaln-reduce", compiled.ffwAdalnReduce,
                 [noResidual ? preBuffer : actBuffer, blockWeights, normPartials, xBuffer],
                 Math.ceil(rows / tile), sources.normSplits);
-          } else {
+          } else if (!(noResidual && batchedGates)) {
             // 🔴 THE TRANSITION'S INPUT IS THE PRE-ATTENTION ACTIVATION under
             // rosettafold3, and the ONLY difference the block wiring makes.
             // `ffw-out` still adds into `actBuffer`, which by then holds
@@ -3350,15 +3393,16 @@ export class Af3DiffusionTransformerGpu {
                   : [condNormalised, blockWeights, ffwSource, xBuffer],
                 Math.ceil(rows / tile), sources.normSplits);
           }
+          const wideInput = noResidual && batchedGates ? preBuffer : xBuffer;
           if (kSplits > 1) {
-            runBlock("ffw-wide", compiled.ffwWide, [xBuffer, blockWeights, widePartials],
+            runBlock("ffw-wide", compiled.ffwWide, [wideInput, blockWeights, widePartials],
                 Math.ceil(rows / wideTile), sources.wideSplits, kSplits);
             const wideGroups = Math.ceil(
               (rows * channels * weights.transitionFactor) / (shape.lanes ?? 256));
             runBlock("ffw-wide-reduce", compiled.ffwWideReduce, [widePartials, gatedBuffer],
                 Math.min(wideGroups, GRID_WIDTH), Math.ceil(wideGroups / GRID_WIDTH));
           } else {
-            runBlock("ffw-wide", compiled.ffwWide, [xBuffer, blockWeights, gatedBuffer],
+            runBlock("ffw-wide", compiled.ffwWide, [wideInput, blockWeights, gatedBuffer],
                 Math.ceil(rows / wideTile), sources.wideSplits);
           }
           if (outKSplits > 1) {

@@ -166,7 +166,8 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
            int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,
            const float* resY = nullptr, const float* resGate = nullptr, int resLd = 0, const half* resYh = nullptr,
-           float resScale = 1.f, bool preSigmoid = true);
+           float resScale = 1.f, bool preSigmoid = true, const float* fScale = nullptr, const float* fShift = nullptr,
+           half* fOut = nullptr);
 
 // ---------------------------------------------------------------- the diffusion head and its sampler (diffusion.mm)
 // how far a template.pdb record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at

@@ -1060,13 +1060,13 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
 }
 static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float* bias, const float* norm, size_t rows, int in, int out,
                    float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
-                   half* lnOut2, const float* lnScale2, const float* lnOffset2) {
+                   half* lnOut2, const float* lnScale2, const float* lnOffset2, bool after) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
   if (!on || rows < 1 || out % 128 || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
-  a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm;
+  a.alpha = alpha; a.beta = 1.f; a.epilogue = 8192; a.bias = (uint64_t)bias; a.aux = (uint64_t)norm; a.tgC = after ? 1 : 0;
   if (lnOut) {
     a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps;
     a.lnOut2 = (uint64_t)lnOut2; a.lnScale2 = (uint64_t)lnScale2; a.lnOffset2 = (uint64_t)lnOffset2;
@@ -1076,13 +1076,13 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
-                half* lnOut2, const float* lnScale2, const float* lnOffset2) {
-  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2);
+                half* lnOut2, const float* lnScale2, const float* lnOffset2, bool after) {
+  return opmOut(X, W, pair, F32, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2, after);
 }
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
-                half* lnOut2, const float* lnScale2, const float* lnOffset2) {
-  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2);
+                half* lnOut2, const float* lnScale2, const float* lnOffset2, bool after) {
+  return opmOut(X, W, pair, F16, bias, norm, rows, in, out, alpha, lnOut, lnScale, lnOffset, lnEps, lnOut2, lnScale2, lnOffset2, after);
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

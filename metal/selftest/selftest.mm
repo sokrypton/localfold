@@ -450,14 +450,16 @@ int main() {
     size_t rows = (size_t)bi * L; int in = O * O;
     auto W = randv((size_t)in * C, 0.1f), bias = randv(128), norm = randv(rows, 0.5f), P0 = randv(rows * C);
     for (auto& v : norm) v = std::abs(v) + 1.f;
-    std::vector<double> refF(rows * C), refH(rows * C);
+    std::vector<double> refF(rows * C), refH(rows * C), refAfter(rows * C);
     auto xh = download(dX, rows * in);
     for (size_t r = 0; r < rows; ++r) for (int o = 0; o < C; ++o) {
       double s = 0;
       for (int k = 0; k < in; ++k) s += (double)(float)xh[r * in + k] * (float)(half)W[(size_t)k * C + o];
       double add = (bias[o & 127] + 2.0 * s) / (1e-3 + norm[r]);
+      double addAfter = (2.0 * s) / std::max((double)norm[r], 1.0) + bias[o & 127];
       refF[r * C + o] = P0[r * C + o] + add;
       refH[r * C + o] = (double)(float)(half)P0[r * C + o] + add;
+      refAfter[r * C + o] = P0[r * C + o] + addAfter;
     }
     half* dW = uploadNew(toH(W).data(), W.size()); float* db = uploadNew(bias.data(), bias.size());
     float* dn = uploadNew(norm.data(), norm.size());
@@ -465,6 +467,10 @@ int main() {
     if (gemmOpmOut(dX, dW, dPf, db, dn, rows, in, C, 2.f))
       report("outer product output add (float pair)", relRms(refF, download(dPf, rows * C)), 1e-3);
     else { ++failures; printf("  gemmOpmOut float: FAIL (not taken)\n"); }
+    upload(dPf, P0.data(), P0.size() * 4);
+    if (gemmOpmOut(dX, dW, dPf, db, dn, rows, in, C, 2.f, nullptr, nullptr, nullptr, 1e-5f, nullptr, nullptr, nullptr, true))
+      report("outer product output add, bias after norm", relRms(refAfter, download(dPf, rows * C)), 1e-3);
+    else { ++failures; printf("  gemmOpmOut after: FAIL (not taken)\n"); }
     if (gemmOpmOut(dX, dW, dPh, db, dn, rows, in, C, 2.f)) {
       auto h = download(dPh, rows * C);
       report("outer product output add (half pair)", relRms(refH, std::vector<float>(h.begin(), h.end())), 3e-3);

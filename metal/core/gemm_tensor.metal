@@ -596,9 +596,9 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         }
         if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
           const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
-          const float s = 1e-3f + ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
+          const float nv = ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
           const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-          const vec<TC, 4> st = lf_out4<TC>(cv + (b128 + v) / s);
+          const vec<TC, 4> st = lf_out4<TC>(cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv)));
           *(device vec<TC, 4>*)dp = st;
           if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
           continue;

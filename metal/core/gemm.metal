@@ -330,8 +330,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         } \
         if (g.epilogue & 8192) { \
           const float b128 = ((device const float*)g.bias)[col & 127]; \
-          const float s = 1e-3f + ((device const float*)g.aux)[(uint)((j) + sm) * ((uint)g.m >> 7) + ((uint)(i) >> 7)]; \
-          v = cv + (b128 + v) / s; \
+          const float nv = ((device const float*)g.aux)[(uint)((j) + sm) * ((uint)g.m >> 7) + ((uint)(i) >> 7)]; \
+          v = cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv)); \
         } \
       } else if (gated) { \
         if (g.epilogue & 4) v += bv2[t]; \
@@ -686,8 +686,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               if (g.biasType & 512) cv = ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc];
             }
             const float b128 = ((device const float*)g.bias)[ic & 127];
-            const float s = 1e-3f + ((device const float*)g.aux)[(uint)jr * ((uint)g.m >> 7) + ((uint)ic >> 7)];
-            v = cv + (b128 + v) / s;
+            const float nv = ((device const float*)g.aux)[(uint)jr * ((uint)g.m >> 7) + ((uint)ic >> 7)];
+            v = cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv));
             lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
             if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
             continue;

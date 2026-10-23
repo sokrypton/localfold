@@ -80,8 +80,8 @@ struct AtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float) kP
 struct AtomLogitsArgs { CP(float) flat; DP(float) out; uint block, nblocks, subsets, heads, queries, keys; };
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift (scale, shift read at row % period), to half or float (and kOut when paired)
 struct AdaLnArgs { DP(float) x; CP(float) scale; CP(float) shift; DP(half) out; DP(float) outF; CP(float) kScale; CP(float) kShift; DP(half) kOut;
-                   CP(float) resY; CP(half) resYh; CP(float) resGate; u64 rows; uint C, period, ld, raw; float eps; uint chained, resLd;
-                   float resScale; };
+                   CP(float) resY; CP(half) resYh; CP(float) resGate; CP(float) fScale; CP(float) fShift; DP(half) fOut;
+                   u64 rows; uint C, period, ld, raw; float eps; uint chained, resLd; float resScale; };
 struct SigmoidAtomArgs { DP(float) qs; DP(float) ks; DP(float) fs; DP(float) zg; DP(float) tg; u64 n; uint raw, pad; };
 // rows of 16-byte chunks gathered: out[r] = mask[g] ? in[idx[g] + k srcRows] : 0, r = k count + g
 struct GatherRowsArgs { CP(uchar) in; CP(int) idx; CP(float) mask; DP(uchar) out; u64 rows, count, srcRows; uint chunks, pad; };
@@ -93,9 +93,10 @@ struct GatedResidualArgs { DP(float) act; CP(float) y; CP(half) yh; CP(float) ga
 struct MulHArgs { DP(half) x; CP(half) y; u64 n; };
 // act[q] = qStart[q] + qMask[q] (positions gathered to q) W, W [3][C]
 struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(float) atomMask; CP(int) idx; CP(float) gmask; CP(float) Wp;
-                          CP(float) qMask; DP(float) act; u64 rows, q1, atoms; uint C; float posScale;
-                          CP(float) qScale; CP(float) qShift; DP(half) xq; CP(float) kScale; CP(float) kShift; DP(half) xk;
-                          float eps; uint chained; };
+                          CP(float) qMask; DP(float) act; CP(float) qScale; CP(float) qShift; DP(half) xq;
+                          CP(float) kScale; CP(float) kShift; DP(half) xk; CP(float) fScale; CP(float) fShift; DP(half) fOut;
+                          CP(float) chiralGrads; CP(float) Wc;
+                          u64 rows, q1, atoms; uint C; float posScale; float eps; uint chained; };
 // per token: the mean over its real atoms of relu(projected), gathered back to the token's atoms
 struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(float) atomMask; CP(float) tokenBias; DP(float) out;
                        u64 rows, q1; uint tokens, dense, Cp, pad; };
@@ -121,10 +122,10 @@ struct FoldCondArgs { CP(float) scale; CP(half) w; DP(half) out; uint Cc, C, ld,
 struct GatedResStridedArgs { DP(float) act; CP(float) y; CP(float) gate; u64 rows; uint C, period, ld, pad; };
 struct AddBroadcastArgs { DP(float) x; CP(float) v; u64 n, total; };            // x[t] += v[t % n]
 // the decoder's start: act[q] = (the query's token's projection + skip[q]) qMask
-struct BroadcastSkipArgs { CP(float) proj; CP(int) idx; CP(float) gmask; CP(float) skip; CP(float) qMask; DP(float) act; u64 rows, q1;
-                           uint C, tokens, dense, pad;
+struct BroadcastSkipArgs { CP(float) proj; CP(int) idx; CP(float) gmask; CP(float) skip; CP(float) qMask; DP(float) act;
                            CP(float) qScale; CP(float) qShift; DP(half) xq; CP(float) kScale; CP(float) kShift; DP(half) xk;
-                           float eps; uint chained; };
+                           CP(float) fScale; CP(float) fShift; DP(half) fOut;
+                           u64 rows, q1; uint C, tokens, dense, pad; float eps; uint chained; };
 // upd[row] = LN(act[row] qMask) W, W [C][3]
 struct MaskLnProject3Args { CP(float) act; CP(float) qMask; CP(float) scale; CP(float) offset; CP(float) Wp; DP(float) upd;
                             CP(float) resY; CP(float) resGate; u64 rows, q1; uint C, pad; };
@@ -161,8 +162,8 @@ struct OuterProdArgs { CP(float) a; CP(float) b; DP(half) out; uint i0, rows, n,
 struct KqNormArgs { DP(half) q; DP(half) k; CP(float) qBias; CP(float) qs; CP(float) qo; CP(float) ks; CP(float) ko; u64 rows;
                     uint ldq, ldk, Wd, pad; };
 // d/dx of the sum over an atom's chirality centres of (improper dihedral - ideal)^2, by central differences
-struct ChiralGradArgs { CP(float) positions; CP(int) centers; CP(float) angles; CP(int) offsets; CP(int) entries; DP(float) grads;
-                        u64 atoms; uint ns, pad; };
+struct ChiralGradArgs { CP(float) positions; CP(float) atomMask; CP(int) centers; CP(float) angles; CP(int) offsets; CP(int) entries;
+                        DP(float) grads; u64 atoms; uint ns; float posScale; };
 // a masked LayerNorm over a WHOLE tensor (rf3's confidence inputs): per-threadgroup partial sums (and live rows), then
 // the statistics over `vendorWidth` columns (the missing ones zero), then applied
 struct MaskedSumArgs { CP(float) x; CP(float) mask; DP(float) partial; CP(float) stat; u64 rows; uint C, pass; };
