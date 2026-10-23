@@ -966,7 +966,15 @@ kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / de
     float4 w0 = float4(((device const half4*)(a.wH + 0 * a.C))[c4]);
     float4 w1 = float4(((device const half4*)(a.wH + 1 * a.C))[c4]);
     float4 w2 = float4(((device const half4*)(a.wH + 2 * a.C))[c4]);
-    ((device float4*)a.out)[t] = ((device const float4*)a.c0)[t] + r0 * w0 + r1 * w1 + r2 * w2;
+    float4 qv = ((device const float4*)a.c0)[t] + r0 * w0 + r1 * w1 + r2 * w2;
+    ((device float4*)a.out)[t] = qv;
+    if (a.xmh && a.C == 128) {
+      float inv = rsqrt(simd_sum(dot(qv, qv)) * (1.f / 128.f) + RMS_EPS);
+      device const float* m = a.mod + (ulong)at * 6 * 128;
+      float4 sc = ((device const float4*)(m + 128))[c4];
+      float4 sh = ((device const float4*)m)[c4];
+      ((device half4*)(a.xmh + (ulong)at * 128))[c4] = half4(qv * inv * (1.f + sc) + sh);
+    }
     return;
   }
   if (t >= a.A * 6) return;
@@ -1166,7 +1174,15 @@ kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
   if (t >= a.A * C4) return;
   uint at = lf_udiv(t, C4), c4 = t - at * C4;
   int token = a.mask[at] != 0.f ? a.atomToToken[at] : 0;
-  ((device float4*)a.q)[t] += ((device const float4*)(a.perToken + (uint)token * a.C))[c4];
+  float4 qv = ((device const float4*)a.q)[t] + ((device const float4*)(a.perToken + (uint)token * a.C))[c4];
+  ((device float4*)a.q)[t] = qv;
+  if (a.xmh && a.C == 128) {
+    float inv = rsqrt(simd_sum(dot(qv, qv)) * (1.f / 128.f) + RMS_EPS);
+    device const float* m = a.mod + (ulong)at * 6 * 128;
+    float4 sc = ((device const float4*)(m + 128))[c4];
+    float4 sh = ((device const float4*)m)[c4];
+    ((device half4*)(a.xmh + (ulong)at * 128))[c4] = half4(qv * inv * (1.f + sc) + sh);
+  }
 }
 kernel void ef2_edm_combine(LF_ARGS(EdmArgs)) {
   uint t = (uint)LF_INDEX;
@@ -1290,25 +1306,44 @@ kernel void ef2_row_pool(constant RowPoolArgs& a [[buffer(0)]], uint3 tg [[threa
                          uint lane [[thread_index_in_simdgroup]]) {
   uint i = tg.x;
   threadgroup float red[8];
-  device float* sc = a.score + (ulong)i * a.T;
+  threadgroup float sc_tg[1024];
+  bool useTg = a.w && a.C == 256 && a.T <= 1024;
+  device float* sc = useTg ? nullptr : a.score + (ulong)i * a.T;
   float mx = -INFINITY;
-  for (uint j = tid; j < a.T; j += 256) mx = max(mx, sc[j]);
-  mx = simd_max(mx);
-  if (lane == 0) red[sg] = mx;
+  if (a.w && a.C == 256) {
+    device const float4* w4 = (device const float4*)a.w;
+    float4 w0 = w4[lane], w1 = w4[lane + 32];
+    for (uint j = sg; j < a.T; j += 8) {
+      device const float4* zr = (device const float4*)(a.z + ((ulong)i * a.T + j) * 256);
+      float v = simd_sum(dot(zr[lane], w0) + dot(zr[lane + 32], w1));
+      if (lane == 0) { if (useTg) sc_tg[j] = v; else sc[j] = v; }
+      mx = max(mx, v);
+    }
+    if (lane == 0) red[sg] = mx;
+  } else {
+    for (uint j = tid; j < a.T; j += 256) mx = max(mx, sc[j]);
+    mx = simd_max(mx);
+    if (lane == 0) red[sg] = mx;
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   mx = red[0]; for (int k = 1; k < 8; ++k) mx = max(mx, red[k]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float sum = 0;
-  for (uint j = tid; j < a.T; j += 256) { float e = exp(sc[j] - mx); sc[j] = e; sum += e; }
+  for (uint j = tid; j < a.T; j += 256) {
+    float v = useTg ? sc_tg[j] : sc[j];
+    float e = exp(v - mx);
+    if (useTg) sc_tg[j] = e; else sc[j] = e;
+    sum += e;
+  }
   sum = simd_sum(sum);
   if (lane == 0) red[sg] = sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float tot = 0; for (int k = 0; k < 8; ++k) tot += red[k];
-  for (uint j = tid; j < a.T; j += 256) sc[j] /= tot;
+  for (uint j = tid; j < a.T; j += 256) { if (useTg) sc_tg[j] /= tot; else sc[j] /= tot; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint c = tid; c < a.C; c += 256) {
     float acc = 0;
-    for (uint j = 0; j < a.T; ++j) acc += sc[j] * a.z[((ulong)i * a.T + j) * a.C + c];
+    for (uint j = 0; j < a.T; ++j) acc += (useTg ? sc_tg[j] : sc[j]) * a.z[((ulong)i * a.T + j) * a.C + c];
     a.pooled[(ulong)i * a.C + c] = acc;
   }
 }

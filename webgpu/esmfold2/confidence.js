@@ -199,6 +199,7 @@ ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
 /** `out[row, o] = sum_i in[row, i] * weight[i, o]`, the weight already transposed. */
 export function createProjectRowsShader({ rows, inChannels, outChannels }) {
   const stageRow = outChannels % 64 === 0 && inChannels <= 1024;
+  const stageWeight = outChannels === 1 && inChannels <= 1024;
   return `
 const ROWS: u32 = ${rows}u;
 const IN: u32 = ${inChannels}u;
@@ -208,7 +209,7 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-${stageRow ? "var<workgroup> rowBuf: array<f32, IN>;" : ""}
+${stageRow ? "var<workgroup> rowBuf: array<f32, IN>;" : ""}${stageWeight ? "var<workgroup> wBuf: array<f32, IN>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -222,6 +223,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${stageRow ? `for (var c = local.x; c < IN; c += 64u) {
     rowBuf[c] = source[rBase + c];
   }
+  workgroupBarrier();` : ""}${stageWeight ? `for (var c = local.x; c < IN; c += 64u) {
+    wBuf[c] = weight[c];
+  }
   workgroupBarrier();` : ""}
   if (slot >= ROWS * OUT) { return; }
   var sum = 0.0;
@@ -229,7 +233,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 ${Array.from({ length: inChannels % 8 === 0 ? 8 : 1 }, (_, u) =>
   stageRow
     ? `    sum += rowBuf[c + ${u}u] * weight[(c + ${u}u) * OUT + o];`
-    : `    sum += source[rBase + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
+    : stageWeight
+      ? `    sum += source[rBase + c + ${u}u] * wBuf[c + ${u}u];`
+      : `    sum += source[rBase + c + ${u}u] * weight[(c + ${u}u) * OUT + o];`).join("\n")}
   }
   out[slot] = sum;
 }`;
@@ -345,13 +351,29 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   let pairRow = i * TOKENS * CHANNELS;
 
-  for (var c = lane; c < CHANNELS; c += LANES) {
+${channels === 4 * LANES ? `  var sum0 = 0.0;
+  var sum1 = 0.0;
+  var sum2 = 0.0;
+  var sum3 = 0.0;
+  for (var j = 0u; j < TOKENS; j += 1u) {
+    let w = ${stageWeights ? "weights[j]" : "exp(biased(i, j) - peak)"};
+    let base = pairRow + j * CHANNELS + lane;
+    sum0 += w * pair[base];
+    sum1 += w * pair[base + ${LANES}u];
+    sum2 += w * pair[base + ${LANES * 2}u];
+    sum3 += w * pair[base + ${LANES * 3}u];
+  }
+  let outBase = i * CHANNELS + lane;
+  out[outBase] = sum0 / denominator;
+  out[outBase + ${LANES}u] = sum1 / denominator;
+  out[outBase + ${LANES * 2}u] = sum2 / denominator;
+  out[outBase + ${LANES * 3}u] = sum3 / denominator;` : `  for (var c = lane; c < CHANNELS; c += LANES) {
     var sum = 0.0;
     for (var j = 0u; j < TOKENS; j += 1u) {
       sum += ${stageWeights ? "weights[j]" : "exp(biased(i, j) - peak)"} * pair[pairRow + j * CHANNELS + c];
     }
     out[i * CHANNELS + c] = sum / denominator;
-  }
+  }`}
 }`;
 }
 
@@ -374,11 +396,14 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
   const keep = (a) => { allocations.push(a); return a; };
   try {
     // Asked for together, so they compile in parallel; see settleAll.
-    const [project, init] = await Promise.all([
+    const [project, init, sToZShader] = await Promise.all([
       pipelines.get(`ef2-conf-rank1:${tokens}:${channels}:${channels}`,
         createRankOneProjectShader({ tokens, channels, outChannels: channels })),
       pipelines.get(`ef2-conf-pair-init:${tokens}:${channels}:${weights.boundaries.length}`,
         createPairInitShader({ tokens, channels, edges: weights.boundaries.length })),
+      input.normed === undefined ? undefined : pipelines.get(
+        `ef2-conf-project:${tokens}:${weights.singleInputs}:${channels}`,
+        createProjectRowsShader({ rows: tokens, inChannels: weights.singleInputs, outChannels: channels })),
     ]);
 
     // 🔴 THE FOUR s -> z PROJECTIONS ON THE DEVICE when the fold hands over the
@@ -386,29 +411,19 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     // 451 -> 256` each, ~180 ms at 255 tokens with the GPU idle - uploaded
     // here straight after. Same weights, same k order, accumulated in f32
     // where JavaScript accumulated in f64.
-    const projected4 = input.normed === undefined ? undefined : await (async () => {
-      const inChannels = weights.singleInputs;
-      const shader = await pipelines.get(`ef2-conf-project:${tokens}:${inChannels}:${channels}`,
-        createProjectRowsShader({ rows: tokens, inChannels, outChannels: channels }));
+    const projected4 = input.normed === undefined ? undefined : (() => {
       const source = keep(allocator.upload("ef2-conf.s-inputs-normed", input.normed, storage()));
-      const outputs = {};
-      const encoder = device.createCommandEncoder({ label: "ef2-conf.s-to-z" });
-      const pass = encoder.beginComputePass({ label: "ef2-conf.s-to-z" });
-      pass.setPipeline(shader);
-      const groups = Math.ceil(tokens * channels / 64);
+      const outputs = { source, dispatches: [] };
       for (const [name, matrix] of [["rows", weights.sToZ], ["cols", weights.sToZTranspose],
                                     ["left", weights.sToZProdIn1], ["right", weights.sToZProdIn2]]) {
         outputs[name] = keep(allocator.allocate(`ef2-conf.${name}`, tokens * channels * 4, storage()));
-        pass.setBindGroup(0, device.createBindGroup({
-          layout: shader.getBindGroupLayout(0),
+        outputs.dispatches.push(device.createBindGroup({
+          layout: sToZShader.getBindGroupLayout(0),
           entries: [source, keep(allocator.upload(`ef2-conf.w-${name}`, matrix, storage())),
                     outputs[name]].map((allocation, binding) => ({
             binding, resource: { buffer: allocation.buffer } })),
         }));
-        pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       }
-      pass.end();
-      device.queue.submit([encoder.finish()]);
       return outputs;
     })();
     const left = projected4?.left ?? keep(allocator.upload("ef2-conf.left", input.left, storage()));
@@ -435,6 +450,16 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
 
     device.pushErrorScope("validation");
     const encoder = device.createCommandEncoder({ label: "ef2-confidence-pair-init" });
+    if (projected4 !== undefined) {
+      const sPass = encoder.beginComputePass({ label: "ef2-conf.s-to-z" });
+      sPass.setPipeline(sToZShader);
+      const groups = Math.ceil(tokens * channels / 64);
+      for (const bindGroup of projected4.dispatches) {
+        sPass.setBindGroup(0, bindGroup);
+        sPass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      }
+      sPass.end();
+    }
     let pass = encoder.beginComputePass({ label: "ef2-conf.project" });
     pass.setPipeline(project);
     pass.setBindGroup(0, bind(project,

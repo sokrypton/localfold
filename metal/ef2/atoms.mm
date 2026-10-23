@@ -83,7 +83,7 @@ void prepareAtomWeights() {
     }
 }
 static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sch, const std::string& B, int halfWindow,
-                     const float* preMod) {
+                     const float* preMod, bool preXm) {
   size_t A = a.A; int C = a.C;
   float* mod = preMod ? const_cast<float*>(preMod) : scratch<float>("atom.mod", A * 6 * C);
   float* ctx = scratch<float>("atom.ctx", A * C);
@@ -91,7 +91,7 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
   if (HALF_GEMM) {
     if (!preMod) lin(sch, B + "adaln", mod, A, C, 6 * C);
     half* xmh = scratch<half>("atom.xmh", A * C);
-    run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, nullptr, xmh, nullptr, (uint)A, (uint)C, 0, 1, 0, 0});
+    if (!preXm) run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, nullptr, xmh, nullptr, (uint)A, (uint)C, 0, 1, 0, 0});
     float* qkvg = scratch<float>("atom.qkv", A * 4 * C);
     {
       Gemm G{}; G.X = xmh; G.tx = F16; G.W = swaQkvg(B, C); G.tw = F16; G.Y = qkvg; G.ty = F32;
@@ -150,7 +150,7 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
   run1d("ef2_gated_add", (A * C) >> 2, GatedAddArgs{x, mod, att, (uint)A, (uint)C, 5, 0});
 }
 void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocks, int halfWindow,
-              const float* preMod) {
+              const float* preMod, bool preXm) {
   size_t n = (size_t)a.A * a.C;
   float* sc = nullptr; half* sch = nullptr;
   float* stackedMod = nullptr;
@@ -177,7 +177,7 @@ void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& 
   }
   for (int b = 0; b < blocks; ++b)
     swaBlock(a, x, sc, sch, "f/" + prefix + "/blocks/" + std::to_string(b) + "/", halfWindow,
-             preMod ? preMod + (size_t)b * a.A * 6 * a.C : nullptr);
+             preMod ? preMod + (size_t)b * a.A * 6 * a.C : nullptr, b == 0 && preXm);
 }
 
 // the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]

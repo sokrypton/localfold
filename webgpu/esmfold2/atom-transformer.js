@@ -196,7 +196,8 @@ ${steps.join("\n")}
 }`;
 }
 
-function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex, scaleIndex) {
+function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex, scaleIndex,
+                                      separateNextMod = false) {
   const steps = [];
   for (let s = LANES >> 1; s >= 8; s >>= 1) {
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
@@ -206,12 +207,15 @@ function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex
                + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();`);
+  const nextModDecl = separateNextMod
+    ? "\n@group(0) @binding(4) var<storage, read> nextModulation: array<f32>;" : "";
+  const modAfter = separateNextMod ? "nextModulation" : "modulation";
   if (channels === 2 * LANES) {
     return `
 @group(0) @binding(0) var<storage, read> delta: array<f32>;
 @group(0) @binding(1) var<storage, read> modulation: array<f32>;
 @group(0) @binding(2) var<storage, read_write> activation: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;${nextModDecl}
 
 var<workgroup> squares: array<f32, ${LANES}>;
 
@@ -235,15 +239,15 @@ ${steps.join("\n")}
   let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
   let scaleBase = modBase + ${scaleIndex * channels}u;
   let shiftBase = modBase + ${shiftIndex * channels}u;
-  output[base + c0] = v0 * inverse * (1.0 + modulation[scaleBase + c0]) + modulation[shiftBase + c0];
-  output[base + c1] = v1 * inverse * (1.0 + modulation[scaleBase + c1]) + modulation[shiftBase + c1];
+  output[base + c0] = v0 * inverse * (1.0 + ${modAfter}[scaleBase + c0]) + ${modAfter}[shiftBase + c0];
+  output[base + c1] = v1 * inverse * (1.0 + ${modAfter}[scaleBase + c1]) + ${modAfter}[shiftBase + c1];
 }`;
   }
   return `
 @group(0) @binding(0) var<storage, read> delta: array<f32>;
 @group(0) @binding(1) var<storage, read> modulation: array<f32>;
 @group(0) @binding(2) var<storage, read_write> activation: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;${nextModDecl}
 
 var<workgroup> squares: array<f32, ${LANES}>;
 var<workgroup> rowBuf: array<f32, ${channels}>;
@@ -267,6 +271,91 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 ${steps.join("\n")}
   let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let scaleBase = modBase + ${scaleIndex * channels}u;
+  let shiftBase = modBase + ${shiftIndex * channels}u;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let scale = ${modAfter}[scaleBase + c];
+    let shift = ${modAfter}[shiftBase + c];
+    output[base + c] = rowBuf[c] * inverse * (1.0 + scale) + shift;
+  }
+}`;
+}
+
+function createBroadcastModulateShader({ atoms, channels }, shiftIndex, scaleIndex) {
+  const steps = [];
+  for (let s = LANES >> 1; s >= 8; s >>= 1) {
+    steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
+  }
+  steps.push(`  if (local.x == 0u) {
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+               + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();`);
+  if (channels === 2 * LANES) {
+    return `
+@group(0) @binding(0) var<storage, read> skip: array<f32>;
+@group(0) @binding(1) var<storage, read> perToken: array<f32>;
+@group(0) @binding(2) var<storage, read> atomToToken: array<i32>;
+@group(0) @binding(3) var<storage, read_write> activation: array<f32>;
+@group(0) @binding(4) var<storage, read> modulation: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+
+var<workgroup> squares: array<f32, ${LANES}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let atom = group.x + group.y * ${GRID_WIDTH}u;
+  if (atom >= ${atoms}u) { return; }
+  let base = atom * ${channels}u;
+  let tokBase = u32(atomToToken[atom]) * ${channels}u;
+  let c0 = local.x;
+  let c1 = local.x + ${LANES}u;
+  let v0 = skip[base + c0] + perToken[tokBase + c0];
+  let v1 = skip[base + c1] + perToken[tokBase + c1];
+  activation[base + c0] = v0;
+  activation[base + c1] = v1;
+  squares[local.x] = v0 * v0 + v1 * v1;
+  workgroupBarrier();
+${steps.join("\n")}
+  let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let modBase = atom * ${channels * 6}u;
+  let scaleBase = modBase + ${scaleIndex * channels}u;
+  let shiftBase = modBase + ${shiftIndex * channels}u;
+  output[base + c0] = v0 * inverse * (1.0 + modulation[scaleBase + c0]) + modulation[shiftBase + c0];
+  output[base + c1] = v1 * inverse * (1.0 + modulation[scaleBase + c1]) + modulation[shiftBase + c1];
+}`;
+  }
+  return `
+@group(0) @binding(0) var<storage, read> skip: array<f32>;
+@group(0) @binding(1) var<storage, read> perToken: array<f32>;
+@group(0) @binding(2) var<storage, read> atomToToken: array<i32>;
+@group(0) @binding(3) var<storage, read_write> activation: array<f32>;
+@group(0) @binding(4) var<storage, read> modulation: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+
+var<workgroup> squares: array<f32, ${LANES}>;
+var<workgroup> rowBuf: array<f32, ${channels}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let atom = group.x + group.y * ${GRID_WIDTH}u;
+  if (atom >= ${atoms}u) { return; }
+  let base = atom * ${channels}u;
+  let tokBase = u32(atomToToken[atom]) * ${channels}u;
+  var square = 0.0;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let v = skip[base + c] + perToken[tokBase + c];
+    activation[base + c] = v;
+    rowBuf[c] = v;
+    square += v * v;
+  }
+  squares[local.x] = square;
+  workgroupBarrier();
+${steps.join("\n")}
+  let inverse = inverseSqrt(squares[0] / ${channels}.0 + ${RMS_EPSILON});
+  let modBase = atom * ${channels * 6}u;
   let scaleBase = modBase + ${scaleIndex * channels}u;
   let shiftBase = modBase + ${shiftIndex * channels}u;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
@@ -687,6 +776,10 @@ export async function compileAtomStack(pipelines, shape) {
       createModulateShader({ atoms, channels }, SHIFT_FFN, SCALE_FFN)),
     residualModulateFfn: pipelines.get(`${base}:res-mod-f`,
       createResidualModulateShader({ atoms, channels }, GATE_ATTENTION, SHIFT_FFN, SCALE_FFN)),
+    residualModulateAttention: pipelines.get(`${base}:res-mod-a`,
+      createResidualModulateShader({ atoms, channels }, GATE_FFN, SHIFT_ATTENTION, SCALE_ATTENTION, true)),
+    broadcastModulateAttention: pipelines.get(`${base}:bcast-mod-a`,
+      createBroadcastModulateShader({ atoms, channels }, SHIFT_ATTENTION, SCALE_ATTENTION)),
     swiglu: pipelines.get(`${base}:swiglu`,
       createSwigluShader({ rows: atoms, model: channels, ffn: hidden })),
     ffnDown: linear("ffn-down", hidden, channels),
@@ -742,15 +835,19 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
         [state.conditioning, scratch.siluCond], ...rows(atoms * channels));
   }
 
-  for (const block of weights) {
+  let preNormalised = state.preNormalised === true;
+  for (let index = 0; index < weights.length; index += 1) {
+    const block = weights[index];
     const modulation = block.modulation ?? scratch.modulation;
     if (block.modulation === undefined) {
       run("esmfold2.atom.adaln", pipelines.modulation,
           [scratch.siluCond, block.adaln, modulation],
           ...linearGrid(atoms, channels * 6));
     }
-    run("esmfold2.atom.modulate-a", pipelines.modulateAttention,
-        [state.activation, modulation, scratch.normalised], ...perAtom);
+    if (!preNormalised) {
+      run("esmfold2.atom.modulate-a", pipelines.modulateAttention,
+          [state.activation, modulation, scratch.normalised], ...perAtom);
+    }
     run("esmfold2.atom.qkv", pipelines.qkv,
         [scratch.normalised, block.qkv, scratch.qkv], ...linearGrid(atoms, channels * 3));
     run("esmfold2.atom.gate", pipelines.gate,
@@ -769,8 +866,16 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
         [scratch.normalised, block.ffnUp, hiddenBuf], ...swigluGrid(atoms, hidden));
     run("esmfold2.atom.ffn-down", pipelines.ffnDown,
         [hiddenBuf, block.ffnDown, delta], ...linearGrid(atoms, channels));
-    run("esmfold2.atom.residual-f", pipelines.residualFfn,
-        [delta, modulation, state.activation], ...rows(atoms * channels));
+    const nextModulation = weights[index + 1]?.modulation;
+    if (block.modulation !== undefined && nextModulation !== undefined) {
+      run("esmfold2.atom.res-mod-a", pipelines.residualModulateAttention,
+          [delta, modulation, state.activation, scratch.normalised, nextModulation], ...perAtom);
+      preNormalised = true;
+    } else {
+      run("esmfold2.atom.residual-f", pipelines.residualFfn,
+          [delta, modulation, state.activation], ...rows(atoms * channels));
+      preNormalised = false;
+    }
   }
 }
 
@@ -815,12 +920,6 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       context.atomConditioning, storage | GPUBufferUsage.COPY_SRC));
     const activation = keep(allocator.allocate("esmfold2.embed.act",
       atoms * channels * 4, storage | (context.capture === undefined ? 0 : GPUBufferUsage.COPY_SRC) | GPUBufferUsage.COPY_DST));
-    // 🔴 THE ACTIVATION STARTS AT THE CONDITIONING ITSELF, not at zero:
-    // `atom_stack(c0, c0)` passes the same tensor as the running activation and
-    // as the conditioning, and only the first is updated.
-    const copy = device.createCommandEncoder({ label: "esmfold2.embed.start" });
-    copy.copyBufferToBuffer(conditioning.buffer, 0, activation.buffer, 0, atoms * channels * 4);
-    device.queue.submit([copy.finish()]);
 
     const state = {
       activation, conditioning,
@@ -849,6 +948,10 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       weights.atomToToken, storage));
 
     const encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
+    // 🔴 THE ACTIVATION STARTS AT THE CONDITIONING ITSELF, not at zero:
+    // `atom_stack(c0, c0)` passes the same tensor as the running activation and
+    // as the conditioning, and only the first is updated.
+    encoder.copyBufferToBuffer(conditioning.buffer, 0, activation.buffer, 0, atoms * channels * 4);
     const batch = deviceTuning(device).batchComputePasses !== false;
     let openPass = null;
     const run = (label, pipeline, buffers, x, y = 1) => {

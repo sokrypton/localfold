@@ -349,6 +349,20 @@ static void opmAdd(half* pair, const float* Y, const float* bias, const float* n
   run1d("af2_opm_add_h", (size_t)bi * L * 32, OpmAddHArgs{pair, Y, bias, norm, lnOut, lnScale, lnOffset, (u64)i0, (uint)bi, (uint)L, 128, 0});
 }
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] @ W + b) / (1e-3 + norm[i][j])
+struct OpmW { const half* w2; const float* b2; };
+static OpmW opmWeights(const std::string& Op, int blk, int C, int O) {
+  int B = blk < 0 ? 1 : (int)dimW(Op + "/left_projection/weights", 0);
+  size_t b = blk < 0 ? 0 : (size_t)blk;
+  half* w2 = M.derived<half>("opm2:" + Op, (size_t)B * C * 2 * O, [&](half* out) {
+    copy2d(out, 2 * O * 2, PH(Op + "/left_projection/weights"), O * 2, O * 2, (size_t)B * C);
+    copy2d(out + O, 2 * O * 2, PH(Op + "/right_projection/weights"), O * 2, O * 2, (size_t)B * C);
+  });
+  float* b2 = M.derived<float>("opm2b:" + Op, (size_t)B * 2 * O, [&](float* out) {
+    copy2d(out, 2 * O * 4, P(Op + "/left_projection/bias"), O * 4, O * 4, (size_t)B);
+    copy2d(out + O, 2 * O * 4, P(Op + "/right_projection/bias"), O * 4, O * 4, (size_t)B);
+  });
+  return {w2 + b * C * 2 * O, b2 + b * 2 * O};
+}
 template <class A>
 static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* msa, A* pair, int rowsN, int C, const float* msaMask,
                              bool ones, const std::string& nextNorm = "", const std::string& nextNorm2 = "",
@@ -356,15 +370,16 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   half* xn = pairLn(msa, rows, C, Op + "/layer_norm_input", blk, "opm.xn", nextMsaNorm, blk, "ln.m");
-  half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
-  for (int side = 0; side < 2; ++side) {
-    std::string w = Op + (side ? "/right_projection" : "/left_projection");
-    Gemm g{}; g.X = xn; g.tx = F16; g.W = PH(w + "/weights", blk); g.tw = F16; g.Y = side ? rt : lt; g.ty = F16; g.rows = rows;
-    g.in = C; g.out = O; g.bias = P(w + "/bias", blk); g.label = "opm projection";
+  OpmW opm = opmWeights(Op, blk, C, O);
+  half* lrt = scratch<half>("opm.left", rows * 2 * O);
+  half* lt = lrt; half* rt = lrt + O;
+  {
+    Gemm g{}; g.X = xn; g.tx = F16; g.W = opm.w2; g.tw = F16; g.Y = lrt; g.ty = F16; g.rows = rows;
+    g.in = C; g.out = 2 * O; g.bias = opm.b2; g.label = "opm projection";
     gemm(g);
   }
   if (!ones) {
-    run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{lt, rt, msaMask, rows, (uint)O, 0});
+    run1d("af2_scale_rows_h", rows * ((2 * O) >> 2), ScaleRowsHArgs{lrt, nullptr, msaMask, rows, (uint)(2 * O), 0});
   }
   // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
   static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
@@ -390,17 +405,17 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
     // T[c][(s, j)][f] = sum_e r[s][j][e] W[c O + e][f], a GEMM batched over c - then Y[i][(j, f)] = sum_{c, s}
     // l[s][i][c] T[(c, s)][(j, f)], one GEMM of K = O S: n^2 S O 128 against the standard form's n^2 O^2 (S + 128)
     half* T = scratch<half>("opm.T", (size_t)O * rows * 128);
-    { Gemm g{}; g.X = rt; g.tx = F16; g.W = Wout; g.tw = F16; g.sw = (int64_t)O * 128; g.Y = T; g.ty = F16; g.sy = (int64_t)rows * 128;
+    { Gemm g{}; g.X = rt; g.ldx = 2 * O; g.tx = F16; g.W = Wout; g.tw = F16; g.sw = (int64_t)O * 128; g.Y = T; g.ty = F16; g.sy = (int64_t)rows * 128;
       g.rows = rows; g.in = O; g.out = 128; g.batch = O; g.accFloat = true; g.label = "opm shallow T"; gemm(g); }
     half* Lt = scratch<half>("opm.Lt", rows * O);
     const bool foldOnes = ones && (!lnOut || (L > 64 && L <= 128));
     const float inv = foldOnes ? 1.f / (1e-3f + (float)rowsN) : 1.f;
-    run1d("af2_opm_left", rows * O, OpmLeftArgs{lt, Lt, (uint)rowsN, (uint)L, (uint)O, inv});
+    float* bt = foldOnes ? scratch<float>("opm.btile", (size_t)L * 128) : nullptr;
+    run1d("af2_opm_left", std::max<size_t>(rows * O, bt ? (size_t)L * 32 : 0),
+          OpmLeftArgs{lt, Lt, (uint)rowsN, (uint)L, (uint)O, inv, 2u * (uint)O, bt ? P(Op + "/output_b", blk) : nullptr, bt});
     int K = O * rowsN;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
     if (foldOnes) {     // every row live: the norm is rowsN everywhere, folded into the GEMM (L scaled, the bias tiled)
-      float* bt = scratch<float>("opm.btile", (size_t)L * 128);
-      run1d("af2_tile_bias", (size_t)L * 128, TileBiasArgs{P(Op + "/output_b", blk), bt, (uint)L, 128, inv, 0});
       for (int i0 = 0; i0 < L; i0 += Bi) {
         int bi = std::min(Bi, L - i0);
         Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = pair + (size_t)i0 * L * 128; g.ty = dtOf<A>(); g.beta = 1.f;
@@ -446,9 +461,9 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass)
-    if (!gemmOpmPermuted(lt + (size_t)i0 * O, L * O, rt, L * O, X, bi, L, O, rowsN, down)) {
+    if (!gemmOpmPermuted(lt + (size_t)i0 * 2 * O, L * 2 * O, rt, L * 2 * O, X, bi, L, O, rowsN, down)) {
       half* Pm = scratch<half>("opm.P", (size_t)Bi * per);
-      { Gemm g{}; g.X = lt + (size_t)i0 * O; g.tx = F16; g.transX = true; g.ldx = L * O; g.W = rt; g.tw = F16; g.ldw = L * O; g.Y = Pm;
+      { Gemm g{}; g.X = lt + (size_t)i0 * 2 * O; g.tx = F16; g.transX = true; g.ldx = L * 2 * O; g.W = rt; g.tw = F16; g.ldw = L * 2 * O; g.Y = Pm;
         g.ty = F16; g.rows = (size_t)bi * O; g.in = rowsN; g.out = L * O; g.alpha = down; g.accFloat = true; g.label = "opm product";
         gemm(g); }
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
@@ -573,6 +588,7 @@ void prepareWeights() {
     const int C = ex ? 64 : 256;
     attnWeights(S + "msa_row_attention_with_pair_bias/attention", 0, C);
     if (!ex) attnWeights(S + "msa_column_attention/attention", 0, C);
+    opmWeights(S + "outer_product_mean", 0, C, 32);
     attnWeights(S + "triangle_attention_starting_node/attention", 0, 128);
     attnWeights(S + "triangle_attention_ending_node/attention", 0, 128);
     triWeights(S + "triangle_multiplication_outgoing", 0, 128);

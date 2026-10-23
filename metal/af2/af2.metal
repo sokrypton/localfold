@@ -337,12 +337,16 @@ kernel void af2_opm_add_h(LF_ARGS(OpmAddHArgs)) {
 // lt [s][i][c] -> [i][c][s] (scaled): the shallow outer product's left operand
 kernel void af2_opm_left(LF_ARGS(OpmLeftArgs)) {
   ulong t = LF_INDEX;
+  if (a.bt && t < (ulong)a.L * 32) {
+    ((device float4*)a.bt)[t] = ((device const float4*)a.bias)[t & 31] * a.scale;
+  }
   const ulong total = (ulong)a.S * a.L * a.O;
   if (t >= total) return;
   uint s, c, i;      // (32-bit division where the index fits: the 64-bit one is slow)
   if (total <= 0xffffffffull) { uint r = lf_udiv((uint)t, a.S); s = (uint)t - r * a.S; i = lf_udiv(r, a.O); c = r - i * a.O; }
   else { s = (uint)(t % a.S); ulong r = t / a.S; c = (uint)(r % a.O); i = (uint)(r / a.O); }
-  a.out[t] = (half)((float)a.lt[((ulong)s * a.L + i) * a.O + c] * a.scale);
+  uint ld = a.ld ? a.ld : a.O;
+  a.out[t] = (half)((float)a.lt[((ulong)s * a.L + i) * ld + c] * a.scale);
 }
 kernel void af2_tile_bias(LF_ARGS(TileBiasArgs)) {      // [L][C] of bias[c] scale
   uint t = (uint)LF_INDEX;

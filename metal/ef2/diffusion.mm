@@ -385,19 +385,21 @@ static void denoiseStep(const Denoiser& d, const float* xNoisy, float* xDenoised
                         const float* G, const float* sTok) {
   int T = d.T, A = d.A, Ct = d.Ct; const AtomCtx& ac = d.atoms.ctx; int Ca = ac.C;
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
+  half* xmh = (HALF_GEMM && Ca == 128 && d.encMod) ? scratch<half>("atom.xmh", (size_t)A * Ca) : nullptr;
   if (HALF_GEMM && (Ca & 3) == 0) {
     run1d("ef2_coords_input", ((size_t)A * Ca) >> 2,
-          CoordsInputArgs{xNoisy, level, q, nullptr, (uint)A, (uint)Ca, d.atoms.c0, Fh("diffusionAtomEncoder/coordsLinear")});
+          CoordsInputArgs{xNoisy, level, q, nullptr, (uint)A, (uint)Ca, d.atoms.c0, Fh("diffusionAtomEncoder/coordsLinear"),
+                          xmh ? d.encMod : nullptr, xmh});
   } else if (HALF_GEMM) {
     half* r6h = scratch<half>("dn.r6", (size_t)A * 6);
-    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, nullptr, r6h, (uint)A, 0, nullptr, nullptr});
+    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, nullptr, r6h, (uint)A, 0, nullptr, nullptr, nullptr, nullptr});
     lin(r6h, "f/diffusionAtomEncoder/coordsLinear", q, A, 6, Ca, 1.f, nullptr, 1.f, d.atoms.c0);     // + c0
   } else {
     float* r6 = scratch<float>("dn.r6", (size_t)A * 6);
-    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, r6, nullptr, (uint)A, 0, nullptr, nullptr});
+    run1d("ef2_coords_input", (size_t)A * 6, CoordsInputArgs{xNoisy, level, r6, nullptr, (uint)A, 0, nullptr, nullptr, nullptr, nullptr});
     lin(r6, "f/diffusionAtomEncoder/coordsLinear", q, A, 6, Ca, 1.f, nullptr, 1.f, d.atoms.c0);      // + c0
   }
-  swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.encMod);
+  swaStack(ac, q, d.atoms.c0, "diffusionAtomEncoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.encMod, xmh != nullptr);
   float* tok = scratch<float>("dn.tok", (size_t)A * Ct);
   {
     Gemm g{}; g.X = q; g.W = M.h("f/diffusionAtomEncoder/toToken"); g.tw = F16; g.half = true; g.Y = tok; g.rows = A; g.in = Ca;
@@ -410,13 +412,18 @@ static void denoiseStep(const Denoiser& d, const float* xNoisy, float* xDenoised
   for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, G, a, b, pendingY, pendingGate);
   size_t prows = ((size_t)T + 15) / 16 * 16;
   half* an = scratch<half>("dn.an", prows * Ct);
-  if (prows > (size_t)T) fill(an + (size_t)T * Ct, 0, (prows - (size_t)T) * Ct * sizeof(half));
+  static const void* zeroedAn = nullptr; static size_t zeroedAnRows = 0;
+  if (prows > (size_t)T && (zeroedAn != an || zeroedAnRows != prows)) {
+    fill(an + (size_t)T * Ct, 0, (prows - (size_t)T) * Ct * sizeof(half));
+    zeroedAn = an; zeroedAnRows = prows;
+  }
   layerNorm(a, an, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", prows * Ca);
   lin(an, "f/diffusionAtomDecoder/tokenToAtom", pt, prows, Ct, Ca);
-  run1d("ef2_gather_tokens", ((size_t)A * Ca) >> 2, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca});
-  swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod);
+  half* decXmh = (HALF_GEMM && Ca == 128 && d.decMod) ? scratch<half>("atom.xmh", (size_t)A * Ca) : nullptr;
+  run1d("ef2_gather_tokens", ((size_t)A * Ca) >> 2, GatherTokensArgs{pt, Ii("atom_to_token"), ac.mask, q, (uint)A, (uint)Ca, decXmh ? d.decMod : nullptr, decXmh});
+  swaStack(ac, q, d.atoms.c0, "diffusionAtomDecoder", d.atomBlocks, DIFFUSION_HALF_WINDOW, d.decMod, decXmh != nullptr);
   if (Ca == 128) {
     run("ef2_decoder_out", grid1d((A + 7) / 8, 1), 256,
         DecoderOutArgs{q, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"),

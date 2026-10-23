@@ -23,7 +23,7 @@ struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C
 struct OpmPermuteArgs { CP(half) Pm; DP(half) X; uint bi, L, O, pad; };
 struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };
 struct OpmAddHArgs { DP(half) pair; CP(float) Y; CP(float) bias; CP(float) norm; DP(half) lnOut; CP(float) lnScale; CP(float) lnOffset; u64 i0; uint bi, L, C, pad; };
-struct OpmLeftArgs { CP(half) lt; DP(half) out; uint S, L, O; float scale; };
+struct OpmLeftArgs { CP(half) lt; DP(half) out; uint S, L, O; float scale; uint ld; CP(float) bias; DP(float) bt; };
 struct TileBiasArgs { CP(float) bias; DP(float) out; uint L, C; float scale; uint pad; };
 struct MaskNormArgs { CP(float) mask; DP(float) norm; uint S, L; };
 struct GlobalAttnArgs { CP(half) xn; CP(float) kv; CP(float) mask; CP(half) qw; DP(float) avg; uint S, L, C, H, D, pad; };

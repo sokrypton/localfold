@@ -20,10 +20,19 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   zTrunk = nullptr;
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
-  lin(s, "f/confidence/sToZ", r, T, Si, C);
-  lin(s, "f/confidence/sToZTranspose", c, T, Si, C);
-  lin(s, "f/confidence/sToZProdIn1", l, T, Si, C);
-  lin(s, "f/confidence/sToZProdIn2", rr, T, Si, C);
+  {
+    uint64_t* ptrs = scratch<uint64_t>("cf.ptrs", 12);
+    uint64_t hp[12] = {
+      (uint64_t)F("confidence/sToZ"), (uint64_t)F("confidence/sToZTranspose"),
+      (uint64_t)F("confidence/sToZProdIn1"), (uint64_t)F("confidence/sToZProdIn2"),
+      (uint64_t)s, (uint64_t)s, (uint64_t)s, (uint64_t)s,
+      (uint64_t)r, (uint64_t)c, (uint64_t)l, (uint64_t)rr
+    };
+    upload(ptrs, hp, sizeof hp);
+    Gemm G{}; G.X = ptrs + 4; G.W = ptrs; G.Y = ptrs + 8; G.rows = T; G.in = Si; G.out = C;
+    G.batch = 4; G.ptrs = true; G.label = "confidence sToZ";
+    gemm(G);
+  }
   if (C == 256) {
     run("ef2_conf_z", grid1d((P + 7) / 8, 1), 256,
         ConfZArgs{z, relIdx(), In("token_bonds"), F("featuriser/tokenBonds"), r, c, (uint)T, (uint)C,
@@ -41,7 +50,7 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
     g.rows = n; g.in = C; g.out = C; g.label = "confidence prodOut";
     gemm(g);
   }
-  releaseScratch({"cf.prod", "cf.s", "cf.r", "cf.c", "cf.l", "cf.rr"});
+  releaseScratch({"cf.prod", "cf.ptrs", "cf.s", "cf.r", "cf.c", "cf.l", "cf.rr"});
   // z + trunk(z)
   float* mask = scratch<float>("trunk.mask", P);
   run1d("ef2_fill", P, FillFArgs{mask, P, 1.f, 0});
@@ -79,10 +88,10 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   }
   releaseScratch({"ftri.", "ftr.", "eln."});
   // single by row-attention pooling
-  float* score = scratch<float>("cf.score", P);
-  lin(z, "f/confidence/poolingAttention", score, P, C, 1);
+  float* score = C == 256 && T <= 1024 ? nullptr : scratch<float>("cf.score", P);
+  if (C != 256) lin(z, "f/confidence/poolingAttention", score, P, C, 1);
   float* pooled = scratch<float>("cf.pooled", (size_t)T * C); float* single = scratch<float>("cf.single", (size_t)T * Cs);
-  run("ef2_row_pool", Grid{(uint32_t)T, 1, 1}, 256, RowPoolArgs{z, score, pooled, (uint)T, (uint)C});
+  run("ef2_row_pool", Grid{(uint32_t)T, 1, 1}, 256, RowPoolArgs{z, score, pooled, (uint)T, (uint)C, C == 256 ? F("confidence/poolingAttention") : nullptr});
   lin(pooled, "f/confidence/poolingOutput", single, T, C, Cs);
   // pLDDT per atom (a table a slot: the atom's position within its token, clamped)
   int bins = dimOf("f/confidence/plddtWeight", 2), slots = dimOf("f/confidence/plddtWeight", 0);
