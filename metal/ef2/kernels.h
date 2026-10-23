@@ -45,6 +45,7 @@ struct QuantiseArgs { CP(float) x; DP(uchar) out; u64 n; float scale; uint pad; 
 
 // ---------------------------------------------------------------- the atoms
 struct AtomFeaturesArgs { CP(float) pos; CP(float) charge; CP(float) mask; CP(int) element; CP(int) nameChars; DP(float) out; DP(half) outH; uint A, pad; };
+struct AtomC0Args { CP(float) pos; CP(float) charge; CP(float) mask; CP(int) element; CP(int) nameChars; CP(half) wh; CP(float) wf; CP(float) scale; CP(float) offset; DP(float) c0; DP(float) copyOut; DP(half) siluH; DP(float) siluF; uint A, C; };
 struct RopeTableArgs { CP(float) pos; CP(int) uid; DP(float) cosT; DP(float) sinT; uint A, pad; };
 struct SiluArgs { CP(float) x; DP(float) y; DP(half) yh; u64 n; };
 struct SwigluArgs { CP(float) h; DP(float) g; uint rows, F; };

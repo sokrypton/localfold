@@ -1741,32 +1741,32 @@ export async function encodeTemplatePairBlock(
   pairMask,
 ) {
   await settleGridAttendTiling(execution.device);   // (this device's attention and contraction answers first)
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
     weights: weights.triangleAttentionStarting.attention,
     pairBias: Object.assign(Object.create(weights.triangleAttentionStarting.pairBias),
       { source: "normalized-input" }),
     label: "template.triangle-attention-starting", residualTarget: pair,
-  });
-  await encodeAttention(execution, encoder, {
+  }));
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
     weights: weights.triangleAttentionEnding.attention,
     pairBias: Object.assign(Object.create(weights.triangleAttentionEnding.pairBias),
       { source: "normalized-input" }),
     label: "template.triangle-attention-ending", residualTarget: pair,
-  });
-  await encodeTriangleMultiplication(
+  }));
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
-  );
-  await encodeTriangleMultiplication(
+  ));
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
-  );
-  await encodeTransition(
+  ));
+  await staged(execution, () => encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
     weights.pairTransition, "template.pair-transition", pair,
-  );
+  ));
 }
 
 export class EvoformerBlockGpu {

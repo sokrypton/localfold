@@ -392,15 +392,14 @@ export class InputEmbedderGpu {
       const extraReadback = allocate("embed.extra-readback", extraElements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       const encoder = this.device.createCommandEncoder({ label: "input-embedder" });
       this.device.pushErrorScope("validation");
+      const compute = encoder.beginComputePass({ label: "input-embedder" });
       const pass = (pipeline, buffers, x, y = 1) => {
-        const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
         }));
         compute.dispatchWorkgroups(x, y);
-        compute.end();
       };
       pass(normalize, [previousMsa, weights, previousMsaNormParams, previousMsaNormalized], input.length);
       // 🔴 ONE WORKGROUP PER PAIR ROW IS L*L OF THEM, and a dispatch is 65535
@@ -417,6 +416,7 @@ export class InputEmbedderGpu {
         dispatch[0], dispatch[1]);
       dispatch = grid(extraElements);
       pass(extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra], dispatch[0], dispatch[1]);
+      compute.end();
       encoder.copyBufferToBuffer(msa.buffer, 0, msaReadback.buffer, 0, msaElements * 4);
       if (pairReadback !== undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, pairReadback.buffer, 0, pairElements * 4);

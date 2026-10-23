@@ -840,7 +840,10 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   }
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   if ((a.epilogue & 16384) && a.n > 64 && a.n <= 128 && a.m <= 1024 && a.m % 48 == 0) { tr = 16; tc = 48; }
-  else if (a.n > 64 && tr > 32 && (groups(32) < 64 || (a.n <= 128 && a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
+  else if (a.n > 128 && tr == 64 && groups(32) < 64) {
+    tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
+  }
+  else if (a.n > 64 && a.n <= 128 && tr > 32 && ((a.n % 16 != 0 && groups(32) < 64) || groups(16) < 32 || (a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
     tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
   }
   else while (tc > 16 && groups(tc) < 64) tc /= 2;

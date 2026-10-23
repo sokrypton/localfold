@@ -561,6 +561,56 @@ kernel void ef2_atom_features(LF_ARGS(AtomFeaturesArgs)) {
   if (a.outH) a.outH[t] = (half)v;
   else a.out[t] = v;
 }
+kernel void ef2_atom_c0(constant AtomC0Args& a [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  uint atom = tid >> 5, l = tid & 31;
+  if (atom >= a.A || a.C != 128) return;
+  bool live = a.mask[atom] != 0.f;
+  float4 v;
+  if (a.wh) {
+    float px = (float)(half)a.pos[atom * 3 + 0];
+    float py = (float)(half)a.pos[atom * 3 + 1];
+    float pz = (float)(half)a.pos[atom * 3 + 2];
+    float chg = (float)(half)a.charge[atom];
+    float msk = (float)(half)a.mask[atom];
+    device const half4* w4 = (device const half4*)a.wh;
+    v = float4(w4[0 * 32 + l]) * px + float4(w4[1 * 32 + l]) * py + float4(w4[2 * 32 + l]) * pz +
+        float4(w4[3 * 32 + l]) * chg + float4(w4[4 * 32 + l]) * msk;
+    if (live) {
+      int el = a.element[atom];
+      if (el >= 0 && el < 128) v += float4(w4[(5 + el) * 32 + l]);
+      for (uint i = 0; i < 4; ++i) {
+        int ch = a.nameChars[atom * 4 + i];
+        if (ch >= 0 && ch < 64) v += float4(w4[(133 + i * 64 + ch) * 32 + l]);
+      }
+    }
+  } else {
+    float px = a.pos[atom * 3 + 0], py = a.pos[atom * 3 + 1], pz = a.pos[atom * 3 + 2];
+    float chg = a.charge[atom], msk = a.mask[atom];
+    device const float4* w4 = (device const float4*)a.wf;
+    v = w4[0 * 32 + l] * px + w4[1 * 32 + l] * py + w4[2 * 32 + l] * pz +
+        w4[3 * 32 + l] * chg + w4[4 * 32 + l] * msk;
+    if (live) {
+      int el = a.element[atom];
+      if (el >= 0 && el < 128) v += w4[(5 + el) * 32 + l];
+      for (uint i = 0; i < 4; ++i) {
+        int ch = a.nameChars[atom * 4 + i];
+        if (ch >= 0 && ch < 64) v += w4[(133 + i * 64 + ch) * 32 + l];
+      }
+    }
+  }
+  float mean = simd_sum(v.x + v.y + v.z + v.w) * (1.f / 128.f);
+  float4 d = v - mean;
+  float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+  float4 y = d * inv * ((device const float4*)a.scale)[l] + ((device const float4*)a.offset)[l];
+  ulong off = (ulong)atom * 32 + l;
+  ((device float4*)a.c0)[off] = y;
+  if (a.copyOut) ((device float4*)a.copyOut)[off] = y;
+  if (a.siluH || a.siluF) {
+    float4 sv = float4(lf_silu(y.x), lf_silu(y.y), lf_silu(y.z), lf_silu(y.w));
+    if (a.siluH) ((device half4*)a.siluH)[off] = half4(sv);
+    else ((device float4*)a.siluF)[off] = sv;
+  }
+}
 // the rotary table [A, 16]: x's two pairs (base 20), y's, z's, then the space uid's ten (base 10000), in bfloat16
 kernel void ef2_rope_table(LF_ARGS(RopeTableArgs)) {
   uint t = (uint)LF_INDEX;

@@ -12,7 +12,7 @@ bool ATOM_BF16 = true;
 int INPUTS_HALF_WINDOW = 64;
 static constexpr int ATOM_FEATURES = 389;
 
-Atoms prepareAtoms(int A, const std::string& prefix) {
+Atoms prepareAtoms(int A, const std::string& prefix, float* copyOut, half* siluH, float* siluF) {
   Atoms at{};
   int C = (int)M.meta("meta/atomChannels");
   at.ctx.A = A; at.ctx.C = C; at.ctx.heads = (int)M.meta("meta/atomHeads");
@@ -37,6 +37,15 @@ Atoms prepareAtoms(int A, const std::string& prefix) {
   at.ctx.cosT = cosT; at.ctx.sinT = sinT;
   at.ctx.ctxh = allocT<half>((size_t)A * C);
   at.c0 = allocT<float>((size_t)A * C);
+  if (C == 128) {
+    size_t sgs = A <= 256 ? 2 : 8;
+    run("ef2_atom_c0", grid1d((A + sgs - 1) / sgs, 1), (int)(sgs * 32),
+        AtomC0Args{In("ref_pos"), In("ref_charge"), at.ctx.mask, Ii("ref_element"), Ii("ref_atom_name_chars"),
+                   HALF_GEMM ? Fh(prefix + "/linear") : nullptr, HALF_GEMM ? nullptr : F(prefix + "/linear"),
+                   F(prefix + "/norm/scale"), F(prefix + "/norm/offset"),
+                   at.c0, copyOut, siluH, siluF, (uint)A, (uint)C});
+    return at;
+  }
   if (HALF_GEMM) {
     half* featH = scratch<half>("atom.features", (size_t)A * ATOM_FEATURES);
     run1d("ef2_atom_features", (size_t)A * ATOM_FEATURES,
@@ -148,7 +157,8 @@ void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& 
   if (!preMod) {
     sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
     sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
-    run1d("ef2_silu", n, SiluArgs{cond, sc, sch, n});
+    if (!cond && a.C == 128) {}
+    else run1d("ef2_silu", n, SiluArgs{cond, sc, sch, n});
     if (HALF_GEMM) {
       stackedMod = scratch<float>("atom.mod", (size_t)blocks * a.A * 6 * a.C);
       uint64_t* ptrs = scratch<uint64_t>("atom.ptrs", 3 * blocks);
@@ -172,11 +182,15 @@ void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& 
 
 // the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]
 void inputsEmbedder(int T, int A, float* sInputs, int sWidth) {
-  Atoms at = prepareAtoms(A, "atom");
-  int C = at.ctx.C, Ct = dimOf("f/atom/toToken", 1), K = (int)M.meta("meta/classes");
-  float* x = scratch<float>("embed.x", (size_t)A * C);
-  copy(x, at.c0, (size_t)A * C * 4);
-  swaStack(at.ctx, x, at.c0, "atom", (int)M.meta("meta/atomBlocks"), INPUTS_HALF_WINDOW);
+  int C = (int)M.meta("meta/atomChannels");
+  size_t n = (size_t)A * C;
+  float* x = scratch<float>("embed.x", n);
+  float* sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
+  half* sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
+  Atoms at = prepareAtoms(A, "atom", x, sch, sc);
+  if (C != 128) copy(x, at.c0, n * 4);
+  swaStack(at.ctx, x, C == 128 ? nullptr : at.c0, "atom", (int)M.meta("meta/atomBlocks"), INPUTS_HALF_WINDOW);
+  int Ct = dimOf("f/atom/toToken", 1), K = (int)M.meta("meta/classes");
   float* tok = scratch<float>("embed.tok", (size_t)A * Ct);
   Gemm g{}; g.X = x; g.W = M.h("f/atom/toToken"); g.tw = F16; g.half = true; g.Y = tok; g.rows = A; g.in = C; g.out = Ct; g.relu = true;
   gemm(g);

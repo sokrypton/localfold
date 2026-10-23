@@ -67,7 +67,7 @@ struct AtomCtx { int A, C, heads, hidden; const float* mask; const float* cosT; 
 struct Atoms { AtomCtx ctx; float* c0; };
 extern bool ATOM_BF16;
 extern int INPUTS_HALF_WINDOW;
-Atoms prepareAtoms(int A, const std::string& prefix);
+Atoms prepareAtoms(int A, const std::string& prefix, float* copyOut = nullptr, half* siluH = nullptr, float* siluF = nullptr);
 void freeAtoms(Atoms& at);
 void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocks, int halfWindow,
               const float* preMod = nullptr);

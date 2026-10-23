@@ -79,15 +79,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   second[row] = second_total / denominator;
 }`;
 }
-const RELU_SHADER = `
-const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index < arrayLength(&source)) { output[index] = max(source[index], 0.0); }
-}`;
 
 function softmaxExpected(logits, rows, bins, centers) {
   const result = new Float32Array(rows);
@@ -242,10 +233,9 @@ export class ConfidenceHeadsGpu {
     const allocate = (label, elements, usage = GPUBufferUsage.STORAGE) =>
       keep(this.allocator.allocate(label, elements * 4, usage));
     try {
-      const [linear, normalize, relu, paeExpectation] = await Promise.all([
+      const [linear, normalize, paeExpectation] = await Promise.all([
         this.pipelines.get("confidence:linear", LINEAR_SHADER),
         this.pipelines.get("confidence:normalize", ATTENTION_NORMALIZE_SHADER),
-        this.pipelines.get("confidence:relu", RELU_SHADER),
         this.pipelines.get(`confidence:pae-expectation:${paeBins}`,
           createPaeExpectationShader(paeBins)),
       ]);
@@ -256,43 +246,50 @@ export class ConfidenceHeadsGpu {
       const normParams = upload("confidence.norm-params", createAttentionNormParameters(
         length, structureChannels, offsets[0], offsets[1], false, 1, length, 1e-5,
       ), GPUBufferUsage.UNIFORM);
-      const linearParams = (label, rows, inner, columns, weight, bias) =>
-        upload(label, new Uint32Array([rows, inner, columns, weight, bias, 0, 0, 0]), GPUBufferUsage.UNIFORM);
+      const linearParams = (label, rows, inner, columns, weight, bias, activation = 0) =>
+        upload(label, new Uint32Array([rows, inner, columns, weight, bias, activation, 0, 0]), GPUBufferUsage.UNIFORM);
       const params = [
-        linearParams("confidence.act0-params", length, structureChannels, hiddenChannels, offsets[2], offsets[3]),
-        linearParams("confidence.act1-params", length, hiddenChannels, hiddenChannels, offsets[4], offsets[5]),
+        linearParams("confidence.act0-params", length, structureChannels, hiddenChannels, offsets[2], offsets[3], 1),
+        linearParams("confidence.act1-params", length, hiddenChannels, hiddenChannels, offsets[4], offsets[5], 1),
         linearParams("confidence.lddt-params", length, hiddenChannels, lddtBins, offsets[6], offsets[7]),
         linearParams("confidence.pae-params", length * length, pairChannels, paeBins, offsets[8], offsets[9]),
       ];
       const normalized = allocate("confidence.normalized", length * structureChannels);
-      const act0Raw = allocate("confidence.act0-raw", length * hiddenChannels);
       const act0 = allocate("confidence.act0", length * hiddenChannels);
-      const act1Raw = allocate("confidence.act1-raw", length * hiddenChannels);
       const act1 = allocate("confidence.act1", length * hiddenChannels);
       const lddtLogits = allocate("confidence.lddt-logits", length * lddtBins,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const paeLogits = allocate("confidence.pae-logits", length * length * paeBins,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const centers = paeCenters(breaks);
+      const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));
+      const centersBuffer = upload("confidence.pae-centers", centers);
+      const tmPerBinBuffer = upload("confidence.pae-tm-per-bin", Float32Array.from(tmPerBin));
+      const expectationShape = upload("confidence.pae-expectation-shape",
+        new Uint32Array([length * length, 0, 0, 0]), GPUBufferUsage.UNIFORM);
+      const paeExpected = allocate("confidence.pae-expected", length * length,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const tmTermBuffer = allocate("confidence.pae-tm-term", length * length,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "confidence-heads" });
+      const pass = encoder.beginComputePass({ label: "confidence-heads" });
       const dispatch = (pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass(); pass.setPipeline(pipeline);
+        pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: buffer.byteSize === undefined
             ? { buffer: buffer.buffer }
             : { buffer: buffer.buffer, offset: buffer.byteOffset, size: buffer.byteSize } })),
         }));
-        pass.dispatchWorkgroups(x, y); pass.end();
+        pass.dispatchWorkgroups(x, y);
       };
       const linearDispatch = (source, parameter,
         output, rows, columns) =>
         dispatch(linear, [source, weights, parameter, output],
           Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS));
       dispatch(normalize, [structure, weights, normParams, normalized], length);
-      linearDispatch(normalized, params[0], act0Raw, length, hiddenChannels);
-      dispatch(relu, [act0Raw, act0], Math.ceil(act0Raw.byteLength / 4 / 64));
-      linearDispatch(act0, params[1], act1Raw, length, hiddenChannels);
-      dispatch(relu, [act1Raw, act1], Math.ceil(act1Raw.byteLength / 4 / 64));
+      linearDispatch(normalized, params[0], act0, length, hiddenChannels);
+      linearDispatch(act0, params[1], act1, length, hiddenChannels);
       linearDispatch(act1, params[2], lddtLogits, length, lddtBins);
       // 🔴 THE PAE PROJECTION'S ROWS ARE EVERY PAIR, 32 TO A WORKGROUP IN Y, so
       // past 1448 residues it asked for more than the 65535 workgroups a
@@ -318,22 +315,13 @@ export class ConfidenceHeadsGpu {
         }
       }
       // ...and both PAE expectations, where the logits already are.
-      const centers = paeCenters(breaks);
-      const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));
-      const centersBuffer = upload("confidence.pae-centers", centers);
-      const tmPerBinBuffer = upload("confidence.pae-tm-per-bin", Float32Array.from(tmPerBin));
-      const expectationShape = upload("confidence.pae-expectation-shape",
-        new Uint32Array([length * length, 0, 0, 0]), GPUBufferUsage.UNIFORM);
-      const paeExpected = allocate("confidence.pae-expected", length * length,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      const tmTermBuffer = allocate("confidence.pae-tm-term", length * length,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       {
         const groups = Math.ceil(length * length / 64);
         dispatch(paeExpectation,
           [paeLogits, centersBuffer, tmPerBinBuffer, expectationShape, paeExpected, tmTermBuffer],
           Math.min(groups, 32768), Math.ceil(groups / 32768));
       }
+      pass.end();
       const readbacks = [lddtLogits, paeLogits, paeExpected, tmTermBuffer].map((source, index) => {
         const target = allocate(`confidence.readback-${index}`, source.byteLength / 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);

@@ -135,15 +135,15 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
     }
   }
   releaseScratch({"dc.joined", "dc.jn", "dc.trln", "dc.pair", "dc.pn", "dc.pb", "dtr."});
-  d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
+  int Ca = (int)M.meta("meta/atomChannels");
+  size_t n = (size_t)A * Ca;
+  float* sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
+  half* sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
+  d.atoms = prepareAtoms(A, "diffusionAtomEncoder", nullptr, sch, sc);
   {
-    int Ca = d.atoms.ctx.C;
-    size_t n = (size_t)A * Ca;
     d.encMod = allocT<float>((size_t)d.atomBlocks * A * 6 * Ca);
     d.decMod = allocT<float>((size_t)d.atomBlocks * A * 6 * Ca);
-    float* sc = HALF_GEMM ? nullptr : scratch<float>("atom.silu", n);
-    half* sch = HALF_GEMM ? scratch<half>("atom.siluh", n) : nullptr;
-    run1d("ef2_silu", n, SiluArgs{d.atoms.c0, sc, sch, n});
+    if (Ca != 128) run1d("ef2_silu", n, SiluArgs{d.atoms.c0, sc, sch, n});
     if (HALF_GEMM) {
       int nb = d.atomBlocks, k = 2 * nb;
       uint64_t* ptrs = scratch<uint64_t>("atom.ptrs", 3 * k);

@@ -430,7 +430,7 @@ export class AlphaFoldMonomerGpu {
           contactReadback === undefined ? undefined : execution.mapFloat32(contactReadback),
         ]), signal);
         throwIfAborted(signal);
-        releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
+        releaseTensor(msaFirstRowTensor); releaseTensor(msaMask); releaseTensor(embedding.msa);
         if (pairReadback !== undefined) releaseTensor(pairReadback);
         if (contactReadback !== undefined) { releaseTensor(contactReadback); releaseTensor(contactTensor); }
         // 🔴 THE EVOFORMER'S POOLED SCRATCH IS DONE WITH ONCE ITS READBACK IS IN, SO IT GOES NOW. The pool kept the
@@ -491,11 +491,14 @@ export class AlphaFoldMonomerGpu {
         // read only by the NEXT pass, and on the last one there is none - so
         // the fold's own answer is unchanged, which is what makes this safe
         // to move rather than a different computation.
-        previousMsa = embedding.msa;
         previousPair = embedding.pairWithoutTemplates;
-        previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
         previousAtom37 = structure.atom37;
-        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)) break;
+        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)
+            || recycle + 1 >= featuresByRecycle.length) {
+          break;
+        }
+        previousMsa = execution.upload(`monomer.recycle-msa-${recycle}`, msaFirstRow, carry);
+        previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
       }
       // The state the next continuation needs. Read back BEFORE the finally
       // releases the allocator, and only these two: atom37 is already on the
@@ -525,14 +528,18 @@ export class AlphaFoldMonomerGpu {
         // resume path already reads as "start this state from zeros" - and
         // say so, rather than to lose the fold.
         try {
-          const stateEncoder = encode("recycle-state");
-          const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
-          const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
-          await submit(stateEncoder, "recycle state readback");
+          const last = results[results.length - 1];
+          let pair = last?.pair;
+          if (pair === undefined) {
+            const stateEncoder = encode("recycle-state");
+            const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
+            await submit(stateEncoder, "recycle state readback");
+            pair = await execution.mapFloat32(pairReadback);
+          }
           resumable = {
             ...resumable,
-            msa: await execution.mapFloat32(msaReadback),
-            pair: await execution.mapFloat32(pairReadback),
+            msa: last?.msaFirstRow ?? resume?.msa,
+            pair,
           };
         } catch (cause) {
           console.warn("this fold cannot be continued from: its recycle state"
