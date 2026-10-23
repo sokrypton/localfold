@@ -420,12 +420,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     workgroupBarrier();
   }
   if (!inBatch) { return; }
-  ${pair ? `${rows.map((i) => `{
+  ${pair ? (pair.rows4 && rpt === 4
+    ? `if (n0 + tn1 < p.n) { pairOut4(m0 + tm, (n0 / 2u) + tn0, acc_0_0 * p.alpha, acc_0_1 * p.alpha, acc_1_0 * p.alpha, acc_1_1 * p.alpha, acc_2_0 * p.alpha, acc_2_1 * p.alpha, acc_3_0 * p.alpha, acc_3_1 * p.alpha); }\n  return;`
+    : `${rows.map((i) => `{
     let m = m0 + tm + ${i}u;
     if (m < p.m && n0 + tn1 < p.n) { pairOut(m, (n0 / 2u) + tn0, acc_${i}_0 * p.alpha, acc_${i}_1 * p.alpha); }
-  }`).join("\n  ")}
-  return;` : ""}
+  }`).join("\n  ")}\n  return;`) : ""}
   let baseC = p.offC + b0 * p.sC0 + b1 * p.sC1;
+  ${gate ? `var prev_gr = -2;
+  var gv0 = vec4<f32>(0.0);
+  var gv1 = vec4<f32>(0.0);
+  let fastGate = p.bias == 0u && p.act == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n;` : ""}
   ${rows.map((i) => `{
     let m = m0 + tm + ${i}u;
     if (m < p.m) {
@@ -435,19 +440,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       ${gate ? `let gr = ${gate === "map" ? "gmap[m]" : "i32(m)"};
       if (gr >= 0) {
         let gBase = u32(gr) * p.gS + p.gOff;
-        if (p.bias == 0u && p.act == 0u && p.sCn == 1u && n0 + tn1 + 3u < p.n) {
+        if (fastGate) {
+          if (gr != prev_gr) {
+            prev_gr = gr;
+            let g0 = gBase + n0 + tn0;
+            let g1 = gBase + n0 + tn1;
+            gv0 = vec4<f32>(gcond[g0], gcond[g0 + 1u], gcond[g0 + 2u], gcond[g0 + 3u]);
+            gv1 = vec4<f32>(gcond[g1], gcond[g1 + 1u], gcond[g1 + 2u], gcond[g1 + 3u]);
+          }
           let c0 = rowC + n0 + tn0;
           let c1 = rowC + n0 + tn1;
-          let g0 = gBase + n0 + tn0;
-          let g1 = gBase + n0 + tn1;
-          c[c0] += gcond[g0] * r0.x;
-          c[c0 + 1u] += gcond[g0 + 1u] * r0.y;
-          c[c0 + 2u] += gcond[g0 + 2u] * r0.z;
-          c[c0 + 3u] += gcond[g0 + 3u] * r0.w;
-          c[c1] += gcond[g1] * r1.x;
-          c[c1 + 1u] += gcond[g1 + 1u] * r1.y;
-          c[c1 + 2u] += gcond[g1 + 2u] * r1.z;
-          c[c1 + 3u] += gcond[g1 + 3u] * r1.w;
+          c[c0] += gv0.x * r0.x;
+          c[c0 + 1u] += gv0.y * r0.y;
+          c[c0 + 2u] += gv0.z * r0.z;
+          c[c0 + 3u] += gv0.w * r0.w;
+          c[c1] += gv1.x * r1.x;
+          c[c1 + 1u] += gv1.y * r1.y;
+          c[c1 + 2u] += gv1.z * r1.z;
+          c[c1 + 3u] += gv1.w * r1.w;
         } else {
         ${[0, 1, 2, 3, 4, 5, 6, 7].map((j) => {
           const nExpr = j < 4 ? `n0 + tn0 + ${j}u` : `n0 + tn1 + ${j - 4}u`;
@@ -994,7 +1004,7 @@ export class Bioemu2Ops {
     // spec.pair = {key, half, decls, body, buffers}: the SwiGLU-pair epilogue (gemm2Source), its buffers at binding 5 on
     // (a half weight's panel staged in f16 where the device has shader-f16: b16Panels false is the control)
     const b16 = v2 && word && this.b16Panels !== false && this.device.features?.has?.("shader-f16") === true;
-    const rpt = v2 && m > 64 && m <= 80 ? 5 : 4;
+    const rpt = v2 && !spec.pair?.rows4 && m <= 160 && Math.ceil(m / 80) < Math.ceil(m / 64) ? 5 : 4;
     const bm = rpt * 16;
     const groups = Math.ceil(m / bm) * Math.ceil(n / (v2 ? 128 : 64)) * B0 * B1;
     const gate = spec.gate ? (spec.gate.map ? "map" : "plain") : null;

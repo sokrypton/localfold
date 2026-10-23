@@ -574,16 +574,16 @@ kernel void be2_cs_atom(LF_ARGS(Be2CsAtomArgs)) {
   if (a.Ca == 128) { const float4 d = x4 - mq; v = dot(d, d); }
   else for (uint c = lane; c < a.Ca; c += 32) { const float d = xr[c] - mq; v += d * d; }
   const float ssq = simd_sum(v);
-  const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
-  const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
-  float ma = 0, ssa = 0, sa = 0;
-  if (st >= 0) { ma = a.tstats[st * 3]; ssa = a.tstats[st * 3 + 1]; sa = a.tstats[st * 3 + 2]; }
-  const float W = (float)(a.Dt + a.Ca);
-  const float mu = ((float)a.Dt * ma + (float)a.Ca * mq) / W, da = ma - mu, dq = mq - mu;
-  const float var = (ssa + ssq + (float)a.Dt * da * da + (float)a.Ca * dq * dq) / W;
   const float sq = sqrt(ssq / a.Ca + 1e-5f);
   const int t = a.atomTok[row];
   if (lane == 0) {
+    const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
+    const int st = a.pad[al] ? (int)(smp * a.T) + a.tokIdx[al] : -1;
+    float ma = 0, ssa = 0, sa = 0;
+    if (st >= 0) { ma = a.tstats[st * 3]; ssa = a.tstats[st * 3 + 1]; sa = a.tstats[st * 3 + 2]; }
+    const float W = (float)(a.Dt + a.Ca);
+    const float mu = ((float)a.Dt * ma + (float)a.Ca * mq) / W, da = ma - mu, dq = mq - mu;
+    const float var = (ssa + ssq + (float)a.Dt * da * da + (float)a.Ca * dq * dq) / W;
     device float* o = a.stats + row * 8;
     o[0] = rsqrt(var + 1e-5f); o[1] = da; o[2] = dq; o[3] = sq; o[4] = mq; o[5] = sa; o[6] = (float)st; o[7] = (float)t;
   }

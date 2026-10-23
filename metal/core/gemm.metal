@@ -79,7 +79,8 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // (EP 1's gated a and b, staged channel-major for the store, reuse the tiles' memory once the k loop is done: in a
   // buffer of their own they cost a 64 x 64 tile its occupancy)
   constexpr int XSZ = (TRB ? BK : TR) * XROW, WSZ = (TRA ? TC_ : BK) * WROW;
-  constexpr int SABSZ = (EP & 7) == 1 ? (2 * (TC_ / 4) * TR * 2 + sizeof(T) - 1) / sizeof(T) : 0;
+  constexpr int SROW = TR + 8;
+  constexpr int SABSZ = (EP & 7) == 1 ? (2 * (TC_ / 4) * SROW * 2 + sizeof(T) - 1) / sizeof(T) : 0;
   threadgroup T tgm[XSZ + WSZ > SABSZ ? XSZ + WSZ : SABSZ];
   threadgroup T* Xs = tgm;
   threadgroup T* Ws = tgm + XSZ;
@@ -197,21 +198,37 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             ob[t] = (half)(vpb * m / (1.f + exp(-vgb)));
           }
           const int cl0 = (sc + b * 8) / 4;     // (the tile's channel of this block's first: 8 a 32 columns)
-          simdgroup_store(ma, Sab + cl0 * TR + sr + a * 8, TR, ulong2(0, 0), true);
-          simdgroup_store(mb, Sab + (TC_ / 4 + cl0) * TR + sr + a * 8, TR, ulong2(0, 0), true);
+          simdgroup_store(ma, Sab + cl0 * SROW + sr + a * 8, SROW, ulong2(0, 0), true);
+          simdgroup_store(mb, Sab + (TC_ / 4 + cl0) * SROW + sr + a * 8, SROW, ulong2(0, 0), true);
         }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
     const bool eqN = g.tgNp == g.tgN;
-    for (int t = tid; t < (TC_ / 4) * TR; t += 128) {      // channel-major, a channel's rows consecutive
-      int cl = t / TR, jl = t % TR, jg = j0 + jl, c = i0 / 4 + cl;
-      if (jg >= g.n || c >= g.tgC) continue;
-      uint p = (uint)(g.tgR0 + jg);
-      ulong q = eqN ? (ulong)p : (ulong)lf_udiv(p, (uint)g.tgN) * (uint)(g.tgNp - g.tgN) + p;
-      outA[(ulong)c * g.tgPairs + q] = Sab[cl * TR + jl];
-      outB[(ulong)c * g.tgPairs + q] = Sab[(TC_ / 4 + cl) * TR + jl];
+    if constexpr (128 % TR == 0) {
+      const int jl = tid % TR, jg = j0 + jl;
+      if (jg < g.n) {
+        const uint p = (uint)(g.tgR0 + jg);
+        const ulong q = eqN ? (ulong)p : (ulong)lf_udiv(p, (uint)g.tgN) * (uint)(g.tgNp - g.tgN) + p;
+        _Pragma("clang loop unroll(full)")
+        for (int cl = tid / TR; cl < TC_ / 4; cl += 128 / TR) {
+          const int c = i0 / 4 + cl;
+          if (c >= g.tgC) break;
+          const ulong dst = (ulong)c * g.tgPairs + q;
+          outA[dst] = Sab[cl * SROW + jl];
+          outB[dst] = Sab[(TC_ / 4 + cl) * SROW + jl];
+        }
+      }
+    } else {
+      for (int t = tid; t < (TC_ / 4) * TR; t += 128) {      // channel-major, a channel's rows consecutive
+        int cl = t / TR, jl = t % TR, jg = j0 + jl, c = i0 / 4 + cl;
+        if (jg >= g.n || c >= g.tgC) continue;
+        uint p = (uint)(g.tgR0 + jg);
+        ulong q = eqN ? (ulong)p : (ulong)lf_udiv(p, (uint)g.tgN) * (uint)(g.tgNp - g.tgN) + p;
+        outA[(ulong)c * g.tgPairs + q] = Sab[cl * SROW + jl];
+        outB[(ulong)c * g.tgPairs + q] = Sab[(TC_ / 4 + cl) * SROW + jl];
+      }
     }
     return;
   }
@@ -274,18 +291,17 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         break; \
       } \
     } \
-    simdgroup_matrix<TC, 8, 8> om, cm; \
+    simdgroup_matrix<TC, 8, 8> om; \
     simdgroup_matrix<half, 8, 8> xm; \
     const bool gated = (EP & 64) == 0 && (g.epilogue & 64); \
     const bool loadC = gated || g.beta != 0.f || ((EP & 64) != 0 && (g.epilogue & (8192 | 1048576))); \
     if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) { \
-      if (loadC && !(g.biasType & 512)) simdgroup_load(cm, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
+      if (loadC && !(g.biasType & 512)) simdgroup_load(om, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
     } else { \
-      if (loadC) simdgroup_load(cm, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
+      if (loadC) simdgroup_load(om, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
     } \
     if (gated) simdgroup_load(xm, (device const half*)g.aux + (ulong)(j) * g.ldaux + (i), (ulong)g.ldaux); \
     thread auto& o = om.thread_elements(); \
-    thread auto& c = cm.thread_elements(); \
     thread auto& x = xm.thread_elements(); \
     float2 bv2(0.f); \
     if ((EP & 64) == 0 && (g.epilogue & 4)) { \
@@ -297,7 +313,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     for (int t = 0; t < 2; ++t) { \
       const int col = (i) + sn + t; \
       float v = g.alpha * (float)e[t]; \
-      float cv = loadC ? (float)c[t] : 0.f; \
+      float cv = loadC ? (float)o[t] : 0.f; \
       if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) { \
         if (loadC && (g.biasType & 512)) cv = ((device const float*)g.C)[(ulong)((j) + sm) * g.ldc + col]; \
       } \
@@ -326,34 +342,106 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) simdgroup_store(acc[a][b], D + (ulong)(j) * g.ldd + (i), (ulong)g.ldd); \
     else simdgroup_store(om, D + (ulong)(j) * g.ldd + (i), (ulong)g.ldd); \
   } while (0)
-  bool stored8x8 = false;
-  if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
-    if (j0 + TR <= g.n && i0 + TC_ <= g.m) {
-      if (g.epilogue & 128) {
-        if constexpr (FC % 2 == 0) {
-          _Pragma("clang loop unroll(full)")
-          for (int a = 0; a < FR; ++a)
-            _Pragma("clang loop unroll(full)")
-            for (int b = 0; b < FC; b += 2) LF_STORE_SWIGLU_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
-          return;
+  if constexpr ((EP & 16) == 0 && (EP & 64) != 0 && metal::is_same_v<TC, half>) {
+    if (g.epilogue & 32768) {
+      int jr_row[FR], st_row[FR];
+      uint t_row[FR];
+      float inv_row[FR], dq_row[FR], sq_row[FR], sa_row[FR];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) {
+        const int jr = j0 + sr + a * 8 + sm;
+        jr_row[a] = jr;
+        if (jr < g.n) {
+          device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)jr * 8);
+          const float4 s0 = sr4[0], s1 = sr4[1];
+          inv_row[a] = s0.x; dq_row[a] = s0.z; sq_row[a] = s0.w; sa_row[a] = s1.y;
+          st_row[a] = (int)s1.z; t_row[a] = (uint)s1.w;
+        } else {
+          inv_row[a] = 0.f; dq_row[a] = 0.f; sq_row[a] = 0.f; sa_row[a] = 0.f;
+          st_row[a] = -2; t_row[a] = 0xffffffffu;
         }
-      } else if ((EP & 64) == 0 || (g.epilogue & (8192 | 1048576))) {
-        _Pragma("clang loop unroll(full)")
-        for (int a = 0; a < FR; ++a)
-          _Pragma("clang loop unroll(full)")
-          for (int b = 0; b < FC; ++b) LF_STORE_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
-        if constexpr ((EP & 128) == 0) return;
-        stored8x8 = true;
       }
+      if (g.epilogue & 131072) {
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          const int col = i0 + sc + b * 8 + sn;
+          if (col >= g.m) break;
+          int prev_st = -2;
+          uint prev_t = 0xffffffffu;
+          float2 pv(0.f), qv(0.f), bv(0.f);
+          _Pragma("clang loop unroll(full)")
+          for (int a = 0; a < FR; ++a) {
+            const int jr = jr_row[a];
+            if (jr >= g.n) continue;
+            const int st = st_row[a];
+            const uint tq = t_row[a];
+            if (st != prev_st) {
+              pv = st >= 0 ? sa_row[a] * *(device const float2*)((device const float*)g.aux2 + (ulong)st * g.m + col) : float2(0.f);
+              prev_st = st;
+            }
+            if (tq != prev_t) {
+              device const float* qb = (device const float*)g.aux3 + (ulong)tq * 2 * g.m + col;
+              qv = *(device const float2*)(qb);
+              bv = *(device const float2*)(qb + g.m);
+              prev_t = tq;
+            }
+            thread auto& e = acc[a][b].thread_elements();
+            const float2 uv = inv_row[a] * (pv + sq_row[a] * float2((float)e[0], (float)e[1]) + dq_row[a] * qv) + bv;
+            const float2 u2 = simd_shuffle_xor(uv, 1);
+            if ((lane & 1) == 0)
+              *(device half2*)(D + (ulong)jr * g.ldd + (col >> 1)) = half2(fast::divide(uv, 1.f + fast::exp(-uv)) * u2);
+          }
+        }
+      } else if constexpr (FC % 2 == 0) {
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; b += 2) {
+          const int i = i0 + sc + b * 8, col = i + sn;
+          if (col + 8 >= g.m) break;
+          _Pragma("clang loop unroll(full)")
+          for (int a = 0; a < FR; ++a) {
+            const int jr = jr_row[a];
+            if (jr >= g.n) continue;
+            const int st = st_row[a];
+            device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
+            device const float* qb = (device const float*)g.aux3 + (ulong)t_row[a] * 2 * g.m;
+            thread auto& ea = acc[a][b].thread_elements();
+            thread auto& eb = acc[a][b + 1].thread_elements();
+            const float2 p1 = st >= 0 ? sa_row[a] * *(device const float2*)(pr + col) : float2(0.f);
+            const float2 p2 = st >= 0 ? sa_row[a] * *(device const float2*)(pr + col + 8) : float2(0.f);
+            const float2 q1 = *(device const float2*)(qb + col), q2 = *(device const float2*)(qb + col + 8);
+            const float2 b1 = *(device const float2*)(qb + g.m + col), b2 = *(device const float2*)(qb + g.m + col + 8);
+            const float2 u1 = inv_row[a] * (p1 + sq_row[a] * float2((float)ea[0], (float)ea[1]) + dq_row[a] * q1) + b1;
+            const float2 u2 = inv_row[a] * (p2 + sq_row[a] * float2((float)eb[0], (float)eb[1]) + dq_row[a] * q2) + b2;
+            *(device half2*)(D + (ulong)jr * g.ldd + (i >> 1) + sn) = half2(fast::divide(u1, 1.f + fast::exp(-u1)) * u2);
+          }
+        }
+      }
+      return;
     }
   }
-  if (!stored8x8) {
   _Pragma("clang loop unroll(full)")
-  for (int a = 0; a < FR; ++a)
+  for (int a = 0; a < FR; ++a) {
+    const int j = j0 + sr + a * 8;
+    if (j >= g.n) continue;
+    if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
+      if (j + 8 <= g.n && i0 + TC_ <= g.m) {
+        if (g.epilogue & 128) {
+          if constexpr (FC % 2 == 0) {
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; b += 2) LF_STORE_SWIGLU_8X8(a, b, j, i0 + sc + b * 8);
+            continue;
+          }
+        } else if ((EP & 64) == 0 || (g.epilogue & (8192 | 1048576))) {
+          _Pragma("clang loop unroll(full)")
+          for (int b = 0; b < FC; ++b) LF_STORE_8X8(a, b, j, i0 + sc + b * 8);
+          continue;
+        }
+      }
+    }
     _Pragma("clang loop unroll(full)")
     for (int b = 0; b < FC; ++b) {
-      const int j = j0 + sr + a * 8, i = i0 + sc + b * 8;
-      if (j >= g.n || i >= g.m) continue;
+      const int i = i0 + sc + b * 8;
+      if (i >= g.m) continue;
       thread auto& e = acc[a][b].thread_elements();
       if (g.epilogue & 128) {
         if constexpr (FC % 2 == 0) {

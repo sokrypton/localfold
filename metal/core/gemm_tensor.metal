@@ -274,27 +274,49 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
           const bool fullM = i0 + TN <= g.m;
           const ushort4 bs(0, 4, 32, 36);
+          int j_row[4], st_row[4];
+          uint t_row[4];
+          float inv_row[4], dq_row[4], sq_row[4], sa_row[4];
           _Pragma("clang loop unroll(full)")
           for (int r_idx = 0; r_idx < 4; ++r_idx) {
-            const uint16_t er = bs[r_idx];
-            const int j = j0 + c.get_multidimensional_index(er)[1];
-            if (j >= g.n) continue;
-            device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)j * 8);
-            const float4 s0 = sr4[0], s1 = sr4[1];
-            const float inv = s0.x, dq = s0.z, sq = s0.w, sa = s1.y;
-            const int st = (int)s1.z;
-            device const float* qb = (device const float*)g.aux3 + (ulong)(uint)s1.w * 2 * g.m;
-            device const float* pr = (device const float*)g.aux2 + (ulong)max(st, 0) * g.m;
-            _Pragma("clang loop unroll(full)")
-            for (int k = 0; k < 4; ++k) {
-              const int i = col0 + k * 32;
-              if (fullM || i < g.m) {
-                const uint16_t e = er + k * 8;
-                const float4 pv = st >= 0 ? sa * *(device const float4*)(pr + i) : float4(0.f);
-                const float4 qv = *(device const float4*)(qb + i);
-                const float4 bv = *(device const float4*)(qb + g.m + i);
+            const int j = j0 + c.get_multidimensional_index(bs[r_idx])[1];
+            j_row[r_idx] = j;
+            if (j < g.n) {
+              device const float4* sr4 = (device const float4*)((device const float*)g.aux + (ulong)j * 8);
+              const float4 s0 = sr4[0], s1 = sr4[1];
+              inv_row[r_idx] = s0.x; dq_row[r_idx] = s0.z; sq_row[r_idx] = s0.w; sa_row[r_idx] = s1.y;
+              st_row[r_idx] = (int)s1.z; t_row[r_idx] = (uint)s1.w;
+            } else {
+              inv_row[r_idx] = 0.f; dq_row[r_idx] = 0.f; sq_row[r_idx] = 0.f; sa_row[r_idx] = 0.f;
+              st_row[r_idx] = -2; t_row[r_idx] = 0xffffffffu;
+            }
+          }
+          _Pragma("clang loop unroll(full)")
+          for (int k = 0; k < 4; ++k) {
+            const int i = col0 + k * 32;
+            if (fullM || i < g.m) {
+              int prev_st = -2;
+              uint prev_t = 0xffffffffu;
+              float4 pv(0.f), qv(0.f), bv(0.f);
+              _Pragma("clang loop unroll(full)")
+              for (int r_idx = 0; r_idx < 4; ++r_idx) {
+                const int j = j_row[r_idx];
+                if (j >= g.n) continue;
+                const int st = st_row[r_idx];
+                const uint t = t_row[r_idx];
+                if (st != prev_st) {
+                  pv = st >= 0 ? sa_row[r_idx] * *(device const float4*)((device const float*)g.aux2 + (ulong)st * g.m + i) : float4(0.f);
+                  prev_st = st;
+                }
+                if (t != prev_t) {
+                  device const float* qb = (device const float*)g.aux3 + (ulong)t * 2 * g.m + i;
+                  qv = *(device const float4*)(qb);
+                  bv = *(device const float4*)(qb + g.m);
+                  prev_t = t;
+                }
+                const uint16_t e = bs[r_idx] + k * 8;
                 const float4 cv = float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-                const float4 uv = inv * (pv + sq * cv + dq * qv) + bv;
+                const float4 uv = inv_row[r_idx] * (pv + sq_row[r_idx] * cv + dq_row[r_idx] * qv) + bv;
                 *(device half2*)(D + (ulong)(i >> 1) + (ulong)j * g.ldd) = half2(fast::divide(uv.xy, 1.f + fast::exp(-uv.xy)) * uv.zw);
               }
             }

@@ -339,13 +339,17 @@ struct Device {
       std::vector<std::thread> threads;
       for (int tensor = 0; tensor < 2; ++tensor) {
         const std::vector<std::pair<std::string, std::string>>* list = &groups[tensor];   // (groups outlives the threads)
-        const size_t chunks = std::min<size_t>(tensor ? 4 : 8, (list->size() + 7) / 8);
+        const size_t blocks = (list->size() + 7) / 8;
+        const size_t chunks = std::min<size_t>(tensor ? 4 : 8, blocks);
         for (size_t c = 0; c < chunks; ++c)
-          threads.emplace_back([this, list, chunks, c, tensor] { @autoreleasepool {
-            std::string src = tensor ? TENSOR_SOURCE : GEMM_SOURCE;
-            for (size_t i = c; i < list->size(); i += chunks) src += "\n" + (*list)[i].second;
-            id<MTLLibrary> l = compile(src, "the cached instances", tensor);
-            for (size_t i = c; i < list->size(); i += chunks) remember((*list)[i].first, pipelineOf(l, (*list)[i].first));
+          threads.emplace_back([this, list, blocks, chunks, c, tensor] { @autoreleasepool {
+            for (size_t b = c; b < blocks; b += chunks) {
+              const size_t i0 = b * 8, i1 = std::min<size_t>(i0 + 8, list->size());
+              std::string src = tensor ? TENSOR_SOURCE : GEMM_SOURCE;
+              for (size_t i = i0; i < i1; ++i) src += "\n" + (*list)[i].second;
+              id<MTLLibrary> l = compile(src, "the cached instances", tensor);
+              for (size_t i = i0; i < i1; ++i) remember((*list)[i].first, pipelineOf(l, (*list)[i].first));
+            }
           } });
       }
       for (auto& t : threads) t.join();
@@ -828,12 +832,12 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   }
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
-  // ...and 48-column tiles likewise (not SwiGLU's or the triangle gate's, whose epilogues pair 8-column blocks)
-  if (tc == 64 && !(a.epilogue & (128 | 256))) {
+  // ...and 48-column tiles likewise (not SwiGLU's, coupling combine's, or the triangle gate's, whose epilogues pair 8-column blocks)
+  if (tc == 64 && !(a.epilogue & (128 | 256 | 32768))) {
     long pad64 = (long)((a.m + 63) / 64) * 64 - a.m, pad48 = (long)((a.m + 47) / 48) * 48 - a.m;
     if (pad64 * 10 > a.m && pad48 < pad64) tc = 48;
   }
-  if ((a.epilogue & 128) && tc < 32) tc = 32;
+  if ((a.epilogue & (128 | 32768)) && tc < 32) tc = 32;
   if (a.epilogue & 256) tc = 64;
   if (lnEmit) { tr = a.m == 256 ? 16 : a.m == 64 ? 64 : 32; tc = a.m == 256 ? 256 : a.m == 64 ? 64 : 128; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);
@@ -847,7 +851,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
   const bool hacc = !lnEmit && !floatAcc && !accFloat && a.beta == 0.f && !(a.epilogue & (64 | 8192)) && ta_ == F16 && tb_ == F16 && tc_ == F16;
   const bool hmma = halfMma && !(ta_ == F16 && tb_ == F16);     // (half staging of an f32 operand)
-  const bool extEp = (a.epilogue & (4096 | 8192 | 16384 | 262144 | 524288 | 1048576)) != 0;
+  const bool extEp = (a.epilogue & (4096 | 8192 | 16384 | 32768 | 262144 | 524288 | 1048576)) != 0;
   auto mtype = [](DT t) { return t == F32 ? "float" : "half"; };
   int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | (extEp ? 64 : 0) | (lnEmit ? 128 : 0) | GEMM_EXTRA_EP;
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
@@ -1044,7 +1048,7 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
 }
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
                          const float* P, const float* QB, bool pairs2) {
-  if (hidden % 8 || !tensorWanted()) return false;
+  if (hidden % 8) return false;
   GemmArgs a{};
   a.A = (uint64_t)Wq; a.B = (uint64_t)Xq; a.C = a.D = (uint64_t)gated;
   a.m = 2 * hidden; a.n = (int)rows; a.k = in; a.lda = 2 * hidden; a.ldb = in; a.ldc = a.ldd = hidden;

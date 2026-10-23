@@ -104,6 +104,49 @@ int main() {
     gemmSwiglu(dX, dW, dG, R, K, Hd);
     auto h = download(dG, R * Hd); std::vector<float> got(h.begin(), h.end());
     report("swiglu", relRms(ref, got), 5e-3);
+    release(dX); release(dW); release(dG);
+  }
+  for (bool pairs2 : {false, true}) {   // coupling combine (BioEmu2 couplingSplit): blocks of 8 and blocks of 2
+    size_t R = 213, T = 36, Tc = 18; int K = 128, Hd = 192, H2 = 2 * Hd;
+    auto X = randv(R * K), W = randv((size_t)K * H2, 0.1f), P = randv(T * H2, 0.3f), QB = randv(Tc * 2 * H2, 0.3f);
+    std::vector<float> Wp((size_t)K * H2), P_p(T * H2), QB_p(Tc * 2 * H2), stats(R * 8, 0.f);
+    const int blk = pairs2 ? 2 : 8;
+    auto pack = [&](const float* src, float* dst, size_t rows) {
+      for (size_t r = 0; r < rows; ++r) for (int c = 0; c < H2; ++c) {
+        int m = c / (2 * blk), q = c % (2 * blk);
+        dst[r * H2 + c] = src[r * H2 + (q < blk ? blk * m + q : Hd + blk * m + q - blk)];
+      }
+    };
+    pack(W.data(), Wp.data(), K); pack(P.data(), P_p.data(), T); pack(QB.data(), QB_p.data(), Tc * 2);
+    for (size_t r = 0; r < R; ++r) {
+      stats[r * 8 + 0] = 0.8f; stats[r * 8 + 2] = -0.2f; stats[r * 8 + 3] = 1.1f; stats[r * 8 + 5] = 0.9f;
+      stats[r * 8 + 6] = (r % 9 == 0) ? -1.f : (float)(r / 6);
+      stats[r * 8 + 7] = (float)(r / 12);
+    }
+    std::vector<double> ref(R * Hd);
+    for (size_t r = 0; r < R; ++r) {
+      double inv = stats[r * 8 + 0], dq = stats[r * 8 + 2], sq = stats[r * 8 + 3], sa = stats[r * 8 + 5];
+      int st = (int)stats[r * 8 + 6]; uint tq = (uint)stats[r * 8 + 7];
+      for (int c = 0; c < Hd; ++c) {
+        double za = 0, zb = 0;
+        for (int k = 0; k < K; ++k) {
+          za += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * H2 + c];
+          zb += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * H2 + Hd + c];
+        }
+        double pa = st >= 0 ? sa * P[(size_t)st * H2 + c] : 0.0;
+        double pb = st >= 0 ? sa * P[(size_t)st * H2 + Hd + c] : 0.0;
+        double ua = inv * (pa + sq * za + dq * QB[(size_t)tq * 2 * H2 + c]) + QB[((size_t)tq * 2 + 1) * H2 + c];
+        double ub = inv * (pb + sq * zb + dq * QB[(size_t)tq * 2 * H2 + Hd + c]) + QB[((size_t)tq * 2 + 1) * H2 + Hd + c];
+        ref[r * Hd + c] = ua / (1.0 + exp(-ua)) * ub;
+      }
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(Wp).data(), Wp.size()); half* dG = allocT<half>(R * Hd);
+    float *dS = uploadNew(stats.data(), stats.size()), *dP = uploadNew(P_p.data(), P_p.size()), *dQB = uploadNew(QB_p.data(), QB_p.size());
+    if (gemmCouplingCombine(dX, dW, dG, R, K, Hd, dS, dP, dQB, pairs2)) {
+      auto h = download(dG, R * Hd);
+      report(pairs2 ? "coupling combine (blocks of 2)" : "coupling combine (blocks of 8)", relRms(ref, std::vector<float>(h.begin(), h.end())), 5e-3);
+    } else { ++failures; printf("  coupling combine: FAIL (not taken)\n"); }
+    release(dX); release(dW); release(dG); release(dS); release(dP); release(dQB);
   }
   {   // gated add
     size_t R = 300; int K = 128, O = 128;

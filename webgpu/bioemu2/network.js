@@ -166,29 +166,49 @@ export class Bioemu2Gpu {
       // and the SwiGLU run in its epilogue (fuseCombine: false is the control - Z written, then cs-combine)
       steps.push(await o.gemm({ m: S * N, n: W2, k: DA, a: cs.xq, b: W, c: out,
         A: { off: 0, m: DA, k: 1 }, B: { off: wo + DT, n: DC, k: 1 }, C: { off: 0, m: I, n: 1 },
-        pair: { key: `cs${T}`, half: I, buffers: [cs.astats, cs.P, QB, atomTokenS],
+        pair: { key: `cs${T}`, half: I, rows4: true, buffers: [cs.astats, cs.P, QB, atomTokenS],
           decls: `@group(0) @binding(5) var<storage, read> astats: array<f32>;
 @group(0) @binding(6) var<storage, read> pTok: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> qb: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> atomTok: array<i32>;`,
-          body: `fn pairOut(r: u32, j0: u32, z1: vec4<f32>, z2: vec4<f32>) {
-  let st = atomTok[r]; var t = ${T}u;
-  if (st >= 0) { t = u32(st) % ${T}u; }
-  let s = r * 6u; let inv = astats[s]; let dq = astats[s + 2u]; let sq = astats[s + 3u];
-  let sa = astats[s + 5u];
+          body: `fn pairOut4(r0: u32, j0: u32, z1_0: vec4<f32>, z2_0: vec4<f32>, z1_1: vec4<f32>, z2_1: vec4<f32>, z1_2: vec4<f32>, z2_2: vec4<f32>, z1_3: vec4<f32>, z2_3: vec4<f32>) {
   let j4 = j0 / 4u;
-  let cr4 = t * 1792u + j4;
+  var prev_st = -2;
   var p1 = vec4<f32>(0.0); var p2 = vec4<f32>(0.0);
-  if (st >= 0) {
-    let pr4 = u32(st) * 896u + j4;
-    p1 = sa * pTok[pr4];
-    p2 = sa * pTok[pr4 + 448u];
-  }
-  let u1 = inv * (p1 + sq * z1 + dq * qb[cr4]) + qb[cr4 + 896u];
-  let u2 = inv * (p2 + sq * z2 + dq * qb[cr4 + 448u]) + qb[cr4 + 1344u];
-  let y = u1 / (vec4<f32>(1.0) + exp(-u1)) * u2;
-  let base = r * 1792u + j0;
-  c[base] = y.x; c[base + 1u] = y.y; c[base + 2u] = y.z; c[base + 3u] = y.w;
+  var q1 = vec4<f32>(0.0); var q2 = vec4<f32>(0.0);
+  var b1 = vec4<f32>(0.0); var b2 = vec4<f32>(0.0);
+  ${[0, 1, 2, 3].map((k) => `{
+    let r = r0 + ${k}u;
+    if (r < p.m) {
+      let st = atomTok[r];
+      let s = r * 6u;
+      let inv = astats[s]; let dq = astats[s + 2u]; let sq = astats[s + 3u];
+      if (st != prev_st) {
+        prev_st = st;
+        var t = ${T}u;
+        if (st >= 0) {
+          t = u32(st) % ${T}u;
+          let sa = astats[s + 5u];
+          let pr4 = u32(st) * 896u + j4;
+          p1 = sa * pTok[pr4];
+          p2 = sa * pTok[pr4 + 448u];
+        } else {
+          p1 = vec4<f32>(0.0);
+          p2 = vec4<f32>(0.0);
+        }
+        let cr4 = t * 1792u + j4;
+        q1 = qb[cr4];
+        q2 = qb[cr4 + 448u];
+        b1 = qb[cr4 + 896u];
+        b2 = qb[cr4 + 1344u];
+      }
+      let u1 = inv * (p1 + sq * z1_${k} + dq * q1) + b1;
+      let u2 = inv * (p2 + sq * z2_${k} + dq * q2) + b2;
+      let y = u1 / (vec4<f32>(1.0) + exp(-u1)) * u2;
+      let base = r * 1792u + j0;
+      c[base] = y.x; c[base + 1u] = y.y; c[base + 2u] = y.z; c[base + 3u] = y.w;
+    }
+  }`).join("\n  ")}
 }` } }));
       return;
     }
@@ -306,30 +326,28 @@ export class Bioemu2Gpu {
     steps.push(await o.map("cs-gamma-g", (n * R * DC) / 4, [
       { buffer: buffers.gA, type: "vec4<f32>", write: true },
       { buffer: buffers.gQ, type: "vec4<f32>", write: true },
-      { buffer: buffers.beta, type: "vec4<f32>", write: true },
       { buffer: buffers.q, type: "vec4<f32>" },
       { buffer: buffers.gAQ, type: "vec4<f32>", write: true },
     ],
     `let j = i / U(1u); let e4 = i % U(1u); let t = e4 / 224u; let c4 = e4 % 224u; let real = t < U(0u);
   var al = vec4<f32>(0.0); var be = vec4<f32>(0.0);
-  if (real) { let at4 = (j * U(0u) + t) * 480u; al = b3[at4 + c4]; be = b3[at4 + 224u + c4]; }
+  if (real) { let at4 = (j * U(0u) + t) * 480u; al = b2[at4 + c4]; be = b2[at4 + 224u + c4]; }
   let g = vec4<f32>(1.0) + al;
+  let rb4 = (j * U(2u) + t) * 448u;
   if (c4 < 192u) {
     b0[(j * U(2u) + t) * 192u + c4] = g;
-    b4[i] = g * (-1.0 / 6.0);
+    b3[rb4 + c4] = g * (-1.0 / 6.0);
   } else {
     b1[(j * U(2u) + t) * 32u + c4 - 192u] = g;
-    b4[i] = g;
+    b3[rb4 + c4] = g;
   }
-  b2[i] = be;`, [T, R * (DC / 4), R]));
+  b3[rb4 + 224u + c4] = be;`, [T, R * (DC / 4), R]));
     const W = await this.stacked("stack/s_to_q_mixer/fc12", all.map((l) => `${layer(l)}/coupling/s_to_q_mixer`), this.half, true);
     const wl = W2 * DC;
-    // (R | B: R = Qq - Qa / 6 - couplingSplit's, fused into a single DC=896 GEMM via gAQ)
-    const qb = (k, a0, aStride, wOff, cOff, more = {}) => o.gemm({ m: R, n: W2, k, a: a0, b: W, c: buffers.QB, batches: [n, 1],
-      A: { off: 0, s0: R * aStride, m: aStride, k: 1 }, B: { off: l0 * wl + wOff, s0: wl, n: DC, k: 1 },
-      C: { off: cOff, s0: R * 2 * W2, m: 2 * W2, n: 1 }, ...more });
-    steps.push(await qb(DC, buffers.gAQ, DC, 0, 0));
-    steps.push(await qb(DC, buffers.beta, DC, 0, W2));
+    // (R | B: R = Qq - Qa / 6 - couplingSplit's, stacked with beta into a single [2R][DC] GEMM)
+    steps.push(await o.gemm({ m: 2 * R, n: W2, k: DC, a: buffers.gAQ, b: W, c: buffers.QB, batches: [n, 1],
+      A: { off: 0, s0: 2 * R * DC, m: DC, k: 1 }, B: { off: l0 * wl, s0: wl, n: DC, k: 1 },
+      C: { off: 0, s0: 2 * R * W2, m: W2, n: 1 } }));
     for (let j = 0; j < n; j += 1) {
       out[j].pre = { W, wOff: (l0 + j) * wl, gA: o.view(buffers.gA, j * R * DT, R * DT), gQ: o.view(buffers.gQ, j * R * DA, R * DA),
                      QB: o.view(buffers.QB, j * R * 2 * W2, R * 2 * W2) };
@@ -948,8 +966,8 @@ export class Bioemu2Gpu {
       cin: o.buffer("cg.cin", 4 * G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),
       q: o.buffer("cg.q", G * T * 1920), s: o.buffer("cg.s", G * T * 2560),
       ...(split ? { gA: o.buffer("cg.gA", G * (T + 1) * DT), gQ: o.buffer("cg.gQ", G * (T + 1) * DA),
-                    gAQ: o.buffer("cg.gAQ", G * (T + 1) * 896),
-                    beta: o.buffer("cg.beta", G * (T + 1) * 896), QB: o.buffer("cg.QB", G * (T + 1) * 2 * 3584) } : {}),
+                    gAQ: o.buffer("cg.gAQ", G * 2 * (T + 1) * 896),
+                    QB: o.buffer("cg.QB", G * (T + 1) * 2 * 3584) } : {}),
     };
     const xhat = batchCond ? o.buffer("cg.xhat", T * DT) : null;
     const hid = o.buffer("dn.hid", S * N * 384);
