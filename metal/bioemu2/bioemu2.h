@@ -147,6 +147,7 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
 void setDynamics(Denoiser& d, float dt, const float* coordsCond);
 void freeDenoiser(Denoiser& d);
 void forgetRowMaps();             // (every fold: the row maps are an input's)
+u64* pointerArray(const std::string& key, const std::vector<u64>& v);
 void setSigmaSchedule(const float* sigmas, int n);
 // x [samples][N][3] (noisy, angstrom) at sigma -> den; cond: each sample's conditioning frame (null: coords_cond)
 void denoise(const Denoiser& d, const float* x, float sigma, float* den, const float* cond = nullptr, int samples = 1);

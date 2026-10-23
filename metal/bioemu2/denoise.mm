@@ -295,7 +295,7 @@ static const float* stackedVectors(const std::string& key, const CondKind& k, co
   });
 }
 // a device array of pointers, rewritten only when one changes (after a sync: an earlier call may still read it)
-static u64* pointerArray(const std::string& key, const std::vector<u64>& v) {
+u64* pointerArray(const std::string& key, const std::vector<u64>& v) {
   struct Arr { u64* dev = nullptr; size_t cap = 0; std::vector<u64> host; };
   static std::map<std::string, Arr> arrays;
   Arr& r = arrays[key];
