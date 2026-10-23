@@ -1069,9 +1069,8 @@ ${kvBind}
 ${gBind}
 ${qbBind}
 @group(0) @binding(${outBindIdx}) var<storage, read_write> out: array<f32>;
-var<workgroup> ks: array<vec4<f32>, 256>;     // [32 keys][32 dims]
+var<workgroup> ks: array<vec4<f32>, 256>;     // [32 keys][32 dims], then reused for [32 queries][8 vec4 keys] logits
 var<workgroup> vs: array<vec4<f32>, 256>;
-var<workgroup> ps: array<vec4<f32>, 256>;     // [32 queries][8 vec4 keys] this chunk's logits
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let flat = wid.x + wid.y * 65535u;
@@ -1112,7 +1111,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       vs[slot] = vec4<f32>(kv[row + ${D}u], kv[row + ${D + 1}u], kv[row + ${D + 2}u], kv[row + ${D + 3}u]);`}
     }
     workgroupBarrier();
-    // this lane's 8 keys of the chunk (2 vec4 stores)
+    // this lane's 8 keys of the chunk (2 vec4s held until ks is free)
+    var pv0 = vec4<f32>(0.0);
+    var pv1 = vec4<f32>(0.0);
     for (var g4 = 0u; g4 < 2u; g4 += 1u) {
       let j0 = sub * 8u + g4 * 4u;
       var pv = vec4<f32>(0.0);
@@ -1125,14 +1126,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         if (mask[w * ${WQ}u + key] == 0) { v = -1.0e6; }
         pv.${"xyzw"[k]} = v;
       }`).join("\n      ")}
-      ps[qi * 8u + sub * 2u + g4] = pv;
+      if (g4 == 0u) { pv0 = pv; } else { pv1 = pv; }
     }
+    workgroupBarrier();
+    let pBase4 = qi * 8u;
+    ks[pBase4 + sub * 2u] = pv0;
+    ks[pBase4 + sub * 2u + 1u] = pv1;
     workgroupBarrier();
     // the online softmax over the chunk's 32 (every lane of a query alike), and this lane's 8 output dims
     var cm = m;
-    let pBase4 = qi * 8u;
     for (var j4 = 0u; j4 < 8u; j4 += 1u) {
-      let pv = ps[pBase4 + j4];
+      let pv = ks[pBase4 + j4];
       cm = max(cm, max(max(pv.x, pv.y), max(pv.z, pv.w)));
     }
     let rescale = exp(m - cm);
@@ -1140,7 +1144,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     o0 = o0 * rescale;
     o1 = o1 * rescale;
     for (var j4 = 0u; j4 < 8u; j4 += 1u) {
-      let ev = exp(ps[pBase4 + j4] - vec4<f32>(cm));
+      let ev = exp(ks[pBase4 + j4] - vec4<f32>(cm));
       l += (ev.x + ev.y) + (ev.z + ev.w);
       let vb0 = j4 * 32u + sub * 2u;
       o0 += ev.x * vs[vb0] + ev.y * vs[vb0 + 8u] + ev.z * vs[vb0 + 16u] + ev.w * vs[vb0 + 24u];
@@ -1202,9 +1206,8 @@ struct P { S: u32, T: u32, QB: u32, pad0: u32, alpha: f32 };
 ${gBind}
 @group(0) @binding(${outBindIdx}) var<storage, read_write> out: array<f32>;
 ${hasQBias ? `@group(0) @binding(${qbBindIdx}) var<storage, read> qBias: array<f32>;` : ""}
-var<workgroup> ks: array<vec4<f32>, ${32 * V}>;     // [32 keys][hd]
+var<workgroup> ks: array<vec4<f32>, ${Math.max(32 * V, 256)}>;     // [32 keys][hd], then reused for [32 queries][8 vec4 keys] logits
 var<workgroup> vs: array<vec4<f32>, ${32 * V}>;
-var<workgroup> ps: array<vec4<f32>, 256>;           // [32 queries][8 vec4 keys]
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let flat = wid.x + wid.y * 65535u;
@@ -1247,6 +1250,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
       }
     }
     workgroupBarrier();
+    var pv0 = vec4<f32>(-3.0e38);
+    var pv1 = vec4<f32>(-3.0e38);
     for (var g4 = 0u; g4 < 2u; g4 += 1u) {
       let j0 = sub * 8u + g4 * 4u;
       var pv = vec4<f32>(-3.0e38);
@@ -1259,20 +1264,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
           pv.${"xyzw"[k]} = qk * p.alpha + bias[biasRow + kt];
         }
       }`).join("\n      ")}
-      ps[ql * 8u + sub * 2u + g4] = pv;
+      if (g4 == 0u) { pv0 = pv; } else { pv1 = pv; }
     }
     workgroupBarrier();
-    var cm = m;
     let pBase4 = ql * 8u;
+    ks[pBase4 + sub * 2u] = pv0;
+    ks[pBase4 + sub * 2u + 1u] = pv1;
+    workgroupBarrier();
+    var cm = m;
     for (var j4 = 0u; j4 < 8u; j4 += 1u) {
-      let pv = ps[pBase4 + j4];
+      let pv = ks[pBase4 + j4];
       cm = max(cm, max(max(pv.x, pv.y), max(pv.z, pv.w)));
     }
     let rescale = exp(m - cm);
     l = l * rescale;
     ${vlIdx.map((e) => `o_${e} = o_${e} * rescale;`).join("\n    ")}
     for (var j4 = 0u; j4 < 8u; j4 += 1u) {
-      let ev = exp(ps[pBase4 + j4] - vec4<f32>(cm));
+      let ev = exp(ks[pBase4 + j4] - vec4<f32>(cm));
       l += (ev.x + ev.y) + (ev.z + ev.w);
       let vb = j4 * ${4 * V}u + sub * ${VL}u;
       ${vlIdx.map((e) => `o_${e} += ev.x * vs[vb + ${e}u] + ev.y * vs[vb + ${V + e}u] + ev.z * vs[vb + ${2 * V + e}u] + ev.w * vs[vb + ${3 * V + e}u];`).join("\n      ")}
@@ -1317,9 +1325,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   let m = red[0] / 768.0;
   workgroupBarrier();
   ${Array.from({ length: 12 }, (_, k) => `let d_${k} = v_${k} - m;`).join("\n  ")}
@@ -1328,9 +1338,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   if (!live) { return; }
   let v = red[0];
   let sa = sqrt(v / 768.0 + 1e-5);
@@ -1345,12 +1357,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }`, rows, [a, gA, tstats, xa], u);
   }
 
-  /** Fused cat-qa + modulated LayerNorm(896) for q_to_s_mixer (one 64-lane workgroup per token row). */
-  catQaLn({ q, a, centre, condS, qsh, rows, T, N, eps = 1e-5 }) {
+  /** Fused cat-qa + modulated LayerNorm(896) for q_to_s_mixer (+ optional csTokenPrep when gA/tstats/xa are passed). */
+  catQaLn({ q, a, centre, condS, qsh, rows, T, N, gA = null, tstats = null, xa = null, eps = 1e-5 }) {
     const u = new Uint32Array(4);
     const f = new Float32Array(u.buffer);
     u[0] = rows; u[1] = T; u[2] = N; f[3] = eps;
-    return this.step("cat-qa-ln", `
+    const fuseCs = Boolean(gA);
+    return this.step(fuseCs ? "cat-qa-ln-cs" : "cat-qa-ln", `
 struct P { rows: u32, T: u32, N: u32, eps: f32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
@@ -1358,7 +1371,10 @@ struct P { rows: u32, T: u32, N: u32, eps: f32 };
 @group(0) @binding(3) var<storage, read> centre: array<i32>;
 @group(0) @binding(4) var<storage, read> cond: array<f32>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
-var<workgroup> red: array<f32, 64>;
+${fuseCs ? `@group(0) @binding(6) var<storage, read> gA: array<f32>;
+@group(0) @binding(7) var<storage, read_write> tstats: array<f32>;
+@group(0) @binding(8) var<storage, read_write> xa: array<f32>;
+var<workgroup> red: array<vec2<f32>, 64>;` : "var<workgroup> red: array<f32, 64>;"}
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let r = wid.x + wid.y * 65535u;
@@ -1371,14 +1387,56 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let v_0 = q[qBase];
   let v_1 = q[qBase + 64u];
   ${Array.from({ length: 12 }, (_, k) => `let v_${k + 2} = a[aBase + ${k * 64}u];`).join("\n  ")}
-  red[li] = ${Array.from({ length: 14 }, (_, k) => `v_${k}`).join(" + ")};
+  ${fuseCs ? `let sumA = ${Array.from({ length: 12 }, (_, k) => `v_${k + 2}`).join(" + ")};
+  let sumQA = ${Array.from({ length: 14 }, (_, k) => `v_${k}`).join(" + ")};
+  red[li] = vec2<f32>(sumA, sumQA);
   workgroupBarrier();
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
+  let mA = red[0].x / 768.0;
+  let mean = red[0].y / 896.0;
+  workgroupBarrier();
+  ${Array.from({ length: 12 }, (_, k) => `let da_${k} = v_${k + 2} - mA;`).join("\n  ")}
+  ${Array.from({ length: 14 }, (_, k) => `let d_${k} = v_${k} - mean;`).join("\n  ")}
+  let ssA = ${Array.from({ length: 12 }, (_, k) => `da_${k} * da_${k}`).join(" + ")};
+  let ssQA = ${Array.from({ length: 14 }, (_, k) => `d_${k} * d_${k}`).join(" + ")};
+  red[li] = vec2<f32>(ssA, ssQA);
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
+  if (!live) { return; }
+  let vA = red[0].x;
+  let sa = sqrt(vA / 768.0 + 1e-5);
+  if (li == 0u) {
+    tstats[row * 3u] = mA;
+    tstats[row * 3u + 1u] = vA;
+    tstats[row * 3u + 2u] = sa;
+  }
+  let gBase = t * 768u + li;
+  let invSa = 1.0 / sa;
+  ${Array.from({ length: 12 }, (_, k) => `xa[aBase + ${k * 64}u] = gA[gBase + ${k * 64}u] * da_${k} * invSa;`).join("\n  ")}
+  let inv = inverseSqrt(red[0].y / 896.0 + p.eps);` : `red[li] = ${Array.from({ length: 14 }, (_, k) => `v_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   let mean = red[0] / 896.0;
   workgroupBarrier();
   ${Array.from({ length: 14 }, (_, k) => `let d_${k} = v_${k} - mean;`).join("\n  ")}
@@ -1387,15 +1445,88 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[li] += red[li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[li] += red[li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[0] += red[1]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
   if (!live) { return; }
-  let inv = inverseSqrt(red[0] / 896.0 + p.eps);
+  let inv = inverseSqrt(red[0] / 896.0 + p.eps);`}
   let cb = t * 2560u + li;
   let yb = row * 896u + li;
   ${Array.from({ length: 14 }, (_, k) => `y[yb + ${k * 64}u] = d_${k} * inv * (1.0 + cond[cb + ${k * 64}u]) + cond[cb + ${896 + k * 64}u];`).join("\n  ")}
-}`, rows, [q, a, centre, condS, qsh], u);
+}`, rows, [q, a, centre, condS, qsh, ...(fuseCs ? [gA, tstats, xa] : [])], u);
+  }
+
+  /** Fused readout tail: add-token + LayerNorm(384) + linear(384 -> 3) + edm-out in one 64-lane workgroup per atom row. */
+  readoutTail({ hid, hidT, atomTokenS, wLn, wOut, X, scalars, out, rows, eps = 1e-5 }) {
+    const u = new Uint32Array(4);
+    const f = new Float32Array(u.buffer);
+    u[0] = rows; f[1] = eps;
+    return this.step("readout-tail", `
+struct P { rows: u32, eps: f32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> hid: array<f32>;
+@group(0) @binding(2) var<storage, read> hidT: array<f32>;
+@group(0) @binding(3) var<storage, read> atomTok: array<i32>;
+@group(0) @binding(4) var<storage, read> wLn: array<f32>;
+@group(0) @binding(5) var<storage, read> wOut: array<f32>;
+@group(0) @binding(6) var<storage, read> xIn: array<f32>;
+@group(0) @binding(7) var<storage, read> scalars: array<f32>;
+@group(0) @binding(8) var<storage, read_write> out: array<f32>;
+var<workgroup> red: array<f32, 64>;
+var<workgroup> row_ln: array<f32, 384>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wid.x + wid.y * 65535u;
+  let live = r < p.rows;
+  let row = min(r, p.rows - 1u);
+  let t = atomTok[row];
+  let hBase = row * 384u + li;
+  ${Array.from({ length: 6 }, (_, k) => `var v_${k} = hid[hBase + ${k * 64}u];`).join("\n  ")}
+  if (t >= 0) {
+    let tBase = u32(t) * 384u + li;
+    ${Array.from({ length: 6 }, (_, k) => `v_${k} += hidT[tBase + ${k * 64}u];`).join("\n    ")}
+  }
+  red[li] = ${Array.from({ length: 6 }, (_, k) => `v_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
+  let mean = red[0] / 384.0;
+  workgroupBarrier();
+  ${Array.from({ length: 6 }, (_, k) => `let d_${k} = v_${k} - mean;`).join("\n  ")}
+  red[li] = ${Array.from({ length: 6 }, (_, k) => `d_${k} * d_${k}`).join(" + ")};
+  workgroupBarrier();
+  if (li < 32u) { red[li] += red[li + 32u]; } workgroupBarrier();
+  if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
+  if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+      + ((red[1] + red[5]) + (red[3] + red[7]));
+  }
+  workgroupBarrier();
+  let inv = inverseSqrt(red[0] / 384.0 + p.eps);
+  ${Array.from({ length: 6 }, (_, k) => `{
+    let c = li + ${k * 64}u;
+    row_ln[c] = d_${k} * inv * wLn[c];
+  }`).join("\n  ")}
+  workgroupBarrier();
+  if (li < 3u && live) {
+    let wBase = li * 384u;
+    var acc = 0.0;
+    for (var k = 0u; k < 384u; k += 1u) {
+      acc += row_ln[k] * wOut[wBase + k];
+    }
+    let oIdx = row * 3u + li;
+    out[oIdx] = scalars[2] * xIn[oIdx] + scalars[3] * acc;
+  }
+}`, rows, [hid, hidT, atomTokenS, wLn, wOut, X, scalars, out], u);
   }
 
   /** Fused couplingSplit atom row statistics + Xq scaling (four 64-lane sub-rows per 256-lane workgroup). */
@@ -1428,9 +1559,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[rb] = ((red[rb] + red[rb + 4u]) + (red[rb + 2u] + red[rb + 6u]))
+      + ((red[rb + 1u] + red[rb + 5u]) + (red[rb + 3u] + red[rb + 7u]));
+  }
+  workgroupBarrier();
   let mq = red[rb] / 128.0;
   workgroupBarrier();
   let d0 = q0 - mq;
@@ -1440,9 +1573,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 32u) { red[rb + li] += red[rb + li + 32u]; } workgroupBarrier();
   if (li < 16u) { red[rb + li] += red[rb + li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[rb + li] += red[rb + li + 8u]; } workgroupBarrier();
-  if (li < 4u) { red[rb + li] += red[rb + li + 4u]; } workgroupBarrier();
-  if (li < 2u) { red[rb + li] += red[rb + li + 2u]; } workgroupBarrier();
-  if (li == 0u) { red[rb] += red[rb + 1u]; } workgroupBarrier();
+  if (li == 0u) {
+    red[rb] = ((red[rb] + red[rb + 4u]) + (red[rb + 2u] + red[rb + 6u]))
+      + ((red[rb + 1u] + red[rb + 5u]) + (red[rb + 3u] + red[rb + 7u]));
+  }
+  workgroupBarrier();
   if (!live) { return; }
   let ssq = red[rb];
   let sq = sqrt(ssq / 128.0 + 1e-5);

@@ -12,7 +12,7 @@
  * implementation - so a disagreement between the lanes would show up here.
  *
  * Every AF3 kernel gets a sibling of this file, comparing against its
- * cpu/af3/*/*-reference.js counterpart.
+ * cpu/af3/.../*-reference.js counterpart.
  */
 import { loadTriangleReferenceBundle } from "../../shared/bundles/bundle.js";
 import { triangleMultiplicationOutgoingReference } from "../../webgpu/kernels/triangle/cpu-reference.js";

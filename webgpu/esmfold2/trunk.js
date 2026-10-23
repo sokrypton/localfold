@@ -336,6 +336,8 @@ export class Esmfold2TrunkGpu {
       const validation = new DeferredValidation(this.device, "ESMFold2 trunk");
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await options.beforeBlock?.(index);
         const pending = [];
         validation.begin();
         // eslint-disable-next-line no-await-in-loop

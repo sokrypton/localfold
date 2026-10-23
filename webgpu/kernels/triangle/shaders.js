@@ -476,6 +476,8 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // running the whole five-kernel update and not only the two.
   const columnOfCol = (c) => packAB
     ? `local.x * ${columnsPerThread}u + ${c}u` : `local.x + ${c * PROJECT_W}u`;
+  const stageColumnOfCol = (c) => packAB
+    ? `local.y * ${columnsPerThread}u + ${c}u` : `local.y + ${c * PROJECT_W}u`;
   const channelChunked = shape.channelChunked === true && !packAB;
   const H_END = channelChunked ? "min(CH, chunk.x + chunk.y)" : "CH";
   const gated = (cell, value, gate) => `pair_mask * ${cell}.${value} * logistic(${cell}.${gate})`;
@@ -485,8 +487,10 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   const abBiasDeclare = [];
   for (let c = 0; c < columnsPerThread; c += 1) {
     abBiasDeclare.push(`  let h_${c} = h0 + ${columnOfCol(c)};
-  ${exactHCols ? "" : `let valid_h_${c} = h_${c} < ${H_END};\n  `}let w_slot_${c} = local.y * TILE_COLUMNS + ${columnOfCol(c)};
-  let w_base_${c} = h_${c} * CZ + local.y;
+  let stage_col_${c} = ${stageColumnOfCol(c)};
+  let stage_h_${c} = h0 + stage_col_${c};
+  ${exactHCols ? "" : `let valid_h_${c} = h_${c} < ${H_END};\n  let valid_stage_h_${c} = stage_h_${c} < ${H_END};\n  `}let w_slot_${c} = local.x * TILE_COLUMNS + stage_col_${c};
+  let w_base_${c} = stage_h_${c} * CZ + local.x;
   ${exactHCols
     ? `let bias_${c} = ${accVector}(
       ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h_${c}]`))).join(",\n      ")});`
@@ -500,7 +504,7 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
     }
   }
   const abStageWeight = Array.from({ length: columnsPerThread }, (_, c) => {
-    const cond = [exactHCols ? null : `valid_h_${c}`, exactCzSteps ? null : "weight_c < CZ"].filter(Boolean).join(" && ");
+    const cond = [exactHCols ? null : `valid_stage_h_${c}`, exactCzSteps ? null : "source_c < CZ"].filter(Boolean).join(" && ");
     return cond === ""
       ? `    {
       let weight_index = w_base_${c} + c0;
@@ -594,7 +598,7 @@ fn main(
 ${abBiasDeclare.join("\n")}
   for (var c0 = 0u; c0 < CZ; c0 += ${PROJECT_W}u) {
     let source_c = c0 + local.x;
-    ${exactCzSteps ? "" : "let weight_c = c0 + local.y;\n    "}var staged = ${projectRowVector}(0.0);
+    var staged = ${projectRowVector}(0.0);
     ${exactCzSteps ? "" : "if (source_c < CZ) {\n      "}if (full_rows) {
         let s0 = s_base0 + c0;
         ${overRows((r) => `${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `s0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
@@ -899,17 +903,24 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
     : `    {
       var projection_w = 0.0;
       var gate_w = 0.0;
-      ${exactOutCols ? "" : `if (valid_col_${c}) {\n        `}if (weight_k < CH) {
+      ${exactOutCols ? "" : `if (valid_col_${c}) {\n        `}${exactOutSteps
+        ? `projection_w = ${readWeight(`weights[wz_base_${c} + k0]`)};
+        gate_w = ${readWeight(`weights[wg_base_${c} + k0]`)};`
+        : `if (weight_k < CH) {
           projection_w = ${readWeight(`weights[wz_base_${c} + k0]`)};
         }
         if (weight_k < CZ) {
           gate_w = ${readWeight(`weights[wg_base_${c} + k0]`)};
-        }${exactOutCols ? "" : "\n      }"}
+        }`}${exactOutCols ? "" : "\n      }"}
       tile_weight[w_slot_${c}] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
     }`).join("\n");
+  const OUT_SOURCE_STRIDE = !acc16
+    && (2 * PROJECT_W_SOURCE * rowsPerThread * 4 + outColumnsPerThread * PROJECT_W2 * 8 > 16384)
+    ? PROJECT_W : SOURCE_STRIDE;
+  const OUT_PROJECT_W_SOURCE = PROJECT_W * OUT_SOURCE_STRIDE;
   const outInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
-      let xs = tile_x[local.y * ${SOURCE_STRIDE}u + ${k}u];
-      let zs = tile_z[local.y * ${SOURCE_STRIDE}u + ${k}u];
+      let xs = tile_x[local.y * ${OUT_SOURCE_STRIDE}u + ${k}u];
+      let zs = tile_z[local.y * ${OUT_SOURCE_STRIDE}u + ${k}u];
       ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
 ${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
         let packed = tile_weight[${k * OUT_TILE_COLUMNS + c * PROJECT_W}u + local.x];
@@ -936,8 +947,8 @@ const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_x: array<${outRowVector}, ${PROJECT_W_SOURCE}>;
-var<workgroup> tile_z: array<${outRowVector}, ${PROJECT_W_SOURCE}>;
+var<workgroup> tile_x: array<${outRowVector}, ${OUT_PROJECT_W_SOURCE}>;
+var<workgroup> tile_z: array<${outRowVector}, ${OUT_PROJECT_W_SOURCE}>;
 // 🔴 ONE vec2 A CELL, NOT TWO SCALAR ARRAYS - the same argument projectAB
 // makes with four matrices and a vec4. The output projection and its gate are
 // contracted at the SAME (k, output channel) cell, so their two weights are
@@ -970,7 +981,7 @@ fn main(
   // been taught to fold is unchanged.
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
-  let tile_index = local.y * ${SOURCE_STRIDE}u + local.x;
+  let tile_index = local.y * ${OUT_SOURCE_STRIDE}u + local.x;
   let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
   let sx_base0 = row0 * CH_STRIDE + local.x;
   let sz_base0 = row0 * CZ_STRIDE + local.x;

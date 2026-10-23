@@ -129,7 +129,7 @@ export class Bioemu2Gpu {
    * metal/bioemu2, which rounds it, Xq in half cost the split its precision). A padding atom (map -1) conditions on
    * the identity, gamma 1 and beta 0, as this port's adaLN gives it.
    */
-  async couplingSplit(steps, prefix, { a, q, condQ, atomTokenS, S, T, N, cs, out, pre = null }) {
+  async couplingSplit(steps, prefix, { a, q, condQ, atomTokenS, S, T, N, cs, out, pre = null, preTok = false }) {
     const o = this.ops;
     const DT = BIOEMU2.token, DA = BIOEMU2.atom, DC = DT + DA, I = 1792, W2 = 2 * I;
     // (pre: conditionGroup's - the layer's [fc1; fc2] a slice of the stacked one at wOff, and gamma and R | B
@@ -156,7 +156,7 @@ export class Bioemu2Gpu {
       A: { off: 0, m: DC, k: 1 }, B: { off: 0, n: DC, k: 1 }, C: { off: W2, m: 2 * W2, n: 1 } }));
     }
     // a token row (sample-stacked): its mean, centred sum of squares and spread; then Xa and P
-    steps.push(await o.csTokenPrep({ a, gA, tstats: cs.tstats, xa: cs.xa, rows: S * T, T }));
+    if (!preTok) steps.push(await o.csTokenPrep({ a, gA, tstats: cs.tstats, xa: cs.xa, rows: S * T, T }));
     steps.push(await o.gemm({ m: S * T, n: W2, k: DT, a: cs.xa, b: W, c: cs.P,
       A: { off: 0, m: DT, k: 1 }, B: { off: wo, n: DC, k: 1 }, C: { off: 0, m: W2, n: 1 } }));
     // an atom row: q's statistics, the whole row's combined (a padding atom's a is zero), its token's spread; Xq; Z
@@ -715,17 +715,20 @@ export class Bioemu2Gpu {
       Promise.all(Array.from({ length: BIOEMU2.msaBlocks }, (_, l) => trunkBlockWeights(this.read, l, "msa"))),
       Promise.all(Array.from({ length: BIOEMU2.pairmixerBlocks }, (_, l) => trunkBlockWeights(this.read, l, "pairmixer"))),
     ]);
+    const allBlocks = [...msaBlocks, ...mixerBlocks];
     const copyBack = [await o.map("copy", T * T * 256, [{ buffer: zPrev, write: true }, { buffer: z }], "b0[i] = b1[i];"),
                       await o.map("copy", T * BIOEMU2.single, [{ buffer: sPrev, write: true }, { buffer: s }], "b0[i] = b1[i];")];
     return {
       z, s, sPrev, zPrev, zInit, sInit, trunkAllocator,
       pass: async (onBlock) => {
         o.run(recycle);
-        for (let l = 0; l < BIOEMU2.msaBlocks; l += 1) {
-          o.run(msaSteps[l]);
-          await trunk.run(pairState, [msaBlocks[l]], { n: T, channels: 256, readback: false, wait: false });
-        }
-        await trunk.run(pairState, mixerBlocks, { n: T, channels: 256, readback: false, onBlockDone: onBlock });
+        await trunk.run(pairState, allBlocks, {
+          n: T, channels: 256, readback: false,
+          beforeBlock: (l) => { if (l < msaSteps.length) o.run(msaSteps[l]); },
+          onBlockDone: onBlock && ((done) => {
+            if (done > msaBlocks.length) onBlock(done - msaBlocks.length, mixerBlocks.length);
+          }),
+        });
         o.run(copyBack);
       },
     };
@@ -996,10 +999,12 @@ export class Bioemu2Gpu {
       }
       // q_to_s's input FIRST - concat(q[own sample, centre(t)], a) per token, modulated by the token's s coupling: s_to_q
       // writes q in place (its fc3's gated residual), and both mixers read the layer's q and a from before either update
-      steps.push(await o.catQaLn({ q, a, centre, condS, qsh, rows: S * T, T, N }));
+      const preTok = Boolean(split && cv?.pre);
+      steps.push(await o.catQaLn({ q, a, centre, condS, qsh, rows: S * T, T, N,
+        ...(preTok ? { gA: cv.pre.gA, tstats: cs.tstats, xa: cs.xa } : {}) }));
       // s_to_q: concat(a[own sample, token(atom)], q) per atom, modulated by the token's q coupling, a SwiGLU to 128
       if (split) {
-        await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt, pre: cv?.pre });
+        await this.couplingSplit(steps, `${cp}/s_to_q_mixer`, { a, q, condQ, atomTokenS, S, T, N, cs, out: sqt, pre: cv?.pre, preTok });
       } else {
         steps.push(await o.map("cat-aq", S * N * 896, [{ buffer: sq, write: true }, { buffer: a }, { buffer: q }, { buffer: atomTokenS, type: "i32" }],
           `let at = i / 896u; let c = i % 896u; let t = b3[at];
@@ -1029,12 +1034,10 @@ export class Bioemu2Gpu {
     const ro = `${P}/readout`;
     steps.push(await o.linear({ x: q, w: await this.w(`${ro}/q_to_hidden/weight`), y: hid, rows: S * N, inC: DA, outC: 384 }));
     steps.push(await o.linear({ x: a, w: await this.w(`${ro}/s_to_hidden/weight`), y: hidT, rows: S * T, inC: DT, outC: 384 }));
-    steps.push(await o.map("add-token", S * N * 384, [{ buffer: hid, write: true }, { buffer: hidT }, { buffer: atomTokenS, type: "i32" }],
-      "let at = i / 384u; let c = i % 384u; let t = b2[at]; if (t >= 0) { b0[i] = b0[i] + b1[u32(t) * 384u + c]; }"));
-    steps.push(await o.layerNorm({ x: hid, y: hid, rows: S * N, width: 384, w: await this.w(`${ro}/to_out_0/weight`, { half: false }) }));
-    steps.push(await o.linear({ x: hid, w: await this.w(`${ro}/to_out_1/weight`, { half: false }), y: out, rows: S * N, inC: 384, outC: 3 }));
-    steps.push(await o.map("edm-out", S * N * 3, [{ buffer: out, write: true }, { buffer: X }, { buffer: scalars }],
-      "b0[i] = b2[2] * b1[i] + b2[3] * b0[i];"));
+    steps.push(await o.readoutTail({ hid, hidT, atomTokenS,
+      wLn: await this.w(`${ro}/to_out_0/weight`, { half: false }),
+      wOut: await this.w(`${ro}/to_out_1/weight`, { half: false }),
+      X, scalars, out, rows: S * N }));
     const program = o.program(steps);
     const fourier = sch;
     return {
