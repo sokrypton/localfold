@@ -114,10 +114,12 @@ export class EvoformerStackGpu {
         // events instead of a stream of "queued" events that all fire at once.
         //
         // They resolve in submission order, so the count cannot go backwards.
-        const submitted = block + 1;
-        const total = input.blockWeights.length;
-        void this.device.queue.onSubmittedWorkDone()
-          .then(() => input.onBlockDone?.(submitted, total));
+        if (input.onBlockDone !== undefined) {
+          const submitted = block + 1;
+          const total = input.blockWeights.length;
+          void this.device.queue.onSubmittedWorkDone()
+            .then(() => input.onBlockDone(submitted, total));
+        }
       }
 
       // 🔴 THE BLOCKS ABOVE WERE ENCODED, NOT COMPUTED. Submission runs ahead of
@@ -206,10 +208,12 @@ export class ExtraMsaPairStackGpu {
         // events instead of a stream of "queued" events that all fire at once.
         //
         // They resolve in submission order, so the count cannot go backwards.
-        const submitted = block + 1;
-        const total = input.blockWeights.length;
-        void this.device.queue.onSubmittedWorkDone()
-          .then(() => input.onBlockDone?.(submitted, total));
+        if (input.onBlockDone !== undefined) {
+          const submitted = block + 1;
+          const total = input.blockWeights.length;
+          void this.device.queue.onSubmittedWorkDone()
+            .then(() => input.onBlockDone(submitted, total));
+        }
       }
       // 🔴 NOTHING IS WAITED FOR WHEN THE PAIR STAYS PUT. The readback below is
       // the only reason this stack ever drained the pipeline, so keeping the

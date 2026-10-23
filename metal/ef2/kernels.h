@@ -54,7 +54,10 @@ struct QkvPrepArgs { DP(float) qkv; CP(float) cosT; CP(float) sinT; uint A, C, h
 struct SwaArgs { CP(float) qkv; CP(int) valid; DP(float) ctx; uint nValid, C, halfWindow; float scale; uint ld, pad; DP(half) outH; };
 struct GateLiveArgs { DP(float) ctx; CP(float) gate; CP(float) mask; DP(half) outH; uint A, C, ld, pad; };
 struct GatedAddArgs { DP(float) x; CP(float) mod; CP(float) d; uint A, C, which, pad; };
-struct ScatterMeanArgs { CP(float) v; CP(int) tokenStart; CP(int) tokenAtoms; CP(float) mask; DP(float) out; uint T, C, ld, pad; CP(float) add; };
+struct ScatterMeanArgs {
+  CP(float) v; CP(int) tokenStart; CP(int) tokenAtoms; CP(float) mask; DP(float) out; uint T, C, ld, adaLd;
+  CP(float) add; CP(float) g; CP(float) gb; CP(float) sh; DP(half) outH;
+};
 struct TailInputsArgs { CP(float) aatype; CP(float) profile; CP(float) delMean; DP(float) out; uint T, C, K, ld; };
 
 // ---------------------------------------------------------------- the diffusion module

@@ -1,6 +1,7 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../../kernels/attention.js";
 import { encodeTemplatePairBlock } from "./block.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
+import { DeferredValidation } from "../../runtime/validation.js";
 // 🔴 THE GEOMETRY IS SHARED WITH AF3 AND AF2-MULTIMER. All three compute the
 // same six features; the monomer differs in its atom layout and in masking the
 // whole concatenation by the BACKBONE mask rather than each feature by its own.
@@ -261,14 +262,33 @@ export class QueryOnlyTemplateGpu {
           // assumed because a checkpoint that set it would be mis-embedded.
           input.useTemplateUnitVector === true ? 1 : 0, 0]),
         GPUBufferUsage.UNIFORM);
+      if (input.weights.blockWeights.length > 0) {
+        const b0 = input.weights.blockWeights[0];
+        await execution.warm(async() => {
+          await Promise.all([
+            QueryOnlyTemplateGpu.warm(execution),
+            encodeTemplatePairBlock(execution, undefined, {
+              sequences: 1,
+              length: input.length,
+              cM: input.templateChannels,
+              cZ: input.templateChannels,
+              cOuter: 0,
+              triangleHidden: b0.triangleMultiplicationOutgoing.linearAPBias.length,
+            }, b0, pair, pairMask),
+          ]);
+        });
+      }
+      const validation = new DeferredValidation(this.device, "template");
       const init = await execution.pipelines.get("template:init", INIT_SHADER);
       let encoder = this.device.createCommandEncoder({ label: "template.initialize" });
+      validation.begin();
       const initGrid = execution.linearGrid(pair.elements);
       execution.dispatch(encoder, init,
         [bias, pair, embeddingWeight, geometryBuffer, aatypeBuffer, initParameters],
         initGrid[0], initGrid[1], 1, "template.initialize");
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
+      validation.end("initialize");
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
 
@@ -279,7 +299,7 @@ export class QueryOnlyTemplateGpu {
       let timestampProfile;
       for (let block = 0; block < input.weights.blockWeights.length; block += 1) {
         encoder = this.device.createCommandEncoder({ label: `template.block-${block}` });
-        this.device.pushErrorScope("validation");
+        validation.begin();
         const profiling = input.profileBlock === block;
         if (profiling) execution.beginTimestampProfile(2048);
         await encodeTemplatePairBlock(execution, encoder, {
@@ -293,12 +313,11 @@ export class QueryOnlyTemplateGpu {
         execution.endComputePass(encoder);
         const pendingProfile = profiling ? execution.finishTimestampProfile(encoder) : undefined;
         this.device.queue.submit([encoder.finish()]);
+        validation.end(`block ${block}`);
         if (pendingProfile !== undefined) {
           await this.device.queue.onSubmittedWorkDone();
           timestampProfile = await execution.readTimestampProfile(pendingProfile);
         }
-        const error = await this.device.popErrorScope();
-        if (error !== null) throw new Error(`WebGPU template block ${block} failed: ${error.message}`);
         execution.releaseSince(persistentCheckpoint);
       }
 
@@ -332,7 +351,7 @@ export class QueryOnlyTemplateGpu {
         execution.pipelines.get("template:output", OUTPUT_SHADER),
       ]);
       encoder = this.device.createCommandEncoder({ label: "template.pointwise-attention" });
-      this.device.pushErrorScope("validation");
+      validation.begin();
       const normGrid = execution.rowGrid(pairs);
       execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized],
         normGrid[0], normGrid[1], 1, "template.output-normalize");
@@ -348,8 +367,8 @@ export class QueryOnlyTemplateGpu {
       const readback = input.outputTensor === undefined
         ? execution.createReadback("template.readback", output, encoder) : undefined;
       this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
-      if (error !== null) throw new Error(`WebGPU template output failed: ${error.message}`);
+      validation.end("output");
+      await validation.settle();
       return {
         pairUpdate: readback === undefined ? undefined : await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,

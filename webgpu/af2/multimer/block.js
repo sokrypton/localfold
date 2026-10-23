@@ -560,15 +560,19 @@ async function encodeOuterProductMean(
     contractPipeline, projectOutputPipeline, scalePipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
-    execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
-    execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
-    execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-    vectorContract
+    outerFirst ? undefined : execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
+    outerFirst ? undefined : execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
+    outerFirst ? undefined : execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
+    !outerFirst
+      ? undefined
+      : vectorContract
       ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
         createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
       : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
-    vectorOutput
+    !outerFirst
+      ? undefined
+      : vectorOutput
       ? execution.pipelines.get(
         `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
         createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock, opmArithmetic))
@@ -579,7 +583,7 @@ async function encodeOuterProductMean(
         createOuterProductMeanProjectOutputShader(
           input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
       ),
-    vectorOutput
+    outerFirst && vectorOutput
       ? execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER)
       : undefined,
   ]);
@@ -669,15 +673,21 @@ async function encodeOuterProductMean(
   } else {
     execution.endComputePass(encoder);
     encoder.clearBuffer(output.allocation.buffer);
+    const fastTiled = input.cZ % 64 === 0 && input.cOuter <= 32;
+    const accumulateGrid = fastTiled
+      ? execution.linearGrid(input.length * Math.ceil(input.length / 8) * input.cZ)
+      : outputGrid;
     for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
       const count = Math.min(tileCapacity, input.sequences - offset);
       const tileParams = uniform(execution, `opm.tile-${offset}`, new Uint32Array([offset, count, 0, 0]));
-      grid = execution.linearGrid(count * input.length * input.cOuter * input.cZ);
+      grid = execution.linearGrid(
+        (fastTiled ? Math.ceil((count * input.length) / 8) : count * input.length)
+          * input.cOuter * input.cZ);
       execution.dispatch(encoder, intermediatePipeline, [left, weights, params, tileParams, intermediate],
         grid[0], grid[1], 1, `opm.intermediate-${offset}`);
       execution.dispatch(encoder, accumulatePipeline,
         [right, intermediate, params, tileParams, output],
-        outputGrid[0], outputGrid[1], 1, `opm.accumulate-${offset}`);
+        accumulateGrid[0], accumulateGrid[1], 1, `opm.accumulate-${offset}`);
     }
     execution.dispatch(encoder, finalizePipeline, [msaMask, weights, params, output],
       outputGrid[0], outputGrid[1], 1, "opm.finalize");

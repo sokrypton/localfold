@@ -850,7 +850,7 @@ kernel void ef2_swa(constant SwaArgs& a [[buffer(0)]], uint3 tg [[threadgroup_po
 kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
   if (t >= a.A * C4) return;
-  uint atom = lf_udiv(t, C4), c4 = t - atom * C4;
+  uint atom = a.C == 128 ? (t >> 5) : lf_udiv(t, C4), c4 = a.C == 128 ? (t & 31) : (t - atom * C4);
   float4 v = float4(0.f);
   if (a.mask[atom] != 0.f) {
     float4 cx = ((device const float4*)a.ctx)[t];
@@ -863,11 +863,56 @@ kernel void ef2_gate_live(LF_ARGS(GateLiveArgs)) {
 kernel void ef2_gated_add(LF_ARGS(GatedAddArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
   if (t >= a.A * C4) return;
-  uint atom = lf_udiv(t, C4), c4 = t - atom * C4;
+  uint atom = a.C == 128 ? (t >> 5) : lf_udiv(t, C4), c4 = a.C == 128 ? (t & 31) : (t - atom * C4);
   ((device float4*)a.x)[t] += ((device const float4*)(a.mod + ((ulong)atom * 6 + a.which) * a.C))[c4] * ((device const float4*)a.d)[t];
 }
 // the mean over each token's atoms, weighted by the mask, into the first C columns of rows ld apart
 kernel void ef2_scatter_mean(LF_ARGS(ScatterMeanArgs)) {
+  if (a.outH && a.C == 768 && (a.adaLd & 3) == 0) {
+    const uint token = (uint)(LF_INDEX >> 5), lane = _tid & 31;
+    if (token >= a.T) return;
+    float4 s[6] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
+    float w = 0.f;
+    const int k0 = a.tokenStart[token], k1 = a.tokenStart[token + 1];
+    for (int k = k0; k < k1; ++k) {
+      const int at = a.tokenAtoms[k];
+      const float m = a.mask[at];
+      device const float4* vr4 = (device const float4*)(a.v + (ulong)at * 768);
+      _Pragma("clang loop unroll(full)")
+      for (int u = 0; u < 6; ++u) s[u] += vr4[lane + 32 * u] * m;
+      w += m;
+    }
+    const float invW = 1.f / max(w, 1e-9f);
+    device const float4* add4 = a.add ? (device const float4*)(a.add + (ulong)token * 768) : nullptr;
+    device float4* out4 = (device float4*)(a.out + (ulong)token * a.ld);
+    float4 xv[6];
+    float sum = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < 6; ++u) {
+      const uint idx = lane + 32 * u;
+      const float4 v = s[u] * invW + (add4 ? add4[idx] : float4(0.f));
+      out4[idx] = v;
+      xv[u] = v;
+      sum += v.x + v.y + v.z + v.w;
+    }
+    const float mean = simd_sum(sum) * (1.f / 768.f);
+    float var = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < 6; ++u) { const float4 d = xv[u] - mean; var += dot(d, d); }
+    const float inv = rsqrt(simd_sum(var) * (1.f / 768.f) + 1e-5f);
+    device const float4* gr4 = (device const float4*)(a.g + (ulong)token * a.adaLd);
+    device const float4* gb4 = (device const float4*)a.gb;
+    device const float4* shr4 = (device const float4*)(a.sh + (ulong)token * a.adaLd);
+    device half4* yr4 = (device half4*)(a.outH + (ulong)token * 768);
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < 6; ++u) {
+      const uint idx = lane + 32 * u;
+      const float4 u4 = gr4[idx] + gb4[idx];
+      const float4 sig = float4(lf_sigmoid(u4.x), lf_sigmoid(u4.y), lf_sigmoid(u4.z), lf_sigmoid(u4.w));
+      yr4[idx] = half4(((xv[u] - mean) * inv) * sig + shr4[idx]);
+    }
+    return;
+  }
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
   if (t >= a.T * C4) return;
   uint token = lf_udiv(t, C4), c4 = t - token * C4, c = c4 << 2;
@@ -958,7 +1003,7 @@ kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / de
   if (a.wH) {
     uint C4 = a.C >> 2;
     if (t >= a.A * C4) return;
-    uint at = lf_udiv(t, C4), c4 = t - at * C4;
+    uint at = a.C == 128 ? (t >> 5) : lf_udiv(t, C4), c4 = a.C == 128 ? (t & 31) : (t - at * C4);
     float s = a.level[1];
     float r0 = (float)(half)(a.x[at * 3 + 0] * s);
     float r1 = (float)(half)(a.x[at * 3 + 1] * s);
@@ -1172,7 +1217,7 @@ kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
 kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
   uint t = (uint)LF_INDEX, C4 = a.C >> 2;
   if (t >= a.A * C4) return;
-  uint at = lf_udiv(t, C4), c4 = t - at * C4;
+  uint at = a.C == 128 ? (t >> 5) : lf_udiv(t, C4), c4 = a.C == 128 ? (t & 31) : (t - at * C4);
   int token = a.mask[at] != 0.f ? a.atomToToken[at] : 0;
   float4 qv = ((device const float4*)a.q)[t] + ((device const float4*)(a.perToken + (uint)token * a.C))[c4];
   ((device float4*)a.q)[t] = qv;

@@ -335,7 +335,8 @@ static void adaLN(const Denoiser& d, const float* G, float* a, half* out, int e,
   run("ef2_ada_ln", grid1d((size_t)(T + sgs - 1) / sgs, 1), sgs * 32,
       AdaCombineArgs{a, G + (size_t)e * C, F(B + "gateBias"), G + (size_t)(e + 1) * C, out, resY, resGate, (uint)T, (uint)C, (uint)ld, 0});
 }
-static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const float*& pendingY, const float*& pendingGate) {
+static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const float*& pendingY, const float*& pendingGate,
+                       bool skipFirstAda = false) {
   int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
   size_t prows = ((size_t)T + 15) / 16 * 16;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
@@ -344,11 +345,11 @@ static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const
   half* ctx = scratch<half>("tb.ctx", prows * C);
   static const void* zeroed = nullptr; static size_t zeroedRows = 0;
   if (prows != (size_t)T && (zeroed != x || zeroedRows != prows)) {
-    fill(x, 0, prows * C * sizeof(half));
+    if (!skipFirstAda) fill(x, 0, prows * C * sizeof(half));
     fill(ctx, 0, prows * C * sizeof(half));
     zeroed = x; zeroedRows = prows;
   }
-  adaLN(d, G, a, x, 4 * b, B + "attention/adaln/", pendingY, pendingGate);
+  if (!skipFirstAda) adaLN(d, G, a, x, 4 * b, B + "attention/adaln/", pendingY, pendingGate);
   pendingY = pendingGate = nullptr;
   // q | k | v | gate in one GEMM (half, the attention's layout), then the flash kernel: the query bias, QK^T, the pair
   // bias, the softmax, PV and the gate - no [H, T, T] scores
@@ -407,16 +408,26 @@ static void denoiseStep(const Denoiser& d, const float* xNoisy, float* xDenoised
     gemm(g);
   }
   float* a = scratch<float>("dn.a", (size_t)T * Ct);
-  run1d("ef2_scatter_mean", ((size_t)T * Ct) >> 2, ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, 0, sTok});
-  const float* pendingY = nullptr; const float* pendingGate = nullptr;
-  for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, G, a, b, pendingY, pendingGate);
   size_t prows = ((size_t)T + 15) / 16 * 16;
-  half* an = scratch<half>("dn.an", prows * Ct);
-  static const void* zeroedAn = nullptr; static size_t zeroedAnRows = 0;
-  if (prows > (size_t)T && (zeroedAn != an || zeroedAnRows != prows)) {
-    fill(an + (size_t)T * Ct, 0, (prows - (size_t)T) * Ct * sizeof(half));
-    zeroedAn = an; zeroedAnRows = prows;
+  half* tbx = scratch<half>("tb.x", prows * Ct);
+  static const void* zeroedTbx = nullptr; static size_t zeroedTbxRows = 0;
+  if (prows > (size_t)T && (zeroedTbx != tbx || zeroedTbxRows != prows)) {
+    fill(tbx + (size_t)T * Ct, 0, (prows - (size_t)T) * Ct * sizeof(half));
+    zeroedTbx = tbx; zeroedTbxRows = prows;
   }
+  const bool fuseAda0 = d.tokenBlocks > 0 && Ct == 768 && ((d.entries * Ct) & 3) == 0;
+  if (fuseAda0) {
+    int sgs = T <= 256 ? 2 : 8;
+    run("ef2_scatter_mean", grid1d((size_t)(T + sgs - 1) / sgs, 1), sgs * 32,
+        ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, (uint)(d.entries * Ct),
+                        sTok, G, F("diffusion/tokenBlocks/0/attention/adaln/gateBias"), G + Ct, tbx});
+  } else {
+    run1d("ef2_scatter_mean", ((size_t)T * Ct) >> 2,
+          ScatterMeanArgs{tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, (uint)T, (uint)Ct, (uint)Ct, 0, sTok, nullptr, nullptr, nullptr, nullptr});
+  }
+  const float* pendingY = nullptr; const float* pendingGate = nullptr;
+  for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, G, a, b, pendingY, pendingGate, b == 0 && fuseAda0);
+  half* an = tbx;
   layerNorm(a, an, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", prows * Ca);

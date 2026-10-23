@@ -97,24 +97,25 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // (vector staging: the host's word, or for a pointer array this entry's own pointers' alignment)
   const bool vec = (g.biasType & 256) && (!g.ptrs || (((ulong)A % (8 * sizeof(TA))) == 0 && ((ulong)B % (8 * sizeof(TB))) == 0));
   // a whole tile (the common case): staged without a bounds check an element (6% of a K-256 projection's time)
-  const bool whole = vec && j0 + TR <= g.n && i0 + TC_ <= g.m && g.k % BK == 0;
+  const bool wholeX = vec && j0 + TR <= g.n && g.k % BK == 0;
+  const bool wholeW = vec && i0 + TC_ <= g.m && g.k % BK == 0;
   for (int k0 = 0; k0 < g.k; k0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (whole) {
-      constexpr int XO = TRB ? BK : TR, XI = TRB ? TR : BK, WO = TRA ? TC_ : BK, WI = TRA ? BK : TC_;
+    if (wholeX) {
+      constexpr int XO = TRB ? BK : TR, XI = TRB ? TR : BK;
       _Pragma("clang loop unroll(full)")
       for (int c = tid; c < XO * (XI / 8); c += 128) {
         int o = c / (XI / 8), in = (c % (XI / 8)) * 8;
         lf_stage8<TB, T>(Xs + o * XROW + in, B + (TRB ? (long)(j0 + in) + (long)(k0 + o) * g.ldb : (long)(k0 + in) + (long)(j0 + o) * g.ldb));
       }
+    } else if (!TRB && vec && g.k % BK == 0) {
       _Pragma("clang loop unroll(full)")
-      for (int c = tid; c < WO * (WI / 8); c += 128) {
-        int o = c / (WI / 8), in = (c % (WI / 8)) * 8;
-        lf_stage8<TA, T>(Ws + o * WROW + in, A + (TRA ? (long)(k0 + in) + (long)(i0 + o) * g.lda : (long)(i0 + in) + (long)(k0 + o) * g.lda));
+      for (int c = tid; c < TR * (BK / 8); c += 128) {
+        int o = c / (BK / 8), in = (c % (BK / 8)) * 8;
+        if (j0 + o < g.n) lf_stage8<TB, T>(Xs + o * XROW + in, B + (long)(k0 + in) + (long)(j0 + o) * g.ldb);
+        else if (k0 == 0) { _Pragma("clang loop unroll(full)") for (int e = 0; e < 8; ++e) Xs[o * XROW + in + e] = (T)0; }
       }
     } else {
-    {   // X = op(B)^T: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]; staged a chunk of 8 along the contiguous axis,
-        // 16 bytes where the whole chunk is inside the matrix (and VEC says it is aligned), element by element where not
       constexpr int OUTER = TRB ? BK : TR, INNER = TRB ? TR : BK;
       const long ld = g.ldb;
       _Pragma("clang loop unroll(full)")
@@ -128,7 +129,14 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         else for (int e = 0; e < 8; ++e) dst[e] = (ob < olim && ib + e < ilim) ? (T)lf_ldf(src + e) : (T)0;
       }
     }
-    {   // W = op(A)^T: element (k, i) = TRA ? A[k + i lda] : A[i + k lda]
+    if (wholeW) {
+      constexpr int WO = TRA ? TC_ : BK, WI = TRA ? BK : TC_;
+      _Pragma("clang loop unroll(full)")
+      for (int c = tid; c < WO * (WI / 8); c += 128) {
+        int o = c / (WI / 8), in = (c % (WI / 8)) * 8;
+        lf_stage8<TA, T>(Ws + o * WROW + in, A + (TRA ? (long)(k0 + in) + (long)(i0 + o) * g.lda : (long)(i0 + in) + (long)(k0 + o) * g.lda));
+      }
+    } else {
       constexpr int OUTER = TRA ? TC_ : BK, INNER = TRA ? BK : TC_;
       const long ld = g.lda;
       _Pragma("clang loop unroll(full)")
@@ -141,7 +149,6 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (vec && ob < olim && ib + 8 <= ilim) lf_stage8<TA, T>(dst, src);
         else for (int e = 0; e < 8; ++e) dst[e] = (ob < olim && ib + e < ilim) ? (T)lf_ldf(src + e) : (T)0;
       }
-    }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     _Pragma("clang loop unroll(full)")
@@ -293,11 +300,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     } \
     simdgroup_matrix<TC, 8, 8> om; \
     simdgroup_matrix<half, 8, 8> xm; \
-    const bool gated = (EP & 64) == 0 && (g.epilogue & 64); \
-    const bool loadC = gated || g.beta != 0.f || ((EP & 64) != 0 && (g.epilogue & (8192 | 1048576))); \
+    const bool gated = (EP & 8) == 0 && (EP & 64) == 0 && (g.epilogue & 64); \
+    const bool loadC = ((EP & 8) == 0 && (gated || g.beta != 0.f)) || ((EP & 64) != 0 && (g.epilogue & (8192 | 1048576))); \
     if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) { \
       if (loadC && !(g.biasType & 512)) simdgroup_load(om, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
-    } else { \
+    } else if constexpr ((EP & 8) == 0 || (EP & 64) != 0) { \
       if (loadC) simdgroup_load(om, C + (ulong)(j) * g.ldc + (i), (ulong)g.ldc); \
     } \
     if (gated) simdgroup_load(xm, (device const half*)g.aux + (ulong)(j) * g.ldaux + (i), (ulong)g.ldaux); \

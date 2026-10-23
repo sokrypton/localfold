@@ -141,7 +141,7 @@ struct Device {
     // than hold both (a 522-token trunk pass held 0.9 GB of them beside its own 1.9). LOCALFOLD_BURIED_MB: the bound
     static const size_t bound = (size_t)(getenv("LOCALFOLD_BURIED_MB") ? atof(getenv("LOCALFOLD_BURIED_MB")) : 128) << 20;
     if (buried >= bound) sync();
-    id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = [dev newBufferWithLength:n + 65536 options:MTLResourceStorageModeShared];
     if (!b) die("out of memory: %.2f GB asked for with %.2f GB held", bytes / 1e9, held / 1e9);
     ++stats.allocs;
     uint64_t addr = b.gpuAddress;
@@ -735,7 +735,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   else if (a.n > 64 && a.n <= 128 && a.n % 16 != 0 && a.k <= 64 && batch == 1) { tm = 32; tn = 64; }
   if (a.n > 128 && tm == 64 && (((a.n + 63) & ~63) - a.n) * 12 > a.n && (((a.n + 31) & ~31) - a.n) * 2 < (((a.n + 63) & ~63) - a.n)) tm = 32;
   if (a.n > 64 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 16 && batch == 1) {
-    tm = (a.m <= 64 || (a.n % 16 == 0 && a.n % 32 != 0)) ? 16 : 32; tn = a.m >= 256 ? 128 : (a.m >= 64 ? 64 : 32);
+    tm = (a.m <= 64 || (tm & 16)) ? 16 : 32; tn = a.m >= 256 ? 128 : (a.m >= 64 ? 64 : 32);
   }
   // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
@@ -852,8 +852,8 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   else if (a.n > 128 && tr == 64 && groups(32) < 64) {
     tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
   }
-  else if (a.n > 64 && a.n <= 128 && tr > 32 && ((a.n % 16 != 0 && groups(32) < 64) || groups(16) < 32 || (a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
-    tr = (a.m < 128 || (a.n % 16 == 0 && a.n % 32 != 0)) ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
+  else if (a.n > 64 && a.n <= 128 && tr > 32 && (groups(16) < 32 || (a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
+    tr = (a.m < 128 || (tr & 16)) ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
   }
   else while (tc > 16 && groups(tc) < 64) tc /= 2;
   // ...and 48-column tiles likewise (not SwiGLU's, coupling combine's, or the triangle gate's, whose epilogues pair 8-column blocks)

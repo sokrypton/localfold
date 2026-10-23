@@ -153,7 +153,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   const int j0 = grp.y * TM, i0 = grp.x * TN;
   typedef dextents<int32_t, 2> E2;
   // X: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]
-  tensor<device TB, E2, tensor_inline> tX(B, TRB ? E2(g.n, g.k) : E2(g.k, g.n), array<int32_t, 2>{1, g.ldb});
+  const int nX = (!TRB && g.n <= 128 && (g.k & 15) == 0 && j0 + TM > g.n && (ulong)(j0 + TM - g.n) * (ulong)g.ldb * sizeof(TB) <= 65536u) ? j0 + TM : g.n;
+  tensor<device TB, E2, tensor_inline> tX(B, TRB ? E2(g.n, g.k) : E2(g.k, nX), array<int32_t, 2>{1, g.ldb});
   // W: element (k, i) = TRA ? A[k + i lda] : A[i + k lda]
   tensor<device TA, E2, tensor_inline> tW(A, TRA ? E2(g.k, g.m) : E2(g.m, g.k), array<int32_t, 2>{1, g.lda});
   constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), TRB, TRA, false);

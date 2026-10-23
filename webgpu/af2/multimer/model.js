@@ -339,7 +339,7 @@ export class AlphaFoldUnifiedGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.extraStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK));
+          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK));
         }
         await capturePair("extra-stack", embedding.pairWithoutTemplates);
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
@@ -362,7 +362,7 @@ export class AlphaFoldUnifiedGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.mainStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK));
+          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK));
         }
 
         await validation.settle();

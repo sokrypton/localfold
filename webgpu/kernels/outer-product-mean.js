@@ -541,10 +541,67 @@ export const OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER = `${OPM_TILE_COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<uniform> tile: TileParameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_left_a: array<vec4<f32>, ${MAX_C_OUTER}>;
+var<workgroup> shared_left_b: array<vec4<f32>, ${MAX_C_OUTER}>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
   let elements = tile.count * p.length * p.c_outer * p.c_z;
+  if (p.c_z % 64u == 0u && p.c_outer <= ${MAX_C_OUTER}u) {
+    let total_rows = tile.count * p.length;
+    let row_tiles = (total_rows + 7u) / 8u;
+    let z_chunks = p.c_z / 64u;
+    let active_groups = row_tiles * p.c_outer * z_chunks;
+    let group_id = group.x + group.y * GRID_WIDTH;
+    if (group_id >= active_groups) { return; }
+    let z_chunk = group_id % z_chunks;
+    let ro_tile = group_id / z_chunks;
+    let outer_right = ro_tile % p.c_outer;
+    let row_base = (ro_tile / p.c_outer) * 8u;
+    let z = z_chunk * 64u + local.x;
+    if (local.x < p.c_outer) {
+      let ol = local.x;
+      let l_off = tile.offset * p.length;
+      shared_left_a[ol] = vec4<f32>(
+        select(0.0, left[(l_off + row_base) * p.c_outer + ol], row_base < total_rows),
+        select(0.0, left[(l_off + row_base + 1u) * p.c_outer + ol], row_base + 1u < total_rows),
+        select(0.0, left[(l_off + row_base + 2u) * p.c_outer + ol], row_base + 2u < total_rows),
+        select(0.0, left[(l_off + row_base + 3u) * p.c_outer + ol], row_base + 3u < total_rows),
+      );
+      shared_left_b[ol] = vec4<f32>(
+        select(0.0, left[(l_off + row_base + 4u) * p.c_outer + ol], row_base + 4u < total_rows),
+        select(0.0, left[(l_off + row_base + 5u) * p.c_outer + ol], row_base + 5u < total_rows),
+        select(0.0, left[(l_off + row_base + 6u) * p.c_outer + ol], row_base + 6u < total_rows),
+        select(0.0, left[(l_off + row_base + 7u) * p.c_outer + ol], row_base + 7u < total_rows),
+      );
+    }
+    workgroupBarrier();
+    var acc_a = vec4<f32>(0.0);
+    var acc_b = vec4<f32>(0.0);
+    let w_stride = p.c_outer * p.c_z;
+    var w_idx = p.output_weight + outer_right * p.c_z + z;
+    for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
+      let w = weights[w_idx];
+      acc_a += shared_left_a[outer_left] * w;
+      acc_b += shared_left_b[outer_left] * w;
+      w_idx += w_stride;
+    }
+    let out_stride = p.c_outer * p.c_z;
+    let out_base = (row_base * p.c_outer + outer_right) * p.c_z + z;
+    if (row_base < total_rows) { output[out_base] = acc_a.x; }
+    if (row_base + 1u < total_rows) { output[out_base + out_stride] = acc_a.y; }
+    if (row_base + 2u < total_rows) { output[out_base + 2u * out_stride] = acc_a.z; }
+    if (row_base + 3u < total_rows) { output[out_base + 3u * out_stride] = acc_a.w; }
+    if (row_base + 4u < total_rows) { output[out_base + 4u * out_stride] = acc_b.x; }
+    if (row_base + 5u < total_rows) { output[out_base + 5u * out_stride] = acc_b.y; }
+    if (row_base + 6u < total_rows) { output[out_base + 6u * out_stride] = acc_b.z; }
+    if (row_base + 7u < total_rows) { output[out_base + 7u * out_stride] = acc_b.w; }
+    return;
+  }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= elements) { return; }
   let z = index % p.c_z; let outer_right = (index / p.c_z) % p.c_outer;
   let residue = (index / (p.c_z * p.c_outer)) % p.length;
@@ -564,10 +621,78 @@ export const OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER = `${OPM_TILE_COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<uniform> tile: TileParameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_right_a: array<vec4<f32>, ${8 * MAX_C_OUTER}>;
+var<workgroup> shared_right_b: array<vec4<f32>, ${8 * MAX_C_OUTER}>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let elements = p.length * p.length * p.c_z;
+  if (p.c_z % 64u == 0u && p.c_outer <= ${MAX_C_OUTER}u) {
+    let z_chunks = p.c_z / 64u;
+    let j_tiles = (p.length + 7u) / 8u;
+    let active_groups = p.length * j_tiles * z_chunks;
+    let group_id = group.x + group.y * GRID_WIDTH;
+    if (group_id >= active_groups) { return; }
+    let z_chunk = group_id % z_chunks;
+    let ij_tile = group_id / z_chunks;
+    let i = ij_tile / j_tiles;
+    let j_base = (ij_tile % j_tiles) * 8u;
+    let z = z_chunk * 64u + local.x;
+    var acc_a = vec4<f32>(0.0);
+    var acc_b = vec4<f32>(0.0);
+    let seq_stride = p.length * p.c_outer * p.c_z;
+    for (var s0 = 0u; s0 < tile.count; s0 += 8u) {
+      let s_count = min(8u, tile.count - s0);
+      let chunk_elems = s_count * p.c_outer;
+      workgroupBarrier();
+      for (var k = local.x; k < chunk_elems; k += 64u) {
+        let seq = tile.offset + s0 + k / p.c_outer;
+        let outer = k % p.c_outer;
+        let r_row = seq * p.length;
+        shared_right_a[k] = vec4<f32>(
+          select(0.0, right[(r_row + j_base) * p.c_outer + outer], j_base < p.length),
+          select(0.0, right[(r_row + j_base + 1u) * p.c_outer + outer], j_base + 1u < p.length),
+          select(0.0, right[(r_row + j_base + 2u) * p.c_outer + outer], j_base + 2u < p.length),
+          select(0.0, right[(r_row + j_base + 3u) * p.c_outer + outer], j_base + 3u < p.length),
+        );
+        shared_right_b[k] = vec4<f32>(
+          select(0.0, right[(r_row + j_base + 4u) * p.c_outer + outer], j_base + 4u < p.length),
+          select(0.0, right[(r_row + j_base + 5u) * p.c_outer + outer], j_base + 5u < p.length),
+          select(0.0, right[(r_row + j_base + 6u) * p.c_outer + outer], j_base + 6u < p.length),
+          select(0.0, right[(r_row + j_base + 7u) * p.c_outer + outer], j_base + 7u < p.length),
+        );
+      }
+      workgroupBarrier();
+      var seq_base = ((s0 * p.length + i) * p.c_outer) * p.c_z + z;
+      var r_idx = 0u;
+      for (var s = 0u; s < s_count; s += 1u) {
+        var temp_index = seq_base;
+        for (var outer = 0u; outer < p.c_outer; outer += 1u) {
+          let inter = intermediate[temp_index];
+          acc_a += shared_right_a[r_idx] * inter;
+          acc_b += shared_right_b[r_idx] * inter;
+          temp_index += p.c_z;
+          r_idx += 1u;
+        }
+        seq_base += seq_stride;
+      }
+    }
+    let out_base = (i * p.length + j_base) * p.c_z + z;
+    if (j_base < p.length) { output[out_base] += acc_a.x; }
+    if (j_base + 1u < p.length) { output[out_base + p.c_z] += acc_a.y; }
+    if (j_base + 2u < p.length) { output[out_base + 2u * p.c_z] += acc_a.z; }
+    if (j_base + 3u < p.length) { output[out_base + 3u * p.c_z] += acc_a.w; }
+    if (j_base + 4u < p.length) { output[out_base + 4u * p.c_z] += acc_b.x; }
+    if (j_base + 5u < p.length) { output[out_base + 5u * p.c_z] += acc_b.y; }
+    if (j_base + 6u < p.length) { output[out_base + 6u * p.c_z] += acc_b.z; }
+    if (j_base + 7u < p.length) { output[out_base + 7u * p.c_z] += acc_b.w; }
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.c_z) { return; }
+  if (index >= elements) { return; }
   let z = index % p.c_z; let pair = index / p.c_z;
   let i = pair / p.length; let j = pair % p.length; var value = 0.0;
   for (var sequence = 0u; sequence < tile.count; sequence += 1u) {
@@ -585,10 +710,35 @@ export const OUTER_PRODUCT_MEAN_FINALIZE_SHADER = `${COMMON}
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_denom: array<f32, 1>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let elements = p.length * p.length * p.c_z;
+  if (p.c_z % 64u == 0u) {
+    let group_base = (group.x + group.y * GRID_WIDTH) * 64u;
+    if (group_base >= elements) { return; }
+    let index = group_base + local.x;
+    let z = index % p.c_z;
+    if (local.x == 0u) {
+      let pair = group_base / p.c_z;
+      let i = pair / p.length;
+      let j = pair % p.length;
+      var count = 0.0;
+      for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+        count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
+      }
+      shared_denom[0] = p.normalization_epsilon + count;
+    }
+    workgroupBarrier();
+    output[index] = (output[index] + weights[p.output_bias + z]) / shared_denom[0];
+    return;
+  }
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.c_z) { return; }
+  if (index >= elements) { return; }
   let z = index % p.c_z; let pair = index / p.c_z; let i = pair / p.length; let j = pair % p.length;
   var count = 0.0;
   for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
@@ -1626,14 +1776,18 @@ export class OuterProductMeanGpu {
       contractPipeline, projectOutputPipeline] = await Promise.all([
       this.pipelines.get("opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
       this.pipelines.get("opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
-      this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
-      this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
-      this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-      this.pipelines.get(`opm:contract:${input.cOuter}:${contractPrecision}`,
-        createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
-      this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device, input.cOuter)}`,
-        createOuterProductMeanProjectOutputShader(
-          input.cOuter, false, opmProjectOutputPairs(this.device, input.cOuter))),
+      outerFirst ? undefined : this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
+      outerFirst ? undefined : this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
+      outerFirst ? undefined : this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
+      outerFirst
+        ? this.pipelines.get(`opm:contract:${input.cOuter}:${contractPrecision}`,
+          createOuterProductMeanContractShader(input.cOuter, contractPrecision))
+        : undefined,
+      outerFirst
+        ? this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device, input.cOuter)}`,
+          createOuterProductMeanProjectOutputShader(
+            input.cOuter, false, opmProjectOutputPairs(this.device, input.cOuter)))
+        : undefined,
     ]);
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -1723,16 +1877,22 @@ export class OuterProductMeanGpu {
         }
       } else {
         encoder.clearBuffer(output.buffer);
+        const fastTiled = input.cZ % 64 === 0 && input.cOuter <= MAX_C_OUTER;
+        const accumulateGrid = fastTiled
+          ? linearGrid(input.length * Math.ceil(input.length / 8) * input.cZ)
+          : outputGrid;
         for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
           const count = Math.min(tileCapacity, input.sequences - offset);
           const tileParams = keep(this.allocator.upload(
             `opm.tile-${offset}`, new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM,
           ));
-          const intermediateGrid = linearGrid(count * input.length * input.cOuter * input.cZ);
+          const intermediateGrid = linearGrid(
+            (fastTiled ? Math.ceil((count * input.length) / 8) : count * input.length)
+              * input.cOuter * input.cZ);
           pass(intermediatePipeline, [left.buffer, weights.buffer, params.buffer, tileParams.buffer, intermediate.buffer],
             intermediateGrid[0], intermediateGrid[1]);
           pass(accumulatePipeline, [right.buffer, intermediate.buffer, params.buffer, tileParams.buffer, output.buffer],
-            outputGrid[0], outputGrid[1]);
+            accumulateGrid[0], accumulateGrid[1]);
         }
         pass(finalizePipeline, [mask.buffer, weights.buffer, params.buffer, output.buffer],
           outputGrid[0], outputGrid[1]);
