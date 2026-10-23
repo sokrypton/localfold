@@ -217,10 +217,104 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   ulong row = (ulong)(tg.y * ng.x + tg.x) * sgs + sg;
   if (row >= a.rows) return;
   const int C4 = a.C / 4;
+  const bool aligned = (a.ldx & 3) == 0;
+  const bool outAligned = (a.ldy & 3) == 0;
+  const bool full = C4 == MAXV * 32;
+  if (full && aligned && outAligned && a.yh && !a.y) {
+    constexpr float invC = 1.f / (float)(MAXV * 128);
+    device const float4* sc4 = (device const float4*)a.scale;
+    device const float4* of4 = (device const float4*)a.offset;
+    device half4* yh4 = (device half4*)(a.yh + row * a.ldy);
+    if (a.xh) {
+      device const half4* xh4 = (device const half4*)(a.xh + row * a.ldx);
+      half4 rh[MAXV];
+      float s = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        half4 h = xh4[lane + 32 * k];
+        rh[k] = h;
+        float4 vf = float4(h);
+        s += vf.x + vf.y + vf.z + vf.w;
+      }
+      float mean = simd_sum(s) * invC, v = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        float4 d = float4(rh[k]) - mean;
+        v += dot(d, d);
+      }
+      float inv = rsqrt(simd_sum(v) * invC + a.eps);
+      if (a.yh2) {
+        device const float4* sc2_4 = (device const float4*)a.scale2;
+        device const float4* of2_4 = (device const float4*)a.offset2;
+        device half4* yh2_4 = (device half4*)(a.yh2 + row * a.ldy);
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < MAXV; ++k) {
+          int c = lane + 32 * k;
+          float4 n0 = (float4(rh[k]) - mean) * inv;
+          float4 n = sc4 ? n0 * sc4[c] : n0;
+          if (of4) n += of4[c];
+          yh4[c] = half4(n);
+          float4 n2 = sc2_4 ? n0 * sc2_4[c] : n0;
+          if (of2_4) n2 += of2_4[c];
+          yh2_4[c] = half4(n2);
+        }
+      } else {
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < MAXV; ++k) {
+          int c = lane + 32 * k;
+          float4 n = (float4(rh[k]) - mean) * inv;
+          if (sc4) n *= sc4[c];
+          if (of4) n += of4[c];
+          yh4[c] = half4(n);
+        }
+      }
+      return;
+    }
+    device const float4* x4 = (device const float4*)(a.x + row * a.ldx);
+    float4 r[MAXV];
+    float s = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < MAXV; ++k) {
+      float4 vf = x4[lane + 32 * k];
+      r[k] = vf;
+      s += vf.x + vf.y + vf.z + vf.w;
+    }
+    float mean = simd_sum(s) * invC, v = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < MAXV; ++k) {
+      float4 d = r[k] - mean;
+      v += dot(d, d);
+    }
+    float inv = rsqrt(simd_sum(v) * invC + a.eps);
+    if (a.yh2) {
+      device const float4* sc2_4 = (device const float4*)a.scale2;
+      device const float4* of2_4 = (device const float4*)a.offset2;
+      device half4* yh2_4 = (device half4*)(a.yh2 + row * a.ldy);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        int c = lane + 32 * k;
+        float4 n0 = (r[k] - mean) * inv;
+        float4 n = sc4 ? n0 * sc4[c] : n0;
+        if (of4) n += of4[c];
+        yh4[c] = half4(n);
+        float4 n2 = sc2_4 ? n0 * sc2_4[c] : n0;
+        if (of2_4) n2 += of2_4[c];
+        yh2_4[c] = half4(n2);
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        int c = lane + 32 * k;
+        float4 n = (r[k] - mean) * inv;
+        if (sc4) n *= sc4[c];
+        if (of4) n += of4[c];
+        yh4[c] = half4(n);
+      }
+    }
+    return;
+  }
   float4 r[MAXV];
   float s = 0;
-  const bool aligned = (a.ldx & 3) == 0;
-  const bool full = C4 == MAXV * 32;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < MAXV; ++k) {
     int c = lane + 32 * k;
@@ -236,7 +330,6 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   for (int k = 0; k < MAXV; ++k)
     if (full || lane + 32 * k < (uint)C4) { float4 d = r[k] - mean; v += dot(d, d); }
   float inv = rsqrt(simd_sum(v) / a.C + a.eps);
-  const bool outAligned = (a.ldy & 3) == 0;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < MAXV; ++k) {
     int c = lane + 32 * k;

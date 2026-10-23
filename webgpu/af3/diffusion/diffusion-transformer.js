@@ -670,15 +670,54 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let inverse_std = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
   ${overHeadVectors((h) => `var total${h} = vec4<f32>(0.0);`)}
+  var column = (INNER * HEADS) / 4u;
   for (var c = 0u; c < C_PAIR; c += 1u) {
     // ...read once, used by every head.
     let x = (pair_cond[base + c] - mean) * inverse_std * scale[c];
-    let column = (c * PER_SUPER * HEADS + INNER * HEADS) / 4u;
     ${overHeadVectors((h) => `total${h} += x * projection[column + ${h}u];`)}
+    column += (PER_SUPER * HEADS) / 4u;
   }
   ${overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>
     `logits[(${h * 4 + l}u) * PAIRS + row] = total${h}.${"xyzw"[l]};`).join("\n    "))}
 }`;
+
+  const pairLogitsSuperFor = (perSuper) => {
+    const overInner = (body) =>
+      Array.from({ length: perSuper }, (_, i) => body(i)).join("\n    ");
+    return `${common}
+const PER_SUPER: u32 = ${perSuper}u;
+@group(0) @binding(0) var<storage, read> pair_cond: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
+${Array.from({ length: perSuper }, (_, i) =>
+  `@group(0) @binding(${3 + i}) var<storage, read_write> logits_${i}: array<f32>;`).join("\n")}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= PAIRS) { return; }
+  let base = row * C_PAIR;
+  var sum = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) { sum += pair_cond[base + c]; }
+  let mean = sum / f32(C_PAIR);
+  var variance = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let d = pair_cond[base + c] - mean;
+    variance += d * d;
+  }
+  let inverse_std = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
+  ${overInner((i) => overHeadVectors((h) => `var total_${i}_${h} = vec4<f32>(0.0);`))}
+  var column = 0u;
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let x = (pair_cond[base + c] - mean) * inverse_std * scale[c];
+    ${overInner((i) => overHeadVectors((h) =>
+      `total_${i}_${h} += x * projection[column + ${i * headVectors + h}u];`))}
+    column += (PER_SUPER * HEADS) / 4u;
+  }
+  ${overInner((i) => overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>
+    `logits_${i}[(${h * 4 + l}u) * PAIRS + row] = total_${i}_${h}.${"xyzw"[l]};`).join("\n    ")))}
+}`;
+  };
 
   // 🔴 THE WEIGHTS WERE THE BANDWIDTH, NOT THE ARITHMETIC. One workgroup per
   // token meant every workgroup read the block's whole weight set: 5.9M floats
@@ -779,7 +818,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (token >= TOKENS) { return; }
   let local = local_id.x;
   let base = token * C_COND;
-  var total = 0.0;
+${condChannels === lanes ? `  let v0 = cond[base + local];
+  let mean = reduce_cond(local, v0) / f32(C_COND);
+  workgroupBarrier();
+  let d0 = v0 - mean;
+  let inverse = inverseSqrt(reduce_cond(local, d0 * d0) / f32(C_COND) + EPSILON);
+  normalised[base + local] = d0 * inverse;` : condChannels > lanes && condChannels < lanes * 2 ? `  let c1 = local + ${lanes}u;
+  let v0 = cond[base + local];
+  var v1 = 0.0;
+  var total = v0;
+  if (c1 < C_COND) {
+    v1 = cond[base + c1];
+    total += v1;
+  }
+  let mean = reduce_cond(local, total) / f32(C_COND);
+  workgroupBarrier();
+  let d0 = v0 - mean;
+  var centred = d0 * d0;
+  var d1 = 0.0;
+  if (c1 < C_COND) {
+    d1 = v1 - mean;
+    centred += d1 * d1;
+  }
+  let inverse = inverseSqrt(reduce_cond(local, centred) / f32(C_COND) + EPSILON);
+  normalised[base + local] = d0 * inverse;
+  if (c1 < C_COND) {
+    normalised[base + c1] = d1 * inverse;
+  }` : `  var total = 0.0;
   for (var c = local; c < C_COND; c += ${lanes}u) { total += cond[base + c]; }
   let mean = reduce_cond(local, total) / f32(C_COND);
   workgroupBarrier();
@@ -789,10 +854,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     centred += d * d;
   }
   let inverse = inverseSqrt(reduce_cond(local, centred) / f32(C_COND) + EPSILON);
-  workgroupBarrier();
   for (var c = local; c < C_COND; c += ${lanes}u) {
     normalised[base + c] = (cond[base + c] - mean) * inverse;
-  }
+  }`}
 }`;
 
   const fuseFfwAdaln = shape.noResidual === true && batchedGates;
@@ -822,6 +886,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base_token = group.x * TILE;
   if (base_token >= ${ROWS}) { return; }
   let local = local_id.x;
+
+${mode === "reduce" || batchedGates ? "" : `  // 🔴 THE NORMALISED CONDITIONING IS READ, NOT DERIVED. normalise-cond
+  // above produced it once for the whole call; all that is left here is the
+  // per-block scale and the staging, which is a copy.
+  // 🔴 A SPLIT PART STAGES ONLY ITS SLICE. Staging the whole conditioning in
+  // every part is what made the first two attempts at this split lose: the
+  // loop below is OUTSIDE the projection that gets sliced, so four parts did
+  // four times the staging to do a quarter of the projection each. It is the
+  // same trap attention-output's split hit, written down there and not
+  // applied here.
+  for (var c = local; c < ${mode === "split" ? `${normKSpan}u` : "C_COND"}; c += ${lanes}u) {
+    let at = ${mode === "split" ? `group.z * ${normKSpan}u + c` : "c"};
+    let w_ln = ${wf(`weights[W_${prefix}SingleCondLayerNormScale + at]`)};
+    ${overGroups((g) => `{
+      var cn = ${stageLanes}(0.0);
+      ${Array.from({ length: tileWidth }, (_, l) => {
+        const t = g * tileWidth + l;
+        return `{
+        let token = min(base_token + ${t}u, ${ROWS} - 1u);
+        let value = cond[${perToken("token")} * C_COND + at] * w_ln;
+        cn${lane(l)} = ${stage16 ? "f16(value)" : "value"};
+      }`;
+      }).join("\n      ")}
+      cond_norm[${g * (mode === "split" ? normKSpan : condChannels)}u + c] = cn;
+    }`)}
+  }
+${mode === "split" ? "  workgroupBarrier();" : "  // Synchronised by reduce_sum's barriers below."}`}
 
 ${useVecNorm ? (() => {
       const steps = channels / lanes;
@@ -873,33 +964,6 @@ ${useVecNorm ? (() => {
     }
     workgroupBarrier();
   }`}
-
-${mode === "reduce" || batchedGates ? "" : `  // 🔴 THE NORMALISED CONDITIONING IS READ, NOT DERIVED. normalise-cond
-  // above produced it once for the whole call; all that is left here is the
-  // per-block scale and the staging, which is a copy.
-  // 🔴 A SPLIT PART STAGES ONLY ITS SLICE. Staging the whole conditioning in
-  // every part is what made the first two attempts at this split lose: the
-  // loop below is OUTSIDE the projection that gets sliced, so four parts did
-  // four times the staging to do a quarter of the projection each. It is the
-  // same trap attention-output's split hit, written down there and not
-  // applied here.
-  for (var c = local; c < ${mode === "split" ? `${normKSpan}u` : "C_COND"}; c += ${lanes}u) {
-    let at = ${mode === "split" ? `group.z * ${normKSpan}u + c` : "c"};
-    let w_ln = ${wf(`weights[W_${prefix}SingleCondLayerNormScale + at]`)};
-    ${overGroups((g) => `{
-      var cn = ${stageLanes}(0.0);
-      ${Array.from({ length: tileWidth }, (_, l) => {
-        const t = g * tileWidth + l;
-        return `{
-        let token = min(base_token + ${t}u, ${ROWS} - 1u);
-        let value = cond[${perToken("token")} * C_COND + at] * w_ln;
-        cn${lane(l)} = ${stage16 ? "f16(value)" : "value"};
-      }`;
-      }).join("\n      ")}
-      cond_norm[${g * (mode === "split" ? normKSpan : condChannels)}u + c] = cn;
-    }`)}
-  }
-  workgroupBarrier();`}
 
   // 🔴 ONE WORKGROUP PER TOKEN IS 68 OF THEM, AND THIS DEVICE HAS 108 CORES.
   // The projection below is the whole cost of this kernel - its four
@@ -2119,7 +2183,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   gate[index] = sg;
 }`;
 
-  return { normaliseCond, pairLogitsFor, adaln, qkvg, qkvgReduce, attend, attentionOutput,
+  return { normaliseCond, pairLogitsFor, pairLogitsSuperFor, adaln, qkvg, qkvgReduce, attend, attentionOutput,
            adalnReduce, ffwAdalnReduce, normKSplits,
            normPartialFloats: normKSplits > 1 ? normKSplits * 2 * rows * channels : 0,
            attentionOutputReduce, attnKSplits,
@@ -2825,7 +2889,7 @@ export class Af3DiffusionTransformerGpu {
     for (const [name, source] of Object.entries(sources)) {
       // ...the factory also returns the split counts the dispatch needs, which
       // are numbers rather than shaders.
-      if (name === "pairLogitsFor" || typeof source !== "string") continue;
+      if (name === "pairLogitsFor" || name === "pairLogitsSuperFor" || typeof source !== "string") continue;
       pending.push(this.pipelines.get(`${base}:${name}`, source)
         .then((pipeline) => { compiled[name] = pipeline; }));
     }
@@ -2834,6 +2898,11 @@ export class Af3DiffusionTransformerGpu {
       pending.push(this.pipelines.get(
         `${base}:pair-logits:${at}`, sources.pairLogitsFor(at, perSuper))
         .then((pipeline) => { compiled.pairLogits[at] = pipeline; }));
+    }
+    if (perSuper >= 2 && 3 + perSuper <= (this.device.limits?.maxStorageBuffersPerShaderStage ?? 8)) {
+      pending.push(this.pipelines.get(
+        `${base}:pair-logits:super`, sources.pairLogitsSuperFor(perSuper))
+        .then((pipeline) => { compiled.pairLogitsSuper = pipeline; }));
     }
     if (flashAttend) {
       // ...with the device's softmax shape, the knobs AF2's attention takes (attentionGroup and
@@ -3297,7 +3366,19 @@ export class Af3DiffusionTransformerGpu {
             runBlock("copy-act", compiled.copyAct, [actBuffer, preBuffer],
                 Math.min(copyGroups, GRID_WIDTH), Math.ceil(copyGroups / GRID_WIDTH));
           }
-          if (buildPairLogits || at >= cached) {
+          const superPairLogits = buildPairLogits
+            && firstInGroup + group.blocks.length <= cached
+            && group.blocks.length === perSuper
+            && compiled.pairLogitsSuper !== undefined;
+          if (superPairLogits) {
+            if (inner === 0) {
+              const pairGroups = Math.ceil(pairs / 64);
+              runBlock("pair-logits", compiled.pairLogitsSuper,
+                  [pairBuffer, pairScale, projection,
+                   ...Array.from({ length: perSuper }, (_, i) => logitsFor(firstInGroup + i))],
+                  Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
+            }
+          } else if (buildPairLogits || at >= cached) {
             const pairGroups = Math.ceil(pairs / 64);
             runBlock("pair-logits", compiled.pairLogits[inner],
                 [pairBuffer, pairScale, projection, logits],

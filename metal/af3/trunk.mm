@@ -430,9 +430,11 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
     outerProductMean(t, B + ".outerProductMean", B + ".msaAttention1.pairNorm",
                      B + ".triangleMultiplicationOutgoing.leftNormInput", B + ".msaAttention1.actNorm", k == 0);
   msaAttention(t, B + ".msaAttention1", "", !updateFirst ? B + ".triangleMultiplicationOutgoing.leftNormInput" : "",
-               B + ".msaTransition.inputLayerNorm", !updateFirst);
+               B + ".msaTransition.inputLayerNorm", !updateFirst || k > 0);
   transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition", nullptr, "", "", "msatr.");
-  if (updateFirst) outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput", "", "", k == 0);
+  if (updateFirst)
+    outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput", "",
+                     (k + 1 < msaBlocks) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.actNorm" : "", k == 0);
   pairUpdates(t.pair, t.masks, t.n, t.C, B,
               (k + 1 < msaBlocks && updateFirst) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.pairNorm" : "");
 }

@@ -109,7 +109,7 @@ static void triangleT(T* pair, const Masks& m, int n, int C, const std::string& 
                            halfProductScale() ? nullptr : scratch<half>("pr.h1", P * C),
                            outgoing ? "triangle out contraction" : "triangle in contraction");
   half* cn = mid.cn; half* outH = mid.outH;
-  half* lnOut = !nextNorm.empty() && !into && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
+  half* lnOut = !nextNorm.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
   if (gemmGatedAddDual(xn, xs ? gl.w : Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C,
                        xs ? gl.b : nullptr, nullptr, outH,
                        "triangle output and gated add", lnOut, lnOut ? W(nextNorm + "Scale") : nullptr,
@@ -196,7 +196,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
       release(sum);
     });
     addLinW(o, w, into ? into : pair, P, Wd, C, Wopt(pre + ".outputProjectionBias"), "grid output");
-  } else if (!nextNorm.empty() && !into && hasW(nextNorm + "Scale") && lenW(pre + ".outputProjection") == (size_t)Wd * C) {
+  } else if (!nextNorm.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(nextNorm + "Scale") && lenW(pre + ".outputProjection") == (size_t)Wd * C) {
     half* lnOut = lnTarget(P, C, xn);
     Gemm g{}; g.X = o; g.tx = F16; g.W = Wh(pre + ".outputProjection"); g.tw = F16; g.Y = pair; g.ty = dtOf<T>(); g.rows = P; g.in = Wd; g.out = C;
     g.beta = 1.f; g.bias = Wopt(pre + ".outputProjectionBias"); g.label = "grid output, next norm";

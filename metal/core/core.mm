@@ -964,7 +964,7 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
   // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
   // 404 ms a trunk pass)
-  if (dual && tensorWanted() && (out == 64 || out % 128 == 0) && in % 8 == 0 && (in <= 128 || (out == 256 && in <= 256)) &&
+  if (dual && tensorWanted() && (out == 64 || out % 128 == 0) && in % 8 == 0 && in <= 512 &&
       a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
     const int tm = out == 256 ? 16 : 64, tn = out == 256 ? 256 : out == 64 ? 64 : 128;
     GemmArgs a{};
@@ -975,8 +975,8 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
     const bool ln = lnOut && lnWanted && out == tn && a16(lnOut) && a16(lnScale) && a16(lnOffset);
     if (ln) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
     ++D().stats.gemms;
-    std::string tile = std::to_string(tm) + "x" + std::to_string(tn);
-    std::string targs = std::to_string(tm) + ", " + std::to_string(tn) + (tp == F16 ? ", half" : "");
+    std::string tile = std::to_string(tm) + "x" + std::to_string(tn) + (ln ? "" : "_nln");
+    std::string targs = std::to_string(tm) + ", " + std::to_string(tn) + (tp == F16 ? ", half" : ", float") + (ln ? ", true" : ", false");
     std::string name = std::string(tp == F16 ? "gemmt_dualh_" : "gemmt_dual_") + tile;
     std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor_dual<" + targs + ">(constant GemmArgs&, uint3, uint);";
     dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)(out / tn), (uint32_t)((rows + tm - 1) / tm), 1}, 128, 0,

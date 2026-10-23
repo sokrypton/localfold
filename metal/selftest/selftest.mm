@@ -229,6 +229,29 @@ int main() {
       report(l1, relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
     } else { ++failures; printf("  emitted LayerNorm, the triangle's tail (C %d): FAIL (not taken)\n", O); }
   }
+  for (int O : {384, 512}) {   // ...and the triangle's fused tail without emitted LayerNorm at C = 384 (OpenDDE) and C = 512 (IntelliFold-2)
+    size_t R = 160; int K = O;
+    auto Xg = randv(R * K), Wg = randv((size_t)K * O, 0.1f), Xv = randv(R * K), Wv = randv((size_t)K * O, 0.1f), Y0 = randv(R * O);
+    std::vector<double> y(R * O);
+    for (size_t r = 0; r < R; ++r) {
+      for (int o = 0; o < O; ++o) {
+        double a = 0, b = 0;
+        for (int k = 0; k < K; ++k) {
+          a += (double)(float)(half)Xg[r * K + k] * (float)(half)Wg[(size_t)k * O + o];
+          b += (double)(float)(half)Xv[r * K + k] * (float)(half)Wv[(size_t)k * O + o];
+        }
+        y[r * O + o] = Y0[r * O + o] + (double)(float)(half)b / (1 + exp(-a));
+      }
+    }
+    half* dXg = uploadNew(toH(Xg).data(), Xg.size()); half* dWg = uploadNew(toH(Wg).data(), Wg.size());
+    half* dXv = uploadNew(toH(Xv).data(), Xv.size()); half* dWv = uploadNew(toH(Wv).data(), Wv.size());
+    float* dY = uploadNew(Y0.data(), Y0.size()); half* tmp = allocT<half>(R * O);
+    gemmGatedAddDual(dXg, dWg, dXv, dWv, dY, R, K, O, nullptr, nullptr, tmp);
+    char l0[64];
+    snprintf(l0, sizeof l0, "the triangle's fused tail (C %d): the pair", O);
+    report(l0, relRms(y, download(dY, R * O)), 2e-3);
+    release(dXg); release(dWg); release(dXv); release(dWv); release(dY); release(tmp);
+  }
   {   // the same two over a half pair (AF3's pairformer stack): the residual summed in float, rounded once on its store,
       // the norm taken from the stored half values
     size_t R = 300; int K = 128, O = 128;

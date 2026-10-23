@@ -211,23 +211,39 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   // hold the same 4 columns on rows ix[1] and ix[1] + 8, while lane ^ 8 holds column ^ 8 (b for a) on the same rows.
   // One butterfly shuffle pairs all 32 lanes: even-block lanes compute row ix[1], odd-block lanes compute row ix[1] + 8
   if constexpr ((EP & 32) != 0) {
+    const bool odd = (c.get_multidimensional_index((uint16_t)0)[0] & 8) != 0;
+    if (j0 + TM <= g.n && i0 + TN <= g.m && !(g.epilogue & 4) && g.alpha == 1.f) {
+      _Pragma("clang loop unroll(full)")
+      for (uint16_t e = 0; e < c.get_capacity(); e += 8) {
+        if (!c.is_valid_element(e)) continue;
+        const auto ix = c.get_multidimensional_index(odd ? (uint16_t)(e + 4) : e);
+        const float4 v0((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+        const float4 v1((float)c[e + 4], (float)c[e + 5], (float)c[e + 6], (float)c[e + 7]);
+        const float4 partner = simd_shuffle_xor(odd ? v0 : v1, 8);
+        const float4 va = odd ? partner : v0;
+        const float4 vb = odd ? v1 : partner;
+        const int i = i0 + (ix[0] & ~8);
+        const int outCol = (i >> 4) * 8 + (i & 7);
+        const float4 res = fast::divide(va, 1.f + fast::exp(-va)) * vb;
+        *(device vec<TC, 4>*)(D + (ulong)(j0 + ix[1]) * g.ldd + outCol) = lf_out4<TC>(res);
+      }
+      return;
+    }
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < c.get_capacity(); e += 8) {
       if (!c.is_valid_element(e)) continue;
-      const auto ix0 = c.get_multidimensional_index(e);
-      const auto ix1 = c.get_multidimensional_index(e + 4);
+      const auto ix = c.get_multidimensional_index(odd ? (uint16_t)(e + 4) : e);
       float4 v0 = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
       float4 v1 = g.alpha * float4((float)c[e + 4], (float)c[e + 5], (float)c[e + 6], (float)c[e + 7]);
-      if ((g.epilogue & 4) && i0 + ix0[0] < g.m) {
-        const float4 bv = *(device const float4*)((device const float*)g.bias + i0 + ix0[0]);
+      if ((g.epilogue & 4) && i0 + ix[0] < g.m) {
+        const float4 bv = *(device const float4*)((device const float*)g.bias + i0 + ix[0]);
         v0 += bv; v1 += bv;
       }
-      const bool odd = (ix0[0] & 8) != 0;
       const float4 partner = simd_shuffle_xor(odd ? v0 : v1, 8);
       const float4 va = odd ? partner : v0;
       const float4 vb = odd ? v1 : partner;
-      const int j = j0 + (odd ? ix1[1] : ix0[1]);
-      const int i = i0 + (ix0[0] & ~8);
+      const int j = j0 + ix[1];
+      const int i = i0 + (ix[0] & ~8);
       if (j < g.n && i + 8 < g.m) {
         const int outCol = (i >> 4) * 8 + (i & 7);
         const float4 res = fast::divide(va, 1.f + fast::exp(-va)) * vb;
@@ -673,8 +689,41 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const uint W = (uint)g.tgC, N = (uint)g.tgN, BS = (uint)g.m / W;
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
         if constexpr (TM == 64 && TN == 128) {
-          const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
+          const int laneCol = c.get_multidimensional_index((uint16_t)0)[0];
+          const int col0 = i0 + laneCol;
           const int jLim = min(g.n, (int)g.tgPairs);
+          if ((W & 127u) == 0 && (g.tgNp & 127) == 0 && i0 + 128 <= g.m) {
+            const uint bs_tile = lf_udiv((uint)i0, W);
+            const uint tile_off = (uint)i0 - bs_tile * W;
+            const uint col0_off = tile_off + (uint)laneCol;
+            const bool doSig = (int)tile_off < g.tgNp;
+            const bool hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
+            float4 bv[4];
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < 4; ++k) {
+              const int i = col0 + k * 32;
+              bv[k] = !hasBias ? float4(0.f)
+                               : halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + i))
+                                          : *(device const float4*)((device const float*)g.bias + boff + i);
+            }
+            const ushort4 rbs(0, 4, 32, 36);
+            _Pragma("clang loop unroll(full)")
+            for (int r_idx = 0; r_idx < 4; ++r_idx) {
+              const uint16_t er = rbs[r_idx];
+              const int j = j0 + c.get_multidimensional_index(er)[1];
+              if (j >= jLim) continue;
+              const uint kr = (uint)j < N ? 0u : lf_udiv((uint)j, N), rr = (uint)j - kr * N;
+              device float* dp0 = D + (((ulong)kr * BS + bs_tile) * N + rr) * W + col0_off;
+              _Pragma("clang loop unroll(full)")
+              for (int k = 0; k < 4; ++k) {
+                const uint16_t e = er + k * 8;
+                float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]) + bv[k];
+                if (doSig) v = fast::divide(1.f, 1.f + fast::exp(-v));
+                *(device float4*)(dp0 + k * 32) = v;
+              }
+            }
+            return;
+          }
           uint bs_col[4], col_off[4];
           float4 bv[4];
           _Pragma("clang loop unroll(full)")
@@ -1050,12 +1099,12 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
   auto mXg = tXg.slice(0, j0); auto mWg = tWg.slice(i0, 0);
   auto mXv = tXv.slice(0, j0); auto mWv = tWv.slice(i0, 0);
   auto cg = op.template get_destination_cooperative_tensor<decltype(mXg), decltype(mWg), half>();
-  auto cv = op.template get_destination_cooperative_tensor<decltype(mXv), decltype(mWv), half>();
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); ++e) if (cg.is_valid_element(e)) cg[e] = 0.h;
+  op.run(mXg, mWg, cg);
+  auto cv = op.template get_destination_cooperative_tensor<decltype(mXv), decltype(mWv), half>();
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cv.get_capacity(); ++e) if (cv.is_valid_element(e)) cv[e] = 0.h;
-  op.run(mXg, mWg, cg);
   op.run(mXv, mWv, cv);
   device TP* D = (device TP*)g.D;
   device const float* bg = (g.epilogue & 4) ? (device const float*)g.bias : nullptr;
@@ -1067,6 +1116,30 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     const int col = i0 + cg.get_multidimensional_index((uint16_t)(k * 8))[0];
     bg4[k] = (bg && col < g.m) ? *(device const float4*)(bg + col) : float4(0.f);
     bv4[k] = (bv && col < g.m) ? *(device const float4*)(bv + col) : float4(0.f);
+  }
+  if constexpr (!LN && TM == 64 && TN == 128) {
+    constexpr int NR = 4;
+    const int col0 = i0 + cg.get_multidimensional_index((uint16_t)0)[0];
+    _Pragma("clang loop unroll(full)")
+    for (int r_idx = 0; r_idx < NR; ++r_idx) {
+      const uint16_t er = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+      const int j = j0 + cg.get_multidimensional_index(er)[1];
+      if (j >= g.n) continue;
+      device TP* dp0 = D + (ulong)j * g.ldd;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 4; ++k) {
+        const uint16_t e = er + k * 8;
+        const int i = col0 + k * 32;
+        float4 v1 = float4((float)cg[e], (float)cg[e + 1], (float)cg[e + 2], (float)cg[e + 3]);
+        if (bg) v1 += bg4[k];
+        float4 v2 = float4((float)cv[e], (float)cv[e + 1], (float)cv[e + 2], (float)cv[e + 3]);
+        if (bv) v2 = float4(half4(v2 + bv4[k]));
+        device vec<TP, 4>* dp = (device vec<TP, 4>*)(dp0 + i);
+        const float4 r = float4(*dp) + v2 * fast::divide(1.f, 1.f + fast::exp(-v1));
+        *dp = lf_out4<TP>(r);
+      }
+    }
+    return;
   }
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
