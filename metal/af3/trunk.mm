@@ -249,7 +249,7 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   const uint after = flag("trunk.dialect.opmBiasAfterNorm") ? 1u : 0u;
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
-  half* lnOut = (C == 128 && !nextNorm.empty() && lnEmit && (matrixUnits() || lnSimd)) ? scratch<half>("pr.x", pairs * C) : nullptr;
+  half* lnOut = ((C == 128 || C == 256) && !nextNorm.empty() && lnEmit && (matrixUnits() || (C == 128 && lnSimd))) ? scratch<half>("pr.x", pairs * C) : nullptr;
   const float* lnScale = lnOut ? W(nextNorm + "Scale") : nullptr;
   const float* lnOffset = lnOut ? Wopt(nextNorm + "Offset") : nullptr;
   half* lnOut2 = (lnOut && !nextNorm2.empty()) ? scratch<half>("pr.x2", pairs * C) : nullptr;
@@ -271,9 +271,10 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
       int bi = std::min(Bi, L - i0);
       half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * C : nullptr;
       half* lnChunk2 = lnOut2 ? lnOut2 + (size_t)i0 * L * C : nullptr;
-      if (C == 128 && gemmOpmOut(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
-                                 norm + (size_t)i0 * L, bi, K, L * C, 1.f, lnChunk, lnScale, lnOffset, 1e-5f,
-                                 lnChunk2, lnScale2, lnOffset2, after != 0))
+      if (C % 128 == 0 && C <= 512 &&
+          gemmOpmOut(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
+                     norm + (size_t)i0 * L, bi, K, L * C, 1.f, lnChunk, lnScale, lnOffset, 1e-5f,
+                     lnChunk2, lnScale2, lnOffset2, after != 0, C))
         continue;
       allEmitted = false;
       if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
@@ -311,9 +312,10 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
     }
     half* lnChunk = lnOut ? lnOut + (size_t)i0 * L * C : nullptr;
     half* lnChunk2 = lnOut2 ? lnOut2 + (size_t)i0 * L * C : nullptr;
-    if (C == 128 && gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
-                               norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f, lnChunk, lnScale, lnOffset, 1e-5f,
-                               lnChunk2, lnScale2, lnOffset2, after != 0)) {
+    if (C % 128 == 0 && C <= 512 &&
+        gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
+                   norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f, lnChunk, lnScale, lnOffset, 1e-5f,
+                   lnChunk2, lnScale2, lnOffset2, after != 0, C)) {
       continue;
     }
     allEmitted = false;

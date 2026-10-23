@@ -329,9 +329,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           if (g.epilogue & 1048576) v = cv * v; \
         } \
         if (g.epilogue & 8192) { \
-          const float b128 = ((device const float*)g.bias)[col & 127]; \
-          const float nv = ((device const float*)g.aux)[(uint)((j) + sm) * ((uint)g.m >> 7) + ((uint)(i) >> 7)]; \
-          v = cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv)); \
+          const uint opmC = (uint)g.tgN, u = (uint)col; \
+          const uint jTok = opmC == 128 ? (u >> 7) : opmC == 256 ? (u >> 8) : lf_udiv(u, opmC); \
+          const float bCol = ((device const float*)g.bias)[u - jTok * opmC]; \
+          const float nv = ((device const float*)g.aux)[(uint)((j) + sm) * (uint)g.tgNp + jTok]; \
+          v = cv + (g.tgC ? v / max(nv, 1.f) + bCol : (bCol + v) / (1e-3f + nv)); \
         } \
       } else if (gated) { \
         if (g.epilogue & 4) v += bv2[t]; \
@@ -434,6 +436,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           if (j >= jLim) continue;
           const uint jr = (uint)(j + sm);
           const uint r = jr < (uint)g.tgN ? jr : jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
+          const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
           device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
           if (j + 8 <= jLim) {
             _Pragma("clang loop unroll(full)")
@@ -446,13 +449,22 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               thread auto& c = cm.thread_elements();
               const float2 gp = *(device const float2*)(gp0 + i + sn);
               const float2 gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
-              o[0] = c[0] + g.alpha * (float)e[0] * gm.x;
-              o[1] = c[1] + g.alpha * (float)e[1] * gm.y;
+              float r0 = c[0] + g.alpha * (float)e[0] * gm.x;
+              float r1 = c[1] + g.alpha * (float)e[1] * gm.y;
+              if (g.aux2) { r0 *= rm; r1 *= rm; }
+              o[0] = r0; o[1] = r1;
               simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+              if (g.aux3) {
+                simdgroup_matrix<half, 8, 8> hm;
+                thread auto& h = hm.thread_elements();
+                h[0] = (half)r0; h[1] = (half)r1;
+                simdgroup_store(hm, (device half*)g.aux3 + (ulong)j * g.ldd + i, (ulong)g.ldd);
+              }
             }
           } else if ((int)jr < jLim) {
             device const float* cp0 = C + (ulong)jr * g.ldc;
             device float* dp0 = D + (ulong)jr * g.ldd;
+            device half* hp0 = g.aux3 ? (device half*)g.aux3 + (ulong)jr * g.ldd : nullptr;
             _Pragma("clang loop unroll(full)")
             for (int b = 0; b < FC; ++b) {
               const int i = i0 + sc + b * 8 + sn;
@@ -460,7 +472,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               const float2 gp = *(device const float2*)(gp0 + i);
               const float2 gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
               const float2 cv = *(device const float2*)(cp0 + i);
-              *(device float2*)(dp0 + i) = cv + g.alpha * float2((float)e[0], (float)e[1]) * gm;
+              float2 res = cv + g.alpha * float2((float)e[0], (float)e[1]) * gm;
+              if (g.aux2) res *= rm;
+              *(device float2*)(dp0 + i) = res;
+              if (hp0) *(device half2*)(hp0 + i) = half2(res);
             }
           }
         }
@@ -585,13 +600,22 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             thread auto& o = om.thread_elements();
             thread auto& c = cm.thread_elements();
             const uint jr = (uint)(j + sm), r = jr < (uint)g.tgN ? jr : jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
+            const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
             _Pragma("clang loop unroll(full)")
             for (int t = 0; t < 2; ++t) {
               const float gp = ((device const float*)g.aux)[(ulong)r * g.ldaux + (i + sn + t)];
               const float gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
-              o[t] = c[t] + g.alpha * (float)e[t] * gm;
+              float res = c[t] + g.alpha * (float)e[t] * gm;
+              if (g.aux2) res *= rm;
+              o[t] = res;
             }
             simdgroup_store(om, D + (ulong)j * g.ldd + i, (ulong)g.ldd);
+            if (g.aux3) {
+              simdgroup_matrix<half, 8, 8> hm;
+              thread auto& h = hm.thread_elements();
+              h[0] = (half)o[0]; h[1] = (half)o[1];
+              simdgroup_store(hm, (device half*)g.aux3 + (ulong)j * g.ldd + i, (ulong)g.ldd);
+            }
             continue;
           }
           if ((g.epilogue & 262144) && j + 8 <= g.n && i + 8 <= g.m) {
@@ -654,7 +678,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               const uint r = (uint)jr < (uint)g.tgN ? (uint)jr : (uint)jr - lf_udiv((uint)jr, (uint)g.tgN) * (uint)g.tgN;
               const float gp = ((device const float*)g.aux)[(ulong)r * g.ldaux + ic];
               const float gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
-              lf_st(D, (ulong)ic + (ulong)jr * g.ldd, lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc) + v * gm);
+              float res = lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc) + v * gm;
+              if (g.aux2) res *= ((device const float*)g.aux2)[r];
+              lf_st(D, (ulong)ic + (ulong)jr * g.ldd, res);
+              if (g.aux3) ((device half*)g.aux3)[(ulong)ic + (ulong)jr * g.ldd] = (half)res;
               continue;
             }
             if (g.epilogue & 524288) {
@@ -685,9 +712,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             if constexpr ((EP & 8) == 0 && !metal::is_same_v<TC, float>) {
               if (g.biasType & 512) cv = ((device const float*)g.C)[(ulong)ic + (ulong)jr * g.ldc];
             }
-            const float b128 = ((device const float*)g.bias)[ic & 127];
-            const float nv = ((device const float*)g.aux)[(uint)jr * ((uint)g.m >> 7) + ((uint)ic >> 7)];
-            v = cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv));
+            const uint opmC = (uint)g.tgN, u = (uint)ic;
+            const uint jTok = opmC == 128 ? (u >> 7) : opmC == 256 ? (u >> 8) : lf_udiv(u, opmC);
+            const float bCol = ((device const float*)g.bias)[u - jTok * opmC];
+            const float nv = ((device const float*)g.aux)[(uint)jr * (uint)g.tgNp + jTok];
+            v = cv + (g.tgC ? v / max(nv, 1.f) + bCol : (bCol + v) / (1e-3f + nv));
             lf_st(D, (ulong)ic + (ulong)jr * g.ldd, v);
             if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
             continue;

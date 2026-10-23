@@ -98,8 +98,7 @@ static void atomBlocks(const std::string& E) {
   for (int b = 0; M.has(E + ".blocks." + num(b) + ".qProjection"); ++b) {
     std::string B = E + ".blocks." + num(b);
     int Wd = (int)(lenW(B + ".qProjection") / C);
-    concatColumns(B + ".qg", C, {{B + ".qProjection", Wd, false}, {B + ".gatingQuery", Wd, false}});
-    concatColumns(B + ".kv", C, {{B + ".kProjection", Wd, false}, {B + ".vProjection", Wd, false}});
+    qgkvWeight(B, C, Wd);
     swigluPairs(B + ".ffwTransition1", C, 2 * C);
     retire({B + ".qProjection", B + ".gatingQuery", B + ".kProjection", B + ".vProjection", B + ".ffwTransition1"});
   }

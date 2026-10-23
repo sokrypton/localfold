@@ -155,7 +155,7 @@ bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, si
                       bool preSigmoid = false, half* lnOut = nullptr, const float* lnScale = nullptr,
                       const float* lnOffset = nullptr, float lnEps = 1e-5f, half* lnOut2 = nullptr,
                       const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr, bool chained = false,
-                      bool* lnEmitted = nullptr);
+                      bool* lnEmitted = nullptr, const float* rowMask = nullptr, half* out3 = nullptr);
 bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
                       const float* bias, int period, int width, int sigCols, const char* label = nullptr);
 bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label = nullptr);
@@ -168,11 +168,11 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
                 float lnEps = 1e-5f, half* lnOut2 = nullptr, const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr,
-                bool after = false);
+                bool after = false, int opmC = 128);
 bool gemmOpmOut(const half* X, const half* W, half* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha = 1.f, half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr,
                 float lnEps = 1e-5f, half* lnOut2 = nullptr, const float* lnScale2 = nullptr, const float* lnOffset2 = nullptr,
-                bool after = false);
+                bool after = false, int opmC = 128);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 // BioEmu2's coupling split (metal/bioemu2's couplingSplit): gemmSwiglu's product over the ATOM half of the row only, Xq Wq
 // (Wq: that half's rows of the blocks-of-8 weight), its epilogue (32768, a float tile) the whole row's pre-activations

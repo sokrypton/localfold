@@ -56,6 +56,7 @@ const half* swigluPairs(const std::string& name, int rows, int I);
 // an attention's q | k | v | gate as one [C][4W] weight (the grid attention stores q, k and the gate transposed),
 // and its GEMM bias where the gate has one (zeros elsewhere)
 const half* qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg);
+const half* qgkvWeight(const std::string& B, int C, int Wd);
 // a LayerNorm's affine (norm + "Scale", norm + "Offset") folded into the [in][out] weight w that reads its output - in w's
 // own column order, so a derived (interleaved, quartered) weight folds as it is: LN(x) w = xhat (diag(scale) w) +
 // offset w. extra: a bias w already had (or null). Derived once, under key
@@ -162,7 +163,8 @@ struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMask
 void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
                          const std::string& B, const float** pendY = nullptr, const float** pendGate = nullptr, bool deferFfwRes = false,
-                         bool precomputedQk = false, const AtomBlockCache* nextBc = nullptr, bool* emittedNextQk = nullptr);
+                         bool precomputedQk = false, const AtomBlockCache* nextBc = nullptr, bool* emittedNextQk = nullptr,
+                         half* finalActH = nullptr, bool* scaledFinal = nullptr);
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows
 void adaLn(float* x, const float* scale, const float* shift, half* out, float* outF, size_t rows, int C, size_t period,
            int ld = 0, const float* kScale = nullptr, const float* kShift = nullptr, half* kOut = nullptr, bool chained = false,

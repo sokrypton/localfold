@@ -209,28 +209,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let right_side = e >= C_OUTER;
     let o = e % C_OUTER;
     let w_base = select(W_LEFT, W_RIGHT, right_side);
-    var totals: array<f32, ${OPM_PROJECT_ROWS}>;
-    for (var r = 0u; r < PROJECT_ROWS; r += 1u) { totals[r] = 0.0; }
+${Array.from({ length: OPM_PROJECT_ROWS }, (_, r) => `    var total_${r} = 0.0;`).join("\n")}
     for (var c = 0u; c < C_M; c += 1u) {
       let w = weights[w_base + c * C_OUTER + o];
-      for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
-        totals[r] += normalized_rows[r * C_M + c] * w;
-      }
+${Array.from({ length: OPM_PROJECT_ROWS }, (_, r) => `      total_${r} += normalized_rows[${r * msaChannels}u + c] * w;`).join("\n")}
     }
-    for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
-      let row = first + r;
-      if (row >= ROWS) { break; }
-      var total = totals[r];
-${offsets.leftProjectionBias === undefined ? "" : `      // rosettafold3's biased projections. BEFORE the mask, because the
-      // reference is `+"`mask * Linear(act)`"+` - a masked row still contributes
-      // nothing, and an unmasked one gains the two cross terms of the bilinear
-      // product. See the note in weights.js.
-      total += weights[select(W_LEFT_BIAS, W_RIGHT_BIAS, right_side) + o];`}
-      // ...masked here, after the projection, on both sides.
-      let keep = msa_mask[row];
-      if (right_side) { right[row * C_OUTER + o] = keep * total; }
-      else { left[row * C_OUTER + o] = keep * total; }
-    }
+${offsets.leftProjectionBias === undefined ? "" : `    let bias_val = weights[select(W_LEFT_BIAS, W_RIGHT_BIAS, right_side) + o];`}
+${Array.from({ length: OPM_PROJECT_ROWS }, (_, r) => `    if (first + ${r}u < ROWS) {
+      let row_${r} = first + ${r}u;
+      let val_${r} = msa_mask[row_${r}] * (total_${r}${offsets.leftProjectionBias === undefined ? "" : " + bias_val"});
+      if (right_side) { right[row_${r} * C_OUTER + o] = val_${r}; }
+      else { left[row_${r} * C_OUTER + o] = val_${r}; }
+    }`).join("\n")}
   }
 }`;
 
@@ -384,8 +374,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         let row = s * TOKENS;
         // BLOCK_I + BLOCK_J reads buy BLOCK_I * BLOCK_J multiply-adds.
         ${overI((i) => `let l${i} = left[(row + i${i}) * C_OUTER + c];`)}
-        var r: ${jVector};
-        ${overJ((j) => `${jAt("r", j)} = right[(row + j${j}) * C_OUTER + e];`)}
+        let r = ${jVector}(${Array.from({ length: blockJ }, (_, j) => `right[(row + j${j}) * C_OUTER + e]`).join(", ")});
         ${overI((i) => `acc${i} += l${i} * r;`)}
       }
       ${overI((i) => `product[${i}u * CELL_CHUNK + index] = acc${i};`)}

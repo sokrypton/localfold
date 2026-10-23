@@ -59,9 +59,11 @@ static void adaCond(const float* cond, size_t rows, int C, int condC, const std:
 }
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits) {
   AtomBlockCache c{};
-  auto a = [&](const char* tag) { return scratch<float>(B + tag, qRows * C); };
-  c.qScale = a(".qs"); c.qShift = a(".qh"); c.kScale = a(".ks"); c.kShift = a(".kh");
-  c.ffwScale = a(".fs"); c.ffwShift = a(".fh"); c.zg = a(".zg"); c.tg = a(".tg");
+  const size_t n = qRows * C;
+  float* s6 = scratch<float>(B + ".s6", 6 * n);
+  c.qScale = s6; c.qShift = s6 + n; c.kScale = s6 + 2 * n; c.kShift = s6 + 3 * n;
+  c.ffwScale = s6 + 4 * n; c.ffwShift = s6 + 5 * n;
+  c.zg = scratch<float>(B + ".zg", n); c.tg = scratch<float>(B + ".tg", n);
   adaCond(qCond, qRows, C, C, B + ".q", c.qScale, c.qShift);
   adaCond(qCond, qRows, C, C, B + ".k", c.kScale, c.kShift);
   adaCond(qCond, qRows, C, C, B + ".ffw", c.ffwScale, c.ffwShift);
@@ -76,8 +78,9 @@ AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t
 // ---------------------------------------------------------------- one cross-attention block, in place on act
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
                          const std::string& B, const float** pendY, const float** pendGate, bool deferFfwRes, bool precomputedQk,
-                         const AtomBlockCache* nextBc, bool* emittedNextQk) {
+                         const AtomBlockCache* nextBc, bool* emittedNextQk, half* finalActH, bool* scaledFinal) {
   if (emittedNextQk) *emittedNextQk = false;
+  if (scaledFinal) *scaledFinal = false;
   size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
   int Wd = heads * D;
   if (D > 32 || sh.keys > 128) die("atom attention: %d keys of a head %d wide", sh.keys, D);
@@ -86,7 +89,8 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   const bool fuseFfw = st.noResidual && C <= 768;
   float* pre = nullptr;
   if (st.noResidual && !fuseFfw) { pre = scratch<float>("ab.pre", qRows * C); copy(pre, act, qRows * C * 4); }
-  half* xq = scratch<half>("ab.xq", qRows * C); half* xk = scratch<half>("ab.xk", qRows * C);
+  half* xqk = scratch<half>("ab.xqk", 2 * qRows * C);
+  half* xq = xqk; half* xk = xqk + qRows * C;
   half* tn = scratch<half>("ab.tn", qRows * C);
   const float* rMask = st.maskPerBlock ? st.qMask : nullptr;
   if (!precomputedQk) {
@@ -104,11 +108,11 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
       adaLn(act, bc.kScale, bc.kShift, xk, nullptr, qRows, C, q1);
     }
   }
-  half* qg = scratch<half>("ab.qg", qRows * 2 * Wd); half* kvAtom = scratch<half>("ab.kvAtom", qRows * 2 * Wd);
-  linW(xq, concatColumns(B + ".qg", C, {{B + ".qProjection", Wd, false}, {B + ".gatingQuery", Wd, false}}), qg, qRows, C, 2 * Wd,
-       nullptr, "atom q gate");
-  linW(xk, concatColumns(B + ".kv", C, {{B + ".kProjection", Wd, false}, {B + ".vProjection", Wd, false}}), kvAtom, qRows, C, 2 * Wd,
-       nullptr, "atom k v");
+  half* qgkv = scratch<half>("ab.qgkv", 2 * qRows * 2 * Wd);
+  half* qg = qgkv; half* kvAtom = qgkv + qRows * 2 * Wd;
+  { Gemm g{}; g.X = xqk; g.tx = F16; g.sx = (int64_t)(qRows * C); g.W = qgkvWeight(B, C, Wd); g.tw = F16; g.sw = (int64_t)C * 2 * Wd;
+    g.Y = qgkv; g.ty = F16; g.sy = (int64_t)(qRows * 2 * Wd); g.rows = qRows; g.in = C; g.out = 2 * Wd; g.batch = 2;
+    g.accFloat = true; g.label = "atom qg kv"; gemm(g); }
   const float* qBias = W(B + ".qBias");
   if (hasW(B + ".queryLayerNormScale")) {       // rf3: q (its bias inside) and k normalised per atom row
     uint32_t sgs = 2 * qRows <= 512 ? 2 : 8;
@@ -160,13 +164,15 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
       run1d("af3_mul_h", qRows * I, MulHArgs{gated, u, qRows * I});
     }
   }
-  const bool wantNextQk = nextBc && !st.noResidual && !st.maskPerBlock && C == 128;
+  const bool wantNextQk = nextBc && C == 128;
+  const float* resMask = wantNextQk ? rMask : (finalActH ? st.qMask : nullptr);
+  half* resOut3 = (wantNextQk && st.noResidual) ? tn : ( wantNextQk ? nullptr : finalActH );
   if (!gemmGateResidual(gated, Wh(B + ".ffwTransition2"), act, qRows, qRows, I, C, bc.tg, C, q1, 1.f,
                         "atom transition, gated residual", true,
                         wantNextQk ? xq : nullptr, wantNextQk ? nextBc->qScale : nullptr, wantNextQk ? nextBc->qShift : nullptr,
                         ADA_RAW ? 0.1f : 1e-5f,
                         wantNextQk ? xk : nullptr, wantNextQk ? nextBc->kScale : nullptr, wantNextQk ? nextBc->kShift : nullptr,
-                        wantNextQk && nextBc->chained, emittedNextQk)) {
+                        wantNextQk && nextBc->chained, emittedNextQk, resMask, resOut3)) {
     float* projected = scratch<float>("ab.projected", qRows * C);
     lin(gated, B + ".ffwTransition2", projected, qRows, I, C);
     if (deferFfwRes && !st.noResidual && C <= 768 && pendY && pendGate) {
@@ -174,6 +180,8 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
     } else {
       run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, projected, nullptr, bc.tg, qRows * C, q1 * C, 1.f, 0});
     }
+  } else if (finalActH && scaledFinal) {
+    *scaledFinal = true;
   }
 }
 
@@ -371,8 +379,9 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
             ChiralGradArgs{atomPositions, atomMask, M.i("chiral.centers"), M.f("chiral.angles"), ch.offsets, ch.entries,
                            grads, atoms, (uint)NS, posScale});
     }
-    half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
-    half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
+    half* xqk0 = fuse0 ? scratch<half>("ab.xqk", 2 * qRows * C) : nullptr;
+    half* xq0 = xqk0;
+    half* xk0 = fuse0 ? xqk0 + qRows * C : nullptr;
     half* tn0 = (fuse0 && o.noResidual) ? scratch<half>("ab.tn", qRows * C) : nullptr;
     const AtomBlockCache* b0 = fuse0 ? &o.blocks[0] : nullptr;
     run1d("af3_encoder_start", (C & 3) ? qRows * C : qRows * (C >> 2),
@@ -388,15 +397,17 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   }
   AtomStep st{gatherOf("batch.queriesToKeys"), o.qMask, o.kMask, o.keyMasked, o.noResidual, maskPerBlock};
   const float* pendY = nullptr; const float* pendGate = nullptr;
-  bool preQk = fuse0;
+  bool preQk = fuse0, scaledFinal = false;
+  half* actH = scratch<half>("enc.actH", qRows * C);
   for (size_t b = 0; b < o.blocks.size(); ++b) {
     bool nextQk = false;
+    const bool last = b + 1 == o.blocks.size();
     crossAttentionBlock(act, st, o.blocks[b], sh, C, o.heads, o.D, E + ".blocks." + num(b),
-                        &pendY, &pendGate, true, preQk, b + 1 < o.blocks.size() ? &o.blocks[b + 1] : nullptr, &nextQk);
+                        &pendY, &pendGate, true, preQk, last ? nullptr : &o.blocks[b + 1], &nextQk,
+                        last ? actH : nullptr, last ? &scaledFinal : nullptr);
     preQk = nextQk;
   }
-  half* actH = scratch<half>("enc.actH", qRows * C);
-  scaleRows(act, o.qMask, qRows, C, q1, actH, pendY, pendGate);
+  if (!scaledFinal) scaleRows(act, o.qMask, qRows, C, q1, actH, pendY, pendGate);
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
   lin(actH, E + ".projectAtomFeaturesForAggr", projected, qRows, C, o.perToken);

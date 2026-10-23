@@ -440,8 +440,9 @@ static float* atomDecoder(const half* tokenAct) {
   AtomStep st{gatherOf("batch.queriesToKeys"), D.enc.qMask, D.enc.kMask, flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
               flag(Dd + ".blocks.0.diffusionNoResidual"), maskPerBlock};
   const bool fuse0 = C == 128 && !D.decBlocks.empty();
-  half* xq0 = fuse0 ? scratch<half>("ab.xq", qRows * C) : nullptr;
-  half* xk0 = fuse0 ? scratch<half>("ab.xk", qRows * C) : nullptr;
+  half* xqk0 = fuse0 ? scratch<half>("ab.xqk", 2 * qRows * C) : nullptr;
+  half* xq0 = xqk0;
+  half* xk0 = fuse0 ? xqk0 + qRows * C : nullptr;
   half* tn0 = (fuse0 && st.noResidual) ? scratch<half>("ab.tn", qRows * C) : nullptr;
   const AtomBlockCache* b0 = fuse0 ? &D.decBlocks[0] : nullptr;
   run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),

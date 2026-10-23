@@ -258,9 +258,11 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             const int j = j0 + c.get_multidimensional_index(er)[1];
             if (j >= jLim) continue;
             const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+            const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
             device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
             device const float* cp0 = C + (ulong)j * g.ldc;
             device float* dp0 = D + (ulong)j * g.ldd;
+            device half* hp0 = g.aux3 ? (device half*)g.aux3 + (ulong)j * g.ldd : nullptr;
             _Pragma("clang loop unroll(full)")
             for (int k = 0; k < 4; ++k) {
               const int i = col0 + k * 32;
@@ -270,7 +272,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 const float4 gp = *(device const float4*)(gp0 + i);
                 const float4 cv = *(device const float4*)(cp0 + i);
                 const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-                *(device float4*)(dp0 + i) = cv + v * gm;
+                float4 res = cv + v * gm;
+                if (g.aux2) res *= rm;
+                *(device float4*)(dp0 + i) = res;
+                if (hp0) *(device half4*)(hp0 + i) = half4(res);
               }
             }
           }
@@ -290,6 +295,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             if (j < jLim) {
               const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
               r_row[r_idx] = r;
+              const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
               device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
               device const float* cp0 = C + (ulong)j * g.ldc;
               device float* dp0 = D + (ulong)j * g.ldd;
@@ -301,7 +307,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 const float4 gp = *(device const float4*)(gp0 + i);
                 const float4 cv = *(device const float4*)(cp0 + i);
                 const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-                const float4 res = cv + v * gm;
+                float4 res = cv + v * gm;
+                if (g.aux2) res *= rm;
                 *(device float4*)(dp0 + i) = res;
                 xv[r_idx][k] = res;
                 s += res.x + res.y + res.z + res.w;
@@ -344,12 +351,20 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             device const float* ksc0 = g.lnOut2 ? (device const float*)g.lnScale2 + pr : nullptr;
             device const float* kof0 = (g.lnOut2 && g.lnOffset2) ? (device const float*)g.lnOffset2 + pr : nullptr;
             device half* kout0 = g.lnOut2 ? (device half*)g.lnOut2 + (ulong)j * 128 : nullptr;
+            const ulong fSpan = 4 * (ulong)g.tgN * 128;
+            device const float* fsc0 = g.aux3 ? sc0 + fSpan : nullptr;
+            device const float* fof0 = g.aux3 ? sc0 + fSpan + (ulong)g.tgN * 128 : nullptr;
+            device half* fout0 = g.aux3 ? (device half*)g.aux3 + (ulong)j * 128 : nullptr;
             _Pragma("clang loop unroll(full)")
             for (int k = 0; k < 4; ++k) {
               const int i = col0 + k * 32;
               const float4 nrm = (xv[r_idx][k] - mean[r_idx]) * inv;
               const float4 y = *(device const float4*)(sc0 + i) * nrm + (of0 ? *(device const float4*)(of0 + i) : float4(0.f));
               *(device half4*)(out0 + i) = half4(y);
+              if (fout0) {
+                const float4 fy = *(device const float4*)(fsc0 + i) * nrm + *(device const float4*)(fof0 + i);
+                *(device half4*)(fout0 + i) = half4(fy);
+              }
               if (g.lnOut2) {
                 if (!g.lnPad) {
                   const float4 ky = *(device const float4*)(ksc0 + i) * nrm + (kof0 ? *(device const float4*)(kof0 + i) : float4(0.f));
@@ -418,9 +433,11 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           const int j = j0 + c.get_multidimensional_index(er)[1];
           if (j >= g.tgPairs) continue;
           const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+          const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
           device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
           device const float* cp0 = C + (ulong)j * g.ldc;
           device float* dp0 = D + (ulong)j * g.ldd;
+          device half* hp0 = g.aux3 ? (device half*)g.aux3 + (ulong)j * g.ldd : nullptr;
           _Pragma("clang loop unroll(full)")
           for (int k = 0; k < 2; ++k) {
             const int i = col0 + k * 32;
@@ -430,7 +447,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
               const float4 gp = *(device const float4*)(gp0 + i);
               const float4 cv = *(device const float4*)(cp0 + i);
               const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-              *(device float4*)(dp0 + i) = cv + v * gm;
+              float4 res = cv + v * gm;
+              if (g.aux2) res *= rm;
+              *(device float4*)(dp0 + i) = res;
+              if (hp0) *(device half4*)(hp0 + i) = half4(res);
             }
           }
         }
@@ -447,7 +467,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
         const float4 cv = *(device const float4*)(C + (ulong)i + (ulong)j * g.ldc);
         const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-        *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = cv + v * gm;
+        float4 res = cv + v * gm;
+        if (g.aux2) res *= ((device const float*)g.aux2)[r];
+        *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = res;
+        if (g.aux3) *(device half4*)((device half*)g.aux3 + (ulong)i + (ulong)j * g.ldd) = half4(res);
       }
       return;
     }
@@ -585,9 +608,11 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             const int j = j0 + c.get_multidimensional_index(er)[1];
             if (j >= jLim) continue;
             const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+            const float rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
             device const float* gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
             device const float* cp0 = C + (ulong)j * g.ldc;
             device float* dp0 = D + (ulong)j * g.ldd;
+            device half* hp0 = g.aux3 ? (device half*)g.aux3 + (ulong)j * g.ldd : nullptr;
             _Pragma("clang loop unroll(full)")
             for (int k = 0; k < 4; ++k) {
               const int i = col0 + k * 32;
@@ -597,7 +622,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 const float4 gp = *(device const float4*)(gp0 + i);
                 const float4 cv = *(device const float4*)(cp0 + i);
                 const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-                *(device float4*)(dp0 + i) = cv + v * gm;
+                float4 res = cv + v * gm;
+                if (g.aux2) res *= rm;
+                *(device float4*)(dp0 + i) = res;
+                if (hp0) *(device half4*)(hp0 + i) = half4(res);
               }
             }
           }
@@ -614,7 +642,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
           const float4 cv = *(device const float4*)(C + (ulong)i + (ulong)j * g.ldc);
           const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-          *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = cv + v * gm;
+          float4 res = cv + v * gm;
+          if (g.aux2) res *= ((device const float*)g.aux2)[r];
+          *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = res;
+          if (g.aux3) *(device half4*)((device half*)g.aux3 + (ulong)i + (ulong)j * g.ldd) = half4(res);
         }
         return;
       }
@@ -732,10 +763,12 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           continue;
         }
         if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
-          const float4 b128 = *(device const float4*)((device const float*)g.bias + (i & 127));
-          const float nv = ((device const float*)g.aux)[(uint)j * ((uint)g.m >> 7) + ((uint)i >> 7)];
+          const uint opmC = (uint)g.tgN, u = (uint)i;
+          const uint jTok = opmC == 128 ? (u >> 7) : opmC == 256 ? (u >> 8) : lf_udiv(u, opmC);
+          const float4 bCol = *(device const float4*)((device const float*)g.bias + (u - jTok * opmC));
+          const float nv = ((device const float*)g.aux)[(uint)j * (uint)g.tgNp + jTok];
           const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-          const vec<TC, 4> st = lf_out4<TC>(cv + (g.tgC ? v / max(nv, 1.f) + b128 : (b128 + v) / (1e-3f + nv)));
+          const vec<TC, 4> st = lf_out4<TC>(cv + (g.tgC ? v / max(nv, 1.f) + bCol : (bCol + v) / (1e-3f + nv)));
           *(device vec<TC, 4>*)dp = st;
           if constexpr ((EP & 64) != 0) { c[e] = (float)st.x; c[e + 1] = (float)st.y; c[e + 2] = (float)st.z; c[e + 3] = (float)st.w; }
           continue;

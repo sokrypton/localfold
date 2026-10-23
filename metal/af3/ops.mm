@@ -99,6 +99,17 @@ const half* qkvgWeight(const std::string& pre, int C, int Wd, bool tr) {
   return concatColumns(pre + ".qkvg", C, {{pre + ".qProjection", Wd, tr}, {pre + ".kProjection", Wd, tr},
                                           {pre + ".vProjection", Wd, false}, {pre + ".gatingQuery", Wd, tr}});
 }
+const half* qgkvWeight(const std::string& B, int C, int Wd) {
+  return M.derived<half>("qgkv:" + B, (size_t)2 * C * 2 * Wd, [&](half* out) {
+    const std::string names[4] = {B + ".qProjection", B + ".gatingQuery", B + ".kProjection", B + ".vProjection"};
+    for (int k = 0; k < 4; ++k) {
+      if (lenW(names[k]) != (size_t)C * Wd) die("%s has %zu elements, not %d x %d", names[k].c_str(), lenW(names[k]), C, Wd);
+      half* dst = out + (size_t)(k >> 1) * C * 2 * Wd;
+      run1d("af3_concat_part", (size_t)C * Wd,
+            ConcatPartArgs{Wh(names[k]), dst, (uint)C, (uint)Wd, (uint)(2 * Wd), (uint)((k & 1) * Wd), 0u, 0});
+    }
+  });
+}
 const float* qkvgBias(const std::string& pre, int Wd) {
   if (!hasW(pre + ".gatingQueryBias")) return nullptr;
   return M.derived<float>("qkvgBias:" + pre, (size_t)4 * Wd, [&](float* out) {

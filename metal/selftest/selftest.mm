@@ -397,52 +397,65 @@ int main() {
     else { ++failures; printf("  gate residual: FAIL (not taken)\n"); }
     release(dX); release(dW); release(dg); release(dA);
   }
-  for (bool chained : {false, true}) {   // gated residual + emitted periodic adaLN (128 wide, unchained & chained)
+  for (bool chained : {false, true}) {   // gated residual + emitted periodic adaLN (128 wide, unchained & chained, + rowMask & out3)
     size_t rows = 195, period = 65; int K = 128, O = 128, ld = 256;
     auto X = randv(rows * K), W = randv((size_t)K * O, 0.1f), gate = randv(period * ld), A0 = randv(rows * O);
-    auto sc1 = randv(period * O), of1 = randv(period * O), sc2 = randv(period * O), of2 = randv(period * O);
-    std::vector<double> ref(A0.begin(), A0.end()), refLn1(rows * O), refLn2(rows * O);
+    auto s6 = randv(6 * period * O), rmask = randv(period);
+    std::vector<double> ref(A0.begin(), A0.end()), refLn1(rows * O), refLn2(rows * O), refLn3(rows * O), refMasked(A0.begin(), A0.end());
     for (size_t r = 0; r < rows; ++r) {
       double m = 0, var = 0;
+      double rm = rmask[r % period];
       for (int o = 0; o < O; ++o) {
         double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
-        ref[r * O + o] += (0.5 * s) * gate[(r % period) * ld + o];
-        m += ref[r * O + o];
+        double val = (ref[r * O + o] + (0.5 * s) * gate[(r % period) * ld + o]) * rm;
+        ref[r * O + o] = val;
+        refMasked[r * O + o] = (double)(float)(half)val;
+        m += val;
       }
       m /= O;
       for (int o = 0; o < O; ++o) { double d = ref[r * O + o] - m; var += d * d; }
       double inv = 1.0 / sqrt(var / O + 1e-5);
-      size_t pr = (r % period) * O;
+      size_t pr = (r % period) * O, span = period * O;
       double m2 = 0, var2 = 0;
       for (int o = 0; o < O; ++o) {
         double nrm = (ref[r * O + o] - m) * inv;
-        double y1 = nrm * sc1[pr + o] + of1[pr + o];
+        double y1 = nrm * s6[pr + o] + s6[span + pr + o];
         refLn1[r * O + o] = y1;
-        if (!chained) refLn2[r * O + o] = nrm * sc2[pr + o] + of2[pr + o];
+        refLn3[r * O + o] = nrm * s6[4 * span + pr + o] + s6[5 * span + pr + o];
+        if (!chained) refLn2[r * O + o] = nrm * s6[2 * span + pr + o] + s6[3 * span + pr + o];
         else m2 += y1;
       }
       if (chained) {
         m2 /= O;
         for (int o = 0; o < O; ++o) { double d = refLn1[r * O + o] - m2; var2 += d * d; }
         double inv2 = 1.0 / sqrt(var2 / O + 1e-5);
-        for (int o = 0; o < O; ++o) refLn2[r * O + o] = (refLn1[r * O + o] - m2) * inv2 * sc2[pr + o] + of2[pr + o];
+        for (int o = 0; o < O; ++o) refLn2[r * O + o] = (refLn1[r * O + o] - m2) * inv2 * s6[2 * span + pr + o] + s6[3 * span + pr + o];
       }
     }
     half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
     float* dg = uploadNew(gate.data(), gate.size()); float* dA = uploadNew(A0.data(), A0.size());
-    float *dsc1 = uploadNew(sc1.data(), sc1.size()), *dof1 = uploadNew(of1.data(), of1.size());
-    float *dsc2 = uploadNew(sc2.data(), sc2.size()), *dof2 = uploadNew(of2.data(), of2.size());
-    half *dLn1 = allocT<half>(rows * O), *dLn2 = allocT<half>(rows * O);
+    float *ds6 = uploadNew(s6.data(), s6.size()), *drm = uploadNew(rmask.data(), rmask.size());
+    size_t span = period * O;
+    half *dLn1 = allocT<half>(rows * O), *dLn2 = allocT<half>(rows * O), *dLn3 = allocT<half>(rows * O);
     bool emitted = false;
     gemmGateResidual(dX, dW, dA, rows, rows, K, O, dg, ld, period, 0.5f, "gate res ln", true,
-                     dLn1, dsc1, dof1, 1e-5f, dLn2, dsc2, dof2, chained, &emitted);
-    report(chained ? "gate residual + adaLN (chained): act" : "gate residual + adaLN: act", relRms(ref, download(dA, rows * O)), 1e-3);
+                     dLn1, ds6, ds6 + span, 1e-5f, dLn2, ds6 + 2 * span, ds6 + 3 * span, chained, &emitted, drm, dLn3);
     if (emitted) {
-      auto h1 = download(dLn1, rows * O), h2 = download(dLn2, rows * O);
+      report(chained ? "gate residual + adaLN (chained): act" : "gate residual + adaLN: act", relRms(ref, download(dA, rows * O)), 1e-3);
+      auto h1 = download(dLn1, rows * O), h2 = download(dLn2, rows * O), h3 = download(dLn3, rows * O);
       report(chained ? "gate residual + adaLN (chained): ln1" : "gate residual + adaLN: ln1", relRms(refLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
       report(chained ? "gate residual + adaLN (chained): ln2" : "gate residual + adaLN: ln2", relRms(refLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+      report(chained ? "gate residual + adaLN (chained): ln3" : "gate residual + adaLN: ln3", relRms(refLn3, std::vector<float>(h3.begin(), h3.end())), 3e-3);
     }
-    release(dX); release(dW); release(dg); release(dA); release(dsc1); release(dof1); release(dsc2); release(dof2); release(dLn1); release(dLn2);
+    if (!chained) {
+      upload(dA, A0.data(), A0.size() * 4);
+      gemmGateResidual(dX, dW, dA, rows, rows, K, O, dg, ld, period, 0.5f, "gate res mask+h", true,
+                       nullptr, nullptr, nullptr, 1e-5f, nullptr, nullptr, nullptr, false, nullptr, drm, dLn3);
+      report("gate residual + rowMask: act", relRms(ref, download(dA, rows * O)), 1e-3);
+      auto hm = download(dLn3, rows * O);
+      report("gate residual + rowMask: actH", relRms(refMasked, std::vector<float>(hm.begin(), hm.end())), 3e-3);
+    }
+    release(dX); release(dW); release(dg); release(dA); release(ds6); release(drm); release(dLn1); release(dLn2); release(dLn3);
   }
   {   // conditioning permuted store (AF3 diffusion conditioning)
     size_t valid = 135, prows = 144; int period = 45, K = 128, W = 128, BS = 3, O = BS * W, sigCols = 64;
@@ -546,6 +559,50 @@ int main() {
     } else { ++failures; printf("  gemmOpmOut emitted LN: FAIL (not taken)\n"); }
     release(dLn1); release(dLn2); release(dsc); release(dof); release(dsc2); release(dof2);
     release(dlt); release(drt); release(dX); release(dW); release(db); release(dn); release(dPf); release(dPh);
+    for (int opmC : {256, 384}) {   // shallow OPM output add at C = 256 (with emitted LN) and C = 384
+      int bi2 = 5, L2 = 7, in2 = 64, out2 = L2 * opmC;
+      auto X2 = randv((size_t)bi2 * in2), W2 = randv((size_t)in2 * out2, 0.1f), b2 = randv(opmC), n2 = randv((size_t)bi2 * L2, 0.5f), P2 = randv((size_t)bi2 * out2);
+      auto sc1 = randv(opmC), of1 = randv(opmC), sc2 = randv(opmC), of2 = randv(opmC);
+      for (auto& v : n2) v = std::abs(v) + 1.f;
+      std::vector<double> ref2((size_t)bi2 * out2), ref2Ln1((size_t)bi2 * out2), ref2Ln2((size_t)bi2 * out2);
+      for (int i = 0; i < bi2; ++i) for (int j = 0; j < L2; ++j) {
+        double m = 0, var = 0;
+        for (int c = 0; c < opmC; ++c) {
+          int o = j * opmC + c;
+          double s = 0;
+          for (int k = 0; k < in2; ++k) s += (double)(float)(half)X2[i * in2 + k] * (float)(half)W2[(size_t)k * out2 + o];
+          double val = P2[i * out2 + o] + (b2[c] + s) / (1e-3 + n2[i * L2 + j]);
+          ref2[i * out2 + o] = val;
+          m += val;
+        }
+        m /= opmC;
+        for (int c = 0; c < opmC; ++c) { double d = ref2[i * out2 + j * opmC + c] - m; var += d * d; }
+        double inv = 1.0 / sqrt(var / opmC + 1e-5);
+        for (int c = 0; c < opmC; ++c) {
+          int o = j * opmC + c;
+          ref2Ln1[i * out2 + o] = (ref2[i * out2 + o] - m) * inv * sc1[c] + of1[c];
+          ref2Ln2[i * out2 + o] = (ref2[i * out2 + o] - m) * inv * sc2[c] + of2[c];
+        }
+      }
+      half* dX2 = uploadNew(toH(X2).data(), X2.size()); half* dW2 = uploadNew(toH(W2).data(), W2.size());
+      float *db2 = uploadNew(b2.data(), b2.size()), *dn2 = uploadNew(n2.data(), n2.size()), *dP2 = uploadNew(P2.data(), P2.size());
+      float *dsc1 = uploadNew(sc1.data(), opmC), *dof1 = uploadNew(of1.data(), opmC), *dsc2 = uploadNew(sc2.data(), opmC), *dof2 = uploadNew(of2.data(), opmC);
+      half *dL1 = allocT<half>((size_t)bi2 * out2), *dL2 = allocT<half>((size_t)bi2 * out2);
+      const bool wantLn = opmC == 256 && matrixUnits();
+      if (gemmOpmOut(dX2, dW2, dP2, db2, dn2, bi2, in2, out2, 1.f, wantLn ? dL1 : nullptr, dsc1, dof1, 1e-5f, wantLn ? dL2 : nullptr, dsc2, dof2, false, opmC)) {
+        char l0[64], l1[64], l2[64];
+        snprintf(l0, sizeof l0, "outer product output add (C %d)", opmC);
+        report(l0, relRms(ref2, download(dP2, (size_t)bi2 * out2)), 1e-3);
+        if (wantLn) {
+          auto h1 = download(dL1, (size_t)bi2 * out2), h2 = download(dL2, (size_t)bi2 * out2);
+          snprintf(l1, sizeof l1, "outer product output add (C %d), emitted LN 1", opmC);
+          snprintf(l2, sizeof l2, "outer product output add (C %d), emitted LN 2", opmC);
+          report(l1, relRms(ref2Ln1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+          report(l2, relRms(ref2Ln2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+        }
+      } else { ++failures; printf("  gemmOpmOut C %d: FAIL (not taken)\n", opmC); }
+      release(dX2); release(dW2); release(db2); release(dn2); release(dP2); release(dsc1); release(dof1); release(dsc2); release(dof2); release(dL1); release(dL2);
+    }
   }
 
   printf("attention\n");

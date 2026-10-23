@@ -531,7 +531,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
     `var total${h} = vec4<f32>(0.0);`).join("\n  ")}
   for (var c0 = 0u; c0 < CHANNELS; c0 += ${biasUnroll}u) {
-${Array.from({ length: biasUnroll }, (_, u) => `    {
+${packNormalized && biasUnroll >= 2 ? Array.from({ length: biasUnroll / 2 }, (_, p) => `    {
+      let c0p = c0 + ${p * 2}u;
+      let pair_val = unpack2x16float(normalized[(base + c0p) >> 1u]);
+      let col0 = (W_BIAS + c0p * HEADS) / 4u;
+      let col1 = col0 + (HEADS / 4u);
+      ${Array.from({ length: heads / 4 }, (_, h) =>
+        `total${h} += pair_val.x * projection[col0 + ${h}u];`).join("\n      ")}
+      ${Array.from({ length: heads / 4 }, (_, h) =>
+        `total${h} += pair_val.y * projection[col1 + ${h}u];`).join("\n      ")}
+    }`).join("\n") : Array.from({ length: biasUnroll }, (_, u) => `    {
       let c = c0 + ${u}u;
       let value = ${storedElement(normalizedStorage, "normalized", "base + c")};
       let column = (W_BIAS + c * HEADS) / 4u;
@@ -971,9 +980,12 @@ ${OUT_VEC4 ? `${overOutGroups((g) => {
   const r0 = g * 4;
   return [0, 1, 2, 3].map((l) => {
     const r = r0 + l;
+    const gRow = chunked ? `(chunk.x * N + row_${r})` : `row_${r}`;
+    const dstRow = transpose ? `((${gRow} % N) * N + ${gRow} / N)` : gRow;
     return `  let row_${r} = first + ${r}u;
   let valid_${r} = row_${r} < ${LIVE};
-  let base_${r} = select(0u, row_${r} * WIDTH, valid_${r});`;
+  let base_${r} = select(0u, row_${r} * WIDTH, valid_${r});
+  let dst_base_${r} = select(0u, ${dstRow} * CHANNELS, valid_${r});`;
   }).join("\n");
 })}
   for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
@@ -1012,9 +1024,7 @@ ${overOutGroups((g) => `      sum${g} += ${outStage16 ? `vec4<f32>(gated[${g * w
     }`}
 ${offsets.outputProjectionBias === undefined ? "" : `${overOutGroups((g) => `    sum${g} += vec4<f32>(weights[W_OUT_BIAS + c]);`)}`}
 ${overOutRows((r) => `    if (valid_${r}) {
-      let row${r} = ${chunked ? "chunk.x * N + " : ""}row_${r};
-      let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
-      output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${Math.floor(r / 4)}.${"xyzw"[r % 4]};
+      output[dst_base_${r} + c] ${residual ? "+=" : "="} sum${Math.floor(r / 4)}.${"xyzw"[r % 4]};
     }`)}` : `${overOutRows((r) => `    var sum${r} = 0.0;`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
       // Consecutive threads read consecutive channels, and this one load is
