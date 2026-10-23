@@ -191,26 +191,26 @@ what. A change that does not move the 522 or 261 + MSA row is not worth its comp
 ## Results (2026-10-23, A100-SXM4-40GB)
 
 Upstream PRs:
-- [`mirditalab/colabfold-kernels#5`](https://github.com/mirditalab/colabfold-kernels/pull/5) (`sokrypton:a100-v08-speed` -> `mirditalab:main`)
-- [`steineggerlab/alphafold#12`](https://github.com/steineggerlab/alphafold/pull/12) (`sokrypton:a100-evoformer-speed` -> `steineggerlab:main`)
+- [`mirditalab/colabfold-kernels#6`](https://github.com/mirditalab/colabfold-kernels/pull/6) (`sokrypton:a100-pallas-speedup` -> `mirditalab:main`)
+- [`steineggerlab/alphafold#13`](https://github.com/steineggerlab/alphafold/pull/13) (`sokrypton:a100-pallas-speedup` -> `steineggerlab:main`)
 
 | engine | 68 | 261 | 522 | 1,044 | 261 + MSA | `r261msa` CA RMSD |
 |---|---:|---:|---:|---:|---:|---:|
 | ColabFold + `colabfold-kernels` 0.8.0 (`~/.venv-colabfold-k08`) | 0.160 | 0.432 | 1.408 | 6.660 | 1.564 | 0.121 A |
-| **ColabFold + `colabfold-kernels` (`~/.venv-cfk-dev`, PRs #5 & #12)** | **0.088** | **0.324** | **1.160** | **5.616** | **1.172** | **0.122 A** |
+| **ColabFold + `colabfold-kernels` (`~/.venv-cfk-dev`, PRs #6 & #13)** | **0.088** | **0.324** | **1.160** | **5.616** | **1.172** | **0.122 A** |
 | LocalFold CUDA baseline (`973308d3`) | 0.065 - 0.089 | 0.316 | 1.145 | 5.590 | 1.103 | 0.000 A |
 | **LocalFold CUDA + single-seq `outLn256<..., VG=true>`** | **0.065** | **0.313** | **1.126** | **5.506** | **1.097** | **0.000 A** |
 
 ### What bought what
 
-1. **`colabfold-kernels` (`mirditalab/colabfold-kernels#5`):**
+1. **`colabfold-kernels` (`mirditalab/colabfold-kernels#6`):**
    - `_ln_proj_kernel` `jax.lax.fori_loop` over `slots` + `(block_m=128, num_warps=4, num_stages=1)` for `m > 16_384` on A100 (`packed_attn.py`): cuts `ln_projection` register spills from 255 registers (`47.0 ms` -> `31.9 ms` per pass on `r522`).
    - `packed_attention` A100 tile & staging tuning (`packed_attn.py`): `block_q=64` for `half and (not column or (biased and 128 < s <= 264))`, `block_k=64` for `half and not column`, `num_stages=3` for `column or (half and s > 128)` (`102 ms` -> `95.2 ms` per pass on `r522`; `-48 ms` on `r261`).
    - `ln_gated_dual_proj` (`tri_mul.py`): `(block_m=128, num_warps=4, chunk=64)` for `m_tot > 16_384` and `(64, 4, None)` for `m_tot <= 16_384` on A100 (`39.0 ms` -> `34.1 ms` per pass on `r522`).
    - `fused_transition` (`transition.py`): restrict `sm80_small` (`chunk=128, num_warps=8`) to `m <= 16_384`.
    - Fused `global_attention` Pallas kernel (`packed_attn.py`, `fused_ops.py`): replaces the 6-kernel XLA sequence in `MSAColumnGlobalAttention` (`extra_msa_stack`) with a single two-pass Pallas kernel in-place on `[S, B, C]`.
    - Fused next-module `LayerNorm` in `output_projection` (`packed_attn.py`, `fused_ops.py`): emits `ln_rows(m_out, ln_scale, ln_offset)` from the already-in-register residual output rows (borrowed from `cuda/af2/src/outln.cuh`), saving 96 full-MSA `pallas_layer_norm` launches per pass (`-24 ms` on `r261msa`).
-2. **`alphafold` (`steineggerlab/alphafold#12`):**
+2. **`alphafold` (`steineggerlab/alphafold#13`):**
    - Single-sequence (`s == 1`) fast path in `Attention.packed` (`modules.py`): skips `packed_attention` in `MSAColumnAttention` when `N_seq == 1` (`r68: 160 -> 112 ms`).
    - Hoisted `OuterProductMean` mask `norm` out of `extra_msa_stack` and `evoformer_stack` (`modules.py`) and removed the redundant `norm = utils.wide_einsum('abc,adc->bdc', mask, mask)` recomputation inside `OuterProductMean.__call__` (saves 208 `[S, L, 1] x [S, L, 1] -> [L, L, 1]` contractions per fold, `-96 ms` on `r261msa`).
    - Wired `fused_ops.global_attention` into `GlobalAttention` & `MSAColumnGlobalAttention` and fused `output_projection` + next-module `LayerNorm` across `MSARowAttentionWithPairBias -> MSAColumnAttention -> Transition` in `EvoformerIteration` (`modules.py`).
