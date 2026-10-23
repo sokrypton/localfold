@@ -84,7 +84,7 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
   for (size_t p0 = 0; p0 < pairs; p0 += per) {
     size_t r = std::min(per, pairs - p0);
     if (chai) {
-      run1d("af3_chai_struct_pair", r * width,
+      run1d("af3_chai_struct_pair", ((Czt & 3) || (Cz & 3)) ? r * width : r * (width >> 2),
             ChaiStructPairArgs{trunkPair, M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
                                entityRank, symRank, W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
                                M.has("batch.declaredBondMatrix") ? M.f("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, p0, r,
@@ -110,10 +110,8 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
     lin(f2n, P + ".pairCondInitialProjection", D.pairCond + p0 * Cz, r, width, Cz);
   }
   for (int k = 0; k < 2; ++k) plainTransition(D.pairCond, pairs, Cz, P + ".pairTransitions." + num(k));
-  if (chai) {     // chai closes the pair track with an affine LayerNorm
-    float* tmp = scratch<float>("dc.fnorm", pairs * Cz);
-    ln(D.pairCond, tmp, pairs, Cz, P + ".pairCondFinalNormScale", P + ".pairCondFinalNormOffset");
-    copy(D.pairCond, tmp, pairs * Cz * 4);
+  if (chai) {     // chai closes the pair track with an affine LayerNorm (in place: a row read whole before it is written)
+    ln(D.pairCond, D.pairCond, pairs, Cz, P + ".pairCondFinalNormScale", P + ".pairCondFinalNormOffset");
   }
   // [trunk single | target_feat]; the openfold3 lineage pads two always-zero columns (unknown DNA, after the restype
   // and profile blocks) - free before a linear, not before this LayerNorm

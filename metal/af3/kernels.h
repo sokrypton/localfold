@@ -24,8 +24,8 @@ struct CastArgs { CP(float) x; DP(half) y; u64 n; };
 
 // ---------------------------------------------------------------- the embedder
 struct RelIdx { CP(int) ri; CP(int) ti; CP(int) asym; CP(int) ent; CP(int) sym; };
-// pair[i][j] = left[i] + right[j] (+ add[ij])
-struct OuterSumArgs { CP(float) left; CP(float) right; CP(float) add; DP(float) pair; uint n, C; };
+// pair[i][j] = left[i] + right[j] (+ add[ij] or add[0])
+struct OuterSumArgs { CP(float) left; CP(float) right; CP(float) add; DP(float) pair; uint n, C, addRow, pad; };
 // pair += the 139 relative-encoding rows a pair's one-hot selects
 struct RelEncArgs { RelIdx r; CP(float) W; DP(float) pair; uint n, C; };
 // pair += bonds[ij] w + (boltz2) table[order[ij]] + unspecified

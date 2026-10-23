@@ -36,9 +36,12 @@ const half* triGateWeight(const std::string& pre, int C) {
 // pair normalised, the norm's name and the buffer. pairLn of the same pair and norm takes its entry; a miss drops both
 // (whatever came between may have moved the pair). LOCALFOLD_LN_EMIT=0: none emitted, every norm its own pass
 struct Emitted { const void* x = nullptr; std::string norm; half* buf = nullptr; };
-static Emitted emitted[3];
+static Emitted emitted[4];
 static void emit(int k, const void* x, const std::string& norm, half* buf) { emitted[k] = {x, norm, buf}; }
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit(k, x, norm, buf); }
+static bool canEmitLn(int C) {
+  return C == 64 || C == 128 || C == 256 || ((C == 384 || C == 512) && matrixUnits());
+}
 static half* takeEmitted(const void* x, const std::string& norm) {
   for (auto& e : emitted)
     if (e.x == x && e.norm == norm) { e.x = nullptr; return e.buf; }
@@ -110,7 +113,7 @@ static void triangleT(T* pair, const Masks& m, int n, int C, const std::string& 
                            halfProductScale() ? nullptr : scratch<half>("pr.h1", P * C),
                            outgoing ? "triangle out contraction" : "triangle in contraction");
   half* cn = mid.cn; half* outH = mid.outH;
-  half* lnOut = !nextNorm.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
+  half* lnOut = !nextNorm.empty() && !into && canEmitLn(C) && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
   if (gemmGatedAddDual(xn, xs ? gl.w : Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C,
                        xs ? gl.b : nullptr, nullptr, outH,
                        "triangle output and gated add", lnOut, lnOut ? W(nextNorm + "Scale") : nullptr,
@@ -197,7 +200,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
       release(sum);
     });
     addLinW(o, w, into ? into : pair, P, Wd, C, Wopt(pre + ".outputProjectionBias"), "grid output");
-  } else if (!nextNorm.empty() && !into && (C == 64 || C == 128 || C == 256) && hasW(nextNorm + "Scale") && lenW(pre + ".outputProjection") == (size_t)Wd * C) {
+  } else if (!nextNorm.empty() && !into && canEmitLn(C) && hasW(nextNorm + "Scale") && lenW(pre + ".outputProjection") == (size_t)Wd * C) {
     half* lnOut = lnTarget(P, C, xn);
     Gemm g{}; g.X = o; g.tx = F16; g.W = Wh(pre + ".outputProjection"); g.tw = F16; g.Y = pair; g.ty = dtOf<T>(); g.rows = P; g.in = Wd; g.out = C;
     g.beta = 1.f; g.bias = Wopt(pre + ".outputProjectionBias"); g.label = "grid output, next norm";
@@ -245,9 +248,13 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   // time, each chunk's rows of pr.x / pr.x2 written once the chunk's SwiGLU has read them (a long pair runs in chunks:
   // both used to be a LayerNorm pass of their own past ~300 tokens)
   half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
+  const bool isSt = !strcmp(scratchPrefix, "st.");
   const bool xh1 = next1 == "__xhat__";
-  const bool emitNext = !next1.empty() && !into && (C == 64 || C == 128 || C == 256) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
-  half* ln1Buf = emitNext ? ((xh1 && shared.xhat != scratch<half>("par.xhat", rows * C)) ? scratch<half>("par.xhat", rows * C) : scratch<half>("pr.x", rows * C)) : nullptr;
+  const bool emitNext = !next1.empty() && !into && canEmitLn(C) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
+  half* ln1Buf = emitNext ? (isSt ? scratch<half>("st.nrm", std::max(rows, rp) * C)
+                                  : ((xh1 && shared.xhat != scratch<half>("par.xhat", rows * C)) ? scratch<half>("par.xhat", rows * C)
+                                                                                                 : scratch<half>("pr.x", rows * C))) : nullptr;
+  half* ln2Buf = (emitNext && !next2.empty()) ? (isSt ? scratch<half>("st.xn", std::max(rows, rp) * C) : scratch<half>("pr.x2", rows * C)) : nullptr;
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -271,18 +278,17 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
       Gemm G{}; G.X = g; G.tx = F16; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x + r0 * C; G.ty = dtOf<T>(); G.rows = r;
       G.in = I; G.out = C; G.beta = 1.f; G.label = "transition2, next norms";
       G.lnOut = ln1Buf + r0 * C; G.lnScale = xh1 ? nullptr : W(next1 + "Scale"); G.lnOffset = xh1 ? nullptr : Wopt(next1 + "Offset");
-      if (!next2.empty()) {
-        G.lnOut2 = scratch<half>("pr.x2", rows * C) + r0 * C; G.lnScale2 = W(next2 + "Scale"); G.lnOffset2 = Wopt(next2 + "Offset");
+      if (ln2Buf) {
+        G.lnOut2 = ln2Buf + r0 * C; G.lnScale2 = W(next2 + "Scale"); G.lnOffset2 = Wopt(next2 + "Offset");
       }
       if (lenW(pre + ".transition2") != (size_t)I * C) die("%s.transition2 has %zu elements", pre.c_str(), lenW(pre + ".transition2"));
       if (gemm(G)) continue;
       if (r0) die("%s: the next norms emitted for some chunks and not others", pre.c_str());
       emittedAll = false;       // (the GEMM took no emission - every chunk falls back alike)
-      continue;
     }
     addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C, nullptr, "transition2");
   }
-  if (emittedAll) { emit(0, x, next1, ln1Buf); if (!next2.empty()) emit(1, x, next2, scratch<half>("pr.x2", rows * C)); }
+  if (emittedAll) { emit(isSt ? 2 : 0, x, next1, ln1Buf); if (ln2Buf) emit(isSt ? 3 : 1, x, next2, ln2Buf); }
 }
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
                 const std::string& next2, const char* scratchPrefix) {
@@ -363,7 +369,7 @@ void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::st
 // attention over the tokens biased by the pair (LN, a projection to the heads), then the transition
 template <class T>
 static void singleTrackT(float* single, const T* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
-                         const float* extraBias, const std::string& nextPairNorm = "") {
+                         const float* extraBias, const std::string& nextPairNorm = "", const std::string& nextB = "") {
   const std::string A = B + ".singleAttention";
   // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the transition reads
   // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
@@ -403,12 +409,14 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
       zeroedNrm = nrm; zeroedO = o; zeroedN = n;
     }
   }
-  if (parallel) {
-    const std::string tn = B + ".singleTransition.inputLayerNorm";
+  const std::string tn = B + ".singleTransition.inputLayerNorm";
+  if (half* b = takeEmitted(single, A + ".layerNorm")) {
+    nrm = b;
+  } else if (parallel) {
     half* txn = scratch<half>("st.xn", np * Cs);
     layerNormDual(single, nrm, W(A + ".layerNormScale"), Wopt(A + ".layerNormOffset"),
                   txn, W(tn + "Scale"), Wopt(tn + "Offset"), n, Cs);
-    emit(2, single, tn, txn);
+    emit(3, single, tn, txn);
   } else {
     ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
   }
@@ -422,8 +430,18 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
-  lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
-  transition(single, n, Cs, B + ".singleTransition", nullptr, "", "", "st.");
+  bool emittedTn = false;
+  if (!parallel && canEmitLn(Cs) && hasW(tn + "Scale") && lenW(A + ".outputProjection") == (size_t)Wd * Cs) {
+    half* txn = scratch<half>("st.xn", np * Cs);
+    Gemm g{}; g.X = o; g.tx = F16; g.W = Wh(A + ".outputProjection"); g.tw = F16; g.Y = single; g.rows = n;
+    g.in = Wd; g.out = Cs; g.beta = 1.f; g.label = "single output, next norm";
+    g.lnOut = txn; g.lnScale = W(tn + "Scale"); g.lnOffset = Wopt(tn + "Offset");
+    if (gemm(g)) { emit(2, single, tn, txn); emittedTn = true; }
+  }
+  if (!emittedTn) lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
+  const std::string nextSn1 = nextB.empty() ? "" : nextB + ".singleAttention.layerNorm";
+  const std::string nextSn2 = (parallel && !nextB.empty()) ? nextB + ".singleTransition.inputLayerNorm" : "";
+  transition(single, n, Cs, B + ".singleTransition", nullptr, nextSn1, nextSn2, "st.");
 }
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias) {
@@ -440,14 +458,14 @@ static void pairformerBlockT(T* pair, float* single, const Masks& m, int n, int 
     // the single track reads the pair ENTERING the block, kept by the parallel updates
     parallelPairUpdates(pair, m, n, C, B, "oirct", !nextB.empty());
     // (folded, the pair's xhat is the block input's; otherwise the kept copy)
-    singleTrackT(single, shared.xhat ? pair : scratch<T>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
+    singleTrackT(single, shared.xhat ? pair : scratch<T>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias, "", nextB);
     shared = {};
     return;
   }
   // (the transition emits the single track's pair norm and the next block's first, where the caller names that block)
   const std::string nextNorm = nextB.empty() ? "" : nextB + ".triangleMultiplicationOutgoing.leftNormInput";
   pairUpdates(pair, m, n, C, B, B + ".singlePairLogitsNorm", nextNorm);
-  singleTrackT(single, pair, m, n, C, Cs, B, extraBias, nextNorm);
+  singleTrackT(single, pair, m, n, C, Cs, B, extraBias, nextNorm, nextB);
 }
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B, const float* extraBias,
                      const std::string& nextB) {

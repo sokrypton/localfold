@@ -220,10 +220,38 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   const bool aligned = (a.ldx & 3) == 0;
   const bool outAligned = (a.ldy & 3) == 0;
   const bool full = C4 == MAXV * 32;
-  if (full && aligned && outAligned && a.yh && !a.y) {
+  if (full && aligned && outAligned && ((a.yh && !a.y) || (a.y && !a.yh && !a.yh2 && a.x))) {
     constexpr float invC = 1.f / (float)(MAXV * 128);
     device const float4* sc4 = (device const float4*)a.scale;
     device const float4* of4 = (device const float4*)a.offset;
+    if (a.y) {
+      device const float4* x4 = (device const float4*)(a.x + row * a.ldx);
+      device float4* y4 = (device float4*)(a.y + row * a.ldy);
+      float4 r[MAXV];
+      float s = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        float4 vf = x4[lane + 32 * k];
+        r[k] = vf;
+        s += vf.x + vf.y + vf.z + vf.w;
+      }
+      float mean = simd_sum(s) * invC, v = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        float4 d = r[k] - mean;
+        v += dot(d, d);
+      }
+      float inv = rsqrt(simd_sum(v) * invC + a.eps);
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < MAXV; ++k) {
+        int c = lane + 32 * k;
+        float4 n = (r[k] - mean) * inv;
+        if (sc4) n *= sc4[c];
+        if (of4) n += of4[c];
+        y4[c] = n;
+      }
+      return;
+    }
     device half4* yh4 = (device half4*)(a.yh + row * a.ldy);
     if (a.xh) {
       device const half4* xh4 = (device const half4*)(a.xh + row * a.ldx);
@@ -362,14 +390,26 @@ LF_LN4(1) LF_LN4(2) LF_LN4(3) LF_LN4(4) LF_LN4(6) LF_LN4(8) LF_LN4(9) LF_LN4(12)
 // ---------------------------------------------------------------- conversions and elementwise (four a thread)
 kernel void lf_to_half(LF_ARGS(ConvArgs)) {
   ulong i = LF_INDEX * 4;
+  if (i + 4 <= a.n) {
+    *(device half4*)(a.y + i) = half4(*(device const float4*)(a.x + i));
+    return;
+  }
   for (int e = 0; e < 4; ++e) if (i + e < a.n) a.y[i + e] = (half)a.x[i + e];
 }
 kernel void lf_to_float(LF_ARGS(ConvBackArgs)) {
   ulong i = LF_INDEX * 4;
+  if (i + 4 <= a.n) {
+    *(device float4*)(a.y + i) = float4(*(device const half4*)(a.x + i));
+    return;
+  }
   for (int e = 0; e < 4; ++e) if (i + e < a.n) a.y[i + e] = (float)a.x[i + e];
 }
 kernel void lf_add(LF_ARGS(AddArgs)) {
   ulong i = LF_INDEX * 4;
+  if (i + 4 <= a.n) {
+    *(device float4*)(a.y + i) += a.a * *(device const float4*)(a.x + i);
+    return;
+  }
   for (int e = 0; e < 4; ++e) if (i + e < a.n) a.y[i + e] += a.a * a.x[i + e];
 }
 kernel void lf_add_bias(LF_ARGS(BiasArgs)) {

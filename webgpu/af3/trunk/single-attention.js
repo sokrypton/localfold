@@ -227,10 +227,8 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
 var<workgroup> act: array<${rowVec}, ${channels}>;
-var<workgroup> reduce_a: array<f32, ${projectLanes}>;
-${variance === "fast" ? `var<workgroup> reduce_b: array<f32, ${projectLanes}>;\n` : ""}\
-${vec4Rows ? `var<workgroup> row_mean: array<f32, 4>;
-var<workgroup> row_inverse_std: array<f32, 4>;\n` : ""}\
+var<workgroup> reduce_a: array<${rowVec}, ${projectLanes}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<${rowVec}, ${projectLanes}>;\n` : ""}\
 
 @compute @workgroup_size(${projectLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -239,57 +237,60 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let split = group.x % ${splits}u;
   if (token >= N) { return; }
   let local = local_id.x;
-${vec4Rows ? `  for (var t = 0u; t < 4u; t += 1u) {
-    let row = min(token + t, N - 1u);
-    let base = row * CHANNELS;
-    var total = 0.0;
-    ${variance === "fast" ? "var squares = 0.0;" : ""}
-    for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
-      let value = single[base + c];
-      total += value;
-      ${variance === "fast" ? "squares += value * value;" : ""}
-    }
-    reduce_a[local] = total;
-    ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
-    workgroupBarrier();
-    for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
-      if (local < stride) {
-        reduce_a[local] += reduce_a[local + stride];
-        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
-      }
-      workgroupBarrier();
-    }
-    let mean = reduce_a[0] / f32(CHANNELS);
-    ${variance === "fast"
-      ? "let variance = reduce_b[0] / f32(CHANNELS) - mean * mean;"
-      : `var centered = 0.0;
-    for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
-      let d = single[base + c] - mean;
-      centered += d * d;
-    }
-    workgroupBarrier();
-    reduce_a[local] = centered;
-    workgroupBarrier();
-    for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
-      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-      workgroupBarrier();
-    }
-    let variance = reduce_a[0] / f32(CHANNELS);`}
-    if (local == 0u) {
-      row_mean[t] = mean;
-      row_inverse_std[t] = inverseSqrt(variance + EPSILON);
+${vec4Rows ? `  let row_0 = min(token, N - 1u);
+  let row_1 = min(token + 1u, N - 1u);
+  let row_2 = min(token + 2u, N - 1u);
+  let row_3 = min(token + 3u, N - 1u);
+  let base_0 = row_0 * CHANNELS;
+  let base_1 = row_1 * CHANNELS;
+  let base_2 = row_2 * CHANNELS;
+  let base_3 = row_3 * CHANNELS;
+  var total = vec4<f32>(0.0);
+  ${variance === "fast" ? "var squares = vec4<f32>(0.0);" : ""}
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
+    let value = vec4<f32>(single[base_0 + c], single[base_1 + c], single[base_2 + c], single[base_3 + c]);
+    total += value;
+    ${variance === "fast" ? "squares += value * value;" : ""}
+  }
+  reduce_a[local] = total;
+  ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
+  workgroupBarrier();
+  for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
     }
     workgroupBarrier();
   }
+  let mean = reduce_a[0] / f32(CHANNELS);
+  ${variance === "fast"
+    ? "let variance = reduce_b[0] / f32(CHANNELS) - mean * mean;"
+    : `var centered = vec4<f32>(0.0);
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
+    let d = vec4<f32>(single[base_0 + c], single[base_1 + c], single[base_2 + c], single[base_3 + c]) - mean;
+    centered += d * d;
+  }
+  workgroupBarrier();
+  reduce_a[local] = centered;
+  workgroupBarrier();
+  for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+    workgroupBarrier();
+  }
+  let variance = reduce_a[0] / f32(CHANNELS);`}
+  let inv_0 = inverseSqrt(variance.x + EPSILON);
+  let inv_1 = inverseSqrt(variance.y + EPSILON);
+  let inv_2 = inverseSqrt(variance.z + EPSILON);
+  let inv_3 = inverseSqrt(variance.w + EPSILON);
+  workgroupBarrier();
   for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     let scale = ${wf("weights[W_NORM_SCALE + c]")};
     let offset = ${wf("weights[W_NORM_OFFSET + c]")};
-    var packed: vec4<f32>;
-${overRows((r) => `    {
-      let row_${r} = min(token + ${r}u, N - 1u);
-      packed.${"xyzw"[r]} = (single[row_${r} * CHANNELS + c] - row_mean[${r}u]) * row_inverse_std[${r}u] * scale + offset;
-    }`)}
-    act[c] = packed;
+    act[c] = vec4<f32>(
+      (single[base_0 + c] - mean.x) * inv_0 * scale + offset,
+      (single[base_1 + c] - mean.y) * inv_1 * scale + offset,
+      (single[base_2 + c] - mean.z) * inv_2 * scale + offset,
+      (single[base_3 + c] - mean.w) * inv_3 * scale + offset);
   }` : `  let base = token * CHANNELS;
 
   var total = 0.0;

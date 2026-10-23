@@ -131,12 +131,12 @@ kernel void af3_outer_sum(LF_ARGS(OuterSumArgs)) {
     uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
     ((device float4*)a.pair)[t] = ((device const float4*)a.left)[i * C4 + c4] +
                                   ((device const float4*)a.right)[j * C4 + c4] +
-                                  (a.add ? ((device const float4*)a.add)[t] : float4(0.f));
+                                  (a.add ? ((device const float4*)a.add)[a.addRow ? c4 : t] : float4(0.f));
     return;
   }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
-  a.pair[t] = a.left[i * a.C + c] + a.right[j * a.C + c] + (a.add ? a.add[t] : 0.f);
+  a.pair[t] = a.left[i * a.C + c] + a.right[j * a.C + c] + (a.add ? a.add[a.addRow ? c : t] : 0.f);
 }
 // AF3's relative encoding (139 one-hot columns: residue offset 66, token offset 66, same entity 1, chain offset 6)
 kernel void af3_relenc(LF_ARGS(RelEncArgs)) {
@@ -171,6 +171,20 @@ kernel void af3_relenc(LF_ARGS(RelEncArgs)) {
 }
 kernel void af3_bond_embed(LF_ARGS(BondEmbedArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.pairs * C4) return;
+    uint p = lf_udiv((uint)t, C4), c4 = (uint)t - p * C4;
+    float4 v = float4(0.f);
+    if (a.bonds && a.w) v += a.bonds[p] * ((device const float4*)a.w)[c4];
+    if (a.table) {
+      int o = a.orders ? (int)a.orders[p] : 0;
+      if (o < 0 || o >= 7) o = 0;
+      v += ((device const float4*)a.table)[o * C4 + c4] + ((device const float4*)a.unspecified)[c4];
+    }
+    ((device float4*)a.pair)[t] += v;
+    return;
+  }
   if (t >= a.pairs * a.C) return;
   uint p = lf_udiv((uint)t, a.C), c = (uint)t - p * a.C;
   float v = 0.f;
@@ -185,6 +199,20 @@ kernel void af3_bond_embed(LF_ARGS(BondEmbedArgs)) {
 // msa = one_hot(32) + clip(deletion) + atan(deletion / 3) 2 / pi (+ is_paired), projected, plus the target's projection
 kernel void af3_msa_embed(LF_ARGS(MsaEmbedArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.count * C4) return;
+    uint row = lf_udiv((uint)t, C4), c4 = (uint)t - row * C4, token = row - lf_udiv(row, a.n) * a.n;
+    int code = a.rows[row]; float d = a.del[row];
+    device const float4* W4 = (device const float4*)a.W;
+    float4 v = code >= 0 && code < 32 ? W4[code * C4 + c4] : float4(0.f);
+    v += clamp(d, 0.f, 1.f) * W4[32 * C4 + c4];
+    v += atan(d / 3.f) * (2.f / M_PI_F) * W4[33 * C4 + c4];
+    if (a.width > 34 && a.pairedQuery && row < a.n) v += W4[34 * C4 + c4];
+    if (a.dnMsa && a.isDna && code == 30 && a.isDna[token] != 0) v += ((device const float4*)a.dnMsa)[c4];      // boltz2's DN row
+    ((device float4*)a.msa)[t] = v + ((device const float4*)a.fromTarget)[token * C4 + c4];
+    return;
+  }
   if (t >= a.count * a.C) return;
   uint row = lf_udiv((uint)t, a.C), c = (uint)t - row * a.C, token = row - lf_udiv(row, a.n) * a.n;
   int code = a.rows[row]; float d = a.del[row];
@@ -248,6 +276,19 @@ kernel void af3_template_sparse_proj(LF_ARGS(SparseProjArgs)) {
 }
 kernel void af3_template_geometry(LF_ARGS(TmplGeomArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.pairs * C4) return;
+    uint p = lf_udiv((uint)t, C4), c4 = (uint)t - p * C4;
+    float4 v = float4(0.f);
+    int b = a.bin[p];
+    if (b >= 0) v += ((device const float4*)a.W0)[b * C4 + c4];
+    v += a.pb[p] * ((device const float4*)a.W1)[c4] + a.uv[p * 3] * ((device const float4*)a.W4)[c4] +
+         a.uv[p * 3 + 1] * ((device const float4*)a.W5)[c4] + a.uv[p * 3 + 2] * ((device const float4*)a.W6)[c4] +
+         a.bb[p] * ((device const float4*)a.W7)[c4];
+    ((device float4*)a.act)[t] += v;
+    return;
+  }
   if (t >= a.pairs * a.C) return;
   uint p = lf_udiv((uint)t, a.C), c = (uint)t - p * a.C;
   float v = 0.f;
@@ -2194,6 +2235,25 @@ kernel void af3_gather_esm(LF_ARGS(GatherEsmArgs)) {
 // ---------------------------------------------------------------- chai-1
 kernel void af3_chai_relenc(LF_ARGS(ChaiRelEncArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= (ulong)a.n * a.n * C4) return;
+    uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    bool sameChain = a.r.asym[i] == a.r.asym[j];
+    int rss = sameChain ? clamp(a.r.ri[i] - a.r.ri[j] + 33, 0, 65) : 66;
+    int rts = sameChain && a.r.ri[i] == a.r.ri[j] ? clamp(a.r.ti[i] - a.r.ti[j] + 32, 0, 65) : 66;
+    device const float4* W4 = (device const float4*)a.W;
+    float4 v = ((device const float4*)a.bias)[c4] + W4[rss * C4 + c4] + W4[(67 + rts) * C4 + c4];
+    if (a.ce) {
+      int relE = a.r.ent[i] - a.r.ent[j];
+      int rchain = relE != 0 ? 5 : clamp(a.r.sym[i] - a.r.sym[j] + 2, 0, 4), rent = clamp(relE + 1, 0, 2);
+      device const float4* ce4 = (device const float4*)a.ce;
+      v += ce4[rchain * C4 + c4] + ce4[(6 + rent) * C4 + c4];
+    }
+    if (a.bond && a.Wbond) v += a.bond[ij] * ((device const float4*)a.Wbond)[c4];
+    ((device float4*)a.pair)[t] += v;
+    return;
+  }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
   bool sameChain = a.r.asym[i] == a.r.asym[j];
@@ -2216,6 +2276,23 @@ kernel void af3_chai_chain_hit(LF_ARGS(ChaiChainHitArgs)) {
 }
 kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
   ulong t = LF_INDEX;
+  if ((a.C & 3) == 0) {
+    uint C4 = a.C >> 2;
+    if (t >= a.count * C4) return;
+    uint row = lf_udiv((uint)t, C4), c4 = (uint)t - row * C4, s = lf_udiv(row, a.n), token = row - s * a.n;
+    bool paired = s > 0 && s < a.pairedRows && a.msaMask[row] != 0.f && a.chainHit[s * a.chains + a.asym[token]] != 0
+               && a.chainHit[s * a.chains + a.asym[0]] != 0;
+    float d = a.del[row];
+    int code = a.rows[row];
+    if (a.isLigand && a.isLigand[token]) code = s == 0 ? 20 : 31;      // (chai's query row: unknown, the rest: its mask class)
+    device const float4* W4 = (device const float4*)a.W;
+    float4 v = ((device const float4*)a.bias)[c4] + (paired ? W4[c4] : float4(0.f)) +
+               W4[(1 + (s == 0 ? 4 : a.source ? a.source[s] : 2)) * C4 + c4] +
+               atan(d / 3.f) * (2.f / M_PI_F) * W4[7 * C4 + c4] + clamp(d, 0.f, 1.f) * W4[8 * C4 + c4] +
+               (code >= 0 && code < 32 ? W4[(9 + code) * C4 + c4] : float4(0.f));
+    ((device float4*)a.msa)[t] = v + ((device const float4*)a.fromSingle)[token * C4 + c4];
+    return;
+  }
   if (t >= a.count * a.C) return;
   uint row = lf_udiv((uint)t, a.C), c = (uint)t - row * a.C, s = lf_udiv(row, a.n), token = row - s * a.n;
   bool paired = s > 0 && s < a.pairedRows && a.msaMask[row] != 0.f && a.chainHit[s * a.chains + a.asym[token]] != 0
@@ -2230,6 +2307,18 @@ kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
 }
 kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
   ulong t = LF_INDEX;
+  if ((a.K & 3) == 0) {
+    uint K4 = a.K >> 2;
+    const ulong total4 = (ulong)a.S * a.n * a.G * K4;
+    if (t >= total4) return;
+    uint k4, i, s, g;
+    if (total4 <= 0xffffffffull) {
+      uint r = lf_udiv((uint)t, K4); k4 = (uint)t - r * K4; uint r2 = lf_udiv(r, a.n); i = r - r2 * a.n; g = lf_udiv(r2, a.S); s = r2 - g * a.S;
+    } else { k4 = (uint)(t % K4); ulong r = t / K4; i = (uint)(r % a.n); r /= a.n; s = (uint)(r % a.S); g = (uint)(r / a.S); }
+    ulong row = (ulong)s * a.n + i;
+    ((device float4*)a.out)[t] = ((device const float4*)a.x)[(row * a.G + g) * K4 + k4] * (a.mask ? a.mask[row] : 1.f);
+    return;
+  }
   const ulong total = (ulong)a.S * a.n * a.G * a.K;
   if (t >= total) return;
   uint k, i, s, g;   // (32-bit division where the index fits: the 64-bit one is slow)
@@ -2241,6 +2330,22 @@ kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
 }
 kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
   ulong t = LF_INDEX;
+  if ((a.K & 3) == 0) {
+    uint K4 = a.K >> 2;
+    ulong per4 = (ulong)a.G * a.K * K4;
+    const ulong total4 = (ulong)a.bi * a.n * per4;
+    if (t >= total4) return;
+    uint l4, k, g, j, i;
+    if (total4 <= 0xffffffffull) {
+      uint r = lf_udiv((uint)t, K4); l4 = (uint)t - r * K4; uint r2 = lf_udiv(r, a.K); k = r - r2 * a.K;
+      uint r3 = lf_udiv(r2, a.G); g = r2 - r3 * a.G; i = lf_udiv(r3, a.n); j = r3 - i * a.n;
+    } else {
+      l4 = (uint)(t % K4); ulong r = t / K4; k = (uint)(r % a.K); r /= a.K; g = (uint)(r % a.G); r /= a.G;
+      j = (uint)(r % a.n); i = (uint)(r / a.n);
+    }
+    ((device float4*)a.out)[t] = ((device const float4*)a.P)[(ulong)g * ((ulong)a.bi * a.K * a.n * K4) + (((ulong)i * a.K + k) * a.n + j) * K4 + l4];
+    return;
+  }
   ulong per = (ulong)a.G * a.K * a.K;
   const ulong total = (ulong)a.bi * a.n * per;
   if (t >= total) return;
@@ -2303,6 +2408,27 @@ kernel void af3_chai_token_feat(LF_ARGS(ChaiTokenFeatArgs)) {
 kernel void af3_chai_struct_pair(LF_ARGS(ChaiStructPairArgs)) {
   uint width = a.Czt + a.Cz;
   ulong t = LF_INDEX;
+  if ((a.Czt & 3) == 0 && (a.Cz & 3) == 0) {
+    uint width4 = width >> 2, Czt4 = a.Czt >> 2, Cz4 = a.Cz >> 2;
+    if (t >= a.rows * width4) return;
+    ulong row = t / width4; uint c4 = (uint)(t - row * width4);
+    ulong ij = a.p0 + row;
+    if (c4 < Czt4) { ((device float4*)a.out)[t] = ((device const float4*)a.trunkPair)[ij * Czt4 + c4]; return; }
+    c4 -= Czt4;
+    uint i = (uint)(ij / a.n), j = (uint)(ij - (ulong)i * a.n);
+    bool sameChain = a.asym[i] == a.asym[j];
+    int rss = sameChain ? clamp(a.ri[i] - a.ri[j] + 33, 0, 65) : 66;
+    int rts = sameChain && a.ri[i] == a.ri[j] ? clamp(a.ti[i] - a.ti[j] + 32, 0, 65) : 66;
+    int relEntity = a.entityRank[i] - a.entityRank[j];
+    int rchain = relEntity != 0 ? 5 : clamp(a.symRank[i] - a.symRank[j] + 2, 0, 4);
+    int rent = clamp(relEntity + 1, 0, 2);
+    device const float4* Wp4 = (device const float4*)a.Wp;
+    float4 v = ((device const float4*)a.bias)[c4] + Wp4[5 * Cz4 + c4] + Wp4[155 * Cz4 + c4] + Wp4[162 * Cz4 + c4] +
+               Wp4[(6 + rchain) * Cz4 + c4] + Wp4[(12 + rent) * Cz4 + c4] + Wp4[(15 + rss) * Cz4 + c4] + Wp4[(82 + rts) * Cz4 + c4];
+    if (a.bonds) v += a.bonds[ij] * ((device const float4*)a.Wb)[c4];
+    ((device float4*)a.out)[t] = v;
+    return;
+  }
   if (t >= a.rows * width) return;
   ulong row = t / width; uint c = (uint)(t - row * width);
   ulong ij = a.p0 + row;

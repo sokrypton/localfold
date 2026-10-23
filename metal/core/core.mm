@@ -754,7 +754,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 or 16 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
-    if (a.m == 256) { tm = a.n <= 128 ? 16 : 32; tn = 256; }
+    if (a.m == 256 || (a.m == 512 && !(a.epilogue & (64 | 8192 | 16384)))) { tm = a.m == 512 ? 32 : (a.n <= 128 ? 16 : 32); tn = 256; }
+    else if (a.m == 384 && !(a.epilogue & (64 | 8192 | 16384))) { tm = 64; tn = 128; }
     else if ((a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0) { tm = 32; tn = 256; }
     else if (a.m == 128 || ((a.epilogue & (8192 | 16384)) && a.m % 128 == 0)) { tm = 64; tn = 128; }
     else if (a.m == 64) { tm = 64; tn = 64; }
@@ -785,8 +786,13 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one tile wide
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
                       ((tm == 64 && tn == 64 && a.m == 64 && !hacc) ||
-                       (tm == 64 && tn == 128 && (a.m == 128 || ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)) && (!hacc || (a.epilogue & 16384))) ||
-                       ((tm == 32 || tm == 16) && tn == 256 && (a.m == 256 || (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc)) &&
+                       (tm == 64 && tn == 128 &&
+                        (a.m == 128 || (a.m == 384 && !(a.epilogue & (64 | 8192 | 16384))) ||
+                         ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)) &&
+                        (!hacc || (a.epilogue & 16384))) ||
+                       ((tm == 32 || tm == 16) && tn == 256 &&
+                        (a.m == 256 || (tm == 32 && a.m == 512 && !(a.epilogue & (64 | 8192 | 16384))) ||
+                         (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc)) &&
                       batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
@@ -801,7 +807,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   std::string name = std::string("gemmt_hh") + (tc_ == F32 ? "f" : "h") + "_" + std::to_string(tm) + "x" + std::to_string(tn) +
                      "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + "_e" + std::to_string(ep);
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor<" + targs + ">(constant GemmArgs&, uint3, uint);";
-  Grid grid{(uint32_t)((a.m + tn - 1) / tn), (uint32_t)((a.n + tm - 1) / tm), (uint32_t)batch};
+  const uint32_t gx = (lnEmit && !(a.epilogue & 8192)) ? 1u : (uint32_t)((a.m + tn - 1) / tn);
+  Grid grid{gx, (uint32_t)((a.n + tm - 1) / tm), (uint32_t)batch};
   std::string lab;
   if (D().profileOn) {
     char b[160]; snprintf(b, sizeof b, "%s %s %dx%dx%d%s", label ? label : "gemm", name.c_str() + 6, a.m, a.n, a.k, batch > 1 ? " batched" : "");
@@ -972,14 +979,14 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
     a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
     a.alpha = 1.f; a.epilogue = biasG ? 4 : 0; a.bias = (uint64_t)biasG;
     a.aux = (uint64_t)Xv; a.ldaux = in; a.aux2 = (uint64_t)Wv; a.aux3 = (uint64_t)biasV;
-    const bool ln = lnOut && lnWanted && out == tn && a16(lnOut) && a16(lnScale) && a16(lnOffset);
+    const bool ln = lnOut && lnWanted && (out == tn || out == 384 || out == 512) && a16(lnOut) && a16(lnScale) && a16(lnOffset);
     if (ln) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
     ++D().stats.gemms;
     std::string tile = std::to_string(tm) + "x" + std::to_string(tn) + (ln ? "" : "_nln");
     std::string targs = std::to_string(tm) + ", " + std::to_string(tn) + (tp == F16 ? ", half" : ", float") + (ln ? ", true" : ", false");
     std::string name = std::string(tp == F16 ? "gemmt_dualh_" : "gemmt_dual_") + tile;
     std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor_dual<" + targs + ">(constant GemmArgs&, uint3, uint);";
-    dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)(out / tn), (uint32_t)((rows + tm - 1) / tm), 1}, 128, 0,
+    dispatchInstance(name, decl, &a, sizeof a, Grid{ln ? 1u : (uint32_t)(out / tn), (uint32_t)((rows + tm - 1) / tm), 1}, 128, 0,
                      label ? label : "gated add, dual");
     return ln;
   }

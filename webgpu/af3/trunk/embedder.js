@@ -232,6 +232,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // One workgroup per token pair: left_i + right_j + the relative encoding's
   // gathered rows + the recycled pair. No pairs x 139 tensor anywhere.
+  const pairPerThread = pairChannels % 64 === 0 && pairChannels <= 512 && relative === "gather" ? pairChannels / 64 : 0;
+  const overPairThread = (body) => Array.from({ length: pairPerThread }, (_, b) => body(b)).join("\n");
+  const singlePerThread = singleChannels % 64 === 0 && singleChannels <= 512 ? singleChannels / 64 : 0;
+  const overSingleThread = (body) => Array.from({ length: singlePerThread }, (_, b) => body(b)).join("\n");
   const assemblePair = `${common}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
@@ -250,7 +254,7 @@ fn sym_id(t: u32) -> i32 { return features[4u * TOKENS + t]; }
 
 var<workgroup> normalized: array<f32, ${pairChannels}>;
 var<workgroup> reduce_a: array<f32, 64>;
-var<workgroup> reduce_b: array<f32, 64>;
+${variance === "fast" ? "var<workgroup> reduce_b: array<f32, 64>;\n" : ""}\
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -264,26 +268,26 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // The recycled pair, whose LayerNorm makes it nonzero even on pass one.
   var total = 0.0;
-  var squares = 0.0;
+  ${variance === "fast" ? "var squares = 0.0;" : ""}
   for (var c = local; c < C_Z; c += 64u) {
     let value = previous[base + c];
     total += value;
-    squares += value * value;
+    ${variance === "fast" ? "squares += value * value;" : ""}
   }
   reduce_a[local] = total;
-  reduce_b[local] = squares;
+  ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
   workgroupBarrier();
-  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 32u];" : ""} }
   workgroupBarrier();
-  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 16u];" : ""} }
   workgroupBarrier();
-  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 8u];" : ""} }
   workgroupBarrier();
-  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 4u];" : ""} }
   workgroupBarrier();
-  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 2u];" : ""} }
   workgroupBarrier();
-  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 1u];" : ""} }
   workgroupBarrier();
   let mean = reduce_a[0] / f32(C_Z);
   ${variance === "fast"
@@ -347,7 +351,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var entity_flag = 0.0;
   if (same_entity) { entity_flag = 1.0; }
 
-  for (var c = local; c < C_Z; c += 64u) {
+${pairPerThread > 0 ? `${overPairThread((b) => `  var recycled_${b} = 0.0;`)}
+  for (var k = 0u; k < C_Z; k += 1u) {
+    let nk = normalized[k];
+    let w_row = W_PREV + k * C_Z + local;
+${overPairThread((b) => `    recycled_${b} += nk * weights[w_row + ${b * 64}u];`)}
+  }
+  let bond_val = bonds[row];
+  ${offsets.tokenBondsTypeEmbed === undefined ? "" : "let bond_type_row = W_BOND_TYPE + u32(clamp(i32(bonds[PAIRS + row]), 0, 6)) * C_Z;"}
+${overPairThread((b) => `  {
+    let c = local + ${b * 64}u;
+    let relative_total = weights[row_a + c] + weights[row_b + c]
+      + entity_flag * weights[row_entity + c] + weights[row_c + c];
+    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled_${b} + relative_total
+      + bond_val * weights[W_BOND + c]
+${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[bond_type_row + c]
+      + weights[W_CONTACT_UNSPECIFIED + c]`};
+  }`)}` : `  for (var c = local; c < C_Z; c += 64u) {
     var recycled = 0.0;
     for (var k = 0u; k < C_Z; k += 1u) {
       recycled += normalized[k] * weights[W_PREV + k * C_Z + c];
@@ -379,7 +399,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[W_BOND_TYPE
           + u32(clamp(i32(bonds[PAIRS + row]), 0, 6)) * C_Z + c]
       + weights[W_CONTACT_UNSPECIFIED + c]`};
-  }
+  }`}
 }`;
 
   // The MSA track: a one-hot residue code plus two deletion scalars.
@@ -427,7 +447,7 @@ ${msaFeatureWidth > 34 && pairedQueryRow ? `    // boltz2's paired flag: column 
 
 var<workgroup> normalized: array<f32, ${singleChannels}>;
 var<workgroup> reduce_a: array<f32, 64>;
-var<workgroup> reduce_b: array<f32, 64>;
+${variance === "fast" ? "var<workgroup> reduce_b: array<f32, 64>;\n" : ""}\
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -438,26 +458,26 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base = token * C_S;
 
   var total = 0.0;
-  var squares = 0.0;
+  ${variance === "fast" ? "var squares = 0.0;" : ""}
   for (var c = local; c < C_S; c += 64u) {
     let value = previous[base + c];
     total += value;
-    squares += value * value;
+    ${variance === "fast" ? "squares += value * value;" : ""}
   }
   reduce_a[local] = total;
-  reduce_b[local] = squares;
+  ${variance === "fast" ? "reduce_b[local] = squares;" : ""}
   workgroupBarrier();
-  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 32u];" : ""} }
   workgroupBarrier();
-  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 16u];" : ""} }
   workgroupBarrier();
-  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 8u];" : ""} }
   workgroupBarrier();
-  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 4u];" : ""} }
   workgroupBarrier();
-  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 2u];" : ""} }
   workgroupBarrier();
-  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; ${variance === "fast" ? "reduce_b[local] += reduce_b[local + 1u];" : ""} }
   workgroupBarrier();
   let mean = reduce_a[0] / f32(C_S);
   ${variance === "fast"
@@ -496,7 +516,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var c = local; c < C_S; c += 64u) {
+${singlePerThread > 0 ? `${overSingleThread((b) => `  var value_${b} = 0.0;`)}
+  let tf_base = token * FEATURE_WIDTH;
+  for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
+    let tf = target_feat[tf_base + f];
+    let w_row = W_SINGLE + f * C_S + local;
+${overSingleThread((b) => `    value_${b} += tf * weights[w_row + ${b * 64}u];`)}
+  }
+  for (var k = 0u; k < C_S; k += 1u) {
+    let nk = normalized[k];
+    let w_row = W_PREV_SINGLE + k * C_S + local;
+${overSingleThread((b) => `    value_${b} += nk * weights[w_row + ${b * 64}u];`)}
+  }
+${overSingleThread((b) => `  single[base + local + ${b * 64}u] = value_${b};`)}` : `  for (var c = local; c < C_S; c += 64u) {
     var value = 0.0;
     for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
       value += target_feat[token * FEATURE_WIDTH + f] * weights[W_SINGLE + f * C_S + c];
@@ -505,7 +537,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       value += normalized[k] * weights[W_PREV_SINGLE + k * C_S + c];
     }
     single[base + c] = value;
-  }
+  }`}
 }`;
 
   return { projectTokens, projectSingleInit, assemblePair, assembleMsa, assembleSingle };

@@ -161,7 +161,8 @@ int main() {
     gemmGatedAdd(dX, dW, dA, dY, R, K, O);
     report("gated add", relRms(ref, download(dY, R * O)), 1e-3);
   }
-  for (int O : {128, 64, 256}) {   // the next LayerNorm emitted by the epilogue (two norms of the same rows): Y += X W, then LN(Y) twice
+  for (int O : {128, 64, 256, 384, 512}) {   // the next LayerNorm emitted by the epilogue (two norms of the same rows): Y += X W, then LN(Y) twice
+    if (O > 256 && !gemmTensorOps()) continue;
     size_t R = 300; int K = 256;
     auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), Y0 = randv(R * O), s1 = randv(O), o1 = randv(O), s2 = randv(O), o2 = randv(O);
     std::vector<double> y(R * O), ref1(R * O), ref2(R * O);
@@ -196,7 +197,8 @@ int main() {
       report(l2, relRms(ref2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
     } else { ++failures; printf("  emitted LayerNorm (C %d): FAIL (not taken)\n", O); }
   }
-  for (int O : {128, 64, 256}) {   // ...and by the triangle's fused tail: pair += Xv Wv sigmoid(Xg Wg), then LN(pair)
+  for (int O : {128, 64, 256, 384, 512}) {   // ...and by the triangle's fused tail: pair += Xv Wv sigmoid(Xg Wg), then LN(pair)
+    if (O > 256 && !gemmTensorOps()) continue;
     size_t R = 300; int K = O;
     auto Xg = randv(R * K), Wg = randv((size_t)K * O, 0.1f), Xv = randv(R * K), Wv = randv((size_t)K * O, 0.1f), Y0 = randv(R * O);
     auto s1 = randv(O), o1 = randv(O);
