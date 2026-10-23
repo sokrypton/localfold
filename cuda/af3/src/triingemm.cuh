@@ -15,10 +15,13 @@
 #pragma once
 #include "fused256.cuh"
 
-// LN of the padded plane's rows into f16 (a padding row is LN(0) = the offset, as triIn256K computes it)
+// LN of the padded plane's rows into f16 (a padding row is LN(0) = the offset, as triIn256K computes it);
+// 8/16-byte vectorised loads and stores for K % 4 == 0 (C 384/512 in bf16 or float: opendde lnPlaneK<384> 9.3 -> 7.7 ms,
+// intellifold2 lnPlaneK<512> 43.7 -> 41.4 ms on 5CAJ)
 template <int C, class PT>
-__global__ void lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, const float* __restrict__ sc,
-                         const float* __restrict__ of) {
+__global__ void __launch_bounds__(256, 6)
+lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, const float* __restrict__ sc,
+         const float* __restrict__ of) {
   constexpr int K = C / 32;
   size_t q = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5), pp = (size_t)np * np;
   int lane = threadIdx.x & 31;
@@ -26,6 +29,56 @@ __global__ void lnPlaneK(const float* __restrict__ pair, half* __restrict__ out,
   unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
   bool real = i < (unsigned)n && j < (unsigned)n;
   size_t pr = (size_t)i * n + j;
+  if constexpr (K % 4 == 0) {
+    constexpr int VEC = (!std::is_same_v<PT, float> && K % 8 == 0) ? 8 : 4, KK = K / VEC;
+    using InVT = std::conditional_t<std::is_same_v<PT, float>, float4, std::conditional_t<VEC == 8, uint4, uint2>>;
+    using OutVT = std::conditional_t<VEC == 8, uint4, uint2>;
+    float v[K], s = 0.f;
+    if (real) {
+      const PT* xp = reinterpret_cast<const PT*>(pair) + pr * C;
+#pragma unroll
+      for (int kk = 0; kk < KK; ++kk) {
+        InVT w = *reinterpret_cast<const InVT*>(xp + (lane + 32 * kk) * VEC);
+        if constexpr (std::is_same_v<PT, float>) {
+          v[kk * 4 + 0] = w.x; v[kk * 4 + 1] = w.y; v[kk * 4 + 2] = w.z; v[kk * 4 + 3] = w.w;
+          s += w.x + w.y + w.z + w.w;
+        } else {
+          const PT* h = reinterpret_cast<const PT*>(&w);
+#pragma unroll
+          for (int e = 0; e < VEC / 2; ++e) {
+            float2 f = ld2f(h + 2 * e);
+            v[kk * VEC + 2 * e] = f.x; v[kk * VEC + 2 * e + 1] = f.y;
+            s += f.x + f.y;
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < K; ++k) v[k] = 0.f;
+    }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / C, qd = 0.f;
+#pragma unroll
+    for (int k = 0; k < K; ++k) { float d = v[k] - mean; qd += d * d; }
+    for (int o = 16; o; o >>= 1) qd += __shfl_xor_sync(~0u, qd, o);
+    float inv = rsqrtf(qd / C + 1e-5f);
+    half* yp = out + q * C;
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk) {
+      int ch = (lane + 32 * kk) * VEC;
+      OutVT o4; half2* oh = reinterpret_cast<half2*>(&o4);
+#pragma unroll
+      for (int e = 0; e < VEC / 4; ++e) {
+        float4 sc4 = __ldg(reinterpret_cast<const float4*>(sc + ch + 4 * e));
+        float4 of4 = __ldg(reinterpret_cast<const float4*>(of + ch + 4 * e));
+        int b = kk * VEC + 4 * e;
+        oh[2 * e]     = __floats2half2_rn((v[b] - mean) * inv * sc4.x + of4.x, (v[b + 1] - mean) * inv * sc4.y + of4.y);
+        oh[2 * e + 1] = __floats2half2_rn((v[b + 2] - mean) * inv * sc4.z + of4.z, (v[b + 3] - mean) * inv * sc4.w + of4.w);
+      }
+      *reinterpret_cast<OutVT*>(yp + ch) = o4;
+    }
+    return;
+  }
   float v[K], s = 0.f;
 #pragma unroll
   for (int k = 0; k < K; ++k) { v[k] = real ? pairLd<PT>(pair, pr * C + lane + 32 * k) : 0.f; s += v[k]; }

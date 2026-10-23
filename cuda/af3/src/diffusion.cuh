@@ -569,12 +569,11 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
     int c = threadIdx.x * 8;
     float4 x0 = *(const float4*)(act + (size_t)r * 768 + c);
     float4 x1 = *(const float4*)(act + (size_t)r * 768 + c + 4);
-    uint4 sc8, sh8;
+    uint4 sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
+    uint4 sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
     if (y) {
       uint4 yy8 = __ldg(reinterpret_cast<const uint4*>(y + (size_t)r * 768 + c));
       uint4 g8 = __ldg(reinterpret_cast<const uint4*>(gate + (size_t)pr * ldg + c));
-      sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
-      sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
       const half2* y2 = (const half2*)&yy8; const half2* g2 = (const half2*)&g8;
       float2 y0 = __half22float2(y2[0]), y1 = __half22float2(y2[1]), y2_ = __half22float2(y2[2]), y3 = __half22float2(y2[3]);
       float2 g0 = __half22float2(g2[0]), g1 = __half22float2(g2[1]), g2_ = __half22float2(g2[2]), g3 = __half22float2(g2[3]);
@@ -583,9 +582,6 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
       *(float4*)(act + (size_t)r * 768 + c) = u0;
       *(float4*)(act + (size_t)r * 768 + c + 4) = u1;
       if (!noRes) { x0 = u0; x1 = u1; }
-    } else {
-      sc8 = __ldg(reinterpret_cast<const uint4*>(scale + (size_t)pr * lds + c));
-      sh8 = __ldg(reinterpret_cast<const uint4*>(shift + (size_t)pr * lds + c));
     }
     float s = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w);
     float ss = (x0.x * x0.x + x0.y * x0.y + x0.z * x0.z + x0.w * x0.w) +
@@ -999,11 +995,48 @@ inline void prepareTransformer(const float* pairCond, int n) {
 }
 
 // q and k LayerNormed over each token's whole heads x dimension row, two-pass, scale and offset
-// (rf3's kq_norm: after the projection and its bias, before the key_dim scaling); a block per row
+// (rf3's kq_norm: after the projection and its bias, before the key_dim scaling); a block per row.
+// At Wd 768 in f16 (NW 6), 96 threads (3 warps) read/write 8 halves (uint4, 16 bytes) a lane with float4 __ldg
+// scale/offset/qBias, halving the shared-memory reduction from 6 warps to 3 (rosettafold3 diffusion 470.5 -> 457.2 ms on 5CAJ)
 template <class T, int NW = 0>
-__global__ void __launch_bounds__(NW ? NW * 32 : 1024, NW == 6 ? 8 : 1)
+__global__ void __launch_bounds__((NW == 6 && std::is_same_v<T, half>) ? 96 : (NW ? NW * 32 : 1024), NW == 6 ? 8 : 1)
 kqNormVecK(T* __restrict__ qkvg, const float* __restrict__ qBias, const float* __restrict__ qs,
            const float* __restrict__ qo, const float* __restrict__ ks, const float* __restrict__ ko, int Wd) {
+  if constexpr (NW == 6 && std::is_same_v<T, half>) {
+    __shared__ float2 red3[3];
+    int side = blockIdx.y, tx = threadIdx.x, c = tx * 8;
+    half* row = qkvg + ((size_t)blockIdx.x * 4 + side) * 768;
+    const float* sc = side ? ks : qs;
+    const float* of = side ? ko : qo;
+    uint4 x8 = *reinterpret_cast<const uint4*>(row + c);
+    float4 s0 = __ldg(reinterpret_cast<const float4*>(sc + c)), s1 = __ldg(reinterpret_cast<const float4*>(sc + c + 4));
+    float4 o0 = __ldg(reinterpret_cast<const float4*>(of + c)), o1 = __ldg(reinterpret_cast<const float4*>(of + c + 4));
+    const half2* xh = reinterpret_cast<const half2*>(&x8);
+    float2 x0 = __half22float2(xh[0]), x1 = __half22float2(xh[1]), x2 = __half22float2(xh[2]), x3 = __half22float2(xh[3]);
+    if (!side && qBias) {
+      float4 qb0 = __ldg(reinterpret_cast<const float4*>(qBias + c)), qb1 = __ldg(reinterpret_cast<const float4*>(qBias + c + 4));
+      x0 = __half22float2(__floats2half2_rn(x0.x + qb0.x, x0.y + qb0.y));
+      x1 = __half22float2(__floats2half2_rn(x1.x + qb0.z, x1.y + qb0.w));
+      x2 = __half22float2(__floats2half2_rn(x2.x + qb1.x, x2.y + qb1.y));
+      x3 = __half22float2(__floats2half2_rn(x3.x + qb1.z, x3.y + qb1.w));
+    }
+    float s = (x0.x + x0.y + x1.x + x1.y) + (x2.x + x2.y + x3.x + x3.y);
+    float ss = (x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y) +
+               (x2.x * x2.x + x2.y * x2.y + x3.x * x3.x + x3.y * x3.y);
+    for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+    if ((tx & 31) == 0) red3[tx >> 5] = make_float2(s, ss);
+    __syncthreads();
+    float2 r0 = red3[0], r1 = red3[1], r2 = red3[2];
+    float invW = 1.f / 768.f, m = (r0.x + r1.x + r2.x) * invW;
+    float inv = rsqrtf(fmaxf((r0.y + r1.y + r2.y) * invW - m * m, 0.f) + 1e-5f);
+    uint4 o8; half2* oh = reinterpret_cast<half2*>(&o8);
+    oh[0] = __floats2half2_rn((x0.x - m) * inv * s0.x + o0.x, (x0.y - m) * inv * s0.y + o0.y);
+    oh[1] = __floats2half2_rn((x1.x - m) * inv * s0.z + o0.z, (x1.y - m) * inv * s0.w + o0.w);
+    oh[2] = __floats2half2_rn((x2.x - m) * inv * s1.x + o1.x, (x2.y - m) * inv * s1.y + o1.y);
+    oh[3] = __floats2half2_rn((x3.x - m) * inv * s1.z + o1.z, (x3.y - m) * inv * s1.w + o1.w);
+    *reinterpret_cast<uint4*>(row + c) = o8;
+    return;
+  }
   __shared__ float2 red[NW ? NW : 32];
   int side = blockIdx.y, tx = threadIdx.x, c = tx * 4, nw = NW ? NW : (int)(blockDim.x >> 5), WW = NW ? NW * 128 : Wd;
   T* row = qkvg + ((size_t)blockIdx.x * 4 + side) * WW;
@@ -1243,7 +1276,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     bool kqNorm = hasW(B + ".queryLayerNormScale");
     if (kqNorm && krows) {
       if (Wd == 768)
-        kqNormVecK<T, 6><<<dim3((unsigned)krows, 2), 192, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".qBias"), W(B + ".queryLayerNormScale"),
+        kqNormVecK<T, 6><<<dim3((unsigned)krows, 2), std::is_same_v<T, half> ? 96u : 192u, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".qBias"), W(B + ".queryLayerNormScale"),
           W(B + ".queryLayerNormOffset"), W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), 768);
       else if (Wd == 384)
         kqNormVecK<T, 3><<<dim3((unsigned)krows, 2), 96, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".qBias"), W(B + ".queryLayerNormScale"),

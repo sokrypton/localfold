@@ -1333,11 +1333,15 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       constexpr int WU = 8, R = 16 * WU;
-      // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
-      size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(C), std::max<size_t>(R, CHUNK / (2 * I)));
       const half* w1t = transitionW1Tiles<false>(Wh(pre + ".transition1"), C, I, 32);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
+        // whole waves of transitionUpK<CC, WU> inside a 512M-element budget where the card has the room (as ef2's
+        // transition256): at 261 tokens (5CAJ) the 32M-element CHUNK/2 budget split each transition into 3 chunks
+        // (624 GEMMs a fold), where 512M runs every block unchunked (208 GEMMs; opendde transition2 100.5 -> 70.8 ms
+        // and transitionUpK<384> 56.1 -> 45.0 ms, protenix2 transition 70.4 -> 61.6 ms)
+        const size_t budget = roomFor((size_t)1 << 30, {"tr.gated", "tr.gatedbf"}) ? (size_t)1 << 29 : CHUNK / 2;
+        size_t rowsPer = transitionUpChunkRows<CC, WU>(wideUpSmem(CC), std::max<size_t>(R, budget / I));
         if (PAIR16) {
           // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
           // pair - no f16 product and add pass
@@ -1500,7 +1504,7 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
 // projected on the tensor cores to 16 padded heads, head-major (out[h][row]) - where cuBLAS took the
 // few-column GEMM as a 16x16 WMMA kernel that read the whole normed pair back.
 template <int C, int WARPS, class PT = float,
-          int MINB = C <= 64 ? 6 : C == 128 ? 5 : C == 256 ? 4 : C == 384 ? 2 : 1>
+          int MINB = C <= 64 ? 6 : C == 128 ? 5 : C == 256 ? 4 : C == 384 ? 3 : 2>
 __global__ void __launch_bounds__(WARPS * 32, MINB) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
     const float* __restrict__ offset, const half* __restrict__ Wp, half* __restrict__ norm, float* __restrict__ out,
     size_t rows, int heads, int ntr) {
@@ -1520,12 +1524,89 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) lnNormHeadsK(const float* __
     }
   }
   cpCommit();
+  constexpr int B = C >= 384 ? 4 : 8;
+  // C >= 256: 8/16-byte vectorised global loads (uint4 at C 256/512, uint2 at C 384, float4 when PT is float),
+  // swizzled shared stores (swX only touches bits 3..5 of c, so 4/8-half chunks stay contiguous) and global norm
+  // stores, with MINB 3 at C 384 and 2 at C 512 (5CAJ: protenix2 35.4 -> 31.3 ms, opendde 25.4 -> 22.2 ms,
+  // intellifold2 68.1 -> 61.3 ms)
+  if constexpr (C >= 256 && (K % 4 == 0)) {
+    constexpr int VEC = (!std::is_same_v<PT, float> && K % 8 == 0) ? 8 : 4, KK = K / VEC;
+    using InVT = std::conditional_t<std::is_same_v<PT, float>, float4, std::conditional_t<VEC == 8, uint4, uint2>>;
+    using OutVT = std::conditional_t<VEC == 8, uint4, uint2>;
+    float sc[K], of[K];
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk) {
+      int ch = (lane + 32 * kk) * VEC;
+#pragma unroll
+      for (int e = 0; e < VEC / 4; ++e) {
+        *reinterpret_cast<float4*>(sc + kk * VEC + 4 * e) = __ldg(reinterpret_cast<const float4*>(scale + ch + 4 * e));
+        *reinterpret_cast<float4*>(of + kk * VEC + 4 * e) = __ldg(reinterpret_cast<const float4*>(offset + ch + 4 * e));
+      }
+    }
+    const bool full = row0 + R <= rows;
+#pragma unroll 1
+    for (int i0 = 0; i0 < 16; i0 += B) {
+      InVT w[B][KK];
+#pragma unroll
+      for (int b = 0; b < B; ++b) {
+        size_t row = row0 + warp * 16 + i0 + b;
+        bool live = full || row < rows;
+        const PT* xp = reinterpret_cast<const PT*>(x) + (live ? row * C : 0);
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk)
+          w[b][kk] = live ? *reinterpret_cast<const InVT*>(xp + (lane + 32 * kk) * VEC) : InVT{};
+      }
+#pragma unroll
+      for (int b = 0; b < B; ++b) {
+        int r = warp * 16 + i0 + b;
+        size_t row = row0 + r, wrow = row;
+        bool live = full || row < rows;
+        if (ntr) {
+          unsigned ru = (unsigned)row, nu = (unsigned)ntr, qi = ru / nu;
+          wrow = (size_t)(ru - qi * nu) * nu + qi;
+        }
+        float v[K], s = 0.f, ss = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+          if constexpr (std::is_same_v<PT, float>) {
+            v[kk * 4 + 0] = w[b][kk].x; v[kk * 4 + 1] = w[b][kk].y;
+            v[kk * 4 + 2] = w[b][kk].z; v[kk * 4 + 3] = w[b][kk].w;
+            s += w[b][kk].x + w[b][kk].y + w[b][kk].z + w[b][kk].w;
+            ss += w[b][kk].x * w[b][kk].x + w[b][kk].y * w[b][kk].y + w[b][kk].z * w[b][kk].z + w[b][kk].w * w[b][kk].w;
+          } else {
+            const PT* h = reinterpret_cast<const PT*>(&w[b][kk]);
+#pragma unroll
+            for (int e = 0; e < VEC / 2; ++e) {
+              float2 f = ld2f(h + 2 * e);
+              v[kk * VEC + 2 * e] = f.x; v[kk * VEC + 2 * e + 1] = f.y;
+              s += f.x + f.y; ss += f.x * f.x + f.y * f.y;
+            }
+          }
+        }
+        for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+        float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+          int ch = (lane + 32 * kk) * VEC;
+          OutVT o4 = OutVT{};
+          if (live) {
+            half2* oh = reinterpret_cast<half2*>(&o4);
+#pragma unroll
+            for (int e = 0; e < VEC / 2; ++e) {
+              int idx = kk * VEC + 2 * e;
+              oh[e] = __floats2half2_rn((v[idx] - mean) * inv * sc[idx] + of[idx],
+                                        (v[idx + 1] - mean) * inv * sc[idx + 1] + of[idx + 1]);
+            }
+          }
+          *reinterpret_cast<OutVT*>(Xs + swX(r, ch)) = o4;
+          if (norm && live) *reinterpret_cast<OutVT*>(norm + wrow * C + ch) = o4;
+        }
+      }
+    }
+  } else {
   float sc[K], of[K];
 #pragma unroll
   for (int k = 0; k < K; ++k) { sc[k] = __ldg(scale + lane + 32 * k); of[k] = __ldg(offset + lane + 32 * k); }
-  // the warp's own 16 rows, eight in flight (Chai-1 at 255 tokens: 32.8 -> 28.1 ms over a fold's 320 calls at
-  // four, 16 no better; four at 384 and 512 channels, where eight rows exceed 128 registers)
-  constexpr int B = C >= 384 ? 4 : 8;
   if (row0 + R <= rows) {
 #pragma unroll 1
     for (int i0 = 0; i0 < 16; i0 += B) {
@@ -1594,6 +1675,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) lnNormHeadsK(const float* __
         }
       }
     }
+  }
   }
   cpWait<0>();
   __syncthreads();
@@ -1671,14 +1753,16 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   size_t pairs = (size_t)n * n; int Wd = heads * D;
   if constexpr (std::is_same_v<T, half>) {
     // three fused kernels (fusedtriangle.cuh): LN + the bias projection (head-major), then per
-    // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place), the flash
-    // kernel, and the output projection added into the pair
-    if (FUSED_GRID && C == 128 && !skipFused("grid") && Wd == 128 && heads <= 16 && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && !hasW(pre + ".gatingQueryBias") &&
-        !hasW(pre + ".outputProjectionBias")) {
+    // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place, with gatingQueryBias
+    // on the gate quarter), the flash kernel, and the output projection (with outputProjectionBias) added into
+    // the pair (RoseTTAFold3 on 5CAJ: trunk 385.5 -> 295.2 ms warm / 428.4 -> 344.3 ms cold, -90.3 ms / -23.4%)
+    if (FUSED_GRID && C == 128 && !skipFused("grid") && Wd == 128 && heads <= 16 && gridFusedFits() && !RESIDUAL_UNTRANSPOSED) {
       int stride = (n + 7) / 8 * 8;
       half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
       std::string qkvg = qkvgWeight(pre, C, Wd, true);
       std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
+      const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
+      const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
       float scale = 1.f / sqrtf((float)D);
       // FP8 attention where the card has it (flash8Run): k and v written e4m3 by the projection, the f16 kernel's
       // k and v never written
@@ -1699,15 +1783,15 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
         uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", pairs * 2 * Wd) : nullptr;
-        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8);
+        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8, gateBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
         if (f8) flash8Run(qkvgOut, kv8, kv8 + pairs * Wd, bias, stride, gathered, n, heads, n, scale, nullptr);
         else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
         // (a bf16 pair takes the output kernel in both directions, adding its f32 accumulators into the pair: the
         // GEMM into f16 and an add pass - cuBLAS takes no f16-in, bf16-out GEMM - were 0.8% more of a 988-token trunk,
         // and an f16 rounding more; 5CAJ with its alignment 0.009 A, 1BRS templated 0.008 A from that form)
-        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
-        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr);
+        if (!tr && !PAIR16 && !outBias) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr, outBias);
         return;
       }
       if (shortPair(pairs, C)) {
@@ -1734,19 +1818,20 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       if (!BIG_FORCED) {
         size_t f, t; deviceMemInfo(&f, &t);
         size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
-        R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
+        size_t maxR = std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+        R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
       }
       int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
       for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
         size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
         half* qkvgOut = scratch<half>("grid.qkvg", (std::min(R, (size_t)n) * n + 128) * 4 * Wd);   // padding: the last query block
         uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min(R, (size_t)n) * n * 2 * Wd) : nullptr;
-        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8);
+        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8, gateBias);
         half* gathered = scratch<half>("grid.gathered", std::min(R, (size_t)n) * n * Wd);
         if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
         else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
-        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
+        if (!tr && !PAIR16 && !outBias) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr, outBias);
       }
       releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });   // (the next triangle's blocks size themselves by what is free)
       if (mg::splitting(pair)) mg::exchange(tr, n, C, PAIR16 ? 2 : 4, n, 1);
@@ -1795,12 +1880,15 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
   size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
-  // as many rows a chunk (up to 256) as what is free allows, as the fused form's: 64M elements is 31 rows at 8,300 tokens,
-  // the template stack's attention 1,072 launches a pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks)
+  // as many rows a chunk (up to max(256, 512K / n)) as what is free allows, as the fused form's: 64M elements is 31 rows
+  // at 8,300 tokens, the template stack's attention 1,072 launches a pass, and capping at 256 split n = 261 (5CAJ, Wd 256)
+  // into 256 + 5 rows and OpenDDE's n = 522 structural subtokens into 256 + 256 + 10 rows (protenix2 trunk 747.8 -> 704.3 ms,
+  // opendde trunk 1288.2 -> 1228.1 ms, intellifold2 trunk 1937.3 -> 1891.9 ms; LOCALFOLD_BIG=1 keeps the 64M-element chunks)
   if (!BIG_FORCED) {
     size_t f, t; deviceMemInfo(&f, &t);
     size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8)), spare = f > t / 16 ? f - t / 16 : 0;
-    R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
+    size_t maxR = std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+    R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
   }
   float scale = 1.f / sqrtf((float)D);
   int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)

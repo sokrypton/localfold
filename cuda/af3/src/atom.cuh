@@ -1401,11 +1401,10 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
 // rf3's chirality signal: per atom, d/dx of sum over its centres of (improper dihedral - ideal)^2,
 // a central difference in double over each of the atom's (centre, corner) entries - an inverted
 // index built once, so each atom sums its own terms (deterministic, no atomics). Transcribed from
-// shared/af3/diffusion/chiral-gradient.js.
-__device__ double improperDihedral(const double* a, const double* b, const double* c, const double* d) {
+// shared/af3/diffusion/chiral-gradient.js; b0, b1, b2 formed directly from the perturbed differences
+// without staging 4 x 3 unperturbed and 4 x 3 perturbed double coordinates per thread.
+__device__ double improperDihedralB(const double* b0, const double* b1, const double* b2) {
   const double eps = 1e-6;
-  double b0[3], b1[3], b2[3];
-  for (int k = 0; k < 3; ++k) { b0[k] = a[k] - b[k]; b1[k] = c[k] - b[k]; b2[k] = d[k] - c[k]; }
   double length = sqrt(b1[0] * b1[0] + b1[1] * b1[1] + b1[2] * b1[2]) + eps;
   double invLen = 1.0 / length;
   double n[3] = {b1[0] * invLen, b1[1] * invLen, b1[2] * invLen};
@@ -1431,19 +1430,18 @@ __global__ void __launch_bounds__(128, 8) chiralGradK(const float* __restrict__ 
     double ideal = angles[centre];
     if (ideal == 0) continue;
     const int* c4 = centers + centre * 4;
-    double p0[3], p1[3], p2[3], p3[3];
-#pragma unroll
-    for (int j = 0; j < 3; ++j) {
-      p0[j] = x[(size_t)c4[0] * 3 + j]; p1[j] = x[(size_t)c4[1] * 3 + j];
-      p2[j] = x[(size_t)c4[2] * 3 + j]; p3[j] = x[(size_t)c4[3] * 3 + j];
-    }
     double d0 = corner == 0 ? step : 0.0, d1 = corner == 1 ? step : 0.0;
     double d2 = corner == 2 ? step : 0.0, d3 = corner == 3 ? step : 0.0;
-    double q0[3] = { p0[0] + (a == 0 ? d0 : 0.0), p0[1] + (a == 1 ? d0 : 0.0), p0[2] + (a == 2 ? d0 : 0.0) };
-    double q1[3] = { p1[0] + (a == 0 ? d1 : 0.0), p1[1] + (a == 1 ? d1 : 0.0), p1[2] + (a == 2 ? d1 : 0.0) };
-    double q2[3] = { p2[0] + (a == 0 ? d2 : 0.0), p2[1] + (a == 1 ? d2 : 0.0), p2[2] + (a == 2 ? d2 : 0.0) };
-    double q3[3] = { p3[0] + (a == 0 ? d3 : 0.0), p3[1] + (a == 1 ? d3 : 0.0), p3[2] + (a == 2 ? d3 : 0.0) };
-    double val = improperDihedral(q0, q1, q2, q3) - ideal;
+    double b0[3], b1[3], b2[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      double q0 = (double)x[(size_t)c4[0] * 3 + j] + (a == j ? d0 : 0.0);
+      double q1 = (double)x[(size_t)c4[1] * 3 + j] + (a == j ? d1 : 0.0);
+      double q2 = (double)x[(size_t)c4[2] * 3 + j] + (a == j ? d2 : 0.0);
+      double q3 = (double)x[(size_t)c4[3] * 3 + j] + (a == j ? d3 : 0.0);
+      b0[j] = q0 - q1; b1[j] = q2 - q1; b2[j] = q3 - q2;
+    }
+    double val = improperDihedralB(b0, b1, b2) - ideal;
     double mid = __shfl_sync(~0u, val, 3, 4);
     if (a < 3) {
       double derivative = (val * val - mid * mid) * invStep;
