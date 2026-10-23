@@ -39,7 +39,11 @@ __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out,
   for (int a = 0; a < 3; ++a) out[t * 3 + a] = g[a];
 }
 // IPA logits -> attention weights, a warp a (query, head): logits[q, k, h] then softmax over k
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__global__ void __launch_bounds__(256, 3)
+#else
 __global__ void __launch_bounds__(256, 4)
+#endif
 ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const float* __restrict__ qp,
             const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
             const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {

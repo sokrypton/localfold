@@ -149,8 +149,9 @@ template <class TH> inline void linearHalf(const float* X, const float* Wt, floa
 inline void linear(const float* X, const float* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
                    int ldx = 0, int ldy = 0, float alpha = 1.f, bool wide = false) {
   if (GEMM_HALF && in >= 16 && out >= 16) {
-    if (wide) linearHalf<__nv_bfloat16>(X, Wt, Y, rows, in, out, beta, ldx, ldy, alpha);
-    else linearHalf<half>(X, Wt, Y, rows, in, out, beta, ldx, ldy, alpha);
+    if (wide && ccMajor() >= 8) linearHalf<__nv_bfloat16>(X, Wt, Y, rows, in, out, beta, ldx, ldy, alpha);
+    else if (!wide) linearHalf<half>(X, Wt, Y, rows, in, out, beta, ldx, ldy, alpha);
+    else CB(cublasSgemm(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, Wt, in, X, ldx ? ldx : in, &beta, Y, ldy ? ldy : out));
     return;
   }
   CB(cublasSgemm(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, Wt, in, X, ldx ? ldx : in, &beta, Y,

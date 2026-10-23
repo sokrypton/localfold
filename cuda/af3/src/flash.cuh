@@ -662,24 +662,25 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
       if (i < QN) *reinterpret_cast<uint4*>(out + outAt(i) + c) = *reinterpret_cast<const uint4*>(G + rq * LDK + c);
     }
     return;
-  }
-  // gates read first and stored as pairs: with a store between every load the compiler
-  // cannot reorder (out may alias qkvg) and the epilogue was 24 serial round trips, 10 us
-  half2 ga[D / 8], gb[D / 8];
+  } else {
+    // gates read first and stored as pairs: with a store between every load the compiler
+    // cannot reorder (out may alias qkvg) and the epilogue was 24 serial round trips, 10 us
+    half2 ga[D / 8], gb[D / 8];
 #pragma unroll
-  for (int et = 0; et < D / 8; ++et) {
-    int e = et * 8 + tig * 2;
-    ga[et] = i0 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
-    gb[et] = i1 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
-  }
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      ga[et] = i0 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
+      gb[et] = i1 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
+    }
 #pragma unroll
-  for (int et = 0; et < D / 8; ++et) {
-    int e = et * 8 + tig * 2;
-    float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-    if (i0 < QN) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
-        __floats2half2_rn(o[et][0] * inv0 * sigm(a.x), o[et][1] * inv0 * sigm(a.y));
-    if (i1 < QN) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
-        __floats2half2_rn(o[et][2] * inv1 * sigm(b2.x), o[et][3] * inv1 * sigm(b2.y));
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
+      if (i0 < QN) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
+          __floats2half2_rn(o[et][0] * inv0 * sigm(a.x), o[et][1] * inv0 * sigm(a.y));
+      if (i1 < QN) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
+          __floats2half2_rn(o[et][2] * inv1 * sigm(b2.x), o[et][3] * inv1 * sigm(b2.y));
+    }
   }
 }
 

@@ -433,7 +433,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     size_t n = P * C;
     ef2AddBf16K<<<blocks((n & 3) == 0 ? (n >> 2) : n), 256, 0, STREAM>>>(z, p16, n);
   } else {
-    float* stack = tight ? z : scratch<float>("cf.stack", P * C);
+    float* stack = tight ? z : scratch<float>("trunk.stack", P * C);
     static float* heldBuf = nullptr; static size_t heldHave = 0;     // (pinned, kept for the process, grown as needed)
     if (tight && heldHave < P * C) {
       if (heldBuf) CK(cudaFreeHost(heldBuf));

@@ -525,17 +525,18 @@ centerNormK(const float* __restrict__ prod, TO* __restrict__ out, size_t r0, siz
         o3[c] = fromF<TO>((tc[24] - m3) * iv3 * sc + of);
       }
       return;
-    }
+    } else {
 #pragma unroll 4
-    for (int c = tx; c < CC; c += 32) {
-      float sc = __ldg(scale + c), of = __ldg(offset + c);
-      const float* tc = T_ + c * 33 + ty;
-      o0[c] = fromF<TO>((tc[0] - m0) * iv0 * sc + of);
-      o1[c] = fromF<TO>((tc[8] - m1) * iv1 * sc + of);
-      o2[c] = fromF<TO>((tc[16] - m2) * iv2 * sc + of);
-      o3[c] = fromF<TO>((tc[24] - m3) * iv3 * sc + of);
+      for (int c = tx; c < CC; c += 32) {
+        float sc = __ldg(scale + c), of = __ldg(offset + c);
+        const float* tc = T_ + c * 33 + ty;
+        o0[c] = fromF<TO>((tc[0] - m0) * iv0 * sc + of);
+        o1[c] = fromF<TO>((tc[8] - m1) * iv1 * sc + of);
+        o2[c] = fromF<TO>((tc[16] - m2) * iv2 * sc + of);
+        o3[c] = fromF<TO>((tc[24] - m3) * iv3 * sc + of);
+      }
+      return;
     }
-    return;
   }
   if constexpr (C_CONST > 0) {
 #pragma unroll
@@ -549,14 +550,15 @@ centerNormK(const float* __restrict__ prod, TO* __restrict__ out, size_t r0, siz
       }
     }
     return;
-  }
+  } else {
 #pragma unroll 4
-  for (int c = tx; c < CC; c += 32) {
-    float sc = __ldg(scale + c), of = __ldg(offset + c);
+    for (int c = tx; c < CC; c += 32) {
+      float sc = __ldg(scale + c), of = __ldg(offset + c);
 #pragma unroll
-    for (int ry = ty; ry < 32; ry += 8) {
-      size_t lr = i0 + ry;
-      if (lr < rows) out[lr * CC + c] = fromF<TO>((T_[c * 33 + ry] - mean[ry]) * inv[ry] * sc + of);
+      for (int ry = ty; ry < 32; ry += 8) {
+        size_t lr = i0 + ry;
+        if (lr < rows) out[lr * CC + c] = fromF<TO>((T_[c * 33 + ry] - mean[ry]) * inv[ry] * sc + of);
+      }
     }
   }
 }
@@ -713,8 +715,8 @@ constexpr size_t wideUpSmem(int C) {
   return C == 384 ? transitionUpSmem<384, 8>() : C == 512 ? transitionUpSmem<512, 8>() : transitionUpSmem<256, 8>();
 }
 constexpr size_t wideUpFitsSmem(int C) {
-  return C == 384 ? transitionUpSmem<384, 4, 16, 1>()
-       : C == 512 ? transitionUpSmem<512, 4, 16, 1>() : transitionUpSmem<256, 8>();
+  return C == 384 ? transitionUpSmem<384, 8, 16, 4>()
+       : C == 512 ? transitionUpSmem<512, 8, 16, 8>() : transitionUpSmem<256, 8>();
 }
 inline bool wideFits(int C) {
   return (C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(wideUpFitsSmem(C));
@@ -1338,7 +1340,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   if constexpr (std::is_same_v<T, half>) {
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
-    if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+    if (FUSED_WIDE && FUSED_TRANSITION && !skipFused("transition") && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       const half* w1t = transitionW1Tiles<false>(Wh(pre + ".transition1"), C, I, 32);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
@@ -1385,10 +1387,14 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
           runUp(std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
         else if (form == 84 && fitsSmem(transitionUpSmem<CC, 8, 16, 4>()))
           runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 4>{});
+        else if (form == 88 && fitsSmem(transitionUpSmem<CC, 8, 16, 8>()))
+          runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 8>{});
         else if (fitsSmem(transitionUpSmem<CC, 8, 32, 1>()))
           runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 1>{});
         else if (fitsSmem(transitionUpSmem<CC, 8, 16, 4>()))
           runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 4>{});
+        else if (fitsSmem(transitionUpSmem<CC, 8, 16, 8>()))
+          runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 8>{});
         else
           runUp(std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
       });
@@ -1742,8 +1748,8 @@ inline bool LN_NORM_HEADS = true;
 inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads,
                         const std::string& scaleName, const std::string& offsetName, const std::string& projName, int ntr = 0) {
   if (!LN_NORM_HEADS || heads > 16) return false;
-  auto run = [&](auto width) -> bool {
-    constexpr int CC = decltype(width)::value, WARPS = 4, R = 16 * WARPS;   // (8 warps: no faster)
+  auto runW = [&](auto width, auto warpsTag) -> bool {
+    constexpr int CC = decltype(width)::value, WARPS = decltype(warpsTag)::value, R = 16 * WARPS;   // (8 warps: no faster; 2 warps: 48 KB at C 512 on T4)
     constexpr size_t smem = lnNormHeadsSmem<CC>(WARPS);
     if (!fitsSmem(smem)) return false;
     std::string wb = heads == 16 ? projName
@@ -1754,6 +1760,9 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
       lnNormHeadsK<CC, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
         pair, W(scaleName), W(offsetName), Wh(wb), norm, raw, rows, heads, ntr));
     return true;
+  };
+  auto run = [&](auto width) -> bool {
+    return runW(width, std::integral_constant<int, 4>{}) || runW(width, std::integral_constant<int, 2>{});
   };
   switch (C) {
     case 64: return run(std::integral_constant<int, 64>{});

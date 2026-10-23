@@ -1118,7 +1118,12 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) gridInK(const float* __restr
 // hiding it
 template <int C, int WD, int WARPS, class PT = float, int WQ = 1,
           int MINB = (C == 128 && WD == 128 && WARPS == 4 && WQ == 1) ? 3 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(WARPS * 32, 1)
+#else
+__global__ void __launch_bounds__(WARPS * 32, MINB)
+#endif
+gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     float* __restrict__ pair, int n, size_t q0, size_t rows, bool tr, const float* __restrict__ ob = nullptr) {
   // ob: the output projection's bias (AF2's and RoseTTAFold3's), or none
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = WD + 8, LDW = C + 8, KS = WD / 16, NT = C / 8;

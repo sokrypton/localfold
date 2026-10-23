@@ -638,7 +638,12 @@ __global__ void atomAttentionFusedK(const T* qg, const float* qBias, const T* kv
 // logits and mask added there, the softmax over the 128 keys in registers, O = P V with P's
 // accumulators reused as the A operand, the gate applied on the way out.
 template <int D, int KEYS>
-__global__ void __launch_bounds__(64, 8) atomAttentionMMA(const half* __restrict__ qg, const float* __restrict__ qBias,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(64, 4)
+#else
+__global__ void __launch_bounds__(64, 8)
+#endif
+atomAttentionMMA(const half* __restrict__ qg, const float* __restrict__ qBias,
     const half* __restrict__ kvAtomAll, const int* __restrict__ q2kIdx, const float* __restrict__ q2kMask, size_t q1,
     const float* __restrict__ qMask, const float* __restrict__ kMask,
     const float* __restrict__ pairLogits, half* __restrict__ out, int queries, int heads, bool keyMasked, float scale, int subsets) {

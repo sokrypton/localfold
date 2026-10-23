@@ -244,20 +244,6 @@ __global__ void layerNormTK(const float* __restrict__ x, TO* __restrict__ y, siz
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* xr = x + row * C;
-  if (C <= 384) {
-    float xv[12], s = 0.f;
-    int k = 0;
-    for (int c = lane; c < C; c += 32, ++k) { float val = __ldg(xr + c); xv[k] = val; s += val; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, v = 0.f;
-    k = 0;
-    for (int c = lane; c < C; c += 32, ++k) { float d = xv[k] - mean; v += d * d; }
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-    float inv = rsqrtf(v / C + 1e-5f);
-    k = 0;
-    for (int c = lane; c < C; c += 32, ++k) y[row * C + c] = (TO)((xv[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c));
-    return;
-  }
   float s = 0;
   for (int c = lane; c < C; c += 32) s += xr[c];
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);

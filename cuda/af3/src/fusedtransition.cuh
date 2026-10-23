@@ -60,7 +60,12 @@ inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
 // holds the next chunk in registers anyway: the second stage was 12 KB that kept its 64 KB SM to ONE block (4 warps)
 template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, class PT = float, int NST = 2,
           int MINB = ((C == 128 || C == 64) && WARPS == 4 && MT == 1 && NC == 16 && NST == 2) ? 3 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(WARPS * 32, (C == 64 && WARPS == 4 && MT == 1 && NC == 16) ? 3 : 1)
+#else
+__global__ void __launch_bounds__(WARPS * 32, MINB)
+#endif
+fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
   constexpr int FT_ROWS = 16 * WARPS * MT, NTH = 32 * WARPS;

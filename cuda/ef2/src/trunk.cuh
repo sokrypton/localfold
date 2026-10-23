@@ -264,28 +264,10 @@ inline void triangle256(float* pair, const float* mask, int L, int C, const std:
 }
 inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
-  if (!fused256Big()) {            // a T4: the 16-warp form, its rows normed in rounds (byte-identical)
-    constexpr int WU = 16, R = 16 * WU;
-    constexpr size_t smem = transitionUpSmem<256, WU, 16, 8>();
-    size_t chunk = std::max<size_t>(R, ((size_t)64 << 20) / (2 * (size_t)I) / R * R);
-    half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
-    half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
-    tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
-    static bool attr = false;
-    if (!attr) { smemAttr((transitionUpK<256, WU, 16, 8>), (int)smem); attr = true; }
-    for (size_t r0 = 0; r0 < P; r0 += chunk) {
-      size_t r = std::min(chunk, P - r0);
-      transitionUpK<256, WU, 16, 8><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
-        pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
-      ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
-    }
-    return;
-  }
   // whole waves of transitionUpK within ~64 MB of widened rows (see transitionUpWaveRows) - or 1 GB where the card
   // has the room: fewer, larger down-projection GEMMs, which cuBLAS runs on a faster kernel past ~100k rows. The
   // trunk at 988 tokens 2556 -> 2485 ms (-2.8%), at 494 601 -> 598, at 261 194 -> 193, byte-identical on all three
   const size_t budget = roomFor((size_t)1 << 30, {"ftr.g", "ftr.gbf"}) ? (size_t)1 << 30 : (size_t)64 << 20;
-  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), budget / (2 * (size_t)I));
   static std::map<std::string, half*> w1tCache;
   static const bool w1tHook = (FORGET_HOOKS.push_back([] { w1tCache.clear(); }), true);
   (void)w1tHook;
@@ -301,6 +283,22 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
     w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
     tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
   }
+  if (!fused256Big()) {            // a T4: the 16-warp form, its rows normed in rounds (byte-identical)
+    constexpr int WU = 16, R = 16 * WU;
+    constexpr size_t smem = transitionUpSmem<256, WU, 16, 8>();
+    size_t chunk = transitionUpChunkRows<256, WU, 16, 8>(smem, budget / (2 * (size_t)I));
+    half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+    static bool attr = false;
+    if (!attr) { smemAttr((transitionUpK<256, WU, 16, 8>), (int)smem); attr = true; }
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      transitionUpK<256, WU, 16, 8><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
+        pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
+      ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
+    }
+    return;
+  }
+  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), budget / (2 * (size_t)I));
   if (PAIR16) {
     // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the pair
     using B16 = __nv_bfloat16;

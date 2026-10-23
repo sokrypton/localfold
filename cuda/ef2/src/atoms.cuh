@@ -193,7 +193,19 @@ __global__ void rmsModulateK(float* __restrict__ x, const float* __restrict__ mo
     else yr[c] = val;
   }
 }
-// q and k (heads of 32, inside the packed [A, 3C] or [A, 4C] qkv): rms per head, rotate, narrow to bfloat16; v narrowed.
+template <bool BF16 = true>
+__device__ __forceinline__ uint32_t swaPack16(float a, float b) {
+  if constexpr (BF16) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<uint32_t*>(&v);
+  } else {
+    auto cl = [](float x) { return fminf(fmaxf(bf16Round(x), -65504.f), 65504.f); };
+    __half2 v = __floats2half2_rn(cl(a), cl(b));
+    return *reinterpret_cast<uint32_t*>(&v);
+  }
+}
+// q and k (heads of 32, inside the packed [A, 3C] or [A, 4C] qkv): rms per head, rotate, narrow to bfloat16 (or bf16-rounded half on sm_75); v narrowed.
+template <bool BF16 = true>
 __global__ void qkvPrepare128K(const float* __restrict__ qkv, const float* __restrict__ cosT, const float* __restrict__ sinT,
                                int A, int rs, uint16_t* __restrict__ qkv16) {
   int atom = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -215,17 +227,13 @@ __global__ void qkvPrepare128K(const float* __restrict__ qkv, const float* __res
     float inv = rsqrtf(s * (1.f / 32.f) + RMS_EPS);
     float v0x = x0.x * inv, v0y = x0.y * inv;
     float v1x = x1.x * inv, v1y = x1.y * inv;
-    __nv_bfloat162 b0 = __floats2bfloat162_rn(v0x * c2.x - v1x * s2.x, v0y * c2.y - v1y * s2.y);
-    __nv_bfloat162 b1 = __floats2bfloat162_rn(v1x * c2.x + v0x * s2.x, v1y * c2.y + v0y * s2.y);
     uint32_t* dst = reinterpret_cast<uint32_t*>(qkv16 + ((size_t)atom * 3 + part) * 128 + head * 32);
-    dst[sub] = *reinterpret_cast<const uint32_t*>(&b0);
-    dst[8 + sub] = *reinterpret_cast<const uint32_t*>(&b1);
+    dst[sub] = swaPack16<BF16>(v0x * c2.x - v1x * s2.x, v0y * c2.y - v1y * s2.y);
+    dst[8 + sub] = swaPack16<BF16>(v1x * c2.x + v0x * s2.x, v1y * c2.y + v0y * s2.y);
   }
   float4 vx = __ldg(reinterpret_cast<const float4*>(base + 256) + lane);
-  __nv_bfloat162 bv0 = __floats2bfloat162_rn(vx.x, vx.y);
-  __nv_bfloat162 bv1 = __floats2bfloat162_rn(vx.z, vx.w);
   reinterpret_cast<uint2*>(qkv16 + ((size_t)atom * 3 + 2) * 128)[lane] =
-      make_uint2(*reinterpret_cast<const uint32_t*>(&bv0), *reinterpret_cast<const uint32_t*>(&bv1));
+      make_uint2(swaPack16<BF16>(vx.x, vx.y), swaPack16<BF16>(vx.z, vx.w));
 }
 // One warp (32 lanes, d = 0..31) per (atom, head): coalesced reads/writes, cos/sin loaded once for both q and k.
 __global__ void qkvPrepareK(float* __restrict__ qkv, const float* __restrict__ cosT, const float* __restrict__ sinT,
@@ -359,35 +367,60 @@ __global__ void __launch_bounds__(128, 4) swaWindowK(const float* __restrict__ q
   for (int u = 0; u < 4; ++u)
     if (rq + u <= r1) ctx[(size_t)valid[rq + u] * C + head * 32 + lane] = acc[u] / l[u];
 }
-__device__ __forceinline__ uint32_t swaPackBf16(float a, float b) {
-  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-  return *reinterpret_cast<uint32_t*>(&v);
-}
 __device__ __forceinline__ void swaLdsm4(uint32_t r[4], const void* smem) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
 }
 __device__ __forceinline__ void swaLdsm4t(uint32_t r[4], const void* smem) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
 }
-__device__ __forceinline__ void swaMma16816Bf16(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+template <bool BF16 = true>
+__device__ __forceinline__ void swaMma16816(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+  if constexpr (BF16) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+  } else {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
+  }
 }
 __device__ __forceinline__ void swaCpAsync16(void* smem, const void* gmem, bool pred) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
   int srcBytes = pred ? 16 : 0;
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(srcBytes));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(srcBytes) : "memory");
+#else
+  *reinterpret_cast<uint4*>(smem) = pred ? *reinterpret_cast<const uint4*>(gmem) : make_uint4(0, 0, 0, 0);
+#endif
 }
-// Tensor Core m16n8k16 bf16 sliding-window atom attention for D == 32, halfWindow <= 64:
-// 2 warps (64 threads, 16 queries x 2 heads per block, 16 queries x 1 head per warp), 144 keys in XOR-swizzled bf16 smem.
+// Tensor Core m16n8k16 (bf16 on sm_80+, m16n8k8 f16 on sm_75) sliding-window atom attention for D == 32, halfWindow <= 64:
+// 2 warps (64 threads, 16 queries x 2 heads per block, 16 queries x 1 head per warp), 144 keys in XOR-swizzled 16-bit smem.
 constexpr int SWA_MMA_Q = 16, SWA_MMA_KT = 144;
+template <bool BF16 = true>
 __global__ void __launch_bounds__(64, 4)
 swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate,
               const int* __restrict__ valid, int nValid,
@@ -414,7 +447,9 @@ swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate
     swaCpAsync16(Kw + key * 32 + cs, kPtr, live);
     swaCpAsync16(Vw + key * 32 + cs, vPtr, live);
   }
-  asm volatile("cp.async.commit_group;\n" ::);
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
   const int rq0 = r0 + g, rq1 = rq0 + 8;
   const int a0 = valid[min(rq0, nValid - 1)], a1 = valid[min(rq1, nValid - 1)];
   uint32_t qa[2][4];
@@ -426,7 +461,9 @@ swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate
     qa[ks][2] = __ldg(reinterpret_cast<const uint32_t*>(qkv16 + (size_t)a0 * 3 * C + head * 32 + e + 8));
     qa[ks][3] = __ldg(reinterpret_cast<const uint32_t*>(qkv16 + (size_t)a1 * 3 * C + head * 32 + e + 8));
   }
-  asm volatile("cp.async.wait_group 0;\n" ::);
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
   __syncwarp();
   const float scaleLog2 = scale * 1.4426950408889634f;
   float sv[SWA_MMA_KT / 8][4];
@@ -439,8 +476,8 @@ swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate
     if (nt + 1 < SWA_MMA_KT / 8)
       swaLdsm4(kb[cur ^ 1], Kw + ((nt + 1) * 8 + (lane & 7)) * 32 + ((lane >> 3) ^ (lane & 3)) * 8);
     sv[nt][0] = sv[nt][1] = sv[nt][2] = sv[nt][3] = 0.f;
-    swaMma16816Bf16(sv[nt], qa[0], kb[cur][0], kb[cur][1]);
-    swaMma16816Bf16(sv[nt], qa[1], kb[cur][2], kb[cur][3]);
+    swaMma16816<BF16>(sv[nt], qa[0], kb[cur][0], kb[cur][1]);
+    swaMma16816<BF16>(sv[nt], qa[1], kb[cur][2], kb[cur][3]);
     int idx = nt * 8 + tig * 2, kr = klo + idx;
     sv[nt][0] = (idx < nKeys && abs(kr - rq0) <= halfWindow) ? sv[nt][0] * scaleLog2 : -1e30f;
     sv[nt][1] = (idx + 1 < nKeys && abs(kr + 1 - rq0) <= halfWindow) ? sv[nt][1] * scaleLog2 : -1e30f;
@@ -461,8 +498,8 @@ swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate
       sv[nt][2] = exp2f(sv[nt][2] - m1); sv[nt][3] = exp2f(sv[nt][3] - m1);
       l0 += sv[nt][0] + sv[nt][1]; l1 += sv[nt][2] + sv[nt][3];
     }
-    uint32_t p0 = swaPackBf16(sv[2 * t][0], sv[2 * t][1]), p1 = swaPackBf16(sv[2 * t][2], sv[2 * t][3]);
-    uint32_t p2 = swaPackBf16(sv[2 * t + 1][0], sv[2 * t + 1][1]), p3 = swaPackBf16(sv[2 * t + 1][2], sv[2 * t + 1][3]);
+    uint32_t p0 = swaPack16<BF16>(sv[2 * t][0], sv[2 * t][1]), p1 = swaPack16<BF16>(sv[2 * t][2], sv[2 * t][3]);
+    uint32_t p2 = swaPack16<BF16>(sv[2 * t + 1][0], sv[2 * t + 1][1]), p3 = swaPack16<BF16>(sv[2 * t + 1][2], sv[2 * t + 1][3]);
     uint32_t* pa = reinterpret_cast<uint32_t*>(sv[t]);
     pa[0] = p0; pa[1] = p1; pa[2] = p2; pa[3] = p3;
   }
@@ -480,10 +517,10 @@ swaWindowMMAK(const uint16_t* __restrict__ qkv16, const float* __restrict__ gate
       swaLdsm4t(vb1[cur ^ 1], Vw + ((t + 1) * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * 32 + ((2 + (lane >> 4)) ^ (lane & 3)) * 8);
     }
     const uint32_t* pa = reinterpret_cast<const uint32_t*>(sv[t]);
-    swaMma16816Bf16(o[0], pa, vb0[cur][0], vb0[cur][1]);
-    swaMma16816Bf16(o[1], pa, vb0[cur][2], vb0[cur][3]);
-    swaMma16816Bf16(o[2], pa, vb1[cur][0], vb1[cur][1]);
-    swaMma16816Bf16(o[3], pa, vb1[cur][2], vb1[cur][3]);
+    swaMma16816<BF16>(o[0], pa, vb0[cur][0], vb0[cur][1]);
+    swaMma16816<BF16>(o[1], pa, vb0[cur][2], vb0[cur][3]);
+    swaMma16816<BF16>(o[2], pa, vb1[cur][0], vb1[cur][1]);
+    swaMma16816<BF16>(o[3], pa, vb1[cur][2], vb1[cur][3]);
   }
   if (rq0 < nValid) {
     float inv0 = 1.f / l0;
@@ -617,11 +654,19 @@ inline void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::s
     int hw = std::min(halfWindow, (int)A);
     if ((ATOM_BF16 || FAST) && hw <= 64 && a.heads == 4 && C == 128) {
       uint16_t* qkv16 = scratch<uint16_t>("atom.qkv16", A * 3 * C);
-      qkvPrepare128K<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(qkvg, a.cosT, a.sinT, (int)A, 4 * C, qkv16);
-      if (zeroCtx && a.nValid < (int)A) CK(cudaMemsetAsync(ctxh, 0, A * C * 2, STREAM));
-      if (a.nValid)
-        swaWindowMMAK<<<dim3((unsigned)((a.nValid + SWA_MMA_Q - 1) / SWA_MMA_Q), 2u), 64, 0, STREAM>>>(
-            qkv16, qkvg + 3 * C, a.valid, a.nValid, nullptr, ctxh, C, hw, 1.f / sqrtf(32.f), 4 * C);
+      if (ccMajor() >= 8) {
+        qkvPrepare128K<true><<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(qkvg, a.cosT, a.sinT, (int)A, 4 * C, qkv16);
+        if (zeroCtx && a.nValid < (int)A) CK(cudaMemsetAsync(ctxh, 0, A * C * 2, STREAM));
+        if (a.nValid)
+          swaWindowMMAK<true><<<dim3((unsigned)((a.nValid + SWA_MMA_Q - 1) / SWA_MMA_Q), 2u), 64, 0, STREAM>>>(
+              qkv16, qkvg + 3 * C, a.valid, a.nValid, nullptr, ctxh, C, hw, 1.f / sqrtf(32.f), 4 * C);
+      } else {
+        qkvPrepare128K<false><<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(qkvg, a.cosT, a.sinT, (int)A, 4 * C, qkv16);
+        if (zeroCtx && a.nValid < (int)A) CK(cudaMemsetAsync(ctxh, 0, A * C * 2, STREAM));
+        if (a.nValid)
+          swaWindowMMAK<false><<<dim3((unsigned)((a.nValid + SWA_MMA_Q - 1) / SWA_MMA_Q), 2u), 64, 0, STREAM>>>(
+              qkv16, qkvg + 3 * C, a.valid, a.nValid, nullptr, ctxh, C, hw, 1.f / sqrtf(32.f), 4 * C);
+      }
     } else {
       qkvPrepareK<<<blocks(A * a.heads * 32, 256), 256, 0, STREAM>>>(qkvg, a.cosT, a.sinT, (int)A, C, a.heads, ATOM_BF16, 4 * C);
       float* ctx = scratch<float>("atom.ctx", A * C);

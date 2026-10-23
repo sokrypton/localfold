@@ -26,16 +26,21 @@
 // Not past 256 channels (the rows' fragments alone are 96-128 registers there, and two blocks do not fit anyway).
 template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half,
           int MINB = (C <= 256 && WARPS == 8 && XROUNDS == 1) ? 2 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(WARPS * 32, 1)
+#else
+__global__ void __launch_bounds__(WARPS * 32, MINB)
+#endif
+transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, TG* __restrict__ gated, size_t rows, int I) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
   constexpr size_t STAGE = (size_t)2 * C * NC * 2;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
   extern __shared__ __align__(16) unsigned char smem[];
   // the LN'd rows and the weight stages share memory: the rows go into registers (A fragments) before
-  // the first stage is issued, so a block's footprint is the larger of the two, not their sum (in rounds, the
-  // rows have a buffer of their own after the stages)
-  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE);
+  // the first stage is issued, so a block's footprint is the larger of the two, not their sum (in rounds,
+  // only stage 0 is issued before the round loop, so the rows share stage 1's memory at smem + STAGE)
+  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + STAGE);
   unsigned char* stages = smem;
   auto Wa = [&](int s) { return (half*)(stages + s * STAGE); };
   auto Wb = [&](int s) { return Wa(s) + C * NC; };
@@ -138,10 +143,12 @@ inline void tileTransitionUp(const half* W1, int C, int I, half* out) {
   tileColumns(W1, C, 2 * I, I, I, 32, out + (size_t)C * I);
 }
 // transitionUpK's dynamic shared memory: the larger of the LN'd rows and the two weight stages
+// (in rounds, Xs shares stage 1 at smem + STAGE while stage 0 is in flight during the prologue)
 template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
 constexpr size_t transitionUpSmem() {
-  if constexpr (XROUNDS > 1) return (size_t)2 * 2 * C * NC * 2 + (size_t)16 * WARPS / XROUNDS * (C + 8) * 2;
-  else return std::max((size_t)16 * WARPS * (C + 8) * 2, (size_t)2 * 2 * C * NC * 2);
+  constexpr size_t stage = (size_t)2 * C * NC * 2, rows = (size_t)16 * WARPS / XROUNDS * (C + 8) * 2;
+  if constexpr (XROUNDS > 1) return stage + (rows > stage ? rows : stage);
+  else return rows > 2 * stage ? rows : 2 * stage;
 }
 
 // The rows one full wave of transitionUpK<C, WARPS> covers - the blocks every multiprocessor holds at
@@ -197,7 +204,12 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
 // this reads half; the tile is bf16 either way)
 template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false, class PT = float,
           int MINB = (C <= 128 && WARPS == 4 && NC == 16) ? 4 : (C == 256 && WARPS == 4 && NC == 16) ? 3 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(WARPS * 32, (C <= 128 && WARPS == 4 && NC == 16) ? 2 : 1)
+#else
+__global__ void __launch_bounds__(WARPS * 32, MINB)
+#endif
+triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
     float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr, RectMap rm = {}) {   // ob: AF2's output bias
   // Woutt: Wout's NC-column tiles (tileColumns), the stages unpadded and swizzled (stageSw)
@@ -437,14 +449,16 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triangleOutK(const TP* __res
 // linear's raw output over the padded rows.
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (an f16 one overflows)
 
-// its dynamic shared memory: the LN'd rows, or the two weight stages and the a/b staging after them
-// ...or, in ROUNDS (xrounds > 1), the stages, the staging and one round's 16 * warps / xrounds rows, none aliased
+// its dynamic shared memory: the LN'd rows, or the two weight stages and the a/b/t2 staging after them;
+// in ROUNDS (xrounds > 1), one round's 16 * warps / xrounds rows share smem + 2 * STAGE with Ta/Tb/Ys
+// (Xs is consumed during the prologue's round loop before the main step loop ever writes Ta/Tb/Ys),
+// keeping triIn256Smem(256, 16, 8) at 49,664 B (<= 64 KB on T4 sm_75, and 2 blocks/SM in 100 KB on sm_89/sm_120)
 template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int xrounds = 1) {
-  size_t rows = (size_t)16 * warps * (C + 8) * 2;
+  size_t rows = (size_t)16 * warps / xrounds * (C + 8) * 2;
   size_t ab = (size_t)2 * 8 * (16 * warps + 8) * sizeof(TA), t2s = (size_t)warps * 16 * 32 * 2;
-  size_t stages = (size_t)2 * 2 * C * 16 * 2 + (ab > t2s ? ab : t2s);
-  if (xrounds > 1) return stages + (size_t)16 * warps / xrounds * (C + 8) * 2;
-  return rows > stages ? rows : stages;
+  size_t tail = ab > t2s ? ab : t2s;
+  size_t stages = (size_t)2 * 2 * C * 16 * 2 + (xrounds > 1 && rows > tail ? rows : tail);
+  return xrounds == 1 && rows > stages ? rows : stages;
 }
 // Wt: tileTriIn's layout at 16 columns a tile
 // XROUNDS > 1: the block's rows LayerNorm'd a round at a time into a buffer of their own, each round's warps
@@ -459,7 +473,12 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float, int MT = 1,
           int MINB = ((C == 128 && WARPS == 4 && XROUNDS == 1 && MT == 2) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
                    : (C == 256 && WARPS == 8 && XROUNDS == 1 && MT == 1) ? 2 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
+#if LF_REG_STAGES
+__global__ void __launch_bounds__(WARPS * 32, (C == 128 && WARPS == 4 && XROUNDS == 1 && MT == 2) ? 2 : 1)
+#else
+__global__ void __launch_bounds__(WARPS * 32, MINB)
+#endif
+triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
     const float* __restrict__ bias = nullptr, RectMap rm = {}) {
@@ -496,7 +515,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) triIn256K(const float* __res
     unsigned u = q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE + (size_t)2 * CH * LDT * sizeof(TA));
+  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE);
   auto W0 = [&](int s) { return (half*)(smem + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
   TA* Ta = (TA*)(smem + 2 * STAGE);

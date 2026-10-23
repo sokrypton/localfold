@@ -568,7 +568,7 @@ __global__ void buildAdaOutWeightsK(const void* const* __restrict__ ptrs, half* 
 
 // Fused LayerNorm(single) + stepNorm + raw half copy for C == 768 (1 warp per row):
 // writes snH [T, 768], snStepH [T, 768], singleH [T, 768] (only 3 copies instead of 26).
-__global__ void __launch_bounds__(256, 4)
+__global__ void __launch_bounds__(256, 2)
 singlePrep3HK(const float* __restrict__ single, const float* __restrict__ stepScale,
               const float* __restrict__ stepOffset, half* __restrict__ outH, int T) {
   int row = blockIdx.x * 8 + (threadIdx.x >> 5);
