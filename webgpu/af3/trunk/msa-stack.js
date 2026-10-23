@@ -268,12 +268,17 @@ export class Af3MsaStackGpu {
     const opmArithmetic = pairMatrixKernels && halfPrecisionAvailable(this.device)
       && opmTuning.opmVectorArithmetic !== "f32" ? "f16" : "f32";
     const opmBlock = vectorGemmBlock(this.device, opmArithmetic, () => true);
+    const opmOutBlock = vectorGemmBlock(this.device, opmArithmetic,
+      ({ columns, inner }) => pairChannels % columns === 0 && (outerChannels * outerChannels) % inner === 0);
     pipelines.opmVecBlock = opmBlock;
+    pipelines.opmVecOutColumns = opmOutBlock.columns;
     if (useOpmVector) {
       into("opmVecContract", `af3-opm-vec-contract:${outerChannels}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
            createOuterProductMeanVectorContractShader(outerChannels, opmBlock, opmArithmetic));
-      into("opmVecOutput", `af3-opm-vec-output:ban${opmShape.opmBiasAfterNorm}`,
-           createAf3OpmVectorOutputShader({ biasAfterNorm: opmShape.opmBiasAfterNorm }));
+      into("opmVecOutput", `af3-opm-vec-output:ban${opmShape.opmBiasAfterNorm}:${vectorGemmBlockKey(opmOutBlock)}:${opmArithmetic}:r1`,
+           createAf3OpmVectorOutputShader({ biasAfterNorm: opmShape.opmBiasAfterNorm, residual: true,
+                                           columns: opmOutBlock.columns, inner: opmOutBlock.inner,
+                                           arithmetic: opmArithmetic }));
     }
     // ...the contraction's dispatch is one workgroup per (i, j) block of token
     // pairs; see the note on its kernel.
@@ -565,16 +570,16 @@ export class Af3MsaStackGpu {
               ceil(n * context.outerChannels, pipelines.opmVecBlock.columns),
               ceil(step.count * context.outerChannels, pipelines.opmVecBlock.rows));
           run("opm.output", pipelines.opmVecOutput,
-              [intermediate, opmWeights, step.output, scratch[0], opmCounts],
-              ceil(pairChannels, 64), ceil(step.count * n, 64));
+              [intermediate, opmWeights, step.output, pair, opmCounts],
+              ceil(pairChannels, pipelines.opmVecOutColumns), ceil(step.count * n, 64));
         }
       } else {
         const perBlock = spread(pipelines.opmBlocks);
         run("opm.contract", pipelines["opm:contract"],
             [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
+        const addPairGroups = spread(ceil(pairs * pairChannels, 64));
+        run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
       }
-      const addPairGroups = spread(ceil(pairs * pairChannels, 64));
-      run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
     };
 
     // The row update: the pair-weighted average, then the transition. Upstream

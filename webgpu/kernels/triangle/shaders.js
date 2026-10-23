@@ -235,8 +235,9 @@ export function createTriangleShaders(
   // 16,384. Fixing one and not the other left the error byte-for-byte
   // identical, which reads as "the fix did not take". docs/ARCHITECTURE.md
   // lists this LayerNorm among the things written four times.
+  const maxC = Math.max(shape.cZ, shape.cHidden);
   const NORMALIZE_ROWS = tileThatFits([8, 4, 2, 1],
-    (rows) => rows * Math.max(shape.cZ, shape.cHidden) * 4 + 64 * 4 * 2 + rows * 4 * 2,
+    (rows) => rows * (maxC + 4) * 4 + 64 * 4 * 2 + rows * 4 * 2,
     shape.maxComputeWorkgroupStorageSize ?? 49152);
   const LANES_PER_ROW = 64 / NORMALIZE_ROWS;
 
@@ -258,8 +259,13 @@ export function createTriangleShaders(
   const countOf = (axis) => (axis === "CZ" ? shape.cZ : shape.cHidden);
   const fastVariance = variance === "fast";
   const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row",
-                           outputStorage = "f32") => `
-var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${shape[count === "CZ" ? "cZ" : "cHidden"]}>;
+                           outputStorage = "f32") => {
+    const cVal = countOf(count);
+    const tileStride = sourceMajor === "channel" && cVal % 32 === 0 && NORMALIZE_ROWS === 8
+      ? cVal + 4 : cVal;
+    const strideExpr = tileStride === cVal ? count : `${tileStride}u`;
+    return `
+var<workgroup> tile: array<f32, ${NORMALIZE_ROWS * tileStride}>;
 var<workgroup> partial_sum: array<f32, 64>;${fastVariance ? "\nvar<workgroup> partial_squares: array<f32, 64>;" : ""}
 var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
 var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
@@ -291,7 +297,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         : `let slot_of = index / ${count};
       let channel = index % ${count};`}
       let row = base_row + slot_of;
-      tile[slot_of * ${count} + channel] = ${load("row", "channel")};
+      tile[slot_of * ${strideExpr} + channel] = ${load("row", "channel")};
     }
   } else {
     for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
@@ -301,7 +307,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         : `let slot_of = index / ${count};
       let channel = index % ${count};`}
       let row = base_row + slot_of;
-      tile[slot_of * ${count} + channel] = select(0.0, ${load("row", "channel")}, row < PAIRS);
+      tile[slot_of * ${strideExpr} + channel] = select(0.0, ${load("row", "channel")}, row < PAIRS);
     }
   }
   workgroupBarrier();
@@ -310,7 +316,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let lane = local % LANES_PER_ROW;
   var total = 0.0;${fastVariance ? "\n  var squares = 0.0;" : ""}
   for (var c = lane; c < ${count}; c += LANES_PER_ROW) {
-    let value = tile[slot * ${count} + c];
+    let value = tile[slot * ${strideExpr} + c];
     total += value;${fastVariance ? "\n    squares += value * value;" : ""}
   }
   partial_sum[local] = total;${fastVariance ? "\n  partial_squares[local] = squares;" : ""}
@@ -325,7 +331,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       ? `let variance = row_squares / f32(${count}) - mean * mean;`
       : `var variance = 0.0;
     for (var c = 0u; c < ${count}; c += 1u) {
-      let centered = tile[slot * ${count} + c] - mean;
+      let centered = tile[slot * ${strideExpr} + c] - mean;
       variance += centered * centered;
     }
     variance /= f32(${count});`}
@@ -339,13 +345,30 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // comment here used to say the count was even in every caller and call the
   // loop the assertion; a WGSL loop asserts nothing, and at cZ 7 this wrote
   // three words a row where the readers expected four.
-  const PAIR_COUNT: u32 = ${Math.ceil(countOf(count) / 2)}u;
-  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
+  const PAIR_COUNT: u32 = ${Math.ceil(cVal / 2)}u;
+${cVal % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_word += 64u) {
+    let channel = col_word * 2u;
+    let w_scale_0 = ${readWeight(`weights[W_${scale} + channel]`)};
+    let w_scale_1 = ${readWeight(`weights[W_${scale} + channel + 1u]`)};
+    let w_offset_0 = ${readWeight(`weights[W_${offset} + channel]`)};
+    let w_offset_1 = ${readWeight(`weights[W_${offset} + channel + 1u]`)};
+    for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
+      let row = base_row + slot_of;
+      if (!full_tile && row >= PAIRS) { break; }
+      let index = slot_of * ${strideExpr} + channel;
+      let scaled = row_inverse_std[slot_of];
+      let centre = row_mean[slot_of];
+      let low = (tile[index] - centre) * scaled * w_scale_0 + w_offset_0;
+      let high = (tile[index + 1u] - centre) * scaled * w_scale_1 + w_offset_1;
+      let pair_word = row * PAIR_COUNT + col_word;
+      ${storedPair(outputStorage, "normalized", "pair_word", "low", "high")}
+    }
+  }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
     if (!full_tile && row >= PAIRS) { continue; }
     let channel = (word % PAIR_COUNT) * 2u;
-    let index = slot_of * ${count} + channel;
+    let index = slot_of * ${strideExpr} + channel;
     let scaled = row_inverse_std[slot_of];
     let centre = row_mean[slot_of];
     let low = (tile[index] - centre) * scaled
@@ -355,14 +378,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // and contributes nothing - which is what an absent channel is worth. The
     // guard is emitted ONLY there, so every even width generates the shader it
     // generated before and pays no select in the normalize loop.
-    let high = ${countOf(count) % 2 === 0 ? "" : "select(0.0, "}(tile[index + 1u] - centre) * scaled
+    let high = ${cVal % 2 === 0 ? "" : "select(0.0, "}(tile[index + 1u] - centre) * scaled
       * ${readWeight(`weights[W_${scale} + channel + 1u]`)}
       + ${readWeight(`weights[W_${offset} + channel + 1u]`)}${
-  countOf(count) % 2 === 0 ? "" : `, channel + 1u < ${count})`};
+  cVal % 2 === 0 ? "" : `, channel + 1u < ${count})`};
     let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
     ${storedPair(outputStorage, "normalized", "pair_word", "low", "high")}
-  }
+  }`}
 }`;
+  };
 
   const normalizeInput = `${common}
 @group(0) @binding(0) var<storage, read> source: array<${t}>;
@@ -392,6 +416,8 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
     throw new Error(`projectTile workgroup ${PROJECT_W} is not 8 or 16`);
   }
   const PROJECT_W2 = PROJECT_W * PROJECT_W;
+  const SOURCE_STRIDE = PROJECT_W + 1;
+  const PROJECT_W_SOURCE = PROJECT_W * SOURCE_STRIDE;
   if (PROJECT_TILE_ROWS % PROJECT_W !== 0 || PROJECT_TILE_COLUMNS % PROJECT_W !== 0) {
     throw new Error(`projectTile ${PROJECT_TILE_ROWS}x${PROJECT_TILE_COLUMNS} is not a `
       + `multiple of the ${PROJECT_W}x${PROJECT_W} workgroup`);
@@ -497,7 +523,7 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
     ? `${k * PROJECT_TILE_COLUMNS + c}u + local.x * ${columnsPerThread}u`
     : `${k * PROJECT_TILE_COLUMNS + c * PROJECT_W}u + local.x`);
   const abInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
-      let x = tile_source[local.y * ${PROJECT_W}u + ${k}u];
+      let x = tile_source[local.y * ${SOURCE_STRIDE}u + ${k}u];
 ${Array.from({ length: columnsPerThread }, (_, c) => `      {
         let packed = tile_weight[${abWeightIndex(k, c)}];
         ${overRows((r) => `acc_${r}_${c} += ${rowAt("x", r)} * packed;`)}
@@ -544,7 +570,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(4) var<storage, read_write> b: array<${storageArray(abStorage)}>;
 ${channelChunked ? "@group(0) @binding(5) var<uniform> chunk: vec4<u32>;" : ""}
 
-var<workgroup> tile_source: array<${projectRowVector}, ${PROJECT_W2}>;
+var<workgroup> tile_source: array<${projectRowVector}, ${PROJECT_W_SOURCE}>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
 // separate matrices contracted over the same source, so the four weights a
 // (k, channel) cell needs are always wanted together. Packed as a vec4 the
@@ -561,7 +587,7 @@ fn main(
 ) {
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
-  let tile_index = local.y * ${PROJECT_W}u + local.x;
+  let tile_index = local.y * ${SOURCE_STRIDE}u + local.x;
   let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
   let s_base0 = row0 * CZ_STRIDE + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
@@ -638,7 +664,7 @@ ${abRowStores}
   const overContractColumns = (body) =>
     Array.from({ length: contractColumns }, (_, c) => body(c)).join("\n      ");
   const contractInner = Array.from({ length: 8 }, (_, k) => `    {
-      let left = tile_a[local.y * 8u + ${k}u];
+      let left = tile_a[local.y * 9u + ${k}u];
       let right = tile_b[${k * 8}u + local.x];
       ${overContractRows((r) => `sum_${r} += ${contractRowAt("left", r)} * right;`)}
     }`).join("\n");
@@ -660,8 +686,8 @@ const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 ${channelChunked ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
-// a's rows an invocation owns, and b's columns, each packed into one vector.
-var<workgroup> tile_a: array<${contractRowVector}, 64>;
+// a's rows an invocation owns (stride 9 avoids 4-way bank conflicts), and b's columns, each packed into one vector.
+var<workgroup> tile_a: array<${contractRowVector}, 72>;
 var<workgroup> tile_b: array<${contractColumnVector}, 64>;
 
 @compute @workgroup_size(8, 8, 1)
@@ -672,7 +698,8 @@ fn main(
   let i0 = group.y * CONTRACT_ROWS + local.y;
   let j0 = group.x * CONTRACT_COLUMNS + local.x;
   let h = group.z;
-  let tile_index = local.y * 8u + local.x;
+  let tile_a_index = local.y * 9u + local.x;
+  let tile_b_index = local.y * 8u + local.x;
 ${contractRowPre}
 ${contractColPre}
   // One accumulator a row, holding that row's columns.
@@ -695,8 +722,8 @@ ${Array.from({ length: contractRows }, (_, r) => `  var sum_${r} = ${contractCol
         if (valid_j_${c}) { ${contractColumnAt("staged_b", c)} = ${loadBTile}; }
       }`)}
     }
-    tile_a[tile_index] = staged_a;
-    tile_b[tile_index] = staged_b;
+    tile_a[tile_a_index] = staged_a;
+    tile_b[tile_b_index] = staged_b;
     workgroupBarrier();
 ${contractInner}
     workgroupBarrier();
@@ -881,8 +908,8 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
       tile_weight[w_slot_${c}] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
     }`).join("\n");
   const outInner = Array.from({ length: PROJECT_W }, (_, k) => `    {
-      let xs = tile_x[local.y * ${PROJECT_W}u + ${k}u];
-      let zs = tile_z[local.y * ${PROJECT_W}u + ${k}u];
+      let xs = tile_x[local.y * ${SOURCE_STRIDE}u + ${k}u];
+      let zs = tile_z[local.y * ${SOURCE_STRIDE}u + ${k}u];
       ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
 ${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
         let packed = tile_weight[${k * OUT_TILE_COLUMNS + c * PROJECT_W}u + local.x];
@@ -909,8 +936,8 @@ const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_x: array<${outRowVector}, ${PROJECT_W2}>;
-var<workgroup> tile_z: array<${outRowVector}, ${PROJECT_W2}>;
+var<workgroup> tile_x: array<${outRowVector}, ${PROJECT_W_SOURCE}>;
+var<workgroup> tile_z: array<${outRowVector}, ${PROJECT_W_SOURCE}>;
 // 🔴 ONE vec2 A CELL, NOT TWO SCALAR ARRAYS - the same argument projectAB
 // makes with four matrices and a vec4. The output projection and its gate are
 // contracted at the SAME (k, output channel) cell, so their two weights are
@@ -943,7 +970,7 @@ fn main(
   // been taught to fold is unchanged.
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
-  let tile_index = local.y * ${PROJECT_W}u + local.x;
+  let tile_index = local.y * ${SOURCE_STRIDE}u + local.x;
   let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
   let sx_base0 = row0 * CH_STRIDE + local.x;
   let sz_base0 = row0 * CZ_STRIDE + local.x;

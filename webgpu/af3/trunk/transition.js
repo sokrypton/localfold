@@ -794,7 +794,8 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const half = f16 || [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
   const innerExpr = innerCols !== null ? `${innerCols}u` : "parameters.inner";
   const colsExpr = outCols !== null ? `${outCols}u` : "parameters.columns";
-  const wOffExpr = weightOffset !== null ? `${weightOffset}u` : "parameters.weight_offset";
+  const cols4Expr = outCols !== null ? `${outCols / 4}u` : "(parameters.columns >> 2u)";
+  const wOff4Expr = weightOffset !== null ? `${weightOffset / 4}u` : "(parameters.weight_offset >> 2u)";
   const accumulators = [];
   const inner = [];
   const stores = [];
@@ -806,16 +807,13 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
       if (f16) {
         flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
       }
-      for (let c = 0; c < 4; c += 1) {
-        const value = `acc_${i}_${j}.${"xyzw"[c]}`;
-        rowStores.push(`      output[row_base_${i} + ${4 * j + c}u] ${residual
-          ? `+= ${value};` : `= ${outputPrecision === "f32" ? value : `${outputPrecision}(${value})`};`}`);
-      }
+      const value = outputPrecision === "f32" ? `acc_${i}_${j}` : `vec4<${outputPrecision}>(acc_${i}_${j})`;
+      rowStores.push(`      output[row_base4_${i} + ${j}u] ${residual ? `+= ${value};` : `= ${value};`}`);
     }
     stores.push(`  {
     let row_${i} = row_origin + ty * ${TM}u + ${i}u;
     if (row_${i} < parameters.rows) {
-      let row_base_${i} = row_${i} * ${colsExpr} + column_origin + tx * ${TN}u;
+      let row_base4_${i} = row_${i} * ${cols4Expr} + (column_origin >> 2u) + tx * ${TN / 4}u;
 ${rowStores.join("\n")}
     }
   }`);
@@ -840,7 +838,6 @@ ${rowStores.join("\n")}
       }
     }
   }
-  const weight = (offset) => weightPrecision === T ? `weights[base${offset}]` : `${T}(weights[base${offset}])`;
   const aSteps = ((BM / 4) * BK) / 256;
   const bSteps = ((BN / 4) * BK) / 256;
   const aStrideExpr = sourceGate === null ? innerExpr : `${sourceGate.stride}u`;
@@ -859,7 +856,7 @@ ${rowStores.join("\n")}
   const bPre = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
-  let b_col_${s} = ${wOffExpr} + column_origin + (${eExpr} % ${BN / 4}u) * 4u + b_k_${s} * ${colsExpr};`;
+  let b_col4_${s} = ${wOff4Expr} + (column_origin >> 2u) + (${eExpr} % ${BN / 4}u) + b_k_${s} * ${cols4Expr};`;
   }).join("\n");
   const aStage = Array.from({ length: aSteps }, (_, s) => `    {
       let base0 = a_base_${s} + k0;
@@ -876,9 +873,9 @@ ${rowStores.join("\n")}
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
     const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const wVec = `weights[b_col4_${s} + k0 * ${cols4Expr}]`;
     return `    {
-      let base = b_col_${s} + k0 * ${colsExpr};
-      b_tile[${eExpr}] = vec4<${T}>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
+      b_tile[${eExpr}] = ${weightPrecision === T ? wVec : `vec4<${T}>(${wVec})`};
     }`;
   }).join("\n");
   return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
@@ -886,9 +883,9 @@ ${rowStores.join("\n")}
   bias_offset: u32, activation: u32, padding: vec2<u32>,
 };
 @group(0) @binding(0) var<storage, read> source: array<${sourcePrecision}>;
-@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<${outputPrecision}>;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<${outputPrecision}>>;
 const BM: u32 = ${BM}u;
 const BN: u32 = ${BN}u;
 const BK: u32 = ${BK}u;
@@ -1047,7 +1044,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // always paired them and says so; this did not, and measured 408 GB/s against
   // its 815 on the same shape.
   const PAIR_COUNT: u32 = CHANNELS / 2u;
-  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += ${LANES}u) {
+${channels % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_word += ${LANES}u) {
+    let c = col_word * 2u;
+    let w_scale_0 = ${w("weights[W_SCALE + c]")};
+    let w_scale_1 = ${w("weights[W_SCALE + c + 1u]")};
+    let w_offset_0 = ${w("weights[W_OFFSET + c]")};
+    let w_offset_1 = ${w("weights[W_OFFSET + c + 1u]")};
+    for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
+      let row = base_row + slot_of;
+      if (!full_tile && row >= p.rows) { break; }
+      let index = slot_of * CHANNELS + c;
+      let centre = row_mean[slot_of];
+      let inverse = row_inverse_std[slot_of];
+      let low = (tile[index] - centre) * inverse * w_scale_0 + w_offset_0;
+      let high = (tile[index + 1u] - centre) * inverse * w_scale_1 + w_offset_1;
+      normalized[base_idx + index] = ${normalizedStorage}(low);
+      normalized[base_idx + index + 1u] = ${normalizedStorage}(high);
+    }
+  }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += ${LANES}u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
     if (!full_tile && row >= p.rows) { continue; }
@@ -1061,7 +1075,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       * ${w("weights[W_SCALE + c + 1u]")} + ${w("weights[W_OFFSET + c + 1u]")};
     normalized[base_idx + index] = ${normalizedStorage}(low);
     normalized[base_idx + index + 1u] = ${normalizedStorage}(high);
-  }
+  }`}
 }`;
 
   if (vector) {

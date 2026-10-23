@@ -370,46 +370,38 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let mean = sums[0] / ${model}.0;
     let variance = max(squares[0] / ${model}.0 - mean * mean, 0.0);
     let inverse = inverseSqrt(variance + ${epsilon});
-    for (var c = local.x; c < ${model}u; c += ${LANES}u) {
-      let scale = select(kScale[c], qScale[c], side == 0u);
-      let normalised = (qkv[origin + c] - mean) * inverse * scale;
-      // 🔴 THE KEY IS WRITTEN (head, dim, row) AND THE VALUE (row, head, dim),
-      // because the two are read by different phases of the attention with
-      // different lanes. Attention's logit phase gives a lane a KEY, so it
-      // wants consecutive rows adjacent; its accumulation phase gives a lane a
-      // CHANNEL, so it wants consecutive dims adjacent. One buffer cannot suit
-      // both and they do not have to: the same kernel writes them.
+    // 🔴 THE KEY IS WRITTEN (head, dim, row) AND THE VALUE (row, head, dim),
+    // because the two are read by different phases of the attention with
+    // different lanes. Attention's logit phase gives a lane a KEY, so it
+    // wants consecutive rows adjacent; its accumulation phase gives a lane a
+    // CHANNEL, so it wants consecutive dims adjacent. One buffer cannot suit
+    // both and they do not have to: the same kernel writes them.
+    // 🔴 SPLIT HALVES: channel d of a head pairs with d + ${headDim / 2}, not with
+    // d + 1. Interleaving adjacent channels is the other common convention and
+    // conforms in shape. Fused with the LayerNorm writeback so unrotated query
+    // and strided key never round-trip through global memory.
+    for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
+      let head = slot / ${headDim / 2}u;
+      let d = slot % ${headDim / 2}u;
+      let c0 = head * ${headDim}u + d;
+      let c1 = c0 + ${headDim / 2}u;
+      let c = cosTab[d];
+      let s = sinTab[d];
       if (side == 0u) {
-        query[out + c] = normalised;
+        let q0 = (qkv[origin + c0] - mean) * inverse * qScale[c0];
+        let q1 = (qkv[origin + c1] - mean) * inverse * qScale[c1];
+        query[out + c0] = q0 * c - q1 * s;
+        query[out + c1] = q0 * s + q1 * c;
       } else {
-        let head = c / ${headDim}u;
-        let d = c % ${headDim}u;
-        key[(head * ${headDim}u + d) * ${rows}u + row] = normalised;
+        let k0 = (qkv[origin + c0] - mean) * inverse * kScale[c0];
+        let k1 = (qkv[origin + c1] - mean) * inverse * kScale[c1];
+        let kFirst = (head * ${headDim}u + d) * ${rows}u + row;
+        let kSecond = kFirst + ${headDim / 2}u * ${rows}u;
+        key[kFirst] = k0 * c - k1 * s;
+        key[kSecond] = k0 * s + k1 * c;
       }
     }
-    workgroupBarrier();
-  }
-
-  // 🔴 SPLIT HALVES: channel d of a head pairs with d + ${headDim / 2}, not with
-  // d + 1. Interleaving adjacent channels is the other common convention and
-  // conforms in shape.
-  for (var slot = local.x; slot < ${(model / 2)}u; slot += ${LANES}u) {
-    let head = slot / ${headDim / 2}u;
-    let d = slot % ${headDim / 2}u;
-    let c = cosTab[d];
-    let s = sinTab[d];
-    let first = out + head * ${headDim}u + d;
-    let second = first + ${headDim / 2}u;
-    let q0 = query[first]; let q1 = query[second];
-    query[first] = q0 * c - q1 * s;
-    query[second] = q0 * s + q1 * c;
-    // The key lives at (head, dim, row), so its two rotated channels are a
-    // whole row-stride apart rather than headDim/2 elements.
-    let kFirst = (head * ${headDim}u + d) * ${rows}u + row;
-    let kSecond = kFirst + ${headDim / 2}u * ${rows}u;
-    let k0 = key[kFirst]; let k1 = key[kSecond];
-    key[kFirst] = k0 * c - k1 * s;
-    key[kSecond] = k0 * s + k1 * c;
+    if (side == 0u) { workgroupBarrier(); }
   }
 }`;
 }
@@ -475,6 +467,7 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
     }
     return lines.join("\n");
   };
+  const CHUNK_STRIDE = LANES + 1;
   const dotUnroll = headDim % 8 === 0 ? 8 : 1;
   const dots = Array.from({ length: dotUnroll }, (_, u) => dotStep(u)).join("\n");
   const writeLogits = [];
@@ -482,7 +475,7 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
     // ...one liveness per QUERY when the chains matter, because the test is
     // between this query and this key rather than about the key alone.
     const alive = chainAware ? `live && q_sequence[${t}u] == key_sequence` : "live";
-    writeLogits.push(`      chunk[${t}u * ${LANES}u + local.x] = `
+    writeLogits.push(`      chunk[${t * CHUNK_STRIDE}u + local.x] = `
       + `select(-3.0e38, dot_${t} * ${(1 / Math.sqrt(headDim)).toPrecision(9)}, ${alive});`);
   }
   const accumulate = [];
@@ -498,7 +491,7 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
 ${chainAware ? "@group(0) @binding(4) var<storage, read> sequence: array<i32>;" : ""}
 
 var<workgroup> q_tile: array<f32, ${queryTile * headDim}>;
-var<workgroup> chunk: array<f32, ${queryTile * LANES}>;
+var<workgroup> chunk: array<f32, ${queryTile * CHUNK_STRIDE}>;
 var<workgroup> peak: array<f32, ${queryTile}>;
 var<workgroup> rescale_of: array<f32, ${queryTile}>;
 var<workgroup> total: array<f32, ${queryTile}>;
@@ -547,9 +540,10 @@ ${writeLogits.join("\n")}
     // The chunk's maximum per query, and the flash rescale of what came before.
     if (local.x < ${queryTile}u) {
       let t = local.x;
+      let row_base = t * ${CHUNK_STRIDE}u;
       var largest = -3.0e38;
       for (var l = 0u; l < ${LANES}u; l += 8u) {
-${Array.from({ length: 8 }, (_, u) => `        largest = max(largest, chunk[t * ${LANES}u + l + ${u}u]);`).join("\n")}
+${Array.from({ length: 8 }, (_, u) => `        largest = max(largest, chunk[row_base + l + ${u}u]);`).join("\n")}
       }
       let previous = peak[t];
       let combined = max(previous, largest);
@@ -560,7 +554,11 @@ ${Array.from({ length: 8 }, (_, u) => `        largest = max(largest, chunk[t * 
       peak[t] = combined;
       var sum = 0.0;
       for (var l = 0u; l < ${LANES}u; l += 8u) {
-${Array.from({ length: 8 }, (_, u) => `        sum += exp(chunk[t * ${LANES}u + l + ${u}u] - combined);`).join("\n")}
+${Array.from({ length: 8 }, (_, u) => `        {
+          let w_${u} = exp(chunk[row_base + l + ${u}u] - combined);
+          chunk[row_base + l + ${u}u] = w_${u};
+          sum += w_${u};
+        }`).join("\n")}
       }
       running[t] += sum;
     }
@@ -569,7 +567,7 @@ ${Array.from({ length: 8 }, (_, u) => `        sum += exp(chunk[t * ${LANES}u + 
     // Phase two: a lane owns a CHANNEL. Each value it reads is used by all
     // ${queryTile} queries too.
 ${Array.from({ length: queryTile }, (_, t) =>
-    `    let rescale_${t} = rescale_of[${t}u];\n    let peak_${t} = peak[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
+    `    let rescale_${t} = rescale_of[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
     if (k0 + ${LANES}u <= ${rows}u) {
       for (var l = 0u; l < ${LANES}u; l += 4u) {
 ${Array.from({ length: 4 }, (_, u) => {
@@ -577,7 +575,7 @@ ${Array.from({ length: 4 }, (_, u) => {
   return `        {
           let v = value[${src} * ${model}u + head * ${headDim}u + local.x];
 ${Array.from({ length: queryTile }, (__, t) =>
-    `          part_${t} += exp(chunk[${t}u * ${LANES}u + l + ${u}u] - peak_${t}) * v;`).join("\n")}
+    `          part_${t} += chunk[${t * CHUNK_STRIDE}u + l + ${u}u] * v;`).join("\n")}
         }`;
 }).join("\n")}
       }
@@ -587,7 +585,7 @@ ${Array.from({ length: queryTile }, (__, t) =>
         if (source >= ${rows}u) { break; }
         let v = value[source * ${model}u + head * ${headDim}u + local.x];
 ${Array.from({ length: queryTile }, (_, t) =>
-    `        part_${t} += exp(chunk[${t}u * ${LANES}u + l] - peak_${t}) * v;`).join("\n")}
+    `        part_${t} += chunk[${t * CHUNK_STRIDE}u + l] * v;`).join("\n")}
       }
     }
 ${accumulate.join("\n")}

@@ -421,7 +421,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // A lane owns a PAIR of channels, so it owns the whole word they share; see
   // webgpu/runtime/storage.js. CHANNELS is 128 here and even in every dialect.
   const PAIR_COUNT: u32 = CHANNELS / 2u;
-  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
+${channels % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_word += 64u) {
+    let c = col_word * 2u;
+    let w_scale_0 = weights[W_NORM_SCALE + c];
+    let w_scale_1 = weights[W_NORM_SCALE + c + 1u];
+    let w_offset_0 = weights[W_NORM_OFFSET + c];
+    let w_offset_1 = weights[W_NORM_OFFSET + c + 1u];
+    for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
+      let row = base_row + slot_of;
+      if (!full_tile && row >= PAIRS) { break; }
+      let index = slot_of * CHANNELS + c;
+      let centre = row_mean[slot_of];
+      let scaled = row_inverse_std[slot_of];
+      let low = (tile[index] - centre) * scaled * w_scale_0 + w_offset_0;
+      let high = (tile[index + 1u] - centre) * scaled * w_scale_1 + w_offset_1;
+      let pair_word = row * PAIR_COUNT + col_word;
+      ${storedPair(normalizedStorage, "normalized", "pair_word", "low", "high")}
+    }
+  }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
     if (!full_tile && row >= PAIRS) { continue; }
@@ -435,7 +452,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       * weights[W_NORM_SCALE + c + 1u] + weights[W_NORM_OFFSET + c + 1u];
     let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
     ${storedPair(normalizedStorage, "normalized", "pair_word", "low", "high")}
-  }
+  }`}
 }`;
 
   const matrixGeometry = shape.attendMatrix
@@ -570,7 +587,7 @@ ${Array.from({ length: biasUnroll }, (_, u) => `    {
   // a row costs, so a taller row tile serves each weight read. See PROJECT_ROWS_F16.
   const project16 = shape.projectArithmetic === "f16" && !packQkvg;
   const AT = project16 ? "f16" : "f32";
-  const ACT_VEC4 = project16 && ROWS % 4 === 0;
+  const ACT_VEC4 = !packQkvg && ROWS % 4 === 0;
   const ACT_GROUPS = ROWS / 4;
   const overActGroups = (body) => Array.from({ length: ACT_GROUPS }, (_, g) => body(g)).join("\n");
   const project = `${project16 || qkvHalf ? "enable f16;\n" : ""}${common}
