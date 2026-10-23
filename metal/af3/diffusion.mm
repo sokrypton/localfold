@@ -264,7 +264,8 @@ static void conditioningAhead(float level) {
   const size_t pn = ((size_t)n + 15) / 16 * 16, per = (size_t)n * (D.ldn + D.ldr) * 4;
   const size_t rem = D.plan.size() - D.planAt, maxK = std::max<size_t>(1, std::min<size_t>(32, ((size_t)768 << 20) / std::max<size_t>(per, 1)));
   const size_t batches = std::max<size_t>(1, (rem + maxK - 1) / maxK), K = std::min<size_t>(rem, (rem + batches - 1) / batches);
-  if (pn > 256 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
+  const size_t maxPn = flag("trunk.dialect.structuralTokens") ? 256 : 128;
+  if (pn > maxPn || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
   D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
   const size_t kn = K * n, pkn = (kn + 63) / 64 * 64, cRows = std::max(K * pn, pkn);
   D.heldSingle = scratch<float>("dt.heldSingle", pkn * Cc);
@@ -296,39 +297,42 @@ static void conditioningAhead(float level) {
   linW(ADA_RAW ? ch : cn, D.wNorm, D.heldNorm, K * pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning, ahead");
   linW(ch, D.wRaw, D.heldRaw, K * pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates, ahead");
 }
-static void transformer(float* act, const float* cond, float level) {
+static void transformerConditioning(const float* cond, float level, float** gNormOut, float** gRawOut, bool* permutedOut) {
   const std::string Tn = "diffusion.transformer";
   int n = D.n, C = metaI(Tn + ".channels"), Cc = metaI(Tn + ".condChannels");
-  int heads = metaI(Tn + ".heads"), Dh = metaI(Tn + ".dimension"), Wd = heads * Dh, factor = metaI(Tn + ".transitionFactor");
-  size_t rows = (size_t)n * NS;
-  // every block's conditioning, two GEMMs - or the slot conditioningAhead holds for this level
-  // (the conditioning GEMMs too on 16-row tiles: [LN0(cond) | cond] in half, the padding rows zero)
   size_t pn = ((size_t)n + 15) / 16 * 16;
-  float* gNorm; float* gRaw;
-  bool permuted = false;
   auto slot = std::find(D.held.begin(), D.held.end(), level);
   if (slot != D.held.end()) {
     size_t idx = (size_t)(slot - D.held.begin());
     size_t stepRows = D.heldPermuted ? (size_t)n : pn;
-    gNorm = D.heldNorm + idx * stepRows * D.ldn;
-    gRaw = D.heldRaw + idx * stepRows * D.ldr;
-    permuted = D.heldPermuted;
-  } else {
-    gNorm = scratch<float>("dt.gNorm", pn * D.ldn);
-    gRaw = scratch<float>("dt.gRaw", pn * D.ldr);
-    half* cn = scratch<half>("dt.cn", pn * Cc);
-    half* ch = scratch<half>("dt.ch", pn * Cc);
-    run("af3_cond_norm_cast", grid1d((pn + 7) / 8, 1), 256, CondNormCastArgs{cond, cn, ch, 1u, (uint)n, (uint)pn, (uint)Cc});
-    if (gemmCondPermuted(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, n, Cc, D.ldn, D.bNorm, n, 2 * C, ADA_RAW ? 0 : C,
-                         "transformer conditioning") &&
-        gemmCondPermuted(ch, D.wRaw, gRaw, pn, n, Cc, D.ldr, D.bRaw, n, C, C,
-                         "transformer zero gates")) {
-      permuted = true;
-    } else {
-      linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
-      linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
-    }
+    *gNormOut = D.heldNorm + idx * stepRows * D.ldn;
+    *gRawOut = D.heldRaw + idx * stepRows * D.ldr;
+    *permutedOut = D.heldPermuted;
+    return;
   }
+  float* gNorm = scratch<float>("dt.gNorm", pn * D.ldn);
+  float* gRaw = scratch<float>("dt.gRaw", pn * D.ldr);
+  half* cn = scratch<half>("dt.cn", pn * Cc);
+  half* ch = scratch<half>("dt.ch", pn * Cc);
+  run("af3_cond_norm_cast", grid1d((pn + 7) / 8, 1), 256, CondNormCastArgs{cond, cn, ch, 1u, (uint)n, (uint)pn, (uint)Cc});
+  if (gemmCondPermuted(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, n, Cc, D.ldn, D.bNorm, n, 2 * C, ADA_RAW ? 0 : C,
+                       "transformer conditioning") &&
+      gemmCondPermuted(ch, D.wRaw, gRaw, pn, n, Cc, D.ldr, D.bRaw, n, C, C,
+                       "transformer zero gates")) {
+    *permutedOut = true;
+  } else {
+    linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
+    linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
+    *permutedOut = false;
+  }
+  *gNormOut = gNorm;
+  *gRawOut = gRaw;
+}
+static void transformer(float* act, const float* gNorm, const float* gRaw, bool permuted, bool preTx0) {
+  const std::string Tn = "diffusion.transformer";
+  int n = D.n, C = metaI(Tn + ".channels");
+  int heads = metaI(Tn + ".heads"), Dh = metaI(Tn + ".dimension"), Wd = heads * Dh, factor = metaI(Tn + ".transitionFactor");
+  size_t rows = (size_t)n * NS;
   bool noResidual = flag(Tn + ".noResidual");
   // the GEMMs run on the rows rounded up to 16: a ragged last tile takes the GEMM's bounds-checked paths (68 rows: 0.31
   // against 0.22 ms for a 768 x 3072 projection). The padding rows compute values nobody reads (zero in, finite out)
@@ -356,10 +360,12 @@ static void transformer(float* act, const float* cond, float level) {
     const float* gFfw = permuted ? gNorm + (size_t)(2 * b + 1) * n * 2 * C : gAtt + 2 * C;
     const float* zAtt = permuted ? gRaw + (size_t)(2 * b) * n * C : gRaw + (size_t)b * 2 * C;
     const float* zFfw = permuted ? gRaw + (size_t)(2 * b + 1) * n * C : zAtt + C;
-    adaLn(act, gAtt, gAtt + C, x, nullptr, rows, C, n, ldn,
-          noResidual ? gFfw : nullptr, noResidual ? gFfw + C : nullptr, noResidual ? tn : nullptr,
-          false, pendY, pendGate, ldr, nullptr, 1.f, permuted);
-    pendY = nullptr; pendGate = nullptr;
+    if (b > 0 || !preTx0) {
+      adaLn(act, gAtt, gAtt + C, x, nullptr, rows, C, n, ldn,
+            noResidual ? gFfw : nullptr, noResidual ? gFfw + C : nullptr, noResidual ? tn : nullptr,
+            false, pendY, pendGate, ldr, nullptr, 1.f, permuted);
+      pendY = nullptr; pendGate = nullptr;
+    }
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = Dh; at.rows = NS; at.scale = 1.f / sqrtf((float)Dh);
     at.bias = D.bias[b]; at.biasStride = D.stride; at.biasPadInf = true; at.qBias = W(B + ".qBias");
@@ -520,21 +526,28 @@ static float* denoise(const float* x, float level, float* eulerX = nullptr, floa
     snProj = scratch<float>("dn.snProj", pn * perToken);
     lin(sn, "diffusion.singleCondEmbeddingProjection", snProj, pn, Cs, perToken);
   }
+  float* gNorm = nullptr; float* gRaw = nullptr; bool permuted = false;
+  transformerConditioning(single, level, &gNorm, &gRaw, &permuted);
   stage("conditioning");
+  const int C = metaI("diffusion.transformer.channels");
+  const bool noResidual = flag("diffusion.transformer.noResidual");
+  const size_t prows = (rows + 15) / 16 * 16;
+  const bool fuseTx0 = D.nblocks > 0 && C == 768 && perToken == 768;
+  half* tx0 = fuseTx0 ? scratch<half>("dt.x", prows * C) : nullptr;
+  half* tn0 = (fuseTx0 && noResidual) ? scratch<half>("dt.tn", prows * C) : nullptr;
+  const int ldn0 = permuted ? 2 * C : D.ldn;
+  const float* gAtt0 = gNorm;
+  const float* gFfw0 = permuted ? gNorm + (size_t)n * 2 * C : gAtt0 + 2 * C;
   const float* atomMask = M.f("batch.predDenseAtomMask");
-  encoderStep("diffusion.encoder", D.enc, x, atomMask, in, snProj);
+  encoderStep("diffusion.encoder", D.enc, x, atomMask, in, snProj,
+              fuseTx0 ? gAtt0 : nullptr, fuseTx0 ? gAtt0 + C : nullptr, tx0,
+              tn0 ? gFfw0 : nullptr, tn0 ? gFfw0 + C : nullptr, tn0, ldn0, permuted);
   stage("encoder");
   float* act = D.enc.tokenAct;
   stage("snproj");
-  transformer(act, single, level);
+  transformer(act, gNorm, gRaw, permuted, fuseTx0);
   stage("transformer");
-  size_t prows = (rows + 15) / 16 * 16;
-  half* actn = scratch<half>("dn.actn", prows * perToken);
-  static const half* zeroedActn = nullptr; static size_t zeroedActnRows = 0;
-  if (prows > rows && (actn != zeroedActn || prows != zeroedActnRows)) {
-    fill(actn + rows * perToken, 0, (prows - rows) * perToken * sizeof(half));
-    zeroedActn = actn; zeroedActnRows = prows;
-  }
+  half* actn = scratch<half>("dt.x", prows * perToken);
   ln(act, actn, rows, perToken, "diffusion.outputNormScale", "diffusion.outputNormOffset");
   float* upd = atomDecoder(actn);
   stage("decoder");

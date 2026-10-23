@@ -359,12 +359,6 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
   const bool parallel = flag("trunk.dialect.parallelPairformer");
   const size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
-  float* s0 = nullptr;
-  if (parallel) {
-    s0 = scratch<float>("st.s0", np * Cs);
-    copy(s0, single, (size_t)n * Cs * 4);
-    if (np > (size_t)n) fill(s0 + (size_t)n * Cs, 0, (np - n) * Cs * 4);
-  }
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
   const half* xs = sharedNorm(pair);
@@ -399,7 +393,15 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
       zeroedNrm = nrm; zeroedO = o; zeroedN = n;
     }
   }
-  ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
+  if (parallel) {
+    const std::string tn = B + ".singleTransition.inputLayerNorm";
+    half* txn = scratch<half>("st.xn", np * Cs);
+    layerNormDual(single, nrm, W(A + ".layerNormScale"), Wopt(A + ".layerNormOffset"),
+                  txn, W(tn + "Scale"), Wopt(tn + "Offset"), n, Cs);
+    emit(2, single, tn, txn);
+  } else {
+    ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
+  }
   const float* gateBias = !parallel ? nullptr : M.derived<float>("gateOne:" + num(Wd), (size_t)4 * Wd, [&](float* b) {
     std::vector<float> v((size_t)4 * Wd, 0.f);
     for (int k = 3 * Wd; k < 4 * Wd; ++k) v[k] = 1.f;
@@ -411,8 +413,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
   lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
-  if (parallel) transition(s0, n, Cs, B + ".singleTransition", single, "", "", "st.");
-  else transition(single, n, Cs, B + ".singleTransition", nullptr, "", "", "st.");
+  transition(single, n, Cs, B + ".singleTransition", nullptr, "", "", "st.");
 }
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias) {

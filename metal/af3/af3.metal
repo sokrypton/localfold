@@ -305,6 +305,7 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
   const uint j0 = tg.x * 8, i0 = tg.y * 8;
   if (i0 >= a.n || j0 >= a.n) return;
   threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
+  threadgroup half4 Ws2[256];        // second 8-head block when H > 8 (2.0 KB)
   threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
   if (a.C <= 128 || (a.C == 256 && a.H <= 4)) {
     if (a.H <= 8) {
@@ -419,57 +420,124 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
         }
       }
     }
-  } else {
+  } else if (a.H <= 8) {
     const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
     const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
     device const half4* p0_base = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C);
     device const half4* p1_base = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C);
-    for (uint h8 = 0; h8 < a.H; h8 += 8) {
-      const uint remH = min(8u, a.H - h8);
-      float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
-      for (uint c0 = 0; c0 < a.C; c0 += 128) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        Ws[tid] = (remH == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + h8 + (tid & 1) * 4) : half4(0.h);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint c4_base = (c0 >> 2) + tx * 4;
+    float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
+    for (uint c0 = 0; c0 < a.C; c0 += 128) {
+      if (c0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+      Ws[tid] = (a.H == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + (tid & 1) * 4) : half4(0.h);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const uint c4_base = (c0 >> 2) + tx * 4;
+      _Pragma("clang loop unroll(full)")
+      for (uint u = 0; u < 4; ++u) {
+        float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+        float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+        uint c = (tx * 4 + u) * 4;
         _Pragma("clang loop unroll(full)")
-        for (uint u = 0; u < 4; ++u) {
-          float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
-          float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
-          uint c = (tx * 4 + u) * 4;
-          _Pragma("clang loop unroll(full)")
-          for (uint k = 0; k < 4; ++k) {
-            float xv0 = x0[k], xv1 = x1[k];
-            float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
-            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
-            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
-          }
+        for (uint k = 0; k < 4; ++k) {
+          float xv0 = x0[k], xv1 = x1[k];
+          float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
+          acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+          acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
         }
       }
-      float4 v0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
-      float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
-      v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
-      v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
-      if (tx == 0 || (tx == 4 && remH > 4)) {
-        const uint h_base = tx;
-        const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
-        const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
-        const bool vj0 = (j0 + col_j0) < a.n;
-        const bool vj1 = (j0 + col_j1) < a.n;
-        const float4 wb = a.wBias ? *(device const float4*)(a.wBias + h8 + h_base) : float4(0.f);
+    }
+    float4 v0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
+    float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
+    v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
+    v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
+    if (tx == 0 || (tx == 4 && a.H > 4)) {
+      const uint h_base = tx;
+      const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
+      const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
+      const bool vj0 = (j0 + col_j0) < a.n;
+      const bool vj1 = (j0 + col_j1) < a.n;
+      const float4 wb = a.wBias ? *(device const float4*)(a.wBias + h_base) : float4(0.f);
+      _Pragma("clang loop unroll(full)")
+      for (uint t = 0; t < 4; ++t) {
+        uint h = h_base + t;
+        tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)((v0[t] + wb[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
+        tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)((v1[t] + wb[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < a.H * 8) {
+      uint h = tid >> 3, row_i = tid & 7, i = i0 + row_i;
+      if (i < a.n) {
+        *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + (h * 8 + row_i) * 16);
+      }
+    }
+  } else {
+    const uint remH = a.H - 8u;
+    const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
+    const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
+    device const half4* p0_base = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C);
+    device const half4* p1_base = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C);
+    float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
+    float4 acc0_2(0.f), acc0_3(0.f), acc1_2(0.f), acc1_3(0.f);
+    for (uint c0 = 0; c0 < a.C; c0 += 128) {
+      if (c0 > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
+      Ws[tid] = *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + (tid & 1) * 4);
+      Ws2[tid] = (remH == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + 8 + (tid & 1) * 4) : half4(0.h);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const uint c4_base = (c0 >> 2) + tx * 4;
+      _Pragma("clang loop unroll(full)")
+      for (uint u = 0; u < 4; ++u) {
+        float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+        float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+        uint c = (tx * 4 + u) * 4;
+        _Pragma("clang loop unroll(full)")
+        for (uint k = 0; k < 4; ++k) {
+          float xv0 = x0[k], xv1 = x1[k];
+          uint wi = (c + k) * 2;
+          float4 wa = float4(Ws[wi]), wb = float4(Ws[wi + 1]);
+          acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+          acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+          float4 wc = float4(Ws2[wi]), wd = float4(Ws2[wi + 1]);
+          acc0_2 += xv0 * wc; acc0_3 += xv0 * wd;
+          acc1_2 += xv1 * wc; acc1_3 += xv1 * wd;
+        }
+      }
+    }
+    float4 v0_0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
+    float4 v1_0 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
+    v0_0 += simd_shuffle_xor(v0_0, (ushort)2); v1_0 += simd_shuffle_xor(v1_0, (ushort)2);
+    v0_0 += simd_shuffle_xor(v0_0, (ushort)1); v1_0 += simd_shuffle_xor(v1_0, (ushort)1);
+    float4 v0_1 = (tx < 4 ? acc0_2 : acc0_3) + simd_shuffle_xor(tx < 4 ? acc0_3 : acc0_2, (ushort)4);
+    float4 v1_1 = (tx < 4 ? acc1_2 : acc1_3) + simd_shuffle_xor(tx < 4 ? acc1_3 : acc1_2, (ushort)4);
+    v0_1 += simd_shuffle_xor(v0_1, (ushort)2); v1_1 += simd_shuffle_xor(v1_1, (ushort)2);
+    v0_1 += simd_shuffle_xor(v0_1, (ushort)1); v1_1 += simd_shuffle_xor(v1_1, (ushort)1);
+    if (tx == 0 || tx == 4) {
+      const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
+      const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
+      const bool vj0 = (j0 + col_j0) < a.n;
+      const bool vj1 = (j0 + col_j1) < a.n;
+      const float4 wb0 = a.wBias ? *(device const float4*)(a.wBias + tx) : float4(0.f);
+      _Pragma("clang loop unroll(full)")
+      for (uint t = 0; t < 4; ++t) {
+        uint h = tx + t;
+        tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)((v0_0[t] + wb0[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
+        tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)((v1_0[t] + wb0[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
+      }
+      if (tx == 0 || remH > 4) {
+        const float4 wb1 = a.wBias ? *(device const float4*)(a.wBias + 8 + tx) : float4(0.f);
         _Pragma("clang loop unroll(full)")
         for (uint t = 0; t < 4; ++t) {
-          uint h = h_base + t;
-          tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)((v0[t] + wb[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
-          tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)((v1[t] + wb[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
+          uint h = tx + t;
+          tile[(h * 8 + row_i0) * 16 + 8 + col_j0] = vj0 ? (half)((v0_1[t] + wb1[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
+          tile[(h * 8 + row_i1) * 16 + 8 + col_j1] = vj1 ? (half)((v1_1[t] + wb1[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (tid < remH * 8) {
-        uint h = h8 + (tid >> 3), row_i = tid & 7, i = i0 + row_i;
-        if (i < a.n) {
-          *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + ((tid >> 3) * 8 + row_i) * 16);
-        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < a.H * 8) {
+      uint h = tid >> 3, row_i = tid & 7, i = i0 + row_i;
+      if (i < a.n) {
+        *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) =
+          *(threadgroup const uint4*)(tile + ((h & 7) * 8 + row_i) * 16 + (h & 8));
       }
     }
   }
@@ -1068,44 +1136,98 @@ kernel void af3_encoder_start(LF_ARGS(EncoderStartArgs)) {
   }
   a.act[t] = a.qStart[gq * a.C + c] + v * a.qMask[gq];
 }
-kernel void af3_aggregate(LF_ARGS(AggregateArgs)) {
-  ulong t = LF_INDEX;
-  if ((a.Cp & 3) == 0) {
-    uint Cp4 = a.Cp >> 2;
-    if (t >= a.rows * Cp4) return;
-    uint u = (uint)t, token = lf_udiv(u, Cp4), c4 = u - token * Cp4;
-    uint k = lf_udiv(token, a.tokens), tok = token - k * a.tokens, g0 = tok * a.dense;
+kernel void af3_aggregate(constant AggregateArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                          uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint3 tpg [[threads_per_threadgroup]]) {
+  ulong token = ((ulong)tg.y * ng.x + tg.x) * (tpg.x >> 5) + sg;
+  if (token >= a.rows) return;
+  uint t32 = (uint)token, k = lf_udiv(t32, a.tokens), tok = t32 - k * a.tokens, g0 = tok * a.dense;
+  if (a.Cp == 768) {
     float count = 0.f;
-    float4 sum = float4(0.f);
-    device const float4* proj4 = (device const float4*)a.projected;
+    float4 sum[6] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
+    device const float4* proj4 = (device const float4*)a.projected + lane;
     for (uint at = 0; at < a.dense; ++at) {
       float m = a.atomMask[g0 + at];
       count += m;
       if (m != 0.f && a.gmask[g0 + at] != 0.f) {
-        float4 v = proj4[((ulong)a.idx[g0 + at] + k * a.q1) * Cp4 + c4];
-        sum += max(v, float4(0.f));
+        device const float4* p4 = proj4 + ((ulong)a.idx[g0 + at] + (ulong)k * a.q1) * 192;
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 6; ++i) sum[i] += max(p4[i * 32], float4(0.f));
       }
     }
-    float4 res = count > 0.f ? sum / count : float4(0.f);
-    if (a.tokenBias) res += ((device const float4*)a.tokenBias)[(ulong)tok * Cp4 + c4];
-    ((device float4*)a.out)[t] = res;
+    device const float4* tb4 = a.tokenBias ? (device const float4*)a.tokenBias + (ulong)tok * 192 + lane : nullptr;
+    device float4* out4 = (device float4*)a.out + token * 192 + lane;
+    float4 xv[6];
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 6; ++i) {
+      float4 res = count > 0.f ? sum[i] / count : float4(0.f);
+      if (tb4) res += tb4[i * 32];
+      out4[i * 32] = res;
+      xv[i] = res;
+    }
+    if (a.xOut) {
+      float s = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 6; ++i) s += xv[i].x + xv[i].y + xv[i].z + xv[i].w;
+      float mean = simd_sum(s) / 768.f, v = 0.f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 6; ++i) { float4 d = xv[i] - mean; v += dot(d, d); }
+      float inv = rsqrt(simd_sum(v) / 768.f + a.eps);
+      ulong pr = (ulong)tok * a.ld;
+      device const float4* sc4 = (device const float4*)(a.scale + pr) + lane;
+      device const float4* sh4 = (device const float4*)(a.shift + pr) + lane;
+      device half4* xout4 = (device half4*)a.xOut + token * 192 + lane;
+      device const float4* fsc4 = a.fOut ? (device const float4*)(a.fScale + pr) + lane : nullptr;
+      device const float4* fsh4 = a.fOut ? (device const float4*)(a.fShift + pr) + lane : nullptr;
+      device half4* fout4 = a.fOut ? (device half4*)a.fOut + token * 192 + lane : nullptr;
+      const bool rawS = a.raw != 0;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 6; ++i) {
+        float4 nrm = (xv[i] - mean) * inv;
+        float4 sv = sc4[i * 32];
+        xout4[i * 32] = half4((rawS ? sv : float4(lf_sigmoid(sv.x), lf_sigmoid(sv.y), lf_sigmoid(sv.z), lf_sigmoid(sv.w))) * nrm + sh4[i * 32]);
+        if (fout4) {
+          float4 fsv = fsc4[i * 32];
+          fout4[i * 32] = half4((rawS ? fsv : float4(lf_sigmoid(fsv.x), lf_sigmoid(fsv.y), lf_sigmoid(fsv.z), lf_sigmoid(fsv.w))) * nrm + fsh4[i * 32]);
+        }
+      }
+    }
     return;
   }
-  if (t >= a.rows * a.Cp) return;
-  uint u = (uint)t, token = lf_udiv(u, a.Cp), c = u - token * a.Cp;
-  uint k = lf_udiv(token, a.tokens), tok = token - k * a.tokens, g0 = tok * a.dense;
-  float count = 0.f, sum = 0.f;
-  for (uint at = 0; at < a.dense; ++at) {
-    float m = a.atomMask[g0 + at];
-    count += m;
-    if (m != 0.f) {
-      float v = a.gmask[g0 + at] != 0.f ? a.projected[((ulong)a.idx[g0 + at] + k * a.q1) * a.Cp + c] : 0.f;
-      sum += max(v, 0.f);
+  if ((a.Cp & 3) == 0) {
+    uint Cp4 = a.Cp >> 2;
+    device const float4* proj4 = (device const float4*)a.projected;
+    for (uint c4 = lane; c4 < Cp4; c4 += 32) {
+      float count = 0.f;
+      float4 sum = float4(0.f);
+      for (uint at = 0; at < a.dense; ++at) {
+        float m = a.atomMask[g0 + at];
+        count += m;
+        if (m != 0.f && a.gmask[g0 + at] != 0.f) {
+          float4 v = proj4[((ulong)a.idx[g0 + at] + (ulong)k * a.q1) * Cp4 + c4];
+          sum += max(v, float4(0.f));
+        }
+      }
+      float4 res = count > 0.f ? sum / count : float4(0.f);
+      if (a.tokenBias) res += ((device const float4*)a.tokenBias)[(ulong)tok * Cp4 + c4];
+      ((device float4*)a.out)[token * Cp4 + c4] = res;
     }
+    return;
   }
-  float res = count > 0.f ? sum / count : 0.f;
-  if (a.tokenBias) res += a.tokenBias[(ulong)tok * a.Cp + c];
-  a.out[t] = res;
+  for (uint c = lane; c < a.Cp; c += 32) {
+    float count = 0.f, sum = 0.f;
+    for (uint at = 0; at < a.dense; ++at) {
+      float m = a.atomMask[g0 + at];
+      count += m;
+      if (m != 0.f) {
+        float v = a.gmask[g0 + at] != 0.f ? a.projected[((ulong)a.idx[g0 + at] + (ulong)k * a.q1) * a.Cp + c] : 0.f;
+        sum += max(v, 0.f);
+      }
+    }
+    float res = count > 0.f ? sum / count : 0.f;
+    if (a.tokenBias) res += a.tokenBias[(ulong)tok * a.Cp + c];
+    a.out[token * a.Cp + c] = res;
+  }
 }
 kernel void af3_target_feat(LF_ARGS(TargetFeatArgs)) {
   const uint width = 31 * 2 + 1 + 384;

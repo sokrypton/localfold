@@ -154,7 +154,10 @@ struct EncoderOut {
 };
 EncoderOut prepareEncoder(const std::string& E, const std::string& ref, const float* trunkSingle, const float* trunkPair);
 void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions, const float* atomMask = nullptr,
-                 float posScale = 1.f, const float* tokenBias = nullptr);
+                 float posScale = 1.f, const float* tokenBias = nullptr,
+                 const float* txScale = nullptr, const float* txShift = nullptr, half* txOut = nullptr,
+                 const float* txFfwScale = nullptr, const float* txFfwShift = nullptr, half* txFfwOut = nullptr,
+                 int txLd = 0, bool txPreSigmoid = false);
 std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
                                    const AtomShape& sh);
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);

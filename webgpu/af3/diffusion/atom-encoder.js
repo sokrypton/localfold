@@ -1075,7 +1075,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // Written one workgroup per row rather than over a tile like its fused
   // sibling: it runs once per block on the query rows alone, and a shape this
   // simple is one that can be read against the reference.
-  const normaliseQueries = `${common}
+  const normaliseQueries = (() => {
+    const cSteps = channels % 64 === 0 && channels <= 256 ? channels / 64 : 0;
+    const overCSteps = (body) => Array.from({ length: cSteps }, (_, s) => body(s)).join("\n  ");
+    const unrollReduceDual = [32, 16, 8, 4, 2, 1].map((stride) =>
+      `  if (local < ${stride}u) {\n    reduce_a[local] += reduce_a[local + ${stride}u];\n    reduce_b[local] += reduce_b[local + ${stride}u];\n  }\n  workgroupBarrier();`
+    ).join("\n");
+    return `${common}
 @group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
@@ -1103,13 +1109,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = sum_a;
   reduce_b[local] = sum_b;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+${unrollReduceDual}
   let mean = reduce_a[0] / f32(C);
   let cond_mean = reduce_b[0] / f32(C);
   workgroupBarrier();
@@ -1125,13 +1125,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = var_a;
   reduce_b[local] = var_b;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
-    }
-    workgroupBarrier();
-  }
+${unrollReduceDual}
   let inverse = inverseSqrt(reduce_a[0] / f32(C) + EPSILON);
   let cond_inverse = inverseSqrt(reduce_b[0] / f32(C) + EPSILON);
   workgroupBarrier();
@@ -1142,7 +1136,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var c = local; c < C; c += 64u) {
+${cSteps > 0 ? `  ${overCSteps((s) => `let c_${s} = local + ${s * 64}u;\n  var scale_value_${s} = weights[W_qSingleCondScaleBias + c_${s}];\n  var shift_${s} = 0.0;`)}
+  for (var d = 0u; d < C; d += 1u) {
+    let cd = cond[d];
+    let ws_base = W_qSingleCondScaleWeights + d * C;
+    let wb_base = W_qSingleCondBias + d * C;
+    ${overCSteps((s) => `scale_value_${s} += cd * weights[ws_base + c_${s}];\n    shift_${s} += cd * weights[wb_base + c_${s}];`)}
+  }
+  ${overCSteps((s) => `normalised[base + c_${s}] = 1.0 / (1.0 + exp(-scale_value_${s})) * ((act[base + c_${s}] - mean) * inverse) + shift_${s};`)}` : `  for (var c = local; c < C; c += 64u) {
     var scale_value = weights[W_qSingleCondScaleBias + c];
     var shift = 0.0;
     for (var d = 0u; d < C; d += 1u) {
@@ -1151,8 +1152,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     normalised[base + c] = 1.0 / (1.0 + exp(-scale_value))
       * ((act[base + c] - mean) * inverse) + shift;
-  }
+  }`}
 }`;
+  })();
 
   const projectKeysAtoms = conditionedProject("k", {
     bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
@@ -1226,14 +1228,40 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let query = query_index % QUERIES;
   let local = local_id.x;
   let query_base = query_index * WIDTH + head * DIMENSION;
-  for (var d = local; d < DIMENSION; d += 64u) {
+${shape.dimension <= 64
+  ? `  if (local < DIMENSION) {
+    staged_q[local] = q[query_base + local];
+  }`
+  : `  for (var d = local; d < DIMENSION; d += 64u) {
     staged_q[d] = q[query_base + d];
-  }
+  }`}
   workgroupBarrier();
 
   let q_mask = queries_mask[query_index];
   let pl_base = (((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS;
-  var local_max = -3.0e38;
+${keys === 128
+  ? `  let key0 = local;
+  let key1 = local + 64u;
+  let key_index0 = subset * KEYS + key0;
+  let key_index1 = subset * KEYS + key1;
+  let k_base0 = key_index0 * WIDTH + head * DIMENSION;
+  let k_base1 = key_index1 * WIDTH + head * DIMENSION;
+  var dot0 = 0.0;
+  var dot1 = 0.0;
+  for (var d = 0u; d < DIMENSION; d += 1u) {
+    let qd = staged_q[d];
+    dot0 += qd * k[k_base0 + d];
+    dot1 += qd * k[k_base1 + d];
+  }
+${keyMasked
+  ? `  let bias0 = -1.0e9 * ((1.0 - q_mask) + (1.0 - keys_mask[key_index0]));
+  let bias1 = -1.0e9 * ((1.0 - q_mask) + (1.0 - keys_mask[key_index1]));`
+  : `  let bias0 = 1.0e9 * (q_mask - 1.0) * (keys_mask[key_index0] - 1.0);
+  let bias1 = 1.0e9 * (q_mask - 1.0) * (keys_mask[key_index1] - 1.0);`}
+  let l0 = dot0 * SCALE + bias0 + pair_logits[pl_base + key0];
+  let l1 = dot1 * SCALE + bias1 + pair_logits[pl_base + key1];
+  let local_max = max(max(-3.0e38, l0), l1);`
+  : `  var local_max = -3.0e38;
   for (var key = local; key < KEYS; key += 64u) {
     let key_index = subset * KEYS + key;
     var dot = 0.0;
@@ -1251,7 +1279,7 @@ ${keyMasked
     let l = dot * SCALE + bias + pair_logits[pl_base + key];
     logits[key] = l;
     local_max = max(local_max, l);
-  }
+  }`}
   reduce[local] = local_max;
   workgroupBarrier();
   if (local < 32u) { reduce[local] = max(reduce[local], reduce[local + 32u]); }
@@ -1269,12 +1297,18 @@ ${keyMasked
   let largest = reduce[0];
   workgroupBarrier();
 
-  var local_sum = 0.0;
+${keys === 128
+  ? `  let val0 = exp(l0 - largest);
+  let val1 = exp(l1 - largest);
+  logits[key0] = val0;
+  logits[key1] = val1;
+  let local_sum = val0 + val1;`
+  : `  var local_sum = 0.0;
   for (var key = local; key < KEYS; key += 64u) {
     let value = exp(logits[key] - largest);
     logits[key] = value;
     local_sum += value;
-  }
+  }`}
   reduce[local] = local_sum;
   workgroupBarrier();
   if (local < 32u) { reduce[local] += reduce[local + 32u]; }
@@ -1291,14 +1325,23 @@ ${keyMasked
   workgroupBarrier();
   let total = reduce[0];
 
-  for (var d = local; d < DIMENSION; d += 64u) {
+${shape.dimension <= 64
+  ? `  if (local < DIMENSION) {
+    var sum = 0.0;
+    let v_base = subset * KEYS * WIDTH + head * DIMENSION + local;
+    for (var key = 0u; key < KEYS; key += 1u) {
+      sum += logits[key] * v[v_base + key * WIDTH];
+    }
+    gathered[query_base + local] = sum / total;
+  }`
+  : `  for (var d = local; d < DIMENSION; d += 64u) {
     var sum = 0.0;
     let v_base = subset * KEYS * WIDTH + head * DIMENSION + d;
     for (var key = 0u; key < KEYS; key += 1u) {
       sum += logits[key] * v[v_base + key * WIDTH];
     }
     gathered[query_base + d] = sum / total;
-  }
+  }`}
 }`;
 
   // The zero-init gate, the residual, and the conditioned transition - all of

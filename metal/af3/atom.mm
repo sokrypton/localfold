@@ -359,7 +359,8 @@ static const ChiralIndex& chiralIndex(size_t atoms) {
 }
 // The encoder's per-step part: the activation from (scaled) positions, the blocks, the per-token aggregation
 void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions, const float* atomMask, float posScale,
-                 const float* tokenBias) {
+                 const float* tokenBias, const float* txScale, const float* txShift, half* txOut,
+                 const float* txFfwScale, const float* txFfwShift, half* txFfwOut, int txLd, bool txPreSigmoid) {
   AtomShape sh = atomShape();
   int C = o.C;
   size_t atoms = (size_t)sh.tokens * sh.dense, q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
@@ -411,10 +412,14 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
   lin(actH, E + ".projectAtomFeaturesForAggr", projected, qRows, C, o.perToken);
-  o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);
-  run1d("af3_aggregate", (o.perToken & 3) ? (size_t)sh.tokens * NS * o.perToken : (size_t)sh.tokens * NS * (o.perToken >> 2),
-        AggregateArgs{projected, q2t.idx, q2t.mask, M.f("batch.refMask"), tokenBias, o.tokenAct, (u64)sh.tokens * NS, q1,
-                      (uint)sh.tokens, (uint)sh.dense, (uint)o.perToken, 0});
+  const size_t tokRows = (size_t)sh.tokens * NS;
+  o.tokenAct = scratch<float>(E + ".tokenAct", tokRows * o.perToken);
+  const uint32_t sgs = tokRows <= 256 ? 2 : 8;
+  run("af3_aggregate", grid1d((tokRows + sgs - 1) / sgs, 1), sgs * 32,
+      AggregateArgs{projected, q2t.idx, q2t.mask, M.f("batch.refMask"), tokenBias, o.tokenAct,
+                    txScale, txShift, txOut, txFfwScale, txFfwShift, txFfwOut,
+                    (u64)tokRows, q1, (uint)sh.tokens, (uint)sh.dense, (uint)o.perToken,
+                    (uint)(txLd ? txLd : o.perToken), ADA_RAW ? 0.1f : 1e-5f, (ADA_RAW || txPreSigmoid) ? 1u : 0u});
 }
 
 // ---------------------------------------------------------------- target_feat

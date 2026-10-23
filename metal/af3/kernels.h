@@ -99,7 +99,8 @@ struct EncoderStartArgs { CP(float) qStart; CP(float) pos; CP(float) atomMask; C
                           u64 rows, q1, atoms; uint C; float posScale; float eps; uint chained; };
 // per token: the mean over its real atoms of relu(projected), gathered back to the token's atoms
 struct AggregateArgs { CP(float) projected; CP(int) idx; CP(float) gmask; CP(float) atomMask; CP(float) tokenBias; DP(float) out;
-                       u64 rows, q1; uint tokens, dense, Cp, pad; };
+                       CP(float) scale; CP(float) shift; DP(half) xOut; CP(float) fScale; CP(float) fShift; DP(half) fOut;
+                       u64 rows, q1; uint tokens, dense, Cp, ld; float eps; uint raw; };
 // target_feat: [aatype one-hot 31 | profile 31 | deletion mean | atom features 384]
 struct TargetFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) atom; DP(float) out; uint tokens, pad; };
 // boltz2's: the atom columns plus six bias-free projections

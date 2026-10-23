@@ -456,21 +456,41 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         }
         return;
       }
+      const bool fullM = i0 + TN <= g.m;
+      const int jLim = min(g.n, (int)g.tgPairs);
+      int prev_ix1 = -1;
+      uint r = 0;
+      float rm = 1.f;
+      device const float* gp0 = nullptr;
+      device const float* cp0 = nullptr;
+      device float* dp0 = nullptr;
+      device half* hp0 = nullptr;
       _Pragma("clang loop unroll(full)")
-      for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
-        if (!c.is_valid_element(e)) continue;
-        const auto ix = c.get_multidimensional_index(e);
-        const int i = i0 + ix[0], j = j0 + ix[1];
-        if (j >= g.tgPairs || i >= g.m) continue;
-        const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-        const uint r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
-        const float4 gp = *(device const float4*)((device const float*)g.aux + (ulong)r * g.ldaux + i);
-        const float4 cv = *(device const float4*)(C + (ulong)i + (ulong)j * g.ldc);
-        const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
-        float4 res = cv + v * gm;
-        if (g.aux2) res *= ((device const float*)g.aux2)[r];
-        *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = res;
-        if (g.aux3) *(device half4*)((device half*)g.aux3 + (ulong)i + (ulong)j * g.ldd) = half4(res);
+      for (int pass = 0; pass < 2; ++pass) {
+        _Pragma("clang loop unroll(full)")
+        for (uint16_t e = (uint16_t)(pass * 4); e < c.get_capacity(); e += 8) {
+          if (!c.is_valid_element(e)) continue;
+          const auto ix = c.get_multidimensional_index(e);
+          const int i = i0 + ix[0], j = j0 + ix[1];
+          if (j >= jLim || (!fullM && i >= g.m)) continue;
+          if (ix[1] != prev_ix1) {
+            prev_ix1 = ix[1];
+            r = (uint)j < (uint)g.tgN ? (uint)j : (uint)j - lf_udiv((uint)j, (uint)g.tgN) * (uint)g.tgN;
+            rm = g.aux2 ? ((device const float*)g.aux2)[r] : 1.f;
+            gp0 = (device const float*)g.aux + (ulong)r * g.ldaux;
+            cp0 = C + (ulong)j * g.ldc;
+            dp0 = D + (ulong)j * g.ldd;
+            hp0 = g.aux3 ? (device half*)g.aux3 + (ulong)j * g.ldd : nullptr;
+          }
+          const float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+          const float4 gp = *(device const float4*)(gp0 + i);
+          const float4 cv = *(device const float4*)(cp0 + i);
+          const float4 gm = g.tgC ? gp : fast::divide(1.f, 1.f + fast::exp(-gp));
+          float4 res = cv + v * gm;
+          if (g.aux2) res *= rm;
+          *(device float4*)(dp0 + i) = res;
+          if (hp0) *(device half4*)(hp0 + i) = half4(res);
+        }
       }
       return;
     }
@@ -1015,7 +1035,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
 // trunk pass; CA 0.002 A; a sigmoid's input needs no more). A = Wg, B = Xg, C = D = the pair, bias the gate's; aux = Xv (ldaux), aux2 = Wv
 // ([k][m], dense), aux3 its bias or 0. A 64 x 128 tile over 4 simdgroups: a thread's 4 adjacent columns at e..e+3.
 // TP the pair's type: float, or half (the pairformer's half pair - the sum in float, rounded once on the store).
-template <int TM = 64, int TN = 128, typename TP = float>
+template <int TM = 64, int TN = 128, typename TP = float, bool LN = true>
 kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]]) {
   using namespace mpp::tensor_ops;
@@ -1040,7 +1060,6 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
   device TP* D = (device TP*)g.D;
   device const float* bg = (g.epilogue & 4) ? (device const float*)g.bias : nullptr;
   device const float* bv = (device const float*)g.aux3;
-  const bool ln = g.lnOut != 0;
   constexpr int NC = TN == 64 ? 2 : 4;
   float4 bg4[NC], bv4[NC];
   _Pragma("clang loop unroll(full)")
@@ -1055,9 +1074,11 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     const auto ix = cg.get_multidimensional_index(e);
     const int i = i0 + ix[0], j = j0 + ix[1];
     if (j >= g.n || i >= g.m) {
-      if (ln) {
-        cg[e] = 0.h; cv[e] = 0.h; cg[e + 1] = 0.h; cv[e + 1] = 0.h;
-        cg[e + 2] = 0.h; cv[e + 2] = 0.h; cg[e + 3] = 0.h; cv[e + 3] = 0.h;
+      if constexpr (LN) {
+        if (g.lnOut != 0) {
+          cg[e] = 0.h; cv[e] = 0.h; cg[e + 1] = 0.h; cv[e + 1] = 0.h;
+          cg[e + 2] = 0.h; cv[e + 2] = 0.h; cg[e + 3] = 0.h; cv[e + 3] = 0.h;
+        }
       }
       continue;
     }
@@ -1070,20 +1091,24 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     const float4 r = float4(*dp) + v2 * (1.f / (1.f + fast::exp(-v1)));
     const vec<TP, 4> st = lf_out4<TP>(r);
     *dp = st;
-    if (ln) {
-      if constexpr (metal::is_same_v<TP, half>) {
-        cg[e] = st.x; cg[e + 1] = st.y; cg[e + 2] = st.z; cg[e + 3] = st.w;
-      } else {
-        const half2 hx = as_type<half2>(st.x), hy = as_type<half2>(st.y), hz = as_type<half2>(st.z), hw = as_type<half2>(st.w);
-        cg[e] = hx.x; cv[e] = hx.y;
-        cg[e + 1] = hy.x; cv[e + 1] = hy.y;
-        cg[e + 2] = hz.x; cv[e + 2] = hz.y;
-        cg[e + 3] = hw.x; cv[e + 3] = hw.y;
+    if constexpr (LN) {
+      if (g.lnOut != 0) {
+        if constexpr (metal::is_same_v<TP, half>) {
+          cg[e] = st.x; cg[e + 1] = st.y; cg[e + 2] = st.z; cg[e + 3] = st.w;
+        } else {
+          const half2 hx = as_type<half2>(st.x), hy = as_type<half2>(st.y), hz = as_type<half2>(st.z), hw = as_type<half2>(st.w);
+          cg[e] = hx.x; cv[e] = hx.y;
+          cg[e + 1] = hy.x; cv[e + 1] = hy.y;
+          cg[e + 2] = hz.x; cv[e + 2] = hz.y;
+          cg[e + 3] = hw.x; cv[e + 3] = hw.y;
+        }
       }
     }
   }
-  threadgroup float part[512];
-  if (ln) lf_emit_ln<TN, metal::is_same_v<TP, half>, (TM * (TN < 128 ? 128 : TN)) / 2048>(cg, cv, (device const TP*)D, part, tid, g, i0, j0);
+  if constexpr (LN) {
+    threadgroup float part[512];
+    if (g.lnOut != 0) lf_emit_ln<TN, metal::is_same_v<TP, half>, (TM * (TN < 128 ? 128 : TN)) / 2048>(cg, cv, (device const TP*)D, part, tid, g, i0, j0);
+  }
 }
 // (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128; <64, 128, half> gemmt_dualh_64x128)
 
