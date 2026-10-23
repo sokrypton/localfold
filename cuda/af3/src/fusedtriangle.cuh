@@ -1304,9 +1304,10 @@ inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOf
 template <int C = 128>
 inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
                       size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
-                      int stride = 0, bool swap = false, uint8_t* kv8 = nullptr, const float* qb = nullptr) {
+                      int stride = 0, bool swap = false, uint8_t* kv8 = nullptr, const float* qb = nullptr,
+                      bool wide = false, uint8_t* vt8 = nullptr) {
   gridInRaw<C>(pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), qb ? qb - 3 * C : nullptr, out, n, q0, rows, tr, Wb, bias,
-               heads, stride, swap, kv8);
+               heads, stride, swap, kv8, wide, vt8);
 }
 template <int WARPS, int WQ = 1, int C = 128>
 void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {

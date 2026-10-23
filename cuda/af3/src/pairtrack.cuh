@@ -712,8 +712,12 @@ constexpr size_t wideTriOutSmem(int C) { return (size_t)C * 65 * 4 + 2 * 64 * 4;
 constexpr size_t wideUpSmem(int C) {
   return C == 384 ? transitionUpSmem<384, 8>() : C == 512 ? transitionUpSmem<512, 8>() : transitionUpSmem<256, 8>();
 }
+constexpr size_t wideUpFitsSmem(int C) {
+  return C == 384 ? transitionUpSmem<384, 4, 16, 1>()
+       : C == 512 ? transitionUpSmem<512, 4, 16, 1>() : transitionUpSmem<256, 8>();
+}
 inline bool wideFits(int C) {
-  return (C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
+  return (C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(wideUpFitsSmem(C));
 }
 // ...and the TRIANGLE's two at 128 channels, where the 128-channel fused kernels do not fit (a T4's 64 KB: the
 // output kernel holds the whole 128 x 128 weight, 71 KB, where these stream it 16 columns a stage, ~35 KB)
@@ -948,7 +952,7 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
     if constexpr (F8) fp8GemmTN(m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
     else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
   };
-  wideWidth256(C, [&](auto cw) {
+  wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
     wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
@@ -991,8 +995,8 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
 inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                                  bool divideByLength, int np) {
   static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
-  if (C <= 256 && fp8Tensor()) { triangleBlockedTN<__nv_fp8_e4m3>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
-  if (C <= 256 && tnBf16) { triangleBlockedTN<__nv_bfloat16>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
+  if (fp8Tensor()) { triangleBlockedTN<__nv_fp8_e4m3>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
+  if (tnBf16) { triangleBlockedTN<__nv_bfloat16>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
   using B16 = __nv_bfloat16;
   const size_t cs = (size_t)np * np;
   const float alpha = divideByLength ? 1.f / n : 1.f;
@@ -1181,27 +1185,30 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       // GEMM into the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
       // (LOCALFOLD_TRI_TN=1: the same layouts in bf16 - the check of the transposed form on a card without FP8)
       static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
-      const bool f8 = TRI_BF16 && bf16Tensor() && fp8Tensor() && C <= 256, tn = f8 || (TRI_BF16 && bf16Tensor() && tnBf16 && C <= 256);
+      const bool f8 = TRI_BF16 && bf16Tensor() && fp8Tensor(), tn = f8 || (TRI_BF16 && bf16Tensor() && tnBf16);
       const int np8 = (n + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
       half* t2 = scratch<half>("tri.t2whole", (tn ? cs8 : cs) * C);
       if (tn) {
-        const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
         auto run = [&](auto tag) {
         using F8 = decltype(tag);
         F8* a8 = scratch<F8>("tri.a8", cs8 * C); F8* b8 = scratch<F8>("tri.b8", cs8 * C);
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs8 * C);
         RectMap rm; rm.T = !outgoing;
-        wideWidth256(C, [&](auto width) {
+        wideWidth(C, [&](auto width) {
           constexpr int CC = decltype(width)::value, WO = 4;
-          wideWarps<CC>(C, [&](auto warps) {
-            constexpr int WI = decltype(warps)::value;
-            WITH_PAIR_T(
-              static bool attr = false;
-              constexpr auto kern = triIn256For<CC, WI, F8, PT>();
-              if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-              kern<<<(unsigned)((cs8 + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
-                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a8, b8, t2, n, np8, cs8, nullptr, rm));
-          });
+          if (!triInGemm<CC, F8>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"),
+                                 pre, a8, b8, t2, n, np8, cs8, !outgoing)) {
+            const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
+            wideWarps<CC>(C, [&](auto warps) {
+              constexpr int WI = decltype(warps)::value;
+              WITH_PAIR_T(
+                static bool attr = false;
+                constexpr auto kern = triIn256For<CC, WI, F8, PT>();
+                if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+                kern<<<(unsigned)((cs8 + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                  pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a8, b8, t2, n, np8, cs8, nullptr, rm));
+            });
+          }
           // (incoming P[i][j] = sum_k a[k][j] b[k][i]: with the transposed operands, sum_k b'[i][k] a'[j][k])
           if (outgoing) triContractTN(np8, cs8, C, alpha, a8, b8, pb, f8);
           else triContractTN(np8, cs8, C, alpha, b8, a8, pb, f8);
@@ -1332,40 +1339,58 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
-      constexpr int WU = 8, R = 16 * WU;
       const half* w1t = transitionW1Tiles<false>(Wh(pre + ".transition1"), C, I, 32);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
-        // whole waves of transitionUpK<CC, WU> inside a 512M-element budget where the card has the room (as ef2's
+        // whole waves of transitionUpK<CC, WU, NC, XR> inside a 512M-element budget where the card has the room (as ef2's
         // transition256): at 261 tokens (5CAJ) the 32M-element CHUNK/2 budget split each transition into 3 chunks
         // (624 GEMMs a fold), where 512M runs every block unchunked (208 GEMMs; opendde transition2 100.5 -> 70.8 ms
-        // and transitionUpK<384> 56.1 -> 45.0 ms, protenix2 transition 70.4 -> 61.6 ms)
-        const size_t budget = roomFor((size_t)1 << 30, {"tr.gated", "tr.gatedbf"}) ? (size_t)1 << 29 : CHUNK / 2;
-        size_t rowsPer = transitionUpChunkRows<CC, WU>(wideUpSmem(CC), std::max<size_t>(R, budget / I));
-        if (PAIR16) {
-          // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
-          // pair - no f16 product and add pass
-          using B16 = __nv_bfloat16;
-          B16* gated = scratch<B16>("tr.gatedbf", std::min(rowsPer, rows) * I);
+        // and transitionUpK<384> 56.1 -> 45.0 ms, protenix2 transition 70.4 -> 61.6 ms).
+        // On a 99 KB shared-memory device (Blackwell sm_120, Ada sm_89), C = 512's 8-warp 32-column form (130 KB) does not
+        // fit and previously fell back to the unfused 4-pass path (~112 ms/pass = ~450 ms/fold on intellifold2); the 8-warp
+        // 16-column 4-round form (96.5 KB) runs on-chip at 72.3 ms/pass and is byte-identical (with FP8 triangle and direct
+        // bf16/transposed grid attention, intellifold2 5CAJ trunk on RTX PRO 6000: 1513.6 -> 1292.8 ms cold, 1482.3 -> 1265.7 ms warm).
+        auto runUp = [&](auto wuTag, auto ncTag, auto xrTag) {
+          constexpr int WU = decltype(wuTag)::value, NC = decltype(ncTag)::value, XR = decltype(xrTag)::value, R = 16 * WU;
+          constexpr size_t smem = transitionUpSmem<CC, WU, NC, XR>();
+          const size_t budget = roomFor((size_t)1 << 30, {"tr.gated", "tr.gatedbf"}) ? (size_t)1 << 29 : CHUNK / 2;
+          size_t rowsPer = transitionUpChunkRows<CC, WU, NC, XR>(smem, std::max<size_t>(R, budget / I));
+          if (PAIR16) {
+            // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
+            // pair - no f16 product and add pass
+            using B16 = __nv_bfloat16;
+            B16* gated = scratch<B16>("tr.gatedbf", std::min(rowsPer, rows) * I);
+            static bool attr = false;
+            if (!attr) { smemAttr((transitionUpK<CC, WU, NC, XR, B16, B16>), (int)smem); attr = true; }
+            for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
+              size_t r = std::min(rowsPer, rows - r0);
+              transitionUpK<CC, WU, NC, XR, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
+                pairRow(x, r0, C), W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
+              linear<B16, B16>(gated, reinterpret_cast<B16*>(pairRow(into(x), r0, C)), r, I, C, pre + ".transition2", false, 1.f);
+            }
+            return;
+          }
+          half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
           static bool attr = false;
-          if (!attr) { smemAttr((transitionUpK<CC, WU, 32, 1, B16, B16>), (int)wideUpSmem(CC)); attr = true; }
+          if (!attr) { smemAttr((transitionUpK<CC, WU, NC, XR>), (int)smem); attr = true; }
           for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
             size_t r = std::min(rowsPer, rows - r0);
-            transitionUpK<CC, WU, 32, 1, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
-              pairRow(x, r0, C), W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
-            linear<B16, B16>(gated, reinterpret_cast<B16*>(pairRow(into(x), r0, C)), r, I, C, pre + ".transition2", false, 1.f);
+            transitionUpK<CC, WU, NC, XR><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
+              x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
+            linear<half, float>(gated, into(x) + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
           }
-          return;
-        }
-        half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
-        static bool attr = false;
-        if (!attr) { smemAttr((transitionUpK<CC, WU>), (int)wideUpSmem(CC)); attr = true; }
-        for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
-          size_t r = std::min(rowsPer, rows - r0);
-          transitionUpK<CC, WU><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
-            x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
-          linear<half, float>(gated, into(x) + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
-        }
+        };
+        static const int form = getenv("LOCALFOLD_TRANS_UP_FORM") ? atoi(getenv("LOCALFOLD_TRANS_UP_FORM")) : 0;
+        if (form == 4 && fitsSmem(transitionUpSmem<CC, 4, 16, 1>()))
+          runUp(std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
+        else if (form == 84 && fitsSmem(transitionUpSmem<CC, 8, 16, 4>()))
+          runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 4>{});
+        else if (fitsSmem(transitionUpSmem<CC, 8, 32, 1>()))
+          runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 1>{});
+        else if (fitsSmem(transitionUpSmem<CC, 8, 16, 4>()))
+          runUp(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 4>{});
+        else
+          runUp(std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
       });
       return;
     }
@@ -1923,6 +1948,26 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     }
     linear<T, T>(act, qkvgOut, prs, C, 4 * Wd, qkvg);
     if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
+    if constexpr (std::is_same_v<T, half>) {
+      static const bool direct2R = !getenv("LOCALFOLD_GRID_2R_DIRECT") || atoi(getenv("LOCALFOLD_GRID_2R_DIRECT"));
+      const float* m = MASK_ALL_ONES ? nullptr : mask;
+      const bool trOut = tr && !RESIDUAL_UNTRANSPOSED && r0 == 0 && rows == (size_t)n;
+      if (direct2R && PAIR16 && !outBias && (!tr || RESIDUAL_UNTRANSPOSED || trOut)) {
+        using B16 = __nv_bfloat16;
+        B16* g16 = scratch<B16>("grid.gathered", prs * Wd);
+        if (flashGrid2RDirect<B16>(qkvgOut, bias, stride, m, g16, n, heads, D, rows, scale, trOut)) {
+          linear<B16, B16>(g16, reinterpret_cast<B16*>(pairRow(into(pair), r0 * n, C)), prs, Wd, C, pre + ".outputProjection", false, 1.f);
+          continue;
+        }
+      }
+      if (direct2R && !PAIR16 && !outBias && trOut) {
+        half* gh = scratch<half>("grid.gathered", prs * Wd);
+        if (flashGrid2RDirect<half>(qkvgOut, bias, stride, m, gh, n, heads, D, rows, scale, true)) {
+          linear<half, float>(gh, into(pair), prs, Wd, C, pre + ".outputProjection", false, 1.f);
+          continue;
+        }
+      }
+    }
     T* gathered = scratch<T>("grid.gathered", prs * Wd);
     flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && std::is_same_v<T, half> ? nullptr : mask, gathered, n, heads, D,
                  r0, rows, tr, scale);       // (no mask when every token is real: the unmasked kernel)

@@ -149,21 +149,21 @@ constexpr size_t transitionUpSmem() {
 // chunk in whole waves. A chunk of 32768 rows was 256 blocks on an A100 at two a multiprocessor, 1.19
 // waves: two rounds with the second nearly empty, then a 25-block tail at 0.12 waves - five rounds of the
 // device where three do (Nsight Compute, ESMFold2 at 262 tokens).
-template <int C, int WARPS>
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
 size_t transitionUpWaveRows(size_t smem) {
   static size_t rows = [smem] {
-    smemAttr((transitionUpK<C, WARPS>), (int)smem);
+    smemAttr((transitionUpK<C, WARPS, NC, XROUNDS>), (int)smem);
     int perSm = 0, dev = 0, sms = 0;
-    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, transitionUpK<C, WARPS>, 32 * WARPS, smem));
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, transitionUpK<C, WARPS, NC, XROUNDS>, 32 * WARPS, smem));
     CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     return (size_t)std::max(1, perSm) * sms * 16 * WARPS;
   }();
   return rows;
 }
 // ...and the largest whole number of those waves inside a budget of rows (at least one wave)
-template <int C, int WARPS>
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
 size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
-  size_t wave = transitionUpWaveRows<C, WARPS>(smem);
+  size_t wave = transitionUpWaveRows<C, WARPS, NC, XROUNDS>(smem);
   return std::max<size_t>(1, budgetRows / wave) * wave;
 }
 

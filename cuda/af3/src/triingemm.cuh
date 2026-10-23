@@ -16,9 +16,10 @@
 #include "fused256.cuh"
 
 // LN of the padded plane's rows into f16 (a padding row is LN(0) = the offset, as triIn256K computes it);
+// TR: read pair transposed (row (i, j) takes pair (j, i), for the incoming FP8/TN triangle contraction);
 // 8/16-byte vectorised loads and stores for K % 4 == 0 (C 384/512 in bf16 or float: opendde lnPlaneK<384> 9.3 -> 7.7 ms,
 // intellifold2 lnPlaneK<512> 43.7 -> 41.4 ms on 5CAJ)
-template <int C, class PT>
+template <int C, class PT, bool TR = false>
 __global__ void __launch_bounds__(256, 6)
 lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, const float* __restrict__ sc,
          const float* __restrict__ of) {
@@ -28,7 +29,7 @@ lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, 
   if (q >= pp) return;
   unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
   bool real = i < (unsigned)n && j < (unsigned)n;
-  size_t pr = (size_t)i * n + j;
+  size_t pr = TR ? ((size_t)j * n + i) : ((size_t)i * n + j);
   if constexpr (K % 4 == 0) {
     constexpr int VEC = (!std::is_same_v<PT, float> && K % 8 == 0) ? 8 : 4, KK = K / VEC;
     using InVT = std::conditional_t<std::is_same_v<PT, float>, float4, std::conditional_t<VEC == 8, uint4, uint2>>;
@@ -186,11 +187,14 @@ __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* _
   }
   cpWait<0>();
 }
-template <int C, class TA>
+template <int C, class TA, bool TR = false>
 __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, const float* __restrict__ pair,
     const float* __restrict__ mask, const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b,
     half* __restrict__ t2, int n, int np, size_t cs) {
-  constexpr int KC = C / 32, NAB = C / 32, LDT = 72;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  if constexpr (sizeof(TA) == 1) return;
+#endif
+  constexpr int KC = C / 32, NAB = C / 32, LDT = sizeof(TA) == 1 ? 80 : 72;
   extern __shared__ __align__(16) unsigned char smem[];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   int wm = warp & 1, wn = warp >> 1;
@@ -207,7 +211,7 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       float v = 0.f;
       if (t < NAB && q < pp) {
         unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-        if (i < (unsigned)n && j < (unsigned)n) v = mask ? mask[(size_t)i * n + j] : 1.f;
+        if (i < (unsigned)n && j < (unsigned)n) v = mask ? mask[TR ? ((size_t)j * n + i) : ((size_t)i * n + j)] : 1.f;
       }
       msk[mi][h] = v;
     }
@@ -215,7 +219,7 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
   tgMain<C>(X, Wt, row0, pp, smem, acc);
   __syncthreads();                      // the stages are free: the epilogue's staging takes them
   if (t < NAB) {
-    // a and b: projection n8 tiles 0..3 against their gates 4..7, staged channel-major for 16-byte row stores
+    // a and b: projection n8 tiles 0..3 against their gates 4..7, staged channel-major for 8/16-byte row stores
     TA* Ta = (TA*)smem + warp * 2 * 16 * LDT;
     TA* Tb = Ta + 16 * LDT;
 #pragma unroll
@@ -233,25 +237,44 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       }
     }
     __syncwarp();
+    if constexpr (sizeof(TA) == 1) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      int idx = lane + 32 * i, chl = idx >> 3, r8 = (idx & 7) * 8;
-      size_t q = row0 + wm * 64 + r8;
-      if (q < cs) {
-        size_t at = (size_t)(t * 32 + wn * 16 + chl) * cs + q;
-        *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + chl * LDT + r8);
-        *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + chl * LDT + r8);
+      for (int i = 0; i < 2; ++i) {
+        int idx = lane + 32 * i, chl = idx >> 2, r16 = (idx & 3) * 16;
+        size_t q = row0 + wm * 64 + r16;
+        if (q < cs) {
+          size_t at = (size_t)(t * 32 + wn * 16 + chl) * cs + q;
+          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + chl * LDT + r16);
+          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + chl * LDT + r16);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        int idx = lane + 32 * i, chl = idx >> 3, r8 = (idx & 7) * 8;
+        size_t q = row0 + wm * 64 + r8;
+        if (q < cs) {
+          size_t at = (size_t)(t * 32 + wn * 16 + chl) * cs + q;
+          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + chl * LDT + r8);
+          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + chl * LDT + r8);
+        }
       }
     }
   } else {
+    auto t2At = [&](size_t q) -> size_t {
+      if constexpr (!TR) return q;
+      unsigned u = (unsigned)q, iq = u / (unsigned)np;
+      return (size_t)(u - iq * (unsigned)np) * (unsigned)np + iq;
+    };
     int c0 = (t - NAB) * 128 + wn * 64 + 2 * tig;
 #pragma unroll
     for (int mi = 0; mi < 4; ++mi) {
       size_t q0 = row0 + wm * 64 + mi * 16 + g, q1 = q0 + 8;
+      size_t r0 = t2At(q0), r1 = t2At(q1);
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        if (q0 < pp) *reinterpret_cast<half2*>(t2 + q0 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][0], acc[mi][j][1]);
-        if (q1 < pp) *reinterpret_cast<half2*>(t2 + q1 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][2], acc[mi][j][3]);
+        if (q0 < pp) *reinterpret_cast<half2*>(t2 + r0 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][0], acc[mi][j][1]);
+        if (q1 < pp) *reinterpret_cast<half2*>(t2 + r1 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][2], acc[mi][j][3]);
       }
     }
   }
@@ -290,19 +313,28 @@ inline const half* triInGemmWeights(const std::string& pre, int C) {
 inline const bool TRIIN_GEMM = !getenv("LOCALFOLD_TRIIN_GEMM") || atoi(getenv("LOCALFOLD_TRIIN_GEMM"));
 template <int C, class TA>
 inline bool triInGemm(const float* pair, const float* mask, const float* sc, const float* of, const std::string& pre, TA* a, TA* b,
-                      half* t2, int n, int np, size_t cs) {
+                      half* t2, int n, int np, size_t cs, bool tr = false) {
   // (from 384 channels: at 256 the LN pass it needs costs more than the GEMM saves - protenix2's trunk 713 -> 719 ms,
-  // where OpenDDE's goes 1453 -> 1422 and IntelliFold-2's 2309 -> 2261)
+  // where OpenDDE's goes 1453 -> 1422 and IntelliFold-2's 2309 -> 2261; on FP8 tensor-core cards (sm_89, sm_120),
+  // TA = __nv_fp8_e4m3 writes 1-byte e4m3 operands with 16-byte uint4 stores and tr = !outgoing so C = 384/512 take
+  // fp8GemmTN: 12.3 ms vs 21.9 ms/pass on OpenDDE and 12.7 ms vs 21.8 ms/pass on IntelliFold-2 on RTX PRO 6000)
   constexpr size_t smem = triInGemmSmem();
   if (C < 384 || !TRIIN_GEMM || !fitsSmem(smem)) return false;
   const half* Wg = triInGemmWeights(pre, C);
   size_t pp = (size_t)np * np;
   half* X = scratch<half>("tri.lnplane", pp * C);
-  WITH_PAIR_T(lnPlaneK<C, PT><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
-  static bool attr = false;
-  if (!attr) { smemAttr((triInGemmK<C, TA>), (int)smem); attr = true; }
   dim3 grid(C / 32 + C / 128, (unsigned)((pp + 127) / 128));
-  triInGemmK<C, TA><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
+  if (tr) {
+    WITH_PAIR_T(lnPlaneK<C, PT, true><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
+    static bool attrT = false;
+    if (!attrT) { smemAttr((triInGemmK<C, TA, true>), (int)smem); attrT = true; }
+    triInGemmK<C, TA, true><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
+  } else {
+    WITH_PAIR_T(lnPlaneK<C, PT, false><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
+    static bool attr = false;
+    if (!attr) { smemAttr((triInGemmK<C, TA, false>), (int)smem); attr = true; }
+    triInGemmK<C, TA, false><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
+  }
   return true;
 }
 

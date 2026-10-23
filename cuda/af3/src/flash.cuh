@@ -2096,6 +2096,41 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
 // an 8-wide head unpadded (AF2's extra stack): flashGrid2R's D 8 form, where it takes the call - unmasked, cp.async
 // (anywhere else the heads are padded to 16)
 inline bool flashNarrow(const float* mask) { return !mask && !flashRegStaged(); }
+// Unmasked, cp.async grid attention (D = 16, 32, 64) writing OT (half or bf16) directly, optionally transposed
+// (trOut: output at [i, rl] instead of [rl, i] for column grid attention, eliminating the separate transpose/addGridK
+// pass, the rowOut16/addHalfToBf16K pass, and the intermediate [pairs, C] f16 output buffer, so the output projection
+// GEMM accumulates straight into the pair in one contiguous call: 5CAJ warm trunk on A100 protenix2 703.2 -> 678.2 ms,
+// opendde 1234.8 -> 1202.3 ms, intellifold2 1892.2 -> 1843.4 ms; on Blackwell RTX PRO 6000 protenix2 461.1 -> 449.1 ms).
+template <class OT>
+inline bool flashGrid2RDirect(const half* qkvg, const half* bias, int stride, const float* mask, OT* out,
+                              int n, int heads, int D, size_t rows, float scale, bool trOut = false,
+                              const float* qBias = nullptr) {
+  if (mask || flashRegStaged() || FLASH_QHI || !FLASH_2R || FLASH_WARPS_OVERRIDE) return false;
+  if (rows == 1 && FLASH_SPLIT && n <= 192 && heads * ((n + 63) / 64) < 4 * 108) return false;
+  const size_t W = (size_t)heads * D;
+  const size_t rs = (size_t)n * 4 * W, ps = 4 * W;
+  const size_t ors = trOut ? W : (size_t)n * W, ops = trOut ? (size_t)n * W : W;
+  if (D == 16 && rows >= 32 && fitsSmem(2 * fa2Stage<16, 2, 48, 2, 2>())) {
+    flashGrid2RRun<16, 2, 48, 2, 2, false, false, OT>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    return true;
+  }
+  if (D == 32 && fitsSmem(2 * fa2Stage<32, 2, 48, 2, 2>())) {
+    if (flash2RWideKeysFor(n) && FLASH_SPEC)
+      flashGrid2RRun<32, 2, 64, 2, 2, false, false, OT, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    else if (flash2RWideKeysFor(n))
+      flashGrid2RRun<32, 2, 64, 2, 2, false, false, OT, false>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    else if (FLASH_SPEC)
+      flashGrid2RRun<32, 2, 48, 2, 2, false, false, OT, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    else
+      flashGrid2RRun<32, 2, 48, 2, 2, false, false, OT, false>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    return true;
+  }
+  if (D == 64 && rows >= 16 && fitsSmem(2 * fa2Stage<64, 4, 48, 1, 1>())) {
+    flashGrid2RRun<64, 4, 48, 1, 1, false, false, OT>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rs, ps, ors, ops);
+    return true;
+  }
+  return false;
+}
 template <class T>
 void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* out, int n, int heads,
                int D, size_t r0, size_t rows, bool tr, float scale, const float* qBias = nullptr) {
