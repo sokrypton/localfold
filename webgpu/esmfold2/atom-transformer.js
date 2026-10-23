@@ -447,9 +447,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     workgroupBarrier();
 
+    let headChunk = head * ${CHUNK}u;
+    var largest = ${FLOOR};
     for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
       var total = 0.0;
-      if (live[slot] != 0.0) {
+      let is_live = live[slot] != 0.0;
+      if (is_live) {
 ${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${headDim / 4}u;\n${Array.from({ length: headDim / 4 }, (_, v) => {
   const e0 = v * 4;
   return `        {
@@ -464,22 +467,24 @@ ${vecKey ? `        let k_base = ((start + base + slot) * ${heads}u + head) * ${
           total += staged_q[q_off + e] * key[k_base + e];
         }`}
       }
-      logits[head * ${CHUNK}u + slot] = total * ${scale};
-    }
-    workgroupBarrier();
-
-    // This chunk's largest logit, per head.
-    let headChunk = head * ${CHUNK}u;
-    var largest = ${FLOOR};
-    for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
-      if (live[slot] != 0.0) { largest = max(largest, logits[headChunk + slot]); }
+      let l = total * ${scale};
+      logits[headChunk + slot] = l;
+      if (is_live) { largest = max(largest, l); }
     }
     reduce[local.x] = largest;
     workgroupBarrier();
 ${(() => {
   const steps = [];
-  for (let s = headDim >> 1; s > 0; s >>= 1) {
+  for (let s = headDim >> 1; s >= (headDim >= 8 ? 8 : 1); s >>= 1) {
     steps.push(`    if (d < ${s}u) { reduce[local.x] = max(reduce[local.x], reduce[local.x + ${s}u]); } workgroupBarrier();`);
+  }
+  if (headDim >= 8) {
+    steps.push(`    if (d == 0u) {
+      let m0 = max(max(reduce[local.x], reduce[local.x + 4u]), max(reduce[local.x + 2u], reduce[local.x + 6u]));
+      let m1 = max(max(reduce[local.x + 1u], reduce[local.x + 5u]), max(reduce[local.x + 3u], reduce[local.x + 7u]));
+      reduce[local.x] = max(m0, m1);
+    }
+    workgroupBarrier();`);
   }
   return steps.join("\n");
 })()}
@@ -507,9 +512,8 @@ ${(() => {
   }
   return steps.join("\n");
 })()}
-    let chunkSum = reduce[head * ${headDim}u];
-    workgroupBarrier();
     if (d == 0u) {
+      let chunkSum = reduce[head * ${headDim}u];
       headSum[head] = headSum[head] * rescale + chunkSum;
       headPeak[head] = peak;
     }

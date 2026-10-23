@@ -72,6 +72,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createJoinedLayerNormShader({ rows, channels }, epsilon) {
   const width = channels * 2;
+  const stageRow = width <= 1536;
   return `
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
@@ -81,8 +82,7 @@ export function createJoinedLayerNormShader({ rows, channels }, epsilon) {
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
-
-fn joined(row: u32, c: u32) -> f32 {
+${stageRow ? `var<workgroup> rowBuf: array<f32, ${width}>;\n` : ""}fn joined(row: u32, c: u32) -> f32 {
   if (c < ${channels}u) { return left[row * ${channels}u + c]; }
   return right[row * ${channels}u + c - ${channels}u];
 }
@@ -96,7 +96,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${width}u; c += ${LANES}u) {
     let value = joined(row, c);
-    total += value;
+${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
     square += value * value;
   }
   sums[local.x] = total;
@@ -111,7 +111,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let mean = sums[0] / ${width}.0;
   let inverse = inverseSqrt(max(squares[0] / ${width}.0 - mean * mean, 0.0) + ${epsilon});
   for (var c = local.x; c < ${width}u; c += ${LANES}u) {
-    destination[row * ${width}u + c] = (joined(row, c) - mean) * inverse * scale[c] + offset[c];
+    destination[row * ${width}u + c] = (${stageRow ? "rowBuf[c]" : "joined(row, c)"} - mean) * inverse * scale[c] + offset[c];
   }
 }`;
 }
@@ -130,6 +130,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * host makes them one dispatch.
  */
 export function createAdaptiveCombineShader({ rows, channels }, epsilon = 1e-5) {
+  const stageRow = channels <= 1536;
   return `
 @group(0) @binding(0) var<storage, read> activation: array<f32>;
 @group(0) @binding(1) var<storage, read> gateShift: array<f32>;
@@ -138,8 +139,7 @@ export function createAdaptiveCombineShader({ rows, channels }, epsilon = 1e-5) 
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
-
-@compute @workgroup_size(${LANES})
+${stageRow ? `var<workgroup> rowBuf: array<f32, ${channels}>;\n` : ""}@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
   let row = group.x + group.y * ${GRID_WIDTH}u;
@@ -149,7 +149,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let value = activation[base + c];
-    total += value;
+${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
     square += value * value;
   }
   sums[local.x] = total;
@@ -166,7 +166,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse = inverseSqrt(variance + ${epsilon});
   let gsBase = row * ${channels * 2}u;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    let normalised = (activation[base + c] - mean) * inverse;
+    let normalised = (${stageRow ? "rowBuf[c]" : "activation[base + c]"} - mean) * inverse;
     let gate = gateShift[gsBase + c] + gateBias[c];
     let shift = gateShift[gsBase + ${channels}u + c];
     output[base + c] = normalised / (1.0 + exp(-gate)) + shift;
@@ -175,14 +175,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 function createBareLayerNormShader({ rows, channels }, epsilon = 1e-5) {
+  const stageRow = channels <= 1536;
   return `
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read_write> destination: array<f32>;
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
-
-@compute @workgroup_size(${LANES})
+${stageRow ? `var<workgroup> rowBuf: array<f32, ${channels}>;\n` : ""}@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
   let row = group.x + group.y * ${GRID_WIDTH}u;
@@ -192,7 +192,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let value = source[base + c];
-    total += value;
+${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
     square += value * value;
   }
   sums[local.x] = total;
@@ -208,7 +208,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
   let inverse = inverseSqrt(variance + ${epsilon});
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    destination[base + c] = (source[base + c] - mean) * inverse;
+    destination[base + c] = (${stageRow ? "rowBuf[c]" : "source[base + c]"} - mean) * inverse;
   }
 }`;
 }
@@ -300,14 +300,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /** `out[i] = a[i] + b[i % channels]`, a vector broadcast down the rows. */
 export function createBroadcastAddShader({ rows, channels }) {
   return `
-@group(0) @binding(0) var<storage, read> vector: array<f32>;
-@group(0) @binding(1) var<storage, read_write> activation: array<f32>;
+@group(0) @binding(0) var<storage, read> base: array<f32>;
+@group(0) @binding(1) var<storage, read> vector: array<f32>;
+@group(0) @binding(2) var<storage, read_write> activation: array<f32>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x + id.y * ${GRID_WIDTH * LANES}u;
   if (i >= ${rows * channels}u) { return; }
-  activation[i] += vector[i % ${channels}u];
+  activation[i] = base[i] + vector[i % ${channels}u];
 }`;
 }
 
@@ -382,7 +383,6 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
       logit = total * ${(1 / Math.sqrt(headDim)).toFixed(10)}
         + bias[(bias_row + j) * ${heads}u + head];
     }
-    logits[lane] = logit;
     reduce[lane] = logit;
     workgroupBarrier();
     if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
@@ -395,16 +395,14 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     }
     workgroupBarrier();
     let block_max = reduce[0];
-    workgroupBarrier();
     let next_max = max(running_max, block_max);
     let rescale = select(exp(running_max - next_max), 0.0, running_max == -3.0e38);
     // ...the weights for this block, and the running sum rescaled onto the new
     // maximum. Both halves must use the SAME maximum or the merge is silent.
-    let weight = select(0.0, exp(logits[lane] - next_max), j < ${tokens}u);
+    let weight = select(0.0, exp(logit - next_max), j < ${tokens}u);
     logits[lane] = weight;
-    reduce[lane] = weight;
     workgroupBarrier();
-    if (lane < 32u) { reduce[lane] += reduce[lane + 32u]; } workgroupBarrier();
+    if (lane < 32u) { reduce[lane] = logits[lane] + logits[lane + 32u]; } workgroupBarrier();
     if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
     if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
     if (lane == 0u) {
@@ -1426,9 +1424,7 @@ export class Esmfold2DenoiserGpu {
              [b.partials, outGate, bias, activation], ...elementwise(tokens * tokenChannels / 4));
     };
     this.program = [];
-    this.program.push({ kind: "copy", from: b.singleBase, to: b.single,
-                        bytes: tokens * tokenChannels * 4 });
-    record("esmfold2.diff.noise-add", pipelines.broadcastAdd, [b.noise, b.single],
+    record("esmfold2.diff.noise-add", pipelines.broadcastAdd, [b.singleBase, b.noise, b.single],
            ...elementwise(tokens * tokenChannels));
     for (const block of sTransitions) {
       record("esmfold2.diff.s-norm", pipelines.normOffset,

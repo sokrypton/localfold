@@ -165,13 +165,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return;
   }
   let row = u32(max(gathers[G_QTA_IDX + slot], 0));
+  let rBase = row * C;
+  let qm = queries_mask[row];
 
   var total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { total += act[row * C + c] * queries_mask[row]; }
+  for (var c = 0u; c < C; c += 1u) { total += act[rBase + c] * qm; }
   let mean = total / f32(C);
   var variance = 0.0;
   for (var c = 0u; c < C; c += 1u) {
-    let d = act[row * C + c] * queries_mask[row] - mean;
+    let d = act[rBase + c] * qm - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C) + EPSILON);
@@ -179,7 +181,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var axis = 0u; axis < 3u; axis += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C; c += 1u) {
-      value += ((act[row * C + c] * queries_mask[row] - mean) * inverse
+      value += ((act[rBase + c] * qm - mean) * inverse
         * weights[P_atomFeaturesLayerNormScale + c]
         + weights[P_atomFeaturesLayerNormOffset + c])
         * weights[P_atomFeaturesToPositionUpdate + c * 3u + axis];

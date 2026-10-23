@@ -425,13 +425,15 @@ ${shape.chiralGradients !== true ? "" : `  // 🔴 rosettafold3's CHIRALITY TERM
     chiral[1] = chiral_grads[at + 1u];
     chiral[2] = chiral_grads[at + 2u];
   }`}
+  let rBase = row * C;
+  let qm = queries_mask[row];
   for (var c = 0u; c < C; c += 1u) {
     var value = 0.0;
     for (var axis = 0u; axis < 3u; axis += 1u) {
       value += gathered[axis] * weights[P_atomPositionsToFeatures + axis * C + c];
 ${shape.chiralGradients !== true ? "" : `      value += chiral[axis] * weights[P_atomChiralToFeatures + axis * C + c];`}
     }
-    act[row * C + c] = queries_cond[row * C + c] + value * queries_mask[row];
+    act[rBase + c] = queries_cond[rBase + c] + value * qm;
   }
 }`;
 
@@ -1162,6 +1164,7 @@ const BLOCK: u32 = ${block}u;
 @group(0) @binding(5) var<storage, read> keys_mask: array<f32>;
 @group(0) @binding(6) var<storage, read_write> gathered: array<f32>;
 
+var<workgroup> staged_q: array<f32, ${shape.dimension}>;
 var<workgroup> logits: array<f32, ${keys}>;
 var<workgroup> reduce: array<f32, 64>;
 
@@ -1176,27 +1179,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let query = query_index % QUERIES;
   let local = local_id.x;
   let query_base = query_index * WIDTH + head * DIMENSION;
+  for (var d = local; d < DIMENSION; d += 64u) {
+    staged_q[d] = q[query_base + d];
+  }
+  workgroupBarrier();
 
+  let q_mask = queries_mask[query_index];
+  let pl_base = (((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS;
+  var local_max = -3.0e38;
   for (var key = local; key < KEYS; key += 64u) {
     let key_index = subset * KEYS + key;
     var dot = 0.0;
+    let k_base = key_index * WIDTH + head * DIMENSION;
     for (var d = 0u; d < DIMENSION; d += 1u) {
-      dot += q[query_base + d] * k[key_index * WIDTH + head * DIMENSION + d];
+      dot += staged_q[d] * k[k_base + d];
     }
     // 🔴 A PRODUCT, NOT A SUM: only a padded query AND a padded key is penalised.
     // A product under AlphaFold 3 and a SUM under OpenDDE; see the note in
     // atom-encoder.js for which models take which and why it is
     // inert on every batch this featuriser produces.
 ${keyMasked
-  ? "    let bias = -1.0e9 * ((1.0 - queries_mask[query_index]) + (1.0 - keys_mask[key_index]));"
-  : "    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);"}
-    logits[key] = dot * SCALE + bias
-      + pair_logits[(((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS + key];
+  ? "    let bias = -1.0e9 * ((1.0 - q_mask) + (1.0 - keys_mask[key_index]));"
+  : "    let bias = 1.0e9 * (q_mask - 1.0) * (keys_mask[key_index] - 1.0);"}
+    let l = dot * SCALE + bias + pair_logits[pl_base + key];
+    logits[key] = l;
+    local_max = max(local_max, l);
   }
-  workgroupBarrier();
-
-  var local_max = -3.0e38;
-  for (var key = local; key < KEYS; key += 64u) { local_max = max(local_max, logits[key]); }
   reduce[local] = local_max;
   workgroupBarrier();
   if (local < 32u) { reduce[local] = max(reduce[local], reduce[local + 32u]); }
@@ -1205,11 +1213,11 @@ ${keyMasked
   workgroupBarrier();
   if (local < 8u) { reduce[local] = max(reduce[local], reduce[local + 8u]); }
   workgroupBarrier();
-  if (local < 4u) { reduce[local] = max(reduce[local], reduce[local + 4u]); }
-  workgroupBarrier();
-  if (local < 2u) { reduce[local] = max(reduce[local], reduce[local + 2u]); }
-  workgroupBarrier();
-  if (local < 1u) { reduce[local] = max(reduce[local], reduce[local + 1u]); }
+  if (local == 0u) {
+    let m0 = max(max(reduce[0], reduce[4]), max(reduce[2], reduce[6]));
+    let m1 = max(max(reduce[1], reduce[5]), max(reduce[3], reduce[7]));
+    reduce[0] = max(m0, m1);
+  }
   workgroupBarrier();
   let largest = reduce[0];
   workgroupBarrier();
@@ -1235,14 +1243,14 @@ ${keyMasked
   if (local < 1u) { reduce[local] += reduce[local + 1u]; }
   workgroupBarrier();
   let total = reduce[0];
-  workgroupBarrier();
 
   for (var d = local; d < DIMENSION; d += 64u) {
     var sum = 0.0;
+    let v_base = subset * KEYS * WIDTH + head * DIMENSION + d;
     for (var key = 0u; key < KEYS; key += 1u) {
-      sum += logits[key] * v[(subset * KEYS + key) * WIDTH + head * DIMENSION + d];
+      sum += logits[key] * v[v_base + key * WIDTH];
     }
-    gathered[query_index * WIDTH + head * DIMENSION + d] = sum / total;
+    gathered[query_base + d] = sum / total;
   }
 }`;
 
@@ -1268,7 +1276,7 @@ const ROW_TILE: u32 = ${outputRowTile}u;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<storage, read_write> act: array<f32>;
 
-var<workgroup> gated: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> gated: array<${rowVector}, ${rowGroups * Math.max(shape.heads * shape.dimension, channels)}>;
 var<workgroup> after: array<${rowVector}, ${rowGroups * channels}>;
 ${shape.noResidual !== true ? "" : `// 🔴 rosettafold3's no_residual: the PRE-attention activation, staged in the
 // tile's own layout so the transition can read it. AF3's block is
@@ -1292,11 +1300,9 @@ var<workgroup> before: array<${rowVector}, ${rowGroups * channels}>;`}
 // is wrong. The SECOND adaptive-zero projection reads the RAW conditioning -
 // see the note where it does - and it runs after the normalised form has been
 // written. Normalising in place would feed it the wrong tensor silently, and
-// nothing here would fail. It costs 4 KiB and no residency: this kernel already
-// holds 24 of the device's 32 KiB, so it is one workgroup a core either way.
+// nothing here would fail. Instead, cond_norm aliases the first half of wide
+// and x aliases gated (whose lifetimes are disjoint and separated by barriers).
 var<workgroup> cond_raw: array<${rowVector}, ${rowGroups * channels}>;
-var<workgroup> cond_norm: array<${rowVector}, ${rowGroups * channels}>;
-var<workgroup> x: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> wide: array<${rowVector}, ${rowGroups * intermediate}>;
 
 @compute @workgroup_size(64)
@@ -1409,7 +1415,7 @@ ${channels % 64 === 0 && intermediate % 64 === 0
     inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_ffwSingleCondLayerNormScale + c];
-    ${overRowGroups((g) => `cond_norm[${g * channels}u + c] =
+    ${overRowGroups((g) => `wide[${g * channels}u + c] =
       (cond_raw[${g * channels}u + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
   }
   workgroupBarrier();
@@ -1422,7 +1428,7 @@ ${channels % 64 === 0 && intermediate % 64 === 0
     for (var d = 0u; d < C; d += 1u) {
       let ws_base = W_ffwSingleCondScaleWeights + d * C;
       let wb_base = W_ffwSingleCondBias + d * C;
-      ${overRowGroups((g) => `let cn_${g} = cond_norm[${g * channels}u + d];`)}
+      ${overRowGroups((g) => `let cn_${g} = wide[${g * channels}u + d];`)}
       ${overCSteps((s) => `{
         let ws = weights[ws_base + c_${s}];
         let wb = weights[wb_base + c_${s}];
@@ -1430,7 +1436,7 @@ ${channels % 64 === 0 && intermediate % 64 === 0
         shift_${s}_${g} += cn_${g} * wb;`)}
       }`)}
     }
-    ${overCSteps((s) => overRowGroups((g) => `x[${g * channels}u + c_${s}] =
+    ${overCSteps((s) => overRowGroups((g) => `gated[${g * channels}u + c_${s}] =
       ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value_${s}_${g}))
       * ((${transitionInput}[${g * channels}u + c_${s}] - mean${g}) * inverse${g}) + shift_${s}_${g};`))}
   }
@@ -1445,7 +1451,7 @@ ${channels % 64 === 0 && intermediate % 64 === 0
     for (var c = 0u; c < C; c += 1u) {
       let column = W_ffwTransition1 + c * doubled;
       ${upGate ? "let up_col = W_ffwAToB + c * INTERMEDIATE;" : ""}
-      ${overRowGroups((g) => `let xc_${g} = x[${g * channels}u + c];`)}
+      ${overRowGroups((g) => `let xc_${g} = gated[${g * channels}u + c];`)}
       ${overISteps((s) => `{
         let wg = weights[column + i_${s}];
         let wv = weights[column + INTERMEDIATE + i_${s}];
@@ -1540,7 +1546,7 @@ ${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLa
     inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_ffwSingleCondLayerNormScale + c];
-    ${overRowGroups((g) => `cond_norm[${g}u * C + c] =
+    ${overRowGroups((g) => `wide[${g}u * C + c] =
       (cond_raw[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
   }
   workgroupBarrier();
@@ -1552,12 +1558,12 @@ ${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLa
       let ws = weights[W_ffwSingleCondScaleWeights + d * C + c];
       let wb = weights[W_ffwSingleCondBias + d * C + c];
       ${overRowGroups((g) => `{
-        let cn = cond_norm[${g}u * C + d];
+        let cn = wide[${g}u * C + d];
         scale_value${g} += cn * ws;
         shift${g} += cn * wb;
       }`)}
     }
-    ${overRowGroups((g) => `x[${g}u * C + c] =
+    ${overRowGroups((g) => `gated[${g}u * C + c] =
       ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
       * ((${transitionInput}[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
   }
@@ -1574,7 +1580,7 @@ ${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLa
       let wv = weights[column + INTERMEDIATE + i];
       ${upGate ? "let wu = weights[W_ffwAToB + c * INTERMEDIATE + i];" : ""}
       ${overRowGroups((g) => `{
-        let xc = x[${g}u * C + c];
+        let xc = gated[${g}u * C + c];
         gate_value${g} += xc * wg;
         value${g} += xc * wv;
         ${upGate ? `up${g} += xc * wu;` : ""}

@@ -124,18 +124,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base = row * C_IN;
 
   var total = 0.0;
-  for (var c = local; c < C_IN; c += LANES) { total += input[base + c]; }
+  for (var c = local; c < C_IN; c += LANES) {
+    let v = input[base + c];
+    normalised[c] = v;
+    total += v;
+  }
   let mean = reduce_sum(local, total) / f32(C_IN);
   workgroupBarrier();
   var centred = 0.0;
   for (var c = local; c < C_IN; c += LANES) {
-    let d = input[base + c] - mean;
+    let d = normalised[c] - mean;
     centred += d * d;
   }
   let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C_IN) + EPSILON);
-  workgroupBarrier();
   for (var c = local; c < C_IN; c += LANES) {
-    normalised[c] = (input[base + c] - mean) * inverse * scale[c] + scale[C_IN + c];
+    normalised[c] = (normalised[c] - mean) * inverse * scale[c] + scale[C_IN + c];
   }
   workgroupBarrier();
 
@@ -179,6 +182,7 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 var<workgroup> reduce_a: array<f32, ${lanes}>;
+var<workgroup> row_buf: array<f32, ${channels}>;
 
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_a[local] = value;
@@ -202,18 +206,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base = row * C;
 
   var total = 0.0;
-  for (var c = local; c < C; c += LANES) { total += input[base + c]; }
+  for (var c = local; c < C; c += LANES) {
+    let v = input[base + c];
+    row_buf[c] = v;
+    total += v;
+  }
   let mean = reduce_sum(local, total) / f32(C);
   workgroupBarrier();
   var centred = 0.0;
   for (var c = local; c < C; c += LANES) {
-    let d = input[base + c] - mean;
+    let d = row_buf[c] - mean;
     centred += d * d;
   }
   let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C) + EPSILON);
-  workgroupBarrier();
   for (var c = local; c < C; c += LANES) {
-    output[base + c] = (input[base + c] - mean) * inverse * scale[c] + scale[C + c];
+    output[base + c] = (row_buf[c] - mean) * inverse * scale[c] + scale[C + c];
   }
 }`;
 

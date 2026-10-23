@@ -36,6 +36,7 @@ export const GRID_WIDTH = 32768;
  * dispatch, thirty-six blocks after anything a checker could see.
  */
 export function createLayerNormShader({ rows, channels }, hasOffset, epsilon) {
+  const stageRow = channels <= 1536;
   return `
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
@@ -44,8 +45,7 @@ ${hasOffset ? "@group(0) @binding(2) var<storage, read> offset: array<f32>;" : "
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
-
-@compute @workgroup_size(${LANES})
+${stageRow ? `var<workgroup> rowBuf: array<f32, ${channels}>;\n` : ""}@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
   let row = group.x + group.y * ${GRID_WIDTH}u;
@@ -55,7 +55,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let value = source[base + c];
-    total += value;
+${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
     square += value * value;
   }
   sums[local.x] = total;
@@ -74,7 +74,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
   let inverse = inverseSqrt(variance + ${epsilon});
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    let normalised = (source[base + c] - mean) * inverse * scale[c];
+    let normalised = (${stageRow ? "rowBuf[c]" : "source[base + c]"} - mean) * inverse * scale[c];
     destination[base + c] = ${hasOffset ? "normalised + offset[c]" : "normalised"};
   }
 }`;
@@ -223,13 +223,13 @@ ${declare.join("\n")}
 
 ${split ? `  let k_start = group.z * ${span}u;
   let k_end = min(k_start + ${span}u, ${inner}u);
-` : ""}  for (var k0 = ${split ? "k_start" : "0u"}; k0 < ${split ? "k_end" : `${inner}u`}; k0 += ${K_CHUNK}u) {
-    for (var slot = local.x; slot < ${rowTile * K_CHUNK}u; slot += ${LANES}u) {
-      let t = slot / ${K_CHUNK}u;
-      let k = slot % ${K_CHUNK}u;
-      let row = row_origin + t;
-      staged[slot] = select(0.0, input[row * ${inner}u + k0 + k]${scaleInput ? " * inputScale[k0 + k]" : ""},
-                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k0 + k < ${inner}u`});
+` : ""}  let k_lane = local.x & ${K_CHUNK - 1}u;
+  for (var k0 = ${split ? "k_start" : "0u"}; k0 < ${split ? "k_end" : `${inner}u`}; k0 += ${K_CHUNK}u) {
+    let k_col = k0 + k_lane;
+${scaleInput ? `    let in_scale = select(0.0, inputScale[k_col], ${exactK ? "true" : `k_col < ${inner}u`});\n` : ""}    for (var slot = local.x; slot < ${rowTile * K_CHUNK}u; slot += ${LANES}u) {
+      let row = row_origin + (slot / ${K_CHUNK}u);
+      staged[slot] = select(0.0, input[row * ${inner}u + k_col]${scaleInput ? " * in_scale" : ""},
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k_col < ${inner}u`});
     }
     workgroupBarrier();
     for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
@@ -380,28 +380,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // d + 1. Interleaving adjacent channels is the other common convention and
     // conforms in shape. Fused with the LayerNorm writeback so unrotated query
     // and strided key never round-trip through global memory.
-    for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
-      let head = slot / ${headDim / 2}u;
-      let d = slot % ${headDim / 2}u;
-      let c0 = head * ${headDim}u + d;
-      let c1 = c0 + ${headDim / 2}u;
-      let c = cosTab[d];
-      let s = sinTab[d];
-      if (side == 0u) {
+${(() => {
+    const invD = LANES % (headDim / 2) === 0;
+    return `    ${invD ? `let d = local.x % ${headDim / 2}u;\n    let c = cosTab[d];\n    let s = sinTab[d];\n` : ""}    if (side == 0u) {
+      for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
+        let head = slot / ${headDim / 2}u;
+${invD ? "" : `        let d = slot % ${headDim / 2}u;\n        let c = cosTab[d];\n        let s = sinTab[d];\n`}        let c0 = head * ${headDim}u + d;
+        let c1 = c0 + ${headDim / 2}u;
         let q0 = (qkv[origin + c0] - mean) * inverse * qScale[c0];
         let q1 = (qkv[origin + c1] - mean) * inverse * qScale[c1];
         query[out + c0] = q0 * c - q1 * s;
         query[out + c1] = q0 * s + q1 * c;
-      } else {
+      }
+      workgroupBarrier();
+    } else {
+      for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
+        let head = slot / ${headDim / 2}u;
+${invD ? "" : `        let d = slot % ${headDim / 2}u;\n        let c = cosTab[d];\n        let s = sinTab[d];\n`}        let c0 = head * ${headDim}u + d;
+        let c1 = c0 + ${headDim / 2}u;
         let k0 = (qkv[origin + c0] - mean) * inverse * kScale[c0];
         let k1 = (qkv[origin + c1] - mean) * inverse * kScale[c1];
-        let kFirst = (head * ${headDim}u + d) * ${rows}u + row;
+        let kFirst = c0 * ${rows}u + row;
         let kSecond = kFirst + ${headDim / 2}u * ${rows}u;
         key[kFirst] = k0 * c - k1 * s;
         key[kSecond] = k0 * s + k1 * c;
       }
-    }
-    if (side == 0u) { workgroupBarrier(); }
+    }`;
+  })()}
   }
 }`;
 }
@@ -684,13 +689,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 ${declare.join("\n")}
 
+  let k_lane = local.x & ${K_CHUNK - 1}u;
   for (var k0 = 0u; k0 < ${model}u; k0 += ${K_CHUNK}u) {
+    let k_col = k0 + k_lane;
     for (var slot = local.x; slot < ${tile * K_CHUNK}u; slot += ${LANES}u) {
-      let t = slot / ${K_CHUNK}u;
-      let k = slot % ${K_CHUNK}u;
-      let row = row_origin + t;
-      staged[slot] = select(0.0, normalised[row * ${model}u + k0 + k],
-                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k0 + k < ${model}u`});
+      let row = row_origin + (slot / ${K_CHUNK}u);
+      staged[slot] = select(0.0, normalised[row * ${model}u + k_col],
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k_col < ${model}u`});
     }
     workgroupBarrier();
     for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {

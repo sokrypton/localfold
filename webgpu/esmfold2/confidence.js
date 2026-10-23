@@ -121,7 +121,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     squares += d * d;
   }
   let inverse = inverseSqrt(total_of(lane, squares) / f32(CHANNELS) + EPSILON);
-  workgroupBarrier();
 
   var squared = 0.0;
   for (var axis = 0u; axis < 3u; axis += 1u) {
@@ -299,9 +298,12 @@ fn largest_of(lane: u32, value: f32) -> f32 {
   if (lane < 32u) { reduce[lane] = max(reduce[lane], reduce[lane + 32u]); } workgroupBarrier();
   if (lane < 16u) { reduce[lane] = max(reduce[lane], reduce[lane + 16u]); } workgroupBarrier();
   if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
-  if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
-  if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
-  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
+  if (lane == 0u) {
+    let m0 = max(max(reduce[0], reduce[4]), max(reduce[2], reduce[6]));
+    let m1 = max(max(reduce[1], reduce[5]), max(reduce[3], reduce[7]));
+    reduce[0] = max(m0, m1);
+  }
+  workgroupBarrier();
   return reduce[0];
 }
 
