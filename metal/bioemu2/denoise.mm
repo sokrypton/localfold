@@ -373,27 +373,36 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const std::string sc = SM + "single_conditioner/", af = SM + "atom_feature_embedder/";
   const int Ca = dimW(af + "r_to_q_trans/weight", 0), Dt = dimW(sc + "single_embed/weight", 0);
   const float cIn = 1.f / sqrtf(sigma * sigma + SIGMA_DATA * SIGMA_DATA), t = 0.25f * logf(sigma / SIGMA_DATA);
-  float* r = scratch<float>("be2.dn.r", RN * 3);
-  be2Run1d("be2_scale_masked", RN * 3, Be2ScaleMaskedArgs{x, Iin("atom_mask"), r, (u64)N, RN, cIn, 0});
-  // the atom stream's initial state
+  // the atom and token streams' initial states
   float* q = scratch<float>("be2.dn.q", RN * Ca);
-  be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{d.q0, q, (u64)N * Ca, RN * Ca});
-  linT(r, af + "r_to_q_trans/weight", q, RN, 3, Ca, 1.f);
-  if (d.dyn) {
-    float* cq = scratch<float>("be2.dn.cq", RN * Ca);
-    if (cond) linT(cond, af + "cond_to_q_trans/weight", cq, RN, 3, Ca);
-    else {
-      float* one = scratch<float>("be2.dn.cq1", (size_t)N * Ca);
-      linT(d.coordsCond, af + "cond_to_q_trans/weight", one, N, 3, Ca);
-      be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{one, cq, (u64)N * Ca, RN * Ca});
-    }
-    run1d("be2_scaled_add", RN * Ca, Be2ScaledAddArgs{q, cq, RN * Ca, d.dynGate, 0});
-  }
   float* a = scratch<float>("be2.dn.a", RT * Dt);
-  be2Run1d("be2_repeat", RT * Dt, Be2RepeatArgs{d.a0, a, (u64)T * Dt, RT * Dt});
-  float* rc = scratch<float>("be2.dn.rc", RT * 3);
-  be2Run1d("be2_centre_atoms", RT * 3, Be2CentreAtomsArgs{r, Iin("token_center_atom_index"), rc, (uint)T, (uint)N, 3, 3, (uint)samples, 0});
-  linT(rc, SM + "r_token_to_a/weight", a, RT, 3, Dt, 1.f);
+  if ((Ca & 3) == 0 && (Dt & 3) == 0) {
+    be2Run1d("be2_q_init", (RN * Ca) >> 2,
+             Be2QInitArgs{x, Iin("atom_mask"), d.q0, Wf(af + "r_to_q_trans/weight"), cond, d.coordsCond,
+                          d.dyn ? Wf(af + "cond_to_q_trans/weight") : nullptr, q, (u64)RN, (uint)N, (uint)Ca, cIn, d.dynGate});
+    be2Run1d("be2_a_init", (RT * Dt) >> 2,
+             Be2AInitArgs{x, Iin("atom_mask"), Iin("token_center_atom_index"), d.a0, Wf(SM + "r_token_to_a/weight"), a,
+                          (u64)RT, (uint)T, (uint)N, (uint)Dt, cIn, 0});
+  } else {
+    float* r = scratch<float>("be2.dn.r", RN * 3);
+    be2Run1d("be2_scale_masked", RN * 3, Be2ScaleMaskedArgs{x, Iin("atom_mask"), r, (u64)N, RN, cIn, 0});
+    be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{d.q0, q, (u64)N * Ca, RN * Ca});
+    linT(r, af + "r_to_q_trans/weight", q, RN, 3, Ca, 1.f);
+    if (d.dyn) {
+      float* cq = scratch<float>("be2.dn.cq", RN * Ca);
+      if (cond) linT(cond, af + "cond_to_q_trans/weight", cq, RN, 3, Ca);
+      else {
+        float* one = scratch<float>("be2.dn.cq1", (size_t)N * Ca);
+        linT(d.coordsCond, af + "cond_to_q_trans/weight", one, N, 3, Ca);
+        be2Run1d("be2_repeat", RN * Ca, Be2RepeatArgs{one, cq, (u64)N * Ca, RN * Ca});
+      }
+      run1d("be2_scaled_add", RN * Ca, Be2ScaledAddArgs{q, cq, RN * Ca, d.dynGate, 0});
+    }
+    be2Run1d("be2_repeat", RT * Dt, Be2RepeatArgs{d.a0, a, (u64)T * Dt, RT * Dt});
+    float* rc = scratch<float>("be2.dn.rc", RT * 3);
+    be2Run1d("be2_centre_atoms", RT * 3, Be2CentreAtomsArgs{r, Iin("token_center_atom_index"), rc, (uint)T, (uint)N, 3, 3, (uint)samples, 0});
+    linT(rc, SM + "r_token_to_a/weight", a, RT, 3, Dt, 1.f);
+  }
   // the layers
   const std::string ab = "attention/attention_layer/pair_bias_attn/", tb = "attention/pair_bias_attn/";
   const int Ha = 4, Ht = 16;
@@ -616,13 +625,12 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   // exactly 0 is NaN. Kept in float, every row stays finite)
   linT(q, ro + "q_to_hidden/weight", h, RN, Ca, Hd, 0.f, 0, 0, true);
   linT(a, ro + "s_to_hidden/weight", ah, RT, Dt, Hd, 0.f, 0, 0, true);
-  be2Run1d("be2_tokens_to_atoms", RN * Hd, Be2TokensToAtomsArgs{ah, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), h, (u64)N,
-                                                             (uint)T, (uint)Hd, (uint)Hd, (uint)samples, 1.f, 0});
-  layerNorm(h, h, RN, Hd, Wf(ro + "to_out_0/weight"), nullptr);
-  float* out = scratch<float>("be2.dn.out", RN * 3);
-  linT(h, ro + "to_out_1/weight", out, RN, Hd, 3);
   const float s2 = sigma * sigma, sd2 = SIGMA_DATA * SIGMA_DATA;
-  run1d("be2_edm_out", RN * 3, Be2EdmOutArgs{x, out, den, RN * 3, sd2 / (s2 + sd2), sigma * SIGMA_DATA / sqrtf(sd2 + s2)});
+  const size_t rGroups = (RN + 7) / 8;
+  run("be2_readout_tail", Grid{(uint32_t)std::min<size_t>(rGroups, 65535), (uint32_t)((rGroups + 65534) / 65535), 1}, 256,
+      Be2ReadoutTailArgs{h, ah, Iin("token_idx_at_atom"), Iin("atom_pad_mask"), Wf(ro + "to_out_0/weight"),
+                         Wf(ro + "to_out_1/weight"), x, den, (u64)RN, (uint)N, (uint)T, (uint)Hd,
+                         sd2 / (s2 + sd2), sigma * SIGMA_DATA / sqrtf(sd2 + s2), 0});
 }
 
 void prepareWeights() {

@@ -1048,6 +1048,104 @@ kernel void be2_edm_out(LF_ARGS(Be2EdmOutArgs)) {
   ulong t = LF_INDEX;
   if (t < a.n) a.d[t] = a.skip * a.x[t] + a.cout * a.out[t];
 }
+kernel void be2_q_init(LF_ARGS(Be2QInitArgs)) {
+  ulong t = LF_INDEX;
+  const uint C4 = a.Ca >> 2;
+  if (t >= a.rows * C4) return;
+  BE2_SPLIT(t, C4, row, c4);
+  const uint smp = lf_udiv(row, a.N), at = row - smp * a.N, c = c4 << 2;
+  const ulong xoff = (ulong)row * 3;
+  const float3 r = a.mask[at] ? a.cIn * float3(a.x[xoff], a.x[xoff + 1], a.x[xoff + 2]) : float3(0.f);
+  float4 v = ((device const float4*)(a.q0 + (ulong)at * a.Ca))[c4];
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < 4; ++k) {
+    device const float* wr = a.wR + (c + k) * 3;
+    v[k] += r.x * wr[0] + r.y * wr[1] + r.z * wr[2];
+  }
+  if (a.wC) {
+    device const float* cc = a.cond ? (a.cond + xoff) : (a.coordsCond + (ulong)at * 3);
+    const float3 cr(cc[0], cc[1], cc[2]);
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 4; ++k) {
+      device const float* wc = a.wC + (c + k) * 3;
+      v[k] += a.dynGate * (cr.x * wc[0] + cr.y * wc[1] + cr.z * wc[2]);
+    }
+  }
+  ((device float4*)a.q)[t] = v;
+}
+kernel void be2_a_init(LF_ARGS(Be2AInitArgs)) {
+  ulong t = LF_INDEX;
+  const uint C4 = a.Dt >> 2;
+  if (t >= a.rows * C4) return;
+  BE2_SPLIT(t, C4, row, c4);
+  const uint smp = lf_udiv(row, a.T), tok = row - smp * a.T, c = c4 << 2;
+  const uint ca = (uint)a.centre[tok];
+  const ulong xoff = ((ulong)smp * a.N + ca) * 3;
+  const float3 r = a.mask[ca] ? a.cIn * float3(a.x[xoff], a.x[xoff + 1], a.x[xoff + 2]) : float3(0.f);
+  float4 v = ((device const float4*)(a.a0 + (ulong)tok * a.Dt))[c4];
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < 4; ++k) {
+    device const float* wa = a.wA + (c + k) * 3;
+    v[k] += r.x * wa[0] + r.y * wa[1] + r.z * wa[2];
+  }
+  ((device float4*)a.a)[t] = v;
+}
+kernel void be2_readout_tail(LF_ARGS(Be2ReadoutTailArgs)) {
+  const ulong row = BE2_ROW; const uint lane = BE2_LANE;
+  if (row >= a.rows) return;
+  const uint smp = lf_udiv((uint)row, a.N), al = (uint)row - smp * a.N;
+  const bool hasTok = a.pad[al] != 0;
+  device const float* hr = a.h + row * a.Hd;
+  device const float* ar = hasTok ? a.ah + ((ulong)smp * a.T + (uint)a.tokIdx[al]) * a.Hd : nullptr;
+  if (a.Hd == 384) {
+    device const float4* h4 = (device const float4*)hr;
+    device const float4* a4 = (device const float4*)ar;
+    const float4 v0 = h4[lane] + (hasTok ? a4[lane] : float4(0.f));
+    const float4 v1 = h4[lane + 32] + (hasTok ? a4[lane + 32] : float4(0.f));
+    const float4 v2 = h4[lane + 64] + (hasTok ? a4[lane + 64] : float4(0.f));
+    const float4 vs = v0 + v1 + v2;
+    const float mean = simd_sum(vs.x + vs.y + vs.z + vs.w) * (1.f / 384.f);
+    const float4 d0 = v0 - mean, d1 = v1 - mean, d2 = v2 - mean;
+    const float inv = rsqrt(simd_sum(dot(d0, d0) + dot(d1, d1) + dot(d2, d2)) * (1.f / 384.f) + 1e-5f);
+    device const float4* wl4 = (device const float4*)a.wLn;
+    const float4 n0 = d0 * inv * wl4[lane];
+    const float4 n1 = d1 * inv * wl4[lane + 32];
+    const float4 n2 = d2 * inv * wl4[lane + 64];
+    device const float4* w0 = (device const float4*)(a.wOut + 0 * 384);
+    device const float4* w1 = (device const float4*)(a.wOut + 1 * 384);
+    device const float4* w2 = (device const float4*)(a.wOut + 2 * 384);
+    const float o0 = simd_sum(dot(n0, w0[lane]) + dot(n1, w0[lane + 32]) + dot(n2, w0[lane + 64]));
+    const float o1 = simd_sum(dot(n0, w1[lane]) + dot(n1, w1[lane + 32]) + dot(n2, w1[lane + 64]));
+    const float o2 = simd_sum(dot(n0, w2[lane]) + dot(n1, w2[lane + 32]) + dot(n2, w2[lane + 64]));
+    if (lane == 0) {
+      const ulong xoff = row * 3;
+      a.den[xoff + 0] = a.skip * a.x[xoff + 0] + a.cout * o0;
+      a.den[xoff + 1] = a.skip * a.x[xoff + 1] + a.cout * o1;
+      a.den[xoff + 2] = a.skip * a.x[xoff + 2] + a.cout * o2;
+    }
+    return;
+  }
+  float s = 0;
+  for (uint c = lane; c < a.Hd; c += 32) s += hr[c] + (hasTok ? ar[c] : 0.f);
+  const float mean = simd_sum(s) / a.Hd;
+  float v = 0;
+  for (uint c = lane; c < a.Hd; c += 32) { const float d = (hr[c] + (hasTok ? ar[c] : 0.f)) - mean; v += d * d; }
+  const float inv = rsqrt(simd_sum(v) / a.Hd + 1e-5f);
+  float p0 = 0, p1 = 0, p2 = 0;
+  for (uint c = lane; c < a.Hd; c += 32) {
+    const float n = ((hr[c] + (hasTok ? ar[c] : 0.f)) - mean) * inv * a.wLn[c];
+    p0 += n * a.wOut[c];
+    p1 += n * a.wOut[a.Hd + c];
+    p2 += n * a.wOut[2 * a.Hd + c];
+  }
+  const float o0 = simd_sum(p0), o1 = simd_sum(p1), o2 = simd_sum(p2);
+  if (lane == 0) {
+    const ulong xoff = row * 3;
+    a.den[xoff + 0] = a.skip * a.x[xoff + 0] + a.cout * o0;
+    a.den[xoff + 1] = a.skip * a.x[xoff + 1] + a.cout * o1;
+    a.den[xoff + 2] = a.skip * a.x[xoff + 2] + a.cout * o2;
+  }
+}
 kernel void be2_cos_embed(LF_ARGS(Be2CosEmbedArgs)) {
   ulong idx = LF_INDEX;
   const uint K = max(a.K, 1u);

@@ -443,7 +443,7 @@ kernel void af3_ada_ln_128(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device float4* x4 = (device float4*)(a.x + row * 128);
-  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
   float4 xv = x4[lane];
@@ -481,7 +481,7 @@ kernel void af3_ada_ln_768(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device float4* x4 = (device float4*)(a.x + row * 768);
-  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
   device const float4* sc4 = (device const float4*)(a.scale + pr);
@@ -523,7 +523,7 @@ kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgro
   ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device float* x = a.x + row * a.C;
-  uint r32 = (uint)row, prRow = r32 - lf_udiv(r32, a.period) * a.period;
+  uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
   ulong pr = (ulong)prRow * a.ld, gpr = (ulong)prRow * a.resLd;
   const bool rawS = (a.raw & 1) != 0, rawG = (a.raw & 2) != 0;
   float s = 0.f;

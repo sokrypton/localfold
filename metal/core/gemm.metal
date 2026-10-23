@@ -287,6 +287,12 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     thread auto& o = om.thread_elements(); \
     thread auto& c = cm.thread_elements(); \
     thread auto& x = xm.thread_elements(); \
+    float2 bv2(0.f); \
+    if ((EP & 64) == 0 && (g.epilogue & 4)) { \
+      const ulong boff = (g.ptrs ? (ulong)z * g.m : 0) + (i) + sn; \
+      bv2 = (!gated && (g.biasType & 255) == 2) ? float2(*(device const half2*)((device const half*)g.bias + boff)) \
+                                                : *(device const float2*)((device const float*)g.bias + boff); \
+    } \
     _Pragma("clang loop unroll(full)") \
     for (int t = 0; t < 2; ++t) { \
       const int col = (i) + sn + t; \
@@ -305,14 +311,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           v = cv + (b128 + v) / s; \
         } \
       } else if (gated) { \
-        if (g.epilogue & 4) v += ((device const float*)g.bias)[col]; \
+        if (g.epilogue & 4) v += bv2[t]; \
         v = cv + (float)x[t] * (1.f / (1.f + exp(-v))); \
       } else { \
         if (g.beta != 0.f) v += g.beta * cv; \
-        if (g.epilogue & 4) { \
-          const ulong boff = g.ptrs ? (ulong)z * g.m : 0; \
-          v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[boff + col] : ((device const float*)g.bias)[boff + col]; \
-        } \
+        if (g.epilogue & 4) v += bv2[t]; \
         if (g.epilogue & 2) v = max(v, 0.f); \
         if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f)); \
       } \
@@ -388,7 +391,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             simdgroup_load(cm, C + (ulong)j * g.ldc + i, (ulong)g.ldc);
             thread auto& o = om.thread_elements();
             thread auto& c = cm.thread_elements();
-            const uint jr = (uint)(j + sm), r = jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
+            const uint jr = (uint)(j + sm), r = jr < (uint)g.tgN ? jr : jr - lf_udiv(jr, (uint)g.tgN) * (uint)g.tgN;
             _Pragma("clang loop unroll(full)")
             for (int t = 0; t < 2; ++t) {
               const float gp = ((device const float*)g.aux)[(ulong)r * g.ldaux + (i + sn + t)];
@@ -455,7 +458,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             }
             if (g.epilogue & 16384) {
               if (jr >= g.tgPairs) continue;
-              const uint r = (uint)jr - lf_udiv((uint)jr, (uint)g.tgN) * (uint)g.tgN;
+              const uint r = (uint)jr < (uint)g.tgN ? (uint)jr : (uint)jr - lf_udiv((uint)jr, (uint)g.tgN) * (uint)g.tgN;
               const float gp = ((device const float*)g.aux)[(ulong)r * g.ldaux + ic];
               const float gm = g.tgC ? gp : (1.f / (1.f + exp(-gp)));
               lf_st(D, (ulong)ic + (ulong)jr * g.ldd, lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc) + v * gm);

@@ -57,7 +57,7 @@ struct JoinPairRelArgs { CP(float) z; RelIdx rel; DP(float) out; u64 p0, n; uint
 struct SiluMulArgs { DP(float) a; CP(float) b; u64 n; };
 struct FourierArgs { CP(float) w; CP(float) b; CP(float) level; DP(float) out; uint n, pad; };
 struct AddRowArgs { CP(float) base; CP(float) row; DP(float) x; u64 rows; uint C, pad; };
-struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; DP(half) outH; uint A, pad; };
+struct CoordsInputArgs { CP(float) x; CP(float) level; DP(float) out; DP(half) outH; uint A, C; CP(float) c0; CP(half) wH; };
 struct AdaCombineArgs { DP(float) an; CP(float) g; CP(float) gb; CP(float) sh; DP(half) out; CP(float) resY; CP(float) resGate; uint T, C, ld, pad; };
 struct SigmoidMulArgs { DP(float) x; CP(float) g; CP(float) gb; DP(float) dst; uint T, C, ld, pad; };
 struct ScaleCopiesArgs { CP(float) x; CP(float) scales; DP(float) out; DP(half) outH; uint rows, C, n, pad; CP(float) offsets; };
@@ -65,6 +65,8 @@ struct BiasSoftmaxArgs { DP(float) S; CP(half) bias; uint T; float scale; };
 struct PairToHeadsArgs { CP(float) pb; DP(half) out; u64 P; uint H, T, stride, blocks; };
 struct GatherTokensArgs { CP(float) perToken; CP(int) atomToToken; CP(float) mask; DP(float) q; uint A, C; };
 struct EdmArgs { CP(float) xNoisy; CP(float) r; DP(float) out; CP(float) level; uint n, pad; };
+struct DecoderOutArgs { CP(float) q; CP(float) scale; CP(float) offset; CP(half) wH; CP(float) xNoisy; CP(float) level;
+                        DP(float) out; uint A, C, halfGemm, pad; };
 
 // ---------------------------------------------------------------- the confidence head
 struct ConfZArgs { DP(float) z; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) rows; CP(float) cols; uint T, C;

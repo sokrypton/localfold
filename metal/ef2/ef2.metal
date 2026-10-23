@@ -813,8 +813,22 @@ kernel void ef2_add_row(LF_ARGS(AddRowArgs)) {
   uint s = a.pad > 0 ? lf_udiv(r, a.pad) : 0, tok = a.pad > 0 ? r - s * a.pad : r;
   ((device float4*)a.x)[t] = ((device const float4*)a.base)[(ulong)tok * C4 + c4] + ((device const float4*)a.row)[(ulong)s * C4 + c4];
 }
-kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / denom | 0]
+kernel void ef2_coords_input(LF_ARGS(CoordsInputArgs)) {     // [A, 6] = [x / denom | 0] (or fused with coordsLinear + c0 when wH is set)
   uint t = (uint)LF_INDEX;
+  if (a.wH) {
+    uint C4 = a.C >> 2;
+    if (t >= a.A * C4) return;
+    uint at = lf_udiv(t, C4), c4 = t - at * C4;
+    float s = a.level[1];
+    float r0 = (float)(half)(a.x[at * 3 + 0] * s);
+    float r1 = (float)(half)(a.x[at * 3 + 1] * s);
+    float r2 = (float)(half)(a.x[at * 3 + 2] * s);
+    float4 w0 = float4(((device const half4*)(a.wH + 0 * a.C))[c4]);
+    float4 w1 = float4(((device const half4*)(a.wH + 1 * a.C))[c4]);
+    float4 w2 = float4(((device const half4*)(a.wH + 2 * a.C))[c4]);
+    ((device float4*)a.out)[t] = ((device const float4*)a.c0)[t] + r0 * w0 + r1 * w1 + r2 * w2;
+    return;
+  }
   if (t >= a.A * 6) return;
   uint at = t / 6, k = t - at * 6;
   float v = k < 3 ? a.x[at * 3 + k] * a.level[1] : 0.f;
@@ -1017,6 +1031,35 @@ kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
 kernel void ef2_edm_combine(LF_ARGS(EdmArgs)) {
   uint t = (uint)LF_INDEX;
   if (t < a.n) a.out[t] = a.level[2] * a.xNoisy[t] + a.level[3] * a.r[t];
+}
+kernel void ef2_decoder_out(constant DecoderOutArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  uint at = (tg.y * ng.x + tg.x) * 8 + sg;
+  if (at >= a.A || a.C != 128) return;
+  const float4 qv = ((device const float4*)(a.q + (ulong)at * 128))[lane];
+  const float mean = simd_sum(qv.x + qv.y + qv.z + qv.w) * (1.f / 128.f);
+  const float4 d = qv - mean;
+  const float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+  const float4 yn = d * inv * ((device const float4*)a.scale)[lane] + ((device const float4*)a.offset)[lane];
+  const float4 qn = a.halfGemm ? float4(half4(yn)) : yn;
+  const uint c0 = lane << 2;
+  float p0 = 0, p1 = 0, p2 = 0;
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 0; k < 4; ++k) {
+    device const half* wk = a.wH + (c0 + k) * 3;
+    p0 += qn[k] * (float)wk[0];
+    p1 += qn[k] * (float)wk[1];
+    p2 += qn[k] * (float)wk[2];
+  }
+  const float r0 = simd_sum(p0), r1 = simd_sum(p1), r2 = simd_sum(p2);
+  if (lane == 0) {
+    const float cSkip = a.level[2], cOut = a.level[3];
+    const uint xoff = at * 3;
+    a.out[xoff + 0] = cSkip * a.xNoisy[xoff + 0] + cOut * r0;
+    a.out[xoff + 1] = cSkip * a.xNoisy[xoff + 1] + cOut * r1;
+    a.out[xoff + 2] = cSkip * a.xNoisy[xoff + 2] + cOut * r2;
+  }
 }
 
 // ---------------------------------------------------------------- the confidence head

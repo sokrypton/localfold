@@ -102,6 +102,12 @@ struct Be2StackArgs { CP(half) a; CP(half) b; DP(half) out; u64 na, nb; };
 // ---------------------------------------------------------------- the denoiser
 struct Be2ScaleMaskedArgs { CP(float) x; CP(int) mask; DP(float) r; u64 N, n; float s; uint pad0; };
 struct Be2EdmOutArgs { CP(float) x; CP(float) out; DP(float) d; u64 n; float skip, cout; };
+struct Be2QInitArgs { CP(float) x; CP(int) mask; CP(float) q0; CP(float) wR; CP(float) cond; CP(float) coordsCond;
+                      CP(float) wC; DP(float) q; u64 rows; uint N, Ca; float cIn, dynGate; };
+struct Be2AInitArgs { CP(float) x; CP(int) mask; CP(int) centre; CP(float) a0; CP(float) wA; DP(float) a;
+                      u64 rows; uint T, N, Dt; float cIn; uint pad0; };
+struct Be2ReadoutTailArgs { CP(float) h; CP(float) ah; CP(int) tokIdx; CP(int) pad; CP(float) wLn; CP(float) wOut;
+                            CP(float) x; DP(float) den; u64 rows; uint N, T, Hd; float skip, cout; uint pad0; };
 struct Be2CosEmbedArgs { CP(float) w; CP(float) b; DP(float) out; float t; uint n; CP(float) ts; uint K, pad0; };
 struct Be2BroadcastAddArgs { DP(float) y; CP(float) v; u64 rows; uint C, pad0; };    // y[r] += v
 struct Be2ScaledAddArgs { DP(float) y; CP(float) x; u64 n; float s; uint pad0; };     // y += s x
