@@ -3024,30 +3024,6 @@ export class Af3DiffusionTransformerGpu {
       const validation = options.validation
         ?? new DeferredValidation(this.device, "diffusion transformer");
 
-      // 🔴 AND THE CONDITIONING'S NORM, ONCE FOR THE WHOLE CALL, for the same
-      // reason the pair norm above is: nothing it reads moves with the block.
-      // Only the SCALE is per block, so what is shared is
-      // `(cond - mean) * inverse` - which 144 workgroup-sets were deriving
-      // separately, two barrier-tree reductions each. Unlike the pair norm this
-      // one does move with the noise level, because the conditioning does, so
-      // it runs per call rather than per schedule.
-      {
-        validation.begin();
-        const encoder = this.device.createCommandEncoder({ label: "difftx.cond-norm" });
-        const pass = encoder.beginComputePass({ label: "cond-norm" });
-        pass.setPipeline(compiled.normaliseCond);
-        pass.setBindGroup(0, this.device.createBindGroup({
-          layout: compiled.normaliseCond.getBindGroupLayout(0),
-          entries: [condBuffer, condNormalised].map((allocation, binding) => ({
-            binding, resource: { buffer: allocation.buffer },
-          })),
-        }));
-        pass.dispatchWorkgroups(Math.min(tokens, GRID_WIDTH), Math.ceil(tokens / GRID_WIDTH));
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
-        validation.end("conditioning layer norm");
-      }
-
       // 🔴 AND EVERY BLOCK'S ZERO-INIT GATE, ONCE, FOR THE SAME REASON THE TWO
       // NORMS ABOVE ARE HOISTED: nothing it reads moves with the block. What is
       // new here is that the BLOCKS ARE THE z AXIS, so this is not twenty-four
@@ -3093,39 +3069,14 @@ export class Af3DiffusionTransformerGpu {
       const ffwAdalnScaleShift = batchedGates
         ? scratch("difftx.ffw-adaln-scale-shift", allBlocks.length * scaleShiftBytes)
         : undefined;
-      if (batchedGates) {
-        validation.begin();
-        const encoder = this.device.createCommandEncoder({ label: "difftx.zero-gates" });
-        const pass = encoder.beginComputePass({ label: "zero-gates" });
-        pass.setPipeline(compiled.zeroGates);
-        pass.setBindGroup(0, this.device.createBindGroup({
-          layout: compiled.zeroGates.getBindGroupLayout(0),
-          entries: [condBuffer, condNormalised, zeroGateWeights,
-                    zeroGateOut, ffwGateOut, adalnScaleShift, ffwAdalnScaleShift]
-            .map((allocation, binding) => ({
-              binding, resource: { buffer: allocation.buffer },
-            })),
-        }));
-        // 🔴 sources.gateTile, NOT `tile`. This kernel is the one built under its
-        // own tiling, and the file's own warning above says what dividing by a
-        // different one costs: "the SHADERS tiled by four while the DISPATCH
-        // divided the token count by eight". Here it was the benign direction -
-        // 68 groups launched where 9 do the work, the other 59 returning at the
-        // bounds check - but benign by luck of a guard is not a reason to keep
-        // it, and it is 7.5x the launches.
-        pass.dispatchWorkgroups(Math.ceil(tokens / sources.gateTile),
-            channels / (shape.lanes ?? 256), allBlocks.length);
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
-        validation.end("batched zero gate");
-      }
 
-      // 🔴 ONE ENCODER AND ONE SUBMIT FOR ALL TWENTY-FOUR BLOCKS. Every block
-      // used to finish and submit its own command buffer, which at eight tokens
-      // - where the matmuls are nothing at all - was most of what the stack
-      // cost. The blocks are strictly sequential on the same buffers and WebGPU
-      // orders passes within an encoder, so batching them changes nothing about
-      // what runs, only how many times the CPU asks the driver to run it.
+      // 🔴 ONE ENCODER AND ONE SUBMIT FOR ALL TWENTY-FOUR BLOCKS (including
+      // `cond-norm` and `zero-gates`). Every block used to finish and submit
+      // its own command buffer, which at eight tokens - where the matmuls are
+      // nothing at all - was most of what the stack cost. The blocks are
+      // strictly sequential on the same buffers and WebGPU orders passes within
+      // an encoder, so batching them changes nothing about what runs, only how
+      // many times the CPU asks the driver to run it.
       validation.begin();
       let encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
       // See #bindGroups: `key` names the pass, and the entry is rebuilt if the
@@ -3188,6 +3139,29 @@ export class Af3DiffusionTransformerGpu {
         pass.dispatchWorkgroups(x, y, z);
         if (!batchPasses) pass.end();
       };
+      // 🔴 AND THE CONDITIONING'S NORM, ONCE FOR THE WHOLE CALL, for the same
+      // reason the pair norm above is: nothing it reads moves with the block.
+      // Only the SCALE is per block, so what is shared is
+      // `(cond - mean) * inverse` - which 144 workgroup-sets were deriving
+      // separately, two barrier-tree reductions each. Unlike the pair norm this
+      // one does move with the noise level, because the conditioning does, so
+      // it runs per call rather than per schedule.
+      run("cond-norm", compiled.normaliseCond, [condBuffer, condNormalised],
+          Math.min(tokens, GRID_WIDTH), Math.ceil(tokens / GRID_WIDTH));
+      if (batchedGates) {
+        // 🔴 sources.gateTile, NOT `tile`. This kernel is the one built under its
+        // own tiling, and the file's own warning above says what dividing by a
+        // different one costs: "the SHADERS tiled by four while the DISPATCH
+        // divided the token count by eight". Here it was the benign direction -
+        // 68 groups launched where 9 do the work, the other 59 returning at the
+        // bounds check - but benign by luck of a guard is not a reason to keep
+        // it, and it is 7.5x the launches.
+        run("zero-gates", compiled.zeroGates,
+            [condBuffer, condNormalised, zeroGateWeights,
+             zeroGateOut, ffwGateOut, adalnScaleShift, ffwAdalnScaleShift],
+            Math.ceil(tokens / sources.gateTile),
+            channels / (shape.lanes ?? 256), "zero-gates", allBlocks.length);
+      }
       // This block's window onto the batched ffw gate, or the raw conditioning
       // when it was not batched - whichever the kernel was compiled to read.
       const ffwGateSlice = (at) => (batchedGates

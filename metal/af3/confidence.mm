@@ -209,10 +209,11 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   for (int b = 0; b < PB; ++b) pc[b] = 0.5f / PB + (float)b / PB;
   float* dpc = scratch<float>("conf.plddtCentres", PB);
   upload(dpc, pc.data(), PB * 4);
-  half* sln = scratch<half>("conf.sln", (size_t)n * Cs);
+  half* sln = scratch<half>("conf.sln", np * Cs);
+  if (np > (size_t)n) fill(sln + (size_t)n * Cs, 0, (np - n) * Cs * sizeof(half));
   if (hasW(P + ".plddtLnScale")) ln(single, sln, n, Cs, P + ".plddtLnScale", P + ".plddtLnOffset");
   else toHalf(single, sln, (size_t)n * Cs);
-  float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
+  float* pl = scratch<float>("conf.plddtLogits", np * dense * PB);
   if (flag("trunk.dialect.chaiConfidence")) {
     // chai-1 predicts pLDDT over the 37 ATOM37 slots and gathers each dense slot's by its atom NAME (no match: slot 0)
     static const char* ATOM37[37] = {"N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD", "CD1", "CD2", "ND1", "ND2",
@@ -231,10 +232,10 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
       }
     int* dIdx = scratch<int>("conf.atom37", idx.size());
     upload(dIdx, idx.data(), idx.size() * 4);
-    float* p37 = scratch<float>("conf.plddt37", (size_t)n * 37 * PB);
-    lin(sln, P + ".plddtLogits", p37, n, Cs, 37 * PB);
+    float* p37 = scratch<float>("conf.plddt37", np * 37 * PB);
+    lin(sln, P + ".plddtLogits", p37, np, Cs, 37 * PB);
     run1d("af3_plddt37", (size_t)n * dense * PB, Plddt37Args{p37, dIdx, pl, (uint)n, (uint)dense, (uint)PB, 0});
-  } else lin(sln, P + ".plddtLogits", pl, n, Cs, dense * PB);
+  } else lin(sln, P + ".plddtLogits", pl, np, Cs, dense * PB);
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
   run1d("af3_expectation", (size_t)n * dense, ExpectationArgs{pl, plddt, nullptr, dpc, (u64)n * dense, (uint)PB, 0, 100.f, 0});
   out.plddt = download(plddt, (size_t)n * dense);

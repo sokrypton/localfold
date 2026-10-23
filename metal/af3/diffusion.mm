@@ -426,9 +426,10 @@ static float* atomDecoder(const half* tokenAct) {
   AtomShape sh = atomShape();
   int C = D.decC;
   size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
+  size_t rows = (size_t)sh.tokens * NS, prows = (rows + 15) / 16 * 16;
   Gather t2q = gatherOf("batch.tokenAtomsToQueries");
-  float* proj = scratch<float>("dec.proj", (size_t)sh.tokens * NS * C);
-  lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, (size_t)sh.tokens * NS, D.decPerToken, C);
+  float* proj = scratch<float>("dec.proj", prows * C);
+  lin(tokenAct, Dd + ".projectTokenFeaturesForBroadcast", proj, prows, D.decPerToken, C);
   float* act = scratch<float>("dec.act", qRows * C);
   run1d("af3_broadcast_skip", (C & 3) ? qRows * C : qRows * (C >> 2),
         BroadcastSkipArgs{proj, t2q.idx, t2q.mask, D.enc.skip, D.enc.qMask, act, qRows, q1, (uint)C,
@@ -506,7 +507,13 @@ static float* denoise(const float* x, float level, float* eulerX = nullptr, floa
   stage("snproj");
   transformer(act, single, level);
   stage("transformer");
-  half* actn = scratch<half>("dn.actn", rows * perToken);
+  size_t prows = (rows + 15) / 16 * 16;
+  half* actn = scratch<half>("dn.actn", prows * perToken);
+  static const half* zeroedActn = nullptr; static size_t zeroedActnRows = 0;
+  if (prows > rows && (actn != zeroedActn || prows != zeroedActnRows)) {
+    fill(actn + rows * perToken, 0, (prows - rows) * perToken * sizeof(half));
+    zeroedActn = actn; zeroedActnRows = prows;
+  }
   ln(act, actn, rows, perToken, "diffusion.outputNormScale", "diffusion.outputNormOffset");
   float* upd = atomDecoder(actn);
   stage("decoder");
@@ -592,7 +599,7 @@ static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_
   const double churn = SAMPLER.churn ? std::min(80.0 / N, std::sqrt(2.0) - 1.0) : 0.0;
   std::vector<float> rot = rotations(T, seeds);
   float* dRot = uploadNew(rot.data(), rot.size());
-  float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+  float* dIn = scratch<float>("sample.noisy", all3);
   float* dG = scratch<float>("sample.grad", all3); float* dNoisy = scratch<float>("sample.noisyKeep", all3);
   run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, atoms * 3, all3, (float)levels[0], 0});
   D.plan.clear(); D.planAt = 0;      // (the levels the denoiser will see, in order, for conditioningAhead)
@@ -604,9 +611,8 @@ static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_
   for (int s = 1; s <= T; ++s) {
     double prev = levels[s - 1], level = levels[s], tHat = prev * (1 + (prev >= 4e-4 && prev <= 80 ? churn : 0)), dt = level - tHat;
     double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
-    run("af3_centroid", Grid{(uint32_t)ns, 1, 1}, 1024, CentroidArgs{dX, dMask, dC, atoms});
-    run1d("af3_augment", atoms * ns, AugmentArgs{dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12, dSeeds, atoms, atoms * ns, (uint)s,
-                                                 (float)injected});
+    run("af3_augment", Grid{(uint32_t)ns, 1, 1}, 1024, AugmentArgs{dX, dIn, dMask, nullptr, dRot + (size_t)(s - 1) * ns * 12, dSeeds, atoms, atoms * ns, (uint)s,
+                                                                   (float)injected});
     if (!secondOrder && exponential) {          // one call: the correction's D taken as this step's (see above)
       float coef = (float)(std::pow(level / tHat, S) - 1);
       const float* d1 = denoise(dIn, (float)tHat, dX, coef, (bool)onStep);
@@ -677,7 +683,7 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     if (!SAMPLER.churn) gamma0 = 0;
     std::vector<float> rot = rotations(steps, seeds);
     float* dRot = uploadNew(rot.data(), rot.size());
-    float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+    float* dNoisy = scratch<float>("sample.noisy", all3);
     run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, n3, all3, (float)levels[0], 0});
     D.plan.clear(); D.planAt = 0;      // (the levels the denoiser will see, for conditioningAhead)
     for (int step = 1; step <= steps; ++step)
@@ -686,9 +692,8 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
       double previous = levels[step - 1], level = levels[step];
       float tHat = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
       double injected = noiseScale * std::sqrt(std::max(0.0, (double)tHat * tHat - previous * previous));
-      run("af3_centroid", Grid{(uint32_t)ns, 1, 1}, 1024, CentroidArgs{dX, dMask, dC, atoms});
-      run1d("af3_augment", atoms * ns, AugmentArgs{dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12, dSeeds, atoms, atoms * ns,
-                                                   (uint)step, (float)injected});
+      run("af3_augment", Grid{(uint32_t)ns, 1, 1}, 1024, AugmentArgs{dX, dNoisy, dMask, nullptr, dRot + (size_t)(step - 1) * ns * 12, dSeeds, atoms, atoms * ns,
+                                                                     (uint)step, (float)injected});
       const double coef = SAMPLER.exponential ? std::pow(level / tHat, stepScale) - 1 : stepScale * (level - tHat) / tHat;
       if (!realign) {
         const float* d = denoise(dNoisy, tHat, dX, (float)coef, (bool)onStep);

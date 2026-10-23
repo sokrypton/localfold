@@ -51,6 +51,8 @@ struct Device {
   id<MTLDevice> dev;
   id<MTLCommandQueue> queue;
   std::map<uint64_t, Alloc> allocs;
+  std::vector<id<MTLResource>> resident;
+  bool residentDirty = true;
   size_t held = 0, peak = 0, buried = 0, peakLive = 0;     // (live: held and the graveyard's, still resident)
   id<MTLCommandBuffer> cb = nil;
   id<MTLComputeCommandEncoder> enc = nil;
@@ -144,6 +146,7 @@ struct Device {
     ++stats.allocs;
     uint64_t addr = b.gpuAddress;
     allocs[addr] = {b, addr, n};
+    residentDirty = true;
     held += n; peakLive = std::max(peakLive, held + buried);
     if (peakTrace && held > stagePeak) { stagePeak = held; stageReport = tracePeak(n); if (held > peak) peakReport = stageReport; }
     peak = std::max(peak, held);
@@ -172,6 +175,7 @@ struct Device {
     held -= it->second.size;
     if (!idle()) { graveyard.push_back({committedSeq + (cb ? 1 : 0), it->second.buf}); buried += it->second.size; }   // (work issued may read it)
     allocs.erase(it);
+    residentDirty = true;
   }
   void* host(const void* p, size_t bytes = 0) {
     const Alloc* a = find((uint64_t)p);
@@ -186,13 +190,16 @@ struct Device {
     if (enc) return;
     if (!cb) cb = [queue commandBufferWithUnretainedReferences];
     enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
-    std::vector<id<MTLResource>> all;
-    all.reserve(allocs.size() + keep.size());
-    for (auto& [_, a] : allocs) all.push_back(a.buf);
-    for (auto& b : keep) all.push_back(b);
     // (not the graveyard's: released buffers are read by no new work, and one named resident by a command buffer still in
     // flight when the graveyard frees it is an "Invalid Resource" failure of that command buffer, though it never reads it)
-    if (!all.empty()) [enc useResources:all.data() count:all.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    if (residentDirty) {
+      resident.clear();
+      resident.reserve(allocs.size());
+      for (auto& [_, a] : allocs) resident.push_back(a.buf);
+      residentDirty = false;
+    }
+    if (!resident.empty()) [enc useResources:resident.data() count:resident.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    if (!keep.empty()) [enc useResources:keep.data() count:keep.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   }
   void commit() {
     if (enc) { [enc endEncoding]; enc = nil; }
@@ -593,6 +600,7 @@ void* mapFile(const std::string& path, size_t* bytes) {
   if (!b) die("cannot map %s for the GPU", path.c_str());
   uint64_t addr = b.gpuAddress;
   d.allocs[addr] = {b, addr, n};
+  d.residentDirty = true;
   if (d.enc) [d.enc useResource:b usage:MTLResourceUsageRead];
   *bytes = (size_t)st.st_size;
   return (void*)addr;
@@ -604,6 +612,7 @@ void unmapFile(void* p) {
   if (it == d.allocs.end()) die("unmapFile of a pointer that is not a mapping");
   if (!d.idle()) { d.graveyard.push_back({d.committedSeq + (d.cb ? 1 : 0), it->second.buf}); d.buried += it->second.buf.length; }
   d.allocs.erase(it);
+  d.residentDirty = true;
 }
 Grid grid1d(size_t n, uint32_t threads) {
   size_t groups = (n + threads - 1) / threads;
@@ -726,7 +735,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   else if (a.n > 64 && a.n <= 128 && a.n % 16 != 0 && a.k <= 64 && batch == 1) { tm = 32; tn = 64; }
   if (a.n > 128 && tm == 64 && (((a.n + 63) & ~63) - a.n) * 12 > a.n && (((a.n + 31) & ~31) - a.n) * 2 < (((a.n + 63) & ~63) - a.n)) tm = 32;
   if (a.n > 64 && ((a.m + tn - 1) / tn) * ((a.n + tm - 1) / tm) < 16 && batch == 1) {
-    tm = a.m <= 64 ? 16 : 32; tn = a.m >= 256 ? 128 : (a.m >= 64 ? 64 : 32);
+    tm = (a.m <= 64 || (a.n % 16 == 0 && a.n % 32 != 0)) ? 16 : 32; tn = a.m >= 256 ? 128 : (a.m >= 64 ? 64 : 32);
   }
   // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
   // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
@@ -844,7 +853,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
     tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
   }
   else if (a.n > 64 && a.n <= 128 && tr > 32 && ((a.n % 16 != 0 && groups(32) < 64) || groups(16) < 32 || (a.n % 16 != 0 && a.k <= 64 && batch == 1))) {
-    tr = a.m < 128 ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
+    tr = (a.m < 128 || (a.n % 16 == 0 && a.n % 32 != 0)) ? 16 : 32; tc = a.m < 32 ? 16 : (groups(64) >= 64 ? 64 : 32);
   }
   else while (tc > 16 && groups(tc) < 64) tc /= 2;
   // ...and 48-column tiles likewise (not SwiGLU's, coupling combine's, or the triangle gate's, whose epilogues pair 8-column blocks)

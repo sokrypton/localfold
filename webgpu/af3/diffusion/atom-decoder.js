@@ -75,15 +75,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= PAIR_ROWS) { return; }
   let base = row * C_PAIR;
+  var norm_pair: array<f32, C_PAIR>;
   var total = 0.0;
-  for (var c = 0u; c < C_PAIR; c += 1u) { total += pair[base + c]; }
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let v = pair[base + c];
+    norm_pair[c] = v;
+    total += v;
+  }
   let mean = total / f32(C_PAIR);
   var variance = 0.0;
   for (var c = 0u; c < C_PAIR; c += 1u) {
-    let d = pair[base + c] - mean;
+    let d = norm_pair[c] - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    norm_pair[c] = (norm_pair[c] - mean) * inverse
+      * weights[P_pairInputLayerNormScale + c];
+  }
 
   let key = row % KEYS;
   let query_index = row / KEYS;
@@ -93,8 +102,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var head = 0u; head < HEADS; head += 1u) {
       var value = 0.0;
       for (var c = 0u; c < C_PAIR; c += 1u) {
-        value += (pair[base + c] - mean) * inverse
-          * weights[P_pairInputLayerNormScale + c]
+        value += norm_pair[c]
           * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];
       }
       logits[((block * SUBSETS + subset) * HEADS + head) * QUERIES * KEYS
@@ -168,22 +176,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let rBase = row * C;
   let qm = queries_mask[row];
 
+  var norm_act: array<f32, C>;
   var total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { total += act[rBase + c] * qm; }
+  for (var c = 0u; c < C; c += 1u) {
+    let v = act[rBase + c] * qm;
+    norm_act[c] = v;
+    total += v;
+  }
   let mean = total / f32(C);
   var variance = 0.0;
   for (var c = 0u; c < C; c += 1u) {
-    let d = act[rBase + c] * qm - mean;
+    let d = norm_act[c] - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C) + EPSILON);
+  for (var c = 0u; c < C; c += 1u) {
+    norm_act[c] = (norm_act[c] - mean) * inverse
+      * weights[P_atomFeaturesLayerNormScale + c]
+      + weights[P_atomFeaturesLayerNormOffset + c];
+  }
 
   for (var axis = 0u; axis < 3u; axis += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C; c += 1u) {
-      value += ((act[rBase + c] * qm - mean) * inverse
-        * weights[P_atomFeaturesLayerNormScale + c]
-        + weights[P_atomFeaturesLayerNormOffset + c])
+      value += norm_act[c]
         * weights[P_atomFeaturesToPositionUpdate + c * 3u + axis];
     }
     update[slot * 3u + axis] = value;
@@ -394,7 +410,10 @@ export class Af3AtomDecoderGpu {
     };
 
     try {
-      const gatherBuffer = persistentUpload("dec.gathers", () => {
+      const shared = encoded.deviceStatics;
+      const fromEncoder = (label, buffer, build) =>
+        (buffer === undefined ? persistentUpload(label, build) : { buffer });
+      const gatherBuffer = fromEncoder("dec.gathers", shared?.gathers, () => {
         const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
         let at = 0;
         const place = (source) => { gathers.set(ints(source), at); at += source.length; };
@@ -431,9 +450,6 @@ export class Af3AtomDecoderGpu {
       // TENSORS - so the decoder binds them rather than uploading a second
       // 17 MiB of them at 59 residues. `encoded.deviceStatics` is offered only
       // by an encoder run that was given a cache to keep them in.
-      const shared = encoded.deviceStatics;
-      const fromEncoder = (label, buffer, build) =>
-        (buffer === undefined ? persistentUpload(label, build) : { buffer });
       const queriesMask = fromEncoder("dec.q-mask", shared?.queriesMask,
                                       () => encoded.queriesMask);
       const keysMask = fromEncoder("dec.k-mask", shared?.keysMask, () => encoded.keysMask);
@@ -460,15 +476,28 @@ export class Af3AtomDecoderGpu {
       const kAtoms = alloc("dec.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("dec.v-atoms", queryRows * width * 4);
       const gate = alloc("dec.gate", queryRows * width * 4);
-      const gathered = alloc("dec.gathered", queryRows * width * 4);
+      // `kAtoms` is written by `project-keys` and read only by `expand-keys`;
+      // `attend` writes `gathered` (identical byte size `queryRows * width * 4`)
+      // afterwards and `output` consumes it before the next block's `project-keys`.
+      const gathered = kAtoms;
       const update = alloc("dec.update", tokens * dense * 3 * 4, GPUBufferUsage.COPY_SRC);
       const readback = keep(this.allocator.allocate("dec.rb", tokens * dense * 3 * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-atom-decoder" });
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-atom-decoder" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -477,7 +506,7 @@ export class Af3AtomDecoderGpu {
             : { buffer: a.buffer, offset: a.byteOffset, size: a.byteSize } })),
         }));
         pass.dispatchWorkgroups(x, y);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));
@@ -539,6 +568,7 @@ export class Af3AtomDecoderGpu {
       const slotGroups = lin(tokens * dense);
       run("finish", compiled.finish, [act, queriesMask, gatherBuffer, pairWeights, update],
           slotGroups[0], slotGroups[1]);
+      endPass();
       encoder.copyBufferToBuffer(update.buffer, 0, readback.buffer, 0, tokens * dense * 3 * 4);
 
       const start = performance.now();

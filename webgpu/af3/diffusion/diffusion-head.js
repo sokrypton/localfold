@@ -87,7 +87,7 @@ function headNorms(weights) {
  * two hundred times a fold, while the GPU sat idle. It is the last big piece of
  * the head that was not a shader.
  */
-const NORMALISE_AND_PROJECT = (rows, inChannels, outChannels, lanes) => `
+const NORMALISE_AND_PROJECT = (rows, inChannels, outChannels, lanes, hasAddend = false) => `
 const ROWS: u32 = ${rows}u;
 const C_IN: u32 = ${inChannels}u;
 const C_OUT: u32 = ${outChannels}u;
@@ -98,6 +98,7 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
 @group(0) @binding(2) var<storage, read> projection: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+${hasAddend ? "@group(0) @binding(4) var<storage, read> addend: array<f32>;" : ""}
 
 var<workgroup> normalised: array<f32, ${inChannels}>;
 var<workgroup> reduce_a: array<f32, ${lanes}>;
@@ -152,13 +153,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     ${overCols((s) => `val_${s} += n_c * projection[p_base + ${s * lanes}u];`)}
   }
   let out_base = row * C_OUT + local;
-  ${overCols((s) => `output[out_base + ${s * lanes}u] = val_${s};`)}`;
+  ${overCols((s) => `output[out_base + ${s * lanes}u] = val_${s}${hasAddend ? ` + addend[out_base + ${s * lanes}u]` : ""};`)}`;
   })() : `for (var out = local; out < C_OUT; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_IN; c += 1u) {
       value += normalised[c] * projection[c * C_OUT + out];
     }
-    output[row * C_OUT + out] = value;
+    output[row * C_OUT + out] = value${hasAddend ? " + addend[row * C_OUT + out]" : ""};
   }`}
 }`;
 
@@ -293,6 +294,9 @@ export class Af3DiffusionHeadGpu {
   /** ...and the atom encoder, for the same reason. */
   #encoder;
 
+  /** ...and the atom decoder, kept rather than constructed per step. */
+  #decoder;
+
   /** ...and one pooled allocator for the single projection's two uploads. */
   #projections;
 
@@ -328,6 +332,7 @@ export class Af3DiffusionHeadGpu {
     this.#conditioner = undefined;
     this.#encoder?.allocator.destroyPooled();
     this.#encoder = undefined;
+    this.#decoder = undefined;
     this.#projections?.destroyPooled();
     this.#projections = undefined;
     this.#releaseChain();
@@ -532,7 +537,7 @@ export class Af3DiffusionHeadGpu {
    * and nothing else - see #chain.
    */
   async #normaliseAndProject(input, rows, inChannels, outChannels, scale, projection,
-                             { into, validation } = {}) {
+                             { into, addend, validation } = {}) {
     // 🔴 POOLED AND KEPT, NOT POOLED AND THROWN AWAY. With `into` this returns
     // while the work is in flight, so release() must not destroy what that
     // work is reading - and a pooled allocator created PER CALL leaks its
@@ -546,9 +551,10 @@ export class Af3DiffusionHeadGpu {
     const held = [];
     try {
       const lanes = 256;
+      const hasAddend = addend !== undefined;
       const pipeline = await pipelineCacheForDevice(this.device).get(
-        `af3-normalise-project:${rows}:${inChannels}:${outChannels}:${lanes}`,
-        NORMALISE_AND_PROJECT(rows, inChannels, outChannels, lanes));
+        `af3-normalise-project:${rows}:${inChannels}:${outChannels}:${lanes}${hasAddend ? ":add" : ""}`,
+        NORMALISE_AND_PROJECT(rows, inChannels, outChannels, lanes, hasAddend));
       const keep = (allocation) => { held.push(allocation); return allocation; };
       const inputBuffer = input instanceof GPUBuffer
         ? { buffer: input } : keep(allocator.upload("np.input", input, storage));
@@ -577,7 +583,8 @@ export class Af3DiffusionHeadGpu {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: [inputBuffer, scaleBuffer, weightBuffer, output].map((a, binding) => ({
+        entries: [inputBuffer, scaleBuffer, weightBuffer, output,
+                  ...(hasAddend ? [{ buffer: addend }] : [])].map((a, binding) => ({
           binding, resource: { buffer: a.buffer },
         })),
       }));
@@ -754,12 +761,7 @@ export class Af3DiffusionHeadGpu {
       tokens, weights.seqChannels, weights.perTokenChannels,
       headNorms(weights).singleCondEmbedding,
       weights.singleCondEmbeddingProjection,
-      { into: chain.act, validation: deferred }));
-    // 🔴 A DISPATCH, NOT A LOOP OVER A COPY. The two halves of the
-    // transformer's input are produced by the two stages above, both on the
-    // device; adding them on the host would mean reading both back.
-    await this.#addInto(chain.act, chain.tokenAct, tokens * weights.perTokenChannels,
-                        deferred);
+      { into: chain.act, addend: chain.tokenAct, validation: deferred }));
 
     this.#transformer ??= new Af3DiffusionTransformerGpu(this.device);
     const transformed = await stage("transformer", () =>
@@ -771,8 +773,9 @@ export class Af3DiffusionHeadGpu {
     await stage("output-norm", () => this.#normaliseOnly(transformed.outputBuffer,
       chain.normalised, tokens, weights.perTokenChannels, headNorms(weights).output, deferred));
 
+    const atomDecoder = (this.#decoder ??= new Af3AtomDecoderGpu(this.device));
     const decoded = await stage("atom-decoder", () =>
-      new Af3AtomDecoderGpu(this.device).run(undefined, encoded, input, weights.decoder,
+      atomDecoder.run(undefined, encoded, input, weights.decoder,
         { staticCache: this.#decoderBuffers,
           deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised } }));
     // 🔴 SETTLED HERE AND NOWHERE EARLIER. The decoder's readback is the one

@@ -32,6 +32,7 @@
  * four empty slots), so leaving it out is not the same as adding zeros.
  */
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { deviceTuning } from "../../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { SOURCES, carriesTensor } from "../../../shared/weights/weight-sources.js";
 
@@ -614,12 +615,11 @@ export class Af3EmbedderGpu {
       // that has one); or nothing, meaning pass one's zeros - cleared on the
       // device rather than allocated on the host and uploaded, which at 255
       // tokens was a 33 MiB array and 30 ms. The same zeros, so bit-identical.
+      const pendingClears = [];
       const zeroed = (label, bytes) => {
         const allocation = keep(this.allocator.allocate(label, bytes,
-                                                        storage | GPUBufferUsage.COPY_DST));
-        const clear = this.device.createCommandEncoder({ label: `${label}.clear` });
-        clear.clearBuffer(allocation.buffer);
-        this.device.queue.submit([clear.finish()]);
+          storage | GPUBufferUsage.COPY_DST));
+        pendingClears.push(allocation.buffer);
         return allocation;
       };
       const recycled = (buffer, array, label, bytes) => (buffer !== undefined ? { buffer }
@@ -679,8 +679,19 @@ export class Af3EmbedderGpu {
       if (options.validation !== undefined) options.validation.begin();
       else this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-embedder" });
+      for (const buffer of pendingClears) encoder.clearBuffer(buffer);
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-embedder" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -689,7 +700,7 @@ export class Af3EmbedderGpu {
           })),
         }));
         pass.dispatchWorkgroups(x, y);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
 
@@ -718,6 +729,7 @@ export class Af3EmbedderGpu {
           [codes, deletions, msaFromTarget, weightBuffer, msa], perRow[0], perRow[1]);
       run("embed.assemble-single", compiled.assembleSingle,
           [targetFeat, previousSingle, weightBuffer, single], tokens);
+      endPass();
 
       if (keepOnDevice) {
         const start = performance.now();

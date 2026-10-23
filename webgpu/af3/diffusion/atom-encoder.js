@@ -278,22 +278,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let token = id.x;
   if (token >= TOKENS) { return; }
   let base = token * C_TRUNK_SINGLE;
+  var norm_s: array<f32, C_TRUNK_SINGLE>;
   var total = 0.0;
-  for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) { total += trunk_single[base + c]; }
+  for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
+    let v = trunk_single[base + c];
+    norm_s[c] = v;
+    total += v;
+  }
   let mean = total / f32(C_TRUNK_SINGLE);
   var variance = 0.0;
   for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
-    let d = trunk_single[base + c] - mean;
+    let d = norm_s[c] - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C_TRUNK_SINGLE) + EPSILON);
+  for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
+    norm_s[c] = (norm_s[c] - mean) * inverse
+      * weights[P_lnormTrunkSingleCondScale + c]
+      + weights[P_lnormTrunkSingleCondOffset + c];
+  }
   for (var out = 0u; out < C; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
-      value += ((trunk_single[base + c] - mean) * inverse
-        * weights[P_lnormTrunkSingleCondScale + c]
-        + weights[P_lnormTrunkSingleCondOffset + c])
-        * weights[P_embedTrunkSingleCond + c * C + out];
+      value += norm_s[c] * weights[P_embedTrunkSingleCond + c * C + out];
     }
     projected[token * C + out] = value;
   }
@@ -310,22 +317,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= TOKENS * TOKENS) { return; }
   let base = row * C_TRUNK_PAIR;
+  var norm_p: array<f32, C_TRUNK_PAIR>;
   var total = 0.0;
-  for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) { total += trunk_pair[base + c]; }
+  for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
+    let v = trunk_pair[base + c];
+    norm_p[c] = v;
+    total += v;
+  }
   let mean = total / f32(C_TRUNK_PAIR);
   var variance = 0.0;
   for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
-    let d = trunk_pair[base + c] - mean;
+    let d = norm_p[c] - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C_TRUNK_PAIR) + EPSILON);
+  for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
+    norm_p[c] = (norm_p[c] - mean) * inverse
+      * weights[P_lnormTrunkPairCondScale + c]
+      + weights[P_lnormTrunkPairCondOffset + c];
+  }
   for (var out = 0u; out < C_PAIR; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
-      value += ((trunk_pair[base + c] - mean) * inverse
-        * weights[P_lnormTrunkPairCondScale + c]
-        + weights[P_lnormTrunkPairCondOffset + c])
-        * weights[P_embedTrunkPairCond + c * C_PAIR + out];
+      value += norm_p[c] * weights[P_embedTrunkPairCond + c * C_PAIR + out];
     }
     projected[row * C_PAIR + out] = value;
   }
@@ -549,13 +563,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       + u32(max(gathers[G_TK_IDX + key_index], 0))) * C_PAIR;
   }
 
+  var q_relu: array<f32, C>;
+  var k_relu: array<f32, C>;
+  for (var d = 0u; d < C; d += 1u) {
+    q_relu[d] = relu(queries_cond[query_index * C + d]);
+    k_relu[d] = relu(keys_cond[key_index * C + d]);
+  }
+  var pair_row = array<f32, ${pairChannels}>();
+  var act_mlp = array<f32, ${pairChannels}>();
   for (var c = 0u; c < C_PAIR; c += 1u) {
     var value = 0.0;
     for (var d = 0u; d < C; d += 1u) {
-      value += relu(queries_cond[query_index * C + d])
-        * weights[P_singleToPairCondRow + d * C_PAIR + c];
-      value += relu(keys_cond[key_index * C + d])
-        * weights[P_singleToPairCondCol + d * C_PAIR + c];
+      value += q_relu[d] * weights[P_singleToPairCondRow + d * C_PAIR + c];
+      value += k_relu[d] * weights[P_singleToPairCondCol + d * C_PAIR + c];
     }
     var offset_term = 0.0;
     for (var axis = 0u; axis < 3u; axis += 1u) {
@@ -564,7 +584,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     value += valid * (offset_term + weights[P_embedPairDistances + c] / (1.0 + squared))
       + valid * weights[P_embedPairOffsetsValid + c];
     if (use_trunk) { value += trunk_pair[trunk_base + c]; }
-    pair[row * C_PAIR + c] = value;
+    pair_row[c] = value;
+    act_mlp[c] = relu(value);
   }
 
   // The three-layer MLP, on a relu of the value just written, plus a residual.
@@ -573,23 +594,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var c = 0u; c < C_PAIR; c += 1u) {
     var value = 0.0;
     for (var d = 0u; d < C_PAIR; d += 1u) {
-      value += relu(pair[row * C_PAIR + d]) * weights[P_pairMlp1 + d * C_PAIR + c];
+      value += act_mlp[d] * weights[P_pairMlp1 + d * C_PAIR + c];
     }
-    hidden1[c] = value;
+    hidden1[c] = relu(value);
   }
   for (var c = 0u; c < C_PAIR; c += 1u) {
     var value = 0.0;
     for (var d = 0u; d < C_PAIR; d += 1u) {
-      value += relu(hidden1[d]) * weights[P_pairMlp2 + d * C_PAIR + c];
+      value += hidden1[d] * weights[P_pairMlp2 + d * C_PAIR + c];
     }
-    hidden2[c] = value;
+    hidden2[c] = relu(value);
   }
   for (var c = 0u; c < C_PAIR; c += 1u) {
     var value = 0.0;
     for (var d = 0u; d < C_PAIR; d += 1u) {
-      value += relu(hidden2[d]) * weights[P_pairMlp3 + d * C_PAIR + c];
+      value += hidden2[d] * weights[P_pairMlp3 + d * C_PAIR + c];
     }
-    pair[row * C_PAIR + c] = pair[row * C_PAIR + c] + value;
+    pair[row * C_PAIR + c] = pair_row[c] + value;
   }
 }`;
 
@@ -604,15 +625,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= PAIR_ROWS) { return; }
   let base = row * C_PAIR;
+  var norm_pair: array<f32, C_PAIR>;
   var total = 0.0;
-  for (var c = 0u; c < C_PAIR; c += 1u) { total += pair[base + c]; }
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let v = pair[base + c];
+    norm_pair[c] = v;
+    total += v;
+  }
   let mean = total / f32(C_PAIR);
   var variance = 0.0;
   for (var c = 0u; c < C_PAIR; c += 1u) {
-    let d = pair[base + c] - mean;
+    let d = norm_pair[c] - mean;
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    norm_pair[c] = (norm_pair[c] - mean) * inverse${perBlockPair ? "" : " * weights[P_pairInputLayerNormScale + c]"};
+  }
 
   let key = row % KEYS;
   let query_index = row / KEYS;
@@ -626,12 +655,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         // the variance are not - they come from the pair, which does not change
         // - so the whole difference is these two indices, and both arms read
         // the same buffer.
-        value += (pair[base + c] - mean) * inverse
+        value += norm_pair[c]
 ${perBlockPair
   ? `          * weights[P_pairInputLayerNormScale + block * C_PAIR + c]
           * weights[P_pairLogitsProjection + (block * C_PAIR + c) * HEADS + head];`
-  : `          * weights[P_pairInputLayerNormScale + c]
-          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];`}
+  : `          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];`}
       }
       let out = ((block * SUBSETS + subset) * HEADS + head) * QUERIES * KEYS
         + query * KEYS + key;
@@ -2053,8 +2081,6 @@ export class Af3AtomEncoderGpu {
           gradients: keep(this.allocator.allocate("atom.chiral.grad", atoms * 3 * 4, storage)),
         };
       })();
-      const refPos = persistentUpload("atom.ref-pos", () => floats(input.refPos));
-      const refSpaceUid = persistentUpload("atom.ref-space", () => ints(input.refSpaceUid));
 
       // Every gather, and the two reference-space columns, in one i32 buffer -
       // see the note in the shader preamble about the eight-buffer guarantee.
@@ -2186,7 +2212,10 @@ export class Af3AtomEncoderGpu {
       const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
-      const gathered = alloc("atom.gathered", queryRows * width * 4);
+      // `kAtoms` is written by `project-keys` and read only by `expand-keys`;
+      // `attend` writes `gathered` (identical byte size `queryRows * width * 4`)
+      // afterwards and `output` consumes it before the next block's `project-keys`.
+      const gathered = kAtoms;
       const tokenAct = alloc("atom.token-act", tokens * perTokenChannels * 4,
         GPUBufferUsage.COPY_SRC);
 
@@ -2244,8 +2273,18 @@ export class Af3AtomEncoderGpu {
       if (deferred === undefined) this.device.pushErrorScope("validation");
       else deferred.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-atom-encoder" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -2254,7 +2293,7 @@ export class Af3AtomEncoderGpu {
             : { buffer: a.buffer, offset: a.byteOffset, size: a.byteSize } })),
         }));
         pass.dispatchWorkgroups(x, y);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));
@@ -2358,6 +2397,7 @@ export class Af3AtomEncoderGpu {
       run("aggregate", compiled.aggregate,
           [act, queriesMask, gatherBuffer, atomMask, pairWeights, tokenAct],
           aggregateGroups[0], aggregateGroups[1]);
+      endPass();
 
       encoder.copyBufferToBuffer(
         tokenAct.buffer, 0,
@@ -2400,7 +2440,7 @@ export class Af3AtomEncoderGpu {
           deviceStatics: {
             pairCond: pair.buffer, queriesCond: queriesCond.buffer,
             keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
-            keysMask: keysMask.buffer,
+            keysMask: keysMask.buffer, gathers: gatherBuffer.buffer,
           },
           elapsedMilliseconds: performance.now() - start,
           memory: this.allocator.snapshot(),
@@ -2431,7 +2471,7 @@ export class Af3AtomEncoderGpu {
         deviceStatics: staticCache === undefined ? undefined : {
           pairCond: pair.buffer, queriesCond: queriesCond.buffer,
           keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
-          keysMask: keysMask.buffer,
+          keysMask: keysMask.buffer, gathers: gatherBuffer.buffer,
         },
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),

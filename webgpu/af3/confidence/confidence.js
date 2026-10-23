@@ -29,6 +29,7 @@
  * plausible-looking tidy-up that destroys what it measures.
  */
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { deviceTuning } from "../../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3PairformerStackGpu } from "../trunk/pairformer-block.js";
 import { GRID_WIDTH } from "../trunk/pair-track.js";
@@ -1167,16 +1168,6 @@ export class Af3ConfidenceHeadGpu {
                                pairMask, pairs, pairChannels);
         input.releasePairBuffer?.();
       }
-      if (fromDevice) {
-        const copy = this.device.createCommandEncoder({ label: "af3-conf.pair-copy" });
-        copy.copyBufferToBuffer(input.pairBuffer, 0, pair.buffer, 0, pairBytes);
-        this.device.queue.submit([copy.finish()]);
-        // ...and the source handed back the moment the copy is queued: this
-        // head never reads it again, and held to the end of the fold it was a
-        // dead `tokens^2 x channels` through the head's four blocks - where the
-        // fold peaks. The queue orders a destroy after the copy that read it.
-        input.releasePairBuffer?.();
-      }
       const targetFeat = keep(this.allocator.upload("af3-conf.target", input.targetFeat, storage));
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));
       const maskBuffer = keep(this.allocator.upload("af3-conf.mask", pairMask, storage));
@@ -1186,12 +1177,20 @@ export class Af3ConfidenceHeadGpu {
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       validation.begin();
-      // ...one per TOKEN, not one per pair; see the note on the kernel.
-      const left = keep(this.allocator.allocate(
-        "af3-conf.left", tokens * pairChannels * 4, storage));
-      const right = keep(this.allocator.allocate(
-        "af3-conf.right", tokens * pairChannels * 4, storage));
       const encoder = this.device.createCommandEncoder({ label: "af3-confidence-embed" });
+      if (fromDevice) {
+        encoder.copyBufferToBuffer(input.pairBuffer, 0, pair.buffer, 0, pairBytes);
+      }
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-confidence-embed" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       if (reembedding) {
         // boltz2's two passes: the per-token projections, then the pair.
         const projections = keep(this.allocator.allocate(
@@ -1223,7 +1222,7 @@ export class Af3ConfidenceHeadGpu {
         const singleReadback = !representations ? undefined : keep(this.allocator.allocate(
           "af3-conf.rb-single", tokens * singleChannels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-        const tokenPass = encoder.beginComputePass({ label: "reembed-project" });
+        const tokenPass = passFor("reembed-project");
         tokenPass.setPipeline(compiled.reembedProject);
         tokenPass.setBindGroup(0, this.device.createBindGroup({
           layout: compiled.reembedProject.getBindGroupLayout(0),
@@ -1231,8 +1230,8 @@ export class Af3ConfidenceHeadGpu {
             (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
         }));
         tokenPass.dispatchWorkgroups(tokens);
-        tokenPass.end();
-        const pairPass = encoder.beginComputePass({ label: "reembed-pair" });
+        if (!batchPasses) tokenPass.end();
+        const pairPass = passFor("reembed-pair");
         pairPass.setPipeline(compiled.reembedPair);
         pairPass.setBindGroup(0, this.device.createBindGroup({
           layout: compiled.reembedPair.getBindGroupLayout(0),
@@ -1242,7 +1241,8 @@ export class Af3ConfidenceHeadGpu {
         }));
         pairPass.dispatchWorkgroups(
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
-        pairPass.end();
+        if (!batchPasses) pairPass.end();
+        endPass();
         if (representations) {
           encoder.copyBufferToBuffer(rebuiltPair.buffer, 0, readback.buffer, 0,
                                      pairs * pairChannels * 4);
@@ -1250,6 +1250,7 @@ export class Af3ConfidenceHeadGpu {
                                      tokens * singleChannels * 4);
         }
         this.device.queue.submit([encoder.finish()]);
+        if (fromDevice) input.releasePairBuffer?.();
         validation.end("confidence re-embed");
         if (representations) {
           await readback.buffer.mapAsync(GPUMapMode.READ);
@@ -1266,7 +1267,12 @@ export class Af3ConfidenceHeadGpu {
         stackPair = rebuiltPair;
         stackSingle = rebuiltSingle;
       } else {
-      const project = encoder.beginComputePass({ label: "embed-project" });
+      // ...one per TOKEN, not one per pair; see the note on the kernel.
+      const left = keep(this.allocator.allocate(
+        "af3-conf.left", tokens * pairChannels * 4, storage));
+      const right = keep(this.allocator.allocate(
+        "af3-conf.right", tokens * pairChannels * 4, storage));
+      const project = passFor("embed-project");
       project.setPipeline(compiled.embedProject);
       project.setBindGroup(0, this.device.createBindGroup({
         layout: compiled.embedProject.getBindGroupLayout(0),
@@ -1278,8 +1284,8 @@ export class Af3ConfidenceHeadGpu {
       const projectGroups = Math.ceil((tokens * pairChannels) / 64);
       project.dispatchWorkgroups(
         Math.min(projectGroups, GRID_WIDTH), Math.ceil(projectGroups / GRID_WIDTH));
-      project.end();
-      const pass = encoder.beginComputePass({ label: "embed" });
+      if (!batchPasses) project.end();
+      const pass = passFor("embed");
       pass.setPipeline(compiled.embed);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: compiled.embed.getBindGroupLayout(0),
@@ -1288,11 +1294,13 @@ export class Af3ConfidenceHeadGpu {
       }));
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-      pass.end();
+      if (!batchPasses) pass.end();
+      endPass();
       if (representations) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readback.buffer, 0, pairs * pairChannels * 4);
       }
       this.device.queue.submit([encoder.finish()]);
+      if (fromDevice) input.releasePairBuffer?.();
       validation.end("confidence embed");
       if (representations) {
         await readback.buffer.mapAsync(GPUMapMode.READ);
@@ -1373,8 +1381,18 @@ export class Af3ConfidenceHeadGpu {
 
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-confidence-heads" });
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-confidence-heads" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -1383,7 +1401,7 @@ export class Af3ConfidenceHeadGpu {
           })),
         }));
         pass.dispatchWorkgroups(x, y);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       // ...ONE WORKGROUP A PAIR ROW, not one thread. The kernel gave a single
       // invocation the whole row and re-derived its LayerNorm for every bin;
@@ -1407,6 +1425,7 @@ export class Af3ConfidenceHeadGpu {
            ...(splitHeads ? [headFeatures] : [])],
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
+      endPass();
       for (const { allocation, source, bytes } of Object.values(readbacks)) {
         encoder.copyBufferToBuffer(source.buffer, 0, allocation.buffer, 0, bytes);
       }

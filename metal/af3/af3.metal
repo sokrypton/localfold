@@ -1033,32 +1033,24 @@ kernel void af3_mask_ln_project3(constant MaskLnProject3Args& a [[buffer(0)]], u
   device const float* x = a.act + row * a.C;
   uint r32 = (uint)row, q1 = (uint)a.q1, prRow = r32 - lf_udiv(r32, q1) * q1;
   if (a.C == 128) {
-    float m = a.qMask[prRow], xv[4], s = 0.f;
+    float m = a.qMask[prRow];
+    device const float4* x4 = (device const float4*)x;
+    float4 xv = x4[lane];
     if (a.resY) {
-      device const float* ry = a.resY + row * 128;
-      device const float* rg = a.resGate + (ulong)prRow * 128;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 4; ++i) {
-        uint c = lane + i * 32;
-        float val = (x[c] + ry[c] * rg[c]) * m;
-        xv[i] = val;
-        s += val;
-      }
-    } else {
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < 4; ++i) { float val = x[lane + i * 32] * m; xv[i] = val; s += val; }
+      float4 ry = ((device const float4*)(a.resY + row * 128))[lane];
+      float4 rg = ((device const float4*)(a.resGate + (ulong)prRow * 128))[lane];
+      xv += ry * rg;
     }
-    float mean = simd_sum(s) * (1.f / 128.f), v = 0.f;
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < 4; ++i) { float d = xv[i] - mean; v += d * d; }
-    float inv = rsqrt(simd_sum(v) * (1.f / 128.f) + 1e-5f);
-    float y0 = 0.f, y1 = 0.f, y2 = 0.f;
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < 4; ++i) {
-      uint c = lane + i * 32;
-      float l = (xv[i] - mean) * inv * a.scale[c] + (a.offset ? a.offset[c] : 0.f);
-      y0 += l * a.Wp[c * 3]; y1 += l * a.Wp[c * 3 + 1]; y2 += l * a.Wp[c * 3 + 2];
-    }
+    xv *= m;
+    float mean = simd_sum(xv.x + xv.y + xv.z + xv.w) * (1.f / 128.f);
+    float4 d = xv - mean;
+    float inv = rsqrt(simd_sum(dot(d, d)) * (1.f / 128.f) + 1e-5f);
+    float4 l = d * inv * ((device const float4*)a.scale)[lane] +
+               (a.offset ? ((device const float4*)a.offset)[lane] : float4(0.f));
+    device const float* wp = a.Wp + lane * 12;
+    float y0 = l.x * wp[0] + l.y * wp[3] + l.z * wp[6] + l.w * wp[9];
+    float y1 = l.x * wp[1] + l.y * wp[4] + l.z * wp[7] + l.w * wp[10];
+    float y2 = l.x * wp[2] + l.y * wp[5] + l.z * wp[8] + l.w * wp[11];
     y0 = simd_sum(y0); y1 = simd_sum(y1); y2 = simd_sum(y2);
     if (lane == 0) { a.upd[row * 3] = y0; a.upd[row * 3 + 1] = y1; a.upd[row * 3 + 2] = y2; }
     return;
@@ -1135,17 +1127,36 @@ kernel void af3_centroid(constant CentroidArgs& a [[buffer(0)]], uint3 tg [[thre
     if (lane < 3) a.c[tg.x * 3 + lane] = v[lane] / (v[3] + 1e-6f);
   }
 }
-kernel void af3_augment(LF_ARGS(AugmentArgs)) {
-  ulong at = LF_INDEX;
-  if (at >= a.total) return;
-  ulong k = at / a.atoms;
-  device const float* r = a.rot + k * 12; device const float* ck = a.c + k * 3;
-  float p[3] = {a.x[at * 3] - ck[0], a.x[at * 3 + 1] - ck[1], a.x[at * 3 + 2] - ck[2]};
-  bool live = a.mask[at % a.atoms] != 0.f;
-  for (int d = 0; d < 3; ++d) {
-    float v = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
-    a.x[at * 3 + d] = v;
-    a.noisy[at * 3 + d] = v + a.injected * lf_gaussian(a.seeds[k], a.step, (at % a.atoms) * 3 + d);
+kernel void af3_augment(constant AugmentArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float part[4][32];
+  threadgroup float ck[3];
+  const ulong k = tg.x;
+  device float* xs = a.x + k * a.atoms * 3;
+  device float* noisy = a.noisy + k * a.atoms * 3;
+  float s[4] = {0, 0, 0, 0};
+  for (ulong i = tid; i < a.atoms; i += 1024)
+    if (a.mask[i] != 0.f) { s[0] += xs[i * 3]; s[1] += xs[i * 3 + 1]; s[2] += xs[i * 3 + 2]; s[3] += 1.f; }
+  for (int d = 0; d < 4; ++d) { float v = simd_sum(s[d]); if (lane == 0) part[d][sg] = v; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float v[4];
+    for (int d = 0; d < 4; ++d) v[d] = simd_sum(part[d][lane]);
+    if (lane < 3) ck[lane] = v[lane] / (v[3] + 1e-6f);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float c0 = ck[0], c1 = ck[1], c2 = ck[2];
+  device const float* r = a.rot + k * 12;
+  const ulong seed = a.seeds[k];
+  for (ulong i = tid; i < a.atoms; i += 1024) {
+    float p[3] = {xs[i * 3] - c0, xs[i * 3 + 1] - c1, xs[i * 3 + 2] - c2};
+    bool live = a.mask[i] != 0.f;
+    for (int d = 0; d < 3; ++d) {
+      float v = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
+      xs[i * 3 + d] = v;
+      noisy[i * 3 + d] = v + a.injected * lf_gaussian(seed, a.step, i * 3 + d);
+    }
   }
 }
 kernel void af3_euler(LF_ARGS(EulerArgs)) {

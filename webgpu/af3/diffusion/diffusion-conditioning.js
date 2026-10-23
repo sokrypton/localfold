@@ -242,16 +242,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (same_entity) { count = 4.0; }
 
   // The 267-wide statistics, in closed form.
+  var norm_pair: array<f32, C_PAIR>;
   var total = count;
-  for (var c = 0u; c < C_PAIR; c += 1u) { total += trunk_pair[base + c]; }
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let v = trunk_pair[base + c];
+    norm_pair[c] = v;
+    total += v;
+  }
   let mean = total / f32(WIDTH);
   var variance = count * (1.0 - mean) * (1.0 - mean)
     + (f32(RELATIVE_WIDTH) - count) * mean * mean;
   for (var c = 0u; c < C_PAIR; c += 1u) {
-    let d = trunk_pair[base + c] - mean;
+    let d = norm_pair[c] - mean;
     variance += d * d;
   }
   let inverse_std = inverseSqrt(variance / f32(WIDTH) + EPSILON);
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    norm_pair[c] = (norm_pair[c] - mean) * inverse_std * scale[c]
+      + scale[WIDTH + c];
+  }
 
   let row_a = C_PAIR + bin_a;
   let row_b = C_PAIR + POSITION_BINS + bin_b;
@@ -261,8 +270,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var out = 0u; out < C_PAIR; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_PAIR; c += 1u) {
-      value += ((trunk_pair[base + c] - mean) * inverse_std * scale[c]
-        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
+      value += norm_pair[c] * projection[c * C_PAIR + out];
     }
     // The set bins, minus the mean times every column's contribution.
     var gathered = scale[row_a] * projection[row_a * C_PAIR + out]
@@ -548,12 +556,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     joint_squares += d * d;
   }
   let joint_inverse = inverseSqrt(total_of(lane, joint_squares) / f32(WIDTH) + EPSILON);
+  workgroupBarrier();
+  for (var c = lane; c < WIDTH; c += LANES) {
+    concatenated[c] = (concatenated[c] - joint_mean) * joint_inverse * scale[c]
+      + scale[WIDTH + c];
+  }
+  workgroupBarrier();
 
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < WIDTH; c += 1u) {
-      value += ((concatenated[c] - joint_mean) * joint_inverse * scale[c]
-        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
+      value += concatenated[c] * projection[c * C_PAIR + out];
     }
     pair[row * C_PAIR + out] = value;
   }
@@ -810,12 +823,10 @@ export class Af3DiffusionConditioningGpu {
     // ...and the third mode, carried on the shape with it so `run` and the
     // shader factory cannot disagree about which kernel is compiled.
     const { split, projectedRelpos } = shape;
-    const featureData = new Int32Array(5 * tokens);
-    ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"].forEach((name, index) => {
-      const source = input.features[name];
-      if (source === undefined) throw new Error(`features.${name} is required`);
-      for (let t = 0; t < tokens; t += 1) featureData[index * tokens + t] = source[t];
-    });
+    const featureNames = ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"];
+    for (const name of featureNames) {
+      if (input.features[name] === undefined) throw new Error(`features.${name} is required`);
+    }
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -835,7 +846,14 @@ export class Af3DiffusionConditioningGpu {
         ? { buffer: input.trunkPairBuffer } : up("cond.trunk-pair", input.trunkPair)));
       const trunkSingle = up("cond.trunk-single", input.trunkSingle);
       const targetFeat = up("cond.target", input.targetFeat);
-      const features = onlyIfNew(() => up("cond.features", featureData));
+      const features = onlyIfNew(() => {
+        const featureData = new Int32Array(5 * tokens);
+        featureNames.forEach((name, index) => {
+          const source = input.features[name];
+          for (let t = 0; t < tokens; t += 1) featureData[index * tokens + t] = source[t];
+        });
+        return up("cond.features", featureData);
+      });
       // 🔴 THE WEIGHT-DERIVED ONES ARE RESIDENT, NOT UPLOADED PER STEP. Six of
       // these eight are functions of the weight bundle - a sampler was writing
       // them across the bus two hundred times, and the two transition bundles
@@ -914,8 +932,18 @@ export class Af3DiffusionConditioningGpu {
       if (deferred === undefined) this.device.pushErrorScope("validation");
       else deferred.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "af3-diffusion-conditioning" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
@@ -924,7 +952,7 @@ export class Af3DiffusionConditioningGpu {
           })),
         }));
         pass.dispatchWorkgroups(x, y);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       // 🔴 THE PAIR CONDITIONING DOES NOT DEPEND ON THE NOISE LEVEL. It is the
@@ -971,6 +999,7 @@ export class Af3DiffusionConditioningGpu {
             [single, transitionWeights.single[index]],
             Math.ceil(tokens / singleTile));
       }
+      endPass();
       if (reusePair === undefined && readPair !== undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);
       }
