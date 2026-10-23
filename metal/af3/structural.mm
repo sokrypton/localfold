@@ -16,7 +16,7 @@ Structural expandStructural(const Trunk& t) {
   int F = metaI(E + "singleInputChannels"), Cs = metaI(E + "singleChannels"), C = metaI(E + "pairChannels");
   if (metaI(E + "roles") != ROLES) die("the expander has %d roles, not 7", metaI(E + "roles"));
   size_t pairs = (size_t)n * n;
-  size_t np = n <= 256 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   const int* parent = M.i("structural.parent"); const int* role = M.i("structural.role");
   // s_inputs and the single
   s.targetFeat = allocT<float>((size_t)n * F);
@@ -109,7 +109,7 @@ DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense
   int slots = metaI(P + "denseSlots"), PB = metaI(P + "plddtBins");
   if (slots != dense) die("plddt_weight has %d slots, the batch %d", slots, dense);
   size_t pairs = (size_t)n * n;
-  size_t np = n <= 256 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   float* single = scratch<float>("ddc.single", np * Cs);
   copy(single, st.single, (size_t)n * Cs * 4);
   run1d("af3_clamp", (size_t)n * Cs, ClampArgs{single, (u64)n * Cs, 512.f, 0});

@@ -24,6 +24,7 @@
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
+import { DeferredValidation } from "../../runtime/validation.js";
 import { tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
 
 const GRID_WIDTH = 32_768;
@@ -71,6 +72,7 @@ ${tmPerBin === null ? "" : `@group(0) @binding(5) var<storage, read_write> tm: a
 const TM_PER_BIN = array<f32, ${bins}>(${Array.from(tmPerBin).join(", ")});`}
 
 var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> reduce3: array<vec4<f32>, LANES>;
 var<workgroup> row_buf: array<f32, CHANNELS>;
 
 fn source(row: u32, channel: u32) -> f32 {
@@ -91,6 +93,18 @@ fn total_of(lane: u32, value: f32) -> f32 {
   if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
   if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
+}
+
+fn total_of_v4(lane: u32, value: vec4<f32>) -> vec4<f32> {
+  reduce3[lane] = value;
+  workgroupBarrier();
+  if (lane < 32u) { reduce3[lane] += reduce3[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce3[lane] += reduce3[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce3[lane] += reduce3[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce3[lane] += reduce3[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce3[lane] += reduce3[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce3[0] += reduce3[1]; } workgroupBarrier();
+  return reduce3[0];
 }
 
 fn largest_of(lane: u32, value: f32) -> f32 {
@@ -147,20 +161,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   var lane_total = 0.0;
   var lane_weighted = 0.0;
-${tmPerBin === null ? "" : "  var lane_tm = 0.0;"}
+  var lane_tm = 0.0;
   if (has_bin) {
     let value = exp(my_logit - peak);
     lane_total = value;
     lane_weighted = value * (MIN_BIN + BIN_WIDTH * (f32(lane) + 0.5));
 ${tmPerBin === null ? "" : "    lane_tm = value * TM_PER_BIN[lane];"}
   }
-  let denominator = total_of(lane, lane_total);
-  workgroupBarrier();
-  let numerator = total_of(lane, lane_weighted);
-${tmPerBin === null ? "" : `  workgroupBarrier();
-  let tm_total = total_of(lane, lane_tm);
-  if (lane == 0u) { tm[row] = tm_total / denominator; }`}
-  if (lane == 0u) { expected[row] = numerator / denominator; }
+  let sums = total_of_v4(lane, vec4<f32>(lane_total, lane_weighted, lane_tm, 0.0));
+  if (lane == 0u) {
+${tmPerBin === null ? "" : "    tm[row] = sums.z / sums.x;"}
+    expected[row] = sums.y / sums.x;
+  }
 }`;
 }
 
@@ -254,6 +266,7 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(5) var<storage, read_write> expected: array<f32>;
 
 var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> reduce2: array<vec2<f32>, LANES>;
 var<workgroup> row_buf: array<f32, CHANNELS>;
 
 fn total_of(lane: u32, value: f32) -> f32 {
@@ -266,6 +279,18 @@ fn total_of(lane: u32, value: f32) -> f32 {
   if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
   if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
   return reduce[0];
+}
+
+fn total_of_v2(lane: u32, value: vec2<f32>) -> vec2<f32> {
+  reduce2[lane] = value;
+  workgroupBarrier();
+  if (lane < 32u) { reduce2[lane] += reduce2[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { reduce2[lane] += reduce2[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { reduce2[lane] += reduce2[lane + 8u]; } workgroupBarrier();
+  if (lane < 4u) { reduce2[lane] += reduce2[lane + 4u]; } workgroupBarrier();
+  if (lane < 2u) { reduce2[lane] += reduce2[lane + 2u]; } workgroupBarrier();
+  if (lane == 0u) { reduce2[0] += reduce2[1]; } workgroupBarrier();
+  return reduce2[0];
 }
 
 fn largest_of(lane: u32, value: f32) -> f32 {
@@ -334,10 +359,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     lane_weighted = value * ${scoreBins === "index"
       ? "f32(lane)" : `(${(1 / bins).toExponential(9)} * (f32(lane) + 0.5))`};
   }
-  let denominator = total_of(lane, lane_total);
-  workgroupBarrier();
-  let numerator = total_of(lane, lane_weighted);
-  if (lane == 0u) { expected[atom] = numerator / denominator; }
+  let sums = total_of_v2(lane, vec2<f32>(lane_total, lane_weighted));
+  if (lane == 0u) { expected[atom] = sums.y / sums.x; }
 }`;
 }
 
@@ -383,11 +406,12 @@ export async function openddeAtomReadouts(device, input, weights) {
       ({ buffer: residentWeightBuffer(device, weights, label, build) });
     const outputs = arms.map((arm) => keep(allocator.allocate(
       `opendde-conf.${arm.name}`, atoms * 4, storage | GPUBufferUsage.COPY_SRC)));
-    const readbacks = arms.map((arm) => keep(allocator.allocate(
-      `opendde-conf.rb-${arm.name}`, atoms * 4,
-      GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
+    const readback = keep(allocator.allocate(
+      "opendde-conf.rb-atoms", 2 * atoms * 4,
+      GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
-    device.pushErrorScope("validation");
+    const validation = new DeferredValidation(device, "OpenDDE atom readouts");
+    validation.begin();
     const encoder = device.createCommandEncoder({ label: "opendde-confidence-atoms" });
     const pass = encoder.beginComputePass({ label: "opendde-confidence-atoms" });
     arms.forEach((arm, index) => {
@@ -407,18 +431,16 @@ export async function openddeAtomReadouts(device, input, weights) {
     });
     pass.end();
     arms.forEach((unused, index) => {
-      encoder.copyBufferToBuffer(outputs[index].buffer, 0, readbacks[index].buffer, 0, atoms * 4);
+      encoder.copyBufferToBuffer(outputs[index].buffer, 0, readback.buffer, index * atoms * 4, atoms * 4);
     });
     device.queue.submit([encoder.finish()]);
-    const error = await device.popErrorScope();
-    if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
-    const read = async (allocation) => {
-      await allocation.buffer.mapAsync(GPUMapMode.READ);
-      const copy = new Float32Array(allocation.buffer.getMappedRange().slice(0));
-      allocation.buffer.unmap();
-      return copy;
-    };
-    const [plddt, resolved] = await Promise.all(readbacks.map(read));
+    validation.end("atom readouts");
+    await readback.buffer.mapAsync(GPUMapMode.READ);
+    const mapped = new Float32Array(readback.buffer.getMappedRange());
+    const plddt = mapped.slice(0, atoms);
+    const resolved = mapped.slice(atoms, 2 * atoms);
+    readback.buffer.unmap();
+    await validation.settle();
     for (let index = 0; index < plddt.length; index += 1) plddt[index] *= 100;
     return { plddt, resolved };
   } finally {
@@ -467,16 +489,15 @@ export async function openddePairReadouts(device, input, weights) {
       ({ buffer: residentWeightBuffer(device, weights, label, build) });
     const outputs = arms.map((arm) => keep(allocator.allocate(
       `opendde-conf.${arm.name}`, rows * 4, storage | GPUBufferUsage.COPY_SRC)));
-    const readbacks = arms.map((arm) => keep(allocator.allocate(
-      `opendde-conf.rb-${arm.name}`, rows * 4,
-      GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
     const tmOut = tmTokens === undefined ? null : keep(allocator.allocate(
       "opendde-conf.tm", rows * 4, storage | GPUBufferUsage.COPY_SRC));
-    const tmBack = tmTokens === undefined ? null : keep(allocator.allocate(
-      "opendde-conf.rb-tm", rows * 4,
+    const planes = tmOut === null ? 2 : 3;
+    const readback = keep(allocator.allocate(
+      "opendde-conf.rb-pairs", planes * rows * 4,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
-    device.pushErrorScope("validation");
+    const validation = new DeferredValidation(device, "OpenDDE pair readouts");
+    validation.begin();
     const encoder = device.createCommandEncoder({ label: "opendde-confidence-readouts" });
     const pass = encoder.beginComputePass({ label: "opendde-confidence-readouts" });
     arms.forEach((arm, index) => {
@@ -497,22 +518,18 @@ export async function openddePairReadouts(device, input, weights) {
     });
     pass.end();
     arms.forEach((arm, index) => {
-      encoder.copyBufferToBuffer(outputs[index].buffer, 0, readbacks[index].buffer, 0, rows * 4);
-      if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, tmBack.buffer, 0, rows * 4);
+      encoder.copyBufferToBuffer(outputs[index].buffer, 0, readback.buffer, index * rows * 4, rows * 4);
+      if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, readback.buffer, 2 * rows * 4, rows * 4);
     });
     device.queue.submit([encoder.finish()]);
-    const error = await device.popErrorScope();
-    if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
-    const read = async (allocation) => {
-      await allocation.buffer.mapAsync(GPUMapMode.READ);
-      const copy = new Float32Array(allocation.buffer.getMappedRange().slice(0));
-      allocation.buffer.unmap();
-      return copy;
-    };
-    const [pae, pde, tm] = await Promise.all([
-      read(readbacks[0]), read(readbacks[1]),
-      ...(tmBack === null ? [] : [read(tmBack)]),
-    ]);
+    validation.end("pair readouts");
+    await readback.buffer.mapAsync(GPUMapMode.READ);
+    const mapped = new Float32Array(readback.buffer.getMappedRange());
+    const pae = mapped.slice(0, rows);
+    const pde = mapped.slice(rows, 2 * rows);
+    const tm = tmOut === null ? undefined : mapped.slice(2 * rows, 3 * rows);
+    readback.buffer.unmap();
+    await validation.settle();
     return { pae, pde, ...(tm === undefined ? {} : { tm }) };
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();

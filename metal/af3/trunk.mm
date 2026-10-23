@@ -17,7 +17,7 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   t.Cm = metaI("trunk.embedder.msaChannels"); t.F = metaI("trunk.embedder.targetFeatWidth");
   t.S = std::min((int)M.meta("batch.sequences"), msaCap);
   size_t pairs = (size_t)t.n * t.n;
-  size_t np = t.n <= 128 ? (size_t)((t.n + 15) & ~15) : (size_t)t.n;
+  size_t np = t.n <= 128 ? (size_t)((t.n + 15) & ~15) : (t.n <= 256 ? (size_t)((t.n + 31) & ~31) : (size_t)t.n);
   t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>(np * t.Cs);
   t.msa = allocT<float>((size_t)t.S * t.n * t.Cm);
   fill(t.pair, 0, pairs * t.C * 4);     // (the recycled pair before the first pass: read in place, embed())
@@ -128,7 +128,7 @@ static void templateEmbedding(Trunk& t) {
 // ---------------------------------------------------------------- the embedder
 static void embed(Trunk& t) {
   int n = t.n, C = t.C; size_t pairs = (size_t)n * n;
-  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   const std::string E = "trunk.embedder.";
   float* left = scratch<float>("emb.left", np * C); float* right = scratch<float>("emb.right", np * C);
   half* tfh = scratch<half>("emb.tfh", np * t.F);

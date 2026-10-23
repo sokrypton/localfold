@@ -288,12 +288,14 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
   if (i0 >= a.n || j0 >= a.n) return;
   threadgroup half4 Ws[256];         // up to 128 * 2 half4s (2.0 KB)
   threadgroup half tile[8 * 8 * 16]; // [8][8][16] halves (2.0 KB)
-  if (a.H <= 8) {
-    if (tid < a.C * (a.H <= 4 ? 1u : 2u)) Ws[tid] = *(device const half4*)(a.W + tid * 4);
-  } else if (tid < a.C * 2) {
-    Ws[tid] = *(device const half4*)(a.W + (tid >> 1) * a.H + (tid & 1) * 4);
+  if (a.C <= 128) {
+    if (a.H <= 8) {
+      if (tid < a.C * (a.H <= 4 ? 1u : 2u)) Ws[tid] = *(device const half4*)(a.W + tid * 4);
+    } else if (tid < a.C * 2) {
+      Ws[tid] = *(device const half4*)(a.W + (tid >> 1) * a.H + (tid & 1) * 4);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint sr_base = a.swap ? j0 : i0;
   const uint sc_base = a.swap ? i0 : j0;
@@ -303,12 +305,11 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
   const bool valid0 = sr0 < a.n && sc < a.n;
   const bool valid1 = sr1 < a.n && sc < a.n;
 
-  const uint c4_per_lane = a.C >> 5; // 4 when C=128, 2 when C=64
-  const uint c4_base = tx * c4_per_lane;
-  device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C) + c4_base;
-  device const half4* p1 = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C) + c4_base;
-
-  if (a.H <= 4) {
+  if (a.H <= 4 && a.C <= 128) {
+    const uint c4_per_lane = a.C >> 5; // 4 when C=128, 2 when C=64
+    const uint c4_base = tx * c4_per_lane;
+    device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C) + c4_base;
+    device const half4* p1 = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C) + c4_base;
     float4 acc0(0.f), acc1(0.f);
     for (uint u = 0; u < c4_per_lane; ++u) {
       float4 x0 = valid0 ? float4(p0[u]) : float4(0.f);
@@ -341,7 +342,11 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
         *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + (h * 8 + row_i) * 16);
       }
     }
-  } else {
+  } else if (a.C <= 128) {
+    const uint c4_per_lane = a.C >> 5;
+    const uint c4_base = tx * c4_per_lane;
+    device const half4* p0 = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C) + c4_base;
+    device const half4* p1 = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C) + c4_base;
     float4 x0_u[4], x1_u[4];
     for (uint u = 0; u < c4_per_lane; ++u) {
       x0_u[u] = valid0 ? float4(p0[u]) : float4(0.f);
@@ -350,9 +355,12 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
     const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
     const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
     for (uint h8 = 0; h8 < a.H; h8 += 8) {
+      const uint remH = min(8u, a.H - h8);
       if (h8 > 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < a.C * 2) Ws[tid] = *(device const half4*)(a.W + (tid >> 1) * a.H + h8 + (tid & 1) * 4);
+        if (tid < a.C * 2) {
+          Ws[tid] = (remH == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (tid >> 1) * a.H + h8 + (tid & 1) * 4) : half4(0.h);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
       float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
@@ -371,7 +379,7 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
       float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
       v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
       v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
-      if (tx == 0 || tx == 4) {
+      if (tx == 0 || (tx == 4 && remH > 4)) {
         const uint h_base = tx;
         const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
         const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
@@ -386,7 +394,60 @@ kernel void af3_pair_bias(constant PairBiasArgs& a [[buffer(0)]], uint3 tg [[thr
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (tid < 64) {
+      if (tid < remH * 8) {
+        uint h = h8 + (tid >> 3), row_i = tid & 7, i = i0 + row_i;
+        if (i < a.n) {
+          *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + ((tid >> 3) * 8 + row_i) * 16);
+        }
+      }
+    }
+  } else {
+    const float eb0 = (a.extraBias && valid0) ? a.extraBias[sr0 * a.n + sc] : 0.f;
+    const float eb1 = (a.extraBias && valid1) ? a.extraBias[sr1 * a.n + sc] : 0.f;
+    device const half4* p0_base = (device const half4*)(a.pn + ((ulong)sr0 * a.n + sc) * a.C);
+    device const half4* p1_base = (device const half4*)(a.pn + ((ulong)sr1 * a.n + sc) * a.C);
+    for (uint h8 = 0; h8 < a.H; h8 += 8) {
+      const uint remH = min(8u, a.H - h8);
+      float4 acc0_0(0.f), acc0_1(0.f), acc1_0(0.f), acc1_1(0.f);
+      for (uint c0 = 0; c0 < a.C; c0 += 128) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        Ws[tid] = (remH == 8 || (tid & 1) == 0) ? *(device const half4*)(a.W + (c0 + (tid >> 1)) * a.H + h8 + (tid & 1) * 4) : half4(0.h);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint c4_base = (c0 >> 2) + tx * 4;
+        _Pragma("clang loop unroll(full)")
+        for (uint u = 0; u < 4; ++u) {
+          float4 x0 = valid0 ? float4(p0_base[c4_base + u]) : float4(0.f);
+          float4 x1 = valid1 ? float4(p1_base[c4_base + u]) : float4(0.f);
+          uint c = (tx * 4 + u) * 4;
+          _Pragma("clang loop unroll(full)")
+          for (uint k = 0; k < 4; ++k) {
+            float xv0 = x0[k], xv1 = x1[k];
+            float4 wa = float4(Ws[(c + k) * 2]), wb = float4(Ws[(c + k) * 2 + 1]);
+            acc0_0 += xv0 * wa; acc0_1 += xv0 * wb;
+            acc1_0 += xv1 * wa; acc1_1 += xv1 * wb;
+          }
+        }
+      }
+      float4 v0 = (tx < 4 ? acc0_0 : acc0_1) + simd_shuffle_xor(tx < 4 ? acc0_1 : acc0_0, (ushort)4);
+      float4 v1 = (tx < 4 ? acc1_0 : acc1_1) + simd_shuffle_xor(tx < 4 ? acc1_1 : acc1_0, (ushort)4);
+      v0 += simd_shuffle_xor(v0, (ushort)2); v1 += simd_shuffle_xor(v1, (ushort)2);
+      v0 += simd_shuffle_xor(v0, (ushort)1); v1 += simd_shuffle_xor(v1, (ushort)1);
+      if (tx == 0 || (tx == 4 && remH > 4)) {
+        const uint h_base = tx;
+        const uint row_i0 = a.swap ? m : r0, col_j0 = a.swap ? r0 : m;
+        const uint row_i1 = a.swap ? m : r1, col_j1 = a.swap ? r1 : m;
+        const bool vj0 = (j0 + col_j0) < a.n;
+        const bool vj1 = (j0 + col_j1) < a.n;
+        const float4 wb = a.wBias ? *(device const float4*)(a.wBias + h8 + h_base) : float4(0.f);
+        _Pragma("clang loop unroll(full)")
+        for (uint t = 0; t < 4; ++t) {
+          uint h = h_base + t;
+          tile[(h * 8 + row_i0) * 16 + col_j0] = vj0 ? (half)((v0[t] + wb[t] + eb0) * M_LOG2E_F) : (half)(-INFINITY);
+          tile[(h * 8 + row_i1) * 16 + col_j1] = vj1 ? (half)((v1[t] + wb[t] + eb1) * M_LOG2E_F) : (half)(-INFINITY);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid < remH * 8) {
         uint h = h8 + (tid >> 3), row_i = tid & 7, i = i0 + row_i;
         if (i < a.n) {
           *(device uint4*)(a.out + ((ulong)h * a.n + i) * a.stride + j0) = *(threadgroup const uint4*)(tile + ((tid >> 3) * 8 + row_i) * 16);

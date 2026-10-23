@@ -9,7 +9,7 @@
 static void boltz2Reembed(float* pair, float* single, const Trunk& t, const float* pseudoBeta, int C, int Cs, int F) {
   const std::string R = "confidence.reembed.";
   int n = t.n; size_t pairs = (size_t)n * n;
-  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   half* sIn = scratch<half>("conf.sInputs", np * F);
   if (np > (size_t)n) fill(sIn + (size_t)n * F, 0, (np - n) * F * sizeof(half));
   ln(t.targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
@@ -60,7 +60,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta) {
   int dense = metaI("batch.dense");
   size_t pairs = (size_t)n * n;
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
-  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   float* pair = scratch<float>("conf.pair", pairs * C);
   float* single = scratch<float>("conf.single", np * Cs);
   if (np > (size_t)n) fill(single + (size_t)n * Cs, 0, (np - n) * Cs * 4);

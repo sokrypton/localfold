@@ -15,16 +15,19 @@ static RelIdx relIdx() {
           M.i("batch.features.entityId"), M.i("batch.features.symId")};
 }
 // the conditioning's plain transition: LN (scale, offset), SwiGLU, the projection added
-static void plainTransition(float* x, size_t rows, int C, const std::string& P) {
+static void plainTransition(float* x, size_t rows, int C, const std::string& P, size_t padRows = 0) {
   int I = (int)(lenW(P + ".ffwTransition1") / (2 * (size_t)C));
+  size_t rp = padRows > rows ? padRows : rows;
   size_t chunk = std::min(rows, std::max<size_t>(64, CHUNK / (2 * (size_t)I)));
-  half* xn = scratch<half>("pt.xn", chunk * C); half* g = scratch<half>("pt.g", chunk * I);
+  half* xn = scratch<half>("pt.xn", std::max(chunk, rp) * C); half* g = scratch<half>("pt.g", std::max(chunk, rp) * I);
+  if (rp > rows && chunk == rows) fill(xn + rows * C, 0, (rp - rows) * C * sizeof(half));
   const half* wp = swigluPairs(P + ".ffwTransition1", C, I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
+    size_t rg = (rp > rows && r == rows) ? rp : r;
     ln(x + r0 * C, xn, r, C, P + ".ffwLayerNormScale", P + ".ffwLayerNormOffset");
-    gemmSwiglu(xn, wp, g, r, C, I);
-    lin(g, P + ".ffwTransition2", x + r0 * C, r, I, C, 1.f);
+    gemmSwiglu(xn, wp, g, rg, C, I);
+    lin(g, P + ".ffwTransition2", x + r0 * C, rg, I, C, 1.f);
   }
 }
 
@@ -153,7 +156,7 @@ static float* singleConditioning(float level) {
 
 // singleConditioning for K levels at once: the K noise projections added to K copies of the base, then the
 // transitions and the final norm - row-wise - over all K n rows (at a short n those were K launches of 68-row work)
-static void singleConditioningBatch(const float* levels, size_t K, float* out) {
+static void singleConditioningBatch(const float* levels, size_t K, float* out, size_t padRows = 0) {
   const std::string P = "diffusion.conditioning";
   int n = D.n, Cs = metaI(P + ".seqChannels");
   size_t nc = lenW(P + ".fourierWeight");
@@ -167,7 +170,7 @@ static void singleConditioningBatch(const float* levels, size_t K, float* out) {
   lin(en, P + ".noiseEmbeddingInitialProjection", projs, K, (int)nc, Cs);
   run1d("af3_single_batch_init", (Cs & 3) ? K * n * Cs : K * n * (Cs >> 2),
         SingleBatchInitArgs{D.singleBase, projs, out, (uint)K, (uint)n, (uint)Cs, 0});
-  for (int t = 0; t < 2; ++t) plainTransition(out, K * n, Cs, P + ".singleTransitions." + num(t));
+  for (int t = 0; t < 2; ++t) plainTransition(out, K * n, Cs, P + ".singleTransitions." + num(t), padRows);
   if (hasW(P + ".singleCondFinalNormScale")) {
     float* tmp = scratch<float>("dc.sfnormK", K * n * Cs);
     ln(out, tmp, K * n, Cs, P + ".singleCondFinalNormScale", P + ".singleCondFinalNormOffset");
@@ -261,11 +264,11 @@ static void conditioningAhead(float level) {
   const size_t pn = ((size_t)n + 15) / 16 * 16, per = (size_t)n * (D.ldn + D.ldr) * 4;
   const size_t rem = D.plan.size() - D.planAt, maxK = std::max<size_t>(1, std::min<size_t>(32, ((size_t)768 << 20) / std::max<size_t>(per, 1)));
   const size_t batches = std::max<size_t>(1, (rem + maxK - 1) / maxK), K = std::min<size_t>(rem, (rem + batches - 1) / batches);
-  if (pn > 128 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
+  if (pn > 256 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
   D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
   const size_t kn = K * n, pkn = (kn + 63) / 64 * 64, cRows = std::max(K * pn, pkn);
-  D.heldSingle = scratch<float>("dt.heldSingle", kn * Cc);
-  singleConditioningBatch(D.held.data(), K, D.heldSingle);      // (the denoiser reads its slot too: heldSingleFor)
+  D.heldSingle = scratch<float>("dt.heldSingle", pkn * Cc);
+  singleConditioningBatch(D.held.data(), K, D.heldSingle, pkn);      // (the denoiser reads its slot too: heldSingleFor)
   int Cs = metaI("diffusion.seqChannels"), perToken = metaI("diffusion.perTokenChannels");
   D.heldSnProj = scratch<float>("dt.heldSnProj", pkn * perToken);
   half* sn = scratch<half>("dt.heldSn", pkn * Cs);

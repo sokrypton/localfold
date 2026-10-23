@@ -144,7 +144,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
   int stride = (n + 63) / 64 * 64;
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
-  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8)) {
+  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
     bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
     run("af3_pair_bias", Grid{(uint32_t)((n + 7) / 8), (uint32_t)((n + 7) / 8), 1}, 256,
         PairBiasArgs{xn, xs ? fb.w : Wh(pre + ".pairBiasProjection"), xs ? fb.b : nullptr, nullptr, bias,
@@ -227,8 +227,8 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) die("%s.transition1 has %zu elements, not %d x 2I", pre.c_str(), w1, C);
   int I = (int)(w1 / (2 * (size_t)C));
-  const bool padSt = rows <= 128 && (rows & 15) && !strcmp(scratchPrefix, "st.") && !sharedNorm(x);
-  size_t rp = padSt ? ((rows + 15) & ~(size_t)15) : rows;
+  const bool padSt = rows <= 256 && (rows & (rows <= 128 ? 15 : 31)) && !strcmp(scratchPrefix, "st.") && !sharedNorm(x);
+  size_t rp = padSt ? (rows <= 128 ? ((rows + 15) & ~(size_t)15) : ((rows + 31) & ~(size_t)31)) : rows;
   size_t chunk = std::min(rows, std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I)));
   half* xn = scratch<half>(std::string(scratchPrefix) + "xn", std::max(chunk, rp) * C);
   half* g = scratch<half>(std::string(scratchPrefix) + "g", std::max(chunk, rp) * I);
@@ -358,7 +358,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the transition reads
   // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
   const bool parallel = flag("trunk.dialect.parallelPairformer");
-  const size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (size_t)n;
+  const size_t np = n <= 128 ? (size_t)((n + 15) & ~15) : (n <= 256 ? (size_t)((n + 31) & ~31) : (size_t)n);
   float* s0 = nullptr;
   if (parallel) {
     s0 = scratch<float>("st.s0", np * Cs);
@@ -372,7 +372,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   int stride = (n + 63) / 64 * 64;
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
-  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 16)) {
+  if (fusedPairBias && (C == 64 || C == 128) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
     Folded f;
     if (xs) f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
     bias = scratch<half>("st.bias", (size_t)heads * n * stride);

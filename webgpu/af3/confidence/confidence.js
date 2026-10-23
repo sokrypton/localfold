@@ -31,6 +31,7 @@
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../../runtime/resident.js";
 import { Af3PairformerStackGpu } from "../trunk/pairformer-block.js";
 import { GRID_WIDTH } from "../trunk/pair-track.js";
 import { DeferredValidation } from "../../runtime/validation.js";
@@ -303,6 +304,7 @@ const EPSILON: f32 = ${epsilon};
   // cpu/af3/confidence/confidence.js has always done it this way - two calls to
   // `linear` over TOKENS rows, then broadcast into the pair - so this brings
   // the GPU TOWARDS the reference rather than away from it.
+  const stageTargetFeat = pairChannels % 64 === 0 && targetFeatWidth <= 1024;
   const embedProject = `${common}
 const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
 const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
@@ -314,18 +316,39 @@ const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 ${shape.absentTerms === true
   ? "@group(0) @binding(4) var<storage, read> absent: array<f32>;" : ""}
 
+${stageTargetFeat ? (() => {
+    const steps = pairChannels / 64;
+    const idx = Array.from({ length: steps }, (_, s) => s);
+    return `var<workgroup> tf_row: array<f32, ${targetFeatWidth}>;
 @compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let token = group.x + group.y * GRID_WIDTH;
+  if (token >= TOKENS) { return; }
+  let local = local_id.x;
+  let tf_base = token * TARGET_WIDTH;
+  for (var f = local; f < TARGET_WIDTH; f += 64u) {
+    tf_row[f] = target_feat[tf_base + f];
+  }
+  workgroupBarrier();
+  ${idx.map((s) => `var l${s} = ${shape.absentTerms === true ? `absent[local + ${s * 64}u]` : "0.0"}; var r${s} = ${shape.absentTerms === true ? `absent[C_Z + local + ${s * 64}u]` : "0.0"};`).join("\n  ")}
+  for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+    let feature = tf_row[f];
+    let wl_base = W_LEFT + f * C_Z + local;
+    let wr_base = W_RIGHT + f * C_Z + local;
+    ${idx.map((s) => `l${s} += feature * weights[wl_base + ${s * 64}u]; r${s} += feature * weights[wr_base + ${s * 64}u];`).join("\n    ")}
+  }
+  let out_base = token * C_Z + local;
+  ${idx.map((s) => `left[out_base + ${s * 64}u] = l${s}; right[out_base + ${s * 64}u] = r${s};`).join("\n  ")}
+}`;
+  })() : `@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let slot = id.x + id.y * GRID_WIDTH * 64u;
   if (slot >= TOKENS * C_Z) { return; }
   let token = slot / C_Z;
   let c = slot % C_Z;
-  // rf3's two dropped s_inputs columns, one per-channel vector each side; see
-  // absentTargetFeatTerms in the CPU reference.
   var left_total = ${shape.absentTerms === true ? "absent[c]" : "0.0"};
   var right_total = ${shape.absentTerms === true ? "absent[C_Z + c]" : "0.0"};
-  // ...one read of the feature serving both projections, which is why they
-  // share a kernel rather than being two dispatches.
   for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
     let feature = target_feat[token * TARGET_WIDTH + f];
     left_total += feature * weights[W_LEFT + f * C_Z + c];
@@ -333,7 +356,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   left[slot] = left_total;
   right[slot] = right_total;
-}`;
+}`}`;
 
   const embed = `${common}
 ${caDgram
@@ -353,9 +376,11 @@ ${embedOffsets.distanceFeatProject === undefined ? ""
 @group(0) @binding(5) var<storage, read> right: array<f32>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= PAIRS) { return; }
+  let local = local_id.x;
   let i = row / TOKENS;
   let j = row % TOKENS;
 
@@ -381,18 +406,22 @@ ${caDgram ? `  // rf3: the bin is how many boundaries the distance is past, so E
     if (squared > LOWER[b] && squared < upper) { bin = i32(b); }
   }`}
   let keep = pair_mask[row];
-
-  for (var c = 0u; c < C_Z; c += 1u) {
+${embedOffsets.distanceFeatProject === undefined ? ""
+  : "  let dist = sqrt(squared + 1.0e-10);"}
+  let row_base = row * C_Z;
+  let i_base = i * C_Z;
+  let j_base = j * C_Z;
+  for (var c = local; c < C_Z; c += 64u) {
     // ...left is indexed by j and right by i. See the note at the top.
-    var value = pair[row * C_Z + c] + left[j * C_Z + c] + right[i * C_Z + c];
+    var value = pair[row_base + c] + left[j_base + c] + right[i_base + c];
     if (bin >= 0) {
       value += keep * weights[W_DGRAM + u32(bin) * C_Z + c];
     }
 ${embedOffsets.distanceFeatProject === undefined ? ""
   : `    // protenix2's second, UNBINNED distance term - and it is not masked,
     // exactly as the binned one above is.
-    value += sqrt(squared + 1.0e-10) * weights[W_DISTANCE + c];`}
-    pair[row * C_Z + c] = value;
+    value += dist * weights[W_DISTANCE + c];`}
+    pair[row_base + c] = value;
   }
 }`;
 
@@ -466,7 +495,30 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var c = local; c < C_Z; c += 64u) {
+  ${pairChannels % 64 === 0 ? (() => {
+    const steps = pairChannels / 64;
+    const idx = Array.from({ length: steps }, (_, s) => s);
+    return `${idx.map((s) => `var l_${s} = 0.0; var r_${s} = 0.0; var p1_${s} = 0.0; var p2_${s} = 0.0;`).join("\n  ")}
+  for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+    let value = s_inputs[f];
+    let fz = f * C_Z + local;
+    ${idx.map((s) => `{
+      let off = fz + ${s * 64}u;
+      l_${s} += value * weights[W_LEFT + off];
+      r_${s} += value * weights[W_RIGHT + off];
+      p1_${s} += value * weights[W_PROD1 + off];
+      p2_${s} += value * weights[W_PROD2 + off];
+    }`).join("\n    ")}
+  }
+  let plane = TOKENS * C_Z;
+  ${idx.map((s) => `{
+    let c = local + ${s * 64}u;
+    projections[token * C_Z + c] = l_${s};
+    projections[plane + token * C_Z + c] = r_${s};
+    projections[2u * plane + token * C_Z + c] = p1_${s};
+    projections[3u * plane + token * C_Z + c] = p2_${s};
+  }`).join("\n  ")}`;
+  })() : `for (var c = local; c < C_Z; c += 64u) {
     var l = 0.0; var r = 0.0; var p1 = 0.0; var p2 = 0.0;
     for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
       let value = s_inputs[f];
@@ -480,7 +532,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     projections[plane + token * C_Z + c] = r;
     projections[2u * plane + token * C_Z + c] = p1;
     projections[3u * plane + token * C_Z + c] = p2;
-  }
+  }`}
 
   // ...and the single track: its own LayerNorm plus a projection of s_inputs.
   var s_total = 0.0;
@@ -509,14 +561,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let s_mean = reduce_a[0] / f32(C_S);
   let s_variance = reduce_b[0] / f32(C_S) - s_mean * s_mean;
   let s_inverse = inverseSqrt(s_variance + EPSILON);
-  for (var c = local; c < C_S; c += 64u) {
+  ${singleChannels % 64 === 0 ? (() => {
+    const steps = singleChannels / 64;
+    const idx = Array.from({ length: steps }, (_, s) => s);
+    return `${idx.map((s) => `var s_${s} = (trunk_single[token * C_S + local + ${s * 64}u] - s_mean) * s_inverse * weights[W_S_SCALE + local + ${s * 64}u] + weights[W_S_OFFSET + local + ${s * 64}u];`).join("\n  ")}
+  for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+    let vf = s_inputs[f];
+    let fs_base = W_S_IN_TO_S + f * C_S + local;
+    ${idx.map((s) => `s_${s} += vf * weights[fs_base + ${s * 64}u];`).join("\n    ")}
+  }
+  ${idx.map((s) => `single[token * C_S + local + ${s * 64}u] = s_${s};`).join("\n  ")}`;
+  })() : `for (var c = local; c < C_S; c += 64u) {
     var value = (trunk_single[token * C_S + c] - s_mean) * s_inverse
       * weights[W_S_SCALE + c] + weights[W_S_OFFSET + c];
     for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
       value += s_inputs[f] * weights[W_S_IN_TO_S + f * C_S + c];
     }
     single[token * C_S + c] = value;
-  }
+  }`}
 }`;
 
   // The pair half: z_norm(trunk z) plus eight terms. One workgroup per pair row,
@@ -641,7 +703,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let bond = bonds[row];
   let bond_row = u32(clamp(i32(bonds[PAIRS + row]), 0, 6));
 
-  for (var c = local; c < C_Z; c += 64u) {
+  ${pairChannels % 64 === 0 ? (() => {
+    const steps = pairChannels / 64;
+    const idx = Array.from({ length: steps }, (_, s) => s);
+    return `${idx.map((s) => `var v_${s} = 0.0;
+  {
+    let c = local + ${s * 64}u;
+    var value = (pair_in[row * C_Z + c] - mean) * inverse * weights[W_Z_SCALE + c]
+      + weights[W_Z_OFFSET + c]
+      + weights[W_RELPOS + bin_a * C_Z + c]
+      + weights[W_RELPOS + row_b * C_Z + c]
+      + weights[W_RELPOS + row_c * C_Z + c]
+      + bond * weights[W_BOND + c]
+      + weights[W_BOND_TYPE + bond_row * C_Z + c]
+      + weights[W_CONTACT + c]
+      + right_at(i, c) + left_at(j, c)
+      + keep * weights[W_DGRAM + dbin * C_Z + c];
+    if (same_entity) { value += weights[W_RELPOS + row_entity * C_Z + c]; }
+    v_${s} = value;
+  }`).join("\n  ")}
+  for (var e = 0u; e < C_Z; e += 1u) {
+    let pe = product[e];
+    let w_base = W_PROD_OUT + e * C_Z + local;
+    ${idx.map((s) => `v_${s} += pe * weights[w_base + ${s * 64}u];`).join("\n    ")}
+  }
+  ${idx.map((s) => `pair_out[row * C_Z + local + ${s * 64}u] = v_${s};`).join("\n  ")}`;
+  })() : `for (var c = local; c < C_Z; c += 64u) {
     var value = (pair_in[row * C_Z + c] - mean) * inverse * weights[W_Z_SCALE + c]
       + weights[W_Z_OFFSET + c]
       + weights[W_RELPOS + bin_a * C_Z + c]
@@ -657,7 +744,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       value += product[e] * weights[W_PROD_OUT + e * C_Z + c];
     }
     pair_out[row * C_Z + c] = value;
-  }
+  }`}
 }`;
 
   const centreList = Array.from(centres, (value) => value.toString()).join(", ");
@@ -714,72 +801,30 @@ var<workgroup> norm_transposed: array<f32, ${pairChannels}>;
 var<workgroup> norm_pae: array<f32, ${pairChannels}>;
 var<workgroup> distance: array<f32, ${NUM_BINS}>;
 var<workgroup> aligned: array<f32, ${NUM_BINS}>;
-var<workgroup> reduce_a: array<f32, 64>;
-var<workgroup> reduce_b: array<f32, 64>;
+var<workgroup> reduce_v4: array<vec4<f32>, 64>;
 
-/** The same, over a row already staged in workgroup memory. */
-fn row_statistics_of(values: ptr<workgroup, array<f32, ${pairChannels}>>,
-                     local: u32) -> vec2<f32> {
-  var total = 0.0;
-  var squares = 0.0;
-  for (var c = local; c < C_Z; c += 64u) {
-    let value = (*values)[c];
-    total += value;
-    squares += value * value;
-  }
-  reduce_a[local] = total;
-  reduce_b[local] = squares;
+/** Mean and inverse std of two rows simultaneously in a single 6-stage tree reduction. */
+fn reduce_two_stats(v: vec4<f32>, local: u32) -> vec4<f32> {
+  reduce_v4[local] = v;
   workgroupBarrier();
-  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
+  if (local < 32u) { reduce_v4[local] += reduce_v4[local + 32u]; }
   workgroupBarrier();
-  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
+  if (local < 16u) { reduce_v4[local] += reduce_v4[local + 16u]; }
   workgroupBarrier();
-  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
+  if (local < 8u) { reduce_v4[local] += reduce_v4[local + 8u]; }
   workgroupBarrier();
-  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
+  if (local < 4u) { reduce_v4[local] += reduce_v4[local + 4u]; }
   workgroupBarrier();
-  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
+  if (local < 2u) { reduce_v4[local] += reduce_v4[local + 2u]; }
   workgroupBarrier();
-  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
+  if (local < 1u) { reduce_v4[local] += reduce_v4[local + 1u]; }
   workgroupBarrier();
-  let mean = reduce_a[0] / f32(C_Z);
-  let variance = reduce_b[0] / f32(C_Z) - mean * mean;
-  workgroupBarrier();
-  return vec2<f32>(mean, inverseSqrt(variance + EPSILON));
-}
-
-/** Mean and inverse standard deviation of one pair row, cooperatively. */
-fn row_statistics(base: u32, local: u32) -> vec2<f32> {
-  var total = 0.0;
-  var squares = 0.0;
-  for (var c = local; c < C_Z; c += 64u) {
-    let value = pair[base + c];
-    total += value;
-    squares += value * value;
-  }
-  reduce_a[local] = total;
-  reduce_b[local] = squares;
-  workgroupBarrier();
-  if (local < 32u) { reduce_a[local] += reduce_a[local + 32u]; reduce_b[local] += reduce_b[local + 32u]; }
-  workgroupBarrier();
-  if (local < 16u) { reduce_a[local] += reduce_a[local + 16u]; reduce_b[local] += reduce_b[local + 16u]; }
-  workgroupBarrier();
-  if (local < 8u) { reduce_a[local] += reduce_a[local + 8u]; reduce_b[local] += reduce_b[local + 8u]; }
-  workgroupBarrier();
-  if (local < 4u) { reduce_a[local] += reduce_a[local + 4u]; reduce_b[local] += reduce_b[local + 4u]; }
-  workgroupBarrier();
-  if (local < 2u) { reduce_a[local] += reduce_a[local + 2u]; reduce_b[local] += reduce_b[local + 2u]; }
-  workgroupBarrier();
-  if (local < 1u) { reduce_a[local] += reduce_a[local + 1u]; reduce_b[local] += reduce_b[local + 1u]; }
-  workgroupBarrier();
-  let mean = reduce_a[0] / f32(C_Z);
-  let variance = reduce_b[0] / f32(C_Z) - mean * mean;
-  // 🔴 A BARRIER BEFORE THE CALLER REUSES THE REDUCTION BUFFER, for the reason
-  // singleHeads gives: every lane has just read slot 0, and a fast one writing
-  // it again while a slow one still reads gives a wrong mean in some rows some
-  // of the time.
-  workgroupBarrier();
-  return vec2<f32>(mean, inverseSqrt(variance + EPSILON));
+  let s = reduce_v4[0];
+  let mean1 = s.x / f32(C_Z);
+  let var1 = s.y / f32(C_Z) - mean1 * mean1;
+  let mean2 = s.z / f32(C_Z);
+  let var2 = s.w / f32(C_Z) - mean2 * mean2;
+  return vec4<f32>(mean1, inverseSqrt(var1 + EPSILON), mean2, inverseSqrt(var2 + EPSILON));
 }
 
 @compute @workgroup_size(64)
@@ -801,16 +846,32 @@ ${preSymmetrised ? `  // 🔴 SYMMETRISED BEFORE THE HEAD, NOT AFTER IT. proteni
     norm_pae[c] = pair[row * C_Z + c];
   }
   workgroupBarrier();
-${headNorm ? `  let sym = row_statistics_of(&norm_row, local);
-  let own = row_statistics(row * C_Z, local);
+${headNorm ? `  var sym_tot = 0.0; var sym_sq = 0.0;
+  var own_tot = 0.0; var own_sq = 0.0;
   for (var c = local; c < C_Z; c += 64u) {
-    norm_row[c] = (norm_row[c] - sym.x) * sym.y * weights[W_LN_SCALE + c]
+    let vs = norm_row[c];
+    let vr = norm_pae[c];
+    sym_tot += vs; sym_sq += vs * vs;
+    own_tot += vr; own_sq += vr * vr;
+  }
+  let both = reduce_two_stats(vec4<f32>(sym_tot, sym_sq, own_tot, own_sq), local);
+  for (var c = local; c < C_Z; c += 64u) {
+    norm_row[c] = (norm_row[c] - both.x) * both.y * weights[W_LN_SCALE + c]
       + weights[W_LN_OFFSET + c];
-    norm_pae[c] = (pair[row * C_Z + c] - own.x) * own.y * weights[W_PAE_SCALE + c]
+    norm_pae[c] = (norm_pae[c] - both.z) * both.w * weights[W_PAE_SCALE + c]
       + weights[W_PAE_OFFSET + c];
   }
-  workgroupBarrier();` : ""}` : `  ${headNorm ? `let own = row_statistics(row * C_Z, local);
-  let other = row_statistics(transposed * C_Z, local);` : ""}
+  workgroupBarrier();` : ""}` : `  ${headNorm ? `var own_tot = 0.0; var own_sq = 0.0;
+  var oth_tot = 0.0; var oth_sq = 0.0;
+  for (var c = local; c < C_Z; c += 64u) {
+    let vo = pair[row * C_Z + c];
+    let vt = pair[transposed * C_Z + c];
+    own_tot += vo; own_sq += vo * vo;
+    oth_tot += vt; oth_sq += vt * vt;
+  }
+  let both = reduce_two_stats(vec4<f32>(own_tot, own_sq, oth_tot, oth_sq), local);
+  let own = both.xy;
+  let other = both.zw;` : ""}
   for (var c = local; c < C_Z; c += 64u) {
 ${headNorm ? `    let centred = (pair[row * C_Z + c] - own.x) * own.y;
     norm_row[c] = centred * weights[W_LN_SCALE + c] + weights[W_LN_OFFSET + c];
@@ -981,7 +1042,23 @@ ${headNorm ? `    let centered = (single[base + c] - mean) * inverse_std;
   // 🔴 ONE DISTRIBUTION PER ATOM SLOT. The projection is (C_S, DENSE, BINS):
   // parallelise across all DENSE * PLDDT_BINS outputs first so all 64 lanes
   // participate and read weights coalesced, then reduce each slot's 50 bins.
-  for (var sb = local; sb < DENSE * PLDDT_BINS; sb += 64u) {
+  var sb = local;
+  for (; sb + 192u < DENSE * PLDDT_BINS; sb += 256u) {
+    var l0 = 0.0; var l1 = 0.0; var l2 = 0.0; var l3 = 0.0;
+    for (var c = 0u; c < C_S; c += 1u) {
+      let pn = plddt_norm[c];
+      let w_base = W_PLDDT + c * DENSE * PLDDT_BINS + sb;
+      l0 += pn * weights[w_base];
+      l1 += pn * weights[w_base + 64u];
+      l2 += pn * weights[w_base + 128u];
+      l3 += pn * weights[w_base + 192u];
+    }
+    plddt_logits[sb] = l0;
+    plddt_logits[sb + 64u] = l1;
+    plddt_logits[sb + 128u] = l2;
+    plddt_logits[sb + 192u] = l3;
+  }
+  for (; sb < DENSE * PLDDT_BINS; sb += 64u) {
     var logit = 0.0;
     for (var c = 0u; c < C_S; c += 1u) {
       logit += plddt_norm[c] * weights[W_PLDDT + c * DENSE * PLDDT_BINS + sb];
@@ -1182,7 +1259,9 @@ export class Af3ConfidenceHeadGpu {
       const targetFeat = keep(this.allocator.upload("af3-conf.target", input.targetFeat, storage));
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));
       const maskBuffer = keep(this.allocator.upload("af3-conf.mask", pairMask, storage));
-      const embedWeights = keep(this.allocator.upload("af3-conf.embed-w", embedPacked.data, storage));
+      const embedWeights = { buffer: residentWeightBuffer(
+        this.device, reembedding ? weights.reembed : weights, "af3-conf.embed-w",
+        () => embedPacked.data) };
       const readback = !representations ? undefined : keep(this.allocator.allocate(
         "af3-conf.rb-pair", pairs * pairChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
@@ -1292,7 +1371,8 @@ export class Af3ConfidenceHeadGpu {
                     Float32Array.of(...absent.left, ...absent.right), storage))] : [])].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
-      const projectGroups = Math.ceil((tokens * pairChannels) / 64);
+      const projectGroups = pairChannels % 64 === 0 && targetFeatWidth <= 1024
+        ? tokens : Math.ceil((tokens * pairChannels) / 64);
       project.dispatchWorkgroups(
         Math.min(projectGroups, GRID_WIDTH), Math.ceil(projectGroups / GRID_WIDTH));
       if (!batchPasses) project.end();
@@ -1303,8 +1383,7 @@ export class Af3ConfidenceHeadGpu {
         entries: [left, pseudoBeta, maskBuffer, embedWeights, pair, right].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
-      const groups = Math.ceil(pairs / 64);
-      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       if (!batchPasses) pass.end();
       endPass();
       if (representations) {
@@ -1343,7 +1422,7 @@ export class Af3ConfidenceHeadGpu {
         { ...options, pairBuffer: stackPair.buffer, singleBuffer: stackSingle.buffer,
           deferReadback: true, validation });
       const out = await this.#heads(stackPair, stackSingle, pairMask, input, weights,
-                                    headPacked, compiled, representations);
+                                    headPacked, compiled, representations, validation);
       // Everything above was submitted ahead of the heads' readback, which has
       // completed, so these resolve without waiting.
       await validation.settle();
@@ -1356,7 +1435,7 @@ export class Af3ConfidenceHeadGpu {
   }
 
   async #heads(pairAllocation, singleAllocation, pairMask, input, weights, headPacked, compiled,
-                representations) {
+                representations, validation) {
     const { tokens, dense } = input;
     const pairs = tokens * tokens;
     const storage = GPUBufferUsage.STORAGE;
@@ -1367,7 +1446,8 @@ export class Af3ConfidenceHeadGpu {
       const pair = pairAllocation;
       const single = singleAllocation;
       const maskBuffer = keep(this.allocator.upload("af3-conf.h-mask", pairMask, storage));
-      const weightBuffer = keep(this.allocator.upload("af3-conf.h-w", headPacked.data, storage));
+      const weightBuffer = { buffer: residentWeightBuffer(
+        this.device, weights, "af3-conf.h-w", () => headPacked.data) };
       const pde = keep(this.allocator.allocate("af3-conf.pde", pairs * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const pae = keep(this.allocator.allocate("af3-conf.pae", pairs * 4,
@@ -1378,19 +1458,26 @@ export class Af3ConfidenceHeadGpu {
         storage | GPUBufferUsage.COPY_SRC));
       const resolved = keep(this.allocator.allocate("af3-conf.resolved", tokens * dense * 2 * 4,
         storage | GPUBufferUsage.COPY_SRC));
-      const readbacks = {};
-      for (const [name, source, bytes] of [["pde", pde, pairs * 4], ["pae", pae, pairs * 4],
+      const slices = [
+        ["pde", pde, pairs * 4],
+        ["pae", pae, pairs * 4],
         ["tmAdjusted", tmAdjusted, pairs * 4],
         ["plddt", plddt, tokens * dense * 4],
         ["resolved", resolved, tokens * dense * 2 * 4],
         // ...and the stack's own output, only for the checker that compares it.
         ...(representations ? [["pair", pair, pairs * weights.pairChannels * 4],
-                               ["single", single, tokens * weights.singleChannels * 4]] : [])]) {
-        readbacks[name] = { allocation: keep(this.allocator.allocate(`af3-conf.rb-${name}`, bytes,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)), source, bytes };
-      }
+                               ["single", single, tokens * weights.singleChannels * 4]] : []),
+      ];
+      let totalBytes = 0;
+      const layout = slices.map(([name, source, bytes]) => {
+        const offset = totalBytes;
+        totalBytes += bytes;
+        return { name, source, offset, bytes };
+      });
+      const readback = keep(this.allocator.allocate("af3-conf.rb-heads", totalBytes,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
-      this.device.pushErrorScope("validation");
+      validation.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-confidence-heads" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
@@ -1437,20 +1524,19 @@ export class Af3ConfidenceHeadGpu {
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
       endPass();
-      for (const { allocation, source, bytes } of Object.values(readbacks)) {
-        encoder.copyBufferToBuffer(source.buffer, 0, allocation.buffer, 0, bytes);
+      for (const { source, offset, bytes } of layout) {
+        encoder.copyBufferToBuffer(source.buffer, 0, readback.buffer, offset, bytes);
       }
       this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
-      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      validation.end("confidence heads");
 
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const mapped = new Float32Array(readback.buffer.getMappedRange());
       const output = {};
-      const entries = Object.entries(readbacks);
-      await Promise.all(entries.map(([, { allocation }]) => allocation.buffer.mapAsync(GPUMapMode.READ)));
-      for (const [name, { allocation }] of entries) {
-        output[name] = new Float32Array(allocation.buffer.getMappedRange().slice(0));
-        allocation.buffer.unmap();
+      for (const { name, offset, bytes } of layout) {
+        output[name] = mapped.slice(offset / 4, (offset + bytes) / 4);
       }
+      readback.buffer.unmap();
       return output;
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
