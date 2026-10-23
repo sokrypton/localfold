@@ -275,7 +275,8 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
     snScaledH = K == 1 ? (half*)(void*)d.snScaled : scratch<half>("dn.snsH", (size_t)(n + 2) * KT * Ct);
     snStep = snScaledH + (size_t)n * KT * Ct;
     snRaw = snScaledH + (size_t)(n + 1) * KT * Ct;
-    run("ef2_scale_copies", grid1d((KT + 7) / 8, 1), 256,
+    size_t sgs = KT <= 256 ? 2 : 8;
+    run("ef2_scale_copies", grid1d((KT + sgs - 1) / sgs, 1), (int)(sgs * 32),
         ScaleCopiesArgs{single, d.scales, nullptr, snScaledH, (uint)KT, (uint)Ct, (uint)n, 1, F("diffusion/stepNorm/offset")});
   } else {
     float* sn = scratch<float>("dn.sn0", KT * Ct);
@@ -325,8 +326,8 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
 // adaLN into half: sigmoid(gate + gateBias) * LN(a) + shift, the projections from G (optionally folding a preceding gated residual into a)
 static void adaLN(const Denoiser& d, const float* G, float* a, half* out, int e, const std::string& B,
                   const float* resY = nullptr, const float* resGate = nullptr) {
-  int T = d.T, C = d.Ct, ld = d.entries * C;
-  run("ef2_ada_ln", grid1d((size_t)(T + 7) / 8, 1), 256,
+  int T = d.T, C = d.Ct, ld = d.entries * C, sgs = T <= 256 ? 2 : 8;
+  run("ef2_ada_ln", grid1d((size_t)(T + sgs - 1) / sgs, 1), sgs * 32,
       AdaCombineArgs{a, G + (size_t)e * C, F(B + "gateBias"), G + (size_t)(e + 1) * C, out, resY, resGate, (uint)T, (uint)C, (uint)ld, 0});
 }
 static void tokenBlock(const Denoiser& d, const float* G, float* a, int b, const float*& pendingY, const float*& pendingGate) {

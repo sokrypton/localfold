@@ -71,6 +71,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${model}u; c += ${LANES}u) {
     let v = state[base + c];
+    row_values[c] = v;
     total += v;
     square += v * v;
   }
@@ -88,7 +89,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let variance = max(squares[0] / ${model}.0 - mean * mean, 0.0);
   let inverse = inverseSqrt(variance + ${epsilon});
   for (var c = local.x; c < ${model}u; c += ${LANES}u) {
-    row_values[c] = (state[base + c] - mean) * inverse * scale[c] + offset[c];
+    row_values[c] = (row_values[c] - mean) * inverse * scale[c] + offset[c];
   }
   workgroupBarrier();
 

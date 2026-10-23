@@ -179,11 +179,11 @@ kernel void lf_gather(constant GatherArgs& a [[buffer(0)]], uint3 tg [[threadgro
   }
 }
 
-// ---------------------------------------------------------------- LayerNorm: a simdgroup a row, eight rows a threadgroup
+// ---------------------------------------------------------------- LayerNorm: a simdgroup a row
 kernel void lf_layernorm(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                          uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+                         uint sgs [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * sgs + sg;
   if (row >= a.rows) return;
   const int C = a.C;
   device const float* x = a.x ? a.x + row * a.ldx : nullptr;
@@ -213,8 +213,8 @@ kernel void lf_layernorm(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[thr
 template <int MAXV>
 kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                           uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-  ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+                          uint sgs [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = (ulong)(tg.y * ng.x + tg.x) * sgs + sg;
   if (row >= a.rows) return;
   const int C4 = a.C / 4;
   float4 r[MAXV];
@@ -263,7 +263,7 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   }
 }
 
-#define LF_LN4(V) template [[host_name("lf_layernorm4_" #V)]] kernel void lf_layernorm4<V>(constant LayerNormArgs&, uint3, uint3, uint, uint);
+#define LF_LN4(V) template [[host_name("lf_layernorm4_" #V)]] kernel void lf_layernorm4<V>(constant LayerNormArgs&, uint3, uint3, uint, uint, uint);
 LF_LN4(1) LF_LN4(2) LF_LN4(3) LF_LN4(4) LF_LN4(6) LF_LN4(8) LF_LN4(9) LF_LN4(12)
 
 // ---------------------------------------------------------------- conversions and elementwise (four a thread)

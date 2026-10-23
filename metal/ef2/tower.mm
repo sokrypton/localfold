@@ -78,25 +78,44 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
       for (size_t i = 0; i < mix.size(); ++i) { mix[i] = expf(cmb[i] - mx); s += mix[i]; }
       for (auto& m : mix) m /= s; }
     float* acc = scratch<float>("shim.acc", R * P);
-    half* xn = scratch<half>("shim.xn", R * C);
     half* attnXn = scratch<half>("esmc.xn", R * C);
-    // each hidden state's LayerNorm and projection, added into the mix by the GEMM itself (alpha mix_k, beta 1)
-    auto mixIn = [&](int k, const float* state) {
-      layerNorm(state, xn, R, C, M.f(shim("norm/scale")), M.f(shim("norm/offset")));
-      lin(xn, shim("projection/weights"), acc, R, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
-    };
     float* x = scratch<float>("esmc.x", R * C);
     run1d("ef2_embed", R * C, EmbedArgs{ids, M.f("c/embed/weights"), x, (uint)R, (uint)C});
-    for (int l = 0; l < e.layers; ++l) {
-      std::string B = "c/blocks/" + std::to_string(l) + "/";
-      layerNormDual(x, xn, M.f(shim("norm/scale")), M.f(shim("norm/offset")),
-                    attnXn, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"), R, C);
-      lin(xn, shim("projection/weights"), acc, R, C, P, l ? 1.f : 0.f, nullptr, mix[l]);
-      esmcBlock(e, x, attnXn, seq, l);
+    if (C <= 1152 && (C & 3) == 0) {
+      float* mixXn = scratch<float>("shim.mixXn", R * C);
+      const float* ss = M.f(shim("norm/scale"));
+      const float* so = M.f(shim("norm/offset"));
+      size_t sgs = R <= 256 ? 2 : 8;
+      Grid gRows = grid1d((R + sgs - 1) / sgs, 1);
+      for (int l = 0; l < e.layers; ++l) {
+        std::string B = "c/blocks/" + std::to_string(l) + "/";
+        run("ef2_shim_norm_acc", gRows, (int)(sgs * 32),
+            ShimNormAccArgs{x, ss, so, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"), nullptr,
+                            mixXn, attnXn, (uint)R, (uint)C, l == 0 ? 1u : 0u, mix[l]});
+        esmcBlock(e, x, attnXn, seq, l);
+      }
+      run("ef2_shim_norm_acc", gRows, (int)(sgs * 32),
+          ShimNormAccArgs{x, ss, so, nullptr, nullptr, M.f("c/final_norm/scale"),
+                          mixXn, attnXn, (uint)R, (uint)C, 0u, mix[e.layers]});
+      lin(attnXn, shim("projection/weights"), acc, R, C, P);
+    } else {
+      half* xn = scratch<half>("shim.xn", R * C);
+      // each hidden state's LayerNorm and projection, added into the mix by the GEMM itself (alpha mix_k, beta 1)
+      auto mixIn = [&](int k, const float* state) {
+        layerNorm(state, xn, R, C, M.f(shim("norm/scale")), M.f(shim("norm/offset")));
+        lin(xn, shim("projection/weights"), acc, R, C, P, k ? 1.f : 0.f, nullptr, mix[k]);
+      };
+      for (int l = 0; l < e.layers; ++l) {
+        std::string B = "c/blocks/" + std::to_string(l) + "/";
+        layerNormDual(x, xn, M.f(shim("norm/scale")), M.f(shim("norm/offset")),
+                      attnXn, M.f(B + "attn_norm/scale"), M.f(B + "attn_norm/offset"), R, C);
+        lin(xn, shim("projection/weights"), acc, R, C, P, l ? 1.f : 0.f, nullptr, mix[l]);
+        esmcBlock(e, x, attnXn, seq, l);
+      }
+      float* last = scratch<float>("esmc.last", R * C);
+      layerNorm(x, last, R, C, M.f("c/final_norm/scale"), nullptr);
+      mixIn(e.layers, last);
     }
-    float* last = scratch<float>("esmc.last", R * C);
-    layerNorm(x, last, R, C, M.f("c/final_norm/scale"), nullptr);
-    mixIn(e.layers, last);
     lin(acc, shim("downproject/weights"), single, R, P, P, 0.f, M.f(shim("downproject/bias")));
   }
   // a non-protein token's state is zero: LN(0) is the offset, the mix sums to one

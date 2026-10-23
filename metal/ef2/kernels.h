@@ -13,6 +13,10 @@ struct StackColsArgs { CP(half) a; CP(half) b; CP(half) c; DP(half) out; uint ro
 struct EmbedArgs { CP(int) ids; CP(float) table; DP(float) x; uint rows, C; };
 struct RopeArgs { DP(float) x; DP(float) y; uint rows, heads, ld, pad; };
 struct QkNormRopeArgs { CP(float) qkv; CP(float) qScale; CP(float) kScale; DP(float) q; DP(float) k; uint rows, C; };
+struct ShimNormAccArgs {
+  CP(float) x; CP(float) shimScale; CP(float) shimOffset; CP(float) attnScale; CP(float) attnOffset; CP(float) finalScale;
+  DP(float) mixXn; DP(half) attnXn; uint rows, C, first; float weight;
+};
 struct SoftmaxSeqArgs { DP(float) S; CP(int) seq; uint rows, total; float scale; uint pad; };
 struct EsmcAttendArgs { CP(float) q; CP(float) k; CP(float) v; CP(int) seq; DP(half) ctx; uint rows, C, ldv, pad; };
 struct ScatterRowsArgs { CP(float) rows; CP(int) tokenToRow; CP(float) zero; DP(float) out; uint T, C; };

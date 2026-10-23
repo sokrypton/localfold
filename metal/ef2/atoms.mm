@@ -89,12 +89,12 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
       G.rows = A; G.in = C; G.out = 4 * C; G.label = "atom qkvg";
       gemm(G);
     }
-    run("ef2_qkv_prepare", rowsOf8(A * a.heads), 256,
+    run("ef2_qkv_prepare", rowsOf8(C == 128 && a.heads == 4 ? A : A * a.heads), 256,
         QkvPrepArgs{qkvg, a.cosT, a.sinT, (uint)A, (uint)C, (uint)a.heads, ATOM_BF16 ? 1u : 0u, (uint)(4 * C), 0});
     half* ctxh = a.ctxh ? a.ctxh : scratch<half>("atom.ctxh", A * C);
     if (!a.ctxh && a.nValid < (int)A) fill(ctxh, 0, A * C * sizeof(half));
     if (a.nValid)
-      run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 64,
+      run("ef2_swa", Grid{(uint32_t)((a.nValid + 31) / 32), (uint32_t)a.heads, 1}, 128,
           SwaArgs{qkvg, a.valid, nullptr, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f), (uint)(4 * C), 0,
                   ctxh});
     const float* resD = nullptr;
@@ -125,10 +125,10 @@ static void swaBlock(const AtomCtx& a, float* x, const float* sc, const half* sc
   float* xm = scratch<float>("atom.xm", A * C);
   run("ef2_rms_modulate", rowsOf8(A), 256, RmsModArgs{x, mod, xm, nullptr, nullptr, (uint)A, (uint)C, 0, 1, 0, 0});
   lin(xm, B + "qkv", qkv, A, C, 3 * C);
-  run("ef2_qkv_prepare", rowsOf8(A * a.heads), 256,
+  run("ef2_qkv_prepare", rowsOf8(C == 128 && a.heads == 4 ? A : A * a.heads), 256,
       QkvPrepArgs{qkv, a.cosT, a.sinT, (uint)A, (uint)C, (uint)a.heads, ATOM_BF16 ? 1u : 0u, (uint)(3 * C), 0});
   if (a.nValid)
-    run("ef2_swa", Grid{(uint32_t)((a.nValid + 15) / 16), (uint32_t)a.heads, 1}, 64,
+    run("ef2_swa", Grid{(uint32_t)((a.nValid + 31) / 32), (uint32_t)a.heads, 1}, 128,
         SwaArgs{qkv, a.valid, ctx, (uint)a.nValid, (uint)C, (uint)std::min(halfWindow, (int)A), 1.f / sqrtf(32.f), (uint)(3 * C), 0, nullptr});
   lin(xm, B + "attnGate", gate, A, C, C);
   run1d("ef2_gate_live", (A * C) >> 2, GateLiveArgs{ctx, gate, a.mask, nullptr, (uint)A, (uint)C, (uint)C, 0});

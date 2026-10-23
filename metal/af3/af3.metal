@@ -439,8 +439,9 @@ kernel void af3_sigmoid_atom(LF_ARGS(SigmoidAtomArgs)) {
 }
 // a simdgroup a row, eight a threadgroup; two-pass variance
 kernel void af3_ada_ln_128(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
-                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint3 tpg [[threads_per_threadgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * (tpg.x >> 5) + sg;
   if (row >= a.rows) return;
   device float4* x4 = (device float4*)(a.x + row * 128);
   uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
@@ -477,8 +478,9 @@ kernel void af3_ada_ln_128(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
   }
 }
 kernel void af3_ada_ln_768(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
-                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint3 tpg [[threads_per_threadgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * (tpg.x >> 5) + sg;
   if (row >= a.rows) return;
   device float4* x4 = (device float4*)(a.x + row * 768);
   uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
@@ -519,8 +521,9 @@ kernel void af3_ada_ln_768(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threa
   }
 }
 kernel void af3_ada_ln(constant AdaLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
-                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                       uint3 tpg [[threads_per_threadgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * (tpg.x >> 5) + sg;
   if (row >= a.rows) return;
   device float* x = a.x + row * a.C;
   uint r32 = (uint)row, prRow = r32 < a.period ? r32 : r32 - lf_udiv(r32, a.period) * a.period;
@@ -1093,50 +1096,51 @@ template <int D>
 kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int Q = 32, K = 128, LD = D, DF = D / 8, KF = K / 8, D8 = D / 8;
-  threadgroup half Ks[K * LD];
-  threadgroup half Vs[K * LD];
+  constexpr int Q = 32, K = 128, LD = D + 8, DF = D / 8, KF = K / 8, D8 = D / 8;
+  threadgroup half KV[K * LD];
   const uint s = tg.x, h = tg.y, ks = lf_udiv(s, a.subsets), ss = s - ks * a.subsets, Wd = a.heads * D, W2 = 2 * Wd;
   const float qs = rsqrt((float)D) * M_LOG2E_F;
-  _Pragma("clang loop unroll(full)")
-  for (uint e = tid; e < Q * D8; e += 128) {
-    uint qi = e / D8, d = (e - qi * D8) * 8;
+  if (D == 32 || tid < Q * D8) {
+    uint qi = tid / D8, d = (tid - qi * D8) * 8;
     device const half* src = a.qg + ((ulong)s * Q + qi) * W2 + h * D + d;
     float4 f0 = float4(*(device const half4*)src) + *(device const float4*)(a.qBias + h * D + d);
     float4 f1 = float4(*(device const half4*)(src + 4)) + *(device const float4*)(a.qBias + h * D + d + 4);
-    *(threadgroup half4*)(Ks + qi * LD + d) = half4(f0 * qs);
-    *(threadgroup half4*)(Ks + qi * LD + d + 4) = half4(f1 * qs);
+    *(threadgroup half4*)(KV + qi * LD + d) = half4(f0 * qs);
+    *(threadgroup half4*)(KV + qi * LD + d + 4) = half4(f1 * qs);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   simdgroup_half8x8 qf[DF];
-  _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], Ks + (sg * 8) * LD + dk * 8, LD);
+  _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[dk], KV + (sg * 8) * LD + dk * 8, LD);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong srcBase = (ulong)ks * a.subsets * Q;
   const bool fullK = a.keys == K;
+  uint4 vReg[D8];
   if (a.q2kIdx) {
     _Pragma("clang loop unroll(full)")
-    for (uint e = tid; e < K * D8; e += 128) {
+    for (uint s_step = 0; s_step < D8; ++s_step) {
+      uint e = tid + s_step * 128;
       uint kj = e / D8, d = (e - kj * D8) * 8, g = ss * a.keys + kj;
       if ((fullK || kj < a.keys) && a.q2kMask[g] != 0.f) {
         device const half* src = a.kv + (srcBase + (uint)a.q2kIdx[g]) * W2 + h * D + d;
-        *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
-        *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
+        *(threadgroup uint4*)(KV + kj * LD + d) = *(device const uint4*)src;
+        vReg[s_step] = *(device const uint4*)(src + Wd);
       } else {
-        *(threadgroup uint4*)(Ks + kj * LD + d) = uint4(0);
-        *(threadgroup uint4*)(Vs + kj * LD + d) = uint4(0);
+        *(threadgroup uint4*)(KV + kj * LD + d) = uint4(0);
+        vReg[s_step] = uint4(0);
       }
     }
   } else {
     _Pragma("clang loop unroll(full)")
-    for (uint e = tid; e < K * D8; e += 128) {
+    for (uint s_step = 0; s_step < D8; ++s_step) {
+      uint e = tid + s_step * 128;
       uint kj = e / D8, d = (e - kj * D8) * 8;
       if (fullK || kj < a.keys) {
         device const half* src = a.kv + ((ulong)s * a.keys + kj) * W2 + h * D + d;
-        *(threadgroup uint4*)(Ks + kj * LD + d) = *(device const uint4*)src;
-        *(threadgroup uint4*)(Vs + kj * LD + d) = *(device const uint4*)(src + Wd);
+        *(threadgroup uint4*)(KV + kj * LD + d) = *(device const uint4*)src;
+        vReg[s_step] = *(device const uint4*)(src + Wd);
       } else {
-        *(threadgroup uint4*)(Ks + kj * LD + d) = uint4(0);
-        *(threadgroup uint4*)(Vs + kj * LD + d) = uint4(0);
+        *(threadgroup uint4*)(KV + kj * LD + d) = uint4(0);
+        vReg[s_step] = uint4(0);
       }
     }
   }
@@ -1146,9 +1150,16 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j)
     _Pragma("clang loop unroll(full)") for (int dk = 0; dk < DF; ++dk) {
       simdgroup_half8x8 kt;
-      simdgroup_load(kt, Ks + (j * 8) * LD + dk * 8, LD, ulong2(0, 0), true);
+      simdgroup_load(kt, KV + (j * 8) * LD + dk * 8, LD, ulong2(0, 0), true);
       simdgroup_multiply_accumulate(sc[j], qf[dk], kt, sc[j]);
     }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  _Pragma("clang loop unroll(full)")
+  for (uint s_step = 0; s_step < D8; ++s_step) {
+    uint e = tid + s_step * 128;
+    uint kj = e / D8, d = (e - kj * D8) * 8;
+    *(threadgroup uint4*)(KV + kj * LD + d) = vReg[s_step];
+  }
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
   const uint q = sg * 8 + sm;
   const float qm = a.qMask[(ulong)ss * Q + q];
@@ -1193,12 +1204,13 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   }
   sum += simd_shuffle_xor(sum, (ushort)1);
   sum += simd_shuffle_xor(sum, (ushort)8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   simdgroup_float8x8 o[DF];
   _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) o[c] = simdgroup_float8x8(0);
   _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j)
     _Pragma("clang loop unroll(full)") for (int c = 0; c < DF; ++c) {
       simdgroup_half8x8 vf;
-      simdgroup_load(vf, Vs + (j * 8) * LD + c * 8, LD);
+      simdgroup_load(vf, KV + (j * 8) * LD + c * 8, LD);
       simdgroup_multiply_accumulate(o[c], p[j], vf, o[c]);
     }
   const ulong qrow = (ulong)s * Q + q;
