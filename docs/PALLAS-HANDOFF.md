@@ -197,7 +197,7 @@ Upstream PRs:
 | engine | 68 | 261 | 522 | 1,044 | 261 + MSA | `r261msa` CA RMSD |
 |---|---:|---:|---:|---:|---:|---:|
 | ColabFold + `colabfold-kernels` 0.8.0 (`~/.venv-colabfold-k08`) | 0.160 | 0.432 | 1.408 | 6.660 | 1.564 | 0.121 A |
-| **ColabFold + `colabfold-kernels` (`~/.venv-cfk-dev`, PRs #5 & #12)** | **0.088** | **0.324** | **1.160** | **5.616** | **1.192** | **0.122 A** |
+| **ColabFold + `colabfold-kernels` (`~/.venv-cfk-dev`, PRs #5 & #12)** | **0.088** | **0.324** | **1.160** | **5.616** | **1.172** | **0.122 A** |
 | LocalFold CUDA baseline (`973308d3`) | 0.065 - 0.089 | 0.316 | 1.145 | 5.590 | 1.103 | 0.000 A |
 | **LocalFold CUDA + single-seq `outLn256<..., VG=true>`** | **0.065** | **0.313** | **1.126** | **5.506** | **1.097** | **0.000 A** |
 
@@ -214,6 +214,7 @@ Upstream PRs:
    - Single-sequence (`s == 1`) fast path in `Attention.packed` (`modules.py`): skips `packed_attention` in `MSAColumnAttention` when `N_seq == 1` (`r68: 160 -> 112 ms`).
    - Hoisted `OuterProductMean` mask `norm` out of `extra_msa_stack` and `evoformer_stack` (`modules.py`) and removed the redundant `norm = utils.wide_einsum('abc,adc->bdc', mask, mask)` recomputation inside `OuterProductMean.__call__` (saves 208 `[S, L, 1] x [S, L, 1] -> [L, L, 1]` contractions per fold, `-96 ms` on `r261msa`).
    - Wired `fused_ops.global_attention` into `GlobalAttention` & `MSAColumnGlobalAttention` and fused `output_projection` + next-module `LayerNorm` across `MSARowAttentionWithPairBias -> MSAColumnAttention -> Transition` in `EvoformerIteration` (`modules.py`).
+   - Fused `Transition` `transition1` bias + ReLU epilogue on large 256-channel MSA tensors (`act.shape[0] * act.shape[1] > 16_384`) via `jax.lax.cond` (`modules.py`): works around XLA `GemmFusion`'s refusal to fuse `broadcast(dynamic-slice(b1))` inside `hk.scan`, eliminating the standalone `loop_maximum_fusion` kernel over the `[S*L, 1024]` intermediate (`-20 ms` on `r261msa`, `1,192 -> 1,172 ms`).
    - Hoisted `InvariantPointAttention` 2D pair bias and inference-only `MultiRigidSidechain` out of the 8-layer `StructureModule` `hk.scan` (`folding.py`, `r68: 112 -> 88 ms`).
 3. **Pallas -> LocalFold CUDA transfer (`cuda/af2/src/outln.cuh`, `cuda/af2/src/evoformer.cuh`):**
    - Added `VG=true` mode to `outLn256` (`outLn16K` / `outLnK`) for `rowsN == 1 && t.msaOnes` in `msaColumnAttention`, computing `v * sigm(g)` directly from `qkvg` in registers while staging `A` into shared memory and skipping `msaFlash<true>` (192 launches/fold saved; `r68: 89 -> 64.5 ms`, `r261: 316 -> 312.6 ms`, `r522: 1145 -> 1125.9 ms`, `r1044: 5579 -> 5505.5 ms`).
