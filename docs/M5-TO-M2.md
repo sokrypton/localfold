@@ -379,9 +379,22 @@ the page's out-of-memory handling is not what a phone user meets.
   all. The rest - the pairformer's ~5 s and the remaining ~4 s of diffusion - and the moved pLDDT (a different kernel
   ran) come from a knob not yet isolated: `trianglePairProjectTile`, `fusedPairBias` and `vectorGemmBlock` are the ones
   left, singly or as a pair. One run an arm, so differences under ~1 s are noise.
-- **Not done: the Mali prior itself.** Paused when the phone was needed back. The next step is those three AF3 arms,
-  then a `["valhall", {...}]` entry in `webgpu/runtime/device-profile.js` with the three half tiles,
-  `diffusionTokenTile` and whatever the AF3 arms name - and NOT `fusedPairBias`/`vectorGemmBlock` unless AF3 needs
-  them, since both lose on AF2 - checked by folding all three models under it. The sweep is `--prior=metal-3
-  --no-prior=<knob>` through `fold.js`/`fold-af2.js` with `LOCALFOLD_GPU_ANDROID=1`; run the arms from bash, since zsh
-  passes an unquoted `$P` as one argument.
+- **The last three AF3 arms** (the phone back, 2026-10-24, same command): `trianglePairProjectTile` 59.6 s warm,
+  diffusion 51.6 / pairformer **52.8** - the pairformer's gain; `fusedPairBias` 61.3, 51.5 / 55.2 - level;
+  `vectorGemmBlock` 61.5, 51.6 / 55.0, pLDDT **26.9662** - level, and the knob that moved the full preset's pLDDT.
+- **The Mali prior, done: `["valhall", {...}]` in `webgpu/runtime/device-profile.js`** - the three half tiles,
+  `diffusionTokenTile` and `trianglePairProjectTile`, metal-3's values; not `fusedPairBias` or `vectorGemmBlock` (both
+  lose on AF2 and gain nothing on AF3), and `runtimeLoopBounds` left tiered. The phone picks it up by its own
+  architecture. Two rounds with the order swapped, against `--no-prior`, seconds:
+
+  | | valhall | no prior |
+  |---|---|---|
+  | AF2 59 residues, repeats | 3.52-3.57 / 3.50-3.54 | 5.76-5.88 / 5.35 |
+  | ESMFold2, repeats | 3.40-3.44 / 3.40-3.44 | 4.60-4.86 / 3.64-3.72 |
+  | AF3 5CAJ 25 steps, warm fold | 56.9 / 55.7 | 64.7 / 61.3 |
+  | ...its diffusion / pairformer | 44.2, 43.2 / 53.3, 53.2 | 54.6, 51.5 / 55.3, 55.3 |
+
+  1.5x on AF2, 1.10x on AF3, ~1.07x on ESMFold2 (the first no-prior round ran after the valhall one and drifted; the
+  second, run first, is the fair one). Every arm the same answer both ways: AF2 -1318268 then -1305572 (the tiered
+  first fold), AF3 pLDDT 26.9520, CA-CA 3.872. One phone; a different Valhall part (G710, G615) reports the same
+  architecture and is unmeasured.

@@ -1379,6 +1379,29 @@ const PRIORS = new Map([
     // trunk's projection both ways beside the attend (f32 where the race fails), so the M5 takes its f16 and the M2
     // keeps f32. Other f16 devices keep the rule.
   }],
+  // Arm Mali-G715 (a Pixel 9, Chrome 155 on Android), reporting {vendor: "arm", architecture: "valhall"}, measured
+  // 2026-10-24 over USB (LOCALFOLD_GPU_ANDROID=1), the shader cache warm. It took DEFAULT_TUNING, and metal-3's entry
+  // answered for it was AF2 1.4x, AF3 1.13x (the diffusion 1.3x) and ESMFold2 1.05x - so this is the five of metal-3's
+  // knobs that carry that, each kept alone (`--prior=metal-3 --no-prior=<knob>`) and timed against no prior at all:
+  //   AF2, 59 residues, warm repeats (s):  none 5.42-5.64 | linearHalfTile 4.37 | attentionProjectHalfTile 4.79 |
+  //     attentionOutputHalfTile 5.08 | the three together 3.61, where all of metal-3 is 3.90 (fusedPairBias 5.57-5.65
+  //     and vectorGemmBlock 5.55-5.58 LOSE here, and change the checksum; the other knobs are level)
+  //   AF3 int5, 5CAJ (255 tokens), 25 steps, warm fold (s), its diffusion / pairformer stages:
+  //     none 61.4, 51.5 / 55.8 | diffusionTokenTile 59.0, 44.1 / 55.5 | trianglePairProjectTile 59.6, 51.6 / 52.8 |
+  //     all of metal-3 53.7, 40.2 / 50.4 (the three half tiles, atomRowTile, singleTransitionTile, singleProjectRows,
+  //     runtimeLoopBounds and fusedPairBias level; vectorGemmBlock level, and the one that moved pLDDT 26.9520 -> 26.9662)
+  // runtimeLoopBounds stays tiered (the default): it is level warm, and makes only the FIRST AF2 fold differ from its
+  // repeats (-1318268 against -1305572; `--tune=runtimeLoopBounds=false` makes all of them -1305572) - docs/M5-TO-M2.md.
+  ["valhall", {
+    linearHalfTile: "16x16x4x8",
+    attentionOutputHalfTile: "16x16x4x8",
+    attentionProjectHalfTile: "16x16x4x2",
+    diffusionTokenTile: {
+      below: 4, atOrAbove: 8, crossover: 256,
+      qkvgCrossover: 64, wideCrossover: 64, attnOutCrossover: 96, outCrossover: 96,
+    },
+    trianglePairProjectTile: { rows: 64, columns: 32, outColumns: 64, workgroup: 16 },
+  }],
 ], );
 
 // NVIDIA L4 (Ada, "lovelace"), a Colab Pro runtime with 12 vCPUs and the two
