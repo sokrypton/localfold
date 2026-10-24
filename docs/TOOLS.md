@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-412 tools. `tools/fixtures/` is data and is not listed.
+413 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (211)
 
@@ -329,7 +329,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (114)
+## `tools/` - everything else (115)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -381,6 +381,7 @@ go through CDP, and the deploy.
 - **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-rfd4p-manifest.py`** - Does our copy of RFD4-Proteina's tensor manifest still describe the shards being served?
 - **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.
 - **`check-smiles-conformer.mjs`** - Is the conformer this port builds a real molecule? Bonds, angles, rings, hands.
 - **`check-smiles-path.mjs`** - The same ligand from a CCD code and from a SMILES string folds the same way.

@@ -143,13 +143,85 @@ def main():
         if not back["enabled"]:
             bad.append("switching back to Protein Hunter left controls disabled")
 
+        # 🔴 AND A REAL HUNT, END TO END: weights, a fold, an MPNN redesign, a
+        # second fold, and a row per cycle. The smallest one that is still the
+        # whole method - one target chain, a 12-residue binder, one cycle - runs
+        # in about twelve seconds on an M5 off the local bundle.
+        cdp.evaluate(ws, """(() => {
+          for (const k of ['alphafold3','openbind0','opendde','boltz2','protenix2',
+                           'intellifold2','rosettafold3'])
+            localStorage.setItem('localfold.modelTerms.' + k, 'accepted');
+          window.__designEntities.set([{ type: 'protein', copies: 1,
+            value: 'GWSTELEKHREELKEFLKKEGITNVEIRIDN' }]);
+          document.getElementById('binder-length').value = '12';
+          document.getElementById('cycles').value = '1';
+          document.getElementById('runs').value = '1';
+          document.getElementById('hunt').click();
+          return 1;
+        })()""")
+        deadline = time.time() + 300
+        hunted = None
+        while time.time() < deadline:
+            hunted = json.loads(cdp.evaluate(ws, """JSON.stringify({
+              status: document.getElementById('status-message').textContent,
+              failed: document.getElementById('status-message').classList.contains('error'),
+              rows: document.querySelectorAll('#results-body tr').length,
+              best: [...document.querySelectorAll('#results-body tr.best td')].map((c) => c.textContent),
+              cycle0Best: (document.querySelector('#results-body tr')?.className ?? '').includes('best'),
+              button: document.getElementById('hunt').textContent.trim(),
+              progress: document.getElementById('progress').value,
+              track: document.querySelectorAll('#cycle-track > *').length,
+            })"""))
+            if hunted["failed"]:
+                break
+            if hunted["button"] == "Hunt" and hunted["rows"] > 0:
+                break
+            time.sleep(2)
+
+        print(f"  hunt: {hunted['status']}")
+        print(f"        rows={hunted['rows']} track={hunted['track']} progress={hunted['progress']}"
+              f" best={hunted['best']}")
+        # 🔴 A MISSING BUNDLE IS NOT A FAILING PAGE, AND IS NOT A SILENT PASS
+        # EITHER. This box has model-af3-int5; another checkout may not, and the
+        # difference has to be visible in the output rather than inferred.
+        if hunted["failed"] and ("404" in hunted["status"] or "manifest" in hunted["status"]):
+            print("        skipped the hunt: this checkout has no AF3 bundle to fold with")
+        elif hunted["failed"]:
+            bad.append(f"the hunt failed: {hunted['status']}")
+        else:
+            # cycle 0 and cycle 1, so the loop folded, designed, and folded again
+            if hunted["rows"] < 2:
+                bad.append(f"the hunt drew {hunted['rows']} rows, expected cycle 0 and cycle 1")
+            if hunted["track"] < 2:
+                bad.append(f"the sequence track has {hunted['track']} lines, expected one per cycle")
+            if "done" not in hunted["status"]:
+                bad.append(f"the hunt did not finish: {hunted['status']!r}")
+            if hunted["progress"] != 1:
+                bad.append(f"the bar ended at {hunted['progress']}, not 1")
+            if len(hunted["best"]) == 0:
+                bad.append("no cycle was marked best")
+            # 🔴 THE LOOP'S OWN RULE, CHECKED THROUGH THE PAGE: cycle 0 is the
+            # mostly-X draw the run STARTED from, so it must never be the best
+            # row however well it folded - and on a 12-mer of mostly X it folds
+            # deceptively well.
+            if hunted["cycle0Best"]:
+                bad.append("cycle 0 was marked best; it is the starting draw and cannot win")
+
         # Pressing Hunt must explain itself rather than throw or do nothing.
-        cdp.evaluate(ws, "document.getElementById('hunt').click()")
+        # On RFD4 it must say so rather than pretending: the engine is in the
+        # tree, the page is not joined to it.
+        cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById('method');
+          pick.value = 'rfd4p';
+          pick.dispatchEvent(new Event('change'));
+          document.getElementById('hunt').click();
+          return 1;
+        })()""")
         time.sleep(0.3)
-        status = cdp.evaluate(ws, "document.getElementById('status-message').textContent")
-        print(f"  after Hunt: {status}")
-        if "not wired" not in status:
-            bad.append("Hunt did not say the loop is missing")
+        onRfd4p = cdp.evaluate(ws, "document.getElementById('status-message').textContent")
+        print(f"  Hunt on RFD4-Proteina: {onRfd4p}")
+        if "not wired" not in onRfd4p:
+            bad.append(f"Hunt on RFD4 did not say it is unwired: {onRfd4p!r}")
     finally:
         proc.terminate()
         server.terminate()

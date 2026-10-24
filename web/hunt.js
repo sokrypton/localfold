@@ -1,0 +1,185 @@
+/**
+ * hunt.js
+ * -------
+ * AI Context: WHAT MAKES THE DESIGN LOOP REAL ON THIS PAGE
+ *
+ * `webgpu/design/hunter-loop.js` is the method and takes its `fold` and
+ * `design` as arguments, so it tests without a GPU. This module is the half
+ * that supplies them: a real AlphaFold 3 fold and a real MPNN redesign, plus
+ * the progress reporting a minutes-long run needs.
+ *
+ * 🔴 IT IS NOT THE PAGE. No DOM here beyond what the caller passes in: the page
+ * hands over a `report` callback and gets one call per cycle, so the loop, the
+ * wiring and the drawing are three separable things. The retired `web/hunter.js`
+ * was all three at once in 795 lines.
+ *
+ * 🔴 ONE FOLDER FOR NOW. `folders` takes a list because rotating the folder per
+ * cycle is the measured win (docs/DESIGN.md 3C), but only the AF3-lineage path
+ * is wired here; a list longer than one is refused rather than silently
+ * folding everything with the first. Ensembles are step 5.
+ */
+import { getDevice } from "./model.js";
+import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
+import { runDesign } from "../webgpu/design/hunter-loop.js";
+import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
+import { chooseDesigner } from "../cpu/design/designers.js";
+
+/** The folding models this driver can actually run, and what each is in af3-model's terms. */
+export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" };
+
+/**
+ * Run one hunt.
+ *
+ * @param {object} options
+ * @param {string[]} options.chains every chain of the complex; the designed
+ *   one's entry is replaced each cycle and starts empty
+ * @param {number} [options.chainIndex=0] which chain is designed
+ * @param {string[]} [options.folders=["af3"]] which model folds. One, for now.
+ * @param {string} [options.designer="auto"] a key of DESIGNERS, or "auto"
+ * @param {{ligands?: number, nucleic?: number}} [options.contents] what the
+ *   target carries, for the automatic designer
+ * @param {number} [options.runs=1]
+ * @param {number} [options.cycles=5]
+ * @param {number} [options.length=75] the designed chain's length
+ * @param {(record: object) => void} options.report called once per cycle
+ * @param {(text: string) => void} [options.status]
+ * @param {(fraction: number) => void} [options.progress]
+ * @param {AbortSignal} [options.signal]
+ * @returns {Promise<{best: object|null, cycles: object[]}>}
+ */
+export async function hunt(options) {
+  const {
+    chains, chainIndex = 0, folders = ["af3"], designer = "auto", contents = {},
+    runs = 1, cycles = 5, length = 75, report, status = () => {}, progress = () => {},
+    signal,
+  } = options;
+
+  if (typeof report !== "function") throw new TypeError("hunt needs a report callback");
+  if (!Array.isArray(chains) || chains.length === 0) throw new TypeError("hunt needs at least one chain");
+  // 🔴 REFUSED, NOT QUIETLY REDUCED. A caller asking for three folders and
+  // getting one is a caller whose result does not mean what they think.
+  if (folders.length !== 1) {
+    throw new Error(`hunt runs one folding model for now, not ${folders.length}.`
+      + " Rotating them per cycle is step 5 of docs/DESIGN.md.");
+  }
+  const [folder] = folders;
+  if (FOLDERS[folder] === undefined) {
+    throw new Error(`no folder ${folder} (have ${Object.keys(FOLDERS).join(", ")})`);
+  }
+
+  // 🔴 THE SEQUENCE IS CHECKED BEFORE ANY WEIGHTS ARE FETCHED. A hunt is many
+  // folds, and finding out after a 300 MB download that a chain has a letter
+  // the model has no token for is the worst moment to find out.
+  for (const [index, chain] of chains.entries()) {
+    if (index === chainIndex || chain.length === 0) continue;
+    const problem = af3SequenceProblem(chain);
+    if (problem !== null) throw new Error(`chain ${index + 1}: ${problem}`);
+  }
+
+  const chosen = designer === "auto" ? chooseDesigner(contents).name : designer;
+
+  // 🔴 TWO DIFFERENT `onProgress` CONTRACTS, SAME NAME. `foldAf3` calls its one
+  // with a FRACTION; the weight loaders call theirs with an OBJECT
+  // (`{loadedBytes, totalBytes, ...}`, see HttpTensorStore#reportProgress).
+  // Treating the object as a number put NaN into the page's progress element,
+  // which threw where a bar would simply have looked wrong - found by loading
+  // the page, not by reading either signature.
+  const fractionOf = (value) => {
+    if (typeof value === "number") return value;
+    const total = value?.totalBytes || value?.totalTensors || 0;
+    const loaded = value?.loadedBytes ?? value?.loadedTensors ?? 0;
+    return total > 0 ? loaded / total : 0;
+  };
+  // ...and nothing non-finite ever reaches the caller, whatever a loader does.
+  const toBar = (fraction) => {
+    if (Number.isFinite(fraction)) progress(Math.min(1, Math.max(0, fraction)));
+  };
+
+  status("loading the folding model");
+  const device = await getDevice(signal);
+  const weights = await loadAf3Weights(
+    (value) => toBar(0.05 * fractionOf(value)), FOLDERS[folder]);
+
+  status("loading the designer");
+  const { model: mpnn } = await loadDesigner({
+    name: chosen, signal,
+    onProgress: (value) => toBar(0.05 + 0.05 * fractionOf(value)),
+  });
+
+  // The bar spans the WHOLE hunt, so a cycle's own fraction is a fraction of
+  // one cell of it. Weight loading took the first tenth.
+  const total = runs * (cycles + 1);
+  const spanOf = (done, fraction) => 0.1 + 0.9 * ((done + fractionOf(fraction)) / total);
+
+  const all = [];
+  let best = null;
+
+  for (let run = 0; run < runs; run += 1) {
+    const stream = runDesign({
+      chains: chains.slice(), chainIndex, cycles, length, run, signal,
+      temperature: options.temperature,
+      omit: options.omit,
+      percentX: options.percentX,
+      alanineBias: options.alanineBias,
+      seed: (options.seed ?? 0) + run,
+
+      fold: async (sequence, context) => {
+        const done = context.run * (cycles + 1) + context.cycle;
+        return foldAf3({
+          sequence, weights, device, signal,
+          seed: (options.seed ?? 0) + context.run,
+          recycles: options.recycles,
+          // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
+          // caller owns it - so passing `undefined` folds anyway and writes
+          // "Folding 16/undefined" into the status line. The sampler's own
+          // preferred count is the right default here.
+          calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
+          onStatus: (text) => status(
+            `run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · ${text}`),
+          onProgress: (fraction) => toBar(spanOf(done, fraction)),
+        });
+      },
+
+      design: async (pdb, context) => {
+        status(`run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · designing`);
+        return designChain(mpnn, {
+          pdb,
+          chain: context.chain,
+          temperature: context.temperature,
+          omit: context.omit,
+          alanineBias: context.alanineBias,
+          random: context.random,
+        });
+      },
+    });
+
+    for await (const record of stream) {
+      // 🔴 WHICH MODEL FOLDED IT TRAVELS WITH THE CYCLE. With one folder it is
+      // the same answer every time; with a rotation it is the difference
+      // between a readable table and a meaningless one, so the field exists now
+      // rather than being added when ensembles land.
+      // 🔴 NOT SPREAD INTO A NEW OBJECT. The loop OWNS `best` and un-sets it on
+      // the record it previously marked when a better cycle arrives, by
+      // mutating that object - so a copy would freeze a `best: true` that has
+      // since become false. The two fields this driver adds are written onto
+      // the loop's own record.
+      record.folder = folder;
+      record.designer = chosen;
+      all.push(record);
+      report(record);
+    }
+  }
+
+  // 🔴 AND THE WINNER IS THE LOOP'S, NOT A MAX OVER SCORES. It refuses to let
+  // cycle 0 win - that sequence is the mostly-X draw the run STARTED from, so
+  // naming it best would be reporting the question as the answer - and refuses
+  // a cycle over the alanine ceiling. Re-deriving the best by score here would
+  // quietly undo both rules, which is what the first version of this file did.
+  for (const record of all) {
+    if (record.best === true && (best === null || record.score > best.score)) best = record;
+  }
+
+  toBar(1);
+  status(best === null ? "no cycle completed" : `best ${best.score.toFixed(3)}`);
+  return { best, cycles: all };
+}

@@ -18,6 +18,8 @@
  */
 import { createEntityList } from "./entity-ui.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
+import { MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
+import { hunt } from "./hunt.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -187,13 +189,124 @@ if (navigator.gpu === undefined) {
   });
 }
 
-// 🔴 THE HONEST BUTTON. It is not disabled, because a disabled control with no
-// explanation is the thing this page is supposed to avoid. It is pressable and
-// it says exactly what is missing.
 const status = element("status-message");
-element("hunt").addEventListener("click", () => {
-  status.textContent = method.value === "hunter"
-    ? "The design loop is not wired yet — this page is the shell. See docs/DESIGN.md."
-    : "RFD4-Proteina is not wired here yet — its engine is in sokrypton/rfd4-proteina-webgpu. See docs/DESIGN.md.";
-  status.classList.add("error");
+const progress = element("progress");
+const huntButton = element("hunt");
+const resultsBox = element("results");
+const resultsBody = element("results-body");
+const trackBox = element("cycle-track-container");
+const track = element("cycle-track");
+
+const say = (text, bad = false) => {
+  status.textContent = text;
+  status.classList.toggle("error", bad);
+};
+
+const number = (id, fallback) => {
+  const raw = Number(element(id).value);
+  return Number.isFinite(raw) ? raw : fallback;
+};
+
+/**
+ * One cycle, as a row and as a line of sequence.
+ *
+ * 🔴 APPENDED AS IT ARRIVES, NOT COLLECTED AND DRAWN AT THE END. A hunt is
+ * minutes long; a page that shows nothing until it finishes is the shape this
+ * one exists not to be.
+ */
+const drawCycle = (record) => {
+  resultsBox.style.display = "";
+  trackBox.style.display = "";
+
+  const row = document.createElement("tr");
+  if (record.best === true) row.className = "best";
+  const objective = Number.isFinite(record.score) ? record.score.toFixed(3) : "—";
+  // 🔴 THE VALIDITY CELL CARRIES A MEASUREMENT, NOT A VERDICT. Only one check
+  // exists so far - the loop's alanine ceiling, which is why a cycle can be
+  // ineligible - so that is what it reports, as the fraction it actually is.
+  // Ring closure and base pairing are step 4 of docs/DESIGN.md.
+  const alanine = `${(record.alanine * 100).toFixed(0)}% Ala`;
+  const vetoed = record.cycle > 0 && record.alanine > MAX_ALANINE;
+  if (vetoed) row.classList.add("rejected");
+  for (const [text, className] of [
+    [String(record.run + 1), ""], [String(record.cycle), ""],
+    [record.folder ?? "—", ""], [objective, ""],
+    [vetoed ? `${alanine} — over the ${Math.round(MAX_ALANINE * 100)}% ceiling` : alanine, "validity"],
+  ]) {
+    const cell = document.createElement("td");
+    cell.textContent = text;
+    if (className) cell.className = className;
+    row.append(cell);
+  }
+  resultsBody.append(row);
+
+  const line = document.createElement("div");
+  line.textContent = `${record.cycle}  ${record.sequence}`;
+  if (record.best === true) line.style.fontWeight = "500";
+  track.append(line);
+};
+
+let running = null;
+
+const startHunt = async () => {
+  const entities = window.__designEntities.read();
+  // The designed chain is a new one appended after the target's, which is what
+  // chainIndex names; the target's own chains keep their order.
+  const target = entities.filter((e) => e.type === "protein").map((e) => e.value);
+  const chains = ["", ...target];
+  const controller = new AbortController();
+  running = controller;
+  huntButton.textContent = "Stop";
+  resultsBody.replaceChildren();
+  track.replaceChildren();
+  say("starting");
+  progress.value = 0;
+  progress.dataset.state = "running";
+
+  try {
+    const { best } = await hunt({
+      chains,
+      chainIndex: 0,
+      folders: Array.from(folders.selectedOptions, (option) => option.value),
+      designer: designerSelect.value,
+      contents: contentsOf(entities),
+      runs: number("runs", 1),
+      cycles: number("cycles", 5),
+      length: number("binder-length", 75),
+      temperature: number("temperature", 0.1),
+      omit: element("omit").value,
+      seed: number("seed", 0),
+      signal: controller.signal,
+      report: drawCycle,
+      status: (text) => say(text),
+      progress: (fraction) => { progress.value = fraction; },
+    });
+    say(best === null
+      ? "no cycle was eligible — every one was over the alanine ceiling"
+      : `done · best run ${best.run + 1} cycle ${best.cycle}, objective ${best.score.toFixed(3)}`);
+    progress.dataset.state = "done";
+  } catch (error) {
+    if (controller.signal.aborted) {
+      say("stopped");
+      progress.dataset.state = "idle";
+    } else {
+      say(error.message, true);
+      progress.dataset.state = "error";
+    }
+  } finally {
+    running = null;
+    huntButton.textContent = "Hunt";
+  }
+};
+
+huntButton.addEventListener("click", () => {
+  if (running !== null) {
+    running.abort();
+    return;
+  }
+  if (method.value !== "hunter") {
+    say("RFD4-Proteina's engine is in the tree but not wired to this page yet. See docs/DESIGN.md.", true);
+    return;
+  }
+  startHunt();
 });

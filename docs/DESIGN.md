@@ -77,7 +77,8 @@ not a code path.
 | `cpu/design/mpnn-bridge.js` | the fold → MPNN join; the interface is a PDB string | works |
 | `cpu/design/designers.js` | the checkpoint registry and the automatic choice | works |
 | `web/public/mpnn/` | **4** checkpoints at noise 0.2 (soluble, protein, ligand, NA), ~16 MB | checked in |
-| `design.html`, `web/design.js` | the new page's shell: controls real, loop not wired | works, `npm run test:design` |
+| `design.html`, `web/design.js` | the page: a Method picker, the controls, and a row plus a sequence line per cycle | works, `npm run test:design` |
+| `web/hunt.js` | what makes the loop real: a true AF3 fold and MPNN redesign, with progress across the whole hunt | works, end to end in the gate |
 | `tools/check-design-page.py` | loads the page, runs its module, requires the auto-designer to respond | works |
 | `web/hunter.js` | the v1 page | 🔴 **retire.** Its page was withheld (`.gitignore`) and is not in this checkout |
 | `tools/protein-hunter-in-page.py` | drives a real run over CDP and checks the table came back | works, needs a page |
@@ -421,8 +422,13 @@ Each step ends green and is committed before the next begins.
 2. **The RunSpec.** aminx's field names and semantics on our engine, with her attribution in place; fixed and tied
    positions reaching `cpu/design/mpnn/`. Gate: a seeded RunSpec reproduces its sequence exactly; new bridge tests.
    **Unlocks** inverse folding, and is the primitive antibody mode and motif scaffolding are built on.
-3. **The loop on one folder.** v1's method, new code, diffed against `cpu/design/sample-sequence.js`'s schedules.
-   Gate: `test/hunter-loop.test.js` adapted and green; the CDP driver completes a real run.
+3. ~~**The loop on one folder.**~~ **Done.** `web/hunt.js` supplies the loop's `fold` and `design` - a real AF3
+   fold and a real MPNN redesign - and `web/design.js` draws a row and a sequence line per cycle as it lands.
+   `npm run test:design` runs the whole thing end to end: a 31-residue target, a 12-residue binder, one cycle,
+   about twelve seconds on an M5 off the local bundle - weights, fold, redesign, fold, two rows, best marked.
+   🔴 It also checks the loop's own rule through the page: **cycle 0 can never be best**, because its sequence
+   is the mostly-X draw the run started from, and on a 12-mer of mostly X it folds deceptively well (pLDDT 99 in a
+   stub, and it was the top scorer).
 4. **Validity checks.** Ring closure, Watson-Crick pairing, antibody framework RMSD, as vetoes with recorded
    reasons. Gate: each check has a fixture that fails it and one that passes.
 5. **Ensembles.** Rotate the folder per cycle. Gate: a run with two folders alternates them and records which folded
