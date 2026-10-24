@@ -50,8 +50,11 @@ const pdb = twoChainPdb();
  * loaded, and every design below then runs through it. It halves the file's
  * runtime as a side effect.
  */
+// (exactly the file's bytes: a Buffer's .buffer can be a larger pool - 65,600 bytes behind this 26,618-byte file on
+// node 26 - and WebAssembly then reads past the module, "unknown section code", so this read as a broken kernel)
+const wasm = readFileSync(path("../web/vendor/mpnn/kernels.wasm"));
 const accelerated = await enableAcceleration(
-  readFileSync(path("../web/vendor/mpnn/kernels.wasm")).buffer,
+  wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength),
 );
 
 /**

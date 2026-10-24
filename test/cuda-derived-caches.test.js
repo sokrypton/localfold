@@ -11,7 +11,8 @@
  *
  * So the rule is structural: a map holding device pointers, in any file cuda/ef2 includes (its #include graph, walked
  * from src/ef2.cu - the one port that warms up during an upload and so the one that calls forgetDerivedWeights),
- * registers a FORGET_HOOKS entry within the few lines after its declaration - or is one of the named caches
+ * registers a FORGET_HOOKS entry within the few lines after its declaration, and that entry clears THIS map (a
+ * hook clearing a neighbour would forget nothing) - or is one of the named caches
  * forgetDerivedWeights() clears itself, or is not a weight at all. cuda/af3 and cuda/af2 upload their weights
  * before anything runs, so their own caches are out of scope.
  */
@@ -53,8 +54,12 @@ it("every device-weight cache registers a forget hook", () => {
       if (!m || !/\*\s*>?\s*$/.test(m[1].trim()) && !/\*\s*>/.test(m[1])) return;     // the VALUE holds a pointer
       seen++;
       if (NOT_A_HOOK.has(m[2])) return;
-      const after = lines.slice(i, i + 4).join("\n");
-      if (!after.includes("FORGET_HOOKS")) offenders.push(`${relative(ROOT, file)}:${i + 1} ${m[2]}`);
+      // (ten lines: a pooled cache declares its chunk list, its counters and its `hooked` flag between the map and the
+      // hook - the window was four, and four correct caches read as offenders)
+      const after = lines.slice(i, i + 10).join("\n");
+      const hook = after.indexOf("FORGET_HOOKS");
+      const clears = hook >= 0 && new RegExp(`\\b${m[2]}\\.clear\\(\\)`).test(after.slice(hook));
+      if (!clears) offenders.push(`${relative(ROOT, file)}:${i + 1} ${m[2]}`);
     });
   }
   assert.ok(seen >= 6, `found only ${seen} device-pointer maps - the pattern stopped matching`);
