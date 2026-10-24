@@ -123,11 +123,20 @@ Hunter needs Ligand and NA, which her browser half does not export. So:
 - **Later, if ever: her extra families.** Her `NOTICE-weights.md` carries PottsMPNN, LASErMPNN and Proton-PottsMPNN
   conversions, with upstream notices — model families this repository does not have.
 
-### 3C. `yehlincho/ProteinHunter2` — private, **no licence file**
-🔴 **No licence means all rights reserved. Read the method, reimplement it; do not copy code** until Yehlin says
-otherwise. **This permission is still open and gates nothing else in this document** — every item below is a method
-we would write ourselves. Note also that `webgpu/design/hunter-loop.js` is already documented as "transcribed from
-`boltz_ph/pipeline.py`" from her unlicensed v1; worth settling with her regardless of what we build next.
+### 3C. `yehlincho/ProteinHunter2` — private, no licence file, **permission granted**
+The repository carries no LICENSE, so the default is all rights reserved — but the author has given permission to
+build on this work (Sergey, 2026-10-24, covering every upstream named here). So code may be ported, not only the
+method.
+
+🔴 **Permission is not a licence, and the difference shows up in what has to be written down.** A grant from
+an author is enough to use the work; it is not a public grant that travels with a copy. So anything taken from an
+unlicensed repository carries, in the file, what it came from and that it is used with permission and when — because
+the next reader cannot infer a private grant from a repository that still says nothing. Where an upstream DOES carry
+a licence, that licence's own terms are what travel: `maraxen/aminx`'s MIT notice, `sokrypton/py2Dmol`'s Beerware
+notice.
+
+The same applies backwards: `webgpu/design/hunter-loop.js` is documented as "transcribed from
+`boltz_ph/pipeline.py`" from her v1, and that provenance line should say it is used with permission now that it is.
 
 Her v2 is v1's loop on one folding runtime instead of six vendored backends. The ideas, and what each costs us:
 
@@ -342,7 +351,9 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 - 🔴 **The worker never commits, pushes, or rewrites history.** It ends each task with a report: what changed and
   why, measurements with their arms, which gates ran and what they said, and what it did not do. We read the diff,
   run the gates, and write the commit message from that report plus our own check.
-- **It must not copy code from `yehlincho/ProteinHunter2`** while that repository has no licence.
+- **Porting code from an upstream is allowed** (permission granted by every author, 2026-10-24), and every ported
+  file must name where it came from. For a licensed upstream that means carrying the licence's notice; for an
+  unlicensed one it means recording that it is used with permission and when.
 - The repository invariants in `AGENTS.md` and `CLAUDE.md` bind it: never widen a tolerance or rewrite a baseline to
   pass a gate, GPU benchmarks one at a time and interleaved, no bundler, and `package-lock.json` and
   `localfold-fixes-for-sergey.md` are never staged.
@@ -353,9 +364,9 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 
 | item | who | blocks |
 |---|---|---|
-| Yehlin's permission: code reuse, or method and credit only? | Sergey | copying from ProteinHunter2 — **nothing in section 6** |
-| Provenance of v1's "transcribed from `boltz_ph/pipeline.py`" | Sergey | nothing; worth settling |
-| NVIDIA's RFD4-Proteina terms — unread, not to be accepted for the user | Sergey | only if Hunter offers RFD4 |
+| ~~Permission from the upstream authors~~ — **granted, all of them** (2026-10-24) | done | nothing |
+| Write the permission into each ported file, and onto `hunter-loop.js`'s existing provenance line | worker | nothing; do it as code lands |
+| 🔴 NVIDIA's RFD4-Proteina weight terms — **unread, and NOT covered by the authors' permission**: NVIDIA is not one of them. Not to be accepted on the user's behalf | Sergey | only if Hunter offers RFD4 as a generator |
 | Is the goal a product site, or a tool beside the folder? | Sergey | section 1's repository choice |
 | `sync-mpnn.py --check` against `sokrypton/mpnn` HEAD | worker | step 2 |
 | Whether Marielle will export LigandMPNN and NA-MPNN to the browser | Sergey / Marielle | would change 3B's trade entirely |
