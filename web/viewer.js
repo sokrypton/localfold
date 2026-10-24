@@ -97,6 +97,32 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
       renderer.setSidechainColor("hydrophobicity");
     },
 
+    /**
+     * Colour whole chains, one colour each.
+     *
+     * 🔴 WHICH IS STILL NOT ABOUT THE PREDICTION, so it belongs here: a chain
+     * is a fact about the structure. What the colours MEAN - designed, held,
+     * part of the target - is the caller's, and the design page's roles are the
+     * first use.
+     *
+     * 🔴 AND IT OVERRIDES `paint()`, which sets a continuous pLDDT ramp. The two
+     * answer different questions - "how sure is the model" against "what is
+     * being decided" - and a page wanting the second must not also call the
+     * first, or whichever ran last silently wins.
+     *
+     * @param {Record<string, string>} colours chain id to CSS colour
+     */
+    colourChains(colours) {
+      if (renderer === undefined) return;
+      for (const [chain, colour] of Object.entries(colours)) {
+        try {
+          renderer.setColor(colour, { chain });
+        } catch {
+          /* a chain the structure does not have is not an error worth stopping a hunt for */
+        }
+      }
+    },
+
     fail,
 
     /**

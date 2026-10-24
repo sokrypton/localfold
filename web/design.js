@@ -18,7 +18,19 @@
  */
 import { createEntityList } from "./entity-ui.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
-import { MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
+import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
+
+// 🔴 THE SAME VALUES AS THE .role-* SWATCHES IN web/localfold.css. Two places,
+// because one is a stylesheet and the other reaches a WebGL renderer that
+// cannot read a CSS class - so they are written out here with the rule that
+// they have to match, and the page gate compares them.
+export const ROLE_COLOURS = {
+  free: "#ffffff",
+  fixed: "#6b7280",
+  tied: "#3b82f6",
+  motif: "#a855f7",
+  target: "#e5e7eb",
+};
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 
@@ -254,6 +266,17 @@ const drawCycle = (record) => {
   // one a sensible camera. So push, then orient once, then draw.
   viewerBox.style.display = "";
   viewer.push(record.pdb, (built) => { if (built) viewer.orient(); });
+  // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
+  // being DECIDED, and pLDDT answers a different question - so the designed
+  // chain takes the "free" colour and everything else the "target" one, the
+  // same two swatches the legend names. These are the only two roles a Hunter
+  // run has today; fixed, tied and motif arrive with the RunSpec's positions
+  // reaching the page.
+  viewer.colourChains({
+    [record.chain]: ROLE_COLOURS.free,
+    ...Object.fromEntries(CHAIN_IDS.split("").filter((id) => id !== record.chain)
+      .map((id) => [id, ROLE_COLOURS.target])),
+  });
 
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;

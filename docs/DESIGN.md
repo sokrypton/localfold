@@ -324,7 +324,7 @@ order of work.
 | Where the run is | run *i* of *n*, cycle *k* of *m*, and which of fold / design is in flight |
 | **Which model folded this cycle** | named per cycle — with ensembles the folder rotates, and a result is meaningless without it |
 | The sequence changing | a residue track per cycle, the `X` positions visibly filling in |
-| **What is being decided, and what is not** | per-residue roles coloured in both the 3D view and the track: free, fixed, tied, motif, target |
+| **What is being decided, and what is not** | **done for the two roles a Hunter run has** — the designed chain takes `free`, every other chain `target`, in the 3D view and named in the legend. `fixed`, `tied` and `motif` arrive when the RunSpec's positions reach the page |
 | Why a cycle won | its objective, against the best so far |
 | **Why a cycle was rejected** | the physical number, not a verdict: `ring 3.87 Å`, `0/12 Watson-Crick pairs`, `framework RMSD 17.6 Å` |
 | The whole hunt | **done** — every cycle is a frame of one py2Dmol object, labelled `cycle_N`, so the play bar walks the hunt |
