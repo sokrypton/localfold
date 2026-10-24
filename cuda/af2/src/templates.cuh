@@ -334,9 +334,9 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
   if (T > 1) {
     float* q = scratch<float>("mtmpl.q", pairs * Wd);
     float* kk = scratch<float>("mtmpl.k", (size_t)T * pairs * Wd);
-    gemm(pairF32(pair, pairs * Cz), P(A + "query_w"), q, pairs, Cz, Wd);
-    float s = 1.f / sqrtf((float)D);
-    CB(cublasSscal(H, (int)(pairs * Wd), &s, q, 1));
+    // (the query's 1/sqrt(D) as the GEMM's alpha: a cublasSscal over the plane took its count as an int, which
+    // L^2 * Wd passes at 5,793 residues)
+    gemm(pairF32(pair, pairs * Cz), P(A + "query_w"), q, pairs, Cz, Wd, 0.f, 1.f / sqrtf((float)D));
     gemm(reps, P(A + "key_w"), kk, (size_t)T * pairs, C, Wd);
     o = scratch<float>("mtmpl.o", pairs * Wd);
     templatePointAttentionK<<<blocks(pairs * Hh), 256, 0, STREAM>>>(q, kk, vv, o, pairs, T, Hh, D);

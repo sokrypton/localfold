@@ -14,9 +14,17 @@ void flashStridedRun(const half* qkvg, const half* bias, int stride, const float
     smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, 1, true>), bytes);
     attr = true;
   }
-  dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
-  flashGridHalf<D, WARPS, MASKED, BK, REG, 1, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
-    qkvg, bias, stride, mask, out, n, heads, 0, false, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+  // rows x heads blocks down grid.y, which stops at 65,535 - the masked column attention (8 heads, a row a residue)
+  // reaches it at 8,192 residues - so the rows go in launches of at most 65,535 / heads, each its rows' pointers and
+  // the first one's index (which the mask is read by)
+  const size_t per = 65535 / heads;
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    const size_t r = std::min(per, rows - r0);
+    dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(r * heads));
+    flashGridHalf<D, WARPS, MASKED, BK, REG, 1, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
+      qkvg + r0 * rowStride, bias, stride, mask, out + r0 * outRowStride, n, heads, r0, false, scale, nullptr,
+      rowStride, posStride, outRowStride, outPosStride);
+  }
 }
 template <int D, int WARPS, bool MASKED>
 void flashStridedAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,

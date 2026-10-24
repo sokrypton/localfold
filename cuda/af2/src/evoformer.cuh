@@ -48,21 +48,6 @@ inline const float* pairAdvance(const float* p, size_t elems) {
 }
 
 // ---------------------------------------------------------------- the embedder
-// relpos [L, L, 73] one-hot, as _relative_encoding builds it
-__global__ void relposK(const int* ri, const int* asym, const int* entity, const int* sym, float* out, int L) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * L) return;
-  int i = (int)(t / L), j = (int)(t % L);
-  float* o = out + t * 73;
-  for (int c = 0; c < 73; ++c) o[c] = 0;
-  int off = ri[i] - ri[j];
-  int clipped = min(max(off + 32, 0), 64);
-  o[asym[i] == asym[j] ? clipped : 65] = 1;
-  bool sameEntity = entity[i] == entity[j];
-  o[66] = sameEntity ? 1.f : 0.f;
-  int rc = min(max(sym[i] - sym[j] + 2, 0), 4);
-  o[67 + (sameEntity ? rc : 5)] = 1;
-}
 // pseudo-beta (CB; CA for glycine) from atom37 positions, then the 15-bin distogram AF2 recycles
 __global__ void prevDgramK(const float* pos37, const int* aatype, float* out, int L) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -204,7 +189,7 @@ __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restr
                            const float* __restrict__ prevPair, const float* __restrict__ lnScale, const float* __restrict__ lnOffset,
                            const int* __restrict__ ri, const int* __restrict__ asym, const int* __restrict__ entity, const int* __restrict__ sym,
                            const float* __restrict__ wRel, const float* __restrict__ bRel,
-                           float* __restrict__ pair, int L) {
+                           float* __restrict__ pair, int L, bool chainRows) {
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
@@ -222,7 +207,11 @@ __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restr
   }
   int off = ri[i] - ri[j];
   int clipped = min(max(off + 32, 0), 64);
-  int r0 = asym[i] == asym[j] ? clipped : 65;
+  // relpos, _relative_encoding's 73 features: across chains the multimer's own row (65); a monomer's projection has
+  // only the 65 residue-offset rows (the rest zero, af2_weights.h), so there a cross-chain pair takes the end of the
+  // window by chain order, as ColabFold's monomer complexes and the +200 break do - the zero row gave every cross-chain
+  // pair no position at all: 12 copies of 6MRR pLDDT 70.5 against ColabFold's 80.7 on float32 weights
+  int r0 = asym[i] == asym[j] ? clipped : chainRows ? 65 : asym[i] > asym[j] ? 64 : 0;
   bool sameEntity = entity[i] == entity[j];
   int rc = min(max(sym[i] - sym[j] + 2, 0), 4);
   int r2 = 67 + (sameEntity ? rc : 5);
@@ -301,7 +290,7 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
     prevPair ? prevPair : t.pair, P(E + "prev_pair_norm/scale", -1), P(E + "prev_pair_norm/offset", -1),
     Idev("residue_index"), Idev("asym_id"), Idev("entity_id"), Idev("sym_id"),
     P(E + "~_relative_encoding/position_activations/weights", -1), P(E + "~_relative_encoding/position_activations/bias", -1),
-    t.pair, L));
+    t.pair, L, M.flag("meta/multimer")));
   // the extra MSA's activations
   size_t erows = (size_t)t.E * L;
   auto ones = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 1.f) return false; return true; };

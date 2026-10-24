@@ -21,9 +21,8 @@ inline const float* P(const std::string& name, int block = -1) {
 
 // ---------------------------------------------------------------- GEMM, row-major
 // Y[rows, out] = X[rows, in] Wt[in, out] (+ beta Y); f32 accumulate, no TF32 on this path
-inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f) {
-  const float one = 1.f;
-  CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, out, X, in, &beta, Y, out));
+inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f, float alpha = 1.f) {
+  CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &alpha, Wt, out, X, in, &beta, Y, out));
 }
 
 // ---------------------------------------------------------------- elementwise
