@@ -1195,6 +1195,7 @@ template <class T> T* poolAllocT(size_t n) {
   T* p; size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
   cudaError_t e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
   if (e != cudaSuccess) { cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM); }
+  if (e != cudaSuccess) { cudaGetLastError(); e = devMalloc(&p, bytes); }     // (a pool's refusal is not the card's: scratchNamed)
   if (e != cudaSuccess) { scratchReportOOM("a pool allocation", bytes); exit(1); }
   return p;
 }
@@ -1392,16 +1393,29 @@ template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal
     if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) {     // (fragmented idle pages: trimmed, asked again)
       cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
     }
+    // ...and from the card itself where the pool still refuses: a pool's refusal is not the card's. rosettafold3 at 3,060
+    // tokens, the template stack's transition: the pool (21.8 GB reserved, 16.1 used, its idle pages among live blocks)
+    // would not grow by 4.79 GB with 18.3 GB of the card free - a cudaMalloc of it, or a fresh pool's, succeeded. (A
+    // scratch buffer is given back with cudaFreeAsync, which frees a cudaMalloc'd one as well, as the capture's above.)
+    if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) { cudaGetLastError(); e = devMalloc(&p, bytes); }
     if (e != cudaSuccess && !fatal) { cudaGetLastError(); have = 0; return nullptr; }
     if (e != cudaSuccess) {
       size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
       size_t freeB, totalB; deviceMemInfo(&freeB, &totalB);
-      fprintf(stderr, "out of device memory: scratch %s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free\n",
-              name.c_str(), n * sizeof(T) / 1e9, held / 1e9, freeB / 1e9, totalB / 1e9);
+      std::string wanted;     // (a shared slot: the buffers it stands for)
+      for (auto& [buf, k] : SHARED_SLOT) if (name == "slot." + std::to_string(k)) wanted += (wanted.empty() ? " (" : " ") + buf;
+      if (!wanted.empty()) wanted += ")";
+      fprintf(stderr, "out of device memory: scratch %s%s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free, %.2f of "
+              "it the pool's idle pages (%s)\n", name.c_str(), wanted.c_str(), n * sizeof(T) / 1e9, held / 1e9, freeB / 1e9,
+              totalB / 1e9, poolIdle() / 1e9, cudaGetErrorString(e));
       std::vector<std::pair<size_t, std::string>> big;
       for (auto& [k, v] : SCRATCH) big.push_back({v.second, k});
       std::sort(big.rbegin(), big.rend());
-      for (size_t i = 0; i < big.size() && i < 12; ++i) fprintf(stderr, "  %8.2f GB  %s\n", big[i].first / 1e9, big[i].second.c_str());
+      for (size_t i = 0; i < big.size() && i < 12; ++i) {
+        std::string who;     // (a shared slot: the buffers it stands for)
+        for (auto& [buf, k] : SHARED_SLOT) if (big[i].second == "slot." + std::to_string(k)) who += (who.empty() ? "  (" : " ") + buf;
+        fprintf(stderr, "  %8.2f GB  %s%s\n", big[i].first / 1e9, big[i].second.c_str(), who.empty() ? "" : (who + ")").c_str());
+      }
       exit(1);
     }
     have = n * sizeof(T);
