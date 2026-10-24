@@ -90,23 +90,51 @@ Two ways in, ranked:
 A third, biasing MPNN toward helix/strand formers at labelled positions, is
 indirect and weak. Not recommended.
 
-## 4. Chain colour indicators
+## 4. Chain colour indicators — **done**
 
 > *"we need chain color indicators... this is for both colors in viewer and also
 > for the span blocks, which which block will be which color"*
-
-**partial.**
 
 - **done** — the palette, the blend, and the chain walk, in `web/contig-ui.js`
   (`CHAIN_COLOURS`, `chainColour`, `shade`, `chainOfSpans`), held to `chainsOf`
   by `test/design-chain-colours.test.js` and watched failing. 🔴 The two walks
   must agree or the indicator is *worse* than nothing: a swatch naming one chain
   while the structure paints another reads as an answer.
-- **queued** — painting the span rows (a colour bar per row via a `::before`, so
-  the grid keeps exactly three children and the mobile breakpoint is unchanged).
-- **queued** — the viewer taking hue from the chain. Hue is the chain; role is a
-  *treatment* of it, because a reader needs both answers and there is one set of
-  pixels. The five-role legend becomes chain swatches plus a note on held.
+- **done** — the span rows carry a `::before` bar, so the grid keeps exactly
+  three children and the phone breakpoint is unchanged.
+- **done** — the viewer takes hue from the chain and expresses role as a
+  treatment of it. The legend is built from the spans; it listed five fixed
+  roles, two of which nothing painted.
+- **gated at runtime**: `tools/check-design-page.py` compares the row bars
+  against the legend swatches, because they come from two walks of the same
+  spans and a disagreement points at the wrong chain, which reads as an answer.
+
+## 5b. The generation was drawn as one picture — **done**
+
+The flow runs its steps and the page pushed only the finished structure, so the
+play bar — which hides itself below two frames — never appeared and RFD4 looked
+static beside a hunt that animates. Live frames are opt-in because each is an
+all-atom decoder pass, so the page asks for a frame COUNT and the cadence falls
+out of it: 16 decodes whether the run is 20 steps or 200. The gate asked for
+`>= 1` frame, which a single finished structure satisfies — it asks for a
+trajectory now.
+
+## 5c. `weights/` is not a directory in this repository — **done**
+
+The shards were never committed, but the top-level directory was called
+`weights/` and advertised something the repository does not have. It is
+`model-rfd4p-int8/` now, matching the nine fold bundles, holding only the config
+and the tensor manifest. 🔴 Upstream's layout is NOT ours to change, so
+`tools/check-rfd4p-manifest.py` maps our paths onto theirs; it reaches the
+network by necessity and reports both files identical to the pinned commit.
+
+## 5d. A contig segment was mis-split — **done**
+
+Reported from the page: `A16-35` read as chain `A1`, first 6, because the chain
+group was greedy and could absorb digits. RFD4's own parser is letters-only with
+an OPTIONAL range. 🔴 A round trip cannot see it — chain "A1" with first 6
+re-joins to exactly "A16-35" — which is why it survived a byte-for-byte check
+against six presets. Only the fields catch it.
 
 ## 5. Side chains in the viewer — **done**
 
@@ -138,13 +166,12 @@ on a real fixture settled it.
 
 ## 7. Known gaps nobody has asked about yet
 
-Worth saying out loud, because each is a control that exists and does nothing:
-
-- **RFD4's `#validate` and `#beam` are ignored by its generate path.** Hunter
-  honours both; `startGenerate` honours neither. A control that silently does
-  nothing is worse than an absent one — this repository's own rule.
-- **Validation results are computed and not displayed.** `hunt()` takes a
-  `progressNote`; the results table has no column for the number.
+- ~~RFD4's `#validate` and `#beam` are ignored by its generate path~~ — **done**.
+  Both honoured, and the picker offered two models (Boltz-2, Protenix-2) that
+  are not in `FOLDERS` and validated nothing at all; the list is gated against
+  that map now.
+- ~~Validation results computed and not displayed~~ — **done** on both paths:
+  the validity column carries the sentence, and the status line repeats it.
 - **Modality parity with RFD4-Proteina** is a standing goal, measured in
   `docs/DESIGN.md` §6 and not closed.
 - **Residue picking in the viewer** — picking spans by clicking rather than
