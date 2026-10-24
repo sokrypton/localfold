@@ -49,6 +49,10 @@ export { FOLDERS } from "./validate-design.js";
  * @param {{ligands?: number, nucleic?: number}} [options.contents] what the
  *   target carries, for the automatic designer
  * @param {number} [options.runs=1]
+ * @param {(run: number) => {chains: string[], length: number, hold: number[]}} [options.job]
+ *   re-read the job for this run, so a contig carrying a length RANGE draws a
+ *   different length each time. Omitted means the fixed `chains` are used for
+ *   every run, which is right whenever nothing is ranged.
  * @param {number} [options.cycles=5]
  * @param {number} [options.length=75] the designed chain's length
  * @param {number} [options.beam=1] how many sequences each cycle tries
@@ -152,11 +156,23 @@ export async function hunt(options) {
   let foldedBy = folders[0];
 
   for (let run = 0; run < runs; run += 1) {
+    // 🔴 THE JOB IS RE-READ PER RUN, because a contig may carry a length RANGE
+    // and each run draws its own length out of it - which is what makes `Runs`
+    // the search over lengths that a range asks for. Without this the chains
+    // are built once and every run folds the same size, so the range would be
+    // honoured in the notation and ignored in the work. A caller that passes no
+    // `job` gets the fixed chains it handed in, which is every caller with no
+    // ranges to resolve.
+    const drawn = options.job === undefined ? null : options.job(run);
+    const runChains = drawn?.chains ?? chains;
+    const runLength = drawn?.length ?? length;
+    const runHold = drawn?.hold ?? options.hold;
+
     const stream = runDesign({
-      chains: chains.slice(), chainIndex, cycles, length, run, signal,
+      chains: runChains.slice(), chainIndex, cycles, length: runLength, run, signal,
       temperature: options.temperature,
       omit: options.omit,
-      hold: options.hold,
+      hold: runHold,
       beam,
 
       // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT

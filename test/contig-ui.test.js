@@ -84,10 +84,16 @@ describe("the design job as a list of spans", () => {
   // reaches a structure by folding a sequence, so it asks for ONE length; and it
   // has no pocket conditioning. Both are stated on the row rather than removed.
   it("marks what Protein Hunter cannot honour, and leaves RFD4 alone", () => {
+    // 🔴 A RANGE IS NO LONGER ONE OF THEM. It used to be refused - "Hunter
+    // folds one length at a time; a range needs a search over lengths" - which
+    // is true of a single fold and describes a search the page already has:
+    // `Runs` repeats the hunt, and each run draws its own length out of the
+    // range (see test/design-length-range.test.js). Both methods take one now.
     const range = [{ kind: "generated", min: 50, max: 120 }];
     expect(contigOf(range, "rfd4p").problems).toEqual([]);
-    expect(contigOf(range, "hunter").problems).toContain(METHOD_LIMITS.hunter.range);
-    // ...but one length is fine on both
+    expect(contigOf(range, "hunter").problems).toEqual([]);
+    expect(METHOD_LIMITS.hunter.range).toBe(undefined);
+    // ...and one length is still fine on both
     expect(contigOf([{ kind: "generated", min: 76, max: 76 }], "hunter").problems).toEqual([]);
 
     const ligand = [{ kind: "generated", min: 80, max: 80 }, { kind: "break" },

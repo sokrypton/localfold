@@ -416,6 +416,50 @@ def main():
             if phrase not in refused:
                 bad.append(f"{wanted_method} did not refuse a segment with no structure: {refused!r}")
 
+        # 🔴 A LENGTH RANGE UNDER PROTEIN HUNTER. Four of the ten shipped
+        # examples were refused for this reason alone - "Hunter folds one length
+        # at a time" - which is true of a single fold and describes a search the
+        # page already has: `Runs` repeats the hunt, so each run draws its own
+        # length out of the range. What must be visible here is that the job is
+        # ACCEPTED, and that the line reports a RANGE rather than the minimum -
+        # the minimum is one draw out of sixteen, not what the job says.
+        ranged = json.loads(cdp.evaluate(ws, """(() => {
+          // 🔴 A RANGED JOB BUILT HERE, NOT A PRESET. A motif preset also
+          // carries a SECOND and unrelated problem - its contig is written in
+          // the original PDB entry's numbering while the shipped example CIF is
+          // a cropped copy - so driving one here would test the range and the
+          // numbering together and report whichever failed first.
+          document.getElementById('method').value = 'hunter';
+          document.getElementById('method').dispatchEvent(new Event('change'));
+          window.__designSpans.set([
+            { kind: 'sequence', value: 'ACDEFGHIKLMNPQRSTVWYACDEFGHIKL' },
+            { kind: 'break' },
+            { kind: 'generated', min: 5, max: 20 },
+          ]);
+          return JSON.stringify({
+            contig: document.getElementById('contig-line').textContent.trim(),
+            problems: document.getElementById('contig-problems').textContent.trim(),
+          });
+        })()"""))
+        # 🔴 THE PRESET'S STRUCTURE IS FETCHED, SO THIS HAS TO WAIT FOR IT.
+        # Hunter reads a `From structure` span's residues out of the loaded
+        # file, and reading the moment after the change event fires catches the
+        # page mid-fetch and reports a refusal that clears a second later.
+        for _ in range(20):
+            if not ranged["problems"]:
+                break
+            time.sleep(1)
+            ranged = json.loads(cdp.evaluate(ws, "JSON.stringify({"
+                "contig: document.getElementById('contig-line').textContent.trim(),"
+                "problems: document.getElementById('contig-problems').textContent.trim(),"
+                "note: document.getElementById('structure-note').textContent.trim()})"))
+        print(f"  ranged under hunter: {ranged}")
+        if ranged["problems"]:
+            bad.append("a length range is refused under Protein Hunter: "
+                       f"{ranged['problems']!r}")
+        if "design 5\u201320" not in ranged["contig"]:
+            bad.append(f"the range is not reported as 5-20: {ranged['contig']!r}")
+
         # 🔴 AND, WHEN ASKED, A REAL GENERATION: the second method end to end.
         if "--generate" in sys.argv:
             cdp.evaluate(ws, """(() => {

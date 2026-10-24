@@ -18,7 +18,7 @@
  */
 import {
   chainColour, chainOfSpans, chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf,
-  LIGAND_COLOUR, shade, spansFromContig,
+  drawLengths, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { generate } from "./generate.js";
 import { validateDesign } from "./validate-design.js";
@@ -302,6 +302,15 @@ const paintJob = () => {
   if (hunter) {
     const { chains, chainIndex, length } = chainsOf(spans, { sequenceOf: resolver() });
     const { hold } = chainsOf(spans, { sequenceOf: resolver() });
+    // 🔴 A RANGE IS REPORTED AS A RANGE. Hunter resolves one length per run now,
+    // and `chainsOf` takes the minimum - so a contig asking for 5-20 residues
+    // described itself as "design 5", which is one draw out of sixteen and not
+    // what the job says. Both ends are taken by pinning the spans each way.
+    const pinned = (end) => chainsOf(spans.map((span) => (span.kind === "generated"
+      ? { ...span, min: span[end], max: span[end] } : span)),
+    { sequenceOf: resolver() }).length;
+    const shortest = pinned("min");
+    const longest = pinned("max");
     const described = chains.map((chain, index) => {
       if (index !== chainIndex) return `given ${chain.length}`;
       // 🔴 THE DESIGNED CHAIN IS HANDED OVER EMPTY when every residue of it comes
@@ -309,6 +318,11 @@ const paintJob = () => {
       // sequence - so its SIZE is the spans' total and not the string's length,
       // which is zero. Reading the string here printed "design 0".
       const total = chain.length === 0 ? length : chain.length;
+      if (longest !== shortest) {
+        const span = `${shortest}\u2013${longest}`;
+        return hold.length === 0 ? `design ${span}`
+          : `design ${span} with ${hold.length} held`;
+      }
       // 🔴 AND HELD RESIDUES ARE PART OF THE DESCRIPTION: a 100-residue chain
       // with 80 held is a 20-residue design, and "design 100" would be wrong by
       // a factor of five.
@@ -615,6 +629,11 @@ const startHunt = async () => {
 
   try {
     const { best, cycles } = await hunt({
+      // 🔴 RE-READ PER RUN, so a length RANGE becomes a search over lengths
+      // rather than a notation the hunt ignores. `drawLengths` is deterministic
+      // in the seed and the run, so the same hunt twice is the same hunt.
+      job: (run) => chainsOf(drawLengths(spans, { run, seed: number("seed", 0) }),
+        { sequenceOf: resolver() }),
       chains,
       chainKinds,
       ligandCodes,
@@ -750,6 +769,30 @@ presetSelect.addEventListener("change", () => {
   };
   if (preset.nsteps !== undefined) element("steps").value = String(preset.nsteps);
   spanList.set(spans);
+
+  // 🔴 AND THE PRESET'S STRUCTURE IS LOADED, NOT JUST NAMED. `cifUrl` was
+  // handed to the generation and never fetched by the page, so the structure
+  // existed only inside a run - which is fine for RFD4, whose engine fetches it
+  // itself, and leaves PROTEIN HUNTER with nothing: Hunter reaches a structure
+  // by folding a SEQUENCE, so a `From structure` span needs the file here to
+  // read its residues from. Without this, switching a motif preset to Hunter
+  // refused with "needs the structure loaded" for a structure the preset had
+  // already named.
+  if (preset.cifUrl !== null && preset.cifUrl !== undefined && loaded?.name !== preset.cifUrl) {
+    fetch(preset.cifUrl).then(async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      // The shipped examples are zstd; a plain .cif is taken as it is.
+      const zstd = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f;
+      takeStructure(new TextDecoder().decode(zstd ? decompress(bytes) : bytes),
+        preset.cifUrl, false);
+      paintJob();
+    }).catch((error) => {
+      // Not fatal: RFD4 fetches it again inside the run, and only Hunter needs
+      // it here - so this says so rather than refusing the preset.
+      structureNote.textContent = `could not load this example's structure: ${error.message}`;
+    });
+  }
   // 🔴 A PRESET IS RFD4's, so loading one picks that method rather than leaving
   // a contig the selected method cannot run.
   method.value = "rfd4p";
@@ -862,7 +905,7 @@ const chainRanges = (atoms) => {
   return chains;
 };
 
-const takeStructure = (text, name) => {
+const takeStructure = (text, name, offerChain = true) => {
   // 🔴 PARSED ON LOAD, NOT ON RUN. A file that is not mmCIF, or an entry with no
   // atom records, is a thing to say now - while the user is looking at the
   // control they just used - rather than minutes later inside a generation.
@@ -872,9 +915,13 @@ const takeStructure = (text, name) => {
   loaded = { text, name, atoms, chains };
   describeStructure();
   // Offer its first chain as a span, since that is almost always the next move.
+  // 🔴 NOT WHEN A PRESET LOADED IT. The preset has just written the spans it
+  // means, and a preset with no `From structure` span - an unconditional
+  // design - would have one PREPENDED here, silently turning it into a
+  // different job from the one it names.
   const [first] = [...chains.entries()];
   const spans = spanList.read();
-  if (!spans.some((span) => span.kind === "segment")) {
+  if (offerChain && !spans.some((span) => span.kind === "segment")) {
     spanList.set([{ kind: "segment", chain: first[0], first: first[1].first, last: first[1].last },
       { kind: "break" }, ...spans.filter((span) => span.kind !== "sequence")]);
   }

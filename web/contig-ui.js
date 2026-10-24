@@ -164,7 +164,13 @@ export const SPAN_NOTES = {
  */
 export const METHOD_LIMITS = {
   hunter: {
-    range: "Protein Hunter folds one length at a time; a range needs a search over lengths.",
+    // 🔴 A RANGE IS NO LONGER REFUSED HERE. It used to read "Protein Hunter
+    // folds one length at a time; a range needs a search over lengths" - which
+    // is true of a single fold and describes a search the page already has.
+    // `Runs` IS that search: each run draws its own length out of the range
+    // (see `drawLengths`), so a range means "try several sizes" rather than
+    // "this method cannot". Four of the ten shipped examples were refused for
+    // this reason alone.
     ligand: "Protein Hunter has no pocket conditioning — a ligand changes the fold and the"
       + " designer, but is not conditioned on.",
     // 🔴 A LABEL IS ONLY USEFUL TO SOMETHING THAT CONDITIONS ON IT. Hunter
@@ -476,6 +482,50 @@ export const spansFromContig = (contig) => {
   }
   return spans;
 };
+
+/**
+ * Resolve every length RANGE to a concrete length, once per run.
+ *
+ * 🔴 THIS IS WHAT "A SEARCH OVER LENGTHS" MEANS, AND THE PAGE ALREADY HAD THE
+ * SEARCH. A contig writes `5-20` for "somewhere between 5 and 20 residues".
+ * Protein Hunter folds one length at a time, so a range used to be refused
+ * outright - but `Runs` repeats the whole hunt, so giving each run its own draw
+ * turns the range into exactly the search the refusal said was missing.
+ *
+ * 🔴 DETERMINISTIC, NOT RANDOM. Two hunts with the same seed have to be the
+ * same hunt, and a draw taken from `Math.random` would make a run impossible to
+ * reproduce or to report. The length comes from a hash of the seed, the run and
+ * WHICH span it is - the last of those because two ranged spans in one contig
+ * are independent choices, and spreading them together would only ever try
+ * "all short" and "all long".
+ *
+ * A span whose min and max agree is returned untouched, so a job with no ranges
+ * is unaffected and `spans === drawLengths(spans, ...)` holds for it elementwise.
+ *
+ * @param {object[]} spans
+ * @param {object} [options]
+ * @param {number} [options.run=0] which run this is
+ * @param {number} [options.seed=0]
+ * @returns {object[]} the same spans with each generated range collapsed
+ */
+export function drawLengths(spans, options = {}) {
+  const run = Math.max(0, Math.floor(options.run ?? 0));
+  const seed = Math.floor(options.seed ?? 0);
+  return spans.map((span, index) => {
+    if (span.kind !== "generated") return span;
+    const low = Math.min(number(span.min, 0), number(span.max, 0));
+    const high = Math.max(number(span.min, 0), number(span.max, 0));
+    if (high <= low) return span;
+    // A small integer hash: enough to decorrelate the spans and the runs, and
+    // reproducible anywhere this runs.
+    let bits = (seed * 0x9e3779b1 + run * 0x85ebca6b + index * 0xc2b2ae35) >>> 0;
+    bits ^= bits >>> 15;
+    bits = Math.imul(bits, 0x2545f491) >>> 0;
+    bits ^= bits >>> 13;
+    const length = low + (bits >>> 0) % (high - low + 1);
+    return { ...span, min: length, max: length };
+  });
+}
 
 /**
  * The same spans as Protein Hunter's chains.
