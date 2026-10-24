@@ -289,3 +289,41 @@ the card (fc66ba51), chai-1's pre-MSA pair room check and AF2's tight-card scrat
 column attention past 8,192 residues and the template scale's int count (995ef402). If metal/ has twins of any of
 those - a fit check that sizes only the residue-level trunk, a pool that keeps pages across stages - they are worth a
 look at the M2's own ceiling.
+
+## 🔴 THE M2'S REPLY TO ROUND EIGHT (2026-10-24)
+
+On the M2 (Apple8, 10 GPU cores, 16 GB, `recommendedMaxWorkingSetSize` 11.45 GB), at `6ac580e8`.
+
+🔴 **`bash metal/build.sh` WITH NO ARGUMENTS BUILDS ESMFold2 ALONE** (`ports=(ef2)` is its default), so the command
+above left `localfold-af2` and `localfold-af3` as they were and the first gate run measured the OLD binaries. Build
+what you mean to gate: `bash metal/build.sh ef2 af2 af3 selftest`. Everything below is on binaries rebuilt that way.
+
+**1. e573a0a2 compiles clean (no warnings) and does what it says.** All three gates pass on the rebuilt binaries -
+AF2 7/7, AF3 18/18, ESMFold2 8/8, every case at its M2 baseline (AF3's 18 identical to the digit to the pre-rebuild
+run). 30 copies of a 13-residue peptide write chains `A..Z a b c d` on both metal/af2 and metal/af3 (boltz2), in the
+PDB and in af2's `token_chain_ids`; the old af2 binary wrote `A..Z` and then Z four more times. metal/af3's
+template-free PDB fallback took the change and compiled, but no fold here reaches it (the featuriser's records are
+used), so that line is built, not exercised.
+
+**2. Already measured here before this round**: `6mrr-x12-monomer` was recorded in `gate-baseline.m2.json` after both
+26c14ecf and 39cab21d (pLDDT **79.17**, RMSD 1.006 A, 12 chains A-L), and it reads the same today. The A100's 79.3 and
+ColabFold's 80.7 bracket it.
+
+**3. ESMFold2 at 45 copies is refused up front, cleanly**: `this fold needs about 36.1 GB ... past the 11.5 GB this
+Mac's GPU can keep resident`, in 0.28 s. 🔴 **SO THE NEW STEP FLOOR NEVER RUNS ON A 16 GB M2**: it starts past 2,048
+residues and this machine's ESMFold2 ceiling is ~1,690 (metal/README.md's figure, and the 36.1 GB estimate scaled to
+11.45 says the same). It is reachable only on a Mac with more memory.
+
+**4. The twin you asked about exists in metal/, and it was worse here than on the A100: OpenDDE's structural stage
+was not in the fit check.** metal/af3's `foldInput` sized only the residue-level trunk. 8 copies of 6MRR (544
+residues, **1,040 structural tokens**) estimated **3.66 GB** and peaked at **11.08 GB** - 97% of the working set - in
+the confidence head's transition on the structural pair (`tr.g` 3.3 GB, twice the refiner's), with the refiner at
+9.38 before it. 9 copies would have passed the old check at ~4 GB and paged. Fixed in metal/af3/main.mm the way
+a71ca0eb fixed cuda/: when the dialect folds on structural tokens, the peak is also `allocated + 6 x` the structural
+f32 pair (`sbatch.tokens`, read before the trunk runs; measured 5.86 at 544 residues). Now 8 copies estimate
+**11.31 GB** against the measured 11.16 (footprint) and fold unchanged (pLDDT 53.21 both ways), and 9 copies are
+refused in under a second at 14.0 GB. AF3's gate is identical after the change. The factor is one M2 measurement at
+one length; the M5, whose tensor path may hold differently, should re-measure it with `LOCALFOLD_PEAK=1
+LOCALFOLD_MEM=1` before trusting it there. Forcing 9 copies past the check (`LOCALFOLD_NO_FOLD_FITS=1`) was not run.
+
+The other items on your not-reaching-metal list were not looked at beyond this one.

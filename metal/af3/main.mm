@@ -136,6 +136,7 @@ ConfidenceOut structuralConfidence(Structural& st, const float* coords, std::vec
 // float (LOCALFOLD_HALF_PAIR=0) - each rounded up. (Below ~600 tokens the fold's fixed costs dominate and the estimate
 // reads up to 5% under; it is the long folds it decides.)
 static const double AF3_MSA_FACTOR = 3.2, AF3_PAIR_SLOW = 5.4;
+static const double OPENDDE_STRUCTURAL_FACTOR = 6;    // (OpenDDE: per byte of the structural f32 pair - foldInput)
 static double af3PairFactor() {
   static const bool halfPair = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
   return halfPair ? 5.1 : AF3_PAIR_SLOW;
@@ -149,7 +150,17 @@ int foldInput(const std::string& dir, Options o) {
       // times factors measured at 522 and 1044 tokens (metal/README.md)
     double pair = (double)n * n * metaI("trunk.embedder.pairChannels") * 4;
     double msa = (double)std::min((int)M.meta("batch.sequences"), o.msaCap) * n * metaI("trunk.embedder.msaChannels") * 4;
-    if (!foldFits("af3", (double)allocated() + af3PairFactor() * pair + AF3_MSA_FACTOR * msa)) { M.unloadInput(); return 1; }
+    double peak = (double)allocated() + af3PairFactor() * pair + AF3_MSA_FACTOR * msa;
+    // OpenDDE folds past its trunk on its structural tokens, and that is its peak - the refiner and then the confidence
+    // head on the structural f32 pair, with the trunk's given back - so it is asked too, before the trunk runs (cuda/af3's
+    // a71ca0eb). Measured on the M2 at 8 copies of 6MRR (544 residues, 1,040 structural tokens): the trunk's estimate
+    // read 3.66 GB and the fold peaked at 11.08 in the confidence head's transition, 5.86 times the structural f32 pair
+    // (1.66 GB) over what was held at this check
+    if (flag("trunk.dialect.structuralTokens") && M.has("sbatch.tokens")) {
+      const double ns = M.meta("sbatch.tokens");
+      peak = std::max(peak, (double)allocated() + OPENDDE_STRUCTURAL_FACTOR * ns * ns * metaI("trunk.embedder.pairChannels") * 4);
+    }
+    if (!foldFits("af3", peak)) { M.unloadInput(); return 1; }
   }
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");
   // the seeds: --seeds, else the job's modelSeeds, else the one seed
