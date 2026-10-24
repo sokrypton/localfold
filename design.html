@@ -178,10 +178,17 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         <span class="fetch-option-title">Validate with</span>
                         <select id="validate"
                             title="Fold the finished design again with a model that did not make it, and report its confidence and how far it moved.">
+                            <!-- 🔴 EXACTLY THE KEYS OF `FOLDERS` IN
+                                 web/validate-design.js. Boltz-2 and Protenix-2
+                                 were offered here and are not in that map, so
+                                 choosing either validated NOTHING and the run
+                                 reported no number - a control that silently
+                                 does nothing, which is worse than an absent
+                                 one. test/design-validate-options.test.js holds
+                                 this list against that map. -->
                             <option value="">nothing</option>
                             <option value="af3" selected>AF3</option>
-                            <option value="boltz2">Boltz-2</option>
-                            <option value="protenix2">Protenix-2</option>
+                            <option value="openbind0">OpenBind-0</option>
                             <option value="opendde">OpenDDE</option>
                         </select>
                     </div>

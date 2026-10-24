@@ -24,10 +24,10 @@ import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
-import { describeValidation, selfConsistency } from "../cpu/design/validate.js";
+import { FOLDERS, validateDesign } from "./validate-design.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
-export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" };
+export { FOLDERS } from "./validate-design.js";
 
 /**
  * Run one hunt.
@@ -257,33 +257,21 @@ export async function hunt(options) {
   // with a model that had no hand in making it is the only independent thing a
   // run produces. See cpu/design/validate.js.
   let validation = null;
-  if (best !== null && validate !== undefined && validate !== ""
-      && FOLDERS[validate] !== undefined) {
-    try {
-      status(`validating with ${validate}`);
-      const weights = await loadAf3Weights(() => {}, FOLDERS[validate]);
-      const refolded = await foldAf3({
-        sequence: best.complex ?? best.sequence,
-        weights, device, signal,
-        seed: (options.seed ?? 0) + 1,
-        calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
-        onStatus: (text) => status(`validating with ${validate} · ${text}`),
-        onProgress: () => {},
-      });
-      const { rmsd, comparable, residues } = selfConsistency(
-        best.pdb, refolded.pdb, CHAIN_IDS[chainIndex]);
-      validation = {
-        model: validate, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
-        pdb: refolded.pdb,
-      };
-      progressNote(describeValidation(validation));
-    } catch (error) {
-      // 🔴 A FAILED VALIDATION DOES NOT FAIL THE RUN. The design is already
-      // made; what is missing is the check, and saying so beats throwing away
-      // the result.
-      validation = { model: validate, failed: error.message };
-      progressNote(`could not validate with ${validate}: ${error.message}`);
-    }
+  if (best !== null) {
+    // One path for both methods - see web/validate-design.js, which is where
+    // this lived until the generate path needed the same check.
+    validation = await validateDesign({
+      pdb: best.pdb,
+      sequence: best.complex ?? best.sequence,
+      chain: CHAIN_IDS[chainIndex],
+      model: validate,
+      device,
+      seed: options.seed ?? 0,
+      steps: options.steps,
+      status,
+      signal,
+    });
+    if (validation?.described !== undefined) progressNote(validation.described);
   }
 
   toBar(1);

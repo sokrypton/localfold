@@ -21,6 +21,8 @@ import {
   LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { generate } from "./generate.js";
+import { validateDesign } from "./validate-design.js";
+import { getDevice } from "./model.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
 import { THREE_TO_ONE } from "../cpu/design/mpnn/constants.js";
@@ -191,6 +193,7 @@ const paintDesignerNote = (spans) => {
 const folders = element("folders");
 const folderNote = element("folder-note");
 const beam = element("beam");
+const validateSelect = element("validate");
 
 /**
  * What the schedule will actually cost, in folds.
@@ -633,7 +636,7 @@ const startHunt = async () => {
       runs: number("runs", 1),
       cycles: number("cycles", 5),
       beam: number("beam", 1),
-      validate: element("validate").value,
+      validate: validateSelect.value,
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
       steps: number("steps", 25),
@@ -910,6 +913,61 @@ element("structure-file").addEventListener("change", async (event) => {
   }
 });
 
+/**
+ * How good a generated candidate is, for picking between them.
+ *
+ * 🔴 A GENERATION SCORES NOTHING OF ITS OWN, which is the whole difficulty: the
+ * flow produces coordinates and no opinion about them. So the ranking is the
+ * VALIDATION fold's - the confidence a model that did not make it assigns, and
+ * whether it reproduces the backbone - and without a validation model there is
+ * nothing to rank by and the first candidate stands.
+ *
+ * 🔴 AND RMSD IS A PENALTY, NOT THE SCORE. A design the validator folds
+ * confidently but somewhere else is not the design that was asked for; 2 A is
+ * the threshold the field holds a self-consistent design to, so beyond it the
+ * confidence is discounted rather than trusted.
+ */
+function rankOf(candidate) {
+  const validation = candidate.validation;
+  if (validation == null || validation.failed !== undefined) return 0;
+  const confidence = validation.confidence ?? {};
+  const base = confidence.iptm ?? (confidence.meanPlddt ?? 0) / 100;
+  if (validation.comparable !== true || !Number.isFinite(validation.rmsd)) return base;
+  return base - Math.max(0, validation.rmsd - 2) * 0.1;
+}
+
+/** One finished candidate, as a row and as the structure on screen. */
+function drawGenerated(candidate, total) {
+  resultsBox.style.display = "";
+  viewerBox.style.display = "";
+  // The finished structure is the last frame, in the same frame of reference as
+  // the trajectory that led to it.
+  viewer.push(reference === null ? candidate.pdb
+    : alignToReference(candidate.pdb, reference, undefined),
+  (built) => { if (built) viewer.orient(); });
+
+  const row = document.createElement("tr");
+  // 🔴 ONE "best" MARKER, CLEARED FIRST - the same rule the hunt table has, and
+  // for the same reason: the leader changes as candidates arrive and every row
+  // that was ever the leader would otherwise keep the marker.
+  for (const marked of resultsBody.querySelectorAll("tr.best")) marked.classList.remove("best");
+  row.className = "best";
+  const validation = candidate.validation;
+  for (const [text, className] of [
+    [String(candidate.candidate + 1), ""],
+    [total === 1 ? "\u2014" : `of ${total}`, ""],
+    ["rfd4-proteina", ""],
+    [`${candidate.tokens} tokens`, ""],
+    [validation?.described ?? `${candidate.steps} steps`, "validity"],
+  ]) {
+    const cell = document.createElement("td");
+    cell.textContent = text;
+    if (className) cell.className = className;
+    row.append(cell);
+  }
+  resultsBody.append(row);
+}
+
 /** RFD4-Proteina: one generation, straight into the viewer. */
 const startGenerate = async () => {
   const spans = spanList.read();
@@ -933,7 +991,21 @@ const startGenerate = async () => {
   progress.dataset.state = "running";
   say("starting");
 
+  // 🔴 THE BEAM IS CANDIDATES, NOT CYCLES. A generation is one pass, so there
+  // is nothing to carry forward the way a hunt carries a sequence between
+  // cycles - drawing N of them and keeping the best is the only thing "try more
+  // than one" can mean here. Each is a whole generation, so the cost is linear
+  // and the control says so by being the same control Hunter labels Sequences.
+  const candidates = Math.max(1, Math.floor(number("beam", 1)));
+  const wanted = validateSelect.value;
+  let best = null;
+
   try {
+    for (let candidate = 0; candidate < candidates; candidate += 1) {
+    if (controller.signal.aborted) break;
+    // Each candidate is its own trajectory, so it gets its own frame of
+    // reference and its own run of the viewer.
+    if (candidate > 0) { viewer.cancelAnimations(); viewer.reset(); reference = null; }
     const result = await generate({
       contig,
       ...presetExtras,
@@ -965,28 +1037,47 @@ const startGenerate = async () => {
           : alignToReference(step.pdb, reference, undefined);
         viewer.push(placed, (built) => { if (built) viewer.orient(); });
       },
-      seed: number("seed", 0),
+      // 🔴 A DIFFERENT SEED A CANDIDATE, or the beam draws the same structure
+      // N times: the flow is deterministic given its seed, so N identical
+      // generations is N times the cost for one answer.
+      seed: number("seed", 0) + candidate,
       signal: controller.signal,
-      status: (text) => say(text),
-      progress: (fraction) => { progress.value = fraction; },
+      status: (text) => say(candidates === 1 ? text
+        : `candidate ${candidate + 1}/${candidates} · ${text}`),
+      progress: (fraction) => {
+        progress.value = (candidate + fraction) / candidates;
+      },
     });
-    viewerBox.style.display = "";
-    // The finished structure is the last frame, in the same frame of reference
-    // as the trajectory that led to it.
-    viewer.push(reference === null ? result.pdb
-      : alignToReference(result.pdb, reference, undefined),
-    (built) => { if (built) viewer.orient(); });
-    resultsBox.style.display = "";
-    const row = document.createElement("tr");
-    row.className = "best";
-    for (const text of ["1", "\u2014", "rfd4-proteina", `${result.tokens} tokens`,
-      `${result.steps} steps`]) {
-      const cell = document.createElement("td");
-      cell.textContent = text;
-      row.append(cell);
+
+    // 🔴 THE CHECK THE GENERATE PATH DID NOT HAVE. `Validate with` was on this
+    // page for both methods and only the hunt honoured it - a control that
+    // silently does nothing, which is worse than an absent one. It matters MORE
+    // here than in a hunt: a hunt at least optimises a folding model's opinion,
+    // where a generation scores nothing at all, so this is the only number the
+    // run produces.
+    const validation = await validateDesign({
+      pdb: result.pdb,
+      model: wanted,
+      device: await getDevice(),
+      seed: number("seed", 0) + candidate,
+      steps: number("steps", 60),
+      status: (text) => say(candidates === 1 ? text
+        : `candidate ${candidate + 1}/${candidates} · ${text}`),
+      signal: controller.signal,
+    });
+
+    const scored = { ...result, validation, candidate };
+    if (best === null || rankOf(scored) > rankOf(best)) best = scored;
+    drawGenerated(scored, candidates);
     }
-    resultsBody.append(row);
-    say(`done · ${result.tokens} tokens over ${result.steps} steps`);
+
+    if (best === null) throw new Error("no candidate completed");
+    const result = best;
+    say(`done · ${result.tokens} tokens over ${result.steps} steps`
+      + (candidates === 1 ? "" : `, best of ${candidates}`)
+      + (result.validation?.described === undefined ? ""
+        : ` · ${result.validation.described}`));
+    progress.value = 1;
     progress.dataset.state = "done";
   } catch (error) {
     if (controller.signal.aborted) {
