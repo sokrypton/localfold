@@ -49,8 +49,16 @@ const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
 // The MSA rows one msa.project workgroup normalises and projects (createMsaAttentionShaders' projectRows): the value
 // and gate weights read once for all of them.
 const MSA_PROJECT_ROWS = 16;
-// (`msaProjectRows` a device tuning for the arms; 1 is the row-a-workgroup kernel)
-const msaProjectRows = (device) => deviceTuning(device).msaProjectRows ?? MSA_PROJECT_ROWS;
+// (`msaProjectRows` a device tuning for the arms; 1 is the row-a-workgroup kernel) - halved until the tile's workgroup
+// storage fits the device: R x (C_M + 128) floats and R statistics pairs. 🔴 At a 128-channel MSA (protenix2, OpenDDE,
+// IntelliFold-2) 16 rows are 16512 bytes, 128 over the 16384 WebGPU guarantees, so test:spec-floor could not create
+// those three models' pipelines; AlphaFold 3's 64 channels fit (12416). The kernel is bit-identical at any row count.
+const msaProjectRows = (device, msaChannels) => {
+  const room = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  let rows = deviceTuning(device).msaProjectRows ?? MSA_PROJECT_ROWS;
+  while (rows > 1 && rows * ((msaChannels + 128) * 4 + 8) > room) rows = Math.ceil(rows / 2);
+  return rows;
+};
 // ...and the consecutive tokens of one sequence one msa.average workgroup averages (`msaAverageRows`; 1 the control)
 const MSA_AVERAGE_ROWS = 8;
 const msaAverageRows = (device) => deviceTuning(device).msaAverageRows ?? MSA_AVERAGE_ROWS;
@@ -286,7 +294,7 @@ export class Af3MsaStackGpu {
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,
-        heads: msaHeads, dimension: msaDimension, projectRows: msaProjectRows(this.device),
+        heads: msaHeads, dimension: msaDimension, projectRows: msaProjectRows(this.device, msaChannels),
         averageRows: msaAverageRows(this.device) },
       packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
     for (const [name, source] of Object.entries(attentionSources)) {
@@ -299,7 +307,7 @@ export class Af3MsaStackGpu {
       // The OPM loop above already appends its own discriminators; this one
       // appended nothing.
       into(`msa:${name}`, `${base}:msa:${name}:${msaAttentionKeyPart(
-        { heads: msaHeads, dimension: msaDimension })}${name === "project" ? `:r${msaProjectRows(this.device)}` : name === "average" ? `:r${msaAverageRows(this.device)}` : ""}`, source);
+        { heads: msaHeads, dimension: msaDimension })}${name === "project" ? `:r${msaProjectRows(this.device, msaChannels)}` : name === "average" ? `:r${msaAverageRows(this.device)}` : ""}`, source);
     }
     into("msaTransition", `${base}:msa-transition`,
       createTransitionShader({ rows, channels: msaChannels, factor: 4 },
@@ -615,7 +623,7 @@ export class Af3MsaStackGpu {
           [attention], weightGroups[0], weightGroups[1]);
       const perRow = spread(rows);
       // ...one workgroup a row now; see the note on the kernel.
-      const perProjectTile = spread(ceil(rows, msaProjectRows(this.device)));
+      const perProjectTile = spread(ceil(rows, msaProjectRows(this.device, msaChannels)));
       run("msa.project", pipelines["msa:project"],
           [msa, attentionWeights, msaScratch[0], msaScratch[1]], perProjectTile[0], perProjectTile[1]);
       const perAverageTile = spread(sequences * ceil(n, msaAverageRows(this.device)));
