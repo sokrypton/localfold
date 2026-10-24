@@ -105,23 +105,44 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
 
                 <div class="fetch-row" id="design-input-container">
                     <div class="entity-list">
-                        <div id="entity-rows"></div>
-                        <button id="add-entity" type="button" title="Add another chain, ligand or nucleic acid to the target.">
-                            <i class="fa-solid fa-plus"></i> Add
-                        </button>
+                        <div id="contig-rows"></div>
+                        <div class="contig-foot">
+                            <button id="add-span" type="button"
+                                title="Add another span: residues to design, a chain you know, part of a loaded structure, a ligand, or a chain break.">
+                                <i class="fa-solid fa-plus"></i> Add span
+                            </button>
+                            <!-- 🔴 THE NOTATION, SHOWN RATHER THAN TYPED. The rows
+                                 are the input; this is what they amount to, in
+                                 RFdiffusion's own contig notation, updating on every
+                                 keystroke. It is here so the list is legible to
+                                 somebody who already thinks in contigs - and so a
+                                 preset loaded into the rows can be recognised. -->
+                            <code id="contig-line" title="What these spans amount to, in RFdiffusion's contig notation."></code>
+                        </div>
+                        <div id="contig-problems" class="option-note"></div>
+                    </div>
+
+                    <!-- 🔴 THE TEN WORKED EXAMPLES THAT COME WITH THE ENGINE, each
+                         one a modality: unconditional, a binder with hotspots,
+                         indexed and unindexed motif scaffolding, a small-molecule
+                         pocket, a DNA complex, partial diffusion, inverse folding.
+                         Loading one fills the rows, so an example is a starting
+                         point to edit rather than a black box to run. -->
+                    <div class="contig-presets">
+                        <label for="preset">Start from</label>
+                        <select id="preset" title="Load a worked example into the spans above.">
+                            <option value="">nothing — build it yourself</option>
+                        </select>
+                        <div id="preset-note" class="option-note"></div>
                     </div>
                 </div>
 
                 <div class="fetch-options" id="designOptions">
 
-                    <!-- WHAT IS BEING DESIGNED. Length first: it is the one
-                         number that decides the size of every job below. -->
-                    <div class="fetch-option-group" id="binderGroup">
-                        <span class="fetch-option-title">Binder</span>
-                        <label for="binder-length">Length</label>
-                        <input type="number" id="binder-length" min="4" max="400" value="75"
-                            title="How many residues the designed chain has. It starts as X at every position and the loop fills it in.">
-                    </div>
+                    <!-- 🔴 NO BINDER LENGTH HERE ANY MORE. It was a control of its
+                         own when the target was an entity list; it is a Design span's
+                         length now, which is where it belongs - one place where a job
+                         says how many residues it wants, whichever method runs it. -->
 
                     <!-- WHO DESIGNS THE SEQUENCE. Auto writes its reason out
                          rather than silently changing the picker: the rule is
@@ -173,6 +194,15 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         <label for="runs">Runs</label>
                         <input type="number" id="runs" min="1" max="100" value="1"
                             title="How many independent hunts to do, each from its own seed.">
+                    </div>
+
+                    <!-- HOW LONG THE GENERATION RUNS. RFD4-Proteina's own, and
+                         the presets carry a count each; this overrides it. -->
+                    <div class="fetch-option-group" id="stepsGroup">
+                        <span class="fetch-option-title">Generation</span>
+                        <label for="steps">Steps</label>
+                        <input type="number" id="steps" min="4" max="400" value="60"
+                            title="How many flow-matching steps RFD4-Proteina takes. Sixty is the presets' usual count.">
                     </div>
 
                     <!-- HOW THE SEQUENCE IS DRAWN. These are the knobs that

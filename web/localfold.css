@@ -1341,3 +1341,92 @@
    changes, since the loop decides `best` by mutating the record it marked
    before and the page cannot see that happen. */
 #cycle-track .best-line { font-weight: 500; }
+
+/* ---------------------------------------------------------------------------
+   The contig editor (design.html): the job as a list of spans.
+
+   🔴 THREE GRID TRACKS AND EXACTLY THREE CHILDREN PER ROW, whatever the kind,
+   for the reason .entity-row's own note gives: a grid with more children than
+   tracks does not overflow, it WRAPS onto an implicit second row, and
+   tools/mobile-layout.py reports that as a row broken across two lines. The
+   per-kind fields therefore live inside the middle child.
+   --------------------------------------------------------------------------- */
+.contig-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  position: relative;
+}
+
+.contig-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The words between the fields. They carry the row's grammar - "residues 5 to
+   20" reads; three bare number boxes do not. */
+.contig-label {
+  font-size: 12px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+
+.contig-number { width: 7ch; padding: 8px; text-align: right; }
+.contig-chain { width: 5ch; padding: 8px; text-align: center; }
+.contig-code { width: 7ch; padding: 8px; text-transform: uppercase; }
+.contig-sequence { flex: 1 1 100%; min-width: 0; height: 52px; resize: vertical; }
+
+/* A break has nothing to fill in, so its row says what it does instead. */
+.contig-break { font-style: italic; }
+
+/* 🔴 A SPAN THE CHOSEN METHOD CANNOT HONOUR IS MARKED, NOT REMOVED - the same
+   rule as the option groups above. The row keeps working, because switching
+   method is one click and the span is still what the user meant. */
+.contig-row-unavailable .entity-value,
+.contig-row-unavailable .entity-picker { border-color: #fbbf24; }
+.contig-reason { flex: 1 1 100%; }
+
+.contig-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* What the spans amount to, in RFdiffusion's notation. Monospace because it is
+   a notation, and selectable because it is worth copying into a script. */
+#contig-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: .02em;
+  color: #374151;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 4px 8px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+#contig-line:empty { display: none; }
+
+#contig-problems:empty { display: none; }
+
+.contig-presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.contig-presets label { font-size: 12px; color: #6b7280; }
+.contig-presets select { max-width: 100%; }
+#preset-note { flex: 1 1 100%; max-width: none; }

@@ -31,17 +31,25 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import cdp  # noqa: E402
 
-# A ligand beside the protein: the one change that must move the automatic
+# A ligand span beside a designed one: the change that must move the automatic
 # designer, because only LigandMPNN's encoder reads heteroatoms.
-WITH_LIGAND = [{"type": "protein", "copies": 1, "value": "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK"},
-               {"type": "ligand", "copies": 1, "value": "HEM"}]
+WITH_LIGAND = [{"kind": "generated", "min": 60, "max": 60},
+               {"kind": "break"},
+               {"kind": "ligand", "code": "HEM"}]
+
+# The target and binder a hunt runs on, as spans.
+HUNT_SPANS = [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN"},
+              {"kind": "break"},
+              {"kind": "generated", "min": 12, "max": 12}]
 
 READ_PAGE = """(() => {
   const t = (id) => document.getElementById(id)?.textContent?.trim() ?? null;
   const n = (sel) => document.querySelectorAll(sel).length;
   return JSON.stringify({
     designer: t("designer-note"), folder: t("folder-note"), gpu: t("gpu-summary"),
-    entityRows: n("#entity-rows > *"), roles: n("#roles-legend .role-list li"),
+    spanRows: n("#contig-rows > *"), roles: n("#roles-legend .role-list li"),
+    contig: t("contig-line"), problems: t("contig-problems"),
+    presets: document.querySelectorAll("#preset option").length,
     columns: n("#results-table thead th"),
     hunt: document.getElementById("hunt")?.textContent?.trim(),
   });
@@ -85,15 +93,26 @@ def main():
             bad.append("the designer note is not the automatic reason")
         if page["roles"] != 5:
             bad.append(f"{page['roles']} role swatches, expected 5")
-        if page["entityRows"] == 0:
-            bad.append("the target list drew no rows")
+        if page["spanRows"] != 3:
+            bad.append(f"the span editor drew {page['spanRows']} rows, expected 3")
+        # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE
+        # ASKED, which differs by method and must. The page opens on Protein
+        # Hunter, whose input is chains - so it reads "given 114 · design 75"
+        # for the default job. A contig would be actively wrong here: a given
+        # SEQUENCE has no contig notation, so the line read "/0,75-75" for a job
+        # whose target is 114 residues long. The RFD4 form is checked below,
+        # through a preset.
+        if "given 114" not in (page["contig"] or "") or "design 75" not in (page["contig"] or ""):
+            bad.append(f"the line does not describe the default job to Hunter: {page['contig']!r}")
+        if page["presets"] < 11:
+            bad.append(f"the preset picker lists {page['presets']} entries, expected 10 plus the blank")
         if page["columns"] != 5:
             bad.append(f"{page['columns']} result columns, expected 5")
         if (page["gpu"] or "") == "":
             bad.append("the page did not say whether WebGPU is available")
 
         # ...and that the automatic choice is wired to the target, not printed.
-        cdp.evaluate(ws, f"""(() => {{ window.__designEntities.set({json.dumps(WITH_LIGAND)}); return 1; }})()""")
+        cdp.evaluate(ws, f"""(() => {{ window.__designSpans.set({json.dumps(WITH_LIGAND)}); return 1; }})()""")
         time.sleep(0.3)
         withLigand = cdp.evaluate(ws, "document.getElementById('designer-note').textContent")
         print(f"  with a ligand: {withLigand}")
@@ -148,12 +167,11 @@ def main():
         # and a row per cycle. A 31-residue target and a 12-residue binder runs
         # in about thirty seconds on an M5 off the local bundles.
         cdp.evaluate(ws, """(() => {
+          const HUNT_SPANS_JSON = __SPANS__;
           for (const k of ['alphafold3','openbind0','opendde','boltz2','protenix2',
                            'intellifold2','rosettafold3'])
             localStorage.setItem('localfold.modelTerms.' + k, 'accepted');
-          window.__designEntities.set([{ type: 'protein', copies: 1,
-            value: 'GWSTELEKHREELKEFLKKEGITNVEIRIDN' }]);
-          document.getElementById('binder-length').value = '12';
+          window.__designSpans.set(HUNT_SPANS_JSON);
           document.getElementById('cycles').value = '3';
           document.getElementById('runs').value = '1';
           // 🔴 TWO FOLDERS, so the run exercises the rotation and not just the
@@ -165,7 +183,7 @@ def main():
           document.getElementById('folders').dispatchEvent(new Event('change'));
           document.getElementById('hunt').click();
           return 1;
-        })()""")
+        })()""".replace("__SPANS__", json.dumps(HUNT_SPANS)))
         deadline = time.time() + 300
         hunted = None
         while time.time() < deadline:
@@ -248,8 +266,12 @@ def main():
                 bad.append("cycle 0 was marked best; it is the starting draw and cannot win")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
-        # On RFD4 it must say so rather than pretending: the engine is in the
-        # tree, the page is not joined to it.
+        # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.
+        # The spans left over from the hunt describe a target by its SEQUENCE,
+        # which is exactly what Hunter takes and exactly what RFD4 cannot hold
+        # fixed - it conditions on coordinates. Refusing it with that reason is
+        # the geometry axis working; a generation that started anyway would be
+        # conditioning on nothing.
         cdp.evaluate(ws, """(() => {
           const pick = document.getElementById('method');
           pick.value = 'rfd4p';
@@ -259,9 +281,39 @@ def main():
         })()""")
         time.sleep(0.3)
         onRfd4p = cdp.evaluate(ws, "document.getElementById('status-message').textContent")
-        print(f"  Hunt on RFD4-Proteina: {onRfd4p}")
-        if "not wired" not in onRfd4p:
-            bad.append(f"Hunt on RFD4 did not say it is unwired: {onRfd4p!r}")
+        print(f"  Generate on a sequence span: {onRfd4p}")
+        if "coordinates" not in onRfd4p:
+            bad.append(f"RFD4 did not refuse a sequence span for the right reason: {onRfd4p!r}")
+
+        # ...and a contig it CAN run is accepted: loading a preset fills the
+        # spans, picks RFD4, and leaves no problem to report.
+        loaded = json.loads(cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById('preset');
+          pick.value = 'motif_idx_1prw';
+          pick.dispatchEvent(new Event('change'));
+          return JSON.stringify({
+            method: document.getElementById('method').value,
+            contig: document.getElementById('contig-line').textContent.trim(),
+            problems: document.getElementById('contig-problems').textContent.trim(),
+            rows: document.querySelectorAll('#contig-rows > *').length,
+            button: document.getElementById('hunt').textContent.trim(),
+          });
+        })()"""))
+        print(f"  preset motif_idx_1prw: {loaded}")
+        # 🔴 THE PRESET'S OWN CONTIG, REBUILT FROM THE ROWS IT FILLED. Loading a
+        # preset into an editor is only honest if the editor can express it: if
+        # the round trip lost a span the page would run a different job from the
+        # one it names.
+        if not loaded["contig"].startswith("5-20,A16-35,10-25,A52-71,5-20"):
+            bad.append(f"the preset did not round-trip through the spans: {loaded['contig']!r}")
+        if loaded["rows"] != 5:
+            bad.append(f"the preset filled {loaded['rows']} rows, expected 5")
+        if loaded["method"] != "rfd4p":
+            bad.append("loading an RFD4 preset did not select RFD4")
+        if loaded["problems"] != "":
+            bad.append(f"the preset reported a problem: {loaded['problems']!r}")
+        if loaded["button"] != "Generate":
+            bad.append(f"the button says {loaded['button']!r} on RFD4, expected Generate")
     finally:
         proc.terminate()
         server.terminate()
