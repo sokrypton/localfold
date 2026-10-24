@@ -545,6 +545,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // 12.4 -> 189 ms, an AF2 pass at 261 residues and 1536 rows 17 -> 84 s), whether a tile reached it or not. The M5
   // never showed it: it allocates registers dynamically, and runs lf_gemm_tensor anyway.
   bool stored8x8 = false;
+  constexpr bool PLAIN_IN_PLACE = (EP & 64) == 0 && metal::is_same_v<TC, half> == ((EP & 8) != 0);
   if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
     if (j0 + TR <= g.n && i0 + TC_ <= g.m) {
       if (g.epilogue & 128) {
@@ -554,6 +555,36 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             _Pragma("clang loop unroll(full)")
             for (int b = 0; b < FC; b += 2) LF_STORE_SWIGLU_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
           return;
+        }
+      } else if (PLAIN_IN_PLACE && (g.epilogue & ~6) == 0 && g.beta == 0.f) {
+        // a plain product (a bias, a ReLU) in the output's type: the accumulators adjusted in place and stored, decided
+        // once for the tile - asked inside LF_STORE_8X8, every one of the FR x FC blocks carries the general epilogue
+        // beside it, and on Apple8 that is 5% of a plain GEMM (1024 x 66816 x 256: 12.3 -> 12.9 ms at 0de9becb)
+        if constexpr (PLAIN_IN_PLACE) {
+          _Pragma("clang loop unroll(full)")
+          for (int a = 0; a < FR; ++a)
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b) {
+              const int i = i0 + sc + b * 8;
+              thread auto& e = acc[a][b].thread_elements();
+              if (g.epilogue || g.alpha != 1.f) {
+                float2 bv2(0.f);
+                if (g.epilogue & 4) {
+                  const ulong boff = (g.ptrs ? (ulong)z * g.m : 0) + i + sn;
+                  bv2 = (g.biasType & 255) == 2 ? float2(*(device const half2*)((device const half*)g.bias + boff))
+                                                : *(device const float2*)((device const float*)g.bias + boff);
+                }
+                _Pragma("clang loop unroll(full)")
+                for (int t = 0; t < 2; ++t) {
+                  float v = g.alpha * (float)e[t] + bv2[t];
+                  if (g.epilogue & 2) v = max(v, 0.f);
+                  e[t] = v;
+                }
+              }
+              simdgroup_store(acc[a][b], D + (ulong)(j0 + sr + a * 8) * g.ldd + i, (ulong)g.ldd);
+            }
+          if constexpr ((EP & 128) == 0) return;
+          stored8x8 = true;
         }
       } else if ((EP & 64) == 0 || (g.epilogue & (8192 | 1048576))) {
         _Pragma("clang loop unroll(full)")
