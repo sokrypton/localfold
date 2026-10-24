@@ -118,18 +118,58 @@ inline std::function<void(const float*, size_t, size_t)> PAIR_CHUNK_SINK;
 // its projection - docking (class 5: none), relative chain (the dense sym-id rank, 2 +- 2, or 5 across entities),
 // relative entity (the dense entity rank, 1 +- 1), the residue and token separations (as the trunk's), the two
 // restraints at their masked column - plus a bond term from the declared-bond matrix (declaredBondMatrix)
-__global__ void chaiStructurePairK(const float* trunkPair, int Czt, const int* residueIndex, const int* tokenIndex,
-                                   const int* asymId, const int* entityRank, const int* symRank, const float* Wp,
-                                   const float* bias, const float* bonds, const float* Wb, float* out, int n, int Cz,
-                                   size_t p0, size_t r) {
+__global__ void chaiStructurePairK(const float* __restrict__ trunkPair, int Czt, const int* __restrict__ residueIndex,
+                                   const int* __restrict__ tokenIndex, const int* __restrict__ asymId,
+                                   const int* __restrict__ entityRank, const int* __restrict__ symRank,
+                                   const float* __restrict__ Wp, const float* __restrict__ bias,
+                                   const float* __restrict__ bonds, const float* __restrict__ Wb,
+                                   float* __restrict__ out, int n, int Cz, size_t p0, size_t r) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   int width = Czt + Cz;
+  auto clip = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  if ((Czt & 3) == 0 && (Cz & 3) == 0) {
+    size_t width4 = (size_t)(width >> 2);
+    if (t >= r * width4) return;
+    int c = (int)(t % width4) << 2; size_t row = t / width4; size_t ij = p0 + row;
+    if (c < Czt) {
+      *(float4*)(out + (t << 2)) = __ldg(reinterpret_cast<const float4*>(trunkPair + ij * Czt + c));
+      return;
+    }
+    c -= Czt;
+    int i = (int)(ij / n), j = (int)(ij % n);
+    int ai = __ldg(asymId + i), aj = __ldg(asymId + j);
+    int ri = __ldg(residueIndex + i), rj = __ldg(residueIndex + j);
+    bool sameChain = ai == aj;
+    int rss = sameChain ? clip(ri - rj + 33, 0, 65) : 66;
+    int rts = sameChain && ri == rj ? clip(__ldg(tokenIndex + i) - __ldg(tokenIndex + j) + 32, 0, 65) : 66;
+    int relEntity = __ldg(entityRank + i) - __ldg(entityRank + j);
+    int rchain = relEntity != 0 ? 5 : clip(__ldg(symRank + i) - __ldg(symRank + j) + 2, 0, 4);
+    int rent = clip(relEntity + 1, 0, 2);
+    float4 b4 = __ldg(reinterpret_cast<const float4*>(bias + c));
+    float4 w5 = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)5 * Cz + c));
+    float4 w155 = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)155 * Cz + c));
+    float4 w162 = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)162 * Cz + c));
+    float4 wc = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)(6 + rchain) * Cz + c));
+    float4 we = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)(12 + rent) * Cz + c));
+    float4 wrs = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)(15 + rss) * Cz + c));
+    float4 wrt = __ldg(reinterpret_cast<const float4*>(Wp + (size_t)(82 + rts) * Cz + c));
+    float4 v = make_float4(b4.x + w5.x + w155.x + w162.x + wc.x + we.x + wrs.x + wrt.x,
+                           b4.y + w5.y + w155.y + w162.y + wc.y + we.y + wrs.y + wrt.y,
+                           b4.z + w5.z + w155.z + w162.z + wc.z + we.z + wrs.z + wrt.z,
+                           b4.w + w5.w + w155.w + w162.w + wc.w + we.w + wrs.w + wrt.w);
+    if (bonds) {
+      float bnd = __ldg(bonds + ij);
+      float4 wb4 = __ldg(reinterpret_cast<const float4*>(Wb + c));
+      v.x += bnd * wb4.x; v.y += bnd * wb4.y; v.z += bnd * wb4.z; v.w += bnd * wb4.w;
+    }
+    *(float4*)(out + (t << 2)) = v;
+    return;
+  }
   if (t >= r * width) return;
   int c = (int)(t % width); size_t row = t / width; size_t ij = p0 + row;
   if (c < Czt) { out[t] = trunkPair[ij * Czt + c]; return; }
   c -= Czt;
   int i = (int)(ij / n), j = (int)(ij % n);
-  auto clip = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
   bool sameChain = asymId[i] == asymId[j];
   int rss = sameChain ? clip(residueIndex[i] - residueIndex[j] + 33, 0, 65) : 66;
   int rts = sameChain && residueIndex[i] == residueIndex[j] ? clip(tokenIndex[i] - tokenIndex[j] + 32, 0, 65) : 66;
@@ -229,7 +269,7 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
           Idev("batch.features.symId"), outRows, n, trunkWidth, 32, 2, p0, r);
       };
       if (chai) {
-        chaiStructurePairK<<<blocks(r * width), 256, 0, STREAM>>>(trunkPair, Czt, Idev("batch.features.residueIndex"),
+        chaiStructurePairK<<<blocks(((Czt & 3) == 0 && (Cz & 3) == 0) ? (r * (width >> 2)) : (r * width)), 256, 0, STREAM>>>(trunkPair, Czt, Idev("batch.features.residueIndex"),
           Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), denseRank("batch.features.entityId"),
           denseRank("batch.features.symId"), W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
           M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, n, Cz, p0, r);
@@ -485,7 +525,9 @@ __global__ void adaLnStridedK(const float* x, const float* scale, const float* s
 // scale/shift/gate read at their row strides. Fuses a residual add with the next adaptive LN.
 template <class TO, bool RAW = false>
 __global__ void gatedAddAdaLnK(float* act, const float* y, const float* gate, int ldg, const float* scale,
-                               const float* shift, int lds, TO* out, int C, int period, bool noRes = false) {
+                               const float* shift, int lds, TO* out, int C, int period, bool noRes = false,
+                               const float* scale2 = nullptr, const float* shift2 = nullptr, TO* out2 = nullptr,
+                               const float* y2 = nullptr, const float* gate2 = nullptr) {
   extern __shared__ float row[];
   __shared__ float red[32];
   size_t r = blockIdx.x, pr = r % period;
@@ -493,7 +535,12 @@ __global__ void gatedAddAdaLnK(float* act, const float* y, const float* gate, in
   float s = 0;
   for (int c = threadIdx.x; c < C; c += blockDim.x) {
     float v = a[c];
-    if (y) { float u = v + y[r * C + c] * sigm(gate[pr * ldg + c]); a[c] = u; if (!noRes) v = u; }
+    if (y) {
+      float u = v + y[r * C + c] * sigm(gate[pr * ldg + c]);
+      if (y2) u += y2[r * C + c] * sigm(gate2[pr * ldg + c]);
+      a[c] = u;
+      if (!noRes) v = u;
+    }
     row[c] = v; s += v;
   }
   auto blockSum = [&](float v) {
@@ -509,8 +556,11 @@ __global__ void gatedAddAdaLnK(float* act, const float* y, const float* gate, in
   for (int c = threadIdx.x; c < C; c += blockDim.x) { float d = row[c] - mean; v += d * d; }
   float inv = rsqrtf(blockSum(v) / C + ADA_EPS);
   if (!out) return;
-  for (int c = threadIdx.x; c < C; c += blockDim.x)
-    out[r * C + c] = fromF<TO>(ADA(scale[pr * lds + c]) * ((row[c] - mean) * inv) + shift[pr * lds + c]);
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float n = (row[c] - mean) * inv;
+    out[r * C + c] = fromF<TO>(ADA(scale[pr * lds + c]) * n + shift[pr * lds + c]);
+    if (out2) out2[r * C + c] = fromF<TO>(ADA(scale2[pr * lds + c]) * n + shift2[pr * lds + c]);
+  }
 }
 // The same, a warp per row with float4 loads (C a multiple of 128): 68 rows of 768 are too
 // few for a block each to pay for its two block-wide reductions.
@@ -562,7 +612,9 @@ __global__ void __launch_bounds__((NW == 6 && std::is_same_v<TO, half> && std::i
                                   (NW == 6 || NW == 3) ? 8 : 1)
 gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* __restrict__ gate, int ldg,
                   const TI* __restrict__ scale, const TI* __restrict__ shift, int lds, TO* __restrict__ out,
-                  int C, int period, bool noRes = false) {
+                  int C, int period, bool noRes = false,
+                  const TI* __restrict__ scale2 = nullptr, const TI* __restrict__ shift2 = nullptr, TO* __restrict__ out2 = nullptr,
+                  const TI* __restrict__ y2 = nullptr, const TI* __restrict__ gate2 = nullptr) {
   if constexpr (NW == 6 && std::is_same_v<TO, half> && std::is_same_v<TI, half>) {
     __shared__ float2 red3[3];
     unsigned r = blockIdx.x, pr = r < (unsigned)period ? r : r % (unsigned)period;
@@ -574,11 +626,20 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
     if (y) {
       uint4 yy8 = __ldg(reinterpret_cast<const uint4*>(y + (size_t)r * 768 + c));
       uint4 g8 = __ldg(reinterpret_cast<const uint4*>(gate + (size_t)pr * ldg + c));
-      const half2* y2 = (const half2*)&yy8; const half2* g2 = (const half2*)&g8;
-      float2 y0 = __half22float2(y2[0]), y1 = __half22float2(y2[1]), y2_ = __half22float2(y2[2]), y3 = __half22float2(y2[3]);
-      float2 g0 = __half22float2(g2[0]), g1 = __half22float2(g2[1]), g2_ = __half22float2(g2[2]), g3 = __half22float2(g2[3]);
+      const half2* yh = (const half2*)&yy8; const half2* gh = (const half2*)&g8;
+      float2 y0 = __half22float2(yh[0]), y1 = __half22float2(yh[1]), y2_ = __half22float2(yh[2]), y3 = __half22float2(yh[3]);
+      float2 g0 = __half22float2(gh[0]), g1 = __half22float2(gh[1]), g2_ = __half22float2(gh[2]), g3 = __half22float2(gh[3]);
       float4 u0 = make_float4(x0.x + y0.x * sigm(g0.x), x0.y + y0.y * sigm(g0.y), x0.z + y1.x * sigm(g1.x), x0.w + y1.y * sigm(g1.y));
       float4 u1 = make_float4(x1.x + y2_.x * sigm(g2_.x), x1.y + y2_.y * sigm(g2_.y), x1.z + y3.x * sigm(g3.x), x1.w + y3.y * sigm(g3.y));
+      if (y2) {
+        uint4 yy8b = __ldg(reinterpret_cast<const uint4*>(y2 + (size_t)r * 768 + c));
+        uint4 g8b = __ldg(reinterpret_cast<const uint4*>(gate2 + (size_t)pr * ldg + c));
+        const half2* yhb = (const half2*)&yy8b; const half2* ghb = (const half2*)&g8b;
+        float2 yb0 = __half22float2(yhb[0]), yb1 = __half22float2(yhb[1]), yb2 = __half22float2(yhb[2]), yb3 = __half22float2(yhb[3]);
+        float2 gb0 = __half22float2(ghb[0]), gb1 = __half22float2(ghb[1]), gb2 = __half22float2(ghb[2]), gb3 = __half22float2(ghb[3]);
+        u0.x += yb0.x * sigm(gb0.x); u0.y += yb0.y * sigm(gb0.y); u0.z += yb1.x * sigm(gb1.x); u0.w += yb1.y * sigm(gb1.y);
+        u1.x += yb2.x * sigm(gb2.x); u1.y += yb2.y * sigm(gb2.y); u1.z += yb3.x * sigm(gb3.x); u1.w += yb3.y * sigm(gb3.y);
+      }
       *(float4*)(act + (size_t)r * 768 + c) = u0;
       *(float4*)(act + (size_t)r * 768 + c + 4) = u1;
       if (!noRes) { x0 = u0; x1 = u1; }
@@ -598,12 +659,29 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
     float2 r0 = red3[0], r1 = red3[1], r2 = red3[2];
     float invC = 1.f / 768.f, mean = (r0.x + r1.x + r2.x) * invC;
     float inv = rsqrtf(fmaxf((r0.y + r1.y + r2.y) * invC - mean * mean, 0.f) + ADA_EPS);
+    float n0x = (x0.x - mean) * inv, n0y = (x0.y - mean) * inv, n0z = (x0.z - mean) * inv, n0w = (x0.w - mean) * inv;
+    float n1x = (x1.x - mean) * inv, n1y = (x1.y - mean) * inv, n1z = (x1.z - mean) * inv, n1w = (x1.w - mean) * inv;
     uint4 o8; half2* o2 = (half2*)&o8;
-    o2[0] = __floats2half2_rn(sc0.x * ((x0.x - mean) * inv) + sh0.x, sc0.y * ((x0.y - mean) * inv) + sh0.y);
-    o2[1] = __floats2half2_rn(sc1.x * ((x0.z - mean) * inv) + sh1.x, sc1.y * ((x0.w - mean) * inv) + sh1.y);
-    o2[2] = __floats2half2_rn(sc2_.x * ((x1.x - mean) * inv) + sh2_.x, sc2_.y * ((x1.y - mean) * inv) + sh2_.y);
-    o2[3] = __floats2half2_rn(sc3.x * ((x1.z - mean) * inv) + sh3.x, sc3.y * ((x1.w - mean) * inv) + sh3.y);
+    o2[0] = __floats2half2_rn(sc0.x * n0x + sh0.x, sc0.y * n0y + sh0.y);
+    o2[1] = __floats2half2_rn(sc1.x * n0z + sh1.x, sc1.y * n0w + sh1.y);
+    o2[2] = __floats2half2_rn(sc2_.x * n1x + sh2_.x, sc2_.y * n1y + sh2_.y);
+    o2[3] = __floats2half2_rn(sc3.x * n1z + sh3.x, sc3.y * n1w + sh3.y);
     *(uint4*)(out + (size_t)r * 768 + c) = o8;
+    if (out2) {
+      uint4 sc8b = __ldg(reinterpret_cast<const uint4*>(scale2 + (size_t)pr * lds + c));
+      uint4 sh8b = __ldg(reinterpret_cast<const uint4*>(shift2 + (size_t)pr * lds + c));
+      const half2* sc2b = (const half2*)&sc8b; const half2* sh2b = (const half2*)&sh8b;
+      float2 sb0 = __half22float2(sc2b[0]), sb1 = __half22float2(sc2b[1]), sb2 = __half22float2(sc2b[2]), sb3 = __half22float2(sc2b[3]);
+      float2 hb0 = __half22float2(sh2b[0]), hb1 = __half22float2(sh2b[1]), hb2 = __half22float2(sh2b[2]), hb3 = __half22float2(sh2b[3]);
+      sb0 = make_float2(adaH(sb0.x), adaH(sb0.y)); sb1 = make_float2(adaH(sb1.x), adaH(sb1.y));
+      sb2 = make_float2(adaH(sb2.x), adaH(sb2.y)); sb3 = make_float2(adaH(sb3.x), adaH(sb3.y));
+      uint4 o8b; half2* o2b = (half2*)&o8b;
+      o2b[0] = __floats2half2_rn(sb0.x * n0x + hb0.x, sb0.y * n0y + hb0.y);
+      o2b[1] = __floats2half2_rn(sb1.x * n0z + hb1.x, sb1.y * n0w + hb1.y);
+      o2b[2] = __floats2half2_rn(sb2.x * n1x + hb2.x, sb2.y * n1y + hb2.y);
+      o2b[3] = __floats2half2_rn(sb3.x * n1z + hb3.x, sb3.y * n1w + hb3.y);
+      *(uint4*)(out2 + (size_t)r * 768 + c) = o8b;
+    }
     return;
   }
   __shared__ float2 red[NW ? NW : 32];
@@ -615,6 +693,10 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
   if (y) {
     float4 yy = load4(y + (size_t)r * CC + c), g = load4(gate + (size_t)pr * ldg + c);
     float4 u = make_float4(x.x + yy.x * sigm(g.x), x.y + yy.y * sigm(g.y), x.z + yy.z * sigm(g.z), x.w + yy.w * sigm(g.w));
+    if (y2) {
+      float4 yy2 = load4(y2 + (size_t)r * CC + c), g2 = load4(gate2 + (size_t)pr * ldg + c);
+      u.x += yy2.x * sigm(g2.x); u.y += yy2.y * sigm(g2.y); u.z += yy2.z * sigm(g2.z); u.w += yy2.w * sigm(g2.w);
+    }
     *(float4*)(act + (size_t)r * CC + c) = u;
     if (!noRes) x = u;
   }
@@ -630,32 +712,40 @@ gatedAddAdaLnVecK(float* __restrict__ act, const TI* __restrict__ y, const TI* _
   for (int w = 0; w < nw; ++w) { float2 rv = red[w]; ts += rv.x; tss += rv.y; }
   float invC = 1.f / CC, mean = ts * invC;
   float inv = rsqrtf(fmaxf(tss * invC - mean * mean, 0.f) + ADA_EPS);
-  store4(out + (size_t)r * CC + c, sc.x * ((x.x - mean) * inv) + sh.x, sc.y * ((x.y - mean) * inv) + sh.y,
-         sc.z * ((x.z - mean) * inv) + sh.z, sc.w * ((x.w - mean) * inv) + sh.w);
+  float nx = (x.x - mean) * inv, ny = (x.y - mean) * inv, nz = (x.z - mean) * inv, nw_ = (x.w - mean) * inv;
+  store4(out + (size_t)r * CC + c, sc.x * nx + sh.x, sc.y * ny + sh.y, sc.z * nz + sh.z, sc.w * nw_ + sh.w);
+  if (out2) {
+    float4 sc2 = load4(scale2 + (size_t)pr * lds + c), sh2 = load4(shift2 + (size_t)pr * lds + c);
+    sc2 = make_float4(ADA(sc2.x), ADA(sc2.y), ADA(sc2.z), ADA(sc2.w));
+    store4(out2 + (size_t)r * CC + c, sc2.x * nx + sh2.x, sc2.y * ny + sh2.y, sc2.z * nz + sh2.z, sc2.w * nw_ + sh2.w);
+  }
 }
 // (gate, scale and shift shared by the samples: row r reads row r % period)
 template <class TO, class TI>
 void gatedAddAdaLn(float* act, const TI* y, const TI* gate, int ldg, const TI* scale, const TI* shift,
-                   int lds, TO* out, int rows, int C, int period, bool noRes = false) {
+                   int lds, TO* out, int rows, int C, int period, bool noRes = false,
+                   const TI* scale2 = nullptr, const TI* shift2 = nullptr, TO* out2 = nullptr,
+                   const TI* y2 = nullptr, const TI* gate2 = nullptr) {
   if (C % 128 == 0 && C / 4 <= 1024 && ldg % 4 == 0 && lds % 4 == 0) {
     auto launch = [&](auto rawTag) {
       constexpr bool R = decltype(rawTag)::value;
       if (C == 768) {
         constexpr unsigned th = (std::is_same_v<TO, half> && std::is_same_v<TI, half>) ? 96u : 192u;
-        gatedAddAdaLnVecK<TO, TI, R, 6><<<rows, th, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, 768, period, noRes);
-      } else if (C == 384) gatedAddAdaLnVecK<TO, TI, R, 3><<<rows, 96, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, 384, period, noRes);
-      else gatedAddAdaLnVecK<TO, TI, R, 0><<<rows, C / 4, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes);
+        gatedAddAdaLnVecK<TO, TI, R, 6><<<rows, th, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, 768, period, noRes, scale2, shift2, out2, y2, gate2);
+      } else if (C == 384) gatedAddAdaLnVecK<TO, TI, R, 3><<<rows, 96, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, 384, period, noRes, scale2, shift2, out2, y2, gate2);
+      else gatedAddAdaLnVecK<TO, TI, R, 0><<<rows, C / 4, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes, scale2, shift2, out2, y2, gate2);
     };
     if (ADA_RAW) launch(std::true_type{});
     else launch(std::false_type{});
   } else if constexpr (std::is_same_v<TI, float>) {
-    if (ADA_RAW) gatedAddAdaLnK<TO, true><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes);
-    else gatedAddAdaLnK<TO><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes);
+    if (ADA_RAW) gatedAddAdaLnK<TO, true><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes, scale2, shift2, out2, y2, gate2);
+    else gatedAddAdaLnK<TO><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period, noRes, scale2, shift2, out2, y2, gate2);
   } else { fprintf(stderr, "gatedAddAdaLn: no f16-input kernel for %d channels\n", C); exit(1); }
 }
 // x += y * sigmoid(gate) with the gate read at a row stride, row r % period
 template <class TI>
-__global__ void addGatedStridedK(float* x, const TI* y, const TI* gate, int ld, size_t rows, int C, int period) {
+__global__ void addGatedStridedK(float* x, const TI* y, const TI* gate, int ld, size_t rows, int C, int period,
+                                 const TI* y2 = nullptr, const TI* gate2 = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((C & 3) == 0 && (ld & 3) == 0 && rows * C < (1ull << 32)) {
     unsigned c4 = (unsigned)(C >> 2), u = (unsigned)t;
@@ -664,8 +754,12 @@ __global__ void addGatedStridedK(float* x, const TI* y, const TI* gate, int ld, 
     unsigned pr = r < (unsigned)period ? r : r % (unsigned)period;
     float4 xv = *(const float4*)(x + (size_t)u * 4);
     float4 yv = load4(y + (size_t)u * 4), gv = load4(gate + (size_t)pr * ld + c);
-    *(float4*)(x + (size_t)u * 4) = make_float4(xv.x + yv.x * sigm(gv.x), xv.y + yv.y * sigm(gv.y),
-                                                xv.z + yv.z * sigm(gv.z), xv.w + yv.w * sigm(gv.w));
+    xv.x += yv.x * sigm(gv.x); xv.y += yv.y * sigm(gv.y); xv.z += yv.z * sigm(gv.z); xv.w += yv.w * sigm(gv.w);
+    if (y2) {
+      float4 yv2 = load4(y2 + (size_t)u * 4), gv2 = load4(gate2 + (size_t)pr * ld + c);
+      xv.x += yv2.x * sigm(gv2.x); xv.y += yv2.y * sigm(gv2.y); xv.z += yv2.z * sigm(gv2.z); xv.w += yv2.w * sigm(gv2.w);
+    }
+    *(float4*)(x + (size_t)u * 4) = xv;
     return;
   }
   if (t >= rows * C) return;
@@ -674,7 +768,9 @@ __global__ void addGatedStridedK(float* x, const TI* y, const TI* gate, int ld, 
     unsigned u = (unsigned)t, cu = (unsigned)C; r = u / cu; c = (int)(u - r * cu);
   } else { r = (unsigned)(t / C); c = (int)(t % C); }
   unsigned pr = r < (unsigned)period ? r : r % (unsigned)period;
-  x[t] += toF(y[t]) * sigm(toF(gate[(size_t)pr * ld + c]));
+  float v = x[t] + toF(y[t]) * sigm(toF(gate[(size_t)pr * ld + c]));
+  if (y2) v += toF(y2[t]) * sigm(toF(gate2[(size_t)pr * ld + c]));
+  x[t] = v;
 }
 // x[k * n + i] += v[i] for every sample k (n elements a sample)
 __global__ void addBroadcastK(float* __restrict__ x, const float* __restrict__ v, size_t n, size_t total) {
@@ -1250,28 +1346,38 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   mg::Shared* oS = shardedQ && !tok ? &mg::shared("sh.dt.o", (std::is_same_v<T, half> ? padRows16((size_t)n * 10) : (size_t)n * 10) * Wd * sizeof(T)) : nullptr;
   T* o = oS ? (T*)oS->local : scratch<T>("dt.o", prows * Wd);
   T* att = scratch<T>("dt.att", prows * C);
-  T* tn = x;                                                           // x is dead once qkvg is projected
+  // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
+  bool noResidual = M.flag(Tn + ".noResidual");
+  T* tn = noResidual ? scratch<T>("dt.tn", prows * C) : x;
   int I = C * factor;
   bool anyUp = hasW(Tn + ".superBlocks.0.blocks.0.ffwAToB");
   T* wide = scratch<T>("dt.wide", prows * (anyUp ? 3 : 2) * I);
   T* gated = scratch<T>("dt.gated", prows * I);
   T* proj = scratch<T>("dt.proj", prows * C);
   zeroOnce(x, prows * C * sizeof(T)); zeroOnce(o, prows * Wd * sizeof(T));
+  if (noResidual) zeroOnce(tn, prows * C * sizeof(T));
   zeroOnce(gated, prows * I * sizeof(T));
   if (tok) for (int k = 0; k < 2; ++k) zeroOnce(qS[k]->local, (prows + 128) * 4 * Wd * sizeof(T));
 
-  // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
-  bool noResidual = M.flag(Tn + ".noResidual");
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   for (int b = 0; b < tc.nblocks; ++b) {
     std::string B = Tn + ".superBlocks." + std::to_string(b / perSuper) + ".blocks." + std::to_string(b % perSuper);
     const T* g = gNorm + (size_t)b * 4 * C; const T* z = gRaw + (size_t)b * 2 * C;
     // the previous block's transition residual, fused with this block's first adaptive LN
+    const T* zPrevAtt = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C : nullptr;
     const T* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
     if (tok) qkvg = (T*)qS[b % 2]->local;
-    if (krows) gatedAddAdaLn<T>(at(act, C), b > 0 ? at(proj, C) : nullptr, zPrev ? at(zPrev, ldr) : nullptr, ldr, at(g, ldn),
-                                at(g + C, ldn), ldn, at(x, C), krows, C, n);
+    if (krows) {
+      if (noResidual)
+        gatedAddAdaLn<T>(at(act, C), b > 0 ? at(att, C) : nullptr, zPrevAtt ? at(zPrevAtt, ldr) : nullptr, ldr,
+                         at(g, ldn), at(g + C, ldn), ldn, at(x, C), krows, C, n, false,
+                         at(g + 2 * C, ldn), at(g + 3 * C, ldn), at(tn, C),
+                         b > 0 ? at(proj, C) : nullptr, zPrev ? at(zPrev, ldr) : nullptr);
+      else
+        gatedAddAdaLn<T>(at(act, C), b > 0 ? at(proj, C) : nullptr, zPrev ? at(zPrev, ldr) : nullptr, ldr,
+                         at(g, ldn), at(g + C, ldn), ldn, at(x, C), krows, C, n);
+    }
     { std::string wq = qkvgWeight(B, C, Wd, false); if (grows) linear<T, T>(at(x, C), at(qkvg, 4 * Wd), grows, C, 4 * Wd, wq); }
     bool kqNorm = hasW(B + ".queryLayerNormScale");
     if (kqNorm && krows) {
@@ -1330,8 +1436,8 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     }
     // (chai has no gating query: its zero weights gate by exactly 0.5, undone here)
     if (grows) linear<T, T>(at(o, Wd), at(att, C), grows, Wd, C, B + ".Transition2", false, 0.f, ADA_RAW ? 2.f : 1.f);
-    if (krows) {
-      gatedAddAdaLn<T>(at(act, C), at(att, C), at(z, ldr), ldr, at(g + 2 * C, ldn), at(g + 3 * C, ldn), ldn, at(tn, C), krows, C, n, noResidual);
+    if (krows && !noResidual) {
+      gatedAddAdaLn<T>(at(act, C), at(att, C), at(z, ldr), ldr, at(g + 2 * C, ldn), at(g + 3 * C, ldn), ldn, at(tn, C), krows, C, n, false);
     }
     bool up; std::string w1 = upGatedTransition1(B, C, I, up);
     if (grows) {
@@ -1342,9 +1448,15 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   }
   // the last block's transition residual
   if (krows) {
+    const T* zLastAtt = gRaw + (size_t)(tc.nblocks - 1) * 2 * C;
+    const T* zLast = zLastAtt + C;
     size_t gw = (C & 3) == 0 && (ldr & 3) == 0 && (size_t)krows * C < (1ull << 32) ? ((size_t)krows * C) >> 2 : (size_t)krows * C;
-    addGatedStridedK<T><<<blocks(gw), 256, 0, STREAM>>>(at(act, C), at(proj, C), at(gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr),
-                                                        ldr, krows, C, n);
+    if (noResidual)
+      addGatedStridedK<T><<<blocks(gw), 256, 0, STREAM>>>(at(act, C), at(att, C), at(zLastAtt, ldr),
+                                                          ldr, krows, C, n, at(proj, C), at(zLast, ldr));
+    else
+      addGatedStridedK<T><<<blocks(gw), 256, 0, STREAM>>>(at(act, C), at(proj, C), at(zLast, ldr),
+                                                          ldr, krows, C, n);
   }
   if (tok) {                    // every rank's rows of the output, for the decoder
     mg::Shared& aS = mg::shared("sh.dt.act", (size_t)n * C * 4);
@@ -1367,9 +1479,14 @@ __global__ void broadcastTokensK(const float* proj, float* perAtom, int tokens, 
 }
 // act[q] = (t2q.mask[q] ? proj[token of t2q.idx[q]] : 0) + skip[q], times the query's mask - what
 // broadcastTokensK, convert(t2q, ...) and addSkipMaskK computed in three passes
+template <class TO = float, bool RAW = false>
 __global__ void broadcastSkipK(const float* __restrict__ proj, const int* __restrict__ idx, const float* __restrict__ gmask,
                                const float* __restrict__ skip, const float* __restrict__ qMask, float* __restrict__ act,
-                               size_t rows, int C, size_t q1, int tokens, int dense) {
+                               size_t rows, int C, size_t q1, int tokens, int dense,
+                               const float* __restrict__ s1 = nullptr, const float* __restrict__ h1 = nullptr,
+                               const float* __restrict__ s2 = nullptr, const float* __restrict__ h2 = nullptr,
+                               TO* __restrict__ xq = nullptr, TO* __restrict__ xk = nullptr, bool chained = false,
+                               const float* __restrict__ s3 = nullptr, const float* __restrict__ h3 = nullptr, TO* __restrict__ tn = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((C & 3) == 0) {
     size_t c4 = (size_t)(C >> 2);
@@ -1386,7 +1503,36 @@ __global__ void broadcastSkipK(const float* __restrict__ proj, const int* __rest
                               : make_float4(0.f, 0.f, 0.f, 0.f);
     float4 sk = *(const float4*)(skip + (t << 2));
     float qm = qMask[gq];
-    *(float4*)(act + (t << 2)) = make_float4((v.x + sk.x) * qm, (v.y + sk.y) * qm, (v.z + sk.z) * qm, (v.w + sk.w) * qm);
+    float4 act4 = make_float4((v.x + sk.x) * qm, (v.y + sk.y) * qm, (v.z + sk.z) * qm, (v.w + sk.w) * qm);
+    *(float4*)(act + (t << 2)) = act4;
+    if (C == 128 && xq) {
+      size_t kb = gq * 128 + c;
+      float4 a = __ldg(reinterpret_cast<const float4*>(s1 + kb)), b = __ldg(reinterpret_cast<const float4*>(h1 + kb));
+      float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + kb)), d = __ldg(reinterpret_cast<const float4*>(h2 + kb));
+      float sum = act4.x + act4.y + act4.z + act4.w;
+      for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+      float mean = sum * (1.f / 128.f), qv = (act4.x - mean) * (act4.x - mean) + (act4.y - mean) * (act4.y - mean) + (act4.z - mean) * (act4.z - mean) + (act4.w - mean) * (act4.w - mean);
+      for (int o = 16; o; o >>= 1) qv += __shfl_xor_sync(~0u, qv, o);
+      float inv = rsqrtf(qv * (1.f / 128.f) + ADA_EPS);
+      float n0 = (act4.x - mean) * inv, n1 = (act4.y - mean) * inv, n2 = (act4.z - mean) * inv, n3 = (act4.w - mean) * inv;
+      float q0 = a.x * n0 + b.x, q1v = a.y * n1 + b.y, q2 = a.z * n2 + b.z, q3 = a.w * n3 + b.w;
+      store4(xq + (t << 2), q0, q1v, q2, q3);
+      if (chained) {
+        float sq = q0 + q1v + q2 + q3;
+        for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
+        float mean2 = sq * (1.f / 128.f), v2 = (q0 - mean2) * (q0 - mean2) + (q1v - mean2) * (q1v - mean2) + (q2 - mean2) * (q2 - mean2) + (q3 - mean2) * (q3 - mean2);
+        for (int o = 16; o; o >>= 1) v2 += __shfl_xor_sync(~0u, v2, o);
+        float inv2 = rsqrtf(v2 * (1.f / 128.f) + ADA_EPS);
+        store4(xk + (t << 2), c2.x * ((q0 - mean2) * inv2) + d.x, c2.y * ((q1v - mean2) * inv2) + d.y,
+               c2.z * ((q2 - mean2) * inv2) + d.z, c2.w * ((q3 - mean2) * inv2) + d.w);
+      } else {
+        store4(xk + (t << 2), c2.x * n0 + d.x, c2.y * n1 + d.y, c2.z * n2 + d.z, c2.w * n3 + d.w);
+      }
+      if (tn) {
+        float4 e3 = __ldg(reinterpret_cast<const float4*>(s3 + kb)), f3 = __ldg(reinterpret_cast<const float4*>(h3 + kb));
+        store4(tn + (t << 2), e3.x * n0 + f3.x, e3.y * n1 + f3.y, e3.z * n2 + f3.z, e3.w * n3 + f3.w);
+      }
+    }
     return;
   }
   if (t >= rows * C) return;
@@ -1405,7 +1551,8 @@ template <class TY = float>
 __global__ void __launch_bounds__(128, 12)
 maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, size_t q1, size_t rows, int C,
                 const float* __restrict__ scale, const float* __restrict__ offset, const float* __restrict__ Wp,
-                float* __restrict__ upd, const TY* __restrict__ prevY = nullptr, const float* __restrict__ prevGate = nullptr) {
+                float* __restrict__ upd, const TY* __restrict__ prevY = nullptr, const float* __restrict__ prevGate = nullptr,
+                const TY* __restrict__ prevAtt = nullptr, const float* __restrict__ prevAttGate = nullptr) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
@@ -1414,6 +1561,7 @@ maskLnProject3K(const float* __restrict__ act, const float* __restrict__ qMask, 
   float m = __ldg(qMask + pr);
   auto val = [&](int c) {
     float v = __ldg(x + c);
+    if (prevAtt) v += toF(prevAtt[row * C + c]) * __ldg(prevAttGate + pr * C + c);
     if (prevY) v += toF(prevY[row * C + c]) * __ldg(prevGate + pr * C + c);
     return v * m;
   };
@@ -1503,28 +1651,64 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   // (the diffusion's tokens split: this rank's subsets and their halo only - ATOM_S0/S1)
   const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
   const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
-  broadcastSkipK<<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(proj, t2q.idx + r0, t2q.mask + r0, enc.skip + r0 * C, enc.qMask + r0,
-                                                   act + r0 * C, R, C, q1, sh.tokens, sh.dense);
   AtomStep st{ gatherOf("batch.queriesToKeys"), enc.qMask, enc.kMask, M.flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
                M.flag(Dd + ".blocks.0.diffusionNoResidual") };
+  bool preNorm0 = C == 128 && !d.blocks.empty();
+  auto launchSkip = [&](auto typeTag) {
+    using T = decltype(typeTag);
+    const float *s1 = nullptr, *h1 = nullptr, *s2 = nullptr, *h2 = nullptr, *s3 = nullptr, *h3 = nullptr;
+    T *xq = nullptr, *xk = nullptr, *tn = nullptr;
+    bool chained = false;
+    if (preNorm0) {
+      const AtomBlockCache& bc0 = d.blocks[0];
+      auto at = [](const float* p, size_t k) { return p ? p + k : p; };
+      s1 = at(bc0.qScale, r0 * C); h1 = at(bc0.qShift, r0 * C);
+      s2 = at(bc0.kScale, r0 * C); h2 = at(bc0.kShift, r0 * C);
+      T* xqBase = scratch<T>("ab.xqk", 2 * qRows * C);
+      xq = xqBase + r0 * C;
+      xk = xqBase + qRows * C + r0 * C;
+      chained = bc0.chained;
+      if (st.noResidual && !chained) {
+        s3 = at(bc0.ffwScale, r0 * C); h3 = at(bc0.ffwShift, r0 * C);
+        tn = scratch<T>("ab.tn", qRows * C) + r0 * C;
+      }
+    }
+    if (ADA_RAW)
+      broadcastSkipK<T, true><<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(
+        proj, t2q.idx + r0, t2q.mask + r0, enc.skip + r0 * C, enc.qMask + r0,
+        act + r0 * C, R, C, q1, sh.tokens, sh.dense, s1, h1, s2, h2, xq, xk, chained, s3, h3, tn);
+    else
+      broadcastSkipK<T, false><<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(
+        proj, t2q.idx + r0, t2q.mask + r0, enc.skip + r0 * C, enc.qMask + r0,
+        act + r0 * C, R, C, q1, sh.tokens, sh.dense, s1, h1, s2, h2, xq, xk, chained, s3, h3, tn);
+  };
+  if (ATOM_HALF) launchSkip(half{}); else launchSkip(0.f);
   bool maskPerBlock = M.flag(Dd + ".blocks.0.maskAtomActPerBlock");
   for (size_t b = 0; b < d.blocks.size(); ++b) {
+    const float* prevGate = b > 0 ? d.blocks[b - 1].tg : nullptr;
+    const float* prevAttGate = (b > 0 && st.noResidual) ? d.blocks[b - 1].zg : nullptr;
     crossAttentionBlock(act, st, d.blocks[b], sh, C, d.heads, d.D, Dd + ".blocks." + std::to_string(b),
-                        b > 0 ? d.blocks[b - 1].tg : nullptr, maskPerBlock ? enc.qMask : nullptr, true, nullptr);
+                        prevGate, maskPerBlock ? enc.qMask : nullptr, true, nullptr,
+                        prevAttGate, b == 0 && preNorm0);
   }
   float* upd = scratch<float>("dec.upd", qRows * 3);
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) { fprintf(stderr, "decoder: position update is not C x 3\n"); exit(1); }
+  const bool hasTr2Last = !d.blocks.empty() && hasW(Dd + ".blocks." + std::to_string(d.blocks.size() - 1) + ".Transition2");
   const float* prevGate = d.blocks.empty() ? nullptr : d.blocks.back().tg + r0 * C;
+  const float* prevAttGate = (!d.blocks.empty() && st.noResidual) ? d.blocks.back().zg + r0 * C : nullptr;
+  int Wd = d.heads * d.D;
   if (ATOM_HALF) {
     const half* prevProj = d.blocks.empty() ? nullptr : scratch<half>("ab.projected", qRows * C) + r0 * C;
+    const half* prevAtt = prevAttGate ? (hasTr2Last ? scratch<half>("ab.attention", qRows * C) : scratch<half>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
     maskLnProject3K<half><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
       W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
-      prevProj, prevGate);
+      prevProj, prevGate, prevAtt, prevAttGate);
   } else {
     const float* prevProj = d.blocks.empty() ? nullptr : scratch<float>("ab.projected", qRows * C) + r0 * C;
+    const float* prevAtt = prevAttGate ? (hasTr2Last ? scratch<float>("ab.attention", qRows * C) : scratch<float>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
     maskLnProject3K<float><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
       W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
-      prevProj, prevGate);
+      prevProj, prevGate, prevAtt, prevAttGate);
   }
   float* out = scratch<float>("dec.out", atoms * NS * 3);
   convert(q2t, upd, out, 3, q1, NS);
@@ -1746,8 +1930,6 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
     const int halo = ar.reach * (int)(f.enc.blocks.size() + f.dec.blocks.size()), subsets = atomShape().subsets;
     ATOM_S0 = std::max(0, ar.s0 - halo); ATOM_S1 = std::min(subsets, ar.s1 + halo);
   }
-  encoderStep("diffusion.encoder", f.enc, scaled); stage("d.encoder");
-  ATOM_S0 = ATOM_S1 = 0;
   int Cs = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
   float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
   if (!f.usePre) {
@@ -1755,10 +1937,15 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
     singleCondEmbeddingNorm(cond.single, sn, n, Cs);
     linear<float, float>(sn, snProj, n, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
   }
+  const bool needTap = M.has("oracle.stages.stages.encoder.tokenAct") || M.has("oracle.stages.stages.transformer.out");
+  encoderStep("diffusion.encoder", f.enc, scaled, needTap ? nullptr : snProj); stage("d.encoder");
+  ATOM_S0 = ATOM_S1 = 0;
   size_t rows = (size_t)n * NS, np = (size_t)n * perToken, rp = rows * perToken;
-  float* act = scratch<float>("dn.act", rp);
-  dtap("encoder.tokenAct", f.enc.tokenAct, rp);
-  copyAddBroadcastK<<<blocks((np & 3) == 0 ? (rp >> 2) : rp), 256, 0, STREAM>>>(f.enc.tokenAct, snProj, act, np, rp);
+  float* act = needTap ? scratch<float>("dn.act", rp) : f.enc.tokenAct;
+  if (needTap) {
+    dtap("encoder.tokenAct", f.enc.tokenAct, rp);
+    copyAddBroadcastK<<<blocks((np & 3) == 0 ? (rp >> 2) : rp), 256, 0, STREAM>>>(f.enc.tokenAct, snProj, act, np, rp);
+  }
   dtap("transformer.act", act, rp);
   if (getenv("TX_ORACLE_IN") && M.has("oracle.stages.stages.transformer.act"))    // the transformer alone, on the oracle's input
     CK(cudaMemcpyAsync(act, Fdev("oracle.stages.stages.transformer.act"), rows * perToken * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -1766,7 +1953,7 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   else diffusionTransformer<float>(act, cond.single, f.seqMask, n);
   stage("d.transformer");
   dtap("transformer.out", act, rows * perToken);
-  float* actn = scratch<float>("dn.actn", rows * perToken);
+  float* actn = needTap ? scratch<float>("dn.actn", rows * perToken) : act;
   layerNormSlow(act, actn, rows, perToken, W("diffusion.outputNormScale"), Wopt("diffusion.outputNormOffset"));
   if (tok) {
     const int halo = ar.reach * (int)f.dec.blocks.size(), subsets = atomShape().subsets;

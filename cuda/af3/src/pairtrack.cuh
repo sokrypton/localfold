@@ -126,6 +126,7 @@ void layerNormDual2(const TI* in, TO* out0, TO* out1, size_t rows, int C,
   const float *s0 = W(scale0), *o0 = W(offset0), *s1 = W(scale1), *o1 = W(offset1);
   if (C == 64) layerNormDualK<TI, TO, 64><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, 64, s0, o0, s1, o1);
   else if (C == 128) layerNormDualK<TI, TO, 128><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, 128, s0, o0, s1, o1);
+  else if (C == 384) layerNormDualK<TI, TO, 384><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, 384, s0, o0, s1, o1);
   else layerNormDualK<TI, TO, 0><<<nb, 256, 0, STREAM>>>(in, out0, out1, rows, C, s0, o0, s1, o1);
 }
 // gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
@@ -1329,18 +1330,18 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
 // ---------------------------------------------------------------- transition
 #include "fusedtransition.cuh"
 template <class T>
-void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+void transition(float* x, size_t rows, int C, int factor, const std::string& pre, T* xnGiven = nullptr) {
   // the width is the weight's (OpenDDE's refiner is factor 2 where its trunk is 4)
   (void)factor;
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
   int I = (int)(w1 / (2 * (size_t)C));
   // (the fused 128-channel kernel adds in place, so not under a redirected residual - nothing parallel is 128 wide)
-  if constexpr (std::is_same_v<T, half>) if (!RESIDUAL_INTO && !skipFused("transition") && fusedTransition(x, rows, C, I, pre)) return;
+  if constexpr (std::is_same_v<T, half>) if (!xnGiven && !RESIDUAL_INTO && !skipFused("transition") && fusedTransition(x, rows, C, I, pre)) return;
   if constexpr (std::is_same_v<T, half>) {
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
-    if (FUSED_WIDE && FUSED_TRANSITION && !skipFused("transition") && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+    if (!xnGiven && FUSED_WIDE && FUSED_TRANSITION && !skipFused("transition") && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       const half* w1t = transitionW1Tiles<false>(Wh(pre + ".transition1"), C, I, 32);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
@@ -1408,13 +1409,13 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   if (rows > rowsPer && roomFor(rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
-  T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
+  T* xn = xnGiven ? xnGiven : scratch<T>("tr.x", std::min(rowsPer, rows) * C);
   T* wide = scratch<T>("tr.wide", std::min(rowsPer, rows) * 2 * I);
   T* gated = scratch<T>("tr.gated", std::min(rowsPer, rows) * I);
   for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
     size_t r = std::min(rowsPer, rows - r0);
-    lnPairRows<T>(x, r0, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
-    linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
+    if (!xnGiven) lnPairRows<T>(x, r0, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
+    linear<T, T>(xnGiven ? xnGiven + r0 * C : xn, wide, r, C, 2 * I, pre + ".transition1");
     swiglu<T>(wide, gated, r, I);
     linearIntoPairRows<T>(gated, into(x), r0, r, I, C, pre + ".transition2");
   }

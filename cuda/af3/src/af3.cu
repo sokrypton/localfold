@@ -205,6 +205,8 @@ static int foldMain(int argc, char** argv) {
                  b + (2 << 20), CUDA_R_16F, 512, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 256, 576, 128, &one, b, CUDA_R_16F, 256, b + (1 << 20), CUDA_R_16F, 128, &zero,
                  b + (2 << 20), CUDA_R_32F, 256, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 128, 1, 128, &one, b, CUDA_R_16F, 128, b + (1 << 20), CUDA_R_16F, 128, &zero,
+                 b + (2 << 20), CUDA_R_32F, 128, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 512, 256, 128, &one, b, CUDA_R_32F, 512, b + (1 << 20), CUDA_R_32F, 128, &zero,
                  b + (2 << 20), CUDA_R_32F, 512, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (ccMajor() >= 8)      // (bf16: the fused triangle's contraction, Ampere on - a T4 runs the unfused path)

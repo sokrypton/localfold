@@ -77,7 +77,7 @@ layerNormSlowK(const float* __restrict__ in, float* __restrict__ out, size_t row
     float* y = out + row * C_CONST;
     float xv[K], s = 0, v = 0;
 #pragma unroll
-    for (int k = 0; k < K; ++k) { xv[k] = __ldg(x + lane + k * 32); s += xv[k]; }
+    for (int k = 0; k < K; ++k) { int c = lane + k * 32; xv[k] = __ldg(x + c); s += xv[k]; }
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s / C_CONST;
 #pragma unroll
@@ -436,7 +436,9 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
         const float* __restrict__ s2, const float* __restrict__ h2, TO* __restrict__ o1, TO* __restrict__ o2,
         size_t rows, int C, size_t period,
         const TY* __restrict__ prevY = nullptr, const float* __restrict__ prevGate = nullptr,
-        const float* __restrict__ rowMask = nullptr) {
+        const float* __restrict__ rowMask = nullptr,
+        const float* __restrict__ s3 = nullptr, const float* __restrict__ h3 = nullptr, TO* __restrict__ o3 = nullptr,
+        const TY* __restrict__ prevAtt = nullptr, const float* __restrict__ prevAttGate = nullptr) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
@@ -445,9 +447,15 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
   if (C == 128) {
     size_t k = pr * 128 + lane * 4;
     float4 v = *(const float4*)(xr + lane * 4);
+    if (prevAtt) {
+      float4 ya = load4(prevAtt + row * 128 + lane * 4), ga = __ldg(reinterpret_cast<const float4*>(prevAttGate + k));
+      v.x += ya.x * ga.x; v.y += ya.y * ga.y; v.z += ya.z * ga.z; v.w += ya.w * ga.w;
+    }
     if (prevY) {
       float4 yy = load4(prevY + row * 128 + lane * 4), g = __ldg(reinterpret_cast<const float4*>(prevGate + k));
       v.x += yy.x * g.x; v.y += yy.y * g.y; v.z += yy.z * g.z; v.w += yy.w * g.w;
+    }
+    if (prevAtt || prevY) {
       if (rowMask) { float m = __ldg(rowMask + pr); v.x *= m; v.y *= m; v.z *= m; v.w *= m; }
       *(float4*)(xr + lane * 4) = v;
     }
@@ -461,13 +469,18 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
     float n0 = (v.x - mean) * inv, n1 = (v.y - mean) * inv, n2 = (v.z - mean) * inv, n3 = (v.w - mean) * inv;
     store4(o1 + row * 128 + lane * 4, a.x * n0 + b.x, a.y * n1 + b.y, a.z * n2 + b.z, a.w * n3 + b.w);
     store4(o2 + row * 128 + lane * 4, c2.x * n0 + d.x, c2.y * n1 + d.y, c2.z * n2 + d.z, c2.w * n3 + d.w);
+    if (o3) {
+      float4 e3 = __ldg(reinterpret_cast<const float4*>(s3 + k)), f3 = __ldg(reinterpret_cast<const float4*>(h3 + k));
+      store4(o3 + row * 128 + lane * 4, e3.x * n0 + f3.x, e3.y * n1 + f3.y, e3.z * n2 + f3.z, e3.w * n3 + f3.w);
+    }
     return;
   }
   float s = 0;
   for (int c = lane; c < C; c += 32) {
     float v = xr[c];
-    if (prevY) {
-      v += toF(prevY[row * C + c]) * prevGate[pr * C + c];
+    if (prevAtt) v += toF(prevAtt[row * C + c]) * prevAttGate[pr * C + c];
+    if (prevY) v += toF(prevY[row * C + c]) * prevGate[pr * C + c];
+    if (prevAtt || prevY) {
       if (rowMask) v *= rowMask[pr];
       xr[c] = v;
     }
@@ -482,6 +495,7 @@ adaLn2K(float* __restrict__ x, const float* __restrict__ s1, const float* __rest
     size_t k = pr * C + c; float n = (xr[c] - mean) * inv;
     o1[row * C + c] = fromF<TO>(s1[k] * n + h1[k]);
     o2[row * C + c] = fromF<TO>(s2[k] * n + h2[k]);
+    if (o3) o3[row * C + c] = fromF<TO>(s3[k] * n + h3[k]);
   }
 }
 struct AtomStep {
@@ -552,7 +566,8 @@ gatedAddAdaLnRowsK(float* __restrict__ act, const TY* __restrict__ y, const floa
 }
 template <class TY = float>
 __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_t n, size_t period,
-                                 const float* rowMask = nullptr, int C = 128) {
+                                 const float* rowMask = nullptr, int C = 128,
+                                 const TY* y2 = nullptr, const float* gate2 = nullptr) {
   if ((n & 3) == 0 && (period & 3) == 0) {
     size_t i4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x, n4 = n >> 2, p4 = period >> 2;
     if (i4 >= n4) return;
@@ -560,6 +575,10 @@ __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_
     float4 xv = reinterpret_cast<const float4*>(x)[i4], yv = load4(y + (i4 << 2)),
            gv = reinterpret_cast<const float4*>(gate)[g4];
     xv.x += yv.x * gv.x; xv.y += yv.y * gv.y; xv.z += yv.z * gv.z; xv.w += yv.w * gv.w;
+    if (y2) {
+      float4 yv2 = load4(y2 + (i4 << 2)), gv2 = reinterpret_cast<const float4*>(gate2)[g4];
+      xv.x += yv2.x * gv2.x; xv.y += yv2.y * gv2.y; xv.z += yv2.z * gv2.z; xv.w += yv2.w * gv2.w;
+    }
     if (rowMask) {
       size_t r = C == 128 ? (g4 >> 5) : (g4 * 4) / (unsigned)C;
       float m = rowMask[r];
@@ -572,15 +591,17 @@ __global__ void addSigmoidGatedK(float* x, const TY* y, const float* gate, size_
   if (i < n) {
     size_t g = i < period ? i : i % period;
     float v = x[i] + toF(y[i]) * gate[g];
+    if (y2) v += toF(y2[i]) * gate2[g];
     if (rowMask) v *= rowMask[g / (unsigned)C];
     x[i] = v;
   }
 }
 template <class TY = float>
 inline void addSigmoidGated(float* x, const TY* y, const float* gate, size_t n, size_t period,
-                            const float* rowMask = nullptr, int C = 128) {
+                            const float* rowMask = nullptr, int C = 128,
+                            const TY* y2 = nullptr, const float* gate2 = nullptr) {
   size_t work = ((n & 3) == 0 && (period & 3) == 0) ? (n >> 2) : n;
-  addSigmoidGatedK<TY><<<blocks(work), 256, 0, STREAM>>>(x, y, gate, n, period, rowMask, C);
+  addSigmoidGatedK<TY><<<blocks(work), 256, 0, STREAM>>>(x, y, gate, n, period, rowMask, C, y2, gate2);
 }
 // One subset's attention, q (+bias) and the gate read out of qg [rows][2W], k and v gathered directly
 // out of kvAtomAll [qRows][2W]; writes the gated attention [rows][W]. One warp a query, lanes over keys.
@@ -588,7 +609,7 @@ template <class T>
 __global__ void atomAttentionFusedK(const T* qg, const float* qBias, const T* kvAtomAll, const int* q2kIdx,
                                     const float* q2kMask, size_t q1, const float* qMask, const float* kMask,
                                     const float* pairLogits, T* out, int queries, int keys, int heads, int D,
-                                    bool keyMasked, int subsets) {
+                                    bool keyMasked, int subsets, float outScale = 1.f) {
   int s = blockIdx.x, ss = s % subsets, sample = s / subsets, h = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x & 31;
   int nw = blockDim.x / 32, Wd = heads * D, W2 = 2 * Wd;
   extern __shared__ float sm[];
@@ -627,7 +648,9 @@ __global__ void atomAttentionFusedK(const T* qg, const float* qBias, const T* kv
     for (int e = lane; e < D; e += 32) {
       float acc = 0;
       for (int key = 0; key < keys; ++key) acc += Pw[key] * Vs[key * (D + 1) + e];
-      out[qrow * Wd + h * D + e] = fromF<T>(acc / sum * sigm(toF(qg[qrow * W2 + Wd + h * D + e])));
+      T val = fromF<T>(acc / sum * sigm(toF(qg[qrow * W2 + Wd + h * D + e])));
+      if (outScale != 1.f) val = fromF<T>(outScale * toF(val));
+      out[qrow * Wd + h * D + e] = val;
     }
     __syncwarp();
   }
@@ -646,7 +669,8 @@ __global__ void __launch_bounds__(64, 8)
 atomAttentionMMA(const half* __restrict__ qg, const float* __restrict__ qBias,
     const half* __restrict__ kvAtomAll, const int* __restrict__ q2kIdx, const float* __restrict__ q2kMask, size_t q1,
     const float* __restrict__ qMask, const float* __restrict__ kMask,
-    const float* __restrict__ pairLogits, half* __restrict__ out, int queries, int heads, bool keyMasked, float scale, int subsets) {
+    const float* __restrict__ pairLogits, half* __restrict__ out, int queries, int heads, bool keyMasked, float scale, int subsets,
+    float outScale = 1.f) {
   static_assert(D == 32, "swizzled D=32");
   constexpr int LD = 32;
   __shared__ __align__(16) half Ks[KEYS * LD];
@@ -751,8 +775,15 @@ atomAttentionMMA(const half* __restrict__ qg, const float* __restrict__ qBias,
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
     float2 fa = __half22float2(ga[et]), fb = __half22float2(gb[et]);
-    *reinterpret_cast<half2*>(out + i0 * Wd + h * D + e) = __floats2half2_rn((o[et][0] * inv0) * sigmH(fa.x), (o[et][1] * inv0) * sigmH(fa.y));
-    *reinterpret_cast<half2*>(out + i1 * Wd + h * D + e) = __floats2half2_rn((o[et][2] * inv1) * sigmH(fb.x), (o[et][3] * inv1) * sigmH(fb.y));
+    half2 h0 = __floats2half2_rn((o[et][0] * inv0) * sigmH(fa.x), (o[et][1] * inv0) * sigmH(fa.y));
+    half2 h1 = __floats2half2_rn((o[et][2] * inv1) * sigmH(fb.x), (o[et][3] * inv1) * sigmH(fb.y));
+    if (outScale != 1.f) {
+      float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+      h0 = __floats2half2_rn(outScale * f0.x, outScale * f0.y);
+      h1 = __floats2half2_rn(outScale * f1.x, outScale * f1.y);
+    }
+    *reinterpret_cast<half2*>(out + i0 * Wd + h * D + e) = h0;
+    *reinterpret_cast<half2*>(out + i1 * Wd + h * D + e) = h1;
   }
 }
 
@@ -841,7 +872,8 @@ inline int ATOM_S0 = 0, ATOM_S1 = 0;
 template <class T>
 void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
                           int C, int heads, int D, const std::string& B, const float* prevGateAll = nullptr,
-                          const float* prevMaskAll = nullptr, bool deferAdd = false, const float* postMaskAll = nullptr) {
+                          const float* prevMaskAll = nullptr, bool deferAdd = false, const float* postMaskAll = nullptr,
+                          const float* prevAttGateAll = nullptr, bool preNormed = false) {
   size_t q1 = (size_t)sh.subsets * sh.queries;                  // one sample's query rows
   size_t qRows = q1 * NS;
   int Wd = heads * D;
@@ -854,9 +886,12 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   auto at = [](const float* p, size_t k) { return p ? p + k : p; };      // (a null tensor stays null)
   float* act = actAll + r0 * C;
   T* projected = scratch<T>("ab.projected", qRows * C) + r0 * C;
+  const bool hasTr2 = hasW(B + ".Transition2");
   const float *qScale = at(bc.qScale, r0 * C), *qShift = at(bc.qShift, r0 * C), *kScale = at(bc.kScale, r0 * C), *kShift = at(bc.kShift, r0 * C);
   const float *zg = at(bc.zg, r0 * C), *ffwScale = at(bc.ffwScale, r0 * C), *ffwShift = at(bc.ffwShift, r0 * C), *tg = at(bc.tg, r0 * C);
   const float *prevGate = at(prevGateAll, r0 * C); const T *prevY = prevGate ? projected : nullptr;
+  const float *prevAttGate = at(prevAttGateAll, r0 * C);
+  const T *prevAtt = prevAttGate ? (hasTr2 ? scratch<T>("ab.attention", qRows * C) : scratch<T>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
   const float *prevMask = at(prevMaskAll, r0), *postMask = at(postMaskAll, r0);
   const float* pairLogits = at(bc.pairLogits, (size_t)(part ? ATOM_S0 : 0) * heads * sh.queries * sh.keys);
   const float *qMask = at(st.qMask, r0), *kMask = at(st.kMask, k0);
@@ -864,23 +899,29 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   T* xqBase = scratch<T>("ab.xqk", 2 * qRows * C);
   T* xq = xqBase + r0 * C;
   T* xk = xqBase + qRows * C + r0 * C;
-  if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
-    if (C == 128) {
-      if (ADA_RAW) adaLnChained128K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
-      else adaLnChained128K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
+  T* tn = (st.noResidual ? scratch<T>("ab.tn", qRows * C) : xqBase) + r0 * C;
+  if (!preNormed) {
+    if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
+      if (C == 128) {
+        if (ADA_RAW) adaLnChained128K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
+        else adaLnChained128K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk, R, q1, prevY, prevGate, prevMask);
+      } else {
+        if (prevY) addSigmoidGated<T>(act, prevY, prevGate, R * C, q1 * C, prevMask, C);
+        float* xqF = scratch<float>("ab.xqF", qRows * C) + r0 * C;
+        adaLn<float>(act, qScale, qShift, xqF, R, C, q1);
+        if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(R * C), 256, 0, STREAM>>>(xqF, xq, R * C);
+        else CK(cudaMemcpyAsync(xq, xqF, R * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        adaLn<T>(xqF, kScale, kShift, xk, R, C, q1);
+      }
     } else {
-      if (prevY) addSigmoidGated<T>(act, prevY, prevGate, R * C, q1 * C, prevMask, C);
-      float* xqF = scratch<float>("ab.xqF", qRows * C) + r0 * C;
-      adaLn<float>(act, qScale, qShift, xqF, R, C, q1);
-      if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(R * C), 256, 0, STREAM>>>(xqF, xq, R * C);
-      else CK(cudaMemcpyAsync(xq, xqF, R * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-      adaLn<T>(xqF, kScale, kShift, xk, R, C, q1);
+      const float* s3 = st.noResidual ? ffwScale : nullptr;
+      const float* h3 = st.noResidual ? ffwShift : nullptr;
+      T* o3 = st.noResidual ? tn : nullptr;
+      if (ADA_RAW) adaLn2K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale,
+                                                                              kShift, xq, xk, R, C, q1, prevY, prevGate, prevMask, s3, h3, o3, prevAtt, prevAttGate);
+      else adaLn2K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk,
+                                                                  R, C, q1, prevY, prevGate, prevMask, s3, h3, o3, prevAtt, prevAttGate);
     }
-  } else {
-    if (ADA_RAW) adaLn2K<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale,
-                                                                            kShift, xq, xk, R, C, q1, prevY, prevGate, prevMask);
-    else adaLn2K<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, qScale, qShift, kScale, kShift, xq, xk,
-                                                                R, C, q1, prevY, prevGate, prevMask);
   }
   T* qgBase = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd);
   T* qg = qgBase + r0 * 2 * Wd;
@@ -903,6 +944,7 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
     qBias = nullptr;
   }
   T* gathered = scratch<T>("ab.gathered", qRows * Wd) + r0 * Wd;
+  const float outScale = hasTr2 ? 1.f : 2.f;    // chai: no Transition2, gated output scaled by 2
   int warps = 8;
   size_t smem = ((size_t)sh.keys * (D + 1) * 2 + (size_t)warps * sh.keys + (size_t)warps * D) * 4;
   dim3 grid((unsigned)nS, heads);
@@ -910,23 +952,22 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
     if (D == 32 && sh.keys == 128 && sh.queries == 32)
       atomAttentionMMA<32, 128><<<grid, 64, 0, STREAM>>>(
         qg, qBias, kvAtomAll, st.queriesToKeys.idx + k0, st.queriesToKeys.mask + k0, q1,
-        qMask, kMask, pairLogits, gathered, sh.queries, heads, st.keyMasked, 1.f / sqrtf((float)D), subs);
+        qMask, kMask, pairLogits, gathered, sh.queries, heads, st.keyMasked, 1.f / sqrtf((float)D), subs, outScale);
     else
       atomAttentionFusedK<T><<<grid, warps * 32, smem, STREAM>>>(
         qg, qBias, kvAtomAll, st.queriesToKeys.idx + k0, st.queriesToKeys.mask + k0, q1,
-        qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked, subs);
+        qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked, subs, outScale);
   } else {
     atomAttentionFusedK<T><<<grid, warps * 32, smem, STREAM>>>(
       qg, qBias, kvAtomAll, st.queriesToKeys.idx + k0, st.queriesToKeys.mask + k0, q1,
-      qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked, subs);
+      qMask, kMask, pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked, subs, outScale);
   }
-  T* attention = scratch<T>("ab.attention", qRows * C) + r0 * C;
-  if (hasW(B + ".Transition2")) linear<T, T>(gathered, attention, R, Wd, C, B + ".Transition2");
-  else castScaleK<T, T><<<blocks(R * C), 256, 0, STREAM>>>(gathered, attention, 2.f, R * C);   // chai
-  T* tn = xq;
-  if (st.noResidual) {
-    adaLn<T, T>(act, ffwScale, ffwShift, tn, R, C, q1, act, attention, zg);
-  } else {
+  T* attention = gathered;
+  if (hasTr2) {
+    attention = scratch<T>("ab.attention", qRows * C) + r0 * C;
+    linear<T, T>(gathered, attention, R, Wd, C, B + ".Transition2");
+  }
+  if (!st.noResidual) {
     if (ADA_RAW) gatedAddAdaLnRowsK<T, true, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
                                                                           tn, R, C, q1);
     else gatedAddAdaLnRowsK<T, false, T><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act, attention, zg, ffwScale, ffwShift,
@@ -939,14 +980,18 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   linear<T, T>(tn, wide, R, C, up ? 3 * I : 2 * I, w1);
   swiglu<T>(wide, gated, R, I, up);
   linear<T, T>(gated, projected, R, I, C, B + ".ffwTransition2");
-  if (!deferAdd) addSigmoidGated<T>(act, projected, tg, R * C, q1 * C, postMask, C);
+  if (!deferAdd) {
+    if (st.noResidual) addSigmoidGated<T>(act, attention, zg, R * C, q1 * C, postMask, C, projected, tg);
+    else addSigmoidGated<T>(act, projected, tg, R * C, q1 * C, postMask, C);
+  }
 }
 inline bool ATOM_HALF = false;        // the atom blocks' GEMMs in f16 (set by --fast)
 inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
                                 int C, int heads, int D, const std::string& B, const float* prevGate = nullptr,
-                                const float* prevMask = nullptr, bool deferAdd = false, const float* postMask = nullptr) {
-  if (ATOM_HALF) crossAttentionBlockT<half>(act, st, bc, sh, C, heads, D, B, prevGate, prevMask, deferAdd, postMask);
-  else crossAttentionBlockT<float>(act, st, bc, sh, C, heads, D, B, prevGate, prevMask, deferAdd, postMask);
+                                const float* prevMask = nullptr, bool deferAdd = false, const float* postMask = nullptr,
+                                const float* prevAttGate = nullptr, bool preNormed = false) {
+  if (ATOM_HALF) crossAttentionBlockT<half>(act, st, bc, sh, C, heads, D, B, prevGate, prevMask, deferAdd, postMask, prevAttGate, preNormed);
+  else crossAttentionBlockT<float>(act, st, bc, sh, C, heads, D, B, prevGate, prevMask, deferAdd, postMask, prevAttGate, preNormed);
 }
 
 // pair[q][k] = row[q] + col[k] + valid * (offsets W + dist / (1 + |d|^2) + Wvalid)
@@ -1018,6 +1063,34 @@ __global__ void chaiAtomPairK(const float* row, const float* col, const float* q
                               const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
                               float* pair, int subsets, int queries, int keys, int Cp, int tokens) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((Cp & 3) == 0) {
+    size_t cp4 = (size_t)(Cp >> 2), total4 = (size_t)subsets * queries * keys * cp4;
+    if (t >= total4) return;
+    int c = (int)(t % cp4) << 2; size_t rest = t / cp4; int key = (int)(rest % keys); size_t qi = rest / keys;
+    int s = (int)(qi / queries);
+    size_t ki = (size_t)s * keys + key;
+    float4 rw = *(const float4*)(row + qi * Cp + c), cl = *(const float4*)(col + ki * Cp + c);
+    float4 v = make_float4(rw.x + cl.x, rw.y + cl.y, rw.z + cl.z, rw.w + cl.w);
+    if (trunkPair && tqMask[qi] != 0 && tkMask[ki] != 0) {
+      float4 tp = *(const float4*)(trunkPair + ((size_t)tqIdx[qi] * tokens + tkIdx[ki]) * Cp + c);
+      v.x += tp.x; v.y += tp.y; v.z += tp.z; v.w += tp.w;
+    }
+    bool valid = qUid[qi] == kUid[ki];
+    float d0 = qPos[qi * 3] - kPos[ki * 3], d1 = qPos[qi * 3 + 1] - kPos[ki * 3 + 1], d2 = qPos[qi * 3 + 2] - kPos[ki * 3 + 2];
+    float sq = d0 * d0 + d1 * d1 + d2 * d2, denom = 1.f + sq;
+    const float edges[10] = { 0.f, 1.f, 4.f, 9.f, 16.f, 25.f, 36.f, 64.f, 144.f, 256.f };
+    int idx = 0;
+    for (int e = 0; e < 10; ++e) idx += sq > edges[e];
+    if (!valid) idx = 11;
+    float4 b4 = *(const float4*)(bf + c), wi = *(const float4*)(Wf + (size_t)idx * Cp + c), w12 = *(const float4*)(Wf + (size_t)12 * Cp + c);
+    float4 w13 = valid ? *(const float4*)(Wf + (size_t)13 * Cp + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+    v.x += b4.x + wi.x + w12.x / denom + w13.x;
+    v.y += b4.y + wi.y + w12.y / denom + w13.y;
+    v.z += b4.z + wi.z + w12.z / denom + w13.z;
+    v.w += b4.w + wi.w + w12.w / denom + w13.w;
+    *(float4*)(pair + (t << 2)) = v;
+    return;
+  }
   size_t total = (size_t)subsets * queries * keys * Cp;
   if (t >= total) return;
   int c = (int)(t % Cp); size_t rest = t / Cp; int key = (int)(rest % keys); size_t qi = rest / keys;
@@ -1077,10 +1150,15 @@ __global__ void atomLogitsLayoutK(const float* __restrict__ flat, float* __restr
 // aggregateK over convert(q2t, ...)'s output, without materialising it: the same sum in the same
 // order (a query the gather masks reads as 0, which the ReLU keeps 0)
 // act[q] = qStart[q] + qMask[q] * ((positions gathered to q) Wp + (chiralGrads gathered to q) Wc), Wp/Wc (3, C)
+template <class TO = float, bool RAW = false>
 __global__ void encoderStartK(const float* __restrict__ qStart, const float* __restrict__ pos,
               const int* __restrict__ idx, const float* __restrict__ gmask, const float* __restrict__ Wp,
               const float* __restrict__ qMask, float* __restrict__ act, size_t rows, int C, size_t q1, size_t atoms,
-              const float* __restrict__ chiralGrads = nullptr, const float* __restrict__ Wc = nullptr) {
+              const float* __restrict__ chiralGrads = nullptr, const float* __restrict__ Wc = nullptr,
+              const float* __restrict__ s1 = nullptr, const float* __restrict__ h1 = nullptr,
+              const float* __restrict__ s2 = nullptr, const float* __restrict__ h2 = nullptr,
+              TO* __restrict__ xq = nullptr, TO* __restrict__ xk = nullptr, bool chained = false,
+              const float* __restrict__ s3 = nullptr, const float* __restrict__ h3 = nullptr, TO* __restrict__ tn = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((C & 3) == 0) {
     size_t c4 = (size_t)(C >> 2);
@@ -1115,7 +1193,36 @@ __global__ void encoderStartK(const float* __restrict__ qStart, const float* __r
     }
     float4 qs = __ldg(reinterpret_cast<const float4*>(qStart + gq * C + c));
     float qm = __ldg(qMask + gq);
-    *(float4*)(act + (t << 2)) = make_float4(qs.x + v.x * qm, qs.y + v.y * qm, qs.z + v.z * qm, qs.w + v.w * qm);
+    float4 act4 = make_float4(qs.x + v.x * qm, qs.y + v.y * qm, qs.z + v.z * qm, qs.w + v.w * qm);
+    *(float4*)(act + (t << 2)) = act4;
+    if (C == 128 && xq) {
+      size_t kb = gq * 128 + c;
+      float4 a = __ldg(reinterpret_cast<const float4*>(s1 + kb)), b = __ldg(reinterpret_cast<const float4*>(h1 + kb));
+      float4 c2 = __ldg(reinterpret_cast<const float4*>(s2 + kb)), d = __ldg(reinterpret_cast<const float4*>(h2 + kb));
+      float sum = act4.x + act4.y + act4.z + act4.w;
+      for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+      float mean = sum * (1.f / 128.f), qv = (act4.x - mean) * (act4.x - mean) + (act4.y - mean) * (act4.y - mean) + (act4.z - mean) * (act4.z - mean) + (act4.w - mean) * (act4.w - mean);
+      for (int o = 16; o; o >>= 1) qv += __shfl_xor_sync(~0u, qv, o);
+      float inv = rsqrtf(qv * (1.f / 128.f) + ADA_EPS);
+      float n0 = (act4.x - mean) * inv, n1 = (act4.y - mean) * inv, n2 = (act4.z - mean) * inv, n3 = (act4.w - mean) * inv;
+      float q0 = a.x * n0 + b.x, q1v = a.y * n1 + b.y, q2 = a.z * n2 + b.z, q3 = a.w * n3 + b.w;
+      store4(xq + (t << 2), q0, q1v, q2, q3);
+      if (chained) {
+        float sq = q0 + q1v + q2 + q3;
+        for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
+        float mean2 = sq * (1.f / 128.f), v2 = (q0 - mean2) * (q0 - mean2) + (q1v - mean2) * (q1v - mean2) + (q2 - mean2) * (q2 - mean2) + (q3 - mean2) * (q3 - mean2);
+        for (int o = 16; o; o >>= 1) v2 += __shfl_xor_sync(~0u, v2, o);
+        float inv2 = rsqrtf(v2 * (1.f / 128.f) + ADA_EPS);
+        store4(xk + (t << 2), c2.x * ((q0 - mean2) * inv2) + d.x, c2.y * ((q1v - mean2) * inv2) + d.y,
+               c2.z * ((q2 - mean2) * inv2) + d.z, c2.w * ((q3 - mean2) * inv2) + d.w);
+      } else {
+        store4(xk + (t << 2), c2.x * n0 + d.x, c2.y * n1 + d.y, c2.z * n2 + d.z, c2.w * n3 + d.w);
+      }
+      if (tn) {
+        float4 e3 = __ldg(reinterpret_cast<const float4*>(s3 + kb)), f3 = __ldg(reinterpret_cast<const float4*>(h3 + kb));
+        store4(tn + (t << 2), e3.x * n0 + f3.x, e3.y * n1 + f3.y, e3.z * n2 + f3.z, e3.w * n3 + f3.w);
+      }
+    }
     return;
   }
   if (t >= rows * C) return;
@@ -1140,14 +1247,23 @@ __global__ void encoderStartK(const float* __restrict__ qStart, const float* __r
 }
 __global__ void aggregateGatherK(const float* __restrict__ projected, const int* __restrict__ idx,
                  const float* __restrict__ gmask, const float* __restrict__ atomMask,
-                 float* __restrict__ out, size_t rows, int tokens, int dense, int Cp, size_t q1) {
+                 float* __restrict__ out, size_t rows, int tokens, int dense, int Cp, size_t q1,
+                 const float* __restrict__ snProj = nullptr) {
   if ((Cp & 3) == 0) {
-    size_t t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x, cp4 = (size_t)(Cp >> 2);
-    if (t4 >= rows * cp4) return;
+    size_t cp4 = (size_t)(Cp >> 2);
     unsigned token, c4;
-    if (rows * cp4 < (1ull << 32)) {
-      unsigned u = (unsigned)t4, cu = (unsigned)cp4; token = u / cu; c4 = u - token * cu;
-    } else { token = (unsigned)(t4 / cp4); c4 = (unsigned)(t4 % cp4); }
+    size_t t4;
+    if (blockDim.x == cp4) {
+      token = blockIdx.x; c4 = threadIdx.x;
+      if (token >= rows) return;
+      t4 = (size_t)token * cp4 + c4;
+    } else {
+      t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      if (t4 >= rows * cp4) return;
+      if (rows * cp4 < (1ull << 32)) {
+        unsigned u = (unsigned)t4, cu = (unsigned)cp4; token = u / cu; c4 = u - token * cu;
+      } else { token = (unsigned)(t4 / cp4); c4 = (unsigned)(t4 % cp4); }
+    }
     unsigned k = rows <= (size_t)tokens ? 0u : token / (unsigned)tokens;
     unsigned tok = rows <= (size_t)tokens ? token : token - k * (unsigned)tokens;
     size_t g0 = (size_t)tok * dense;
@@ -1161,8 +1277,13 @@ __global__ void aggregateGatherK(const float* __restrict__ projected, const int*
         sum.z += v.z > 0 ? v.z : 0.f; sum.w += v.w > 0 ? v.w : 0.f;
       }
     }
-    reinterpret_cast<float4*>(out)[t4] = count > 0 ? make_float4(sum.x / count, sum.y / count, sum.z / count, sum.w / count)
-                                                   : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 res = count > 0 ? make_float4(sum.x / count, sum.y / count, sum.z / count, sum.w / count)
+                           : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (snProj) {
+      float4 sn = __ldg(reinterpret_cast<const float4*>(snProj) + (size_t)tok * cp4 + c4);
+      res.x += sn.x; res.y += sn.y; res.z += sn.z; res.w += sn.w;
+    }
+    reinterpret_cast<float4*>(out)[t4] = res;
     return;
   }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1178,7 +1299,9 @@ __global__ void aggregateGatherK(const float* __restrict__ projected, const int*
       sum += v > 0 ? v : 0;
     }
   }
-  out[t] = count > 0 ? sum / count : 0.f;
+  float res = count > 0 ? sum / count : 0.f;
+  if (snProj) res += snProj[(token % tokens) * Cp + c];
+  out[t] = res;
 }
 __global__ void aggregateK(const float* tokenAtoms, const float* atomMask, float* out, size_t rows, int tokens,
                            int dense, int Cp) {
@@ -1366,7 +1489,7 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   o.pair = scratch<float>(E + ".pair", pairRows * Cp);
   Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");
   if (chai)
-    chaiAtomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, W(E + ".embedAtomPairFeat"),
+    chaiAtomPairK<<<blocks((Cp & 3) == 0 ? (pairRows * (Cp >> 2)) : (pairRows * Cp)), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, W(E + ".embedAtomPairFeat"),
       W(E + ".embedAtomPairFeatBias"), tp, tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp,
       sh.tokens);
   else
@@ -1484,7 +1607,7 @@ inline const Chirality& chirality(size_t atoms) {           // the inverted inde
 }
 // The encoder's per-step part: the activation from (scaled) positions, the blocks, the
 // per-token aggregation. Fills o.skip and o.tokenAct.
-inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions) {
+inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions, const float* snProj = nullptr) {
   AtomShape sh = atomShape();
   int C = o.C;
   size_t atoms = (size_t)sh.tokens * sh.dense, q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
@@ -1492,6 +1615,7 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   float* act = scratch<float>(E + ".act", qRows * C);
   bool maskPerBlock = M.flag(E + ".blocks.0.maskAtomActPerBlock");   // padded atom rows zeroed before every block
   bool chiral = atomPositions && hasW(E + ".atomChiralToFeatures");
+  bool preNorm0 = atomPositions && C == 128 && !o.blocks.empty();
   if (atomPositions) {
     // the start, the positions (and optional chirality gradients) gathered to queries, their three-row projections,
     // the query mask and the add, in one pass (a K = 3 GEMM wrote its whole output at a fraction of the bandwidth)
@@ -1512,9 +1636,39 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
     // (the diffusion's tokens split: this rank's subsets and their halo only - ATOM_S0/S1)
     const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
     const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
-    encoderStartK<<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(o.qStart + r0 * C, atomPositions, t2q.idx + r0, t2q.mask + r0,
-      W(E + ".atomPositionsToFeatures"), o.qMask + r0, act + r0 * C, R, C, q1, atoms,
-      grads, chiral ? W(E + ".atomChiralToFeatures") : nullptr);
+    auto launchStart = [&](auto typeTag) {
+      using T = decltype(typeTag);
+      const float *s1 = nullptr, *h1 = nullptr, *s2 = nullptr, *h2 = nullptr, *s3 = nullptr, *h3 = nullptr;
+      T *xq = nullptr, *xk = nullptr, *tn = nullptr;
+      bool chained = false;
+      if (preNorm0) {
+        const AtomBlockCache& bc0 = o.blocks[0];
+        auto at = [](const float* p, size_t k) { return p ? p + k : p; };
+        s1 = at(bc0.qScale, r0 * C); h1 = at(bc0.qShift, r0 * C);
+        s2 = at(bc0.kScale, r0 * C); h2 = at(bc0.kShift, r0 * C);
+        T* xqBase = scratch<T>("ab.xqk", 2 * qRows * C);
+        xq = xqBase + r0 * C;
+        xk = xqBase + qRows * C + r0 * C;
+        chained = bc0.chained;
+        if (o.noResidual && !chained) {
+          s3 = at(bc0.ffwScale, r0 * C); h3 = at(bc0.ffwShift, r0 * C);
+          tn = scratch<T>("ab.tn", qRows * C) + r0 * C;
+        }
+      }
+      if (ADA_RAW)
+        encoderStartK<T, true><<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(
+          o.qStart + r0 * C, atomPositions, t2q.idx + r0, t2q.mask + r0,
+          W(E + ".atomPositionsToFeatures"), o.qMask + r0, act + r0 * C, R, C, q1, atoms,
+          grads, chiral ? W(E + ".atomChiralToFeatures") : nullptr,
+          s1, h1, s2, h2, xq, xk, chained, s3, h3, tn);
+      else
+        encoderStartK<T, false><<<blocks((C & 3) == 0 ? (R * (C >> 2)) : (R * C)), 256, 0, STREAM>>>(
+          o.qStart + r0 * C, atomPositions, t2q.idx + r0, t2q.mask + r0,
+          W(E + ".atomPositionsToFeatures"), o.qMask + r0, act + r0 * C, R, C, q1, atoms,
+          grads, chiral ? W(E + ".atomChiralToFeatures") : nullptr,
+          s1, h1, s2, h2, xq, xk, chained, s3, h3, tn);
+    };
+    if (ATOM_HALF) launchStart(half{}); else launchStart(0.f);
   } else {
     for (int k = 0; k < NS; ++k)
       CK(cudaMemcpyAsync(act + k * q1 * C, o.qStart, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -1523,8 +1677,10 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   for (size_t b = 0; b < o.blocks.size(); ++b) {
     bool last = b + 1 == o.blocks.size();
     const float* prevGate = b > 0 ? o.blocks[b - 1].tg : nullptr;
+    const float* prevAttGate = (b > 0 && o.noResidual) ? o.blocks[b - 1].zg : nullptr;
     crossAttentionBlock(act, st, o.blocks[b], sh, C, o.heads, o.D, E + ".blocks." + std::to_string(b),
-                        prevGate, maskPerBlock ? o.qMask : nullptr, !last, last ? o.qMask : nullptr);
+                        prevGate, maskPerBlock ? o.qMask : nullptr, !last, last ? o.qMask : nullptr,
+                        prevAttGate, b == 0 && preNorm0);
   }
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
@@ -1535,10 +1691,16 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   }
   // the gather back to token atoms fused into the mean: the gathered tensor was atoms x 768 floats
   // a sample, written and read again every step (96 MB at 261 tokens and five samples)
-  o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);
-  size_t aggrWork = (o.perToken & 3) == 0 ? (size_t)sh.tokens * NS * (o.perToken >> 2) : (size_t)sh.tokens * NS * o.perToken;
-  aggregateGatherK<<<blocks(aggrWork), 256, 0, STREAM>>>(projected, q2t.idx, q2t.mask,
-    Fdev("batch.refMask"), o.tokenAct, (size_t)sh.tokens * NS, sh.tokens, sh.dense, o.perToken, q1);
+  size_t rows = (size_t)sh.tokens * NS;
+  o.tokenAct = scratch<float>(E + ".tokenAct", rows * o.perToken);
+  if ((o.perToken & 3) == 0 && (o.perToken >> 2) <= 1024) {
+    aggregateGatherK<<<(unsigned)rows, (unsigned)(o.perToken >> 2), 0, STREAM>>>(projected, q2t.idx, q2t.mask,
+      Fdev("batch.refMask"), o.tokenAct, rows, sh.tokens, sh.dense, o.perToken, q1, snProj);
+  } else {
+    size_t aggrWork = (o.perToken & 3) == 0 ? rows * (o.perToken >> 2) : rows * o.perToken;
+    aggregateGatherK<<<blocks(aggrWork), 256, 0, STREAM>>>(projected, q2t.idx, q2t.mask,
+      Fdev("batch.refMask"), o.tokenAct, rows, sh.tokens, sh.dense, o.perToken, q1, snProj);
+  }
 }
 inline EncoderOut atomEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                               const float* trunkPair, const float* atomPositions) {
