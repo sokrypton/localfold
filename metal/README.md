@@ -66,7 +66,15 @@ The CUDA gates' cases, scored against crystals, with this Mac's baseline in `met
 python3 metal/af3/gate.py [--write] [--only=<case or model>]   # 16: eight models, ligand + phosphoserine, DNA,
 python3 metal/af2/gate.py [--write]                             #   methylated DNA, kitchen sink, glycan, templates
 python3 metal/ef2/gate.py [--write]                             # AF2 5, ESMFold2 8
+python3 metal/bench/gate.py [--write]                           # lf_gemm's SPEED, this chip's own times (below)
 ```
+
+A chip without its own answer baseline is held to its generation's (an M5 Pro to the M5's), else the M2's. The answer
+gates cannot see a kernel slow down - 5646656b made every `lf_gemm` 15x slower on the M2 and passed them all on the M5
+(docs/M2-TO-M5.md) - so `metal/bench/gate.py` times the bench's plain and extended-epilogue arms against
+`metal/bench/bench-baseline.<chip>-<cores>c.json` and fails at 1.3x. Speed is not shared between chips: a new chip
+records its own. A change to `gemm.metal` wants it run on an M1/M2 (static registers) as well as on the chip that wrote
+it.
 
 On an M2 (10-core GPU), 2026-10-09: every case passes. Against the CUDA-translated port this replaced, case by case:
 
