@@ -18,8 +18,8 @@ Mirrors `../localfold/tools/quantize_model.py` and `../localfold/tools/export_bi
 Usage:
   python3 tools/export_rfd4p_model.py \
     --input ./weights/model.safetensors \
-    --config ./weights/config.json \
-    --output ./weights/int8 \
+    --config ./model-rfd4p-int8/config.json \
+    --output ./model-rfd4p-int8 \
     --format int8 \
     --shard-mb 32
 """
@@ -233,9 +233,9 @@ def export_bundle(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=Path("./weights/model.safetensors"))
-    parser.add_argument("--config", type=Path, default=Path("./weights/config.json"))
-    parser.add_argument("--output", type=Path, default=Path("./weights/int8"))
+    parser.add_argument("--input", type=Path, default=Path("./model-rfd4p-int8/model.safetensors"))
+    parser.add_argument("--config", type=Path, default=Path("./model-rfd4p-int8/config.json"))
+    parser.add_argument("--output", type=Path, default=Path("./model-rfd4p-int8"))
     parser.add_argument("--format", choices=("int8", "f16", "f32"), default="int8")
     parser.add_argument("--shard-mb", type=int, default=32)
     args = parser.parse_args()

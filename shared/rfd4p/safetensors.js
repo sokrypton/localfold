@@ -64,12 +64,12 @@ export function parseSafetensors(buffer) {
 // own copy on Hugging Face beside the nine fold bundles - is the fallback to
 // reach for if that happens, not a thing to do twice over now.
 //
-// A local `./weights/int8` is still honoured first, so a developer who exported
+// A local `./model-rfd4p-int8` is still honoured first, so a developer who exported
 // their own shards is not forced through the network. See docs/DESIGN.md.
 export const RFD4P_PUBLISHED_BASE = 'https://sokrypton.github.io/rfd4-proteina-webgpu';
 export const DEFAULT_LOCAL_WEIGHTS_URL = './weights/model.safetensors';
-export const DEFAULT_LOCAL_SHARDED_DIR = './weights/int8';
-export const DEFAULT_LOCAL_CONFIG_URL = './weights/config.json';
+export const DEFAULT_LOCAL_SHARDED_DIR = './model-rfd4p-int8';
+export const DEFAULT_LOCAL_CONFIG_URL = './model-rfd4p-int8/config.json';
 export const DEFAULT_PUBLISHED_SHARDED_DIR = `${RFD4P_PUBLISHED_BASE}/weights/int8`;
 export const DEFAULT_PUBLISHED_CONFIG_URL = `${RFD4P_PUBLISHED_BASE}/weights/config.json`;
 export const DEFAULT_HF_REPO = 'nvidia/RFD4-Proteina';

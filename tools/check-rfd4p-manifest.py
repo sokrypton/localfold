@@ -5,7 +5,7 @@
 
 🔴 WHY THIS IS A GATE AND NOT A CURIOSITY. The ~420 MB of INT8 shards are NOT in
 this repository: they are fetched from `sokrypton/rfd4-proteina-webgpu`'s Pages
-URL at run time (see `weights/SOURCE.md`). What IS here is `int8/manifest.json`,
+URL at run time (see `model-rfd4p-int8/SOURCE.md`). What IS here is `manifest.json`,
 which records the SHARD AND BYTE OFFSET of every one of the 1,257 tensors - so
 the file we keep and the files we fetch have to describe each other.
 
@@ -32,8 +32,15 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = "sokrypton/rfd4-proteina-webgpu"
 # The files we keep a copy of, as paths inside that repository.
-COPIED = ["weights/config.json", "weights/int8/config.json", "weights/int8/manifest.json"]
-SOURCE = os.path.join(ROOT, "weights/SOURCE.md")
+# 🔴 OUR PATH -> UPSTREAM'S. The local directory was flattened and renamed when
+# the hosting decision was made (the shards are served by the port, never kept
+# here), and upstream's own layout is NOT ours to change - so the two sides are
+# written out as a mapping rather than assumed equal.
+COPIED = {
+    "model-rfd4p-int8/config.json": "weights/config.json",
+    "model-rfd4p-int8/manifest.json": "weights/int8/manifest.json",
+}
+SOURCE = os.path.join(ROOT, "model-rfd4p-int8/SOURCE.md")
 
 
 def digest(data):
@@ -41,7 +48,7 @@ def digest(data):
 
 
 def pinned_commit():
-    """The commit `weights/SOURCE.md` says our copy came from."""
+    """The commit `model-rfd4p-int8/SOURCE.md` says our copy came from."""
     text = open(SOURCE).read()
     found = re.search(r"^- commit: `([0-9a-f]{7,40})`", text, re.M)
     if found is None:
@@ -76,13 +83,17 @@ def main():
 
     reference = head if (write and head) else pin
     drifted, missing = [], []
-    for path in COPIED:
+    for path, theirPath in COPIED.items():
         local_path = os.path.join(ROOT, path)
         if not os.path.exists(local_path):
             missing.append(path)
             continue
         local = open(local_path, "rb").read()
-        theirs = upstream(path, reference)
+        # 🔴 FETCHED BY UPSTREAM'S PATH, COMPARED AGAINST OURS. The local
+        # directory was renamed and flattened; theirs was not, and is not ours
+        # to change. Asking for our own path here would 404 and read as "the
+        # file is gone from upstream" rather than as a bug in this script.
+        theirs = upstream(theirPath, reference)
         if theirs is None:
             print("offline, so nothing was compared - a missing network is not a drift")
             return 0

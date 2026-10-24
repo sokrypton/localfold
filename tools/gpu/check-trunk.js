@@ -43,13 +43,13 @@ async function fetchBuffer(url) {
  * someone has exported or downloaded one; otherwise this reaches for
  * Hugging Face and the download is large.
  *
- * So every check that calls this needs that file. See weights/SOURCE.md.
+ * So every check that calls this needs that file. See model-rfd4p-int8/SOURCE.md.
  */
 export async function loadReleased() {
   const local = await fetch('/weights/model.safetensors', { method: 'HEAD' }).catch(() => null);
   const weightsUrl = local && local.ok ? '/weights/model.safetensors' : DEFAULT_HF_WEIGHTS_URL;
-  const configUrl = await fetch('/weights/config.json', { method: 'HEAD' })
-    .then((r) => (r && r.ok ? '/weights/config.json' : DEFAULT_HF_CONFIG_URL))
+  const configUrl = await fetch('/model-rfd4p-int8/config.json', { method: 'HEAD' })
+    .then((r) => (r && r.ok ? '/model-rfd4p-int8/config.json' : DEFAULT_HF_CONFIG_URL))
     .catch(() => DEFAULT_HF_CONFIG_URL);
   const [cfg, buf] = await Promise.all([
     fetch(configUrl).then((r) => r.json()),

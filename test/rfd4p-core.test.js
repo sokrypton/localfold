@@ -104,7 +104,7 @@ test('buildBatch builds all 10 interactive presets (.cif.zst and specMode) and p
 test('pairFeatures static cache matches uncached pairFeatures bit-for-bit', () => {
   const bytes = fs.readFileSync(path.join(EXAMPLES_DIR, 'ppi_pdl1.cif.zst'));
   const { batch, n } = buildBatch(bytes, { seed: 42 });
-  const cfg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../weights/config.json'), 'utf8')).config.nn;
+  const cfg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../model-rfd4p-int8/config.json'), 'utf8')).config.nn;
   const distCfg = { dim: cfg.xt_pair_dist_dim, min: cfg.xt_pair_dist_min, max: cfg.xt_pair_dist_max };
 
   const ca0 = new Float32Array(n * 3);
@@ -241,7 +241,7 @@ test('Kabsch 3D superimposer, Hungarian assignment, and processSampleToAtoms exp
   assert.equal(parsedCif.length, structure.atoms.length);
 });
 
-test('readShardedTensor dequantizes block-64 INT8 and ./weights/int8/manifest.json indexes all 1,257 tensors', () => {
+test('readShardedTensor dequantizes block-64 INT8 and ./model-rfd4p-int8/manifest.json indexes all 1,257 tensors', () => {
   // Synthetic 2-block (128-element) int8 tensor
   const blockSize = 64;
   const n = 128;
@@ -271,7 +271,7 @@ test('readShardedTensor dequantizes block-64 INT8 and ./weights/int8/manifest.js
   assert.equal(data[64], 0.0);
   assert.equal(data[66], 1.0);
 
-  const manifestPath = path.resolve(__dirname, '../weights/int8/manifest.json');
+  const manifestPath = path.resolve(__dirname, '../model-rfd4p-int8/manifest.json');
   if (fs.existsSync(manifestPath)) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     assert.equal(manifest.format, 'rfd4p-sharded-v1');

@@ -162,8 +162,10 @@ oracle-dumps-colab/
 # RFD4-Proteina's INT8 shards: ~420 MB, hosted rather than committed, exactly as
 # the nine fold bundles are. The config and the tensor manifest beside them ARE
 # tracked - they are what the tests read and what says where a tensor lives.
-# 🔴 This directory is named `weights/` and not `model-rfd4p-int8/` because the
-# engine's three defaults in shared/rfd4p/safetensors.js still point here;
-# renaming it belongs with the hosting decision, not before it. See docs/DESIGN.md.
-weights/int8/*.bin
-weights/*.safetensors
+# 🔴 RENAMED FROM `weights/` ONCE THE HOSTING DECISION WAS MADE: the shards are
+# served by sokrypton/rfd4-proteina-webgpu's Pages URL and are never kept here,
+# so a top-level directory called `weights/` named something this repository
+# does not have. It matches the nine fold bundles' `model-*` convention now, and
+# holds only the config and the tensor manifest - text the tests read offline.
+model-rfd4p-int8/*.bin
+model-rfd4p-int8/*.safetensors
