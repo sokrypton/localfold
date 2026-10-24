@@ -408,11 +408,9 @@ rather than after.
 
 Each step ends green and is committed before the next begins.
 
-1. **Scaffold and the page shell.** `design.html` in the light style, the ensemble and designer pickers, no loop
-   wired. Gate: `npm run test:site` resolves it, `tools/mobile-layout.py` passes.
-   Alongside it, audit py2Dmol for the three things section 5 needs - role colouring, a labelled frame API, residue
-   picking - and record which already exist, since that decides whether the viewer needs an upstream change early.
-   The gate that does run is **`npm run test:design`** (`tools/check-design-page.py`): it loads the page in headless
+1. ~~**Scaffold and the page shell.**~~ **Done**, and py2Dmol audited
+   (docs/DESIGN-PY2DMOL.md: role colouring EXISTS, frames and picking PARTIAL).
+   The gate is **`npm run test:design`** (`tools/check-design-page.py`): it loads the page in headless
    Chrome, requires the module to actually run, and requires the automatic designer to MOVE when the target gains a
    ligand - a note reading "Auto → SolubleMPNN" is also what a broken wire prints, since soluble is the fallback.
    🔴 **Both of those gates are already red on this checkout, for reasons that predate this work and are not
@@ -420,9 +418,12 @@ Each step ends green and is committed before the next begins.
    (it is missing `weights-08.int5.bin`), and `tools/mobile-layout.py` reports four failures about `index.html`'s
    own option grouping. Verified by re-running both with this work stashed: identical failures. Until they are
    green, a new page's module graph has to be resolved by hand.
-2. **The RunSpec.** aminx's field names and semantics on our engine, with her attribution in place; fixed and tied
-   positions reaching `cpu/design/mpnn/`. Gate: a seeded RunSpec reproduces its sequence exactly; new bridge tests.
-   **Unlocks** inverse folding, and is the primitive antibody mode and motif scaffolding are built on.
+2. **The RunSpec — built and tested, NOT yet wired.** `cpu/design/runspec.js` translates aminx's field names into
+   `Model.sample`'s options, with 10 tests. 🔴 **Nothing routes through it yet:** `web/hunt.js` still hands
+   `temperature` and `omit` to the loop, which hands them to `designChain`, which builds its own bias. Wiring it
+   means teaching the bridge to accept pre-built sample options, and it would have no visible effect until the page
+   can express a fixed position - so the honest order is **UI for positions first, then the wiring**, and
+   `runspec.js` is the thing both will meet at. **Unlocks** inverse folding, antibody mode and motif scaffolding.
 3. ~~**The loop on one folder.**~~ **Done.** `web/hunt.js` supplies the loop's `fold` and `design` - a real AF3
    fold and a real MPNN redesign - and `web/design.js` draws a row and a sequence line per cycle as it lands.
    `npm run test:design` runs the whole thing end to end: a 31-residue target, a 12-residue binder, one cycle,
@@ -430,8 +431,12 @@ Each step ends green and is committed before the next begins.
    🔴 It also checks the loop's own rule through the page: **cycle 0 can never be best**, because its sequence
    is the mostly-X draw the run started from, and on a 12-mer of mostly X it folds deceptively well (pLDDT 99 in a
    stub, and it was the top scorer).
-4. **Validity checks.** Ring closure, Watson-Crick pairing, antibody framework RMSD, as vetoes with recorded
-   reasons. Gate: each check has a fixture that fails it and one that passes.
+4. **Validity checks.** Only the loop's alanine ceiling exists today, and the page reports it as the fraction it
+   is. Ring closure, Watson-Crick pairing and antibody framework RMSD are vetoes with recorded reasons - 🔴 but each
+   one only becomes *reachable* with the modality that produces it, so this step is really a part of 6 and 7 rather
+   than before them. The one check that would bite a protein-binder hunt today and does not exist is **contact
+   rejection**: whether the designed chain is actually touching the target. Gate: each check has a fixture that
+   fails it and one that passes.
 5. ~~**Ensembles.**~~ **Done.** The folder rotates per cycle - not per run, since a design only has to satisfy
    several models if the model changes UNDER the sequence being refined. `npm run test:design` reads the rotation
    off the table and fails if the column does not alternate: a four-cycle run with two folders gives
@@ -447,7 +452,8 @@ Each step ends green and is committed before the next begins.
 
 **Unsettled, needs a decision when reached:** whether the first page exposes more than one MPNN noise level; whether
 the ONNX sampler earns its dependency (step 2 is where to measure it); whether pocket conditioning is worth a
-Boltz-2-only path.
+Boltz-2-only path; and how RFD4 reaches the page - its engine is in the tree and the Method picker says plainly that
+it is not joined to it, which needs the 420 MB fetch and a generation to be worth claiming.
 
 ---
 
