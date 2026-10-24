@@ -431,6 +431,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     // built, and read them uninitialised (only where K < the step count: 68 tokens takes all 200 either way)
     if (SIGMA_MAX_K <= 0) {
       const size_t stepBytes = (size_t)d.layers * (perLayer + R * 4 * I * 4);
+      // (as many steps as 448 MB holds; BE2_COND_STEPS=K sets K, 1 the per-step control)
       const int envK = getenv("BE2_COND_STEPS") ? std::max(1, atoi(getenv("BE2_COND_STEPS")))
                                                 : std::max(1, std::min(steps, (int)(((size_t)448 << 20) / std::max<size_t>(stepBytes, 1))));
       const int batches = std::max(1, (steps + envK - 1) / envK);

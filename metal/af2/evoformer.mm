@@ -222,6 +222,7 @@ static half* pairBias(const T* pair, int L, int C, const std::string& normW, con
   // (rows padded with -inf to a whole 64-key tile: biasStride(L), and the attention's NT kernel - core.mm)
   const int S = biasStride(L);
   half* b = scratch<half>("bias.b", (size_t)H * L * S);
+  // (the pair bias projected and laid out per head in one kernel; LOCALFOLD_PAIR_BIAS=0 the control - a GEMM, then the layout)
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   if (fusedPairBias && C <= 128 && (C & 31) == 0 && (H == 4 || H == 8)) {
     run("af2_pair_bias", Grid{(uint32_t)((L + 7) / 8), (uint32_t)((L + 7) / 8), 1}, 256,
@@ -406,8 +407,7 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   }
   const half* Wout = PH(Op + "/output_w", blk);        // [O * O][128]
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
-  half* lnOut = (!nextNorm.empty() && lnEmit && (matrixUnits() || lnSimd)) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
+  half* lnOut = (!nextNorm.empty() && lnEmit && matrixUnits()) ? lnTarget((size_t)L * L, 128, nullptr) : nullptr;
   const float* lnScale = lnOut ? P(nextNorm + "/scale", blk) : nullptr;
   const float* lnOffset = lnOut ? P(nextNorm + "/offset", blk) : nullptr;
   half* lnOut2 = (lnOut && !nextNorm2.empty() && L <= 512) ? scratch<half>("ln.p2", (size_t)L * L * 128) : nullptr;

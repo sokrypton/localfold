@@ -853,11 +853,11 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
     if (tensorWanted()) return gemmTensorRun(tc_, a, batch, accFloat, label);
   }
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
   const bool lnEmit = a.lnOut && !(a.epilogue & (128 | 256 | 4096 | 16384 | 32768 | 262144 | 524288 | 1048576)) &&
                       !a.ptrs && batch == 1 && !getenv("LOCALFOLD_GEMM_TILE") &&
-                      ((a.m == 64 && lnWanted) ||
-                       (lnSimd && ((a.m == 128 && (!(a.epilogue & 8192) || a.tgN == 128)) || (a.m == 256 && (!(a.epilogue & 8192) || a.tgN == 256)) || ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)))) &&
+                      // (64 wide only: lf_gemm's native square tile. At 128 and 256 the tile narrows to 32 and 16 rows and reads
+                      // its X 2-4x over - a measured loss, kept opt-in by 557fcc3e and taken by nothing, so gone)
+                      a.m == 64 && lnWanted &&
                       a.ldd % 4 == 0 && a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
   if (!lnEmit) {
@@ -895,7 +895,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   }
   if ((a.epilogue & (128 | 32768)) && tc < 32) tc = 32;
   if (a.epilogue & 256) tc = 64;
-  if (lnEmit) { tr = a.m == 256 ? 16 : a.m == 64 ? 64 : 32; tc = a.m == 256 ? 256 : a.m == 64 ? 64 : 128; }
+  if (lnEmit) { tr = 64; tc = 64; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);
   if (tr % 16 || tc % 16 || tr < 16 || tc < 16) die("gemm: no %d x %d tile", tr, tc);
   auto esize = [](DT t) { return t == F32 ? 4 : 2; };
@@ -1014,10 +1014,10 @@ static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const h
                      label ? label : "gated add, dual");
     return ln;
   }
-  const int lnMode = getenv("LOCALFOLD_LN_EMIT") ? atoi(getenv("LOCALFOLD_LN_EMIT")) : 1;
-  if (dual && !tensorWanted() && out % 64 == 0 && in % 16 == 0 && in <= 512 && !(out > 128 && lnOut && lnMode >= 2) &&
+  if (dual && !tensorWanted() && out % 64 == 0 && in % 16 == 0 && in <= 512 &&
       a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
-    const bool ln = lnOut && lnWanted && (out == 64 || (out == 128 && lnMode != 0)) && a16(lnOut) && a16(lnScale) && a16(lnOffset);
+    // (the next LayerNorm at 64 and 128 wide; past that the caller's own - lf_gemm_dual's tile is 32 x 128 at most)
+    const bool ln = lnOut && lnWanted && (out == 64 || out == 128) && a16(lnOut) && a16(lnScale) && a16(lnOffset);
     const int tr = 32, tc = (ln && out == 128) ? 128 : 64;
     const int sgr = tc == 128 ? 1 : 2, sgc = tc == 128 ? 4 : 2;
     GemmArgs a{};

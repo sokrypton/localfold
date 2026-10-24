@@ -571,6 +571,7 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
   float* levels = scratch<float>("dn.levels", (size_t)std::max(steps, 1) * 4);
   if (steps > 0) upload(levels, hostLevels.data(), (size_t)steps * 16);
   size_t stepBytes = (size_t)d.T * (d.entries + d.tokenBlocks + 4) * d.Ct * 4;
+  // (the step conditioning computed K steps at a time, as many as 320 MB holds; EF2_COND_BATCH=K sets K, 1 the per-step control)
   int maxK = getenv("EF2_COND_BATCH") ? std::max(1, atoi(getenv("EF2_COND_BATCH")))
                                       : std::max(1, std::min(steps, (int)(((size_t)320 << 20) / std::max<size_t>(stepBytes, 1))));
   int batches = std::max(1, (steps + maxK - 1) / maxK);

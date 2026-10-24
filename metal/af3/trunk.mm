@@ -289,9 +289,8 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   const half* Wout = Wh(pre + ".outputW");          // [O * O][C]
   const uint after = flag("trunk.dialect.opmBiasAfterNorm") ? 1u : 0u;
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
   const bool opmEmit = S <= 128 ? (C == 128 || C == 256) : canEmitPairLn(C);
-  half* lnOut = (opmEmit && !nextNorm.empty() && lnEmit && (matrixUnits() || (C == 128 && lnSimd))) ? scratch<half>("mnorm.p1", pairs * C) : nullptr;
+  half* lnOut = (opmEmit && !nextNorm.empty() && lnEmit && matrixUnits()) ? scratch<half>("mnorm.p1", pairs * C) : nullptr;
   const float* lnScale = lnOut ? W(nextNorm + "Scale") : nullptr;
   const float* lnOffset = lnOut ? Wopt(nextNorm + "Offset") : nullptr;
   half* lnOut2 = (lnOut && !nextNorm2.empty()) ? scratch<half>("mnorm.p2", pairs * C) : nullptr;

@@ -124,7 +124,7 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   const bool hasT2 = hasW(B + ".Transition2");
   const bool directAct = !hasT2 && st.noResidual && Wd == C;
   half* gathered = directAct ? nullptr : scratch<half>("ab.gathered", qRows * Wd);
-  static const bool scalarAttention = getenv("AF3_SCALAR_ATOM_ATTENTION") != nullptr;      // (the control arm)
+  static const bool scalarAttention = (getenv("AF3_SCALAR_ATOM_ATTENTION") && atoi(getenv("AF3_SCALAR_ATOM_ATTENTION")) != 0);      // (the control arm)
   const bool mma = !scalarAttention && sh.queries == 32 && sh.keys <= 128 && (D == 16 || D == 32);
   run(mma ? (D == 16 ? "af3_atom_attention_mma16" : "af3_atom_attention_mma32") : "af3_atom_attention",
       Grid{(uint32_t)(sh.subsets * NS), (uint32_t)heads, 1}, 128,
@@ -192,7 +192,7 @@ std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size
                                    const float* qUid, const float* kUid) {
   std::vector<float*> out;
   size_t per = (size_t)sh.subsets * heads * sh.queries * sh.keys;
-  static const bool scalarAttention = getenv("AF3_SCALAR_ATOM_ATTENTION") != nullptr;
+  static const bool scalarAttention = (getenv("AF3_SCALAR_ATOM_ATTENTION") && atoi(getenv("AF3_SCALAR_ATOM_ATTENTION")) != 0);
   const uint log2Scale = (!scalarAttention && sh.queries == 32 && sh.keys <= 128 && (D == 16 || D == 32)) ? 1u : 0u;
   Gather tq = qUid ? gatherOf("batch.tokensToQueries") : Gather{};
   Gather tk = qUid ? gatherOf("batch.tokensToKeys") : Gather{};

@@ -149,6 +149,7 @@ static void gridAttentionT(T* pair, const Masks& m, int n, int C, const std::str
   }
   // (rows padded to a whole 64-key tile with -inf, so the attention's last key tile needs no per-element mask)
   int stride = (n + 63) / 64 * 64;
+  // (the pair bias projected and laid out per head in one kernel; LOCALFOLD_PAIR_BIAS=0 the control - a GEMM, then the layout)
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
   if (fusedPairBias && (C == 64 || (C % 128 == 0 && C <= 512)) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
@@ -394,6 +395,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   const half* xs = sharedNorm(pair);
   half* pln = xs ? (half*)xs : pairLn(pair, P, C, B + ".singlePairLogitsNorm", nextPairNorm);
   int stride = (n + 63) / 64 * 64;
+  // (the pair bias projected and laid out per head in one kernel; LOCALFOLD_PAIR_BIAS=0 the control - a GEMM, then the layout)
   static const bool fusedPairBias = !getenv("LOCALFOLD_PAIR_BIAS") || atoi(getenv("LOCALFOLD_PAIR_BIAS")) != 0;
   half* bias = nullptr;
   if (fusedPairBias && (C == 64 || (C % 128 == 0 && C <= 512)) && (heads == 4 || heads == 8 || heads == 12 || heads == 16)) {
