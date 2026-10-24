@@ -754,7 +754,9 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 or 16 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
-    if (a.m == 256 || (a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512)))) { tm = a.m == 512 ? 32 : (a.n <= 128 ? 16 : 32); tn = 256; }
+    // (an outer product's add normalises over its own group, tgN wide: a row a tile wide is a group only where tgN is the
+    // row - L x 128 = 256 at TWO tokens took the 256-wide norm over two tokens' channels and read past lnScale)
+    if ((a.m == 256 && (!(a.epilogue & 8192) || a.tgN == 256)) || (a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512)))) { tm = a.m == 512 ? 32 : (a.n <= 128 ? 16 : 32); tn = 256; }
     else if (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) { tm = 64; tn = 128; }
     else if ((a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0) { tm = 32; tn = 256; }
     else if (a.m == 128 || ((a.epilogue & (8192 | 16384)) && a.m % 128 == 0)) { tm = 64; tn = 128; }
@@ -787,11 +789,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
                       ((tm == 64 && tn == 64 && a.m == 64 && !hacc) ||
                        (tm == 64 && tn == 128 &&
-                        (a.m == 128 || (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) ||
+                        ((a.m == 128 && (!(a.epilogue & 8192) || a.tgN == 128)) || (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) ||
                          ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)) &&
                         (!hacc || (a.epilogue & 16384))) ||
                        ((tm == 32 || tm == 16) && tn == 256 &&
-                        (a.m == 256 || (tm == 32 && a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512))) ||
+                        ((a.m == 256 && (!(a.epilogue & 8192) || a.tgN == 256)) || (tm == 32 && a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512))) ||
                          (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc)) &&
                       batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
@@ -839,7 +841,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   const bool lnEmit = a.lnOut && !(a.epilogue & (128 | 256 | 4096 | 16384 | 32768 | 262144 | 524288 | 1048576)) &&
                       !a.ptrs && batch == 1 && !getenv("LOCALFOLD_GEMM_TILE") &&
                       ((a.m == 64 && lnWanted) ||
-                       (lnSimd && (a.m == 128 || a.m == 256 || ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)))) &&
+                       (lnSimd && ((a.m == 128 && (!(a.epilogue & 8192) || a.tgN == 128)) || (a.m == 256 && (!(a.epilogue & 8192) || a.tgN == 256)) || ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)))) &&
                       a.ldd % 4 == 0 && a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
   if (!lnEmit) {
