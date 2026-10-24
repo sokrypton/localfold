@@ -891,7 +891,7 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
   const float *zg = at(bc.zg, r0 * C), *ffwScale = at(bc.ffwScale, r0 * C), *ffwShift = at(bc.ffwShift, r0 * C), *tg = at(bc.tg, r0 * C);
   const float *prevGate = at(prevGateAll, r0 * C); const T *prevY = prevGate ? projected : nullptr;
   const float *prevAttGate = at(prevAttGateAll, r0 * C);
-  const T *prevAtt = prevAttGate ? (hasTr2 ? scratch<T>("ab.attention", qRows * C) : scratch<T>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
+  const T *prevAtt = prevAttGate ? (hasTr2 ? scratch<T>("ab.attention", qRows * C) + r0 * C : scratch<T>("ab.gathered", qRows * Wd) + r0 * Wd) : nullptr;
   const float *prevMask = at(prevMaskAll, r0), *postMask = at(postMaskAll, r0);
   const float* pairLogits = at(bc.pairLogits, (size_t)(part ? ATOM_S0 : 0) * heads * sh.queries * sh.keys);
   const float *qMask = at(st.qMask, r0), *kMask = at(st.kMask, k0);

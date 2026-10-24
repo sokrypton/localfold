@@ -1699,13 +1699,13 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   int Wd = d.heads * d.D;
   if (ATOM_HALF) {
     const half* prevProj = d.blocks.empty() ? nullptr : scratch<half>("ab.projected", qRows * C) + r0 * C;
-    const half* prevAtt = prevAttGate ? (hasTr2Last ? scratch<half>("ab.attention", qRows * C) : scratch<half>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
+    const half* prevAtt = prevAttGate ? (hasTr2Last ? scratch<half>("ab.attention", qRows * C) + r0 * C : scratch<half>("ab.gathered", qRows * Wd) + r0 * Wd) : nullptr;
     maskLnProject3K<half><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
       W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
       prevProj, prevGate, prevAtt, prevAttGate);
   } else {
     const float* prevProj = d.blocks.empty() ? nullptr : scratch<float>("ab.projected", qRows * C) + r0 * C;
-    const float* prevAtt = prevAttGate ? (hasTr2Last ? scratch<float>("ab.attention", qRows * C) : scratch<float>("ab.gathered", qRows * Wd)) + r0 * C : nullptr;
+    const float* prevAtt = prevAttGate ? (hasTr2Last ? scratch<float>("ab.attention", qRows * C) + r0 * C : scratch<float>("ab.gathered", qRows * Wd) + r0 * Wd) : nullptr;
     maskLnProject3K<float><<<(unsigned)((R + 3) / 4), 128, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
       W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3,
       prevProj, prevGate, prevAtt, prevAttGate);

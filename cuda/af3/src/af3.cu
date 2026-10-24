@@ -72,7 +72,7 @@ static int foldMain(int argc, char** argv) {
   // the whole OPM - sharing a slot with opm.*, as it did past 32 MB (AF3, 5CAJ with 1,024 rows), the OPM wrote over the
   // attention's input and the fold's pLDDT fell 95.25 -> 84.69 with its coordinates nearly unmoved)
   SHARED_NESTED = { { "tmpl.", "tri." }, { "tmpl.", "grid." }, { "tmpl.", "tr." }, { "tmpl.", "p16." }, { "emb.", "p16." },
-                    { "msaatt.", "tr." }, { "msaatt.", "opm." } };
+                    { "msaatt.", "tr." }, { "msaatt.", "opm." }, { "st.", "tr." } };
   // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
   // measure the two on a device - the fused ones are each a block's worth of shared memory)
   if (const char* u = getenv("LOCALFOLD_UNFUSED")) {
