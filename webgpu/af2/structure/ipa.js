@@ -161,9 +161,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
 const SOFTMAX_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
 @group(0) @binding(1) var<uniform> p: Parameters;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
@@ -174,10 +173,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var sum = 0.0;
   for (var k = 0u; k < p.length; k += 1u) {
     let w = exp(logits[base + k] - maximum);
-    output[base + k] = w;
+    logits[base + k] = w;
     sum += w;
   }
-  for (var k = 0u; k < p.length; k += 1u) { output[base + k] = output[base + k] / sum; }
+  for (var k = 0u; k < p.length; k += 1u) { logits[base + k] = logits[base + k] / sum; }
 }`;
 
 const SCALAR_FEATURE_SHADER = `${COMMON}
@@ -449,17 +448,29 @@ export class InvariantPointAttentionGpu {
     const allocate = (label, elements, usage = GPUBufferUsage.STORAGE) =>
       keep(this.allocator.allocate(label, elements * 4, usage));
     const attentionElements = input.heads * input.length * input.length;
+    const { pipelines, weights, params, mask, pair, pairBias } = shared;
+    const bindGroup = (pipeline, buffers) => this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+    });
+    const queryScalar = allocate("ipa.query-scalar", input.length * shared.queryScalarColumns);
+    const kvScalar = allocate("ipa.kv-scalar", input.length * shared.kvScalarColumns);
+    const kvPointLocal = allocate("ipa.kv-point-local", input.length * shared.kvPointColumns);
+    const queryPoint = allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3);
+    const kvPoint = allocate("ipa.kv-point",
+      input.length * input.heads * (input.pointQk + input.pointV) * 3);
+    const logits = allocate("ipa.logits", attentionElements);
+    const features = allocate("ipa.features", input.length * shared.featureChannels);
     return {
-      queryScalar: allocate("ipa.query-scalar", input.length * shared.queryScalarColumns),
-      kvScalar: allocate("ipa.kv-scalar", input.length * shared.kvScalarColumns),
-      queryPointLocal: allocate("ipa.query-point-local", input.length * shared.queryPointColumns),
-      kvPointLocal: allocate("ipa.kv-point-local", input.length * shared.kvPointColumns),
-      queryPoint: allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3),
-      kvPoint: allocate("ipa.kv-point",
-        input.length * input.heads * (input.pointQk + input.pointV) * 3),
-      logits: allocate("ipa.logits", attentionElements),
-      attention: allocate("ipa.attention", attentionElements),
-      features: allocate("ipa.features", input.length * shared.featureChannels),
+      queryScalar, kvScalar, kvPointLocal, queryPoint, kvPoint, logits, features,
+      logitsBg: bindGroup(pipelines[3],
+        [queryScalar, kvScalar, queryPoint, kvPoint, pairBias, mask, weights, params, logits]),
+      softmaxBg: bindGroup(pipelines[4], [logits, params]),
+      scalarFeatureBg: bindGroup(pipelines[5], [logits, kvScalar, params, features]),
+      pairFeatureBg: bindGroup(pipelines[7], [logits, pair, params, features]),
+      sourceBgs: new WeakMap(),
+      affineBgs: new WeakMap(),
+      outputBgs: new WeakMap(),
       release: () => { for (let i = allocations.length - 1; i >= 0; i -= 1) allocations[i].release(); },
     };
   }
@@ -472,45 +483,60 @@ export class InvariantPointAttentionGpu {
    * read back, which is the whole point - see the note in structure/core.js.
    */
   encode(compute, input, shared, scratch, source, affine, output) {
-    const { pipelines, weights, params, mask, pair, pairBias } = shared;
-    const dispatch = (pipeline, buffers, x, y = 1) => {
+    const { pipelines, weights, params } = shared;
+    const bindGroup = (pipeline, buffers) => this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+    });
+    const runBg = (pipeline, bg, x, y = 1) => {
       compute.setPipeline(pipeline);
-      compute.setBindGroup(0, this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
-      }));
+      compute.setBindGroup(0, bg);
       compute.dispatchWorkgroups(x, y);
     };
     const linearGrid = (elements, workgroupSize = 64) => {
       const groups = Math.ceil(elements / workgroupSize);
       return [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     };
-    const linear = (paramsValue, result, columns) =>
-      dispatch(pipelines[1], [source, weights, paramsValue, result],
-        Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-    linear(shared.qScalarParams, scratch.queryScalar, shared.queryScalarColumns);
-    linear(shared.kvScalarParams, scratch.kvScalar, shared.kvScalarColumns);
-    linear(shared.qPointParams, scratch.queryPointLocal, shared.queryPointColumns);
-    linear(shared.kvPointParams, scratch.kvPointLocal, shared.kvPointColumns);
-    dispatch(pipelines[2], [scratch.queryPointLocal, affine, shared.qPointTransformParams, scratch.queryPoint],
-      Math.ceil(scratch.queryPoint.byteLength / 4 / 3 / 64));
-    dispatch(pipelines[2], [scratch.kvPointLocal, affine, shared.kvPointTransformParams, scratch.kvPoint],
-      Math.ceil(scratch.kvPoint.byteLength / 4 / 3 / 64));
+    let sBgs = scratch.sourceBgs.get(source.buffer);
+    if (sBgs === undefined) {
+      sBgs = [
+        bindGroup(pipelines[1], [source, weights, shared.qScalarParams, scratch.queryScalar]),
+        bindGroup(pipelines[1], [source, weights, shared.kvScalarParams, scratch.kvScalar]),
+        bindGroup(pipelines[1], [source, weights, shared.qPointParams, scratch.kvPointLocal]),
+        bindGroup(pipelines[1], [source, weights, shared.kvPointParams, scratch.kvPointLocal]),
+      ];
+      scratch.sourceBgs.set(source.buffer, sBgs);
+    }
+    let aBgs = scratch.affineBgs.get(affine.buffer);
+    if (aBgs === undefined) {
+      aBgs = [
+        bindGroup(pipelines[2], [scratch.kvPointLocal, affine, shared.qPointTransformParams, scratch.queryPoint]),
+        bindGroup(pipelines[2], [scratch.kvPointLocal, affine, shared.kvPointTransformParams, scratch.kvPoint]),
+        bindGroup(pipelines[6], [scratch.logits, scratch.kvPoint, affine, params, scratch.features]),
+      ];
+      scratch.affineBgs.set(affine.buffer, aBgs);
+    }
+    let outBg = scratch.outputBgs.get(output.buffer);
+    if (outBg === undefined) {
+      outBg = bindGroup(pipelines[1], [scratch.features, weights, shared.outputParams, output]);
+      scratch.outputBgs.set(output.buffer, outBg);
+    }
+    const linRows = Math.ceil(input.length / TRANSITION_TILE_ROWS);
+    runBg(pipelines[1], sBgs[0], Math.ceil(shared.queryScalarColumns / TRANSITION_TILE_COLUMNS), linRows);
+    runBg(pipelines[1], sBgs[1], Math.ceil(shared.kvScalarColumns / TRANSITION_TILE_COLUMNS), linRows);
+    runBg(pipelines[1], sBgs[2], Math.ceil(shared.queryPointColumns / TRANSITION_TILE_COLUMNS), linRows);
+    runBg(pipelines[2], aBgs[0], Math.ceil(scratch.queryPoint.byteLength / 4 / 3 / 64));
+    runBg(pipelines[1], sBgs[3], Math.ceil(shared.kvPointColumns / TRANSITION_TILE_COLUMNS), linRows);
+    runBg(pipelines[2], aBgs[1], Math.ceil(scratch.kvPoint.byteLength / 4 / 3 / 64));
     const attentionElements = input.heads * input.length * input.length;
     const logitsGrid = linearGrid(attentionElements);
-    dispatch(pipelines[3],
-      [scratch.queryScalar, scratch.kvScalar, scratch.queryPoint, scratch.kvPoint, pairBias, mask, weights, params,
-        scratch.logits], logitsGrid[0], logitsGrid[1]);
+    runBg(pipelines[3], scratch.logitsBg, logitsGrid[0], logitsGrid[1]);
     const softmaxGrid = linearGrid(input.heads * input.length);
-    dispatch(pipelines[4], [scratch.logits, params, scratch.attention], softmaxGrid[0], softmaxGrid[1]);
-    dispatch(pipelines[5], [scratch.attention, scratch.kvScalar, params, scratch.features],
-      Math.ceil(input.length * input.heads * input.scalarV / 64));
-    dispatch(pipelines[6], [scratch.attention, scratch.kvPoint, affine, params, scratch.features],
-      Math.ceil(input.length * input.heads * input.pointV / 64));
-    dispatch(pipelines[7], [scratch.attention, pair, params, scratch.features],
-      Math.ceil(input.length * input.heads * input.pairChannels / 64));
-    dispatch(pipelines[1], [scratch.features, weights, shared.outputParams, output],
-      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    runBg(pipelines[4], scratch.softmaxBg, softmaxGrid[0], softmaxGrid[1]);
+    runBg(pipelines[5], scratch.scalarFeatureBg, Math.ceil(input.length * input.heads * input.scalarV / 64));
+    runBg(pipelines[6], aBgs[2], Math.ceil(input.length * input.heads * input.pointV / 64));
+    runBg(pipelines[7], scratch.pairFeatureBg, Math.ceil(input.length * input.heads * input.pairChannels / 64));
+    runBg(pipelines[1], outBg, Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), linRows);
   }
 
   async run(input) {
@@ -533,7 +559,6 @@ export class InvariantPointAttentionGpu {
       const affine = upload("ipa.affine", input.affine);
       const queryScalar = allocate("ipa.query-scalar", input.length * queryScalarColumns);
       const kvScalar = allocate("ipa.kv-scalar", input.length * kvScalarColumns);
-      const queryPointLocal = allocate("ipa.query-point-local", input.length * queryPointColumns);
       const kvPointLocal = allocate("ipa.kv-point-local", input.length * kvPointColumns);
       const queryPoint = allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3);
       const kvPoint = allocate(
@@ -541,7 +566,6 @@ export class InvariantPointAttentionGpu {
       );
       const attentionElements = input.heads * input.length * input.length;
       const logits = allocate("ipa.logits", attentionElements);
-      const attention = allocate("ipa.attention", attentionElements);
       const features = allocate("ipa.features", input.length * featureChannels);
       const output = allocate("ipa.output", input.length * input.channels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const encoder = this.device.createCommandEncoder({ label: "invariant-point-attention" });
@@ -564,10 +588,10 @@ export class InvariantPointAttentionGpu {
           Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
       linear(shared.qScalarParams, queryScalar, queryScalarColumns);
       linear(shared.kvScalarParams, kvScalar, kvScalarColumns);
-      linear(shared.qPointParams, queryPointLocal, queryPointColumns);
-      linear(shared.kvPointParams, kvPointLocal, kvPointColumns);
-      pass(pipelines[2], [queryPointLocal, affine, shared.qPointTransformParams, queryPoint],
+      linear(shared.qPointParams, kvPointLocal, queryPointColumns);
+      pass(pipelines[2], [kvPointLocal, affine, shared.qPointTransformParams, queryPoint],
         Math.ceil(queryPoint.byteLength / 4 / 3 / 64));
+      linear(shared.kvPointParams, kvPointLocal, kvPointColumns);
       pass(pipelines[2], [kvPointLocal, affine, shared.kvPointTransformParams, kvPoint],
         Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
       // ...FOLDED. heads * L * L elements over 64 lanes passes 65535 workgroups
@@ -576,12 +600,12 @@ export class InvariantPointAttentionGpu {
       pass(pipelines[3], [queryScalar, kvScalar, queryPoint, kvPoint, pairBias, mask, weights, params, logits],
         logitsGrid[0], logitsGrid[1]);
       const softmaxGrid = linearGrid(input.heads * input.length);
-      pass(pipelines[4], [logits, params, attention], softmaxGrid[0], softmaxGrid[1]);
-      pass(pipelines[5], [attention, kvScalar, params, features],
+      pass(pipelines[4], [logits, params], softmaxGrid[0], softmaxGrid[1]);
+      pass(pipelines[5], [logits, kvScalar, params, features],
         Math.ceil(input.length * input.heads * input.scalarV / 64));
-      pass(pipelines[6], [attention, kvPoint, affine, params, features],
+      pass(pipelines[6], [logits, kvPoint, affine, params, features],
         Math.ceil(input.length * input.heads * input.pointV / 64));
-      pass(pipelines[7], [attention, pair, params, features],
+      pass(pipelines[7], [logits, pair, params, features],
         Math.ceil(input.length * input.heads * input.pairChannels / 64));
       pass(pipelines[1], [features, weights, shared.outputParams, output],
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));

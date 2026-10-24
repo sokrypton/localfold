@@ -736,16 +736,14 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
       } else {
         const float* d = denoise(dNoisy, tHat);
         if (onStep) onStep(d, step, steps);
-        // (boltz2: the noisy copy rigid-aligned onto the answer, each sample - rigid.cuh)
-        std::vector<float> noisy = download(dNoisy, all3), answer = download(d, all3);
-        for (int k = 0; k < ns; ++k) {
-          std::vector<float> x(noisy.begin() + (size_t)k * n3, noisy.begin() + (size_t)(k + 1) * n3),
-                             t(answer.begin() + (size_t)k * n3, answer.begin() + (size_t)(k + 1) * n3);
-          rigidAlign(x, t, mask, (int)atoms);
-          std::copy(x.begin(), x.end(), noisy.begin() + (size_t)k * n3);
-        }
-        upload(dNoisy, noisy.data(), all3 * sizeof(float));
-        run1d("af3_euler", all3, EulerArgs{dX, dNoisy, d, all3, (float)coef, 0});
+        // (boltz2: the noisy copy rigid-aligned onto the answer, each sample - rigid.cuh, directly on unified memory)
+        sync();
+        float* hNoisy = (float*)host(dNoisy);
+        const float* hAns = (const float*)host(d);
+        float* hX = (float*)host(dX);
+        for (int k = 0; k < ns; ++k)
+          rigidAlign(hNoisy + (size_t)k * n3, hAns + (size_t)k * n3, mask.data(), (int)atoms,
+                     hX + (size_t)k * n3, (float)coef);
       }
     }
     release(dRot);

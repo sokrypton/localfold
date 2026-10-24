@@ -151,57 +151,84 @@ export class StructurePostAttentionGpu {
     const elements = input.length * input.channels;
     const allocate = (label, count, usage = GPUBufferUsage.STORAGE) =>
       keep(this.allocator.allocate(label, count * 4, usage));
+    const bindGroup = (pipeline, buffers) => this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+    });
+    const weights = upload("structure.weights", packed.data);
+    const attentionNormParams = upload("structure.attention-norm-params", normParams(
+      input.length, input.channels, packed.offsets[0], packed.offsets[1]), GPUBufferUsage.UNIFORM);
+    const transitionNormParams = upload("structure.transition-norm-params", normParams(
+      input.length, input.channels, packed.offsets[8], packed.offsets[9]), GPUBufferUsage.UNIFORM);
+    const transitionParams = [
+      linearParams("structure.transition-0-params", packed.offsets[2], packed.offsets[3], 1),
+      linearParams("structure.transition-1-params", packed.offsets[4], packed.offsets[5], 1),
+      linearParams("structure.transition-2-params", packed.offsets[6], packed.offsets[7], 0),
+    ];
+    const affineParams = linearParams("structure.affine-params", packed.offsets[10], packed.offsets[11], 0, 6);
+    const normalized = allocate("structure.attention-normalized", elements);
+    const transition0 = allocate("structure.transition-0", elements);
+    const transition1 = allocate("structure.transition-1", elements);
+    const affineUpdate = allocate("structure.affine-update", input.length * 6);
     return {
       addNormalize, linear, affinePipeline,
-      weights: upload("structure.weights", packed.data),
-      attentionNormParams: upload("structure.attention-norm-params", normParams(
-        input.length, input.channels, packed.offsets[0], packed.offsets[1]), GPUBufferUsage.UNIFORM),
-      transitionNormParams: upload("structure.transition-norm-params", normParams(
-        input.length, input.channels, packed.offsets[8], packed.offsets[9]), GPUBufferUsage.UNIFORM),
-      transitionParams: [
-        linearParams("structure.transition-0-params", packed.offsets[2], packed.offsets[3], 1),
-        linearParams("structure.transition-1-params", packed.offsets[4], packed.offsets[5], 1),
-        linearParams("structure.transition-2-params", packed.offsets[6], packed.offsets[7], 0),
-      ],
-      affineParams: linearParams("structure.affine-params", packed.offsets[10], packed.offsets[11], 0, 6),
+      weights, attentionNormParams, transitionNormParams, transitionParams, affineParams,
       // Scratch, reused across iterations - safe for the same reason as the
       // IPA's: one compute pass orders the dispatches and barriers between them.
-      normalized: allocate("structure.attention-normalized", elements),
-      transition0: allocate("structure.transition-0", elements),
-      transition1: allocate("structure.transition-1", elements),
-      transition2: allocate("structure.transition-2", elements),
-      affineUpdate: allocate("structure.affine-update", input.length * 6),
+      normalized, transition0, transition1, affineUpdate,
+      transitionBgs: [
+        bindGroup(linear, [normalized, weights, transitionParams[0], transition0]),
+        bindGroup(linear, [transition0, weights, transitionParams[1], transition1]),
+        bindGroup(linear, [transition1, weights, transitionParams[2], transition0]),
+      ],
+      attnNormBgs: new WeakMap(),
+      outBgs: new WeakMap(),
+      affineBgs: new WeakMap(),
       release: () => { for (let i = allocations.length - 1; i >= 0; i -= 1) allocations[i].release(); },
     };
   }
 
   /** Record one post-attention update into an open compute pass. */
   encode(compute, input, prepared, source, attention, affine, output, affineOutput) {
-    const dispatch = (pipeline, buffers, x, y = 1) => {
+    const bindGroup = (pipeline, buffers) => this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+    });
+    const runBg = (pipeline, bg, x, y = 1) => {
       compute.setPipeline(pipeline);
-      compute.setBindGroup(0, this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
-      }));
+      compute.setBindGroup(0, bg);
       compute.dispatchWorkgroups(x, y);
     };
     const { weights } = prepared;
     const columns = Math.ceil(input.channels / TRANSITION_TILE_COLUMNS);
     const rows = Math.ceil(input.length / TRANSITION_TILE_ROWS);
-    dispatch(prepared.addNormalize,
-      [source, attention, weights, prepared.attentionNormParams, prepared.normalized], input.length);
-    dispatch(prepared.linear,
-      [prepared.normalized, weights, prepared.transitionParams[0], prepared.transition0], columns, rows);
-    dispatch(prepared.linear,
-      [prepared.transition0, weights, prepared.transitionParams[1], prepared.transition1], columns, rows);
-    dispatch(prepared.linear,
-      [prepared.transition1, weights, prepared.transitionParams[2], prepared.transition2], columns, rows);
-    dispatch(prepared.addNormalize,
-      [prepared.normalized, prepared.transition2, weights, prepared.transitionNormParams, output], input.length);
-    dispatch(prepared.linear, [output, weights, prepared.affineParams, prepared.affineUpdate],
-      Math.ceil(6 / TRANSITION_TILE_COLUMNS), rows);
-    dispatch(prepared.affinePipeline, [affine, prepared.affineUpdate, affineOutput],
-      Math.ceil(input.length / 64));
+    let attnNormBg = prepared.attnNormBgs.get(source.buffer);
+    if (attnNormBg === undefined) {
+      attnNormBg = bindGroup(prepared.addNormalize,
+        [source, attention, weights, prepared.attentionNormParams, prepared.normalized]);
+      prepared.attnNormBgs.set(source.buffer, attnNormBg);
+    }
+    let outBgs = prepared.outBgs.get(output.buffer);
+    if (outBgs === undefined) {
+      outBgs = [
+        bindGroup(prepared.addNormalize,
+          [prepared.normalized, prepared.transition0, weights, prepared.transitionNormParams, output]),
+        bindGroup(prepared.linear, [output, weights, prepared.affineParams, prepared.affineUpdate]),
+      ];
+      prepared.outBgs.set(output.buffer, outBgs);
+    }
+    let affineBg = prepared.affineBgs.get(affine.buffer);
+    if (affineBg === undefined) {
+      affineBg = bindGroup(prepared.affinePipeline, [affine, prepared.affineUpdate, affineOutput]);
+      prepared.affineBgs.set(affine.buffer, affineBg);
+    }
+    runBg(prepared.addNormalize, attnNormBg, input.length);
+    runBg(prepared.linear, prepared.transitionBgs[0], columns, rows);
+    runBg(prepared.linear, prepared.transitionBgs[1], columns, rows);
+    runBg(prepared.linear, prepared.transitionBgs[2], columns, rows);
+    runBg(prepared.addNormalize, outBgs[0], input.length);
+    runBg(prepared.linear, outBgs[1], Math.ceil(6 / TRANSITION_TILE_COLUMNS), rows);
+    runBg(prepared.affinePipeline, affineBg, Math.ceil(input.length / 64));
   }
 
   async run(input) {
@@ -242,7 +269,6 @@ export class StructurePostAttentionGpu {
       const normalized = allocate("structure.attention-normalized", elements);
       const transition0 = allocate("structure.transition-0", elements);
       const transition1 = allocate("structure.transition-1", elements);
-      const transition2 = allocate("structure.transition-2", elements);
       const output = allocate("structure.output", elements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const affineUpdate = allocate("structure.affine-update", input.length * 6);
       const affineOutput = allocate("structure.affine-output", input.length * 7,
@@ -263,9 +289,9 @@ export class StructurePostAttentionGpu {
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
       pass(linear, [transition0, weights, transitionParams[1], transition1],
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(linear, [transition1, weights, transitionParams[2], transition2],
+      pass(linear, [transition1, weights, transitionParams[2], transition0],
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(addNormalize, [normalized, transition2, weights, transitionNormParams, output], input.length);
+      pass(addNormalize, [normalized, transition0, weights, transitionNormParams, output], input.length);
       pass(linear, [output, weights, affineParams, affineUpdate],
         Math.ceil(6 / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
       pass(affinePipeline, [affine, affineUpdate, affineOutput], Math.ceil(input.length / 64));

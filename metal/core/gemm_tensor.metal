@@ -973,13 +973,13 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         return;
       }
     }
-    if constexpr ((TM == 64 && TN == 128) || (TM == 32 && TN == 256) ||
-                  (TM == 16 && TN == 256) || (TM == 64 && TN == 64) || (TM == 32 && TN == 64)) {
+    if constexpr ((TM % 16 == 0) && (TN % 32 == 0) && (TN >= 64 || TM >= 32) && (EP & 16) == 0) {
       if ((g.m & 3) == 0) {
-        constexpr int NC = TN == 64 ? 2 : 4;
-        constexpr int NR = (TM * TN) / (512 * NC);
-        constexpr int CSTEP = TN == 256 ? 64 : 32;
-        constexpr int RBLK = TN == 64 ? 16 : 32;
+        constexpr bool oneM = TM == 16 || TN == 256 || (TM == 32 && TN == 128);
+        constexpr int CSTEP = oneM ? 64 : 32;
+        constexpr int NC = TN / CSTEP;
+        constexpr int NR = oneM ? (TM / 8) : (((TM + 31) / 32) * 2);
+        constexpr int RBLK = 8 * NC;
         const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
         const bool fullM = i0 + TN <= g.m;
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
@@ -1090,6 +1090,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             _Pragma("clang loop unroll(full)")
             for (int r_idx = 0; r_idx < NR; ++r_idx) {
               const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
+              if constexpr (TM % 32 != 0 && !oneM) { if (!c.is_valid_element(e0)) continue; }
               const int j = j0 + c.get_multidimensional_index(e0)[1];
               if (j >= g.n) continue;
               device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
@@ -1120,6 +1121,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             _Pragma("clang loop unroll(full)")
             for (int r_idx = 0; r_idx < NR; ++r_idx) {
               const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
+              if constexpr (TM % 32 != 0 && !oneM) { if (!c.is_valid_element(e0)) continue; }
               const int j = j0 + c.get_multidimensional_index(e0)[1];
               if (j >= g.n) continue;
               device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
@@ -1149,6 +1151,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         _Pragma("clang loop unroll(full)")
         for (int r_idx = 0; r_idx < NR; ++r_idx) {
           const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
+          if constexpr (TM % 32 != 0 && !oneM) { if (!c.is_valid_element(e0)) continue; }
           const int j = j0 + c.get_multidimensional_index(e0)[1];
           if (j >= g.n) continue;
           device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;

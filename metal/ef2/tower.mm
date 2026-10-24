@@ -22,9 +22,10 @@ static const half* towerW(const std::string& name) {
   M.expand(name, w);
   return w;
 }
-static void towerLin(const half* X, const std::string& name, float* Y, size_t rows, int in, int out, float alpha = 1.f, float beta = 0.f) {
+static void towerLin(const half* X, const std::string& name, float* Y, size_t rows, int in, int out, float alpha = 1.f, float beta = 0.f,
+                     const char* label = nullptr) {
   Gemm g{}; g.X = X; g.tx = F16; g.W = towerW(name); g.tw = F16; g.Y = Y; g.ty = F32; g.rows = rows; g.in = in; g.out = out;
-  g.alpha = alpha; g.beta = beta; g.label = name.c_str();
+  g.alpha = alpha; g.beta = beta; g.label = label ? label : name.c_str();
   gemm(g);
 }
 // fc1 with its gate and up columns interleaved for gemmSwiglu: in place once for a decoded tower, into scratch for a
@@ -47,10 +48,11 @@ static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int lay
   std::string B = "c/blocks/" + std::to_string(layer) + "/";
   size_t R = e.rows, prows = (R + 15) / 16 * 16; int C = e.model, H = e.heads;
   float* qkv = scratch<float>("esmc.qkv", prows * 3 * C);
-  towerLin(xn, B + "qkv/weights", qkv, prows, C, 3 * C);
+  towerLin(xn, B + "qkv/weights", qkv, prows, C, 3 * C, 1.f, 0.f, "esmc qkv");
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   if (C % 64 == 0 && C <= 1152) {
-    run("ef2_qk_norm_rope", Grid{(uint32_t)((R + 7) / 8), 2, 1}, 256,
+    size_t sgs = R <= 256 ? 2 : 8;
+    run("ef2_qk_norm_rope", Grid{(uint32_t)((R + sgs - 1) / sgs), 2, 1}, (uint32_t)(sgs * 32),
         QkNormRopeArgs{qkv, M.f(B + "q_norm/scale"), M.f(B + "k_norm/scale"), q, k, (uint)R, (uint)C});
   } else {
     layerNorm(qkv, q, R, C, M.f(B + "q_norm/scale"), nullptr, 1e-5f, 3 * C, C);
@@ -60,11 +62,11 @@ static void esmcBlock(const Esmc& e, float* x, half* xn, const int* seq, int lay
   half* ctx = scratch<half>("esmc.ctx", prows * C);
   run("ef2_esmc_attend", Grid{(uint32_t)((R + 31) / 32), (uint32_t)H, 1}, 128,
       EsmcAttendArgs{q, k, qkv + 2 * C, seq, ctx, (uint)R, (uint)C, (uint)(3 * C), 0});
-  towerLin(ctx, B + "attn_out/weights", x, prows, C, C, 1.f / e.residualScale, 1.f);
+  towerLin(ctx, B + "attn_out/weights", x, prows, C, C, 1.f / e.residualScale, 1.f, "esmc attn_out");
   layerNorm(x, xn, R, C, M.f(B + "ffn_norm/scale"), M.f(B + "ffn_norm/offset"));
   half* g = scratch<half>("esmc.g", prows * e.ffn);
   gemmSwiglu(xn, towerFc1(B + "fc1/weights", C, e.ffn), g, prows, C, e.ffn);
-  towerLin(g, B + "fc2/weights", x, prows, e.ffn, C, 1.f / e.residualScale, 1.f);
+  towerLin(g, B + "fc2/weights", x, prows, e.ffn, C, 1.f / e.residualScale, 1.f, "esmc fc2");
 }
 
 void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tokenToRow, int T, float* lmZ) {

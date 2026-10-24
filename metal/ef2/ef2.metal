@@ -118,8 +118,9 @@ kernel void ef2_rope(LF_ARGS(RopeArgs)) {
 // q_norm, k_norm and rotary in one pass over qkv [rows, 3C] (C a multiple of 64 up to 1152): tg.y selects q (0) or k (1),
 // a simdgroup a row; within each 128-channel step (two 64-wide heads), lane and lane ^ 8 hold the (d, d + 32) rotary pair
 kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  uint row = tg.x * 8 + sg;
+                             uint sg [[simdgroup_index_in_threadgroup]], uint sgs [[simdgroups_per_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  uint row = tg.x * sgs + sg;
   if (row >= a.rows) return;
   const uint C = a.C, C4 = C >> 2, isK = tg.y;
   device const float4* x4 = (device const float4*)(a.qkv + (ulong)row * 3 * C + isK * C);
@@ -127,10 +128,11 @@ kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg 
   device float4* y4 = (device float4*)((isK ? a.k : a.q) + (ulong)row * C);
   float4 r[9];
   float s = 0;
+  const bool exact1152 = C == 1152;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
     uint c = lane + 32 * k;
-    if (c < C4) {
+    if (exact1152 || c < C4) {
       r[k] = x4[c];
       s += r[k].x + r[k].y + r[k].z + r[k].w;
     }
@@ -138,7 +140,7 @@ kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg 
   float mean = simd_sum(s) / (float)C, v = 0;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
-    if (lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
+    if (exact1152 || lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
   }
   float inv = rsqrt(simd_sum(v) / (float)C + 1e-5f);
   uint d0 = (lane & 7) << 2;
@@ -152,7 +154,7 @@ kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg 
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
     uint c = lane + 32 * k;
-    if (c < C4) {
+    if (exact1152 || c < C4) {
       float4 n = (r[k] - mean) * inv * sc4[c];
       float4 p = simd_shuffle_xor(n, 8);
       y4[c] = (lane & 8) ? (p * sn + n * cs) : (n * cs - p * sn);
@@ -165,6 +167,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
   uint row = (tg.y * ng.x + tg.x) * sgs + sg;
   if (row >= a.rows) return;
   const uint C = a.C, C4 = C >> 2;
+  const bool exact1152 = C == 1152;
   device const float4* x4 = (device const float4*)(a.x + (ulong)row * C);
   device const float4* ss4 = (device const float4*)a.shimScale;
   device const float4* so4 = (device const float4*)a.shimOffset;
@@ -174,7 +177,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
     uint c = lane + 32 * k;
-    if (c < C4) {
+    if (exact1152 || c < C4) {
       r[k] = x4[c];
       s += r[k].x + r[k].y + r[k].z + r[k].w;
     }
@@ -182,7 +185,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
   float mean = simd_sum(s) / (float)C, v = 0;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
-    if (lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
+    if (exact1152 || lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
   }
   float inv = rsqrt(simd_sum(v) / (float)C + 1e-5f);
   if (a.finalScale) {
@@ -191,7 +194,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
     _Pragma("clang loop unroll(full)")
     for (int k = 0; k < 9; ++k) {
       uint c = lane + 32 * k;
-      if (c < C4) {
+      if (exact1152 || c < C4) {
         r[k] = (r[k] - mean) * inv * fs4[c];
         s2 += r[k].x + r[k].y + r[k].z + r[k].w;
       }
@@ -199,7 +202,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
     mean = simd_sum(s2) / (float)C; v = 0;
     _Pragma("clang loop unroll(full)")
     for (int k = 0; k < 9; ++k) {
-      if (lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
+      if (exact1152 || lane + 32 * k < C4) { float4 d = r[k] - mean; v += dot(d, d); }
     }
     inv = rsqrt(simd_sum(v) / (float)C + 1e-5f);
   }
@@ -209,7 +212,7 @@ kernel void ef2_shim_norm_acc(constant ShimNormAccArgs& a [[buffer(0)]], uint3 t
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {
     uint c = lane + 32 * k;
-    if (c < C4) {
+    if (exact1152 || c < C4) {
       float4 n0 = (r[k] - mean) * inv;
       float4 sn = float4(half4(n0 * ss4[c] + so4[c]));
       float4 acc = (a.first ? float4(0.f) : m4[c]) + a.weight * sn;

@@ -85,6 +85,23 @@ int main() {
     Gemm g{}; g.X = dX; g.W = dW; g.Y = dY; g.rows = R; g.in = K; g.out = O; g.alpha = 0.5f; g.beta = 2.f; g.bias = db; g.relu = true;
     gemm(g);
     report("alpha, beta, bias, relu", relRms(ref, download(dY, R * O)), 1e-5);
+    release(dX); release(dW); release(db); release(dY);
+  }
+  for (auto [R, K, O] : std::vector<std::tuple<size_t, int, int>>{{16, 64, 64}, {32, 64, 64}, {196, 128, 256}, {80, 128, 512}, {80, 64, 2560}}) {
+    auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), b = randv(O), Y0 = randv(R * O);
+    std::vector<double> ref(R * O);
+    for (size_t r = 0; r < R; ++r) for (int o = 0; o < O; ++o) {
+      double s = 0; for (int k = 0; k < K; ++k) s += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+      ref[r * O + o] = std::max(0.0, 0.5 * s + 2.0 * Y0[r * O + o] + b[o]);
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size()); float* db = uploadNew(b.data(), b.size());
+    float* dY = uploadNew(Y0.data(), Y0.size());
+    Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.ty = F32; g.rows = R; g.in = K; g.out = O;
+    g.alpha = 0.5f; g.beta = 2.f; g.bias = db; g.relu = true;
+    gemm(g);
+    char label[96]; snprintf(label, sizeof label, "f16 vecEp alpha, beta, bias, relu %zux%dx%d", R, K, O);
+    report(label, relRms(ref, download(dY, R * O)), 2e-3);
+    release(dX); release(dW); release(db); release(dY);
   }
   for (size_t R : {size_t(333), size_t(68), size_t(16)}) {   // SwiGLU in blocks of 8 (tall tile + short tiles)
     int K = 128, Hd = 256;

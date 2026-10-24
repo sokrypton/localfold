@@ -6,7 +6,8 @@
 
 // x (rows, 3) aligned onto target by the weighted Kabsch rotation (float64, Jacobi on H^T H; a
 // reflection is refused through the determinant's sign)
-inline void rigidAlign(std::vector<float>& x, const std::vector<float>& target, const std::vector<float>& w, int n) {
+inline void rigidAlign(float* x, const float* target, const float* w, int n,
+                       float* eulerOut = nullptr, float eulerCoef = 0.f) {
   double tot = 0, cx[3] = {0, 0, 0}, ct[3] = {0, 0, 0};
   for (int a = 0; a < n; ++a) { tot += w[a]; for (int k = 0; k < 3; ++k) { cx[k] += w[a] * x[a * 3 + k]; ct[k] += w[a] * target[a * 3 + k]; } }
   tot = std::max(tot, 1e-8);
@@ -69,8 +70,15 @@ inline void rigidAlign(std::vector<float>& x, const std::vector<float>& target, 
   for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) { double s = 0; for (int k = 0; k < 3; ++k) s += uu[i * 3 + k] * (k == 2 ? sign : 1) * vv[j * 3 + k]; r[i * 3 + j] = s; }
   for (int a = 0; a < n; ++a) {
     double d[3] = {x[a * 3] - cx[0], x[a * 3 + 1] - cx[1], x[a * 3 + 2] - cx[2]};
-    for (int i = 0; i < 3; ++i) x[a * 3 + i] = (float)(d[0] * r[i * 3] + d[1] * r[i * 3 + 1] + d[2] * r[i * 3 + 2] + ct[i]);
+    for (int i = 0; i < 3; ++i) {
+      float al = (float)(d[0] * r[i * 3] + d[1] * r[i * 3 + 1] + d[2] * r[i * 3 + 2] + ct[i]);
+      if (eulerOut) eulerOut[a * 3 + i] = al + eulerCoef * (al - target[a * 3 + i]);
+      else x[a * 3 + i] = al;
+    }
   }
+}
+inline void rigidAlign(std::vector<float>& x, const std::vector<float>& target, const std::vector<float>& w, int n) {
+  rigidAlign(x.data(), target.data(), w.data(), n);
 }
 
 #ifdef __CUDACC__

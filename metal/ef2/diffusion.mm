@@ -251,6 +251,8 @@ void prepareDiffusionWeights() {
   pairBiasScales(nb, Cz);
   pairBiasOffsets(nb, Cz);
   pairBiasWeights(nb, Cz, H);
+  adaWeights(nb, Ct);
+  outGateWeights(nb, Ct);
   outGateBiases(nb, Ct);
   for (int b = 0; b < nb; ++b) qkvgWeight(b, Ct);
 }
@@ -293,36 +295,15 @@ static void conditioningSteps(const Denoiser& d, const float* levels, int K, flo
     snStep = scratch<half>("dn.sn", pKT * Ct);
     layerNorm(single, snStep, pKT, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   }
-  if (HALF_GEMM && snRaw) {
-    uint64_t* ptrs = scratch<uint64_t>("dn.adaptrs", 9 * (size_t)n);
-    std::vector<uint64_t> hp(9 * (size_t)n);
-    for (int b = 0; b < nb; ++b)
-      for (int k = 0; k < 2; ++k) {
-        const int j = 2 * b + k;
-        const std::string P = "diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/");
-        hp[2 * j] = (uint64_t)Fh(P + "adaln/gateWeights");
-        hp[2 * j + 1] = (uint64_t)Fh(P + "adaln/shiftWeights");
-        hp[2 * n + 2 * j] = hp[2 * n + 2 * j + 1] = (uint64_t)(snScaledH + (size_t)j * pKT * Ct);
-        hp[4 * n + 2 * j] = (uint64_t)(G + (size_t)(2 * j) * Ct);
-        hp[4 * n + 2 * j + 1] = (uint64_t)(G + (size_t)(2 * j + 1) * Ct);
-        hp[6 * n + j] = (uint64_t)Fh(P + "outGateWeights");
-        hp[7 * n + j] = (uint64_t)snRaw;
-        hp[8 * n + j] = (uint64_t)(G + (size_t)(4 * nb + j) * Ct);
-      }
-    upload(ptrs, hp.data(), hp.size() * 8);
-    Gemm g{}; g.X = ptrs + 2 * n; g.tx = F16; g.W = ptrs; g.tw = F16; g.Y = ptrs + 4 * n; g.ldy = ld;
-    g.rows = pKT; g.in = Ct; g.out = Ct; g.batch = 2 * n; g.ptrs = true; g.label = "adaLN projections";
-    gemm(g);
-    Gemm o{}; o.X = ptrs + 7 * n; o.tx = F16; o.W = ptrs + 6 * n; o.tw = F16; o.Y = ptrs + 8 * n; o.ldy = ld;
-    o.bias = outGateBiases(nb, Ct); o.rows = pKT; o.in = Ct; o.out = Ct; o.batch = n; o.ptrs = true; o.label = "out gates";
-    gemm(o);
-  } else {
+  {
     Gemm g{};
     if (HALF_GEMM) { g.X = snScaledH; g.tx = F16; } else { g.X = snScaledF; g.half = true; }
     g.sx = (int64_t)pKT * Ct; g.W = adaWeights(nb, Ct); g.tw = F16; g.sw = (int64_t)Ct * 2 * Ct;
     g.Y = G; g.ldy = ld; g.sy = 2 * Ct; g.rows = pKT; g.in = Ct; g.out = 2 * Ct; g.batch = n; g.label = "adaLN projections";
     gemm(g);
-    Gemm o{}; o.X = single; o.W = outGateWeights(nb, Ct); o.tw = F16; o.half = true; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
+    Gemm o{};
+    if (HALF_GEMM && snRaw) { o.X = snRaw; o.tx = F16; } else { o.X = single; o.half = true; }
+    o.W = outGateWeights(nb, Ct); o.tw = F16; o.Y = G + (size_t)4 * nb * Ct; o.ldy = ld;
     o.bias = outGateBiases(nb, Ct); o.rows = pKT; o.in = Ct; o.out = 2 * nb * Ct; o.label = "out gates";
     gemm(o);
   }
@@ -593,10 +574,6 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
   float* bG = batchK == 1 ? d.G : scratch<float>("dn.bG", pBatchRows * d.entries * d.Ct);
   float* bSTok = scratch<float>("dn.bsTok", pBatchRows * d.Ct);
   for (int i = 0; i < steps; ++i) {
-    if (i % batchK == 0) {
-      int k = std::min(batchK, steps - i);
-      conditioningSteps(d, levels + i * 4, k, bSingle, bG, bSTok);
-    }
     int bi = i % batchK;
     double sigma = sched[i], next = sched[i + 1], gamma = s.churn && next > s.gammaMin ? s.gamma0 : 0;
     double tot = 0, c[3] = {0, 0, 0};
@@ -617,6 +594,10 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
     double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
     for (auto& v : x) v += (float)(eps * N(rng));
     upload(dx, x.data(), (size_t)A * 12);
+    if (bi == 0) {
+      int k = std::min(batchK, steps - i);
+      conditioningSteps(d, levels + i * 4, k, bSingle, bG, bSTok);
+    }
     denoiseStep(d, dx, dd, levels + i * 4,
                 bG + (size_t)bi * d.T * d.entries * d.Ct,
                 bSTok + (size_t)bi * d.T * d.Ct);
