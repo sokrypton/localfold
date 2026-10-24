@@ -166,3 +166,53 @@ for v in 1 4 1 4; do LOCALFOLD_TRI_BLOCKS=$v ./metal/ef2/localfold-ef2 --sequenc
 ```
 
 An `ada_ln` kernel slower than `9b61f8b4`'s on the M2 takes its unrolled form only on Apple9+.
+
+---
+
+## 5. The M2's reply (2026-10-24, `5a48c897`)
+
+Apple M2 (`Apple8`, 10 cores, 16 GB), macOS 13.2.1, SDK 13.3, Chrome stock flags. Every number is arm against arm on
+this box, interleaved, after an untimed run of each; base is `9b61f8b4`.
+
+**Step 0 builds clean on SDK 13.3.** Step 1 found two regressions, both in code only `lf_gemm` runs, measured on the M5
+under `TENSOR=0` - an Apple10, whose registers are allocated dynamically. The M2's are static, for the whole kernel.
+
+1. **`5646656b`'s per-row 8 x 8 store made every `lf_gemm` 15x slower**, whether a tile reached that store or not: the
+   bench's plain `1024 66816 256 0 hhh` 12.4 -> 189 ms (bisected by the bench, then to the one hunk), an AF2 pass at
+   261 residues and 512 + 1024 rows 17.4 -> 84 s, the AF2 gate 7 min. The parent's shape is back (13.4 ms).
+2. **The extended epilogues on `lf_gemm` (`0de9becb`, and `5646656b`'s coupling combine) lose on every port here.** The
+   e64 instance alone is 1.8x a plain one on the same product (21.8 against 12.6 ms). `gemmExtendedEpilogues()` keeps
+   them on the matrix units and Apple9+, off on Apple8; `LOCALFOLD_LF_GEMM_EXT=0/1` forces either arm:
+
+| (base / off / on) | |
+|---|---|
+| AF2 261 res, 512 + 1024 rows, one pass | 17.4 s / **15.5** / 26.4 |
+| AF2 6MRR, 4 passes | 1105 ms / 888-973 / 888 |
+| ESMFold2 sampler, 68 / 261 res | 274 / **185** / 174 ms; 765 / **595** / 808 ms |
+| Boltz-2 total, 68 / 261 res | 7.96 / **7.50** / 11.87 s; 39.4 / **35.0** / 51.3 s |
+| BioEmu2 6MRR, 2 samples, sampler | 25.4 / **21.0** / 28.7 s |
+
+**Gates after the fix:** selftest 123 ok in both arms (a declined epilogue reads "not taken here"); AF2 6/6 (1 min 24);
+ESMFold2 8/8; AF3 18/18; `check-native-worker.py --offline --no-page --no-af3` ok. Recorded: AF2 `5caj-msa`; AF3
+`af3-5caj-msa` and `boltz2-5caj-template` (new); `af3-kitchen-sink` 70.19 -> 78.69 and `af3-glycan` 48.67 -> 47.71
+(`cb160ba0`, as predicted); and **`chai1-6mrr` 82.74 -> 84.46 with its ligand case** - not this pass (base reads the
+same) but `1e670797`'s chai-1 input work, which the M5 recorded and the M2 never had.
+
+**Step 4, the other Metal kernels:** `af3_atom_attention_mma` wins (Boltz-2 diffusion 6.15 against the scalar control's
+6.82 s); the blocked triangle is level (740 / 744 ms, 10.8 / 10.9 s at 261); `ef2_ada_ln` is 26 ms over 253 calls and
+the sampler is faster than base. `lf_center_norm_32h1` is 555 ms against base's `lf_center_norm_32` 350 at 261 - but
+the half-product path it belongs to still wins the trunk: `LOCALFOLD_HALF_PROD=0` is ESMFold2 11.01 against 10.80 s,
+Boltz-2 17.01 against 16.77. Kept.
+
+**WebGPU, stock flags:** `check-quantised-upload` 0 differing at every codec; `test:stock` folds AF3, OpenDDE,
+ESMFold2, boltz2, protenix2, IntelliFold-2 and RF3. Its AF2 and BioEmu2 rows fail for this box's bundles, not code:
+the registry's monomer is int5 at `./model/` and this checkout's `./model/` is the old int8 export (`fold-af2.js
+--bundle=/model-af2-monomer-int5` folds stock at pLDDT 62.912, repeat identical), and there is no BioEmu2 WebGPU bundle
+here. `atomRowTile`: pinned 4 against the derived rule, level (44 / 44 ms at 68 tokens, 132 / 132 at 255). AF2's vector
+OPM wins (block 145 against 155 ms at 150 x 256). Round seven (docs/M2-HANDOFF.md) answered: both register-tiled
+attentions LOSE here - `gridAttendTiled` `grid.attend` 571 -> 952 ms and the pairformer +11% at 200 tokens,
+`attentionTiled` an AF2 block 144-147 -> 150-157 ms - so both stay ampere-only.
+
+**Left:** the plain `lf_gemm` bench is still 7% off base (13.4 against 12.5 ms) - small, not bisected. Not run here:
+`check-evoformer-stack` (its fixtures are not in the checkout), the page (`fold-in-page.py`), `test:portable` and
+`test:spec-floor`.
