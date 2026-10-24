@@ -13,6 +13,13 @@
 #include <cstring>
 #include <fstream>
 
+// a chain's PDB letter, the page's (shared/af3/structure/pdb.js): upper case, lower case, then digits - 'A' + at most 25
+// wrote a 27th chain on as Z beside the 26th, and every reader merged them (as cuda/af2's pdbChain, 042f1442)
+static inline char pdbChain(int k) {
+  static const char CHAINS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  return CHAINS[k % 62];
+}
+
 extern const char* PORT_SOURCE;
 
 namespace {
@@ -82,7 +89,7 @@ std::string pdbText(const std::vector<float>& pos, const std::vector<float>& pld
   std::string out; char line[128]; int serial = 1;
   for (int i = 0; i < L; ++i) {
     int aa = std::min(std::max(aatype[i], 0), 19);
-    char chain = (char)('A' + std::min(asym[i] - firstAsym, 25));
+    char chain = pdbChain(asym[i] - firstAsym);
     for (int a = 0; a < 37; ++a) {
       if (mask37[aa * 37 + a] == 0) continue;
       const float* p = &pos[((size_t)i * 37 + a) * 3];
@@ -289,7 +296,7 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
   {
     std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ".pdb" ? out.substr(0, out.size() - 4) : out;
     int firstAsym = *std::min_element(asym.begin(), asym.end());
-    auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
+    auto chainId = [&](int i) { return pdbChain(asym[i] - firstAsym); };
     std::vector<float> contact;
     if (distogram) {
       float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);

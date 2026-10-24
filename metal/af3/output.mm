@@ -71,7 +71,8 @@ std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& 
       int z = elem[i]; const char* el = z >= 0 && z < 18 ? ELEM[z] : "X";
       const char* res = aatype[t] >= 0 && aatype[t] < 20 ? RES[aatype[t]] : "UNK";
       fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++,
-              strlen(name) < 4 ? (std::string(" ") + name).c_str() : name, res, 'A' + (chain[t] - 1) % 26, resIdx[t], x[i * 3],
+              strlen(name) < 4 ? (std::string(" ") + name).c_str() : name, res,
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[(chain[t] - 1) % 62], resIdx[t], x[i * 3],
               x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[i] : 0.0, el);
     }
   fprintf(f, "END\n");
