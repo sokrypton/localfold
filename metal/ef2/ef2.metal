@@ -42,7 +42,7 @@ kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], u
       va = row[tid];
       vb = row[B8 + tid];
     }
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_device);   // (device: every lane's read of the row lands before any lane overwrites it)
     if (tid < B8) {
       row[2 * tid] = va;
       row[2 * tid + 1] = vb;
@@ -55,7 +55,7 @@ kernel void ef2_interleave8_inplace(constant Interleave8Args& a [[buffer(0)]], u
     va1 = row[m1];
     vb1 = row[B8 + m1];
   }
-  threadgroup_barrier(mem_flags::mem_none);
+  threadgroup_barrier(mem_flags::mem_device);
   row[2 * tid] = va0;
   row[2 * tid + 1] = vb0;
   if (m1 < B8) {
@@ -77,7 +77,7 @@ kernel void ef2_interleave8_inplace_wide(constant Interleave8Args& a [[buffer(0)
       vb[k] = row[B8 + m];
     }
   }
-  threadgroup_barrier(mem_flags::mem_none);
+  threadgroup_barrier(mem_flags::mem_device);
   _Pragma("clang loop unroll(full)")
   for (uint k = 0; k < 4; ++k) {
     const uint m = k * 256 + tid;
@@ -927,7 +927,10 @@ kernel void ef2_scatter_mean(LF_ARGS(ScatterMeanArgs)) {
   }
   float4 v = s / max(w, 1e-9f);
   if (a.add) v += *(device const float4*)(a.add + (ulong)token * a.C + c);
-  *(device float4*)(a.out + (ulong)token * a.ld + c) = v;
+  device float* o = a.out + (ulong)token * a.ld + c;
+  // (s_inputs' rows are 451 wide: a float4 store there is misaligned, which Metal leaves undefined)
+  if ((a.ld & 3) == 0) *(device float4*)o = v;
+  else { o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w; }
 }
 kernel void ef2_tail_inputs(LF_ARGS(TailInputsArgs)) {
   uint t = (uint)LF_INDEX, F = 2 * a.K + 1;
