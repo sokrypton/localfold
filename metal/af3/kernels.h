@@ -51,8 +51,8 @@ struct PairBiasArgs { CP(half) pn; CP(half) W; CP(float) wBias; CP(float) extraB
 struct KeyMaskArgs { CP(float) msaMask; DP(float) keyMask; uint S, n; };
 // w[h][i][ld] = softmax_j(flat[(i, j)][h] + mask), a threadgroup a (h, i) row, the padding zero
 struct MsaWeightsArgs { CP(float) flat; CP(float) keyMask; DP(half) w; uint n, heads, ld, pad; };
-// v [s][j][h d + e] -> [h][j][s][e] (j < np, the rows past n zero)
-struct MsaVHeadsArgs { CP(half) v; DP(half) out; uint S, n, heads, d, np, pad; };
+// v [s][j][h d + e] -> [h][j][s][e] (j < np, the rows past n zero; mask optional)
+struct MsaVHeadsArgs { CP(half) v; DP(half) out; CP(float) mask; uint S, n, heads, d, np, pad; };
 // o [h][i][s][e] -> [s][i][h d + e], times sigmoid(gate)
 struct MsaFromHeadsArgs { CP(half) o; CP(half) gate; DP(half) out; uint S, n, heads, d; };
 struct MaskNormArgs { CP(float) mask; DP(float) norm; uint S, L; };
@@ -214,8 +214,9 @@ struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int
                           pairedRows; };   // (source: batch.msaSource, each row's database; null reads UNIREF90)
 struct ChaiChainHitArgs { CP(int) rows; CP(float) msaMask; CP(int) asym; DP(int) hit; u64 count; uint n, chains; };
 // the grouped outer product: [S][n][G K] -> [G][S][n][K]; P_g [(i, k)][(j, l)] (bi rows i) -> [(i, j)][(g, k, l)]
-struct GroupMajorArgs { CP(float) x; CP(float) mask; DP(float) out; uint S, n, G, K; };
+struct GroupMajorArgs { CP(float) x; CP(float) y; CP(float) mask; DP(float) out; DP(float) outY; uint S, n, G, K; };
 struct GroupedPermuteArgs { CP(float) P; DP(float) out; uint bi, n, G, K; };
+struct GroupedPermuteLnArgs { CP(float) P; DP(float) out; DP(half) outH; CP(float) scale; CP(float) offset; uint bi, n, G, K; float eps; uint pad; };
 struct ScaleHArgs { CP(half) x; DP(float) y; u64 n; float s; uint pad; };       // y = s x (chai's missing output projection)
 // chai-1's atom-pair term: [one_hot(#(|d|^2 > e^2), 12; 11 across reference spaces) | 1 / (1 + |d|^2) | valid] through a
 // biased linear, beside the row and column terms and the trunk pair

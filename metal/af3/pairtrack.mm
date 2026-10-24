@@ -36,12 +36,13 @@ const half* triGateWeight(const std::string& pre, int C) {
 // pair normalised, the norm's name and the buffer. pairLn of the same pair and norm takes its entry; a miss drops both
 // (whatever came between may have moved the pair). LOCALFOLD_LN_EMIT=0: none emitted, every norm its own pass
 struct Emitted { const void* x = nullptr; std::string norm; half* buf = nullptr; };
-static Emitted emitted[4];
+static Emitted emitted[6];
 static void emit(int k, const void* x, const std::string& norm, half* buf) { emitted[k] = {x, norm, buf}; }
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit(k, x, norm, buf); }
 static bool canEmitLn(int C) {
   return C == 64 || C == 128 || C == 256 || ((C == 384 || C == 512) && matrixUnits());
 }
+bool canEmitPairLn(int C) { return canEmitLn(C); }
 static half* takeEmitted(const void* x, const std::string& norm) {
   for (auto& e : emitted)
     if (e.x == x && e.norm == norm) { e.x = nullptr; return e.buf; }
@@ -49,12 +50,14 @@ static half* takeEmitted(const void* x, const std::string& norm) {
     if (e.x == x) e.x = nullptr;
   return nullptr;
 }
+half* takePairLn(const void* x, const std::string& norm) { return takeEmitted(x, norm); }
 template <class T> static half* pairLnT(const T* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "") {
   if (half* b = takeEmitted(pair, norm)) return b;
-  half* xn = scratch<half>("pr.x", P * C);
+  const bool msaPair = norm.find(".msaAttention1.pairNorm") != std::string::npos;
+  half* xn = scratch<half>(msaPair ? "mnorm.p1" : "pr.x", P * C);
   if (!nextNorm.empty() && (nextNorm == "__xhat__" || hasW(nextNorm + "Scale"))) {
     const bool xh = nextNorm == "__xhat__";
-    half* xn2 = scratch<half>(xh ? "par.xhat" : "pr.x2", P * C);
+    half* xn2 = scratch<half>(msaPair ? "mnorm.p2" : (xh ? "par.xhat" : "pr.x2"), P * C);
     layerNormDual(pair, xn, W(norm + "Scale"), Wopt(norm + "Offset"),
                   xn2, xh ? nullptr : W(nextNorm + "Scale"), xh ? nullptr : Wopt(nextNorm + "Offset"), P, C);
     emit(0, pair, nextNorm, xn2);
@@ -249,12 +252,18 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   // both used to be a LayerNorm pass of their own past ~300 tokens)
   half* inAll = takeEmitted(x, pre + ".inputLayerNorm");
   const bool isSt = !strcmp(scratchPrefix, "st.");
+  const bool isMsa = !strcmp(scratchPrefix, "msatr.");
+  const bool msaNext = !isSt && !isMsa && next1.find(".msaAttention1.pairNorm") != std::string::npos;
   const bool xh1 = next1 == "__xhat__";
   const bool emitNext = !next1.empty() && !into && canEmitLn(C) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
   half* ln1Buf = emitNext ? (isSt ? scratch<half>("st.nrm", std::max(rows, rp) * C)
-                                  : ((xh1 && shared.xhat != scratch<half>("par.xhat", rows * C)) ? scratch<half>("par.xhat", rows * C)
-                                                                                                 : scratch<half>("pr.x", rows * C))) : nullptr;
-  half* ln2Buf = (emitNext && !next2.empty()) ? (isSt ? scratch<half>("st.xn", std::max(rows, rp) * C) : scratch<half>("pr.x2", rows * C)) : nullptr;
+                                  : isMsa ? scratch<half>("mnorm.m1", rows * C)
+                                          : msaNext ? scratch<half>("mnorm.p1", rows * C)
+                                                    : ((xh1 && shared.xhat != scratch<half>("par.xhat", rows * C)) ? scratch<half>("par.xhat", rows * C)
+                                                                                                                   : scratch<half>("pr.x", rows * C))) : nullptr;
+  half* ln2Buf = (emitNext && !next2.empty()) ? (isSt ? scratch<half>("st.xn", std::max(rows, rp) * C)
+                                                      : isMsa ? scratch<half>("mnorm.m2", rows * C)
+                                                              : scratch<half>("pr.x2", rows * C)) : nullptr;
   bool emittedAll = emitNext;
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
@@ -285,10 +294,15 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
       if (gemm(G)) continue;
       if (r0) die("%s: the next norms emitted for some chunks and not others", pre.c_str());
       emittedAll = false;       // (the GEMM took no emission - every chunk falls back alike)
+      continue;
     }
     addLin(g, pre + ".transition2", (into ? into : x) + r0 * C, rg, I, C, nullptr, "transition2");
   }
-  if (emittedAll) { emit(isSt ? 2 : 0, x, next1, ln1Buf); if (ln2Buf) emit(isSt ? 3 : 1, x, next2, ln2Buf); }
+  if (emittedAll) {
+    int s0 = isSt ? 2 : isMsa ? 4 : 0;
+    emit(s0, x, next1, ln1Buf);
+    if (ln2Buf) emit(s0 + 1, x, next2, ln2Buf);
+  }
 }
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
                 const std::string& next2, const char* scratchPrefix) {
@@ -430,15 +444,13 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
-  bool emittedTn = false;
   if (!parallel && canEmitLn(Cs) && hasW(tn + "Scale") && lenW(A + ".outputProjection") == (size_t)Wd * Cs) {
     half* txn = scratch<half>("st.xn", np * Cs);
     Gemm g{}; g.X = o; g.tx = F16; g.W = Wh(A + ".outputProjection"); g.tw = F16; g.Y = single; g.rows = n;
     g.in = Wd; g.out = Cs; g.beta = 1.f; g.label = "single output, next norm";
     g.lnOut = txn; g.lnScale = W(tn + "Scale"); g.lnOffset = Wopt(tn + "Offset");
-    if (gemm(g)) { emit(2, single, tn, txn); emittedTn = true; }
-  }
-  if (!emittedTn) lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
+    if (gemm(g)) emit(2, single, tn, txn);
+  } else lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
   const std::string nextSn1 = nextB.empty() ? "" : nextB + ".singleAttention.layerNorm";
   const std::string nextSn2 = (parallel && !nextB.empty()) ? nextB + ".singleTransition.inputLayerNorm" : "";
   transition(single, n, Cs, B + ".singleTransition", nullptr, nextSn1, nextSn2, "st.");

@@ -754,8 +754,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 or 16 x 256 tiles, a whole row each)
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   if (a.lnOut && lnWanted && !tri && !getenv("LOCALFOLD_GEMM_TILE")) {
-    if (a.m == 256 || (a.m == 512 && !(a.epilogue & (64 | 8192 | 16384)))) { tm = a.m == 512 ? 32 : (a.n <= 128 ? 16 : 32); tn = 256; }
-    else if (a.m == 384 && !(a.epilogue & (64 | 8192 | 16384))) { tm = 64; tn = 128; }
+    if (a.m == 256 || (a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512)))) { tm = a.m == 512 ? 32 : (a.n <= 128 ? 16 : 32); tn = 256; }
+    else if (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) { tm = 64; tn = 128; }
     else if ((a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0) { tm = 32; tn = 256; }
     else if (a.m == 128 || ((a.epilogue & (8192 | 16384)) && a.m % 128 == 0)) { tm = 64; tn = 128; }
     else if (a.m == 64) { tm = 64; tn = 64; }
@@ -787,11 +787,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
                       ((tm == 64 && tn == 64 && a.m == 64 && !hacc) ||
                        (tm == 64 && tn == 128 &&
-                        (a.m == 128 || (a.m == 384 && !(a.epilogue & (64 | 8192 | 16384))) ||
+                        (a.m == 128 || (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) ||
                          ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)) &&
                         (!hacc || (a.epilogue & 16384))) ||
                        ((tm == 32 || tm == 16) && tn == 256 &&
-                        (a.m == 256 || (tm == 32 && a.m == 512 && !(a.epilogue & (64 | 8192 | 16384))) ||
+                        (a.m == 256 || (tm == 32 && a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512))) ||
                          (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc)) &&
                       batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
@@ -807,7 +807,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   std::string name = std::string("gemmt_hh") + (tc_ == F32 ? "f" : "h") + "_" + std::to_string(tm) + "x" + std::to_string(tn) +
                      "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + "_e" + std::to_string(ep);
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm_tensor<" + targs + ">(constant GemmArgs&, uint3, uint);";
-  const uint32_t gx = (lnEmit && !(a.epilogue & 8192)) ? 1u : (uint32_t)((a.m + tn - 1) / tn);
+  const uint32_t gx = (lnEmit && (!(a.epilogue & 8192) || a.m == a.tgN)) ? 1u : (uint32_t)((a.m + tn - 1) / tn);
   Grid grid{gx, (uint32_t)((a.n + tm - 1) / tm), (uint32_t)batch};
   std::string lab;
   if (D().profileOn) {

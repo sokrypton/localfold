@@ -399,6 +399,7 @@ export class Af3MsaStackGpu {
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
+          blockIndex: index,
           // ...the pair track skipped on the LAST block only, so `--stop-after-opm`
           // with one block is that block's first half and with four is three
           // whole blocks plus the fourth's first half.
@@ -603,7 +604,9 @@ export class Af3MsaStackGpu {
     // keeps the transition inside `_msa_update`, so it moves with it.
     const updateMsa = () => {
       const addMsaGroups = spread(ceil(rows * msaChannels, 64));
-      run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
+      if (!context.blockIndex) {
+        run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
+      }
       const logitGroups = spread(ceil(n * n, 64));
       run("msa.attention-logits", pipelines["msa:attentionLogits"],
           [pair, keyMask, attentionWeights, attention], logitGroups[0], logitGroups[1]);

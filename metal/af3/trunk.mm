@@ -56,6 +56,10 @@ static void templateEmbedding(Trunk& t) {
   bool fused = flag(P + "fused");
   if (!M.has("template.passes")) die("this input was exported before template passes: export it again");
   int passes = metaI("template.passes"), templates = metaI("template.templates");
+  bool anyRepeat = false;
+  for (int k = 0; k < passes; ++k)
+    if ((float)M.meta("template." + num(k) + ".repeat") != 0.f) { anyRepeat = true; break; }
+  if (!anyRepeat) return;
   int width = (int)M.meta("template.featureWidth", 0);
   bool outer = flag("template.outerResidual");
   // The stage's room, the trunk's highest after the MSA stack's (1044 tokens: 4.19 GB, five pair-sized tensors): the
@@ -120,7 +124,14 @@ static void templateEmbedding(Trunk& t) {
   // featuriser's divisor, cuda/featurise/af3_export.h - by four, boltz2's one template reached the trunk at a quarter)
   half* summedH = scratch<half>("tmpl.summedH", pairs * Ct);
   scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true, summedH);
-  lin(summedH, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
+  const std::string nextPn = flag("trunk.dialect.msaUpdateBeforeOuterProduct") ? "trunk.msaBlocks.0.msaAttention1.pairNorm" : "";
+  if (!nextPn.empty() && canEmitPairLn(Cq) && hasW(nextPn + "Scale") && lenW(P + "outputLinear") == (size_t)Ct * Cq) {
+    half* lnOut = scratch<half>("mnorm.p1", pairs * Cq);
+    Gemm g{}; g.X = summedH; g.tx = F16; g.W = Wh(P + "outputLinear"); g.tw = F16; g.Y = t.pair; g.rows = pairs;
+    g.in = Ct; g.out = Cq; g.beta = 1.f; g.label = "template output, next norm";
+    g.lnOut = lnOut; g.lnScale = W(nextPn + "Scale"); g.lnOffset = Wopt(nextPn + "Offset");
+    if (gemm(g)) emitPairLn(0, t.pair, nextPn, lnOut);
+  } else lin(summedH, P + "outputLinear", t.pair, pairs, Ct, Cq, 1.f);
   if (reclaim) releaseScratch({"tmpl."});
 }
 
@@ -134,10 +145,9 @@ static void embed(Trunk& t) {
   if (np > (size_t)n) fill(tfh + (size_t)n * t.F, 0, (np - n) * t.F * sizeof(half));
   toHalf(t.targetFeat, tfh, (size_t)n * t.F);
   if (flag("trunk.dialect.pairInitFromSingle")) {        // OpenDDE: the pair from s_init
-    float* sInit = scratch<float>("emb.sInit", np * t.Cs);
-    lin(tfh, E + "singleActivations", sInit, np, t.F, t.Cs);
-    lin(sInit, E + "leftSingle", left, n, t.Cs, C);
-    lin(sInit, E + "rightSingle", right, n, t.Cs, C);
+    lin(tfh, E + "singleActivations", t.single, np, t.F, t.Cs);
+    lin(t.single, E + "leftSingle", left, n, t.Cs, C);
+    lin(t.single, E + "rightSingle", right, n, t.Cs, C);
   } else {
     lin(tfh, E + "leftSingle", left, np, t.F, C);
     lin(tfh, E + "rightSingle", right, np, t.F, C);
@@ -185,15 +195,29 @@ static void embed(Trunk& t) {
                         types ? W(E + "tokenBondsTypeEmbed") : nullptr, types ? W(E + "contactEncodingUnspecified") : nullptr,
                         pairs, (uint)C, 0});
   releaseScratch({"emb.prevln"});
-  if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
-  templateEmbedding(t);
-  if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
   auto buildSingle = [&]() {      // the single: target_feat projected, plus the recycled single's (chai's first: s_init's)
-    lin(tfh, E + "singleActivations", t.single, np, t.F, t.Cs);
+    if (!flag("trunk.dialect.pairInitFromSingle")) lin(tfh, E + "singleActivations", t.single, np, t.F, t.Cs);
     half* sln = scratch<half>("emb.prevsln", np * t.Cs);
     if (np > (size_t)n) fill(sln + (size_t)n * t.Cs, 0, (np - n) * t.Cs * sizeof(half));
     ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
-    lin(sln, E + "prevSingleEmbedding", t.single, np, t.Cs, t.Cs, 1.f);
+    const std::string sn1 = "trunk.pairformerBlocks.0.singleAttention.layerNorm";
+    const std::string sn2 = flag("trunk.dialect.parallelPairformer") ? "trunk.pairformerBlocks.0.singleTransition.inputLayerNorm" : "";
+    if (canEmitPairLn(t.Cs) && hasW(sn1 + "Scale") && lenW(E + "prevSingleEmbedding") == (size_t)t.Cs * t.Cs) {
+      half* nrm = scratch<half>("trunk.sn1", np * t.Cs);
+      half* txn = (!sn2.empty() && hasW(sn2 + "Scale")) ? scratch<half>("trunk.sn2", np * t.Cs) : nullptr;
+      if (np > (size_t)n) {
+        fill(nrm + (size_t)n * t.Cs, 0, (np - n) * t.Cs * sizeof(half));
+        if (txn) fill(txn + (size_t)n * t.Cs, 0, (np - n) * t.Cs * sizeof(half));
+      }
+      Gemm g{}; g.X = sln; g.tx = F16; g.W = Wh(E + "prevSingleEmbedding"); g.tw = F16; g.Y = t.single; g.rows = n;
+      g.in = t.Cs; g.out = t.Cs; g.beta = 1.f; g.label = "prevSingleEmbedding, next norm";
+      g.lnOut = nrm; g.lnScale = W(sn1 + "Scale"); g.lnOffset = Wopt(sn1 + "Offset");
+      if (txn) { g.lnOut2 = txn; g.lnScale2 = W(sn2 + "Scale"); g.lnOffset2 = Wopt(sn2 + "Offset"); }
+      if (gemm(g)) {
+        emitPairLn(2, t.single, sn1, nrm);
+        if (txn) emitPairLn(3, t.single, sn2, txn);
+      }
+    } else lin(sln, E + "prevSingleEmbedding", t.single, np, t.Cs, t.Cs, 1.f);
   };
   if (!t.msa) t.msa = allocT<float>((size_t)t.S * n * t.Cm);
   if (flag("trunk.dialect.chaiMsaFeatures")) {
@@ -215,23 +239,25 @@ static void embed(Trunk& t) {
                            chainHit, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa,
                            M.has("batch.msaSource") ? M.i("batch.msaSource") : nullptr, rows, (uint)n, (uint)t.Cm,
                            (uint)chains, pairedRows});
-    ++t.pass;
-    return;
+  } else {
+    // the MSA: its features projected, plus the target's projection broadcast over the rows
+    float* fromTarget = scratch<float>("emb.fromTarget", np * t.Cm);
+    lin(tfh, E + "extraMsaTargetFeat", fromTarget, np, t.F, t.Cm);
+    size_t rows = (size_t)t.S * n;
+    int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
+    if (msaWidth != 34 && msaWidth != 35) die("msa feature width %d", msaWidth);
+    run1d("af3_msa_embed", (t.Cm & 3) ? rows * t.Cm : rows * (t.Cm >> 2),
+          MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa,
+                       hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
+                       M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, rows, (uint)n,
+                       (uint)t.Cm, (uint)msaWidth,
+                       flag("trunk.dialect.msaPairedQueryRow")
+                         || (flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1) ? 1u : 0u});
+    buildSingle();
   }
-  // the MSA: its features projected, plus the target's projection broadcast over the rows
-  float* fromTarget = scratch<float>("emb.fromTarget", np * t.Cm);
-  lin(tfh, E + "extraMsaTargetFeat", fromTarget, np, t.F, t.Cm);
-  size_t rows = (size_t)t.S * n;
-  int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
-  if (msaWidth != 34 && msaWidth != 35) die("msa feature width %d", msaWidth);
-  run1d("af3_msa_embed", (t.Cm & 3) ? rows * t.Cm : rows * (t.Cm >> 2),
-        MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa,
-                     hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
-                     M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, rows, (uint)n,
-                     (uint)t.Cm, (uint)msaWidth,
-                     flag("trunk.dialect.msaPairedQueryRow")
-                       || (flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1) ? 1u : 0u});
-  buildSingle();
+  if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
+  templateEmbedding(t);
+  if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
   ++t.pass;
 }
 
@@ -242,13 +268,17 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   int L = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int O = metaI(pre + ".outerChannels");
   size_t rows = (size_t)S * L, pairs = (size_t)L * L;
-  half* xn = scratch<half>("opm.xn", rows * Cm);
-  if (!dualMsaNorm.empty() && hasW(dualMsaNorm + "Scale")) {
-    half* xn2 = scratch<half>("msaatt.ln", rows * Cm);
-    layerNormDual(t.msa, xn, W(pre + ".layerNormInputScale"), Wopt(pre + ".layerNormInputOffset"),
-                  xn2, W(dualMsaNorm + "Scale"), Wopt(dualMsaNorm + "Offset"), rows, Cm);
-  } else {
-    ln(t.msa, xn, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+  half* xn = takePairLn(t.msa, pre + ".layerNormInput");
+  if (!xn) {
+    xn = scratch<half>("opm.xn", rows * Cm);
+    if (!dualMsaNorm.empty() && hasW(dualMsaNorm + "Scale")) {
+      half* xn2 = scratch<half>("mnorm.m2", rows * Cm);
+      layerNormDual(t.msa, xn, W(pre + ".layerNormInputScale"), Wopt(pre + ".layerNormInputOffset"),
+                    xn2, W(dualMsaNorm + "Scale"), Wopt(dualMsaNorm + "Offset"), rows, Cm);
+      emitPairLn(5, t.msa, dualMsaNorm, xn2);
+    } else {
+      ln(t.msa, xn, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+    }
   }
   half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
   linH(xn, pre + ".leftProjection", lt, rows, Cm, O, Wopt(pre + ".leftProjectionBias"));      // (rf3's biases, before the mask)
@@ -260,10 +290,11 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   const uint after = flag("trunk.dialect.opmBiasAfterNorm") ? 1u : 0u;
   static const bool lnEmit = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   static const bool lnSimd = getenv("LOCALFOLD_LN_EMIT") && atoi(getenv("LOCALFOLD_LN_EMIT")) >= 2;
-  half* lnOut = ((C == 128 || C == 256) && !nextNorm.empty() && lnEmit && (matrixUnits() || (C == 128 && lnSimd))) ? scratch<half>("pr.x", pairs * C) : nullptr;
+  const bool opmEmit = S <= 128 ? (C == 128 || C == 256) : canEmitPairLn(C);
+  half* lnOut = (opmEmit && !nextNorm.empty() && lnEmit && (matrixUnits() || (C == 128 && lnSimd))) ? scratch<half>("mnorm.p1", pairs * C) : nullptr;
   const float* lnScale = lnOut ? W(nextNorm + "Scale") : nullptr;
   const float* lnOffset = lnOut ? Wopt(nextNorm + "Offset") : nullptr;
-  half* lnOut2 = (lnOut && !nextNorm2.empty()) ? scratch<half>("pr.x2", pairs * C) : nullptr;
+  half* lnOut2 = (lnOut && !nextNorm2.empty()) ? scratch<half>("mnorm.p2", pairs * C) : nullptr;
   const float* lnScale2 = lnOut2 ? W(nextNorm2 + "Scale") : nullptr;
   const float* lnOffset2 = lnOut2 ? Wopt(nextNorm2 + "Offset") : nullptr;
   if (S <= 128) {
@@ -345,17 +376,21 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
 // msa + transition(msa) + pwa(msa); af3-any-model 7cc3165) - in place once the whole MSA's norm is taken, before any of
 // the averaging is added. Its scratch is msatr.*, the msa family's (main.mm), so it never shares a slot with msaatt.ln.
 static void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelTransition = "",
-                         const std::string& nextPairNorm = "", const std::string& nextMsaNorm = "", bool preNormed = false) {
+                         const std::string& nextPairNorm = "", const std::string& nextMsaNorm = "", bool preNormed = false,
+                         bool computeKeyMask = true) {
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int heads = metaI(pre + ".heads"), d = metaI(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
-  half* xn = scratch<half>("msaatt.ln", rows * Cm);
-  if (!preNormed && !parallelTransition.empty()) {
-    half* txn = scratch<half>("msatr.xn", rows * Cm);
-    layerNormDual(t.msa, xn, W(pre + ".actNormScale"), Wopt(pre + ".actNormOffset"),
-                  txn, W(parallelTransition + ".inputLayerNormScale"), Wopt(parallelTransition + ".inputLayerNormOffset"), rows, Cm);
-    emitPairLn(2, t.msa, parallelTransition + ".inputLayerNorm", txn);
-  } else if (!preNormed) ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  half* xn = takePairLn(t.msa, pre + ".actNorm");
+  if (!xn) {
+    xn = scratch<half>("msaatt.ln", rows * Cm);
+    if (!preNormed && !parallelTransition.empty()) {
+      half* txn = scratch<half>("msatr.xn", rows * Cm);
+      layerNormDual(t.msa, xn, W(pre + ".actNormScale"), Wopt(pre + ".actNormOffset"),
+                    txn, W(parallelTransition + ".inputLayerNormScale"), Wopt(parallelTransition + ".inputLayerNormOffset"), rows, Cm);
+      emitPairLn(4, t.msa, parallelTransition + ".inputLayerNorm", txn);
+    } else if (!preNormed) ln(t.msa, xn, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  }
   if (!parallelTransition.empty()) transition(t.msa, rows, Cm, parallelTransition, nullptr, "", "", "msatr.");
   half* pln = pairLn(t.pair, pairs, C, pre + ".pairNorm", nextPairNorm);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
@@ -364,8 +399,8 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   const bool chaiMask = flag("trunk.dialect.chaiMsaFeatures");
   const float* keyMask = t.seqMask;
   if (!chaiMask) {
-    float* km = scratch<float>("msaatt.keymask", n);
-    run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, km, (uint)S, (uint)n});
+    float* km = scratch<float>("mnorm.keymask", n);
+    if (computeKeyMask) run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, km, (uint)S, (uint)n});
     keyMask = km;
   }
   int ldw = (n + 7) / 8 * 8;
@@ -373,11 +408,17 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   run("af3_msa_weights", Grid{(uint32_t)(heads * n), 1, 1}, 256, MsaWeightsArgs{flat, keyMask, w, (uint)n, (uint)heads, (uint)ldw, 0});
   half* v = scratch<half>("msaatt.v", rows * Wd);
   linH(xn, pre + ".vProjection", v, rows, Cm, Wd);
-  if (chaiMask) run1d("af3_scale_rows_h", (Wd & 3) ? rows * Wd : rows * (Wd >> 2), ScaleRowsHArgs{v, nullptr, t.msaMask, rows, (uint)Wd, 0});
   half* vh = scratch<half>("msaatt.vh", (size_t)S * ldw * Wd);
   const bool v8 = d % 8 == 0 && (size_t)S * ldw * Wd < ((size_t)1 << 32);     // (16 bytes a thread)
-  if (v8) run1d("af3_msa_v_heads8", (size_t)S * ldw * Wd / 8, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
-  else run1d("af3_msa_v_heads", (size_t)S * ldw * Wd, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
+  const uint d8 = (uint)(d / 8);
+  const bool tiled8 = v8 && d8 >= 1 && (16 % d8) == 0 && (d8 & (d8 - 1)) == 0 &&
+                      ((size_t)ldw * heads * d8 + 15) / 16 <= 65535 && ((size_t)S + 15) / 16 <= 65535;
+  const float* vMask = chaiMask ? t.msaMask : nullptr;
+  if (tiled8) {
+    run("af3_msa_v_heads8_tiled", Grid{(uint32_t)(((size_t)ldw * heads * d8 + 15) / 16), (uint32_t)((S + 15) / 16), 1}, 256,
+        MsaVHeadsArgs{v, vh, vMask, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
+  } else if (v8) run1d("af3_msa_v_heads8", (size_t)S * ldw * Wd / 8, MsaVHeadsArgs{v, vh, vMask, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
+  else run1d("af3_msa_v_heads", (size_t)S * ldw * Wd, MsaVHeadsArgs{v, vh, vMask, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
   // per head: O_h [n][S d] = W_h [n][ldw] V_h [ldw][S d]
   half* oh = scratch<half>("msaatt.oh", rows * Wd);
   { Gemm g{}; g.X = w; g.tx = F16; g.sx = (int64_t)n * ldw; g.W = vh; g.tw = F16; g.sw = (int64_t)ldw * S * d; g.Y = oh; g.ty = F16;
@@ -385,13 +426,18 @@ static void msaAttention(Trunk& t, const std::string& pre, const std::string& pa
   half* gate = scratch<half>("msaatt.gate", rows * Wd);
   linH(xn, pre + ".gatingQuery", gate, rows, Cm, Wd);
   half* gated = scratch<half>("msaatt.gated", rows * Wd);
-  if (v8) run1d("af3_msa_from_heads8", rows * Wd / 8, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
+  if (tiled8) {
+    run("af3_msa_from_heads8_tiled", Grid{(uint32_t)(((size_t)n * heads * d8 + 15) / 16), (uint32_t)((S + 15) / 16), 1}, 256,
+        MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
+  } else if (v8) run1d("af3_msa_from_heads8", rows * Wd / 8, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
   else run1d("af3_msa_from_heads", rows * Wd, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
   if (!nextMsaNorm.empty() && (Cm == 64 || Cm == 128) && hasW(nextMsaNorm + "Scale") && lenW(pre + ".outputProjection") == (size_t)Wd * Cm) {
+    half* msaLnOut = scratch<half>("msaatt.ln", rows * Cm);
     Gemm g{}; g.X = gated; g.tx = F16; g.W = Wh(pre + ".outputProjection"); g.tw = F16; g.Y = t.msa; g.rows = rows;
     g.in = Wd; g.out = Cm; g.beta = 1.f; g.label = "msa output, next norm";
-    g.lnOut = xn; g.lnScale = W(nextMsaNorm + "Scale"); g.lnOffset = Wopt(nextMsaNorm + "Offset");
-    if (gemm(g)) { emitPairLn(2, t.msa, nextMsaNorm, xn); return; }
+    g.lnOut = msaLnOut; g.lnScale = W(nextMsaNorm + "Scale"); g.lnOffset = Wopt(nextMsaNorm + "Offset");
+    if (gemm(g)) emitPairLn(4, t.msa, nextMsaNorm, msaLnOut);
+    return;
   }
   lin(gated, pre + ".outputProjection", t.msa, rows, Wd, Cm, 1.f);
 }
@@ -413,9 +459,14 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
   linF(lnM, pre + ".leftProjection", L, rows, Cm, O);
   linF(lnM, pre + ".rightProjection", R, rows, Cm, O);
   float* Lg = scratch<float>("gopm.lg", rows * O); float* Rg = scratch<float>("gopm.rg", rows * O);
-  run1d("af3_group_major", (K & 3) ? rows * O : rows * (O >> 2), GroupMajorArgs{L, t.msaMask, Lg, (uint)S, (uint)n, (uint)G, (uint)K});
-  run1d("af3_group_major", (K & 3) ? rows * O : rows * (O >> 2), GroupMajorArgs{R, t.msaMask, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
-  int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, ((size_t)16 << 20) / ((size_t)n * per * 2 + (size_t)n * C)));
+  if (G == 8 && K == 8 && (rows + 31) / 32 <= 65535) {
+    run("af3_group_major8_tiled", Grid{(uint32_t)((rows + 31) / 32), 2, 1}, 256,
+        GroupMajorArgs{L, R, t.msaMask, Lg, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
+  } else {
+    size_t gmThreads = (K & 7) == 0 ? rows * (O >> 3) : ((K & 3) == 0 ? rows * (O >> 2) : rows * O);
+    run1d("af3_group_major", gmThreads, GroupMajorArgs{L, R, t.msaMask, Lg, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
+  }
+  int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, ((size_t)32 << 20) / ((size_t)n * per * 2)));
   float* Pm = scratch<float>("gopm.P", (size_t)Bi * n * per); float* Pp = scratch<float>("gopm.Pp", (size_t)Bi * n * per);
   for (int i0 = 0; i0 < n; i0 += Bi) {
     int bi = std::min(Bi, n - i0);
@@ -423,9 +474,11 @@ static void groupedOuterProduct(Trunk& t, const std::string& pre) {
     { Gemm g{}; g.X = Lg + (size_t)i0 * K; g.transX = true; g.ldx = n * K; g.sx = (int64_t)S * n * K; g.W = Rg; g.ldw = n * K;
       g.sw = (int64_t)S * n * K; g.Y = Pm; g.sy = (int64_t)bi * K * n * K; g.rows = (size_t)bi * K; g.in = S; g.out = n * K; g.batch = G;
       g.label = "grouped opm"; gemm(g); }
-    run1d("af3_grouped_permute", (K & 3) ? (size_t)bi * n * per : (size_t)bi * n * (per >> 2), GroupedPermuteArgs{Pm, Pp, (uint)bi, (uint)n, (uint)G, (uint)K});
-    layerNorm(Pp, Pm, (size_t)bi * n, per, W(pre + ".productNormScale"), W(pre + ".productNormOffset"), 0.1f);
-    linF(Pm, pre + ".outputW", t.pair + (size_t)i0 * n * C, (size_t)bi * n, per, C, W(pre + ".outputB"), 1.f);
+    size_t pRows = (size_t)bi * n, sgs = pRows <= 256 ? 2 : 8, groups = (pRows + sgs - 1) / sgs;
+    Grid gGrid = groups <= 65535 ? Grid{(uint32_t)groups, 1, 1} : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
+    run("af3_grouped_permute_ln", gGrid, (uint32_t)(sgs * 32),
+        GroupedPermuteLnArgs{Pm, Pp, nullptr, W(pre + ".productNormScale"), W(pre + ".productNormOffset"), (uint)bi, (uint)n, (uint)G, (uint)K, 0.1f, 0});
+    linF(Pp, pre + ".outputW", t.pair + (size_t)i0 * n * C, pRows, per, C, W(pre + ".outputB"), 1.f);
   }
 }
 static void msaBlock(Trunk& t, int k, int msaBlocks) {
@@ -434,7 +487,7 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
     // chai-1: z += grouped OPM(m); m += attention(m, z) + transition(m), both off the same m; then the pair track in two
     // parallel stages
     groupedOuterProduct(t, B + ".outerProductMean");
-    msaAttention(t, B + ".msaAttention1", B + ".msaTransition", "__xhat__");
+    msaAttention(t, B + ".msaAttention1", B + ".msaTransition", "__xhat__", "", false, k == 0);
     parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "oit", true);
     parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "rc", false);
     return;
@@ -444,8 +497,11 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
     outerProductMean(t, B + ".outerProductMean", B + ".msaAttention1.pairNorm",
                      B + ".triangleMultiplicationOutgoing.leftNormInput", B + ".msaAttention1.actNorm", k == 0);
   msaAttention(t, B + ".msaAttention1", "", !updateFirst ? B + ".triangleMultiplicationOutgoing.leftNormInput" : "",
-               B + ".msaTransition.inputLayerNorm", !updateFirst || k > 0);
-  transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition", nullptr, "", "", "msatr.");
+               B + ".msaTransition.inputLayerNorm", !updateFirst || k > 0, k == 0);
+  const std::string nextMsa1 = updateFirst ? B + ".outerProductMean.layerNormInput"
+                                           : ((k + 1 < msaBlocks) ? "trunk.msaBlocks." + num(k + 1) + ".outerProductMean.layerNormInput" : "");
+  const std::string nextMsa2 = (k + 1 < msaBlocks) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.actNorm" : "";
+  transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition", nullptr, nextMsa1, nextMsa2, "msatr.");
   if (updateFirst)
     outerProductMean(t, B + ".outerProductMean", B + ".triangleMultiplicationOutgoing.leftNormInput", "",
                      (k + 1 < msaBlocks) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.actNorm" : "", k == 0);
@@ -473,7 +529,7 @@ void runTrunk(Trunk& t) {
   // (and the MSA stack's pair-track scratch and MSA tensor: the stack's half pair is made beside the f32 one before its blocks make theirs)
   if (reclaim) {
     if (t.msa) { release(t.msa); t.msa = nullptr; }
-    releaseScratch({"msaatt.", "msatr.", "opm.", "gopm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "st.", "par."});
+    releaseScratch({"msaatt.", "msatr.", "opm.", "gopm.", "mnorm.", "trunk.zBeforeMsa", "pr.", "grid.", "tr.", "par."});
   }
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
@@ -492,7 +548,7 @@ void runTrunk(Trunk& t) {
       pairformerBlock(zh, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
     if (reclaim) {
-      releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});
+      releaseScratch({"pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});
       t.pair = allocT<float>(pairs * t.C);
     }
     toFloat(zh, t.pair, pairs * t.C);
@@ -502,7 +558,7 @@ void runTrunk(Trunk& t) {
     for (int k = 0; k < blocks; ++k)
       pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
                       k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
-  if (reclaim) releaseScratch({"pr.", "grid.", "tr.", "st.", "par."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
+  if (reclaim) releaseScratch({"pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 
 // ---------------------------------------------------------------- the distogram

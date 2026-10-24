@@ -983,7 +983,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const bool hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
         float4 b4[4] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
         if constexpr ((EP & 64) != 0 && !metal::is_same_v<TACC, half>) {
-          if (g.m > TN && !(g.epilogue & (64 | 8192))) {
+          if (g.m > TN && (!(g.epilogue & 8192) || g.tgN == g.m)) {
             int j_row[NR];
             float s4[NR];
             _Pragma("clang loop unroll(full)")
@@ -993,14 +993,18 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
               s4[r_idx] = 0.f;
             }
             const bool hasBeta = g.beta != 0.f, floatC = (g.biasType & 512) != 0;
+            const bool isOpm = (g.epilogue & 8192) != 0, isGated = (g.epilogue & 64) != 0;
             device const float* cfBase = (device const float*)g.C + (ulong)z * g.sc;
+            device const float* auxF = (device const float*)g.aux;
+            device const half* auxH = (device const half*)g.aux;
+            const bool tgC = g.tgC != 0;
             for (int iTile = 0; ; ) {
-              if (hasBias) {
+              if (hasBias || isOpm) {
                 _Pragma("clang loop unroll(full)")
                 for (int k = 0; k < 4; ++k) {
                   const int col = iTile + col0 + k * CSTEP;
-                  b4[k] = halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
-                                   : *(device const float4*)((device const float*)g.bias + boff + col);
+                  b4[k] = (!isOpm && halfBias) ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
+                                               : *(device const float4*)((device const float*)g.bias + boff + col);
                 }
               }
               _Pragma("clang loop unroll(full)")
@@ -1013,16 +1017,29 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 device TC* dp0 = D + rowOff;
                 device const TC* cp0 = C + cOff;
                 device const float* cfp0 = cfBase + cOff;
+                const float nv0 = isOpm ? auxF[j] : 0.f;
+                const float inv0 = isOpm ? (tgC ? 1.f / max(nv0, 1.f) : 1.f / (1e-3f + nv0)) : 0.f;
+                device const half* ap0 = isGated ? auxH + (ulong)j * g.ldaux + (ulong)(iTile + col0) : nullptr;
                 _Pragma("clang loop unroll(full)")
                 for (int k = 0; k < 4; ++k) {
                   const uint16_t e = (uint16_t)(e0 + k * 8);
                   float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
-                  if (hasBeta) {
-                    const float4 cv = floatC ? *(device const float4*)(cfp0 + k * CSTEP)
-                                             : float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
-                    v += g.beta * cv;
+                  if (isOpm) {
+                    const float4 cv = float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                    v = cv + (tgC ? v * inv0 + b4[k] : (b4[k] + v) * inv0);
+                  } else if (isGated) {
+                    if (hasBias) v += b4[k];
+                    const float4 cv = float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                    const float4 av = float4(*(device const half4*)(ap0 + k * CSTEP));
+                    v = cv + av * fast::divide(1.f, 1.f + fast::exp(-v));
+                  } else {
+                    if (hasBeta) {
+                      const float4 cv = floatC ? *(device const float4*)(cfp0 + k * CSTEP)
+                                               : float4(*(device const vec<TC, 4>*)(cp0 + k * CSTEP));
+                      v += g.beta * cv;
+                    }
+                    if (hasBias) v += b4[k];
                   }
-                  if (hasBias) v += b4[k];
                   const vec<TC, 4> st = lf_out4<TC>(v);
                   *(device vec<TC, 4>*)(dp0 + k * CSTEP) = st;
                   s4[r_idx] += (float)st.x + (float)st.y + (float)st.z + (float)st.w;

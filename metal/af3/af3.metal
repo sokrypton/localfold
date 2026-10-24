@@ -687,7 +687,13 @@ kernel void af3_msa_v_heads(LF_ARGS(MsaVHeadsArgs)) {
   } else {
     e = (uint)(t % a.d); ulong rest = t / a.d; s = (uint)(rest % a.S); rest /= a.S; j = (uint)(rest % a.np); h = (uint)(rest / a.np);
   }
-  a.out[t] = j < a.n ? a.v[((ulong)s * a.n + j) * a.heads * a.d + h * a.d + e] : (half)0.f;
+  if (j < a.n) {
+    ulong row = (ulong)s * a.n + j;
+    half val = a.v[row * a.heads * a.d + h * a.d + e];
+    a.out[t] = a.mask ? (half)((float)val * a.mask[row]) : val;
+  } else {
+    a.out[t] = (half)0.f;
+  }
 }
 kernel void af3_msa_from_heads(LF_ARGS(MsaFromHeadsArgs)) {
   ulong t = LF_INDEX;
@@ -702,7 +708,43 @@ kernel void af3_msa_v_heads8(LF_ARGS(MsaVHeadsArgs)) {
   const uint t = (uint)LF_INDEX;
   if ((ulong)t >= (ulong)a.S * a.np * a.heads * d8) return;
   uint r = lf_udiv(t, d8), e8 = t - r * d8, r2 = lf_udiv(r, a.S), s = r - r2 * a.S, h = lf_udiv(r2, a.np), j = r2 - h * a.np;
-  ((device uint4*)a.out)[t] = j < a.n ? *(device const uint4*)(a.v + ((ulong)s * a.n + j) * a.heads * a.d + h * a.d + e8 * 8) : uint4(0);
+  if (j >= a.n) { ((device uint4*)a.out)[t] = uint4(0); return; }
+  ulong row = (ulong)s * a.n + j;
+  uint4 val = *(device const uint4*)(a.v + row * a.heads * a.d + h * a.d + e8 * 8);
+  if (a.mask) {
+    float m = a.mask[row];
+    half4 v0 = as_type<half4>(val.xy), v1 = as_type<half4>(val.zw);
+    val = uint4(as_type<uint2>(half4(float4(v0) * m)), as_type<uint2>(half4(float4(v1) * m)));
+  }
+  ((device uint4*)a.out)[t] = val;
+}
+kernel void af3_msa_v_heads8_tiled(constant MsaVHeadsArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint4 tile[16][17];
+  const uint d8 = a.d >> 3, hd8 = a.heads * d8, totalJHE = a.n * hd8;
+  const uint jhe0 = tg.x * 16, s0 = tg.y * 16;
+  const uint tx = tid & 15, ty = tid >> 4;
+  const uint s_ld = s0 + ty, jhe_ld = jhe0 + tx;
+  uint4 val(0);
+  if (s_ld < a.S && jhe_ld < totalJHE) {
+    val = ((device const uint4*)a.v)[(ulong)s_ld * totalJHE + jhe_ld];
+    if (a.mask) {
+      uint j_ld = lf_udiv(jhe_ld, hd8);
+      float m = a.mask[(ulong)s_ld * a.n + j_ld];
+      half4 v0 = as_type<half4>(val.xy), v1 = as_type<half4>(val.zw);
+      val = uint4(as_type<uint2>(half4(float4(v0) * m)), as_type<uint2>(half4(float4(v1) * m)));
+    }
+  }
+  tile[ty][tx] = val;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint se = tid & (16 * d8 - 1), p = tid / (16 * d8);
+  const uint ds = se / d8, e8 = se & (d8 - 1);
+  const uint jh = (jhe0 / d8) + p;
+  const uint j = lf_udiv(jh, a.heads), h = jh - j * a.heads;
+  const uint s_st = s0 + ds;
+  if (j < a.np && s_st < a.S) {
+    ((device uint4*)a.out)[(((ulong)h * a.np + j) * a.S + s_st) * d8 + e8] = (j < a.n) ? tile[ds][p * d8 + e8] : uint4(0);
+  }
 }
 kernel void af3_msa_from_heads8(LF_ARGS(MsaFromHeadsArgs)) {
   const uint W8 = a.heads * a.d / 8, d8 = a.d / 8;
@@ -713,6 +755,33 @@ kernel void af3_msa_from_heads8(LF_ARGS(MsaFromHeadsArgs)) {
   device const half4* g = (device const half4*)(a.gate + (ulong)t * 8);
   device half4* out = (device half4*)(a.out + (ulong)t * 8);
   for (int k = 0; k < 2; ++k) out[k] = half4(float4(o[k]) * (1.f / (1.f + exp(-float4(g[k])))));
+}
+kernel void af3_msa_from_heads8_tiled(constant MsaFromHeadsArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint4 tile[16][17];
+  const uint d8 = a.d >> 3, hd8 = a.heads * d8, totalIHE = a.n * hd8;
+  const uint ihe0 = tg.x * 16, s0 = tg.y * 16;
+  const uint se = tid & (16 * d8 - 1), p = tid / (16 * d8);
+  const uint ds = se / d8, e8 = se & (d8 - 1);
+  const uint ih = (ihe0 / d8) + p;
+  const uint i = lf_udiv(ih, a.heads), h = ih - i * a.heads;
+  const uint s_ld = s0 + ds;
+  tile[ds][p * d8 + e8] = (i < a.n && s_ld < a.S)
+    ? ((device const uint4*)a.o)[(((ulong)h * a.n + i) * a.S + s_ld) * d8 + e8]
+    : uint4(0);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint tx = tid & 15, ty = tid >> 4;
+  const uint s_st = s0 + ty, ihe_st = ihe0 + tx;
+  if (s_st < a.S && ihe_st < totalIHE) {
+    const ulong idx8 = (ulong)s_st * totalIHE + ihe_st;
+    const uint4 ov = tile[ty][tx];
+    const uint4 gv = ((device const uint4*)a.gate)[idx8];
+    const half4 o0 = as_type<half4>(ov.xy), o1 = as_type<half4>(ov.zw);
+    const half4 g0 = as_type<half4>(gv.xy), g1 = as_type<half4>(gv.zw);
+    const half4 r0 = half4(float4(o0) * (1.f / (1.f + exp(-float4(g0)))));
+    const half4 r1 = half4(float4(o1) * (1.f / (1.f + exp(-float4(g1)))));
+    ((device uint4*)a.out)[idx8] = uint4(as_type<uint2>(r0), as_type<uint2>(r1));
+  }
 }
 kernel void af3_mask_norm(LF_ARGS(MaskNormArgs)) {
   uint t = (uint)LF_INDEX;
@@ -2305,28 +2374,92 @@ kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
             (code >= 0 && code < 32 ? a.W[(9 + code) * a.C + c] : 0.f);
   a.msa[t] = v + a.fromSingle[token * a.C + c];
 }
+kernel void af3_group_major8_tiled(constant GroupMajorArgs& a [[buffer(0)]],
+                                   uint3 tg [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float4 tile0[8][33], tile1[8][33];
+  const ulong rows = (ulong)a.S * a.n;
+  device const float4* x4 = (device const float4*)(tg.y ? a.y : a.x);
+  device float4* ox4 = (device float4*)(tg.y ? a.outY : a.out);
+  uint rIn = tid >> 3, gIn = tid & 7u;
+  ulong rowIn = (ulong)tg.x * 32 + rIn;
+  if (rowIn < rows) {
+    float m = a.mask ? a.mask[rowIn] : 1.f;
+    ulong src4 = (rowIn * 8 + gIn) * 2;
+    tile0[gIn][rIn] = x4[src4] * m;
+    tile1[gIn][rIn] = x4[src4 + 1] * m;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint gOut = tid >> 5, rOut = tid & 31u;
+  ulong rowOut = (ulong)tg.x * 32 + rOut;
+  if (rowOut < rows) {
+    ulong dst4 = ((ulong)gOut * rows + rowOut) * 2;
+    ox4[dst4] = tile0[gOut][rOut];
+    ox4[dst4 + 1] = tile1[gOut][rOut];
+  }
+}
 kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
   ulong t = LF_INDEX;
-  if ((a.K & 3) == 0) {
-    uint K4 = a.K >> 2;
-    const ulong total4 = (ulong)a.S * a.n * a.G * K4;
-    if (t >= total4) return;
-    uint k4, i, s, g;
-    if (total4 <= 0xffffffffull) {
-      uint r = lf_udiv((uint)t, K4); k4 = (uint)t - r * K4; uint r2 = lf_udiv(r, a.n); i = r - r2 * a.n; g = lf_udiv(r2, a.S); s = r2 - g * a.S;
-    } else { k4 = (uint)(t % K4); ulong r = t / K4; i = (uint)(r % a.n); r /= a.n; s = (uint)(r % a.S); g = (uint)(r / a.S); }
-    ulong row = (ulong)s * a.n + i;
-    ((device float4*)a.out)[t] = ((device const float4*)a.x)[(row * a.G + g) * K4 + k4] * (a.mask ? a.mask[row] : 1.f);
+  const ulong rows = (ulong)a.S * a.n;
+  if ((a.K & 7) == 0) {
+    uint K8 = a.K >> 3;
+    const ulong total8 = rows * a.G * K8;
+    if (t >= total8) return;
+    uint k8 = 0, g;
+    ulong row;
+    if (total8 <= 0xffffffffull && rows <= 0xffffffffull) {
+      uint r = K8 == 1 ? (uint)t : lf_udiv((uint)t, K8);
+      if (K8 != 1) k8 = (uint)t - r * K8;
+      g = lf_udiv(r, (uint)rows);
+      row = r - (ulong)g * rows;
+    } else {
+      k8 = (uint)(t % K8); ulong r = t / K8; row = r % rows; g = (uint)(r / rows);
+    }
+    float m = a.mask ? a.mask[row] : 1.f;
+    ulong src4 = ((row * a.G + g) * K8 + k8) * 2, dst4 = t * 2;
+    device const float4* x4 = (device const float4*)a.x;
+    device float4* ox4 = (device float4*)a.out;
+    ox4[dst4] = x4[src4] * m;
+    ox4[dst4 + 1] = x4[src4 + 1] * m;
+    if (a.y && a.outY) {
+      device const float4* y4 = (device const float4*)a.y;
+      device float4* oy4 = (device float4*)a.outY;
+      oy4[dst4] = y4[src4] * m;
+      oy4[dst4 + 1] = y4[src4 + 1] * m;
+    }
     return;
   }
-  const ulong total = (ulong)a.S * a.n * a.G * a.K;
+  if ((a.K & 3) == 0) {
+    uint K4 = a.K >> 2;
+    const ulong total4 = rows * a.G * K4;
+    if (t >= total4) return;
+    uint k4 = 0, g;
+    ulong row;
+    if (total4 <= 0xffffffffull && rows <= 0xffffffffull) {
+      uint r = K4 == 1 ? (uint)t : lf_udiv((uint)t, K4);
+      if (K4 != 1) k4 = (uint)t - r * K4;
+      g = lf_udiv(r, (uint)rows);
+      row = r - (ulong)g * rows;
+    } else {
+      k4 = (uint)(t % K4); ulong r = t / K4; row = r % rows; g = (uint)(r / rows);
+    }
+    float m = a.mask ? a.mask[row] : 1.f;
+    ulong src4 = (row * a.G + g) * K4 + k4;
+    ((device float4*)a.out)[t] = ((device const float4*)a.x)[src4] * m;
+    if (a.y && a.outY) ((device float4*)a.outY)[t] = ((device const float4*)a.y)[src4] * m;
+    return;
+  }
+  const ulong total = rows * a.G * a.K;
   if (t >= total) return;
-  uint k, i, s, g;   // (32-bit division where the index fits: the 64-bit one is slow)
-  if (total <= 0xffffffffull) {
-    uint r = lf_udiv((uint)t, a.K); k = (uint)t - r * a.K; uint r2 = lf_udiv(r, a.n); i = r - r2 * a.n; g = lf_udiv(r2, a.S); s = r2 - g * a.S;
-  } else { k = (uint)(t % a.K); ulong r = t / a.K; i = (uint)(r % a.n); r /= a.n; s = (uint)(r % a.S); g = (uint)(r / a.S); }
-  ulong row = (ulong)s * a.n + i;
-  a.out[t] = a.x[(row * a.G + g) * a.K + k] * (a.mask ? a.mask[row] : 1.f);
+  uint k, g;
+  ulong row;
+  if (total <= 0xffffffffull && rows <= 0xffffffffull) {
+    uint r = lf_udiv((uint)t, a.K); k = (uint)t - r * a.K; g = lf_udiv(r, (uint)rows); row = r - (ulong)g * rows;
+  } else { k = (uint)(t % a.K); ulong r = t / a.K; row = r % rows; g = (uint)(r / rows); }
+  float m = a.mask ? a.mask[row] : 1.f;
+  ulong src = (row * a.G + g) * a.K + k;
+  a.out[t] = a.x[src] * m;
+  if (a.y && a.outY) a.outY[t] = a.y[src] * m;
 }
 kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
   ulong t = LF_INDEX;
@@ -2358,6 +2491,110 @@ kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
     j = (uint)(r % a.n); i = (uint)(r / a.n);
   }
   a.out[t] = a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l];
+}
+kernel void af3_grouped_permute_ln(constant GroupedPermuteLnArgs& a [[buffer(0)]],
+                                   uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
+                                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                   uint3 tpg [[threads_per_threadgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * (tpg.x >> 5) + sg;
+  if (row >= (ulong)a.bi * a.n) return;
+  uint i = lf_udiv((uint)row, a.n), j = (uint)row - i * a.n;
+  const uint per = a.G * a.K * a.K;
+  if (a.K == 8 && per == 512) {
+    device const float4* P4 = (device const float4*)a.P;
+    device const float4* sc4 = (device const float4*)a.scale;
+    device const float4* of4 = (device const float4*)a.offset;
+    const ulong gStride4 = (ulong)a.bi * 8 * a.n * 2;
+    const ulong ijBase4 = ((ulong)i * 8 * a.n + j) * 2;
+    const ulong nStep4 = (ulong)a.n * 2;
+    float4 xv[4];
+    float s = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint m = 0; m < 4; ++m) {
+      uint c4 = lane + m * 32;
+      uint l4 = c4 & 1u, k = (c4 >> 1) & 7u, g = c4 >> 4;
+      float4 v = P4[g * gStride4 + ijBase4 + k * nStep4 + l4];
+      xv[m] = v;
+      s += v.x + v.y + v.z + v.w;
+    }
+    float mean = simd_sum(s) * (1.f / 512.f), var = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint m = 0; m < 4; ++m) { float4 d = xv[m] - mean; var += dot(d, d); }
+    float inv = rsqrt(simd_sum(var) * (1.f / 512.f) + a.eps);
+    if (a.outH) {
+      device half4* out4 = (device half4*)(a.outH + row * 512);
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0; m < 4; ++m) {
+        uint c4 = lane + m * 32;
+        out4[c4] = half4((xv[m] - mean) * inv * sc4[c4] + of4[c4]);
+      }
+    } else {
+      device float4* out4 = (device float4*)(a.out + row * 512);
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0; m < 4; ++m) {
+        uint c4 = lane + m * 32;
+        out4[c4] = (xv[m] - mean) * inv * sc4[c4] + of4[c4];
+      }
+    }
+    return;
+  }
+  if (a.K == 8 && per == 1024) {
+    device const float4* P4 = (device const float4*)a.P;
+    device const float4* sc4 = (device const float4*)a.scale;
+    device const float4* of4 = (device const float4*)a.offset;
+    const ulong gStride4 = (ulong)a.bi * 8 * a.n * 2;
+    const ulong ijBase4 = ((ulong)i * 8 * a.n + j) * 2;
+    const ulong nStep4 = (ulong)a.n * 2;
+    float4 xv[8];
+    float s = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint m = 0; m < 8; ++m) {
+      uint c4 = lane + m * 32;
+      uint l4 = c4 & 1u, k = (c4 >> 1) & 7u, g = c4 >> 4;
+      float4 v = P4[g * gStride4 + ijBase4 + k * nStep4 + l4];
+      xv[m] = v;
+      s += v.x + v.y + v.z + v.w;
+    }
+    float mean = simd_sum(s) * (1.f / 1024.f), var = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint m = 0; m < 8; ++m) { float4 d = xv[m] - mean; var += dot(d, d); }
+    float inv = rsqrt(simd_sum(var) * (1.f / 1024.f) + a.eps);
+    if (a.outH) {
+      device half4* out4 = (device half4*)(a.outH + row * 1024);
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0; m < 8; ++m) {
+        uint c4 = lane + m * 32;
+        out4[c4] = half4((xv[m] - mean) * inv * sc4[c4] + of4[c4]);
+      }
+    } else {
+      device float4* out4 = (device float4*)(a.out + row * 1024);
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0; m < 8; ++m) {
+        uint c4 = lane + m * 32;
+        out4[c4] = (xv[m] - mean) * inv * sc4[c4] + of4[c4];
+      }
+    }
+    return;
+  }
+  const uint K2 = a.K * a.K;
+  float s = 0.f;
+  for (uint c = lane; c < per; c += 32) {
+    uint g = lf_udiv(c, K2), rem = c - g * K2, k = lf_udiv(rem, a.K), l = rem - k * a.K;
+    s += a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l];
+  }
+  float mean = simd_sum(s) / (float)per, var = 0.f;
+  for (uint c = lane; c < per; c += 32) {
+    uint g = lf_udiv(c, K2), rem = c - g * K2, k = lf_udiv(rem, a.K), l = rem - k * a.K;
+    float d = a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l] - mean;
+    var += d * d;
+  }
+  float inv = rsqrt(simd_sum(var) / (float)per + a.eps);
+  for (uint c = lane; c < per; c += 32) {
+    uint g = lf_udiv(c, K2), rem = c - g * K2, k = lf_udiv(rem, a.K), l = rem - k * a.K;
+    float v = (a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l] - mean) * inv * a.scale[c] + a.offset[c];
+    if (a.outH) a.outH[row * per + c] = (half)v;
+    else a.out[row * per + c] = v;
+  }
 }
 kernel void af3_scale_h(LF_ARGS(ScaleHArgs)) {
   ulong t = LF_INDEX;

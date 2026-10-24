@@ -171,9 +171,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) lane: u32) {
   let first = (group.x + group.y * GRID_WIDTH) * PROJECT_ROWS;
   if (first >= ROWS) { return; }
-  for (var at = lane; at < PROJECT_ROWS * C_M; at += 64u) {
-    let row = first + at / C_M;
-    normalized_rows[at] = select(0.0, msa[min(row, ROWS - 1u) * C_M + at % C_M], row < ROWS);
+  for (var c = lane; c < C_M; c += 64u) {
+${Array.from({ length: OPM_PROJECT_ROWS }, (_, r) => `    let row_in_${r} = first + ${r}u;
+    normalized_rows[${r * msaChannels}u + c] = select(0.0, msa[min(row_in_${r}, ROWS - 1u) * C_M + c], row_in_${r} < ROWS);`).join("\n")}
   }
   workgroupBarrier();
   if (lane < PROJECT_ROWS) {

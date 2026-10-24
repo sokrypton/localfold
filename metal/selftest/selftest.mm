@@ -584,7 +584,7 @@ int main() {
     } else { ++failures; printf("  gemmOpmOut emitted LN: FAIL (not taken)\n"); }
     release(dLn1); release(dLn2); release(dsc); release(dof); release(dsc2); release(dof2);
     release(dlt); release(drt); release(dX); release(dW); release(db); release(dn); release(dPf); release(dPh);
-    for (int opmC : {256, 384}) {   // shallow OPM output add at C = 256 (with emitted LN) and C = 384
+    for (int opmC : {256, 384, 512}) {   // shallow OPM output add at C = 256, 384, 512 (with emitted LN on matrix units)
       int bi2 = 5, L2 = 7, in2 = 64, out2 = L2 * opmC;
       auto X2 = randv((size_t)bi2 * in2), W2 = randv((size_t)in2 * out2, 0.1f), b2 = randv(opmC), n2 = randv((size_t)bi2 * L2, 0.5f), P2 = randv((size_t)bi2 * out2);
       auto sc1 = randv(opmC), of1 = randv(opmC), sc2 = randv(opmC), of2 = randv(opmC);
@@ -626,6 +626,35 @@ int main() {
           report(l2, relRms(ref2Ln2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
         }
       } else { ++failures; printf("  gemmOpmOut C %d: FAIL (not taken)\n", opmC); }
+      if (opmC > 256 && matrixUnits()) {
+        upload(dP2, P2.data(), P2.size() * 4);
+        if (gemmOpmOut(dX2, dW2, dP2, db2, dn2, bi2, in2, opmC, 1.f, dL1, dsc1, dof1, 1e-5f, dL2, dsc2, dof2, false, opmC)) {
+          std::vector<double> rStd((size_t)bi2 * opmC), rLn1((size_t)bi2 * opmC), rLn2((size_t)bi2 * opmC);
+          for (int r = 0; r < bi2; ++r) {
+            double m = 0, var = 0;
+            for (int c = 0; c < opmC; ++c) {
+              double s = 0;
+              for (int k = 0; k < in2; ++k) s += (double)(float)(half)X2[r * in2 + k] * (float)(half)W2[(size_t)k * opmC + c];
+              double val = P2[r * opmC + c] + (b2[c] + s) / (1e-3 + n2[r]);
+              rStd[r * opmC + c] = val;
+              m += val;
+            }
+            m /= opmC;
+            for (int c = 0; c < opmC; ++c) { double d = rStd[r * opmC + c] - m; var += d * d; }
+            double inv = 1.0 / sqrt(var / opmC + 1e-5);
+            for (int c = 0; c < opmC; ++c) {
+              rLn1[r * opmC + c] = (rStd[r * opmC + c] - m) * inv * sc1[c] + of1[c];
+              rLn2[r * opmC + c] = (rStd[r * opmC + c] - m) * inv * sc2[c] + of2[c];
+            }
+          }
+          char l1[64], l2[64];
+          auto h1 = download(dL1, (size_t)bi2 * opmC), h2 = download(dL2, (size_t)bi2 * opmC);
+          snprintf(l1, sizeof l1, "outer product output add (C %d), emitted LN 1", opmC);
+          snprintf(l2, sizeof l2, "outer product output add (C %d), emitted LN 2", opmC);
+          report(l1, relRms(rLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+          report(l2, relRms(rLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+        } else { ++failures; printf("  gemmOpmOut emitted LN C %d: FAIL (not taken)\n", opmC); }
+      }
       release(dX2); release(dW2); release(db2); release(dn2); release(dP2); release(dsc1); release(dof1); release(dsc2); release(dof2); release(dL1); release(dL2);
     }
   }

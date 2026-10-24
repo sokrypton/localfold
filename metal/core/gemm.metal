@@ -808,11 +808,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
           thread auto& e = acc[a][b].thread_elements();
           const int col0 = sc + b * 8 + sn, ic0 = i0 + col0, sc0 = (g.epilogue & 8192) ? (col0 & 127) : col0;
           const float n0 = ((float)e[0] - m) * inv, n1 = ((float)e[1] - m) * inv;
-          const float s0 = lnSc[sc0], s1 = lnSc[sc0 + 1];
+          const float s0 = lnSc ? lnSc[sc0] : 1.f, s1 = lnSc ? lnSc[sc0 + 1] : 1.f;
           const float o0 = lnOf ? lnOf[sc0] : 0.f, o1 = lnOf ? lnOf[sc0 + 1] : 0.f;
           *(device half2*)(lnOut + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * s0 + o0), (half)(n1 * s1 + o1));
           if (lnOut2) {
-            const float t0 = lnSc2[sc0], t1 = lnSc2[sc0 + 1];
+            const float t0 = lnSc2 ? lnSc2[sc0] : 1.f, t1 = lnSc2 ? lnSc2[sc0 + 1] : 1.f;
             const float p0 = lnOf2 ? lnOf2[sc0] : 0.f, p1 = lnOf2 ? lnOf2[sc0 + 1] : 0.f;
             *(device half2*)(lnOut2 + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * t0 + p0), (half)(n1 * t1 + p1));
           }
@@ -1099,7 +1099,7 @@ kernel void lf_gemm_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadg
           thread auto& eg = acc[a][b].thread_elements();
           const int col0 = sc + b * 8 + sn, ic0 = i0 + col0;
           const float n0 = (eg[0] - m) * inv, n1 = (eg[1] - m) * inv;
-          const float s0 = lnSc[col0], s1 = lnSc[col0 + 1];
+          const float s0 = lnSc ? lnSc[col0] : 1.f, s1 = lnSc ? lnSc[col0 + 1] : 1.f;
           const float o0 = lnOf ? lnOf[col0] : 0.f, o1 = lnOf ? lnOf[col0 + 1] : 0.f;
           *(device half2*)(lnOut + (ulong)jr * g.ldd + ic0) = half2((half)(n0 * s0 + o0), (half)(n1 * s1 + o1));
         }

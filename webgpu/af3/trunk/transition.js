@@ -316,29 +316,6 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
     Array.from({ length: slotsPerThread }, (_, b) => body(b)).join("\n");
   const overOutSlots = (body) =>
     Array.from({ length: channelsPerThread }, (_, s) => body(s)).join("\n");
-  // The fast variance is the trunk's; the atom and diffusion stacks want the
-  // two-pass one. See the note in webgpu/kernels/triangle/shaders.js.
-  const varianceCode = variance === "fast"
-    ? `let variance = sum_squares / f32(CHANNELS) - mean * mean;`
-    : `var centered_total = 0.0;
-  for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    let d = input[base + c] - mean;
-    centered_total += d * d;
-  }
-  // 🔴 A BARRIER BEFORE REUSING THE REDUCTION BUFFER. Every invocation has
-  // just read reduce_a[0] for the mean; writing reduce_a[local] without a
-  // barrier lets a fast lane clobber slot 0 while a slow one is still reading
-  // it. The result is a WRONG MEAN in some rows, some of the time - which
-  // reads as a numerical problem, not a race.
-  workgroupBarrier();
-  reduce_a[local] = centered_total;
-  workgroupBarrier();
-  for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
-    workgroupBarrier();
-  }
-  let variance = reduce_a[0] / f32(CHANNELS);`;
-
   return `${stage16 || weight16 || acc16 ? "enable f16;\n" : ""}
 const ROWS: u32 = ${rows}u;
 const CHANNELS: u32 = ${channels}u;
@@ -369,9 +346,8 @@ var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
 var<workgroup> gated: array<${stageVector}, ${groups * chunk}>;
 ${(() => {
   const vecNorm = channels % WORKGROUP === 0 && WORKGROUP <= 128;
-  const reduceType = vecNorm ? vector : "f32";
-  return `var<workgroup> reduce_a: array<${reduceType}, ${WORKGROUP}>;
-${variance === "fast" ? `var<workgroup> reduce_b: array<${reduceType}, ${WORKGROUP}>;\n` : ""}\
+  return `var<workgroup> reduce_a: array<${vector}, ${WORKGROUP}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<${vector}, ${WORKGROUP}>;\n` : ""}\
 ${vecNorm ? "" : `var<workgroup> row_mean: array<f32, ${tile}>;
 var<workgroup> row_inverse_std: array<f32, ${tile}>;`}`;
 })()}
@@ -448,13 +424,13 @@ ${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {
   // it is cheap next to the two matmuls, which are what the tile is for. What
   // it leaves behind is a mean and an inverse deviation per row, so that the
   // normalised tile can then be written LANES rows at a time.
-  for (var t = 0u; t < TILE; t += 1u) {
-    let row = min(base_row + t, ROWS - 1u);
-    let base = row * CHANNELS;
-    var total = 0.0;
-    ${variance === "fast" ? "var sq_total = 0.0;" : ""}
+  for (var g = 0u; g < ${groups}u; g += 1u) {
+    ${overLanes((l) => `let base_${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u) * CHANNELS;`).join("\n    ")}
+    var total = ${zero};
+    ${variance === "fast" ? `var sq_total = ${zero};` : ""}
     for (var c = local; c < CHANNELS; c += WORKGROUP) {
-      let value = input[base + c];
+      var value: ${vector};
+      ${overLanes((l, at) => `value${at} = input[base_${l} + c];`).join("\n      ")}
       total += value;
       ${variance === "fast" ? "sq_total += value * value;" : ""}
     }
@@ -468,12 +444,26 @@ ${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {
       }
       workgroupBarrier();
     }
-    let mean = reduce_a[0] / f32(CHANNELS);
-    ${variance === "fast" ? "let sum_squares = reduce_b[0];" : ""}
-    ${varianceCode}
+    let mean = reduce_a[0] / ${vector}(f32(CHANNELS));
+    ${variance === "fast"
+      ? `let variance = reduce_b[0] / ${vector}(f32(CHANNELS)) - mean * mean;`
+      : `var centered_total = ${zero};
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      var d: ${vector};
+      ${overLanes((l, at) => `d${at} = input[base_${l} + c] - mean${at};`).join("\n      ")}
+      centered_total += d * d;
+    }
+    workgroupBarrier();
+    reduce_a[local] = centered_total;
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+      workgroupBarrier();
+    }
+    let variance = reduce_a[0] / ${vector}(f32(CHANNELS));`}
     if (local == 0u) {
-      row_mean[t] = mean;
-      row_inverse_std[t] = inverseSqrt(variance + EPSILON);
+      ${overLanes((l, at) => `row_mean[g * ${lanes}u + ${l}u] = mean${at};
+      row_inverse_std[g * ${lanes}u + ${l}u] = inverseSqrt(variance${at} + EPSILON);`).join("\n      ")}
     }
     workgroupBarrier();
   }
@@ -482,10 +472,10 @@ ${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {
   // read. A row past the end is clamped rather than skipped: it contributes to
   // no output, and leaving the lane uninitialised would put a NaN in a vector
   // whose other lanes are real.
-  for (var g = 0u; g < ${groups}u; g += 1u) {
-    for (var c = local; c < CHANNELS; c += WORKGROUP) {
-      let scale = ${w("weights[W_SCALE + c]")};
-      let offset = ${w("weights[W_OFFSET + c]")};
+  for (var c = local; c < CHANNELS; c += WORKGROUP) {
+    let scale = ${w("weights[W_SCALE + c]")};
+    let offset = ${w("weights[W_OFFSET + c]")};
+    for (var g = 0u; g < ${groups}u; g += 1u) {
       var packed: ${vector};
       ${overLanes((l, at) => `{
         let row${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u);

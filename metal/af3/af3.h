@@ -70,6 +70,8 @@ const float* qkvgBias(const std::string& pre, int Wd);
 struct Masks { const float* pair; const float* seq; bool ones; };
 // (into: where the residual goes, when not the input itself - chai-1's parallel block)
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf);
+half* takePairLn(const void* x, const std::string& norm);
+bool canEmitPairLn(int C);
 half* pairLn(const float* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
 half* pairLn(const half* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
