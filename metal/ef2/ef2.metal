@@ -128,6 +128,8 @@ kernel void ef2_qk_norm_rope(constant QkNormRopeArgs& a [[buffer(0)]], uint3 tg 
   device float4* y4 = (device float4*)((isK ? a.k : a.q) + (ulong)row * C);
   float4 r[9];
   float s = 0;
+  // ESM-C's 1152 fills a lane's nine float4s, so the bounds test folds away (with two simdgroups a threadgroup at 256
+  // rows and under, bed4fb7d: 0.60 -> 0.45 ms here, ef2_shim_norm_acc 0.86 -> 0.72)
   const bool exact1152 = C == 1152;
   _Pragma("clang loop unroll(full)")
   for (int k = 0; k < 9; ++k) {

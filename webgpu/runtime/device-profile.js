@@ -1297,13 +1297,12 @@ const PRIORS = new Map([
     // timestamps in one submit, 256 tokens; probe-grid-attend-race.js prints it). On the M5: 5.95 ms untiled against
     // 4.18 tiled, the same five runs of five, ~0.4 s once a page; the trunk pass 3248 / 3263 -> 3071 / 3081 ms GPU.
     // `--tune=gridAttendTiled=false,gridAttendTiledHalf=false` (or true) answers instead and skips the race.
-    // 🔴 THE TRIANGLE'S PROJECTION TILE AT 32x32, AMPERE'S, MEASURED ON AN M5 UNDER STOCK FLAGS. bench-triangle-project
-    // at 255 tokens: project 5.06 -> 4.79 ms, project-out 3.26 -> 2.91, contract untouched, relRMS 0 (the tile
-    // reorders no sum). AF3 int5's 255-token trunk pass, three rounds interleaved: tri.project-out 278 / 292 / 295 ->
-    // 234 / 239 / 239 ms, tri.project 342 / 359 / 364 -> 335 / 342 / 344, the pass's GPU 3179 / 3305 / 3344 -> 3197 /
-    // 3259 / 3301. A wider output tile (outColumns 64) took project-out 10-18 ms further and the pass did not follow.
-    // ...and on the M2, the same pass alternated: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project 635 / 1003
-    // -> 599 / 1004 - so it holds on both parts.
+    // 🔴 THE TRIANGLE'S PROJECTION TILE AT 64x32 IN A 16x16 WORKGROUP, ITS OUTPUT TILE 64 COLUMNS WIDE, MEASURED ON AN M5
+    // UNDER STOCK FLAGS. Ampere's 32x32 came first (AF3 int5, 255 tokens, a trunk pass: tri.project-out 278-295 ->
+    // 234-239 ms, tri.project 342-364 -> 335-344, held on the M2: project-out 503 / 776 -> 364 / 624); the 256-thread
+    // tile with unrolled register accumulators (a6b916c8) took it further. profile-af2-block.js, 255 x 128, against
+    // 32x32: triangle project 2.91 / 2.88 -> 2.51 / 2.51 ms, output 2.07 / 2.02 -> 1.73 / 1.68, the block 89.4 -> 88.2;
+    // 5CAJ's monomer fold 10361 -> 10156 ms warm, the same checksum (the tile reorders no sum). Not measured on an M2.
     trianglePairProjectTile: { rows: 64, columns: 32, outColumns: 64, workgroup: 16 },
     // 🔴 NOT TIERED ON APPLE: THE FIRST FOLD RAN EVERY KERNEL WITH OPAQUE LOOP BOUNDS AND PAID MORE THAN THE COMPILE IT
     // SAVED. "tiered" (DEFAULT_TUNING) was measured on NVIDIA, whose driver compile dominates a fresh VM's first fold;
@@ -1337,11 +1336,25 @@ const PRIORS = new Map([
     // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
     // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
     vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
+    // 🔴 THE f16 VECTOR LINEAR, ATTENTION OUTPUT AND q/k/v/gate PROJECTION TILES AT 256 THREADS, MEASURED ON AN M5 UNDER
+    // STOCK FLAGS (7bb3fe2f; under 128 columns they fall back to x4). profile-af2-block.js, 255 x 128: msa-transition
+    // 7.17 -> 5.36 ms, pair-transition 3.72 -> 2.85, the attention outputs 2.08 -> 1.54 and 1.13 -> 0.87, the
+    // projections 5.14 -> 4.74 and 2.59 -> 2.43; with that commit's OPM staging, the block 110.5 -> 89.4 ms and 5CAJ's
+    // fold 12637 -> 10361 warm, bit-identical. Not measured on an M2.
     linearHalfTile: "16x16x4x8",
     attentionOutputHalfTile: "16x16x4x8",
     attentionProjectHalfTile: "16x16x4x2",
+    // 🔴 AF3's SINGLE TRANSITION AND SINGLE ATTENTION PROJECTIONS FOUR ROWS A LANE IN vec4, MEASURED ON AN M5 UNDER
+    // STOCK FLAGS (57f822f5). bench-trunk.js, AF3 int5, 128 tokens: single-transition 37.9 -> 16.1-16.9 ms,
+    // single.project 9.21 -> 5.57, single.project-out 7.65 -> 6.29 (with its residual add fused), relRMS 0. Not
+    // measured on an M2.
     singleTransitionTile: 4,
     singleProjectRows: 4,
+    // 🔴 THE ATOM STACKS' ROW TILE AT 4 AT EVERY SIZE, MEASURED ON AN M5 UNDER STOCK FLAGS (ed330437): the derived rule
+    // takes tile 1-2 below 1024 padded atoms and 8 above 2048, whose 28 KiB of workgroup storage halves residency.
+    // bench-head.js --profile, AF3 int5, the atom output passes of a denoiser call, two rounds alternated, derived / 4 /
+    // 8: 68 tokens 1.97-2.17 / 1.24-1.49 / 1.55 ms; 255 tokens (6120 atoms) 3.82-4.50 / 3.80-3.83 / 4.44-4.45 - no
+    // tile-4 cliff here (the A100's and the T4's, above). Not measured on an M2.
     atomRowTile: { below: 4, atOrAbove: 4, crossover: 1 << 30 },
     // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
     // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
