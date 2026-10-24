@@ -231,3 +231,61 @@ node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js --length=200 --sequence
 
 and `check-af3-grid-attention.js --tiled` / `check-evoformer-attention.js --dimension=32
 --tune-json='{"attentionTiled":true}'` for the answers. If it wins there it belongs in DEFAULT_TUNING.
+
+## 🔴 ROUND EIGHT ASK: the large-length pass (2026-10-24)
+
+Written from the A100. A pass over every port at 68 to 4,080 tokens (copies of 6MRR, which folds from its sequence
+alone, each chain scored against the crystal). Most of what it fixed is cuda/-only (memory fit checks, the scratch
+pool's fallback, AF2's launch limits and scratch release). **Three changes reach `metal/`, and one of them has never
+been compiled** - this box cannot build Objective-C++. In order:
+
+**1. Build it: e573a0a2 (PDB chain letters past Z).** metal/af2 named a chain `'A' + min(k, 25)` in its PDB and its
+confidence JSON, so from the 27th chain on every chain wrote as Z and readers merged them; it now takes the page's 62
+letters (`pdbChain` in metal/af2/main.mm), and metal/af3/output.mm's template-free fallback wrapped the same set at 26.
+It is cuda/af2's 042f1442 as plain C++, unbuilt. Under 27 chains every letter is unchanged, so the gates should not
+move:
+
+```
+bash metal/build.sh
+python3 metal/af2/gate.py && python3 metal/af3/gate.py && python3 metal/ef2/gate.py
+```
+
+**2. AF2's monomer on a complex: 39cab21d (another agent's port) and 26c14ecf (the shared featuriser).** Two faults,
+found because 12 copies of 6MRR, single sequence, read pLDDT 50 where ColabFold reads 80.7:
+- a cross-chain pair took the multimer's relpos row 65, which a monomer's projection has as zeros (cuda/af2 995ef402;
+  metal 39cab21d);
+- a single-sequence complex folded on ONE alignment row where ColabFold gives each copy its own (the monomer merge
+  dropped each chain's query row). AlphaFold 2 itself collapses many copies on one row: ColabFold's own JAX, patched
+  to one row, reads 21.8 at 30 copies, as did we.
+
+The second is in cuda/featurise, which metal links (`standalone.o`), so it reaches the M2 with no metal edit. The A100:
+12 copies pLDDT **79.3** native, **79.1** on the page (WebGPU), ColabFold 80.7, ~0.9 A a chain. On the M2:
+
+```
+S=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
+metal/af2/fold x12.pdb --sequence=$(python3 -c "print(':'.join(['$S']*12))")
+```
+
+Expect ~79 and 12 chains A-L. 🔴 **A metal gate case that folds a single-sequence complex on the monomer WILL move**
+(it has more alignment rows now) - that is 26c14ecf, not a regression: re-record it and say which moved, by how much.
+cuda/af2's gate gained `6mrr-x12-monomer` for this (69.1 -> 79.3); metal/af2/gate.py could carry the same case.
+
+**3. ESMFold2's long-input step floor: 4fa29d9f.** Past 2,048 residues the checkpoint's 15 scheduled steps (11 run)
+leave the backbone SHORT - 45 copies (3,060 residues) had 15.9% of CA-CA outside 3.6-4.0 A, 60 copies 91.5% - so a
+long input now takes the per-atom floor, 64 scheduled (45 run), in the page, python/localfold/worker.py and
+cuda/featurise/standalone.cpp (which metal links). Euler is kept: the exponential update measured WORSE there at every
+count (docs/EF2FAST.md, "Long inputs" - it never passes the denoiser's shrunken answer, where Euler's 1.638 step
+overshoots it). Only if the M2 has the memory for it:
+
+```
+metal/ef2/fold x45.pdb --sequence=$(python3 -c "print(':'.join(['$S']*45))")
+```
+
+should print 45 steps run and keep CA-CA in band. A clean refusal or a clean out-of-memory is also an answer worth
+writing down - nothing in this pass sized metal/ at these lengths, so its large-length behaviour is unmeasured.
+
+Not reaching metal/, for completeness: OpenDDE's structural-stage fit check (a71ca0eb), the scratch pool's fallback to
+the card (fc66ba51), chai-1's pre-MSA pair room check and AF2's tight-card scratch release (dd61b0d9), AF2's masked
+column attention past 8,192 residues and the template scale's int count (995ef402). If metal/ has twins of any of
+those - a fit check that sizes only the residue-level trunk, a pool that keeps pages across stages - they are worth a
+look at the M2's own ceiling.
