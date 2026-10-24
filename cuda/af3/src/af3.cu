@@ -7,7 +7,11 @@
 #include "../../featurise/standalone_api.h"
 #include <dirent.h>
 #include <future>
-#define LN_VEC_MIN_K 2
+// lnRowsToShared's vector loads down to 2-wide rows (AF3's 128-channel pair: K = 4) only where an SM's shared memory seats
+// the fused pair kernels four blocks deep (LF_SM_SMEM >= 164 KB: an A100, a Hopper part), which hides their latency -
+// AF3's trunk at 988 tokens 4,752 -> 4,694 ms on an A100; on a 100 KB SM, where two blocks seat, they stalled on
+// global loads (long-scoreboard 1.2 -> 3.4 a warp-issue) and cost the same trunk 5% (RTX PRO 6000: 2,750 -> 2,896 ms)
+#define LN_VEC_MIN_K (LF_SM_SMEM >= (164 << 10) ? 2 : 8)
 #include "trunk.cuh"
 #include "atom.cuh"
 #include "diffusion.cuh"
