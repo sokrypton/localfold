@@ -385,11 +385,11 @@ engine*.
 | ligand target | ✅ runs, LigandMPNN chosen automatically | ✅ preset `110-110,/0,SAM` |
 | nucleic target | ✅ runs, NA-MPNN chosen automatically | ✅ preset `A1-9/0 B1-10/0 120-150` |
 | from a structure | ✅ its sequence is read out | ✅ its coordinates are conditioned on |
-| motif, indexed | ❌ needs fixed positions on the page | ✅ preset round-trips through the spans |
-| motif, unindexed | ❌ as above | ✅ preset round-trips |
-| inverse folding | ❌ needs fixed positions | ✅ plumbed, needs a structure |
+| motif, indexed | ✅ objective 0.835, the motif survives exactly | ✅ preset round-trips through the spans |
+| motif, unindexed | ❌ Hunter cannot choose where the motif sits | ✅ preset round-trips |
+| inverse folding | ✅ objective 0.906, whole chain resampled | ✅ plumbed, needs a structure |
 | partial diffusion | ❌ no analogue | ✅ plumbed, needs a structure |
-| antibody CDR | ❌ needs fixed positions | ❌ no preset |
+| antibody CDR | ✅ objective 0.882, framework held either side | ❌ no preset |
 | cyclic | ❌ | ❌ |
 | PTM target | ❌ | ❌ |
 | epitope / hotspots | ❌ | ⚠️ preset-only, not editable |
@@ -398,11 +398,20 @@ engine*.
 `npm run test:design --cases` re-runs the Hunter column, asserting the automatic
 designer follows the job; `--generate` re-runs RFD4's unconditional case.
 
-🔴 **The one primitive most of the gaps need is fixed positions on the page**:
-antibody mode, inverse folding for Hunter, and both motif forms are all "hold
-these residues, design the rest". `cpu/design/runspec.js` already translates
-them - what is missing is a way to say which, which is a span-level field rather
-than a new screen.
+🔴 **That primitive now exists, and it was one checkbox.** A given span is HELD
+by default; ticking `redesign` keeps its place and length and lets the designer
+rewrite its letters. At the scale of a whole chain that is inverse folding; at
+the scale of part of one it is an antibody's CDR; and a given span between two
+Design spans is a scaffolded motif. All three run, and the gate asserts the held
+residues SURVIVE in the designed sequence - the only check that catches a hold
+which is not holding, since the run looks identical either way.
+
+What is left is genuinely different in kind, not more of the same: **cyclic** and
+**PTM** need the sampler and the featuriser to express a molecule this page
+cannot describe yet; **unindexed** motif placement needs the loop to search over
+where the motif sits; **hotspots** are editable only through a preset's
+conditions; and **labelled spans** (CATH, secondary structure) need a row that
+carries a name and a polymer type.
 
 
 

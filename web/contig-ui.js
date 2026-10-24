@@ -97,6 +97,7 @@ const number = (value, fallback) => {
 
 /** A fresh span of `kind`, with defaults a reader would expect. */
 export function emptySpan(kind = "generated") {
+  // (a given span is HELD by default; `redesign` is the opt-in)
   if (kind === "generated") return { kind, min: 75, max: 75 };
   if (kind === "sequence") return { kind, value: "", polymer: "protein" };
   if (kind === "segment") return { kind, chain: "A", first: 1, last: 100 };
@@ -210,82 +211,128 @@ export function contigOf(spans, method = "rfd4p") {
  * @param {object} [options]
  * @param {(chain: string, first: number, last: number) => string|null} [options.sequenceOf]
  * @returns {{chains: string[], chainKinds: string[], ligandCodes: string[],
- *            chainIndex: number, length: number, problems: string[]}}
+ *            chainIndex: number, length: number, hold: number[],
+ *            problems: string[]}} `hold` is positions within the designed chain
+ *   the designer must not rewrite - see designChain() in cpu/design/mpnn-bridge.js
  */
 export function chainsOf(spans, options = {}) {
   const sequenceOf = options.sequenceOf;
-  // 🔴 WHAT EACH CHAIN IS MADE OF, AND THE LIGANDS BESIDE THEM, because the FOLD
-  // needs both: the featuriser gives a ligand a chain of its own and reads a
-  // nucleic chain one token per base, so a DNA target folded as protein is not a
-  // slower answer, it is a different one. They travel with the chains.
+  const chains = [];
   const kinds = [];
   const ligands = [];
-  const chains = [];
   const problems = [];
-  let current = { parts: [], designed: false, length: 0, polymer: "protein" };
+  let hold = [];
+  let designedIndex = -1;
+  let designedLength = 0;
+  let current = { parts: [], polymer: "protein", designed: false, length: 0, given: false };
+
   const finish = () => {
-    if (current.parts.length === 0 && !current.designed) return;
-    if (current.designed && current.parts.length > 0) {
-      problems.push("Protein Hunter cannot mix designed and given residues in one chain;"
-        + " put a chain break between them");
+    if (current.parts.length === 0) return;
+    const index = chains.length;
+    // 🔴 THE CHAIN IS BUILT PART BY PART, AND THE HELD POSITIONS ARE THE GIVEN
+    // PARTS' INDICES INSIDE IT. That is what lets one chain mix given and
+    // designed residues - a scaffolded motif, an antibody's framework around its
+    // CDRs - which Hunter could not express at all before: it designed whole
+    // chains only.
+    let text = "";
+    const held = [];
+    for (const part of current.parts) {
+      if (part.held) {
+        for (let at = 0; at < part.text.length; at += 1) held.push(text.length + at);
+      }
+      text += part.text;
     }
-    chains.push(current.designed ? "" : current.parts.join(""));
-    // A designed chain is always protein: nothing here designs nucleic acids.
+    // 🔴 A WHOLLY DESIGNED CHAIN IS HANDED OVER EMPTY, AND THAT IS NOT A
+    // DETAIL: the loop draws its own starting sequence when the chain is empty -
+    // the percent-X ramp, the first cycle's proline omission, the seeded draw -
+    // and all of that is Protein Hunter's METHOD, held to the reference in
+    // cpu/design/sample-sequence.js. Pre-filling it with X would silently
+    // replace the method's own opening move with a constant.
+    //
+    // 🔴 A MIXED CHAIN CANNOT BE, because the loop has no way to know where the
+    // held residues go. So a scaffolded chain arrives pre-shaped, and the
+    // percent-X ramp does NOT apply to it - a deviation from the reference's
+    // schedule that only arises in a case the reference cannot express at all.
+    // 🔴 EMPTIED ONLY WHEN EVERY RESIDUE CAME FROM A `Design` SPAN. A chain that
+    // is wholly FREED - a given span marked redesign, which is inverse folding -
+    // keeps its text, because that sequence IS the starting point the method
+    // works from. Emptying it would throw away the thing being inverse-folded
+    // and draw a random mostly-X chain of the same length instead.
+    const wholly = current.designed && held.length === 0 && !current.given;
+    chains.push(wholly ? "" : text);
     kinds.push(current.designed ? "protein" : current.polymer);
-    if (current.designed) lengths.push(current.length);
-    current = { parts: [], designed: false, length: 0, polymer: "protein" };
+    if (current.designed) {
+      if (designedIndex >= 0) problems.push("Protein Hunter designs one chain at a time");
+      designedIndex = index;
+      designedLength = current.length;
+      hold = held;
+    }
+    current = { parts: [], polymer: "protein", designed: false, length: 0, given: false };
   };
-  const lengths = [];
+
   for (const span of spans) {
     if (span.kind === "break") { finish(); continue; }
-    if (span.kind === "sequence") {
-      const value = String(span.value ?? "").trim().toUpperCase();
-      if (value.length === 0) problems.push("a given sequence is empty");
-      current.parts.push(value);
-      // 🔴 THE FIRST SPAN OF A CHAIN DECIDES ITS TYPE, and mixing two inside one
-      // chain is reported rather than resolved - a chain is one polymer.
-      if (current.parts.length === 1) current.polymer = span.polymer ?? "protein";
-      else if ((span.polymer ?? "protein") !== current.polymer) {
-        problems.push("a chain cannot be part protein and part nucleic;"
-          + " put a chain break between them");
-      }
-      continue;
-    }
-    if (span.kind === "generated") {
-      current.designed = true;
-      current.length = number(span.min, 0);
-      continue;
-    }
-    if (span.kind === "segment") {
-      if (sequenceOf === undefined) {
-        problems.push("Protein Hunter folds sequences, so a \u201cFrom structure\u201d span needs"
-          + " the structure loaded to read its sequence from");
-        continue;
-      }
-      const sequence = sequenceOf(String(span.chain ?? ""), number(span.first, 0), number(span.last, 0));
-      if (sequence === null || sequence.length === 0) {
-        problems.push(`chain ${span.chain} ${span.first}-${span.last} is not in the loaded structure`);
-        continue;
-      }
-      current.parts.push(sequence);
-      continue;
-    }
     if (span.kind === "ligand") {
       const code = String(span.code ?? "").trim().toUpperCase();
       if (code.length > 0) ligands.push(code);
       continue;
     }
+    if (span.kind === "generated") {
+      current.designed = true;
+      const length = number(span.min, 0);
+      current.length += length;
+      // 🔴 X IS WHAT THE LOOP FOLDS AND WHAT MPNN REWRITES. A designed span is
+      // that many unknowns in the starting sequence; the loop only draws its own
+      // when the whole chain is empty, so a mixed chain arrives already shaped.
+      current.parts.push({ text: "X".repeat(length), held: false });
+      continue;
+    }
+    // ...a given span: its residues, held unless the user asked for them back
+    let text = "";
+    if (span.kind === "sequence") {
+      text = String(span.value ?? "").trim().toUpperCase();
+      if (text.length === 0) problems.push("a given sequence is empty");
+      if (current.parts.length === 0) current.polymer = span.polymer ?? "protein";
+      else if ((span.polymer ?? "protein") !== current.polymer) {
+        problems.push("a chain cannot be part protein and part nucleic;"
+          + " put a chain break between them");
+      }
+    } else {
+      if (sequenceOf === undefined) {
+        problems.push("Protein Hunter folds sequences, so a \u201cFrom structure\u201d span needs"
+          + " the structure loaded to read its sequence from");
+        continue;
+      }
+      const found = sequenceOf(String(span.chain ?? ""), number(span.first, 0), number(span.last, 0));
+      if (found === null || found.length === 0) {
+        problems.push(`chain ${span.chain} ${span.first}-${span.last} is not in the loaded structure`);
+        continue;
+      }
+      text = found;
+    }
+    // 🔴 `redesign` IS THE SEQUENCE AXIS, MADE EDITABLE. A given span is held by
+    // default; asked to be redesigned it keeps its place and its length and lets
+    // the designer rewrite its letters - which is inverse folding when it is the
+    // whole chain, and an antibody's CDR when it is part of one.
+    const redesign = span.redesign === true;
+    if (redesign) current.designed = true;
+    current.given = true;
+    current.parts.push({ text, held: !redesign });
   }
   finish();
 
-  const chainIndex = chains.findIndex((chain) => chain.length === 0);
-  if (chainIndex < 0) problems.push("nothing is being designed; add a Design span");
-  if (lengths.length > 1) {
-    problems.push("Protein Hunter designs one chain at a time, not " + lengths.length);
+  if (designedIndex < 0) {
+    problems.push("nothing is being designed; add a Design span or mark a given one Redesign");
   }
+  // 🔴 A CHAIN THAT IS ENTIRELY HELD IS NOT A DESIGN, and the designer says so
+  // too - but saying it here names the spans rather than the residue count.
+  if (designedIndex >= 0 && hold.length > 0 && hold.length === chains[designedIndex]?.length) {
+    problems.push("every residue of the designed chain is held, so there is nothing to design");
+  }
+
   return {
-    chains, chainKinds: kinds, ligandCodes: ligands, chainIndex,
-    length: lengths[0] ?? 0, problems: [...new Set(problems)],
+    chains, chainKinds: kinds, ligandCodes: ligands, chainIndex: designedIndex,
+    length: designedLength, hold, problems: [...new Set(problems)],
   };
 }
 
@@ -420,6 +467,24 @@ export function createContigList(rowsContainer, addButton, options = {}) {
       } else {
         fields.append(element("span", "contig-label contig-break",
           "everything below is a separate chain"));
+      }
+      // 🔴 THE SEQUENCE AXIS AS ONE CHECKBOX, on both given kinds. Held is the
+      // default because a given span usually IS the thing being designed
+      // against; unticked it is a framework or a motif, ticked it keeps its
+      // place and length and lets the designer rewrite its letters. That one
+      // box is what makes inverse folding and an antibody's CDRs expressible.
+      if (span.kind === "sequence" || span.kind === "segment") {
+        const redesign = element("label", "contig-redesign");
+        const box = element("input");
+        box.type = "checkbox";
+        box.checked = span.redesign === true;
+        box.title = "Keep these residues' place and number, but let the designer rewrite them.";
+        box.addEventListener("change", () => {
+          spans[index] = { ...spans[index], redesign: box.checked };
+          changed();
+        });
+        redesign.append(box, element("span", undefined, "redesign"));
+        fields.append(redesign);
       }
       row.append(fields);
 

@@ -111,6 +111,10 @@ export function chainMaskFor(structure, chain) {
  *   discourages it. See alanineBias() in sample-sequence.js.
  * @param {() => number} [options.random] pass `uniformFrom(seed)` to make the
  *   design reproducible
+ * @param {Iterable<number>} [options.hold] positions WITHIN the designed chain,
+ *   0-based, to keep as they are. The designer conditions on them and does not
+ *   rewrite them - which is what an antibody's framework, a scaffolded motif and
+ *   inverse folding's fixed residues all are.
  * @returns {{sequence: string, full: string, score: number,
  *            designed: number, structure: object}} `sequence` is the designed
  *   chain alone, which is what goes back into the fold; `full` is every chain,
@@ -141,6 +145,45 @@ export function designChain(model, options) {
   if (designed === 0) {
     throw new Error(`the prediction has no chain ${options.chain}`
       + ` (it has ${structure.chainList.join(", ")})`);
+  }
+
+  // 🔴 WHICH POSITIONS ARE IN THE CHAIN, KEPT BEFORE ANY ARE HELD. The returned
+  // sequence is the whole designed chain, held residues included - the loop
+  // folds it next cycle and a chain missing its motif is a different molecule -
+  // so extraction cannot read the mask, which is about what may be WRITTEN.
+  // Reading the mask returned only the free residues: a 22-residue scaffold came
+  // back as the 12 designed ones, and the next cycle folded that.
+  const inChain = Float32Array.from(chainMask);
+
+  // 🔴 HELD POSITIONS ARE THE CHAIN MASK'S ZEROES, AND NOTHING ELSE IS NEEDED.
+  // `S` already carries the structure's own residue at every position - that is
+  // how the FIXED CHAINS are conditioned - so clearing a position's mask bit
+  // both stops the designer writing there and leaves its neighbours conditioned
+  // on what is actually there. Per-position, where chainMaskFor is per-chain.
+  //
+  // 🔴 THE INDICES ARE WITHIN THE DESIGNED CHAIN, not into the structure, because
+  // that is the numbering the caller has: a span says "hold residues 1-20 of the
+  // binder", and the binder's position in the complex is not its business.
+  if (options.hold !== undefined) {
+    const offsets = [];
+    for (let index = 0; index < chainMask.length; index += 1) {
+      if (chainMask[index] === 1) offsets.push(index);
+    }
+    let held = 0;
+    for (const position of options.hold) {
+      const offset = offsets[position];
+      if (offset === undefined) {
+        throw new Error(`cannot hold position ${position} of a ${offsets.length}-residue chain`);
+      }
+      chainMask[offset] = 0;
+      held += 1;
+    }
+    // 🔴 HOLDING EVERY POSITION IS NOT A DESIGN. It runs, returns the sequence
+    // it was given, and looks like a cycle that simply did not improve.
+    if (held === offsets.length) {
+      throw new Error(`every one of chain ${options.chain}'s ${held} residues is held,`
+        + " so there is nothing to design");
+    }
   }
 
   const result = model.sample(model.encode({
@@ -186,8 +229,8 @@ export function designChain(model, options) {
     ? naDisplaySequence(result.S[0], structure.isRNA)
     : sequenceToString(result.S[0]))];
   const chainLetters = [];
-  for (let index = 0; index < chainMask.length; index += 1) {
-    if (chainMask[index] === 1) chainLetters.push(letters[index]);
+  for (let index = 0; index < inChain.length; index += 1) {
+    if (inChain[index] === 1) chainLetters.push(letters[index]);
   }
   // 🔴 THE CHAINS COME BACK IN THE STRUCTURE'S ORDER, NOT THE REQUEST'S. The
   // reference splits its designer's output on ":" and indexes it by a chain

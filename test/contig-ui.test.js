@@ -122,7 +122,7 @@ describe("the design job as a list of spans", () => {
         { kind: "generated", min: 12, max: 12 }];
       expect(chainsOf(spans)).toEqual({
         chains: [TARGET, ""], chainKinds: ["protein", "protein"], ligandCodes: [],
-        chainIndex: 1, length: 12, problems: [],
+        chainIndex: 1, length: 12, hold: [], problems: [],
       });
       // ...and the designed chain can come first, which is how v1 ordered them
       const first = chainsOf([{ kind: "generated", min: 20, max: 20 }, { kind: "break" },
@@ -132,17 +132,13 @@ describe("the design job as a list of spans", () => {
     });
 
     it("refuses what Hunter cannot express", () => {
-      // a motif inside a designed chain: one chain, both given and designed
-      expect(chainsOf([{ kind: "sequence", value: "AAA" }, { kind: "generated", min: 5, max: 5 }])
-        .problems).toContain("Protein Hunter cannot mix designed and given residues in one chain;"
-          + " put a chain break between them");
       // two designed chains
       expect(chainsOf([{ kind: "generated", min: 5, max: 5 }, { kind: "break" },
         { kind: "generated", min: 6, max: 6 }]).problems)
-        .toContain("Protein Hunter designs one chain at a time, not 2");
+        .toContain("Protein Hunter designs one chain at a time");
       // nothing designed at all
       expect(chainsOf([{ kind: "sequence", value: TARGET }]).problems)
-        .toContain("nothing is being designed; add a Design span");
+        .toContain("nothing is being designed; add a Design span or mark a given one Redesign");
       expect(chainsOf([{ kind: "sequence", value: "" }, { kind: "break" },
         { kind: "generated", min: 9, max: 9 }]).problems).toContain("a given sequence is empty");
     });
@@ -177,7 +173,7 @@ describe("the design job as a list of spans", () => {
         ? "MKVLA" : null);
       expect(chainsOf(spans, { sequenceOf })).toEqual({
         chains: ["MKVLA", ""], chainKinds: ["protein", "protein"], ligandCodes: [],
-        chainIndex: 1, length: 8, problems: [],
+        chainIndex: 1, length: 8, hold: [], problems: [],
       });
 
       // ...and a span naming residues the structure does not have says which
@@ -211,6 +207,68 @@ describe("the design job as a list of spans", () => {
         { kind: "break" }, { kind: "generated", min: 9, max: 9 }]).problems)
         .toContain("a chain cannot be part protein and part nucleic;"
           + " put a chain break between them");
+    });
+
+    // 🔴 ONE CHAIN MIXING GIVEN AND DESIGNED RESIDUES is the primitive most of
+    // the remaining modalities need, and Hunter could not express it at all
+    // before: it designed whole chains only. The held positions are the given
+    // parts' indices inside the chain, which is exactly what designChain zeroes
+    // in the chain mask.
+    it("scaffolds a motif: X around held residues, in one chain", () => {
+      const sequenceOf = (chain, first, last) => (chain === "A"
+        ? "MKVLATGGAWRECKLMNPQ".slice(0, last - first + 1) : null);
+      const motif = chainsOf([{ kind: "generated", min: 5, max: 5 },
+        { kind: "segment", chain: "A", first: 1, last: 8 },
+        { kind: "generated", min: 5, max: 5 }], { sequenceOf });
+      // 🔴 PRE-SHAPED, because the loop cannot know where the motif goes - unlike
+      // a wholly designed chain, which is handed over EMPTY so the loop draws
+      // its own opening sequence (the percent-X ramp is the method, not a
+      // detail). The ramp therefore does not apply to a scaffolded chain, which
+      // is a deviation in a case the reference cannot express at all.
+      expect(motif.chains).toEqual(["XXXXXMKVLATGGXXXXX"]);
+      expect(motif.hold).toEqual([5, 6, 7, 8, 9, 10, 11, 12]);
+      expect(motif.chainIndex).toBe(0);
+      expect(motif.problems).toEqual([]);
+    });
+
+    // 🔴 `redesign` IS THE SEQUENCE AXIS MADE EDITABLE, and these two cases are
+    // the same flag used at two scales: the whole chain is inverse folding, part
+    // of one is an antibody's CDR.
+    it("frees a given span when it is marked redesign", () => {
+      const sequenceOf = (chain, first, last) => (chain === "A"
+        ? "MKVLATGGAWRECKLMNPQ".slice(0, last - first + 1) : null);
+      const inverse = chainsOf([{ kind: "segment", chain: "A", first: 1, last: 10,
+        redesign: true }], { sequenceOf });
+      expect(inverse.chains).toEqual(["MKVLATGGAW"]);
+      expect(inverse.hold).toEqual([]);
+      expect(inverse.chainIndex).toBe(0);
+
+      const cdr = chainsOf([
+        { kind: "segment", chain: "A", first: 1, last: 5 },
+        { kind: "segment", chain: "A", first: 6, last: 9, redesign: true },
+        { kind: "segment", chain: "A", first: 10, last: 14 },
+      ], { sequenceOf });
+      expect(cdr.hold).toEqual([0, 1, 2, 3, 4, 9, 10, 11, 12, 13]);
+      expect(cdr.problems).toEqual([]);
+    });
+
+    it("refuses a designed chain with every residue held", () => {
+      const sequenceOf = () => "MKVLA";
+      expect(chainsOf([{ kind: "segment", chain: "A", first: 1, last: 5 },
+        { kind: "generated", min: 0, max: 0 }], { sequenceOf }).problems)
+        .toContain("every residue of the designed chain is held,"
+          + " so there is nothing to design");
+    });
+
+    // 🔴 THE LOOP'S OWN OPENING MOVE IS PRESERVED for the ordinary case: a
+    // wholly designed chain is handed over EMPTY, which is what makes the loop
+    // draw its mostly-X starting sequence rather than being given a constant.
+    it("hands a wholly designed chain over empty, so the loop draws it", () => {
+      const plain = chainsOf([{ kind: "sequence", value: "MKVLA" }, { kind: "break" },
+        { kind: "generated", min: 12, max: 12 }]);
+      expect(plain.chains).toEqual(["MKVLA", ""]);
+      expect(plain.length).toBe(12);
+      expect(plain.hold).toEqual([]);
     });
 
     it("ignores a ligand, which is context and not a chain", () => {

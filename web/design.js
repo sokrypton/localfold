@@ -214,8 +214,20 @@ const paintJob = () => {
   // 114 residues long. Hunter is told about its chains instead.
   if (hunter) {
     const { chains, chainIndex, length } = chainsOf(spans, { sequenceOf: resolver() });
-    const described = chains.map((chain, index) => (index === chainIndex
-      ? `design ${length}` : `given ${chain.length}`)).join("  ·  ");
+    const { hold } = chainsOf(spans, { sequenceOf: resolver() });
+    const described = chains.map((chain, index) => {
+      if (index !== chainIndex) return `given ${chain.length}`;
+      // 🔴 THE DESIGNED CHAIN IS HANDED OVER EMPTY when every residue of it comes
+      // from a Design span - that is what makes the loop draw its own opening
+      // sequence - so its SIZE is the spans' total and not the string's length,
+      // which is zero. Reading the string here printed "design 0".
+      const total = chain.length === 0 ? length : chain.length;
+      // 🔴 AND HELD RESIDUES ARE PART OF THE DESCRIPTION: a 100-residue chain
+      // with 80 held is a 20-residue design, and "design 100" would be wrong by
+      // a factor of five.
+      return hold.length === 0 ? `design ${total}`
+        : `design ${total - hold.length} of ${total}, ${hold.length} held`;
+    }).join("  ·  ");
     contigLine.textContent = chains.length === 0 ? "" : described;
   } else {
     contigLine.textContent = contig.length === 0 ? "" : `${contig}    (${span} tokens)`;
@@ -385,7 +397,7 @@ const startHunt = async () => {
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
-  const { chains, chainKinds, ligandCodes, chainIndex, length, problems }
+  const { chains, chainKinds, ligandCodes, chainIndex, length, hold, problems }
     = chainsOf(spans, { sequenceOf: resolver() });
   if (problems.length > 0) {
     say(problems.join(" · "), true);
@@ -410,6 +422,7 @@ const startHunt = async () => {
       chainKinds,
       ligandCodes,
       chainIndex,
+      hold,
       folders: Array.from(folders.selectedOptions, (option) => option.value),
       designer: designerSelect.value,
       contents: contentsOf(spans),

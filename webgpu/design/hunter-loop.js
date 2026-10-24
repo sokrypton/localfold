@@ -138,6 +138,8 @@ export function withChain(chains, index, sequence) {
  * @param {boolean} [options.alanineBias=false]
  * @param {number} [options.alanineBiasStart=-0.5]
  * @param {number} [options.alanineBiasEnd=-0.1]
+ * @param {Iterable<number>} [options.hold] positions within the designed chain
+ *   to keep as they are, every cycle. See designChain() in ./mpnn-bridge.js.
  * @param {number} [options.seed=0]
  * @param {number} [options.run=0] carried onto every record, for the table
  * @param {AbortSignal} [options.signal]
@@ -199,6 +201,12 @@ export async function* runDesign(options) {
       const designed = await design(previous.pdb, {
         chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
         cycle, run,
+        // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
+        // caller's question and not the loop's: a framework, a motif, or
+        // nothing. The loop's only stake is that it is the same every cycle -
+        // held residues that moved between cycles would make the trajectory
+        // meaningless.
+        hold: options.hold,
       });
       sequence = designed.sequence;
       designScore = designed.score;

@@ -46,6 +46,8 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  * @param {number} [options.runs=1]
  * @param {number} [options.cycles=5]
  * @param {number} [options.length=75] the designed chain's length
+ * @param {Iterable<number>} [options.hold] positions within the designed chain
+ *   to keep as they are - a framework, a motif - every cycle
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -139,6 +141,7 @@ export async function hunt(options) {
       chains: chains.slice(), chainIndex, cycles, length, run, signal,
       temperature: options.temperature,
       omit: options.omit,
+      hold: options.hold,
       percentX: options.percentX,
       alanineBias: options.alanineBias,
       seed: (options.seed ?? 0) + run,
@@ -184,6 +187,7 @@ export async function hunt(options) {
           omit: context.omit,
           alanineBias: context.alanineBias,
           random: context.random,
+          hold: context.hold,
         });
       },
     });

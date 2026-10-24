@@ -53,12 +53,31 @@ WITH_LIGAND = [{"kind": "generated", "min": 60, "max": 60},
 # 🔴 ONE HUNT PER MODALITY, with the designer each must choose. The rule is the
 # reference's and lives in cpu/design/designers.js; what is checked here is that
 # the SPANS carry enough for it to fire.
+MOTIF = "GWSTELEKHR"
+FRAME_LEFT = "GWSTELEKHR"
+FRAME_RIGHT = "EGITNVEIRIDN"
+
 MODALITIES = [
-    ("unconditional", [{"kind": "generated", "min": 24, "max": 24}], "SolubleMPNN"),
+    ("unconditional", [{"kind": "generated", "min": 24, "max": 24}], "SolubleMPNN", None),
     ("ligand target", [{"kind": "generated", "min": 24, "max": 24}, {"kind": "break"},
-                       {"kind": "ligand", "code": "HEM"}], "LigandMPNN"),
+                       {"kind": "ligand", "code": "HEM"}], "LigandMPNN", None),
     ("nucleic target", [{"kind": "sequence", "value": "ATGCATGCATGC", "polymer": "dna"},
-                        {"kind": "break"}, {"kind": "generated", "min": 20, "max": 20}], "NA-MPNN"),
+                        {"kind": "break"}, {"kind": "generated", "min": 20, "max": 20}],
+     "NA-MPNN", None),
+    # 🔴 THE THREE CASES HELD RESIDUES UNLOCK, and the fourth element is what
+    # must SURVIVE in the designed sequence. That is the only assertion that
+    # catches a hold which is not holding: the run looks identical either way,
+    # and the first version of this returned the free residues alone - a
+    # 22-residue scaffold came back as its 12 designed ones.
+    ("motif scaffold", [{"kind": "generated", "min": 6, "max": 6},
+                        {"kind": "sequence", "value": MOTIF},
+                        {"kind": "generated", "min": 6, "max": 6}], "SolubleMPNN", MOTIF),
+    ("inverse folding", [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN",
+                          "redesign": True}], "SolubleMPNN", None),
+    ("antibody-style CDR", [{"kind": "sequence", "value": FRAME_LEFT},
+                            {"kind": "sequence", "value": "EELKEFLKK", "redesign": True},
+                            {"kind": "sequence", "value": FRAME_RIGHT}],
+     "SolubleMPNN", FRAME_LEFT + "|" + FRAME_RIGHT),
 ]
 
 # The target and binder a hunt runs on, as spans.
@@ -374,7 +393,7 @@ def main():
               document.getElementById('preset').dispatchEvent(new Event('change'));
               return 1;
             })()""")
-            for label, spans, designer in MODALITIES:
+            for label, spans, designer, survives in MODALITIES:
                 cdp.evaluate(ws, """(() => {
                   document.getElementById('method').value = 'hunter';
                   document.getElementById('method').dispatchEvent(new Event('change'));
@@ -391,6 +410,8 @@ def main():
                       rows: document.querySelectorAll('#results-body tr').length,
                       designer: document.getElementById('designer-note').textContent,
                       button: document.getElementById('hunt').textContent.trim(),
+                      last: [...document.querySelectorAll('#cycle-track > *')]
+                        .map((n) => n.textContent.trim().split(/\s+/)[1] ?? '').pop() ?? '',
                     })"""))
                     if case["failed"] or (case["button"] == "Hunt" and case["rows"] > 0):
                         break
@@ -403,6 +424,12 @@ def main():
                     bad.append(f"{label} drew {case['rows']} rows, expected cycle 0 and 1")
                 if designer not in case["designer"]:
                     bad.append(f"{label} chose the wrong designer: {case['designer']!r}")
+                if survives is not None and not case["failed"]:
+                    print(f"        designed: {case['last']}")
+                    for piece in survives.split("|"):
+                        if piece not in case["last"]:
+                            bad.append(f"{label} did not hold {piece!r}:"
+                                       f" the designed sequence is {case['last']!r}")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
         # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.
