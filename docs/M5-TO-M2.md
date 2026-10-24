@@ -309,3 +309,39 @@ Then the routine, once: `./metal/selftest/localfold-selftest`, `LOCALFOLD_LF_GEM
 If 5646656b's bench does not fail, the shapes or the 1.3x are wrong for the M2 - say which arm moved and by how much
 rather than widening the limit. And the plain `lf_gemm` bench's remaining 7% to base (13.4 against 12.5 ms) is still
 yours, if it is worth a bisect; the gate's baseline makes it visible from now on.
+
+---
+
+## 7. The M2's round two (2026-10-24)
+
+Apple M2 (`Apple8`, 10-core GPU), macOS 13.2.1, at `557cc712`.
+
+**Every ask, done.**
+- `6mrr-x12-monomer`: **79.17 pLDDT / 1.006 A** (pTM 0.2354, 169 s) - the fixed value, not the relpos bug's ~56. Recorded
+  in `metal/af2/gate-baseline.m2.json`.
+- `metal/bench/gate.py --write` recorded `bench-baseline.m2-10c.json`: plain whole 12.845 ms, e64 whole 23.096, plain
+  partial 12.912, plain small 0.248, e64 small 0.479. Re-run 0.99-1.01x.
+- **It catches 5646656b on every arm**: plain whole **13.88x**, e64 whole 2.51x, plain partial **13.06x**, plain small
+  **10.91x**, e64 small 3.15x. The shapes and the 1.3x are right for the M2; nothing to widen.
+- Selftest all passed, and all passed again under `LOCALFOLD_LF_GEMM_EXT=1`. Gates: AF2 7/7, ESMFold2 8/8, AF3 18/18.
+  `npm test` 1372/1373 (the untracked `tools/_fold_film.py`).
+
+**Found on a Pixel 9 over USB (Mali-G715, `arm / valhall`, Chrome 155, stock): the occupancy probe was elided.**
+`webgpu/runtime/occupancy.js` and `tools/gpu/probe-occupancy.js` timed `fma(value, 0.9999, 1e-7)` 65536 times and
+stored only when `id.x == 0u`. Mali's compiler sank the loop into that one invocation and folded the affine chain:
+6359 workgroups in **2.4 ms** (eleven trillion FMAs a second on a phone), so the plateau ran off the sweep and the
+width read **6359**. With a nonlinear step and a store no compiler can rule out, the same count is **133 ms** (~0.4 T/s,
+the part's ceiling) and the width **~40-150** (431 with only the store fixed - the chain's folding was the other 7x).
+The M2 never elided it: the shipped kernel's 6359 already took 169 ms, and its width is 112-157 either way, within
+this machine's drift. Fixed in both copies.
+
+It moved nothing measurable on the phone: AF3 int5 6MRR, 25 steps, two folds, alternated with `--occupancy=8192`
+against the measured width - **bit-identical (pLDDT 85.86870) and 24.2-24.5 s both ways**, peak 776 MiB. At 68 tokens
+the derivations land the same; a longer fold is where a width of 64 against 8192 could matter, not run.
+
+The phone otherwise: `shader-f16` under stock flags, subgroups 16 only (so every subgroup kernel declines and AF2's
+attention is `flash-registers-32-chunk16`), `maxStorageBuffersPerShaderStage` **8** (the spec floor),
+`maxComputeWorkgroupStorageSize` 32768, binding 2 GiB. AF3 folds at a clean backbone (N-CA 1.443, CA-CA 3.824).
+`probe-limits.js` **kills the GPU process** there ("Instance dropped in popErrorScope") rather than refusing: it holds
+twelve pair tensors at 1000 residues, ~5.7 GB, and Android takes the instance instead of returning out-of-memory - so
+the page's out-of-memory handling is not what a phone user meets.

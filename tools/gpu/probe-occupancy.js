@@ -26,10 +26,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // A dependent chain, so nothing here is elided and nothing is memory bound.
   var value = f32(id.x) * 1e-6 + 1.0;
   for (var step = 0u; step < 65536u; step += 1u) {
-    value = fma(value, 0.9999, 1e-7);
+    value = fma(value, value * 1e-9 + 0.9999, 1e-7);
   }
   // Written by one invocation only, so the store is not the measurement.
-  if (id.x == 0u) { sink[0] = value; }
+  // 🔴 NEITHER THE CHAIN NOR THE STORE MAY BE FOLDABLE, OR A COMPILER RUNS NONE OF IT.
+  // This read fma(value, 0.9999, 1e-7) and stored when id.x == 0u, and Mali's compiler
+  // (Pixel 9, Chrome 155) took both: the loop sank into the one invocation that stores it,
+  // and an affine chain has a closed form. 6359 workgroups timed 2.4 ms - eleven trillion
+  // FMAs a second on a phone - so the plateau ran off the end of the sweep and the width read
+  // 6359 where it is ~40-150. A nonlinear step and a store no compiler can rule out make it
+  // 133 ms there (~0.4 T/s, the part's ceiling); the M2 and the A100 never elided it, and the
+  // M2's width is unchanged by this (112-157 either way).
+  if (value == 12345.678) { sink[0] = value; }
 }`;
 
 const option = (args, name, fallback) => {
