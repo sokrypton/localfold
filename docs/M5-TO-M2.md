@@ -332,8 +332,9 @@ stored only when `id.x == 0u`. Mali's compiler sank the loop into that one invoc
 6359 workgroups in **2.4 ms** (eleven trillion FMAs a second on a phone), so the plateau ran off the sweep and the
 width read **6359**. With a nonlinear step and a store no compiler can rule out, the same count is **133 ms** (~0.4 T/s,
 the part's ceiling) and the width **~40-150** (431 with only the store fixed - the chain's folding was the other 7x).
-The M2 never elided it: the shipped kernel's 6359 already took 169 ms, and its width is 112-157 either way, within
-this machine's drift. Fixed in both copies.
+The M2 never elided it: the shipped kernel's 6359 already took 169 ms, and its width is 112-431 with either shader, within
+this machine's drift. Fixed in both copies. The page's own six-count measurement (`--no-prior`, AF3 6MRR) reads
+**64** on the M2 with the old shader twice and with the new one - unchanged where it was right.
 
 It moved nothing measurable on the phone: AF3 int5 6MRR, 25 steps, two folds, alternated with `--occupancy=8192`
 against the measured width - **bit-identical (pLDDT 85.86870) and 24.2-24.5 s both ways**, peak 776 MiB. At 68 tokens

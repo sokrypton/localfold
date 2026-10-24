@@ -35,8 +35,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // and an affine chain has a closed form. 6359 workgroups timed 2.4 ms - eleven trillion
   // FMAs a second on a phone - so the plateau ran off the end of the sweep and the width read
   // 6359 where it is ~40-150. A nonlinear step and a store no compiler can rule out make it
-  // 133 ms there (~0.4 T/s, the part's ceiling); the M2 and the A100 never elided it, and the
-  // M2's width is unchanged by this (112-157 either way).
+  // 133 ms there (~0.4 T/s, the part's ceiling); the M2 never elided it (the A100 is not
+  // re-measured), and the M2's width is unchanged by this (112-431 either way, its run-to-run drift).
   if (value == 12345.678) { sink[0] = value; }
 }`;
 
