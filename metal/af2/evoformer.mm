@@ -370,16 +370,29 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   half* xn = pairLn(msa, rows, C, Op + "/layer_norm_input", blk, "opm.xn", nextMsaNorm, blk, "ln.m");
-  OpmW opm = opmWeights(Op, blk, C, O);
-  half* lrt = scratch<half>("opm.left", rows * 2 * O);
-  half* lt = lrt; half* rt = lrt + O;
-  {
+  // the shallow form reads l | r interleaved, [s][i][l | r] from one GEMM (ldx 2 O); 🔴 THE STANDARD FORM READS EACH AS
+  // ITS OWN [s][(i, c)] MATRIX, i O + c, which the interleaved buffer is not (93890570 gave it that buffer: every fold
+  // with more than 128 rows read a mix of l and r - a 59-residue query at 8,076 rows pLDDT 96.2 -> 47.6), so past 128
+  // rows the two projections stay two GEMMs into two buffers
+  const bool merged = rowsN <= 128;
+  half* lt; half* rt;
+  if (merged) {
+    OpmW opm = opmWeights(Op, blk, C, O);
+    half* lrt = scratch<half>("opm.left", rows * 2 * O);
+    lt = lrt; rt = lrt + O;
     Gemm g{}; g.X = xn; g.tx = F16; g.W = opm.w2; g.tw = F16; g.Y = lrt; g.ty = F16; g.rows = rows;
     g.in = C; g.out = 2 * O; g.bias = opm.b2; g.label = "opm projection";
     gemm(g);
-  }
-  if (!ones) {
-    run1d("af2_scale_rows_h", rows * ((2 * O) >> 2), ScaleRowsHArgs{lrt, nullptr, msaMask, rows, (uint)(2 * O), 0});
+    if (!ones) run1d("af2_scale_rows_h", rows * ((2 * O) >> 2), ScaleRowsHArgs{lrt, nullptr, msaMask, rows, (uint)(2 * O), 0});
+  } else {
+    lt = scratch<half>("opm.left", rows * O); rt = scratch<half>("opm.right", rows * O);
+    for (int side = 0; side < 2; ++side) {
+      std::string w = Op + (side ? "/right_projection" : "/left_projection");
+      Gemm g{}; g.X = xn; g.tx = F16; g.W = PH(w + "/weights", blk); g.tw = F16; g.Y = side ? rt : lt; g.ty = F16; g.rows = rows;
+      g.in = C; g.out = O; g.bias = P(w + "/bias", blk); g.label = "opm projection";
+      gemm(g);
+    }
+    if (!ones) run1d("af2_scale_rows_h", rows * (O >> 2), ScaleRowsHArgs{lt, rt, msaMask, rows, (uint)O, 0});
   }
   // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
   static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
@@ -461,9 +474,9 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* m
   for (int i0 = 0; i0 < L; i0 += Bi) {
     int bi = std::min(Bi, L - i0);
     // (on the matrix units the product's epilogue stores it permuted - no Pm, no permute pass)
-    if (!gemmOpmPermuted(lt + (size_t)i0 * 2 * O, L * 2 * O, rt, L * 2 * O, X, bi, L, O, rowsN, down)) {
+    if (!gemmOpmPermuted(lt + (size_t)i0 * O, L * O, rt, L * O, X, bi, L, O, rowsN, down)) {
       half* Pm = scratch<half>("opm.P", (size_t)Bi * per);
-      { Gemm g{}; g.X = lt + (size_t)i0 * 2 * O; g.tx = F16; g.transX = true; g.ldx = L * 2 * O; g.W = rt; g.tw = F16; g.ldw = L * 2 * O; g.Y = Pm;
+      { Gemm g{}; g.X = lt + (size_t)i0 * O; g.tx = F16; g.transX = true; g.ldx = L * O; g.W = rt; g.tw = F16; g.ldw = L * O; g.Y = Pm;
         g.ty = F16; g.rows = (size_t)bi * O; g.in = rowsN; g.out = L * O; g.alpha = down; g.accFloat = true; g.label = "opm product";
         gemm(g); }
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
