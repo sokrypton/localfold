@@ -974,7 +974,8 @@ export class Bioemu2Gpu {
     // time): G as many as fit 64 MiB of group buffers - 10 at 68 tokens (measured: 128 MiB, all 16, 239.2 ms a call; 32 MiB 240.6; 16 MiB 241.2)
     const batchCond = this.options.batchConditioning !== false;
     const LAYERS = BIOEMU2.denoiserLayers;
-    const perLayer = T * (DT + 6 * DA + 6 * DT + 1920 + 2560) + (split ? (T + 1) * (DT + DA + 896 + 2 * 3584) : 0);
+    // (a layer's floats in the group buffers below - cin four rows of DT, gAQ two of 896 - or the groups pass the budget)
+    const perLayer = T * (4 * DT + 6 * DA + 6 * DT + 1920 + 2560) + (split ? (T + 1) * (DT + DA + 2 * 896 + 2 * 3584) : 0);
     const G = batchCond ? Math.max(1, Math.min(LAYERS, Math.floor((this.options.condGroupMiB ?? 96) * 2 ** 20 / 4 / perLayer))) : 0;
     const groupBufs = !batchCond ? null : {
       cin: o.buffer("cg.cin", 4 * G * T * DT), atom: o.buffer("cg.atom", G * T * 6 * DA), tok: o.buffer("cg.tok", G * T * 6 * DT),

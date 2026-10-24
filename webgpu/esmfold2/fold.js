@@ -925,8 +925,8 @@ export async function foldEsmfold2(device, options) {
       // pass that reads it, chunk by chunk, and the fold is at its fullest
       // exactly there - three pair-sized f32 tensors where two will do. See
       // prepare() in webgpu/esmfold2/diffusion.js for why the row chunking
-      // makes that safe. relPos stays in `held`, because it is now the
-      // conditioning and the sampler reads it at every step.
+      // makes that safe. And once the pair bias is built from it nothing reads
+      // it again, so prepare() hands it back through releaseRelPos below.
       weights: weights.denoiser, features, sInputs, pair, relPos, reuseRelPos: true,
       // 🔴 AND THE TRUNK'S PAIR IS DEAD ONCE THE CONDITIONING HAS READ IT. The
       // distogram head ran before the denoiser and nothing after the sampler

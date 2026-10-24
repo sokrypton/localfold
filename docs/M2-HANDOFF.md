@@ -91,7 +91,10 @@ export PATH="$HOME/sergey/.venv-localfold/bin:/opt/homebrew/bin:/usr/local/bin:$
 # 1. Native Metal self-test & gates
 bash metal/build.sh selftest bench af3 af2 ef2 bioemu2
 ./metal/selftest/localfold-selftest
-python3 metal/af2/gate.py
+# (the selftest sets LOCALFOLD_LN_EMIT=2 - lnSimd, a path an Apple7/8 fold does not take by default - unless it is set:
+#  run it a second time in the shipped mode, or the M2's default emitted-LayerNorm path goes unchecked)
+LOCALFOLD_LN_EMIT=1 ./metal/selftest/localfold-selftest
+python3 metal/af2/gate.py   # (and --write once: the 5caj-msa case has no M2 baseline yet, so it cannot fail there)
 python3 metal/ef2/gate.py
 python3 metal/af3/gate.py
 python3 tools/check-native-worker.py --offline --no-af3 --no-page

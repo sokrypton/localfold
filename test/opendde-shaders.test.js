@@ -28,16 +28,16 @@ const ATOM_SHAPE = {
 describe("the atom attention's mask bias", () => {
   const lineOf = (keyMaskedAtomAttention) => createAtomBlockShaders(
     "", { ...ATOM_SHAPE, keyMaskedAtomAttention },
-  ).attendFor(0).split("\n").find((line) => line.includes("let bias ="));
+  ).attendFor(0).split("\n").find((line) => /let bias0? =/.test(line));   // (two keys a lane: bias0 / bias1)
 
   it("is a PRODUCT under AlphaFold 3 - both padded, or no penalty", () => {
     const line = lineOf(false);
-    assert.match(line, /\(queries_mask\[query_index\] - 1\.0\) \* \(keys_mask\[key_index\] - 1\.0\)/);
+    assert.match(line, /\((q_mask|queries_mask\[query_index\]) - 1\.0\) \* \(keys_mask\[key_index0?\] - 1\.0\)/);
   });
 
   it("is a SUM under OpenDDE - either padded is enough", () => {
     const line = lineOf(true);
-    assert.match(line, /-1\.0e9 \* \(\(1\.0 - queries_mask\[query_index\]\) \+ /);
+    assert.match(line, /-1\.0e9 \* \(\(1\.0 - (q_mask|queries_mask\[query_index\])\) \+ /);
   });
 
   it("really does generate two different kernels", () => {

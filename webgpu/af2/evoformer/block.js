@@ -1023,7 +1023,7 @@ async function encodeGlobalAttention(
     shape.length, 1, 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  // ...FOUR ROWS A WORKGROUP now, not one thread an element; see the kernel.
+  // ...GLOBAL_ATTENTION_OUTPUT_ROWS (8) ROWS A WORKGROUP now, not one thread an element; see the kernel.
   const outputRows = Math.ceil((shape.sequences * shape.length) / GLOBAL_ATTENTION_OUTPUT_ROWS);
   const outputGrid = execution.rowGrid(outputRows);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],

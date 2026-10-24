@@ -505,7 +505,7 @@ async function encodeGlobalAttention(
   let grid = execution.linearGrid(shape.length * shape.sequences * headDim);
   execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
     grid[0], grid[1], 1, `${label}.kv`);
-  // ...ONE WORKGROUP A COLUMN, and four rows a workgroup for the output; see the two
+  // ...ONE WORKGROUP A COLUMN, and GLOBAL_ATTENTION_OUTPUT_ROWS (8) rows a workgroup for the output; see the two
   // generators in webgpu/af2/evoformer/block.js.
   execution.dispatch(encoder, queryPipeline, [normalized, mask, weights, parameters, query],
     shape.length, 1, 1, `${label}.query`);
