@@ -370,7 +370,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                   "the vector epilogue requires 16-row by 32-column multiple tiles");
     static_assert((EP & 64) == 0 || ((TM * TN == 8192 || TM * TN == 4096 || TM * TN == 2048) && (!metal::is_same_v<TACC, half> || (TM == 64 && TN == 128))),
                   "the emitted LayerNorm: 64 x 128, 32 x 128, 16 x 128, 32 x 256, or 16 x 256");
-    if constexpr (metal::is_same_v<TC, float> && metal::is_same_v<TACC, half>) {
+    // (the gated residual, 16384: a half tile - the only TC float / TACC half pair - or a float tile emitting the next
+    // adaLN, which has no other path: the float tile's own 16384 below stores and returns without emitting)
+    if constexpr (metal::is_same_v<TC, float> && (metal::is_same_v<TACC, half> || ((EP & 64) != 0 && TM == 64 && TN == 128)))
+    if (metal::is_same_v<TACC, half> || (g.epilogue & 16384)) {
       if constexpr (TM == 64 && TN == 128) {
         constexpr int NR = 4;
         const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
@@ -401,7 +404,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 float4 res = cv + v * gm;
                 if (g.aux2) res *= rm;
                 *(device float4*)(dp0 + i) = res;
-                if (hp0) *(device half4*)(hp0 + i) = half4(res);
+                if (hp0) *(device half4*)(hp0 + i) = lf_out4<half>(res);
               }
             }
           }
@@ -576,7 +579,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
               float4 res = cv + v * gm;
               if (g.aux2) res *= rm;
               *(device float4*)(dp0 + i) = res;
-              if (hp0) *(device half4*)(hp0 + i) = half4(res);
+              if (hp0) *(device half4*)(hp0 + i) = lf_out4<half>(res);
             }
           }
         }
@@ -615,7 +618,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           float4 res = cv + v * gm;
           if (g.aux2) res *= rm;
           *(device float4*)(dp0 + i) = res;
-          if (hp0) *(device half4*)(hp0 + i) = half4(res);
+          if (hp0) *(device half4*)(hp0 + i) = lf_out4<half>(res);
         }
       }
       return;
@@ -771,7 +774,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 float4 res = cv + v * gm;
                 if (g.aux2) res *= rm;
                 *(device float4*)(dp0 + i) = res;
-                if (hp0) *(device half4*)(hp0 + i) = half4(res);
+                if (hp0) *(device half4*)(hp0 + i) = lf_out4<half>(res);
               }
             }
           }
@@ -791,7 +794,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
           float4 res = cv + v * gm;
           if (g.aux2) res *= ((device const float*)g.aux2)[r];
           *(device float4*)(D + (ulong)i + (ulong)j * g.ldd) = res;
-          if (g.aux3) *(device half4*)((device half*)g.aux3 + (ulong)i + (ulong)j * g.ldd) = half4(res);
+          if (g.aux3) *(device half4*)((device half*)g.aux3 + (ulong)i + (ulong)j * g.ldd) = lf_out4<half>(res);
         }
         return;
       }
@@ -973,7 +976,10 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         return;
       }
     }
-    if constexpr ((TM % 16 == 0) && (TN % 32 == 0) && (TN >= 64 || TM >= 32) && (EP & 16) == 0) {
+    // (not at 128 rows: there the layout this assumes - a row a group of 4 elements, read off its first - is wrong, and
+    // 128 x 32 came out at relRMS 1.07 in the selftest; 128 is a multiple of 32, so no is_valid_element check caught
+    // it as it does 80 and 112. Those tiles take the per-element epilogue below)
+    if constexpr ((TM % 16 == 0) && (TN % 32 == 0) && (TN >= 64 || TM >= 32) && TM < 128 && (EP & 16) == 0) {
       if ((g.m & 3) == 0) {
         constexpr bool oneM = TM == 16 || TN == 256 || (TM == 32 && TN == 128);
         constexpr int CSTEP = oneM ? 64 : 32;

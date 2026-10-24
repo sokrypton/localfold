@@ -57,6 +57,8 @@ static void gemmCase(const char* what, size_t R, int K, int O, bool tx, bool tw,
 }
 
 int main() {
+  // (2: every emission path, lnSimd included, which an Apple7/8 fold does not take by default - so on an M1/M2 run it
+  // again with LOCALFOLD_LN_EMIT=1, the shipped mode; set, it is kept: overwrite 0)
   setenv("LOCALFOLD_LN_EMIT", "2", 0);
   setSource("selftest", PORT_SOURCE);
   printf("GEMM\n");
@@ -87,7 +89,13 @@ int main() {
     report("alpha, beta, bias, relu", relRms(ref, download(dY, R * O)), 1e-5);
     release(dX); release(dW); release(db); release(dY);
   }
-  for (auto [R, K, O] : std::vector<std::tuple<size_t, int, int>>{{16, 64, 64}, {32, 64, 64}, {196, 128, 256}, {80, 128, 512}, {80, 64, 2560}}) {
+  // (and every tile the row-grouped register epilogue now takes - TM 16..128 by TN 32..128, the rows not a multiple of
+  // 32 among them - which these five shapes reach only partly: n picks TM, m TN)
+  std::vector<std::tuple<size_t, int, int>> vecShapes{{16, 64, 64}, {32, 64, 64}, {196, 128, 256}, {80, 128, 512}, {80, 64, 2560}};
+  for (size_t R : {size_t(16), size_t(48), size_t(64), size_t(96), size_t(112), size_t(128)})
+    for (int O : {32, 64, 128, 768}) vecShapes.emplace_back(R, 128, O);
+  vecShapes.emplace_back(128, 128, 2560); vecShapes.emplace_back(128, 64, 3072);   // (128 x 64)
+  for (auto [R, K, O] : vecShapes) {
     auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), b = randv(O), Y0 = randv(R * O);
     std::vector<double> ref(R * O);
     for (size_t r = 0; r < R; ++r) for (int o = 0; o < O; ++o) {

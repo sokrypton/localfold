@@ -585,7 +585,9 @@ void* mapFile(const std::string& path, size_t* bytes) {
   // "Insufficient Memory" on its first command (a 49,364,992-byte shard, 3,013 pages exactly: every float32 folding
   // bundle of the released ESMFold2 died loading). So the span is anonymous zeroed memory with the file mapped over
   // its front: the tail page is ordinary memory, and nothing changes for a file that ends mid-page.
-  size_t page = (size_t)getpagesize(), n = ((size_t)st.st_size + 2 + page - 1) / page * page;
+  // (and 64 KB more, as every allocation has (newBufferWithLength n + 65536): a GEMM's tile reads past its operand's last
+  // row, and a tensor read straight from a mapping is an operand too - anonymous pages, address space only)
+  size_t page = (size_t)getpagesize(), n = ((size_t)st.st_size + 65536 + page - 1) / page * page;
   size_t filePages = ((size_t)st.st_size + page - 1) / page * page;
   void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (p != MAP_FAILED && filePages > 0 &&
@@ -705,6 +707,14 @@ void precompile() { D().precompile(); }
 // ---------------------------------------------------------------- GEMM
 int GEMM_EXTRA_EP = 0;
 namespace {
+// every pointer of a pointer-array GEMM's device array (ptrs) 16-byte aligned - the vector epilogue's float4 stores;
+// the array read back on the host (unified memory; pointerArray uploads it before the GEMM is encoded)
+bool ptrsAligned(uint64_t array, int batch) {
+  if (!array) return true;
+  const uint64_t* p = (const uint64_t*)host((const void*)array);
+  for (int z = 0; z < batch; ++z) if (p[z] % 16) return false;
+  return true;
+}
 // The matrix units' GEMM (gemm_tensor.metal): half operands, any output, every epilogue. LOCALFOLD_GEMM_TENSOR=0 keeps
 // lf_gemm (the control); read at every call, as the bench's arms set it.
 bool tensorWanted() {
@@ -723,7 +733,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // float, scales, and saturates on the store: halfProductScale)
   const bool scaledHalf = tc_ == F16 && accFloat && a.alpha != 1.f;
   // (the coupling combine, 32768, reads its product in float: a half tile rounds Z before a sum that cancels)
-  const bool hacc = !floatAcc && ((tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768))) || (a.epilogue & 16384));
+  // (the gated residual, 16384, too: d1778df5 summed its product in a half tile for ~1% of Boltz-2's diffusion, and the
+  // selftest's gate residual went 4.2e-8 -> 5.9e-5 of the whole residual - the update itself rounded before the add;
+  // LOCALFOLD_GATE_HALF_ACC=1 is that arm: 6MRR 5 x 200, 3.70 / 3.73 s float against 3.66 / 3.71 half)
+  static const bool gateHalf = getenv("LOCALFOLD_GATE_HALF_ACC") && atoi(getenv("LOCALFOLD_GATE_HALF_ACC")) != 0;
+  const bool hacc = !floatAcc && ((tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192 | 32768 | 16384))) || (gateHalf && (a.epilogue & 16384)));
   const bool tri = a.epilogue & 256;
   const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || !hacc) && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
@@ -767,7 +781,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
                      (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) &&
                      (tm == 64 || ((tm == 32 || tm == 16) && tn == 256) || (!(a.epilogue & 32768) && tm % 16 == 0 && tn % 32 == 0)) &&
                      a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
-                     (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0)
+                     (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0) && ptrsAligned(a.D, batch) &&
+                               (a.beta == 0.f || ptrsAligned(a.C, batch))
                              : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & (64 | 1048576)) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   const bool swigluReg = vecWanted && (a.epilogue & 128) && !(a.epilogue & ~(128 | 4)) &&
@@ -912,6 +927,8 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
 }
 }  // namespace
 static GemmArgs gemmArgs(const Gemm& g) {
+  // (the vector epilogue's float C in a pointer-array GEMM would be read at C + z sc, an address in the ARRAY)
+  if (g.ptrs && g.yinFloat) die("gemm: a float C (yinFloat) is not taken with a pointer array (ptrs)");
   GemmArgs a{};
   a.A = (uint64_t)g.W; a.B = (uint64_t)g.X; a.C = (uint64_t)(g.Yin ? g.Yin : g.Y); a.D = (uint64_t)g.Y;
   a.m = g.out; a.n = (int)g.rows; a.k = g.in;
@@ -1102,7 +1119,20 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
     a.lnOut2 = (uint64_t)lnOut2; a.lnScale2 = (uint64_t)lnScale2; a.lnOffset2 = (uint64_t)lnOffset2;
   }
   bool emitted = gemmRun(F16, F16, tp, a, 1, false, true, "opm output, normalised add");
-  return !lnOut || emitted;
+  // 🔴 ONCE THE ADD HAS RUN, TRUE: the callers read false as "nothing run" (core.h) and add the output again with their
+  // own GEMM - which they did wherever the epilogue declined the LayerNorm (LOCALFOLD_GEMM_TILE, an unaligned lnOut).
+  // So the declined norm is run here, over the rows just added, opmC channels each
+  if (lnOut && !emitted) {
+    const size_t nr = rows * (size_t)(out / opmC);
+    if (tp == F32) {
+      layerNorm((const float*)pair, lnOut, nr, opmC, lnScale, lnOffset, lnEps);
+      if (lnOut2) layerNorm((const float*)pair, lnOut2, nr, opmC, lnScale2, lnOffset2, lnEps);
+    } else {
+      layerNorm((const half*)pair, lnOut, nr, opmC, lnScale, lnOffset, lnEps);
+      if (lnOut2) layerNorm((const half*)pair, lnOut2, nr, opmC, lnScale2, lnOffset2, lnEps);
+    }
+  }
+  return true;
 }
 bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out,
                 float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,

@@ -457,7 +457,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               if (g.aux3) {
                 simdgroup_matrix<half, 8, 8> hm;
                 thread auto& h = hm.thread_elements();
-                h[0] = (half)r0; h[1] = (half)r1;
+                h[0] = (half)clamp(r0, -65504.f, 65504.f); h[1] = (half)clamp(r1, -65504.f, 65504.f);
                 simdgroup_store(hm, (device half*)g.aux3 + (ulong)j * g.ldd + i, (ulong)g.ldd);
               }
             }
@@ -475,7 +475,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               float2 res = cv + g.alpha * float2((float)e[0], (float)e[1]) * gm;
               if (g.aux2) res *= rm;
               *(device float2*)(dp0 + i) = res;
-              if (hp0) *(device half2*)(hp0 + i) = half2(res);
+              if (hp0) *(device half2*)(hp0 + i) = half2(clamp(res, -65504.f, 65504.f));
             }
           }
         }
@@ -613,7 +613,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             if (g.aux3) {
               simdgroup_matrix<half, 8, 8> hm;
               thread auto& h = hm.thread_elements();
-              h[0] = (half)o[0]; h[1] = (half)o[1];
+              h[0] = (half)clamp((float)o[0], -65504.f, 65504.f); h[1] = (half)clamp((float)o[1], -65504.f, 65504.f);
               simdgroup_store(hm, (device half*)g.aux3 + (ulong)j * g.ldd + i, (ulong)g.ldd);
             }
             continue;
@@ -681,7 +681,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               float res = lf_ldf(C + (ulong)ic + (ulong)jr * g.ldc) + v * gm;
               if (g.aux2) res *= ((device const float*)g.aux2)[r];
               lf_st(D, (ulong)ic + (ulong)jr * g.ldd, res);
-              if (g.aux3) ((device half*)g.aux3)[(ulong)ic + (ulong)jr * g.ldd] = (half)res;
+              if (g.aux3) ((device half*)g.aux3)[(ulong)ic + (ulong)jr * g.ldd] = (half)clamp(res, -65504.f, 65504.f);
               continue;
             }
             if (g.epilogue & 524288) {
