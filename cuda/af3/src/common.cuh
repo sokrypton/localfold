@@ -1372,7 +1372,8 @@ inline bool fp8Tensor() {
   }();
   return on;
 }
-template <class T> T* scratchNamed(const std::string& name, size_t n) {
+// (fatal false: a refusal returns null and leaves the slot empty, for a caller that can ask for less)
+template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal = true) {
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
     // (from the pool, stream-ordered - and freed only after the device is idle, as cudaFree was: the frame tap's
@@ -1391,6 +1392,7 @@ template <class T> T* scratchNamed(const std::string& name, size_t n) {
     if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) {     // (fragmented idle pages: trimmed, asked again)
       cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
     }
+    if (e != cudaSuccess && !fatal) { cudaGetLastError(); have = 0; return nullptr; }
     if (e != cudaSuccess) {
       size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
       size_t freeB, totalB; deviceMemInfo(&freeB, &totalB);
@@ -1466,13 +1468,13 @@ inline void zeroPlanePad(half* x, int L, int Lp, int C) {
   CK(cudaMemset2DAsync(x + L, (size_t)Lp * e, 0, (size_t)(Lp - L) * e, (size_t)C * Lp, STREAM));                // columns
   CK(cudaMemset2DAsync(x + (size_t)L * Lp, (size_t)Lp * Lp * e, 0, (size_t)(Lp - L) * Lp * e, (size_t)C, STREAM)); // rows
 }
-template <class T> T* scratch(const std::string& name, size_t n) {
+template <class T> T* scratch(const std::string& name, size_t n, bool fatal = true) {
   const char* family = sharedFamily(name, n * sizeof(T));
-  if (!family) return scratchNamed<T>(name, n);
+  if (!family) return scratchNamed<T>(name, n, fatal);
   const std::string slot = sharedSlot(name, family, n * sizeof(T));
   cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
   if (capturing != cudaStreamCaptureStatusNone) SLOT_CAPTURED.insert(SHARED_SLOT[name]);
-  return scratchNamed<T>(slot, n);
+  return scratchNamed<T>(slot, n, fatal);
 }
 
 // The process's end once its outputs are written: flushed first. (std::exit, not _exit: _exit measured no

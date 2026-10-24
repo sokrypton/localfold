@@ -397,6 +397,24 @@ static int foldMain(int argc, char** argv) {
   if (repl) sh::ON = false;
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
+  // OpenDDE folds past its trunk on its structural tokens, ~2 a residue, and that is the fold's peak, so it is asked
+  // too, before the trunk runs: the structural f32 pair and the refiner triangle's bf16 b (6 bytes a channel a
+  // structural pair) beside the trunk's f32 pair and its recycled bf16 one (6 a residue pair). Measured on a 40 GB A100:
+  // 1,836 residues (3,510 structural tokens) passed the trunk's own check and ran out in the refiner's triangle with
+  // 29.6 GB held outside the scratch - the structural pair 18.9, the trunk's two 7.8
+  if (doFold && M.flag("trunk.dialect.structuralTokens") && M.has("sbatch.tokens") && !getenv("LOCALFOLD_NO_FOLD_FITS")) {
+    const int ns = (int)M.meta("sbatch.tokens");
+    const double C = M.meta("trunk.embedder.pairChannels");
+    size_t f, t; deviceMemInfo(&f, &t);
+    for (auto& [name, slot] : SCRATCH) f += slot.second;
+    const double pairs = 6 * C * ((double)ns * ns + (double)tokens * tokens), spare = (double)t / 20;
+    if (pairs + spare > (double)f) {
+      const int most = (double)f > spare ? (int)(tokens * std::sqrt(((double)f - spare) / pairs)) : 0;
+      fprintf(stderr, "%d tokens do not fit this card: OpenDDE folds them on %d structural tokens, which needs ~%.1f GB "
+              "and %.1f GB is free - it folds up to ~%d tokens\n", tokens, ns, (pairs + spare) / 1e9, f / 1e9, most);
+      return 1;
+    }
+  }
   // several GPUs on a sharded pair: the diffusion runs whole on every rank (oneCardPast) where the fold would fit one
   // of them (asked before anything is allocated, so every rank answers alike) AND it is short or batches several
   // samples; else sharded - its tokens split over the ranks with one sample (diffusionTransformer), which on fences

@@ -1015,9 +1015,18 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
     size_t perRow = (size_t)np * C * 6, spare = f > t / 64 ? f - t / 64 : 0;
     width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
   }
-  B16* a = scratch<B16>("trib.abf", (size_t)width * np * C);
-  B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
-  half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
+  // ...and narrower where the card refuses that: the free memory counts the pool's idle pages, and pages idle among a
+  // stage's live buffers cannot be one block's - OpenDDE's refiner at 1,768 residues (3,384 structural tokens) on a
+  // 40 GB A100 sized 648 rows, 5.05 GB, where a cudaMalloc had 3.39 GB, and ran out
+  B16 *a, *prod; half* t2;
+  for (;; width = std::max(8, width / 2 / 8 * 8)) {
+    const bool last = width == 8;
+    a = scratch<B16>("trib.abf", (size_t)width * np * C, last);
+    prod = a ? scratch<B16>("trib.pbf", (size_t)width * np * C, last) : nullptr;
+    t2 = prod ? scratch<half>("trib.t2", (size_t)width * np * C, last) : nullptr;
+    if (t2) break;
+    releaseScratch({ "trib.abf", "trib.pbf", "trib.t2" });
+  }
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
   wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
