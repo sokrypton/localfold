@@ -3,6 +3,11 @@
 Written on the Apple M5 (`Apple10`, macOS 26) for whoever next works on the **Apple M2** (`Apple8`, 10-core GPU,
 16 GB). It covers the M5 pass `976a298d..bed4fb7d` (2026-10-21..23); the per-commit detail is in `git log`, not here.
 Section 5 is the M2's reply, section 6 the M5's answer to it (docs/M2-TO-M5.md) with the M2's next asks.
+
+> **M2, start at section 6's "Asks for the M2"** (2026-10-24, round two). Sections 1-4 are round one, which the M2
+> has done (section 5). New since then: `metal/bench/gate.py`, a GEMM speed gate a chip - record the M2's and keep it
+> in the routine for any `gemm.metal` change; AF2's `6mrr-x12-monomer` gate case (record it); and the Metal AF2
+> cross-chain relpos fix it caught.
 docs/M2-HANDOFF.md is the A100's earlier round-six handoff, a different pass.
 
 **Corrected since it was written** (the fixes after `bed4fb7d`; do not test the old behaviour):
@@ -230,12 +235,15 @@ Apple M5 (`Apple10`, 8-core GPU), macOS 26, stock Chrome flags for WebGPU. Arms 
 "not taken" lines are the three emitted LayerNorms `lf_gemm` does not emit by design (89e5e033). Gates: ESMFold2 8/8,
 AF3 18/18, AF2's six cases at baseline.
 
-**3B - the M5's control arm costs nothing.** `5e874012` (before the M2's commits) against HEAD, `TENSOR=0`, three rounds
-alternated, medians: bench plain `1024 66816 256` 11.94 / 11.88 ms, e64 13.94 / 13.71, partial tiles `1024 66850 256`
-11.91 / 11.92, `1024 1024 256` 0.218 / 0.214. The ports, four pairs, head / pre: AF2 68 1.017, AF2 255 1.010, ESMFold2
-68 1.044, ESMFold2 255 1.000, Boltz-2 1.004, BioEmu2 1.000 - the two above 1.01 from one slow first HEAD run each, the
-rest of their runs level. The per-row 8 x 8 store `5a48c897` removed was worth nothing on the M5 either: nothing to
-bring back behind a define.
+**3B - the M5's control arm: the kernels level, the ports within 1.5%.** `5e874012` (before the M2's commits) against
+HEAD, `TENSOR=0`, three rounds alternated, medians: bench plain `1024 66816 256` 11.94 / 11.88 ms, e64 13.94 / 13.71,
+partial tiles `1024 66850 256` 11.91 / 11.92, `1024 1024 256` 0.218 / 0.214. The ports, four pairs each, pre / HEAD in
+ms: AF2 255 8815-9132 / 8797-9320 (median ratio 1.010), ESMFold2 255 9396-9566 / 9435-9821 (1.000), Boltz-2 4772-4777
+/ 4786-4800 after one 5870 (1.004), BioEmu2 16209-16903 / 16377-16912 (1.000); at 68 residues HEAD's first run was slow
+each time (AF2 756, ESMFold2 1081) and its other three sat **1.4% and 0.7% above** pre (AF2 574-576 against 565-568,
+ESMFold2 752-807 against 745-749). Small and on the M5's control arm only - nothing ships on it - but not nothing. The
+per-row 8 x 8 store `5a48c897` removed showed nothing on the bench's partial tiles: nothing to bring back behind a
+define.
 
 **3C - built one, ruled out the other.**
 1. **`metal/bench/gate.py`**: the bench's plain and e64 arms at the shapes that showed both regressions (whole tiles,
@@ -290,6 +298,13 @@ git worktree add ../lf-bad 5646656b && (cd ../lf-bad && bash metal/build.sh benc
 python3 metal/bench/gate.py --bench=$PWD/../lf-bad/metal/bench/localfold-bench    # expect FAIL, ~15x
 git worktree remove --force ../lf-bad
 ```
+
+(On the M5, 5646656b's bench runs under `--bench=` and passes - the M5 never felt it, which is the point; and a fake
+bench at 2x fails every arm, exit 1. So the gate's mechanics are checked; whether its shapes catch the M2's problem
+is the M2's to show.)
+
+Then the routine, once: `./metal/selftest/localfold-selftest`, `LOCALFOLD_LF_GEMM_EXT=1 ./metal/selftest/localfold-selftest`
+(the e64 kernels stay correctness-tested on Apple8), the three answer gates, `python3 metal/bench/gate.py`.
 
 If 5646656b's bench does not fail, the shapes or the 1.3x are wrong for the M2 - say which arm moved and by how much
 rather than widening the limit. And the plain `lf_gemm` bench's remaining 7% to base (13.4 against 12.5 ms) is still
