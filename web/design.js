@@ -76,13 +76,14 @@ const contentsOf = (spans) => ({
 // Declaration order is part of this file's behaviour, so the lookups do not
 // move below the functions that read them.
 const method = element("method");
-const methodNote = element("method-note");
 const status = element("status-message");
 const progress = element("progress");
 const huntButton = element("hunt");
+// 🔴 THE LABEL IS A <span> INSIDE THE BUTTON, beside its icon: writing to the
+// button's own textContent would delete the icon with it.
+const huntLabel = huntButton.querySelector("span");
 const resultsBox = element("results");
 const resultsBody = element("results-body");
-const trackBox = element("cycle-track-container");
 const track = element("cycle-track");
 
 // 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
@@ -241,8 +242,36 @@ const paintJob = () => {
 
 window.__designSpans = spanList;
 
+/**
+ * The folder chips, which are what a reader actually touches.
+ *
+ * 🔴 THE <select> STAYS THE STATE, so nothing downstream changes: web/hunt.js
+ * reads `selectedOptions`, and the page gate sets `option.selected` and fires a
+ * change. The chips only mirror it. A control that is the only one on the strip
+ * three rows tall, whose selection greys like a disabled field, is the thing
+ * this pass was for.
+ */
+const folderChips = element("folder-chips");
+
+const paintFolderChips = () => {
+  folderChips.replaceChildren();
+  for (const option of folders.options) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `design-chip${option.selected ? " design-chip-on" : ""}`;
+    chip.textContent = option.textContent;
+    chip.setAttribute("aria-pressed", option.selected ? "true" : "false");
+    chip.addEventListener("click", () => {
+      option.selected = !option.selected;
+      folders.dispatchEvent(new Event("change"));
+    });
+    folderChips.append(chip);
+  }
+};
+
 designerSelect.addEventListener("change", () => paintDesignerNote(spanList.read()));
-folders.addEventListener("change", paintFolderNote);
+folders.addEventListener("change", () => { paintFolderChips(); paintFolderNote(); paintMethod(); });
+paintFolderChips();
 paintFolderNote();
 
 /**
@@ -255,35 +284,66 @@ paintFolderNote();
  * because RFD4 generates structure directly rather than folding and redesigning
  * in a loop - so there is no cycle, no designer, and no folding model.
  */
-const HUNTER_ONLY = {
-  designerGroup: "RFD4-Proteina writes its own sequence; there is no separate designer.",
-  folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
-  scheduleGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
+const UNUSED_BY = {
+  hunter: {
+    // 🔴 STEPS IS RFD4's FLOW, NOT A SCHEDULE. It was left live on both methods
+    // for several passes, where it did nothing at all on a hunt - a control
+    // that silently does nothing is exactly what the rest of this map exists to
+    // prevent.
+    stepsGroup: "Protein Hunter has no flow to step through; its schedule is Cycles and Runs.",
+  },
+  rfd4p: {
+    designerGroup: "RFD4-Proteina writes its own sequence; there is no separate designer.",
+    folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
+    cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
+    runsGroup: "RFD4-Proteina generates once; run it again for another sample.",
+    temperatureGroup: "RFD4-Proteina does not sample a sequence with a temperature.",
+    omitGroup: "RFD4-Proteina has no designer to forbid letters to.",
+  },
+};
+
+/**
+ * 🔴 THE METHOD'S DESCRIPTION IS THE RESTING STATUS LINE, not a note under the
+ * picker. index.html does the same with "Ready. Paste a sequence and press
+ * Fold." - the one place a reader already looks for what the page is about to
+ * do, and one fewer block of prose in the panel.
+ */
+const RESTING = {
+  hunter: "Folds a mostly-X sequence, redesigns it on the hallucinated backbone, and folds again."
+    + " Press Hunt.",
+  rfd4p: "Generates all-atom structure in one pass. The first run downloads ~420 MB of weights."
+    + " Press Generate.",
 };
 
 const paintMethod = () => {
   const hunter = method.value === "hunter";
-  methodNote.textContent = hunter
-    ? "Folds a mostly-X sequence, redesigns on the hallucinated backbone, and re-folds. Needs a folding model."
-    : "Generates all-atom structure by flow matching, in one pass. Its weights are ~420 MB and"
-      + " download on the first generation.";
-  methodNote.classList.toggle("warn", !hunter);
+  if (running === null) say(RESTING[method.value] ?? "");
   // 🔴 THE BUTTON SAYS WHICH MACHINE IT STARTS. "Hunt" is the loop; RFD4
   // generates in one pass and calling that a hunt would misdescribe it.
-  if (running === null) huntButton.textContent = hunter ? "Hunt" : "Generate";
+  if (running === null) huntLabel.textContent = hunter ? "Hunt" : "Generate";
   paintJob();
-  for (const [id, why] of Object.entries(HUNTER_ONLY)) {
+  // 🔴 BOTH DIRECTIONS, from one map. Every group either method cannot use is
+  // greyed WITH ITS REASON and never removed - a control that vanishes when the
+  // method changes teaches nothing and makes the reader hunt for it again.
+  const unusable = UNUSED_BY[method.value] ?? {};
+  for (const id of new Set([...Object.keys(UNUSED_BY.hunter), ...Object.keys(UNUSED_BY.rfd4p)])) {
     const group = document.getElementById(id);
     if (group === null) continue;
-    group.classList.toggle("unavailable", !hunter);
-    for (const control of group.querySelectorAll("select, input, button")) control.disabled = !hunter;
+    const why = unusable[id];
+    group.classList.toggle("unavailable", why !== undefined);
+    for (const control of group.querySelectorAll("select, input, button")) {
+      control.disabled = why !== undefined;
+    }
+    for (const chip of group.querySelectorAll(".design-chip")) {
+      chip.disabled = why !== undefined;
+    }
     let reason = group.querySelector(".unavailable-reason");
     if (reason === null) {
       reason = document.createElement("div");
       reason.className = "option-note unavailable-reason";
       group.append(reason);
     }
-    reason.textContent = hunter ? "" : why;
+    reason.textContent = why ?? "";
   }
 };
 
@@ -318,7 +378,6 @@ if (navigator.gpu === undefined) {
  */
 const drawCycle = (record) => {
   resultsBox.style.display = "";
-  trackBox.style.display = "";
 
   const row = document.createElement("tr");
   // 🔴 THE PREVIOUS BEST ROW HAS TO BE UN-MARKED, because the loop decides
@@ -410,7 +469,7 @@ const startHunt = async () => {
   }
   const controller = new AbortController();
   running = controller;
-  huntButton.textContent = "Stop";
+  huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
   // A new hunt is a new object: the atom count changes with the binder's
@@ -481,7 +540,7 @@ const startHunt = async () => {
     }
   } finally {
     running = null;
-    huntButton.textContent = method.value === "hunter" ? "Hunt" : "Generate";
+    huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
   }
 };
 
@@ -766,7 +825,7 @@ const startGenerate = async () => {
   }
   const controller = new AbortController();
   running = controller;
-  huntButton.textContent = "Stop";
+  huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
   viewer.cancelAnimations();
@@ -816,7 +875,7 @@ const startGenerate = async () => {
     }
   } finally {
     running = null;
-    huntButton.textContent = method.value === "hunter" ? "Hunt" : "Generate";
+    huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
   }
 };
 

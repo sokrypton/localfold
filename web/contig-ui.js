@@ -518,6 +518,10 @@ export function createContigList(rowsContainer, addButton, options = {}) {
   const methodOf = options.method ?? (() => "rfd4p");
   let spans = (options.initial ?? [emptySpan("generated")]).map((span) => ({ ...span }));
 
+  // Which rows have their extras open. Kept outside `spans` because it is about
+  // looking, not about the job: a disclosure is not part of what gets designed.
+  const open = new Set();
+
   const draw = () => {
     const limits = METHOD_LIMITS[methodOf()] ?? {};
     rowsContainer.replaceChildren();
@@ -543,137 +547,133 @@ export function createContigList(rowsContainer, addButton, options = {}) {
       row.append(picker);
 
       const fields = element("div", "contig-fields");
+      const extras = element("div", "contig-more");
       const bind = (input, key, transform = (value) => value) => {
         input.addEventListener("input", () => {
           spans[index] = { ...spans[index], [key]: transform(input.value) };
-          // 🔴 THE CONTIG LINE UPDATES ON EVERY KEYSTROKE, but the rows are NOT
-          // redrawn - redrawing steals focus mid-number and the caret jumps to
-          // the end of the field.
+          // The summary updates on every keystroke; the ROWS are not redrawn,
+          // because redrawing steals focus mid-number and the caret jumps.
           notify(read());
         });
       };
-
-      if (span.kind === "generated") {
-        const from = element("input", "entity-value contig-number");
-        from.type = "number";
-        from.min = "1";
-        from.value = String(span.min ?? 75);
-        from.title = "How many residues to design. The shortest, if you give a range.";
-        bind(from, "min", (value) => number(value, 1));
-        const to = element("input", "entity-value contig-number");
-        to.type = "number";
-        to.min = "1";
-        to.value = String(span.max ?? span.min ?? 75);
-        to.title = "The longest. Leave it equal to design exactly one length.";
-        bind(to, "max", (value) => number(value, 1));
-        const name = element("input", "entity-value contig-name");
-        name.value = String(span.name ?? "");
-        name.placeholder = "h1";
-        name.title = "A label for this span, so a condition can name it. Letters and digits.";
-        bind(name, "name", (value) => value.trim());
-        const secondary = element("select", "entity-picker");
-        secondary.title = "Ask RFD4-Proteina for this span's secondary structure. Needs a label.";
-        for (const [key, label] of Object.entries(SPAN_STRUCTURES)) {
+      const pick = (title, options, key, selected) => {
+        const control = element("select", "entity-picker");
+        control.title = title;
+        for (const [value, label] of options) {
           const option = element("option", undefined, label);
-          option.value = key;
-          option.selected = (span.secondary ?? "") === key;
-          secondary.append(option);
+          option.value = value;
+          option.selected = value === selected;
+          control.append(option);
         }
-        secondary.addEventListener("change", () => {
-          spans[index] = { ...spans[index], secondary: secondary.value };
+        control.addEventListener("change", () => {
+          spans[index] = { ...spans[index], [key]: control.value };
           changed();
         });
-        fields.append(element("span", "contig-label", "residues"), from,
+        return control;
+      };
+      const text = (className, value, placeholder, title, key, transform) => {
+        const control = element("input", `entity-value ${className}`);
+        control.value = String(value ?? "");
+        if (placeholder !== undefined) control.placeholder = placeholder;
+        control.title = title;
+        bind(control, key, transform);
+        return control;
+      };
+
+      if (span.kind === "generated") {
+        const from = text("contig-number", span.min ?? 75, undefined,
+          "How many residues to design. The shortest, if you give a range.",
+          "min", (value) => number(value, 1));
+        from.type = "number";
+        from.min = "1";
+        const to = text("contig-number", span.max ?? span.min ?? 75, undefined,
+          "The longest. Leave it equal to design exactly one length.",
+          "max", (value) => number(value, 1));
+        to.type = "number";
+        to.min = "1";
+        fields.append(element("span", "contig-label", "design"), from,
           element("span", "contig-label", "to"), to,
-          element("span", "contig-label", "as"), name, secondary);
+          element("span", "contig-label", "residues"));
         if (number(span.max, 0) !== number(span.min, 0) && limits.range !== undefined) {
           row.classList.add("contig-row-unavailable");
-          fields.append(element("div", "option-note warn contig-reason", limits.range));
+          extras.append(element("div", "option-note warn contig-reason", limits.range));
         }
-      } else if (span.kind === "segment") {
-        const chain = element("input", "entity-value contig-chain");
-        chain.value = String(span.chain ?? "A");
-        chain.maxLength = 4;
-        chain.title = "Which chain of the loaded structure.";
-        bind(chain, "chain", (value) => value.trim());
-        const first = element("input", "entity-value contig-number");
-        first.type = "number";
-        first.value = String(span.first ?? 1);
-        first.title = "First residue, by the structure's own numbering.";
-        bind(first, "first", (value) => number(value, 1));
-        const last = element("input", "entity-value contig-number");
-        last.type = "number";
-        last.value = String(span.last ?? 100);
-        last.title = "Last residue, inclusive.";
-        bind(last, "last", (value) => number(value, 1));
-        const hotspots = element("input", "entity-value contig-hotspots");
-        hotspots.value = String(span.hotspots ?? "");
-        hotspots.placeholder = "54 56 66";
-        hotspots.title = "Residues of this chain the design should sit against - an epitope."
-          + " RFD4-Proteina conditions on them; Protein Hunter has no equivalent.";
-        bind(hotspots, "hotspots", (value) => value.trim());
-        fields.append(element("span", "contig-label", "chain"), chain,
-          element("span", "contig-label", "residues"), first,
-          element("span", "contig-label", "to"), last,
-          element("span", "contig-label", "hotspots"), hotspots);
-        if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
+        extras.append(element("span", "contig-label", "label"),
+          text("contig-name", span.name, "h1",
+            "A label, so a condition can name this span. Letters and digits.", "name",
+            (value) => value.trim()),
+          pick("Ask for this span's secondary structure. Needs a label.",
+            Object.entries(SPAN_STRUCTURES), "secondary", span.secondary ?? ""),
+          pick("What this span is made of.",
+            [["protein", "protein"], ["rna", "RNA"], ["dna", "DNA"]],
+            "polymer", span.polymer ?? "protein"));
+        if (String(span.name ?? "").trim().length > 0 && limits.labelled !== undefined) {
           row.classList.add("contig-row-unavailable");
-          fields.append(element("div", "option-note warn contig-reason", limits.hotspots));
+          extras.append(element("div", "option-note warn contig-reason", limits.labelled));
         }
       } else if (span.kind === "sequence") {
         const value = element("textarea", "entity-value contig-sequence");
         value.value = String(span.value ?? "");
-        value.rows = 2;
+        value.rows = 1;
         value.spellcheck = false;
-        value.placeholder = "the chain's one-letter sequence";
+        value.placeholder = "one-letter sequence";
         value.title = "A chain whose sequence you know. Protein Hunter folds it.";
-        bind(value, "value", (text) => text.replace(/\s+/g, "").toUpperCase());
-        const polymer = element("select", "entity-picker");
-        polymer.title = "What this chain is. A nucleic chain folds one token per base.";
-        for (const [key, label] of [["protein", "protein"], ["dna", "DNA"], ["rna", "RNA"]]) {
-          const option = element("option", undefined, label);
-          option.value = key;
-          option.selected = (span.polymer ?? "protein") === key;
-          polymer.append(option);
-        }
-        polymer.addEventListener("change", () => {
-          spans[index] = { ...spans[index], polymer: polymer.value };
-          changed();
-        });
-        fields.append(polymer, value);
+        bind(value, "value", (raw) => raw.replace(/\s+/g, "").toUpperCase());
+        fields.append(value);
         if (limits.sequence !== undefined) {
           row.classList.add("contig-row-unavailable");
-          fields.append(element("div", "option-note warn contig-reason", limits.sequence));
+          extras.append(element("div", "option-note warn contig-reason", limits.sequence));
+        }
+      } else if (span.kind === "segment") {
+        const chain = text("contig-chain", span.chain ?? "A", undefined,
+          "Which chain of the loaded structure.", "chain", (value) => value.trim());
+        chain.maxLength = 4;
+        const first = text("contig-number", span.first ?? 1, undefined,
+          "First residue, by the structure's own numbering.", "first",
+          (value) => number(value, 1));
+        first.type = "number";
+        const last = text("contig-number", span.last ?? 100, undefined,
+          "Last residue, inclusive.", "last", (value) => number(value, 1));
+        last.type = "number";
+        fields.append(element("span", "contig-label", "chain"), chain,
+          element("span", "contig-label", "residues"), first,
+          element("span", "contig-label", "to"), last);
+        const hotspots = text("contig-hotspots", span.hotspots, "54 56",
+          "Residues of this chain the design should sit against - an epitope.",
+          "hotspots", (value) => value.trim());
+        extras.append(element("span", "contig-label", "hotspots"), hotspots);
+        if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
+          row.classList.add("contig-row-unavailable");
+          extras.append(element("div", "option-note warn contig-reason", limits.hotspots));
         }
       } else if (span.kind === "ligand") {
-        const code = element("input", "entity-value contig-code");
-        code.value = String(span.code ?? "");
+        const code = text("contig-code", span.code, "SAM",
+          "The ligand's CCD code, as the PDB names it.", "code",
+          (value) => value.trim().toUpperCase());
         code.maxLength = 5;
-        code.placeholder = "SAM";
-        code.title = "The ligand's CCD code, as the PDB names it.";
-        bind(code, "code", (value) => value.trim().toUpperCase());
-        fields.append(element("span", "contig-label", "code"), code);
+        fields.append(element("span", "contig-label", "ligand"), code);
         if (limits.ligand !== undefined) {
           row.classList.add("contig-row-unavailable");
-          fields.append(element("div", "option-note warn contig-reason", limits.ligand));
+          extras.append(element("div", "option-note warn contig-reason", limits.ligand));
         }
       } else {
         fields.append(element("span", "contig-label contig-break",
           "everything below is a separate chain"));
       }
-      // 🔴 THE SEQUENCE AXIS AS ONE CHECKBOX, on both given kinds. Held is the
-      // default because a given span usually IS the thing being designed
-      // against; unticked it is a framework or a motif, ticked it keeps its
-      // place and length and lets the designer rewrite its letters. That one
-      // box is what makes inverse folding and an antibody's CDRs expressible.
+
+      // The extras both given kinds share: what it is made of, what is modified
+      // in it, and whether the designer may rewrite it.
       if (span.kind === "sequence" || span.kind === "segment") {
-        const modified = element("input", "entity-value contig-modified");
-        modified.value = String(span.modifications ?? "");
-        modified.placeholder = "16:SEP";
-        modified.title = "Modified residues in this span, as position:code - 16:SEP for a"
-          + " phosphoserine at its 16th residue. Positions are 1-based within the span.";
-        bind(modified, "modifications", (value) => value.trim());
-        fields.append(element("span", "contig-label", "modified"), modified);
+        if (span.kind === "sequence") {
+          extras.append(element("span", "contig-label", "is"),
+            pick("What this chain is. A nucleic chain folds one token per base.",
+              [["protein", "protein"], ["dna", "DNA"], ["rna", "RNA"]],
+              "polymer", span.polymer ?? "protein"));
+        }
+        extras.append(element("span", "contig-label", "modified"),
+          text("contig-modified", span.modifications, "16:SEP",
+            "Modified residues, as position:code. Positions are 1-based within the span.",
+            "modifications", (value) => value.trim()));
 
         const redesign = element("label", "contig-redesign");
         const box = element("input");
@@ -685,23 +685,55 @@ export function createContigList(rowsContainer, addButton, options = {}) {
           changed();
         });
         redesign.append(box, element("span", undefined, "redesign"));
-        fields.append(redesign);
+        extras.append(redesign);
       }
       row.append(fields);
 
-      const remove = element("button", "entity-remove", "×");
+      // 🔴 THE DISCLOSURE CARRIES A DOT WHEN SOMETHING BEHIND IT IS SET, so a
+      // closed row still says it has a modification, a hotspot or a label. A
+      // folded control that hides a set value is how a job quietly stops being
+      // the job on screen.
+      const buttons = element("div", "contig-fields");
+      if (extras.childElementCount > 0) {
+        // 🔴 index.html's OWN BUTTON CLASSES, icon and all. Left as a bare
+        // <button> these came out as heavy dark boxes - the loudest thing on a
+        // row whose job is to be quiet - because nothing but a width was ever
+        // applied to them.
+        const disclose = element("button", "btn btn-grey btn-small contig-disclose");
+        disclose.type = "button";
+        disclose.innerHTML = '<i class="fa-solid fa-ellipsis"></i>';
+        disclose.title = open.has(index) ? "Fewer settings" : "More settings for this span";
+        disclose.setAttribute("aria-expanded", open.has(index) ? "true" : "false");
+        const set = [span.modifications, span.hotspots, span.name].some(
+          (value) => String(value ?? "").trim().length > 0)
+          || span.redesign === true
+          || (span.polymer !== undefined && span.polymer !== "protein");
+        if (set) disclose.dataset.set = "1";
+        disclose.addEventListener("click", () => {
+          if (open.has(index)) open.delete(index);
+          else open.add(index);
+          draw();
+        });
+        buttons.append(disclose);
+      }
+
+      const remove = element("button", "btn btn-grey btn-small entity-remove");
       remove.type = "button";
+      remove.innerHTML = '<i class="fa-solid fa-xmark"></i>';
       remove.title = "Remove this span";
-      // 🔴 THE LAST SPAN CANNOT BE REMOVED. An empty list is a job that cannot
-      // run, and a list with no rows also has no way to add the first one back
-      // that is obvious from looking at it.
+      remove.setAttribute("aria-label", "Remove this span");
+      // The last span cannot go: an empty list is a job that cannot run, and
+      // offers no obvious way to add the first one back.
       remove.disabled = spans.length === 1;
       remove.addEventListener("click", () => {
         spans.splice(index, 1);
+        open.clear();
         changed();
       });
-      row.append(remove);
+      buttons.append(remove);
+      row.append(buttons);
 
+      if (open.has(index) && extras.childElementCount > 0) row.append(extras);
       rowsContainer.append(row);
     }
   };

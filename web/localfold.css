@@ -1231,44 +1231,202 @@
 }
 
 /* ---------------------------------------------------------------------------
-   design.html (Protein Hunter)
+   design.html — the design page
 
-   🔴 ONLY WHAT THAT PAGE INTRODUCES. Its target list, its option groups and
-   its containers are py2Dmol's own classes and index.html's, so they are not
-   restated here; what follows is the surfaces a design page needs and a fold
-   page has none of - a note under a control, a residue-role legend, and the
-   per-cycle table. Every selector is anchored to an id or a class this
-   project introduced, as the header of this file requires.
+   🔴 ONLY WHAT THIS PAGE INTRODUCES. Its head, its panel, its option strip and
+   its buttons are index.html's own classes, reused rather than restyled, so the
+   two pages stay the same page. What follows is the three surfaces a design page
+   needs and a fold page has none of: a span row, a line saying what the spans
+   amount to, and a per-cycle result.
    --------------------------------------------------------------------------- */
 
-/* What a control says underneath itself. The automatic designer's reason lives
-   here, and so does the folder count's advice: this page's rule is that a
-   choice the page made for you is a choice the page explains. */
+/* A SPAN ROW. Three grid tracks and exactly three children whatever the kind,
+   for the reason .entity-row's own note gives: a grid with more children than
+   tracks does not overflow, it WRAPS onto an implicit second row, which
+   tools/mobile-layout.py reports as a row broken across two lines. The per-kind
+   fields live inside the middle child.
+
+   🔴 AND THE LIST NEEDS THE PANEL'S FULL WIDTH. With the structure and preset
+   controls beside it the list computed to 248px, the middle track to 70, and
+   every row's fields wrapped into a column - the page read as rubble. Both now
+   sit in the option strip, which is what index.html's page-head note is about. */
+.contig-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+}
+
+/* One line, and it stays one line: the fields of a kind are few enough to fit,
+   and the two that are not - a sequence and its extras - get the row below. */
+.contig-fields {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The words between the controls. They carry the row's grammar: "residues 5 to
+   20" reads, three bare number boxes do not. */
+.contig-label {
+  font-size: 12px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+
+.contig-number { width: 6ch; padding: 6px 8px; text-align: right; }
+.contig-chain { width: 4ch; padding: 6px 8px; text-align: center; }
+.contig-code { width: 6ch; padding: 6px 8px; text-transform: uppercase; }
+.contig-name { width: 5ch; padding: 6px 8px; }
+.contig-hotspots { width: 9ch; padding: 6px 8px; }
+.contig-modified { width: 9ch; padding: 6px 8px; }
+
+/* A sequence is the one field that wants the room, so it takes what is left. */
+.contig-sequence {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 34px;
+  padding: 7px 10px;
+  resize: vertical;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
+/* A break has nothing to fill in, so its row says what it does instead. */
+.contig-break { font-style: italic; color: #9ca3af; }
+
+/* 🔴 THE EXTRAS ARE A SECOND LINE, REVEALED, NOT A WIDER ROW. A given span can
+   carry a polymer, modified residues, hotspots and a redesign toggle; inline
+   they pushed the sequence box down to five characters. Folded away, a row is
+   one line and the reader opens the one row they care about - which is the same
+   trick .entity-row plays with its own ⋮ popup. */
+.contig-more {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding-top: 2px;
+}
+
+/* The disclosure and the remove button are index.html's own, so a row's two
+   quietest controls look the way the fold page's do. */
+.contig-disclose { width: 34px; position: relative; }
+.contig-disclose[aria-expanded="true"] { color: #111827; box-shadow: inset 0 0 0 1px #d1d5db; }
+
+/* ...with a dot when something behind it is set, so a closed row still says it
+   carries a modification or a hotspot. The same signal .entity-options uses. */
+.contig-disclose[data-set]::after {
+  content: "";
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  margin: -10px 0 0 7px;
+  border-radius: 50%;
+  background: #3b82f6;
+}
+
+/* A span the chosen method cannot honour: marked, still present, carrying its
+   reason. Never display:none - a control that vanishes teaches nothing. */
+.contig-row-unavailable .entity-value,
+.contig-row-unavailable .entity-picker { border-color: #fbbf24; }
+.contig-reason { flex: 1 1 100%; }
+
+.contig-redesign {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #374151;
+  white-space: nowrap;
+}
+
+/* WHAT THE SPANS AMOUNT TO, between the list and the settings: the notation the
+   chosen method is actually asked in, and anything wrong with the job. */
+.design-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 8px 2px 0;
+}
+
+#contig-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: .02em;
+  color: #374151;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 3px 8px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+#contig-line:empty, #contig-problems:empty { display: none; }
+
+/* The structure control is three things on one line inside its group. */
+.design-structure { display: flex; align-items: center; gap: 6px; }
+.design-structure #structure-id { width: 7ch; }
+
+/* 🔴 THE FILE INPUT IS DRIVEN BY ITS LABEL, NOT SHOWN. A native file control
+   renders as a button plus a filename the browser truncates to "N…n" at this
+   width, which is both ugly and says nothing. The label is a button like the
+   others and the input is reachable by keyboard, so it is hidden from sight
+   rather than from the page. */
+.design-structure input[type="file"] {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.design-structure input[type="file"]:focus-visible + label { outline: 2px solid #3b82f6; }
+
+/* EVERYTHING THE PAGE DECIDED FOR YOU, in one short column under the strip
+   rather than four paragraphs threaded through it. */
+.design-notes { display: flex; flex-direction: column; gap: 2px; padding: 8px 2px 0; }
+.design-notes .option-note { max-width: none; }
+.design-notes .option-note:empty { display: none; }
+
+/* A control the chosen method cannot honour: greyed, still there, with its
+   reason. */
+#designOptions .fetch-option-group.unavailable > label,
+#designOptions .fetch-option-group.unavailable > .fetch-option-title { opacity: .45; }
+#designOptions .fetch-option-group.unavailable select,
+#designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
+.unavailable-reason { font-style: italic; }
+
+/* What a control says underneath itself. */
 .option-note {
   font-size: 12px;
   line-height: 1.4;
   color: #6b7280;
   margin-top: 4px;
-  max-width: 320px;
+  max-width: 420px;
 }
 
-/* 🔴 AMBER, NOT RED. A warning here means the hunt will still run and will
-   lose something - a designer that cannot see the ligand, five folders where
-   two measured better. Red is for a page that cannot proceed. */
+/* 🔴 AMBER, NOT RED. A warning here means the run will proceed and lose
+   something - a designer that cannot see the ligand, five folders where two
+   measured better. Red is for a page that cannot proceed. */
 .option-note.warn { color: #92400e; }
 
-#designer-note, #folder-note { min-height: 2.4em; }
-
-/* The residue roles, in the one place they are named in words. The swatches
-   are the same colours the sequence track and the 3D view use, so a residue
-   picked in one is recognisable in the other. */
+/* THE RESULTS. The roles are named beside them, because that is where they are
+   read - at the foot of the page they explained a picture nobody was looking
+   at. */
 #roles-legend .role-list {
   list-style: none;
-  margin: 6px 0 0;
+  margin: 0 0 10px;
   padding: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 16px;
+  gap: 4px 14px;
   font-size: 12px;
   color: #374151;
 }
@@ -1276,37 +1434,38 @@
 #roles-legend .role-list li { display: flex; align-items: center; gap: 6px; }
 
 .role-swatch {
-  width: 12px;
-  height: 12px;
+  width: 11px;
+  height: 11px;
   border-radius: 3px;
   border: 1px solid #d1d5db;
   flex: 0 0 auto;
 }
 
-/* Free is the page's background, so it reads as "nothing is holding this" and
-   the held roles are the ones that carry colour. */
+/* Free is the page's own background, so it reads as "nothing is holding this"
+   and the held roles are the ones that carry colour. */
 .role-free { background: #fff; }
 .role-fixed { background: #6b7280; }
 .role-tied { background: #3b82f6; }
 .role-motif { background: #a855f7; }
 .role-target { background: #e5e7eb; }
 
-/* One row a cycle. The binder's sequence in a monospace track at the same
-   measure as the sequence viewer on index.html, so the letters line up when
-   two cycles are read against each other. */
+/* One line a cycle, at the sequence viewer's measure so two cycles read against
+   each other. */
 #cycle-track {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   letter-spacing: .02em;
   overflow-x: auto;
-  margin-top: 6px;
+  margin-bottom: 10px;
 }
+
+#cycle-track:empty { display: none; }
+#cycle-track .best-line { font-weight: 500; }
 
 #results-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
-  margin-top: 6px;
 }
 
 #results-table th,
@@ -1318,149 +1477,73 @@
 }
 
 #results-table th { color: #6b7280; font-weight: 500; }
-
-/* The best cycle of the whole hunt. */
 #results-table tr.best td { background: #f0fdf4; font-weight: 500; }
 
-/* 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS NUMBER. The validity cell carries
-   the measurement that failed - a ring length, a count of base pairs - because
-   a verdict with the number removed is the thing this page exists not to do. */
+/* 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS NUMBER, because a verdict with the
+   measurement removed is the thing this page exists not to do. */
 #results-table tr.rejected td { color: #92400e; }
 #results-table td.validity { white-space: normal; }
 
-/* A control the chosen method cannot honour: greyed, still present, and
-   carrying its reason. 🔴 NOT display:none - a control that vanishes when the
-   method changes teaches the reader nothing and makes them look for it again. */
-#designOptions .fetch-option-group.unavailable > label,
-#designOptions .fetch-option-group.unavailable > .fetch-option-title { opacity: .45; }
-#designOptions .fetch-option-group.unavailable select,
-#designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
-.unavailable-reason { font-style: italic; }
+/* The folders a run rotates through, as chips: one line, and what is on is
+   plain without reading a scrollbar. */
+.design-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 
-/* The best cycle's line in the sequence track. Set and cleared as the leader
-   changes, since the loop decides `best` by mutating the record it marked
-   before and the page cannot see that happen. */
-#cycle-track .best-line { font-weight: 500; }
-
-/* ---------------------------------------------------------------------------
-   The contig editor (design.html): the job as a list of spans.
-
-   🔴 THREE GRID TRACKS AND EXACTLY THREE CHILDREN PER ROW, whatever the kind,
-   for the reason .entity-row's own note gives: a grid with more children than
-   tracks does not overflow, it WRAPS onto an implicit second row, and
-   tools/mobile-layout.py reports that as a row broken across two lines. The
-   per-kind fields therefore live inside the middle child.
-   --------------------------------------------------------------------------- */
-.contig-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 8px;
-  position: relative;
-}
-
-.contig-fields {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-/* The words between the fields. They carry the row's grammar - "residues 5 to
-   20" reads; three bare number boxes do not. */
-.contig-label {
-  font-size: 12px;
+.design-chip {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 13px;
+  background: #fff;
   color: #6b7280;
-  white-space: nowrap;
-}
-
-.contig-number { width: 7ch; padding: 8px; text-align: right; }
-.contig-chain { width: 5ch; padding: 8px; text-align: center; }
-.contig-code { width: 7ch; padding: 8px; text-transform: uppercase; }
-.contig-sequence { flex: 1 1 100%; min-width: 0; height: 52px; resize: vertical; }
-
-/* A break has nothing to fill in, so its row says what it does instead. */
-.contig-break { font-style: italic; }
-
-/* 🔴 A SPAN THE CHOSEN METHOD CANNOT HONOUR IS MARKED, NOT REMOVED - the same
-   rule as the option groups above. The row keeps working, because switching
-   method is one click and the span is still what the user meant. */
-.contig-row-unavailable .entity-value,
-.contig-row-unavailable .entity-picker { border-color: #fbbf24; }
-.contig-reason { flex: 1 1 100%; }
-
-.contig-foot {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-/* What the spans amount to, in RFdiffusion's notation. Monospace because it is
-   a notation, and selectable because it is worth copying into a script. */
-#contig-line {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  letter-spacing: .02em;
-  color: #374151;
-  background: #f9fafb;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  padding: 4px 8px;
-  min-width: 0;
-  overflow-x: auto;
-  white-space: nowrap;
+  line-height: 1;
+  cursor: pointer;
 }
 
-#contig-line:empty { display: none; }
+.design-chip:hover { border-color: #9ca3af; color: #111827; }
 
-#contig-problems:empty { display: none; }
-
-.contig-presets {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid #e5e7eb;
+/* 🔴 ON IS A FILLED CHIP, not a tinted row. The listbox this replaced showed
+   its selection as a grey highlight, which is what every disabled control on
+   the page also looks like. */
+.design-chip-on {
+  background: #eff6ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+  font-weight: 500;
 }
 
-.contig-presets label { font-size: 12px; color: #6b7280; }
-.contig-presets select { max-width: 100%; }
-#preset-note { flex: 1 1 100%; max-width: none; }
+/* 🔴 A CONTROL AS WIDE AS ITS CONTENT, NOT AS WIDE AS ITS COLUMN. Omit holds
+   one letter and Seed one digit, and both were stretching to fill the strip -
+   which pushed "Start from" onto a line of its own and made the settings read
+   as three ragged rows rather than one block. The groups still share the strip
+   evenly; it is the inputs inside them that stop growing. */
+#designOptions #omit { width: 8ch; }
+#designOptions #seed { width: 8ch; }
+#designOptions #temperature { width: 8ch; }
+#designOptions #cycles, #designOptions #runs, #designOptions #steps { width: 6ch; }
+#designOptions #preset { max-width: 260px; }
+#designOptions #designer { max-width: 180px; }
 
-/* The structure a `From structure` span refers to. */
-.contig-structure {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid #e5e7eb;
+/* Folders earns the room the others give back: seven chips on one line. */
+#folderGroup { flex: 1 1 auto; min-width: 0; }
+
+/* 🔴 A SPAN ROW STACKS ON A PHONE, because its first track is a select naming a
+   kind - "Given sequence" is 290px of a 390px screen, and at that width the
+   fields were squeezed to nothing and the two buttons overflowed the panel
+   entirely. The kind and the row's buttons keep line one; the fields take line
+   two, full width, which is the only place they fit. */
+@media (max-width: 640px) {
+  .contig-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 6px;
+  }
+
+  .contig-row > .entity-picker { grid-column: 1; grid-row: 1; min-width: 0; }
+  .contig-row > .contig-fields:last-of-type { grid-column: 2; grid-row: 1; }
+
+  /* The fields, and the extras when they are open, span the row below. */
+  .contig-fields:not(:last-of-type) { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
+  .contig-more { grid-column: 1 / -1; }
+
+  .contig-sequence { flex: 1 1 100%; }
 }
-
-.contig-structure label { font-size: 12px; color: #6b7280; }
-.contig-structure input[type="file"] { font-size: 12px; max-width: 100%; }
-#structure-note { flex: 1 1 100%; max-width: none; }
-
-/* The Redesign toggle on a given span: keep its place, rewrite its letters. */
-.contig-redesign {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: #374151;
-  white-space: nowrap;
-}
-
-/* The epitope residues a design should sit against. */
-.contig-hotspots { width: 11ch; padding: 8px; }
-
-/* Modified residues in a span, as position:code. */
-.contig-modified { width: 12ch; padding: 8px; }
-
-/* A generated span's label, the handle a condition selects it by. */
-.contig-name { width: 6ch; padding: 8px; }

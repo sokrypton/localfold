@@ -186,9 +186,13 @@ def main():
           const pick = document.getElementById("method");
           pick.value = "rfd4p";
           pick.dispatchEvent(new Event("change"));
-          const groups = ["designerGroup", "folderGroup", "scheduleGroup"];
+          const groups = ["designerGroup", "folderGroup", "cyclesGroup"];
           return JSON.stringify({
-            note: document.getElementById("method-note")?.textContent?.trim() ?? "",
+            // 🔴 THE METHOD'S DESCRIPTION IS THE RESTING STATUS LINE NOW, as
+            // index.html does with "Ready. Paste a sequence and press Fold." -
+            // one fewer block of prose in the panel, and the one place a reader
+            // already looks for what the page is about to do.
+            note: document.getElementById("status-message")?.textContent?.trim() ?? "",
             disabled: groups.filter((id) => {
               const g = document.getElementById(id);
               return g !== null && [...g.querySelectorAll("select, input")].every((c) => c.disabled);
@@ -205,7 +209,7 @@ def main():
         for key in ("disabled", "reasons", "stillThere"):
             if len(switched[key]) != 3:
                 bad.append(f"switching method: {key} covered {switched[key]}, expected all three groups")
-        if "flow matching" not in switched["note"] or "🔴" in switched["note"]:
+        if "one pass" not in switched["note"] or "🔴" in switched["note"]:
             # 🔴 AND THE REPO'S COMMENT MARKER MUST NOT REACH THE PAGE. It is a
             # convention for source, not a thing to show a reader; it leaked into this
             # very note once.
@@ -237,6 +241,7 @@ def main():
           // 🔴 TWO FOLDERS, so the run exercises the rotation and not just the
           // loop: a design has to satisfy several models rather than overfit
           // one, and that only happens if the model changes under it.
+          // The select is still the state; the chips mirror it.
           for (const option of document.getElementById('folders').options) {
             option.selected = option.value === 'af3' || option.value === 'opendde';
           }
@@ -595,8 +600,12 @@ def main():
             problems: document.getElementById('contig-problems').textContent.trim(),
             note: document.getElementById('preset-note').textContent.trim(),
             rows: document.querySelectorAll('#contig-rows > *').length,
-            structures: [...document.querySelectorAll('#contig-rows select')]
-              .map((s) => s.value).filter((v) => v === 'HELIX' || v === 'LOOP' || v === 'STRAND'),
+            // 🔴 READ FROM THE SPANS, NOT THE DOM. A span's secondary structure
+            // lives behind its row's disclosure now, so the control is not in
+            // the document until that row is opened - and a DOM query finds
+            // nothing while the job is perfectly correct.
+            structures: window.__designSpans.read().map((span) => span.secondary ?? '')
+              .filter((value) => value !== ''),
           });
         })()"""))
         print(f"  preset custom_cath_monomer: rows={cath['rows']}"

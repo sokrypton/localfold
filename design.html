@@ -46,128 +46,78 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
 
     <div class="mx-auto page-width" style="position: relative;">
 
-        <!-- THE JOB, AS A LIST OF OBJECTS YOU ADD TO. Each object is a chain -
-             which in the general case is a CONTIG: an ordered run of spans,
-             some given and some to be made. That is RFdiffusion's own notion
-             and it describes Hunter's inputs too, which is why both methods can
-             share one input model (docs/DESIGN.md section 5).
+        <!-- 🔴 THE METHOD AND THE ACTIONS LIVE IN THE PAGE HEAD, NOT IN THE
+             PANEL, and index.html's own note says why: with the buttons inside
+             the input row, "every row was cut short by their column". This page
+             learned it the hard way - the span list computed to 248px with the
+             structure and preset controls beside it, so every row's fields
+             wrapped into a column and the list read as rubble.
 
-             🔴 A SPAN HAS TWO INDEPENDENT AXES, GEOMETRY AND SEQUENCE, and
-             almost every modality is a combination of them: a target chain is
-             given/given, a binder is generated/free, a motif is given/given
-             inside a designed chain, inverse folding is given geometry with a
-             free sequence. Those pairs ARE the residue roles in the legend
-             below - one model, shown once, in the track and in the 3D view.
+             Method sits here because it decides what every control below means,
+             which is the one thing that should never be scrolled to. -->
+        <div class="page-head page-head-fold" style="padding-right: 0;">
+            <h1>LocalDesign</h1>
+            <div class="fold-actions">
+                <select id="method" class="entity-picker"
+                    title="How the design is made. Protein Hunter folds and redesigns in a loop; RFD4-Proteina generates structure directly.">
+                    <option value="hunter" selected>Protein Hunter</option>
+                    <option value="rfd4p">RFD4-Proteina</option>
+                </select>
+                <button type="button" id="add-span" class="btn btn-grey btn-small"
+                    title="Add a span: residues to design, a chain you know, part of a loaded structure, a ligand, or a chain break.">
+                    <i class="fa-solid fa-plus"></i>
+                    <span>Add span</span>
+                </button>
+                <button type="button" id="hunt" class="btn btn-primary">
+                    <i class="fa-solid fa-dna"></i>
+                    <span>Hunt</span>
+                </button>
+            </div>
+        </div>
 
-             🔴 WHAT DIFFERS PER METHOD IS WHICH SPANS ARE LEGAL, NOT WHAT A
-             SPAN IS. Hunter cannot generate geometry: it hallucinates through a
-             folding model, so a generated span means "fold it from X and see",
-             and a length RANGE is not something it can express today. RFD4
-             generates geometry natively and takes ranges. The Method picker's
-             real job is to refuse the spans the chosen method cannot honour AND
-             SAY WHY.
-
-             🔴 TODAY THIS IS STILL index.html's ENTITY LIST - a type, a value
-             and a number of copies, built by web/entity-ui.js - which expresses
-             a whole given chain and a ligand but NOT a contig of spans. Spans
-             are the next piece of work on this page, not something already
-             here; see docs/DESIGN.md section 5. The binder's length therefore
-             still sits in its own control below rather than as a generated span
-             in a row. -->
-        <div id="design-panel" class="container-box page-width" style="margin-bottom: 10px;">
+        <!-- ONE PANEL FOR THE WHOLE JOB, in index.html's shape: the thing being
+             made on top, its settings in a single strip underneath. It was seven
+             boxes - method, spans, structure, preset, designer, sampling,
+             action - and seven boxes is a page with no hierarchy at all. -->
+        <div id="design-panel" class="container-box page-width">
             <div class="fetch-panel">
 
-                <!-- WHICH METHOD, FIRST, BECAUSE IT DECIDES WHAT THE REST MEAN.
-                     Two different machines behind one page: Protein Hunter
-                     hallucinates through a folding model, RFD4-Proteina
-                     generates all-atom structure by flow matching. They share
-                     the object list below, the viewer and the seed; they do not
-                     share a code path.
+                <!-- THE JOB, AS A LIST OF SPANS YOU ADD TO. Each row is a chain -
+                     or part of one - and in the general case a CONTIG: an ordered
+                     run of spans, some given and some to be made. That is
+                     RFdiffusion's own notion and it describes Protein Hunter's
+                     inputs too, which is why both methods share one editor
+                     (docs/DESIGN.md section 5).
 
-                     🔴 THE CONTROLS BELOW CHANGE WITH IT, BUT WHAT IS SHARED
-                     STAYS PUT - the same rule index.html states about its own
-                     model picker: a control that moves when the method changes
-                     is a control the reader has to find again. A control the
-                     chosen method cannot honour is DISABLED WITH ITS REASON
-                     rather than removed, because a control that vanishes
-                     teaches nothing. -->
-                <div class="fetch-options" id="methodOptions">
-                    <div class="fetch-option-group" id="methodGroup">
-                        <span class="fetch-option-title">Method</span>
-                        <select id="method"
-                            title="How the design is made. Protein Hunter folds and redesigns in a loop; RFD4-Proteina generates structure directly.">
-                            <option value="hunter" selected>Protein Hunter</option>
-                            <option value="rfd4p">RFD4-Proteina</option>
-                        </select>
-                        <div id="method-note" class="option-note"></div>
-                    </div>
-                </div>
+                     🔴 A SPAN HAS TWO AXES, GEOMETRY AND SEQUENCE, and every
+                     modality is a combination of them: a target chain is
+                     given/given, a binder generated/free, a motif given/given
+                     inside a designed chain, inverse folding given geometry with
+                     a free sequence. Those pairs ARE the residue roles.
 
+                     🔴 WHAT DIFFERS PER METHOD IS WHICH SPANS ARE LEGAL, not what
+                     a span is. A span the chosen method cannot honour says so on
+                     the row rather than disappearing. -->
                 <div class="fetch-row" id="design-input-container">
                     <div class="entity-list">
                         <div id="contig-rows"></div>
-                        <div class="contig-foot">
-                            <button id="add-span" type="button"
-                                title="Add another span: residues to design, a chain you know, part of a loaded structure, a ligand, or a chain break.">
-                                <i class="fa-solid fa-plus"></i> Add span
-                            </button>
-                            <!-- 🔴 THE NOTATION, SHOWN RATHER THAN TYPED. The rows
-                                 are the input; this is what they amount to, in
-                                 RFdiffusion's own contig notation, updating on every
-                                 keystroke. It is here so the list is legible to
-                                 somebody who already thinks in contigs - and so a
-                                 preset loaded into the rows can be recognised. -->
-                            <code id="contig-line" title="What these spans amount to, in RFdiffusion's contig notation."></code>
-                        </div>
-                        <div id="contig-problems" class="option-note"></div>
-                    </div>
-
-                    <!-- 🔴 THE STRUCTURE A `From structure` SPAN REFERS TO. Without one
-                         those spans name residues of nothing, and so do partial
-                         diffusion and inverse folding, which start FROM a structure
-                         rather than from noise. Loading one is therefore not an
-                         extra: it is what half the modalities are conditioned on.
-
-                         🔴 mmCIF, NOT PDB. RFD4's pipeline parses mmCIF, and RCSB
-                         serves both - web/template-source.js prefers `.pdb` because
-                         its own reader is fixed-column, which is the opposite
-                         preference. -->
-                    <div class="contig-structure">
-                        <label for="structure-id">Structure</label>
-                        <input type="text" id="structure-id" placeholder="1PRW" size="8"
-                            title="A PDB entry to take given segments from. Fetched as mmCIF from RCSB.">
-                        <button id="load-structure" type="button" title="Fetch this entry from RCSB.">Load</button>
-                        <input type="file" id="structure-file" accept=".cif,.mmcif,.cif.zst"
-                            title="...or load an mmCIF from this computer.">
-                        <div id="structure-note" class="option-note"></div>
-                    </div>
-
-                    <!-- 🔴 THE TEN WORKED EXAMPLES THAT COME WITH THE ENGINE, each
-                         one a modality: unconditional, a binder with hotspots,
-                         indexed and unindexed motif scaffolding, a small-molecule
-                         pocket, a DNA complex, partial diffusion, inverse folding.
-                         Loading one fills the rows, so an example is a starting
-                         point to edit rather than a black box to run. -->
-                    <div class="contig-presets">
-                        <label for="preset">Start from</label>
-                        <select id="preset" title="Load a worked example into the spans above.">
-                            <option value="">nothing — build it yourself</option>
-                        </select>
-                        <div id="preset-note" class="option-note"></div>
                     </div>
                 </div>
 
+                <!-- WHAT THE SPANS AMOUNT TO, in the notation the chosen method
+                     is actually asked in - a contig for RFD4-Proteina, chains for
+                     Protein Hunter, since a given SEQUENCE has no contig
+                     notation. Anything wrong with the job is said beside it. -->
+                <div class="design-summary">
+                    <code id="contig-line"></code>
+                    <div id="contig-problems" class="option-note"></div>
+                </div>
+
+                <!-- ...AND THE SETTINGS, in py2Dmol's own groups: a column each,
+                     a rule between them, and a title saying which question the
+                     column answers. One strip, not four boxes. -->
                 <div class="fetch-options" id="designOptions">
 
-                    <!-- 🔴 NO BINDER LENGTH HERE ANY MORE. It was a control of its
-                         own when the target was an entity list; it is a Design span's
-                         length now, which is where it belongs - one place where a job
-                         says how many residues it wants, whichever method runs it. -->
-
-                    <!-- WHO DESIGNS THE SEQUENCE. Auto writes its reason out
-                         rather than silently changing the picker: the rule is
-                         the reference's - a ligand or nucleic target needs the
-                         checkpoint trained with one. See cpu/design/designers.js. -->
                     <div class="fetch-option-group" id="designerGroup">
                         <span class="fetch-option-title">Designer</span>
                         <select id="designer"
@@ -178,21 +128,26 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                             <option value="ligand">LigandMPNN</option>
                             <option value="na">NA-MPNN</option>
                         </select>
-                        <div id="designer-note" class="option-note"></div>
                     </div>
 
-                    <!-- WHICH MODEL FOLDS. 🔴 A LIST, NOT ONE CHOICE, and this
-                         is the single most consequential control on the page.
-                         Rotating the folder every cycle makes a design satisfy
-                         several models instead of overfitting one; Yehlin
-                         measured two or three beating one, and five or six
-                         doing worse than two (docs/DESIGN.md 3C, HER numbers on
-                         HER stack, not reproduced here). The picker therefore
-                         does not offer "all of them" as a convenience. -->
+                    <!-- 🔴 A LIST, NOT ONE CHOICE, and the most consequential
+                         control here. Rotating the folder every cycle makes a
+                         design satisfy several models instead of overfitting one;
+                         two or three beat one, and five or six did worse than two
+                         (docs/DESIGN.md 3C - measured elsewhere, not here). -->
                     <div class="fetch-option-group" id="folderGroup">
                         <span class="fetch-option-title">Folders</span>
-                        <select id="folders" multiple size="4"
-                            title="Which folding model runs each cycle. Pick two or three: a design then has to satisfy all of them. More is not better.">
+                        <!-- 🔴 THE CHIPS ARE THE CONTROL; THIS SELECT IS THE STATE.
+                             A seven-option multiple select renders as a scrolling
+                             listbox three rows tall - the only control on the
+                             strip that is not one line - and its selected row
+                             greys in a way that reads as disabled. The chips sit
+                             on one line, say what is on at a glance, and write
+                             their answer back here, so every reader of #folders
+                             (web/design.js, the page gate) is untouched. -->
+                        <div id="folder-chips" class="design-chips"></div>
+                        <select id="folders" multiple size="3" hidden
+                            title="Which folding model runs each cycle. Pick two or three: a design then has to satisfy all of them.">
                             <option value="af3" selected>AF3</option>
                             <option value="boltz2">Boltz-2</option>
                             <option value="protenix2">Protenix-2</option>
@@ -201,115 +156,129 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                             <option value="intellifold2">IntelliFold-2</option>
                             <option value="ef2">ESMFold2</option>
                         </select>
-                        <div id="folder-note" class="option-note"></div>
                     </div>
 
-                    <!-- HOW LONG TO HUNT. Cycles is the loop's depth, runs its
-                         width: independent hunts from different seeds. -->
-                    <div class="fetch-option-group" id="scheduleGroup">
-                        <span class="fetch-option-title">Schedule</span>
-                        <label for="cycles">Cycles</label>
+                    <div class="fetch-option-group" id="cyclesGroup">
+                        <span class="fetch-option-title">Cycles</span>
                         <input type="number" id="cycles" min="1" max="50" value="5"
                             title="How many fold-then-redesign rounds each run does.">
-                        <label for="runs">Runs</label>
+                    </div>
+
+                    <div class="fetch-option-group" id="runsGroup">
+                        <span class="fetch-option-title">Runs</span>
                         <input type="number" id="runs" min="1" max="100" value="1"
                             title="How many independent hunts to do, each from its own seed.">
                     </div>
 
-                    <!-- HOW LONG THE GENERATION RUNS. RFD4-Proteina's own, and
-                         the presets carry a count each; this overrides it. -->
                     <div class="fetch-option-group" id="stepsGroup">
-                        <span class="fetch-option-title">Generation</span>
-                        <label for="steps">Steps</label>
+                        <span class="fetch-option-title">Steps</span>
                         <input type="number" id="steps" min="4" max="400" value="60"
-                            title="How many flow-matching steps RFD4-Proteina takes. Sixty is the presets' usual count.">
+                            title="How many flow-matching steps RFD4-Proteina takes.">
                     </div>
 
-                    <!-- HOW THE SEQUENCE IS DRAWN. These are the knobs that
-                         decide what the designer is allowed to write; the
-                         field names follow maraxen/aminx's RunSpec so the two
-                         mean the same thing. See docs/DESIGN.md 3B. -->
-                    <div class="fetch-option-group" id="samplingGroup">
-                        <span class="fetch-option-title">Sampling</span>
-                        <label for="temperature">Temperature</label>
+                    <!-- The knobs that decide what the designer may write. The
+                         field names follow maraxen/aminx's RunSpec, so a spec, a
+                         script and this page mean the same thing by them. -->
+                    <div class="fetch-option-group" id="temperatureGroup">
+                        <span class="fetch-option-title">Temperature</span>
                         <input type="number" id="temperature" min="0.01" max="2" step="0.01" value="0.1"
                             title="How sharply the designer samples. Low is conservative.">
-                        <label for="omit">Omit</label>
-                        <input type="text" id="omit" value="C" maxlength="20" size="6"
-                            title="Amino acid letters the designer may never write. Cysteine is omitted by default.">
-                        <label for="seed">Seed</label>
-                        <input type="number" id="seed" min="0" value="0"
-                            title="The seed. A given target, setting and seed give the same hunt every time.">
                     </div>
 
+                    <div class="fetch-option-group" id="omitGroup">
+                        <span class="fetch-option-title">Omit</span>
+                        <input type="text" id="omit" value="C" maxlength="20"
+                            title="Amino acid letters the designer may never write. Cysteine is omitted by default.">
+                    </div>
+
+                    <div class="fetch-option-group" id="seedGroup">
+                        <span class="fetch-option-title">Seed</span>
+                        <input type="number" id="seed" min="0" value="0"
+                            title="A given job, setting and seed give the same result every time.">
+                    </div>
+
+                    <!-- 🔴 THE STRUCTURE HALF THE MODALITIES ARE CONDITIONED ON. A
+                         span taken From structure names residues of THIS; partial
+                         diffusion starts the flow from it; inverse folding holds
+                         its backbone. mmCIF, because RFD4's pipeline parses mmCIF
+                         where web/template-source.js prefers PDB. -->
+                    <div class="fetch-option-group" id="structureGroup">
+                        <span class="fetch-option-title">Structure</span>
+                        <div class="design-structure">
+                            <input type="text" id="structure-id" placeholder="1PRW"
+                                title="A PDB entry to take given segments from. Fetched as mmCIF from RCSB.">
+                            <button type="button" id="load-structure" class="btn btn-grey btn-small">Load</button>
+                            <input type="file" id="structure-file" accept=".cif,.mmcif,.cif.zst">
+                            <label for="structure-file" class="btn btn-grey btn-small"
+                                title="...or open an mmCIF from this computer.">Open file</label>
+                        </div>
+                    </div>
+
+                    <!-- Ten worked examples, each a modality. Loading one fills
+                         the spans, so an example is a starting point to edit
+                         rather than a black box to run. -->
+                    <div class="fetch-option-group" id="presetGroup">
+                        <span class="fetch-option-title">Start from</span>
+                        <select id="preset" title="Load a worked example into the spans above.">
+                            <option value="">nothing</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 🔴 EVERYTHING THE PAGE DECIDED FOR YOU, IN ONE PLACE. The
+                     designer it picked and why, the advice on how many folders to
+                     rotate, what a loaded example asks for, what a structure gave
+                     us. Each was a note hanging under its own control, which put
+                     four ragged paragraphs through the middle of the settings;
+                     collected here they read as one short column and the strip
+                     stays a strip. -->
+                <div class="design-notes">
+                    <div id="designer-note" class="option-note"></div>
+                    <div id="folder-note" class="option-note"></div>
+                    <div id="preset-note" class="option-note"></div>
+                    <div id="structure-note" class="option-note"></div>
                 </div>
             </div>
         </div>
 
-        <!-- WHAT IT IS DOING NOW - the first of the three questions. The run
-             and cycle counters and the stage live here, with the progress bar
-             spanning the WHOLE hunt rather than the current fold: a bar that
-             restarts every cycle tells you nothing about how long is left.
-
-             🔴 OUTSIDE the viewer, which is hidden until there is something to
-             show - the same arrangement as index.html, and for the same reason:
-             a status line inside a hidden element is a status line nobody can
-             read while they wait for the first result. -->
-        <div class="container-box page-width" id="hunt-bar" style="margin-bottom: 10px;">
-            <div class="fetch-row">
-                <button id="hunt" class="primary"
-                    title="Start hunting. The loop is not wired yet.">Hunt</button>
+        <!-- WHAT IT IS DOING NOW. The bar spans the WHOLE run rather than the
+             current fold: one that restarts every cycle says nothing about how
+             long is left. Always laid out, so nothing below it moves. -->
+        <div id="status-row">
+            <div id="status-line">
                 <div id="status-message"></div>
             </div>
             <progress id="progress" max="1" value="0" data-state="idle"></progress>
             <div id="gpu-summary" class="option-note"></div>
         </div>
 
-        <!-- WHAT IS BEING DECIDED, AND WHAT IS NOT. 🔴 THE SURFACE A FOLD PAGE
-             DOES NOT NEED AND A DESIGN PAGE CANNOT DO WITHOUT. Every residue
-             has a ROLE - free to change, held fixed, tied to another position,
-             part of a motif, or part of the target - and those roles are what
-             the user is really setting when they pick residues. The same
-             colours are used in the sequence track and in the 3D view, so a
-             residue picked in one is recognisable in the other. -->
-        <div class="container-box page-width" id="roles-legend" style="margin-bottom: 10px;">
-            <span class="fetch-option-title">Residue roles</span>
-            <ul class="role-list">
-                <li><span class="role-swatch role-free"></span>free &mdash; the designer may rewrite it</li>
-                <li><span class="role-swatch role-fixed"></span>fixed &mdash; held at its letter</li>
-                <li><span class="role-swatch role-tied"></span>tied &mdash; forced equal to another position</li>
-                <li><span class="role-swatch role-motif"></span>motif &mdash; held in sequence and in geometry</li>
-                <li><span class="role-swatch role-target"></span>target &mdash; not designed at all</li>
-            </ul>
-        </div>
-
-        <!-- WHAT IT HAS FOUND SO FAR. Every cycle is a frame of one object, so
-             the play bar walks the whole hunt and a design can be watched
-             arriving rather than inspected afterwards. v1 did this and it is
-             the single best thing about it. -->
+        <!-- EVERY CYCLE IS A FRAME OF ONE OBJECT, so the play bar walks the whole
+             run and a design can be watched arriving rather than inspected
+             afterwards. -->
         <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;"></div>
 
-        <!-- The binder's sequence as it changes, one row a cycle, coloured by
-             the roles above. This is where X positions filling in is visible,
-             which is the clearest signal that the loop is working at all. -->
-        <div class="container-box page-width" id="cycle-track-container" style="display: none; margin-bottom: 10px;">
-            <span class="fetch-option-title">Sequence by cycle</span>
+        <!-- 🔴 WHAT IS BEING DECIDED, AND WHAT IS NOT - the surface a fold page
+             has no need of. The designed chain takes the free colour and every
+             other chain the target one, the same swatches named here. Beside the
+             results because that is where they are read, not at the foot of the
+             page. -->
+        <div id="results" class="container-box page-width" style="display: none;">
+            <div id="roles-legend">
+                <ul class="role-list">
+                    <li><span class="role-swatch role-free"></span>designed</li>
+                    <li><span class="role-swatch role-fixed"></span>held</li>
+                    <li><span class="role-swatch role-tied"></span>tied</li>
+                    <li><span class="role-swatch role-motif"></span>motif</li>
+                    <li><span class="role-swatch role-target"></span>target</li>
+                </ul>
+            </div>
+
             <div id="cycle-track"></div>
-        </div>
 
-        <!-- ...AND WHY IT KEPT OR REJECTED THE LAST THING - the third question,
-             and the row most likely to be dropped for time.
-
-             🔴 A REJECTION IS SHOWN AS ITS PHYSICAL NUMBER, NOT AS A VERDICT:
-             `ring 3.87 A`, `0/12 Watson-Crick pairs`, `framework RMSD 17.6 A`.
-             A model can run, score itself well, and produce the wrong
-             molecule - in Yehlin's measurements ESMFold2 reports fine
-             confidence and gets none of a DNA duplex's base pairs - so a page
-             that reports only the objective is a page that lies. Validity is a
-             veto separate from the objective, and the reason has to be on
-             screen. -->
-        <div class="container-box page-width" id="results" style="display: none; margin-bottom: 10px;">
-            <span class="fetch-option-title">Cycles</span>
+            <!-- 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS MEASUREMENT: "touches
+                 0/4 hotspots (nearest 23.7 A, needs 8 A)". A model can run, score
+                 itself well and produce the wrong molecule, so a page reporting
+                 only the objective is a page that lies. -->
             <table id="results-table">
                 <thead>
                     <tr>
