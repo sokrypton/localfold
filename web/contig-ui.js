@@ -200,10 +200,19 @@ export function contigOf(spans, method = "rfd4p") {
  * a motif inside a designed chain - is not something Hunter can express, and is
  * reported rather than flattened.
  *
+ * 🔴 A `From structure` SPAN REACHES HUNTER THROUGH ITS SEQUENCE, not its
+ * coordinates - that is the geometry axis once more. The caller supplies
+ * `sequenceOf`, backed by whatever structure is loaded; without one the span is
+ * reported rather than skipped, because a hunt that silently dropped the target
+ * would fold the binder alone and score it against nothing.
+ *
  * @param {object[]} spans
+ * @param {object} [options]
+ * @param {(chain: string, first: number, last: number) => string|null} [options.sequenceOf]
  * @returns {{chains: string[], chainIndex: number, length: number, problems: string[]}}
  */
-export function chainsOf(spans) {
+export function chainsOf(spans, options = {}) {
+  const sequenceOf = options.sequenceOf;
   const chains = [];
   const problems = [];
   let current = { parts: [], designed: false, length: 0 };
@@ -229,6 +238,20 @@ export function chainsOf(spans) {
     if (span.kind === "generated") {
       current.designed = true;
       current.length = number(span.min, 0);
+      continue;
+    }
+    if (span.kind === "segment") {
+      if (sequenceOf === undefined) {
+        problems.push("Protein Hunter folds sequences, so a \u201cFrom structure\u201d span needs"
+          + " the structure loaded to read its sequence from");
+        continue;
+      }
+      const sequence = sequenceOf(String(span.chain ?? ""), number(span.first, 0), number(span.last, 0));
+      if (sequence === null || sequence.length === 0) {
+        problems.push(`chain ${span.chain} ${span.first}-${span.last} is not in the loaded structure`);
+        continue;
+      }
+      current.parts.push(sequence);
       continue;
     }
     if (span.kind === "ligand") continue;

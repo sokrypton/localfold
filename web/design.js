@@ -19,6 +19,9 @@
 import { chainsOf, contigOf, createContigList } from "./contig-ui.js";
 import { generate } from "./generate.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
+import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
+import { THREE_TO_ONE } from "../cpu/design/mpnn/constants.js";
+import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
 import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
@@ -79,7 +82,14 @@ const resultsBody = element("results-body");
 const trackBox = element("cycle-track-container");
 const track = element("cycle-track");
 
+// 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
+// same reason as the lookups above: `paintJob` runs while the span list is still
+// constructing, and it reaches the run state and the loaded structure. Five
+// bindings on this page have thrown "Cannot access X before initialization" by
+// being declared below the callback that reads them. The rule that actually
+// holds is: shared state at the top, helpers as function DECLARATIONS.
 let running = null;
+let loaded = null;
 
 const say = (text, bad = false) => {
   status.textContent = text;
@@ -200,7 +210,7 @@ const paintJob = () => {
   // no contig notation, so the line read "/0,75-75" for a job whose target is
   // 114 residues long. Hunter is told about its chains instead.
   if (hunter) {
-    const { chains, chainIndex, length } = chainsOf(spans);
+    const { chains, chainIndex, length } = chainsOf(spans, { sequenceOf: resolver() });
     const described = chains.map((chain, index) => (index === chainIndex
       ? `design ${length}` : `given ${chain.length}`)).join("  ·  ");
     contigLine.textContent = chains.length === 0 ? "" : described;
@@ -208,7 +218,7 @@ const paintJob = () => {
     contigLine.textContent = contig.length === 0 ? "" : `${contig}    (${span} tokens)`;
   }
 
-  const theirs = hunter ? chainsOf(spans).problems : problems;
+  const theirs = hunter ? chainsOf(spans, { sequenceOf: resolver() }).problems : problems;
   contigProblems.textContent = theirs.join(" · ");
   contigProblems.classList.toggle("warn", theirs.length > 0);
   paintDesignerNote(spans);
@@ -372,7 +382,7 @@ const startHunt = async () => {
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
-  const { chains, chainIndex, length, problems } = chainsOf(spans);
+  const { chains, chainIndex, length, problems } = chainsOf(spans, { sequenceOf: resolver() });
   if (problems.length > 0) {
     say(problems.join(" · "), true);
     return;
@@ -478,14 +488,15 @@ export const spansFromContig = (contig) => {
   return spans;
 };
 
-let presetConditions;
-let presetCif;
+// What a preset carries beyond its contig: the conditions, the template
+// structure, and the per-modality options that make partial diffusion and
+// inverse folding what they are.
+let presetExtras = {};
 
 presetSelect.addEventListener("change", () => {
   const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
   if (preset === undefined) {
-    presetConditions = undefined;
-    presetCif = undefined;
+    presetExtras = {};
     presetNote.textContent = "";
     presetNote.classList.remove("warn");
     return;
@@ -497,8 +508,12 @@ presetSelect.addEventListener("change", () => {
     presetNote.classList.add("warn");
     return;
   }
-  presetConditions = preset.conditions;
-  presetCif = preset.cifUrl;
+  presetExtras = {
+    conditions: preset.conditions,
+    cifUrl: preset.cifUrl,
+    partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,
+    inverseFolding: preset.inverseFolding,
+  };
   if (preset.nsteps !== undefined) element("steps").value = String(preset.nsteps);
   spanList.set(spans);
   // 🔴 A PRESET IS RFD4's, so loading one picks that method rather than leaving
@@ -507,6 +522,152 @@ presetSelect.addEventListener("change", () => {
   paintMethod();
   presetNote.textContent = preset.description ?? "";
   presetNote.classList.remove("warn");
+});
+
+/**
+ * THE LOADED STRUCTURE, which half the modalities are conditioned on.
+ *
+ * 🔴 WHAT IT UNLOCKS, so the control is not mistaken for a convenience: a
+ * `From structure` span names residues of THIS; partial diffusion starts the
+ * flow partway along from it; inverse folding holds its backbone. Without one,
+ * only the unconditional cases can run.
+ *
+ * 🔴 AND IT SERVES BOTH METHODS, differently, which is the geometry axis again.
+ * RFD4 takes its coordinates. Protein Hunter cannot - it folds sequences - but
+ * it CAN read the sequence of a given segment out of it, which is how a
+ * structure-derived target reaches a hunt.
+ */
+const structureNote = element("structure-note");
+
+/**
+ * The one-letter sequence of a loaded structure's residues, for Hunter.
+ *
+ * 🔴 ONE LETTER PER RESIDUE, NOT PER ATOM, and in residue order. An atom array
+ * repeats its residue name once per atom, so walking it naively gives a
+ * sequence several times too long - which folds, and folds something else.
+ */
+/**
+ * The resolver, or nothing when no structure is loaded.
+ *
+ * 🔴 `undefined` IS A DIFFERENT ANSWER FROM "not found", and conflating them
+ * produced a wrong message: with the resolver always supplied, a segment span
+ * on a page with no structure reported "chain A 1-40 is not in the loaded
+ * structure" - naming a structure that does not exist - instead of saying to
+ * load one. chainsOf distinguishes the two, so this has to as well.
+ *
+ * 🔴 AND A DECLARATION, for the fifth time on this page: written as a `const`
+ * arrow it threw "Cannot access 'resolver' before initialization" in the same
+ * breath as the comment below warning about exactly that. Helpers a
+ * constructor-time callback can reach are declarations here, without exception.
+ */
+function resolver() {
+  return loaded === null ? undefined : sequenceOf;
+}
+
+// 🔴 A FUNCTION DECLARATION, NOT A `const` ARROW, AND THAT IS THE POINT. This
+// is the FOURTH binding on this page that a constructor-time callback reached
+// before its initialiser ran - the span list draws and notifies from inside
+// createContigList, which calls paintJob, which calls this. A declaration is
+// hoisted AND initialised, so the whole class of bug cannot happen to it.
+// Anything a callback might reach during construction should be declared this
+// way rather than hoisted by hand one at a time.
+function sequenceOf(chain, first, last) {
+  if (loaded === null) return null;
+  const atoms = loaded.atoms;
+  const count = atoms?.nAtoms ?? atoms?.chain_id?.length ?? 0;
+  const seen = new Map();
+  for (let index = 0; index < count; index += 1) {
+    if (String(atoms.chain_id[index]) !== chain) continue;
+    const residue = Number(atoms.res_id[index]);
+    if (residue < first || residue > last) continue;
+    if (!seen.has(residue)) seen.set(residue, String(atoms.res_name[index]).trim().toUpperCase());
+  }
+  if (seen.size === 0) return null;
+  return [...seen.entries()].sort((a, b) => a[0] - b[0])
+    // 🔴 AN UNKNOWN RESIDUE BECOMES X RATHER THAN DISAPPEARING. Dropping it
+    // would shift every residue number after it, and the span's own numbering is
+    // what the user typed.
+    .map(([, name]) => THREE_TO_ONE[name] ?? "X").join("");
+}
+
+const describeStructure = () => {
+  if (loaded === null) {
+    structureNote.textContent = "";
+    structureNote.classList.remove("warn");
+    return;
+  }
+  const parts = [...loaded.chains.entries()]
+    .map(([chain, range]) => `${chain} ${range.first}\u2013${range.last}`);
+  structureNote.textContent = `${loaded.name}: ${parts.join(", ")}`;
+  structureNote.classList.remove("warn");
+};
+
+/** The chains a loaded structure has, and the residue range of each. */
+const chainRanges = (atoms) => {
+  const chains = new Map();
+  const count = atoms?.nAtoms ?? atoms?.chain_id?.length ?? 0;
+  for (let index = 0; index < count; index += 1) {
+    const chain = String(atoms.chain_id[index]);
+    const residue = Number(atoms.res_id[index]);
+    const seen = chains.get(chain);
+    if (seen === undefined) chains.set(chain, { first: residue, last: residue });
+    else {
+      seen.first = Math.min(seen.first, residue);
+      seen.last = Math.max(seen.last, residue);
+    }
+  }
+  return chains;
+};
+
+const takeStructure = (text, name) => {
+  // 🔴 PARSED ON LOAD, NOT ON RUN. A file that is not mmCIF, or an entry with no
+  // atom records, is a thing to say now - while the user is looking at the
+  // control they just used - rather than minutes later inside a generation.
+  const atoms = parseCifToAtomArray(text);
+  const chains = chainRanges(atoms);
+  if (chains.size === 0) throw new Error("no atoms in that file");
+  loaded = { text, name, atoms, chains };
+  describeStructure();
+  // Offer its first chain as a span, since that is almost always the next move.
+  const [first] = [...chains.entries()];
+  const spans = spanList.read();
+  if (!spans.some((span) => span.kind === "segment")) {
+    spanList.set([{ kind: "segment", chain: first[0], first: first[1].first, last: first[1].last },
+      { kind: "break" }, ...spans.filter((span) => span.kind !== "sequence")]);
+  }
+  paintJob();
+};
+
+element("load-structure").addEventListener("click", async () => {
+  const id = element("structure-id").value.trim();
+  if (id.length === 0) {
+    structureNote.textContent = "give a PDB entry, like 1PRW";
+    structureNote.classList.add("warn");
+    return;
+  }
+  structureNote.textContent = `fetching ${id.toUpperCase()}\u2026`;
+  structureNote.classList.remove("warn");
+  try {
+    const response = await fetch(`https://files.rcsb.org/download/${id.toUpperCase()}.cif`);
+    if (!response.ok) throw new Error(`RCSB answered ${response.status}`);
+    takeStructure(await response.text(), id.toUpperCase());
+  } catch (error) {
+    structureNote.textContent = `could not load ${id.toUpperCase()}: ${error.message}`;
+    structureNote.classList.add("warn");
+  }
+});
+
+element("structure-file").addEventListener("change", async (event) => {
+  const file = event.target.files?.[0];
+  if (file === undefined) return;
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const zstd = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f && bytes[3] === 0xfd;
+    takeStructure(new TextDecoder().decode(zstd ? decompress(bytes) : bytes), file.name);
+  } catch (error) {
+    structureNote.textContent = `could not read ${file.name}: ${error.message}`;
+    structureNote.classList.add("warn");
+  }
 });
 
 /** RFD4-Proteina: one generation, straight into the viewer. */
@@ -531,8 +692,9 @@ const startGenerate = async () => {
   try {
     const result = await generate({
       contig,
-      conditions: presetConditions,
-      cifUrl: presetCif,
+      ...presetExtras,
+      // A structure the user loaded is the one they mean, over a preset's.
+      ...(loaded === null ? {} : { inputCif: loaded.text }),
       steps: number("steps", 60),
       seed: number("seed", 0),
       signal: controller.signal,

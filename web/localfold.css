@@ -1430,3 +1430,18 @@
 .contig-presets label { font-size: 12px; color: #6b7280; }
 .contig-presets select { max-width: 100%; }
 #preset-note { flex: 1 1 100%; max-width: none; }
+
+/* The structure a `From structure` span refers to. */
+.contig-structure {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.contig-structure label { font-size: 12px; color: #6b7280; }
+.contig-structure input[type="file"] { font-size: 12px; max-width: 100%; }
+#structure-note { flex: 1 1 100%; max-width: none; }

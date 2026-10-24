@@ -272,6 +272,33 @@ def main():
             if hunted["cycle0Best"]:
                 bad.append("cycle 0 was marked best; it is the starting draw and cannot win")
 
+        # 🔴 A STRUCTURE SEGMENT WITHOUT A STRUCTURE MUST BE REFUSED, on both
+        # methods and for different reasons - Hunter needs the sequence to fold,
+        # RFD4 needs the coordinates to condition on. A run that started anyway
+        # would design against nothing.
+        for wanted_method, phrase in (("hunter", "needs the structure loaded"),
+                                      ("rfd4p", "names a segment of an existing structure")):
+            cdp.evaluate(ws, """(() => {
+              const pick = document.getElementById('method');
+              pick.value = '%s';
+              pick.dispatchEvent(new Event('change'));
+              document.getElementById('preset').value = '';
+              document.getElementById('preset').dispatchEvent(new Event('change'));
+              window.__designSpans.set([{ kind: 'segment', chain: 'A', first: 1, last: 40 },
+                { kind: 'break' }, { kind: 'generated', min: 30, max: 30 }]);
+              document.getElementById('hunt').click();
+              return 1;
+            })()""" % wanted_method)
+            # 🔴 THE REFUSAL IS ASYNCHRONOUS ON RFD4 - it happens inside
+            # generate(), after the click returns - so reading the status in the
+            # same expression caught "starting" and called it a pass.
+            time.sleep(1.5)
+            refused = cdp.evaluate(ws, """document.getElementById('status-message').textContent
+              + ' || ' + document.getElementById('contig-problems').textContent""")
+            print(f"  segment with no structure, {wanted_method}: {refused[:120]}")
+            if phrase not in refused:
+                bad.append(f"{wanted_method} did not refuse a segment with no structure: {refused!r}")
+
         # 🔴 AND, WHEN ASKED, A REAL GENERATION: the second method end to end.
         if "--generate" in sys.argv:
             cdp.evaluate(ws, """(() => {
@@ -326,10 +353,14 @@ def main():
           const pick = document.getElementById('method');
           pick.value = 'rfd4p';
           pick.dispatchEvent(new Event('change'));
+          // 🔴 ITS OWN SPANS, so this check does not depend on what an earlier
+          // one left behind - which it did, and read the wrong refusal.
+          window.__designSpans.set([{ kind: 'sequence', value: 'GWSTELEKHREELKEFLKK' },
+            { kind: 'break' }, { kind: 'generated', min: 30, max: 30 }]);
           document.getElementById('hunt').click();
           return 1;
         })()""")
-        time.sleep(0.3)
+        time.sleep(1.5)
         onRfd4p = cdp.evaluate(ws, "document.getElementById('status-message').textContent")
         print(f"  Generate on a sequence span: {onRfd4p}")
         if "coordinates" not in onRfd4p:

@@ -82,8 +82,15 @@ async function templateCif(url, signal) {
  *   `C_HOT`, ...) as the presets carry it
  * @param {string} [options.cifUrl] a template structure the contig refers to;
  *   required whenever the contig names a given segment like `A18-132`
+ * @param {string} [options.inputCif] the same thing as text, for a structure the
+ *   user loaded rather than one a preset points at. Wins over `cifUrl`.
  * @param {number} [options.steps]
  * @param {string} [options.recycleSchedule]
+ * @param {number} [options.partialTrajectoryFractionSteps] partial diffusion:
+ *   start the flow partway along, from the input structure rather than from
+ *   noise, and re-denoise the rest. 0.5 is the preset's.
+ * @param {boolean} [options.inverseFolding] hold the backbone and resample only
+ *   the sequence
  * @param {number} [options.seed=0]
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -94,19 +101,35 @@ async function templateCif(url, signal) {
  */
 export async function generate(options) {
   const {
-    contig, conditions, cifUrl, steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
+    contig, conditions, cifUrl, inputCif: givenCif, steps = DEFAULT_STEPS,
+    recycleSchedule, seed = 0,
+    partialTrajectoryFractionSteps, inverseFolding,
     status = () => {}, progress = () => {}, onStep, signal,
   } = options;
 
   if (typeof contig !== "string" || contig.trim().length === 0) {
     throw new Error("a generation needs a contig, e.g. \"100-100\" for an unconditional monomer");
   }
+  // 🔴 TWO MODALITIES NEED THE INPUT STRUCTURE EVEN WITH NO GIVEN SEGMENT, and
+  // saying so here is the difference between a clear refusal and a generation
+  // that quietly ignores what was asked. Partial diffusion starts the flow
+  // partway along FROM that structure; inverse folding holds its backbone and
+  // resamples the sequence. Both are meaningless without one.
+  const haveStructure = givenCif !== undefined || cifUrl !== undefined;
+  if (partialTrajectoryFractionSteps !== undefined && !haveStructure) {
+    throw new Error("partial diffusion starts from an existing structure and re-denoises it,"
+      + " so it needs one to start from");
+  }
+  if (inverseFolding === true && !haveStructure) {
+    throw new Error("inverse folding holds a backbone and resamples its sequence,"
+      + " so it needs the backbone");
+  }
   // 🔴 REFUSED HERE RATHER THAN DEEP IN THE PIPELINE. A contig naming a chain
   // segment with no structure to take it from fails somewhere inside the
   // validation pipeline with a message about an absent chain; said here it names
   // the thing the user has to supply.
   const needsTemplate = /(^|,)\s*[A-Za-z]\d/.test(contig);
-  if (needsTemplate && cifUrl === undefined) {
+  if (needsTemplate && !haveStructure) {
     throw new Error(`the contig "${contig.trim()}" names a segment of an existing structure,`
       + " so it needs one to take it from - load an example or add a structure");
   }
@@ -119,7 +142,7 @@ export async function generate(options) {
   });
 
   status("preparing the input");
-  const inputCif = cifUrl === undefined ? undefined : await templateCif(cifUrl, signal);
+  const inputCif = givenCif ?? (cifUrl === undefined ? undefined : await templateCif(cifUrl, signal));
   const spec = { contig, ...(conditions === undefined ? {} : { conditions }) };
   const { batch, n } = buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
 
@@ -129,6 +152,15 @@ export async function generate(options) {
     seed,
     signal,
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
+    ...(partialTrajectoryFractionSteps === undefined
+      ? {} : { partialTrajectoryFractionSteps }),
+    // 🔴 INVERSE FOLDING AND PARTIAL DIFFUSION BOTH NEED THE ENCODER, which is
+    // a separate ~28 MB of shards the loader can skip. They read the input
+    // structure into the model's latent rather than starting from noise, and
+    // that is what the encoder is for.
+    ...(inverseFolding === true ? { inverseFolding: true } : {}),
+    withEncoder: inverseFolding === true || partialTrajectoryFractionSteps !== undefined,
+    inputAtoms: inputCif === undefined ? undefined : batch.__atoms,
     onStep: (step) => {
       // The remaining 30% of the bar is the flow itself.
       const index = step?.step ?? step?.i ?? 0;

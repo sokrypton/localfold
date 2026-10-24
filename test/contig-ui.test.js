@@ -161,6 +161,30 @@ describe("the design job as a list of spans", () => {
       expect(contigOf(segment, "rfd4p").problems).toEqual([]);
     });
 
+    // 🔴 A `From structure` SPAN REACHES HUNTER THROUGH ITS SEQUENCE, since
+    // Hunter folds sequences and cannot be handed coordinates. Without a
+    // structure loaded the span is REPORTED, not skipped: a hunt that quietly
+    // dropped its target would fold the binder alone and score it against
+    // nothing, which looks like a working run.
+    it("reads a structure segment as a sequence, and refuses it without one", () => {
+      const spans = [{ kind: "segment", chain: "A", first: 10, last: 14 },
+        { kind: "break" }, { kind: "generated", min: 8, max: 8 }];
+      expect(chainsOf(spans).problems).toContain("Protein Hunter folds sequences, so a"
+        + " \u201cFrom structure\u201d span needs the structure loaded to read its sequence from");
+
+      const sequenceOf = (chain, first, last) => (chain === "A" && first === 10 && last === 14
+        ? "MKVLA" : null);
+      expect(chainsOf(spans, { sequenceOf })).toEqual({
+        chains: ["MKVLA", ""], chainIndex: 1, length: 8, problems: [],
+      });
+
+      // ...and a span naming residues the structure does not have says which
+      const missing = [{ kind: "segment", chain: "Z", first: 1, last: 9 },
+        { kind: "break" }, { kind: "generated", min: 8, max: 8 }];
+      expect(chainsOf(missing, { sequenceOf }).problems)
+        .toContain("chain Z 1-9 is not in the loaded structure");
+    });
+
     it("ignores a ligand, which is context and not a chain", () => {
       const spans = [{ kind: "generated", min: 80, max: 80 }, { kind: "break" },
         { kind: "ligand", code: "HEM" }];

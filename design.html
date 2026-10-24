@@ -122,6 +122,26 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         <div id="contig-problems" class="option-note"></div>
                     </div>
 
+                    <!-- 🔴 THE STRUCTURE A `From structure` SPAN REFERS TO. Without one
+                         those spans name residues of nothing, and so do partial
+                         diffusion and inverse folding, which start FROM a structure
+                         rather than from noise. Loading one is therefore not an
+                         extra: it is what half the modalities are conditioned on.
+
+                         🔴 mmCIF, NOT PDB. RFD4's pipeline parses mmCIF, and RCSB
+                         serves both - web/template-source.js prefers `.pdb` because
+                         its own reader is fixed-column, which is the opposite
+                         preference. -->
+                    <div class="contig-structure">
+                        <label for="structure-id">Structure</label>
+                        <input type="text" id="structure-id" placeholder="1PRW" size="8"
+                            title="A PDB entry to take given segments from. Fetched as mmCIF from RCSB.">
+                        <button id="load-structure" type="button" title="Fetch this entry from RCSB.">Load</button>
+                        <input type="file" id="structure-file" accept=".cif,.mmcif,.cif.zst"
+                            title="...or load an mmCIF from this computer.">
+                        <div id="structure-note" class="option-note"></div>
+                    </div>
+
                     <!-- 🔴 THE TEN WORKED EXAMPLES THAT COME WITH THE ENGINE, each
                          one a modality: unconditional, a binder with hotspots,
                          indexed and unindexed motif scaffolding, a small-molecule
