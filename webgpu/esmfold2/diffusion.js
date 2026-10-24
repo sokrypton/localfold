@@ -254,12 +254,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 }
 
-function createSplitGatedAddAdaptiveShader({ rows, channels, splits }, epsilon = 1e-5) {
+// `activation += delta * sigmoid(outGate + bias)`, then the next adaLN over the updated row - delta one buffer, or (splits
+// > 0) the sum of a split-K GEMM's `splits` partial products, read here instead of reduced by a pass of their own
+function createGatedAddAdaptiveShader({ rows, channels, splits = 0 }, epsilon = 1e-5) {
   const elements = rows * channels;
   const terms = Array.from({ length: splits }, (_, z) => `partials[${z * elements}u + i]`).join(" + ");
   const stageRow = channels <= 1536;
   return `
-@group(0) @binding(0) var<storage, read> partials: array<f32>;
+@group(0) @binding(0) var<storage, read> ${splits ? "partials" : "delta"}: array<f32>;
 @group(0) @binding(1) var<storage, read> outGate: array<f32>;
 @group(0) @binding(2) var<storage, read> outGateBias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> activation: array<f32>;
@@ -279,62 +281,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var square = 0.0;
   for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
     let i = base + c;
-    let delta = ${terms};
-    let og = outGate[i] + outGateBias[c];
-    let value = activation[i] + delta / (1.0 + exp(-og));
-    activation[i] = value;
-${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
-    square += value * value;
-  }
-  sums[local.x] = total;
-  squares[local.x] = square;
-  workgroupBarrier();
-  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
-  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
-  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
-  if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
-  }
-  workgroupBarrier();
-  let mean = sums[0] / ${channels}.0;
-  let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
-  let inverse = inverseSqrt(variance + ${epsilon});
-  let gsBase = row * ${channels * 2}u;
-  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    let normalised = (${stageRow ? "rowBuf[c]" : "activation[base + c]"} - mean) * inverse;
-    let gate = gateShift[gsBase + c] + gateBias[c];
-    let shift = gateShift[gsBase + ${channels}u + c];
-    output[base + c] = normalised / (1.0 + exp(-gate)) + shift;
-  }
-}`;
-}
-
-function createGatedAddAdaptiveShader({ rows, channels }, epsilon = 1e-5) {
-  const stageRow = channels <= 1536;
-  return `
-@group(0) @binding(0) var<storage, read> delta: array<f32>;
-@group(0) @binding(1) var<storage, read> outGate: array<f32>;
-@group(0) @binding(2) var<storage, read> outGateBias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> activation: array<f32>;
-@group(0) @binding(4) var<storage, read> gateShift: array<f32>;
-@group(0) @binding(5) var<storage, read> gateBias: array<f32>;
-@group(0) @binding(6) var<storage, read_write> output: array<f32>;
-
-var<workgroup> sums: array<f32, ${LANES}>;
-var<workgroup> squares: array<f32, ${LANES}>;
-${stageRow ? `var<workgroup> rowBuf: array<f32, ${channels}>;\n` : ""}@compute @workgroup_size(${LANES})
-fn main(@builtin(workgroup_id) group: vec3<u32>,
-        @builtin(local_invocation_id) local: vec3<u32>) {
-  let row = group.x + group.y * ${GRID_WIDTH}u;
-  if (row >= ${rows}u) { return; }
-  let base = row * ${channels}u;
-  var total = 0.0;
-  var square = 0.0;
-  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
-    let i = base + c;
-    let og = outGate[i] + outGateBias[c];
-    let value = activation[i] + delta[i] / (1.0 + exp(-og));
+${splits ? `    let delta = ${terms};\n` : ""}    let og = outGate[i] + outGateBias[c];
+    let value = activation[i] + ${splits ? "delta" : "delta[i]"} / (1.0 + exp(-og));
     activation[i] = value;
 ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
     square += value * value;
@@ -956,7 +904,7 @@ export class Esmfold2DenoiserGpu {
         reduceGatedAdd: get("reduce-gated-add",
           createSplitGatedAddShader({ rows: tokens, outer: tokenChannels, splits: kSplits })),
         reduceGatedAddAdaptive: get("reduce-gated-add-adaptive",
-          createSplitGatedAddAdaptiveShader({ rows: tokens, channels: tokenChannels, splits: kSplits }, epsilon)),
+          createGatedAddAdaptiveShader({ rows: tokens, channels: tokenChannels, splits: kSplits }, epsilon)),
         swigluSplit: get("swiglu-split", createLinearShader({ rows: tokens, inner: tokenChannels,
           outer: 2 * hidden }, false, weightPrecision, false, rowTile, 4, kSplits)),
         swigluReduce: get("swiglu-reduce",
