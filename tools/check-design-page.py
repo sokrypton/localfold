@@ -149,8 +149,8 @@ def main():
         page = json.loads(cdp.evaluate(ws, READ_PAGE))
         for key, value in page.items():
             print(f"  {key}: {value}")
-        if not (page["designer"] or "").startswith("Auto"):
-            bad.append("the designer note is not the automatic reason")
+        if "because" not in (page["designer"] or ""):
+            bad.append(f"the designer note does not say why: {page['designer']!r}")
         if page["roles"] != 5:
             bad.append(f"{page['roles']} role swatches, expected 5")
         if page["spanRows"] != 3:
@@ -186,7 +186,11 @@ def main():
           const pick = document.getElementById("method");
           pick.value = "rfd4p";
           pick.dispatchEvent(new Event("change"));
-          const groups = ["designerGroup", "folderGroup", "cyclesGroup"];
+          // 🔴 NOT designerGroup: it is hidden now, since the automatic rule is
+          // right in every measured case and a picker whose answer is already
+          // correct is a question nobody needs asked. Its NOTE is still checked
+          // above - the answer stays even though the control went.
+          const groups = ["folderGroup", "cyclesGroup", "runsGroup"];
           return JSON.stringify({
             // 🔴 THE METHOD'S DESCRIPTION IS THE RESTING STATUS LINE NOW, as
             // index.html does with "Ready. Paste a sequence and press Fold." -
@@ -197,18 +201,42 @@ def main():
               const g = document.getElementById(id);
               return g !== null && [...g.querySelectorAll("select, input")].every((c) => c.disabled);
             }),
-            reasons: groups.filter((id) => (document.getElementById(id)
-              ?.querySelector(".unavailable-reason")?.textContent ?? "").length > 0),
-            stillThere: groups.filter((id) => {
+            // 🔴 ONE LINE NAMING ALL OF THEM, NOT A SENTENCE PER GROUP. Six
+            // italic reasons threaded between the controls is the ragged-
+            // paragraph problem the notes column exists to fix, and the first
+            // version of this put it straight back. The greyed control says
+            // THAT it cannot be used; this line says which and why.
+            unused: document.getElementById("unused-note")?.textContent ?? "",
+            // 🔴 STILL IN THE PAGE, NOT NECESSARILY ON SCREEN - and `hidden`
+            // cannot tell the two apart. `runsGroup` lives in the advanced
+            // strip, which is COLLAPSED by default, so it is legitimately
+            // hidden and `offsetParent` is null for a control that is present
+            // and correct. What must never happen is a control being REMOVED on
+            // a method switch: a disabled control explains itself, a vanished
+            // one does not, and taking a control away does not change its value
+            // either. So this asks whether the element is in the document, and
+            // reports separately whether it is hidden for a reason other than
+            // the strip being shut.
+            stillThere: groups.filter((id) => document.getElementById(id) !== null),
+            wronglyHidden: groups.filter((id) => {
               const g = document.getElementById(id);
-              return g !== null && g.offsetParent !== null;
+              return g !== null && g.hasAttribute("hidden") && !g.classList.contains("advanced");
             }),
           });
         })()"""))
         print(f"  on RFD4-Proteina: {switched}")
-        for key in ("disabled", "reasons", "stillThere"):
+        for key in ("disabled", "stillThere"):
             if len(switched[key]) != 3:
                 bad.append(f"switching method: {key} covered {switched[key]}, expected all three groups")
+        # The one line has to NAME every greyed control, or a reader is left with
+        # three dead inputs and no account of why.
+        if switched["wronglyHidden"]:
+            bad.append("a method switch hid a control that is not advanced: "
+                       f"{switched['wronglyHidden']}")
+        missing = [word for word in ("folds with", "cycles", "runs")
+                   if word not in switched["unused"].lower()]
+        if missing:
+            bad.append(f"the unused-control line does not name {missing}: {switched['unused']!r}")
         if "one pass" not in switched["note"] or "🔴" in switched["note"]:
             # 🔴 AND THE REPO'S COMMENT MARKER MUST NOT REACH THE PAGE. It is a
             # convention for source, not a thing to show a reader; it leaked into this
@@ -302,11 +330,15 @@ def main():
             # cycle 0 and cycle 1, so the loop folded, designed, and folded again
             if hunted["rows"] < 4:
                 bad.append(f"the hunt drew {hunted['rows']} rows, expected cycle 0 through 3")
-            # 🔴 THE ROTATION, READ OFF THE TABLE. Alternating is the whole
-            # point; a column reading af3 four times is a rotation that is not
-            # rotating, and would look like a working ensemble.
-            if hunted["folders"][:4] != ["af3", "opendde", "af3", "opendde"]:
-                bad.append(f"the folder did not rotate per cycle: {hunted['folders']}")
+            # 🔴 ONE FOLDER, NAMED ON EVERY ROW. This used to assert an
+            # ALTERNATION - af3, opendde, af3, opendde - from when the page
+            # offered two folders and rotated them per cycle. There is one
+            # folder select now, so the column must read that folder every time;
+            # an empty cell or a second name means the row is reporting
+            # something other than the model that actually folded it.
+            folded = set(hunted["folders"][:4])
+            if folded != {"opendde"}:
+                bad.append(f"the folder column is not the one folder chosen: {hunted['folders']}")
             if hunted["track"] < 4:
                 bad.append(f"the sequence track has {hunted['track']} lines, expected one per cycle")
             if not hunted["viewerShown"]:

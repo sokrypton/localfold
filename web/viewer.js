@@ -46,8 +46,8 @@ export const VIEWER_CANVAS_HEIGHT = 420;
  * @param {(message: string) => void} [options.onFail] shown in place of the
  *   structure; defaults to writing the message into the container.
  */
-export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail,
-                                        frameLabel = "recycle" }) {
+export function createStructureViewer(options) {
+  const { container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail, frameLabel = "recycle" } = options;
   let renderer;
   let objectName;
   let frames = 0;
@@ -98,6 +98,29 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
     },
 
     /**
+     * The design page's own painting: cartoon only, coloured by role.
+     *
+     * 🔴 NO SIDECHAINS. `paint()` above colours them by hydrophobicity, which is
+     * the right answer for looking at ONE finished structure and the wrong one
+     * for watching a design move: every cycle redraws a different set of
+     * sidechains and the backbone - the thing that is actually being designed -
+     * disappears behind them.
+     *
+     * 🔴 AND NO pLDDT RAMP EITHER. It answers "how sure is the model", where
+     * this page's question is "what is being decided". Running both means
+     * whichever painted last silently wins.
+     *
+     * @param {Record<string, string>} roles chain id to colour
+     */
+    paintRoles(roles) {
+      if (renderer === undefined) return;
+      try {
+        renderer.hideSidechains?.();
+      } catch { /* a viewer with none is already right */ }
+      this.colourChains(roles);
+    },
+
+    /**
      * Colour whole chains, one colour each.
      *
      * 🔴 WHICH IS STILL NOT ABOUT THE PREDICTION, so it belongs here: a chain
@@ -120,6 +143,33 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
         } catch {
           /* a chain the structure does not have is not an error worth stopping a hunt for */
         }
+      }
+    },
+
+    /**
+     * Colour individual residues, over whatever `colourChains` has painted.
+     *
+     * 🔴 POSITIONS ARE GLOBAL AND ZERO-BASED - indices into the object's whole
+     * residue list, ligands included, not positions within the chain. That is
+     * py2Dmol's own convention (`positionsFor` ranges over `coords`), and the
+     * `chain` key INTERSECTS rather than re-bases, so passing a chain's own
+     * numbering here silently colours the wrong residues of the right chain.
+     *
+     * 🔴 AND IT MERGES RATHER THAN REPLACES: setColor keeps the advanced colour
+     * object it finds, so a chain colour set first stays underneath. Call this
+     * AFTER colourChains, never before.
+     *
+     * @param {number[]} positions
+     * @param {string} colour
+     * @param {string} [chain]
+     */
+    colourResidues(positions, colour, chain) {
+      if (renderer === undefined || positions.length === 0) return;
+      try {
+        renderer.setColor(colour, chain === undefined
+          ? { positions } : { chain, positions });
+      } catch {
+        /* a residue the structure does not have is not worth stopping a hunt for */
       }
     },
 
@@ -202,7 +252,11 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
         // reason to lose the fold.
         try { renderer.showSidechains(); } catch { /* backbone-only structure */ }
         frames += 1;
-        if (built) { this.paint(); onBuild?.(container); }
+        // 🔴 `onPaint` LETS A PAGE OWN ITS OWN LOOK. index.html's pages want the
+        // pLDDT ramp and hydrophobic sidechains; the design page wants a bare
+        // cartoon coloured by role, and calling paint() first then overriding it
+        // made every frame flash the ramp before settling.
+        if (built) { (options.onPaint ?? (() => this.paint()))(this); onBuild?.(container); }
         return { built, frames };
       } catch (error) {
         if (frames === 0) fail(error instanceof Error ? error.message : String(error));

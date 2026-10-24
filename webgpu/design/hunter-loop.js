@@ -143,6 +143,8 @@ export function withChain(chains, index, sequence) {
  * @param {(cycle: object) => (string|null|Promise<string|null>)} [options.veto]
  *   given a finished cycle, a reason it is not a candidate - or null to keep it.
  *   The reason lands on the record as `vetoed`.
+ * @param {number} [options.beam=1] how many sequences to sample per cycle. Each
+ *   is folded and the best carries forward, so this multiplies the folds.
  * @param {number} [options.seed=0]
  * @param {number} [options.run=0] carried onto every record, for the table
  * @param {AbortSignal} [options.signal]
@@ -167,6 +169,7 @@ export async function* runDesign(options) {
   // silently stops meaning anything in.
   const random = uniformFrom(options.seed ?? 0);
   const temperature = options.temperature ?? 0.1;
+  const beam = Math.max(1, Math.floor(options.beam ?? 1));
   const standingOmit = options.omit ?? "C";
 
   let sequence = chains[chainIndex] ?? "";
@@ -193,6 +196,9 @@ export async function* runDesign(options) {
     let designScore;
     let bias;
     let omit;
+    // The cycle's candidate sequences. Empty on cycle 0, which folds the
+    // starting draw rather than designing anything.
+    let drawn = [];
     if (cycle > 0) {
       omit = omittedLetters(cycle - 1, standingOmit);
       bias = options.alanineBias === true
@@ -201,25 +207,55 @@ export async function* runDesign(options) {
         })
         : 0;
       // ...off the previous cycle's structure, which is the loop's whole point.
-      const designed = await design(previous.pdb, {
-        chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
-        cycle, run,
-        // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
-        // caller's question and not the loop's: a framework, a motif, or
-        // nothing. The loop's only stake is that it is the same every cycle -
-        // held residues that moved between cycles would make the trajectory
-        // meaningless.
-        hold: options.hold,
-      });
-      sequence = designed.sequence;
-      designScore = designed.score;
-      throwIfAborted(signal);
+      //
+      // 🔴 SEVERAL SEQUENCES FROM ONE BACKBONE IS A BEAM, and `beam` is how
+      // wide. MPNN samples from the same structure each time - the draws differ
+      // because they come off the same seeded stream - so the candidates are
+      // different sequences for the SAME backbone, which is the thing worth
+      // searching over. The reference's method is a beam of one.
+      const candidates = [];
+      for (let draw = 0; draw < beam; draw += 1) {
+        const designed = await design(previous.pdb, {
+          chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
+          cycle, run, draw,
+          // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
+          // caller's question and not the loop's: a framework, a motif, or
+          // nothing. The loop's only stake is that it is the same every cycle -
+          // held residues that moved between cycles would make the trajectory
+          // meaningless.
+          hold: options.hold,
+        });
+        throwIfAborted(signal);
+        candidates.push(designed);
+      }
+      drawn = candidates;
     }
 
-    const folded = await fold(withChain(chains, chainIndex, sequence), {
-      cycle, run, signal,
-    });
-    throwIfAborted(signal);
+    // 🔴 EVERY CANDIDATE IS FOLDED AND THE BEST ONE BECOMES THE CYCLE. Scoring
+    // them by MPNN's own likelihood instead would be cheaper and would measure
+    // the wrong thing: the objective is what the FOLD says, and a sequence MPNN
+    // likes is not the same as a sequence that folds to the target.
+    let folded;
+    let picked = null;
+    if (drawn.length <= 1) {
+      sequence = drawn.length === 1 ? drawn[0].sequence : sequence;
+      designScore = drawn[0]?.score;
+      folded = await fold(withChain(chains, chainIndex, sequence), { cycle, run, signal });
+      throwIfAborted(signal);
+    } else {
+      for (const [draw, candidate] of drawn.entries()) {
+        const attempt = await fold(withChain(chains, chainIndex, candidate.sequence),
+          { cycle, run, draw, draws: drawn.length, signal });
+        throwIfAborted(signal);
+        const score = objectiveOf(attempt.confidence ?? {}, chainIndex);
+        if (picked === null || score > picked.score) {
+          picked = { score, candidate, attempt };
+        }
+      }
+      sequence = picked.candidate.sequence;
+      designScore = picked.candidate.score;
+      folded = picked.attempt;
+    }
 
     const confidence = folded.confidence ?? {};
     const { value, objective } = objectiveOf(confidence, chainIndex);
@@ -252,6 +288,8 @@ export async function* runDesign(options) {
     const eligible = cycle > 0 && alanine <= MAX_ALANINE && vetoed === null;
     const record = {
       run, cycle, sequence, alanine, objective, score: value, designScore, vetoed,
+      // How many sequences this cycle tried, so a table can say what it cost.
+      drawn: drawn.length,
       omit, alanineBias: bias, chainIndex, chain: chainLetter,
       complex: withChain(chains, chainIndex, sequence),
       pdb: folded.pdb,

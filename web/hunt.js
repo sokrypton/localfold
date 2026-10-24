@@ -24,6 +24,7 @@ import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
+import { describeValidation, selfConsistency } from "../cpu/design/validate.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
 export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" };
@@ -50,6 +51,10 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  * @param {number} [options.runs=1]
  * @param {number} [options.cycles=5]
  * @param {number} [options.length=75] the designed chain's length
+ * @param {number} [options.beam=1] how many sequences each cycle tries
+ * @param {string} [options.validate] a folding model to re-fold the finished
+ *   design with, for a confidence nothing was optimised against and an RMSD to
+ *   the design it should reproduce
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
@@ -65,8 +70,8 @@ export async function hunt(options) {
   const {
     chains, chainKinds, ligandCodes, modifications, chainIndex = 0, folders = ["af3"],
     designer = "auto", contents = {},
-    runs = 1, cycles = 5, length = 75, report, status = () => {}, progress = () => {},
-    signal,
+    runs = 1, cycles = 5, length = 75, beam = 1, validate, report,
+    status = () => {}, progress = () => {}, progressNote = () => {}, signal,
   } = options;
 
   if (typeof report !== "function") throw new TypeError("hunt needs a report callback");
@@ -134,7 +139,10 @@ export async function hunt(options) {
 
   // The bar spans the WHOLE hunt, so a cycle's own fraction is a fraction of
   // one cell of it. Weight loading took the first tenth.
-  const total = runs * (cycles + 1);
+  // 🔴 THE BEAM MULTIPLIES THE WORK, so the bar has to count the folds and not
+  // the cycles: at four sequences a cycle a bar counting cycles sits still for
+  // four folds and then jumps.
+  const total = runs * (1 + cycles * beam);
   const spanOf = (done, fraction) => 0.1 + 0.9 * ((done + fractionOf(fraction)) / total);
 
   const all = [];
@@ -149,6 +157,7 @@ export async function hunt(options) {
       temperature: options.temperature,
       omit: options.omit,
       hold: options.hold,
+      beam,
 
       // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT
       // ALL. It cannot condition on hotspots the way RFD4 does, so the only way
@@ -166,7 +175,8 @@ export async function hunt(options) {
       seed: (options.seed ?? 0) + run,
 
       fold: async (sequence, context) => {
-        const done = context.run * (cycles + 1) + context.cycle;
+        const cycleStart = context.cycle === 0 ? 0 : 1 + (context.cycle - 1) * beam;
+        const done = context.run * (1 + cycles * beam) + cycleStart + (context.draw ?? 0);
         // 🔴 WHICH MODEL FOLDS THIS CYCLE, AND WHY IT ROTATES BY CYCLE RATHER
         // THAN BY RUN. A design has to satisfy several models instead of
         // overfitting one, which only happens if the model CHANGES UNDER the
@@ -196,6 +206,7 @@ export async function hunt(options) {
           calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
           onStatus: (text) => status(
             `run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles}`
+            + (context.draws > 1 ? ` · sequence ${(context.draw ?? 0) + 1}/${context.draws}` : "")
             + `${folders.length > 1 ? ` · ${folder}` : ""} · ${text}`),
           onProgress: (fraction) => toBar(spanOf(done, fraction)),
         });
@@ -241,7 +252,41 @@ export async function hunt(options) {
     if (record.best === true && (best === null || record.score > best.score)) best = record;
   }
 
+  // 🔴 AND THEN THE ONE NUMBER NOTHING WAS OPTIMISED AGAINST. The objective is
+  // the folding model's opinion of its own design; folding the finished sequence
+  // with a model that had no hand in making it is the only independent thing a
+  // run produces. See cpu/design/validate.js.
+  let validation = null;
+  if (best !== null && validate !== undefined && validate !== ""
+      && FOLDERS[validate] !== undefined) {
+    try {
+      status(`validating with ${validate}`);
+      const weights = await loadAf3Weights(() => {}, FOLDERS[validate]);
+      const refolded = await foldAf3({
+        sequence: best.complex ?? best.sequence,
+        weights, device, signal,
+        seed: (options.seed ?? 0) + 1,
+        calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
+        onStatus: (text) => status(`validating with ${validate} · ${text}`),
+        onProgress: () => {},
+      });
+      const { rmsd, comparable, residues } = selfConsistency(
+        best.pdb, refolded.pdb, CHAIN_IDS[chainIndex]);
+      validation = {
+        model: validate, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
+        pdb: refolded.pdb,
+      };
+      progressNote(describeValidation(validation));
+    } catch (error) {
+      // 🔴 A FAILED VALIDATION DOES NOT FAIL THE RUN. The design is already
+      // made; what is missing is the check, and saying so beats throwing away
+      // the result.
+      validation = { model: validate, failed: error.message };
+      progressNote(`could not validate with ${validate}: ${error.message}`);
+    }
+  }
+
   toBar(1);
   status(best === null ? "no cycle completed" : `best ${best.score.toFixed(3)}`);
-  return { best, cycles: all };
+  return { best, cycles: all, validation };
 }

@@ -38,6 +38,7 @@ export const ROLE_COLOURS = {
 };
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
+import { alignToReference } from "../cpu/design/align.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -85,6 +86,9 @@ const huntLabel = huntButton.querySelector("span");
 const resultsBox = element("results");
 const resultsBody = element("results-body");
 const track = element("cycle-track");
+const advancedButton = element("show-advanced");
+const stepsTitle = element("steps-title");
+const unusedNote = element("unused-note");
 
 // 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
 // same reason as the lookups above: `paintJob` runs while the span list is still
@@ -94,6 +98,45 @@ const track = element("cycle-track");
 // holds is: shared state at the top, helpers as function DECLARATIONS.
 let running = null;
 let loaded = null;
+// 🔴 THE FIRST CYCLE OF THE RUN, KEPT AS THE FRAME EVERY LATER ONE IS FITTED
+// ONTO, and the designed chain's held positions, kept so the viewer can paint
+// them. Both belong to a RUN rather than to a record, so `drawCycle` - which
+// sees one record at a time - cannot derive either.
+let reference = null;
+let held = [];
+
+/**
+ * A chain's own residue numbering, as py2Dmol's global residue indices.
+ *
+ * 🔴 THE TWO NUMBERINGS ARE NOT THE SAME AND LOOK IDENTICAL WHEN THEY AGREE.
+ * `chainsOf` gives positions inside the DESIGNED CHAIN; py2Dmol's `positions`
+ * index the whole object, ligands and target chains included. They coincide
+ * exactly when the designed chain is written first and nothing precedes it -
+ * a monomer design - which is the case a binder run is not.
+ *
+ * Counted off the PDB rather than off the chain lengths, because a ligand's
+ * HETATM residues are in that count too and the span list does not say where.
+ */
+function globalResidues(pdb, chain, positions) {
+  if (positions.length === 0) return [];
+  const wanted = new Set(positions);
+  const out = [];
+  let index = -1;
+  let within = 0;
+  let previous = null;
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    // Chain, residue number and insertion code together identify a residue.
+    const key = line.slice(21, 27);
+    if (key === previous) continue;
+    previous = key;
+    index += 1;
+    if (line[21] !== chain) continue;
+    if (wanted.has(within)) out.push(index);
+    within += 1;
+  }
+  return out;
+}
 
 const say = (text, bad = false) => {
   status.textContent = text;
@@ -121,10 +164,15 @@ const paintDesignerNote = (spans) => {
   const contents = contentsOf(spans);
   if (designerSelect.value === "auto") {
     const { name, why } = chooseDesigner(contents);
-    designerNote.textContent = `Auto → ${DESIGNERS[name].label}, because ${why}.`;
+    // 🔴 THE ANSWER, NOT THE MECHANISM. With the picker hidden there is no
+    // "Auto" for the reader to relate this to, so the line names the checkpoint
+    // and the reason it was chosen, and leaves the arrow out of it.
+    designerNote.textContent = `${DESIGNERS[name].label} designs the sequence, because ${why}.`;
     designerNote.classList.remove("warn");
     return;
   }
+  // ...and the explicit branch below stays live: the select is still settable by
+  // a driver, and re-showing the group is one attribute.
   const chosen = DESIGNERS[designerSelect.value];
   const blind = [];
   // 🔴 NAMED, NOT IMPLIED. These are the cases where an explicit pick drops
@@ -144,28 +192,31 @@ const paintDesignerNote = (spans) => {
 
 const folders = element("folders");
 const folderNote = element("folder-note");
+const beam = element("beam");
 
 /**
- * What the Folders picker says underneath itself.
+ * What the schedule will actually cost, in folds.
  *
- * 🔴 THE ADVICE IS SOMEBODY ELSE'S MEASUREMENT AND IS LABELLED AS SUCH. Yehlin
- * measured two or three folders beating one, and five or six doing worse than
- * two, on her stack with her judge (docs/DESIGN.md 3C). Nothing here has
- * reproduced it, so the page advises and does not enforce.
+ * 🔴 BECAUSE THE BEAM MULTIPLIES IT AND NOTHING ELSE SAYS SO. Sequences × cycles
+ * × runs is the number of folds a hunt runs, and at four sequences over five
+ * cycles that is twenty - minutes of work chosen by a control that looks like
+ * any other number field.
  */
-const paintFolderNote = () => {
-  const n = Array.from(folders.selectedOptions).length;
-  if (n === 0) {
-    folderNote.textContent = "Pick at least one model to fold with.";
-    folderNote.classList.add("warn");
+const paintCost = () => {
+  const sequences = Math.max(1, number("beam", 1));
+  const folds = sequences * (Math.max(1, number("cycles", 5)) + 1) * Math.max(1, number("runs", 1));
+  // 🔴 A GENERATION HAS NO FOLDS TO COUNT. This line is Protein Hunter's
+  // arithmetic and said nothing true on RFD4, where it sat under a method that
+  // folds nothing at all.
+  if (method.value !== "hunter") {
+    folderNote.textContent = "";
+    folderNote.classList.remove("warn");
     return;
   }
-  const rotation = n === 1 ? "One model folds every cycle." : `${n} models, rotating one per cycle.`;
-  let advice = "";
-  if (n === 1) advice = " Two or three usually beat one: a design has to satisfy all of them.";
-  else if (n >= 5) advice = " Five or more did worse than two in the measurement this follows — weak members get an equal vote.";
-  folderNote.textContent = rotation + advice;
-  folderNote.classList.toggle("warn", n >= 5);
+  folderNote.textContent = sequences === 1
+    ? `${folds} folds: one sequence a cycle, the reference's method.`
+    : `${folds} folds: ${sequences} sequences a cycle, and the best carries forward.`;
+  folderNote.classList.toggle("warn", folds > 40);
 };
 
 // 🔴 THE JOB, AS A LIST OF SPANS. One editor for both methods: `chainsOf`
@@ -242,37 +293,14 @@ const paintJob = () => {
 
 window.__designSpans = spanList;
 
-/**
- * The folder chips, which are what a reader actually touches.
- *
- * 🔴 THE <select> STAYS THE STATE, so nothing downstream changes: web/hunt.js
- * reads `selectedOptions`, and the page gate sets `option.selected` and fires a
- * change. The chips only mirror it. A control that is the only one on the strip
- * three rows tall, whose selection greys like a disabled field, is the thing
- * this pass was for.
- */
-const folderChips = element("folder-chips");
-
-const paintFolderChips = () => {
-  folderChips.replaceChildren();
-  for (const option of folders.options) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = `design-chip${option.selected ? " design-chip-on" : ""}`;
-    chip.textContent = option.textContent;
-    chip.setAttribute("aria-pressed", option.selected ? "true" : "false");
-    chip.addEventListener("click", () => {
-      option.selected = !option.selected;
-      folders.dispatchEvent(new Event("change"));
-    });
-    folderChips.append(chip);
-  }
-};
-
 designerSelect.addEventListener("change", () => paintDesignerNote(spanList.read()));
-folders.addEventListener("change", () => { paintFolderChips(); paintFolderNote(); paintMethod(); });
-paintFolderChips();
-paintFolderNote();
+for (const id of ["beam", "cycles", "runs"]) element(id).addEventListener("input", paintCost);
+paintCost();
+paintAdvanced();
+// 🔴 AN ARROW, NOT THE FUNCTION ITSELF: `paintMethod` is declared below this
+// line, and handing the binding over directly reads it before it is
+// initialised. Deferring the lookup to call time is the whole fix.
+folders.addEventListener("change", () => paintMethod());
 
 /**
  * WHICH CONTROLS THE CHOSEN METHOD ACTUALLY HONOURS.
@@ -285,15 +313,9 @@ paintFolderNote();
  * in a loop - so there is no cycle, no designer, and no folding model.
  */
 const UNUSED_BY = {
-  hunter: {
-    // 🔴 STEPS IS RFD4's FLOW, NOT A SCHEDULE. It was left live on both methods
-    // for several passes, where it did nothing at all on a hunt - a control
-    // that silently does nothing is exactly what the rest of this map exists to
-    // prevent.
-    stepsGroup: "Protein Hunter has no flow to step through; its schedule is Cycles and Runs.",
-  },
+  // Nothing: every control on the strip means something to a hunt.
+  hunter: {},
   rfd4p: {
-    designerGroup: "RFD4-Proteina writes its own sequence; there is no separate designer.",
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
     runsGroup: "RFD4-Proteina generates once; run it again for another sample.",
@@ -315,13 +337,38 @@ const RESTING = {
     + " Press Generate.",
 };
 
+/**
+ * The tuning knobs, folded away until asked for.
+ *
+ * 🔴 ELEVEN CONTROLS IS A FORM, NOT A SETTINGS STRIP. The five behind this are
+ * the ones nobody changes on a first run; the six left describe the job.
+ */
+function paintAdvanced() {
+  const open = advancedButton.getAttribute("aria-expanded") === "true";
+  for (const group of document.querySelectorAll("#designOptions .advanced")) {
+    group.hidden = !open;
+  }
+  advancedButton.textContent = open ? "fewer" : "5 more";
+}
+
+advancedButton.addEventListener("click", () => {
+  const open = advancedButton.getAttribute("aria-expanded") === "true";
+  advancedButton.setAttribute("aria-expanded", open ? "false" : "true");
+  paintAdvanced();
+});
+
 const paintMethod = () => {
   const hunter = method.value === "hunter";
+  // 🔴 ONE CONTROL, TWO MEANINGS, AND THE LABEL SAYS WHICH. Both methods sample
+  // a structure over steps; a hunt's are the fold's diffusion steps and RFD4's
+  // are its flow steps.
+  stepsTitle.textContent = hunter ? "Diffusion steps" : "Flow steps";
   if (running === null) say(RESTING[method.value] ?? "");
   // 🔴 THE BUTTON SAYS WHICH MACHINE IT STARTS. "Hunt" is the loop; RFD4
   // generates in one pass and calling that a hunt would misdescribe it.
   if (running === null) huntLabel.textContent = hunter ? "Hunt" : "Generate";
   paintJob();
+  paintCost();
   // 🔴 BOTH DIRECTIONS, from one map. Every group either method cannot use is
   // greyed WITH ITS REASON and never removed - a control that vanishes when the
   // method changes teaches nothing and makes the reader hunt for it again.
@@ -337,14 +384,20 @@ const paintMethod = () => {
     for (const chip of group.querySelectorAll(".design-chip")) {
       chip.disabled = why !== undefined;
     }
-    let reason = group.querySelector(".unavailable-reason");
-    if (reason === null) {
-      reason = document.createElement("div");
-      reason.className = "option-note unavailable-reason";
-      group.append(reason);
-    }
-    reason.textContent = why ?? "";
+    // 🔴 THE REASON DOES NOT GO ON THE GROUP. Six italic sentences threaded
+    // between the controls is the ragged-paragraph problem the notes column was
+    // made to fix, and switching to RFD4 reintroduced it in one step. The greyed
+    // control says THAT it cannot be used; one line below says what and why.
+    group.querySelector(".unavailable-reason")?.remove();
   }
+
+  const names = Object.keys(unusable)
+    .map((id) => document.getElementById(id)?.querySelector(".fetch-option-title")?.textContent)
+    .filter((name) => name !== undefined && name.trim().length > 0)
+    .map((name) => name.toLowerCase());
+  unusedNote.textContent = names.length === 0 ? ""
+    : `${hunter ? "Protein Hunter" : "RFD4-Proteina"} does not use ${names.length === 1
+      ? names[0] : `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`}.`;
 };
 
 method.addEventListener("change", paintMethod);
@@ -417,8 +470,18 @@ const drawCycle = (record) => {
   // 🔴 PUSHED BEFORE THE ROW IS DRAWN would be wrong: the viewer is built on
   // its FIRST frame, and orienting it on that frame is what gives every later
   // one a sensible camera. So push, then orient once, then draw.
+  // 🔴 EVERY CYCLE IS FITTED ONTO THE FIRST, OR THE PLAY BAR SHOWS THE CAMERA
+  // MOVING. Each cycle is an independent fold, so its coordinates sit wherever
+  // the model put them: played back raw, the whole complex tumbles and the one
+  // thing that changed - a loop closing, a helix straightening - is invisible
+  // underneath the tumbling. `alignToReference` holds the chains the design is
+  // NOT, so the designed chain is the only thing that moves.
+  if (reference === null) reference = record.pdb;
+  const placed = reference === record.pdb ? record.pdb
+    : alignToReference(record.pdb, reference, record.chain);
+
   viewerBox.style.display = "";
-  viewer.push(record.pdb, (built) => { if (built) viewer.orient(); });
+  viewer.push(placed, (built) => { if (built) viewer.orient(); });
   // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
   // being DECIDED, and pLDDT answers a different question - so the designed
   // chain takes the "free" colour and everything else the "target" one, the
@@ -430,6 +493,12 @@ const drawCycle = (record) => {
     ...Object.fromEntries(CHAIN_IDS.split("").filter((id) => id !== record.chain)
       .map((id) => [id, ROLE_COLOURS.target])),
   });
+  // 🔴 AND THE HELD RESIDUES OVER THE TOP, which is what makes the picture
+  // answer "which parts are kept": a scaffolded motif is held residues inside
+  // a designed chain, so colouring by chain alone paints the motif as though
+  // the designer were free to rewrite it. The legend has named `held` since the
+  // page was built and nothing painted it until now.
+  viewer.colourResidues(globalResidues(placed, record.chain, held), ROLE_COLOURS.fixed);
 
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;
@@ -453,6 +522,13 @@ const viewerBox = element("viewer-container");
 const viewer = createStructureViewer({
   container: viewerBox,
   frameLabel: "cycle",
+  // 🔴 NO SIDECHAINS, AND NO pLDDT RAMP. The default paint colours sidechains by
+  // hydrophobicity, which is right for ONE finished structure and wrong for
+  // watching a design move: every cycle redraws a different set of them and the
+  // backbone - the thing being designed - disappears behind them. Setting this
+  // at CONSTRUCTION rather than after the first frame is what stops the ramp
+  // flashing on every rebuild before the roles overwrite it.
+  onPaint: (v) => v.paintRoles({}),
   onFail: (message) => say(`the viewer could not start: ${message}`, true),
 });
 
@@ -476,6 +552,9 @@ const startHunt = async () => {
   // length, so frames cannot be shared with the last one.
   viewer.cancelAnimations();
   viewer.reset();
+  // A new run is a new frame of reference and a new held set.
+  reference = null;
+  held = hold;
   say("starting");
   progress.value = 0;
   progress.dataset.state = "running";
@@ -495,11 +574,18 @@ const startHunt = async () => {
       // structure loaded, and tools/check-design-page.py has to be able to force
       // an epitope that cannot be satisfied to prove the veto fires.
       hotspots: window.__designHotspots ?? hotspotsOf(spans),
-      folders: Array.from(folders.selectedOptions, (option) => option.value),
+      // 🔴 STILL A LIST, because web/hunt.js rotates one per cycle and that
+      // capability is intact; the page asks for one.
+      folders: [folders.value],
       designer: designerSelect.value,
       contents: contentsOf(spans),
       runs: number("runs", 1),
       cycles: number("cycles", 5),
+      beam: number("beam", 1),
+      validate: element("validate").value,
+      // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
+      // were not reachable from this page at all.
+      steps: number("steps", 25),
       length,
       temperature: number("temperature", 0.1),
       omit: element("omit").value,
@@ -830,6 +916,10 @@ const startGenerate = async () => {
   track.replaceChildren();
   viewer.cancelAnimations();
   viewer.reset();
+  // A generation is one frame, so there is nothing to fit it onto and nothing
+  // held: RFD4 conditions on given coordinates rather than holding a sequence.
+  reference = null;
+  held = [];
   progress.value = 0;
   progress.dataset.state = "running";
   say("starting");

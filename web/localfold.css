@@ -1275,8 +1275,12 @@
   white-space: nowrap;
 }
 
-.contig-number { width: 6ch; padding: 6px 8px; text-align: right; }
-.contig-chain { width: 4ch; padding: 6px 8px; text-align: center; }
+/* 🔴 WIDE ENOUGH FOR THREE DIGITS AND THE SPINNER. At 6ch a number input fits
+   "75" and clips "120" behind the up/down arrows, which is most of the presets:
+   sm_sam asks for 120-165 and motif_unidx for 60-105. The arrows take ~2ch of
+   whatever is declared, so the field has to be the content plus them. */
+.contig-number { width: 9ch; padding: 6px 4px 6px 8px; text-align: right; }
+.contig-chain { width: 5ch; padding: 6px 8px; text-align: center; }
 .contig-code { width: 6ch; padding: 6px 8px; text-transform: uppercase; }
 .contig-name { width: 5ch; padding: 6px 8px; }
 .contig-hotspots { width: 9ch; padding: 6px 8px; }
@@ -1520,12 +1524,17 @@
 #designOptions #omit { width: 8ch; }
 #designOptions #seed { width: 8ch; }
 #designOptions #temperature { width: 8ch; }
-#designOptions #cycles, #designOptions #runs, #designOptions #steps { width: 6ch; }
-#designOptions #preset { max-width: 260px; }
+#designOptions #cycles, #designOptions #runs, #designOptions #steps,
+#designOptions #beam { width: 8ch; }
+#designOptions #preset { max-width: 240px; }
 #designOptions #designer { max-width: 180px; }
+#designOptions #folders, #designOptions #validate { max-width: 150px; }
 
-/* Folders earns the room the others give back: seven chips on one line. */
-#folderGroup { flex: 1 1 auto; min-width: 0; }
+/* The advanced toggle has no label above it, so it needs the control's own
+   height to sit on the strip's baseline with everything else. */
+#advancedGroup .fetch-option-title { visibility: hidden; }
+
+
 
 /* 🔴 A SPAN ROW STACKS ON A PHONE, because its first track is a select naming a
    kind - "Given sequence" is 290px of a 390px screen, and at that width the

@@ -118,7 +118,19 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                      column answers. One strip, not four boxes. -->
                 <div class="fetch-options" id="designOptions">
 
-                    <div class="fetch-option-group" id="designerGroup">
+                    <!-- 🔴 HIDDEN, AND STILL THE STATE. The automatic rule reads the
+                         job and picks the checkpoint trained for it - LigandMPNN
+                         where there are heteroatoms, NA-MPNN for a nucleic chain,
+                         SolubleMPNN otherwise - and it was right in every case
+                         measured (docs/DESIGN.md section 6). A picker whose
+                         answer is already correct is a question nobody needs
+                         asked, so the control goes and the ANSWER stays: the note
+                         below the strip still names the checkpoint and why.
+
+                         The <select> itself remains, at "auto", because it is
+                         what web/hunt.js reads and what a driver can still set to
+                         force a family by hand. -->
+                    <div class="fetch-option-group" id="designerGroup" hidden>
                         <span class="fetch-option-title">Designer</span>
                         <select id="designer"
                             title="Which MPNN redesigns the binder each cycle. Auto reads the target and picks the checkpoint trained for it.">
@@ -130,31 +142,47 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         </select>
                     </div>
 
-                    <!-- 🔴 A LIST, NOT ONE CHOICE, and the most consequential
-                         control here. Rotating the folder every cycle makes a
-                         design satisfy several models instead of overfitting one;
-                         two or three beat one, and five or six did worse than two
-                         (docs/DESIGN.md 3C - measured elsewhere, not here). -->
+                    <!-- 🔴 ONE FOLDING MODEL. It was a multi-select that rotated a
+                         different model into each cycle - the measured win in
+                         Yehlin's v2 - and the page is simpler asking one
+                         question. web/hunt.js still takes a LIST and still
+                         rotates it, so the capability is intact and untested
+                         from here; what went is the control, not the code.
+
+                         🔴 AND THE MODEL THAT FOLDS IS NOT THE MODEL THAT JUDGES.
+                         A hunt's objective comes from the same fold that made the
+                         design, which is a model scoring its own work; the
+                         Validate control below is the independent check, and
+                         Yehlin's own numbers are AF3-judged for exactly this
+                         reason. -->
                     <div class="fetch-option-group" id="folderGroup">
-                        <span class="fetch-option-title">Folders</span>
-                        <!-- 🔴 THE CHIPS ARE THE CONTROL; THIS SELECT IS THE STATE.
-                             A seven-option multiple select renders as a scrolling
-                             listbox three rows tall - the only control on the
-                             strip that is not one line - and its selected row
-                             greys in a way that reads as disabled. The chips sit
-                             on one line, say what is on at a glance, and write
-                             their answer back here, so every reader of #folders
-                             (web/design.js, the page gate) is untouched. -->
-                        <div id="folder-chips" class="design-chips"></div>
-                        <select id="folders" multiple size="3" hidden
-                            title="Which folding model runs each cycle. Pick two or three: a design then has to satisfy all of them.">
+                        <span class="fetch-option-title">Folds with</span>
+                        <select id="folders"
+                            title="Which model folds the sequence each cycle. Its confidence is the objective being optimised.">
                             <option value="af3" selected>AF3</option>
                             <option value="boltz2">Boltz-2</option>
                             <option value="protenix2">Protenix-2</option>
                             <option value="opendde">OpenDDE</option>
-                            <option value="rosettafold3">RoseTTAFold3</option>
-                            <option value="intellifold2">IntelliFold-2</option>
-                            <option value="ef2">ESMFold2</option>
+                        </select>
+                    </div>
+
+                    <!-- 🔴 THE INDEPENDENT CHECK, AND THE ONLY NUMBER THAT IS NOT
+                         SELF-REPORTED. Protein Hunter optimises a model's opinion
+                         of its own design; RFD4-Proteina generates a structure and
+                         scores nothing at all. Folding the finished sequence with
+                         a model that had no hand in making it gives a confidence
+                         that was not optimised against, and an RMSD to the design
+                         it was supposed to reproduce - which is the standard
+                         self-consistency check. -->
+                    <div class="fetch-option-group" id="validateGroup">
+                        <span class="fetch-option-title">Validate with</span>
+                        <select id="validate"
+                            title="Fold the finished design again with a model that did not make it, and report its confidence and how far it moved.">
+                            <option value="">nothing</option>
+                            <option value="af3" selected>AF3</option>
+                            <option value="boltz2">Boltz-2</option>
+                            <option value="protenix2">Protenix-2</option>
+                            <option value="opendde">OpenDDE</option>
                         </select>
                     </div>
 
@@ -164,34 +192,52 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                             title="How many fold-then-redesign rounds each run does.">
                     </div>
 
-                    <div class="fetch-option-group" id="runsGroup">
+                    <!-- 🔴 HOW MANY SEQUENCES A CYCLE TRIES. One is the reference's
+                         method: design once, fold it, carry it forward. More is a
+                         beam - MPNN samples several sequences from the same
+                         backbone, each is folded, and the best carries forward -
+                         which explores more per cycle and costs that many folds.
+                         The cost is linear and worth saying out loud. -->
+                    <div class="fetch-option-group" id="beamGroup">
+                        <span class="fetch-option-title">Sequences</span>
+                        <input type="number" id="beam" min="1" max="16" value="1"
+                            title="How many sequences MPNN samples per cycle. Each is folded and the best carries forward, so this multiplies the folds.">
+                    </div>
+
+                    <div class="fetch-option-group advanced" id="runsGroup">
                         <span class="fetch-option-title">Runs</span>
                         <input type="number" id="runs" min="1" max="100" value="1"
                             title="How many independent hunts to do, each from its own seed.">
                     </div>
 
-                    <div class="fetch-option-group" id="stepsGroup">
-                        <span class="fetch-option-title">Steps</span>
-                        <input type="number" id="steps" min="4" max="400" value="60"
-                            title="How many flow-matching steps RFD4-Proteina takes.">
+                    <!-- 🔴 STEPS MEANS SOMETHING ON BOTH METHODS, and greying it
+                         out on Protein Hunter was wrong: a fold has diffusion
+                         steps too, they were simply never exposed and ran at the
+                         sampler's own default of 25. RFD4-Proteina's are flow
+                         steps. Same control, same question - how long to sample -
+                         and the label says which. -->
+                    <div class="fetch-option-group advanced" id="stepsGroup">
+                        <span class="fetch-option-title" id="steps-title">Diffusion steps</span>
+                        <input type="number" id="steps" min="4" max="400" value="25"
+                            title="How many sampling steps each structure takes.">
                     </div>
 
                     <!-- The knobs that decide what the designer may write. The
                          field names follow maraxen/aminx's RunSpec, so a spec, a
                          script and this page mean the same thing by them. -->
-                    <div class="fetch-option-group" id="temperatureGroup">
+                    <div class="fetch-option-group advanced" id="temperatureGroup">
                         <span class="fetch-option-title">Temperature</span>
                         <input type="number" id="temperature" min="0.01" max="2" step="0.01" value="0.1"
                             title="How sharply the designer samples. Low is conservative.">
                     </div>
 
-                    <div class="fetch-option-group" id="omitGroup">
+                    <div class="fetch-option-group advanced" id="omitGroup">
                         <span class="fetch-option-title">Omit</span>
                         <input type="text" id="omit" value="C" maxlength="20"
                             title="Amino acid letters the designer may never write. Cysteine is omitted by default.">
                     </div>
 
-                    <div class="fetch-option-group" id="seedGroup">
+                    <div class="fetch-option-group advanced" id="seedGroup">
                         <span class="fetch-option-title">Seed</span>
                         <input type="number" id="seed" min="0" value="0"
                             title="A given job, setting and seed give the same result every time.">
@@ -214,6 +260,21 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         </div>
                     </div>
 
+                    <!-- 🔴 ELEVEN CONTROLS IS NOT A SETTINGS STRIP, IT IS A FORM.
+                         Five of them - runs, steps, temperature, omit, seed - are
+                         tuning nobody changes on a first run, and they were
+                         crowding the six that describe the job. They fold away
+                         behind this, and the toggle says how many are behind it
+                         rather than being an unlabelled chevron. -->
+                    <div class="fetch-option-group" id="advancedGroup">
+                        <span class="fetch-option-title">&nbsp;</span>
+                        <button type="button" id="show-advanced" class="btn btn-grey btn-small"
+                            aria-expanded="false"
+                            title="Runs, sampling steps, temperature, omitted letters and the seed.">
+                            5 more
+                        </button>
+                    </div>
+
                     <!-- Ten worked examples, each a modality. Loading one fills
                          the spans, so an example is a starting point to edit
                          rather than a black box to run. -->
@@ -233,6 +294,7 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                      collected here they read as one short column and the strip
                      stays a strip. -->
                 <div class="design-notes">
+                    <div id="unused-note" class="option-note"></div>
                     <div id="designer-note" class="option-note"></div>
                     <div id="folder-note" class="option-note"></div>
                     <div id="preset-note" class="option-note"></div>
