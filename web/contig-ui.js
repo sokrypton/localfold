@@ -50,8 +50,8 @@ export const SPAN_LABELS = {
 /** What each kind is, shown as the picker's title. */
 export const SPAN_NOTES = {
   generated: "Residues to design. Give one length, or a range for the method to choose from.",
-  sequence: "A chain you know the sequence of. Protein Hunter folds it; RFD4-Proteina needs its"
-    + " coordinates, so use \u201cFrom structure\u201d there.",
+  sequence: "A chain you know the sequence of - protein, DNA or RNA. Protein Hunter folds it;"
+    + " RFD4-Proteina needs its coordinates, so use \u201cFrom structure\u201d there.",
   segment: "Residues taken from a loaded structure, held as they are.",
   ligand: "A small molecule by its CCD code, as context to design against.",
   break: "Everything after this is a separate chain.",
@@ -98,7 +98,7 @@ const number = (value, fallback) => {
 /** A fresh span of `kind`, with defaults a reader would expect. */
 export function emptySpan(kind = "generated") {
   if (kind === "generated") return { kind, min: 75, max: 75 };
-  if (kind === "sequence") return { kind, value: "" };
+  if (kind === "sequence") return { kind, value: "", polymer: "protein" };
   if (kind === "segment") return { kind, chain: "A", first: 1, last: 100 };
   if (kind === "ligand") return { kind, code: "" };
   return { kind };
@@ -209,13 +209,20 @@ export function contigOf(spans, method = "rfd4p") {
  * @param {object[]} spans
  * @param {object} [options]
  * @param {(chain: string, first: number, last: number) => string|null} [options.sequenceOf]
- * @returns {{chains: string[], chainIndex: number, length: number, problems: string[]}}
+ * @returns {{chains: string[], chainKinds: string[], ligandCodes: string[],
+ *            chainIndex: number, length: number, problems: string[]}}
  */
 export function chainsOf(spans, options = {}) {
   const sequenceOf = options.sequenceOf;
+  // 🔴 WHAT EACH CHAIN IS MADE OF, AND THE LIGANDS BESIDE THEM, because the FOLD
+  // needs both: the featuriser gives a ligand a chain of its own and reads a
+  // nucleic chain one token per base, so a DNA target folded as protein is not a
+  // slower answer, it is a different one. They travel with the chains.
+  const kinds = [];
+  const ligands = [];
   const chains = [];
   const problems = [];
-  let current = { parts: [], designed: false, length: 0 };
+  let current = { parts: [], designed: false, length: 0, polymer: "protein" };
   const finish = () => {
     if (current.parts.length === 0 && !current.designed) return;
     if (current.designed && current.parts.length > 0) {
@@ -223,8 +230,10 @@ export function chainsOf(spans, options = {}) {
         + " put a chain break between them");
     }
     chains.push(current.designed ? "" : current.parts.join(""));
+    // A designed chain is always protein: nothing here designs nucleic acids.
+    kinds.push(current.designed ? "protein" : current.polymer);
     if (current.designed) lengths.push(current.length);
-    current = { parts: [], designed: false, length: 0 };
+    current = { parts: [], designed: false, length: 0, polymer: "protein" };
   };
   const lengths = [];
   for (const span of spans) {
@@ -233,6 +242,13 @@ export function chainsOf(spans, options = {}) {
       const value = String(span.value ?? "").trim().toUpperCase();
       if (value.length === 0) problems.push("a given sequence is empty");
       current.parts.push(value);
+      // 🔴 THE FIRST SPAN OF A CHAIN DECIDES ITS TYPE, and mixing two inside one
+      // chain is reported rather than resolved - a chain is one polymer.
+      if (current.parts.length === 1) current.polymer = span.polymer ?? "protein";
+      else if ((span.polymer ?? "protein") !== current.polymer) {
+        problems.push("a chain cannot be part protein and part nucleic;"
+          + " put a chain break between them");
+      }
       continue;
     }
     if (span.kind === "generated") {
@@ -254,7 +270,11 @@ export function chainsOf(spans, options = {}) {
       current.parts.push(sequence);
       continue;
     }
-    if (span.kind === "ligand") continue;
+    if (span.kind === "ligand") {
+      const code = String(span.code ?? "").trim().toUpperCase();
+      if (code.length > 0) ligands.push(code);
+      continue;
+    }
   }
   finish();
 
@@ -263,7 +283,10 @@ export function chainsOf(spans, options = {}) {
   if (lengths.length > 1) {
     problems.push("Protein Hunter designs one chain at a time, not " + lengths.length);
   }
-  return { chains, chainIndex, length: lengths[0] ?? 0, problems: [...new Set(problems)] };
+  return {
+    chains, chainKinds: kinds, ligandCodes: ligands, chainIndex,
+    length: lengths[0] ?? 0, problems: [...new Set(problems)],
+  };
 }
 
 /**
@@ -365,7 +388,19 @@ export function createContigList(rowsContainer, addButton, options = {}) {
         value.placeholder = "the chain's one-letter sequence";
         value.title = "A chain whose sequence you know. Protein Hunter folds it.";
         bind(value, "value", (text) => text.replace(/\s+/g, "").toUpperCase());
-        fields.append(value);
+        const polymer = element("select", "entity-picker");
+        polymer.title = "What this chain is. A nucleic chain folds one token per base.";
+        for (const [key, label] of [["protein", "protein"], ["dna", "DNA"], ["rna", "RNA"]]) {
+          const option = element("option", undefined, label);
+          option.value = key;
+          option.selected = (span.polymer ?? "protein") === key;
+          polymer.append(option);
+        }
+        polymer.addEventListener("change", () => {
+          spans[index] = { ...spans[index], polymer: polymer.value };
+          changed();
+        });
+        fields.append(polymer, value);
         if (limits.sequence !== undefined) {
           row.classList.add("contig-row-unavailable");
           fields.append(element("div", "option-note warn contig-reason", limits.sequence));

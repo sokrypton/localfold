@@ -121,7 +121,8 @@ describe("the design job as a list of spans", () => {
       const spans = [{ kind: "sequence", value: TARGET }, { kind: "break" },
         { kind: "generated", min: 12, max: 12 }];
       expect(chainsOf(spans)).toEqual({
-        chains: [TARGET, ""], chainIndex: 1, length: 12, problems: [],
+        chains: [TARGET, ""], chainKinds: ["protein", "protein"], ligandCodes: [],
+        chainIndex: 1, length: 12, problems: [],
       });
       // ...and the designed chain can come first, which is how v1 ordered them
       const first = chainsOf([{ kind: "generated", min: 20, max: 20 }, { kind: "break" },
@@ -175,7 +176,8 @@ describe("the design job as a list of spans", () => {
       const sequenceOf = (chain, first, last) => (chain === "A" && first === 10 && last === 14
         ? "MKVLA" : null);
       expect(chainsOf(spans, { sequenceOf })).toEqual({
-        chains: ["MKVLA", ""], chainIndex: 1, length: 8, problems: [],
+        chains: ["MKVLA", ""], chainKinds: ["protein", "protein"], ligandCodes: [],
+        chainIndex: 1, length: 8, problems: [],
       });
 
       // ...and a span naming residues the structure does not have says which
@@ -183,6 +185,32 @@ describe("the design job as a list of spans", () => {
         { kind: "break" }, { kind: "generated", min: 8, max: 8 }];
       expect(chainsOf(missing, { sequenceOf }).problems)
         .toContain("chain Z 1-9 is not in the loaded structure");
+    });
+
+    // 🔴 WHAT A CHAIN IS MADE OF CHANGES THE FOLD, NOT ONLY THE DESIGNER. The
+    // featuriser reads a nucleic chain one token per base and gives each ligand
+    // a chain of its own, so a DNA target folded as protein is not a slower
+    // answer - it is a different one. The kinds travel with the chains.
+    it("carries each chain's polymer and the ligands beside them", () => {
+      const dna = chainsOf([{ kind: "sequence", value: "ATGCATGC", polymer: "dna" },
+        { kind: "break" }, { kind: "generated", min: 20, max: 20 }]);
+      expect(dna.chainKinds).toEqual(["dna", "protein"]);
+      expect(dna.chains).toEqual(["ATGCATGC", ""]);
+
+      const withLigand = chainsOf([{ kind: "generated", min: 60, max: 60 },
+        { kind: "break" }, { kind: "ligand", code: "hem" }]);
+      expect(withLigand.ligandCodes).toEqual(["HEM"]);
+      // a designed chain is protein whatever else is in the job
+      expect(withLigand.chainKinds).toEqual(["protein"]);
+
+      // 🔴 A CHAIN IS ONE POLYMER. Mixing two inside one chain is reported
+      // rather than resolved, because either resolution is a different molecule
+      // from the one asked for.
+      expect(chainsOf([{ kind: "sequence", value: "AAA" },
+        { kind: "sequence", value: "ATGC", polymer: "dna" },
+        { kind: "break" }, { kind: "generated", min: 9, max: 9 }]).problems)
+        .toContain("a chain cannot be part protein and part nucleic;"
+          + " put a chain break between them");
     });
 
     it("ignores a ligand, which is context and not a chain", () => {

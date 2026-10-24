@@ -33,6 +33,11 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  * @param {object} options
  * @param {string[]} options.chains every chain of the complex; the designed
  *   one's entry is replaced each cycle and starts empty
+ * @param {string[]} [options.chainKinds] what each chain is made of
+ *   (`"protein" | "dna" | "rna"`), which changes the FOLD and not only the
+ *   designer: the featuriser reads a nucleic chain one token per base
+ * @param {string[]} [options.ligandCodes] ligands beside the chains, each given
+ *   a chain of its own by the featuriser
  * @param {number} [options.chainIndex=0] which chain is designed
  * @param {string[]} [options.folders=["af3"]] which models fold, rotating one per cycle
  * @param {string} [options.designer="auto"] a key of DESIGNERS, or "auto"
@@ -49,7 +54,8 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  */
 export async function hunt(options) {
   const {
-    chains, chainIndex = 0, folders = ["af3"], designer = "auto", contents = {},
+    chains, chainKinds, ligandCodes, chainIndex = 0, folders = ["af3"],
+    designer = "auto", contents = {},
     runs = 1, cycles = 5, length = 75, report, status = () => {}, progress = () => {},
     signal,
   } = options;
@@ -66,8 +72,14 @@ export async function hunt(options) {
   // 🔴 THE SEQUENCE IS CHECKED BEFORE ANY WEIGHTS ARE FETCHED. A hunt is many
   // folds, and finding out after a 300 MB download that a chain has a letter
   // the model has no token for is the worst moment to find out.
+  //
+  // 🔴 PROTEIN CHAINS ONLY. af3SequenceProblem reads the protein alphabet, so a
+  // DNA chain's A, T, G and C would be judged against it - three of the four are
+  // legal amino acids and T is not, which makes it fail for the wrong reason and
+  // pass for worse ones.
   for (const [index, chain] of chains.entries()) {
     if (index === chainIndex || chain.length === 0) continue;
+    if ((chainKinds?.[index] ?? "protein") !== "protein") continue;
     const problem = af3SequenceProblem(chain);
     if (problem !== null) throw new Error(`chain ${index + 1}: ${problem}`);
   }
@@ -144,6 +156,11 @@ export async function hunt(options) {
         foldedBy = folder;
         return foldAf3({
           sequence, weights: loaded.get(folder), device, signal,
+          // A ligand and a nucleic chain change the FOLD as well as the
+          // designer: the featuriser gives each ligand a chain of its own and
+          // reads a nucleic chain one token per base.
+          ...(chainKinds === undefined ? {} : { chainKinds }),
+          ...(ligandCodes === undefined || ligandCodes.length === 0 ? {} : { ligandCodes }),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the

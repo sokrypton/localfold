@@ -48,14 +48,17 @@ const element = (id) => {
 /**
  * The two counts `chooseDesigner` reads, from the spans.
  *
- * 🔴 NUCLEIC IS ALWAYS ZERO FOR NOW, and that is a gap rather than a fact: a
- * span does not yet say whether a given chain is protein or DNA, so a nucleic
- * target cannot be expressed and NA-MPNN can only be chosen by hand. Marking
- * the span's polymer type is the next piece of the editor.
+ * 🔴 BOTH ARE REAL NOW: a `Given sequence` span says whether it is protein, DNA
+ * or RNA, so a nucleic target picks NA-MPNN and a ligand picks LigandMPNN
+ * without anyone choosing by hand. That is the rule the reference uses, and
+ * `cpu/design/designers.js` owns it.
  */
+const NUCLEIC = new Set(["dna", "rna"]);
+
 const contentsOf = (spans) => ({
   ligands: spans.filter((span) => span.kind === "ligand").length,
-  nucleic: 0,
+  nucleic: spans.filter((span) => span.kind === "sequence" && NUCLEIC.has(span.polymer ?? ""))
+    .length,
 });
 
 // 🔴 THE METHOD PICKER IS LOOKED UP FIRST, before anything that reads it. The
@@ -382,7 +385,8 @@ const startHunt = async () => {
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
-  const { chains, chainIndex, length, problems } = chainsOf(spans, { sequenceOf: resolver() });
+  const { chains, chainKinds, ligandCodes, chainIndex, length, problems }
+    = chainsOf(spans, { sequenceOf: resolver() });
   if (problems.length > 0) {
     say(problems.join(" · "), true);
     return;
@@ -403,6 +407,8 @@ const startHunt = async () => {
   try {
     const { best } = await hunt({
       chains,
+      chainKinds,
+      ligandCodes,
       chainIndex,
       folders: Array.from(folders.selectedOptions, (option) => option.value),
       designer: designerSelect.value,
