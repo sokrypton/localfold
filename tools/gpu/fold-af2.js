@@ -505,7 +505,9 @@ export async function main(device, args) {
     const checksum = checksumOf(other.final.structure.atom37);
     repeats.push({ milliseconds: Math.round(performance.now() - at), checksum,
                    sameFold: checksum === firstChecksum });
-    if (checksum !== firstChecksum) {
+    // `--allow-nondeterminism` records every repeat instead, so the pattern can be read: A, B, B is a
+    // first-touch difference, A, B, C a race (bench-af2-warm.js's same escape).
+    if (checksum !== firstChecksum && !args.includes("--allow-nondeterminism")) {
       throw new Error(`fold ${again + 1} returned checksum ${checksum} where the first`
         + ` returned ${firstChecksum}; the same input at the same seed must fold the same`);
     }

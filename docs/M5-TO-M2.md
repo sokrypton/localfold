@@ -345,3 +345,18 @@ attention is `flash-registers-32-chunk16`), `maxStorageBuffersPerShaderStage` **
 `probe-limits.js` **kills the GPU process** there ("Instance dropped in popErrorScope") rather than refusing: it holds
 twelve pair tensors at 1000 residues, ~5.7 GB, and Android takes the instance instead of returning out-of-memory - so
 the page's out-of-memory handling is not what a phone user meets.
+
+**The Pixel 9, continued** (`LOCALFOLD_GPU_ANDROID=1`; Chrome's shader cache there is the user's own profile and warm).
+- **AF2's first fold differs from its repeats, and it is tiered loop bounds, not a race.** `fold-af2.js --repeat=6`:
+  -1318268 then -1305572 five times, the first identical across processes (A, B, B - no race). With
+  `--tune=runtimeLoopBounds=false` every fold is -1305572; `--no-pool` changes nothing. pLDDT 62.932 against 62.916.
+  With the cache warm, tiering costs rather than pays: first fold 6.49-6.54 s tiered against 6.30-6.38 without.
+  `fold-af2.js --allow-nondeterminism` (new) records every repeat instead of throwing at the first difference.
+- **ESMFold2** folds deterministically, 40 residues in ~3.7 s. **AF3** at 255 tokens (5CAJ A, 25 steps): ~61 s a warm
+  fold, half pairformer and half diffusion, peak 1007 MiB.
+- **The Apple prior beats no prior on Mali**, two rounds alternated, `--prior=metal-3`: AF2 warm 5.30-5.51 -> 3.80-3.94
+  s (**1.4x**), AF3 255 warm 61.3-61.4 -> 53.5-54.8 s (1.13x; diffusion 1.3x), ESMFold2 3.66-3.68 -> 3.46-3.51 s.
+  `--prior=ampere` is level with none. The AF2 gain, one knob kept at a time: `linearHalfTile` 4.37 s,
+  `attentionProjectHalfTile` 4.79, `attentionOutputHalfTile` 5.08; `trianglePairProjectTile`, `runtimeLoopBounds`,
+  `attentionGroup` level; `fusedPairBias` and `vectorGemmBlock` slightly worse (5.55-5.65). So a Mali prior is the three
+  half tiles and not the rest - the AF3 diffusion knobs are being attributed next.
