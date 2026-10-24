@@ -188,9 +188,14 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
 // ---------------------------------------------------------------- the encoder
 // per-block pair logits off the pair conditioning: LN (scale only), one projection to blocks x heads, laid out per block
 std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
-                                   const AtomShape& sh) {
+                                   const AtomShape& sh, const float* qMask, const float* kMask, bool keyMasked, int D,
+                                   const float* qUid, const float* kUid) {
   std::vector<float*> out;
   size_t per = (size_t)sh.subsets * heads * sh.queries * sh.keys;
+  static const bool scalarAttention = getenv("AF3_SCALAR_ATOM_ATTENTION") != nullptr;
+  const uint log2Scale = (!scalarAttention && sh.queries == 32 && sh.keys <= 128 && (D == 16 || D == 32)) ? 1u : 0u;
+  Gather tq = qUid ? gatherOf("batch.tokensToQueries") : Gather{};
+  Gather tk = qUid ? gatherOf("batch.tokensToKeys") : Gather{};
   half* pn = scratch<half>("apl.pn", pairRows * Cp);
   if (flag(P + ".pairNormPerBlock")) {      // a block its own LayerNorm scale and projection (OpenDDE, protenix2)
     float* flat = scratch<float>("apl.flat", pairRows * heads);
@@ -198,7 +203,9 @@ std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size
       ln(pair, pn, pairRows, Cp, P + ".pairInputLayerNormScales." + num(b), "");
       lin(pn, P + ".pairLogitsProjections." + num(b), flat, pairRows, Cp, heads);
       float* pl = scratch<float>(P + ".pl" + num(b), per);
-      run1d("af3_atom_logits", per, AtomLogitsArgs{flat, pl, 0, 1, (uint)sh.subsets, (uint)heads, (uint)sh.queries, (uint)sh.keys});
+      run1d("af3_atom_logits", per,
+            AtomLogitsArgs{flat, qMask, kMask, qUid, tq.mask, kUid, tk.mask, pl, 0, 1, (uint)sh.subsets, (uint)heads,
+                           (uint)sh.queries, (uint)sh.keys, keyMasked ? 1u : 0u, log2Scale});
       out.push_back(pl);
     }
     return out;
@@ -208,8 +215,9 @@ std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size
   lin(pn, P + ".pairLogitsProjection", flat, pairRows, Cp, nblocks * heads);
   for (int b = 0; b < nblocks; ++b) {
     float* pl = scratch<float>(P + ".pl" + num(b), per);
-    run1d("af3_atom_logits", per, AtomLogitsArgs{flat, pl, (uint)b, (uint)nblocks, (uint)sh.subsets, (uint)heads, (uint)sh.queries,
-                                                 (uint)sh.keys});
+    run1d("af3_atom_logits", per,
+          AtomLogitsArgs{flat, qMask, kMask, qUid, tq.mask, kUid, tk.mask, pl, (uint)b, (uint)nblocks, (uint)sh.subsets,
+                         (uint)heads, (uint)sh.queries, (uint)sh.keys, keyMasked ? 1u : 0u, log2Scale});
     out.push_back(pl);
   }
   return out;
@@ -332,12 +340,11 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
     lin(h1, E + ".pairMlp3", o.pair, pairRows, Cp, Cp, 1.f);
   }
   int nblocks = 0; while (M.has(E + ".blocks." + num(nblocks) + ".qProjection")) ++nblocks;
-  std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh);
-  if (chai)     // chai: attention within one reference space (one residue, or one ligand)
-    for (float* pl : logits) sameRefMask(pl, o.qUid, o.kUid, o.heads, sh);
-  for (int b = 0; b < nblocks; ++b) o.blocks.push_back(prepareAtomBlock(E + ".blocks." + num(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = flag(E + ".blocks.0.keyMaskedAtomAttention");
   o.noResidual = flag(E + ".blocks.0.diffusionNoResidual");
+  std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh,
+                                              o.qMask, o.kMask, o.keyMasked, o.D, chai ? o.qUid : nullptr, chai ? o.kUid : nullptr);
+  for (int b = 0; b < nblocks; ++b) o.blocks.push_back(prepareAtomBlock(E + ".blocks." + num(b), o.qCond, qRows, C, logits[b]));
   releaseScratch({"enc.", "apl.", "ada."});
   return o;
 }

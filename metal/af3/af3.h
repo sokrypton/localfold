@@ -71,7 +71,7 @@ struct Masks { const float* pair; const float* seq; bool ones; };
 // (into: where the residual goes, when not the input itself - chai-1's parallel block)
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf);
 half* takePairLn(const void* x, const std::string& norm);
-bool canEmitPairLn(int C);
+bool canEmitPairLn(int C, size_t rows = 1024);
 half* pairLn(const float* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
 half* pairLn(const half* pair, size_t P, int C, const std::string& norm, const std::string& nextNorm = "");
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
@@ -163,7 +163,8 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
                  const float* txFfwScale = nullptr, const float* txFfwShift = nullptr, half* txFfwOut = nullptr,
                  int txLd = 0, bool txPreSigmoid = false);
 std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks, int heads,
-                                   const AtomShape& sh);
+                                   const AtomShape& sh, const float* qMask = nullptr, const float* kMask = nullptr,
+                                   bool keyMasked = false, int D = 0, const float* qUid = nullptr, const float* kUid = nullptr);
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);
 struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMasked, noResidual, maskPerBlock = false; };
 // chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space

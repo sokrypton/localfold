@@ -230,17 +230,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     variance += d * d;
   }
   let inverse = inverseSqrt(variance / f32(C) + EPSILON);
-  for (var c = 0u; c < C; c += 1u) {
-    norm_act[c] = (norm_act[c] - mean) * inverse
-      * weights[P_atomFeaturesLayerNormScale + c]
-      + weights[P_atomFeaturesLayerNormOffset + c];
-  }
-
   var v0 = 0.0;
   var v1 = 0.0;
   var v2 = 0.0;
   for (var c = 0u; c < C; c += 1u) {
-    let n_c = norm_act[c];
+    let n_c = (norm_act[c] - mean) * inverse
+      * weights[P_atomFeaturesLayerNormScale + c]
+      + weights[P_atomFeaturesLayerNormOffset + c];
     let wBase = P_atomFeaturesToPositionUpdate + c * 3u;
     v0 += n_c * weights[wBase];
     v1 += n_c * weights[wBase + 1u];

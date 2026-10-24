@@ -76,8 +76,9 @@ struct ReluHArgs { CP(float) x; DP(half) y; u64 n; };
 struct AtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float) kPos; CP(float) qUid; CP(float) kUid; CP(float) kMask;
                       CP(float) Woff; CP(float) Wdist; CP(float) Wvalid; CP(float) tp; CP(int) tqIdx; CP(float) tqMask; CP(int) tkIdx;
                       CP(float) tkMask; DP(float) pair; uint subsets, queries, keys, Cp, tokens, maskPadded; };
-// flat [(s, q, k)][blocks heads] -> block b's [s][h][q][k]
-struct AtomLogitsArgs { CP(float) flat; DP(float) out; uint block, nblocks, subsets, heads, queries, keys; };
+// flat [(s, q, k)][blocks heads] -> block b's [s][h][q][k], with (qMask, kMask) bias and optional sameRefMask/log2Scale baked in
+struct AtomLogitsArgs { CP(float) flat; CP(float) qMask; CP(float) kMask; CP(float) qUid; CP(float) tqMask; CP(float) kUid; CP(float) tkMask;
+                        DP(float) out; uint block, nblocks, subsets, heads, queries, keys, keyMasked, log2Scale; };
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift (scale, shift read at row % period), to half or float (and kOut when paired)
 struct AdaLnArgs { DP(float) x; CP(float) scale; CP(float) shift; DP(half) out; DP(float) outF; CP(float) kScale; CP(float) kShift; DP(half) kOut;
                    CP(float) resY; CP(half) resYh; CP(float) resGate; CP(float) fScale; CP(float) fShift; DP(half) fOut; CP(float) rowMask;

@@ -903,9 +903,18 @@ kernel void af3_atom_pair(LF_ARGS(AtomPairArgs)) {
 kernel void af3_atom_logits(LF_ARGS(AtomLogitsArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.subsets * a.heads * a.queries * a.keys) return;
-  uint key = (uint)(t % a.keys); ulong rest = t / a.keys; uint q = (uint)(rest % a.queries); rest /= a.queries;
-  uint h = (uint)(rest % a.heads), s = (uint)(rest / a.heads);
-  a.out[t] = a.flat[(((ulong)s * a.queries + q) * a.keys + key) * a.nblocks * a.heads + a.block * a.heads + h];
+  uint u = (uint)t, qv = lf_udiv(u, a.keys), key = u - qv * a.keys;
+  uint hv = lf_udiv(qv, a.queries), q = qv - hv * a.queries;
+  uint s = lf_udiv(hv, a.heads), h = hv - s * a.heads;
+  ulong qi = (ulong)s * a.queries + q, ki = (ulong)s * a.keys + key;
+  float pl = a.flat[(qi * a.keys + key) * a.nblocks * a.heads + a.block * a.heads + h];
+  if (a.qUid && !(a.tqMask[qi] != 0.f && a.tkMask[ki] != 0.f && a.qUid[qi] == a.kUid[ki])) pl = -1e9f;
+  if (a.qMask && a.kMask) {
+    float qm = a.qMask[qi], km = a.kMask[ki];
+    float mb = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - km)) : (1e9f * (qm - 1.f)) * (km - 1.f);
+    pl += mb;
+  }
+  a.out[t] = a.log2Scale ? pl * M_LOG2E_F : pl;
 }
 kernel void af3_sigmoid_atom(LF_ARGS(SigmoidAtomArgs)) {
   ulong t = LF_INDEX;
@@ -1160,15 +1169,12 @@ kernel void af3_atom_attention(constant AtomAttnArgs& a [[buffer(0)]], uint3 tg 
     ulong qrow = (ulong)s * a.queries + qi;
     for (uint e = lane; e < D; e += 32) Qs[sg][e] = ((float)a.qg[qrow * W2 + h * D + e] + a.qBias[h * D + e]) * scale;
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    float qm = a.qMask[(ulong)ss * a.queries + qi];
     device const float* pl = a.logits + (((ulong)ss * a.heads + h) * a.queries + qi) * a.keys;
     float mx = -1e30f;
     for (uint key = lane; key < a.keys; key += 32) {
       float dot = 0.f;
       for (uint e = 0; e < D; ++e) dot += Qs[sg][e] * (float)Ks[key * LD + e];
-      float km = a.kMask[(ulong)ss * a.keys + key];
-      float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - km)) : 1e9f * (qm - 1.f) * (km - 1.f);
-      float l = dot + maskBias + pl[key];
+      float l = dot + pl[key];
       Ps[sg][key] = l; mx = max(mx, l);
     }
     mx = simd_max(mx);
@@ -1888,19 +1894,14 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
   }
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
   const uint q = sg * 8 + sm;
-  const float qm = a.qMask[(ulong)ss * Q + q];
   device const float* pl = a.logits + (((ulong)ss * a.heads + h) * Q + q) * a.keys;
-  device const float* km = a.kMask + (ulong)ss * a.keys;
   float mx = -1e30f;
   if (fullK) {
     _Pragma("clang loop unroll(full)") for (int j = 0; j < KF; ++j) {
       thread auto& e = sc[j].thread_elements();
-      const uint k = j * 8 + sn;
-      const float2 pv = *(device const float2*)(pl + k);
-      const float2 kv = *(device const float2*)(km + k);
-      const float2 mb = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kv)) : (1e9f * (qm - 1.f)) * (kv - 1.f);
-      e[0] += (pv.x + mb.x) * M_LOG2E_F;
-      e[1] += (pv.y + mb.y) * M_LOG2E_F;
+      const float2 pv = *(device const float2*)(pl + j * 8 + sn);
+      e[0] += pv.x;
+      e[1] += pv.y;
       mx = max(mx, max((float)e[0], (float)e[1]));
     }
   } else {
@@ -1908,13 +1909,8 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
       thread auto& e = sc[j].thread_elements();
       _Pragma("clang loop unroll(full)") for (int t = 0; t < 2; ++t) {
         const uint k = j * 8 + sn + t;
-        if (k < a.keys) {
-          float kk = km[k];
-          float maskBias = a.keyMasked ? -1e9f * ((1.f - qm) + (1.f - kk)) : 1e9f * (qm - 1.f) * (kk - 1.f);
-          e[t] += (pl[k] + maskBias) * M_LOG2E_F;
-        } else {
-          e[t] = -1e30f;
-        }
+        if (k < a.keys) e[t] += pl[k];
+        else e[t] = -1e30f;
         mx = max(mx, (float)e[t]);
       }
     }
@@ -2029,14 +2025,24 @@ kernel void af3_kq_norm(constant KqNormArgs& a [[buffer(0)]], uint3 tg [[threadg
     device half4* x4 = (device half4*)x;
     device const float4* sc4 = (device const float4*)sc;
     device const float4* of4 = (device const float4*)of;
-    device const float4* qb4 = (device const float4*)qb;
     float4 xv[6]; float s = 0.f;
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < 6; ++i) {
-      uint idx = lane + i * 32;
-      float4 val = float4(x4[idx]) + (qb4 ? qb4[idx] : float4(0.f));
-      xv[i] = val;
-      s += val.x + val.y + val.z + val.w;
+    if (qb) {
+      device const float4* qb4 = (device const float4*)qb;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 6; ++i) {
+        uint idx = lane + i * 32;
+        float4 val = float4(x4[idx]) + qb4[idx];
+        xv[i] = val;
+        s += val.x + val.y + val.z + val.w;
+      }
+    } else {
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < 6; ++i) {
+        uint idx = lane + i * 32;
+        float4 val = float4(x4[idx]);
+        xv[i] = val;
+        s += val.x + val.y + val.z + val.w;
+      }
     }
     float mean = simd_sum(s) / 768.f, v = 0.f;
     _Pragma("clang loop unroll(full)")
@@ -2087,10 +2093,12 @@ kernel void af3_chiral_grad(LF_ARGS(ChiralGradArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.atoms * a.ns) return;
   uint u = (uint)t, atoms = (uint)a.atoms, k = lf_udiv(u, atoms), atom = u - k * atoms;
+  int e0 = a.offsets[atom], e1 = a.offsets[atom + 1];
+  if (e0 == e1) { a.grads[t * 3] = 0.f; a.grads[t * 3 + 1] = 0.f; a.grads[t * 3 + 2] = 0.f; return; }
   device const float* x = a.positions + (ulong)k * a.atoms * 3;
   float3 g = float3(0.f);
   const float step = 1e-3f;
-  for (int e = a.offsets[atom]; e < a.offsets[atom + 1]; ++e) {
+  for (int e = e0; e < e1; ++e) {
     int centre = a.entries[e] >> 2, corner = a.entries[e] & 3;
     float ideal = a.angles[centre];
     if (ideal == 0.f) continue;

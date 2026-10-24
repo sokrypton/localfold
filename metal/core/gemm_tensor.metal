@@ -973,22 +973,27 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         return;
       }
     }
-    if constexpr ((TM == 64 && TN == 128) || (TM == 32 && TN == 256)) {
+    if constexpr ((TM == 64 && TN == 128) || (TM == 32 && TN == 256) ||
+                  (TM == 16 && TN == 256) || (TM == 64 && TN == 64) || (TM == 32 && TN == 64)) {
       if ((g.m & 3) == 0) {
-        constexpr int NR = 4;
+        constexpr int NC = TN == 64 ? 2 : 4;
+        constexpr int NR = (TM * TN) / (512 * NC);
         constexpr int CSTEP = TN == 256 ? 64 : 32;
+        constexpr int RBLK = TN == 64 ? 16 : 32;
         const int col0 = i0 + c.get_multidimensional_index((uint16_t)0)[0];
         const bool fullM = i0 + TN <= g.m;
         const ulong boff = g.ptrs ? (ulong)z * g.m : 0;
         const bool hasBias = (g.epilogue & 4) != 0, halfBias = (g.biasType & 255) == 2;
-        float4 b4[4] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
-        if constexpr ((EP & 64) != 0 && !metal::is_same_v<TACC, half>) {
+        float4 b4[NC];
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < NC; ++k) b4[k] = float4(0.f);
+        if constexpr ((EP & 64) != 0 && !metal::is_same_v<TACC, half> && TN >= 128) {
           if (g.m > TN && (!(g.epilogue & 8192) || g.tgN == g.m)) {
             int j_row[NR];
             float s4[NR];
             _Pragma("clang loop unroll(full)")
             for (int r_idx = 0; r_idx < NR; ++r_idx) {
-              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
               j_row[r_idx] = j0 + c.get_multidimensional_index(e0)[1];
               s4[r_idx] = 0.f;
             }
@@ -1001,7 +1006,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             for (int iTile = 0; ; ) {
               if (hasBias || isOpm) {
                 _Pragma("clang loop unroll(full)")
-                for (int k = 0; k < 4; ++k) {
+                for (int k = 0; k < NC; ++k) {
                   const int col = iTile + col0 + k * CSTEP;
                   b4[k] = (!isOpm && halfBias) ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
                                                : *(device const float4*)((device const float*)g.bias + boff + col);
@@ -1011,7 +1016,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
               for (int r_idx = 0; r_idx < NR; ++r_idx) {
                 const int j = j_row[r_idx];
                 if (j >= g.n) continue;
-                const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+                const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
                 const ulong rowOff = (ulong)j * g.ldd + (ulong)(iTile + col0);
                 const ulong cOff = (ulong)j * g.ldc + (ulong)(iTile + col0);
                 device TC* dp0 = D + rowOff;
@@ -1021,7 +1026,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
                 const float inv0 = isOpm ? (tgC ? 1.f / max(nv0, 1.f) : 1.f / (1e-3f + nv0)) : 0.f;
                 device const half* ap0 = isGated ? auxH + (ulong)j * g.ldaux + (ulong)(iTile + col0) : nullptr;
                 _Pragma("clang loop unroll(full)")
-                for (int k = 0; k < 4; ++k) {
+                for (int k = 0; k < NC; ++k) {
                   const uint16_t e = (uint16_t)(e0 + k * 8);
                   float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
                   if (isOpm) {
@@ -1059,7 +1064,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         }
         if (hasBias && !(g.epilogue & 8192)) {
           _Pragma("clang loop unroll(full)")
-          for (int k = 0; k < 4; ++k) {
+          for (int k = 0; k < NC; ++k) {
             const int col = col0 + k * CSTEP;
             if (fullM || col < g.m)
               b4[k] = halfBias ? float4(*(device const half4*)((device const half*)g.bias + boff + col))
@@ -1069,21 +1074,22 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         if constexpr (!metal::is_same_v<TACC, half>) {
           if (g.epilogue & 8192) {
             const uint opmC = (uint)g.tgN;
-            float4 bCol4[4] = {float4(0.f), float4(0.f), float4(0.f), float4(0.f)};
-            uint jTok4[4];
+            float4 bCol4[NC];
+            uint jTok4[NC];
             _Pragma("clang loop unroll(full)")
-            for (int k = 0; k < 4; ++k) {
+            for (int k = 0; k < NC; ++k) {
+              bCol4[k] = float4(0.f);
               const uint u = (uint)(col0 + k * CSTEP);
               const uint jTok = opmC == 128 ? (u >> 7) : opmC == 256 ? (u >> 8) : lf_udiv(u, opmC);
               jTok4[k] = jTok;
               if (fullM || (int)u < g.m) bCol4[k] = *(device const float4*)((device const float*)g.bias + (u - jTok * opmC));
             }
-            const bool sameTok = (jTok4[0] == jTok4[3]);
+            const bool sameTok = (jTok4[0] == jTok4[NC - 1]);
             device const float* auxF = (device const float*)g.aux;
             const bool tgC = g.tgC != 0;
             _Pragma("clang loop unroll(full)")
             for (int r_idx = 0; r_idx < NR; ++r_idx) {
-              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
               const int j = j0 + c.get_multidimensional_index(e0)[1];
               if (j >= g.n) continue;
               device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
@@ -1092,7 +1098,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
               const float nv0 = sameTok ? auxF[rowBase + jTok4[0]] : 0.f;
               const float inv0 = sameTok ? (tgC ? 1.f / max(nv0, 1.f) : 1.f / (1e-3f + nv0)) : 0.f;
               _Pragma("clang loop unroll(full)")
-              for (int k = 0; k < 4; ++k) {
+              for (int k = 0; k < NC; ++k) {
                 const int col = col0 + k * CSTEP;
                 if (!fullM && col >= g.m) continue;
                 const uint16_t e = (uint16_t)(e0 + k * 8);
@@ -1113,14 +1119,14 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             device const half* auxH = (device const half*)g.aux;
             _Pragma("clang loop unroll(full)")
             for (int r_idx = 0; r_idx < NR; ++r_idx) {
-              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+              const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
               const int j = j0 + c.get_multidimensional_index(e0)[1];
               if (j >= g.n) continue;
               device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
               device const TC* cp0 = C + (ulong)j * g.ldc + (ulong)col0;
               device const half* ap0 = auxH + (ulong)j * g.ldaux + (ulong)col0;
               _Pragma("clang loop unroll(full)")
-              for (int k = 0; k < 4; ++k) {
+              for (int k = 0; k < NC; ++k) {
                 const int col = col0 + k * CSTEP;
                 if (!fullM && col >= g.m) continue;
                 const uint16_t e = (uint16_t)(e0 + k * 8);
@@ -1142,14 +1148,14 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         device const float* cfBase = (device const float*)g.C + (ulong)z * g.sc;
         _Pragma("clang loop unroll(full)")
         for (int r_idx = 0; r_idx < NR; ++r_idx) {
-          const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * 32);
+          const uint16_t e0 = (uint16_t)((r_idx & 1) * 4 + (r_idx >> 1) * RBLK);
           const int j = j0 + c.get_multidimensional_index(e0)[1];
           if (j >= g.n) continue;
           device TC* dp0 = D + (ulong)j * g.ldd + (ulong)col0;
           device const TC* cp0 = C + (ulong)j * g.ldc + (ulong)col0;
           device const float* cfp0 = cfBase + (ulong)j * g.ldc + (ulong)col0;
           _Pragma("clang loop unroll(full)")
-          for (int k = 0; k < 4; ++k) {
+          for (int k = 0; k < NC; ++k) {
             const int col = col0 + k * CSTEP;
             if (!fullM && col >= g.m) continue;
             const uint16_t e = (uint16_t)(e0 + k * 8);

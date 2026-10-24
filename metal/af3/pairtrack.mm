@@ -39,10 +39,10 @@ struct Emitted { const void* x = nullptr; std::string norm; half* buf = nullptr;
 static Emitted emitted[6];
 static void emit(int k, const void* x, const std::string& norm, half* buf) { emitted[k] = {x, norm, buf}; }
 void emitPairLn(int k, const void* x, const std::string& norm, half* buf) { emit(k, x, norm, buf); }
-static bool canEmitLn(int C) {
-  return C == 64 || C == 128 || C == 256 || ((C == 384 || C == 512) && matrixUnits());
+static bool canEmitLn(int C, size_t rows = 1024) {
+  return C == 64 || C == 128 || C == 256 || ((C == 384 || C == 512) && rows > 128 && matrixUnits());
 }
-bool canEmitPairLn(int C) { return canEmitLn(C); }
+bool canEmitPairLn(int C, size_t rows) { return canEmitLn(C, rows); }
 static half* takeEmitted(const void* x, const std::string& norm) {
   for (auto& e : emitted)
     if (e.x == x && e.norm == norm) { e.x = nullptr; return e.buf; }
@@ -255,7 +255,7 @@ static void transitionT(T* x, size_t rows, int C, const std::string& pre, T* int
   const bool isMsa = !strcmp(scratchPrefix, "msatr.");
   const bool msaNext = !isSt && !isMsa && next1.find(".msaAttention1.pairNorm") != std::string::npos;
   const bool xh1 = next1 == "__xhat__";
-  const bool emitNext = !next1.empty() && !into && canEmitLn(C) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
+  const bool emitNext = !next1.empty() && !into && canEmitLn(C, rows) && (xh1 || hasW(next1 + "Scale")) && (next2.empty() || hasW(next2 + "Scale"));
   half* ln1Buf = emitNext ? (isSt ? scratch<half>("st.nrm", std::max(rows, rp) * C)
                                   : isMsa ? scratch<half>("mnorm.m1", rows * C)
                                           : msaNext ? scratch<half>("mnorm.p1", rows * C)
@@ -444,7 +444,7 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   at.bias = bias; at.biasStride = stride; at.biasPadInf = true; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
-  if (!parallel && canEmitLn(Cs) && hasW(tn + "Scale") && lenW(A + ".outputProjection") == (size_t)Wd * Cs) {
+  if (!parallel && canEmitLn(Cs, n) && hasW(tn + "Scale") && lenW(A + ".outputProjection") == (size_t)Wd * Cs) {
     half* txn = scratch<half>("st.xn", np * Cs);
     Gemm g{}; g.X = o; g.tx = F16; g.W = Wh(A + ".outputProjection"); g.tw = F16; g.Y = single; g.rows = n;
     g.in = Wd; g.out = Cs; g.beta = 1.f; g.label = "single output, next norm";

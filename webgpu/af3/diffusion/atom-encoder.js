@@ -357,8 +357,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= QUERY_ROWS) { return; }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= QUERY_ROWS * C) { return; }
+  let row = index / C;
+  let c = index % C;
   let atom_live = gathers[G_TA_MASK + row] != 0;
   let atom_from = u32(max(gathers[G_TA_IDX + row], 0));
   let token_live = gathers[G_TQ_MASK + row] != 0;
@@ -366,16 +368,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   var mask_value = 0.0;
   if (atom_live) { mask_value = atom_mask[atom_from]; }
-  queries_mask[row] = mask_value;
+  if (c == 0u) { queries_mask[row] = mask_value; }
 
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    if (atom_live) { value = conditioning[atom_from * C + c]; }
-    // The trunk's single conditioning, broadcast per token.
-    if (token_live) { value += trunk_projected[token_from * C + c]; }
-    // 🔴 MASKED HERE, before the keys gather from it.
-    queries_cond[row * C + c] = value * mask_value;
-  }
+  var value = 0.0;
+  if (atom_live) { value = conditioning[atom_from * C + c]; }
+  // The trunk's single conditioning, broadcast per token.
+  if (token_live) { value += trunk_projected[token_from * C + c]; }
+  // 🔴 MASKED HERE, before the keys gather from it.
+  queries_cond[index] = value * mask_value;
 }`;
 
   const buildKeys = `${common}
@@ -387,18 +387,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= KEY_ROWS) { return; }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= KEY_ROWS * C) { return; }
+  let row = index / C;
+  let c = index % C;
   let live = gathers[G_QK_MASK + row] != 0;
   let source = u32(max(gathers[G_QK_IDX + row], 0));
   var mask_value = 0.0;
   if (live) { mask_value = queries_mask[source]; }
-  keys_mask[row] = mask_value;
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    if (live) { value = queries_cond[source * C + c]; }
-    keys_cond[row * C + c] = value;
-  }
+  if (c == 0u) { keys_mask[row] = mask_value; }
+  var value = 0.0;
+  if (live) { value = queries_cond[source * C + c]; }
+  keys_cond[index] = value;
 }`;
 
   // The query activation: the conditioning plus the projected noisy positions.
@@ -415,11 +415,14 @@ ${shape.chiralGradients !== true ? "" : `// ...and the chirality gradient, in th
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= QUERY_ROWS) { return; }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= QUERY_ROWS * C) { return; }
+  let row = index / C;
+  let c = index % C;
+  let live = gathers[G_TA_MASK + row] != 0;
+  let source = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
   var gathered = array<f32, 3>(0.0, 0.0, 0.0);
-  if (gathers[G_TA_MASK + row] != 0) {
-    let source = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
+  if (live) {
     gathered[0] = positions[source];
     gathered[1] = positions[source + 1u];
     gathered[2] = positions[source + 2u];
@@ -429,26 +432,23 @@ ${shape.chiralGradients !== true ? "" : `  // 🔴 rosettafold3's CHIRALITY TERM
   // are per token-atom. It is the ONLY reflection-asymmetric signal the network
   // has - see shared/af3/diffusion/chiral-gradient.js.
   var chiral = array<f32, 3>(0.0, 0.0, 0.0);
-  if (gathers[G_TA_MASK + row] != 0) {
+  if (live) {
     // ...\`at\`, because \`from\` is a WGSL RESERVED KEYWORD and the parser says
     // so at a line number in generated source, which is the least helpful place
     // to read an error. Third time tonight a WGSL lexical rule bit a name or a
     // comment that read perfectly as JavaScript.
-    let at = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
+    let at = source;
     chiral[0] = chiral_grads[at];
     chiral[1] = chiral_grads[at + 1u];
     chiral[2] = chiral_grads[at + 2u];
   }`}
-  let rBase = row * C;
   let qm = queries_mask[row];
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    for (var axis = 0u; axis < 3u; axis += 1u) {
-      value += gathered[axis] * weights[P_atomPositionsToFeatures + axis * C + c];
-${shape.chiralGradients !== true ? "" : `      value += chiral[axis] * weights[P_atomChiralToFeatures + axis * C + c];`}
-    }
-    act[rBase + c] = queries_cond[rBase + c] + value * qm;
+  var value = 0.0;
+  for (var axis = 0u; axis < 3u; axis += 1u) {
+    value += gathered[axis] * weights[P_atomPositionsToFeatures + axis * C + c];
+${shape.chiralGradients !== true ? "" : `    value += chiral[axis] * weights[P_atomChiralToFeatures + axis * C + c];`}
   }
+  act[index] = queries_cond[index] + value * qm;
 }`;
 
   // 🔴 rosettafold3's CHIRALITY GRADIENT, ONE THREAD PER ATOM AND NO ATOMICS.
@@ -496,8 +496,16 @@ fn improper(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>) -> f32 {
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let atom = id.x + id.y * GRID_WIDTH * 64u;
   if (atom >= arrayLength(&entry_offsets) - 1u) { return; }
+  let e0 = entry_offsets[atom];
+  let e1 = entry_offsets[atom + 1u];
+  if (e0 == e1) {
+    gradients[atom * 3u] = 0.0;
+    gradients[atom * 3u + 1u] = 0.0;
+    gradients[atom * 3u + 2u] = 0.0;
+    return;
+  }
   var total = vec3<f32>(0.0);
-  for (var e = entry_offsets[atom]; e < entry_offsets[atom + 1u]; e = e + 1u) {
+  for (var e = e0; e < e1; e = e + 1u) {
     let packed = entries[e];
     let centre = packed >> 2u;
     let corner = packed & 3u;
@@ -2439,7 +2447,7 @@ export class Af3AtomEncoderGpu {
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));
 
-      const qr = lin(queryRows);
+      const qr = lin(queryRows * channels);
       const pr = lin(pairRows);
       // 🔴 EVERYTHING HERE EXCEPT build-act IS THE SAME ON EVERY CALL. See
       // `persistent` above: with a staticCache these run once per fold.
@@ -2452,7 +2460,7 @@ export class Af3AtomEncoderGpu {
         run("build-queries", compiled.buildQueries,
             [conditioning, atomMask, gatherBuffer, trunkSingleProjected, queriesCond,
              queriesMask], qr[0], qr[1]);
-        const kr = lin(keyRows);
+        const kr = lin(keyRows * channels);
         run("build-keys", compiled.buildKeys,
             [queriesCond, queriesMask, gatherBuffer, keysCond, keysMask], kr[0], kr[1]);
         run("build-pair", compiled.buildPair,

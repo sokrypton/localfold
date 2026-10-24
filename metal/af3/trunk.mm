@@ -202,7 +202,7 @@ static void embed(Trunk& t) {
     ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
     const std::string sn1 = "trunk.pairformerBlocks.0.singleAttention.layerNorm";
     const std::string sn2 = flag("trunk.dialect.parallelPairformer") ? "trunk.pairformerBlocks.0.singleTransition.inputLayerNorm" : "";
-    if (canEmitPairLn(t.Cs) && hasW(sn1 + "Scale") && lenW(E + "prevSingleEmbedding") == (size_t)t.Cs * t.Cs) {
+    if (canEmitPairLn(t.Cs, n) && hasW(sn1 + "Scale") && lenW(E + "prevSingleEmbedding") == (size_t)t.Cs * t.Cs) {
       half* nrm = scratch<half>("trunk.sn1", np * t.Cs);
       half* txn = (!sn2.empty() && hasW(sn2 + "Scale")) ? scratch<half>("trunk.sn2", np * t.Cs) : nullptr;
       if (np > (size_t)n) {

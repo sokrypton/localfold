@@ -416,15 +416,18 @@ static void prepareDecoder() {
   D.decHeads = metaI(Dd + ".heads"); D.decD = metaI(Dd + ".dimension"); D.decPerToken = metaI(Dd + ".perTokenChannels");
   size_t qRows = (size_t)sh.subsets * sh.queries;
   int nblocks = 0; while (M.has(Dd + ".blocks." + num(nblocks) + ".qProjection")) ++nblocks;
-  std::vector<float*> logits = atomPairLogits(Dd, D.enc.pair, qRows * sh.keys, Cp, nblocks, D.decHeads, sh);
+  const bool chai = flag("trunk.dialect.chaiAtomStack");
+  const bool keyMasked = flag(Dd + ".blocks.0.keyMaskedAtomAttention");
+  std::vector<float*> logits = atomPairLogits(Dd, D.enc.pair, qRows * sh.keys, Cp, nblocks, D.decHeads, sh,
+                                              D.enc.qMask, D.enc.kMask, keyMasked, D.decD,
+                                              chai ? D.enc.qUid : nullptr, chai ? D.enc.kUid : nullptr);
   const float* cond = D.enc.qCond;
-  if (flag("trunk.dialect.chaiAtomStack")) {
+  if (chai) {
     // chai conditions its decoder on a second, affine LayerNorm of the encoder's conditioning, and restricts its
     // attention to one reference space as the encoder does
     float* c2 = scratch<float>("dec.cond", qRows * D.decC);
     ln(D.enc.qCond, c2, qRows, D.decC, Dd + ".postAtomCondLayerNormScale", Dd + ".postAtomCondLayerNormOffset");
     cond = c2;
-    for (float* pl : logits) sameRefMask(pl, D.enc.qUid, D.enc.kUid, D.decHeads, sh);
   }
   D.decBlocks.clear();
   for (int b = 0; b < nblocks; ++b) D.decBlocks.push_back(prepareAtomBlock(Dd + ".blocks." + num(b), cond, qRows, D.decC, logits[b]));

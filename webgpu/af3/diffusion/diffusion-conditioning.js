@@ -512,14 +512,26 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   // ...projected to the pair width, into the first half of the concatenation.
-  for (var out = lane; out < C_PAIR; out += LANES) {
+  ${pairChannels === 128 ? `{
+    var val0 = 0.0;
+    var val1 = 0.0;
+    for (var c = 0u; c < C_TRUNK; c += 1u) {
+      let n_c = (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c];
+      let z_base = c * C_PAIR + lane;
+      val0 += n_c * z_projection[z_base];
+      val1 += n_c * z_projection[z_base + LANES];
+    }
+    concatenated[lane] = val0;
+    concatenated[lane + LANES] = val1;
+  }` : `for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK; c += 1u) {
       value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
         + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
     }
     concatenated[out] = value;
-  }
+  }`}
 
   // The relative encoding, projected on its own and with no LayerNorm. It is
   // one-hot in three or four of 139 columns, so the projection is a gather of
@@ -572,13 +584,25 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var out = lane; out < C_PAIR; out += LANES) {
+  ${pairChannels === 128 ? `{
+    var val0 = 0.0;
+    var val1 = 0.0;
+    for (var c = 0u; c < WIDTH; c += 1u) {
+      let n_c = concatenated[c];
+      let p_base = c * C_PAIR + lane;
+      val0 += n_c * projection[p_base];
+      val1 += n_c * projection[p_base + LANES];
+    }
+    let out_base = row * C_PAIR + lane;
+    pair[out_base] = val0;
+    pair[out_base + LANES] = val1;
+  }` : `for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < WIDTH; c += 1u) {
       value += concatenated[c] * projection[c * C_PAIR + out];
     }
     pair[row * C_PAIR + out] = value;
-  }
+  }`}
 }`;
 
   // 🔴 THE THIRD SHAPE: THE RELPOS PROJECTED, THE TRUNK PAIR PASSED THROUGH.
@@ -620,14 +644,26 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   // ...projected to the pair width, into the first half of the concatenation.
-  for (var out = lane; out < C_PAIR; out += LANES) {
+  ${pairChannels === 128 ? `{
+    var val0 = 0.0;
+    var val1 = 0.0;
+    for (var c = 0u; c < C_TRUNK; c += 1u) {
+      let n_c = (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c];
+      let z_base = c * C_PAIR + lane;
+      val0 += n_c * z_projection[z_base];
+      val1 += n_c * z_projection[z_base + LANES];
+    }
+    concatenated[lane] = val0;
+    concatenated[lane + LANES] = val1;
+  }` : `for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK; c += 1u) {
       value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
         + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
     }
     concatenated[out] = value;
-  }`,
+  }`}`,
              `  // The trunk pair, copied in RAW: no LayerNorm of its own and no
   // projection. The joint LayerNorm below is the only one it sees.
   for (var c = lane; c < C_TRUNK; c += LANES) {
