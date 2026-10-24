@@ -65,9 +65,11 @@ def cases():
     out.append(("af3-glycan", "af3", [f"--job={os.path.join(FIX, 'af3-jobs', 'rnaseb_glycosylated.json')}"], [], None,
                 "NAG,BMA,MAN"))
     seq = chain_sequence(crystal_5caj, "A")
-    a3m = os.path.join(REPO, "oracle-dumps", "5caj-a.a3m")
-    if os.path.exists(a3m):     # the MSA stack at depth (1024 of its 7907 rows, AF3's num_msa)
-        out.append(("af3-5caj-msa", "af3", [f"--sequence={seq}", f"--a3m={a3m}"], [], [crystal_5caj, "A"]))
+    a3m = os.path.join(FIX, "5caj-a.a3m")   # checked in: when it lived in the ignored oracle-dumps/ and went
+    # missing, this case was skipped in silence - and that is how a scratch-sharing bug that cost 10 pLDDT on a deep
+    # alignment passed this gate (af3.cu, SHARED_NESTED)
+    # the MSA stack at depth (1024 of its 7907 rows, AF3's num_msa)
+    out.append(("af3-5caj-msa", "af3", [f"--sequence={seq}", f"--a3m={a3m}"], [], [crystal_5caj, "A"]))
     out.append(("af3-5caj-template", "af3", [f"--sequence={seq}", f"--template={crystal_5caj}:A"], [],
                 [crystal_5caj, "A"]))
     # boltz2 divides its template term by the templates present, not the padded slots (3daf8f8e): by four, its one

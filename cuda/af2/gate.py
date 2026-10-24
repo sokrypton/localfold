@@ -65,9 +65,11 @@ def fold_cases():
         ("1brs-multimer-template", [f"--sequence={a}:{d}", f"--model={MULTIMER}", f"--template={c1brs}:A+D"],
          [c1brs, "A,D"]),
     ]
-    a3m = os.path.join(REPO, "oracle-dumps", "5caj-a.a3m")
-    if os.path.exists(a3m):     # the MSA and extra stacks at depth (512 + 1024 of 7907 rows)
-        out.append(("5caj-msa", [f"--sequence={s5caj}", f"--a3m={a3m}"], [c5caj, "A"]))
+    a3m = os.path.join(FIX, "5caj-a.a3m")   # checked in: when it lived in the ignored oracle-dumps/ and went
+    # missing, this case was skipped in silence - and that is how a scratch-sharing bug that cost 10 pLDDT on a deep
+    # alignment passed this gate (af3.cu, SHARED_NESTED)
+    # the MSA and extra stacks at depth (512 + 1024 of 7907 rows)
+    out.append(("5caj-msa", [f"--sequence={s5caj}", f"--a3m={a3m}"], [c5caj, "A"]))
     return out
 
 

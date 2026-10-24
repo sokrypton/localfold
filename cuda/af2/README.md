@@ -133,7 +133,7 @@ and streams every pass to the page. See docs/WEB.md.
 ```
 cuda/af2/fold ub.pdb --job=tools/fixtures/af3-jobs/ubiquitin_monomer.json --model=model_3_ptm   # any of the ten
 cuda/af2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
-cuda/af2/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
+cuda/af2/fold 5caj.pdb --sequence=<SEQ> --a3m=tools/fixtures/5caj-a.a3m
 cuda/af2/fold 5caj.pdb --sequence=<SEQ> --template=tools/fixtures/5caj-crystal.pdb:A
 cuda/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 \
     --template=tools/fixtures/1brs-crystal.pdb:A+D

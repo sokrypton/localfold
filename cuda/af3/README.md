@@ -157,7 +157,7 @@ resident (`localfold-af3 - --serve=<dir>`) and streams every trunk pass and diff
 
 ```
 cuda/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
-cuda/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
+cuda/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=tools/fixtures/5caj-a.a3m
 ```
 
 
