@@ -57,6 +57,8 @@ to debug from. Decide the product question first; the rest of this document is u
 | `cpu/design/mpnn-bridge.js` | the fold → MPNN join; the interface is a PDB string | works |
 | `cpu/design/designers.js` | the checkpoint registry and the automatic choice | works |
 | `web/public/mpnn/` | **4** checkpoints at noise 0.2 (soluble, protein, ligand, NA), ~16 MB | checked in |
+| `design.html`, `web/design.js` | the new page's shell: controls real, loop not wired | works, `npm run test:design` |
+| `tools/check-design-page.py` | loads the page, runs its module, requires the auto-designer to respond | works |
 | `web/hunter.js` | the v1 page | 🔴 **retire.** Its page was withheld (`.gitignore`) and is not in this checkout |
 | `tools/protein-hunter-in-page.py` | drives a real run over CDP and checks the table came back | works, needs a page |
 | `test/hunter-loop.test.js`, `test/sample-sequence.test.js`, `test/mpnn-bridge.test.js`, `test/designers.test.js` | the loop, the schedules, the bridge, the registry | green |
@@ -300,6 +302,9 @@ Each step ends green and is committed before the next begins.
    wired. Gate: `npm run test:site` resolves it, `tools/mobile-layout.py` passes.
    Alongside it, audit py2Dmol for the three things section 5 needs - role colouring, a labelled frame API, residue
    picking - and record which already exist, since that decides whether the viewer needs an upstream change early.
+   The gate that does run is **`npm run test:design`** (`tools/check-design-page.py`): it loads the page in headless
+   Chrome, requires the module to actually run, and requires the automatic designer to MOVE when the target gains a
+   ligand - a note reading "Auto → SolubleMPNN" is also what a broken wire prints, since soluble is the fallback.
    🔴 **Both of those gates are already red on this checkout, for reasons that predate this work and are not
    design's to fix:** `npm run test:site` fails because `model-boltz2-int5/` has drifted from its manifest module
    (it is missing `weights-08.int5.bin`), and `tools/mobile-layout.py` reports four failures about `index.html`'s

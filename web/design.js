@@ -93,7 +93,14 @@ const paintFolderNote = () => {
   folderNote.classList.toggle("warn", n >= 5);
 };
 
-const entities = createEntityList(
+// 🔴 `let`, AND THE CALLBACK READS IT DEFENSIVELY, BECAUSE createEntityList
+// CALLS onChange WHILE IT IS STILL CONSTRUCTING. It renders its initial rows
+// inside the constructor and notifies from there, so a callback that reads the
+// binding being initialised throws "Cannot access 'entities' before
+// initialization" and the whole module fails to load - which is how this was
+// found, by loading the page rather than by resolving its imports.
+let entities;
+entities = createEntityList(
   element("entity-rows"), element("add-entity"),
   {
     // Something to design against on arrival, as index.html ships a foldable
@@ -101,12 +108,18 @@ const entities = createEntityList(
     // were measured on.
     initial: [{ type: "protein", copies: 1,
       value: "FTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNA" }],
-    onChange: () => paintDesignerNote(entities.read()),
+    onChange: () => paintDesignerNote(entities?.read() ?? []),
     // This page has no MSA control, so an automatic template has nothing to
     // draw a hit from. Answer honestly rather than letting the list assume.
     msaIsSearch: () => false,
   },
 );
+
+// 🔴 THE TARGET LIST, REACHABLE FROM A DRIVER, as index.html exposes
+// `window.__entityList` for the same reason: tools/check-design-page.py sets a
+// target and then requires the automatic designer to MOVE, which is the only
+// form of that check that can fail for the right reason.
+window.__designEntities = entities;
 
 designerSelect.addEventListener("change", () => paintDesignerNote(entities.read()));
 folders.addEventListener("change", paintFolderNote);
