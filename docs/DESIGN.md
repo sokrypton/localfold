@@ -431,8 +431,13 @@ Each step ends green and is committed before the next begins.
    stub, and it was the top scorer).
 4. **Validity checks.** Ring closure, Watson-Crick pairing, antibody framework RMSD, as vetoes with recorded
    reasons. Gate: each check has a fixture that fails it and one that passes.
-5. **Ensembles.** Rotate the folder per cycle. Gate: a run with two folders alternates them and records which folded
-   each cycle. 🔴 Reproducing her ipTM result is a *measurement*, not a gate — and it needs n≈30 per arm.
+5. ~~**Ensembles.**~~ **Done.** The folder rotates per cycle - not per run, since a design only has to satisfy
+   several models if the model changes UNDER the sequence being refined. `npm run test:design` reads the rotation
+   off the table and fails if the column does not alternate: a four-cycle run with two folders gives
+   `af3, opendde, af3, opendde`, and every folder is loaded before the first cycle rather than mid-bar. Two
+   AF3-lineage models stay resident together on a 16 GB M5.
+   🔴 Reproducing her ipTM result is a *measurement*, not a gate, and it needs n≈30 per arm. Nothing here has
+   measured whether ensembles help; only that they run.
 6. **Then, in her order of value:** epitope targeting by contact residues (filter first), PTM targets, cyclic,
    antibody CDR mode.
 7. **Then the expensive modalities**, in this order: ligand and nucleic binders (checkpoints already mirrored),

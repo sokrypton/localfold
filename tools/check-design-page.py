@@ -143,10 +143,10 @@ def main():
         if not back["enabled"]:
             bad.append("switching back to Protein Hunter left controls disabled")
 
-        # 🔴 AND A REAL HUNT, END TO END: weights, a fold, an MPNN redesign, a
-        # second fold, and a row per cycle. The smallest one that is still the
-        # whole method - one target chain, a 12-residue binder, one cycle - runs
-        # in about twelve seconds on an M5 off the local bundle.
+        # 🔴 AND A REAL HUNT, END TO END: two models' weights, a fold, an MPNN
+        # redesign, three more folds with the model rotating under the sequence,
+        # and a row per cycle. A 31-residue target and a 12-residue binder runs
+        # in about thirty seconds on an M5 off the local bundles.
         cdp.evaluate(ws, """(() => {
           for (const k of ['alphafold3','openbind0','opendde','boltz2','protenix2',
                            'intellifold2','rosettafold3'])
@@ -154,8 +154,15 @@ def main():
           window.__designEntities.set([{ type: 'protein', copies: 1,
             value: 'GWSTELEKHREELKEFLKKEGITNVEIRIDN' }]);
           document.getElementById('binder-length').value = '12';
-          document.getElementById('cycles').value = '1';
+          document.getElementById('cycles').value = '3';
           document.getElementById('runs').value = '1';
+          // 🔴 TWO FOLDERS, so the run exercises the rotation and not just the
+          // loop: a design has to satisfy several models rather than overfit
+          // one, and that only happens if the model changes under it.
+          for (const option of document.getElementById('folders').options) {
+            option.selected = option.value === 'af3' || option.value === 'opendde';
+          }
+          document.getElementById('folders').dispatchEvent(new Event('change'));
           document.getElementById('hunt').click();
           return 1;
         })()""")
@@ -167,6 +174,7 @@ def main():
               failed: document.getElementById('status-message').classList.contains('error'),
               rows: document.querySelectorAll('#results-body tr').length,
               best: [...document.querySelectorAll('#results-body tr.best td')].map((c) => c.textContent),
+              folders: [...document.querySelectorAll('#results-body tr')].map((r) => r.children[2].textContent),
               cycle0Best: (document.querySelector('#results-body tr')?.className ?? '').includes('best'),
               button: document.getElementById('hunt').textContent.trim(),
               progress: document.getElementById('progress').value,
@@ -179,6 +187,7 @@ def main():
             time.sleep(2)
 
         print(f"  hunt: {hunted['status']}")
+        print(f"        folded by: {hunted['folders']}")
         print(f"        rows={hunted['rows']} track={hunted['track']} progress={hunted['progress']}"
               f" best={hunted['best']}")
         # 🔴 A MISSING BUNDLE IS NOT A FAILING PAGE, AND IS NOT A SILENT PASS
@@ -190,16 +199,25 @@ def main():
             bad.append(f"the hunt failed: {hunted['status']}")
         else:
             # cycle 0 and cycle 1, so the loop folded, designed, and folded again
-            if hunted["rows"] < 2:
-                bad.append(f"the hunt drew {hunted['rows']} rows, expected cycle 0 and cycle 1")
+            if hunted["rows"] < 4:
+                bad.append(f"the hunt drew {hunted['rows']} rows, expected cycle 0 through 3")
+            # 🔴 THE ROTATION, READ OFF THE TABLE. Alternating is the whole
+            # point; a column reading af3 four times is a rotation that is not
+            # rotating, and would look like a working ensemble.
+            if hunted["folders"][:4] != ["af3", "opendde", "af3", "opendde"]:
+                bad.append(f"the folder did not rotate per cycle: {hunted['folders']}")
             if hunted["track"] < 2:
                 bad.append(f"the sequence track has {hunted['track']} lines, expected one per cycle")
             if "done" not in hunted["status"]:
                 bad.append(f"the hunt did not finish: {hunted['status']!r}")
             if hunted["progress"] != 1:
                 bad.append(f"the bar ended at {hunted['progress']}, not 1")
-            if len(hunted["best"]) == 0:
-                bad.append("no cycle was marked best")
+            # 🔴 EXACTLY ONE BEST ROW, five cells wide. "At least one" passed
+            # happily while three rows carried the marker, because each had been
+            # the leader when it was drawn.
+            if len(hunted["best"]) != 5:
+                bad.append(f"expected exactly one best row of 5 cells, got {len(hunted['best'])} cells:"
+                           f" {hunted['best']}")
             # 🔴 THE LOOP'S OWN RULE, CHECKED THROUGH THE PAGE: cycle 0 is the
             # mostly-X draw the run STARTED from, so it must never be the best
             # row however well it folded - and on a 12-mer of mostly X it folds

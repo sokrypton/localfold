@@ -13,10 +13,10 @@
  * wiring and the drawing are three separable things. The retired `web/hunter.js`
  * was all three at once in 795 lines.
  *
- * 🔴 ONE FOLDER FOR NOW. `folders` takes a list because rotating the folder per
- * cycle is the measured win (docs/DESIGN.md 3C), but only the AF3-lineage path
- * is wired here; a list longer than one is refused rather than silently
- * folding everything with the first. Ensembles are step 5.
+ * 🔴 THE FOLDER ROTATES PER CYCLE, which is the measured win (docs/DESIGN.md
+ * 3C): a design then has to satisfy several models instead of overfitting one.
+ * Only the AF3-lineage families are wired - they share `foldAf3` - so ESMFold2
+ * and the rest are not in FOLDERS yet.
  */
 import { getDevice } from "./model.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -34,7 +34,7 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  * @param {string[]} options.chains every chain of the complex; the designed
  *   one's entry is replaced each cycle and starts empty
  * @param {number} [options.chainIndex=0] which chain is designed
- * @param {string[]} [options.folders=["af3"]] which model folds. One, for now.
+ * @param {string[]} [options.folders=["af3"]] which models fold, rotating one per cycle
  * @param {string} [options.designer="auto"] a key of DESIGNERS, or "auto"
  * @param {{ligands?: number, nucleic?: number}} [options.contents] what the
  *   target carries, for the automatic designer
@@ -56,15 +56,11 @@ export async function hunt(options) {
 
   if (typeof report !== "function") throw new TypeError("hunt needs a report callback");
   if (!Array.isArray(chains) || chains.length === 0) throw new TypeError("hunt needs at least one chain");
-  // 🔴 REFUSED, NOT QUIETLY REDUCED. A caller asking for three folders and
-  // getting one is a caller whose result does not mean what they think.
-  if (folders.length !== 1) {
-    throw new Error(`hunt runs one folding model for now, not ${folders.length}.`
-      + " Rotating them per cycle is step 5 of docs/DESIGN.md.");
-  }
-  const [folder] = folders;
-  if (FOLDERS[folder] === undefined) {
-    throw new Error(`no folder ${folder} (have ${Object.keys(FOLDERS).join(", ")})`);
+  if (folders.length === 0) throw new Error("hunt needs at least one folding model");
+  for (const name of folders) {
+    if (FOLDERS[name] === undefined) {
+      throw new Error(`no folder ${name} (have ${Object.keys(FOLDERS).join(", ")})`);
+    }
   }
 
   // 🔴 THE SEQUENCE IS CHECKED BEFORE ANY WEIGHTS ARE FETCHED. A hunt is many
@@ -95,10 +91,19 @@ export async function hunt(options) {
     if (Number.isFinite(fraction)) progress(Math.min(1, Math.max(0, fraction)));
   };
 
-  status("loading the folding model");
+  // 🔴 EVERY FOLDER IN THE ROTATION IS LOADED BEFORE THE FIRST CYCLE, not on the
+  // cycle that first needs it. Loading mid-run would put a 300 MB download in
+  // the middle of a progress bar that is already counting cycles, and the
+  // rotation visits all of them anyway.
+  status(folders.length === 1 ? "loading the folding model"
+    : `loading ${folders.length} folding models`);
   const device = await getDevice(signal);
-  const weights = await loadAf3Weights(
-    (value) => toBar(0.05 * fractionOf(value)), FOLDERS[folder]);
+  const loaded = new Map();
+  for (const [index, name] of folders.entries()) {
+    const share = (step) => 0.05 * ((index + step) / folders.length);
+    loaded.set(name, await loadAf3Weights(
+      (value) => toBar(share(fractionOf(value))), FOLDERS[name]));
+  }
 
   status("loading the designer");
   const { model: mpnn } = await loadDesigner({
@@ -113,6 +118,9 @@ export async function hunt(options) {
 
   const all = [];
   let best = null;
+  // Which folder the cycle currently being yielded was folded by. The loop
+  // calls `fold` and then yields, so this is set before the record exists.
+  let foldedBy = folders[0];
 
   for (let run = 0; run < runs; run += 1) {
     const stream = runDesign({
@@ -125,8 +133,17 @@ export async function hunt(options) {
 
       fold: async (sequence, context) => {
         const done = context.run * (cycles + 1) + context.cycle;
+        // 🔴 WHICH MODEL FOLDS THIS CYCLE, AND WHY IT ROTATES BY CYCLE RATHER
+        // THAN BY RUN. A design has to satisfy several models instead of
+        // overfitting one, which only happens if the model CHANGES UNDER the
+        // sequence being refined - rotating per run would give each run one
+        // model and overfit each of them separately. Yehlin measured two or
+        // three beating one and five or six doing worse than two
+        // (docs/DESIGN.md 3C, her stack, not reproduced here).
+        const folder = folders[(context.run * (cycles + 1) + context.cycle) % folders.length];
+        foldedBy = folder;
         return foldAf3({
-          sequence, weights, device, signal,
+          sequence, weights: loaded.get(folder), device, signal,
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
@@ -135,7 +152,8 @@ export async function hunt(options) {
           // preferred count is the right default here.
           calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
           onStatus: (text) => status(
-            `run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · ${text}`),
+            `run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles}`
+            + `${folders.length > 1 ? ` · ${folder}` : ""} · ${text}`),
           onProgress: (fraction) => toBar(spanOf(done, fraction)),
         });
       },
@@ -163,7 +181,7 @@ export async function hunt(options) {
       // mutating that object - so a copy would freeze a `best: true` that has
       // since become false. The two fields this driver adds are written onto
       // the loop's own record.
-      record.folder = folder;
+      record.folder = foldedBy;
       record.designer = chosen;
       all.push(record);
       report(record);

@@ -219,7 +219,15 @@ const drawCycle = (record) => {
   trackBox.style.display = "";
 
   const row = document.createElement("tr");
-  if (record.best === true) row.className = "best";
+  // 🔴 THE PREVIOUS BEST ROW HAS TO BE UN-MARKED, because the loop decides
+  // `best` by MUTATING the record it had marked before - and this page drew
+  // that row when it arrived and cannot see the change. Without this, every
+  // cycle that was ever the leader keeps the marker and a four-cycle run ends
+  // with three "best" rows, which the page gate caught.
+  if (record.best === true) {
+    for (const marked of resultsBody.querySelectorAll("tr.best")) marked.classList.remove("best");
+    row.className = "best";
+  }
   const objective = Number.isFinite(record.score) ? record.score.toFixed(3) : "—";
   // 🔴 THE VALIDITY CELL CARRIES A MEASUREMENT, NOT A VERDICT. Only one check
   // exists so far - the loop's alanine ceiling, which is why a cycle can be
@@ -242,7 +250,11 @@ const drawCycle = (record) => {
 
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;
-  if (record.best === true) line.style.fontWeight = "500";
+  // ...and the same for the track, for the same reason.
+  if (record.best === true) {
+    for (const marked of track.querySelectorAll(".best-line")) marked.classList.remove("best-line");
+    line.className = "best-line";
+  }
   track.append(line);
 };
 

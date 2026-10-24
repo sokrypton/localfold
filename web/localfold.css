@@ -1336,3 +1336,8 @@
 #designOptions .fetch-option-group.unavailable select,
 #designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
 .unavailable-reason { font-style: italic; }
+
+/* The best cycle's line in the sequence track. Set and cleared as the leader
+   changes, since the loop decides `best` by mutating the record it marked
+   before and the page cannot see that happen. */
+#cycle-track .best-line { font-weight: 500; }
