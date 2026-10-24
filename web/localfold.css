@@ -1229,3 +1229,101 @@
 @media (max-width: 948px) {
   .native-status-slot { flex: 1 1 100%; justify-content: flex-start; }
 }
+
+/* ---------------------------------------------------------------------------
+   design.html (Protein Hunter)
+
+   🔴 ONLY WHAT THAT PAGE INTRODUCES. Its target list, its option groups and
+   its containers are py2Dmol's own classes and index.html's, so they are not
+   restated here; what follows is the surfaces a design page needs and a fold
+   page has none of - a note under a control, a residue-role legend, and the
+   per-cycle table. Every selector is anchored to an id or a class this
+   project introduced, as the header of this file requires.
+   --------------------------------------------------------------------------- */
+
+/* What a control says underneath itself. The automatic designer's reason lives
+   here, and so does the folder count's advice: this page's rule is that a
+   choice the page made for you is a choice the page explains. */
+.option-note {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #6b7280;
+  margin-top: 4px;
+  max-width: 320px;
+}
+
+/* 🔴 AMBER, NOT RED. A warning here means the hunt will still run and will
+   lose something - a designer that cannot see the ligand, five folders where
+   two measured better. Red is for a page that cannot proceed. */
+.option-note.warn { color: #92400e; }
+
+#designer-note, #folder-note { min-height: 2.4em; }
+
+/* The residue roles, in the one place they are named in words. The swatches
+   are the same colours the sequence track and the 3D view use, so a residue
+   picked in one is recognisable in the other. */
+#roles-legend .role-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 12px;
+  color: #374151;
+}
+
+#roles-legend .role-list li { display: flex; align-items: center; gap: 6px; }
+
+.role-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid #d1d5db;
+  flex: 0 0 auto;
+}
+
+/* Free is the page's background, so it reads as "nothing is holding this" and
+   the held roles are the ones that carry colour. */
+.role-free { background: #fff; }
+.role-fixed { background: #6b7280; }
+.role-tied { background: #3b82f6; }
+.role-motif { background: #a855f7; }
+.role-target { background: #e5e7eb; }
+
+/* One row a cycle. The binder's sequence in a monospace track at the same
+   measure as the sequence viewer on index.html, so the letters line up when
+   two cycles are read against each other. */
+#cycle-track {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: .02em;
+  overflow-x: auto;
+  margin-top: 6px;
+}
+
+#results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+#results-table th,
+#results-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+}
+
+#results-table th { color: #6b7280; font-weight: 500; }
+
+/* The best cycle of the whole hunt. */
+#results-table tr.best td { background: #f0fdf4; font-weight: 500; }
+
+/* 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS NUMBER. The validity cell carries
+   the measurement that failed - a ring length, a count of base pairs - because
+   a verdict with the number removed is the thing this page exists not to do. */
+#results-table tr.rejected td { color: #92400e; }
+#results-table td.validity { white-space: normal; }

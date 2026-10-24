@@ -1,0 +1,241 @@
+<!--
+design.html
+-----------
+AI Context: THE PROTEIN HUNTER PAGE (the design loop, not a fold)
+
+🔴 THIS IS A SHELL. The controls, the feedback surfaces and the designer's
+automatic choice are real; THE LOOP IS NOT WIRED. Pressing Hunt says so. See
+docs/DESIGN.md for the plan, the upstreams and the order of work.
+
+🔴 THE PAGE IS NOT LINKED FROM index.html AND NOTHING LINKS TO IT. It is in
+tools/build_site.py's OPTIONAL list, so a clean checkout without it still
+builds - but it IS copied when present, which means that once `main` is
+deployed the URL exists. Unlinked is not hidden; say so rather than implying
+otherwise.
+
+🔴 WHY THIS PAGE CANNOT BE SHAPED LIKE index.html's. A fold is one action with
+one answer, so that page can show a viewer and a score. A hunt is minutes of
+nested work - runs, then cycles, then a fold and a design inside each cycle -
+and an interface that only shows the final answer is the wrong shape for it. At
+any instant this page has to answer three questions without being asked: what
+is it doing now, what has it found so far, and why did it keep or reject the
+last thing. Every surface below exists for one of those three.
+
+The style IS index.html's: py2Dmol's light application CSS plus
+web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
+-->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Protein Hunter</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
+    <link rel="stylesheet" href="./web/localfold.css">
+    <!-- Same reason as index.html: the app writes this on load and on every
+         clear, so an inline script in the head is the one place guaranteed to
+         run before the first of those. py2Dmol's default names controls this
+         page does not have. -->
+    <script>window.py2dmolReadyMessage = "Ready. Describe a target and press Hunt.";</script>
+</head>
+
+<body class="bg-gray-50 text-gray-800 font-sans p-4">
+
+    <div class="mx-auto page-width" style="position: relative;">
+
+        <!-- WHAT TO DESIGN AGAINST, AND WHAT TO DESIGN. The target is an entity
+             list, exactly as index.html's fold input is - a type, a value and a
+             number of copies - because a design target is the same kind of
+             thing as a fold input and can be a ligand or a nucleic chain, which
+             no colon-separated string can express. The rows are built by
+             web/entity-ui.js; this is only where they go.
+
+             🔴 THE BINDER IS NOT AN ENTITY ROW. It has no sequence yet - that
+             is the whole point - so it is described by its LENGTH and sits
+             apart from the things that already exist. v1 put a length box next
+             to a target textarea and that was the clearest part of it. -->
+        <div id="design-panel" class="container-box page-width" style="margin-bottom: 10px;">
+            <div class="fetch-panel">
+                <div class="fetch-row" id="design-input-container">
+                    <div class="entity-list">
+                        <div id="entity-rows"></div>
+                        <button id="add-entity" type="button" title="Add another chain, ligand or nucleic acid to the target.">
+                            <i class="fa-solid fa-plus"></i> Add
+                        </button>
+                    </div>
+                </div>
+
+                <div class="fetch-options" id="designOptions">
+
+                    <!-- WHAT IS BEING DESIGNED. Length first: it is the one
+                         number that decides the size of every job below. -->
+                    <div class="fetch-option-group" id="binderGroup">
+                        <span class="fetch-option-title">Binder</span>
+                        <label for="binder-length">Length</label>
+                        <input type="number" id="binder-length" min="4" max="400" value="75"
+                            title="How many residues the designed chain has. It starts as X at every position and the loop fills it in.">
+                    </div>
+
+                    <!-- WHO DESIGNS THE SEQUENCE. Auto writes its reason out
+                         rather than silently changing the picker: the rule is
+                         the reference's - a ligand or nucleic target needs the
+                         checkpoint trained with one. See cpu/design/designers.js. -->
+                    <div class="fetch-option-group" id="designerGroup">
+                        <span class="fetch-option-title">Designer</span>
+                        <select id="designer"
+                            title="Which MPNN redesigns the binder each cycle. Auto reads the target and picks the checkpoint trained for it.">
+                            <option value="auto" selected>Auto</option>
+                            <option value="soluble">SolubleMPNN</option>
+                            <option value="protein">ProteinMPNN</option>
+                            <option value="ligand">LigandMPNN</option>
+                            <option value="na">NA-MPNN</option>
+                        </select>
+                        <div id="designer-note" class="option-note"></div>
+                    </div>
+
+                    <!-- WHICH MODEL FOLDS. 🔴 A LIST, NOT ONE CHOICE, and this
+                         is the single most consequential control on the page.
+                         Rotating the folder every cycle makes a design satisfy
+                         several models instead of overfitting one; Yehlin
+                         measured two or three beating one, and five or six
+                         doing worse than two (docs/DESIGN.md 3C, HER numbers on
+                         HER stack, not reproduced here). The picker therefore
+                         does not offer "all of them" as a convenience. -->
+                    <div class="fetch-option-group" id="folderGroup">
+                        <span class="fetch-option-title">Folders</span>
+                        <select id="folders" multiple size="4"
+                            title="Which folding model runs each cycle. Pick two or three: a design then has to satisfy all of them. More is not better.">
+                            <option value="af3" selected>AF3</option>
+                            <option value="boltz2">Boltz-2</option>
+                            <option value="protenix2">Protenix-2</option>
+                            <option value="opendde">OpenDDE</option>
+                            <option value="rosettafold3">RoseTTAFold3</option>
+                            <option value="intellifold2">IntelliFold-2</option>
+                            <option value="ef2">ESMFold2</option>
+                        </select>
+                        <div id="folder-note" class="option-note"></div>
+                    </div>
+
+                    <!-- HOW LONG TO HUNT. Cycles is the loop's depth, runs its
+                         width: independent hunts from different seeds. -->
+                    <div class="fetch-option-group" id="scheduleGroup">
+                        <span class="fetch-option-title">Schedule</span>
+                        <label for="cycles">Cycles</label>
+                        <input type="number" id="cycles" min="1" max="50" value="5"
+                            title="How many fold-then-redesign rounds each run does.">
+                        <label for="runs">Runs</label>
+                        <input type="number" id="runs" min="1" max="100" value="1"
+                            title="How many independent hunts to do, each from its own seed.">
+                    </div>
+
+                    <!-- HOW THE SEQUENCE IS DRAWN. These are the knobs that
+                         decide what the designer is allowed to write; the
+                         field names follow maraxen/aminx's RunSpec so the two
+                         mean the same thing. See docs/DESIGN.md 3B. -->
+                    <div class="fetch-option-group" id="samplingGroup">
+                        <span class="fetch-option-title">Sampling</span>
+                        <label for="temperature">Temperature</label>
+                        <input type="number" id="temperature" min="0.01" max="2" step="0.01" value="0.1"
+                            title="How sharply the designer samples. Low is conservative.">
+                        <label for="omit">Omit</label>
+                        <input type="text" id="omit" value="C" maxlength="20" size="6"
+                            title="Amino acid letters the designer may never write. Cysteine is omitted by default.">
+                        <label for="seed">Seed</label>
+                        <input type="number" id="seed" min="0" value="0"
+                            title="The seed. A given target, setting and seed give the same hunt every time.">
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <!-- WHAT IT IS DOING NOW - the first of the three questions. The run
+             and cycle counters and the stage live here, with the progress bar
+             spanning the WHOLE hunt rather than the current fold: a bar that
+             restarts every cycle tells you nothing about how long is left.
+
+             🔴 OUTSIDE the viewer, which is hidden until there is something to
+             show - the same arrangement as index.html, and for the same reason:
+             a status line inside a hidden element is a status line nobody can
+             read while they wait for the first result. -->
+        <div class="container-box page-width" id="hunt-bar" style="margin-bottom: 10px;">
+            <div class="fetch-row">
+                <button id="hunt" class="primary"
+                    title="Start hunting. The loop is not wired yet.">Hunt</button>
+                <div id="status-message"></div>
+            </div>
+            <progress id="progress" max="1" value="0" data-state="idle"></progress>
+            <div id="gpu-summary" class="option-note"></div>
+        </div>
+
+        <!-- WHAT IS BEING DECIDED, AND WHAT IS NOT. 🔴 THE SURFACE A FOLD PAGE
+             DOES NOT NEED AND A DESIGN PAGE CANNOT DO WITHOUT. Every residue
+             has a ROLE - free to change, held fixed, tied to another position,
+             part of a motif, or part of the target - and those roles are what
+             the user is really setting when they pick residues. The same
+             colours are used in the sequence track and in the 3D view, so a
+             residue picked in one is recognisable in the other. -->
+        <div class="container-box page-width" id="roles-legend" style="margin-bottom: 10px;">
+            <span class="fetch-option-title">Residue roles</span>
+            <ul class="role-list">
+                <li><span class="role-swatch role-free"></span>free &mdash; the designer may rewrite it</li>
+                <li><span class="role-swatch role-fixed"></span>fixed &mdash; held at its letter</li>
+                <li><span class="role-swatch role-tied"></span>tied &mdash; forced equal to another position</li>
+                <li><span class="role-swatch role-motif"></span>motif &mdash; held in sequence and in geometry</li>
+                <li><span class="role-swatch role-target"></span>target &mdash; not designed at all</li>
+            </ul>
+        </div>
+
+        <!-- WHAT IT HAS FOUND SO FAR. Every cycle is a frame of one object, so
+             the play bar walks the whole hunt and a design can be watched
+             arriving rather than inspected afterwards. v1 did this and it is
+             the single best thing about it. -->
+        <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;"></div>
+
+        <!-- The binder's sequence as it changes, one row a cycle, coloured by
+             the roles above. This is where X positions filling in is visible,
+             which is the clearest signal that the loop is working at all. -->
+        <div class="container-box page-width" id="cycle-track-container" style="display: none; margin-bottom: 10px;">
+            <span class="fetch-option-title">Sequence by cycle</span>
+            <div id="cycle-track"></div>
+        </div>
+
+        <!-- ...AND WHY IT KEPT OR REJECTED THE LAST THING - the third question,
+             and the row most likely to be dropped for time.
+
+             🔴 A REJECTION IS SHOWN AS ITS PHYSICAL NUMBER, NOT AS A VERDICT:
+             `ring 3.87 A`, `0/12 Watson-Crick pairs`, `framework RMSD 17.6 A`.
+             A model can run, score itself well, and produce the wrong
+             molecule - in Yehlin's measurements ESMFold2 reports fine
+             confidence and gets none of a DNA duplex's base pairs - so a page
+             that reports only the objective is a page that lies. Validity is a
+             veto separate from the objective, and the reason has to be on
+             screen. -->
+        <div class="container-box page-width" id="results" style="display: none; margin-bottom: 10px;">
+            <span class="fetch-option-title">Cycles</span>
+            <table id="results-table">
+                <thead>
+                    <tr>
+                        <th>Run</th>
+                        <th>Cycle</th>
+                        <th>Folded by</th>
+                        <th>Objective</th>
+                        <th>Validity</th>
+                    </tr>
+                </thead>
+                <tbody id="results-body"></tbody>
+            </table>
+        </div>
+
+        <div id="downloads" class="container-box page-width" style="display: none;"></div>
+
+    </div>
+
+    <script type="module" src="./web/design.js"></script>
+
+</body>
+
+</html>

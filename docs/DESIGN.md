@@ -106,9 +106,14 @@ Taking her sampler wholesale is a **trade**, and the first page should not make 
 
 Hunter needs Ligand and NA, which her browser half does not export. So:
 
-- **Take now: her RunSpec semantics.** `runspec_core.mjs` specifies the knob surface our bridge lacks — fixed
-  positions, tied positions, decoding order, bias/omit, and a seeded PRNG that makes
-  (structure, RunSpec, seed) reproducible. Adopt the *semantics and the field names* against our engine.
+- **Take now: her RunSpec semantics.** The knob surface our bridge lacks — fixed positions, tied positions,
+  decoding order, bias/omit, and a seeded PRNG. **Specified in docs/DESIGN-RUNSPEC.md**: ten fields with their
+  defaults, the eleven input tensors, the SplitMix64 draw, and the tie semantics. Adopt the *semantics and the
+  field names* against our engine.
+  🔴 **One finding there changes how reproducibility must be implemented:** she pads the structure to its length
+  bucket *before* building the inputs, so the PRNG is consumed over the padded length. The same structure at the
+  same seed therefore samples differently depending on whether it lands in the 128 or the 256 bucket. A
+  reimplementation that draws over the real length is not her sampler, and the difference is silent.
 - **Take now: her parity discipline.** A per-checkpoint ledger that states where parity is incomplete rather than
   implying it is finished.
 - **Measure later, decide later: the ONNX sampler.** A speed arm against the JS engine for the ProteinMPNN case,
@@ -295,6 +300,11 @@ Each step ends green and is committed before the next begins.
    wired. Gate: `npm run test:site` resolves it, `tools/mobile-layout.py` passes.
    Alongside it, audit py2Dmol for the three things section 5 needs - role colouring, a labelled frame API, residue
    picking - and record which already exist, since that decides whether the viewer needs an upstream change early.
+   🔴 **Both of those gates are already red on this checkout, for reasons that predate this work and are not
+   design's to fix:** `npm run test:site` fails because `model-boltz2-int5/` has drifted from its manifest module
+   (it is missing `weights-08.int5.bin`), and `tools/mobile-layout.py` reports four failures about `index.html`'s
+   own option grouping. Verified by re-running both with this work stashed: identical failures. Until they are
+   green, a new page's module graph has to be resolved by hand.
 2. **The RunSpec.** aminx's field names and semantics on our engine, with her attribution in place; fixed and tied
    positions reaching `cpu/design/mpnn/`. Gate: a seeded RunSpec reproduces its sequence exactly; new bridge tests.
    **Unlocks** inverse folding, and is the primitive antibody mode and motif scaffolding are built on.

@@ -45,7 +45,10 @@ FILES = [".nojekyll", "index.html", "dev.html"]
 # gitignored, and every tool that touches them SKIPS a page it cannot find
 # rather than dropping its probe - so putting them back is one line here and the
 # gates come back with them.
-OPTIONAL = ["single.html", "proteinhunter.html"]
+# ...and `design.html`, which IS in the repository and is copied when present:
+# nothing links to it and index.html does not mention it, but it is on the site
+# once `main` deploys. Unlinked is not hidden; see docs/DESIGN.md.
+OPTIONAL = ["single.html", "proteinhunter.html", "design.html"]
 DIRECTORIES = ["web", "shared", "cpu", "webgpu"]
 
 # ...and never these, wherever they appear.
