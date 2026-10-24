@@ -107,7 +107,18 @@ READ_PAGE = """(() => {
   const n = (sel) => document.querySelectorAll(sel).length;
   return JSON.stringify({
     designer: t("designer-note"), folder: t("folder-note"), gpu: t("gpu-summary"),
-    spanRows: n("#contig-rows > *"), roles: n("#roles-legend .role-list li"),
+    spanRows: n("#contig-rows > *"),
+    // 🔴 THE LEGEND IS THE JOB'S NOW, so it is read as TEXT and compared with
+    // the chains the span list actually has. Counting a fixed five was a gate
+    // on a hard-coded list, and two of that five - tied, motif - were never
+    // painted by anything.
+    legend: [...document.querySelectorAll("#role-list li")].map((li) => li.textContent.trim()),
+    // Every row that belongs to a chain carries that chain's bar; the swatch
+    // and the bar have to be the SAME colour or the indicator points nowhere.
+    rowColours: [...document.querySelectorAll("#contig-rows .contig-row")]
+      .map((row) => row.style.getPropertyValue("--chain-colour") || null),
+    legendColours: [...document.querySelectorAll("#role-list .role-swatch")]
+      .map((s) => s.style.getPropertyValue("--chain-colour")),
     contig: t("contig-line"), problems: t("contig-problems"),
     presets: document.querySelectorAll("#preset option").length,
     columns: n("#results-table thead th"),
@@ -151,8 +162,24 @@ def main():
             print(f"  {key}: {value}")
         if "because" not in (page["designer"] or ""):
             bad.append(f"the designer note does not say why: {page['designer']!r}")
-        if page["roles"] != 5:
-            bad.append(f"{page['roles']} role swatches, expected 5")
+        # The default job is a given target, a break, and a designed binder - so
+        # two chains, and the designed one has to be named as such or the reader
+        # cannot tell which colour is the thing being made.
+        if len(page["legend"]) != 2:
+            bad.append(f"the legend has {page['legend']}, expected one entry a chain")
+        if not any("designed" in entry for entry in page["legend"]):
+            bad.append(f"the legend does not say which chain is designed: {page['legend']}")
+        # 🔴 THE SWATCH AND THE ROW BAR MUST BE THE SAME COLOUR. They come from
+        # two different walks of the same spans, and a disagreement between them
+        # is an indicator that points at the wrong chain - which reads as an
+        # answer rather than as a bug.
+        rowsByChain = [c for c in page["rowColours"] if c]
+        if sorted(set(rowsByChain)) != sorted(set(page["legendColours"])):
+            bad.append("row bars and legend swatches disagree: "
+                       f"{sorted(set(rowsByChain))} against {sorted(set(page['legendColours']))}")
+        # ...and the break row belongs to no chain, so it carries no bar.
+        if len(rowsByChain) != 2:
+            bad.append(f"expected two chained rows, got {page['rowColours']}")
         if page["spanRows"] != 3:
             bad.append(f"the span editor drew {page['spanRows']} rows, expected 3")
         # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE
@@ -427,6 +454,16 @@ def main():
             else:
                 if "100 tokens" not in generated["status"]:
                     bad.append(f"the generation did not report its tokens: {generated['status']!r}")
+                # 🔴 A GENERATION IS A TRAJECTORY AND MUST BE DRAWN AS ONE.
+                # This asked for one frame, which a page that pushes only the
+                # finished structure satisfies - and that is exactly what it
+                # did, so RFD4 looked static beside a hunt that animates while
+                # the gate stayed green. The flow decodes a bounded number of
+                # live frames now, so several is the right answer; the play bar
+                # hides itself below two.
+                if generated["frames"] < 3:
+                    bad.append(f"the generation drew {generated['frames']} frames,"
+                               " expected a trajectory")
                 if generated["frames"] < 1:
                     bad.append("the generation drew no structure")
                 if generated["progress"] != 1:

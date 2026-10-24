@@ -419,6 +419,64 @@ export function conditionsOf(spans) {
   return Object.keys(conditions).length === 0 ? undefined : conditions;
 }
 
+/** One contig string back into spans, or null for a piece this editor has no row for. */
+export const spansFromContig = (contig) => {
+  const spans = [];
+  for (const raw of String(contig).split(",")) {
+    const piece = raw.trim();
+    if (piece.length === 0) continue;
+    if (piece === "/0" || /^\/\d+$/.test(piece)) { spans.push({ kind: "break" }); continue; }
+    // 🔴 THE CHAIN IS LETTERS ONLY, AND THE GREEDY VERSION SPLIT `A16-35` AS
+    // CHAIN "A1", FIRST 6. This is `parseContigToken`'s own expression in
+    // shared/rfd4p/pipeline/spec.js, which is the parser the engine actually
+    // uses; ours read `[A-Za-z][A-Za-z0-9]*`, which can absorb digits and then
+    // backtracks to leave the first residue a digit short.
+    //
+    // 🔴 AND A ROUND TRIP CANNOT SEE IT, which is why it survived a check
+    // against six shipped presets byte for byte: chain "A1" with first 6 joins
+    // back to exactly "A16-35". The only thing that catches a mis-split is
+    // comparing the FIELDS, so test/design-contig-spans.test.js does that.
+    //
+    // 🔴 AND THE RANGE IS OPTIONAL: `A16` is one residue, which the engine
+    // accepts and this editor used to refuse outright - the whole preset fell
+    // through to "no row for it yet".
+    const segment = /^([A-Za-z]+)(\d+)(?:-(\d+))?$/.exec(piece);
+    if (segment !== null) {
+      const first = Number(segment[2]);
+      spans.push({ kind: "segment", chain: segment[1],
+        first, last: segment[3] === undefined ? first : Number(segment[3]) });
+      continue;
+    }
+    const generated = /^(\d+)-(\d+)$/.exec(piece);
+    if (generated !== null) {
+      spans.push({ kind: "generated", min: Number(generated[1]), max: Number(generated[2]) });
+      continue;
+    }
+    if (/^\d+$/.test(piece)) {
+      spans.push({ kind: "generated", min: Number(piece), max: Number(piece) });
+      continue;
+    }
+    // A labelled span - `h1:16-16P` - carries a name and a polymer type, and the
+    // name is the handle a secondary-structure or CATH condition selects it by.
+    const labelled = /^([A-Za-z][A-Za-z0-9]*):(\d+)-(\d+)([PRD])?$/.exec(piece);
+    if (labelled !== null) {
+      spans.push({
+        kind: "generated", name: labelled[1],
+        min: Number(labelled[2]), max: Number(labelled[3]),
+        polymer: { P: "protein", R: "rna", D: "dna" }[labelled[4] ?? "P"],
+        // 🔴 THE SECONDARY STRUCTURE IS RECOVERED FROM THE CONDITIONS, NOT THE
+        // CONTIG, because the contig carries only the name. Filled in below.
+        secondary: "",
+      });
+      continue;
+    }
+    if (/^[A-Za-z0-9]+:/.test(piece)) return null;
+    if (/^[A-Z0-9]{1,5}$/.test(piece)) { spans.push({ kind: "ligand", code: piece }); continue; }
+    return null;
+  }
+  return spans;
+};
+
 /**
  * The same spans as Protein Hunter's chains.
  *
@@ -611,8 +669,30 @@ export function createContigList(rowsContainer, addButton, options = {}) {
     const limits = METHOD_LIMITS[methodOf()] ?? {};
     rowsContainer.replaceChildren();
 
+    // 🔴 THE SAME WALK THE VIEWER WILL PAINT, taken once for the whole list
+    // rather than per row: a row cannot know which chain it is in without
+    // seeing the breaks before it.
+    const chainOf = chainOfSpans(spans);
+
     for (const [index, span] of spans.entries()) {
       const row = element("div", `contig-row contig-row-${span.kind}`);
+      // 🔴 THE CHAIN'S COLOUR AS A CUSTOM PROPERTY, DRAWN BY A ::before BAR.
+      // Not a grid child: `.contig-row` is a three-track grid and the mobile
+      // breakpoint assigns those tracks by hand, so a fourth element would have
+      // to be placed twice and would be the first thing to break on a phone.
+      // A span in no chain - a break, a ligand - gets no bar rather than
+      // borrowing the next chain's colour and announcing a chain that has not
+      // started.
+      const chain = chainOf[index];
+      if (chain !== null) {
+        row.style.setProperty("--chain-colour", chainColour(chain));
+        row.classList.add("contig-row-chained");
+        row.title = `chain ${CHAIN_IDS[chain] ?? "?"}`;
+      } else if (span.kind === "ligand") {
+        row.style.setProperty("--chain-colour", LIGAND_COLOUR);
+        row.classList.add("contig-row-chained");
+        row.title = "a ligand belongs to no chain";
+      }
 
       const picker = element("select", "entity-picker");
       picker.title = SPAN_NOTES[span.kind] ?? "";

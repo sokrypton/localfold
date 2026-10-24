@@ -28,6 +28,7 @@ import { getDevice } from "./model.js";
 import { buildBatch } from "../shared/rfd4p/pipeline/index.js";
 import { fetchRfd4pConfig, fetchShardedWeights } from "../shared/rfd4p/safetensors.js";
 import { generateRfd4p } from "../webgpu/rfd4p/generate.js";
+import { processSampleToAtoms, toPdbString } from "../shared/rfd4p/output.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 
 /** How many flow-matching steps a generation takes when the caller does not say. */
@@ -108,7 +109,7 @@ export async function generate(options) {
     contig, conditions, cifUrl, inputCif: givenCif, fromAnnotations = false,
     steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
     partialTrajectoryFractionSteps, inverseFolding,
-    status = () => {}, progress = () => {}, onStep, signal,
+    status = () => {}, progress = () => {}, onStep, frames = 0, signal,
   } = options;
 
   if (typeof contig !== "string" || contig.trim().length === 0) {
@@ -196,12 +197,43 @@ export async function generate(options) {
     ...(inverseFolding === true ? { inverseFolding: true } : {}),
     withEncoder: inverseFolding === true || partialTrajectoryFractionSteps !== undefined,
     inputAtoms: inputCif === undefined ? undefined : batch.__atoms,
+    // 🔴 A LIVE FRAME IS A DECODER PASS, SO IT IS ASKED FOR BY COUNT, NOT BY
+    // STEP. `decodeEvery` makes the engine run the all-atom decoder on that
+    // cadence - real GPU work on top of the flow - so a 60-step generation
+    // decoded every step would pay 60 decodes to draw 60 nearly identical
+    // frames. `frames` is how many the caller wants to WATCH, and the cadence
+    // falls out of it; 0 turns the whole thing off and nothing is decoded.
+    ...(frames > 0 ? { decodeEvery: Math.max(1, Math.round(steps / frames)) } : {}),
     onStep: (step) => {
       // The remaining 30% of the bar is the flow itself.
       const index = step?.step ?? step?.i ?? 0;
       progress(0.7 + 0.3 * Math.min(1, (index + 1) / steps));
       status(`generating · step ${index + 1}/${steps}`);
-      if (onStep !== undefined) onStep(step);
+      // 🔴 AND THE CALLER IS HANDED A PDB, NOT THE RAW DECODE. `step.decoded`
+      // is `formatSampleLocalLatents`'s {coors, atomMask, residueType}, which
+      // is two transforms short of something a viewer can draw - and those are
+      // exactly the two the FINAL structure goes through, so doing them here
+      // keeps one path rather than letting the page reimplement the tail of
+      // the pipeline.
+      let pdb;
+      if (step?.decoded != null) {
+        try {
+          pdb = toPdbString(processSampleToAtoms({
+            coors: step.decoded.coors,
+            atomMask: step.decoded.atomMask,
+            residueType: step.decoded.residueType,
+            paddingMask: step.paddingMask,
+            insertionLogits: step.insertionLogits ?? null,
+            inputAtoms: inputCif === undefined ? undefined : batch.__atoms,
+            batch,
+          }));
+        } catch {
+          // A frame that cannot be drawn is not a reason to lose the run; the
+          // final structure comes from its own call below.
+          pdb = undefined;
+        }
+      }
+      if (onStep !== undefined) onStep({ ...step, pdb });
     },
   });
 

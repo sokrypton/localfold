@@ -347,6 +347,11 @@ export class Rfd4pGeneratorGpu {
             xt: { bb_ca: Float32Array.from(x.bb_ca), local_latents: Float32Array.from(x.local_latents) },
             logits: lastLogits,
             decoded: liveDecoded,
+            // 🔴 THE PADDING MASK TRAVELS WITH THE FRAME. `processSampleToAtoms`
+            // needs it, and without it a caller drawing a live frame would
+            // either rebuild it from the batch - a second copy of this
+            // function's own input - or draw the padded positions as atoms.
+            paddingMask: pad,
             insertionLogits: liveDecoded ? lastInsertion : null,
             convergence,
           });

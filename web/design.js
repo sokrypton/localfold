@@ -16,7 +16,10 @@
  *
  * See docs/DESIGN.md for the plan this page is step one of.
  */
-import { chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf } from "./contig-ui.js";
+import {
+  chainColour, chainOfSpans, chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf,
+  LIGAND_COLOUR, shade, spansFromContig,
+} from "./contig-ui.js";
 import { generate } from "./generate.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
@@ -25,17 +28,6 @@ import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
 import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
-// 🔴 THE SAME VALUES AS THE .role-* SWATCHES IN web/localfold.css. Two places,
-// because one is a stylesheet and the other reaches a WebGL renderer that
-// cannot read a CSS class - so they are written out here with the rule that
-// they have to match, and the page gate compares them.
-export const ROLE_COLOURS = {
-  free: "#ffffff",
-  fixed: "#6b7280",
-  tied: "#3b82f6",
-  motif: "#a855f7",
-  target: "#e5e7eb",
-};
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import { alignToReference } from "../cpu/design/align.js";
@@ -89,6 +81,7 @@ const track = element("cycle-track");
 const advancedButton = element("show-advanced");
 const stepsTitle = element("steps-title");
 const unusedNote = element("unused-note");
+const roleList = element("role-list");
 
 // 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
 // same reason as the lookups above: `paintJob` runs while the span list is still
@@ -102,6 +95,11 @@ let loaded = null;
 // ONTO, and the designed chain's held positions, kept so the viewer can paint
 // them. Both belong to a RUN rather than to a record, so `drawCycle` - which
 // sees one record at a time - cannot derive either.
+// 🔴 HOW MANY TRAJECTORY FRAMES A GENERATION IS WATCHED IN. Each one costs an
+// all-atom decoder pass, so this is a budget rather than a resolution: enough
+// to read as motion, few enough that watching is not most of the run.
+const TRAJECTORY_FRAMES = 16;
+
 let reference = null;
 let held = [];
 
@@ -254,8 +252,42 @@ const contigProblems = element("contig-problems");
  * which is the clearest way to convey that the spans are the job and the method
  * is a choice about how to realise it.
  */
+/**
+ * The colour key, built from the job rather than written into the page.
+ *
+ * 🔴 IT NAMES THE CHAINS THAT EXIST, NOT A FIXED SET OF ROLES. The static
+ * version listed five - designed, held, tied, motif, target - and nothing
+ * painted `tied` or `motif`: a legend for a picture the page could not draw.
+ * What the viewer actually shows is one colour a chain, so that is what this
+ * says, and it comes from the same `chainOfSpans` walk the rows use.
+ */
+function paintLegend(spans) {
+  const chains = [...new Set(chainOfSpans(spans).filter((at) => at !== null))]
+    .sort((a, b) => a - b);
+  const { chainIndex } = chainsOf(spans, { sequenceOf: resolver() });
+  const entry = (colour, text) => {
+    const item = document.createElement("li");
+    const swatch = document.createElement("span");
+    swatch.className = "role-swatch";
+    swatch.style.setProperty("--chain-colour", colour);
+    item.append(swatch, text);
+    return item;
+  };
+  const items = chains.map((at) => entry(chainColour(at),
+    `chain ${CHAIN_IDS[at] ?? "?"}${at === chainIndex ? " — designed" : ""}`));
+  // Only worth a line when there is something held to explain.
+  if (held.length > 0 && chainIndex >= 0) {
+    items.push(entry(shade(chainColour(chainIndex), "#374151", 0.55), "held"));
+  }
+  if (spans.some((span) => span.kind === "ligand")) {
+    items.push(entry(LIGAND_COLOUR, "ligand"));
+  }
+  roleList.replaceChildren(...items);
+}
+
 const paintJob = () => {
   const spans = spanList?.read() ?? [];
+  paintLegend(spans);
   const hunter = method.value === "hunter";
   const { contig, problems, tokens } = contigOf(spans, method.value);
   const span = tokens.min === tokens.max ? `${tokens.min}` : `${tokens.min}\u2013${tokens.max}`;
@@ -488,17 +520,30 @@ const drawCycle = (record) => {
   // same two swatches the legend names. These are the only two roles a Hunter
   // run has today; fixed, tied and motif arrive with the RunSpec's positions
   // reaching the page.
+  // 🔴 HUE IS THE CHAIN, TREATMENT IS THE ROLE. A reader needs both answers -
+  // which chain is this, and is it being decided - and there is one set of
+  // pixels to give them in. Colouring by role alone, which this page did first,
+  // cannot say which chain a held motif belongs to; colouring by chain alone
+  // cannot say what is being designed. So every chain keeps its own colour, the
+  // one being designed at full strength and the rest faded toward the
+  // background - and the fade is a BLEND rather than a swap, so a recessive
+  // chain is still the colour of its row.
+  const designed = CHAIN_IDS.indexOf(record.chain);
   viewer.colourChains({
-    [record.chain]: ROLE_COLOURS.free,
-    ...Object.fromEntries(CHAIN_IDS.split("").filter((id) => id !== record.chain)
-      .map((id) => [id, ROLE_COLOURS.target])),
+    [record.chain]: chainColour(designed),
+    ...Object.fromEntries(CHAIN_IDS.split("").map((id, at) => [id, at])
+      .filter(([id]) => id !== record.chain)
+      .map(([id, at]) => [id, shade(chainColour(at), "#ffffff", 0.62)])),
   });
   // 🔴 AND THE HELD RESIDUES OVER THE TOP, which is what makes the picture
   // answer "which parts are kept": a scaffolded motif is held residues inside
   // a designed chain, so colouring by chain alone paints the motif as though
   // the designer were free to rewrite it. The legend has named `held` since the
   // page was built and nothing painted it until now.
-  viewer.colourResidues(globalResidues(placed, record.chain, held), ROLE_COLOURS.fixed);
+  // ...and the held residues darker rather than grey, so they still read as
+  // part of their own chain while saying they are not being rewritten.
+  viewer.colourResidues(globalResidues(placed, record.chain, held),
+    shade(chainColour(designed), "#374151", 0.55));
 
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;
@@ -655,48 +700,6 @@ for (const preset of RFD4P_PRESETS) {
   presetSelect.append(option);
 }
 
-/** One contig string back into spans, or null for a piece this editor has no row for. */
-export const spansFromContig = (contig) => {
-  const spans = [];
-  for (const raw of String(contig).split(",")) {
-    const piece = raw.trim();
-    if (piece.length === 0) continue;
-    if (piece === "/0" || /^\/\d+$/.test(piece)) { spans.push({ kind: "break" }); continue; }
-    const segment = /^([A-Za-z][A-Za-z0-9]*)(\d+)-(\d+)$/.exec(piece);
-    if (segment !== null) {
-      spans.push({ kind: "segment", chain: segment[1],
-        first: Number(segment[2]), last: Number(segment[3]) });
-      continue;
-    }
-    const generated = /^(\d+)-(\d+)$/.exec(piece);
-    if (generated !== null) {
-      spans.push({ kind: "generated", min: Number(generated[1]), max: Number(generated[2]) });
-      continue;
-    }
-    if (/^\d+$/.test(piece)) {
-      spans.push({ kind: "generated", min: Number(piece), max: Number(piece) });
-      continue;
-    }
-    // A labelled span - `h1:16-16P` - carries a name and a polymer type, and the
-    // name is the handle a secondary-structure or CATH condition selects it by.
-    const labelled = /^([A-Za-z][A-Za-z0-9]*):(\d+)-(\d+)([PRD])?$/.exec(piece);
-    if (labelled !== null) {
-      spans.push({
-        kind: "generated", name: labelled[1],
-        min: Number(labelled[2]), max: Number(labelled[3]),
-        polymer: { P: "protein", R: "rna", D: "dna" }[labelled[4] ?? "P"],
-        // 🔴 THE SECONDARY STRUCTURE IS RECOVERED FROM THE CONDITIONS, NOT THE
-        // CONTIG, because the contig carries only the name. Filled in below.
-        secondary: "",
-      });
-      continue;
-    }
-    if (/^[A-Za-z0-9]+:/.test(piece)) return null;
-    if (/^[A-Z0-9]{1,5}$/.test(piece)) { spans.push({ kind: "ligand", code: piece }); continue; }
-    return null;
-  }
-  return spans;
-};
 
 // What a preset carries beyond its contig: the conditions, the template
 // structure, and the per-modality options that make partial diffusion and
@@ -942,13 +945,37 @@ const startGenerate = async () => {
       // A structure the user loaded is the one they mean, over a preset's.
       ...(loaded === null ? {} : { inputCif: loaded.text }),
       steps: number("steps", 60),
+      // 🔴 A GENERATION IS A TRAJECTORY AND WAS DRAWN AS ONE PICTURE. The flow
+      // runs 60 steps and the page pushed only the finished structure, so the
+      // play bar - which hides itself below two frames - never appeared and
+      // RFD4 looked static beside a hunt that animates. Asking for a FRAME
+      // COUNT rather than a cadence is what keeps the cost bounded: each frame
+      // is an all-atom decoder pass on top of the flow, so this is ~16 decodes
+      // whether the run is 20 steps or 200.
+      frames: TRAJECTORY_FRAMES,
+      onStep: (step) => {
+        if (step.pdb === undefined) return;
+        viewerBox.style.display = "";
+        // 🔴 FITTED ONTO THE FIRST FRAME, for the reason a hunt is: a flow step
+        // moves the molecule as well as folding it, so played back raw the
+        // trajectory tumbles. There is no designed chain to exclude here - the
+        // whole thing is being generated - so the fit is over everything.
+        if (reference === null) reference = step.pdb;
+        const placed = reference === step.pdb ? step.pdb
+          : alignToReference(step.pdb, reference, undefined);
+        viewer.push(placed, (built) => { if (built) viewer.orient(); });
+      },
       seed: number("seed", 0),
       signal: controller.signal,
       status: (text) => say(text),
       progress: (fraction) => { progress.value = fraction; },
     });
     viewerBox.style.display = "";
-    viewer.push(result.pdb, (built) => { if (built) viewer.orient(); });
+    // The finished structure is the last frame, in the same frame of reference
+    // as the trajectory that led to it.
+    viewer.push(reference === null ? result.pdb
+      : alignToReference(result.pdb, reference, undefined),
+    (built) => { if (built) viewer.orient(); });
     resultsBox.style.display = "";
     const row = document.createElement("tr");
     row.className = "best";

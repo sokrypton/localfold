@@ -1258,6 +1258,26 @@
   position: relative;
 }
 
+/* WHICH CHAIN THIS BLOCK IS, as the colour it will be in the viewer. The bar is
+   a ::before rather than a grid child because this is a three-track grid whose
+   tracks the phone breakpoint assigns by hand - a fourth element would have to
+   be placed twice, and would be the first thing to break there.
+
+   Rows in the same chain carry the same bar, so a chain break is visible as the
+   colour changing rather than only as the "New chain" row that causes it. */
+.contig-row-chained { padding-left: 12px; }
+
+.contig-row-chained::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 4px;
+  border-radius: 2px;
+  background: var(--chain-colour, transparent);
+}
+
 /* One line, and it stays one line: the fields of a kind are few enough to fit,
    and the two that are not - a sequence and its extras - get the row below. */
 .contig-fields {
@@ -1447,11 +1467,10 @@
 
 /* Free is the page's own background, so it reads as "nothing is holding this"
    and the held roles are the ones that carry colour. */
-.role-free { background: #fff; }
-.role-fixed { background: #6b7280; }
-.role-tied { background: #3b82f6; }
-.role-motif { background: #a855f7; }
-.role-target { background: #e5e7eb; }
+/* The swatch takes its colour from the job now - one per chain, set inline from
+   the same palette the span rows and the viewer use - so there are no per-role
+   background rules left to drift out of step with it. */
+.role-swatch { background: var(--chain-colour, #e5e7eb); }
 
 /* One line a cycle, at the sequence viewer's measure so two cycles read against
    each other. */
