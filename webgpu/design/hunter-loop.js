@@ -140,6 +140,9 @@ export function withChain(chains, index, sequence) {
  * @param {number} [options.alanineBiasEnd=-0.1]
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are, every cycle. See designChain() in ./mpnn-bridge.js.
+ * @param {(cycle: object) => (string|null|Promise<string|null>)} [options.veto]
+ *   given a finished cycle, a reason it is not a candidate - or null to keep it.
+ *   The reason lands on the record as `vetoed`.
  * @param {number} [options.seed=0]
  * @param {number} [options.run=0] carried onto every record, for the table
  * @param {AbortSignal} [options.signal]
@@ -233,9 +236,22 @@ export async function* runDesign(options) {
     // 20-mer of pure X, cycle 0 folded to pLDDT 72.9 and won a run whose two
     // design cycles were both over the alanine ceiling - twenty unknown
     // residues offered as a design.
-    const eligible = cycle > 0 && alanine <= MAX_ALANINE;
+    // 🔴 VALIDITY IS A VETO, AND IT IS THE CALLER'S TO SUPPLY. The loop knows
+    // two things that make a cycle ineligible - it is cycle 0, or it is over the
+    // alanine ceiling - and both are about the SEQUENCE. Whether the molecule is
+    // right (does the binder touch its target, does a ring close, do the bases
+    // pair) is geometry, and the loop has no business parsing structures. A
+    // caller that cares passes `veto`.
+    //
+    // 🔴 THE REASON IS KEPT, not just the verdict: a rejected cycle has to be
+    // able to say why, with its measurement.
+    let vetoed = null;
+    if (cycle > 0 && typeof options.veto === "function") {
+      vetoed = (await options.veto({ pdb: folded.pdb, confidence, sequence, cycle, run })) ?? null;
+    }
+    const eligible = cycle > 0 && alanine <= MAX_ALANINE && vetoed === null;
     const record = {
-      run, cycle, sequence, alanine, objective, score: value, designScore,
+      run, cycle, sequence, alanine, objective, score: value, designScore, vetoed,
       omit, alanineBias: bias, chainIndex, chain: chainLetter,
       complex: withChain(chains, chainIndex, sequence),
       pdb: folded.pdb,

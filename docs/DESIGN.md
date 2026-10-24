@@ -392,7 +392,7 @@ engine*.
 | antibody CDR | ✅ objective 0.882, framework held either side | ❌ no preset |
 | cyclic | ❌ | ❌ |
 | PTM target | ❌ | ❌ |
-| epitope / hotspots | ❌ needs a contact-rejection filter | ✅ editable per given chain, as a bracketed `C_HOT` selection |
+| epitope / hotspots | ✅ one field, reached by a contact filter: fold, then reject a cycle that is not touching | ✅ the same field, as a bracketed `C_HOT` condition |
 | labelled spans (CATH, secondary structure) | ❌ | ⚠️ the editor has no row; it says so |
 
 `npm run test:design --cases` re-runs the Hunter column, asserting the automatic
@@ -491,12 +491,15 @@ Each step ends green and is committed before the next begins.
    🔴 It also checks the loop's own rule through the page: **cycle 0 can never be best**, because its sequence
    is the mostly-X draw the run started from, and on a 12-mer of mostly X it folds deceptively well (pLDDT 99 in a
    stub, and it was the top scorer).
-4. **Validity checks.** Only the loop's alanine ceiling exists today, and the page reports it as the fraction it
-   is. Ring closure, Watson-Crick pairing and antibody framework RMSD are vetoes with recorded reasons - 🔴 but each
-   one only becomes *reachable* with the modality that produces it, so this step is really a part of 6 and 7 rather
-   than before them. The one check that would bite a protein-binder hunt today and does not exist is **contact
-   rejection**: whether the designed chain is actually touching the target. Gate: each check has a fixture that
-   fails it and one that passes.
+4. **Validity checks — the framework is in, with two checks in it.** The loop takes a `veto` callback, because
+   whether a MOLECULE is right is geometry and the loop has no business parsing structures; it keeps the reason on
+   the record, and the page prints the reason rather than re-describing it. In it today: the alanine ceiling, and
+   **contact rejection** (`cpu/design/contact.js`) - CA to CA at `shared/heads/contact-threshold.js`'s 8 Å
+   protein-protein convention. 🔴 That one is what makes an epitope mean anything for Hunter, which cannot condition
+   on hotspots the way RFD4 does: fold, then reject a cycle whose binder is somewhere else. Proved to fire by asking
+   for residue 9999 - every cycle rejected, `touches 0/1 hotspots (nearest none, needs 8 A)`.
+   Still to add, each reachable only with the modality that produces it: ring closure, Watson-Crick pairing,
+   antibody framework RMSD.
 5. ~~**Ensembles.**~~ **Done.** The folder rotates per cycle - not per run, since a design only has to satisfy
    several models if the model changes UNDER the sequence being refined. `npm run test:design` reads the rotation
    off the table and fails if the column does not alternate: a four-cycle run with two folders gives

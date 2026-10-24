@@ -16,7 +16,7 @@
  *
  * See docs/DESIGN.md for the plan this page is step one of.
  */
-import { chainsOf, conditionsOf, contigOf, createContigList } from "./contig-ui.js";
+import { chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf } from "./contig-ui.js";
 import { generate } from "./generate.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
@@ -336,12 +336,17 @@ const drawCycle = (record) => {
   // ineligible - so that is what it reports, as the fraction it actually is.
   // Ring closure and base pairing are step 4 of docs/DESIGN.md.
   const alanine = `${(record.alanine * 100).toFixed(0)}% Ala`;
-  const vetoed = record.cycle > 0 && record.alanine > MAX_ALANINE;
+  const overAlanine = record.cycle > 0 && record.alanine > MAX_ALANINE;
+  // 🔴 THE VETO'S OWN WORDS, WHICH ALREADY CARRY ITS MEASUREMENT - "touches 0/4
+  // hotspots (nearest 23.7 A, needs 8 A)". Re-describing it here would be a
+  // second place for the number to go stale.
+  const vetoed = overAlanine || typeof record.vetoed === "string";
   if (vetoed) row.classList.add("rejected");
   for (const [text, className] of [
     [String(record.run + 1), ""], [String(record.cycle), ""],
     [record.folder ?? "—", ""], [objective, ""],
-    [vetoed ? `${alanine} — over the ${Math.round(MAX_ALANINE * 100)}% ceiling` : alanine, "validity"],
+    [overAlanine ? `${alanine} — over the ${Math.round(MAX_ALANINE * 100)}% ceiling`
+      : (record.vetoed ?? alanine), "validity"],
   ]) {
     const cell = document.createElement("td");
     cell.textContent = text;
@@ -417,12 +422,19 @@ const startHunt = async () => {
   progress.dataset.state = "running";
 
   try {
-    const { best } = await hunt({
+    const { best, cycles } = await hunt({
       chains,
       chainKinds,
       ligandCodes,
       chainIndex,
       hold,
+      // 🔴 THE SAME HOTSPOTS RFD4 CONDITIONS ON, used the only way Hunter can:
+      // fold, then reject a cycle whose binder is not touching them.
+      // 🔴 `window.__designHotspots` IS A DRIVER'S DOOR, as __designSpans is:
+      // hotspots normally come from a `From structure` span, which needs a
+      // structure loaded, and tools/check-design-page.py has to be able to force
+      // an epitope that cannot be satisfied to prove the veto fires.
+      hotspots: window.__designHotspots ?? hotspotsOf(spans),
       folders: Array.from(folders.selectedOptions, (option) => option.value),
       designer: designerSelect.value,
       contents: contentsOf(spans),
@@ -437,9 +449,26 @@ const startHunt = async () => {
       status: (text) => say(text),
       progress: (fraction) => { progress.value = fraction; },
     });
-    say(best === null
-      ? "no cycle was eligible — every one was over the alanine ceiling"
-      : `done · best run ${best.run + 1} cycle ${best.cycle}, objective ${best.score.toFixed(3)}`);
+    // 🔴 WHY NO CYCLE WON, FROM THE CYCLES THEMSELVES. This used to blame the
+    // alanine ceiling unconditionally, which became a lie the moment a second
+    // veto existed: a run rejected for touching nothing was reported as
+    // alanine-rich.
+    if (best === null) {
+      const reasons = [...new Set(cycles.filter((record) => record.cycle > 0)
+        .map((record) => record.vetoed
+          ?? (record.alanine > MAX_ALANINE
+            ? `over the ${Math.round(MAX_ALANINE * 100)}% alanine ceiling` : "not scored")))];
+      // 🔴 NOT MARKED AS AN ERROR, because the run COMPLETED - it just has no
+      // candidate, which is a result and sometimes the right one (a 24-mer
+      // against a lone ligand really is alanine-rich). Red is for a page that
+      // could not proceed, and painting this red made the gate read a finished
+      // run as a crash.
+      say(reasons.length === 0 ? "no cycle completed"
+        : `no cycle was eligible — ${reasons.join("; ")}`);
+    } else {
+      say(`done · best run ${best.run + 1} cycle ${best.cycle},`
+        + ` objective ${best.score.toFixed(3)}`);
+    }
     progress.dataset.state = "done";
   } catch (error) {
     if (controller.signal.aborted) {

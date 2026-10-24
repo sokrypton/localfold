@@ -20,9 +20,10 @@
  */
 import { getDevice } from "./model.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
-import { runDesign } from "../webgpu/design/hunter-loop.js";
+import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner } from "../cpu/design/designers.js";
+import { contactProblem } from "../cpu/design/contact.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
 export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" };
@@ -48,6 +49,9 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  * @param {number} [options.length=75] the designed chain's length
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
+ * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
+ *   design must touch. A cycle that does not is rejected with the distance.
+ * @param {number} [options.hotspotsNeeded] how many of them must be touched
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -142,6 +146,18 @@ export async function hunt(options) {
       temperature: options.temperature,
       omit: options.omit,
       hold: options.hold,
+
+      // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT
+      // ALL. It cannot condition on hotspots the way RFD4 does, so the only way
+      // to ask is to fold and then reject a cycle whose binder is somewhere
+      // else. With no hotspots named it still refuses a binder that drifted off
+      // the target entirely, which ipTM alone will not catch - the model can be
+      // confident about a chain that is nowhere near.
+      veto: ({ pdb }) => contactProblem(pdb, {
+        chain: CHAIN_IDS[chainIndex],
+        ...(options.hotspots === undefined ? {} : { residues: options.hotspots }),
+        ...(options.hotspotsNeeded === undefined ? {} : { minimum: options.hotspotsNeeded }),
+      }),
       percentX: options.percentX,
       alanineBias: options.alanineBias,
       seed: (options.seed ?? 0) + run,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { METHOD_LIMITS, SPAN_KINDS, chainsOf, conditionsOf, contigOf, emptySpan,
+import { METHOD_LIMITS, SPAN_KINDS, chainsOf, conditionsOf, contigOf, emptySpan, hotspotsOf,
   spanToContig } from "../web/contig-ui.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 
@@ -308,15 +308,24 @@ describe("the design job as a list of spans", () => {
       expect(conditionsOf([])).toBe(undefined);
     });
 
-    // 🔴 AND HUNTER SAYS IT CANNOT. Yehlin reaches an epitope with a contact
-    // REJECTION filter - fold, then discard the cycle if the binder is not
-    // touching the hotspots - which this page does not have. A field that
-    // quietly did nothing would be worse than one that refuses.
-    it("marks hotspots unavailable on Protein Hunter", () => {
-      const spans = [{ kind: "segment", chain: "A", first: 1, last: 40, hotspots: "12" },
+    // 🔴 ONE FIELD, TWO MECHANISMS, AND BOTH METHODS CAN NOW HONOUR IT. RFD4
+    // turns hotspots into a C_HOT condition and generates against them; Protein
+    // Hunter has no conditioning at all, so it folds and then REJECTS a cycle
+    // whose binder is not touching them (cpu/design/contact.js). The same thing
+    // asked for, reached two different ways - which is why the editor does not
+    // need a per-method screen.
+    it("offers hotspots to both methods", () => {
+      const spans = [{ kind: "segment", chain: "A", first: 1, last: 40, hotspots: "12 14" },
         { kind: "break" }, { kind: "generated", min: 30, max: 30 }];
-      expect(contigOf(spans, "hunter").problems).toContain(METHOD_LIMITS.hunter.hotspots);
+      expect(contigOf(spans, "hunter").problems).toEqual([]);
       expect(contigOf(spans, "rfd4p").problems).toEqual([]);
+      // RFD4 reads them as a condition...
+      expect(conditionsOf(spans)).toEqual({
+        C_HOT: { true: [{ select: "sel('A/*/[12,14]/*')" }] },
+      });
+      // ...and Hunter as plain numbers to measure against
+      expect(hotspotsOf(spans)).toEqual({ A: [12, 14] });
+      expect(hotspotsOf([{ kind: "generated", min: 9, max: 9 }])).toBe(undefined);
     });
   });
 });

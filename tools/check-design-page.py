@@ -378,6 +378,51 @@ def main():
                 if generated["progress"] != 1:
                     bad.append(f"the bar ended at {generated['progress']}, not 1")
 
+        # 🔴 THE CONTACT VETO, PROVED BY ASKING FOR AN EPITOPE THAT CANNOT BE
+        # TOUCHED. A filter that never fires is indistinguishable from no filter,
+        # and this is the only check that tells them apart: residue 9999 is not
+        # in any prediction, so every cycle must be rejected, the reason must
+        # carry its measurement, and the summary must name THAT reason rather
+        # than blaming the alanine ceiling - which it did, until a second veto
+        # existed to catch it out.
+        if "--cases" in sys.argv:
+            cdp.evaluate(ws, """(() => {
+              document.getElementById('method').value = 'hunter';
+              document.getElementById('method').dispatchEvent(new Event('change'));
+              document.getElementById('cycles').value = '1';
+              window.__designHotspots = { A: [9999] };
+              window.__designSpans.set([
+                { kind: 'sequence', value: 'GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE' },
+                { kind: 'break' }, { kind: 'generated', min: 16, max: 16 }]);
+              document.getElementById('hunt').click();
+              return 1;
+            })()""")
+            vetoDeadline = time.time() + 600
+            veto = None
+            while time.time() < vetoDeadline:
+                veto = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                  status: document.getElementById('status-message').textContent,
+                  rows: document.querySelectorAll('#results-body tr').length,
+                  rejected: document.querySelectorAll('#results-body tr.rejected').length,
+                  validity: [...document.querySelectorAll('#results-body td.validity')]
+                    .map((n) => n.textContent).join(' | '),
+                  button: document.getElementById('hunt').textContent.trim(),
+                })"""))
+                if veto["button"] == "Hunt" and veto["rows"] > 0:
+                    break
+                time.sleep(2)
+            print(f"  contact veto: rejected={veto['rejected']} | {veto['status'][:70]}")
+            print(f"                {veto['validity'][:110]}")
+            if veto["rejected"] < 1:
+                bad.append("an impossible epitope rejected no cycle; the contact filter never fired")
+            if "hotspots" not in veto["validity"]:
+                bad.append(f"the veto's reason is missing from the table: {veto['validity']!r}")
+            if "needs 8 A" not in veto["validity"]:
+                bad.append(f"the veto did not carry its measurement: {veto['validity']!r}")
+            if "hotspots" not in veto["status"]:
+                bad.append(f"the summary blamed the wrong thing: {veto['status']!r}")
+            cdp.evaluate(ws, "delete window.__designHotspots")
+
         # 🔴 AND, WHEN ASKED, ONE HUNT PER MODALITY. Each asserts the automatic
         # designer followed the job, which is the thing most likely to rot: the
         # rule lives in cpu/design/designers.js and the spans have to carry
