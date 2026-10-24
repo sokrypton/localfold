@@ -707,13 +707,12 @@ void precompile() { D().precompile(); }
 // ---------------------------------------------------------------- GEMM
 int GEMM_EXTRA_EP = 0;
 namespace {
-// every pointer of a pointer-array GEMM's device array (ptrs) 16-byte aligned - the vector epilogue's float4 stores;
-// the array read back on the host (unified memory; pointerArray uploads it before the GEMM is encoded)
-bool ptrsAligned(uint64_t array, int batch) {
-  if (!array) return true;
-  const uint64_t* p = (const uint64_t*)host((const void*)array);
-  for (int z = 0; z < batch; ++z) if (p[z] % 16) return false;
-  return true;
+std::mutex ptrsMu;
+std::unordered_map<uint64_t, bool> ptrsAlignedOf;
+bool ptrsAligned(uint64_t array) {
+  std::lock_guard<std::mutex> l(ptrsMu);
+  auto it = ptrsAlignedOf.find(array);
+  return it != ptrsAlignedOf.end() && it->second;
 }
 // The matrix units' GEMM (gemm_tensor.metal): half operands, any output, every epilogue. LOCALFOLD_GEMM_TENSOR=0 keeps
 // lf_gemm (the control); read at every call, as the bench's arms set it.
@@ -781,8 +780,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
                      (!(a.epilogue & 262144) || (al4(a.C, a.ldc) && al4(a.aux, a.ldaux))) &&
                      (tm == 64 || ((tm == 32 || tm == 16) && tn == 256) || (!(a.epilogue & 32768) && tm % 16 == 0 && tn % 32 == 0)) &&
                      a.m % 4 == 0 && (!a.ptrs || (!a.lnOut && !(a.epilogue & ~(4)))) &&
-                     (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0) && ptrsAligned(a.D, batch) &&
-                               (a.beta == 0.f || ptrsAligned(a.C, batch))
+                     (a.ptrs ? a.ldd % 4 == 0 && (a.beta == 0.f || a.ldc % 4 == 0) && ptrsAligned(a.D) &&
+                               (a.beta == 0.f || ptrsAligned(a.C))
                              : al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & (64 | 1048576)) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc))) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   const bool swigluReg = vecWanted && (a.epilogue & 128) && !(a.epilogue & ~(128 | 4)) &&
@@ -802,14 +801,16 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one tile wide
   const bool lnEmit = a.lnOut && lnWanted && vecEp &&
-                      ((tm == 64 && tn == 64 && a.m == 64 && !hacc) ||
+                      // (the gated residual, 16384, emits only at 64 x 128 - gemm_tensor.metal's float tile has no other
+                      // emitting form - so the 64 x 64 and 256-wide clauses are not its: they would mark lnOut written)
+                      ((tm == 64 && tn == 64 && a.m == 64 && !hacc && !(a.epilogue & 16384)) ||
                        (tm == 64 && tn == 128 &&
                         ((a.m == 128 && (!(a.epilogue & 8192) || a.tgN == 128)) || (a.m == 384 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 384))) ||
                          ((a.epilogue & 8192) && a.tgN == 128 && a.m % 128 == 0)) &&
                         (!hacc || (a.epilogue & 16384))) ||
                        ((tm == 32 || tm == 16) && tn == 256 &&
                         ((a.m == 256 && (!(a.epilogue & 8192) || a.tgN == 256)) || (tm == 32 && a.m == 512 && (!(a.epilogue & (8192 | 16384)) || ((a.epilogue & 8192) && a.tgN == 512))) ||
-                         (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc)) &&
+                         (tm == 32 && (a.epilogue & 8192) && a.tgN == 256 && a.m % 256 == 0)) && !hacc && !(a.epilogue & 16384))) &&
                       batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
@@ -926,6 +927,10 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   return lnEmit;
 }
 }  // namespace
+void notePointerArray(const void* array, bool aligned16) {
+  std::lock_guard<std::mutex> l(ptrsMu);
+  ptrsAlignedOf[(uint64_t)array] = aligned16;
+}
 static GemmArgs gemmArgs(const Gemm& g) {
   // (the vector epilogue's float C in a pointer-array GEMM would be read at C + z sc, an address in the ARRAY)
   if (g.ptrs && g.yinFloat) die("gemm: a float C (yinFloat) is not taken with a pointer array (ptrs)");

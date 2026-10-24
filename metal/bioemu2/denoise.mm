@@ -304,6 +304,9 @@ u64* pointerArray(const std::string& key, const std::vector<u64>& v) {
     if (r.cap < v.size()) { if (r.dev) release(r.dev); r.dev = allocT<u64>(v.size()); r.cap = v.size(); }
     upload(r.dev, v.data(), v.size() * sizeof(u64));
     r.host = v;
+    bool aligned = true;
+    for (u64 x : v) aligned = aligned && x % 16 == 0;
+    notePointerArray(r.dev, aligned);   // (core.h: the vector epilogue takes the array only when said so)
   }
   return r.dev;
 }

@@ -25,6 +25,10 @@ void* alloc(size_t bytes);                  // zero-filled
 void release(const void* p);                // (kept alive until the work issued so far is done)
 template <class T> T* allocT(size_t n) { return (T*)alloc(n * sizeof(T)); }
 void* host(const void* p);                  // the bytes behind a device pointer (read them after a sync)
+// a pointer-array GEMM's device array (Gemm::ptrs) whose every pointer is 16-byte aligned, said by whoever built it on
+// the host - the vector epilogue's float4 stores take one only then (an array never said is not taken: reading it back
+// would need a sync, an upload while kernels are queued being a staged copy)
+void notePointerArray(const void* array, bool aligned16);
 bool isDevice(const void* p);
 size_t allocated();                         // bytes held now
 size_t peakAllocated();
