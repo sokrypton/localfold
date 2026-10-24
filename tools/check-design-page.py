@@ -2,6 +2,12 @@
 
     python3 tools/check-design-page.py
     python3 tools/check-design-page.py --generate   # ...and a real RFD4-Proteina generation
+    python3 tools/check-design-page.py --cases      # ...and a hunt per modality
+
+🔴 `--cases` RUNS ONE HUNT PER MODALITY - unconditional, a ligand target, a
+nucleic target - and asserts the AUTOMATIC DESIGNER follows the job: soluble for
+protein alone, LigandMPNN where heteroatoms are present, NA-MPNN for a nucleic
+chain. It is the matrix, and it takes a couple of minutes.
 
 🔴 `--generate` IS OPT-IN BECAUSE IT DOWNLOADS ~420 MB. It runs an
 unconditional 100-mer through RFD4-Proteina - the second method, the one the
@@ -43,6 +49,17 @@ import cdp  # noqa: E402
 WITH_LIGAND = [{"kind": "generated", "min": 60, "max": 60},
                {"kind": "break"},
                {"kind": "ligand", "code": "HEM"}]
+
+# 🔴 ONE HUNT PER MODALITY, with the designer each must choose. The rule is the
+# reference's and lives in cpu/design/designers.js; what is checked here is that
+# the SPANS carry enough for it to fire.
+MODALITIES = [
+    ("unconditional", [{"kind": "generated", "min": 24, "max": 24}], "SolubleMPNN"),
+    ("ligand target", [{"kind": "generated", "min": 24, "max": 24}, {"kind": "break"},
+                       {"kind": "ligand", "code": "HEM"}], "LigandMPNN"),
+    ("nucleic target", [{"kind": "sequence", "value": "ATGCATGCATGC", "polymer": "dna"},
+                        {"kind": "break"}, {"kind": "generated", "min": 20, "max": 20}], "NA-MPNN"),
+]
 
 # The target and binder a hunt runs on, as spans.
 HUNT_SPANS = [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN"},
@@ -341,6 +358,51 @@ def main():
                     bad.append("the generation drew no structure")
                 if generated["progress"] != 1:
                     bad.append(f"the bar ended at {generated['progress']}, not 1")
+
+        # 🔴 AND, WHEN ASKED, ONE HUNT PER MODALITY. Each asserts the automatic
+        # designer followed the job, which is the thing most likely to rot: the
+        # rule lives in cpu/design/designers.js and the spans have to carry
+        # enough for it to fire.
+        if "--cases" in sys.argv:
+            cdp.evaluate(ws, """(() => {
+              for (const o of document.getElementById('folders').options) {
+                o.selected = o.value === 'af3';
+              }
+              document.getElementById('folders').dispatchEvent(new Event('change'));
+              document.getElementById('cycles').value = '1';
+              document.getElementById('preset').value = '';
+              document.getElementById('preset').dispatchEvent(new Event('change'));
+              return 1;
+            })()""")
+            for label, spans, designer in MODALITIES:
+                cdp.evaluate(ws, """(() => {
+                  document.getElementById('method').value = 'hunter';
+                  document.getElementById('method').dispatchEvent(new Event('change'));
+                  window.__designSpans.set(%s);
+                  document.getElementById('hunt').click();
+                  return 1;
+                })()""" % json.dumps(spans))
+                caseDeadline = time.time() + 600
+                case = None
+                while time.time() < caseDeadline:
+                    case = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                      status: document.getElementById('status-message').textContent,
+                      failed: document.getElementById('status-message').classList.contains('error'),
+                      rows: document.querySelectorAll('#results-body tr').length,
+                      designer: document.getElementById('designer-note').textContent,
+                      button: document.getElementById('hunt').textContent.trim(),
+                    })"""))
+                    if case["failed"] or (case["button"] == "Hunt" and case["rows"] > 0):
+                        break
+                    time.sleep(2)
+                print(f"  {label}: rows={case['rows']} | {case['status'][:60]}")
+                print(f"        {case['designer'][:90]}")
+                if case["failed"]:
+                    bad.append(f"{label} failed: {case['status']}")
+                elif case["rows"] < 2:
+                    bad.append(f"{label} drew {case['rows']} rows, expected cycle 0 and 1")
+                if designer not in case["designer"]:
+                    bad.append(f"{label} chose the wrong designer: {case['designer']!r}")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
         # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.

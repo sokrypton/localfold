@@ -370,6 +370,42 @@ closure, not the app.
 
 ## 6. The target: modality parity with RFD4-Proteina
 
+### Where it stands, measured
+
+Every row below was run through `design.html` on an M5. 🔴 **"runs" is not
+"designs well"** - a 24-mer against a lone HEM is a hard case and its cycles
+went over the alanine ceiling, which is the loop's veto working rather than a
+pass. What these establish is that the job can be *expressed* and *reaches the
+engine*.
+
+| | Protein Hunter | RFD4-Proteina |
+|---|---|---|
+| unconditional | ✅ objective 0.802 | ✅ 100 tokens / 30 steps |
+| protein binder | ✅ objective 0.589, two folders rotating | ✅ preset, needs a structure |
+| ligand target | ✅ runs, LigandMPNN chosen automatically | ✅ preset `110-110,/0,SAM` |
+| nucleic target | ✅ runs, NA-MPNN chosen automatically | ✅ preset `A1-9/0 B1-10/0 120-150` |
+| from a structure | ✅ its sequence is read out | ✅ its coordinates are conditioned on |
+| motif, indexed | ❌ needs fixed positions on the page | ✅ preset round-trips through the spans |
+| motif, unindexed | ❌ as above | ✅ preset round-trips |
+| inverse folding | ❌ needs fixed positions | ✅ plumbed, needs a structure |
+| partial diffusion | ❌ no analogue | ✅ plumbed, needs a structure |
+| antibody CDR | ❌ needs fixed positions | ❌ no preset |
+| cyclic | ❌ | ❌ |
+| PTM target | ❌ | ❌ |
+| epitope / hotspots | ❌ | ⚠️ preset-only, not editable |
+| labelled spans (CATH, secondary structure) | ❌ | ⚠️ the editor has no row; it says so |
+
+`npm run test:design --cases` re-runs the Hunter column, asserting the automatic
+designer follows the job; `--generate` re-runs RFD4's unconditional case.
+
+🔴 **The one primitive most of the gaps need is fixed positions on the page**:
+antibody mode, inverse folding for Hunter, and both motif forms are all "hold
+these residues, design the rest". `cpu/design/runspec.js` already translates
+them - what is missing is a way to say which, which is a span-level field rather
+than a new screen.
+
+
+
 The standing goal is that Protein Hunter eventually offers **every modality RFD4-Proteina does**. Its Studio ships
 nine (its Studio examples manifest), plus a DNA case among its page examples and motif scaffolding in both an
 indexed and an unindexed form.
