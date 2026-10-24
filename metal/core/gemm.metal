@@ -539,25 +539,37 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       }
     }
   }
+  // A whole tile in range stores in 8 x 8 blocks with both loops unrolled, and everything else takes the loop below
+  // element by element. 5646656b gave that loop a per-row 8 x 8 store too, and on Apple8 - registers allocated
+  // statically, for the whole kernel - that store's mere presence cost every lf_gemm 15x (the bench's 1024 x 66816 x 256
+  // 12.4 -> 189 ms, an AF2 pass at 261 residues and 1536 rows 17 -> 84 s), whether a tile reached it or not. The M5
+  // never showed it: it allocates registers dynamically, and runs lf_gemm_tensor anyway.
+  bool stored8x8 = false;
+  if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
+    if (j0 + TR <= g.n && i0 + TC_ <= g.m) {
+      if (g.epilogue & 128) {
+        if constexpr (FC % 2 == 0) {
+          _Pragma("clang loop unroll(full)")
+          for (int a = 0; a < FR; ++a)
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; b += 2) LF_STORE_SWIGLU_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
+          return;
+        }
+      } else if ((EP & 64) == 0 || (g.epilogue & (8192 | 1048576))) {
+        _Pragma("clang loop unroll(full)")
+        for (int a = 0; a < FR; ++a)
+          _Pragma("clang loop unroll(full)")
+          for (int b = 0; b < FC; ++b) LF_STORE_8X8(a, b, j0 + sr + a * 8, i0 + sc + b * 8);
+        if constexpr ((EP & 128) == 0) return;
+        stored8x8 = true;
+      }
+    }
+  }
+  if (!stored8x8) {
   _Pragma("clang loop unroll(full)")
   for (int a = 0; a < FR; ++a) {
     const int j = j0 + sr + a * 8;
     if (j >= g.n) continue;
-    if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
-      if (j + 8 <= g.n && i0 + TC_ <= g.m) {
-        if (g.epilogue & 128) {
-          if constexpr (FC % 2 == 0) {
-            _Pragma("clang loop unroll(full)")
-            for (int b = 0; b < FC; b += 2) LF_STORE_SWIGLU_8X8(a, b, j, i0 + sc + b * 8);
-            continue;
-          }
-        } else if ((EP & 64) == 0 || (g.epilogue & (8192 | 1048576))) {
-          _Pragma("clang loop unroll(full)")
-          for (int b = 0; b < FC; ++b) LF_STORE_8X8(a, b, j, i0 + sc + b * 8);
-          continue;
-        }
-      }
-    }
     _Pragma("clang loop unroll(full)")
     for (int b = 0; b < FC; ++b) {
       const int i = i0 + sc + b * 8;
@@ -750,6 +762,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if constexpr ((EP & 128) != 0) e[t] = metal::is_same_v<TC, half> ? (float)(half)clamp(v, -65504.f, 65504.f) : v;
       }
     }
+  }
   }
   if constexpr ((EP & 128) != 0) {
     if (g.lnOut) {

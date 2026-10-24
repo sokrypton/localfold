@@ -189,6 +189,7 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
                          const float* P, const float* QB, bool pairs2 = false);
 bool gemmTensorOps();      // (whether the GEMMs run on the matrix units - Metal 4's tensor operations)
+bool gemmExtendedEpilogues();   // (whether the fused epilogues below run here: the matrix units, or lf_gemm on Apple9+)
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
 // the matrix units' layout of that weight (and bias): each 128 columns 32 channels' pa, then ga, pb, gb - where

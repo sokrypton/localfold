@@ -393,7 +393,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   const int Ha = 4, Ht = 16;
   const size_t P = (size_t)T * T, wb = (size_t)N * WK * Ha, tbn = (size_t)Ht * P;
   const int Dc = Dt + Ca;                                  // the coupling's width, 896
-  const bool csplit = HALF && splitPays(samples, T, N, Dt, Ca);
+  const bool csplit = HALF && gemmExtendedEpilogues() && splitPays(samples, T, N, Dt, Ca);
   float* cqc = scratch<float>("be2.dn.cqc", (size_t)(T + 1) * (2 * Dc + Ca));
   float* csc = scratch<float>("be2.dn.csc", (size_t)T * (2 * Dc + Dt));
   float* sq = HALF ? nullptr : scratch<float>("be2.dn.sq", RN * Dc);
@@ -631,7 +631,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
     // s_to_q = [a broadcast | q]; q_to_s = [q centre | a]
     // (the fast arm: both inputs normalised directly into half from q and a, or s_to_q SPLIT via couplingSplit)
     if (HALF) {
-      const bool csplit = splitPays(samples, T, N, Dt, Ca);
+      const bool csplit = gemmExtendedEpilogues() && splitPays(samples, T, N, Dt, Ca);
       auto rowsGrid = [](size_t rows) {
         const size_t groups = (rows + 7) / 8;
         return Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1};
@@ -795,12 +795,14 @@ void prepareWeights() {
       const std::string s2q = couplingPrefix(l) + "s_to_q_mixer/", q2s = couplingPrefix(l) + "q_to_s_mixer/";
       const int I = dimW(s2q + "fc1/weight", 0);
       swigluPairs(s2q, Dc, I);
-      const half* w12 = csPairs(s2q, Dc, I);
-      const size_t wq = (size_t)Ca * 2 * I;
-      M.derived<half>((staged ? "csQ2:" : "csQ2b:") + s2q, 2 * wq, [&](half* out) {
-        copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
-        copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
-      });
+      if (gemmExtendedEpilogues()) {      // (the coupling split's weights, where it runs)
+        const half* w12 = csPairs(s2q, Dc, I);
+        const size_t wq = (size_t)Ca * 2 * I;
+        M.derived<half>((staged ? "csQ2:" : "csQ2b:") + s2q, 2 * wq, [&](half* out) {
+          copy2d(out, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+          copy2d(out + wq, wq * 2, w12 + (size_t)Dt * 2 * I, wq * 2, wq * 2, 1);
+        });
+      }
       swigluPairs(q2s, Dc, dimW(q2s + "fc1/weight", 0));
     }
   }

@@ -959,7 +959,7 @@ bool gemm(const Gemm& g) {
 bool gemmGatedRows(const Gemm& g, const float* gate, int ldg, const int* map) {
   static const bool on = !getenv("LOCALFOLD_GATED_ROWS") || atoi(getenv("LOCALFOLD_GATED_ROWS")) != 0;
   const int ldy = g.ldy ? g.ldy : g.out;
-  if (!on || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.out % 4 ||
+  if (!on || !gemmExtendedEpilogues() || g.tw != F16 || g.tx != F16 || g.ty != F32 || g.batch != 1 || g.out % 4 ||
       ldy % 4 || ldg % 4 || ((uint64_t)g.Y & 15) || ((uint64_t)gate & 15) || g.bias || g.beta != 0.f || g.lnOut || g.Yin)
     return false;
   GemmArgs a = gemmArgs(g);
@@ -1058,7 +1058,7 @@ bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, si
                       const float* rowMask, half* out3) {
   if (lnEmitted) *lnEmitted = false;
   static const bool on = !getenv("LOCALFOLD_GATE_RES") || atoi(getenv("LOCALFOLD_GATE_RES")) != 0;
-  if (!on || prows < 1 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15) || (out3 && ((uint64_t)out3 & 15)))
+  if (!on || !gemmExtendedEpilogues() || prows < 1 || out % 4 || ld % 4 || ((uint64_t)act & 15) || ((uint64_t)gate & 15) || (out3 && ((uint64_t)out3 & 15)))
     return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)act;
@@ -1079,7 +1079,7 @@ bool gemmGateResidual(const half* X, const half* W, float* act, size_t prows, si
 }
 bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size_t validRows, int in, int out,
                       const float* bias, int period, int width, int sigCols, const char* label) {
-  if (out % 64 || width % 4 || sigCols % 4 || ((uint64_t)Y & 15) || (bias && ((uint64_t)bias & 15)))
+  if (!gemmExtendedEpilogues() || out % 64 || width % 4 || sigCols % 4 || ((uint64_t)Y & 15) || (bias && ((uint64_t)bias & 15)))
     return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
@@ -1090,7 +1090,7 @@ bool gemmCondPermuted(const half* X, const half* W, float* Y, size_t prows, size
   return true;
 }
 bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int out, const char* label) {
-  if (out % 4 != 0 || ((uint64_t)Y & 15) != 0) return false;
+  if (!gemmExtendedEpilogues() || out % 4 != 0 || ((uint64_t)Y & 15) != 0) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)Y;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -1101,7 +1101,7 @@ bool gemmMulH(const half* X, const half* W, half* Y, size_t rows, int in, int ou
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S, float alpha) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
   const int rows = bi * O, cols = L * O;
-  if (!on || O % 4 || rows < 1 || cols % 4 || ((uint64_t)X & 15)) return false;
+  if (!on || !gemmExtendedEpilogues() || O % 4 || rows < 1 || cols % 4 || ((uint64_t)X & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)rt; a.B = (uint64_t)lt; a.C = a.D = (uint64_t)X;
   a.m = cols; a.n = rows; a.k = S; a.lda = ldr; a.ldb = ldl; a.ldc = a.ldd = cols;
@@ -1113,7 +1113,7 @@ static bool opmOut(const half* X, const half* W, void* pair, DT tp, const float*
                    float alpha, half* lnOut, const float* lnScale, const float* lnOffset, float lnEps,
                    half* lnOut2, const float* lnScale2, const float* lnOffset2, bool after, int opmC) {
   static const bool on = !getenv("LOCALFOLD_OPM_ADD") || atoi(getenv("LOCALFOLD_OPM_ADD")) != 0;
-  if (!on || rows < 1 || opmC < 128 || opmC % 128 || out % opmC || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
+  if (!on || !gemmExtendedEpilogues() || rows < 1 || opmC < 128 || opmC % 128 || out % opmC || ((uint64_t)pair & 15) || ((uint64_t)bias & 15)) return false;
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -1160,7 +1160,7 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
 }
 bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t rows, int in, int hidden, const float* stats,
                          const float* P, const float* QB, bool pairs2) {
-  if (hidden % 8) return false;
+  if (!gemmExtendedEpilogues() || hidden % 8) return false;
   GemmArgs a{};
   a.A = (uint64_t)Wq; a.B = (uint64_t)Xq; a.C = a.D = (uint64_t)gated;
   a.m = 2 * hidden; a.n = (int)rows; a.k = in; a.lda = 2 * hidden; a.ldb = in; a.ldc = a.ldd = hidden;
@@ -1170,6 +1170,19 @@ bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t row
   return true;
 }
 bool gemmTensorOps() { return tensorWanted(); }
+// The epilogues behind lf_gemm's EP bit 64 (the gated rows and residual, the conditioning permute, the half product, the
+// OPM's permuted product and normalised add, the coupling combine) run on lf_gemm only where registers are allocated
+// dynamically - Apple9 and later, the M3 on. On Apple8 (the M2) the extended instance spills: a plain 1024 x 66816 x 256
+// product is 21.8 ms in it against 12.6 in the plain one, and AF2 at 261 residues and 1536 rows took 26.4 s a pass with
+// the OPM's two fused against 15.5 with the separate permute and add they replace (17.4 before any of this). Everywhere
+// else they keep what the M5 measured. LOCALFOLD_LF_GEMM_EXT=0/1 forces either arm.
+bool gemmExtendedEpilogues() {
+  if (tensorWanted()) return true;
+  static const int forced = getenv("LOCALFOLD_LF_GEMM_EXT") ? atoi(getenv("LOCALFOLD_LF_GEMM_EXT")) : -1;
+  if (forced >= 0) return forced != 0;
+  static const bool dynamicRegisters = [D().dev supportsFamily:(MTLGPUFamily)1009];   // (Apple9, by value: SDK 13 has no name)
+  return dynamicRegisters;
+}
 bool triQuartersApply(int C) {
   static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
   return reg && C % 32 == 0 && tensorWanted();

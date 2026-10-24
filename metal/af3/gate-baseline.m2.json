@@ -4,6 +4,11 @@
   "ptm": "0.9403",
   "rmsd": 0.447
  },
+ "af3-5caj-msa": {
+  "plddt": 95.39,
+  "ptm": "0.9485",
+  "rmsd": 1.905
+ },
  "af3-5caj-template": {
   "plddt": 95.41,
   "ptm": "0.9553",
@@ -34,17 +39,22 @@
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.02,
-  "plddt": 48.67,
-  "ptm": "0.4225",
+  "ligand": 0.013,
+  "plddt": 47.71,
+  "ptm": "0.4284",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.048,
-  "nucleic": 0.046,
-  "plddt": 70.19,
-  "ptm": "0.6830",
+  "ligand": 0.045,
+  "nucleic": 0.044,
+  "plddt": 78.69,
+  "ptm": "0.8135",
   "rmsd": null
+ },
+ "boltz2-5caj-template": {
+  "plddt": 97.59,
+  "ptm": "0.9753",
+  "rmsd": 0.533
  },
  "boltz2-6mrr": {
   "plddt": 96.89,
@@ -52,15 +62,15 @@
   "rmsd": 0.612
  },
  "chai1-6mrr": {
-  "plddt": 82.74,
-  "ptm": "0.7515",
-  "rmsd": 0.995
+  "plddt": 84.46,
+  "ptm": "0.7805",
+  "rmsd": 1.034
  },
  "chai1-6mrr-gol-sep3": {
-  "ligand": 0.064,
-  "plddt": 83.29,
-  "ptm": "0.7791",
-  "rmsd": 1.737
+  "ligand": 0.054,
+  "plddt": 84.69,
+  "ptm": "0.8042",
+  "rmsd": 1.694
  },
  "intellifold2-6mrr": {
   "plddt": 85.22,

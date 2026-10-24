@@ -167,7 +167,7 @@ int main() {
     if (gemmCouplingCombine(dX, dW, dG, R, K, Hd, dS, dP, dQB, pairs2)) {
       auto h = download(dG, R * Hd);
       report(pairs2 ? "coupling combine (blocks of 2)" : "coupling combine (blocks of 8)", relRms(ref, std::vector<float>(h.begin(), h.end())), 5e-3);
-    } else { ++failures; printf("  coupling combine: FAIL (not taken)\n"); }
+    } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  coupling combine: FAIL (not taken)\n" : "  coupling combine: not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dX); release(dW); release(dG); release(dS); release(dP); release(dQB);
   }
   {   // gated add
@@ -426,7 +426,7 @@ int main() {
     int* dm = uploadNew(mp.data(), mp.size());
     Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.ty = F32; g.rows = R; g.in = K; g.out = O; g.alpha = 0.75f;
     if (gemmGatedRows(g, dg, ldg, dm)) report("gated rows (mapped)", relRms(ref, download(dY, R * O)), 1e-3);
-    else { ++failures; printf("  gated rows (mapped): FAIL (not taken)\n"); }
+    else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gated rows (mapped): FAIL (not taken)\n" : "  gated rows (mapped): not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dX); release(dW); release(dg); release(dY); release(dm);
   }
   for (bool pre : {false, true}) {   // gated residual (AF3 diffusion transformer): act[r][o] += (alpha X W)[r][o] * (pre ? g : sigmoid(g))
@@ -443,7 +443,7 @@ int main() {
     float* dg = uploadNew(gate.data(), gate.size()); float* dA = uploadNew(A0.data(), A0.size());
     if (gemmGateResidual(dX, dW, dA, prows, rows, K, O, dg, ld, period, 0.5f, "gate res", pre))
       report(pre ? "gate residual (pre-sigmoid)" : "gate residual (sigmoid)", relRms(ref, download(dA, prows * O)), 1e-3);
-    else { ++failures; printf("  gate residual: FAIL (not taken)\n"); }
+    else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gate residual: FAIL (not taken)\n" : "  gate residual: not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dX); release(dW); release(dg); release(dA);
   }
   for (bool chained : {false, true}) {   // gated residual + emitted periodic adaLN (128 wide, unchained & chained, + rowMask & out3)
@@ -498,11 +498,12 @@ int main() {
     }
     if (!chained) {
       upload(dA, A0.data(), A0.size() * 4);
-      gemmGateResidual(dX, dW, dA, rows, rows, K, O, dg, ld, period, 0.5f, "gate res mask+h", true,
-                       nullptr, nullptr, nullptr, 1e-5f, nullptr, nullptr, nullptr, false, nullptr, drm, dLn3);
-      report("gate residual + rowMask: act", relRms(ref, download(dA, rows * O)), 1e-3);
-      auto hm = download(dLn3, rows * O);
-      report("gate residual + rowMask: actH", relRms(refMasked, std::vector<float>(hm.begin(), hm.end())), 3e-3);
+      if (gemmGateResidual(dX, dW, dA, rows, rows, K, O, dg, ld, period, 0.5f, "gate res mask+h", true,
+                           nullptr, nullptr, nullptr, 1e-5f, nullptr, nullptr, nullptr, false, nullptr, drm, dLn3)) {
+        report("gate residual + rowMask: act", relRms(ref, download(dA, rows * O)), 1e-3);
+        auto hm = download(dLn3, rows * O);
+        report("gate residual + rowMask: actH", relRms(refMasked, std::vector<float>(hm.begin(), hm.end())), 3e-3);
+      } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gate residual + rowMask: FAIL (not taken)\n" : "  gate residual + rowMask: not taken here (no extended epilogues on lf_gemm)\n"); }
     }
     release(dX); release(dW); release(dg); release(dA); release(ds6); release(drm); release(dLn1); release(dLn2); release(dLn3);
   }
@@ -521,7 +522,7 @@ int main() {
     float* db = uploadNew(bias.data(), bias.size()); float* dY = allocT<float>(valid * O);
     if (gemmCondPermuted(dX, dW, dY, prows, valid, K, O, db, period, W, sigCols))
       report("conditioning permuted store", relRms(ref, download(dY, valid * O)), 1e-3);
-    else { ++failures; printf("  conditioning permuted store: FAIL (not taken)\n"); }
+    else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  conditioning permuted store: FAIL (not taken)\n" : "  conditioning permuted store: not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dX); release(dW); release(db); release(dY);
   }
   {   // in-place half multiply: Y[r][o] *= (X W)[r][o]
@@ -537,7 +538,7 @@ int main() {
     if (gemmMulH(dX, dW, dY, R, K, O)) {
       auto h = download(dY, R * O);
       report("in-place half multiply (gemmMulH)", relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
-    } else { ++failures; printf("  gemmMulH: FAIL (not taken)\n"); }
+    } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmMulH: FAIL (not taken)\n" : "  gemmMulH: not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dX); release(dW); release(dY);
   }
   {   // outer product permuted + normalised output add (float and half pair)
@@ -555,7 +556,7 @@ int main() {
     if (gemmOpmPermuted(dlt, ldl, drt, ldr, dX, bi, L, O, S, 0.5f)) {
       auto h = download(dX, (size_t)bi * L * O * O);
       report("outer product permuted (gemmOpmPermuted)", relRms(refP, std::vector<float>(h.begin(), h.end())), 2e-3);
-    } else { ++failures; printf("  gemmOpmPermuted: FAIL (not taken)\n"); }
+    } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmPermuted: FAIL (not taken)\n" : "  gemmOpmPermuted: not taken here (no extended epilogues on lf_gemm)\n"); }
     size_t rows = (size_t)bi * L; int in = O * O;
     auto W = randv((size_t)in * C, 0.1f), bias = randv(128), norm = randv(rows, 0.5f), P0 = randv(rows * C);
     for (auto& v : norm) v = std::abs(v) + 1.f;
@@ -575,15 +576,15 @@ int main() {
     float* dPf = uploadNew(P0.data(), P0.size()); half* dPh = uploadNew(toH(P0).data(), P0.size());
     if (gemmOpmOut(dX, dW, dPf, db, dn, rows, in, C, 2.f))
       report("outer product output add (float pair)", relRms(refF, download(dPf, rows * C)), 1e-3);
-    else { ++failures; printf("  gemmOpmOut float: FAIL (not taken)\n"); }
+    else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut float: FAIL (not taken)\n" : "  gemmOpmOut float: not taken here (no extended epilogues on lf_gemm)\n"); }
     upload(dPf, P0.data(), P0.size() * 4);
     if (gemmOpmOut(dX, dW, dPf, db, dn, rows, in, C, 2.f, nullptr, nullptr, nullptr, 1e-5f, nullptr, nullptr, nullptr, true))
       report("outer product output add, bias after norm", relRms(refAfter, download(dPf, rows * C)), 1e-3);
-    else { ++failures; printf("  gemmOpmOut after: FAIL (not taken)\n"); }
+    else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut after: FAIL (not taken)\n" : "  gemmOpmOut after: not taken here (no extended epilogues on lf_gemm)\n"); }
     if (gemmOpmOut(dX, dW, dPh, db, dn, rows, in, C, 2.f)) {
       auto h = download(dPh, rows * C);
       report("outer product output add (half pair)", relRms(refH, std::vector<float>(h.begin(), h.end())), 3e-3);
-    } else { ++failures; printf("  gemmOpmOut half: FAIL (not taken)\n"); }
+    } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut half: FAIL (not taken)\n" : "  gemmOpmOut half: not taken here (no extended epilogues on lf_gemm)\n"); }
     auto sc = randv(C), of = randv(C), sc2 = randv(C), of2 = randv(C);
     std::vector<double> refLn1(rows * C), refLn2(rows * C);
     for (size_t r = 0; r < rows; ++r) {
@@ -605,7 +606,7 @@ int main() {
       auto h1 = download(dLn1, rows * C), h2 = download(dLn2, rows * C);
       report("outer product output add, emitted LN 1", relRms(refLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
       report("outer product output add, emitted LN 2", relRms(refLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
-    } else { ++failures; printf("  gemmOpmOut emitted LN: FAIL (not taken)\n"); }
+    } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut emitted LN: FAIL (not taken)\n" : "  gemmOpmOut emitted LN: not taken here (no extended epilogues on lf_gemm)\n"); }
     release(dLn1); release(dLn2); release(dsc); release(dof); release(dsc2); release(dof2);
     release(dlt); release(drt); release(dX); release(dW); release(db); release(dn); release(dPf); release(dPh);
     for (int opmC : {256, 384, 512}) {   // shallow OPM output add at C = 256, 384, 512 (with emitted LN on matrix units)
@@ -649,7 +650,7 @@ int main() {
           report(l1, relRms(ref2Ln1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
           report(l2, relRms(ref2Ln2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
         }
-      } else { ++failures; printf("  gemmOpmOut C %d: FAIL (not taken)\n", opmC); }
+      } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut C %d: FAIL (not taken)\n" : "  gemmOpmOut C %d: not taken here (no extended epilogues on lf_gemm)\n", opmC); }
       if (opmC > 256 && matrixUnits()) {
         upload(dP2, P2.data(), P2.size() * 4);
         if (gemmOpmOut(dX2, dW2, dP2, db2, dn2, bi2, in2, opmC, 1.f, dL1, dsc1, dof1, 1e-5f, dL2, dsc2, dof2, false, opmC)) {
@@ -677,7 +678,7 @@ int main() {
           snprintf(l2, sizeof l2, "outer product output add (C %d), emitted LN 2", opmC);
           report(l1, relRms(rLn1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
           report(l2, relRms(rLn2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
-        } else { ++failures; printf("  gemmOpmOut emitted LN C %d: FAIL (not taken)\n", opmC); }
+        } else { if (gemmExtendedEpilogues()) ++failures; printf(gemmExtendedEpilogues() ? "  gemmOpmOut emitted LN C %d: FAIL (not taken)\n" : "  gemmOpmOut emitted LN C %d: not taken here (no extended epilogues on lf_gemm)\n", opmC); }
       }
       release(dX2); release(dW2); release(db2); release(dn2); release(dP2); release(dsc1); release(dof1); release(dsc2); release(dof2); release(dL1); release(dL2);
     }
