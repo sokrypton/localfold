@@ -722,7 +722,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   bool tight = shortPair(pairs, C);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   T* ln = scratch<T>("emb.prevln", per * C);
-  if (t.p16 && !tight) scratch<float>("p16.tmp", per * C);
+  if (t.p16 && !tight) scratch<float>("p16.tmp", std::max<size_t>(1, std::min(per, CHUNK / C)) * C);
   if (t.pass == 0 && !M.has("oracle.trunk.stages.z_before_prev")) {
     float* prev0 = scratch<float>("emb.prev0", C);
     layerNormPairRows<T>(t.prevPair, t.p16, 0, ln, 1, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");

@@ -1047,21 +1047,22 @@ inline void transitionHalf(const float* x, const half* xh, float* out, size_t ro
   // (a chunk sized for the L2 - 16 MB of widened rows - measured 8% SLOWER at 494 tokens than this: the GEMMs lose more
   // to their smaller M than the SwiGLU gains from the cache)
   size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (4 * (size_t)I * 2));
-  if (!xh) {
-    half* c = scratch<half>("be2.tr.xh", rows * C);
-    if (norm) lnTo<half>(x, c, rows, C, w("norm/weight"), w("norm/bias"), ldx);
-    else toHalfRows<half>(x, c, rows, C, ldx);
-    xh = c;
-  }
+  half* c = xh ? nullptr : scratch<half>("be2.tr.xh", std::min(rows, chunk) * C);
+  int lx = ldx ? ldx : C;
   // (fc1 | fc2's output in bf16: the SwiGLU reads it once and it is the widest tensor of the layer - written f32 it was
   // 9 ms of an 82 ms step at 494 tokens)
   half* h12 = scratch<half>("be2.tr.h12", std::min(rows, chunk) * 2 * I);
   __nv_bfloat16* g = scratch<__nv_bfloat16>("be2.tr.g", std::min(rows, chunk) * I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
+    const half* xChunk = xh ? (xh + r0 * C) : c;
+    if (!xh) {
+      if (norm) lnTo<half>(x + r0 * lx, c, r, C, w("norm/weight"), w("norm/bias"), ldx);
+      else toHalfRows<half>(x + r0 * lx, c, r, C, ldx);
+    }
     {
       const float one = 1.f, zero = 0.f;
-      CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, 2 * I, (int)r, C, &one, w12, CUDA_R_16F, C, xh + r0 * C, CUDA_R_16F, C,
+      CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, 2 * I, (int)r, C, &one, w12, CUDA_R_16F, C, xChunk, CUDA_R_16F, C,
                       &zero, h12, CUDA_R_16F, 2 * I, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       if (getenv("BE2_DEBUG_HALF")) {
         CK(cudaStreamSynchronize(STREAM));
@@ -1310,19 +1311,21 @@ inline void transition(const float* x, float* out, size_t rows, int C, const std
   auto w = [&](const std::string& n) { return layer < 0 ? P(p + n) : PL(p + n, layer); };
   const int I = layer < 0 ? dimP(p + "fc1/weight", 0) : dimP(p + "fc1/weight", 1);
   const int Co = layer < 0 ? dimP(p + "fc3/weight", 0) : dimP(p + "fc3/weight", 1);   // (a mixer narrows: 896 -> 128)
-  const float* xin = x; int ld = ldx ? ldx : C;
-  if (norm) {
-    float* xn = scratch<float>("be2.tr.xn", rows * C);
-    layerNorm(x, xn, rows, C, w("norm/weight"), w("norm/bias"), 1e-5f, ld, C);
-    xin = xn; ld = C;
-  }
+  int ld = ldx ? ldx : C;
   size_t chunk = std::max<size_t>(1, ((size_t)96 << 20) / (4 * (size_t)I * 3));
+  float* xn = norm ? scratch<float>("be2.tr.xn", std::min(rows, chunk) * C) : nullptr;
   float* h1 = scratch<float>("be2.tr.h1", std::min(rows, chunk) * I);
   float* h2 = scratch<float>("be2.tr.h2", std::min(rows, chunk) * I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
-    linear(xin + r0 * ld, w("fc1/weight"), h1, r, C, I, 0.f, ld);
-    linear(xin + r0 * ld, w("fc2/weight"), h2, r, C, I, 0.f, ld);
+    const float* xin = x + r0 * ld;
+    int ldi = ld;
+    if (norm) {
+      layerNorm(xin, xn, r, C, w("norm/weight"), w("norm/bias"), 1e-5f, ld, C);
+      xin = xn; ldi = C;
+    }
+    linear(xin, w("fc1/weight"), h1, r, C, I, 0.f, ldi);
+    linear(xin, w("fc2/weight"), h2, r, C, I, 0.f, ldi);
     size_t nSm = ((r * I & 3) == 0 && (((uintptr_t)h1 | (uintptr_t)h2) & 15) == 0) ? (r * I) >> 2 : r * I;
     siluMulK<<<blocks(nSm), 256, 0, STREAM>>>(h1, h2, h1, r * I);
     linear(h1, w("fc3/weight"), out + r0 * Co, r, I, Co, residual ? 1.f : 0.f, 0, 0, 1.f, true);

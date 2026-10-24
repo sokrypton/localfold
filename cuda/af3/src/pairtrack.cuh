@@ -836,7 +836,7 @@ __global__ void rectLayerNormK(const float* pair, const float* mask, TO* out, fl
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
   for (int c = lane; c < C; c += 32)
     out[row * C + c] = fromF<TO>(((live ? pairLd<PT>(pair, p * C + c) : 0.f) - mean) * inv * scale[c] + offset[c]);
-  if (lane == 0 && m) m[row] = p != SIZE_MAX ? mask[p] : 0.f;
+  if (lane == 0 && m) m[row] = p != SIZE_MAX ? (mask ? mask[p] : 1.f) : 0.f;
 }
 // one operand from a chunk's (rows, 2C) [projection | gate] rows, channel-major into the rectangle's
 // buffer at q0 + row - through a 32 x 32 tile, so the reads run along the channels and the writes along
@@ -1356,7 +1356,8 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
         auto runUp = [&](auto wuTag, auto ncTag, auto xrTag) {
           constexpr int WU = decltype(wuTag)::value, NC = decltype(ncTag)::value, XR = decltype(xrTag)::value, R = 16 * WU;
           constexpr size_t smem = transitionUpSmem<CC, WU, NC, XR>();
-          const size_t budget = roomFor((size_t)1 << 30, {"tr.gated", "tr.gatedbf"}) ? (size_t)1 << 29 : CHUNK / 2;
+          const size_t full = std::min<size_t>(rows * I, (size_t)144 << 20);
+          const size_t budget = (!shortPair(rows, C) && roomFor(full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
           size_t rowsPer = transitionUpChunkRows<CC, WU, NC, XR>(smem, std::max<size_t>(R, budget / I));
           if (PAIR16) {
             // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
@@ -1853,7 +1854,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       if (!BIG_FORCED) {
         size_t f, t; deviceMemInfo(&f, &t);
         size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
-        size_t maxR = std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+        size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
         R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
       }
       int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
@@ -1922,7 +1923,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   if (!BIG_FORCED) {
     size_t f, t; deviceMemInfo(&f, &t);
     size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8)), spare = f > t / 16 ? f - t / 16 : 0;
-    size_t maxR = std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+    size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
     R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
   }
   float scale = 1.f / sqrtf((float)D);

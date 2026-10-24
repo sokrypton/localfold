@@ -296,9 +296,11 @@ static int foldInput(const Opts& o) {
   };
   const int Si = 455, Cs = 384, C = 256;
   size_t Pn = (size_t)T * T;
+  const bool reuseZ = !check && o.sampler == "edm";
   float* sInputs = dalloc((size_t)T * Si);
   inputEmbedder(sInputs, Si, tap);
-  float* sInit = dalloc((size_t)T * Cs); float* zInit = dalloc(Pn * C);
+  float* sInit = dalloc((size_t)T * Cs);
+  float* zInit = (reuseZ && Pn > ((size_t)1 << 20)) ? nullptr : dalloc(Pn * C);
   trunkInit(sInputs, Si, sInit, zInit, tap);
   float* s = dalloc((size_t)T * Cs); float* z = dalloc(Pn * C);
   CK(cudaMemsetAsync(s, 0, (size_t)T * Cs * 4, STREAM)); CK(cudaMemsetAsync(z, 0, Pn * C * 4, STREAM));
@@ -312,23 +314,43 @@ static int foldInput(const Opts& o) {
   }
   CK(cudaStreamSynchronize(STREAM));
   printf("trunk %.1f ms (%d passes)\n", ms(t0), o.passes); t0 = std::chrono::steady_clock::now();
-  CK(cudaFree(sInit)); CK(cudaFree(zInit));
+  CK(cudaFree(sInit)); if (zInit) CK(cudaFree(zInit));
+  releaseScratch();      // (the trunk's buffers - a gigabyte of triangle operands at 500 tokens - are the denoiser's room)
   const int B = dimP("distogram_module/distogram/weight", 0);
   std::vector<float> contacts;
   {
-    float* logits = scratch<float>("be2.dg.logits", Pn * B);
-    distogram(z, logits);
-    tap("distogram", logits, Pn * B);
     // Boltz's 64 bins over 2-22 A: the bins whose lower edges (linspace(2, 22, 63)) are at most 8 A
     int near = 0; for (int e = 0; e < B - 1; ++e) if (2.0 + 20.0 * e / (B - 2) <= 8.0) ++near;
     float* probs = scratch<float>("be2.dg.contacts", Pn);
-    contactProbsK<<<blocks(Pn), 256, 0, STREAM>>>(logits, probs, Pn, B, near);
+    if (check) {
+      float* logits = scratch<float>("be2.dg.logits", Pn * B);
+      distogram(z, logits);
+      tap("distogram", logits, Pn * B);
+      contactProbsK<<<blocks(Pn), 256, 0, STREAM>>>(logits, probs, Pn, B, near);
+    } else {
+      size_t R = std::max<size_t>(1, std::min<size_t>(T, ((size_t)256 << 10) / std::max(T, 1)));
+      float* zs = scratch<float>("be2.dg.zs", R * T * C);
+      float* logits = scratch<float>("be2.dg.logits", R * T * B);
+      for (size_t r0 = 0; r0 < (size_t)T; r0 += R) {
+        size_t r = std::min<size_t>(R, T - r0), n = r * T;
+        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, T, C, r0, r);
+        linear(zs, P("distogram_module/distogram/weight"), logits, n, C, B);
+        addBiasRows(logits, P("distogram_module/distogram/bias"), n, B);
+        contactProbsK<<<blocks(n), 256, 0, STREAM>>>(logits, probs + r0 * T, n, B, near);
+      }
+    }
     contacts = download(probs, Pn);
   }
   // (the denoiser side - its static context and every call - on the f16 tensor cores under --fast; the trunk keeps TF32)
   GEMM_HALF = FAST_PATH;
-  releaseScratch();      // (the trunk's buffers - a gigabyte of triangle operands at 500 tokens - are the denoiser's room)
-  Denoiser d = staticContext(s, z, sInputs, Si, tap);
+  releaseScratch();
+  Denoiser d = staticContext(s, z, sInputs, Si, tap, reuseZ);
+  if (reuseZ) {
+    z = nullptr;
+    for (float* p : {sInputs, s}) CK(cudaFree(p));
+    sInputs = s = nullptr;
+    releaseScratch();
+  }
   CK(cudaStreamSynchronize(STREAM));
   printf("static context %.1f ms\n", ms(t0));
   if (check && M.has("o/denoise0.x")) {
@@ -436,7 +458,7 @@ static int foldInput(const Opts& o) {
     printf("-> %s%s\n", o.out.c_str(), out.size() > 1 ? (" (+" + std::to_string(out.size() - 1) + " more samples)").c_str() : "");
   }
   freeDenoiser(d);
-  for (float* p : {sInputs, s, z}) CK(cudaFree(p));
+  for (float* p : {sInputs, s, z}) if (p) CK(cudaFree(p));
   releaseScratch();
   return 0;
 }

@@ -108,11 +108,11 @@ __global__ void zInitTermsK(float* z, const float* rows, const float* cols, cons
                             const float* bonds, const float* wBond, const int* cls, const float* thr, const float* enc,
                             const float* encB, const float* unspec, const float* unsel, const float* fw, const float* fb,
                             RelTables relW, const int* asym, const int* ent, const int* res, const int* sym,
-                            int T, int C) {
+                            int T, int C, size_t r0 = 0, size_t nRows = 0) {
   __shared__ float shCos[256];
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)T * T * C;
-  int c = (int)(t % C); size_t ij = t / C;
+  size_t total = (nRows ? nRows : (size_t)T * T) * C;
+  int c = (int)(t % C); size_t ij = r0 + t / C;
   bool valid = t < total;
   int k = valid ? cls[ij] : 0;
   float th = (valid && k > 1) ? (thr[ij] - 4.f) / 16.f : 0.f;
@@ -150,24 +150,30 @@ __global__ void zInitTermsK(float* z, const float* rows, const float* cols, cons
        + relW.chain[(size_t)dChain * C + c];
   z[t] = v;
 }
+inline void zInitRows(float* zOut, const float* rows, const float* cols, int T, int C, size_t r0 = 0, size_t nRows = 0) {
+  size_t r = nRows ? nRows : (size_t)T * T;
+  const std::string cc = SE + "contact_conditioning/";
+  zInitTermsK<<<blocks(r * C), 256, 0, STREAM>>>(zOut, rows, cols, Idev("method_feature"),
+      P(SE + "method_conditioning/pair_embedding/weight"), Fdev("token_bonds"), P(SE + "token_bonds/weight"),
+      Idev("contact_class"), Fdev("contact_threshold"), P(cc + "encoder/weight"), P(cc + "encoder/bias"),
+      P(cc + "encoding_unspecified"), P(cc + "encoding_unselected"), P(cc + "fourier_embedding/proj/weight"),
+      P(cc + "fourier_embedding/proj/bias"),
+      relTables(SE + "rel_pos/"), Idev("asym_id"), Idev("entity_id"), Idev("residue_index"), Idev("sym_id"),
+      T, C, r0, r);
+}
 inline void trunkInit(const float* sInputs, int Si, float* sInit, float* zInit,
                       const std::function<void(const char*, const float*, size_t)>& tap) {
   const int T = D_.T, Cs = dimP(SE + "s_init/weight", 0), C = dimP(SE + "z_init_1/weight", 0);
   linear(sInputs, P(SE + "s_init/weight"), sInit, T, Si, Cs);
   addMethodEmbK<<<blocks((size_t)T * Cs), 256, 0, STREAM>>>(
       sInit, Idev("method_feature"), P(SE + "method_conditioning/embedding/weight"), T, Cs);
-  float* rows = scratch<float>("be2.zi.rows", (size_t)T * C); float* cols = scratch<float>("be2.zi.cols", (size_t)T * C);
-  linear(sInputs, P(SE + "z_init_1/weight"), rows, T, Si, C);
-  linear(sInputs, P(SE + "z_init_2/weight"), cols, T, Si, C);
-  const std::string cc = SE + "contact_conditioning/";
-  zInitTermsK<<<blocks((size_t)T * T * C), 256, 0, STREAM>>>(zInit, rows, cols, Idev("method_feature"),
-      P(SE + "method_conditioning/pair_embedding/weight"), Fdev("token_bonds"), P(SE + "token_bonds/weight"),
-      Idev("contact_class"), Fdev("contact_threshold"), P(cc + "encoder/weight"), P(cc + "encoder/bias"),
-      P(cc + "encoding_unspecified"), P(cc + "encoding_unselected"), P(cc + "fourier_embedding/proj/weight"),
-      P(cc + "fourier_embedding/proj/bias"),
-      relTables(SE + "rel_pos/"), Idev("asym_id"), Idev("entity_id"), Idev("residue_index"), Idev("sym_id"),
-      T, C);
-  if (tap) { tap("s_init", sInit, (size_t)T * Cs); tap("z_init", zInit, (size_t)T * T * C); }
+  if (zInit) {
+    float* rows = scratch<float>("be2.zi.rows", (size_t)T * C); float* cols = scratch<float>("be2.zi.cols", (size_t)T * C);
+    linear(sInputs, P(SE + "z_init_1/weight"), rows, T, Si, C);
+    linear(sInputs, P(SE + "z_init_2/weight"), cols, T, Si, C);
+    zInitRows(zInit, rows, cols, T, C);
+  }
+  if (tap) { tap("s_init", sInit, (size_t)T * Cs); if (zInit) tap("z_init", zInit, (size_t)T * T * C); }
 }
 
 // ---------------------------------------------------------------- the triangle multiplication
@@ -442,16 +448,33 @@ inline void trunkPass(const float* sInputs, int Si, const float* sInit, const fl
   layerNorm(s, sn, T, Cs, P(SE + "s_norm/weight"), P(SE + "s_norm/bias"));
   CK(cudaMemcpyAsync(s, sInit, (size_t)T * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   linear(sn, P(SE + "s_recycle/weight"), s, T, Cs, Cs, 1.f);
+  size_t pChunk = std::min<size_t>(Pn, (size_t)1 << 20);
+  float *ziRows = nullptr, *ziCols = nullptr;
+  if (!zInit) {
+    ziRows = scratch<float>("be2.zi.rows", (size_t)T * C);
+    ziCols = scratch<float>("be2.zi.cols", (size_t)T * C);
+    linear(sInputs, P(SE + "z_init_1/weight"), ziRows, T, Si, C);
+    linear(sInputs, P(SE + "z_init_2/weight"), ziCols, T, Si, C);
+  }
   if (FAST) {
-    half* znh = reinterpret_cast<half*>(scratch<__nv_bfloat16>("ftri.a", Pn * C));
-    lnTo<half>(z, znh, Pn, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
-    CK(cudaMemcpyAsync(z, zInit, Pn * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    linearPre<half>(znh, halfMirror<half>(P(SE + "z_recycle/weight"), (size_t)C * C), z, Pn, C, C, 1.f);
+    half* znh = reinterpret_cast<half*>(scratch<__nv_bfloat16>("ftri.a", pChunk * C));
+    const half* wRec = halfMirror<half>(P(SE + "z_recycle/weight"), (size_t)C * C);
+    for (size_t r0 = 0; r0 < Pn; r0 += pChunk) {
+      size_t r = std::min(pChunk, Pn - r0);
+      lnTo<half>(z + r0 * C, znh, r, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
+      if (zInit) CK(cudaMemcpyAsync(z + r0 * C, zInit + r0 * C, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      else zInitRows(z + r0 * C, ziRows, ziCols, T, C, r0, r);
+      linearPre<half>(znh, wRec, z + r0 * C, r, C, C, 1.f);
+    }
   } else {
-    float* zn = scratch<float>("be2.tri.zn", Pn * C);       // (shares the triangle's: spent before it runs)
-    layerNorm(z, zn, Pn, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
-    CK(cudaMemcpyAsync(z, zInit, Pn * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    linear(zn, P(SE + "z_recycle/weight"), z, Pn, C, C, 1.f);
+    float* zn = scratch<float>("be2.tri.zn", pChunk * C);       // (shares the triangle's: spent before it runs)
+    for (size_t r0 = 0; r0 < Pn; r0 += pChunk) {
+      size_t r = std::min(pChunk, Pn - r0);
+      layerNorm(z + r0 * C, zn, r, C, P(SE + "z_norm/weight"), P(SE + "z_norm/bias"));
+      if (zInit) CK(cudaMemcpyAsync(z + r0 * C, zInit + r0 * C, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      else zInitRows(z + r0 * C, ziRows, ziCols, T, C, r0, r);
+      linear(zn, P(SE + "z_recycle/weight"), z + r0 * C, r, C, C, 1.f);
+    }
   }
   // the MSA module
   float* m = scratch<float>("be2.msa.m", (size_t)S * T * Cm);
@@ -483,9 +506,13 @@ inline void trunkPass(const float* sInputs, int Si, const float* sInit, const fl
 inline void distogram(const float* z, float* logits) {
   const int T = D_.T, C = 256; size_t Pn = (size_t)T * T;
   const int B = dimP("distogram_module/distogram/weight", 0);
-  float* zs = scratch<float>("be2.dg.zs", Pn * C);
-  symmetriseK<<<blocks(Pn * C), 256, 0, STREAM>>>(z, zs, T, C);
-  linear(zs, P("distogram_module/distogram/weight"), logits, Pn, C, B);
+  size_t R = std::max<size_t>(1, std::min<size_t>(T, ((size_t)256 << 10) / std::max(T, 1)));
+  float* zs = scratch<float>("be2.dg.zs", R * T * C);
+  for (size_t r0 = 0; r0 < (size_t)T; r0 += R) {
+    size_t r = std::min<size_t>(R, T - r0), n = r * T;
+    symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, T, C, r0, r);
+    linear(zs, P("distogram_module/distogram/weight"), logits + r0 * T * B, n, C, B);
+  }
   addBiasRows(logits, P("distogram_module/distogram/bias"), Pn, B);
 }
 

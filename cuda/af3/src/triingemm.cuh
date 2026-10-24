@@ -194,12 +194,12 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
   if constexpr (sizeof(TA) == 1) return;
 #endif
-  constexpr int KC = C / 32, NAB = C / 32, LDT = sizeof(TA) == 1 ? 80 : 72;
+  constexpr int KC = C / 32, NAB = C / 32, NT = NAB + C / 128, LDT = sizeof(TA) == 1 ? 80 : 72;
   extern __shared__ __align__(16) unsigned char smem[];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   int wm = warp & 1, wn = warp >> 1;
-  const int t = blockIdx.x;                                      // the column tile (fastest: a row tile's run together)
-  const size_t pp = (size_t)np * np, row0 = (size_t)blockIdx.y * 128;
+  const int t = gridDim.y > 1 ? (int)blockIdx.x : (int)(blockIdx.x % NT);   // the column tile (fastest: a row tile's run together)
+  const size_t pp = (size_t)np * np, row0 = (gridDim.y > 1 ? (size_t)blockIdx.y : (size_t)(blockIdx.x / NT)) * 128;
   const half* Wt = Wg + (size_t)t * C * 128;
   // the thread's eight rows' masks, read before the main loop (issued under the pipeline's fill)
   float msk[4][2];
@@ -321,9 +321,10 @@ inline bool triInGemm(const float* pair, const float* mask, const float* sc, con
   constexpr size_t smem = triInGemmSmem();
   if (C < 384 || !TRIIN_GEMM || !fitsSmem(smem)) return false;
   const half* Wg = triInGemmWeights(pre, C);
-  size_t pp = (size_t)np * np;
+  size_t pp = (size_t)np * np, rowTiles = (pp + 127) / 128;
+  constexpr int NT = C / 32 + C / 128;
   half* X = scratch<half>("tri.lnplane", pp * C);
-  dim3 grid(C / 32 + C / 128, (unsigned)((pp + 127) / 128));
+  dim3 grid = rowTiles <= 65535 ? dim3(NT, (unsigned)rowTiles) : dim3((unsigned)(rowTiles * NT), 1);
   if (tr) {
     WITH_PAIR_T(lnPlaneK<C, PT, true><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
     static bool attrT = false;

@@ -113,6 +113,19 @@ inline const float* pairOnes(size_t P) {
 inline void trimulFast(float* z, const std::string& p, int l, bool outgoing) {
   const int T = D_.T, C = 256;
   const std::string Tn = ef2Triangle(p, l, !outgoing);
+  if (shortPair((size_t)T * T, C)) {
+    int Lp = (T + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    if (!roomFor(5 * plane * C * 2, { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.pg", "ftri.cn", "ftri.out" })) {
+      releaseScratch({ "ftri.", "ftr.", "be2.pwa.", "be2.opm.", "be2.tr.", "be2.ie.", "be2.cl.", "be2.pt.", "be2.zi." });
+      static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+      if (fusedBlocks && FUSED256 && T >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma()) {
+        triangleBlockedFusedEf2(z, nullptr, T, C, Tn, outgoing);
+      } else {
+        triangleBlockedEf2(z, nullptr, T, C, Tn, outgoing);
+      }
+      return;
+    }
+  }
   if (FUSED256 && T >= FUSED256_MIN_TOKENS && fused256Fits()) triangle256(z, nullptr, T, C, Tn, outgoing);
   else triangleFast(z, pairOnes((size_t)T * T), T, C, Tn, outgoing);
 }

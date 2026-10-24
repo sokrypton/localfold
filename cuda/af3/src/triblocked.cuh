@@ -20,7 +20,7 @@ __global__ void rect2LayerNormK(const float* pair, const float* mask, half* out,
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
   for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half(((x ? x[c] : 0.f) - mean) * inv * scale[c] + offset[c]);
-  if (lane == 0 && m) m[row] = p != SIZE_MAX ? mask[p] : 0.f;
+  if (lane == 0 && m) m[row] = p != SIZE_MAX ? (mask ? mask[p] : 1.f) : 0.f;
 }
 __global__ void rect2GateK(const half* pg, const float* m, half* out, size_t q0, size_t cnt, int C, size_t size) {
   __shared__ float A[32][33];

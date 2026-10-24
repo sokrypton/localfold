@@ -248,20 +248,26 @@ inline void windowBiasBatch(const float* pr, const WinBiasPtrs& ptrs, float* out
   for (int l = 0; l < layers; ++l) windowBias(pr, ptrs.normW[l], ptrs.projZ[l], out + (size_t)l * wb, N, H);
 }
 // the token pair's bias: LN(z) (scale, no offset) -> proj_z [H, C], heads first: out[h][i][j]
-__global__ void tokenBiasK(const float* zn, const float* biasHC, float* out, int T, int H) {
-  // zn is already projected: [T*T, H]
+__global__ void tokenBiasK(const float* zn, const float* biasHC, float* out, int T, int H, size_t r0 = 0, size_t rows = 0) {
+  // zn is already projected: [rows, H]
+  size_t P2 = (size_t)T * T;
+  if (!rows) rows = P2;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * H) return;
-  int h = (int)(t % H); size_t ij = t / H;
-  out[(size_t)h * T * T + ij] = zn[t];
+  if (t >= rows * H) return;
+  int h = (int)(t % H); size_t ij = r0 + t / H;
+  out[(size_t)h * P2 + ij] = zn[t];
 }
 inline void tokenBias(const float* z, const float* normW, const float* projZ, float* out, int T, int C, int H) {
   size_t P2 = (size_t)T * T;
-  float* zn = scratch<float>("be2.tb.zn", P2 * C);
-  layerNorm(z, zn, P2, C, normW, nullptr);
-  float* proj = scratch<float>("be2.tb.proj", P2 * H);
-  linear(zn, projZ, proj, P2, C, H);
-  tokenBiasK<<<blocks(P2 * H), 256, 0, STREAM>>>(proj, nullptr, out, T, H);
+  size_t chunk = std::min<size_t>(P2, (size_t)256 << 10);
+  float* zn = scratch<float>("be2.tb.zn", chunk * C);
+  float* proj = scratch<float>("be2.tb.proj", chunk * H);
+  for (size_t r0 = 0; r0 < P2; r0 += chunk) {
+    size_t r = std::min(chunk, P2 - r0);
+    layerNorm(z + r0 * C, zn, r, C, normW, nullptr);
+    linear(zn, projZ, proj, r, C, H);
+    tokenBiasK<<<blocks(r * H), 256, 0, STREAM>>>(proj, nullptr, out, T, H, r0, r);
+  }
 }
 // Fused 16-layer tokenBias under GEMM_HALF: since norm_z has no bias offset, LN_l(z)_{ij,c} = z_hat_{ij,c} * norm_z[l, c].
 // Pre-multiplying W_tb[l*H + h, c] = proj_z[l, h, c] * norm_z[l, c] lets us normalize d.z ONCE (affine-free into half)
@@ -273,10 +279,12 @@ __global__ void tokenBiasScaleProjHalfK(const float* __restrict__ normZ, const f
   int c = (int)(t % C); size_t lh = t / C; int l = (int)(lh / H);
   out[t] = __float2half(projZ[t] * normZ[(size_t)l * C + c]);
 }
-__global__ void tokenBiasBatchK(const float* __restrict__ proj, float* __restrict__ out, size_t P2, int LH) {
+__global__ void tokenBiasBatchK(const float* __restrict__ proj, float* __restrict__ out, size_t P2, int LH,
+                                size_t r0 = 0, size_t rows = 0) {
+  if (!rows) rows = P2;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= P2 * LH) return;
-  int lh = (int)(t % LH); size_t ij = t / LH;
+  if (t >= rows * LH) return;
+  int lh = (int)(t % LH); size_t ij = r0 + t / LH;
   out[(size_t)lh * P2 + ij] = proj[t];
 }
 inline void tokenBiasAll(const float* z, const float* normWAll, const float* projZAll,
@@ -299,11 +307,15 @@ inline void tokenBiasAll(const float* z, const float* normWAll, const float* pro
     tokenBiasScaleProjHalfK<<<blocks((size_t)LH * C), 256, 0, STREAM>>>(normWAll, projZAll, wh, layers, H, C);
     wCache[projZAll] = wh;
   }
-  half* znh = scratch<half>("be2.tb.znh", P2 * C);
-  lnTo<half>(z, znh, P2, C, nullptr, nullptr);
-  float* proj = scratch<float>("be2.tb.projAll", P2 * LH);
-  linearPre<half>(znh, wh, proj, P2, C, LH);
-  tokenBiasBatchK<<<blocks(P2 * LH), 256, 0, STREAM>>>(proj, out, P2, LH);
+  size_t chunk = std::min<size_t>(P2, (size_t)256 << 10);
+  half* znh = scratch<half>("be2.tb.znh", chunk * C);
+  float* proj = scratch<float>("be2.tb.projAll", chunk * LH);
+  for (size_t r0 = 0; r0 < P2; r0 += chunk) {
+    size_t r = std::min(chunk, P2 - r0);
+    lnTo<half>(z + r0 * C, znh, r, C, nullptr, nullptr);
+    linearPre<half>(znh, wh, proj, r, C, LH);
+    tokenBiasBatchK<<<blocks(r * LH), 256, 0, STREAM>>>(proj, out, P2, LH, r0, r);
+  }
 }
 
 
