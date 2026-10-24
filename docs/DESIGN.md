@@ -36,8 +36,17 @@ from it, and that is exactly the product case named here as the thing that would
   are already this repository's idiom and collide with nothing. Its parity checks come with it.
 - **Its PAGE does not.** AtomWorks Studio, Mol*, the Rust/wasm annotation studio and the nebula assets stay behind:
   this page is `index.html`'s light theme with py2Dmol, and two viewer stacks in one page is a cost with no return.
-- **Its weights go where the other nine went** - Hugging Face, gitignored - because this repository's Pages build
-  carries 0.0 MiB of parameters and 423 MB of int8 shards in git would end that.
+- **Its weights are fetched from the port that publishes them** (Sergey, 2026-10-24), not copied here and not
+  re-uploaded: the loader's chain is a local export → `sokrypton/rfd4-proteina-webgpu`'s Pages URL → Hugging
+  Face, so this repository's build keeps carrying 0.0 MiB of parameters and there is no second 420 MB copy to
+  drift from the first. 🔴 That makes the other repository's Pages URL a **dependency**: if it stops
+  publishing, RFD4 stops loading here, and our own Hugging Face copy is the fallback to reach for then rather
+  than a thing to do twice over now.
+- 🔴 **Its 293 KB tensor manifest IS tracked here, and it can drift.** The tests read it without a network,
+  but it records byte offsets into shards it does not contain - so if that port re-exports, these offsets describe
+  the old shards while the fetched ones are new, every tensor reads from the wrong place, and nothing says so. It
+  is the failure `model-boltz2-int5/` has today. `weights/SOURCE.md` pins the commit; a `--check` against
+  upstream, as `tools/sync-mpnn.py` and `tools/sync-py2dmol.py` both have, is the missing piece.
 - 🔴 **And NVIDIA's terms become this repository's problem.** Today every model here has terms that
   `tools/model-terms.py` can express. An NVIDIA research checkpoint offered from the same page has to be expressible
   the same way, and nobody has read those terms yet. **That is the real cost of merging, and it is the user's call,

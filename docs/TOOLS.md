@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-391 tools. `tools/fixtures/` is data and is not listed.
+412 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (202)
+## `tools/gpu/` - the WebGPU lane (211)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -34,6 +34,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-grid-project.js`** - The grid attention's two projection kernels, at several row tiles.
 - **`bench-head.js`** - Where one denoiser call's time goes.
 - **`bench-jaxjs-matmul.js`** - jax-js's WebGPU matmul at the shapes this repository's kernels run.
+- **`bench-kernels.js`** - A/B GEMM kernel variants inside the real trunk: per-kernel GPU time of one trunk pass (`passPrograms[0]`) and the trunk output against the baseline variant, interleaved over rounds (laptops throttle; never trust back-to-back).
 - **`bench-msa-attention.js`** - The flash attention kernel alone, at several key-chunk sizes, in one process.
 - **`bench-normsplit.js`** - diffusionNormSplit, on and off, ALTERNATING IN ONE PROCESS.
 - **`bench-opm.js`** - The outer product mean's contraction alone, at several (i, j) blocks.
@@ -86,10 +87,12 @@ Each exports `async function main(device, args)` and is run as
 - **`check-block-upload.js`** - Does a whole diffusion transformer block decode the same on the GPU?
 - **`check-bundle-device-decode.js`** - A REAL bundle's tensors, decoded on the host and on the device, compared bit for bit.
 - **`check-chiral-gradient.js`** - RoseTTAFold3's chirality gradient: the GPU kernel against the CPU reference.
+- **`check-decoder.js`** - GPU autoencoder decoder (`webgpu/rfd4p/decoder.js`) vs the PyTorch oracle across all 6 cases.
 - **`check-delta-upload.js`** - Does the SHIPPED uploader ADD a delta to weights that are already resident?
 - **`check-difftx-batched.js`** - Does the batched path compute the same thing S times?
 - **`check-difftx-samples.js`** - Does the sample dimension leave the one-sample path alone?
 - **`check-difftx-splits.js`** - Does every K-split of the diffusion transformer compute the unsplit answer?
+- **`check-encoder.js`** - GPU autoencoder encoder (`webgpu/rfd4p/encoder.js`) vs the PyTorch oracle (`oracle-dumps/encoder_oracle.*`).
 - **`check-esmc-block.js`** - Does webgpu/esmc/block.js compute an ESM-C block?
 - **`check-esmc-tower.js`** - Does webgpu/esmc/tower.js compute ESM-C's 36 blocks and ESMFold2's mix?
 - **`check-esmfold2-atom-stack.js`** - Does the sliding-window atom transformer compute what its reference does?
@@ -102,6 +105,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-evoformer-stack.js`** - The 48-block AF2 evoformer stack against AlphaFold's own activations.
 - **`check-evoformer-transition.js`** - AF2's evoformer transition on the GPU against a CPU reference.
 - **`check-fused-template-features.js`** - The FUSED template embedder's 108 feature columns, built from a structure and checked against af3-any-model's own.
+- **`check-generate.js`** - End-to-end GPU generation (`webgpu/rfd4p/generate.js`) vs the PyTorch oracle trajectory, replaying recorded noise (`randn` and `randperm` draws).
 - **`check-grid-attend-matrix.js`** - AF3's `grid.attend` on the matrix units, against the CPU reference and against the scalar kernel it replaces.
 - **`check-grid-project-matrix.js`** - Does the matrix grid projection compute the vector one's answer?
 - **`check-int5-gpu.js`** - Does an int5 tensor decode the same on the GPU as on the host?
@@ -117,6 +121,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
+- **`check-recovery.js`** - WebGPU device-loss recovery in the studio: destroy the device mid-generation and between runs; the failed run must say the GPU was reset, and the next Generate must succeed on a new device (web/app.js `_watchDevice`).
+- **`check-rfd4p.js`** - Headless Chrome WebGPU differential parity suite for RFD4-Proteina (`npm run test:gpu`).
 - **`check-smiles-conformer-gpu.js`** - Does the device's conformer refinement compute the host's? And is it faster?
 - **`check-staged-matrix.js`** - Does the staged matrix projection compute what createLinearShader computes, in every buffer precision, with and without the residual, on ragged shapes?
 - **`check-structure-core.js`** - The eight-iteration structure core: what it computes, and what it costs.
@@ -128,6 +134,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-triangle-residual.js`** - The residual form of the triangle output projection writes base + out.
 - **`check-triangle-shapes.js`** - The triangle multiplication against its CPU reference, across SHAPES.
 - **`check-triangle.js`** - Differential-test triangle multiplication on the Chrome GPU lane.
+- **`check-trunk.js`** - GPU trunk vs the PyTorch oracle, with the released weights.
+- **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
 - **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
@@ -214,6 +222,7 @@ Each exports `async function main(device, args)` and is run as
 - **`profile-af2-template.js`** - Per-kernel GPU time inside one AF2 TEMPLATE pair block.
 - **`profile-bioemu2.js`** - Where webgpu/bioemu2's time goes on a real input: the trunk by wall clock, the denoiser call per dispatch.
 - **`profile-esmc-block.js`** - Where does an ESM-C block's time actually go?
+- **`profile-rfd4p.js`** - Detailed GPU kernel + host pipeline profiler for RFD4-Proteina (`Rfd4pTrunkGpu`, `Rfd4pDecoderGpu`, `Rfd4pEncoderGpu`, and full 60-step `Rfd4pGeneratorGpu`).
 - **`profile.js`** - Per-pass GPU time, by wrapping the device rather than editing the kernels.
 - **`relative-rms.js`** - One relative-RMS, guarded, because fifty-five tools each wrote their own.
 - **`sidechain-geometry.js`** - How close is a predicted structure to the chemistry it was given?
@@ -221,13 +230,20 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (54)
+## `tools/oracle/` - the reference side (65)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
 
 - **`af3-bundle.js`** - Reading an AF3 export and an oracle dump, for the block checkers.
 - **`bench_af3_native.py`** - Native AlphaFold 3 on this box, at settings LocalFold can actually match.
+- **`check-batch.mjs`** - Verify the JS input pipeline (`shared/rfd4p/pipeline/index.js` -> `buildBatch`) against the Python RFD4-Proteina oracle dumps (`oracle-dumps/*.safetensors` and `oracle-dumps/cpu/*.safetensors`), and verify downstream feature construction (`trunkSeqFeatures`, `trunkCondFeatures`, `pairFeatures`, `pairCondFeatures`)
+- **`check-cpu-trunk.mjs`** - Stage-wise check of the CPU reference against a PyTorch oracle, using the released weights.
+- **`check-decoder.mjs`** - Check the CPU decoder (`cpu/rfd4p/decoder.js`) against the oracle's decode inputs/outputs, including the sequence-readout conditioning of the last trunk step.
+- **`check-encoder.mjs`** - Check the CPU autoencoder encoder (`cpu/rfd4p/encoder.js`) and partial-diffusion / inverse-folding helpers (`shared/rfd4p/partial.js`) against `oracle-dumps/encoder_oracle.*`.
+- **`check-features.mjs`** - Check JS feature construction (`shared/rfd4p/features.js`) against the oracle's recorded pre-`linear_out` feature matrices, given the oracle's own batch and x_t for call 0.
+- **`check-output.mjs`** - Verify RFD4-Proteina output processing, Hungarian insertion mapping, internal-coord group grafting, input-frame alignment, and mmCIF / PDB writers (`shared/rfd4p/output.js`) against the upstream PyTorch oracle dumps (`oracle-dumps/<case>.cif`).
+- **`check-sampler.mjs`** - Replay an oracle trajectory through the JS sampler (`shared/rfd4p/flow.js`), using the recorded network outputs and recorded noise: schedule, initial noise and every step's update must reproduce the next recorded x_t. Also checks the recycle depths.
 - **`check_af3_atom.js`** - Check every per-atom conditioning embedding against AF3, term by term.
 - **`check_af3_block.js`** - Run our AF3 pairformer block against the oracle's, with the real weights.
 - **`check_af3_confidence.js`** - Check the confidence head against AF3: pLDDT, PAE and PDE.
@@ -258,10 +274,12 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_trunk.py`** - Run the AF3 trunk on a toy protein, on CPU, and dump inputs and outputs.
 - **`dump_af3_trunk_taps.py`** - af3-any-model's whole TRUNK on the real 6MRR batch, stage by stage.
 - **`dump_af3_tx_supers.py`** - af3-any-model's token transformer at a TRUNCATED depth, for a bisect.
+- **`dump_batch_cpu.py`** - Dump the RFD4-Proteina *input pipeline* batch on CPU (no model, no GPU).
 - **`dump_bioemu2.py`** - BioEmu2's features and every stage of its network, from af3-any-model's own port.
 - **`dump_bioemu2_steering.py`** - BioEmu2's steered samplers on a toy denoiser, from af3-any-model's port.
 - **`dump_bioemu2_topology.py`** - BioEmu2's bonded graph, steering tables and physicality report, from af3-any-model's port.
 - **`dump_chai1_denoise.py`** - af3-any-model's diffusion head for Chai-1, one denoise step on the REAL trunk, with chai's own pair input.
+- **`dump_encoder_cpu.py`** - Dump deterministic CPU ground-truth oracle for the RFD4-Proteina Autoencoder Encoder (`EncoderTransformer`, `AutoEncoder.encode`) and Partial Diffusion / Inverse Folding helpers (`resolve_partial_t`, `build_partial_schedule`, `corrupt_batch`, `sample_noised_target_backbone`).
 - **`dump_esmfold2_confidence.py`** - Synthyra's ESMFold2 ConfidenceHead, inputs and outputs, from THEIR code.
 - **`dump_monomer_template.py`** - Capture AF2-MONOMER's template embedder by running AF2's own module.
 - **`dump_msap.py`** - MSA Pairformer's reference tensors for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
@@ -269,9 +287,11 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.
 - **`dump_rdkit_smiles.py`** - RDKit's own answer for a corpus of SMILES, as the reference this port is held to.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
+- **`dump_rfd4p.py`** - Dump a deterministic RFD4-Proteina oracle from the upstream PyTorch code.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
 - **`dump_truncated.py`** - One evoformer block on each side, so a difference has one place to live.
 - **`embedder_reference.py`** - The embedder's pair init, computed straight from the inputs and weights.
+- **`oracle-io.mjs`** - Node helpers for reading RFD4-Proteina oracle dumps (`tools/oracle/dump_rfd4p.py`) and the released checkpoint, and for comparing tensors.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
 - **`regen_batch_dumps.py`** - Re-dump every reference batch tools/check-batch-fields.js reads, from the af3-any-model installed in ~/.venv-lfjax.
@@ -309,7 +329,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (113)
+## `tools/` - everything else (114)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -396,6 +416,7 @@ go through CDP, and the deploy.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.
+- **`export_rfd4p_model.py`** - Export an RFD4-Proteina checkpoint (`model.safetensors` + `config.json`) into a `../localfold`-style sharded bundle (`manifest.json` + `shard_XXX.bin`) with symmetric per-block INT8 quantization (`block=64` + `float16` scale per block).
 - **`fold-clears-msa.py`** - Pressing Fold must take the PREVIOUS job's alignment off the page.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.

@@ -158,3 +158,12 @@ oracle-dumps-colab/
 # BioEmu2, written by tools/export_bioemu2_model.py and tools/quantize_af3.py
 /model-bioemu2-f32
 /model-bioemu2-int5
+
+# RFD4-Proteina's INT8 shards: ~420 MB, hosted rather than committed, exactly as
+# the nine fold bundles are. The config and the tensor manifest beside them ARE
+# tracked - they are what the tests read and what says where a tensor lives.
+# 🔴 This directory is named `weights/` and not `model-rfd4p-int8/` because the
+# engine's three defaults in shared/rfd4p/safetensors.js still point here;
+# renaming it belongs with the hosting decision, not before it. See docs/DESIGN.md.
+weights/int8/*.bin
+weights/*.safetensors
