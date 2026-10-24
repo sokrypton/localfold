@@ -51,7 +51,9 @@ kernel void af2_prev_dgram(LF_ARGS(PrevDgramArgs)) {
     a.out[(ulong)t * 15 + b] = (d2 > lo * lo && d2 < upper) ? (half)1.f : (half)0.f;
   }
 }
-// relpos [L, L, 73] one-hot, as _relative_encoding builds it
+// relpos [L, L, 73] one-hot, as _relative_encoding builds it: across chains the multimer's own row (65); a monomer's
+// projection has only the 65 residue-offset rows (the rest zero), so there a cross-chain pair takes the end of the window
+// by chain order, as ColabFold's monomer complexes and the +200 break do (cuda/af2 995ef402: 12 x 6MRR 50 -> 69 pLDDT)
 kernel void af2_relpos(LF_ARGS(RelposArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.L * a.L) return;
@@ -59,7 +61,7 @@ kernel void af2_relpos(LF_ARGS(RelposArgs)) {
   device half* o = a.out + (ulong)t * 73;
   for (int c = 0; c < 73; ++c) o[c] = (half)0.f;
   int clipped = clamp(a.ri[i] - a.ri[j] + 32, 0, 64);
-  o[a.asym[i] == a.asym[j] ? clipped : 65] = (half)1.f;
+  o[a.asym[i] == a.asym[j] ? clipped : a.chainRows ? 65 : a.asym[i] > a.asym[j] ? 64 : 0] = (half)1.f;
   bool sameEntity = a.entity[i] == a.entity[j];
   o[66] = sameEntity ? (half)1.f : (half)0.f;
   int rc = clamp(a.sym[i] - a.sym[j] + 2, 0, 4);

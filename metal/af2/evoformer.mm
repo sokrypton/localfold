@@ -129,7 +129,8 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPos) {
   run1d("af2_prev_dgram", pairs, PrevDgramArgs{prevPos, aatype, dgram, (uint)L, 0});
   linearB(dgram, E + "prev_pos_linear", -1, t.pair, pairs, 15, 128, false, 1.f);
   half* rel = scratch<half>("emb.rel", pairs * 73);
-  run1d("af2_relpos", pairs, RelposArgs{Ii("residue_index"), Ii("asym_id"), Ii("entity_id"), Ii("sym_id"), rel, (uint)L, 0});
+  run1d("af2_relpos", pairs, RelposArgs{Ii("residue_index"), Ii("asym_id"), Ii("entity_id"), Ii("sym_id"), rel, (uint)L,
+                                         (uint)(M.meta("meta/multimer", 0) != 0)});
   linearB(rel, E + "~_relative_encoding/position_activations", -1, t.pair, pairs, 73, 128, false, 1.f);
   releaseScratch({"emb.rel", "emb.dgram"});
   // the extra MSA's activations

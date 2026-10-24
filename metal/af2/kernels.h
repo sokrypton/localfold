@@ -7,7 +7,7 @@ struct TargetFeatArgs { CP(int) aatype; DP(half) tf; uint L, pad; };
 struct BroadcastRowsArgs { DP(float) msa; CP(float) row; u64 rows; uint L, C; };
 struct OuterSumArgs { DP(float) pair; CP(float) left; CP(float) right; uint L, C; uint add, pad; };   // add: pair += rather than =
 struct PrevDgramArgs { CP(float) pos37; CP(int) aatype; DP(half) out; uint L, pad; };
-struct RelposArgs { CP(int) ri; CP(int) asym; CP(int) entity; CP(int) sym; DP(half) out; uint L, pad; };
+struct RelposArgs { CP(int) ri; CP(int) asym; CP(int) entity; CP(int) sym; DP(half) out; uint L, chainRows; };
 struct ExtraFeatArgs { CP(int) codes; CP(float) hasDel; CP(float) delVal; DP(half) out; u64 rows; };
 struct PairMaskArgs { CP(float) seqMask; DP(float) out; uint L, pad; };
 
