@@ -13,154 +13,156 @@ docs/M2-HANDOFF.md is the A100's earlier round-six handoff, a different pass.
 - `AF3_SCALAR_ATOM_ATTENTION=0` now means off; it used to turn the scalar control ON whatever its value, so the A/B
   below was the same arm twice.
 - ESMFold2 past ~620 residues (6a0bb428) and two-token AF3-lineage folds (3bd04bb6) were broken and are fixed.
+- `lf_gemm` (the M2's GEMM) emits the next LayerNorm only at 64 output columns, `lf_gemm_dual` up to 128; the 128/256
+  emission mode on `lf_gemm` lost, nothing took it, and it is gone with its `LOCALFOLD_LN_EMIT` switch (89e5e033).
+- Measured since on the M5 and kept: the `plain` GEMM rule from 976a298d (reverted, six pairs: every case within
+  1.1%), and the `metal-3` WebGPU knobs, each now with its M5 numbers in `webgpu/runtime/device-profile.js` (52e5b69f).
 
 ---
 
-## 1. Why This Handoff Exists (M5 vs. M2 Architecture Gap)
+## 1. Why the M2 needs its own pass
 
-Over 17 commits (`976a298d..0aeeb53b`), we optimized all four model families (`af3`, `af2`, `ef2` / `esmc`, `bioemu2`) across both native **Metal** (`metal/`) and **WebGPU** (`webgpu/`) on an Apple M5.
+Everything here was written and measured on the M5. Three differences can turn an M5 win into an M2 loss or break:
 
-While ~80% of those optimizations reduce memory traffic, dispatch count, or host/device overhead on **all** GPUs, the M5 and M2 differ in three hardware ways that can invert kernel-level choices:
-
-1. **Dynamic Caching (M3+ / `Apple9`+) vs. Static Register File (M2 / `Apple8`)**:
-   - On the M5, unified SRAM is dynamically partitioned between registers, L1, and threadgroup memory. Holding `12..16 x vec4<f32>` (48–64 floats per thread) in private registers to stage a full LayerNorm/AdaLN row is essentially free in occupancy.
-   - On the M2, registers are statically carved out per simdgroup. Increasing per-thread registers from 32 to 64–96 can drop active simdgroups per core by 2x or spill to device stack memory.
-2. **WebGPU `adapter.info` Cannot Distinguish M2 from M5**:
-   - Under stock Chrome flags (`LOCALFOLD_STOCK_FLAGS=1`), both M2 and M5 report `{ vendor: "apple", architecture: "metal-3", device: "", description: "" }`.
-   - Therefore, any change to `PRIORS.get("metal-3")` in `webgpu/runtime/device-profile.js` or any shader change in `webgpu/` runs identically on M2 and M5 unless gated by a runtime micro-race (like `webgpu/af3/trunk/grid-attend-race.js`).
-3. **Metal 4 Tensor Units (`Apple10`) vs. Metal 3 `simdgroup_matrix` (`Apple8`)**:
-   - In native `metal/`, `lf_gemm_tensor` (`metal/core/gemm_tensor.metal`, using Metal 4 `matmul2d` on M5's per-core neural accelerators) is gated on `tensorWanted()` (`Apple10` + macOS 26) in `metal/core/core.mm`.
-   - On the M2, `tensorWanted()` is `false`, so `gemmRun` uses `lf_gemm` (`metal/core/gemm.metal`) and clears `a.lnOut = 0`. However, all non-tensor kernels in `metal/` (`common.metal`, `af3.metal`, `af2.metal`, `ef2.metal`, `bioemu2.metal`) run directly on the M2.
+1. **The M2 runs different GEMM kernels.** The M5 takes `lf_gemm_tensor` (`metal/core/gemm_tensor.metal`, Metal 4
+   tensor ops, `Apple10` and macOS 26 only). The M2 takes `lf_gemm` / `lf_gemm_dual` (`metal/core/gemm.metal`,
+   `simdgroup_matrix`). The pass changed `gemm.metal` heavily, and **those kernels have only ever run on the M5 under
+   `LOCALFOLD_GEMM_TENSOR=0`**: the same source, but the M5's compiler, register file and core count. See section 3A.
+2. **Register pressure.** The M5 (Apple9+) allocates registers dynamically; the M2 (`Apple8`) does not, so kernels that
+   hold a whole row in registers (the unrolled `float4` AdaLN / LayerNorm forms) can lose occupancy or spill there.
+3. **WebGPU cannot tell the two apart.** Both report `apple / metal-3` with an empty device string under stock Chrome,
+   so every `PRIORS.get("metal-3")` value in `webgpu/runtime/device-profile.js` ships to both. A knob the two chips
+   disagree on needs a threshold that wins on both, or a startup race like `webgpu/af3/trunk/grid-attend-race.js`.
 
 ---
 
-## 2. Engineering Rules & Setup on the M2
+## 2. Rules and setup
 
-1. **Engineering invariants (`AGENTS.md`, `CLAUDE.md`, `metal/README.md`)**:
-   - Never widen tolerances or overwrite reference tensors / gate baselines merely to make a failing test pass.
-   - Run GPU benchmarks strictly one at a time, and measure speed arms **interleaved (`ABBA` or `BAAB`)** on warm shader/pipeline caches.
-   - Keep `src/` and `webgpu/` directly loadable by the browser (plain ES modules, relative `.js` specifiers, no bundler or build step).
-   - Never stage or commit `package-lock.json` or `localfold-fixes-for-sergey.md`.
-   - When a tuning knob disagrees between M2 and M5:
-     - In **Metal (`metal/`)**: branch at runtime using `[device supportsFamily:MTLGPUFamilyApple9]` (M3/M4/M5 with Dynamic Caching) vs `MTLGPUFamilyApple8` (M2), or `tensorWanted()` (`Apple10`).
-     - In **WebGPU (`webgpu/`)**: either pick a threshold (e.g. register-staging row width cap) that wins on both, or add the arm to the startup micro-race (`webgpu/af3/trunk/grid-attend-race.js`) rather than regressing either chip.
-2. **Environment & build commands**:
-   ```bash
-   export PATH="$HOME/sergey/.venv-localfold/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-   git checkout opus-55-opt && git pull --rebase origin opus-55-opt
+- `AGENTS.md` / `CLAUDE.md` / `metal/README.md` hold the invariants: never widen a tolerance or rewrite a baseline to
+  pass a gate; one GPU job at a time; speed arms interleaved (ABBA) on warm caches; never commit `package-lock.json` or
+  `localfold-fixes-for-sergey.md`.
+- **The first run of a freshly built Metal binary compiles its GEMM instances inside the timed stages** (up to 4x
+  long). Run every case once, untimed, before timing it.
+- In zsh, `env $e` with `e="A=1 B=2"` sets ONE variable `A` to `1 B=2`. Write each assignment out.
+- A Metal knob the chips disagree on: branch on the device (`tensorWanted()` for Apple10; for Apple9 use
+  `supportsFamily` with the enum **by value** - the M2's SDK 13.3 does not name it; see the note at `core.mm:40`).
 
-   # Build all native Metal binaries
-   bash metal/build.sh selftest bench af3 af2 ef2 bioemu2
-   ```
-   *(Note: When benchmarking two Metal binaries side-by-side, place them in `metal/<port>/localfold-<port>-a` and `metal/<port>/localfold-<port>-b` rather than running from `/tmp` or overwriting `metal/<port>/localfold-<port>` on each run: `lf::standalone::main` locates repo assets relative to `dirname(argv[0])`, and overwriting a Mach-O executable in place triggers ~45 ms of macOS `amfid` code-signature re-verification.)*
-
----
-
-## 3. Classification of the first 17 M5 commits (`976a298d..0aeeb53b`)
-
-### A. Inert on M2 (`Apple10` Tensor-Unit Only)
-These changes live inside `metal/core/gemm_tensor.metal` or `gemmTensorRun` in `metal/core/core.mm` (`tensorWanted() == true`):
-- `172f226c`, `d1778df5`, `41555140`, `63e12b5c`, `91f35240`, `7d2cbdf7`, `0aeeb53b`:
-  - `lf_gemm_tensor` butterfly register SwiGLU (`e40`), `16x256` and `32x256` single/dual emitted LayerNorm epilogues (`e64`, `e192`, `e256`), `yinFloat` (`biasType |= 512`), and `16x256` dual triangle-output GEMM (`lf_gemm_tensor_dual`).
-  - **How M2 handles `g.lnOut` / `g.lnOut2` and `g.yinFloat`**:
-    - When `gemmRun` runs on M2 (`tensorWanted() == false`), line 788 of `metal/core/core.mm` sets `a.lnOut = 0` and returns `false`. Thus `recordEmitted` is never called, `takeEmitted(dst)` returns `false`, and every caller in `af3`, `af2`, `ef2`, and `bioemu2` executes its standard `layerNorm(...)` path automatically.
-    - `g.yinFloat` (`a.biasType |= 512`, adding a `float*` residual `C` to a `half`-output GEMM) is supported in **both** `lf_gemm_tensor` (`metal/core/gemm_tensor.metal`) and `lf_gemm` (`metal/core/gemm.metal`), and has been verified across all four Metal ports (`af3`, `af2`, `ef2`, `bioemu2`) and `localfold-selftest` under `LOCALFOLD_GEMM_TENSOR=0`.
-
-### B. Universally Faster on Both M2 and M5
-- **Load-time weight preparation & decode-time SwiGLU interleaving** (`63e12b5c`, `426f0a57`, `7d2cbdf7`, `0aeeb53b`):
-  - `isSwiglu` in `loadBundle` (`metal/core/core.mm`), `prepareWeights()` in `metal/af2/evoformer.mm`, `prepareTrunkWeights()` / `prepareAtomWeights()` / `prepareDiffusionWeights()` in `metal/ef2`, and decoding small weights (`>= 2048` elements and 2D AF2/EF2 linear weights) to `half` at load time.
-- **Producer kernels writing `half*` directly** (`7d2cbdf7`, `0aeeb53b`):
-  - Dual `float* y + half* yh` output in `lf_layernorm` / `lf_layernorm4` (`metal/core/common.metal`), `af2` embedder/template/IPA/structure transitions writing `half*`, and `ef2` `ef2_atom_features`, `ef2_coords_input`, and `ef2_distance_embed` writing `half*`.
-- **`ef2` Confidence Head memory & dispatch cuts** (`0aeeb53b`, `metal/ef2/confidence.mm`):
-  - Fused `confidence/zNorm` into `ef2_conf_z` in-place on `zTrunk` (1 simdgroup per pair row instead of 256 threads per pair), fused `toHalf` into `ef2_distance_embed`, and replaced `toFloat + add` with `ef2_add_half` (eliminating two `P * C * 4` float buffers — `2.2 GB` saved at 1044 tokens).
-- **Step-invariant & pointer-batched diffusion conditioning** (`976a298d`, `3be1a173`, `172f226c`, `426f0a57`, `35dfa517`, `f285d862`):
-  - Hoisting step-invariant conditioning projections outside the step loop in `metal/bioemu2`, `metal/ef2`, and `webgpu/esmfold2`.
-- **WebGPU contiguous `int5` unpack & bank-conflict-free shared tiles** (`35dfa517`, `befd793d`, `52f8dd56`):
-  - Contiguous-pair fast path in `webgpu/weights/quantised-upload.js` (`-65.5%` unpack GPU time), `+1`/`+4` stride padding in `contractF16` (`webgpu/kernels/triangle/shaders.js`), `createTranspose2dShader`, and `createOuterProductMeanShader`, and `tuning.matrixLinear !== false` gating for `splitTransitionConfig` / `pairTransitionSplit`.
-
-### C. Suspects to A/B Test on the M2 (Where M5 and M2 Can Diverge)
-
-These are the exact items tuned on M5 where M2's static register file, 10-core GPU size, or cache hierarchy could behave differently:
-
-| # | Area | Commit & Files | Why It Might Differ on M2 |
-|---|---|---|---|
-| **1** | **WebGPU `atomRowTile: 4` pinned in `metal-3`** | `ed330437` (`webgpu/runtime/device-profile.js:1345`) | Pinning `atomRowTile = 4` (14 KiB workgroup memory, `vec4<f32>`) beat tile 1/2 (at `<1024` atoms) and tile 8 (at `>2048` atoms) on M5. On M2's 10-core GPU, check if tile 4 at 68 tokens (`~576` atoms = 144 workgroups across 3 splits) under-occupies or beats `DEFAULT_TUNING` (`atomRowTile: null`). |
-| **2** | **WebGPU register-staged full-row LayerNorm / AdaLN (`C = 768..1024`)** | `ed330437` (`webgpu/af3/diffusion/diffusion-conditioning.js`, `webgpu/af3/diffusion/diffusion-transformer.js`, `webgpu/af3/trunk/transition.js`), `f285d862` (`webgpu/bioemu2/ops.js`), `35dfa517` (`webgpu/esmc/block.js`) | Holds up to `16 x vec4<f32>` (64 floats/lane) in private registers to avoid re-reading global memory. Great with M5 Dynamic Caching; on M2 (`Apple8`), `>= 48` floats/lane in private registers can halve simdgroup occupancy. |
-| **3** | **WebGPU 4-row x 64-lane (256-thread) workgroup packing** | `ed330437` (`webgpu/af3/diffusion/atom-encoder.js`, `webgpu/af3/diffusion/atom-decoder.js`), `f285d862` (`webgpu/bioemu2/ops.js` `lnFastSource` & `csAtomPrep`) | Packs 4 atom rows of 64 lanes into one 256-lane workgroup. Check both numerical stability and speed on M2. |
-| **4** | **WebGPU AF2 Vector OPM (`opmVectorOutput`, `opmVectorContract`)** | `befd793d` (`webgpu/af2/evoformer/block.js`, `webgpu/kernels/outer-product-mean.js`) | Enabled when `opmMatrixContract === false` (which `metal-3` sets). Won `-8.8%` to `-14.6%` on M5; verify on M2 across `L = 59, 150, 255`. |
-| **5** | **Metal unrolled `float4` register staging in AdaLN (`C = 768..1024`)** | `0c3dd2dd` (`metal/bioemu2/bioemu2.metal`), `70248dce` & `dedf5ec0` (`metal/af3/af3.metal`), `d8620d9b` (`metal/ef2/ef2.metal`) | Unrolled `float4` register arrays in `af3_ada_ln*`, `be2_ada_ln*`, `ef2_ada_ln`. Check on M2 with `--profile` that static register allocation does not spill. |
-| **6** | **Metal `af3_atom_attention_mma` at `keys <= 128` & single-block `triContract` up to 32 MB** | `41555140` (`metal/af3/atom.mm:164`, `metal/core/core.mm:1205`) | Both run on M2 (`af3_atom_attention_mma` uses Metal 3 `simdgroup_float8x8`). Verify `AF3_SCALAR_ATOM_ATTENTION=0` vs `1` and `LOCALFOLD_TRI_BLOCKS=1` vs `4` on M2. |
-
----
-
-## 4. Step-by-Step Action Plan on the M2
-
-### Step 1: Run Correctness Gates on the M2 (Metal & WebGPU)
 ```bash
 export PATH="$HOME/sergey/.venv-localfold/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-
-# 1. Native Metal self-test & gates
+git checkout opus-55-opt && git pull --rebase origin opus-55-opt
 bash metal/build.sh selftest bench af3 af2 ef2 bioemu2
-./metal/selftest/localfold-selftest
-LOCALFOLD_GEMM_TENSOR=0 ./metal/selftest/localfold-selftest   # (on an M2 the same path; on an M5 the M2's kernels)
-python3 metal/af2/gate.py   # (and --write once: the 5caj-msa case has no M2 baseline yet, so it cannot fail there)
-python3 metal/ef2/gate.py
-python3 metal/af3/gate.py
-# (af3-kitchen-sink and af3-glycan are expected to read MOVED against an M2 baseline older than 2026-10-20: cb160ba0,
-#  AF3 dropping a glycan's O1 - exact against AF3's own batch - moved them on the M5 at that commit alone, kitchen sink
-#  pLDDT 70.61 -> 77.08, glycan 48.62 -> 48.25. If those two are the only moves, re-record them and the new 5caj-msa:
-#  python3 metal/af3/gate.py --write --only=af3-kitchen-sink,af3-glycan,af3-5caj-msa)
-python3 tools/check-native-worker.py --offline --no-af3 --no-page
-
-# 2. WebGPU differential checks & stock-Chrome suite
-node tools/gpu-chrome.mjs tools/gpu/check-quantised-upload.js
-node tools/gpu-chrome.mjs tools/gpu/check-af3-pairformer-block.js
-node tools/gpu-chrome.mjs tools/gpu/check-af2-evoformer-block.js
-LOCALFOLD_STOCK_FLAGS=1 npm run test:stock
 ```
 
-### Step 2: Run the WebGPU A/B Benchmarks on the M2 (`LOCALFOLD_STOCK_FLAGS=1`)
+---
 
-Run each pair interleaved (`ABBA`) on warm caches:
+## 3. What to suspect on the M2
 
-1. **Test `atomRowTile: 4` vs `null` (Suspect #1)**:
-   ```bash
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-head.js --tokens=68 --rounds=3 --tune=atomRowTile=null
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-head.js --tokens=68 --rounds=3
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-head.js --tokens=255 --rounds=3 --tune=atomRowTile=null
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-head.js --tokens=255 --rounds=3
-   ```
-   - **If `atomRowTile=null` wins at 68 tokens on M2**: change `atomRowTile` in `PRIORS.get("metal-3")` (`webgpu/runtime/device-profile.js:1345`) or race it in `grid-attend-race.js`.
+### A. `gemm.metal` code written on the M5 (runs on the M2, never run on one)
 
-2. **Test AF2 Vector OPM on M2 (Suspect #4)**:
-   ```bash
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js --bundle=/model-af2-monomer-int5 --length=150 --sequences=256 --tune=opmVectorOutput=false,opmVectorContract=false
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js --bundle=/model-af2-monomer-int5 --length=150 --sequences=256
-   ```
+| Commit | What |
+|---|---|
+| `887f8d1d` | `yinFloat` (a float residual into a half-output GEMM) in `lf_gemm` |
+| `0de9becb`, `19d31add` | fused epilogues, `halfProductScale`, float-accumulated f16 stores in `lf_gemm`; a register spill fix |
+| `557fcc3e` | `lf_gemm` emitting the next LayerNorm at 64 columns; the 64-wide dual GEMM |
+| `57d4b618`, `0847a49b` | vectorised bias/scale epilogue; blocks-of-2 `gemmCouplingCombine` |
+| `5646656b` | `gemmCouplingCombine` ported to Apple8 |
+| `84e68ca6` | `lf_gemm_dual` (two GEMMs sharing an A tile), emitting LayerNorm up to 128 |
+| `b15f7b6d`, `c2791e57` | `gemmGatedAddDual` at C = 256, then 384/512 |
 
-3. **Test Register-Staged LayerNorm/AdaLN & 4-Row Packing on M2 (Suspects #2 & #3)**:
-   - Compare `HEAD` against `976a298d~1` (or toggle the register-staging width cap from `1024` down to `512` in `webgpu/af3/diffusion/diffusion-conditioning.js`, `webgpu/af3/diffusion/diffusion-transformer.js`, `webgpu/af3/trunk/transition.js`, and `webgpu/bioemu2/ops.js`):
-   ```bash
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/fold-esmfold2.js --tokens=68 --repeat=2
-   LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-trunk.js --tokens=200 --blocks=8
-   ```
-   - **If `C = 768` / `1024` register staging is slower on M2**: lower the register-staged cutoff to `channels <= 512` (at `<= 512` channels across 64 lanes, each lane holds at most `2 x vec4<f32>` = 8 floats, which never spills on M2 while still covering `C=128`, `256`, `384`, and `512`!).
+The M5 check was `LOCALFOLD_GEMM_TENSOR=0`: the selftest passes, and AF2 6/6, ESMFold2 8/8 and AF3 18/18 gates match
+before and after the cleanup. Note that an M5 under `TENSOR=0` gives AF3's kitchen-sink different digits from the
+tensor baseline (arithmetic, expected) - **the M2's own baselines are the reference, not the M5's.**
 
-### Step 3: Run the Native Metal A/B Benchmarks on the M2
+### B. Other Metal kernels (run on both chips)
 
-1. **Test `af3_atom_attention_mma` (`keys <= 128`) and `LOCALFOLD_TRI_BLOCKS` (Suspect #6)**:
-   ```bash
-   # Atom attention MMA vs scalar at 68 tokens
-   AF3_SCALAR_ATOM_ATTENTION=1 ./metal/af3/localfold-af3 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --recycles=0 --steps=50 --out=/tmp/a.pdb
-   AF3_SCALAR_ATOM_ATTENTION=0 ./metal/af3/localfold-af3 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --recycles=0 --steps=50 --out=/tmp/b.pdb
+- Unrolled `float4` register staging in AdaLN: `af3_ada_ln*`, `be2_ada_ln*`, `ef2_ada_ln` (`0c3dd2dd`, `70248dce`,
+  `dedf5ec0`, `d8620d9b`) - check `--profile` for a regression against `9b61f8b4`.
+- `simdgroup_float8x8` FlashAttention for ESM-C and sliding-window attention (`b1d9d3bc`, `0d73a36c`, `376c5a1d`).
+- `af3_atom_attention_mma` at keys <= 128 (`41555140`; `AF3_SCALAR_ATOM_ATTENTION=1` is the scalar control) and the
+  blocked triangle contraction (`LOCALFOLD_TRI_BLOCKS=1` the control).
+- The XOR-swizzled `lf_center_norm` family and `lf_center_norm_wide_h` (`dd66ce1a`, `a8c6006c`).
 
-   # Single-block vs 4-block triangle contraction
-   LOCALFOLD_TRI_BLOCKS=4 ./metal/ef2/localfold-ef2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --out=/tmp/a.pdb
-   LOCALFOLD_TRI_BLOCKS=1 ./metal/ef2/localfold-ef2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --out=/tmp/b.pdb
-   ```
-2. **Profile AdaLN kernels on M2 (Suspect #5)**:
-   ```bash
-   ./metal/ef2/localfold-ef2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --profile
-   ./metal/bioemu2/localfold-bioemu2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE --samples=5 --profile
-   ```
-   - If any `ada_ln` kernel regressed vs `976a298d~1` on M2 due to static register pressure, dispatch the unrolled register variant only when `D().family9` (`[device supportsFamily:MTLGPUFamilyApple9]`) is true.
+### C. WebGPU `metal-3` values this pass set (ship to the M2 unmeasured there)
+
+- `atomRowTile` pinned to 4 at every size (`ed330437`). M5: best or level at 68 and 255 tokens (numbers at the value).
+- `opmMatrixContract: false` - matters only where `chromium-experimental-subgroup-matrix` is on, not under stock flags.
+- `diffusionTokenTile.outCrossover: 96`.
+- Register-staged full-row LayerNorm / AdaLN at C = 768-1024 (`ed330437`, `f285d862`, `35dfa517`) and the 4-row x
+  64-lane atom packing (`ed330437`, `f285d862`).
+
+The other `metal-3` values (`trianglePairProjectTile`, the f16 half tiles, `singleTransitionTile`,
+`singleProjectRows`) predate this pass; their comments say "Not measured on an M2".
+
+---
+
+## 4. The M2 checklist
+
+### Step 0: the build is the first check
+
+`bash metal/build.sh ...` above, on the M2's SDK 13.3. The host code must not name a Metal enum newer than macOS 13
+(the M5's SDK 26 hides that). A failure here is a portability fix, not a reason to raise the floor.
+
+### Step 1: correctness
+
+```bash
+./metal/selftest/localfold-selftest          # the M2's GEMM is the shipped path here; nothing to force
+python3 metal/af2/gate.py
+python3 metal/ef2/gate.py
+python3 metal/af3/gate.py
+python3 tools/check-native-worker.py --offline --no-page   # add --no-af3 without AlphaFold 3's weights
+```
+
+- `af2 5caj-msa` and `af3-5caj-msa` have no M2 baseline, so they print NEW and cannot fail. If everything else passes,
+  record them: `python3 metal/af2/gate.py --write --only=5caj-msa` and the AF3 one below.
+- `af3-kitchen-sink` and `af3-glycan` are expected to read MOVED: cb160ba0 (AF3 drops a glycan's O1, exact against
+  AF3's own batch) moved them on the M5 at that commit alone (kitchen sink pLDDT 70.61 -> 77.08, glycan 48.62 ->
+  48.25). If those are the only moves: `python3 metal/af3/gate.py --write --only=af3-kitchen-sink,af3-glycan,af3-5caj-msa`.
+- Any other MOVED or FAIL is a real finding against section 3A or 3B.
+
+```bash
+node tools/gpu-chrome.mjs tools/gpu/check-quantised-upload.js
+node tools/gpu-chrome.mjs tools/gpu/check-evoformer-stack.js
+npm run test:stock            # every bundle on this box folds under a stock Chrome
+```
+
+### Step 2: is the M2 faster than before the pass?
+
+The question the M5 answered with -12..-29% Metal compute (and WebGPU -3..-26%). Build `9b61f8b4` beside HEAD and
+alternate them, after one untimed run of each:
+
+```bash
+git worktree add ../lf-base 9b61f8b4 && (cd ../lf-base && bash metal/build.sh af2 ef2 af3 bioemu2)
+SEQ=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
+for r in 1 2 3; do for root in ../lf-base .; do
+  (cd $root && ./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep -E "^(trunk|sampler) ")
+done; done
+```
+
+The same for `af2` (pass times), `af3 --model=boltz2` (`total`) and `bioemu2
+--job=tools/fixtures/bioemu2/6mrr-68.json --samples=2`, at 68 residues and at 5CAJ's 255. A port slower than
+`9b61f8b4` is bisected through section 3A/3B's commits, with `LOCALFOLD_GEMM_TENSOR` irrelevant here.
+
+### Step 3: the WebGPU `metal-3` values (stock flags, interleaved)
+
+```bash
+# atomRowTile: off = the derived rule; 4 = the pin. Atom output passes in gpuPasses (output-*).
+for t in off 4 off 4; do LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/bench-head.js \
+  --model=/model-af3-int5/manifest.json --tokens=68 --calls=6 --profile --atomtile=$t; done   # and --tokens=255
+# AF2's vector OPM
+for v in false true false true; do LOCALFOLD_STOCK_FLAGS=1 node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js \
+  --bundle=/model-af2-monomer-int5 --length=150 --sequences=256 --tune=opmVectorOutput=$v,opmVectorContract=$v; done
+```
+
+Where the M2 disagrees with the M5, do not just flip the prior (the M5 then loses): find a threshold that wins on
+both, or race the two forms at startup as `grid-attend-race.js` does.
+
+### Step 4: Metal kernels in 3B
+
+```bash
+for v in 1 0 1 0; do AF3_SCALAR_ATOM_ATTENTION=$v ./metal/af3/localfold-af3 --sequence=$SEQ --model=boltz2 --out=/tmp/x.pdb | grep total; done
+for v in 1 4 1 4; do LOCALFOLD_TRI_BLOCKS=$v ./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep trunk; done
+./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb --profile        # the ada_ln rows, against ../lf-base
+./metal/bioemu2/localfold-bioemu2 --sequence=$SEQ --samples=2 --out=/tmp/x.pdb --profile
+```
+
+An `ada_ln` kernel slower than `9b61f8b4`'s on the M2 takes its unrolled form only on Apple9+.
