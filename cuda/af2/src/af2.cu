@@ -15,6 +15,12 @@
 #include "structure.cuh"
 #include "../../af3/src/profile.cuh"
 #include "../../featurise/af2_weights.h"   // the weight walk: the page's bundle read as published, no map
+// a chain's PDB letter, the page's (shared/af3/structure/pdb.js): upper case, lower case, then digits - it was 'A' + at
+// most 25, so a 27th chain on wrote as Z beside the 26th and every reader merged them (45 copies of 6MRR: 26 chains)
+inline char pdbChain(int k) {
+  static const char CHAINS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  return CHAINS[k % 62];
+}
 
 static const char* RESTYPE3[21] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
                                    "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK"};
@@ -150,7 +156,7 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
     contactPairsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(dg, pairs, cp);
     contact = download(cp, pairs);
   }
-  auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
+  auto chainId = [&](int i) { return pdbChain(asym[i] - firstAsym); };
   auto matrix = [&](FILE* f, const std::vector<float>& m) {
     std::string j; appendMatrix2(j, m.data(), L); fwrite(j.data(), 1, j.size(), f);
   };
@@ -556,7 +562,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         for (int d = 0; d < 3; ++d) q[d] = R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + passCentre[d];
         snprintf(line, sizeof line, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f           %c\n", (int)k + 1,
                  strlen(ATOM37[a]) < 4 ? (std::string(" ") + ATOM37[a]).c_str() : ATOM37[a], RESTYPE3[hAatype[i] > 19 ? 20 : aa],
-                 (char)('A' + std::min(hAsym[i] - hFirstAsym, 25)), hRi[i] + 1, q[0], q[1], q[2], 1.0, plddt[i], ATOM37[a][0]);
+                 pdbChain(hAsym[i] - hFirstAsym), hRi[i] + 1, q[0], q[1], q[2], 1.0, plddt[i], ATOM37[a][0]);
         out += line;
       }
       out += "END\n";
@@ -665,7 +671,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   int serial = 1;
   for (int i = 0; i < L; ++i) {
     int aa = std::min(std::max(aatype[i], 0), 19);
-    char chain = (char)('A' + std::min(asym[i] - firstAsym, 25));     // asym ids count from the first chain's
+    char chain = pdbChain(asym[i] - firstAsym);     // asym ids count from the first chain's
     for (int a = 0; a < 37; ++a) {
       if (mask37[aa * 37 + a] == 0) continue;
       const float* p = &pos[((size_t)i * 37 + a) * 3];
