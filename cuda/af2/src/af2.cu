@@ -433,6 +433,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       checkOracle("single", single, (size_t)L * 384, "o/full/single");
     }
     mark("evoformer"); memReport("evoformer"); so = structureModule(single, pairOut, L, positionScale);
+    // (on a card short of room its pair-sized buffers given back - read by nothing past it, and the next pass's
+    // triangle wants the room: 8.5 GB of point attention at 4,080 residues)
+    if (AF2_TIGHT) releaseScratch({ "sm.attn", "sm.b2d", "sm.act2d", "sm.lnstats", "sm.lnc" });
     if (check) {
       checkOracle("structure act", so.act, (size_t)L * 384, "o/full/structure_act");
       checkOracle("angles", so.angles, (size_t)L * 14, "o/full/angles");
@@ -634,6 +637,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
     warmStackWeights(t.extraZeros, multimer, monomerTemplates);
     release();
+    // (its scratch is kept for the fold it warms - but not on a card short of room, whose stages give theirs back as
+    // they go: kept, 21 GB of it sat beside a 4,080-residue multimer's own pair and its first triangle ran out)
+    if (AF2_TIGHT) releaseScratch();
     return 0;
   }
   if (profile) prof::stop(30);

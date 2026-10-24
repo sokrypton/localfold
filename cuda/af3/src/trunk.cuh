@@ -2377,7 +2377,12 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   if (M.flag("trunk.dialect.msaDoubleAddPair")) {
     // (sharded: room for it beside the triangle's whole form, which the MSA stack's blocks make next - asked of the free
     // memory before them, the copy alone fitted and left the triangle 1 GB short)
-    zHost = !roomFor(zBytes + (sharded(t) ? sh::wholeFormBytes(t.n, t.C, t.p16 ? 2 : 4) : 0));
+    // ...and on one GPU, beside the triangle's whole b (bf16) and a parallel block's copy of the pair (chai-1's MSA
+    // blocks): asked of the copy alone, chai-1 at 4,080 tokens kept its 8.5 GB here and the MSA stack's triangle then
+    // found 6.7 GB free beside it and par.base
+    const size_t beside = sharded(t) ? sh::wholeFormBytes(t.n, t.C, t.p16 ? 2 : 4)
+      : (size_t)t.n * t.n * t.C * 2 + (M.flag("trunk.dialect.groupedOuterProduct") ? zBytes : 0);
+    zHost = !roomFor(zBytes + beside);
     if (zHost) {
       static void* host = nullptr; static size_t have = 0;
       if (have < zBytes) {
