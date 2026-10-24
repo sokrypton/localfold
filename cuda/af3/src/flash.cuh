@@ -125,6 +125,29 @@ __device__ __forceinline__ void cpAsync16(void* dst, const void* src, bool valid
 #else
 #define LF_REG_STAGES 0
 #endif
+// LF_SM_SMEM: the shared memory one SM holds on the architecture this pass compiles for (CUDA's table of compute
+// capabilities); 0 in the host pass, which does not read __launch_bounds__
+#if !defined(__CUDA_ARCH__)
+#define LF_SM_SMEM 0
+#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870
+#define LF_SM_SMEM (164 << 10)
+#elif __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#define LF_SM_SMEM (228 << 10)
+#elif __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 720
+#define LF_SM_SMEM (96 << 10)
+#elif __CUDA_ARCH__ == 750
+#define LF_SM_SMEM (64 << 10)
+#else                                                    // 86, 89, 120, 121
+#define LF_SM_SMEM (100 << 10)
+#endif
+// a __launch_bounds__ minimum of `want` blocks an SM, no more than shared memory seats at `smem` bytes a block (and the
+// 1 KB the driver reserves a block). A minimum the SM cannot seat buys no occupancy and still caps the registers at
+// 64 K / (want x threads): on the RTX PRO 6000's 100 KB, triIn256K's four at 34.8 KB a block (two seat) held it to 128
+// registers with 8-24 bytes spilled - 1,145 us a launch at 988 tokens against 1,105 without.
+constexpr int fitBlocks(int want, size_t smem) {
+  const int seated = LF_SM_SMEM ? (int)((size_t)LF_SM_SMEM / (smem + 1024)) : want;
+  return seated < 1 ? 1 : seated < want ? seated : want;
+}
 template <int N> struct RegStage {
   uint4 v[N];
   __device__ __forceinline__ void load(int i, const void* src) { v[i] = *reinterpret_cast<const uint4*>(src); }

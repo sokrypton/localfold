@@ -874,10 +874,15 @@ __host__ __device__ inline int vtPerm64(int lk) {
   int g = lk & 31;
   return (lk & 32) + (g & 16) + ((g & 15) < 8 ? ((g & 7) >> 1) * 4 + (g & 1) : ((g & 7) >> 1) * 4 + 2 + (g & 1));
 }
+// gridInK's dynamic shared memory (its launchers', and its own __launch_bounds__')
+constexpr size_t gridInSmem(int warps, int nc = 64, int C = 128) {
+  size_t xr = (size_t)16 * warps * (C + 8) * 2, st = (size_t)C * (nc + 8) * 2, ys = (size_t)16 * warps * (nc + 8) * 2;
+  return st + (xr > st + ys ? xr : st + ys);
+}
 template <int C, int NQ, int WARPS, class PT = float, int NCI = 64, int MT = 1,
           int MINB = (WARPS == 4 && NCI == 64 && MT == 1 && (C == 128 || C == 64)) ? 3
                    : (((WARPS == 8 && NCI == 64 && MT == 1) || (WARPS == 4 && NCI == 32 && MT == 2)) && (C == 128 || C == 64)) ? 2 : 1>
-__global__ void __launch_bounds__(WARPS * 32, MINB) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
+__global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, NCI, C))) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wq, half* __restrict__ out, int n, size_t q0,
     size_t rows, bool tr, const half* __restrict__ Wb, half* __restrict__ bias, int heads, int stride, bool swap,
     const float* __restrict__ qb = nullptr,      // qb: a bias on the NQ projected columns (AF2's gate bias), or none
@@ -1300,10 +1305,6 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
 #endif
 constexpr int GI_WARPS = 8, GO_WARPS = 8;
 // the launchers on raw pointers (AF2 calls these with its own weights and biases), then AF3's by name
-inline size_t gridInSmem(int warps, int nc = 64, int C = 128) {
-  size_t xr = (size_t)16 * warps * (C + 8) * 2, st = (size_t)C * (nc + 8) * 2, ys = (size_t)16 * warps * (nc + 8) * 2;
-  return st + (xr > st + ys ? xr : st + ys);
-}
 template <int WARPS, int NCI = 64, int C = 128, int MT = 1>
 void gridInAt(const float* pair, const float* lnScale, const float* lnOffset, const half* Wq, const float* qb, half* out,
               int n, size_t q0, size_t rows, bool tr, const half* Wb, half* bias, int heads, int stride, bool swap,

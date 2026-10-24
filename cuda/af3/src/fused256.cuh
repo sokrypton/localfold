@@ -495,9 +495,9 @@ template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false,
           int MINB = ((C == 128 && WARPS == 4 && MT == 2) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
                    : (C == 256 && WARPS == 8 && XROUNDS == 1 && MT == 1) ? 2 : 1>
 #if LF_REG_STAGES
-__global__ void __launch_bounds__(WARPS * 32, (C == 128 && WARPS == 4 && MT == 2) ? 2 : 1)
+__global__ void __launch_bounds__(WARPS * 32, fitBlocks((C == 128 && WARPS == 4 && MT == 2) ? 2 : 1, triIn256Smem<TA>(C, WARPS, XROUNDS, MT)))
 #else
-__global__ void __launch_bounds__(WARPS * 32, MINB)
+__global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, triIn256Smem<TA>(C, WARPS, XROUNDS, MT)))
 #endif
 triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
