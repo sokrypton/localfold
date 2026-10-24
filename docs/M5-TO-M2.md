@@ -274,12 +274,14 @@ Pro to the M5's: same GPU family, same kernels, same order - only the fit check 
 `6mrr-x12-monomer` and fixed its cross-chain relpos: on the monomer every cross-chain pair took the multimer's row 65,
 which the monomer's weights have as zeros. Metal had the same bug - 55.97 pLDDT, 1.304 A; ported, 66.59 / 1.702 (CUDA
 69.09 / 1.788). The other six AF2 cases unchanged. WebGPU encodes chains as the +200 break and was never affected.
+Then `26c14ecf` (each chain's own query row in a single-sequence complex, through `cuda/featurise`, which Metal shares)
+took it to **79.11 / 1.033** (CUDA 79.29 / 0.917, ColabFold 80.7 / 0.97); the M5's baseline is that.
 
 ### Asks for the M2
 
 ```bash
 git pull --rebase origin opus-55-opt && bash metal/build.sh selftest bench af2 af3 ef2 bioemu2
-python3 metal/af2/gate.py --only=6mrr-x12-monomer    # NEW: expect ~66 pLDDT, not ~56 (the bug)
+python3 metal/af2/gate.py --only=6mrr-x12-monomer    # NEW: expect ~79 pLDDT (~56 is the relpos bug)
 python3 metal/af2/gate.py --write --only=6mrr-x12-monomer
 python3 metal/bench/gate.py --write                  # records bench-baseline.m2-10c.json
 python3 metal/bench/gate.py                          # ok at ~1.0x
