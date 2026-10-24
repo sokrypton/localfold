@@ -192,15 +192,62 @@ runDesign({ fold, design, spec }) -> async generator of cycles
 
 New file, `design.html`. **`web/hunter.js` is not reused.**
 
-- **Style is `index.html`'s**: `web/vendor/py2Dmol.app.css` plus `web/localfold.css`, light. 🔴 **Not**
-  `web/style.css`, the dark theme the withheld pages used. Every rule anchored to an id or class this project
-  introduces; the existing palette, the 600 + 8 + 340 shell, the 58 px inputs.
-- **One viewer**: py2Dmol, as `index.html` has it. Not Mol*.
-- **Controls** follow v1's set (target, binder length, cycles, runs, seed, percent-`X`, temperature, omit, designer
-  picker with a visible reason for the automatic choice) plus the ensemble picker. Read
-  `sokrypton/mpnn`'s `app/constrainttable.js` before designing fixed/tied-position UI.
-- **Held off the live site** via `OPTIONAL` in `build_site.py`, and `tools/mobile-layout.py` already prints
-  "not present, skipped" for a page that is absent.
+**The goal is an interface as easy as `index.html`'s, highly interactive, with enough visual feedback that it is
+always obvious what the machine is doing.** That is a harder target here than for folding, and for one reason: a
+fold is a single action with one answer, while a hunt is minutes of nested work — runs, then cycles, then a fold and
+a design inside each cycle. 🔴 **An interface that only shows the final answer is wrong for this.** Every cycle must
+land something visible the moment it exists, and at any instant the page should answer three questions without being
+asked: *what is it doing now*, *what has it found so far*, and *why did it keep or reject the last thing*.
+
+### Style
+
+- `index.html`'s light theme: `web/vendor/py2Dmol.app.css` plus `web/localfold.css`. 🔴 **Not** `web/style.css`, the
+  dark theme the withheld pages used.
+- Every rule anchored to an id or class this project introduces; the existing palette, the 600 + 8 + 340 shell, the
+  58 px inputs, option rows content-sized rather than hand-sized.
+- One viewer: py2Dmol, as `index.html` has it. Not Mol*.
+
+### What has to be visible
+
+| | shown as |
+|---|---|
+| Where the run is | run *i* of *n*, cycle *k* of *m*, and which of fold / design is in flight |
+| **Which model folded this cycle** | named per cycle — with ensembles the folder rotates, and a result is meaningless without it |
+| The sequence changing | a residue track per cycle, the `X` positions visibly filling in |
+| **What is being decided, and what is not** | per-residue roles coloured in both the 3D view and the track: free, fixed, tied, motif, target |
+| Why a cycle won | its objective, against the best so far |
+| **Why a cycle was rejected** | the physical number, not a verdict: `ring 3.87 Å`, `0/12 Watson-Crick pairs`, `framework RMSD 17.6 Å` |
+| The whole hunt | every cycle a frame, so it plays back — v1 did this and it is worth keeping |
+
+That rejection row is the one most likely to be cut for time and the one worth keeping most: a model can score
+itself well and produce the wrong molecule, so a page that reports only the objective is a page that lies.
+
+### Input should be picking, not typing
+
+Hotspots, epitope contacts, fixed positions and motif residues are all *sets of residues*. Typing `54,56,58` is the
+v1 interface and it is the part least like `index.html`'s ease. **Picking them in the viewer is the target.**
+`sokrypton/rfd4-proteina-webgpu` already went this way — its guide documents picking in the viewer, a query
+language, selection paths and PyMOL commands — so the idea is proven in this family of pages; scale it down to what
+a design page needs rather than adopting the whole editor.
+
+### py2Dmol is ours, so the viewer can change to suit this
+
+🔴 **Beerware, `so3@mit.edu`** — "do whatever you want with this stuff" as long as the notice is retained. So where
+the viewer is the limiting factor, the answer is to extend it rather than work around it. What this page is likely
+to need and should be checked for first: per-residue colouring by *role* rather than by value, a frame API that
+takes a labelled cycle, and residue picking that emits a selection the page can read.
+
+🔴 **The vendored copy is a mirror and must not be edited in place.** `web/vendor/SOURCE.md` pins
+`sokrypton/py2Dmol` by commit; the workflow is to change it upstream, rebuild its bundle, re-run
+`python3 tools/sync-py2dmol.py`, and check with `--check`. Editing `web/vendor/py2Dmol.full.min.js` directly is how
+a change gets silently reverted by the next sync.
+
+### UI already written, and ours to reuse
+
+`sokrypton/mpnn`'s own page has the pieces a design UI needs and this repository has never taken: a sequence view, a
+residue trace, and a **constraint table** — which is the fixed/tied-position interface, already built against the
+same engine. Read those before designing ours. They are not in the mirror: `sync-mpnn.py` copies only the import
+closure, not the app.
 
 ---
 
@@ -246,6 +293,8 @@ Each step ends green and is committed before the next begins.
 
 1. **Scaffold and the page shell.** `design.html` in the light style, the ensemble and designer pickers, no loop
    wired. Gate: `npm run test:site` resolves it, `tools/mobile-layout.py` passes.
+   Alongside it, audit py2Dmol for the three things section 5 needs - role colouring, a labelled frame API, residue
+   picking - and record which already exist, since that decides whether the viewer needs an upstream change early.
 2. **The RunSpec.** aminx's field names and semantics on our engine, with her attribution in place; fixed and tied
    positions reaching `cpu/design/mpnn/`. Gate: a seeded RunSpec reproduces its sequence exactly; new bridge tests.
    **Unlocks** inverse folding, and is the primitive antibody mode and motif scaffolding are built on.
@@ -295,5 +344,6 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 | Is the goal a product site, or a tool beside the folder? | Sergey | section 1's repository choice |
 | `sync-mpnn.py --check` against `sokrypton/mpnn` HEAD | worker | step 2 |
 | Whether Marielle will export LigandMPNN and NA-MPNN to the browser | Sergey / Marielle | would change 3B's trade entirely |
+| Does py2Dmol already do role colouring, labelled frames and residue picking? | worker | how much of section 5 needs an upstream change |
 | How geometric conditioning works - template, contact term, or an RMSD-to-motif term in the objective | unassigned | motif scaffolding, enzyme design |
 | Does `partial_diffusion` have a Hunter analogue? Read her `13_warmstart.py` | unassigned | that one modality |
