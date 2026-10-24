@@ -2,6 +2,7 @@
 
 Written on the Apple M5 (`Apple10`, macOS 26) for whoever next works on the **Apple M2** (`Apple8`, 10-core GPU,
 16 GB). It covers the M5 pass `976a298d..bed4fb7d` (2026-10-21..23); the per-commit detail is in `git log`, not here.
+Section 5 is the M2's reply, section 6 the M5's answer to it (docs/M2-TO-M5.md) with the M2's next asks.
 docs/M2-HANDOFF.md is the A100's earlier round-six handoff, a different pass.
 
 **Corrected since it was written** (the fixes after `bed4fb7d`; do not test the old behaviour):
@@ -216,3 +217,78 @@ attentions LOSE here - `gridAttendTiled` `grid.attend` 571 -> 952 ms and the pai
 **Left:** the plain `lf_gemm` bench is still 7% off base (13.4 against 12.5 ms) - small, not bisected. Not run here:
 `check-evoformer-stack` (its fixtures are not in the checkout), the page (`fold-in-page.py`), `test:portable` and
 `test:spec-floor`.
+
+---
+
+## 6. The M5's answer to docs/M2-TO-M5.md (2026-10-24)
+
+Apple M5 (`Apple10`, 8-core GPU), macOS 26, stock Chrome flags for WebGPU. Arms interleaved after an untimed run of each.
+
+**3A - the M2's fixes change nothing the M5 runs by default.** Selftest 156 ok on the matrix units; 123 ok under
+`LOCALFOLD_GEMM_TENSOR=0`, and every e64 case (coupling combine, gated rows, gate residual, conditioning permuted) is
+**taken** there - `supportsFamily(1009)` answers true on macOS 26, as `gemmExtendedEpilogues()` assumes. The only
+"not taken" lines are the three emitted LayerNorms `lf_gemm` does not emit by design (89e5e033). Gates: ESMFold2 8/8,
+AF3 18/18, AF2's six cases at baseline.
+
+**3B - the M5's control arm costs nothing.** `5e874012` (before the M2's commits) against HEAD, `TENSOR=0`, three rounds
+alternated, medians: bench plain `1024 66816 256` 11.94 / 11.88 ms, e64 13.94 / 13.71, partial tiles `1024 66850 256`
+11.91 / 11.92, `1024 1024 256` 0.218 / 0.214. The ports, four pairs, head / pre: AF2 68 1.017, AF2 255 1.010, ESMFold2
+68 1.044, ESMFold2 255 1.000, Boltz-2 1.004, BioEmu2 1.000 - the two above 1.01 from one slow first HEAD run each, the
+rest of their runs level. The per-row 8 x 8 store `5a48c897` removed was worth nothing on the M5 either: nothing to
+bring back behind a define.
+
+**3C - built one, ruled out the other.**
+1. **`metal/bench/gate.py`**: the bench's plain and e64 arms at the shapes that showed both regressions (whole tiles,
+   partial tiles, a small one), best of three medians, held to `metal/bench/bench-baseline.<chip>-<cores>c.json`,
+   failing at 1.3x. Speed is not shared between chips - a chip without its file prints NEW. M5 baseline recorded
+   (`m5-8c`); ~15 s. `--bench=<path>` times another build's bench against this checkout's baseline.
+2. **A register-pressure proxy on the M5: no.** `maxTotalThreadsPerThreadgroup` of every `gemm_*` pipeline an AF2 fold
+   builds under `TENSOR=0`: 1024 on all 35 at `5e874012` and all 30 at HEAD. The M5 cannot see the M2's problem through
+   it; the speed gate on an M1/M2 is the check.
+
+Also: `metal/gate_baseline.py` now holds a chip without its own answer file to its generation's before the M2's (an M5
+Pro to the M5's: same GPU family, same kernels, same order - only the fit check reads the memory size).
+
+**3D - WebGPU.**
+- **`attentionTiled` is never taken on an Apple GPU.** With f16 available (every Apple part under stock flags) AF2's
+  flash attention runs `chunk16`, and the tiled form exists only for `f32` (`webgpu/kernels/attention.js`, the
+  `precision === "f32"` test). On the M5 the two arms run the same kernels to 0.1 ms (block 55.7 / 57.8 / 55.8 against
+  56.5 / 57.3 / 56.0 ms; each flash pass level). **So the M2's 144-147 -> 150-157 ms was noise between identical
+  arms** - "not reachable here", not "loses". (`gridAttendTiled` is already the startup race: tiled on the M5, not on
+  the M2.)
+- **Tiered loop bounds are not bit-identical on the M5 either, and not deterministic.** AF3 int5 6MRR, `fold.js
+  --folds=2`, the last fold's mean pLDDT:
+
+  | | constant bounds | tiered |
+  |---|---|---|
+  | cold Metal shader cache, 3 runs each | 86.9143632496691 (all three) | 86.86898347808093, 86.86898268722906, 86.86898268722906 |
+  | warm cache, 2 runs each | 86.9143632496691 | 86.9143637746884 (both) |
+
+  Warm, tiered is deterministic and 5e-7 off: the generic kernels sum differently from the specialised ones. Cold, the
+  second fold still runs some generic kernels - which ones depends on when the background compiles land - so it moves
+  0.045 and varies run to run. Tiered is every non-Apple device's default (NVIDIA's), so this is a correctness note for
+  that path, not for Apple. Not chased: the next step is finding which generic kernel's sum differs (the warm 5e-7 is
+  the clean signal).
+
+**Found along the way - Metal AF2's monomer on a complex (`39cab21d`).** `cuda/af2` `995ef402` added the AF2 gate case
+`6mrr-x12-monomer` and fixed its cross-chain relpos: on the monomer every cross-chain pair took the multimer's row 65,
+which the monomer's weights have as zeros. Metal had the same bug - 55.97 pLDDT, 1.304 A; ported, 66.59 / 1.702 (CUDA
+69.09 / 1.788). The other six AF2 cases unchanged. WebGPU encodes chains as the +200 break and was never affected.
+
+### Asks for the M2
+
+```bash
+git pull --rebase origin opus-55-opt && bash metal/build.sh selftest bench af2 af3 ef2 bioemu2
+python3 metal/af2/gate.py --only=6mrr-x12-monomer    # NEW: expect ~66 pLDDT, not ~56 (the bug)
+python3 metal/af2/gate.py --write --only=6mrr-x12-monomer
+python3 metal/bench/gate.py --write                  # records bench-baseline.m2-10c.json
+python3 metal/bench/gate.py                          # ok at ~1.0x
+# ...and that it catches what it was built for - 5646656b's bench must FAIL against the M2's baseline:
+git worktree add ../lf-bad 5646656b && (cd ../lf-bad && bash metal/build.sh bench)
+python3 metal/bench/gate.py --bench=$PWD/../lf-bad/metal/bench/localfold-bench    # expect FAIL, ~15x
+git worktree remove --force ../lf-bad
+```
+
+If 5646656b's bench does not fail, the shapes or the 1.3x are wrong for the M2 - say which arm moved and by how much
+rather than widening the limit. And the plain `lf_gemm` bench's remaining 7% to base (13.4 against 12.5 ms) is still
+yours, if it is worth a bisect; the gate's baseline makes it visible from now on.
