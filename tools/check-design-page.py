@@ -426,6 +426,12 @@ def main():
               // the simplest job there is: one generated span, nothing given
               window.__designSpans.set([{ kind: 'generated', min: 100, max: 100 }]);
               document.getElementById('steps').value = '30';
+              // 🔴 A BEAM OF TWO, because one exercises none of the loop. The
+              // candidate loop, the per-candidate seed, the ranking and the
+              // single-best marker all only exist above one, and a beam of 1
+              // runs the same straight line the page ran before the control was
+              // honoured at all.
+              document.getElementById('beam').value = '2';
               document.getElementById('hunt').click();
               return 1;
             })()""")
@@ -436,6 +442,12 @@ def main():
                   status: document.getElementById('status-message').textContent,
                   failed: document.getElementById('status-message').classList.contains('error'),
                   rows: document.querySelectorAll('#results-body tr').length,
+                  best: document.querySelectorAll('#results-body tr.best').length,
+                  // The validity cell carries each candidate's own validation
+                  // sentence, which is the only per-candidate number the table
+                  // shows.
+                  verdicts: [...document.querySelectorAll('#results-body tr')]
+                    .map((tr) => tr.lastElementChild?.textContent ?? ''),
                   progress: document.getElementById('progress').value,
                   frames: (() => {
                     const entry = Object.values(window.py2dmol_viewers ?? {})[0];
@@ -443,12 +455,15 @@ def main():
                     return renderer?.objectsData?.[renderer?.currentObjectName]?.frames?.length ?? 0;
                   })(),
                 })"""))
-                if generated["failed"] or generated["rows"] > 0:
+                # 🔴 NOT "a row appeared": the first candidate draws its row
+                # immediately, so that would stop the clock while the second is
+                # still generating and read a half-finished beam as the result.
+                if generated["failed"] or "done" in generated["status"]:
                     break
                 time.sleep(3)
             print(f"  generate: {generated['status']}")
-            print(f"            rows={generated['rows']} frames={generated['frames']}"
-                  f" progress={generated['progress']}")
+            print(f"            rows={generated['rows']} best={generated['best']}"
+                  f" frames={generated['frames']} progress={generated['progress']}")
             if generated["failed"]:
                 bad.append(f"the generation failed: {generated['status']}")
             else:
@@ -468,6 +483,25 @@ def main():
                     bad.append("the generation drew no structure")
                 if generated["progress"] != 1:
                     bad.append(f"the bar ended at {generated['progress']}, not 1")
+                # Both candidates are drawn, and exactly one of them is marked -
+                # the same rule the hunt table has, because the leader changes
+                # as candidates arrive.
+                if generated["rows"] != 2:
+                    bad.append(f"a beam of 2 drew {generated['rows']} rows, expected 2")
+                if generated["best"] != 1:
+                    bad.append(f"{generated['best']} rows marked best, expected exactly 1")
+                if "best of 2" not in generated["status"]:
+                    bad.append("the status does not say the beam was ranked: "
+                               f"{generated['status']!r}")
+                # 🔴 AND THE TWO CANDIDATES MUST ACTUALLY DIFFER. The flow is
+                # deterministic given its seed, so if the per-candidate seed did
+                # not reach the engine the beam would draw ONE structure twice,
+                # rank it against itself, and satisfy every assertion above - N
+                # times the cost for one answer, silently. Two identical
+                # verdicts is what that looks like from here.
+                if len(set(generated["verdicts"])) < 2:
+                    bad.append("the beam's candidates are identical, so the seed is not"
+                               f" reaching the engine: {generated['verdicts']}")
 
         # 🔴 THE CONTACT VETO, PROVED BY ASKING FOR AN EPITOPE THAT CANNOT BE
         # TOUCHED. A filter that never fires is indistinguishable from no filter,
@@ -494,6 +528,12 @@ def main():
                 veto = json.loads(cdp.evaluate(ws, """JSON.stringify({
                   status: document.getElementById('status-message').textContent,
                   rows: document.querySelectorAll('#results-body tr').length,
+                  best: document.querySelectorAll('#results-body tr.best').length,
+                  // The validity cell carries each candidate's own validation
+                  // sentence, which is the only per-candidate number the table
+                  // shows.
+                  verdicts: [...document.querySelectorAll('#results-body tr')]
+                    .map((tr) => tr.lastElementChild?.textContent ?? ''),
                   rejected: document.querySelectorAll('#results-body tr.rejected').length,
                   validity: [...document.querySelectorAll('#results-body td.validity')]
                     .map((n) => n.textContent).join(' | '),
@@ -544,6 +584,12 @@ def main():
                       status: document.getElementById('status-message').textContent,
                       failed: document.getElementById('status-message').classList.contains('error'),
                       rows: document.querySelectorAll('#results-body tr').length,
+                  best: document.querySelectorAll('#results-body tr.best').length,
+                  // The validity cell carries each candidate's own validation
+                  // sentence, which is the only per-candidate number the table
+                  // shows.
+                  verdicts: [...document.querySelectorAll('#results-body tr')]
+                    .map((tr) => tr.lastElementChild?.textContent ?? ''),
                       designer: document.getElementById('designer-note').textContent,
                       button: document.getElementById('hunt').textContent.trim(),
                       last: [...document.querySelectorAll('#cycle-track > *')]
@@ -591,6 +637,12 @@ def main():
                       failed: document.getElementById('status-message')
                         .classList.contains('error'),
                       rows: document.querySelectorAll('#results-body tr').length,
+                  best: document.querySelectorAll('#results-body tr.best').length,
+                  // The validity cell carries each candidate's own validation
+                  // sentence, which is the only per-candidate number the table
+                  // shows.
+                  verdicts: [...document.querySelectorAll('#results-body tr')]
+                    .map((tr) => tr.lastElementChild?.textContent ?? ''),
                       button: document.getElementById('hunt').textContent.trim(),
                     })"""))
                     if ran["failed"] or (ran["button"] == "Generate" and ran["rows"] > 0):
