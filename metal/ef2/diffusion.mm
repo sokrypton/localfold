@@ -57,6 +57,8 @@ static const half* pairBiasWeights(int nb, int Cz, int H) {
   });
 }
 
+// the rows the step conditioning computes for K T rows: 16 at a time to 128, 64 past it (the GEMM tiles it takes)
+static size_t condRows(size_t KT) { return KT <= 128 ? (KT + 15) / 16 * 16 : (KT + 63) / 64 * 64; }
 Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
   Denoiser d{};
   d.T = T; d.A = A; d.Cz = (int)M.meta("meta/pairChannels"); d.Ct = (int)M.meta("meta/tokenChannels2");
@@ -179,8 +181,12 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
     if (sb != d.sBase) copy(d.sBase, sb, (size_t)T * Ct * sizeof(float));
     releaseScratch({"dc.sn", "dc.sb"});
   }
-  d.single = allocT<float>(prows * Ct); d.snScaled = allocT<float>((size_t)(2 * nb + 1) * prows * Ct);
-  d.G = allocT<float>(prows * d.entries * Ct); d.scales = allocT<float>((size_t)(2 * nb + 1) * Ct);
+  // (sized by conditioningSteps' own rounding - its pKT at K = 1, T to 64 rows past 128 - because sample() hands these
+  // three to it whole when a step batch is one step, which is every fold past ~620 residues: sized to 16 rows, 660
+  // residues wrote past d.G and the fold died after the trunk)
+  size_t crows = condRows(T);
+  d.single = allocT<float>(crows * Ct); d.snScaled = allocT<float>((size_t)(2 * nb + 1) * crows * Ct);
+  d.G = allocT<float>(crows * d.entries * Ct); d.scales = allocT<float>((size_t)(2 * nb + 1) * Ct);
   for (int b = 0; b < nb; ++b)
     for (int k = 0; k < 2; ++k)
       copy(d.scales + (size_t)(2 * b + k) * Ct, F("diffusion/tokenBlocks/" + std::to_string(b) + (k ? "/transition/" : "/attention/") +
@@ -259,7 +265,7 @@ void prepareDiffusionWeights() {
 
 static void conditioningSteps(const Denoiser& d, const float* levels, int K, float* single, float* G, float* sTok) {
   int T = d.T, Ct = d.Ct, nb = d.tokenBlocks, n = 2 * nb, ld = d.entries * Ct;
-  size_t KT = (size_t)K * T, pKT = KT <= 128 ? (KT + 15) / 16 * 16 : (KT + 63) / 64 * 64;
+  size_t KT = (size_t)K * T, pKT = condRows(KT);
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", (size_t)K * nf); float* noise = scratch<float>("dc.noise", (size_t)K * Ct);
   run1d("ef2_fourier", (size_t)K * nf, FourierArgs{F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), levels, four, (uint)nf, (uint)K});
@@ -441,7 +447,7 @@ static void setLevel(const Denoiser& d, float t) {
 }
 void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised) {
   setLevel(d, t);
-  float* sTok = scratch<float>("dn.sTok", (((size_t)d.T + 15) / 16 * 16) * d.Ct);
+  float* sTok = scratch<float>("dn.sTok", condRows(d.T) * d.Ct);
   conditioningSteps(d, d.level, 1, d.single, d.G, sTok);
   denoiseStep(d, xNoisy, xDenoised, d.level, d.G, sTok);
 }
@@ -569,7 +575,7 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
                                       : std::max(1, std::min(steps, (int)(((size_t)320 << 20) / std::max<size_t>(stepBytes, 1))));
   int batches = std::max(1, (steps + maxK - 1) / maxK);
   int batchK = std::max(1, (steps + batches - 1) / batches);
-  size_t bKT = (size_t)batchK * d.T, pBatchRows = bKT <= 128 ? (bKT + 15) / 16 * 16 : (bKT + 63) / 64 * 64;
+  size_t pBatchRows = condRows((size_t)batchK * d.T);
   float* bSingle = batchK == 1 ? d.single : scratch<float>("dn.bsingle", pBatchRows * d.Ct);
   float* bG = batchK == 1 ? d.G : scratch<float>("dn.bG", pBatchRows * d.entries * d.Ct);
   float* bSTok = scratch<float>("dn.bsTok", pBatchRows * d.Ct);
