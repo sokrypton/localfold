@@ -59,7 +59,9 @@ struct Be2CsWqArgs { CP(half) w1; CP(half) w2; DP(half) out; uint C, I, off, K; 
 // the denoiser's conditioning a group of layers at a time (denoise.mm, condGroup): out[j][r] = silu(LN(c[r]) w[l0 + j] +
 // b[l0 + j]) in half - every layer conditions on the same rows, only its LayerNorm's affine is its own; w, b stacked
 // [layers][C] (b null: none). A simdgroup a row. Then the bias add over the batch: y[j][r][o] += bias[l0 + j][o]
-struct Be2CondInArgs { CP(float) c; CP(float) w; CP(float) b; DP(half) out; u64 rows; uint Rc, C, l0, nLayers; };
+// (silu: SiLU(LN(c) w + b) - the conditioning's input; 0: LN(c) w + b alone - the pair's norm. Its own flag: the
+// 128-wide path once read a missing bias as no SiLU, which a checkpoint without cond_0/bias would have lost)
+struct Be2CondInArgs { CP(float) c; CP(float) w; CP(float) b; DP(half) out; u64 rows; uint Rc, C, l0, nLayers, silu, pad0; };
 struct Be2BatchBiasArgs { DP(float) y; CP(float) bias; u64 n; uint Rc, O, l0, pad0; };
 struct Be2TokensToAtomsArgs { CP(float) tok; CP(int) atomTok; CP(int) pad; DP(float) out; u64 N; uint T, C, ldo, samples;
                               float beta; uint pad0; };

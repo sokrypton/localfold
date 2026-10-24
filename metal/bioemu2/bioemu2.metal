@@ -673,11 +673,8 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
     for (uint j = 0; j < a.nLayers; ++j) {
       device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 128);
       float4 n = nv * w4[lane];
-      if (a.b) {
-        device const float4* b4 = (device const float4*)(a.b + (ulong)(a.l0 + j) * 128);
-        n += b4[lane];
-        n = n / (1.f + exp(-n));
-      }
+      if (a.b) n += ((device const float4*)(a.b + (ulong)(a.l0 + j) * 128))[lane];
+      if (a.silu) n = n / (1.f + exp(-n));
       ((device half4*)(a.out + ((ulong)j * a.Rc + row) * 128))[lane] = half4(n);
     }
     return;
@@ -692,8 +689,14 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
     for (uint j = 0; j < a.nLayers; ++j) {
       device const float4* w4 = (device const float4*)(a.w + (ulong)(a.l0 + j) * 256);
       device half4* o4 = (device half4*)(a.out + ((ulong)j * a.Rc + row) * 256);
-      o4[lane] = half4(n0 * w4[lane]);
-      o4[lane + 32] = half4(n1 * w4[lane + 32]);
+      float4 m0 = n0 * w4[lane], m1 = n1 * w4[lane + 32];
+      if (a.b) {
+        device const float4* b4 = (device const float4*)(a.b + (ulong)(a.l0 + j) * 256);
+        m0 += b4[lane]; m1 += b4[lane + 32];
+      }
+      if (a.silu) { m0 = m0 / (1.f + exp(-m0)); m1 = m1 / (1.f + exp(-m1)); }
+      o4[lane] = half4(m0);
+      o4[lane + 32] = half4(m1);
     }
     return;
   }
@@ -721,7 +724,7 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
         const uint idx = lane + 32 * k;
         float4 n = xv[k] * w4[idx];
         if (b4) n += b4[idx];
-        out4[idx] = half4(n / (1.f + exp(-n)));
+        out4[idx] = half4(a.silu ? n / (1.f + exp(-n)) : n);
       }
     }
     return;
@@ -751,7 +754,7 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
       const uint idx = lane + 32 * k;
       float4 n = (xv[k] - mean) * inv * w4[idx];
       if (b4) n += b4[idx];
-      out4[idx] = half4(n / (1.f + exp(-n)));
+      out4[idx] = half4(a.silu ? n / (1.f + exp(-n)) : n);
     }
     return;
   }
@@ -764,7 +767,7 @@ kernel void be2_cond_in(LF_ARGS(Be2CondInArgs)) {
     float n = (x[c] - mean) * inv;
     n *= w[c];
     if (b) n += b[c];
-    a.out[row * a.C + c] = (half)lf_silu(n);
+    a.out[row * a.C + c] = (half)(a.silu ? lf_silu(n) : n);
   }
 }
 kernel void be2_batch_bias(LF_ARGS(Be2BatchBiasArgs)) {

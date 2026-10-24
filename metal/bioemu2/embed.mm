@@ -55,7 +55,7 @@ float* layerCond(const CondLayer& L, const float* c, int Rc, int Cc, int D, cons
     if (pR > Rc) fill(cnh + (size_t)Rc * Cc, 0, (size_t)(pR - Rc) * Cc * 2);
     const size_t groups = ((size_t)Rc + 7) / 8;
     run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-        Be2CondInArgs{c, Wf(L.p + "cond_0/weight"), WfOpt(L.p + "cond_0/bias"), cnh, (u64)Rc, (uint)Rc, (uint)Cc, 0, 1});
+        Be2CondInArgs{c, Wf(L.p + "cond_0/weight"), WfOpt(L.p + "cond_0/bias"), cnh, (u64)Rc, (uint)Rc, (uint)Cc, 0, 1, 1, 0});
     linT(cnh, L.p + "cond_2/weight", cond, pR, Cc, 6 * D);
     if (const float* b2 = WfOpt(L.p + "cond_2/bias"))
       be2Run1d("be2_batch_bias", (size_t)Rc * 6 * D, Be2BatchBiasArgs{cond, b2, (u64)Rc * 6 * D, (uint)Rc, (uint)(6 * D), 0, 0});
@@ -207,7 +207,7 @@ void inputEmbedder(float* sInputs, int Si, const Tap& tap) {
       half* cnh = scratch<half>("be2.ie.cnh", (size_t)ieLayers * N * C);
       const size_t groups = ((size_t)N + 7) / 8;
       run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-          Be2CondInArgs{c, cw0, cb0, cnh, (u64)N, (uint)N, (uint)C, 0, (uint)ieLayers});
+          Be2CondInArgs{c, cw0, cb0, cnh, (u64)N, (uint)N, (uint)C, 0, (uint)ieLayers, 1, 0});
       float* condAll = scratch<float>("be2.ie.condAll", (size_t)ieLayers * N * 6 * C);
       std::vector<u64> X(ieLayers), Wp(ieLayers), Y(ieLayers);
       for (int i = 0; i < ieLayers; ++i) {

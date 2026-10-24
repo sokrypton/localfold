@@ -141,7 +141,7 @@ Denoiser staticContext(const float* sTrunk, const float* zTrunk, const float* sI
     float* proj = scratch<float>("be2.tb.proj", (size_t)d.layers * P * Ht);
     const size_t groups = (P + 7) / 8;
     run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-        Be2CondInArgs{d.z, tbNorm, nullptr, znh, (u64)P, (uint)P, (uint)C, 0, (uint)d.layers});
+        Be2CondInArgs{d.z, tbNorm, nullptr, znh, (u64)P, (uint)P, (uint)C, 0, (uint)d.layers, 0, 0});
     Gemm G{}; G.X = znh; G.tx = F16; G.sx = (int64_t)P * C; G.W = tbProj; G.tw = F16; G.transW = true; G.sw = (int64_t)Ht * C;
     G.Y = proj; G.ty = F32; G.sy = (int64_t)P * Ht; G.rows = P; G.in = C; G.out = Ht; G.batch = d.layers; G.label = "tb proj_z";
     gemm(G);
@@ -321,7 +321,7 @@ static void condGroup(const float* cndP, const float* cndT, int T, int K, int Dt
     const bool loopLayers = Dt == 768 && Rc >= 256;
     const size_t rows = loopLayers ? (size_t)Rc : (size_t)n * Rc, groups = (rows + 7) / 8;
     run("be2_cond_in", Grid{(uint32_t)std::min<size_t>(groups, 65535), (uint32_t)((groups + 65534) / 65535), 1}, 256,
-        Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, loopLayers ? (uint)n : 0});
+        Be2CondInArgs{cnd, w, b, cin, (u64)rows, (uint)Rc, (uint)Dt, (uint)l0, loopLayers ? (uint)n : 0, 1, 0});
     std::vector<u64> X, Wp, Y;
     for (int j = 0; j < n; ++j) {
       X.push_back((u64)(cin + (size_t)j * Rc * Dt));
@@ -344,12 +344,13 @@ static void condGroup(const float* cndP, const float* cndT, int T, int K, int Dt
 struct RowMaps { int samples = 0; int* atomTok = nullptr; int* tok = nullptr; };
 static RowMaps ROW_MAPS;
 static std::vector<float> SIGMA_SCHED;
-static int SIGMA_NEXT = 0, SIGMA_BATCH_I0 = -1, SIGMA_BATCH_K = 0, SIGMA_MAX_K = 1;
+static int SIGMA_NEXT = 0, SIGMA_BATCH_I0 = -1, SIGMA_BATCH_K = 0, SIGMA_MAX_K = 0;
+static bool SIGMA_BATCH_QB = false;     // (the window's coupling RB: built by a call that took the split)
 static const float* SIGMA_SC0 = nullptr;
 void setSigmaSchedule(const float* sigmas, int n) {
   if (sigmas && n > 0) SIGMA_SCHED.assign(sigmas, sigmas + n);
   else SIGMA_SCHED.clear();
-  SIGMA_NEXT = 0; SIGMA_BATCH_I0 = -1; SIGMA_BATCH_K = 0; SIGMA_MAX_K = 1; SIGMA_SC0 = nullptr;
+  SIGMA_NEXT = 0; SIGMA_BATCH_I0 = -1; SIGMA_BATCH_K = 0; SIGMA_MAX_K = 0; SIGMA_SC0 = nullptr; SIGMA_BATCH_QB = false;
 }
 // 🔴 FORGOTTEN EVERY FOLD: the maps are this input's atoms' tokens, and a resident server's next job is another input -
 // keyed on the sample count alone, a second fold of the same count read the first one's (cuda/bioemu2's resident server
@@ -410,7 +411,7 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   // coupling RB ahead so their GEMMs run on K * T and 2 * K * (T + 1) rows instead of a single step's
   int curStep = -1, curK = 1, bi = 0;
   if (batchCond && G == d.layers && !SIGMA_SCHED.empty()) {
-    if (SIGMA_SC0 != d.sc0) { SIGMA_SC0 = d.sc0; SIGMA_BATCH_I0 = -1; SIGMA_NEXT = 0; }
+    if (SIGMA_SC0 != d.sc0) { SIGMA_SC0 = d.sc0; SIGMA_BATCH_I0 = -1; SIGMA_NEXT = 0; SIGMA_MAX_K = 0; SIGMA_BATCH_QB = false; }
     if (SIGMA_NEXT > 0 && SIGMA_SCHED[SIGMA_NEXT - 1] == sigma) curStep = SIGMA_NEXT - 1;
     else if (SIGMA_NEXT < (int)SIGMA_SCHED.size() && SIGMA_SCHED[SIGMA_NEXT] == sigma) curStep = SIGMA_NEXT++;
     else setSigmaSchedule(nullptr, 0);
@@ -421,16 +422,24 @@ void denoise(const Denoiser& d, const float* x, float sigma, float* den, const f
   float* cgQB = nullptr;
   if (curStep >= 0) {
     const int steps = (int)SIGMA_SCHED.size();
-    const size_t stepBytes = (size_t)d.layers * (perLayer + (csplit ? R * 4 * I * 4 : 0));
-    const int envK = getenv("BE2_COND_STEPS") ? std::max(1, atoi(getenv("BE2_COND_STEPS")))
-                                              : std::max(1, std::min(steps, (int)(((size_t)448 << 20) / std::max<size_t>(stepBytes, 1))));
-    const int batches = std::max(1, (steps + envK - 1) / envK);
-    SIGMA_MAX_K = std::max(1, (steps + batches - 1) / batches);
+    // 🔴 K ONCE A SCHEDULE, FROM THE SPLIT'S BYTES WHETHER OR NOT THIS CALL SPLITS: every batch of a step - 64 particles,
+    // then the remainder - reads one window, and the window's layout (a layer's stride in be2.cg.*) is K's. Taken per
+    // call, a 64 + 1 run's two calls asked for two K, the second reallocated the buffers under a window still marked
+    // built, and read them uninitialised (only where K < the step count: 68 tokens takes all 200 either way)
+    if (SIGMA_MAX_K <= 0) {
+      const size_t stepBytes = (size_t)d.layers * (perLayer + R * 4 * I * 4);
+      const int envK = getenv("BE2_COND_STEPS") ? std::max(1, atoi(getenv("BE2_COND_STEPS")))
+                                                : std::max(1, std::min(steps, (int)(((size_t)448 << 20) / std::max<size_t>(stepBytes, 1))));
+      const int batches = std::max(1, (steps + envK - 1) / envK);
+      SIGMA_MAX_K = std::max(1, (steps + batches - 1) / batches);
+    }
     for (int k = 0; k < 4; ++k)
       cg[k] = scratch<float>(std::string("be2.cg.") + COND_KINDS[k].key, (size_t)G * padRows((size_t)SIGMA_MAX_K * (T + COND_KINDS[k].rowsExtra)) * outC[k]);
     if (csplit) cgQB = scratch<float>("be2.cg.QB", (size_t)G * padRows((size_t)SIGMA_MAX_K * R) * 4 * I);
-    if (SIGMA_BATCH_I0 < 0 || curStep < SIGMA_BATCH_I0 || curStep >= SIGMA_BATCH_I0 + SIGMA_BATCH_K) {
+    // (and rebuilt where this call splits and the window was built by one that did not: it holds no coupling RB)
+    if (SIGMA_BATCH_I0 < 0 || curStep < SIGMA_BATCH_I0 || curStep >= SIGMA_BATCH_I0 + SIGMA_BATCH_K || (csplit && !SIGMA_BATCH_QB)) {
       SIGMA_BATCH_I0 = curStep;
+      SIGMA_BATCH_QB = csplit;
       SIGMA_BATCH_K = std::min(SIGMA_MAX_K, steps - curStep);
       const int K = SIGMA_BATCH_K;
       const size_t KT = (size_t)K * T, pKT = padRows(KT), pRK = padRows((size_t)K * R);
