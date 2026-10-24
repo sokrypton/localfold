@@ -393,7 +393,7 @@ engine*.
 | cyclic | 🔴 **blocked in the fold path, not here**: `cyclicPeriod` is READ by `cpu/af3/diffusion/atom-encoder.js` and produced by nothing, so the model takes the feature and no featuriser computes it | ❌ no preset; `cif.js` knows a `cyclic-pseudo-peptide` chain type |
 | PTM target | ✅ objective 0.356, a phosphoserine swapped in by CCD code | ⚠️ through a loaded structure that already carries it |
 | epitope / hotspots | ✅ one field, reached by a contact filter: fold, then reject a cycle that is not touching | ✅ the same field, as a bracketed `C_HOT` condition |
-| labelled spans (CATH, secondary structure) | ❌ | ⚠️ the editor has no row; it says so |
+| labelled spans (secondary structure) | ❌ nothing to condition on; it folds what the sequence gives | ✅ a span takes a label and a structure, and `custom_cath_monomer` round-trips with its `C_SEC` |
 
 `npm run test:design --cases` re-runs the Hunter column, asserting the automatic
 designer follows the job; `--generate` re-runs RFD4's unconditional case.

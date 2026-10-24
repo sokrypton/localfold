@@ -1461,3 +1461,6 @@
 
 /* Modified residues in a span, as position:code. */
 .contig-modified { width: 12ch; padding: 8px; }
+
+/* A generated span's label, the handle a condition selects it by. */
+.contig-name { width: 6ch; padding: 8px; }

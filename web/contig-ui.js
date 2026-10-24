@@ -39,6 +39,12 @@
 /** The kinds a span can be, in the order the picker lists them. */
 export const SPAN_KINDS = ["generated", "sequence", "segment", "ligand", "break"];
 
+/** What a contig calls each polymer, from SUFFIX_TO_CHAIN_TYPE in the pipeline. */
+export const SPAN_POLYMER_SUFFIX = { protein: "P", rna: "R", dna: "D" };
+
+/** The secondary structures a named span can ask for, as C_SEC's own keys. */
+export const SPAN_STRUCTURES = { "": "any", HELIX: "helix", LOOP: "loop", STRAND: "strand" };
+
 /** The chain letters the loop and the fold agree on, mirroring hunter-loop's. */
 export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -52,7 +58,8 @@ export const SPAN_LABELS = {
 
 /** What each kind is, shown as the picker's title. */
 export const SPAN_NOTES = {
-  generated: "Residues to design. Give one length, or a range for the method to choose from.",
+  generated: "Residues to design. Give one length, or a range for the method to choose from."
+    + " Name it to ask for a secondary structure.",
   sequence: "A chain you know the sequence of - protein, DNA or RNA. Protein Hunter folds it;"
     + " RFD4-Proteina needs its coordinates, so use \u201cFrom structure\u201d there.",
   segment: "Residues taken from a loaded structure, held as they are.",
@@ -75,6 +82,12 @@ export const METHOD_LIMITS = {
     range: "Protein Hunter folds one length at a time; a range needs a search over lengths.",
     ligand: "Protein Hunter has no pocket conditioning — a ligand changes the fold and the"
       + " designer, but is not conditioned on.",
+    // 🔴 A LABEL IS ONLY USEFUL TO SOMETHING THAT CONDITIONS ON IT. Hunter
+    // reaches a structure by folding a sequence; it has no way to be told "this
+    // stretch should be a helix", so a named span would be a control that did
+    // nothing.
+    labelled: "Protein Hunter cannot be asked for a secondary structure; it folds whatever"
+      + " the sequence gives.",
   },
   rfd4p: {
     // 🔴 THE GEOMETRY AXIS, AS A LIMIT. RFD4 generates coordinates AROUND given
@@ -101,7 +114,7 @@ const number = (value, fallback) => {
 /** A fresh span of `kind`, with defaults a reader would expect. */
 export function emptySpan(kind = "generated") {
   // (a given span is HELD by default; `redesign` is the opt-in)
-  if (kind === "generated") return { kind, min: 75, max: 75 };
+  if (kind === "generated") return { kind, min: 75, max: 75, name: "", secondary: "", polymer: "protein" };
   if (kind === "sequence") return { kind, value: "", polymer: "protein" };
   if (kind === "segment") return { kind, chain: "A", first: 1, last: 100, hotspots: "" };
   if (kind === "ligand") return { kind, code: "" };
@@ -138,7 +151,15 @@ export function spanToContig(span) {
   const max = number(span.max, min);
   if (!Number.isFinite(min) || min < 1) return null;
   if (!Number.isFinite(max) || max < min) return null;
-  return `${min}-${max}`;
+  // 🔴 A NAMED SPAN BECOMES A RESIDUE NAME, which is how a secondary-structure
+  // or CATH condition selects it: `sel('*/h1/*/*')` reads field two of the path,
+  // the res_name. So the label is not decoration - it is the only handle a
+  // condition has on a stretch of residues that does not exist yet.
+  const name = String(span.name ?? "").trim();
+  const suffix = SPAN_POLYMER_SUFFIX[span.polymer ?? "protein"] ?? "P";
+  if (name.length === 0) return `${min}-${max}`;
+  if (!/^[A-Za-z][A-Za-z0-9]*$/.test(name)) return null;
+  return `${name}:${min}-${max}${suffix}`;
 }
 
 /**
@@ -173,6 +194,9 @@ export function contigOf(spans, method = "rfd4p") {
       min += low;
       max += high;
       if (high !== low && limits.range !== undefined) problems.push(limits.range);
+      if (String(span.name ?? "").trim().length > 0 && limits.labelled !== undefined) {
+        problems.push(limits.labelled);
+      }
     } else if (span.kind === "segment") {
       if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
         problems.push(limits.hotspots);
@@ -282,10 +306,32 @@ export function conditionsOf(spans) {
     const seen = hot.get(chain) ?? [];
     hot.set(chain, [...seen, ...residues]);
   }
-  if (hot.size === 0) return undefined;
-  const select = [...hot.entries()]
-    .map(([chain, residues]) => `sel('${chain}/*/[${residues.join(",")}]/*')`);
-  return { C_HOT: { true: select.map((expression) => ({ select: expression })) } };
+  // 🔴 SECONDARY STRUCTURE IS ASKED FOR BY NAME, grouped by what was asked. The
+  // selections are OR-ed with `|` because that is what the shipped
+  // fold-conditioned preset does, and a condition takes one expression per arm.
+  const structures = new Map();
+  for (const span of spans) {
+    if (span.kind !== "generated") continue;
+    const name = String(span.name ?? "").trim();
+    const wanted = String(span.secondary ?? "").trim();
+    if (name.length === 0 || wanted.length === 0) continue;
+    structures.set(wanted, [...(structures.get(wanted) ?? []), name]);
+  }
+
+  const conditions = {};
+  if (hot.size > 0) {
+    conditions.C_HOT = {
+      true: [...hot.entries()].map(([chain, residues]) => ({
+        select: `sel('${chain}/*/[${residues.join(",")}]/*')`,
+      })),
+    };
+  }
+  if (structures.size > 0) {
+    conditions.C_SEC = Object.fromEntries([...structures.entries()].map(([wanted, names]) => [
+      wanted, [{ select: names.map((name) => `sel('*/${name}/*/*')`).join(" | ") }],
+    ]));
+  }
+  return Object.keys(conditions).length === 0 ? undefined : conditions;
 }
 
 /**
@@ -520,8 +566,26 @@ export function createContigList(rowsContainer, addButton, options = {}) {
         to.value = String(span.max ?? span.min ?? 75);
         to.title = "The longest. Leave it equal to design exactly one length.";
         bind(to, "max", (value) => number(value, 1));
+        const name = element("input", "entity-value contig-name");
+        name.value = String(span.name ?? "");
+        name.placeholder = "h1";
+        name.title = "A label for this span, so a condition can name it. Letters and digits.";
+        bind(name, "name", (value) => value.trim());
+        const secondary = element("select", "entity-picker");
+        secondary.title = "Ask RFD4-Proteina for this span's secondary structure. Needs a label.";
+        for (const [key, label] of Object.entries(SPAN_STRUCTURES)) {
+          const option = element("option", undefined, label);
+          option.value = key;
+          option.selected = (span.secondary ?? "") === key;
+          secondary.append(option);
+        }
+        secondary.addEventListener("change", () => {
+          spans[index] = { ...spans[index], secondary: secondary.value };
+          changed();
+        });
         fields.append(element("span", "contig-label", "residues"), from,
-          element("span", "contig-label", "to"), to);
+          element("span", "contig-label", "to"), to,
+          element("span", "contig-label", "as"), name, secondary);
         if (number(span.max, 0) !== number(span.min, 0) && limits.range !== undefined) {
           row.classList.add("contig-row-unavailable");
           fields.append(element("div", "option-note warn contig-reason", limits.range));

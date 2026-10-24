@@ -325,6 +325,50 @@ describe("the design job as a list of spans", () => {
   // before slashes, so a bare list conditions on its first residue alone and
   // says nothing about it. Two shipped presets were doing exactly that - see
   // test/rfd4p-selection.test.js.
+  // 🔴 A LABELLED SPAN IS THE HANDLE A CONDITION SELECTS A STRETCH BY, and this
+  // is the last thing the editor could not express: `sel('*/h1/*/*')` reads
+  // field two of the path, the res_name, so a span's label becomes the name of
+  // residues that do not exist yet. Held to the shipped fold-conditioned preset,
+  // contig AND conditions.
+  describe("labelled spans and the structure they ask for", () => {
+    const ROSSMANN = [
+      { kind: "generated", min: 16, max: 16, name: "h1", secondary: "HELIX" },
+      { kind: "generated", min: 4, max: 4, name: "l1", secondary: "LOOP" },
+      { kind: "generated", min: 8, max: 8, name: "s1", secondary: "STRAND" },
+      { kind: "generated", min: 4, max: 4, name: "l2", secondary: "LOOP" },
+      { kind: "generated", min: 14, max: 14, name: "h2", secondary: "HELIX" },
+      { kind: "generated", min: 8, max: 8, name: "s2", secondary: "STRAND" },
+    ];
+
+    it("builds custom_cath_monomer's contig and its C_SEC exactly", () => {
+      const preset = RFD4P_PRESETS.find((entry) => entry.id === "custom_cath_monomer");
+      expect(contigOf(ROSSMANN, "rfd4p").contig).toBe(preset.contig);
+      expect(conditionsOf(ROSSMANN).C_SEC).toEqual(preset.conditions.C_SEC);
+      expect(contigOf(ROSSMANN, "rfd4p").problems).toEqual([]);
+    });
+
+    it("suffixes the polymer, and refuses a name that is not a name", () => {
+      expect(spanToContig({ kind: "generated", min: 6, max: 6, name: "r1", polymer: "rna" }))
+        .toBe("r1:6-6R");
+      expect(spanToContig({ kind: "generated", min: 6, max: 6, name: "d1", polymer: "dna" }))
+        .toBe("d1:6-6D");
+      // an unnamed span is the plain form, unchanged
+      expect(spanToContig({ kind: "generated", min: 6, max: 6 })).toBe("6-6");
+      // ...and a label with a space or a leading digit is not a label
+      expect(spanToContig({ kind: "generated", min: 6, max: 6, name: "1h" })).toBe(null);
+      expect(spanToContig({ kind: "generated", min: 6, max: 6, name: "h 1" })).toBe(null);
+    });
+
+    // 🔴 AND HUNTER CANNOT BE ASKED. It reaches a structure by folding a
+    // sequence, so there is no way to tell it "this stretch should be a helix";
+    // a named span there would be a control that did nothing.
+    it("marks a labelled span unavailable on Protein Hunter", () => {
+      expect(contigOf(ROSSMANN, "hunter").problems).toContain(METHOD_LIMITS.hunter.labelled);
+      // an unnamed span of the same lengths is fine
+      expect(contigOf([{ kind: "generated", min: 16, max: 16 }], "hunter").problems).toEqual([]);
+    });
+  });
+
   describe("the conditions a span list asks for", () => {
     it("writes hotspots as a bracketed selection, per chain", () => {
       expect(conditionsOf([{ kind: "segment", chain: "A", first: 18, last: 132,

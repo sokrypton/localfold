@@ -535,6 +535,35 @@ def main():
             bad.append(f"the preset reported a problem: {loaded['problems']!r}")
         if loaded["button"] != "Generate":
             bad.append(f"the button says {loaded['button']!r} on RFD4, expected Generate")
+
+        # 🔴 AND THE FOLD-CONDITIONED PRESET, which the editor could not express
+        # at all until labelled spans existed - it used to refuse to load it
+        # rather than lose its labels. Its six named spans drive C_SEC, so the
+        # round trip has to rebuild the contig AND show what each asks for.
+        cath = json.loads(cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById('preset');
+          pick.value = 'custom_cath_monomer';
+          pick.dispatchEvent(new Event('change'));
+          return JSON.stringify({
+            contig: document.getElementById('contig-line').textContent.trim(),
+            problems: document.getElementById('contig-problems').textContent.trim(),
+            note: document.getElementById('preset-note').textContent.trim(),
+            rows: document.querySelectorAll('#contig-rows > *').length,
+            structures: [...document.querySelectorAll('#contig-rows select')]
+              .map((s) => s.value).filter((v) => v === 'HELIX' || v === 'LOOP' || v === 'STRAND'),
+          });
+        })()"""))
+        print(f"  preset custom_cath_monomer: rows={cath['rows']}"
+              f" structures={cath['structures']}")
+        print(f"        {cath['contig'][:80]}")
+        if not cath["contig"].startswith("h1:16-16P,l1:4-4P,s1:8-8P,l2:4-4P,h2:14-14P,s2:8-8P"):
+            bad.append(f"the labelled preset did not round-trip: {cath['contig']!r}")
+        if cath["rows"] != 6:
+            bad.append(f"the labelled preset filled {cath['rows']} rows, expected 6")
+        if cath["structures"] != ["HELIX", "LOOP", "STRAND", "LOOP", "HELIX", "STRAND"]:
+            bad.append(f"the secondary structures were not restored: {cath['structures']}")
+        if cath["problems"] != "":
+            bad.append(f"the labelled preset reported a problem: {cath['problems']!r}")
     finally:
         proc.terminate()
         server.terminate()

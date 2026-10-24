@@ -526,10 +526,20 @@ export const spansFromContig = (contig) => {
       spans.push({ kind: "generated", min: Number(piece), max: Number(piece) });
       continue;
     }
-    // 🔴 A LABELLED SPAN LIKE `h1:16-16P` IS NOT SOMETHING THIS EDITOR HAS A ROW
-    // FOR. It carries a name and a polymer type and drives the CATH and
-    // secondary-structure conditions, which is a whole feature; saying so beats
-    // loading a job that silently lost them.
+    // A labelled span - `h1:16-16P` - carries a name and a polymer type, and the
+    // name is the handle a secondary-structure or CATH condition selects it by.
+    const labelled = /^([A-Za-z][A-Za-z0-9]*):(\d+)-(\d+)([PRD])?$/.exec(piece);
+    if (labelled !== null) {
+      spans.push({
+        kind: "generated", name: labelled[1],
+        min: Number(labelled[2]), max: Number(labelled[3]),
+        polymer: { P: "protein", R: "rna", D: "dna" }[labelled[4] ?? "P"],
+        // 🔴 THE SECONDARY STRUCTURE IS RECOVERED FROM THE CONDITIONS, NOT THE
+        // CONTIG, because the contig carries only the name. Filled in below.
+        secondary: "",
+      });
+      continue;
+    }
     if (/^[A-Za-z0-9]+:/.test(piece)) return null;
     if (/^[A-Z0-9]{1,5}$/.test(piece)) { spans.push({ kind: "ligand", code: piece }); continue; }
     return null;
@@ -556,6 +566,18 @@ presetSelect.addEventListener("change", () => {
       + ` (${preset.contig}) — it would run a different job from the one it names.`;
     presetNote.classList.add("warn");
     return;
+  }
+  // 🔴 AND THE SECONDARY STRUCTURE IS PUT BACK ON THE SPANS, so a loaded preset
+  // shows what it asks for instead of an unexplained label. C_SEC's arms name
+  // the spans by `sel('*/h1/*/*')`, which is where these come from.
+  for (const [wanted, arms] of Object.entries(preset.conditions?.C_SEC ?? {})) {
+    for (const arm of arms) {
+      for (const match of String(arm.select ?? "").matchAll(/sel\('\*\/([A-Za-z0-9]+)\//g)) {
+        for (const span of spans) {
+          if (span.name === match[1]) span.secondary = wanted;
+        }
+      }
+    }
   }
   presetExtras = {
     conditions: preset.conditions,
