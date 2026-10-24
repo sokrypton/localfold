@@ -1348,7 +1348,9 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
         // whole waves of transitionUpK<CC, WU, NC, XR> inside a 512M-element budget where the card has the room (as ef2's
         // transition256): at 261 tokens (5CAJ) the 32M-element CHUNK/2 budget split each transition into 3 chunks
         // (624 GEMMs a fold), where 512M runs every block unchunked (208 GEMMs; opendde transition2 100.5 -> 70.8 ms
-        // and transitionUpK<384> 56.1 -> 45.0 ms, protenix2 transition 70.4 -> 61.6 ms).
+        // and transitionUpK<384> 56.1 -> 45.0 ms, protenix2 transition 70.4 -> 61.6 ms). The room asked for is only what
+        // the rows need under that cap, and a short pair takes CHUNK/2; a 144M cap instead cost 988 tokens on the A100
+        // (protenix2 trunk 11,457 -> 11,574 ms, opendde 20,663 -> 20,743) with roomFor already guarding long folds.
         // On a 99 KB shared-memory device (Blackwell sm_120, Ada sm_89), C = 512's 8-warp 32-column form (130 KB) does not
         // fit and previously fell back to the unfused 4-pass path (~112 ms/pass = ~450 ms/fold on intellifold2); the 8-warp
         // 16-column 4-round form (96.5 KB) runs on-chip at 72.3 ms/pass and is byte-identical (with FP8 triangle and direct
@@ -1356,7 +1358,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
         auto runUp = [&](auto wuTag, auto ncTag, auto xrTag) {
           constexpr int WU = decltype(wuTag)::value, NC = decltype(ncTag)::value, XR = decltype(xrTag)::value, R = 16 * WU;
           constexpr size_t smem = transitionUpSmem<CC, WU, NC, XR>();
-          const size_t full = std::min<size_t>(rows * I, (size_t)144 << 20);
+          const size_t full = std::min<size_t>(rows * I, (size_t)1 << 29);
           const size_t budget = (!shortPair(rows, C) && roomFor(full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
           size_t rowsPer = transitionUpChunkRows<CC, WU, NC, XR>(smem, std::max<size_t>(R, budget / I));
           if (PAIR16) {
