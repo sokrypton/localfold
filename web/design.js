@@ -126,6 +126,49 @@ folders.addEventListener("change", paintFolderNote);
 paintDesignerNote(entities.read());
 paintFolderNote();
 
+/**
+ * WHICH CONTROLS THE CHOSEN METHOD ACTUALLY HONOURS.
+ *
+ * 🔴 DISABLED WITH A REASON, NEVER REMOVED. A control that vanishes when the
+ * method changes teaches the reader nothing and makes them hunt for it again;
+ * one that greys out and says why teaches them what the two methods are. Each
+ * entry below is a control Protein Hunter uses and RFD4-Proteina does not,
+ * because RFD4 generates structure directly rather than folding and redesigning
+ * in a loop - so there is no cycle, no designer, and no folding model.
+ */
+const HUNTER_ONLY = {
+  designerGroup: "RFD4-Proteina writes its own sequence; there is no separate designer.",
+  folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
+  scheduleGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
+};
+
+const method = element("method");
+const methodNote = element("method-note");
+
+const paintMethod = () => {
+  const hunter = method.value === "hunter";
+  methodNote.textContent = hunter
+    ? "Folds a mostly-X sequence, redesigns on the hallucinated backbone, and re-folds. Needs a folding model."
+    : "Generates all-atom structure by flow matching, in one pass. Not wired into this page yet.";
+  methodNote.classList.toggle("warn", !hunter);
+  for (const [id, why] of Object.entries(HUNTER_ONLY)) {
+    const group = document.getElementById(id);
+    if (group === null) continue;
+    group.classList.toggle("unavailable", !hunter);
+    for (const control of group.querySelectorAll("select, input, button")) control.disabled = !hunter;
+    let reason = group.querySelector(".unavailable-reason");
+    if (reason === null) {
+      reason = document.createElement("div");
+      reason.className = "option-note unavailable-reason";
+      group.append(reason);
+    }
+    reason.textContent = hunter ? "" : why;
+  }
+};
+
+method.addEventListener("change", paintMethod);
+paintMethod();
+
 // 🔴 WHETHER A HUNT CAN RUN HERE AT ALL, SAID BEFORE IT IS TRIED. A hunt is
 // many folds; finding out on cycle one that this browser has no WebGPU is the
 // worst time to find out.
@@ -149,6 +192,8 @@ if (navigator.gpu === undefined) {
 // it says exactly what is missing.
 const status = element("status-message");
 element("hunt").addEventListener("click", () => {
-  status.textContent = "The design loop is not wired yet — this page is the shell. See docs/DESIGN.md.";
+  status.textContent = method.value === "hunter"
+    ? "The design loop is not wired yet — this page is the shell. See docs/DESIGN.md."
+    : "RFD4-Proteina is not wired here yet — its engine is in sokrypton/rfd4-proteina-webgpu. See docs/DESIGN.md.";
   status.classList.add("error");
 });

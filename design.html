@@ -46,19 +46,63 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
 
     <div class="mx-auto page-width" style="position: relative;">
 
-        <!-- WHAT TO DESIGN AGAINST, AND WHAT TO DESIGN. The target is an entity
-             list, exactly as index.html's fold input is - a type, a value and a
-             number of copies - because a design target is the same kind of
-             thing as a fold input and can be a ligand or a nucleic chain, which
-             no colon-separated string can express. The rows are built by
-             web/entity-ui.js; this is only where they go.
+        <!-- THE JOB, AS A LIST OF OBJECTS YOU ADD TO. Each object is a chain -
+             which in the general case is a CONTIG: an ordered run of spans,
+             some given and some to be made. That is RFdiffusion's own notion
+             and it describes Hunter's inputs too, which is why both methods can
+             share one input model (docs/DESIGN.md section 5).
 
-             🔴 THE BINDER IS NOT AN ENTITY ROW. It has no sequence yet - that
-             is the whole point - so it is described by its LENGTH and sits
-             apart from the things that already exist. v1 put a length box next
-             to a target textarea and that was the clearest part of it. -->
+             🔴 A SPAN HAS TWO INDEPENDENT AXES, GEOMETRY AND SEQUENCE, and
+             almost every modality is a combination of them: a target chain is
+             given/given, a binder is generated/free, a motif is given/given
+             inside a designed chain, inverse folding is given geometry with a
+             free sequence. Those pairs ARE the residue roles in the legend
+             below - one model, shown once, in the track and in the 3D view.
+
+             🔴 WHAT DIFFERS PER METHOD IS WHICH SPANS ARE LEGAL, NOT WHAT A
+             SPAN IS. Hunter cannot generate geometry: it hallucinates through a
+             folding model, so a generated span means "fold it from X and see",
+             and a length RANGE is not something it can express today. RFD4
+             generates geometry natively and takes ranges. The Method picker's
+             real job is to refuse the spans the chosen method cannot honour AND
+             SAY WHY.
+
+             🔴 TODAY THIS IS STILL index.html's ENTITY LIST - a type, a value
+             and a number of copies, built by web/entity-ui.js - which expresses
+             a whole given chain and a ligand but NOT a contig of spans. Spans
+             are the next piece of work on this page, not something already
+             here; see docs/DESIGN.md section 5. The binder's length therefore
+             still sits in its own control below rather than as a generated span
+             in a row. -->
         <div id="design-panel" class="container-box page-width" style="margin-bottom: 10px;">
             <div class="fetch-panel">
+
+                <!-- WHICH METHOD, FIRST, BECAUSE IT DECIDES WHAT THE REST MEAN.
+                     Two different machines behind one page: Protein Hunter
+                     hallucinates through a folding model, RFD4-Proteina
+                     generates all-atom structure by flow matching. They share
+                     the object list below, the viewer and the seed; they do not
+                     share a code path.
+
+                     🔴 THE CONTROLS BELOW CHANGE WITH IT, BUT WHAT IS SHARED
+                     STAYS PUT - the same rule index.html states about its own
+                     model picker: a control that moves when the method changes
+                     is a control the reader has to find again. A control the
+                     chosen method cannot honour is DISABLED WITH ITS REASON
+                     rather than removed, because a control that vanishes
+                     teaches nothing. -->
+                <div class="fetch-options" id="methodOptions">
+                    <div class="fetch-option-group" id="methodGroup">
+                        <span class="fetch-option-title">Method</span>
+                        <select id="method"
+                            title="How the design is made. Protein Hunter folds and redesigns in a loop; RFD4-Proteina generates structure directly.">
+                            <option value="hunter" selected>Protein Hunter</option>
+                            <option value="rfd4p">RFD4-Proteina</option>
+                        </select>
+                        <div id="method-note" class="option-note"></div>
+                    </div>
+                </div>
+
                 <div class="fetch-row" id="design-input-container">
                     <div class="entity-list">
                         <div id="entity-rows"></div>

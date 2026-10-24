@@ -100,6 +100,49 @@ def main():
         if "LigandMPNN" not in withLigand:
             bad.append(f"a ligand did not move the automatic designer: {withLigand!r}")
 
+        # ...and that switching method disables exactly the controls the other
+        # method cannot honour, WITH their reasons - greyed and explained, never
+        # removed, which is the page's own rule.
+        switched = json.loads(cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById("method");
+          pick.value = "rfd4p";
+          pick.dispatchEvent(new Event("change"));
+          const groups = ["designerGroup", "folderGroup", "scheduleGroup"];
+          return JSON.stringify({
+            note: document.getElementById("method-note")?.textContent?.trim() ?? "",
+            disabled: groups.filter((id) => {
+              const g = document.getElementById(id);
+              return g !== null && [...g.querySelectorAll("select, input")].every((c) => c.disabled);
+            }),
+            reasons: groups.filter((id) => (document.getElementById(id)
+              ?.querySelector(".unavailable-reason")?.textContent ?? "").length > 0),
+            stillThere: groups.filter((id) => {
+              const g = document.getElementById(id);
+              return g !== null && g.offsetParent !== null;
+            }),
+          });
+        })()"""))
+        print(f"  on RFD4-Proteina: {switched}")
+        for key in ("disabled", "reasons", "stillThere"):
+            if len(switched[key]) != 3:
+                bad.append(f"switching method: {key} covered {switched[key]}, expected all three groups")
+        if "flow matching" not in switched["note"] or "🔴" in switched["note"]:
+            # 🔴 AND THE REPO'S COMMENT MARKER MUST NOT REACH THE PAGE. It is a
+            # convention for source, not a thing to show a reader; it leaked into this
+            # very note once.
+            bad.append(f"the method note is wrong or carries a source marker: {switched['note']!r}")
+
+        # ...and switching back must re-enable them, or the page is a one-way door.
+        back = json.loads(cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById("method");
+          pick.value = "hunter";
+          pick.dispatchEvent(new Event("change"));
+          return JSON.stringify({ enabled: [...document.querySelectorAll(
+            "#designerGroup select, #folderGroup select, #scheduleGroup input")].every((c) => !c.disabled) });
+        })()"""))
+        if not back["enabled"]:
+            bad.append("switching back to Protein Hunter left controls disabled")
+
         # Pressing Hunt must explain itself rather than throw or do nothing.
         cdp.evaluate(ws, "document.getElementById('hunt').click()")
         time.sleep(0.3)

@@ -1327,3 +1327,12 @@
    a verdict with the number removed is the thing this page exists not to do. */
 #results-table tr.rejected td { color: #92400e; }
 #results-table td.validity { white-space: normal; }
+
+/* A control the chosen method cannot honour: greyed, still present, and
+   carrying its reason. 🔴 NOT display:none - a control that vanishes when the
+   method changes teaches the reader nothing and makes them look for it again. */
+#designOptions .fetch-option-group.unavailable > label,
+#designOptions .fetch-option-group.unavailable > .fetch-option-title { opacity: .45; }
+#designOptions .fetch-option-group.unavailable select,
+#designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
+.unavailable-reason { font-style: italic; }

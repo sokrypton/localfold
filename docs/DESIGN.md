@@ -27,14 +27,25 @@ this repository. Three things follow from putting it beside that stack rather th
 3. **The site build resolves the whole module graph** (`tools/build_site.py`) and has no bundler, so a page in
    another repository that imports this one's fold path would have to carry a mirror of it.
 
-**What argues the other way, and the condition that would flip this.** The established pattern in this project is
-one repository per tool, same conventions, each at its own Pages URL — `sokrypton/mpnn` and
-`sokrypton/rfd4-proteina-webgpu` are both that, and both self-contained. Hunter is not self-contained, which is why
-it is the exception. But if the goal is a **product** — one site offering hallucination and generative design behind
-one UI — then one repository is right, and the fold path gets mirrored in exactly as MPNN already is
-(`tools/sync-mpnn.py` + `cpu/design/mpnn/SOURCE.md`). 🔴 The cost of that is real and worth stating: the fold
-kernels are the fastest-moving part of this tree, and a design loop pinned to a stale mirror of them is a bad place
-to debug from. Decide the product question first; the rest of this document is unaffected by the answer.
+**🔴 AND THE CONDITION THAT FLIPS THIS HAS BEEN MET, so the table above is the reasoning and not the answer.**
+The page is to carry a **Method** picker - `{ProteinHunter, RFD4-Proteina}`, Protein Hunter the default - with the
+controls below it changing to suit (Sergey, 2026-10-24). One page offering both methods needs both engines reachable
+from it, and that is exactly the product case named here as the thing that would change the recommendation. So:
+
+- **RFD4-Proteina's ENGINE comes here**: its shared pipeline, its WebGPU engine and its float32 CPU reference, which
+  are already this repository's idiom and collide with nothing. Its parity checks come with it.
+- **Its PAGE does not.** AtomWorks Studio, Mol*, the Rust/wasm annotation studio and the nebula assets stay behind:
+  this page is `index.html`'s light theme with py2Dmol, and two viewer stacks in one page is a cost with no return.
+- **Its weights go where the other nine went** - Hugging Face, gitignored - because this repository's Pages build
+  carries 0.0 MiB of parameters and 423 MB of int8 shards in git would end that.
+- 🔴 **And NVIDIA's terms become this repository's problem.** Today every model here has terms that
+  `tools/model-terms.py` can express. An NVIDIA research checkpoint offered from the same page has to be expressible
+  the same way, and nobody has read those terms yet. **That is the real cost of merging, and it is the user's call,
+  not a detail to be absorbed quietly.**
+
+What does NOT change: the two methods remain different machines. Hunter hallucinates through a folding model and
+needs the fold stack; RFD4 generates and needs none of it. They share a page, an input model (below) and a viewer -
+not a code path.
 
 **Hygiene, so design can live here without touching what ships.** All four already exist as patterns:
 
@@ -215,8 +226,53 @@ a design inside each cycle. 🔴 **An interface that only shows the final answer
 land something visible the moment it exists, and at any instant the page should answer three questions without being
 asked: *what is it doing now*, *what has it found so far*, and *why did it keep or reject the last thing*.
 
-### Style
+### The input model: every object is a chain, and a chain is a contig
 
+🔴 **ONE INPUT MODEL FOR BOTH METHODS, AND IT IS THE PART WORTH GETTING RIGHT.** The page is a list of objects you
+add to, and each object is a chain — which in the general case is a *contig*: an ordered run of spans, some given and
+some to be made. That is RFdiffusion's own notion, and it turns out to describe Hunter's inputs too.
+
+A span has **two independent axes**, and almost every modality in section 6 is a combination of them:
+
+| | geometry | sequence |
+|---|---|---|
+| a target chain | given | given |
+| a binder | **generated** | **free** |
+| a motif | given | given |
+| the scaffold around a motif | **generated** | **free** |
+| inverse folding | given | **free** |
+| a ligand or nucleic target | given | given (or N/A) |
+
+Read down those two columns and the modality list stops being a list of features:
+
+- **protein binder** = one given chain + one object that is a single generated span of fixed length
+- **unconditional** = one object, one generated span, nothing else
+- **inverse folding** = one object, geometry given, sequence free — no generated span at all
+- **motif scaffolding** = one object, spans `[generated 5-15][given: motif][generated 10-30]`; *indexed* fixes where
+  the motif sits, *unindexed* leaves the generated lengths as ranges and lets the method choose
+- **antibody CDR** = one object whose framework spans are given and whose CDR spans are free in sequence
+- **enzyme design** = motif scaffolding plus a ligand object
+
+🔴 **AND THE SPAN AXES ARE THE RESIDUE ROLES.** The colours in the legend below are not a separate concept: `target`
+is given/given on a chain nobody designs, `motif` is given/given inside a designed one, `free` is sequence-free,
+`fixed` is a sequence-given position inside a free span. One model, shown once, in the track and in the 3D view.
+
+**What differs per method is which spans are legal, not what a span is.** Hunter cannot generate geometry — it
+hallucinates through a folding model, so a "generated" span means *fold it from X and see*, and a length RANGE is
+not something it can express today. RFD4 generates geometry natively and takes ranges. So the Method picker's real
+job is to grey out the spans the chosen method cannot honour, **and to say why** rather than silently dropping them.
+
+🔴 **A length RANGE on Hunter is the first thing that will be asked for and the first thing to refuse clearly.** v1
+took a single length; a range implies a search over lengths, which is a different loop and is not in section 7's
+order of work.
+
+### Layout and style
+
+- **A Method picker at the top** — `{ProteinHunter, RFD4-Proteina}`, Hunter the default — with the controls beneath
+  it changing to suit. 🔴 **What is shared stays put when the method changes**: the object list, the viewer, the
+  seed, the downloads. A control that moves when the method changes is a control the reader has to find again, which
+  is `index.html`'s own stated rule about its model picker. And a control the chosen method cannot honour is
+  disabled **with its reason**, not removed — a control that vanishes teaches nothing.
 - `index.html`'s light theme: `web/vendor/py2Dmol.app.css` plus `web/localfold.css`. 🔴 **Not** `web/style.css`, the
   dark theme the withheld pages used.
 - Every rule anchored to an id or class this project introduces; the existing palette, the 600 + 8 + 340 shell, the
