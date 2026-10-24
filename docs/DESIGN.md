@@ -79,6 +79,7 @@ not a code path.
 | `web/public/mpnn/` | **4** checkpoints at noise 0.2 (soluble, protein, ligand, NA), ~16 MB | checked in |
 | `design.html`, `web/design.js` | the page: a Method picker, the controls, and a row plus a sequence line per cycle | works, `npm run test:design` |
 | `web/hunt.js` | what makes the loop real: a true AF3 fold and MPNN redesign, with progress across the whole hunt | works, end to end in the gate |
+| `web/viewer.js` | the py2Dmol wrapper: builds on the first frame, appends the rest, keeps the camera. Written for the withheld pages; **`design.html` is the first page to load it** | works |
 | `tools/check-design-page.py` | loads the page, runs its module, requires the auto-designer to respond | works |
 | `web/hunter.js` | the v1 page | 🔴 **retire.** Its page was withheld (`.gitignore`) and is not in this checkout |
 | `tools/protein-hunter-in-page.py` | drives a real run over CDP and checks the table came back | works, needs a page |
@@ -326,7 +327,7 @@ order of work.
 | **What is being decided, and what is not** | per-residue roles coloured in both the 3D view and the track: free, fixed, tied, motif, target |
 | Why a cycle won | its objective, against the best so far |
 | **Why a cycle was rejected** | the physical number, not a verdict: `ring 3.87 Å`, `0/12 Watson-Crick pairs`, `framework RMSD 17.6 Å` |
-| The whole hunt | every cycle a frame, so it plays back — v1 did this and it is worth keeping |
+| The whole hunt | **done** — every cycle is a frame of one py2Dmol object, labelled `cycle_N`, so the play bar walks the hunt |
 
 That rejection row is the one most likely to be cut for time and the one worth keeping most: a model can score
 itself well and produce the wrong molecule, so a page that reports only the objective is a page that lies.

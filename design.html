@@ -278,6 +278,17 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
 
     </div>
 
+    <!-- 🔴 py2Dmol ITSELF, WHICH web/viewer.js NEEDS ON `window`. Without these
+         two the page runs a whole hunt, draws every row, and silently shows no
+         structure - the viewer's registry simply stays empty, which is how this
+         was found. index.html loads the same pair.
+
+         `align` is separate because it cannot be concatenated: it starts its
+         Worker by having the worker importScripts *itself*, found through
+         document.currentScript.src, which inlining leaves empty. It is what
+         superposes one cycle onto the next. -->
+    <script src="./web/vendor/py2Dmol.align.js"></script>
+    <script src="./web/vendor/py2Dmol.full.min.js"></script>
     <script type="module" src="./web/design.js"></script>
 
 </body>

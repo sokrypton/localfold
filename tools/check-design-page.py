@@ -179,6 +179,23 @@ def main():
               button: document.getElementById('hunt').textContent.trim(),
               progress: document.getElementById('progress').value,
               track: document.querySelectorAll('#cycle-track > *').length,
+              // 🔴 THE VIEWER'S OWN FRAME COUNT, from py2Dmol rather than from
+              // our bookkeeping: one frame a cycle is what makes the play bar
+              // walk the hunt, and a viewer that drew nothing would otherwise
+              // pass every other assertion here.
+              frames: (() => {
+                // 🔴 THE REGISTRY HOLDS A WRAPPER, NOT THE RENDERER. Each entry
+                // is { handleIncrementalStateUpdate, handleReplaceFrame,
+                // renderer } - reading frames off the wrapper gives 0 for a
+                // viewer that is working perfectly, which is what this check
+                // did until it was probed.
+                const registry = window.py2dmol_viewers ?? {};
+                const entry = Object.values(registry)[0];
+                const renderer = entry?.renderer ?? entry;
+                const name = renderer?.currentObjectName;
+                return renderer?.objectsData?.[name]?.frames?.length ?? 0;
+              })(),
+              viewerShown: document.getElementById('viewer-container').offsetParent !== null,
             })"""))
             if hunted["failed"]:
                 break
@@ -188,7 +205,8 @@ def main():
 
         print(f"  hunt: {hunted['status']}")
         print(f"        folded by: {hunted['folders']}")
-        print(f"        rows={hunted['rows']} track={hunted['track']} progress={hunted['progress']}"
+        print(f"        rows={hunted['rows']} track={hunted['track']} frames={hunted['frames']}"
+              f" progress={hunted['progress']}"
               f" best={hunted['best']}")
         # 🔴 A MISSING BUNDLE IS NOT A FAILING PAGE, AND IS NOT A SILENT PASS
         # EITHER. This box has model-af3-int5; another checkout may not, and the
@@ -206,8 +224,12 @@ def main():
             # rotating, and would look like a working ensemble.
             if hunted["folders"][:4] != ["af3", "opendde", "af3", "opendde"]:
                 bad.append(f"the folder did not rotate per cycle: {hunted['folders']}")
-            if hunted["track"] < 2:
+            if hunted["track"] < 4:
                 bad.append(f"the sequence track has {hunted['track']} lines, expected one per cycle")
+            if not hunted["viewerShown"]:
+                bad.append("the viewer stayed hidden through a finished hunt")
+            if hunted["frames"] < 4:
+                bad.append(f"the viewer holds {hunted['frames']} frames, expected one per cycle")
             if "done" not in hunted["status"]:
                 bad.append(f"the hunt did not finish: {hunted['status']!r}")
             if hunted["progress"] != 1:

@@ -20,6 +20,7 @@ import { createEntityList } from "./entity-ui.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
 import { MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
+import { createStructureViewer } from "./viewer.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -248,6 +249,12 @@ const drawCycle = (record) => {
   }
   resultsBody.append(row);
 
+  // 🔴 PUSHED BEFORE THE ROW IS DRAWN would be wrong: the viewer is built on
+  // its FIRST frame, and orienting it on that frame is what gives every later
+  // one a sensible camera. So push, then orient once, then draw.
+  viewerBox.style.display = "";
+  viewer.push(record.pdb, (built) => { if (built) viewer.orient(); });
+
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;
   // ...and the same for the track, for the same reason.
@@ -257,6 +264,21 @@ const drawCycle = (record) => {
   }
   track.append(line);
 };
+
+// 🔴 EVERY CYCLE IS A FRAME OF ONE OBJECT, so the play bar walks the whole hunt
+// and a design can be WATCHED arriving rather than inspected afterwards. v1 did
+// this and it is the single best thing about it.
+//
+// web/viewer.js is reused as it is: it owns building py2Dmol on the first frame,
+// appending the rest, and keeping the camera across rebuilds, and it
+// deliberately owns nothing about the prediction. (It was written for the two
+// withheld pages and nothing has loaded it since; this is the first page to.)
+const viewerBox = element("viewer-container");
+const viewer = createStructureViewer({
+  container: viewerBox,
+  frameLabel: "cycle",
+  onFail: (message) => say(`the viewer could not start: ${message}`, true),
+});
 
 let running = null;
 
@@ -271,6 +293,10 @@ const startHunt = async () => {
   huntButton.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
+  // A new hunt is a new object: the atom count changes with the binder's
+  // length, so frames cannot be shared with the last one.
+  viewer.cancelAnimations();
+  viewer.reset();
   say("starting");
   progress.value = 0;
   progress.dataset.state = "running";
