@@ -97,6 +97,10 @@ LOCALFOLD_LN_EMIT=1 ./metal/selftest/localfold-selftest
 python3 metal/af2/gate.py   # (and --write once: the 5caj-msa case has no M2 baseline yet, so it cannot fail there)
 python3 metal/ef2/gate.py
 python3 metal/af3/gate.py
+# (af3-kitchen-sink and af3-glycan are expected to read MOVED against an M2 baseline older than 2026-10-20: cb160ba0,
+#  AF3 dropping a glycan's O1 - exact against AF3's own batch - moved them on the M5 at that commit alone, kitchen sink
+#  pLDDT 70.61 -> 77.08, glycan 48.62 -> 48.25. If those two are the only moves, re-record them and the new 5caj-msa:
+#  python3 metal/af3/gate.py --write --only=af3-kitchen-sink,af3-glycan,af3-5caj-msa)
 python3 tools/check-native-worker.py --offline --no-af3 --no-page
 
 # 2. WebGPU differential checks & stock-Chrome suite

@@ -39,16 +39,16 @@
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.02,
-  "plddt": 48.98,
-  "ptm": "0.4251",
+  "ligand": 0.013,
+  "plddt": 48.31,
+  "ptm": "0.4333",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.049,
-  "nucleic": 0.047,
-  "plddt": 70.58,
-  "ptm": "0.6898",
+  "ligand": 0.043,
+  "nucleic": 0.045,
+  "plddt": 77.45,
+  "ptm": "0.8034",
   "rmsd": null
  },
  "boltz2-5caj-template": {
