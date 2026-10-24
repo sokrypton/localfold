@@ -106,9 +106,29 @@ export const ESMFOLD2_SAMPLER_MODE = "diffusion";
  */
 export const ESMFOLD2_ATOMISED_STEPS = 64;
 
-/** The scheduled step count a fold runs: the dial's, raised to the floor above for per-atom tokens. */
-export function esmfold2StepsFor(asked, { atomised = false } = {}) {
-  return atomised ? Math.max(asked, ESMFOLD2_ATOMISED_STEPS) : asked;
+/**
+ * ...and the same floor for a LONG input. Past ~2,048 residues the checkpoint's
+ * 15 scheduled steps (11 run) leave the backbone short: the denoiser's answer
+ * there is a shrunken chain, and 11 steps do not walk out of it. Copies of 6MRR
+ * on the 600M model, CA-CA outside 3.6-4.0 A (two seeds):
+ *
+ * | residues | 15 (11) | 25 (18) | 45 (32) |
+ * |---|---|---|---|
+ * | 2,040 | 0.3% | | |
+ * | 3,060 | 15.9% | **0.4%** | |
+ * | 4,080 | 91.5% | 9.4% | **0.1%** |
+ *
+ * and the sampler is a few percent of such a fold (11 steps 0.2 s against a
+ * 31 s trunk at 3,060; the wall clock the same at 15 and 25). Euler's update,
+ * not the exponential one, which is WORSE there - a shorter backbone at every
+ * count (docs/EF2FAST.md, "Long inputs"). python/localfold/worker.py and
+ * cuda/featurise/standalone.cpp apply it too.
+ */
+export const ESMFOLD2_LONG_RESIDUES = 2048;
+
+/** The scheduled step count a fold runs: the dial's, raised to the floor above for per-atom tokens or a long input. */
+export function esmfold2StepsFor(asked, { atomised = false, residues = 0 } = {}) {
+  return atomised || residues > ESMFOLD2_LONG_RESIDUES ? Math.max(asked, ESMFOLD2_ATOMISED_STEPS) : asked;
 }
 
 /**

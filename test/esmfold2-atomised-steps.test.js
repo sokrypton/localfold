@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
-import { ESMFOLD2_ATOMISED_STEPS, ESMFOLD2_COUNTS, esmfold2StepsFor } from "../web/esmfold2-model.js";
+import { ESMFOLD2_ATOMISED_STEPS, ESMFOLD2_COUNTS, ESMFOLD2_LONG_RESIDUES, esmfold2StepsFor } from "../web/esmfold2-model.js";
 import { SAMPLER_PRESETS } from "../webgpu/esmfold2/fold.js";
 
 /**
@@ -32,5 +32,30 @@ describe("ESMFold2's step floor for a ligand or a modified residue", () => {
     assert.ok(line !== null, "python/localfold/worker.py no longer states ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS");
     expect(Number(line[1])).toBe(ESMFOLD2_COUNTS.diffusion.preferred);
     expect(Number(line[2])).toBe(ESMFOLD2_ATOMISED_STEPS);
+  });
+});
+
+/**
+ * ...and the same floor for a long input: past ESMFOLD2_LONG_RESIDUES the checkpoint's eleven steps leave the backbone
+ * SHORT (copies of 6MRR: 15.9% of CA-CA out of band at 3,060 residues, 91.5% at 4,080; 0.4% and 0.1% with the floor).
+ * Three copies of the rule - the page, the worker, the native binary's standalone - held to one here.
+ */
+describe("ESMFold2's step floor for a long input", () => {
+  it("raises the dial past the length, and only past it", () => {
+    expect(esmfold2StepsFor(15, { residues: ESMFOLD2_LONG_RESIDUES })).toBe(15);
+    expect(esmfold2StepsFor(15, { residues: ESMFOLD2_LONG_RESIDUES + 1 })).toBe(ESMFOLD2_ATOMISED_STEPS);
+    expect(esmfold2StepsFor(200, { residues: 4080 })).toBe(200);
+  });
+
+  it("is the length python/localfold/worker.py and cuda/featurise/standalone.cpp apply", () => {
+    const worker = readFileSync(new URL("../python/localfold/worker.py", import.meta.url), "utf8");
+    const line = worker.match(/^ESMFOLD2_LONG_RESIDUES = (\d+)$/m);
+    assert.ok(line !== null, "python/localfold/worker.py no longer states ESMFOLD2_LONG_RESIDUES");
+    expect(Number(line[1])).toBe(ESMFOLD2_LONG_RESIDUES);
+    const native = readFileSync(new URL("../cuda/featurise/standalone.cpp", import.meta.url), "utf8");
+    const rule = native.match(/if \(atomised \|\| residues > (\d+)\) foldArgs\.push_back\("--steps=(\d+)"\);/);
+    assert.ok(rule !== null, "cuda/featurise/standalone.cpp no longer states its ESMFold2 step floor");
+    expect(Number(rule[1])).toBe(ESMFOLD2_LONG_RESIDUES);
+    expect(Number(rule[2])).toBe(ESMFOLD2_ATOMISED_STEPS);
   });
 });

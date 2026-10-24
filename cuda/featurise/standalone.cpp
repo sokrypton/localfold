@@ -332,13 +332,17 @@ static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
   for (auto& f : run.foldFlags()) foldArgs.push_back(f);
   // 🔴 THE PAGE'S FLOOR FOR PER-ATOM TOKENS: a ligand or a modified residue is torn at the checkpoint's 15 scheduled
   // steps (11 run) and whole at 64 (web/esmfold2-model.js ESMFOLD2_ATOMISED_STEPS; python/localfold/worker.py applies it too)
+  // - and for a long input, past 2,048 residues, whose backbone 11 steps leave short (ESMFOLD2_LONG_RESIDUES)
   if (run.args.option("steps").empty()) {
     bool atomised = !run.args.option("ligands").empty() || !run.args.option("smiles").empty() || !run.args.option("modify").empty();
+    size_t residues = 0;
+    for (auto& c : splitNonEmpty(run.args.option("sequence"), ':')) residues += c.size();
     if (!run.args.option("job").empty()) {
       Expanded request = expandEntities(jobFromJson(readFile(run.args.option("job"))).entities);
       atomised = atomised || !request.ligands.empty() || !request.modifications.empty();
+      for (auto& c : request.chains) residues += c.size();
     }
-    if (atomised) foldArgs.push_back("--steps=64");
+    if (atomised || residues > 2048) foldArgs.push_back("--steps=64");
   }
   std::vector<std::string> extra = {"--fold-bundle=" + trunk};
   for (auto& f : ccdFlag(run)) extra.push_back(f);

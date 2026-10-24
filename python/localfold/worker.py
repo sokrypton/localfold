@@ -49,8 +49,23 @@ WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR")     # (where fetch-weights
 # ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
 # (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
 ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
+# ...and the same floor past this many residues, whose backbone 11 steps leave short (ESMFOLD2_LONG_RESIDUES)
+ESMFOLD2_LONG_RESIDUES = 2048
 # BioEmu2's: the vendor's 200 (web/bioemu2-model.js BIOEMU2_DEFAULT_STEPS)
 BIOEMU2_DEFAULT_STEPS = 200
+
+
+def job_residues(text):
+    """An AlphaFold 3 job's polymer residues, every copy counted (web/app.js counts its chains' the same way)."""
+    spec = json.loads(text)
+    spec = spec[0] if isinstance(spec, list) else spec
+    total = 0
+    for entry in spec.get("sequences", []):
+        for kind, body in entry.items():
+            if kind in ("protein", "dna", "rna") and isinstance(body, dict):
+                ids = body.get("id", "A")
+                total += len(body.get("sequence", "")) * (len(ids) if isinstance(ids, list) else 1)
+    return total
 
 
 def atomised_job(text):
@@ -703,10 +718,11 @@ class Worker:
             dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
-            # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45
+            # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45 - and for
+            # a long input, whose backbone 11 steps leave short (ESMFOLD2_LONG_RESIDUES)
             # (web/esmfold2-model.js, ESMFOLD2_ATOMISED_STEPS) - applied here too, for a job no page sent
             steps = int((job.get("schedule") or {}).get("steps") or 0)
-            if atomised_job(job["job"]):
+            if atomised_job(job["job"]) or job_residues(job["job"]) > ESMFOLD2_LONG_RESIDUES:
                 steps = max(steps or ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS)
             if steps:
                 fold.append(f"--steps={steps}")

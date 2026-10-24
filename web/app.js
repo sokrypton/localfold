@@ -3436,7 +3436,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
  * syncModelControls exists to prevent, and a preset table is exactly the kind
  * of thing that gains a value on the page before it gains one in the code.
  */
-function samplerPreset({ atomised = false } = {}) {
+function samplerPreset({ atomised = false, residues = 0 } = {}) {
   // 🔴 THE MODEL DECIDES THE MODE, NOT THE HIDDEN SELECT. Hiding a control does
   // not change its value - that is what put "unknown model esmfold2" in front
   // of somebody folding an oligomer - so this reads the model's own answer and
@@ -3453,8 +3453,8 @@ function samplerPreset({ atomised = false } = {}) {
     ? ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred
     : Number(chosen);
   // ...raised for a ligand or a modified residue, whose per-atom tokens eleven steps leave torn
-  // (ESMFOLD2_ATOMISED_STEPS)
-  const name = `${mode}-${esmfold2StepsFor(dial, { atomised })}`;
+  // (ESMFOLD2_ATOMISED_STEPS), and for a long input, whose backbone they leave short (ESMFOLD2_LONG_RESIDUES)
+  const name = `${mode}-${esmfold2StepsFor(dial, { atomised, residues })}`;
   if (SAMPLER_PRESETS[name] === undefined) {
     throw new Error(`no ESMFold2 sampler called ${name}; `
       + `known: ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -3510,7 +3510,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
                       ...parseCcdComponent(await response.text()) });
   }
   // ...and the sampler, decided once: the fold runs it and the archive records it
-  const sampler = samplerPreset({ atomised: ligands.length > 0 || modifyWith.length > 0 });
+  const sampler = samplerPreset({ atomised: ligands.length > 0 || modifyWith.length > 0,
+    residues: chains.reduce((sum, chain) => sum + chain.length, 0) });
   throwIfAborted(signal);
   const loaded = await (modelLoad
     ?? loadEsmfold2Weights(undefined,
@@ -4205,7 +4206,8 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
   if (isEsmfold2(family)) {
     const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
-    request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
+    const residues = chains.reduce((sum, chain) => sum + chain.length, 0);
+    request.schedule = { steps: Number(samplerPreset({ atomised, residues }).split("-").pop()) };
   } else if (BIOEMU2_FAMILIES.includes(family)) {
     // (BioEmu2's own dial: BIOEMU2_COUNTS, the vendor's 200 when it is empty - not AlphaFold 3's table)
     request.schedule = { steps: Number(element("af3-count").value) || BIOEMU2_DEFAULT_STEPS };

@@ -4116,3 +4116,30 @@ geometry at a given scheduled count, at the price of two to six more steps run, 
 with Euler at more steps (15 geometric + exponential at 13 run, 0.110; 25 Euler at 18 run, 0.103). They do not let a
 ligand job run fewer steps: at 25 scheduled 300M's glycerol is 0.199 A. And 7 steps fold the backbone but leave
 side-chain bonds at 0.09-0.13 A against 0.06 at 11, to save four of a fold's ~1 s of denoiser calls.
+
+## Long inputs: the step floor, and why it is Euler's (2026-10-24)
+
+Past ~2,048 residues the checkpoint's 15 scheduled steps (11 run) leave the backbone **short**: the denoiser's answer
+at those lengths is a shrunken chain and eleven steps do not walk out of it. Copies of 6MRR, single sequence, 600M,
+two seeds, CA-CA outside 3.6-4.0 A / median:
+
+| residues | 15 (11) Euler | 25 (18) Euler | 45 (32) Euler | 15 exp | 25 exp | 25 exp+geo (21) |
+|---|---|---|---|---|---|---|
+| 68 | 0% / 3.82 | 0% / 3.81 | | 0% / 3.81 | 0% / 3.81 | 0% / 3.81 |
+| 2,040 | 0.3% / 3.79 | | | | | |
+| 3,060 | 15.9% / 3.68 | **0.4% / 3.77** | | 63.9% / 3.56 | 21.0% / 3.68 | 14.2% / 3.67 |
+| 4,080 | 91.5% / 3.44 | 9.4% / 3.69 | **0.1% / 3.80** | 97.1% / 3.37 | 83.9% / 3.51 | 79.0% / 3.54 |
+
+(300M at 3,060: Euler 2.5% at 15, 1.7% at 25; exp 21.0% and 1.4%.) The per-chain RMSD follows: 5.01 A at 3,060 and 25
+Euler steps against 5.75-6.24 for the exponential arms. **The exponential update is worse here, at every count** - the
+opposite of AlphaFold 3. It is not a defect: cuda/ef2's step and cpu/esmfold2/sampler.js's are the same line, and
+test/diffusion-update.test.js holds it to r^S x + (1 - r^S) d. What differs is the overshoot: biohub's step scale is
+1.638, so an Euler step lands PAST the denoiser's answer, which corrects a shrunken one; the exponential step never
+passes it, and lands a backbone the denoiser shrank. Every failing arm above fails SHORT, and the exponential always
+shorter.
+
+So the default stays Euler and a long input takes the per-atom floor, 64 scheduled (45 run): `ESMFOLD2_LONG_RESIDUES`
+(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/featurise/standalone.cpp and held together by
+test/esmfold2-atomised-steps.test.js. It costs the sampler's time only, which past that length is a few percent of a
+fold: 45 copies 785 ms of sampler (45 steps) against a 31 s trunk, the wall clock the same at 15 and 25. 45 copies
+through `cuda/ef2/fold` now: 0.6% out of band, median 3.78 (15.9% / 3.68 before).
