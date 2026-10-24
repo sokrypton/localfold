@@ -360,4 +360,28 @@ the page's out-of-memory handling is not what a phone user meets.
   `--prior=ampere` is level with none. The AF2 gain, one knob kept at a time: `linearHalfTile` 4.37 s,
   `attentionProjectHalfTile` 4.79, `attentionOutputHalfTile` 5.08; `trianglePairProjectTile`, `runtimeLoopBounds`,
   `attentionGroup` level; `fusedPairBias` and `vectorGemmBlock` slightly worse (5.55-5.65). So a Mali prior is the three
-  half tiles and not the rest - the AF3 diffusion knobs are being attributed next.
+  half tiles and not the rest for AF2: the three together are **3.61-3.62 s** warm, better than the whole prior's 3.90.
+- **AF3 wants different knobs.** 5CAJ A, 255 tokens, 25 steps, `--folds=2`, one knob of `metal-3` kept at a time
+  (diffusion and pairformer are both folds' stage totals; the warm fold is the second):
+
+  | arm | diffusion | pairformer | warm fold | pLDDT |
+  |---|---:|---:|---:|---:|
+  | no prior | 51.5 s | 55.8 s | 61.4 s | 26.9520 |
+  | all of `metal-3` | **40.2** | **50.4** | **53.7** | 26.9662 |
+  | `diffusionTokenTile` | 44.1 | 55.5 | 59.0 | 26.9520 |
+  | `atomRowTile` | 52.5 | 55.5 | 63.6 | 26.9520 |
+  | `singleTransitionTile` | 52.0 | 54.6 | 61.5 | 26.9520 |
+  | `singleProjectRows` | 51.6 | 54.9 | 61.0 | 26.9520 |
+  | the three half tiles | 51.6 | 55.4 | 61.4 | 26.9520 |
+  | `runtimeLoopBounds` | 50.5 | 54.8 | 61.3 | 26.9520 |
+
+  `diffusionTokenTile` is ~60% of the diffusion gain; the three half tiles that are AF2's whole gain move AF3 not at
+  all. The rest - the pairformer's ~5 s and the remaining ~4 s of diffusion - and the moved pLDDT (a different kernel
+  ran) come from a knob not yet isolated: `trianglePairProjectTile`, `fusedPairBias` and `vectorGemmBlock` are the ones
+  left, singly or as a pair. One run an arm, so differences under ~1 s are noise.
+- **Not done: the Mali prior itself.** Paused when the phone was needed back. The next step is those three AF3 arms,
+  then a `["valhall", {...}]` entry in `webgpu/runtime/device-profile.js` with the three half tiles,
+  `diffusionTokenTile` and whatever the AF3 arms name - and NOT `fusedPairBias`/`vectorGemmBlock` unless AF3 needs
+  them, since both lose on AF2 - checked by folding all three models under it. The sweep is `--prior=metal-3
+  --no-prior=<knob>` through `fold.js`/`fold-af2.js` with `LOCALFOLD_GPU_ANDROID=1`; run the arms from bash, since zsh
+  passes an unquoted `$P` as one argument.
