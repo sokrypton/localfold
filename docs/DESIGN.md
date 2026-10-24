@@ -302,17 +302,24 @@ v1 interface and it is the part least like `index.html`'s ease. **Picking them i
 language, selection paths and PyMOL commands — so the idea is proven in this family of pages; scale it down to what
 a design page needs rather than adopting the whole editor.
 
-### py2Dmol is ours, so the viewer can change to suit this
+### py2Dmol is ours, and the audit says what is actually missing
 
 🔴 **Beerware, `so3@mit.edu`** — "do whatever you want with this stuff" as long as the notice is retained. So where
-the viewer is the limiting factor, the answer is to extend it rather than work around it. What this page is likely
-to need and should be checked for first: per-residue colouring by *role* rather than by value, a frame API that
-takes a labelled cycle, and residue picking that emits a selection the page can read.
+the viewer is the limiting factor, extend it rather than work around it. **docs/DESIGN-PY2DMOL.md** audits the three
+things this page needs, so only what is missing gets built:
 
-🔴 **The vendored copy is a mirror and must not be edited in place.** `web/vendor/SOURCE.md` pins
-`sokrypton/py2Dmol` by commit; the workflow is to change it upstream, rebuild its bundle, re-run
-`python3 tools/sync-py2dmol.py`, and check with `--check`. Editing `web/vendor/py2Dmol.full.min.js` directly is how
-a change gets silently reverted by the next sync.
+| what the page needs | verdict | what to do |
+|---|---|---|
+| per-residue colouring by **role** | **EXISTS** | use `setColor(colour, { positions })` — it takes an array or a `Set`, and writes an `advanced` colour on the object. Verified at `src/parts/embed.js:448`. Nothing upstream needed |
+| a **labelled** frame per cycle | **PARTIAL** | frames, stepping, the play bar and a `py2dmol-frame-change` event all exist, and `frame.name` is already stored — but it is drawn by the full app's label element, which the embed path does not create. The upstream change is small: let the embed show a frame's name |
+| residue **picking** the page can read | **PARTIAL** | picking, selection and a change event exist. The gap: the event carries **no detail**, so a page must read `v.selection` — 0-based indices — and translate them itself via the renderer's chain and residue-number arrays. Either live with the translation or give the event a payload upstream |
+
+So the viewer is much closer than assumed: the role colouring that looked like the big ask is free, and the two
+partials are a label and an event payload rather than new machinery.
+
+🔴 **The vendored copy is a mirror and must not be edited in place.** `web/vendor/SOURCE.md` pins `sokrypton/py2Dmol`
+by commit; change it upstream, rebuild its bundle, re-run `python3 tools/sync-py2dmol.py`, and check with `--check`.
+Editing `web/vendor/py2Dmol.full.min.js` directly is how a change gets silently reverted by the next sync.
 
 ### UI already written, and ours to reuse
 
@@ -426,6 +433,6 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 | Is the goal a product site, or a tool beside the folder? | Sergey | section 1's repository choice |
 | `sync-mpnn.py --check` against `sokrypton/mpnn` HEAD | worker | step 2 |
 | Whether Marielle will export LigandMPNN and NA-MPNN to the browser | Sergey / Marielle | would change 3B's trade entirely |
-| Does py2Dmol already do role colouring, labelled frames and residue picking? | worker | how much of section 5 needs an upstream change |
+| ~~Does py2Dmol already do role colouring, labelled frames and residue picking?~~ — **audited, docs/DESIGN-PY2DMOL.md**: colouring EXISTS, frames and picking PARTIAL | done | nothing |
 | How geometric conditioning works - template, contact term, or an RMSD-to-motif term in the objective | unassigned | motif scaffolding, enzyme design |
 | Does `partial_diffusion` have a Hunter analogue? Read her `13_warmstart.py` | unassigned | that one modality |

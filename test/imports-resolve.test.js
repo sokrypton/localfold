@@ -191,9 +191,16 @@ test("every source path named in python, yaml, html or markdown exists", () => {
   // ours and went red on this very paragraph. A path preceded by `/` is
   // another checkout's - which is the convention that rule's own header
   // documents, and the accurate way to write it.
+  //
+  // 🔴 AND `src/parts/` IS py2Dmol's SEVENTH, ARRIVING THE SAME WAY cartoon's
+  // DID - which is the paragraph above happening a second time. It is now the
+  // LARGEST of them (embed.js, multi.js, plugins.js, selectpanel.js,
+  // sidechains.js), and docs/DESIGN-PY2DMOL.md cites those files because an
+  // audit of someone else's API is worth nothing without the line it was read
+  // from. Nothing of ours has ever lived at src/parts/.
   const FOREIGN = ["src/align/", "src/app/", "src/cartoon/", "src/core/", "src/io/",
-                   "src/panels/", "src/alphafold3/", "src/dawn/", "src/mpnn/",
-                   "src/py2Dmol/"];
+                   "src/panels/", "src/parts/", "src/alphafold3/", "src/dawn/",
+                   "src/mpnn/", "src/py2Dmol/"];
   // Its own walker: the shared one above is deliberately JS-only, and widening
   // it made the comment rule read python it has no exclusions for.
   const walkAny = (dir, out = []) => {
