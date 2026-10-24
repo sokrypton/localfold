@@ -528,6 +528,12 @@ const viewer = createStructureViewer({
   // backbone - the thing being designed - disappears behind them. Setting this
   // at CONSTRUCTION rather than after the first frame is what stops the ramp
   // flashing on every rebuild before the roles overwrite it.
+  // 🔴 ASKED FOR AT CONSTRUCTION, NOT HIDDEN AFTER. py2Dmol rebuilds side-chain
+  // atoms on every frame load, so hiding them in `onPaint` - which runs on the
+  // FIRST frame only - had them back by cycle two and every cycle after, with
+  // nothing throwing. Not asking for them is the only fix that is not a race
+  // with the per-frame rebuild.
+  sidechains: false,
   onPaint: (v) => v.paintRoles({}),
   onFail: (message) => say(`the viewer could not start: ${message}`, true),
 });

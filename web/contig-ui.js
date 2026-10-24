@@ -48,6 +48,91 @@ export const SPAN_STRUCTURES = { "": "any", HELIX: "helix", LOOP: "loop", STRAND
 /** The chain letters the loop and the fold agree on, mirroring hunter-loop's. */
 export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
+/**
+ * One colour per chain, shared by the span rows and the viewer.
+ *
+ * 🔴 THE SWATCH AND THE STRUCTURE MUST BE THE SAME COLOUR OR NEITHER IS WORTH
+ * DRAWING. That is the whole point of the indicator: a reader looks at a row,
+ * looks at the viewer, and knows which thing moved. So the palette is exported
+ * from here - beside `chainsOf`, which is what decides where one chain ends and
+ * the next begins - rather than written out again in the page and in the CSS.
+ *
+ * 🔴 AND HUE IS THE CHAIN, NEVER THE ROLE. Designed, held and target are drawn
+ * as TREATMENTS of the chain's own colour (see `shade`), because a reader needs
+ * both answers at once and there is only one set of pixels to give them in.
+ * Colouring by role alone - which this page did first - cannot say which chain a
+ * held motif belongs to, and colouring by chain alone cannot say what is being
+ * decided.
+ *
+ * Chosen to stay apart on a white background and to survive the fade below:
+ * blue, green, magenta, orange, teal, olive. A seventh chain wraps, which is
+ * honest - the page is not going to pretend 26 distinguishable hues exist.
+ */
+export const CHAIN_COLOURS = ["#2563eb", "#16a34a", "#d946ef", "#ea580c", "#0891b2", "#ca8a04"];
+
+/** A ligand belongs to no chain, so it takes the one neutral in the set. */
+export const LIGAND_COLOUR = "#78716c";
+
+/** The colour of the nth chain, wrapping rather than running out. */
+export function chainColour(index) {
+  return CHAIN_COLOURS[((index % CHAIN_COLOURS.length) + CHAIN_COLOURS.length) % CHAIN_COLOURS.length];
+}
+
+/**
+ * A chain's colour, moved toward another - how a ROLE is drawn.
+ *
+ * 🔴 BLENDED RATHER THAN SWAPPED, so the hue survives and the chain is still
+ * identifiable when it is recessive. A target chain painted flat grey is a chain
+ * the reader can no longer match to its row, which is the thing the swatch was
+ * added for.
+ *
+ * @param {string} colour a #rrggbb
+ * @param {string} towards a #rrggbb
+ * @param {number} fraction 0 keeps `colour`, 1 reaches `towards`
+ */
+export function shade(colour, towards, fraction) {
+  const read = (hex) => [1, 3, 5].map((at) => Number.parseInt(hex.slice(at, at + 2), 16));
+  const [r, g, b] = read(colour);
+  const [tr, tg, tb] = read(towards);
+  const mix = (from, to) => Math.round(from + (to - from) * fraction)
+    .toString(16).padStart(2, "0");
+  return `#${mix(r, tr)}${mix(g, tg)}${mix(b, tb)}`;
+}
+
+/**
+ * Which chain each span belongs to, as an index per span.
+ *
+ * 🔴 THE SAME WALK `chainsOf` DOES, AND IT HAS TO STAY THE SAME WALK: a break
+ * starts a chain, a ligand belongs to none, and everything else joins the chain
+ * in progress. If this drifted from `chainsOf`, the row would be labelled one
+ * colour and the structure painted another, which is worse than no indicator at
+ * all because it reads as an answer.
+ *
+ * @param {object[]} spans
+ * @returns {(number|null)[]} the chain index per span, or null where the span is
+ *   not part of a chain - a break, or a ligand.
+ */
+export function chainOfSpans(spans) {
+  const out = [];
+  let index = 0;
+  let used = false;
+  for (const span of spans) {
+    if (span.kind === "break") {
+      // 🔴 A BREAK ONLY ADVANCES A CHAIN THAT HAS SOMETHING IN IT. Two breaks in
+      // a row, or one before any span, would otherwise skip a colour and the
+      // rows would disagree with `chainsOf`, which starts a chain when a part
+      // arrives rather than when a break is seen.
+      if (used) { index += 1; used = false; }
+      out.push(null);
+      continue;
+    }
+    if (span.kind === "ligand") { out.push(null); continue; }
+    used = true;
+    out.push(index);
+  }
+  return out;
+}
+
 export const SPAN_LABELS = {
   generated: "Design",
   sequence: "Given sequence",

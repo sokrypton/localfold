@@ -48,6 +48,12 @@ export const VIEWER_CANVAS_HEIGHT = 420;
  */
 export function createStructureViewer(options) {
   const { container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail, frameLabel = "recycle" } = options;
+  // 🔴 ASKED ONCE, HERE, BECAUSE THE REBUILD IS PER-FRAME. py2Dmol builds
+  // side-chain atoms at frame-load time, so wanting none is a property of the
+  // VIEWER and not something a page can settle after a frame lands - see the
+  // note on the showSidechains call in `push`. Defaults to true, which is what
+  // index.html's pages want.
+  const wantsSidechains = options.sidechains !== false;
   let renderer;
   let objectName;
   let frames = 0;
@@ -114,9 +120,12 @@ export function createStructureViewer(options) {
      */
     paintRoles(roles) {
       if (renderer === undefined) return;
+      // Belt and braces for a viewer that WAS built wanting them and is being
+      // repainted by role; a viewer built with `sidechains: false` never made
+      // any and this is a no-op.
       try {
         renderer.hideSidechains?.();
-      } catch { /* a viewer with none is already right */ }
+      } catch { /* a structure with none is already right */ }
       this.colourChains(roles);
     },
 
@@ -250,7 +259,25 @@ export function createStructureViewer(options) {
         // check per frame. It throws on a structure carrying no side-chain
         // atoms at all, which a poly-glycine legitimately is, and that is not a
         // reason to lose the fold.
-        try { renderer.showSidechains(); } catch { /* backbone-only structure */ }
+        //
+        // 🔴 AND A PAGE THAT DOES NOT WANT THEM MUST BE ASKED HERE, NOT AFTER.
+        // This line is per-FRAME and `onPaint` below is first-frame only, so a
+        // page that hid them in onPaint had them put back by frame two and
+        // every frame after - which is exactly what the design page saw, with
+        // nothing throwing and the hide call itself working perfectly. Hiding
+        // them after showing them would also flash them once a cycle. Not
+        // asking for them is the only fix that is not a race with this line.
+        //
+        // 🔴 AND NOT WANTING THEM IS ALSO PER-FRAME, because py2Dmol builds them
+        // whether or not this page asks: `show` takes no option for it, and
+        // `renderer.sidechains` reads true after the first frame with the
+        // showSidechains call above removed entirely. So the opposite call has
+        // to run on the same cadence as the rebuild it is undoing - measured,
+        // not assumed, after a guard that skipped the show left them on.
+        try {
+          if (wantsSidechains) renderer.showSidechains();
+          else renderer.hideSidechains();
+        } catch { /* backbone-only structure: nothing to show or hide */ }
         frames += 1;
         // 🔴 `onPaint` LETS A PAGE OWN ITS OWN LOOK. index.html's pages want the
         // pLDDT ramp and hydrophobic sidechains; the design page wants a bare
