@@ -74,6 +74,12 @@ MODALITIES = [
                         {"kind": "generated", "min": 6, "max": 6}], "SolubleMPNN", MOTIF),
     ("inverse folding", [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN",
                           "redesign": True}], "SolubleMPNN", None),
+    # 🔴 A PTM TARGET: a CCD component swapped in at one position, which v1
+    # could not express at all. The token count does not change.
+    ("PTM target", [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN",
+                     "modifications": "4:SEP"},
+                    {"kind": "break"}, {"kind": "generated", "min": 14, "max": 14}],
+     "SolubleMPNN", None),
     ("antibody-style CDR", [{"kind": "sequence", "value": FRAME_LEFT},
                             {"kind": "sequence", "value": "EELKEFLKK", "redesign": True},
                             {"kind": "sequence", "value": FRAME_RIGHT}],

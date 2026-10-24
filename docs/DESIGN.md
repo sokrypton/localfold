@@ -390,8 +390,8 @@ engine*.
 | inverse folding | ✅ objective 0.906, whole chain resampled | ✅ plumbed, needs a structure |
 | partial diffusion | ❌ no analogue | ✅ plumbed, needs a structure |
 | antibody CDR | ✅ objective 0.882, framework held either side | ❌ no preset |
-| cyclic | ❌ | ❌ |
-| PTM target | ❌ | ❌ |
+| cyclic | 🔴 **blocked in the fold path, not here**: `cyclicPeriod` is READ by `cpu/af3/diffusion/atom-encoder.js` and produced by nothing, so the model takes the feature and no featuriser computes it | ❌ no preset; `cif.js` knows a `cyclic-pseudo-peptide` chain type |
+| PTM target | ✅ objective 0.356, a phosphoserine swapped in by CCD code | ⚠️ through a loaded structure that already carries it |
 | epitope / hotspots | ✅ one field, reached by a contact filter: fold, then reject a cycle that is not touching | ✅ the same field, as a bracketed `C_HOT` condition |
 | labelled spans (CATH, secondary structure) | ❌ | ⚠️ the editor has no row; it says so |
 
@@ -422,10 +422,11 @@ original 1PRW rather than to the cropped example. Bracketing is strictly closer
 to what the preset says it does; whether the numbers are right is not something
 this repository can settle.
 
-What is left is genuinely different in kind, not more of the same: **cyclic** and
-**PTM** need the sampler and the featuriser to express a molecule this page
-cannot describe yet; **unindexed** motif placement needs the loop to search over
-where the motif sits; and **labelled spans** (CATH, secondary structure) need a row that
+What is left is genuinely different in kind, not more of the same. 🔴 **cyclic is
+blocked below this page**: `cyclicPeriod` is read by the atom encoder and
+produced by nothing, so adding it is fold-path work in the shipping path and not
+a design feature. **Unindexed** motif placement needs the loop to search over
+where the motif sits, which is a different loop. And **labelled spans** (CATH, secondary structure) need a row that
 carries a name and a polymer type.
 
 

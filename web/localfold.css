@@ -1458,3 +1458,6 @@
 
 /* The epitope residues a design should sit against. */
 .contig-hotspots { width: 11ch; padding: 8px; }
+
+/* Modified residues in a span, as position:code. */
+.contig-modified { width: 12ch; padding: 8px; }

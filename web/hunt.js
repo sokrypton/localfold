@@ -39,6 +39,9 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  *   designer: the featuriser reads a nucleic chain one token per base
  * @param {string[]} [options.ligandCodes] ligands beside the chains, each given
  *   a chain of its own by the featuriser
+ * @param {{chain: string, position: number, code: string}[]} [options.modifications]
+ *   modified residues - a phosphoserine, a methylated base - swapped in by CCD
+ *   code at one position of one chain
  * @param {number} [options.chainIndex=0] which chain is designed
  * @param {string[]} [options.folders=["af3"]] which models fold, rotating one per cycle
  * @param {string} [options.designer="auto"] a key of DESIGNERS, or "auto"
@@ -60,7 +63,7 @@ export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" 
  */
 export async function hunt(options) {
   const {
-    chains, chainKinds, ligandCodes, chainIndex = 0, folders = ["af3"],
+    chains, chainKinds, ligandCodes, modifications, chainIndex = 0, folders = ["af3"],
     designer = "auto", contents = {},
     runs = 1, cycles = 5, length = 75, report, status = () => {}, progress = () => {},
     signal,
@@ -180,6 +183,10 @@ export async function hunt(options) {
           // reads a nucleic chain one token per base.
           ...(chainKinds === undefined ? {} : { chainKinds }),
           ...(ligandCodes === undefined || ligandCodes.length === 0 ? {} : { ligandCodes }),
+          // A modified residue is a CCD component swapped in at one position:
+          // the fold fetches it and the token count does not change.
+          ...(modifications === undefined || modifications.length === 0
+            ? {} : { modifications }),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the

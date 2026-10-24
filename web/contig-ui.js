@@ -39,6 +39,9 @@
 /** The kinds a span can be, in the order the picker lists them. */
 export const SPAN_KINDS = ["generated", "sequence", "segment", "ligand", "break"];
 
+/** The chain letters the loop and the fold agree on, mirroring hunter-loop's. */
+export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
 export const SPAN_LABELS = {
   generated: "Design",
   sequence: "Given sequence",
@@ -192,6 +195,40 @@ export function contigOf(spans, method = "rfd4p") {
 }
 
 /**
+ * The modified residues a span list names, as the fold wants them.
+ *
+ * 🔴 POSITION IS WITHIN THE CHAIN AND 1-BASED, because that is how a PDB and a
+ * paper number residues, and this field is read by a person. `chainsOf` turns it
+ * into the chain letters the fold uses.
+ *
+ * @param {object[]} spans
+ * @returns {{chainOffset: number, position: number, code: string}[]} positions
+ *   relative to the span's own chain, for `chainsOf` to place
+ */
+export function modificationsOf(spans) {
+  const out = [];
+  let chainOffset = 0;
+  let within = 0;
+  for (const span of spans) {
+    if (span.kind === "break") { chainOffset += 1; within = 0; continue; }
+    if (span.kind === "ligand") continue;
+    const length = span.kind === "generated"
+      ? number(span.min, 0)
+      : (span.kind === "sequence"
+        ? String(span.value ?? "").trim().length
+        : number(span.last, 0) - number(span.first, 0) + 1);
+    for (const entry of String(span.modifications ?? "").split(/[\s,]+/).filter(Boolean)) {
+      const [position, code] = entry.split(":");
+      const at = Number(position);
+      if (!Number.isFinite(at) || code === undefined || code.length === 0) continue;
+      out.push({ chainOffset, position: within + at, code: code.toUpperCase() });
+    }
+    within += length;
+  }
+  return out;
+}
+
+/**
  * The hotspots a span list names, per chain, as plain numbers.
  *
  * 🔴 THE SAME FIELD FEEDS BOTH METHODS BY DIFFERENT ROUTES: RFD4 turns these
@@ -283,6 +320,7 @@ export function chainsOf(spans, options = {}) {
   const chains = [];
   const kinds = [];
   const ligands = [];
+  const modifications = [];
   const problems = [];
   let hold = [];
   let designedIndex = -1;
@@ -393,9 +431,26 @@ export function chainsOf(spans, options = {}) {
     problems.push("every residue of the designed chain is held, so there is nothing to design");
   }
 
+  // 🔴 A MODIFICATION'S CHAIN IS THE LETTER THE FOLD USES, resolved here because
+  // a span knows only its own offset: the editor counts chains by breaks, and
+  // CHAIN_IDS is the alphabet the loop and the fold agree on.
+  const placed = modificationsOf(spans).map((entry) => ({
+    chain: CHAIN_IDS[entry.chainOffset],
+    position: entry.position,
+    code: entry.code,
+  })).filter((entry) => entry.chain !== undefined);
+  for (const entry of placed) {
+    const chain = chains[CHAIN_IDS.indexOf(entry.chain)];
+    if (chain !== undefined && chain.length > 0 && entry.position > chain.length) {
+      problems.push(`chain ${entry.chain} has ${chain.length} residues,`
+        + ` so position ${entry.position} cannot be modified`);
+    }
+  }
+
   return {
     chains, chainKinds: kinds, ligandCodes: ligands, chainIndex: designedIndex,
-    length: designedLength, hold, problems: [...new Set(problems)],
+    length: designedLength, hold, modifications: placed,
+    problems: [...new Set(problems)],
   };
 }
 
@@ -548,6 +603,14 @@ export function createContigList(rowsContainer, addButton, options = {}) {
       // place and length and lets the designer rewrite its letters. That one
       // box is what makes inverse folding and an antibody's CDRs expressible.
       if (span.kind === "sequence" || span.kind === "segment") {
+        const modified = element("input", "entity-value contig-modified");
+        modified.value = String(span.modifications ?? "");
+        modified.placeholder = "16:SEP";
+        modified.title = "Modified residues in this span, as position:code - 16:SEP for a"
+          + " phosphoserine at its 16th residue. Positions are 1-based within the span.";
+        bind(modified, "modifications", (value) => value.trim());
+        fields.append(element("span", "contig-label", "modified"), modified);
+
         const redesign = element("label", "contig-redesign");
         const box = element("input");
         box.type = "checkbox";

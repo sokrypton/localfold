@@ -402,7 +402,7 @@ const startHunt = async () => {
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
-  const { chains, chainKinds, ligandCodes, chainIndex, length, hold, problems }
+  const { chains, chainKinds, ligandCodes, modifications, chainIndex, length, hold, problems }
     = chainsOf(spans, { sequenceOf: resolver() });
   if (problems.length > 0) {
     say(problems.join(" · "), true);
@@ -426,6 +426,7 @@ const startHunt = async () => {
       chains,
       chainKinds,
       ligandCodes,
+      modifications,
       chainIndex,
       hold,
       // 🔴 THE SAME HOTSPOTS RFD4 CONDITIONS ON, used the only way Hunter can:

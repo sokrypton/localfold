@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
 import { METHOD_LIMITS, SPAN_KINDS, chainsOf, conditionsOf, contigOf, emptySpan, hotspotsOf,
-  spanToContig } from "../web/contig-ui.js";
+  modificationsOf, spanToContig } from "../web/contig-ui.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 
 const contig = (spans, method = "rfd4p") => contigOf(spans, method).contig;
@@ -121,10 +121,15 @@ describe("the design job as a list of spans", () => {
     it("reads a given chain and a designed one", () => {
       const spans = [{ kind: "sequence", value: TARGET }, { kind: "break" },
         { kind: "generated", min: 12, max: 12 }];
-      expect(chainsOf(spans)).toEqual({
-        chains: [TARGET, ""], chainKinds: ["protein", "protein"], ligandCodes: [],
-        chainIndex: 1, length: 12, hold: [], problems: [],
-      });
+      // 🔴 THE FIELDS THIS TEST IS ABOUT, not the whole object: a deep-equal
+      // here broke on every field later added to the return - polymer kinds,
+      // ligands, held positions, modifications - each time reporting a passing
+      // feature as a failure.
+      const read = chainsOf(spans);
+      expect(read.chains).toEqual([TARGET, ""]);
+      expect(read.chainIndex).toBe(1);
+      expect(read.length).toBe(12);
+      expect(read.problems).toEqual([]);
       // ...and the designed chain can come first, which is how v1 ordered them
       const first = chainsOf([{ kind: "generated", min: 20, max: 20 }, { kind: "break" },
         { kind: "sequence", value: TARGET }]);
@@ -172,10 +177,11 @@ describe("the design job as a list of spans", () => {
 
       const sequenceOf = (chain, first, last) => (chain === "A" && first === 10 && last === 14
         ? "MKVLA" : null);
-      expect(chainsOf(spans, { sequenceOf })).toEqual({
-        chains: ["MKVLA", ""], chainKinds: ["protein", "protein"], ligandCodes: [],
-        chainIndex: 1, length: 8, hold: [], problems: [],
-      });
+      const read = chainsOf(spans, { sequenceOf });
+      expect(read.chains).toEqual(["MKVLA", ""]);
+      expect(read.chainIndex).toBe(1);
+      expect(read.length).toBe(8);
+      expect(read.problems).toEqual([]);
 
       // ...and a span naming residues the structure does not have says which
       const missing = [{ kind: "segment", chain: "Z", first: 1, last: 9 },
@@ -270,6 +276,40 @@ describe("the design job as a list of spans", () => {
       expect(plain.chains).toEqual(["MKVLA", ""]);
       expect(plain.length).toBe(12);
       expect(plain.hold).toEqual([]);
+    });
+
+    // 🔴 A MODIFIED RESIDUE IS A PTM TARGET, which v1 could not express at all.
+    // The position is 1-based WITHIN THE SPAN because that is how a person reads
+    // a paper, and chainsOf resolves it to the chain letter and offset the fold
+    // uses.
+    it("places modified residues on the right chain and position", () => {
+      const spans = [{ kind: "sequence", value: "GWSTELEKHREELK", modifications: "3:SEP 7:TPO" },
+        { kind: "break" }, { kind: "generated", min: 12, max: 12 }];
+      expect(modificationsOf(spans)).toEqual([
+        { chainOffset: 0, position: 3, code: "SEP" },
+        { chainOffset: 0, position: 7, code: "TPO" },
+      ]);
+      expect(chainsOf(spans).modifications).toEqual([
+        { chain: "A", position: 3, code: "SEP" },
+        { chain: "A", position: 7, code: "TPO" },
+      ]);
+
+      // ...offset past earlier spans of the same chain, and past a break
+      const later = [{ kind: "sequence", value: "AAAAA" },
+        { kind: "sequence", value: "GGGGG", modifications: "2:SEP" },
+        { kind: "break" },
+        { kind: "sequence", value: "CCCCC", modifications: "1:TPO" },
+        { kind: "break" }, { kind: "generated", min: 6, max: 6 }];
+      expect(chainsOf(later).modifications).toEqual([
+        { chain: "A", position: 7, code: "SEP" },
+        { chain: "B", position: 1, code: "TPO" },
+      ]);
+
+      // 🔴 AND A POSITION PAST THE CHAIN'S END IS REPORTED. The fold would
+      // otherwise fetch a CCD component and place it nowhere.
+      expect(chainsOf([{ kind: "sequence", value: "AAA", modifications: "9:SEP" },
+        { kind: "break" }, { kind: "generated", min: 5, max: 5 }]).problems)
+        .toContain("chain A has 3 residues, so position 9 cannot be modified");
     });
 
     it("ignores a ligand, which is context and not a chain", () => {
