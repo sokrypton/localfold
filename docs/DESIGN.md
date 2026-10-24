@@ -378,25 +378,37 @@ went over the alanine ceiling, which is the loop's veto working rather than a
 pass. What these establish is that the job can be *expressed* and *reaches the
 engine*.
 
+🔴 **AND "THE PRESET LOADS" IS NOT "THE PRESET RUNS".** Every RFD4 row below was
+marked ✅ on the editor round-tripping its preset - and when they were actually
+generated, **seven of the eight conditioned ones failed**. The reason is in
+section 3D's note now: a preset without `specMode` is driven by its structure's
+own ANNOTATIONS, and its contig string is written in the original entry's
+numbering. `motif_idx_1prw` asks for `A52-71` where its example CIF has chain A
+at residues 0-42. Running it from the spec gave "Preserved segment 'A52-71'
+matched no atoms". Every column below is now a generation or a hunt, not a
+round trip.
+
 | | Protein Hunter | RFD4-Proteina |
 |---|---|---|
 | unconditional | ✅ objective 0.802 | ✅ 100 tokens / 30 steps |
-| protein binder | ✅ objective 0.589, two folders rotating | ✅ preset, needs a structure |
-| ligand target | ✅ runs, LigandMPNN chosen automatically | ✅ preset `110-110,/0,SAM` |
-| nucleic target | ✅ runs, NA-MPNN chosen automatically | ✅ preset `A1-9/0 B1-10/0 120-150` |
+| protein binder | ✅ objective 0.589, two folders rotating | ✅ 183 tokens (`ppi_pdl1`) |
+| ligand target | ✅ runs, LigandMPNN chosen automatically | ✅ 165 tokens (`sm_sam`) |
+| nucleic target | ✅ runs, NA-MPNN chosen automatically | ✅ 147 tokens (`dna_7m5w`) |
 | from a structure | ✅ its sequence is read out | ✅ its coordinates are conditioned on |
-| motif, indexed | ✅ objective 0.835, the motif survives exactly | ✅ preset round-trips through the spans |
-| motif, unindexed | ❌ Hunter cannot choose where the motif sits | ✅ preset round-trips |
-| inverse folding | ✅ objective 0.906, whole chain resampled | ✅ plumbed, needs a structure |
-| partial diffusion | ❌ no analogue | ✅ plumbed, needs a structure |
+| motif, indexed | ✅ objective 0.835, the motif survives exactly | ✅ 67 tokens |
+| motif, unindexed | ❌ Hunter cannot choose where the motif sits | ✅ 112 tokens |
+| inverse folding | ✅ objective 0.906, whole chain resampled | ✅ 67 tokens |
+| partial diffusion | ❌ no analogue | ✅ 67 tokens over 10 of 20 steps, as its fraction asks |
 | antibody CDR | ✅ objective 0.882, framework held either side | ❌ no preset |
 | cyclic | 🔴 **blocked in the fold path, not here**: `cyclicPeriod` is READ by `cpu/af3/diffusion/atom-encoder.js` and produced by nothing, so the model takes the feature and no featuriser computes it | ❌ no preset; `cif.js` knows a `cyclic-pseudo-peptide` chain type |
 | PTM target | ✅ objective 0.356, a phosphoserine swapped in by CCD code | ⚠️ through a loaded structure that already carries it |
 | epitope / hotspots | ✅ one field, reached by a contact filter: fold, then reject a cycle that is not touching | ✅ the same field, as a bracketed `C_HOT` condition |
-| labelled spans (secondary structure) | ❌ nothing to condition on; it folds what the sequence gives | ✅ a span takes a label and a structure, and `custom_cath_monomer` round-trips with its `C_SEC` |
+| labelled spans (secondary structure) | ❌ nothing to condition on; it folds what the sequence gives | ✅ 54 tokens (`custom_cath_monomer`), which is the 54-residue protein its own description names |
 
-`npm run test:design --cases` re-runs the Hunter column, asserting the automatic
-designer follows the job; `--generate` re-runs RFD4's unconditional case.
+`--cases` re-runs the Hunter column, asserting the automatic designer follows the
+job and that held residues survive; **`--presets` generates all ten of RFD4's
+presets**, which is the arm that caught the seven failures above; `--generate`
+is the quick unconditional one.
 
 🔴 **That primitive now exists, and it was one checkbox.** A given span is HELD
 by default; ticking `redesign` keeps its place and length and lets the designer

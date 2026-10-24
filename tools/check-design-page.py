@@ -3,11 +3,17 @@
     python3 tools/check-design-page.py
     python3 tools/check-design-page.py --generate   # ...and a real RFD4-Proteina generation
     python3 tools/check-design-page.py --cases      # ...and a hunt per modality
+    python3 tools/check-design-page.py --presets    # ...and a generation per RFD4 preset
 
 🔴 `--cases` RUNS ONE HUNT PER MODALITY - unconditional, a ligand target, a
 nucleic target - and asserts the AUTOMATIC DESIGNER follows the job: soluble for
 protein alone, LigandMPNN where heteroatoms are present, NA-MPNN for a nucleic
 chain. It is the matrix, and it takes a couple of minutes.
+
+🔴 `--presets` GENERATES EVERY ONE OF RFD4-PROTEINA'S TEN PRESETS, which is the
+only check that tells a preset that LOADS from a preset that RUNS - and seven of
+eight conditioned ones were failing while the editor round-tripped them
+perfectly. Several minutes, and it downloads the weights.
 
 🔴 `--generate` IS OPT-IN BECAUSE IT DOWNLOADS ~420 MB. It runs an
 unconditional 100-mer through RFD4-Proteina - the second method, the one the
@@ -49,6 +55,11 @@ import cdp  # noqa: E402
 WITH_LIGAND = [{"kind": "generated", "min": 60, "max": 60},
                {"kind": "break"},
                {"kind": "ligand", "code": "HEM"}]
+
+# Every RFD4-Proteina preset, for `--presets`. The ids are the engine's own.
+PRESET_TOKENS = ["uncond_short", "ppi_pdl1", "motif_idx_1prw", "motif_unidx_1prw", "sm_sam",
+                 "dna_7m5w", "yaml_5o45_binder", "partial_diffusion_1prw",
+                 "inverse_folding_1prw", "custom_cath_monomer"]
 
 # 🔴 ONE HUNT PER MODALITY, with the designer each must choose. The rule is the
 # reference's and lives in cpu/design/designers.js; what is checked here is that
@@ -481,6 +492,41 @@ def main():
                         if piece not in case["last"]:
                             bad.append(f"{label} did not hold {piece!r}:"
                                        f" the designed sequence is {case['last']!r}")
+
+        # 🔴 EVERY RFD4 PRESET, GENERATED. A preset that loads is not a preset
+        # that runs: the editor round-tripped all ten while seven of the eight
+        # conditioned ones failed in the pipeline, because a preset without
+        # `specMode` is driven by its structure's ANNOTATIONS and its contig is
+        # written in the original entry's numbering. Only a generation says so.
+        if "--presets" in sys.argv:
+            for preset in PRESET_TOKENS:
+                cdp.evaluate(ws, """(() => {
+                  const pick = document.getElementById('preset');
+                  pick.value = '%s';
+                  pick.dispatchEvent(new Event('change'));
+                  document.getElementById('steps').value = '20';
+                  document.getElementById('results-body').replaceChildren();
+                  document.getElementById('hunt').click();
+                  return 1;
+                })()""" % preset)
+                presetDeadline = time.time() + 2400
+                ran = None
+                while time.time() < presetDeadline:
+                    ran = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                      status: document.getElementById('status-message').textContent,
+                      failed: document.getElementById('status-message')
+                        .classList.contains('error'),
+                      rows: document.querySelectorAll('#results-body tr').length,
+                      button: document.getElementById('hunt').textContent.trim(),
+                    })"""))
+                    if ran["failed"] or (ran["button"] == "Generate" and ran["rows"] > 0):
+                        break
+                    time.sleep(3)
+                print(f"  {preset}: {ran['status'][:72]}")
+                if ran["failed"]:
+                    bad.append(f"preset {preset} failed to generate: {ran['status']}")
+                elif "tokens" not in ran["status"]:
+                    bad.append(f"preset {preset} did not report its tokens: {ran['status']!r}")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
         # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.

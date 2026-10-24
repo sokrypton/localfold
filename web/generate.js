@@ -82,6 +82,10 @@ async function templateCif(url, signal) {
  *   `C_HOT`, ...) as the presets carry it
  * @param {string} [options.cifUrl] a template structure the contig refers to;
  *   required whenever the contig names a given segment like `A18-132`
+ * @param {boolean} [options.fromAnnotations] drive the batch from the
+ *   structure's own condition annotations rather than from `contig`. This is
+ *   what a preset without `specMode` means, and it is not interchangeable - see
+ *   the note at `buildFrom` below.
  * @param {string} [options.inputCif] the same thing as text, for a structure the
  *   user loaded rather than one a preset points at. Wins over `cifUrl`.
  * @param {number} [options.steps]
@@ -101,8 +105,8 @@ async function templateCif(url, signal) {
  */
 export async function generate(options) {
   const {
-    contig, conditions, cifUrl, inputCif: givenCif, steps = DEFAULT_STEPS,
-    recycleSchedule, seed = 0,
+    contig, conditions, cifUrl, inputCif: givenCif, fromAnnotations = false,
+    steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
     partialTrajectoryFractionSteps, inverseFolding,
     status = () => {}, progress = () => {}, onStep, signal,
   } = options;
@@ -115,7 +119,12 @@ export async function generate(options) {
   // that quietly ignores what was asked. Partial diffusion starts the flow
   // partway along FROM that structure; inverse folding holds its backbone and
   // resamples the sequence. Both are meaningless without one.
-  const haveStructure = givenCif !== undefined || cifUrl !== undefined;
+  // 🔴 `null` IS NOT `undefined`, AND ONE PRESET SHIPS IT. custom_cath_monomer's
+  // cifUrl is `null` - it is pure spec, no structure - and a `=== undefined`
+  // test let that through to fetch("null"), which 404s with a message naming no
+  // file at all.
+  const templateUrl = cifUrl === null ? undefined : cifUrl;
+  const haveStructure = givenCif !== undefined || templateUrl !== undefined;
   if (partialTrajectoryFractionSteps !== undefined && !haveStructure) {
     throw new Error("partial diffusion starts from an existing structure and re-denoises it,"
       + " so it needs one to start from");
@@ -128,7 +137,15 @@ export async function generate(options) {
   // segment with no structure to take it from fails somewhere inside the
   // validation pipeline with a message about an absent chain; said here it names
   // the thing the user has to supply.
-  const needsTemplate = /(^|,)\s*[A-Za-z]\d/.test(contig);
+  // 🔴 A LABELLED SPAN IS NOT A CHAIN SEGMENT, and a regex looking for
+  // "letter then digit" cannot tell them apart: `h1:16-16P` starts exactly like
+  // `A18-132`. The difference is the COLON - a label names the span, a segment
+  // names a chain - so each piece is tested whole.
+  const needsTemplate = contig.split(",").some((piece) => {
+    const token = piece.trim();
+    if (token.includes(":")) return false;              // a labelled span
+    return /^[A-Za-z][A-Za-z0-9]*-?\d+-\d+$/.test(token) && /^[A-Za-z]/.test(token);
+  });
   if (needsTemplate && !haveStructure) {
     throw new Error(`the contig "${contig.trim()}" names a segment of an existing structure,`
       + " so it needs one to take it from - load an example or add a structure");
@@ -142,9 +159,27 @@ export async function generate(options) {
   });
 
   status("preparing the input");
-  const inputCif = givenCif ?? (cifUrl === undefined ? undefined : await templateCif(cifUrl, signal));
-  const spec = { contig, ...(conditions === undefined ? {} : { conditions }) };
-  const { batch, n } = buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
+  const inputCif = givenCif ?? (templateUrl === undefined
+    ? undefined : await templateCif(templateUrl, signal));
+  // 🔴 TWO WAYS TO BUILD A BATCH, AND THEY ARE NOT INTERCHANGEABLE.
+  //
+  //   - FROM A SPEC: a contig plus conditions, with a structure as a template.
+  //     This is what a user-built job is, and what a preset marked `specMode`
+  //     is.
+  //   - FROM AN ANNOTATED STRUCTURE: the mmCIF carries `condition_coordinate`,
+  //     `condition_sequence`, `condition_index`, `expsegmin`/`expsegmax` per
+  //     residue, and those ARE the job. A preset without `specMode` means this.
+  //
+  // 🔴 AND THE SHIPPED EXAMPLES ONLY WORK THE SECOND WAY, which is how this was
+  // found: `motif_idx_1prw`'s contig asks for `A52-71`, its own example CIF has
+  // chain A at residues 0-42, and building from the spec fails with "Preserved
+  // segment 'A52-71' matched no atoms". The contig in those presets is written
+  // in the ORIGINAL 1PRW numbering and is a label, not an input. Running them
+  // from the spec was wrong for every conditioned preset.
+  const { batch, n } = fromAnnotations && inputCif !== undefined
+    ? buildBatch(inputCif, { seed })
+    : buildBatch({ contig, ...(conditions === undefined ? {} : { conditions }) },
+      { seed, ...(inputCif === undefined ? {} : { inputCif }) });
 
   status(`generating ${n} tokens over ${steps} steps`);
   const result = await generateRfd4p(device, weights, cfg, batch, {

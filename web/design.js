@@ -582,6 +582,12 @@ presetSelect.addEventListener("change", () => {
   presetExtras = {
     conditions: preset.conditions,
     cifUrl: preset.cifUrl,
+    // 🔴 A PRESET WITHOUT `specMode` IS DRIVEN BY ITS STRUCTURE'S ANNOTATIONS,
+    // not by its contig - see the note in web/generate.js. Its contig string is
+    // written in the original entry's numbering and does not match the cropped
+    // example, so running it from the spec fails outright.
+    fromAnnotations: preset.specMode !== true && preset.cifUrl !== null
+      && preset.cifUrl !== undefined,
     partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,
     inverseFolding: preset.inverseFolding,
   };
@@ -591,7 +597,16 @@ presetSelect.addEventListener("change", () => {
   // a contig the selected method cannot run.
   method.value = "rfd4p";
   paintMethod();
-  presetNote.textContent = preset.description ?? "";
+  // 🔴 AND THE ROWS ARE A VIEW OF IT, NOT THE INPUT, for those presets. Editing
+  // them switches to the contig path, where the numbering has to match the
+  // structure - and for the 1PRW examples it does not. Said plainly rather than
+  // letting an edit fail with "matched no atoms".
+  presetNote.textContent = (preset.description ?? "")
+    + (presetExtras.fromAnnotations
+      ? "  \u2014 this preset is driven by its structure's own annotations;"
+        + " the spans show what it asks for, and editing them switches to the contig,"
+        + " whose numbering may not match the example."
+      : "");
   presetNote.classList.remove("warn");
 });
 
