@@ -1455,3 +1455,6 @@
   color: #374151;
   white-space: nowrap;
 }
+
+/* The epitope residues a design should sit against. */
+.contig-hotspots { width: 11ch; padding: 8px; }

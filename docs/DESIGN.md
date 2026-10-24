@@ -392,7 +392,7 @@ engine*.
 | antibody CDR | ✅ objective 0.882, framework held either side | ❌ no preset |
 | cyclic | ❌ | ❌ |
 | PTM target | ❌ | ❌ |
-| epitope / hotspots | ❌ | ⚠️ preset-only, not editable |
+| epitope / hotspots | ❌ needs a contact-rejection filter | ✅ editable per given chain, as a bracketed `C_HOT` selection |
 | labelled spans (CATH, secondary structure) | ❌ | ⚠️ the editor has no row; it says so |
 
 `npm run test:design --cases` re-runs the Hunter column, asserting the automatic
@@ -406,11 +406,26 @@ Design spans is a scaffolded motif. All three run, and the gate asserts the held
 residues SURVIVE in the designed sequence - the only check that catches a hold
 which is not holding, since the run looks identical either way.
 
+🔴 **AND TWO SHIPPED PRESETS WERE CONDITIONING ON ALMOST NOTHING.**
+`evalPathSelection` splits a selection on commas *before* it splits a path on
+slashes, so a residue field reading `54,56,66,115` is four tokens of which only
+the first is a path - and an unbracketed `16-35` reaches `parseInt` and becomes
+the single residue 16. Measured on `motif_idx_1prw`: the bare form selects
+residue 16 where the bracketed form selects 16-35. `ppi_pdl1`'s four hotspots
+were written the same way. Both are bracketed now, with the finding recorded at
+the top of `shared/rfd4p/presets.js` and the DSL pinned by
+`test/rfd4p-selection.test.js`.
+🔴 **One question that leaves open for whoever owns those presets:** bracketed,
+`[16-35,52-71]` still selects only 16-35, because the example's chain A is
+renumbered and has no residue 52-71 at all. So those numbers may belong to the
+original 1PRW rather than to the cropped example. Bracketing is strictly closer
+to what the preset says it does; whether the numbers are right is not something
+this repository can settle.
+
 What is left is genuinely different in kind, not more of the same: **cyclic** and
 **PTM** need the sampler and the featuriser to express a molecule this page
 cannot describe yet; **unindexed** motif placement needs the loop to search over
-where the motif sits; **hotspots** are editable only through a preset's
-conditions; and **labelled spans** (CATH, secondary structure) need a row that
+where the motif sits; and **labelled spans** (CATH, secondary structure) need a row that
 carries a name and a polymer type.
 
 

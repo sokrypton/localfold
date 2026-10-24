@@ -16,7 +16,7 @@
  *
  * See docs/DESIGN.md for the plan this page is step one of.
  */
-import { chainsOf, contigOf, createContigList } from "./contig-ui.js";
+import { chainsOf, conditionsOf, contigOf, createContigList } from "./contig-ui.js";
 import { generate } from "./generate.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
@@ -712,6 +712,11 @@ const startGenerate = async () => {
     const result = await generate({
       contig,
       ...presetExtras,
+      // 🔴 HOTSPOTS NAMED IN THE SPANS WIN OVER A PRESET'S, because they are
+      // what the user just typed. A preset's other conditions stay.
+      ...(conditionsOf(spans) === undefined ? {} : {
+        conditions: { ...presetExtras.conditions, ...conditionsOf(spans) },
+      }),
       // A structure the user loaded is the one they mean, over a preset's.
       ...(loaded === null ? {} : { inputCif: loaded.text }),
       steps: number("steps", 60),

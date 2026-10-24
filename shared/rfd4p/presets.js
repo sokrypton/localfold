@@ -1,4 +1,25 @@
 /**
+ * 🔴 LOCALFOLD EDIT: THE RESIDUE LISTS IN THESE SELECTIONS ARE BRACKETED.
+ *
+ * `evalPathSelection` splits a selection on COMMAS before it splits a path on
+ * slashes, so a selection whose residue field reads `16-35,52-71` is TWO tokens
+ * - the path up to the first range, and then a stray `52-71` - of which only
+ * the first is a path at all; and an unbracketed range reaches
+ * `parseInt('16-35')` and becomes the single residue 16. Measured on
+ * motif_idx_1prw: the bare form selects residue 16 alone where the bracketed
+ * form selects 16-35. `ppi_pdl1`'s four hotspots were written the same way.
+ *
+ * 🔴 AND ONE QUESTION THIS DOES NOT ANSWER, for whoever owns these
+ * upstream: bracketed, `[16-35,52-71]` still selects only 16-35, because the
+ * example's chain A is renumbered and has no residue 52 to 71 (its given
+ * segments are A1-20 and A22-41). So the numbering in these conditions may
+ * belong to the original 1PRW rather than to the cropped example. Bracketing is
+ * strictly closer to what the presets SAY they condition on; whether the numbers
+ * themselves are right is not something this repository can settle.
+ *
+ * See test/rfd4p-selection.test.js, which pins the DSL behaviour.
+ */
+/**
  * RFD4-Proteina interactive design presets covering all upstream benchmark families
  * (Unconditional Monomer, PPI Binder w/ Hotspots, Indexed & Unindexed Motif Scaffolding,
  * Small-Molecule Pocket, DNA Binder, Partial Diffusion, Inverse Folding, and YAML/Contig specs).
@@ -30,7 +51,7 @@ export const RFD4P_PRESETS = Object.freeze([
     conditions: {
       C_CRD: { true: [{ select: "sel('A/*/*/*')" }] },
       C_SEQ: { true: [{ select: "sel('A/*/*/*')" }] },
-      C_HOT: { true: [{ select: "sel('A/*/54,56,66,115/*')" }] },
+      C_HOT: { true: [{ select: "sel('A/*/[54,56,66,115]/*')" }] },
     },
   },
   {
@@ -44,8 +65,8 @@ export const RFD4P_PRESETS = Object.freeze([
     nsteps: 60,
     recycleSchedule: 'low',
     conditions: {
-      C_CRDGRP: { 1: [{ select: "sel('A/*/16-35,52-71/*')" }] },
-      C_SEQ: { true: [{ select: "sel('A/*/16-35,52-71/*')" }] },
+      C_CRDGRP: { 1: [{ select: "sel('A/*/[16-35,52-71]/*')" }] },
+      C_SEQ: { true: [{ select: "sel('A/*/[16-35,52-71]/*')" }] },
     },
   },
   {
@@ -59,9 +80,9 @@ export const RFD4P_PRESETS = Object.freeze([
     nsteps: 60,
     recycleSchedule: 'low',
     conditions: {
-      C_IDX: { false: [{ select: "sel('A/*/16-35,52-71/*')" }] },
-      C_CRDGRP: { 1: [{ select: "sel('A/*/16-35,52-71/*')" }] },
-      C_SEQ: { true: [{ select: "sel('A/*/16-35,52-71/*')" }] },
+      C_IDX: { false: [{ select: "sel('A/*/[16-35,52-71]/*')" }] },
+      C_CRDGRP: { 1: [{ select: "sel('A/*/[16-35,52-71]/*')" }] },
+      C_SEQ: { true: [{ select: "sel('A/*/[16-35,52-71]/*')" }] },
     },
   },
   {

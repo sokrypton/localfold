@@ -72,6 +72,12 @@ export const METHOD_LIMITS = {
     range: "Protein Hunter folds one length at a time; a range needs a search over lengths.",
     ligand: "Protein Hunter has no pocket conditioning — a ligand changes the fold and the"
       + " designer, but is not conditioned on.",
+    // 🔴 AND NO EPITOPE CONDITIONING EITHER. Yehlin's v2 reaches this with a
+    // contact-REJECTION filter - fold, then throw the cycle away if the binder
+    // is not touching the hotspots - which is a check this page does not have.
+    // Saying so beats a hotspot field that quietly does nothing.
+    hotspots: "Protein Hunter cannot condition on an epitope; it would need a contact filter"
+      + " on each cycle, which is not built.",
   },
   rfd4p: {
     // 🔴 THE GEOMETRY AXIS, AS A LIMIT. RFD4 generates coordinates AROUND given
@@ -100,7 +106,7 @@ export function emptySpan(kind = "generated") {
   // (a given span is HELD by default; `redesign` is the opt-in)
   if (kind === "generated") return { kind, min: 75, max: 75 };
   if (kind === "sequence") return { kind, value: "", polymer: "protein" };
-  if (kind === "segment") return { kind, chain: "A", first: 1, last: 100 };
+  if (kind === "segment") return { kind, chain: "A", first: 1, last: 100, hotspots: "" };
   if (kind === "ligand") return { kind, code: "" };
   return { kind };
 }
@@ -171,6 +177,9 @@ export function contigOf(spans, method = "rfd4p") {
       max += high;
       if (high !== low && limits.range !== undefined) problems.push(limits.range);
     } else if (span.kind === "segment") {
+      if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
+        problems.push(limits.hotspots);
+      }
       const span0 = number(span.first, 0);
       const span1 = number(span.last, span0);
       min += span1 - span0 + 1;
@@ -186,6 +195,43 @@ export function contigOf(spans, method = "rfd4p") {
     problems.push("every span is a chain break, so nothing would be designed");
   }
   return { contig: pieces.join(","), problems: [...new Set(problems)], tokens: { min, max } };
+}
+
+/**
+ * The conditions a span list asks RFD4-Proteina for.
+ *
+ * 🔴 TODAY THAT IS HOTSPOTS AND NOTHING ELSE. `C_HOT` marks residues of a GIVEN
+ * chain that the designed chain should sit against - an epitope - and it is the
+ * one condition a user can reasonably name by hand. The rest (`C_CRD`, `C_SEQ`,
+ * `C_CRDGRP`) are structural bookkeeping a preset sets as a whole.
+ *
+ * 🔴 THE RESIDUE LIST IS BRACKETED, AND THAT IS NOT COSMETIC.
+ * `evalPathSelection` splits a selection on commas before it splits a path on
+ * slashes, so a bare list conditions on its first residue alone and says
+ * nothing - which is what two shipped presets were doing. See
+ * test/rfd4p-selection.test.js.
+ *
+ * @param {object[]} spans
+ * @returns {object|undefined} a condition spec, or nothing to condition on
+ */
+export function conditionsOf(spans) {
+  const hot = new Map();
+  for (const span of spans) {
+    if (span.kind !== "segment" && span.kind !== "sequence") continue;
+    const residues = String(span.hotspots ?? "").split(/[^0-9-]+/).filter(Boolean);
+    if (residues.length === 0) continue;
+    // A sequence span has no chain id of its own in the structure; only a
+    // `From structure` span can name one.
+    if (span.kind !== "segment") continue;
+    const chain = String(span.chain ?? "").trim();
+    if (chain.length === 0) continue;
+    const seen = hot.get(chain) ?? [];
+    hot.set(chain, [...seen, ...residues]);
+  }
+  if (hot.size === 0) return undefined;
+  const select = [...hot.entries()]
+    .map(([chain, residues]) => `sel('${chain}/*/[${residues.join(",")}]/*')`);
+  return { C_HOT: { true: select.map((expression) => ({ select: expression })) } };
 }
 
 /**
@@ -424,9 +470,20 @@ export function createContigList(rowsContainer, addButton, options = {}) {
         last.value = String(span.last ?? 100);
         last.title = "Last residue, inclusive.";
         bind(last, "last", (value) => number(value, 1));
+        const hotspots = element("input", "entity-value contig-hotspots");
+        hotspots.value = String(span.hotspots ?? "");
+        hotspots.placeholder = "54 56 66";
+        hotspots.title = "Residues of this chain the design should sit against - an epitope."
+          + " RFD4-Proteina conditions on them; Protein Hunter has no equivalent.";
+        bind(hotspots, "hotspots", (value) => value.trim());
         fields.append(element("span", "contig-label", "chain"), chain,
           element("span", "contig-label", "residues"), first,
-          element("span", "contig-label", "to"), last);
+          element("span", "contig-label", "to"), last,
+          element("span", "contig-label", "hotspots"), hotspots);
+        if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
+          row.classList.add("contig-row-unavailable");
+          fields.append(element("div", "option-note warn contig-reason", limits.hotspots));
+        }
       } else if (span.kind === "sequence") {
         const value = element("textarea", "entity-value contig-sequence");
         value.value = String(span.value ?? "");

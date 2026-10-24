@@ -1,5 +1,6 @@
 import { describe, expect, it } from "./harness.js";
-import { METHOD_LIMITS, SPAN_KINDS, chainsOf, contigOf, emptySpan, spanToContig } from "../web/contig-ui.js";
+import { METHOD_LIMITS, SPAN_KINDS, chainsOf, conditionsOf, contigOf, emptySpan,
+  spanToContig } from "../web/contig-ui.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 
 const contig = (spans, method = "rfd4p") => contigOf(spans, method).contig;
@@ -276,6 +277,46 @@ describe("the design job as a list of spans", () => {
         { kind: "ligand", code: "HEM" }];
       expect(chainsOf(spans).chains).toEqual([""]);
       expect(chainsOf(spans).chainIndex).toBe(0);
+    });
+  });
+
+  // 🔴 HOTSPOTS ARE THE ONE CONDITION A USER CAN REASONABLY NAME, and the
+  // bracketed residue list is not cosmetic: evalPathSelection splits on commas
+  // before slashes, so a bare list conditions on its first residue alone and
+  // says nothing about it. Two shipped presets were doing exactly that - see
+  // test/rfd4p-selection.test.js.
+  describe("the conditions a span list asks for", () => {
+    it("writes hotspots as a bracketed selection, per chain", () => {
+      expect(conditionsOf([{ kind: "segment", chain: "A", first: 18, last: 132,
+        hotspots: "54 56 66 115" }]))
+        .toEqual({ C_HOT: { true: [{ select: "sel('A/*/[54,56,66,115]/*')" }] } });
+      // separators are whatever the user typed
+      expect(conditionsOf([{ kind: "segment", chain: "A", first: 1, last: 9, hotspots: "10, 12" }]))
+        .toEqual({ C_HOT: { true: [{ select: "sel('A/*/[10,12]/*')" }] } });
+      // one selection per chain
+      const two = conditionsOf([
+        { kind: "segment", chain: "A", first: 1, last: 9, hotspots: "10" },
+        { kind: "segment", chain: "B", first: 1, last: 9, hotspots: "3" },
+      ]);
+      expect(two.C_HOT.true.length).toBe(2);
+    });
+
+    it("asks for nothing when no hotspot is named", () => {
+      expect(conditionsOf([{ kind: "generated", min: 10, max: 10 }])).toBe(undefined);
+      expect(conditionsOf([{ kind: "segment", chain: "A", first: 1, last: 9, hotspots: "" }]))
+        .toBe(undefined);
+      expect(conditionsOf([])).toBe(undefined);
+    });
+
+    // 🔴 AND HUNTER SAYS IT CANNOT. Yehlin reaches an epitope with a contact
+    // REJECTION filter - fold, then discard the cycle if the binder is not
+    // touching the hotspots - which this page does not have. A field that
+    // quietly did nothing would be worse than one that refuses.
+    it("marks hotspots unavailable on Protein Hunter", () => {
+      const spans = [{ kind: "segment", chain: "A", first: 1, last: 40, hotspots: "12" },
+        { kind: "break" }, { kind: "generated", min: 30, max: 30 }];
+      expect(contigOf(spans, "hunter").problems).toContain(METHOD_LIMITS.hunter.hotspots);
+      expect(contigOf(spans, "rfd4p").problems).toEqual([]);
     });
   });
 });
