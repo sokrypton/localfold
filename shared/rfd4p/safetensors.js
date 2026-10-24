@@ -366,17 +366,25 @@ export async function fetchShardedWeights(baseDir = null, opts = {}) {
 /**
  * Where the INT8 shards are, this run: a local export if one is there, else the published port's.
  *
- * 🔴 PROBED ON THE MANIFEST, NOT ASSUMED, because the two cases are a developer
- * who ran tools/export_rfd4p_model.py and a visitor who has never heard of it,
- * and the visitor is the common one. A 293 KB manifest is a cheap probe against
- * a 420 MB download, and the Cache API keeps the shards after the first visit.
+ * 🔴 PROBED ON A SHARD, NOT ON THE MANIFEST, and the difference is a bug that
+ * shipped for one commit. `manifest.json` is COMMITTED to this repository - the
+ * tests read it without a network - so a probe on it always succeeds and always
+ * chose the local base, which then 404'd on `shard_000.bin` because the shards
+ * are gitignored and were never there. The question is "are the WEIGHTS here",
+ * and only a weight file answers it.
+ *
+ * The two cases are a developer who ran tools/export_rfd4p_model.py and a
+ * visitor who has never heard of it; the visitor is the common one. The Cache
+ * API keeps the shards after the first visit.
  *
  * @param {AbortSignal|null} [signal]
  * @returns {Promise<string>} the base directory to read shards from
  */
 export async function resolveRfd4pShardBase(signal = null) {
-  const local = await fetch(`${DEFAULT_LOCAL_SHARDED_DIR}/manifest.json`, { method: 'HEAD', signal })
-    .catch(() => null);
+  // The exporter's first core shard. Any shard would do; this one is always
+  // written, and asking for a byte of it costs nothing.
+  const local = await fetch(`${DEFAULT_LOCAL_SHARDED_DIR}/shard_000.bin`,
+    { method: 'HEAD', signal }).catch(() => null);
   if (local && local.ok) return DEFAULT_LOCAL_SHARDED_DIR;
   return DEFAULT_PUBLISHED_SHARDED_DIR;
 }

@@ -1,6 +1,13 @@
 """Does design.html load, run its module, and say true things?
 
     python3 tools/check-design-page.py
+    python3 tools/check-design-page.py --generate   # ...and a real RFD4-Proteina generation
+
+🔴 `--generate` IS OPT-IN BECAUSE IT DOWNLOADS ~420 MB. It runs an
+unconditional 100-mer through RFD4-Proteina - the second method, the one the
+default run only checks the refusals of - and a fresh Chrome profile has no
+cache, so every run pays the weights again. About forty seconds on an M5 once
+they are down. The default arm checks everything that does not need them.
 
 🔴 WHY THIS EXISTS WHEN `test:site` AND `mobile-layout.py` ALREADY TOUCH THE
 PAGES. Neither one runs a page's JavaScript. `build_site.py` resolves the module
@@ -264,6 +271,49 @@ def main():
             # deceptively well.
             if hunted["cycle0Best"]:
                 bad.append("cycle 0 was marked best; it is the starting draw and cannot win")
+
+        # 🔴 AND, WHEN ASKED, A REAL GENERATION: the second method end to end.
+        if "--generate" in sys.argv:
+            cdp.evaluate(ws, """(() => {
+              document.getElementById('preset').value = '';
+              document.getElementById('preset').dispatchEvent(new Event('change'));
+              document.getElementById('method').value = 'rfd4p';
+              document.getElementById('method').dispatchEvent(new Event('change'));
+              // the simplest job there is: one generated span, nothing given
+              window.__designSpans.set([{ kind: 'generated', min: 100, max: 100 }]);
+              document.getElementById('steps').value = '30';
+              document.getElementById('hunt').click();
+              return 1;
+            })()""")
+            genDeadline = time.time() + 2400
+            generated = None
+            while time.time() < genDeadline:
+                generated = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                  status: document.getElementById('status-message').textContent,
+                  failed: document.getElementById('status-message').classList.contains('error'),
+                  rows: document.querySelectorAll('#results-body tr').length,
+                  progress: document.getElementById('progress').value,
+                  frames: (() => {
+                    const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+                    const renderer = entry?.renderer ?? entry;
+                    return renderer?.objectsData?.[renderer?.currentObjectName]?.frames?.length ?? 0;
+                  })(),
+                })"""))
+                if generated["failed"] or generated["rows"] > 0:
+                    break
+                time.sleep(3)
+            print(f"  generate: {generated['status']}")
+            print(f"            rows={generated['rows']} frames={generated['frames']}"
+                  f" progress={generated['progress']}")
+            if generated["failed"]:
+                bad.append(f"the generation failed: {generated['status']}")
+            else:
+                if "100 tokens" not in generated["status"]:
+                    bad.append(f"the generation did not report its tokens: {generated['status']!r}")
+                if generated["frames"] < 1:
+                    bad.append("the generation drew no structure")
+                if generated["progress"] != 1:
+                    bad.append(f"the bar ended at {generated['progress']}, not 1")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
         # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.
