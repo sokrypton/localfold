@@ -9,7 +9,7 @@ HEAD. Checksums and pLDDTs do not travel between machines - compare an M5 arm ag
 | commit | what |
 |---|---|
 | `5a48c897` | `lf_gemm`'s store loop back to its pre-`5646656b` shape; the extended epilogues off on Apple8 (`gemmExtendedEpilogues()`); the selftest reports a declined epilogue as "not taken here"; M2 baselines recorded |
-| `b7117825` | `lf_gemm`'s plain product decided once a tile again, not inside each block's store |
+| `40de1a68` | `lf_gemm`'s plain product decided once a tile again, not inside each block's store |
 | `3e3e7f80` | docs/M5-TO-M2.md section 5 |
 | (this commit) | `msa.project`'s row tile clamped to the device's workgroup storage (section 2, `test:spec-floor`); this document |
 
@@ -87,7 +87,7 @@ fallback, the one that died (`denoise.mm:274`) included, because the split decis
 predicate. 🔴 **The Apple9 boundary is an assumption, not a measurement**: no M3 or M4 has run either arm. It rests on
 the M5's own numbers under `TENSOR=0` (dynamic registers, wins) against the M2's (static, losses).
 
-### 1C. Another 3% of the plain product (`b7117825`)
+### 1C. Another 3% of the plain product (`40de1a68`)
 
 With 1A fixed the bench was still 13.2 ms against base's 12.3. Bisected over `9b61f8b4..5646656b^` (threshold 12.8 ms,
 7 repetitions) to `0de9becb`: it moved the plain-product check (no epilogue but bias/ReLU, no beta, the accumulator in
@@ -179,7 +179,7 @@ the changed store, which computes the same values in the same order - expected i
 `TENSOR=0` the selftest's e64 cases must still print `ok`, not "not taken here" - if they do not, `supportsFamily(1009)`
 answers differently on macOS 26 than assumed, and the predicate is wrong for the M3/M4 too.
 
-### 3B. The M5's control arm, `LOCALFOLD_GEMM_TENSOR=0`, before and after `5a48c897` and `b7117825`
+### 3B. The M5's control arm, `LOCALFOLD_GEMM_TENSOR=0`, before and after `5a48c897` and `40de1a68`
 
 The M2's fixes revert two M5-measured changes in `lf_gemm`. On the M5 they should cost little - its registers are
 dynamic - but nobody has measured it:
