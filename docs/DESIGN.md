@@ -237,6 +237,33 @@ asked: *what is it doing now*, *what has it found so far*, and *why did it keep 
 
 ### The input model: every object is a chain, and a chain is a contig
 
+🔴 **AND IT IS ALREADY WRITTEN.** `shared/rfd4p/design-spec.js` came in with the engine: pure, no imports, an
+atom array in and a plain object out. It reads a structure's condition annotations and returns per-chain roles, length
+ranges, an RFdiffusion contig string and the task that amounts to. The span axes below are its
+`condition_coordinate` (geometry) and `condition_sequence` (sequence), with `condition_index` saying whether a motif's
+POSITION is pinned - which is the whole difference between indexed and unindexed scaffolding - and
+`expsegmin`/`expsegmax` carrying a generated span's range.
+
+Its seven example structures are the proof the abstraction holds, and are now a test
+(`test/rfd4p-design-spec.test.js`, no Studio needed - the annotations are in the mmCIF and the parser keeps them):
+
+| example | task it reads | contig |
+|---|---|---|
+| `uncond_short` | unconditional | `100` |
+| `ppi_pdl1` | binder | `50-120/0 B1-115` |
+| `motif_idx_1prw` | motif | `5-20/A1-20/10-25/A22-41/5-20` |
+| `motif_unidx_1prw` | motif | `60-105/[A1-40]` |
+| `sm_sam` | small-molecule binder | `120-165 + S;M` |
+| `dna_7m5w` | binder | `A1-9/0 B1-10/0 120-150` |
+| `5o45_cropped` | redesign all | `115` |
+
+The two motif rows are the same protein and the same motif, differing only in whether its position is pinned - the
+brackets. That is one model producing seven modalities with no per-modality branch, which is the reason to build on
+it rather than invent a second vocabulary.
+
+🔴 **It is RFD4's vocabulary, though, not a shared one yet.** Protein Hunter has no notion of a length range or
+of generating geometry, so generalising these roles across both methods is the next piece of input work.
+
 🔴 **ONE INPUT MODEL FOR BOTH METHODS, AND IT IS THE PART WORTH GETTING RIGHT.** The page is a list of objects you
 add to, and each object is a chain — which in the general case is a *contig*: an ordered run of spans, some given and
 some to be made. That is RFdiffusion's own notion, and it turns out to describe Hunter's inputs too.
@@ -443,5 +470,7 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 | `sync-mpnn.py --check` against `sokrypton/mpnn` HEAD | worker | step 2 |
 | Whether Marielle will export LigandMPNN and NA-MPNN to the browser | Sergey / Marielle | would change 3B's trade entirely |
 | ~~Does py2Dmol already do role colouring, labelled frames and residue picking?~~ — **audited, docs/DESIGN-PY2DMOL.md**: colouring EXISTS, frames and picking PARTIAL | done | nothing |
+| 🔴 RFD4's GPU parity checks need `model.safetensors` - FLOAT weights from **NVIDIA's own** HF repo, under their terms, a large download. The harness itself works | Sergey | running those checks here |
+| Rename `weights/` to `model-rfd4p-int8/` for this repository's convention, now the hosting is settled | worker | nothing |
 | How geometric conditioning works - template, contact term, or an RMSD-to-motif term in the objective | unassigned | motif scaffolding, enzyme design |
 | Does `partial_diffusion` have a Hunter analogue? Read her `13_warmstart.py` | unassigned | that one modality |

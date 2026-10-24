@@ -8,7 +8,7 @@
  * oracle's first-cycle states) and then the full recycle depth (compared with the oracle's network outputs).
  */
 
-import { parseSafetensors } from '../../shared/rfd4p/safetensors.js';
+import { DEFAULT_HF_CONFIG_URL, DEFAULT_HF_WEIGHTS_URL, parseSafetensors } from '../../shared/rfd4p/safetensors.js';
 import { pairCondFeatures, pairFeatures, trunkCondFeatures, trunkSeqFeatures } from '../../shared/rfd4p/features.js';
 import { Rfd4pTrunkGpu } from '../../webgpu/rfd4p/trunk.js';
 
@@ -33,12 +33,29 @@ async function fetchBuffer(url) {
   return r.arrayBuffer();
 }
 
+/**
+ * The released FLOAT weights, which the parity checks compare the GPU against.
+ *
+ * 🔴 THESE ARE NOT THE INT8 SHARDS THE PAGE RUNS ON, and they are not in this
+ * repository either. Parity has to be measured against full precision, so this
+ * wants `model.safetensors` - which lives in NVIDIA's own Hugging Face repo
+ * under NVIDIA's own terms. A local `weights/model.safetensors` is used when
+ * someone has exported or downloaded one; otherwise this reaches for
+ * Hugging Face and the download is large.
+ *
+ * So every check that calls this needs that file. See weights/SOURCE.md.
+ */
 export async function loadReleased() {
+  const local = await fetch('/weights/model.safetensors', { method: 'HEAD' }).catch(() => null);
+  const weightsUrl = local && local.ok ? '/weights/model.safetensors' : DEFAULT_HF_WEIGHTS_URL;
+  const configUrl = await fetch('/weights/config.json', { method: 'HEAD' })
+    .then((r) => (r && r.ok ? '/weights/config.json' : DEFAULT_HF_CONFIG_URL))
+    .catch(() => DEFAULT_HF_CONFIG_URL);
   const [cfg, buf] = await Promise.all([
-    fetch('/weights/config.json').then((r) => r.json()),
-    fetchBuffer('/weights/model.safetensors'),
+    fetch(configUrl).then((r) => r.json()),
+    fetchBuffer(weightsUrl),
   ]);
-  return { cfg: cfg.config, weights: parseSafetensors(buf).tensors };
+  return { cfg: cfg.config ?? cfg, weights: parseSafetensors(buf).tensors };
 }
 
 export async function loadOracleCase(name) {
