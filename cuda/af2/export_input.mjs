@@ -123,7 +123,9 @@ if (args.includes("--search")) {
       model: isMultimer ? "multimer" : "monomer",
     }).a3m;
   } else {
-    a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
+    // (none: each chain's own row, merged as a search's - shared/input/mmseqs2-api.js, singleSequenceA3m)
+    const { singleSequenceA3m } = await import("../../shared/input/mmseqs2-api.js");
+    a3m = a3mPath === "" ? singleSequenceA3m(chains, isMultimer ? "multimer" : "monomer") : readFileSync(a3mPath, "utf8");
   }
 }
 const featureOptions = {

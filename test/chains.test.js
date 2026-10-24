@@ -27,15 +27,16 @@ describe("monomer-model oligomer preprocessing", () => {
     ]);
     const parsed = parseA3m(merged);
     expect(parsed.query).toBe("ACDWY");
-    expect(parsed.sequences).toEqual(["ACDWY", "ACD--", "---W-"]);
-    expect(parsed.deletionMatrix[1]).toEqual([0, 1, 0, 0, 0]);
+    // (each chain's own query row too, as ColabFold pads it: a single-sequence complex folds on those)
+    expect(parsed.sequences).toEqual(["ACDWY", "ACD--", "ACD--", "---WY", "---W-"]);
+    expect(parsed.deletionMatrix[2]).toEqual([0, 1, 0, 0, 0]);
   });
 
   it("expands one alignment independently into both homooligomer copies", () => {
     const chain = ">a\nAC\n>hit\nA-\n";
     const parsed = parseA3m(mergeUnpairedChainA3ms([chain, chain]));
     expect(parsed.query).toBe("ACAC");
-    expect(parsed.sequences).toEqual(["ACAC", "A---", "--A-"]);
+    expect(parsed.sequences).toEqual(["ACAC", "AC--", "A---", "--AC", "--A-"]);
   });
 
   it("projects the complex MSA into queries py2Dmol can match to PDB chains", () => {
@@ -58,7 +59,7 @@ describe("pairing repeated chains", () => {
     expect(diagonal.length).toBe(8);
     // ...the whole point: half the rows, and each one covers both copies.
     expect(paired.depth).toBe(3);
-    expect(diagonal.depth).toBe(5);
+    expect(diagonal.depth).toBe(7);
     expect(paired.sequences[1]).toBe("CCCCCCCC");
     expect(paired.sequences[2]).toBe("DDDDDDDD");
   });

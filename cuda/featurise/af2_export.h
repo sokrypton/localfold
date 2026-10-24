@@ -323,10 +323,16 @@ inline Af2Export exportAf2(const Args& args) {
       for (auto& t : paired) if (!trimWs(t).empty()) any = true;
       if (any) for (size_t i = 0; i < chains.size(); ++i) pairedBySequence[chains[i]] = paired[i];
       a3m = search::mergeSearchedChains(chains, chainA3ms, pairedBySequence, isMultimer ? "multimer" : "monomer").a3m;
+    } else if (!a3mPath.empty()) {
+      a3m = readFile(a3mPath);
+    } else if (chains.size() == 1) {
+      a3m = ">query\n" + chains[0] + "\n";
     } else {
-      std::string joined;
-      for (auto& c : chains) joined += c;
-      a3m = a3mPath.empty() ? ">query\n" + joined + "\n" : readFile(a3mPath);
+      // none: each chain's own row, merged as a search's (mmseqs2-api.js, singleSequenceA3m) - the monomer's copies
+      // each a row of their own, as ColabFold folds a single-sequence complex
+      std::vector<std::string> queryOnly;
+      for (auto& c : chains) queryOnly.push_back(">101\n" + c + "\n");
+      a3m = search::mergeSearchedChains(chains, queryOnly, {}, isMultimer ? "multimer" : "monomer").a3m;
     }
   }
   Af2Options o;

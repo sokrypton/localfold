@@ -659,6 +659,23 @@ export function searchCacheEntry({ chains, searched }) {
       depth: searched.depth, templateHits: searched.templateHits };
 }
 
+/**
+ * The alignment of a fold with none: each chain's own one-row alignment, merged
+ * the way a search's are - a single sequence is an alignment of depth one, a
+ * CHAIN at a time. One chain is its query; a complex on AlphaFold 2's monomer
+ * gets each copy's row besides the joined one (mergeUnpairedChainA3ms), as
+ * ColabFold folds it, and the multimer's merge of one-row chains is the joined
+ * row alone, as before.
+ *
+ * @param {string[]} sequences the chains, in fold order
+ * @param {string} model a CHAIN_MERGES key ("monomer", "multimer", ...)
+ * @returns {string}
+ */
+export function singleSequenceA3m(sequences, model) {
+  return sequences.length === 1 ? `>query\n${sequences[0]}\n`
+    : mergeSearchedChains({ sequences, chainA3ms: sequences.map((sequence) => `>101\n${sequence}\n`), model }).a3m;
+}
+
 export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model }) {
   const merge = CHAIN_MERGES[model];
   if (merge === undefined) {

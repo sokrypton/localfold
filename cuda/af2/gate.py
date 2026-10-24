@@ -65,8 +65,9 @@ def fold_cases():
         ("1brs-multimer-template", [f"--sequence={a}:{d}", f"--model={MULTIMER}", f"--template={c1brs}:A+D"],
          [c1brs, "A,D"]),
         # the MONOMER on a complex, where nearly every pair is across chains: a cross-chain pair took the multimer's
-        # relpos row, which a monomer's projection has as zeros, and twelve copies read pLDDT 50 where ColabFold
-        # reads 81 (chain A scored; the pLDDT is what moves)
+        # relpos row, which a monomer's projection has as zeros, and the single-sequence alignment was one joined row
+        # where ColabFold gives each copy its own - twelve copies read pLDDT 50, then 69 with the relpos fixed, and
+        # 79 with the rows, where ColabFold reads 81 (chain A scored; the pLDDT is what moves)
         ("6mrr-x12-monomer", [f"--sequence={':'.join([SEQ_6MRR] * 12)}"], [c6mrr]),
     ]
     a3m = os.path.join(FIX, "5caj-a.a3m")   # checked in: when it lived in the ignored oracle-dumps/ and went

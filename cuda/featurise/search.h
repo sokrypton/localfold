@@ -305,7 +305,8 @@ inline std::string mergeUnpairedChainA3ms(const std::vector<std::string>& texts)
   for (size_t c = 0; c < al.size(); ++c) {
     int left = 0, right = 0;
     for (size_t k = 0; k < al.size(); ++k) { if (k < c) left += al[k].length; else if (k > c) right += al[k].length; }
-    for (size_t row = 1; row < al[c].raw.size(); ++row)
+    // (each chain's own query row too, as ColabFold pads it - but one chain's IS the joined row, not written twice)
+    for (size_t row = al.size() > 1 ? 0 : 1; row < al[c].raw.size(); ++row)
       out += "\n>chain_" + std::to_string(c + 1) + "|" + al[c].descriptions[row] + "\n" + std::string(left, '-') + al[c].raw[row] + std::string(right, '-');
   }
   return out + "\n";

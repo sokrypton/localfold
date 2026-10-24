@@ -33,7 +33,7 @@ import { planRecycleReuse } from "../shared/af2/model/recycle-convergence.js";
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
-  expandSearchedChains, planSearchReuse, searchCacheEntry }
+  expandSearchedChains, planSearchReuse, searchCacheEntry, singleSequenceA3m }
   from "../shared/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
@@ -5080,7 +5080,10 @@ async function fold(event) {
     // QueryOnlyTemplateGpu with no weights. See graphFamily.
     const multimer = graphOf(family) === "multimer";
     const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
-    const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
+    // (none: each chain's own row, merged as a search's - on the monomer a complex's copies each a row of their own,
+    // as ColabFold folds it; see singleSequenceA3m)
+    const alignmentForDriver = alignment === null ? singleSequenceA3m(chains, multimer ? "multimer" : "monomer")
+      : alignmentForModel;
 
     // 🔴 THE MONOMER'S TEMPLATE, BUILT BEFORE af2Key, because a trunk cached
     // from a fold WITHOUT one is not this fold's trunk - which is what that

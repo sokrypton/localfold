@@ -52,8 +52,17 @@ export function residueIndexWithChainBreaks(totalLength, chainLengths) {
  * Assemble per-chain A3Ms into ColabFold-style unpaired complex rows.
  *
  * The first row contains every chain. Each remaining row occupies one chain
- * and is padded with gaps in all others. Supplying the same A3M more than once
- * gives the homooligomer expansion; distinct A3Ms give a heterooligomer MSA.
+ * and is padded with gaps in all others - each chain's OWN query row among
+ * them, as ColabFold's pad_sequences writes it. Supplying the same A3M more
+ * than once gives the homooligomer expansion; distinct A3Ms give a
+ * heterooligomer MSA.
+ *
+ * 🔴 THE CHAIN'S QUERY ROW IS WHAT A SINGLE-SEQUENCE COMPLEX FOLDS ON. It was
+ * dropped here (the loop began at row 1), so a complex with no alignment had
+ * one row, and AlphaFold 2's monomer collapses many copies on one row: 30
+ * copies of 6MRR pLDDT 21.8 and 16.7 A a chain, as ColabFold's own JAX does
+ * when given that row alone - and 57.2 and 1.74 A with the copies' rows, as
+ * ColabFold folds it.
  * Lowercase insertions are kept verbatim because they do not consume aligned
  * columns but do carry the deletion counts used by feature preprocessing.
  *
@@ -72,7 +81,8 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
     const alignment = alignments[chain];
     const left = lengths.slice(0, chain).reduce((sum, length) => sum + length, 0);
     const right = lengths.slice(chain + 1).reduce((sum, length) => sum + length, 0);
-    for (let row = 1; row < alignment.rawSequences.length; row += 1) {
+    // (one chain's own query row IS the joined one, so it is not written twice)
+    for (let row = alignments.length > 1 ? 0 : 1; row < alignment.rawSequences.length; row += 1) {
       lines.push(`>chain_${chain + 1}|${alignment.descriptions[row]}`);
       lines.push(`${"-".repeat(left)}${alignment.rawSequences[row]}${"-".repeat(right)}`);
     }
