@@ -169,3 +169,4 @@ oracle-dumps-colab/
 # holds only the config and the tensor manifest - text the tests read offline.
 model-rfd4p-int8/*.bin
 model-rfd4p-int8/*.safetensors
+model-rfd4p-int8/shards/

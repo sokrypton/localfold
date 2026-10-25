@@ -49,7 +49,7 @@ SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6",
 # The trunk's bounds; the DECODER's stages take 1e-4 on both arms and the binary applies that
 # itself - it runs in f32 whatever the arm, because its near-uniform softmax costs far more in
 # reduced precision than the trunk's does and it is one pass a generation. See src/rfd4p.cu.
-BOUND = {"exact": 1e-5, "fast": 5e-3}   # and the same for each one's `-big` arm
+BOUND = {"exact": 1e-5, "fast": 5e-3, "int8": 2.5e-2}   # and the same for each one's `-big` arm
 # A residual is this machine's arithmetic, not its luck: hold it to the bound AND to the baseline.
 TOL_RES = 2.0   # a stage may drift this many times its recorded residual before it is a finding
 TOL_MS = 0.25   # a timing is noisy and machine-specific; 25% is a regression worth printing
@@ -111,9 +111,19 @@ def main() -> int:
         # of the triangle's choices invert with length and the long branch only fires past ~40,000
         # pairs, where no oracle case reaches. LOCALFOLD_BIG forces it, as cuda/af3's big-input
         # paths are forced - an untested branch is a second, wrong implementation waiting to happen.
-        for arm in ("exact", "fast", "exact-big", "fast-big"):
-            cmd = [BINARY, case_dir, f"--weights={args.weights}", f"--oracle={oracle_dir}"]
-            if arm.startswith("fast"):
+        # 🔴 THE int8 ARM IS HELD TO THE BUNDLE'S QUANTISATION, NOT THE PORT'S ARITHMETIC. Reading
+        # the published int8 weights against an oracle computed from the FLOAT checkpoint measures
+        # how good int8 is, which is upstream's decision and not this port's; what it catches here
+        # is a reader that puts a tensor in the wrong place. It is skipped where the shards are
+        # not on disk, which is everywhere but a machine that fetched them.
+        arms = ["exact", "fast", "exact-big", "fast-big"]
+        if (REPO / "model-rfd4p-int8" / "shards" / "shard_000.bin").exists():
+            arms.append("int8")
+        for arm in arms:
+            weights = (f"--int8={REPO / 'model-rfd4p-int8'}" if arm == "int8"
+                       else f"--weights={args.weights}")
+            cmd = [BINARY, case_dir, weights, f"--oracle={oracle_dir}"]
+            if arm.startswith("fast") or arm == "int8":
                 cmd.append("--fast")
             env = dict(os.environ)
             if arm.endswith("-big"):

@@ -212,6 +212,29 @@ q/k/v came from one GEMM and the gate from another; at 4W it reads the wrong tok
 full, finite, wrong attention. And `stacked()` returned a reference to a static string, so asking it
 for a weight and then a bias left both names pointing at the bias.
 
+## The published int8 bundle
+
+`--int8=model-rfd4p-int8` reads the bundle `sokrypton/rfd4-proteina-webgpu` publishes, as the page
+does: 11 core shards, 331 MB, int8 codes with a float16 scale a block of 64, decoded on the device
+into the same names the float32 export writes. The architecture scalars come from its `config.json`
+where the export writes them as `m meta/...`, so the port sizes itself identically either way.
+
+🔴 **IT IS NOT A SPEED FEATURE AND THE MEASUREMENT SAYS SO: 2.01 s cold against the float32
+export's 1.95.** Reading a third of the bytes buys nothing here because the float path already
+mmaps and uploads asynchronously, and both land at about half a second of startup. What it buys is
+**distribution**: 331 MB instead of 1,226 on disk, and no NVIDIA checkpoint at all - the port runs
+from the published bundle alone, so nobody has to accept terms to fold with it.
+
+Quality: against an oracle computed from the FLOAT checkpoint it reads 1.6e-02, which is the
+bundle's quantisation and upstream's decision rather than this port's arithmetic. The structure it
+generates is **0.15 A of mean CA from the float one at the same seed**, with identical CA-CA and
+radius of gyration. The gate runs it as its own arm wherever the shards are on disk.
+
+🔴 **AND THE ENCODER'S FIVE SHARDS ARE NOT FETCHED.** The bundle splits 331 MB of `core` from 138 MB
+of `encoder`, the latter read only for partial diffusion and inverse folding, which this port does
+not do. A bundle without them is complete rather than broken, and a tensor the trunk or decoder
+actually wants is still caught by name at first use.
+
 ## What is not done
 
 - **An end-to-end trajectory comparison.** Every PIECE is held to the reference - the trunk, the
@@ -219,8 +242,6 @@ for a weight and then a bias left both names pointing at the bias.
   joins them is checked only by the structure it produces being a protein. `--gen-oracle` runs
   `generateRfd4pCpu` beside it at a step count somebody can wait for; 🔴 do not run it at the
   preset's 60, which is `depths` JS trunk passes at about a minute each.
-- **The int8 bundle.** `model-rfd4p-int8/` has a `manifest.json` and is the shipping path through
-  `Model::loadBundle`, as `cuda/bioemu2` does; this reads the float32 export only.
 - **A native featuriser.** `export_input.mjs` drives the page's own JS; the C++ twin under
   `cuda/featurise/` comes with the `--job` form and the `lf::standalone::main` dispatch.
 - **A gate.** There is no `gate.py` or `gate-baseline.json` yet, so nothing re-runs these numbers.

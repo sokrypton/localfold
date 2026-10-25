@@ -1,19 +1,21 @@
 {
  "_card": "NVIDIA A100-SXM4-40GB",
  "speed-n100-r6": {
-  "exact_ms": 156.38,
-  "fast_ms": 42.75
+  "exact_ms": 156.33,
+  "fast_ms": 42.49
  },
  "trunk-1": {
   "exact": 9.46e-06,
   "exact-big": 9.46e-06,
   "fast": 0.00101,
-  "fast-big": 0.00101
+  "fast-big": 0.00101,
+  "int8": 0.0159
  },
  "trunk-2": {
   "exact": 3.1e-05,
   "exact-big": 3.1e-05,
   "fast": 0.000962,
-  "fast-big": 0.00104
+  "fast-big": 0.00104,
+  "int8": 0.0206
  }
 }

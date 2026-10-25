@@ -14,13 +14,14 @@
 #include "decoder.cuh"
 #include "sampler.cuh"
 #include "generate.cuh"
+#include "bundle.cuh"
 #include <fstream>
 #include <chrono>
 
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, gen, out = "design.pdb";
+  std::string dir, weights, oracle, gen, int8, out = "design.pdb";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
   bool fast = false; // TF32 on the tensor cores, as every other port's --fast does
@@ -30,13 +31,15 @@ struct Opts {
 int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t);
 
 int run(const Opts& o) {
-  M.load(o.weights);
+  if (!o.weights.empty()) M.load(o.weights);
   M.load(o.dir);
   if (!o.oracle.empty()) M.load(o.oracle);
   if (!o.gen.empty()) M.load(o.gen);
   for (int seg = 0; seg < (int)M.segs.size(); ++seg) M.upload(seg);
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
+  // The published int8 bundle, decoded on the device into the same names the float32 export writes.
+  if (!o.int8.empty()) rfd4p::loadInt8Bundle(o.int8, o.int8 + "/shards");
   F32_TF32 = o.fast;
   CB(cublasSetMathMode(H, o.fast ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
 
@@ -94,6 +97,10 @@ int run(const Opts& o) {
   // with an f32 oracle past a model-dependent floor. The decoder therefore runs in f32 on BOTH arms
   // (see decoder.cuh) and takes one bound.
   auto boundFor = [&](const char* name) {
+    // 🔴 THE int8 BUNDLE IS HELD TO ITS OWN QUANTISATION, which is upstream's choice and not this
+    // port's arithmetic: read against an oracle computed from the FLOAT checkpoint it lands at
+    // 1.6e-02, and the structure it generates is 0.15 A of CA from the float one at the same seed.
+    if (!o.int8.empty()) return 2.5e-2;
     const bool decoder = name[0] == 'd' && name[1] == '/';
     if (decoder) return 1e-4;   // the decoder is f32 on both arms
     return o.fast ? 5e-3 : 1e-5;
@@ -387,6 +394,7 @@ int foldMain(int argc, char** argv) {
     if (!f.compare(0, 10, "--weights=")) o.weights = value("weights");
     else if (!f.compare(0, 9, "--oracle=")) o.oracle = value("oracle");
     else if (!f.compare(0, 11, "--generate=")) o.gen = f.substr(11);
+    else if (!f.compare(0, 7, "--int8=")) o.int8 = f.substr(7);
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
@@ -394,7 +402,10 @@ int foldMain(int argc, char** argv) {
     else if (f == "--no-insertion") o.insertion = false;
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
-  if (o.weights.empty()) { fprintf(stderr, "--weights=<dir> is required\n"); return 1; }
+  if (o.weights.empty() && o.int8.empty()) {
+    fprintf(stderr, "one of --weights=<dir> or --int8=<dir> is required\n");
+    return 1;
+  }
   return run(o);
 }
 
