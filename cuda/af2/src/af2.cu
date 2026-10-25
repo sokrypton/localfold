@@ -201,7 +201,8 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
 static std::string FRAMES_DIR;
 // a pair's expected PAE and its pTM term (confidence.compute_tm's), from its 64 logits - reduced on the
 // device, because the logits are 64 floats a pair (17 MB a pass at 261 residues) and these are two
-__global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
+__global__ void __launch_bounds__(256, 6)
+paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= pairs) return;
@@ -228,7 +229,8 @@ __global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, 
   }
 }
 // P(distance < 8 A) from the symmetrised distogram logits: bins 0..18 (breaks 2.3125 + 0.3125 b)
-__global__ void contact8K(const float* logits, size_t pairs, float* out) {
+__global__ void __launch_bounds__(256, 6)
+contact8K(const float* logits, size_t pairs, float* out) {
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= pairs) return;

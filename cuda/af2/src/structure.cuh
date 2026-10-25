@@ -40,9 +40,9 @@ __global__ void identityRigidK(float* r, int L) {
 }
 // points [L, H*3*P] from the projection (per head: x[0:P] y[P:2P] z[2P:3P]) -> global [L, H, P, 3]
 __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out, int L, int Hh, int Pp) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * Hh * Pp) return;
-  int p = (int)(t % Pp); size_t r = t / Pp; int h = (int)(r % Hh); int i = (int)(r / Hh);
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (unsigned)(L * Hh * Pp)) return;
+  int p = (int)(t % (unsigned)Pp); unsigned r = t / (unsigned)Pp; int h = (int)(r % (unsigned)Hh); int i = (int)(r / (unsigned)Hh);
   const float* s = proj + (size_t)i * Hh * 3 * Pp + h * 3 * Pp;
   float loc[3] = {ptx_ldg_f32(s + p), ptx_ldg_f32(s + Pp + p), ptx_ldg_f32(s + 2 * Pp + p)}, g[3];
   float rg[12];
@@ -52,7 +52,7 @@ __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out,
   rg[4] = r1.x; rg[5] = r1.y; rg[6] = r1.z; rg[7] = r1.w;
   rg[8] = r2.x; rg[9] = r2.y; rg[10] = r2.z; rg[11] = r2.w;
   rapply(rg, loc, g);
-  for (int a = 0; a < 3; ++a) ptx_st_global_f32(out + t * 3 + a, g[a]);
+  for (int a = 0; a < 3; ++a) ptx_st_global_f32(out + (size_t)t * 3 + a, g[a]);
 }
 // IPA logits -> attention weights, a warp a (query, head): logits[q, k, h] then softmax over k
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -64,10 +64,10 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
             const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
             const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
   __shared__ float srow[8][512];
-  size_t wid = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  unsigned wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (wid >= (size_t)L * Hh) return;
-  int h = (int)(wid % Hh), q = (int)(wid / Hh);
+  if (wid >= (unsigned)(L * Hh)) return;
+  int h = (int)(wid % (unsigned)Hh), q = (int)(wid / (unsigned)Hh);
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
   float mx = -INFINITY;
   float w = ptx_ldg_f32(pw + h);
@@ -160,54 +160,84 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
   sum = ptx_warp_sum_f32(sum);
   for (int k = lane; k < L; k += 32) ptx_st_global_f32(row + k, ptx_div_f32(ptx_ld_global_f32(row + k), sum));
 }
-// IPA's scalar and point outputs when the pair term runs in ipaPairTermK: a warp a (query, head), lanes 0..Cs-1
-// accumulating vs and lanes Cs..Cs+Pv-1 accumulating vp concurrently in one loop over k
-__global__ void __launch_bounds__(256, 6)
+// IPA's scalar and point outputs when the pair term runs in ipaPairTermK: a warp a (query tile of 4, head),
+// lanes 0..Cs-1 accumulating vs and lanes Cs..Cs+Pv-1 accumulating vp concurrently in one loop over k
+__global__ void __launch_bounds__(128, 8)
 ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, const float* __restrict__ vp,
                 const float* __restrict__ rig, float* __restrict__ final_, int L, int Hh, int Cs, int Pv, int C2) {
   int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (wid >= L * Hh) return;
-  int q = wid / Hh, h = wid % Hh;
-  const float* a = attn + (size_t)wid * L;
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
-  float* f = final_ + (size_t)q * Fw;
   if (Cs == 16 && Pv == 8) {
-    __shared__ float sp[8][24];
+    int qTiles = (L + 3) >> 2;
+    if (wid >= qTiles * Hh) return;
+    int h = wid % Hh, q0 = (wid / Hh) << 2;
+    int nq = ptx_min_s32(4, L - q0);
+    __shared__ float sp[4][24];
     const float* p0 = lane < 16 ? (vs + h * 16 + lane) : (vp + h * 24 + (lane - 16));
-    const float* p1 = vp + h * 24 + (lane - 8);
+    const float* p1 = vp + h * 24 + (lane >= 24 ? (lane - 8) : 0);
     int st0 = lane < 16 ? (Hh * 16) : (Hh * 24), st1 = Hh * 24;
-    float g0 = 0.f, g1 = 0.f;
-#pragma unroll 8
-    for (int k = 0; k < L; ++k) {
-      float ak = ptx_ldg_f32(a + k);
-      g0 = ptx_fma_f32(ak, ptx_ldg_f32(p0 + (size_t)k * st0), g0);
-      if (lane >= 24) g1 = ptx_fma_f32(ak, ptx_ldg_f32(p1 + (size_t)k * st1), g1);
+    const size_t aStride = (size_t)Hh * L;
+    const float* a0 = attn + ((size_t)q0 * Hh + h) * L;
+    const float* a1 = (nq > 1) ? (a0 + aStride) : a0;
+    const float* a2 = (nq > 2) ? (a0 + 2 * aStride) : a0;
+    const float* a3 = (nq > 3) ? (a0 + 3 * aStride) : a0;
+    float g0_0 = 0.f, g0_1 = 0.f, g0_2 = 0.f, g0_3 = 0.f;
+    float g1_0 = 0.f, g1_1 = 0.f, g1_2 = 0.f, g1_3 = 0.f;
+#pragma unroll 4
+    for (int k = 0; k < L; ++k, p0 += st0, p1 += st1) {
+      float v0 = ptx_ldg_f32(p0);
+      float v1 = lane >= 24 ? ptx_ldg_f32(p1) : 0.f;
+      float ak0 = ptx_ldg_f32(a0 + k);
+      float ak1 = ptx_ldg_f32(a1 + k);
+      float ak2 = ptx_ldg_f32(a2 + k);
+      float ak3 = ptx_ldg_f32(a3 + k);
+      g0_0 = ptx_fma_f32(ak0, v0, g0_0);
+      g0_1 = ptx_fma_f32(ak1, v0, g0_1);
+      g0_2 = ptx_fma_f32(ak2, v0, g0_2);
+      g0_3 = ptx_fma_f32(ak3, v0, g0_3);
+      if (lane >= 24) {
+        g1_0 = ptx_fma_f32(ak0, v1, g1_0);
+        g1_1 = ptx_fma_f32(ak1, v1, g1_1);
+        g1_2 = ptx_fma_f32(ak2, v1, g1_2);
+        g1_3 = ptx_fma_f32(ak3, v1, g1_3);
+      }
     }
-    if (lane < 16) ptx_st_global_f32(f + h * 16 + lane, g0);
-    else ptx_st_shared_f32(&sp[warp][lane - 16], g0);
-    if (lane >= 24) ptx_st_shared_f32(&sp[warp][lane - 8], g1);
-    ptx_bar_warp();
-    if (lane < 8) {
-      int p = lane;
-      float g[3] = {ptx_ld_shared_f32(&sp[warp][p * 3]),
-                    ptx_ld_shared_f32(&sp[warp][p * 3 + 1]),
-                    ptx_ld_shared_f32(&sp[warp][p * 3 + 2])}, loc[3];
-      float rg[12];
-      const float* rbase = rig + q * 12;
-      float4 r0 = ptx_ldg_v4_f32(rbase), r1 = ptx_ldg_v4_f32(rbase + 4), r2 = ptx_ldg_v4_f32(rbase + 8);
-      rg[0] = r0.x; rg[1] = r0.y; rg[2] = r0.z; rg[3] = r0.w;
-      rg[4] = r1.x; rg[5] = r1.y; rg[6] = r1.z; rg[7] = r1.w;
-      rg[8] = r2.x; rg[9] = r2.y; rg[10] = r2.z; rg[11] = r2.w;
-      rapplyInv(rg, g, loc);
-      int base = Hh * 16, idx = h * 8 + p;
-      ptx_st_global_f32(f + base + idx, loc[0]);
-      ptx_st_global_f32(f + base + Hh * 8 + idx, loc[1]);
-      ptx_st_global_f32(f + base + 2 * Hh * 8 + idx, loc[2]);
-      ptx_st_global_f32(f + base + 3 * Hh * 8 + idx,
-                        ptx_sqrt_f32(ptx_max_f32(ptx_fma_f32(loc[2], loc[2], ptx_fma_f32(loc[1], loc[1], ptx_mul_f32(loc[0], loc[0]))), 1e-16f)));
+    float g0s[4] = {g0_0, g0_1, g0_2, g0_3};
+    float g1s[4] = {g1_0, g1_1, g1_2, g1_3};
+    for (int qi = 0; qi < nq; ++qi) {
+      int q = q0 + qi;
+      float* f = final_ + (size_t)q * Fw;
+      if (lane < 16) ptx_st_global_f32(f + h * 16 + lane, g0s[qi]);
+      else ptx_st_shared_f32(&sp[warp][lane - 16], g0s[qi]);
+      if (lane >= 24) ptx_st_shared_f32(&sp[warp][lane - 8], g1s[qi]);
+      ptx_bar_warp();
+      if (lane < 8) {
+        int p = lane;
+        float g[3] = {ptx_ld_shared_f32(&sp[warp][p * 3]),
+                      ptx_ld_shared_f32(&sp[warp][p * 3 + 1]),
+                      ptx_ld_shared_f32(&sp[warp][p * 3 + 2])}, loc[3];
+        float rg[12];
+        const float* rbase = rig + q * 12;
+        float4 r0 = ptx_ldg_v4_f32(rbase), r1 = ptx_ldg_v4_f32(rbase + 4), r2 = ptx_ldg_v4_f32(rbase + 8);
+        rg[0] = r0.x; rg[1] = r0.y; rg[2] = r0.z; rg[3] = r0.w;
+        rg[4] = r1.x; rg[5] = r1.y; rg[6] = r1.z; rg[7] = r1.w;
+        rg[8] = r2.x; rg[9] = r2.y; rg[10] = r2.z; rg[11] = r2.w;
+        rapplyInv(rg, g, loc);
+        int base = Hh * 16, idx = h * 8 + p;
+        ptx_st_global_f32(f + base + idx, loc[0]);
+        ptx_st_global_f32(f + base + Hh * 8 + idx, loc[1]);
+        ptx_st_global_f32(f + base + 2 * Hh * 8 + idx, loc[2]);
+        ptx_st_global_f32(f + base + 3 * Hh * 8 + idx,
+                          ptx_sqrt_f32(ptx_max_f32(ptx_fma_f32(loc[2], loc[2], ptx_fma_f32(loc[1], loc[1], ptx_mul_f32(loc[0], loc[0]))), 1e-16f)));
+      }
+      ptx_bar_warp();
     }
     return;
   }
+  if (wid >= L * Hh) return;
+  int q = wid / Hh, h = wid % Hh;
+  const float* a = attn + (size_t)wid * L;
+  float* f = final_ + (size_t)q * Fw;
   float s = 0.f, g0 = 0.f, g1 = 0.f, g2 = 0.f;
   int p = lane - Cs;
   bool isS = lane < Cs, isP = p >= 0 && p < Pv;
@@ -277,8 +307,9 @@ __global__ void ipaOutputsK(const float* attn, const float* vs, const float* vp,
 // heads' sums (a block a (query, head) read the query's pair row once per head - 12 times, ~1.5 GB a call at 494
 // residues). Each sum runs over k in the same order with the same arithmetic, so the outputs are the same bytes.
 constexpr int IPA_MAX_HEADS = 16, IPA_KT = 256;
-__global__ void ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, float* __restrict__ final_,
-                             int L, int Hh, int Cs, int Pv, int C2) {
+__global__ void __launch_bounds__(128, 6)
+ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, float* __restrict__ final_,
+             int L, int Hh, int Cs, int Pv, int C2) {
   __shared__ float as[IPA_MAX_HEADS][IPA_KT];
   int q = blockIdx.x;
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
@@ -287,15 +318,29 @@ __global__ void ipaPairTermK(const float* __restrict__ attn, const float* __rest
     float acc[12] = {};
     for (int k0 = 0; k0 < L; k0 += IPA_KT) {
       int kt = ptx_min_s32(IPA_KT, L - k0);
-      for (int t = c; t < 12 * kt; t += 128) {
-        int h = t / kt, k = t - h * kt;
-        ptx_st_shared_f32(&as[h][k], ptx_ldg_f32(attn + ((size_t)q * 12 + h) * L + k0 + k));
+#pragma unroll
+      for (int h = 0; h < 12; ++h) {
+        const float* ah = attn + ((size_t)q * 12 + h) * L + k0;
+        if (c < kt) ptx_st_shared_f32(&as[h][c], ptx_ldg_f32(ah + c));
+        if (c + 128 < kt) ptx_st_shared_f32(&as[h][c + 128], ptx_ldg_f32(ah + c + 128));
       }
       ptx_bar_sync();
       const float* a2d = act2d + ((size_t)q * L + k0) * 128 + c;
-#pragma unroll 8
-      for (int k = 0; k < kt; ++k) {
-        float v = ptx_ldg_f32(a2d + (size_t)k * 128);
+      int k = 0;
+      for (; k + 3 < kt; k += 4, a2d += 512) {
+        float v0 = ptx_ldg_f32(a2d);
+        float v1 = ptx_ldg_f32(a2d + 128);
+        float v2 = ptx_ldg_f32(a2d + 256);
+        float v3 = ptx_ldg_f32(a2d + 384);
+        float vs[4] = {v0, v1, v2, v3};
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+          for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ptx_ld_shared_f32(&as[h][k + u]), vs[u], acc[h]);
+        }
+      }
+      for (; k < kt; ++k, a2d += 128) {
+        float v = ptx_ldg_f32(a2d);
 #pragma unroll
         for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ptx_ld_shared_f32(&as[h][k]), v, acc[h]);
       }
@@ -447,7 +492,7 @@ __global__ void addBiasIntoK(float* dst, float* y, const float* bias, size_t row
     ptx_st_global_f32(y + t, ptx_relu_f32(s));
   }
 }
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(256, 4)
 addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const float* __restrict__ bias,
            float* __restrict__ out, size_t rows, int C, const float* __restrict__ scale, const float* __restrict__ offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -474,11 +519,6 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
     }
     s = ptx_warp_sum_f32(s);
     float mean = ptx_mul_f32(s, 1.f / 384.f);
-#pragma unroll
-    for (int k = 0; k < 12; ++k) { float d = ptx_sub_f32(xv[k], mean); v = ptx_fma_f32(d, d, v); }
-    v = ptx_warp_sum_f32(v);
-    float inv = ptx_rsqrt_f32(ptx_fma_f32(v, 1.f / 384.f, 1e-5f));
-    float* outr = out + row * 384;
     float sc[12], of[12];
 #pragma unroll
     for (int k = 0; k < 12; ++k) {
@@ -486,6 +526,11 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
       sc[k] = ptx_ldg_f32(scale + c);
       of[k] = ptx_ldg_f32(offset + c);
     }
+#pragma unroll
+    for (int k = 0; k < 12; ++k) { float d = ptx_sub_f32(xv[k], mean); v = ptx_fma_f32(d, d, v); }
+    v = ptx_warp_sum_f32(v);
+    float inv = ptx_rsqrt_f32(ptx_fma_f32(v, 1.f / 384.f, 1e-5f));
+    float* outr = out + row * 384;
 #pragma unroll
     for (int k = 0; k < 12; ++k) {
       int c = lane + k * 32;
@@ -508,15 +553,16 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
     ptx_st_global_f32(out + row * C + c,
                       ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(ptx_ld_global_f32(rr + c), mean), inv), ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c)));
 }
-__global__ void ipaUnpackK(const float* __restrict__ proj, float* __restrict__ qs, float* __restrict__ ks, float* __restrict__ vs,
-                           const float* __restrict__ bias, const float* __restrict__ rig,
-                           float* __restrict__ qp, float* __restrict__ kp, float* __restrict__ vp,
-                           int L, int Hh, int Cs, int Pq, int Pv, float qScale) {
+__global__ void __launch_bounds__(256, 6)
+ipaUnpackK(const float* __restrict__ proj, float* __restrict__ qs, float* __restrict__ ks, float* __restrict__ vs,
+           const float* __restrict__ bias, const float* __restrict__ rig,
+           float* __restrict__ qp, float* __restrict__ kp, float* __restrict__ vp,
+           int L, int Hh, int Cs, int Pq, int Pv, float qScale) {
   int Ws = Hh * Cs, Wqp = Hh * 3 * Pq, Wvp = Hh * 3 * Pv, Wipa = 3 * Ws + 2 * Wqp + Wvp;
   int pts = Hh * (2 * Pq + Pv), work = ptx_max_s32(3 * Ws, pts);
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * work) return;
-  int i = (int)(t / work), k = (int)(t % work);
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (unsigned)(L * work)) return;
+  int i = (int)(t / (unsigned)work), k = (int)(t % (unsigned)work);
   const float* row = proj + (size_t)i * Wipa;
   if (k < 3 * Ws) {
     float v = ptx_add_f32(ptx_ldg_f32(row + k), ptx_ldg_f32(bias + k));
@@ -702,9 +748,10 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
     // (the pair term apart, a block a query: see ipaPairTermK)
     const bool pairApart = act2d && Hh <= IPA_MAX_HEADS && C2 <= 1024;
-    if ((pairApart || lean) && Cs + Pv <= 32)
-      ipaOutputsFastK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(attn, vs, vp, rig, fin, L, Hh, Cs, Pv, C2);
-    else
+    if ((pairApart || lean) && Cs + Pv <= 32) {
+      size_t nw = (Cs == 16 && Pv == 8) ? (size_t)((L + 3) >> 2) * Hh : (size_t)L * Hh;
+      ipaOutputsFastK<<<(unsigned)((nw + 3) / 4), 128, 0, STREAM>>>(attn, vs, vp, rig, fin, L, Hh, Cs, Pv, C2);
+    } else
       ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, pairApart ? nullptr : act2d, rig, fin, L, Hh, Cs, Pv, C2);
     if (pairApart) ipaPairTermK<<<L, (C2 == 128 && Hh == 12) ? 128 : (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
     if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
