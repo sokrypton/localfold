@@ -715,10 +715,13 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       B16* m16 = reinterpret_cast<B16*>(msa);
       AttnW w = attnWeights(R + "/attention", blk, C);
       int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
-      half* xn = scratch<half>("frow.xn", rows * C);
-      if (takeEmittedLn(R + "/query_norm", blk, msa, rows) != xn)
+      // the previous block's outer product mean may have emitted these rows already (into opmln.next, see there)
+      half* xn = (half*)takeEmittedLn(R + "/query_norm", blk, msa, rows);
+      if (!xn) {
+        xn = scratch<half>("frow.xn", rows * C);
         layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
                                                                                   P(R + "/query_norm/offset", blk));
+      }
       half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       const std::string ln = S + "msa_column_attention/query_norm";
@@ -1214,7 +1217,12 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       if (MSA16 && msa == t.msa16) {
         int nextBlk = rows > 4096 ? (t.opmFirst ? blk : (blk + 1 < (int)dimW(S + "msa_transition/transition1/weights", 0) ? blk + 1 : -1)) : -1;
         const std::string rln = S + "msa_row_attention_with_pair_bias/query_norm";
-        half* xnRow = nextBlk >= 0 ? scratch<half>("frow.xn", rows * C) : nullptr;
+        // 🔴 NOT frow.xn: the rows live from here, the end of block b, to block b+1's row attention - across the whole
+        // pair stack - and frow. is a SHARED family whose slot the pair stack's families may be handed (af2.cu,
+        // SHARED_FAMILIES). Which slot depends on what the process folded before, so a resident server's second job
+        // (a 522-residue fold, then 5CAJ with its alignment) read rows the triangle had overwritten: CA-CA 1.95 A,
+        // 17.9 A from the crystal, at pLDDT 82.4. opmln. is in no family, so the buffer is this one's alone
+        half* xnRow = nextBlk >= 0 ? scratch<half>("opmln.next", rows * C) : nullptr;
         const float* s2 = nextBlk >= 0 ? P(rln + "/scale", nextBlk) : nullptr;
         const float* o2 = nextBlk >= 0 ? P(rln + "/offset", nextBlk) : nullptr;
         withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk, s2, o2, xnRow); });
