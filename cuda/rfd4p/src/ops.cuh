@@ -172,14 +172,15 @@ __global__ void mulSigmoidAddK(const float* __restrict__ a, const float* __restr
 }
 // As above, with the gate read CHANNEL-MAJOR: it comes out of the triangle's fused projection in
 // plane layout, and an index is cheaper than the GEMM that producing it separately would cost.
-__global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const float* __restrict__ gPlanes,
+template <class T>
+__global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __restrict__ gPlanes,
                                         const float* __restrict__ pairMask, float* __restrict__ z,
                                         size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   size_t p = i / C;
   if (pairMask && pairMask[p] == 0.f) return;
-  const float g = gPlanes[(size_t)(i - p * C) * rows + p];
+  const float g = (float)gPlanes[(size_t)(i - p * C) * rows + p];
   z[i] += a[i] * (1.f / (1.f + __expf(-g)));
 }
 
@@ -212,14 +213,18 @@ __global__ void pairMaskK(const float* __restrict__ mask, float* __restrict__ ou
 // `Y[out][rows] = X[rows][in] * W[out][in]^T` - the projection written CHANNEL-MAJOR, which is the
 // layout the triangle's contraction wants. Same arithmetic as `linear`, transposed on the way out, so
 // the transpose costs nothing instead of a kernel over the whole pair tensor.
-inline void linearPlanes(const float* X, float* Y, size_t rows, int in, int out, const std::string& w) {
+template <class T>
+inline void linearPlanes(const T* X, T* Y, size_t rows, int in, int out, const std::string& w) {
   if (lenW(w) != (size_t)in * out) {
     fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out);
     exit(1);
   }
   const float one = 1.f, zero = 0.f;
-  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, out, in, &one, X, CUDA_R_32F, in, W(w),
-                  CUDA_R_32F, in, &zero, Y, CUDA_R_32F, (int)rows, computeType(),
+  constexpr cudaDataType_t TY = std::is_same_v<T, half> ? CUDA_R_16F : CUDA_R_32F;
+  const void* Wp = std::is_same_v<T, half> ? (const void*)Wh(w) : (const void*)W(w);
+  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, out, in, &one, X, TY, in, Wp, TY, in,
+                  &zero, Y, TY, (int)rows,
+                  std::is_same_v<T, half> ? CUBLAS_COMPUTE_32F : computeType(),
                   CUBLAS_GEMM_DEFAULT));
 }
 
@@ -242,17 +247,20 @@ __global__ void toPlanesK(const float* __restrict__ in, float* __restrict__ out,
 // The triangle's gating, in plane layout and in one launch: `a = aP * sigmoid(aG) * mask` and
 // `b = bP * sigmoid(bG) * mask`, reading the four quarters of one fused projection and writing over
 // the first and third. Replaces two sigmoid-multiplies, two mask passes and two transposes.
-__global__ void gatePlanesK(float* __restrict__ p, const float* __restrict__ pairMask, size_t pairs,
+template <class T>
+__global__ void gatePlanesK(T* __restrict__ p, const float* __restrict__ pairMask, size_t pairs,
                             int cH) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= pairs * (size_t)cH) return;
   const float m = pairMask ? pairMask[i % pairs] : 1.f;
-  float* aP = p;
-  const float* aG = p + pairs * (size_t)cH;
-  float* bP = p + 2 * pairs * (size_t)cH;
-  const float* bG = p + 3 * pairs * (size_t)cH;
-  aP[i] = m * aP[i] / (1.f + __expf(-aG[i]));
-  bP[i] = m * bP[i] / (1.f + __expf(-bG[i]));
+  T* aP = p;
+  const T* aG = p + pairs * (size_t)cH;
+  T* bP = p + 2 * pairs * (size_t)cH;
+  const T* bG = p + 3 * pairs * (size_t)cH;
+  const float a = m * (float)aP[i] / (1.f + __expf(-(float)aG[i]));
+  const float b = m * (float)bP[i] / (1.f + __expf(-(float)bG[i]));
+  aP[i] = (T)a;
+  bP[i] = (T)b;
 }
 
 __global__ void fromPlanesK(const float* __restrict__ in, float* __restrict__ out, size_t pairs, int C) {

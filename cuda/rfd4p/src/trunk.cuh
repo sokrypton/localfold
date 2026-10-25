@@ -229,12 +229,19 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
 // stride is 1 - the channels interleave, which is legal and saves transposing into planes the way AF3
 // does. Outgoing is `x[i][j] = sum_k a[i][k] b[j][k]`, incoming `sum_k a[k][i] b[k][j]`, and the only
 // difference is which operand is transposed.
-inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
-                     const std::string& pre) {
+// 🔴 THE PLANES ARE HALF UNDER --fast, AND THEY ARE THE BIGGEST INTERMEDIATE IN THE PORT: five
+// projections of [pairs, 384] at n = 100 is 1408 x 10,000 floats, 56 MB written and read back once a
+// triangle. The GEMMs around them are at 144 TFLOP/s against this card's 156 TF32 ceiling, so what is
+// left to win is bytes, not arithmetic. The contraction still accumulates in f32 - a sum over n of
+// products is where half overflows, which is the one place AF3's pair track keeps f32 too.
+template <class TP>
+inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgoing,
+                      const std::string& pre) {
   const size_t rows = d.pairs();
   const int cZ = d.P, cH = d.TRI, n = d.n;
-  float* zNorm = scratch<float>("rfd4p.tri.zn", rows * cZ);
-  layerNorm(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")), optW(wn(pre + ".layer_norm_in.bias")));
+  TP* zNorm = scratch<TP>("rfd4p.tri.zn", rows * cZ);
+  layerNorm<TP>(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")),
+                optW(wn(pre + ".layer_norm_in.bias")));
 
   // 🔴 ONE PROJECTION, NOT FOUR, AND IT LANDS IN THE LAYOUT THE CONTRACTION WANTS. a_p, a_g, b_p and
   // b_g all read the same `zNorm`, so their weights stack into one `[4 * cH, cZ]` matrix - a plain
@@ -247,21 +254,23 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
                                     {wn(pre + ".linear_a_p.weight"), wn(pre + ".linear_a_g.weight"),
                                      wn(pre + ".linear_b_p.weight"), wn(pre + ".linear_b_g.weight"),
                                      wn(pre + ".linear_g.weight")});
-  float* planes = scratch<float>("rfd4p.tri.planes", (4 * (size_t)cH + cZ) * rows);
-  linearPlanes(zNorm, planes, rows, cZ, 4 * cH + cZ, fused);
-  gatePlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(planes, pairMask, rows, cH);
-  const float* aT = planes;
-  const float* bT = planes + 2 * rows * (size_t)cH;
-  const float* gPlanes = planes + 4 * rows * (size_t)cH;
+  TP* planes = scratch<TP>("rfd4p.tri.planes", (4 * (size_t)cH + cZ) * rows);
+  linearPlanes<TP>(zNorm, planes, rows, cZ, 4 * cH + cZ, fused);
+  gatePlanesK<TP><<<blocks(rows * cH), 256, 0, STREAM>>>(planes, pairMask, rows, cH);
+  const TP* aT = planes;
+  const TP* bT = planes + 2 * rows * (size_t)cH;
+  const TP* gPlanes = planes + 4 * rows * (size_t)cH;
 
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
   float* xT = scratch<float>("rfd4p.tri.xt", rows * cH);
   const float one = 1.f, zero = 0.f;
+  constexpr cudaDataType_t TPT = std::is_same_v<TP, half> ? CUDA_R_16F : CUDA_R_32F;
   CB(cublasGemmStridedBatchedEx(
       H, outgoing ? CUBLAS_OP_T : CUBLAS_OP_N, outgoing ? CUBLAS_OP_N : CUBLAS_OP_T, n, n, n, &one,
-      bT, CUDA_R_32F, n, (long long)n * n, aT, CUDA_R_32F, n, (long long)n * n, &zero,
-      xT, CUDA_R_32F, n, (long long)n * n, cH, computeType(), CUBLAS_GEMM_DEFAULT));
+      bT, TPT, n, (long long)n * n, aT, TPT, n, (long long)n * n, &zero,
+      xT, CUDA_R_32F, n, (long long)n * n, cH,
+      std::is_same_v<TP, half> ? CUBLAS_COMPUTE_32F : computeType(), CUBLAS_GEMM_DEFAULT));
   float* x = scratch<float>("rfd4p.tri.x", rows * cH);
   fromPlanes(xT, x, rows, cH);
   float* xNorm = scratch<float>("rfd4p.tri.xn", rows * cH);
@@ -272,7 +281,13 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
   // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
   // was taken at the top, so nothing downstream of here reads z again. The gate arrives channel-major
   // out of the fused projection, which costs the kernel an index and saves a whole GEMM.
-  mulSigmoidAddPlaneGateK<<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z, rows, cZ);
+  mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z, rows, cZ);
+}
+
+inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
+                     const std::string& pre) {
+  if (F32_TF32) triangleT<half>(z, pairMask, d, outgoing, pre);
+  else triangleT<float>(z, pairMask, d, outgoing, pre);
 }
 
 // ---------------------------------------------------------------- the pair update
