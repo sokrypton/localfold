@@ -518,6 +518,23 @@ fold; alone 0.763 ms a call there, 95 TFLOP/s, a harness loading a hand-edited c
 Nothing here beats the compiled kernel, and the best case for the four-block form (every reload hidden) was ~5% of
 this kernel, ~1.5% of a fold.
 
+**Three more, none taken** (A100, steady-state server, two interleaved rounds):
+
+- *The MSA row attention's tiling.* At 261 keys it runs at 68.6 TFLOP/s against the triangle attention's 95, and its
+  64-query blocks pad 261 queries to 320. A block of one warp over four grid rows (32 queries, 288) and key tiles of
+  32 or 64 were each slower than the shipped two warps x two rows x 48 keys (508 rows, 8 heads, bf16 out): 1w x 4r
+  0.80x at 48 keys, 0.98x at 32, 0.69x at 64; 2w x 2r 0.96x at 32, 0.89x at 64. The shape the earlier rounds chose
+  is the fastest of the six; less padding does not pay against fewer warps a query tile.
+- *An INT8 triangle contraction* (the A100's integer MMAs at twice bf16's rate; the contraction is ~10% of a long
+  fold, already 75-78% of the tensor pipe in cuBLASLt). Not built: unlike e4m3 it needs a scale a row, and a
+  contraction row is written by many blocks of the input kernel, so it costs a quantising pass over a and b (~0.14
+  ms a call at 522 residues) against ~0.13 ms saved on the 0.26 ms contraction. FP8, which needs no scales, bought
+  2-7% on the cards that have it.
+- *CUDA graphs below eight passes* (`AF2_GRAPHS`): the same-shape job repeated, 68 residues 63.8 -> 57.8 ms and 261
+  301.5 -> 294.6, level at 522 and with an alignment, output identical. But the first fold in a process pays ~9 ms
+  more, and 68 residues folded after a 261-residue job gains nothing (63.5 against 64.4). Open - not a default
+  until that order dependence is understood.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
