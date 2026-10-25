@@ -513,6 +513,41 @@ def main() -> int:
                       if caca else f"  {'int8 job':10s} no structure  FAILED")
                 got["int8_job"] = {"caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
 
+            # 🔴 THE ASSIGNMENT SOLVER, ON ITS OWN. It decides which designed token an
+            # unindexed motif is grafted onto, so a wrong answer is a plausible structure with
+            # the motif in the WRONG PLACE - not a crash and not a number anybody reads. It is
+            # Jonker-Volgenant with potentials, which agrees with the textbook Hungarian on the
+            # optimum and may differ where the optimum is not unique, so it is compared against
+            # the reference's own rather than against a property like "the cost is minimal".
+            # 🔴 AND THE MATRIX IS GENERATED ON BOTH SIDES, not passed between them: a double
+            # written and re-read as text differs in the last place, and an assignment is a
+            # DISCRETE answer that can flip on exactly that.
+            probe = HERE / "featurise" / "assign-probe"
+            if probe.exists():
+                bad_assign, n_assign = 0, 0
+                shapes = [(4, 4), (3, 7), (7, 3), (1, 5), (5, 1), (12, 12), (9, 14), (20, 11)]
+                for sd in (1, 7, 42):
+                    for rows, cols in shapes:
+                        for mode in ("n", "x"):
+                            for every in ("", "3", "5"):
+                                # (not `args`: that is argparse's namespace in this scope, and
+                                # shadowing it made the NEXT arm fail with
+                                # `'list' object has no attribute 'weights'`)
+                                probe_args = [str(sd), str(rows), str(cols), mode]
+                                if every:
+                                    probe_args.append(every)
+                                a = run([probe, *probe_args], cwd=REPO).stdout.strip()
+                                b = run(["node", HERE / "featurise" / "assign-probe.mjs",
+                                         *probe_args], cwd=REPO).stdout.strip()
+                                n_assign += 1
+                                if a != b:
+                                    bad_assign += 1
+                if bad_assign:
+                    failed += 1
+                print(f"  {'assign':10s} {n_assign} matrices against the reference solver  "
+                      f"{'ok ' if not bad_assign else f'DIFFER {bad_assign}'}")
+                got["assign"] = {"cases": n_assign, "differing": bad_assign}
+
             # 🔴 AND A JOB THAT NAMES AN INPUT STRUCTURE MUST FOLD, not merely featurise. Every
             # arm above is a contig - a pure design job where most of the structure pipeline is a
             # no-op - and this one runs the whole of it in the fold binary: the mmCIF reader, the
