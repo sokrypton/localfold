@@ -152,6 +152,17 @@ again.
   (n=200 151.9 → 147.8, n=400 575.9 → 555.9) and exactly nothing at n=100, where the materialised
   norm it removes is small beside the launch overhead it does not. Kept for the lengths that matter;
   measure a kernel at the size it will run, not at the size that is convenient.
+- **CUDA GRAPHS, which is the one I most expected to pay.** At n=100 a pass is 578 kernel launches
+  averaging 12.5 us, 104,130 of them in a generation, and nsys puts the card at 88% busy - 12% of
+  the sampling spent between kernels. Captured once per distinct recycle depth and replayed, with
+  the conditioning copied into fixed buffers and the sampler's scalars moved behind a device
+  pointer so a frozen graph could still see them: **1.46 s with, 1.45 s without.** Nothing. The
+  gaps are not launch overhead that a graph can remove.
+  🔴 AND THE FIRST ATTEMPT LOOKED 9% SLOWER FOR A REASON THAT WAS MINE: the warm-up that sizes
+  scratch before a capture ran one pass A DEPTH, 21 extra trunk passes out of 180, inside the timed
+  region. The buffers do not depend on the depth - only whether the second conditioning pack exists
+  does - so one pass at the deepest recycle is enough. A setup cost inside the measurement is not a
+  slow kernel.
 - **Avoiding the strided read of the triangle's gate**, either way round: a tiled transpose of the
   gate first is 53.0 → 54.1, and giving `linear_g` its own row-major GEMM off the half-normed input
   is 54.9. A strided element costs a whole transaction whatever its width, and both ways of dodging
