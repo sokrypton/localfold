@@ -148,17 +148,20 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     if (j > 0) {
       cpWait<0>();
       __syncthreads();
-      if (NST == 2 && j + 1 < chunks) issue(j + 1, st ^ 1);
     }
 #endif
     const half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
     float ha[MT][NC / 8][4] = {}, hb[MT][NC / 8][4] = {};
     constexpr int N2 = NC / 16, STEPS1 = KS * N2;
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+    uint32_t vb[2][4];
     {
       uint32_t fa[2][4], fb[2][4];
       ldsm4t(fa[0], a + stageSw<NC>(kl, cl));
       if constexpr (!RELU) ldsm4t(fb[0], b + stageSw<NC>(kl, cl));
+#if !LF_REG_STAGES
+      if (j > 0 && NST == 2 && j + 1 < chunks) issue(j + 1, st ^ 1);
+#endif
 #pragma unroll
       for (int s = 0; s < STEPS1; ++s) {
         const int cur = s & 1, ks = s / N2, n2 = s % N2;
@@ -166,6 +169,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
           const int nks = (s + 1) / N2, nn2 = (s + 1) % N2;
           ldsm4t(fa[cur ^ 1], a + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
           if constexpr (!RELU) ldsm4t(fb[cur ^ 1], b + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
+        } else {
+          ldsm4t(vb[0], w2 + w2Sw<C>(kl, cl));
         }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -184,8 +189,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     // SwiGLU in f32, straight into the second GEMM's A fragments
 #pragma unroll
     for (int t = 0; t < NC / 16; ++t) {
-      uint32_t vb[2][4];
-      ldsm4t(vb[0], w2 + w2Sw<C>(t * 16 + kl, cl));
+      if (t > 0) ldsm4t(vb[0], w2 + w2Sw<C>(t * 16 + kl, cl));
       uint32_t pa[MT][4];
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
@@ -247,11 +251,15 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     }
     __syncwarp();
     if constexpr (MT == 1) {
+      float4 a4All[RW / LPR];
+#pragma unroll
+      for (int i = 0; i < RW / LPR; ++i)
+        a4All[i] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
         size_t row = baseRow + i * LPR;
         if (row >= rows) continue;
-        float4 a4 = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
+        float4 a4 = a4All[i];
         float4 v = pairUnpack4<PT>(pv[i]);
         if constexpr (RELU) {
           a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
@@ -488,7 +496,7 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
       if (const char* e = getenv("LOCALFOLD_FT_FORM")) return atoi(e) == 1;
       int dev, perSm = 0; CK(cudaGetDevice(&dev));
       CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-      return (size_t)perSm >= 3 * ((size_t)64 * (128 + 8) * 2 + 2 * ftStage<128, 16>());
+      return (size_t)perSm >= 3 * (ftSmem<128, 4, 1, 16, RELU>() + 1024);
     }();
     if (oneTile) fusedTransitionAt<4, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     else fusedTransitionAt<4, RELU, 2, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
