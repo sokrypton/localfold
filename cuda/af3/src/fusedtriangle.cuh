@@ -941,8 +941,8 @@ constexpr size_t gridInSmem(int warps, int nc = 64, int C = 128) {
   return st + (xr > st + ys ? xr : st + ys);
 }
 template <int C, int NQ, int WARPS, class PT = float, int NCI = 64, int MT = 1,
-          int MINB = (WARPS == 4 && NCI == 64 && MT == 1 && (C == 128 || C == 64)) ? 3
-                   : (((WARPS == 8 && NCI == 64 && MT == 1) || (WARPS == 4 && NCI == 32 && MT == 2)) && (C == 128 || C == 64)) ? 2 : 1>
+          int MINB = (WARPS == 4 && (NCI == 64 && MT == 1 || NCI == 32 && MT == 2) && (C == 128 || C == 64)) ? 3
+                   : (WARPS == 8 && NCI == 64 && MT == 1 && (C == 128 || C == 64)) ? 2 : 1>
 __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, NCI, C))) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wq, half* __restrict__ out, int n, size_t q0,
     size_t rows, bool tr, const half* __restrict__ Wb, half* __restrict__ bias, int heads, int stride, bool swap,
@@ -1400,7 +1400,13 @@ inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOf
   // a T4 (64 KB an SM): 4 warps at two 16-row tiles each (MT=2, 128 rows a block) and 32-column stages, with prologue Xs
   // aliasing stage 1 of Wst + YsBase (27.0 KB a block -> 2 blocks = 8 warps = 256 rows an SM, and half the shared-memory
   // ldsm4t weight reads per row)
-  if (GI_T4_NC && ccMajor() < 8 && (rows + 127) / 128 >= (size_t)MIN_BLOCKS && fitsSmem(gridInSmem(4, GI_T4_NC, C))) {
+  static const bool gi8Fits2 = [] {
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    size_t lim = getenv("LOCALFOLD_SMEM_LIMIT") ? smemLimit() : (size_t)perSm;
+    return lim >= 2 * (gridInSmem(GI_WARPS, 64, C) + 1024);
+  }();
+  if (GI_T4_NC && !gi8Fits2 && (rows + 127) / 128 >= (size_t)MIN_BLOCKS && fitsSmem(gridInSmem(4, GI_T4_NC, C))) {
     gridInAt<4, GI_T4_NC, C, 2>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8, vt8);
     return;
   }

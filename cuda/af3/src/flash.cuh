@@ -1124,7 +1124,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false> __h
 // (an FP8 part runs flash8 below instead, through the pair track: e4m3 MMAs, half of these)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
-__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D == 8 && BK <= 64) ? 4 : (!ONE && WARPS * RR == 4 && WARPS * MT <= 4 && (BK <= 48 || (BK == 64 && D <= 32)) && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D == 8 && BK <= 64) ? 4 : (!ONE && WARPS * RR == 4 && MT <= 2 && (BK <= 48 || (BK == 64 && D <= 32)) && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, OT* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is

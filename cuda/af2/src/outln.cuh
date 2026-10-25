@@ -41,6 +41,7 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, rg = warp & 3, chh = warp >> 2;
   const size_t row0 = (size_t)blockIdx.x * R;
+  const bool fullRows = (row0 + R <= rows);
   auto As = [&](int s) { return (TI*)(smem + s * STG); };
   auto Ws = [&](int s) { return (TI*)(smem + s * STG) + R * LDA; };
   M* V = (M*)smem;
@@ -66,7 +67,8 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     } else {   // A: 64 rows x 32 k, one 16-byte piece a thread
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
-      cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+      if (fullRows) cpAsync16(As(s) + swA(r, c), O + row * C + kc * KC + c, true);
+      else cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
     }
 #pragma unroll
     for (int i = 0; i < WPT; ++i) {   // W: 32 k x 256 columns, four a thread
@@ -86,11 +88,19 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
       cpWait<0>();
       // Stage 0 is now idle while kc == KSTEPS - 1 reads Stage 1: prefetch the first 32 rows of msa into V[0..31]
       static_assert((R / 2) * LDV * 2 <= STG, "first half of V fits in idle stage 0");
+      if (fullRows) {
 #pragma unroll
-      for (int i = 0; i < (R / 2) * C / 8 / NTH; ++i) {
-        const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
-        const size_t row = row0 + r;
-        cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+        for (int i = 0; i < (R / 2) * C / 8 / NTH; ++i) {
+          const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
+          cpAsync16(V + r * LDV + c, msa + (row0 + r) * C + c, true);
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < (R / 2) * C / 8 / NTH; ++i) {
+          const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
+          const size_t row = row0 + r;
+          cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+        }
       }
       cpCommit();
     }
@@ -115,11 +125,19 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     __syncthreads();
   }
   // the second half of the residual rows into V[32..63] (every warp is past the last barrier), coalesced
+  if (fullRows) {
 #pragma unroll
-  for (int i = (R / 2) * C / 8 / NTH; i < R * C / 8 / NTH; ++i) {
-    const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
-    const size_t row = row0 + r;
-    cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+    for (int i = (R / 2) * C / 8 / NTH; i < R * C / 8 / NTH; ++i) {
+      const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
+      cpAsync16(V + r * LDV + c, msa + (row0 + r) * C + c, true);
+    }
+  } else {
+#pragma unroll
+    for (int i = (R / 2) * C / 8 / NTH; i < R * C / 8 / NTH; ++i) {
+      const int u = i * NTH + threadIdx.x, r = u / (C / 8), c = (u % (C / 8)) * 8;
+      const size_t row = row0 + r;
+      cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+    }
   }
   cpCommit();
   const int c0 = lane * 8;

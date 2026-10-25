@@ -443,6 +443,19 @@ inline void msaFlash(const half* qkvg, const half* bias, int stride, B16* o, int
       return;
     }
   }
+  if constexpr (NB) {
+    const int p64 = (n + 63) / 64 * 64, p48 = (n + 47) / 48 * 48;
+    if (n >= 128 && p64 <= 1.025 * p48 && fitsSmem(2 * fa2Stage<32, 4, 64, 2, 1, true>())) {
+      if (FLASH_SPEC) flashGrid2RRun<32, 4, 64, 2, 1, true, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+      else flashGrid2RRun<32, 4, 64, 2, 1, true, false, B16, false>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+      return;
+    }
+    if (n >= 96 && fitsSmem(2 * fa2Stage<32, 4, 48, 2, 1, true>())) {
+      if (FLASH_SPEC) flashGrid2RRun<32, 4, 48, 2, 1, true, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+      else flashGrid2RRun<32, 4, 48, 2, 1, true, false, B16, false>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
+      return;
+    }
+  }
   if (FLASH_SPEC && !NB && flash2RWideKeysFor(n))
     flashGrid2RRun<32, 2, 64, 2, 2, NB, false, B16, true>(qkvg, bias, stride, o, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride);
   else if (FLASH_SPEC)
