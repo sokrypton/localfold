@@ -151,9 +151,57 @@ __global__ void pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __re
   else for (size_t k = i; k < n; ++k) ptx_st_global_f32(out + k, toF(in[k]));
 }
 template <class PT, bool FAST_INV = false, class TX = float>
-__global__ void opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __restrict__ bias,
-                           const float* __restrict__ norm, size_t i0, int Bi, int L, float xs = 1.f, float normVal = 0.f) {
+__global__ void __launch_bounds__(256, 6)
+opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __restrict__ bias,
+           const float* __restrict__ norm, size_t i0, int Bi, int L, float xs = 1.f, float normVal = 0.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if constexpr (!std::is_same_v<PT, float> && !std::is_same_v<TX, float>) {
+    if (t >= (size_t)Bi * L * 16) return;
+    int f = (int)((t & 15) << 3);
+    size_t p = i0 * L + (t >> 4);
+    float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
+    uint4 ux = ptx_ldg_v4_u32(x + (t << 3));
+    float4 b0 = ptx_ldg_v4_f32(bias + f);
+    float4 b1 = ptx_ldg_v4_f32(bias + f + 4);
+    PT* pp = reinterpret_cast<PT*>(pair) + (p << 7) + f;
+    uint4 up = ptx_ld_global_v4_u32(pp);
+    float2 a0 = ptx_f16x2_to_f32x2(ux.x), a1 = ptx_f16x2_to_f32x2(ux.y);
+    float2 a2 = ptx_f16x2_to_f32x2(ux.z), a3 = ptx_f16x2_to_f32x2(ux.w);
+    float2 q0 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(up.x) : ptx_f16x2_to_f32x2(up.x);
+    float2 q1 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(up.y) : ptx_f16x2_to_f32x2(up.y);
+    float2 q2 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(up.z) : ptx_f16x2_to_f32x2(up.z);
+    float2 q3 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(up.w) : ptx_f16x2_to_f32x2(up.w);
+    if constexpr (FAST_INV) {
+      float inv = ptx_rcp_f32(denom);
+      q0.x = ptx_fma_f32(ptx_fma_f32(xs, a0.x, b0.x), inv, q0.x);
+      q0.y = ptx_fma_f32(ptx_fma_f32(xs, a0.y, b0.y), inv, q0.y);
+      q1.x = ptx_fma_f32(ptx_fma_f32(xs, a1.x, b0.z), inv, q1.x);
+      q1.y = ptx_fma_f32(ptx_fma_f32(xs, a1.y, b0.w), inv, q1.y);
+      q2.x = ptx_fma_f32(ptx_fma_f32(xs, a2.x, b1.x), inv, q2.x);
+      q2.y = ptx_fma_f32(ptx_fma_f32(xs, a2.y, b1.y), inv, q2.y);
+      q3.x = ptx_fma_f32(ptx_fma_f32(xs, a3.x, b1.z), inv, q3.x);
+      q3.y = ptx_fma_f32(ptx_fma_f32(xs, a3.y, b1.w), inv, q3.y);
+    } else {
+      q0.x += ptx_fma_f32(xs, a0.x, b0.x) / denom;
+      q0.y += ptx_fma_f32(xs, a0.y, b0.y) / denom;
+      q1.x += ptx_fma_f32(xs, a1.x, b0.z) / denom;
+      q1.y += ptx_fma_f32(xs, a1.y, b0.w) / denom;
+      q2.x += ptx_fma_f32(xs, a2.x, b1.x) / denom;
+      q2.y += ptx_fma_f32(xs, a2.y, b1.y) / denom;
+      q3.x += ptx_fma_f32(xs, a3.x, b1.z) / denom;
+      q3.y += ptx_fma_f32(xs, a3.y, b1.w) / denom;
+    }
+    uint4 out4;
+    if constexpr (std::is_same_v<PT, __nv_bfloat16>) {
+      out4 = make_uint4(ptx_cvt_bf16x2_f32(q0.x, q0.y), ptx_cvt_bf16x2_f32(q1.x, q1.y),
+                        ptx_cvt_bf16x2_f32(q2.x, q2.y), ptx_cvt_bf16x2_f32(q3.x, q3.y));
+    } else {
+      out4 = make_uint4(ptx_cvt_f16x2_f32(q0.x, q0.y), ptx_cvt_f16x2_f32(q1.x, q1.y),
+                        ptx_cvt_f16x2_f32(q2.x, q2.y), ptx_cvt_f16x2_f32(q3.x, q3.y));
+    }
+    ptx_st_global_v4_u32(pp, out4);
+    return;
+  }
   if (t >= (size_t)Bi * L * 32) return;
   int f = (int)((t & 31) << 2);
   size_t p = i0 * L + (t >> 5);
@@ -604,8 +652,9 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       AttnW w = attnWeights(R + "/attention", blk, C);
       int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
       half* xn = scratch<half>("frow.xn", rows * C);
-      layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
-                                                                                P(R + "/query_norm/offset", blk));
+      if (takeEmittedLn(R + "/query_norm", blk, msa, rows) != xn)
+        layerNormVK<256, B16, half><<<lnVGrid(rows), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
+                                                                                  P(R + "/query_norm/offset", blk));
       half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
       ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
       const std::string ln = S + "msa_column_attention/query_norm";
@@ -1016,6 +1065,14 @@ __global__ void __launch_bounds__(128, 2) opmOutK(const half* __restrict__ Pm, c
   const bool full = row0 + 128 <= pp;
 #pragma unroll
   for (int mi = 0; mi < 4; ++mi) {
+    PairRaw4<PT> pv[8];
+    const size_t ij0 = (size_t)i0 * L + row0 + wm * 64 + mi * 16 + (lane >> 4);
+    if (full && !norm) {
+#pragma unroll
+      for (int ep = 0; ep < 8; ++ep) {
+        pv[ep] = pairLdRaw4<PT>(pair, (ij0 + ep * 2) * 128 + f);
+      }
+    }
 #pragma unroll
     for (int t = 0; t < 8; ++t) {
       int c = t * 8 + 2 * tig;
@@ -1024,12 +1081,6 @@ __global__ void __launch_bounds__(128, 2) opmOutK(const half* __restrict__ Pm, c
     }
     __syncwarp();
     if (full && !norm) {
-      const size_t ij0 = (size_t)i0 * L + row0 + wm * 64 + mi * 16 + (lane >> 4);
-      PairRaw4<PT> pv[8];
-#pragma unroll
-      for (int ep = 0; ep < 8; ++ep) {
-        pv[ep] = pairLdRaw4<PT>(pair, (ij0 + ep * 2) * 128 + f);
-      }
 #pragma unroll
       for (int ep = 0; ep < 8; ++ep) {
         float4 a4 = ptx_ld_shared_v4_f32(Ys + (ep * 2 + (lane >> 4)) * LDY + cl);
@@ -1096,8 +1147,15 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       auto ow = opmWeights(Op, blk, C, O);
       const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
       const float* msk = ones ? nullptr : msaMask;
-      if (MSA16 && msa == t.msa16)
-        withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk); });
+      if (MSA16 && msa == t.msa16) {
+        int nextBlk = rows > 4096 ? (t.opmFirst ? blk : (blk + 1 < (int)dimW(S + "msa_transition/transition1/weights", 0) ? blk + 1 : -1)) : -1;
+        const std::string rln = S + "msa_row_attention_with_pair_bias/query_norm";
+        half* xnRow = nextBlk >= 0 ? scratch<half>("frow.xn", rows * C) : nullptr;
+        const float* s2 = nextBlk >= 0 ? P(rln + "/scale", nextBlk) : nullptr;
+        const float* o2 = nextBlk >= 0 ? P(rln + "/offset", nextBlk) : nullptr;
+        withMsa16([&](auto tag) { lnGemm<256, decltype(tag)>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk, s2, o2, xnRow); });
+        if (nextBlk >= 0) EMITTED_LN = EmittedLn{ rln, nextBlk, msa, xnRow, rows };
+      }
       else if (C == 256) lnGemm<256>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
       else lnGemm<64>(msa, rows, s0, o0, ow.first, ow.second, 2 * O, O, lt, rt, msk);
     } else {
@@ -1200,7 +1258,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
         for (int i0 = 0; i0 < L; i0 += Bi) {
           int bi = std::min(Bi, L - i0);
           ltGemm(Lt + (size_t)i0 * K, T, Y, true, bi, K, L * 128, nullptr, false, 0.f);
-          WITH_PAIR_T(opmAdd128K<PT, true, half><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L));
+          WITH_PAIR_T(opmAdd128K<PT, true, half><<<blocks((size_t)bi * L * (std::is_same_v<PT, float> ? 32 : 16)), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L));
         }
         return;
       }

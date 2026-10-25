@@ -142,11 +142,17 @@ __device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* _
     sA[i] = X + qr * rs + (tid & 3) * 8;
   }
   const half* sB = Wt + (size_t)(tid >> 4) * 128 + (tid & 15) * 8;
+  const bool fullRows = row0 + 128 <= pp;
   auto issue = [&](int kc) {
     if (kc < KC) {
       half *A = As(kc % TG_STAGES), *B = Bs(kc % TG_STAGES);
+      if (fullRows) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) cpAsync16(A + dA + i * 1024, sA[i] + kc * ks, okA[i]);
+        for (int i = 0; i < 4; ++i) cpAsync16(A + dA + i * 1024, sA[i] + kc * ks, true);
+      } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) cpAsync16(A + dA + i * 1024, sA[i] + kc * ks, okA[i]);
+      }
 #pragma unroll
       for (int i = 0; i < 4; ++i) cpAsync16(B + dB + i * 1024, sB + (size_t)kc * 4096 + i * 1024, true);
     }

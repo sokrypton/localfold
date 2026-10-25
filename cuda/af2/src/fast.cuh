@@ -290,15 +290,16 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::s
 // out0 (rows of split), the rest to out1 (rows of N - split) - the outer product mean's left and right projections in
 // one pass over the MSA
 template <int C, int WARPS, int MT, class PT = float>
-__global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ x, size_t rows, const float* __restrict__ lnS,
+__global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const float* __restrict__ x, size_t rows, const float* __restrict__ lnS,
     const float* __restrict__ lnO, const half* __restrict__ Wt, const float* __restrict__ bias, int N, int split,
-    half* __restrict__ out0, half* __restrict__ out1, const float* __restrict__ mask = nullptr) {
-  constexpr int NC = 16, R = 16 * WARPS * MT, LDX = C + 8, KS = C / 16, NTH = 32 * WARPS;
+    half* __restrict__ out0, half* __restrict__ out1, const float* __restrict__ mask = nullptr,
+    const float* __restrict__ lnS2 = nullptr, const float* __restrict__ lnO2 = nullptr, half* __restrict__ outLn2 = nullptr) {
+  constexpr int NC = 16, R = 16 * WARPS * MT, XR = 16 * WARPS, LDX = C + 8, KS = C / 16, NTH = 32 * WARPS;
   constexpr size_t STAGE = (size_t)C * NC * 2;
-  static_assert(STAGE + (size_t)WARPS * (16 * MT) * NC * 2 <= (size_t)R * LDX * 2, "stage 1 and Ys fit in Xs");
+  static_assert(STAGE + (size_t)WARPS * (16 * MT) * NC * 2 <= (size_t)XR * LDX * 2, "stage 1 and Ys fit in Xs");
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = (half*)smem;
-  auto Ws = [&](int st) { return (half*)(smem + (st == 0 ? (size_t)R * LDX * 2 : 0)); };
+  auto Ws = [&](int st) { return (half*)(smem + (st == 0 ? (size_t)XR * LDX * 2 : 0)); };
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t row0 = (size_t)blockIdx.x * R;
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
@@ -317,17 +318,22 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
 #if !LF_REG_STAGES
   issue(0, 0);
 #endif
-  lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
-                                  lnS, lnO, Xs, LDX, warp, lane);
-#if !LF_REG_STAGES
-  cpWait<0>();
-#endif
-  __syncthreads();
   uint32_t xa[MT][KS][4];
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
+    if (mt > 0) __syncthreads();
+    lnRowsToShared<C, XR, WARPS, PT>(x, [&](int r) {
+        size_t row = row0 + (MT == 1 ? r : ((r >> 4) * MT + mt) * 16 + (r & 15));
+        return row < rows ? row : SIZE_MAX;
+      }, lnS, lnO, Xs, LDX, warp, lane, WARPS == 4 ? lnS2 : nullptr, WARPS == 4 ? lnO2 : nullptr, WARPS == 4 ? outLn2 : nullptr);
+    if (mt + 1 == MT) {
+#if !LF_REG_STAGES
+      cpWait<0>();
+#endif
+    }
+    __syncthreads();
 #pragma unroll
-    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + ((warp * MT + mt) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   }
   __syncthreads();                                   // every warp has its fragments: stage 1 and Ys take Xs's memory
 #if LF_REG_STAGES
@@ -366,6 +372,12 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
   const int r_ep = lane >> 1, c_ep = (lane & 1) * 8;
   for (int n = 0; n < tiles; ++n) {
     int st = n & 1;
+    float2 bf[2];
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      int col = n * NC + nt * 8 + tig * 2;
+      bf[nt] = bias ? ptx_ldg_v2_f32(bias + col) : make_float2(0.f, 0.f);
+    }
 #if LF_REG_STAGES
     if (n + 1 < tiles) loadR(n + 1);
     __syncthreads();
@@ -394,12 +406,6 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
       float2 q = ptx_f16x2_to_f32x2(h);
       return ptx_cvt_f16x2_f32(ptx_mul_f32(q.x, m), ptx_mul_f32(q.y, m));
     };
-    float2 bf[2];
-#pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
-      int col = n * NC + nt * 8 + tig * 2;
-      bf[nt] = bias ? ptx_ldg_v2_f32(bias + col) : make_float2(0.f, 0.f);
-    }
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
@@ -419,32 +425,31 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
       if (row < rows)
         ptx_st_global_v4_u32(o_base + row * ld, ptx_ld_shared_v4_u32(Ys + (mt * 16 + r_ep) * NC + c_ep));
     }
-    __syncwarp();
 #if LF_REG_STAGES
+    __syncwarp();
     if (n + 1 < tiles) storeR(st ^ 1);               // (stage st ^ 1 last read before this tile's barrier)
 #endif
   }
 }
 template <int C, class PT = float>
 inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* lnO, const half* Wt, const float* bias, int N,
-                   int split, half* out0, half* out1, const float* mask = nullptr) {
+                   int split, half* out0, half* out1, const float* mask = nullptr,
+                   const float* lnS2 = nullptr, const float* lnO2 = nullptr, half* outLn2 = nullptr) {
   if (rows <= 4096) {
     constexpr int WARPS = 2, MT = 1, R = 16 * WARPS * MT;
-    constexpr size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * 16 * 2;
+    constexpr size_t smem = (size_t)16 * WARPS * (C + 8) * 2 + (size_t)C * 16 * 2;
     lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1, mask);
     return;
   }
   constexpr int WARPS = 4;
   auto at = [&](auto mt) {
     constexpr int MT = decltype(mt)::value, R = 16 * WARPS * MT;
-    constexpr size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * 16 * 2;
+    constexpr size_t smem = (size_t)16 * WARPS * (C + 8) * 2 + (size_t)C * 16 * 2;
     static bool attr = false;
     if (!attr) { smemAttr((lnGemmK<C, WARPS, MT, PT>), (int)smem); attr = true; }
-    lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1, mask);
+    lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1, mask, lnS2, lnO2, outLn2);
   };
-  // two row tiles a warp, else one where 128 rows do not fit (a T4's 64 KB at 256 channels: 66 KB) - each output's sum
-  // the same either way
-  if (fitsSmem((size_t)16 * WARPS * 2 * (C + 8) * 2 + (size_t)C * 16 * 2)) at(std::integral_constant<int, 2>{});
+  if (fitsSmem((size_t)16 * WARPS * (C + 8) * 2 + (size_t)C * 16 * 2)) at(std::integral_constant<int, 2>{});
   else at(std::integral_constant<int, 1>{});
 }
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
