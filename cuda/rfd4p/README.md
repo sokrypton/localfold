@@ -1,24 +1,26 @@
 # RFD4-Proteina on CUDA
 
-The native port of the design model the page runs in `webgpu/rfd4p/`. **It generates**: noise in, a
-PDB out, with the trunk, the flow sampler and the autoencoder decoder all held to
-`cpu/rfd4p/reference.js` stage by stage.
+The native port of the design model the page runs in `webgpu/rfd4p/`. **A job file in, a PDB out,
+in one process with no JavaScript** - the featuriser, the trunk, the autoencoder's two halves and
+the flow sampler are all here, and all held to `cpu/rfd4p/` and `shared/rfd4p/` stage by stage.
 
 ```
-node cuda/rfd4p/export_input.mjs cuda/rfd4p/data --generate
-./cuda/rfd4p/localfold-rfd4p cuda/rfd4p/data --weights=cuda/rfd4p/weights-f32 \
-    --generate=cuda/rfd4p/data-gen --out=design.pdb --fast
-generated 54 residues, 420 atoms over 60 steps (120 trunk passes) -> design.pdb
-  sampling 0.52 s, with the decode and the write 0.53 s
+./cuda/rfd4p/localfold-rfd4p --job=<job.json> --weights=cuda/rfd4p/weights-f32 --out=design.pdb --fast
+generated 53 residues, 265 atoms over 25 steps (52 trunk passes) -> design.pdb
+  sampling 0.42 s
 ```
 
-And it is a protein rather than a ball of atoms: 54 CA, consecutive CA-CA **median 3.81 A with all
-53 inside [3.6, 4.0]**, radius of gyration 10.3 A for a 54-mer.
+All ten of RFD4-Proteina's shipped presets generate: unconditional, fold-conditioned, motif
+scaffolding indexed and unindexed, protein-protein interface, DNA binding, a YAML binder job,
+small molecule, partial diffusion and inverse folding.
+
+And the result is a protein rather than a ball of atoms: 54 CA, consecutive CA-CA **median 3.81 A
+with all 53 inside [3.6, 4.0]**, radius of gyration 10.3 A for a 54-mer.
 
 ## What runs, and what it is held to
 
 ```
-node cuda/rfd4p/export_weights.mjs cuda/rfd4p/weights-f32          # 558 tensors, 714 MB
+node cuda/rfd4p/export_weights.mjs cuda/rfd4p/weights-f32 --include=all   # 4,371 entries, 1.7 GB (trunk, decoder, encoder)
 node cuda/rfd4p/export_input.mjs  cuda/rfd4p/data --oracle=cuda/rfd4p/oracle
 bash cuda/build.sh rfd4p
 ./cuda/rfd4p/localfold-rfd4p cuda/rfd4p/data --weights=cuda/rfd4p/weights-f32 --oracle=cuda/rfd4p/oracle
