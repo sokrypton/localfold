@@ -523,10 +523,34 @@ residues the cropped example does not contain, so building one from the spec fai
     means `S[i][i]` - so it is not a sort by eigenvalue at all. Ported as written, with V8's own
     binary insertion sort, because the order decides the rotation and "fixing" it would disagree
     with every number the page produces.
-  - **this is where the remaining work starts.** `transforms.js`'s pipeline with real atoms:
-    `realizeExpandableSegments` over a structure, `buildAtom37Slots` returning real slots so the
-    per-atom loop of `convertToProteinaBatch` stops being a no-op, and the bodies of
-    `unindexFlaggedTokens`, `materializeInternalCoords` and `centerAndFeaturizeCentroid`.
+  - **this is where the remaining work starts**, and it is `transforms.js` with real atoms -
+    the same fourteen stages the spec path already runs, but with every branch a contig's `<M>`
+    stubs make inert now live. In the order they run, with what each needs:
+
+    | stage | `transforms.js` | what a structure makes live |
+    |---|---|---|
+    | `addSrcComponentAnnotation` | 340-358 | nothing new |
+    | `realizeExpandableSegments` | 363-475 | real residues between the sentinels |
+    | `ensureChemicalFlags` | 272-335 | the 17 boolean columns actually vary |
+    | `filterUnwantedAtoms` | 480-496 | waters and unwanted elements are dropped |
+    | `annotateCovalentModificationsAndAtomize` | 510-562 | real peptide bonds, so `atomize` means something |
+    | `finalizeAndCanonicalizeSequenceConditioning` | 629-708 | a real sequence to canonicalise |
+    | `featurizeExpandedSegments` | 713-747 | the inference deletion block fires |
+    | `materializeInternalCoords` | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
+    | `unindexFlaggedTokens` | 822-1027 | 🔴 the whole 200-line body, which a contig skips entirely |
+    | `centerAndFeaturizeCentroid` | 1032-1108 | the recentering on conditioned coordinates |
+    | `buildAtom37Slots` | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
+    | `computeTokenBondFeatures` | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
+
+    🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
+    `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
+    never reaches; this port has been bitten twice by a draw that happens where it looks as
+    though it should not, and both times the symptom was somewhere else entirely.
+
+    🔴 **AND THE EXISTING `featurise.cpp` KEEPS THE ATOM ARRAY IN FOUR PIECES** - `cif::AtomSite`,
+    `cif::Ids`, `cif::Annotations` and `chirality::Stereo`. That is fine for a reader and wrong
+    for a pipeline that MUTATES them together; consolidating them into one `AtomArray` is the
+    first thing to do, before the first stage rather than after the fifth.
   - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
     constrain once there are residues and atoms.
 
