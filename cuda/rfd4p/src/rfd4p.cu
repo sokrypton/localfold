@@ -18,6 +18,7 @@ struct Opts {
   std::string dir, weights, oracle, out = "trunk.bin";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
+  bool fast = false; // TF32 on the tensor cores, as every other port's --fast does
   bool insertion = true;
 };
 
@@ -28,7 +29,8 @@ int run(const Opts& o) {
   for (int seg = 0; seg < (int)M.segs.size(); ++seg) M.upload(seg);
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
-  CB(cublasSetMathMode(H, CUBLAS_PEDANTIC_MATH));
+  F32_TF32 = o.fast;
+  CB(cublasSetMathMode(H, o.fast ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
 
   rfd4p::Dims d;
   d.n = (int)M.meta("meta/n");
@@ -67,6 +69,9 @@ int run(const Opts& o) {
 
   // Every stage is compared the moment it is produced, so the first one that moves is the one named -
   // a later stage's residual is its own fault plus everything upstream of it.
+  // 🔴 THE BAR FOLLOWS THE ARITHMETIC. TF32 carries ten mantissa bits, so the exact path's 1e-5 would
+  // fail a --fast run that is working perfectly; these are the bounds the other ports' gates use.
+  const double bound = o.fast ? 5e-3 : 1e-5;
   int bad = 0;
   double worst = 0;
   std::string worstAt;
@@ -75,7 +80,7 @@ int run(const Opts& o) {
     tap = [&](const char* name, const float* p, size_t count) {
       double r = checkOracle(name, p, count, name);
       if (r >= 0 && r > worst) { worst = r; worstAt = name; }
-      if (r > 1e-5) ++bad;
+      if (r > bound) ++bad;
     };
   }
 
@@ -119,8 +124,8 @@ int run(const Opts& o) {
            nRecycle, nRecycle == 1 ? "" : "s", o.repeat);
   }
   if (!o.oracle.empty()) {
-    printf("worst stage %s at relRMS %.2e; %d stage%s past 1e-5\n",
-           worstAt.empty() ? "(none)" : worstAt.c_str(), worst, bad, bad == 1 ? "" : "s");
+    printf("worst stage %s at relRMS %.2e; %d stage%s past %.0e\n",
+           worstAt.empty() ? "(none)" : worstAt.c_str(), worst, bad, bad == 1 ? "" : "s", bound);
   }
   return bad == 0 ? 0 : 1;
 }
@@ -136,6 +141,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
+    else if (f == "--fast") o.fast = true;
     else if (f == "--no-insertion") o.insertion = false;
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }

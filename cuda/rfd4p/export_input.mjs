@@ -58,19 +58,23 @@ const seed = Number(option("seed", "0"));
 const step = Number(option("step", "0"));
 const nRecycle = Number(option("recycles", "1"));
 const oracleDir = option("oracle", "");
+const length = Number(option("length", "0"));
 const checkpoint = option("checkpoint", `${hub}/a06e2509c7033b010fc43614e9fd840303588502/model.safetensors`);
 const cfg = JSON.parse(readFileSync(option("config", `${repo}model-rfd4p-int8/config.json`), "utf8")).config;
 const nn = cfg.nn;
 
 const preset = getRfd4pPresetById(presetId);
 if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
-if (preset.cifUrl) {
+if (preset.cifUrl && !length) {
   console.error(`${presetId} needs a structure; only the pure-spec presets export offline for now`);
   process.exit(1);
 }
-const { batch, n } = buildBatch(
-  { contig: preset.contig, ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }) },
-  { seed });
+// `--length=N` is one unconditioned protein segment of N residues, for sizing and timing: the trunk's
+// cost is a function of the token count and nothing in the conditioning changes a single shape.
+const spec = length
+  ? { contig: `a1:${length}-${length}P` }
+  : { contig: preset.contig, ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }) };
+const { batch, n } = buildBatch(spec, { seed });
 
 const raw = readFileSync(checkpoint);
 const parsedWeights = parseSafetensors(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));

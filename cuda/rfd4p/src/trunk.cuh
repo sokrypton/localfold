@@ -60,19 +60,18 @@ inline void adaLn(const float* x, const float* cond, float* out, size_t rows, in
   rmsNorm(x, normedX, rows, C, nullptr);
   rmsNorm(cond, normedC, condRows, condC, W(wn(pre + ".norm_cond.weight")));
   linear<float, float>(normedC, gamma, condRows, condC, C, wn(pre + ".to_gamma.0.weight"), true);
-  addBias(gamma, W(wn(pre + ".to_gamma.0.bias")), condRows, C);
   linear<float, float>(normedC, beta, condRows, condC, C, wn(pre + ".to_beta.weight"), true);
-  adaLnApplyK<<<blocks(rows * C), 256, 0, STREAM>>>(normedX, gamma, beta, rowMask, out, rows, C,
-                                                    condRows == 1);
+  adaLnApplyK<<<blocks(rows * C), 256, 0, STREAM>>>(normedX, gamma, W(wn(pre + ".to_gamma.0.bias")),
+                                                    beta, rowMask, out, rows, C, condRows == 1);
 }
 
 // `out = x * sigmoid(cond W + b)` - the residual's gate, zero-initialised at training time.
-inline void adaScale(const float* x, const float* cond, float* out, size_t rows, int C, int condC,
-                     const float* rowMask, const std::string& pre) {
+inline void adaScaleAdd(const float* x, const float* cond, float* residual, size_t rows, int C,
+                        int condC, const float* rowMask, const std::string& pre) {
   float* gamma = scratch<float>("rfd4p.scale.g", rows * C);
   linear<float, float>(cond, gamma, rows, condC, C, wn(pre + ".to_adaln_zero_gamma.0.weight"), true);
-  addBias(gamma, W(wn(pre + ".to_adaln_zero_gamma.0.bias")), rows, C);
-  adaScaleApplyK<<<blocks(rows * C), 256, 0, STREAM>>>(x, gamma, rowMask, out, rows, C);
+  adaScaleAddK<<<blocks(rows * C), 256, 0, STREAM>>>(
+      x, gamma, W(wn(pre + ".to_adaln_zero_gamma.0.bias")), rowMask, residual, rows, C);
 }
 
 // `silu(gates) * xPart` through `[dim -> 2 * inner]` and back, the masked rows zeroed. Replaces its
@@ -149,43 +148,44 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
 // stride is 1 - the channels interleave, which is legal and saves transposing into planes the way AF3
 // does. Outgoing is `x[i][j] = sum_k a[i][k] b[j][k]`, incoming `sum_k a[k][i] b[k][j]`, and the only
 // difference is which operand is transposed.
-inline void triangle(const float* z, float* out, const float* pairMask, const Dims& d, bool outgoing,
+inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
                      const std::string& pre) {
   const size_t rows = d.pairs();
   const int cZ = d.P, cH = d.TRI, n = d.n;
   float* zNorm = scratch<float>("rfd4p.tri.zn", rows * cZ);
   layerNorm(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")), optW(wn(pre + ".layer_norm_in.bias")));
 
-  float* aP = scratch<float>("rfd4p.tri.ap", rows * cH);
-  float* aG = scratch<float>("rfd4p.tri.ag", rows * cH);
-  float* bP = scratch<float>("rfd4p.tri.bp", rows * cH);
-  float* bG = scratch<float>("rfd4p.tri.bg", rows * cH);
-  const std::pair<float*, const char*> projections[4] = {
-      {aP, ".linear_a_p"}, {aG, ".linear_a_g"}, {bP, ".linear_b_p"}, {bG, ".linear_b_g"}};
-  for (const auto& [dst, name] : projections) {
-    linear<float, float>(zNorm, dst, rows, cZ, cH, wn(pre + name + ".weight"), true);
-    if (hasW(wn(pre + name + ".bias"))) addBias(dst, W(wn(pre + name + ".bias")), rows, cH);
+  // 🔴 ONE PROJECTION, NOT FOUR, AND IT LANDS IN THE LAYOUT THE CONTRACTION WANTS. a_p, a_g, b_p and
+  // b_g all read the same `zNorm`, so their weights stack into one `[4 * cH, cZ]` matrix - a plain
+  // concatenation, because `[out, in]` row-major stacks along `out`. `linearPlanes` then writes the
+  // result channel-major, which is what `toPlanesK` used to produce: that transpose was the largest
+  // single kernel in the profile at 14.8%, and it is now nothing at all.
+  const std::string fused = wn(pre + ".abpg~");
+  if (!hasW(fused)) {
+    float* w = dalloc(4 * (size_t)cH * cZ);
+    const char* parts[4] = {".linear_a_p", ".linear_a_g", ".linear_b_p", ".linear_b_g"};
+    for (int q = 0; q < 4; ++q) {
+      CK(cudaMemcpyAsync(w + (size_t)q * cH * cZ, W(wn(pre + parts[q] + ".weight")),
+                         (size_t)cH * cZ * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
+    }
+    CK(cudaStreamSynchronize(STREAM));
+    deviceWeight(fused, w, 4 * (size_t)cH * cZ);
   }
-  float* a = scratch<float>("rfd4p.tri.a", rows * cH);
-  float* b = scratch<float>("rfd4p.tri.b", rows * cH);
-  mulSigmoidK<<<blocks(rows * cH), 256, 0, STREAM>>>(aP, aG, a, rows * cH);
-  mulSigmoidK<<<blocks(rows * cH), 256, 0, STREAM>>>(bP, bG, b, rows * cH);
-  maskRowsK<<<blocks(rows * cH), 256, 0, STREAM>>>(a, pairMask, rows, cH);
-  maskRowsK<<<blocks(rows * cH), 256, 0, STREAM>>>(b, pairMask, rows, cH);
+  float* planes = scratch<float>("rfd4p.tri.planes", 4 * rows * cH);
+  linearPlanes(zNorm, planes, rows, cZ, 4 * cH, fused);
+  gatePlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(planes, pairMask, rows, cH);
+  const float* aT = planes;
+  const float* bT = planes + 2 * rows * (size_t)cH;
 
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
-  float* aT = scratch<float>("rfd4p.tri.at", rows * cH);
-  float* bT = scratch<float>("rfd4p.tri.bt", rows * cH);
   float* xT = scratch<float>("rfd4p.tri.xt", rows * cH);
   float* x = scratch<float>("rfd4p.tri.x", rows * cH);
-  toPlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(a, aT, rows, cH);
-  toPlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(b, bT, rows, cH);
   const float one = 1.f, zero = 0.f;
   CB(cublasGemmStridedBatchedEx(
       H, outgoing ? CUBLAS_OP_T : CUBLAS_OP_N, outgoing ? CUBLAS_OP_N : CUBLAS_OP_T, n, n, n, &one,
       bT, CUDA_R_32F, n, (long long)n * n, aT, CUDA_R_32F, n, (long long)n * n, &zero,
-      xT, CUDA_R_32F, n, (long long)n * n, cH, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+      xT, CUDA_R_32F, n, (long long)n * n, cH, computeType(), CUBLAS_GEMM_DEFAULT));
   fromPlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(xT, x, rows, cH);
 
   float* xNorm = scratch<float>("rfd4p.tri.xn", rows * cH);
@@ -196,7 +196,9 @@ inline void triangle(const float* z, float* out, const float* pairMask, const Di
   if (hasW(wn(pre + ".linear_z.bias"))) addBias(xProj, W(wn(pre + ".linear_z.bias")), rows, cZ);
   linear<float, float>(zNorm, gProj, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
   if (hasW(wn(pre + ".linear_g.bias"))) addBias(gProj, W(wn(pre + ".linear_g.bias")), rows, cZ);
-  mulSigmoidK<<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gProj, out, rows * cZ);
+  // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
+  // was taken at the top, so nothing downstream of here reads z again.
+  mulSigmoidAddK<<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gProj, pairMask, z, rows, cZ);
 }
 
 // ---------------------------------------------------------------- the pair update
@@ -227,11 +229,8 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   hadamardWriteK<<<blocks(rows * P), 256, 0, STREAM>>>(pij, pairMask, z, n, P);
 
   if (d.useTriMult) {
-    float* tri = scratch<float>("rfd4p.pu.tri", rows * P);
-    triangle(z, tri, pairMask, d, true, pre + ".tri_mult_out");
-    addIntoMaskedK<<<blocks(rows * P), 256, 0, STREAM>>>(z, tri, pairMask, rows, P);
-    triangle(z, tri, pairMask, d, false, pre + ".tri_mult_in");
-    addIntoMaskedK<<<blocks(rows * P), 256, 0, STREAM>>>(z, tri, pairMask, rows, P);
+    triangle(z, pairMask, d, true, pre + ".tri_mult_out");
+    triangle(z, pairMask, d, false, pre + ".tri_mult_in");
   }
 
   // PairTransition: LayerNorm, up, ReLU, down, residual.
@@ -242,11 +241,9 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   float* o = scratch<float>("rfd4p.pu.o", rows * P);
   layerNorm(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
   linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-  addBias(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
-  reluK<<<blocks(rows * hidden), 256, 0, STREAM>>>(h, rows * hidden);
+  biasReluK<<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
   linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
-  addBias(o, W(wn(tr + ".linear_2.bias")), rows, P);
-  addIntoMaskedK<<<blocks(rows * P), 256, 0, STREAM>>>(z, o, pairMask, rows, P);
+  biasAddK<<<blocks(rows * P), 256, 0, STREAM>>>(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
 }
 
 // ---------------------------------------------------------------- one token layer
@@ -256,17 +253,14 @@ inline void tokenLayer(float* s, const float* z, const float* c, const float* ma
   const int D = d.D, C = d.C;
   float* ada = scratch<float>("rfd4p.l.ada", n * D);
   float* attn = scratch<float>("rfd4p.l.attn", n * D);
-  float* scaled = scratch<float>("rfd4p.l.scaled", n * D);
 
   adaLn(s, c, ada, n, D, n, C, mask, pre + ".mhba.adaln");
   pairBiasAttention(ada, z, pairMask, mask, attn, d, pre + ".mhba.mha");
-  adaScale(attn, c, scaled, n, D, C, mask, pre + ".mhba.scale_output");
-  addIntoMaskedK<<<blocks(n * D), 256, 0, STREAM>>>(s, scaled, mask, n, D);
+  adaScaleAdd(attn, c, s, n, D, C, mask, pre + ".mhba.scale_output");
 
   adaLn(s, c, ada, n, D, n, C, mask, pre + ".transition.adaln");
   swiGluTransition(ada, attn, n, D, 4, mask, pre + ".transition.transition");
-  adaScale(attn, c, scaled, n, D, C, mask, pre + ".transition.scale_output");
-  addIntoMaskedK<<<blocks(n * D), 256, 0, STREAM>>>(s, scaled, mask, n, D);
+  adaScaleAdd(attn, c, s, n, D, C, mask, pre + ".transition.scale_output");
 }
 
 // ---------------------------------------------------------------- the whole trunk
@@ -370,7 +364,7 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
     const float alpha = 1.f / sqrtf((float)D), beta = 0.f;
     CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)n, D, &alpha, k, CUDA_R_32F, D,
                     q, CUDA_R_32F, D, &beta, t.insertion, CUDA_R_32F, (int)n,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                    computeType(), CUBLAS_GEMM_DEFAULT));
   }
 }
 

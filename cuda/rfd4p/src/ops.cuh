@@ -8,6 +8,16 @@
 
 namespace rfd4p {
 
+// The compute type for the two GEMMs this port issues directly (the triangle's contraction and the
+// insertion head). `linear()` reads `F32_TF32` itself; these have to ask.
+//
+// 🔴 TF32 IS NOT f32 AND THE ORACLE BOUND MOVES WITH IT. Ten mantissa bits against twenty-three, so a
+// trunk that reads 6e-7 exact reads ~1e-3 here. That is the reason it is a FLAG and the strict path
+// stays the default: the parity gate runs the exact arm, and --fast is held to a looser bar.
+inline cublasComputeType_t computeType() {
+  return F32_TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+}
+
 // ---------------------------------------------------------------- RMSNorm
 //
 // 🔴 NOT LayerNorm WITH THE MEAN LEFT IN. `rmsnorm_torch` divides by sqrt(mean(x^2) + eps) and never
@@ -94,24 +104,30 @@ inline void rmsNorm(const float* x, TY* y, size_t rows, int C, const float* scal
 // (cuda/ef2/src/atoms.cuh) takes one `(C, 6C)` matrix off `silu(c)`. RFD4-Proteina has two separate
 // matrices, a sigmoid on the scale, no `+1`, and no silu - `rfproteina/nn/modules/adaptive_ln_scale.py`.
 __global__ void adaLnApplyK(const float* __restrict__ normedX, const float* __restrict__ gamma,
-                            const float* __restrict__ beta, const float* __restrict__ mask,
-                            float* __restrict__ out, size_t rows, int C, bool broadcastCond) {
+                            const float* __restrict__ gammaBias, const float* __restrict__ beta,
+                            const float* __restrict__ mask, float* __restrict__ out, size_t rows,
+                            int C, bool broadcastCond) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   size_t r = i / C;
+  int c = (int)(i - r * C);
   if (mask && mask[r] == 0.f) { out[i] = 0.f; return; }
-  size_t ci = (broadcastCond ? 0 : r) * (size_t)C + (i - r * C);
-  float g = 1.f / (1.f + __expf(-gamma[ci]));
+  size_t ci = (broadcastCond ? 0 : r) * (size_t)C + c;
+  float g = 1.f / (1.f + __expf(-(gamma[ci] + (gammaBias ? gammaBias[c] : 0.f))));
   out[i] = normedX[i] * g + beta[ci];
 }
 
-// `out = x * sigmoid(cond W + b)` - AdaptiveOutputScale, the residual's gate.
-__global__ void adaScaleApplyK(const float* __restrict__ x, const float* __restrict__ gamma,
-                               const float* __restrict__ mask, float* __restrict__ out, size_t rows, int C) {
+// `residual += x * sigmoid(gamma + bias)` - AdaptiveOutputScale AND the residual add it always feeds,
+// in one pass. Keeping them apart cost two launches over [n, 768] per half-layer and a round trip
+// through memory for a tensor nothing else reads.
+__global__ void adaScaleAddK(const float* __restrict__ x, const float* __restrict__ gamma,
+                             const float* __restrict__ bias, const float* __restrict__ mask,
+                             float* __restrict__ residual, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
-  if (mask && mask[i / C] == 0.f) { out[i] = 0.f; return; }
-  out[i] = x[i] * (1.f / (1.f + __expf(-gamma[i])));
+  if (mask && mask[i / C] == 0.f) return;
+  const float g = gamma[i] + (bias ? bias[i % C] : 0.f);
+  residual[i] += x[i] * (1.f / (1.f + __expf(-g)));
 }
 
 // ---------------------------------------------------------------- SwiGLU
@@ -144,15 +160,29 @@ __global__ void addIntoMaskedK(float* __restrict__ y, const float* __restrict__ 
   if (mask && mask[i / C] == 0.f) return;
   y[i] += x[i];
 }
-// y = a * sigmoid(b), elementwise - the triangle's output gate and its two projections' gates.
-__global__ void mulSigmoidK(const float* __restrict__ a, const float* __restrict__ b,
-                            float* __restrict__ y, size_t n) {
+// `z += a * sigmoid(b)` on the live pairs - the triangle's output gate and the residual it feeds.
+__global__ void mulSigmoidAddK(const float* __restrict__ a, const float* __restrict__ b,
+                               const float* __restrict__ pairMask, float* __restrict__ z,
+                               size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) y[i] = a[i] * (1.f / (1.f + __expf(-b[i])));
+  if (i >= rows * (size_t)C) return;
+  if (pairMask && pairMask[i / C] == 0.f) return;
+  z[i] += a[i] * (1.f / (1.f + __expf(-b[i])));
 }
-__global__ void reluK(float* __restrict__ x, size_t n) {
+// `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
+__global__ void biasReluK(float* __restrict__ x, const float* __restrict__ bias, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n && x[i] < 0.f) x[i] = 0.f;
+  if (i >= rows * (size_t)C) return;
+  const float v = x[i] + bias[i % C];
+  x[i] = v < 0.f ? 0.f : v;
+}
+// `z += x + bias` on the live pairs - the pair transition's down projection and its residual.
+__global__ void biasAddK(const float* __restrict__ x, const float* __restrict__ bias,
+                         const float* __restrict__ pairMask, float* __restrict__ z, size_t rows, int C) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C) return;
+  if (pairMask && pairMask[i / C] == 0.f) return;
+  z[i] += x[i] + bias[i % C];
 }
 // Zero every row the mask clears; the reference zeroes a padded token's whole row at several seams.
 __global__ void maskRowsK(float* __restrict__ x, const float* __restrict__ mask, size_t rows, int C) {
@@ -163,6 +193,20 @@ __global__ void maskRowsK(float* __restrict__ x, const float* __restrict__ mask,
 __global__ void pairMaskK(const float* __restrict__ mask, float* __restrict__ out, int n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < (size_t)n * n) out[i] = mask[i / n] * mask[i % n];
+}
+
+// `Y[out][rows] = X[rows][in] * W[out][in]^T` - the projection written CHANNEL-MAJOR, which is the
+// layout the triangle's contraction wants. Same arithmetic as `linear`, transposed on the way out, so
+// the transpose costs nothing instead of a kernel over the whole pair tensor.
+inline void linearPlanes(const float* X, float* Y, size_t rows, int in, int out, const std::string& w) {
+  if (lenW(w) != (size_t)in * out) {
+    fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out);
+    exit(1);
+  }
+  const float one = 1.f, zero = 0.f;
+  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, out, in, &one, X, CUDA_R_32F, in, W(w),
+                  CUDA_R_32F, in, &zero, Y, CUDA_R_32F, (int)rows, computeType(),
+                  CUBLAS_GEMM_DEFAULT));
 }
 
 // ---------------------------------------------------------------- channel planes
@@ -181,6 +225,22 @@ __global__ void toPlanesK(const float* __restrict__ in, float* __restrict__ out,
   int c = (int)(i - p * C);
   out[(size_t)c * pairs + p] = in[i];
 }
+// The triangle's gating, in plane layout and in one launch: `a = aP * sigmoid(aG) * mask` and
+// `b = bP * sigmoid(bG) * mask`, reading the four quarters of one fused projection and writing over
+// the first and third. Replaces two sigmoid-multiplies, two mask passes and two transposes.
+__global__ void gatePlanesK(float* __restrict__ p, const float* __restrict__ pairMask, size_t pairs,
+                            int cH) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pairs * (size_t)cH) return;
+  const float m = pairMask ? pairMask[i % pairs] : 1.f;
+  float* aP = p;
+  const float* aG = p + pairs * (size_t)cH;
+  float* bP = p + 2 * pairs * (size_t)cH;
+  const float* bG = p + 3 * pairs * (size_t)cH;
+  aP[i] = m * aP[i] / (1.f + __expf(-aG[i]));
+  bP[i] = m * bP[i] / (1.f + __expf(-bG[i]));
+}
+
 __global__ void fromPlanesK(const float* __restrict__ in, float* __restrict__ out, size_t pairs, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= pairs * (size_t)C) return;
