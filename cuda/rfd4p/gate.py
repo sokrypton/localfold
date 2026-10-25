@@ -77,6 +77,12 @@ TRAJECTORIES = [
     ("smallmol", HERE / "data-smg",
      ["--preset=sm_sam", "--generate", "--gen-oracle", "--steps=2"], False),
 ]
+# 🔴 THE NATIVE FEATURISER IS HELD TO BYTES, NOT TO A TOLERANCE. `export_input.mjs` drives the
+# page's own shared/rfd4p/ and stays as the reference; `rfd4p-featurise` writes the same
+# model.idx/model.bin and a single differing float fails this. A sweep of LENGTHS, not one: the
+# first version was exact at 53 and 100 residues and one ulp out at 1, 2, 7 and 257, the centering
+# scale written `0.2f` where the reference multiplies in double.
+FEATURISE_LENGTHS = [1, 2, 7, 53, 100, 257, 400]
 SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6", "--repeat=30"])
 # The trunk's bounds; the DECODER's stages take 1e-4 on both arms and the binary applies that
 # itself - it runs in f32 whatever the arm, because its near-uniform softmax costs far more in
@@ -124,6 +130,50 @@ def ca_rms(a: Path, b: Path) -> float:
     total = sum((px - qx) ** 2 + (py - qy) ** 2 + (pz - qz) ** 2
                 for (px, py, pz), (qx, qy, qz) in zip(x, y))
     return (total / len(x)) ** 0.5
+
+
+def compare_dirs(native: Path, js: Path) -> list[str]:
+    """Every tensor the NATIVE directory writes, against the JavaScript's, as bytes.
+
+    🔴 THE JAVASCRIPT SIDE MAY CARRY MORE, AND THAT IS NOT A DIFFERENCE. `--oracle=` makes the
+    exporter write `in/zLatent` and `in/decSeq`, which are the reference TRUNK's outputs and not a
+    featurisation; the featuriser rightly does not produce them. What is compared is what the
+    native side claims, and a key it claims that the JavaScript lacks IS a difference.
+    """
+    import struct
+
+    def load(d: Path) -> dict:
+        out: dict = {}
+        raw = (d / "model.bin").read_bytes()
+        for ln in (d / "model.idx").read_text().splitlines():
+            p = ln.split()
+            if p[0] == "m":
+                out[p[1]] = ("m", float(p[2]))
+                continue
+            off, cnt = int(p[2]), int(p[3])
+            fmt = ("<%df" if p[0] == "t" else "<%di") % cnt
+            out[p[1]] = (p[0], struct.unpack(fmt, raw[off * 4:(off + cnt) * 4]))
+        return out
+
+    if not (native / "model.idx").exists() or not (js / "model.idx").exists():
+        return ["one side was not written"]
+    a, b = load(native), load(js)
+    differ = []
+    for k, (kind, va) in sorted(a.items()):
+        if k not in b:
+            differ.append(f"{k} is only in the native directory")
+            continue
+        vb = b[k][1]
+        if kind == "m":
+            if va != vb:
+                differ.append(f"{k} is {va} native and {vb} in JS")
+        elif len(va) != len(vb):
+            differ.append(f"{k} is {len(va)} long native and {len(vb)} in JS")
+        else:
+            n = sum(1 for x, y in zip(va, vb) if x != y)
+            if n:
+                differ.append(f"{k}: {n} of {len(va)} differ")
+    return differ
 
 
 def worst_of(out: str) -> tuple[float, int]:
@@ -275,6 +325,42 @@ def main() -> int:
               row["fast_ca_rms"] = round(rms, 4)
               print(f"  {name:10s} {'fast vs exact':10s} {rms:8.3f} A of CA over 60 steps  {mark}")
           got[name] = row
+
+    # ---- the native featuriser, against the JavaScript exporter's own bytes -------------------
+    if not args.only or args.only in "featurise":
+        binary = HERE / "featurise" / "rfd4p-featurise"
+        if not binary.exists():
+            print("  featurise  no rfd4p-featurise; run bash cuda/build.sh rfd4p")
+            failed += 1
+        else:
+            cases = [(f"n{L}", [f"--length={L}"], [f"--length={L}"]) for L in FEATURISE_LENGTHS]
+            # And a CONDITIONED case, because a plain segment reaches neither the selection
+            # language nor the CATH table. The preset is turned into the plain condition spec the
+            # C++ reads, so neither side learns about the other's menu.
+            spec = HERE / "featurise" / "gate-cath.json"
+            r = run(["node", HERE / "featurise" / "preset-spec.mjs", "custom_cath_monomer"],
+                    cwd=REPO)
+            if r.returncode == 0:
+                spec.write_text(r.stdout)
+                cases.append(("cath", [f"--spec={spec}"], ["--preset=custom_cath_monomer"]))
+            first, bad_fields = "", 0
+            for tag, native_flags, js_flags in cases:
+                nat, js = HERE / f"gate-nat-{tag}", HERE / f"gate-js-{tag}"
+                run([binary, nat, f"--weights={args.weights}",
+                     f"--config={REPO}/model-rfd4p-int8/config.json", *native_flags], cwd=REPO)
+                if not (js / "model.idx").exists():
+                    run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", js,
+                         *js_flags], cwd=REPO)
+                differ = compare_dirs(nat, js)
+                if differ:
+                    bad_fields += len(differ)
+                    first = first or f"{tag}: {differ[0]}"
+            mark = "ok " if not bad_fields else "DIFFERS"
+            if bad_fields:
+                failed += 1
+            print(f"  {'featurise':10s} {len(cases)} cases, {bad_fields} field(s) differ"
+                  f"{'  ' + first if first else ''}  {mark}")
+            got["featurise"] = {"cases": len(cases), "differing": bad_fields}
 
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:

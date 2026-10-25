@@ -271,6 +271,49 @@ export) and would have been the standalone form's first bug.
 `sum(depths)` JS trunk passes at about a minute each, so the preset's 60 steps is an afternoon.
 `--gen-oracle` is opt-in on the exporter for that reason.
 
+## The featuriser in C++, held to the JavaScript's BYTES
+
+`cuda/rfd4p/featurise/rfd4p-featurise` takes a condition spec and writes the port's input
+directory with no JavaScript anywhere on the path:
+
+```
+cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --spec=<job.json>
+cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --length=100
+```
+
+`gate.py`'s `featurise` arm holds it to `export_input.mjs` **field by field, as bytes** - eight
+cases, 0 differing - over seven lengths and the CATH-plus-secondary-structure preset. That bar is
+`cuda/featurise`'s and it is the only one worth having: a featuriser that merely agrees closely is
+a second, slightly different model.
+
+🔴 **IT NEEDED V8's `log` AND `exp`, AND glibc's ARE NOT THEM.** `get_time_embedding` is
+`exp(-log(2000) / (half - 1) * i)` a channel, and glibc's own log and exp differ from V8's on
+**2.6% and 7.2%** of arguments - so a featuriser on the system libm cannot be held to bytes however
+right its structure. `cuda/featurise/jsmath.h` carries both now, 0 of 200,000 apart, which also
+makes the port's own Box-Muller exact.
+
+🔴 **AND THE FIRST VERSION WAS EXACT AT 53 AND 100 RESIDUES AND ONE ULP OUT AT 1, 2, 7 AND 257** -
+the centering scale written `0.2f` where the reference multiplies by JavaScript's `0.2`, the
+DOUBLE, so the product rounded twice. A sweep of lengths is what separates "exact" from "exact at
+the length I tried", and it is why the gate runs seven.
+
+🔴 **AND FOR A SPEC INPUT ALMOST EVERY BATCH FIELD IS ITS INITIALISATION VALUE** - which is the
+reference's behaviour and not an omission. Every token realised from a contig is a `<M>` stub with
+no atoms, so `buildAtom37Slots` returns -1 for all 37 slots and the whole per-atom loop of
+`convertToProteinaBatch` is a no-op: `element` is -1 and `condition_index` is 1 because nothing
+overwrites the fill. A port that helpfully computed them would disagree. What is actually computed
+is the chain - `token_bond_path_length[i][j] = |i - j|` and `canonical_polymer_ordering` at the
+neighbours - and the conditions.
+
+The selection language is a SUBSET and says so: a union of `sel('*/<segment>/*/*')`, which is what
+a contig with no residue numbers and no atoms can express. Anything else is refused by name, never
+quietly matched to nothing - a condition silently dropped is a condition the model is told is
+absent.
+
+`featurise/tables.inc` is generated from `shared/rfd4p/` (the 147-token vocabulary and its atom37
+layouts, the condition registry and its enums, the CATH maps), and
+`test/rfd4p-native-tables.test.js` fails when it is stale.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,
@@ -345,8 +388,11 @@ residues the cropped example does not contain, so building one from the spec fai
 
 ## What is not done
 
-- **A native featuriser.** `export_input.mjs` drives the page's own JS; the C++ twin under
-  `cuda/featurise/` comes with the `--job` form and the `lf::standalone::main` dispatch.
+- **A native featuriser for an input STRUCTURE.** The spec path is done (below); the seven
+  `web/examples/*.cif.zst` presets still go through `export_input.mjs`, because they need the
+  mmCIF reader, the CCD bond tables and the chirality templates.
+- **A `--job` form on the fold binary.** The featuriser and the fold are two processes; the other
+  ports dispatch through `lf::standalone::main` in one.
 - **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
   group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
   shipped preset has one.

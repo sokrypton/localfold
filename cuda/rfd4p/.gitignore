@@ -7,3 +7,7 @@ weights-f32/
 data*/
 oracle*/
 gate-full-*.pdb
+gate-nat-*/
+gate-js-*/
+gate-cath.json
+featurise/gate-cath.json

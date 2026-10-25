@@ -60,6 +60,21 @@ fi
 for name in af3-featurise af2-featurise ef2-featurise bioemu2-featurise resolve-templates chem-probe fetch-weights msa-search; do
   ln -sfn featurise "$here/featurise/$name"
 done
+# RFD4-Proteina's featuriser is its OWN binary, not a link to the one above: its pipeline shares
+# nothing with AF3's - a contig and a selection language rather than a job of chains - and the only
+# code the two have in common is jsmath and the JSON reader, which it includes.
+rfbin="$here/rfd4p/featurise/rfd4p-featurise"
+rfstamp="$(cat "$here"/rfd4p/featurise/featurise.cpp "$here"/rfd4p/featurise/tables.inc \
+  "$here"/rfd4p/src/schedule.h "$here"/featurise/jsmath.h "$here"/featurise/json.h \
+  | sha256sum | cut -c1-16)"
+if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; then
+  ( g++ -std=c++17 -O2 -ffp-contract=off "$here/rfd4p/featurise/featurise.cpp" -o "$rfbin.building" \
+      >> "$log" 2>&1 \
+    && mv "$rfbin.building" "$rfbin" && echo "$rfstamp" > "$rfbin.stamp" \
+    && echo "built rfd4p-featurise" >> "$log" \
+    || { echo "FAILED rfd4p-featurise" >> "$log"; exit 1; } ) &
+  pids+=($!)
+fi
 # (no GPU: the featurisers still build, the ports cannot)
 if [ "${ports[*]}" = featurise ]; then
   status=0; for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || status=1; done
