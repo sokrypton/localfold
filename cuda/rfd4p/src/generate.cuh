@@ -292,6 +292,41 @@ inline bool matchInsertedAtoms(const std::vector<std::string>& srcName,
  * contributes nothing to it.
  */
 /**
+ * `buildPredictedInsertionMapping`: the model's own answer, from the insertion head.
+ *
+ * 🔴 THE HEAD IS ASKED ONLY ON THE LAST STEP, and that is the one whose logits mean anything -
+ * the reference's note is that a mapping captured at t = 0 is noise, and the fallback exists
+ * for exactly that case. `trunk.cuh` already passes `s == steps - 1`.
+ *
+ * 🔴 AND THE SCORE IS READ AT THE TOKEN'S OWN INDEX IN AN n x n MATRIX, not at its position in
+ * the unindexed list: row `uPos`, column `iPos`, both absolute. Compacting either axis first
+ * gives a matrix of the right shape and the wrong entries.
+ */
+inline Insertion predictedInsertionMapping(int n, const float* logits, const int* condIndex,
+                                           const std::vector<uint8_t>& emitted) {
+  Insertion out;
+  if (!logits || !condIndex) return out;
+  std::vector<int> unidx, idx;
+  for (int tk = 0; tk < n; ++tk) {
+    const bool indexed = condIndex[(size_t)tk * 37 + 1] != 0;
+    if (!indexed) unidx.push_back(tk);
+    else if (emitted.empty() || emitted[tk]) idx.push_back(tk);
+  }
+  if (unidx.empty() || idx.empty()) return out;
+  std::vector<double> score((size_t)unidx.size() * idx.size());
+  for (size_t r = 0; r < unidx.size(); ++r) {
+    for (size_t c = 0; c < idx.size(); ++c) {
+      score[r * idx.size() + c] = (double)logits[(size_t)unidx[r] * n + idx[c]];
+    }
+  }
+  const assign::Assignment a = assign::maximize(score, (int)unidx.size(), (int)idx.size());
+  out.source = unidx;
+  out.target.assign(unidx.size(), -1);
+  for (size_t k = 0; k < a.row.size(); ++k) out.target[a.row[k]] = idx[a.col[k]];
+  return out;
+}
+
+/**
  * The transfer: a mapped motif's conditioned coordinates onto the token it was grafted to.
  *
  * 🔴 IT WRITES INTO THE ANCHOR SET, WHICH IS THE WHOLE POINT. An unindexed token's conditioned
@@ -302,9 +337,14 @@ inline bool matchInsertedAtoms(const std::vector<std::string>& srcName,
 inline void applyInsertion(const GenOut& g, int n, const Insertion& ins,
                            const std::vector<std::string>& atomNames, float* condCoord,
                            float* condIntCrd, int* coordGroup,
-                           std::vector<uint8_t>& isInsertion) {
-  isInsertion.assign((size_t)n * 37, 0);
-  if (ins.source.empty()) return;
+                           std::vector<uint8_t>& isInsertion, bool dryRun = false,
+                           bool* allMatched = nullptr) {
+  if (!dryRun) isInsertion.assign((size_t)n * 37, 0);
+  if (allMatched) *allMatched = true;
+  if (ins.source.empty()) {
+    if (allMatched) *allMatched = false;
+    return;
+  }
   // 🔴 SLOT TO NAME IS RESIDUE-INDEPENDENT IN THIS PORT, which is what the writer above already
   // assumes: `atomNames` is one 37-long list read from the model directory and every residue
   // indexes it the same way. The reference carries a per-residue slot map; if the two ever
@@ -346,7 +386,14 @@ inline void applyInsertion(const GenOut& g, int n, const Insertion& ins,
       tSlot.push_back(s);
     }
     std::vector<int> matched;
-    if (sn.empty() || !matchInsertedAtoms(sn, se, sp, tn, te, tp, matched)) continue;
+    if (sn.empty() || !matchInsertedAtoms(sn, se, sp, tn, te, tp, matched)) {
+      // 🔴 ONE PAIR THAT CANNOT BE MATCHED REJECTS THE WHOLE MAPPING, which is what makes the
+      // fallback a fallback: the reference validates every pair before applying any, and a
+      // half-applied mapping would graft some motifs and silently drop others.
+      if (allMatched) *allMatched = false;
+      continue;
+    }
+    if (dryRun) continue;
     for (int s : tSlot) isInsertion[(size_t)tgt * 37 + s] = 1;
     for (size_t m = 0; m < matched.size(); ++m) {
       const size_t from = (size_t)u * 37 + sSlot[m];
@@ -360,6 +407,46 @@ inline void applyInsertion(const GenOut& g, int n, const Insertion& ins,
       }
     }
   }
+}
+
+/**
+ * The model's mapping if every pair of it can be grafted, otherwise the geometric one.
+ *
+ * 🔴 THE PREDICTED ONE IS TRIED FIRST AND VALIDATED BEFORE ANYTHING IS WRITTEN. The reference
+ * builds it, checks that every unindexed token's atoms can be matched onto its target's, and
+ * only then applies it - falling back to the geometric mapping if any pair fails. Applying
+ * first and repairing afterwards would leave a motif grafted by one rule and the rest by
+ * another.
+ *
+ * 🔴 AND THE VALIDATION IS NOT FALSIFIABLE ON THE ONE SHIPPED UNINDEXED CASE. On
+ * `motif_unidx_1prw` the head's mapping is fully matchable, so applying it UNCHECKED gives the
+ * same answer and the gate stays green - and the two mappings agree there atom for atom, which
+ * is itself worth knowing. What would exercise it is an input whose unindexed motif cannot be
+ * grafted onto the token the head picks; the corpus has none, and this is recorded rather than
+ * left looking checked.
+ */
+inline Insertion resolveInsertion(const GenOut& g, int n, const float* insertionLogits,
+                                  const int* condIndex, const int* resType, const float* coords,
+                                  const float* condCoord, const float* condIntCrd,
+                                  const std::vector<uint8_t>& emitted,
+                                  const std::vector<std::string>& atomNames, bool* usedPredicted) {
+  std::vector<uint8_t> scratchFlags;
+  auto usable = [&](const Insertion& ins) {
+    if (ins.source.empty()) return false;
+    bool ok = false;
+    applyInsertion(g, n, ins, atomNames, const_cast<float*>(condCoord),
+                   const_cast<float*>(condIntCrd), nullptr, scratchFlags, true, &ok);
+    return ok;
+  };
+  const Insertion predicted =
+      predictedInsertionMapping(n, insertionLogits, condIndex, emitted);
+  if (usable(predicted)) {
+    if (usedPredicted) *usedPredicted = true;
+    return predicted;
+  }
+  if (usedPredicted) *usedPredicted = false;
+  return geometricInsertionMapping(g, n, condIndex, resType, coords, condCoord, condIntCrd,
+                                   emitted);
 }
 
 inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const float* condIntCrd,

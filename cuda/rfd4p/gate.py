@@ -632,12 +632,25 @@ def main() -> int:
                             if ln.startswith("ATOM")})
                 unk = sum(1 for ln in updb.read_text().splitlines()
                           if ln.startswith("ATOM") and ln[17:20].strip() == "UNK")
-                uok = ures == 72 and unk == 0 and bool(uca) and min(uca) > 2.8
+                # 🔴 AND THE FOLD'S OWN COUNT MUST MATCH ITS OWN FILE. It counted every token
+                # where it writes only the emitted ones, so it said "72 residues" over a file
+                # holding 112 and "602 atoms" over 562 - and that disagreement is exactly what
+                # made the residue bug look like it was not there.
+                ustdout = run([BINARY, f"--job={ufold}", f"--int8={bundle}",
+                               f"--work-dir={HERE / 'gate-unindexed'}", f"--out={updb}",
+                               "--seed=0", "--fast"], cwd=REPO).stdout
+                m = re.search(r"generated (\d+) residues, (\d+) atoms", ustdout)
+                said = (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
+                wrote = (ures, sum(1 for ln in updb.read_text().splitlines()
+                                   if ln.startswith("ATOM")))
+                uok = (ures == 72 and unk == 0 and bool(uca) and min(uca) > 2.8
+                       and said == wrote)
                 if not uok:
                     failed += 1
                 print(f"  {'unindexed':10s} the indexed tokens only, {ures} residues and "
-                      f"{unk} UNK  {'ok ' if uok else 'WRONG TOKEN SET'}")
-                got["unindexed"] = {"residues": ures, "unk": unk}
+                      f"{unk} UNK, the count matches the file  "
+                      f"{'ok ' if uok else f'WRONG: said {said} wrote {wrote}'}")
+                got["unindexed"] = {"residues": ures, "unk": unk, "count_matches": said == wrote}
 
                 # 🔴 AND A SECOND STRUCTURE WITH TWO CHAINS, because `motif_idx_1prw`'s only
                 # chain is A and `chainName(0)` is A too - the chain half of this arm cannot

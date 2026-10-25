@@ -548,8 +548,10 @@ residues the cropped example does not contain, so building one from the spec fai
     (`src/superpose.h`) - a **0.12 A** refinement, measured, not the rescue it looks like. An unindexed motif is grafted onto a
     generated token (`geometricInsertionMapping` and `matchInsertedAtoms`, on `src/assign.h`)
     and its conditioned coordinates transferred, which is how it reaches the output at all.
-    What is left is the PREDICTED insertion mapping from the trunk's own logits - the geometric
-    fallback is what runs now - and the coordinate-group permutation.
+    The mapping is the trunk's OWN - `predictedInsertionMapping` off the insertion head's
+    logits, validated pair by pair and falling back to the geometric one if any pair cannot be
+    grafted. On `motif_unidx_1prw` the head's answer is used and agrees with the geometric one
+    atom for atom. What is left of this path is the coordinate-group permutation.
 
     🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
     in-context conditioning that the sampler never generates, and the reference writes only the
@@ -562,6 +564,17 @@ residues the cropped example does not contain, so building one from the spec fai
     PORT.** The shortest CA-CA step is 2.76 A there and 3.66 at 60. The int8 arm records this
     exact trap in these exact words - "reading that as int8's fault would be reading the step
     count as a defect" - and this arm was written at 25 anyway.
+
+    🔴 **AND THE FOLD'S OWN COUNT DISAGREED WITH ITS OWN FILE, TWICE.** It counted every token
+    where it writes only the emitted ones: "72 residues" over a file holding 112, then "602
+    atoms" over 562. That disagreement is what made the residue bug look like it was not
+    there, so the gate now holds the printed line to the file it describes - and putting the
+    mask back reddens it at `said (72, 602) wrote (72, 562)`.
+
+    🔴 **AND THE VALIDATION OF THE PREDICTED MAPPING IS NOT FALSIFIABLE ON THE ONE UNINDEXED
+    CASE THE CORPUS HAS.** The head's mapping is fully matchable there, so applying it
+    UNCHECKED gives the same answer and the gate stays green. What would exercise it is an
+    input whose motif cannot be grafted onto the token the head picks; there is none.
 
     🔴 **AND THE OUTPUT USED TO RENUMBER THE MOTIF.** The writer spelled `i + 1` and
     `chainName(chain_iid)`, which is right for a chain this port NAMED and wrong for one a file

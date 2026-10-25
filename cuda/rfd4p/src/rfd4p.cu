@@ -501,10 +501,21 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       }
       if (M.has("g/condIndex")) {
         std::vector<uint8_t> emitted((size_t)n, 1);
-        const rfd4p::Insertion ins = rfd4p::geometricInsertionMapping(
-            g, n, M.i("g/condIndex"), M.has("g/resType") ? M.i("g/resType") : nullptr,
+        // The insertion head's own logits from the LAST step, which is the only pass that
+        // asked for them; the geometric mapping is the fallback when they cannot be grafted.
+        const std::vector<float> insLogits =
+            t.insertion ? download(t.insertion, (size_t)n * n) : std::vector<float>();
+        bool usedPredicted = false;
+        const rfd4p::Insertion ins = rfd4p::resolveInsertion(
+            g, n, insLogits.empty() ? nullptr : insLogits.data(), M.i("g/condIndex"),
+            M.has("g/resType") ? M.i("g/resType") : nullptr,
             M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
-            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted);
+            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted, atomNames,
+            &usedPredicted);
+        if (!ins.source.empty()) {
+          printf("  %zu unindexed token%s grafted by the %s mapping\n", ins.source.size(),
+                 ins.source.size() == 1 ? "" : "s", usedPredicted ? "predicted" : "geometric");
+        }
         rfd4p::applyInsertion(g, n, ins, atomNames, condCoordRW.data(),
                               condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
                               coordGroupRW.empty() ? nullptr : coordGroupRW.data(), isInsertion);
@@ -531,8 +542,13 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     }
     std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf, naming)
                                     : rfd4p::toPdb(g, n, atomNames, resNames, chainOf, naming));
+    // 🔴 COUNTED OVER WHAT IS WRITTEN, NOT OVER EVERY TOKEN. The unindexed tokens are grafted
+    // rather than emitted, and counting them made this line disagree with its own file twice:
+    // "72 residues" over 112, then "602 atoms" over 562. A count that does not match the
+    // output is worse than no count - it is what made the residue bug look like a non-issue.
     int atoms = 0, residues = 0;
     for (int i = 0; i < n; ++i) {
+      if (naming.skip(i)) continue;
       if (g.residueType[i] >= 0) ++residues;
       for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
     }
