@@ -251,11 +251,15 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
   };
   auto paddedAt = [&](size_t row) -> size_t { if constexpr (VEC) return row; else return padded(row); };
   if constexpr (VEC) {
+    const int c0_p = (int)threadIdx.x / (R / 8), r0_p = ((int)threadIdx.x % (R / 8)) * 8;
+    const size_t row = row0 + r0_p;
+    const bool ok = row < plane;
+    const TP* srcBase = prod + (size_t)c0_p * stride + (ok ? row : 0);
+    TT* dstBase = Ps + c0_p * LDP + r0_p;
 #pragma unroll
-    for (int t0_ = 0; t0_ < C * (R / 8); t0_ += NTH) {
-      int t = t0_ + (int)threadIdx.x, c = t / (R / 8), r = (t % (R / 8)) * 8;
-      size_t row = row0 + r;
-      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * stride + (row < plane ? row : 0), row < plane);
+    for (int it = 0; it < (C * (R / 8)) / NTH; ++it) {
+      constexpr int C_STEP = NTH / (R / 8);
+      cpAsync16(dstBase + it * C_STEP * LDP, srcBase + (size_t)it * C_STEP * stride, ok);
     }
     cpCommit(); cpWait<0>();
   } else {
@@ -318,9 +322,7 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
       if (g + 8 == m) { mb = mean; ib = inv; }
     }
   }
-  auto nrm = [&](int r, float m, float inv, int k) {
-    float sc = VEC ? ptx_ld_shared_f32(nsc + k) : ptx_ldg_f32(cnScale + k);
-    float of = VEC ? ptx_ld_shared_f32(nsc + C + k) : ptx_ldg_f32(cnOffset + k);
+  auto nrmVal = [&](int r, float m, float inv, int k, float sc, float of) {
     return ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(toF(Ps[pIdx(k, r)]), m), inv), sc, of);
   };
   uint32_t xa[KS][4];
@@ -329,10 +331,14 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
 #pragma unroll
     for (int d = 0; d < 8; ++d) {
       int ks = ks0 + d, k = ks * 16 + 2 * tig;
-      xa[ks][0] = pack2(nrm(ra, ma, ia, k), nrm(ra, ma, ia, k + 1));
-      xa[ks][1] = pack2(nrm(rb, mb, ib, k), nrm(rb, mb, ib, k + 1));
-      xa[ks][2] = pack2(nrm(ra, ma, ia, k + 8), nrm(ra, ma, ia, k + 9));
-      xa[ks][3] = pack2(nrm(rb, mb, ib, k + 8), nrm(rb, mb, ib, k + 9));
+      float2 sc01 = VEC ? ptx_ld_shared_v2_f32(nsc + k) : ptx_ldg_v2_f32(cnScale + k);
+      float2 of01 = VEC ? ptx_ld_shared_v2_f32(nsc + C + k) : ptx_ldg_v2_f32(cnOffset + k);
+      float2 sc89 = VEC ? ptx_ld_shared_v2_f32(nsc + k + 8) : ptx_ldg_v2_f32(cnScale + k + 8);
+      float2 of89 = VEC ? ptx_ld_shared_v2_f32(nsc + C + k + 8) : ptx_ldg_v2_f32(cnOffset + k + 8);
+      xa[ks][0] = pack2(nrmVal(ra, ma, ia, k, sc01.x, of01.x), nrmVal(ra, ma, ia, k + 1, sc01.y, of01.y));
+      xa[ks][1] = pack2(nrmVal(rb, mb, ib, k, sc01.x, of01.x), nrmVal(rb, mb, ib, k + 1, sc01.y, of01.y));
+      xa[ks][2] = pack2(nrmVal(ra, ma, ia, k + 8, sc89.x, of89.x), nrmVal(ra, ma, ia, k + 9, sc89.y, of89.y));
+      xa[ks][3] = pack2(nrmVal(rb, mb, ib, k + 8, sc89.x, of89.x), nrmVal(rb, mb, ib, k + 9, sc89.y, of89.y));
     }
     if constexpr (C == 512) __syncwarp();
   }
@@ -379,6 +385,8 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     // the chunk's residual and gate, loaded before its MMAs so they cover the latency (ncu: long scoreboard
     // 39% of the kernel's stalls, on these loads issued after the GEMM)
     PairRaw4<PT> pv[C < 512 ? PER : 1]; uint2 gv[C < 512 ? PER : 1];
+    float4 b4 = {0.f, 0.f, 0.f, 0.f};
+    if constexpr (BIAS) b4 = ptx_ldg_v4_f32(ob + n * NC + q0_);
     if constexpr (C < 512) {
 #pragma unroll
       for (int i = 0; i < PER; ++i) {
@@ -438,24 +446,29 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     int c = n * NC + q0_;
 #pragma unroll
     for (int i = 0; i < PER; ++i) {
-      size_t row = row0 + warp * 16 + i * LPR + lane / (NC / 4);
-      size_t pr = C < 512 ? (pr_[i] == ~0u ? SIZE_MAX : (size_t)pr_[i]) : pairAt(row);
-      if (pr == SIZE_MAX) continue;
+      size_t pr;
+      if constexpr (C < 512) {
+        if (pr_[i] == ~0u) continue;
+        pr = (size_t)pr_[i];
+      } else {
+        size_t row = row0 + warp * 16 + i * LPR + lane / (NC / 4);
+        pr = pairAt(row);
+        if (pr == SIZE_MAX) continue;
+      }
       int rl = i * LPR + lane / (NC / 4);
       float4 o = ptx_ld_shared_v4_f32(Os + rl * LDO + q0_);
-      uint2 gw = C < 512 ? gv[i] : ptx_ld_global_v2_u32(t2 + paddedAt(row) * C + c);
+      uint2 gw = C < 512 ? gv[i] : ptx_ld_global_v2_u32(t2 + paddedAt(row0 + warp * 16 + i * LPR + lane / (NC / 4)) * C + c);
       float2 g01 = ptx_f16x2_to_f32x2(gw.x), g23 = ptx_f16x2_to_f32x2(gw.y);
       float4 v = C < 512 ? pairUnpack4<PT>(pv[i]) : pairLd4<PT>(pair, pr * C + c);
       if constexpr (BIAS) {
-        float4 b4 = ptx_ldg_v4_f32(ob + c);
         o.x = ptx_add_f32(o.x, b4.x); o.y = ptx_add_f32(o.y, b4.y); o.z = ptx_add_f32(o.z, b4.z); o.w = ptx_add_f32(o.w, b4.w);
       }
       v.x = ptx_fma_f32(o.x, sigmH(g01.x), v.x); v.y = ptx_fma_f32(o.y, sigmH(g01.y), v.y);
       v.z = ptx_fma_f32(o.z, sigmH(g23.x), v.z); v.w = ptx_fma_f32(o.w, sigmH(g23.y), v.w);
       pairSt4<PT>(pair, pr * C + c, v);
     }
-    __syncwarp();
 #if LF_REG_STAGES
+    __syncwarp();
     if (n + 1 < chunks) stage(n + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
 #endif
   }
@@ -496,7 +509,7 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 // shared memory then feeds MT MMAs where it fed one - the kernel was shared-memory bound (Nsight Compute at 988
 // tokens: the LSU's shared wavefronts 68% of peak, the tensor pipe 57%). Each output's k order is unchanged.
 template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float, int MT = 1,
-          int MINB = ((C == 128 && WARPS == 4 && MT == 2) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
+          int MINB = (((C == 128 || C == 64) && WARPS == 4 && (MT == 2 || MT == 1)) || (C == 256 && WARPS == 4 && XROUNDS == 1 && MT == 1)) ? 4
                    : (C == 256 && WARPS == 8 && XROUNDS == 1 && MT == 1) ? 2 : 1>
 #if LF_REG_STAGES
 __global__ void __launch_bounds__(WARPS * 32, fitBlocks((C == 128 && WARPS == 4 && MT == 2) ? 2 : 1, triIn256Smem<TA>(C, WARPS, XROUNDS, MT)))
@@ -627,6 +640,16 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
 #if LF_REG_STAGES
     if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
 #endif
+    float2 bp[NC / 8], bq[NC / 8];
+    if constexpr (BIAS) {
+#pragma unroll
+      for (int nt = 0; nt < NC / 8; ++nt) {
+        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
+        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
+        bp[nt] = ptx_ldg_v2_f32(bias + col);
+        bq[nt] = ptx_ldg_v2_f32(bias + qcol);
+      }
+    }
 #if LF_REG_STAGES
     __syncthreads();
 #else
@@ -653,11 +676,7 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     if constexpr (BIAS) {
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
-        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
-        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
-        float2 bp = ptx_ldg_v2_f32(bias + col);
-        float2 bq = ptx_ldg_v2_f32(bias + qcol);
-        float b0 = bp.x, b1 = bp.y, g0 = bq.x, g1 = bq.y;
+        float b0 = bp[nt].x, b1 = bp[nt].y, g0 = bq[nt].x, g1 = bq[nt].y;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
           p[mt][nt][0] = ptx_add_f32(p[mt][nt][0], b0); p[mt][nt][1] = ptx_add_f32(p[mt][nt][1], b1);

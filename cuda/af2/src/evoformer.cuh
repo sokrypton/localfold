@@ -1431,14 +1431,28 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
   B16* a = scratch<B16>("trib.abf", (size_t)width * Lp * C);
   B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
   half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
-  const size_t smem = triIn256Smem<B16>(128, 8);
+  static const bool xr2 = [] {
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    return (size_t)perSm < 3 * (triIn256Smem<B16>(128, 8) + 1024);
+  }();
+  const size_t smem = xr2 ? triIn256Smem<B16>(128, 4, 2, 2) : triIn256Smem<B16>(128, 8);
   WITH_PAIR_T(
     static bool attr = false;
-    if (!attr) { smemAttr((triIn256K<128, 4, B16, 1, true, PT, 2>), (int)smem); attr = true; }
+    if (!attr) {
+      if (xr2) smemAttr((triIn256K<128, 4, B16, 2, true, PT, 2>), (int)smem);
+      else smemAttr((triIn256K<128, 4, B16, 1, true, PT, 2>), (int)smem);
+      attr = true;
+    }
     auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
-      triIn256K<128, 4, B16, 1, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
-        pair, mask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, ao, bo, t2o, L, Lp, plane,
-        tw.bias, rm);
+      if (xr2)
+        triIn256K<128, 4, B16, 2, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
+          pair, mask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, ao, bo, t2o, L, Lp, plane,
+          tw.bias, rm);
+      else
+        triIn256K<128, 4, B16, 1, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
+          pair, mask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, ao, bo, t2o, L, Lp, plane,
+          tw.bias, rm);
     };
     in(RectMap{}, plane, nullptr, b, nullptr);
     for (int k0 = 0; k0 < L; k0 += width) {
@@ -1482,14 +1496,14 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // kernel at two row tiles a warp (biased), a bf16 contraction, and the output kernel streaming its weight 16 columns
   // a stage with the bias in its epilogue - where the narrow output kernel holds the whole weight at one block an SM.
   // LOCALFOLD_TRI128=narrow|wide forces either (as cuda/af3's pairtrack.cuh)
-  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && af2Wide128() && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
+  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && af2Wide128() && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
     const half* wt = w.wt;
     // FP8 operands where the card has FP8 tensor instructions (fp8Tensor), as cuda/af3's triangle: both directions in the
     // outgoing layout (the incoming input kernel reading the pair transposed, RectMap's T), through an e4m3 GEMM into
     // the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
-    if (fp8Tensor()) {
+    if (fp8Tensor() && L >= 80) {
       using F8 = __nv_fp8_e4m3;
       const int np8 = (L + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
       F8* a8 = scratch<F8>("ftri.a8", cs8 * C); F8* b8 = scratch<F8>("ftri.b8", cs8 * C);
@@ -1510,12 +1524,29 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     }
     __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
     half* t2 = scratch<half>("ftri.t2", plane * C);
-    const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);
-    WITH_PAIR_T(
-      static bool attr = false;
-      if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
-      triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
-        pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+    static const bool xr2 = [] {
+      int dev, perSm = 0; CK(cudaGetDevice(&dev));
+      CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+      return (size_t)perSm < 3 * (triIn256Smem<__nv_bfloat16>(128, 8) + 1024);
+    }();
+    if (L < 80) {
+      triInRaw<__nv_bfloat16, true>(pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
+                                    w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
+    } else if (xr2) {
+      const size_t smem = triIn256Smem<__nv_bfloat16>(128, 4, 2, 2);
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 2, true, PT, 2>), (int)smem); attr = true; }
+        triIn256K<128, 4, __nv_bfloat16, 2, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+          pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+    } else {
+      const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
+        triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+          pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+    }
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
     triContractBf16(outgoing, Lp, plane, C, 1.f, a, b, prod);
     triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
