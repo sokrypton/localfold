@@ -148,6 +148,101 @@ __global__ void swiGluSecondK(const float* __restrict__ wide, float* __restrict_
   gated[i] = (gate / (1.f + __expf(-gate))) * xPart;
 }
 
+// ---------------------------------------------------------------- the attention's pair bias
+//
+// RMSNorm the pair row, project it to `heads` numbers, and write them in flash's bias layout - one
+// kernel, one warp a pair, where it used to be a norm over [pairs, 384], a GEMM whose output is
+// twelve columns wide, and a layout pass. The normed pair tensor was materialised (15 MB written and
+// read back a layer, 84 layers a pass) for the sake of 12 numbers a row, and the GEMM that consumed
+// it ran at 3.2 TFLOP/s because its N is 12.
+//
+// A lane holds C/32 channels in registers, so the row is read once: the sum of squares and all
+// `heads` dot products come off the same registers.
+template <class T, int K, int HEADS>
+__global__ void __launch_bounds__(256)
+pairBiasK(const float* __restrict__ z, const float* __restrict__ normW,
+          const float* __restrict__ biasW, const float* __restrict__ pairMask, T* __restrict__ bias,
+          int n, int stride, float scale) {
+  constexpr int C = K * 32;
+  constexpr int heads = HEADS;
+  // 🔴 THE PROJECTION IS NOT STAGED IN SHARED MEMORY. At [12, 384] it is 18 KB, which with eight
+  // warps a block caps this kernel at two blocks an SM; every lane reads the same words every pair,
+  // so L1 broadcasts them and the occupancy is worth more than the staging.
+  const size_t pair = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (pair >= (size_t)n * n) return;
+  const int lane = threadIdx.x & 31;
+  const int i = (int)(pair / n), j = (int)(pair % n);
+
+  float v[K];
+  float sq = 0.f;
+  #pragma unroll
+  for (int k = 0; k < K; ++k) {
+    v[k] = __ldg(z + pair * C + k * 32 + lane);
+    sq += v[k] * v[k];
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
+  const float inv = rsqrtf(sq / (float)C + 1e-5f);
+  #pragma unroll
+  for (int k = 0; k < K; ++k) v[k] *= inv * __ldg(normW + k * 32 + lane);
+
+  // 🔴 ALL `heads` BUTTERFLIES AT ONCE, NOT ONE HEAD AT A TIME. A warp reduction is five dependent
+  // shuffles; done in a loop the twelve of them serialise into sixty latencies and the kernel runs
+  // 4.5x off its own bandwidth. Unrolled over a compile-time head count they are twelve independent
+  // chains and the scheduler interleaves them.
+  const bool dead = pairMask && pairMask[pair] == 0.f;
+  float dot[HEADS];
+  #pragma unroll
+  for (int h = 0; h < HEADS; ++h) {
+    dot[h] = 0.f;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) dot[h] += v[k] * __ldg(biasW + h * C + k * 32 + lane);
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) {
+    #pragma unroll
+    for (int h = 0; h < HEADS; ++h) dot[h] += __shfl_xor_sync(~0u, dot[h], o);
+  }
+  if (lane < HEADS) {
+    const float out = dead ? -1e4f : dot[lane] * scale;
+    bias[(size_t)lane * n * stride + (size_t)i * stride + j] =
+        std::is_same_v<T, half> ? (T)fmaxf(out, -6e4f) : (T)out;
+  }
+}
+
+// The padding columns flash reads past the chain's end, zeroed once a shape rather than every layer.
+template <class T>
+__global__ void biasPadK(T* __restrict__ bias, int n, int stride, int heads) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const int pad = stride - n;
+  if (pad <= 0 || i >= (size_t)heads * n * pad) return;
+  const int h = (int)(i / ((size_t)n * pad));
+  const size_t within = i - (size_t)h * n * pad;
+  const int row = (int)(within / pad), col = n + (int)(within % pad);
+  bias[(size_t)h * n * stride + (size_t)row * stride + col] = (T)0.f;
+}
+
+template <class T>
+inline void pairBias(const float* z, const std::string& normW, const std::string& biasW,
+                     const float* pairMask, T* bias, int n, int stride, int heads, int C,
+                     float scale) {
+  const size_t pairs = (size_t)n * n;
+  const unsigned grid = (unsigned)((pairs + 7) / 8);
+  if (C == 384 && heads == 12) {
+    pairBiasK<T, 12, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                      stride, scale);
+  } else if (C == 256 && heads == 12) {
+    pairBiasK<T, 8, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                     stride, scale);
+  } else {
+    fprintf(stderr, "pairBias: no kernel for %d channels and %d heads\n", C, heads);
+    exit(1);
+  }
+  if (stride > n) {
+    biasPadK<T><<<blocks((size_t)heads * n * (stride - n)), 256, 0, STREAM>>>(bias, n, stride, heads);
+  }
+}
+
 // ---------------------------------------------------------------- small helpers
 __global__ void addIntoK(float* __restrict__ y, const float* __restrict__ x, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

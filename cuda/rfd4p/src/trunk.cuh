@@ -173,12 +173,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
   linear<float, float>(normed, qkv, n, W_, W_ * 4, qkvgW, true);
   addBias(qkv, W(qkvgB), n, W_ * 4);
 
-  // bias [pairs, heads] -> [head][i][j] with a padded row stride, which is the layout flash reads.
+  // The pair bias: RMSNorm, project to `heads`, and lay out for flash, in one kernel.
   const int stride = (d.n + 7) / 8 * 8;
-  float* zNorm = scratch<float>("rfd4p.at.zn", d.pairs() * d.P);
-  float* raw = scratch<float>("rfd4p.at.raw", d.pairs() * d.H);
-  rmsNorm(pair, zNorm, d.pairs(), d.P, W(wn(pre + ".pair_norm.weight")));
-  linear<float, float>(zNorm, raw, d.pairs(), d.P, d.H, wn(pre + ".to_bias.weight"), true);
 
   // 🔴 THE f32 KERNEL DEREFERENCES `mask` WITHOUT CHECKING IT (flash.cuh:1061), where the f16 ones
   // take a MASKED template bool - so a null here is an illegal access, not an unmasked attention. It
@@ -197,8 +193,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     rmsNorm<half>(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     rmsNorm<half>(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     packVGK<half><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
-    biasLayoutK<half><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
-                                                              LOG2E);
+    pairBias<half>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask, bias,
+                   d.n, stride, d.H, d.P, LOG2E);
     flashGrid<half>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
                     1.f / sqrtf((float)d.dimHead()), nullptr);
     linear<half, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
@@ -209,8 +205,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     packVGK<float><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
-    biasLayoutK<float><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
-                                                               1.f);
+    pairBias<float>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask, bias,
+                    d.n, stride, d.H, d.P, 1.f);
     flashGrid<float>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
                      1.f / sqrtf((float)d.dimHead()), nullptr);
     linear<float, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
