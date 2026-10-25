@@ -376,7 +376,7 @@ __global__ void centerNormHK(const float* __restrict__ prod, TY* __restrict__ ou
 // TI, TO: the rows' and the output's types (a bf16 MSA in, a bf16 transition input out: cuda/af2's MSA16)
 inline unsigned lnVGrid(size_t rows) { return (unsigned)((rows + 7) / 8); }
 template <int C, class TI = float, class TO = half, bool RELU = false>
-__global__ void __launch_bounds__(256, 6)
+__global__ void __launch_bounds__(256, 8)
 layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const float* __restrict__ scale,
             const float* __restrict__ offset) {
   constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
@@ -384,53 +384,53 @@ layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const flo
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const TI* xr = x + row * C;
-  float v[STEPS][VEC], sc[STEPS][VEC], of[STEPS][VEC];
-  float s = 0;
+  float v[STEPS][VEC];
+  if constexpr (!std::is_same_v<TI, float> && VEC == 4) {
+    uint2 u[STEPS];
 #pragma unroll
-  for (int k = 0; k < STEPS; ++k) {
-    int c = (k * 32 + lane) * VEC;
-    if constexpr (VEC == 4) {
-      float4 s4 = ptx_ldg_v4_f32(scale + c), o4 = ptx_ldg_v4_f32(offset + c);
-      sc[k][0] = s4.x; sc[k][1] = s4.y; sc[k][2] = s4.z; sc[k][3] = s4.w;
-      of[k][0] = o4.x; of[k][1] = o4.y; of[k][2] = o4.z; of[k][3] = o4.w;
-    } else {
-      float2 s2 = ptx_ldg_v2_f32(scale + c), o2 = ptx_ldg_v2_f32(offset + c);
-      sc[k][0] = s2.x; sc[k][1] = s2.y; of[k][0] = o2.x; of[k][1] = o2.y;
+    for (int k = 0; k < STEPS; ++k) u[k] = ptx_ldg_v2_u32(xr + (k * 32 + lane) * 4);
+#pragma unroll
+    for (int k = 0; k < STEPS; ++k) {
+      float2 q0 = std::is_same_v<TI, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u[k].x) : ptx_f16x2_to_f32x2(u[k].x);
+      float2 q1 = std::is_same_v<TI, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u[k].y) : ptx_f16x2_to_f32x2(u[k].y);
+      v[k][0] = q0.x; v[k][1] = q0.y; v[k][2] = q1.x; v[k][3] = q1.y;
     }
-    if constexpr (!std::is_same_v<TI, float>) {
-      if constexpr (VEC == 4) {
-        uint2 u2 = ptx_ldg_v2_u32(xr + c);
-        float2 q0 = std::is_same_v<TI, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u2.x) : ptx_f16x2_to_f32x2(u2.x);
-        float2 q1 = std::is_same_v<TI, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u2.y) : ptx_f16x2_to_f32x2(u2.y);
-        v[k][0] = q0.x; v[k][1] = q0.y; v[k][2] = q1.x; v[k][3] = q1.y;
-      } else {
+  } else {
+#pragma unroll
+    for (int k = 0; k < STEPS; ++k) {
+      int c = (k * 32 + lane) * VEC;
+      if constexpr (!std::is_same_v<TI, float>) {
         float2 q = ld2f(xr + c); v[k][0] = q.x; v[k][1] = q.y;
+      } else if constexpr (VEC == 4) {
+        float4 q = ptx_ldg_v4_f32(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w;
+      } else {
+        float2 q = ptx_ldg_v2_f32(xr + c); v[k][0] = q.x; v[k][1] = q.y;
       }
-    } else if constexpr (VEC == 4) {
-      float4 q = ptx_ldg_v4_f32(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w;
-    } else {
-      float2 q = ptx_ldg_v2_f32(xr + c); v[k][0] = q.x; v[k][1] = q.y;
     }
-#pragma unroll
-    for (int u = 0; u < VEC; ++u) s += v[k][u];
   }
-  s = ptx_warp_sum_f32(s);
-  float mean = ptx_div_f32(s, (float)C), q2 = 0;
+  float s = 0.f;
 #pragma unroll
   for (int k = 0; k < STEPS; ++k)
 #pragma unroll
-    for (int u = 0; u < VEC; ++u) { float d = v[k][u] - mean; q2 += d * d; }
+    for (int u = 0; u < VEC; ++u) s = ptx_add_f32(s, v[k][u]);
+  s = ptx_warp_sum_f32(s);
+  float mean = ptx_div_f32(s, (float)C), q2 = 0.f;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k)
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) { float d = ptx_sub_f32(v[k][u], mean); q2 = ptx_fma_f32(d, d, q2); }
   q2 = ptx_warp_sum_f32(q2);
-  float inv = ptx_rsqrt_f32(ptx_div_f32(q2, (float)C) + 1e-5f);
+  float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q2, (float)C), 1e-5f));
   TO* yr = y + row * C;
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
     if constexpr (VEC == 4) {
-      float a0 = ptx_fma_f32((v[k][0] - mean) * inv, sc[k][0], of[k][0]);
-      float b0 = ptx_fma_f32((v[k][1] - mean) * inv, sc[k][1], of[k][1]);
-      float a1 = ptx_fma_f32((v[k][2] - mean) * inv, sc[k][2], of[k][2]);
-      float b1 = ptx_fma_f32((v[k][3] - mean) * inv, sc[k][3], of[k][3]);
+      float4 s4 = ptx_ldg_v4_f32(scale + c), o4 = ptx_ldg_v4_f32(offset + c);
+      float a0 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][0], mean), inv), s4.x, o4.x);
+      float b0 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][1], mean), inv), s4.y, o4.y);
+      float a1 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][2], mean), inv), s4.z, o4.z);
+      float b1 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][3], mean), inv), s4.w, o4.w);
       if constexpr (RELU) { a0 = ptx_relu_f32(a0); b0 = ptx_relu_f32(b0); a1 = ptx_relu_f32(a1); b1 = ptx_relu_f32(b1); }
       uint2 out2;
       if constexpr (std::is_same_v<TO, half>) {
@@ -440,8 +440,9 @@ layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const flo
       }
       ptx_st_global_v2_u32(yr + c, out2);
     } else {
-      float a = ptx_fma_f32((v[k][0] - mean) * inv, sc[k][0], of[k][0]);
-      float b = ptx_fma_f32((v[k][1] - mean) * inv, sc[k][1], of[k][1]);
+      float2 s2 = ptx_ldg_v2_f32(scale + c), o2 = ptx_ldg_v2_f32(offset + c);
+      float a = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][0], mean), inv), s2.x, o2.x);
+      float b = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k][1], mean), inv), s2.y, o2.y);
       if constexpr (RELU) { a = ptx_relu_f32(a); b = ptx_relu_f32(b); }
       if constexpr (std::is_same_v<TO, half>) ptx_st_global_u32(yr + c, ptx_cvt_f16x2_f32(a, b));
       else ptx_st_global_u32(yr + c, ptx_cvt_bf16x2_f32(a, b));

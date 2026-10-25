@@ -80,13 +80,50 @@ inline size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor
 // LOCALFOLD_PAIR_F32=1 keeps the f32 pair.
 inline bool AF2_P16 = false;
 template <class PT, class TX>
-__global__ void addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const float* __restrict__ bias128 = nullptr, float biasScale = 1.f) {
+__global__ void __launch_bounds__(256, 8)
+addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const float* __restrict__ bias128 = nullptr, float biasScale = 1.f) {
+  if constexpr (std::is_same_v<PT, __nv_bfloat16> && std::is_same_v<TX, half>) {
+    size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i + 7 < n) {
+      __nv_bfloat16* p16 = reinterpret_cast<__nv_bfloat16*>(pair);
+      uint4 pu = ptx_ld_global_v4_u32(p16 + i);
+      uint4 xu = ptx_ldg_v4_u32(x + i);
+      float4 b0 = make_float4(0.f, 0.f, 0.f, 0.f), b1 = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (bias128) {
+        const int c8 = (threadIdx.x & 15) << 3;
+        b0 = ptx_ldg_v4_f32(bias128 + c8);
+        b1 = ptx_ldg_v4_f32(bias128 + c8 + 4);
+        asm("mul.ftz.f32 %0, %0, %8;\n\t"
+            "mul.ftz.f32 %1, %1, %8;\n\t"
+            "mul.ftz.f32 %2, %2, %8;\n\t"
+            "mul.ftz.f32 %3, %3, %8;\n\t"
+            "mul.ftz.f32 %4, %4, %8;\n\t"
+            "mul.ftz.f32 %5, %5, %8;\n\t"
+            "mul.ftz.f32 %6, %6, %8;\n\t"
+            "mul.ftz.f32 %7, %7, %8;"
+            : "+f"(b0.x), "+f"(b0.y), "+f"(b0.z), "+f"(b0.w),
+              "+f"(b1.x), "+f"(b1.y), "+f"(b1.z), "+f"(b1.w)
+            : "f"(biasScale));
+      }
+      float2 p0 = ptx_bf16x2_to_f32x2(pu.x), p1 = ptx_bf16x2_to_f32x2(pu.y);
+      float2 p2 = ptx_bf16x2_to_f32x2(pu.z), p3 = ptx_bf16x2_to_f32x2(pu.w);
+      float2 x0 = ptx_f16x2_to_f32x2(xu.x), x1 = ptx_f16x2_to_f32x2(xu.y);
+      float2 x2 = ptx_f16x2_to_f32x2(xu.z), x3 = ptx_f16x2_to_f32x2(xu.w);
+      uint4 out4;
+      out4.x = ptx_cvt_bf16x2_f32(p0.x + (x0.x + b0.x), p0.y + (x0.y + b0.y));
+      out4.y = ptx_cvt_bf16x2_f32(p1.x + (x1.x + b0.z), p1.y + (x1.y + b0.w));
+      out4.z = ptx_cvt_bf16x2_f32(p2.x + (x2.x + b1.x), p2.y + (x2.y + b1.y));
+      out4.w = ptx_cvt_bf16x2_f32(p3.x + (x3.x + b1.z), p3.y + (x3.y + b1.w));
+      ptx_st_global_v4_u32(p16 + i, out4);
+    }
+    return;
+  }
   size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (i + 3 < n) {
     float4 p = pairLd4<PT>(pair, i);
     float4 b = make_float4(0.f, 0.f, 0.f, 0.f);
     if (bias128) {
-      b = ptx_ldg_v4_f32(bias128 + (i & 127));
+      b = ptx_ldg_v4_f32(bias128 + ((threadIdx.x & 31) << 2));
       asm("mul.ftz.f32 %0, %0, %4;\n\t"
           "mul.ftz.f32 %1, %1, %4;\n\t"
           "mul.ftz.f32 %2, %2, %4;\n\t"
@@ -1111,7 +1148,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
             for (int i0 = 0; i0 < L; i0 += Bi) {
               int bi = std::min(Bi, L - i0);
               ltGemm(Lt + (size_t)i0 * K, T, Yb, true, bi, K, L * 128, nullptr, false, 0.f);
-              addIntoPairK<__nv_bfloat16, half><<<blocks((size_t)bi * L * 32), 256, 0, STREAM>>>(
+              addIntoPairK<__nv_bfloat16, half><<<blocks((size_t)bi * L * 16), 256, 0, STREAM>>>(
                 reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(t.pair) + (size_t)i0 * L * 128), Yb, (size_t)bi * L * 32 * 4, ob, inv);
             }
             return;

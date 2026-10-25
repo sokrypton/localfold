@@ -165,7 +165,7 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
   for (int c = lane; c < C; c += 32) ptx_st_global_f32(y + row * C + c, ptx_fma_f32((ptx_ldg_f32(xr + c) - mean) * inv, ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c)));
 }
 template <int C, class TI = float, bool RELU = false>
-__global__ void __launch_bounds__(256, C >= 384 ? 4 : 6)
+__global__ void __launch_bounds__(256, C >= 384 ? 6 : 8)
 layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
                const float* __restrict__ scale, const float* __restrict__ offset) {
   constexpr int K = C / 32;
@@ -175,18 +175,25 @@ layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
   const TI* xr = x + row * C;
   float v[K], s = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { float xk = toF(xr[lane + 32 * k]); v[k] = xk; s += xk; }
+  for (int k = 0; k < K; ++k) {
+    float xk;
+    if constexpr (std::is_same_v<TI, float>) xk = ptx_ldg_f32(xr + lane + 32 * k);
+    else if constexpr (std::is_same_v<TI, __nv_bfloat16>) xk = ptx_bf16_raw_to_f32(ptx_ldg_u16(xr + lane + 32 * k));
+    else xk = ptx_f16_raw_to_f32(ptx_ldg_u16(xr + lane + 32 * k));
+    v[k] = xk;
+    s = ptx_add_f32(s, xk);
+  }
   s = ptx_warp_sum_f32(s);
   float mean = ptx_div_f32(s, (float)C), q2 = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { float d = v[k] - mean; q2 += d * d; }
+  for (int k = 0; k < K; ++k) { float d = ptx_sub_f32(v[k], mean); q2 = ptx_fma_f32(d, d, q2); }
   q2 = ptx_warp_sum_f32(q2);
-  float inv = ptx_rsqrt_f32(ptx_div_f32(q2, (float)C) + 1e-5f);
+  float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q2, (float)C), 1e-5f));
   float* yr = y + row * C;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + 32 * k;
-    float out = ptx_fma_f32((v[k] - mean) * inv, ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c));
+    float out = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c));
     ptx_st_global_f32(yr + c, RELU ? ptx_relu_f32(out) : out);
   }
 }
