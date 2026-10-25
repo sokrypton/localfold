@@ -33,6 +33,7 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import { alignToReference } from "../cpu/design/align.js";
+import { translateSpans } from "../cpu/design/source-numbering.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -778,14 +779,52 @@ presetSelect.addEventListener("change", () => {
   // read its residues from. Without this, switching a motif preset to Hunter
   // refused with "needs the structure loaded" for a structure the preset had
   // already named.
-  if (preset.cifUrl !== null && preset.cifUrl !== undefined && loaded?.name !== preset.cifUrl) {
+  const chosen = presetSelect.value;
+  // 🔴 ALREADY LOADED IS NOT ALREADY TRANSLATED. The spans were just re-set from
+  // the preset, in the ENTRY's numbering, so skipping the fetch must not also
+  // skip the move onto the structure - re-picking a preset left its contig
+  // naming residues the loaded file does not contain, which is the exact state
+  // this whole path exists to prevent.
+  if (preset.cifUrl !== undefined && preset.cifUrl !== null && loaded?.name === preset.cifUrl) {
+    const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
+    if (translated > 0) spanList.set(moved);
+  } else if (preset.cifUrl !== null && preset.cifUrl !== undefined) {
+    // 🔴 THE OLD STRUCTURE GOES FIRST, SYNCHRONOUSLY. `startGenerate` prefers a
+    // loaded structure over the preset's own `cifUrl` - a user's file is the
+    // one they mean - and the fetch below takes a moment, so a Generate pressed
+    // in that window would run THIS preset's contig against the PREVIOUS
+    // preset's structure. It is not hypothetical: it shifted every result in
+    // the preset sweep by one, each preset silently generating the job before
+    // it, with no error anywhere. Cleared, the engine falls back to the
+    // preset's own cifUrl, which is the right answer for the whole window.
+    loaded = null;
+    describeStructure();
     fetch(preset.cifUrl).then(async (response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
       // The shipped examples are zstd; a plain .cif is taken as it is.
       const zstd = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f;
+      // 🔴 THE PRESET MAY HAVE CHANGED WHILE THIS WAS IN FLIGHT. A fetch that
+      // lands after the reader has picked something else would take THIS
+      // structure and apply it to THOSE spans - which is not a hypothetical:
+      // it shifted every result in the preset sweep by one and translated one
+      // preset's contig against another's crop, producing `A17-131`, a range
+      // that matched no atoms and still looked like a plausible answer.
+      if (presetSelect.value !== chosen) return;
       takeStructure(new TextDecoder().decode(zstd ? decompress(bytes) : bytes),
         preset.cifUrl, false);
+      // 🔴 AND THE CONTIG IS PUT INTO THE CROP'S OWN NUMBERING. A shipped
+      // example is a CROP, and its contig is written in the numbering of the
+      // entry it was cut from - `A16-35` against a file whose chain A runs
+      // 0-42. RFD4 never notices, because a preset without `specMode` runs from
+      // its structure's annotations rather than its contig; Protein Hunter
+      // reads the contig literally and refused, correctly, for a structure the
+      // preset had already named. Each atom records where it came from, so this
+      // is a lookup rather than an alignment - see cpu/design/source-numbering.js.
+      // ...and the spans translated are the ones this PRESET set, not whatever
+      // is in the editor now, for the same reason.
+      const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
+      if (translated > 0) spanList.set(moved);
       paintJob();
     }).catch((error) => {
       // Not fatal: RFD4 fetches it again inside the run, and only Hunter needs

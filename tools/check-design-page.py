@@ -736,12 +736,39 @@ def main():
             button: document.getElementById('hunt').textContent.trim(),
           });
         })()"""))
+        # 🔴 THE PRESET'S STRUCTURE IS FETCHED, AND LOADING IT REWRITES THE
+        # CONTIG. A shipped example is a CROP whose contig is written in the
+        # numbering of the entry it was cut from, so the spans are translated onto
+        # the file once it arrives - which happens a beat after the change event,
+        # so reading immediately catches the untranslated form.
+        for _ in range(20):
+            if "A1-20" in loaded["contig"]:
+                break
+            time.sleep(1)
+            loaded = json.loads(cdp.evaluate(ws, "JSON.stringify({"
+                "method: document.getElementById('method').value,"
+                "contig: document.getElementById('contig-line').textContent.trim(),"
+                "problems: document.getElementById('contig-problems').textContent.trim(),"
+                "rows: document.querySelectorAll('#contig-rows > *').length,"
+                "button: document.getElementById('hunt').textContent.trim()})"))
         print(f"  preset motif_idx_1prw: {loaded}")
-        # 🔴 THE PRESET'S OWN CONTIG, REBUILT FROM THE ROWS IT FILLED. Loading a
-        # preset into an editor is only honest if the editor can express it: if
-        # the round trip lost a span the page would run a different job from the
-        # one it names.
-        if not loaded["contig"].startswith("5-20,A16-35,10-25,A52-71,5-20"):
+        # The crop runs chain A from 0-42; the preset asks for A16-35 and A52-71.
+        # Translated, that is A1-20 and A22-41, and an UNtranslated contig here
+        # means Protein Hunter would refuse a structure the preset just loaded.
+        if "A1-20" not in loaded["contig"] or "A22-41" not in loaded["contig"]:
+            bad.append("the preset's contig was not moved onto its own structure: "
+                       f"{loaded['contig']!r}")
+        # 🔴 THE PRESET'S SHAPE, REBUILT FROM THE ROWS IT FILLED. Loading a preset
+        # into an editor is only honest if the editor can express it: if the round
+        # trip lost a span the page would run a different job from the one it
+        # names. This used to assert the preset's contig STRING - which is right
+        # until the spans are translated onto the structure, and then asserts the
+        # numbering that does not match the file. The five spans and the generated
+        # lengths are what must survive; the chain ranges are checked above,
+        # against the crop.
+        shape = loaded["contig"].split()[0]
+        if (not shape.startswith("5-20,") or ",10-25," not in shape
+                or not shape.endswith(",5-20")):
             bad.append(f"the preset did not round-trip through the spans: {loaded['contig']!r}")
         if loaded["rows"] != 5:
             bad.append(f"the preset filled {loaded['rows']} rows, expected 5")
