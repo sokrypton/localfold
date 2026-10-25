@@ -161,6 +161,71 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
           else w[b][kk] = row != SIZE_MAX ? ptx_ldg_u32(src) : 0u;
         }
       }
+      if constexpr (B % 2 == 0) {
+        if (!outLn2) {
+#pragma unroll
+          for (int b = 0; b < B; b += 2) {
+            float v0[K], v1[K];
+#pragma unroll
+            for (int kk = 0; kk < KK; ++kk) {
+              const uint32_t* u0 = reinterpret_cast<const uint32_t*>(&w[b][kk]);
+              const uint32_t* u1 = reinterpret_cast<const uint32_t*>(&w[b + 1][kk]);
+#pragma unroll
+              for (int e = 0; e < VEC / 2; ++e) {
+                float2 f0 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u0[e]) : ptx_f16x2_to_f32x2(u0[e]);
+                float2 f1 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u1[e]) : ptx_f16x2_to_f32x2(u1[e]);
+                v0[kk * VEC + 2 * e] = f0.x; v0[kk * VEC + 2 * e + 1] = f0.y;
+                v1[kk * VEC + 2 * e] = f1.x; v1[kk * VEC + 2 * e + 1] = f1.y;
+              }
+            }
+            float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+            for (int k = 0; k < K; ++k) { s0 += v0[k]; s1 += v1[k]; }
+            ptx_warp_sum2_f32(s0, s1);
+            float mean0 = ptx_div_f32(s0, (float)C), mean1 = ptx_div_f32(s1, (float)C), inv0, inv1;
+            if constexpr (FAST_VAR) {
+              float ss0 = 0.f, ss1 = 0.f;
+#pragma unroll
+              for (int k = 0; k < K; ++k) { ss0 += v0[k] * v0[k]; ss1 += v1[k] * v1[k]; }
+              ptx_warp_sum2_f32(ss0, ss1);
+              inv0 = ptx_rsqrt_f32(ptx_fma_f32(-mean0, mean0, ptx_div_f32(ss0, (float)C)) + 1e-5f);
+              inv1 = ptx_rsqrt_f32(ptx_fma_f32(-mean1, mean1, ptx_div_f32(ss1, (float)C)) + 1e-5f);
+            } else {
+              float q0 = 0.f, q1 = 0.f;
+#pragma unroll
+              for (int k = 0; k < K; ++k) {
+                float d0 = v0[k] - mean0, d1 = v1[k] - mean1;
+                q0 += d0 * d0; q1 += d1 * d1;
+              }
+              ptx_warp_sum2_f32(q0, q1);
+              inv0 = ptx_rsqrt_f32(ptx_div_f32(q0, (float)C) + 1e-5f);
+              inv1 = ptx_rsqrt_f32(ptx_div_f32(q1, (float)C) + 1e-5f);
+            }
+            int r0 = warp + (base + b) * WARPS, r1 = warp + (base + b + 1) * WARPS;
+#pragma unroll
+            for (int kk = 0; kk < KK; ++kk) {
+              VT o4_0, o4_1;
+              uint32_t* oh0 = reinterpret_cast<uint32_t*>(&o4_0);
+              uint32_t* oh1 = reinterpret_cast<uint32_t*>(&o4_1);
+#pragma unroll
+              for (int e = 0; e < VEC / 2; ++e) {
+                float y0a = ptx_fma_f32((v0[kk * VEC + 2 * e] - mean0) * inv0, sc[kk * VEC + 2 * e], of[kk * VEC + 2 * e]);
+                float y0b = ptx_fma_f32((v0[kk * VEC + 2 * e + 1] - mean0) * inv0, sc[kk * VEC + 2 * e + 1], of[kk * VEC + 2 * e + 1]);
+                float y1a = ptx_fma_f32((v1[kk * VEC + 2 * e] - mean1) * inv1, sc[kk * VEC + 2 * e], of[kk * VEC + 2 * e]);
+                float y1b = ptx_fma_f32((v1[kk * VEC + 2 * e + 1] - mean1) * inv1, sc[kk * VEC + 2 * e + 1], of[kk * VEC + 2 * e + 1]);
+                oh0[e] = ptx_cvt_f16x2_f32(y0a, y0b);
+                oh1[e] = ptx_cvt_f16x2_f32(y1a, y1b);
+              }
+              half* dst0 = Xs + r0 * LDX + (lane + 32 * kk) * VEC;
+              half* dst1 = Xs + r1 * LDX + (lane + 32 * kk) * VEC;
+              if constexpr (VEC == 8) { ptx_st_shared_v4_u32(dst0, o4_0); ptx_st_shared_v4_u32(dst1, o4_1); }
+              else if constexpr (VEC == 4) { ptx_st_shared_v2_u32(dst0, o4_0); ptx_st_shared_v2_u32(dst1, o4_1); }
+              else { ptx_st_shared_u32(dst0, o4_0); ptx_st_shared_u32(dst1, o4_1); }
+            }
+          }
+          continue;
+        }
+      }
 #pragma unroll
       for (int b = 0; b < B; ++b) {
         float v[K];
@@ -513,11 +578,18 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       }
       __syncwarp();
       const int r_base = lane / (W2 / 8), c = (lane % (W2 / 8)) * 8;
+      constexpr int N_YS = 16 * (W2 / 8) / 32;
+      uint4 yv[N_YS];
 #pragma unroll
-      for (int i = 0; i < 16 * (W2 / 8) / 32; ++i) {
+      for (int i = 0; i < N_YS; ++i) {
+        int r = i * (32 / (W2 / 8)) + r_base;
+        yv[i] = ptx_ld_shared_v4_u32(Ys + r * LDX + c);
+      }
+#pragma unroll
+      for (int i = 0; i < N_YS; ++i) {
         int r = i * (32 / (W2 / 8)) + r_base;
         size_t row = row0 + warp * 16 + r;
-        if (row < pp) ptx_st_global_v4_u32(t2 + row * C + c0 + c, ptx_ld_shared_v4_u32(Ys + r * LDX + c));
+        if (row < pp) ptx_st_global_v4_u32(t2 + row * C + c0 + c, yv[i]);
       }
     } else {
 #pragma unroll

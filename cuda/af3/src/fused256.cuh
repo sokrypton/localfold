@@ -230,8 +230,9 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
   float* nsc = VEC ? stat + 2 * R : nullptr;                  // [C] scale, [C] offset
   if constexpr (VEC) {
     for (int c = threadIdx.x; c < C; c += NTH) {
-      ptx_st_shared_f32(nsc + c, ptx_ldg_f32(cnScale + c));
-      ptx_st_shared_f32(nsc + C + c, ptx_ldg_f32(cnOffset + c));
+      float sc_v = ptx_ldg_f32(cnScale + c), of_v = ptx_ldg_f32(cnOffset + c);
+      ptx_st_shared_f32(nsc + c, sc_v);
+      ptx_st_shared_f32(nsc + C + c, of_v);
     }
   }
   auto pIdx = [&](int c, int r) { return c * LDP + (VEC ? r : (r ^ (c & 31))); };
@@ -276,23 +277,29 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
   // conflict four ways, so it takes two rows a word (a bf16 pair) - the same sums in the same order, so
   // byte-identical (a thread pair a row reads conflict-free and sums in another order: 0.7% more of the
   // trunk, and a different fold). ESMFold2 trunk 3462 -> 3415 ms at 1,044 tokens, 223.6 -> 220.5 at 261
-  auto rowStats = [&](int r, float (&v)[C / 32]) {
-    float s = 0.f;
+  auto rowStats2 = [&](int r, float (&va)[C / 32], float (&vb)[C / 32]) {
+    float sa = 0.f, sb = 0.f;
 #pragma unroll
-    for (int k = 0; k < C / 32; ++k) s = ptx_add_f32(s, v[k]);
-    s = ptx_warp_sum_f32(s);
-    float mean = ptx_div_f32(s, (float)C), q = 0.f;
+    for (int k = 0; k < C / 32; ++k) { sa = ptx_add_f32(sa, va[k]); sb = ptx_add_f32(sb, vb[k]); }
+    ptx_warp_sum2_f32(sa, sb);
+    float ma_ = ptx_div_f32(sa, (float)C), mb_ = ptx_div_f32(sb, (float)C), qa = 0.f, qb = 0.f;
 #pragma unroll
-    for (int k = 0; k < C / 32; ++k) { float d = ptx_sub_f32(v[k], mean); q = ptx_fma_f32(d, d, q); }
-    q = ptx_warp_sum_f32(q);
+    for (int k = 0; k < C / 32; ++k) {
+      float da = ptx_sub_f32(va[k], ma_), db = ptx_sub_f32(vb[k], mb_);
+      qa = ptx_fma_f32(da, da, qa); qb = ptx_fma_f32(db, db, qb);
+    }
+    ptx_warp_sum2_f32(qa, qb);
     if (lane == 0) {
-      ptx_st_shared_f32(stat + r, mean);
-      ptx_st_shared_f32(stat + R + r, ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f)));
+      float ia_ = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(qa, (float)C), 1e-5f));
+      float ib_ = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(qb, (float)C), 1e-5f));
+      ptx_st_shared_v2_f32(stat + r, ma_, mb_);
+      ptx_st_shared_v2_f32(stat + R + r, ia_, ib_);
     }
   };
   int ra = warp * 16 + g, rb = ra + 8;
   float ma = 0.f, ia = 0.f, mb = 0.f, ib = 0.f;
   if constexpr (VEC) {
+#pragma unroll
     for (int r = 2 * warp; r < R; r += 2 * WARPS) {
       float va[C / 32], vb[C / 32];
 #pragma unroll
@@ -301,7 +308,7 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
         if constexpr (std::is_same_v<TT, __nv_bfloat16>) ptx_bf16x2_to_f32x2(w, va[k], vb[k]);
         else ptx_f16x2_to_f32x2(w, va[k], vb[k]);
       }
-      rowStats(r, va); rowStats(r + 1, vb);
+      rowStats2(r, va, vb);
     }
     __syncthreads();
     ma = ptx_ld_shared_f32(stat + ra); ia = ptx_ld_shared_f32(stat + R + ra);
@@ -718,7 +725,7 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
           unsigned qa0 = row0 + (warp * MT + mt) * 16 + g;
           if (qa0 < pp) ptx_st_global_v4_u32(t2 + (size_t)qa0 * C + c0 + c, y0);
           if (qa0 + 8 < pp) ptx_st_global_v4_u32(t2 + (size_t)(qa0 + 8) * C + c0 + c, y1);
-          __syncwarp();
+          if (mt + 1 < MT) __syncwarp();
         }
       } else {
 #pragma unroll

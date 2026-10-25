@@ -324,6 +324,31 @@ __device__ __forceinline__ float ptx_warp_sum_f32(float v) {
       "}" : "+f"(v));
   return v;
 }
+__device__ __forceinline__ void ptx_warp_sum2_f32(float& a, float& b) {
+  asm("{\n\t"
+      ".reg .f32 ta, tb;\n\t"
+      "shfl.sync.bfly.b32 ta, %0, 16, 0x1f, 0xffffffff;\n\t"
+      "shfl.sync.bfly.b32 tb, %1, 16, 0x1f, 0xffffffff;\n\t"
+      "add.ftz.f32 %0, %0, ta;\n\t"
+      "add.ftz.f32 %1, %1, tb;\n\t"
+      "shfl.sync.bfly.b32 ta, %0, 8, 0x1f, 0xffffffff;\n\t"
+      "shfl.sync.bfly.b32 tb, %1, 8, 0x1f, 0xffffffff;\n\t"
+      "add.ftz.f32 %0, %0, ta;\n\t"
+      "add.ftz.f32 %1, %1, tb;\n\t"
+      "shfl.sync.bfly.b32 ta, %0, 4, 0x1f, 0xffffffff;\n\t"
+      "shfl.sync.bfly.b32 tb, %1, 4, 0x1f, 0xffffffff;\n\t"
+      "add.ftz.f32 %0, %0, ta;\n\t"
+      "add.ftz.f32 %1, %1, tb;\n\t"
+      "shfl.sync.bfly.b32 ta, %0, 2, 0x1f, 0xffffffff;\n\t"
+      "shfl.sync.bfly.b32 tb, %1, 2, 0x1f, 0xffffffff;\n\t"
+      "add.ftz.f32 %0, %0, ta;\n\t"
+      "add.ftz.f32 %1, %1, tb;\n\t"
+      "shfl.sync.bfly.b32 ta, %0, 1, 0x1f, 0xffffffff;\n\t"
+      "shfl.sync.bfly.b32 tb, %1, 1, 0x1f, 0xffffffff;\n\t"
+      "add.ftz.f32 %0, %0, ta;\n\t"
+      "add.ftz.f32 %1, %1, tb;\n\t"
+      "}" : "+f"(a), "+f"(b));
+}
 __device__ __forceinline__ float ptx_warp_max_f32(float v) {
   asm("{\n\t"
       ".reg .f32 t;\n\t"
