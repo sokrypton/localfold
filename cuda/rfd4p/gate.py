@@ -358,6 +358,15 @@ def main() -> int:
             for sd in (0, 1, 7, 42):
                 cases.append((f"ranged{sd}", [f"--spec={ranged}", f"--seed={sd}"],
                               [f"--spec={ranged}", f"--seed={sd}"]))
+            # 🔴 AND THREE CHAINS, because a one-chain job cannot see the permutations at all -
+            # `permutation(1)`'s Fisher-Yates loop runs zero times - and a TWO-chain one agreed by
+            # coincidence while the featuriser was skipping a draw. Three is where "the segment
+            # length is drawn even when min == max" showed: skipping it moved every later draw up
+            # one and relabelled the chains.
+            chains = HERE / "featurise" / "gate-chains.json"
+            for sd in (0, 3):
+                cases.append((f"chains{sd}", [f"--spec={chains}", f"--seed={sd}"],
+                              [f"--spec={chains}", f"--seed={sd}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this

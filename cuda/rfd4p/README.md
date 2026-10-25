@@ -297,9 +297,15 @@ JavaScript at all** - and its PDB is byte-identical to the one the exporter's ow
 produces.
 
 `gate.py`'s `featurise` arm holds both directories to `export_input.mjs` **field by field, as
-bytes** - twelve cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure preset
-and a RANGED contig at four seeds. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
+bytes** - fourteen cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure
+preset, a RANGED contig at four seeds and a THREE-CHAIN one at two. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
 merely agrees closely is a second, slightly different model.
+
+🔴 **AND A SEGMENT'S LENGTH IS DRAWN EVEN WHEN ITS RANGE IS A POINT.** Skipping the draw when
+`min == max` is not an optimisation: it moves every later draw up one, so the chain and molecule
+PERMUTATIONS come out different and the chains are relabelled. A one-chain job cannot see it
+(`permutation(1)`'s Fisher-Yates loop runs zero times), a two-chain one agreed by coincidence, and
+three chains is where it showed - which is why the gate runs three.
 
 🔴 **AND THERE ARE TWO RANDOM SOURCES, WHICH ARE NOT THE SAME ONE.** The SAMPLER's is xorshift128+
 with Box-Muller; the PIPELINE's is mulberry32, and it decides how long a ranged contig segment

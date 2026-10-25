@@ -214,6 +214,7 @@ inline Weights readWeights(const string& dir, const std::set<string>& wanted) {
 struct Segment {
   string name;
   int minLen = 0, maxLen = 0;
+  bool chainBreak = false;      // the `/0` token: what follows is a new chain
 };
 
 inline vector<Segment> parseContig(const string& contig) {
@@ -227,6 +228,7 @@ inline vector<Segment> parseContig(const string& contig) {
     while (!tok.empty() && isspace((unsigned char)tok.front())) tok.erase(tok.begin());
     while (!tok.empty() && isspace((unsigned char)tok.back())) tok.pop_back();
     if (tok.empty()) continue;
+    if (tok == "/0") { out.push_back(Segment{"", 0, 0, true}); continue; }
     const size_t colon = tok.find(':');
     if (colon == string::npos) {
       fprintf(stderr, "contig token '%s' is not a named expandable segment; this featuriser does "
@@ -638,6 +640,15 @@ struct PipelineRng {
   int nextInt(int lo, int hiExclusive) {
     return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
   }
+  vector<int> permutation(int n) {
+    vector<int> p(n);
+    for (int i = 0; i < n; ++i) p[i] = i;
+    for (int i = n - 1; i > 0; --i) {
+      const int j = (int)std::floor(nextFloat() * (i + 1));
+      std::swap(p[i], p[j]);
+    }
+    return p;
+  }
 };
 
 // ---------------------------------------------------------------- spec -> batch
@@ -659,20 +670,46 @@ inline Batch buildSpecBatch(const vector<Segment>& segments,
   // these few integers. (`convertToProteinaBatch` asks for `permutation(1)` twice, whose
   // Fisher-Yates loop runs zero times and draws nothing.)
   PipelineRng prng((uint32_t)seed);
-  vector<int> lengths;
-  int n = 0;
+  vector<int> lengths, chainOf;
+  int n = 0, chains = 0;
   for (const Segment& s : segments) {
-    const int len = s.minLen == s.maxLen ? s.minLen : prng.nextInt(s.minLen, s.maxLen + 1);
+    if (s.chainBreak) { ++chains; lengths.push_back(0); continue; }
+    // 🔴 THE DRAW HAPPENS EVEN WHEN min == max, and skipping it is not an optimisation: it moves
+    // every later draw up one, so the CHAIN and MOLECULE permutations come out different. A
+    // one-chain job hides it (those permutations are over one element and draw nothing) and a
+    // two-chain one hid it by coincidence; three chains is where it showed.
+    const int len = prng.nextInt(s.minLen, s.maxLen + 1);
     lengths.push_back(len);
+    for (int k = 0; k < len; ++k) chainOf.push_back(chains);
     n += len;
   }
+  ++chains;
   Batch b;
   b.resize(n);
+  // 🔴 A CHAIN BREAK BREAKS THE BONDED RUN, so the path length across it is ZERO rather than a
+  // large number - there is no path, and the reference leaves the entry at its fill. The
+  // canonical ordering stops at the boundary for the same reason.
   for (int i = 0; i < n; ++i) {
     for (int j = 0; j < n; ++j) {
+      if (chainOf[i] != chainOf[j]) continue;
       b.tokenBondPathLength[(size_t)i * n + j] = std::abs(i - j);
       b.canonicalPolymerOrdering[(size_t)i * n + j] = j == i + 1 ? -1 : (j == i - 1 ? 1 : 0);
     }
+  }
+  // 🔴 THE CHAIN AND MOLECULE IDS ARE PERMUTED, AND THE DRAWS COME AFTER THE SEGMENT LENGTHS.
+  // `convertToProteinaBatch` asks the pipeline's rng for a permutation of the chains and then one
+  // of the molecules; with a single chain each is `permutation(1)`, whose Fisher-Yates loop runs
+  // zero times and draws nothing, which is why a one-chain job is seed-independent past its
+  // lengths. With two it is two draws, and getting their ORDER wrong relabels the chains.
+  const vector<int> chainPerm = prng.permutation(chains);
+  const vector<int> molPerm = prng.permutation(chains);   // one molecule a chain for a pure contig
+  for (int i = 0; i < n; ++i) {
+    b.chainIid[i] = chainPerm[chainOf[i]];
+    b.moleculeIid[i] = molPerm[chainOf[i]];
+    b.indexGroup[i] = chainOf[i];
+    // `molecule_entity_id` at inference: every chain whose sequence is all `<M>` - which is every
+    // chain of a contig - takes a FRESH entity after the ones the input had, in chain order.
+    b.moleculeEntityId[i] = chains + chainOf[i];
   }
   // Which segment each token came from, so a `sel('*/<name>/*/*')` can select it.
   vector<string> owner(n);
