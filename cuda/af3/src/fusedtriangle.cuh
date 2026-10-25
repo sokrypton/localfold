@@ -1315,11 +1315,20 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
   }
   {
     const int r0_ = (int)threadIdx.x / (WD / 8), c0 = ((int)threadIdx.x % (WD / 8)) * 8;
+    const bool fullRows = (row0 + R <= rows);
+    if (fullRows) {
 #pragma unroll
-    for (int it = 0; it < R * (WD / 8) / NTH; ++it) {
-      int r = r0_ + it * (NTH / (WD / 8));
-      size_t q = row0 + r;
-      cpAsync16(Xs + swX(r, c0), gathered + (q < rows ? q : 0) * WD + c0, q < rows);
+      for (int it = 0; it < R * (WD / 8) / NTH; ++it) {
+        int r = r0_ + it * (NTH / (WD / 8));
+        cpAsync16(Xs + swX(r, c0), gathered + (row0 + r) * WD + c0, true);
+      }
+    } else {
+#pragma unroll
+      for (int it = 0; it < R * (WD / 8) / NTH; ++it) {
+        int r = r0_ + it * (NTH / (WD / 8));
+        size_t q = row0 + r;
+        cpAsync16(Xs + swX(r, c0), gathered + (q < rows ? q : 0) * WD + c0, q < rows);
+      }
     }
   }
   cpCommit();
@@ -1407,6 +1416,8 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
   __syncthreads();
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
+    float4 b4;
+    if (ob) b4 = ptx_ldg_v4_f32(ob + hh * (C / 2) + cl0);
 #pragma unroll
     for (int e8 = 0; e8 < NT / 2; ++e8) {
       int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
@@ -1420,7 +1431,6 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
       int rl = i * LPR + rl0;
       float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0), v = pairUnpack4<PT>(pv[hh][i]);
       if (ob) {
-        float4 b4 = ptx_ldg_v4_f32(ob + hh * (C / 2) + cl0);
         a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
       }
       v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);

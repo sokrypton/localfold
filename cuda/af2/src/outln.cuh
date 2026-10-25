@@ -106,18 +106,19 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     }
     __syncthreads();
     const TI* A = As(st); const TI* Wt = Ws(st);
-    uint32_t a[2][4];
+    uint32_t a[2][4], f[2][4];
     ldsm4(a[0], A + swA(rg * 16 + (lane & 15), (lane >> 4) * 8));
     ldsm4(a[1], A + swA(rg * 16 + (lane & 15), 16 + (lane >> 4) * 8));
+    const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7), cl = chh * 128 + (lane >> 4) * 8;
+    ldsm4t(f[0], Wt + swW(kl0, cl));
 #pragma unroll
     for (int ks = 0; ks < KC / 16; ++ks) {
-      uint32_t f[2][4];
-      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), cl = chh * 128 + (lane >> 4) * 8;
-      ldsm4t(f[0], Wt + swW(kl, cl));
+      const int kl = ks * 16 + kl0;
 #pragma unroll
       for (int n2 = 0; n2 < 8; ++n2) {
         const int cur = n2 & 1;
         if (n2 + 1 < 8) ldsm4t(f[cur ^ 1], Wt + swW(kl, cl + (n2 + 1) * 16));
+        else if (ks + 1 < KC / 16) ldsm4t(f[0], Wt + swW(kl + 16, cl));
         if constexpr (BFI) { mma16816bf(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816bf(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
         else { mma16816(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
       }
@@ -234,6 +235,7 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t row0 = (size_t)blockIdx.x * R16;
+  const bool fullRows = (row0 + R16 <= rows);
   auto As = [&](int s) { return (TI*)(smem + s * STG16); };
   auto Ws = [&](int s) { return (TI*)(smem + s * STG16) + R16 * LDA; };
   M* V = (M*)smem;
@@ -243,8 +245,8 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
       const size_t row = row0 + r;
       if constexpr (VG) {
         const half* vg = reinterpret_cast<const half*>(O) + row * 2 * C + kc * KC + c;
-        uint4 v4 = row < rows ? ptx_ldg_v4_u32(vg) : make_uint4(0, 0, 0, 0);
-        uint4 g4 = row < rows ? ptx_ldg_v4_u32(vg + C) : make_uint4(0, 0, 0, 0);
+        uint4 v4 = (fullRows || row < rows) ? ptx_ldg_v4_u32(vg) : make_uint4(0, 0, 0, 0);
+        uint4 g4 = (fullRows || row < rows) ? ptx_ldg_v4_u32(vg + C) : make_uint4(0, 0, 0, 0);
         const uint32_t *vh = reinterpret_cast<const uint32_t*>(&v4), *gh = reinterpret_cast<const uint32_t*>(&g4);
         uint32_t o4[4];
 #pragma unroll
@@ -257,7 +259,8 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
         }
         ptx_st_shared_v4_u32(As(s) + swA(r, c), make_uint4(o4[0], o4[1], o4[2], o4[3]));
       } else {
-        cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
+        if (fullRows) cpAsync16(As(s) + swA(r, c), O + row * C + kc * KC + c, true);
+        else cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
       }
     }
 #pragma unroll
@@ -277,28 +280,37 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
     else {
       cpWait<0>();
       static_assert(R16 * LDV * 2 <= STG16, "all 16 rows of V fit in idle stage 0");
+      if (fullRows) {
 #pragma unroll
-      for (int i = 0; i < R16 * C / 8 / NTH16; ++i) {
-        const int u = i * NTH16 + threadIdx.x, r = u >> 5, c = (u & 31) * 8;
-        const size_t row = row0 + r;
-        cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+        for (int i = 0; i < R16 * C / 8 / NTH16; ++i) {
+          const int u = i * NTH16 + threadIdx.x, r = u >> 5, c = (u & 31) * 8;
+          cpAsync16(V + r * LDV + c, msa + (row0 + r) * C + c, true);
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < R16 * C / 8 / NTH16; ++i) {
+          const int u = i * NTH16 + threadIdx.x, r = u >> 5, c = (u & 31) * 8;
+          const size_t row = row0 + r;
+          cpAsync16(V + r * LDV + c, msa + (row < rows ? row : 0) * C + c, row < rows);
+        }
       }
       cpCommit();
     }
     __syncthreads();
     const TI* A = As(st); const TI* Wt = Ws(st);
-    uint32_t a[2][4];
+    uint32_t a[2][4], f[2][4];
     ldsm4(a[0], A + swA(lane & 15, (lane >> 4) * 8));
     ldsm4(a[1], A + swA(lane & 15, 16 + (lane >> 4) * 8));
+    const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7), cl = warp * 64 + (lane >> 4) * 8;
+    ldsm4t(f[0], Wt + swW(kl0, cl));
 #pragma unroll
     for (int ks = 0; ks < KC / 16; ++ks) {
-      uint32_t f[2][4];
-      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), cl = warp * 64 + (lane >> 4) * 8;
-      ldsm4t(f[0], Wt + swW(kl, cl));
+      const int kl = ks * 16 + kl0;
 #pragma unroll
       for (int n2 = 0; n2 < 4; ++n2) {
         const int cur = n2 & 1;
         if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], Wt + swW(kl, cl + (n2 + 1) * 16));
+        else if (ks + 1 < KC / 16) ldsm4t(f[0], Wt + swW(kl + 16, cl));
         if constexpr (BFI) { mma16816bf(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816bf(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
         else { mma16816(acc[2 * n2], a[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], a[ks], f[cur][2], f[cur][3]); }
       }
