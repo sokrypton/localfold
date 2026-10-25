@@ -55,11 +55,7 @@ __global__ void pointsToGlobalK(const float* proj, const float* rig, float* out,
   for (int a = 0; a < 3; ++a) ptx_st_global_f32(out + (size_t)t * 3 + a, g[a]);
 }
 // IPA logits -> attention weights, a warp a (query, head): logits[q, k, h] then softmax over k
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 __global__ void __launch_bounds__(256, 3)
-#else
-__global__ void __launch_bounds__(256, 4)
-#endif
 ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const float* __restrict__ qp,
             const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
             const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
@@ -86,6 +82,10 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
 #pragma unroll 1
     for (int k = lane; k < L; k += 32, kpk += 96 * Hh, ksk += 128 * Hh, b2dk += 32 * Hh) {
       float4 kp0 = ptx_ldg_v4_f32(kpk), kp1 = ptx_ldg_v4_f32(kpk + 1), kp2 = ptx_ldg_v4_f32(kpk + 2);
+      float4 v0 = ptx_ldg_v4_f32(ksk), v1 = ptx_ldg_v4_f32(ksk + 1);
+      float4 v2 = ptx_ldg_v4_f32(ksk + 2), v3 = ptx_ldg_v4_f32(ksk + 3);
+      float b2d_val = ptx_ldg_f32(b2dk);
+      float sm_val = ptx_ldg_f32(seqMask + k);
       float d2 = 0.f;
       float dx, dy, dz;
       dx = ptx_sub_f32(qp0.x, kp0.x); dy = ptx_sub_f32(qp0.y, kp0.y); dz = ptx_sub_f32(qp0.z, kp0.z);
@@ -96,13 +96,9 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
       d2 = ptx_add_f32(d2, ptx_fma_f32(dz, dz, ptx_fma_f32(dy, dy, ptx_mul_f32(dx, dx))));
       dx = ptx_sub_f32(qp2.y, kp2.y); dy = ptx_sub_f32(qp2.z, kp2.z); dz = ptx_sub_f32(qp2.w, kp2.w);
       d2 = ptx_add_f32(d2, ptx_fma_f32(dz, dz, ptx_fma_f32(dy, dy, ptx_mul_f32(dx, dx))));
-      float4 v0 = ptx_ldg_v4_f32(ksk), v1 = ptx_ldg_v4_f32(ksk + 1);
       float sc = 0.f;
       sc = ptx_fma_f32(qv0.x, v0.x, sc); sc = ptx_fma_f32(qv0.y, v0.y, sc); sc = ptx_fma_f32(qv0.z, v0.z, sc); sc = ptx_fma_f32(qv0.w, v0.w, sc);
       sc = ptx_fma_f32(qv1.x, v1.x, sc); sc = ptx_fma_f32(qv1.y, v1.y, sc); sc = ptx_fma_f32(qv1.z, v1.z, sc); sc = ptx_fma_f32(qv1.w, v1.w, sc);
-      float4 v2 = ptx_ldg_v4_f32(ksk + 2), v3 = ptx_ldg_v4_f32(ksk + 3);
-      float b2d_val = ptx_ldg_f32(b2dk);
-      float sm_val = ptx_ldg_f32(seqMask + k);
       sc = ptx_fma_f32(qv2.x, v2.x, sc); sc = ptx_fma_f32(qv2.y, v2.y, sc); sc = ptx_fma_f32(qv2.z, v2.z, sc); sc = ptx_fma_f32(qv2.w, v2.w, sc);
       sc = ptx_fma_f32(qv3.x, v3.x, sc); sc = ptx_fma_f32(qv3.y, v3.y, sc); sc = ptx_fma_f32(qv3.z, v3.z, sc); sc = ptx_fma_f32(qv3.w, v3.w, sc);
       float s = ptx_mul_f32(nw2, d2);
@@ -210,6 +206,11 @@ ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, co
       if (qi >= nq) break;
       int q = q0 + qi;
       float* f = final_ + (size_t)q * Fw;
+      float4 r0, r1, r2;
+      if (lane < 8) {
+        const float* rbase = rig + q * 12;
+        r0 = ptx_ldg_v4_f32(rbase); r1 = ptx_ldg_v4_f32(rbase + 4); r2 = ptx_ldg_v4_f32(rbase + 8);
+      }
       if (lane < 16) ptx_st_global_f32(f + h * 16 + lane, g0s[qi]);
       else ptx_st_shared_f32(&sp[warp][lane - 16], g0s[qi]);
       if (lane >= 24) ptx_st_shared_f32(&sp[warp][lane - 8], g1s[qi]);
@@ -220,8 +221,6 @@ ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, co
                       ptx_ld_shared_f32(&sp[warp][p * 3 + 1]),
                       ptx_ld_shared_f32(&sp[warp][p * 3 + 2])}, loc[3];
         float rg[12];
-        const float* rbase = rig + q * 12;
-        float4 r0 = ptx_ldg_v4_f32(rbase), r1 = ptx_ldg_v4_f32(rbase + 4), r2 = ptx_ldg_v4_f32(rbase + 8);
         rg[0] = r0.x; rg[1] = r0.y; rg[2] = r0.z; rg[3] = r0.w;
         rg[4] = r1.x; rg[5] = r1.y; rg[6] = r1.z; rg[7] = r1.w;
         rg[8] = r2.x; rg[9] = r2.y; rg[10] = r2.z; rg[11] = r2.w;
@@ -342,14 +341,24 @@ ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, fl
 #pragma unroll
         for (int h = 0; h < 12; ++h) ptx_st_shared_f32(&as[h][c], a0[h]);
       }
-      ptx_bar_sync();
       const float* a2d = act2d + ((size_t)q * L + k0) * 128 + c;
       int k = 0;
+      float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+      if (kt >= 4) {
+        v0 = ptx_ldg_f32(a2d);
+        v1 = ptx_ldg_f32(a2d + 128);
+        v2 = ptx_ldg_f32(a2d + 256);
+        v3 = ptx_ldg_f32(a2d + 384);
+      }
+      ptx_bar_sync();
       for (; k + 3 < kt; k += 4, a2d += 512) {
-        float v0 = ptx_ldg_f32(a2d);
-        float v1 = ptx_ldg_f32(a2d + 128);
-        float v2 = ptx_ldg_f32(a2d + 256);
-        float v3 = ptx_ldg_f32(a2d + 384);
+        float nv0 = 0.f, nv1 = 0.f, nv2 = 0.f, nv3 = 0.f;
+        if (k + 7 < kt) {
+          nv0 = ptx_ldg_f32(a2d + 512);
+          nv1 = ptx_ldg_f32(a2d + 640);
+          nv2 = ptx_ldg_f32(a2d + 768);
+          nv3 = ptx_ldg_f32(a2d + 896);
+        }
         float4 ah[12];
 #pragma unroll
         for (int h = 0; h < 12; ++h) ah[h] = ptx_ld_shared_v4_f32(reinterpret_cast<const float4*>(&as[h][k]));
@@ -361,6 +370,7 @@ ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, fl
         for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].z, v2, acc[h]);
 #pragma unroll
         for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].w, v3, acc[h]);
+        v0 = nv0; v1 = nv1; v2 = nv2; v3 = nv3;
       }
       for (; k < kt; ++k, a2d += 128) {
         float v = ptx_ldg_f32(a2d);
@@ -534,9 +544,7 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
     }
 #pragma unroll
     for (int k = 0; k < 12; ++k) {
-      int c = lane + k * 32;
       float val = ptx_add_f32(xv[k], ptx_add_f32(yv[k], bv[k]));
-      ptx_st_global_f32(rr + c, val);
       xv[k] = val;
       s = ptx_add_f32(s, val);
     }
@@ -546,6 +554,10 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
       int c = lane + k * 32;
       sc[k] = ptx_ldg_f32(scale + c);
       of[k] = ptx_ldg_f32(offset + c);
+    }
+#pragma unroll
+    for (int k = 0; k < 12; ++k) {
+      ptx_st_global_f32(rr + lane + k * 32, xv[k]);
     }
     s = ptx_warp_sum_f32(s);
     float mean = ptx_mul_f32(s, 1.f / 384.f);
