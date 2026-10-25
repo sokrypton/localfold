@@ -450,5 +450,191 @@ inline AtomSite readAtomSite(const Block& block) {
   return a;
 }
 
+/** `getResidueSegments`: the index where each residue starts, plus `n`. */
+inline vector<int> residueSegments(const AtomSite& a) {
+  if (a.n == 0) return {0};
+  vector<int> starts{0};
+  for (size_t i = 1; i < a.n; ++i) {
+    if (a.chainId[i] != a.chainId[i - 1] || a.resId[i] != a.resId[i - 1] ||
+        a.resName[i] != a.resName[i - 1] || a.insCode[i] != a.insCode[i - 1]) {
+      starts.push_back((int)i);
+    }
+  }
+  starts.push_back((int)a.n);
+  return starts;
+}
+
+/** `getPolymerizationAtoms`: the atom that leaves one residue and the one that enters the next. */
+inline std::pair<string, string> polymerizationAtoms(const string& resName, int chainType) {
+  if (chainType == tables::CT_POLYPEPTIDE_L || chainType == tables::CT_POLYPEPTIDE_D ||
+      chainType == tables::CT_CYCLIC_PSEUDO_PEPTIDE || tables::AA_RESIDUES.count(resName)) {
+    return {"C", "N"};
+  }
+  if (chainType == tables::CT_DNA || chainType == tables::CT_RNA ||
+      chainType == tables::CT_DNA_RNA_HYBRID || tables::RNA_RESIDUES.count(resName) ||
+      tables::DNA_RESIDUES.count(resName)) {
+    return {"O3'", "P"};
+  }
+  return {"", ""};
+}
+
+struct Bond {
+  int u = 0, v = 0, type = 0;
+};
+
+/**
+ * `buildBondsForAtomArray`: the declared links, then each residue's own, then the polymer
+ * backbone, then a retype of everything incident on a metal.
+ *
+ * 🔴 THE ORDER OF THE RESULT IS INSERTION ORDER, NOT SORTED. The reference accumulates into a
+ * JavaScript `Map`, which preserves it, and the bond LIST is what later stages index - so a
+ * `std::map` here would reorder every bond and move every index that names one.
+ *
+ * 🔴 AND A FIRST BOND FOR A PAIR WINS. `addBond` only inserts where the key is absent, so a
+ * `_struct_conn` covalent link is NOT overwritten by the residue dictionary's idea of the same
+ * pair - which is the whole point of reading `struct_conn` first.
+ */
+inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
+  vector<Bond> bonds;
+  std::map<long long, size_t> seen;
+  const int n = (int)a.n;
+  auto addBond = [&](int u, int v, int type) {
+    if (u == v || u < 0 || v < 0 || u >= n || v >= n) return;
+    const int lo = std::min(u, v), hi = std::max(u, v);
+    const long long key = (long long)lo * n + hi;
+    if (seen.count(key)) return;
+    seen[key] = bonds.size();
+    bonds.push_back({lo, hi, type});
+  };
+  auto table = [&](const char* cat, const char* col) -> const vector<string>* {
+    auto c = block.find(cat);
+    if (c == block.end()) return nullptr;
+    auto it = c->second.find(col);
+    return it == c->second.end() ? nullptr : &it->second;
+  };
+
+  // The residue dictionary: the built-in tables, overlaid by the file's own `_chem_comp_bond`.
+  std::map<string, std::map<string, int>> resBonds;
+  for (const auto& [res, pairs] : tables::STD_RESIDUE_BONDS) {
+    for (const auto& [key, bt] : pairs) resBonds[res][key] = bt;
+  }
+  if (const vector<string>* comps = table("chem_comp_bond", "comp_id")) {
+    const vector<string>* a1s = table("chem_comp_bond", "atom_id_1");
+    const vector<string>* a2s = table("chem_comp_bond", "atom_id_2");
+    const vector<string>* orders = table("chem_comp_bond", "value_order");
+    const vector<string>* aroms = table("chem_comp_bond", "pdbx_aromatic_flag");
+    for (size_t i = 0; a1s && a2s && i < comps->size() && i < a1s->size() && i < a2s->size(); ++i) {
+      const string& x = (*a1s)[i];
+      const string& y = (*a2s)[i];
+      string order = orders && i < orders->size() && !(*orders)[i].empty() ? (*orders)[i] : "SING";
+      string arom = aroms && i < aroms->size() && !(*aroms)[i].empty() ? (*aroms)[i] : "N";
+      for (char& ch : order) ch = (char)toupper((unsigned char)ch);
+      for (char& ch : arom) ch = (char)toupper((unsigned char)ch);
+      auto it = tables::COMP_BOND_ORDER_TO_TYPE.find(order + ":" + arom);
+      resBonds[(*comps)[i]][x < y ? x + ":" + y : y + ":" + x] =
+          it == tables::COMP_BOND_ORDER_TO_TYPE.end() ? tables::BT_ANY : it->second;
+    }
+  }
+
+  const vector<int> starts = residueSegments(a);
+  vector<int> atomToRes(a.n, 0);
+  for (size_t r = 0; r + 1 < starts.size(); ++r) {
+    for (int i = starts[r]; i < starts[r + 1]; ++i) atomToRes[i] = (int)r;
+  }
+
+  // 1. `_struct_conn`: the covalent links the file declares, at the identity symmetry only.
+  if (const vector<string>* types = table("struct_conn", "conn_type_id")) {
+    for (size_t row = 0; row < types->size(); ++row) {
+      if ((*types)[row] != "covale") continue;
+      const vector<string>* s1 = table("struct_conn", "ptnr1_symmetry");
+      const vector<string>* s2 = table("struct_conn", "ptnr2_symmetry");
+      if (s1 && row < s1->size() && (*s1)[row] != "1_555") continue;
+      if (s2 && row < s2->size() && (*s2)[row] != "1_555") continue;
+      int found[2] = {-1, -1};
+      for (int p = 0; p < 2; ++p) {
+        const string tag = "ptnr" + std::to_string(p + 1);
+        auto col = [&](const char* suffix) -> string {
+          const vector<string>* c = table("struct_conn", (tag + suffix).c_str());
+          return c && row < c->size() ? (*c)[row] : string();
+        };
+        const string asym = col("_label_asym_id"), comp = col("_label_comp_id");
+        string seq = col("_label_seq_id");
+        if (seq == "." && !col("_auth_seq_id").empty()) seq = col("_auth_seq_id");
+        const int seqInt = safeInt(seq, -999999);
+        const string atomName = col("_label_atom_id");
+        // 🔴 THE LAST MATCH WINS, which is the reference's loop and not a typo: it keeps
+        // assigning rather than breaking out.
+        for (int i = 0; i < n; ++i) {
+          if (a.chainId[i] == asym && a.resName[i] == comp && a.resId[i] == seqInt &&
+              a.atomName[i] == atomName) {
+            found[p] = i;
+          }
+        }
+      }
+      if (found[0] >= 0 && found[1] >= 0 && found[0] != found[1]) {
+        const vector<string>* ord = table("struct_conn", "pdbx_value_order");
+        string o = ord && row < ord->size() && !(*ord)[row].empty() ? (*ord)[row] : "sing";
+        for (char& ch : o) ch = (char)tolower((unsigned char)ch);
+        auto it = tables::STRUCT_CONN_ORDER_TO_TYPE.find(o);
+        addBond(found[0], found[1],
+                it == tables::STRUCT_CONN_ORDER_TO_TYPE.end() ? tables::BT_SINGLE : it->second);
+      }
+    }
+  }
+
+  // 2. Each residue's own bonds, from the dictionary.
+  for (size_t r = 0; r + 1 < starts.size(); ++r) {
+    const int s = starts[r], e = starts[r + 1];
+    auto m = resBonds.find(a.resName[s]);
+    if (m == resBonds.end()) continue;
+    for (int i = s; i < e; ++i) {
+      for (int j = i + 1; j < e; ++j) {
+        const string& x = a.atomName[i];
+        const string& y = a.atomName[j];
+        auto bt = m->second.find(x < y ? x + ":" + y : y + ":" + x);
+        if (bt != m->second.end()) addBond(i, j, bt->second);
+      }
+    }
+  }
+
+  // 3. The polymer backbone, between consecutive residues of one chain - unless one of the two
+  //    atoms is already bonded to the other residue, which a declared link would have made.
+  for (size_t r = 0; r + 2 < starts.size(); ++r) {
+    const int s1 = starts[r], e1 = starts[r + 1], s2 = starts[r + 1], e2 = starts[r + 2];
+    if (a.chainId[s1] != a.chainId[s2]) continue;
+    if (a.resId[s2] - a.resId[s1] != 1) continue;
+    const string outName = polymerizationAtoms(a.resName[s1], a.chainType[s1]).first;
+    const string inName = polymerizationAtoms(a.resName[s2], a.chainType[s2]).second;
+    if (outName.empty() || inName.empty()) continue;
+    int idxOut = -1, idxIn = -1;
+    for (int i = s1; i < e1; ++i) if (a.atomName[i] == outName) { idxOut = i; break; }
+    for (int i = s2; i < e2; ++i) if (a.atomName[i] == inName) { idxIn = i; break; }
+    if (idxOut < 0 || idxIn < 0) continue;
+    bool linked = false;
+    for (const Bond& b : bonds) {
+      if (b.type == tables::BT_COORDINATION) continue;
+      if ((b.u == idxOut && atomToRes[b.v] == (int)r + 1) ||
+          (b.v == idxOut && atomToRes[b.u] == (int)r + 1) ||
+          (b.u == idxIn && atomToRes[b.v] == (int)r) ||
+          (b.v == idxIn && atomToRes[b.u] == (int)r)) {
+        linked = true;
+        break;
+      }
+    }
+    if (!linked) addBond(idxOut, idxIn, tables::BT_SINGLE);
+  }
+
+  // 4. Anything touching a metal is a COORDINATION bond, whatever it was.
+  for (Bond& b : bonds) {
+    string eu = a.element[b.u], ev = a.element[b.v];
+    for (char& ch : eu) ch = (char)toupper((unsigned char)ch);
+    for (char& ch : ev) ch = (char)toupper((unsigned char)ch);
+    if (tables::METAL_ELEMENTS.count(eu) || tables::METAL_ELEMENTS.count(ev)) {
+      b.type = tables::BT_COORDINATION;
+    }
+  }
+  return bonds;
+}
+
 }  // namespace cif
 }  // namespace rfd4p

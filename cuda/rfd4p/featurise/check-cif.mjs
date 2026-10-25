@@ -35,7 +35,10 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
-  const rows = lines.slice(1).filter((l) => !l.startsWith("extra\t")).map((l) => l.split("\t"));
+  const rows = lines.slice(1).filter((l) => !l.startsWith("extra\t") && !l.startsWith("bond\t"))
+    .map((l) => l.split("\t"));
+  const bonds = lines.filter((l) => l.startsWith("bond\t"))
+    .map((l) => l.split("\t").slice(1).map(Number));
 
   const wrong = [];
   if (n !== js.res_name.length) wrong.push(`n ${n} vs ${js.res_name.length}`);
@@ -74,6 +77,16 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     if (rows.length !== want.length) wrong.push(`${label} length`);
     else if (bad) wrong.push(`${label} ${bad}`);
   }
+  // 🔴 THE BOND LIST IS COMPARED IN ORDER, NOT AS A SET. Later stages index into it, so two
+  // lists with the same contents in a different order are two different inputs.
+  if (bonds.length !== js.bonds.length) {
+    wrong.push(`bonds ${bonds.length} vs ${js.bonds.length}`);
+  } else {
+    const bad = bonds.filter((b, i) =>
+      b[0] !== js.bonds[i][0] || b[1] !== js.bonds[i][1] || b[2] !== js.bonds[i][2]).length;
+    if (bad) wrong.push(`bonds ${bad}`);
+  }
+
   structures += 1;
   if (wrong.length) differing += 1;
   console.log(`  ${name.padEnd(26)} ${String(n).padStart(5)} atoms  `

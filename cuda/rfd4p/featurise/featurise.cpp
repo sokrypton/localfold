@@ -930,6 +930,9 @@ int run(int argc, char** argv) {
              a.charge[i], a.atomicNumber[i], (int)a.isAromatic[i], (int)a.isLeavingAtom[i],
              a.chainType[i], a.chemCompType[i].c_str());
     }
+    for (const rfd4p::cif::Bond& b : rfd4p::cif::buildBonds(a, block)) {
+      printf("bond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+    }
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;
   }

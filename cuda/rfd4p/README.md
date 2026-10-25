@@ -494,9 +494,12 @@ residues the cropped example does not contain, so building one from the spec fai
     `label_seq_id` is `.`.
   - `computeIdAndEntityAnnotations` (the pn-unit, molecule and entity ids), and the annotation
     columns parsed into typed arrays rather than kept as strings.
-  - `buildBondsForAtomArray` with `STD_RESIDUE_BONDS` (28 residues of explicit bond lists),
-    `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, `ELEMENT_TO_ATOMIC_NUMBER` (94) and
-    `METAL_ELEMENTS` (61) - all generable into `tables.inc`.
+  - ~~`buildBondsForAtomArray`~~ **done**: the `_struct_conn` covalent links, each residue's own
+    bonds from `STD_RESIDUE_BONDS` overlaid by the file's `_chem_comp_bond`, the polymer backbone,
+    and the metal retype - the bond list compared IN ORDER, since later stages index into it. 🔴
+    A first bond for a pair wins, so a declared link is not overwritten by the dictionary's idea
+    of the same pair; and `_struct_conn`'s partner search keeps the LAST match rather than the
+    first, which is the reference's loop and not a slip.
   - `pipeline/chirality.js`: `ensureStereochemistryAnnotations` and `computeChiralityFeatures`,
     with `IDEAL_POLYHEDRA` (4 geometries, 19 unit vectors), `STEREOISOMER_TEMPLATES` (11 entries,
     105 point sets, built at load by brute-force permutation - precompute them) and

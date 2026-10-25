@@ -754,5 +754,58 @@ inline const std::unordered_map<std::string, AnnotationSpec> ANNOTATIONS_1BODY =
     {"annotation_coords-with-insertion_1_atom", {"float", 3, NAN, ""}},
 };
 
+// A standard residue's own bonds, as `<atom1>:<atom2>` with atom1 < atom2 and the bond type.
+inline const std::unordered_map<std::string, std::unordered_map<std::string, int>>
+    STD_RESIDUE_BONDS = {
+    {"ALA", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CA:N", 1}}},
+    {"ARG", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD:NE", 1}, {"CD:CG", 1}, {"CZ:NH1", 1}, {"CZ:NH2", 2}, {"CA:N", 1}, {"CZ:NE", 1}}},
+    {"ASN", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CG:ND2", 1}, {"CG:OD1", 2}, {"CA:N", 1}}},
+    {"ASP", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CG:OD1", 2}, {"CG:OD2", 1}, {"CA:N", 1}}},
+    {"CYS", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:SG", 1}, {"CA:N", 1}}},
+    {"GLN", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD:NE2", 1}, {"CD:OE1", 2}, {"CD:CG", 1}, {"CA:N", 1}}},
+    {"GLU", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD:OE1", 2}, {"CD:OE2", 1}, {"CD:CG", 1}, {"CA:N", 1}}},
+    {"GLY", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:N", 1}}},
+    {"HIS", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD2:NE2", 5}, {"CE1:NE2", 5}, {"CD2:CG", 6}, {"CG:ND1", 5}, {"CA:N", 1}, {"CE1:ND1", 6}}},
+    {"ILE", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG1", 1}, {"CB:CG2", 1}, {"CD1:CG1", 1}, {"CA:N", 1}}},
+    {"LEU", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD1:CG", 1}, {"CD2:CG", 1}, {"CA:N", 1}}},
+    {"LYS", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD:CE", 1}, {"CE:NZ", 1}, {"CD:CG", 1}, {"CA:N", 1}}},
+    {"MET", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CG:SD", 1}, {"CA:N", 1}, {"CE:SD", 1}}},
+    {"PHE", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD1:CE1", 5}, {"CD2:CE2", 6}, {"CE1:CZ", 6}, {"CE2:CZ", 5}, {"CD1:CG", 6}, {"CD2:CG", 5}, {"CA:N", 1}}},
+    {"PRO", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD:CG", 1}, {"CA:N", 1}, {"CD:N", 1}}},
+    {"SER", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:OG", 1}, {"CA:N", 1}}},
+    {"THR", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG2", 1}, {"CB:OG1", 1}, {"CA:N", 1}}},
+    {"TRP", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD1:NE1", 5}, {"CD2:CE2", 6}, {"CD2:CE3", 5}, {"CE2:CZ2", 5}, {"CE3:CZ3", 6}, {"CD1:CG", 6}, {"CD2:CG", 5}, {"CH2:CZ2", 6}, {"CH2:CZ3", 5}, {"CA:N", 1}, {"CE2:NE1", 5}}},
+    {"TYR", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG", 1}, {"CD1:CE1", 5}, {"CD2:CE2", 6}, {"CE1:CZ", 6}, {"CE2:CZ", 5}, {"CD1:CG", 6}, {"CD2:CG", 5}, {"CZ:OH", 1}, {"CA:N", 1}}},
+    {"VAL", {{"C:O", 2}, {"C:OXT", 1}, {"C:CA", 1}, {"CA:CB", 1}, {"CB:CG1", 1}, {"CB:CG2", 1}, {"CA:N", 1}}},
+    {"A", {{"C1':N9", 1}, {"C2:N3", 6}, {"C1':C2'", 1}, {"C2':O2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C4:C5", 6}, {"C5:C6", 5}, {"C4':C5'", 1}, {"C6:N1", 6}, {"C6:N6", 1}, {"C8:N7", 6}, {"C2:N1", 5}, {"C4:N3", 5}, {"C5:N7", 5}, {"C4:N9", 5}, {"C8:N9", 5}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"C", {{"C1':N1", 1}, {"C2:N3", 1}, {"C2:O2", 2}, {"C1':C2'", 1}, {"C2':O2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C4:C5", 1}, {"C4:N4", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C5:C6", 2}, {"C4':C5'", 1}, {"C2:N1", 1}, {"C6:N1", 1}, {"C4:N3", 2}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"G", {{"C1':N9", 1}, {"C2:N2", 1}, {"C2:N3", 2}, {"C1':C2'", 1}, {"C2':O2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C4:C5", 6}, {"C5:C6", 1}, {"C4':C5'", 1}, {"C6:N1", 1}, {"C6:O6", 2}, {"C8:N7", 6}, {"C2:N1", 1}, {"C4:N3", 1}, {"C5:N7", 5}, {"C4:N9", 5}, {"C8:N9", 5}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"U", {{"C1':N1", 1}, {"C2:N3", 1}, {"C2:O2", 2}, {"C1':C2'", 1}, {"C2':O2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C4:C5", 1}, {"C4:O4", 2}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C5:C6", 2}, {"C4':C5'", 1}, {"C2:N1", 1}, {"C6:N1", 1}, {"C4:N3", 1}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"DA", {{"C1':N9", 1}, {"C2:N3", 6}, {"C1':C2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C4:C5", 6}, {"C5:C6", 5}, {"C4':C5'", 1}, {"C6:N1", 6}, {"C6:N6", 1}, {"C8:N7", 6}, {"C2:N1", 5}, {"C4:N3", 5}, {"C5:N7", 5}, {"C4:N9", 5}, {"C8:N9", 5}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"DC", {{"C1':N1", 1}, {"C2:N3", 1}, {"C2:O2", 2}, {"C1':C2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C4:C5", 1}, {"C4:N4", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C5:C6", 2}, {"C4':C5'", 1}, {"C2:N1", 1}, {"C6:N1", 1}, {"C4:N3", 2}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"DG", {{"C1':N9", 1}, {"C2:N2", 1}, {"C2:N3", 2}, {"C1':C2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C4:C5", 6}, {"C5:C6", 1}, {"C4':C5'", 1}, {"C6:N1", 1}, {"C6:O6", 2}, {"C8:N7", 6}, {"C2:N1", 1}, {"C4:N3", 1}, {"C5:N7", 5}, {"C4:N9", 5}, {"C8:N9", 5}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+    {"DT", {{"C1':N1", 1}, {"C2:N3", 1}, {"C2:O2", 2}, {"C1':C2'", 1}, {"C2':C3'", 1}, {"C3':O3'", 1}, {"C4:C5", 1}, {"C4:O4", 2}, {"C3':C4'", 1}, {"C4':O4'", 1}, {"C5:C6", 2}, {"C5:C7", 1}, {"C4':C5'", 1}, {"C2:N1", 1}, {"C6:N1", 1}, {"C4:N3", 1}, {"C1':O4'", 1}, {"C5':O5'", 1}, {"OP3:P", 1}, {"O5':P", 1}, {"OP1:P", 2}, {"OP2:P", 1}}},
+};
+
+// `_chem_comp_bond.value_order:pdbx_aromatic_flag` and `_struct_conn.pdbx_value_order`.
+inline const std::unordered_map<std::string, int> COMP_BOND_ORDER_TO_TYPE = {
+    {"SING:N", BT_SINGLE},
+    {"DOUB:N", BT_DOUBLE},
+    {"TRIP:N", BT_TRIPLE},
+    {"QUAD:N", BT_QUADRUPLE},
+    {"SING:Y", BT_AROMATIC_SINGLE},
+    {"DOUB:Y", BT_AROMATIC_DOUBLE},
+    {"TRIP:Y", BT_AROMATIC_TRIPLE},
+    {"AROM:Y", BT_AROMATIC},
+    {"AROM:N", BT_AROMATIC},
+};
+
+inline const std::unordered_map<std::string, int> STRUCT_CONN_ORDER_TO_TYPE = {
+    {"sing", BT_SINGLE},
+    {"doub", BT_DOUBLE},
+    {"trip", BT_TRIPLE},
+    {"quad", BT_QUADRUPLE},
+};
+
 }  // namespace tables
 }  // namespace rfd4p

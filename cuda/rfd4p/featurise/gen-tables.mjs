@@ -16,7 +16,7 @@ import {
 import {
   CHAIN_TYPE, BOND_TYPE, ELEMENT_TO_ATOMIC_NUMBER, METAL_ELEMENTS, STD_RESIDUE_CHARGES,
   STD_RESIDUE_AROMATIC, AA_RESIDUES, RNA_RESIDUES, DNA_RESIDUES, SCALAR_1BODY_ANNOTATIONS,
-  NONSCALAR_1BODY_ANNOTATIONS,
+  NONSCALAR_1BODY_ANNOTATIONS, STD_RESIDUE_BONDS,
 } from "../../../shared/rfd4p/pipeline/cif.js";
 import { CONDITION_ENUMS, CONDITION_REGISTRY } from "../../../shared/rfd4p/pipeline/spec.js";
 import { parseCathCode } from "../../../shared/rfd4p/conditions.js";
@@ -206,6 +206,31 @@ for (const [name, spec] of Object.entries(NONSCALAR_1BODY_ANNOTATIONS)) {
 }
 w("};");
 w("");
+w("// A standard residue's own bonds, as `<atom1>:<atom2>` with atom1 < atom2 and the bond type.");
+w("inline const std::unordered_map<std::string, std::unordered_map<std::string, int>>");
+w("    STD_RESIDUE_BONDS = {");
+for (const [res, pairs] of Object.entries(STD_RESIDUE_BONDS)) {
+  const entries = pairs.map(([a1, a2, bt]) =>
+    `{${str(a1 < a2 ? `${a1}:${a2}` : `${a2}:${a1}`)}, ${bt}}`);
+  w(`    {${str(res)}, {${entries.join(", ")}}},`);
+}
+w("};");
+w("");
+w("// `_chem_comp_bond.value_order:pdbx_aromatic_flag` and `_struct_conn.pdbx_value_order`.");
+{
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../../shared/rfd4p/pipeline/cif.js", import.meta.url), "utf8");
+  for (const [name, decl] of [["COMP_BOND_ORDER_TO_TYPE", "const COMP_BOND_ORDER_TO_TYPE = {"],
+                              ["STRUCT_CONN_ORDER_TO_TYPE", "const STRUCT_CONN_ORDER_TO_TYPE = {"]]) {
+    const body = src.slice(src.indexOf(decl));
+    w(`inline const std::unordered_map<std::string, int> ${name} = {`);
+    for (const m of body.slice(0, body.indexOf("};")).matchAll(/'?([A-Za-z:]+)'?:\s*BOND_TYPE\.(\w+)/g)) {
+      w(`    {${str(m[1])}, BT_${m[2]}},`);
+    }
+    w("};");
+    w("");
+  }
+}
 w("}  // namespace tables");
 w("}  // namespace rfd4p");
 
