@@ -471,6 +471,9 @@ if (generate) {
     "g/condIntCrd": batch[COND.INTCRD]
       ? Float32Array.from(field(COND.INTCRD))
       : new Float32Array(n * 37 * 3).fill(NaN),
+    // `coord_to_be_noised`: the centred INPUT position, which is what the geometric insertion
+    // mapping measures against - not the generated coordinates.
+    "g/coords": Float32Array.from(field("coords")),
     "g/pairNoDist": pairNoDist,
     "g/cond": condAll,
     "g/cond1": cond1All,
@@ -518,6 +521,10 @@ if (generate) {
     "g/allowedTypes": Int32Array.from(ALLOWED_RESIDUE_TYPES.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/atom37Legal": Int32Array.from(UNIFIED_RESTYPE_ATOM37_MASK.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/coordGroup": Int32Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : new Int32Array(n * 37).fill(-1)),
+    // Which atoms are indexed, and the INPUT's residue per token - the two things the mapping
+    // reads that the generated structure does not carry.
+    "g/condIndex": Int32Array.from(field(COND.IDX), (v) => (v ? 1 : 0)),
+    "g/resType": Int32Array.from(field("residue_type")),
     "g/condSeq": Int32Array.from(field(COND.SEQ)),
     ...(alignsChirality ? {
       "g/chiralFrames": Int32Array.from(field("chiral_frame_atoms")),

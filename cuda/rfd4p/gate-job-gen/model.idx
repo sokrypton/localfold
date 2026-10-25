@@ -31,3 +31,6 @@ i g/atom37Legal 368318 5439
 i g/coordGroup 373757 888
 t g/condCoord 374645 2664
 t g/condIntCrd 377309 2664
+i g/condIndex 379973 888
+i g/resType 380861 24
+t g/coords 380885 2664

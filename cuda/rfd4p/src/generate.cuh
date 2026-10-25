@@ -10,6 +10,10 @@
 #include "decoder.cuh"
 #include "sampler.cuh"
 #include "superpose.h"
+#include "assign.h"
+#include <array>
+#include <limits>
+#include <string>
 #include <map>
 
 namespace rfd4p {
@@ -122,6 +126,13 @@ inline GenOut postprocess(int n, int nTypes, const std::vector<float>& logits,
 struct OutNaming {
   std::vector<int> resId;    // per token, the input's own
   std::vector<int> chain;    // per token, up to two characters packed little-endian
+  // 🔴 AN UNINDEXED TOKEN IS NOT WRITTEN AT ALL. It is in-context conditioning that the
+  // sampler never generated, and the reference emits only the INDEXED tokens - the unindexed
+  // motif reaches the output by being grafted onto one of them. Writing them produced 40
+  // spurious `UNK` residues on `motif_unidx_1prw`, which the fold's own count did not report
+  // because it counts tokens with a known residue type and these have none.
+  std::vector<uint8_t> emit;
+  bool skip(int i) const { return !emit.empty() && i < (int)emit.size() && !emit[i]; }
   bool empty() const { return resId.empty(); }
 };
 
@@ -133,6 +144,129 @@ inline std::string chainFromCode(int code) {
     if (c) out += c;
   }
   return out;
+}
+
+/**
+ * `annotate_unindexed_insertion`: where each unindexed motif token is grafted.
+ *
+ * 🔴 AN UNINDEXED MOTIF IS NEVER EMITTED, SO IT HAS TO BE PUT SOMEWHERE. It is in-context
+ * conditioning - the sampler does not write it - so the design comes out without it, and the
+ * motif's conditioned coordinates reach the output only by being TRANSFERRED onto a generated
+ * token. Which token is a Hungarian assignment, and a wrong one is a plausible structure with
+ * the motif in the wrong place.
+ *
+ * 🔴 AND THE SCORE IS NEGATIVE SQUARED DISTANCE WITH A 1e4 PENALTY FOR A RESIDUE MISMATCH, so
+ * an identity disagreement costs more than any distance a structure can produce - the mapping
+ * prefers a far ALA to a near GLY, which is the point: it is placing a known motif, not finding
+ * the nearest atom.
+ */
+struct Insertion {
+  std::vector<int> target;   // per unindexed token, the generated token it maps onto, or -1
+  std::vector<int> source;   // the unindexed tokens, in order
+};
+
+inline Insertion geometricInsertionMapping(const GenOut& g, int n, const int* condIndex,
+                                           const int* resType, const float* coords,
+                                           const float* condCoord, const float* condIntCrd,
+                                           const std::vector<uint8_t>& emitted) {
+  Insertion out;
+  std::vector<int> unidx, idx;
+  for (int tk = 0; tk < n; ++tk) {
+    // A token is unindexed when its live slots are; `condition_index` is per atom and uniform
+    // over a token, so slot 1 (the CA, always present) decides.
+    const bool indexed = condIndex ? condIndex[(size_t)tk * 37 + 1] != 0 : true;
+    if (!indexed) unidx.push_back(tk);
+    else if (emitted.empty() || emitted[tk]) idx.push_back(tk);
+  }
+  if (unidx.empty() || idx.empty()) return out;
+
+  std::vector<double> score((size_t)unidx.size() * idx.size());
+  for (size_t r = 0; r < unidx.size(); ++r) {
+    const int u = unidx[r];
+    const size_t ca = (size_t)u * 37 + 1;
+    // 🔴 THE REFERENCE COORDINATE FALLS BACK IN A FIXED ORDER: `coord_to_be_noised`, then the
+    // conditioned coordinate, then the internal one, then the origin. Each is a different
+    // frame, and taking whichever is finite FIRST is what the reference does.
+    double ref[3] = {0, 0, 0};
+    const float* src = nullptr;
+    if (coords && std::isfinite(coords[ca * 3])) src = coords;
+    else if (condCoord && std::isfinite(condCoord[ca * 3])) src = condCoord;
+    else if (condIntCrd && std::isfinite(condIntCrd[ca * 3])) src = condIntCrd;
+    if (src) for (int k = 0; k < 3; ++k) ref[k] = (double)src[ca * 3 + k];
+    const int uType = resType ? resType[u] : -1;
+    for (size_t c = 0; c < idx.size(); ++c) {
+      const int i = idx[c];
+      const float* gca = &g.coors[(size_t)i * 111 + 1 * 3];
+      double d2 = 0;
+      for (int k = 0; k < 3; ++k) { const double dd = ref[k] - (double)gca[k]; d2 += dd * dd; }
+      const int iType = g.residueType[i];
+      const double penalty = (uType >= 0 && uType == iType) ? 0.0 : 1e4;
+      score[r * idx.size() + c] = -(d2 + penalty);
+    }
+  }
+  const assign::Assignment a = assign::maximize(score, (int)unidx.size(), (int)idx.size());
+  out.source = unidx;
+  out.target.assign(unidx.size(), -1);
+  for (size_t k = 0; k < a.row.size(); ++k) out.target[a.row[k]] = idx[a.col[k]];
+  return out;
+}
+
+/**
+ * `_get_target_indices_corresponding_to_inserted`: the motif's atoms onto the target's.
+ *
+ * 🔴 BY NAME FIRST, THEN BY ELEMENT AND DISTANCE - and it REFUSES rather than guessing. A name
+ * that the target does not have falls through to a Hungarian over the unmatched pairs, where a
+ * different element is an infinite cost; if any source atom is left unmatched, or the chosen
+ * cell was one of those infinities, the whole mapping is rejected and the caller falls back.
+ * Returning a partial match would graft half a residue.
+ */
+inline bool matchInsertedAtoms(const std::vector<std::string>& srcName,
+                               const std::vector<std::string>& srcElem,
+                               const std::vector<std::array<double, 3>>& srcPos,
+                               const std::vector<std::string>& tgtName,
+                               const std::vector<std::string>& tgtElem,
+                               const std::vector<std::array<double, 3>>& tgtPos,
+                               std::vector<int>& outIdx) {
+  const size_t nSrc = srcName.size(), nTgt = tgtName.size();
+  outIdx.assign(nSrc, -1);
+  std::map<std::string, int> byName;
+  for (size_t t = 0; t < nTgt; ++t) byName.emplace(tgtName[t], (int)t);
+  std::vector<uint8_t> used(nTgt, 0);
+  std::vector<int> unmatchedSrc;
+  for (size_t s = 0; s < nSrc; ++s) {
+    auto it = byName.find(srcName[s]);
+    if (it != byName.end() && !used[it->second]) { outIdx[s] = it->second; used[it->second] = 1; }
+    else unmatchedSrc.push_back((int)s);
+  }
+  if (unmatchedSrc.empty()) return true;
+  std::vector<int> unmatchedTgt;
+  for (size_t t = 0; t < nTgt; ++t) if (!used[t]) unmatchedTgt.push_back((int)t);
+  if (unmatchedSrc.size() > unmatchedTgt.size()) return false;
+  std::vector<double> dist(unmatchedSrc.size() * unmatchedTgt.size());
+  for (size_t r = 0; r < unmatchedSrc.size(); ++r) {
+    for (size_t c = 0; c < unmatchedTgt.size(); ++c) {
+      const int s = unmatchedSrc[r], tt = unmatchedTgt[c];
+      if (srcElem[s] != tgtElem[tt]) {
+        dist[r * unmatchedTgt.size() + c] = std::numeric_limits<double>::infinity();
+      } else {
+        double d = 0;
+        for (int k = 0; k < 3; ++k) {
+          const double dd = srcPos[s][k] - tgtPos[tt][k];
+          d += dd * dd;
+        }
+        dist[r * unmatchedTgt.size() + c] = std::sqrt(d);
+      }
+    }
+  }
+  const assign::Assignment a =
+      assign::minimize(dist, (int)unmatchedSrc.size(), (int)unmatchedTgt.size());
+  for (size_t k = 0; k < a.row.size(); ++k) {
+    const size_t cell = (size_t)a.row[k] * unmatchedTgt.size() + a.col[k];
+    if (!std::isfinite(dist[cell])) return false;
+    outIdx[unmatchedSrc[a.row[k]]] = unmatchedTgt[a.col[k]];
+  }
+  for (size_t s = 0; s < nSrc; ++s) if (outIdx[s] < 0) return false;
+  return true;
 }
 
 /**
@@ -157,6 +291,77 @@ inline std::string chainFromCode(int code) {
  * conditioned contributes its superposed geometry to the frame, and a group that is not
  * contributes nothing to it.
  */
+/**
+ * The transfer: a mapped motif's conditioned coordinates onto the token it was grafted to.
+ *
+ * 🔴 IT WRITES INTO THE ANCHOR SET, WHICH IS THE WHOLE POINT. An unindexed token's conditioned
+ * coordinates never reach the output otherwise - the token is not emitted - so without this the
+ * alignment has no anchors from the motif at all and the design is placed by the rest of the
+ * conditioning alone.
+ */
+inline void applyInsertion(const GenOut& g, int n, const Insertion& ins,
+                           const std::vector<std::string>& atomNames, float* condCoord,
+                           float* condIntCrd, int* coordGroup,
+                           std::vector<uint8_t>& isInsertion) {
+  isInsertion.assign((size_t)n * 37, 0);
+  if (ins.source.empty()) return;
+  // 🔴 SLOT TO NAME IS RESIDUE-INDEPENDENT IN THIS PORT, which is what the writer above already
+  // assumes: `atomNames` is one 37-long list read from the model directory and every residue
+  // indexes it the same way. The reference carries a per-residue slot map; if the two ever
+  // disagree this is where it shows, and the writer would be wrong in the same place.
+  auto nameOf = [&](int, int slot) -> std::string {
+    return slot < (int)atomNames.size() ? atomNames[slot] : std::string();
+  };
+  for (size_t k = 0; k < ins.source.size(); ++k) {
+    const int u = ins.source[k], tgt = ins.target[k];
+    if (tgt < 0) continue;
+    std::vector<std::string> sn, se, tn, te;
+    std::vector<std::array<double, 3>> sp, tp;
+    std::vector<int> sSlot, tSlot;
+    for (int s = 0; s < 37; ++s) {
+      const size_t at = (size_t)u * 37 + s;
+      const std::string nm = nameOf(0, s);
+      // 🔴 `OXT` AND `OP3` ARE DROPPED FROM THE SOURCE, as the reference drops them: a leaving
+      // atom has no counterpart in a generated residue and would make every match fail.
+      if (nm.empty() || nm == "OXT" || nm == "OP3") continue;
+      if (!g.atomMask[at] && !(condCoord && std::isfinite(condCoord[at * 3]))) continue;
+      sn.push_back(nm);
+      se.push_back(nm.substr(0, 1));
+      std::array<double, 3> pos{0, 0, 0};
+      const float* src = condCoord && std::isfinite(condCoord[at * 3]) ? condCoord : nullptr;
+      if (src) for (int c = 0; c < 3; ++c) pos[c] = (double)src[at * 3 + c];
+      sp.push_back(pos);
+      sSlot.push_back(s);
+    }
+    for (int s = 0; s < 37; ++s) {
+      const size_t at = (size_t)tgt * 37 + s;
+      if (!g.atomMask[at]) continue;
+      const std::string nm = nameOf(0, s);
+      if (nm.empty()) continue;
+      tn.push_back(nm);
+      te.push_back(nm.substr(0, 1));
+      tp.push_back({(double)g.coors[(size_t)tgt * 111 + s * 3],
+                    (double)g.coors[(size_t)tgt * 111 + s * 3 + 1],
+                    (double)g.coors[(size_t)tgt * 111 + s * 3 + 2]});
+      tSlot.push_back(s);
+    }
+    std::vector<int> matched;
+    if (sn.empty() || !matchInsertedAtoms(sn, se, sp, tn, te, tp, matched)) continue;
+    for (int s : tSlot) isInsertion[(size_t)tgt * 37 + s] = 1;
+    for (size_t m = 0; m < matched.size(); ++m) {
+      const size_t from = (size_t)u * 37 + sSlot[m];
+      const size_t to = (size_t)tgt * 37 + tSlot[matched[m]];
+      if (coordGroup && coordGroup[from] != -1) coordGroup[to] = coordGroup[from];
+      if (condCoord && std::isfinite(condCoord[from * 3])) {
+        for (int c = 0; c < 3; ++c) condCoord[to * 3 + c] = condCoord[from * 3 + c];
+      }
+      if (condIntCrd && std::isfinite(condIntCrd[from * 3])) {
+        for (int c = 0; c < 3; ++c) condIntCrd[to * 3 + c] = condIntCrd[from * 3 + c];
+      }
+    }
+  }
+}
+
 inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const float* condIntCrd,
                               const int* coordGroup) {
   if (!condCoord) return;
@@ -280,6 +485,7 @@ inline std::string toCif(const GenOut& g, int n, const std::vector<std::string>&
   int serial = 1;
   char line[512];
   for (int i = 0; i < n; ++i) {
+    if (naming.skip(i)) continue;
     const int rt = g.residueType[i];
     const std::string res = rt >= 0 && rt < (int)resNames.size() ? resNames[rt] : "UNK";
     const std::string chain = i < (int)naming.chain.size()
@@ -310,6 +516,7 @@ inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>&
   char line[96];
   int serial = 1;
   for (int i = 0; i < n; ++i) {
+    if (naming.skip(i)) continue;
     const int rt = g.residueType[i];
     const std::string res = rt >= 0 && rt < (int)resNames.size() ? resNames[rt] : "UNK";
     // 🔴 THE CHAIN, NOT A LITERAL 'A'. Every atom used to go into chain A, which for a binder or

@@ -2081,6 +2081,16 @@ int run(int argc, char** argv) {
     // anchors that put the whole thing back. Without them a motif design superposes on nothing.
     g.tensor("g/condCoord", b.condCoord);
     g.tensor("g/condIntCrd", b.condInternalCoord);
+    // 🔴 WHAT THE INSERTION MAPPING NEEDS, AND ONLY IT. An unindexed motif is not EMITTED - it
+    // is in-context conditioning, so the sampler never writes it - and has to be grafted onto
+    // one of the tokens that was. The mapping is over the INPUT's residue identity and the
+    // INPUT's coordinates, neither of which survives into the generated structure: `g/resType`
+    // is the input's residue per token where `GenOut::residueType` is the DESIGNED one, and
+    // `g/coords` is `coord_to_be_noised`, the centred input position.
+    { vector<int> ci(b.conditionIndex.begin(), b.conditionIndex.end());
+      g.ints("g/condIndex", ci); }
+    g.ints("g/resType", b.residueType);
+    g.tensor("g/coords", b.coords);
   }
   g.close();
   {

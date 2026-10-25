@@ -612,6 +612,33 @@ def main() -> int:
                 # A renumbers them - the design then no longer superposes on the target it was
                 # built against, which no RMSD or bond check would ever report. Compared per
                 # TOKEN against the reference pipeline's own `res_id` and `chain_id`.
+                # 🔴 AND AN UNINDEXED MOTIF, WHICH IS A DIFFERENT TOKEN SET ENTIRELY. Its 40
+                # unindexed tokens are in-context conditioning the sampler never writes, so the
+                # output must carry only the 72 INDEXED ones - the motif reaches it by being
+                # grafted onto them. The writer emitted all 112, the extra 40 as `UNK`, and the
+                # fold's own count did not report it because it counts tokens with a known
+                # residue type and those have none.
+                # 🔴 AND AT 60 STEPS, NOT 25. At 25 this fold's shortest CA-CA step is 2.76 A
+                # and the band below rejects it - which is the step count, not the port: at 60
+                # the same job is 3.66 to 3.88. The int8 arm above records the same trap in the
+                # same words, and this arm was written at 25 anyway.
+                ufold = HERE / "featurise" / "gate-unindexed.json"
+                updb = HERE / "gate-unindexed.pdb"
+                run([BINARY, f"--job={ufold}", f"--int8={bundle}",
+                     f"--work-dir={HERE / 'gate-unindexed'}", f"--out={updb}", "--seed=0",
+                     "--fast"], cwd=REPO)
+                uca = chain_steps(updb)
+                ures = len({ln[22:26] for ln in updb.read_text().splitlines()
+                            if ln.startswith("ATOM")})
+                unk = sum(1 for ln in updb.read_text().splitlines()
+                          if ln.startswith("ATOM") and ln[17:20].strip() == "UNK")
+                uok = ures == 72 and unk == 0 and bool(uca) and min(uca) > 2.8
+                if not uok:
+                    failed += 1
+                print(f"  {'unindexed':10s} the indexed tokens only, {ures} residues and "
+                      f"{unk} UNK  {'ok ' if uok else 'WRONG TOKEN SET'}")
+                got["unindexed"] = {"residues": ures, "unk": unk}
+
                 # 🔴 AND A SECOND STRUCTURE WITH TWO CHAINS, because `motif_idx_1prw`'s only
                 # chain is A and `chainName(0)` is A too - the chain half of this arm cannot
                 # fail on it. `ppi_pdl1` carries A and B, and the batch's `chain_iid` is

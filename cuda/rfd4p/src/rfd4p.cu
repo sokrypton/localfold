@@ -484,18 +484,50 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
       path = stem + "_" + std::to_string(design + 1) + ext;
     }
+    // 🔴 THE UNINDEXED MOTIFS FIRST, BECAUSE THEY SUPPLY ANCHORS THE ALIGNMENT THEN USES. An
+    // unindexed token is in-context conditioning and is never emitted, so its conditioned
+    // coordinates reach the output only by being grafted onto a token that was.
+    std::vector<uint8_t> isInsertion;
+    std::vector<float> condCoordRW, condIntCrdRW;
+    std::vector<int> coordGroupRW;
+    if (M.has("g/condCoord")) {
+      const size_t slots = (size_t)n * 37;
+      condCoordRW.assign(M.f("g/condCoord"), M.f("g/condCoord") + slots * 3);
+      if (M.has("g/condIntCrd")) {
+        condIntCrdRW.assign(M.f("g/condIntCrd"), M.f("g/condIntCrd") + slots * 3);
+      }
+      if (M.has("g/coordGroup")) {
+        coordGroupRW.assign(M.i("g/coordGroup"), M.i("g/coordGroup") + slots);
+      }
+      if (M.has("g/condIndex")) {
+        std::vector<uint8_t> emitted((size_t)n, 1);
+        const rfd4p::Insertion ins = rfd4p::geometricInsertionMapping(
+            g, n, M.i("g/condIndex"), M.has("g/resType") ? M.i("g/resType") : nullptr,
+            M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
+            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted);
+        rfd4p::applyInsertion(g, n, ins, atomNames, condCoordRW.data(),
+                              condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
+                              coordGroupRW.empty() ? nullptr : coordGroupRW.data(), isInsertion);
+      }
+    }
     // 🔴 INTO THE INPUT'S FRAME BEFORE ANYTHING IS WRITTEN. A contig has no conditioned
     // coordinates, so this is a no-op there; a structure job's output is otherwise in the
     // sampler's centred frame and superposes on nothing.
-    rfd4p::alignToInputFrame(g, n, M.has("g/condCoord") ? M.f("g/condCoord") : nullptr,
-                             M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr,
-                             M.has("g/coordGroup") ? M.i("g/coordGroup") : nullptr);
+    rfd4p::alignToInputFrame(g, n, condCoordRW.empty() ? nullptr : condCoordRW.data(),
+                             condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
+                             coordGroupRW.empty() ? nullptr : coordGroupRW.data());
     // The input's own numbering and chain letters where a job named a structure; absent for a
     // contig, where the token index IS the residue number.
     rfd4p::OutNaming naming;
     if (M.has("g/outResId") && M.has("g/outChain")) {
       naming.resId.assign(M.i("g/outResId"), M.i("g/outResId") + n);
       naming.chain.assign(M.i("g/outChain"), M.i("g/outChain") + n);
+    }
+    // Only the INDEXED tokens are written; an unindexed motif was grafted onto one of them.
+    if (M.has("g/condIndex")) {
+      const int* ci = M.i("g/condIndex");
+      naming.emit.assign((size_t)n, 1);
+      for (int i = 0; i < n; ++i) naming.emit[i] = ci[(size_t)i * 37 + 1] != 0;
     }
     std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf, naming)
                                     : rfd4p::toPdb(g, n, atomNames, resNames, chainOf, naming));
