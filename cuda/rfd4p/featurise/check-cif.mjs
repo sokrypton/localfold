@@ -29,6 +29,7 @@ import {
   unindexFlaggedTokens,
   centerAndFeaturizeCentroid, addSupportsLocalLatentAnnotation, buildAtom37Slots,
   convertToProteinaBatch,
+  runValidationPipeline,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync, existsSync } from "node:fs";
@@ -666,27 +667,15 @@ for (const [name, text] of cases) {
   // `annotateCovalentModificationsAndAtomize` and `addGlobalTokenIdAnnotation`, on top of the
   // realised array - the four stages that decide which atoms survive and where the tokens fall.
   {
-    const rng = createSeededRng(0);
-    const realized = realizeExpandableSegments(js, { rng });
-    const filtered = filterUnwantedAtoms(realized);
-    addGlobalAtomIdAnnotation(filtered);
-    annotateCovalentModificationsAndAtomize(filtered);
-    addGlobalTokenIdAnnotation(filtered);
-    finalizeAndCanonicalizeSequenceConditioning(filtered);
-    // `featurizeExpandedSegments` can DELETE atoms, so it runs before the count is compared and
-    // its result is what every column below is held to.
-    const expanded = featurizeExpandedSegments(filtered);
-    // 🔴 THE SAME GENERATOR THE REALISATION USED. `materializeInternalCoords` draws from the
-    // pipeline's one stream, so the gate must advance a single `rng` across both stages or it
-    // agrees only where neither draws.
-    materializeInternalCoords(expanded, { rng });
-    // `unindexFlaggedTokens` COPIES the unindexed motifs to the end and removes the originals,
-    // so it changes the atom count and everything below is held to its result.
-    const unindexed = unindexFlaggedTokens(expanded);
-    // 🔴 THE SHIFT MOVES THE CONDITION COLUMNS TOO, so `centerAndFeaturizeCentroid` runs before
-    // the conditioned coordinates are compared, not after.
-    const { centroidWithoutCond } = centerAndFeaturizeCentroid(unindexed);
-    addSupportsLocalLatentAnnotation(unindexed);
+    // 🔴 THE REFERENCE'S OWN DRIVER, NOT A SEQUENCE WRITTEN HERE. This used to list the stages
+    // by hand and so did the native dump - which meant both sides took the same order and
+    // agreed perfectly while BOTH were missing `runValidationPipeline`'s second
+    // `addGlobalTokenIdAnnotation`. A gate that re-implements the thing it is checking is
+    // checking its own reimplementation.
+    const ran = runValidationPipeline(js, { seed: 0 });
+    const unindexed = ran.atoms;
+    const centroidWithoutCond =
+      ran.batch.centroid_of_atoms_without_coordinate_conditioning.data;
     const slots = buildAtom37Slots(unindexed);
     const out3 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
       { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
@@ -781,7 +770,7 @@ for (const [name, text] of cases) {
       // 🔴 THE FLOAT KEYS COUNT THEIR NaNs RATHER THAN SUMMING THEM. Most of these columns are
       // NaN by design (an absent condition), and a sum over them is NaN however wrong the finite
       // entries are - which is a comparison that passes on everything.
-      const { batch: refBatch } = convertToProteinaBatch(unindexed, { centroidWithoutCond, rng });
+      const refBatch = ran.batch;
       const bN = Number((out3.find((l) => l.startsWith("azbatch\t")) ?? "\t0").split("\t")[1]);
       const gotB = new Map(out3.filter((l) => /^azbatch\t[a-z]/.test(l))
         .map((l) => { const f = l.split("\t"); return [f[1], f.slice(2)]; }));

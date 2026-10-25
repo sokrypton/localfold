@@ -660,6 +660,15 @@ residues the cropped example does not contain, so building one from the spec fai
     a total failure; it is the mirror of the `Math.fround` trap, which hides a difference where
     this invents one.
 
+    🔴 **AND THE GATE WAS COMPARING TWO HAND-WRITTEN SEQUENCES, NOT THE PIPELINE.** Both the
+    dump and the gate's JavaScript side listed the fourteen stages by hand, so both were
+    missing `runValidationPipeline`'s SECOND `addGlobalTokenIdAnnotation` and agreed perfectly.
+    The native side has the driver now (`featurise.cpp`'s `runValidationPipeline`) and the gate
+    drives the reference's own, so a stage added to either is in the comparison without anyone
+    remembering to add it. The missing call turned out to be INERT - that stage changes neither
+    `atomize` nor the residue boundaries, and removing it leaves all seventeen green - so this
+    found no wrong answer, only an instrument that could not have found one.
+
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
     never reaches; this port has been bitten twice by a draw that happens where it looks as

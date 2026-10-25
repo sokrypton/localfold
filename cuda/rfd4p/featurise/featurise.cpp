@@ -770,6 +770,45 @@ using PipelineRng = atoms::PipelineRng;
  * always carries the atomic number; `element` carries -1 wherever the residue is masked, so the
  * model is not handed the composition of a residue it is being asked to design.
  */
+/**
+ * `runValidationPipeline`: the fourteen stages in the reference's own order, then the batch.
+ *
+ * 🔴 `addGlobalTokenIdAnnotation` RUNS TWICE. It is called after the atomisation decides which
+ * residues are one token an atom, and AGAIN after
+ * `finalizeAndCanonicalizeSequenceConditioning`. Measured, the second call is INERT - that
+ * stage changes neither `atomize` nor the residue boundaries, so removing it leaves all
+ * seventeen gate cases green - and it is kept because it is the reference's.
+ *
+ * 🔴 THE REASON IT MATTERS IS HOW IT WAS FOUND: the dump listed these stages by hand and so did
+ * the gate's JavaScript side, so BOTH were missing the second call and agreed perfectly. A gate
+ * that re-implements the thing it is checking is checking its own reimplementation. The order
+ * lives HERE, once; the gate drives the reference's own `runValidationPipeline` against it, so
+ * the next stage added to either is in the comparison without anyone remembering to add it.
+ *
+ * 🔴 AND `realizeExpandableSegments` IS INFERENCE-ONLY where everything after it is not.
+ */
+inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& centroid,
+                                 atoms::PipelineRng& prng, int pathLengthCutoff,
+                                 bool isInference);
+
+inline Batch runValidationPipeline(atoms::AtomArray& a, atoms::PipelineRng& prng,
+                                   int pathLengthCutoff = 64, bool isInference = true) {
+  atoms::addSrcComponentAnnotation(a);
+  if (isInference) atoms::realizeExpandableSegments(a, prng);
+  atoms::filterUnwantedAtoms(a);
+  atoms::addGlobalAtomIdAnnotation(a);
+  atoms::annotateCovalentModificationsAndAtomize(a);
+  atoms::addGlobalTokenIdAnnotation(a);
+  atoms::finalizeAndCanonicalizeSequenceConditioning(a);
+  atoms::addGlobalTokenIdAnnotation(a);
+  atoms::featurizeExpandedSegments(a, isInference);
+  atoms::materializeInternalCoords(a, prng);
+  atoms::unindexFlaggedTokens(a, isInference);
+  const atoms::Centroid centroid = atoms::centerAndFeaturizeCentroid(a);
+  atoms::addSupportsLocalLatentAnnotation(a);
+  return buildStructureBatch(a, centroid, prng, pathLengthCutoff, isInference);
+}
+
 inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& centroid,
                                  atoms::PipelineRng& prng, int pathLengthCutoff = 64,
                                  bool isInference = true) {
@@ -1313,32 +1352,21 @@ int run(int argc, char** argv) {
       rfd4p::atoms::PipelineRng prng((uint32_t)seed);
       rfd4p::atoms::realizeExpandableSegments(arr, prng);
       if (atomize) {
-        // The next three stages, in `index.js`'s order. `--atomize` dumps what they decide -
-        // which atoms survive, which residues are covalent modifications, and where the tokens
-        // fall - rather than the realised columns `--realize` prints.
-        rfd4p::atoms::filterUnwantedAtoms(arr);
-        rfd4p::atoms::addGlobalAtomIdAnnotation(arr);
-        rfd4p::atoms::annotateCovalentModificationsAndAtomize(arr);
-        rfd4p::atoms::addGlobalTokenIdAnnotation(arr);
-        rfd4p::atoms::finalizeAndCanonicalizeSequenceConditioning(arr);
-        rfd4p::atoms::featurizeExpandedSegments(arr);
-        // 🔴 THE SAME `prng` THE REALISATION USED, NOT A FRESH ONE. `materializeInternalCoords`
-        // draws from the pipeline's single stream, so handing it its own generator would agree
-        // with the reference only where neither stage draws anything.
-        rfd4p::atoms::materializeInternalCoords(arr, prng);
-        rfd4p::atoms::unindexFlaggedTokens(arr);
-        const rfd4p::atoms::Centroid centroid = rfd4p::atoms::centerAndFeaturizeCentroid(arr);
-        rfd4p::atoms::addSupportsLocalLatentAnnotation(arr);
+        // 🔴 THE WHOLE DRIVER, NOT A HAND-WRITTEN SEQUENCE. `runValidationPipeline` owns the
+        // order - including the SECOND `addGlobalTokenIdAnnotation`, which a hand-written
+        // sequence here dropped and the gate could not see, because the gate's JavaScript side
+        // was sequenced by the same hand. Both sides drive their own driver now.
+        const rfd4p::featurise::Batch sb = rfd4p::featurise::runValidationPipeline(arr, prng);
+        const rfd4p::atoms::Centroid centroid{{sb.centroidWithoutCond[0],
+                                               sb.centroidWithoutCond[1],
+                                               sb.centroidWithoutCond[2]}};
         const vector<int> slots = rfd4p::atoms::buildAtom37Slots(arr);
         printf("atomized\t%zu\n", arr.n());
         printf("azcentroid\t%.17g\t%.17g\t%.17g\n", (double)centroid.v[0], (double)centroid.v[1],
                (double)centroid.v[2]);
         {
-          // `convertToProteinaBatch` on the finished atom array - the batch the model reads.
-          // 🔴 THE SAME `prng`, STILL. It opens with two permutations drawn from the stream the
-          // realisation and the internal coordinates have already advanced.
-          const rfd4p::featurise::Batch sb =
-              rfd4p::featurise::buildStructureBatch(arr, centroid, prng);
+          // The batch `runValidationPipeline` returned - not a second one built beside it,
+          // which would draw its two permutations again from a stream the first had advanced.
           printf("azbatch\t%d\n", sb.n);
           const auto ints = [&](const char* name, const auto& v) {
             long long sum = 0, nz = 0, weighted = 0;
