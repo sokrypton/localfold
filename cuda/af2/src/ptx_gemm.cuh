@@ -55,56 +55,99 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
 
   const int ksteps = K / BK;
   issue(0, 0);
-  if (ksteps > 1) issue(1, 1);
+  if (ksteps > 1) {
+    issue(1, 1);
+    cpWait<1>();
+  } else {
+    cpWait<0>();
+  }
+  __syncthreads();
 
   float acc[2][8][4] = {};
+  int st = 0, st2 = 2;
 #pragma unroll 1
   for (int kc = 0; kc < ksteps; ++kc) {
-    const int st = kc % 3;
-    if (kc + 2 < ksteps) {
-      issue(kc + 2, (kc + 2) % 3);
-      cpWait<2>();
-    } else if (kc + 1 < ksteps) {
-      cpWait<1>();
-    } else {
-      cpWait<0>();
-    }
-    __syncthreads();
     const TI* A = As(st);
     const TI* B = Bs(st);
-    uint32_t a[2][2][4];
+    uint32_t a0[2][4], a1[2][4], f[2][4];
+    const int r0 = warpM * 32 + (lane & 15);
+    const int ak0 = (lane >> 4) * 8;
+    const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7);
+    const int cl = warpN * 64 + (lane >> 4) * 8;
+    ldsm4(a0[0], A + swA32(r0, ak0));
+    ldsm4(a0[1], A + swA32(r0 + 16, ak0));
+    ldsm4t(f[0], B + swB128(kl0, cl));
+    ldsm4t(f[1], B + swB128(kl0, cl + 16));
+    if (kc + 2 < ksteps) issue(kc + 2, st2);
+
 #pragma unroll
-    for (int m = 0; m < 2; ++m) {
-      const int r = warpM * 32 + m * 16 + (lane & 15);
-      ldsm4(a[m][0], A + swA32(r, (lane >> 4) * 8));
-      ldsm4(a[m][1], A + swA32(r, 16 + (lane >> 4) * 8));
-    }
+    for (int n2 = 0; n2 < 4; ++n2) {
+      const int cur = n2 & 1;
+      if (n2 == 1) ldsm4t(f[0], B + swB128(kl0, cl + 32));
+      if (n2 == 2) {
+        ldsm4t(f[1], B + swB128(kl0, cl + 48));
+        ldsm4(a1[0], A + swA32(r0, 16 + ak0));
+        ldsm4(a1[1], A + swA32(r0 + 16, 16 + ak0));
+      }
+      if (n2 == 3) ldsm4t(f[0], B + swB128(kl0 + 16, cl));
 #pragma unroll
-    for (int ks = 0; ks < 2; ++ks) {
-      uint32_t f[2][4];
-      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-      const int cl = warpN * 64 + (lane >> 4) * 8;
-      ldsm4t(f[0], B + swB128(kl, cl));
-#pragma unroll
-      for (int n2 = 0; n2 < 4; ++n2) {
-        const int cur = n2 & 1;
-        if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], B + swB128(kl, cl + (n2 + 1) * 16));
-#pragma unroll
-        for (int m = 0; m < 2; ++m) {
-          if constexpr (BFI) {
-            mma16816bf(acc[m][2 * n2], a[m][ks], f[cur][0], f[cur][1]);
-            mma16816bf(acc[m][2 * n2 + 1], a[m][ks], f[cur][2], f[cur][3]);
-          } else {
-            mma16816(acc[m][2 * n2], a[m][ks], f[cur][0], f[cur][1]);
-            mma16816(acc[m][2 * n2 + 1], a[m][ks], f[cur][2], f[cur][3]);
-          }
+      for (int m = 0; m < 2; ++m) {
+        if constexpr (BFI) {
+          mma16816bf(acc[m][2 * n2], a0[m], f[cur][0], f[cur][1]);
+          mma16816bf(acc[m][2 * n2 + 1], a0[m], f[cur][2], f[cur][3]);
+        } else {
+          mma16816(acc[m][2 * n2], a0[m], f[cur][0], f[cur][1]);
+          mma16816(acc[m][2 * n2 + 1], a0[m], f[cur][2], f[cur][3]);
         }
       }
     }
-    __syncthreads();
+#pragma unroll
+    for (int n2 = 0; n2 < 4; ++n2) {
+      const int cur = n2 & 1;
+      if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], B + swB128(kl0 + 16, cl + (n2 + 1) * 16));
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        if constexpr (BFI) {
+          mma16816bf(acc[m][2 * n2], a1[m], f[cur][0], f[cur][1]);
+          mma16816bf(acc[m][2 * n2 + 1], a1[m], f[cur][2], f[cur][3]);
+        } else {
+          mma16816(acc[m][2 * n2], a1[m], f[cur][0], f[cur][1]);
+          mma16816(acc[m][2 * n2 + 1], a1[m], f[cur][2], f[cur][3]);
+        }
+      }
+    }
+    if (kc + 1 < ksteps) {
+      if (kc + 2 < ksteps) cpWait<1>();
+      else cpWait<0>();
+      __syncthreads();
+    }
+    st = (st == 2) ? 0 : st + 1;
+    st2 = (st2 == 2) ? 0 : st2 + 1;
   }
+  if constexpr (!std::is_same_v<TO, float>) __syncthreads();
 
   const int g = lane >> 2, tig = lane & 3;
+  constexpr int LDW = 72;
+  TO* Ws = reinterpret_cast<TO*>(smem) + warp * (32 * LDW);
+  const int rw0 = lane >> 3, cw0 = (lane & 7) << 3;
+  if constexpr (!std::is_same_v<TO, float> && BETA) {
+    if (fullRows) {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rw0;
+        cpAsync16(Ws + rw * LDW + cw0, Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 64 + cw0, true);
+      }
+    } else {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rw0;
+        const size_t row = row0 + warpM * 32 + rw;
+        cpAsync16(Ws + rw * LDW + cw0, Y + (row < rows ? row : 0) * ldy + col0 + warpN * 64 + cw0, row < rows);
+      }
+    }
+    cpCommit();
+  }
+
   float2 bf[8];
   if constexpr (BIAS) {
 #pragma unroll
@@ -151,25 +194,14 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
     }
     return;
   } else {
-    // Coalesced shared-memory staging per warp: 32 rows x 72 TO elements (4608B/warp, 36.8KB total <= 48KB)
-    constexpr int LDW = 72;
-    TO* Ws = reinterpret_cast<TO*>(smem) + warp * (32 * LDW);
-    const int rw0 = lane >> 3, cw0 = (lane & 7) << 3;
     if constexpr (BETA) {
-#pragma unroll
-      for (int s = 0; s < 8; ++s) {
-        const int rw = s * 4 + rw0;
-        const size_t row = row0 + warpM * 32 + rw;
-        const int col = col0 + warpN * 64 + cw0;
-        uint4 v4 = (row < rows) ? ptx_ld_global_v4_u32(Y + row * ldy + col) : make_uint4(0, 0, 0, 0);
-        ptx_st_shared_v4_u32(Ws + rw * LDW + cw0, v4);
-      }
+      cpWait<0>();
       ptx_bar_warp();
     }
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
+    for (int h = 0; h < 2; ++h) {
         const int rw = m * 16 + g + 8 * h;
 #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
@@ -191,13 +223,22 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
       }
     }
     ptx_bar_warp();
+    if (fullRows) {
 #pragma unroll
-    for (int s = 0; s < 8; ++s) {
-      const int rw = s * 4 + rw0;
-      const size_t row = row0 + warpM * 32 + rw;
-      const int col = col0 + warpN * 64 + cw0;
-      if (row < rows) {
-        ptx_st_global_v4_u32(Y + row * ldy + col, ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rw0;
+        ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 64 + cw0,
+                             ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+      }
+    } else {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rw0;
+        const size_t row = row0 + warpM * 32 + rw;
+        if (row < rows) {
+          ptx_st_global_v4_u32(Y + row * ldy + col0 + warpN * 64 + cw0,
+                               ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+        }
       }
     }
   }
@@ -247,56 +288,97 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
 
   const int ksteps = K / BK;
   issue(0, 0);
-  if (ksteps > 1) issue(1, 1);
+  if (ksteps > 1) {
+    issue(1, 1);
+    cpWait<1>();
+  } else {
+    cpWait<0>();
+  }
+  __syncthreads();
 
   float acc[2][4][4] = {};
+  int st = 0, st2 = 2;
 #pragma unroll 1
   for (int kc = 0; kc < ksteps; ++kc) {
-    const int st = kc % 3;
-    if (kc + 2 < ksteps) {
-      issue(kc + 2, (kc + 2) % 3);
-      cpWait<2>();
-    } else if (kc + 1 < ksteps) {
-      cpWait<1>();
-    } else {
-      cpWait<0>();
-    }
-    __syncthreads();
     const TI* A = As(st);
     const TI* B = Bs(st);
-    uint32_t a[2][2][4];
+    uint32_t a0[2][4], a1[2][4], f[2][4];
+    const int r0 = warpM * 32 + (lane & 15);
+    const int ak0 = (lane >> 4) * 8;
+    const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7);
+    const int cl = warpN * 32 + (lane >> 4) * 8;
+    ldsm4(a0[0], A + swA32(r0, ak0));
+    ldsm4(a0[1], A + swA32(r0 + 16, ak0));
+    ldsm4t(f[0], B + swB64(kl0, cl));
+    ldsm4t(f[1], B + swB64(kl0, cl + 16));
+    if (kc + 2 < ksteps) issue(kc + 2, st2);
+
 #pragma unroll
-    for (int m = 0; m < 2; ++m) {
-      const int r = warpM * 32 + m * 16 + (lane & 15);
-      ldsm4(a[m][0], A + swA32(r, (lane >> 4) * 8));
-      ldsm4(a[m][1], A + swA32(r, 16 + (lane >> 4) * 8));
-    }
+    for (int n2 = 0; n2 < 2; ++n2) {
+      const int cur = n2 & 1;
+      if (n2 == 0) {
+        ldsm4(a1[0], A + swA32(r0, 16 + ak0));
+        ldsm4(a1[1], A + swA32(r0 + 16, 16 + ak0));
+      }
+      if (n2 == 1) ldsm4t(f[0], B + swB64(kl0 + 16, cl));
 #pragma unroll
-    for (int ks = 0; ks < 2; ++ks) {
-      uint32_t f[2][4];
-      const int kl = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-      const int cl = warpN * 32 + (lane >> 4) * 8;
-      ldsm4t(f[0], B + swB64(kl, cl));
-#pragma unroll
-      for (int n2 = 0; n2 < 2; ++n2) {
-        const int cur = n2 & 1;
-        if (n2 + 1 < 2) ldsm4t(f[cur ^ 1], B + swB64(kl, cl + (n2 + 1) * 16));
-#pragma unroll
-        for (int m = 0; m < 2; ++m) {
-          if constexpr (BFI) {
-            mma16816bf(acc[m][2 * n2], a[m][ks], f[cur][0], f[cur][1]);
-            mma16816bf(acc[m][2 * n2 + 1], a[m][ks], f[cur][2], f[cur][3]);
-          } else {
-            mma16816(acc[m][2 * n2], a[m][ks], f[cur][0], f[cur][1]);
-            mma16816(acc[m][2 * n2 + 1], a[m][ks], f[cur][2], f[cur][3]);
-          }
+      for (int m = 0; m < 2; ++m) {
+        if constexpr (BFI) {
+          mma16816bf(acc[m][2 * n2], a0[m], f[cur][0], f[cur][1]);
+          mma16816bf(acc[m][2 * n2 + 1], a0[m], f[cur][2], f[cur][3]);
+        } else {
+          mma16816(acc[m][2 * n2], a0[m], f[cur][0], f[cur][1]);
+          mma16816(acc[m][2 * n2 + 1], a0[m], f[cur][2], f[cur][3]);
         }
       }
     }
-    __syncthreads();
+#pragma unroll
+    for (int n2 = 0; n2 < 2; ++n2) {
+      const int cur = n2 & 1;
+      if (n2 == 0) ldsm4t(f[1], B + swB64(kl0 + 16, cl + 16));
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        if constexpr (BFI) {
+          mma16816bf(acc[m][2 * n2], a1[m], f[cur][0], f[cur][1]);
+          mma16816bf(acc[m][2 * n2 + 1], a1[m], f[cur][2], f[cur][3]);
+        } else {
+          mma16816(acc[m][2 * n2], a1[m], f[cur][0], f[cur][1]);
+          mma16816(acc[m][2 * n2 + 1], a1[m], f[cur][2], f[cur][3]);
+        }
+      }
+    }
+    if (kc + 1 < ksteps) {
+      if (kc + 2 < ksteps) cpWait<1>();
+      else cpWait<0>();
+      __syncthreads();
+    }
+    st = (st == 2) ? 0 : st + 1;
+    st2 = (st2 == 2) ? 0 : st2 + 1;
   }
+  if constexpr (!std::is_same_v<TO, float>) __syncthreads();
 
   const int g = lane >> 2, tig = lane & 3;
+  constexpr int LDW = 40;
+  TO* Ws = reinterpret_cast<TO*>(smem) + warp * (32 * LDW);
+  const int rw0 = lane >> 2, cw0 = (lane & 3) << 3;
+  if constexpr (!std::is_same_v<TO, float> && BETA) {
+    if (fullRows) {
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int rw = s * 8 + rw0;
+        cpAsync16(Ws + rw * LDW + cw0, Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 32 + cw0, true);
+      }
+    } else {
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int rw = s * 8 + rw0;
+        const size_t row = row0 + warpM * 32 + rw;
+        cpAsync16(Ws + rw * LDW + cw0, Y + (row < rows ? row : 0) * ldy + col0 + warpN * 32 + cw0, row < rows);
+      }
+    }
+    cpCommit();
+  }
+
   float2 bf[4];
   if constexpr (BIAS) {
 #pragma unroll
@@ -342,18 +424,8 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
       }
     }
   } else {
-    constexpr int LDW = 40;
-    TO* Ws = reinterpret_cast<TO*>(smem) + warp * (32 * LDW);
-    const int rw0 = lane >> 2, cw0 = (lane & 3) << 3;
     if constexpr (BETA) {
-#pragma unroll
-      for (int s = 0; s < 4; ++s) {
-        const int rw = s * 8 + rw0;
-        const size_t row = row0 + warpM * 32 + rw;
-        const int col = col0 + warpN * 32 + cw0;
-        uint4 v4 = (row < rows) ? ptx_ld_global_v4_u32(Y + row * ldy + col) : make_uint4(0, 0, 0, 0);
-        ptx_st_shared_v4_u32(Ws + rw * LDW + cw0, v4);
-      }
+      cpWait<0>();
       ptx_bar_warp();
     }
 #pragma unroll
@@ -381,13 +453,25 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
       }
     }
     ptx_bar_warp();
+    if (fullRows) {
 #pragma unroll
-    for (int s = 0; s < 4; ++s) {
-      const int rw = s * 8 + rw0;
-      const size_t row = row0 + warpM * 32 + rw;
-      const int col = col0 + warpN * 32 + cw0;
-      if (row < rows && col < N) {
-        ptx_st_global_v4_u32(Y + row * ldy + col, ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+      for (int s = 0; s < 4; ++s) {
+        const int rw = s * 8 + rw0;
+        const int col = col0 + warpN * 32 + cw0;
+        if (col < N) {
+          ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col,
+                               ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+        }
+      }
+    } else {
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int rw = s * 8 + rw0;
+        const size_t row = row0 + warpM * 32 + rw;
+        const int col = col0 + warpN * 32 + cw0;
+        if (row < rows && col < N) {
+          ptx_st_global_v4_u32(Y + row * ldy + col, ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+        }
       }
     }
   }
