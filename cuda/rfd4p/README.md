@@ -53,7 +53,7 @@ assembly, the sampler and the decode are inside it on both:
 | **PyTorch compiled, warm** | **5.34 s** | the second design of a two-replicate run |
 | cuda/rfd4p, exact f32 | 4.80 s | |
 | cuda/rfd4p, `--fast`, first design | 1.43 s | pays cuBLAS's heuristics and the lazy f16 mirrors |
-| **cuda/rfd4p, `--fast`, warm** | **1.27 s** | **4.2x the warm compiled run** |
+| **cuda/rfd4p, `--fast`, warm** | **1.26 s** | **4.2x the warm compiled run** |
 
 🔴 **4.2x IS THE NUMBER, AND THE OTHER ROWS ARE WHY IT TOOK FIVE RUNS TO GET.** Against the
 preset upstream ships for first runs it is 10.1x, and that preset says in its own header that it
@@ -85,7 +85,7 @@ input and their own 6 cycles, not something built here:
 | PyTorch compiled | 158.7 | | | f32 |
 | **PyTorch compiled, its own default precision** | **65.3** | 8.2 | **57.1** | bf16 matmuls |
 | cuda/rfd4p, exact | 156.0 | — | 156.0 | f32 |
-| **cuda/rfd4p, `--fast`** | **40.6** | — | **40.6** | TF32 + f16 |
+| **cuda/rfd4p, `--fast`** | **40.4** | — | **40.4** | TF32 + f16 |
 
 🔴 **AND THEIR FORWARD BUILDS ITS OWN FEATURES WHERE THIS ONE IS HANDED THEM** - 8.2 ms of their
 65.3, measured by wrapping `cond_factory`, `init_repr_factory` and `pair_repr_builder`. In the
@@ -137,6 +137,7 @@ four oracle arms.
 | eight lanes a pair in the bias kernel, and the contraction's output narrow to its norm | **43.2 at n=100, 370.5 at n=400** | the reductions, not the loads; and a widening transpose nothing needed |
 | `xProj` narrowed where the projection has no bias | **42.7 at n=100, 357.3 at n=400** | it was the biggest thing the gated add read |
 | the token track on f16 | **40.6 at n=100, 352.1 at n=400** | it was the last thing still running on TF32 |
+| each pair stage leaving behind the next one's LayerNorm, past 40,000 pairs | **340.1 at n=400**, 40.7 unchanged at n=100 | z was written and read straight back, three times an update |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.

@@ -15,6 +15,20 @@ namespace rfd4p {
 // 🔴 TF32 IS NOT f32 AND THE ORACLE BOUND MOVES WITH IT. Ten mantissa bits against twenty-three, so a
 // trunk that reads 6e-7 exact reads ~1e-3 here. That is the reason it is a FLAG and the strict path
 // stays the default: the parity gate runs the exact arm, and --fast is held to a looser bar.
+// Four consecutive values, loaded and stored at their natural width.
+__device__ __forceinline__ float4 quad4(const float* p) { return *(const float4*)p; }
+__device__ __forceinline__ float4 quad4(const __half* p) {
+  const __half2* h = (const __half2*)p;
+  const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ void store4(float* p, float4 v) { *(float4*)p = v; }
+__device__ __forceinline__ void store4(__half* p, float4 v) {
+  __half2* h = (__half2*)p;
+  h[0] = __floats2half2_rn(v.x, v.y);
+  h[1] = __floats2half2_rn(v.z, v.w);
+}
+
 // Four values a thread from either an f32 or a half source.
 __device__ __forceinline__ float4 quad(const float4* p, size_t i) { return p[i]; }
 __device__ __forceinline__ float4 quad(const __half2* p, size_t i) {
@@ -253,6 +267,116 @@ template <class T>
 __global__ void narrowK(const float* __restrict__ x, T* __restrict__ y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] = (T)x[i];
+}
+
+// ---------------------------------------------------------------- an update and the norm after it
+//
+// 🔴 EVERY PAIR UPDATE WRITES z AND THEN IMMEDIATELY READS IT BACK TO NORM IT, three times: the
+// hadamard write feeds the first triangle's `layer_norm_in`, each triangle's gated add feeds the
+// next norm, and the last feeds the pair transition's. Fused, the row is already in registers when
+// the reduction wants it and z is read once instead of twice - three fewer passes over the largest
+// tensor in the port, an update.
+//
+// A warp a row, the row in registers, mean and variance in two butterflies - the shape of
+// `layerNormInK`, with the update folded in front of it.
+// 🔴 FOUR CONSECUTIVE CHANNELS A LANE, NOT ONE STRIDED BY 32. The first version of this gave each
+// lane `c = k * 32 + lane`, which is what `layerNormInK` does and is fine for a norm - but the
+// UPDATE in front of it then reads z, pij and the gate one element at a time, losing the
+// vectorisation those kernels had on their own. Fused that way it was 40.6 -> 41.4 ms: the saved
+// read of z did not cover the lost access width.
+template <class TZ, class TO, int K, class FUpdate>
+__device__ __forceinline__ void updateThenLn(TZ* __restrict__ z, TO* __restrict__ out,
+                                             const float* __restrict__ lnW,
+                                             const float* __restrict__ lnB, size_t row, int C,
+                                             bool live, FUpdate update) {
+  const int lane = threadIdx.x & 31;
+  float v[K];
+  float sum = 0.f;
+  #pragma unroll
+  for (int q = 0; q < K / 4; ++q) {
+    const int c0 = q * 128 + lane * 4;
+    float4 x = quad4(z + row * C + c0);
+    if (live) {
+      x.x += update(c0);
+      x.y += update(c0 + 1);
+      x.z += update(c0 + 2);
+      x.w += update(c0 + 3);
+      store4(z + row * C + c0, x);
+    }
+    v[q * 4] = x.x; v[q * 4 + 1] = x.y; v[q * 4 + 2] = x.z; v[q * 4 + 3] = x.w;
+    sum += x.x + x.y + x.z + x.w;
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  const float mean = sum / (float)C;
+  float var = 0.f;
+  #pragma unroll
+  for (int k = 0; k < K; ++k) { const float d = v[k] - mean; var += d * d; }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(~0u, var, o);
+  const float inv = rsqrtf(var / (float)C + 1e-5f);
+  #pragma unroll
+  for (int q = 0; q < K / 4; ++q) {
+    const int c0 = q * 128 + lane * 4;
+    float4 r;
+    r.x = (v[q * 4] - mean) * inv;
+    r.y = (v[q * 4 + 1] - mean) * inv;
+    r.z = (v[q * 4 + 2] - mean) * inv;
+    r.w = (v[q * 4 + 3] - mean) * inv;
+    const float4 w = lnW ? *(const float4*)(lnW + c0) : make_float4(1, 1, 1, 1);
+    const float4 b = lnB ? *(const float4*)(lnB + c0) : make_float4(0, 0, 0, 0);
+    r.x = r.x * w.x + b.x; r.y = r.y * w.y + b.y; r.z = r.z * w.z + b.z; r.w = r.w * w.w + b.w;
+    store4(out + row * C + c0, r);
+  }
+}
+
+// `z += pij[j] * pij[i + P]`, then the norm the next stage wants.
+template <class TZ, class TO, int K>
+__global__ void __launch_bounds__(256)
+hadamardThenLnK(const float* __restrict__ pij, const float* __restrict__ pairMask,
+                TZ* __restrict__ z, TO* __restrict__ out, const float* __restrict__ lnW,
+                const float* __restrict__ lnB, int n, int C) {
+  const size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= (size_t)n * n) return;
+  const int i = (int)(row / n), j = (int)(row % n);
+  const bool live = !pairMask || pairMask[row] != 0.f;
+  updateThenLn<TZ, TO, K>(z, out, lnW, lnB, row, C, live, [&](int c) {
+    return pij[(size_t)j * 2 * C + c] * pij[(size_t)i * 2 * C + C + c];
+  });
+}
+
+// `z += a * sigmoid(gate)`, then the norm the next stage wants. `PLANE` reads the gate
+// channel-major, which is how the short form's fused projection leaves it.
+template <class TA, class TG, class TZ, class TO, int K, bool PLANE>
+__global__ void __launch_bounds__(256)
+gateAddThenLnK(const TA* __restrict__ a, const TG* __restrict__ gate,
+               const float* __restrict__ pairMask, TZ* __restrict__ z, TO* __restrict__ out,
+               const float* __restrict__ lnW, const float* __restrict__ lnB, size_t rows, int C) {
+  const size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= rows) return;
+  const bool live = !pairMask || pairMask[row] != 0.f;
+  updateThenLn<TZ, TO, K>(z, out, lnW, lnB, row, C, live, [&](int c) {
+    const float g = PLANE ? (float)gate[(size_t)c * rows + row] : (float)gate[row * C + c];
+    return (float)a[row * C + c] * (1.f / (1.f + __expf(-g)));
+  });
+}
+
+template <class TZ, class TO>
+inline void hadamardThenLn(const float* pij, const float* pairMask, TZ* z, TO* out,
+                           const float* lnW, const float* lnB, int n, int C) {
+  const unsigned g = blocks((size_t)n * n * 32, 256);
+  if (C == 384) hadamardThenLnK<TZ, TO, 12><<<g, 256, 0, STREAM>>>(pij, pairMask, z, out, lnW, lnB, n, C);
+  else if (C == 256) hadamardThenLnK<TZ, TO, 8><<<g, 256, 0, STREAM>>>(pij, pairMask, z, out, lnW, lnB, n, C);
+  else { fprintf(stderr, "hadamardThenLn: no kernel for %d channels\n", C); exit(1); }
+}
+
+template <class TA, class TG, class TZ, class TO, bool PLANE>
+inline void gateAddThenLn(const TA* a, const TG* gate, const float* pairMask, TZ* z, TO* out,
+                          const float* lnW, const float* lnB, size_t rows, int C) {
+  const unsigned g = blocks(rows * 32, 256);
+  if (C == 384) gateAddThenLnK<TA, TG, TZ, TO, 12, PLANE><<<g, 256, 0, STREAM>>>(a, gate, pairMask, z, out, lnW, lnB, rows, C);
+  else if (C == 256) gateAddThenLnK<TA, TG, TZ, TO, 8, PLANE><<<g, 256, 0, STREAM>>>(a, gate, pairMask, z, out, lnW, lnB, rows, C);
+  else { fprintf(stderr, "gateAddThenLn: no kernel for %d channels\n", C); exit(1); }
 }
 
 // ---------------------------------------------------------------- the attention's pair bias

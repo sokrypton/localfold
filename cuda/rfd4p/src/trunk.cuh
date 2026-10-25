@@ -263,16 +263,22 @@ inline void pairBiasAttention(const float* nodes, const TZ* pair, const float* p
 // left to win is bytes, not arithmetic. The contraction still accumulates in f32 - a sum over n of
 // products is where half overflows, which is the one place AF3's pair track keeps f32 too.
 template <class TZ, class TP, bool LONG>
-inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing,
-                      const std::string& pre) {
+inline void triangleT(TZ* z, const TP* zNormIn, const float* pairMask, const Dims& d, bool outgoing,
+                      const std::string& pre, TP* nextNorm, const float* nextW, const float* nextB) {
   // On a long chain the contraction's output is narrowed too, and the gate is transposed before it
   // is read. Both invert with length - see the table below - so they are one decision.
   using TX = std::conditional_t<LONG, TP, float>;
   const size_t rows = d.pairs();
   const int cZ = d.P, cH = d.TRI, n = d.n;
-  TP* zNorm = scratch<TP>("rfd4p.tri.zn", rows * cZ);
-  layerNormIn<TZ, TP>(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")),
-                      optW(wn(pre + ".layer_norm_in.bias")));
+  // A null `zNorm` means "norm z yourself"; a null `nextNorm` means "do not leave one behind".
+  // The fused form pays on a long chain and costs on a short one - see `longForm`.
+  const TP* zNorm = zNormIn;
+  if (zNorm == nullptr) {
+    TP* own = scratch<TP>("rfd4p.tri.zn", rows * cZ);
+    layerNormIn<TZ, TP>(z, own, rows, cZ, W(wn(pre + ".layer_norm_in.weight")),
+                        optW(wn(pre + ".layer_norm_in.bias")));
+    zNorm = own;
+  }
 
   // 🔴 ONE PROJECTION, NOT FOUR, AND IT LANDS IN THE LAYOUT THE CONTRACTION WANTS. a_p, a_g, b_p and
   // b_g all read the same `zNorm`, so their weights stack into one `[4 * cH, cZ]` matrix - a plain
@@ -345,14 +351,16 @@ inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing
   //   transposed 54.8      149.2          513.3
   //
   // so the crossover is about 40,000 pairs and the rule is on `rows`, which is what sets the stride.
+  // The gate, the residual it feeds, and the LayerNorm the NEXT stage wants - one pass over z.
   if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
     linear<TP, TP>(zNorm, gate, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
-    if (zBias) mulSigmoidAddGate<float, TP, TZ>(xProj32, gate, pairMask, z, rows, cZ);
-    else mulSigmoidAddGate<TP, TP, TZ>(xProj16, gate, pairMask, z, rows, cZ);
+    if (zBias) gateAddThenLn<float, TP, TZ, TP, false>(xProj32, gate, pairMask, z, nextNorm, nextW, nextB, rows, cZ);
+    else gateAddThenLn<TP, TP, TZ, TP, false>(xProj16, gate, pairMask, z, nextNorm, nextW, nextB, rows, cZ);
+  } else if (zBias) {
+    mulSigmoidAddPlaneGate<float, TP, TZ>(xProj32, gPlanes, pairMask, z, rows, cZ);
   } else {
-    if (zBias) mulSigmoidAddPlaneGate<float, TP, TZ>(xProj32, gPlanes, pairMask, z, rows, cZ);
-    else mulSigmoidAddPlaneGate<TP, TP, TZ>(xProj16, gPlanes, pairMask, z, rows, cZ);
+    mulSigmoidAddPlaneGate<TP, TP, TZ>(xProj16, gPlanes, pairMask, z, rows, cZ);
   }
 }
 
@@ -373,12 +381,12 @@ inline bool longForm(size_t rows) {
   return forced || rows >= 40000;
 }
 
-template <class TZ>
-inline void triangle(TZ* z, const float* pairMask, const Dims& d, bool outgoing,
-                     const std::string& pre) {
-  using TP = std::conditional_t<std::is_same_v<TZ, half>, half, float>;
-  if (longForm(d.pairs())) triangleT<TZ, TP, true>(z, pairMask, d, outgoing, pre);
-  else triangleT<TZ, TP, false>(z, pairMask, d, outgoing, pre);
+template <class TZ, class TP>
+inline void triangle(TZ* z, const TP* zNormIn, const float* pairMask, const Dims& d, bool outgoing,
+                     const std::string& pre, TP* nextNorm, const float* nextW, const float* nextB) {
+  if (longForm(d.pairs()))
+    triangleT<TZ, TP, true>(z, zNormIn, pairMask, d, outgoing, pre, nextNorm, nextW, nextB);
+  else triangleT<TZ, TP, false>(z, zNormIn, pairMask, d, outgoing, pre, nextNorm, nextW, nextB);
 }
 
 // ---------------------------------------------------------------- the pair update
@@ -456,36 +464,44 @@ inline void pairReprUpdate(const float* s, TZ* z, const float* mask, const float
   layerNorm(s, xNorm, n, D, W(wn(pre + ".layer_norm_in.weight")), W(wn(pre + ".layer_norm_in.bias")));
   float* pij = scratch<float>("rfd4p.pu.pij", (size_t)n * P * 2);
   linear<float, float>(xNorm, pij, n, D, P * 2, wn(pre + ".linear_x.weight"), true);
-  hadamardWrite<TZ>(pij, pairMask, z, n, P);
+  // 🔴 EACH STAGE LEAVES BEHIND THE NORM THE NEXT ONE WANTS. The hadamard write, both triangles'
+  // gated adds and the pair transition's residual each write z and were each followed by a pass
+  // that read it straight back to norm it; fused, z is read once a stage instead of twice.
+  using TP = std::conditional_t<std::is_same_v<TZ, half>, half, float>;
+  const std::string tr = pre + ".transition_out";
+  const std::string firstNorm = d.useTriMult ? pre + ".tri_mult_out.layer_norm_in" : tr + ".layer_norm";
+  TP* norm = scratch<TP>("rfd4p.pu.norm", rows * P);
+
+  const bool fuse = longForm(rows);
+  if (fuse) {
+    hadamardThenLn<TZ, TP>(pij, pairMask, z, norm, W(wn(firstNorm + ".weight")),
+                           optW(wn(firstNorm + ".bias")), n, P);
+  } else {
+    hadamardWrite<TZ>(pij, pairMask, z, n, P);
+  }
 
   if (d.useTriMult) {
-    triangle<TZ>(z, pairMask, d, true, pre + ".tri_mult_out");
-    triangle<TZ>(z, pairMask, d, false, pre + ".tri_mult_in");
+    const std::string second = pre + ".tri_mult_in.layer_norm_in";
+    TP* norm2 = fuse ? scratch<TP>("rfd4p.pu.norm2", rows * P) : nullptr;
+    triangle<TZ, TP>(z, fuse ? norm : nullptr, pairMask, d, true, pre + ".tri_mult_out", norm2,
+                     fuse ? W(wn(second + ".weight")) : nullptr,
+                     fuse ? optW(wn(second + ".bias")) : nullptr);
+    triangle<TZ, TP>(z, norm2, pairMask, d, false, pre + ".tri_mult_in", fuse ? norm : nullptr,
+                     fuse ? W(wn(tr + ".layer_norm.weight")) : nullptr,
+                     fuse ? W(wn(tr + ".layer_norm.bias")) : nullptr);
+  }
+  if (!fuse) {
+    layerNormIn<TZ, TP>(z, norm, rows, P, W(wn(tr + ".layer_norm.weight")),
+                        W(wn(tr + ".layer_norm.bias")));
   }
 
-  // PairTransition: LayerNorm, up, ReLU, down, residual.
-  const std::string tr = pre + ".transition_out";
+  // PairTransition: up, ReLU, down, residual - its LayerNorm was done by whatever wrote z last.
   const int hidden = (int)lenW(wn(tr + ".linear_1.bias"));
   float* o = scratch<float>("rfd4p.pu.o", rows * P);
-  // The widened hidden is [pairs, 768] - the largest buffer in the update after the planes - so under
-  // --fast it is half, and with it the normed input the up projection reads.
-  if (F32_TF32) {
-    half* zn = scratch<half>("rfd4p.pu.zn16", rows * P);
-    half* h = scratch<half>("rfd4p.pu.h16", rows * (size_t)hidden);
-    layerNormIn<TZ, half>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")),
-                          W(wn(tr + ".layer_norm.bias")));
-    linear<half, half>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-    biasRelu<half>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
-    linear<half, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
-  } else {
-    float* zn = scratch<float>("rfd4p.pu.zn", rows * P);
-    float* h = scratch<float>("rfd4p.pu.h", rows * (size_t)hidden);
-    layerNormIn<TZ, float>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")),
-                           W(wn(tr + ".layer_norm.bias")));
-    linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-    biasRelu<float>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
-    linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
-  }
+  TP* h = scratch<TP>("rfd4p.pu.h", rows * (size_t)hidden);
+  linear<TP, TP>(norm, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
+  biasRelu<TP>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
+  linear<TP, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
   biasAdd<TZ>(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
 }
 
