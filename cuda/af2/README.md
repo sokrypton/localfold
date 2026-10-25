@@ -494,6 +494,30 @@ over a dozen latency-bound kernels at a third to a half of their busiest unit. G
 (an unofficial assembler, one binary per architecture) aimed at those kernels, worth at most ~13% of a 522-residue
 fold for the attention alone.
 
+**The SASS experiment, on the triangle attention** (`flashGrid2R<32,2,48,2,2,...,half,SPEC>`, 30% of a 522-residue
+fold; alone 0.763 ms a call there, 95 TFLOP/s, a harness loading a hand-edited cubin beside the compiled kernel):
+
+- CuAssembler (cloudcores) round-trips the kernel to bit-identical output and speed once its sm_80 repository has
+  learned this binary's instructions - but **mis-encodes every `LDGSTS`** (a `desc[UR8]` bit the original lacks,
+  60 instructions) and runs anyway. Reassemble nothing whole; patch the original words.
+- `ptxas`'s schedule is already good: the softmax and P.V block interleaves `MUFU` and `HMMA` through its middle,
+  its `MUFU`-only head and `HMMA`-only tail are the tile's own dependencies, and crossing tiles needs a third
+  stage (measured slower) or ~24 registers (two blocks an SM). The stalls are diffuse: the per-tile barrier 7.6%,
+  the prologue's and epilogue's loads ~7% (11 key tiles a block at 522), the rest spread over the MMA chains.
+- `ex2.approx.f16x2` is **two scalar `MUFU.EX2.F16`** on sm_80, not half the SFU work: 48 `MUFU` against 54 `HMMA`
+  a warp and tile, both ~8 pipe cycles each, so the SFU is loaded as heavily as the tensor pipe (both ~40%).
+  Moving exponentials to the FMA pipe was measured slower already (the comment at the call).
+- The one lever only SASS holds, a register allocation for four blocks an SM (128 registers; 166 now): the loop's
+  peak live set is 127 (`nvdisasm -plr`; the 154 peak is the once-a-block prologue). Forced to four blocks the
+  compiler spills five loop values and four blocks do reside (15.7 warps an SM against 11.8), but the kernel is
+  **15% slower** (0.882 against 0.767 ms): 19% of its stall samples wait on those reloads, issued at the tile's top
+  and used at once. They cannot be issued earlier - all five registers are read as MMA operands up to the last
+  instructions before the back-edge, and no register is free to hold one sooner. A hand allocation has the same
+  127 values and the same 128 slots, so it chooses what to spill, not whether.
+
+Nothing here beats the compiled kernel, and the best case for the four-block form (every reload hidden) was ~5% of
+this kernel, ~1.5% of a fold.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
