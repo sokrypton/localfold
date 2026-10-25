@@ -2119,17 +2119,18 @@ template <class T> constexpr cudaDataType cudaType() {
 template <class T> __device__ __forceinline__ float toF(T v) {
   if constexpr (std::is_same_v<T, float>) return v;
   else if constexpr (std::is_same_v<T, __nv_bfloat16>) return ptx_bf16_raw_to_f32(*reinterpret_cast<const unsigned short*>(&v));
-  else return ptx_f16_raw_to_f32(*reinterpret_cast<const unsigned short*>(&v));
+  else if constexpr (std::is_same_v<T, half>) return ptx_f16_raw_to_f32(*reinterpret_cast<const unsigned short*>(&v));
+  else return float(v);
 }
 template <class T> __device__ __forceinline__ T fromF(float v) {
   if constexpr (std::is_same_v<T, float>) return v;
   else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     unsigned short r = ptx_f32_to_bf16_raw(v);
     return *reinterpret_cast<const __nv_bfloat16*>(&r);
-  } else {
+  } else if constexpr (std::is_same_v<T, half>) {
     unsigned short r = ptx_f32_to_f16_raw(v);
     return *reinterpret_cast<const half*>(&r);
-  }
+  } else return T(v);
 }
 // two adjacent elements of a 16-bit tensor as floats, bf16 or f16
 template <class T> __device__ __forceinline__ float2 ld2f(const T* p) {

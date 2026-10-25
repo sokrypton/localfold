@@ -16,11 +16,19 @@ __global__ void rect2LayerNormK(const float* pair, const float* mask, half* out,
   size_t p = rect2Pair(r, q0 + row, n);
   const float* x = p != SIZE_MAX ? pair + p * C : nullptr;
   float s = 0, ss = 0;
-  for (int c = lane; c < C; c += 32) { float v = x ? x[c] : 0.f; s += v; ss += v * v; }
-  for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
-  float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half(((x ? x[c] : 0.f) - mean) * inv * scale[c] + offset[c]);
-  if (lane == 0 && m) m[row] = p != SIZE_MAX ? (mask ? mask[p] : 1.f) : 0.f;
+  for (int c = lane; c < C; c += 32) {
+    float v = x ? ptx_ldg_f32(x + c) : 0.f;
+    s = ptx_add_f32(s, v);
+    ss = ptx_fma_f32(v, v, ss);
+  }
+  s = ptx_warp_sum_f32(s);
+  ss = ptx_warp_sum_f32(ss);
+  float mean = ptx_div_f32(s, (float)C), inv = ptx_rsqrt_f32(ptx_add_f32(ptx_fma_f32(-mean, mean, ptx_div_f32(ss, (float)C)), 1e-5f));
+  for (int c = lane; c < C; c += 32) {
+    float v = x ? ptx_ldg_f32(x + c) : 0.f;
+    ptx_st_global_b16(out + row * C + c, ptx_f32_to_f16_raw(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v, mean), inv), ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c))));
+  }
+  if (lane == 0 && m) ptx_st_global_f32(m + row, p != SIZE_MAX ? (mask ? ptx_ldg_f32(mask + p) : 1.f) : 0.f);
 }
 __global__ void rect2GateK(const half* pg, const float* m, half* out, size_t q0, size_t cnt, int C, size_t size) {
   __shared__ float A[32][33];
@@ -29,13 +37,16 @@ __global__ void rect2GateK(const half* pg, const float* m, half* out, size_t q0,
   for (int ry = ty; ry < 32; ry += 8) {
     size_t row = row0 + ry; int c = c0 + tx;
     float v = 0;
-    if (row < cnt && c < C) { const half* p = pg + row * 2 * C; v = __half2float(p[c]) * m[row] / (1.f + __expf(-__half2float(p[C + c]))); }
-    A[ry][tx] = v;
+    if (row < cnt && c < C) {
+      const half* p = pg + row * 2 * C;
+      v = ptx_mul_f32(ptx_mul_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + c)), ptx_ldg_f32(m + row)), ptx_sigm_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + C + c))));
+    }
+    ptx_st_shared_f32(&A[ry][tx], v);
   }
   __syncthreads();
   for (int cy = ty; cy < 32; cy += 8) {
     size_t row = row0 + tx; int c = c0 + cy;
-    if (row < cnt && c < C) out[(size_t)c * size + q0 + row] = __float2half(A[tx][cy]);
+    if (row < cnt && c < C) ptx_st_global_b16(out + (size_t)c * size + q0 + row, ptx_f32_to_f16_raw(ptx_ld_shared_f32(&A[tx][cy])));
   }
 }
 __global__ void rect2CenterNormK(const float* prod, half* out, size_t q0, size_t cnt, int C, size_t size,
@@ -44,19 +55,27 @@ __global__ void rect2CenterNormK(const float* prod, half* out, size_t q0, size_t
   size_t row0 = (size_t)blockIdx.x * 32; int tx = threadIdx.x, ty = threadIdx.y;
   size_t row = row0 + tx;
   float s = 0, ss = 0;
-  if (row < cnt) for (int c = ty; c < C; c += 8) { float v = prod[(size_t)c * size + q0 + row]; s += v; ss += v * v; }
-  ps[ty][tx] = s; pss[ty][tx] = ss;
+  if (row < cnt) for (int c = ty; c < C; c += 8) {
+    float v = ptx_ldg_f32(prod + (size_t)c * size + q0 + row);
+    s = ptx_add_f32(s, v);
+    ss = ptx_fma_f32(v, v, ss);
+  }
+  ptx_st_shared_f32(&ps[ty][tx], s);
+  ptx_st_shared_f32(&pss[ty][tx], ss);
   __syncthreads();
   if (ty == 0) {
     float a = 0, b = 0;
-    for (int k = 0; k < 8; ++k) { a += ps[k][tx]; b += pss[k][tx]; }
-    float mu = a / C; mean[tx] = mu; inv[tx] = rsqrtf(b / C - mu * mu + 1e-5f);
+    for (int k = 0; k < 8; ++k) { a = ptx_add_f32(a, ptx_ld_shared_f32(&ps[k][tx])); b = ptx_add_f32(b, ptx_ld_shared_f32(&pss[k][tx])); }
+    float mu = ptx_div_f32(a, (float)C);
+    ptx_st_shared_f32(mean + tx, mu);
+    ptx_st_shared_f32(inv + tx, ptx_rsqrt_f32(ptx_add_f32(ptx_fma_f32(-mu, mu, ptx_div_f32(b, (float)C)), 1e-5f)));
   }
   __syncthreads();
   for (int ry = ty; ry < 32; ry += 8) {
     size_t lr = row0 + ry; if (lr >= cnt) continue;
+    float mu = ptx_ld_shared_f32(mean + ry), iv = ptx_ld_shared_f32(inv + ry);
     for (int c = tx; c < C; c += 32)
-      out[lr * C + c] = __float2half((prod[(size_t)c * size + q0 + lr] - mean[ry]) * inv[ry] * scale[c] + offset[c]);
+      ptx_st_global_b16(out + lr * C + c, ptx_f32_to_f16_raw(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(ptx_ldg_f32(prod + (size_t)c * size + q0 + lr), mu), iv), ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c))));
   }
 }
 __global__ void rect2GatedAddK(float* pair, const float* t1, const half* t2, TriRect2 r, size_t q0, size_t cnt, int n, int C) {
@@ -64,7 +83,10 @@ __global__ void rect2GatedAddK(float* pair, const float* t1, const half* t2, Tri
   if (t >= cnt * C) return;
   size_t row = t / C; int c = (int)(t % C);
   size_t p = rect2Pair(r, q0 + row, n);
-  if (p != SIZE_MAX) pair[p * C + c] += t1[t] / (1.f + __expf(-__half2float(t2[t])));
+  if (p != SIZE_MAX) {
+    float cur = ptx_ld_global_f32(pair + p * C + c);
+    ptx_st_global_f32(pair + p * C + c, ptx_fma_f32(ptx_ldg_f32(t1 + t), ptx_sigm_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(t2 + t))), cur));
+  }
 }
 
 // The driver, on the caller's weights: the LayerNorm in, one [projection | gate] (C, 2C) f16 matrix and its

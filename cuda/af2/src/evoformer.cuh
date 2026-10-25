@@ -1225,7 +1225,8 @@ __global__ void packBatched2K(const float* __restrict__ w0, const float* __restr
   if (t >= (size_t)nblk * slice) return;
   int b = (int)(t / slice); size_t s = t % slice;
   float* o = out + (size_t)b * 2 * slice;
-  o[s] = w0[t]; o[slice + s] = w1[t];
+  ptx_st_global_f32(o + s, ptx_ldg_f32(w0 + t));
+  ptx_st_global_f32(o + slice + s, ptx_ldg_f32(w1 + t));
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated
 __global__ void __launch_bounds__(256, 8)
@@ -1240,38 +1241,38 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
   int c0 = (int)blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
   int c = c0 + tx;
   if (ij0 + 32 <= pairs && c0 + 32 <= C) {
-    float pba = projB ? __ldg(projB + c) : 0.f, pbb = projB ? __ldg(projB + C + c) : 0.f;
-    float gba = gateB ? __ldg(gateB + c) : 0.f, gbb = gateB ? __ldg(gateB + C + c) : 0.f;
+    float pba = projB ? ptx_ldg_f32(projB + c) : 0.f, pbb = projB ? ptx_ldg_f32(projB + C + c) : 0.f;
+    float gba = gateB ? ptx_ldg_f32(gateB + c) : 0.f, gbb = gateB ? ptx_ldg_f32(gateB + C + c) : 0.f;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       size_t ij = ij0 + ty + k * 8;
       size_t base = ij * (size_t)ld + c;
-      float m = __ldg(mask + ij);
-      float pa = __ldg(proj + base) + pba, ga = __ldg(gate + base) + gba;
-      float pb = __ldg(proj + base + C) + pbb, gb = __ldg(gate + base + C) + gbb;
-      A[ty + k * 8][tx] = pa * m / (1.f + __expf(-ga));
-      B[ty + k * 8][tx] = pb * m / (1.f + __expf(-gb));
+      float m = ptx_ldg_f32(mask + ij);
+      float pa = ptx_add_f32(ptx_ldg_f32(proj + base), pba), ga = ptx_add_f32(ptx_ldg_f32(gate + base), gba);
+      float pb = ptx_add_f32(ptx_ldg_f32(proj + base + C), pbb), gb = ptx_add_f32(ptx_ldg_f32(gate + base + C), gbb);
+      ptx_st_shared_f32(&A[ty + k * 8][tx], ptx_mul_f32(ptx_mul_f32(pa, m), ptx_sigm_f32(ga)));
+      ptx_st_shared_f32(&B[ty + k * 8][tx], ptx_mul_f32(ptx_mul_f32(pb, m), ptx_sigm_f32(gb)));
     }
     __syncthreads();
     size_t ij = ij0 + tx;
 #pragma unroll
     for (int k = 0; k < 32; k += 8) {
       int co = c0 + ty + k;
-      a[(size_t)co * pairs + ij] = A[tx][ty + k];
-      b[(size_t)co * pairs + ij] = B[tx][ty + k];
+      ptx_st_global_f32(a + (size_t)co * pairs + ij, ptx_ld_shared_f32(&A[tx][ty + k]));
+      ptx_st_global_f32(b + (size_t)co * pairs + ij, ptx_ld_shared_f32(&B[tx][ty + k]));
     }
     return;
   }
-  float pba = (c < C && projB) ? __ldg(projB + c) : 0.f, pbb = (c < C && projB) ? __ldg(projB + C + c) : 0.f;
-  float gba = (c < C && gateB) ? __ldg(gateB + c) : 0.f, gbb = (c < C && gateB) ? __ldg(gateB + C + c) : 0.f;
+  float pba = (c < C && projB) ? ptx_ldg_f32(projB + c) : 0.f, pbb = (c < C && projB) ? ptx_ldg_f32(projB + C + c) : 0.f;
+  float gba = (c < C && gateB) ? ptx_ldg_f32(gateB + c) : 0.f, gbb = (c < C && gateB) ? ptx_ldg_f32(gateB + C + c) : 0.f;
 #pragma unroll
   for (int k = 0; k < 32; k += 8) {
     size_t ij = ij0 + ty + k;
     if (ij < pairs && c < C) {
-      float m = __ldg(mask + ij);
+      float m = ptx_ldg_f32(mask + ij);
       size_t base = ij * (size_t)ld + c;
-      A[ty + k][tx] = (__ldg(proj + base) + pba) * m / (1.f + __expf(-(__ldg(gate + base) + gba)));
-      B[ty + k][tx] = (__ldg(proj + base + C) + pbb) * m / (1.f + __expf(-(__ldg(gate + base + C) + gbb)));
+      ptx_st_shared_f32(&A[ty + k][tx], ptx_mul_f32(ptx_mul_f32(ptx_add_f32(ptx_ldg_f32(proj + base), pba), m), ptx_sigm_f32(ptx_add_f32(ptx_ldg_f32(gate + base), gba))));
+      ptx_st_shared_f32(&B[ty + k][tx], ptx_mul_f32(ptx_mul_f32(ptx_add_f32(ptx_ldg_f32(proj + base + C), pbb), m), ptx_sigm_f32(ptx_add_f32(ptx_ldg_f32(gate + base + C), gbb))));
     }
   }
   __syncthreads();
@@ -1280,8 +1281,8 @@ triSplitK(const float* __restrict__ proj, const float* __restrict__ gate, const 
   for (int k = 0; k < 32; k += 8) {
     int co = c0 + ty + k;
     if (co < C && ij < pairs) {
-      a[(size_t)co * pairs + ij] = A[tx][ty + k];
-      b[(size_t)co * pairs + ij] = B[tx][ty + k];
+      ptx_st_global_f32(a + (size_t)co * pairs + ij, ptx_ld_shared_f32(&A[tx][ty + k]));
+      ptx_st_global_f32(b + (size_t)co * pairs + ij, ptx_ld_shared_f32(&B[tx][ty + k]));
     }
   }
 }
@@ -1292,9 +1293,10 @@ __global__ void operand2K(const float* proj, const float* gate, const float* pb,
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < (size_t)C * 2 * C) {
     int k = (int)(t / (2 * C)), o = (int)(t % (2 * C));
-    w[t] = __float2half(o < C ? proj[(size_t)k * 2 * C + side * C + o] : gate[(size_t)k * 2 * C + side * C + o - C]);
+    ptx_st_global_b16(w + t, ptx_f32_to_f16_raw(o < C ? ptx_ldg_f32(proj + (size_t)k * 2 * C + side * C + o)
+                                                      : ptx_ldg_f32(gate + (size_t)k * 2 * C + side * C + o - C)));
   }
-  if (t < (size_t)2 * C) bias[t] = (int)t < C ? pb[side * C + t] : gb[side * C + t - C];
+  if (t < (size_t)2 * C) ptx_st_global_f32(bias + t, (int)t < C ? ptx_ldg_f32(pb + side * C + t) : ptx_ldg_f32(gb + side * C + t - C));
 }
 inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const std::string& T, int blk, bool outgoing) {
   struct Op { half* w; float* b; };

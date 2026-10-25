@@ -443,13 +443,15 @@ __global__ void concat3K(const float* a, const float* b, const float* c, half* o
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; int Wt = wa + wb + wc;
   if (t >= (size_t)C * Wt) return;
   int col = (int)(t % Wt), r = (int)(t / Wt);
-  float v = col < wa ? a[(size_t)r * wa + col] : col < wa + wb ? b[(size_t)r * wb + col - wa] : c[(size_t)r * wc + col - wa - wb];
-  out[t] = __float2half(v);
+  float v = col < wa ? ptx_ldg_f32(a + (size_t)r * wa + col)
+                     : col < wa + wb ? ptx_ldg_f32(b + (size_t)r * wb + col - wa)
+                                     : ptx_ldg_f32(c + (size_t)r * wc + col - wa - wb);
+  ptx_st_global_b16(out + t, ptx_f32_to_f16_raw(v));
 }
 __global__ void concat3BiasK(const float* a, const float* b, const float* c, float* out, int wa, int wb, int wc) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= wa + wb + wc) return;
-  out[t] = t < wa ? a[t] : t < wa + wb ? b[t - wa] : c[t - wa - wb];
+  ptx_st_global_f32(out + t, t < wa ? ptx_ldg_f32(a + t) : t < wa + wb ? ptx_ldg_f32(b + t - wa) : ptx_ldg_f32(c + t - wa - wb));
 }
 struct TriW { const half* w5; const float* b5; const half* out; };
 inline TriW triWeights(const std::string& T, int blk, int C) {
@@ -480,18 +482,20 @@ __global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, s
     size_t r = r0 + ry; int c = c0 + tx;
     float va = 0, vb = 0;
     if (r < pairs) {
-      const half* p = pg + r * 5 * C; float m = mask[p0 + r];
-      va = __half2float(p[c]) * m / (1.f + __expf(-__half2float(p[2 * C + c])));
-      vb = __half2float(p[C + c]) * m / (1.f + __expf(-__half2float(p[3 * C + c])));
+      const half* p = pg + r * 5 * C; float m = ptx_ldg_f32(mask + p0 + r);
+      va = ptx_mul_f32(ptx_mul_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + c)), m), ptx_sigm_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + 2 * C + c))));
+      vb = ptx_mul_f32(ptx_mul_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + C + c)), m), ptx_sigm_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(p + 3 * C + c))));
     }
-    A[ry][tx] = va; B[ry][tx] = vb;
+    ptx_st_shared_f32(&A[ry][tx], va);
+    ptx_st_shared_f32(&B[ry][tx], vb);
   }
   __syncthreads();
   for (int cy = ty; cy < 32; cy += 8) {
     size_t r = r0 + tx; int c = c0 + cy;
     if (r < pairs) {
       size_t at = (size_t)c * Lp * Lp + ((p0 + r) / L) * Lp + (p0 + r) % L;
-      a[at] = __float2half(A[tx][cy]); b[at] = __float2half(B[tx][cy]);
+      ptx_st_global_b16(a + at, ptx_f32_to_f16_raw(ptx_ld_shared_f32(&A[tx][cy])));
+      ptx_st_global_b16(b + at, ptx_f32_to_f16_raw(ptx_ld_shared_f32(&B[tx][cy])));
     }
   }
 }
@@ -505,12 +509,12 @@ __global__ void interleaveTriK(const float* proj, const float* gate, const float
   if (t < (size_t)C * 4 * C) {
     int k = (int)(t / (4 * C)), col = (int)(t % (4 * C)), part = col / (2 * C), cc = col % (2 * C), ch = cc / 2;
     const float* src = part ? gate : proj;
-    wpg[t] = __float2half(src[(size_t)k * 2 * C + (cc & 1) * C + ch]);
+    ptx_st_global_b16(wpg + t, ptx_f32_to_f16_raw(ptx_ldg_f32(src + (size_t)k * 2 * C + (cc & 1) * C + ch)));
   }
   if (t < (size_t)5 * C) {
     int col = (int)t;
-    if (col < 4 * C) { int part = col / (2 * C), cc = col % (2 * C), ch = cc / 2; bias[t] = (part ? gb : pb)[(cc & 1) * C + ch]; }
-    else bias[t] = lb[col - 4 * C];
+    if (col < 4 * C) { int part = col / (2 * C), cc = col % (2 * C), ch = cc / 2; ptx_st_global_f32(bias + t, ptx_ldg_f32((part ? gb : pb) + (cc & 1) * C + ch)); }
+    else ptx_st_global_f32(bias + t, ptx_ldg_f32(lb + col - 4 * C));
   }
 }
 struct TriFused { const half* wpg; const float* bias; const half* wt; const half* wout; };

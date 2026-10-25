@@ -98,6 +98,7 @@ __device__ __forceinline__ void ptx_st_global_u32(void* p, uint32_t v) {
 __device__ __forceinline__ void ptx_st_global_u16(void* p, unsigned short v) {
   asm volatile("st.global.b16 [%0], %1;" :: "l"(p), "h"(v) : "memory");
 }
+__device__ __forceinline__ void ptx_st_global_b16(void* p, unsigned short v) { ptx_st_global_u16(p, v); }
 __device__ __forceinline__ void ptx_st_global_v2_f32(void* p, float2 v) {
   asm volatile("st.global.v2.f32 [%0], {%1, %2};" :: "l"(p), "f"(v.x), "f"(v.y) : "memory");
 }

@@ -38,14 +38,21 @@ template <class PT> __device__ __forceinline__ float pairLd(const float* p, size
   if constexpr (std::is_same_v<PT, float>) return ptx_ld_global_f32(p + i);
   else return toF(reinterpret_cast<const PT*>(p)[i]);
 }
-template <class PT> __device__ __forceinline__ float4 pairLd4(const float* p, size_t i) {
-  if constexpr (std::is_same_v<PT, float>) return ptx_ld_global_v4_f32(p + i);
+template <class PT> using PairRaw4 = std::conditional_t<sizeof(PT) == 4, float4, uint2>;
+template <class PT> __device__ __forceinline__ PairRaw4<PT> pairLdRaw4(const float* p, size_t i) {
+  if constexpr (sizeof(PT) == 4) return ptx_ld_global_v4_f32(p + i);
+  else return ptx_ld_global_v2_u32(reinterpret_cast<const PT*>(p) + i);
+}
+template <class PT> __device__ __forceinline__ float4 pairUnpack4(PairRaw4<PT> raw) {
+  if constexpr (std::is_same_v<PT, float>) return raw;
   else {
-    uint2 w = ptx_ld_global_v2_u32(reinterpret_cast<const PT*>(p) + i);
-    float2 a = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(w.x) : ptx_f16x2_to_f32x2(w.x);
-    float2 b = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(w.y) : ptx_f16x2_to_f32x2(w.y);
+    float2 a = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(raw.x) : ptx_f16x2_to_f32x2(raw.x);
+    float2 b = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(raw.y) : ptx_f16x2_to_f32x2(raw.y);
     return make_float4(a.x, a.y, b.x, b.y);
   }
+}
+template <class PT> __device__ __forceinline__ float4 pairLd4(const float* p, size_t i) {
+  return pairUnpack4<PT>(pairLdRaw4<PT>(p, i));
 }
 template <class PT> __device__ __forceinline__ void pairSt4(float* p, size_t i, float4 v) {
   if constexpr (std::is_same_v<PT, float>) ptx_st_global_v4_f32(p + i, v);
@@ -236,7 +243,7 @@ __global__ void tileColumnsK(const half* __restrict__ W, int K, int ld, int col0
   size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
   if (e >= (size_t)K * cols) return;
   int c = (int)(e % NC); size_t rest = e / NC; int k = (int)(rest % K), t = (int)(rest / K);
-  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(W + (size_t)k * ld + col0 + t * NC + c);
+  ptx_st_global_v4_u32(out + e, ptx_ldg_v4_u32(W + (size_t)k * ld + col0 + t * NC + c));
 }
 inline void tileColumns(const half* W, int K, int ld, int col0, int cols, int NC, half* out) {
   size_t n8 = (size_t)K * cols / 8;
@@ -264,7 +271,7 @@ __global__ void tileTriInK(const half* __restrict__ Wpg, const half* __restrict_
   size_t f = e - part * seg;
   int c = (int)(f % NC); size_t rest = f / NC; int k = (int)(rest % C), t = (int)(rest / C);
   const half* src = part < 2 ? Wpg + (size_t)k * 4 * C + part * 2 * C + t * NC + c : Wg + (size_t)k * C + t * NC + c;
-  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(src);
+  ptx_st_global_v4_u32(out + e, ptx_ldg_v4_u32(src));
 }
 inline void tileTriIn(const half* Wpg, const half* Wg, int C, int NC, half* out) {
   size_t n8 = (size_t)5 * C * C / 8;
@@ -280,7 +287,7 @@ __global__ void tileTriIn3K(const half* __restrict__ Wp, const half* __restrict_
   const half* src = part == 0 ? Wp + (size_t)k * 2 * C + t * NC + c
                   : part == 1 ? Wgate + (size_t)k * 2 * C + t * NC + c
                               : Wg + (size_t)k * C + t * NC + c;
-  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(src);
+  ptx_st_global_v4_u32(out + e, ptx_ldg_v4_u32(src));
 }
 inline const half* triInTiles(const half* Wp, const half* Wgate, const half* Wg, int C, int NC = 16) {
   static std::map<std::pair<const half*, int>, half*> tiles;
@@ -372,7 +379,7 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;                          // the thread's rows within the block
   size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
-  float m0 = pr0 != SIZE_MAX ? (mask ? __ldg(mask + pr0) : 1.f) : 0.f, m1 = pr1 != SIZE_MAX ? (mask ? __ldg(mask + pr1) : 1.f) : 0.f;
+  float m0 = pr0 != SIZE_MAX ? (mask ? ptx_ldg_f32(mask + pr0) : 1.f) : 0.f, m1 = pr1 != SIZE_MAX ? (mask ? ptx_ldg_f32(mask + pr1) : 1.f) : 0.f;
   const int ch0 = (int)threadIdx.x / (R / 8), r8 = ((int)threadIdx.x % (R / 8)) * 8;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
@@ -387,8 +394,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int col = (gating ? 4 * C + 2 * (j - C / 16) * TI_NC : j * TI_NC) + nt * 8 + tig * 2;
         int qcol = gating ? col + TI_NC : 2 * C + col;
-        bp[nt] = __ldg(reinterpret_cast<const float2*>(bias + col));
-        bq[nt] = __ldg(reinterpret_cast<const float2*>(bias + qcol));
+        bp[nt] = ptx_ldg_v2_f32(bias + col);
+        bq[nt] = ptx_ldg_v2_f32(bias + qcol);
       }
     }
     float p[TI_NC / 8][4] = {}, q[TI_NC / 8][4] = {};
@@ -411,8 +418,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         float b0 = bp[nt].x, b1 = bp[nt].y, g0 = bq[nt].x, g1 = bq[nt].y;
-        p[nt][0] += b0; p[nt][1] += b1; p[nt][2] += b0; p[nt][3] += b1;
-        q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
+        p[nt][0] = ptx_add_f32(p[nt][0], b0); p[nt][1] = ptx_add_f32(p[nt][1], b1);
+        p[nt][2] = ptx_add_f32(p[nt][2], b0); p[nt][3] = ptx_add_f32(p[nt][3], b1);
+        q[nt][0] = ptx_add_f32(q[nt][0], g0); q[nt][1] = ptx_add_f32(q[nt][1], g1);
+        q[nt][2] = ptx_add_f32(q[nt][2], g0); q[nt][3] = ptx_add_f32(q[nt][3], g1);
       }
     }
     if (gating) {                       // t2, row-major: columns (j - C/16)*32 + nt*8 + 2 tig
@@ -422,10 +431,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int c = nt * 8 + tig * 2;
-        *reinterpret_cast<half2*>(Ys + g * LDX + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
-        *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
-        *reinterpret_cast<half2*>(Ys + g * LDX + TI_NC + c) = __floats2half2_rn(q[nt][0], q[nt][1]);
-        *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + TI_NC + c) = __floats2half2_rn(q[nt][2], q[nt][3]);
+        ptx_st_shared_u32(Ys + g * LDX + c, ptx_cvt_f16x2_f32(p[nt][0], p[nt][1]));
+        ptx_st_shared_u32(Ys + (g + 8) * LDX + c, ptx_cvt_f16x2_f32(p[nt][2], p[nt][3]));
+        ptx_st_shared_u32(Ys + g * LDX + TI_NC + c, ptx_cvt_f16x2_f32(q[nt][0], q[nt][1]));
+        ptx_st_shared_u32(Ys + (g + 8) * LDX + TI_NC + c, ptx_cvt_f16x2_f32(q[nt][2], q[nt][3]));
       }
       __syncwarp();
       const int r_base = lane / (W2 / 8), c = (lane % (W2 / 8)) * 8;
@@ -433,16 +442,16 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       for (int i = 0; i < 16 * (W2 / 8) / 32; ++i) {
         int r = i * (32 / (W2 / 8)) + r_base;
         size_t row = row0 + warp * 16 + r;
-        if (row < pp) *reinterpret_cast<uint4*>(t2 + row * C + c0 + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
+        if (row < pp) ptx_st_global_v4_u32(t2 + row * C + c0 + c, ptx_ld_shared_v4_u32(Ys + r * LDX + c));
       }
     } else {
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int ch = nt * 4 + tig;                    // (sigmH: the product is rounded to 16 bits next)
-        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigmH(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigmH(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigmH(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigmH(q[nt][3]) * m1);
+        Ta[ch * LDT + lr0] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[nt][0], sigmH(q[nt][0])), m0));
+        Tb[ch * LDT + lr0] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[nt][1], sigmH(q[nt][1])), m0));
+        Ta[ch * LDT + lr1] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[nt][2], sigmH(q[nt][2])), m1));
+        Tb[ch * LDT + lr1] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[nt][3], sigmH(q[nt][3])), m1));
       }
       __syncthreads();
       if (row0 + r8 < cs) {
@@ -451,8 +460,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
           int ch = ch0 + it * (NTH / (R / 8));
           if ((16 * (R / 8)) % NTH != 0 && ch >= 16) break;
           size_t at = (size_t)(j * 16 + ch) * cs + row0 + r8;
-          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + ch * LDT + r8);
-          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + ch * LDT + r8);
+          ptx_st_global_v4_u32(a + at, ptx_ld_shared_v4_u32(Ta + ch * LDT + r8));
+          ptx_st_global_v4_u32(b + at, ptx_ld_shared_v4_u32(Tb + ch * LDT + r8));
         }
       }
     }
@@ -488,15 +497,15 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
   __syncthreads();
   for (int r = warp; r < R; r += WARPS) {                            // the center norm, a warp a row
     float v[C / 32]; float s = 0.f;
-    for (int k = 0; k < C / 32; ++k) { v[k] = (float)Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, q = 0.f;
-    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = rsqrtf(q / C + 1e-5f);
+    for (int k = 0; k < C / 32; ++k) { v[k] = toF(Ps[(lane + 32 * k) * LDP + r]); s = ptx_add_f32(s, v[k]); }
+    s = ptx_warp_sum_f32(s);
+    float mean = ptx_div_f32(s, (float)C), q = 0.f;
+    for (int k = 0; k < C / 32; ++k) { float d = ptx_sub_f32(v[k], mean); q = ptx_fma_f32(d, d, q); }
+    q = ptx_warp_sum_f32(q);
+    float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f));
     for (int k = 0; k < C / 32; ++k) {
       int c = lane + 32 * k;
-      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * cnScale[c] + cnOffset[c]);
+      ptx_st_shared_u16(Xs + r * LDX + c, ptx_f32_to_f16_raw(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), ptx_ldg_f32(cnScale + c), ptx_ldg_f32(cnOffset + c))));
     }
   }
   __syncthreads();
@@ -526,16 +535,20 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
   for (int et = 0; et < NT; ++et) {
     int c = et * 8 + tig * 2;
     float ob0 = 0.f, ob1 = 0.f;      // (the output projection's bias, where the model has one)
-    if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
+    if constexpr (BIAS) { float2 bf = ptx_ldg_v2_f32(bias + c); ob0 = bf.x; ob1 = bf.y; }
     if (p0 != SIZE_MAX) {
-      float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
+      float2 gt = ptx_f16x2_to_f32x2(ptx_ld_global_u32(t2 + r0 * C + c));
       float2 v = pairLd2<PT>(pair, p0 * C + c);
-      v.x += (acc[et][0] + ob0) * sigmH(gt.x); v.y += (acc[et][1] + ob1) * sigmH(gt.y); pairSt2<PT>(pair, p0 * C + c, v);
+      v.x = ptx_fma_f32(ptx_add_f32(acc[et][0], ob0), sigmH(gt.x), v.x);
+      v.y = ptx_fma_f32(ptx_add_f32(acc[et][1], ob1), sigmH(gt.y), v.y);
+      pairSt2<PT>(pair, p0 * C + c, v);
     }
     if (p1 != SIZE_MAX) {
-      float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
+      float2 gt = ptx_f16x2_to_f32x2(ptx_ld_global_u32(t2 + r1 * C + c));
       float2 v = pairLd2<PT>(pair, p1 * C + c);
-      v.x += (acc[et][2] + ob0) * sigmH(gt.x); v.y += (acc[et][3] + ob1) * sigmH(gt.y); pairSt2<PT>(pair, p1 * C + c, v);
+      v.x = ptx_fma_f32(ptx_add_f32(acc[et][2], ob0), sigmH(gt.x), v.x);
+      v.y = ptx_fma_f32(ptx_add_f32(acc[et][3], ob1), sigmH(gt.y), v.y);
+      pairSt2<PT>(pair, p1 * C + c, v);
     }
   }
 }
@@ -557,7 +570,10 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
   // the center norm's scale and offset, read once: a thread's half row of them was 128 scalar loads a
   // tile from global memory, four times the epilogue's (ncu: lg_throttle the kernel's top stall)
   float* Ns = (float*)(Pst + 2 * C * LDP);                           // [2][C]
-  for (int c = threadIdx.x; c < C; c += NTH) { Ns[c] = cnScale[c]; Ns[C + c] = cnOffset[c]; }
+  for (int c = threadIdx.x; c < C; c += NTH) {
+    ptx_st_shared_f32(Ns + c, ptx_ldg_f32(cnScale + c));
+    ptx_st_shared_f32(Ns + C + c, ptx_ldg_f32(cnOffset + c));
+  }
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t tiles = (pp + R - 1) / R;
   {
@@ -590,17 +606,17 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
     else cpWait<0>();
     // the epilogue's operands, loaded now so the norm and the GEMM cover their latency (one block
     // an SM: nothing else would)
-    auto pairOf = [&](size_t q) -> size_t {
-      if (q >= pp) return SIZE_MAX;
+    auto pairOf = [&](size_t q) -> unsigned {
+      if (q >= pp) return ~0u;
       unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-      return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+      return i < (unsigned)n && j < (unsigned)n ? i * (unsigned)n + j : ~0u;
     };
     // in the epilogue's layout (below): half hh of the columns, piece i - row i * 2 + lane / 16 of the
     // warp's 16, columns hh * 64 + (lane % 16) * 4 .. + 4 - so a load is 16 bytes of pair and 8 of gate,
     // whole rows, where a fragment's layout was 8 and 4 bytes in each of 8 rows (ncu: lg_throttle 35%)
     constexpr int EP = 16 * (C / 2) / 4 / 32;                       // pieces a lane, a half
     static_assert(C == 128 && EP == 8, "the epilogue is laid out for C 128");
-    size_t pe[EP]; float4 pv[2][EP]; uint2 gv[2][EP];
+    unsigned pe[EP]; PairRaw4<PT> pv[2][EP]; uint2 gv[2][EP];
 #pragma unroll
     for (int i = 0; i < EP; ++i) {
       size_t rr = tile * R + warp * 16 + i * 2 + (lane >> 4);
@@ -608,7 +624,7 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 #pragma unroll
       for (int hh = 0; hh < 2; ++hh) {
         int c = hh * (C / 2) + (lane & 15) * 4;
-        if (pe[i] != SIZE_MAX) { pv[hh][i] = pairLd4<PT>(pair, pe[i] * C + c); gv[hh][i] = *reinterpret_cast<const uint2*>(t2 + rr * C + c); }
+        if (pe[i] != ~0u) { pv[hh][i] = pairLdRaw4<PT>(pair, (size_t)pe[i] * C + c); gv[hh][i] = ptx_ld_global_v2_u32(t2 + rr * C + c); }
       }
     }
     __syncthreads();
@@ -622,23 +638,24 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
       int r = threadIdx.x >> 1, cb = (threadIdx.x & 1) * (C / 2);
       float s = 0.f;
 #pragma unroll 8
-      for (int c = cb; c < cb + C / 2; ++c) s += (float)Ps[c * LDP + r];
-      s += __shfl_xor_sync(~0u, s, 1);
-      float mean = s / C, q = 0.f;
+      for (int c = cb; c < cb + C / 2; ++c) s = ptx_add_f32(s, toF(Ps[c * LDP + r]));
+      s = ptx_add_f32(s, ptx_shfl_xor_f32(s, 1));
+      float mean = ptx_div_f32(s, (float)C), q = 0.f;
 #pragma unroll 8
-      for (int c = cb; c < cb + C / 2; ++c) { float d = (float)Ps[c * LDP + r] - mean; q += d * d; }
-      q += __shfl_xor_sync(~0u, q, 1);
-      float inv = rsqrtf(q / C + 1e-5f);
+      for (int c = cb; c < cb + C / 2; ++c) { float d = ptx_sub_f32(toF(Ps[c * LDP + r]), mean); q = ptx_fma_f32(d, d, q); }
+      q = ptx_add_f32(q, ptx_shfl_xor_f32(q, 1));
+      float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f));
 #pragma unroll
       for (int c0 = cb; c0 < cb + C / 2; c0 += 8) {
         uint32_t w[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
           int c = c0 + 2 * e;
-          w[e] = pack2(((float)Ps[c * LDP + r] - mean) * inv * Ns[c] + Ns[C + c],
-                       ((float)Ps[(c + 1) * LDP + r] - mean) * inv * Ns[c + 1] + Ns[C + c + 1]);
+          float2 ns = ptx_ld_shared_v2_f32(Ns + c), no = ptx_ld_shared_v2_f32(Ns + C + c);
+          w[e] = ptx_cvt_f16x2_f32(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(toF(Ps[c * LDP + r]), mean), inv), ns.x, no.x),
+                                   ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(toF(Ps[(c + 1) * LDP + r]), mean), inv), ns.y, no.y));
         }
-        *reinterpret_cast<uint4*>(Xs + r * LDX + c0) = make_uint4(w[0], w[1], w[2], w[3]);
+        ptx_st_shared_v4_u32(Xs + r * LDX + c0, make_uint4(w[0], w[1], w[2], w[3]));
       }
     }
     __syncthreads();
@@ -673,24 +690,24 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 #pragma unroll
       for (int e8 = 0; e8 < NT / 2; ++e8) {
         int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
-        *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[et][0], acc[et][1]);
-        *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[et][2], acc[et][3]);
+        ptx_st_shared_v2_f32(Ys + g * LDY + c, acc[et][0], acc[et][1]);
+        ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[et][2], acc[et][3]);
       }
       __syncwarp();
 #pragma unroll
       for (int i = 0; i < EP; ++i) {
-        if (pe[i] == SIZE_MAX) continue;
+        if (pe[i] == ~0u) continue;
         int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = hh * (C / 2) + cl;
-        float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl), v = pv[hh][i];
-        float2 g01 = __half22float2(*reinterpret_cast<const half2*>(&gv[hh][i].x));
-        float2 g23 = __half22float2(*reinterpret_cast<const half2*>(&gv[hh][i].y));
+        float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl), v = pairUnpack4<PT>(pv[hh][i]);
+        float2 g01 = ptx_f16x2_to_f32x2(gv[hh][i].x);
+        float2 g23 = ptx_f16x2_to_f32x2(gv[hh][i].y);
         if constexpr (BIAS) {
-          float4 b4 = *reinterpret_cast<const float4*>(bias + c);
-          a4.x += b4.x; a4.y += b4.y; a4.z += b4.z; a4.w += b4.w;
+          float4 b4 = ptx_ldg_v4_f32(bias + c);
+          a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
         }
-        v.x += a4.x * sigmH(g01.x); v.y += a4.y * sigmH(g01.y);
-        v.z += a4.z * sigmH(g23.x); v.w += a4.w * sigmH(g23.y);
-        pairSt4<PT>(pair, pe[i] * C + c, v);
+        v.x = ptx_fma_f32(a4.x, sigmH(g01.x), v.x); v.y = ptx_fma_f32(a4.y, sigmH(g01.y), v.y);
+        v.z = ptx_fma_f32(a4.z, sigmH(g23.x), v.z); v.w = ptx_fma_f32(a4.w, sigmH(g23.y), v.w);
+        pairSt4<PT>(pair, (size_t)pe[i] * C + c, v);
       }
       __syncwarp();
     }
@@ -1239,7 +1256,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
   constexpr int EP = 16 * (C / 2) / 4 / 32, LPR = 32 / (C / 8);
   static_assert((C == 64 || C == 128) && WD == C, "the epilogue is laid out for C 64 or 128");
   const int rl0 = lane / (C / 8), cl0 = (lane % (C / 8)) * 4;
-  unsigned pe[EP]; float4 pv[2][EP];
+  unsigned pe[EP]; PairRaw4<PT> pv[2][EP];
 #pragma unroll
   for (int i = 0; i < EP; ++i) {
     size_t q = row0 + warp * 16 + i * LPR + rl0;
@@ -1247,7 +1264,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
       unsigned Q = (unsigned)(q0 + q), a = Q / (unsigned)n;           // 32-bit: a 64-bit divide is ~70 instructions
       pe[i] = tr ? (Q - a * (unsigned)n) * (unsigned)n + a : Q;
 #pragma unroll
-      for (int hh = 0; hh < 2; ++hh) pv[hh][i] = pairLd4<PT>(pair, (size_t)pe[i] * C + hh * (C / 2) + cl0);
+      for (int hh = 0; hh < 2; ++hh) pv[hh][i] = pairLdRaw4<PT>(pair, (size_t)pe[i] * C + hh * (C / 2) + cl0);
     } else pe[i] = ~0u;
   }
   cpWait<0>();
@@ -1327,7 +1344,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     for (int i = 0; i < EP; ++i) {
       if (pe[i] == ~0u) continue;
       int rl = i * LPR + rl0;
-      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0), v = pv[hh][i];
+      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0), v = pairUnpack4<PT>(pv[hh][i]);
       if (ob) {
         float4 b4 = ptx_ldg_v4_f32(ob + hh * (C / 2) + cl0);
         a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
