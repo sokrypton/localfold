@@ -340,18 +340,22 @@ if (args.includes("--encoder")) {
 // 🔴 ONLY 35 OF THE 897 SEQUENCE COLUMNS CHANGE FROM STEP TO STEP - the three of `xt_bb_ca` and the
 // thirty-two of `xt_local_latents`, at offsets 0 and 3 - so the features are exported once and the
 // port overwrites those columns on the device. That is the same condition `webgpu/rfd4p/generate.js`
-// tests before it takes its own on-device step loop (`caOff === 0 && latOff === 3`), and it holds
-// only while there are no coordinate groups to permute and no chirality frames: both are empty for
-// an unconditional monomer and this export REFUSES anything else rather than silently freezing a
-// feature that should move.
+// tests before it takes its own on-device step loop (`caOff === 0 && latOff === 3`). The two
+// features that also move per step are handled rather than frozen: a chirality frame is
+// recomputed on the device each step (`src/chirality.cuh`) and a coordinate group's LABELS are
+// permuted from a replayed `randperm` stream (`crdUniq`/`crdPerm`). The rule that matters is that
+// a per-step feature is replayed or recomputed and NEVER silently frozen - freezing one is a
+// plausible structure generated from a feature the model was supposed to see move.
 //
 // The pair features go out without their distance bins (the first 30 columns), which the port fills
 // from the current CA each step.
 if (generate) {
-  // 🔴 WHAT STILL REFUSES IS A COORDINATE GROUP, and only that. The chirality alignment also moves
-  // between steps and used to be refused with it; the port recomputes it on the device now
-  // (src/chirality.cuh), which is what lets the small-molecule preset generate at all. A coordinate
-  // group's permutation is a `randperm` draw a step and is not done.
+  // 🔴 NOTHING REFUSES HERE ANY MORE, AND THIS COMMENT SAID TWO THINGS DID. The chirality
+  // alignment moves between steps and the port recomputes it on the device (src/chirality.cuh),
+  // which is what lets the small-molecule preset generate at all; a coordinate group's
+  // permutation is a `randperm` draw at the top of every step and is exported beside the noise
+  // (`crdUniq`/`crdPerm` below). The paragraph above still states the RULE - a per-step feature
+  // is replayed or recomputed, never silently frozen - which is the part worth keeping.
   const alignsChirality = nn.noise_align_chirality && (cache.activeFrames?.length ?? 0) > 0;
   // 🔴 A PARTIAL RUN'S STEP COUNT, SCHEDULE AND RECYCLE DEPTHS ARE ALL DIFFERENT, and they are
   // derived here exactly as `generateRfd4pCpu` derives them rather than guessed from the preset.

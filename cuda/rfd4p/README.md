@@ -332,9 +332,10 @@ JavaScript at all** - and its PDB is byte-identical to the one the exporter's ow
 produces.
 
 `gate.py`'s `featurise` arm holds both directories to `export_input.mjs` **field by field, as
-bytes** - fifteen cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure
-preset, a RANGED contig at four seeds, a THREE-CHAIN one at two, and a job with a protein, a DNA
-and an RNA chain in it. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
+bytes** - eighteen cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure
+preset, a RANGED contig at four seeds, a THREE-CHAIN one at two, a job with a protein, a DNA
+and an RNA chain in it, two that name an input STRUCTURE (with a contig and without), and one
+with three COORDINATE GROUPS, whose labels are permuted afresh at the top of every step. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
 merely agrees closely is a second, slightly different model.
 
 🔴 **AND A SEGMENT'S LENGTH IS DRAWN EVEN WHEN ITS RANGE IS A POINT.** Skipping the draw when
@@ -526,15 +527,15 @@ residues the cropped example does not contain, so building one from the spec fai
     with every number the page produces.
   - ~~**`transforms.js` with real atoms**~~ **done, all fourteen stages** - the same pipeline
     the spec path already ran, but with every branch a contig's `<M>` stubs made inert now
-    live. Held to the reference over sixteen cases: the seven shipped structures and nine the
+    live. Held to the reference over twenty-two cases: the seven shipped structures and fifteen the
     gate synthesises, because the shipped seven could not reach most of it (see the three
-    findings below the table). `convertToProteinaBatch` (1175-1606) is ported too, so a
+    findings below the table) - four of the fifteen built this session purely to make the mmCIF READER's own filters reachable. `convertToProteinaBatch` (1175-1606) is ported too, so a
     structure now reaches the batch the model reads - 46 keys held to the reference over all
-    seventeen cases. Zstandard is native too (`cuda/featurise/zstd.h`,
+    twenty-two cases. Zstandard is native too (`cuda/featurise/zstd.h`,
     dlopen'd like `common.cuh`'s blob reader), so the page's own `.cif.zst` goes straight into
     the binary and the gate drives all seven that way as well as decompressed. `applyContig` takes PRESERVED segments now
     (`featurise/contig.h`), so a contig against a real structure assembles natively - five
-    contigs over each of the seventeen cases, compared column by column with the bonds and
+    contigs over each of the twenty-two cases, compared column by column with the bonds and
     `originalResId`. The selection language reads real atoms too
     (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
     which is what every structure preset writes and what the contig-only subset could not say.
@@ -569,6 +570,55 @@ residues the cropped example does not contain, so building one from the spec fai
     permutation entries; placing it after the noise moves 45. Freezing the labels moves 909 of
     `in/seq`'s 104052. All three watched failing, and the step-0 permutation is in `in/seq`
     itself - which is why the stream is drawn before the features rather than beside the noise.
+
+    🔴 **AND THREE OF THE mmCIF READER'S RULES ARE FILTERS NO SHIPPED STRUCTURE CAN TRIP.**
+    Scanned over the seven: every file is **model 1 alone**, every `label_alt_id` is **`.`**,
+    and `label_seq_id` equals `auth_seq_id` in **every row of every file**. So the model
+    filter, the altloc filter and the `label_*`-wins rule were ported from reading the
+    reference and gated by nothing - and each fails silently rather than loudly. Three
+    structures now build a file that trips them, each watched failing on itself and on nothing
+    else: without the model filter `sm_sam+twomodels` is **132 atoms against 66**, without the
+    altloc skip `motif_idx_1prw+altloc` is **330 against 306**, and taking `auth_seq_id` moves
+    `res_id` in all 306 of `motif_idx_1prw+authnum`, eight selections, every condition - and
+    **refuses six contigs outright** with `Preserved segment 'A1-6' matched no atoms`. That
+    last is the shape worth knowing: the wrong column does not make a wrong structure, it
+    makes a REFUSAL, which reads as a malformed job rather than as a reader bug.
+
+    🔴 **AND A FOURTH: THE LEGACY `mask_*` COLUMNS, WHERE IGNORING A COLUMN YOU DO NOT KNOW IS
+    GREEN ON EVERY FILE AND MEANS THE OPPOSITE.** `mask_index_1_residue`,
+    `mask_sequence_1_residue` and `mask_coordinate_1_atom` are BOOLEANS that rewrite the
+    `condition_*` annotations - where the sequence mask is set the condition becomes the
+    residue's own name and where it is not it becomes `<M>` - so a file written the old way
+    conditions the model on everything exactly where a reader that skipped the columns would
+    condition it on nothing. No shipped structure carries one. `motif_idx_1prw+legacymask`
+    does, and skipping the index rewrite alone is watched failing on the ANNOTATION KEY SET
+    and on five contigs' `condition_index`. The corpus is **22 structures** now.
+
+    🔴 **AND TWO OF `superpose.h`'s FIVE CONVENTIONS ARE NOT WHAT THE FILE SAID THEY WERE.**
+    The header claimed three things were "the reference's and not the textbook's" and that a
+    port writing the textbook version "disagrees on more than half of a random sweep". Mutated
+    ONE AT A TIME against the gate's own 240 point sets, they are nothing like each other:
+
+    | mutation of `src/superpose.h` | differing of 240 | worst element | where |
+    |---|---:|---:|---|
+    | the eigenvectors not forced right-handed | **114** | 1.94 | every n |
+    | U's third column as a third singular vector | **99** | 1.92 | every n |
+    | `det(H)`'s sign ignored | **90** | 1.92 | every n |
+    | the textbook Jacobi (two full matrix products) | **29** | 0.97 | **n = 2 only** |
+    | a negative eigenvalue not clamped to zero | **0** | - | nowhere |
+    | ...and the `sqrt`-site guard removed as well | **0** | - | nowhere |
+    | the three "reference, not textbook" ones together | 125 | | |
+
+    The "more than half" was the three TOGETHER. The partial Jacobi update moves only
+    rank-deficient inputs - two centred points are collinear, so the rotation about that line
+    is not determined by the data and either answer is as good; it is still ported exactly
+    because the two sides are held to the same bytes, but it decides no structure. And the
+    eigenvalue clamp is **inert, and cannot be anything else**: a negative eigenvalue does come
+    up, 41 times in that sweep, but it lands in slot 2 thirty-seven times - whose vector is
+    never read, because U's third column is a cross product, so the two conventions are
+    connected and the second kills the first - and in slot 1 four times, where the clamped 0
+    and the unclamped NaN both fail `sigma > 1e-9` and take the same complement branch. Three
+    of the five are load-bearing at every point count; the file now says which.
 
     🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
     in-context conditioning that the sampler never generates, and the reference writes only the
@@ -752,7 +802,7 @@ residues the cropped example does not contain, so building one from the spec fai
     The native side has the driver now (`featurise.cpp`'s `runValidationPipeline`) and the gate
     drives the reference's own, so a stage added to either is in the comparison without anyone
     remembering to add it. The missing call turned out to be INERT - that stage changes neither
-    `atomize` nor the residue boundaries, and removing it leaves all seventeen green - so this
+    `atomize` nor the residue boundaries, and removing it leaves all eighteen green (of the eighteen then in the corpus) - so this
     found no wrong answer, only an instrument that could not have found one.
 
     🔴 **AND `sel(a),sel(b)` IS NOT `sel(a)|sel(b)`.** The pipe is a union; the COMMA makes the
@@ -764,9 +814,28 @@ residues the cropped example does not contain, so building one from the spec fai
     `selection.h`, that cannot produce a wrong fold either way. Four conventions were watched
     failing - a descending range read ascending (9 cases), atom names expanding a hyphen as a
     range (17), `*` matched as a literal (17), and a later term overwriting instead of
-    unioning (9) - and two are provably inert and say so: the already-matched skip, since the
-    loop only ever SETS a bit, and the residue-number normalisation, since every preset writes
-    clean numbers.
+    unioning (9).
+
+    🔴 **AND TWO OF THOSE FOUR WERE SAID TO BE COVERED AND WERE NOT, BECAUSE THE SELECTIONS
+    CAME FROM THE PRESETS AND THE PRESETS ONLY WRITE THE EASY FORMS.** Counted: **117 distinct
+    atom names over the shipped structures and not one has a hyphen**, so the 17 cases above
+    for "atom names expanding a hyphen" cannot have been that rule - a mutation of a branch no
+    input reaches reddens nothing, so whatever that arm changed, it changed something else as
+    well (dropping `isResId` entirely also pushes every atom name through `atoi`, which turns
+    `CA` into `0` and reddens everything). The count was real and the attribution was reading
+    the mutation rather than the corpus. Likewise the residue-number normalisation was written
+    down as "provably inert, since every preset writes clean numbers" - true of the presets,
+    and an excuse rather than a measurement.
+
+    Nine selection forms nothing could reach are in the corpus now - a bare residue number, a
+    bare hyphenated one, a zero-padded one alone and in a spaced list, an atom-name list, one
+    whose item carries a hyphen, a chain list, and the transformation field both ways. Four
+    rules, each watched failing at **9 of the 18 structures then in the corpus** with a mutation that touches only it: a
+    hyphenated ATOM NAME split in two, a BARE `1-3`
+    expanded as a range where it is the single value 1, a zero-padded `[0054]` left
+    unnormalised, and the `transformation_id` default moved from `"1"` to `"2"` (checked both
+    ways - `.../1` is every atom, `.../2` is none). The already-matched skip remains genuinely
+    inert and still says so: that loop only ever SETS a bit.
 
     🔴 **AND `applyConditions`' ARMS ARE APPLIED IN JSON ORDER, WHICH A `std::map` DESTROYS.**
     A `C_CRD` with a `true` arm over a chain and a `false` arm over two of its residues is one
@@ -778,11 +847,19 @@ residues the cropped example does not contain, so building one from the spec fai
     gains a trailing `.x`, so `3.40.50` is stored `3.40.50.x` - the fourth level unnamed means
     ANY, not missing (13 cases).
 
+    🔴 **AND THE CATH RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS THE ONLY THING ONE CODE CAN
+    SAY.** The reference is `if (!cathStr.endsWith('.x')) cathStr += '.x'`, so a COMPLETE
+    four-level code gains a FIFTH field - `3.40.50.20` is stored `3.40.50.20.x` - and a
+    one-level `3` becomes `3.x`, not `3.x.x.x`. All four shapes are in the corpus now, and the
+    pad-to-four reading was watched failing at **14 of those same 18** - naming `cath-4` and `cath-1` and
+    agreeing on `3.40.50`, which is the whole point: on the one code the presets write, the
+    wrong rule is indistinguishable from the right one.
+
     🔴 **AND THE GATE COULD NOT SEE THE RESIDUE-NUMBER SWAP, TWICE OVER.** `applyConditions`
     evaluates selections against the INPUT's numbering - `applyContig` renumbers every
     preserved segment from 1 - and puts the assembled numbering back at the end. Running
     conditions with `originalResId` equal to `res_id` makes BOTH identity, so deleting either
-    left all seventeen green. A case in the pipeline's real order (contig, then conditions)
+    left all eighteen green (of the eighteen then in the corpus). A case in the pipeline's real order (contig, then conditions)
     reddens the swap on 2 structures, and dumping `res_id` reddens the restore on 8. Same root
     cause as the four above: **an input on which the thing under test cannot act**.
 
@@ -813,24 +890,26 @@ residues the cropped example does not contain, so building one from the spec fai
     field nothing else looks at, so the gate round-trips every structure:
     `concat(slice(0, k), slice(k, n))` must reproduce the dump byte for byte, at four split
     points including ones that cut a residue and a bond in half.
-  - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
-    constrain once there are residues and atoms.
+  - ~~the selection language in full (`chain/res_name/res_id/atom_name`)~~ **done**
+    (`featurise/selection.h`); it only had anything to constrain once there were residues and
+    atoms, which is why it waited for the mmCIF reader.
 
   🔴 **AND THE THING TO CHECK FIRST IS THE RNG ORDER**, not the chemistry: `materializeInternalCoords`
   draws `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes its own path,
   both of which a contig never reaches - and this port has already been bitten twice by a draw
   that happens when it looks as though it should not.
-- **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
-  group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
-  shipped preset has one.
-- **Mapping an insertion back onto the input structure** (`processSampleToAtoms`'s `inputAtoms`
-  path, with the Hungarian assignment). The port writes its own records.
+- ~~**An input with COORDINATE GROUPS to permute**~~ **done** (`894b684f`): the relabelling is a
+  `randperm` draw at the top of every step and is replayed like the noise. No shipped preset has
+  one, so `gate-crdgroups.json` builds a three-group case.
+- ~~**Mapping an insertion back onto the input structure**~~ **done**: the trunk's own insertion
+  head with a geometric CA-distance fallback (`src/assign.h`, `resolveInsertion`), and the output
+  aligned onto the conditioned frame.
+- ~~**The selection language in full**~~ **done** (`featurise/selection.h`), as a stated SUBSET -
+  a union of `sel(...)` joined by `|`, with a comma between terms refused by name.
+- ~~**Anything but an unconditional monomer through `--generate`**~~ **done**: both per-step
+  features are handled rather than refused - a chirality frame recomputed on the device, a
+  coordinate group's labels permuted from a replayed stream.
 - **A padded input**, so the masking paths are written and unexercised.
-- **Anything but an unconditional monomer through `--generate`.** The export REFUSES an input whose
-  per-step features are more than the noised state, rather than silently freezing a feature that
-  should move - coordinate groups to permute and chirality frames both move per step and neither is
-  handled. That is the same condition `webgpu/rfd4p/generate.js` tests before taking its own
-  on-device loop.
 - **The C++ random source.** Box-Muller runs through V8's `Math.log`, and `cuda/featurise/jsmath.h`
   carries sin and cos but no log, so the noise is REPLAYED from the exporter rather than redrawn:
   one ulp in one draw diverges a sixty-step trajectory. The draw ORDER is a function of the schedule

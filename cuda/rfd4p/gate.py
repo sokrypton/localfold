@@ -564,9 +564,13 @@ def main() -> int:
             # 🔴 AND THE KABSCH SUPERPOSITION, which puts a generated structure back into the
             # INPUT's frame. Without it a motif design is a correct structure in the wrong
             # place, which superposes on nothing and which no bond length, clash score or chain
-            # check can see. Three of its conventions are the reference's own and not the
-            # textbook's, and a port that wrote the textbook version differed on more than half
-            # of a random sweep.
+            # check can see. Four of its conventions are the reference's own and not the
+            # textbook's, and this sweep is what prices them: mutated one at a time it is 114 of
+            # 240 for forcing the eigenvectors right-handed, 99 for U's third column being a
+            # cross product, 90 for det(H)'s sign, and 29 - all of them n = 2, where the rotation
+            # is not determined by the data - for the partial Jacobi update. A fifth, clamping a
+            # negative eigenvalue, is 0 of 240; see the comment in src/superpose.h for why it
+            # cannot be anything else.
             sprobe = HERE / "featurise" / "superpose-probe"
             if sprobe.exists():
                 bad_sp, n_sp = 0, 0

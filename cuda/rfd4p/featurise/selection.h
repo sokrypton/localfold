@@ -144,7 +144,15 @@ inline vector<uint8_t> evalPathSelection(const atoms::AtomArray& a, const string
       if (!mResId.empty() && !mResId.count(std::to_string(a.site.resId[i]))) continue;
       if (!mAtom.empty() && !mAtom.count(a.site.atomName[i])) continue;
       // 🔴 `transformation_id` IS "1" WHERE THE READER DID NOT SET ONE, not absent - the
-      // reference defaults it the same way, and a selection that names it must match that.
+      // reference defaults it the same way (`cif.js` fills the column with "1" outright), and a
+      // selection that names it must match that. Checked both ways on all eighteen structures:
+      // `.../1` is every atom and `.../2` is none.
+      //
+      // 🔴 AND IT IS A CONSTANT HERE RATHER THAN A COLUMN, WHICH IS ONLY SAFE BECAUSE THIS PORT
+      // DOES NOT EXPAND AN ASSEMBLY. `prepare.js` writes a copy's operation into
+      // `transformation_id` and then renames every chain `<chain>_<id>`; the day that path is
+      // ported, this line is a silent wrong answer on every selection that names a copy, and
+      // the corpus above cannot see it because no file it reads has a second copy.
       if (!mTrans.empty() && !mTrans.count("1")) continue;
       out[i] = 1;
     }

@@ -385,6 +385,14 @@ inline AtomSite readAtomSite(const Block& block) {
   // with twenty NMR models would otherwise come through twenty times over, and a residue with two
   // conformations twice. The altloc key is the reference's - `label_asym`, `label_seq`,
   // `auth_seq`, `label_comp`, `label_atom` - and the FIRST row with a given key wins.
+  //
+  // 🔴 AND NEITHER FILTER COULD FIRE ON ANYTHING THIS GATE READ. Scanned over the seven shipped
+  // structures: every one is model 1 alone and every `label_alt_id` is `.`, so both were ported
+  // from the reference and gated by nothing. `sm_sam+twomodels` and `motif_idx_1prw+altloc`
+  // build a file that trips them, and each is watched failing: without the model filter the
+  // first is **132 atoms against 66**, without the altloc skip the second is **330 against
+  // 306**. The altloc case writes the DISPLACED conformation first, because a port that kept
+  // the last row rather than the first agrees whenever they happen to be in written order.
   const vector<string>* modelNums = column("pdbx_PDB_model_num");
   const vector<string>* altIds = column("label_alt_id");
   const string firstModel = modelNums && !modelNums->empty() ? (*modelNums)[0] : string();
@@ -407,6 +415,14 @@ inline AtomSite readAtomSite(const Block& block) {
   // `safeInt(label_seq_id, -1)` for the residue number - writing it the other way round is the
   // obvious guess and it is wrong, and on a file where the two numberings differ it renumbers
   // every residue a contig names.
+  //
+  // 🔴 AND THE TWO NUMBERINGS ARE EQUAL IN EVERY ROW OF EVERY SHIPPED FILE, so this said
+  // "renumbers every residue a contig names" with nothing able to show it.
+  // `motif_idx_1prw+authnum` puts them 500 apart, and taking `auth_seq_id` there is watched
+  // failing on `res_id` in all 306 atoms, on eight selections, on every condition - and on
+  // SIX CONTIGS, each refused outright with "Preserved segment 'A1-6' matched no atoms". That
+  // last is the shape worth knowing: the wrong column does not produce a wrong structure, it
+  // produces a REFUSAL, which reads as a malformed job rather than as a reader bug.
   AtomSite a;
   a.n = selected.size();
   for (size_t k = 0; k < a.n; ++k) {
@@ -471,6 +487,14 @@ inline AtomSite readAtomSite(const Block& block) {
  * BECOMES `condition_index_1_residue`, and `mask_sequence_1_residue` turns the residue's own name
  * into its sequence condition where the mask is set and `<M>` where it is not - so a file written
  * the old way means the opposite of what reading the columns separately would give.
+ *
+ * 🔴 AND NO SHIPPED STRUCTURE CARRIES ONE, so all three rewrites were ported from the reference
+ * and gated by nothing. `motif_idx_1prw+legacymask` writes the three columns in place of the
+ * conditions, and skipping the index rewrite alone is watched failing on the ANNOTATION KEY SET
+ * (`mask_index_1_residue` left where `condition_index_1_residue` should be) and on five contigs'
+ * `condition_index`. A port that merely ignored a column it did not know would be green on
+ * every file here and would condition the model on nothing where the file conditions it on
+ * everything.
  */
 struct Annotations {
   std::map<string, vector<int>> ints;        // int and bool columns

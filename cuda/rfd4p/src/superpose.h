@@ -30,12 +30,29 @@ struct Fit {
 /**
  * `jacobiEigen3x3`, exactly as `output.js` has it.
  *
- * 🔴 THREE THINGS HERE ARE THE REFERENCE'S AND NOT THE TEXTBOOK'S, and a port that writes the
- * textbook version disagrees on more than half of a random sweep: the rotation updates only the
- * four entries it touches plus the third row and column (not two full matrix products), a
- * negative eigenvalue is CLAMPED to zero, and the eigenvector matrix is forced to a right-handed
- * frame by negating its third column when the determinant is negative. The last of those is the
- * one that changes the answer rather than its last digit.
+ * Three things here are the reference's and not the textbook's, and all three put together
+ * disagree on 125 of the gate's 240 point sets - which is where this comment's old claim that
+ * "the textbook version disagrees on more than half" came from. Mutated ONE AT A TIME against
+ * the same sweep, they are nothing like each other:
+ *
+ * 🔴 **FORCING THE EIGENVECTOR MATRIX RIGHT-HANDED IS THE ONE THAT MATTERS: 114 of 240**, at
+ * every point count, a rotation element moving by up to 1.94. Negating the third column when
+ * det(V) < 0 is not a tidy-up.
+ *
+ * **The partial rotation update is 29 of 240 AND ALL 29 ARE n = 2.** Writing it as two full
+ * matrix products is the same arithmetic in a different order, and the only inputs it moves are
+ * the rank-deficient ones - two centred points are collinear, so the rotation about that line is
+ * not determined by the data and either answer is as good. It must still be ported exactly,
+ * because the two sides are held to the same bytes; it is not a convention that decides a
+ * structure.
+ *
+ * 🔴 **AND CLAMPING A NEGATIVE EIGENVALUE TO ZERO IS INERT - 0 of 240, and so is removing the
+ * sqrt-site guard beside it, and so is removing BOTH.** Not because it never happens: a negative
+ * eigenvalue comes up 41 times in that sweep. It lands in slot 2 thirty-seven times, whose vector
+ * `superimpose` never reads because U's third column is a CROSS PRODUCT - the two conventions are
+ * connected, and the second is what kills the first - and in slot 1 four times, where the clamped
+ * 0 and the unclamped NaN both fail `sigma > 1e-9` and take the same complement branch. Kept
+ * because the reference has it, written down as measured rather than as a 🔴 nobody can falsify.
  */
 inline void jacobiEigen(const double in[9], double values[3], double vectors[9]) {
   double a[9];
@@ -98,6 +115,11 @@ inline double det3(const double m[9]) {
  * eigendecomposition and then "fixing the determinant" is the usual recipe and is NOT this one:
  * where the smallest singular value is near zero its vector is numerical noise, and the cross
  * product is defined there while the eigenvector is not.
+ *
+ * Both halves measured one at a time on the gate's 240 point sets, at every point count from 2
+ * to 200: the third singular vector in place of the cross product is **99 differing**, and
+ * taking det(H)'s sign as always positive is **90**, each moving a rotation element by up to
+ * 1.92. These two are load-bearing where two of jacobiEigen's three are not.
  */
 inline Fit superimpose(const vector<double>& fixed, const vector<double>& mobile) {
   Fit out;

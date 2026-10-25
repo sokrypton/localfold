@@ -68,12 +68,25 @@ rfbin="$here/rfd4p/featurise/rfd4p-featurise"
 # path lives in three more (`atoms.h`, `cif.h`, `chirality.h`), so a change to a transform stage
 # left the binary untouched and the gate diffed the PREVIOUS build against the new reference -
 # green or red for reasons nothing in the diff explains.
-rfstamp="$(cat "$here"/rfd4p/featurise/featurise.cpp "$here"/rfd4p/featurise/tables.inc \
-  "$here"/rfd4p/featurise/assign-probe.cpp "$here"/rfd4p/src/assign.h \
-  "$here"/rfd4p/featurise/superpose-probe.cpp "$here"/rfd4p/src/superpose.h \
-  "$here"/rfd4p/featurise/atoms.h "$here"/rfd4p/featurise/cif.h \
-  "$here"/rfd4p/featurise/chirality.h \
-  "$here"/rfd4p/src/schedule.h "$here"/featurise/jsmath.h "$here"/featurise/json.h \
+# 🔴 GLOBBED, NOT ENUMERATED, BECAUSE THIS LIST WENT STALE TWICE AND BOTH TIMES THE GATE DIFFED
+# A BINARY NOBODY HAD BUILT. First it named five files while `atoms.h`, `cif.h` and
+# `chirality.h` were outside it; then it named those and the structure path landed in
+# `selection.h`, `contig.h` and `conditions.h`, which were outside it too - so a mutation left
+# in `selection.h` survived a clean `build.sh rfd4p` and the `cif` arm reported the SELECTION
+# LANGUAGE inverted on nine structures with the source plainly correct. A hand-written list of
+# inputs is a list that falls behind the code; the FOLD binary's stamp below already globs this
+# directory, and these two must not disagree about what the featuriser is made of.
+#
+# 🔴 AND A STAMP SAYS THE SOURCES HAVE NOT MOVED, NOT THAT THIS BINARY CAME FROM THEM. A
+# falsification run that compiles `featurise.cpp` by hand writes the binary and leaves the stamp
+# alone, so the next `build.sh` matches the stamp, skips the build, and the gate measures the
+# MUTATION with every source restored and `git status` clean - which is how the `cif` arm was
+# read twice as a defect in one sitting. `rm <binary>.stamp` after any hand build; mutate
+# through a scratch copy where you can.
+rfstamp="$(cat "$here"/rfd4p/featurise/*.cpp "$here"/rfd4p/featurise/*.h \
+  "$here"/rfd4p/featurise/*.inc \
+  "$here"/rfd4p/src/assign.h "$here"/rfd4p/src/superpose.h "$here"/rfd4p/src/schedule.h \
+  "$here"/featurise/*.h \
   | sha256sum | cut -c1-16)"
 if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; then
   # ...and the same code as an object the fold links, by the same g++ with the same flags, so a

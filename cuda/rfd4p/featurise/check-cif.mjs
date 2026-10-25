@@ -115,6 +115,146 @@ function withCoordinateGroups(text, count = 12) {
 }
 
 /**
+ * The atom_site loop of a file, as a thing that can be rewritten row by row.
+ *
+ * 🔴 FOUR OF `cif.h`'s RULES ARE FILTERS AND NO SHIPPED STRUCTURE CAN TRIP ONE. Scanned over
+ * the seven: every file is **model 1 only**, every `label_alt_id` is `.`, `label_seq_id`
+ * equals `auth_seq_id` in **every row of every file**, and not one carries a legacy `mask_*`
+ * column. So the model filter, the altloc filter, the `label_*`-wins rule and the legacy
+ * rewrite were all ported from reading the reference and gated by nothing - and each of them
+ * fails SILENTLY: twenty NMR models come through twenty times over, a two-conformation
+ * residue twice, and a file whose two numberings differ gets every residue a contig names
+ * renumbered. These three builders are what make them reachable.
+ */
+function atomSiteLoop(text) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  if (head < 0) throw new Error("no atom_site loop");
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  let last = end;
+  const rows = [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length) break;
+    rows.push(tok);
+    last = i + 1;
+  }
+  return { lines, head, end, last, cols, rows };
+}
+
+function writeAtomSite(L, rows) {
+  return [...L.lines.slice(0, L.end), ...rows.map((r) => r.join(" ")),
+          ...L.lines.slice(L.last)].join("\n");
+}
+
+/**
+ * The same structure with a SECOND MODEL appended - every atom again, displaced, under
+ * `pdbx_PDB_model_num` 2. A reader that does not filter returns twice the atoms.
+ */
+function withSecondModel(text) {
+  const L = atomSiteLoop(text);
+  const m = L.cols.indexOf("pdbx_PDB_model_num");
+  const id = L.cols.indexOf("id");
+  const xyz = ["Cartn_x", "Cartn_y", "Cartn_z"].map((c) => L.cols.indexOf(c));
+  if (m < 0 || xyz.some((k) => k < 0)) throw new Error("no model column to duplicate");
+  const second = L.rows.map((r, k) => {
+    const t = [...r];
+    t[m] = "2";
+    if (id >= 0) t[id] = String(L.rows.length + k);
+    for (const c of xyz) t[c] = (Number(t[c]) + 7.5).toFixed(3);
+    return t;
+  });
+  return writeAtomSite(L, [...L.rows, ...second]);
+}
+
+/**
+ * The same structure with the first `count` atoms given TWO conformations - altloc `A` as
+ * written and altloc `B` displaced, the B row FIRST so that taking the last would be visible.
+ */
+function withAltLocs(text, count = 24) {
+  const L = atomSiteLoop(text);
+  const alt = L.cols.indexOf("label_alt_id");
+  const xyz = ["Cartn_x", "Cartn_y", "Cartn_z"].map((c) => L.cols.indexOf(c));
+  const occ = L.cols.indexOf("occupancy");
+  if (alt < 0 || xyz.some((k) => k < 0)) throw new Error("no altloc column");
+  const out = [];
+  for (let i = 0; i < L.rows.length; i += 1) {
+    const r = [...L.rows[i]];
+    if (i < count) {
+      const b = [...r];
+      b[alt] = "B";
+      for (const c of xyz) b[c] = (Number(b[c]) + 1.25).toFixed(3);
+      if (occ >= 0) { b[occ] = "0.4"; r[occ] = "0.6"; }
+      r[alt] = "A";
+      // 🔴 THE DISPLACED ONE FIRST. The reference keeps the FIRST row for an altloc key, so a
+      // port that kept the last would differ only when the two are not in written order.
+      out.push(b, r);
+    } else {
+      out.push(r);
+    }
+  }
+  return writeAtomSite(L, out);
+}
+
+/**
+ * The same structure with `auth_seq_id` shifted 500 off `label_seq_id`, so the two numberings
+ * disagree in every row and the reader must demonstrably take `label_*`.
+ */
+function withAuthNumbering(text) {
+  const L = atomSiteLoop(text);
+  const ls = L.cols.indexOf("label_seq_id");
+  const au = L.cols.indexOf("auth_seq_id");
+  if (ls < 0 || au < 0) throw new Error("no seq id columns");
+  let moved = 0;
+  const out = L.rows.map((r) => {
+    const t = [...r];
+    const n = Number(t[ls]);
+    if (Number.isFinite(n) && t[ls] !== ".") { t[au] = String(n + 500); moved += 1; }
+    return t;
+  });
+  if (!moved) throw new Error("no polymer residue to renumber");
+  return writeAtomSite(L, out);
+}
+
+/**
+ * The same structure written the OLD way: `mask_index_1_residue`, `mask_sequence_1_residue`
+ * and `mask_coordinate_1_atom` in place of the `condition_*` columns.
+ *
+ * 🔴 A FILE WRITTEN THIS WAY MEANS THE OPPOSITE OF WHAT READING THE COLUMNS SEPARATELY GIVES.
+ * The three legacy columns are BOOLEANS that rewrite the conditions: where
+ * `mask_sequence_1_residue` is set the condition becomes the residue's OWN NAME and where it
+ * is not it becomes `<M>`; `mask_coordinate_1_atom` the same with the atom's own coordinates
+ * against NaN. So a port that merely skipped the unknown columns would condition the model on
+ * nothing where the file conditions it on everything. Not one shipped structure carries one.
+ */
+function withLegacyMasks(text) {
+  const L = atomSiteLoop(text);
+  const idx = L.cols.indexOf("condition_index_1_residue");
+  const seq = L.cols.indexOf("condition_sequence_1_residue");
+  if (idx < 0 || seq < 0) throw new Error("no condition columns to rewrite");
+  const resId = L.cols.indexOf("label_seq_id");
+  const lines = [...L.lines];
+  lines[L.head + idx] = "_atom_site.mask_index_1_residue ";
+  lines[L.head + seq] = "_atom_site.mask_sequence_1_residue ";
+  lines.splice(L.end, 0, "_atom_site.mask_coordinate_1_atom ");
+  const rows = L.rows.map((r) => {
+    const t = [...r];
+    // The sequence mask is a BOOLEAN where the condition was a residue name: set it off for
+    // every third residue, so the rewrite must put `<M>` there and the name everywhere else.
+    const n = resId >= 0 ? Number(t[resId]) : 0;
+    t[seq] = Number.isFinite(n) && n % 3 === 0 ? "False" : "True";
+    t.push(Number.isFinite(n) && n % 4 === 0 ? "False" : "True");
+    return t;
+  });
+  const out = { lines, head: L.head, end: L.end + 1, last: L.last + 1, cols: L.cols, rows };
+  return writeAtomSite(out, rows);
+}
+
+/**
  * The same structure with an INTERIOR run of residues marked unindexed, and every atom put in
  * index group 0.
  *
@@ -421,6 +561,14 @@ cases.set("motif_idx_1prw+beside-expandable",
 cases.set("ppi_pdl1+swapped-arg", withSwappedArginines(cases.get("ppi_pdl1")));
 cases.set("ppi_pdl1+threechains",
   withDuplicatedChain(withDuplicatedChain(cases.get("ppi_pdl1"), "Y"), "Z"));
+// 🔴 THE READER'S THREE FILTERS, WHICH THE SHIPPED SEVEN CANNOT TRIP. Each is a rule whose
+// failure is silent and whose cost is the whole structure: a second model doubles every atom,
+// an alternate conformation duplicates a residue, and taking `auth_seq_id` renumbers every
+// residue a contig names. A file nobody deposits here has all three.
+cases.set("sm_sam+twomodels", withSecondModel(cases.get("sm_sam")));
+cases.set("motif_idx_1prw+altloc", withAltLocs(cases.get("motif_idx_1prw")));
+cases.set("motif_idx_1prw+authnum", withAuthNumbering(cases.get("motif_idx_1prw")));
+cases.set("motif_idx_1prw+legacymask", withLegacyMasks(cases.get("motif_idx_1prw")));
 
 /**
  * The contigs to try on a structure: a preserved segment it really has, with an expandable one
@@ -459,6 +607,22 @@ function contigsFor(name, js) {
 /**
  * The selections to try: the ones the shipped presets write, over whichever chain and residue
  * numbers this structure actually has, plus a list, a range and a descending range.
+ *
+ * 🔴 AND THE FORMS THE PRESETS DO NOT WRITE, BECAUSE THREE OF THE PORT'S RULES WERE STATED FROM
+ * READING THE REFERENCE AND NOTHING COULD REACH THEM. A field is only expanded INSIDE brackets
+ * and a hyphen is only a range for RESIDUE NUMBERS, so the bare forms are a different code path
+ * entirely: `[1-3]` is 1,2,3 while a bare `1-3` is `parseInt("1-3")` = 1 - a selection that
+ * matches one residue where a reader expects three - and an atom-name list leaves a hyphen
+ * alone. The last of those used to be justified here with "plenty of atom names contain one",
+ * which is false on this corpus: 117 distinct atom names over the twenty-one structures and NOT
+ * ONE has a hyphen. The rule is still right and is now checked on a name that does, by asking
+ * for one that cannot match rather than by waiting for a structure to carry it - a selection
+ * matching nothing is a real answer and both sides must give it.
+ *
+ * All four new rules watched failing, one mutation at a time, at **9 of the 18 structures then in the corpus** each - the nine
+ * structures whose first chain is long enough to take the full list: a bare hyphen expanded as
+ * a range, an atom name split at its hyphen, a zero-padded residue number left unnormalised,
+ * and the transformation default changed from "1" to "2".
  */
 function selectionsFor(js) {
   const chains = [...new Set(js.chain_id)].sort();
@@ -469,6 +633,9 @@ function selectionsFor(js) {
   const pick = [ids[1], ids[3], ids[5]];
   const names = [...new Set(js.atom_name)];
   const atom = names.includes("CA") ? "CA" : names[0];
+  const other = names.find((n) => n !== atom) ?? atom;
+  // A zero-padded residue number, which the reader normalises through the integer.
+  const padded = `000${ids[1]}`;
   return [
     `sel('${cid}/*/*/*')`,
     "sel('*/*/*/*')",
@@ -478,6 +645,20 @@ function selectionsFor(js) {
     `sel('${cid}/*/*/${atom}')`,
     `sel('*/${js.res_name[0]}/*/*')`,
     `sel('${cid}/*/[${pick[0]}]/*')|sel('${cid}/*/[${pick[2]}]/*')`,
+    // A BARE residue number and a bare hyphenated one: the second is the single value `ids[1]`,
+    // not the range it looks like.
+    `sel('${cid}/*/${ids[1]}/*')`,
+    `sel('${cid}/*/${ids[1]}-${ids[4]}/*')`,
+    `sel('${cid}/*/[${padded}]/*')`,
+    `sel('${cid}/*/[${padded}, ${ids[3]} ]/*')`,
+    // An atom-name LIST, and one whose item carries a hyphen - which is not a range and must
+    // match the atom literally called that, i.e. nothing.
+    `sel('${cid}/*/*/[${atom},${other}]')`,
+    `sel('${cid}/*/*/[${atom}-${other}]')`,
+    // A chain list, and the transformation field the reader defaults to "1".
+    `sel('[${chains.join(",")}]/*/*/*')`,
+    `sel('${cid}/*/*/*/1')`,
+    `sel('${cid}/*/*/*/2')`,
   ];
 }
 
@@ -507,6 +688,13 @@ function conditionsFor(js) {
     ["crdgrp", { C_CRD: { true: [{ select: all }] }, C_CRDGRP: { 2: [{ select: few }] } }],
     ["secondary", { C_SEC: { HELIX: [{ select: few }] } }],
     ["cath", { C_CATH: { "3.40.50": [{ select: all }] } }],
+    // 🔴 AND THE CATH RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS WHAT ONE CODE SUGGESTS. The
+    // reference appends `.x` to anything not already ending in `.x`, so a COMPLETE four-level
+    // code gains a fifth field: `3.40.50.20` is stored as `3.40.50.20.x`. Surprising, the
+    // reference's own, and untestable on the three-level code alone.
+    ["cath-4", { C_CATH: { "3.40.50.20": [{ select: all }] } }],
+    ["cath-x", { C_CATH: { "3.40.50.x": [{ select: all }] } }],
+    ["cath-1", { C_CATH: { 3: [{ select: few }] } }],
     ["unindexed", { C_IDX: { false: [{ select: few, group: "m1" }] } }],
     ["two-groups", { C_IDX: { false: [
       { select: `sel('${cid}/*/[${ids[1]}]/*')`, group: "m1" },

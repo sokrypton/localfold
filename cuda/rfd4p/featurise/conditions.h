@@ -190,6 +190,12 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           // 🔴 A CATH CODE GAINS A TRAILING `.x` IF IT HAS NONE, so `3.40.50` is stored as
           // `3.40.50.x` - the fourth level is the homologous superfamily and a spec that does
           // not name it is saying "any", not "level four is missing".
+          //
+          // 🔴 AND THE RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS WHAT THAT ONE EXAMPLE READS
+          // LIKE. It is the reference's own `if (!cathStr.endsWith('.x')) cathStr += '.x'`, so
+          // a COMPLETE code gains a FIFTH field - `3.40.50.20` is stored as `3.40.50.20.x` -
+          // and a one-level `3` becomes `3.x`, not `3.x.x.x`. Checked on all four shapes; a
+          // port that padded to four levels agrees on `3.40.50` and on nothing else.
           if (!a.ann.strings.count(full)) a.ann.strings[full].assign(n, "x.x.x.x");
           string cath = value;
           if (cath.size() < 2 || cath.compare(cath.size() - 2, 2, ".x") != 0) cath += ".x";

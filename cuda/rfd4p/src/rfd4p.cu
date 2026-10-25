@@ -2,14 +2,18 @@
 //
 //   localfold-rfd4p <input dir> --weights=<dir> [--oracle=<dir>] [--out=<path>]
 //
-// `<input dir>` is `cuda/rfd4p/export_input.mjs`'s `model.idx`/`model.bin`: the trunk's features for
-// one sampler step. `--weights=` is `export_weights.mjs`'s float32 directory (the int8 bundle through
-// `Model::loadBundle` is the shipping path and is not wired yet). `--oracle=` is the CPU reference's
-// answer stage by stage, and turns this into the differential that gates the port.
+//   localfold-rfd4p --job=<spec.json> --weights=<dir> [--int8=<bundle>] [--out=<design.pdb>]
 //
-// 🔴 WHAT THIS IS NOT, YET: a fold. There is no sampler, no decoder and no output structure - this
-// runs ONE trunk pass and compares it. The flow loop (`shared/rfd4p/flow.js`), the autoencoder decoder
-// and the all-atom output come next, and each wants its own stage-by-stage bar before it is believed.
+// `<input dir>` is `cuda/rfd4p/export_input.mjs`'s `model.idx`/`model.bin`: the trunk's features for
+// one sampler step, which is the differential path. `--job=` is the whole thing in one process -
+// the spec read, the mmCIF featurised (`featurise/featurise.cpp`, linked in), the flow loop run and
+// a structure written. `--weights=` is `export_weights.mjs`'s float32 directory and `--int8=` the
+// published bundle through `Model::loadBundle`; `--oracle=` is the CPU reference's answer stage by
+// stage, and turns the first form into the differential that gates the port.
+//
+// 🔴 THIS HEADER SAID "WHAT THIS IS NOT, YET: A FOLD" LONG AFTER IT WAS ONE, and said the int8
+// bundle "is not wired yet" while `gate.py`'s `int8 job` arm folded from it alone. A file's own
+// first paragraph is the one thing nobody re-reads; both claims are gone rather than softened.
 #include "trunk.cuh"
 #include "decoder.cuh"
 #include "sampler.cuh"
