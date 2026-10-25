@@ -1,0 +1,8 @@
+localfold-rfd4p
+localfold-rfd4p.arch
+*.o
+# The exported float32 weights (714 MB), the featurised inputs and the CPU reference's stages: all
+# written by export_weights.mjs / export_input.mjs, none of them this repository's to carry.
+weights-f32/
+data*/
+oracle*/
