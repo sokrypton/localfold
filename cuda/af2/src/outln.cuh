@@ -181,12 +181,16 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   __syncthreads();
   // a warp a row at a time: lane's 8 columns lane*8 .. +7
   constexpr int RPW = R / (NTH / 32);
+  uint4 ob = (row0 + warp < rows) ? ptx_ld_shared_v4_u32(V + warp * LDV + c0) : make_uint4(0, 0, 0, 0);
 #pragma unroll
   for (int i = 0; i < RPW; ++i) {
     const int r = warp + i * (NTH / 32);
     const size_t row = row0 + r;
     if (row >= rows) break;
-    const uint4 ob = ptx_ld_shared_v4_u32(V + r * LDV + c0);
+    uint4 next_ob;
+    if (i + 1 < RPW && row + (NTH / 32) < rows) {
+      next_ob = ptx_ld_shared_v4_u32(V + (r + (NTH / 32)) * LDV + c0);
+    }
     ptx_st_global_v4_u32(msa + row * C + c0, ob);
     float v[8];
     if constexpr (BF) {
@@ -219,6 +223,7 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
       else xo[e] = ptx_cvt_bf16x2_f32(a, b);
     }
     ptx_st_global_v4_u32(xn + row * C + c0, make_uint4(xo[0], xo[1], xo[2], xo[3]));
+    if (i + 1 < RPW) ob = next_ob;
   }
 }
 template <class M, class TO, class TI = M, bool VG = false>
@@ -354,12 +359,16 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
   *reinterpret_cast<float4*>(of) = ptx_ldg_v4_f32(lnO + c0);
   *reinterpret_cast<float4*>(of + 4) = ptx_ldg_v4_f32(lnO + c0 + 4);
   __syncthreads();
+  uint4 ob = (row0 + warp < rows) ? ptx_ld_shared_v4_u32(V + warp * LDV + c0) : make_uint4(0, 0, 0, 0);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int r = warp + i * 4;
     const size_t row = row0 + r;
     if (row >= rows) break;
-    const uint4 ob = ptx_ld_shared_v4_u32(V + r * LDV + c0);
+    uint4 next_ob;
+    if (i + 1 < 4 && row + 4 < rows) {
+      next_ob = ptx_ld_shared_v4_u32(V + (r + 4) * LDV + c0);
+    }
     ptx_st_global_v4_u32(msa + row * C + c0, ob);
     float v[8];
     if constexpr (BF) {
@@ -392,6 +401,7 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
       else xo[e] = ptx_cvt_bf16x2_f32(a, b);
     }
     ptx_st_global_v4_u32(xn + row * C + c0, make_uint4(xo[0], xo[1], xo[2], xo[3]));
+    if (i + 1 < 4) ob = next_ob;
   }
 }
 template <class M, class TO, class TI = M, bool VG = false>

@@ -675,12 +675,19 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     cpWait<0>();
     __syncwarp();
     half* G = Kst(tiles & 1) + warp * 16 * LDK;
+    uint32_t ga[D / 8], gb[D / 8];
+#pragma unroll
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      ga[et] = ptx_ld_shared_u32(G + g * LDK + e);
+      gb[et] = ptx_ld_shared_u32(G + (g + 8) * LDK + e);
+    }
 #pragma unroll
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
       float ax, ay, bx, by;
-      ptx_f16x2_to_f32x2(ptx_ld_shared_u32(G + g * LDK + e), ax, ay);
-      ptx_f16x2_to_f32x2(ptx_ld_shared_u32(G + (g + 8) * LDK + e), bx, by);
+      ptx_f16x2_to_f32x2(ga[et], ax, ay);
+      ptx_f16x2_to_f32x2(gb[et], bx, by);
       ptx_st_shared_u32(G + g * LDK + e,
           ptx_cvt_f16x2_f32(ptx_mul_f32(ptx_mul_f32(o[et][0], inv0), sigm(ax)),
                             ptx_mul_f32(ptx_mul_f32(o[et][1], inv0), sigm(ay))));
@@ -690,10 +697,16 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     }
     __syncwarp();
     constexpr int PER = D / 8, G_PER = D / 16;
+    uint4 yv[G_PER];
+#pragma unroll
+    for (int k = 0; k < G_PER; ++k) {
+      int u = k * 32 + lane, rq = u / PER, c = (u % PER) * 8;
+      yv[k] = ptx_ld_shared_v4_u32(G + rq * LDK + c);
+    }
 #pragma unroll
     for (int k = 0; k < G_PER; ++k) {
       int u = k * 32 + lane, rq = u / PER, c = (u % PER) * 8, i = q0 + warp * 16 + rq;
-      if (i < QN) ptx_st_global_v4_u32(out + outAt(i) + c, ptx_ld_shared_v4_u32(G + rq * LDK + c));
+      if (i < QN) ptx_st_global_v4_u32(out + outAt(i) + c, yv[k]);
     }
     return;
   } else {
@@ -1124,7 +1137,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false> __h
 // (an FP8 part runs flash8 below instead, through the pair track: e4m3 MMAs, half of these)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
-__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D == 8 && BK <= 64) ? 4 : (!ONE && WARPS * RR == 4 && MT <= 2 && (BK <= 48 || (BK == 64 && D <= 32)) && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+__global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D == 8 && BK <= 64) ? fitBlocks(4, 2 * fa2Stage<D, WARPS, BK, MT, RR, NB>()) : (!ONE && WARPS * RR == 4 && MT <= 2 && (BK <= 48 || (BK == 64 && D <= 32)) && (D <= 32 || (D == 64 && MT == 1))) ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, OT* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is

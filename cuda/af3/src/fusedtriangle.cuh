@@ -1457,11 +1457,14 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
   // the accumulators through shared memory, 64 f32 columns at a time
   constexpr int LDY = C / 2 + 4;
   float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
+  float4 b4[2];
+  if (ob) {
+    b4[0] = ptx_ldg_v4_f32(ob + cl0);
+    b4[1] = ptx_ldg_v4_f32(ob + (C / 2) + cl0);
+  }
   __syncthreads();
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
-    float4 b4;
-    if (ob) b4 = ptx_ldg_v4_f32(ob + hh * (C / 2) + cl0);
 #pragma unroll
     for (int e8 = 0; e8 < NT / 2; ++e8) {
       int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
@@ -1469,15 +1472,22 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
       ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[et][2], acc[et][3]);
     }
     __syncwarp();
+    float4 a4[EP];
+#pragma unroll
+    for (int i = 0; i < EP; ++i) {
+      int rl = i * LPR + rl0;
+      a4[i] = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0);
+    }
 #pragma unroll
     for (int i = 0; i < EP; ++i) {
       if (pe[i] == ~0u) continue;
-      int rl = i * LPR + rl0;
-      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0), v = pairUnpack4<PT>(pv[hh][i]);
+      float4 v = pairUnpack4<PT>(pv[hh][i]);
       if (ob) {
-        a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
+        a4[i].x = ptx_add_f32(a4[i].x, b4[hh].x); a4[i].y = ptx_add_f32(a4[i].y, b4[hh].y);
+        a4[i].z = ptx_add_f32(a4[i].z, b4[hh].z); a4[i].w = ptx_add_f32(a4[i].w, b4[hh].w);
       }
-      v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
+      v.x = ptx_add_f32(v.x, a4[i].x); v.y = ptx_add_f32(v.y, a4[i].y);
+      v.z = ptx_add_f32(v.z, a4[i].z); v.w = ptx_add_f32(v.w, a4[i].w);
       pairSt4<PT>(pair, (size_t)pe[i] * C + hh * (C / 2) + cl0, v);
     }
     __syncwarp();
