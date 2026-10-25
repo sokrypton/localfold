@@ -65,7 +65,7 @@ export class Rfd4pGeneratorGpu {
    * @param {GPUDevice} device
    * @param {object} weights name -> {data: Float32Array, shape}
    * @param {object} cfg bundle `config` (`{ nn, autoencoder_config }`)
-   * @param {{half?: boolean, chunkFloats?: number}} [opts]
+   * @param {{half?: boolean, chunkBytes?: number}} [opts]
    */
   constructor(device, weights, cfg, opts = {}) {
     const resolvedWeights = weights?.tensors ?? weights;

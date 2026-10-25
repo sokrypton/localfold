@@ -3,16 +3,25 @@
  * `Rfd4pEncoderGpu`, and full 60-step `Rfd4pGeneratorGpu`).
  *
  *   DISPLAY=:99 node tools/gpu-chrome.mjs tools/gpu/profile-rfd4p.js
+ *   DISPLAY=:99 node tools/gpu-chrome.mjs tools/gpu/profile-rfd4p.js --lengths=100,200,400 --e2e=0
+ *
+ * 🔴 `--lengths=N,...` EXISTS BECAUSE THE PRESETS ARE ALL SHORT. The longest one in the
+ * repository is `ppi_pdl1` at 191 tokens, and `webgpu/rfd4p/trunk.js` changes shape at
+ * 362: past there the pair scratch no longer fits one chunk, `triF16` turns off, and the
+ * chunked arm of `triangle()` runs a different set of kernels in f32. Nothing measured by
+ * a preset reaches that arm, so every number ever recorded for this port describes the
+ * short path only - and the designs people run are 100-400. A synthetic unconditioned
+ * segment is the one way to profile at the length it will run.
  */
 
 import {
-  DEFAULT_LOCAL_SHARDED_DIR,
   Rfd4pGeneratorGpu,
   buildBatch,
   fetchShardedWeights,
   getRfd4pPresetById,
   pairCondFeatures,
   pairFeatures,
+  resolveRfd4pShardBase,
   seededRng,
   trunkCondFeatures,
   trunkSeqFeatures,
@@ -22,9 +31,24 @@ export async function main(device, args = []) {
   const opt = Object.fromEntries(args.map((a) => a.replace(/^--/, '').split('=')));
   if (opt['no-submat'] === '1') device.noSubmat = true;
   const half = opt.half !== '0';
-  const { tensors: weights, config } = await fetchShardedWeights(DEFAULT_LOCAL_SHARDED_DIR, { includeEncoder: true });
+  // 🔴 NOT THE LOCAL DIR UNCONDITIONALLY. The shards are gitignored, so hard-coding the
+  // local base made this tool unrunnable for anyone who had not run the exporter - which
+  // is the common case. `resolveRfd4pShardBase` asks a weight file, not the manifest.
+  const shardBase = await resolveRfd4pShardBase();
+  const { tensors: weights, config } = await fetchShardedWeights(shardBase, { includeEncoder: true });
   const gen = new Rfd4pGeneratorGpu(device, weights, config, { half });
   const deviceCapabilities = {
+    // 🔴 WHICH GPU, BECAUSE THE SAME MILLISECONDS MEAN DIFFERENT THINGS ON DIFFERENT ONES.
+    // A pass at n = 400 running every large kernel at ~2.9 TFLOP/s is a kernel problem on
+    // a card with ten times that and a ceiling on a laptop; the report cannot be read at
+    // all without the adapter beside it, and this one did not print it.
+    adapter: {
+      vendor: device.adapterInfo?.vendor ?? null,
+      architecture: device.adapterInfo?.architecture ?? null,
+      device: device.adapterInfo?.device ?? null,
+      description: device.adapterInfo?.description ?? null,
+    },
+    submat8: gen.trunk.engine.submat8,
     hasF16: gen.trunk.engine.hasF16,
     hasSubgroupMatrix: gen.trunk.engine.hasSubgroupMatrix,
     subgroupMatrixConfigs: gen.trunk.engine.subgroupMatrixConfigs,
@@ -37,9 +61,34 @@ export async function main(device, args = []) {
     return buildBatch(bytes, { seed: 42 });
   }
 
+  /**
+   * One unconditioned segment of `len` residues, built from a contig alone.
+   *
+   * No structure is involved: a spec with a contig and no input starts from an empty atom
+   * array, so the length is free and the batch is the same shape the presets produce.
+   */
+  function loadLengthBatch(len) {
+    return buildBatch({ contig: `${len}-${len}` }, { seed: 42 });
+  }
+
+  // A case is a preset id or a synthetic length; `--lengths` adds the second kind.
+  const cases = [];
+  if (opt.lengths) {
+    for (const raw of opt.lengths.split(',')) {
+      const len = Number(raw);
+      if (!Number.isInteger(len) || len < 2) throw new Error(`--lengths: ${raw} is not a length`);
+      cases.push({ key: `n${len}`, load: () => loadLengthBatch(len) });
+    }
+  }
+  if (!opt.lengths || opt.presets) {
+    for (const presetId of (opt.presets ? opt.presets.split(',') : ['uncond_short', 'ppi_pdl1'])) {
+      cases.push({ key: presetId, load: () => loadPresetBatch(presetId) });
+    }
+  }
+
   const kernelProfiles = {};
-  for (const presetId of (opt.presets ? opt.presets.split(',') : ['uncond_short', 'ppi_pdl1'])) {
-    const { batch, n } = await loadPresetBatch(presetId);
+  for (const { key: presetId, load } of cases) {
+    const { batch, n } = await load();
     const rng = seededRng(42);
     const nnCfg = config.nn;
     const distCfg = { dim: nnCfg.xt_pair_dist_dim, min: nnCfg.xt_pair_dist_min, max: nnCfg.xt_pair_dist_max };
@@ -105,6 +154,10 @@ export async function main(device, args = []) {
 
     kernelProfiles[presetId] = {
       n,
+      // 🔴 THE SHAPE THE TRUNK ACTUALLY CHOSE, recorded beside the timings. Two numbers at
+      // different lengths are not comparable when one ran the f16 single-chunk kernels and
+      // the other ran the f32 chunked ones, and nothing in a kernel name says which.
+      shape: { triF16: gen.trunk.triF16, chunks: gen.trunk.chunks.length, chunkRows: gen.trunk.R },
       cpuFeaturesMs: {
         seqMs: Number(seqMs.toFixed(3)),
         condMs: Number(condMs.toFixed(3)),

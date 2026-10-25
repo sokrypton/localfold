@@ -29,6 +29,60 @@ const T = 256; // tri_mult_c
 const LAYERS_PER_SUBMIT = 2;
 const OUT = 3 + 32 + 147;
 
+/** The default bound on the R-indexed pair scratch; see `chunkPlan`. */
+export const DEFAULT_CHUNK_BYTES = 896 * 1024 * 1024;
+
+/**
+ * How the pair track is sliced, and in which arithmetic.
+ *
+ * 🔴 THE ARITHMETIC IS CHOSEN BEFORE THE SLICE, NOT AFTER, and it used to be the other way
+ * round: `triF16` tested `R === nn` while R came from a bound computed in f32 terms. So
+ * narrowing the pair track - the thing that HALVES this scratch - could never buy any of the
+ * length it paid for, and at n = 363 the whole f16 path switched off at once. Measured on an
+ * Apple M5 (8-core GPU), one trunk pass over 14 layers:
+ *
+ *        n=100    n=200    n=362    n=400
+ *   f16   115.8    444.5   1437.7   1815.8     one chunk
+ *   f32       -        -        -   3523.7     two chunks, and 495 ms of it a COPY
+ *
+ * n=362 -> n=400 is 1.22x the pairs and was 2.45x the time, because the fallback is also the
+ * path that never got the f16 kernels or the fused gate. The cliff sat just below the lengths
+ * people design at, which is the trap `cuda/rfd4p/README.md` names: a kernel measured at one
+ * length is measured at one length.
+ *
+ * 🔴 AND THE BOUND IS IN BYTES BECAUSE THAT IS WHAT IT WAS ALWAYS MEASURING. The old divisor
+ * was `2 * T`, the per-row cost of `proj` ALONE - a buffer only the CHUNKED path allocates -
+ * so the real f32 scratch at the old R was 939 MB rather than the 256 MB the float bound
+ * appeared to state. 896 MB is that same figure said plainly, which is why f32 lands exactly
+ * where it did.
+ *
+ * 🔴 AND THE TWO SHAPES COST DIFFERENT AMOUNTS A ROW, so the question is asked in that order:
+ * does the whole pair tensor fit as ONE chunk, which allocates no `proj` and may be f16 - and
+ * only if it does not, how many rows fit the chunked f32 shape, which pays for `proj` as
+ * well. Sizing R once from one of the two costs and then picking the other shape is how a
+ * bound gets quietly doubled; an earlier draft of this did exactly that, taking f16's row
+ * cost and then allocating f32 buffers against it.
+ *
+ * @param {number} nn pairs, i.e. n * n
+ * @param {{wantF16?: boolean, chunkBytes?: number}} [opts]
+ * @returns {{triF16: boolean, R: number, chunks: number, scratchBytes: number}}
+ */
+export function chunkPlan(nn, opts = {}) {
+  const wantF16 = opts.wantF16 === true;
+  const chunkBytes = opts.chunkBytes ?? DEFAULT_CHUNK_BYTES;
+  // zc + xc + gz + phid, as `Rfd4pEngine.buffer` floats a pair row.
+  const oneChunkRow = wantF16 ? (P / 2 + T / 2 + P / 2 + P) : (P + T + P + 2 * P);
+  const chunkedRow = (P + T + P + 2 * P) + 2 * T;
+  const oneChunk = nn * oneChunkRow * 4 <= chunkBytes;
+  const R = oneChunk ? nn : Math.max(1, Math.min(nn, Math.floor(chunkBytes / (chunkedRow * 4))));
+  return {
+    triF16: wantF16 && oneChunk,
+    R,
+    chunks: Math.ceil(nn / R),
+    scratchBytes: R * (oneChunk ? oneChunkRow : chunkedRow) * 4,
+  };
+}
+
 /**
  * @param {object} weights name -> {data: Float32Array, shape}
  * @param {object} cfg bundle `config.nn`
@@ -46,14 +100,17 @@ export class Rfd4pTrunkGpu {
    * @param {GPUDevice} device
    * @param {object} weights
    * @param {object} cfg bundle `config.nn`
-   * @param {{half?: boolean, chunkFloats?: number}} [opts]
+   * @param {{half?: boolean, chunkBytes?: number}} [opts]
+   *   `chunkBytes` bounds the R-indexed pair scratch; see `record` for why it is bytes.
    */
   constructor(device, weights, cfg, opts = {}) {
     checkConfig(cfg);
     this.engine = new Rfd4pEngine(device);
     this.cfg = cfg;
     this.half = opts.half ?? false;
-    this.chunkFloats = opts.chunkFloats ?? 64 * 1024 * 1024;
+    // 896 MB, which is what the old `64 * 1024 * 1024` float bound came to in f32 once the
+    // buffers it did not count are counted: one chunk to n = 362 in f32, n = 512 in f16.
+    this.chunkBytes = opts.chunkBytes ?? DEFAULT_CHUNK_BYTES;
     this.nlayers = cfg.nlayers;
     this.n = 0;
     this.w = this.uploadWeights(weights);
@@ -266,11 +323,11 @@ export class Rfd4pTrunkGpu {
     const nPad = Math.ceil(n / 16) * 16;
     const nnPad = n * nPad;
     this.nPad = nPad;
-    const R = Math.max(1, Math.min(nn, Math.floor(this.chunkFloats / (2 * T))));
+    // The slice and the arithmetic together; `chunkPlan` carries why.
+    const { triF16, R } = chunkPlan(nn, { wantF16: this.half && e.hasF16, chunkBytes: this.chunkBytes });
+    this.triF16 = triF16;
     this.R = R;
     const b = (label, floats) => e.buffer(label, floats);
-    const triF16 = this.half && e.hasF16 && R === nn;
-    this.triF16 = triF16;
     const B = (this.buf = {
       seqF: b('seqF', n * seqStride), condF: b('condF', batchCondRows * condStride),
       pairF: b('pairF', nn * pairStride), pairCondF: b('pairCondF', dims.pairCond),
