@@ -31,6 +31,7 @@
 
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
+#include "../../featurise/zstd.h"
 #include "../src/schedule.h"
 #include "atoms.h"
 #include "chirality.h"
@@ -1193,18 +1194,9 @@ int run(int argc, char** argv) {
   // Dumping what it does read is how that half gets a gate before the other half exists, rather
   // than landing unmeasured and being trusted because it compiles.
   if (!dumpCif.empty()) {
-    string text;
-    FILE* f = fopen(dumpCif.c_str(), "rb");
-    if (!f) { fprintf(stderr, "no %s\n", dumpCif.c_str()); return 1; }
-    char buf[65536];
-    size_t got;
-    while ((got = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
-    fclose(f);
-    if (text.size() > 3 && (unsigned char)text[0] == 0x28 && (unsigned char)text[1] == 0xb5) {
-      fprintf(stderr, "%s is zstd; this reader takes a plain .cif and the page's examples are "
-                      "compressed - decompress it first\n", dumpCif.c_str());
-      return 1;
-    }
+    bool opened = false;
+    const string text = lf::zstd::readTextOrCompressed(dumpCif, &opened);
+    if (!opened) { fprintf(stderr, "no %s\n", dumpCif.c_str()); return 1; }
     const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
     rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
     rfd4p::cif::deriveChemistry(a, block);

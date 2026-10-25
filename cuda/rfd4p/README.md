@@ -483,8 +483,9 @@ residues the cropped example does not contain, so building one from the spec fai
     file to a 925-atom complex. 🔴 Two rules that are the obvious guess backwards: `label_*` wins
     over `auth_*` (writing it the other way renumbers every residue a contig names), and the
     reader filters to MODEL ONE and the first altloc, without which a twenty-model NMR entry comes
-    through twenty times. Decompression is still JavaScript's - the examples are zstd and the
-    reader says so rather than guessing.
+    through twenty times. Decompression is native now (`cuda/featurise/zstd.h`), so a `.cif.zst`
+    goes straight in; the four MAGIC BYTES decide, never the file extension, or a decompressed
+    copy under its original name would be refused and a renamed plain file accepted.
   - ~~the chemistry `parseCifToAtomArray` derives from those columns~~ **done**: the charge
     fallbacks, `atomic_number`, the aromatic and leaving-atom flags, `chem_comp_type`,
     `chain_type` and `is_polymer` - all 22 columns, all seven structures, 0 differing. 🔴 The
@@ -529,9 +530,11 @@ residues the cropped example does not contain, so building one from the spec fai
     gate synthesises, because the shipped seven could not reach most of it (see the three
     findings below the table). `convertToProteinaBatch` (1175-1606) is ported too, so a
     structure now reaches the batch the model reads - 46 keys held to the reference over all
-    seventeen cases. What is left of the structure path is `applyContig` with PRESERVED
-    segments, native zstd, `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group
-    permutation. In the order they run, with what each needs:
+    seventeen cases. Zstandard is native too (`cuda/featurise/zstd.h`,
+    dlopen'd like `common.cuh`'s blob reader), so the page's own `.cif.zst` goes straight into
+    the binary and the gate drives all seven that way as well as decompressed. What is left of
+    the structure path is `applyContig` with PRESERVED segments,
+    `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|

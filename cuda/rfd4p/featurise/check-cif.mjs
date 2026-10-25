@@ -30,7 +30,7 @@ import {
   convertToProteinaBatch,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -390,6 +390,10 @@ let differing = 0;
 for (const [name, text] of cases) {
   const path = join(work, `${name.replace("+", "_plus_")}.cif`);
   writeFileSync(path, text);
+  // A synthesised case has no shipped `.cif.zst`; only the seven real ones can be driven
+  // compressed, which is enough - the decompression does not depend on the structure.
+  const shipped = `${repo}web/examples/${name}.cif.zst`;
+  const zstPath = cases.has(name) && existsSync(shipped) ? shipped : null;
 
   const js = parseCifToAtomArray(text);
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
@@ -926,6 +930,29 @@ for (const [name, text] of cases) {
         const bad = got.filter((v, i) => !eq(v, want[i])).length;
         if (bad) wrong.push(`az prob ${k} ${bad}`);
       }
+    }
+  }
+
+  // 🔴 THE COMPRESSED FILE MUST GIVE THE SAME BYTES AS THE PLAIN ONE. Decompression was the
+  // last JavaScript on this path, and the reader refused a `.cif.zst` by name - so every case
+  // above goes through a file this gate decompressed for it, which is not what the page ships.
+  // Driving the binary at the ORIGINAL `.cif.zst` and diffing the whole dump is what says the
+  // native decompression is the same decompression.
+  if (zstPath) {
+    const plain = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
+      { encoding: "utf8", maxBuffer: 1 << 28 });
+    // 🔴 THE REFUSAL IS CAUGHT AND REPORTED, NOT LET THROUGH. A broken decompression makes the
+    // reader refuse ("no _atom_site loop") and `execFileSync` THROW, which ends the whole gate
+    // with a stack trace instead of naming the case - watched happening.
+    let compressed = null;
+    try {
+      compressed = execFileSync(binary, ["x", `--dump-cif=${zstPath}`, "--atomize"],
+        { encoding: "utf8", maxBuffer: 1 << 28 });
+    } catch (err) {
+      wrong.push(`zstd read refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+    }
+    if (compressed !== null && plain !== compressed) {
+      wrong.push("zstd dump differs from the plain file's");
     }
   }
 
