@@ -32,22 +32,43 @@ A trunk pass at 100 tokens and 6 recycles, on this A100, against PyTorch on the 
 **same captured batch** — hooked out of a real `rfd4-generate` run, so it is their own featurised
 input and their own 6 cycles, not something built here:
 
-| | ms a pass | |
-|---|---:|---|
-| PyTorch eager, f32 | 265.4 | upstream's `quickstart`, which turns compilation off |
-| PyTorch compiled, f32 | 158.7 | `torch.compile`, which is what `compile_lengths` does in production |
-| **cuda/rfd4p, exact f32** | **157.8** | a tie with compiled PyTorch, at matched precision |
-| **cuda/rfd4p, `--fast`** | **49.5** | **3.2x compiled PyTorch, 5.4x eager** |
+| | ms a pass | of which features | network | precision |
+|---|---:|---:|---:|---|
+| PyTorch eager | 265.4 | | | f32 |
+| PyTorch compiled | 158.7 | | | f32 |
+| **PyTorch compiled, its own default precision** | **65.3** | 8.2 | **57.1** | bf16 matmuls |
+| cuda/rfd4p, exact | 157.8 | — | 157.8 | f32 |
+| **cuda/rfd4p, `--fast`** | **49.5** | — | **49.5** | TF32 + f16 |
 
-🔴 **READ THE PRECISION COLUMN BEFORE THE RATIO.** At matched f32 this port and a compiled PyTorch
-are the same speed to within a percent. The margin is TF32 on the GEMMs and f16 on the attention and
-the pair intermediates, which is a different arithmetic and is why `--fast` is a flag with its own
-oracle bound rather than the default.
+🔴 **THE HONEST NUMBER IS 1.15x, NOT 5x.** Against PyTorch's *production* path - compiled, at the
+precision upstream's own config selects - this port's network is 49.5 ms against 57.1. The 5.4x is
+against `quickstart`, which turns compilation off and is upstream's first-run preset, not how anyone
+generates. A ratio quoted without naming the other side's configuration is not a measurement, and
+this file had it wrong for a while.
 
-🔴 **AND THEIR FORWARD BUILDS ITS OWN FEATURES WHERE THIS ONE IS HANDED THEM.** `cond_factory`,
-`init_repr_factory` and `pair_repr_builder` turn the raw batch into the 609-, 897- and 107-wide
-matrices that `export_input.mjs` writes, and that work is inside the number above for PyTorch and
-outside it here. A real generation will have to build them on this side too.
+🔴 **AND THEIR FORWARD BUILDS ITS OWN FEATURES WHERE THIS ONE IS HANDED THEM** - 8.2 ms of their
+65.3, measured by wrapping `cond_factory`, `init_repr_factory` and `pair_repr_builder`. That work is
+inside their number and outside ours, and a finished port owes it. Counting it against us, the whole
+trunk call is 49.5 + (unmeasured) against 65.3.
+
+At matched f32 and both optimised, this port and a compiled PyTorch are the same speed to within a
+percent - 157.8 against 158.7. Everything beyond that is arithmetic, which is why `--fast` is a flag
+with its own oracle bound.
+
+### How it scales
+
+Both arms at 6 recycles, the `--length=N` unconditioned segment:
+
+| n | exact | `--fast` | ratio |
+|---:|---:|---:|---:|
+| 54 | 73.3 | 29.7 | 2.47 |
+| 100 | 157.8 | 49.7 | 3.18 |
+| 200 | 538.6 | 151.9 | 3.55 |
+| 400 | 2137.0 | 575.9 | 3.71 |
+
+The reduced-precision arm pulls further ahead with length, which is what a pair track that grows as
+n^2 and contracts as n^3 should do: the longer the chain, the more of the pass is GEMM and the less
+is launch overhead.
 
 ### What the optimisation round moved, in order
 
