@@ -17,6 +17,11 @@ template <int C, int NC = FT_NC, bool RELU = false>
 __host__ __device__ constexpr size_t ftStage() {   // W1 a (and b) chunks [C][NC] (stageSw), W2 chunk [NC][C] (w2Sw)
   return (size_t)(RELU ? 1 : 2) * C * NC * 2 + (size_t)NC * C * 2;
 }
+template <int C, int WARPS, int MT = 1, int NC = FT_NC, bool RELU = false>
+__host__ __device__ constexpr size_t ftSmem() {
+  constexpr size_t xs = (size_t)16 * WARPS * MT * (C + 8) * 2, st = ftStage<C, NC, RELU>();
+  return (xs > st ? xs : st) + st;
+}
 // a W2 stage row is C halves unpadded (128 or 256: 16 or 32 16-byte chunks), the chunk index XOR-swizzled by
 // the row's low three bits: ldmatrix.trans reads eight consecutive rows at one chunk
 template <int C>
@@ -70,11 +75,11 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
   constexpr int FT_ROWS = 16 * WARPS * MT, NTH = 32 * WARPS;
   constexpr int LDX = C + 8, KS = C / 16, NT = C / 8;
-  constexpr size_t STAGE = ftStage<C, NC, RELU>();
+  constexpr size_t STAGE = ftStage<C, NC, RELU>(), FT_XS = (size_t)FT_ROWS * LDX * 2;
+  constexpr size_t OFF0 = FT_XS > STAGE ? FT_XS : STAGE;
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = (half*)smem;                                    // [FT_ROWS][LDX]
-  unsigned char* stages = smem + (size_t)FT_ROWS * LDX * 2;
-  auto W1a = [&](int s) { return (half*)(stages + s * STAGE); };
+  half* Xs = (half*)smem;                                    // [FT_ROWS][LDX]; stage 1 aliases Xs once xa is loaded
+  auto W1a = [&](int s) { return (half*)(smem + (s == 0 ? OFF0 : 0)); };
   auto W1b = [&](int s) { return W1a(s) + (RELU ? 0 : C * NC); };
   auto W2s = [&](int s) { return W1b(s) + C * NC; };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -115,9 +120,6 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
   cpWait<0>();
 #endif
   __syncthreads();
-#if !LF_REG_STAGES
-  if (NST == 2 && 1 < chunks) issue(1, 1);
-#endif
   uint32_t xa[MT][KS][4];
 #pragma unroll
   for (int m = 0; m < MT; ++m) {
@@ -125,6 +127,10 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     for (int ks = 0; ks < KS; ++ks)
       ldsm4(xa[m][ks], Xs + ((warp * MT + m) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   }
+  __syncthreads();
+#if !LF_REG_STAGES
+  if (NST == 2 && 1 < chunks) issue(1, 1);
+#endif
   float acc[MT][NT][4] = {};
   for (int j = 0; j < chunks; ++j) {
     int st = NST == 1 ? 0 : j & 1;
@@ -144,7 +150,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     float2 b1v[NC / 8];
     if constexpr (RELU) {
 #pragma unroll
-      for (int nt = 0; nt < NC / 8; ++nt) b1v[nt] = *reinterpret_cast<const float2*>(b1 + j * NC + nt * 8 + tig * 2);
+      for (int nt = 0; nt < NC / 8; ++nt) b1v[nt] = ptx_ldg_v2_f32(b1 + j * NC + nt * 8 + tig * 2);
     }
     float ha[MT][NC / 8][4] = {}, hb[MT][NC / 8][4] = {};
     constexpr int N2 = NC / 16, STEPS1 = KS * N2;
@@ -192,8 +198,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
         auto gate = [&](int nt, int e) {
-          if constexpr (RELU) return fmaxf(ha[m][nt][e] + ((e & 1) ? b1v[nt].y : b1v[nt].x), 0.f);
-          else { float v = ha[m][nt][e]; return v * sigmH(v) * hb[m][nt][e]; }   // packed to f16 next
+          if constexpr (RELU) return ptx_max_f32(ptx_add_f32(ha[m][nt][e], (e & 1) ? b1v[nt].y : b1v[nt].x), 0.f);
+          else { float v = ha[m][nt][e]; return ptx_mul_f32(ptx_mul_f32(v, sigmH(v)), hb[m][nt][e]); }   // packed to f16 next
         };
         pa[m][0] = pack2(gate(2 * t, 0), gate(2 * t, 1)); pa[m][1] = pack2(gate(2 * t, 2), gate(2 * t, 3));
         pa[m][2] = pack2(gate(2 * t + 1, 0), gate(2 * t + 1, 1)); pa[m][3] = pack2(gate(2 * t + 1, 2), gate(2 * t + 1, 3));
@@ -222,6 +228,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     if (NST == 1 && j + 1 < chunks) issue(j + 1, 0);
 #endif
   }
+  __syncthreads();
   // the residual, through the warp's own Xs rows (only it read them, as its A fragments; the loop's
   // barriers are behind every warp) 64 f32 columns at a time, so the read-modify-write is 16 bytes a lane
   // of whole rows, where a fragment's layout was 8 bytes in each of 8 rows
@@ -233,12 +240,12 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
     const int c = hh * (C / 2) + cl;
-    float4 pv[MT == 1 ? RW / LPR : 1];
+    PairRaw4<PT> pv[MT == 1 ? RW / LPR : 1];
     if constexpr (MT == 1) {
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
         size_t row = baseRow + i * LPR;
-        if (row < rows) pv[i] = pairLd4<PT>(x, row * C + c);
+        if (row < rows) pv[i] = pairLdRaw4<PT>(x, row * C + c);
       }
     }
 #pragma unroll
@@ -246,8 +253,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
       for (int e8 = 0; e8 < NT / 2; ++e8) {
         int et = hh * (NT / 2) + e8, c8 = e8 * 8 + tig * 2;
-        *reinterpret_cast<float2*>(Ys + (m * 16 + g) * LDY + c8) = make_float2(acc[m][et][0], acc[m][et][1]);
-        *reinterpret_cast<float2*>(Ys + (m * 16 + g + 8) * LDY + c8) = make_float2(acc[m][et][2], acc[m][et][3]);
+        ptx_st_shared_v2_f32(Ys + (m * 16 + g) * LDY + c8, acc[m][et][0], acc[m][et][1]);
+        ptx_st_shared_v2_f32(Ys + (m * 16 + g + 8) * LDY + c8, acc[m][et][2], acc[m][et][3]);
       }
     }
     __syncwarp();
@@ -256,26 +263,28 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
       for (int i = 0; i < RW / LPR; ++i) {
         size_t row = baseRow + i * LPR;
         if (row >= rows) continue;
-        float4 a4 = *reinterpret_cast<const float4*>(Ys + (rl0 + i * LPR) * LDY + cl);
-        float4 v = pv[i];
+        float4 a4 = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
+        float4 v = pairUnpack4<PT>(pv[i]);
         if constexpr (RELU) {
-          float4 b4 = *reinterpret_cast<const float4*>(b2 + c);
-          a4.x += b4.x; a4.y += b4.y; a4.z += b4.z; a4.w += b4.w;
+          float4 b4 = ptx_ldg_v4_f32(b2 + c);
+          a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
         }
-        v.x += a4.x; v.y += a4.y; v.z += a4.z; v.w += a4.w; pairSt4<PT>(x, row * C + c, v);
+        v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
+        pairSt4<PT>(x, row * C + c, v);
       }
     } else {
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
         size_t row = baseRow + i * LPR;
         if (row >= rows) continue;
-        float4 a4 = *reinterpret_cast<const float4*>(Ys + (rl0 + i * LPR) * LDY + cl);
+        float4 a4 = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
         float4 v = pairLd4<PT>(x, row * C + c);
         if constexpr (RELU) {
-          float4 b4 = *reinterpret_cast<const float4*>(b2 + c);
-          a4.x += b4.x; a4.y += b4.y; a4.z += b4.z; a4.w += b4.w;
+          float4 b4 = ptx_ldg_v4_f32(b2 + c);
+          a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
         }
-        v.x += a4.x; v.y += a4.y; v.z += a4.z; v.w += a4.w; pairSt4<PT>(x, row * C + c, v);
+        v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
+        pairSt4<PT>(x, row * C + c, v);
       }
     }
     if (hh == 0) __syncwarp();
@@ -354,9 +363,9 @@ __global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restri
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       int c = wn * 16 + nt * 8 + tig * 2;
-      float bb0 = b1[j * NC + c], bb1 = b1[j * NC + c + 1];
-      *reinterpret_cast<half2*>(Hs + (wm * 16 + g) * LDH + c) = __floats2half2_rn(fmaxf(ha[nt][0] + bb0, 0.f), fmaxf(ha[nt][1] + bb1, 0.f));
-      *reinterpret_cast<half2*>(Hs + (wm * 16 + g + 8) * LDH + c) = __floats2half2_rn(fmaxf(ha[nt][2] + bb0, 0.f), fmaxf(ha[nt][3] + bb1, 0.f));
+      float2 bb = ptx_ldg_v2_f32(b1 + j * NC + c);
+      ptx_st_shared_u32(Hs + (wm * 16 + g) * LDH + c, ptx_cvt_f16x2_f32(ptx_max_f32(ptx_add_f32(ha[nt][0], bb.x), 0.f), ptx_max_f32(ptx_add_f32(ha[nt][1], bb.y), 0.f)));
+      ptx_st_shared_u32(Hs + (wm * 16 + g + 8) * LDH + c, ptx_cvt_f16x2_f32(ptx_max_f32(ptx_add_f32(ha[nt][2], bb.x), 0.f), ptx_max_f32(ptx_add_f32(ha[nt][3], bb.y), 0.f)));
     }
     asm volatile("bar.sync %0, 64;" ::"r"(1 + wm) : "memory");     // the pair's two halves
 #pragma unroll
@@ -381,8 +390,8 @@ __global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restri
 #pragma unroll
     for (int e8 = 0; e8 < 8; ++e8) {
       int c = e8 * 8 + tig * 2;
-      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[q * 8 + e8][0], acc[q * 8 + e8][1]);
-      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[q * 8 + e8][2], acc[q * 8 + e8][3]);
+      ptx_st_shared_v2_f32(Ys + g * LDY + c, acc[q * 8 + e8][0], acc[q * 8 + e8][1]);
+      ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[q * 8 + e8][2], acc[q * 8 + e8][3]);
     }
     __syncwarp();
 #pragma unroll
@@ -390,9 +399,13 @@ __global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restri
       int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = wn * (C / 2) + q * 64 + cl;
       size_t row = row0 + wm * 16 + rl;
       if (row >= rows) continue;
-      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl);
+      float4 b4 = ptx_ldg_v4_f32(b2 + c);
       float4 v = pairLd4<PT>(x, row * C + c);
-      v.x += a4.x + b2[c]; v.y += a4.y + b2[c + 1]; v.z += a4.z + b2[c + 2]; v.w += a4.w + b2[c + 3];
+      v.x = ptx_add_f32(v.x, ptx_add_f32(a4.x, b4.x));
+      v.y = ptx_add_f32(v.y, ptx_add_f32(a4.y, b4.y));
+      v.z = ptx_add_f32(v.z, ptx_add_f32(a4.z, b4.z));
+      v.w = ptx_add_f32(v.w, ptx_add_f32(a4.w, b4.w));
       pairSt4<PT>(x, row * C + c, v);
     }
     __syncwarp();
@@ -418,7 +431,7 @@ template <int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, int NST = 2,
 void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
                        const half* W2, const float* b1, const float* b2) {
   constexpr int R = 16 * WARPS * MT;
-  size_t smem = (size_t)R * (C + 8) * 2 + NST * ftStage<C, NC, RELU>();
+  constexpr size_t smem = ftSmem<C, WARPS, MT, NC, RELU>();
   const half* w1t = transitionW1Tiles<RELU>(W1, C, I, NC);
   WITH_PAIR_T(
     static bool attr = false;
@@ -437,10 +450,10 @@ inline bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
 // whether fusedTransitionRaw has a form for this shape on this device (the two-tile form, else the one-tile at 4 warps)
 inline bool fusedTransitionFits(size_t rows, int C, int I) {
   if (!FUSED_TRANSITION) return false;
-  if (C == 64) return (I % 16 == 0) && fitsSmem((size_t)16 * 4 * (64 + 8) * 2 + 2 * ftStage<64, 16, true>());
+  if (C == 64) return (I % 16 == 0) && fitsSmem(ftSmem<64, 4, 1, 16, true>());
   if (C != 128 || I % FT_NC) return false;
-  if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) return true;
-  return fitsSmem((size_t)16 * 4 * (128 + 8) * 2 + 2 * ftStage<128>());
+  if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem(ftSmem<128, 4, 2, 16>())) return true;
+  return fitsSmem(ftSmem<128, 4, 1, FT_NC>());
 }
 template <bool RELU = false>
 inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float* lnScale, const float* lnOffset,
@@ -456,18 +469,18 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   // twice the rows - an RTX PRO 6000's 1,000-residue pair transition 1.20 -> 0.94 ms a call (--bench-pair: two tiles
   // on 4 warps 1.19, one tile on 8 1.03), bit-identical. AF3's SwiGLU form there is unmeasured and keeps the rule below
   if constexpr (RELU) {
-    if (ccMajor() == 12 && (rows + 255) / 256 >= MIN_BLOCKS && fitsSmem((size_t)256 * (128 + 8) * 2 + 2 * ftStage<128, 16, RELU>())) {
+    if (ccMajor() == 12 && (rows + 255) / 256 >= MIN_BLOCKS && fitsSmem(ftSmem<128, 16, 1, 16, RELU>())) {
       fusedTransitionAt<16, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
       return true;
     }
   }
   // a part without cp.async (a T4: register-staged, LF_REG_STAGES): ONE weight stage, so two 64-row blocks of the one-tile
   // form fit its 64 KB SM (29 KB each) where every two-stage form held one block - 4 warps an SM
-  if (FT_ONE_STAGE && ccMajor() < 8 && (rows + 63) / 64 >= MIN_BLOCKS && fitsSmem((size_t)64 * (128 + 8) * 2 + ftStage<128, 16, RELU>())) {
+  if (FT_ONE_STAGE && ccMajor() < 8 && (rows + 63) / 64 >= MIN_BLOCKS && fitsSmem(ftSmem<128, 4, 1, 16, RELU>())) {
     fusedTransitionAt<4, RELU, 1, 16, 1>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     return true;
   }
-  if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16, RELU>())) {
+  if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem(ftSmem<128, 4, 2, 16, RELU>())) {
     static const bool oneTile = [] {
       if (const char* e = getenv("LOCALFOLD_FT_FORM")) return atoi(e) == 1;
       int dev, perSm = 0; CK(cudaGetDevice(&dev));
@@ -478,9 +491,13 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
     else fusedTransitionAt<4, RELU, 2, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     return true;
   }
+  if ((rows + 63) / 64 >= MIN_BLOCKS && fitsSmem(ftSmem<128, 4, 1, 16, RELU>())) {
+    fusedTransitionAt<4, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    return true;
+  }
   int warps = FT_WARPS == 8 && (rows + 127) / 128 < MIN_BLOCKS ? 4 : FT_WARPS;   // a small input: more, smaller blocks
   // no more than the device's shared memory (a T4's 64 KB takes the 4-warp form, or the unfused one)
-  auto smemFor = [](int w) { return (size_t)16 * w * (128 + 8) * 2 + 2 * ftStage<128>(); };
+  auto smemFor = [](int w) { return (size_t)16 * w * (128 + 8) * 2 + ftStage<128, FT_NC, RELU>(); };
   while (warps > 4 && !fitsSmem(smemFor(warps))) warps /= 2;
   if (!fitsSmem(smemFor(warps))) return false;
   if (warps == 4) fusedTransitionAt<4, RELU>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);

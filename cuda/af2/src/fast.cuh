@@ -545,7 +545,7 @@ __global__ void augmentWeightK(const half* w, const float* b, half* out, int K, 
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)(K + 8) * N) return;
   int r = (int)(t / N), c = (int)(t % N);
-  out[t] = r < K ? w[(size_t)r * N + c] : r == K ? __float2half(b[c]) : __float2half(0.f);
+  ptx_st_global_u16(out + t, r < K ? ptx_ldg_u16(w + (size_t)r * N + c) : r == K ? ptx_f32_to_f16_raw(ptx_ldg_f32(b + c)) : (unsigned short)0);
 }
 inline const half* augmentedWeight(const std::string& name, int blk, const float* bias, int K, int N) {
   static std::map<std::pair<std::string, int>, half*> cache;
@@ -558,9 +558,8 @@ inline const half* augmentedWeight(const std::string& name, int blk, const float
 __global__ void onesColumnK(half* x, size_t rows, int K) {     // x [rows, K+8]: column K = 1, K+1.. = 0
   size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows) return;
-  uint4 u = make_uint4(0, 0, 0, 0);
-  reinterpret_cast<half*>(&u)[0] = __float2half(1.f);
-  *reinterpret_cast<uint4*>(x + r * (K + 8) + K) = u;
+  uint4 u = make_uint4((uint32_t)ptx_f32_to_f16_raw(1.f), 0, 0, 0);
+  ptx_st_global_v4_u32(x + r * (K + 8) + K, u);
 }
 // a [rows, K+8] f16 buffer whose last 8 columns are (1, 0, ...), kept per (name, size)
 // a half weight's bf16 copy (MSA16), made once
@@ -568,17 +567,17 @@ __global__ void halfToBf16K(const half* in, __nv_bfloat16* out, size_t n) {
   if ((n & 7) == 0) {
     size_t i8 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i8 < (n >> 3)) {
-      uint4 u = reinterpret_cast<const uint4*>(in)[i8];
-      const half2* h2 = reinterpret_cast<const half2*>(&u);
-      uint4 r; __nv_bfloat162* b2 = reinterpret_cast<__nv_bfloat162*>(&r);
+      uint4 u = ptx_ldg_v4_u32(reinterpret_cast<const uint4*>(in) + i8);
+      const uint32_t* h2 = reinterpret_cast<const uint32_t*>(&u);
+      uint4 r; uint32_t* b2 = reinterpret_cast<uint32_t*>(&r);
 #pragma unroll
-      for (int k = 0; k < 4; ++k) { float2 f = __half22float2(h2[k]); b2[k] = __floats2bfloat162_rn(f.x, f.y); }
-      reinterpret_cast<uint4*>(out)[i8] = r;
+      for (int k = 0; k < 4; ++k) { float2 f = ptx_f16x2_to_f32x2(h2[k]); b2[k] = ptx_cvt_bf16x2_f32(f.x, f.y); }
+      ptx_st_global_v4_u32(reinterpret_cast<uint4*>(out) + i8, r);
     }
     return;
   }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = __float2bfloat16(__half2float(in[i]));
+  if (i < n) ptx_st_global_u16(out + i, ptx_f32_to_bf16_raw(ptx_f16_raw_to_f32(ptx_ldg_u16(in + i))));
 }
 inline const __nv_bfloat16* bf16Of(const half* w, size_t n) {
   static std::map<const half*, __nv_bfloat16*> copies;
@@ -591,9 +590,8 @@ inline const __nv_bfloat16* bf16Of(const half* w, size_t n) {
 __global__ void onesColumnBf16K(__nv_bfloat16* x, size_t rows, int K) {     // as onesColumnK, in bf16
   size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows) return;
-  uint4 u = make_uint4(0, 0, 0, 0);
-  reinterpret_cast<__nv_bfloat16*>(&u)[0] = __float2bfloat16(1.f);
-  *reinterpret_cast<uint4*>(x + r * (K + 8) + K) = u;
+  uint4 u = make_uint4((uint32_t)ptx_f32_to_bf16_raw(1.f), 0, 0, 0);
+  ptx_st_global_v4_u32(x + r * (K + 8) + K, u);
 }
 inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, int K) {
   static std::map<std::string, std::pair<__nv_bfloat16*, size_t>> bufs;

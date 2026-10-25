@@ -119,14 +119,14 @@ transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
     size_t r0 = row0 + warp * 16 + g, r1 = r0 + 8;
 #pragma unroll
     for (int nt = 0; nt < NC / 8; ++nt) {
-      auto gate = [&](int e) { float v = ha[nt][e]; return v * sigmH(v) * hb[nt][e]; };   // rounded to f16 next
+      auto gate = [&](int e) { float v = ha[nt][e]; return ptx_mul_f32(ptx_mul_f32(v, sigmH(v)), hb[nt][e]); };   // rounded to f16 next
       int c = j * NC + nt * 8 + tig * 2;
       if constexpr (std::is_same_v<TG, half>) {
-        if (r0 < rows) *reinterpret_cast<uint32_t*>(gated + r0 * I + c) = pack2(gate(0), gate(1));
-        if (r1 < rows) *reinterpret_cast<uint32_t*>(gated + r1 * I + c) = pack2(gate(2), gate(3));
+        if (r0 < rows) ptx_st_global_u32(gated + r0 * I + c, ptx_cvt_f16x2_f32(gate(0), gate(1)));
+        if (r1 < rows) ptx_st_global_u32(gated + r1 * I + c, ptx_cvt_f16x2_f32(gate(2), gate(3)));
       } else {
-        if (r0 < rows) *reinterpret_cast<__nv_bfloat162*>(gated + r0 * I + c) = __floats2bfloat162_rn(gate(0), gate(1));
-        if (r1 < rows) *reinterpret_cast<__nv_bfloat162*>(gated + r1 * I + c) = __floats2bfloat162_rn(gate(2), gate(3));
+        if (r0 < rows) ptx_st_global_u32(gated + r0 * I + c, ptx_cvt_bf16x2_f32(gate(0), gate(1)));
+        if (r1 < rows) ptx_st_global_u32(gated + r1 * I + c, ptx_cvt_bf16x2_f32(gate(2), gate(3)));
       }
     }
 #if LF_REG_STAGES
