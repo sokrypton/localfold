@@ -34,6 +34,7 @@
 #include "../../featurise/zstd.h"
 #include "contig.h"
 #include "selection.h"
+#include "conditions.h"
 #include "../src/schedule.h"
 #include "atoms.h"
 #include "chirality.h"
@@ -1208,7 +1209,7 @@ int run(int argc, char** argv) {
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
   bool realize = false, atomize = false;
-  string contigStr, selectStr;
+  string contigStr, selectStr, condJson;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -1224,6 +1225,7 @@ int run(int argc, char** argv) {
     else if (a == "--atomize") { realize = true; atomize = true; }
     else if (!a.compare(0, 9, "--contig=")) contigStr = a.substr(9);
     else if (!a.compare(0, 9, "--select=")) selectStr = a.substr(9);
+    else if (!a.compare(0, 13, "--conditions=")) condJson = a.substr(13);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -1254,6 +1256,68 @@ int run(int argc, char** argv) {
       printf("select\t%zu", m.size());
       for (const uint8_t v : m) printf("\t%d", (int)v);
       printf("\n");
+      return 0;
+    }
+    if (!condJson.empty()) {
+      // `--conditions=<json>` with `--contig=` runs the spec path over the structure: contig,
+      // then conditions against the INPUT's residue numbers, and dumps every annotation they
+      // wrote.
+      rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text);
+      vector<int> originalResId = src.site.resId;
+      if (!contigStr.empty()) {
+        const rfd4p::contig::Applied applied = rfd4p::contig::applyContig(src, contigStr);
+        src = applied.atomArray;
+        originalResId = applied.originalResId;
+      }
+      const Json cj = lf::parseJson(condJson);
+      rfd4p::conditions::Spec spec;
+      if (cj.isObject()) {
+        for (const auto& [key, arms] : cj.o) {
+          for (const auto& [value, sels] : arms.o) {
+            vector<rfd4p::conditions::Entry> list;
+            if (sels.isArray()) {
+              for (const Json& e : sels.a) {
+                rfd4p::conditions::Entry entry;
+                const Json* sel = e.get("select");
+                if (sel && sel->isString()) entry.select = sel->s;
+                const Json* grp = e.get("group");
+                if (grp && !Json::absent(grp)) {
+                  entry.hasGroup = true;
+                  entry.group = grp->isString() ? grp->s : std::to_string((long long)grp->n);
+                }
+                list.push_back(entry);
+              }
+            }
+            auto sAt = std::find_if(spec.begin(), spec.end(),
+                                    [&](const auto& kv) { return kv.first == key; });
+            if (sAt == spec.end()) { spec.push_back({key, {}}); sAt = spec.end() - 1; }
+            sAt->second.push_back({value, list});
+          }
+        }
+      }
+      rfd4p::conditions::applyConditions(src, spec, originalResId);
+      printf("cond\t%zu\n", src.n());
+      // 🔴 `res_id` TOO, because the whole function runs with the INPUT's numbering swapped in
+      // and puts the assembled one back at the end. Dumping only the annotations leaves that
+      // restore unobserved - removing it left every case green.
+      printf("condresid");
+      for (const int v : src.site.resId) printf("\t%d", v);
+      printf("\n");
+      for (const auto& [key, v] : src.ann.ints) {
+        printf("condi\t%s", key.c_str());
+        for (const int x : v) printf("\t%d", x);
+        printf("\n");
+      }
+      for (const auto& [key, v] : src.ann.floats) {
+        printf("condf\t%s", key.c_str());
+        for (const double x : v) printf("\t%.17g", x);
+        printf("\n");
+      }
+      for (const auto& [key, v] : src.ann.strings) {
+        printf("conds\t%s", key.c_str());
+        for (const string& x : v) printf("\t%s", x.c_str());
+        printf("\n");
+      }
       return 0;
     }
     if (!contigStr.empty()) {

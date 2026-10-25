@@ -17,7 +17,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
 import { STANDARD_POLYMER_RESIDUES } from "../../../shared/rfd4p/encoding.js";
-import { applyContig, evalSelection } from "../../../shared/rfd4p/pipeline/spec.js";
+import { applyContig, evalSelection, applyConditions } from "../../../shared/rfd4p/pipeline/spec.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -443,6 +443,39 @@ function selectionsFor(js) {
     `sel('${cid}/*/*/${atom}')`,
     `sel('*/${js.res_name[0]}/*/*')`,
     `sel('${cid}/*/[${pick[0]}]/*')|sel('${cid}/*/[${pick[2]}]/*')`,
+  ];
+}
+
+/**
+ * The conditions to try, over whichever chain this structure has: one of every dtype the
+ * registry's shipped presets use.
+ *
+ * 🔴 THE SHIPPED EXAMPLES ARE ALREADY POST-CONTIG, so these run WITHOUT one - `ppi_pdl1.cif.zst`
+ * carries chain A as a one-atom sentinel and chain B as the target, which is what
+ * `applyContig('A18-132,/0,76-76')` produced, not what it takes. Re-applying the preset's own
+ * contig to its own output matches no atoms, which is the right refusal and the wrong test.
+ */
+function conditionsFor(js) {
+  const chains = [...new Set(js.chain_id)].sort();
+  if (!chains.length) return [];
+  const cid = chains[chains.length - 1];
+  const ids = [...new Set(js.res_id.filter((_, i) => js.chain_id[i] === cid))].sort((a, b) => a - b);
+  if (ids.length < 4) return [];
+  const all = `sel('${cid}/*/*/*')`;
+  const few = `sel('${cid}/*/[${ids[1]},${ids[2]}]/*')`;
+  return [
+    ["coord", { C_CRD: { true: [{ select: all }] } }],
+    ["coord-off", { C_CRD: { true: [{ select: all }], false: [{ select: few }] } }],
+    ["seq", { C_SEQ: { true: [{ select: all }] } }],
+    ["seq-name", { C_SEQ: { ALA: [{ select: few }] } }],
+    ["hotspot", { C_HOT: { true: [{ select: few }] } }],
+    ["crdgrp", { C_CRD: { true: [{ select: all }] }, C_CRDGRP: { 2: [{ select: few }] } }],
+    ["secondary", { C_SEC: { HELIX: [{ select: few }] } }],
+    ["cath", { C_CATH: { "3.40.50": [{ select: all }] } }],
+    ["unindexed", { C_IDX: { false: [{ select: few, group: "m1" }] } }],
+    ["two-groups", { C_IDX: { false: [
+      { select: `sel('${cid}/*/[${ids[1]}]/*')`, group: "m1" },
+      { select: `sel('${cid}/*/[${ids[2]}]/*')`, group: "m2" }] } }],
   ];
 }
 
@@ -1025,6 +1058,107 @@ for (const [name, text] of cases) {
     else {
       const bad = got.filter((v, i) => v !== want[i]).length;
       if (bad) wrong.push(`select ${sel} ${bad} of ${want.length}`);
+    }
+  }
+
+  // `applyConditions` over a real atom array - one case per dtype the presets use. The
+  // annotations each one writes are compared WHOLE, by name and by value.
+  for (const [label, spec] of conditionsFor(js)) {
+    let out;
+    try {
+      out = execFileSync(binary, ["x", `--dump-cif=${path}`, `--conditions=${JSON.stringify(spec)}`],
+        { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    } catch (err) {
+      wrong.push(`cond ${label} refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+      continue;
+    }
+    const ref = parseCifToAtomArray(text);
+    try {
+      applyConditions(ref, spec, ref.res_id.slice());
+    } catch (err) {
+      wrong.push(`cond ${label} reference threw: ${err.message}`);
+      continue;
+    }
+    const got = new Map();
+    for (const l of out) {
+      if (!/^cond[ifs]\t/.test(l)) continue;
+      const f = l.split("\t");
+      got.set(f[1], { kind: f[0], values: f.slice(2) });
+    }
+    for (const [key, want] of Object.entries(ref.annotations)) {
+      const g = got.get(key);
+      if (!g) { wrong.push(`cond ${label} ${key} missing`); continue; }
+      const flat = Array.isArray(want[0]) ? want.flat() : want;
+      if (g.values.length !== flat.length) {
+        wrong.push(`cond ${label} ${key} ${g.values.length} vs ${flat.length}`);
+        continue;
+      }
+      const bad = g.kind === "conds"
+        ? g.values.filter((v, i) => v !== String(flat[i])).length
+        : g.values.filter((v, i) => !eq(Number(v), Number(flat[i]))).length;
+      if (bad) wrong.push(`cond ${label} ${key} ${bad}`);
+    }
+    for (const key of got.keys()) {
+      if (!(key in ref.annotations)) wrong.push(`cond ${label} ${key} extra`);
+    }
+    const residLine = out.find((l) => l.startsWith("condresid\t"));
+    if (!residLine) wrong.push(`cond ${label} res_id missing`);
+    else {
+      const g = residLine.split("\t").slice(1).map(Number);
+      const bad = g.filter((v, i) => v !== ref.res_id[i]).length;
+      if (bad || g.length !== ref.res_id.length) wrong.push(`cond ${label} res_id ${bad}`);
+    }
+  }
+
+  // 🔴 AND ONE CASE IN THE PIPELINE'S OWN ORDER: contig FIRST, then conditions written against
+  // the INPUT's residue numbers. Without it the gate hands `applyConditions` an
+  // `originalResId` equal to `res_id`, so the swap that makes a motif selection mean what it
+  // says is a no-op and removing it leaves everything green.
+  for (const spec of contigsFor(name, js).slice(0, 1)) {
+    const chains = [...new Set(js.chain_id)].sort();
+    const cid = chains[chains.length - 1];
+    const ids = [...new Set(js.res_id.filter((_, i) => js.chain_id[i] === cid))]
+      .sort((a, b) => a - b);
+    if (ids.length < 6) continue;
+    const cond = { C_SEQ: { true: [{ select: `sel('${cid}/*/[${ids[1]},${ids[3]}]/*')` }] } };
+    let out;
+    try {
+      out = execFileSync(binary, ["x", `--dump-cif=${path}`, `--contig=${spec}`,
+        `--conditions=${JSON.stringify(cond)}`],
+        { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    } catch (err) {
+      wrong.push(`contig+cond refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+      continue;
+    }
+    let ref;
+    try {
+      const applied = applyContig(parseCifToAtomArray(text), spec);
+      ref = applied.atomArray;
+      applyConditions(ref, cond, applied.originalResId);
+    } catch (err) {
+      wrong.push(`contig+cond reference threw: ${err.message}`);
+      continue;
+    }
+    // 🔴 AND `res_id` HERE, where the swapped-in numbering really differs from the assembled
+    // one. In the conditions-only cases above both are the same array, so the swap AND the
+    // restore are identity and neither can be seen.
+    const residLine = out.find((l) => l.startsWith("condresid\t"));
+    if (!residLine) wrong.push("contig+cond res_id missing");
+    else {
+      const g = residLine.split("\t").slice(1).map(Number);
+      const bad = g.filter((v, i) => v !== ref.res_id[i]).length;
+      if (bad || g.length !== ref.res_id.length) wrong.push(`contig+cond res_id ${bad}`);
+    }
+    const line = out.find((l) => l.startsWith("conds\tcondition_sequence_1_residue\t"));
+    const want = ref.annotations.condition_sequence_1_residue;
+    if (!line) wrong.push("contig+cond sequence missing");
+    else if (want) {
+      const g = line.split("\t").slice(2);
+      if (g.length !== want.length) wrong.push(`contig+cond sequence ${g.length} vs ${want.length}`);
+      else {
+        const bad = g.filter((v, i) => v !== String(want[i])).length;
+        if (bad) wrong.push(`contig+cond sequence ${bad}`);
+      }
     }
   }
 

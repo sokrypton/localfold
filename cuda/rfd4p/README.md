@@ -538,8 +538,11 @@ residues the cropped example does not contain, so building one from the spec fai
     `originalResId`. The selection language reads real atoms too
     (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
     which is what every structure preset writes and what the contig-only subset could not say.
-    What is left of the structure path is `applyConditions` over an atom array,
-    `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
+    `applyConditions` writes those selections onto the atoms
+    (`featurise/conditions.h`), every dtype the presets use. What is left of the structure path
+    is wiring it into the JOB path - the stages all exist and are gated, but `--spec` still
+    refuses a structure input - plus `processSampleToAtoms`'s `inputAtoms` path and the
+    coordinate-group permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
@@ -684,6 +687,24 @@ residues the cropped example does not contain, so building one from the spec fai
     unioning (9) - and two are provably inert and say so: the already-matched skip, since the
     loop only ever SETS a bit, and the residue-number normalisation, since every preset writes
     clean numbers.
+
+    🔴 **AND `applyConditions`' ARMS ARE APPLIED IN JSON ORDER, WHICH A `std::map` DESTROYS.**
+    A `C_CRD` with a `true` arm over a chain and a `false` arm over two of its residues is one
+    condition with two arms, and the LAST applied wins; sorted, `"false"` came before `"true"`
+    and the false arm was overwritten instead of overwriting - **48 coordinates and 16 groups
+    wrong on every structure**. The JSON reader was already order-preserving; the container
+    threw it away. Two conventions that read backwards are pinned beside it: `C_SEQ: {true}`
+    writes the residue's OWN NAME rather than the string `"true"` (13 cases), and a CATH code
+    gains a trailing `.x`, so `3.40.50` is stored `3.40.50.x` - the fourth level unnamed means
+    ANY, not missing (13 cases).
+
+    🔴 **AND THE GATE COULD NOT SEE THE RESIDUE-NUMBER SWAP, TWICE OVER.** `applyConditions`
+    evaluates selections against the INPUT's numbering - `applyContig` renumbers every
+    preserved segment from 1 - and puts the assembled numbering back at the end. Running
+    conditions with `originalResId` equal to `res_id` makes BOTH identity, so deleting either
+    left all seventeen green. A case in the pipeline's real order (contig, then conditions)
+    reddens the swap on 2 structures, and dumping `res_id` reddens the restore on 8. Same root
+    cause as the four above: **an input on which the thing under test cannot act**.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
