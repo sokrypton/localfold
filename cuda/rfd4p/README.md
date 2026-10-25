@@ -10,6 +10,11 @@ generated 53 residues, 265 atoms over 25 steps (52 trunk passes) -> design.pdb
   sampling 0.42 s
 ```
 
+`--out=design.cif` writes mmCIF, which is what RFD4-Proteina itself writes; `--out=design.pdb`
+writes PDB. 🔴 **A multi-chain design comes out as more than one chain now** - every atom used to
+go into chain A, which for a binder or a complex is a structure no viewer and no scorer can read
+correctly, and which no RMSD or bond check would ever have noticed.
+
 A real job end to end - 100 residues, 60 steps, from the file to the PDB - is **1.74 s of wall
 clock**, of which 1.04 is the sampler and the rest is the weights and the featurisation.
 
@@ -482,9 +487,8 @@ residues the cropped example does not contain, so building one from the spec fai
 - **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
   group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
   shipped preset has one.
-- **Writing an mmCIF**, and mapping an insertion back onto the input structure
-  (`processSampleToAtoms`'s `inputAtoms` path, with the Hungarian assignment). The port writes a
-  PDB from the fallback path.
+- **Mapping an insertion back onto the input structure** (`processSampleToAtoms`'s `inputAtoms`
+  path, with the Hungarian assignment). The port writes its own records.
 - **A padded input**, so the masking paths are written and unexercised.
 - **Anything but an unconditional monomer through `--generate`.** The export REFUSES an input whose
   per-step features are more than the noised state, rather than silently freezing a feature that

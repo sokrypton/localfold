@@ -483,6 +483,30 @@ def main() -> int:
                       if caca else f"  {'int8 job':10s} no structure  FAILED")
                 got["int8_job"] = {"caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
 
+            # 🔴 AND A TWO-CHAIN DESIGN MUST COME OUT AS TWO CHAINS, in both formats. The writer
+            # used to put every atom in chain A - the chains were in the batch and simply not
+            # carried to it - which for a binder or a complex is a structure no viewer and no
+            # scorer can read correctly, and which no RMSD or bond check would ever notice.
+            pair = HERE / "featurise" / "gate-pair.json"
+            seen = {}
+            for ext in ("pdb", "cif"):
+                out_pdb = HERE / f"gate-pair.{ext}"
+                run([BINARY, f"--job={pair}", f"--weights={args.weights}",
+                     f"--work-dir={HERE / 'gate-pair'}", f"--out={out_pdb}", "--fast"], cwd=REPO)
+                text = out_pdb.read_text() if out_pdb.exists() else ""
+                if ext == "pdb":
+                    seen[ext] = sorted({l[21] for l in text.splitlines()
+                                        if l.startswith("ATOM")})
+                else:
+                    seen[ext] = sorted({l.split()[6] for l in text.splitlines()
+                                        if l.startswith("ATOM ")})
+            ok = seen.get("pdb") == ["A", "B"] and seen.get("cif") == ["A", "B"]
+            if not ok:
+                failed += 1
+            print(f"  {'chains':10s} a two-chain job writes {seen.get('pdb')} as PDB and "
+                  f"{seen.get('cif')} as mmCIF  {'ok ' if ok else 'WRONG'}")
+            got["chains"] = {"pdb": seen.get("pdb"), "cif": seen.get("cif")}
+
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:
         ensure_inputs(case_dir, None, export_flags)

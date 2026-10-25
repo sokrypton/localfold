@@ -18,3 +18,6 @@ featurise/gate-refusal.json
 gate-refused/
 gate-job-int8/
 gate-job-int8.pdb
+gate-pair/
+gate-pair.pdb
+gate-pair.cif

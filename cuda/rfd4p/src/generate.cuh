@@ -109,15 +109,91 @@ inline GenOut postprocess(int n, int nTypes, const std::vector<float>& logits,
   return out;
 }
 
+/** A chain index as mmCIF/PDB names them: A..Z, then AA, BB, ... as the reference's own does. */
+inline std::string chainName(int idx) {
+  if (idx < 26) return std::string(1, (char)('A' + idx));
+  const int k = idx - 26;
+  return std::string(k / 26 + 2, (char)('A' + k % 26));
+}
+
+/** `_atom_site.label_atom_id`: a name with a quote in it (`O5'`) is quoted. */
+inline std::string cifAtomName(const std::string& name) {
+  if (name.empty()) return ".";
+  if (name.find('\'') != std::string::npos || name.find(' ') != std::string::npos) {
+    return "\"" + name + "\"";
+  }
+  return name;
+}
+
+/**
+ * `Cartn_x` and its two neighbours, to three decimals ROUND-HALF-TO-EVEN - which is NumPy's and
+ * Biotite's, and so the reference's. `%.3f` is round-half-away-from-zero and differs on an exact
+ * half, which a coordinate hits often enough to notice when two files are diffed.
+ */
+inline std::string cifCoord(float v) {
+  const double scaled = (double)v * 1000.0;
+  const double fl = std::floor(scaled);
+  const double diff = scaled - fl;
+  double rounded;
+  if (std::fabs(diff - 0.5) < 1e-6) rounded = std::fmod(fl, 2.0) == 0 ? fl : fl + 1;
+  else rounded = std::floor(scaled + 0.5);
+  char buf[32];
+  snprintf(buf, sizeof buf, "%.3f", rounded / 1000.0);
+  return buf;
+}
+
+/**
+ * The structure as mmCIF (`toCifString`), which is the format RFD4-Proteina itself writes.
+ * `atomNames` is 37 long, `resNames` 147, `chainOf` one chain index a token.
+ */
+inline std::string toCif(const GenOut& g, int n, const std::vector<std::string>& atomNames,
+                         const std::vector<std::string>& resNames,
+                         const std::vector<int>& chainOf) {
+  static const char* COLUMNS[] = {
+      "group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id", "label_comp_id",
+      "label_asym_id", "label_entity_id", "label_seq_id", "pdbx_PDB_ins_code", "auth_seq_id",
+      "auth_comp_id", "auth_asym_id", "auth_atom_id", "B_iso_or_equiv", "occupancy",
+      "pdbx_formal_charge", "is_unindexed_insertion",
+      "annotation_src-coordinate-conditioned-region_1_atom", "Cartn_x", "Cartn_y", "Cartn_z",
+      "pdbx_PDB_model_num"};
+  std::string out = "data_rfd4p_design\n#\nloop_\n";
+  for (const char* c : COLUMNS) out += std::string("_atom_site.") + c + "\n";
+  int serial = 1;
+  char line[512];
+  for (int i = 0; i < n; ++i) {
+    const int rt = g.residueType[i];
+    const std::string res = rt >= 0 && rt < (int)resNames.size() ? resNames[rt] : "UNK";
+    const std::string chain = chainName(i < (int)chainOf.size() ? chainOf[i] : 0);
+    for (int a = 0; a < 37; ++a) {
+      if (!g.atomMask[(size_t)i * 37 + a]) continue;
+      const std::string name = cifAtomName(atomNames[a]);
+      snprintf(line, sizeof line, "ATOM %d %s %s . %s %s 0 %d . %d %s %s %s nan 1.0 ? False . %s %s %s 1\n",
+               serial++, atomNames[a].substr(0, 1).c_str(), name.c_str(), res.c_str(),
+               chain.c_str(), i + 1, i + 1, res.c_str(), chain.c_str(), name.c_str(),
+               cifCoord(g.coors[(size_t)i * 111 + a * 3]).c_str(),
+               cifCoord(g.coors[(size_t)i * 111 + a * 3 + 1]).c_str(),
+               cifCoord(g.coors[(size_t)i * 111 + a * 3 + 2]).c_str());
+      out += line;
+    }
+  }
+  out += "#\n";
+  return out;
+}
+
 /** The structure as PDB records. `atomNames` is 37 long, `resNames` 147. */
 inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>& atomNames,
-                         const std::vector<std::string>& resNames) {
+                         const std::vector<std::string>& resNames,
+                         const std::vector<int>& chainOf) {
   std::string out;
   char line[96];
   int serial = 1;
   for (int i = 0; i < n; ++i) {
     const int rt = g.residueType[i];
     const std::string res = rt >= 0 && rt < (int)resNames.size() ? resNames[rt] : "UNK";
+    // 🔴 THE CHAIN, NOT A LITERAL 'A'. Every atom used to go into chain A, which for a binder or
+    // a complex is a structure no viewer and no scorer can read correctly - the chains are there
+    // in the batch and were simply not carried to the writer.
+    const char chain = chainName(i < (int)chainOf.size() ? chainOf[i] : 0)[0];
     for (int a = 0; a < 37; ++a) {
       if (!g.atomMask[(size_t)i * 37 + a]) continue;
       const std::string& name = atomNames[a];
@@ -125,8 +201,8 @@ inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>&
       char field[5];
       snprintf(field, sizeof field, name.size() >= 4 ? "%-4s" : " %-3s", name.c_str());
       snprintf(line, sizeof line,
-               "ATOM  %5d %4s %3s A%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n", serial++,
-               field, res.c_str(), i + 1, g.coors[(size_t)i * 111 + a * 3],
+               "ATOM  %5d %4s %3s %c%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n", serial++,
+               field, res.c_str(), chain, i + 1, g.coors[(size_t)i * 111 + a * 3],
                g.coors[(size_t)i * 111 + a * 3 + 1], g.coors[(size_t)i * 111 + a * 3 + 2],
                name.substr(0, 1).c_str());
       out += line;

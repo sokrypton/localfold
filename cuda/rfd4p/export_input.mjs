@@ -476,6 +476,10 @@ if (generate) {
     "g/stochastic": Int32Array.from(stepNoise),
     "g/coordCond": Int32Array.from(field("coord_cond_mask"), (v) => (v ? 1 : 0)),
     "g/moleculeIid": Int32Array.from(field("molecule_iid")),
+    // 🔴 THE CHAIN, SO A MULTI-CHAIN DESIGN COMES OUT AS MORE THAN ONE CHAIN. Without it the
+    // port wrote every atom into chain A, which for a binder or a complex is a structure no
+    // viewer and no scorer can read correctly.
+    "g/chainIid": Int32Array.from(field("chain_iid")),
     "g/allowedTypes": Int32Array.from(ALLOWED_RESIDUE_TYPES.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/atom37Legal": Int32Array.from(UNIFIED_RESTYPE_ATOM37_MASK.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/coordGroup": Int32Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : new Int32Array(n * 37).fill(-1)),

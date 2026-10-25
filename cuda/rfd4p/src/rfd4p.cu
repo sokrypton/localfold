@@ -577,8 +577,15 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
             atomNames.size(), resNames.size());
     return 1;
   }
-  const std::string pdb = rfd4p::toPdb(g, n, atomNames, resNames);
-  std::ofstream(o.out) << pdb;
+  // 🔴 THE FORMAT FOLLOWS THE NAME, because mmCIF is what RFD4-Proteina itself writes and a PDB
+  // cannot carry a long chain id or more than 99,999 atoms. `--out=design.cif` gets a CIF.
+  const std::vector<int> chainOf =
+      M.has("g/chainIid")
+          ? std::vector<int>(M.i("g/chainIid"), M.i("g/chainIid") + n)
+          : std::vector<int>(n, 0);
+  const bool wantCif = o.out.size() > 4 && o.out.compare(o.out.size() - 4, 4, ".cif") == 0;
+  std::ofstream(o.out) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf)
+                                   : rfd4p::toPdb(g, n, atomNames, resNames, chainOf));
   int atoms = 0, residues = 0;
   for (int i = 0; i < n; ++i) {
     if (g.residueType[i] >= 0) ++residues;

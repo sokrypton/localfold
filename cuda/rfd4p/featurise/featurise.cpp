@@ -1199,6 +1199,7 @@ int run(int argc, char** argv) {
     }
     g.ints("g/coordCond", cc);
     g.ints("g/moleculeIid", mi);
+    g.ints("g/chainIid", b.chainIid);
     g.ints("g/condSeq", cs);
     vector<int> allowed(tables::ALLOWED_RESIDUE_TYPES.begin(), tables::ALLOWED_RESIDUE_TYPES.end());
     vector<int> legal(tables::RESTYPE_ATOM37_MASK.begin(), tables::RESTYPE_ATOM37_MASK.end());

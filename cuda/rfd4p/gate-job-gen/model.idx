@@ -24,7 +24,8 @@ i g/depths 367163 10
 i g/stochastic 367173 20
 i g/coordCond 367193 24
 i g/moleculeIid 367217 24
-i g/condSeq 367241 24
-i g/allowedTypes 367265 1029
-i g/atom37Legal 368294 5439
-i g/coordGroup 373733 888
+i g/chainIid 367241 24
+i g/condSeq 367265 24
+i g/allowedTypes 367289 1029
+i g/atom37Legal 368318 5439
+i g/coordGroup 373757 888
