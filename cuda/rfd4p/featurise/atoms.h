@@ -979,6 +979,12 @@ inline void bondFlankingResidues(AtomArray& a, int prevRes, int nextRes,
  * 🔴 AND THE COPY'S TOKEN IDS ARE TRANSIENT. `addGlobalTokenIdAnnotation` runs again at the end
  * and renumbers everything, so `nextCopyTokenId` only ever reaches the output through
  * `insertion_source_idx` - which is -1 at inference anyway.
+ *
+ * 🔴 AND THE TRAINING BRANCH OF THAT LINE IS NOT PORTED FAITHFULLY, DELIBERATELY. The reference
+ * reads `motif.token_id[s]` two lines AFTER replacing `motif.token_id` with a fresh empty array,
+ * so at `isInference: false` it writes `undefined` into every `insertion_source_idx`. This reads
+ * the original token id instead. Nothing here runs that path - it is inference-only - and
+ * reproducing a read of a cleared array would be porting a defect rather than a convention.
  */
 inline void unindexFlaggedTokens(AtomArray& a, bool isInference = true) {
   const size_t n = a.n();
@@ -1309,6 +1315,362 @@ inline vector<int> buildAtom37Slots(const AtomArray& a) {
     if (it != atom37KeyToSlot().end()) slots[i] = it->second;
   }
   return slots;
+}
+
+/** `BOND_TYPE_TO_ORDER`: 🔴 a QUADRUPLE bond is order ONE and a COORDINATION bond is order
+ *  FOUR. Not a transcription slip - the table is the reference's, and the obvious reading of
+ *  either name gives the other's number. */
+inline int bondTypeToOrder(int bt) {
+  switch (bt) {
+    case tables::BT_DOUBLE: case tables::BT_AROMATIC_DOUBLE: return 2;
+    case tables::BT_TRIPLE: case tables::BT_AROMATIC_TRIPLE: return 3;
+    case tables::BT_COORDINATION: return 4;
+    default: return 1;
+  }
+}
+inline bool bondTypeIsAromatic(int bt) {
+  return bt == tables::BT_AROMATIC_SINGLE || bt == tables::BT_AROMATIC_DOUBLE ||
+         bt == tables::BT_AROMATIC_TRIPLE || bt == tables::BT_AROMATIC;
+}
+
+/**
+ * `computeTokenPathLengths`: a BFS from every source over the token graph.
+ *
+ * 🔴 ZERO MEANS "NOT REACHED" AND ALSO "ITSELF", because only `d > 0` is written. The matrix
+ * starts zeroed and an unreachable pair keeps that zero, so a port that wrote -1 for
+ * unreachable would be reporting something the model has never been shown.
+ */
+inline vector<int16_t> computeTokenPathLengths(const vector<int>& tok1, const vector<int>& tok2,
+                                               const vector<int>& sources, int cutoff = 64) {
+  const size_t nSources = sources.size();
+  vector<int16_t> dist(nSources * nSources, 0);
+  if (nSources == 0 || tok1.empty()) return dist;
+  int maxNode = 0;
+  for (const int v : tok1) maxNode = std::max(maxNode, v);
+  for (const int v : tok2) maxNode = std::max(maxNode, v);
+  for (const int v : sources) maxNode = std::max(maxNode, v);
+  const size_t nNodes = (size_t)maxNode + 1;
+  vector<vector<int>> adj(nNodes);
+  for (size_t i = 0; i < tok1.size(); ++i) {
+    adj[tok1[i]].push_back(tok2[i]);
+    adj[tok2[i]].push_back(tok1[i]);
+  }
+  vector<int> d(nNodes), queue(nNodes);
+  for (size_t s = 0; s < nSources; ++s) {
+    std::fill(d.begin(), d.end(), -1);
+    d[sources[s]] = 0;
+    size_t head = 0, tail = 0;
+    queue[tail++] = sources[s];
+    while (head < tail) {
+      const int u = queue[head++];
+      for (const int v : adj[u]) {
+        if (d[v] == -1) { d[v] = d[u] + 1; queue[tail++] = v; }
+      }
+    }
+    for (size_t t = 0; t < nSources; ++t) {
+      const int dv = d[sources[t]];
+      if (dv > 0) dist[s * nSources + t] = (int16_t)(dv > cutoff ? cutoff + 1 : dv);
+    }
+  }
+  return dist;
+}
+
+/** The five token-level bond planes, each `[nTokens, nTokens]`. */
+struct TokenBondFeatures {
+  size_t n = 0;
+  vector<uint8_t> bondMask, isAromatic;
+  vector<int16_t> bondOrder, pathLength;
+  vector<int8_t> canonical;
+};
+
+/**
+ * `computeTokenBondFeatures`: the bond planes over the DIRECT tokens, then copied onto the
+ * unindexed borrowers that point at them.
+ *
+ * 🔴 A BORROWER TOKEN COMPUTES NOTHING. Every plane is built over the tokens with no
+ * `insertion_source_idx`, and a borrower's row is COPIED from the row of the token it came
+ * from - within its own index group only. So the matrices are built at one size and written at
+ * another, and getting that wrong gives a plausible matrix of the right shape.
+ *
+ * 🔴 AND AT INFERENCE THERE ARE NO BORROWERS, SO THAT COPY IS DEAD CODE HERE. `unindexFlaggedTokens`
+ * writes `srcTok = isInference ? -1 : ...`, so every token's source is -1, `nDirect == nTotal`,
+ * and deleting the borrower block leaves all sixteen gate cases green. It is kept because it is
+ * the reference's, and recorded here so nobody reads its passing as evidence.
+ *
+ * 🔴 AND A BOND BETWEEN TWO POLYMER TOKENS IS SUPPRESSED ONCE IT IS DIRECTIONAL. `suppress`
+ * clears `bond_mask`, `bond_order` and `is_aromatic` for exactly the pairs
+ * `canonical_polymer_ordering` describes - the backbone is told to the model as an ORDER, not
+ * as a bond, and leaving both in says the same thing twice.
+ *
+ * 🔴 AND THE PATH LENGTHS ARE MEASURED OVER A GRAPH WITH INVENTED NODES IN IT.
+ * `_fill_res_id_gaps` threads `gap - 1` virtual tokens through an unbonded `res_id` gap, so two
+ * residues numbered ten apart are ten steps apart rather than unreachable. They exist only for
+ * the BFS and never appear in the output.
+ */
+inline TokenBondFeatures computeTokenBondFeatures(const AtomArray& a, int pathLengthCutoff = 64,
+                                                  bool fillResIdGaps = true) {
+  const size_t nAtoms = a.n();
+  const vector<int> tokenBounds = tokenStarts(a);
+  const size_t nTotal = tokenBounds.empty() ? 0 : tokenBounds.size() - 1;
+  TokenBondFeatures out;
+  out.n = nTotal;
+  out.bondMask.assign(nTotal * nTotal, 0);
+  out.isAromatic.assign(nTotal * nTotal, 0);
+  out.bondOrder.assign(nTotal * nTotal, 0);
+  out.pathLength.assign(nTotal * nTotal, 0);
+  out.canonical.assign(nTotal * nTotal, 0);
+  if (nTotal == 0) return out;
+
+  vector<int> atomToToken(nAtoms, 0);
+  for (size_t t = 0; t < nTotal; ++t) {
+    for (int i = tokenBounds[t]; i < tokenBounds[t + 1]; ++i) atomToToken[i] = (int)t;
+  }
+  vector<int> insSrc(nAtoms, -1);
+  if (a.insertionSourceIdx.size() == nAtoms) insSrc = a.insertionSourceIdx;
+  vector<int> srcPerTok(nTotal);
+  vector<uint8_t> isTokWithSrc(nTotal);
+  size_t nDirect = 0;
+  for (size_t t = 0; t < nTotal; ++t) {
+    srcPerTok[t] = insSrc[tokenBounds[t]];
+    isTokWithSrc[t] = srcPerTok[t] != -1;
+    if (!isTokWithSrc[t]) ++nDirect;
+  }
+  vector<int> toksWithSrc, srcToks;
+  for (size_t t = 0; t < nTotal; ++t) {
+    if (isTokWithSrc[t]) { toksWithSrc.push_back((int)t); srcToks.push_back(srcPerTok[t]); }
+  }
+
+  vector<int> idxGrp;
+  auto grpIt = a.ann.ints.find("condition_index-group_1_token");
+  idxGrp = grpIt != a.ann.ints.end() && grpIt->second.size() == nAtoms ? grpIt->second
+                                                                      : defaultIndexGroups(a);
+  vector<int> tokGroups(nTotal);
+  for (size_t t = 0; t < nTotal; ++t) tokGroups[t] = idxGrp[tokenBounds[t]];
+
+  vector<uint8_t> isDirectAtom(nAtoms, 0);
+  for (size_t t = 0; t < nTotal; ++t) {
+    if (isTokWithSrc[t]) continue;
+    for (int i = tokenBounds[t]; i < tokenBounds[t + 1]; ++i) isDirectAtom[i] = 1;
+  }
+
+  vector<int> edgeTok1, edgeTok2, edgeBt, edgeAtom1, edgeAtom2;
+  for (const cif::Bond& b : a.bonds) {
+    if (!isDirectAtom[b.u] || !isDirectAtom[b.v]) continue;
+    const int t1 = atomToToken[b.u], t2 = atomToToken[b.v];
+    if (t1 == t2) continue;
+    edgeTok1.push_back(t1); edgeTok2.push_back(t2); edgeBt.push_back(b.type);
+    edgeAtom1.push_back(b.u); edgeAtom2.push_back(b.v);
+  }
+
+  const int16_t SENTINEL = 32767;
+  vector<uint8_t> dMask(nDirect * nDirect, 0), dArom(nDirect * nDirect, 0);
+  vector<int16_t> work(nDirect * nDirect, SENTINEL);
+  for (size_t e = 0; e < edgeTok1.size(); ++e) {
+    const int t1 = edgeTok1[e], t2 = edgeTok2[e];
+    const int16_t ord = (int16_t)bondTypeToOrder(edgeBt[e]);
+    dMask[t1 * nDirect + t2] = dMask[t2 * nDirect + t1] = 1;
+    work[t1 * nDirect + t2] = std::min(work[t1 * nDirect + t2], ord);
+    work[t2 * nDirect + t1] = std::min(work[t2 * nDirect + t1], ord);
+    if (bondTypeIsAromatic(edgeBt[e])) {
+      dArom[t1 * nDirect + t2] = dArom[t2 * nDirect + t1] = 1;
+    }
+  }
+  vector<int16_t> dOrder(nDirect * nDirect, 0);
+  for (size_t i = 0; i < dOrder.size(); ++i) dOrder[i] = work[i] < SENTINEL ? work[i] : 0;
+  for (size_t t = 0; t < nDirect; ++t) {
+    dMask[t * nDirect + t] = 0; dOrder[t * nDirect + t] = 0; dArom[t * nDirect + t] = 0;
+  }
+
+  vector<int> directTokStarts, directTokGroups;
+  for (size_t t = 0; t < nTotal; ++t) {
+    if (isTokWithSrc[t]) continue;
+    directTokStarts.push_back(tokenBounds[t]);
+    directTokGroups.push_back(tokGroups[t]);
+  }
+  vector<uint8_t> isPoly(nDirect);
+  for (size_t t = 0; t < nDirect; ++t) {
+    isPoly[t] = !(a.atomize.size() == nAtoms && a.atomize[directTokStarts[t]]);
+  }
+  // `token_type` is not set until the batch is built, so every token reads PROTEIN - which is
+  // also the reference's fallback, and makes `isCanonical` uniformly true.
+  vector<int> resIdPerDirect(nDirect), molPerDirect(nDirect);
+  for (size_t t = 0; t < nDirect; ++t) {
+    resIdPerDirect[t] = a.site.resId[directTokStarts[t]];
+    molPerDirect[t] = a.ids.moleculeIid[directTokStarts[t]];
+  }
+
+  auto segIt = a.ann.ints.find("annotation_expsegmin_1_residue");
+  vector<uint8_t> standsIn(nAtoms, 0);
+  bool anyStandsIn = false;
+  if (segIt != a.ann.ints.end() && segIt->second.size() == nAtoms) {
+    for (size_t i = 0; i < nAtoms; ++i) {
+      standsIn[i] = segIt->second[i] != -1;
+      anyStandsIn = anyStandsIn || standsIn[i];
+    }
+  }
+  auto leavingEntering = [&](int i) {
+    std::pair<string, string> p = cif::polymerizationAtoms(a.site.resName[i], a.site.chainType[i]);
+    if (p.first.empty() && p.second.empty()) p = {"C", "N"};
+    return std::pair<bool, bool>{a.site.atomName[i] == p.first || standsIn[i],
+                                 a.site.atomName[i] == p.second || standsIn[i]};
+  };
+
+  vector<int8_t> dCanonical(nDirect * nDirect, 0);
+  vector<uint8_t> suppress(nDirect * nDirect, 0);
+  for (size_t e = 0; e < edgeTok1.size(); ++e) {
+    const int a1 = edgeAtom1[e], a2 = edgeAtom2[e];
+    const int t1 = edgeTok1[e], t2 = edgeTok2[e];
+    const auto [leaves1, enters1] = leavingEntering(a1);
+    const auto [leaves2, enters2] = leavingEntering(a2);
+    bool fwd = leaves1 && enters2;
+    bool rev = leaves2 && enters1;
+    if (anyStandsIn && standsIn[a1] && standsIn[a2]) {
+      const bool sameMol = molPerDirect[t1] == molPerDirect[t2];
+      const bool closesRing = sameMol && std::abs(resIdPerDirect[t1] - resIdPerDirect[t2]) > 1;
+      const bool tok1Upstream = (t1 < t2) != closesRing;
+      fwd = tok1Upstream;
+      rev = !tok1Upstream;
+    }
+    auto direct = [&](int up, int dn) {
+      dCanonical[dn * nDirect + up] = 1;
+      dCanonical[up * nDirect + dn] = -1;
+      suppress[up * nDirect + dn] = 1;
+      suppress[dn * nDirect + up] = 1;
+    };
+    if (fwd) direct(t1, t2);
+    if (rev) direct(t2, t1);
+  }
+
+  for (size_t i = 0; i < nDirect; ++i) {
+    for (size_t j = 0; j < nDirect; ++j) {
+      const size_t idx = i * nDirect + j;
+      const bool polyPoly = isPoly[i] && isPoly[j];
+      const bool sameGroup = directTokGroups[i] == directTokGroups[j];
+      if (!(polyPoly && sameGroup && dMask[idx] == 1)) dCanonical[idx] = 0;
+      if ((suppress[idx] == 1 && polyPoly) || !sameGroup) {
+        dMask[idx] = 0; dOrder[idx] = 0; dArom[idx] = 0;
+      }
+    }
+  }
+
+  vector<int> pathTok1 = edgeTok1, pathTok2 = edgeTok2, sources;
+  for (size_t t = 0; t < nDirect; ++t) sources.push_back((int)t);
+
+  if (fillResIdGaps) {
+    const vector<int> resStarts = cif::residueSegments(a.site);
+    const size_t nRes = resStarts.size() - 1;
+    vector<int> atomToRes(nAtoms, 0);
+    for (size_t r = 0; r < nRes; ++r) {
+      for (int i = resStarts[r]; i < resStarts[r + 1]; ++i) atomToRes[i] = (int)r;
+    }
+    vector<int> comp(nRes);
+    for (size_t r = 0; r < nRes; ++r) comp[r] = (int)r;
+    std::function<int(int)> findComp = [&](int x) {
+      while (comp[x] != x) { comp[x] = comp[comp[x]]; x = comp[x]; }
+      return x;
+    };
+    auto unionComp = [&](int x, int y) {
+      const int rx = findComp(x), ry = findComp(y);
+      if (rx != ry) comp[ry] = rx;
+    };
+    for (const cif::Bond& b : a.bonds) unionComp(atomToRes[b.u], atomToRes[b.v]);
+
+    vector<int> resGroups(nRes), resIds(nRes);
+    vector<string> resChainIids(nRes);
+    vector<uint8_t> resIsPoly(nRes);
+    for (size_t r = 0; r < nRes; ++r) {
+      const int s = resStarts[r];
+      resGroups[r] = idxGrp[s];
+      resChainIids[r] = a.ids.chainIid[s];
+      resIds[r] = a.site.resId[s];
+      resIsPoly[r] = a.site.isPolymer[s];
+    }
+    vector<int> allTok1, allTok2;
+    for (const cif::Bond& b : a.bonds) {
+      const int t1 = atomToToken[b.u], t2 = atomToToken[b.v];
+      if (t1 != t2) { allTok1.push_back(t1); allTok2.push_back(t2); }
+    }
+    int nextVirtual = (int)nTotal;
+    std::set<int> uniqueGroups(resGroups.begin(), resGroups.end());
+    for (const int grp : uniqueGroups) {
+      std::set<string> uniqueChains;
+      for (size_t r = 0; r < nRes; ++r) if (resGroups[r] == grp) uniqueChains.insert(resChainIids[r]);
+      for (const string& cid : uniqueChains) {
+        vector<int> members;
+        for (size_t r = 0; r < nRes; ++r) {
+          if (resIsPoly[r] && resGroups[r] == grp && resChainIids[r] == cid) members.push_back((int)r);
+        }
+        std::stable_sort(members.begin(), members.end(),
+                         [&](int x, int y) { return resIds[x] < resIds[y]; });
+        for (size_t m = 0; m + 1 < members.size(); ++m) {
+          const int prevRes = members[m], nextRes = members[m + 1];
+          if (findComp(prevRes) == findComp(nextRes)) continue;
+          const int gap = std::max(resIds[nextRes] - resIds[prevRes], 1);
+          unionComp(prevRes, nextRes);
+          const int nFillers = gap - 1;
+          if (nFillers <= 0) continue;
+          if (resStarts[prevRes + 1] != resStarts[nextRes]) continue;
+          const int firstV = nextVirtual;
+          for (int f = 0; f < nFillers - 1; ++f) {
+            allTok1.push_back(nextVirtual + f);
+            allTok2.push_back(nextVirtual + f + 1);
+          }
+          nextVirtual += nFillers;
+          const int lastV = nextVirtual - 1;
+          auto link = [&](int s, int e, bool exiting) -> int {
+            if (e - s == 1 && a.site.resName[s] == "<M>") return s;
+            std::pair<string, string> p =
+                cif::polymerizationAtoms(a.site.resName[s], a.site.chainType[s]);
+            if (p.first.empty() && p.second.empty()) p = {"C", "N"};
+            const string& target = exiting ? p.first : p.second;
+            int match = -1, count = 0;
+            for (int i = s; i < e; ++i) if (a.site.atomName[i] == target) { match = i; ++count; }
+            return count == 1 ? match : -1;
+          };
+          const int leftAtom = link(resStarts[prevRes], resStarts[prevRes + 1], true);
+          const int rightAtom = link(resStarts[nextRes], resStarts[nextRes + 1], false);
+          if (leftAtom >= 0) { allTok1.push_back(atomToToken[leftAtom]); allTok2.push_back(firstV); }
+          if (rightAtom >= 0) { allTok1.push_back(lastV); allTok2.push_back(atomToToken[rightAtom]); }
+        }
+      }
+    }
+    pathTok1 = allTok1;
+    pathTok2 = allTok2;
+    sources.clear();
+    for (size_t t = 0; t < nTotal; ++t) if (!isTokWithSrc[t]) sources.push_back((int)t);
+  }
+
+  vector<int16_t> dPath = computeTokenPathLengths(pathTok1, pathTok2, sources, pathLengthCutoff);
+  for (size_t i = 0; i < nDirect; ++i) {
+    for (size_t j = 0; j < nDirect; ++j) {
+      if (i == j || directTokGroups[i] != directTokGroups[j]) dPath[i * nDirect + j] = 0;
+    }
+  }
+
+  for (size_t i = 0; i < nDirect; ++i) {
+    for (size_t j = 0; j < nDirect; ++j) {
+      const size_t s = i * nDirect + j, d = i * nTotal + j;
+      out.bondMask[d] = dMask[s]; out.bondOrder[d] = dOrder[s];
+      out.isAromatic[d] = dArom[s]; out.pathLength[d] = dPath[s]; out.canonical[d] = dCanonical[s];
+    }
+  }
+  std::set<int> borrowerGroups;
+  for (const int t : toksWithSrc) borrowerGroups.insert(tokGroups[t]);
+  for (const int grp : borrowerGroups) {
+    vector<int> grpToks, grpSrcs;
+    for (size_t k = 0; k < toksWithSrc.size(); ++k) {
+      if (tokGroups[toksWithSrc[k]] == grp) { grpToks.push_back(toksWithSrc[k]); grpSrcs.push_back(srcToks[k]); }
+    }
+    for (size_t i = 0; i < grpToks.size(); ++i) {
+      for (size_t j = 0; j < grpToks.size(); ++j) {
+        const size_t d = (size_t)grpToks[i] * nTotal + grpToks[j];
+        const size_t s = (size_t)grpSrcs[i] * nDirect + grpSrcs[j];
+        out.bondMask[d] = dMask[s]; out.bondOrder[d] = dOrder[s];
+        out.isAromatic[d] = dArom[s]; out.pathLength[d] = dPath[s]; out.canonical[d] = dCanonical[s];
+      }
+    }
+  }
+  return out;
 }
 
 }  // namespace atoms

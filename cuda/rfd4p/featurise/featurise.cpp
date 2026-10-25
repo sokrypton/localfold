@@ -1022,6 +1022,28 @@ int run(int argc, char** argv) {
         printf("atomized\t%zu\n", arr.n());
         printf("azcentroid\t%.17g\t%.17g\t%.17g\n", (double)centroid.v[0], (double)centroid.v[1],
                (double)centroid.v[2]);
+        {
+          const rfd4p::atoms::TokenBondFeatures tb = rfd4p::atoms::computeTokenBondFeatures(arr);
+          printf("aztb\t%zu\n", tb.n);
+          // 🔴 THE PLANES AS CHECKSUMS AND AS NON-ZERO ENTRIES, not element by element: at 924
+          // atoms these are five 924x924 matrices and printing them whole is 4 million numbers
+          // a structure. A checksum that weights by POSITION catches a transpose, which a sum
+          // would not.
+          const auto plane = [&](const char* name, auto get) {
+            long long sum = 0, nz = 0, weighted = 0;
+            for (size_t i = 0; i < tb.n * tb.n; ++i) {
+              const long long v = (long long)get(i);
+              sum += v;
+              if (v) { ++nz; weighted += v * (long long)(i % 1000003); }
+            }
+            printf("aztb\t%s\t%lld\t%lld\t%lld\n", name, sum, nz, weighted);
+          };
+          plane("bond_mask", [&](size_t i) { return tb.bondMask[i]; });
+          plane("bond_order", [&](size_t i) { return tb.bondOrder[i]; });
+          plane("is_aromatic", [&](size_t i) { return tb.isAromatic[i]; });
+          plane("path_length", [&](size_t i) { return tb.pathLength[i]; });
+          plane("canonical", [&](size_t i) { return tb.canonical[i]; });
+        }
         for (const char* key : {"condition_coordinate_1_atom", "condition_ChainCentroid_1_atom"}) {
           auto it = arr.ann.floats.find(key);
           if (it == arr.ann.floats.end()) continue;

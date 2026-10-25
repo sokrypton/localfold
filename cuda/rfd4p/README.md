@@ -523,9 +523,14 @@ residues the cropped example does not contain, so building one from the spec fai
     means `S[i][i]` - so it is not a sort by eigenvalue at all. Ported as written, with V8's own
     binary insertion sort, because the order decides the rotation and "fixing" it would disagree
     with every number the page produces.
-  - **this is where the remaining work starts**, and it is `transforms.js` with real atoms -
-    the same fourteen stages the spec path already runs, but with every branch a contig's `<M>`
-    stubs make inert now live. In the order they run, with what each needs:
+  - ~~**`transforms.js` with real atoms**~~ **done, all fourteen stages** - the same pipeline
+    the spec path already ran, but with every branch a contig's `<M>` stubs made inert now
+    live. Held to the reference over sixteen cases: the seven shipped structures and nine the
+    gate synthesises, because the shipped seven could not reach most of it (see the three
+    findings below the table). What is left of the structure path is `convertToProteinaBatch`
+    (1175-1606) - assembling what the stages produced into the batch tensors - plus
+    `applyContig` with PRESERVED segments, native zstd, `processSampleToAtoms`'s `inputAtoms`
+    path and the coordinate-group permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
@@ -544,7 +549,8 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`centerAndFeaturizeCentroid`~~ **done** | 1032-1108 | the recentering on conditioned coordinates |
     | ~~`addSupportsLocalLatentAnnotation`~~ **done** | 1113-1126 | a residue carries a latent only out of unindexed context |
     | ~~`buildAtom37Slots`~~ **done** | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
-    | `computeTokenBondFeatures` | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
+    | ~~`computeTokenBondFeatures`~~ **done** | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
+    | ~~`computeTokenPathLengths`~~ **done** | `bonds.js` 130-188 | a BFS over a graph with invented nodes in it |
 
     🔴 **`realizeExpandableSegments` GOES RIGHT TO LEFT**, so an earlier sentinel's index is
     still its index when its turn comes; and the suffix's residue numbers shift only within the

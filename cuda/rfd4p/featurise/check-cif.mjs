@@ -15,6 +15,7 @@ import { parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
 import {
   ensureStereochemistryAnnotations, computeChiralityFeatures,
 } from "../../../shared/rfd4p/pipeline/chirality.js";
+import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -728,6 +729,32 @@ for (const [name, text] of cases) {
       // fround of both sides cannot tell that from a port that kept it in double, which is
       // this gate's own recorded mistake in another column. Exact, with the native side
       // printed at full precision, turns that mutation red.
+      // `computeTokenBondFeatures`: five [nTokens, nTokens] planes, compared as a sum, a
+      // non-zero count and a POSITION-WEIGHTED checksum - element by element is four million
+      // numbers a structure, and a plain sum cannot see a transpose.
+      const tbN = Number((out3.find((l) => l.startsWith("aztb\t")) ?? "\t0").split("\t")[1]);
+      const tb = computeTokenBondFeatures(unindexed);
+      const planes = [["bond_mask", tb.bond_mask], ["bond_order", tb.bond_order],
+        ["is_aromatic", tb.is_aromatic], ["path_length", tb.token_bond_path_length],
+        ["canonical", tb.canonical_polymer_ordering]];
+      if (tbN !== planes[0][1].shape[0]) wrong.push(`az tb tokens ${tbN} vs ${planes[0][1].shape[0]}`);
+      else {
+        const got = new Map(out3.filter((l) => /^aztb\t[a-z]/.test(l))
+          .map((l) => { const f = l.split("\t"); return [f[1], f.slice(2).map(Number)]; }));
+        for (const [name, p] of planes) {
+          let sum = 0; let nz = 0; let weighted = 0;
+          for (let i = 0; i < p.data.length; i += 1) {
+            const v = p.data[i];
+            sum += v;
+            if (v) { nz += 1; weighted += v * (i % 1000003); }
+          }
+          const g = got.get(name);
+          if (!g) { wrong.push(`az tb ${name} missing`); continue; }
+          if (g[0] !== sum || g[1] !== nz || g[2] !== weighted) {
+            wrong.push(`az tb ${name} ${g.join("/")} vs ${sum}/${nz}/${weighted}`);
+          }
+        }
+      }
       const shifted = new Map(out3.filter((l) => l.startsWith("azshift\t")).map((l) => {
         const f = l.split("\t");
         return [f[1], f.slice(2).map(Number)];
