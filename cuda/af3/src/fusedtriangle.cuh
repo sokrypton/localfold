@@ -1023,38 +1023,61 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(C <= 128 ? 4 : 3, lnHead
 #pragma unroll
   for (int nt = 0; nt < N / 8; ++nt) {
     int h = nt * 8 + tig * 2;
-    ptx_st_shared_f32(Os + h * LDO + lr0, ptx_add_f32(acc[nt][0], rb0));
-    ptx_st_shared_f32(Os + (h + 1) * LDO + lr0, ptx_add_f32(acc[nt][1], rb0));
-    ptx_st_shared_f32(Os + h * LDO + lr1, ptx_add_f32(acc[nt][2], rb1));
-    ptx_st_shared_f32(Os + (h + 1) * LDO + lr1, ptx_add_f32(acc[nt][3], rb1));
+    float o0 = rowBias ? ptx_add_f32(acc[nt][0], rb0) : acc[nt][0];
+    float o1 = rowBias ? ptx_add_f32(acc[nt][1], rb0) : acc[nt][1];
+    float o2 = rowBias ? ptx_add_f32(acc[nt][2], rb1) : acc[nt][2];
+    float o3 = rowBias ? ptx_add_f32(acc[nt][3], rb1) : acc[nt][3];
+    ptx_st_shared_f32(Os + h * LDO + lr0, o0);
+    ptx_st_shared_f32(Os + (h + 1) * LDO + lr0, o1);
+    ptx_st_shared_f32(Os + h * LDO + lr1, o2);
+    ptx_st_shared_f32(Os + (h + 1) * LDO + lr1, o3);
   }
   __syncthreads();
   if (biasOut) {
     if (row0 + r >= rows) return;
-    unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
-    if (tr) { unsigned x = i; i = j; j = x; }
     constexpr int HSTEP = NTH / R;
-    const size_t base = ((size_t)h0 * L + i) * stride, step = (size_t)HSTEP * L * stride;
-    auto cvt = [&](float v) { return ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(ptx_add_f32(v, pm), LOG2E), -6e4f)); };
+    auto cvt = [&](float v) {
+      if (pairMask) v = ptx_add_f32(v, pm);
+      return ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(v, LOG2E), -6e4f));
+    };
     if (H == 4 * HSTEP) {
       float v0 = ptx_ld_shared_f32(Os + (h0 + 0 * HSTEP) * LDO + r);
       float v1 = ptx_ld_shared_f32(Os + (h0 + 1 * HSTEP) * LDO + r);
       float v2 = ptx_ld_shared_f32(Os + (h0 + 2 * HSTEP) * LDO + r);
       float v3 = ptx_ld_shared_f32(Os + (h0 + 3 * HSTEP) * LDO + r);
-      ptx_st_global_u16(biasOut + base + j, cvt(v0));
-      ptx_st_global_u16(biasOut + base + step + j, cvt(v1));
-      ptx_st_global_u16(biasOut + base + 2 * step + j, cvt(v2));
-      ptx_st_global_u16(biasOut + base + 3 * step + j, cvt(v3));
+      unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
+      if (tr) { unsigned x = i; i = j; j = x; }
+      const size_t base = ((size_t)h0 * L + i) * stride, step = (size_t)HSTEP * L * stride;
+      uint16_t u0 = cvt(v0), u1 = cvt(v1), u2 = cvt(v2), u3 = cvt(v3);
+      ptx_st_global_u16(biasOut + base + j, u0);
+      ptx_st_global_u16(biasOut + base + step + j, u1);
+      ptx_st_global_u16(biasOut + base + 2 * step + j, u2);
+      ptx_st_global_u16(biasOut + base + 3 * step + j, u3);
+      if (j == ul - 1 && L < stride) {
+        for (int h = h0; h < H; h += HSTEP)
+          for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + pad, 0);
+      }
+      return;
     } else if (H == 2 * HSTEP) {
       float v0 = ptx_ld_shared_f32(Os + (h0 + 0 * HSTEP) * LDO + r);
       float v1 = ptx_ld_shared_f32(Os + (h0 + 1 * HSTEP) * LDO + r);
-      ptx_st_global_u16(biasOut + base + j, cvt(v0));
-      ptx_st_global_u16(biasOut + base + step + j, cvt(v1));
-    } else {
-      for (int h = h0; h < H; h += HSTEP) {
-        float v = ptx_ld_shared_f32(Os + h * LDO + r);
-        ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + j, cvt(v));
+      unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
+      if (tr) { unsigned x = i; i = j; j = x; }
+      const size_t base = ((size_t)h0 * L + i) * stride, step = (size_t)HSTEP * L * stride;
+      uint16_t u0 = cvt(v0), u1 = cvt(v1);
+      ptx_st_global_u16(biasOut + base + j, u0);
+      ptx_st_global_u16(biasOut + base + step + j, u1);
+      if (j == ul - 1 && L < stride) {
+        for (int h = h0; h < H; h += HSTEP)
+          for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + pad, 0);
       }
+      return;
+    }
+    unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
+    if (tr) { unsigned x = i; i = j; j = x; }
+    for (int h = h0; h < H; h += HSTEP) {
+      float v = ptx_ld_shared_f32(Os + h * LDO + r);
+      ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + j, cvt(v));
     }
     if (j == ul - 1 && L < stride) {
       for (int h = h0; h < H; h += HSTEP)
@@ -1308,8 +1331,8 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         }
       }
     }
-    __syncwarp();
 #if LF_REG_STAGES
+    __syncwarp();
     if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
     __syncthreads();
 #endif
@@ -1363,12 +1386,21 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
           ptx_st_shared_u16(Ys + (h + 1) * 20 + g + 8, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][3])));
         }
         __syncwarp();
-        int r = lane & 15;
+        int r = lane & 15, h0 = lane >> 4;
         size_t q = row0 + (warp * MT + mt) * 16 + r;
-        if (q < rows) {
+        if (heads == 4) {
+          uint16_t b0 = ptx_ld_shared_u16(Ys + h0 * 20 + r);
+          uint16_t b1 = ptx_ld_shared_u16(Ys + (h0 + 2) * 20 + r);
+          if (q < rows) {
+            unsigned Q = (unsigned)(q0 + q), qa = Q / (unsigned)n, qb = Q - qa * (unsigned)n;
+            size_t base = ((size_t)h0 * n + qa) * stride + qb, step = (size_t)2 * n * stride;
+            ptx_st_global_u16(bias + base, b0);
+            ptx_st_global_u16(bias + base + step, b1);
+          }
+        } else if (q < rows) {
           unsigned Q = (unsigned)(q0 + q), qa = Q / (unsigned)n, qb = Q - qa * (unsigned)n;
           size_t base = (size_t)qa * stride + qb, hStep = (size_t)n * stride;
-          for (int h = lane >> 4; h < heads; h += 2) ptx_st_global_u16(bias + h * hStep + base, ptx_ld_shared_u16(Ys + h * 20 + r));
+          for (int h = h0; h < heads; h += 2) ptx_st_global_u16(bias + h * hStep + base, ptx_ld_shared_u16(Ys + h * 20 + r));
         }
       }
     } else {

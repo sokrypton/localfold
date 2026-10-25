@@ -89,6 +89,11 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
     if (m0) dbin = ptx_ffs_u32(m0) - 1;
     else if (m1) dbin = 31 + ptx_ffs_u32(m1);
   }
+  float w0v[2] = {0.f, 0.f};
+  if (dbin >= 0) {
+    w0v[0] = ptx_ldg_f32(w0 + dbin * C + lane);
+    w0v[1] = ptx_ldg_f32(w0 + dbin * C + lane + 32);
+  }
   const float4* fi4 = reinterpret_cast<const float4*>(frames + (size_t)i * 12);
   float4 fi0 = ptx_ldg_v4_f32(fi4 + 0), fi1 = ptx_ldg_v4_f32(fi4 + 1), fi2 = ptx_ldg_v4_f32(fi4 + 2);
   const float* tj = frames + (size_t)j * 12 + 9;
@@ -107,13 +112,19 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
-    float a = ptx_add_f32(ptx_ld_shared_f32(&sw[0][c]), (dbin >= 0 ? ptx_mul_f32(pb2d, ptx_ldg_f32(w0 + dbin * C + c)) : 0.f));
-    a = ptx_fma_f32(pb2d, ptx_ld_shared_f32(&sw[1][c]), a);
+    float s0 = ptx_ld_shared_f32(&sw[0][c]);
+    float s1 = ptx_ld_shared_f32(&sw[1][c]);
+    float s2 = ptx_ld_shared_f32(&sw[2][c]);
+    float s3 = ptx_ld_shared_f32(&sw[3][c]);
+    float s4 = ptx_ld_shared_f32(&sw[4][c]);
+    float s5 = ptx_ld_shared_f32(&sw[5][c]);
+    float a = ptx_add_f32(s0, (dbin >= 0 ? ptx_mul_f32(pb2d, w0v[k]) : 0.f));
+    a = ptx_fma_f32(pb2d, s1, a);
     a = ptx_add_f32(a, ptx_add_f32(w2v[k], w3v[k]));
-    a = ptx_fma_f32(f1, ptx_ld_shared_f32(&sw[2][c]), a);
-    a = ptx_fma_f32(f2, ptx_ld_shared_f32(&sw[3][c]), a);
-    a = ptx_fma_f32(f3, ptx_ld_shared_f32(&sw[4][c]), a);
-    a = ptx_fma_f32(bb, ptx_ld_shared_f32(&sw[5][c]), a);
+    a = ptx_fma_f32(f1, s2, a);
+    a = ptx_fma_f32(f2, s3, a);
+    a = ptx_fma_f32(f3, s4, a);
+    a = ptx_fma_f32(bb, s5, a);
     ptx_st_global_f32(act + ij * C + c, ptx_add_f32(a, qtv[k]));
   }
 }
@@ -256,6 +267,11 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
   float lo1 = ptx_fma_f32((float)b1, (50.75f - 3.25f) / 38.f, 3.25f), hi1 = ptx_fma_f32((float)(b1 + 1), (50.75f - 3.25f) / 38.f, 3.25f);
   uint32_t m1 = ptx_ballot_sync(b1 < 39 && d2 > ptx_mul_f32(lo1, lo1) && d2 < (b1 + 1 < 39 ? ptx_mul_f32(hi1, hi1) : 1e8f));
   int dbin = m0 ? (ptx_ffs_u32(m0) - 1) : (m1 ? (31 + ptx_ffs_u32(m1)) : -1);
+  float w0v[2] = {0.f, 0.f};
+  if (dbin >= 0) {
+    w0v[0] = ptx_ldg_f32(w + dbin * C + lane);
+    w0v[1] = ptx_ldg_f32(w + dbin * C + lane + 32);
+  }
   auto bbm = [&](int r) {
     return ptx_mul_f32(ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)r * 37), ptx_ldg_f32(tMask + (size_t)r * 37 + 1)),
                        ptx_ldg_f32(tMask + (size_t)r * 37 + 2));
@@ -264,10 +280,13 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
-    float a = ptx_fma_f32(m2, ptx_ld_shared_f32(sw39 + c), (dbin >= 0 ? ptx_ldg_f32(w + dbin * C + c) : 0.f));
+    float s39 = ptx_ld_shared_f32(sw39 + c);
+    float s87 = ptx_ld_shared_f32(sw87 + c);
+    float sb0 = ptx_ld_shared_f32(sb + c);
+    float a = ptx_fma_f32(m2, s39, w0v[k]);
     a = ptx_add_f32(a, ptx_add_f32(w2v[k], w3v[k]));
-    a = ptx_add_f32(a, ptx_ld_shared_f32(sw87 + c));
-    ptx_st_global_f32(act + ij * C + c, ptx_fma_f32(a, bb, ptx_ld_shared_f32(sb + c)));
+    a = ptx_add_f32(a, s87);
+    ptx_st_global_f32(act + ij * C + c, ptx_fma_f32(a, bb, sb0));
   }
 }
 // the pointwise attention from the query pair over the templates: q [pairs, H*D] (scaled), k, v
