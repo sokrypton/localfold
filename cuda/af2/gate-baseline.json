@@ -1,37 +1,37 @@
 {
  "1brs-multimer": {
-  "plddt": 38.69,
-  "ptm": "0.1905",
-  "rmsd": 16.264
+  "plddt": 38.9,
+  "ptm": "0.1934",
+  "rmsd": 17.086
  },
  "1brs-multimer-template": {
-  "plddt": 95.5,
-  "ptm": "0.8939",
-  "rmsd": 0.274
+  "plddt": 95.47,
+  "ptm": "0.8935",
+  "rmsd": 0.275
  },
  "5caj-msa": {
   "plddt": 95.96,
-  "ptm": "0.9158",
-  "rmsd": 1.829
+  "ptm": "0.9155",
+  "rmsd": 1.833
  },
  "5caj-seq": {
-  "plddt": 31.05,
-  "ptm": "0.2069",
-  "rmsd": 18.456
+  "plddt": 31.37,
+  "ptm": "0.2057",
+  "rmsd": 18.991
  },
  "5caj-template": {
-  "plddt": 97.22,
-  "ptm": "0.9259",
-  "rmsd": 0.216
+  "plddt": 97.24,
+  "ptm": "0.9262",
+  "rmsd": 0.218
  },
  "6mrr": {
-  "plddt": 84.4,
-  "ptm": "0.6078",
-  "rmsd": 1.89
+  "plddt": 84.61,
+  "ptm": "0.6096",
+  "rmsd": 1.893
  },
  "6mrr-x12-monomer": {
-  "plddt": 79.29,
-  "ptm": "0.2413",
-  "rmsd": 0.917
+  "plddt": 79.51,
+  "ptm": "0.2364",
+  "rmsd": 0.918
  }
 }

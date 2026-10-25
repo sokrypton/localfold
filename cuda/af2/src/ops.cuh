@@ -33,28 +33,33 @@ __global__ void reluBiasK(float* __restrict__ y, const float* __restrict__ b, si
     size_t n4 = rows * (size_t)c4;
     if (t >= n4) return;
     int c = ((c4 & (c4 - 1)) == 0) ? (int)(t & (size_t)(c4 - 1)) : (n4 <= UINT32_MAX ? (int)((unsigned)t % (unsigned)c4) : (int)(t % c4));
-    float4 yv = reinterpret_cast<const float4*>(y)[t];
-    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
-    reinterpret_cast<float4*>(y)[t] = make_float4(fmaxf(yv.x + bv.x, 0.f), fmaxf(yv.y + bv.y, 0.f), fmaxf(yv.z + bv.z, 0.f), fmaxf(yv.w + bv.w, 0.f));
+    float4 yv = ptx_ld_global_v4_f32(reinterpret_cast<const float4*>(y) + t);
+    float4 bv = ptx_ldg_v4_f32(reinterpret_cast<const float4*>(b) + c);
+    yv.x = ptx_relu_f32(yv.x + bv.x);
+    yv.y = ptx_relu_f32(yv.y + bv.y);
+    yv.z = ptx_relu_f32(yv.z + bv.z);
+    yv.w = ptx_relu_f32(yv.w + bv.w);
+    ptx_st_global_v4_f32(reinterpret_cast<float4*>(y) + t, yv);
     return;
   }
   size_t n = rows * C;
   if (t >= n) return;
   int c = ((C & (C - 1)) == 0) ? (int)(t & (size_t)(C - 1)) : (n <= UINT32_MAX ? (int)((unsigned)t % (unsigned)C) : (int)(t % C));
-  y[t] = fmaxf(y[t] + __ldg(b + c), 0.f);
+  ptx_st_global_f32(y + t, ptx_relu_f32(ptx_ld_global_f32(y + t) + ptx_ldg_f32(b + c)));
 }
 __global__ void addK2(float* __restrict__ y, const float* __restrict__ x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if ((n & 3) == 0 && (((uintptr_t)y | (uintptr_t)x) & 15) == 0) {
     size_t n4 = n >> 2;
     if (t < n4) {
-      float4 yv = reinterpret_cast<const float4*>(y)[t];
-      float4 xv = reinterpret_cast<const float4*>(x)[t];
-      reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + xv.x, yv.y + xv.y, yv.z + xv.z, yv.w + xv.w);
+      float4 yv = ptx_ld_global_v4_f32(reinterpret_cast<const float4*>(y) + t);
+      float4 xv = ptx_ldg_v4_f32(reinterpret_cast<const float4*>(x) + t);
+      yv.x += xv.x; yv.y += xv.y; yv.z += xv.z; yv.w += xv.w;
+      ptx_st_global_v4_f32(reinterpret_cast<float4*>(y) + t, yv);
     }
     return;
   }
-  if (t < n) y[t] += x[t];
+  if (t < n) ptx_st_global_f32(y + t, ptx_ld_global_f32(y + t) + ptx_ldg_f32(x + t));
 }
 // y[(b * A + a), c] += x[swap ? (a * B + b) : (b * A + a), c] + bias[c]
 __global__ void addBiasSwapIntoK(float* __restrict__ y, const float* __restrict__ x, const float* __restrict__ b,
@@ -85,18 +90,18 @@ __global__ void addBiasSwapIntoK(float* __restrict__ y, const float* __restrict_
         sr = (r % A) * B + (r / A);
       }
     }
-    float4 yv = reinterpret_cast<const float4*>(y)[t];
-    float4 xv = __ldg(reinterpret_cast<const float4*>(x) + sr * c4 + c);
-    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
-    reinterpret_cast<float4*>(y)[t] = make_float4(yv.x + (xv.x + bv.x), yv.y + (xv.y + bv.y),
-                                                  yv.z + (xv.z + bv.z), yv.w + (xv.w + bv.w));
+    float4 yv = ptx_ld_global_v4_f32(reinterpret_cast<const float4*>(y) + t);
+    float4 xv = ptx_ldg_v4_f32(reinterpret_cast<const float4*>(x) + sr * c4 + c);
+    float4 bv = ptx_ldg_v4_f32(reinterpret_cast<const float4*>(b) + c);
+    yv.x += (xv.x + bv.x); yv.y += (xv.y + bv.y); yv.z += (xv.z + bv.z); yv.w += (xv.w + bv.w);
+    ptx_st_global_v4_f32(reinterpret_cast<float4*>(y) + t, yv);
     return;
   }
   size_t n = rows * C;
   if (t >= n) return;
   size_t r = t / C; int c = (int)(t % C);
   size_t sr = swap ? ((r % A) * B + (r / A)) : r;
-  y[t] += x[sr * C + c] + __ldg(b + c);
+  ptx_st_global_f32(y + t, ptx_ld_global_f32(y + t) + (ptx_ldg_f32(x + sr * C + c) + ptx_ldg_f32(b + c)));
 }
 inline void addBiasSwapInto(float* y, const float* x, const float* b, int B, int A, int C, bool swap = false) {
   size_t rows = (size_t)B * A;
@@ -121,16 +126,17 @@ __global__ void addBiasScaleRowsK(float* __restrict__ y, const float* __restrict
     } else {
       r = t / (size_t)c4; c = (int)(t % (size_t)c4);
     }
-    float4 yv = reinterpret_cast<const float4*>(y)[t];
-    float4 bv = __ldg(reinterpret_cast<const float4*>(b) + c);
-    float s = __ldg(rowScale + r);
-    reinterpret_cast<float4*>(y)[t] = make_float4((yv.x + bv.x) * s, (yv.y + bv.y) * s, (yv.z + bv.z) * s, (yv.w + bv.w) * s);
+    float4 yv = ptx_ld_global_v4_f32(reinterpret_cast<const float4*>(y) + t);
+    float4 bv = ptx_ldg_v4_f32(reinterpret_cast<const float4*>(b) + c);
+    float s = ptx_ldg_f32(rowScale + r);
+    yv.x = (yv.x + bv.x) * s; yv.y = (yv.y + bv.y) * s; yv.z = (yv.z + bv.z) * s; yv.w = (yv.w + bv.w) * s;
+    ptx_st_global_v4_f32(reinterpret_cast<float4*>(y) + t, yv);
     return;
   }
   size_t n = rows * (size_t)C;
   if (t >= n) return;
   size_t r = t / (size_t)C; int c = (int)(t % (size_t)C);
-  y[t] = (y[t] + __ldg(b + c)) * __ldg(rowScale + r);
+  ptx_st_global_f32(y + t, (ptx_ld_global_f32(y + t) + ptx_ldg_f32(b + c)) * ptx_ldg_f32(rowScale + r));
 }
 inline void linearB(const float* X, const std::string& w, int block, float* Y, size_t rows, int in, int out,
                     bool relu = false, const float* rowScale = nullptr) {
@@ -150,16 +156,16 @@ __global__ void layerNormK(const float* x, float* y, size_t rows, int C, const f
   if (row >= rows) return;
   const float* xr = x + row * C;
   float s = 0;
-  for (int c = lane; c < C; c += 32) s += xr[c];
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  for (int c = lane; c < C; c += 32) s += ptx_ldg_f32(xr + c);
+  s = ptx_warp_sum_f32(s);
   float mean = s / C, v = 0;
-  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
-  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = rsqrtf(v / C + 1e-5f);
-  for (int c = lane; c < C; c += 32) y[row * C + c] = (xr[c] - mean) * inv * scale[c] + offset[c];
+  for (int c = lane; c < C; c += 32) { float d = ptx_ldg_f32(xr + c) - mean; v = ptx_fma_f32(d, d, v); }
+  v = ptx_warp_sum_f32(v);
+  float inv = ptx_rsqrt_f32(v / C + 1e-5f);
+  for (int c = lane; c < C; c += 32) ptx_st_global_f32(y + row * C + c, ptx_fma_f32((ptx_ldg_f32(xr + c) - mean) * inv, ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c)));
 }
 template <int C, class TI = float, bool RELU = false>
-__global__ void __launch_bounds__(256, C >= 384 ? 4 : 8)
+__global__ void __launch_bounds__(256, C >= 384 ? 4 : 6)
 layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
                const float* __restrict__ scale, const float* __restrict__ offset) {
   constexpr int K = C / 32;
@@ -169,29 +175,29 @@ layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
   const TI* xr = x + row * C;
   float v[K], s = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { float xk = (float)__ldg(xr + lane + 32 * k); v[k] = xk; s += xk; }
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  float mean = s / C, q2 = 0.f;
+  for (int k = 0; k < K; ++k) { float xk = toF(xr[lane + 32 * k]); v[k] = xk; s += xk; }
+  s = ptx_warp_sum_f32(s);
+  float mean = ptx_div_f32(s, (float)C), q2 = 0.f;
 #pragma unroll
   for (int k = 0; k < K; ++k) { float d = v[k] - mean; q2 += d * d; }
-  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
-  float inv = rsqrtf(q2 / C + 1e-5f);
+  q2 = ptx_warp_sum_f32(q2);
+  float inv = ptx_rsqrt_f32(ptx_div_f32(q2, (float)C) + 1e-5f);
   float* yr = y + row * C;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + 32 * k;
-    float out = (v[k] - mean) * inv * __ldg(scale + c) + __ldg(offset + c);
-    yr[c] = RELU ? fmaxf(out, 0.f) : out;
+    float out = ptx_fma_f32((v[k] - mean) * inv, ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c));
+    ptx_st_global_f32(yr + c, RELU ? ptx_relu_f32(out) : out);
   }
 }
 inline void layerNorm(const float* x, float* y, size_t rows, int C, const std::string& w, int block = -1) {
   const float *sc = P(w + "/scale", block), *of = P(w + "/offset", block);
-  unsigned g = (unsigned)((rows + 7) / 8);
+  unsigned g = lnVGrid(rows);
   if (C == 64) layerNormFastK<64><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 128) layerNormFastK<128><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 256) layerNormFastK<256><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else if (C == 384) layerNormFastK<384><<<g, 256, 0, STREAM>>>(x, y, rows, sc, of);
-  else layerNormK<<<g, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
+  else layerNormK<<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 
 // Channel-major [C, pairs] -> row-major [pairs, C] + LayerNorm in one pass
@@ -205,7 +211,7 @@ centerNormF32K(const float* __restrict__ prod, float* __restrict__ out, size_t p
   size_t r = r0 + lane;
   if (r < pairs) {
 #pragma unroll
-    for (int c = warp; c < C; c += 8) tile[c][lane] = __ldg(prod + (size_t)c * pairs + r);
+    for (int c = warp; c < C; c += 8) ptx_st_shared_f32(&tile[c][lane], ptx_ldg_f32(prod + (size_t)c * pairs + r));
   }
   __syncthreads();
   constexpr int K = C / 32;
@@ -213,8 +219,8 @@ centerNormF32K(const float* __restrict__ prod, float* __restrict__ out, size_t p
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + 32 * k;
-    sc[k] = __ldg(scale + c);
-    of[k] = __ldg(offset + c);
+    sc[k] = ptx_ldg_f32(scale + c);
+    of[k] = ptx_ldg_f32(offset + c);
   }
 #pragma unroll
   for (int m = 0; m < 4; ++m) {
@@ -223,18 +229,18 @@ centerNormF32K(const float* __restrict__ prod, float* __restrict__ out, size_t p
     if (rm >= pairs) break;
     float v[K], s = 0.f;
 #pragma unroll
-    for (int k = 0; k < K; ++k) { float xk = tile[lane + 32 * k][row]; v[k] = xk; s += xk; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, q2 = 0.f;
+    for (int k = 0; k < K; ++k) { float xk = ptx_ld_shared_f32(&tile[lane + 32 * k][row]); v[k] = xk; s += xk; }
+    s = ptx_warp_sum_f32(s);
+    float mean = ptx_div_f32(s, (float)C), q2 = 0.f;
 #pragma unroll
     for (int k = 0; k < K; ++k) { float d = v[k] - mean; q2 += d * d; }
-    for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
-    float inv = rsqrtf(q2 / C + 1e-5f);
+    q2 = ptx_warp_sum_f32(q2);
+    float inv = ptx_rsqrt_f32(ptx_div_f32(q2, (float)C) + 1e-5f);
     float* yr = out + rm * C;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
       int c = lane + 32 * k;
-      yr[c] = (v[k] - mean) * inv * sc[k] + of[k];
+      ptx_st_global_f32(yr + c, ptx_fma_f32((v[k] - mean) * inv, sc[k], of[k]));
     }
   }
 }
@@ -272,7 +278,7 @@ __global__ void swap01K(const float* __restrict__ x, float* __restrict__ y, int 
     } else {
       c = (int)(t % c4); size_t r = t / c4; b = (int)(r % B); a = (int)(r / B);
     }
-    reinterpret_cast<float4*>(y)[((size_t)b * A + a) * c4 + c] = reinterpret_cast<const float4*>(x)[t];
+    ptx_st_global_v4_f32(reinterpret_cast<float4*>(y) + ((size_t)b * A + a) * c4 + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(x) + t));
     return;
   }
   size_t total = (size_t)A * B * C;
@@ -281,11 +287,11 @@ __global__ void swap01K(const float* __restrict__ x, float* __restrict__ y, int 
     unsigned u = (unsigned)t, r = C == 1 ? u : u / (unsigned)C;
     int c = C == 1 ? 0 : (int)(u - r * (unsigned)C);
     unsigned a = r / (unsigned)B, b = r - a * (unsigned)B;
-    y[((size_t)b * A + a) * C + c] = x[t];
+    ptx_st_global_f32(y + ((size_t)b * A + a) * C + c, ptx_ldg_f32(x + t));
     return;
   }
   int c = (int)(t % C); size_t r = t / C; int b = (int)(r % B), a = (int)(r / B);
-  y[((size_t)b * A + a) * C + c] = x[t];
+  ptx_st_global_f32(y + ((size_t)b * A + a) * C + c, ptx_ldg_f32(x + t));
 }
 inline void swap01(const float* x, float* y, int A, int B, int C) {
   size_t work = (C & 3) == 0 ? (size_t)A * B * (C >> 2) : (size_t)A * B * C;

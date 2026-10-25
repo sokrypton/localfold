@@ -29,34 +29,51 @@ inline void needF32Pair(const char* where) {
 }
 // ...and with the flag given (the trunk's pair outside its pair-track updates: t.p16)
 #define WITH_PT(flag, ...) do { if (flag) { using PT = __nv_bfloat16; __VA_ARGS__; } else { using PT = float; __VA_ARGS__; } } while (0)
-template <class PT> __device__ __forceinline__ void pairSt(float* p, size_t i, float v) { reinterpret_cast<PT*>(p)[i] = fromF<PT>(v); }
+template <class PT> __device__ __forceinline__ void pairSt(float* p, size_t i, float v) {
+  if constexpr (std::is_same_v<PT, float>) ptx_st_global_f32(p + i, v);
+  else ptx_st_global_u16(reinterpret_cast<PT*>(p) + i, std::is_same_v<PT, __nv_bfloat16> ? ptx_f32_to_bf16_raw(v) : ptx_f32_to_f16_raw(v));
+}
 #define WITH_PAIR_T(...) do { if (PAIR16) { using PT = __nv_bfloat16; __VA_ARGS__; } else { using PT = float; __VA_ARGS__; } } while (0)
 template <class PT> __device__ __forceinline__ float pairLd(const float* p, size_t i) {
-  return (float)reinterpret_cast<const PT*>(p)[i];
+  if constexpr (std::is_same_v<PT, float>) return ptx_ld_global_f32(p + i);
+  else return toF(reinterpret_cast<const PT*>(p)[i]);
 }
 template <class PT> __device__ __forceinline__ float4 pairLd4(const float* p, size_t i) {
-  if constexpr (std::is_same_v<PT, float>) return *reinterpret_cast<const float4*>(p + i);
+  if constexpr (std::is_same_v<PT, float>) return ptx_ld_global_v4_f32(p + i);
   else {
-    uint2 w = *reinterpret_cast<const uint2*>(reinterpret_cast<const PT*>(p) + i);
-    float2 a = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&w.x)), b = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&w.y));
+    uint2 w = ptx_ld_global_v2_u32(reinterpret_cast<const PT*>(p) + i);
+    float2 a = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(w.x) : ptx_f16x2_to_f32x2(w.x);
+    float2 b = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(w.y) : ptx_f16x2_to_f32x2(w.y);
     return make_float4(a.x, a.y, b.x, b.y);
   }
 }
 template <class PT> __device__ __forceinline__ void pairSt4(float* p, size_t i, float4 v) {
-  if constexpr (std::is_same_v<PT, float>) *reinterpret_cast<float4*>(p + i) = v;
+  if constexpr (std::is_same_v<PT, float>) ptx_st_global_v4_f32(p + i, v);
   else {
-    __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y), b = __floats2bfloat162_rn(v.z, v.w);
-    uint2 w; w.x = *reinterpret_cast<uint32_t*>(&a); w.y = *reinterpret_cast<uint32_t*>(&b);
-    *reinterpret_cast<uint2*>(reinterpret_cast<PT*>(p) + i) = w;
+    uint2 w;
+    if constexpr (std::is_same_v<PT, __nv_bfloat16>) {
+      w.x = ptx_cvt_bf16x2_f32(v.x, v.y);
+      w.y = ptx_cvt_bf16x2_f32(v.z, v.w);
+    } else {
+      w.x = ptx_cvt_f16x2_f32(v.x, v.y);
+      w.y = ptx_cvt_f16x2_f32(v.z, v.w);
+    }
+    ptx_st_global_v2_u32(reinterpret_cast<PT*>(p) + i, w);
   }
 }
 template <class PT> __device__ __forceinline__ float2 pairLd2(const float* p, size_t i) {
-  if constexpr (std::is_same_v<PT, float>) return *reinterpret_cast<const float2*>(p + i);
-  else return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(reinterpret_cast<const PT*>(p) + i));
+  if constexpr (std::is_same_v<PT, float>) return ptx_ld_global_v2_f32(p + i);
+  else {
+    uint32_t u = ptx_ld_global_u32(reinterpret_cast<const PT*>(p) + i);
+    return std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u) : ptx_f16x2_to_f32x2(u);
+  }
 }
 template <class PT> __device__ __forceinline__ void pairSt2(float* p, size_t i, float2 v) {
-  if constexpr (std::is_same_v<PT, float>) *reinterpret_cast<float2*>(p + i) = v;
-  else *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<PT*>(p) + i) = __floats2bfloat162_rn(v.x, v.y);
+  if constexpr (std::is_same_v<PT, float>) ptx_st_global_v2_f32(p + i, v);
+  else {
+    uint32_t u = std::is_same_v<PT, __nv_bfloat16> ? ptx_cvt_bf16x2_f32(v.x, v.y) : ptx_cvt_f16x2_f32(v.x, v.y);
+    ptx_st_global_u32(reinterpret_cast<PT*>(p) + i, u);
+  }
 }
 #ifndef LN_VEC16
 #define LN_VEC16 1
@@ -80,16 +97,20 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
     // triangleOutK<384> 39.2 -> 35.7 ms on 5CAJ)
     constexpr int VEC = K % 8 == 0 ? 8 : (K % 4 == 0 ? 4 : 2), KK = K / VEC;
     using VT = std::conditional_t<VEC == 8, uint4, std::conditional_t<VEC == 4, uint2, uint32_t>>;
-    using FT = std::conditional_t<VEC >= 4, float4, float2>;
     float sc[K], of[K];
 #pragma unroll
     for (int kk = 0; kk < KK; ++kk) {
       int ch = (lane + 32 * kk) * VEC;
-      *reinterpret_cast<FT*>(sc + kk * VEC) = *reinterpret_cast<const FT*>(scale + ch);
-      *reinterpret_cast<FT*>(of + kk * VEC) = *reinterpret_cast<const FT*>(offset + ch);
-      if constexpr (VEC == 8) {
-        *reinterpret_cast<FT*>(sc + kk * VEC + 4) = *reinterpret_cast<const FT*>(scale + ch + 4);
-        *reinterpret_cast<FT*>(of + kk * VEC + 4) = *reinterpret_cast<const FT*>(offset + ch + 4);
+      if constexpr (VEC >= 4) {
+        *reinterpret_cast<float4*>(sc + kk * VEC) = ptx_ldg_v4_f32(scale + ch);
+        *reinterpret_cast<float4*>(of + kk * VEC) = ptx_ldg_v4_f32(offset + ch);
+        if constexpr (VEC == 8) {
+          *reinterpret_cast<float4*>(sc + kk * VEC + 4) = ptx_ldg_v4_f32(scale + ch + 4);
+          *reinterpret_cast<float4*>(of + kk * VEC + 4) = ptx_ldg_v4_f32(offset + ch + 4);
+        }
+      } else {
+        *reinterpret_cast<float2*>(sc + kk * VEC) = ptx_ldg_v2_f32(scale + ch);
+        *reinterpret_cast<float2*>(of + kk * VEC) = ptx_ldg_v2_f32(offset + ch);
       }
     }
     for (int base = 0; base < RPW; base += B) {
@@ -98,46 +119,58 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
       for (int b = 0; b < B; ++b) {
         size_t row = rowOf(warp + (base + b) * WARPS);
 #pragma unroll
-        for (int kk = 0; kk < KK; ++kk)
-          w[b][kk] = row != SIZE_MAX ? *reinterpret_cast<const VT*>(reinterpret_cast<const PT*>(x) + row * C + (lane + 32 * kk) * VEC)
-                                     : VT{};
+        for (int kk = 0; kk < KK; ++kk) {
+          const void* src = reinterpret_cast<const PT*>(x) + row * C + (lane + 32 * kk) * VEC;
+          if constexpr (VEC == 8) w[b][kk] = row != SIZE_MAX ? ptx_ldg_v4_u32(src) : uint4{0, 0, 0, 0};
+          else if constexpr (VEC == 4) w[b][kk] = row != SIZE_MAX ? ptx_ldg_v2_u32(src) : uint2{0, 0};
+          else w[b][kk] = row != SIZE_MAX ? ptx_ldg_u32(src) : 0u;
+        }
       }
 #pragma unroll
       for (int b = 0; b < B; ++b) {
         float v[K];
 #pragma unroll
         for (int kk = 0; kk < KK; ++kk) {
-          const PT* h = reinterpret_cast<const PT*>(&w[b][kk]);
+          const uint32_t* u32 = reinterpret_cast<const uint32_t*>(&w[b][kk]);
 #pragma unroll
-          for (int e = 0; e < VEC / 2; ++e) { float2 f = ld2f(h + 2 * e); v[kk * VEC + 2 * e] = f.x; v[kk * VEC + 2 * e + 1] = f.y; }
+          for (int e = 0; e < VEC / 2; ++e) {
+            float2 f = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(u32[e]) : ptx_f16x2_to_f32x2(u32[e]);
+            v[kk * VEC + 2 * e] = f.x;
+            v[kk * VEC + 2 * e + 1] = f.y;
+          }
         }
         float s = 0.f;
 #pragma unroll
         for (int k = 0; k < K; ++k) s += v[k];
-        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-        float mean = s / C, inv;
+        s = ptx_warp_sum_f32(s);
+        float mean = ptx_div_f32(s, (float)C), inv;
         if constexpr (FAST_VAR) {
           float ss = 0.f;
 #pragma unroll
           for (int k = 0; k < K; ++k) ss += v[k] * v[k];
-          for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(~0u, ss, o);
-          inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+          ss = ptx_warp_sum_f32(ss);
+          inv = ptx_rsqrt_f32(ptx_fma_f32(-mean, mean, ptx_div_f32(ss, (float)C)) + 1e-5f);
         } else {
           float q = 0.f;
 #pragma unroll
           for (int k = 0; k < K; ++k) { float d = v[k] - mean; q += d * d; }
-          for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-          inv = rsqrtf(q / C + 1e-5f);
+          q = ptx_warp_sum_f32(q);
+          inv = ptx_rsqrt_f32(ptx_div_f32(q, (float)C) + 1e-5f);
         }
         int r = warp + (base + b) * WARPS;
 #pragma unroll
         for (int kk = 0; kk < KK; ++kk) {
-          VT o4; half2* oh = reinterpret_cast<half2*>(&o4);
+          VT o4; uint32_t* oh = reinterpret_cast<uint32_t*>(&o4);
 #pragma unroll
-          for (int e = 0; e < VEC / 2; ++e)
-            oh[e] = __floats2half2_rn((v[kk * VEC + 2 * e] - mean) * inv * sc[kk * VEC + 2 * e] + of[kk * VEC + 2 * e],
-                                      (v[kk * VEC + 2 * e + 1] - mean) * inv * sc[kk * VEC + 2 * e + 1] + of[kk * VEC + 2 * e + 1]);
-          *reinterpret_cast<VT*>(Xs + r * LDX + (lane + 32 * kk) * VEC) = o4;
+          for (int e = 0; e < VEC / 2; ++e) {
+            float y0 = ptx_fma_f32((v[kk * VEC + 2 * e] - mean) * inv, sc[kk * VEC + 2 * e], of[kk * VEC + 2 * e]);
+            float y1 = ptx_fma_f32((v[kk * VEC + 2 * e + 1] - mean) * inv, sc[kk * VEC + 2 * e + 1], of[kk * VEC + 2 * e + 1]);
+            oh[e] = ptx_cvt_f16x2_f32(y0, y1);
+          }
+          half* dst = Xs + r * LDX + (lane + 32 * kk) * VEC;
+          if constexpr (VEC == 8) ptx_st_shared_v4_u32(dst, o4);
+          else if constexpr (VEC == 4) ptx_st_shared_v2_u32(dst, o4);
+          else ptx_st_shared_u32(dst, o4);
         }
       }
     }
@@ -149,7 +182,7 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
   float sc[MAX_B > 1 ? K : 1], of[MAX_B > 1 ? K : 1]; // a lane's channels' scale and offset, loaded once for all its rows
   if constexpr (MAX_B > 1) {
 #pragma unroll
-    for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
+    for (int k = 0; k < K; ++k) { sc[k] = ptx_ldg_f32(scale + lane + 32 * k); of[k] = ptx_ldg_f32(offset + lane + 32 * k); }
   }
   for (int base = 0; base < RPW; base += B) {
     PT w[B][K];
@@ -164,28 +197,28 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
     for (int b = 0; b < B; ++b) {
       float v[K], s = 0.f;
 #pragma unroll
-      for (int k = 0; k < K; ++k) { v[k] = (float)w[b][k]; s += v[k]; }
-      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-      float mean = s / C, inv;
+      for (int k = 0; k < K; ++k) { v[k] = toF(w[b][k]); s += v[k]; }
+      s = ptx_warp_sum_f32(s);
+      float mean = ptx_div_f32(s, (float)C), inv;
       if constexpr (FAST_VAR) {
         float ss = 0.f;
 #pragma unroll
         for (int k = 0; k < K; ++k) ss += v[k] * v[k];
-        for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(~0u, ss, o);
-        inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+        ss = ptx_warp_sum_f32(ss);
+        inv = ptx_rsqrt_f32(ptx_fma_f32(-mean, mean, ptx_div_f32(ss, (float)C)) + 1e-5f);
       } else {
         float q = 0.f;
 #pragma unroll
         for (int k = 0; k < K; ++k) { float d = v[k] - mean; q += d * d; }
-        for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-        inv = rsqrtf(q / C + 1e-5f);
+        q = ptx_warp_sum_f32(q);
+        inv = ptx_rsqrt_f32(ptx_div_f32(q, (float)C) + 1e-5f);
       }
       half* xrow = Xs + (warp + (base + b) * WARPS) * LDX + lane;
 #pragma unroll
       for (int k = 0; k < K; ++k) {
-        float sk = MAX_B > 1 ? sc[k] : scale[lane + 32 * k];
-        float ok = MAX_B > 1 ? of[k] : offset[lane + 32 * k];
-        xrow[32 * k] = __float2half((v[k] - mean) * inv * sk + ok);
+        float sk = MAX_B > 1 ? sc[k] : ptx_ldg_f32(scale + lane + 32 * k);
+        float ok = MAX_B > 1 ? of[k] : ptx_ldg_f32(offset + lane + 32 * k);
+        ptx_st_shared_u16(xrow + 32 * k, ptx_f32_to_f16_raw(ptx_fma_f32((v[k] - mean) * inv, sk, ok)));
       }
     }
   }

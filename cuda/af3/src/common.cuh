@@ -2112,25 +2112,31 @@ inline const float* Fdev(const std::string& k) {     // non-weight float inputs 
 // ---------------------------------------------------------------- precision
 // The activations' storage type is T throughout a stage: float for the precise path that
 // is checked against AF3, half for the fast one. Residual streams stay f32 either way.
+#include "ptx_primitives.cuh"
 template <class T> constexpr cudaDataType cudaType() {
   return std::is_same_v<T, float> ? CUDA_R_32F : std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_16F;
 }
 template <class T> __device__ __forceinline__ float toF(T v) {
   if constexpr (std::is_same_v<T, float>) return v;
-  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat162float(v);
-  else return __half2float(v);
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return ptx_bf16_raw_to_f32(*reinterpret_cast<const unsigned short*>(&v));
+  else return ptx_f16_raw_to_f32(*reinterpret_cast<const unsigned short*>(&v));
 }
 template <class T> __device__ __forceinline__ T fromF(float v) {
   if constexpr (std::is_same_v<T, float>) return v;
-  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __float2bfloat16(v);
-  else return __float2half(v);
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    unsigned short r = ptx_f32_to_bf16_raw(v);
+    return *reinterpret_cast<const __nv_bfloat16*>(&r);
+  } else {
+    unsigned short r = ptx_f32_to_f16_raw(v);
+    return *reinterpret_cast<const half*>(&r);
+  }
 }
 // two adjacent elements of a 16-bit tensor as floats, bf16 or f16
 template <class T> __device__ __forceinline__ float2 ld2f(const T* p) {
-  if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
-  else return __half22float2(*reinterpret_cast<const half2*>(p));
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) return ptx_bf16x2_to_f32x2(*reinterpret_cast<const uint32_t*>(p));
+  else return ptx_f16x2_to_f32x2(*reinterpret_cast<const uint32_t*>(p));
 }
-__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ float sigm(float x) { return ptx_sigm_f32(x); }
 // the sigmoid on one MUFU op (tanh.approx: |error| of the sigmoid <= ~2.5e-4) where exp and a reciprocal
 // were two - only where that is below the noise already there: a result rounded to f16 straight after
 // (its own step ~4.9e-4 relative), or the triangle output's gate, whose update comes off a bf16 product
@@ -2140,7 +2146,7 @@ __device__ __forceinline__ float sigmH(float x) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750                     // (Volta: no tanh.approx)
   return 1.f / (1.f + __expf(-x));
 #else
-  float t; asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x)); return fmaf(0.5f, t, 0.5f);
+  return ptx_sigm_fast_f32(x);
 #endif
 }
 

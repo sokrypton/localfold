@@ -31,7 +31,7 @@ inline const void* biasFor(const float* bias, int n, bool asHalf) {
 }
 __global__ void toBf16FK(const float* x, __nv_bfloat16* y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) y[i] = __float2bfloat16(x[i]);
+  if (i < n) ptx_st_global_u16(y + i, ptx_f32_to_bf16_raw(ptx_ldg_f32(x + i)));
 }
 // bf16: X, Wt and Y all bf16 (cuBLASLt takes no f16-in, bf16-out GEMM) - the bf16 MSA's (MSA16); the bias a bf16 copy
 inline const void* biasForBf16(const float* bias, int n) {
@@ -245,13 +245,14 @@ __global__ void layerNormTK(const float* __restrict__ x, TO* __restrict__ y, siz
   if (row >= rows) return;
   const float* xr = x + row * C;
   float s = 0;
-  for (int c = lane; c < C; c += 32) s += xr[c];
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  float mean = s / C, v = 0;
-  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
-  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = rsqrtf(v / C + 1e-5f);
-  for (int c = lane; c < C; c += 32) y[row * C + c] = (TO)((xr[c] - mean) * inv * scale[c] + offset[c]);
+  for (int c = lane; c < C; c += 32) s += ptx_ldg_f32(xr + c);
+  s = ptx_warp_sum_f32(s);
+  float mean = ptx_div_f32(s, (float)C), v = 0;
+  for (int c = lane; c < C; c += 32) { float d = ptx_ldg_f32(xr + c) - mean; v += d * d; }
+  v = ptx_warp_sum_f32(v);
+  float inv = ptx_rsqrt_f32(ptx_div_f32(v, (float)C) + 1e-5f);
+  for (int c = lane; c < C; c += 32)
+    y[row * C + c] = fromF<TO>(ptx_fma_f32((ptx_ldg_f32(xr + c) - mean) * inv, ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c)));
 }
 // (the same at a width known at compile time: layerNormVK, elementwise.cuh)
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::string& w, int block = -1) {
@@ -430,7 +431,7 @@ __global__ void swapAddK(float* __restrict__ y, const float* __restrict__ x, int
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)A * B * C) return;
   int c = (int)(t % C); size_t r = t / C; int a = (int)(r % A), b = (int)(r / A);
-  y[t] += __ldg(x + ((size_t)a * B + b) * C + c);
+  ptx_st_global_f32(y + t, ptx_ld_global_f32(y + t) + ptx_ldg_f32(x + ((size_t)a * B + b) * C + c));
 }
 // o [rows, H*Dp] f16 from the flash kernel, a padded head's first D columns kept: the output projection
 // reads the padded layout directly (its weight has zero rows there), so nothing is copied

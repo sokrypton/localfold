@@ -80,79 +80,79 @@ inline size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor
 inline bool AF2_P16 = false;
 template <class PT, class TX>
 __global__ void addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const float* __restrict__ bias128 = nullptr, float biasScale = 1.f) {
-  __shared__ float sb[128];
-  if (bias128 && threadIdx.x < 128) sb[threadIdx.x] = bias128[threadIdx.x] * biasScale;
-  if (bias128) __syncthreads();
   size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (i + 3 < n) {
     float4 p = pairLd4<PT>(pair, i);
-    float4 b = bias128 ? *reinterpret_cast<const float4*>(sb + (i & 127)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 b = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (bias128) {
+      b = ptx_ldg_v4_f32(bias128 + (i & 127));
+      asm("mul.ftz.f32 %0, %0, %4;\n\t"
+          "mul.ftz.f32 %1, %1, %4;\n\t"
+          "mul.ftz.f32 %2, %2, %4;\n\t"
+          "mul.ftz.f32 %3, %3, %4;"
+          : "+f"(b.x), "+f"(b.y), "+f"(b.z), "+f"(b.w) : "f"(biasScale));
+    }
     if constexpr (std::is_same_v<TX, float>) {
-      float4 v = *reinterpret_cast<const float4*>(x + i);
+      float4 v = ptx_ldg_v4_f32(x + i);
       p.x += v.x + b.x; p.y += v.y + b.y; p.z += v.z + b.z; p.w += v.w + b.w;
     } else {
-      uint2 u = *reinterpret_cast<const uint2*>(x + i);
-      float2 a = __half22float2(*reinterpret_cast<const half2*>(&u.x));
-      float2 c = __half22float2(*reinterpret_cast<const half2*>(&u.y));
+      uint2 u = ptx_ldg_v2_u32(x + i);
+      float2 a = ptx_f16x2_to_f32x2(u.x);
+      float2 c = ptx_f16x2_to_f32x2(u.y);
       p.x += a.x + b.x; p.y += a.y + b.y; p.z += c.x + b.z; p.w += c.y + b.w;
     }
     pairSt4<PT>(pair, i, p);
   } else {
-    for (size_t k = i; k < n; ++k) pairSt<PT>(pair, k, pairLd<PT>(pair, k) + (toF(x[k]) + (bias128 ? sb[k & 127] : 0.f)));
+    for (size_t k = i; k < n; ++k)
+      pairSt<PT>(pair, k, pairLd<PT>(pair, k) + (toF(x[k]) + (bias128 ? ptx_ldg_f32(bias128 + (k & 127)) * biasScale : 0.f)));
   }
 }
 __global__ void pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, size_t n) {
   size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
-  if (i + 3 < n) *reinterpret_cast<float4*>(out + i) = pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(in), i);
-  else for (size_t k = i; k < n; ++k) out[k] = __bfloat162float(in[k]);
+  if (i + 3 < n) ptx_st_global_v4_f32(out + i, pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(in), i));
+  else for (size_t k = i; k < n; ++k) ptx_st_global_f32(out + k, toF(in[k]));
 }
 template <class PT, bool FAST_INV = false, class TX = float>
 __global__ void opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __restrict__ bias,
                            const float* __restrict__ norm, size_t i0, int Bi, int L, float xs = 1.f, float normVal = 0.f) {
-  __shared__ float sb[128];
-  if (threadIdx.x < 128) sb[threadIdx.x] = bias[threadIdx.x];
-  __syncthreads();
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)Bi * L * 32) return;
   int f = (int)((t & 31) << 2);
   size_t p = i0 * L + (t >> 5);
-  float denom = 1e-3f + (norm ? __ldg(norm + p) : normVal);
+  float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
   float4 x4;
   if constexpr (std::is_same_v<TX, float>) {
-    x4 = *reinterpret_cast<const float4*>(x + (t << 2));
+    x4 = ptx_ldg_v4_f32(x + (t << 2));
   } else {
-    uint2 u = *reinterpret_cast<const uint2*>(x + (t << 2));
-    float2 a = __half22float2(*reinterpret_cast<const half2*>(&u.x));
-    float2 c = __half22float2(*reinterpret_cast<const half2*>(&u.y));
+    uint2 u = ptx_ldg_v2_u32(x + (t << 2));
+    float2 a = ptx_f16x2_to_f32x2(u.x);
+    float2 c = ptx_f16x2_to_f32x2(u.y);
     x4 = make_float4(a.x, a.y, c.x, c.y);
   }
-  float4 b4 = *reinterpret_cast<const float4*>(sb + f);
+  float4 b4 = ptx_ldg_v4_f32(bias + f);
   float4 p4 = pairLd4<PT>(pair, (p << 7) + f);
   if constexpr (FAST_INV) {
-    float inv = 1.f / denom;
-    p4.x += (b4.x + xs * x4.x) * inv;
-    p4.y += (b4.y + xs * x4.y) * inv;
-    p4.z += (b4.z + xs * x4.z) * inv;
-    p4.w += (b4.w + xs * x4.w) * inv;
+    float inv = ptx_rcp_f32(denom);
+    p4.x = ptx_fma_f32(ptx_fma_f32(xs, x4.x, b4.x), inv, p4.x);
+    p4.y = ptx_fma_f32(ptx_fma_f32(xs, x4.y, b4.y), inv, p4.y);
+    p4.z = ptx_fma_f32(ptx_fma_f32(xs, x4.z, b4.z), inv, p4.z);
+    p4.w = ptx_fma_f32(ptx_fma_f32(xs, x4.w, b4.w), inv, p4.w);
   } else {
-    p4.x += (b4.x + xs * x4.x) / denom;
-    p4.y += (b4.y + xs * x4.y) / denom;
-    p4.z += (b4.z + xs * x4.z) / denom;
-    p4.w += (b4.w + xs * x4.w) / denom;
+    p4.x += ptx_fma_f32(xs, x4.x, b4.x) / denom;
+    p4.y += ptx_fma_f32(xs, x4.y, b4.y) / denom;
+    p4.z += ptx_fma_f32(xs, x4.z, b4.z) / denom;
+    p4.w += ptx_fma_f32(xs, x4.w, b4.w) / denom;
   }
   pairSt4<PT>(pair, (p << 7) + f, p4);
 }
 template <class PT>
 __global__ void opmZeroMask128K(float* __restrict__ pair, const float* __restrict__ bias, size_t pairs, float denom = 1e-3f) {
-  __shared__ float sb[128];
-  if (threadIdx.x < 128) sb[threadIdx.x] = (bias[threadIdx.x] + 0.f) / denom;
-  __syncthreads();
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= pairs * 32) return;
   int f = (int)((t & 31) << 2);
-  float4 b4 = *reinterpret_cast<const float4*>(sb + f);
+  float4 b4 = ptx_ldg_v4_f32(bias + f);
   float4 p4 = pairLd4<PT>(pair, t << 2);
-  p4.x += b4.x; p4.y += b4.y; p4.z += b4.z; p4.w += b4.w;
+  p4.x += b4.x / denom; p4.y += b4.y / denom; p4.z += b4.z / denom; p4.w += b4.w / denom;
   pairSt4<PT>(pair, t << 2, p4);
 }
 // the pair as f32 for a reader with no bf16 form (the template embedders' query): itself, or a converted copy
