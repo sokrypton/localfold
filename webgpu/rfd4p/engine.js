@@ -34,6 +34,8 @@ function gemmSource(half, b16 = false, pair = null, gate = false, aF16 = false, 
   const rows = [0, 1, 2, 3];
   const EA = aF16 ? 'f16' : 'f32';
   const EB = b16 ? 'f16' : 'f32';
+  // Elementwise B shares A's type, as in `gemmSubmatSource`; packed (`half`) B is read as words.
+  const EBelem = aF16 ? 'f16' : 'f32';
   const isBase = Boolean(variant?.baseline);
   const useShufTa2 = Boolean(!isBase && (variant?.shufTa2 ?? true) && vecA);
   const useShufTa = useShufTa2;
@@ -53,7 +55,7 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
   gOff: u32, gStride: u32, gSigm: u32, pad0: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> a: array<${useShufTa ? `vec4<${EA}>` : EA}>;
-@group(0) @binding(2) var<storage, read> b: array<${useVecB ? 'vec4<u32>' : (half ? 'u32' : 'f32')}>;
+@group(0) @binding(2) var<storage, read> b: array<${useVecB ? 'vec4<u32>' : (half ? 'u32' : EBelem)}>;
 @group(0) @binding(3) var<storage, read_write> c: array<${EC}>;
 @group(0) @binding(4) var<storage, read> bias: array<${vecEpilogue ? 'vec4<f32>' : 'f32'}>;
 ${gate ? `@group(0) @binding(5) var<storage, read> gsc: array<${EG}>;` : ''}
@@ -241,12 +243,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let row0 = n0 + r4 * 4u;
         let bAddr0 = baseB + bRow(row0) * p.sBn + k * p.sBk;
         if (row0 + 3u < p.n) {
-          v = vec4<f32>(b[bAddr0], b[bAddr0 + p.sBn], b[bAddr0 + 2u * p.sBn], b[bAddr0 + 3u * p.sBn]);
+          v = vec4<f32>(f32(b[bAddr0]), f32(b[bAddr0 + p.sBn]), f32(b[bAddr0 + 2u * p.sBn]), f32(b[bAddr0 + 3u * p.sBn]));
         } else {
-          if (row0 < p.n) { v.x = b[bAddr0]; }
-          if (row0 + 1u < p.n) { v.y = b[bAddr0 + p.sBn]; }
-          if (row0 + 2u < p.n) { v.z = b[bAddr0 + 2u * p.sBn]; }
-          if (row0 + 3u < p.n) { v.w = b[bAddr0 + 3u * p.sBn]; }
+          if (row0 < p.n) { v.x = f32(b[bAddr0]); }
+          if (row0 + 1u < p.n) { v.y = f32(b[bAddr0 + p.sBn]); }
+          if (row0 + 2u < p.n) { v.z = f32(b[bAddr0 + 2u * p.sBn]); }
+          if (row0 + 3u < p.n) { v.w = f32(b[bAddr0 + 3u * p.sBn]); }
         }
       }
       tb[kk * 33u + r4] = vec4<${EB}>(v);
@@ -502,6 +504,8 @@ function gemmSmallSource(half, b16 = false, gate = false, aF16 = false, cF16 = f
   const rows = [0, 1];
   const EA = aF16 ? 'f16' : 'f32';
   const EB = b16 ? 'f16' : 'f32';
+  // Elementwise B shares A's type, as in `gemmSubmatSource`; packed (`half`) B is read as words.
+  const EBelem = aF16 ? 'f16' : 'f32';
   const EC = cF16 ? 'f16' : 'f32';
   const EG = gF16 ? 'f16' : 'f32';
   const useF16 = b16 || aF16 || cF16 || gF16;
@@ -514,7 +518,7 @@ struct P { m: u32, n: u32, k: u32, b1: u32,
   gOff: u32, gStride: u32, gSigm: u32, pad0: u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> a: array<${EA}>;
-@group(0) @binding(2) var<storage, read> b: array<${half ? 'u32' : 'f32'}>;
+@group(0) @binding(2) var<storage, read> b: array<${half ? 'u32' : EBelem}>;
 @group(0) @binding(3) var<storage, read_write> c: array<${EC}>;
 @group(0) @binding(4) var<storage, read> bias: array<f32>;
 ${gate ? `@group(0) @binding(5) var<storage, read> gsc: array<${EG}>;` : ''}
@@ -646,12 +650,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let bOff = k0 * p.sBk;
         let bAddr0 = bBase0 + bOff;
         if (fullB) {
-          v = vec4<f32>(b[bAddr0], b[bAddr0 + p.sBn], b[bAddr0 + 2u * p.sBn], b[bAddr0 + 3u * p.sBn]);
+          v = vec4<f32>(f32(b[bAddr0]), f32(b[bAddr0 + p.sBn]), f32(b[bAddr0 + 2u * p.sBn]), f32(b[bAddr0 + 3u * p.sBn]));
         } else {
-          if (rowB0 < p.n) { v.x = b[bAddr0]; }
-          if (rowB0 + 1u < p.n) { v.y = b[bAddr0 + p.sBn]; }
-          if (rowB0 + 2u < p.n) { v.z = b[bAddr0 + 2u * p.sBn]; }
-          if (rowB0 + 3u < p.n) { v.w = b[bAddr0 + 3u * p.sBn]; }
+          if (rowB0 < p.n) { v.x = f32(b[bAddr0]); }
+          if (rowB0 + 1u < p.n) { v.y = f32(b[bAddr0 + p.sBn]); }
+          if (rowB0 + 2u < p.n) { v.z = f32(b[bAddr0 + 2u * p.sBn]); }
+          if (rowB0 + 3u < p.n) { v.w = f32(b[bAddr0 + 3u * p.sBn]); }
         }
       }
       tb[tbWrite] = vec4<${EB}>(v);
@@ -2661,7 +2665,8 @@ export class Rfd4pEngine {
     u[27] = spec.pad0 ?? 0;
     const submat = b16 && this.hasSubgroupMatrix;
     const tiles64 = Math.ceil(m / 64) * Math.ceil(n / 128) * B0 * B1;
-    const small = (submat ? !spec.noSmall : !spec.pair && !spec.noSmall) &&
+    // The stock small kernel has no fused input LayerNorm, so an `inNorm: 'ln'` GEMM stays on the tiled one.
+    const small = (submat ? !spec.noSmall : !spec.pair && !spec.noSmall && spec.inNorm !== 'ln') &&
       (submat ? (m <= 32 || tiles64 < (k <= 64 ? 100 : 80)) : (m <= 32 || n <= 64 || tiles64 < 32));
     const aF16 = this.hasF16 && spec.aF16 === true;
     const cF16 = this.hasF16 && spec.cF16 === true;
@@ -2706,6 +2711,7 @@ export class Rfd4pEngine {
         spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? `[${B0 * B1}]` : ''}`);
     }
     const inLn = (submat ? (vecIO && (vecEpilogue || Boolean(spec.pair))) : (fullK && vecEpilogue && !small)) && spec.inNorm === 'ln';
+    if (spec.inNorm === 'ln' && !inLn) throw new Error(`gemm ${m}x${n}x${k}: inNorm 'ln' is not supported by the kernel this shape selects`);
     const vKey = !submat && !small && this.gemmVariant ? `-v${JSON.stringify(this.gemmVariant)}` : '';
     const key = `${small ? 'gemm-s' : 'gemm'}${submat ? `-sm${this.submat8 ? '8' : ''}${half ? '-h' : '-f'}${aF16 ? '-a16' : ''}${cF16 ? '-c16' : ''}${vecIO ? '-v' : (vecB ? '-vb' : '')}${vecEpilogue ? '-ve' : ''}${inLn ? '-ln' : ''}${hasAlpha ? '-al' : ''}${hasBias ? '-b' : ''}${actType ? `-act${actType}` : ''}${acc ? '-ac' : ''}${hasGate && addOnly ? '-ga' : (hasGate && !gSigm ? '-gns' : '')}` : `${wordB ? '-h' : ''}${b16 ? '-b16' : ''}${aF16 ? '-a16' : ''}${cF16 ? '-c16' : ''}${fullK ? '-fk' : ''}${vecAStock ? '-va' : ''}${vecBStock ? '-vb' : ''}${vecEpilogue ? '-ve' : ''}${inLn ? '-ln' : ''}${hasAlpha ? '-al' : ''}${hasBias ? '-b' : ''}${actType ? `-act${actType}` : ''}${acc ? '-ac' : ''}${hasGate && addOnly ? '-ga' : (hasGate && !gSigm ? '-gns' : '')}${vKey}`}${spec.pair ? `-p-${spec.pair.key}` : ''}${hasGate ? `-g${gF16 ? '16' : ''}` : ''}`;
     const src = submat
