@@ -492,8 +492,14 @@ residues the cropped example does not contain, so building one from the spec fai
     component the file says nothing about; and a NON-POLYMER chain takes `auth_seq_id` as its
     residue number, without which a het group's atoms all collapse into one residue because its
     `label_seq_id` is `.`.
-  - `computeIdAndEntityAnnotations` (the pn-unit, molecule and entity ids), and the annotation
-    columns parsed into typed arrays rather than kept as strings.
+  - ~~`computeIdAndEntityAnnotations`~~ **done**: the pn-unit and molecule components, the
+    three-level Weisfeiler-Lehman entity hash and the instance ids - all 30 columns, all seven
+    structures, 0 differing. 🔴 Coordination bonds are excluded at every level (a metal touching
+    two chains does not make them one molecule), and the sort is NUMERIC where the column is -
+    `molecule_id` and `res_id` sorted as text put 10 before 9 and renumber every entity past the
+    ninth.
+  - the annotation columns parsed into typed arrays rather than kept as strings, and the rest of
+    `parseCifToAtomArray`'s tail.
   - ~~`buildBondsForAtomArray`~~ **done**: the `_struct_conn` covalent links, each residue's own
     bonds from `STD_RESIDUE_BONDS` overlaid by the file's `_chem_comp_bond`, the polymer backbone,
     and the metal retype - the bond list compared IN ORDER, since later stages index into it. 🔴

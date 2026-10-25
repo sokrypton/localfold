@@ -35,10 +35,10 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
-  const rows = lines.slice(1).filter((l) => !l.startsWith("extra\t") && !l.startsWith("bond\t"))
-    .map((l) => l.split("\t"));
+  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id)\t/.test(l)).map((l) => l.split("\t"));
   const bonds = lines.filter((l) => l.startsWith("bond\t"))
     .map((l) => l.split("\t").slice(1).map(Number));
+  const ids = lines.filter((l) => l.startsWith("id\t")).map((l) => l.split("\t").slice(1));
 
   const wrong = [];
   if (n !== js.res_name.length) wrong.push(`n ${n} vs ${js.res_name.length}`);
@@ -85,6 +85,24 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     const bad = bonds.filter((b, i) =>
       b[0] !== js.bonds[i][0] || b[1] !== js.bonds[i][1] || b[2] !== js.bonds[i][2]).length;
     if (bad) wrong.push(`bonds ${bad}`);
+  }
+
+  // The id and entity annotations, which the bonds decide.
+  const idColumns = [
+    ["pn_unit_id", 0, (v) => v, js.pn_unit_id],
+    ["molecule_id", 1, Number, js.molecule_id],
+    ["chain_entity", 2, Number, js.chain_entity],
+    ["pn_unit_entity", 3, Number, js.pn_unit_entity],
+    ["molecule_entity", 4, Number, js.molecule_entity],
+    ["chain_iid", 5, (v) => v, js.chain_iid],
+    ["pn_unit_iid", 6, (v) => v, js.pn_unit_iid],
+    ["molecule_iid", 7, Number, js.molecule_iid],
+  ];
+  for (const [label, at, cast, want] of idColumns) {
+    if (!want) continue;
+    if (ids.length !== want.length) { wrong.push(`${label} length`); continue; }
+    const bad = ids.filter((r, i) => cast(r[at]) !== want[i]).length;
+    if (bad) wrong.push(`${label} ${bad}`);
   }
 
   structures += 1;

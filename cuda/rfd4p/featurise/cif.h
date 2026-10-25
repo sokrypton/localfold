@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include "tables.inc"
@@ -634,6 +636,255 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
     }
   }
   return bonds;
+}
+
+/**
+ * `computeIdAndEntityAnnotations`: the pn-unit, molecule and entity ids, and the instance ids.
+ *
+ * Three levels, each a connected-component pass over the bonds plus a Weisfeiler-Lehman hash that
+ * decides which instances are the SAME entity - two chains with the same residues in the same
+ * arrangement get one id, which is what makes a homodimer a homodimer.
+ *
+ * 🔴 COORDINATION BONDS ARE EXCLUDED EVERYWHERE HERE. A metal touching two chains does not make
+ * them one molecule, and leaving them in merges a protein with whatever its zinc also touches.
+ *
+ * 🔴 AND THE SORT IS NUMERIC WHERE THE COLUMN IS. `molecule_id` and `res_id` are numbers and
+ * `chain_id` and `pn_unit_id` are strings; sorting the numeric ones as text puts 10 before 9 and
+ * renumbers every entity past the ninth.
+ */
+struct Ids {
+  vector<string> pnUnitId, chainIid, pnUnitIid;
+  vector<int> moleculeId, chainEntity, pnUnitEntity, moleculeEntity, moleculeIid;
+};
+
+inline Ids computeIds(const AtomSite& a, const vector<Bond>& bonds) {
+  const int n = (int)a.n;
+  Ids out;
+  if (n == 0) return out;
+  vector<std::pair<int, int>> links;
+  for (const Bond& b : bonds) {
+    if (b.type != tables::BT_COORDINATION) links.push_back({b.u, b.v});
+  }
+
+  // 1. pn_unit_id: the chain, with connected NON-POLYMER chains merged into one comma-joined name.
+  out.pnUnitId = a.chainId;
+  {
+    vector<string> nonPoly;
+    for (int i = 0; i < n; ++i) {
+      if (!a.isPolymer[i] &&
+          std::find(nonPoly.begin(), nonPoly.end(), a.chainId[i]) == nonPoly.end()) {
+        nonPoly.push_back(a.chainId[i]);
+      }
+    }
+    std::sort(nonPoly.begin(), nonPoly.end());
+    if (!nonPoly.empty()) {
+      std::map<string, int> idx;
+      for (size_t k = 0; k < nonPoly.size(); ++k) idx[nonPoly[k]] = (int)k;
+      vector<std::set<int>> adj(nonPoly.size());
+      for (size_t k = 0; k < nonPoly.size(); ++k) adj[k].insert((int)k);
+      for (const auto& [u, v] : links) {
+        if (a.isPolymer[u] || a.isPolymer[v]) continue;
+        auto cu = idx.find(a.chainId[u]), cv = idx.find(a.chainId[v]);
+        if (cu == idx.end() || cv == idx.end() || cu->second == cv->second) continue;
+        adj[cu->second].insert(cv->second);
+        adj[cv->second].insert(cu->second);
+      }
+      vector<uint8_t> seen(nonPoly.size(), 0);
+      for (size_t i = 0; i < nonPoly.size(); ++i) {
+        if (seen[i]) continue;
+        vector<string> comp;
+        vector<int> queue{(int)i};
+        seen[i] = 1;
+        for (size_t q = 0; q < queue.size(); ++q) {
+          comp.push_back(nonPoly[queue[q]]);
+          for (int nb : adj[queue[q]]) {
+            if (!seen[nb]) { seen[nb] = 1; queue.push_back(nb); }
+          }
+        }
+        vector<string> sorted = comp;
+        std::sort(sorted.begin(), sorted.end());
+        string joined;
+        for (size_t k = 0; k < sorted.size(); ++k) joined += (k ? "," : "") + sorted[k];
+        std::set<string> members(comp.begin(), comp.end());
+        for (int k = 0; k < n; ++k) if (members.count(a.chainId[k])) out.pnUnitId[k] = joined;
+      }
+    }
+  }
+
+  // 2. molecule_id: the connected components of the pn-units.
+  {
+    vector<string> units;
+    for (int i = 0; i < n; ++i) {
+      if (std::find(units.begin(), units.end(), out.pnUnitId[i]) == units.end()) {
+        units.push_back(out.pnUnitId[i]);
+      }
+    }
+    std::sort(units.begin(), units.end());
+    std::map<string, int> idx;
+    for (size_t k = 0; k < units.size(); ++k) idx[units[k]] = (int)k;
+    vector<std::set<int>> adj(units.size());
+    for (size_t k = 0; k < units.size(); ++k) adj[k].insert((int)k);
+    for (const auto& [u, v] : links) {
+      const int pu = idx[out.pnUnitId[u]], pv = idx[out.pnUnitId[v]];
+      if (pu == pv) continue;
+      adj[pu].insert(pv);
+      adj[pv].insert(pu);
+    }
+    std::map<string, int> unitToMol;
+    vector<uint8_t> seen(units.size(), 0);
+    int counter = 0;
+    for (size_t i = 0; i < units.size(); ++i) {
+      if (seen[i]) continue;
+      vector<int> queue{(int)i};
+      seen[i] = 1;
+      for (size_t q = 0; q < queue.size(); ++q) {
+        unitToMol[units[queue[q]]] = counter;
+        for (int nb : adj[queue[q]]) {
+          if (!seen[nb]) { seen[nb] = 1; queue.push_back(nb); }
+        }
+      }
+      ++counter;
+    }
+    out.moleculeId.assign(n, 0);
+    for (int i = 0; i < n; ++i) out.moleculeId[i] = unitToMol[out.pnUnitId[i]];
+  }
+
+  // 3. The entity at each level: a Weisfeiler-Lehman hash over the level below.
+  auto levelEntities = [&](const vector<string>& level, bool levelNumeric,
+                           const vector<string>& lowerId, bool lowerNumeric,
+                           const vector<string>& lowerEntity, bool includeInterBonds) {
+    auto less = [](bool numeric) {
+      return [numeric](const string& x, const string& y) {
+        return numeric ? atof(x.c_str()) < atof(y.c_str()) : x < y;
+      };
+    };
+    vector<string> instances;
+    for (int i = 0; i < n; ++i) {
+      if (std::find(instances.begin(), instances.end(), level[i]) == instances.end()) {
+        instances.push_back(level[i]);
+      }
+    }
+    std::sort(instances.begin(), instances.end(), less(levelNumeric));
+    std::map<string, int> hashToEntity;
+    int next = 0;
+    vector<int> result(n, 0);
+    for (const string& inst : instances) {
+      vector<int> members;
+      for (int i = 0; i < n; ++i) if (level[i] == inst) members.push_back(i);
+      std::map<int, int> toLocal;
+      for (size_t l = 0; l < members.size(); ++l) toLocal[members[l]] = (int)l;
+      vector<string> nodes;
+      for (int g : members) {
+        if (std::find(nodes.begin(), nodes.end(), lowerId[g]) == nodes.end()) {
+          nodes.push_back(lowerId[g]);
+        }
+      }
+      std::sort(nodes.begin(), nodes.end(), less(lowerNumeric));
+      std::map<string, int> nodeIdx;
+      for (size_t k = 0; k < nodes.size(); ++k) nodeIdx[nodes[k]] = (int)k;
+      vector<string> labels(nodes.size());
+      for (size_t k = 0; k < nodes.size(); ++k) {
+        for (int g : members) {
+          if (lowerId[g] == nodes[k]) { labels[k] = lowerEntity[g]; break; }
+        }
+      }
+      vector<std::set<int>> adj(nodes.size());
+      for (size_t k = 0; k < nodes.size(); ++k) adj[k].insert((int)k);
+      vector<string> inter;
+      for (const auto& [u, v] : links) {
+        if (!toLocal.count(u) || !toLocal.count(v)) continue;
+        const int nu = nodeIdx[lowerId[u]], nv = nodeIdx[lowerId[v]];
+        if (nu == nv) continue;
+        adj[nu].insert(nv);
+        adj[nv].insert(nu);
+        if (includeInterBonds) {
+          const string t1 = lowerEntity[u] + ":" + std::to_string(a.resId[u]) + ":" +
+                            a.resName[u] + ":" + a.atomName[u];
+          const string t2 = lowerEntity[v] + ":" + std::to_string(a.resId[v]) + ":" +
+                            a.resName[v] + ":" + a.atomName[v];
+          inter.push_back(t1 < t2 ? t1 + "|" + t2 : t2 + "|" + t1);
+        }
+      }
+      vector<string> cur = labels;
+      for (int iter = 0; iter < 3; ++iter) {
+        vector<string> nextLabels(nodes.size());
+        for (size_t k = 0; k < nodes.size(); ++k) {
+          vector<string> nb;
+          for (int j : adj[k]) nb.push_back(cur[j]);
+          std::sort(nb.begin(), nb.end());
+          string joined;
+          for (size_t q = 0; q < nb.size(); ++q) joined += (q ? "," : "") + nb[q];
+          nextLabels[k] = cur[k] + "(" + joined + ")";
+        }
+        cur = nextLabels;
+      }
+      vector<string> sortedLabels = cur;
+      std::sort(sortedLabels.begin(), sortedLabels.end());
+      string wl;
+      for (size_t k = 0; k < sortedLabels.size(); ++k) wl += (k ? ";" : "") + sortedLabels[k];
+      std::map<string, int> counts;
+      for (const string& l : labels) counts[l] += 1;
+      string countPart;
+      bool first = true;
+      for (const auto& [label, c] : counts) {
+        countPart += (first ? "" : ",") + label + ":" + std::to_string(c);
+        first = false;
+      }
+      std::sort(inter.begin(), inter.end());
+      string interPart;
+      for (size_t k = 0; k < inter.size(); ++k) interPart += (k ? "&" : "") + inter[k];
+      const string hash =
+          wl + "_" + std::to_string(nodes.size()) + "_" + countPart + "_" + interPart;
+      auto it = hashToEntity.find(hash);
+      int eid;
+      if (it == hashToEntity.end()) { eid = next++; hashToEntity[hash] = eid; }
+      else eid = it->second;
+      for (int g : members) result[g] = eid;
+    }
+    return result;
+  };
+
+  auto asText = [](const vector<int>& v) {
+    vector<string> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = std::to_string(v[i]);
+    return out;
+  };
+  const vector<string> resIdText = asText(a.resId);
+  const vector<string> moleculeIdText = asText(out.moleculeId);
+  out.chainEntity = levelEntities(a.chainId, false, resIdText, true, a.resName, false);
+  out.pnUnitEntity =
+      levelEntities(out.pnUnitId, false, a.chainId, false, asText(out.chainEntity), true);
+  out.moleculeEntity =
+      levelEntities(moleculeIdText, true, out.pnUnitId, false, asText(out.pnUnitEntity), true);
+
+  // The instance ids. `transformation_id` is "1" throughout for every file this reads.
+  out.chainIid.resize(n);
+  out.pnUnitIid.resize(n);
+  vector<string> molIid(n);
+  for (int i = 0; i < n; ++i) {
+    out.chainIid[i] = a.chainId[i] + "_1";
+    string joined;
+    size_t from = 0;
+    const string& p = out.pnUnitId[i];
+    while (from <= p.size()) {
+      const size_t comma = p.find(',', from);
+      joined += (from ? "," : "") + p.substr(from, comma == string::npos ? string::npos : comma - from) + "_1";
+      if (comma == string::npos) break;
+      from = comma + 1;
+    }
+    out.pnUnitIid[i] = joined;
+    molIid[i] = std::to_string(out.moleculeId[i]) + "1";
+  }
+  vector<string> uniqueMol;
+  for (const string& m : molIid) {
+    if (std::find(uniqueMol.begin(), uniqueMol.end(), m) == uniqueMol.end()) uniqueMol.push_back(m);
+  }
+  std::sort(uniqueMol.begin(), uniqueMol.end());
+  std::map<string, int> molMap;
+  for (size_t k = 0; k < uniqueMol.size(); ++k) molMap[uniqueMol[k]] = (int)k;
+  out.moleculeIid.assign(n, 0);
+  for (int i = 0; i < n; ++i) out.moleculeIid[i] = molMap[molIid[i]];
+  return out;
 }
 
 }  // namespace cif

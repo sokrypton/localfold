@@ -930,8 +930,13 @@ int run(int argc, char** argv) {
              a.charge[i], a.atomicNumber[i], (int)a.isAromatic[i], (int)a.isLeavingAtom[i],
              a.chainType[i], a.chemCompType[i].c_str());
     }
-    for (const rfd4p::cif::Bond& b : rfd4p::cif::buildBonds(a, block)) {
-      printf("bond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+    const vector<rfd4p::cif::Bond> bonds = rfd4p::cif::buildBonds(a, block);
+    for (const rfd4p::cif::Bond& b : bonds) printf("bond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+    const rfd4p::cif::Ids ids = rfd4p::cif::computeIds(a, bonds);
+    for (size_t i = 0; i < a.n; ++i) {
+      printf("id\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%d\n", ids.pnUnitId[i].c_str(),
+             ids.moleculeId[i], ids.chainEntity[i], ids.pnUnitEntity[i], ids.moleculeEntity[i],
+             ids.chainIid[i].c_str(), ids.pnUnitIid[i].c_str(), ids.moleculeIid[i]);
     }
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;
