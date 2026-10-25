@@ -148,19 +148,26 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gaInK(const float* __restrict__
   for (int c = 0; c < 32; ++c) ptx_st_shared_f32(&sm.red[warp][lane][c], qacc[c]);
   if (hf == 0) ptx_st_shared_f32(&sm.mred[warp][tok], macc);
   __syncthreads();
-  for (int t = threadIdx.x; t < 32 * 32; t += WARPS * 32) {
-    const int ln = t / 32, c = t % 32, bb = b0 + (ln >> 1);
+#pragma unroll
+  for (int it = 0; it < (32 * 32) / (WARPS * 32); ++it) {
+    const int ln = it * WARPS + warp, c = lane, bb = b0 + (ln >> 1);
     if (bb >= L) continue;
+    float r[WARPS];
+#pragma unroll
+    for (int w = 0; w < WARPS; ++w) r[w] = ptx_ld_shared_f32(&sm.red[w][ln][c]);
     float a = 0.f;
 #pragma unroll
-    for (int w = 0; w < WARPS; ++w) a = ptx_add_f32(a, ptx_ld_shared_f32(&sm.red[w][ln][c]));
+    for (int w = 0; w < WARPS; ++w) a = ptx_add_f32(a, r[w]);
     ptx_st_global_f32(qsum + (size_t)bb * C + (ln & 1) * 32 + c, a);
   }
-  for (int t = threadIdx.x; t < 16; t += WARPS * 32) {
-    if (b0 + t >= L) continue;
+  if (threadIdx.x < 16 && b0 + (int)threadIdx.x < L) {
+    const int t = threadIdx.x;
+    float r[WARPS];
+#pragma unroll
+    for (int w = 0; w < WARPS; ++w) r[w] = ptx_ld_shared_f32(&sm.mred[w][t]);
     float a = 0.f;
 #pragma unroll
-    for (int w = 0; w < WARPS; ++w) a = ptx_add_f32(a, ptx_ld_shared_f32(&sm.mred[w][t]));
+    for (int w = 0; w < WARPS; ++w) a = ptx_add_f32(a, r[w]);
     ptx_st_global_f32(msum + b0 + t, a);
   }
 }
@@ -175,8 +182,10 @@ __global__ void __launch_bounds__(64) gaQueryK(const float* __restrict__ part, i
   const size_t slab = (size_t)L * C + L;
   float qs = 0.f, ms = 0.f;
   for (int y = 0; y < Y; ++y) {
-    qs = ptx_add_f32(qs, ptx_ldg_f32(part + y * slab + (size_t)b * C + t));
-    ms = ptx_add_f32(ms, ptx_ldg_f32(part + y * slab + (size_t)L * C + b));
+    float qy = ptx_ldg_f32(part + y * slab + (size_t)b * C + t);
+    float my = ptx_ldg_f32(part + y * slab + (size_t)L * C + b);
+    qs = ptx_add_f32(qs, qy);
+    ms = ptx_add_f32(ms, my);
   }
   ptx_st_shared_f32(qa + t, ptx_div_f32(qs, ptx_add_f32(ms, 1e-10f)));
   __syncthreads();
@@ -184,10 +193,14 @@ __global__ void __launch_bounds__(64) gaQueryK(const float* __restrict__ part, i
 #pragma unroll
   for (int c = 0; c < C; c += 4) {
     float4 q4 = ptx_ld_shared_v4_f32(qa + c);
-    a = ptx_fma_f32(q4.x, ptx_ldg_f32(wq + (size_t)c * H * D + t), a);
-    a = ptx_fma_f32(q4.y, ptx_ldg_f32(wq + (size_t)(c + 1) * H * D + t), a);
-    a = ptx_fma_f32(q4.z, ptx_ldg_f32(wq + (size_t)(c + 2) * H * D + t), a);
-    a = ptx_fma_f32(q4.w, ptx_ldg_f32(wq + (size_t)(c + 3) * H * D + t), a);
+    float w0 = ptx_ldg_f32(wq + (size_t)c * H * D + t);
+    float w1 = ptx_ldg_f32(wq + (size_t)(c + 1) * H * D + t);
+    float w2 = ptx_ldg_f32(wq + (size_t)(c + 2) * H * D + t);
+    float w3 = ptx_ldg_f32(wq + (size_t)(c + 3) * H * D + t);
+    a = ptx_fma_f32(q4.x, w0, a);
+    a = ptx_fma_f32(q4.y, w1, a);
+    a = ptx_fma_f32(q4.z, w2, a);
+    a = ptx_fma_f32(q4.w, w3, a);
   }
   ptx_st_global_f32(q + (size_t)b * H * D + t, ptx_mul_f32(a, ptx_rsqrt_f32((float)D)));
 }
@@ -211,8 +224,9 @@ __global__ void __launch_bounds__(256, 2) gaAttnK(const float* __restrict__ kv, 
   for (int s = threadIdx.x; s < N; s += 256) {
     const float4* p = reinterpret_cast<const float4*>(kv + ((size_t)b * N + s) * 2 * D);
     const float4 k0 = ptx_ldg_v4_f32(p), k1 = ptx_ldg_v4_f32(p + 1), v0 = ptx_ldg_v4_f32(p + 2), v1 = ptx_ldg_v4_f32(p + 3);
+    const float m_raw = ptx_ldg_f32(mask + (size_t)s * L + b);
     const float k[D] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w}, v[D] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
-    const float bias = ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(mask + (size_t)s * L + b), 1.f));
+    const float bias = ptx_mul_f32(1e9f, ptx_sub_f32(m_raw, 1.f));
 #pragma unroll
     for (int h = 0; h < H; ++h) {
       float4 q0 = ptx_ld_shared_v4_f32(qh + h * D), q1 = ptx_ld_shared_v4_f32(qh + h * D + 4);
@@ -330,6 +344,7 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gaOutK(const half* __restrict__
     uint32_t xa[K / 16][4];
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
+    __syncwarp();
     if (s + WARPS < s1 && b < L) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) gn[i] = ptx_ldg_v4_u32(gate + ((size_t)(s + WARPS) * L + b) * K + hf * 32 + 8 * i);
@@ -346,7 +361,11 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gaOutK(const half* __restrict__
     uint32_t f[2][4];
     ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
-    for (int ks = 0; ks < K / 16; ++ks)
+    for (int ks = 0; ks < K / 16; ++ks) {
+      if (ks == 2 && bt1 < L) {
+#pragma unroll
+        for (int nt = 0; nt < C / 8; ++nt) r1[nt] = ptx_ld_global_v2_f32(row1 + nt * 8 + tig * 2);
+      }
 #pragma unroll
       for (int n2 = 0; n2 < C / 16; ++n2) {
         const int step = ks * (C / 16) + n2, cur = step & 1;
@@ -354,14 +373,10 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gaOutK(const half* __restrict__
         else if (ks + 1 < K / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
         mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
-    if (bt1 < L) {
-#pragma unroll
-      for (int nt = 0; nt < C / 8; ++nt) r1[nt] = ptx_ld_global_v2_f32(row1 + nt * 8 + tig * 2);
     }
     float2 b2All[C / 8];
 #pragma unroll
     for (int nt = 0; nt < C / 8; ++nt) b2All[nt] = ptx_ld_shared_v2_f32(sBo + nt * 8 + tig * 2);
-    __syncwarp();
     if (bt0 < L) {
 #pragma unroll
       for (int nt = 0; nt < C / 8; ++nt) {
@@ -453,6 +468,7 @@ __global__ void __launch_bounds__(WARPS * 32, 4) projAdd64K(const half* __restri
     uint32_t xa[K / 16][4];
 #pragma unroll
     for (int ks = 0; ks < K / 16; ++ks) ldsm4(xa[ks], xs + (lane & 15) * LDX + ks * 16 + (lane >> 4) * 8);
+    __syncwarp();
     if ((tile + stepT) * 16 < rows) {
       const size_t rn = (tile + stepT) * 16 + tok;
 #pragma unroll
@@ -471,7 +487,11 @@ __global__ void __launch_bounds__(WARPS * 32, 4) projAdd64K(const half* __restri
     uint32_t f[2][4];
     ldsm4t(f[0], Ws + kl * LDW + cl);
 #pragma unroll
-    for (int ks = 0; ks < K / 16; ++ks)
+    for (int ks = 0; ks < K / 16; ++ks) {
+      if (ks == 2 && rr1 < rows) {
+#pragma unroll
+        for (int nt = 0; nt < C / 8; ++nt) v1[nt] = ptx_ld_global_v2_f32(row1 + nt * 8 + tig * 2);
+      }
 #pragma unroll
       for (int n2 = 0; n2 < C / 16; ++n2) {
         const int step = ks * (C / 16) + n2, cur = step & 1;
@@ -479,14 +499,10 @@ __global__ void __launch_bounds__(WARPS * 32, 4) projAdd64K(const half* __restri
         else if (ks + 1 < K / 16) ldsm4t(f[cur ^ 1], Ws + ((ks + 1) * 16 + kl) * LDW + cl);
         mma16816(acc[2 * n2], xa[ks], f[cur][0], f[cur][1]); mma16816(acc[2 * n2 + 1], xa[ks], f[cur][2], f[cur][3]);
       }
-    if (rr1 < rows) {
-#pragma unroll
-      for (int nt = 0; nt < C / 8; ++nt) v1[nt] = ptx_ld_global_v2_f32(row1 + nt * 8 + tig * 2);
     }
     float2 b2All[C / 8];
 #pragma unroll
     for (int nt = 0; nt < C / 8; ++nt) b2All[nt] = ptx_ld_shared_v2_f32(sBo + nt * 8 + tig * 2);
-    __syncwarp();
     if (rr0 < rows) {
 #pragma unroll
       for (int nt = 0; nt < C / 8; ++nt) {
