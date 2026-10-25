@@ -218,6 +218,9 @@ opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __re
   if (t >= (size_t)Bi * L * 32) return;
   int f = (int)((t & 31) << 2);
   size_t p = i0 * L + (t >> 5);
+  PairRaw4<PT> pr = pairLdRaw4<PT>(pair, (p << 7) + f);
+  float4 b4 = ptx_ldg_v4_f32(bias + f);
+  float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
   float4 x4;
   if constexpr (std::is_same_v<TX, float>) {
     x4 = ptx_ldg_v4_f32(x + (t << 2));
@@ -227,9 +230,7 @@ opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __re
     float2 c = ptx_f16x2_to_f32x2(u.y);
     x4 = make_float4(a.x, a.y, c.x, c.y);
   }
-  float4 p4 = pairLd4<PT>(pair, (p << 7) + f);
-  float4 b4 = ptx_ldg_v4_f32(bias + f);
-  float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
+  float4 p4 = pairUnpack4<PT>(pr);
   if constexpr (FAST_INV) {
     float inv = ptx_rcp_f32(denom);
     p4.x = ptx_fma_f32(ptx_fma_f32(xs, x4.x, b4.x), inv, p4.x);

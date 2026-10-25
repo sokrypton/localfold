@@ -318,14 +318,16 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t row0 = (size_t)blockIdx.x * R;
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  const int k0 = (int)threadIdx.x / (NC / 8), c0 = ((int)threadIdx.x % (NC / 8)) * 8, sw0 = stageSw<NC>(k0, c0);
+  const half* baseWt = Wt + k0 * NC + c0;
   auto issue = [&](int n, int st) {
-    half* w = Ws(st);
+    half* w = Ws(st) + sw0;
+    const half* src = baseWt + (size_t)n * (C * NC);
 #pragma unroll
     for (int it = 0; it < ITER; ++it) {
-      const int t = it * NTH + (int)threadIdx.x;
-      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
-      int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      cpAsync16(w + stageSw<NC>(k, c), Wt + ((size_t)n * C + k) * NC + c, true);
+      if ((C * (NC / 8)) % NTH != 0 && it * NTH + (int)threadIdx.x >= C * (NC / 8)) break;
+      int off = it * (NTH / (NC / 8)) * NC;
+      cpAsync16(w + off, src + off, true);
     }
     cpCommit();
   };
@@ -373,8 +375,6 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
     }
   };
   loadR(0); storeR(0);
-#else
-  if (1 < tiles) issue(1, 1);
 #endif
   float ma[MT], mb[MT];
 #pragma unroll
@@ -408,7 +408,7 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
     uint32_t f[2][4];
     ldsm4t(f[0], w + stageSw<NC>(kl, cl));
 #if !LF_REG_STAGES
-    if (n > 0 && n + 1 < tiles) issue(n + 1, st ^ 1);
+    if (n + 1 < tiles) issue(n + 1, st ^ 1);
 #endif
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
