@@ -352,10 +352,6 @@ if (generate) {
   // between steps and used to be refused with it; the port recomputes it on the device now
   // (src/chirality.cuh), which is what lets the small-molecule preset generate at all. A coordinate
   // group's permutation is a `randperm` draw a step and is not done.
-  if ((cache.crdUniq?.length ?? 0) > 1) {
-    console.error("--generate does not yet cover an input with coordinate groups to permute");
-    process.exit(1);
-  }
   const alignsChirality = nn.noise_align_chirality && (cache.activeFrames?.length ?? 0) > 0;
   // 🔴 A PARTIAL RUN'S STEP COUNT, SCHEDULE AND RECYCLE DEPTHS ARE ALL DIFFERENT, and they are
   // derived here exactly as `generateRfd4pCpu` derives them rather than guessed from the preset.
@@ -439,8 +435,16 @@ if (generate) {
     for (let g = 0; g < groupIds.length; g += 1) take(3);
     take(n * latentDim);
   }
+  // 🔴 THE LABEL PERMUTATION IS DRAWN AT THE TOP OF EACH STEP, BEFORE THAT STEP'S NOISE, and it
+  // consumes RAW uniforms rather than normals - `randperm` takes `next()` once per swap where
+  // every other draw here goes through Box-Muller. Modelling it as `randn` would advance the
+  // stream by a different amount and move every later draw of the run.
+  const crdUniqAll = [...new Set(Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : []))]
+    .filter((v) => v !== -1).sort((a, b) => a - b);
+  const crdPerm = [];
   const stepNoise = [];
   for (let s2 = 0; s2 < steps; s2 += 1) {
+    crdPerm.push(...rng2.randperm(crdUniqAll.length));
     for (const dm of ["bb_ca", "local_latents"]) {
       const t2 = Math.fround(genSched[dm].ts[s2]);
       const cfg2 = genSched[dm].step;
@@ -487,6 +491,7 @@ if (generate) {
   }, {
     steps,
     nGroups: groupIds.length,
+    nCrdGroups: crdUniqAll.length,
     centeringScale: DEFAULT_SAMPLING.centering.scale,
     alignChirality: alignsChirality ? 1 : 0,
     chirOff: alignsChirality ? cache.chirOff : -1,
@@ -524,6 +529,10 @@ if (generate) {
     // Which atoms are indexed, and the INPUT's residue per token - the two things the mapping
     // reads that the generated structure does not carry.
     "g/condIndex": Int32Array.from(field(COND.IDX), (v) => (v ? 1 : 0)),
+    ...(crdUniqAll.length ? {
+      "g/crdUniq": Int32Array.from(crdUniqAll),
+      "g/crdPerm": Int32Array.from(crdPerm),
+    } : {}),
     "g/resType": Int32Array.from(field("residue_type")),
     "g/condSeq": Int32Array.from(field(COND.SEQ)),
     ...(alignsChirality ? {

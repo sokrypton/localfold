@@ -1,4 +1,5 @@
 m meta/nGroups 1
+m meta/nCrdGroups 0
 m meta/steps 10
 m meta/centeringScale 0.20000000000000001
 m meta/distDim 30

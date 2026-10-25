@@ -1,4 +1,7 @@
+i g/crdUniq 0 1
+i g/crdPerm 1 60
 m meta/nGroups 1
+m meta/nCrdGroups 1
 m meta/steps 60
 m meta/centeringScale 0.20000000000000001
 m meta/distDim 30
@@ -13,26 +16,26 @@ m meta/partialTBb 0
 m meta/partialTLl 0
 m meta/baseNsteps 60
 m meta/fullNsteps 0
-t g/pairNoDist 0 1342208
-t g/cond 1342208 4092480
-t g/cond1 5434688 4092480
-t g/pairCond 9527168 30720
-t g/noise 9557888 200371
-t g/emitBb 9758259 112
-t g/emitLl 9758371 112
-i g/depths 9758483 60
-i g/stochastic 9758543 120
-i g/coordCond 9758663 112
-i g/moleculeIid 9758775 112
-i g/chainIid 9758887 112
-i g/outResId 9758999 112
-i g/outChain 9759111 112
-i g/condSeq 9759223 112
-i g/allowedTypes 9759335 1029
-i g/atom37Legal 9760364 5439
-i g/coordGroup 9765803 4144
-t g/condCoord 9769947 12432
-t g/condIntCrd 9782379 12432
-i g/condIndex 9794811 4144
-i g/resType 9798955 112
-t g/coords 9799067 12432
+t g/pairNoDist 61 1342208
+t g/cond 1342269 4092480
+t g/cond1 5434749 4092480
+t g/pairCond 9527229 30720
+t g/noise 9557949 200371
+t g/emitBb 9758320 112
+t g/emitLl 9758432 112
+i g/depths 9758544 60
+i g/stochastic 9758604 120
+i g/coordCond 9758724 112
+i g/moleculeIid 9758836 112
+i g/chainIid 9758948 112
+i g/outResId 9759060 112
+i g/outChain 9759172 112
+i g/condSeq 9759284 112
+i g/allowedTypes 9759396 1029
+i g/atom37Legal 9760425 5439
+i g/coordGroup 9765864 4144
+t g/condCoord 9770008 12432
+t g/condIntCrd 9782440 12432
+i g/condIndex 9794872 4144
+i g/resType 9799016 112
+t g/coords 9799128 12432

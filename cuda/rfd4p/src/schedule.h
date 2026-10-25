@@ -50,6 +50,26 @@ struct Rng {
     // JS takes the low 53 bits of (s1 + b) and divides by 2^53.
     return (double)((s1 + b) & ((1ull << 53) - 1)) / 9007199254740992.0;
   }
+  /**
+   * `randperm(k)`: Fisher-Yates over the SAMPLER's stream, as `flow.js` has it.
+   *
+   * 🔴 IT CONSUMES k-1 RAW UNIFORMS, NOT NORMALS. Every other draw here goes through
+   * Box-Muller, which takes two uniforms per PAIR of outputs; this one takes `next()` directly,
+   * once per swap. Modelling it as `randn` advances the stream by a different amount and moves
+   * every later draw of the run - measured, 49 of 75 permutation entries wrong.
+   *
+   * 🔴 AND AT k <= 1 IT DRAWS NOTHING, which is why a single coordinate group is the identity
+   * and costs no stream - the reason every shipped example works without this existing at all.
+   */
+  std::vector<int> randperm(int k) {
+    std::vector<int> p(k > 0 ? k : 0);
+    for (int i = 0; i < k; ++i) p[i] = i;
+    for (int i = k - 1; i > 0; --i) {
+      const int j = (int)std::floor(next() * (i + 1));
+      std::swap(p[i], p[j]);
+    }
+    return p;
+  }
   void randn(float* out, size_t count) {
     for (size_t i = 0; i < count; i += 2) {
       const double u = std::max(next(), 1e-300);

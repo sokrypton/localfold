@@ -551,16 +551,24 @@ residues the cropped example does not contain, so building one from the spec fai
     The mapping is the trunk's OWN - `predictedInsertionMapping` off the insertion head's
     logits, validated pair by pair and falling back to the geometric one if any pair cannot be
     grafted. On `motif_unidx_1prw` the head's answer is used and agrees with the geometric one
-    atom for atom. What is left of this path is the coordinate-group
-    permutation, which BOTH sides now refuse by name rather than one of them guessing.
+    atom for atom. The coordinate-group permutation is
+    implemented on both sides, which was the last item: **the structure path is complete.**
 
-    🔴 **AND THE NATIVE SIDE WAS NOT REFUSING IT - IT WAS GUESSING.** `coord_group_seq`
-    permutes its group LABELS every step, off the sampler's stream, so an input with more than
-    one group has a feature that must move. `export_input.mjs` has refused that since it was
-    written; this side wrote the labels unpermuted and produced a generation that is wrong from
-    step one, in silence. Every shipped example has at most ONE group - where the permutation
-    is the identity - so neither the refusal nor the bug it hides is reachable without a case
-    built for it (`gate-crdgroups.json`, three groups on `ppi_pdl1`).
+    🔴 **IT WAS A SILENT WRONG ANSWER ON ONE SIDE AND A REFUSAL ON THE OTHER.**
+    `coord_group_seq` permutes its group LABELS at the top of every step - a group's id says
+    only which atoms move together, so the model must not learn to read the number.
+    `export_input.mjs` refused an input with more than one group; this side wrote the labels
+    FROZEN and generated from them. Every shipped example has at most ONE group, where the
+    permutation is the identity, so neither the refusal nor the bug was reachable without a
+    case built for it (`gate-crdgroups.json`: three groups on `ppi_pdl1` through `C_CRDGRP`).
+
+    🔴 **AND THE DRAW IS RAW UNIFORMS AT THE TOP OF THE STEP, BOTH OF WHICH MOVE THE WHOLE
+    RUN.** `randperm` takes `next()` once per swap where every other draw here goes through
+    Box-Muller's two-uniforms-per-pair, and it happens before that step's noise because
+    `trunkSeqFeatures` is built before the forward. Modelling it as normals moves 49 of 75
+    permutation entries; placing it after the noise moves 45. Freezing the labels moves 909 of
+    `in/seq`'s 104052. All three watched failing, and the step-0 permutation is in `in/seq`
+    itself - which is why the stream is drawn before the features rather than beside the noise.
 
     🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
     in-context conditioning that the sampler never generates, and the reference writes only the

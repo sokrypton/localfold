@@ -368,7 +368,9 @@ constexpr int TOKEN_TYPE_ATOMIZED = 3;
 
 /** `trunkSeqFeatures` (`nn.init_repr_factory`): `[n, 897]` for the shipped checkpoint. */
 inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weights& w,
-                                 const vector<float>& xBb, const vector<float>& xLl, int& dimOut) {
+                                 const vector<float>& xBb, const vector<float>& xLl, int& dimOut,
+                                 const vector<int>& crdUniq = {},
+                                 const vector<int>& crdPerm = {}) {
   const int n = b.n;
   // Pass one sizes the row; pass two fills it. The reference builds a block list the same way.
   vector<std::pair<string, int>> blocks;
@@ -480,7 +482,18 @@ inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weight
           embedRow(w(pre + tag + ".embedding.weight"), 16, e, d);
         }
       } else if (f == "coord_group_seq") {
-        for (int k = 0; k < 37; ++k) d[k] = (float)b.coordGroup[(size_t)i * 37 + k];
+        // 🔴 THE LABELS ARE PERMUTED, NOT THE ATOMS. A coordinate group's id is arbitrary - it
+        // says only which atoms move together - so the reference relabels the groups every step
+        // and the model must not learn to read the number. `-1` is not a group and is left.
+        for (int k = 0; k < 37; ++k) {
+          const int gid = b.coordGroup[(size_t)i * 37 + k];
+          int mapped = gid;
+          if (gid != -1 && !crdPerm.empty()) {
+            const auto at = std::find(crdUniq.begin(), crdUniq.end(), gid);
+            if (at != crdUniq.end()) mapped = crdPerm[(size_t)(at - crdUniq.begin())];
+          }
+          d[k] = (float)mapped;
+        }
       } else if (f == "chirality") {
         for (int k = 0; k < 18; ++k) d[k] = b.chirality[(size_t)i * 18 + k];
       } else if (f == "chain_centroid_xyz") {
@@ -1915,7 +1928,47 @@ int run(int argc, char** argv) {
   }
 
   int seqDim = 0, condDim = 0, pairDim = 0;
-  const vector<float> seq = seqFeatures(b, cfg, w, xBb, xLl, seqDim);
+  // 🔴 THE PERMUTATION STREAM IS DRAWN BEFORE THE FEATURES, BECAUSE STEP ZERO'S IS IN THEM.
+  // `in/seq` carries the step-0 `coord_group_seq`, and its labels are already permuted there -
+  // the reference builds those features with `rng.randperm` after `sampleInitialNoise` has run.
+  // Drawing it later would give the same permutation from a different point in the stream, and
+  // writing the raw labels into `in/seq` differed from the exporter in 909 of 104052 values.
+  std::set<int> crdUniqSet(b.coordGroup.begin(), b.coordGroup.end());
+  crdUniqSet.erase(-1);
+  const vector<int> crdUniq(crdUniqSet.begin(), crdUniqSet.end());
+  vector<int> crdPerm;
+  {
+    // One stream, consumed exactly as `sample_noise` then the step loop do: the backbone, its
+    // per-molecule offsets, the latents, then a permutation at the top of every step.
+    Rng gp((uint64_t)seed);
+    vector<float> skip((size_t)std::max<size_t>(n * 32, 3));
+    gp.randn(skip.data(), (size_t)n * 3);
+    vector<int> mgroups;
+    for (int i = 0; i < n; ++i) {
+      if (emit.bb[i] && !b.coordCondMask[i] &&
+          std::find(mgroups.begin(), mgroups.end(), b.moleculeIid[i]) == mgroups.end()) {
+        mgroups.push_back(b.moleculeIid[i]);
+      }
+    }
+    for (size_t k = 0; k < mgroups.size(); ++k) gp.randn(skip.data(), 3);
+    gp.randn(skip.data(), (size_t)n * 32);
+    for (int s2 = 0; s2 < nsteps; ++s2) {
+      const vector<int> perm = gp.randperm((int)crdUniq.size());
+      crdPerm.insert(crdPerm.end(), perm.begin(), perm.end());
+      for (int dm = 0; dm < 2; ++dm) {
+        const Schedule& sc = dm ? schedLl : schedBb;
+        const double t2 = dm ? (float)schedLl.ts[s2] : (float)schedBb.ts[s2];
+        if (t2 != 0 && !(t2 > sc.step.tLimOde || t2 < sc.step.tLimOdeBelow)) {
+          vector<float> tmp((size_t)n * (dm ? 32 : 3));
+          gp.randn(tmp.data(), tmp.size());
+        }
+      }
+    }
+  }
+  const vector<float> seq =
+      seqFeatures(b, cfg, w, xBb, xLl, seqDim, crdUniq,
+                  crdPerm.empty() ? vector<int>() : vector<int>(crdPerm.begin(),
+                                                                crdPerm.begin() + crdUniq.size()));
   const vector<float> cond0 = condFeatures(b, cfg, w, tBb, tLl, -1, condDim);
   const vector<float> cond1 = condFeatures(b, cfg, w, tBb, tLl, 1, condDim);
   const vector<float> pair = pairFeatures(b, cfg, xBb, false, pairDim);
@@ -2020,12 +2073,23 @@ int run(int argc, char** argv) {
     std::sort(groups.begin(), groups.end());
     for (size_t k = 0; k < groups.size(); ++k) take(3);
     take((size_t)n * 32);
+    // 🔴 THE LABEL PERMUTATION IS DRAWN AT THE TOP OF EACH STEP, BEFORE THAT STEP'S NOISE.
+    // `trunkSeqFeatures` is built before the forward and before the modality updates, so its
+    // `randperm` comes first in the stream; putting it after the noise would give the same
+    // permutations and a different trajectory.
     for (int s2 = 0; s2 < steps; ++s2) {
+      // The same draw the hoisted block above made, in the same place in the stream.
+      g2.randperm((int)crdUniq.size());
       for (int dm = 0; dm < 2; ++dm) {
         if (stochastic[s2 * 2 + dm]) take((size_t)n * (dm ? 32 : 3));
       }
     }
+    if (!crdUniq.empty()) {
+      g.ints("g/crdUniq", crdUniq);
+      g.ints("g/crdPerm", crdPerm);
+    }
     g.meta("nGroups", (double)groups.size());
+    g.meta("nCrdGroups", (double)crdUniq.size());
   }
 
   g.meta("steps", steps);
@@ -2074,21 +2138,6 @@ int run(int argc, char** argv) {
     vector<int> legal(tables::RESTYPE_ATOM37_MASK.begin(), tables::RESTYPE_ATOM37_MASK.end());
     g.ints("g/allowedTypes", allowed);
     g.ints("g/atom37Legal", legal);
-    // 🔴 MORE THAN ONE COORDINATE GROUP IS REFUSED, BECAUSE `coord_group_seq` MOVES EVERY STEP.
-    // The reference permutes the group LABELS with a `randperm` off the sampler's stream each
-    // time it builds the sequence features, so freezing them at their input values is a feature
-    // that should move and does not - and the draws would shift every later draw of the run.
-    // `export_input.mjs` has refused this since it was written; this side proceeded in SILENCE
-    // and wrote a generation that is wrong from step one.
-    {
-      std::set<int> uniq(b.coordGroup.begin(), b.coordGroup.end());
-      uniq.erase(-1);
-      if (uniq.size() > 1) {
-        fprintf(stderr, "--generate does not yet cover an input with coordinate groups to "
-                        "permute (%zu groups)\n", uniq.size());
-        exit(1);
-      }
-    }
     g.ints("g/coordGroup", b.coordGroup);
     // 🔴 THE CONDITIONED COORDINATES THEMSELVES, for the alignment at the far end. A generated
     // structure comes out in the model's CENTRED frame; the atoms whose coordinates were
