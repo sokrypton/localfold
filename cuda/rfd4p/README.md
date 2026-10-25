@@ -552,6 +552,14 @@ residues the cropped example does not contain, so building one from the spec fai
     produces four pieces and every stage of `transforms.js` changes several of them TOGETHER -
     `realizeExpandableSegments` inserts atoms, which moves every column, every annotation and
     every bond index at once. Four parallel objects is four places to forget one.
+
+    Its `slice` and `concat` are the only primitives the rest of the pipeline has for inserting
+    and dropping atoms, and they walk the columns through ONE list (`forEachColumn`) - the
+    reference gets that free by walking its object's own keys, and a C++ struct cannot. A column
+    added and not listed keeps its OLD values through an insertion, which is a wrong answer in a
+    field nothing else looks at, so the gate round-trips every structure:
+    `concat(slice(0, k), slice(k, n))` must reproduce the dump byte for byte, at four split
+    points including ones that cut a residue and a bond in half.
   - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
     constrain once there are residues and atoms.
 

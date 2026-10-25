@@ -218,6 +218,21 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     }
   }
 
+  // 🔴 AND THE SLICE/CONCAT ROUND TRIP, at split points that cut through a residue and a bond.
+  // Those two are the only primitives the rest of the pipeline has for inserting and dropping
+  // atoms; a column they forget keeps its OLD values through an insertion, which is a wrong
+  // answer in a field nothing else looks at. Cutting the array in two and putting it back must
+  // reproduce every byte of the dump.
+  for (const k of [1, 2, 17, Math.max(1, n - 1)]) {
+    if (k >= n) continue;
+    const again = execFileSync(binary, ["x", `--dump-cif=${path}`, `--split=${k}`],
+      { encoding: "utf8", maxBuffer: 1 << 28 });
+    if (again !== execFileSync(binary, ["x", `--dump-cif=${path}`],
+      { encoding: "utf8", maxBuffer: 1 << 28 })) {
+      wrong.push(`round trip at ${k}`);
+    }
+  }
+
   structures += 1;
   if (wrong.length) differing += 1;
   console.log(`  ${name.padEnd(26)} ${String(n).padStart(5)} atoms  `

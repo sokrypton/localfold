@@ -882,6 +882,7 @@ int run(int argc, char** argv) {
   using rfd4p::CENTERING_SCALE;
   using rfd4p::recycleDepths;
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
+  int splitAt = 0;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -892,6 +893,7 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 10, "--weights=")) weightsDir = a.substr(10);
     else if (!a.compare(0, 7, "--int8=")) int8Dir = a.substr(7);
     else if (!a.compare(0, 11, "--dump-cif=")) dumpCif = a.substr(11);
+    else if (!a.compare(0, 8, "--split=")) splitAt = atoi(a.c_str() + 8);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -981,6 +983,15 @@ int run(int argc, char** argv) {
     arr.bonds = bonds;
     arr.ids = ids;
     arr.stereo = st;
+    // 🔴 THE ROUND TRIP IS THE SLICE/CONCAT GATE. Those two are the only primitives the rest of
+    // the pipeline has for inserting and dropping atoms, and a column they forget keeps its OLD
+    // values through an insertion - a wrong answer in a field nothing else looks at. Cutting the
+    // array in two and putting it back must reproduce it exactly, which `--split=K` asks for and
+    // the checker diffs against the un-split dump.
+    if (splitAt > 0 && splitAt < (int)arr.n()) {
+      arr = rfd4p::atoms::concat({rfd4p::atoms::slice(arr, 0, splitAt),
+                                  rfd4p::atoms::slice(arr, splitAt, (int)arr.n())});
+    }
     rfd4p::atoms::ensureChemicalFlags(arr);
     rfd4p::atoms::addSrcComponentAnnotation(arr);
     rfd4p::atoms::computeWithinChainSourceResIdx(arr);

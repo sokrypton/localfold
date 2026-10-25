@@ -11,6 +11,7 @@
 #pragma once
 #include "chirality.h"
 #include "cif.h"
+#include <type_traits>
 
 namespace rfd4p {
 namespace atoms {
@@ -39,6 +40,212 @@ struct AtomArray {
 
   size_t n() const { return site.n; }
 };
+
+/**
+ * Every per-atom column, handed to `visit` one at a time.
+ *
+ * 🔴 ONE LIST, BECAUSE SLICING AND CONCATENATING MUST NOT FORGET A COLUMN. The reference gets
+ * this for free - it walks the object's own keys and takes every array whose length is the atom
+ * count - and a C++ struct cannot. A column added to `AtomArray` and not added here is a column
+ * that silently keeps its OLD values through an insertion, which is a wrong answer in a field
+ * nothing else checks. `site.selected` is deliberately absent: it indexes the FILE's rows, not
+ * the atoms, and must not be resliced with them.
+ */
+template <class F>
+inline void forEachColumn(AtomArray& a, F visit) {
+  for (vector<string>* v : {&a.site.element, &a.site.atomName, &a.site.resName, &a.site.chainId,
+                            &a.site.insCode, &a.site.labelAltId, &a.site.chemCompType,
+                            &a.ids.pnUnitId, &a.ids.chainIid, &a.ids.pnUnitIid}) {
+    visit(*v);
+  }
+  for (vector<int>* v : {&a.site.labelEntityId, &a.site.resId, &a.site.authSeqId, &a.site.atomId,
+                         &a.site.charge, &a.site.atomicNumber, &a.site.chainType,
+                         &a.ids.moleculeId, &a.ids.chainEntity, &a.ids.pnUnitEntity,
+                         &a.ids.moleculeEntity, &a.ids.moleculeIid, &a.stereo.chiralType,
+                         &a.atomId, &a.tokenId, &a.withinChainSourceResIdx}) {
+    visit(*v);
+  }
+  for (vector<double>* v : {&a.site.x, &a.site.y, &a.site.z, &a.site.bFactor, &a.site.occupancy}) {
+    visit(*v);
+  }
+  for (vector<uint8_t>* v : {&a.site.hetero, &a.site.isPolymer, &a.site.isAromatic,
+                             &a.site.isLeavingAtom, &a.stereo.stereogenicBondAtoms,
+                             &a.isProtein, &a.isRna, &a.isDna, &a.isNucleicAcid,
+                             &a.isProteinBackbone, &a.isRnaBackbone, &a.isDnaBackbone,
+                             &a.isNucleicAcidBackbone, &a.isStandardAa, &a.isStandardOrUnknownAa,
+                             &a.isStandardUnknownOrMaskedAa, &a.isStandardRna,
+                             &a.isStandardOrUnknownRna, &a.isStandardUnknownOrMaskedRna,
+                             &a.isStandardDna, &a.isStandardOrUnknownDna,
+                             &a.isStandardUnknownOrMaskedDna, &a.atomize,
+                             &a.isCovalentModification}) {
+    visit(*v);
+  }
+}
+
+/**
+ * `sliceAtoms`: the given atoms, in the given order, with the bonds that survive RE-INDEXED.
+ *
+ * 🔴 A BOND SURVIVES ONLY IF BOTH ENDS DO, and comes back with `min, max` rather than its
+ * original direction - which is the reference's, and which the bond list's consumers rely on.
+ */
+inline AtomArray slice(const AtomArray& a, const vector<int>& indices) {
+  AtomArray out = a;
+  out.site.selected.clear();
+  const size_t nOrig = a.n();
+  auto take = [&](auto& dst) {
+    using T = typename std::decay_t<decltype(dst)>::value_type;
+    if (dst.size() != nOrig) { dst.clear(); return; }
+    vector<T> picked;
+    picked.reserve(indices.size());
+    for (int idx : indices) picked.push_back(dst[idx]);
+    dst = std::move(picked);
+  };
+  forEachColumn(out, take);
+  out.site.n = indices.size();
+  for (auto& [name, v] : out.ann.ints) take(v);
+  for (auto& [name, v] : out.ann.strings) take(v);
+  for (auto& [name, v] : out.ann.floats) {
+    // A three-wide annotation is `n * 3` long, so it is resliced a ROW at a time.
+    if (v.size() == nOrig) { take(v); continue; }
+    if (v.size() != nOrig * 3) { v.clear(); continue; }
+    vector<double> picked;
+    picked.reserve(indices.size() * 3);
+    for (int idx : indices) {
+      for (int k = 0; k < 3; ++k) picked.push_back(v[(size_t)idx * 3 + k]);
+    }
+    v = std::move(picked);
+  }
+  std::map<int, int> oldToNew;
+  for (size_t i = 0; i < indices.size(); ++i) oldToNew[indices[i]] = (int)i;
+  out.bonds.clear();
+  for (const cif::Bond& b : a.bonds) {
+    auto u = oldToNew.find(b.u), v = oldToNew.find(b.v);
+    if (u == oldToNew.end() || v == oldToNew.end()) continue;
+    out.bonds.push_back({std::min(u->second, v->second), std::max(u->second, v->second), b.type});
+  }
+  return out;
+}
+
+inline AtomArray slice(const AtomArray& a, int from, int to) {
+  vector<int> indices;
+  for (int i = from; i < to; ++i) indices.push_back(i);
+  return slice(a, indices);
+}
+
+/**
+ * `concatAtoms`: the arrays end to end, with each one's bonds shifted by the atoms before it.
+ *
+ * 🔴 AN ANNOTATION MISSING FROM ONE PART TAKES ITS DEFAULT THERE, not zero and not the previous
+ * part's values - which is what makes an inserted stub carry `<M>` for its sequence condition and
+ * -1 for its expandable-segment bounds rather than inheriting whatever it was spliced next to.
+ */
+/**
+ * The same columns of two arrays, in lockstep - which is how `concat` appends without a
+ * per-column name anywhere. A single list (`forEachColumn`) would need the caller to know WHICH
+ * column it was looking at; this just hands over both.
+ */
+template <class F>
+inline void forEachColumnPair(AtomArray& dst, const AtomArray& src, F visit) {
+  AtomArray& s2 = const_cast<AtomArray&>(src);
+  vector<vector<string>*> ds, ss;
+  vector<vector<int>*> di, si;
+  vector<vector<double>*> dd, sd;
+  vector<vector<uint8_t>*> db, sb;
+  auto collect = [](AtomArray& a, vector<vector<string>*>& cs, vector<vector<int>*>& ci,
+                    vector<vector<double>*>& cd, vector<vector<uint8_t>*>& cb) {
+    forEachColumn(a, [&](auto& column) {
+      using V = std::decay_t<decltype(column)>;
+      if constexpr (std::is_same_v<V, vector<string>>) cs.push_back(&column);
+      else if constexpr (std::is_same_v<V, vector<int>>) ci.push_back(&column);
+      else if constexpr (std::is_same_v<V, vector<double>>) cd.push_back(&column);
+      else cb.push_back(&column);
+    });
+  };
+  collect(dst, ds, di, dd, db);
+  collect(s2, ss, si, sd, sb);
+  for (size_t i = 0; i < ds.size(); ++i) visit(*ds[i], *ss[i]);
+  for (size_t i = 0; i < di.size(); ++i) visit(*di[i], *si[i]);
+  for (size_t i = 0; i < dd.size(); ++i) visit(*dd[i], *sd[i]);
+  for (size_t i = 0; i < db.size(); ++i) visit(*db[i], *sb[i]);
+}
+
+/**
+ * `concatAtoms`: the arrays end to end, with each one's bonds shifted by the atoms before it.
+ *
+ * 🔴 AN ANNOTATION MISSING FROM ONE PART TAKES ITS DEFAULT THERE, not zero and not the previous
+ * part's values - which is what makes an inserted stub carry `<M>` for its sequence condition and
+ * -1 for its expandable-segment bounds rather than inheriting whatever it was spliced next to.
+ */
+inline AtomArray concat(const vector<AtomArray>& parts) {
+  if (parts.empty()) return {};
+  AtomArray out = parts[0];
+  out.site.selected.clear();
+  auto fallback = [](const string& name) -> std::pair<double, string> {
+    if (name == "_expseg_uid") return {-1, ""};
+    auto it = tables::ANNOTATIONS_1BODY.find(name);
+    if (it != tables::ANNOTATIONS_1BODY.end()) return {it->second.fallback, it->second.text};
+    if (name.rfind("condition_sequence-probability-", 0) == 0) return {NAN, ""};
+    return {0, ""};
+  };
+  // Every key any part has, so a column one part lacks is filled with its default there.
+  std::set<string> intKeys, strKeys, floatKeys;
+  std::map<string, int> floatCols;
+  for (const AtomArray& p : parts) {
+    for (const auto& [k, v] : p.ann.ints) intKeys.insert(k);
+    for (const auto& [k, v] : p.ann.strings) strKeys.insert(k);
+    for (const auto& [k, v] : p.ann.floats) {
+      floatKeys.insert(k);
+      if (p.n() && v.size() == p.n() * 3) floatCols[k] = 3;
+      else if (!floatCols.count(k)) floatCols[k] = 1;
+    }
+  }
+  cif::Annotations joined;
+  for (const string& k : intKeys) joined.ints[k];
+  for (const string& k : strKeys) joined.strings[k];
+  for (const string& k : floatKeys) joined.floats[k];
+  for (const AtomArray& p : parts) {
+    for (const string& k : intKeys) {
+      auto it = p.ann.ints.find(k);
+      for (size_t i = 0; i < p.n(); ++i) {
+        joined.ints[k].push_back(it == p.ann.ints.end() ? (int)fallback(k).first : it->second[i]);
+      }
+    }
+    for (const string& k : strKeys) {
+      auto it = p.ann.strings.find(k);
+      for (size_t i = 0; i < p.n(); ++i) {
+        joined.strings[k].push_back(it == p.ann.strings.end() ? fallback(k).second : it->second[i]);
+      }
+    }
+    for (const string& k : floatKeys) {
+      auto it = p.ann.floats.find(k);
+      const int cols = floatCols[k];
+      for (size_t i = 0; i < p.n(); ++i) {
+        for (int c = 0; c < cols; ++c) {
+          joined.floats[k].push_back(it == p.ann.floats.end() ? fallback(k).first
+                                                              : it->second[i * cols + c]);
+        }
+      }
+    }
+  }
+
+  for (size_t part = 1; part < parts.size(); ++part) {
+    forEachColumnPair(out, parts[part], [](auto& dst, const auto& src) {
+      dst.insert(dst.end(), src.begin(), src.end());
+    });
+  }
+  size_t total = 0;
+  for (const AtomArray& p : parts) total += p.n();
+  out.site.n = total;
+  out.ann = std::move(joined);
+
+  out.bonds.clear();
+  int offset = 0;
+  for (const AtomArray& p : parts) {
+    for (const cif::Bond& b : p.bonds) out.bonds.push_back({b.u + offset, b.v + offset, b.type});
+    offset += (int)p.n();
+  }
+  return out;
+}
 
 /** Everything `parseCifToAtomArray` produces, in one object. */
 inline AtomArray fromCif(const string& text) {
