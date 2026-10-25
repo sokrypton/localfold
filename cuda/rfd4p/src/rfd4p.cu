@@ -24,6 +24,7 @@ struct Opts {
   std::string dir, weights, oracle, gen, int8, out = "design.pdb";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
+  int designs = 1;   // generate this many times, so a WARM one can be timed
   bool fast = false; // TF32 on the tensor cores, as every other port's --fast does
   bool insertion = true;
 };
@@ -266,9 +267,26 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   CK(cudaMemcpyAsync(pairF, Fdev("g/pairNoDist"), (size_t)n * n * pairDim * sizeof(float),
                      cudaMemcpyDeviceToDevice, STREAM));
 
+  // 🔴 A SECOND DESIGN IS THE WARM ONE, which is how PyTorch's own warm number is taken (its first
+  // pays for torch.compile). Ours pays for cuBLAS's heuristic picks, the lazy f16 weight mirrors
+  // and every first-touch allocation; small, but a comparison of warm against cold is not a
+  // comparison. The noise is replayed from the start each time, so every design is the same one -
+  // this measures time, not variety.
+  const size_t noiseStart = at;
+  std::vector<float> bb0 = bb, ll0 = ll;
+  double loopMs = 0;
+  int passes = 0;
+  for (int design = 0; design < std::max(1, o.designs); ++design) {
+  at = noiseStart;
+  passes = 0;
+  if (design) {
+    CK(cudaMemcpyAsync(xBb, bb0.data(), bb0.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+    CK(cudaMemcpyAsync(xLl, ll0.data(), ll0.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+    CK(cudaMemcpyAsync(seqF, Fdev("in/seq"), (size_t)n * d.seqF * sizeof(float),
+                       cudaMemcpyDeviceToDevice, STREAM));
+  }
   CK(cudaStreamSynchronize(STREAM));
   const auto t0 = std::chrono::steady_clock::now();
-  int passes = 0;
   const rfd4p::Schedule schedBb = rfd4p::bbCaSchedule(steps);
   const rfd4p::Schedule schedLl = rfd4p::latentSchedule(steps);
   const float* emitBbDev = Fdev("g/emitBb");
@@ -306,8 +324,9 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   }
 
   CK(cudaStreamSynchronize(STREAM));
-  const double loopMs =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  loopMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (o.designs > 1) printf("  design %d: sampling %.2f s\n", design + 1, loopMs / 1000);
+  }
 
   // `sequenceForDecoder`: a conditioned residue stays, an emitted unconditioned one takes the
   // argmax of the trunk's ALLOWED logits.
@@ -376,12 +395,9 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     if (g.residueType[i] >= 0) ++residues;
     for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
   }
-  const double wholeMs =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   printf("generated %d residues, %d atoms over %d steps (%d trunk passes) -> %s\n", residues, atoms,
          steps, passes, o.out.c_str());
-  printf("  sampling %.2f s, with the decode and the write %.2f s\n", loopMs / 1000,
-         wholeMs / 1000);
+  printf("  sampling %.2f s\n", loopMs / 1000);
   return 0;
 }
 
@@ -398,6 +414,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
+    else if (!f.compare(0, 10, "--designs=")) o.designs = atoi(f.c_str() + 10);
     else if (f == "--fast") o.fast = true;
     else if (f == "--no-insertion") o.insertion = false;
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }

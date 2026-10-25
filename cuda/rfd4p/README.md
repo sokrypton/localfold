@@ -52,14 +52,17 @@ assembly, the sampler and the decode are inside it on both:
 | PyTorch compiled, first design | 10.91 s | about half of it is `torch.compile` |
 | **PyTorch compiled, warm** | **5.34 s** | the second design of a two-replicate run |
 | cuda/rfd4p, exact f32 | 4.80 s | |
-| **cuda/rfd4p, `--fast`** | **1.47 s** | **3.6x the warm compiled run** |
+| cuda/rfd4p, `--fast`, first design | 1.49 s | pays cuBLAS's heuristics and the lazy f16 mirrors |
+| **cuda/rfd4p, `--fast`, warm** | **1.33 s** | **4.0x the warm compiled run** |
 
-🔴 **3.4x IS THE NUMBER, AND THE OTHER THREE ROWS ARE WHY IT TOOK FOUR RUNS TO GET.** Against the
+🔴 **4.0x IS THE NUMBER, AND THE OTHER ROWS ARE WHY IT TOOK FIVE RUNS TO GET.** Against the
 preset upstream ships for first runs it is 10.1x, and that preset says in its own header that it
 disables compilation. Against a compiled run whose FIRST design pays for the compiling it is 1.9x.
-Only the warm row is production against production. 🔴 And our exact f32 arm at 4.80 s is a TIE
-with it, which is the same thing the per-pass trunk comparison below says: the margin is
-arithmetic, not kernels.
+Only the two warm rows are production against production, and they are matched on purpose:
+`--designs=N` generates more than once so the SECOND can be timed, which is how PyTorch's own warm
+number is taken. Comparing their warm against our cold would have under-read us by 11%.
+🔴 And our exact f32 arm at 4.80 s is a TIE with their warm compiled run, which is the same thing
+the per-pass trunk comparison below says: the margin is arithmetic, not kernels.
 
 Whole process, including loading 1.2 GB of weights: **2.00 s against 22.39 s** - **11.2x cold**,
 because their cold pays for `torch.compile` (10.2 s of that 22.39) where ours pays only for a read.
