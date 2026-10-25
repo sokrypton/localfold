@@ -32,6 +32,7 @@
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
 #include "../../featurise/zstd.h"
+#include "contig.h"
 #include "../src/schedule.h"
 #include "atoms.h"
 #include "chirality.h"
@@ -1167,6 +1168,7 @@ int run(int argc, char** argv) {
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
   bool realize = false, atomize = false;
+  string contigStr;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -1180,6 +1182,7 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 8, "--split=")) splitAt = atoi(a.c_str() + 8);
     else if (a == "--realize") realize = true;
     else if (a == "--atomize") { realize = true; atomize = true; }
+    else if (!a.compare(0, 9, "--contig=")) contigStr = a.substr(9);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -1197,9 +1200,43 @@ int run(int argc, char** argv) {
     bool opened = false;
     const string text = lf::zstd::readTextOrCompressed(dumpCif, &opened);
     if (!opened) { fprintf(stderr, "no %s\n", dumpCif.c_str()); return 1; }
+    // `--contig=` runs `applyContig` over the structure and dumps what it assembled, which is
+    // the one stage between the reader and the transforms.
     const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
     rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
     rfd4p::cif::deriveChemistry(a, block);
+    if (!contigStr.empty()) {
+      rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text);
+      const rfd4p::contig::Applied applied = rfd4p::contig::applyContig(src, contigStr);
+      const rfd4p::atoms::AtomArray& r = applied.atomArray;
+      printf("contig\t%zu\n", r.n());
+      auto seg = [&](const char* key) -> const vector<int>* {
+        auto it = r.ann.ints.find(key);
+        return it == r.ann.ints.end() ? nullptr : &it->second;
+      };
+      const vector<int>* mn = seg("annotation_expsegmin_1_residue");
+      const vector<int>* mx = seg("annotation_expsegmax_1_residue");
+      const vector<int>* uid = seg("_expseg_uid");
+      // 🔴 TWO OF THE SENTINEL'S OTHER ANNOTATIONS, because it is SLICED from a real atom and
+      // every annotation it inherits has to be reset to its default - without a column here
+      // that reset is unobserved and a stub arrives conditioned like its neighbour.
+      const vector<int>* cidx = seg("condition_index_1_residue");
+      auto cseqIt = r.ann.strings.find("condition_sequence_1_residue");
+      const vector<string>* cseq = cseqIt == r.ann.strings.end() ? nullptr : &cseqIt->second;
+      for (size_t i = 0; i < r.n(); ++i) {
+        printf("cg\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%.17g\t%.17g\t%.17g"
+               "\t%d\t%s\n",
+               r.site.resName[i].c_str(), r.site.atomName[i].c_str(), r.site.element[i].c_str(),
+               r.site.chainId[i].c_str(), r.site.resId[i], r.site.chainType[i],
+               mn && i < mn->size() ? (*mn)[i] : -1, mx && i < mx->size() ? (*mx)[i] : -1,
+               uid && i < uid->size() ? (*uid)[i] : -1, applied.originalResId[i],
+               r.ids.chainIid[i].c_str(), r.site.x[i], r.site.y[i], r.site.z[i],
+               cidx && i < cidx->size() ? (*cidx)[i] : -99,
+               cseq && i < cseq->size() ? (*cseq)[i].c_str() : "?");
+      }
+      for (const rfd4p::cif::Bond& b : r.bonds) printf("cgbond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+      return 0;
+    }
     printf("n %zu\n", a.n);
     for (size_t i = 0; i < a.n; ++i) {
       printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g"

@@ -17,6 +17,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
 import { STANDARD_POLYMER_RESIDUES } from "../../../shared/rfd4p/encoding.js";
+import { applyContig } from "../../../shared/rfd4p/pipeline/spec.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -384,6 +385,40 @@ cases.set("motif_idx_1prw+beside-expandable",
 // two the two draws agree often enough that swapping them left all sixteen cases green.
 cases.set("ppi_pdl1+threechains",
   withDuplicatedChain(withDuplicatedChain(cases.get("ppi_pdl1"), "Y"), "Z"));
+
+/**
+ * The contigs to try on a structure: a preserved segment it really has, with an expandable one
+ * before it, after it, and a second pure-expandable chain.
+ *
+ * 🔴 THE RANGE IS READ OFF THE STRUCTURE, NOT TYPED IN. A contig naming residues a file does not
+ * have is a refusal on both sides - which is a fine thing to test and NOT a test of the
+ * assembly, so this picks a window the chain actually spans.
+ */
+function contigsFor(name, js) {
+  const byChain = new Map();
+  for (let i = 0; i < js.nAtoms; i += 1) {
+    const c = js.chain_id[i];
+    if (!js.is_polymer[i]) continue;
+    const r = js.res_id[i];
+    const seen = byChain.get(c);
+    if (!seen) byChain.set(c, [r, r]);
+    else { seen[0] = Math.min(seen[0], r); seen[1] = Math.max(seen[1], r); }
+  }
+  let best = null;
+  for (const [c, [lo, hi]] of byChain) {
+    if (hi - lo < 8) continue;
+    if (!best || hi - lo > best[2] - best[1]) best = [c, lo, hi];
+  }
+  if (!best) return [];
+  const [cid, lo, hi] = best;
+  const a = lo + 1;
+  const b = Math.min(lo + 6, hi);
+  const seg = `${cid}${a}-${b}`;
+  // 🔴 AND ONE WITH THE PURE-EXPANDABLE RUN FIRST, which is the only shape that reaches the
+  // queue-and-reorder: a leading run with no atoms cannot be placed until a later run brings
+  // some, and is then moved back in front of it.
+  return [seg, `4-4,${seg}`, `${seg},3-3`, `${seg},/0,5-5P`, `5-5P,/0,${seg}`];
+}
 
 let structures = 0;
 let differing = 0;
@@ -953,6 +988,71 @@ for (const [name, text] of cases) {
     }
     if (compressed !== null && plain !== compressed) {
       wrong.push("zstd dump differs from the plain file's");
+    }
+  }
+
+  // `applyContig` against a real structure - the stage that was refused by name until the
+  // mmCIF reader existed. Four contigs a design job actually writes: a bare preserved segment,
+  // an expandable one before it, one after it, and a second chain that is pure expandable
+  // (which is the run the reference has to queue and then REORDER in front).
+  // 🔴 ONLY ON THE STRUCTURES THAT HAVE THE CHAIN AND RESIDUES THE CONTIG NAMES. A preserved
+  // segment that matches no atoms is a refusal on both sides, which is a different test.
+  for (const spec of contigsFor(name, js)) {
+    let got = null;
+    try {
+      got = execFileSync(binary, ["x", `--dump-cif=${path}`, `--contig=${spec}`],
+        { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    } catch (err) {
+      wrong.push(`contig ${spec} refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+      continue;
+    }
+    let want;
+    try {
+      want = applyContig(parseCifToAtomArray(text), spec);
+    } catch (err) {
+      wrong.push(`contig ${spec} reference threw: ${err.message}`);
+      continue;
+    }
+    const rows = got.filter((l) => l.startsWith("cg\t")).map((l) => l.split("\t").slice(1));
+    const bonds = got.filter((l) => l.startsWith("cgbond\t"))
+      .map((l) => l.split("\t").slice(1).map(Number));
+    const w = want.atomArray;
+    if (rows.length !== w.nAtoms) {
+      wrong.push(`contig ${spec} ${rows.length} vs ${w.nAtoms} atoms`);
+      continue;
+    }
+    const cols = [
+      ["res_name", 0, (v) => v, w.res_name],
+      ["atom_name", 1, (v) => v, w.atom_name],
+      ["element", 2, (v) => v, w.element],
+      ["chain_id", 3, (v) => v, w.chain_id],
+      ["res_id", 4, Number, w.res_id],
+      ["chain_type", 5, Number, w.chain_type],
+      ["expsegmin", 6, Number, w.annotations["annotation_expsegmin_1_residue"]],
+      ["expsegmax", 7, Number, w.annotations["annotation_expsegmax_1_residue"]],
+      ["expseg_uid", 8, Number, w.annotations._expseg_uid],
+      ["originalResId", 9, Number, want.originalResId],
+      ["chain_iid", 10, (v) => v, w.chain_iid],
+      ["x", 11, Number, w.coord.map((c) => c[0])],
+      ["y", 12, Number, w.coord.map((c) => c[1])],
+      ["z", 13, Number, w.coord.map((c) => c[2])],
+      // The reference stores this one as BOOLEANS, so `1 === true` is false and the whole
+      // column reads as differing - cast both sides, not just the dump's.
+      ["condition_index", 14, Number,
+        w.annotations.condition_index_1_residue?.map(Number)],
+      ["condition_sequence", 15, (v) => v, w.annotations.condition_sequence_1_residue],
+    ];
+    for (const [label, at, cast, expected] of cols) {
+      if (!expected) continue;
+      const bad = rows.filter((r, i) => !eq(cast(r[at]), expected[i])).length;
+      if (bad) wrong.push(`contig ${spec} ${label} ${bad}`);
+    }
+    if (bonds.length !== w.bonds.length) {
+      wrong.push(`contig ${spec} bonds ${bonds.length} vs ${w.bonds.length}`);
+    } else {
+      const bad = bonds.filter((b, i) => b[0] !== w.bonds[i][0] || b[1] !== w.bonds[i][1]
+        || b[2] !== w.bonds[i][2]).length;
+      if (bad) wrong.push(`contig ${spec} bonds ${bad}`);
     }
   }
 

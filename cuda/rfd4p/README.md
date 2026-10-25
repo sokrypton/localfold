@@ -532,9 +532,11 @@ residues the cropped example does not contain, so building one from the spec fai
     structure now reaches the batch the model reads - 46 keys held to the reference over all
     seventeen cases. Zstandard is native too (`cuda/featurise/zstd.h`,
     dlopen'd like `common.cuh`'s blob reader), so the page's own `.cif.zst` goes straight into
-    the binary and the gate drives all seven that way as well as decompressed. What is left of
-    the structure path is `applyContig` with PRESERVED segments,
-    `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
+    the binary and the gate drives all seven that way as well as decompressed. `applyContig` takes PRESERVED segments now
+    (`featurise/contig.h`), so a contig against a real structure assembles natively - five
+    contigs over each of the seventeen cases, compared column by column with the bonds and
+    `originalResId`. What is left of the structure path is `processSampleToAtoms`'s
+    `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
@@ -639,6 +641,24 @@ residues the cropped example does not contain, so building one from the spec fai
     passes real token ids and `sm_sam` - the one structure with stereocentres - went red at
     once. **A comparison where both sides take the same early return is not a comparison**;
     this is the third shape of that mistake recorded here, after the `Math.fround` pair.
+
+    🔴 **AND `applyContig`'s SENTINEL RESIDUE ID IS `-(2**31)`, NOT -1** - guessed as -1 and the
+    gate named it on fifteen structures, one entry each. A real mmCIF carries negative residue
+    numbers, so -1 would COLLIDE with one, and silently: a selection written against the input's
+    own numbering would then match the stub. Four more conventions were watched failing - an
+    expandable token before a preserved one inserts BEFORE it (15 cases), a leading
+    pure-expandable run is queued and then REORDERED back in front (15), the sentinel's
+    inherited annotations are reset to their defaults (2 int, 12 string), and the sentinel takes
+    over its neighbours' bond (15). One branch is unreachable from here and says so in
+    `contig.h`: the sentinel fits a HOLE in the numbering where there is one, and
+    `buildRunPreserved` renumbers every preserved segment contiguously from 1 before anything is
+    inserted, so there never is one.
+
+    🔴 **AND ONE OF THOSE COLUMNS READ AS WRONG BECAUSE OF THE COMPARISON, NOT THE PORT.**
+    `condition_index_1_residue` is BOOLEANS in the reference and ints in the dump, so `1 ===
+    true` is false and all 53 atoms differed. Cast one side only and a correct column reads as
+    a total failure; it is the mirror of the `Math.fround` trap, which hides a difference where
+    this invents one.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
