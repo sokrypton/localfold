@@ -34,6 +34,7 @@ import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import { alignToReference } from "../cpu/design/align.js";
 import { translateSpans } from "../cpu/design/source-numbering.js";
+import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -85,6 +86,13 @@ const advancedButton = element("show-advanced");
 const stepsTitle = element("steps-title");
 const unusedNote = element("unused-note");
 const roleList = element("role-list");
+// 🔴 HOISTED HERE WITH THE REST, and not left beside the preset code, because
+// `paintMethod` rebuilds the example list and runs during construction - long
+// before that code. Declared below, it throws "Cannot access presetSelect
+// before initialization" and the whole module fails to load, which is the
+// fifth time this file has been bitten by exactly that.
+const presetSelect = element("preset");
+const presetNote = element("preset-note");
 
 // 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
 // same reason as the lookups above: `paintJob` runs while the span list is still
@@ -417,6 +425,8 @@ const paintMethod = () => {
   // 🔴 THE BUTTON SAYS WHICH MACHINE IT STARTS. "Hunt" is the loop; RFD4
   // generates in one pass and calling that a hunt would misdescribe it.
   if (running === null) huntLabel.textContent = hunter ? "Hunt" : "Generate";
+  // The examples are the method's: four of the ten are RFD4-only.
+  paintPresets();
   paintJob();
   paintCost();
   // 🔴 BOTH DIRECTIONS, from one map. Every group either method cannot use is
@@ -713,15 +723,48 @@ const startHunt = async () => {
  * cannot read is reported rather than dropped, because a preset that loaded
  * "most of" its contig would run a different job from the one it names.
  */
-const presetSelect = element("preset");
-const presetNote = element("preset-note");
 
-for (const preset of RFD4P_PRESETS) {
-  const option = document.createElement("option");
-  option.value = preset.id;
-  option.textContent = preset.title ?? preset.id;
-  presetSelect.append(option);
+/**
+ * The examples the selected method can actually run.
+ *
+ * 🔴 OFFERING ONE THE METHOD WILL REFUSE IS A CONTROL THAT DOES NOTHING. The
+ * examples are RFD4-Proteina's and Protein Hunter can take six of the ten, so
+ * under Hunter the other four are listed as unavailable WITH their reason
+ * rather than silently dropped - a reader who came for the ligand-pocket
+ * example needs to know it is the method and not the page.
+ *
+ * 🔴 AND A LOADED EXAMPLE THE NEW METHOD CANNOT RUN IS CLEARED, because
+ * changing the method would otherwise leave the rows describing a job the
+ * button refuses, with the picker still naming it.
+ */
+function paintPresets() {
+  const hunter = method.value === "hunter";
+  // 🔴 READ THE SELECTION BEFORE CLEARING IT. `replaceChildren` removes the
+  // options, and a select with no options reports "" - so comparing against
+  // `presetSelect.value` further down compares against nothing and the loaded
+  // example loses its place in the picker on every method change.
+  const wasChosen = presetSelect.value;
+  presetSelect.replaceChildren();
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "Start from\u2026";
+  presetSelect.append(blank);
+  for (const preset of RFD4P_PRESETS) {
+    const suits = presetSuits(preset.id, method.value);
+    const option = document.createElement("option");
+    option.value = preset.id;
+    option.textContent = suits ? (preset.title ?? preset.id)
+      : `${preset.title ?? preset.id} — ${HUNTER_CANNOT[preset.id]}`;
+    option.disabled = !suits;
+    option.selected = preset.id === wasChosen && suits;
+    presetSelect.append(option);
+  }
+  if (!hunter) return;
+  // ...and if the example already loaded is one Hunter cannot run, it goes.
+  const chosen = RFD4P_PRESETS.find((entry) => entry.id === wasChosen);
+  if (chosen !== undefined && !presetSuits(chosen.id, "hunter")) presetSelect.value = "";
 }
+paintPresets();
 
 
 // What a preset carries beyond its contig: the conditions, the template

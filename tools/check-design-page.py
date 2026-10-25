@@ -121,6 +121,17 @@ READ_PAGE = """(() => {
       .map((s) => s.style.getPropertyValue("--chain-colour")),
     contig: t("contig-line"), problems: t("contig-problems"),
     presets: document.querySelectorAll("#preset option").length,
+    // 🔴 THE EXAMPLES ARE THE METHOD'S. They are RFD4-Proteina's and
+    // Protein Hunter can run six of the ten, so under Hunter the other four
+    // are listed DISABLED with their reason rather than dropped - a reader
+    // who came for the ligand-pocket example needs to know it is the method
+    // and not the page. Offering one the method then refuses is the same
+    // fault as a control that does nothing.
+    presetsOffered: [...document.querySelectorAll("#preset option")]
+      .filter((o) => !o.disabled && o.value).length,
+    presetsRefused: [...document.querySelectorAll("#preset option")]
+      .filter((o) => o.disabled).map((o) => o.textContent),
+    presetInHead: document.querySelector(".fold-actions #preset") !== null,
     columns: n("#results-table thead th"),
     hunt: document.getElementById("hunt")?.textContent?.trim(),
   });
@@ -180,6 +191,19 @@ def main():
         # ...and the break row belongs to no chain, so it carries no bar.
         if len(rowsByChain) != 2:
             bad.append(f"expected two chained rows, got {page['rowColours']}")
+        # The default method is Protein Hunter, which takes six of the ten.
+        if page["presetsOffered"] != 6:
+            bad.append(f"{page['presetsOffered']} examples offered under Hunter,"
+                       " expected 6")
+        # 🔴 AND EACH REFUSAL SAYS WHY. A greyed row with no reason is a
+        # dead end a reader cannot act on.
+        if len(page["presetsRefused"]) != 4:
+            bad.append(f"{len(page['presetsRefused'])} examples refused, expected 4")
+        for text in page["presetsRefused"]:
+            if "\u2014" not in text:
+                bad.append(f"an unavailable example gives no reason: {text!r}")
+        if not page["presetInHead"]:
+            bad.append("the example picker is not beside the method it belongs to")
         if page["spanRows"] != 3:
             bad.append(f"the span editor drew {page['spanRows']} rows, expected 3")
         # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE

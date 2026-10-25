@@ -1250,6 +1250,17 @@
    controls beside it the list computed to 248px, the middle track to 70, and
    every row's fields wrapped into a column - the page read as rubble. Both now
    sit in the option strip, which is what index.html's page-head note is about. */
+/* 🔴 THE EXAMPLE PICKER IS CAPPED, BECAUSE THE TITLES ARE SENTENCES. "Custom
+   Contig - CATH 3.40.50 Rossmann + Secondary Structure" sets the select's
+   natural width to about half the page, which pushed "Add span" onto two lines
+   and shoved the primary button to the edge. Capped, the select truncates its
+   own text - which is what a select does - and the head stays one row. */
+.fold-actions #preset { max-width: 240px; }
+
+/* ...and a button in that row never wraps: it is two words and a glyph, and a
+   wrapped one changes the height of the whole head. */
+.fold-actions .btn { white-space: nowrap; }
+
 .contig-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;

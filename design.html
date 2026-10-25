@@ -63,6 +63,19 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                     <option value="hunter" selected>Protein Hunter</option>
                     <option value="rfd4p">RFD4-Proteina</option>
                 </select>
+                <!-- 🔴 BESIDE THE METHOD, AND FILTERED BY IT. An example is
+                     where most readers start, so it belongs with the first
+                     choice they make rather than at the far end of the
+                     settings. And the list is RFD4-Proteina's: Protein Hunter
+                     cannot run four of the ten, so offering those under Hunter
+                     invites a click and then explains why it was wrong - the
+                     same fault as a control that does nothing. The options are
+                     rebuilt on every method change from
+                     cpu/design/preset-methods.js. -->
+                <select id="preset" class="entity-picker"
+                    title="Load a worked example into the spans below.">
+                    <option value="">Start from…</option>
+                </select>
                 <button type="button" id="add-span" class="btn btn-grey btn-small"
                     title="Add a span: residues to design, a chain you know, part of a loaded structure, a ligand, or a chain break.">
                     <i class="fa-solid fa-plus"></i>
@@ -282,15 +295,6 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         </button>
                     </div>
 
-                    <!-- Ten worked examples, each a modality. Loading one fills
-                         the spans, so an example is a starting point to edit
-                         rather than a black box to run. -->
-                    <div class="fetch-option-group" id="presetGroup">
-                        <span class="fetch-option-title">Start from</span>
-                        <select id="preset" title="Load a worked example into the spans above.">
-                            <option value="">nothing</option>
-                        </select>
-                    </div>
                 </div>
 
                 <!-- 🔴 EVERYTHING THE PAGE DECIDED FOR YOU, IN ONE PLACE. The
