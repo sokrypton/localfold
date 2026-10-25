@@ -139,15 +139,35 @@ inline void adaLnPacked(const float* x, const float* gamma, const float* beta, c
 // `silu(gates) * xPart` through `[dim -> 2 * inner]` and back, the masked rows zeroed. Replaces its
 // input (the conditioning's two transitions) or feeds a residual (the token transition) - the caller
 // decides; this writes `out` and adds nothing.
+// 🔴 THE WIDENED INTERMEDIATE IS half UNDER --fast, AND IT IS THE TOKEN TRACK'S BIGGEST GEMM PAIR.
+// Everything else in this port narrowed long ago; the token track stayed on `linear<float, float>`,
+// which under --fast means TF32 - half this card's f16 rate - and `[n, 768] -> [n, 6144] -> [n, 768]`
+// twice a layer is most of what that costs. The input is narrowed on the way in rather than the
+// adaLN writing half, so the residual stream `s` stays f32 across 14 layers and 6 recycles.
+template <class TC>
+inline void swiGluTransitionT(const float* x, float* out, size_t rows, int dim, int expansion,
+                              const float* rowMask, const std::string& pre) {
+  const int inner = dim * expansion;
+  TC* wide = scratch<TC>("rfd4p.sw.wide", rows * (size_t)inner * 2);
+  TC* gated = scratch<TC>("rfd4p.sw.gated", rows * (size_t)inner);
+  const TC* in;
+  if constexpr (std::is_same_v<TC, float>) {
+    in = x;
+  } else {
+    TC* xh = scratch<TC>("rfd4p.sw.x", rows * (size_t)dim);
+    narrowK<TC><<<blocks(rows * dim), 256, 0, STREAM>>>(x, xh, rows * dim);
+    in = xh;
+  }
+  linear<TC, TC>(in, wide, rows, dim, inner * 2, wn(pre + ".swish_linear.0.weight"), true);
+  swiGluSecondK<TC><<<blocks(rows * inner), 256, 0, STREAM>>>(wide, gated, rows, inner);
+  linear<TC, float>(gated, out, rows, inner, dim, wn(pre + ".linear_out.weight"), true);
+  if (rowMask) maskRowsK<<<blocks(rows * dim), 256, 0, STREAM>>>(out, rowMask, rows, dim);
+}
+
 inline void swiGluTransition(const float* x, float* out, size_t rows, int dim, int expansion,
                              const float* rowMask, const std::string& pre) {
-  const int inner = dim * expansion;
-  float* wide = scratch<float>("rfd4p.sw.wide", rows * (size_t)inner * 2);
-  float* gated = scratch<float>("rfd4p.sw.gated", rows * (size_t)inner);
-  linear<float, float>(x, wide, rows, dim, inner * 2, wn(pre + ".swish_linear.0.weight"), true);
-  swiGluSecondK<<<blocks(rows * inner), 256, 0, STREAM>>>(wide, gated, rows, inner);
-  linear<float, float>(gated, out, rows, inner, dim, wn(pre + ".linear_out.weight"), true);
-  if (rowMask) maskRowsK<<<blocks(rows * dim), 256, 0, STREAM>>>(out, rowMask, rows, dim);
+  if (F32_TF32) swiGluTransitionT<half>(x, out, rows, dim, expansion, rowMask, pre);
+  else swiGluTransitionT<float>(x, out, rows, dim, expansion, rowMask, pre);
 }
 
 // ---------------------------------------------------------------- pair-biased attention
@@ -161,8 +181,18 @@ inline void pairBiasAttention(const float* nodes, const TZ* pair, const float* p
                               const std::string& pre) {
   const size_t n = d.n;
   const int W_ = d.D;
-  float* normed = scratch<float>("rfd4p.at.norm", n * W_);
-  rmsNorm(nodes, normed, n, W_, W(wn(pre + ".node_norm.weight")));
+  // 🔴 THE NORMED NODES GO IN AS half SO THE PROJECTION RUNS ON THE f16 TENSOR CORES. Only the
+  // GEMM's INPUT narrows - its output stays f32, so the QK norms and the pack below are untouched.
+  // TF32 is half this card's f16 rate and the token track was still on it.
+  float* normed32 = nullptr;
+  half* normed16 = nullptr;
+  if (F32_TF32) {
+    normed16 = scratch<half>("rfd4p.at.norm16", n * W_);
+    rmsNorm<half>(nodes, normed16, n, W_, W(wn(pre + ".node_norm.weight")));
+  } else {
+    normed32 = scratch<float>("rfd4p.at.norm", n * W_);
+    rmsNorm(nodes, normed32, n, W_, W(wn(pre + ".node_norm.weight")));
+  }
 
   // q, k, v and the gate are four projections of one normed input, so they are one [4W, W] GEMM and
   // one bias - and the result is already [q | k | v | g] per token, which is flash's own layout.
@@ -171,7 +201,8 @@ inline void pairBiasAttention(const float* nodes, const TZ* pair, const float* p
   const std::string qkvgB = stacked(wn(pre + ".qkvgb~"),
                                      {wn(pre + ".to_qkv.bias"), wn(pre + ".to_g.bias")});
   float* qkv = scratch<float>("rfd4p.at.qkv", n * (size_t)W_ * 4);
-  linear<float, float>(normed, qkv, n, W_, W_ * 4, qkvgW, true);
+  if (F32_TF32) linear<half, float>(normed16, qkv, n, W_, W_ * 4, qkvgW, true);
+  else linear<float, float>(normed32, qkv, n, W_, W_ * 4, qkvgW, true);
   addBias(qkv, W(qkvgB), n, W_ * 4);
 
   // The pair bias: RMSNorm, project to `heads`, and lay out for flash, in one kernel.

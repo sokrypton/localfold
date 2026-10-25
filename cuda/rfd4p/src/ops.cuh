@@ -237,15 +237,22 @@ __global__ void adaScaleAddBroadcastK(const float* __restrict__ x, const float* 
 // `swish_linear.0.weight` is `[2 * inner, dim]` chunked into `(xPart, gates)`, and the product is
 // `silu(gates) * xPart` - the silu is on the SECOND half (`seq_transition_af3.py`). Reusing the other
 // kernel returns a tensor of the right shape and magnitude and the wrong answer.
-__global__ void swiGluSecondK(const float* __restrict__ wide, float* __restrict__ gated, size_t rows, int F) {
+template <class T>
+__global__ void swiGluSecondK(const T* __restrict__ wide, T* __restrict__ gated, size_t rows, int F) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)F) return;
   size_t r = i / F;
   int c = (int)(i - r * F);
-  const float* w = wide + r * 2 * (size_t)F;
-  float xPart = w[c];
-  float gate = w[F + c];
-  gated[i] = (gate / (1.f + __expf(-gate))) * xPart;
+  const T* w = wide + r * 2 * (size_t)F;
+  const float xPart = (float)w[c], gate = (float)w[F + c];
+  gated[i] = (T)((gate / (1.f + __expf(-gate))) * xPart);
+}
+
+// float -> T, for narrowing a token-track activation on its way into an f16 GEMM.
+template <class T>
+__global__ void narrowK(const float* __restrict__ x, T* __restrict__ y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = (T)x[i];
 }
 
 // ---------------------------------------------------------------- the attention's pair bias
