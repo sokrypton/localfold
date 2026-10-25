@@ -507,6 +507,35 @@ def main() -> int:
                   f"{seen.get('cif')} as mmCIF  {'ok ' if ok else 'WRONG'}")
             got["chains"] = {"pdb": seen.get("pdb"), "cif": seen.get("cif")}
 
+            # 🔴 AND `--designs=N` MUST GIVE N DIFFERENT PROTEINS, not one protein N times. It used
+            # to replay a single noise stream so a warm fold could be timed, and the flag now draws
+            # a fresh one per design - which is only meaningful if the designs DIFFER and each is
+            # still a chain. Both halves are asserted: a bug that returned the same structure N
+            # times would otherwise pass every geometry check there is.
+            campaign = HERE / "gate-campaign.pdb"
+            for old in HERE.glob("gate-campaign*.pdb"):
+                old.unlink()
+            run([BINARY, f"--job={fold}", f"--weights={args.weights}",
+                 f"--work-dir={HERE / 'gate-campaign'}", f"--out={campaign}", "--designs=3",
+                 "--fast"], cwd=REPO)
+            made = sorted(HERE.glob("gate-campaign*.pdb"))
+            steps_ok = all(3.4 <= sum(c) / len(c) <= 4.1
+                           for c in (chain_steps(f) for f in made) if c)
+            spread = []
+            if len(made) > 1:
+                first = chain_steps(made[0])
+                for f in made[1:]:
+                    a = (made[0]).read_text()
+                    b = f.read_text()
+                    spread.append(a != b)
+            ok = len(made) == 3 and steps_ok and all(spread)
+            if not ok:
+                failed += 1
+            print(f"  {'designs':10s} --designs=3 wrote {len(made)} structures, "
+                  f"{'all different and all chains' if ok else 'NOT 3 DIFFERENT CHAINS'}  "
+                  f"{'ok ' if ok else 'WRONG'}")
+            got["designs"] = {"written": len(made)}
+
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:
         ensure_inputs(case_dir, None, export_flags)

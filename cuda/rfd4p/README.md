@@ -15,6 +15,19 @@ writes PDB. 🔴 **A multi-chain design comes out as more than one chain now** -
 go into chain A, which for a binder or a complex is a structure no viewer and no scorer can read
 correctly, and which no RMSD or bond check would ever have noticed.
 
+**`--designs=N` is a campaign**, not a timing flag: N different proteins out of one process with
+the weights already up - 0.43 s for the first and **0.27 s each after it**. Design 1 keeps the
+featuriser's recorded noise so the trajectory gate still compares two sides that drew the same
+numbers; every later one DRAWS its own, seeded `seed + design`, which the port can do now that
+its Box-Muller is bit-identical to the page's. The gate asserts both halves - three structures,
+all different (13-15 A of CA apart) and all still chains - because a bug that returned the same
+structure N times would pass every geometry check there is.
+
+🔴 **AND IT FOLDS THEM AT SIXTY STEPS, NOT TWENTY-FIVE.** At 25 one seed in three came out at
+CA-CA 4.50 A, which is the sampler not being converged rather than the campaign being wrong - the
+same lesson `npm run test:modified` records as "it must be folded converged or it measures
+nothing".
+
 A real job end to end - 100 residues, 60 steps, from the file to the PDB - is **1.74 s of wall
 clock**, of which 1.04 is the sampler and the rest is the weights and the featurisation.
 

@@ -31,6 +31,7 @@ namespace {
 struct Opts {
   std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job,
       out = "design.pdb";
+  int seed = 0;      // a later design draws its own noise from seed + design
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
   int designs = 1;   // generate this many times, so a WARM one can be timed
@@ -257,7 +258,7 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   const int condDim = d.condF, pairDim = d.pairF;
   const std::vector<float> emitBb = download(Fdev("g/emitBb"), n);
   const std::vector<float> emitLl = download(Fdev("g/emitLl"), n);
-  const std::vector<float> noise = download(Fdev("g/noise"), M.len("g/noise"));
+  std::vector<float> noise = download(Fdev("g/noise"), M.len("g/noise"));
   const int* depths = M.i("g/depths");
   const int* stochastic = M.i("g/stochastic");
   const int* coordCond = M.i("g/coordCond");
@@ -373,15 +374,153 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   // comparison. The noise is replayed from the start each time, so every design is the same one -
   // this measures time, not variety.
   const size_t noiseStart = at;
-  std::vector<float> bb0 = bb, ll0 = ll;
+  const size_t noiseFloats = noise.size();
   double loopMs = 0;
   int passes = 0;
+  // 🔴 EACH DESIGN IS WRITTEN, NOT ONLY THE LAST. `--designs=N` used to replay one noise stream
+  // N times so a warm fold could be timed against a cold one; it draws a FRESH stream for every
+  // design after the first now, which is what a campaign wants and costs the same. Design 1 keeps
+  // the exporter's replayed stream, so the trajectory gate is unchanged: an oracle comparison
+  // needs the reference's own draws and nobody else's.
+  auto finishDesign = [&](int design) -> int {
+
+    // 🔴 THE WHOLE LOOP AGAINST THE REFERENCE'S OWN, which is the one thing every per-stage gate
+    // cannot say: the trunk, the decoder and the schedules are each held to `cpu/rfd4p`, and what is
+    // left over is whether they are WIRED together the way `generateRfd4pCpu` wires them - the order
+    // of the noise draws, which features move between steps, when the emit masks apply, whether the
+    // step advances x or x1. Two steps exercise all of that as well as sixty and cost minutes
+    // instead of hours.
+    if (!o.genOracle.empty()) {
+      int bad = 0;
+      for (const auto& [name, ptr, count] : std::initializer_list<std::tuple<const char*, const float*, size_t>>{
+               {"gen/xBb", xBb, (size_t)n * 3}, {"gen/xLl", xLl, (size_t)n * 32}}) {
+        const double r = checkOracle(name, ptr, count, name);
+        // 🔴 A TRAJECTORY COMPOUNDS, SO ITS --fast BOUND IS NOT A STAGE'S. The trunk's f16 and TF32
+        // residual is ~1e-3 a pass; the step at t = 0.001 amplifies it and the next step starts from
+        // the result, so two steps read 1.6e-2 with every input exact. That is arithmetic, not a
+        // defect, and the number that says so is the STRUCTURE: a finished 60-step generation is
+        // 0.020 A of CA from the exact arm, worst atom 0.034 - far inside the seed-to-seed spread.
+        // The gate measures that directly beside this.
+        if (r > (o.fast ? 5e-2 : 1e-5)) ++bad;
+      }
+      printf("  the trajectory %s the reference's over %d steps\n",
+             bad ? "DIVERGES from" : "matches", steps);
+      if (bad) return 1;
+    }
+
+    // `sequenceForDecoder`: a conditioned residue stays, an emitted unconditioned one takes the
+    // argmax of the trunk's ALLOWED logits.
+    const int nTypes = d.classes;
+    const std::vector<float> logits = download(t.logits, (size_t)n * nTypes);
+    const std::vector<int> allowed(M.i("g/allowedTypes"), M.i("g/allowedTypes") + 7 * nTypes);
+    const int* tokenType = M.i("in/tokenType");
+    std::vector<int> seq(M.i("g/condSeq"), M.i("g/condSeq") + n);
+    for (int i = 0; i < n; ++i) {
+      if (!emitLl[i] || seq[i] != 0) continue;
+      const int tt = std::max(0, std::min(6, tokenType[i]));
+      int best = 0;
+      float bestV = -3.4028234663852886e38f;
+      for (int r = 0; r < nTypes; ++r) {
+        const float v = allowed[(size_t)tt * nTypes + r] ? logits[(size_t)i * nTypes + r]
+                                                         : -3.4028234663852886e38f;
+        if (v > bestV) { bestV = v; best = r; }
+      }
+      seq[i] = best;
+    }
+    int* seqDev = upload(seq.data(), seq.size());
+
+    rfd4p::DecDims dd;
+    dd.n = n;
+    dd.D = (int)M.meta("meta/decTokenDim");
+    dd.C = (int)M.meta("meta/decCondDim");
+    dd.H = (int)M.meta("meta/decHeads");
+    dd.nlayers = (int)M.meta("meta/decLayers");
+    dd.nTypes = nTypes;
+    dd.latent = d.latent;
+    dd.fdim = (int)M.meta("meta/decFeatDim");
+    float* dLogits = scratch<float>("gen.dlogits", (size_t)n * nTypes);
+    float* dCoors = scratch<float>("gen.dcoors", (size_t)n * 111);
+    float* dPresence = scratch<float>("gen.dpresence", (size_t)n * 37);
+    rfd4p::decode(dd, xBb, xLl, M.i("in/tokenType") ? Idev("in/tokenType") : nullptr, seqDev,
+                  Fdev("in/attnMask"), dLogits, dCoors, dPresence);
+    CK(cudaStreamSynchronize(STREAM));
+
+    const rfd4p::GenOut g = rfd4p::postprocess(
+        n, nTypes, download(dLogits, (size_t)n * nTypes), download(dCoors, (size_t)n * 111),
+        download(dPresence, (size_t)n * 37), download(xBb, (size_t)n * 3), seq,
+        std::vector<int>(tokenType, tokenType + n),
+        std::vector<int>(M.i("g/coordGroup"), M.i("g/coordGroup") + (size_t)n * 37), allowed,
+        std::vector<int>(M.i("g/atom37Legal"), M.i("g/atom37Legal") + (size_t)nTypes * 37), emitLl,
+        download(t.mask, n));
+
+    // The atom and residue names, written beside the tensors by the exporter: the page's own tables.
+    std::vector<std::string> atomNames, resNames;
+    {
+      std::ifstream in(o.gen + "/names.txt");
+      std::string line, word;
+      for (int which = 0; which < 2 && std::getline(in, line); ++which) {
+        std::istringstream ss(line);
+        while (ss >> word) (which == 0 ? atomNames : resNames).push_back(word);
+      }
+    }
+    if (atomNames.size() != 37 || resNames.size() != (size_t)nTypes) {
+      fprintf(stderr, "%s/names.txt has %zu atom and %zu residue names\n", o.gen.c_str(),
+              atomNames.size(), resNames.size());
+      return 1;
+    }
+    // 🔴 THE FORMAT FOLLOWS THE NAME, because mmCIF is what RFD4-Proteina itself writes and a PDB
+    // cannot carry a long chain id or more than 99,999 atoms. `--out=design.cif` gets a CIF.
+    const std::vector<int> chainOf =
+        M.has("g/chainIid")
+            ? std::vector<int>(M.i("g/chainIid"), M.i("g/chainIid") + n)
+            : std::vector<int>(n, 0);
+    const bool wantCif = o.out.size() > 4 && o.out.compare(o.out.size() - 4, 4, ".cif") == 0;
+    // One file a design: `design.pdb`, then `design_2.pdb`, `design_3.pdb`. The first keeps the
+    // name it was asked for, so a single-design run is unchanged.
+    std::string path = o.out;
+    if (design > 0) {
+      const size_t dot = path.rfind('.');
+      const std::string stem = dot == std::string::npos ? path : path.substr(0, dot);
+      const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
+      path = stem + "_" + std::to_string(design + 1) + ext;
+    }
+    std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf)
+                                    : rfd4p::toPdb(g, n, atomNames, resNames, chainOf));
+    int atoms = 0, residues = 0;
+    for (int i = 0; i < n; ++i) {
+      if (g.residueType[i] >= 0) ++residues;
+      for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
+    }
+    printf("generated %d residues, %d atoms over %d steps (%d trunk passes) -> %s\n", residues, atoms,
+           steps, passes, path.c_str());
+    printf("  sampling %.2f s\n", loopMs / 1000);
+    return 0;
+  };
+
   for (int design = 0; design < std::max(1, o.designs); ++design) {
   at = noiseStart;
   passes = 0;
   if (design) {
-    CK(cudaMemcpyAsync(xBb, bb0.data(), bb0.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
-    CK(cudaMemcpyAsync(xLl, ll0.data(), ll0.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+    // 🔴 A FRESH STREAM, NOT THE SAME ONE AGAIN. The port's Box-Muller is bit-identical to the
+    // page's now, so a later design can DRAW rather than replay - seeded `seed + design`, which
+    // is how a campaign gets variety out of one process with the weights already up. Design 1
+    // keeps the exporter's recorded stream so the trajectory gate still compares two sides that
+    // drew the same numbers.
+    noise.resize(noiseFloats);
+    rfd4p::Rng g2((uint64_t)(o.seed + design));
+    g2.randn(noise.data(), noise.size());
+    const std::vector<float> nbb = rfd4p::zeroComBbNoise(noise.data(), n, emitBb.data());
+    std::vector<float> nb = nbb;
+    size_t a2 = (size_t)n * 3;
+    rfd4p::applyPerGroupOffset(nb, n, emitBb.data(), coordCond, moleculeIid, groups, noise.data(),
+                               a2, scale);
+    std::vector<float> nl(noise.begin() + a2, noise.begin() + a2 + (size_t)n * latent);
+    for (int i = 0; i < n; ++i) {
+      if (!emitLl[i]) for (int k = 0; k < latent; ++k) nl[(size_t)i * latent + k] = 0.f;
+    }
+    at = a2 + (size_t)n * latent;
+    CK(cudaMemcpyAsync(xBb, nb.data(), nb.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
+    CK(cudaMemcpyAsync(xLl, nl.data(), nl.size() * sizeof(float), cudaMemcpyHostToDevice, STREAM));
     CK(cudaMemcpyAsync(seqF, Fdev("in/seq"), (size_t)n * d.seqF * sizeof(float),
                        cudaMemcpyDeviceToDevice, STREAM));
   }
@@ -490,110 +629,8 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
 
   CK(cudaStreamSynchronize(STREAM));
   loopMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  if (o.designs > 1) printf("  design %d: sampling %.2f s\n", design + 1, loopMs / 1000);
+  if (int rc = finishDesign(design)) return rc;
   }
-
-  // 🔴 THE WHOLE LOOP AGAINST THE REFERENCE'S OWN, which is the one thing every per-stage gate
-  // cannot say: the trunk, the decoder and the schedules are each held to `cpu/rfd4p`, and what is
-  // left over is whether they are WIRED together the way `generateRfd4pCpu` wires them - the order
-  // of the noise draws, which features move between steps, when the emit masks apply, whether the
-  // step advances x or x1. Two steps exercise all of that as well as sixty and cost minutes
-  // instead of hours.
-  if (!o.genOracle.empty()) {
-    int bad = 0;
-    for (const auto& [name, ptr, count] : std::initializer_list<std::tuple<const char*, const float*, size_t>>{
-             {"gen/xBb", xBb, (size_t)n * 3}, {"gen/xLl", xLl, (size_t)n * 32}}) {
-      const double r = checkOracle(name, ptr, count, name);
-      // 🔴 A TRAJECTORY COMPOUNDS, SO ITS --fast BOUND IS NOT A STAGE'S. The trunk's f16 and TF32
-      // residual is ~1e-3 a pass; the step at t = 0.001 amplifies it and the next step starts from
-      // the result, so two steps read 1.6e-2 with every input exact. That is arithmetic, not a
-      // defect, and the number that says so is the STRUCTURE: a finished 60-step generation is
-      // 0.020 A of CA from the exact arm, worst atom 0.034 - far inside the seed-to-seed spread.
-      // The gate measures that directly beside this.
-      if (r > (o.fast ? 5e-2 : 1e-5)) ++bad;
-    }
-    printf("  the trajectory %s the reference's over %d steps\n",
-           bad ? "DIVERGES from" : "matches", steps);
-    if (bad) return 1;
-  }
-
-  // `sequenceForDecoder`: a conditioned residue stays, an emitted unconditioned one takes the
-  // argmax of the trunk's ALLOWED logits.
-  const int nTypes = d.classes;
-  const std::vector<float> logits = download(t.logits, (size_t)n * nTypes);
-  const std::vector<int> allowed(M.i("g/allowedTypes"), M.i("g/allowedTypes") + 7 * nTypes);
-  const int* tokenType = M.i("in/tokenType");
-  std::vector<int> seq(M.i("g/condSeq"), M.i("g/condSeq") + n);
-  for (int i = 0; i < n; ++i) {
-    if (!emitLl[i] || seq[i] != 0) continue;
-    const int tt = std::max(0, std::min(6, tokenType[i]));
-    int best = 0;
-    float bestV = -3.4028234663852886e38f;
-    for (int r = 0; r < nTypes; ++r) {
-      const float v = allowed[(size_t)tt * nTypes + r] ? logits[(size_t)i * nTypes + r]
-                                                       : -3.4028234663852886e38f;
-      if (v > bestV) { bestV = v; best = r; }
-    }
-    seq[i] = best;
-  }
-  int* seqDev = upload(seq.data(), seq.size());
-
-  rfd4p::DecDims dd;
-  dd.n = n;
-  dd.D = (int)M.meta("meta/decTokenDim");
-  dd.C = (int)M.meta("meta/decCondDim");
-  dd.H = (int)M.meta("meta/decHeads");
-  dd.nlayers = (int)M.meta("meta/decLayers");
-  dd.nTypes = nTypes;
-  dd.latent = d.latent;
-  dd.fdim = (int)M.meta("meta/decFeatDim");
-  float* dLogits = scratch<float>("gen.dlogits", (size_t)n * nTypes);
-  float* dCoors = scratch<float>("gen.dcoors", (size_t)n * 111);
-  float* dPresence = scratch<float>("gen.dpresence", (size_t)n * 37);
-  rfd4p::decode(dd, xBb, xLl, M.i("in/tokenType") ? Idev("in/tokenType") : nullptr, seqDev,
-                Fdev("in/attnMask"), dLogits, dCoors, dPresence);
-  CK(cudaStreamSynchronize(STREAM));
-
-  const rfd4p::GenOut g = rfd4p::postprocess(
-      n, nTypes, download(dLogits, (size_t)n * nTypes), download(dCoors, (size_t)n * 111),
-      download(dPresence, (size_t)n * 37), download(xBb, (size_t)n * 3), seq,
-      std::vector<int>(tokenType, tokenType + n),
-      std::vector<int>(M.i("g/coordGroup"), M.i("g/coordGroup") + (size_t)n * 37), allowed,
-      std::vector<int>(M.i("g/atom37Legal"), M.i("g/atom37Legal") + (size_t)nTypes * 37), emitLl,
-      download(t.mask, n));
-
-  // The atom and residue names, written beside the tensors by the exporter: the page's own tables.
-  std::vector<std::string> atomNames, resNames;
-  {
-    std::ifstream in(o.gen + "/names.txt");
-    std::string line, word;
-    for (int which = 0; which < 2 && std::getline(in, line); ++which) {
-      std::istringstream ss(line);
-      while (ss >> word) (which == 0 ? atomNames : resNames).push_back(word);
-    }
-  }
-  if (atomNames.size() != 37 || resNames.size() != (size_t)nTypes) {
-    fprintf(stderr, "%s/names.txt has %zu atom and %zu residue names\n", o.gen.c_str(),
-            atomNames.size(), resNames.size());
-    return 1;
-  }
-  // 🔴 THE FORMAT FOLLOWS THE NAME, because mmCIF is what RFD4-Proteina itself writes and a PDB
-  // cannot carry a long chain id or more than 99,999 atoms. `--out=design.cif` gets a CIF.
-  const std::vector<int> chainOf =
-      M.has("g/chainIid")
-          ? std::vector<int>(M.i("g/chainIid"), M.i("g/chainIid") + n)
-          : std::vector<int>(n, 0);
-  const bool wantCif = o.out.size() > 4 && o.out.compare(o.out.size() - 4, 4, ".cif") == 0;
-  std::ofstream(o.out) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf)
-                                   : rfd4p::toPdb(g, n, atomNames, resNames, chainOf));
-  int atoms = 0, residues = 0;
-  for (int i = 0; i < n; ++i) {
-    if (g.residueType[i] >= 0) ++residues;
-    for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
-  }
-  printf("generated %d residues, %d atoms over %d steps (%d trunk passes) -> %s\n", residues, atoms,
-         steps, passes, o.out.c_str());
-  printf("  sampling %.2f s\n", loopMs / 1000);
   return 0;
 }
 
@@ -611,6 +648,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 13, "--enc-oracle=")) o.encOracle = f.substr(13);
     else if (!f.compare(0, 10, "--encoder=")) o.enc = f.substr(10);
     else if (!f.compare(0, 6, "--job=")) o.job = f.substr(6);
+    else if (!f.compare(0, 7, "--seed=")) o.seed = atoi(f.c_str() + 7);
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
@@ -661,7 +699,7 @@ int jobMain(int argc, char** argv) {
 
   std::vector<std::string> own = {argv[0], outDir, "--generate=" + outDir + "-gen"};
   for (const std::string& f : keep) {
-    if (f.compare(0, 2, "--") == 0 && f.compare(0, 7, "--seed=") != 0) own.push_back(f);
+    if (f.compare(0, 2, "--") == 0) own.push_back(f);
   }
   std::vector<char*> ownv;
   for (std::string& f : own) ownv.push_back(f.data());
