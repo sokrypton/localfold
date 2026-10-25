@@ -279,6 +279,16 @@ __global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __
   z[i] += a[i] * (1.f / (1.f + __expf(-g)));
 }
 
+template <class T>
+__global__ void mulSigmoidAddGateK(const float* __restrict__ a, const T* __restrict__ gate,
+                                   const float* __restrict__ pairMask, float* __restrict__ z,
+                                   size_t rows, int C) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C) return;
+  if (pairMask && pairMask[i / C] == 0.f) return;
+  z[i] += a[i] * (1.f / (1.f + __expf(-(float)gate[i])));
+}
+
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
 template <class T>
 __global__ void biasReluK(T* __restrict__ x, const float* __restrict__ bias, size_t rows, int C) {

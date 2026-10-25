@@ -63,8 +63,8 @@ Both arms at 6 recycles, the `--length=N` unconditioned segment:
 |---:|---:|---:|---:|
 | 54 | 74.8 | 29.9 | 2.50 |
 | 100 | 157.6 | 49.8 | 3.17 |
-| 200 | 534.8 | 147.8 | 3.62 |
-| 400 | 2114.5 | 555.9 | 3.80 |
+| 200 | 534.8 | 149.0 | 3.59 |
+| 400 | 2114.5 | 513.5 | 4.12 |
 
 The reduced-precision arm pulls further ahead with length, which is what a pair track that grows as
 n^2 and contracts as n^3 should do: the longer the chain, the more of the pass is GEMM and the less
@@ -88,6 +88,7 @@ four oracle arms.
 | the triangle's planes in half | 53.0 | 56 MB written and read back a triangle, 84 triangles a pass |
 | the pair transition's hidden in half | 49.5 | the largest buffer left in an update |
 | the pair bias fused into one kernel | 49.8 at n=100, **555.9 at n=400** | a wash on a short chain, 3.5% at a long one |
+| the triangle's gate transposed past 40,000 pairs | 49.9 at n=100, **513.5 at n=400** | the strided read inverts with length |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.

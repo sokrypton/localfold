@@ -277,7 +277,24 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
   // was taken at the top, so nothing downstream of here reads z again. The gate arrives channel-major
   // out of the fused projection, which costs the kernel an index and saves a whole GEMM.
-  mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z, rows, cZ);
+  // 🔴 WHETHER TO TRANSPOSE THE GATE FIRST DEPENDS ON THE LENGTH, AND IT INVERTS. The gate comes out
+  // of the fused projection channel-major, so reading it in place costs a transaction an element;
+  // that is cheap on a short chain and ruinous on a long one, where this kernel was 23.6% of the
+  // pass and 2.7x off its own bandwidth. Measured both ways, `--fast`, 6 recycles:
+  //
+  //        n=100          n=200          n=400
+  //   in place   49.8      147.8          555.9
+  //   transposed 54.8      149.2          513.3
+  //
+  // so the crossover is about 40,000 pairs and the rule is on `rows`, which is what sets the stride.
+  if (rows >= 40000) {
+    TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
+    fromPlanes<TP, TP>(gPlanes, gate, rows, cZ);
+    mulSigmoidAddGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gate, pairMask, z, rows, cZ);
+  } else {
+    mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z,
+                                                                       rows, cZ);
+  }
 }
 
 inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
