@@ -47,14 +47,14 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
                                    const float* __restrict__ w6, const float* __restrict__ w7, const float* __restrict__ bsum,
                                    const float* __restrict__ qterm, float* __restrict__ act, int L, int C) {
   __shared__ float sw[6][64];
-  if (threadIdx.x < 64) {
+  if (threadIdx.x < 16) {
     int c = threadIdx.x;
-    ptx_st_shared_f32(&sw[0][c], ptx_ldg_f32(bsum + c));
-    ptx_st_shared_f32(&sw[1][c], ptx_ldg_f32(w1 + c));
-    ptx_st_shared_f32(&sw[2][c], ptx_ldg_f32(w4 + c));
-    ptx_st_shared_f32(&sw[3][c], ptx_ldg_f32(w5 + c));
-    ptx_st_shared_f32(&sw[4][c], ptx_ldg_f32(w6 + c));
-    ptx_st_shared_f32(&sw[5][c], ptx_ldg_f32(w7 + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[0]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(bsum) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[1]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w1) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[2]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w4) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[3]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w5) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[4]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w6) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw[5]) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w7) + c));
   }
   __syncthreads();
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -89,14 +89,17 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
     if (m0) dbin = ptx_ffs_u32(m0) - 1;
     else if (m1) dbin = 31 + ptx_ffs_u32(m1);
   }
-  const float *Ri = frames + (size_t)i * 12, *ti = Ri + 9, *tj = frames + (size_t)j * 12 + 9;
-  float d[3] = {
-    ptx_sub_f32(ptx_ldg_f32(tj + 0), ptx_ldg_f32(ti + 0)),
-    ptx_sub_f32(ptx_ldg_f32(tj + 1), ptx_ldg_f32(ti + 1)),
-    ptx_sub_f32(ptx_ldg_f32(tj + 2), ptx_ldg_f32(ti + 2))
-  }, v[3];
-  for (int a = 0; a < 3; ++a)
-    v[a] = ptx_fma_f32(ptx_ldg_f32(Ri + a), d[0], ptx_fma_f32(ptx_ldg_f32(Ri + 3 + a), d[1], ptx_mul_f32(ptx_ldg_f32(Ri + 6 + a), d[2])));
+  const float4* fi4 = reinterpret_cast<const float4*>(frames + (size_t)i * 12);
+  float4 fi0 = ptx_ldg_v4_f32(fi4 + 0), fi1 = ptx_ldg_v4_f32(fi4 + 1), fi2 = ptx_ldg_v4_f32(fi4 + 2);
+  const float* tj = frames + (size_t)j * 12 + 9;
+  float d0 = ptx_sub_f32(ptx_ldg_f32(tj + 0), fi2.y);
+  float d1 = ptx_sub_f32(ptx_ldg_f32(tj + 1), fi2.z);
+  float d2_v = ptx_sub_f32(ptx_ldg_f32(tj + 2), fi2.w);
+  float v[3] = {
+    ptx_fma_f32(fi0.x, d0, ptx_fma_f32(fi0.w, d1, ptx_mul_f32(fi1.z, d2_v))),
+    ptx_fma_f32(fi0.y, d0, ptx_fma_f32(fi1.x, d1, ptx_mul_f32(fi1.w, d2_v))),
+    ptx_fma_f32(fi0.z, d0, ptx_fma_f32(fi1.y, d1, ptx_mul_f32(fi2.x, d2_v)))
+  };
   float nv = ptx_rsqrt_f32(ptx_max_f32(ptx_fma_f32(v[0], v[0], ptx_fma_f32(v[1], v[1], ptx_mul_f32(v[2], v[2]))), 1e-12f));
   float bb = ptx_sqrt_f32(ptx_mul_f32(ptx_ldg_f32(bbMask + i), ptx_ldg_f32(bbMask + j)));
   float nv_bb = ptx_mul_f32(nv, bb);
@@ -219,11 +222,11 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
                                           const float* __restrict__ tMask, const float* __restrict__ w,
                                           const float* __restrict__ b, float* __restrict__ act, int L, int C) {
   __shared__ float sb[64], sw39[64], sw87[64];
-  if (threadIdx.x < 64) {
+  if (threadIdx.x < 16) {
     int c = threadIdx.x;
-    ptx_st_shared_f32(sb + c, ptx_ldg_f32(b + c));
-    ptx_st_shared_f32(sw39 + c, ptx_ldg_f32(w + 39 * C + c));
-    ptx_st_shared_f32(sw87 + c, ptx_ldg_f32(w + 87 * C + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sb) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(b) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw39) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w + 39 * C) + c));
+    ptx_st_shared_v4_f32(reinterpret_cast<float4*>(sw87) + c, ptx_ldg_v4_f32(reinterpret_cast<const float4*>(w + 87 * C) + c));
   }
   __syncthreads();
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;

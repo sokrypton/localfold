@@ -924,6 +924,8 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(C <= 128 ? 4 : 3, lnHead
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;
   float rb0 = (rowBias && row0 + lr0 < rows) ? ptx_ldg_f32(rowBias + row0 + lr0) : 0.f;
   float rb1 = (rowBias && row0 + lr1 < rows) ? ptx_ldg_f32(rowBias + row0 + lr1) : 0.f;
+  const int r = (int)threadIdx.x & (R - 1), h0 = (int)threadIdx.x / R;
+  const float pm = (biasOut && pairMask && row0 + r < rows) ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + r0 + row0 + r), 1.f)) : 0.f;
   cpWait<0>();
   __syncthreads();
   float acc[N / 8][4] = {};
@@ -956,24 +958,50 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(C <= 128 ? 4 : 3, lnHead
   }
   __syncthreads();
   if (biasOut) {
-    const int r = (int)threadIdx.x & (R - 1), h0 = (int)threadIdx.x / R;
     if (row0 + r >= rows) return;
     unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
-    const float pm = pairMask ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + ij), 1.f)) : 0.f;
     if (tr) { unsigned x = i; i = j; j = x; }
-    for (int h = h0; h < H; h += NTH / R) {
-      float v = ptx_add_f32(ptx_ld_shared_f32(Os + h * LDO + r), pm);
-      ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + j, ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(v, LOG2E), -6e4f)));
-      if (j == ul - 1) for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + pad, 0);
+    constexpr int HSTEP = NTH / R;
+    const size_t base = ((size_t)h0 * L + i) * stride, step = (size_t)HSTEP * L * stride;
+    auto cvt = [&](float v) { return ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(ptx_add_f32(v, pm), LOG2E), -6e4f)); };
+    if (H == 4 * HSTEP) {
+      float v0 = ptx_ld_shared_f32(Os + (h0 + 0 * HSTEP) * LDO + r);
+      float v1 = ptx_ld_shared_f32(Os + (h0 + 1 * HSTEP) * LDO + r);
+      float v2 = ptx_ld_shared_f32(Os + (h0 + 2 * HSTEP) * LDO + r);
+      float v3 = ptx_ld_shared_f32(Os + (h0 + 3 * HSTEP) * LDO + r);
+      ptx_st_global_u16(biasOut + base + j, cvt(v0));
+      ptx_st_global_u16(biasOut + base + step + j, cvt(v1));
+      ptx_st_global_u16(biasOut + base + 2 * step + j, cvt(v2));
+      ptx_st_global_u16(biasOut + base + 3 * step + j, cvt(v3));
+    } else if (H == 2 * HSTEP) {
+      float v0 = ptx_ld_shared_f32(Os + (h0 + 0 * HSTEP) * LDO + r);
+      float v1 = ptx_ld_shared_f32(Os + (h0 + 1 * HSTEP) * LDO + r);
+      ptx_st_global_u16(biasOut + base + j, cvt(v0));
+      ptx_st_global_u16(biasOut + base + step + j, cvt(v1));
+    } else {
+      for (int h = h0; h < H; h += HSTEP) {
+        float v = ptx_ld_shared_f32(Os + h * LDO + r);
+        ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + j, cvt(v));
+      }
+    }
+    if (j == ul - 1 && L < stride) {
+      for (int h = h0; h < H; h += HSTEP)
+        for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + pad, 0);
     }
     return;
   }
-  const int h0 = (int)threadIdx.x / R, r = (int)threadIdx.x % R;
   if (row0 + r < rows) {
+    constexpr int NIT = (N * R + NTH - 1) / NTH;
+    float ov[NIT];
 #pragma unroll
-    for (int it = 0; it < (N * R + NTH - 1) / NTH; ++it) {
+    for (int it = 0; it < NIT; ++it) {
       int h = h0 + it * (NTH / R);
-      if ((N * R) % NTH == 0 || h < N) ptx_st_global_f32(out + (size_t)h * rows + row0 + r, ptx_ld_shared_f32(Os + h * LDO + r));
+      if ((N * R) % NTH == 0 || h < N) ov[it] = ptx_ld_shared_f32(Os + h * LDO + r);
+    }
+#pragma unroll
+    for (int it = 0; it < NIT; ++it) {
+      int h = h0 + it * (NTH / R);
+      if ((N * R) % NTH == 0 || h < N) ptx_st_global_f32(out + (size_t)h * rows + row0 + r, ov[it]);
     }
   }
 }
@@ -1097,12 +1125,17 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = ptx_ldg_v2_f32(qb + j * NC + nt * 8 + tig * 2);
     }
+    const half* w = Wst + st * C * LDW;
+    const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
+    uint32_t f[2][4];
 #if LF_REG_STAGES
     __syncthreads();
+    ldsm4t(f[0], w + kl * LDW + cl);
 #else
     if (j > 0) {
       cpWait<0>();
       __syncthreads();
+      ldsm4t(f[0], w + kl * LDW + cl);
       if (j + 1 < chunks) issue(j + 1, st ^ 1);
       else if (bias) {
         const int kb0 = (int)threadIdx.x >> 1, cb0 = ((int)threadIdx.x & 1) * 8;
@@ -1113,13 +1146,11 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         }
         cpCommit();
       }
+    } else {
+      ldsm4t(f[0], w + kl * LDW + cl);
     }
 #endif
-    const half* w = Wst + st * C * LDW;
     float acc[MT][NC / 8][4] = {};
-    const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
-    uint32_t f[2][4];
-    ldsm4t(f[0], w + kl * LDW + cl);
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
 #pragma unroll
@@ -1190,11 +1221,18 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
           }
         }
       } else {
+        constexpr int N_YS = 16 * (NC / 8) / 32;
+        uint4 yv[N_YS];
 #pragma unroll
-        for (int i = 0; i < 16 * (NC / 8) / 32; ++i) {
+        for (int i = 0; i < N_YS; ++i) {
+          int r = i * (32 / (NC / 8)) + r_base;
+          yv[i] = ptx_ld_shared_v4_u32(Ys + r * LDW + c_out);
+        }
+#pragma unroll
+        for (int i = 0; i < N_YS; ++i) {
           int r = i * (32 / (NC / 8)) + r_base;
           size_t row = tileRow0 + r;
-          if (row < rows) ptx_st_global_v4_u32(out + row * NQ + j * NC + c_out, ptx_ld_shared_v4_u32(Ys + r * LDW + c_out));
+          if (row < rows) ptx_st_global_v4_u32(out + row * NQ + j * NC + c_out, yv[i]);
         }
       }
     }
