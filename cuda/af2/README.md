@@ -457,6 +457,43 @@ pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor th
 lane (1%, within the drift), nor 48-key tiles for the MSA row attention where 64 pad more (261 residues: no change -
 its rate there is not the padding).
 
+### Hand-written PTX, and how far it can go (branch argon-ptx, 2026-10-25)
+
+Four rounds rewrote the fold's kernels in inline PTX (cuda/af3/src/ptx_primitives.cuh, cuda/af2/src/ptx_gemm.cuh),
+tuned on an A10. On this A100 (resident server, 4 passes at 508:1024, median of warm jobs, interleaved builds):
+
+| | 68 res | 261 res | 522 res | 261 + 7,907-row MSA | 1,044 res |
+|---|---:|---:|---:|---:|---:|
+| before (e44ea57f) | 65.0 ms | 314.3 | 1112.0 | 1094.9 | 5454 |
+| after round 4 | 64.8 | 301.1 | 1086.2 | 1093.3 | 5358 |
+| after round 5 | 64.1 | 301.7 | 1076.8 | 1041.7 | 5336 |
+
+Round 5 is two corrections rather than a speed-up: the PTX conversions no longer build for sm_75 unless they fall
+back below sm_80, and the PTX GEMM loses to cuBLASLt here, so an A100 takes cuBLASLt (`ptxGemmPays`).
+
+**The ceiling.** Nsight Compute over ~450 launches mid-fold, each kernel's busiest unit (tensor pipe, DRAM, shared
+memory, SFU) as a share of peak: if every kernel were pushed to 80% of its busiest unit - more than cuBLASLt's own
+GEMMs reach here (75-78% tensor pipe) - the fold would be **1.50x** faster at 522 residues and **1.48x** at 5CAJ
+with its alignment. That is the whole prize for any amount of PTX or SASS, and it is not reachable in full:
+
+| | share of fold (522 / 5CAJ+MSA) | busiest unit now | bound |
+|---|---:|---|---:|
+| flash attention (triangle, MSA row/column) | 30% / 28% | tensor 30-48%, SFU 34-48% | 2.0x |
+| fused LayerNorm + GEMM kernels (triIn, gridIn, transition, triangleOut, gridOut, outLn) | 57% / 29% | tensor 14-51%, DRAM 13-79% | 1.3-1.4x |
+| the PTX GEMMs (now cuBLASLt on an A100) | - / 34% | tensor 51-55% | 1.5x |
+| cuBLASLt / CUTLASS | 13% / 9% | tensor 59-78% | 1.1-1.2x |
+
+The custom kernels are not throughput-bound: they issue in 21-50% of cycles, the leading stall is `wait` (a
+fixed-latency dependency, MMA on MMA) with 2.5-3.9 warps a scheduler to hide it. That is a scheduling and
+register-allocation limit, which is ptxas's and not the PTX's: inline PTX fixes instruction selection and, as
+`asm volatile`, the order ptxas is handed, but ptxas still allocates and schedules. The attention's bound counts
+one unit at a time, and its tensor, SFU, FMA and ALU work share the issue slots, so its 2.0x is generous.
+
+So, on an A100: hand PTX bought 0-4% over four rounds, and its GEMM lost to cuBLASLt. The remaining 1.5x is spread
+over a dozen latency-bound kernels at a third to a half of their busiest unit. Going further means control of SASS
+(an unofficial assembler, one binary per architecture) aimed at those kernels, worth at most ~13% of a 522-residue
+fold for the attention alone.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
