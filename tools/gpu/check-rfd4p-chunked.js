@@ -11,14 +11,27 @@
  * norms without transposing, projects into a per-chunk `proj` and scatters that into aT/bT
  * through a `tri-gate-*` map. None of them had a reference.
  *
- * 🔴 AND IT HAS FOUND THREE REAL FAULTS, each invisible to every other gate here:
+ * 🔴 AND IT HAS FOUND FIVE REAL FAULTS, each invisible to every other gate here:
  *   1. a chunk starting off a four-row boundary (`transposeLnOut` reads `x` four pair rows
  *      a word): relRMS ~1.0 on the pair track, and the default R was 4-aligned by luck;
  *   2. the recycle's own norm reading an f16 pair track as f32 - `inF16` missing where
  *      `outF16` was given, which was RIGHT until f16 stopped implying one chunk;
  *   3. the chunked triangle contracting over k = n rather than the 16-padded nPad the
- *      subgroup-matrix GEMM wants, which the single-chunk arm has always padded for.
+ *      subgroup-matrix GEMM wants, which the single-chunk arm has always padded for;
+ *   4. the stock GEMMs declaring elementwise B as `array<f32>` while it holds halves, so
+ *      the incoming triangle - which reads `bT` by stride - read f16 bytes as floats:
+ *      relRMS 0.43 on the alpha carbons and 1.02 on the latents;
+ *   5. `inNorm: 'ln'` DROPPED IN SILENCE when the selected kernel cannot fuse it, which a
+ *      ragged tail chunk provokes by sending the pair transition's `l1Fused` linear to the
+ *      stock small kernel.
  * Each produced a plausible structure rather than an error.
+ *
+ * 🔴 AND (4) AND (5) ONLY APPEAR UNDER `LOCALFOLD_STOCK_FLAGS=1`, WHICH IS WHAT A VISITOR
+ * RUNS. Both live in `gemmSource`/`gemmSmallSource`; the subgroup-matrix kernel handles
+ * either case, so on the developer flags this machine measures under, both arms passed and
+ * three commits of measurement here never saw them. They were found on an Apple M2 by the
+ * agent reviewing the upstream PR, by running THIS gate with the flag. Run both flag sets,
+ * and quote which one a number came from.
  *
  * 🔴 AND THE TELL THAT SEPARATED (2) FROM AN ACCUMULATION was that its residual was
  * IDENTICAL for two equal chunks and for four ragged ones, to four decimal places. An
@@ -34,14 +47,25 @@
  * - the GEMM is global either way - and measured it is EXACTLY ZERO where the chunks
  * divide evenly, so the f32 arm is a bit-for-bit comparison and not an approximate one.
  *
- * 🔴 THE f16 ARM IS NOT, AND THE RESIDUAL IS STATED RATHER THAN EXPLAINED AWAY: the two
- * f16 arms agree to 2.0e-3 on the alpha carbons and 4.4e-3 on the latents, where their f32
- * counterparts are bit-identical. It is flat in the chunk count and it survives
- * `--recycles=1`, so it is neither an accumulation nor the recycle seam - the two
- * formulations round at different points somewhere in the pass, and WHERE is not yet
- * identified. It is inside the f16 band, and at these lengths the alternative is the f32
- * chunked arm, which differs from f16 by far more; but a clean account of those 2e-3 is
- * missing and this comment is not a substitute for one.
+ * 🔴 THE f16 ARM IS NOT, AND THE RESIDUAL IS STATED RATHER THAN EXPLAINED AWAY. Measured at
+ * n = 200 on an M5, every plan the default sweep runs:
+ *
+ *   stock flags       1.33e-4 even, 1.67e-4 with a 4-row tail, 2.87e-4 with a 64-row tail
+ *   developer flags   6.59e-4, the SAME to three figures on all four plans
+ *
+ * where the f32 arm is 1.9e-7 to 5.1e-7 throughout. An M2 reads 1.5e-4 / 2.6e-4 / 2.9e-4
+ * and 6.9e-4 on the same arms, so neither column is this machine's.
+ *
+ * 🔴 AND THE SPLIT BETWEEN THE TWO COLUMNS IS THE CLUE, which is why they are both here:
+ * the subgroup-matrix path disagrees 4x WORSE than the stock one and is perfectly flat in
+ * both the chunk count and the tail, while the stock path varies with the tail. A residual
+ * that does not move with the slicing is not the slicing: most of this belongs to the
+ * submat kernels' own selection - the incoming GEMM falls off `vecIO`, where the
+ * single-chunk arm takes the fused `triProjG` - and not to chunking at all. That is a much
+ * narrower search than "the two formulations round at different points somewhere", which
+ * is what this comment said while only the developer column existed. It survives
+ * `--recycles=1`, so it is not the recycle seam either. Still unaccounted for; this
+ * comment is not a substitute for an account, but it now says where to look.
  *
  * 🔴 IT COMPARES THE TRUNK'S OUTPUT, NOT A TRAJECTORY, so it is seconds and not a
  * generation: one `forward` an arm at one set of features. `check-rfd4p-length.js` is the
@@ -105,6 +129,20 @@ function decodeHalves(words) {
   return out;
 }
 
+/**
+ * An R whose LAST chunk is about `tail` pair rows, four-aligned, in three chunks and a bit.
+ *
+ * 🔴 ASKED FOR IN ROWS RATHER THAN A CHUNK COUNT, because a count says nothing about the tail:
+ * a count that divides `nn` leaves none at all, and which counts divide is a property of the
+ * length. Three full chunks is enough to be a chunked run and cheap enough to be a default.
+ * `chunkPlan` rounds R down to a multiple of four, so the tail that comes back is this one
+ * plus whatever that rounding adds - the caller reads `tailRows` off the row rather than
+ * trusting this, and `plan.tail` makes an even result a refusal.
+ */
+function tailRows(nn, tail) {
+  return Math.max(4, Math.floor((nn - tail) / 12) * 4);
+}
+
 /** The features one `forward` needs, built once and shared by every arm. */
 function buildFeatures(batch, n, config, weights) {
   const rng = seededRng(42);
@@ -137,8 +175,16 @@ export async function main(device, args = []) {
   const arms = (opt.arms ?? 'f32,f16').split(',');
   // How many chunks to force, as a divisor of the pair rows.
   const chunkCounts = (opt.chunks ?? '2,3,5').split(',').map(Number);
-  // When set, every entry of `--chunks` uses this R instead of deriving one from a count.
+  // When set, this R is used directly and the `--chunks`/`--tails` list is not swept.
   const explicitRows = opt.rows === undefined ? null : Number(opt.rows);
+  // 🔴 AND A SHORT TAIL IS IN THE DEFAULT SWEEP NOW, BECAUSE AN EVEN SPLIT CANNOT REACH THE
+  // STOCK SMALL KERNEL. A full chunk is thousands of pair rows and that kernel is chosen
+  // below ~640, so the ONLY way a chunked run sends a GEMM there is a ragged last chunk.
+  // That is exactly where the silently dropped `inNorm: 'ln'` lived: on stock Chrome every
+  // even split passed and every ragged one failed, whatever the tail length - and the old
+  // default `--chunks=2,3,5` happened to give one 4-row tail, which is short enough that
+  // nothing downstream of it mattered. A tail of 33-640 rows is the case with teeth.
+  const tails = (opt.tails ?? '64').split(',').map(Number).filter((t) => t > 0);
   // 🔴 RECYCLES, BECAUSE THE SECOND CYCLE TAKES A DIFFERENT ROUTE IN EACH ARM. With one
   // chunk the last layer FUSES the next cycle's norm (`outZc`, `zCycNormScaled`); sliced,
   // `recycleIn` does it separately with `zCycNorm`. The two are equivalent and round
@@ -212,20 +258,36 @@ export async function main(device, args = []) {
     }
   }
 
+  // 🔴 `--rows=` IS ONE PLAN, NOT ONE PER `--chunks=` ENTRY. It used to be swept inside that
+  // loop, so naming R ran the identical plan once per chunk count and printed the same row
+  // three times - three identical numbers read as three agreeing cases.
+  const plans = explicitRows !== null
+    ? [{ rows: explicitRows, asked: `R=${explicitRows}`, tail: 0 }]
+    : [
+        ...chunkCounts.map((want) => ({ rows: Math.max(1, Math.ceil(nn / want)), asked: `${want} chunks`, tail: 0 })),
+        ...tails.map((tail) => ({ rows: tailRows(nn, tail), asked: `~${tail}-row tail`, tail })),
+      ];
+
   const rows = [];
   let failures = 0;
   for (const arm of arms) {
     const half = arm === 'f16';
     const ref = await run(half, undefined);
     if (ref.chunks !== 1) throw new Error(`the ${arm} reference is ${ref.chunks} chunks at n=${n} - raise the bound or lower n`);
-    for (const want of chunkCounts) {
+    for (const plan of plans) {
       // 🔴 `--rows=` SETS R DIRECTLY, because `--chunks=` CONFOUNDS TWO HYPOTHESES. Every
       // chunk count that divides nn evenly also happened to give an 8-aligned R here, so
       // "the tail is short" and "R is not a multiple of the workgroup's row count" fit the
       // same six measurements. Naming R separates them: ask for one that is 8-aligned and
       // still ragged, and one that divides nn and is not.
-      const rowsWanted = explicitRows ?? Math.max(1, Math.ceil(nn / want));
-      const got = await run(half, boundForRows(nn, half, rowsWanted));
+      const got = await run(half, boundForRows(nn, half, plan.rows));
+      // 🔴 AND A TAIL CASE THAT CAME BACK EVEN IS AN INERT CASE, which is this file's own
+      // recurring complaint one more time: a plan asked for a short last chunk and got a
+      // clean division tests the arm the even splits already test, while still printing a
+      // green row. Refuse rather than report it.
+      if (plan.tail && !(nn % got.chunkRows > 0)) {
+        throw new Error(`the ~${plan.tail}-row tail case divided evenly at R=${got.chunkRows} (n=${n}) - it tests nothing the even splits do not`);
+      }
       // 🔴 A ROW IS ONLY A SLICING COMPARISON WHEN BOTH ARMS HOLD THE SAME ARITHMETIC, and
       // in the f16 arm today they do not: the single-chunk reference narrows the pair track
       // (`triF16`) and the chunked arm cannot, so comparing them measures f16-against-f32
@@ -236,7 +298,7 @@ export async function main(device, args = []) {
       if (got.triF16 !== ref.triF16) {
         rows.push({
           arm,
-          wantChunks: want,
+          asked: plan.asked,
           chunks: got.chunks,
           chunkRows: got.chunkRows,
           comparable: false,
@@ -282,7 +344,7 @@ export async function main(device, args = []) {
       if (!ok) failures += 1;
       rows.push({
         arm,
-        wantChunks: want,
+        asked: plan.asked,
         chunks: got.chunks,
         chunkRows: got.chunkRows,
         // 🔴 WHETHER THE LAST CHUNK IS SHORT, which is the discriminator this found: an

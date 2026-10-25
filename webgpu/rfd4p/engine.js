@@ -2671,6 +2671,15 @@ export class Rfd4pEngine {
     const aF16 = this.hasF16 && spec.aF16 === true;
     const cF16 = this.hasF16 && spec.cF16 === true;
     const gF16 = this.hasF16 && hasGate && spec.gate?.f16 === true;
+    // 🔴 THESE THREE TYPE THE BUFFER, NOT THE STAGING TILE, so dropping one on a device without
+    // f16 is not a graceful degrade: the caller has already packed halves and the kernel would
+    // declare `array<f32>` and read them as floats - which is bug (1) above, one operand along.
+    // `b16` is different and needs no guard, because it chooses the TILE's precision and both
+    // choices compute the same thing. Every caller gates on `e.hasF16` already (trunk.js asks
+    // `wantF16: this.half && e.hasF16`); this is what says so if one stops.
+    if (!this.hasF16 && (spec.aF16 === true || spec.cF16 === true || spec.gate?.f16 === true)) {
+      throw new Error(`gemm ${m}x${n}x${k}: f16 operands asked of a device without shader-f16`);
+    }
     const wordB = half || (aF16 && B.k === 1 && B.n % 2 === 0 && B.off % 2 === 0 && B.s0 % 2 === 0 && B.s1 % 2 === 0);
     const vecBStock = wordB &&
       B.k === 1 && B.n % 8 === 0 && B.off % 8 === 0 && B.s0 % 8 === 0 && B.s1 % 8 === 0 &&
@@ -2703,6 +2712,12 @@ export class Rfd4pEngine {
       B.k === 1 && B.off % 4 === 0 && B.s0 % 4 === 0 && B.s1 % 4 === 0 && B.n % 4 === 0;
     if (useGemv) {
       const inNorm = spec.inNorm ?? '';
+      // 🔴 AND THIS RETURNS BEFORE THE `inLn` CHECK BELOW, so the gemv path needs its own: the
+      // two kernel families implement DISJOINT `inNorm` sets, and a norm the selected one does
+      // not know was dropped in silence. `gemvSource` does `rmsCond`, `lnCond` and `rmsPre`.
+      if (inNorm && !['rmsCond', 'lnCond', 'rmsPre'].includes(inNorm)) {
+        throw new Error(`gemm ${m}x${n}x${k}: inNorm '${inNorm}' is not implemented by the gemv kernel this shape selects`);
+      }
       const gemvGroups = Math.ceil(n / 16) * B0 * B1;
       const gemvKey = `gemv-m${m}-k${k}${inNorm ? `-${inNorm}` : ''}${hasAlpha ? '-al' : ''}${hasBias ? '-b' : ''}${actType ? `-act${actType}` : ''}${acc ? '-ac' : ''}${hasGate ? (addOnly ? '-ga' : (gSigm ? '-gs' : '-gm')) : ''}`;
       const gemvSrc = gemvSource(m, k / 128, hasGate, addOnly, gSigm, hasAlpha, hasBias, actType, acc === 1, inNorm);
@@ -2711,6 +2726,14 @@ export class Rfd4pEngine {
         spec.label ?? `gemm ${m}x${n}x${k}${B0 * B1 > 1 ? `[${B0 * B1}]` : ''}`);
     }
     const inLn = (submat ? (vecIO && (vecEpilogue || Boolean(spec.pair))) : (fullK && vecEpilogue && !small)) && spec.inNorm === 'ln';
+    // 🔴 AND THE OTHER DIRECTION OF THE SAME HOLE: `gemmSource` and `gemmSubmatSource` implement
+    // `'ln'` AND NOTHING ELSE, so `rmsPre` - the only other value any caller asks for - would be
+    // dropped in silence by whichever of them a shape selects. It reaches the gemv kernel today
+    // only because `useGemv` wants `k % 128 == 0` and this checkpoint's conditioning width is
+    // 256; a width of 192 would decline the gemv, take this path, and quietly stop normalising.
+    if (spec.inNorm && spec.inNorm !== 'ln') {
+      throw new Error(`gemm ${m}x${n}x${k}: inNorm '${spec.inNorm}' is implemented only by the gemv kernel, which this shape does not select`);
+    }
     if (spec.inNorm === 'ln' && !inLn) throw new Error(`gemm ${m}x${n}x${k}: inNorm 'ln' is not supported by the kernel this shape selects`);
     const vKey = !submat && !small && this.gemmVariant ? `-v${JSON.stringify(this.gemmVariant)}` : '';
     const key = `${small ? 'gemm-s' : 'gemm'}${submat ? `-sm${this.submat8 ? '8' : ''}${half ? '-h' : '-f'}${aF16 ? '-a16' : ''}${cF16 ? '-c16' : ''}${vecIO ? '-v' : (vecB ? '-vb' : '')}${vecEpilogue ? '-ve' : ''}${inLn ? '-ln' : ''}${hasAlpha ? '-al' : ''}${hasBias ? '-b' : ''}${actType ? `-act${actType}` : ''}${acc ? '-ac' : ''}${hasGate && addOnly ? '-ga' : (hasGate && !gSigm ? '-gns' : '')}` : `${wordB ? '-h' : ''}${b16 ? '-b16' : ''}${aF16 ? '-a16' : ''}${cF16 ? '-c16' : ''}${fullK ? '-fk' : ''}${vecAStock ? '-va' : ''}${vecBStock ? '-vb' : ''}${vecEpilogue ? '-ve' : ''}${inLn ? '-ln' : ''}${hasAlpha ? '-al' : ''}${hasBias ? '-b' : ''}${actType ? `-act${actType}` : ''}${acc ? '-ac' : ''}${hasGate && addOnly ? '-ga' : (hasGate && !gSigm ? '-gns' : '')}${vKey}`}${spec.pair ? `-p-${spec.pair.key}` : ''}${hasGate ? `-g${gF16 ? '16' : ''}` : ''}`;
