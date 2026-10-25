@@ -103,28 +103,46 @@ struct CondPack {
   float* at(int layer, int slot) const { return buf + ((size_t)layer * 6 + slot) * n * D; }
 };
 
-inline void buildCondPack(const float* c, const Dims& d, const char* slot, CondPack& pack) {
+template <class TC>
+inline void buildCondPackT(const float* c, const Dims& d, const char* slot, CondPack& pack) {
   const size_t n = d.n;
   const int D = d.D, C = d.C;
   pack.n = n;
   pack.D = D;
   pack.buf = scratch<float>(slot, (size_t)d.nlayers * 6 * n * D);
-  float* normedC = scratch<float>("rfd4p.cp.nc", n * C);
+  TC* normedC = scratch<TC>("rfd4p.cp.nc", n * C);
+  // The output scales read `c` itself rather than a normed copy, so it is narrowed once here.
+  const TC* cIn;
+  if constexpr (std::is_same_v<TC, float>) {
+    cIn = c;
+  } else {
+    TC* ch = scratch<TC>("rfd4p.cp.c", n * C);
+    narrowK<TC><<<blocks(n * C), 256, 0, STREAM>>>(c, ch, n * C);
+    cIn = ch;
+  }
   for (int i = 0; i < d.nlayers; ++i) {
     const std::string L = "nn.transformer_layers." + std::to_string(i);
     const char* adalns[2] = {".mhba.adaln", ".transition.adaln"};
     for (int k = 0; k < 2; ++k) {
       const std::string pre = L + adalns[k];
-      rmsNorm(c, normedC, n, C, W(wn(pre + ".norm_cond.weight")));
-      linear<float, float>(normedC, pack.at(i, 2 * k), n, C, D, wn(pre + ".to_gamma.0.weight"), true);
-      linear<float, float>(normedC, pack.at(i, 2 * k + 1), n, C, D, wn(pre + ".to_beta.weight"), true);
+      rmsNorm<TC>(c, normedC, n, C, W(wn(pre + ".norm_cond.weight")));
+      linear<TC, float>(normedC, pack.at(i, 2 * k), n, C, D, wn(pre + ".to_gamma.0.weight"), true);
+      linear<TC, float>(normedC, pack.at(i, 2 * k + 1), n, C, D, wn(pre + ".to_beta.weight"), true);
     }
     const char* scales[2] = {".mhba.scale_output", ".transition.scale_output"};
     for (int k = 0; k < 2; ++k) {
-      linear<float, float>(c, pack.at(i, 4 + k), n, C, D,
-                           wn(L + scales[k] + ".to_adaln_zero_gamma.0.weight"), true);
+      linear<TC, float>(cIn, pack.at(i, 4 + k), n, C, D,
+                        wn(L + scales[k] + ".to_adaln_zero_gamma.0.weight"), true);
     }
   }
+}
+
+// 🔴 SIX PROJECTIONS A LAYER, REBUILT EVERY STEP - 84 a forward and 5,040 a generation, which is
+// why they are worth narrowing even though each is only [n, 256] x [256, 768]. The gammas and betas
+// stay f32: they are read by `adaLnApplyK` and by the residual's gate, and they are small.
+inline void buildCondPack(const float* c, const Dims& d, const char* slot, CondPack& pack) {
+  if (F32_TF32) buildCondPackT<half>(c, d, slot, pack);
+  else buildCondPackT<float>(c, d, slot, pack);
 }
 
 // adaLN with its gamma and beta already projected.
