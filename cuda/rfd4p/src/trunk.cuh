@@ -306,8 +306,7 @@ inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing
     linear<TP, TP>(zNorm, gate, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
     mulSigmoidAddGate<TP, TZ>(xProj, gate, pairMask, z, rows, cZ);
   } else {
-    mulSigmoidAddPlaneGateK<TP, TZ><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask,
-                                                                           z, rows, cZ);
+    mulSigmoidAddPlaneGate<TP, TZ>(xProj, gPlanes, pairMask, z, rows, cZ);
   }
 }
 
@@ -367,8 +366,31 @@ __global__ void hadamardWrite4K(const float4* __restrict__ pij, const float* __r
   zz.x += pi.x * pj.x; zz.y += pi.y * pj.y; zz.z += pi.z * pj.z; zz.w += pi.w * pj.w;
   z[i] = zz;
 }
+__global__ void hadamardWrite4HK(const float4* __restrict__ pij, const float* __restrict__ pairMask,
+                                 __half2* __restrict__ z, int n, int P4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)n * n * P4) return;
+  const size_t pair = i / P4;
+  const int c = (int)(i - pair * P4);
+  if (pairMask && pairMask[pair] == 0.f) return;
+  const int row = (int)(pair / n), col = (int)(pair % n);
+  const float4 pi = pij[(size_t)col * 2 * P4 + c];
+  const float4 pj = pij[(size_t)row * 2 * P4 + P4 + c];
+  float2 lo = __half22float2(z[2 * i]), hi = __half22float2(z[2 * i + 1]);
+  lo.x += pi.x * pj.x; lo.y += pi.y * pj.y; hi.x += pi.z * pj.z; hi.y += pi.w * pj.w;
+  z[2 * i] = __floats2half2_rn(lo.x, lo.y);
+  z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
+}
+
 template <class TZ>
 inline void hadamardWrite(const float* pij, const float* pairMask, TZ* z, int n, int P) {
+  if constexpr (std::is_same_v<TZ, half>) {
+    if ((P & 3) == 0 && ((uintptr_t)pij & 15) == 0 && ((uintptr_t)z & 7) == 0) {
+      hadamardWrite4HK<<<blocks((size_t)n * n * (P >> 2)), 256, 0, STREAM>>>(
+          (const float4*)pij, pairMask, (__half2*)z, n, P >> 2);
+      return;
+    }
+  }
   if constexpr (std::is_same_v<TZ, float>) {
     if ((P & 3) == 0 && ((((uintptr_t)pij | (uintptr_t)z) & 15) == 0)) {
       hadamardWrite4K<<<blocks((size_t)n * n * (P >> 2)), 256, 0, STREAM>>>(

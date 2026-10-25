@@ -430,6 +430,64 @@ __global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __res
   zz.w += aa.w / (1.f + __expf(-g[3]));
   z[i] = zz;
 }
+// The same for the gated add. The gate stays a strided read - that is the layout the fused
+// projection produces and the short form keeps - but x, z and the sigmoid go four at a time.
+template <class T>
+__global__ void mulSigmoidAddPlaneGate4HK(const float4* __restrict__ a, const T* __restrict__ gPlanes,
+                                          const float* __restrict__ pairMask,
+                                          __half2* __restrict__ z, size_t rows, int C4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C4) return;
+  const size_t p = i / C4;
+  if (pairMask && pairMask[p] == 0.f) return;
+  const int c0 = (int)(i - p * C4) * 4;
+  const float4 aa = a[i];
+  float g[4];
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) g[k] = (float)gPlanes[(size_t)(c0 + k) * rows + p];
+  float2 lo = __half22float2(z[2 * i]), hi = __half22float2(z[2 * i + 1]);
+  lo.x += aa.x / (1.f + __expf(-g[0]));
+  lo.y += aa.y / (1.f + __expf(-g[1]));
+  hi.x += aa.z / (1.f + __expf(-g[2]));
+  hi.y += aa.w / (1.f + __expf(-g[3]));
+  z[2 * i] = __floats2half2_rn(lo.x, lo.y);
+  z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
+}
+
+template <class T>
+__global__ void mulSigmoidAddGate4HK(const float4* __restrict__ a, const T* __restrict__ gate,
+                                     const float* __restrict__ pairMask, __half2* __restrict__ z,
+                                     size_t rows, int C4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C4) return;
+  if (pairMask && pairMask[i / C4] == 0.f) return;
+  const float4 aa = a[i];
+  float g[4];
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) g[k] = (float)gate[4 * i + k];
+  float2 lo = __half22float2(z[2 * i]), hi = __half22float2(z[2 * i + 1]);
+  lo.x += aa.x / (1.f + __expf(-g[0]));
+  lo.y += aa.y / (1.f + __expf(-g[1]));
+  hi.x += aa.z / (1.f + __expf(-g[2]));
+  hi.y += aa.w / (1.f + __expf(-g[3]));
+  z[2 * i] = __floats2half2_rn(lo.x, lo.y);
+  z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
+}
+
+template <class T, class TZ>
+inline void mulSigmoidAddPlaneGate(const float* a, const T* gPlanes, const float* pairMask, TZ* z,
+                                   size_t rows, int C) {
+  if constexpr (std::is_same_v<TZ, half>) {
+    if ((C & 3) == 0 && ((uintptr_t)a & 15) == 0 && ((uintptr_t)z & 7) == 0) {
+      mulSigmoidAddPlaneGate4HK<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+          (const float4*)a, gPlanes, pairMask, (__half2*)z, rows, C >> 2);
+      return;
+    }
+  }
+  mulSigmoidAddPlaneGateK<T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gPlanes, pairMask,
+                                                                               z, rows, C);
+}
+
 template <class T, class TZ>
 inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMask, TZ* z,
                               size_t rows, int C) {
@@ -437,6 +495,14 @@ inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMa
     if ((C & 3) == 0 && ((((uintptr_t)a | (uintptr_t)z) & 15) == 0)) {
       mulSigmoidAddGate4K<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
           (const float4*)a, gate, pairMask, (float4*)z, rows, C >> 2);
+      return;
+    }
+  }
+  if constexpr (std::is_same_v<TZ, half>) {
+    // The dense-gate form of the kernel above: the gate is row-major here, so it reads four in a row.
+    if ((C & 3) == 0 && ((uintptr_t)a & 15) == 0 && ((uintptr_t)z & 7) == 0) {
+      mulSigmoidAddGate4HK<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+          (const float4*)a, gate, pairMask, (__half2*)z, rows, C >> 2);
       return;
     }
   }
@@ -502,9 +568,33 @@ __global__ void biasAdd4K(const float4* __restrict__ x, const float* __restrict_
   zz.x += xx.x + bb.x; zz.y += xx.y + bb.y; zz.z += xx.z + bb.z; zz.w += xx.w + bb.w;
   z[i] = zz;
 }
+// 🔴 A half z COST THE VECTORISED PATHS THAT A float z HAD, which is most of why narrowing the
+// pair tensor paid 2-3% instead of the 8% its byte count promised: `biasAdd`, the hadamard write
+// and the gated add all fell back to one element a thread. Four halves is one 8-byte access, the
+// same shape as the float4 path beside it.
+__global__ void biasAdd4HK(const float4* __restrict__ x, const float* __restrict__ bias,
+                           const float* __restrict__ pairMask, __half2* __restrict__ z, size_t rows,
+                           int C4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C4) return;
+  if (pairMask && pairMask[i / C4] == 0.f) return;
+  const float4 bb = ((const float4*)bias)[i % C4], xx = x[i];
+  float2 lo = __half22float2(z[2 * i]), hi = __half22float2(z[2 * i + 1]);
+  lo.x += xx.x + bb.x; lo.y += xx.y + bb.y; hi.x += xx.z + bb.z; hi.y += xx.w + bb.w;
+  z[2 * i] = __floats2half2_rn(lo.x, lo.y);
+  z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
+}
+
 template <class TZ>
 inline void biasAdd(const float* x, const float* bias, const float* pairMask, TZ* z, size_t rows,
                     int C) {
+  if constexpr (std::is_same_v<TZ, half>) {
+    if ((C & 3) == 0 && ((((uintptr_t)x | (uintptr_t)bias) & 15) == 0) && ((uintptr_t)z & 7) == 0) {
+      biasAdd4HK<<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+          (const float4*)x, bias, pairMask, (__half2*)z, rows, C >> 2);
+      return;
+    }
+  }
   if constexpr (std::is_same_v<TZ, float>) {
     if ((C & 3) == 0 && ((((uintptr_t)x | (uintptr_t)z | (uintptr_t)bias) & 15) == 0)) {
       biasAdd4K<<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(

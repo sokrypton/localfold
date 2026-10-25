@@ -52,7 +52,7 @@ assembly, the sampler and the decode are inside it on both:
 | PyTorch compiled, first design | 10.91 s | about half of it is `torch.compile` |
 | **PyTorch compiled, warm** | **5.34 s** | the second design of a two-replicate run |
 | cuda/rfd4p, exact f32 | 4.80 s | |
-| **cuda/rfd4p, `--fast`** | **1.58 s** | **3.4x the warm compiled run** |
+| **cuda/rfd4p, `--fast`** | **1.50 s** | **3.6x the warm compiled run** |
 
 🔴 **3.4x IS THE NUMBER, AND THE OTHER THREE ROWS ARE WHY IT TOOK FOUR RUNS TO GET.** Against the
 preset upstream ships for first runs it is 10.1x, and that preset says in its own header that it
@@ -80,7 +80,7 @@ input and their own 6 cycles, not something built here:
 | PyTorch compiled | 158.7 | | | f32 |
 | **PyTorch compiled, its own default precision** | **65.3** | 8.2 | **57.1** | bf16 matmuls |
 | cuda/rfd4p, exact | 156.0 | — | 156.0 | f32 |
-| **cuda/rfd4p, `--fast`** | **46.6** | — | **46.6** | TF32 + f16 |
+| **cuda/rfd4p, `--fast`** | **43.9** | — | **43.9** | TF32 + f16 |
 
 🔴 **AND THEIR FORWARD BUILDS ITS OWN FEATURES WHERE THIS ONE IS HANDED THEM** - 8.2 ms of their
 65.3, measured by wrapping `cond_factory`, `init_repr_factory` and `pair_repr_builder`. In the
@@ -128,6 +128,7 @@ four oracle arms.
 | the long form's gate projected row-major instead of transposed | **442.6 at n=400**, 47.5 unchanged at n=100 | a second GEMM beats a transpose once the tensor is big |
 | the pair-bias kernel's loads vectorised | 47.3 / 440.4 | four channels a lane, not one |
 | the pair tensor itself in half | **46.6 at n=100, 431.5 at n=400** | 2-3%, and it halves the biggest tensor |
+| the half pair tensor's kernels vectorised too | **43.9 at n=100, 401.2 at n=400** | narrowing z had silently dropped them to one element a thread |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.
