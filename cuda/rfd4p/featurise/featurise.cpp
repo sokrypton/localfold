@@ -1015,7 +1015,18 @@ int run(int argc, char** argv) {
         // draws from the pipeline's single stream, so handing it its own generator would agree
         // with the reference only where neither stage draws anything.
         rfd4p::atoms::materializeInternalCoords(arr, prng);
+        rfd4p::atoms::unindexFlaggedTokens(arr);
         printf("atomized\t%zu\n", arr.n());
+        for (size_t i = 0; i < arr.n(); ++i) {
+          printf("azun\t%d\t%d\t%s\n", arr.insertionSourceIdx[i], (int)arr.isUnindexedSource[i],
+                 arr.ids.chainIid[i].c_str());
+        }
+        {
+          const vector<int>& g = arr.ann.ints["condition_index-group_1_token"];
+          printf("azgrp");
+          for (int v : g) printf("\t%d", v);
+          printf("\n");
+        }
         {
           const vector<int>& g = arr.ann.ints["condition_CoordinateGroup_1_atom"];
           const vector<double>& ic = arr.ann.floats["condition_InternalCoordinate_1_atom"];

@@ -23,6 +23,7 @@ import {
   finalizeAndCanonicalizeSequenceConditioning,
   featurizeExpandedSegments,
   materializeInternalCoords,
+  unindexFlaggedTokens,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -104,6 +105,104 @@ function withCoordinateGroups(text, count = 12) {
     seen += 1;
   }
   if (existing < 0) lines.splice(end, 0, "_atom_site.condition_CoordinateGroup_1_atom ");
+  return lines.join("\n");
+}
+
+/**
+ * The same structure with an INTERIOR run of residues marked unindexed, and every atom put in
+ * index group 0.
+ *
+ * 🔴 BECAUSE THE SHIPPED MOTIFS ARE UNINDEXED AT A CHAIN EDGE, which is the branch that
+ * collapses. Three of `unindexFlaggedTokens`' conventions only exist for the other branch and
+ * were all inert on the fourteen cases above: a removed run with ordinary residues on BOTH
+ * sides must leave a hole in `res_id` rather than renumber, the residues it separates must NOT
+ * be re-bonded (nothing collapsed between them), and the index-group shift is zero whenever the
+ * groups were derived rather than supplied - so putting everything in group 0 is what makes the
+ * shift observable.
+ */
+function withInteriorUnindexed(text, fromSeq = 30, toSeq = 40) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const seqAt = cols.indexOf("label_seq_id");
+  const idxAt = cols.indexOf("condition_index_1_residue");
+  const grpAt = cols.indexOf("condition_index-group_1_token");
+  const added = [];
+  if (idxAt < 0) added.push("condition_index_1_residue");
+  if (grpAt < 0) added.push("condition_index-group_1_token");
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length) continue;
+    const seq = Number(tok[seqAt]);
+    const indexed = !(seq >= fromSeq && seq < toSeq);
+    const idxVal = indexed ? "1" : "0";
+    if (idxAt >= 0) tok[idxAt] = idxVal;
+    if (grpAt >= 0) tok[grpAt] = "0";
+    for (const name of added) tok.push(name === "condition_index_1_residue" ? idxVal : "0");
+    lines[i] = tok.join(" ");
+  }
+  lines.splice(end, 0, ...added.map((name) => `_atom_site.${name} `));
+  return lines.join("\n");
+}
+
+/**
+ * The same structure with the `count` residues immediately AFTER its expandable segment marked
+ * unindexed.
+ *
+ * 🔴 BECAUSE THE RE-BOND IS THE ONE CONVENTION AN EDGE OR A PLAIN INTERIOR RUN CANNOT REACH.
+ * `bondFlankingResidues` fires only where residues that are now neighbours had something
+ * COLLAPSE between them - which needs a removed run that is interior (so both flanks survive)
+ * AND adjacent to an expandable segment (so it collapses at all). An edge run has no left
+ * flank; a plain interior run does not collapse. This is the only shape that is both.
+ */
+function withUnindexedBesideExpandable(text, count = 3) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const segAt = cols.indexOf("annotation_expsegmin_1_residue");
+  const idxAt = cols.indexOf("condition_index_1_residue");
+  if (segAt < 0) throw new Error("no expandable-segment column");
+  const key = (t) => `${t[cols.indexOf("label_asym_id")]}|${t[cols.indexOf("label_seq_id")]}`
+    + `|${t[cols.indexOf("label_comp_id")]}`;
+  const rowsAt = [];
+  const resKeys = [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length) continue;
+    const k = key(tok);
+    if (!resKeys.length || resKeys[resKeys.length - 1] !== k) resKeys.push(k);
+    rowsAt.push([i, tok, resKeys.length - 1]);
+  }
+  const expRes = [...new Set(rowsAt.filter(([, t]) => Number(t[segAt]) !== -1).map(([, , r]) => r))];
+  if (!expRes.length) throw new Error("no expandable residue");
+  // Either side of ANY expandable residue will do, but the run must stay INTERIOR - at a chain
+  // edge it would collapse for the boundary reason and prove nothing about adjacency. A
+  // structure whose only expandable residues are its first and last cannot host this case.
+  let from = -1;
+  let to = -1;
+  for (const r of expRes) {
+    for (const [f, t] of [[r + 1, r + 1 + count], [r - count, r]]) {
+      if (f > 0 && t < resKeys.length) { from = f; to = t; break; }
+    }
+    if (from >= 0) break;
+  }
+  if (from < 0) throw new Error("no interior run beside the segment");
+  const added = idxAt < 0;
+  for (const [i, tok, r] of rowsAt) {
+    const value = r >= from && r < to ? "0" : "1";
+    if (added) tok.push(value);
+    else tok[idxAt] = value;
+    lines[i] = tok.join(" ");
+  }
+  if (added) lines.splice(end, 0, "_atom_site.condition_index_1_residue ");
   return lines.join("\n");
 }
 
@@ -273,6 +372,9 @@ cases.set("motif_idx_1prw+masked", withMaskedSequence(cases.get("motif_idx_1prw"
 cases.set("motif_idx_1prw+coordgroups", withCoordinateGroups(cases.get("motif_idx_1prw")));
 cases.set("5o45_cropped+icgroups",
   withInternalCoords(withCoordinateGroups(cases.get("5o45_cropped"))));
+cases.set("ppi_pdl1+interior-unindexed", withInteriorUnindexed(cases.get("ppi_pdl1")));
+cases.set("motif_idx_1prw+beside-expandable",
+  withUnindexedBesideExpandable(cases.get("motif_idx_1prw")));
 
 let structures = 0;
 let differing = 0;
@@ -530,34 +632,37 @@ for (const [name, text] of cases) {
     // pipeline's one stream, so the gate must advance a single `rng` across both stages or it
     // agrees only where neither draws.
     materializeInternalCoords(expanded, { rng });
+    // `unindexFlaggedTokens` COPIES the unindexed motifs to the end and removes the originals,
+    // so it changes the atom count and everything below is held to its result.
+    const unindexed = unindexFlaggedTokens(expanded);
     const out3 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
       { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
     const got = out3.filter((l) => l.startsWith("az\t")).map((l) => l.split("\t").slice(1));
     const gotBonds = out3.filter((l) => l.startsWith("azbond\t"))
       .map((l) => l.split("\t").slice(1).map(Number));
-    if (got.length !== expanded.nAtoms) {
-      wrong.push(`atomized ${got.length} vs ${expanded.nAtoms}`);
+    if (got.length !== unindexed.nAtoms) {
+      wrong.push(`atomized ${got.length} vs ${unindexed.nAtoms}`);
     } else {
       const after = [
-        ["az res_name", 0, (v) => v, expanded.res_name],
-        ["az atom_name", 1, (v) => v, expanded.atom_name],
-        ["az element", 2, (v) => v, expanded.element],
-        ["az res_id", 3, Number, expanded.res_id],
-        ["az atom_id", 4, Number, expanded.atom_id],
-        ["az token_id", 5, Number, expanded.token_id],
-        ["az atomize", 6, Number, expanded.atomize.map((v) => (v ? 1 : 0))],
+        ["az res_name", 0, (v) => v, unindexed.res_name],
+        ["az atom_name", 1, (v) => v, unindexed.atom_name],
+        ["az element", 2, (v) => v, unindexed.element],
+        ["az res_id", 3, Number, unindexed.res_id],
+        ["az atom_id", 4, Number, unindexed.atom_id],
+        ["az token_id", 5, Number, unindexed.token_id],
+        ["az atomize", 6, Number, unindexed.atomize.map((v) => (v ? 1 : 0))],
         ["az is_covalent_modification", 7, Number,
-          expanded.is_covalent_modification.map((v) => (v ? 1 : 0))],
+          unindexed.is_covalent_modification.map((v) => (v ? 1 : 0))],
       ];
       for (const [label, at, cast, want] of after) {
         if (!want) continue;
         const bad = got.filter((r, i) => !eq(cast(r[at]), want[i])).length;
         if (bad) wrong.push(`${label} ${bad}`);
       }
-      if (gotBonds.length !== expanded.bonds.length) wrong.push("az bonds length");
+      if (gotBonds.length !== unindexed.bonds.length) wrong.push("az bonds length");
       else {
-        const bad = gotBonds.filter((b, i) => b[0] !== expanded.bonds[i][0]
-          || b[1] !== expanded.bonds[i][1] || b[2] !== expanded.bonds[i][2]).length;
+        const bad = gotBonds.filter((b, i) => b[0] !== unindexed.bonds[i][0]
+          || b[1] !== unindexed.bonds[i][1] || b[2] !== unindexed.bonds[i][2]).length;
         if (bad) wrong.push(`az bonds ${bad}`);
       }
 
@@ -568,19 +673,19 @@ for (const [name, text] of cases) {
       // coordinates are compared here and not only at the realise stage.
       const xyz = out3.filter((l) => l.startsWith("azxyz\t"))
         .map((l) => l.split("\t").slice(1).map(Number));
-      if (xyz.length !== expanded.nAtoms) wrong.push(`az xyz ${xyz.length}`);
+      if (xyz.length !== unindexed.nAtoms) wrong.push(`az xyz ${xyz.length}`);
       else {
-        const bad = xyz.filter((c, i) => !eq(c[0], expanded.coord[i][0])
-          || !eq(c[1], expanded.coord[i][1]) || !eq(c[2], expanded.coord[i][2])).length;
+        const bad = xyz.filter((c, i) => !eq(c[0], unindexed.coord[i][0])
+          || !eq(c[1], unindexed.coord[i][1]) || !eq(c[2], unindexed.coord[i][2])).length;
         if (bad) wrong.push(`az xyz ${bad}`);
       }
       // `materializeInternalCoords`: the group column it creates where there is none, and the
       // internal coordinates it fills - which is where the pipeline's RNG is next consumed.
       const ic = out3.filter((l) => l.startsWith("azic\t"))
         .map((l) => l.split("\t").slice(1).map(Number));
-      const wantGroup = expanded.annotations["condition_CoordinateGroup_1_atom"];
-      const wantIc = expanded.annotations["condition_InternalCoordinate_1_atom"];
-      if (ic.length !== expanded.nAtoms) wrong.push(`az ic ${ic.length}`);
+      const wantGroup = unindexed.annotations["condition_CoordinateGroup_1_atom"];
+      const wantIc = unindexed.annotations["condition_InternalCoordinate_1_atom"];
+      if (ic.length !== unindexed.nAtoms) wrong.push(`az ic ${ic.length}`);
       else {
         const badG = ic.filter((r, i) => r[0] !== wantGroup[i]).length;
         if (badG) wrong.push(`az coord-group ${badG}`);
@@ -588,8 +693,31 @@ for (const [name, text] of cases) {
           || !eq(r[3], wantIc[i][2])).length;
         if (badI) wrong.push(`az internal-coord ${badI}`);
       }
+      // `unindexFlaggedTokens`: the copy's provenance, and the index groups it shifts so the
+      // unindexed ones sit past every indexed one.
+      const un = out3.filter((l) => l.startsWith("azun\t")).map((l) => l.split("\t").slice(1));
+      if (un.length !== unindexed.nAtoms) wrong.push(`az unindexed ${un.length}`);
+      else {
+        const badS = un.filter((r, i) => Number(r[0]) !== unindexed.insertion_source_idx[i]).length;
+        if (badS) wrong.push(`az insertion-source ${badS}`);
+        const badU = un.filter((r, i) =>
+          Number(r[1]) !== (unindexed.is_unindexed_source[i] ? 1 : 0)).length;
+        if (badU) wrong.push(`az unindexed-source ${badU}`);
+        const badC = un.filter((r, i) => r[2] !== unindexed.chain_iid[i]).length;
+        if (badC) wrong.push(`az chain_iid ${badC}`);
+      }
+      const grpLine = out3.find((l) => l.startsWith("azgrp"));
+      const gotGrp = grpLine ? grpLine.split("\t").slice(1).map(Number) : [];
+      const wantGrp = unindexed.annotations["condition_index-group_1_token"];
+      if (wantGrp) {
+        if (gotGrp.length !== wantGrp.length) wrong.push(`az index-group ${gotGrp.length}`);
+        else {
+          const bad = gotGrp.filter((v, i) => v !== wantGrp[i]).length;
+          if (bad) wrong.push(`az index-group ${bad}`);
+        }
+      }
       const seq = out3.filter((l) => l.startsWith("azseq\t")).map((l) => l.split("\t")[1]);
-      const wantSeq = expanded.annotations["condition_sequence_1_residue"];
+      const wantSeq = unindexed.annotations["condition_sequence_1_residue"];
       if (seq.length !== wantSeq.length) wrong.push(`az sequence ${seq.length} vs ${wantSeq.length}`);
       else {
         const bad = seq.filter((v, i) => v !== wantSeq[i]).length;
@@ -599,7 +727,7 @@ for (const [name, text] of cases) {
         const f = l.split("\t");
         return [f[1], f.slice(2).map(Number)];
       }));
-      const wantProb = new Map(Object.entries(expanded.annotations)
+      const wantProb = new Map(Object.entries(unindexed.annotations)
         .filter(([k]) => k.startsWith("condition_sequence-probability-"))
         .map(([k, v]) => [k.slice("condition_sequence-probability-".length, -"_1_residue".length), v]));
       const onlyGot = [...gotProb.keys()].filter((k) => !wantProb.has(k));

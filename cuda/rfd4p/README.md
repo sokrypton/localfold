@@ -540,7 +540,7 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`finalizeAndCanonicalizeSequenceConditioning`~~ **done** | 629-708 | a real sequence to canonicalise |
     | ~~`featurizeExpandedSegments`~~ **done** | 713-747 | the inference deletion block fires |
     | ~~`materializeInternalCoords`~~ **done** | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
-    | `unindexFlaggedTokens` | 822-1027 | 🔴 the whole 200-line body, which a contig skips entirely |
+    | ~~`unindexFlaggedTokens`~~ **done** | 822-1027 | 🔴 the whole 200-line body, which a contig skips entirely |
     | `centerAndFeaturizeCentroid` | 1032-1108 | the recentering on conditioned coordinates |
     | `buildAtom37Slots` | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
     | `computeTokenBondFeatures` | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
@@ -583,6 +583,19 @@ residues the cropped example does not contain, so building one from the spec fai
     `allFinite` skip, drawing once for every group, filling the nine normals column-major, and
     taking `u2` before `u1`. **Every one of them produces a perfectly valid rotation and a stream
     one draw out** - which is the whole reason the warning was there.
+
+    🔴 **AND `unindexFlaggedTokens` HAS THREE CONVENTIONS THAT ONLY EXIST FOR THE BRANCH THE
+    SHIPPED MOTIFS DO NOT TAKE.** Every shipped motif is unindexed at a chain EDGE, which
+    collapses; the interesting rules are about an INTERIOR run. `+interior-unindexed` (an
+    interior run with ordinary residues both sides, everything in index group 0) turns two of
+    them red - a removed run must leave a HOLE in `res_id` rather than renumber, and the
+    index-group shift is zero whenever the groups were derived rather than supplied, so only a
+    file that supplies them can see it. `+beside-expandable` (an interior run touching the
+    expandable residue at position 21 of `motif_idx_1prw`) is the only shape that reaches the
+    re-bond at all, since that needs a run which is interior AND collapses. Removing the
+    re-bond turns it red; forcing its `collapsedKept` test TRUE does not, because the extra
+    pairs are already bonded - the guard saves work rather than changing the answer, and
+    `atoms.h` says so rather than implying it was checked.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

@@ -83,8 +83,8 @@ struct AtomArray {
   vector<uint8_t> isStandardDna, isStandardOrUnknownDna, isStandardUnknownOrMaskedDna;
 
   // Added by the later stages.
-  vector<uint8_t> atomize, isCovalentModification;
-  vector<int> atomId, tokenId, withinChainSourceResIdx;
+  vector<uint8_t> atomize, isCovalentModification, isUnindexedSource;
+  vector<int> atomId, tokenId, withinChainSourceResIdx, insertionSourceIdx;
 
   size_t n() const { return site.n; }
 };
@@ -110,7 +110,7 @@ inline void forEachColumn(AtomArray& a, F visit) {
                          &a.site.charge, &a.site.atomicNumber, &a.site.chainType,
                          &a.ids.moleculeId, &a.ids.chainEntity, &a.ids.pnUnitEntity,
                          &a.ids.moleculeEntity, &a.ids.moleculeIid, &a.stereo.chiralType,
-                         &a.atomId, &a.tokenId, &a.withinChainSourceResIdx}) {
+                         &a.atomId, &a.tokenId, &a.withinChainSourceResIdx, &a.insertionSourceIdx}) {
     visit(*v);
   }
   for (vector<double>* v : {&a.site.x, &a.site.y, &a.site.z, &a.site.bFactor, &a.site.occupancy}) {
@@ -125,7 +125,7 @@ inline void forEachColumn(AtomArray& a, F visit) {
                              &a.isStandardOrUnknownRna, &a.isStandardUnknownOrMaskedRna,
                              &a.isStandardDna, &a.isStandardOrUnknownDna,
                              &a.isStandardUnknownOrMaskedDna, &a.atomize,
-                             &a.isCovalentModification}) {
+                             &a.isCovalentModification, &a.isUnindexedSource}) {
     visit(*v);
   }
 }
@@ -874,6 +874,275 @@ inline void materializeInternalCoords(AtomArray& a, PipelineRng& prng,
       payload[i * 3 + 2] = cx * R[2][0] + cy * R[2][1] + cz * R[2][2];
     }
   }
+}
+
+/**
+ * `getDefaultIndexGroups`: one group a MOLECULE for the indexed atoms, then one group per
+ * contiguous RUN for the unindexed ones, numbered after every molecule.
+ */
+inline vector<int> defaultIndexGroups(const AtomArray& a) {
+  const size_t n = a.n();
+  if (n == 0) return {};
+  const vector<int>& mol = a.ids.moleculeIid;
+  auto idxIt = a.ann.ints.find("condition_index_1_residue");
+  vector<int> isIndexed(n, 1);
+  if (idxIt != a.ann.ints.end() && idxIt->second.size() == n) {
+    for (size_t i = 0; i < n; ++i) isIndexed[i] = idxIt->second[i] ? 1 : 0;
+  }
+  std::set<int> uniqueMols(mol.begin(), mol.end());
+  std::map<int, int> dense;
+  for (const int m : uniqueMols) { const int k = (int)dense.size(); dense[m] = k; }
+  const int nMolecules = (int)uniqueMols.size();
+
+  vector<int> groups(n, 0);
+  for (size_t i = 0; i < n; ++i) if (isIndexed[i]) groups[i] = dense[mol[i]];
+
+  bool anyUn = false;
+  for (size_t i = 0; i < n && !anyUn; ++i) anyUn = !isIndexed[i];
+  if (!anyUn) return groups;
+
+  vector<int> runIds(n, 0);
+  int r = 0;
+  for (size_t i = 1; i < n; ++i) {
+    if (mol[i] != mol[i - 1] || isIndexed[i] != isIndexed[i - 1]) ++r;
+    runIds[i] = r;
+  }
+  std::set<int> unindexedRuns;
+  for (size_t i = 0; i < n; ++i) if (!isIndexed[i]) unindexedRuns.insert(runIds[i]);
+  std::map<int, int> runDense;
+  for (const int rid : unindexedRuns) { const int k = (int)runDense.size(); runDense[rid] = k; }
+  for (size_t i = 0; i < n; ++i) {
+    if (!isIndexed[i]) groups[i] = runDense[runIds[i]] + nMolecules;
+  }
+  return groups;
+}
+
+/**
+ * `bondFlankingResidues`: join two residues that are now neighbours, if each offers exactly one
+ * polymerization atom.
+ *
+ * 🔴 EXACTLY ONE. `findPolymerizationAtomIdx` counts the matches and returns nothing when there
+ * are two - an altloc or a duplicated name makes the join ambiguous, and the reference declines
+ * rather than taking the first. A `<M>` stub residue of one atom IS that atom, whatever it is
+ * called.
+ */
+inline void bondFlankingResidues(AtomArray& a, int prevRes, int nextRes,
+                                 const vector<int>& bounds) {
+  const int sPrev = bounds[prevRes], ePrev = bounds[prevRes + 1];
+  const int sNext = bounds[nextRes], eNext = bounds[nextRes + 1];
+  if (a.atomize.size() == a.n() && (a.atomize[sPrev] || a.atomize[sNext])) return;
+  // `token_type` is not set until the batch is built, so both ends take the reference's
+  // PROTEIN default and with it the C/N fallback where the residue names say nothing.
+  auto names = [&](int s) {
+    std::pair<string, string> p = cif::polymerizationAtoms(a.site.resName[s], a.site.chainType[s]);
+    if (p.first.empty() && p.second.empty()) p = {"C", "N"};
+    return p;
+  };
+  auto find = [&](int s, int e, bool exiting) -> int {
+    if (e - s == 1 && a.site.resName[s] == "<M>") return s;
+    const std::pair<string, string> p = names(s);
+    const string& target = exiting ? p.first : p.second;
+    int match = -1, count = 0;
+    for (int i = s; i < e; ++i) {
+      if (a.site.atomName[i] == target) { match = i; ++count; }
+    }
+    return count == 1 ? match : -1;
+  };
+  const int left = find(sPrev, ePrev, true);
+  const int right = find(sNext, eNext, false);
+  if (left < 0 || right < 0) return;
+  const int u = std::min(left, right), v = std::max(left, right);
+  for (const cif::Bond& b : a.bonds) {
+    if (std::min(b.u, b.v) == u && std::max(b.u, b.v) == v) return;
+  }
+  a.bonds.push_back(cif::Bond{u, v, tables::BT_SINGLE});
+}
+
+/**
+ * `unindexFlaggedTokens`: an unindexed motif is COPIED to the end of the array under fresh
+ * residue numbers, and at inference its original is removed.
+ *
+ * 🔴 A REMOVED RUN ONLY COLLAPSES THE NUMBERING AT A CHAIN'S EDGE OR BESIDE AN EXPANDABLE
+ * SEGMENT. An interior run with ordinary residues on both sides leaves a HOLE in `res_id` on
+ * purpose - the chain really is broken there and the numbering says so - so "renumber what is
+ * left" is the wrong reading and produces a chain that claims to be continuous.
+ *
+ * 🔴 AND THE RESIDUES THAT BECOME NEIGHBOURS ARE RE-BONDED ONLY WHERE SOMETHING COLLAPSED
+ * BETWEEN THEM. `collapsedKept[next] > collapsedKept[prev]` is the test, and it is why the
+ * number of collapsed residues before each atom has to survive the slice. Measured: removing
+ * the re-bond entirely turns the gate red, so the call is live - but forcing the test TRUE
+ * changes nothing on any case built, because the extra pairs it admits are consecutive
+ * residues that the polymer bonds already joined and `bondFlankingResidues` declines a bond it
+ * finds present. The guard saves work rather than changing the answer.
+ *
+ * 🔴 AND THE COPY'S TOKEN IDS ARE TRANSIENT. `addGlobalTokenIdAnnotation` runs again at the end
+ * and renumbers everything, so `nextCopyTokenId` only ever reaches the output through
+ * `insertion_source_idx` - which is -1 at inference anyway.
+ */
+inline void unindexFlaggedTokens(AtomArray& a, bool isInference = true) {
+  const size_t n = a.n();
+  auto idxIt = a.ann.ints.find("condition_index_1_residue");
+  vector<int> cIdx(n, 1);
+  if (idxIt != a.ann.ints.end() && idxIt->second.size() == n) cIdx = idxIt->second;
+  bool anyUnindexed = false;
+  for (size_t i = 0; i < n && !anyUnindexed; ++i) anyUnindexed = !cIdx[i];
+
+  if (!anyUnindexed) {
+    a.insertionSourceIdx.assign(n, -1);
+    a.isUnindexedSource.assign(n, 0);
+    addGlobalTokenIdAnnotation(a);
+    addGlobalAtomIdAnnotation(a);
+    return;
+  }
+
+  if (!a.ann.ints.count("condition_index-group_1_token")) {
+    a.ann.ints["condition_index-group_1_token"] = defaultIndexGroups(a);
+  }
+  const vector<int> indexGroups = a.ann.ints["condition_index-group_1_token"];
+
+  std::map<string, int> nextFreeResId;
+  for (size_t i = 0; i < n; ++i) {
+    const string& cid = a.ids.chainIid[i];
+    auto it = nextFreeResId.find(cid);
+    if (it == nextFreeResId.end() || a.site.resId[i] + 1 > it->second) {
+      nextFreeResId[cid] = a.site.resId[i] + 1;
+    }
+  }
+  int nextCopyTokenId = 0;
+  for (size_t i = 0; i < n; ++i) nextCopyTokenId = std::max(nextCopyTokenId, a.tokenId[i] + 1);
+
+  std::set<int> unindexedGroupIds;
+  for (size_t i = 0; i < n; ++i) if (!cIdx[i]) unindexedGroupIds.insert(indexGroups[i]);
+
+  vector<AtomArray> slices;
+  for (const int gid : unindexedGroupIds) {
+    vector<int> members;
+    for (size_t i = 0; i < n; ++i) if (!cIdx[i] && indexGroups[i] == gid) members.push_back((int)i);
+    AtomArray motif = slice(a, members);
+
+    vector<string> motifChains;
+    for (size_t i = 0; i < motif.n(); ++i) {
+      if (std::find(motifChains.begin(), motifChains.end(), motif.ids.chainIid[i]) ==
+          motifChains.end()) {
+        motifChains.push_back(motif.ids.chainIid[i]);
+      }
+    }
+    for (const string& cid : motifChains) {
+      int minRes = INT32_MAX, maxRes = INT32_MIN;
+      for (size_t i = 0; i < motif.n(); ++i) {
+        if (motif.ids.chainIid[i] != cid) continue;
+        minRes = std::min(minRes, motif.site.resId[i]);
+        maxRes = std::max(maxRes, motif.site.resId[i]);
+      }
+      const int offset = nextFreeResId[cid] - minRes;
+      for (size_t i = 0; i < motif.n(); ++i) {
+        if (motif.ids.chainIid[i] == cid) motif.site.resId[i] += offset;
+      }
+      nextFreeResId[cid] = maxRes + offset + 2;
+    }
+
+    const vector<int> rb = cif::residueSegments(motif.site);
+    motif.insertionSourceIdx.assign(motif.n(), -1);
+    vector<int> newTok(motif.n(), 0);
+    for (size_t r = 0; r + 1 < rb.size(); ++r) {
+      const int s = rb[r], e = rb[r + 1];
+      const int srcTok = isInference ? -1 : motif.tokenId[s];
+      for (int i = s; i < e; ++i) { motif.insertionSourceIdx[i] = srcTok; newTok[i] = nextCopyTokenId; }
+      ++nextCopyTokenId;
+    }
+    motif.tokenId = newTok;
+    slices.push_back(std::move(motif));
+  }
+  const AtomArray unindexed = concat(slices);
+
+  const vector<int> rbOrig = cif::residueSegments(a.site);
+  const size_t nResOrig = rbOrig.size() - 1;
+  vector<uint8_t> isRemovedRes(nResOrig, 0), isExpandableRes(nResOrig, 0);
+  vector<string> chainOfRes(nResOrig);
+  auto segIt = a.ann.ints.find("annotation_expsegmin_1_residue");
+  for (size_t r = 0; r < nResOrig; ++r) {
+    const int s = rbOrig[r], e = rbOrig[r + 1];
+    chainOfRes[r] = a.ids.chainIid[s];
+    isExpandableRes[r] = segIt != a.ann.ints.end() && segIt->second[s] != -1;
+    for (int i = s; i < e; ++i) if (!cIdx[i]) { isRemovedRes[r] = 1; break; }
+  }
+
+  vector<int> nCollapsedBefore(nResOrig, 0);
+  vector<string> uniqueChains;
+  for (const string& c : chainOfRes) {
+    if (std::find(uniqueChains.begin(), uniqueChains.end(), c) == uniqueChains.end()) {
+      uniqueChains.push_back(c);
+    }
+  }
+  for (const string& cid : uniqueChains) {
+    vector<int> inChain;
+    for (size_t r = 0; r < nResOrig; ++r) if (chainOfRes[r] == cid) inChain.push_back((int)r);
+    vector<uint8_t> collapse(inChain.size());
+    for (size_t m = 0; m < inChain.size(); ++m) collapse[m] = isRemovedRes[inChain[m]];
+    size_t k = 0;
+    while (k < inChain.size()) {
+      if (!isRemovedRes[inChain[k]]) { ++k; continue; }
+      const size_t runStart = k;
+      while (k < inChain.size() && isRemovedRes[inChain[k]]) ++k;
+      const size_t runStop = k;
+      const bool atBoundary = runStart == 0 || runStop == inChain.size();
+      const bool adjExpandable = !atBoundary && (isExpandableRes[inChain[runStart - 1]] ||
+                                                 isExpandableRes[inChain[runStop]]);
+      if (!atBoundary && !adjExpandable) {
+        for (size_t m = runStart; m < runStop; ++m) collapse[m] = 0;
+      }
+    }
+    int cum = 0;
+    for (size_t m = 0; m < inChain.size(); ++m) {
+      nCollapsedBefore[inChain[m]] = cum;
+      if (collapse[m]) ++cum;
+    }
+  }
+
+  vector<int> collapsedBeforeAtom(n, 0);
+  vector<uint8_t> tokenToUnindex(n, 0);
+  for (size_t r = 0; r < nResOrig; ++r) {
+    const int s = rbOrig[r], e = rbOrig[r + 1];
+    for (int i = s; i < e; ++i) {
+      collapsedBeforeAtom[i] = nCollapsedBefore[r];
+      tokenToUnindex[i] = isRemovedRes[r];
+      a.site.resId[i] -= nCollapsedBefore[r];
+    }
+  }
+
+  vector<int> indexedKeep, collapsedKept;
+  for (size_t i = 0; i < n; ++i) {
+    if (!tokenToUnindex[i]) { indexedKeep.push_back((int)i); collapsedKept.push_back(collapsedBeforeAtom[i]); }
+  }
+  AtomArray indexedArr = slice(a, indexedKeep);
+  const vector<int> rb = cif::residueSegments(indexedArr.site);
+  for (size_t r = 0; r + 1 < rb.size() - 1; ++r) {
+    const int sPrev = rb[r], sNext = rb[r + 1];
+    if (indexedArr.ids.chainIid[sPrev] == indexedArr.ids.chainIid[sNext] &&
+        indexedArr.site.resId[sNext] - indexedArr.site.resId[sPrev] == 1 &&
+        collapsedKept[sNext] > collapsedKept[sPrev]) {
+      bondFlankingResidues(indexedArr, (int)r, (int)r + 1, rb);
+    }
+  }
+  computeWithinChainSourceResIdx(indexedArr);
+  indexedArr.insertionSourceIdx.assign(indexedArr.n(), -1);
+
+  a = concat({indexedArr, unindexed});
+  vector<int>& fullGrp = a.ann.ints["condition_index-group_1_token"];
+  const vector<int>& fullIdx = a.ann.ints["condition_index_1_residue"];
+  int maxIdxGrp = INT32_MIN, minUnidxGrp = INT32_MAX;
+  bool sawIdx = false;
+  for (size_t i = 0; i < a.n(); ++i) {
+    if (fullIdx[i]) { maxIdxGrp = std::max(maxIdxGrp, fullGrp[i]); sawIdx = true; }
+    else minUnidxGrp = std::min(minUnidxGrp, fullGrp[i]);
+  }
+  const int shift = (sawIdx ? maxIdxGrp : -1) - minUnidxGrp + 1;
+  for (size_t i = 0; i < a.n(); ++i) if (!fullIdx[i]) fullGrp[i] += shift;
+
+  a.isUnindexedSource.assign(a.n(), 0);
+  addGlobalTokenIdAnnotation(a);
+  addGlobalAtomIdAnnotation(a);
+  ensureChemicalFlags(a);
 }
 
 }  // namespace atoms
