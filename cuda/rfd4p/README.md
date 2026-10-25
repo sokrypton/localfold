@@ -498,15 +498,16 @@ residues the cropped example does not contain, so building one from the spec fai
     two chains does not make them one molecule), and the sort is NUMERIC where the column is -
     `molecule_id` and `res_id` sorted as text put 10 before 9 and renumber every entity past the
     ninth.
-  - the annotation columns parsed into typed arrays rather than kept as strings, and the rest of
-    `parseCifToAtomArray`'s tail.
+  - ~~the annotation columns, typed~~ **done**, including the legacy `mask_*` columns that
+    REWRITE the `condition_*` ones they shadow. With this `parseCifToAtomArray` is ported whole:
+    every column, every annotation and every bond, on all seven shipped structures, 0 differing.
   - ~~`buildBondsForAtomArray`~~ **done**: the `_struct_conn` covalent links, each residue's own
     bonds from `STD_RESIDUE_BONDS` overlaid by the file's `_chem_comp_bond`, the polymer backbone,
     and the metal retype - the bond list compared IN ORDER, since later stages index into it. 🔴
     A first bond for a pair wins, so a declared link is not overwritten by the dictionary's idea
     of the same pair; and `_struct_conn`'s partner search keeps the LAST match rather than the
     first, which is the reference's loop and not a slip.
-  - `pipeline/chirality.js`: `ensureStereochemistryAnnotations` and `computeChiralityFeatures`,
+  - **this is where the remaining work starts.** `pipeline/chirality.js`: `ensureStereochemistryAnnotations` and `computeChiralityFeatures`,
     with `IDEAL_POLYHEDRA` (4 geometries, 19 unit vectors), `STEREOISOMER_TEMPLATES` (11 entries,
     105 point sets, built at load by brute-force permutation - precompute them) and
     `STD_POLYMER_CHIRAL_CENTERS` (~29 residues). 🔴 The port already has `properRotation` and the

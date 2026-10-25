@@ -35,10 +35,16 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
-  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id)\t/.test(l)).map((l) => l.split("\t"));
+  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id|ann)\t/.test(l))
+    .map((l) => l.split("\t"));
   const bonds = lines.filter((l) => l.startsWith("bond\t"))
     .map((l) => l.split("\t").slice(1).map(Number));
   const ids = lines.filter((l) => l.startsWith("id\t")).map((l) => l.split("\t").slice(1));
+  const ann = new Map();
+  for (const l of lines.filter((x) => x.startsWith("ann\t"))) {
+    const p = l.split("\t");
+    ann.set(p[2], { kind: p[1], values: p.slice(3) });
+  }
 
   const wrong = [];
   if (n !== js.res_name.length) wrong.push(`n ${n} vs ${js.res_name.length}`);
@@ -103,6 +109,28 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     if (ids.length !== want.length) { wrong.push(`${label} length`); continue; }
     const bad = ids.filter((r, i) => cast(r[at]) !== want[i]).length;
     if (bad) wrong.push(`${label} ${bad}`);
+  }
+
+  // 🔴 AND THE ANNOTATION SET ITSELF, not only the values. A column silently absent is a
+  // conditioning silently dropped, which is the failure this whole featuriser is written against.
+  const wantNames = Object.keys(js.annotations).sort().join(" ");
+  const gotNames = [...ann.keys()].sort().join(" ");
+  if (wantNames !== gotNames) wrong.push(`annotations {${gotNames}} vs {${wantNames}}`);
+  else {
+    for (const [name, want] of Object.entries(js.annotations)) {
+      const got = ann.get(name);
+      const flat = Array.isArray(want[0]) ? want.flat() : want;
+      if (got.values.length !== flat.length) { wrong.push(`${name} length`); continue; }
+      let bad = 0;
+      for (let i = 0; i < flat.length; i += 1) {
+        const w = flat[i];
+        const g = got.kind === "s" ? got.values[i] : Number(got.values[i]);
+        if (typeof w === "boolean") { if ((w ? 1 : 0) !== g) bad += 1; }
+        else if (typeof w === "number") { if (!eqf(g, w)) bad += 1; }
+        else if (String(w) !== String(g)) bad += 1;
+      }
+      if (bad) wrong.push(`${name} ${bad}`);
+    }
   }
 
   structures += 1;

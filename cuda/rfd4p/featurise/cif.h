@@ -187,6 +187,8 @@ struct AtomSite {
   // Every `_atom_site.<name>` this reader does not have a field for, kept by name: the annotation
   // columns are exactly these, and a job's conditioning lives in them.
   std::map<string, vector<string>> extra;
+  // The rows of the file this reader kept, which an annotation column must be indexed by.
+  vector<size_t> selected;
 
   // Derived, not read: the chemistry `parseCifToAtomArray` works out from the columns above and
   // from the file's own `_chem_comp` / `_chem_comp_atom` / `_entity_poly` tables.
@@ -449,7 +451,121 @@ inline AtomSite readAtomSite(const Block& block) {
       for (size_t k : selected) dst.push_back(k < values.size() ? values[k] : string());
     }
   }
+  a.selected = selected;
   return a;
+}
+
+/**
+ * The annotation columns, typed. A structure that carries its job carries it HERE - the
+ * conditioning the page would otherwise build from a contig.
+ *
+ * 🔴 EVERY VALUE HAS ITS OWN DEFAULT AND A `.` MEANS IT. An int column defaults to -1 or 0, a
+ * bool to true or false, `condition_sequence_1_residue` to `<M>`; filling a missing entry with
+ * zero instead would be conditioning the model on something the file did not say.
+ *
+ * 🔴 AND THE LEGACY `mask_*` COLUMNS REWRITE THE `condition_*` ONES. `mask_index_1_residue`
+ * BECOMES `condition_index_1_residue`, and `mask_sequence_1_residue` turns the residue's own name
+ * into its sequence condition where the mask is set and `<M>` where it is not - so a file written
+ * the old way means the opposite of what reading the columns separately would give.
+ */
+struct Annotations {
+  std::map<string, vector<int>> ints;        // int and bool columns
+  std::map<string, vector<float>> floats;    // float columns, and the 3-wide categories
+  std::map<string, vector<string>> strings;
+};
+
+inline Annotations readAnnotations(const AtomSite& a, const Block& block,
+                                   const vector<size_t>& selected) {
+  Annotations out;
+  auto cat = block.find("atom_site");
+  const auto& cols = cat->second;
+  for (const auto& [name, values] : cols) {
+    const tables::AnnotationSpec* spec = nullptr;
+    tables::AnnotationSpec derived{"", 1, 0, ""};
+    auto known = tables::ANNOTATIONS_1BODY.find(name);
+    if (known != tables::ANNOTATIONS_1BODY.end()) {
+      spec = &known->second;
+    } else if (name.rfind("condition_sequence-probability-", 0) == 0) {
+      derived = {"float", 1, NAN, ""};
+      spec = &derived;
+    } else if (name.rfind("mask_sequence-probability-", 0) == 0) {
+      derived = {"bool", 1, 0, ""};
+      spec = &derived;
+    } else if (name == "condition_cath-label_1_residue" && !block.count(name)) {
+      derived = {"str", 1, 0, "x.x.x.x"};
+      spec = &derived;
+    }
+    if (!spec || spec->cols != 1) continue;
+    const string type = spec->type;
+    for (size_t k = 0; k < selected.size(); ++k) {
+      const string raw = selected[k] < values.size() ? values[selected[k]] : string();
+      if (type == "int") out.ints[name].push_back(safeInt(raw, (int)spec->fallback));
+      else if (type == "bool") out.ints[name].push_back(safeBool(raw, spec->fallback != 0) ? 1 : 0);
+      else if (type == "float") out.floats[name].push_back(safeFloat(raw, (float)spec->fallback));
+      else out.strings[name].push_back(unset(raw) ? string(spec->text) : raw);
+    }
+  }
+  // The three-wide categories, each its own `loop_` keyed by `idx0`.
+  for (const auto& [name, spec] : tables::ANNOTATIONS_1BODY) {
+    if (spec.cols == 1) continue;
+    auto c = block.find(name);
+    if (c == block.end()) continue;
+    vector<float>& arr = out.floats[name];
+    arr.assign(a.n * spec.cols, (float)spec.fallback);
+    auto col = [&](const string& key) -> const vector<string>* {
+      auto it = c->second.find(key);
+      return it == c->second.end() ? nullptr : &it->second;
+    };
+    const vector<string>* idx0 = col("idx0");
+    const vector<string>* val0 = col("val0");
+    const size_t rows = idx0 ? idx0->size() : (val0 ? val0->size() : 0);
+    for (size_t r = 0; r < rows; ++r) {
+      const int atomIdx = idx0 ? safeInt((*idx0)[r], -1) : (int)r;
+      if (atomIdx < 0 || atomIdx >= (int)a.n) continue;
+      for (int ch = 0; ch < spec.cols; ++ch) {
+        const vector<string>* v = col("val" + std::to_string(ch));
+        const string raw = v && r < v->size() ? (*v)[r] : string();
+        arr[(size_t)atomIdx * spec.cols + ch] =
+            string(spec.type) == "int" ? (float)safeInt(raw, (int)spec.fallback)
+                                       : safeFloat(raw, (float)spec.fallback);
+      }
+    }
+  }
+  // The legacy masks, which REPLACE the condition columns they shadow.
+  if (out.ints.count("mask_index_1_residue")) {
+    out.ints["condition_index_1_residue"] = out.ints["mask_index_1_residue"];
+    out.ints.erase("mask_index_1_residue");
+  }
+  if (out.ints.count("mask_sequence_1_residue")) {
+    const vector<int> mask = out.ints["mask_sequence_1_residue"];
+    vector<string> seq(a.n);
+    auto existing = out.strings.find("condition_sequence_1_residue");
+    for (size_t i = 0; i < a.n; ++i) {
+      if (!mask[i]) { seq[i] = "<M>"; continue; }
+      const bool have = existing != out.strings.end() && existing->second[i] != "<M>";
+      seq[i] = have ? existing->second[i] : a.resName[i];
+    }
+    out.strings["condition_sequence_1_residue"] = seq;
+    out.ints.erase("mask_sequence_1_residue");
+  }
+  if (out.ints.count("mask_coordinate_1_atom")) {
+    const vector<int> mask = out.ints["mask_coordinate_1_atom"];
+    vector<float>& crd = out.floats["condition_coordinate_1_atom"];
+    const vector<float> existing = crd;
+    crd.assign(a.n * 3, NAN);
+    for (size_t i = 0; i < a.n; ++i) {
+      if (!mask[i]) continue;
+      if (existing.size() == a.n * 3) {
+        for (int ch = 0; ch < 3; ++ch) crd[i * 3 + ch] = existing[i * 3 + ch];
+      } else {
+        crd[i * 3] = a.x[i];
+        crd[i * 3 + 1] = a.y[i];
+        crd[i * 3 + 2] = a.z[i];
+      }
+    }
+    out.ints.erase("mask_coordinate_1_atom");
+  }
+  return out;
 }
 
 /** `getResidueSegments`: the index where each residue starts, plus `n`. */

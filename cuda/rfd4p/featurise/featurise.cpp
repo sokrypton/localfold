@@ -938,6 +938,22 @@ int run(int argc, char** argv) {
              ids.moleculeId[i], ids.chainEntity[i], ids.pnUnitEntity[i], ids.moleculeEntity[i],
              ids.chainIid[i].c_str(), ids.pnUnitIid[i].c_str(), ids.moleculeIid[i]);
     }
+    const rfd4p::cif::Annotations ann = rfd4p::cif::readAnnotations(a, block, a.selected);
+    for (const auto& [name, v] : ann.ints) {
+      printf("ann\ti\t%s", name.c_str());
+      for (int x : v) printf("\t%d", x);
+      printf("\n");
+    }
+    for (const auto& [name, v] : ann.floats) {
+      printf("ann\tf\t%s", name.c_str());
+      for (float x : v) printf("\t%.9g", (double)x);
+      printf("\n");
+    }
+    for (const auto& [name, v] : ann.strings) {
+      printf("ann\ts\t%s", name.c_str());
+      for (const auto& x : v) printf("\t%s", x.c_str());
+      printf("\n");
+    }
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;
   }
