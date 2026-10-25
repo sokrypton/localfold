@@ -164,6 +164,31 @@ on a real fixture settled it.
 | cut-off range fields | `.contig-number` 9ch |
 | beauty and organisation pass | one card, `index.html`'s idiom |
 
+## 6b. Pocket conditioning — a port gap, and reachable
+
+🔴 **"Protein Hunter has no pocket conditioning" was the wrong claim, and it was
+mine.** It reads as a property of the method; it is a property of this tree.
+
+Genuine Boltz-2 takes a `pocket` constraint — a binder chain plus the residues
+it should contact — and Hunter folds with whatever is in `FOLDERS`, so a folder
+honouring one *would* condition the fold on the pocket. What is actually
+missing, verified here:
+
+- the AF3-lineage featuriser has **no constraint path at all** — nothing in
+  `shared/af3/featurise/` builds one;
+- `FOLDERS` is `{af3, openbind0, opendde}`, and **boltz2 is not in it** although
+  it is published (it has a `remote`) and shares `foldAf3` with all three;
+- pocket conditioning *does* exist in this repo, in **BioEmu2**
+  (`pocket_feature`, `contact_conditioning`, `contact_threshold`) — but
+  `pocket_feature` is allocated all-zeros and populated by nothing, and
+  `docs/EF2FAST.md` records it sitting in upstream's `_IGNORED_FEATURE_KEYS`,
+  i.e. no released checkpoint consumes it. `contact_conditioning` is real and
+  populated. BioEmu2 is not reachable from the design page.
+
+So closing it means a constraint path in the featuriser plus boltz2 in
+`FOLDERS`. Not verified: whether af3-any-model's boltz2 port exposes the
+constraint at all, which decides whether this is plumbing or a port.
+
 ## 7. Known gaps nobody has asked about yet
 
 - ~~RFD4's `#validate` and `#beam` are ignored by its generate path~~ — **done**.

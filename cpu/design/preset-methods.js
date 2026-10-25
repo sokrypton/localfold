@@ -27,9 +27,14 @@
  * A preset absent from this map is one Hunter CAN run.
  */
 export const HUNTER_CANNOT = {
-  // Hunter has no pocket conditioning: LigandMPNN sees the ligand and the fold
-  // changes, but nothing is designed AGAINST the pocket the way RFD4 means.
-  sm_sam: "Protein Hunter has no pocket conditioning",
+  // 🔴 A PORT GAP, NOT A PROPERTY OF THE METHOD. LigandMPNN sees the ligand and
+  // the fold changes, but nothing is designed AGAINST the pocket the way RFD4
+  // means - because no folder in `FOLDERS` takes a pocket constraint. Genuine
+  // Boltz-2 does take one (a binder chain plus the residues it should contact),
+  // and boltz2 is published and shares `foldAf3` with the three folders that
+  // are wired, so this is reachable: it needs a constraint path in
+  // shared/af3/featurise, which has none, and boltz2 added to FOLDERS.
+  sm_sam: "no folding model here takes a pocket constraint yet",
   // Labelled spans ask for a secondary structure, which Hunter cannot be told:
   // it folds whatever the sequence gives.
   custom_cath_monomer: "Protein Hunter cannot be asked for a secondary structure",

@@ -158,9 +158,9 @@ export const SPAN_NOTES = {
  * 🔴 PROTEIN HUNTER'S LIMIT IS NOT A MISSING FEATURE, IT IS THE METHOD. It
  * reaches a structure by folding a sequence, so it can only ask for ONE length
  * and see what comes back; a range implies a search over lengths, which is a
- * different loop. And it has no pocket conditioning, so a ligand in the list
- * would change the fold and the designer but not be designed *against* in the
- * way RFD4 means.
+ * different loop. And no folder here takes a pocket constraint, so a ligand in
+ * the list changes the fold and the designer but is not designed *against* in
+ * the way RFD4 means - a gap in this port rather than in the method.
  */
 export const METHOD_LIMITS = {
   hunter: {
@@ -171,8 +171,16 @@ export const METHOD_LIMITS = {
     // (see `drawLengths`), so a range means "try several sizes" rather than
     // "this method cannot". Four of the ten shipped examples were refused for
     // this reason alone.
-    ligand: "Protein Hunter has no pocket conditioning — a ligand changes the fold and the"
-      + " designer, but is not conditioned on.",
+    // 🔴 THIS IS A PORT GAP, NOT A PROPERTY OF THE METHOD, and the wording used
+    // to claim the second. Genuine Boltz-2 takes a `pocket` constraint - a
+    // binder chain plus the residues it should contact - and Hunter folds with
+    // whatever is in FOLDERS, so a folder that honoured one WOULD condition the
+    // fold on the pocket. What is missing is in this tree: the AF3-lineage
+    // featuriser has no constraint path at all (nothing in shared/af3/featurise
+    // builds one), and boltz2 is not in FOLDERS, though it is published and
+    // shares `foldAf3` with the three that are.
+    ligand: "This port's folding models do not take a pocket constraint yet — a ligand"
+      + " changes the fold and the designer, but is not conditioned on.",
     // 🔴 A LABEL IS ONLY USEFUL TO SOMETHING THAT CONDITIONS ON IT. Hunter
     // reaches a structure by folding a sequence; it has no way to be told "this
     // stretch should be a helix", so a named span would be a control that did
