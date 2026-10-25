@@ -545,10 +545,23 @@ residues the cropped example does not contain, so building one from the spec fai
     featuriser is byte-exact against `export_input.mjs` on both routes.
     Its output carries the INPUT's own residue numbering and chain letters, so a motif still
     superposes on the target it was built against, and is aligned onto the conditioned frame
-    (`src/superpose.h`) - a **0.12 A** refinement, measured, not the rescue it looks like. What is left is the rest of
-    `processSampleToAtoms`'s `inputAtoms` path - the unindexed-insertion machinery (the
-    Hungarian match and its geometric fallback), which only an unindexed motif reaches - and
-    the coordinate-group permutation.
+    (`src/superpose.h`) - a **0.12 A** refinement, measured, not the rescue it looks like. An unindexed motif is grafted onto a
+    generated token (`geometricInsertionMapping` and `matchInsertedAtoms`, on `src/assign.h`)
+    and its conditioned coordinates transferred, which is how it reaches the output at all.
+    What is left is the PREDICTED insertion mapping from the trunk's own logits - the geometric
+    fallback is what runs now - and the coordinate-group permutation.
+
+    🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
+    in-context conditioning that the sampler never generates, and the reference writes only the
+    INDEXED tokens; `motif_unidx_1prw` came out with 112 residues where it should have 72. The
+    fold's own line did not report it - it counts tokens with a known residue type, and those
+    have none - so the count said 72 while the file held 112. Found by reading the two against
+    each other, not by any gate.
+
+    🔴 **AND THE ARM FOR IT FAILED FIRST AT 25 STEPS, WHICH WAS THE STEP COUNT AND NOT THE
+    PORT.** The shortest CA-CA step is 2.76 A there and 3.66 at 60. The int8 arm records this
+    exact trap in these exact words - "reading that as int8's fault would be reading the step
+    count as a defect" - and this arm was written at 25 anyway.
 
     🔴 **AND THE OUTPUT USED TO RENUMBER THE MOTIF.** The writer spelled `i + 1` and
     `chainName(chain_iid)`, which is right for a chain this port NAMED and wrong for one a file
