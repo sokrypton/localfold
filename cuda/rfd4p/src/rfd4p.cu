@@ -627,18 +627,23 @@ int foldMain(int argc, char** argv) {
 // to disk because that is what the port reads and what a second run can reuse; what is gone is
 // the second process and the Node it needed.
 int jobMain(int argc, char** argv) {
-  std::string job, weights, outDir, rest;
+  std::string job, weights, int8, outDir;
   std::vector<std::string> keep;
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
     if (!f.compare(0, 6, "--job=")) job = f.substr(6);
     else if (!f.compare(0, 10, "--weights=")) { weights = f.substr(10); keep.push_back(f); }
+    else if (!f.compare(0, 7, "--int8=")) { int8 = f.substr(7); keep.push_back(f); }
     else if (!f.compare(0, 11, "--work-dir=")) outDir = f.substr(11);
     else keep.push_back(f);
   }
   if (outDir.empty()) outDir = job + ".featurised";
-  std::vector<std::string> fargs = {"rfd4p-featurise", outDir, "--weights=" + weights,
-                                    "--spec=" + job, "--generate"};
+  // 🔴 THE FEATURISER READS THE PUBLISHED BUNDLE TOO, so `--int8=` alone is a whole design with no
+  // float checkpoint - which is the difference between a run anybody can make and one that needs
+  // NVIDIA's weight terms accepted. Every table it wants is float32 in that bundle by the
+  // bundle's own rule: only the matrices are coded.
+  std::vector<std::string> fargs = {"rfd4p-featurise", outDir, "--spec=" + job, "--generate",
+                                    int8.empty() ? "--weights=" + weights : "--int8=" + int8};
   // A seed given to the fold is the job's seed, and both halves need it.
   for (const std::string& f : keep) {
     if (!f.compare(0, 7, "--seed=") || !f.compare(0, 9, "--config=")) fargs.push_back(f);

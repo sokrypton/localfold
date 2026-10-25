@@ -132,6 +132,17 @@ def ca_rms(a: Path, b: Path) -> float:
     return (total / len(x)) ** 0.5
 
 
+def chain_steps(pdb: Path) -> list[float]:
+    """Consecutive CA-CA distances, which say whether a fold is a chain at all."""
+    if not pdb.exists():
+        return []
+    ca = [(float(l[30:38]), float(l[38:46]), float(l[46:54]))
+          for l in pdb.read_text().splitlines()
+          if l.startswith("ATOM") and l[12:16].strip() == "CA"]
+    return [sum((a - b) ** 2 for a, b in zip(ca[i], ca[i + 1])) ** 0.5
+            for i in range(len(ca) - 1)]
+
+
 def compare_dirs(native: Path, js: Path) -> list[str]:
     """Every tensor the NATIVE directory writes, against the JavaScript's, as bytes.
 
@@ -444,6 +455,33 @@ def main() -> int:
             print(f"  {'job':10s} one process against featurise-then-fold  "
                   f"{'ok ' if same else 'DIFFERS'}")
             got["job"] = {"same_pdb": bool(same)}
+
+            # 🔴 AND THE SAME JOB FROM THE PUBLISHED BUNDLE ALONE, which is the run anybody can
+            # make: no float checkpoint and so no weight terms to accept. It is scored on the
+            # CHAIN and not against the float arm's coordinates - int8 perturbs the velocity field
+            # and the sampler is chaotic, so the trajectory lands on a DIFFERENT member of the
+            # distribution (2.1 A of CA at 25 steps), which is not a defect and not a tolerance
+            # anybody should pin.
+            bundle = REPO / "model-rfd4p-int8"
+            if (bundle / "shards" / "shard_000.bin").exists():
+                i8pdb = HERE / "gate-job-int8.pdb"
+                # 🔴 A CONVERGED JOB, NOT THE FEATURISER'S. The ranged case above runs 10 steps
+                # at one recycle because it exists to compare BYTES; folded, it is not a chain on
+                # either arithmetic (CA-CA 4.32 A, worst gap 14.6) and reading that as int8's
+                # fault would be reading the step count as a defect.
+                fold = HERE / "featurise" / "gate-fold.json"
+                run([BINARY, f"--job={fold}", f"--int8={bundle}",
+                     f"--work-dir={HERE / 'gate-job-int8'}", f"--out={i8pdb}", "--seed=0",
+                     "--fast"], cwd=REPO)
+                caca = chain_steps(i8pdb)
+                ok = bool(caca) and 3.4 <= (sum(caca) / len(caca)) <= 4.1 and min(caca) > 2.8
+                if not ok:
+                    failed += 1
+                print(f"  {'int8 job':10s} the published bundle alone, "
+                      f"{len(caca)} CA-CA mean "
+                      f"{sum(caca) / len(caca):.3f} A  {'ok ' if ok else 'NOT A CHAIN'}"
+                      if caca else f"  {'int8 job':10s} no structure  FAILED")
+                got["int8_job"] = {"caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
 
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:

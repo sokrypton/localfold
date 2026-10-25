@@ -295,7 +295,16 @@ else on the path.
 
 ```
 cuda/rfd4p/localfold-rfd4p --job=<job.json> --weights=cuda/rfd4p/weights-f32 --out=design.pdb
+cuda/rfd4p/localfold-rfd4p --job=<job.json> --int8=model-rfd4p-int8 --out=design.pdb
 ```
+
+🔴 **THE SECOND LINE IS A WHOLE DESIGN WITH NO FLOAT CHECKPOINT**, which is the difference between
+a run anybody can make and one that needs NVIDIA's weight terms accepted: the published int8
+bundle carries every table the featuriser wants as **float32**, by the bundle's own rule that only
+the matrices are coded. The gate folds a converged job that way and scores the CHAIN - 52 CA-CA at
+a mean of 3.72 A - rather than comparing coordinates with the float arm, because int8 perturbs the
+velocity field and the sampler is chaotic, so it lands on a DIFFERENT member of the distribution
+(2.1 A of CA at 25 steps). That is not a defect and not a tolerance anybody should pin.
 
 The gate holds that route to the two-step one byte for byte, because linking the featuriser in is
 a second way to reach it and a second way to get it wrong.

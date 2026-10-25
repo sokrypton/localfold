@@ -170,6 +170,64 @@ struct Weights {
   bool has(const string& name) const { return index.count(name) > 0; }
 };
 
+/**
+ * The PUBLISHED int8 bundle's float32 tensors, by name.
+ *
+ * 🔴 EVERY TABLE THIS NEEDS IS float32 IN THAT BUNDLE, which is not luck: only the matrices are
+ * coded, and an embedding table is not a matrix anybody would quantise - "quantising a LayerNorm's
+ * scale saves a few kilobytes and moves every number downstream of it" (src/bundle.cuh). So the
+ * featuriser reads the bundle directly and a whole design needs no float checkpoint, which is the
+ * difference between a run anybody can make and one that needs NVIDIA's weight terms accepted.
+ */
+inline Weights readBundleWeights(const string& dir, const std::set<string>& wanted) {
+  Weights w;
+  string text;
+  {
+    FILE* f = fopen((dir + "/manifest.json").c_str(), "rb");
+    if (!f) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
+    char buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
+    fclose(f);
+  }
+  const lf::Json manifest = lf::parseJson(text);
+  const lf::Json* tensors = manifest.get("tensors");
+  if (!tensors || !tensors->isObject()) {
+    fprintf(stderr, "%s/manifest.json has no tensors\n", dir.c_str());
+    exit(1);
+  }
+  size_t at = 0;
+  for (const auto& [name, rec] : tensors->o) {
+    if (!wanted.count(name)) continue;
+    const lf::Json* dtype = rec.get("dtype");
+    if (dtype && dtype->isString() && dtype->s != "float32") {
+      fprintf(stderr, "%s is %s in the bundle; this featuriser reads only its float32 tensors\n",
+              name.c_str(), dtype->s.c_str());
+      exit(1);
+    }
+    size_t elements = 1;
+    const lf::Json* shape = rec.get("shape");
+    if (shape && shape->isArray()) for (const lf::Json& d : shape->a) elements *= (size_t)d.n;
+    const lf::Json* file = rec.get("file");
+    const lf::Json* off = rec.get("byteOffset");
+    FILE* bin = fopen((dir + "/shards/" + (file ? file->s : "")).c_str(), "rb");
+    if (!bin) {
+      fprintf(stderr, "no %s/shards/%s\n", dir.c_str(), file ? file->s.c_str() : "?");
+      exit(1);
+    }
+    w.blob.resize(at + elements);
+    if (fseek(bin, (long)(off ? off->n : 0), SEEK_SET) != 0 ||
+        fread(w.blob.data() + at, 4, elements, bin) != elements) {
+      fprintf(stderr, "%s runs past its shard\n", name.c_str());
+      exit(1);
+    }
+    fclose(bin);
+    w.index["w/" + name] = {at, elements};
+    at += elements;
+  }
+  return w;
+}
+
 inline Weights readWeights(const string& dir, const std::set<string>& wanted) {
   Weights w;
   FILE* idx = fopen((dir + "/model.idx").c_str(), "r");
@@ -820,7 +878,7 @@ int run(int argc, char** argv) {
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
   using rfd4p::recycleDepths;
-  string out, specPath, weightsDir, configPath;
+  string out, specPath, weightsDir, configPath, int8Dir;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -829,6 +887,7 @@ int run(int argc, char** argv) {
     if (a.rfind("--", 0) != 0) { out = a; continue; }
     if (!a.compare(0, 7, "--spec=")) specPath = a.substr(7);
     else if (!a.compare(0, 10, "--weights=")) weightsDir = a.substr(10);
+    else if (!a.compare(0, 7, "--int8=")) int8Dir = a.substr(7);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -837,14 +896,16 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 10, "--recycle=")) recycleSchedule = a.substr(10);
     else { fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
   }
-  if (out.empty() || weightsDir.empty() || (specPath.empty() && !length)) {
+  if (out.empty() || (weightsDir.empty() && int8Dir.empty()) || (specPath.empty() && !length)) {
     fprintf(stderr, "usage: rfd4p-featurise <out dir> --weights=<dir> "
                     "(--spec=<job.json> | --length=N) [--config=<config.json>] [--seed=N] "
                     "[--step=N]\n");
     return 1;
   }
   // The bundle's own feature lists and widths, from the same config.json the port reads.
-  if (configPath.empty()) configPath = "model-rfd4p-int8/config.json";
+  if (configPath.empty()) {
+    configPath = int8Dir.empty() ? "model-rfd4p-int8/config.json" : int8Dir + "/config.json";
+  }
   string text;
   {
     FILE* f = fopen(configPath.c_str(), "rb");
@@ -970,7 +1031,7 @@ int run(int argc, char** argv) {
     }
   }
 
-  const Weights w = readWeights(weightsDir, {
+  const std::set<string> wantedWeights = {
       "w/nn.init_repr_factory.feat_creators.2.embedding.weight",
       "w/nn.init_repr_factory.feat_creators.7.ss_embedding.weight",
       "w/nn.init_repr_factory.feat_creators.16.embedding.weight",
@@ -978,7 +1039,15 @@ int run(int argc, char** argv) {
       "w/nn.cond_factory.feat_creators.2.embedding_C.weight",
       "w/nn.cond_factory.feat_creators.2.embedding_A.weight",
       "w/nn.cond_factory.feat_creators.2.embedding_T.weight",
-  });
+  };
+  Weights w;
+  if (!int8Dir.empty()) {
+    std::set<string> bare;
+    for (const string& k : wantedWeights) bare.insert(k.substr(2));   // drop the `w/`
+    w = readBundleWeights(int8Dir, bare);
+  } else {
+    w = readWeights(weightsDir, wantedWeights);
+  }
 
   int seqDim = 0, condDim = 0, pairDim = 0;
   const vector<float> seq = seqFeatures(b, cfg, w, xBb, xLl, seqDim);

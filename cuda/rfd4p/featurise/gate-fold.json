@@ -1,0 +1,5 @@
+{
+  "contig": "h1:24-24P,l1:5-5P,h2:24-24P",
+  "nsteps": 25,
+  "recycleSchedule": "low"
+}
