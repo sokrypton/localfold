@@ -10,6 +10,9 @@
    "B"
   ]
  },
+ "designs": {
+  "written": 3
+ },
  "encoder": {
   "exact": 1.273e-06
  },
@@ -18,7 +21,7 @@
   "differing": 0
  },
  "int8_job": {
-  "caca_mean": 3.721
+  "caca_mean": 3.808
  },
  "inverse": {
   "exact": 1.828e-07,
@@ -40,8 +43,8 @@
   "fast": 0.008377
  },
  "speed-n100-r6": {
-  "exact_ms": 156.27,
-  "fast_ms": 41.33
+  "exact_ms": 156.15,
+  "fast_ms": 41.54
  },
  "trajectory": {
   "exact": 3.295e-06,

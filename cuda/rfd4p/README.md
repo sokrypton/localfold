@@ -51,7 +51,7 @@ On `custom_cath_monomer` (54 tokens, the one preset that needs no structure), ag
 checkpoint, all 37 stages — the three init products, the single and pair state after each of the 14
 layers, and the five outputs:
 
-`gate.py` is what re-runs all of it - **27 checks, all green on this A100**: the trunk's stages in
+`gate.py` is what re-runs all of it - **28 checks, all green on this A100**: the trunk's stages in
 five arms at one and two recycles, the encoder, FOUR sampling loops against the reference's own
 trajectory (the monomer, partial diffusion, inverse folding and the small molecule's chirality),
 the native featuriser against the JavaScript's bytes, its refusals, the one-process `--job` form,

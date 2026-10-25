@@ -390,7 +390,7 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // of the noise draws, which features move between steps, when the emit masks apply, whether the
     // step advances x or x1. Two steps exercise all of that as well as sixty and cost minutes
     // instead of hours.
-    if (!o.genOracle.empty()) {
+    if (!o.genOracle.empty() && design == 0) {
       int bad = 0;
       for (const auto& [name, ptr, count] : std::initializer_list<std::tuple<const char*, const float*, size_t>>{
                {"gen/xBb", xBb, (size_t)n * 3}, {"gen/xLl", xLl, (size_t)n * 32}}) {
@@ -559,8 +559,10 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // The loop's INPUT, before anything in the loop can have moved it: the replayed noise against
     // the reference's own draw, and the features this port assembles from it against the ones the
     // reference builds from scratch.
-    if (s == 0 && !o.genOracle.empty() && design + 1 == std::max(1, o.designs) &&
-        M.has("gen/x0Bb")) {
+    // 🔴 DESIGN 0, NOT THE LAST ONE. The oracle's draws are the exporter's, which only the FIRST
+    // design replays - every later one draws its own, so comparing it would be comparing two
+    // different noise streams and calling the difference a port defect.
+    if (s == 0 && !o.genOracle.empty() && design == 0 && M.has("gen/x0Bb")) {
       checkOracle("gen/x0Bb", xBb, (size_t)n * 3, "gen/x0Bb");
       checkOracle("gen/x0Ll", xLl, (size_t)n * 32, "gen/x0Ll");
       checkOracle("gen/f0Seq", seqF, (size_t)n * d.seqF, "gen/f0Seq");
@@ -611,7 +613,7 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // 🔴 EVERY STEP, SO A DIVERGENCE HAS A STEP NUMBER. The backbone's first step divides by
     // t = 0.001, so a difference the trunk makes in the sixth digit leaves it in the third - and
     // the end alone cannot tell that from the loop being wired wrong.
-    if (!o.genOracle.empty() && design + 1 == std::max(1, o.designs)) {
+    if (!o.genOracle.empty() && design == 0) {
       char key[32];
       snprintf(key, sizeof key, "gen/s%dBb", s);
       if (M.has(key)) {
