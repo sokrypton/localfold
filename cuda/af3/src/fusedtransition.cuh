@@ -258,6 +258,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
       }
     }
     __syncwarp();
+    float4 b4;
+    if constexpr (RELU) b4 = ptx_ldg_v4_f32(b2 + c);
     if constexpr (MT == 1) {
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
@@ -266,25 +268,40 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
         float4 a4 = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
         float4 v = pairUnpack4<PT>(pv[i]);
         if constexpr (RELU) {
-          float4 b4 = ptx_ldg_v4_f32(b2 + c);
           a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
         }
         v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
         pairSt4<PT>(x, row * C + c, v);
       }
     } else {
+      constexpr int N_EPI = RW / LPR;
+      constexpr int EPI_B = (N_EPI % 4 == 0) ? 4 : 1;
 #pragma unroll
-      for (int i = 0; i < RW / LPR; ++i) {
-        size_t row = baseRow + i * LPR;
-        if (row >= rows) continue;
-        float4 a4 = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
-        float4 v = pairLd4<PT>(x, row * C + c);
-        if constexpr (RELU) {
-          float4 b4 = ptx_ldg_v4_f32(b2 + c);
-          a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
+      for (int i0 = 0; i0 < N_EPI; i0 += EPI_B) {
+        PairRaw4<PT> pvr[EPI_B];
+        float4 a4v[EPI_B];
+#pragma unroll
+        for (int d = 0; d < EPI_B; ++d) {
+          int i = i0 + d;
+          size_t row = baseRow + i * LPR;
+          if (row < rows) {
+            a4v[d] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
+            pvr[d] = pairLdRaw4<PT>(x, row * C + c);
+          }
         }
-        v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
-        pairSt4<PT>(x, row * C + c, v);
+#pragma unroll
+        for (int d = 0; d < EPI_B; ++d) {
+          int i = i0 + d;
+          size_t row = baseRow + i * LPR;
+          if (row >= rows) continue;
+          float4 a4 = a4v[d];
+          float4 v = pairUnpack4<PT>(pvr[d]);
+          if constexpr (RELU) {
+            a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
+          }
+          v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
+          pairSt4<PT>(x, row * C + c, v);
+        }
       }
     }
     if (hh == 0) __syncwarp();

@@ -4,6 +4,8 @@
 #include "ops.cuh"
 #include "../../af3/src/fusedtransition.cuh"     // (and fusedtriangle.cuh)
 #include "../../af3/src/fused256.cuh"          // (its streaming triangle kernels: a T4's, below)
+#include "outln.cuh"
+#include "ptx_gemm.cuh"
 
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)
@@ -47,6 +49,27 @@ inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t ro
                    bool relu, float beta, int ldx = 0, int ldy = 0, bool bf16 = false) {
   if (ldx == 0) ldx = in;
   if (ldy == 0) ldy = out;
+  const size_t blocks128 = ((out + 127) / 128) * ((rows + 127) / 128);
+  const bool usePtx = ((rows >= 96 && (out % 128 == 0) && blocks128 >= 72) || rows <= 128);
+  if ((in % 32 == 0) && (out % 64 == 0) && (ldx % 8 == 0) && (ldy % 8 == 0) && (beta == 0.f || beta == 1.f) &&
+      usePtx && !getenv("AF2_NO_PTX_GEMM")) {
+    const bool useBf = bf16;
+    const bool hasBeta = (beta != 0.f);
+    if (useBf) {
+      ptx_gemm::dispatchPtxGemm16<__nv_bfloat16, __nv_bfloat16>(
+        reinterpret_cast<const __nv_bfloat16*>(X), reinterpret_cast<const __nv_bfloat16*>(Wt),
+        reinterpret_cast<__nv_bfloat16*>(Y), biasF, rows, in, out, ldx, ldy, relu, hasBeta);
+    } else if (yHalf) {
+      ptx_gemm::dispatchPtxGemm16<half, half>(
+        reinterpret_cast<const half*>(X), reinterpret_cast<const half*>(Wt),
+        reinterpret_cast<half*>(Y), biasF, rows, in, out, ldx, ldy, relu, hasBeta);
+    } else {
+      ptx_gemm::dispatchPtxGemm16<half, float>(
+        reinterpret_cast<const half*>(X), reinterpret_cast<const half*>(Wt),
+        reinterpret_cast<float*>(Y), biasF, rows, in, out, ldx, ldy, relu, hasBeta);
+    }
+    return;
+  }
   if (!LT) CB(cublasLtCreate(&LT));
   const void* bias = bf16 ? biasForBf16(biasF, out) : biasFor(biasF, out, yHalf);
   if (getenv("AF2_LT_SHAPES") && beta != 0.f && biasF) {

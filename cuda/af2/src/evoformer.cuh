@@ -749,7 +749,8 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
     // slower: cuda/af3's transitionUpK in a ReLU-with-bias form, writing these augmented rows, 182.8 ms
     // over 5CAJ's 576 calls against 117.8 for the LN plus this GEMM it replaced, and 181.6 at two tiles a
     // warp. At 256 channels its m16-a-warp MMAs read each weight fragment for one MMA; cuBLAS does better.)
-    size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
+    size_t chunk = std::min(rows, std::max<size_t>(32768, (((size_t)128 << 20) / (2 * (size_t)(I + 8))) & ~(size_t)127));
+    if (!AF2_TIGHT && rows <= 135168) chunk = rows;
     // (on sm_12x the MSA16 stack's MSA transition in one kernel, cuda/af3's fusedTransitionSplit256: 2.41 -> 2.00 ms a
     // call at 1,000 residues x 508 rows on an RTX PRO 6000; slower on an A100, which keeps the two GEMMs below)
     if (MSA16 && !MSA16_HALF && C == 256 && I == 4 * C && ccMajor() == 12 &&
@@ -763,6 +764,23 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
       constexpr bool BF = std::is_same_v<B16, __nv_bfloat16>;
       B16* x16 = reinterpret_cast<B16*>(x);
       B16* xh = scratch<B16>("ftr.xn16", chunk * C);
+      const size_t blocks128 = ((C + 127) / 128) * ((chunk + 127) / 128);
+      if (((chunk >= 96 && blocks128 >= 72) || chunk <= 128) && !getenv("AF2_NO_PTX_GEMM")) {
+        B16* mh = scratch<B16>("ftr.mid16" + std::to_string(I), chunk * I);
+        const void* w1 = msaWeight<B16>(PH(T + "/transition1/weights", blk), (size_t)C * I);
+        const void* w2 = msaWeight<B16>(PH(T + "/transition2/weights", blk), (size_t)I * C);
+        const B16* emitted = (const B16*)takeEmittedLn(T + "/input_layer_norm", blk, x, rows);
+        for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+          size_t r = std::min(chunk, rows - r0);
+          const B16* xin = emitted ? emitted + r0 * C : xh;
+          if (!emitted)
+            layerNormVK<256, B16, B16><<<lnVGrid(r), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
+                                                                                  P(T + "/input_layer_norm/offset", blk));
+          ltGemm(xin, w1, mh, !BF, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I, BF);
+          ltGemm(mh, w2, x16 + r0 * C, !BF, r, I, C, P(T + "/transition2/bias", blk), false, 1.f, 0, 0, BF);
+        }
+        return;
+      }
       B16* mh;
       if constexpr (BF) mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
       else mh = augmentedInput("ftr.mid16h" + std::to_string(I), chunk, I);
@@ -1857,6 +1875,7 @@ inline void warmStackWeights(bool extraZeros = false, bool multimer = false, boo
             bf16Of(rw.out, (size_t)rw.H * rw.Dp * C);
             bf16Of(cw.out, (size_t)cw.H * cw.Dp * C);
             bf16Of(PH(S + "msa_transition/transition1/weights", b), (size_t)C * I);
+            bf16Of(PH(S + "msa_transition/transition2/weights", b), (size_t)I * C);
             bf16Of(w2, (size_t)(I + 8) * C);
             biasForBf16(P(S + "msa_transition/transition1/bias", b), I);
           }

@@ -2347,7 +2347,12 @@ inline AsyncTap& TAP() { static AsyncTap* tap = new AsyncTap(); return *tap; }  
 // a probability or a distance as one byte a pair, on the device, before it is tapped: x / scale, clamped
 __global__ void quantiseK(const float* in, unsigned char* out, size_t n, float scale) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = (unsigned char)fminf(255.f, fmaxf(0.f, rintf(in[i] / scale)));
+  if (i < n) {
+    float q = ptx_div_f32(ptx_ldg_f32(in + i), scale);
+    uint32_t u8;
+    asm("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(u8) : "f"(q));
+    ptx_st_global_u8(out + i, u8);
+  }
 }
 // a file written whole: a temporary renamed into place, so a reader never sees half of one
 inline void writeWhole(const std::string& path, const void* data, size_t bytes) {

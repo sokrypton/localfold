@@ -192,40 +192,49 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
     for (int k = 0; k < K; ++k) { sc[k] = ptx_ldg_f32(scale + lane + 32 * k); of[k] = ptx_ldg_f32(offset + lane + 32 * k); }
   }
   for (int base = 0; base < RPW; base += B) {
-    PT w[B][K];
+    using RawT = std::conditional_t<std::is_same_v<PT, float>, float, unsigned short>;
+    RawT w[B][K];
 #pragma unroll
     for (int b = 0; b < B; ++b) {
       size_t row = rowOf(warp + (base + b) * WARPS);
       const PT* xp = reinterpret_cast<const PT*>(x) + (row != SIZE_MAX ? row * C + lane : 0);
 #pragma unroll
-      for (int k = 0; k < K; ++k) w[b][k] = row != SIZE_MAX ? xp[32 * k] : PT(0.f);
+      for (int k = 0; k < K; ++k) {
+        if constexpr (std::is_same_v<PT, float>) w[b][k] = row != SIZE_MAX ? ptx_ldg_f32(xp + 32 * k) : 0.f;
+        else w[b][k] = row != SIZE_MAX ? ptx_ldg_u16(xp + 32 * k) : (unsigned short)0;
+      }
     }
 #pragma unroll
     for (int b = 0; b < B; ++b) {
       float v[K], s = 0.f;
 #pragma unroll
-      for (int k = 0; k < K; ++k) { v[k] = toF(w[b][k]); s += v[k]; }
+      for (int k = 0; k < K; ++k) {
+        if constexpr (std::is_same_v<PT, float>) v[k] = w[b][k];
+        else if constexpr (std::is_same_v<PT, __nv_bfloat16>) v[k] = ptx_bf16_raw_to_f32(w[b][k]);
+        else v[k] = ptx_f16_raw_to_f32(w[b][k]);
+        s = ptx_add_f32(s, v[k]);
+      }
       s = ptx_warp_sum_f32(s);
       float mean = ptx_div_f32(s, (float)C), inv;
       if constexpr (FAST_VAR) {
         float ss = 0.f;
 #pragma unroll
-        for (int k = 0; k < K; ++k) ss += v[k] * v[k];
+        for (int k = 0; k < K; ++k) ss = ptx_fma_f32(v[k], v[k], ss);
         ss = ptx_warp_sum_f32(ss);
-        inv = ptx_rsqrt_f32(ptx_fma_f32(-mean, mean, ptx_div_f32(ss, (float)C)) + 1e-5f);
+        inv = ptx_rsqrt_f32(ptx_add_f32(ptx_fma_f32(-mean, mean, ptx_div_f32(ss, (float)C)), 1e-5f));
       } else {
         float q = 0.f;
 #pragma unroll
-        for (int k = 0; k < K; ++k) { float d = v[k] - mean; q += d * d; }
+        for (int k = 0; k < K; ++k) { float d = ptx_sub_f32(v[k], mean); q = ptx_fma_f32(d, d, q); }
         q = ptx_warp_sum_f32(q);
-        inv = ptx_rsqrt_f32(ptx_div_f32(q, (float)C) + 1e-5f);
+        inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f));
       }
       half* xrow = Xs + (warp + (base + b) * WARPS) * LDX + lane;
 #pragma unroll
       for (int k = 0; k < K; ++k) {
         float sk = MAX_B > 1 ? sc[k] : ptx_ldg_f32(scale + lane + 32 * k);
         float ok = MAX_B > 1 ? of[k] : ptx_ldg_f32(offset + lane + 32 * k);
-        ptx_st_shared_u16(xrow + 32 * k, ptx_f32_to_f16_raw(ptx_fma_f32((v[k] - mean) * inv, sk, ok)));
+        ptx_st_shared_u16(xrow + 32 * k, ptx_f32_to_f16_raw(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), sk, ok)));
       }
     }
   }

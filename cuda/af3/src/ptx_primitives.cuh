@@ -115,72 +115,72 @@ __device__ __forceinline__ void ptx_st_global_v4_u32(void* p, uint4 v) {
 // ---------------------------------------------------------------- shared memory loads & stores
 __device__ __forceinline__ float ptx_ld_shared_f32(const void* p) {
   float v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.f32 %0, [%1];" : "=f"(v) : "r"(a) : "memory");
+  asm volatile("ld.shared.f32 %0, [%1];" : "=f"(v) : "r"(a));
   return v;
 }
 __device__ __forceinline__ uint32_t ptx_ld_shared_u32(const void* p) {
   uint32_t v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.b32 %0, [%1];" : "=r"(v) : "r"(a) : "memory");
+  asm volatile("ld.shared.b32 %0, [%1];" : "=r"(v) : "r"(a));
   return v;
 }
 __device__ __forceinline__ unsigned short ptx_ld_shared_u16(const void* p) {
   unsigned short v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.b16 %0, [%1];" : "=h"(v) : "r"(a) : "memory");
+  asm volatile("ld.shared.b16 %0, [%1];" : "=h"(v) : "r"(a));
   return v;
 }
 __device__ __forceinline__ float2 ptx_ld_shared_v2_f32(const void* p) {
   float2 v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "r"(a) : "memory");
+  asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "r"(a));
   return v;
 }
 __device__ __forceinline__ float4 ptx_ld_shared_v4_f32(const void* p) {
   float4 v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(a) : "memory");
+  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(a));
   return v;
 }
 __device__ __forceinline__ uint2 ptx_ld_shared_v2_u32(const void* p) {
   uint2 v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(a) : "memory");
+  asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(a));
   return v;
 }
 __device__ __forceinline__ uint4 ptx_ld_shared_v4_u32(const void* p) {
   uint4 v; uint32_t a = ptx_smem_addr(p);
-  asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(a) : "memory");
+  asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(a));
   return v;
 }
 
 __device__ __forceinline__ void ptx_st_shared_f32(void* p, float v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.f32 [%0], %1;" :: "r"(a), "f"(v) : "memory");
+  asm volatile("st.shared.f32 [%0], %1;" :: "r"(a), "f"(v));
 }
 __device__ __forceinline__ void ptx_st_shared_u32(void* p, uint32_t v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.b32 [%0], %1;" :: "r"(a), "r"(v) : "memory");
+  asm volatile("st.shared.b32 [%0], %1;" :: "r"(a), "r"(v));
 }
 __device__ __forceinline__ void ptx_st_shared_u16(void* p, unsigned short v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.b16 [%0], %1;" :: "r"(a), "h"(v) : "memory");
+  asm volatile("st.shared.b16 [%0], %1;" :: "r"(a), "h"(v));
 }
 __device__ __forceinline__ void ptx_st_shared_b16(void* p, unsigned short v) { ptx_st_shared_u16(p, v); }
 __device__ __forceinline__ void ptx_st_shared_v2_f32(void* p, float2 v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(v.x), "f"(v.y) : "memory");
+  asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(v.x), "f"(v.y));
 }
 __device__ __forceinline__ void ptx_st_shared_v2_f32(void* p, float x, float y) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(x), "f"(y) : "memory");
+  asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(x), "f"(y));
 }
 __device__ __forceinline__ void ptx_st_shared_v4_f32(void* p, float4 v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(a), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+  asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(a), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
 }
 __device__ __forceinline__ void ptx_st_shared_v2_u32(void* p, uint2 v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.v2.b32 [%0], {%1, %2};" :: "r"(a), "r"(v.x), "r"(v.y) : "memory");
+  asm volatile("st.shared.v2.b32 [%0], {%1, %2};" :: "r"(a), "r"(v.x), "r"(v.y));
 }
 __device__ __forceinline__ void ptx_st_shared_v4_u32(void* p, uint4 v) {
   uint32_t a = ptx_smem_addr(p);
-  asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" :: "r"(a), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+  asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" :: "r"(a), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
 }
 
 // ---------------------------------------------------------------- PTX type conversions (FP16 / BF16 / FP32)
