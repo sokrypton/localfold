@@ -206,6 +206,19 @@ export async function generate(options) {
     // generator draws from a distribution, and the speed is what makes a reader try
     // another seed. 🔴 WHAT WOULD MAKE IT MORE THAN A TRADE is an oracle dump at
     // 200-400 tokens (there is none) or an independent re-fold of both designs.
+    //
+    // 🔴 AND THE COMMENT ABOVE CAME TRUE AGAIN ONE LEVEL DOWN, WHICH IS WHY IT IS
+    // STILL HERE. Asking for `half` is what put a visitor on the CHUNKED f16 pair
+    // track past n = 512, and that arm was WRONG on a stock Chrome - relRMS 0.43 on
+    // the alpha carbons against the single-chunk arm - while passing on the
+    // subgroup-matrix flags every tool in `tools/gpu/` is run with. Two stock-only
+    // kernel gaps, fixed in a821bd1f, found by an M2 running
+    // `tools/gpu/check-rfd4p-chunked.js` under `LOCALFOLD_STOCK_FLAGS=1`. So the
+    // numbers quoted above are developer-flag numbers, and the arm this line selects
+    // is now held by that gate under BOTH flag sets - stock 1.3e-4 to 2.9e-4,
+    // developer 6.6e-4, over even and ragged plans. A design through the ragged
+    // 4-chunk f16 path on stock flags, n = 200 at 60 steps: median CA-CA 3.864 A,
+    // 199 of 199 bonds in band.
     half: true,
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
     ...(partialTrajectoryFractionSteps === undefined
