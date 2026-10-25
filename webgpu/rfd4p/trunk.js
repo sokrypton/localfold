@@ -74,9 +74,10 @@ export function chunkPlan(nn, opts = {}) {
   const oneChunkRow = wantF16 ? (P / 2 + T / 2 + P / 2 + P) : (P + T + P + 2 * P);
   // 🔴 AND THE CHUNKED SHAPE NO LONGER PAYS FOR gz A ROW: it is nn-indexed now, written
   // once and read once, so that the output gate is not recomputed per chunk (see
-  // `triangle`). What is left R-indexed is zc + xc + phid + proj. The bound has always
-  // described the R-indexed scratch and nothing else, so moving a buffer out of that set
-  // raises R rather than the total - 101944 rows to 122332 at the default bound.
+  // `triangle`). What is left R-indexed is zc + xc + phid - `proj` is gone too, because the
+  // chunked projection writes aT/bT directly now. The bound has always described the
+  // R-indexed scratch and nothing else, so taking a buffer out of that set raises R rather
+  // than the total: 101944 rows with gz and proj in it, 166788 in f32 without them.
   //
   // 🔴 AND THE CHUNKED SHAPE NARROWS TOO, which is what decouples the arithmetic from the
   // slicing. It used to be that `triF16` REQUIRED one chunk, because the chunked kernels
@@ -84,7 +85,7 @@ export function chunkPlan(nn, opts = {}) {
   // the slicing changed, and memory jumped 46% (2056 -> 3001 MiB) while the pass took 2.02x
   // as long. The chunked kernels read and write halves now, so f16 is a property of the
   // DEVICE and the request, and the slicing is a property of the length.
-  const chunkedRow = wantF16 ? (P / 2 + T / 2 + P + T) : ((P + T + 2 * P) + 2 * T);
+  const chunkedRow = wantF16 ? (P / 2 + T / 2 + P) : (P + T + 2 * P);
   const oneChunk = nn * oneChunkRow * 4 <= chunkBytes;
   const fits = Math.max(1, Math.min(nn, Math.floor(chunkBytes / (chunkedRow * 4))));
   // 🔴 AND A CHUNK MUST START ON A MULTIPLE OF FOUR PAIR ROWS, which is `transposeLnOut`'s
@@ -378,7 +379,9 @@ export class Rfd4pTrunkGpu {
       bT: b('bT', triF16 ? Math.ceil((T * nPad * nPad) / 2) : T * nn),
       x: b('x', triF16 ? Math.ceil((T * Math.ceil(nn / 4) * 4) / 2) : T * Math.ceil(nn / 4) * 4),
       zc: b('zc', triF16 ? Math.ceil((R * P) / 2) : R * P),
-      proj: R < nn ? b('proj', triF16 ? R * T : R * 2 * T) : null,
+      // `proj` is gone: the chunked arm's projection writes aT/bT directly through `rowOff`,
+      // so nothing stages 2T channels a row any more. It was R * 2T - 239 MiB at n = 600.
+      proj: null,
       xc: b('xc', triF16 ? Math.ceil((R * T) / 2) : R * T),
       // nn-indexed, not R-indexed: written once by the triangle's first chunk loop and read
       // by its second, so the output gate is never recomputed. See `triangle`.
@@ -618,7 +621,6 @@ export class Rfd4pTrunkGpu {
     // and aT/bT are all `array<f16>` here, and the a/b values pass through untouched - only
     // the incoming transpose rearranges them - so the binding TYPE carries the arithmetic
     // and the body is the same text either way.
-    const triType = triF16 ? 'f16' : 'f32';
     // 🔴 AND IN f16 THE TRIANGLE'S OPERANDS ARE ROW-PADDED TO 16, WHICH IS THE CONTRACTION'S
     // REQUIREMENT AND NOT A LAYOUT PREFERENCE. The subgroup-matrix GEMM wants k divisible by
     // 16; the single-chunk arm has always padded for it (`stride = nPad`), and the first
@@ -665,17 +667,36 @@ export class Rfd4pTrunkGpu {
         fusePairWrite
           ? await e.pairWriteLnIn({ z: B.z, zIn, pp: B.pp, zc: B.zc, w: t.lnIn, rows, n, r0, splitPp, outF16: triF16 })
           : await e.norm({ type: 'ln', x: B.z, y: B.zc, rows, width: P, w: t.lnIn, xOff: r0 * P, inF16: triF16, outF16: triF16 }),
-        await e.triProjG({ x: B.zc, w: t.projG, proj: B.proj, gz: this.gzView(r0, rows), rows, aF16: triF16, outF16: triF16 }),
-        // One layout, both directions - so one pipeline, and the name no longer says which.
-        await e.map('tri-gate', rows * T,
-          [{ buffer: B.aT, write: true, type: triType }, { buffer: B.bT, write: true, type: triType }, { buffer: B.proj, type: triType }],
-          `let rr = i / 256u; let c = i % 256u; let r = U(0u) + rr; let n = U(1u);
-  let st = U(2u); let bs = U(3u);
-  let pr = rr * 512u;
-  let av = b2[pr + c];
-  let bv = b2[pr + 256u + c];
-  let at = c * bs + (r / n) * st + r % n;
-  b0[at] = av; b1[at] = bv;`, [r0, n, stride, batchStride]),
+        // 🔴 STRAIGHT INTO aT/bT, so there is no `proj` and no pass over it. The chunked arm
+        // used to project into an R-indexed staging buffer and then scatter it channel-major
+        // through a `tri-gate` map; `rowOff` lets the fused projection write the destination
+        // itself. Measured, n = 600: the pass goes 4401.7 -> 4099.3 ms and the 103.98 ms
+        // scatter is gone.
+        //
+        // 🔴 AND IT SAVES NO MEMORY AT n = 600, WHICH IS NOT WHAT I PREDICTED. `proj` is
+        // R * 2T and looked like 239 MiB of 2724, but it is R-INDEXED and so inside a fixed
+        // 896 MB budget: taking it out of the row cost raises R instead of lowering the
+        // total. Measured - 2724.0 MiB before and after, with R going 244664 -> 333636 - so
+        // what it actually buys past the saturation point is FEWER CHUNKS (n = 1000 goes 5
+        // to 3), and bytes only below it, where the budget has slack: n = 513 drops 2244.8
+        // -> 2055.6 MiB because its scratch is 707 MB rather than the full 896.
+        //
+        // 🔴 AND IT MAKES THE TWO ARMS AGREE BETTER, which was not the point and is the
+        // most useful thing it did: f16 chunked against f16 single-chunk goes **2.4e-3 ->
+        // 6.6e-4** on the alpha carbons and 4.8e-3 -> 2.2e-3 on the latents. The arms were
+        // running DIFFERENT triProjG epilogues - the `proj` branch's `pairOutCol` against
+        // the fused store - so part of that unexplained residual was simply two
+        // formulations of a*sigmoid(b), and now there is one.
+        //
+        // 🔴 `incoming: false` EVEN FOR THE INCOMING TRIANGLE, and that is not a bug: the
+        // flag only sets `pad0`, which un-transposes the GATE for the single-chunk arm whose
+        // `zc` IS transposed. Here `zc` is a plain row window and the transpose lives in the
+        // contraction's strides, so the gate already comes out in row order and must not be
+        // permuted again.
+        await e.triProjG({
+          x: B.zc, w: t.projG, aT: B.aT, bT: B.bT, gz: this.gzView(r0, rows), rows,
+          n, nPad: stride, batchStride, rowOff: r0, incoming: false, aF16: triF16, outF16: triF16,
+        }),
       );
     }
     // The transpose lives here now, as two strides rather than a pass over the data.

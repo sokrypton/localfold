@@ -114,10 +114,11 @@ describe("the rfd4p trunk's pair-track chunk plan", () => {
   it("pins the default plan's rows, four-aligned", () => {
     // The bound the trunk ships with, stated so a change to the row cost has to be
     // deliberate. It was 101944 while gz was R-indexed and is 122332 now that gz is held
-    // whole - the bound describes the R-indexed scratch, so taking a buffer out of that set
-    // buys rows rather than bytes.
+    // whole and `proj` stopped existing - the bound describes the R-indexed scratch, so
+    // taking a buffer out of that set buys rows rather than bytes. 101944 -> 122332 ->
+    // 166816 as gz and then proj left it.
     const { R, chunks } = chunkPlan(600 * 600, {});
-    expect(R).toBe(122332);
+    expect(R).toBe(166816);
     expect(R % 4).toBe(0);
     expect(chunks).toBe(3);
   });

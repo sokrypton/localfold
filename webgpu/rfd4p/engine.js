@@ -2949,7 +2949,24 @@ export class Rfd4pEngine {
    * tiles 0..7 write `a = a_p * sigm(a_g)` and `b = b_p * sigm(b_g)` (`[rows, 512]`) to `proj`;
    * tiles 8..10 write `sigm(g)` (`[rows, 384]`) to `gz`.
    */
-  triProjG({ x, w, wSum = null, proj, aT, bT, gz, rows, incoming = false, n = 0, nPad = n, aF16 = false, outF16 = false, label }) {
+  /**
+   * The fused pair projection: a, b and the output gate in one m x 1408 x 384 GEMM.
+   *
+   * 🔴 `rowOff` IS WHAT LETS A CHUNK WRITE aT/bT DIRECTLY, so the chunked arm needs neither
+   * a `proj` staging buffer nor a scatter pass over it. It rides on `C.off`, which the pair
+   * epilogue does not otherwise read (that path indexes `c[cBase * p.sC0 + mPad]` with no
+   * `offC` term), so one uniform carries it and the shader text is the same for both arms -
+   * at `rowOff = 0` the added term is `m + 0` and the single-chunk arm is unchanged.
+   *
+   * It has to be added BEFORE the row index is divided into the padded layout, not after:
+   * `mPad` is `(m / sCn) * sCm + m % sCn`, so a flat offset on the result would only be
+   * right when r0 happened to be a multiple of n.
+   *
+   * `batchStride` is the per-channel slice, which the chunked arm pads in BOTH dimensions
+   * (nPad x nPad) because its incoming contraction reads the operand transposed by stride
+   * and so reaches row nPad - 1.
+   */
+  triProjG({ x, w, wSum = null, proj, aT, bT, gz, rows, incoming = false, n = 0, nPad = n, rowOff = 0, batchStride = n * nPad, aF16 = false, outF16 = false, label }) {
     if (aT && bT) {
       const f16Out = outF16 && this.hasF16 && w.half === true;
       const submat = this.hasSubgroupMatrix && w.half === true;
@@ -2962,7 +2979,7 @@ export class Rfd4pEngine {
       const triEpi2 = !this.gemmVariant?.baseline && (this.gemmVariant?.triEpi2 ?? true);
       return this.gemm({
         m: rows, n: 1408, k: 384, a: x, b: w, c: aT, bias: wSum ?? undefined, inNorm: inLn ? 'ln' : '', noSmall: true, aF16, pad0: incoming ? n : 0,
-        A: { off: 0, m: 384, k: 1 }, B: { off: 0, n: 384, k: 1 }, C: { off: 0, s0: n * nPad, m: nPad, n },
+        A: { off: 0, m: 384, k: 1 }, B: { off: 0, n: 384, k: 1 }, C: { off: rowOff, s0: batchStride, m: nPad, n },
         pair: {
           key: `triprojg-ab${f16Out ? '-h' : ''}${inLn ? '-ln' : ''}`,
           colMajorStore: 'cond1024',
@@ -3004,7 +3021,7 @@ export class Rfd4pEngine {
   let cSub = li / 64u;
   let m = m0 + mLocal;
   let mValid = inBatch && (m < p.m);
-  let mPad = select(m, (m / p.sCn) * p.sCm + (m % p.sCn), p.sCm != p.sCn);
+  let mg = m + p.offC; let mPad = select(mg, (mg / p.sCn) * p.sCm + (mg % p.sCn), p.sCm != p.sCn);
   let r4 = mLocal / 4u;
   let comp = mLocal % 4u;
   if (mValid) {
@@ -3049,7 +3066,7 @@ export class Rfd4pEngine {
   let cSub = li / 64u;
   let m = m0 + mLocal;
   let mValid = inBatch && (m < p.m) && (n0 < 1024u);
-  let mPad = select(m, (m / p.sCn) * p.sCm + (m % p.sCn), p.sCm != p.sCn);
+  let mg = m + p.offC; let mPad = select(mg, (mg / p.sCn) * p.sCm + (mg % p.sCn), p.sCm != p.sCn);
   let r4 = mLocal / 4u;
   let comp = mLocal % 4u;
   if (mValid) {
@@ -3102,7 +3119,7 @@ export class Rfd4pEngine {
         ${inLn ? (this.submat8 ? `let mean = lnStat[rLocal * 2u];
         let inv = lnStat[rLocal * 2u + 1u];` : `let mean = f32(scratch[rLocal * 34u + 32u]);
         let inv = f32(scratch[rLocal * 34u + 33u]);`) : ''}
-        let mPad = select(m, (m / p.sCn) * p.sCm + (m % p.sCn), p.sCm != p.sCn);
+        let mg = m + p.offC; let mPad = select(mg, (mg / p.sCn) * p.sCm + (mg % p.sCn), p.sCm != p.sCn);
         let s8 = 8u * p.sC0;
         if (n0 < 512u) {
           let c0 = ((n0 / 2u) + cSub) * p.sC0 + mPad;
