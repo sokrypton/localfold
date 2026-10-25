@@ -4,6 +4,7 @@
 // Everything else is reused - `gemm`/`linear` (cuda/ef2/src/ops.cuh, cuda/af3/src/common.cuh),
 // `layerNorm` for the pair track's LayerNorms, `flashGrid` for the attention.
 #pragma once
+#include <set>
 #include "../../ef2/src/ops.cuh"
 
 namespace rfd4p {
@@ -169,6 +170,19 @@ __global__ void mulSigmoidAddK(const float* __restrict__ a, const float* __restr
   if (pairMask && pairMask[i / C] == 0.f) return;
   z[i] += a[i] * (1.f / (1.f + __expf(-b[i])));
 }
+// As above, with the gate read CHANNEL-MAJOR: it comes out of the triangle's fused projection in
+// plane layout, and an index is cheaper than the GEMM that producing it separately would cost.
+__global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const float* __restrict__ gPlanes,
+                                        const float* __restrict__ pairMask, float* __restrict__ z,
+                                        size_t rows, int C) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C) return;
+  size_t p = i / C;
+  if (pairMask && pairMask[p] == 0.f) return;
+  const float g = gPlanes[(size_t)(i - p * C) * rows + p];
+  z[i] += a[i] * (1.f / (1.f + __expf(-g)));
+}
+
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
 __global__ void biasReluK(float* __restrict__ x, const float* __restrict__ bias, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -285,14 +299,17 @@ inline void fromPlanes(const float* in, float* out, size_t pairs, int C) {
 // flash reads one `[position][q | k | v | gate]` row of `4W`. q and k are written there already, normed
 // straight out of the `to_qkv` projection by two strided `rmsNorm`s; this puts v (still in that
 // projection, at its third `W`) and the gate beside them.
+// `src` is the fused [q | k | v | g] projection, one row of `4 * W` a token; q and k are already in
+// `qkvg`, normed. 🔴 THE ROW STRIDE IS AN ARGUMENT because it was 3W when q/k/v came from one GEMM and
+// the gate from another, and 4W once they were fused - baked in, it reads the wrong token's v and
+// still produces a full, finite attention.
 template <class T>
-__global__ void packVGK(const float* __restrict__ v, const float* __restrict__ gate,
-                        T* __restrict__ qkvg, size_t n, int W) {
+__global__ void packVGK(const float* __restrict__ src, T* __restrict__ qkvg, size_t n, int W) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n * (size_t)W) return;
   size_t pos = i / W;
   int c = (int)(i - pos * W);
-  const float vv = v[pos * 3 * W + c], gg = gate[i];
+  const float vv = src[pos * 4 * W + 2 * W + c], gg = src[pos * 4 * W + 3 * W + c];
   if constexpr (std::is_same_v<T, half>) {
     qkvg[pos * 4 * W + 2 * W + c] = __float2half(vv);
     qkvg[pos * 4 * W + 3 * W + c] = __float2half(gg);

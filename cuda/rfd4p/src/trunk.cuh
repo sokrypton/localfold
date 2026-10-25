@@ -47,6 +47,27 @@ inline std::string wn(const std::string& name) { return "w/" + name; }
 // config (`tri_mult_bias: false`), and the reference reads them with `getOptionalTensorData`.
 inline const float* optW(const std::string& name) { return hasW(name) ? W(name) : nullptr; }
 
+// Several `[out, in]` weights stacked along `out`, built once and cached under `key`. A row-major
+// `[out, in]` matrix stacks by plain concatenation, so this is a copy and not a layout change - which
+// is the whole reason the exporter leaves the checkpoint's orientation alone.
+inline std::string stacked(const std::string& key, const std::vector<std::string>& parts) {
+  static std::set<std::string> built;
+  if (!built.count(key)) {
+    size_t total = 0;
+    for (const auto& part : parts) total += lenW(part);
+    float* w = dalloc(total);
+    size_t at = 0;
+    for (const auto& part : parts) {
+      CK(cudaMemcpyAsync(w + at, W(part), lenW(part) * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
+      at += lenW(part);
+    }
+    CK(cudaStreamSynchronize(STREAM));
+    deviceWeight(key, w, total);
+    built.insert(key);
+  }
+  return key;
+}
+
 // ---------------------------------------------------------------- the two conditioned wrappers
 //
 // `out = RMSNorm(x) * sigmoid(gamma) + beta`, gamma and beta two linears of `RMSNorm(cond; norm_cond)`.
@@ -142,13 +163,15 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
   float* normed = scratch<float>("rfd4p.at.norm", n * W_);
   rmsNorm(nodes, normed, n, W_, W(wn(pre + ".node_norm.weight")));
 
-  float* qkv = scratch<float>("rfd4p.at.qkv", n * (size_t)W_ * 3);
-  linear<float, float>(normed, qkv, n, W_, W_ * 3, wn(pre + ".to_qkv.weight"), true);
-  addBias(qkv, W(wn(pre + ".to_qkv.bias")), n, W_ * 3);
-
-  float* gate = scratch<float>("rfd4p.at.gate", n * W_);
-  linear<float, float>(normed, gate, n, W_, W_, wn(pre + ".to_g.weight"), true);
-  addBias(gate, W(wn(pre + ".to_g.bias")), n, W_);
+  // q, k, v and the gate are four projections of one normed input, so they are one [4W, W] GEMM and
+  // one bias - and the result is already [q | k | v | g] per token, which is flash's own layout.
+  const std::string qkvgW = stacked(wn(pre + ".qkvg~"),
+                                     {wn(pre + ".to_qkv.weight"), wn(pre + ".to_g.weight")});
+  const std::string qkvgB = stacked(wn(pre + ".qkvgb~"),
+                                     {wn(pre + ".to_qkv.bias"), wn(pre + ".to_g.bias")});
+  float* qkv = scratch<float>("rfd4p.at.qkv", n * (size_t)W_ * 4);
+  linear<float, float>(normed, qkv, n, W_, W_ * 4, qkvgW, true);
+  addBias(qkv, W(qkvgB), n, W_ * 4);
 
   // bias [pairs, heads] -> [head][i][j] with a padded row stride, which is the layout flash reads.
   const int stride = (d.n + 7) / 8 * 8;
@@ -171,9 +194,9 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     half* qkvg = scratch<half>("rfd4p.at.qkvg16", packed);
     half* bias = scratch<half>("rfd4p.at.bias16", biasFloats);
     half* attn = scratch<half>("rfd4p.at.out16", n * W_);
-    rmsNorm<half>(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-    rmsNorm<half>(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-    packVGK<half><<<blocks(n * W_), 256, 0, STREAM>>>(qkv + 2 * W_, gate, qkvg, n, W_);
+    rmsNorm<half>(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
+    rmsNorm<half>(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
+    packVGK<half><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
     biasLayoutK<half><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
                                                               LOG2E);
     flashGrid<half>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
@@ -183,9 +206,9 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     float* qkvg = scratch<float>("rfd4p.at.qkvg", packed);
     float* bias = scratch<float>("rfd4p.at.bias", biasFloats);
     float* attn = scratch<float>("rfd4p.at.out", n * W_);
-    rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-    rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-    packVGK<float><<<blocks(n * W_), 256, 0, STREAM>>>(qkv + 2 * W_, gate, qkvg, n, W_);
+    rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
+    rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
+    packVGK<float><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
     biasLayoutK<float><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
                                                                1.f);
     flashGrid<float>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
@@ -218,22 +241,18 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
   // concatenation, because `[out, in]` row-major stacks along `out`. `linearPlanes` then writes the
   // result channel-major, which is what `toPlanesK` used to produce: that transpose was the largest
   // single kernel in the profile at 14.8%, and it is now nothing at all.
-  const std::string fused = wn(pre + ".abpg~");
-  if (!hasW(fused)) {
-    float* w = dalloc(4 * (size_t)cH * cZ);
-    const char* parts[4] = {".linear_a_p", ".linear_a_g", ".linear_b_p", ".linear_b_g"};
-    for (int q = 0; q < 4; ++q) {
-      CK(cudaMemcpyAsync(w + (size_t)q * cH * cZ, W(wn(pre + parts[q] + ".weight")),
-                         (size_t)cH * cZ * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
-    }
-    CK(cudaStreamSynchronize(STREAM));
-    deviceWeight(fused, w, 4 * (size_t)cH * cZ);
-  }
-  float* planes = scratch<float>("rfd4p.tri.planes", 4 * rows * cH);
-  linearPlanes(zNorm, planes, rows, cZ, 4 * cH, fused);
+  // a_p, a_g, b_p, b_g AND the output gate all read this same zNorm, so all five stack into one
+  // [4 * cH + cZ, cZ] projection - one GEMM a triangle instead of five.
+  const std::string fused = stacked(wn(pre + ".abpgz~"),
+                                    {wn(pre + ".linear_a_p.weight"), wn(pre + ".linear_a_g.weight"),
+                                     wn(pre + ".linear_b_p.weight"), wn(pre + ".linear_b_g.weight"),
+                                     wn(pre + ".linear_g.weight")});
+  float* planes = scratch<float>("rfd4p.tri.planes", (4 * (size_t)cH + cZ) * rows);
+  linearPlanes(zNorm, planes, rows, cZ, 4 * cH + cZ, fused);
   gatePlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(planes, pairMask, rows, cH);
   const float* aT = planes;
   const float* bT = planes + 2 * rows * (size_t)cH;
+  const float* gPlanes = planes + 4 * rows * (size_t)cH;
 
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
@@ -248,14 +267,12 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
   float* xNorm = scratch<float>("rfd4p.tri.xn", rows * cH);
   layerNorm(x, xNorm, rows, cH, W(wn(pre + ".layer_norm_out.weight")), optW(wn(pre + ".layer_norm_out.bias")));
   float* xProj = scratch<float>("rfd4p.tri.xp", rows * cZ);
-  float* gProj = scratch<float>("rfd4p.tri.gp", rows * cZ);
   linear<float, float>(xNorm, xProj, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
   if (hasW(wn(pre + ".linear_z.bias"))) addBias(xProj, W(wn(pre + ".linear_z.bias")), rows, cZ);
-  linear<float, float>(zNorm, gProj, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
-  if (hasW(wn(pre + ".linear_g.bias"))) addBias(gProj, W(wn(pre + ".linear_g.bias")), rows, cZ);
   // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
-  // was taken at the top, so nothing downstream of here reads z again.
-  mulSigmoidAddK<<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gProj, pairMask, z, rows, cZ);
+  // was taken at the top, so nothing downstream of here reads z again. The gate arrives channel-major
+  // out of the fused projection, which costs the kernel an index and saves a whole GEMM.
+  mulSigmoidAddPlaneGateK<<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z, rows, cZ);
 }
 
 // ---------------------------------------------------------------- the pair update
