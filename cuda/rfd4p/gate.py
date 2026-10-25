@@ -513,6 +513,31 @@ def main() -> int:
                       if caca else f"  {'int8 job':10s} no structure  FAILED")
                 got["int8_job"] = {"caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
 
+            # 🔴 AND A JOB THAT NAMES AN INPUT STRUCTURE MUST FOLD, not merely featurise. Every
+            # arm above is a contig - a pure design job where most of the structure pipeline is a
+            # no-op - and this one runs the whole of it in the fold binary: the mmCIF reader, the
+            # fourteen transform stages and `convertToProteinaBatch` on real atoms. It is scored
+            # on the CHAIN, because the reference's own trajectory for a structure job is what
+            # the featuriser arm already compares byte for byte; what this adds is that the batch
+            # those bytes describe folds into a protein.
+            if (REPO / "model-rfd4p-int8" / "shards" / "shard_000.bin").exists():
+                sfold = HERE / "featurise" / "gate-structure-fold.json"
+                spdb = HERE / "gate-structure-fold.pdb"
+                bundle = REPO / "model-rfd4p-int8"
+                run([BINARY, f"--job={sfold}", f"--int8={bundle}",
+                     f"--work-dir={HERE / 'gate-structure-fold'}", f"--out={spdb}", "--seed=0",
+                     "--fast"], cwd=REPO)
+                caca = chain_steps(spdb)
+                ok = bool(caca) and 3.4 <= (sum(caca) / len(caca)) <= 4.1 and min(caca) > 2.8
+                if not ok:
+                    failed += 1
+                print(f"  {'structure':10s} a job with an input structure folds, "
+                      f"{len(caca)} CA-CA mean {sum(caca) / len(caca):.3f} A  "
+                      f"{'ok ' if ok else 'NOT A CHAIN'}"
+                      if caca else f"  {'structure':10s} no structure  FAILED")
+                got["structure_job"] = {
+                    "caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
+
             # 🔴 AND A TWO-CHAIN DESIGN MUST COME OUT AS TWO CHAINS, in both formats. The writer
             # used to put every atom in chain A - the chains were in the batch and simply not
             # carried to it - which for a binder or a complex is a structure no viewer and no

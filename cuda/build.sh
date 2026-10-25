@@ -109,7 +109,16 @@ for port in "${ports[@]}"; do
   # (rfd4p is built on cuda/ef2's ops and cuda/af3's flash, and links its OWN featuriser object -
   # cuda/rfd4p/featurise, whose pipeline shares nothing with AF3's - so `--job=<spec>` featurises
   # and folds in one process)
-  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh); link=("$here/rfd4p/featurise/featurise.o"); }
+  # 🔴 AND ITS FEATURISER'S SOURCES ARE IN THE STAMP, because it LINKS that object. The stamp
+  # below hashes `cuda/featurise` - the AF3 lineage's - and rfd4p's pipeline lives in
+  # `cuda/rfd4p/featurise`, so a change there rebuilt `rfd4p-featurise` and left
+  # `localfold-rfd4p` linked against the PREVIOUS object. A structure job featurised correctly
+  # through the standalone binary and refused through the fold one, with nothing in the diff to
+  # explain it. Same shape as the stamp that hashed five files while the structure path lived
+  # in three more.
+  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh "$here"/rfd4p/featurise/*.cpp \
+    "$here"/rfd4p/featurise/*.h "$here"/rfd4p/featurise/*.inc); \
+    link=("$here/rfd4p/featurise/featurise.o"); }
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
