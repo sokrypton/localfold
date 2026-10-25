@@ -751,12 +751,13 @@ inline Emit emitMasks(const Batch& b) {
   return e;
 }
 
-}  // namespace featurise
-}  // namespace rfd4p
-
-// ---------------------------------------------------------------- main
-int main(int argc, char** argv) {
-  using namespace rfd4p::featurise;
+// ---------------------------------------------------------------- the entry point
+//
+// 🔴 A FUNCTION, NOT A `main`, SO THE FOLD BINARY CAN CALL IT. `localfold-rfd4p --job=<spec>`
+// links this object and featurises in its OWN process before the fold, which is what every other
+// port here does (`lf::standalone::main`) - the alternative is a second process and a directory
+// on disk between them.
+int run(int argc, char** argv) {
   using lf::Json;
   using lf::parseJson;
   using rfd4p::Schedule;
@@ -765,7 +766,6 @@ int main(int argc, char** argv) {
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
   using rfd4p::recycleDepths;
-  namespace tables = rfd4p::tables;
   string out, specPath, weightsDir, configPath;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
@@ -1095,3 +1095,10 @@ int main(int argc, char** argv) {
   printf("%s: %d steps, %.1f MB\n", gen.c_str(), steps, g.offset * 4 / 1e6);
   return 0;
 }
+
+}  // namespace featurise
+}  // namespace rfd4p
+
+#ifndef RFD4P_FEATURISE_NO_MAIN
+int main(int argc, char** argv) { return rfd4p::featurise::run(argc, argv); }
+#endif

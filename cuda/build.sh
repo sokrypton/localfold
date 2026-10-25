@@ -68,8 +68,13 @@ rfstamp="$(cat "$here"/rfd4p/featurise/featurise.cpp "$here"/rfd4p/featurise/tab
   "$here"/rfd4p/src/schedule.h "$here"/featurise/jsmath.h "$here"/featurise/json.h \
   | sha256sum | cut -c1-16)"
 if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; then
+  # ...and the same code as an object the fold links, by the same g++ with the same flags, so a
+  # `--job` fold reads the featuriser's own bytes.
   ( g++ -std=c++17 -O2 -ffp-contract=off "$here/rfd4p/featurise/featurise.cpp" -o "$rfbin.building" \
       >> "$log" 2>&1 \
+    && g++ -std=c++17 -O2 -ffp-contract=off -DRFD4P_FEATURISE_NO_MAIN \
+         -c "$here/rfd4p/featurise/featurise.cpp" -o "$here/rfd4p/featurise/featurise.o" \
+         >> "$log" 2>&1 \
     && mv "$rfbin.building" "$rfbin" && echo "$rfstamp" > "$rfbin.stamp" \
     && echo "built rfd4p-featurise" >> "$log" \
     || { echo "FAILED rfd4p-featurise" >> "$log"; exit 1; } ) &
@@ -95,9 +100,10 @@ for port in "${ports[@]}"; do
   # (bioemu2 is built on them too, and links the featuriser: `localfold-bioemu2 --job=...`)
   extra=(); link=("$sobj"); [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
   [ "$port" != bioemu2 ] || extra=("$here"/ef2/src/*.cuh)
-  # (rfd4p is built on cuda/ef2's ops and cuda/af3's flash; it links no featuriser YET - it reads an
-  # exported input directory and has no --job form, so there is nothing for standalone.o to dispatch)
-  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  # (rfd4p is built on cuda/ef2's ops and cuda/af3's flash, and links its OWN featuriser object -
+  # cuda/rfd4p/featurise, whose pipeline shares nothing with AF3's - so `--job=<spec>` featurises
+  # and folds in one process)
+  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh); link=("$here/rfd4p/featurise/featurise.o"); }
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical

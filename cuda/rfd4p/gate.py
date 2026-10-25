@@ -384,6 +384,26 @@ def main() -> int:
                   f"{'  ' + first if first else ''}  {mark}")
             got["featurise"] = {"cases": len(cases), "differing": bad_fields}
 
+            # 🔴 AND THE ONE-PROCESS FORM, because linking the featuriser in is a second way to
+            # reach it and a second way to get it wrong. `--job=<spec>` must produce the SAME PDB
+            # as featurising to a directory and folding that directory - byte for byte, since both
+            # routes run the same code over the same bytes.
+            jobdir = HERE / "gate-job"
+            jobpdb, viapdb = HERE / "gate-job.pdb", HERE / "gate-via.pdb"
+            r = run([BINARY, f"--job={ranged}", f"--weights={args.weights}",
+                     f"--work-dir={jobdir}", f"--out={jobpdb}", "--seed=0"], cwd=REPO)
+            run([BINARY, HERE / "gate-nat-ranged0", f"--weights={args.weights}",
+                 f"--generate={HERE / 'gate-nat-ranged0'}-gen", f"--out={viapdb}"], cwd=REPO)
+            same = (jobpdb.exists() and viapdb.exists()
+                    and jobpdb.read_bytes() == viapdb.read_bytes())
+            if not same:
+                failed += 1
+                if r.returncode != 0:
+                    print(r.stdout[-800:], r.stderr[-600:])
+            print(f"  {'job':10s} one process against featurise-then-fold  "
+                  f"{'ok ' if same else 'DIFFERS'}")
+            got["job"] = {"same_pdb": bool(same)}
+
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:
         ensure_inputs(case_dir, None, export_flags)

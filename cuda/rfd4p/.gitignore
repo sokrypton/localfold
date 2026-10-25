@@ -11,3 +11,6 @@ gate-nat-*/
 gate-js-*/
 gate-cath.json
 featurise/gate-cath.json
+gate-job/
+gate-job.pdb
+gate-via.pdb

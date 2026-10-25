@@ -1,0 +1,30 @@
+m meta/nGroups 1
+m meta/steps 10
+m meta/centeringScale 0.20000000000000001
+m meta/distDim 30
+m meta/distMin 0.10000000000000001
+m meta/distMax 3
+m meta/alignChirality 0
+m meta/chirOff -1
+m meta/chiralFrameWidth 0
+m meta/partial 0
+m meta/inverseFolding 0
+m meta/partialTBb 0
+m meta/partialTLl 0
+m meta/baseNsteps 10
+m meta/fullNsteps 0
+t g/pairNoDist 0 61632
+t g/cond 61632 146160
+t g/cond1 207792 146160
+t g/pairCond 353952 5120
+t g/noise 359072 8043
+t g/emitBb 367115 24
+t g/emitLl 367139 24
+i g/depths 367163 10
+i g/stochastic 367173 20
+i g/coordCond 367193 24
+i g/moleculeIid 367217 24
+i g/condSeq 367241 24
+i g/allowedTypes 367265 1029
+i g/atom37Legal 368294 5439
+i g/coordGroup 373733 888

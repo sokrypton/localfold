@@ -281,6 +281,17 @@ cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --sp
 cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --length=100
 ```
 
+**Or in one process**, which is the form to use: the fold binary links the same object and
+featurises before it folds, so a condition spec goes in and a structure comes out with nothing
+else on the path.
+
+```
+cuda/rfd4p/localfold-rfd4p --job=<job.json> --weights=cuda/rfd4p/weights-f32 --out=design.pdb
+```
+
+The gate holds that route to the two-step one byte for byte, because linking the featuriser in is
+a second way to reach it and a second way to get it wrong.
+
 `--generate` writes the whole-generation directory too, so **a fold from a condition spec needs no
 JavaScript at all** - and its PDB is byte-identical to the one the exporter's own directory
 produces.
@@ -403,8 +414,6 @@ residues the cropped example does not contain, so building one from the spec fai
 - **A native featuriser for an input STRUCTURE.** The spec path is done (below); the seven
   `web/examples/*.cif.zst` presets still go through `export_input.mjs`, because they need the
   mmCIF reader, the CCD bond tables and the chirality templates.
-- **A `--job` form on the fold binary.** The featuriser and the fold are two processes; the other
-  ports dispatch through `lf::standalone::main` in one.
 - **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
   group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
   shipped preset has one.

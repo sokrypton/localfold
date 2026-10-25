@@ -21,10 +21,16 @@
 #include <fstream>
 #include <chrono>
 
+// 🔴 OUTSIDE THE ANONYMOUS NAMESPACE. Declared inside it this is `<unnamed>::rfd4p`, which
+// shadows the real namespace and makes every `rfd4p::Dims` in the file fail to resolve.
+// The featuriser, linked in rather than run as a second process (featurise/featurise.cpp).
+namespace rfd4p { namespace featurise { int run(int argc, char** argv); } }
+
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, out = "design.pdb";
+  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job,
+      out = "design.pdb";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
   int designs = 1;   // generate this many times, so a WARM one can be timed
@@ -597,6 +603,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 13, "--gen-oracle=")) o.genOracle = f.substr(13);
     else if (!f.compare(0, 13, "--enc-oracle=")) o.encOracle = f.substr(13);
     else if (!f.compare(0, 10, "--encoder=")) o.enc = f.substr(10);
+    else if (!f.compare(0, 6, "--job=")) o.job = f.substr(6);
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
@@ -614,9 +621,48 @@ int foldMain(int argc, char** argv) {
 
 }  // namespace
 
+// 🔴 `--job=<spec>` IS ONE PROCESS AND NO JAVASCRIPT. The featuriser is linked in, so a condition
+// spec is turned into the input directory here - by the same code, with the same bytes, that
+// `rfd4p-featurise` writes - and the fold reads it straight after. The directory is still written
+// to disk because that is what the port reads and what a second run can reuse; what is gone is
+// the second process and the Node it needed.
+int jobMain(int argc, char** argv) {
+  std::string job, weights, outDir, rest;
+  std::vector<std::string> keep;
+  for (int i = 1; i < argc; ++i) {
+    const std::string f = argv[i];
+    if (!f.compare(0, 6, "--job=")) job = f.substr(6);
+    else if (!f.compare(0, 10, "--weights=")) { weights = f.substr(10); keep.push_back(f); }
+    else if (!f.compare(0, 11, "--work-dir=")) outDir = f.substr(11);
+    else keep.push_back(f);
+  }
+  if (outDir.empty()) outDir = job + ".featurised";
+  std::vector<std::string> fargs = {"rfd4p-featurise", outDir, "--weights=" + weights,
+                                    "--spec=" + job, "--generate"};
+  // A seed given to the fold is the job's seed, and both halves need it.
+  for (const std::string& f : keep) {
+    if (!f.compare(0, 7, "--seed=") || !f.compare(0, 9, "--config=")) fargs.push_back(f);
+  }
+  std::vector<char*> fargv;
+  for (std::string& f : fargs) fargv.push_back(f.data());
+  if (int rc = rfd4p::featurise::run((int)fargv.size(), fargv.data())) return rc;
+
+  std::vector<std::string> own = {argv[0], outDir, "--generate=" + outDir + "-gen"};
+  for (const std::string& f : keep) {
+    if (f.compare(0, 2, "--") == 0 && f.compare(0, 7, "--seed=") != 0) own.push_back(f);
+  }
+  std::vector<char*> ownv;
+  for (std::string& f : own) ownv.push_back(f.data());
+  return foldMain((int)ownv.size(), ownv.data());
+}
+
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (!strncmp(argv[i], "--job=", 6)) return jobMain(argc, argv);
+  }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) {
-    fprintf(stderr, "usage: localfold-rfd4p <input dir> --weights=<dir> [--oracle=<dir>]\n");
+    fprintf(stderr, "usage: localfold-rfd4p <input dir> --weights=<dir> [--oracle=<dir>]\n"
+                    "       localfold-rfd4p --job=<spec.json> --weights=<dir> [--out=<pdb>]\n");
     return 1;
   }
   return foldMain(argc, argv);
