@@ -15,6 +15,13 @@ namespace rfd4p {
 // 🔴 TF32 IS NOT f32 AND THE ORACLE BOUND MOVES WITH IT. Ten mantissa bits against twenty-three, so a
 // trunk that reads 6e-7 exact reads ~1e-3 here. That is the reason it is a FLAG and the strict path
 // stays the default: the parity gate runs the exact arm, and --fast is held to a looser bar.
+// Four values a thread from either an f32 or a half source.
+__device__ __forceinline__ float4 quad(const float4* p, size_t i) { return p[i]; }
+__device__ __forceinline__ float4 quad(const __half2* p, size_t i) {
+  const float2 a = __half22float2(p[2 * i]), b = __half22float2(p[2 * i + 1]);
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+
 inline cublasComputeType_t computeType() {
   return F32_TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 }
@@ -388,8 +395,8 @@ __global__ void mulSigmoidAddK(const float* __restrict__ a, const float* __restr
 }
 // As above, with the gate read CHANNEL-MAJOR: it comes out of the triangle's fused projection in
 // plane layout, and an index is cheaper than the GEMM that producing it separately would cost.
-template <class T, class TZ>
-__global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __restrict__ gPlanes,
+template <class TA, class T, class TZ>
+__global__ void mulSigmoidAddPlaneGateK(const TA* __restrict__ a, const T* __restrict__ gPlanes,
                                         const float* __restrict__ pairMask, TZ* __restrict__ z,
                                         size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -397,17 +404,17 @@ __global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __
   size_t p = i / C;
   if (pairMask && pairMask[p] == 0.f) return;
   const float g = (float)gPlanes[(size_t)(i - p * C) * rows + p];
-  z[i] = (TZ)((float)z[i] + a[i] * (1.f / (1.f + __expf(-g))));
+  z[i] = (TZ)((float)z[i] + (float)a[i] * (1.f / (1.f + __expf(-g))));
 }
 
-template <class T, class TZ>
-__global__ void mulSigmoidAddGateK(const float* __restrict__ a, const T* __restrict__ gate,
+template <class TA, class T, class TZ>
+__global__ void mulSigmoidAddGateK(const TA* __restrict__ a, const T* __restrict__ gate,
                                    const float* __restrict__ pairMask, TZ* __restrict__ z,
                                    size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   if (pairMask && pairMask[i / C] == 0.f) return;
-  z[i] = (TZ)((float)z[i] + a[i] * (1.f / (1.f + __expf(-(float)gate[i]))));
+  z[i] = (TZ)((float)z[i] + (float)a[i] * (1.f / (1.f + __expf(-(float)gate[i]))));
 }
 template <class T>
 __global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __restrict__ gate,
@@ -429,8 +436,8 @@ __global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __res
 }
 // The same for the gated add. The gate stays a strided read - that is the layout the fused
 // projection produces and the short form keeps - but x, z and the sigmoid go four at a time.
-template <class T>
-__global__ void mulSigmoidAddPlaneGate4HK(const float4* __restrict__ a, const T* __restrict__ gPlanes,
+template <class TA4, class T>
+__global__ void mulSigmoidAddPlaneGate4HK(const TA4* __restrict__ a, const T* __restrict__ gPlanes,
                                           const float* __restrict__ pairMask,
                                           __half2* __restrict__ z, size_t rows, int C4) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -438,7 +445,7 @@ __global__ void mulSigmoidAddPlaneGate4HK(const float4* __restrict__ a, const T*
   const size_t p = i / C4;
   if (pairMask && pairMask[p] == 0.f) return;
   const int c0 = (int)(i - p * C4) * 4;
-  const float4 aa = a[i];
+  const float4 aa = quad(a, i);
   float g[4];
   #pragma unroll
   for (int k = 0; k < 4; ++k) g[k] = (float)gPlanes[(size_t)(c0 + k) * rows + p];
@@ -451,14 +458,14 @@ __global__ void mulSigmoidAddPlaneGate4HK(const float4* __restrict__ a, const T*
   z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
 }
 
-template <class T>
-__global__ void mulSigmoidAddGate4HK(const float4* __restrict__ a, const T* __restrict__ gate,
+template <class TA4, class T>
+__global__ void mulSigmoidAddGate4HK(const TA4* __restrict__ a, const T* __restrict__ gate,
                                      const float* __restrict__ pairMask, __half2* __restrict__ z,
                                      size_t rows, int C4) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C4) return;
   if (pairMask && pairMask[i / C4] == 0.f) return;
-  const float4 aa = a[i];
+  const float4 aa = quad(a, i);
   float g[4];
   #pragma unroll
   for (int k = 0; k < 4; ++k) g[k] = (float)gate[4 * i + k];
@@ -471,24 +478,31 @@ __global__ void mulSigmoidAddGate4HK(const float4* __restrict__ a, const T* __re
   z[2 * i + 1] = __floats2half2_rn(hi.x, hi.y);
 }
 
-template <class T, class TZ>
-inline void mulSigmoidAddPlaneGate(const float* a, const T* gPlanes, const float* pairMask, TZ* z,
+template <class TA, class T, class TZ>
+inline void mulSigmoidAddPlaneGate(const TA* a, const T* gPlanes, const float* pairMask, TZ* z,
                                    size_t rows, int C) {
+  constexpr size_t align = std::is_same_v<TA, float> ? 15 : 7;
   if constexpr (std::is_same_v<TZ, half>) {
-    if ((C & 3) == 0 && ((uintptr_t)a & 15) == 0 && ((uintptr_t)z & 7) == 0) {
-      mulSigmoidAddPlaneGate4HK<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
-          (const float4*)a, gPlanes, pairMask, (__half2*)z, rows, C >> 2);
+    if ((C & 3) == 0 && ((uintptr_t)a & align) == 0 && ((uintptr_t)z & 7) == 0) {
+      if constexpr (std::is_same_v<TA, float>) {
+        mulSigmoidAddPlaneGate4HK<float4, T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+            (const float4*)a, gPlanes, pairMask, (__half2*)z, rows, C >> 2);
+      } else {
+        mulSigmoidAddPlaneGate4HK<__half2, T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+            (const __half2*)a, gPlanes, pairMask, (__half2*)z, rows, C >> 2);
+      }
       return;
     }
   }
-  mulSigmoidAddPlaneGateK<T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gPlanes, pairMask,
-                                                                               z, rows, C);
+  mulSigmoidAddPlaneGateK<TA, T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(
+      a, gPlanes, pairMask, z, rows, C);
 }
 
-template <class T, class TZ>
-inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMask, TZ* z,
+template <class TA, class T, class TZ>
+inline void mulSigmoidAddGate(const TA* a, const T* gate, const float* pairMask, TZ* z,
                               size_t rows, int C) {
-  if constexpr (std::is_same_v<TZ, float>) {
+  constexpr size_t align = std::is_same_v<TA, float> ? 15 : 7;
+  if constexpr (std::is_same_v<TZ, float> && std::is_same_v<TA, float>) {
     if ((C & 3) == 0 && ((((uintptr_t)a | (uintptr_t)z) & 15) == 0)) {
       mulSigmoidAddGate4K<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
           (const float4*)a, gate, pairMask, (float4*)z, rows, C >> 2);
@@ -497,14 +511,19 @@ inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMa
   }
   if constexpr (std::is_same_v<TZ, half>) {
     // The dense-gate form of the kernel above: the gate is row-major here, so it reads four in a row.
-    if ((C & 3) == 0 && ((uintptr_t)a & 15) == 0 && ((uintptr_t)z & 7) == 0) {
-      mulSigmoidAddGate4HK<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
-          (const float4*)a, gate, pairMask, (__half2*)z, rows, C >> 2);
+    if ((C & 3) == 0 && ((uintptr_t)a & align) == 0 && ((uintptr_t)z & 7) == 0) {
+      if constexpr (std::is_same_v<TA, float>) {
+        mulSigmoidAddGate4HK<float4, T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+            (const float4*)a, gate, pairMask, (__half2*)z, rows, C >> 2);
+      } else {
+        mulSigmoidAddGate4HK<__half2, T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+            (const __half2*)a, gate, pairMask, (__half2*)z, rows, C >> 2);
+      }
       return;
     }
   }
-  mulSigmoidAddGateK<T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gate, pairMask, z, rows,
-                                                                          C);
+  mulSigmoidAddGateK<TA, T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gate, pairMask, z,
+                                                                              rows, C);
 }
 
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.

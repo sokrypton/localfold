@@ -288,9 +288,19 @@ inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing
   TP* xNorm = scratch<TP>("rfd4p.tri.xn", rows * cH);
   layerNormIn<TX, TP>(x, xNorm, rows, cH, W(wn(pre + ".layer_norm_out.weight")),
                       optW(wn(pre + ".layer_norm_out.bias")));
-  float* xProj = scratch<float>("rfd4p.tri.xp", rows * cZ);
-  linear<TP, float>(xNorm, xProj, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
-  if (hasW(wn(pre + ".linear_z.bias"))) addBias(xProj, W(wn(pre + ".linear_z.bias")), rows, cZ);
+  // 🔴 `xProj` IS THE BIGGEST THING THE GATED ADD READS - f32 it is 245 MB at n=400 against the
+  // gate's 123 and z's 123 - so it is narrowed too where the projection has no bias to add. This
+  // checkpoint's `linear_z` has none; one that does keeps the f32 path rather than growing a
+  // half-precision bias add nothing has measured.
+  const bool zBias = hasW(wn(pre + ".linear_z.bias"));
+  float* xProj32 = zBias ? scratch<float>("rfd4p.tri.xp", rows * cZ) : nullptr;
+  TP* xProj16 = zBias ? nullptr : scratch<TP>("rfd4p.tri.xp16", rows * cZ);
+  if (zBias) {
+    linear<TP, float>(xNorm, xProj32, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
+    addBias(xProj32, W(wn(pre + ".linear_z.bias")), rows, cZ);
+  } else {
+    linear<TP, TP>(xNorm, xProj16, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
+  }
   // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
   // was taken at the top, so nothing downstream of here reads z again. The gate arrives channel-major
   // out of the fused projection, which costs the kernel an index and saves a whole GEMM.
@@ -307,9 +317,11 @@ inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing
   if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
     linear<TP, TP>(zNorm, gate, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
-    mulSigmoidAddGate<TP, TZ>(xProj, gate, pairMask, z, rows, cZ);
+    if (zBias) mulSigmoidAddGate<float, TP, TZ>(xProj32, gate, pairMask, z, rows, cZ);
+    else mulSigmoidAddGate<TP, TP, TZ>(xProj16, gate, pairMask, z, rows, cZ);
   } else {
-    mulSigmoidAddPlaneGate<TP, TZ>(xProj, gPlanes, pairMask, z, rows, cZ);
+    if (zBias) mulSigmoidAddPlaneGate<float, TP, TZ>(xProj32, gPlanes, pairMask, z, rows, cZ);
+    else mulSigmoidAddPlaneGate<TP, TP, TZ>(xProj16, gPlanes, pairMask, z, rows, cZ);
   }
 }
 
