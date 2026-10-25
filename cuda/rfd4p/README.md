@@ -540,7 +540,9 @@ residues the cropped example does not contain, so building one from the spec fai
     which is what every structure preset writes and what the contig-only subset could not say.
     `applyConditions` writes those selections onto the atoms
     (`featurise/conditions.h`), every dtype the presets use. **A job that names an input
-    structure featurises natively now**, byte-exact against `export_input.mjs` on both routes.
+    structure FOLDS natively now** - `localfold-rfd4p --job=<spec with an input>` reads the
+    mmCIF, runs the fourteen stages and samples, 67 tokens of 1PRW at CA-CA 3.798 A - and the
+    featuriser is byte-exact against `export_input.mjs` on both routes.
     What is left is `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group
     permutation.
 
@@ -550,7 +552,19 @@ residues the cropped example does not contain, so building one from the spec fai
     written in the ORIGINAL entry's numbering and names residues the cropped example does not
     contain. With `specMode: true` it is a spec - annotations discarded, arginines re-labelled,
     contig and conditions applied. The port implemented the second as the default and gave 116
-    tokens where the exporter gives 183; the featuriser gate now drives both. In the order they run, with what each needs:
+    tokens where the exporter gives 183; the featuriser gate now drives both.
+
+    🔴 **AND `cuda/build.sh` WITH NO ARGUMENTS DOES NOT BUILD rfd4p** (`ports=(af3 af2 ef2)`),
+    while the featuriser-binary block sits OUTSIDE the port loop - so every `bash cuda/build.sh`
+    in this campaign rebuilt `rfd4p-featurise` and left `localfold-rfd4p` alone. A structure job
+    featurised correctly through the standalone binary and refused through the fold one, with
+    nothing in the diff to explain it; the fold binary was eight hours old. **And the fold
+    binary's own stamp hashed `cuda/featurise` while rfd4p LINKS
+    `cuda/rfd4p/featurise/featurise.o`**, so even naming the port would have relinked the
+    previous object. Both fixed - the SECOND stamp in this port to name fewer files than it
+    depends on, after the one that hashed five while the structure path lived in three more.
+
+    In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
