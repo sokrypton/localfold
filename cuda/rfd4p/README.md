@@ -533,8 +533,10 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`ensureChemicalFlags`~~ **done** | 272-335 | the 17 boolean columns actually vary |
     | ~~`computeWithinChainSourceResIdx`~~ **done** | 252-267 | real residues to count |
     | ~~`realizeExpandableSegments`~~ **done** | 363-475 | real residues between the sentinels |
-    | `filterUnwantedAtoms` | 480-496 | waters and unwanted elements are dropped |
-    | `annotateCovalentModificationsAndAtomize` | 510-562 | real peptide bonds, so `atomize` means something |
+    | ~~`filterUnwantedAtoms`~~ **done** | 480-496 | hydrogens, leaving `OXT` and nucleic `OP3` are dropped |
+    | ~~`addGlobalAtomIdAnnotation`~~ **done** | 499-504 | `atom_id` after the filter, not before |
+    | ~~`annotateCovalentModificationsAndAtomize`~~ **done** | 510-562 | real peptide bonds, so `atomize` means something |
+    | ~~`addGlobalTokenIdAnnotation`~~ **done** | 567-584 | one token a residue, or one an ATOM where it is atomised |
     | `finalizeAndCanonicalizeSequenceConditioning` | 629-708 | a real sequence to canonicalise |
     | `featurizeExpandedSegments` | 713-747 | the inference deletion block fires |
     | `materializeInternalCoords` | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
@@ -547,6 +549,17 @@ residues the cropped example does not contain, so building one from the spec fai
     still its index when its turn comes; and the suffix's residue numbers shift only within the
     sentinel's own `chain_iid`, not its `chain_id`, because two chains can share a letter across
     transformations. Exact on all seven - 306 atoms to 330 on 1PRW, bonds included.
+
+    🔴 **AND THE SEVEN SHIPPED STRUCTURES REACH ONE OF `filterUnwantedAtoms`' THREE RULES.**
+    Counted: 32 hydrogens in `sm_sam` and **not one `OXT` or `OP3` in the whole corpus**, so
+    deleting either of the other two left `check-cif.mjs` green on all seven - and no protein
+    structure has a SECOND chain, so a cross-chain peptide bond could not be built at all. The
+    gate synthesises four cases on top of the seven (`+OXT`, `+OP3`, `+crosslink` - a declared
+    covale across a gap - and `+interchain` - a duplicated chain bonded C to N at adjacent
+    numbering), both sides reading the same synthesised text. Each of the five conventions was
+    then watched failing on exactly one of them: the `OP3` rule, the `OXT` rule, `resDiff === 1`,
+    `sameChain`, and the atomised branch of the token numbering. **Four of the five were
+    unreachable before those cases existed.**
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

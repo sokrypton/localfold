@@ -64,7 +64,13 @@ done
 # nothing with AF3's - a contig and a selection language rather than a job of chains - and the only
 # code the two have in common is jsmath and the JSON reader, which it includes.
 rfbin="$here/rfd4p/featurise/rfd4p-featurise"
+# 🔴 EVERY HEADER IT INCLUDES, NOT JUST THE .cpp. The stamp named five files and the structure
+# path lives in three more (`atoms.h`, `cif.h`, `chirality.h`), so a change to a transform stage
+# left the binary untouched and the gate diffed the PREVIOUS build against the new reference -
+# green or red for reasons nothing in the diff explains.
 rfstamp="$(cat "$here"/rfd4p/featurise/featurise.cpp "$here"/rfd4p/featurise/tables.inc \
+  "$here"/rfd4p/featurise/atoms.h "$here"/rfd4p/featurise/cif.h \
+  "$here"/rfd4p/featurise/chirality.h \
   "$here"/rfd4p/src/schedule.h "$here"/featurise/jsmath.h "$here"/featurise/json.h \
   | sha256sum | cut -c1-16)"
 if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; then

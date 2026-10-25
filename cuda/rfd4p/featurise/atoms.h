@@ -480,6 +480,140 @@ inline void realizeExpandableSegments(AtomArray& a, PipelineRng& prng,
   ensureChemicalFlags(a);
 }
 
+/**
+ * `filterUnwantedAtoms`: hydrogens, a protein's LEAVING `OXT` and a nucleic acid's `OP3` go.
+ *
+ * 🔴 THE `OXT` RULE READS `is_leaving_atom` AND THE `OP3` ONE DOES NOT. A C-terminal OXT is a
+ * real atom and stays; only the one the CCD marks as leaving - the one a peptide bond would have
+ * taken - is dropped. `OP3` is dropped from every nucleic residue whatever the flag says, which
+ * is the reference's asymmetry and not an oversight of it.
+ */
+inline void filterUnwantedAtoms(AtomArray& a) {
+  ensureChemicalFlags(a);
+  vector<int> keep;
+  keep.reserve(a.n());
+  for (size_t i = 0; i < a.n(); ++i) {
+    string elem = a.site.element[i];
+    for (char& c : elem) c = (char)std::toupper((unsigned char)c);
+    if (elem == "H" || elem == "D") continue;
+    const string& atomName = a.site.atomName[i];
+    if (a.isProtein[i] && atomName == "OXT" && a.site.isLeavingAtom[i]) continue;
+    if (a.isNucleicAcid[i] && atomName == "OP3") continue;
+    keep.push_back((int)i);
+  }
+  if (keep.size() != a.n()) a = slice(a, keep);
+  ensureChemicalFlags(a);
+}
+
+/** The residues that carry a local latent, as a set - `LOCAL_LATENT_RESIDUES` is kept in the
+ *  order its feature column wants, and this stage asks only whether a name is in it. */
+inline const std::unordered_set<string>& localLatentResidues() {
+  static const std::unordered_set<string> s(tables::LOCAL_LATENT_RESIDUES.begin(),
+                                            tables::LOCAL_LATENT_RESIDUES.end());
+  return s;
+}
+
+/**
+ * `annotateCovalentModificationsAndAtomize`: a polymer residue reached by a bond that is not its
+ * own backbone link is a covalent modification, and anything with no local latent is atomised.
+ *
+ * 🔴 THE TEST IS "NOT A STANDARD BACKBONE BOND", NOT "IS A STRANGE BOND". A peptide C-N or a
+ * phosphodiester O3'-P between CONSECUTIVE residues of ONE chain is the polymer doing its job;
+ * every other inter-residue bond marks both polymer ends it touches. So a disulfide marks two
+ * cysteines, a glycan marks the asparagine, and a chain break - `res_id` two apart - marks a pair
+ * that looks like an ordinary peptide bond and is not one.
+ *
+ * 🔴 AND `atomize` IS STICKY. A residue already flagged by an earlier stage stays flagged however
+ * ordinary its name is; the set membership can only ADD to it.
+ */
+inline void annotateCovalentModificationsAndAtomize(AtomArray& a) {
+  const size_t n = a.n();
+  const vector<int> starts = cif::residueSegments(a.site);
+  const size_t nRes = starts.empty() ? 0 : starts.size() - 1;
+  vector<int> atomToRes(n, 0);
+  for (size_t r = 0; r < nRes; ++r) {
+    for (int i = starts[r]; i < starts[r + 1]; ++i) atomToRes[i] = (int)r;
+  }
+
+  vector<uint8_t> resIsCovMod(nRes, 0);
+  for (const cif::Bond& b : a.bonds) {
+    const int r1 = atomToRes[b.u], r2 = atomToRes[b.v];
+    if (r1 == r2) continue;
+    const string& an1 = a.site.atomName[b.u];
+    const string& an2 = a.site.atomName[b.v];
+    const bool sameChain = a.ids.chainIid[b.u] == a.ids.chainIid[b.v];
+    const bool adjacent = std::abs(a.site.resId[b.u] - a.site.resId[b.v]) == 1;
+    const bool peptide = sameChain && adjacent && a.isProtein[b.u] && a.isProtein[b.v] &&
+                         ((an1 == "C" && an2 == "N") || (an1 == "N" && an2 == "C"));
+    const bool phosphodiester =
+        sameChain && adjacent && a.isNucleicAcid[b.u] && a.isNucleicAcid[b.v] &&
+        ((an1 == "O3'" && an2 == "P") || (an1 == "P" && an2 == "O3'"));
+    if (peptide || phosphodiester) continue;
+    if (a.site.isPolymer[b.u]) resIsCovMod[r1] = 1;
+    if (a.site.isPolymer[b.v]) resIsCovMod[r2] = 1;
+  }
+
+  a.isCovalentModification.assign(n, 0);
+  a.atomize.resize(n, 0);
+  for (size_t r = 0; r < nRes; ++r) {
+    const int s = starts[r], e = starts[r + 1];
+    const bool atomise = !localLatentResidues().count(a.site.resName[s]) || a.atomize[s];
+    for (int i = s; i < e; ++i) {
+      a.isCovalentModification[i] = resIsCovMod[r];
+      a.atomize[i] = atomise ? 1 : 0;
+    }
+  }
+}
+
+/** `addGlobalTokenIdAnnotation`: one token a residue, or one token an ATOM where it is atomised. */
+inline void addGlobalTokenIdAnnotation(AtomArray& a) {
+  const vector<int> starts = cif::residueSegments(a.site);
+  a.tokenId.assign(a.n(), 0);
+  int next = 0;
+  for (size_t r = 0; r + 1 < starts.size(); ++r) {
+    const int s = starts[r], e = starts[r + 1];
+    if (a.atomize[s]) {
+      for (int i = s; i < e; ++i) a.tokenId[i] = next++;
+    } else {
+      for (int i = s; i < e; ++i) a.tokenId[i] = next;
+      ++next;
+    }
+  }
+}
+
+/**
+ * `getTokenStarts(atoms, true)`: where each token begins, plus `n`.
+ *
+ * 🔴 IT READS `token_id` WHERE THERE IS ONE AND FALLS BACK TO THE RESIDUES WHERE THERE IS NOT,
+ * which is the reference's own two-branch shape and not a convenience: the stages before
+ * `addGlobalTokenIdAnnotation` call this too, and on an atomised residue the two branches give
+ * different answers.
+ */
+inline vector<int> tokenStarts(const AtomArray& a) {
+  const size_t n = a.n();
+  if (n == 0) return {0};
+  if (a.tokenId.size() == n) {
+    vector<int> starts{0};
+    for (size_t i = 1; i < n; ++i) {
+      if (a.tokenId[i] != a.tokenId[i - 1]) starts.push_back((int)i);
+    }
+    starts.push_back((int)n);
+    return starts;
+  }
+  const vector<int> res = cif::residueSegments(a.site);
+  vector<int> starts;
+  for (size_t r = 0; r + 1 < res.size(); ++r) {
+    const int s = res[r], e = res[r + 1];
+    if (a.atomize.size() == n && a.atomize[s]) {
+      for (int i = s; i < e; ++i) starts.push_back(i);
+    } else {
+      starts.push_back(s);
+    }
+  }
+  starts.push_back((int)n);
+  return starts;
+}
+
 /** `addGlobalAtomIdAnnotation`: 0..n-1, re-run whenever atoms are inserted or dropped. */
 inline void addGlobalAtomIdAnnotation(AtomArray& a) {
   a.atomId.resize(a.n());

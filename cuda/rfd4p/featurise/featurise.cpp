@@ -883,7 +883,7 @@ int run(int argc, char** argv) {
   using rfd4p::recycleDepths;
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
-  bool realize = false;
+  bool realize = false, atomize = false;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -896,6 +896,7 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 11, "--dump-cif=")) dumpCif = a.substr(11);
     else if (!a.compare(0, 8, "--split=")) splitAt = atoi(a.c_str() + 8);
     else if (a == "--realize") realize = true;
+    else if (a == "--atomize") { realize = true; atomize = true; }
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -1000,6 +1001,26 @@ int run(int argc, char** argv) {
     if (realize) {
       rfd4p::atoms::PipelineRng prng((uint32_t)seed);
       rfd4p::atoms::realizeExpandableSegments(arr, prng);
+      if (atomize) {
+        // The next three stages, in `index.js`'s order. `--atomize` dumps what they decide -
+        // which atoms survive, which residues are covalent modifications, and where the tokens
+        // fall - rather than the realised columns `--realize` prints.
+        rfd4p::atoms::filterUnwantedAtoms(arr);
+        rfd4p::atoms::addGlobalAtomIdAnnotation(arr);
+        rfd4p::atoms::annotateCovalentModificationsAndAtomize(arr);
+        rfd4p::atoms::addGlobalTokenIdAnnotation(arr);
+        printf("atomized\t%zu\n", arr.n());
+        for (size_t i = 0; i < arr.n(); ++i) {
+          printf("az\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n", arr.site.resName[i].c_str(),
+                 arr.site.atomName[i].c_str(), arr.site.element[i].c_str(), arr.site.resId[i],
+                 arr.atomId[i], arr.tokenId[i], (int)arr.atomize[i],
+                 (int)arr.isCovalentModification[i]);
+        }
+        for (const rfd4p::cif::Bond& b : arr.bonds) {
+          printf("azbond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+        }
+        return 0;
+      }
       printf("realized\t%zu\n", arr.n());
       // 🔴 `_expseg_uid` IS ABSENT WHERE THERE WAS NOTHING TO EXPAND, because the stage returns
       // before creating it - which is the reference's behaviour and which `operator[]` on a map

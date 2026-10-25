@@ -17,7 +17,9 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
-  realizeExpandableSegments, createSeededRng,
+  realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
+  addGlobalAtomIdAnnotation, annotateCovalentModificationsAndAtomize,
+  addGlobalTokenIdAnnotation,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -35,13 +37,156 @@ const eq = (p, q) => (Number.isNaN(p) && Number.isNaN(q)) || p === q;
 // take the narrower comparison - and say so.
 const eqf = (p, q) => (Number.isNaN(p) && Number.isNaN(q)) || Math.fround(p) === Math.fround(q);
 
+/**
+ * The same structure with one extra atom in its first residue of `resNames`, copied from a row
+ * that is already there so every other column stays legal.
+ *
+ * 🔴 BECAUSE `filterUnwantedAtoms` HAS THREE RULES AND THE SEVEN SHIPPED STRUCTURES REACH ONE.
+ * Counted: 32 hydrogens in `sm_sam` and NOT ONE `OXT` or `OP3` anywhere in the corpus - so the
+ * leaving-oxygen and the nucleic-terminal rules were both untested, and deleting either left
+ * this gate green on all seven. These two cases are what can see them. Both sides read the SAME
+ * synthesised text, so a difference is still the port's and never the fixture's.
+ */
+function withExtraAtom(text, resNames, atomName, element) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  if (head < 0) throw new Error("no _atom_site loop");
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const at = (k) => cols.indexOf(k);
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length) continue;
+    if (!resNames.includes(tok[at("label_comp_id")])) continue;
+    for (const [key, value] of [["type_symbol", element], ["label_atom_id", atomName],
+      ["auth_atom_id", atomName]]) {
+      if (at(key) >= 0) tok[at(key)] = value;
+    }
+    lines.splice(i, 0, tok.join(" "));
+    return lines.join("\n");
+  }
+  throw new Error(`no row for ${resNames.join("/")}`);
+}
+
+/**
+ * The same structure with one of its chains duplicated under a new `label_asym_id`.
+ *
+ * 🔴 BECAUSE NO SHIPPED STRUCTURE HAS TWO PROTEIN CHAINS. Surveyed: every one of the seven has
+ * at most ONE chain carrying backbone `C` atoms, so a cross-chain peptide bond - the only shape
+ * that can see the `sameChain` clause - cannot be built from the corpus at all.
+ */
+function withDuplicatedChain(text, newAsym = "Z") {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const at = (k) => cols.indexOf(k);
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  let last = end;
+  const rows = [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length === cols.length) { rows.push(tok); last = i; }
+  }
+  const src = rows.find((r) => r[at("label_atom_id")] === "C")?.[at("label_asym_id")];
+  if (!src) throw new Error("no chain with a backbone C");
+  const copies = rows.filter((r) => r[at("label_asym_id")] === src).map((r) => {
+    const t = r.slice();
+    t[at("label_asym_id")] = newAsym;
+    if (at("auth_asym_id") >= 0) t[at("auth_asym_id")] = newAsym;
+    return t.join(" ");
+  });
+  lines.splice(last + 1, 0, ...copies);
+  return lines.join("\n");
+}
+
+/**
+ * The same structure with a covalent bond DECLARED between a `C` and an `N` that are not
+ * neighbours - a crosslink, in the single-value `_struct_conn` form `motif_idx_1prw` ships.
+ *
+ * 🔴 BECAUSE THE ADJACENCY CLAUSE IS OTHERWISE UNREACHABLE. `annotateCovalentModifications`
+ * exempts a C-N bond only between CONSECUTIVE residues of one chain, and dropping `resDiff === 1`
+ * left all nine cases above green - no shipped structure declares a C-N bond across a gap, so
+ * the rule that makes a crosslink a modification rather than a backbone link was never asked.
+ */
+function withDeclaredBond(text, { gap = 4, crossChain = false } = {}) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const at = (k) => cols.indexOf(k);
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const rows = [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length === cols.length) rows.push(tok);
+  }
+  const field = (r, k) => r[at(k)];
+  const emit = (first, second) => {
+    const block = ["#",
+      "_struct_conn.id                        x1",
+      "_struct_conn.conn_type_id              covale",
+      "_struct_conn.pdbx_value_order          sing",
+      `_struct_conn.ptnr1_label_asym_id       ${field(first, "label_asym_id")}`,
+      `_struct_conn.ptnr2_label_asym_id       ${field(second, "label_asym_id")}`,
+      `_struct_conn.ptnr1_label_comp_id       ${field(first, "label_comp_id")}`,
+      `_struct_conn.ptnr2_label_comp_id       ${field(second, "label_comp_id")}`,
+      `_struct_conn.ptnr1_label_seq_id        ${field(first, "label_seq_id")}`,
+      `_struct_conn.ptnr2_label_seq_id        ${field(second, "label_seq_id")}`,
+      "_struct_conn.ptnr1_label_atom_id       C",
+      "_struct_conn.ptnr2_label_atom_id       N",
+      "_struct_conn.pdbx_ptnr1_PDB_ins_code   .",
+      "_struct_conn.pdbx_ptnr2_PDB_ins_code   .",
+      "#", ""];
+    return `${text.replace(/\s*$/, "")}\n${block.join("\n")}`;
+  };
+  if (crossChain) {
+    // Any C and N in DIFFERENT chains whose residue numbers are one apart - which chain letters
+    // happen to carry those numbers is the file's business, so both ends are searched.
+    const cs = rows.filter((r) => field(r, "label_atom_id") === "C");
+    const ns = rows.filter((r) => field(r, "label_atom_id") === "N");
+    for (const c of cs) {
+      const n = ns.find((r) => field(r, "label_asym_id") !== field(c, "label_asym_id")
+        && Math.abs(Number(field(r, "label_seq_id")) - Number(field(c, "label_seq_id"))) === 1);
+      if (n) return emit(c, n);
+    }
+    throw new Error("no cross-chain C/N pair one residue apart");
+  }
+  const first = rows.find((r) => field(r, "label_atom_id") === "C");
+  if (!first) throw new Error("no C atom");
+  const second = rows.find((r) => field(r, "label_atom_id") === "N"
+    && field(r, "label_asym_id") === field(first, "label_asym_id")
+    && Number(field(r, "label_seq_id")) - Number(field(first, "label_seq_id")) >= gap);
+  if (!second) throw new Error("no distant N atom");
+  return emit(first, second);
+}
+
+// 🔴 THE EXAMPLES ARE ZSTD AND THE READER TAKES A PLAIN FILE, which it says rather than
+// guessing. Decompression is the one thing on this path that is still JavaScript's.
+const cases = new Map();
+for (const f of readdirSync(`${repo}web/examples`).filter((x) => x.endsWith(".cif.zst")).sort()) {
+  cases.set(f.replace(".cif.zst", ""),
+    decodeTextOrZstd(new Uint8Array(readFileSync(`${repo}web/examples/${f}`))));
+}
+cases.set("ppi_pdl1+OXT",
+  withExtraAtom(cases.get("ppi_pdl1"), ["ALA", "GLY", "SER", "LEU", "VAL"], "OXT", "O"));
+cases.set("dna_7m5w+OP3",
+  withExtraAtom(cases.get("dna_7m5w"), ["DA", "DC", "DG", "DT"], "OP3", "O"));
+cases.set("ppi_pdl1+crosslink", withDeclaredBond(cases.get("ppi_pdl1")));
+cases.set("ppi_pdl1+interchain",
+  withDeclaredBond(withDuplicatedChain(cases.get("ppi_pdl1")), { crossChain: true }));
+
 let structures = 0;
 let differing = 0;
-for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith(".cif.zst")).sort()) {
-  // 🔴 THE EXAMPLES ARE ZSTD AND THE READER TAKES A PLAIN FILE, which it says rather than
-  // guessing. Decompression is the one thing on this path that is still JavaScript's.
-  const text = decodeTextOrZstd(new Uint8Array(readFileSync(`${repo}web/examples/${name}`)));
-  const path = join(work, name.replace(".cif.zst", ".cif"));
+for (const [name, text] of cases) {
+  const path = join(work, `${name.replace("+", "_plus_")}.cif`);
   writeFileSync(path, text);
 
   const js = parseCifToAtomArray(text);
@@ -272,6 +417,48 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
         const bad = gotBonds.filter((b, i) => b[0] !== realized.bonds[i][0]
           || b[1] !== realized.bonds[i][1] || b[2] !== realized.bonds[i][2]).length;
         if (bad) wrong.push(`rz bonds ${bad}`);
+      }
+    }
+  }
+
+  // `filterUnwantedAtoms`, `addGlobalAtomIdAnnotation`,
+  // `annotateCovalentModificationsAndAtomize` and `addGlobalTokenIdAnnotation`, on top of the
+  // realised array - the four stages that decide which atoms survive and where the tokens fall.
+  {
+    const realized = realizeExpandableSegments(js, { rng: createSeededRng(0) });
+    const filtered = filterUnwantedAtoms(realized);
+    addGlobalAtomIdAnnotation(filtered);
+    annotateCovalentModificationsAndAtomize(filtered);
+    addGlobalTokenIdAnnotation(filtered);
+    const out3 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
+      { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    const got = out3.filter((l) => l.startsWith("az\t")).map((l) => l.split("\t").slice(1));
+    const gotBonds = out3.filter((l) => l.startsWith("azbond\t"))
+      .map((l) => l.split("\t").slice(1).map(Number));
+    if (got.length !== filtered.nAtoms) {
+      wrong.push(`atomized ${got.length} vs ${filtered.nAtoms}`);
+    } else {
+      const after = [
+        ["az res_name", 0, (v) => v, filtered.res_name],
+        ["az atom_name", 1, (v) => v, filtered.atom_name],
+        ["az element", 2, (v) => v, filtered.element],
+        ["az res_id", 3, Number, filtered.res_id],
+        ["az atom_id", 4, Number, filtered.atom_id],
+        ["az token_id", 5, Number, filtered.token_id],
+        ["az atomize", 6, Number, filtered.atomize.map((v) => (v ? 1 : 0))],
+        ["az is_covalent_modification", 7, Number,
+          filtered.is_covalent_modification.map((v) => (v ? 1 : 0))],
+      ];
+      for (const [label, at, cast, want] of after) {
+        if (!want) continue;
+        const bad = got.filter((r, i) => !eq(cast(r[at]), want[i])).length;
+        if (bad) wrong.push(`${label} ${bad}`);
+      }
+      if (gotBonds.length !== filtered.bonds.length) wrong.push("az bonds length");
+      else {
+        const bad = gotBonds.filter((b, i) => b[0] !== filtered.bonds[i][0]
+          || b[1] !== filtered.bonds[i][1] || b[2] !== filtered.bonds[i][2]).length;
+        if (bad) wrong.push(`az bonds ${bad}`);
       }
     }
   }
