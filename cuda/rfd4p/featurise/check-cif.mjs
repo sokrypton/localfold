@@ -17,7 +17,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
 import { STANDARD_POLYMER_RESIDUES } from "../../../shared/rfd4p/encoding.js";
-import { applyContig } from "../../../shared/rfd4p/pipeline/spec.js";
+import { applyContig, evalSelection } from "../../../shared/rfd4p/pipeline/spec.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -419,6 +419,31 @@ function contigsFor(name, js) {
   // queue-and-reorder: a leading run with no atoms cannot be placed until a later run brings
   // some, and is then moved back in front of it.
   return [seg, `4-4,${seg}`, `${seg},3-3`, `${seg},/0,5-5P`, `5-5P,/0,${seg}`];
+}
+
+/**
+ * The selections to try: the ones the shipped presets write, over whichever chain and residue
+ * numbers this structure actually has, plus a list, a range and a descending range.
+ */
+function selectionsFor(js) {
+  const chains = [...new Set(js.chain_id)].sort();
+  if (!chains.length) return [];
+  const cid = chains[0];
+  const ids = [...new Set(js.res_id.filter((_, i) => js.chain_id[i] === cid))].sort((a, b) => a - b);
+  if (ids.length < 6) return [`sel('${cid}/*/*/*')`, "sel('*/*/*/*')"];
+  const pick = [ids[1], ids[3], ids[5]];
+  const names = [...new Set(js.atom_name)];
+  const atom = names.includes("CA") ? "CA" : names[0];
+  return [
+    `sel('${cid}/*/*/*')`,
+    "sel('*/*/*/*')",
+    `sel('${cid}/*/[${pick.join(",")}]/*')`,
+    `sel('${cid}/*/[${ids[1]}-${ids[4]}]/*')`,
+    `sel('${cid}/*/[${ids[4]}-${ids[1]}]/*')`,
+    `sel('${cid}/*/*/${atom}')`,
+    `sel('*/${js.res_name[0]}/*/*')`,
+    `sel('${cid}/*/[${pick[0]}]/*')|sel('${cid}/*/[${pick[2]}]/*')`,
+  ];
 }
 
 let structures = 0;
@@ -977,6 +1002,29 @@ for (const [name, text] of cases) {
     }
     if (compressed !== null && plain !== compressed) {
       wrong.push("zstd dump differs from the plain file's");
+    }
+  }
+
+  // `evalPathSelection` against a real structure - every selection the shipped presets write,
+  // plus the list and range forms that are the easiest to get wrong.
+  // 🔴 THE SELECTIONS COME FROM THE PRESETS, NOT FROM IMAGINATION. `ppi_pdl1` locks a chain and
+  // names four hotspot residues by number; a selection language checked only on what its author
+  // thought of is checked on the easy half.
+  for (const sel of selectionsFor(js)) {
+    let line;
+    try {
+      line = execFileSync(binary, ["x", `--dump-cif=${path}`, `--select=${sel}`],
+        { encoding: "utf8", maxBuffer: 1 << 28 }).trim();
+    } catch (err) {
+      wrong.push(`select ${sel} refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+      continue;
+    }
+    const got = line.split("\t").slice(2).map(Number);
+    const want = evalSelection(js, sel).map((v) => (v ? 1 : 0));
+    if (got.length !== want.length) wrong.push(`select ${sel} length ${got.length}`);
+    else {
+      const bad = got.filter((v, i) => v !== want[i]).length;
+      if (bad) wrong.push(`select ${sel} ${bad} of ${want.length}`);
     }
   }
 

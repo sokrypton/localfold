@@ -33,6 +33,7 @@
 #include "../../featurise/jsmath.h"
 #include "../../featurise/zstd.h"
 #include "contig.h"
+#include "selection.h"
 #include "../src/schedule.h"
 #include "atoms.h"
 #include "chirality.h"
@@ -1207,7 +1208,7 @@ int run(int argc, char** argv) {
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
   bool realize = false, atomize = false;
-  string contigStr;
+  string contigStr, selectStr;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -1222,6 +1223,7 @@ int run(int argc, char** argv) {
     else if (a == "--realize") realize = true;
     else if (a == "--atomize") { realize = true; atomize = true; }
     else if (!a.compare(0, 9, "--contig=")) contigStr = a.substr(9);
+    else if (!a.compare(0, 9, "--select=")) selectStr = a.substr(9);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -1244,6 +1246,16 @@ int run(int argc, char** argv) {
     const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
     rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
     rfd4p::cif::deriveChemistry(a, block);
+    if (!selectStr.empty()) {
+      // `--select=` evaluates one selection against the structure and dumps the mask, which is
+      // the only way to hold the path language to the reference's without a whole job.
+      rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text);
+      const vector<uint8_t> m = rfd4p::selection::evalSelection(src, selectStr);
+      printf("select\t%zu", m.size());
+      for (const uint8_t v : m) printf("\t%d", (int)v);
+      printf("\n");
+      return 0;
+    }
     if (!contigStr.empty()) {
       rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text);
       const rfd4p::contig::Applied applied = rfd4p::contig::applyContig(src, contigStr);

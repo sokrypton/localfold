@@ -535,8 +535,11 @@ residues the cropped example does not contain, so building one from the spec fai
     the binary and the gate drives all seven that way as well as decompressed. `applyContig` takes PRESERVED segments now
     (`featurise/contig.h`), so a contig against a real structure assembles natively - five
     contigs over each of the seventeen cases, compared column by column with the bonds and
-    `originalResId`. What is left of the structure path is `processSampleToAtoms`'s
-    `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
+    `originalResId`. The selection language reads real atoms too
+    (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
+    which is what every structure preset writes and what the contig-only subset could not say.
+    What is left of the structure path is `applyConditions` over an atom array,
+    `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
@@ -668,6 +671,19 @@ residues the cropped example does not contain, so building one from the spec fai
     remembering to add it. The missing call turned out to be INERT - that stage changes neither
     `atomize` nor the residue boundaries, and removing it leaves all seventeen green - so this
     found no wrong answer, only an instrument that could not have found one.
+
+    🔴 **AND `sel(a),sel(b)` IS NOT `sel(a)|sel(b)`.** The pipe is a union; the COMMA makes the
+    reference's parser return after the first term and silently drop the second. The first
+    port unioned both and the gate caught it as 8 extra atoms on three structures. This port
+    **refuses a comma between terms by name** rather than copying either behaviour: matching
+    the reference means silently discarding a condition somebody wrote, and unioning means
+    applying one they did not ask for. A deliberate divergence, stated here and in
+    `selection.h`, that cannot produce a wrong fold either way. Four conventions were watched
+    failing - a descending range read ascending (9 cases), atom names expanding a hyphen as a
+    range (17), `*` matched as a literal (17), and a later term overwriting instead of
+    unioning (9) - and two are provably inert and say so: the already-matched skip, since the
+    loop only ever SETS a bit, and the residue-number normalisation, since every preset writes
+    clean numbers.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
