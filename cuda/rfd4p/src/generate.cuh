@@ -109,6 +109,30 @@ inline GenOut postprocess(int n, int nTypes, const std::vector<float>& logits,
   return out;
 }
 
+/**
+ * The per-token naming an INPUT structure supplies: its own residue numbers and chain letters.
+ *
+ * 🔴 EMPTY FOR A CONTIG, AND THAT IS NOT A MISSING CASE. A pure design job has no input, so the
+ * token index IS the residue number and the chain letters are the ones this port assigned -
+ * which is what `chainName` spells. A job with an input must keep what the file said, or a
+ * motif comes out renumbered and no longer superposes on the target it was built against.
+ */
+struct OutNaming {
+  std::vector<int> resId;    // per token, the input's own
+  std::vector<int> chain;    // per token, up to two characters packed little-endian
+  bool empty() const { return resId.empty(); }
+};
+
+/** A packed chain code back to its letters; `chainName(idx)` where there is none. */
+inline std::string chainFromCode(int code) {
+  std::string out;
+  for (int k = 0; k < 2; ++k) {
+    const char c = (char)((code >> (8 * k)) & 0xff);
+    if (c) out += c;
+  }
+  return out;
+}
+
 /** A chain index as mmCIF/PDB names them: A..Z, then AA, BB, ... as the reference's own does. */
 inline std::string chainName(int idx) {
   if (idx < 26) return std::string(1, (char)('A' + idx));
@@ -148,7 +172,7 @@ inline std::string cifCoord(float v) {
  */
 inline std::string toCif(const GenOut& g, int n, const std::vector<std::string>& atomNames,
                          const std::vector<std::string>& resNames,
-                         const std::vector<int>& chainOf) {
+                         const std::vector<int>& chainOf, const OutNaming& naming = {}) {
   static const char* COLUMNS[] = {
       "group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id", "label_comp_id",
       "label_asym_id", "label_entity_id", "label_seq_id", "pdbx_PDB_ins_code", "auth_seq_id",
@@ -163,13 +187,16 @@ inline std::string toCif(const GenOut& g, int n, const std::vector<std::string>&
   for (int i = 0; i < n; ++i) {
     const int rt = g.residueType[i];
     const std::string res = rt >= 0 && rt < (int)resNames.size() ? resNames[rt] : "UNK";
-    const std::string chain = chainName(i < (int)chainOf.size() ? chainOf[i] : 0);
+    const std::string chain = i < (int)naming.chain.size()
+                                  ? chainFromCode(naming.chain[i])
+                                  : chainName(i < (int)chainOf.size() ? chainOf[i] : 0);
+    const int resId = i < (int)naming.resId.size() ? naming.resId[i] : i + 1;
     for (int a = 0; a < 37; ++a) {
       if (!g.atomMask[(size_t)i * 37 + a]) continue;
       const std::string name = cifAtomName(atomNames[a]);
       snprintf(line, sizeof line, "ATOM %d %s %s . %s %s 0 %d . %d %s %s %s nan 1.0 ? False . %s %s %s 1\n",
                serial++, atomNames[a].substr(0, 1).c_str(), name.c_str(), res.c_str(),
-               chain.c_str(), i + 1, i + 1, res.c_str(), chain.c_str(), name.c_str(),
+               chain.c_str(), resId, resId, res.c_str(), chain.c_str(), name.c_str(),
                cifCoord(g.coors[(size_t)i * 111 + a * 3]).c_str(),
                cifCoord(g.coors[(size_t)i * 111 + a * 3 + 1]).c_str(),
                cifCoord(g.coors[(size_t)i * 111 + a * 3 + 2]).c_str());
@@ -183,7 +210,7 @@ inline std::string toCif(const GenOut& g, int n, const std::vector<std::string>&
 /** The structure as PDB records. `atomNames` is 37 long, `resNames` 147. */
 inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>& atomNames,
                          const std::vector<std::string>& resNames,
-                         const std::vector<int>& chainOf) {
+                         const std::vector<int>& chainOf, const OutNaming& naming = {}) {
   std::string out;
   char line[96];
   int serial = 1;
@@ -193,7 +220,11 @@ inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>&
     // 🔴 THE CHAIN, NOT A LITERAL 'A'. Every atom used to go into chain A, which for a binder or
     // a complex is a structure no viewer and no scorer can read correctly - the chains are there
     // in the batch and were simply not carried to the writer.
-    const char chain = chainName(i < (int)chainOf.size() ? chainOf[i] : 0)[0];
+    const std::string chainStr = i < (int)naming.chain.size()
+                                     ? chainFromCode(naming.chain[i])
+                                     : chainName(i < (int)chainOf.size() ? chainOf[i] : 0);
+    const char chain = chainStr.empty() ? 'A' : chainStr[0];
+    const int resId = i < (int)naming.resId.size() ? naming.resId[i] : i + 1;
     for (int a = 0; a < 37; ++a) {
       if (!g.atomMask[(size_t)i * 37 + a]) continue;
       const std::string& name = atomNames[a];
@@ -202,7 +233,7 @@ inline std::string toPdb(const GenOut& g, int n, const std::vector<std::string>&
       snprintf(field, sizeof field, name.size() >= 4 ? "%-4s" : " %-3s", name.c_str());
       snprintf(line, sizeof line,
                "ATOM  %5d %4s %3s %c%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n", serial++,
-               field, res.c_str(), chain, i + 1, g.coors[(size_t)i * 111 + a * 3],
+               field, res.c_str(), chain, resId, g.coors[(size_t)i * 111 + a * 3],
                g.coors[(size_t)i * 111 + a * 3 + 1], g.coors[(size_t)i * 111 + a * 3 + 2],
                name.substr(0, 1).c_str());
       out += line;

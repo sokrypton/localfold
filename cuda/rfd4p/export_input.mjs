@@ -31,6 +31,7 @@
 // disagree - the duplicate cannot go stale in silence.
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { buildBatch, decodeTextOrZstd } from "../../shared/rfd4p/pipeline/index.js";
+import { getTokenStarts } from "../../shared/rfd4p/pipeline/bonds.js";
 import { getRfd4pPresetById } from "../../shared/rfd4p/presets.js";
 import { parseConditionSpecYaml } from "../../shared/rfd4p/pipeline/spec.js";
 import {
@@ -132,9 +133,25 @@ if (!length && preset.cifUrl) {
 const spec = length
   ? { contig: `a1:${length}-${length}P` }
   : { contig: preset.contig, ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }) };
-const { batch, n } = fromAnnotations
+const built = fromAnnotations
   ? buildBatch(inputCif, { seed })
   : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
+const { batch, n } = built;
+// The per-token naming an input structure supplies, for the writer at the far end.
+const outNaming = (() => {
+  const atoms = built.atoms;
+  if (!atoms || inputCif === undefined) return null;
+  const starts = getTokenStarts(atoms, false);
+  return {
+    resId: starts.map((a) => Number(atoms.res_id[a])),
+    chain: starts.map((a) => {
+      const cid = String(atoms.chain_id[a] ?? "");
+      let packed = 0;
+      for (let k = 0; k < cid.length && k < 2; k += 1) packed |= cid.charCodeAt(k) << (8 * k);
+      return packed;
+    }),
+  };
+})();
 
 const raw = readFileSync(checkpoint);
 const parsedWeights = parseSafetensors(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
@@ -480,6 +497,15 @@ if (generate) {
     // port wrote every atom into chain A, which for a binder or a complex is a structure no
     // viewer and no scorer can read correctly.
     "g/chainIid": Int32Array.from(field("chain_iid")),
+    // 🔴 AND THE INPUT'S OWN NUMBERING AND CHAIN LETTERS, where there was an input. A motif's
+    // residues are deposited under their own numbers; writing the token index renumbers them and
+    // the design no longer superposes on the target it was built against. The chain is its
+    // CHARACTERS packed little-endian, not an index - `chainName(i)` spells A..Z for chains this
+    // port named, and an input with chains H and L would come out A and B.
+    ...(outNaming === null ? {} : {
+      "g/outResId": Int32Array.from(outNaming.resId),
+      "g/outChain": Int32Array.from(outNaming.chain),
+    }),
     "g/allowedTypes": Int32Array.from(ALLOWED_RESIDUE_TYPES.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/atom37Legal": Int32Array.from(UNIFIED_RESTYPE_ATOM37_MASK.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/coordGroup": Int32Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : new Int32Array(n * 37).fill(-1)),

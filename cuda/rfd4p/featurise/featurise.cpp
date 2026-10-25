@@ -1707,6 +1707,7 @@ int run(int argc, char** argv) {
   // The structure path's conditions keep their ORDER and their `group:` field, which the spec
   // path's map-of-maps has nowhere to put.
   rfd4p::conditions::Spec structureConditions;
+  vector<int> outputResId, outputChain;
   string inputPath;
   bool asAnnotatedCif = false, specMode = false;
   int nsteps = 60;
@@ -1815,6 +1816,33 @@ int run(int argc, char** argv) {
     // rotations and the two permutations, in that order, from this one stream.
     rfd4p::atoms::PipelineRng prng((uint32_t)seed);
     b = runValidationPipeline(src, prng);
+    // 🔴 THE OUTPUT'S NAMING COMES FROM THE INPUT, NOT FROM THE TOKEN INDEX. A motif's residues
+    // keep the numbering and the chain letter they were deposited under, so the design can be
+    // superposed on the target it was built against; writing `i + 1` and chain A renumbers the
+    // motif and makes that comparison silently wrong. The reference reads
+    // `inputAtoms.res_id[a0]` and `inputAtoms.chain_id[a0]` per token, which is what these two
+    // carry across to the writer.
+    //
+    // 🔴 AND THE CHAIN IS ITS CHARACTERS, NOT AN INDEX. `chainName(i)` spells A..Z then AA..ZZ,
+    // which is right for a chain the port NAMED and wrong for one a file did - an input with
+    // chains H and L would come out A and B. Two characters packed into an int covers every id
+    // `chainName` itself can spell.
+    {
+      const vector<int> starts = rfd4p::atoms::tokenStarts(src);
+      vector<int> outResId, outChain;
+      for (size_t tk = 0; tk + 1 < starts.size(); ++tk) {
+        const int a0 = starts[tk];
+        outResId.push_back(src.site.resId[a0]);
+        const string& cid = src.site.chainId[a0];
+        int packed = 0;
+        for (size_t c = 0; c < cid.size() && c < 2; ++c) {
+          packed |= (int)(unsigned char)cid[c] << (8 * c);
+        }
+        outChain.push_back(packed);
+      }
+      outputResId = outResId;
+      outputChain = outChain;
+    }
   }
   const int n = b.n;
 
@@ -2037,6 +2065,10 @@ int run(int argc, char** argv) {
     g.ints("g/coordCond", cc);
     g.ints("g/moleculeIid", mi);
     g.ints("g/chainIid", b.chainIid);
+    if (!outputResId.empty()) {
+      g.ints("g/outResId", outputResId);
+      g.ints("g/outChain", outputChain);
+    }
     g.ints("g/condSeq", cs);
     vector<int> allowed(tables::ALLOWED_RESIDUE_TYPES.begin(), tables::ALLOWED_RESIDUE_TYPES.end());
     vector<int> legal(tables::RESTYPE_ATOM37_MASK.begin(), tables::RESTYPE_ATOM37_MASK.end());

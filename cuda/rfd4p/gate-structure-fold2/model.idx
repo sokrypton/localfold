@@ -1,0 +1,20 @@
+m meta/n 183
+m meta/nRecycle 1
+m meta/seqFeatDim 897
+m meta/condFeatDim 609
+m meta/pairFeatDim 107
+m meta/pairCondFeatDim 512
+m meta/decLayers 12
+m meta/decTokenDim 768
+m meta/decCondDim 128
+m meta/decHeads 12
+m meta/decFeatDim 214
+t in/seq 0 164151
+t in/cond0 164151 111447
+t in/cond1 275598 111447
+t in/pair 387045 3583323
+t in/pairCond 3970368 512
+t in/mask 3970880 183
+t in/caNm 3971063 549
+t in/attnMask 3971612 183
+i in/tokenType 3971795 183

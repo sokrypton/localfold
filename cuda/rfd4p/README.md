@@ -543,8 +543,22 @@ residues the cropped example does not contain, so building one from the spec fai
     structure FOLDS natively now** - `localfold-rfd4p --job=<spec with an input>` reads the
     mmCIF, runs the fourteen stages and samples, 67 tokens of 1PRW at CA-CA 3.798 A - and the
     featuriser is byte-exact against `export_input.mjs` on both routes.
-    What is left is `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group
-    permutation.
+    Its output carries the INPUT's own residue numbering and chain letters, so a motif still
+    superposes on the target it was built against. What is left is the rest of
+    `processSampleToAtoms`'s `inputAtoms` path - the unindexed-insertion machinery (the
+    Hungarian match and its geometric fallback), which only an unindexed motif reaches - and
+    the coordinate-group permutation.
+
+    🔴 **AND THE OUTPUT USED TO RENUMBER THE MOTIF.** The writer spelled `i + 1` and
+    `chainName(chain_iid)`, which is right for a chain this port NAMED and wrong for one a file
+    did: `motif_idx_1prw` came out 1..67 where the reference writes the input's 0..66, and a
+    two-chain input would come out A and B whatever its letters were. Both are carried across
+    now (`g/outResId`, `g/outChain` - the chain as its CHARACTERS, since an input with chains H
+    and L would otherwise become A and B), and the exporter writes them too so the
+    featurise-then-fold path agrees. The gate compares per TOKEN against the reference
+    pipeline's own `res_id` and `chain_id`, over two structures - **one chain cannot falsify
+    the chain half**, since `motif_idx_1prw`'s only chain is A and `chainName(0)` is also A;
+    with `ppi_pdl1` beside it, naming from the permuted index reddens 183 tokens.
 
     🔴 **AND A STRUCTURE IS THE JOB UNLESS THE SPEC SAYS OTHERWISE - THE TWO ROUTES DISAGREE BY
     67 TOKENS ON ONE FILE.** Without `specMode`, `export_input.mjs` hands the CIF straight to

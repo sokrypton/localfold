@@ -484,8 +484,15 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
       path = stem + "_" + std::to_string(design + 1) + ext;
     }
-    std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf)
-                                    : rfd4p::toPdb(g, n, atomNames, resNames, chainOf));
+    // The input's own numbering and chain letters where a job named a structure; absent for a
+    // contig, where the token index IS the residue number.
+    rfd4p::OutNaming naming;
+    if (M.has("g/outResId") && M.has("g/outChain")) {
+      naming.resId.assign(M.i("g/outResId"), M.i("g/outResId") + n);
+      naming.chain.assign(M.i("g/outChain"), M.i("g/outChain") + n);
+    }
+    std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf, naming)
+                                    : rfd4p::toPdb(g, n, atomNames, resNames, chainOf, naming));
     int atoms = 0, residues = 0;
     for (int i = 0; i < n; ++i) {
       if (g.residueType[i] >= 0) ++residues;

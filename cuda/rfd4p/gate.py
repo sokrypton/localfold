@@ -538,6 +538,58 @@ def main() -> int:
                 got["structure_job"] = {
                     "caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
 
+                # 🔴 AND THE OUTPUT KEEPS THE INPUT'S NUMBERING AND CHAIN LETTERS. A motif's
+                # residues are deposited under their own numbers, and writing `i + 1` and chain
+                # A renumbers them - the design then no longer superposes on the target it was
+                # built against, which no RMSD or bond check would ever report. Compared per
+                # TOKEN against the reference pipeline's own `res_id` and `chain_id`.
+                # 🔴 AND A SECOND STRUCTURE WITH TWO CHAINS, because `motif_idx_1prw`'s only
+                # chain is A and `chainName(0)` is A too - the chain half of this arm cannot
+                # fail on it. `ppi_pdl1` carries A and B, and the batch's `chain_iid` is
+                # PERMUTED, so naming from it rather than from the input disagrees.
+                naming_cases = [("motif_idx_1prw", spdb)]
+                sfold2 = HERE / "featurise" / "gate-structure-fold2.json"
+                spdb2 = HERE / "gate-structure-fold2.pdb"
+                run([BINARY, f"--job={sfold2}", f"--int8={bundle}",
+                     f"--work-dir={HERE / 'gate-structure-fold2'}", f"--out={spdb2}",
+                     "--seed=0", "--fast"], cwd=REPO)
+                naming_cases.append(("ppi_pdl1", spdb2))
+                ref = run(["node", "--input-type=module", "-e", r'''
+                    import { buildBatch, decodeTextOrZstd } from "./shared/rfd4p/pipeline/index.js";
+                    import { getTokenStarts } from "./shared/rfd4p/pipeline/bonds.js";
+                    import { readFileSync } from "node:fs";
+                    const out = {};
+                    for (const nm of ["motif_idx_1prw", "ppi_pdl1"]) {
+                      const text = decodeTextOrZstd(new Uint8Array(
+                        readFileSync(`web/examples/${nm}.cif.zst`)));
+                      const { atoms } = buildBatch(text, { seed: 0 });
+                      const starts = getTokenStarts(atoms, false);
+                      out[nm] = starts.map((a) => [atoms.res_id[a], atoms.chain_id[a]]);
+                    }
+                    console.log(JSON.stringify(out));
+                '''], cwd=REPO)
+                wants = json.loads(ref.stdout.strip().splitlines()[-1])
+                bad, total = 0, 0
+                for nm, pdb_path in naming_cases:
+                    want = wants[nm]
+                    seen_tok, got_tok = [], []
+                    for line in pdb_path.read_text().splitlines():
+                        if not line.startswith("ATOM"):
+                            continue
+                        key = (int(line[22:26]), line[21])
+                        if not seen_tok or seen_tok[-1] != key:
+                            seen_tok.append(key)
+                            got_tok.append([key[0], key[1]])
+                    total += len(got_tok)
+                    bad += (abs(len(got_tok) - len(want))
+                            + sum(1 for g, w in zip(got_tok, want) if g != w))
+                if bad:
+                    failed += 1
+                print(f"  {'out names':10s} the input's own numbering and chains, "
+                      f"{total} tokens over {len(naming_cases)}  "
+                      f"{'ok ' if not bad else f'DIFFER {bad}'}")
+                got["out_naming"] = {"tokens": total, "differing": int(bad)}
+
             # 🔴 AND A TWO-CHAIN DESIGN MUST COME OUT AS TWO CHAINS, in both formats. The writer
             # used to put every atom in chain A - the chains were in the batch and simply not
             # carried to it - which for a binder or a complex is a structure no viewer and no
