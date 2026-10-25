@@ -32,6 +32,7 @@
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
 #include "../src/schedule.h"
+#include "cif.h"
 #include "tables.inc"
 
 namespace rfd4p {
@@ -878,7 +879,7 @@ int run(int argc, char** argv) {
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
   using rfd4p::recycleDepths;
-  string out, specPath, weightsDir, configPath, int8Dir;
+  string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -888,6 +889,7 @@ int run(int argc, char** argv) {
     if (!a.compare(0, 7, "--spec=")) specPath = a.substr(7);
     else if (!a.compare(0, 10, "--weights=")) weightsDir = a.substr(10);
     else if (!a.compare(0, 7, "--int8=")) int8Dir = a.substr(7);
+    else if (!a.compare(0, 11, "--dump-cif=")) dumpCif = a.substr(11);
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -896,6 +898,37 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 10, "--recycle=")) recycleSchedule = a.substr(10);
     else { fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
   }
+  // 🔴 THE mmCIF READER, ON ITS OWN. The structure path is not finished - what this reads is
+  // everything that comes STRAIGHT FROM THE FILE, and the chemistry the reference derives from it
+  // (bonds, leaving atoms, chain types, the id and entity annotations) is still the exporter's.
+  // Dumping what it does read is how that half gets a gate before the other half exists, rather
+  // than landing unmeasured and being trusted because it compiles.
+  if (!dumpCif.empty()) {
+    string text;
+    FILE* f = fopen(dumpCif.c_str(), "rb");
+    if (!f) { fprintf(stderr, "no %s\n", dumpCif.c_str()); return 1; }
+    char buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
+    fclose(f);
+    if (text.size() > 3 && (unsigned char)text[0] == 0x28 && (unsigned char)text[1] == 0xb5) {
+      fprintf(stderr, "%s is zstd; this reader takes a plain .cif and the page's examples are "
+                      "compressed - decompress it first\n", dumpCif.c_str());
+      return 1;
+    }
+    const rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(rfd4p::cif::parseBlock(text));
+    printf("n %zu\n", a.n);
+    for (size_t i = 0; i < a.n; ++i) {
+      printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\n",
+             a.element[i].c_str(), a.atomName[i].c_str(), a.resName[i].c_str(),
+             a.chainId[i].c_str(), a.insCode[i].c_str(), a.labelAltId[i].c_str(), a.resId[i],
+             a.authSeqId[i], a.atomId[i], a.labelEntityId[i], (int)a.hetero[i], (double)a.x[i],
+             (double)a.y[i], (double)a.z[i], (double)a.bFactor[i], (double)a.occupancy[i]);
+    }
+    for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
+    return 0;
+  }
+
   if (out.empty() || (weightsDir.empty() && int8Dir.empty()) || (specPath.empty() && !length)) {
     fprintf(stderr, "usage: rfd4p-featurise <out dir> --weights=<dir> "
                     "(--spec=<job.json> | --length=N) [--config=<config.json>] [--seed=N] "

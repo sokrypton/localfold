@@ -51,7 +51,7 @@ On `custom_cath_monomer` (54 tokens, the one preset that needs no structure), ag
 checkpoint, all 37 stages — the three init products, the single and pair state after each of the 14
 layers, and the five outputs:
 
-`gate.py` is what re-runs all of it - **29 checks, all green on this A100**: the trunk's stages in
+`gate.py` is what re-runs all of it - **30 checks, all green on this A100**: the trunk's stages in
 five arms at one and two recycles, the encoder, FOUR sampling loops against the reference's own
 trajectory (the monomer, partial diffusion, inverse folding and the small molecule's chirality),
 the native featuriser against the JavaScript's bytes, its refusals, the one-process `--job` form,
@@ -477,8 +477,17 @@ residues the cropped example does not contain, so building one from the spec fai
 - **A native featuriser for an input STRUCTURE.** The spec path is done (above); the seven
   `web/examples/*.cif.zst` presets still go through `export_input.mjs`. What that path needs, in
   the order it runs - the map is worth having before anybody starts:
-  - `pipeline/zstd.js` + `vendor/fzstd.js` to decompress, and `pipeline/cif.js`'s tokeniser and
-    `parseCifToAtomArray` (1,195 lines, and the largest single piece).
+  - ~~`pipeline/cif.js`'s tokeniser and the `_atom_site` loop~~ **done**: `featurise/cif.h` reads
+    a plain mmCIF and `gate.py`'s `cif` arm holds every column that comes STRAIGHT FROM THE FILE
+    to `parseCifToAtomArray`'s, over all seven shipped structures - 0 differing, from a 1-atom
+    file to a 925-atom complex. 🔴 Two rules that are the obvious guess backwards: `label_*` wins
+    over `auth_*` (writing it the other way renumbers every residue a contig names), and the
+    reader filters to MODEL ONE and the first altloc, without which a twenty-model NMR entry comes
+    through twenty times. Decompression is still JavaScript's - the examples are zstd and the
+    reader says so rather than guessing.
+  - the chemistry `parseCifToAtomArray` DERIVES from those columns and `featurise/cif.h` does not:
+    `is_polymer`, `chem_comp_type`, `atomic_number`, the aromatic and leaving-atom flags, the
+    charge fallbacks, the chain types, and `computeIdAndEntityAnnotations`.
   - `buildBondsForAtomArray` with `STD_RESIDUE_BONDS` (28 residues of explicit bond lists),
     `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, `ELEMENT_TO_ATOMIC_NUMBER` (94) and
     `METAL_ELEMENTS` (61) - all generable into `tables.inc`.

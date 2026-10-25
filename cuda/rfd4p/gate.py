@@ -557,6 +557,23 @@ def main() -> int:
                   f"{'ok ' if ok else 'WRONG'}")
             got["designs"] = {"written": len(made)}
 
+            # 🔴 AND THE mmCIF READER, which is the structure path's first half and is gated
+            # BEFORE its second half exists. What it claims is what comes straight from the file;
+            # the chemistry the reference derives from that - bonds, leaving atoms, chain types,
+            # the id and entity annotations - is still the exporter's, and the checker compares
+            # only what the reader claims rather than letting omission look like agreement.
+            r = run(["node", HERE / "featurise" / "check-cif.mjs"], cwd=REPO)
+            m = re.search(r"(\d+) structures, (\d+) differing", r.stdout)
+            if not m or m.group(2) != "0":
+                failed += 1
+                if not m:
+                    print(r.stdout[-1000:], r.stderr[-600:])
+            print(f"  {'cif':10s} {m.group(1) if m else '?'} shipped structures, "
+                  f"{m.group(2) if m else '?'} differing  "
+                  f"{'ok ' if m and m.group(2) == '0' else 'DIFFERS'}")
+            got["cif"] = {"structures": int(m.group(1)) if m else 0,
+                          "differing": int(m.group(2)) if m else -1}
+
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:
         ensure_inputs(case_dir, None, export_flags)
