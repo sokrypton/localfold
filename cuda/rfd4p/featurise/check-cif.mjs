@@ -24,6 +24,7 @@ import {
   featurizeExpandedSegments,
   materializeInternalCoords,
   unindexFlaggedTokens,
+  centerAndFeaturizeCentroid, addSupportsLocalLatentAnnotation, buildAtom37Slots,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -635,6 +636,11 @@ for (const [name, text] of cases) {
     // `unindexFlaggedTokens` COPIES the unindexed motifs to the end and removes the originals,
     // so it changes the atom count and everything below is held to its result.
     const unindexed = unindexFlaggedTokens(expanded);
+    // 🔴 THE SHIFT MOVES THE CONDITION COLUMNS TOO, so `centerAndFeaturizeCentroid` runs before
+    // the conditioned coordinates are compared, not after.
+    const { centroidWithoutCond } = centerAndFeaturizeCentroid(unindexed);
+    addSupportsLocalLatentAnnotation(unindexed);
+    const slots = buildAtom37Slots(unindexed);
     const out3 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
       { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
     const got = out3.filter((l) => l.startsWith("az\t")).map((l) => l.split("\t").slice(1));
@@ -715,6 +721,45 @@ for (const [name, text] of cases) {
           const bad = gotGrp.filter((v, i) => v !== wantGrp[i]).length;
           if (bad) wrong.push(`az index-group ${bad}`);
         }
+      }
+      // `centerAndFeaturizeCentroid`, `addSupportsLocalLatentAnnotation`, `buildAtom37Slots`.
+      // 🔴 THE CENTROID IS COMPARED EXACTLY, NOT THROUGH `Math.fround`. The reference writes it
+      // into a Float32Array, so the sums are rounded ONCE at the end - and comparing the
+      // fround of both sides cannot tell that from a port that kept it in double, which is
+      // this gate's own recorded mistake in another column. Exact, with the native side
+      // printed at full precision, turns that mutation red.
+      const shifted = new Map(out3.filter((l) => l.startsWith("azshift\t")).map((l) => {
+        const f = l.split("\t");
+        return [f[1], f.slice(2).map(Number)];
+      }));
+      const cen = (out3.find((l) => l.startsWith("azcentroid\t")) ?? "").split("\t").slice(1)
+        .map(Number);
+      if (cen.length !== 3 || cen.some((v, i) => !eq(v, centroidWithoutCond[i]))) {
+        wrong.push(`az centroid ${cen.join(",")} vs ${[...centroidWithoutCond].join(",")}`);
+      }
+      // The shift moves the condition columns too, so they are re-compared AFTER the centring -
+      // without this the whole second half of the stage is unobserved.
+      for (const key of ["condition_coordinate_1_atom", "condition_ChainCentroid_1_atom"]) {
+        const want = unindexed.annotations[key];
+        const got = shifted.get(key);
+        if (!want) continue;
+        if (!got) { wrong.push(`az ${key} missing`); continue; }
+        const bad = want.filter((c, i) => !eq(got[i * 3], c[0]) || !eq(got[i * 3 + 1], c[1])
+          || !eq(got[i * 3 + 2], c[2])).length;
+        if (bad) wrong.push(`az ${key} ${bad}`);
+      }
+      const fin = out3.filter((l) => l.startsWith("azfin\t")).map((l) => l.split("\t").slice(1));
+      if (fin.length !== unindexed.nAtoms) wrong.push(`az final ${fin.length}`);
+      else {
+        const badC = fin.filter((r, i) => !eq(Number(r[0]), unindexed.coord_to_be_noised[i][0])
+          || !eq(Number(r[1]), unindexed.coord_to_be_noised[i][1])
+          || !eq(Number(r[2]), unindexed.coord_to_be_noised[i][2])).length;
+        if (badC) wrong.push(`az coord-to-be-noised ${badC}`);
+        const badL = fin.filter((r, i) =>
+          Number(r[3]) !== (unindexed.supports_local_latent[i] ? 1 : 0)).length;
+        if (badL) wrong.push(`az supports-local-latent ${badL}`);
+        const badS = fin.filter((r, i) => Number(r[4]) !== slots[i]).length;
+        if (badS) wrong.push(`az atom37-slot ${badS}`);
       }
       const seq = out3.filter((l) => l.startsWith("azseq\t")).map((l) => l.split("\t")[1]);
       const wantSeq = unindexed.annotations["condition_sequence_1_residue"];

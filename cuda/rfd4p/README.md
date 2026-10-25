@@ -541,8 +541,9 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`featurizeExpandedSegments`~~ **done** | 713-747 | the inference deletion block fires |
     | ~~`materializeInternalCoords`~~ **done** | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
     | ~~`unindexFlaggedTokens`~~ **done** | 822-1027 | 🔴 the whole 200-line body, which a contig skips entirely |
-    | `centerAndFeaturizeCentroid` | 1032-1108 | the recentering on conditioned coordinates |
-    | `buildAtom37Slots` | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
+    | ~~`centerAndFeaturizeCentroid`~~ **done** | 1032-1108 | the recentering on conditioned coordinates |
+    | ~~`addSupportsLocalLatentAnnotation`~~ **done** | 1113-1126 | a residue carries a latent only out of unindexed context |
+    | ~~`buildAtom37Slots`~~ **done** | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
     | `computeTokenBondFeatures` | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
 
     🔴 **`realizeExpandableSegments` GOES RIGHT TO LEFT**, so an earlier sentinel's index is
@@ -596,6 +597,19 @@ residues the cropped example does not contain, so building one from the spec fai
     re-bond turns it red; forcing its `collapsedKept` test TRUE does not, because the extra
     pairs are already bonded - the guard saves work rather than changing the answer, and
     `atoms.h` says so rather than implying it was checked.
+
+    🔴 **AND TWO OF `centerAndFeaturizeCentroid`'s CONVENTIONS WERE INVISIBLE BECAUSE THE GATE
+    WAS NOT LOOKING, NOT BECAUSE NO CASE REACHED THEM.** The centring shifts
+    `condition_coordinate_1_atom` as well as the structure, and nothing compared that column
+    after the stage - deleting the shift left all sixteen green. It is compared now and the
+    same mutation turns **twelve** of them red. The other was the gate's own recorded mistake
+    repeated: the centroid is a `Float32Array` in the reference, the comparison used
+    `Math.fround` on BOTH sides, and so a port that kept it in double scored perfectly.
+    Compared exactly, with the native side printed at full precision, removing the single
+    float32 rounding turns **fifteen** of sixteen red. **A narrowed comparison is how a
+    narrowing hides - twice now, in two different columns.** Two clauses here genuinely cannot
+    be falsified by any input (the `isfinite` guard on the shift, since `NaN - x` is `NaN`, and
+    the `|| !allowed` in the sequence conditioning) and `atoms.h` says so of each.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

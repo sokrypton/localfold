@@ -1016,7 +1016,24 @@ int run(int argc, char** argv) {
         // with the reference only where neither stage draws anything.
         rfd4p::atoms::materializeInternalCoords(arr, prng);
         rfd4p::atoms::unindexFlaggedTokens(arr);
+        const rfd4p::atoms::Centroid centroid = rfd4p::atoms::centerAndFeaturizeCentroid(arr);
+        rfd4p::atoms::addSupportsLocalLatentAnnotation(arr);
+        const vector<int> slots = rfd4p::atoms::buildAtom37Slots(arr);
         printf("atomized\t%zu\n", arr.n());
+        printf("azcentroid\t%.17g\t%.17g\t%.17g\n", (double)centroid.v[0], (double)centroid.v[1],
+               (double)centroid.v[2]);
+        for (const char* key : {"condition_coordinate_1_atom", "condition_ChainCentroid_1_atom"}) {
+          auto it = arr.ann.floats.find(key);
+          if (it == arr.ann.floats.end()) continue;
+          printf("azshift\t%s", key);
+          for (double v : it->second) printf("\t%.17g", v);
+          printf("\n");
+        }
+        for (size_t i = 0; i < arr.n(); ++i) {
+          printf("azfin\t%.17g\t%.17g\t%.17g\t%d\t%d\n", arr.coordToBeNoisedX[i],
+                 arr.coordToBeNoisedY[i], arr.coordToBeNoisedZ[i],
+                 (int)arr.supportsLocalLatent[i], slots[i]);
+        }
         for (size_t i = 0; i < arr.n(); ++i) {
           printf("azun\t%d\t%d\t%s\n", arr.insertionSourceIdx[i], (int)arr.isUnindexedSource[i],
                  arr.ids.chainIid[i].c_str());

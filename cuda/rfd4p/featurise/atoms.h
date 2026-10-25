@@ -83,8 +83,9 @@ struct AtomArray {
   vector<uint8_t> isStandardDna, isStandardOrUnknownDna, isStandardUnknownOrMaskedDna;
 
   // Added by the later stages.
-  vector<uint8_t> atomize, isCovalentModification, isUnindexedSource;
+  vector<uint8_t> atomize, isCovalentModification, isUnindexedSource, supportsLocalLatent;
   vector<int> atomId, tokenId, withinChainSourceResIdx, insertionSourceIdx;
+  vector<double> coordToBeNoisedX, coordToBeNoisedY, coordToBeNoisedZ;
 
   size_t n() const { return site.n; }
 };
@@ -113,7 +114,7 @@ inline void forEachColumn(AtomArray& a, F visit) {
                          &a.atomId, &a.tokenId, &a.withinChainSourceResIdx, &a.insertionSourceIdx}) {
     visit(*v);
   }
-  for (vector<double>* v : {&a.site.x, &a.site.y, &a.site.z, &a.site.bFactor, &a.site.occupancy}) {
+  for (vector<double>* v : {&a.site.x, &a.site.y, &a.site.z, &a.site.bFactor, &a.site.occupancy, &a.coordToBeNoisedX, &a.coordToBeNoisedY, &a.coordToBeNoisedZ}) {
     visit(*v);
   }
   for (vector<uint8_t>* v : {&a.site.hetero, &a.site.isPolymer, &a.site.isAromatic,
@@ -125,7 +126,7 @@ inline void forEachColumn(AtomArray& a, F visit) {
                              &a.isStandardOrUnknownRna, &a.isStandardUnknownOrMaskedRna,
                              &a.isStandardDna, &a.isStandardOrUnknownDna,
                              &a.isStandardUnknownOrMaskedDna, &a.atomize,
-                             &a.isCovalentModification, &a.isUnindexedSource}) {
+                             &a.isCovalentModification, &a.isUnindexedSource, &a.supportsLocalLatent}) {
     visit(*v);
   }
 }
@@ -1143,6 +1144,171 @@ inline void unindexFlaggedTokens(AtomArray& a, bool isInference = true) {
   addGlobalTokenIdAnnotation(a);
   addGlobalAtomIdAnnotation(a);
   ensureChemicalFlags(a);
+}
+
+/**
+ * `centerAndFeaturizeCentroid`: the structure is centred, and the centroid of everything the
+ * conditioning does NOT place is reported.
+ *
+ * 🔴 THE CENTRE IS TAKEN OVER THE CONDITIONED ATOMS WHERE THERE ARE ANY, AND OVER ALL OF THEM
+ * WHERE THERE ARE NONE. `if (anyCoordCond && !coordMask[i]) continue` is one line doing two
+ * jobs, and reading it as "centre on the conditioned atoms" puts an unconditioned structure at
+ * the origin of nothing.
+ *
+ * 🔴 AND THE SHIFT MOVES THE CONDITION COLUMNS TOO, or the conditioned coordinates would point
+ * at where the structure used to be. Both `condition_coordinate_1_atom` and
+ * `condition_ChainCentroid_1_atom`. Deleting that shift turns twelve of the gate's cases red;
+ * the FINITE test guarding it does not, and cannot - `NaN - x` is `NaN`, so the guard is a
+ * statement of intent rather than a rule, kept because the reference has it.
+ *
+ * 🔴 AND THE ANSWER IS A Float32Array IN THE REFERENCE, so the three sums are accumulated in
+ * double and ROUNDED ONCE at the end. Keeping them double here drifts in the last place.
+ */
+struct Centroid {
+  float v[3];
+};
+inline Centroid centerAndFeaturizeCentroid(AtomArray& a) {
+  const size_t n = a.n();
+  auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+  vector<double>* crd =
+      crdIt != a.ann.floats.end() && crdIt->second.size() == n * 3 ? &crdIt->second : nullptr;
+  vector<uint8_t> coordMask(n, 0);
+  bool anyCoordCond = false;
+  if (crd) {
+    for (size_t i = 0; i < n; ++i) {
+      if (std::isfinite((*crd)[i * 3]) && std::isfinite((*crd)[i * 3 + 1]) &&
+          std::isfinite((*crd)[i * 3 + 2])) {
+        coordMask[i] = 1;
+        anyCoordCond = true;
+      }
+    }
+  }
+  double sx = 0, sy = 0, sz = 0;
+  long count = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (anyCoordCond && !coordMask[i]) continue;
+    if (!std::isfinite(a.site.x[i]) || !std::isfinite(a.site.y[i]) || !std::isfinite(a.site.z[i])) {
+      continue;
+    }
+    sx += a.site.x[i]; sy += a.site.y[i]; sz += a.site.z[i];
+    ++count;
+  }
+  const double shx = count > 0 ? sx / count : 0.0;
+  const double shy = count > 0 ? sy / count : 0.0;
+  const double shz = count > 0 ? sz / count : 0.0;
+
+  a.coordToBeNoisedX.resize(n);
+  a.coordToBeNoisedY.resize(n);
+  a.coordToBeNoisedZ.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    a.coordToBeNoisedX[i] = a.site.x[i] - shx;
+    a.coordToBeNoisedY[i] = a.site.y[i] - shy;
+    a.coordToBeNoisedZ[i] = a.site.z[i] - shz;
+  }
+  for (const char* key : {"condition_coordinate_1_atom", "condition_ChainCentroid_1_atom"}) {
+    auto it = a.ann.floats.find(key);
+    if (it == a.ann.floats.end() || it->second.size() != n * 3) continue;
+    vector<double>& arr = it->second;
+    for (size_t i = 0; i < n; ++i) {
+      if (!std::isfinite(arr[i * 3]) || !std::isfinite(arr[i * 3 + 1]) ||
+          !std::isfinite(arr[i * 3 + 2])) {
+        continue;
+      }
+      arr[i * 3] -= shx; arr[i * 3 + 1] -= shy; arr[i * 3 + 2] -= shz;
+    }
+  }
+
+  double ux = 0, uy = 0, uz = 0;
+  long uCount = 0;
+  bool anyNotCond = false;
+  for (size_t i = 0; i < n; ++i) {
+    if (coordMask[i]) continue;
+    anyNotCond = true;
+    if (!std::isfinite(a.coordToBeNoisedX[i]) || !std::isfinite(a.coordToBeNoisedY[i]) ||
+        !std::isfinite(a.coordToBeNoisedZ[i])) {
+      continue;
+    }
+    ux += a.coordToBeNoisedX[i]; uy += a.coordToBeNoisedY[i]; uz += a.coordToBeNoisedZ[i];
+    ++uCount;
+  }
+  Centroid out;
+  if (anyNotCond && uCount > 0) {
+    out.v[0] = (float)(ux / uCount);
+    out.v[1] = (float)(uy / uCount);
+    out.v[2] = (float)(uz / uCount);
+  } else {
+    out.v[0] = out.v[1] = out.v[2] = NAN;
+  }
+  return out;
+}
+
+/**
+ * `addSupportsLocalLatentAnnotation`: a residue carries a local latent when its name has one,
+ * it is not atomised, and nothing in its TOKEN is unindexed context.
+ */
+inline void addSupportsLocalLatentAnnotation(AtomArray& a) {
+  const size_t n = a.n();
+  auto idxIt = a.ann.ints.find("condition_index_1_residue");
+  vector<uint8_t> unindexed(n, 0);
+  if (idxIt != a.ann.ints.end() && idxIt->second.size() == n) {
+    for (size_t i = 0; i < n; ++i) unindexed[i] = idxIt->second[i] ? 0 : 1;
+  }
+  vector<uint8_t> inContext(n, 0);
+  const vector<int> tokens = tokenStarts(a);
+  for (size_t t = 0; t + 1 < tokens.size(); ++t) {
+    const int s = tokens[t], e = tokens[t + 1];
+    bool any = false;
+    for (int i = s; i < e && !any; ++i) any = unindexed[i] != 0;
+    if (any) for (int i = s; i < e; ++i) inContext[i] = 1;
+  }
+  a.supportsLocalLatent.assign(n, 0);
+  for (size_t i = 0; i < n; ++i) {
+    a.supportsLocalLatent[i] = localLatentResidues().count(a.site.resName[i]) &&
+                               !(a.atomize.size() == n && a.atomize[i]) && !inContext[i];
+  }
+}
+
+/** `ATOM37_KEY_TO_SLOT`: `<residue>|<atom>` to its slot, with every standard amino acid's
+ *  atoms ALSO reachable under `UNK` - a residue nobody identified still has a backbone. */
+inline const std::map<string, int>& atom37KeyToSlot() {
+  static const std::map<string, int> m = [] {
+    std::map<string, int> out;
+    for (size_t t = 0; t < tables::TOKENS.size(); ++t) {
+      const string res = tables::TOKENS[t];
+      if (res == "<M>" || !localLatentResidues().count(res)) continue;
+      for (int slot = 0; slot < 37; ++slot) {
+        string atom = tables::TOKEN_ATOMS[t][slot];
+        while (!atom.empty() && std::isspace((unsigned char)atom.front())) atom.erase(atom.begin());
+        while (!atom.empty() && std::isspace((unsigned char)atom.back())) atom.pop_back();
+        if (atom.empty()) continue;
+        out.emplace(res + "|" + atom, slot);
+        if (tables::STANDARD_AA.count(res)) out.emplace("UNK|" + atom, slot);
+      }
+    }
+    return out;
+  }();
+  return m;
+}
+
+/**
+ * `buildAtom37Slots`: each atom's slot, or -1 where the layout has no place for it.
+ *
+ * 🔴 AN ATOMISED ATOM IS SLOT 1 WHATEVER IT IS. It is its own token and sits where a CA would,
+ * so the lookup is skipped entirely - a port that looked its name up would give a ligand's
+ * carbon the slot some amino acid happens to use for that name.
+ */
+inline vector<int> buildAtom37Slots(const AtomArray& a) {
+  const size_t n = a.n();
+  vector<int> slots(n, -1);
+  for (size_t i = 0; i < n; ++i) {
+    if (a.atomize.size() == n && a.atomize[i]) { slots[i] = 1; continue; }
+    string atom = a.site.atomName[i];
+    while (!atom.empty() && std::isspace((unsigned char)atom.front())) atom.erase(atom.begin());
+    while (!atom.empty() && std::isspace((unsigned char)atom.back())) atom.pop_back();
+    auto it = atom37KeyToSlot().find(a.site.resName[i] + "|" + atom);
+    if (it != atom37KeyToSlot().end()) slots[i] = it->second;
+  }
+  return slots;
 }
 
 }  // namespace atoms
