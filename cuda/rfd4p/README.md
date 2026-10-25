@@ -1,8 +1,19 @@
 # RFD4-Proteina on CUDA
 
-The native port of the design model the page runs in `webgpu/rfd4p/`. **It is a trunk and nothing
-else so far** — one pass, held to `cpu/rfd4p/reference.js` stage by stage. There is no sampler, no
-decoder and no output structure yet, so this does not generate anything.
+The native port of the design model the page runs in `webgpu/rfd4p/`. **It generates**: noise in, a
+PDB out, with the trunk, the flow sampler and the autoencoder decoder all held to
+`cpu/rfd4p/reference.js` stage by stage.
+
+```
+node cuda/rfd4p/export_input.mjs cuda/rfd4p/data --generate
+./cuda/rfd4p/localfold-rfd4p cuda/rfd4p/data --weights=cuda/rfd4p/weights-f32 \
+    --generate=cuda/rfd4p/data-gen --out=design.pdb --fast
+generated 54 residues, 420 atoms over 60 steps (120 trunk passes) -> design.pdb
+  sampling 0.52 s, with the decode and the write 0.53 s
+```
+
+And it is a protein rather than a ball of atoms: 54 CA, consecutive CA-CA **median 3.81 A with all
+53 inside [3.6, 4.0]**, radius of gyration 10.3 A for a 54-mer.
 
 ## What runs, and what it is held to
 
@@ -28,6 +39,37 @@ the bugs below were found by it or by `o/s0` rather than by a finished trunk tha
 
 ## Speed
 
+### A whole generation
+
+100 tokens, 60 steps, **180 trunk passes on both sides** (the `medium` recycle schedule, which is
+what `rfd4-generate` runs), one design, same A100. Timed from the first trunk call to the end, so
+model loading and reading the input file are outside it on both sides, and the per-step feature
+assembly, the sampler and the decode are inside it on both:
+
+| | sampling + decode | |
+|---|---:|---|
+| PyTorch eager | 16.00 s | `inference_experiment=quickstart`, which turns compilation OFF |
+| PyTorch compiled, first design | 10.91 s | about half of it is `torch.compile` |
+| **PyTorch compiled, warm** | **5.34 s** | the second design of a two-replicate run |
+| cuda/rfd4p, exact f32 | 4.80 s | |
+| **cuda/rfd4p, `--fast`** | **1.58 s** | **3.4x the warm compiled run** |
+
+🔴 **3.4x IS THE NUMBER, AND THE OTHER THREE ROWS ARE WHY IT TOOK FOUR RUNS TO GET.** Against the
+preset upstream ships for first runs it is 10.1x, and that preset says in its own header that it
+disables compilation. Against a compiled run whose FIRST design pays for the compiling it is 1.9x.
+Only the warm row is production against production. 🔴 And our exact f32 arm at 4.80 s is a TIE
+with it, which is the same thing the per-pass trunk comparison below says: the margin is
+arithmetic, not kernels.
+
+Whole process, including loading 1.2 GB of weights: **2.08 s against 22.14 s**.
+
+Per pass, the two loops are 8.8 ms (ours) and 29.7 ms (theirs) against isolated trunk costs of 7.8
+and 10.9 ms - so our loop adds 13% over its own trunk and theirs adds 170%. That gap is mostly
+feature assembly: their factories rebuild every feature each call where this port overwrites the 35
+columns that move and the 30 distance bins, which is what `webgpu/rfd4p/generate.js` does too.
+
+### A trunk pass, by itself
+
 A trunk pass at 100 tokens and 6 recycles, on this A100, against PyTorch on the same card and the
 **same captured batch** — hooked out of a real `rfd4-generate` run, so it is their own featurised
 input and their own 6 cycles, not something built here:
@@ -37,22 +79,15 @@ input and their own 6 cycles, not something built here:
 | PyTorch eager | 265.4 | | | f32 |
 | PyTorch compiled | 158.7 | | | f32 |
 | **PyTorch compiled, its own default precision** | **65.3** | 8.2 | **57.1** | bf16 matmuls |
-| cuda/rfd4p, exact | 157.8 | — | 157.8 | f32 |
+| cuda/rfd4p, exact | 156.0 | — | 156.0 | f32 |
 | **cuda/rfd4p, `--fast`** | **46.6** | — | **46.6** | TF32 + f16 |
 
-🔴 **THE HONEST NUMBER IS 1.22x, NOT 5x.** Against PyTorch's *production* path - compiled, at the
-precision upstream's own config selects - this port's network is 46.6 ms against 57.1. The 5.4x is
-against `quickstart`, which turns compilation off and is upstream's first-run preset, not how anyone
-generates. A ratio quoted without naming the other side's configuration is not a measurement, and
-this file had it wrong for a while.
-
 🔴 **AND THEIR FORWARD BUILDS ITS OWN FEATURES WHERE THIS ONE IS HANDED THEM** - 8.2 ms of their
-65.3, measured by wrapping `cond_factory`, `init_repr_factory` and `pair_repr_builder`. That work is
-inside their number and outside ours, and a finished port owes it. Counting it against us, the whole
-trunk call is 49.5 + (unmeasured) against 65.3.
+65.3, measured by wrapping `cond_factory`, `init_repr_factory` and `pair_repr_builder`. In the
+generation above both sides pay it.
 
 At matched f32 and both optimised, this port and a compiled PyTorch are the same speed to within a
-percent - 157.8 against 158.7. Everything beyond that is arithmetic, which is why `--fast` is a flag
+percent - 156.0 against 158.7. Everything beyond that is arithmetic, which is why `--fast` is a flag
 with its own oracle bound.
 
 ### How it scales
@@ -163,9 +198,11 @@ for a weight and then a bias left both names pointing at the bias.
 
 ## What is not done
 
-- **The sampler, the decoder and an output structure** — i.e. generating anything. The flow loop is
-  `shared/rfd4p/flow.js`, the decoder is the autoencoder's 12 layers, and both want their own
-  stage-by-stage bar before they are believed.
+- **An end-to-end trajectory comparison.** Every PIECE is held to the reference - the trunk, the
+  decoder, and the sampler's schedules are ported from `shared/rfd4p/flow.js` - but the LOOP that
+  joins them is checked only by the structure it produces being a protein. `--gen-oracle` runs
+  `generateRfd4pCpu` beside it at a step count somebody can wait for; 🔴 do not run it at the
+  preset's 60, which is `depths` JS trunk passes at about a minute each.
 - **The int8 bundle.** `model-rfd4p-int8/` has a `manifest.json` and is the shipping path through
   `Model::loadBundle`, as `cuda/bioemu2` does; this reads the float32 export only.
 - **A native featuriser.** `export_input.mjs` drives the page's own JS; the C++ twin under
@@ -175,6 +212,17 @@ for a weight and then a bias left both names pointing at the bias.
   without fetching a structure — no ligand, no nucleic chain, no binder — and `--length=N` makes an
   unconditioned segment for sizing and timing only.
 - **A padded input**, so the masking paths are written and unexercised.
+- **Anything but an unconditional monomer through `--generate`.** The export REFUSES an input whose
+  per-step features are more than the noised state, rather than silently freezing a feature that
+  should move - coordinate groups to permute and chirality frames both move per step and neither is
+  handled. That is the same condition `webgpu/rfd4p/generate.js` tests before taking its own
+  on-device loop.
+- **The C++ random source.** Box-Muller runs through V8's `Math.log`, and `cuda/featurise/jsmath.h`
+  carries sin and cos but no log, so the noise is REPLAYED from the exporter rather than redrawn:
+  one ulp in one draw diverges a sixty-step trajectory. The draw ORDER is a function of the schedule
+  alone, so the exporter reproduces the stream without running the model - the same thing
+  `tools/oracle/dump_rfd4p.py` does for the JS sampler. Porting fdlibm's `__ieee754_log` into
+  `jsmath.h` is ~40 lines and would make the port's own sampler exact.
 
 🔴 **AND TWO BRANCHES ONLY RUN PAST 40,000 PAIRS, WHICH NO ORACLE CASE REACHES.** `LOCALFOLD_BIG`
 forces the long form at any size - as `cuda/af3`'s big-input paths are forced - and the gate runs

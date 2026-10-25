@@ -50,6 +50,7 @@ import {
 import {
   aeMasks, decodeLatentsCpu, decoderPostprocess, decoderSeqFeatures, sequenceForDecoder,
 } from "../../cpu/rfd4p/decoder.js";
+import { generateRfd4pCpu } from "../../cpu/rfd4p/reference.js";
 
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--"));
@@ -66,6 +67,8 @@ const step = Number(option("step", "0"));
 const nRecycle = Number(option("recycles", "1"));
 const oracleDir = option("oracle", "");
 const generate = args.includes("--generate");
+const stepsOverride = Number(option("steps", "0"));
+const recycleOverride = option("recycle", "");
 const length = Number(option("length", "0"));
 const checkpoint = option("checkpoint", `${hub}/a06e2509c7033b010fc43614e9fd840303588502/model.safetensors`);
 const cfg = JSON.parse(readFileSync(option("config", `${repo}model-rfd4p-int8/config.json`), "utf8")).config;
@@ -211,8 +214,9 @@ if (generate) {
     console.error("--generate only covers inputs whose per-step features are the noised state alone");
     process.exit(1);
   }
-  const steps = preset.nsteps ?? DEFAULT_SAMPLING.nsteps;
-  const depths = recycleDepths(preset.recycleSchedule ?? "none", steps);
+  const steps = stepsOverride || preset.nsteps || DEFAULT_SAMPLING.nsteps;
+  const depths = recycleDepths(recycleOverride || preset.recycleSchedule || "none", steps);
+  const genSched = sampleSchedule({ ...DEFAULT_SAMPLING, nsteps: steps });
   const pairNoDist = pairFeatures(batch, {
     n, caNm: x.bb_ca, feats: nn.feats_pair_repr,
     dist: { dim: nn.xt_pair_dist_dim, min: nn.xt_pair_dist_min, max: nn.xt_pair_dist_max },
@@ -227,8 +231,8 @@ if (generate) {
   const pairCondAll = new Float32Array(steps * f.pairCond.length);
   for (let s2 = 0; s2 < steps; s2 += 1) {
     const tt2 = {
-      bb_ca: Math.fround(sched.bb_ca.ts[s2]),
-      local_latents: Math.fround(sched.local_latents.ts[s2]),
+      bb_ca: Math.fround(genSched.bb_ca.ts[s2]),
+      local_latents: Math.fround(genSched.local_latents.ts[s2]),
     };
     condAll.set(trunkCondFeatures(batch, {
       n, t: tt2, recycleRemaining: null, feats: nn.feats_cond_seq, weights, cache: {} }).data,
@@ -256,8 +260,8 @@ if (generate) {
   const stepNoise = [];
   for (let s2 = 0; s2 < steps; s2 += 1) {
     for (const dm of ["bb_ca", "local_latents"]) {
-      const t2 = Math.fround(sched[dm].ts[s2]);
-      const cfg2 = sched[dm].step;
+      const t2 = Math.fround(genSched[dm].ts[s2]);
+      const cfg2 = genSched[dm].step;
       const stochastic = t2 !== 0 && !(t2 > cfg2.t_lim_ode || t2 < cfg2.t_lim_ode_below);
       stepNoise.push(stochastic ? 1 : 0);
       if (stochastic) take(n * (dm === "bb_ca" ? 3 : 32));
@@ -294,6 +298,24 @@ if (generate) {
     "g/coordGroup": Int32Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : new Int32Array(n * 37).fill(-1)),
     "g/condSeq": Int32Array.from(field(COND.SEQ)),
   });
+  // 🔴 AND THE WHOLE GENERATION, WHEN IT IS SHORT ENOUGH TO AFFORD. `generateRfd4pCpu` is sixty
+  // trunk passes in JavaScript at about a minute each, so the end-to-end comparison is run at a
+  // step count somebody can wait for - which is enough, because every mechanism the loop has is
+  // exercised by two steps as much as by sixty.
+  // 🔴 OPT-IN, BECAUSE SIXTY STEPS OF JS TRUNK IS HOURS. `generateRfd4pCpu` is `depths` trunk
+  // passes an actual minute each; at the preset's 60 steps that is a whole afternoon, and running
+  // it by accident alongside `--oracle` is how this export went away for two hours. Ask for it with
+  // `--gen-oracle` and a step count somebody can wait for.
+  if (args.includes("--gen-oracle")) {
+    const gen = await generateRfd4pCpu(batch, weights, cfg, { nsteps: steps, seed });
+    writeDir(`${out}-gen-oracle`, {
+      "gen/xBb": gen.x.bb_ca,
+      "gen/xLl": gen.x.local_latents,
+      "gen/coors": gen.structure ? Float32Array.from(gen.structure.coors ?? []) : new Float32Array(0),
+    }, {});
+    console.log(`${out}-gen-oracle: the reference's own ${steps}-step sample`);
+  }
+
   // The names the PDB needs, beside the tensors: the page's own tables, not a second copy.
   writeFileSync(`${out}-gen/names.txt`,
     `${ATOM37_NAMES.join(" ")}\n${UNIFIED_ATOM37_TOKENS.join(" ")}\n`);

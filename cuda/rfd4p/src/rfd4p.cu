@@ -13,21 +13,27 @@
 #include "trunk.cuh"
 #include "decoder.cuh"
 #include "sampler.cuh"
+#include "generate.cuh"
+#include <fstream>
+#include <chrono>
 
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, out = "trunk.bin";
+  std::string dir, weights, oracle, gen, out = "design.pdb";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
   bool fast = false; // TF32 on the tensor cores, as every other port's --fast does
   bool insertion = true;
 };
 
+int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t);
+
 int run(const Opts& o) {
   M.load(o.weights);
   M.load(o.dir);
   if (!o.oracle.empty()) M.load(o.oracle);
+  if (!o.gen.empty()) M.load(o.gen);
   for (int seg = 0; seg < (int)M.segs.size(); ++seg) M.upload(seg);
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
@@ -115,6 +121,8 @@ int run(const Opts& o) {
     };
   }
 
+  if (!o.gen.empty()) return generate(o, d, t);
+
   rfd4p::forward(t, Fdev("in/seq"), Fdev("in/cond0"), Fdev("in/cond1"), Fdev("in/pair"),
                  Fdev("in/pairCond"), nRecycle, o.insertion, tap);
 
@@ -183,6 +191,193 @@ int run(const Opts& o) {
   return bad == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------- a whole generation
+//
+// The flow loop: sixty steps of trunk, each advancing x by one Euler-Maruyama step, then one
+// decode of the finished state into atoms.
+int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
+  const int n = d.n;
+  const int steps = (int)M.meta("meta/steps");
+  const int condDim = d.condF, pairDim = d.pairF;
+  const std::vector<float> emitBb = download(Fdev("g/emitBb"), n);
+  const std::vector<float> emitLl = download(Fdev("g/emitLl"), n);
+  const std::vector<float> noise = download(Fdev("g/noise"), M.len("g/noise"));
+  const int* depths = M.i("g/depths");
+  const int* stochastic = M.i("g/stochastic");
+  const int* coordCond = M.i("g/coordCond");
+  const int* moleculeIid = M.i("g/moleculeIid");
+
+  // `sample_noise` for both modalities: standard normal on the emitting tokens, the backbone
+  // centred and then offset once a molecule - all of it replayed from the exporter's own draws.
+  std::vector<float> bb(noise.begin(), noise.begin() + (size_t)n * 3);
+  size_t at = (size_t)n * 3;
+  double mean[3] = {0, 0, 0};
+  int live = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!emitBb[i]) { bb[i * 3] = bb[i * 3 + 1] = bb[i * 3 + 2] = 0.f; continue; }
+    ++live;
+    for (int k = 0; k < 3; ++k) mean[k] += bb[i * 3 + k];
+  }
+  for (int k = 0; k < 3; ++k) mean[k] = (float)(mean[k] / std::max(live, 1));
+  for (int i = 0; i < n; ++i) {
+    if (!emitBb[i]) continue;
+    for (int k = 0; k < 3; ++k) bb[i * 3 + k] = (float)(bb[i * 3 + k] - (float)mean[k]);
+  }
+  const float scale = (float)M.meta("meta/centeringScale");
+  std::vector<int> groups;
+  for (int i = 0; i < n; ++i) {
+    if (emitBb[i] && !coordCond[i] &&
+        std::find(groups.begin(), groups.end(), moleculeIid[i]) == groups.end()) {
+      groups.push_back(moleculeIid[i]);
+    }
+  }
+  std::sort(groups.begin(), groups.end());
+  for (int g : groups) {
+    const float off[3] = {noise[at], noise[at + 1], noise[at + 2]};
+    at += 3;
+    for (int i = 0; i < n; ++i) {
+      if (!emitBb[i] || coordCond[i] || moleculeIid[i] != g) continue;
+      for (int k = 0; k < 3; ++k) bb[i * 3 + k] = (float)(bb[i * 3 + k] + (float)(scale * off[k]));
+    }
+  }
+  std::vector<float> ll(noise.begin() + at, noise.begin() + at + (size_t)n * 32);
+  at += (size_t)n * 32;
+  for (int i = 0; i < n; ++i) {
+    if (!emitLl[i]) for (int k = 0; k < 32; ++k) ll[(size_t)i * 32 + k] = 0.f;
+  }
+
+  float* xBb = upload(bb.data(), bb.size());
+  float* xLl = upload(ll.data(), ll.size());
+  float* x1Bb = scratch<float>("gen.x1bb", (size_t)n * 3);
+  float* x1Ll = scratch<float>("gen.x1ll", (size_t)n * 32);
+  float* epsBuf = scratch<float>("gen.eps", (size_t)n * 32);
+  // The features are the exporter's, with the two state blocks overwritten each step.
+  float* seqF = scratch<float>("gen.seq", (size_t)n * d.seqF);
+  float* pairF = scratch<float>("gen.pair", (size_t)n * n * pairDim);
+  CK(cudaMemcpyAsync(seqF, Fdev("in/seq"), (size_t)n * d.seqF * sizeof(float),
+                     cudaMemcpyDeviceToDevice, STREAM));
+  CK(cudaMemcpyAsync(pairF, Fdev("g/pairNoDist"), (size_t)n * n * pairDim * sizeof(float),
+                     cudaMemcpyDeviceToDevice, STREAM));
+
+  CK(cudaStreamSynchronize(STREAM));
+  const auto t0 = std::chrono::steady_clock::now();
+  int passes = 0;
+  const rfd4p::Schedule schedBb = rfd4p::bbCaSchedule(steps);
+  const rfd4p::Schedule schedLl = rfd4p::latentSchedule(steps);
+  const float* emitBbDev = Fdev("g/emitBb");
+  const float* emitLlDev = Fdev("g/emitLl");
+
+  for (int s = 0; s < steps; ++s) {
+    rfd4p::writeStateK<<<(unsigned)n, 256, 0, STREAM>>>(seqF, xBb, xLl, n, d.seqF, d.latent);
+    rfd4p::pairDistBinsK<<<blocks((size_t)n * n), 256, 0, STREAM>>>(
+        pairF, xBb, n, pairDim, (int)M.meta("meta/distDim"), (float)M.meta("meta/distMin"),
+        (float)M.meta("meta/distMax"));
+    rfd4p::forward(t, seqF, Fdev("g/cond") + (size_t)s * n * condDim,
+                   Fdev("g/cond1") + (size_t)s * n * condDim, pairF,
+                   Fdev("g/pairCond") + (size_t)s * d.pairCondF, depths[s], s == steps - 1);
+    passes += depths[s];
+    rfd4p::maskEmitK<<<blocks((size_t)n * 3), 256, 0, STREAM>>>(t.bbCa, emitBbDev, n, 3);
+    rfd4p::maskEmitK<<<blocks((size_t)n * 32), 256, 0, STREAM>>>(t.localLatents, emitLlDev, n, 32);
+
+    for (int dm = 0; dm < 2; ++dm) {
+      const rfd4p::Schedule& sc = dm == 0 ? schedBb : schedLl;
+      const int dim = dm == 0 ? 3 : 32;
+      const double tt = (float)sc.ts[s], dt = sc.ts[s + 1] - sc.ts[s];
+      const size_t count = (size_t)n * dim;
+      const float* eps = nullptr;
+      if (stochastic[s * 2 + dm]) {
+        CK(cudaMemcpyAsync(epsBuf, noise.data() + at, count * sizeof(float),
+                           cudaMemcpyHostToDevice, STREAM));
+        at += count;
+        eps = epsBuf;
+      }
+      rfd4p::simulationStep(dm == 0 ? xBb : xLl, dm == 0 ? t.bbCa : t.localLatents,
+                            dm == 0 ? x1Bb : x1Ll, eps, dm == 0 ? emitBbDev : emitLlDev, count, dim,
+                            tt, dt, sc.gt[s], sc.step);
+      CK(cudaStreamSynchronize(STREAM));   // epsBuf is reused by the next modality
+    }
+  }
+
+  CK(cudaStreamSynchronize(STREAM));
+  const double loopMs =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+  // `sequenceForDecoder`: a conditioned residue stays, an emitted unconditioned one takes the
+  // argmax of the trunk's ALLOWED logits.
+  const int nTypes = d.classes;
+  const std::vector<float> logits = download(t.logits, (size_t)n * nTypes);
+  const std::vector<int> allowed(M.i("g/allowedTypes"), M.i("g/allowedTypes") + 7 * nTypes);
+  const int* tokenType = M.i("in/tokenType");
+  std::vector<int> seq(M.i("g/condSeq"), M.i("g/condSeq") + n);
+  for (int i = 0; i < n; ++i) {
+    if (!emitLl[i] || seq[i] != 0) continue;
+    const int tt = std::max(0, std::min(6, tokenType[i]));
+    int best = 0;
+    float bestV = -3.4028234663852886e38f;
+    for (int r = 0; r < nTypes; ++r) {
+      const float v = allowed[(size_t)tt * nTypes + r] ? logits[(size_t)i * nTypes + r]
+                                                       : -3.4028234663852886e38f;
+      if (v > bestV) { bestV = v; best = r; }
+    }
+    seq[i] = best;
+  }
+  int* seqDev = upload(seq.data(), seq.size());
+
+  rfd4p::DecDims dd;
+  dd.n = n;
+  dd.D = (int)M.meta("meta/decTokenDim");
+  dd.C = (int)M.meta("meta/decCondDim");
+  dd.H = (int)M.meta("meta/decHeads");
+  dd.nlayers = (int)M.meta("meta/decLayers");
+  dd.nTypes = nTypes;
+  dd.latent = d.latent;
+  dd.fdim = (int)M.meta("meta/decFeatDim");
+  float* dLogits = scratch<float>("gen.dlogits", (size_t)n * nTypes);
+  float* dCoors = scratch<float>("gen.dcoors", (size_t)n * 111);
+  float* dPresence = scratch<float>("gen.dpresence", (size_t)n * 37);
+  rfd4p::decode(dd, xBb, xLl, M.i("in/tokenType") ? Idev("in/tokenType") : nullptr, seqDev,
+                Fdev("in/attnMask"), dLogits, dCoors, dPresence);
+  CK(cudaStreamSynchronize(STREAM));
+
+  const rfd4p::GenOut g = rfd4p::postprocess(
+      n, nTypes, download(dLogits, (size_t)n * nTypes), download(dCoors, (size_t)n * 111),
+      download(dPresence, (size_t)n * 37), download(xBb, (size_t)n * 3), seq,
+      std::vector<int>(tokenType, tokenType + n),
+      std::vector<int>(M.i("g/coordGroup"), M.i("g/coordGroup") + (size_t)n * 37), allowed,
+      std::vector<int>(M.i("g/atom37Legal"), M.i("g/atom37Legal") + (size_t)nTypes * 37), emitLl,
+      download(t.mask, n));
+
+  // The atom and residue names, written beside the tensors by the exporter: the page's own tables.
+  std::vector<std::string> atomNames, resNames;
+  {
+    std::ifstream in(o.gen + "/names.txt");
+    std::string line, word;
+    for (int which = 0; which < 2 && std::getline(in, line); ++which) {
+      std::istringstream ss(line);
+      while (ss >> word) (which == 0 ? atomNames : resNames).push_back(word);
+    }
+  }
+  if (atomNames.size() != 37 || resNames.size() != (size_t)nTypes) {
+    fprintf(stderr, "%s/names.txt has %zu atom and %zu residue names\n", o.gen.c_str(),
+            atomNames.size(), resNames.size());
+    return 1;
+  }
+  const std::string pdb = rfd4p::toPdb(g, n, atomNames, resNames);
+  std::ofstream(o.out) << pdb;
+  int atoms = 0, residues = 0;
+  for (int i = 0; i < n; ++i) {
+    if (g.residueType[i] >= 0) ++residues;
+    for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
+  }
+  const double wholeMs =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  printf("generated %d residues, %d atoms over %d steps (%d trunk passes) -> %s\n", residues, atoms,
+         steps, passes, o.out.c_str());
+  printf("  sampling %.2f s, with the decode and the write %.2f s\n", loopMs / 1000,
+         wholeMs / 1000);
+  return 0;
+}
+
 int foldMain(int argc, char** argv) {
   Opts o;
   o.dir = argv[1];
@@ -191,6 +386,7 @@ int foldMain(int argc, char** argv) {
     auto value = [&](const char* name) { return f.substr(strlen(name) + 3); };
     if (!f.compare(0, 10, "--weights=")) o.weights = value("weights");
     else if (!f.compare(0, 9, "--oracle=")) o.oracle = value("oracle");
+    else if (!f.compare(0, 11, "--generate=")) o.gen = f.substr(11);
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
