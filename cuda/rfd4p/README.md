@@ -527,15 +527,15 @@ residues the cropped example does not contain, so building one from the spec fai
     with every number the page produces.
   - ~~**`transforms.js` with real atoms**~~ **done, all fourteen stages** - the same pipeline
     the spec path already ran, but with every branch a contig's `<M>` stubs made inert now
-    live. Held to the reference over twenty-seven cases: the seven shipped structures and twenty the
+    live. Held to the reference over twenty-nine cases: the seven shipped structures and twenty-two the
     gate synthesises, because the shipped seven could not reach most of it (see the three
     findings below the table) - nine of the twenty built this session purely to make the mmCIF READER's own filters and fallbacks reachable, four of those chosen by gcov. `convertToProteinaBatch` (1175-1606) is ported too, so a
     structure now reaches the batch the model reads - 46 keys held to the reference over all
-    twenty-seven cases. Zstandard is native too (`cuda/featurise/zstd.h`,
+    twenty-nine cases. Zstandard is native too (`cuda/featurise/zstd.h`,
     dlopen'd like `common.cuh`'s blob reader), so the page's own `.cif.zst` goes straight into
     the binary and the gate drives all seven that way as well as decompressed. `applyContig` takes PRESERVED segments now
     (`featurise/contig.h`), so a contig against a real structure assembles natively - five
-    contigs over each of the twenty-seven cases, compared column by column with the bonds and
+    contigs over each of the twenty-nine cases, compared column by column with the bonds and
     `originalResId`. The selection language reads real atoms too
     (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
     which is what every structure preset writes and what the contig-only subset could not say.
@@ -617,8 +617,8 @@ residues the cropped example does not contain, so building one from the spec fai
     is not exercising the rule on it**, which is the sharpest form of this session's lesson:
     coverage tells you where to look and is not itself the test.
 
-    The corpus is **27 structures** now, twenty of them synthesised, and gcov is how the last
-    eight were chosen. Three more gaps it named and the corpus now covers: the contig
+    The corpus is **29 structures** now, twenty-two of them synthesised, and gcov is how the last
+    ten were chosen. Three more gaps it named and the corpus now covers: the contig
     suffixes `R` and `D` (`suffixChainType` maps `P`/`R`/`D` onto protein, RNA and DNA, and
     every contig ever written here asked for a protein - a segment typed as the wrong molecule
     is not a refusal, it is a chain the model reads as the wrong polymer; **24 of 27** with
@@ -646,6 +646,31 @@ residues the cropped example does not contain, so building one from the spec fai
     wrong was the fixture, which copied a preset's shape and so read as though it tested
     something. `gate-structure-contig.json` and `gate-crdgroups.json` set `specMode` and are
     where a structure's conditions are actually gated.
+
+    🔴 **AND E/Z DOUBLE-BOND STEREOCHEMISTRY WAS THE LARGEST UNTESTED THING IN THE
+    FEATURISER: 80 LINES OF `chirality.h`, UNREACHED BY ALL TWENTY-SEVEN STRUCTURES.**
+    `classifyDoubleBond`, the stereogenic-bond scan and the E/Z labelling. A double bond is
+    stereogenic only where each end has one or two neighbours and a two-neighbour end's pair
+    are topologically different - and SAM's only non-aromatic `DOUB` is a CARBONYL, whose
+    oxygen end has no other neighbour at all, while every other double bond in the corpus is
+    aromatic and skipped. So `stereogenic_bond_atoms`, which the model reads, was produced by
+    code nothing had run: get it backwards and the model is handed an ISOMER, which no bond
+    length, clash score or chain check can see. `sm_sam+stereobond` promotes `C2-C3` to
+    `DOUB` and drops the four hydrogens that would give those carbons three neighbours each,
+    which leaves one neighbour at each end and makes the rule fire - **2 stereogenic atoms
+    where the unmodified file has 0**. Flipping the E/Z side and never setting the flag are
+    each 1 of 29.
+
+    🔴 **AND THE PLANARITY CUTOFF NEEDED A BOND THAT IS NOT PLANAR, WHICH A REAL MOLECULE'S IS
+    NOT.** `classifyDoubleBond` returns 0 where the substituents' in-plane projections are
+    less than 60 degrees apart, because the geometry then says nothing about which side
+    anything is on - and dropping that guard was **0 of 28**, since `C2=C3` is cleanly
+    determined. `sm_sam+twistedbond` moves one substituent to make the cosine zero, and now
+    dropping it is 1 of 29. 🔴 **THE FIRST VERSION ROTATED A FIXED NINETY DEGREES AND DID NOT
+    WORK**: the substituents start **49.3 degrees** apart, so a quarter turn lands on 139.3
+    and |cosine| goes 0.652 -> **0.758**, still the wrong side of 0.5. The perpendicular is
+    CONSTRUCTED now, which is exact whatever the molecule started at. Third time in this
+    session that reaching a line was mistaken for exercising the rule on it.
 
     🔴 **AND THE REFUSAL ARM FOR THE CENTROID NEEDED THREE THINGS AND MISSED TWO IN TURN.** On
     a pure contig a centroid is ALREADY refused for needing a structure, so the first attempt

@@ -221,6 +221,80 @@ function withAuthNumbering(text) {
 }
 
 /**
+ * The small molecule with a STEREOGENIC DOUBLE BOND in it: `C2=C3`, and the four hydrogens
+ * that would give those carbons three neighbours each taken away.
+ *
+ * 🔴 E/Z DOUBLE-BOND STEREOCHEMISTRY WAS THE LARGEST UNTESTED THING IN THE FEATURISER, and
+ * gcov is what said so: `classifyDoubleBond`, the stereogenic-bond scan and the E/Z labelling
+ * are **80 uncovered lines of `chirality.h`**, every one of them unreached by all twenty-seven
+ * structures. A double bond is stereogenic only where each end has one or two neighbours and a
+ * two-neighbour end's pair are topologically different - and SAM's only non-aromatic `DOUB` is
+ * a carbonyl, whose oxygen end has no other neighbour at all, while every other double bond in
+ * the corpus is aromatic and skipped. So the feature the model reads as `stereogenic_bond_atoms`
+ * was produced by code nothing had run: getting it backwards hands the model an ISOMER and no
+ * bond length, clash score or chain check can see it.
+ *
+ * The edit is local rather than a molecule invented from nothing: `C2-C3` becomes `DOUB`, and
+ * `H3`/`H4` (on C2) and `H5`/`H6` (on C3) go, which leaves each end exactly one neighbour -
+ * `C0` and `S0` - so the rule fires. The result is not a real compound and does not need to be;
+ * both sides read the same file and must agree about what it says.
+ */
+function withStereogenicDoubleBond(text, twist = false) {
+  const gone = new Set(["H3", "H4", "H5", "H6"]);
+  const L = atomSiteLoop(text);
+  const nameAt = L.cols.indexOf("label_atom_id");
+  if (nameAt < 0) throw new Error("no atom name column");
+  const kept = L.rows.filter((r) => !gone.has(r[nameAt]));
+  if (kept.length === L.rows.length) throw new Error("no hydrogens to remove");
+  if (twist) {
+    // 🔴 AND THE PLANARITY CUTOFF NEEDS A BOND THAT IS NOT PLANAR, which a real molecule's is.
+    // `classifyDoubleBond` returns 0 where the two substituents' in-plane projections are less
+    // than 60 degrees apart (`|cosine| < 0.5`), because then the geometry does not say which
+    // side anything is on - and dropping that guard was 0 of 28, since `C2=C3`'s substituents
+    // are cleanly trans. Rotating `C0` ninety degrees about the C2->C3 axis puts the two
+    // projections at right angles, which is exactly the undetermined case the guard is for: a
+    // port without it assigns a side from noise.
+    const xyz = ["Cartn_x", "Cartn_y", "Cartn_z"].map((c) => L.cols.indexOf(c));
+    const at = (n) => kept.find((r) => r[nameAt] === n);
+    const pos = (r) => xyz.map((c) => Number(r[c]));
+    const [c2, c3, c0] = [at("C2"), at("C3"), at("C0")];
+    if (!c2 || !c3 || !c0) throw new Error("C0, C2 or C3 missing");
+    const p2 = pos(c2), p3 = pos(c3), p0 = pos(c0);
+    const ps = pos(at("S0"));
+    const dot = (u, w) => u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    const sub = (u, w) => [u[0] - w[0], u[1] - w[1], u[2] - w[2]];
+    const ax = sub(p3, p2);
+    const k = ax.map((v) => v / Math.hypot(...ax));
+    // 🔴 ROTATING BY A FIXED NINETY DEGREES IS NOT ENOUGH, which the first attempt assumed and
+    // measured: `C2=C3`'s substituents start 49.3 degrees apart, so a quarter turn lands on
+    // 139.3 and |cosine| goes 0.652 -> 0.758, still the wrong side of the 0.5 cutoff. The
+    // perpendicular is CONSTRUCTED instead, which makes the cosine exactly zero whatever the
+    // molecule started at.
+    const s0 = sub(p0, p2), s1 = sub(ps, p3);
+    const q0 = s0.map((v, i) => v - dot(s0, k) * k[i]);
+    const q1 = s1.map((v, i) => v - dot(s1, k) * k[i]);
+    const perp = [k[1] * q1[2] - k[2] * q1[1], k[2] * q1[0] - k[0] * q1[2],
+                  k[0] * q1[1] - k[1] * q1[0]];
+    const scale = Math.hypot(...q0) / Math.hypot(...perp);
+    for (let i = 0; i < 3; i += 1) {
+      c0[xyz[i]] = (p2[i] + dot(s0, k) * k[i] + perp[i] * scale).toFixed(3);
+    }
+  }
+  let out = writeAtomSite(L, kept);
+  // The component tables name those atoms too: drop their bonds and their `_chem_comp_atom`
+  // rows, and promote the one bond that is left between the two carbons.
+  out = out.split("\n").filter((line) => {
+    const tok = line.trim().split(/\s+/);
+    if (tok.length >= 3 && tok[0] === "S;M" && (gone.has(tok[1]) || gone.has(tok[2]))) return false;
+    if (tok.length >= 3 && tok[0] === "S;M" && gone.has(tok[1])) return false;
+    return true;
+  }).map((line) => (line.trimStart().startsWith("S;M C2  C3  SING")
+    ? line.replace("SING", "DOUB") : line)).join("\n");
+  if (!out.includes("C2  C3  DOUB")) throw new Error("the C2-C3 bond was not promoted");
+  return out;
+}
+
+/**
  * The same structure with its own chemistry tables REMOVED, so the reader must fall back to
  * the built-in ones.
  *
@@ -631,6 +705,8 @@ cases.set("dna_7m5w+nochemtables", withoutChemTables(cases.get("dna_7m5w")));
 cases.set("ppi_pdl1+OXT+nochemtables", withoutChemTables(cases.get("ppi_pdl1+OXT")));
 cases.set("dna_7m5w+OP3+nochemtables", withoutChemTables(cases.get("dna_7m5w+OP3")));
 cases.set("ppi_pdl1+nocharges", withoutChemTables(cases.get("ppi_pdl1"), true));
+cases.set("sm_sam+stereobond", withStereogenicDoubleBond(cases.get("sm_sam")));
+cases.set("sm_sam+twistedbond", withStereogenicDoubleBond(cases.get("sm_sam"), true));
 
 /**
  * The contigs to try on a structure: a preserved segment it really has, with an expandable one
