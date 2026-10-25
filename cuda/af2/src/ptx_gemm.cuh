@@ -201,8 +201,15 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
+      for (int h = 0; h < 2; ++h) {
         const int rw = m * 16 + g + 8 * h;
+        uint32_t ru[8];
+        if constexpr (BETA) {
+#pragma unroll
+          for (int nt = 0; nt < 8; ++nt) {
+            ru[nt] = ptx_ld_shared_u32(Ws + rw * LDW + nt * 8 + tig * 2);
+          }
+        }
 #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
           const int cw = nt * 8 + tig * 2;
@@ -210,10 +217,9 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
           if constexpr (BIAS) { v0 = ptx_add_f32(v0, bf[nt].x); v1 = ptx_add_f32(v1, bf[nt].y); }
           if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
           if constexpr (BETA) {
-            uint32_t ru = ptx_ld_shared_u32(Ws + rw * LDW + cw);
             float r0, r1;
-            if constexpr (BFO) ptx_bf16x2_to_f32x2(ru, r0, r1);
-            else ptx_f16x2_to_f32x2(ru, r0, r1);
+            if constexpr (BFO) ptx_bf16x2_to_f32x2(ru[nt], r0, r1);
+            else ptx_f16x2_to_f32x2(ru[nt], r0, r1);
             v0 = ptx_add_f32(v0, r0);
             v1 = ptx_add_f32(v1, r1);
           }
@@ -223,12 +229,16 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
       }
     }
     ptx_bar_warp();
+    uint4 wv[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      wv[s] = ptx_ld_shared_v4_u32(Ws + (s * 4 + rw0) * LDW + cw0);
+    }
     if (fullRows) {
 #pragma unroll
       for (int s = 0; s < 8; ++s) {
         const int rw = s * 4 + rw0;
-        ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 64 + cw0,
-                             ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+        ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 64 + cw0, wv[s]);
       }
     } else {
 #pragma unroll
@@ -236,8 +246,7 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
         const int rw = s * 4 + rw0;
         const size_t row = row0 + warpM * 32 + rw;
         if (row < rows) {
-          ptx_st_global_v4_u32(Y + row * ldy + col0 + warpN * 64 + cw0,
-                               ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+          ptx_st_global_v4_u32(Y + row * ldy + col0 + warpN * 64 + cw0, wv[s]);
         }
       }
     }
@@ -397,7 +406,48 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
     }
   }
 
-  if constexpr (std::is_same_v<TO, float>) {
+  if constexpr (std::is_same_v<TO, float> && !BETA) {
+    __syncthreads();
+    constexpr int LDF = 40;
+    float* Fs = reinterpret_cast<float*>(smem) + warp * (32 * LDF);
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int rw = m * 16 + g + 8 * h;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          float v0 = acc[m][nt][2 * h], v1 = acc[m][nt][2 * h + 1];
+          if constexpr (BIAS) { v0 = ptx_add_f32(v0, bf[nt].x); v1 = ptx_add_f32(v1, bf[nt].y); }
+          if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
+          ptx_st_shared_v2_f32(Fs + rw * LDF + nt * 8 + tig * 2, v0, v1);
+        }
+      }
+    }
+    ptx_bar_warp();
+    const int rwf0 = lane >> 3, cwf0 = (lane & 7) << 2;
+    float4 fv[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      fv[s] = ptx_ld_shared_v4_f32(Fs + (s * 4 + rwf0) * LDF + cwf0);
+    }
+    if (fullRows) {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rwf0;
+        ptx_st_global_v4_f32(Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 32 + cwf0, fv[s]);
+      }
+    } else {
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int rw = s * 4 + rwf0;
+        const size_t row = row0 + warpM * 32 + rw;
+        if (row < rows) {
+          ptx_st_global_v4_f32(Y + row * ldy + col0 + warpN * 32 + cwf0, fv[s]);
+        }
+      }
+    }
+  } else if constexpr (std::is_same_v<TO, float>) {
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
 #pragma unroll
@@ -433,6 +483,13 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int rw = m * 16 + g + 8 * h;
+        uint32_t ru[4];
+        if constexpr (BETA) {
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+            ru[nt] = ptx_ld_shared_u32(Ws + rw * LDW + nt * 8 + tig * 2);
+          }
+        }
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
           const int cw = nt * 8 + tig * 2;
@@ -440,10 +497,9 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
           if constexpr (BIAS) { v0 = ptx_add_f32(v0, bf[nt].x); v1 = ptx_add_f32(v1, bf[nt].y); }
           if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
           if constexpr (BETA) {
-            uint32_t ru = ptx_ld_shared_u32(Ws + rw * LDW + cw);
             float r0, r1;
-            if constexpr (BFO) ptx_bf16x2_to_f32x2(ru, r0, r1);
-            else ptx_f16x2_to_f32x2(ru, r0, r1);
+            if constexpr (BFO) ptx_bf16x2_to_f32x2(ru[nt], r0, r1);
+            else ptx_f16x2_to_f32x2(ru[nt], r0, r1);
             v0 = ptx_add_f32(v0, r0);
             v1 = ptx_add_f32(v1, r1);
           }
@@ -453,24 +509,24 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
       }
     }
     ptx_bar_warp();
+    uint4 wv[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      wv[s] = ptx_ld_shared_v4_u32(Ws + (s * 8 + rw0) * LDW + cw0);
+    }
     if (fullRows) {
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
         const int rw = s * 8 + rw0;
-        const int col = col0 + warpN * 32 + cw0;
-        if (col < N) {
-          ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col,
-                               ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
-        }
+        ptx_st_global_v4_u32(Y + (row0 + warpM * 32 + rw) * ldy + col0 + warpN * 32 + cw0, wv[s]);
       }
     } else {
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
         const int rw = s * 8 + rw0;
         const size_t row = row0 + warpM * 32 + rw;
-        const int col = col0 + warpN * 32 + cw0;
-        if (row < rows && col < N) {
-          ptx_st_global_v4_u32(Y + row * ldy + col, ptx_ld_shared_v4_u32(Ws + rw * LDW + cw0));
+        if (row < rows) {
+          ptx_st_global_v4_u32(Y + row * ldy + col0 + warpN * 32 + cw0, wv[s]);
         }
       }
     }
