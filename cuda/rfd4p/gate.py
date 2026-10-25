@@ -333,7 +333,13 @@ def main() -> int:
             print("  featurise  no rfd4p-featurise; run bash cuda/build.sh rfd4p")
             failed += 1
         else:
-            cases = [(f"n{L}", [f"--length={L}"], [f"--length={L}"]) for L in FEATURISE_LENGTHS]
+            # 🔴 THE RECYCLE SCHEDULE IS PASSED TO BOTH SIDES RATHER THAN DEFAULTED ON EITHER.
+            # `export_input.mjs --length=N` replaces only the CONTIG, so it keeps the default
+            # preset's `low` schedule, where the C++ has no preset and defaults to `none`. That is
+            # a difference in the harness, not in the featuriser, and saying it out loud is
+            # cheaper than teaching one side about the other's menu.
+            cases = [(f"n{L}", [f"--length={L}", "--recycle=none"],
+                      [f"--length={L}", "--recycle=none"]) for L in FEATURISE_LENGTHS]
             # And a CONDITIONED case, because a plain segment reaches neither the selection
             # language nor the CATH table. The preset is turned into the plain condition spec the
             # C++ reads, so neither side learns about the other's menu.
@@ -343,6 +349,11 @@ def main() -> int:
             if r.returncode == 0:
                 spec.write_text(r.stdout)
                 cases.append(("cath", [f"--spec={spec}"], ["--preset=custom_cath_monomer"]))
+            # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
+            # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
+            # C++ now draws rather than replays, so Box-Muller is compared here too. Without this
+            # arm the featuriser could be exact on one step and wrong about the whole run.
+            cases = [(tag, nf + ["--generate"], jf + ["--generate"]) for tag, nf, jf in cases]
             first, bad_fields = "", 0
             for tag, native_flags, js_flags in cases:
                 nat, js = HERE / f"gate-nat-{tag}", HERE / f"gate-js-{tag}"
@@ -352,6 +363,8 @@ def main() -> int:
                     run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", js,
                          *js_flags], cwd=REPO)
                 differ = compare_dirs(nat, js)
+                differ += [f"-gen {d}" for d in compare_dirs(
+                    Path(str(nat) + "-gen"), Path(str(js) + "-gen"))]
                 if differ:
                     bad_fields += len(differ)
                     first = first or f"{tag}: {differ[0]}"

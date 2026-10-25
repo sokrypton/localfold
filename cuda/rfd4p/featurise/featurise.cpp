@@ -736,8 +736,12 @@ int main(int argc, char** argv) {
   using rfd4p::bbCaSchedule;
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
+  using rfd4p::recycleDepths;
+  namespace tables = rfd4p::tables;
   string out, specPath, weightsDir, configPath;
   int seed = 0, step = 0, length = 0;
+  bool generate = false;
+  string recycleSchedule = "none";
   for (int i = 1; i < argc; ++i) {
     const string a = argv[i];
     if (a.rfind("--", 0) != 0) { out = a; continue; }
@@ -747,6 +751,8 @@ int main(int argc, char** argv) {
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
     else if (!a.compare(0, 9, "--length=")) length = atoi(a.c_str() + 9);
+    else if (a == "--generate") generate = true;
+    else if (!a.compare(0, 10, "--recycle=")) recycleSchedule = a.substr(10);
     else { fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
   }
   if (out.empty() || weightsDir.empty() || (specPath.empty() && !length)) {
@@ -809,6 +815,9 @@ int main(int argc, char** argv) {
     }
     contig = spec.get("contig")->s;
     if (!Json::absent(spec.get("nsteps"))) nsteps = (int)spec.get("nsteps")->n;
+    for (const char* k : {"recycleSchedule", "recycle_schedule"}) {
+      if (!Json::absent(spec.get(k))) recycleSchedule = spec.get(k)->s;
+    }
     const Json* cond = spec.get("conditions");
     if (cond && cond->isObject()) {
       for (const auto& [key, arms] : cond->o) {
@@ -938,5 +947,123 @@ int main(int argc, char** argv) {
   dir.ints("in/tokenType", b.tokenType);
   dir.close();
   printf("%s: %d tokens, %.1f MB\n", out.c_str(), n, dir.offset * 4 / 1e6);
+
+  // ---- and everything a whole GENERATION needs, when it is asked for -------------------------
+  //
+  // 🔴 ONLY THIRTY-FIVE OF THE SEQUENCE COLUMNS MOVE BETWEEN STEPS - `xt_bb_ca` at 0 and
+  // `xt_local_latents` at 3 - so the features go out once and the port overwrites those columns on
+  // the device. The pair track's distance bins are refilled the same way, which is why they are
+  // written WITHOUT them here. Everything else about a step is the conditioning, which depends on
+  // t alone and is written for every step.
+  if (!generate) return 0;
+  const string gen = out + "-gen";
+  Dir g(gen);
+  const int steps = nsteps;
+  const vector<int> depths = recycleDepths(recycleSchedule, steps);
+
+  int pairNoDistDim = 0;
+  const vector<float> pairNoDist = pairFeatures(b, cfg, xBb, true, pairNoDistDim);
+  vector<float> condAll, cond1All, pairCondAll;
+  vector<int> stochastic;
+  for (int s2 = 0; s2 < steps; ++s2) {
+    const double t2Bb = (float)schedBb.ts[s2], t2Ll = (float)schedLl.ts[s2];
+    int d0 = 0, d1 = 0;
+    const vector<float> c0 = condFeatures(b, cfg, w, t2Bb, t2Ll, -1, d0);
+    const vector<float> c1 = condFeatures(b, cfg, w, t2Bb, t2Ll, 1, d1);
+    const vector<float> pc = pairCondFeatures(cfg, t2Bb, t2Ll);
+    condAll.insert(condAll.end(), c0.begin(), c0.end());
+    cond1All.insert(cond1All.end(), c1.begin(), c1.end());
+    pairCondAll.insert(pairCondAll.end(), pc.begin(), pc.end());
+    for (int dm = 0; dm < 2; ++dm) {
+      const Schedule& sc = dm ? schedLl : schedBb;
+      const double t2 = dm ? t2Ll : t2Bb;
+      stochastic.push_back(
+          (t2 != 0 && !(t2 > sc.step.tLimOde || t2 < sc.step.tLimOdeBelow)) ? 1 : 0);
+    }
+  }
+
+  // The noise stream, drawn rather than replayed: jsmath carries V8's log, so Box-Muller here is
+  // the page's to the bit. The ORDER is `sample_noise`'s - the backbone, its per-molecule offsets,
+  // then the latents - and then a draw a step wherever the step is stochastic.
+  vector<float> noise;
+  {
+    Rng g2((uint64_t)seed);
+    auto take = [&](size_t count) {
+      const size_t at = noise.size();
+      noise.resize(at + count);
+      g2.randn(noise.data() + at, count);
+    };
+    take((size_t)n * 3);
+    vector<int> groups;
+    for (int i = 0; i < n; ++i) {
+      if (emit.bb[i] && !b.coordCondMask[i] &&
+          std::find(groups.begin(), groups.end(), b.moleculeIid[i]) == groups.end()) {
+        groups.push_back(b.moleculeIid[i]);
+      }
+    }
+    std::sort(groups.begin(), groups.end());
+    for (size_t k = 0; k < groups.size(); ++k) take(3);
+    take((size_t)n * 32);
+    for (int s2 = 0; s2 < steps; ++s2) {
+      for (int dm = 0; dm < 2; ++dm) {
+        if (stochastic[s2 * 2 + dm]) take((size_t)n * (dm ? 32 : 3));
+      }
+    }
+    g.meta("nGroups", (double)groups.size());
+  }
+
+  g.meta("steps", steps);
+  g.meta("centeringScale", CENTERING_SCALE);
+  g.meta("distDim", cfg.xtPairDistDim);
+  g.meta("distMin", cfg.xtPairDistMin);
+  g.meta("distMax", cfg.xtPairDistMax);
+  g.meta("alignChirality", 0);       // a contig has no chiral frames; a structure input will
+  g.meta("chirOff", -1);
+  g.meta("chiralFrameWidth", 0);
+  g.meta("partial", 0);
+  g.meta("inverseFolding", 0);
+  g.meta("partialTBb", 0);
+  g.meta("partialTLl", 0);
+  g.meta("baseNsteps", steps);
+  g.meta("fullNsteps", 0);
+  g.tensor("g/pairNoDist", pairNoDist);
+  g.tensor("g/cond", condAll);
+  g.tensor("g/cond1", cond1All);
+  g.tensor("g/pairCond", pairCondAll);
+  g.tensor("g/noise", noise);
+  {
+    vector<float> eb(n), el(n);
+    for (int i = 0; i < n; ++i) { eb[i] = emit.bb[i]; el[i] = emit.ll[i]; }
+    g.tensor("g/emitBb", eb);
+    g.tensor("g/emitLl", el);
+  }
+  g.ints("g/depths", depths);
+  g.ints("g/stochastic", stochastic);
+  {
+    vector<int> cc(n), mi(n), cs(n);
+    for (int i = 0; i < n; ++i) {
+      cc[i] = b.coordCondMask[i] ? 1 : 0;
+      mi[i] = b.moleculeIid[i];
+      cs[i] = b.conditionSequence[i];
+    }
+    g.ints("g/coordCond", cc);
+    g.ints("g/moleculeIid", mi);
+    g.ints("g/condSeq", cs);
+    vector<int> allowed(tables::ALLOWED_RESIDUE_TYPES.begin(), tables::ALLOWED_RESIDUE_TYPES.end());
+    vector<int> legal(tables::RESTYPE_ATOM37_MASK.begin(), tables::RESTYPE_ATOM37_MASK.end());
+    g.ints("g/allowedTypes", allowed);
+    g.ints("g/atom37Legal", legal);
+    g.ints("g/coordGroup", b.coordGroup);
+  }
+  g.close();
+  {
+    FILE* f = fopen((gen + "/names.txt").c_str(), "w");
+    for (int a = 0; a < 37; ++a) fprintf(f, a ? " %s" : "%s", tables::ATOM37_NAMES[a]);
+    fprintf(f, "\n");
+    for (int t = 0; t < tables::N_TOKENS; ++t) fprintf(f, t ? " %s" : "%s", tables::TOKENS[t]);
+    fprintf(f, "\n");
+    fclose(f);
+  }
+  printf("%s: %d steps, %.1f MB\n", gen.c_str(), steps, g.offset * 4 / 1e6);
   return 0;
 }

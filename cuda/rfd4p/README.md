@@ -281,10 +281,17 @@ cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --sp
 cuda/rfd4p/featurise/rfd4p-featurise <out> --weights=cuda/rfd4p/weights-f32 --length=100
 ```
 
-`gate.py`'s `featurise` arm holds it to `export_input.mjs` **field by field, as bytes** - eight
-cases, 0 differing - over seven lengths and the CATH-plus-secondary-structure preset. That bar is
-`cuda/featurise`'s and it is the only one worth having: a featuriser that merely agrees closely is
-a second, slightly different model.
+`--generate` writes the whole-generation directory too, so **a fold from a condition spec needs no
+JavaScript at all** - and its PDB is byte-identical to the one the exporter's own directory
+produces.
+
+`gate.py`'s `featurise` arm holds both directories to `export_input.mjs` **field by field, as
+bytes** - eight cases, 0 differing - over seven lengths and the CATH-plus-secondary-structure
+preset. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
+merely agrees closely is a second, slightly different model.
+
+🔴 **THE NOISE IS DRAWN NATIVELY NOW, NOT REPLAYED**, and the gate compares it: `g/noise` is in the
+generation directory, so Box-Muller is held to V8's in the same breath as everything else.
 
 🔴 **IT NEEDED V8's `log` AND `exp`, AND glibc's ARE NOT THEM.** `get_time_embedding` is
 `exp(-log(2000) / (half - 1) * i)` a channel, and glibc's own log and exp differ from V8's on

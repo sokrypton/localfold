@@ -20,4 +20,5 @@ process.stdout.write(JSON.stringify({
   contig: preset.contig,
   conditions: preset.conditions,
   nsteps: preset.nsteps,
+  recycleSchedule: preset.recycleSchedule,
 }) + "\n");
