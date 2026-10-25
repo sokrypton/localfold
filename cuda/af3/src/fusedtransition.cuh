@@ -89,10 +89,12 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
   static_assert((NTH / (NC / 8)) % 8 == 0 && (NTH / (C / 8)) % 8 == 0, "stage row steps preserve swizzle bits");
   const int k0_1 = (int)threadIdx.x / (NC / 8), c0_1 = ((int)threadIdx.x % (NC / 8)) * 8, sw1 = stageSw<NC>(k0_1, c0_1);
   const int k0_2 = (int)threadIdx.x / (C / 8), c0_2 = ((int)threadIdx.x % (C / 8)) * 8, sw2 = w2Sw<C>(k0_2, c0_2);
+  const half* baseW1 = W1t + k0_1 * NC + c0_1;
+  const half* baseW2 = W2 + k0_2 * C + c0_2;
   auto stage = [&](int j, int st, auto&& op) {
     half *a = W1a(st) + sw1, *b = W1b(st) + sw1, *w2 = W2s(st) + sw2;
-    const half* src1 = W1t + ((size_t)j * C + k0_1) * NC + c0_1;
-    const half* src2 = W2 + (size_t)(j * NC + k0_2) * C + c0_2;
+    const half* src1 = baseW1 + (size_t)j * (C * NC);
+    const half* src2 = baseW2 + (size_t)j * (NC * C);
 #pragma unroll
     for (int it = 0; it < IT1; ++it) {                            // W1 rows k, NC columns each half
       if ((C * (NC / 8)) % NTH != 0 && it * NTH + (int)threadIdx.x >= C * (NC / 8)) break;
@@ -128,9 +130,6 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
       ldsm4(xa[m][ks], Xs + ((warp * MT + m) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   }
   __syncthreads();
-#if !LF_REG_STAGES
-  if (NST == 2 && 1 < chunks) issue(1, 1);
-#endif
   float acc[MT][NT][4] = {};
   for (int j = 0; j < chunks; ++j) {
     int st = NST == 1 ? 0 : j & 1;
@@ -160,7 +159,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
       ldsm4t(fa[0], a + stageSw<NC>(kl, cl));
       if constexpr (!RELU) ldsm4t(fb[0], b + stageSw<NC>(kl, cl));
 #if !LF_REG_STAGES
-      if (j > 0 && NST == 2 && j + 1 < chunks) issue(j + 1, st ^ 1);
+      if (NST == 2 && j + 1 < chunks) issue(j + 1, st ^ 1);
 #endif
 #pragma unroll
       for (int s = 0; s < STEPS1; ++s) {
@@ -186,19 +185,26 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
         }
       }
     }
-    // SwiGLU in f32, straight into the second GEMM's A fragments
+    // SwiGLU / ReLU in f32, straight into the second GEMM's A fragments
 #pragma unroll
     for (int t = 0; t < NC / 16; ++t) {
       if (t > 0) ldsm4t(vb[0], w2 + w2Sw<C>(t * 16 + kl, cl));
       uint32_t pa[MT][4];
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
-        auto gate = [&](int nt, int e) {
-          if constexpr (RELU) return ptx_max_f32(ptx_add_f32(ha[m][nt][e], (e & 1) ? b1v[nt].y : b1v[nt].x), 0.f);
-          else { float v = ha[m][nt][e]; return ptx_mul_f32(ptx_mul_f32(v, sigmH(v)), hb[m][nt][e]); }   // packed to f16 next
-        };
-        pa[m][0] = pack2(gate(2 * t, 0), gate(2 * t, 1)); pa[m][1] = pack2(gate(2 * t, 2), gate(2 * t, 3));
-        pa[m][2] = pack2(gate(2 * t + 1, 0), gate(2 * t + 1, 1)); pa[m][3] = pack2(gate(2 * t + 1, 2), gate(2 * t + 1, 3));
+        if constexpr (RELU) {
+          const int nt0 = 2 * t, nt1 = 2 * t + 1;
+          pa[m][0] = ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[m][nt0][0], b1v[nt0].x), ptx_add_f32(ha[m][nt0][1], b1v[nt0].y));
+          pa[m][1] = ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[m][nt0][2], b1v[nt0].x), ptx_add_f32(ha[m][nt0][3], b1v[nt0].y));
+          pa[m][2] = ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[m][nt1][0], b1v[nt1].x), ptx_add_f32(ha[m][nt1][1], b1v[nt1].y));
+          pa[m][3] = ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[m][nt1][2], b1v[nt1].x), ptx_add_f32(ha[m][nt1][3], b1v[nt1].y));
+        } else {
+          auto gate = [&](int nt, int e) {
+            float v = ha[m][nt][e]; return ptx_mul_f32(ptx_mul_f32(v, sigmH(v)), hb[m][nt][e]);   // packed to f16 next
+          };
+          pa[m][0] = pack2(gate(2 * t, 0), gate(2 * t, 1)); pa[m][1] = pack2(gate(2 * t, 2), gate(2 * t, 3));
+          pa[m][2] = pack2(gate(2 * t + 1, 0), gate(2 * t + 1, 1)); pa[m][3] = pack2(gate(2 * t + 1, 2), gate(2 * t + 1, 3));
+        }
       }
 #pragma unroll
       for (int et = 0; et < NT; et += 2) {
@@ -255,6 +261,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i)
         a4All[i] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
+      if (hh == 0) __syncwarp();
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
         size_t row = baseRow + i * LPR;
@@ -277,11 +284,13 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
         for (int d = 0; d < EPI_B; ++d) {
           int i = i0 + d;
+          a4v[d] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
+        }
+#pragma unroll
+        for (int d = 0; d < EPI_B; ++d) {
+          int i = i0 + d;
           size_t row = baseRow + i * LPR;
-          if (row < rows) {
-            a4v[d] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * LPR) * LDY + cl);
-            pvr[d] = pairLdRaw4<PT>(x, row * C + c);
-          }
+          if (row < rows) pvr[d] = pairLdRaw4<PT>(x, row * C + c);
         }
 #pragma unroll
         for (int d = 0; d < EPI_B; ++d) {
@@ -297,8 +306,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
           pairSt4<PT>(x, row * C + c, v);
         }
       }
+      if (hh == 0) __syncwarp();
     }
-    if (hh == 0) __syncwarp();
   }
 }
 
@@ -375,8 +384,8 @@ __global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restri
     for (int nt = 0; nt < 2; ++nt) {
       int c = wn * 16 + nt * 8 + tig * 2;
       float2 bb = ptx_ldg_v2_f32(b1 + j * NC + c);
-      ptx_st_shared_u32(Hs + (wm * 16 + g) * LDH + c, ptx_cvt_f16x2_f32(ptx_max_f32(ptx_add_f32(ha[nt][0], bb.x), 0.f), ptx_max_f32(ptx_add_f32(ha[nt][1], bb.y), 0.f)));
-      ptx_st_shared_u32(Hs + (wm * 16 + g + 8) * LDH + c, ptx_cvt_f16x2_f32(ptx_max_f32(ptx_add_f32(ha[nt][2], bb.x), 0.f), ptx_max_f32(ptx_add_f32(ha[nt][3], bb.y), 0.f)));
+      ptx_st_shared_u32(Hs + (wm * 16 + g) * LDH + c, ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[nt][0], bb.x), ptx_add_f32(ha[nt][1], bb.y)));
+      ptx_st_shared_u32(Hs + (wm * 16 + g + 8) * LDH + c, ptx_cvt_relu_f16x2_f32(ptx_add_f32(ha[nt][2], bb.x), ptx_add_f32(ha[nt][3], bb.y)));
     }
     asm volatile("bar.sync %0, 64;" ::"r"(1 + wm) : "memory");     // the pair's two halves
 #pragma unroll
@@ -396,30 +405,42 @@ __global__ void __launch_bounds__(WM * 64) fusedTransitionSplitK(float* __restri
   constexpr int LDY = 64 + 4;
   float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
   static_assert((size_t)WARPS * 16 * LDY * 4 <= XS + 2 * STAGE, "the staging fits");
+  const int rl0 = lane >> 4, cl = (lane & 15) * 4;
+  const size_t baseRow = row0 + wm * 16 + rl0;
 #pragma unroll
   for (int q = 0; q < C / 128; ++q) {
-#pragma unroll
-    for (int e8 = 0; e8 < 8; ++e8) {
-      int c = e8 * 8 + tig * 2;
-      ptx_st_shared_v2_f32(Ys + g * LDY + c, acc[q * 8 + e8][0], acc[q * 8 + e8][1]);
-      ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[q * 8 + e8][2], acc[q * 8 + e8][3]);
-    }
-    __syncwarp();
+    const int c = wn * (C / 2) + q * 64 + cl;
+    const float4 b4 = ptx_ldg_v4_f32(b2 + c);
+    PairRaw4<PT> pv[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = wn * (C / 2) + q * 64 + cl;
-      size_t row = row0 + wm * 16 + rl;
+      size_t row = baseRow + i * 2;
+      if (row < rows) pv[i] = pairLdRaw4<PT>(x, row * C + c);
+    }
+#pragma unroll
+    for (int e8 = 0; e8 < 8; ++e8) {
+      int c8 = e8 * 8 + tig * 2;
+      ptx_st_shared_v2_f32(Ys + g * LDY + c8, acc[q * 8 + e8][0], acc[q * 8 + e8][1]);
+      ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c8, acc[q * 8 + e8][2], acc[q * 8 + e8][3]);
+    }
+    __syncwarp();
+    float4 a4All[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      a4All[i] = ptx_ld_shared_v4_f32(Ys + (rl0 + i * 2) * LDY + cl);
+    if (q + 1 < C / 128) __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      size_t row = baseRow + i * 2;
       if (row >= rows) continue;
-      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl);
-      float4 b4 = ptx_ldg_v4_f32(b2 + c);
-      float4 v = pairLd4<PT>(x, row * C + c);
+      float4 a4 = a4All[i];
+      float4 v = pairUnpack4<PT>(pv[i]);
       v.x = ptx_add_f32(v.x, ptx_add_f32(a4.x, b4.x));
       v.y = ptx_add_f32(v.y, ptx_add_f32(a4.y, b4.y));
       v.z = ptx_add_f32(v.z, ptx_add_f32(a4.z, b4.z));
       v.w = ptx_add_f32(v.w, ptx_add_f32(a4.w, b4.w));
       pairSt4<PT>(x, row * C + c, v);
     }
-    __syncwarp();
   }
 }
 // x += ReLU(LN(x) W1 + b1) W2 + b2 at C 256 on bf16 rows, the split form above at WM 4; false where the device cannot

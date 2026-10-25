@@ -190,10 +190,40 @@ __device__ __forceinline__ uint32_t ptx_cvt_f16x2_f32(float lo, float hi) {
   asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
   return d;
 }
+// Pack ReLU(lo, hi) -> f16x2 in a 32-bit register using hardware .relu modifier on sm_80+
+__device__ __forceinline__ uint32_t ptx_cvt_relu_f16x2_f32(float lo, float hi) {
+  uint32_t d;
+#if __CUDA_ARCH__ >= 800
+  asm("cvt.rn.relu.f16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
+#else
+  asm("{\n\t"
+      ".reg .f32 r0, r1;\n\t"
+      "max.f32 r0, %1, 0f00000000;\n\t"
+      "max.f32 r1, %2, 0f00000000;\n\t"
+      "cvt.rn.f16x2.f32 %0, r1, r0;\n\t"
+      "}" : "=r"(d) : "f"(lo), "f"(hi));
+#endif
+  return d;
+}
 // Pack (lo, hi) -> bf16x2 in a 32-bit register (lo in [15:0], hi in [31:16])
 __device__ __forceinline__ uint32_t ptx_cvt_bf16x2_f32(float lo, float hi) {
   uint32_t d;
   asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
+  return d;
+}
+// Pack ReLU(lo, hi) -> bf16x2 in a 32-bit register using hardware .relu modifier on sm_80+
+__device__ __forceinline__ uint32_t ptx_cvt_relu_bf16x2_f32(float lo, float hi) {
+  uint32_t d;
+#if __CUDA_ARCH__ >= 800
+  asm("cvt.rn.relu.bf16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
+#else
+  asm("{\n\t"
+      ".reg .f32 r0, r1;\n\t"
+      "max.f32 r0, %1, 0f00000000;\n\t"
+      "max.f32 r1, %2, 0f00000000;\n\t"
+      "cvt.rn.bf16x2.f32 %0, r1, r0;\n\t"
+      "}" : "=r"(d) : "f"(lo), "f"(hi));
+#endif
   return d;
 }
 // Unpack f16x2 -> (lo, hi) float2
