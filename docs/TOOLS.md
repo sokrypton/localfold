@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-416 tools. `tools/fixtures/` is data and is not listed.
+417 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (214)
+## `tools/gpu/` - the WebGPU lane (215)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -122,6 +122,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
 - **`check-recovery.js`** - WebGPU device-loss recovery in the studio: destroy the device mid-generation and between runs; the failed run must say the GPU was reset, and the next Generate must succeed on a new device (web/app.js `_watchDevice`).
+- **`check-rfd4p-chunked.js`** - Does the CHUNKED pair track compute what the single-chunk one computes?
 - **`check-rfd4p-length.js`** - The reduced-precision pair track, checked AT A LENGTH THAT CHUNKS.
 - **`check-rfd4p.js`** - Headless Chrome WebGPU differential parity suite for RFD4-Proteina (`npm run test:gpu`).
 - **`check-smiles-conformer-gpu.js`** - Does the device's conformer refinement compute the host's? And is it faster?

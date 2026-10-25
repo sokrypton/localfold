@@ -3250,7 +3250,18 @@ fn pairOut(m: u32, n0: u32, tn0: u32, r0: vec4<f32>, r1: vec4<f32>) {
   }
 
   /** Fused `[256, nn] -> [rows, 256]` coalesced transpose + LayerNorm(width=256) for triangle output. */
+  /**
+   * `y = LayerNorm_w(x^T)` over 256 channels, reading `x` channel-major.
+   *
+   * 🔴 `r0` MUST BE A MULTIPLE OF FOUR. `x` is read as `array<vec4<f32>>` along the ROW
+   * axis - `x[c * nnStride4 + (r0 + rLocal) / 4]` - so four consecutive pair rows share a
+   * word and a chunk starting off that boundary reads every row of every channel from the
+   * wrong place. It is not a tidiness alignment: misaligned it is relRMS ~1.0 on the pair
+   * track, measured. `chunkPlan` in trunk.js is what guarantees it, and says so; this
+   * throws rather than trusting the caller, because the symptom is a plausible structure.
+   */
   transposeLnOut({ x, y, rows, nn, w, inF16 = false, outF16 = false, r0 = 0, eps = 1e-5 }) {
+    if (r0 % 4 !== 0) throw new Error(`transposeLnOut: r0=${r0} is not a multiple of 4 - it reads x four pair rows a word`);
     const f16In = inF16 && this.hasF16;
     const f16Out = outF16 && this.hasF16;
     const groups = Math.ceil(rows / 16);

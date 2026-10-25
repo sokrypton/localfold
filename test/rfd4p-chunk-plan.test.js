@@ -70,11 +70,40 @@ describe("the rfd4p trunk's pair-track chunk plan", () => {
   });
 
   it("still returns a usable plan when the bound is tiny", () => {
-    // A bound smaller than one row is still one row; zero rows is not a plan.
+    // A bound smaller than one row is still a plan - and the floor is FOUR rows, not one,
+    // because `transposeLnOut` reads four pair rows a word and a chunk must start on that
+    // boundary. Zero rows is not a plan and one row is a wrong one.
     const plan = chunkPlan(400 * 400, { wantF16: true, chunkBytes: 16 });
-    expect(plan.R).toBe(1);
+    expect(plan.R).toBe(4);
     expect(plan.triF16).toBe(false);
-    expect(plan.chunks).toBe(160000);
+    expect(plan.chunks).toBe(40000);
+  });
+
+  it("starts every chunk on a multiple of four pair rows", () => {
+    // 🔴 THE INVARIANT `transposeLnOut` DEPENDS ON, and the one this file exists to keep: a
+    // chunk begins at k * R, the kernel reads `x` as vec4 along the row axis, and a start
+    // off that boundary reads every row of every channel from the wrong word. Measured at
+    // n = 60 against the single-chunk arm: R = 450 and 225 divide 3600 EXACTLY and come
+    // back at relRMS 0.89 and 1.04 on the pair track, where 1800, 1208, 1200, 900 and 512
+    // all agree at 1.3e-6. So raggedness is fine and a misaligned start is not.
+    //
+    // Swept over bounds rather than a chosen few, because the default bound happens to
+    // give R = 101944 = 4 * 25486 and has hidden this since the chunking was written.
+    for (let mb = 1; mb <= 2048; mb += 1) {
+      for (const nn of [400 * 400, 513 * 513, 1000 * 1000]) {
+        const { R, chunks } = chunkPlan(nn, { wantF16: true, chunkBytes: mb * 1024 * 1024 });
+        if (chunks === 1) continue;
+        expect(R % 4).toBe(0);
+      }
+    }
+  });
+
+  it("keeps the default plan's rows where they were, four-aligned already", () => {
+    // The bound the trunk ships with, stated so the alignment above is visibly free: this
+    // is the number every n > 512 design has been chunked at, and it was already aligned.
+    const { R } = chunkPlan(600 * 600, {});
+    expect(R).toBe(101944);
+    expect(R % 4).toBe(0);
   });
 
   it("gives a bigger bound more rows, monotonically", () => {

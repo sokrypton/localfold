@@ -74,7 +74,26 @@ export function chunkPlan(nn, opts = {}) {
   const oneChunkRow = wantF16 ? (P / 2 + T / 2 + P / 2 + P) : (P + T + P + 2 * P);
   const chunkedRow = (P + T + P + 2 * P) + 2 * T;
   const oneChunk = nn * oneChunkRow * 4 <= chunkBytes;
-  const R = oneChunk ? nn : Math.max(1, Math.min(nn, Math.floor(chunkBytes / (chunkedRow * 4))));
+  const fits = Math.max(1, Math.min(nn, Math.floor(chunkBytes / (chunkedRow * 4))));
+  // 🔴 AND A CHUNK MUST START ON A MULTIPLE OF FOUR PAIR ROWS, which is `transposeLnOut`'s
+  // requirement and not an alignment anybody chose for tidiness: it reads the contraction
+  // output as `array<vec4<f32>>` along the ROW axis - `x[c * nnStride4 + (r0 + rLocal) / 4]`
+  // - so four consecutive pair rows share a word, and a chunk beginning off that boundary
+  // reads every row of every channel from the wrong place. `rLocal` is already a multiple
+  // of four, so the whole requirement lands on r0 = k * R, i.e. on R.
+  //
+  // Measured at n = 60 against the single-chunk arm, which is what found this: R = 1800,
+  // 1208, 1200, 900 and 512 all agree at 1.3e-6, and R = 515, 450 and 225 come back at
+  // relRMS 0.89 to 1.04 on `z`. **RAGGEDNESS IS NOT THE DISCRIMINATOR** - 450 and 225
+  // divide 3600 exactly and still fail, while 1208 and 512 leave a short tail and pass -
+  // so a tail of any length is fine and a misaligned START is not.
+  //
+  // 🔴 NOTHING EVER SHIPPED WRONG, and the reason is luck rather than design: the default
+  // bound gives R = 101944, which is 4 * 25486. This has always been one changed constant
+  // away from silently wrong structures past the single-chunk threshold - a smaller
+  // `chunkBytes`, a different pair width, another buffer in the row cost - so the invariant
+  // is stated here instead of being a property of one arithmetic.
+  const R = oneChunk ? nn : Math.min(nn, Math.max(4, fits - (fits % 4)));
   return {
     triF16: wantF16 && oneChunk,
     R,
