@@ -32,6 +32,7 @@
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { buildBatch, decodeTextOrZstd } from "../../shared/rfd4p/pipeline/index.js";
 import { getRfd4pPresetById } from "../../shared/rfd4p/presets.js";
+import { parseConditionSpecYaml } from "../../shared/rfd4p/pipeline/spec.js";
 import {
   ALLOWED_RESIDUE_TYPES, ATOM37_NAMES, UNIFIED_ATOM37_TOKENS, UNIFIED_RESTYPE_ATOM37_MASK,
 } from "../../shared/rfd4p/encoding.js";
@@ -59,7 +60,9 @@ import { encodeLatentsCpu, encoderSeqFeatures } from "../../cpu/rfd4p/encoder.js
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--"));
 if (!out) {
-  console.error("usage: export_input.mjs <out dir> [--preset=<id>] [--seed=N] [--recycles=N] [--oracle=<dir>]");
+  console.error("usage: export_input.mjs <out dir> [--preset=<id> | --spec=<job.yaml|.json>]"
+    + " [--seed=N] [--recycles=N] [--oracle=<dir>] [--generate [--gen-oracle] [--steps=N]]"
+    + " [--encoder] [--length=N]");
   process.exit(1);
 }
 const option = (name, fallback) => args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
@@ -78,7 +81,34 @@ const checkpoint = option("checkpoint", `${hub}/a06e2509c7033b010fc43614e9fd8403
 const cfg = JSON.parse(readFileSync(option("config", `${repo}model-rfd4p-int8/config.json`), "utf8")).config;
 const nn = cfg.nn;
 
-const preset = getRfd4pPresetById(presetId);
+// 🔴 A JOB IS THE PROTOCOL'S OWN ENTRY, NOT A PRESET ID. `--spec=<file>` takes a condition spec -
+// the `{contig, conditions, ...}` object RFD4-Proteina's own YAML and JSON jobs are - and treats
+// it as a preset with the same fields, so everything below (the structure, the sampler mode, the
+// step count) is driven by the file rather than by a name compiled into presets.js. Without it
+// this port could only ever run the ten examples.
+const specPath = option("spec", "");
+const preset = specPath
+  ? (() => {
+      const text = readFileSync(specPath, "utf8");
+      const job = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
+      if (!job.contig && !job.input) {
+        console.error(`${specPath} has neither a contig nor an input`);
+        process.exit(1);
+      }
+      return {
+        id: job.id ?? "job",
+        contig: job.contig,
+        conditions: job.conditions,
+        cifUrl: job.cifUrl ?? job.input ?? null,
+        specMode: job.specMode ?? (job.cifUrl === undefined && job.input === undefined),
+        nsteps: job.nsteps,
+        recycleSchedule: job.recycleSchedule ?? job.recycle_schedule,
+        partialTrajectoryFractionSteps:
+          job.partialTrajectoryFractionSteps ?? job.partial_trajectory_fraction_steps,
+        inverseFolding: job.inverseFolding ?? job.inverse_folding,
+      };
+    })()
+  : getRfd4pPresetById(presetId);
 if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
 // 🔴 A PRESET'S STRUCTURE IS A FILE IN THIS CHECKOUT, NOT A FETCH. This used to refuse every
 // conditioned preset with "only the pure-spec presets export offline", which was never true: the

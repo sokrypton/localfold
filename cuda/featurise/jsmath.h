@@ -265,4 +265,122 @@ inline double round(double v) {
   return c - 0.5 <= v ? c : c - 1.0;
 }
 
+// Math.log (V8's ieee754::log, fdlibm e_log.c)
+//
+// 🔴 NEEDED BECAUSE A SINUSOIDAL TIME EMBEDDING AND A BOX-MULLER DRAW BOTH GO THROUGH IT. RFD4's
+// `get_time_embedding` computes `exp(-log(2000) / (half - 1) * i)` per channel, and the sampler's
+// noise is `sqrt(-2 * log(u))`; one ulp in either puts a native featuriser's bytes beside the
+// page's rather than on them, and a sixty-step trajectory turns one ulp into a different protein.
+namespace detail {
+// 🔴 fdlibm's OWN DECIMAL LITERALS, NOT HEX FROM MEMORY. Every one of these round-trips to the
+// bit pattern fdlibm intends, and the first attempt at this file wrote `Lg7` as a mangled copy of
+// `Lg3`'s hex - which put 19% of arguments one ulp out, a residual indistinguishable from "V8 is
+// not fdlibm after all" until the constants were checked one at a time.
+inline const double ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10,
+                    Lg1 = 6.666666666666735130e-01, Lg2 = 3.999999999940941908e-01,
+                    Lg3 = 2.857142874366239149e-01, Lg4 = 2.222219843214978396e-01,
+                    Lg5 = 1.818357216161805012e-01, Lg6 = 1.531383769920937332e-01,
+                    Lg7 = 1.479819860511658591e-01;
+}  // namespace detail
+
+inline double log(double x) {
+  int32_t hx = hi(x);
+  uint32_t lx = lo(x);
+  int32_t k = 0;
+  if (hx < 0x00100000) {                       // x < 2**-1022
+    if (((hx & 0x7fffffff) | (int32_t)lx) == 0) return -INFINITY;
+    if (hx < 0) return NAN;
+    k -= 54;
+    x *= words(0x43500000, 0);                 // subnormal: scale up by 2**54
+    hx = hi(x);
+  }
+  if (hx >= 0x7ff00000) return x + x;
+  k += (hx >> 20) - 1023;
+  hx &= 0x000fffff;
+  const int32_t i0 = (hx + 0x95f64) & 0x100000;
+  x = words((uint32_t)(hx | (i0 ^ 0x3ff00000)), lo(x));   // normalise x or x/2
+  k += i0 >> 20;
+  const double f = x - 1.0;
+  if ((0x000fffff & (2 + hx)) < 3) {           // |f| < 2**-20
+    if (f == 0.0) {
+      if (k == 0) return 0.0;
+      const double dk = (double)k;
+      return dk * detail::ln2_hi + dk * detail::ln2_lo;
+    }
+    const double R = f * f * (0.5 - 0.33333333333333333 * f);
+    if (k == 0) return f - R;
+    const double dk = (double)k;
+    return dk * detail::ln2_hi - ((R - dk * detail::ln2_lo) - f);
+  }
+  const double s = f / (2.0 + f);
+  const double dk = (double)k;
+  const double z = s * s;
+  const int32_t i1 = hx - 0x6147a;
+  const double w = z * z;
+  const int32_t j = 0x6b851 - hx;
+  const double t1 = w * (detail::Lg2 + w * (detail::Lg4 + w * detail::Lg6));
+  const double t2 = z * (detail::Lg1 + w * (detail::Lg3 + w * (detail::Lg5 + w * detail::Lg7)));
+  const int32_t i2 = i1 | j;
+  const double R = t2 + t1;
+  if (i2 > 0) {
+    const double hfsq = 0.5 * f * f;
+    if (k == 0) return f - (hfsq - s * (hfsq + R));
+    return dk * detail::ln2_hi - ((hfsq - (s * (hfsq + R) + dk * detail::ln2_lo)) - f);
+  }
+  if (k == 0) return f - s * (f - R);
+  return dk * detail::ln2_hi - ((s * (f - R) - dk * detail::ln2_lo) - f);
+}
+
+// Math.exp (V8's ieee754::exp, fdlibm e_exp.c)
+namespace detail {
+inline const double halF[2] = {0.5, -0.5};
+inline const double o_threshold = 7.09782712893383973096e+02,
+                    u_threshold = -7.45133219101941108420e+02,
+                    ln2HI[2] = {6.93147180369123816490e-01, -6.93147180369123816490e-01},
+                    ln2LO[2] = {1.90821492927058770002e-10, -1.90821492927058770002e-10},
+                    invln2 = 1.44269504088896338700e+00,
+                    P1 = 1.66666666666666019037e-01, P2 = -2.77777777770155933842e-03,
+                    P3 = 6.61375632143793436117e-05, P4 = -1.65339022054652515390e-06,
+                    P5 = 4.13813679705723846039e-08, twom1000 = 9.33263618503218878990e-302;
+}  // namespace detail
+
+inline double exp(double x) {
+  const int32_t hx0 = hi(x);
+  const int32_t xsb = (hx0 >> 31) & 1;
+  const int32_t hx = hx0 & 0x7fffffff;
+  if (hx >= 0x40862E42) {                      // |x| >= 709.78
+    if (hx >= 0x7ff00000) {
+      if (((hx & 0xfffff) | (int32_t)lo(x)) != 0) return x + x;   // NaN
+      return xsb == 0 ? x : 0.0;
+    }
+    if (x > detail::o_threshold) return INFINITY;
+    if (x < detail::u_threshold) return 0.0;
+  }
+  double hi_ = 0, lo_ = 0, t;
+  int32_t k = 0;
+  if (hx > 0x3fd62e42) {                       // |x| > 0.5 ln2
+    if (hx < 0x3FF0A2B2) {                     // |x| < 1.5 ln2
+      hi_ = x - detail::ln2HI[xsb];
+      lo_ = detail::ln2LO[xsb];
+      k = 1 - xsb - xsb;
+    } else {
+      k = (int32_t)(detail::invln2 * x + detail::halF[xsb]);
+      t = (double)k;
+      hi_ = x - t * detail::ln2HI[0];
+      lo_ = t * detail::ln2LO[0];
+    }
+    x = hi_ - lo_;
+  } else if (hx < 0x3e300000) {                // |x| < 2**-28
+    return 1.0 + x;
+  }
+  const double z = x * x;
+  const double c =
+      x - z * (detail::P1 + z * (detail::P2 + z * (detail::P3 + z * (detail::P4 + z * detail::P5))));
+  if (k == 0) return 1.0 - ((x * c) / (c - 2.0) - x);
+  double y = 1.0 - ((lo_ - (x * c) / (2.0 - c)) - hi_);
+  if (k >= -1021) return words((uint32_t)(hi(y) + (k << 20)), lo(y));
+  y = words((uint32_t)(hi(y) + ((k + 1000) << 20)), lo(y));
+  return y * detail::twom1000;
+}
+
 }  // namespace lf::jsmath

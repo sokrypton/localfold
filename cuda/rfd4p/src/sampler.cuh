@@ -12,16 +12,17 @@ namespace rfd4p {
 
 // ---------------------------------------------------------------- the random source
 //
-// 🔴 THE INTEGER STREAM IS EXACT AND THE GAUSSIAN IS NOT, AND THE GATE DEPENDS ON THE DIFFERENCE.
-// `seededRng` is xorshift128+ on uint64, which C++ reproduces bit for bit. Box-Muller then puts that
-// through `Math.log`, `Math.cos` and `Math.sin` - and V8's are fdlibm where this box's libm is
-// glibc's, which CLAUDE.md records as differing in the last place on a few percent of arguments.
-// `cuda/featurise/jsmath.h` carries V8's sin and cos; it has no log.
+// 🔴 THE WHOLE STREAM IS NOW BIT-EXACT AGAINST V8, INTEGERS AND GAUSSIANS ALIKE. `seededRng` is
+// xorshift128+ on uint64, which C++ reproduces trivially; Box-Muller then puts that through
+// `Math.log`, `Math.cos` and `Math.sin`, and `cuda/featurise/jsmath.h` carries V8's fdlibm for all
+// three - 0 of 200,000 arguments apart. glibc is NOT a substitute: its own log and exp differ from
+// V8 on 2.6% and 7.2% of the same arguments, and one ulp in one draw is nothing in a sample and
+// everything in a sixty-step trajectory.
 //
-// One ulp in one draw is nothing in a sample and everything in a TRAJECTORY comparison, which
-// diverges over sixty steps. So a case with `in/noise` replays the exporter's own draws - the same
-// thing `tools/oracle/dump_rfd4p.py` does for the JS sampler - and the stream below is for folds
-// nobody is comparing against JS.
+// A case that carries `g/noise` still REPLAYS the exporter's draws rather than redrawing them.
+// That is not because the stream is doubted: a replay is what lets a trajectory be compared when
+// the two sides disagree about how many draws a step takes, which is a wiring question and the one
+// this gate exists to answer.
 struct Rng {
   uint64_t s0, s1;
   explicit Rng(uint64_t seed = 0) {
@@ -41,7 +42,7 @@ struct Rng {
     for (size_t i = 0; i < count; i += 2) {
       const double u = std::max(next(), 1e-300);
       const double w = next();
-      const double r = std::sqrt(-2.0 * std::log(u));
+      const double r = std::sqrt(-2.0 * lf::jsmath::log(u));
       out[i] = (float)(r * lf::jsmath::cos(2.0 * M_PI * w));
       if (i + 1 < count) out[i + 1] = (float)(r * lf::jsmath::sin(2.0 * M_PI * w));
     }
