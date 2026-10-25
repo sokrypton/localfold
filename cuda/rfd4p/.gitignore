@@ -14,3 +14,5 @@ featurise/gate-cath.json
 gate-job/
 gate-job.pdb
 gate-via.pdb
+featurise/gate-refusal.json
+gate-refused/

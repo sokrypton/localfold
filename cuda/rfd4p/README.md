@@ -336,9 +336,17 @@ is the chain - `token_bond_path_length[i][j] = |i - j|` and `canonical_polymer_o
 neighbours - and the conditions.
 
 The selection language is a SUBSET and says so: a union of `sel('*/<segment>/*/*')`, which is what
-a contig with no residue numbers and no atoms can express. Anything else is refused by name, never
+a contig with no residue numbers and no atoms can express. Anything else is refused BY NAME, never
 quietly matched to nothing - a condition silently dropped is a condition the model is told is
-absent.
+absent, which is a different job folded under the right name. The gate has an arm for the
+refusals: a preserved segment, an unknown chain type, a condition that needs atoms, a selection
+that constrains a chain.
+
+🔴 **AND ONE OF THOSE REFUSALS IS STRICTER THAN THE REFERENCE.** `C_SEQ` on a pure contig reaches
+`finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`, so the
+page folds such a job with the condition having done **nothing** - measured. This refuses instead.
+What it costs is a job the page accepts and this does not; what it buys is that a conditioning
+this cannot apply is never silently dropped.
 
 `featurise/tables.inc` is generated from `shared/rfd4p/` (the 147-token vocabulary and its atom37
 layouts, the condition registry and its enums, the CATH maps), and

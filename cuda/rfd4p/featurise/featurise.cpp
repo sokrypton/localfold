@@ -623,7 +623,14 @@ inline void applyConditions(Batch& b,
           for (int k = 0; k < 3; ++k) b.cathLabel[(size_t)i * 3 + k] = code->second[k];
         }
       } else {
-        fprintf(stderr, "condition '%s' has dtype %s, which needs an input structure\n",
+        // 🔴 REFUSED, WHERE THE REFERENCE SILENTLY IGNORES IT. `C_SEQ` on a pure contig reaches
+        // `finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`,
+        // so the page folds such a job with the condition having done NOTHING - measured. A job
+        // whose conditioning is quietly dropped is worse than one that will not start, so this
+        // says so; what it costs is a job the page accepts and this does not.
+        fprintf(stderr, "condition '%s' has dtype %s, which needs an input structure - on a pure "
+                        "contig the reference drops it silently, so this refuses rather than "
+                        "fold as though it had been applied\n",
                 key.c_str(), dtype.c_str());
         exit(1);
       }

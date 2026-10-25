@@ -398,6 +398,33 @@ def main() -> int:
                   f"{'  ' + first if first else ''}  {mark}")
             got["featurise"] = {"cases": len(cases), "differing": bad_fields}
 
+            # 🔴 AND WHAT IT REFUSES, BY NAME. A featuriser that covers a subset has to say which
+            # subset at the moment it is handed something outside it - a condition quietly matched
+            # to nothing is a condition the model is told is absent, which is a different job
+            # folded under the right name. Each of these must name the thing it cannot take.
+            refusals = [
+                ('{"contig":"a1:5-5P,A16-35"}', "preserved segment"),
+                ('{"contig":"a1:5-5X"}', "chain type"),
+                ('{"contig":"a1:5-5P","conditions":{"C_SEQ":{"ALA":[{"select":"sel(\'*/a1/*/*\')"}]}}}',
+                 "drops it silently"),
+                ('{"contig":"a1:5-5P","conditions":{"C_SEC":{"HELIX":[{"select":"sel(\'A/*/12/*\')"}]}}}',
+                 "constrains a chain"),
+            ]
+            bad_refusals = []
+            probe = HERE / "featurise" / "gate-refusal.json"
+            for text, wanted in refusals:
+                probe.write_text(text)
+                r = run([binary, HERE / "gate-refused", f"--weights={args.weights}",
+                         f"--config={REPO}/model-rfd4p-int8/config.json", f"--spec={probe}"],
+                        cwd=REPO)
+                if r.returncode == 0 or wanted not in r.stderr:
+                    bad_refusals.append(wanted)
+            if bad_refusals:
+                failed += 1
+            print(f"  {'refusals':10s} {len(refusals)} inputs outside the subset  "
+                  f"{'ok ' if not bad_refusals else 'NOT REFUSED: ' + ', '.join(bad_refusals)}")
+            got["refusals"] = {"checked": len(refusals), "wrong": len(bad_refusals)}
+
             # 🔴 AND THE ONE-PROCESS FORM, because linking the featuriser in is a second way to
             # reach it and a second way to get it wrong. `--job=<spec>` must produce the SAME PDB
             # as featurising to a directory and folding that directory - byte for byte, since both
