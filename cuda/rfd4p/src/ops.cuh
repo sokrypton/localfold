@@ -249,19 +249,57 @@ __global__ void fromPlanesK(const float* __restrict__ in, float* __restrict__ ou
   out[i] = in[(size_t)c * pairs + p];
 }
 
+// 🔴 AND FUSING THAT TRANSPOSE INTO THE LayerNorm THAT FOLLOWS IT WAS MEASURED AND IS WORSE: 66.5 ->
+// 73.4 ms. One thread a pair loops the channels, which is 10,000 threads and ~39 blocks at n = 100 -
+// every load coalesced and the card two thirds idle, against `layerNormRegK`'s warp a row with the
+// whole row in registers. The coalescing argument was right and the occupancy one decides it.
+//
+// A 32x32 tiled transpose instead, which is the part that was actually slow: the naive form reads
+// `in[c * pairs + p]` with consecutive threads `pairs` apart, so its loads are one word a
+// transaction. Staging a tile through shared memory makes both sides coalesced.
+template <int TILE = 32>
+__global__ void __launch_bounds__(TILE * 8)
+fromPlanesTiledK(const float* __restrict__ in, float* __restrict__ out, size_t pairs, int C) {
+  __shared__ float tile[TILE][TILE + 1];
+  const size_t p0 = (size_t)blockIdx.x * TILE;
+  const int c0 = blockIdx.y * TILE;
+  for (int r = threadIdx.y; r < TILE; r += blockDim.y) {
+    const int c = c0 + r;
+    const size_t p = p0 + threadIdx.x;
+    tile[r][threadIdx.x] = (c < C && p < pairs) ? in[(size_t)c * pairs + p] : 0.f;
+  }
+  __syncthreads();
+  for (int r = threadIdx.y; r < TILE; r += blockDim.y) {
+    const size_t p = p0 + r;
+    const int c = c0 + threadIdx.x;
+    if (c < C && p < pairs) out[p * C + c] = tile[threadIdx.x][r];
+  }
+}
+inline void fromPlanes(const float* in, float* out, size_t pairs, int C) {
+  dim3 grid((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32));
+  fromPlanesTiledK<32><<<grid, dim3(32, 8), 0, STREAM>>>(in, out, pairs, C);
+}
+
 // ---------------------------------------------------------------- attention packing
 //
 // flash reads one `[position][q | k | v | gate]` row of `4W`. q and k are written there already, normed
 // straight out of the `to_qkv` projection by two strided `rmsNorm`s; this puts v (still in that
 // projection, at its third `W`) and the gate beside them.
+template <class T>
 __global__ void packVGK(const float* __restrict__ v, const float* __restrict__ gate,
-                        float* __restrict__ qkvg, size_t n, int W) {
+                        T* __restrict__ qkvg, size_t n, int W) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n * (size_t)W) return;
   size_t pos = i / W;
   int c = (int)(i - pos * W);
-  qkvg[pos * 4 * W + 2 * W + c] = v[pos * 3 * W + c];
-  qkvg[pos * 4 * W + 3 * W + c] = gate[i];
+  const float vv = v[pos * 3 * W + c], gg = gate[i];
+  if constexpr (std::is_same_v<T, half>) {
+    qkvg[pos * 4 * W + 2 * W + c] = __float2half(vv);
+    qkvg[pos * 4 * W + 3 * W + c] = __float2half(gg);
+  } else {
+    qkvg[pos * 4 * W + 2 * W + c] = vv;
+    qkvg[pos * 4 * W + 3 * W + c] = gg;
+  }
 }
 
 // `raw [i * n + j][heads]` -> `bias [head][i][j]`, `n` rows a head at a padded row stride.
@@ -276,16 +314,26 @@ __global__ void packVGK(const float* __restrict__ v, const float* __restrict__ g
 // exactly; `-1e4` added to a dot product leaves the same ~0 softmax weight, so the two agree to the
 // width of a float and not to the bit. Nothing here is padded yet (every gated case is one full
 // chain), and a padded case wants this checked before it is believed.
-__global__ void biasLayoutK(const float* __restrict__ raw, float* __restrict__ bias,
-                            const float* __restrict__ pairMask, int n, int stride, int heads) {
+// 🔴 AND THE f16 KERNELS WORK IN THE LOG2 DOMAIN, SO THE BIAS MUST ARRIVE PRE-MULTIPLIED BY LOG2E.
+// They fold `scale * LOG2E` into q and leave the bias alone (flash.cuh:434), where the f32 reference
+// kernel is in the natural domain and wants `scale` 1. Handing the half path an unscaled bias is a
+// softmax at the wrong temperature - every logit still finite, every weight wrong.
+template <class T>
+__global__ void biasLayoutK(const float* __restrict__ raw, T* __restrict__ bias,
+                            const float* __restrict__ pairMask, int n, int stride, int heads,
+                            float scale) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (size_t)heads * n * stride) return;
   int h = (int)(i / ((size_t)n * stride));
   size_t within = i - (size_t)h * n * stride;
   int row = (int)(within / stride), col = (int)(within % stride);
-  if (col >= n) { bias[i] = 0.f; return; }
-  size_t pair = (size_t)row * n + col;
-  bias[i] = (pairMask && pairMask[pair] == 0.f) ? -1e4f : raw[pair * heads + h];
+  float v = 0.f;
+  if (col < n) {
+    size_t pair = (size_t)row * n + col;
+    v = (pairMask && pairMask[pair] == 0.f) ? -1e4f : raw[pair * heads + h] * scale;
+  }
+  if constexpr (std::is_same_v<T, half>) bias[i] = __float2half(fmaxf(v, -6e4f));
+  else bias[i] = v;
 }
 
 }  // namespace rfd4p

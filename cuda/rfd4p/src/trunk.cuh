@@ -66,12 +66,53 @@ inline void adaLn(const float* x, const float* cond, float* out, size_t rows, in
 }
 
 // `out = x * sigmoid(cond W + b)` - the residual's gate, zero-initialised at training time.
-inline void adaScaleAdd(const float* x, const float* cond, float* residual, size_t rows, int C,
-                        int condC, const float* rowMask, const std::string& pre) {
-  float* gamma = scratch<float>("rfd4p.scale.g", rows * C);
-  linear<float, float>(cond, gamma, rows, condC, C, wn(pre + ".to_adaln_zero_gamma.0.weight"), true);
-  adaScaleAddK<<<blocks(rows * C), 256, 0, STREAM>>>(
-      x, gamma, W(wn(pre + ".to_adaln_zero_gamma.0.bias")), rowMask, residual, rows, C);
+// ---------------------------------------------------------------- the conditioning, hoisted
+//
+// 🔴 EVERY ONE OF THESE PROJECTIONS IS A FUNCTION OF `c` ALONE, AND `c` DOES NOT CHANGE INSIDE THE
+// RECYCLE LOOP. Cycle 0 uses c0 and every later cycle uses c1, so at six cycles the per-layer gammas
+// and betas were being recomputed six times to the same numbers - 504 GEMMs a pass where 168 will do.
+// They are computed once per conditioning and read by every cycle.
+//
+// Six tensors a layer: the two adaLNs' gamma and beta, and the two output scales' gamma. The adaLNs
+// project a NORMED c (each site has its own `norm_cond.weight`); the output scales project c raw.
+struct CondPack {
+  float* buf = nullptr;
+  size_t n = 0;
+  int D = 0;
+  float* at(int layer, int slot) const { return buf + ((size_t)layer * 6 + slot) * n * D; }
+};
+
+inline void buildCondPack(const float* c, const Dims& d, const char* slot, CondPack& pack) {
+  const size_t n = d.n;
+  const int D = d.D, C = d.C;
+  pack.n = n;
+  pack.D = D;
+  pack.buf = scratch<float>(slot, (size_t)d.nlayers * 6 * n * D);
+  float* normedC = scratch<float>("rfd4p.cp.nc", n * C);
+  for (int i = 0; i < d.nlayers; ++i) {
+    const std::string L = "nn.transformer_layers." + std::to_string(i);
+    const char* adalns[2] = {".mhba.adaln", ".transition.adaln"};
+    for (int k = 0; k < 2; ++k) {
+      const std::string pre = L + adalns[k];
+      rmsNorm(c, normedC, n, C, W(wn(pre + ".norm_cond.weight")));
+      linear<float, float>(normedC, pack.at(i, 2 * k), n, C, D, wn(pre + ".to_gamma.0.weight"), true);
+      linear<float, float>(normedC, pack.at(i, 2 * k + 1), n, C, D, wn(pre + ".to_beta.weight"), true);
+    }
+    const char* scales[2] = {".mhba.scale_output", ".transition.scale_output"};
+    for (int k = 0; k < 2; ++k) {
+      linear<float, float>(c, pack.at(i, 4 + k), n, C, D,
+                           wn(L + scales[k] + ".to_adaln_zero_gamma.0.weight"), true);
+    }
+  }
+}
+
+// adaLN with its gamma and beta already projected.
+inline void adaLnPacked(const float* x, const float* gamma, const float* beta, const float* gammaBias,
+                        float* out, size_t rows, int C, const float* rowMask) {
+  float* normedX = scratch<float>("rfd4p.ada.x", rows * C);
+  rmsNorm(x, normedX, rows, C, nullptr);
+  adaLnApplyK<<<blocks(rows * C), 256, 0, STREAM>>>(normedX, gamma, gammaBias, beta, rowMask, out,
+                                                    rows, C, false);
 }
 
 // `silu(gates) * xPart` through `[dim -> 2 * inner]` and back, the masked rows zeroed. Replaces its
@@ -109,31 +150,48 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
   linear<float, float>(normed, gate, n, W_, W_, wn(pre + ".to_g.weight"), true);
   addBias(gate, W(wn(pre + ".to_g.bias")), n, W_);
 
-  // flash wants one packed [position][q | k | v | gate] row, and applies sigmoid(gate) itself.
-  float* qkvg = scratch<float>("rfd4p.at.qkvg", n * (size_t)W_ * 4);
-  rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-  rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
-  packVGK<<<blocks(n * W_), 256, 0, STREAM>>>(qkv + 2 * W_, gate, qkvg, n, W_);
-
   // bias [pairs, heads] -> [head][i][j] with a padded row stride, which is the layout flash reads.
   const int stride = (d.n + 7) / 8 * 8;
   float* zNorm = scratch<float>("rfd4p.at.zn", d.pairs() * d.P);
   float* raw = scratch<float>("rfd4p.at.raw", d.pairs() * d.H);
-  float* bias = scratch<float>("rfd4p.at.bias", (size_t)d.H * d.n * stride);
   rmsNorm(pair, zNorm, d.pairs(), d.P, W(wn(pre + ".pair_norm.weight")));
   linear<float, float>(zNorm, raw, d.pairs(), d.P, d.H, wn(pre + ".to_bias.weight"), true);
-  biasLayoutK<<<blocks((size_t)d.H * d.n * stride), 256, 0, STREAM>>>(raw, bias, pairMask, d.n,
-                                                                     stride, d.H);
 
   // 🔴 THE f32 KERNEL DEREFERENCES `mask` WITHOUT CHECKING IT (flash.cuh:1061), where the f16 ones
   // take a MASKED template bool - so a null here is an illegal access, not an unmasked attention. It
   // is a KEY mask, `mask[row * n + j]`, and with one grid row that is the token mask itself; the
   // reference's per-PAIR masking rides in the bias above.
-  float* attn = scratch<float>("rfd4p.at.out", n * W_);
-  flashGrid<float>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
-                   1.f / sqrtf((float)d.dimHead()), nullptr);
-
-  linear<float, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
+  //
+  // The f16 arm is the whole point of --fast here: the f32 kernel is one thread a query and was
+  // 11.9% of the pass, where this one is on the tensor cores. It is the same call with half operands
+  // and the bias in the log2 domain.
+  const int biasFloats = (int)((size_t)d.H * d.n * stride);
+  const size_t packed = n * (size_t)W_ * 4;
+  if (F32_TF32) {
+    half* qkvg = scratch<half>("rfd4p.at.qkvg16", packed);
+    half* bias = scratch<half>("rfd4p.at.bias16", biasFloats);
+    half* attn = scratch<half>("rfd4p.at.out16", n * W_);
+    rmsNorm<half>(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
+    rmsNorm<half>(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
+    packVGK<half><<<blocks(n * W_), 256, 0, STREAM>>>(qkv + 2 * W_, gate, qkvg, n, W_);
+    biasLayoutK<half><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
+                                                              LOG2E);
+    flashGrid<half>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
+                    1.f / sqrtf((float)d.dimHead()), nullptr);
+    linear<half, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
+  } else {
+    float* qkvg = scratch<float>("rfd4p.at.qkvg", packed);
+    float* bias = scratch<float>("rfd4p.at.bias", biasFloats);
+    float* attn = scratch<float>("rfd4p.at.out", n * W_);
+    rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
+    rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 3, W_ * 4);
+    packVGK<float><<<blocks(n * W_), 256, 0, STREAM>>>(qkv + 2 * W_, gate, qkvg, n, W_);
+    biasLayoutK<float><<<blocks(biasFloats), 256, 0, STREAM>>>(raw, bias, pairMask, d.n, stride, d.H,
+                                                               1.f);
+    flashGrid<float>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
+                     1.f / sqrtf((float)d.dimHead()), nullptr);
+    linear<float, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
+  }
   addBias(out, W(wn(pre + ".to_out_node.bias")), n, W_);
 }
 
@@ -180,14 +238,13 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
   float* xT = scratch<float>("rfd4p.tri.xt", rows * cH);
-  float* x = scratch<float>("rfd4p.tri.x", rows * cH);
   const float one = 1.f, zero = 0.f;
   CB(cublasGemmStridedBatchedEx(
       H, outgoing ? CUBLAS_OP_T : CUBLAS_OP_N, outgoing ? CUBLAS_OP_N : CUBLAS_OP_T, n, n, n, &one,
       bT, CUDA_R_32F, n, (long long)n * n, aT, CUDA_R_32F, n, (long long)n * n, &zero,
       xT, CUDA_R_32F, n, (long long)n * n, cH, computeType(), CUBLAS_GEMM_DEFAULT));
-  fromPlanesK<<<blocks(rows * cH), 256, 0, STREAM>>>(xT, x, rows, cH);
-
+  float* x = scratch<float>("rfd4p.tri.x", rows * cH);
+  fromPlanes(xT, x, rows, cH);
   float* xNorm = scratch<float>("rfd4p.tri.xn", rows * cH);
   layerNorm(x, xNorm, rows, cH, W(wn(pre + ".layer_norm_out.weight")), optW(wn(pre + ".layer_norm_out.bias")));
   float* xProj = scratch<float>("rfd4p.tri.xp", rows * cZ);
@@ -247,20 +304,26 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
 }
 
 // ---------------------------------------------------------------- one token layer
-inline void tokenLayer(float* s, const float* z, const float* c, const float* mask,
+inline void tokenLayer(float* s, const float* z, const CondPack& cond, int layer, const float* mask,
                        const float* pairMask, const Dims& d, const std::string& pre) {
   const size_t n = d.n;
-  const int D = d.D, C = d.C;
+  const int D = d.D;
   float* ada = scratch<float>("rfd4p.l.ada", n * D);
   float* attn = scratch<float>("rfd4p.l.attn", n * D);
 
-  adaLn(s, c, ada, n, D, n, C, mask, pre + ".mhba.adaln");
+  adaLnPacked(s, cond.at(layer, 0), cond.at(layer, 1),
+              W(wn(pre + ".mhba.adaln.to_gamma.0.bias")), ada, n, D, mask);
   pairBiasAttention(ada, z, pairMask, mask, attn, d, pre + ".mhba.mha");
-  adaScaleAdd(attn, c, s, n, D, C, mask, pre + ".mhba.scale_output");
+  adaScaleAddK<<<blocks(n * D), 256, 0, STREAM>>>(
+      attn, cond.at(layer, 4), W(wn(pre + ".mhba.scale_output.to_adaln_zero_gamma.0.bias")), mask, s,
+      n, D);
 
-  adaLn(s, c, ada, n, D, n, C, mask, pre + ".transition.adaln");
+  adaLnPacked(s, cond.at(layer, 2), cond.at(layer, 3),
+              W(wn(pre + ".transition.adaln.to_gamma.0.bias")), ada, n, D, mask);
   swiGluTransition(ada, attn, n, D, 4, mask, pre + ".transition.transition");
-  adaScaleAdd(attn, c, s, n, D, C, mask, pre + ".transition.scale_output");
+  adaScaleAddK<<<blocks(n * D), 256, 0, STREAM>>>(
+      attn, cond.at(layer, 5),
+      W(wn(pre + ".transition.scale_output.to_adaln_zero_gamma.0.bias")), mask, s, n, D);
 }
 
 // ---------------------------------------------------------------- the whole trunk
@@ -289,6 +352,9 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
   const float* c0 = buildCond(cond0, "rfd4p.c0");
   const float* c1 = nRecycle > 1 ? buildCond(cond1, "rfd4p.c1") : c0;
   emit("o/c", c0, n * C);
+  CondPack pack0, pack1;
+  buildCondPack(c0, d, "rfd4p.pack0", pack0);
+  if (nRecycle > 1) buildCondPack(c1, d, "rfd4p.pack1", pack1);
 
   float* sInit = scratch<float>("rfd4p.sInit", n * D);
   linear<float, float>(seq, sInit, n, d.seqF, D, wn("nn.init_repr_factory.linear_out.weight"), true);
@@ -331,10 +397,10 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
     CK(cudaMemcpyAsync(t.z, zInit, pairs * P * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
     addIntoK<<<blocks(pairs * P), 256, 0, STREAM>>>(t.z, delta, pairs * P);
 
-    const float* c = cycle == 0 ? c0 : c1;
+    const CondPack& pack = cycle == 0 ? pack0 : pack1;
     const bool last = cycle == cycles - 1;
     for (int i = 0; i < d.nlayers; ++i) {
-      tokenLayer(t.s, t.z, c, mask, pairMask, d, "nn.transformer_layers." + std::to_string(i));
+      tokenLayer(t.s, t.z, pack, i, mask, pairMask, d, "nn.transformer_layers." + std::to_string(i));
       if (d.updatePairRepr && i < d.nlayers - 1 && i % d.everyN == 0) {
         pairReprUpdate(t.s, t.z, mask, pairMask, d, "nn.pair_update_layers." + std::to_string(i));
       }
