@@ -11,6 +11,8 @@
 // runs ONE trunk pass and compares it. The flow loop (`shared/rfd4p/flow.js`), the autoencoder decoder
 // and the all-atom output come next, and each wants its own stage-by-stage bar before it is believed.
 #include "trunk.cuh"
+#include "decoder.cuh"
+#include "sampler.cuh"
 
 namespace {
 
@@ -73,6 +75,23 @@ int run(const Opts& o) {
   // a later stage's residual is its own fault plus everything upstream of it.
   // 🔴 THE BAR FOLLOWS THE ARITHMETIC. TF32 carries ten mantissa bits, so the exact path's 1e-5 would
   // fail a --fast run that is working perfectly; these are the bounds the other ports' gates use.
+  //
+  // 🔴 AND THE DECODER'S FLOOR IS HIGHER THAN THE TRUNK'S, FOR A REASON THAT WAS MEASURED RATHER
+  // THAN ASSUMED. Its stages read up to 3.1e-05 where the trunk reads 5.8e-07, and three
+  // measurements say that is the comparison's floor and not a defect: its features are BIT-identical
+  // (relRMS exactly 0), its adaLN is 1.3e-07, and the error enters at the attention output, 4.3e-06.
+  // A one-ulp nudge of the decoder's latent comes out at x1, so nothing here amplifies - what
+  // differs is that the reference computes its attention in JS doubles with a two-pass softmax where
+  // flash is f32 with an online rescale, and the decoder's softmax is NEAR-UNIFORM over every key
+  // where the trunk's is sharpened by its pair bias. 4e-6 is what a 64-dim f32 dot and a 54-key
+  // average should differ by. Same shape as docs/PARITY.md's note that an f64 reference cannot agree
+  // with an f32 oracle past a model-dependent floor. The decoder therefore runs in f32 on BOTH arms
+  // (see decoder.cuh) and takes one bound.
+  auto boundFor = [&](const char* name) {
+    const bool decoder = name[0] == 'd' && name[1] == '/';
+    if (decoder) return 1e-4;   // the decoder is f32 on both arms
+    return o.fast ? 5e-3 : 1e-5;
+  };
   const double bound = o.fast ? 5e-3 : 1e-5;
   int bad = 0;
   double worst = 0;
@@ -80,14 +99,44 @@ int run(const Opts& o) {
   std::function<void(const char*, const float*, size_t)> tap;
   if (!o.oracle.empty()) {
     tap = [&](const char* name, const float* p, size_t count) {
+      // 🔴 relRMS ALONE CANNOT TELL A GROWING ERROR FROM A SHRINKING SIGNAL, and the decoder's
+      // stages bulge in the middle of the stack and come back - which is one or the other. The
+      // oracle's own RMS is printed beside it, so the absolute error is visible.
       double r = checkOracle(name, p, count, name);
+      if (r >= 0 && getenv("LOCALFOLD_RFD4P_ABS")) {
+        const float* ref = M.f(name);
+        double sq = 0;
+        for (size_t i = 0; i < count; ++i) sq += (double)ref[i] * ref[i];
+        const double rms = sqrt(sq / count);
+        printf("      |oracle| rms %.4e, absolute error %.3e\n", rms, r * rms);
+      }
       if (r >= 0 && r > worst) { worst = r; worstAt = name; }
-      if (r > bound) ++bad;
+      if (r > boundFor(name)) ++bad;
     };
   }
 
   rfd4p::forward(t, Fdev("in/seq"), Fdev("in/cond0"), Fdev("in/cond1"), Fdev("in/pair"),
                  Fdev("in/pairCond"), nRecycle, o.insertion, tap);
+
+  // The decoder, when the input directory carries its tensors. It takes the trunk's latent and the
+  // sequence that trunk's logits chose - both exported here so the two sides decode the SAME input
+  // rather than each its own.
+  if (M.has("in/caNm") && M.has("in/zLatent")) {
+    rfd4p::DecDims dd;
+    dd.n = d.n;
+    dd.D = (int)M.meta("meta/decTokenDim");
+    dd.C = (int)M.meta("meta/decCondDim");
+    dd.H = (int)M.meta("meta/decHeads");
+    dd.nlayers = (int)M.meta("meta/decLayers");
+    dd.nTypes = (int)M.meta("meta/nResidueTypes");
+    dd.latent = d.latent;
+    dd.fdim = (int)M.meta("meta/decFeatDim");
+    float* dLogits = scratch<float>("rfd4p.out.logits", n * (size_t)dd.nTypes);
+    float* dCoors = scratch<float>("rfd4p.out.coors", n * 111);
+    float* dPresence = scratch<float>("rfd4p.out.presence", n * 37);
+    rfd4p::decode(dd, Fdev("in/caNm"), Fdev("in/zLatent"), Idev("in/tokenType"), Idev("in/decSeq"),
+                  Fdev("in/attnMask"), dLogits, dCoors, dPresence, tap);
+  }
 
   if (tap) {
     // o/z is emitted inside forward(), where the pair tensor's type is known.
@@ -127,8 +176,9 @@ int run(const Opts& o) {
            nRecycle, nRecycle == 1 ? "" : "s", o.repeat);
   }
   if (!o.oracle.empty()) {
-    printf("worst stage %s at relRMS %.2e; %d stage%s past %.0e\n",
-           worstAt.empty() ? "(none)" : worstAt.c_str(), worst, bad, bad == 1 ? "" : "s", bound);
+    printf("worst stage %s at relRMS %.2e; %d stage%s past their bound (trunk %.0e, decoder %.0e)\n",
+           worstAt.empty() ? "(none)" : worstAt.c_str(), worst, bad, bad == 1 ? "" : "s", bound,
+           boundFor("d/"));
   }
   return bad == 0 ? 0 : 1;
 }

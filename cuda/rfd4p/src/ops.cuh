@@ -215,6 +215,17 @@ __global__ void adaScaleAddK(const float* __restrict__ x, const float* __restric
 
 // ---------------------------------------------------------------- SwiGLU
 //
+// The same, with one broadcast gamma row - the decoder's conditioning is constant across tokens.
+__global__ void adaScaleAddBroadcastK(const float* __restrict__ x, const float* __restrict__ gamma,
+                                      const float* __restrict__ mask, float* __restrict__ residual,
+                                      size_t rows, int C) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C) return;
+  size_t r = i / C;
+  if (mask && mask[r] == 0.f) return;
+  residual[i] += x[i] * (1.f / (1.f + __expf(-gamma[i - r * C])));
+}
+
 // 🔴 THE HALVES ARE THE OTHER WAY ROUND FROM `ops.cuh`'s `swigluK`, WHICH IS `silu(a) * b`. RFD4's
 // `swish_linear.0.weight` is `[2 * inner, dim]` chunked into `(xPart, gates)`, and the product is
 // `silu(gates) * xPart` - the silu is on the SECOND half (`seq_transition_af3.py`). Reusing the other

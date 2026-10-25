@@ -46,6 +46,9 @@ CASES = [
     ("trunk-2", HERE / "data-r2", HERE / "oracle-r2", ["--recycles=2"]),
 ]
 SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6", "--repeat=30"])
+# The trunk's bounds; the DECODER's stages take 1e-4 on both arms and the binary applies that
+# itself - it runs in f32 whatever the arm, because its near-uniform softmax costs far more in
+# reduced precision than the trunk's does and it is one pass a generation. See src/rfd4p.cu.
 BOUND = {"exact": 1e-5, "fast": 5e-3}   # and the same for each one's `-big` arm
 # A residual is this machine's arithmetic, not its luck: hold it to the bound AND to the baseline.
 TOL_RES = 2.0   # a stage may drift this many times its recorded residual before it is a finding
@@ -127,7 +130,8 @@ def main() -> int:
                 mark, failed = "OVER BOUND", failed + 1
             elif name in base and arm in base[name] and worst > base[name][arm] * TOL_RES:
                 mark, failed = "MOVED", failed + 1
-            print(f"  {name:10s} {arm:10s} relRMS {worst:.2e}  (bound {BOUND[arm.split('-')[0]]:.0e})  {mark}")
+            print(f"  {name:10s} {arm:10s} worst {worst:.2e}  (trunk {BOUND[arm.split('-')[0]]:.0e},"
+                  f" decoder 1e-04)  {mark}")
         got[name] = row
 
     name, case_dir, export_flags, fold_flags = SPEED
