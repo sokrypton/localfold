@@ -2673,7 +2673,8 @@ export class Rfd4pEngine {
     const gF16 = this.hasF16 && hasGate && spec.gate?.f16 === true;
     // 🔴 THESE THREE TYPE THE BUFFER, NOT THE STAGING TILE, so dropping one on a device without
     // f16 is not a graceful degrade: the caller has already packed halves and the kernel would
-    // declare `array<f32>` and read them as floats - which is bug (1) above, one operand along.
+    // declare `array<f32>` and read them as floats - the elementwise-B fault that `EBelem`
+    // fixes above, one operand along.
     // `b16` is different and needs no guard, because it chooses the TILE's precision and both
     // choices compute the same thing. Every caller gates on `e.hasF16` already (trunk.js asks
     // `wantF16: this.half && e.hasF16`); this is what says so if one stops.
