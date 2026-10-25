@@ -60,8 +60,18 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
-  int i = (int)(ij / L), j = (int)(ij % L);
+  unsigned uij = (unsigned)ij, ul = (unsigned)L, ui = uij / ul;
+  int i = (int)ui, j = (int)(uij - ui * ul);
   int rawAi = ptx_ldg_s32(tAatype + i), rawAj = ptx_ldg_s32(tAatype + j);
+  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
+  float w2v[2], w3v[2], qtv[2];
+#pragma unroll
+  for (int k = 0; k < 2; ++k) {
+    int c = lane + 32 * k;
+    w2v[k] = ptx_ldg_f32(w2 + aj * C + c);
+    w3v[k] = ptx_ldg_f32(w3 + ai * C + c);
+    qtv[k] = ptx_ldg_f32(qterm + ij * C + c);
+  }
   int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
   float pb2d = ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)i * 37 + pi), ptx_ldg_f32(tMask + (size_t)j * 37 + pj));
   float d2 = 0.f;
@@ -91,18 +101,17 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
   float bb = ptx_sqrt_f32(ptx_mul_f32(ptx_ldg_f32(bbMask + i), ptx_ldg_f32(bbMask + j)));
   float nv_bb = ptx_mul_f32(nv, bb);
   float f1 = ptx_mul_f32(v[0], nv_bb), f2 = ptx_mul_f32(v[1], nv_bb), f3 = ptx_mul_f32(v[2], nv_bb);
-  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
     float a = ptx_add_f32(ptx_ld_shared_f32(&sw[0][c]), (dbin >= 0 ? ptx_mul_f32(pb2d, ptx_ldg_f32(w0 + dbin * C + c)) : 0.f));
     a = ptx_fma_f32(pb2d, ptx_ld_shared_f32(&sw[1][c]), a);
-    a = ptx_add_f32(a, ptx_add_f32(ptx_ldg_f32(w2 + aj * C + c), ptx_ldg_f32(w3 + ai * C + c)));
+    a = ptx_add_f32(a, ptx_add_f32(w2v[k], w3v[k]));
     a = ptx_fma_f32(f1, ptx_ld_shared_f32(&sw[2][c]), a);
     a = ptx_fma_f32(f2, ptx_ld_shared_f32(&sw[3][c]), a);
     a = ptx_fma_f32(f3, ptx_ld_shared_f32(&sw[4][c]), a);
     a = ptx_fma_f32(bb, ptx_ld_shared_f32(&sw[5][c]), a);
-    ptx_st_global_f32(act + ij * C + c, ptx_add_f32(a, ptx_ldg_f32(qterm + ij * C + c)));
+    ptx_st_global_f32(act + ij * C + c, ptx_add_f32(a, qtv[k]));
   }
 }
 __global__ void sumBiasesK(float* out, const float* const* bs, int n, int C) {
@@ -220,8 +229,17 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
-  int i = (int)(ij / L), j = (int)(ij % L);
+  unsigned uij = (unsigned)ij, ul = (unsigned)L, ui = uij / ul;
+  int i = (int)ui, j = (int)(uij - ui * ul);
   int rawAi = ptx_ldg_s32(tAatype + i), rawAj = ptx_ldg_s32(tAatype + j);
+  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
+  float w2v[2], w3v[2];
+#pragma unroll
+  for (int k = 0; k < 2; ++k) {
+    int c = lane + 32 * k;
+    w2v[k] = ptx_ldg_f32(w + (40 + aj) * C + c);
+    w3v[k] = ptx_ldg_f32(w + (62 + ai) * C + c);
+  }
   int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
   float m2 = ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)i * 37 + pi), ptx_ldg_f32(tMask + (size_t)j * 37 + pj));
   float d2 = 0.f;
@@ -240,12 +258,11 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
                        ptx_ldg_f32(tMask + (size_t)r * 37 + 2));
   };
   float bb = ptx_mul_f32(bbm(i), bbm(j));
-  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
     float a = ptx_fma_f32(m2, ptx_ld_shared_f32(sw39 + c), (dbin >= 0 ? ptx_ldg_f32(w + dbin * C + c) : 0.f));
-    a = ptx_add_f32(a, ptx_add_f32(ptx_ldg_f32(w + (40 + aj) * C + c), ptx_ldg_f32(w + (62 + ai) * C + c)));
+    a = ptx_add_f32(a, ptx_add_f32(w2v[k], w3v[k]));
     a = ptx_add_f32(a, ptx_ld_shared_f32(sw87 + c));
     ptx_st_global_f32(act + ij * C + c, ptx_fma_f32(a, bb, ptx_ld_shared_f32(sb + c)));
   }

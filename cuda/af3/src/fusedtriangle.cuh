@@ -889,8 +889,11 @@ void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pa
 // out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 16, W (C, N)):
 // the single track's pair logits, the pair read once and written head-major (the layout the
 // softmax reads) through shared memory.
+constexpr size_t lnHeadsSmem(int warps, int C = 128, int N = 16) {
+  return (size_t)16 * warps * (C + 8) * 2 + (size_t)C * (N + 8) * 2;
+}
 template <int C, int N, int WARPS, class PT = float>
-__global__ void __launch_bounds__(WARPS * 32, C <= 128 ? 4 : 3) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
+__global__ void __launch_bounds__(WARPS * 32, fitBlocks(C <= 128 ? 4 : 3, lnHeadsSmem(WARPS, C, N))) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wp, float* __restrict__ out, size_t rows,
     half* __restrict__ biasOut = nullptr, int L = 0, int H = 0, int stride = 0, bool tr = false, size_t r0 = 0,
     const float* __restrict__ pairMask = nullptr, const float* __restrict__ rowBias = nullptr) {
@@ -972,8 +975,8 @@ template <int N, int C = 128>
 inline void lnHeadsRaw(const float* x, const float* scale, const float* offset, const half* w, float* out, size_t rows,
                        half* biasOut = nullptr, int L = 0, int H = 0, int stride = 0, bool tr = false, size_t r0 = 0,
                        const float* pairMask = nullptr, const float* rowBias = nullptr) {
-  constexpr int WARPS = 8, R = 16 * WARPS;      // (raw pointers: AF2's pair-bias pass)
-  size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2;
+  constexpr int WARPS = 4, R = 16 * WARPS;      // (raw pointers: AF2's pair-bias pass, 23.0 KB smem -> 4 blocks/SM on sm_86)
+  size_t smem = lnHeadsSmem(WARPS, C, N);
   WITH_PAIR_T(
     static bool attr = false;
     if (!attr) { smemAttr((lnHeadsK<C, N, WARPS, PT>), (int)smem); attr = true; }
