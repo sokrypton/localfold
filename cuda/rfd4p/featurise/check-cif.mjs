@@ -17,6 +17,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
+  realizeExpandableSegments, createSeededRng,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -230,6 +231,48 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     if (again !== execFileSync(binary, ["x", `--dump-cif=${path}`],
       { encoding: "utf8", maxBuffer: 1 << 28 })) {
       wrong.push(`round trip at ${k}`);
+    }
+  }
+
+  // `realizeExpandableSegments`: each sentinel becomes its run of masked residues, everything
+  // after it shifts, and the bonds are rebuilt and re-sorted. Compared on the columns it TOUCHES.
+  {
+    const realized = realizeExpandableSegments(js, { rng: createSeededRng(0) });
+    const out2 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--realize"],
+      { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    const got = out2.filter((l) => l.startsWith("rz\t")).map((l) => l.split("\t").slice(1));
+    const gotBonds = out2.filter((l) => l.startsWith("rzbond\t"))
+      .map((l) => l.split("\t").slice(1).map(Number));
+    if (got.length !== realized.nAtoms) {
+      wrong.push(`realized ${got.length} vs ${realized.nAtoms}`);
+    } else {
+      const after = [
+        ["rz res_name", 0, (v) => v, realized.res_name],
+        ["rz atom_name", 1, (v) => v, realized.atom_name],
+        ["rz element", 2, (v) => v, realized.element],
+        ["rz res_id", 3, Number, realized.res_id],
+        ["rz auth_seq_id", 4, Number, realized.auth_seq_id],
+        ["rz _expseg_uid", 5, Number, realized.annotations._expseg_uid],
+        ["rz x", 6, Number, realized.coord.map((c) => c[0])],
+        ["rz y", 7, Number, realized.coord.map((c) => c[1])],
+        ["rz z", 8, Number, realized.coord.map((c) => c[2])],
+        ["rz occupancy", 9, Number, realized.occupancy],
+      ];
+      for (const [label, at, cast, want] of after) {
+        // 🔴 AN ABSENT ANNOTATION IS NOT A ZERO ONE. `_expseg_uid` is never created where there
+        // was nothing to expand, because the stage returns first - so a structure without an
+        // expandable segment has no column, not a column of -1, and comparing one against the
+        // other would report every atom.
+        if (!want) continue;
+        const bad = got.filter((r, i) => !eq(cast(r[at]), want[i])).length;
+        if (bad) wrong.push(`${label} ${bad}`);
+      }
+      if (gotBonds.length !== realized.bonds.length) wrong.push("rz bonds length");
+      else {
+        const bad = gotBonds.filter((b, i) => b[0] !== realized.bonds[i][0]
+          || b[1] !== realized.bonds[i][1] || b[2] !== realized.bonds[i][2]).length;
+        if (bad) wrong.push(`rz bonds ${bad}`);
+      }
     }
   }
 

@@ -532,7 +532,7 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`addSrcComponentAnnotation`~~ **done** | 340-358 | nothing new |
     | ~~`ensureChemicalFlags`~~ **done** | 272-335 | the 17 boolean columns actually vary |
     | ~~`computeWithinChainSourceResIdx`~~ **done** | 252-267 | real residues to count |
-    | `realizeExpandableSegments` | 363-475 | real residues between the sentinels |
+    | ~~`realizeExpandableSegments`~~ **done** | 363-475 | real residues between the sentinels |
     | `filterUnwantedAtoms` | 480-496 | waters and unwanted elements are dropped |
     | `annotateCovalentModificationsAndAtomize` | 510-562 | real peptide bonds, so `atomize` means something |
     | `finalizeAndCanonicalizeSequenceConditioning` | 629-708 | a real sequence to canonicalise |
@@ -542,6 +542,11 @@ residues the cropped example does not contain, so building one from the spec fai
     | `centerAndFeaturizeCentroid` | 1032-1108 | the recentering on conditioned coordinates |
     | `buildAtom37Slots` | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
     | `computeTokenBondFeatures` | `bonds.js` 198-566 | real bonds, so `bond_mask` is not all zero |
+
+    🔴 **`realizeExpandableSegments` GOES RIGHT TO LEFT**, so an earlier sentinel's index is
+    still its index when its turn comes; and the suffix's residue numbers shift only within the
+    sentinel's own `chain_iid`, not its `chain_id`, because two chains can share a letter across
+    transformations. Exact on all seven - 306 atoms to 330 on 1PRW, bonds included.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

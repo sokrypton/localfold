@@ -19,6 +19,24 @@ namespace atoms {
 using std::string;
 using std::vector;
 
+/**
+ * The PIPELINE's random source (`createSeededRng`, mulberry32) - not the sampler's xorshift128+.
+ * Both are seeded from the job's seed and neither consumes the other's stream.
+ */
+struct PipelineRng {
+  uint32_t a;
+  explicit PipelineRng(uint32_t seed) : a(seed) {}
+  double nextFloat() {
+    a = a + 0x6d2b79f5u;
+    uint32_t t = (a ^ (a >> 15)) * (1u | a);
+    t = (t + ((t ^ (t >> 7)) * (61u | t))) ^ t;
+    return (double)((t ^ (t >> 14))) / 4294967296.0;
+  }
+  int nextInt(int lo, int hiExclusive) {
+    return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
+  }
+};
+
 struct AtomArray {
   cif::AtomSite site;
   cif::Ids ids;
@@ -347,6 +365,119 @@ inline void computeWithinChainSourceResIdx(AtomArray& a) {
     else ++within;
     for (int i = s; i < e; ++i) a.withinChainSourceResIdx[i] = within;
   }
+}
+
+/**
+ * `realizeExpandableSegments`: each sentinel becomes the run of masked residues its length range
+ * asked for, and everything after it shifts.
+ *
+ * 🔴 RIGHT TO LEFT, so an earlier sentinel's index is still its index when its turn comes.
+ * Expanding left to right would need every later index remapped after every expansion, and the
+ * reference does not - it relies on the order.
+ *
+ * 🔴 AND THE SUFFIX'S RESIDUE NUMBERS SHIFT ONLY WITHIN THE SENTINEL'S OWN CHAIN. A segment that
+ * grows by ten residues moves the ten after it in that chain and nothing in any other, which is
+ * what `chain_iid` is compared for rather than `chain_id`: two chains can share a letter across
+ * transformations.
+ *
+ * 🔴 AND THE LENGTH IS DRAWN EVEN WHEN THE RANGE IS A POINT - see the spec path, where skipping
+ * that draw moved every later one and relabelled the chains.
+ */
+inline void realizeExpandableSegments(AtomArray& a, PipelineRng& prng,
+                                      const vector<int>& given = {}) {
+  if (a.n() == 0) return;
+  auto segMin = a.ann.ints.find("annotation_expsegmin_1_residue");
+  auto segMax = a.ann.ints.find("annotation_expsegmax_1_residue");
+  if (segMin == a.ann.ints.end() || segMax == a.ann.ints.end()) return;
+  vector<int> sentinels;
+  for (size_t i = 0; i < a.n(); ++i) {
+    if (segMin->second[i] != -1 && a.site.resName[i] != "<M>") sentinels.push_back((int)i);
+  }
+  if (sentinels.empty()) return;
+
+  vector<int> lengths;
+  for (size_t k = 0; k < sentinels.size(); ++k) {
+    const int lo = segMin->second[sentinels[k]], hi = segMax->second[sentinels[k]];
+    if (k < given.size()) {
+      if (given[k] < lo || given[k] > hi) {
+        fprintf(stderr, "segment length %d outside [%d, %d] for sentinel %zu\n", given[k], lo, hi,
+                k);
+        exit(1);
+      }
+      lengths.push_back(given[k]);
+    } else {
+      lengths.push_back(prng.nextInt(lo, hi + 1));
+    }
+  }
+  a.ann.ints["_expseg_uid"].assign(a.n(), -1);
+
+  for (int k = (int)sentinels.size() - 1; k >= 0; --k) {
+    const int idx = sentinels[k], segLen = lengths[k];
+    int prevNeighbour = -1, nextNeighbour = -1;
+    for (const cif::Bond& b : a.bonds) {
+      const int other = b.u == idx ? b.v : (b.v == idx ? b.u : -1);
+      if (other < 0) continue;
+      if (other < idx) prevNeighbour = other;
+      else nextNeighbour = other;
+    }
+    const int baseResId = a.site.resId[idx];
+    const string chainIid =
+        a.ids.chainIid.empty() ? a.site.chainId[idx] : a.ids.chainIid[idx];
+
+    vector<AtomArray> parts;
+    if (idx > 0) parts.push_back(slice(a, 0, idx));
+    AtomArray single = slice(a, idx, idx + 1);
+    single.site.resName[0] = "<M>";
+    single.site.atomName[0] = "UNK";
+    single.site.element[0] = "X";
+    single.site.atomicNumber[0] = 0;
+    single.site.x[0] = single.site.y[0] = single.site.z[0] = NAN;
+    single.site.occupancy[0] = 0.0;
+    single.ann.ints["_expseg_uid"][0] = k;
+    if (segLen > 0) {
+      vector<AtomArray> stubs;
+      for (int sIdx = 0; sIdx < segLen; ++sIdx) {
+        AtomArray st = single;
+        st.site.resId[0] = baseResId + sIdx;
+        st.site.authSeqId[0] = baseResId + sIdx;
+        stubs.push_back(std::move(st));
+      }
+      AtomArray run = concat(stubs);
+      run.bonds.clear();
+      for (int sIdx = 0; sIdx + 1 < segLen; ++sIdx) {
+        run.bonds.push_back({sIdx, sIdx + 1, tables::BT_SINGLE});
+      }
+      parts.push_back(std::move(run));
+    }
+    if (idx + 1 < (int)a.n()) {
+      AtomArray suffix = slice(a, idx + 1, (int)a.n());
+      if (segLen != 1) {
+        for (size_t i = 0; i < suffix.n(); ++i) {
+          const string cid =
+              suffix.ids.chainIid.empty() ? suffix.site.chainId[i] : suffix.ids.chainIid[i];
+          if (cid != chainIid) continue;
+          suffix.site.resId[i] += segLen - 1;
+          suffix.site.authSeqId[i] += segLen - 1;
+        }
+      }
+      parts.push_back(std::move(suffix));
+    }
+    a = parts.empty() ? slice(a, 0, 0) : concat(parts);
+
+    if (segLen > 0) {
+      if (prevNeighbour != -1) a.bonds.push_back({prevNeighbour, idx, tables::BT_SINGLE});
+      if (nextNeighbour != -1) {
+        a.bonds.push_back({idx + segLen - 1, nextNeighbour + segLen - 1, tables::BT_SINGLE});
+      }
+    } else if (prevNeighbour != -1 && nextNeighbour != -1) {
+      a.bonds.push_back({prevNeighbour, nextNeighbour - 1, tables::BT_SINGLE});
+    }
+  }
+  std::stable_sort(a.bonds.begin(), a.bonds.end(), [](const cif::Bond& x, const cif::Bond& y) {
+    return x.u != y.u ? x.u < y.u : x.v < y.v;
+  });
+  computeWithinChainSourceResIdx(a);
+  ensureChemicalFlags(a);
 }
 
 /** `addGlobalAtomIdAnnotation`: 0..n-1, re-run whenever atoms are inserted or dropped. */

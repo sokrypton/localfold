@@ -883,6 +883,7 @@ int run(int argc, char** argv) {
   using rfd4p::recycleDepths;
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
+  bool realize = false;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
   string recycleSchedule = "none";
@@ -894,6 +895,7 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 7, "--int8=")) int8Dir = a.substr(7);
     else if (!a.compare(0, 11, "--dump-cif=")) dumpCif = a.substr(11);
     else if (!a.compare(0, 8, "--split=")) splitAt = atoi(a.c_str() + 8);
+    else if (a == "--realize") realize = true;
     else if (!a.compare(0, 9, "--config=")) configPath = a.substr(9);
     else if (!a.compare(0, 7, "--seed=")) seed = atoi(a.c_str() + 7);
     else if (!a.compare(0, 7, "--step=")) step = atoi(a.c_str() + 7);
@@ -995,6 +997,29 @@ int run(int argc, char** argv) {
     rfd4p::atoms::ensureChemicalFlags(arr);
     rfd4p::atoms::addSrcComponentAnnotation(arr);
     rfd4p::atoms::computeWithinChainSourceResIdx(arr);
+    if (realize) {
+      rfd4p::atoms::PipelineRng prng((uint32_t)seed);
+      rfd4p::atoms::realizeExpandableSegments(arr, prng);
+      printf("realized\t%zu\n", arr.n());
+      // 🔴 `_expseg_uid` IS ABSENT WHERE THERE WAS NOTHING TO EXPAND, because the stage returns
+      // before creating it - which is the reference's behaviour and which `operator[]` on a map
+      // turns into an empty vector and a read past its end. Asking the map first is the fix; a
+      // segfault on the one shipped structure with no expandable segment was the symptom.
+      auto uidIt = arr.ann.ints.find("_expseg_uid");
+      const vector<int>* uid = uidIt == arr.ann.ints.end() ? nullptr : &uidIt->second;
+      for (size_t i = 0; i < arr.n(); ++i) {
+        printf("rz\t%s\t%s\t%s\t%d\t%d\t%d\t%.17g\t%.17g\t%.17g\t%.17g\n",
+               arr.site.resName[i].c_str(), arr.site.atomName[i].c_str(),
+               arr.site.element[i].c_str(), arr.site.resId[i], arr.site.authSeqId[i],
+               uid && i < uid->size() ? (*uid)[i] : -1, arr.site.x[i], arr.site.y[i],
+               arr.site.z[i],
+               arr.site.occupancy[i]);
+      }
+      for (const rfd4p::cif::Bond& b : arr.bonds) {
+        printf("rzbond\t%d\t%d\t%d\n", b.u, b.v, b.type);
+      }
+      return 0;
+    }
     const std::pair<const char*, const vector<uint8_t>*> flags[] = {
         {"is_protein", &arr.isProtein}, {"is_rna", &arr.isRna}, {"is_dna", &arr.isDna},
         {"is_nucleic_acid", &arr.isNucleicAcid},
