@@ -367,6 +367,11 @@ def main() -> int:
             for sd in (0, 3):
                 cases.append((f"chains{sd}", [f"--spec={chains}", f"--seed={sd}"],
                               [f"--spec={chains}", f"--seed={sd}"]))
+            # And a protein, a DNA and an RNA chain in one job: for a contig the chain type reaches
+            # the batch as `token_type` and nothing else, which is exactly why it is worth an arm -
+            # one wrong integer a token, in a field no geometry check could see.
+            mixed = HERE / "featurise" / "gate-mixed.json"
+            cases.append(("mixed", [f"--spec={mixed}"], [f"--spec={mixed}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this

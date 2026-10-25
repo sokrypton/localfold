@@ -297,8 +297,9 @@ JavaScript at all** - and its PDB is byte-identical to the one the exporter's ow
 produces.
 
 `gate.py`'s `featurise` arm holds both directories to `export_input.mjs` **field by field, as
-bytes** - fourteen cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure
-preset, a RANGED contig at four seeds and a THREE-CHAIN one at two. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
+bytes** - fifteen cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure
+preset, a RANGED contig at four seeds, a THREE-CHAIN one at two, and a job with a protein, a DNA
+and an RNA chain in it. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
 merely agrees closely is a second, slightly different model.
 
 🔴 **AND A SEGMENT'S LENGTH IS DRAWN EVEN WHEN ITS RANGE IS A POINT.** Skipping the draw when

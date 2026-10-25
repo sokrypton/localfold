@@ -15,9 +15,9 @@
 // 2.6% and 7.2% of arguments - so a featuriser built on the system libm cannot be held to bytes,
 // however right its structure.
 //
-// WHAT IS COVERED SO FAR: a pure condition spec whose contig is polymer segments - the shape
-// `--length=N` and `custom_cath_monomer` take - with secondary-structure and CATH conditioning.
-// An input STRUCTURE (the seven `web/examples/*.cif.zst` presets) still goes through the exporter,
+// WHAT IS COVERED SO FAR: a pure condition spec - segments of protein, DNA or RNA, fixed or
+// ranged in length, in one chain or several, with secondary-structure and CATH conditioning. An
+// input STRUCTURE (the seven `web/examples/*.cif.zst` presets) still goes through the exporter,
 // because it needs the mmCIF reader, the CCD bond tables and the chirality templates.
 #include <algorithm>
 #include <cmath>
@@ -215,6 +215,7 @@ struct Segment {
   string name;
   int minLen = 0, maxLen = 0;
   bool chainBreak = false;      // the `/0` token: what follows is a new chain
+  int tokenType = tables::TT_PROTEIN;
 };
 
 inline vector<Segment> parseContig(const string& contig) {
@@ -239,10 +240,18 @@ inline vector<Segment> parseContig(const string& contig) {
     Segment seg;
     seg.name = tok.substr(0, colon);
     string rest = tok.substr(colon + 1);
+    // The chain-type suffix. For a contig every token is a `<M>` stub whatever the chain is, so
+    // the suffix reaches the batch as `token_type` and nothing else - but that is what the model
+    // reads to know it is folding a nucleic chain.
     if (!rest.empty() && isalpha((unsigned char)rest.back())) {
-      if (rest.back() != 'P') {
-        fprintf(stderr, "contig segment '%s' is not a polypeptide; only P is covered\n", tok.c_str());
-        exit(1);
+      switch (rest.back()) {
+        case 'P': seg.tokenType = tables::TT_PROTEIN; break;
+        case 'R': seg.tokenType = tables::TT_RNA; break;
+        case 'D': seg.tokenType = tables::TT_DNA; break;
+        default:
+          fprintf(stderr, "contig segment '%s' has chain type '%c', which is not P, R or D\n",
+                  tok.c_str(), rest.back());
+          exit(1);
       }
       rest.pop_back();
     }
@@ -670,7 +679,7 @@ inline Batch buildSpecBatch(const vector<Segment>& segments,
   // these few integers. (`convertToProteinaBatch` asks for `permutation(1)` twice, whose
   // Fisher-Yates loop runs zero times and draws nothing.)
   PipelineRng prng((uint32_t)seed);
-  vector<int> lengths, chainOf;
+  vector<int> lengths, chainOf, typeOf;
   int n = 0, chains = 0;
   for (const Segment& s : segments) {
     if (s.chainBreak) { ++chains; lengths.push_back(0); continue; }
@@ -680,7 +689,7 @@ inline Batch buildSpecBatch(const vector<Segment>& segments,
     // two-chain one hid it by coincidence; three chains is where it showed.
     const int len = prng.nextInt(s.minLen, s.maxLen + 1);
     lengths.push_back(len);
-    for (int k = 0; k < len; ++k) chainOf.push_back(chains);
+    for (int k = 0; k < len; ++k) { chainOf.push_back(chains); typeOf.push_back(s.tokenType); }
     n += len;
   }
   ++chains;
@@ -704,6 +713,7 @@ inline Batch buildSpecBatch(const vector<Segment>& segments,
   const vector<int> chainPerm = prng.permutation(chains);
   const vector<int> molPerm = prng.permutation(chains);   // one molecule a chain for a pure contig
   for (int i = 0; i < n; ++i) {
+    b.tokenType[i] = typeOf[i];
     b.chainIid[i] = chainPerm[chainOf[i]];
     b.moleculeIid[i] = molPerm[chainOf[i]];
     b.indexGroup[i] = chainOf[i];
