@@ -46,7 +46,7 @@ CASES = [
     ("trunk-2", HERE / "data-r2", HERE / "oracle-r2", ["--recycles=2"]),
 ]
 SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6", "--repeat=30"])
-BOUND = {"exact": 1e-5, "fast": 5e-3}
+BOUND = {"exact": 1e-5, "fast": 5e-3}   # and the same for each one's `-big` arm
 # A residual is this machine's arithmetic, not its luck: hold it to the bound AND to the baseline.
 TOL_RES = 2.0   # a stage may drift this many times its recorded residual before it is a finding
 TOL_MS = 0.25   # a timing is noisy and machine-specific; 25% is a regression worth printing
@@ -104,11 +104,18 @@ def main() -> int:
             continue
         ensure_inputs(case_dir, oracle_dir, flags)
         row = {}
-        for arm in ("exact", "fast"):
+        # 🔴 AND THE LONG FORM IS RUN AT 54 TOKENS, which is the only way it is checked at all: two
+        # of the triangle's choices invert with length and the long branch only fires past ~40,000
+        # pairs, where no oracle case reaches. LOCALFOLD_BIG forces it, as cuda/af3's big-input
+        # paths are forced - an untested branch is a second, wrong implementation waiting to happen.
+        for arm in ("exact", "fast", "exact-big", "fast-big"):
             cmd = [BINARY, case_dir, f"--weights={args.weights}", f"--oracle={oracle_dir}"]
-            if arm == "fast":
+            if arm.startswith("fast"):
                 cmd.append("--fast")
-            r = run(cmd)
+            env = dict(os.environ)
+            if arm.endswith("-big"):
+                env["LOCALFOLD_BIG"] = "1"
+            r = run(cmd, env=env)
             worst, past = worst_of(r.stdout)
             if r.returncode != 0 and past <= 0:
                 print(f"{name}/{arm}: FAILED to run\n{r.stdout[-1500:]}{r.stderr[-1500:]}")
@@ -120,7 +127,7 @@ def main() -> int:
                 mark, failed = "OVER BOUND", failed + 1
             elif name in base and arm in base[name] and worst > base[name][arm] * TOL_RES:
                 mark, failed = "MOVED", failed + 1
-            print(f"  {name:10s} {arm:6s} relRMS {worst:.2e}  (bound {BOUND[arm]:.0e})  {mark}")
+            print(f"  {name:10s} {arm:10s} relRMS {worst:.2e}  (bound {BOUND[arm.split('-')[0]]:.0e})  {mark}")
         got[name] = row
 
     name, case_dir, export_flags, fold_flags = SPEED

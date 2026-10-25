@@ -61,10 +61,10 @@ Both arms at 6 recycles, the `--length=N` unconditioned segment:
 
 | n | exact | `--fast` | ratio |
 |---:|---:|---:|---:|
-| 54 | 74.8 | 29.9 | 2.50 |
-| 100 | 157.6 | 49.8 | 3.17 |
-| 200 | 534.8 | 149.0 | 3.59 |
-| 400 | 2114.5 | 513.5 | 4.12 |
+| 54 | 72.5 | 29.5 | 2.46 |
+| 100 | 157.4 | 50.0 | 3.15 |
+| 200 | 533.0 | 147.2 | 3.62 |
+| 400 | 2046.9 | 509.1 | 4.02 |
 
 The reduced-precision arm pulls further ahead with length, which is what a pair track that grows as
 n^2 and contracts as n^3 should do: the longer the chain, the more of the pass is GEMM and the less
@@ -88,7 +88,7 @@ four oracle arms.
 | the triangle's planes in half | 53.0 | 56 MB written and read back a triangle, 84 triangles a pass |
 | the pair transition's hidden in half | 49.5 | the largest buffer left in an update |
 | the pair bias fused into one kernel | 49.8 at n=100, **555.9 at n=400** | a wash on a short chain, 3.5% at a long one |
-| the triangle's gate transposed past 40,000 pairs | 49.9 at n=100, **513.5 at n=400** | the strided read inverts with length |
+| a long form past 40,000 pairs: the gate transposed and the contraction's output narrowed | **509.1 at n=400**, 50.0 unchanged at n=100 | both choices invert with length |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.
@@ -101,8 +101,9 @@ again.
 - **The plane transpose fused into the LayerNorm after it**, 66.5 → 73.4. One thread a pair looping
   the channels makes every load coalesced and leaves ~39 blocks at n = 100, against `layerNormRegK`'s
   warp a row with the row in registers. The coalescing argument was right; occupancy decided it.
-- **The contraction writing its output in half**, 50.0 → 51.1. The f16 output picks a different
-  cutlass kernel and the transpose after it pays for the conversion.
+- **The contraction writing its output in half AT A SHORT CHAIN**, 50.0 → 51.1 at n=100. At n=400 it
+  is 513.5 → 507.6, so it is taken there and not here; it rides the same `longForm` switch as the
+  gate.
 - **The fused pair-bias kernel at a SHORT chain.** It is a win at the lengths people design at
   (n=200 151.9 → 147.8, n=400 575.9 → 555.9) and exactly nothing at n=100, where the materialised
   norm it removes is small beside the launch overhead it does not. Kept for the lengths that matter;
@@ -170,3 +171,8 @@ for a weight and then a bias left both names pointing at the bias.
   without fetching a structure — no ligand, no nucleic chain, no binder — and `--length=N` makes an
   unconditioned segment for sizing and timing only.
 - **A padded input**, so the masking paths are written and unexercised.
+
+🔴 **AND TWO BRANCHES ONLY RUN PAST 40,000 PAIRS, WHICH NO ORACLE CASE REACHES.** `LOCALFOLD_BIG`
+forces the long form at any size - as `cuda/af3`'s big-input paths are forced - and the gate runs
+every oracle case both ways for exactly that reason. An untested branch that fires only on inputs
+nobody gates is how a port grows a second, wrong implementation.

@@ -230,9 +230,12 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
 // triangle. The GEMMs around them are at 144 TFLOP/s against this card's 156 TF32 ceiling, so what is
 // left to win is bytes, not arithmetic. The contraction still accumulates in f32 - a sum over n of
 // products is where half overflows, which is the one place AF3's pair track keeps f32 too.
-template <class TP>
+template <class TP, bool LONG>
 inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgoing,
                       const std::string& pre) {
+  // On a long chain the contraction's output is narrowed too, and the gate is transposed before it
+  // is read. Both invert with length - see the table below - so they are one decision.
+  using TX = std::conditional_t<LONG, TP, float>;
   const size_t rows = d.pairs();
   const int cZ = d.P, cH = d.TRI, n = d.n;
   TP* zNorm = scratch<TP>("rfd4p.tri.zn", rows * cZ);
@@ -259,13 +262,14 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
 
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
-  float* xT = scratch<float>("rfd4p.tri.xt", rows * cH);
+  TX* xT = scratch<TX>("rfd4p.tri.xt", rows * cH);
   const float one = 1.f, zero = 0.f;
   constexpr cudaDataType_t TPT = std::is_same_v<TP, half> ? CUDA_R_16F : CUDA_R_32F;
+  constexpr cudaDataType_t TXT = std::is_same_v<TX, half> ? CUDA_R_16F : CUDA_R_32F;
   CB(cublasGemmStridedBatchedEx(
       H, outgoing ? CUBLAS_OP_T : CUBLAS_OP_N, outgoing ? CUBLAS_OP_N : CUBLAS_OP_T, n, n, n, &one,
       bT, TPT, n, (long long)n * n, aT, TPT, n, (long long)n * n, &zero,
-      xT, CUDA_R_32F, n, (long long)n * n, cH,
+      xT, TXT, n, (long long)n * n, cH,
       std::is_same_v<TP, half> ? CUBLAS_COMPUTE_32F : computeType(), CUBLAS_GEMM_DEFAULT));
   float* x = scratch<float>("rfd4p.tri.x", rows * cH);
   fromPlanes(xT, x, rows, cH);
@@ -287,7 +291,7 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   //   transposed 54.8      149.2          513.3
   //
   // so the crossover is about 40,000 pairs and the rule is on `rows`, which is what sets the stride.
-  if (rows >= 40000) {
+  if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
     fromPlanes<TP, TP>(gPlanes, gate, rows, cZ);
     mulSigmoidAddGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gate, pairMask, z, rows, cZ);
@@ -297,10 +301,33 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   }
 }
 
+// 🔴 TWO CHOICES IN THE TRIANGLE INVERT WITH LENGTH, AND THE SHORT ANSWER WAS RECORDED FIRST. The
+// gate's strided read and the contraction's f32 output are both cheaper on a short chain and dearer
+// on a long one. Measured `--fast`, 6 recycles:
+//
+//                 n=100     n=200     n=400
+//   short form     49.9     149.2     555.9
+//   long form      51.2     148.0     507.6
+//
+// The crossover is about 40,000 pairs. 🔴 AND THE LONG FORM IS UNREACHABLE BY THE ORACLE, whose only
+// case is 54 tokens - so `LOCALFOLD_BIG` forces it at any size, exactly as cuda/af3's big-input
+// paths are checked. An untested branch that only runs on inputs nobody gates is how a port grows a
+// second, wrong implementation.
+inline bool longForm(size_t rows) {
+  static const bool forced = getenv("LOCALFOLD_BIG") != nullptr;
+  return forced || rows >= 40000;
+}
+
 inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
                      const std::string& pre) {
-  if (F32_TF32) triangleT<half>(z, pairMask, d, outgoing, pre);
-  else triangleT<float>(z, pairMask, d, outgoing, pre);
+  const bool big = longForm(d.pairs());
+  if (F32_TF32) {
+    if (big) triangleT<half, true>(z, pairMask, d, outgoing, pre);
+    else triangleT<half, false>(z, pairMask, d, outgoing, pre);
+  } else {
+    if (big) triangleT<float, true>(z, pairMask, d, outgoing, pre);
+    else triangleT<float, false>(z, pairMask, d, outgoing, pre);
+  }
 }
 
 // ---------------------------------------------------------------- the pair update
