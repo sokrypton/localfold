@@ -699,9 +699,17 @@ int jobMain(int argc, char** argv) {
   for (std::string& f : fargs) fargv.push_back(f.data());
   if (int rc = rfd4p::featurise::run((int)fargv.size(), fargv.data())) return rc;
 
+  // 🔴 A FLAG BELONGS TO ONE HALF OR THE OTHER, and handing the fold a featuriser's flag is how
+  // `--job --config=` died in silence: the featuriser ran, wrote its directory, and the fold
+  // refused with "unknown flag" after the only lines anybody reads. The featuriser-only ones are
+  // named here; everything else goes to the fold, so a new fold flag needs no change.
+  static const char* FEATURISER_ONLY[] = {"--config=", "--spec=", "--length=", "--step="};
   std::vector<std::string> own = {argv[0], outDir, "--generate=" + outDir + "-gen"};
   for (const std::string& f : keep) {
-    if (f.compare(0, 2, "--") == 0) own.push_back(f);
+    if (f.compare(0, 2, "--") != 0) continue;
+    bool theirs = false;
+    for (const char* k : FEATURISER_ONLY) theirs = theirs || f.compare(0, strlen(k), k) == 0;
+    if (!theirs) own.push_back(f);
   }
   std::vector<char*> ownv;
   for (std::string& f : own) ownv.push_back(f.data());

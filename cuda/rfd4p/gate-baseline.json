@@ -43,10 +43,11 @@
   "fast": 0.008377
  },
  "speed-n100-r6": {
-  "exact_ms": 156.15,
-  "fast_ms": 41.54
+  "exact_ms": 156.14,
+  "fast_ms": 41.34
  },
  "trajectory": {
+  "designs_oracle": 1,
   "exact": 3.295e-06,
   "fast": 0.01596,
   "fast_ca_rms": 0.0195

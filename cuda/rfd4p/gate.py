@@ -335,6 +335,23 @@ def main() -> int:
                   mark = f"ok (was {was})"
               row["fast_ca_rms"] = round(rms, 4)
               print(f"  {name:10s} {'fast vs exact':10s} {rms:8.3f} A of CA over 60 steps  {mark}")
+          # 🔴 AND THE TWO FLAGS TOGETHER, ONCE. `--designs=N` makes every design after the first
+          # draw its OWN noise, so an oracle comparison must be pinned to design 0 - and when it
+          # was not, the gate would have read two different noise streams as a port defect. No arm
+          # ran both until this one.
+          if name == "trajectory":
+              r = run([BINARY, case_dir, f"--weights={args.weights}",
+                       f"--generate={case_dir}-gen", f"--gen-oracle={case_dir}-gen-oracle",
+                       f"--out={case_dir}-gate2.pdb", "--designs=2"], cwd=REPO)
+              matched = r.stdout.count("the trajectory matches")
+              diverged = "DIVERGES" in r.stdout
+              both_ok = matched == 1 and not diverged
+              if not both_ok:
+                  failed += 1
+              print(f"  {'designs+oracle':10s} compared {matched} time(s), "
+                    f"{'pinned to design 0' if both_ok else 'WRONG DESIGN'}  "
+                    f"{'ok ' if both_ok else 'WRONG'}")
+              row["designs_oracle"] = matched
           got[name] = row
 
     # ---- the native featuriser, against the JavaScript exporter's own bytes -------------------
@@ -470,7 +487,11 @@ def main() -> int:
                 # either arithmetic (CA-CA 4.32 A, worst gap 14.6) and reading that as int8's
                 # fault would be reading the step count as a defect.
                 fold = HERE / "featurise" / "gate-fold.json"
+                # `--config=` is the featuriser's flag and must not reach the fold, which would
+                # refuse it AFTER the featuriser had written its directory - a failure in silence,
+                # since the only lines anybody reads are the featuriser's.
                 run([BINARY, f"--job={fold}", f"--int8={bundle}",
+                     f"--config={bundle}/config.json",
                      f"--work-dir={HERE / 'gate-job-int8'}", f"--out={i8pdb}", "--seed=0",
                      "--fast"], cwd=REPO)
                 caca = chain_steps(i8pdb)
