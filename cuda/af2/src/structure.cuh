@@ -64,10 +64,9 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
             const float* __restrict__ kp, const float* __restrict__ b2d, const float* __restrict__ pw,
             const float* __restrict__ seqMask, float* __restrict__ attn, int L, int Hh, int Cs, int Pq) {
   __shared__ float srow[8][512];
-  unsigned wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (wid >= (unsigned)(L * Hh)) return;
-  int h = (int)(wid % (unsigned)Hh), q = (int)(wid / (unsigned)Hh);
+  int h = (int)(blockIdx.x % (unsigned)Hh), q = (int)(blockIdx.x / (unsigned)Hh) * 8 + warp;
+  if (q >= L) return;
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
   float mx = -INFINITY;
   float w = ptx_ldg_f32(pw + h);
@@ -81,8 +80,11 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
     float sq = ptx_ldg_f32(seqMask + q);
     const float invSqrt3 = 0.5773502691896257645f;
     const float nw2 = ptx_mul_f32(-0.5f, w);
-    for (int k = lane; k < L; k += 32) {
-      const float4* kpk = reinterpret_cast<const float4*>(kp + ((size_t)k * Hh + h) * 12);
+    const float4* kpk = reinterpret_cast<const float4*>(kp + ((size_t)lane * Hh + h) * 12);
+    const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)lane * Hh + h) * 16);
+    const float* b2dk = b2d + ((size_t)q * L + lane) * Hh + h;
+#pragma unroll 1
+    for (int k = lane; k < L; k += 32, kpk += 96 * Hh, ksk += 128 * Hh, b2dk += 32 * Hh) {
       float4 kp0 = ptx_ldg_v4_f32(kpk), kp1 = ptx_ldg_v4_f32(kpk + 1), kp2 = ptx_ldg_v4_f32(kpk + 2);
       float d2 = 0.f;
       float dx, dy, dz;
@@ -94,19 +96,18 @@ ipaWeightsK(const float* __restrict__ qs, const float* __restrict__ ks, const fl
       d2 = ptx_add_f32(d2, ptx_fma_f32(dz, dz, ptx_fma_f32(dy, dy, ptx_mul_f32(dx, dx))));
       dx = ptx_sub_f32(qp2.y, kp2.y); dy = ptx_sub_f32(qp2.z, kp2.z); dz = ptx_sub_f32(qp2.w, kp2.w);
       d2 = ptx_add_f32(d2, ptx_fma_f32(dz, dz, ptx_fma_f32(dy, dy, ptx_mul_f32(dx, dx))));
-      const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * 16);
+      float4 v0 = ptx_ldg_v4_f32(ksk), v1 = ptx_ldg_v4_f32(ksk + 1);
       float sc = 0.f;
-      float4 v0 = ptx_ldg_v4_f32(ksk);
       sc = ptx_fma_f32(qv0.x, v0.x, sc); sc = ptx_fma_f32(qv0.y, v0.y, sc); sc = ptx_fma_f32(qv0.z, v0.z, sc); sc = ptx_fma_f32(qv0.w, v0.w, sc);
-      float4 v1 = ptx_ldg_v4_f32(ksk + 1);
       sc = ptx_fma_f32(qv1.x, v1.x, sc); sc = ptx_fma_f32(qv1.y, v1.y, sc); sc = ptx_fma_f32(qv1.z, v1.z, sc); sc = ptx_fma_f32(qv1.w, v1.w, sc);
-      float4 v2 = ptx_ldg_v4_f32(ksk + 2);
+      float4 v2 = ptx_ldg_v4_f32(ksk + 2), v3 = ptx_ldg_v4_f32(ksk + 3);
+      float b2d_val = ptx_ldg_f32(b2dk);
+      float sm_val = ptx_ldg_f32(seqMask + k);
       sc = ptx_fma_f32(qv2.x, v2.x, sc); sc = ptx_fma_f32(qv2.y, v2.y, sc); sc = ptx_fma_f32(qv2.z, v2.z, sc); sc = ptx_fma_f32(qv2.w, v2.w, sc);
-      float4 v3 = ptx_ldg_v4_f32(ksk + 3);
       sc = ptx_fma_f32(qv3.x, v3.x, sc); sc = ptx_fma_f32(qv3.y, v3.y, sc); sc = ptx_fma_f32(qv3.z, v3.z, sc); sc = ptx_fma_f32(qv3.w, v3.w, sc);
       float s = ptx_mul_f32(nw2, d2);
-      s = ptx_add_f32(s, ptx_add_f32(sc, ptx_ldg_f32(b2d + ((size_t)q * L + k) * Hh + h)));
-      s = ptx_fma_f32(-1e5f, ptx_fma_f32(-sq, ptx_ldg_f32(seqMask + k), 1.f), s);
+      s = ptx_add_f32(s, ptx_add_f32(sc, b2d_val));
+      s = ptx_fma_f32(-1e5f, ptx_fma_f32(-sq, sm_val, 1.f), s);
       s = ptx_mul_f32(s, invSqrt3);
       if (L <= 512) ptx_st_shared_f32(&srow[warp][k], s);
       else ptx_st_global_f32(row + k, s);
@@ -170,7 +171,7 @@ ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, co
   if (Cs == 16 && Pv == 8) {
     int qTiles = (L + 3) >> 2;
     if (wid >= qTiles * Hh) return;
-    int h = wid % Hh, q0 = (wid / Hh) << 2;
+    int h = wid / qTiles, q0 = (wid % qTiles) << 2;
     int nq = ptx_min_s32(4, L - q0);
     __shared__ float sp[4][24];
     const float* p0 = lane < 16 ? (vs + h * 16 + lane) : (vp + h * 24 + (lane - 16));
@@ -204,7 +205,9 @@ ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, co
     }
     float g0s[4] = {g0_0, g0_1, g0_2, g0_3};
     float g1s[4] = {g1_0, g1_1, g1_2, g1_3};
-    for (int qi = 0; qi < nq; ++qi) {
+#pragma unroll
+    for (int qi = 0; qi < 4; ++qi) {
+      if (qi >= nq) break;
       int q = q0 + qi;
       float* f = final_ + (size_t)q * Fw;
       if (lane < 16) ptx_st_global_f32(f + h * 16 + lane, g0s[qi]);
@@ -230,7 +233,7 @@ ipaOutputsFastK(const float* __restrict__ attn, const float* __restrict__ vs, co
         ptx_st_global_f32(f + base + 3 * Hh * 8 + idx,
                           ptx_sqrt_f32(ptx_max_f32(ptx_fma_f32(loc[2], loc[2], ptx_fma_f32(loc[1], loc[1], ptx_mul_f32(loc[0], loc[0]))), 1e-16f)));
       }
-      ptx_bar_warp();
+      if (qi + 1 < nq) ptx_bar_warp();
     }
     return;
   }
@@ -307,22 +310,37 @@ __global__ void ipaOutputsK(const float* attn, const float* vs, const float* vp,
 // heads' sums (a block a (query, head) read the query's pair row once per head - 12 times, ~1.5 GB a call at 494
 // residues). Each sum runs over k in the same order with the same arithmetic, so the outputs are the same bytes.
 constexpr int IPA_MAX_HEADS = 16, IPA_KT = 256;
+template <int MAX_H = IPA_MAX_HEADS>
 __global__ void __launch_bounds__(128, 6)
 ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, float* __restrict__ final_,
              int L, int Hh, int Cs, int Pv, int C2) {
-  __shared__ float as[IPA_MAX_HEADS][IPA_KT];
+  __shared__ __align__(16) float as[MAX_H][IPA_KT];
   int q = blockIdx.x;
   int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
-  if (C2 == 128 && Hh == 12 && blockDim.x == 128) {
+  if constexpr (MAX_H == 12) {
     int c = threadIdx.x;
     float acc[12] = {};
     for (int k0 = 0; k0 < L; k0 += IPA_KT) {
       int kt = ptx_min_s32(IPA_KT, L - k0);
+      if (c + 128 < kt) {
+        float a0[12], a1[12];
 #pragma unroll
-      for (int h = 0; h < 12; ++h) {
-        const float* ah = attn + ((size_t)q * 12 + h) * L + k0;
-        if (c < kt) ptx_st_shared_f32(&as[h][c], ptx_ldg_f32(ah + c));
-        if (c + 128 < kt) ptx_st_shared_f32(&as[h][c + 128], ptx_ldg_f32(ah + c + 128));
+        for (int h = 0; h < 12; ++h) {
+          const float* ah = attn + ((size_t)q * 12 + h) * L + k0;
+          a0[h] = ptx_ldg_f32(ah + c);
+          a1[h] = ptx_ldg_f32(ah + c + 128);
+        }
+#pragma unroll
+        for (int h = 0; h < 12; ++h) {
+          ptx_st_shared_f32(&as[h][c], a0[h]);
+          ptx_st_shared_f32(&as[h][c + 128], a1[h]);
+        }
+      } else if (c < kt) {
+        float a0[12];
+#pragma unroll
+        for (int h = 0; h < 12; ++h) a0[h] = ptx_ldg_f32(attn + ((size_t)q * 12 + h) * L + k0 + c);
+#pragma unroll
+        for (int h = 0; h < 12; ++h) ptx_st_shared_f32(&as[h][c], a0[h]);
       }
       ptx_bar_sync();
       const float* a2d = act2d + ((size_t)q * L + k0) * 128 + c;
@@ -332,19 +350,24 @@ ipaPairTermK(const float* __restrict__ attn, const float* __restrict__ act2d, fl
         float v1 = ptx_ldg_f32(a2d + 128);
         float v2 = ptx_ldg_f32(a2d + 256);
         float v3 = ptx_ldg_f32(a2d + 384);
-        float vs[4] = {v0, v1, v2, v3};
+        float4 ah[12];
 #pragma unroll
-        for (int u = 0; u < 4; ++u) {
+        for (int h = 0; h < 12; ++h) ah[h] = ptx_ld_shared_v4_f32(reinterpret_cast<const float4*>(&as[h][k]));
 #pragma unroll
-          for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ptx_ld_shared_f32(&as[h][k + u]), vs[u], acc[h]);
-        }
+        for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].x, v0, acc[h]);
+#pragma unroll
+        for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].y, v1, acc[h]);
+#pragma unroll
+        for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].z, v2, acc[h]);
+#pragma unroll
+        for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ah[h].w, v3, acc[h]);
       }
       for (; k < kt; ++k, a2d += 128) {
         float v = ptx_ldg_f32(a2d);
 #pragma unroll
         for (int h = 0; h < 12; ++h) acc[h] = ptx_fma_f32(ptx_ld_shared_f32(&as[h][k]), v, acc[h]);
       }
-      ptx_bar_sync();
+      if (k0 + IPA_KT < L) ptx_bar_sync();
     }
     float* f = final_ + (size_t)q * Fw + 12 * Cs + 48 * Pv + c;
 #pragma unroll
@@ -517,8 +540,6 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
       xv[k] = val;
       s = ptx_add_f32(s, val);
     }
-    s = ptx_warp_sum_f32(s);
-    float mean = ptx_mul_f32(s, 1.f / 384.f);
     float sc[12], of[12];
 #pragma unroll
     for (int k = 0; k < 12; ++k) {
@@ -526,6 +547,8 @@ addBiasLnK(float* __restrict__ residual, const float* __restrict__ y, const floa
       sc[k] = ptx_ldg_f32(scale + c);
       of[k] = ptx_ldg_f32(offset + c);
     }
+    s = ptx_warp_sum_f32(s);
+    float mean = ptx_mul_f32(s, 1.f / 384.f);
 #pragma unroll
     for (int k = 0; k < 12; ++k) { float d = ptx_sub_f32(xv[k], mean); v = ptx_fma_f32(d, d, v); }
     v = ptx_warp_sum_f32(v);
@@ -612,9 +635,10 @@ __global__ void sidechainAtomsK(const float* unnorm, const float* rig, float pos
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= L) return;
   int aa = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(aatypeIn + i), 0), 19);    // the reference clips X to the 20 standard types
-  float bb[12];
-  for (int k = 0; k < 12; ++k) bb[k] = ptx_ldg_f32(rig + i * 12 + k);
-  for (int k = 9; k < 12; ++k) bb[k] = ptx_mul_f32(bb[k], positionScale);
+  const float4* rb4 = reinterpret_cast<const float4*>(rig + i * 12);
+  float4 r0 = ptx_ldg_v4_f32(rb4 + 0), r1 = ptx_ldg_v4_f32(rb4 + 1), r2 = ptx_ldg_v4_f32(rb4 + 2);
+  float bb[12] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w,
+                  r2.x, ptx_mul_f32(r2.y, positionScale), ptx_mul_f32(r2.z, positionScale), ptx_mul_f32(r2.w, positionScale)};
   float sinA[8], cosA[8];
   sinA[0] = 0.f; cosA[0] = 1.f;
   for (int a = 0; a < 7; ++a) {
@@ -745,7 +769,7 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     gemm(act, ipaIt->second.w, proj, L, C, Wipa);
     ipaUnpackK<<<blocks((size_t)L * ipaWork), 256, 0, STREAM>>>(
       proj, qs, ks, vs, ipaIt->second.b, rig, qp, kp, vp, L, Hh, Cs, Pq, Pv, sqrtf(1.f / Cs));
-    ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
+    ipaWeightsK<<<(unsigned)(((L + 7) / 8) * Hh), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
     // (the pair term apart, a block a query: see ipaPairTermK)
     const bool pairApart = act2d && Hh <= IPA_MAX_HEADS && C2 <= 1024;
     if ((pairApart || lean) && Cs + Pv <= 32) {
@@ -753,7 +777,10 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
       ipaOutputsFastK<<<(unsigned)((nw + 3) / 4), 128, 0, STREAM>>>(attn, vs, vp, rig, fin, L, Hh, Cs, Pv, C2);
     } else
       ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, pairApart ? nullptr : act2d, rig, fin, L, Hh, Cs, Pv, C2);
-    if (pairApart) ipaPairTermK<<<L, (C2 == 128 && Hh == 12) ? 128 : (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
+    if (pairApart) {
+      if (C2 == 128 && Hh == 12) ipaPairTermK<12><<<L, 128, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
+      else ipaPairTermK<16><<<L, (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
+    }
     if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
                                                          P(S + "pair_layer_norm/offset"), fin, L, Hh, Cs, Pv, C2);
     gemm(fin, P(I + "output_projection/weights", -1), upd, L, Fw, C);

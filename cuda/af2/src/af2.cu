@@ -44,7 +44,8 @@ static std::vector<float> expectation(const std::vector<float>& logits, size_t r
 // per bin - with the logits' two 17 MB downloads, most of the 218 ms between a 261-residue fold's last pass and its
 // result): the PAE expectation and the pair's TM term (confidence.compute_tm's, before its row means), and the distogram's
 // P(< 8 A). Double accumulation in the host's bin order; the exp is the device's.
-__global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
+__global__ void __launch_bounds__(256, 6)
+paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= pairs) return;
@@ -52,6 +53,7 @@ __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* 
   float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
   mx = ptx_warp_max_f32(mx);
   double s = 0.0, e = 0.0, t = 0.0;
+#pragma unroll
   for (int k = 0; k < 2; ++k) {
     int b = lane + k * 32;
     float c = b < 63 ? ptx_fma_f32((float)b, 0.5f, 0.25f) : (62.f * 0.5f + 0.25f + 0.5f);
@@ -61,6 +63,7 @@ __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* 
     float cd0 = ptx_div_f32(c, d0);
     t = ptx_add_f64(t, ptx_div_f64(p, ptx_cvt_f64_f32(ptx_fma_f32(cd0, cd0, 1.f))));
   }
+#pragma unroll
   for (int o = 16; o; o >>= 1) {
     s = ptx_add_f64(s, ptx_shfl_xor_f64(s, o));
     e = ptx_add_f64(e, ptx_shfl_xor_f64(e, o));
@@ -71,7 +74,8 @@ __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* 
     ptx_st_global_f64(tm + r, ptx_div_f64(t, s));
   }
 }
-__global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
+__global__ void __launch_bounds__(256, 6)
+contactPairsK(const float* logits, size_t pairs, float* out) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= pairs) return;
@@ -81,6 +85,7 @@ __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
   double e0 = ptx_cvt_f64_f32(ptx_exp_f32(ptx_sub_f32(l0, mx)));
   double e1 = ptx_cvt_f64_f32(ptx_exp_f32(ptx_sub_f32(l1, mx)));
   double s = ptx_add_f64(e0, e1), near = lane <= 18 ? e0 : 0.0;
+#pragma unroll
   for (int o = 16; o; o >>= 1) {
     s = ptx_add_f64(s, ptx_shfl_xor_f64(s, o));
     near = ptx_add_f64(near, ptx_shfl_xor_f64(near, o));
@@ -211,6 +216,7 @@ paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
   float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
   mx = ptx_warp_max_f32(mx);
   float s = 0.f, e = 0.f, t = 0.f;
+#pragma unroll
   for (int k = 0; k < 2; ++k) {
     int b = lane + k * 32;
     float c = b < 63 ? ptx_fma_f32((float)b, step, step * 0.5f) : (62.f * step + step * 0.5f + step);
