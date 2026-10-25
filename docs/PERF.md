@@ -2814,3 +2814,35 @@ candidate changes the numbers rather than the schedule:
 None of these are taken. They are model changes wearing an optimisation's clothes, and they
 need a quality argument - a re-fold of the designs, not a backbone that merely looks protein-
 shaped - before any of them belongs behind a flag.
+
+### And 95% of the pass is matmul, which is why there is nothing left to borrow
+
+| n | pass | matmul | everything else |
+|---:|---:|---:|---:|
+| 200 | 444.5 | 425.6 (95.7%) | 18.9 (4.3%) |
+| 400 | 1815.8 | 1719.3 (94.7%) | 96.5 (5.3%) |
+| 512 | 2914.2 | 2754.8 (94.5%) | 159.4 (5.5%) |
+
+"Everything else" is every norm, transpose, bias, gate, softmax and elementwise kernel in the
+pass added together. So the ceiling above is not a detail about six kernels - it is 95% of the
+work, and the other 5% cannot be made negative.
+
+🔴 **WHICH IS WHY `cuda/rfd4p`'S OPTIMISATION ROUND DOES NOT TRANSFER.** That port's late
+commits are byte-count work - narrowing planes and the pair tensor to f16, vectorising
+elementwise kernels, fusing norms into the stages that produce them - because on an A-series
+card its GEMMs were already at 144 TFLOP/s against a 156 TF32 ceiling and "what is left is
+bytes". Here the GEMMs are the ceiling and the bytes are 5%. The same change is worth 19% on
+that card and under a percent here.
+
+Checked one by one against this port: the fused triangle projections, the fused q/k/v/gate,
+the one-kernel pair bias (with four pairs a subgroup and one vec4 reduction serving all
+four), f16 planes and pair tensor and transition hidden, norms fused into GEMM
+prologues/epilogues, residuals and biases fused into producers, tiled transposes, and the
+conditioning hoisted out of the recycle loop - **all already here**, and `condUniform`
+(collapsing the conditioning to one row when it is token-invariant) is here and not there.
+The one thing they have that this port does not is `abffcfee`, each pair stage leaving the
+next stage's LayerNorm behind. Of the three norms it fuses, two are already fused here
+(`pairWriteLnIn`, and `l1Fused`'s `inNorm: 'ln'` prologue); the third is the standalone
+`ln 160000x384` before the incoming triangle, which is **12.996 ms over 7 calls, 0.72% of a
+pass** - and it already runs at ~132 GB/s, so fusing it saves the read of z and not the
+write. Worth about a third of a percent. Not taken.
