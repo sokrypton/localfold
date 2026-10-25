@@ -32,6 +32,7 @@
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
 #include "../src/schedule.h"
+#include "atoms.h"
 #include "chirality.h"
 #include "cif.h"
 #include "tables.inc"
@@ -972,6 +973,43 @@ int run(int argc, char** argv) {
     for (int v : cf.slotOwner) printf("\t%d", v);
     printf("\nchirtetra");
     for (int v : cf.tetrahedralVertices) printf("\t%d", v);
+    printf("\n");
+    // The first transform stages, which a reader can run without the rest of the pipeline.
+    rfd4p::atoms::AtomArray arr;
+    arr.site = a;
+    arr.ann = ann;
+    arr.bonds = bonds;
+    arr.ids = ids;
+    arr.stereo = st;
+    rfd4p::atoms::ensureChemicalFlags(arr);
+    rfd4p::atoms::addSrcComponentAnnotation(arr);
+    rfd4p::atoms::computeWithinChainSourceResIdx(arr);
+    const std::pair<const char*, const vector<uint8_t>*> flags[] = {
+        {"is_protein", &arr.isProtein}, {"is_rna", &arr.isRna}, {"is_dna", &arr.isDna},
+        {"is_nucleic_acid", &arr.isNucleicAcid},
+        {"is_protein_backbone", &arr.isProteinBackbone},
+        {"is_rna_backbone", &arr.isRnaBackbone}, {"is_dna_backbone", &arr.isDnaBackbone},
+        {"is_nucleic_acid_backbone", &arr.isNucleicAcidBackbone},
+        {"is_standard_aa", &arr.isStandardAa},
+        {"is_standard_or_unknown_aa", &arr.isStandardOrUnknownAa},
+        {"is_standard_unknown_or_masked_aa", &arr.isStandardUnknownOrMaskedAa},
+        {"is_standard_rna", &arr.isStandardRna},
+        {"is_standard_or_unknown_rna", &arr.isStandardOrUnknownRna},
+        {"is_standard_unknown_or_masked_rna", &arr.isStandardUnknownOrMaskedRna},
+        {"is_standard_dna", &arr.isStandardDna},
+        {"is_standard_or_unknown_dna", &arr.isStandardOrUnknownDna},
+        {"is_standard_unknown_or_masked_dna", &arr.isStandardUnknownOrMaskedDna}};
+    for (const auto& [name, v] : flags) {
+      printf("flag\t%s", name);
+      for (uint8_t x : *v) printf("\t%d", (int)x);
+      printf("\n");
+    }
+    printf("srccomp");
+    for (const auto& v : arr.ann.strings["annotation_src-component_1_atom"]) {
+      printf("\t%s", v.c_str());
+    }
+    printf("\nwithinchain");
+    for (int v : arr.withinChainSourceResIdx) printf("\t%d", v);
     printf("\n");
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;

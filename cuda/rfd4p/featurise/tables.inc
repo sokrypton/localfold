@@ -1027,5 +1027,33 @@ inline const std::unordered_map<std::string, int> CHIRAL_TYPE = {
     {"CHI_OCTAHEDRAL", 8},
 };
 
+inline const std::unordered_set<std::string> PROTEIN_BACKBONE_ATOMS = {
+    "N", "CA", "C", "O",
+};
+
+inline const std::unordered_set<std::string> RNA_BACKBONE_ATOMS = {
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+};
+
+inline const std::unordered_set<std::string> DNA_BACKBONE_ATOMS = {
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'",
+};
+
+inline const std::unordered_set<std::string> NA_BACKBONE_ATOMS = {
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+};
+
+inline const std::unordered_set<std::string> STANDARD_AA = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+};
+
+inline const std::unordered_set<std::string> STANDARD_RNA = {
+    "A", "C", "G", "U",
+};
+
+inline const std::unordered_set<std::string> STANDARD_DNA = {
+    "DA", "DC", "DG", "DT",
+};
+
 }  // namespace tables
 }  // namespace rfd4p

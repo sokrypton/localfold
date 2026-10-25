@@ -15,6 +15,9 @@ import { parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
 import {
   ensureStereochemistryAnnotations, computeChiralityFeatures,
 } from "../../../shared/rfd4p/pipeline/chirality.js";
+import {
+  ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
+} from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,7 +48,7 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
   const rows = lines.slice(1)
-    .filter((l) => !/^(extra|bond|id|ann|chiral|stereobond|chirfeat|chircenter|chirframe|chirowner|chirtetra)\t?/.test(l))
+    .filter((l) => !/^(extra|bond|id|ann|chiral|stereobond|chirfeat|chircenter|chirframe|chirowner|chirtetra|flag|srccomp|withinchain)\t?/.test(l))
     .map((l) => l.split("\t"));
   const named = (tag) => {
     const l = lines.find((x) => x.startsWith(`${tag}\t`));
@@ -56,6 +59,18 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const ids = lines.filter((l) => l.startsWith("id\t")).map((l) => l.split("\t").slice(1));
   ensureStereochemistryAnnotations(js);
   const chir = computeChiralityFeatures(js);
+  // 🔴 THE ANNOTATION SET IS SNAPSHOT BEFORE THE TRANSFORMS RUN. `addSrcComponentAnnotation`
+  // ADDS one, and comparing afterwards asks the reader for a column the reader is not the stage
+  // that produces - the native side dumps both, at the point each is made.
+  // 🔴 THE VALUES TOO, NOT ONLY THE NAMES. An annotated structure CARRIES
+  // `annotation_src-component_1_atom` and `addSrcComponentAnnotation` then OVERWRITES it, so
+  // comparing afterwards asks the reader to have produced the transform's answer.
+  const annotationsFromCif = Object.keys(js.annotations).sort().join(" ");
+  const cifAnnotationValues = Object.fromEntries(
+    Object.entries(js.annotations).map(([k, v]) => [k, Array.isArray(v[0]) ? v.map((r) => r.slice()) : v.slice()]));
+  ensureChemicalFlags(js);
+  addSrcComponentAnnotation(js);
+  computeWithinChainSourceResIdx(js);
   const ann = new Map();
   for (const l of lines.filter((x) => x.startsWith("ann\t"))) {
     const p = l.split("\t");
@@ -129,11 +144,12 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
 
   // 🔴 AND THE ANNOTATION SET ITSELF, not only the values. A column silently absent is a
   // conditioning silently dropped, which is the failure this whole featuriser is written against.
-  const wantNames = Object.keys(js.annotations).sort().join(" ");
+  const wantNames = annotationsFromCif;
   const gotNames = [...ann.keys()].sort().join(" ");
   if (wantNames !== gotNames) wrong.push(`annotations {${gotNames}} vs {${wantNames}}`);
   else {
-    for (const [name, want] of Object.entries(js.annotations)) {
+    for (const name of annotationsFromCif.split(" ").filter(Boolean)) {
+      const want = cifAnnotationValues[name];
       const got = ann.get(name);
       const flat = Array.isArray(want[0]) ? want.flat() : want;
       if (got.values.length !== flat.length) { wrong.push(`${name} length`); continue; }
@@ -171,6 +187,35 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     if (got.length !== want.length) { wrong.push(`${label} length ${got.length}/${want.length}`); continue; }
     const bad = got.filter((v, i) => !eqf(v, want[i])).length;
     if (bad) wrong.push(`${label} ${bad}`);
+  }
+
+  // `ensureChemicalFlags`' seventeen booleans, and the two annotations beside them.
+  const flagLines = new Map();
+  for (const l of lines.filter((x) => x.startsWith("flag\t"))) {
+    const p = l.split("\t");
+    flagLines.set(p[1], p.slice(2).map(Number));
+  }
+  for (const [label, want] of Object.entries(js).filter(([k]) => flagLines.has(k))) {
+    const got = flagLines.get(label);
+    if (got.length !== want.length) { wrong.push(`${label} length`); continue; }
+    const bad = got.filter((v, i) => v !== (want[i] ? 1 : 0)).length;
+    if (bad) wrong.push(`${label} ${bad}`);
+  }
+  if (flagLines.size !== 17) wrong.push(`flags ${flagLines.size}`);
+  {
+    const l = lines.find((x) => x.startsWith("srccomp\t"));
+    const got = l ? l.split("\t").slice(1) : [];
+    const want = js.annotations["annotation_src-component_1_atom"];
+    if (got.length !== want.length) wrong.push("src-component length");
+    else {
+      const bad = got.filter((v, i) => v !== want[i]).length;
+      if (bad) wrong.push(`src-component ${bad}`);
+    }
+    const w2 = js.within_chain_source_res_idx;
+    const g2 = named("withinchain");
+    if (w2 && (g2.length !== w2.length || g2.some((v, i) => v !== w2[i]))) {
+      wrong.push("within_chain_source_res_idx");
+    }
   }
 
   structures += 1;

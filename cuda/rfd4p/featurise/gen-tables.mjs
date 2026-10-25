@@ -12,6 +12,7 @@ import {
   UNIFIED_ATOM37_TOKENS, UNIFIED_ATOM37_ENCODING, UNIFIED_RESTYPE_ATOM37_MASK,
   ALLOWED_RESIDUE_TYPES, STANDARD_POLYMER_RESIDUES, LOCAL_LATENT_RESIDUE_SET,
   TokenType, TOKEN_TYPE_IDS, RESIDUES_BY_TOKEN_TYPE, ATOM37_NAMES,
+  STANDARD_AA, STANDARD_RNA, STANDARD_DNA,
 } from "../../../shared/rfd4p/encoding.js";
 import {
   CHAIN_TYPE, BOND_TYPE, ELEMENT_TO_ATOMIC_NUMBER, METAL_ELEMENTS, STD_RESIDUE_CHARGES,
@@ -295,6 +296,45 @@ w("inline const std::unordered_map<std::string, int> CHIRAL_TYPE = {");
 for (const [k, v] of Object.entries(CHIRAL_TYPE)) w(`    {${str(k)}, ${v}},`);
 w("};");
 w("");
+// The backbone atom sets and the standard-residue sets `transforms.js` keeps privately. Read out
+// of the source for `STD_POLYMER_CHIRAL_CENTERS`'s reason: not exported, and a hand copy is a
+// second place for them to live.
+{
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../../shared/rfd4p/pipeline/transforms.js", import.meta.url),
+                           "utf8");
+  const setOf = (name) => {
+    const at = src.indexOf(`const ${name} = new Set([`);
+    if (at < 0) return null;
+    const body = src.slice(at, src.indexOf("]);", at));
+    // 🔴 BOTH QUOTE STYLES. A nucleic backbone atom is written `"O5'"` - double-quoted, because
+    // its name contains an apostrophe - and a single-quote-only pattern reads straight through
+    // it, producing garbage members like `", "C5`. The same trap as STD_POLYMER_CHIRAL_CENTERS,
+    // one table later.
+    return [...body.matchAll(/'([^']*)'|"([^"]*)"/g)].map((m) => m[1] ?? m[2]);
+  };
+  const protein = setOf("PROTEIN_BACKBONE_ATOMS");
+  const rna = setOf("RNA_BACKBONE_ATOMS");
+  const dna = setOf("DNA_BACKBONE_ATOMS");
+  const na = [...new Set([...(rna ?? []), ...(dna ?? [])])];
+  for (const [name, members] of [["PROTEIN_BACKBONE_ATOMS", protein],
+                                 ["RNA_BACKBONE_ATOMS", rna],
+                                 ["DNA_BACKBONE_ATOMS", dna],
+                                 ["NA_BACKBONE_ATOMS", na]]) {
+    w(`inline const std::unordered_set<std::string> ${name} = {`);
+    w("    " + members.map(str).join(", ") + ",");
+    w("};");
+    w("");
+  }
+}
+for (const [name, members] of [["STANDARD_AA", STANDARD_AA], ["STANDARD_RNA", STANDARD_RNA],
+                               ["STANDARD_DNA", STANDARD_DNA]]) {
+  w(`inline const std::unordered_set<std::string> ${name} = {`);
+  w("    " + [...members].map(str).join(", ") + ",");
+  w("};");
+  w("");
+}
+
 w("}  // namespace tables");
 w("}  // namespace rfd4p");
 

@@ -529,9 +529,10 @@ residues the cropped example does not contain, so building one from the spec fai
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
-    | `addSrcComponentAnnotation` | 340-358 | nothing new |
+    | ~~`addSrcComponentAnnotation`~~ **done** | 340-358 | nothing new |
+    | ~~`ensureChemicalFlags`~~ **done** | 272-335 | the 17 boolean columns actually vary |
+    | ~~`computeWithinChainSourceResIdx`~~ **done** | 252-267 | real residues to count |
     | `realizeExpandableSegments` | 363-475 | real residues between the sentinels |
-    | `ensureChemicalFlags` | 272-335 | the 17 boolean columns actually vary |
     | `filterUnwantedAtoms` | 480-496 | waters and unwanted elements are dropped |
     | `annotateCovalentModificationsAndAtomize` | 510-562 | real peptide bonds, so `atomize` means something |
     | `finalizeAndCanonicalizeSequenceConditioning` | 629-708 | a real sequence to canonicalise |
@@ -547,10 +548,10 @@ residues the cropped example does not contain, so building one from the spec fai
     never reaches; this port has been bitten twice by a draw that happens where it looks as
     though it should not, and both times the symptom was somewhere else entirely.
 
-    🔴 **AND THE EXISTING `featurise.cpp` KEEPS THE ATOM ARRAY IN FOUR PIECES** - `cif::AtomSite`,
-    `cif::Ids`, `cif::Annotations` and `chirality::Stereo`. That is fine for a reader and wrong
-    for a pipeline that MUTATES them together; consolidating them into one `AtomArray` is the
-    first thing to do, before the first stage rather than after the fifth.
+    🔴 **AND THE ATOM ARRAY IS ONE OBJECT NOW** (`featurise/atoms.h`), because a reader naturally
+    produces four pieces and every stage of `transforms.js` changes several of them TOGETHER -
+    `realizeExpandableSegments` inserts atoms, which moves every column, every annotation and
+    every bond index at once. Four parallel objects is four places to forget one.
   - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
     constrain once there are residues and atoms.
 
