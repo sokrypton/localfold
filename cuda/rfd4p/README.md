@@ -315,6 +315,19 @@ with Box-Muller; the PIPELINE's is mulberry32, and it decides how long a ranged 
 comes out - the gate's four seeds give 24, 30, 27 and 33 tokens, so a wrong draw order there is a
 wrong protein rather than a wrong digit.
 
+**And it is quick**, which matters because every gate here featurises:
+
+| | native | the JavaScript exporter |
+|---|---:|---:|
+| floor (1 token, 1 step) | **0.01 s** | 3.24 s |
+| 100 tokens, 60 steps | **0.13 s** | 3.41 s |
+| 400 tokens, 60 steps | **0.81 s** | 4.13 s |
+
+🔴 **READ THE FLOOR ROW FIRST**: most of the JavaScript's time is node starting and
+`parseSafetensors` walking a 1.74 GB checkpoint, not featurising. The honest statement is that the
+native side has essentially no floor - it reads seven embedding tables out of the exported index -
+and is about 4x on the work itself at 400 tokens.
+
 🔴 **THE NOISE IS DRAWN NATIVELY NOW, NOT REPLAYED**, and the gate compares it: `g/noise` is in the
 generation directory, so Box-Muller is held to V8's in the same breath as everything else.
 
