@@ -58,12 +58,34 @@ CASES = [
 # when the emit masks apply, which recycle depth each step gets. Two steps exercise all of it, and
 # it caught the port running four recycles a step against the reference's six.
 ENCODER = ("encoder", HERE / "data-pd", ["--preset=partial_diffusion_1prw", "--encoder"])
-TRAJECTORY = ("trajectory", HERE / "data-g2", ["--generate", "--gen-oracle", "--steps=2"])
+# (name, input dir, exporter flags, needs the encoder beside --generate)
+#
+# 🔴 FOUR LOOPS, NOT ONE, BECAUSE THEY ARE FOUR DIFFERENT LOOPS. The monomer starts from noise and
+# runs the ordinary schedule. `partial` starts from a STRUCTURE through the encoder, corrupts it to
+# the midpoint and runs an EXPANDED schedule's tail with a different draw order. `inverse` keeps the
+# backbone and redraws it from its forward marginal at every step. `smallmol` is the only shipped
+# preset with chiral frames, which are the one sequence feature besides the noised state that moves
+# between steps. Each of the last three has a branch the first cannot reach.
+TRAJECTORIES = [
+    ("trajectory", HERE / "data-g2", ["--generate", "--gen-oracle", "--steps=2"], False),
+    ("partial", HERE / "data-pdg",
+     ["--preset=partial_diffusion_1prw", "--generate", "--encoder", "--gen-oracle", "--steps=4"],
+     True),
+    ("inverse", HERE / "data-ifg",
+     ["--preset=inverse_folding_1prw", "--generate", "--encoder", "--gen-oracle", "--steps=2"],
+     True),
+    ("smallmol", HERE / "data-smg",
+     ["--preset=sm_sam", "--generate", "--gen-oracle", "--steps=2"], False),
+]
 SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6", "--repeat=30"])
 # The trunk's bounds; the DECODER's stages take 1e-4 on both arms and the binary applies that
 # itself - it runs in f32 whatever the arm, because its near-uniform softmax costs far more in
 # reduced precision than the trunk's does and it is one pass a generation. See src/rfd4p.cu.
 BOUND = {"exact": 1e-5, "fast": 5e-3, "int8": 2.5e-2}   # and the same for each one's `-big` arm
+# 🔴 A TRAJECTORY'S BOUND IS NOT A STAGE'S, because it compounds: the trunk's ~1e-3 a pass is
+# amplified by the first step's division by t = 0.001 and the next step starts from the result. The
+# number that says what that is worth is the structure, which the arm measures beside it.
+TRAJECTORY_BOUND = {"exact": 1e-5, "fast": 5e-2}
 # A residual is this machine's arithmetic, not its luck: hold it to the bound AND to the baseline.
 TOL_RES = 2.0   # a stage may drift this many times its recorded residual before it is a finding
 TOL_MS = 0.25   # a timing is noisy and machine-specific; 25% is a regression worth printing
@@ -84,6 +106,24 @@ def ensure_inputs(case_dir: Path, oracle_dir: Path | None, flags: list[str]) -> 
     if r.returncode != 0:
         print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr)
         sys.exit(f"could not export {case_dir}")
+
+
+def ca_rms(a: Path, b: Path) -> float:
+    """CA root-mean-square deviation between two PDBs, as written (no superposition).
+
+    They are two arithmetics over ONE trajectory from ONE seed, so they are already in the same
+    frame - fitting them would hide exactly the drift being measured.
+    """
+    def cas(p: Path) -> list[tuple[float, float, float]]:
+        return [(float(l[30:38]), float(l[38:46]), float(l[46:54]))
+                for l in p.read_text().splitlines()
+                if l.startswith("ATOM") and l[12:16].strip() == "CA"]
+    x, y = cas(a), cas(b)
+    if not x or len(x) != len(y):
+        return float("nan")
+    total = sum((px - qx) ** 2 + (py - qy) ** 2 + (pz - qz) ** 2
+                for (px, py, pz), (qx, qy, qz) in zip(x, y))
+    return (total / len(x)) ** 0.5
 
 
 def worst_of(out: str) -> tuple[float, int]:
@@ -182,34 +222,59 @@ def main() -> int:
         print(f"  {name:10s} {'exact':10s} worst {worst:.2e}  (1e-04)  {mark}")
         got[name] = {"exact": worst}
 
-    # ---- the whole sampling loop, two steps, against the reference's own ----------------------
-    name, case_dir, export_flags = TRAJECTORY
-    if not args.only or args.only in name:
-        if not (case_dir.with_name(case_dir.name + "-gen-oracle") / "model.idx").exists():
-            print(f"  building {case_dir.name} (two steps of the JS sampler)...", flush=True)
-            r = run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", case_dir,
-                     *export_flags], cwd=REPO)
-            if r.returncode != 0:
-                print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr)
-                sys.exit(f"could not export {case_dir}")
-        row = {}
-        for arm in ("exact", "fast"):
-            cmd = [BINARY, case_dir, f"--weights={args.weights}", f"--generate={case_dir}-gen",
-                   f"--gen-oracle={case_dir}-gen-oracle", f"--out={case_dir}-gate.pdb"]
-            if arm == "fast":
-                cmd.append("--fast")
-            r = run(cmd)
-            vals = [float(v) for v in re.findall(r"gen/x(?:Bb|Ll)\s+relRMS ([\d.e+-]+)", r.stdout)]
-            worst = max(vals) if vals else float("nan")
-            mark = "ok "
-            if not vals or "DIVERGES" in r.stdout:
-                mark, failed = "DIVERGES", failed + 1
-                if not vals:
-                    print(r.stdout[-1200:], r.stderr[-800:])
-            row[arm] = worst
-            print(f"  {name:10s} {arm:10s} worst {worst:.2e}  "
-                  f"({BOUND[arm]:.0e})  {mark}")
-        got[name] = row
+    # ---- the whole sampling loop, against the reference's own --------------------------------
+    for name, case_dir, export_flags, needs_encoder in TRAJECTORIES:
+      if not args.only or args.only in name:
+          if not (case_dir.with_name(case_dir.name + "-gen-oracle") / "model.idx").exists():
+              print(f"  building {case_dir.name} (two steps of the JS sampler)...", flush=True)
+              r = run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", case_dir,
+                       *export_flags], cwd=REPO)
+              if r.returncode != 0:
+                  print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr)
+                  sys.exit(f"could not export {case_dir}")
+          row = {}
+          for arm in ("exact", "fast"):
+              cmd = [BINARY, case_dir, f"--weights={args.weights}", f"--generate={case_dir}-gen",
+                       f"--gen-oracle={case_dir}-gen-oracle", f"--out={case_dir}-gate.pdb"]
+              if needs_encoder:
+                  cmd.append(f"--encoder={case_dir}-enc")
+              if arm == "fast":
+                  cmd.append("--fast")
+              r = run(cmd)
+              vals = [float(v) for v in re.findall(r"gen/x(?:Bb|Ll)\s+relRMS ([\d.e+-]+)", r.stdout)]
+              worst = max(vals) if vals else float("nan")
+              mark = "ok "
+              if not vals or "DIVERGES" in r.stdout:
+                  mark, failed = "DIVERGES", failed + 1
+                  if not vals:
+                      print(r.stdout[-1200:], r.stderr[-800:])
+              row[arm] = worst
+              print(f"  {name:10s} {arm:10s} worst {worst:.2e}  "
+                    f"({TRAJECTORY_BOUND[arm]:.0e})  {mark}")
+          # 🔴 AND WHAT --fast COSTS A FINISHED STRUCTURE, which is the only form of that question
+          # anybody can act on. A trajectory compounds, so its relRMS says the arithmetic differs and
+          # not by how much it matters; the preset's own 60 steps both ways, scored on CA, says that.
+          full, full_gen = HERE / "data", HERE / "data-gen"
+          if name == "trajectory" and (full_gen / "model.idx").exists():
+              pdbs = []
+              for arm in ("exact", "fast"):
+                  out = HERE / f"gate-full-{arm}.pdb"
+                  cmd = [BINARY, full, f"--weights={args.weights}", f"--generate={full_gen}",
+                         f"--out={out}"]
+                  if arm == "fast":
+                      cmd.append("--fast")
+                  run(cmd)
+                  pdbs.append(out)
+              rms = ca_rms(*pdbs)
+              mark = "ok "
+              was = base.get(name, {}).get("fast_ca_rms")
+              if rms != rms or rms > 0.2:
+                  mark, failed = "MOVED", failed + 1
+              elif was:
+                  mark = f"ok (was {was})"
+              row["fast_ca_rms"] = round(rms, 4)
+              print(f"  {name:10s} {'fast vs exact':10s} {rms:8.3f} A of CA over 60 steps  {mark}")
+          got[name] = row
 
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:

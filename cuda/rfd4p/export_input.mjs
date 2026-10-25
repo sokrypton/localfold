@@ -44,6 +44,9 @@ import {
   DEFAULT_SAMPLING, flowEmitMasks, recycleDepths, sampleInitialNoise, sampleSchedule, seededRng,
 } from "../../shared/rfd4p/flow.js";
 import {
+  buildPartialSchedule, partialStepCount, resolvePartialT,
+} from "../../shared/rfd4p/partial.js";
+import {
   adaptiveLayerNorm, applyNorm, forwardTrunkCpu, layerNorm, linearLayer,
   multiheadAttnAndTransition, pairBiasAttention, pairReprUpdate, swiGluTransition,
 } from "../../cpu/rfd4p/reference.js";
@@ -298,13 +301,41 @@ if (args.includes("--encoder")) {
 // The pair features go out without their distance bins (the first 30 columns), which the port fills
 // from the current CA each step.
 if (generate) {
-  if ((cache.crdUniq?.length ?? 0) > 1 || (nn.noise_align_chirality && (cache.activeFrames?.length ?? 0) > 0)) {
-    console.error("--generate only covers inputs whose per-step features are the noised state alone");
+  // 🔴 WHAT STILL REFUSES IS A COORDINATE GROUP, and only that. The chirality alignment also moves
+  // between steps and used to be refused with it; the port recomputes it on the device now
+  // (src/chirality.cuh), which is what lets the small-molecule preset generate at all. A coordinate
+  // group's permutation is a `randperm` draw a step and is not done.
+  if ((cache.crdUniq?.length ?? 0) > 1) {
+    console.error("--generate does not yet cover an input with coordinate groups to permute");
     process.exit(1);
   }
-  const steps = stepsOverride || preset.nsteps || DEFAULT_SAMPLING.nsteps;
-  const depths = recycleDepths(recycleOverride || preset.recycleSchedule || "none", steps);
-  const genSched = sampleSchedule({ ...DEFAULT_SAMPLING, nsteps: steps });
+  const alignsChirality = nn.noise_align_chirality && (cache.activeFrames?.length ?? 0) > 0;
+  // 🔴 A PARTIAL RUN'S STEP COUNT, SCHEDULE AND RECYCLE DEPTHS ARE ALL DIFFERENT, and they are
+  // derived here exactly as `generateRfd4pCpu` derives them rather than guessed from the preset.
+  // `partial_trajectory_fraction_steps` runs `round(frac * nsteps)` steps off the TAIL of the full
+  // schedule - so a half-trajectory of 60 is 30 steps whose spacing is the last 30 of 60, not the
+  // 30-step schedule, which has the right endpoints and the wrong spacing everywhere between.
+  // Inverse folding runs the whole schedule (both start times are 0) against a backbone resampled
+  // from its forward marginal at every step.
+  const baseNsteps = stepsOverride || preset.nsteps || DEFAULT_SAMPLING.nsteps;
+  const inverseFolding = preset.inverseFolding === true;
+  const frac = inverseFolding ? null : (preset.partialTrajectoryFractionSteps ?? null);
+  const partialOpts = {
+    nsteps: baseNsteps,
+    ...(inverseFolding ? { inverseFolding: true } : {}),
+    ...(frac != null ? { partialTrajectoryFractionSteps: frac } : {}),
+  };
+  const partialTDict = resolvePartialT(partialOpts, DEFAULT_SAMPLING);
+  const isPartial = Object.keys(partialTDict).length > 0;
+  const steps = isPartial && frac != null ? partialStepCount(frac, baseNsteps) : baseNsteps;
+  // 🔴 `fullNsteps` IS baseNsteps ALWAYS, not only when partial - that is what `generateRfd4pCpu`
+  // passes, and with it `recycleDepths` takes the schedule's TAIL rather than resampling it.
+  const depths = recycleDepths(recycleOverride || preset.recycleSchedule || "none", steps,
+    baseNsteps);
+  const genSched = isPartial
+    ? buildPartialSchedule(partialTDict, steps, DEFAULT_SAMPLING,
+      { fullNsteps: frac != null ? baseNsteps : null })
+    : sampleSchedule({ ...DEFAULT_SAMPLING, nsteps: steps });
   const pairNoDist = pairFeatures(batch, {
     n, caNm: x.bb_ca, feats: nn.feats_pair_repr,
     dist: { dim: nn.xt_pair_dist_dim, min: nn.xt_pair_dist_min, max: nn.xt_pair_dist_max },
@@ -339,12 +370,28 @@ if (generate) {
   const rng2 = seededRng(seed);
   const chunks = [];
   const take = (count) => { const a = rng2.randn(count); chunks.push(a); return a; };
-  take(n * 3);
   const offsetMask = (i) => emit.bb_ca[i] && !(field("coord_cond_mask")[i]);
   const groupIds = [...new Set(Array.from({ length: n }, (_, i) => i).filter(offsetMask)
     .map((i) => field("molecule_iid")[i]))].sort((a, b) => a - b);
-  for (let g = 0; g < groupIds.length; g += 1) take(3);
-  take(n * 32);
+  const latentDim = cfg.autoencoder_config.nn_ae.latent_z_dim ?? 32;
+  // 🔴 THE DRAW ORDER IS THE SPECIFICATION, AND A PARTIAL RUN'S IS NOT THE ORDINARY ONE. Upstream's
+  // `corrupt_batch` draws bb_ca's noise, then the latents', then bb_ca's per-molecule offset -
+  // where `sample_noise` draws bb_ca, the offset, then the latents. One transposition shifts every
+  // subsequent draw of the whole run, which is invisible in any single stage and wrong everywhere.
+  if (isPartial) {
+    take(n * latentDim);                       // encodeLatentsCpu's reparameterisation
+    take(n * 3);                               // corrupt_batch: zero-COM backbone noise
+    take(n * latentDim);                       // corrupt_batch: latent noise
+    for (let g = 0; g < groupIds.length; g += 1) take(3);
+    if (inverseFolding) {
+      take(n * 3);                             // the target backbone at ts[0]
+      for (let g = 0; g < groupIds.length; g += 1) take(3);
+    }
+  } else {
+    take(n * 3);
+    for (let g = 0; g < groupIds.length; g += 1) take(3);
+    take(n * latentDim);
+  }
   const stepNoise = [];
   for (let s2 = 0; s2 < steps; s2 += 1) {
     for (const dm of ["bb_ca", "local_latents"]) {
@@ -352,7 +399,13 @@ if (generate) {
       const cfg2 = genSched[dm].step;
       const stochastic = t2 !== 0 && !(t2 > cfg2.t_lim_ode || t2 < cfg2.t_lim_ode_below);
       stepNoise.push(stochastic ? 1 : 0);
-      if (stochastic) take(n * (dm === "bb_ca" ? 3 : 32));
+      if (stochastic) take(n * (dm === "bb_ca" ? 3 : latentDim));
+    }
+    // The resampled target comes AFTER both modalities have stepped, and not after the last step,
+    // where the clean target is used as it is.
+    if (inverseFolding && s2 < steps - 1) {
+      take(n * 3);
+      for (let g = 0; g < groupIds.length; g += 1) take(3);
     }
   }
   let total = 0;
@@ -369,10 +422,22 @@ if (generate) {
     "g/noise": noise,
     "g/emitBb": Float32Array.from(emit.bb_ca, (v) => (v ? 1 : 0)),
     "g/emitLl": Float32Array.from(emit.local_latents, (v) => (v ? 1 : 0)),
+    // The chirality's CLEAN packed vectors and nothing rotated: the port fits a frame against the
+    // noisy CA each step and rotates these, so what is exported is the input, not a step's output.
+    ...(alignsChirality ? { "g/chir": Float32Array.from(field("chirality")) } : {}),
   }, {
     steps,
     nGroups: groupIds.length,
     centeringScale: DEFAULT_SAMPLING.centering.scale,
+    alignChirality: alignsChirality ? 1 : 0,
+    chirOff: alignsChirality ? cache.chirOff : -1,
+    chiralFrameWidth: alignsChirality ? batch.chiral_frame_atoms.shape.at(-1) : 0,
+    partial: isPartial ? 1 : 0,
+    inverseFolding: inverseFolding ? 1 : 0,
+    partialTBb: partialTDict.bb_ca ?? 0,
+    partialTLl: partialTDict.local_latents ?? 0,
+    baseNsteps,
+    fullNsteps: frac != null ? baseNsteps : 0,
     distDim: nn.xt_pair_dist_dim,
     distMin: nn.xt_pair_dist_min,
     distMax: nn.xt_pair_dist_max,
@@ -385,6 +450,10 @@ if (generate) {
     "g/atom37Legal": Int32Array.from(UNIFIED_RESTYPE_ATOM37_MASK.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/coordGroup": Int32Array.from(batch[COND.CRDGRP] ? field(COND.CRDGRP) : new Int32Array(n * 37).fill(-1)),
     "g/condSeq": Int32Array.from(field(COND.SEQ)),
+    ...(alignsChirality ? {
+      "g/chiralFrames": Int32Array.from(field("chiral_frame_atoms")),
+      "g/chiralOwners": Int32Array.from(field("chiral_slot_owner")),
+    } : {}),
   });
   // 🔴 AND THE WHOLE GENERATION, WHEN IT IS SHORT ENOUGH TO AFFORD. `generateRfd4pCpu` is sixty
   // trunk passes in JavaScript at about a minute each, so the end-to-end comparison is run at a
@@ -401,8 +470,10 @@ if (generate) {
     // record is what separates "the loop is wired wrong" from "the loop amplifies".
     const perStep = {};
     const gen = await generateRfd4pCpu(batch, weights, cfg, {
-      nsteps: steps,
+      nsteps: baseNsteps,
       seed,
+      ...(inverseFolding ? { inverseFolding: true } : {}),
+      ...(frac != null ? { partialTrajectoryFractionSteps: frac } : {}),
       // 🔴 THE SAME RECYCLE SCHEDULE THE PORT IS HANDED, SAID OUT LOUD. `generateRfd4pCpu`
       // defaults to `medium` and the exporter writes `g/depths` from the PRESET's, so leaving it
       // off ran the reference at six recycles against the port's four - the two sides doing

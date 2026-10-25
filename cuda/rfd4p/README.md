@@ -28,6 +28,9 @@ On `custom_cath_monomer` (54 tokens, the one preset that needs no structure), ag
 checkpoint, all 37 stages — the three init products, the single and pair state after each of the 14
 layers, and the five outputs:
 
+`gate.py` is what re-runs all of it: the trunk's stages in five arms, the encoder, the whole
+sampling loop, and a timing.
+
 | | one recycle | two recycles |
 |---|---|---|
 | exact (the default) | **5.80e-07** | **5.32e-07** |
@@ -268,6 +271,53 @@ export) and would have been the standalone form's first bug.
 `sum(depths)` JS trunk passes at about a minute each, so the preset's 60 steps is an afternoon.
 `--gen-oracle` is opt-in on the exporter for that reason.
 
+## Every preset generates
+
+All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,
+motif scaffolding (indexed and unindexed), protein-protein interface, DNA binding, a YAML binder
+job, small molecule, partial diffusion and inverse folding.
+
+🔴 **THE SMALL-MOLECULE PRESET WAS THE LAST, AND IT NEEDED A KERNEL RATHER THAN A FLAG.** The
+export writes the sequence features once and the port overwrites the thirty-five state columns each
+step, so a feature that moves for any other reason would silently be frozen at step zero - which is
+why it was refused rather than folded with a stale value. `align_chirality` is such a feature: a
+chiral centre's packed vectors are written in the CLEAN structure's frame, and at each step the
+noisy CA positions define a new one, so the neighbours are re-read out of `x_t`, a proper rotation
+is fitted, and the vectors are rotated by it. `src/chirality.cuh` does that on the device - one
+thread a frame, a 4x4 Jacobi eigendecomposition in DOUBLE, because the reference runs it in JS
+doubles and `sm_sam` has six frames over 165 tokens. What still refuses is a coordinate group.
+
+## Partial diffusion and inverse folding
+
+The two runs that do not start from noise, and the reason the encoder exists.
+
+**Partial diffusion** takes a clean structure, corrupts it to a point part-way along the schedule
+(`partial_trajectory_fraction_steps`) and denoises from there, which diversifies a scaffold rather
+than inventing one. **Inverse folding** holds the backbone and redesigns the sequence and rotamers:
+the target CA is resampled from its forward marginal at every step
+(`resampled_forward_marginal`), so the latents are denoised against a backbone that never drifts.
+
+`--generate` takes both when the export says so, and needs `--encoder=<dir>` beside it, because the
+latent half of the clean sample is the encoder's output and the other half is the input's own CA.
+
+🔴 **A PARTIAL RUN'S SCHEDULE IS NOT THE ORDINARY ONE WITH ITS HEAD CUT OFF.**
+`build_partial_schedule` EXPANDS a schedule until its tail of `nsteps + 1` points starts at the
+corruption time, so half of 60 steps is 30 points taken from the 60-step schedule - not the
+30-step schedule, which has the right endpoints and the wrong spacing everywhere between. Inverse
+folding starts at t = 0 for both modalities, where the expansion degenerates to the ordinary
+schedule.
+
+🔴 **AND ITS RECYCLE DEPTHS TAKE THE TAIL WHERE A SHORT RUN RESAMPLES.** `recycleDepths` is passed
+`fullNsteps = baseNsteps` always, and when the bands already expand to that it slices rather than
+resamples - a different branch from the one a `--steps=2` run takes.
+
+🔴 **AND THE DRAW ORDER IS THE SPECIFICATION, AND A PARTIAL RUN'S IS NOT THE ORDINARY ONE.**
+`corrupt_batch` draws the backbone's noise, then the latents', then the backbone's per-molecule
+offset - where `sample_noise` draws the backbone, the offset, then the latents. One transposition
+shifts every subsequent draw of the whole run: invisible in any single stage and wrong everywhere.
+The encoder's own reparameterisation draw comes first of all, because the generator hands it the
+rng before `corrupt_batch` touches it.
+
 ## The autoencoder ENCODER
 
 `--encoder=<dir> --enc-oracle=<dir>`, on the 1PRW partial-diffusion preset (67 tokens): the input
@@ -297,9 +347,12 @@ residues the cropped example does not contain, so building one from the spec fai
 
 - **A native featuriser.** `export_input.mjs` drives the page's own JS; the C++ twin under
   `cuda/featurise/` comes with the `--job` form and the `lf::standalone::main` dispatch.
-- **Any preset's GENERATION but the monomer's.** Every preset EXPORTS now (see below), so the trunk,
-  the decoder and the encoder can be held to the reference on a real structure; the sampling loop
-  still refuses an input whose per-step features are more than the noised state.
+- **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
+  group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
+  shipped preset has one.
+- **Writing an mmCIF**, and mapping an insertion back onto the input structure
+  (`processSampleToAtoms`'s `inputAtoms` path, with the Hungarian assignment). The port writes a
+  PDB from the fallback path.
 - **A padded input**, so the masking paths are written and unexercised.
 - **Anything but an unconditional monomer through `--generate`.** The export REFUSES an input whose
   per-step features are more than the noised state, rather than silently freezing a feature that

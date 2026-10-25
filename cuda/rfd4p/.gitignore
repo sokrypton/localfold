@@ -6,3 +6,4 @@ localfold-rfd4p.arch
 weights-f32/
 data*/
 oracle*/
+gate-full-*.pdb
