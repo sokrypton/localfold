@@ -39,7 +39,7 @@ struct Trunk {
   float* logits = nullptr;          // [n, classes]
   float* insertion = nullptr;       // [n, n], only when asked
   float* s = nullptr;               // [n, D]
-  float* z = nullptr;               // [n * n, P]
+  void* z = nullptr;                // [n * n, P], f32 or half (see `forward`)
 };
 
 inline std::string wn(const std::string& name) { return "w/" + name; }
@@ -155,7 +155,8 @@ inline void swiGluTransition(const float* x, float* out, size_t rows, int dim, i
 // 🔴 THE QK NORM IS OVER THE WHOLE 768, NOT PER HEAD. `pair_bias_attn.py` norms the concatenated
 // projection before it is split into twelve heads of 64, so a per-head RMSNorm - the obvious reading,
 // and what most ports do - is a different function.
-inline void pairBiasAttention(const float* nodes, const float* pair, const float* pairMask,
+template <class TZ>
+inline void pairBiasAttention(const float* nodes, const TZ* pair, const float* pairMask,
                               const float* tokenMask, float* out, const Dims& d,
                               const std::string& pre) {
   const size_t n = d.n;
@@ -193,8 +194,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     rmsNorm<half>(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     rmsNorm<half>(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     packVGK<half><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
-    pairBias<half>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask, bias,
-                   d.n, stride, d.H, d.P, LOG2E);
+    pairBias<TZ, half>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask,
+                       bias, d.n, stride, d.H, d.P, LOG2E);
     flashGrid<half>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
                     1.f / sqrtf((float)d.dimHead()), nullptr);
     linear<half, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
@@ -205,8 +206,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
     rmsNorm(qkv, qkvg, n, W_, W(wn(pre + ".q_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     rmsNorm(qkv + W_, qkvg + W_, n, W_, W(wn(pre + ".k_layer_norm.weight")), 1e-5f, W_ * 4, W_ * 4);
     packVGK<float><<<blocks(n * W_), 256, 0, STREAM>>>(qkv, qkvg, n, W_);
-    pairBias<float>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask, bias,
-                    d.n, stride, d.H, d.P, 1.f);
+    pairBias<TZ, float>(pair, wn(pre + ".pair_norm.weight"), wn(pre + ".to_bias.weight"), pairMask,
+                        bias, d.n, stride, d.H, d.P, 1.f);
     flashGrid<float>(qkvg, bias, stride, tokenMask, attn, d.n, d.H, d.dimHead(), 0, 1, false,
                      1.f / sqrtf((float)d.dimHead()), nullptr);
     linear<float, float>(attn, out, n, W_, W_, wn(pre + ".to_out_node.weight"), true);
@@ -230,8 +231,8 @@ inline void pairBiasAttention(const float* nodes, const float* pair, const float
 // triangle. The GEMMs around them are at 144 TFLOP/s against this card's 156 TF32 ceiling, so what is
 // left to win is bytes, not arithmetic. The contraction still accumulates in f32 - a sum over n of
 // products is where half overflows, which is the one place AF3's pair track keeps f32 too.
-template <class TP, bool LONG>
-inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgoing,
+template <class TZ, class TP, bool LONG>
+inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing,
                       const std::string& pre) {
   // On a long chain the contraction's output is narrowed too, and the gate is transposed before it
   // is read. Both invert with length - see the table below - so they are one decision.
@@ -239,8 +240,8 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   const size_t rows = d.pairs();
   const int cZ = d.P, cH = d.TRI, n = d.n;
   TP* zNorm = scratch<TP>("rfd4p.tri.zn", rows * cZ);
-  layerNorm<TP>(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")),
-                optW(wn(pre + ".layer_norm_in.bias")));
+  layerNormIn<TZ, TP>(z, zNorm, rows, cZ, W(wn(pre + ".layer_norm_in.weight")),
+                      optW(wn(pre + ".layer_norm_in.bias")));
 
   // 🔴 ONE PROJECTION, NOT FOUR, AND IT LANDS IN THE LAYOUT THE CONTRACTION WANTS. a_p, a_g, b_p and
   // b_g all read the same `zNorm`, so their weights stack into one `[4 * cH, cZ]` matrix - a plain
@@ -303,10 +304,10 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
     linear<TP, TP>(zNorm, gate, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
-    mulSigmoidAddGate<TP>(xProj, gate, pairMask, z, rows, cZ);
+    mulSigmoidAddGate<TP, TZ>(xProj, gate, pairMask, z, rows, cZ);
   } else {
-    mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z,
-                                                                       rows, cZ);
+    mulSigmoidAddPlaneGateK<TP, TZ><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask,
+                                                                           z, rows, cZ);
   }
 }
 
@@ -327,16 +328,12 @@ inline bool longForm(size_t rows) {
   return forced || rows >= 40000;
 }
 
-inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoing,
+template <class TZ>
+inline void triangle(TZ* z, const float* pairMask, const Dims& d, bool outgoing,
                      const std::string& pre) {
-  const bool big = longForm(d.pairs());
-  if (F32_TF32) {
-    if (big) triangleT<half, true>(z, pairMask, d, outgoing, pre);
-    else triangleT<half, false>(z, pairMask, d, outgoing, pre);
-  } else {
-    if (big) triangleT<float, true>(z, pairMask, d, outgoing, pre);
-    else triangleT<float, false>(z, pairMask, d, outgoing, pre);
-  }
+  using TP = std::conditional_t<std::is_same_v<TZ, half>, half, float>;
+  if (longForm(d.pairs())) triangleT<TZ, TP, true>(z, pairMask, d, outgoing, pre);
+  else triangleT<TZ, TP, false>(z, pairMask, d, outgoing, pre);
 }
 
 // ---------------------------------------------------------------- the pair update
@@ -345,15 +342,16 @@ inline void triangle(float* z, const float* pairMask, const Dims& d, bool outgoi
 // `pair_update.py` writes `pi[:, None, :, :] * pj[:, :, None, :]`: the FIRST half is broadcast along
 // the i axis, so it is indexed by **j**, and the second half by **i**. Swapping them transposes the
 // write and still produces a plausible pair tensor.
+template <class TZ>
 __global__ void hadamardWriteK(const float* __restrict__ pij, const float* __restrict__ pairMask,
-                               float* __restrict__ z, int n, int P) {
+                               TZ* __restrict__ z, int n, int P) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (size_t)n * n * P) return;
   size_t pair = i / P;
   int c = (int)(i - pair * P);
   if (pairMask && pairMask[pair] == 0.f) return;
   int row = (int)(pair / n), col = (int)(pair % n);
-  z[i] += pij[(size_t)col * 2 * P + c] * pij[(size_t)row * 2 * P + P + c];
+  z[i] = (TZ)((float)z[i] + pij[(size_t)col * 2 * P + c] * pij[(size_t)row * 2 * P + P + c]);
 }
 __global__ void hadamardWrite4K(const float4* __restrict__ pij, const float* __restrict__ pairMask,
                                 float4* __restrict__ z, int n, int P4) {
@@ -369,16 +367,20 @@ __global__ void hadamardWrite4K(const float4* __restrict__ pij, const float* __r
   zz.x += pi.x * pj.x; zz.y += pi.y * pj.y; zz.z += pi.z * pj.z; zz.w += pi.w * pj.w;
   z[i] = zz;
 }
-inline void hadamardWrite(const float* pij, const float* pairMask, float* z, int n, int P) {
-  if ((P & 3) == 0 && ((((uintptr_t)pij | (uintptr_t)z) & 15) == 0)) {
-    hadamardWrite4K<<<blocks((size_t)n * n * (P >> 2)), 256, 0, STREAM>>>(
-        (const float4*)pij, pairMask, (float4*)z, n, P >> 2);
-  } else {
-    hadamardWriteK<<<blocks((size_t)n * n * P), 256, 0, STREAM>>>(pij, pairMask, z, n, P);
+template <class TZ>
+inline void hadamardWrite(const float* pij, const float* pairMask, TZ* z, int n, int P) {
+  if constexpr (std::is_same_v<TZ, float>) {
+    if ((P & 3) == 0 && ((((uintptr_t)pij | (uintptr_t)z) & 15) == 0)) {
+      hadamardWrite4K<<<blocks((size_t)n * n * (P >> 2)), 256, 0, STREAM>>>(
+          (const float4*)pij, pairMask, (float4*)z, n, P >> 2);
+      return;
+    }
   }
+  hadamardWriteK<TZ><<<blocks((size_t)n * n * P), 256, 0, STREAM>>>(pij, pairMask, z, n, P);
 }
 
-inline void pairReprUpdate(const float* s, float* z, const float* mask, const float* pairMask,
+template <class TZ>
+inline void pairReprUpdate(const float* s, TZ* z, const float* mask, const float* pairMask,
                            const Dims& d, const std::string& pre) {
   const size_t rows = d.pairs();
   const int n = d.n, P = d.P, D = d.D;
@@ -386,11 +388,11 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   layerNorm(s, xNorm, n, D, W(wn(pre + ".layer_norm_in.weight")), W(wn(pre + ".layer_norm_in.bias")));
   float* pij = scratch<float>("rfd4p.pu.pij", (size_t)n * P * 2);
   linear<float, float>(xNorm, pij, n, D, P * 2, wn(pre + ".linear_x.weight"), true);
-  hadamardWrite(pij, pairMask, z, n, P);
+  hadamardWrite<TZ>(pij, pairMask, z, n, P);
 
   if (d.useTriMult) {
-    triangle(z, pairMask, d, true, pre + ".tri_mult_out");
-    triangle(z, pairMask, d, false, pre + ".tri_mult_in");
+    triangle<TZ>(z, pairMask, d, true, pre + ".tri_mult_out");
+    triangle<TZ>(z, pairMask, d, false, pre + ".tri_mult_in");
   }
 
   // PairTransition: LayerNorm, up, ReLU, down, residual.
@@ -402,23 +404,26 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   if (F32_TF32) {
     half* zn = scratch<half>("rfd4p.pu.zn16", rows * P);
     half* h = scratch<half>("rfd4p.pu.h16", rows * (size_t)hidden);
-    layerNorm<half>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
+    layerNormIn<TZ, half>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")),
+                          W(wn(tr + ".layer_norm.bias")));
     linear<half, half>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
     biasRelu<half>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
     linear<half, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
   } else {
     float* zn = scratch<float>("rfd4p.pu.zn", rows * P);
     float* h = scratch<float>("rfd4p.pu.h", rows * (size_t)hidden);
-    layerNorm(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
+    layerNormIn<TZ, float>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")),
+                           W(wn(tr + ".layer_norm.bias")));
     linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
     biasRelu<float>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
     linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
   }
-  biasAdd(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
+  biasAdd<TZ>(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
 }
 
 // ---------------------------------------------------------------- one token layer
-inline void tokenLayer(float* s, const float* z, const CondPack& cond, int layer, const float* mask,
+template <class TZ>
+inline void tokenLayer(float* s, const TZ* z, const CondPack& cond, int layer, const float* mask,
                        const float* pairMask, const Dims& d, const std::string& pre) {
   const size_t n = d.n;
   const int D = d.D;
@@ -427,7 +432,7 @@ inline void tokenLayer(float* s, const float* z, const CondPack& cond, int layer
 
   adaLnPacked(s, cond.at(layer, 0), cond.at(layer, 1),
               W(wn(pre + ".mhba.adaln.to_gamma.0.bias")), ada, n, D, mask);
-  pairBiasAttention(ada, z, pairMask, mask, attn, d, pre + ".mhba.mha");
+  pairBiasAttention<TZ>(ada, z, pairMask, mask, attn, d, pre + ".mhba.mha");
   adaScaleAddK<<<blocks(n * D), 256, 0, STREAM>>>(
       attn, cond.at(layer, 4), W(wn(pre + ".mhba.scale_output.to_adaln_zero_gamma.0.bias")), mask, s,
       n, D);
@@ -444,15 +449,33 @@ inline void tokenLayer(float* s, const float* z, const CondPack& cond, int layer
 //
 // `tap` is given every named stage as it is produced, which is what the --oracle arm reads; it is null
 // in a fold.
-inline void forward(Trunk& t, const float* seq, const float* cond0, const float* cond1, const float* pairF,
-                    const float* pairCondF, int nRecycle, bool wantInsertion,
-                    const std::function<void(const char*, const float*, size_t)>& tap = nullptr) {
+// 🔴 THE PAIR TENSOR IS half UNDER --fast, AND IT IS THE MODEL'S STATE, NOT AN INTERMEDIATE. About a
+// third of the pass reads or writes z, so its width sets the floor for `layerNormIn`, `pairBiasK`,
+// the hadamard write, the transition's residual and both triangles' gated adds - every one of which
+// is at its bandwidth already. The f32 arm keeps f32, the oracle compares in f32 either way, and the
+// recycle projection and the heads are unchanged: only the storage narrows.
+template <class TZ>
+inline void forwardT(Trunk& t, const float* seq, const float* cond0, const float* cond1,
+                     const float* pairF, const float* pairCondF, int nRecycle, bool wantInsertion,
+                     const std::function<void(const char*, const float*, size_t)>& tap = nullptr) {
   const Dims& d = t.d;
   const size_t n = d.n, pairs = d.pairs();
   const int D = d.D, P = d.P, C = d.C, PC = d.PC;
   const float* mask = t.mask;
   const float* pairMask = t.pairMask;
+  TZ* z = (TZ*)t.z;
+  // A stage comparison is always in f32; a half pair tensor is widened into this on the way out.
   auto emit = [&](const char* name, const float* p, size_t count) { if (tap) tap(name, p, count); };
+  auto emitPair = [&](const std::string& name, const TZ* p, size_t count) {
+    if (!tap) return;
+    if constexpr (std::is_same_v<TZ, float>) {
+      tap(name.c_str(), (const float*)p, count);
+    } else {
+      float* wide = scratch<float>("rfd4p.emit.z", count);
+      widenK<<<blocks(count), 256, 0, STREAM>>>(p, wide, count);
+      tap(name.c_str(), wide, count);
+    }
+  };
 
   // c = two SwiGLU transitions of the conditioning features, with no residual between them.
   auto buildCond = [&](const float* feats, const char* slot) {
@@ -492,9 +515,14 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
     CK(cudaMemcpyAsync(zInit, adaOut, pairs * P * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
   }
   emit("o/zInit", zInit, pairs * P);
+  TZ* zInitZ = (TZ*)zInit;
+  if constexpr (std::is_same_v<TZ, half>) {
+    zInitZ = scratch<half>("rfd4p.zInit16", pairs * P);
+    toHalfK<<<blocks(pairs * P), 256, 0, STREAM>>>(zInit, zInitZ, pairs * P);
+  }
 
   CK(cudaMemsetAsync(t.s, 0, n * D * sizeof(float), STREAM));
-  CK(cudaMemsetAsync(t.z, 0, pairs * P * sizeof(float), STREAM));
+  CK(cudaMemsetAsync(z, 0, pairs * P * sizeof(TZ), STREAM));
   const int cycles = std::max(1, nRecycle);
   for (int cycle = 0; cycle < cycles; ++cycle) {
     // s = s_init + Lin(RMS(s)), z = z_init + Lin(RMS(z)); both are zero on the first cycle, so the
@@ -506,21 +534,23 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
     CK(cudaMemcpyAsync(t.s, sInit, n * D * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
     addIntoK<<<blocks(n * D), 256, 0, STREAM>>>(t.s, delta, n * D);
 
-    rmsNorm(t.z, norm, pairs, P, W(wn("nn.z_cycle_norm.weight")));
+    rmsNormIn<TZ, float>(z, norm, pairs, P, W(wn("nn.z_cycle_norm.weight")), nullptr);
     linear<float, float>(norm, delta, pairs, P, P, wn("nn.z_cycle_proj.weight"), true);
-    CK(cudaMemcpyAsync(t.z, zInit, pairs * P * sizeof(float), cudaMemcpyDeviceToDevice, STREAM));
-    addIntoK<<<blocks(pairs * P), 256, 0, STREAM>>>(t.z, delta, pairs * P);
+    CK(cudaMemcpyAsync(z, zInitZ, pairs * P * sizeof(TZ), cudaMemcpyDeviceToDevice, STREAM));
+    addIntoTK<TZ><<<blocks(pairs * P), 256, 0, STREAM>>>(z, delta, pairs * P);
 
     const CondPack& pack = cycle == 0 ? pack0 : pack1;
     const bool last = cycle == cycles - 1;
     for (int i = 0; i < d.nlayers; ++i) {
-      tokenLayer(t.s, t.z, pack, i, mask, pairMask, d, "nn.transformer_layers." + std::to_string(i));
+      tokenLayer<TZ>(t.s, z, pack, i, mask, pairMask, d,
+                     "nn.transformer_layers." + std::to_string(i));
       if (d.updatePairRepr && i < d.nlayers - 1 && i % d.everyN == 0) {
-        pairReprUpdate(t.s, t.z, mask, pairMask, d, "nn.pair_update_layers." + std::to_string(i));
+        pairReprUpdate<TZ>(t.s, z, mask, pairMask, d,
+                           "nn.pair_update_layers." + std::to_string(i));
       }
       if (last) {
         emit(("o/s" + std::to_string(i)).c_str(), t.s, n * D);
-        emit(("o/z" + std::to_string(i)).c_str(), t.z, pairs * P);
+        emitPair("o/z" + std::to_string(i), z, pairs * P);
       }
     }
   }
@@ -534,6 +564,8 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
   rmsNorm(t.s, normed, n, D, W(wn("nn.sequence_readout.0.weight")));
   linear<float, float>(normed, t.logits, n, D, d.classes, wn("nn.sequence_readout.1.weight"), true);
 
+  emitPair("o/z", z, pairs * P);
+
   // The insertion head: plain projections of s, no norm, logits q k^T / sqrt(D). See the 🔴 in
   // cpu/rfd4p/reference.js - this was skipped there for a wrong tensor name and nothing noticed.
   if (wantInsertion && t.insertion && hasW(wn("nn.insertion_q_proj.weight"))) {
@@ -545,6 +577,16 @@ inline void forward(Trunk& t, const float* seq, const float* cond0, const float*
     CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)n, (int)n, D, &alpha, k, CUDA_R_32F, D,
                     q, CUDA_R_32F, D, &beta, t.insertion, CUDA_R_32F, (int)n,
                     computeType(), CUBLAS_GEMM_DEFAULT));
+  }
+}
+
+inline void forward(Trunk& t, const float* seq, const float* cond0, const float* cond1,
+                    const float* pairF, const float* pairCondF, int nRecycle, bool wantInsertion,
+                    const std::function<void(const char*, const float*, size_t)>& tap = nullptr) {
+  if (F32_TF32) {
+    forwardT<half>(t, seq, cond0, cond1, pairF, pairCondF, nRecycle, wantInsertion, tap);
+  } else {
+    forwardT<float>(t, seq, cond0, cond1, pairF, pairCondF, nRecycle, wantInsertion, tap);
   }
 }
 

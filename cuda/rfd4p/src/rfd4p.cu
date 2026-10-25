@@ -61,7 +61,9 @@ int run(const Opts& o) {
   rfd4p::pairMaskK<<<blocks(pairs), 256, 0, STREAM>>>(t.mask, pairMask, d.n);
   t.pairMask = pairMask;
   t.s = scratch<float>("rfd4p.s", n * d.D);
-  t.z = scratch<float>("rfd4p.z", pairs * d.P);
+  // The pair tensor is half under --fast; `forward` picks and casts.
+  t.z = o.fast ? (void*)scratch<half>("rfd4p.z16", pairs * d.P)
+               : (void*)scratch<float>("rfd4p.z", pairs * d.P);
   t.bbCa = scratch<float>("rfd4p.bbCa", n * 3);
   t.localLatents = scratch<float>("rfd4p.ll", n * d.latent);
   t.logits = scratch<float>("rfd4p.logits", n * d.classes);
@@ -88,17 +90,18 @@ int run(const Opts& o) {
                  Fdev("in/pairCond"), nRecycle, o.insertion, tap);
 
   if (tap) {
-    for (const char* name : {"o/bbCa", "o/localLatents", "o/logits", "o/insertion", "o/s", "o/z"}) {
+    // o/z is emitted inside forward(), where the pair tensor's type is known.
+    for (const char* name : {"o/bbCa", "o/localLatents", "o/logits", "o/insertion", "o/s"}) {
       const float* p = !strcmp(name, "o/bbCa") ? t.bbCa
                      : !strcmp(name, "o/localLatents") ? t.localLatents
                      : !strcmp(name, "o/logits") ? t.logits
                      : !strcmp(name, "o/insertion") ? t.insertion
-                     : !strcmp(name, "o/s") ? t.s : t.z;
+                     : t.s;
       size_t count = !strcmp(name, "o/bbCa") ? n * 3
                    : !strcmp(name, "o/localLatents") ? n * d.latent
                    : !strcmp(name, "o/logits") ? n * (size_t)d.classes
                    : !strcmp(name, "o/insertion") ? pairs
-                   : !strcmp(name, "o/s") ? n * d.D : pairs * d.P;
+                   : n * d.D;
       tap(name, p, count);
     }
   }

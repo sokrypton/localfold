@@ -57,6 +57,88 @@ rmsNormRegK(const float* __restrict__ x, TY* __restrict__ y, size_t rows, int C,
   }
 }
 
+// 🔴 ef2's `layerNorm` AND THIS FILE'S `rmsNorm` BOTH TAKE A float INPUT, which is the one thing
+// standing between the pair tensor and half. These are the same register kernels with the input type
+// templated: the reduction and the arithmetic stay f32, only the loads narrow.
+template <int MAX_K, class TI, class TO>
+__global__ void __launch_bounds__(256, 2)
+layerNormInK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, int C,
+             const float* __restrict__ scale, const float* __restrict__ offset, float eps) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const TI* xr = x + row * C;
+  float xv[MAX_K], s = 0.f;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    xv[k] = (float)xr[k * 32 + lane];
+    s += xv[k];
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  const float mean = s / (float)C;
+  float v = 0.f;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) { const float d = xv[k] - mean; v += d * d; }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  const float inv = rsqrtf(v / (float)C + eps);
+  TO* yr = y + row * C;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    const int c = k * 32 + lane;
+    float r = (xv[k] - mean) * inv;
+    if (scale) r *= __ldg(scale + c);
+    if (offset) r += __ldg(offset + c);
+    yr[c] = (TO)r;
+  }
+}
+
+template <int MAX_K, class TI, class TO>
+__global__ void __launch_bounds__(256, 2)
+rmsNormInK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, int C,
+           const float* __restrict__ scale, float eps) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const TI* xr = x + row * C;
+  float xv[MAX_K], v = 0.f;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    xv[k] = (float)xr[k * 32 + lane];
+    v += xv[k] * xv[k];
+  }
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  const float inv = rsqrtf(v / (float)C + eps);
+  TO* yr = y + row * C;
+  #pragma unroll
+  for (int k = 0; k < MAX_K; ++k) {
+    const int c = k * 32 + lane;
+    float r = xv[k] * inv;
+    if (scale) r *= __ldg(scale + c);
+    yr[c] = (TO)r;
+  }
+}
+
+// Dispatch on the width; every width this model norms over divides by 32.
+#define RFD4P_NORM_IN(NAME, KERNEL, ARGS)                                                        \
+  template <class TI, class TO>                                                                  \
+  inline void NAME(const TI* x, TO* y, size_t rows, int C, const float* scale,                   \
+                   const float* offset, float eps = 1e-5f) {                                     \
+    const unsigned b = blocks(rows * 32, 256);                                                   \
+    (void)offset;                                                                                \
+    switch (C) {                                                                                 \
+      case 768: KERNEL<24, TI, TO><<<b, 256, 0, STREAM>>> ARGS; return;                          \
+      case 384: KERNEL<12, TI, TO><<<b, 256, 0, STREAM>>> ARGS; return;                          \
+      case 256: KERNEL<8, TI, TO><<<b, 256, 0, STREAM>>> ARGS; return;                           \
+      default: fprintf(stderr, #NAME ": no kernel for %d channels\n", C); exit(1);               \
+    }                                                                                            \
+  }
+RFD4P_NORM_IN(layerNormIn, layerNormInK, (x, y, rows, C, scale, offset, eps))
+RFD4P_NORM_IN(rmsNormIn, rmsNormInK, (x, y, rows, C, scale, eps))
+#undef RFD4P_NORM_IN
+
 // The generic form, a warp a row, for a width the register kernel does not cover.
 template <class TY = float>
 __global__ void rmsNormK(const float* x, TY* y, size_t rows, int C, const float* scale, float eps,
@@ -158,9 +240,9 @@ __global__ void swiGluSecondK(const float* __restrict__ wide, float* __restrict_
 //
 // A lane holds C/32 channels in registers, so the row is read once: the sum of squares and all
 // `heads` dot products come off the same registers.
-template <class T, int K, int HEADS>
+template <class TZ, class T, int K, int HEADS>
 __global__ void __launch_bounds__(256)
-pairBiasK(const float* __restrict__ z, const float* __restrict__ normW,
+pairBiasK(const TZ* __restrict__ z, const float* __restrict__ normW,
           const float* __restrict__ biasW, const float* __restrict__ pairMask, T* __restrict__ bias,
           int n, int stride, float scale) {
   constexpr int C = K * 32;
@@ -173,18 +255,34 @@ pairBiasK(const float* __restrict__ z, const float* __restrict__ normW,
   const int lane = threadIdx.x & 31;
   const int i = (int)(pair / n), j = (int)(pair % n);
 
-  float v[K];
+  // 🔴 FOUR CHANNELS A LANE, NOT ONE. A lane strided by 32 reads one word a transaction and this
+  // kernel sat 2.3x off its own bandwidth; with `float4` a warp's load is one 128-byte line. C is a
+  // multiple of 128 for every width this runs at, so the mapping is exact.
+  constexpr int Q = K / 4;                                  // four channels a lane
+  float4 v4[Q];
   float sq = 0.f;
+  const TZ* zr = z + pair * C;
+  const float4* nw = (const float4*)normW;
   #pragma unroll
-  for (int k = 0; k < K; ++k) {
-    v[k] = __ldg(z + pair * C + k * 32 + lane);
-    sq += v[k] * v[k];
+  for (int q = 0; q < Q; ++q) {
+    if constexpr (std::is_same_v<TZ, float>) {
+      v4[q] = __ldg((const float4*)zr + q * 32 + lane);
+    } else {
+      // Four halves is one 8-byte load; `__half2` pairs widen without touching memory twice.
+      const __half2* h = (const __half2*)(zr + (q * 32 + lane) * 4);
+      const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+      v4[q] = make_float4(a.x, a.y, b.x, b.y);
+    }
+    sq += v4[q].x * v4[q].x + v4[q].y * v4[q].y + v4[q].z * v4[q].z + v4[q].w * v4[q].w;
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
   const float inv = rsqrtf(sq / (float)C + 1e-5f);
   #pragma unroll
-  for (int k = 0; k < K; ++k) v[k] *= inv * __ldg(normW + k * 32 + lane);
+  for (int q = 0; q < Q; ++q) {
+    const float4 w = __ldg(nw + q * 32 + lane);
+    v4[q].x *= inv * w.x; v4[q].y *= inv * w.y; v4[q].z *= inv * w.z; v4[q].w *= inv * w.w;
+  }
 
   // 🔴 ALL `heads` BUTTERFLIES AT ONCE, NOT ONE HEAD AT A TIME. A warp reduction is five dependent
   // shuffles; done in a loop the twelve of them serialise into sixty latencies and the kernel runs
@@ -195,8 +293,12 @@ pairBiasK(const float* __restrict__ z, const float* __restrict__ normW,
   #pragma unroll
   for (int h = 0; h < HEADS; ++h) {
     dot[h] = 0.f;
+    const float4* bw = (const float4*)(biasW + h * C);
     #pragma unroll
-    for (int k = 0; k < K; ++k) dot[h] += v[k] * __ldg(biasW + h * C + k * 32 + lane);
+    for (int q = 0; q < Q; ++q) {
+      const float4 b = __ldg(bw + q * 32 + lane);
+      dot[h] += v4[q].x * b.x + v4[q].y * b.y + v4[q].z * b.z + v4[q].w * b.w;
+    }
   }
   #pragma unroll
   for (int o = 16; o; o >>= 1) {
@@ -222,18 +324,19 @@ __global__ void biasPadK(T* __restrict__ bias, int n, int stride, int heads) {
   bias[(size_t)h * n * stride + (size_t)row * stride + col] = (T)0.f;
 }
 
-template <class T>
-inline void pairBias(const float* z, const std::string& normW, const std::string& biasW,
+template <class TZ, class T>
+inline void pairBias(const TZ* z, const std::string& normW, const std::string& biasW,
                      const float* pairMask, T* bias, int n, int stride, int heads, int C,
                      float scale) {
   const size_t pairs = (size_t)n * n;
   const unsigned grid = (unsigned)((pairs + 7) / 8);
+  static_assert(true, "");
   if (C == 384 && heads == 12) {
-    pairBiasK<T, 12, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
-                                                      stride, scale);
+    pairBiasK<TZ, T, 12, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                          stride, scale);
   } else if (C == 256 && heads == 12) {
-    pairBiasK<T, 8, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
-                                                     stride, scale);
+    pairBiasK<TZ, T, 8, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                         stride, scale);
   } else {
     fprintf(stderr, "pairBias: no kernel for %d channels and %d heads\n", C, heads);
     exit(1);
@@ -247,6 +350,16 @@ inline void pairBias(const float* z, const std::string& normW, const std::string
 __global__ void addIntoK(float* __restrict__ y, const float* __restrict__ x, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] += x[i];
+}
+template <class T>
+__global__ void addIntoTK(T* __restrict__ y, const float* __restrict__ x, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = (T)((float)y[i] + x[i]);
+}
+template <class T>
+__global__ void widenK(const T* __restrict__ x, float* __restrict__ y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = (float)x[i];
 }
 // y += x, but only where the row's mask is set (a masked row must stay exactly zero).
 __global__ void addIntoMaskedK(float* __restrict__ y, const float* __restrict__ x,
@@ -267,26 +380,26 @@ __global__ void mulSigmoidAddK(const float* __restrict__ a, const float* __restr
 }
 // As above, with the gate read CHANNEL-MAJOR: it comes out of the triangle's fused projection in
 // plane layout, and an index is cheaper than the GEMM that producing it separately would cost.
-template <class T>
+template <class T, class TZ>
 __global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __restrict__ gPlanes,
-                                        const float* __restrict__ pairMask, float* __restrict__ z,
+                                        const float* __restrict__ pairMask, TZ* __restrict__ z,
                                         size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   size_t p = i / C;
   if (pairMask && pairMask[p] == 0.f) return;
   const float g = (float)gPlanes[(size_t)(i - p * C) * rows + p];
-  z[i] += a[i] * (1.f / (1.f + __expf(-g)));
+  z[i] = (TZ)((float)z[i] + a[i] * (1.f / (1.f + __expf(-g))));
 }
 
-template <class T>
+template <class T, class TZ>
 __global__ void mulSigmoidAddGateK(const float* __restrict__ a, const T* __restrict__ gate,
-                                   const float* __restrict__ pairMask, float* __restrict__ z,
+                                   const float* __restrict__ pairMask, TZ* __restrict__ z,
                                    size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   if (pairMask && pairMask[i / C] == 0.f) return;
-  z[i] += a[i] * (1.f / (1.f + __expf(-(float)gate[i])));
+  z[i] = (TZ)((float)z[i] + a[i] * (1.f / (1.f + __expf(-(float)gate[i]))));
 }
 template <class T>
 __global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __restrict__ gate,
@@ -306,15 +419,18 @@ __global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __res
   zz.w += aa.w / (1.f + __expf(-g[3]));
   z[i] = zz;
 }
-template <class T>
-inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMask, float* z,
+template <class T, class TZ>
+inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMask, TZ* z,
                               size_t rows, int C) {
-  if ((C & 3) == 0 && ((((uintptr_t)a | (uintptr_t)z) & 15) == 0)) {
-    mulSigmoidAddGate4K<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
-        (const float4*)a, gate, pairMask, (float4*)z, rows, C >> 2);
-  } else {
-    mulSigmoidAddGateK<T><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gate, pairMask, z, rows, C);
+  if constexpr (std::is_same_v<TZ, float>) {
+    if ((C & 3) == 0 && ((((uintptr_t)a | (uintptr_t)z) & 15) == 0)) {
+      mulSigmoidAddGate4K<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+          (const float4*)a, gate, pairMask, (float4*)z, rows, C >> 2);
+      return;
+    }
   }
+  mulSigmoidAddGateK<T, TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gate, pairMask, z, rows,
+                                                                          C);
 }
 
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
@@ -354,12 +470,13 @@ inline void biasRelu(T* x, const float* bias, size_t rows, int C) {
   biasReluK<T><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(x, bias, rows, C);
 }
 // `z += x + bias` on the live pairs - the pair transition's down projection and its residual.
+template <class TZ>
 __global__ void biasAddK(const float* __restrict__ x, const float* __restrict__ bias,
-                         const float* __restrict__ pairMask, float* __restrict__ z, size_t rows, int C) {
+                         const float* __restrict__ pairMask, TZ* __restrict__ z, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
   if (pairMask && pairMask[i / C] == 0.f) return;
-  z[i] += x[i] + bias[i % C];
+  z[i] = (TZ)((float)z[i] + x[i] + bias[i % C]);
 }
 // Four at a time. The row length divides by four everywhere this runs, so a quad never straddles
 // two pairs and the mask is still one lookup a thread.
@@ -374,14 +491,17 @@ __global__ void biasAdd4K(const float4* __restrict__ x, const float* __restrict_
   zz.x += xx.x + bb.x; zz.y += xx.y + bb.y; zz.z += xx.z + bb.z; zz.w += xx.w + bb.w;
   z[i] = zz;
 }
-inline void biasAdd(const float* x, const float* bias, const float* pairMask, float* z, size_t rows,
+template <class TZ>
+inline void biasAdd(const float* x, const float* bias, const float* pairMask, TZ* z, size_t rows,
                     int C) {
-  if ((C & 3) == 0 && ((((uintptr_t)x | (uintptr_t)z | (uintptr_t)bias) & 15) == 0)) {
-    biasAdd4K<<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>((const float4*)x, bias, pairMask,
-                                                                   (float4*)z, rows, C >> 2);
-  } else {
-    biasAddK<<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(x, bias, pairMask, z, rows, C);
+  if constexpr (std::is_same_v<TZ, float>) {
+    if ((C & 3) == 0 && ((((uintptr_t)x | (uintptr_t)z | (uintptr_t)bias) & 15) == 0)) {
+      biasAdd4K<<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+          (const float4*)x, bias, pairMask, (float4*)z, rows, C >> 2);
+      return;
+    }
   }
+  biasAddK<TZ><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(x, bias, pairMask, z, rows, C);
 }
 // Zero every row the mask clears; the reference zeroes a padded token's whole row at several seams.
 __global__ void maskRowsK(float* __restrict__ x, const float* __restrict__ mask, size_t rows, int C) {
