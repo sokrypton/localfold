@@ -10,6 +10,9 @@ generated 53 residues, 265 atoms over 25 steps (52 trunk passes) -> design.pdb
   sampling 0.42 s
 ```
 
+A real job end to end - 100 residues, 60 steps, from the file to the PDB - is **1.74 s of wall
+clock**, of which 1.04 is the sampler and the rest is the weights and the featurisation.
+
 All ten of RFD4-Proteina's shipped presets generate: unconditional, fold-conditioned, motif
 scaffolding indexed and unindexed, protein-protein interface, DNA binding, a YAML binder job,
 small molecule, partial diffusion and inverse folding.
