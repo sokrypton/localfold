@@ -537,9 +537,9 @@ residues the cropped example does not contain, so building one from the spec fai
     | ~~`addGlobalAtomIdAnnotation`~~ **done** | 499-504 | `atom_id` after the filter, not before |
     | ~~`annotateCovalentModificationsAndAtomize`~~ **done** | 510-562 | real peptide bonds, so `atomize` means something |
     | ~~`addGlobalTokenIdAnnotation`~~ **done** | 567-584 | one token a residue, or one an ATOM where it is atomised |
-    | `finalizeAndCanonicalizeSequenceConditioning` | 629-708 | a real sequence to canonicalise |
-    | `featurizeExpandedSegments` | 713-747 | the inference deletion block fires |
-    | `materializeInternalCoords` | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
+    | ~~`finalizeAndCanonicalizeSequenceConditioning`~~ **done** | 629-708 | a real sequence to canonicalise |
+    | ~~`featurizeExpandedSegments`~~ **done** | 713-747 | the inference deletion block fires |
+    | ~~`materializeInternalCoords`~~ **done** | 752-817 | 🔴 `prng.randomSO3()` per coordinate group - A DRAW |
     | `unindexFlaggedTokens` | 822-1027 | 🔴 the whole 200-line body, which a contig skips entirely |
     | `centerAndFeaturizeCentroid` | 1032-1108 | the recentering on conditioned coordinates |
     | `buildAtom37Slots` | 1131-1145 | 🔴 real slots, so `convertToProteinaBatch`'s per-atom loop (1405-1442, 1475-1486) stops being a no-op |
@@ -560,6 +560,29 @@ residues the cropped example does not contain, so building one from the spec fai
     then watched failing on exactly one of them: the `OP3` rule, the `OXT` rule, `resDiff === 1`,
     `sameChain`, and the atomised branch of the token numbering. **Four of the five were
     unreachable before those cases existed.**
+
+    🔴 **AND `finalizeAndCanonicalizeSequenceConditioning`'s BACKBONE EXEMPTION IS INVISIBLE
+    WHILE THE SEQUENCE IS GIVEN.** The stage reveals a residue's name only where the atom is not
+    ALREADY conditioned, and every shipped motif conditions its sequence - so deleting the
+    `is_*_backbone` test changed nothing on eleven cases. A twelfth (`+masked`, the same motif
+    with every `condition_sequence_1_residue` set to `<M>`) separates a residue whose conditioned
+    coordinates are backbone-only from one with a conditioned side chain, and the mutation moves
+    20 atoms there. The deletion of an all-`NaN` probability column is the other live convention
+    (`5o45_cropped` keeps **0** of the 28 where the others keep all 28), which is why the gate
+    compares the SET of column names and not only their values. One clause genuinely cannot be
+    falsified - the `|| !allowed` in `conditioned` - and `atoms.h` says why rather than leaving
+    it looking untested.
+
+    🔴 **AND THE DRAW THIS TABLE HAS BEEN WARNING ABOUT SINCE IT WAS WRITTEN IS NOW COVERED, BY
+    TWO CASES THAT HAD TO BE BUILT.** Not one shipped structure has a POSITIVE
+    `condition_CoordinateGroup_1_atom`, so `materializeInternalCoords` never reached its
+    `randomSO3` at all. `+coordgroups` gives a structure two groups (one cannot tell a per-group
+    draw from one draw shared by all), and `+icgroups` gives a NON-EXPANDING structure two groups
+    with the first's internal coordinates already set, so that group is skipped and the second
+    must take the FIRST rotation. Four orderings were then watched failing: drawing before the
+    `allFinite` skip, drawing once for every group, filling the nine normals column-major, and
+    taking `u2` before `u1`. **Every one of them produces a perfectly valid rotation and a stream
+    one draw out** - which is the whole reason the warning was there.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

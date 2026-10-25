@@ -1009,7 +1009,40 @@ int run(int argc, char** argv) {
         rfd4p::atoms::addGlobalAtomIdAnnotation(arr);
         rfd4p::atoms::annotateCovalentModificationsAndAtomize(arr);
         rfd4p::atoms::addGlobalTokenIdAnnotation(arr);
+        rfd4p::atoms::finalizeAndCanonicalizeSequenceConditioning(arr);
+        rfd4p::atoms::featurizeExpandedSegments(arr);
+        // 🔴 THE SAME `prng` THE REALISATION USED, NOT A FRESH ONE. `materializeInternalCoords`
+        // draws from the pipeline's single stream, so handing it its own generator would agree
+        // with the reference only where neither stage draws anything.
+        rfd4p::atoms::materializeInternalCoords(arr, prng);
         printf("atomized\t%zu\n", arr.n());
+        {
+          const vector<int>& g = arr.ann.ints["condition_CoordinateGroup_1_atom"];
+          const vector<double>& ic = arr.ann.floats["condition_InternalCoordinate_1_atom"];
+          for (size_t i = 0; i < arr.n(); ++i) {
+            printf("azic\t%d\t%.17g\t%.17g\t%.17g\n", i < g.size() ? g[i] : -1,
+                   ic.size() == arr.n() * 3 ? ic[i * 3] : NAN,
+                   ic.size() == arr.n() * 3 ? ic[i * 3 + 1] : NAN,
+                   ic.size() == arr.n() * 3 ? ic[i * 3 + 2] : NAN);
+          }
+        }
+        for (size_t i = 0; i < arr.n(); ++i) {
+          printf("azxyz\t%.17g\t%.17g\t%.17g\n", arr.site.x[i], arr.site.y[i], arr.site.z[i]);
+        }
+        for (const string& s : arr.ann.strings["condition_sequence_1_residue"]) {
+          printf("azseq\t%s\n", s.c_str());
+        }
+        // 🔴 THE COLUMNS THAT EXIST, NAMED - because the stage DELETES one that ends up entirely
+        // NaN, and a comparison over a fixed list of 28 cannot tell an absent column from a
+        // present one full of NaN.
+        for (const char* tok : rfd4p::tables::STANDARD_POLYMER_RESIDUES) {
+          const string key = string("condition_sequence-probability-") + tok + "_1_residue";
+          auto it = arr.ann.floats.find(key);
+          if (it == arr.ann.floats.end()) continue;
+          printf("azprob\t%s", tok);
+          for (double v : it->second) printf("\t%.17g", v);
+          printf("\n");
+        }
         for (size_t i = 0; i < arr.n(); ++i) {
           printf("az\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n", arr.site.resName[i].c_str(),
                  arr.site.atomName[i].c_str(), arr.site.element[i].c_str(), arr.site.resId[i],

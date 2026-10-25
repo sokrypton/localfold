@@ -35,6 +35,36 @@ struct PipelineRng {
   int nextInt(int lo, int hiExclusive) {
     return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
   }
+  /**
+   * A uniformly random rotation: nine Box-Muller normals, then Gram-Schmidt.
+   *
+   * 🔴 EIGHTEEN DRAWS, ROW BY ROW, AND THE ORDER IS THE CONTRACT. Each of the nine entries takes
+   * `u1` then `u2` in that order, and `u1` is floored at 1e-12 BEFORE the log - so a port that
+   * draws both up front, or fills column-major, produces a perfectly valid rotation from a
+   * different point in the stream and every later draw in the pipeline moves with it.
+   */
+  void randomSO3(double R[3][3]) {
+    double m[3][3];
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        const double u1 = std::max(1e-12, nextFloat());
+        const double u2 = nextFloat();
+        m[i][j] = std::sqrt(-2.0 * lf::jsmath::log(u1)) * lf::jsmath::cos(2.0 * M_PI * u2);
+      }
+    }
+    double n0 = lf::jsmath::hypot(m[0][0], m[0][1], m[0][2]);
+    if (n0 == 0.0) n0 = 1.0;
+    for (int k = 0; k < 3; ++k) R[0][k] = m[0][k] / n0;
+    const double d10 = m[1][0] * R[0][0] + m[1][1] * R[0][1] + m[1][2] * R[0][2];
+    double v1[3];
+    for (int k = 0; k < 3; ++k) v1[k] = m[1][k] - d10 * R[0][k];
+    double n1 = lf::jsmath::hypot(v1[0], v1[1], v1[2]);
+    if (n1 == 0.0) n1 = 1.0;
+    for (int k = 0; k < 3; ++k) R[1][k] = v1[k] / n1;
+    R[2][0] = R[0][1] * R[1][2] - R[0][2] * R[1][1];
+    R[2][1] = R[0][2] * R[1][0] - R[0][0] * R[1][2];
+    R[2][2] = R[0][0] * R[1][1] - R[0][1] * R[1][0];
+  }
 };
 
 struct AtomArray {
@@ -618,6 +648,232 @@ inline vector<int> tokenStarts(const AtomArray& a) {
 inline void addGlobalAtomIdAnnotation(AtomArray& a) {
   a.atomId.resize(a.n());
   for (size_t i = 0; i < a.n(); ++i) a.atomId[i] = (int)i;
+}
+
+/** The residues whose sequence identity may be CONDITIONED - the amino acids and the RNA bases,
+ *  the two token types whose name the conditioning vocabulary can express. */
+inline const std::unordered_set<string>& conditionableResidues() {
+  static const std::unordered_set<string> s = [] {
+    std::unordered_set<string> out;
+    for (const char* key : {"aa", "rna"}) {
+      auto it = tables::RESIDUES_BY_TOKEN_TYPE.find(key);
+      if (it != tables::RESIDUES_BY_TOKEN_TYPE.end()) out.insert(it->second.begin(),
+                                                                 it->second.end());
+    }
+    return out;
+  }();
+  return s;
+}
+
+/**
+ * `finalizeAndCanonicalizeSequenceConditioning`: the sequence condition is settled, then the
+ * per-residue probability columns are rewritten to agree with it.
+ *
+ * 🔴 A RESIDUE THE VOCABULARY CANNOT NAME IS CONDITIONED BY BEING ITSELF. `conditioned` is
+ * `existing || !allowed`, so a ligand or a modified residue counts as conditioned without any
+ * annotation asking for it - it has no `<M>` to hide behind, and the model is told what it is.
+ * That `|| !allowed` is PROVABLY INERT and is kept because the reference has it: `conditioned`
+ * is read only to decide whether the spread overwrites `sequence` with the residue's own name,
+ * and for a residue the vocabulary cannot name the first loop has already written exactly that.
+ * It cannot be falsified by any input, so it is recorded here rather than left looking untested.
+ *
+ * 🔴 AND THE REQUIREMENT SPREADS OVER A TOKEN, NOT A RESIDUE. One atom with conditioned
+ * coordinates off the backbone makes its WHOLE token required, which for an atomised residue is
+ * that one atom and for an ordinary one is all of it - so the same geometry means different
+ * things either side of `atomize`, and reading residues here would be wrong in exactly the
+ * atomised case the stage before this one creates.
+ *
+ * 🔴 AND A PROBABILITY COLUMN THAT ENDS UP ENTIRELY `NaN` IS DELETED RATHER THAN KEPT. An empty
+ * column and an absent one are different inputs downstream; writing 28 columns of NaN where the
+ * reference writes none is a difference no per-atom comparison of the columns that DO exist can
+ * see.
+ */
+inline void finalizeAndCanonicalizeSequenceConditioning(AtomArray& a) {
+  const size_t n = a.n();
+  vector<string> seqIn(n, "<M>");
+  auto cSeqIt = a.ann.strings.find("condition_sequence_1_residue");
+  if (cSeqIt != a.ann.strings.end() && cSeqIt->second.size() == n) seqIn = cSeqIt->second;
+  auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+  const vector<double>* crd =
+      crdIt != a.ann.floats.end() && crdIt->second.size() == n * 3 ? &crdIt->second : nullptr;
+  auto grpIt = a.ann.ints.find("condition_CoordinateGroup_1_atom");
+  const vector<int>* grp =
+      grpIt != a.ann.ints.end() && grpIt->second.size() == n ? &grpIt->second : nullptr;
+
+  vector<string> sequence(n);
+  vector<uint8_t> conditioned(n, 0), required(n, 0);
+  for (size_t i = 0; i < n; ++i) {
+    const bool allowed = conditionableResidues().count(a.site.resName[i]) > 0;
+    const bool existing = seqIn[i] != "<M>";
+    sequence[i] = allowed ? seqIn[i] : a.site.resName[i];
+    conditioned[i] = (existing || !allowed) ? 1 : 0;
+    bool req = conditioned[i] || (a.atomize.size() == n && a.atomize[i]);
+    const bool hasCrd =
+        (crd && std::isfinite((*crd)[i * 3]) && std::isfinite((*crd)[i * 3 + 1]) &&
+         std::isfinite((*crd)[i * 3 + 2])) ||
+        (grp && (*grp)[i] > 0);
+    if (hasCrd) {
+      const bool backbone = a.isProteinBackbone[i] || a.isRnaBackbone[i] || a.isDnaBackbone[i];
+      if (!backbone) req = true;
+    }
+    required[i] = req ? 1 : 0;
+  }
+
+  const vector<int> tokens = tokenStarts(a);
+  for (size_t t = 0; t + 1 < tokens.size(); ++t) {
+    const int s = tokens[t], e = tokens[t + 1];
+    bool any = false;
+    for (int i = s; i < e && !any; ++i) any = required[i] != 0;
+    if (!any) continue;
+    for (int i = s; i < e; ++i) {
+      if (!conditioned[i]) sequence[i] = a.site.resName[i];
+    }
+  }
+  a.ann.strings["condition_sequence_1_residue"] = sequence;
+
+  const vector<int> res = cif::residueSegments(a.site);
+  vector<uint8_t> seqAtoms(n, 0);
+  for (size_t r = 0; r + 1 < res.size(); ++r) {
+    const int s = res[r], e = res[r + 1];
+    bool any = false;
+    for (int i = s; i < e && !any; ++i) any = sequence[i] != "<M>";
+    if (any) for (int i = s; i < e; ++i) seqAtoms[i] = 1;
+  }
+
+  for (const char* tok : tables::STANDARD_POLYMER_RESIDUES) {
+    const string key = string("condition_sequence-probability-") + tok + "_1_residue";
+    auto it = a.ann.floats.find(key);
+    vector<double> prob = it != a.ann.floats.end() && it->second.size() == n
+                              ? it->second
+                              : vector<double>(n, NAN);
+    bool anyMask = false;
+    for (size_t i = 0; i < n; ++i) {
+      if (seqAtoms[i]) {
+        prob[i] = sequence[i] == tok ? 1.0 : 0.0;
+        anyMask = true;
+      } else if (!std::isfinite(prob[i])) {
+        prob[i] = NAN;
+      } else {
+        anyMask = true;
+      }
+    }
+    if (anyMask) a.ann.floats[key] = prob;
+    else a.ann.floats.erase(key);
+  }
+}
+
+/**
+ * `featurizeExpandedSegments`: at inference an expanded segment nobody indexed is DELETED, and
+ * whatever expanded segment is left has its coordinates zeroed.
+ *
+ * 🔴 THE DELETION IS INFERENCE-ONLY AND THE ZEROING IS NOT. Training keeps the unindexed
+ * segments and still zeroes them, so the two halves are not one switch - reading the stage as
+ * "drop the expanded segments" would zero nothing on the training path and delete too much on
+ * neither.
+ *
+ * 🔴 AND AN ATOM IS UNINDEXED WHEN `condition_index_1_residue` IS FALSEY, WHICH INCLUDES ZERO.
+ * The column is an int and the reference tests `!cIdx[i]`, so index 0 is unindexed - not a
+ * missing value, an actual zero, which is what an unindexed motif carries.
+ */
+inline void featurizeExpandedSegments(AtomArray& a, bool isInference = true) {
+  auto segIt = a.ann.ints.find("annotation_expsegmin_1_residue");
+  if (segIt == a.ann.ints.end()) return;
+  bool hasExp = false;
+  for (size_t i = 0; i < a.n() && !hasExp; ++i) hasExp = segIt->second[i] != -1;
+  if (!hasExp) return;
+
+  auto idxIt = a.ann.ints.find("condition_index_1_residue");
+  if (isInference && idxIt != a.ann.ints.end()) {
+    const vector<int>& seg = segIt->second;
+    const vector<int>& idx = idxIt->second;
+    vector<int> keep;
+    keep.reserve(a.n());
+    for (size_t i = 0; i < a.n(); ++i) {
+      if (!(seg[i] != -1 && idx[i] == 0)) keep.push_back((int)i);
+    }
+    if (keep.size() < a.n()) a = slice(a, keep);
+  }
+  const vector<int>& seg = a.ann.ints["annotation_expsegmin_1_residue"];
+  for (size_t i = 0; i < a.n(); ++i) {
+    if (seg[i] != -1) { a.site.x[i] = 0.0; a.site.y[i] = 0.0; a.site.z[i] = 0.0; }
+  }
+}
+
+/**
+ * `materializeInternalCoords`: every positive coordinate GROUP whose internal coordinates are
+ * not all set gets its members' positions, centred on the group and turned by a random rotation.
+ *
+ * 🔴 THE DRAW HAPPENS PER QUALIFYING GROUP, AFTER THE `continue`, IN ASCENDING GROUP ORDER - and
+ * NOT AT ALL where a rotation is supplied, because the reference writes
+ * `(rotations && rotations[gid]) || prng.randomSO3()` and `||` short-circuits. Three ways to get
+ * the stream wrong without getting the geometry wrong: drawing for every group rather than the
+ * ones that need it, drawing before the `allFinite` test, and drawing even when a rotation was
+ * given. This port has already been bitten twice by a draw that happens where it looks as
+ * though it should not.
+ *
+ * 🔴 AND THE GROUP COLUMN IS CREATED HERE WHERE IT IS ABSENT, as 0 for an atom with finite
+ * conditioned coordinates and -1 for one without - so a structure that never mentions groups
+ * still gets the column, and every group in it is 0, which is not positive and draws nothing.
+ */
+inline void materializeInternalCoords(AtomArray& a, PipelineRng& prng,
+                                      const std::map<int, std::array<std::array<double, 3>, 3>>&
+                                          rotations = {}) {
+  const size_t n = a.n();
+  if (!a.ann.ints.count("condition_CoordinateGroup_1_atom")) {
+    auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+    const vector<double>* crd =
+        crdIt != a.ann.floats.end() && crdIt->second.size() == n * 3 ? &crdIt->second : nullptr;
+    vector<int>& g = a.ann.ints["condition_CoordinateGroup_1_atom"];
+    g.assign(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+      const bool known = crd && std::isfinite((*crd)[i * 3]) &&
+                         std::isfinite((*crd)[i * 3 + 1]) && std::isfinite((*crd)[i * 3 + 2]);
+      g[i] = known ? 0 : -1;
+    }
+  }
+  if (!a.ann.floats.count("condition_InternalCoordinate_1_atom")) {
+    a.ann.floats["condition_InternalCoordinate_1_atom"].assign(n * 3, NAN);
+  }
+  const vector<int>& groups = a.ann.ints["condition_CoordinateGroup_1_atom"];
+  vector<double>& payload = a.ann.floats["condition_InternalCoordinate_1_atom"];
+
+  std::set<int> positive;
+  for (size_t i = 0; i < n; ++i) if (groups[i] > 0) positive.insert(groups[i]);
+  if (positive.empty()) return;
+
+  for (const int gid : positive) {
+    vector<int> members;
+    bool allFinite = true;
+    for (size_t i = 0; i < n; ++i) {
+      if (groups[i] != gid) continue;
+      members.push_back((int)i);
+      if (!std::isfinite(payload[i * 3]) || !std::isfinite(payload[i * 3 + 1]) ||
+          !std::isfinite(payload[i * 3 + 2])) {
+        allFinite = false;
+      }
+    }
+    if (allFinite || members.empty()) continue;
+
+    double mx = 0, my = 0, mz = 0;
+    for (const int i : members) { mx += a.site.x[i]; my += a.site.y[i]; mz += a.site.z[i]; }
+    mx /= (double)members.size();
+    my /= (double)members.size();
+    mz /= (double)members.size();
+
+    double R[3][3];
+    auto given = rotations.find(gid);
+    if (given != rotations.end()) {
+      for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) R[r][c] = given->second[r][c];
+    } else {
+      prng.randomSO3(R);
+    }
+    for (const int i : members) {
+      const double cx = a.site.x[i] - mx, cy = a.site.y[i] - my, cz = a.site.z[i] - mz;
+      payload[i * 3] = cx * R[0][0] + cy * R[0][1] + cz * R[0][2];
+      payload[i * 3 + 1] = cx * R[1][0] + cy * R[1][1] + cz * R[1][2];
+      payload[i * 3 + 2] = cx * R[2][0] + cy * R[2][1] + cz * R[2][2];
+    }
+  }
 }
 
 }  // namespace atoms

@@ -20,6 +20,9 @@ import {
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
   addGlobalAtomIdAnnotation, annotateCovalentModificationsAndAtomize,
   addGlobalTokenIdAnnotation,
+  finalizeAndCanonicalizeSequenceConditioning,
+  featurizeExpandedSegments,
+  materializeInternalCoords,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -69,6 +72,90 @@ function withExtraAtom(text, resNames, atomName, element) {
     return lines.join("\n");
   }
   throw new Error(`no row for ${resNames.join("/")}`);
+}
+
+/**
+ * The same structure with a `condition_CoordinateGroup_1_atom` column giving the first `count`
+ * atoms group 1, the next `count` group 2, and everything else -1.
+ *
+ * 🔴 BECAUSE NOT ONE SHIPPED STRUCTURE HAS A POSITIVE COORDINATE GROUP, so
+ * `materializeInternalCoords` never reaches its `randomSO3` draw - and that draw is the one the
+ * README has been warning about since the stage table was written. Two groups rather than one,
+ * because the draw happens PER GROUP in ascending order and a single group cannot tell a
+ * correct stream from one that draws once for all of them.
+ */
+function withCoordinateGroups(text, count = 12) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const existing = cols.indexOf("condition_CoordinateGroup_1_atom");
+  let seen = 0;
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length + (existing < 0 ? 0 : 0)) continue;
+    const gid = seen < count ? "1" : seen < count * 2 ? "2" : "-1";
+    if (existing >= 0) tok[existing] = gid;
+    else tok.push(gid);
+    lines[i] = tok.join(" ");
+    seen += 1;
+  }
+  if (existing < 0) lines.splice(end, 0, "_atom_site.condition_CoordinateGroup_1_atom ");
+  return lines.join("\n");
+}
+
+/**
+ * The same structure with `condition_InternalCoordinate_1_atom` already SET for atoms
+ * `0..count-1`, in the `idx0`/`val0..val2` loop the three-wide annotations take.
+ *
+ * 🔴 BECAUSE A GROUP THAT IS ALREADY COMPLETE DRAWS NOTHING, and that is the half of the RNG
+ * order the two-group case cannot see. Paired with `withCoordinateGroups` on a structure that
+ * does NOT expand (so the file's atom indices are still the stage's), group 1 is skipped and
+ * group 2 takes the FIRST rotation - a port that drew before the `allFinite` test would hand it
+ * the second, with geometry that is perfectly valid and a stream that is one rotation out.
+ */
+function withInternalCoords(text, count = 12) {
+  const rows = [];
+  for (let i = 0; i < count; i += 1) rows.push(`${i} ${i * 0.5} ${i * 0.25} ${i * 0.125}`);
+  const block = ["#", "loop_",
+    "_condition_InternalCoordinate_1_atom.idx0",
+    "_condition_InternalCoordinate_1_atom.val0",
+    "_condition_InternalCoordinate_1_atom.val1",
+    "_condition_InternalCoordinate_1_atom.val2",
+    ...rows, "#", ""];
+  return `${text.replace(/\s*$/, "")}\n${block.join("\n")}`;
+}
+
+/**
+ * The same structure with every residue's sequence condition set back to `<M>`.
+ *
+ * 🔴 BECAUSE THE BACKBONE EXEMPTION IS INVISIBLE WHILE THE SEQUENCE IS ALREADY CONDITIONED.
+ * `finalizeAndCanonicalizeSequenceConditioning` spreads "required" over a token and then reveals
+ * the residue name only where the atom is NOT already conditioned - so on the shipped motifs,
+ * whose sequence is given, removing the `is_*_backbone` test changes nothing at all. Masked, the
+ * same structure separates a residue whose conditioned coordinates are backbone-only (which must
+ * stay `<M>`) from one with a conditioned side chain (which must be revealed).
+ */
+function withMaskedSequence(text) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const col = cols.indexOf("condition_sequence_1_residue");
+  if (col < 0) throw new Error("no condition_sequence column");
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length) continue;
+    tok[col] = "<M>";
+    lines[i] = tok.join(" ");
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -182,6 +269,10 @@ cases.set("dna_7m5w+OP3",
 cases.set("ppi_pdl1+crosslink", withDeclaredBond(cases.get("ppi_pdl1")));
 cases.set("ppi_pdl1+interchain",
   withDeclaredBond(withDuplicatedChain(cases.get("ppi_pdl1")), { crossChain: true }));
+cases.set("motif_idx_1prw+masked", withMaskedSequence(cases.get("motif_idx_1prw")));
+cases.set("motif_idx_1prw+coordgroups", withCoordinateGroups(cases.get("motif_idx_1prw")));
+cases.set("5o45_cropped+icgroups",
+  withInternalCoords(withCoordinateGroups(cases.get("5o45_cropped"))));
 
 let structures = 0;
 let differing = 0;
@@ -425,40 +516,101 @@ for (const [name, text] of cases) {
   // `annotateCovalentModificationsAndAtomize` and `addGlobalTokenIdAnnotation`, on top of the
   // realised array - the four stages that decide which atoms survive and where the tokens fall.
   {
-    const realized = realizeExpandableSegments(js, { rng: createSeededRng(0) });
+    const rng = createSeededRng(0);
+    const realized = realizeExpandableSegments(js, { rng });
     const filtered = filterUnwantedAtoms(realized);
     addGlobalAtomIdAnnotation(filtered);
     annotateCovalentModificationsAndAtomize(filtered);
     addGlobalTokenIdAnnotation(filtered);
+    finalizeAndCanonicalizeSequenceConditioning(filtered);
+    // `featurizeExpandedSegments` can DELETE atoms, so it runs before the count is compared and
+    // its result is what every column below is held to.
+    const expanded = featurizeExpandedSegments(filtered);
+    // 🔴 THE SAME GENERATOR THE REALISATION USED. `materializeInternalCoords` draws from the
+    // pipeline's one stream, so the gate must advance a single `rng` across both stages or it
+    // agrees only where neither draws.
+    materializeInternalCoords(expanded, { rng });
     const out3 = execFileSync(binary, ["x", `--dump-cif=${path}`, "--atomize"],
       { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
     const got = out3.filter((l) => l.startsWith("az\t")).map((l) => l.split("\t").slice(1));
     const gotBonds = out3.filter((l) => l.startsWith("azbond\t"))
       .map((l) => l.split("\t").slice(1).map(Number));
-    if (got.length !== filtered.nAtoms) {
-      wrong.push(`atomized ${got.length} vs ${filtered.nAtoms}`);
+    if (got.length !== expanded.nAtoms) {
+      wrong.push(`atomized ${got.length} vs ${expanded.nAtoms}`);
     } else {
       const after = [
-        ["az res_name", 0, (v) => v, filtered.res_name],
-        ["az atom_name", 1, (v) => v, filtered.atom_name],
-        ["az element", 2, (v) => v, filtered.element],
-        ["az res_id", 3, Number, filtered.res_id],
-        ["az atom_id", 4, Number, filtered.atom_id],
-        ["az token_id", 5, Number, filtered.token_id],
-        ["az atomize", 6, Number, filtered.atomize.map((v) => (v ? 1 : 0))],
+        ["az res_name", 0, (v) => v, expanded.res_name],
+        ["az atom_name", 1, (v) => v, expanded.atom_name],
+        ["az element", 2, (v) => v, expanded.element],
+        ["az res_id", 3, Number, expanded.res_id],
+        ["az atom_id", 4, Number, expanded.atom_id],
+        ["az token_id", 5, Number, expanded.token_id],
+        ["az atomize", 6, Number, expanded.atomize.map((v) => (v ? 1 : 0))],
         ["az is_covalent_modification", 7, Number,
-          filtered.is_covalent_modification.map((v) => (v ? 1 : 0))],
+          expanded.is_covalent_modification.map((v) => (v ? 1 : 0))],
       ];
       for (const [label, at, cast, want] of after) {
         if (!want) continue;
         const bad = got.filter((r, i) => !eq(cast(r[at]), want[i])).length;
         if (bad) wrong.push(`${label} ${bad}`);
       }
-      if (gotBonds.length !== filtered.bonds.length) wrong.push("az bonds length");
+      if (gotBonds.length !== expanded.bonds.length) wrong.push("az bonds length");
       else {
-        const bad = gotBonds.filter((b, i) => b[0] !== filtered.bonds[i][0]
-          || b[1] !== filtered.bonds[i][1] || b[2] !== filtered.bonds[i][2]).length;
+        const bad = gotBonds.filter((b, i) => b[0] !== expanded.bonds[i][0]
+          || b[1] !== expanded.bonds[i][1] || b[2] !== expanded.bonds[i][2]).length;
         if (bad) wrong.push(`az bonds ${bad}`);
+      }
+
+      // `finalizeAndCanonicalizeSequenceConditioning`: the settled sequence, and the probability
+      // columns that SURVIVE it - compared as a SET of names as well as values, because the
+      // stage deletes a column that ends up entirely NaN and an absent column is not an empty one.
+      // `featurizeExpandedSegments` zeroes every expanded segment's coordinates, so the
+      // coordinates are compared here and not only at the realise stage.
+      const xyz = out3.filter((l) => l.startsWith("azxyz\t"))
+        .map((l) => l.split("\t").slice(1).map(Number));
+      if (xyz.length !== expanded.nAtoms) wrong.push(`az xyz ${xyz.length}`);
+      else {
+        const bad = xyz.filter((c, i) => !eq(c[0], expanded.coord[i][0])
+          || !eq(c[1], expanded.coord[i][1]) || !eq(c[2], expanded.coord[i][2])).length;
+        if (bad) wrong.push(`az xyz ${bad}`);
+      }
+      // `materializeInternalCoords`: the group column it creates where there is none, and the
+      // internal coordinates it fills - which is where the pipeline's RNG is next consumed.
+      const ic = out3.filter((l) => l.startsWith("azic\t"))
+        .map((l) => l.split("\t").slice(1).map(Number));
+      const wantGroup = expanded.annotations["condition_CoordinateGroup_1_atom"];
+      const wantIc = expanded.annotations["condition_InternalCoordinate_1_atom"];
+      if (ic.length !== expanded.nAtoms) wrong.push(`az ic ${ic.length}`);
+      else {
+        const badG = ic.filter((r, i) => r[0] !== wantGroup[i]).length;
+        if (badG) wrong.push(`az coord-group ${badG}`);
+        const badI = ic.filter((r, i) => !eq(r[1], wantIc[i][0]) || !eq(r[2], wantIc[i][1])
+          || !eq(r[3], wantIc[i][2])).length;
+        if (badI) wrong.push(`az internal-coord ${badI}`);
+      }
+      const seq = out3.filter((l) => l.startsWith("azseq\t")).map((l) => l.split("\t")[1]);
+      const wantSeq = expanded.annotations["condition_sequence_1_residue"];
+      if (seq.length !== wantSeq.length) wrong.push(`az sequence ${seq.length} vs ${wantSeq.length}`);
+      else {
+        const bad = seq.filter((v, i) => v !== wantSeq[i]).length;
+        if (bad) wrong.push(`az sequence ${bad}`);
+      }
+      const gotProb = new Map(out3.filter((l) => l.startsWith("azprob\t")).map((l) => {
+        const f = l.split("\t");
+        return [f[1], f.slice(2).map(Number)];
+      }));
+      const wantProb = new Map(Object.entries(expanded.annotations)
+        .filter(([k]) => k.startsWith("condition_sequence-probability-"))
+        .map(([k, v]) => [k.slice("condition_sequence-probability-".length, -"_1_residue".length), v]));
+      const onlyGot = [...gotProb.keys()].filter((k) => !wantProb.has(k));
+      const onlyWant = [...wantProb.keys()].filter((k) => !gotProb.has(k));
+      if (onlyGot.length) wrong.push(`az prob extra ${onlyGot.join(",")}`);
+      if (onlyWant.length) wrong.push(`az prob missing ${onlyWant.join(",")}`);
+      for (const [k, want] of wantProb) {
+        const got = gotProb.get(k);
+        if (!got) continue;
+        const bad = got.filter((v, i) => !eq(v, want[i])).length;
+        if (bad) wrong.push(`az prob ${k} ${bad}`);
       }
     }
   }
