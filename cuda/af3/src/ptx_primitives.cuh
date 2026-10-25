@@ -161,6 +161,7 @@ __device__ __forceinline__ void ptx_st_shared_u16(void* p, unsigned short v) {
   uint32_t a = ptx_smem_addr(p);
   asm volatile("st.shared.b16 [%0], %1;" :: "r"(a), "h"(v) : "memory");
 }
+__device__ __forceinline__ void ptx_st_shared_b16(void* p, unsigned short v) { ptx_st_shared_u16(p, v); }
 __device__ __forceinline__ void ptx_st_shared_v2_f32(void* p, float2 v) {
   uint32_t a = ptx_smem_addr(p);
   asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(v.x), "f"(v.y) : "memory");
