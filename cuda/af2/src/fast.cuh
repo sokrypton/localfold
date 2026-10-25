@@ -31,8 +31,23 @@ inline const void* biasFor(const float* bias, int n, bool asHalf) {
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
   return copies[bias] = h;
 }
-__global__ void toBf16FK(const float* x, __nv_bfloat16* y, size_t n) {
+__global__ void __launch_bounds__(256, 8)
+toBf16FK(const float* __restrict__ x, __nv_bfloat16* __restrict__ y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((n & 7) == 0 && (((uintptr_t)x | (uintptr_t)y) & 15) == 0) {
+    size_t i8 = i << 3;
+    if (i8 < n) {
+      float4 v0 = ptx_ldg_v4_f32(x + i8);
+      float4 v1 = ptx_ldg_v4_f32(x + i8 + 4);
+      uint4 u;
+      u.x = ptx_cvt_bf16x2_f32(v0.x, v0.y);
+      u.y = ptx_cvt_bf16x2_f32(v0.z, v0.w);
+      u.z = ptx_cvt_bf16x2_f32(v1.x, v1.y);
+      u.w = ptx_cvt_bf16x2_f32(v1.z, v1.w);
+      ptx_st_global_v4_u32(y + i8, u);
+    }
+    return;
+  }
   if (i < n) ptx_st_global_u16(y + i, ptx_f32_to_bf16_raw(ptx_ldg_f32(x + i)));
 }
 // bf16: X, Wt and Y all bf16 (cuBLASLt takes no f16-in, bf16-out GEMM) - the bf16 MSA's (MSA16); the bias a bf16 copy
@@ -42,7 +57,7 @@ inline const void* biasForBf16(const float* bias, int n) {
   auto it = copies.find(bias);
   if (it != copies.end()) return it->second;
   __nv_bfloat16* h = wpool<__nv_bfloat16>(n);
-  toBf16FK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
+  toBf16FK<<<blocks((n & 7) == 0 ? (n >> 3) : n), 256, 0, STREAM>>>(bias, h, n);
   return copies[bias] = h;
 }
 inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,

@@ -145,7 +145,8 @@ addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const
       pairSt<PT>(pair, k, pairLd<PT>(pair, k) + (toF(x[k]) + (bias128 ? ptx_ldg_f32(bias128 + (k & 127)) * biasScale : 0.f)));
   }
 }
-__global__ void pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, size_t n) {
+__global__ void __launch_bounds__(256, 8)
+pairBf16ToF32K(const __nv_bfloat16* __restrict__ in, float* __restrict__ out, size_t n) {
   size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (i + 3 < n) ptx_st_global_v4_f32(out + i, pairLd4<__nv_bfloat16>(reinterpret_cast<const float*>(in), i));
   else for (size_t k = i; k < n; ++k) ptx_st_global_f32(out + k, toF(in[k]));
@@ -255,10 +256,34 @@ __global__ void pairOuterSumK(float* pair, const float* left, const float* right
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / L), j = (int)(ij % L);
   pairSt<PT>(pair, t, ptx_add_f32(ptx_ldg_f32(left + (size_t)i * C + c), ptx_ldg_f32(right + (size_t)j * C + c)));
 }
-__global__ void msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ bias, const int* __restrict__ aatype,
-                             const float* __restrict__ wP1d, const float* __restrict__ bP1d,
-                             const float* __restrict__ prevRowLn, size_t rows, int L, int C) {
+__global__ void __launch_bounds__(256, 8)
+msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ bias, const int* __restrict__ aatype,
+             const float* __restrict__ wP1d, const float* __restrict__ bP1d,
+             const float* __restrict__ prevRowLn, size_t rows, int L, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (C == 256) {
+    if (t >= rows * 64) return;
+    int c = (int)(t & 63) << 2;
+    size_t row = t >> 6;
+    int i = (int)((unsigned)row % (unsigned)L);
+    int a = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(aatype + i), 0), 19);
+    size_t idx = t << 2;
+    float4 mv = ptx_ld_global_v4_f32(msa + idx);
+    float4 bv = ptx_ldg_v4_f32(bias + c);
+    float4 wv = ptx_ldg_v4_f32(wP1d + a * 256 + c);
+    float4 bp = ptx_ldg_v4_f32(bP1d + c);
+    mv.x = ptx_add_f32(ptx_add_f32(mv.x, bv.x), ptx_add_f32(wv.x, bp.x));
+    mv.y = ptx_add_f32(ptx_add_f32(mv.y, bv.y), ptx_add_f32(wv.y, bp.y));
+    mv.z = ptx_add_f32(ptx_add_f32(mv.z, bv.z), ptx_add_f32(wv.z, bp.z));
+    mv.w = ptx_add_f32(ptx_add_f32(mv.w, bv.w), ptx_add_f32(wv.w, bp.w));
+    if (row < (size_t)L) {
+      float4 pv = ptx_ldg_v4_f32(prevRowLn + idx);
+      mv.x = ptx_add_f32(mv.x, pv.x); mv.y = ptx_add_f32(mv.y, pv.y);
+      mv.z = ptx_add_f32(mv.z, pv.z); mv.w = ptx_add_f32(mv.w, pv.w);
+    }
+    ptx_st_global_v4_f32(msa + idx, mv);
+    return;
+  }
   if (t >= rows * C) return;
   int c = (int)(t % C), i = (int)(t / C % L);
   int a = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(aatype + i), 0), 19);
@@ -268,18 +293,19 @@ __global__ void msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ 
   ptx_st_global_f32(msa + t, v);
 }
 template <class PT>
-__global__ void embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
-                           const float* __restrict__ wRight, const float* __restrict__ bRight,
-                           const float* __restrict__ pos37, const int* __restrict__ aatype,
-                           const float* __restrict__ wDg, const float* __restrict__ bDg,
-                           const float* __restrict__ prevPair, const float* __restrict__ lnScale, const float* __restrict__ lnOffset,
-                           const int* __restrict__ ri, const int* __restrict__ asym, const int* __restrict__ entity, const int* __restrict__ sym,
-                           const float* __restrict__ wRel, const float* __restrict__ bRel,
-                           float* __restrict__ pair, int L, bool chainRows) {
+__global__ void __launch_bounds__(256, 6)
+embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
+           const float* __restrict__ wRight, const float* __restrict__ bRight,
+           const float* __restrict__ pos37, const int* __restrict__ aatype,
+           const float* __restrict__ wDg, const float* __restrict__ bDg,
+           const float* __restrict__ prevPair, const float* __restrict__ lnScale, const float* __restrict__ lnOffset,
+           const int* __restrict__ ri, const int* __restrict__ asym, const int* __restrict__ entity, const int* __restrict__ sym,
+           const float* __restrict__ wRel, const float* __restrict__ bRel,
+           float* __restrict__ pair, int L, bool chainRows) {
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
-  int i = (int)(ij / L), j = (int)(ij % L);
+  int i = (int)((unsigned)ij / (unsigned)L), j = (int)((unsigned)ij % (unsigned)L);
   int rawAi = ptx_ldg_s32(aatype + i), rawAj = ptx_ldg_s32(aatype + j);
   int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 19), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 19);
   int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
@@ -329,21 +355,30 @@ __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restr
     pairSt<PT>(pair, ij * 128 + c, ptx_add_f32(acc, rel));
   }
 }
-__global__ void extraEmbedK(const int* __restrict__ codes, const float* __restrict__ hasDel,
-                            const float* __restrict__ delVal, const float* __restrict__ w,
-                            const float* __restrict__ b, float* __restrict__ out, size_t rows) {
-  __shared__ float sw[25 * 64], sb[64];
-  for (int i = threadIdx.x; i < 25 * 64; i += blockDim.x) ptx_st_shared_f32(sw + i, ptx_ldg_f32(w + i));
-  if (threadIdx.x < 64) ptx_st_shared_f32(sb + threadIdx.x, ptx_ldg_f32(b + threadIdx.x));
+__global__ void __launch_bounds__(256, 6)
+extraEmbedK(const int* __restrict__ codes, const float* __restrict__ hasDel,
+            const float* __restrict__ delVal, const float* __restrict__ w,
+            const float* __restrict__ b, float* __restrict__ out, size_t rows) {
+  __shared__ __align__(16) float sw[25 * 64], sb[64];
+  for (int i = threadIdx.x; i < 25 * 16; i += blockDim.x) {
+    ptx_st_shared_v4_f32(sw + (i << 2), ptx_ldg_v4_f32(w + (i << 2)));
+  }
+  if (threadIdx.x < 16) ptx_st_shared_v4_f32(sb + (threadIdx.x << 2), ptx_ldg_v4_f32(b + (threadIdx.x << 2)));
   __syncthreads();
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * 64) return;
-  size_t r = t >> 6; int c = (int)(t & 63);
+  size_t t4 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t4 >= rows * 16) return;
+  size_t r = t4 >> 4; int c = (int)(t4 & 15) << 2;
   int code = ptx_ldg_s32(codes + r);
-  float v = (code >= 0 && code < 23) ? ptx_ld_shared_f32(sw + code * 64 + c) : 0.f;
-  v = ptx_fma_f32(ptx_ldg_f32(hasDel + r), ptx_ld_shared_f32(sw + 23 * 64 + c), v);
-  v = ptx_fma_f32(ptx_ldg_f32(delVal + r), ptx_ld_shared_f32(sw + 24 * 64 + c), v);
-  ptx_st_global_f32(out + t, ptx_add_f32(v, ptx_ld_shared_f32(sb + c)));
+  float hd = ptx_ldg_f32(hasDel + r), dv = ptx_ldg_f32(delVal + r);
+  float4 v = (code >= 0 && code < 23) ? ptx_ld_shared_v4_f32(sw + code * 64 + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+  float4 w23 = ptx_ld_shared_v4_f32(sw + 23 * 64 + c);
+  float4 w24 = ptx_ld_shared_v4_f32(sw + 24 * 64 + c);
+  float4 bv = ptx_ld_shared_v4_f32(sb + c);
+  v.x = ptx_add_f32(ptx_fma_f32(dv, w24.x, ptx_fma_f32(hd, w23.x, v.x)), bv.x);
+  v.y = ptx_add_f32(ptx_fma_f32(dv, w24.y, ptx_fma_f32(hd, w23.y, v.y)), bv.y);
+  v.z = ptx_add_f32(ptx_fma_f32(dv, w24.z, ptx_fma_f32(hd, w23.z, v.z)), bv.z);
+  v.w = ptx_add_f32(ptx_fma_f32(dv, w24.w, ptx_fma_f32(hd, w23.w, v.w)), bv.w);
+  ptx_st_global_v4_f32(out + (t4 << 2), v);
 }
 __global__ void pairMaskK(const float* seqMask, float* out, int L) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -363,7 +398,7 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   gemm(W(f + "msa_feat"), P(E + "preprocess_msa/weights", -1), t.msa, (size_t)N * L, 49, 256);
   float* prevRowLn = scratch<float>("emb.prevRow", (size_t)L * 256);
   layerNorm(prevMsaRow, prevRowLn, L, 256, E + "prev_msa_first_row_norm");
-  msaEmbedAddK<<<blocks((size_t)N * L * 256), 256, 0, STREAM>>>(
+  msaEmbedAddK<<<blocks((size_t)N * L * 64), 256, 0, STREAM>>>(
     t.msa, P(E + "preprocess_msa/bias", -1), aatype, P(E + "preprocess_1d/weights", -1), P(E + "preprocess_1d/bias", -1),
     prevRowLn, (size_t)N * L, L, 256);
   // pair = left[i] + right[j] + prev_pos_linear(dgram) + LN(prev pair) + relpos
@@ -396,7 +431,7 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   t.extraOnes = ones(M.f(f + "extra_msa_mask"), erows);
   t.extraZeros = zeros(M.f(f + "extra_msa_mask"), erows);
   if (!t.extraZeros) {
-    extraEmbedK<<<blocks(erows * 64), 256, 0, STREAM>>>(
+    extraEmbedK<<<blocks(erows * 16), 256, 0, STREAM>>>(
       Idev(f + "extra_msa"), W(f + "extra_has_deletion"), W(f + "extra_deletion_value"),
       P(E + "extra_msa_activations/weights", -1), P(E + "extra_msa_activations/bias", -1), t.extra, erows);
   }

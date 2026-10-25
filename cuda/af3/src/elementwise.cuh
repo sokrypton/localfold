@@ -419,9 +419,29 @@ layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const flo
   for (int k = 0; k < STEPS; ++k)
 #pragma unroll
     for (int u = 0; u < VEC; ++u) { float d = ptx_sub_f32(v[k][u], mean); q2 = ptx_fma_f32(d, d, q2); }
+  TO* yr = y + row * C;
+  if constexpr (VEC == 4 && STEPS == 1) {
+    float4 s4 = ptx_ldg_v4_f32(scale + lane * 4);
+    float4 o4 = ptx_ldg_v4_f32(offset + lane * 4);
+    q2 = ptx_warp_sum_f32(q2);
+    float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q2, (float)C), 1e-5f));
+    int c = lane * 4;
+    float a0 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[0][0], mean), inv), s4.x, o4.x);
+    float b0 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[0][1], mean), inv), s4.y, o4.y);
+    float a1 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[0][2], mean), inv), s4.z, o4.z);
+    float b1 = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[0][3], mean), inv), s4.w, o4.w);
+    if constexpr (RELU) { a0 = ptx_relu_f32(a0); b0 = ptx_relu_f32(b0); a1 = ptx_relu_f32(a1); b1 = ptx_relu_f32(b1); }
+    uint2 out2;
+    if constexpr (std::is_same_v<TO, half>) {
+      out2.x = ptx_cvt_f16x2_f32(a0, b0); out2.y = ptx_cvt_f16x2_f32(a1, b1);
+    } else {
+      out2.x = ptx_cvt_bf16x2_f32(a0, b0); out2.y = ptx_cvt_bf16x2_f32(a1, b1);
+    }
+    ptx_st_global_v2_u32(yr + c, out2);
+    return;
+  }
   q2 = ptx_warp_sum_f32(q2);
   float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q2, (float)C), 1e-5f));
-  TO* yr = y + row * C;
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;

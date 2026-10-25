@@ -416,7 +416,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         size_t n16 = (size_t)(t.N + t.T) * L * 256;
         t.msa16 = reinterpret_cast<float*>(scratch<__nv_bfloat16>("msa16", n16));
         if (MSA16_HALF) toHalfK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<half*>(t.msa16), n16);
-        else toBf16FK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
+        else toBf16FK<<<blocks((n16 & 7) == 0 ? (n16 >> 3) : n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
       }
     }
     for (int b = 0; b < mainBlocks; ++b) {

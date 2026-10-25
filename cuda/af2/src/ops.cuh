@@ -187,13 +187,20 @@ layerNormFastK(const TI* __restrict__ x, float* __restrict__ y, size_t rows,
   float mean = ptx_div_f32(s, (float)C), q2 = 0.f;
 #pragma unroll
   for (int k = 0; k < K; ++k) { float d = ptx_sub_f32(v[k], mean); q2 = ptx_fma_f32(d, d, q2); }
+  float sc[K], of[K];
+#pragma unroll
+  for (int k = 0; k < K; ++k) {
+    int c = lane + 32 * k;
+    sc[k] = ptx_ldg_f32(scale + c);
+    of[k] = ptx_ldg_f32(offset + c);
+  }
   q2 = ptx_warp_sum_f32(q2);
   float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q2, (float)C), 1e-5f));
   float* yr = y + row * C;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + 32 * k;
-    float out = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), ptx_ldg_f32(scale + c), ptx_ldg_f32(offset + c));
+    float out = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), sc[k], of[k]);
     ptx_st_global_f32(yr + c, RELU ? ptx_relu_f32(out) : out);
   }
 }
