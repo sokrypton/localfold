@@ -159,11 +159,11 @@ inline int safeInt(const string& s, int fallback = 0) {
   const long v = strtol(s.c_str(), &end, 10);
   return end == s.c_str() ? fallback : (int)v;
 }
-inline float safeFloat(const string& s, float fallback = NAN) {
+inline double safeFloat(const string& s, double fallback = NAN) {
   if (unset(s) || s == "nan" || s == "NaN") return fallback;
   char* end = nullptr;
   const double v = strtod(s.c_str(), &end);
-  return end == s.c_str() ? fallback : (float)v;
+  return end == s.c_str() ? fallback : v;
 }
 inline bool safeBool(const string& s, bool fallback = false) {
   if (unset(s)) return fallback;
@@ -182,7 +182,11 @@ struct AtomSite {
   vector<string> element, atomName, resName, chainId, insCode, labelAltId;
   vector<int> labelEntityId;
   vector<int> resId, authSeqId, atomId, charge;
-  vector<float> x, y, z, bFactor, occupancy;
+  // 🔴 DOUBLE, NOT FLOAT. The reference parses these with `parseFloat` and keeps them as
+  // JavaScript numbers all the way into the chirality fit, which is sensitive enough that
+  // narrowing them here moves the fitted rotation in the sixth figure. Nothing about an mmCIF's
+  // three decimals needs double - what needs it is agreeing with the reference bit for bit.
+  vector<double> x, y, z, bFactor, occupancy;
   vector<uint8_t> hetero;
   // Every `_atom_site.<name>` this reader does not have a field for, kept by name: the annotation
   // columns are exactly these, and a job's conditioning lives in them.
@@ -427,7 +431,7 @@ inline AtomSite readAtomSite(const Block& block) {
     a.authSeqId.push_back(safeInt(at(column("auth_seq_id"), i), resId));
     a.atomId.push_back(safeInt(at(column("id"), i), (int)k + 1));
     a.bFactor.push_back(safeFloat(at(column("B_iso_or_equiv"), i)));
-    a.occupancy.push_back(safeFloat(at(column("occupancy"), i), 1.0f));
+    a.occupancy.push_back(safeFloat(at(column("occupancy"), i), 1.0));
     const string alt = at(column("label_alt_id"), i);
     a.labelAltId.push_back(alt.empty() ? "." : alt);
     a.x.push_back(safeFloat(at(column("Cartn_x"), i)));
@@ -470,7 +474,11 @@ inline AtomSite readAtomSite(const Block& block) {
  */
 struct Annotations {
   std::map<string, vector<int>> ints;        // int and bool columns
-  std::map<string, vector<float>> floats;    // float columns, and the 3-wide categories
+  // 🔴 DOUBLE, for the coordinates' reason: `condition_coordinate_1_atom` feeds the chirality
+  // fit, and a float there moves the fitted rotation in the sixth figure on any input that uses
+  // conditioned coordinates. None of the shipped examples does, which is exactly why it is
+  // written down rather than left to be found.
+  std::map<string, vector<double>> floats;
   std::map<string, vector<string>> strings;
 };
 
@@ -501,7 +509,7 @@ inline Annotations readAnnotations(const AtomSite& a, const Block& block,
       const string raw = selected[k] < values.size() ? values[selected[k]] : string();
       if (type == "int") out.ints[name].push_back(safeInt(raw, (int)spec->fallback));
       else if (type == "bool") out.ints[name].push_back(safeBool(raw, spec->fallback != 0) ? 1 : 0);
-      else if (type == "float") out.floats[name].push_back(safeFloat(raw, (float)spec->fallback));
+      else if (type == "float") out.floats[name].push_back(safeFloat(raw, spec->fallback));
       else out.strings[name].push_back(unset(raw) ? string(spec->text) : raw);
     }
   }
@@ -510,8 +518,8 @@ inline Annotations readAnnotations(const AtomSite& a, const Block& block,
     if (spec.cols == 1) continue;
     auto c = block.find(name);
     if (c == block.end()) continue;
-    vector<float>& arr = out.floats[name];
-    arr.assign(a.n * spec.cols, (float)spec.fallback);
+    vector<double>& arr = out.floats[name];
+    arr.assign(a.n * spec.cols, spec.fallback);
     auto col = [&](const string& key) -> const vector<string>* {
       auto it = c->second.find(key);
       return it == c->second.end() ? nullptr : &it->second;
@@ -526,8 +534,8 @@ inline Annotations readAnnotations(const AtomSite& a, const Block& block,
         const vector<string>* v = col("val" + std::to_string(ch));
         const string raw = v && r < v->size() ? (*v)[r] : string();
         arr[(size_t)atomIdx * spec.cols + ch] =
-            string(spec.type) == "int" ? (float)safeInt(raw, (int)spec.fallback)
-                                       : safeFloat(raw, (float)spec.fallback);
+            string(spec.type) == "int" ? (double)safeInt(raw, (int)spec.fallback)
+                                       : safeFloat(raw, spec.fallback);
       }
     }
   }
@@ -550,8 +558,8 @@ inline Annotations readAnnotations(const AtomSite& a, const Block& block,
   }
   if (out.ints.count("mask_coordinate_1_atom")) {
     const vector<int> mask = out.ints["mask_coordinate_1_atom"];
-    vector<float>& crd = out.floats["condition_coordinate_1_atom"];
-    const vector<float> existing = crd;
+    vector<double>& crd = out.floats["condition_coordinate_1_atom"];
+    const vector<double> existing = crd;
     crd.assign(a.n * 3, NAN);
     for (size_t i = 0; i < a.n; ++i) {
       if (!mask[i]) continue;

@@ -12,7 +12,9 @@
  */
 import { decodeTextOrZstd } from "../../../shared/rfd4p/pipeline/index.js";
 import { parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
-import { ensureStereochemistryAnnotations } from "../../../shared/rfd4p/pipeline/chirality.js";
+import {
+  ensureStereochemistryAnnotations, computeChiralityFeatures,
+} from "../../../shared/rfd4p/pipeline/chirality.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +23,12 @@ import { join } from "node:path";
 const repo = new URL("../../../", import.meta.url).pathname;
 const binary = `${repo}cuda/rfd4p/featurise/rfd4p-featurise`;
 const work = mkdtempSync(join(tmpdir(), "rfd4p-cif-"));
+// 🔴 EXACT, NOT THROUGH `Math.fround`. Comparing the float32 of both sides is how a NARROWING
+// hides: the reader kept coordinates as float where the reference keeps doubles, every column
+// still "matched", and the difference only showed six stages later in the chirality fit.
+const eq = (p, q) => (Number.isNaN(p) && Number.isNaN(q)) || p === q;
+// The chirality tensors ARE float32 on both sides (the reference writes a Float32Array), so they
+// take the narrower comparison - and say so.
 const eqf = (p, q) => (Number.isNaN(p) && Number.isNaN(q)) || Math.fround(p) === Math.fround(q);
 
 let structures = 0;
@@ -36,7 +44,8 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
-  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id|ann|chiral|stereobond)\t?/.test(l))
+  const rows = lines.slice(1)
+    .filter((l) => !/^(extra|bond|id|ann|chiral|stereobond|chirfeat|chircenter|chirframe|chirowner|chirtetra)\t?/.test(l))
     .map((l) => l.split("\t"));
   const named = (tag) => {
     const l = lines.find((x) => x.startsWith(`${tag}\t`));
@@ -46,6 +55,7 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     .map((l) => l.split("\t").slice(1).map(Number));
   const ids = lines.filter((l) => l.startsWith("id\t")).map((l) => l.split("\t").slice(1));
   ensureStereochemistryAnnotations(js);
+  const chir = computeChiralityFeatures(js);
   const ann = new Map();
   for (const l of lines.filter((x) => x.startsWith("ann\t"))) {
     const p = l.split("\t");
@@ -66,11 +76,11 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     ["atom_id", 8, Number, js.atom_id],
     ["label_entity_id", 9, Number, js.label_entity_id],
     ["hetero", 10, Number, js.hetero.map((v) => (v ? 1 : 0))],
-    ["x", 11, Number, js.coord.map((v) => v[0])],
-    ["y", 12, Number, js.coord.map((v) => v[1])],
-    ["z", 13, Number, js.coord.map((v) => v[2])],
-    ["b_factor", 14, Number, js.b_factor],
-    ["occupancy", 15, Number, js.occupancy],
+    ["x", 11, Number, js.coord.map((v) => v[0]), eq],
+    ["y", 12, Number, js.coord.map((v) => v[1]), eq],
+    ["z", 13, Number, js.coord.map((v) => v[2]), eq],
+    ["b_factor", 14, Number, js.b_factor, eq],
+    ["occupancy", 15, Number, js.occupancy, eq],
     // The derived half: the charge after its fallbacks, the atomic number, the aromatic and
     // leaving flags, the chain type and the component type.
     ["charge", 16, Number, js.charge],
@@ -80,11 +90,11 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     ["chain_type", 20, Number, js.chain_type],
     ["chem_comp_type", 21, (v) => v, js.chem_comp_type],
   ];
-  for (const [label, at, cast, want] of columns) {
-    const eq = typeof want[0] === "number" ? eqf : (p, q) => p === q;
+  for (const [label, at, cast, want, how] of columns) {
+    const same = how ?? (typeof want[0] === "number" ? eq : (p, q) => p === q);
     let bad = 0;
     for (let i = 0; i < Math.min(rows.length, want.length); i += 1) {
-      if (!eq(cast(rows[i][at]), want[i])) bad += 1;
+      if (!same(cast(rows[i][at]), want[i])) bad += 1;
     }
     if (rows.length !== want.length) wrong.push(`${label} length`);
     else if (bad) wrong.push(`${label} ${bad}`);
@@ -132,7 +142,7 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
         const w = flat[i];
         const g = got.kind === "s" ? got.values[i] : Number(got.values[i]);
         if (typeof w === "boolean") { if ((w ? 1 : 0) !== g) bad += 1; }
-        else if (typeof w === "number") { if (!eqf(g, w)) bad += 1; }
+        else if (typeof w === "number") { if (!eq(g, w)) bad += 1; }
         else if (String(w) !== String(g)) bad += 1;
       }
       if (bad) wrong.push(`${name} ${bad}`);
@@ -147,6 +157,19 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   ]) {
     if (got.length !== want.length) { wrong.push(`${label} length`); continue; }
     const bad = got.filter((v, i) => v !== want[i]).length;
+    if (bad) wrong.push(`${label} ${bad}`);
+  }
+
+  // The four chirality tensors, plus the centre flag.
+  for (const [label, got, want] of [
+    ["chirality", named("chirfeat"), Array.from(chir.chirality.data)],
+    ["is_chiral_center", named("chircenter"), Array.from(chir.is_chiral_center)],
+    ["chiral_frame_atoms", named("chirframe"), Array.from(chir.chiral_frame_atoms.data)],
+    ["chiral_slot_owner", named("chirowner"), Array.from(chir.chiral_slot_owner.data)],
+    ["tetrahedral_vertices", named("chirtetra"), Array.from(chir.tetrahedral_vertices.data)],
+  ]) {
+    if (got.length !== want.length) { wrong.push(`${label} length ${got.length}/${want.length}`); continue; }
+    const bad = got.filter((v, i) => !eqf(v, want[i])).length;
     if (bad) wrong.push(`${label} ${bad}`);
   }
 

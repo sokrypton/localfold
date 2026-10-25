@@ -922,12 +922,12 @@ int run(int argc, char** argv) {
     rfd4p::cif::deriveChemistry(a, block);
     printf("n %zu\n", a.n);
     for (size_t i = 0; i < a.n; ++i) {
-      printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g"
+      printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g"
              "\t%d\t%d\t%d\t%d\t%d\t%s\n",
              a.element[i].c_str(), a.atomName[i].c_str(), a.resName[i].c_str(),
              a.chainId[i].c_str(), a.insCode[i].c_str(), a.labelAltId[i].c_str(), a.resId[i],
-             a.authSeqId[i], a.atomId[i], a.labelEntityId[i], (int)a.hetero[i], (double)a.x[i],
-             (double)a.y[i], (double)a.z[i], (double)a.bFactor[i], (double)a.occupancy[i],
+             a.authSeqId[i], a.atomId[i], a.labelEntityId[i], (int)a.hetero[i], a.x[i],
+             a.y[i], a.z[i], a.bFactor[i], a.occupancy[i],
              a.charge[i], a.atomicNumber[i], (int)a.isAromatic[i], (int)a.isLeavingAtom[i],
              a.chainType[i], a.chemCompType[i].c_str());
     }
@@ -947,7 +947,7 @@ int run(int argc, char** argv) {
     }
     for (const auto& [name, v] : ann.floats) {
       printf("ann\tf\t%s", name.c_str());
-      for (float x : v) printf("\t%.9g", (double)x);
+      for (double x : v) printf("\t%.17g", x);
       printf("\n");
     }
     for (const auto& [name, v] : ann.strings) {
@@ -960,6 +960,18 @@ int run(int argc, char** argv) {
     for (int t : st.chiralType) printf("\t%d", t);
     printf("\nstereobond");
     for (uint8_t b : st.stereogenicBondAtoms) printf("\t%d", (int)b);
+    printf("\n");
+    const rfd4p::chirality::Features cf = rfd4p::chirality::features(a, bonds, ann, st, {}, {});
+    printf("chirfeat");
+    for (float v : cf.chirality) printf("\t%.9g", (double)v);
+    printf("\nchircenter");
+    for (uint8_t v : cf.isChiralCenter) printf("\t%d", (int)v);
+    printf("\nchirframe");
+    for (int v : cf.frameAtoms) printf("\t%d", v);
+    printf("\nchirowner");
+    for (int v : cf.slotOwner) printf("\t%d", v);
+    printf("\nchirtetra");
+    for (int v : cf.tetrahedralVertices) printf("\t%d", v);
     printf("\n");
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;

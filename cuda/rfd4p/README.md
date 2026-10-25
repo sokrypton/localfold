@@ -516,13 +516,17 @@ residues the cropped example does not contain, so building one from the spec fai
     `tables.inc` was 21 entries where the source has 49 until the generator's character class
     admitted a quoted atom name - it had silently kept the twenty amino acids and dropped every
     nucleotide.
-  - **this is where the remaining work starts.** `computeChiralityFeatures`: the four tensors,
-    needing the Kabsch fit and `STEREOISOMER_TEMPLATES` - both already in `tables.inc` (the
-    templates precomputed rather than brute-forced at start-up), and `src/chirality.cuh` already
-    has `properRotation` and the 4x4 Jacobi.
-  - the parts of `transforms.js` a contig skips: `buildAtom37Slots` returning real slots, so the
-    per-atom loop of `convertToProteinaBatch` stops being a no-op, and `unindexFlaggedTokens`'
-    body, `materializeInternalCoords`' rotations and `centerAndFeaturizeCentroid`' recentering.
+  - ~~`computeChiralityFeatures`~~ **done**: the Kabsch fit through the eigendecomposition of
+    `BᵀB`, the template search, the planar double-bond alignment, the block packing for
+    overlapping centres and the cycling fill. All four tensors exact on all seven.
+    🔴 Its eigenvector sort comparator reads `S[j][j] - S[i][j]` - an OFF-diagonal where it plainly
+    means `S[i][i]` - so it is not a sort by eigenvalue at all. Ported as written, with V8's own
+    binary insertion sort, because the order decides the rotation and "fixing" it would disagree
+    with every number the page produces.
+  - **this is where the remaining work starts.** `transforms.js`'s pipeline with real atoms:
+    `realizeExpandableSegments` over a structure, `buildAtom37Slots` returning real slots so the
+    per-atom loop of `convertToProteinaBatch` stops being a no-op, and the bodies of
+    `unindexFlaggedTokens`, `materializeInternalCoords` and `centerAndFeaturizeCentroid`.
   - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
     constrain once there are residues and atoms.
 
