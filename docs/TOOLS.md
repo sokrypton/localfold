@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-413 tools. `tools/fixtures/` is data and is not listed.
+415 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (211)
+## `tools/gpu/` - the WebGPU lane (213)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -122,6 +122,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
 - **`check-recovery.js`** - WebGPU device-loss recovery in the studio: destroy the device mid-generation and between runs; the failed run must say the GPU was reset, and the next Generate must succeed on a new device (web/app.js `_watchDevice`).
+- **`check-rfd4p-length.js`** - The reduced-precision pair track, checked AT A LENGTH THAT CHUNKS.
 - **`check-rfd4p.js`** - Headless Chrome WebGPU differential parity suite for RFD4-Proteina (`npm run test:gpu`).
 - **`check-smiles-conformer-gpu.js`** - Does the device's conformer refinement compute the host's? And is it faster?
 - **`check-staged-matrix.js`** - Does the staged matrix projection compute what createLinearShader computes, in every buffer precision, with and without the residual, on ragged shapes?
@@ -137,6 +138,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-trunk.js`** - GPU trunk vs the PyTorch oracle, with the released weights.
 - **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
 - **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
+- **`compare-rfd4p-arms.mjs`** - Compare two `check-rfd4p-length.js --arm=` runs on the host.
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-bioemu2.js`** - A whole BioEmu2 fold on the GPU: an AlphaFold 3 job in, samples out.
