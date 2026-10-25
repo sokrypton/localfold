@@ -1,11 +1,24 @@
 {
  "_card": "NVIDIA A100-SXM4-40GB",
+ "chains": {
+  "cif": [
+   "A",
+   "B"
+  ],
+  "pdb": [
+   "A",
+   "B"
+  ]
+ },
  "encoder": {
   "exact": 1.273e-06
  },
  "featurise": {
   "cases": 15,
   "differing": 0
+ },
+ "int8_job": {
+  "caca_mean": 3.721
  },
  "inverse": {
   "exact": 1.828e-07,
@@ -27,8 +40,8 @@
   "fast": 0.008377
  },
  "speed-n100-r6": {
-  "exact_ms": 156.38,
-  "fast_ms": 41.63
+  "exact_ms": 156.27,
+  "fast_ms": 41.33
  },
  "trajectory": {
   "exact": 3.295e-06,
