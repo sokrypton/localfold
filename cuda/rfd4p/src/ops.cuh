@@ -251,74 +251,72 @@ __global__ void swiGluSecondK(const float* __restrict__ wide, float* __restrict_
 //
 // A lane holds C/32 channels in registers, so the row is read once: the sum of squares and all
 // `heads` dot products come off the same registers.
-template <class TZ, class T, int K, int HEADS>
+// 🔴 EIGHT LANES A PAIR, NOT THIRTY-TWO, BECAUSE THE COST IS THE REDUCTIONS AND NOT THE LOADS.
+// A warp reduction is five dependent shuffles; twelve heads over a full warp is sixty of them a
+// pair, and this kernel sat 4.2x off its own bandwidth with them. At eight lanes a pair the
+// butterfly is three rounds, one warp carries FOUR pairs, and the same `__shfl_xor` instruction
+// serves all four groups at once - twelve heads x three rounds a warp is nine shuffles a pair.
+//
+// Each lane holds C/8 channels, read four at a time, so a group's load is still one 128-byte line.
+template <class TZ, class T, int C, int HEADS, int LANES = 8>
 __global__ void __launch_bounds__(256)
 pairBiasK(const TZ* __restrict__ z, const float* __restrict__ normW,
           const float* __restrict__ biasW, const float* __restrict__ pairMask, T* __restrict__ bias,
           int n, int stride, float scale) {
-  constexpr int C = K * 32;
-  constexpr int heads = HEADS;
-  // 🔴 THE PROJECTION IS NOT STAGED IN SHARED MEMORY. At [12, 384] it is 18 KB, which with eight
-  // warps a block caps this kernel at two blocks an SM; every lane reads the same words every pair,
-  // so L1 broadcasts them and the occupancy is worth more than the staging.
-  const size_t pair = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  if (pair >= (size_t)n * n) return;
+  constexpr int Q = C / LANES / 4;            // float4s a lane
   const int lane = threadIdx.x & 31;
+  const int group = lane / LANES, gl = lane % LANES;
+  const size_t pair =
+      (size_t)blockIdx.x * (blockDim.x / LANES) + (threadIdx.x / 32) * (32 / LANES) + group;
+  if (pair >= (size_t)n * n) return;
   const int i = (int)(pair / n), j = (int)(pair % n);
 
-  // 🔴 FOUR CHANNELS A LANE, NOT ONE. A lane strided by 32 reads one word a transaction and this
-  // kernel sat 2.3x off its own bandwidth; with `float4` a warp's load is one 128-byte line. C is a
-  // multiple of 128 for every width this runs at, so the mapping is exact.
-  constexpr int Q = K / 4;                                  // four channels a lane
   float4 v4[Q];
   float sq = 0.f;
   const TZ* zr = z + pair * C;
-  const float4* nw = (const float4*)normW;
   #pragma unroll
   for (int q = 0; q < Q; ++q) {
+    const int c0 = gl * 4 + q * LANES * 4;
     if constexpr (std::is_same_v<TZ, float>) {
-      v4[q] = __ldg((const float4*)zr + q * 32 + lane);
+      v4[q] = __ldg((const float4*)(zr + c0));
     } else {
-      // Four halves is one 8-byte load; `__half2` pairs widen without touching memory twice.
-      const __half2* h = (const __half2*)(zr + (q * 32 + lane) * 4);
+      const __half2* h = (const __half2*)(zr + c0);
       const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
       v4[q] = make_float4(a.x, a.y, b.x, b.y);
     }
     sq += v4[q].x * v4[q].x + v4[q].y * v4[q].y + v4[q].z * v4[q].z + v4[q].w * v4[q].w;
   }
   #pragma unroll
-  for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
+  for (int o = LANES / 2; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
   const float inv = rsqrtf(sq / (float)C + 1e-5f);
   #pragma unroll
   for (int q = 0; q < Q; ++q) {
-    const float4 w = __ldg(nw + q * 32 + lane);
+    const float4 w = __ldg((const float4*)(normW + gl * 4 + q * LANES * 4));
     v4[q].x *= inv * w.x; v4[q].y *= inv * w.y; v4[q].z *= inv * w.z; v4[q].w *= inv * w.w;
   }
 
-  // 🔴 ALL `heads` BUTTERFLIES AT ONCE, NOT ONE HEAD AT A TIME. A warp reduction is five dependent
-  // shuffles; done in a loop the twelve of them serialise into sixty latencies and the kernel runs
-  // 4.5x off its own bandwidth. Unrolled over a compile-time head count they are twelve independent
-  // chains and the scheduler interleaves them.
   const bool dead = pairMask && pairMask[pair] == 0.f;
   float dot[HEADS];
   #pragma unroll
   for (int h = 0; h < HEADS; ++h) {
     dot[h] = 0.f;
-    const float4* bw = (const float4*)(biasW + h * C);
+    const float* bw = biasW + h * C;
     #pragma unroll
     for (int q = 0; q < Q; ++q) {
-      const float4 b = __ldg(bw + q * 32 + lane);
+      const float4 b = __ldg((const float4*)(bw + gl * 4 + q * LANES * 4));
       dot[h] += v4[q].x * b.x + v4[q].y * b.y + v4[q].z * b.z + v4[q].w * b.w;
     }
   }
   #pragma unroll
-  for (int o = 16; o; o >>= 1) {
+  for (int o = LANES / 2; o; o >>= 1) {
     #pragma unroll
     for (int h = 0; h < HEADS; ++h) dot[h] += __shfl_xor_sync(~0u, dot[h], o);
   }
-  if (lane < HEADS) {
-    const float out = dead ? -1e4f : dot[lane] * scale;
-    bias[(size_t)lane * n * stride + (size_t)i * stride + j] =
+  // Every lane of the group now holds every head's sum; the group's lanes share out the writes.
+  #pragma unroll
+  for (int h = gl; h < HEADS; h += LANES) {
+    const float out = dead ? -1e4f : dot[h] * scale;
+    bias[(size_t)h * n * stride + (size_t)i * stride + j] =
         std::is_same_v<T, half> ? (T)fmaxf(out, -6e4f) : (T)out;
   }
 }
@@ -340,14 +338,13 @@ inline void pairBias(const TZ* z, const std::string& normW, const std::string& b
                      const float* pairMask, T* bias, int n, int stride, int heads, int C,
                      float scale) {
   const size_t pairs = (size_t)n * n;
-  const unsigned grid = (unsigned)((pairs + 7) / 8);
-  static_assert(true, "");
+  const unsigned grid = (unsigned)((pairs + 31) / 32);   // 256 threads / 8 lanes = 32 pairs a block
   if (C == 384 && heads == 12) {
-    pairBiasK<TZ, T, 12, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
-                                                          stride, scale);
+    pairBiasK<TZ, T, 384, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                        stride, scale);
   } else if (C == 256 && heads == 12) {
-    pairBiasK<TZ, T, 8, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
-                                                         stride, scale);
+    pairBiasK<TZ, T, 256, 12><<<grid, 256, 0, STREAM>>>(z, W(normW), W(biasW), pairMask, bias, n,
+                                                        stride, scale);
   } else {
     fprintf(stderr, "pairBias: no kernel for %d channels and %d heads\n", C, heads);
     exit(1);

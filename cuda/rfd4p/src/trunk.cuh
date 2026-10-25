@@ -281,12 +281,15 @@ inline void triangleT(TZ* z, const float* pairMask, const Dims& d, bool outgoing
       bT, TPT, n, (long long)n * n, aT, TPT, n, (long long)n * n, &zero,
       xT, TXT, n, (long long)n * n, cH,
       std::is_same_v<TP, half> ? CUBLAS_COMPUTE_32F : computeType(), CUBLAS_GEMM_DEFAULT));
-  float* x = scratch<float>("rfd4p.tri.x", rows * cH);
-  fromPlanes(xT, x, rows, cH);
-  float* xNorm = scratch<float>("rfd4p.tri.xn", rows * cH);
-  layerNorm(x, xNorm, rows, cH, W(wn(pre + ".layer_norm_out.weight")), optW(wn(pre + ".layer_norm_out.bias")));
+  // The contraction's output stays in TX all the way to its norm: `layerNormIn` takes a half input
+  // where ef2's `layerNorm` cannot, which is what forced a widening transpose here before.
+  TX* x = scratch<TX>("rfd4p.tri.x", rows * cH);
+  fromPlanes<TX, TX>(xT, x, rows, cH);
+  TP* xNorm = scratch<TP>("rfd4p.tri.xn", rows * cH);
+  layerNormIn<TX, TP>(x, xNorm, rows, cH, W(wn(pre + ".layer_norm_out.weight")),
+                      optW(wn(pre + ".layer_norm_out.bias")));
   float* xProj = scratch<float>("rfd4p.tri.xp", rows * cZ);
-  linear<float, float>(xNorm, xProj, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
+  linear<TP, float>(xNorm, xProj, rows, cH, cZ, wn(pre + ".linear_z.weight"), true);
   if (hasW(wn(pre + ".linear_z.bias"))) addBias(xProj, W(wn(pre + ".linear_z.bias")), rows, cZ);
   // Straight into z: the gate and the residual it always feeds, in one pass. Safe because `zNorm`
   // was taken at the top, so nothing downstream of here reads z again. The gate arrives channel-major
