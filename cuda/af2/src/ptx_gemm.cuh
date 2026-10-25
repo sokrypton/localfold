@@ -31,25 +31,22 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
   const bool fullRows = (row0 + BM <= rows);
   auto issue = [&](int kc, int s) {
     const int kBase = kc * BK;
+    const int rA0 = tid >> 2, kA = (tid & 3) << 3, swA0 = swA32(rA0, kA);
     if (fullRows) {
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const int u = i * NTH + tid, r = u >> 2, k = (u & 3) << 3;
-        cpAsync16(As(s) + swA32(r, k), X + (row0 + r) * ldx + kBase + k, true);
-      }
+      const TI* xBase = X + (row0 + rA0) * ldx + kBase + kA;
+      cpAsync16(As(s) + swA0, xBase, true);
+      cpAsync16(As(s) + swA0 + 2048, xBase + 64 * ldx, true);
     } else {
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
-        const int u = i * NTH + tid, r = u >> 2, k = (u & 3) << 3;
-        const size_t row = row0 + r;
-        cpAsync16(As(s) + swA32(r, k), X + (row < rows ? row : 0) * ldx + kBase + k, row < rows);
+        const size_t row = row0 + rA0 + i * 64;
+        cpAsync16(As(s) + swA0 + i * 2048, X + (row < rows ? row : 0) * ldx + kBase + kA, row < rows);
       }
     }
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int u = i * NTH + tid, k = u >> 4, c = (u & 15) << 3;
-      cpAsync16(Bs(s) + swB128(k, c), Wt + (size_t)(kBase + k) * N + col0 + c, true);
-    }
+    const int kB0 = tid >> 4, cB = (tid & 15) << 3, swB0 = swB128(kB0, cB);
+    const TI* wBase = Wt + (size_t)(kBase + kB0) * N + col0 + cB;
+    cpAsync16(Bs(s) + swB0, wBase, true);
+    cpAsync16(Bs(s) + swB0 + 2048, wBase + (size_t)16 * N, true);
     cpCommit();
   };
 
@@ -74,22 +71,23 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
     const int ak0 = (lane >> 4) * 8;
     const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7);
     const int cl = warpN * 64 + (lane >> 4) * 8;
-    ldsm4(a0[0], A + swA32(r0, ak0));
-    ldsm4(a0[1], A + swA32(r0 + 16, ak0));
-    ldsm4t(f[0], B + swB128(kl0, cl));
-    ldsm4t(f[1], B + swB128(kl0, cl + 16));
+    const int aOff = swA32(r0, ak0), bOff = swB128(kl0, cl);
+    ldsm4(a0[0], A + aOff);
+    ldsm4(a0[1], A + aOff + 512);
+    ldsm4t(f[0], B + bOff);
+    ldsm4t(f[1], B + (bOff ^ 16));
     if (kc + 2 < ksteps) issue(kc + 2, st2);
 
 #pragma unroll
     for (int n2 = 0; n2 < 4; ++n2) {
       const int cur = n2 & 1;
-      if (n2 == 1) ldsm4t(f[0], B + swB128(kl0, cl + 32));
+      if (n2 == 1) ldsm4t(f[0], B + (bOff ^ 32));
       if (n2 == 2) {
-        ldsm4t(f[1], B + swB128(kl0, cl + 48));
-        ldsm4(a1[0], A + swA32(r0, 16 + ak0));
-        ldsm4(a1[1], A + swA32(r0 + 16, 16 + ak0));
+        ldsm4t(f[1], B + (bOff ^ 48));
+        ldsm4(a1[0], A + (aOff ^ 16));
+        ldsm4(a1[1], A + (aOff ^ 16) + 512);
       }
-      if (n2 == 3) ldsm4t(f[0], B + swB128(kl0 + 16, cl));
+      if (n2 == 3) ldsm4t(f[0], B + bOff + 2048);
 #pragma unroll
       for (int m = 0; m < 2; ++m) {
         if constexpr (BFI) {
@@ -104,7 +102,7 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
 #pragma unroll
     for (int n2 = 0; n2 < 4; ++n2) {
       const int cur = n2 & 1;
-      if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], B + swB128(kl0 + 16, cl + (n2 + 1) * 16));
+      if (n2 + 1 < 4) ldsm4t(f[cur ^ 1], B + (bOff ^ ((n2 + 1) * 16)) + 2048);
 #pragma unroll
       for (int m = 0; m < 2; ++m) {
         if constexpr (BFI) {
@@ -215,15 +213,20 @@ ptxGemm128x128K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restr
           const int cw = nt * 8 + tig * 2;
           float v0 = acc[m][nt][2 * h], v1 = acc[m][nt][2 * h + 1];
           if constexpr (BIAS) { v0 = ptx_add_f32(v0, bf[nt].x); v1 = ptx_add_f32(v1, bf[nt].y); }
-          if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
           if constexpr (BETA) {
+            if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
             float r0, r1;
             if constexpr (BFO) ptx_bf16x2_to_f32x2(ru[nt], r0, r1);
             else ptx_f16x2_to_f32x2(ru[nt], r0, r1);
             v0 = ptx_add_f32(v0, r0);
             v1 = ptx_add_f32(v1, r1);
           }
-          uint32_t packed = BFO ? ptx_cvt_bf16x2_f32(v0, v1) : ptx_cvt_f16x2_f32(v0, v1);
+          uint32_t packed;
+          if constexpr (RELU && !BETA) {
+            packed = BFO ? ptx_cvt_relu_bf16x2_f32(v0, v1) : ptx_cvt_relu_f16x2_f32(v0, v1);
+          } else {
+            packed = BFO ? ptx_cvt_bf16x2_f32(v0, v1) : ptx_cvt_f16x2_f32(v0, v1);
+          }
           ptx_st_shared_u32(Ws + rw * LDW + cw, packed);
         }
       }
@@ -273,25 +276,22 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
   const bool fullRows = (row0 + BM <= rows);
   auto issue = [&](int kc, int s) {
     const int kBase = kc * BK;
+    const int rA0 = tid >> 2, kA = (tid & 3) << 3, swA0 = swA32(rA0, kA);
     if (fullRows) {
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const int u = i * NTH + tid, r = u >> 2, k = (u & 3) << 3;
-        cpAsync16(As(s) + swA32(r, k), X + (row0 + r) * ldx + kBase + k, true);
-      }
+      const TI* xBase = X + (row0 + rA0) * ldx + kBase + kA;
+      cpAsync16(As(s) + swA0, xBase, true);
+      cpAsync16(As(s) + swA0 + 1024, xBase + 32 * ldx, true);
     } else {
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
-        const int u = i * NTH + tid, r = u >> 2, k = (u & 3) << 3;
-        const size_t row = row0 + r;
-        cpAsync16(As(s) + swA32(r, k), X + (row < rows ? row : 0) * ldx + kBase + k, row < rows);
+        const size_t row = row0 + rA0 + i * 32;
+        cpAsync16(As(s) + swA0 + i * 1024, X + (row < rows ? row : 0) * ldx + kBase + kA, row < rows);
       }
     }
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int u = i * NTH + tid, k = u >> 3, c = (u & 7) << 3;
-      cpAsync16(Bs(s) + swB64(k, c), Wt + (size_t)(kBase + k) * N + col0 + c, true);
-    }
+    const int kB0 = tid >> 3, cB = (tid & 7) << 3, swB0 = swB64(kB0, cB);
+    const TI* wBase = Wt + (size_t)(kBase + kB0) * N + col0 + cB;
+    cpAsync16(Bs(s) + swB0, wBase, true);
+    cpAsync16(Bs(s) + swB0 + 1024, wBase + (size_t)16 * N, true);
     cpCommit();
   };
 
@@ -316,20 +316,21 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
     const int ak0 = (lane >> 4) * 8;
     const int kl0 = ((lane >> 3) & 1) * 8 + (lane & 7);
     const int cl = warpN * 32 + (lane >> 4) * 8;
-    ldsm4(a0[0], A + swA32(r0, ak0));
-    ldsm4(a0[1], A + swA32(r0 + 16, ak0));
-    ldsm4t(f[0], B + swB64(kl0, cl));
-    ldsm4t(f[1], B + swB64(kl0, cl + 16));
+    const int aOff = swA32(r0, ak0), bOff = swB64(kl0, cl);
+    ldsm4(a0[0], A + aOff);
+    ldsm4(a0[1], A + aOff + 512);
+    ldsm4t(f[0], B + bOff);
+    ldsm4t(f[1], B + (bOff ^ 16));
     if (kc + 2 < ksteps) issue(kc + 2, st2);
 
 #pragma unroll
     for (int n2 = 0; n2 < 2; ++n2) {
       const int cur = n2 & 1;
       if (n2 == 0) {
-        ldsm4(a1[0], A + swA32(r0, 16 + ak0));
-        ldsm4(a1[1], A + swA32(r0 + 16, 16 + ak0));
+        ldsm4(a1[0], A + (aOff ^ 16));
+        ldsm4(a1[1], A + (aOff ^ 16) + 512);
       }
-      if (n2 == 1) ldsm4t(f[0], B + swB64(kl0 + 16, cl));
+      if (n2 == 1) ldsm4t(f[0], B + bOff + 1024);
 #pragma unroll
       for (int m = 0; m < 2; ++m) {
         if constexpr (BFI) {
@@ -344,7 +345,7 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
 #pragma unroll
     for (int n2 = 0; n2 < 2; ++n2) {
       const int cur = n2 & 1;
-      if (n2 == 0) ldsm4t(f[1], B + swB64(kl0 + 16, cl + 16));
+      if (n2 == 0) ldsm4t(f[1], B + (bOff ^ 16) + 1024);
 #pragma unroll
       for (int m = 0; m < 2; ++m) {
         if constexpr (BFI) {
@@ -495,15 +496,20 @@ ptxGemm64x64K(const TI* __restrict__ X, const TI* __restrict__ Wt, TO* __restric
           const int cw = nt * 8 + tig * 2;
           float v0 = acc[m][nt][2 * h], v1 = acc[m][nt][2 * h + 1];
           if constexpr (BIAS) { v0 = ptx_add_f32(v0, bf[nt].x); v1 = ptx_add_f32(v1, bf[nt].y); }
-          if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
           if constexpr (BETA) {
+            if constexpr (RELU) { v0 = ptx_relu_f32(v0); v1 = ptx_relu_f32(v1); }
             float r0, r1;
             if constexpr (BFO) ptx_bf16x2_to_f32x2(ru[nt], r0, r1);
             else ptx_f16x2_to_f32x2(ru[nt], r0, r1);
             v0 = ptx_add_f32(v0, r0);
             v1 = ptx_add_f32(v1, r1);
           }
-          uint32_t packed = BFO ? ptx_cvt_bf16x2_f32(v0, v1) : ptx_cvt_f16x2_f32(v0, v1);
+          uint32_t packed;
+          if constexpr (RELU && !BETA) {
+            packed = BFO ? ptx_cvt_relu_bf16x2_f32(v0, v1) : ptx_cvt_relu_f16x2_f32(v0, v1);
+          } else {
+            packed = BFO ? ptx_cvt_bf16x2_f32(v0, v1) : ptx_cvt_f16x2_f32(v0, v1);
+          }
           ptx_st_shared_u32(Ws + rw * LDW + cw, packed);
         }
       }
