@@ -807,11 +807,15 @@ export function forwardTrunkCpu(n, f, mask, weights, cfg, nRecycle = 1, opts = {
   const logits = linearLayer(sSeqNorm, n, D, W('nn.sequence_readout.1.weight'), 147);
 
   let insertion = null;
-  if (opts.insertion && getOptionalTensorData(weights, 'nn.insertion_q_proj.0.weight')) {
-    const qNorm = applyNorm(s, n, D, norm, W('nn.insertion_q_proj.0.weight'));
-    const q = linearLayer(qNorm, n, D, W('nn.insertion_q_proj.1.weight'), D);
-    const kNorm = applyNorm(s, n, D, norm, W('nn.insertion_k_proj.0.weight'));
-    const k = linearLayer(kNorm, n, D, W('nn.insertion_k_proj.1.weight'), D);
+  // 🔴 PLAIN PROJECTIONS OF `s`, AS webgpu/rfd4p/trunk.js DOES (`insQ`/`insK`) - no norm, and the tensor is
+  // `nn.insertion_q_proj.weight`. This asked for `nn.insertion_q_proj.0.weight`, a norm/linear PAIR that the
+  // checkpoint does not contain (it is one [768, 768] matrix, in the float safetensors and in the int8 manifest
+  // alike), so the optional guard never passed and the head was SILENTLY SKIPPED: `generateRfd4pCpu` returned
+  // `insertionLogits: null` on every run, which leaves an unindexed motif with no Hungarian mapping to place it
+  // by - and left the GPU insertion head compared against nothing. Upstream's `62276d95`, ported here.
+  if (opts.insertion && getOptionalTensorData(weights, 'nn.insertion_q_proj.weight')) {
+    const q = linearLayer(s, n, D, W('nn.insertion_q_proj.weight'), D);
+    const k = linearLayer(s, n, D, W('nn.insertion_k_proj.weight'), D);
     const scale = 1 / Math.sqrt(D);
     insertion = new Float32Array(n * n);
     for (let i = 0; i < n; i += 1) {
