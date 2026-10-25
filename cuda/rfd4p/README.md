@@ -485,9 +485,15 @@ residues the cropped example does not contain, so building one from the spec fai
     reader filters to MODEL ONE and the first altloc, without which a twenty-model NMR entry comes
     through twenty times. Decompression is still JavaScript's - the examples are zstd and the
     reader says so rather than guessing.
-  - the chemistry `parseCifToAtomArray` DERIVES from those columns and `featurise/cif.h` does not:
-    `is_polymer`, `chem_comp_type`, `atomic_number`, the aromatic and leaving-atom flags, the
-    charge fallbacks, the chain types, and `computeIdAndEntityAnnotations`.
+  - ~~the chemistry `parseCifToAtomArray` derives from those columns~~ **done**: the charge
+    fallbacks, `atomic_number`, the aromatic and leaving-atom flags, `chem_comp_type`,
+    `chain_type` and `is_polymer` - all 22 columns, all seven structures, 0 differing. 🔴 The
+    file's own `_chem_comp_atom` wins over the built-in tables, which are the fallback for a
+    component the file says nothing about; and a NON-POLYMER chain takes `auth_seq_id` as its
+    residue number, without which a het group's atoms all collapse into one residue because its
+    `label_seq_id` is `.`.
+  - `computeIdAndEntityAnnotations` (the pn-unit, molecule and entity ids), and the annotation
+    columns parsed into typed arrays rather than kept as strings.
   - `buildBondsForAtomArray` with `STD_RESIDUE_BONDS` (28 residues of explicit bond lists),
     `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, `ELEMENT_TO_ATOMIC_NUMBER` (94) and
     `METAL_ELEMENTS` (61) - all generable into `tables.inc`.

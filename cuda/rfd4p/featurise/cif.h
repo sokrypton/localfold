@@ -18,6 +18,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "tables.inc"
 
 namespace rfd4p {
 namespace cif {
@@ -184,7 +185,174 @@ struct AtomSite {
   // Every `_atom_site.<name>` this reader does not have a field for, kept by name: the annotation
   // columns are exactly these, and a job's conditioning lives in them.
   std::map<string, vector<string>> extra;
+
+  // Derived, not read: the chemistry `parseCifToAtomArray` works out from the columns above and
+  // from the file's own `_chem_comp` / `_chem_comp_atom` / `_entity_poly` tables.
+  vector<int> atomicNumber, chainType;
+  vector<uint8_t> isPolymer, isAromatic, isLeavingAtom;
+  vector<string> chemCompType;
 };
+
+/**
+ * `parseCifToAtomArray`'s derived half: the atomic number, the component type, the aromatic and
+ * leaving-atom flags, the charge fallbacks and the per-chain type.
+ *
+ * 🔴 THE FILE'S OWN TABLES WIN OVER THE STANDARD ONES. `_chem_comp_atom` carries a charge, an
+ * aromatic flag and a leaving flag per component atom, and a structure that has them means them -
+ * the built-in tables are the fallback for a component the file says nothing about, not the other
+ * way round.
+ *
+ * 🔴 AND A NON-POLYMER CHAIN TAKES `auth_seq_id` AS ITS RESIDUE NUMBER (`update_nonpoly_seq_ids`),
+ * which is not cosmetic: a ligand's `label_seq_id` is `.` and so -1 for every one of its atoms,
+ * which would collapse a whole het group into one residue.
+ */
+inline void deriveChemistry(AtomSite& a, const Block& block) {
+  auto table = [&](const char* cat, const char* col) -> const vector<string>* {
+    auto c = block.find(cat);
+    if (c == block.end()) return nullptr;
+    auto it = c->second.find(col);
+    return it == c->second.end() ? nullptr : &it->second;
+  };
+  // `_chem_comp.type`, by component id.
+  std::map<string, string> compType;
+  if (const vector<string>* ids = table("chem_comp", "id")) {
+    const vector<string>* types = table("chem_comp", "type");
+    if (!types) types = table("chem_comp", "pdbx_type");
+    for (size_t i = 0; types && i < ids->size() && i < types->size(); ++i) {
+      if (unset((*types)[i])) continue;
+      string up = (*types)[i];
+      for (char& ch : up) ch = (char)toupper((unsigned char)ch);
+      compType[(*ids)[i]] = up;
+    }
+  }
+  // `_chem_comp_atom`, by `<comp>:<atom>`.
+  std::map<string, int> ccaCharge;
+  std::map<string, bool> ccaArom, ccaLeaving;
+  if (const vector<string>* cids = table("chem_comp_atom", "comp_id")) {
+    const vector<string>* aids = table("chem_comp_atom", "atom_id");
+    const vector<string>* chgs = table("chem_comp_atom", "charge");
+    const vector<string>* aroms = table("chem_comp_atom", "pdbx_aromatic_flag");
+    const vector<string>* leavs = table("chem_comp_atom", "pdbx_leaving_atom_flag");
+    for (size_t i = 0; aids && i < cids->size() && i < aids->size(); ++i) {
+      const string key = (*cids)[i] + ":" + (*aids)[i];
+      if (chgs && i < chgs->size()) ccaCharge[key] = safeInt((*chgs)[i], 0);
+      if (aroms && i < aroms->size()) ccaArom[key] = (*aroms)[i] == "Y";
+      if (leavs && i < leavs->size()) ccaLeaving[key] = (*leavs)[i] == "Y";
+    }
+  }
+  // `_entity.type` and `_entity_poly`, which say what KIND of chain each one is.
+  std::map<string, string> entityType, entityPolyType, chainToPolyType;
+  if (const vector<string>* ids = table("entity", "id")) {
+    if (const vector<string>* types = table("entity", "type")) {
+      for (size_t i = 0; i < ids->size() && i < types->size(); ++i) {
+        string low = (*types)[i];
+        for (char& ch : low) ch = (char)tolower((unsigned char)ch);
+        entityType[(*ids)[i]] = low;
+      }
+    }
+  }
+  if (const vector<string>* eids = table("entity_poly", "entity_id")) {
+    const vector<string>* ptypes = table("entity_poly", "type");
+    const vector<string>* strands = table("entity_poly", "pdbx_strand_id");
+    for (size_t i = 0; i < eids->size(); ++i) {
+      string pt = ptypes && i < ptypes->size() ? (*ptypes)[i] : string();
+      for (char& ch : pt) ch = (char)tolower((unsigned char)ch);
+      entityPolyType[(*eids)[i]] = pt;
+      if (strands && i < strands->size()) {
+        string list = (*strands)[i];
+        size_t from = 0;
+        while (from <= list.size()) {
+          const size_t comma = list.find(',', from);
+          string one = list.substr(from, comma == string::npos ? string::npos : comma - from);
+          while (!one.empty() && isspace((unsigned char)one.front())) one.erase(one.begin());
+          while (!one.empty() && isspace((unsigned char)one.back())) one.pop_back();
+          if (!one.empty()) chainToPolyType[one] = pt;
+          if (comma == string::npos) break;
+          from = comma + 1;
+        }
+      }
+    }
+  }
+
+  a.atomicNumber.assign(a.n, 0);
+  a.chemCompType.assign(a.n, "");
+  a.isAromatic.assign(a.n, 0);
+  a.isLeavingAtom.assign(a.n, 0);
+  a.chainType.assign(a.n, 0);
+  a.isPolymer.assign(a.n, 0);
+  for (size_t k = 0; k < a.n; ++k) {
+    const string key = a.resName[k] + ":" + a.atomName[k];
+    if (a.charge[k] == 0) {
+      auto cc = ccaCharge.find(key);
+      if (cc != ccaCharge.end()) a.charge[k] = cc->second;
+      else {
+        auto sc = tables::STD_RESIDUE_CHARGES.find(key);
+        if (sc != tables::STD_RESIDUE_CHARGES.end()) a.charge[k] = sc->second;
+      }
+    }
+    auto ar = ccaArom.find(key);
+    a.isAromatic[k] = ar != ccaArom.end() ? (ar->second ? 1 : 0)
+                                          : (tables::STD_RESIDUE_AROMATIC.count(key) ? 1 : 0);
+    auto lv = ccaLeaving.find(key);
+    if (lv != ccaLeaving.end()) {
+      a.isLeavingAtom[k] = lv->second ? 1 : 0;
+    } else {
+      const bool aa = tables::AA_RESIDUES.count(a.resName[k]) && a.atomName[k] == "OXT";
+      const bool na = (tables::RNA_RESIDUES.count(a.resName[k]) ||
+                       tables::DNA_RESIDUES.count(a.resName[k])) && a.atomName[k] == "OP3";
+      a.isLeavingAtom[k] = (aa || na) ? 1 : 0;
+    }
+    string up = a.element[k];
+    for (char& ch : up) ch = (char)toupper((unsigned char)ch);
+    auto z = tables::ELEMENT_TO_ATOMIC_NUMBER.find(up);
+    a.atomicNumber[k] = z == tables::ELEMENT_TO_ATOMIC_NUMBER.end() ? 0 : z->second;
+    auto ct = compType.find(a.resName[k]);
+    if (ct != compType.end()) a.chemCompType[k] = ct->second;
+    else if (a.resName[k] == "GLY") a.chemCompType[k] = "PEPTIDE LINKING";
+    else if (tables::AA_RESIDUES.count(a.resName[k])) a.chemCompType[k] = "L-PEPTIDE LINKING";
+    else if (tables::DNA_RESIDUES.count(a.resName[k])) a.chemCompType[k] = "DNA LINKING";
+    else if (tables::RNA_RESIDUES.count(a.resName[k])) a.chemCompType[k] = "RNA LINKING";
+    else a.chemCompType[k] = "NON-POLYMER";
+  }
+
+  // The chain type is decided ONCE a chain, from its FIRST atom, and applied to all of them.
+  std::map<string, int> byChain;
+  for (size_t k = 0; k < a.n; ++k) {
+    if (byChain.count(a.chainId[k])) continue;
+    const string eid = std::to_string(a.labelEntityId[k]);
+    string poly;
+    auto c2p = chainToPolyType.find(a.chainId[k]);
+    if (c2p != chainToPolyType.end()) poly = c2p->second;
+    if (poly.empty()) { auto e = entityPolyType.find(eid); if (e != entityPolyType.end()) poly = e->second; }
+    if (poly.empty()) { auto e = entityType.find(eid); if (e != entityType.end()) poly = e->second; }
+    int type = -1;
+    if (!poly.empty()) {
+      auto m = tables::MMCIF_CHAIN_TYPE_MAP.find(poly);
+      if (m != tables::MMCIF_CHAIN_TYPE_MAP.end()) type = m->second;
+    }
+    if (type < 0) {
+      const string& res = a.resName[k];
+      // 🔴 `5-20` AND `<M>` ARE POLYPEPTIDE, which is not a curiosity: an expandable segment's
+      // sentinel is named by its length range and a masked residue by `<M>`, and both must come
+      // out as protein or a contig's own chain is typed NON-POLYMER.
+      bool range = !res.empty() && res.find('-') != string::npos;
+      for (char ch : res) range = range && (isdigit((unsigned char)ch) || ch == '-');
+      if (tables::DNA_RESIDUES.count(res)) type = tables::CT_DNA;
+      else if (tables::RNA_RESIDUES.count(res)) type = tables::CT_RNA;
+      else if (tables::AA_RESIDUES.count(res) || range || res == "<M>")
+        type = tables::CT_POLYPEPTIDE_L;
+      else type = tables::CT_NON_POLYMER;
+    }
+    byChain[a.chainId[k]] = type;
+  }
+  for (size_t k = 0; k < a.n; ++k) {
+    a.chainType[k] = byChain[a.chainId[k]];
+    a.isPolymer[k] = a.chainType[k] <= tables::CT_RNA ? 1 : 0;
+    if (!a.isPolymer[k]) a.resId[k] = a.authSeqId[k];
+  }
+}
+
+
 
 inline AtomSite readAtomSite(const Block& block) {
   auto cat = block.find("atom_site");

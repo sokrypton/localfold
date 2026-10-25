@@ -56,6 +56,14 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
     ["z", 13, Number, js.coord.map((v) => v[2])],
     ["b_factor", 14, Number, js.b_factor],
     ["occupancy", 15, Number, js.occupancy],
+    // The derived half: the charge after its fallbacks, the atomic number, the aromatic and
+    // leaving flags, the chain type and the component type.
+    ["charge", 16, Number, js.charge],
+    ["atomic_number", 17, Number, js.atomic_number],
+    ["is_aromatic", 18, Number, js.is_aromatic.map((v) => (v ? 1 : 0))],
+    ["is_leaving_atom", 19, Number, js.is_leaving_atom.map((v) => (v ? 1 : 0))],
+    ["chain_type", 20, Number, js.chain_type],
+    ["chem_comp_type", 21, (v) => v, js.chem_comp_type],
   ];
   for (const [label, at, cast, want] of columns) {
     const eq = typeof want[0] === "number" ? eqf : (p, q) => p === q;

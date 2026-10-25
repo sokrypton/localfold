@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <cmath>
 #include <vector>
 
 namespace rfd4p {
@@ -569,6 +571,187 @@ inline const std::unordered_map<std::string, std::array<int, 3>> CATH_CODES = {
     {"3.90", {2, 31, -1}},
     {"4", {3, -1, -1}},
     {"6", {4, -1, -1}},
+};
+
+// The chemistry `parseCifToAtomArray` derives from a structure's own columns.
+inline const std::unordered_map<std::string, int> ELEMENT_TO_ATOMIC_NUMBER = {
+    {"H", 1},
+    {"D", 1},
+    {"T", 1},
+    {"HE", 2},
+    {"LI", 3},
+    {"BE", 4},
+    {"B", 5},
+    {"C", 6},
+    {"N", 7},
+    {"O", 8},
+    {"F", 9},
+    {"NE", 10},
+    {"NA", 11},
+    {"MG", 12},
+    {"AL", 13},
+    {"SI", 14},
+    {"P", 15},
+    {"S", 16},
+    {"CL", 17},
+    {"AR", 18},
+    {"K", 19},
+    {"CA", 20},
+    {"SC", 21},
+    {"TI", 22},
+    {"V", 23},
+    {"CR", 24},
+    {"MN", 25},
+    {"FE", 26},
+    {"CO", 27},
+    {"NI", 28},
+    {"CU", 29},
+    {"ZN", 30},
+    {"GA", 31},
+    {"GE", 32},
+    {"AS", 33},
+    {"SE", 34},
+    {"BR", 35},
+    {"KR", 36},
+    {"RB", 37},
+    {"SR", 38},
+    {"Y", 39},
+    {"ZR", 40},
+    {"NB", 41},
+    {"MO", 42},
+    {"TC", 43},
+    {"RU", 44},
+    {"RH", 45},
+    {"PD", 46},
+    {"AG", 47},
+    {"CD", 48},
+    {"IN", 49},
+    {"SN", 50},
+    {"SB", 51},
+    {"TE", 52},
+    {"I", 53},
+    {"XE", 54},
+    {"CS", 55},
+    {"BA", 56},
+    {"LA", 57},
+    {"CE", 58},
+    {"PR", 59},
+    {"ND", 60},
+    {"PM", 61},
+    {"SM", 62},
+    {"EU", 63},
+    {"GD", 64},
+    {"TB", 65},
+    {"DY", 66},
+    {"HO", 67},
+    {"ER", 68},
+    {"TM", 69},
+    {"YB", 70},
+    {"LU", 71},
+    {"HF", 72},
+    {"TA", 73},
+    {"W", 74},
+    {"RE", 75},
+    {"OS", 76},
+    {"IR", 77},
+    {"PT", 78},
+    {"AU", 79},
+    {"HG", 80},
+    {"TL", 81},
+    {"PB", 82},
+    {"BI", 83},
+    {"PO", 84},
+    {"AT", 85},
+    {"RN", 86},
+    {"FR", 87},
+    {"RA", 88},
+    {"AC", 89},
+    {"TH", 90},
+    {"PA", 91},
+    {"U", 92},
+};
+
+inline const std::unordered_set<std::string> METAL_ELEMENTS = {
+    "LI", "BE", "NA", "MG", "AL", "K", "CA", "SC", "TI", "V", "CR", "MN", "FE", "CO", "NI", "CU", "ZN", "GA", "RB", "SR", "Y", "ZR", "NB", "MO", "TC", "RU", "RH", "PD", "AG", "CD", "IN", "SN", "CS", "BA", "LA", "CE", "PR", "ND", "PM", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "HF", "TA", "W", "RE", "OS", "IR", "PT", "AU", "HG", "TL", "PB", "BI",
+};
+
+inline const std::unordered_set<std::string> AA_RESIDUES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "UNK",
+};
+
+inline const std::unordered_set<std::string> RNA_RESIDUES = {
+    "A", "C", "G", "U", "N",
+};
+
+inline const std::unordered_set<std::string> DNA_RESIDUES = {
+    "DA", "DC", "DG", "DT", "DN",
+};
+
+// `<residue>:<atom>` -> the charge or the aromatic flag a standard residue carries.
+inline const std::unordered_map<std::string, int> STD_RESIDUE_CHARGES = {
+    {"ARG:NH2", 1},
+    {"HIS:ND1", 1},
+    {"LYS:NZ", 1},
+};
+
+inline const std::unordered_set<std::string> STD_RESIDUE_AROMATIC = {
+    "HIS:CG", "HIS:ND1", "HIS:CD2", "HIS:CE1", "HIS:NE2",
+    "PHE:CG", "PHE:CD1", "PHE:CD2", "PHE:CE1", "PHE:CE2", "PHE:CZ",
+    "TRP:CG", "TRP:CD1", "TRP:CD2", "TRP:NE1", "TRP:CE2", "TRP:CE3", "TRP:CZ2", "TRP:CZ3", "TRP:CH2",
+    "TYR:CG", "TYR:CD1", "TYR:CD2", "TYR:CE1", "TYR:CE2", "TYR:CZ",
+    "A:N9", "A:C8", "A:N7", "A:C5", "A:C6", "A:N1", "A:C2", "A:N3", "A:C4",
+    "G:N9", "G:C8", "G:N7", "G:C5", "G:C4",
+    "DA:N9", "DA:C8", "DA:N7", "DA:C5", "DA:C6", "DA:N1", "DA:C2", "DA:N3", "DA:C4",
+    "DG:N9", "DG:C8", "DG:N7", "DG:C5", "DG:C4",
+};
+
+// `_entity_poly.type` (lowercased) -> the chain type, as the reference maps it.
+inline const std::unordered_map<std::string, int> MMCIF_CHAIN_TYPE_MAP = {
+    {"cyclic-pseudo-peptide", CT_CYCLIC_PSEUDO_PEPTIDE},
+    {"other", CT_OTHER_POLYMER},
+    {"peptide nucleic acid", CT_PEPTIDE_NUCLEIC_ACID},
+    {"polydeoxyribonucleotide", CT_DNA},
+    {"polydeoxyribonucleotide/polyribonucleotide hybrid", CT_DNA_RNA_HYBRID},
+    {"polypeptide(d)", CT_POLYPEPTIDE_D},
+    {"polypeptide(l)", CT_POLYPEPTIDE_L},
+    {"polyribonucleotide", CT_RNA},
+    {"branched", CT_BRANCHED},
+    {"macrolide", CT_MACROLIDE},
+    {"non-polymer", CT_NON_POLYMER},
+    {"water", CT_WATER},
+};
+
+// The annotation columns a structure may carry, with the type and default each takes.
+struct AnnotationSpec { const char* type; int cols; double fallback; const char* text; };
+inline const std::unordered_map<std::string, AnnotationSpec> ANNOTATIONS_1BODY = {
+    {"annotation_expsegmin_1_residue", {"int", 1, -1, ""}},
+    {"annotation_expsegmax_1_residue", {"int", 1, -1, ""}},
+    {"annotation_src-component_1_atom", {"str", 1, 0, ""}},
+    {"annotation_src-index-group_1_atom", {"int", 1, 0, ""}},
+    {"annotation_src-coordinate-conditioned-region_1_atom", {"int", 1, -1, ""}},
+    {"condition_sequence_1_residue", {"str", 1, 0, "<M>"}},
+    {"condition_index_1_residue", {"bool", 1, 1, ""}},
+    {"condition_index-group_1_token", {"int", 1, 0, ""}},
+    {"condition_hotspot_1_atom", {"bool", 1, 0, ""}},
+    {"condition_hbond_1_atom", {"int", 1, 0, ""}},
+    {"condition_rasa-binned_1_atom", {"int", 1, 0, ""}},
+    {"condition_pistack_1_atom", {"bool", 1, 0, ""}},
+    {"condition_saltbridge_1_atom", {"int", 1, 0, ""}},
+    {"condition_hydrophobic_1_atom", {"bool", 1, 0, ""}},
+    {"condition_pication_1_atom", {"int", 1, 0, ""}},
+    {"condition_metal-coord_1_atom", {"int", 1, 0, ""}},
+    {"condition_CoordinateGroup_1_atom", {"int", 1, -1, ""}},
+    {"condition_secondary-structure_1_residue", {"int", 1, 0, ""}},
+    {"mask_sequence_1_residue", {"bool", 1, 0, ""}},
+    {"mask_coordinate_1_atom", {"bool", 1, 0, ""}},
+    {"mask_index_1_residue", {"bool", 1, 1, ""}},
+    {"condition_coordinate_1_atom", {"float", 3, NAN, ""}},
+    {"condition_InternalCoordinate_1_atom", {"float", 3, NAN, ""}},
+    {"condition_ChainCentroid_1_atom", {"float", 3, NAN, ""}},
+    {"condition_cath-label_1_residue", {"int", 3, -1, ""}},
+    {"annotation_coords-with-insertion_1_atom", {"float", 3, NAN, ""}},
 };
 
 }  // namespace tables

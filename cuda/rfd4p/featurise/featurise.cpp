@@ -916,14 +916,19 @@ int run(int argc, char** argv) {
                       "compressed - decompress it first\n", dumpCif.c_str());
       return 1;
     }
-    const rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(rfd4p::cif::parseBlock(text));
+    const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
+    rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
+    rfd4p::cif::deriveChemistry(a, block);
     printf("n %zu\n", a.n);
     for (size_t i = 0; i < a.n; ++i) {
-      printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g\n",
+      printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.9g\t%.9g\t%.9g\t%.9g\t%.9g"
+             "\t%d\t%d\t%d\t%d\t%d\t%s\n",
              a.element[i].c_str(), a.atomName[i].c_str(), a.resName[i].c_str(),
              a.chainId[i].c_str(), a.insCode[i].c_str(), a.labelAltId[i].c_str(), a.resId[i],
              a.authSeqId[i], a.atomId[i], a.labelEntityId[i], (int)a.hetero[i], (double)a.x[i],
-             (double)a.y[i], (double)a.z[i], (double)a.bFactor[i], (double)a.occupancy[i]);
+             (double)a.y[i], (double)a.z[i], (double)a.bFactor[i], (double)a.occupancy[i],
+             a.charge[i], a.atomicNumber[i], (int)a.isAromatic[i], (int)a.isLeavingAtom[i],
+             a.chainType[i], a.chemCompType[i].c_str());
     }
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;

@@ -13,7 +13,11 @@ import {
   ALLOWED_RESIDUE_TYPES, STANDARD_POLYMER_RESIDUES, LOCAL_LATENT_RESIDUE_SET,
   TokenType, TOKEN_TYPE_IDS, RESIDUES_BY_TOKEN_TYPE, ATOM37_NAMES,
 } from "../../../shared/rfd4p/encoding.js";
-import { CHAIN_TYPE, BOND_TYPE } from "../../../shared/rfd4p/pipeline/cif.js";
+import {
+  CHAIN_TYPE, BOND_TYPE, ELEMENT_TO_ATOMIC_NUMBER, METAL_ELEMENTS, STD_RESIDUE_CHARGES,
+  STD_RESIDUE_AROMATIC, AA_RESIDUES, RNA_RESIDUES, DNA_RESIDUES, SCALAR_1BODY_ANNOTATIONS,
+  NONSCALAR_1BODY_ANNOTATIONS,
+} from "../../../shared/rfd4p/pipeline/cif.js";
 import { CONDITION_ENUMS, CONDITION_REGISTRY } from "../../../shared/rfd4p/pipeline/spec.js";
 import { parseCathCode } from "../../../shared/rfd4p/conditions.js";
 
@@ -28,6 +32,8 @@ w("#include <array>");
 w("#include <cstdint>");
 w("#include <string>");
 w("#include <unordered_map>");
+w("#include <unordered_set>");
+w("#include <cmath>");
 w("#include <vector>");
 w("");
 w("namespace rfd4p {");
@@ -142,6 +148,61 @@ w("inline const std::unordered_map<std::string, std::array<int, 3>> CATH_CODES =
     const v = parseCathCode(code);
     if (v) w(`    {${str(code)}, {${v.join(", ")}}},`);
   }
+}
+w("};");
+w("");
+w("// The chemistry `parseCifToAtomArray` derives from a structure's own columns.");
+w("inline const std::unordered_map<std::string, int> ELEMENT_TO_ATOMIC_NUMBER = {");
+for (const [el, z] of Object.entries(ELEMENT_TO_ATOMIC_NUMBER)) w(`    {${str(el)}, ${z}},`);
+w("};");
+w("");
+w("inline const std::unordered_set<std::string> METAL_ELEMENTS = {");
+w("    " + [...METAL_ELEMENTS].map(str).join(", ") + ",");
+w("};");
+w("");
+for (const [name, set] of [["AA_RESIDUES", AA_RESIDUES], ["RNA_RESIDUES", RNA_RESIDUES],
+                           ["DNA_RESIDUES", DNA_RESIDUES]]) {
+  w(`inline const std::unordered_set<std::string> ${name} = {`);
+  const names = [...set];
+  for (let i = 0; i < names.length; i += 10) w("    " + names.slice(i, i + 10).map(str).join(", ") + ",");
+  w("};");
+  w("");
+}
+w("// `<residue>:<atom>` -> the charge or the aromatic flag a standard residue carries.");
+w("inline const std::unordered_map<std::string, int> STD_RESIDUE_CHARGES = {");
+for (const [res, atoms] of Object.entries(STD_RESIDUE_CHARGES)) {
+  for (const [atom, q] of Object.entries(atoms)) w(`    {${str(`${res}:${atom}`)}, ${q}},`);
+}
+w("};");
+w("");
+w("inline const std::unordered_set<std::string> STD_RESIDUE_AROMATIC = {");
+for (const [res, atoms] of Object.entries(STD_RESIDUE_AROMATIC)) {
+  w("    " + [...atoms].map((a) => str(`${res}:${a}`)).join(", ") + ",");
+}
+w("};");
+w("");
+w("// `_entity_poly.type` (lowercased) -> the chain type, as the reference maps it.");
+w("inline const std::unordered_map<std::string, int> MMCIF_CHAIN_TYPE_MAP = {");
+{
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../../shared/rfd4p/pipeline/cif.js", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("const MMCIF_CHAIN_TYPE_MAP = {"));
+  for (const m of body.slice(0, body.indexOf("};")).matchAll(/'([^']+)':\s*CHAIN_TYPE\.(\w+)/g)) {
+    w(`    {${str(m[1])}, CT_${m[2]}},`);
+  }
+}
+w("};");
+w("");
+w("// The annotation columns a structure may carry, with the type and default each takes.");
+w("struct AnnotationSpec { const char* type; int cols; double fallback; const char* text; };");
+w("inline const std::unordered_map<std::string, AnnotationSpec> ANNOTATIONS_1BODY = {");
+for (const [name, spec] of Object.entries(SCALAR_1BODY_ANNOTATIONS)) {
+  const fb = typeof spec.default === "string" ? 0 : Number(spec.default);
+  const text = typeof spec.default === "string" ? spec.default : "";
+  w(`    {${str(name)}, {${str(spec.type)}, 1, ${fb}, ${str(text)}}},`);
+}
+for (const [name, spec] of Object.entries(NONSCALAR_1BODY_ANNOTATIONS)) {
+  w(`    {${str(name)}, {${str(spec.type)}, ${spec.cols}, ${Number.isNaN(spec.default) ? "NAN" : spec.default}, ""}},`);
 }
 w("};");
 w("");
