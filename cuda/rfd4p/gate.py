@@ -349,6 +349,15 @@ def main() -> int:
             if r.returncode == 0:
                 spec.write_text(r.stdout)
                 cases.append(("cath", [f"--spec={spec}"], ["--preset=custom_cath_monomer"]))
+            # 🔴 AND A RANGED CONTIG AT FOUR SEEDS, which is the only arm that reaches the
+            # PIPELINE's random source. It is a different generator from the sampler's - mulberry32
+            # where the sampler is xorshift128+ - and it decides how long each segment comes out:
+            # these four seeds give 24, 30, 27 and 33 tokens, so a wrong draw order is a wrong
+            # protein rather than a wrong digit.
+            ranged = HERE / "featurise" / "gate-ranged.json"
+            for sd in (0, 1, 7, 42):
+                cases.append((f"ranged{sd}", [f"--spec={ranged}", f"--seed={sd}"],
+                              [f"--spec={ranged}", f"--seed={sd}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this

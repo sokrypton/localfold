@@ -286,9 +286,14 @@ JavaScript at all** - and its PDB is byte-identical to the one the exporter's ow
 produces.
 
 `gate.py`'s `featurise` arm holds both directories to `export_input.mjs` **field by field, as
-bytes** - eight cases, 0 differing - over seven lengths and the CATH-plus-secondary-structure
-preset. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
+bytes** - twelve cases, 0 differing - over seven lengths, the CATH-plus-secondary-structure preset
+and a RANGED contig at four seeds. That bar is `cuda/featurise`'s and it is the only one worth having: a featuriser that
 merely agrees closely is a second, slightly different model.
+
+🔴 **AND THERE ARE TWO RANDOM SOURCES, WHICH ARE NOT THE SAME ONE.** The SAMPLER's is xorshift128+
+with Box-Muller; the PIPELINE's is mulberry32, and it decides how long a ranged contig segment
+comes out - the gate's four seeds give 24, 30, 27 and 33 tokens, so a wrong draw order there is a
+wrong protein rather than a wrong digit.
 
 🔴 **THE NOISE IS DRAWN NATIVELY NOW, NOT REPLAYED**, and the gate compares it: `g/noise` is in the
 generation directory, so Box-Muller is held to V8's in the same breath as everything else.

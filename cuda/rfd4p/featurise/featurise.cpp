@@ -247,12 +247,6 @@ inline vector<Segment> parseContig(const string& contig) {
     const size_t dash = rest.find('-');
     seg.minLen = atoi(rest.substr(0, dash).c_str());
     seg.maxLen = dash == string::npos ? seg.minLen : atoi(rest.substr(dash + 1).c_str());
-    if (seg.minLen != seg.maxLen) {
-      fprintf(stderr, "contig segment '%s' has a RANGE; its realised length is a seeded draw and "
-                      "this featuriser does not yet reproduce the pipeline's own RNG order\n",
-              tok.c_str());
-      exit(1);
-    }
     out.push_back(seg);
   }
   return out;
@@ -626,6 +620,26 @@ inline void applyConditions(Batch& b,
   }
 }
 
+// ---------------------------------------------------------------- the pipeline's own RNG
+//
+// 🔴 TWO SEPARATE RANDOM SOURCES, AND THEY ARE NOT THE SAME ONE. The SAMPLER's is xorshift128+
+// with Box-Muller (`seededRng`, flow.js); the PIPELINE's is mulberry32 (`createSeededRng`,
+// transforms.js) and it decides a ranged segment's realised length. Both are seeded from the job's
+// `seed` and neither consumes the other's stream.
+struct PipelineRng {
+  uint32_t a;
+  explicit PipelineRng(uint32_t seed) : a(seed) {}
+  double nextFloat() {
+    a = a + 0x6d2b79f5u;
+    uint32_t t = (a ^ (a >> 15)) * (1u | a);
+    t = (t + ((t ^ (t >> 7)) * (61u | t))) ^ t;
+    return (double)((t ^ (t >> 14))) / 4294967296.0;
+  }
+  int nextInt(int lo, int hiExclusive) {
+    return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
+  }
+};
+
 // ---------------------------------------------------------------- spec -> batch
 //
 // 🔴 FOR A SPEC INPUT ALMOST EVERY FIELD IS ITS INITIALISATION VALUE, and that is not laziness in
@@ -637,9 +651,21 @@ inline void applyConditions(Batch& b,
 // What is actually computed is the chain: `token_bond_path_length[i][j] = |i - j|` over the single
 // bonded run, and `canonical_polymer_ordering` is -1 at the next residue and +1 at the previous.
 inline Batch buildSpecBatch(const vector<Segment>& segments,
-                            const std::map<string, std::map<string, vector<string>>>& conditions) {
+                            const std::map<string, std::map<string, vector<string>>>& conditions,
+                            int seed) {
+  // 🔴 A RANGED SEGMENT'S LENGTH IS A DRAW, AND THE ORDER IS THE SPECIFICATION.
+  // `realizeExpandableSegments` takes `nextInt(min, max + 1)` once per segment in CONTIG order and
+  // nothing else on this path touches that stream, so the whole of the pipeline's randomness is
+  // these few integers. (`convertToProteinaBatch` asks for `permutation(1)` twice, whose
+  // Fisher-Yates loop runs zero times and draws nothing.)
+  PipelineRng prng((uint32_t)seed);
+  vector<int> lengths;
   int n = 0;
-  for (const Segment& s : segments) n += s.minLen;
+  for (const Segment& s : segments) {
+    const int len = s.minLen == s.maxLen ? s.minLen : prng.nextInt(s.minLen, s.maxLen + 1);
+    lengths.push_back(len);
+    n += len;
+  }
   Batch b;
   b.resize(n);
   for (int i = 0; i < n; ++i) {
@@ -652,7 +678,9 @@ inline Batch buildSpecBatch(const vector<Segment>& segments,
   vector<string> owner(n);
   {
     int at = 0;
-    for (const Segment& s : segments) for (int k = 0; k < s.minLen; ++k) owner[at++] = s.name;
+    for (size_t si = 0; si < segments.size(); ++si) {
+      for (int k = 0; k < lengths[si]; ++k) owner[at++] = segments[si].name;
+    }
   }
   applyConditions(b, conditions, owner);
   return b;
@@ -835,7 +863,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  const Batch b = buildSpecBatch(parseContig(contig), conditions);
+  const Batch b = buildSpecBatch(parseContig(contig), conditions, seed);
   const int n = b.n;
 
   // The sampler's first step, exactly as the exporter reaches it.
