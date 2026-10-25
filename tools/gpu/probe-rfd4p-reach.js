@@ -26,9 +26,10 @@
  *     n    f16 was   f16 now   f32    chunks now
  *   400       1269      1269  2436    1
  *   512       2056      2056  3395    1
- *   513       3001      2237  3381    2     <- was +46% in ONE residue, now +8.8%
- *   600       3769      2719  4290    2
- *  1000       8840      5918 10285    5
+ *   513       3001      2245  3381    2     <- was +46% in ONE residue, now +9.2%
+ *   600       3769      2724  4290    2
+ *   800          -      4114     -    3
+ *  1000       8840      5926 10285    5
  *  1200          -      8103 14403    6
  *
  * 🔴 NOTHING REFUSES UP TO n = 1200, so the ceiling is the 16 GB this machine shares with

@@ -369,8 +369,13 @@ export class Rfd4pTrunkGpu {
       zInitStatic: b('zInitStatic', triF16 ? Math.ceil((nn * P) / 2) : nn * P),
       zInit: b('zInit', triF16 ? Math.ceil((nn * P) / 2) : nn * P),
       z: b('z', triF16 ? Math.ceil((nn * P) / 2) : nn * P),
-      aT: b('aT', triF16 ? Math.ceil((T * nnPad) / 2) : T * nn),
-      bT: b('bT', triF16 ? Math.ceil((T * nnPad) / 2) : T * nn),
+      // 🔴 nPad x nPad IN f16, NOT n x nPad: the chunked incoming triangle reads its
+      // operand transposed by stride, so k reaches row nPad - 1 and that row has to EXIST
+      // and be zero. A slice of n*nPad has no such row and the read lands in the next
+      // channel's data. Costs nPad/n, about 1%. The single-chunk arm uses the narrower
+      // n*nPad layout and fits inside this.
+      aT: b('aT', triF16 ? Math.ceil((T * nPad * nPad) / 2) : T * nn),
+      bT: b('bT', triF16 ? Math.ceil((T * nPad * nPad) / 2) : T * nn),
       x: b('x', triF16 ? Math.ceil((T * Math.ceil(nn / 4) * 4) / 2) : T * Math.ceil(nn / 4) * 4),
       zc: b('zc', triF16 ? Math.ceil((R * P) / 2) : R * P),
       proj: R < nn ? b('proj', triF16 ? R * T : R * 2 * T) : null,
@@ -626,8 +631,34 @@ export class Rfd4pTrunkGpu {
     // The pad costs nothing and corrupts nothing: WebGPU zero-initialises, the scatter never
     // writes the padding, and a zero contributes zero to the contraction - which is the same
     // reason the single-chunk arm can contract over nPad.
+    // 🔴 AND THE INCOMING TRIANGLE NO LONGER TRANSPOSES ANY DATA - THE GEMM READS THE
+    // TRANSPOSE BY SWAPPING TWO STRIDES. The contraction is x[i][j] = sum_k a[k][i] b[k][j]
+    // going in, against sum_k a[i][k] b[j][k] going out, and both are the SAME bytes read
+    // with `m` and `k` exchanged: {m: st, k: 1} outgoing, {m: 1, k: st} incoming. So the
+    // scatter writes one natural layout for both directions and `tri-gate-in` stops being
+    // a transpose.
+    //
+    // It was 1510.7 ms of a 5846.4 ms pass at n = 600 - 25.8%, and 16x its own outgoing
+    // twin at 90.9 - entirely because of the write pattern: `at = c*bs + (r%n)*st + r/n`
+    // advances by `st` as r advances, so consecutive workgroups wrote a row apart and
+    // nothing coalesced, where the outgoing index advances by 1 and does. Measured, the two
+    // scatters together go 1601.6 ms -> 103.98, and the pass 5846.4 -> 4401.7.
+    //
+    // 🔴 AND THE STRIDED READ COSTS THE CONTRACTION NOTHING, which was the risk worth
+    // measuring rather than assuming: {m: 1, k: st} fails `vecIO`'s `A.k === 1`, so the
+    // incoming GEMM drops off the vectorised submatrix path. It reads **297.9 ms against
+    // the outgoing direction's 300.3** - the two are the same kernel cost to within noise,
+    // so what the vector path buys here is nothing and what the transpose cost was
+    // everything.
+    //
+    // 🔴 THE ROW DIMENSION HAS TO BE PADDED TOO, not just the column one, and getting that
+    // wrong reads the NEXT CHANNEL rather than zeros: with k running to nPad, the incoming
+    // read k*st + i reaches row nPad - 1, which is past n - 1. A per-channel slice of
+    // n*nPad has no such row and the read lands in channel c+1's data. nPad*nPad does, and
+    // WebGPU zero-initialises it, so those k contribute nothing. It costs nPad/n - about 1%
+    // of aT and bT.
     const stride = triF16 ? nPad : n;
-    const batchStride = triF16 ? nnPad : nn;
+    const batchStride = triF16 ? nPad * nPad : nn;
     const steps = [];
     for (const [r0, rows] of this.chunks) {
       steps.push(
@@ -635,19 +666,23 @@ export class Rfd4pTrunkGpu {
           ? await e.pairWriteLnIn({ z: B.z, zIn, pp: B.pp, zc: B.zc, w: t.lnIn, rows, n, r0, splitPp, outF16: triF16 })
           : await e.norm({ type: 'ln', x: B.z, y: B.zc, rows, width: P, w: t.lnIn, xOff: r0 * P, inF16: triF16, outF16: triF16 }),
         await e.triProjG({ x: B.zc, w: t.projG, proj: B.proj, gz: this.gzView(r0, rows), rows, aF16: triF16, outF16: triF16 }),
-        await e.map(incoming ? 'tri-gate-in' : 'tri-gate-out', rows * T,
+        // One layout, both directions - so one pipeline, and the name no longer says which.
+        await e.map('tri-gate', rows * T,
           [{ buffer: B.aT, write: true, type: triType }, { buffer: B.bT, write: true, type: triType }, { buffer: B.proj, type: triType }],
           `let rr = i / 256u; let c = i % 256u; let r = U(0u) + rr; let n = U(1u);
   let st = U(2u); let bs = U(3u);
   let pr = rr * 512u;
   let av = b2[pr + c];
   let bv = b2[pr + 256u + c];
-  ${incoming ? 'let at = c * bs + (r % n) * st + r / n;' : 'let at = c * bs + (r / n) * st + r % n;'}
+  let at = c * bs + (r / n) * st + r % n;
   b0[at] = av; b1[at] = bv;`, [r0, n, stride, batchStride]),
       );
     }
+    // The transpose lives here now, as two strides rather than a pass over the data.
+    const opA = incoming ? { s0: batchStride, m: 1, k: stride } : { s0: batchStride, m: stride, k: 1 };
+    const opB = incoming ? { s0: batchStride, n: 1, k: stride } : { s0: batchStride, n: stride, k: 1 };
     steps.push(await e.gemm({ m: n, n, k: stride, a: B.aT, b: B.bT, c: B.x, batches: [T, 1], f16: this.half, aF16: triF16, cF16: triF16,
-      A: { s0: batchStride, m: stride, k: 1 }, B: { s0: batchStride, n: stride, k: 1 }, C: { s0: xBatchStride, m: n, n: 1 }, label: incoming ? 'tri-in' : 'tri-out' }));
+      A: opA, B: opB, C: { s0: xBatchStride, m: n, n: 1 }, label: incoming ? 'tri-in' : 'tri-out' }));
     // 🔴 THE GATE IS NOT RECOMPUTED. This loop used to re-run `norm` and `triProjG` per
     // chunk purely to rebuild `gz`, because gz was R-indexed and the first loop's later
     // chunks had overwritten the earlier ones. triProjG is one fused m x 1408 x 384 GEMM
