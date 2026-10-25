@@ -527,10 +527,11 @@ residues the cropped example does not contain, so building one from the spec fai
     the spec path already ran, but with every branch a contig's `<M>` stubs made inert now
     live. Held to the reference over sixteen cases: the seven shipped structures and nine the
     gate synthesises, because the shipped seven could not reach most of it (see the three
-    findings below the table). What is left of the structure path is `convertToProteinaBatch`
-    (1175-1606) - assembling what the stages produced into the batch tensors - plus
-    `applyContig` with PRESERVED segments, native zstd, `processSampleToAtoms`'s `inputAtoms`
-    path and the coordinate-group permutation. In the order they run, with what each needs:
+    findings below the table). `convertToProteinaBatch` (1175-1606) is ported too, so a
+    structure now reaches the batch the model reads - 46 keys held to the reference over all
+    seventeen cases. What is left of the structure path is `applyContig` with PRESERVED
+    segments, native zstd, `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group
+    permutation. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|
@@ -616,6 +617,25 @@ residues the cropped example does not contain, so building one from the spec fai
     narrowing hides - twice now, in two different columns.** Two clauses here genuinely cannot
     be falsified by any input (the `isfinite` guard on the shift, since `NaN - x` is `NaN`, and
     the `|| !allowed` in the sequence conditioning) and `atoms.h` says so of each.
+
+    🔴 **AND `convertToProteinaBatch` OPENS WITH TWO DRAWS WHOSE ORDER TWO CHAINS CANNOT SEE.**
+    It permutes the chains and then the molecules from the stream the realisation and the
+    internal coordinates have already advanced; at one element `permutation(1)` draws nothing,
+    and at TWO the two draws agree often enough that swapping them left all sixteen cases
+    green. `+threechains` (`ppi_pdl1` with its one real chain duplicated twice) turns it red,
+    and the failure reads as `chain_iid` and `molecule_iid` with each other's values - which is
+    what a swapped draw order looks like and what no geometry check could show. Four more
+    conventions were watched failing there: a masked chain taking a FRESH entity after every
+    one the input had (16 cases), `element` carrying -1 rather than the atomic number wherever
+    the residue is masked (3), `is_resolved_mask` spreading over a token with ALL where the
+    context masks spread with ANY (8), and the chain permutation itself (9).
+
+    🔴 **AND `tetrahedral_vertices` WAS STUBBED AT -1 AND THE GATE AGREED WITH IT.** The
+    reference fills it only `if (tokenIds)`, the earlier chirality arm passed `{}` on both
+    sides, so neither computed anything and the column matched perfectly. Building the batch
+    passes real token ids and `sm_sam` - the one structure with stereocentres - went red at
+    once. **A comparison where both sides take the same early return is not a comparison**;
+    this is the third shape of that mistake recorded here, after the `Math.fround` pair.
 
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig

@@ -16,6 +16,7 @@ import {
   ensureStereochemistryAnnotations, computeChiralityFeatures,
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
+import { STANDARD_POLYMER_RESIDUES } from "../../../shared/rfd4p/encoding.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -26,6 +27,7 @@ import {
   materializeInternalCoords,
   unindexFlaggedTokens,
   centerAndFeaturizeCentroid, addSupportsLocalLatentAnnotation, buildAtom37Slots,
+  convertToProteinaBatch,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -377,6 +379,11 @@ cases.set("5o45_cropped+icgroups",
 cases.set("ppi_pdl1+interior-unindexed", withInteriorUnindexed(cases.get("ppi_pdl1")));
 cases.set("motif_idx_1prw+beside-expandable",
   withUnindexedBesideExpandable(cases.get("motif_idx_1prw")));
+// 🔴 THREE CHAINS, BECAUSE TWO CANNOT SEE THE DRAW ORDER. `convertToProteinaBatch` permutes
+// the chains and then the molecules from one stream; at one element each draws nothing, and at
+// two the two draws agree often enough that swapping them left all sixteen cases green.
+cases.set("ppi_pdl1+threechains",
+  withDuplicatedChain(withDuplicatedChain(cases.get("ppi_pdl1"), "Y"), "Z"));
 
 let structures = 0;
 let differing = 0;
@@ -729,6 +736,113 @@ for (const [name, text] of cases) {
       // fround of both sides cannot tell that from a port that kept it in double, which is
       // this gate's own recorded mistake in another column. Exact, with the native side
       // printed at full precision, turns that mutation red.
+      // `convertToProteinaBatch`: the batch the model reads, every key of it. Compared the same
+      // way as the bond planes - size, sum, non-zero count and a POSITION-WEIGHTED checksum -
+      // because `coords` alone is three million floats at 924 atoms.
+      // 🔴 THE FLOAT KEYS COUNT THEIR NaNs RATHER THAN SUMMING THEM. Most of these columns are
+      // NaN by design (an absent condition), and a sum over them is NaN however wrong the finite
+      // entries are - which is a comparison that passes on everything.
+      const { batch: refBatch } = convertToProteinaBatch(unindexed, { centroidWithoutCond, rng });
+      const bN = Number((out3.find((l) => l.startsWith("azbatch\t")) ?? "\t0").split("\t")[1]);
+      const gotB = new Map(out3.filter((l) => /^azbatch\t[a-z]/.test(l))
+        .map((l) => { const f = l.split("\t"); return [f[1], f.slice(2)]; }));
+      const intKeys = [["residue_type", "residue_type"], ["condition_sequence", "condition_sequence_1_residue"],
+        ["token_type", "token_type"], ["tok_idx", "tok_idx"], ["chain_iid", "chain_iid"],
+        ["molecule_iid", "molecule_iid"], ["molecule_entity_id", "molecule_entity_id"],
+        ["supports_local_latent", "supports_local_latent"],
+        ["is_in_context_conditioning", "is_in_context_conditioning"],
+        ["is_resolved_mask", "is_resolved_mask"], ["insertion_source_idx", "insertion_source_idx"],
+        ["coord_cond_mask", "coord_cond_mask"],
+        ["condition_secondary_structure", "condition_secondary-structure_1_residue"],
+        ["condition_index_group", "condition_index-group_1_token"],
+        ["cath_label", "condition_cath-label_1_residue"], ["atom37_mask", "atom37_mask"],
+        ["element", "element"], ["ground_truth_element", "ground_truth_element"],
+        ["charge", "charge"], ["incident_bond_type_counts", "incident_bond_type_counts"],
+        ["condition_index", "condition_index_1_residue"],
+        ["condition_coordinate_group", "condition_CoordinateGroup_1_atom"],
+        ["condition_hotspot", "condition_hotspot_1_atom"],
+        ["condition_rasa", "condition_rasa-binned_1_atom"],
+        ["condition_hbond", "condition_hbond_1_atom"],
+        ["condition_pistack", "condition_pistack_1_atom"],
+        ["condition_pication", "condition_pication_1_atom"],
+        ["condition_saltbridge", "condition_saltbridge_1_atom"],
+        ["condition_hydrophobic", "condition_hydrophobic_1_atom"],
+        ["condition_metal_coord", "condition_metal-coord_1_atom"],
+        ["chiral_frame_atoms", "chiral_frame_atoms"], ["chiral_slot_owner", "chiral_slot_owner"],
+        ["tetrahedral_vertices", "tetrahedral_vertices"], ["bond_mask", "bond_mask"],
+        ["bond_order", "bond_order"], ["is_aromatic", "is_aromatic"],
+        ["token_bond_path_length", "token_bond_path_length"],
+        ["canonical_polymer_ordering", "canonical_polymer_ordering"]];
+      const floatKeys = [["coords", "coords"], ["coords_nm", "coords_nm"],
+        ["condition_coordinate", "condition_coordinate_1_atom"],
+        ["condition_internal_coordinate", "condition_InternalCoordinate_1_atom"],
+        ["condition_chain_centroid", "condition_ChainCentroid_1_atom"],
+        ["chirality", "chirality"], ["loss_weight", "loss_weight"]];
+      if (bN !== refBatch.residue_type.shape[1]) {
+        wrong.push(`az batch tokens ${bN} vs ${refBatch.residue_type.shape[1]}`);
+      } else {
+        for (const [name, key] of intKeys) {
+          const want = refBatch[key]?.data;
+          const g = gotB.get(name);
+          if (!want) { wrong.push(`az batch ${name} absent from reference`); continue; }
+          if (!g) { wrong.push(`az batch ${name} missing`); continue; }
+          let sum = 0; let nz = 0; let weighted = 0;
+          for (let i = 0; i < want.length; i += 1) {
+            const v = want[i];
+            sum += v;
+            if (v) { nz += 1; weighted += v * (i % 1000003); }
+          }
+          if (Number(g[0]) !== want.length || Number(g[1]) !== sum || Number(g[2]) !== nz
+            || Number(g[3]) !== weighted) {
+            wrong.push(`az batch ${name} ${g.join("/")} vs ${want.length}/${sum}/${nz}/${weighted}`);
+          }
+        }
+        for (const [name, key] of floatKeys) {
+          const want = refBatch[key]?.data;
+          const g = gotB.get(name);
+          if (!want) { wrong.push(`az batch ${name} absent from reference`); continue; }
+          if (!g) { wrong.push(`az batch ${name} missing`); continue; }
+          let sum = 0; let nan = 0; let nz = 0;
+          for (let i = 0; i < want.length; i += 1) {
+            if (Number.isNaN(want[i])) { nan += 1; continue; }
+            sum += want[i] * ((i % 1000003) + 1);
+            if (want[i] !== 0) nz += 1;
+          }
+          if (Number(g[0]) !== want.length || Number(g[2]) !== nan || Number(g[3]) !== nz
+            || Math.abs(Number(g[1]) - sum) > Math.abs(sum) * 1e-6 + 1e-6) {
+            wrong.push(`az batch ${name} ${g.join("/")} vs ${want.length}/${sum}/${nan}/${nz}`);
+          }
+        }
+        // The 28 sequence-probability columns are one tensor here and 28 keys there.
+        {
+          const g = gotB.get("seq_prob");
+          let sum = 0; let nan = 0; let nz = 0; let len = 0;
+          STANDARD_POLYMER_RESIDUES.forEach((tok, k) => {
+            const want = refBatch[`condition_sequence-probability-${tok}_1_residue`].data;
+            for (let t = 0; t < want.length; t += 1) {
+              const i = k * want.length + t;
+              len += 1;
+              if (Number.isNaN(want[t])) { nan += 1; continue; }
+              sum += want[t] * ((i % 1000003) + 1);
+              if (want[t] !== 0) nz += 1;
+            }
+          });
+          if (!g) wrong.push("az batch seq_prob missing");
+          else if (Number(g[0]) !== len || Number(g[2]) !== nan || Number(g[3]) !== nz
+            || Math.abs(Number(g[1]) - sum) > Math.abs(sum) * 1e-6 + 1e-6) {
+            wrong.push(`az batch seq_prob ${g.join("/")} vs ${len}/${sum}/${nan}/${nz}`);
+          }
+        }
+        {
+          const g = gotB.get("centroid");
+          const want = refBatch.centroid_of_atoms_without_coordinate_conditioning.data;
+          if (!g) wrong.push("az batch centroid missing");
+          else if ([0, 1, 2].some((k) => !eq(Number(g[1 + k]), want[k]))) {
+            wrong.push(`az batch centroid ${g.slice(1).join(",")} vs ${[...want].join(",")}`);
+          }
+        }
+      }
+
       // `computeTokenBondFeatures`: five [nTokens, nTokens] planes, compared as a sum, a
       // non-zero count and a POSITION-WEIGHTED checksum - element by element is four million
       // numbers a structure, and a plain sum cannot see a transpose.

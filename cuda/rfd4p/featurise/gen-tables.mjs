@@ -59,6 +59,28 @@ for (let i = 0; i < nTok; i += 8) {
 w("};");
 w("");
 
+w("// `TOKEN_TO_IDX`: a residue name to its vocabulary index, which IS its `residue_type`.");
+w("inline const std::unordered_map<std::string, int> TOKEN_TO_IDX = {");
+for (let i = 0; i < nTok; i += 4) {
+  w("    " + UNIFIED_ATOM37_TOKENS.slice(i, i + 4)
+    .map((name, k) => `{${str(name)}, ${i + k}}`).join(", ") + ",");
+}
+w("};");
+w("");
+
+w("// `token_group_by_idx`: each token's TOKEN TYPE id, which `convertToProteinaBatch` reads to");
+w("// decide a token's type from its residue name. -1 where the group names no known type.");
+w(`inline const std::array<int, ${nTok}> TOKEN_GROUP_TYPE = {`);
+for (let i = 0; i < nTok; i += 12) {
+  w("    " + UNIFIED_ATOM37_TOKENS.slice(i, i + 12).map((_, k) => {
+    const grp = UNIFIED_ATOM37_ENCODING.token_group_by_idx[i + k];
+    const id = TOKEN_TYPE_IDS[grp];
+    return id === undefined ? -1 : id;
+  }).join(", ") + ",");
+}
+w("};");
+w("");
+
 w("// `[token][slot]` atom names, empty where the token has no atom in that slot.");
 w(`inline const std::array<std::array<const char*, 37>, ${nTok}> TOKEN_ATOMS = {{`);
 for (const t of UNIFIED_ATOM37_TOKENS) {

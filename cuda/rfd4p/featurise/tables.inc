@@ -39,6 +39,65 @@ inline const std::array<const char*, 147> TOKENS = {
     "GLA", "A2G", "NGA",
 };
 
+// `TOKEN_TO_IDX`: a residue name to its vocabulary index, which IS its `residue_type`.
+inline const std::unordered_map<std::string, int> TOKEN_TO_IDX = {
+    {"<M>", 0}, {"ALA", 1}, {"ARG", 2}, {"ASN", 3},
+    {"ASP", 4}, {"CYS", 5}, {"GLN", 6}, {"GLU", 7},
+    {"GLY", 8}, {"HIS", 9}, {"ILE", 10}, {"LEU", 11},
+    {"LYS", 12}, {"MET", 13}, {"PHE", 14}, {"PRO", 15},
+    {"SER", 16}, {"THR", 17}, {"TRP", 18}, {"TYR", 19},
+    {"VAL", 20}, {"UNK", 21}, {"A", 22}, {"C", 23},
+    {"G", 24}, {"U", 25}, {"N", 26}, {"DA", 27},
+    {"DC", 28}, {"DG", 29}, {"DT", 30}, {"DN", 31},
+    {"<A>", 32}, {"<G>", 33}, {"SEP", 34}, {"TPO", 35},
+    {"CSO", 36}, {"PTR", 37}, {"CME", 38}, {"KCX", 39},
+    {"LLP", 40}, {"CSD", 41}, {"HIC", 42}, {"ALY", 43},
+    {"HYP", 44}, {"MLY", 45}, {"TYS", 46}, {"M3L", 47},
+    {"OCS", 48}, {"CSS", 49}, {"CSX", 50}, {"CAS", 51},
+    {"AIB", 52}, {"0TD", 53}, {"MLZ", 54}, {"NLE", 55},
+    {"MEQ", 56}, {"2MR", 57}, {"4D4", 58}, {"D2T", 59},
+    {"ABA", 60}, {"YCM", 61}, {"ORN", 62}, {"SEC", 63},
+    {"MEN", 64}, {"CGU", 65}, {"KPI", 66}, {"PHD", 67},
+    {"SMC", 68}, {"MHS", 69}, {"TPQ", 70}, {"NEP", 71},
+    {"MK8", 72}, {"DPP", 73}, {"ALC", 74}, {"CAF", 75},
+    {"DDE", 76}, {"CIR", 77}, {"PHI", 78}, {"SCH", 79},
+    {"DAB", 80}, {"SCY", 81}, {"LYR", 82}, {"NMM", 83},
+    {"SNC", 84}, {"SME", 85}, {"TYQ", 86}, {"MHO", 87},
+    {"FTR", 88}, {"TRQ", 89}, {"EEP", 90}, {"4HH", 91},
+    {"3FG", 92}, {"TOX", 93}, {"AGM", 94}, {"CCS", 95},
+    {"NIY", 96}, {"V5N", 97}, {"HY3", 98}, {"OMY", 99},
+    {"P1L", 100}, {"4BF", 101}, {"MGN", 102}, {"MP8", 103},
+    {"004", 104}, {"0AF", 105}, {"5CT", 106}, {"ASA", 107},
+    {"IYR", 108}, {"TRX", 109}, {"5OH", 110}, {"SEB", 111},
+    {"DAH", 112}, {"TBG", 113}, {"ALO", 114}, {"DDZ", 115},
+    {"KCR", 116}, {"GLZ", 117}, {"IIL", 118}, {"ML3", 119},
+    {"PPN", 120}, {"SLL", 121}, {"TYI", 122}, {"CSU", 123},
+    {"CYG", 124}, {"ILX", 125}, {"OAS", 126}, {"HRG", 127},
+    {"OMT", 128}, {"PBF", 129}, {"API", 130}, {"HIP", 131},
+    {"MIS", 132}, {"ALN", 133}, {"NAG", 134}, {"BMA", 135},
+    {"MAN", 136}, {"FUC", 137}, {"GLC", 138}, {"GAL", 139},
+    {"BGC", 140}, {"SIA", 141}, {"NDG", 142}, {"XYP", 143},
+    {"GLA", 144}, {"A2G", 145}, {"NGA", 146},
+};
+
+// `token_group_by_idx`: each token's TOKEN TYPE id, which `convertToProteinaBatch` reads to
+// decide a token's type from its residue name. -1 where the group names no known type.
+inline const std::array<int, 147> TOKEN_GROUP_TYPE = {
+    4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+    1, 1, 1, 2, 2, 2, 2, 2, 3, 4, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5,
+};
+
 // `[token][slot]` atom names, empty where the token has no atom in that slot.
 inline const std::array<std::array<const char*, 37>, 147> TOKEN_ATOMS = {{
     {{"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}},

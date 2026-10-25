@@ -35,6 +35,18 @@ struct PipelineRng {
   int nextInt(int lo, int hiExclusive) {
     return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
   }
+  /** Fisher-Yates, from the top down - `convertToProteinaBatch` permutes the chains and then
+   *  the molecules, and at one element the loop draws NOTHING, which is why a one-chain job is
+   *  seed-independent past its segment lengths. */
+  vector<int> permutation(int n) {
+    vector<int> p(n);
+    for (int i = 0; i < n; ++i) p[i] = i;
+    for (int i = n - 1; i > 0; --i) {
+      const int j = (int)std::floor(nextFloat() * (i + 1));
+      std::swap(p[i], p[j]);
+    }
+    return p;
+  }
   /**
    * A uniformly random rotation: nine Box-Muller normals, then Gram-Schmidt.
    *

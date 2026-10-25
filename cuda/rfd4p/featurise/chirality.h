@@ -505,6 +505,33 @@ inline Features features(const cif::AtomSite& a, const vector<cif::Bond>& bonds,
     centers.push_back({i, bonded, geometry});
   }
 
+  // 🔴 `tetrahedral_vertices` IS FILLED ONLY WHERE THE CALLER HAS TOKEN IDS, and until the batch
+  // was built nobody passed any - so this stayed at -1 and the gate, passing `{}` on both sides,
+  // agreed with it. It is the four TOKENS around a tetrahedral centre, and it exists only where
+  // the centre and all its neighbours are atomised ligand atoms: a polymer stereocentre is
+  // described by the frames above instead.
+  //
+  // 🔴 AND A THREE-COORDINATE CENTRE USES ITSELF AS THE FOURTH VERTEX. The lone pair has no
+  // atom, so the centre stands in for it - dropping to three entries would change the shape and
+  // padding with -1 would name a vertex that is not there.
+  if (!tokenIds.empty()) {
+    for (const Center& c : centers) {
+      if (c.geometry != "tetrahedral") continue;
+      if (c.bonded.size() != 3 && c.bonded.size() != 4) continue;
+      vector<int> support{c.idx};
+      support.insert(support.end(), c.bonded.begin(), c.bonded.end());
+      bool ok = true;
+      for (const int idx : support) {
+        const bool ligand = !a.isPolymer[idx];
+        if (!ligand || atomize.empty() || !atomize[idx]) { ok = false; break; }
+      }
+      if (!ok) continue;
+      vector<int> v = c.bonded;
+      if (v.size() == 3) v.push_back(c.idx);
+      for (int k = 0; k < 4; ++k) out.tetrahedralVertices[(size_t)c.idx * 4 + k] = tokenIds[v[k]];
+    }
+  }
+
   struct Frame { bool isCenter; int cidx; vector<int> bonded; vector<Vec3> rotated; };
   vector<Frame> frames;
   for (const Center& c : centers) {

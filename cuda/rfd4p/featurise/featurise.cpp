@@ -64,6 +64,20 @@ struct Config {
 // `condition_index` is 1 by that route, not by anybody's choice.
 struct Batch {
   int n = 0;
+  // 🔴 THESE ELEVEN ARE THE STRUCTURE PATH'S, AND A CONTIG LEAVES THEM AT THEIR FILL. On the
+  // spec path `convertToProteinaBatch` is a no-op over all of them, which is why they were
+  // absent until a real structure had to go through: `residue_type` is `<M>` for every token,
+  // `coords` is zero because there are none, and `is_resolved_mask` is false because nothing
+  // was observed. A field a contig never writes is still a field the model reads.
+  vector<int> residueType, tokIdx, insertionSourceIdx;  // [n]
+  vector<uint8_t> isResolvedMask;                       // [n]
+  vector<float> lossWeight;                             // [n]
+  vector<float> coords, coordsNm;                       // [n, 37, 3]
+  vector<int> groundTruthElement;                       // [n, 37]
+  vector<int> incidentBondTypeCounts;                   // [n, 37, 10]
+  vector<uint8_t> conditionIndex;                       // [n, 37]  fill 1
+  vector<int> tetrahedralVertices;                      // [n, 4]
+  float centroidWithoutCond[3] = {0, 0, 0};
   vector<uint8_t> paddingMask;              // [n]  all 1
   vector<int> tokenType;                    // [n]
   vector<int> moleculeIid, moleculeEntityId, chainIid, indexGroup;
@@ -91,6 +105,18 @@ struct Batch {
   void resize(int tokens) {
     n = tokens;
     const size_t t = tokens, a = t * 37, p = t * t;
+    residueType.assign(t, 0);          // 0 is `<M>`
+    tokIdx.assign(t, 0);
+    insertionSourceIdx.assign(t, -1);
+    isResolvedMask.assign(t, 0);
+    lossWeight.assign(t, 1.0f);
+    coords.assign(a * 3, 0.f);
+    coordsNm.assign(a * 3, 0.f);
+    groundTruthElement.assign(a, 0);
+    incidentBondTypeCounts.assign(a * 10, 0);
+    conditionIndex.assign(a, 1);
+    tetrahedralVertices.assign(t * 4, 0);
+    centroidWithoutCond[0] = centroidWithoutCond[1] = centroidWithoutCond[2] = std::nanf("");
     paddingMask.assign(t, 1);
     tokenType.assign(t, tables::TT_PROTEIN);
     moleculeIid.assign(t, 0);
@@ -705,28 +731,13 @@ inline void applyConditions(Batch& b,
 // with Box-Muller (`seededRng`, flow.js); the PIPELINE's is mulberry32 (`createSeededRng`,
 // transforms.js) and it decides a ranged segment's realised length. Both are seeded from the job's
 // `seed` and neither consumes the other's stream.
-struct PipelineRng {
-  uint32_t a;
-  explicit PipelineRng(uint32_t seed) : a(seed) {}
-  double nextFloat() {
-    a = a + 0x6d2b79f5u;
-    uint32_t t = (a ^ (a >> 15)) * (1u | a);
-    t = (t + ((t ^ (t >> 7)) * (61u | t))) ^ t;
-    return (double)((t ^ (t >> 14))) / 4294967296.0;
-  }
-  int nextInt(int lo, int hiExclusive) {
-    return lo + (int)std::floor(nextFloat() * (hiExclusive - lo));
-  }
-  vector<int> permutation(int n) {
-    vector<int> p(n);
-    for (int i = 0; i < n; ++i) p[i] = i;
-    for (int i = n - 1; i > 0; --i) {
-      const int j = (int)std::floor(nextFloat() * (i + 1));
-      std::swap(p[i], p[j]);
-    }
-    return p;
-  }
-};
+//
+// 🔴 AND IT IS `atoms.h`'s, NOT A SECOND COPY. This file carried its own identical mulberry32 with
+// `permutation` on it while `atoms.h`'s carried `randomSO3`, so the spec path and the structure
+// path drew from two objects that merely happened to agree - and the structure path needs BOTH
+// methods. One generator, one stream; a second copy is a divergence waiting for someone to edit
+// one of them.
+using PipelineRng = atoms::PipelineRng;
 
 // ---------------------------------------------------------------- spec -> batch
 //
@@ -738,6 +749,277 @@ struct PipelineRng {
 //
 // What is actually computed is the chain: `token_bond_path_length[i][j] = |i - j|` over the single
 // bonded run, and `canonical_polymer_ordering` is -1 at the next residue and +1 at the previous.
+/**
+ * `convertToProteinaBatch` with real atoms - the general case `buildSpecBatch` below is the
+ * contig-shaped specialisation of.
+ *
+ * 🔴 IT OPENS WITH TWO DRAWS AND THEY ARE THE FIRST THING TO GET RIGHT: the chain permutation
+ * then the molecule permutation, from the SAME stream the segment realisation and the internal
+ * coordinates have already been drawing from. At one chain each is `permutation(1)`, whose
+ * Fisher-Yates loop runs zero times and draws nothing, which is exactly why a one-chain job
+ * hides a mistake here and three chains do not.
+ *
+ * 🔴 AND AT INFERENCE A CHAIN WHOSE SEQUENCE IS ENTIRELY `<M>` TAKES A FRESH ENTITY, in sorted
+ * chain order, numbered after every entity the input had. Two masked chains are therefore NOT
+ * the same entity however identical they look - which is the opposite of the rule everywhere
+ * else in this featuriser, where identical contents mean one entity.
+ *
+ * 🔴 AND `element` IS THE GROUND TRUTH ONLY WHERE THE SEQUENCE IS GIVEN. `ground_truth_element`
+ * always carries the atomic number; `element` carries -1 wherever the residue is masked, so the
+ * model is not handed the composition of a residue it is being asked to design.
+ */
+inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& centroid,
+                                 atoms::PipelineRng& prng, int pathLengthCutoff = 64,
+                                 bool isInference = true) {
+  const size_t nAtoms = a.n();
+  const vector<int> tokStarts = atoms::tokenStarts(a);
+  const int nTokens = tokStarts.empty() ? 0 : (int)tokStarts.size() - 1;
+  Batch b;
+  b.resize(nTokens);
+  b.chiralFrameAtoms.assign((size_t)nTokens * 48, -1);
+  for (int k = 0; k < 3; ++k) b.centroidWithoutCond[k] = centroid.v[k];
+  if (nTokens == 0) return b;
+
+  vector<string> uniqueChains;
+  for (const string& c : a.ids.chainIid) {
+    if (std::find(uniqueChains.begin(), uniqueChains.end(), c) == uniqueChains.end()) {
+      uniqueChains.push_back(c);
+    }
+  }
+  std::sort(uniqueChains.begin(), uniqueChains.end());
+  std::map<string, int> chainToIdx;
+  for (size_t i = 0; i < uniqueChains.size(); ++i) chainToIdx[uniqueChains[i]] = (int)i;
+  std::set<int> molSet(a.ids.moleculeIid.begin(), a.ids.moleculeIid.end());
+  const vector<int> uniqueMols(molSet.begin(), molSet.end());
+  std::map<int, int> molToIdx;
+  for (size_t i = 0; i < uniqueMols.size(); ++i) molToIdx[uniqueMols[i]] = (int)i;
+  const vector<int> chainPerm = prng.permutation((int)uniqueChains.size());
+  const vector<int> molPerm = prng.permutation((int)uniqueMols.size());
+
+  std::set<int> entSet(a.ids.moleculeEntity.begin(), a.ids.moleculeEntity.end());
+  const vector<int> uniqueEntities(entSet.begin(), entSet.end());
+  std::map<int, int> entityToIdx;
+  for (size_t i = 0; i < uniqueEntities.size(); ++i) entityToIdx[uniqueEntities[i]] = (int)i;
+  vector<int> entityIds(nAtoms);
+  for (size_t i = 0; i < nAtoms; ++i) entityIds[i] = entityToIdx[a.ids.moleculeEntity[i]];
+
+  vector<string> cSeqNames(nAtoms, "<M>");
+  auto cSeqIt = a.ann.strings.find("condition_sequence_1_residue");
+  if (cSeqIt != a.ann.strings.end() && cSeqIt->second.size() == nAtoms) cSeqNames = cSeqIt->second;
+  if (isInference) {
+    int nextEntity = (int)uniqueEntities.size();
+    vector<string> maskedChains;
+    for (size_t i = 0; i < nAtoms; ++i) {
+      if (cSeqNames[i] != "<M>") continue;
+      const string& cid = a.ids.chainIid[i];
+      if (std::find(maskedChains.begin(), maskedChains.end(), cid) == maskedChains.end()) {
+        maskedChains.push_back(cid);
+      }
+    }
+    std::sort(maskedChains.begin(), maskedChains.end());
+    for (const string& cid : maskedChains) {
+      for (size_t i = 0; i < nAtoms; ++i) if (a.ids.chainIid[i] == cid) entityIds[i] = nextEntity;
+      ++nextEntity;
+    }
+  }
+
+  vector<int> atomTokenType(nAtoms, tables::TT_UNKNOWN);
+  for (size_t i = 0; i < nAtoms; ++i) {
+    if (a.isStandardUnknownOrMaskedDna[i]) atomTokenType[i] = tables::TT_DNA;
+    if (a.isStandardUnknownOrMaskedRna[i]) atomTokenType[i] = tables::TT_RNA;
+    if (a.isStandardUnknownOrMaskedAa[i]) atomTokenType[i] = tables::TT_PROTEIN;
+    auto it = tables::TOKEN_TO_IDX.find(a.site.resName[i]);
+    if (it != tables::TOKEN_TO_IDX.end()) {
+      const int tid = tables::TOKEN_GROUP_TYPE[it->second];
+      if (tid != tables::TT_UNKNOWN && tid >= 0) atomTokenType[i] = tid;
+    }
+    if (a.atomize[i]) atomTokenType[i] = tables::TT_ATOMIZED;
+  }
+
+  // `is_resolved_mask` spreads over a token with ALL, not ANY - one unobserved atom makes the
+  // whole token unresolved, where the context and sequence masks spread with ANY.
+  vector<uint8_t> atomResolved(nAtoms);
+  for (size_t i = 0; i < nAtoms; ++i) {
+    atomResolved[i] = a.site.occupancy[i] > 0.0 && !std::isnan(a.site.x[i]) &&
+                      !std::isnan(a.site.y[i]) && !std::isnan(a.site.z[i]);
+  }
+  auto idxIt = a.ann.ints.find("condition_index_1_residue");
+  vector<uint8_t> unindexed(nAtoms, 0);
+  if (idxIt != a.ann.ints.end() && idxIt->second.size() == nAtoms) {
+    for (size_t i = 0; i < nAtoms; ++i) unindexed[i] = idxIt->second[i] ? 0 : 1;
+  }
+  vector<uint8_t> resolvedSpread(nAtoms, 0), inContextSpread(nAtoms, 0);
+  for (int t = 0; t < nTokens; ++t) {
+    const int s = tokStarts[t], e = tokStarts[t + 1];
+    bool all = true, any = false;
+    for (int i = s; i < e; ++i) { all = all && atomResolved[i]; any = any || unindexed[i]; }
+    for (int i = s; i < e; ++i) { resolvedSpread[i] = all; inContextSpread[i] = any; }
+  }
+
+  // `encodeResNames(..., '<A>')`: an atomised atom encodes as `<A>` whatever it is called, and
+  // a masked non-atomised residue stays `<M>` even where the residue name would resolve.
+  const int idxAtomized = tables::TOKEN_TO_IDX.count("<A>") ? tables::TOKEN_TO_IDX.at("<A>") : 0;
+  const int idxMasked = tables::TOKEN_TO_IDX.count("<M>") ? tables::TOKEN_TO_IDX.at("<M>") : 0;
+  auto encode = [&](const string& name, size_t i) {
+    if (a.atomize[i]) return idxAtomized;
+    auto it = tables::TOKEN_TO_IDX.find(name);
+    return it == tables::TOKEN_TO_IDX.end() ? idxAtomized : it->second;
+  };
+  vector<int> atomResidueType(nAtoms), atomCSeq(nAtoms);
+  for (size_t i = 0; i < nAtoms; ++i) {
+    atomResidueType[i] = encode(a.site.resName[i], i);
+    atomCSeq[i] = encode(cSeqNames[i], i);
+    if (cSeqNames[i] == "<M>" && !a.atomize[i]) atomCSeq[i] = idxMasked;
+  }
+
+  // 🔴 RECOMPUTED HERE, ON THE CENTRED ATOMS, because that is where the reference calls it -
+  // the chirality fit reads coordinates, and the gate's own earlier dump ran it before the
+  // centring. Same function, different input, different sixth figure.
+  const chirality::Features chir =
+      chirality::features(a.site, a.bonds, a.ann, a.stereo, a.tokenId, a.atomize);
+
+  auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+  const vector<double>* cCrd =
+      crdIt != a.ann.floats.end() && crdIt->second.size() == nAtoms * 3 ? &crdIt->second : nullptr;
+  auto intIt = a.ann.floats.find("condition_InternalCoordinate_1_atom");
+  const vector<double>* cInt =
+      intIt != a.ann.floats.end() && intIt->second.size() == nAtoms * 3 ? &intIt->second : nullptr;
+  auto cenIt = a.ann.floats.find("condition_ChainCentroid_1_atom");
+  const vector<double>* cCen =
+      cenIt != a.ann.floats.end() && cenIt->second.size() == nAtoms * 3 ? &cenIt->second : nullptr;
+  auto intCol = [&](const char* key) -> const vector<int>* {
+    auto it = a.ann.ints.find(key);
+    return it != a.ann.ints.end() && it->second.size() == nAtoms ? &it->second : nullptr;
+  };
+  const vector<int>* cSec = intCol("condition_secondary-structure_1_residue");
+  const vector<int>* cGrp = intCol("condition_index-group_1_token");
+  vector<int> derivedGrp;
+  if (!cGrp) { derivedGrp = atoms::defaultIndexGroups(a); cGrp = &derivedGrp; }
+  const vector<int>* cCrdGrp = intCol("condition_CoordinateGroup_1_atom");
+  const vector<int>* cHot = intCol("condition_hotspot_1_atom");
+  const vector<int>* cRas = intCol("condition_rasa-binned_1_atom");
+  const vector<int>* cHb = intCol("condition_hbond_1_atom");
+  const vector<int>* cPiStack = intCol("condition_pistack_1_atom");
+  const vector<int>* cPiCation = intCol("condition_pication_1_atom");
+  const vector<int>* cSalt = intCol("condition_saltbridge_1_atom");
+  const vector<int>* cHphob = intCol("condition_hydrophobic_1_atom");
+  const vector<int>* cMcoord = intCol("condition_metal-coord_1_atom");
+  auto cathIt = a.ann.strings.find("condition_cath-label_1_residue");
+  const vector<string>* cCath =
+      cathIt != a.ann.strings.end() && cathIt->second.size() == nAtoms ? &cathIt->second : nullptr;
+
+  for (int t = 0; t < nTokens; ++t) {
+    const int i = tokStarts[t];
+    b.residueType[t] = atomResidueType[i];
+    b.conditionSequence[t] = atomCSeq[i];
+    b.tokenType[t] = atomTokenType[i];
+    b.tokIdx[t] = a.tokenId[i];
+    b.chainIid[t] = chainPerm[chainToIdx[a.ids.chainIid[i]]];
+    b.moleculeIid[t] = molPerm[molToIdx[a.ids.moleculeIid[i]]];
+    b.moleculeEntityId[t] = entityIds[i];
+    b.supportsLocalLatent[t] = a.supportsLocalLatent[i];
+    b.isInContextConditioning[t] = inContextSpread[i];
+    b.isResolvedMask[t] = resolvedSpread[i];
+    b.insertionSourceIdx[t] = a.insertionSourceIdx.size() == nAtoms ? a.insertionSourceIdx[i] : -1;
+    b.coordCondMask[t] = cCrd && std::isfinite((*cCrd)[i * 3]) &&
+                         std::isfinite((*cCrd)[i * 3 + 1]) && std::isfinite((*cCrd)[i * 3 + 2]);
+    b.secondaryStructure[t] = cSec ? (*cSec)[i] : 0;
+    b.indexGroup[t] = (*cGrp)[i];
+    if (cCath) {
+      // `parseCathCode`: the LONGEST progressive key the maps can spell wins, and a part
+      // that is `x` stops the walk - so `3.x.50` is the class alone, not the class and the
+      // topology. `CATH_CODES` already holds each key's whole triple.
+      const string& code = (*cCath)[i];
+      if (!code.empty() && code != "x.x.x.x" && code != "null") {
+        string key;
+        size_t pos = 0;
+        for (int part = 0; part < 3; ++part) {
+          const size_t dot = code.find('.', pos);
+          const string piece = code.substr(pos, dot == string::npos ? string::npos : dot - pos);
+          if (piece.empty() || piece == "x") break;
+          const string next = key.empty() ? piece : key + "." + piece;
+          auto hit = tables::CATH_CODES.find(next);
+          if (hit == tables::CATH_CODES.end()) break;
+          key = next;
+          for (int k = 0; k < 3; ++k) b.cathLabel[(size_t)t * 3 + k] = hit->second[k];
+          if (dot == string::npos) break;
+          pos = dot + 1;
+        }
+      }
+    }
+    if (cCen) {
+      for (int k = 0; k < 3; ++k) b.chainCentroid[(size_t)t * 3 + k] = (float)(*cCen)[i * 3 + k];
+    }
+    for (int k = 0; k < 18; ++k) b.chirality[(size_t)t * 18 + k] = chir.chirality[(size_t)i * 18 + k];
+    for (int k = 0; k < 48; ++k) {
+      b.chiralFrameAtoms[(size_t)t * 48 + k] = chir.frameAtoms[(size_t)i * 48 + k];
+    }
+    for (int k = 0; k < 6; ++k) b.chiralSlotOwner[(size_t)t * 6 + k] = chir.slotOwner[(size_t)i * 6 + k];
+    for (int k = 0; k < 4; ++k) {
+      b.tetrahedralVertices[(size_t)t * 4 + k] = chir.tetrahedralVertices[(size_t)i * 4 + k];
+    }
+  }
+
+  const vector<int> slots = atoms::buildAtom37Slots(a);
+  for (size_t i = 0; i < nAtoms; ++i) {
+    const int s = slots[i];
+    if (s < 0) continue;
+    const size_t ts = (size_t)a.tokenId[i] * 37 + s;
+    b.atom37Mask[ts] = 1;
+    b.coords[ts * 3] = (float)a.coordToBeNoisedX[i];
+    b.coords[ts * 3 + 1] = (float)a.coordToBeNoisedY[i];
+    b.coords[ts * 3 + 2] = (float)a.coordToBeNoisedZ[i];
+    const int z = a.site.atomicNumber[i];
+    b.groundTruthElement[ts] = z;
+    b.element[ts] = cSeqNames[i] != "<M>" ? z : -1;
+    b.charge[ts] = a.site.charge[i];
+    if (cCrd) for (int k = 0; k < 3; ++k) b.condCoord[ts * 3 + k] = (float)(*cCrd)[i * 3 + k];
+    if (cInt) for (int k = 0; k < 3; ++k) b.condInternalCoord[ts * 3 + k] = (float)(*cInt)[i * 3 + k];
+    b.conditionIndex[ts] = idxIt != a.ann.ints.end() ? (idxIt->second[i] ? 1 : 0) : 1;
+    b.coordGroup[ts] = cCrdGrp ? (*cCrdGrp)[i] : -1;
+    b.hotspot[ts] = cHot && (*cHot)[i] ? 1 : 0;
+    b.rasaBinned[ts] = cRas ? (*cRas)[i] : 0;
+    b.hbond[ts] = cHb ? (*cHb)[i] : 0;
+    b.pistack[ts] = cPiStack && (*cPiStack)[i] ? 1 : 0;
+    b.pication[ts] = cPiCation ? (*cPiCation)[i] : 0;
+    b.saltbridge[ts] = cSalt ? (*cSalt)[i] : 0;
+    b.hydrophobic[ts] = cHphob && (*cHphob)[i] ? 1 : 0;
+    b.metalCoord[ts] = cMcoord ? (*cMcoord)[i] : 0;
+  }
+  // 🔴 A BOND COUNTS AT BOTH ENDS AND IS NOT DEDUPLICATED. Each end increments its own slot's
+  // counter for that bond type, so a bond within one slot's atom counts twice there.
+  for (const cif::Bond& bond : a.bonds) {
+    for (const int end : {bond.u, bond.v}) {
+      const int s = slots[end];
+      if (s < 0) continue;
+      b.incidentBondTypeCounts[((size_t)a.tokenId[end] * 37 + s) * 10 + bond.type] += 1;
+    }
+  }
+  for (size_t i = 0; i < b.coords.size(); ++i) b.coordsNm[i] = b.coords[i] / 10.0f;
+
+  const atoms::TokenBondFeatures tb = atoms::computeTokenBondFeatures(a, pathLengthCutoff,
+                                                                      isInference);
+  b.bondMask = tb.bondMask;
+  b.isAromatic = tb.isAromatic;
+  b.canonicalPolymerOrdering = tb.canonical;
+  b.bondOrder.assign(tb.bondOrder.begin(), tb.bondOrder.end());
+  b.tokenBondPathLength.assign(tb.pathLength.begin(), tb.pathLength.end());
+
+  for (int k = 0; k < 28; ++k) {
+    const string key =
+        string("condition_sequence-probability-") + tables::STANDARD_POLYMER_RESIDUES[k] +
+        "_1_residue";
+    auto it = a.ann.floats.find(key);
+    for (int t = 0; t < nTokens; ++t) {
+      b.seqProb[(size_t)k * nTokens + t] =
+          it != a.ann.floats.end() && it->second.size() == nAtoms
+              ? (float)it->second[tokStarts[t]]
+              : std::nanf("");
+    }
+  }
+  return b;
+}
+
 inline Batch buildSpecBatch(const vector<Segment>& segments,
                             const std::map<string, std::map<string, vector<string>>>& conditions,
                             int seed) {
@@ -1022,6 +1304,83 @@ int run(int argc, char** argv) {
         printf("atomized\t%zu\n", arr.n());
         printf("azcentroid\t%.17g\t%.17g\t%.17g\n", (double)centroid.v[0], (double)centroid.v[1],
                (double)centroid.v[2]);
+        {
+          // `convertToProteinaBatch` on the finished atom array - the batch the model reads.
+          // 🔴 THE SAME `prng`, STILL. It opens with two permutations drawn from the stream the
+          // realisation and the internal coordinates have already advanced.
+          const rfd4p::featurise::Batch sb =
+              rfd4p::featurise::buildStructureBatch(arr, centroid, prng);
+          printf("azbatch\t%d\n", sb.n);
+          const auto ints = [&](const char* name, const auto& v) {
+            long long sum = 0, nz = 0, weighted = 0;
+            for (size_t i = 0; i < v.size(); ++i) {
+              const long long x = (long long)v[i];
+              sum += x;
+              if (x) { ++nz; weighted += x * (long long)(i % 1000003); }
+            }
+            printf("azbatch\t%s\t%zu\t%lld\t%lld\t%lld\n", name, v.size(), sum, nz, weighted);
+          };
+          const auto reals = [&](const char* name, const vector<float>& v) {
+            // NaN is COUNTED rather than summed: these columns are mostly NaN by design, and a
+            // sum over them says only "NaN" however wrong the finite entries are.
+            double sum = 0;
+            long long nan = 0, nz = 0;
+            for (size_t i = 0; i < v.size(); ++i) {
+              if (std::isnan(v[i])) { ++nan; continue; }
+              sum += (double)v[i] * (double)((i % 1000003) + 1);
+              if (v[i] != 0.f) ++nz;
+            }
+            printf("azbatch\t%s\t%zu\t%.9g\t%lld\t%lld\n", name, v.size(), sum, nan, nz);
+          };
+          ints("residue_type", sb.residueType);
+          ints("condition_sequence", sb.conditionSequence);
+          ints("token_type", sb.tokenType);
+          ints("tok_idx", sb.tokIdx);
+          ints("chain_iid", sb.chainIid);
+          ints("molecule_iid", sb.moleculeIid);
+          ints("molecule_entity_id", sb.moleculeEntityId);
+          ints("supports_local_latent", sb.supportsLocalLatent);
+          ints("is_in_context_conditioning", sb.isInContextConditioning);
+          ints("is_resolved_mask", sb.isResolvedMask);
+          ints("insertion_source_idx", sb.insertionSourceIdx);
+          ints("coord_cond_mask", sb.coordCondMask);
+          ints("condition_secondary_structure", sb.secondaryStructure);
+          ints("condition_index_group", sb.indexGroup);
+          ints("cath_label", sb.cathLabel);
+          ints("atom37_mask", sb.atom37Mask);
+          ints("element", sb.element);
+          ints("ground_truth_element", sb.groundTruthElement);
+          ints("charge", sb.charge);
+          ints("incident_bond_type_counts", sb.incidentBondTypeCounts);
+          ints("condition_index", sb.conditionIndex);
+          ints("condition_coordinate_group", sb.coordGroup);
+          ints("condition_hotspot", sb.hotspot);
+          ints("condition_rasa", sb.rasaBinned);
+          ints("condition_hbond", sb.hbond);
+          ints("condition_pistack", sb.pistack);
+          ints("condition_pication", sb.pication);
+          ints("condition_saltbridge", sb.saltbridge);
+          ints("condition_hydrophobic", sb.hydrophobic);
+          ints("condition_metal_coord", sb.metalCoord);
+          ints("chiral_frame_atoms", sb.chiralFrameAtoms);
+          ints("chiral_slot_owner", sb.chiralSlotOwner);
+          ints("tetrahedral_vertices", sb.tetrahedralVertices);
+          ints("bond_mask", sb.bondMask);
+          ints("bond_order", sb.bondOrder);
+          ints("is_aromatic", sb.isAromatic);
+          ints("token_bond_path_length", sb.tokenBondPathLength);
+          ints("canonical_polymer_ordering", sb.canonicalPolymerOrdering);
+          reals("coords", sb.coords);
+          reals("coords_nm", sb.coordsNm);
+          reals("condition_coordinate", sb.condCoord);
+          reals("condition_internal_coordinate", sb.condInternalCoord);
+          reals("condition_chain_centroid", sb.chainCentroid);
+          reals("chirality", sb.chirality);
+          reals("loss_weight", sb.lossWeight);
+          reals("seq_prob", sb.seqProb);
+          printf("azbatch\tcentroid\t3\t%.17g\t%.17g\t%.17g\n", (double)sb.centroidWithoutCond[0],
+                 (double)sb.centroidWithoutCond[1], (double)sb.centroidWithoutCond[2]);
+        }
         {
           const rfd4p::atoms::TokenBondFeatures tb = rfd4p::atoms::computeTokenBondFeatures(arr);
           printf("aztb\t%zu\n", tb.n);
