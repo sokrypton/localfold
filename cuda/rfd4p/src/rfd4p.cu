@@ -13,6 +13,7 @@
 #include "trunk.cuh"
 #include "decoder.cuh"
 #include "sampler.cuh"
+#include "encoder.cuh"
 #include "generate.cuh"
 #include "bundle.cuh"
 #include <fstream>
@@ -21,7 +22,7 @@
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, gen, int8, out = "design.pdb";
+  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, out = "design.pdb";
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
   int designs = 1;   // generate this many times, so a WARM one can be timed
@@ -36,6 +37,9 @@ int run(const Opts& o) {
   M.load(o.dir);
   if (!o.oracle.empty()) M.load(o.oracle);
   if (!o.gen.empty()) M.load(o.gen);
+  if (!o.genOracle.empty()) M.load(o.genOracle);
+  if (!o.enc.empty()) M.load(o.enc);
+  if (!o.encOracle.empty()) M.load(o.encOracle);
   for (int seg = 0; seg < (int)M.segs.size(); ++seg) M.upload(seg);
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
@@ -102,8 +106,10 @@ int run(const Opts& o) {
     // port's arithmetic: read against an oracle computed from the FLOAT checkpoint it lands at
     // 1.6e-02, and the structure it generates is 0.15 A of CA from the float one at the same seed.
     if (!o.int8.empty()) return 2.5e-2;
-    const bool decoder = name[0] == 'd' && name[1] == '/';
-    if (decoder) return 1e-4;   // the decoder is f32 on both arms
+    // The autoencoder's two halves run f32 on both arms (decoder.cuh, encoder.cuh), so one
+    // bound serves them and it does not follow --fast.
+    const bool autoenc = (name[0] == 'd' || name[0] == 'e') && name[1] == '/';
+    if (autoenc) return 1e-4;
     return o.fast ? 5e-3 : 1e-5;
   };
   const double bound = o.fast ? 5e-3 : 1e-5;
@@ -111,7 +117,7 @@ int run(const Opts& o) {
   double worst = 0;
   std::string worstAt;
   std::function<void(const char*, const float*, size_t)> tap;
-  if (!o.oracle.empty()) {
+  if (!o.oracle.empty() || !o.encOracle.empty()) {
     tap = [&](const char* name, const float* p, size_t count) {
       // 🔴 relRMS ALONE CANNOT TELL A GROWING ERROR FROM A SHRINKING SIGNAL, and the decoder's
       // stages bulge in the middle of the stack and come back - which is one or the other. The
@@ -127,6 +133,40 @@ int run(const Opts& o) {
       if (r >= 0 && r > worst) { worst = r; worstAt = name; }
       if (r > boundFor(name)) ++bad;
     };
+  }
+
+  // The autoencoder ENCODER, when the input directory carries its tensors: clean all-atom
+  // coordinates into the local latents a partial-diffusion or inverse-folding run starts from.
+  // 🔴 ITS ORACLE IS THE DETERMINISTIC ARM (z is the mean), because the sampled one would compare
+  // two Box-Muller implementations rather than the encoder - see export_input.mjs.
+  if (!o.enc.empty()) {
+    rfd4p::EncDims ed;
+    ed.n = d.n;
+    ed.D = (int)M.meta("meta/encTokenDim");
+    ed.C = (int)M.meta("meta/encCondDim");
+    ed.H = (int)M.meta("meta/encHeads");
+    ed.nlayers = (int)M.meta("meta/encLayers");
+    ed.latent = d.latent;
+    ed.fdim = (int)M.meta("meta/encFeatDim");
+    ed.ttDim = (int)M.meta("meta/encTtDim");
+    ed.chargeDim = (int)M.meta("meta/encChargeDim");
+    const int offsets[7] = {
+        (int)M.meta("meta/encOffAbs"),   (int)M.meta("meta/encOffRel"),
+        (int)M.meta("meta/encOffChain"), (int)M.meta("meta/encOffBonds"),
+        (int)M.meta("meta/encOffElCh"),  (int)M.meta("meta/encTtCreator"),
+        (int)M.meta("meta/encElChCreator")};
+    float* mean = scratch<float>("rfd4p.enc.mean", (size_t)ed.n * ed.latent);
+    float* logScale = scratch<float>("rfd4p.enc.ls", (size_t)ed.n * ed.latent);
+    float* zLat = scratch<float>("rfd4p.enc.z", (size_t)ed.n * ed.latent);
+    rfd4p::encode(ed, Fdev("e/coorsNm"), Fdev("e/atomMask"), Idev("in/tokenType"),
+                  Fdev("e/chainIid"), Fdev("e/bondCounts"), Idev("e/element"), Idev("e/charge"),
+                  Fdev("in/mask"), Fdev("in/attnMask"), Fdev("e/emit"), nullptr, mean, logScale,
+                  zLat, offsets, o.encOracle.empty() ? nullptr : tap);
+    CK(cudaStreamSynchronize(STREAM));
+    if (!o.encOracle.empty()) {
+      printf("encoder: %s, worst %.3e at %s\n", bad ? "FAILED" : "ok", worst, worstAt.c_str());
+      return bad ? 1 : 0;
+    }
   }
 
   if (!o.gen.empty()) return generate(o, d, t);
@@ -289,14 +329,29 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   const auto t0 = std::chrono::steady_clock::now();
   const rfd4p::Schedule schedBb = rfd4p::bbCaSchedule(steps);
   const rfd4p::Schedule schedLl = rfd4p::latentSchedule(steps);
+
   const float* emitBbDev = Fdev("g/emitBb");
   const float* emitLlDev = Fdev("g/emitLl");
 
   for (int s = 0; s < steps; ++s) {
     rfd4p::writeStateK<<<(unsigned)n, 256, 0, STREAM>>>(seqF, xBb, xLl, n, d.seqF, d.latent);
     rfd4p::pairDistBinsK<<<blocks((size_t)n * n), 256, 0, STREAM>>>(
-        pairF, xBb, n, pairDim, (int)M.meta("meta/distDim"), (float)M.meta("meta/distMin"),
+        pairF, xBb, Fdev("in/mask"), n, pairDim, (int)M.meta("meta/distDim"),
+        (float)M.meta("meta/distMin"),
         (float)M.meta("meta/distMax"));
+    // The loop's INPUT, before anything in the loop can have moved it: the replayed noise against
+    // the reference's own draw, and the features this port assembles from it against the ones the
+    // reference builds from scratch.
+    if (s == 0 && !o.genOracle.empty() && design + 1 == std::max(1, o.designs) &&
+        M.has("gen/x0Bb")) {
+      checkOracle("gen/x0Bb", xBb, (size_t)n * 3, "gen/x0Bb");
+      checkOracle("gen/x0Ll", xLl, (size_t)n * 32, "gen/x0Ll");
+      checkOracle("gen/f0Seq", seqF, (size_t)n * d.seqF, "gen/f0Seq");
+      checkOracle("gen/f0Pair", pairF, (size_t)n * n * pairDim, "gen/f0Pair");
+      checkOracle("gen/f0Cond", Fdev("g/cond"), (size_t)n * condDim, "gen/f0Cond");
+      checkOracle("gen/f0Cond1", Fdev("g/cond1"), (size_t)n * condDim, "gen/f0Cond1");
+      checkOracle("gen/f0PairCond", Fdev("g/pairCond"), (size_t)d.pairCondF, "gen/f0PairCond");
+    }
     rfd4p::forward(t, seqF, Fdev("g/cond") + (size_t)s * n * condDim,
                    Fdev("g/cond1") + (size_t)s * n * condDim, pairF,
                    Fdev("g/pairCond") + (size_t)s * d.pairCondF, depths[s], s == steps - 1);
@@ -321,11 +376,46 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
                             tt, dt, sc.gt[s], sc.step);
       CK(cudaStreamSynchronize(STREAM));   // epsBuf is reused by the next modality
     }
+    // 🔴 EVERY STEP, SO A DIVERGENCE HAS A STEP NUMBER. The backbone's first step divides by
+    // t = 0.001, so a difference the trunk makes in the sixth digit leaves it in the third - and
+    // the end alone cannot tell that from the loop being wired wrong.
+    if (!o.genOracle.empty() && design + 1 == std::max(1, o.designs)) {
+      char key[32];
+      snprintf(key, sizeof key, "gen/s%dBb", s);
+      if (M.has(key)) {
+        const double rb = checkOracle(key, xBb, (size_t)n * 3, key);
+        snprintf(key, sizeof key, "gen/s%dLl", s);
+        const double rl = checkOracle(key, xLl, (size_t)n * 32, key);
+        snprintf(key, sizeof key, "gen/s%dX1Bb", s);
+        const double qb = M.has(key) ? checkOracle(key, x1Bb, (size_t)n * 3, key) : -1;
+        snprintf(key, sizeof key, "gen/s%dX1Ll", s);
+        const double ql = M.has(key) ? checkOracle(key, x1Ll, (size_t)n * 32, key) : -1;
+        printf("  step %d: x %.3e / %.3e   x1 %.3e / %.3e  (bb / ll)\n", s, rb, rl, qb, ql);
+      }
+    }
   }
 
   CK(cudaStreamSynchronize(STREAM));
   loopMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   if (o.designs > 1) printf("  design %d: sampling %.2f s\n", design + 1, loopMs / 1000);
+  }
+
+  // 🔴 THE WHOLE LOOP AGAINST THE REFERENCE'S OWN, which is the one thing every per-stage gate
+  // cannot say: the trunk, the decoder and the schedules are each held to `cpu/rfd4p`, and what is
+  // left over is whether they are WIRED together the way `generateRfd4pCpu` wires them - the order
+  // of the noise draws, which features move between steps, when the emit masks apply, whether the
+  // step advances x or x1. Two steps exercise all of that as well as sixty and cost minutes
+  // instead of hours.
+  if (!o.genOracle.empty()) {
+    int bad = 0;
+    for (const auto& [name, ptr, count] : std::initializer_list<std::tuple<const char*, const float*, size_t>>{
+             {"gen/xBb", xBb, (size_t)n * 3}, {"gen/xLl", xLl, (size_t)n * 32}}) {
+      const double r = checkOracle(name, ptr, count, name);
+      if (r > (o.fast ? 5e-3 : 1e-5)) ++bad;
+    }
+    printf("  the trajectory %s the reference's over %d steps\n",
+           bad ? "DIVERGES from" : "matches", steps);
+    if (bad) return 1;
   }
 
   // `sequenceForDecoder`: a conditioned residue stays, an emitted unconditioned one takes the
@@ -411,6 +501,9 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 9, "--oracle=")) o.oracle = value("oracle");
     else if (!f.compare(0, 11, "--generate=")) o.gen = f.substr(11);
     else if (!f.compare(0, 7, "--int8=")) o.int8 = f.substr(7);
+    else if (!f.compare(0, 13, "--gen-oracle=")) o.genOracle = f.substr(13);
+    else if (!f.compare(0, 13, "--enc-oracle=")) o.encOracle = f.substr(13);
+    else if (!f.compare(0, 10, "--encoder=")) o.enc = f.substr(10);
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
     else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);

@@ -147,6 +147,12 @@ inline Schedule latentSchedule(int nsteps) {
 }
 
 // `[width, depth]` bands over the steps, one depth a step (`Proteina.recycle_depths`).
+//
+// 🔴 A SHORTER RUN RESAMPLES THE BANDS, IT DOES NOT TAKE THEIR TAIL. The bands always expand to
+// SIXTY entries whatever `nsteps` is, and `recycleDepths` then reads them at `i * 60 / nsteps` -
+// so two steps of `low` are its FIRST and THIRTY-FIRST entries, [4, 1], where a tail would give
+// [1, 1]. Taking the tail runs the whole short schedule at the cheapest depth the long one ever
+// reaches, which is a different model, not a cheaper one.
 inline std::vector<int> recycleDepths(const std::string& name, int nsteps) {
   std::vector<std::pair<int, int>> bands;
   if (name == "none") bands = {{60, 1}};
@@ -154,13 +160,15 @@ inline std::vector<int> recycleDepths(const std::string& name, int nsteps) {
   else if (name == "medium") bands = {{5, 6}, {10, 5}, {5, 4}, {10, 3}, {20, 2}, {10, 1}};
   else if (name == "high") bands = {{15, 6}, {15, 5}, {15, 4}, {15, 3}};
   else { fprintf(stderr, "recycle schedule %s not known\n", name.c_str()); exit(1); }
-  std::vector<int> depths;
+  std::vector<int> full;
   for (const auto& [width, depth] : bands) {
-    for (int i = 0; i < width; ++i) depths.push_back(depth);
+    for (int i = 0; i < width; ++i) full.push_back(depth);
   }
-  // A shorter run takes the TAIL of the full schedule, as the reference does.
-  if ((int)depths.size() > nsteps) depths.erase(depths.begin(), depths.end() - nsteps);
-  while ((int)depths.size() < nsteps) depths.push_back(depths.empty() ? 1 : depths.back());
+  if ((int)full.size() == nsteps) return full;
+  std::vector<int> depths(nsteps);
+  for (int i = 0; i < nsteps; ++i) {
+    depths[i] = full[std::min((int)full.size() - 1, (int)((long long)i * full.size() / nsteps))];
+  }
   return depths;
 }
 
@@ -169,21 +177,26 @@ inline std::vector<int> recycleDepths(const std::string& name, int nsteps) {
 // `x1 = x + (1 - t) v` is the clean estimate the decoder sees; `x` advances by the Euler-Maruyama
 // term. Both are masked to the emitting tokens, and a masked row is left exactly zero rather than
 // merely small - the reference writes zero there and a residual would accumulate over sixty steps.
+// 🔴 THE INNER ARITHMETIC IS DOUBLE AND THE STORES ARE FLOAT, which is what the reference does and
+// is not pedantry here: at the first step t is 0.001, and `x + (1 - t) * ss` subtracts two numbers
+// that agree to three digits before dividing by t. In float that cancellation keeps four digits of
+// a value the next step multiplies up; in double it keeps thirteen. `f32` at each store is where
+// the reference rounds, so the port rounds in the same places.
 __global__ void simulationStepK(float* __restrict__ x, const float* __restrict__ v,
                                 float* __restrict__ x1, const float* __restrict__ eps,
-                                const float* __restrict__ emit, size_t count, int dim, float t,
-                                float dt, float gt, float r, float std_, int stochastic) {
+                                const float* __restrict__ emit, size_t count, int dim, double t,
+                                double dt, double gt, double r, double std_, int stochastic) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const bool live = emit[i / dim] != 0.f;
   const float xi = x[i], vi = v[i];
-  x1[i] = live ? xi + (1.f - t) * vi : 0.f;
-  if (t == 0.f) return;
-  const float score = (t * vi - xi) / (1.f - t);
-  const float ss = score * r;
-  const float vs = (xi + (1.f - t) * ss) / t;
-  const float delta = stochastic ? (vs + gt * ss) * dt + std_ * eps[i] : vs * dt;
-  x[i] = live ? xi + delta : 0.f;
+  x1[i] = live ? (float)(xi + (float)((1.0 - t) * vi)) : 0.f;
+  if (t == 0.0) return;
+  const double score = (t * vi - xi) / (1.0 - t);
+  const double ss = score * r;
+  const double vs = (xi + (1.0 - t) * ss) / t;
+  const double delta = stochastic ? (vs + gt * ss) * dt + std_ * eps[i] : vs * dt;
+  x[i] = live ? (float)(xi + delta) : 0.f;
 }
 
 inline void simulationStep(float* x, const float* v, float* x1, const float* eps, const float* emit,
@@ -192,9 +205,8 @@ inline void simulationStep(float* x, const float* v, float* x1, const float* eps
   const double r = tsrRatio(t, step.tsrK, step.tsrSigma);
   const bool stochastic = t != 0.0 && !(t > step.tLimOde || t < step.tLimOdeBelow);
   const double sd = stochastic ? std::sqrt(2 * gt * step.scScaleNoise * dt) : 0.0;
-  simulationStepK<<<blocks(count), 256, 0, STREAM>>>(x, v, x1, eps, emit, count, dim, (float)t,
-                                                     (float)dt, (float)gt, (float)r, (float)sd,
-                                                     stochastic ? 1 : 0);
+  simulationStepK<<<blocks(count), 256, 0, STREAM>>>(x, v, x1, eps, emit, count, dim, t, dt, gt, r,
+                                                     sd, stochastic ? 1 : 0);
 }
 
 }  // namespace rfd4p

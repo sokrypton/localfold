@@ -45,6 +45,20 @@ CASES = [
     ("trunk-1", HERE / "data", HERE / "oracle", []),
     ("trunk-2", HERE / "data-r2", HERE / "oracle-r2", ["--recycles=2"]),
 ]
+# The two stages a trunk oracle cannot reach, each with its own input and its own reference.
+#
+# 🔴 THE ENCODER NEEDS A REAL STRUCTURE, which is why it is the 1PRW partial-diffusion preset and
+# not the monomer every other case uses: it turns clean all-atom coordinates into latents, and a
+# contig has none. Its oracle is the DETERMINISTIC arm (z is the mean), because the sampled one
+# would compare two Box-Muller implementations rather than the encoder.
+#
+# 🔴 AND THE TRAJECTORY IS THE ONLY ARM THAT CHECKS THE LOOP. Every stage above is held to the
+# reference one call at a time; what is left over is whether they are WIRED the way
+# `generateRfd4pCpu` wires them - the order of the noise draws, which features move between steps,
+# when the emit masks apply, which recycle depth each step gets. Two steps exercise all of it, and
+# it caught the port running four recycles a step against the reference's six.
+ENCODER = ("encoder", HERE / "data-pd", ["--preset=partial_diffusion_1prw", "--encoder"])
+TRAJECTORY = ("trajectory", HERE / "data-g2", ["--generate", "--gen-oracle", "--steps=2"])
 SPEED = ("speed-n100-r6", HERE / "data-n100", ["--length=100"], ["--recycles=6", "--repeat=30"])
 # The trunk's bounds; the DECODER's stages take 1e-4 on both arms and the binary applies that
 # itself - it runs in f32 whatever the arm, because its near-uniform softmax costs far more in
@@ -142,6 +156,59 @@ def main() -> int:
                 mark, failed = "MOVED", failed + 1
             print(f"  {name:10s} {arm:10s} worst {worst:.2e}  (trunk {BOUND[arm.split('-')[0]]:.0e},"
                   f" decoder 1e-04)  {mark}")
+        got[name] = row
+
+    # ---- the encoder, against its own reference -----------------------------------------------
+    name, case_dir, export_flags = ENCODER
+    if not args.only or args.only in name:
+        if not (case_dir.with_name(case_dir.name + "-enc") / "model.idx").exists():
+            print(f"  building {case_dir.name} (the encoder's structure case)...", flush=True)
+            r = run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", case_dir,
+                     *export_flags], cwd=REPO)
+            if r.returncode != 0:
+                print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr)
+                sys.exit(f"could not export {case_dir}")
+        r = run([BINARY, case_dir, f"--weights={args.weights}",
+                 f"--encoder={case_dir}-enc", f"--enc-oracle={case_dir}-enc-oracle"])
+        m = re.search(r"encoder: (\w+), worst ([\d.e+-]+)", r.stdout)
+        worst = float(m.group(2)) if m else float("nan")
+        mark = "ok "
+        if not m or m.group(1) != "ok":
+            mark, failed = "OVER BOUND", failed + 1
+            if not m:
+                print(r.stdout[-1200:], r.stderr[-800:])
+        elif name in base and worst > base[name].get("exact", 0) * TOL_RES:
+            mark, failed = "MOVED", failed + 1
+        print(f"  {name:10s} {'exact':10s} worst {worst:.2e}  (1e-04)  {mark}")
+        got[name] = {"exact": worst}
+
+    # ---- the whole sampling loop, two steps, against the reference's own ----------------------
+    name, case_dir, export_flags = TRAJECTORY
+    if not args.only or args.only in name:
+        if not (case_dir.with_name(case_dir.name + "-gen-oracle") / "model.idx").exists():
+            print(f"  building {case_dir.name} (two steps of the JS sampler)...", flush=True)
+            r = run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", case_dir,
+                     *export_flags], cwd=REPO)
+            if r.returncode != 0:
+                print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr)
+                sys.exit(f"could not export {case_dir}")
+        row = {}
+        for arm in ("exact", "fast"):
+            cmd = [BINARY, case_dir, f"--weights={args.weights}", f"--generate={case_dir}-gen",
+                   f"--gen-oracle={case_dir}-gen-oracle", f"--out={case_dir}-gate.pdb"]
+            if arm == "fast":
+                cmd.append("--fast")
+            r = run(cmd)
+            vals = [float(v) for v in re.findall(r"gen/x(?:Bb|Ll)\s+relRMS ([\d.e+-]+)", r.stdout)]
+            worst = max(vals) if vals else float("nan")
+            mark = "ok "
+            if not vals or "DIVERGES" in r.stdout:
+                mark, failed = "DIVERGES", failed + 1
+                if not vals:
+                    print(r.stdout[-1200:], r.stderr[-800:])
+            row[arm] = worst
+            print(f"  {name:10s} {arm:10s} worst {worst:.2e}  "
+                  f"({BOUND[arm]:.0e})  {mark}")
         got[name] = row
 
     name, case_dir, export_flags, fold_flags = SPEED

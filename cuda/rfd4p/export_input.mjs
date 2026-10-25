@@ -30,7 +30,7 @@
 // compared with what `forwardTrunkCpu` returns on the identical input, and the export FAILS if they
 // disagree - the duplicate cannot go stale in silence.
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
-import { buildBatch } from "../../shared/rfd4p/pipeline/index.js";
+import { buildBatch, decodeTextOrZstd } from "../../shared/rfd4p/pipeline/index.js";
 import { getRfd4pPresetById } from "../../shared/rfd4p/presets.js";
 import {
   ALLOWED_RESIDUE_TYPES, ATOM37_NAMES, UNIFIED_ATOM37_TOKENS, UNIFIED_RESTYPE_ATOM37_MASK,
@@ -51,6 +51,7 @@ import {
   aeMasks, decodeLatentsCpu, decoderPostprocess, decoderSeqFeatures, sequenceForDecoder,
 } from "../../cpu/rfd4p/decoder.js";
 import { generateRfd4pCpu } from "../../cpu/rfd4p/reference.js";
+import { encodeLatentsCpu, encoderSeqFeatures } from "../../cpu/rfd4p/encoder.js";
 
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--"));
@@ -76,16 +77,31 @@ const nn = cfg.nn;
 
 const preset = getRfd4pPresetById(presetId);
 if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
-if (preset.cifUrl && !length) {
-  console.error(`${presetId} needs a structure; only the pure-spec presets export offline for now`);
-  process.exit(1);
+// 🔴 A PRESET'S STRUCTURE IS A FILE IN THIS CHECKOUT, NOT A FETCH. This used to refuse every
+// conditioned preset with "only the pure-spec presets export offline", which was never true: the
+// seven examples the page names are `web/examples/*.cif.zst`, shipped here, and the page fetches
+// them over its own origin. Reading them off disk is the whole of what that refusal cost, and it
+// is what makes the motif, PPI, small-molecule, DNA and partial-diffusion cases exportable at all.
+//
+// 🔴 AND A PRESET WITHOUT `specMode` IS BUILT FROM ITS STRUCTURE'S ANNOTATIONS, NOT ITS CONTIG.
+// web/generate.js has the note: those contigs are written in the ORIGINAL entry's numbering and
+// name residues the cropped example does not contain, so building one from the spec fails with
+// "Preserved segment 'A52-71' matched no atoms". The structure IS the job.
+const fromAnnotations = !length && preset.specMode !== true
+  && preset.cifUrl !== null && preset.cifUrl !== undefined;
+let inputCif;
+if (!length && preset.cifUrl) {
+  const bytes = readFileSync(`${repo}${preset.cifUrl.replace(/^\.\//, "")}`);
+  inputCif = decodeTextOrZstd(new Uint8Array(bytes));
 }
 // `--length=N` is one unconditioned protein segment of N residues, for sizing and timing: the trunk's
 // cost is a function of the token count and nothing in the conditioning changes a single shape.
 const spec = length
   ? { contig: `a1:${length}-${length}P` }
   : { contig: preset.contig, ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }) };
-const { batch, n } = buildBatch(spec, { seed });
+const { batch, n } = fromAnnotations
+  ? buildBatch(inputCif, { seed })
+  : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
 
 const raw = readFileSync(checkpoint);
 const parsedWeights = parseSafetensors(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
@@ -197,6 +213,78 @@ const floats = writeDir(out, {
 });
 console.log(`${out}: ${n} tokens, ${(floats * 4 / 1e6).toFixed(1)} MB`);
 
+// ---- the autoencoder ENCODER's inputs, and its own oracle ------------------------------------
+//
+// 🔴 THE ENCODER IS THE ONLY STAGE WHOSE INPUT IS A REAL STRUCTURE, which is why it could not be
+// exported at all until the preset loader learned to read `web/examples/*.cif.zst` off disk. It
+// turns clean all-atom coordinates into the local latents a partial-diffusion or inverse-folding
+// run starts from, so without it those two presets have no starting point.
+//
+// 🔴 AND THE ORACLE IS THE DETERMINISTIC ARM. `encodeLatentsCpu` draws `n * 32` normals for its
+// reparameterisation out of the SAMPLER's stream; comparing the sampled z would compare two
+// Box-Muller implementations rather than the encoder, so the gate takes `deterministic: true`
+// (z is the mean) and the sampled arm is covered by the generate loop's replayed noise.
+if (args.includes("--encoder")) {
+  const encCfg = cfg.autoencoder_config.nn_ae.encoder;
+  const encDims = {
+    token_type: encCfg.token_type_emb_dim ?? 32,
+    x1_a37coors_nm: 37 * 4,
+    x1_a37coors_nm_rel: 37 * 4,
+    chain_idx_seq: 1,
+    incident_bond_type_counts: 37 * 10,
+    atom37_element_charge_embedding: 37 * (8 + (encCfg.charge_emb_dim ?? 16)),
+  };
+  // The offsets the kernel needs, derived from `feats_seq` rather than typed in: a reordered
+  // feature list must move the kernel's writes with it, and -1 means the block is absent.
+  const encOff = {};
+  let o2 = 0;
+  encCfg.feats_seq.forEach((fname, idx) => {
+    encOff[fname] = o2;
+    encOff[`${fname}@`] = idx;
+    o2 += encDims[fname];
+  });
+  const encFdim = o2;
+  const atomMask = batch.atom37_mask ? field("atom37_mask") : field("coord_mask");
+  const coorsNm = batch.coords_nm
+    ? field("coords_nm")
+    : Float32Array.from(field("coords"), (v) => Math.fround(v / 10));
+  const encFloats = writeDir(`${out}-enc`, {
+    "e/coorsNm": Float32Array.from(coorsNm),
+    "e/atomMask": Float32Array.from(atomMask, (v) => (v ? 1 : 0)),
+    "e/chainIid": Float32Array.from(field("chain_iid")),
+    "e/bondCounts": Float32Array.from(field("incident_bond_type_counts")),
+    "e/emit": Float32Array.from(aeMasks(batch, n).emit, (v) => (v ? 1 : 0)),
+  }, {
+    encLayers: encCfg.nlayers,
+    encTokenDim: encCfg.token_dim,
+    encCondDim: encCfg.dim_cond,
+    encHeads: encCfg.nheads,
+    encFeatDim: encFdim,
+    encTtDim: encCfg.token_type_emb_dim ?? 32,
+    encChargeDim: encCfg.charge_emb_dim ?? 16,
+    encOffAbs: encOff.x1_a37coors_nm ?? -1,
+    encOffRel: encOff.x1_a37coors_nm_rel ?? -1,
+    encOffChain: encOff.chain_idx_seq ?? -1,
+    encOffBonds: encOff.incident_bond_type_counts ?? -1,
+    encOffElCh: encOff.atom37_element_charge_embedding ?? -1,
+    encTtCreator: encOff["token_type@"] ?? -1,
+    encElChCreator: encOff["atom37_element_charge_embedding@"] ?? -1,
+  }, {
+    "e/element": Int32Array.from(field("ground_truth_element")),
+    "e/charge": Int32Array.from(field("charge")),
+  });
+  const enc = encodeLatentsCpu(batch, {
+    n, weights, cfg: encCfg, deterministic: true,
+  });
+  writeDir(`${out}-enc-oracle`, {
+    "e/feats": Float32Array.from(encoderSeqFeatures(batch, { n, weights, cfg: encCfg }).data),
+    "e/mean": enc.mean,
+    "e/logScale": enc.logScale,
+    "e/zLatent": enc.zLatent,
+  }, {});
+  console.log(`${out}-enc: ${encFdim} encoder columns, ${(encFloats * 4 / 1e6).toFixed(1)} MB`);
+}
+
 // ---- everything a whole generation needs, written once ---------------------------------------
 //
 // 🔴 ONLY 35 OF THE 897 SEQUENCE COLUMNS CHANGE FROM STEP TO STEP - the three of `xt_bb_ca` and the
@@ -307,11 +395,74 @@ if (generate) {
   // it by accident alongside `--oracle` is how this export went away for two hours. Ask for it with
   // `--gen-oracle` and a step count somebody can wait for.
   if (args.includes("--gen-oracle")) {
-    const gen = await generateRfd4pCpu(batch, weights, cfg, { nsteps: steps, seed });
+    // 🔴 EVERY STEP, NOT ONLY THE LAST. A trajectory comparison that sees the end alone cannot say
+    // WHICH step went wrong, and the backbone's first step divides by t = 0.001 - so a difference
+    // the trunk makes in the fifth digit arrives at the end a thousand times larger. The per-step
+    // record is what separates "the loop is wired wrong" from "the loop amplifies".
+    const perStep = {};
+    const gen = await generateRfd4pCpu(batch, weights, cfg, {
+      nsteps: steps,
+      seed,
+      // 🔴 THE SAME RECYCLE SCHEDULE THE PORT IS HANDED, SAID OUT LOUD. `generateRfd4pCpu`
+      // defaults to `medium` and the exporter writes `g/depths` from the PRESET's, so leaving it
+      // off ran the reference at six recycles against the port's four - the two sides doing
+      // different amounts of work on identical inputs. It read as a wrong trajectory: the noise
+      // and the step-0 features were exact to the last bit and the velocity was 8e-2 out.
+      recycleSchedule: recycleOverride || preset.recycleSchedule || "none",
+      onStep: ({ step: s2, x1, xt }) => {
+        perStep[`gen/s${s2}Bb`] = Float32Array.from(xt.bb_ca);
+        perStep[`gen/s${s2}Ll`] = Float32Array.from(xt.local_latents);
+        perStep[`gen/s${s2}X1Bb`] = Float32Array.from(x1.bb_ca);
+        perStep[`gen/s${s2}X1Ll`] = Float32Array.from(x1.local_latents);
+      },
+    });
+    // 🔴 AND THE LOOP'S INPUT, NOT ONLY ITS OUTPUT. `generateRfd4pCpu` draws its own initial noise
+    // and builds its own first-step features; the port replays a recorded stream and overwrites two
+    // column blocks. Writing both here is what separates "the port's noise is wrong", "the port's
+    // features are wrong" and "the port's trunk is wrong" - three answers a final-state comparison
+    // gives one number for. A fresh rng reproduces the draw exactly: nothing consumes the stream
+    // before `sample_noise`.
+    const rng0 = seededRng(seed);
+    const x0 = sampleInitialNoise({
+      n, emit, coordCondMask: field("coord_cond_mask"), moleculeIid: field("molecule_iid"),
+      rng: rng0, centeringScale: DEFAULT_SAMPLING.centering?.scale ?? 0.2,
+    });
+    const t0 = {
+      bb_ca: Math.fround(genSched.bb_ca.ts[0]),
+      local_latents: Math.fround(genSched.local_latents.ts[0]),
+    };
+    const cache0 = {};
+    const f0Seq = trunkSeqFeatures(batch, {
+      n, xt: x0, feats: nn.feats_seq, weights, randperm: (len) => rng0.randperm(len, 0),
+      noiseAlignChirality: nn.noise_align_chirality, cache: cache0,
+    }).data;
+    const f0Pair = pairFeatures(batch, {
+      n, caNm: x0.bb_ca, feats: nn.feats_pair_repr,
+      dist: { dim: nn.xt_pair_dist_dim, min: nn.xt_pair_dist_min, max: nn.xt_pair_dist_max },
+      seqSepDim: nn.seq_sep_dim, cache: cache0,
+    }).data;
+    // 🔴 AND THE CONDITIONING, BUILT THE REFERENCE'S WAY - no cache, which is how the generate
+    // loop calls it. The block above exports `g/cond` from a call that passes a fresh cache, and
+    // "a fresh cache is the same as no cache" is an assumption, not a measurement.
+    const f0Cond = trunkCondFeatures(batch, {
+      n, t: t0, recycleRemaining: null, feats: nn.feats_cond_seq, weights,
+    }).data;
+    const f0Cond1 = trunkCondFeatures(batch, {
+      n, t: t0, recycleRemaining: 1, feats: nn.feats_cond_seq, weights,
+    }).data;
+    const f0PairCond = pairCondFeatures(t0, nn.feats_pair_cond);
     writeDir(`${out}-gen-oracle`, {
+      "gen/x0Bb": x0.bb_ca,
+      "gen/x0Ll": x0.local_latents,
+      "gen/f0Seq": Float32Array.from(f0Seq),
+      "gen/f0Pair": Float32Array.from(f0Pair),
+      "gen/f0Cond": Float32Array.from(f0Cond),
+      "gen/f0Cond1": Float32Array.from(f0Cond1),
+      "gen/f0PairCond": Float32Array.from(f0PairCond),
       "gen/xBb": gen.x.bb_ca,
       "gen/xLl": gen.x.local_latents,
       "gen/coors": gen.structure ? Float32Array.from(gen.structure.coors ?? []) : new Float32Array(0),
+      ...perStep,
     }, {});
     console.log(`${out}-gen-oracle: the reference's own ${steps}-step sample`);
   }

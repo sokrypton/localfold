@@ -25,11 +25,19 @@ __global__ void writeStateK(float* __restrict__ feats, const float* __restrict__
 
 // `xt_bb_ca_pair_dists`: a one-hot over `dim` buckets of the CA-CA distance, bucketed right-open
 // against `limits[k] = min + (max - min) * k / (dim - 2)`, which is `torch.bucketize(right=False)`.
-__global__ void pairDistBinsK(float* __restrict__ pair, const float* __restrict__ caNm, int n,
-                              int pdim, int dim, float mn, float mx) {
+//
+// 🔴 A PADDED TOKEN'S PAIR IS LEFT ALONE, NOT BINNED. The reference skips a row or a column whose
+// `padding_mask` is clear, so those thirty columns stay zero where this kernel would have written
+// a one-hot of a distance between two positions that are not there. It is inert on an input with
+// no padding - which is every case measured here - and that is exactly why it is worth writing
+// down rather than discovering on the first padded batch.
+__global__ void pairDistBinsK(float* __restrict__ pair, const float* __restrict__ caNm,
+                              const float* __restrict__ mask, int n, int pdim, int dim, float mn,
+                              float mx) {
   size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (p >= (size_t)n * n) return;
   const int i = (int)(p / n), j = (int)(p % n);
+  if (mask[i] == 0.f || mask[j] == 0.f) return;
   const float dx = caNm[i * 3] - caNm[j * 3];
   const float dy = caNm[i * 3 + 1] - caNm[j * 3 + 1];
   const float dz = caNm[i * 3 + 2] - caNm[j * 3 + 2];

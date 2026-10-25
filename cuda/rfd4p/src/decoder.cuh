@@ -23,7 +23,14 @@ struct DecDims {
   int dimHead() const { return D / H; }
 };
 
-inline std::string dwn(const std::string& name) { return "w/autoencoder.decoder." + name; }
+// 🔴 ONE LAYER SERVES BOTH HALVES OF THE AUTOENCODER. The encoder's transformer is the decoder's
+// to the letter - LayerNorm throughout, no pair bias, a conditioning that is identically zero - and
+// differs only in its weight prefix, its depth and what is bolted on at each end. A second copy
+// would be a second place for a convention to drift; `root` is the whole of the difference.
+inline std::string aew(const std::string& root, const std::string& name) {
+  return "w/" + root + "." + name;
+}
+inline std::string dwn(const std::string& name) { return aew("autoencoder.decoder", name); }
 
 // The decoder's input features, `[n, 3 + 32 + 32 + nTypes]` in `feats_seq` order: the CA position in
 // nanometres, the latent, the token type's embedding, and the conditioned residue type's - the last
@@ -55,11 +62,12 @@ __global__ void decoderFeatsK(const float* __restrict__ caNm, const float* __res
 }
 
 // One decoder layer. The same shape as the trunk's, with LayerNorm throughout and no pair bias.
-inline void decoderLayer(float* s, const float* gammaMha, const float* betaMha, const float* gammaTr,
+inline void aeLayer(const std::string& root, float* s, const float* gammaMha, const float* betaMha, const float* gammaTr,
                          const float* betaTr, const float* scaleMha, const float* scaleTr,
                          const float* mask, const float* zeroBias, int stride, const DecDims& d,
-                         const std::string& pre,
-                         const std::function<void(const char*, const float*, size_t)>& tap = nullptr) {
+                    const std::string& pre,
+                    const std::function<void(const char*, const float*, size_t)>& tap = nullptr) {
+  auto dwn = [&](const std::string& name) { return aew(root, name); };
   const size_t n = d.n;
   const int W_ = d.D;
   float* ada = scratch<float>("rfd4p.dec.ada", n * W_);
@@ -118,8 +126,45 @@ inline void decoderLayer(float* s, const float* gammaMha, const float* betaMha, 
   layerNorm(s, normed, n, W_, nullptr, nullptr);
   adaLnApplyK<<<blocks(n * W_), 256, 0, STREAM>>>(normed, gammaTr, nullptr, betaTr, mask, ada, n, W_,
                                                   true);
-  swiGluTransition(ada, attn, n, W_, 4, mask, "autoencoder.decoder." + pre + ".transition.transition");
+  swiGluTransition(ada, attn, n, W_, 4, mask, root + "." + pre + ".transition.transition");
   adaScaleAddBroadcastK<<<blocks(n * W_), 256, 0, STREAM>>>(attn, scaleTr, mask, s, n, W_);
+}
+
+/**
+ * The six conditioning rows a layer needs, for a stack whose conditioning is identically zero.
+ *
+ * 🔴 ONE ROW A LAYER, NOT ONE A TOKEN. `c` is zero everywhere, so `norm_cond` returns its own bias
+ * broadcast and every gamma, beta and output gate is the same vector for every token - computed
+ * once for the whole pass rather than per token and per step. Both halves of the autoencoder are
+ * built this way, which is why this is a function and not two copies.
+ */
+inline float* aeConditioning(const std::string& root, int nlayers, int C, int D,
+                             const char* tag) {
+  auto dwn = [&](const std::string& name) { return aew(root, name); };
+  float* zeroC = scratch<float>(std::string("rfd4p.") + tag + ".c", C);
+  CK(cudaMemsetAsync(zeroC, 0, C * sizeof(float), STREAM));
+  float* cond = scratch<float>(std::string("rfd4p.") + tag + ".cond", (size_t)nlayers * 6 * D);
+  float* normedC = scratch<float>(std::string("rfd4p.") + tag + ".nc", C);
+  auto condAt = [&](int layer, int slot) { return cond + ((size_t)layer * 6 + slot) * D; };
+  for (int i = 0; i < nlayers; ++i) {
+    const std::string L = "transformer_layers." + std::to_string(i);
+    const char* adalns[2] = {".mhba.adaln", ".transition.adaln"};
+    for (int k = 0; k < 2; ++k) {
+      const std::string pre = L + adalns[k];
+      layerNorm(zeroC, normedC, 1, C, W(dwn(pre + ".norm_cond.weight")),
+                W(dwn(pre + ".norm_cond.bias")));
+      linear<float, float>(normedC, condAt(i, 2 * k), 1, C, D, dwn(pre + ".to_gamma.0.weight"), true);
+      addBias(condAt(i, 2 * k), W(dwn(pre + ".to_gamma.0.bias")), 1, D);
+      linear<float, float>(normedC, condAt(i, 2 * k + 1), 1, C, D, dwn(pre + ".to_beta.weight"), true);
+    }
+    const char* scales[2] = {".mhba.scale_output", ".transition.scale_output"};
+    for (int k = 0; k < 2; ++k) {
+      linear<float, float>(zeroC, condAt(i, 4 + k), 1, C, D,
+                           dwn(L + scales[k] + ".to_adaln_zero_gamma.0.weight"), true);
+      addBias(condAt(i, 4 + k), W(dwn(L + scales[k] + ".to_adaln_zero_gamma.0.bias")), 1, D);
+    }
+  }
+  return cond;
 }
 
 /**
@@ -151,30 +196,8 @@ inline void decode(const DecDims& d, const float* caNm, const float* z, const in
   const int D = d.D, C = d.C;
   auto emit = [&](const char* name, const float* p, size_t count) { if (tap) tap(name, p, count); };
 
-  // The conditioning: `c` is zero, so each layer's gamma and beta are one row, from `norm_cond`'s
-  // bias alone. Computed once for the whole decode.
-  float* zeroC = scratch<float>("rfd4p.dec.c", C);
-  CK(cudaMemsetAsync(zeroC, 0, C * sizeof(float), STREAM));
-  float* cond = scratch<float>("rfd4p.dec.cond", (size_t)d.nlayers * 6 * D);
+  float* cond = aeConditioning("autoencoder.decoder", d.nlayers, C, D, "dec");
   auto condAt = [&](int layer, int slot) { return cond + ((size_t)layer * 6 + slot) * D; };
-  float* normedC = scratch<float>("rfd4p.dec.nc", C);
-  for (int i = 0; i < d.nlayers; ++i) {
-    const std::string L = "transformer_layers." + std::to_string(i);
-    const char* adalns[2] = {".mhba.adaln", ".transition.adaln"};
-    for (int k = 0; k < 2; ++k) {
-      const std::string pre = L + adalns[k];
-      layerNorm(zeroC, normedC, 1, C, W(dwn(pre + ".norm_cond.weight")), W(dwn(pre + ".norm_cond.bias")));
-      linear<float, float>(normedC, condAt(i, 2 * k), 1, C, D, dwn(pre + ".to_gamma.0.weight"), true);
-      addBias(condAt(i, 2 * k), W(dwn(pre + ".to_gamma.0.bias")), 1, D);
-      linear<float, float>(normedC, condAt(i, 2 * k + 1), 1, C, D, dwn(pre + ".to_beta.weight"), true);
-    }
-    const char* scales[2] = {".mhba.scale_output", ".transition.scale_output"};
-    for (int k = 0; k < 2; ++k) {
-      linear<float, float>(zeroC, condAt(i, 4 + k), 1, C, D,
-                           dwn(L + scales[k] + ".to_adaln_zero_gamma.0.weight"), true);
-      addBias(condAt(i, 4 + k), W(dwn(L + scales[k] + ".to_adaln_zero_gamma.0.bias")), 1, D);
-    }
-  }
 
   float* feats = scratch<float>("rfd4p.dec.feats", n * (size_t)d.fdim);
   decoderFeatsK<<<(unsigned)n, 256, 0, STREAM>>>(
@@ -201,9 +224,9 @@ inline void decode(const DecDims& d, const float* caNm, const float* z, const in
   }
 
   for (int i = 0; i < d.nlayers; ++i) {
-    decoderLayer(s, condAt(i, 0), condAt(i, 1), condAt(i, 2), condAt(i, 3), condAt(i, 4),
-                 condAt(i, 5), attnMask, (const float*)zeroBias, stride, d,
-                 "transformer_layers." + std::to_string(i), i == 0 ? tap : nullptr);
+    aeLayer("autoencoder.decoder", s, condAt(i, 0), condAt(i, 1), condAt(i, 2), condAt(i, 3), condAt(i, 4),
+            condAt(i, 5), attnMask, (const float*)zeroBias, stride, d,
+            "transformer_layers." + std::to_string(i), i == 0 ? tap : nullptr);
     emit(("d/s" + std::to_string(i)).c_str(), s, n * D);
   }
 

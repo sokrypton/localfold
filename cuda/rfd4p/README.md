@@ -241,19 +241,65 @@ of `encoder`, the latter read only for partial diffusion and inverse folding, wh
 not do. A bundle without them is complete rather than broken, and a tensor the trunk or decoder
 actually wants is still caught by name at first use.
 
+## The sampling loop, against the reference's own
+
+`--generate=<dir> --gen-oracle=<dir>` runs `generateRfd4pCpu` beside the port and compares the
+trajectory at EVERY step, plus the loop's input before it: the replayed noise, the step-0 sequence
+and pair features, and the conditioning.
+
+🔴 **THIS IS THE ONLY ARM THAT CHECKS THE WIRING, AND IT FOUND THE LOOP RUNNING A DIFFERENT MODEL.**
+Each piece above is held to the reference one call at a time. What is left over is whether they are
+joined the way `generateRfd4pCpu` joins them - the order of the noise draws, which features move
+between steps, when the emit masks apply, whether the step advances `x` or `x1`, and **which recycle
+depth each step gets**. The last of those was wrong: the exporter wrote `g/depths` from the
+PRESET's `low` schedule and ran the reference at `generateRfd4pCpu`'s default `medium`, so the two
+sides did four recycles against six on identical inputs. It read as a broken trajectory - the
+initial noise and the step-0 features were exact to the last bit and the velocity was 8e-2 out -
+and no per-stage gate could see it, because every stage was right.
+
+🔴 **AND A SHORT RUN RESAMPLES THE RECYCLE BANDS, IT DOES NOT TAKE THEIR TAIL.** The bands expand to
+SIXTY entries whatever `nsteps` is and are then read at `i * 60 / nsteps`, so two steps of `low` are
+its first and thirty-first entries, `[4, 1]`. `sampler.cuh`'s own `recycleDepths` took the tail,
+`[1, 1]` - the whole short schedule at the cheapest depth the long one ever reaches, which is a
+different model and not a cheaper one. It is unused by `--generate` (the depths come from the
+export) and would have been the standalone form's first bug.
+
+🔴 **TWO STEPS EXERCISE AS MUCH AS SIXTY AND COST MINUTES INSTEAD OF HOURS** - `generateRfd4pCpu` is
+`sum(depths)` JS trunk passes at about a minute each, so the preset's 60 steps is an afternoon.
+`--gen-oracle` is opt-in on the exporter for that reason.
+
+## The autoencoder ENCODER
+
+`--encoder=<dir> --enc-oracle=<dir>`, on the 1PRW partial-diffusion preset (67 tokens): the input
+features **exact**, `mean` and `zLatent` at **1.27e-06**.
+
+It is the DECODER's transformer run the other way round - LayerNorm throughout, no pair bias, a
+conditioning that is identically zero - so `aeLayer` and `aeConditioning` serve both and the weight
+prefix is the whole of the difference. What is its own is the two ends: 1,587 feature columns built
+per ATOM and gated on `atom37_mask`, and a reparameterisation head, `z = mean + eps * exp(logScale)`.
+
+🔴 **ITS ORACLE IS THE DETERMINISTIC ARM.** `encodeLatentsCpu` draws `n * 32` normals out of the
+SAMPLER's stream, so comparing the sampled `z` would compare two Box-Muller implementations rather
+than the encoder. The gate takes `deterministic: true`, where `z` is the mean.
+
+🔴 **AND IT COULD NOT BE CHECKED AT ALL UNTIL THE EXPORTER READ A STRUCTURE.** The encoder's input
+IS a structure, and the exporter refused every preset that has one with "only the pure-spec presets
+export offline" - which was never true: the seven examples the page names are
+`web/examples/*.cif.zst`, shipped in this checkout, and the page fetches them over its own origin.
+Reading them off disk is the whole of what that refusal cost, and it is what makes the motif, PPI,
+small-molecule, DNA and partial-diffusion cases exportable.
+
+🔴 **A PRESET WITHOUT `specMode` IS BUILT FROM ITS STRUCTURE'S ANNOTATIONS, NOT ITS CONTIG** -
+web/generate.js has the note. Those contigs are written in the original entry's numbering and name
+residues the cropped example does not contain, so building one from the spec fails outright.
+
 ## What is not done
 
-- **An end-to-end trajectory comparison.** Every PIECE is held to the reference - the trunk, the
-  decoder, and the sampler's schedules are ported from `shared/rfd4p/flow.js` - but the LOOP that
-  joins them is checked only by the structure it produces being a protein. `--gen-oracle` runs
-  `generateRfd4pCpu` beside it at a step count somebody can wait for; 🔴 do not run it at the
-  preset's 60, which is `depths` JS trunk passes at about a minute each.
 - **A native featuriser.** `export_input.mjs` drives the page's own JS; the C++ twin under
   `cuda/featurise/` comes with the `--job` form and the `lf::standalone::main` dispatch.
-- **A gate.** There is no `gate.py` or `gate-baseline.json` yet, so nothing re-runs these numbers.
-- **Any case but one, and any length but three.** `custom_cath_monomer` is the only preset that builds
-  without fetching a structure — no ligand, no nucleic chain, no binder — and `--length=N` makes an
-  unconditioned segment for sizing and timing only.
+- **Any preset's GENERATION but the monomer's.** Every preset EXPORTS now (see below), so the trunk,
+  the decoder and the encoder can be held to the reference on a real structure; the sampling loop
+  still refuses an input whose per-step features are more than the noised state.
 - **A padded input**, so the masking paths are written and unexercised.
 - **Anything but an unconditional monomer through `--generate`.** The export REFUSES an input whose
   per-step features are more than the noised state, rather than silently freezing a feature that
