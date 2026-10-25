@@ -462,6 +462,15 @@ if (generate) {
   for (const c of chunks) { noise.set(c, at); at += c.length; }
 
   const gFloats = writeDir(`${out}-gen`, {
+    // 🔴 FLOATS, NOT INTS. Put in the `ints` map these became an Int32Array and every NaN
+    // became a 0 - a conditioned coordinate of zero is a real position, so the anchor set
+    // would have been every atom at the origin rather than none.
+    "g/condCoord": batch[COND.CRD]
+      ? Float32Array.from(field(COND.CRD))
+      : new Float32Array(n * 37 * 3).fill(NaN),
+    "g/condIntCrd": batch[COND.INTCRD]
+      ? Float32Array.from(field(COND.INTCRD))
+      : new Float32Array(n * 37 * 3).fill(NaN),
     "g/pairNoDist": pairNoDist,
     "g/cond": condAll,
     "g/cond1": cond1All,

@@ -445,7 +445,7 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
                   Fdev("in/attnMask"), dLogits, dCoors, dPresence);
     CK(cudaStreamSynchronize(STREAM));
 
-    const rfd4p::GenOut g = rfd4p::postprocess(
+    rfd4p::GenOut g = rfd4p::postprocess(
         n, nTypes, download(dLogits, (size_t)n * nTypes), download(dCoors, (size_t)n * 111),
         download(dPresence, (size_t)n * 37), download(xBb, (size_t)n * 3), seq,
         std::vector<int>(tokenType, tokenType + n),
@@ -484,6 +484,12 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
       path = stem + "_" + std::to_string(design + 1) + ext;
     }
+    // 🔴 INTO THE INPUT'S FRAME BEFORE ANYTHING IS WRITTEN. A contig has no conditioned
+    // coordinates, so this is a no-op there; a structure job's output is otherwise in the
+    // sampler's centred frame and superposes on nothing.
+    rfd4p::alignToInputFrame(g, n, M.has("g/condCoord") ? M.f("g/condCoord") : nullptr,
+                             M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr,
+                             M.has("g/coordGroup") ? M.i("g/coordGroup") : nullptr);
     // The input's own numbering and chain letters where a job named a structure; absent for a
     // contig, where the token index IS the residue number.
     rfd4p::OutNaming naming;

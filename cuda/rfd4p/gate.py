@@ -181,7 +181,12 @@ def compare_dirs(native: Path, js: Path) -> list[str]:
         elif len(va) != len(vb):
             differ.append(f"{k} is {len(va)} long native and {len(vb)} in JS")
         else:
-            n = sum(1 for x, y in zip(va, vb) if x != y)
+            # 🔴 NaN EQUALS NaN HERE. A conditioned coordinate that nobody set is NaN on both
+            # sides, and `x != y` is TRUE for two NaNs - so a column that is absent by design
+            # reads as every element differing. The first tensor to carry NaN through this
+            # comparison reported 111 of 111 wrong while the two files were byte-identical.
+            n = sum(1 for x, y in zip(va, vb)
+                    if x != y and not (x != x and y != y))
             if n:
                 differ.append(f"{k}: {n} of {len(va)} differ")
     return differ

@@ -31,3 +31,5 @@ i g/condSeq 5527918 67
 i g/allowedTypes 5527985 1029
 i g/atom37Legal 5529014 5439
 i g/coordGroup 5534453 2479
+t g/condCoord 5536932 7437
+t g/condIntCrd 5544369 7437

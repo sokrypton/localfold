@@ -2075,6 +2075,12 @@ int run(int argc, char** argv) {
     g.ints("g/allowedTypes", allowed);
     g.ints("g/atom37Legal", legal);
     g.ints("g/coordGroup", b.coordGroup);
+    // 🔴 THE CONDITIONED COORDINATES THEMSELVES, for the alignment at the far end. A generated
+    // structure comes out in the model's CENTRED frame; the atoms whose coordinates were
+    // conditioned are the only ones whose place in the input's frame is known, so they are the
+    // anchors that put the whole thing back. Without them a motif design superposes on nothing.
+    g.tensor("g/condCoord", b.condCoord);
+    g.tensor("g/condIntCrd", b.condInternalCoord);
   }
   g.close();
   {

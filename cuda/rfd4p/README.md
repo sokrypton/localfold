@@ -544,7 +544,8 @@ residues the cropped example does not contain, so building one from the spec fai
     mmCIF, runs the fourteen stages and samples, 67 tokens of 1PRW at CA-CA 3.798 A - and the
     featuriser is byte-exact against `export_input.mjs` on both routes.
     Its output carries the INPUT's own residue numbering and chain letters, so a motif still
-    superposes on the target it was built against. What is left is the rest of
+    superposes on the target it was built against, and is aligned onto the conditioned frame
+    (`src/superpose.h`) - a **0.12 A** refinement, measured, not the rescue it looks like. What is left is the rest of
     `processSampleToAtoms`'s `inputAtoms` path - the unindexed-insertion machinery (the
     Hungarian match and its geometric fallback), which only an unindexed motif reaches - and
     the coordinate-group permutation.
