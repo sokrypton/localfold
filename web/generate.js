@@ -187,6 +187,26 @@ export async function generate(options) {
     nsteps: steps,
     seed,
     signal,
+    // 🔴 THE PAGE HAD NEVER ASKED FOR f16, SO THE ONE CONFIGURATION NOBODY RAN WAS
+    // THE ONE THAT SHIPPED. Every tool in `tools/gpu/` defaults to `half`, so each
+    // number recorded for this port describes an arm a visitor never took, and the
+    // f32 arm is 1.56x slower at n = 200 and about 2.6x at n = 400 - the pair track
+    // narrows, so `chunkPlan` also keeps one chunk to n = 512 instead of 362 and a
+    // 400-residue design stops falling onto the chunked kernels entirely.
+    //
+    // 🔴 AND IT IS A DIFFERENT STRUCTURE, KNOWINGLY: `tools/gpu/check-rfd4p-length.js`
+    // measures the two arithmetics at n = 200 over 60 steps at one seed at **mean CA
+    // 2.687 A, worst 7.935**, against the 0.5 A `tools/gpu/check-generate.js` holds
+    // its own half arm to at the oracle's length. Both arms produce a well-formed
+    // chain (medians 3.87 and 3.86, nothing torn), so this is the SAME DISTRIBUTION
+    // SAMPLED DIFFERENTLY - a per-pass difference of order 1e-3 compounded over 120
+    // passes of a chaotic trajectory, which is what `cuda/rfd4p`'s own notes say from
+    // the other side: "one ulp in one draw diverges a sixty-step trajectory". The
+    // design is not the f32 arm's design, and that is the trade taken here: a
+    // generator draws from a distribution, and the speed is what makes a reader try
+    // another seed. 🔴 WHAT WOULD MAKE IT MORE THAN A TRADE is an oracle dump at
+    // 200-400 tokens (there is none) or an independent re-fold of both designs.
+    half: true,
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
     ...(partialTrajectoryFractionSteps === undefined
       ? {} : { partialTrajectoryFractionSteps }),

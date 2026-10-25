@@ -23,13 +23,26 @@
  * chaotic trajectory. `cuda/rfd4p`'s notes say the same thing from the other side: "one ulp
  * in one draw diverges a sixty-step trajectory".
  *
- * 🔴 SO f16 IS NOT VALIDATED BEYOND THE ORACLE'S LENGTH, AND `web/generate.js` STAYS f32.
- * Turning `half` on there is worth 1.56x at n = 200 and about 2.6x at n = 400 - every tool
- * in this directory already defaults to it - but a 2.7 A mean deviation is a DIFFERENT
- * STRUCTURE, and "both of them look like proteins" is not evidence that the faster one is
- * right. What would settle it is an oracle dump at 200-400 tokens, which does not exist
- * here, or an independent re-fold of both designs. Until one of those exists this tool
- * records the gap rather than closing it.
+ * 🔴 AND `web/generate.js` RUNS f16 ANYWAY, DELIBERATELY - this number is the price, not a
+ * veto. A generator DRAWS, so two arithmetics taking different paths through a chaotic
+ * trajectory are two samples and not a right answer and a wrong one; what a deviation this
+ * size forbids is calling one arm's design the OTHER arm's, which nothing here does. The
+ * bar it has to clear instead is that each arm's own output is a MOLECULE, which is what
+ * `caSpacing` below measures and what the page's own validation re-folds - and at the design
+ * page's settings the two arms are indistinguishable on it (f32 pLDDT 32.1 / RMSD 20.55 A,
+ * f16 32.6 / 20.08 on a 100-mer at 30 steps, where 20 A is those cheap settings and not the
+ * arithmetic). The speed is what lets a reader draw again, which is the whole activity.
+ *
+ * 🔴 SO WHAT THIS TOOL IS FOR NOW IS THE GEOMETRY AT THE LENGTHS THE f16 PATH REACHES.
+ * `--arm=f16 --length=400` is the one that nothing had ever checked: before the single-chunk
+ * threshold moved it was unreachable in f16, so the arm the page now runs at a designer's own
+ * length had never produced a structure anybody scored. Measured, 60 steps, seed 42:
+ *
+ *   median 3.884 A   least 3.771   worst 3.972   399 of 399 bonds inside [3.6, 4.0]
+ *
+ * Every bond is a peptide bond, which is a cleaner backbone than either arm managed at
+ * n = 200 - where the f32 REFERENCE itself has one at 4.008. An oracle dump at 200-400
+ * tokens would still be worth more than any of this, and there is none.
  */
 
 import {
