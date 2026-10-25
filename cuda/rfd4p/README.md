@@ -527,15 +527,15 @@ residues the cropped example does not contain, so building one from the spec fai
     with every number the page produces.
   - ~~**`transforms.js` with real atoms**~~ **done, all fourteen stages** - the same pipeline
     the spec path already ran, but with every branch a contig's `<M>` stubs made inert now
-    live. Held to the reference over twenty-two cases: the seven shipped structures and fifteen the
+    live. Held to the reference over twenty-seven cases: the seven shipped structures and twenty the
     gate synthesises, because the shipped seven could not reach most of it (see the three
-    findings below the table) - four of the fifteen built this session purely to make the mmCIF READER's own filters reachable. `convertToProteinaBatch` (1175-1606) is ported too, so a
+    findings below the table) - nine of the twenty built this session purely to make the mmCIF READER's own filters and fallbacks reachable, four of those chosen by gcov. `convertToProteinaBatch` (1175-1606) is ported too, so a
     structure now reaches the batch the model reads - 46 keys held to the reference over all
-    twenty-two cases. Zstandard is native too (`cuda/featurise/zstd.h`,
+    twenty-seven cases. Zstandard is native too (`cuda/featurise/zstd.h`,
     dlopen'd like `common.cuh`'s blob reader), so the page's own `.cif.zst` goes straight into
     the binary and the gate drives all seven that way as well as decompressed. `applyContig` takes PRESERVED segments now
     (`featurise/contig.h`), so a contig against a real structure assembles natively - five
-    contigs over each of the twenty-two cases, compared column by column with the bonds and
+    contigs over each of the twenty-seven cases, compared column by column with the bonds and
     `originalResId`. The selection language reads real atoms too
     (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
     which is what every structure preset writes and what the contig-only subset could not say.
@@ -592,7 +592,33 @@ residues the cropped example does not contain, so building one from the spec fai
     conditions the model on everything exactly where a reader that skipped the columns would
     condition it on nothing. No shipped structure carries one. `motif_idx_1prw+legacymask`
     does, and skipping the index rewrite alone is watched failing on the ANNOTATION KEY SET
-    and on five contigs' `condition_index`. The corpus is **22 structures** now.
+    and on five contigs' `condition_index`.
+
+    🔴 **AND THEN GCOV SAID WHAT READING COULD NOT: THE WHOLE FALLBACK HALF OF
+    `deriveChemistry` WAS DEAD.** Built with `--coverage` and run over the corpus, the guard
+    reads **913,128 hits on the `if` and ZERO on the `else`** - "the file's own tables win over
+    the standard ones" turned out to mean they win EVERY time, because every structure carries
+    `_chem_comp_atom`, `_chem_comp` and `_entity_poly`. Five rules live in that else and none
+    had ever run: `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule,
+    `chemCompType` from the residue tables, and the chain type from the residue NAME - the last
+    of which carries this port's 🔴 that `5-20` and `<M>` must come out POLYPEPTIDE "or a
+    contig's own chain is typed NON-POLYMER", a justification read out of the reference and
+    sitting on a line that had never executed. `withoutChemTables` strips the tables; all five
+    are watched failing now - the chain-type rule at **2 of 27**, the leaving-atom rule 2, the
+    aromatic table 2, `chemCompType` 1, the charge table 1.
+
+    🔴 **AND TWO OF THE FIVE STAYED GREEN ON A BRANCH THE STRIP HAD JUST MADE REACHABLE.** The
+    leaving-atom rule needs a file that HAS an OXT or an OP3, so stripping a fragment with
+    neither reaches the line and cannot see it. And `STD_RESIDUE_CHARGES` sits under
+    `if (a.charge[k] == 0)`, which every chargeable atom in this corpus fails because the file
+    declares `+1` itself - measured, the guard is entered 913,128 times of 926,116 and the
+    ~12,988 that skip it are exactly those atoms - so it needs no `_chem_comp_atom`, NO
+    declared formal charge, and one of the three residues the table knows. **Reaching a line
+    is not exercising the rule on it**, which is the sharpest form of this session's lesson:
+    coverage tells you where to look and is not itself the test.
+
+    The corpus is **27 structures** now, twenty of them synthesised, and gcov is how the last
+    eight were chosen.
 
     🔴 **AND TWO OF `superpose.h`'s FIVE CONVENTIONS ARE NOT WHAT THE FILE SAID THEY WERE.**
     The header claimed three things were "the reference's and not the textbook's" and that a

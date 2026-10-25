@@ -221,6 +221,60 @@ function withAuthNumbering(text) {
 }
 
 /**
+ * The same structure with its own chemistry tables REMOVED, so the reader must fall back to
+ * the built-in ones.
+ *
+ * 🔴 THE WHOLE FALLBACK HALF OF `deriveChemistry` IS DEAD ON EVERY SHIPPED FILE, and gcov is
+ * what said so rather than reading: each of the twenty-two structures carries
+ * `_chem_comp_atom`, `_chem_comp` and `_entity_poly`, and "the file's own tables win" means
+ * they win EVERY time - 913,128 hits on the `if` and **zero on the `else`**. Five rules live
+ * in that else: `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule,
+ * `chemCompType` from the residue tables, and the chain type from the residue NAME - the last
+ * of which carries this port's 🔴 that `5-20` and `<M>` must come out POLYPEPTIDE or a
+ * contig's own chain is typed NON-POLYMER. That note was written from reading the reference
+ * and the line it sits on had never run.
+ */
+function withoutChemTables(text, blankFormalCharge = false) {
+  if (blankFormalCharge) {
+    // 🔴 AND `STD_RESIDUE_CHARGES` NEEDS A THIRD THING, WHICH IS WHY STRIPPING THE TABLES LEFT
+    // IT GREEN. The fallback is under `if (a.charge[k] == 0)`, and every chargeable atom in
+    // this corpus carries `+1` in the file's OWN `pdbx_formal_charge` - measured: the guard is
+    // entered 913,128 times out of 926,116, and the ~12,988 that skip it are exactly those
+    // atoms. So the table can only be reached by a file that declares no formal charge AND has
+    // no `_chem_comp_atom`, and the three keys it holds are `ARG:NH2`, `HIS:ND1` and `LYS:NZ`.
+    const L = atomSiteLoop(text);
+    const fc = L.cols.indexOf("pdbx_formal_charge");
+    if (fc < 0) throw new Error("no formal charge column to blank");
+    text = writeAtomSite(L, L.rows.map((r) => { const t = [...r]; t[fc] = "?"; return t; }));
+  }
+  const out = [];
+  const drop = ["_chem_comp_atom.", "_chem_comp.", "_entity_poly.", "_entity_poly_seq.",
+                "_entity."];
+  const lines = text.split("\n");
+  let i = 0;
+  let removed = 0;
+  while (i < lines.length) {
+    const isLoop = lines[i].trim() === "loop_";
+    const headAt = isLoop ? i + 1 : i;
+    const tag = lines[headAt]?.trim().split(/\s+/)[0] ?? "";
+    if (drop.some((d) => tag.startsWith(d))) {
+      // Skip the whole block: its tags, then its rows, up to the next `#`/`loop_`.
+      let j = headAt;
+      while (j < lines.length && lines[j].trim().startsWith("_")) j += 1;
+      while (j < lines.length && lines[j].trim() && !lines[j].startsWith("#") &&
+             lines[j].trim() !== "loop_") j += 1;
+      removed += 1;
+      i = j;
+      continue;
+    }
+    out.push(lines[i]);
+    i += 1;
+  }
+  if (removed < 3) throw new Error(`only ${removed} chemistry blocks to remove`);
+  return out.join("\n");
+}
+
+/**
  * The same structure written the OLD way: `mask_index_1_residue`, `mask_sequence_1_residue`
  * and `mask_coordinate_1_atom` in place of the `condition_*` columns.
  *
@@ -569,6 +623,14 @@ cases.set("sm_sam+twomodels", withSecondModel(cases.get("sm_sam")));
 cases.set("motif_idx_1prw+altloc", withAltLocs(cases.get("motif_idx_1prw")));
 cases.set("motif_idx_1prw+authnum", withAuthNumbering(cases.get("motif_idx_1prw")));
 cases.set("motif_idx_1prw+legacymask", withLegacyMasks(cases.get("motif_idx_1prw")));
+cases.set("motif_idx_1prw+nochemtables", withoutChemTables(cases.get("motif_idx_1prw")));
+cases.set("dna_7m5w+nochemtables", withoutChemTables(cases.get("dna_7m5w")));
+// 🔴 AND THE LEAVING-ATOM FALLBACK NEEDS A LEAVING ATOM TOO. Stripping the tables from a file
+// with no OXT and no OP3 reaches the rule and cannot see it: the first two cases above left
+// `(aa || na) ? 1 : 0` green when it was deleted. These two have the atom AND the fallback.
+cases.set("ppi_pdl1+OXT+nochemtables", withoutChemTables(cases.get("ppi_pdl1+OXT")));
+cases.set("dna_7m5w+OP3+nochemtables", withoutChemTables(cases.get("dna_7m5w+OP3")));
+cases.set("ppi_pdl1+nocharges", withoutChemTables(cases.get("ppi_pdl1"), true));
 
 /**
  * The contigs to try on a structure: a preserved segment it really has, with an expandable one

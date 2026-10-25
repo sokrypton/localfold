@@ -210,6 +210,23 @@ struct AtomSite {
  * the built-in tables are the fallback for a component the file says nothing about, not the other
  * way round.
  *
+ * 🔴 AND "THE FILE'S OWN TABLES WIN" MEANT THEY WIN EVERY TIME: THE WHOLE FALLBACK HALF OF THIS
+ * FUNCTION WAS DEAD. Found by gcov over the corpus rather than by reading - 913,128 hits on the
+ * `if` and **zero on the `else`**, because every shipped structure carries `_chem_comp_atom`,
+ * `_chem_comp` and `_entity_poly`. Five rules live in that else and none had ever run:
+ * `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule, `chemCompType`
+ * from the residue tables, and the chain type from the residue NAME. `withoutChemTables` in
+ * `check-cif.mjs` strips the tables, and each is now watched failing: the chain-type rule at 2
+ * of 27, the leaving-atom rule 2, the aromatic table 2, `chemCompType` 1, the charge table 1.
+ *
+ * 🔴 AND TWO OF THE FIVE NEEDED MORE THAN THE STRIP, WHICH IS WHY THE FIRST ATTEMPT LEFT THEM
+ * GREEN ON A BRANCH IT HAD JUST MADE REACHABLE. The leaving-atom rule needs a file that HAS an
+ * OXT or an OP3, so stripping a fragment with neither reaches the line and cannot see it; and
+ * `STD_RESIDUE_CHARGES` sits under `if (a.charge[k] == 0)`, which every chargeable atom here
+ * fails because the file declares `+1` itself - it needs no `_chem_comp_atom`, no declared
+ * formal charge, AND one of the three residues the table knows. Reaching a line is not
+ * exercising the rule on it.
+ *
  * 🔴 AND A NON-POLYMER CHAIN TAKES `auth_seq_id` AS ITS RESIDUE NUMBER (`update_nonpoly_seq_ids`),
  * which is not cosmetic: a ligand's `label_seq_id` is `.` and so -1 for every one of its atoms,
  * which would collapse a whole het group into one residue.
@@ -343,6 +360,11 @@ inline void deriveChemistry(AtomSite& a, const Block& block) {
       // 🔴 `5-20` AND `<M>` ARE POLYPEPTIDE, which is not a curiosity: an expandable segment's
       // sentinel is named by its length range and a masked residue by `<M>`, and both must come
       // out as protein or a contig's own chain is typed NON-POLYMER.
+      //
+      // 🔴 AND THIS NOTE SAT ON A LINE THAT HAD NEVER EXECUTED. `_entity_poly` types every chain
+      // in every shipped file, so `type < 0` was never true; the justification above was read
+      // out of the reference rather than measured. It is right - dropping `range || res ==
+      // "<M>"` is 2 of 27 differing on the stripped files - but it was a guess until then.
       bool range = !res.empty() && res.find('-') != string::npos;
       for (char ch : res) range = range && (isdigit((unsigned char)ch) || ch == '-');
       if (tables::DNA_RESIDUES.count(res)) type = tables::CT_DNA;
