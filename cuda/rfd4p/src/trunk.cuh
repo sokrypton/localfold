@@ -325,13 +325,26 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   // PairTransition: LayerNorm, up, ReLU, down, residual.
   const std::string tr = pre + ".transition_out";
   const int hidden = (int)lenW(wn(tr + ".linear_1.bias"));
-  float* zn = scratch<float>("rfd4p.pu.zn", rows * P);
-  float* h = scratch<float>("rfd4p.pu.h", rows * (size_t)hidden);
   float* o = scratch<float>("rfd4p.pu.o", rows * P);
-  layerNorm(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
-  linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-  biasReluK<<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
-  linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
+  // The widened hidden is [pairs, 768] - the largest buffer in the update after the planes - so under
+  // --fast it is half, and with it the normed input the up projection reads.
+  if (F32_TF32) {
+    half* zn = scratch<half>("rfd4p.pu.zn16", rows * P);
+    half* h = scratch<half>("rfd4p.pu.h16", rows * (size_t)hidden);
+    layerNorm<half>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
+    linear<half, half>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
+    biasReluK<half><<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows,
+                                                               hidden);
+    linear<half, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
+  } else {
+    float* zn = scratch<float>("rfd4p.pu.zn", rows * P);
+    float* h = scratch<float>("rfd4p.pu.h", rows * (size_t)hidden);
+    layerNorm(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
+    linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
+    biasReluK<float><<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows,
+                                                                hidden);
+    linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
+  }
   biasAddK<<<blocks(rows * P), 256, 0, STREAM>>>(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
 }
 

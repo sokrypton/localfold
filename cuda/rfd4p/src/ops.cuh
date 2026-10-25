@@ -185,11 +185,12 @@ __global__ void mulSigmoidAddPlaneGateK(const float* __restrict__ a, const T* __
 }
 
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
-__global__ void biasReluK(float* __restrict__ x, const float* __restrict__ bias, size_t rows, int C) {
+template <class T>
+__global__ void biasReluK(T* __restrict__ x, const float* __restrict__ bias, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * (size_t)C) return;
-  const float v = x[i] + bias[i % C];
-  x[i] = v < 0.f ? 0.f : v;
+  const float v = (float)x[i] + bias[i % C];
+  x[i] = (T)(v < 0.f ? 0.f : v);
 }
 // `z += x + bias` on the live pairs - the pair transition's down projection and its residual.
 __global__ void biasAddK(const float* __restrict__ x, const float* __restrict__ bias,
@@ -279,27 +280,28 @@ __global__ void fromPlanesK(const float* __restrict__ in, float* __restrict__ ou
 // A 32x32 tiled transpose instead, which is the part that was actually slow: the naive form reads
 // `in[c * pairs + p]` with consecutive threads `pairs` apart, so its loads are one word a
 // transaction. Staging a tile through shared memory makes both sides coalesced.
-template <int TILE = 32>
+template <class TI, class TO, int TILE = 32>
 __global__ void __launch_bounds__(TILE * 8)
-fromPlanesTiledK(const float* __restrict__ in, float* __restrict__ out, size_t pairs, int C) {
+fromPlanesTiledK(const TI* __restrict__ in, TO* __restrict__ out, size_t pairs, int C) {
   __shared__ float tile[TILE][TILE + 1];
   const size_t p0 = (size_t)blockIdx.x * TILE;
   const int c0 = blockIdx.y * TILE;
   for (int r = threadIdx.y; r < TILE; r += blockDim.y) {
     const int c = c0 + r;
     const size_t p = p0 + threadIdx.x;
-    tile[r][threadIdx.x] = (c < C && p < pairs) ? in[(size_t)c * pairs + p] : 0.f;
+    tile[r][threadIdx.x] = (c < C && p < pairs) ? (float)in[(size_t)c * pairs + p] : 0.f;
   }
   __syncthreads();
   for (int r = threadIdx.y; r < TILE; r += blockDim.y) {
     const size_t p = p0 + r;
     const int c = c0 + threadIdx.x;
-    if (c < C && p < pairs) out[p * C + c] = tile[threadIdx.x][r];
+    if (c < C && p < pairs) out[p * C + c] = (TO)tile[threadIdx.x][r];
   }
 }
-inline void fromPlanes(const float* in, float* out, size_t pairs, int C) {
+template <class TI, class TO>
+inline void fromPlanes(const TI* in, TO* out, size_t pairs, int C) {
   dim3 grid((unsigned)((pairs + 31) / 32), (unsigned)((C + 31) / 32));
-  fromPlanesTiledK<32><<<grid, dim3(32, 8), 0, STREAM>>>(in, out, pairs, C);
+  fromPlanesTiledK<TI, TO, 32><<<grid, dim3(32, 8), 0, STREAM>>>(in, out, pairs, C);
 }
 
 // ---------------------------------------------------------------- attention packing
