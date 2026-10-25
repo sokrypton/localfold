@@ -136,6 +136,11 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     int st = NST == 1 ? 0 : j & 1;
     // chunk j has landed; the barrier also says every warp is done with the stage the next issue
     // overwrites (chunk j - 1's), so one barrier a chunk
+    float2 b1v[NC / 8];
+    if constexpr (RELU) {
+#pragma unroll
+      for (int nt = 0; nt < NC / 8; ++nt) b1v[nt] = ptx_ldg_v2_f32(b1 + j * NC + nt * 8 + tig * 2);
+    }
 #if LF_REG_STAGES
     if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half*, const half* src) { next.load(i, src); });
     __syncthreads();
@@ -147,15 +152,10 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     }
 #endif
     const half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
-    float2 b1v[NC / 8];
-    if constexpr (RELU) {
-#pragma unroll
-      for (int nt = 0; nt < NC / 8; ++nt) b1v[nt] = ptx_ldg_v2_f32(b1 + j * NC + nt * 8 + tig * 2);
-    }
     float ha[MT][NC / 8][4] = {}, hb[MT][NC / 8][4] = {};
     constexpr int N2 = NC / 16, STEPS1 = KS * N2;
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
-    if constexpr (MT == 1) {
+    {
       uint32_t fa[2][4], fb[2][4];
       ldsm4t(fa[0], a + stageSw<NC>(kl, cl));
       if constexpr (!RELU) ldsm4t(fb[0], b + stageSw<NC>(kl, cl));
@@ -167,24 +167,16 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
           ldsm4t(fa[cur ^ 1], a + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
           if constexpr (!RELU) ldsm4t(fb[cur ^ 1], b + stageSw<NC>(nks * 16 + kl, nn2 * 16 + cl));
         }
-        mma16816(ha[0][2 * n2], xa[0][ks], fa[cur][0], fa[cur][1]); mma16816(ha[0][2 * n2 + 1], xa[0][ks], fa[cur][2], fa[cur][3]);
-        if constexpr (!RELU) {
-          mma16816(hb[0][2 * n2], xa[0][ks], fb[cur][0], fb[cur][1]); mma16816(hb[0][2 * n2 + 1], xa[0][ks], fb[cur][2], fb[cur][3]);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+          mma16816(ha[m][2 * n2], xa[m][ks], fa[cur][0], fa[cur][1]);
+          mma16816(ha[m][2 * n2 + 1], xa[m][ks], fa[cur][2], fa[cur][3]);
         }
-      }
-    } else {
+        if constexpr (!RELU) {
 #pragma unroll
-      for (int ks = 0; ks < KS; ++ks) {
-#pragma unroll
-        for (int n2 = 0; n2 < N2; ++n2) {
-          uint32_t fa[4], fb[4];
-          ldsm4t(fa, a + stageSw<NC>(ks * 16 + kl, n2 * 16 + cl));
-          if constexpr (!RELU) ldsm4t(fb, b + stageSw<NC>(ks * 16 + kl, n2 * 16 + cl));
-#pragma unroll
-          for (int m = 0; m < MT; ++m) { mma16816(ha[m][2 * n2], xa[m][ks], fa[0], fa[1]); mma16816(ha[m][2 * n2 + 1], xa[m][ks], fa[2], fa[3]); }
-          if constexpr (!RELU) {
-#pragma unroll
-            for (int m = 0; m < MT; ++m) { mma16816(hb[m][2 * n2], xa[m][ks], fb[0], fb[1]); mma16816(hb[m][2 * n2 + 1], xa[m][ks], fb[2], fb[3]); }
+          for (int m = 0; m < MT; ++m) {
+            mma16816(hb[m][2 * n2], xa[m][ks], fb[cur][0], fb[cur][1]);
+            mma16816(hb[m][2 * n2 + 1], xa[m][ks], fb[cur][2], fb[cur][3]);
           }
         }
       }
@@ -193,7 +185,7 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
     for (int t = 0; t < NC / 16; ++t) {
       uint32_t vb[2][4];
-      if constexpr (MT == 1) ldsm4t(vb[0], w2 + w2Sw<C>(t * 16 + kl, cl));
+      ldsm4t(vb[0], w2 + w2Sw<C>(t * 16 + kl, cl));
       uint32_t pa[MT][4];
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
@@ -204,20 +196,14 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
         pa[m][0] = pack2(gate(2 * t, 0), gate(2 * t, 1)); pa[m][1] = pack2(gate(2 * t, 2), gate(2 * t, 3));
         pa[m][2] = pack2(gate(2 * t + 1, 0), gate(2 * t + 1, 1)); pa[m][3] = pack2(gate(2 * t + 1, 2), gate(2 * t + 1, 3));
       }
-      if constexpr (MT == 1) {
 #pragma unroll
-        for (int et = 0; et < NT; et += 2) {
-          const int cur = (et >> 1) & 1;
-          if (et + 2 < NT) ldsm4t(vb[cur ^ 1], w2 + w2Sw<C>(t * 16 + kl, (et + 2) * 8 + cl));
-          mma16816(acc[0][et], pa[0], vb[cur][0], vb[cur][1]); mma16816(acc[0][et + 1], pa[0], vb[cur][2], vb[cur][3]);
-        }
-      } else {
+      for (int et = 0; et < NT; et += 2) {
+        const int cur = (et >> 1) & 1;
+        if (et + 2 < NT) ldsm4t(vb[cur ^ 1], w2 + w2Sw<C>(t * 16 + kl, (et + 2) * 8 + cl));
 #pragma unroll
-        for (int et = 0; et < NT; et += 2) {
-          uint32_t vb[4];
-          ldsm4t(vb, w2 + w2Sw<C>(t * 16 + kl, et * 8 + cl));
-#pragma unroll
-          for (int m = 0; m < MT; ++m) { mma16816(acc[m][et], pa[m], vb[0], vb[1]); mma16816(acc[m][et + 1], pa[m], vb[2], vb[3]); }
+        for (int m = 0; m < MT; ++m) {
+          mma16816(acc[m][et], pa[m], vb[cur][0], vb[cur][1]);
+          mma16816(acc[m][et + 1], pa[m], vb[cur][2], vb[cur][3]);
         }
       }
     }
@@ -240,6 +226,8 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
     const int c = hh * (C / 2) + cl;
+    float4 b4;
+    if constexpr (RELU) b4 = ptx_ldg_v4_f32(b2 + c);
     PairRaw4<PT> pv[MT == 1 ? RW / LPR : 1];
     if constexpr (MT == 1) {
 #pragma unroll
@@ -258,8 +246,6 @@ fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
       }
     }
     __syncwarp();
-    float4 b4;
-    if constexpr (RELU) b4 = ptx_ldg_v4_f32(b2 + c);
     if constexpr (MT == 1) {
 #pragma unroll
       for (int i = 0; i < RW / LPR; ++i) {
