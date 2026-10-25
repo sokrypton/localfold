@@ -69,7 +69,22 @@ inline vector<string> expandPathField(const string& rawField, bool isResId) {
   if (v.empty() || v == "*") return {"*"};
   if (v.size() >= 2 && v.front() == '[' && v.back() == ']') {
     vector<string> out;
-    for (const string& raw : splitTopLevel(v.substr(1, v.size() - 2), ',')) {
+    // 🔴 A PLAIN COMMA SPLIT, NOT `splitTopLevel`, WHICH IS THE REFERENCE'S OWN
+    // `v.slice(1, -1).split(',')` AND MATTERS ON EXACTLY ONE INPUT. Quote-aware splitting
+    // looks like the careful choice and is wrong here: an atom name ending in a PRIME opens a
+    // quote that never closes, so `[C1',C2']` comes back as the single item `C1',C2'` and the
+    // selection matches nothing where the reference matches 18 atoms. The brackets are already
+    // stripped and the reference supports no nesting, so there is no top level left to respect.
+    vector<string> items;
+    {
+      string buf;
+      const string inner = v.substr(1, v.size() - 2);
+      for (const char c : inner) {
+        if (c == ',') { items.push_back(buf); buf.clear(); } else { buf += c; }
+      }
+      items.push_back(buf);
+    }
+    for (const string& raw : items) {
       const string item = trim(raw);
       if (item.empty()) continue;
       if (item == "*") { out.push_back("*"); continue; }
@@ -175,9 +190,20 @@ inline vector<uint8_t> evalSelection(const atoms::AtomArray& a, const string& ex
   size_t at = 0, lastEnd = 0;
   bool sawTerm = false;
   while (at < expr.size()) {
-    const size_t open = expr.find("sel('", at);
-    if (open == string::npos) break;
-    const size_t close = expr.find("')", open);
+    // 🔴 EITHER QUOTE, BECAUSE A SUGAR ATOM'S NAME CONTAINS A PRIME. This took `sel('` alone
+    // and so could not express `C1'`, `O3'`, `O5'` and the five other primed names a nucleic
+    // chain has - the one case where the quoting is not a formality, since the prime would
+    // close the single quote. mmCIF writes those names double-quoted for the same reason, the
+    // reference accepts `sel("...")` and returns 9 atoms for one and 18 for a two-name list,
+    // and this port REFUSED the whole selection. A loud refusal rather than a wrong answer,
+    // but it meant no atom of a DNA or RNA chain could be named at all. Found by counting:
+    // `splitTopLevel`'s quote machinery ran 1758 times over 14,534 characters and never saw a
+    // quote, because every selection the corpus wrote named a protein atom.
+    const size_t openS = expr.find("sel('", at), openD = expr.find("sel(\"", at);
+    if (openS == string::npos && openD == string::npos) break;
+    const bool single = openD == string::npos || (openS != string::npos && openS < openD);
+    const size_t open = single ? openS : openD;
+    const size_t close = expr.find(single ? "')" : "\")", open);
     if (close == string::npos) {
       fprintf(stderr, "selection '%s' has an unterminated sel(...)\n", expr.c_str());
       exit(1);

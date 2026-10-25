@@ -389,7 +389,7 @@ a contig with no residue numbers and no atoms can express. Anything else is refu
 quietly matched to nothing - a condition silently dropped is a condition the model is told is
 absent, which is a different job folded under the right name. The gate has an arm for the
 refusals: a preserved segment, an unknown chain type, a condition that needs atoms, a selection
-that constrains a chain.
+that constrains a chain, and a centroid given fewer than three numbers.
 
 🔴 **AND ONE OF THOSE REFUSALS IS STRICTER THAN THE REFERENCE.** `C_SEQ` on a pure contig reaches
 `finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`, so the
@@ -646,6 +646,27 @@ residues the cropped example does not contain, so building one from the spec fai
     wrong was the fixture, which copied a preset's shape and so read as though it tested
     something. `gate-structure-contig.json` and `gate-crdgroups.json` set `specMode` and are
     where a structure's conditions are actually gated.
+
+    🔴 **AND COUNTING FOUND A CAPABILITY THE PORT DID NOT HAVE: NO ATOM OF A DNA OR RNA CHAIN
+    COULD BE NAMED IN A SELECTION AT ALL.** `splitTopLevel`'s quote machinery - single quotes,
+    the doubled-`''` escape, double quotes, backslash escapes - ran **1758 times over 14,534
+    characters and never saw a quote**, because every selection the corpus wrote named a
+    PROTEIN atom. That is not a formality: **a sugar atom's name contains a prime**, which
+    closes the single quote, so `dna_7m5w`'s eight primed names (`C1'`, `O3'`, `O5'` and the
+    rest) can only be written double-quoted - which is how the mmCIF itself writes them. The
+    reference accepts `sel("...")` and returns 9 atoms for one name and 18 for a two-name
+    list; this port matched `sel('` alone and **refused the whole selection**. A loud refusal
+    rather than a wrong answer, and still a real limitation on exactly the modality the port
+    advertises.
+
+    🔴 **AND BEHIND IT A SECOND BUG, WHERE BEING CAREFUL WAS THE MISTAKE.** With the double
+    quote accepted, a two-name list was still wrong: `expandPathField` split the bracket
+    contents with the quote-aware `splitTopLevel` where the reference uses a plain
+    `v.slice(1, -1).split(',')`. Quote-awareness looks like the considered choice and is wrong
+    here - a name ending in a prime opens a quote that never closes, so `[C1',C2']` comes back
+    as the single item `C1',C2'` and matches nothing where the reference matches **18 of 390**
+    atoms. The brackets are already stripped and the reference supports no nesting, so there
+    is no top level left to respect. Both were watched failing before the fix.
 
     🔴 **AND E/Z DOUBLE-BOND STEREOCHEMISTRY WAS THE LARGEST UNTESTED THING IN THE
     FEATURISER: 80 LINES OF `chirality.h`, UNREACHED BY ALL TWENTY-SEVEN STRUCTURES.**
@@ -990,7 +1011,9 @@ residues the cropped example does not contain, so building one from the spec fai
   head with a geometric CA-distance fallback (`src/assign.h`, `resolveInsertion`), and the output
   aligned onto the conditioned frame.
 - ~~**The selection language in full**~~ **done** (`featurise/selection.h`), as a stated SUBSET -
-  a union of `sel(...)` joined by `|`, with a comma between terms refused by name.
+  a union of `sel(...)` joined by `|`, in EITHER quote - a nucleic atom's name carries a
+  prime, so it can only be written double-quoted - with a comma between terms refused by
+  name.
 - ~~**Anything but an unconditional monomer through `--generate`**~~ **done**: both per-step
   features are handled rather than refused - a chirality frame recomputed on the device, a
   coordinate group's labels permuted from a replayed stream.

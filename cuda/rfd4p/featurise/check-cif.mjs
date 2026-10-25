@@ -802,6 +802,36 @@ function selectionsFor(js) {
     `sel('[${chains.join(",")}]/*/*/*')`,
     `sel('${cid}/*/*/*/1')`,
     `sel('${cid}/*/*/*/2')`,
+    ...primedSelections(cid, names),
+  ];
+}
+
+/**
+ * The selections that need QUOTE HANDLING, which only a nucleic chain forces.
+ *
+ * 🔴 `splitTopLevel`'s WHOLE QUOTE MACHINERY WAS DEAD: counted, it runs 1758 times over 14,534
+ * characters and **never sees a quote at all**. Single quotes, the doubled-`''` escape, double
+ * quotes and their backslash escape - none of it had ever executed, because every selection
+ * written here names a protein atom and the `sel('...')` wrapper is stripped before the path
+ * is split.
+ *
+ * 🔴 AND IT IS NOT DECORATION, BECAUSE A SUGAR ATOM'S NAME CONTAINS A PRIME. `dna_7m5w` has
+ * eight of them - `C1'`, `O3'`, `O5'` and the rest - and the mmCIF itself writes them
+ * double-quoted for exactly that reason. So selecting a nucleic atom by name is the ordinary
+ * case that needs the machinery, and nothing had asked for one. Measured against the
+ * reference: a double-quoted path ending in `C1'` is 9 atoms and the bracketed two-name list
+ * is 18, while the SQL-style doubled-quote form inside single quotes silently matches NOTHING
+ * - which is the reference's answer and so must be this port's, and is in the corpus for that
+ * reason rather than because anybody would write it.
+ */
+function primedSelections(cid, names) {
+  const primed = names.filter((n) => n.includes("'")).sort();
+  if (primed.length < 2) return [];
+  const [a, b] = primed;
+  return [
+    `sel("${cid}/*/*/${a}")`,
+    `sel("${cid}/*/*/[${a},${b}]")`,
+    `sel('${cid}/*/*/${a}'')`,
   ];
 }
 

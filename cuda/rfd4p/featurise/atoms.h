@@ -657,10 +657,18 @@ inline void addGlobalTokenIdAnnotation(AtomArray& a) {
 /**
  * `getTokenStarts(atoms, true)`: where each token begins, plus `n`.
  *
- * 🔴 IT READS `token_id` WHERE THERE IS ONE AND FALLS BACK TO THE RESIDUES WHERE THERE IS NOT,
- * which is the reference's own two-branch shape and not a convenience: the stages before
- * `addGlobalTokenIdAnnotation` call this too, and on an atomised residue the two branches give
- * different answers.
+ * It reads `token_id` where there is one and falls back to the residues where there is not,
+ * which is the reference's own two-branch shape. On an atomised residue the two branches give
+ * different answers, so which one runs matters.
+ *
+ * 🔴 AND THE FALLBACK NEVER RUNS HERE, WHERE THIS COMMENT USED TO SAY IT DID. It claimed "the
+ * stages before `addGlobalTokenIdAnnotation` call this too", which is the reference's shape
+ * read across rather than measured: instrumented and counted, the residue branch is entered
+ * **0 times** over the cif corpus's twenty-nine structures, all twelve spec fixtures, their
+ * `--generate` directories and six bare lengths. Every one of the five call sites runs after
+ * the annotation. Kept because it is the reference's and because a stage added before the
+ * annotation would need it - but it is dead code today and says so, rather than carrying a
+ * reason nothing can check. If you add a caller, this is the line that decides what it sees.
  */
 inline vector<int> tokenStarts(const AtomArray& a) {
   const size_t n = a.n();
@@ -1436,7 +1444,7 @@ struct TokenBondFeatures {
  *
  * 🔴 AND AT INFERENCE THERE ARE NO BORROWERS, SO THAT COPY IS DEAD CODE HERE. `unindexFlaggedTokens`
  * writes `srcTok = isInference ? -1 : ...`, so every token's source is -1, `nDirect == nTotal`,
- * and deleting the borrower block leaves all sixteen gate cases green. It is kept because it is
+ * and deleting the borrower block leaves all twenty-nine cif cases green. It is kept because it is
  * the reference's, and recorded here so nobody reads its passing as evidence.
  *
  * 🔴 AND A BOND BETWEEN TWO POLYMER TOKENS IS SUPPRESSED ONCE IT IS DIRECTIONAL. `suppress`
