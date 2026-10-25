@@ -49,36 +49,43 @@ __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* 
   int lane = threadIdx.x & 31;
   if (r >= pairs) return;
   const float* l = logits + r * 64;
-  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
-  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  double s = 0, e = 0, t = 0;
+  float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
+  mx = ptx_warp_max_f32(mx);
+  double s = 0.0, e = 0.0, t = 0.0;
   for (int k = 0; k < 2; ++k) {
     int b = lane + k * 32;
-    float c = b < 63 ? b * 0.5f + 0.25f : 62 * 0.5f + 0.25f + 0.5f;
-    double p = expf((k ? l1 : l0) - mx);
-    s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
+    float c = b < 63 ? ptx_fma_f32((float)b, 0.5f, 0.25f) : (62.f * 0.5f + 0.25f + 0.5f);
+    double p = ptx_cvt_f64_f32(ptx_exp_f32(ptx_sub_f32(k ? l1 : l0, mx)));
+    s = ptx_add_f64(s, p);
+    e = ptx_fma_f64(p, ptx_cvt_f64_f32(c), e);
+    float cd0 = ptx_div_f32(c, d0);
+    t = ptx_add_f64(t, ptx_div_f64(p, ptx_cvt_f64_f32(ptx_fma_f32(cd0, cd0, 1.f))));
   }
   for (int o = 16; o; o >>= 1) {
-    s += __shfl_xor_sync(~0u, s, o);
-    e += __shfl_xor_sync(~0u, e, o);
-    t += __shfl_xor_sync(~0u, t, o);
+    s = ptx_add_f64(s, ptx_shfl_xor_f64(s, o));
+    e = ptx_add_f64(e, ptx_shfl_xor_f64(e, o));
+    t = ptx_add_f64(t, ptx_shfl_xor_f64(t, o));
   }
-  if (lane == 0) { pae[r] = (float)(e / s); tm[r] = t / s; }
+  if (lane == 0) {
+    ptx_st_global_f32(pae + r, ptx_cvt_f32_f64(ptx_div_f64(e, s)));
+    ptx_st_global_f64(tm + r, ptx_div_f64(t, s));
+  }
 }
 __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= pairs) return;
   const float* l = logits + r * 64;
-  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
-  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  double e0 = expf(l0 - mx), e1 = expf(l1 - mx);
-  double s = e0 + e1, near = lane <= 18 ? e0 : 0.0;
+  float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
+  mx = ptx_warp_max_f32(mx);
+  double e0 = ptx_cvt_f64_f32(ptx_exp_f32(ptx_sub_f32(l0, mx)));
+  double e1 = ptx_cvt_f64_f32(ptx_exp_f32(ptx_sub_f32(l1, mx)));
+  double s = ptx_add_f64(e0, e1), near = lane <= 18 ? e0 : 0.0;
   for (int o = 16; o; o >>= 1) {
-    s += __shfl_xor_sync(~0u, s, o);
-    near += __shfl_xor_sync(~0u, near, o);
+    s = ptx_add_f64(s, ptx_shfl_xor_f64(s, o));
+    near = ptx_add_f64(near, ptx_shfl_xor_f64(near, o));
   }
-  if (lane == 0) out[r] = (float)(near / s);
+  if (lane == 0) ptx_st_global_f32(out + r, ptx_cvt_f32_f64(ptx_div_f64(near, s)));
 }
 // the predicted TM-score from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
 static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
@@ -199,22 +206,26 @@ __global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, 
   int lane = threadIdx.x & 31;
   if (ij >= pairs) return;
   const float* l = logits + ij * 64;
-  const float step = 31.f / 62;
-  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
-  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  float s = 0, e = 0, t = 0;
+  const float step = 31.f / 62.f;
+  float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
+  mx = ptx_warp_max_f32(mx);
+  float s = 0.f, e = 0.f, t = 0.f;
   for (int k = 0; k < 2; ++k) {
     int b = lane + k * 32;
-    float c = b < 63 ? b * step + step / 2 : 62 * step + step / 2 + step;
-    float p = expf((k ? l1 : l0) - mx);
-    s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
+    float c = b < 63 ? ptx_fma_f32((float)b, step, step * 0.5f) : (62.f * step + step * 0.5f + step);
+    float p = ptx_exp_f32(ptx_sub_f32(k ? l1 : l0, mx));
+    s = ptx_add_f32(s, p);
+    e = ptx_fma_f32(p, c, e);
+    float cd0 = ptx_div_f32(c, d0);
+    t = ptx_add_f32(t, ptx_div_f32(p, ptx_fma_f32(cd0, cd0, 1.f)));
   }
-  for (int o = 16; o; o >>= 1) {
-    s += __shfl_xor_sync(~0u, s, o);
-    e += __shfl_xor_sync(~0u, e, o);
-    t += __shfl_xor_sync(~0u, t, o);
+  s = ptx_warp_sum_f32(s);
+  e = ptx_warp_sum_f32(e);
+  t = ptx_warp_sum_f32(t);
+  if (lane == 0) {
+    ptx_st_global_f32(pae + ij, ptx_div_f32(e, s));
+    ptx_st_global_f32(tm + ij, ptx_div_f32(t, s));
   }
-  if (lane == 0) { pae[ij] = e / s; tm[ij] = t / s; }
 }
 // P(distance < 8 A) from the symmetrised distogram logits: bins 0..18 (breaks 2.3125 + 0.3125 b)
 __global__ void contact8K(const float* logits, size_t pairs, float* out) {
@@ -222,15 +233,13 @@ __global__ void contact8K(const float* logits, size_t pairs, float* out) {
   int lane = threadIdx.x & 31;
   if (ij >= pairs) return;
   const float* l = logits + ij * 64;
-  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
-  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
-  float p0 = expf(l0 - mx), p1 = expf(l1 - mx);
-  float s = p0 + p1, near = lane <= 18 ? p0 : 0.f;
-  for (int o = 16; o; o >>= 1) {
-    s += __shfl_xor_sync(~0u, s, o);
-    near += __shfl_xor_sync(~0u, near, o);
-  }
-  if (lane == 0) out[ij] = near / s;
+  float l0 = ptx_ldg_f32(l + lane), l1 = ptx_ldg_f32(l + lane + 32), mx = ptx_max_f32(l0, l1);
+  mx = ptx_warp_max_f32(mx);
+  float p0 = ptx_exp_f32(ptx_sub_f32(l0, mx)), p1 = ptx_exp_f32(ptx_sub_f32(l1, mx));
+  float s = ptx_add_f32(p0, p1), near = lane <= 18 ? p0 : 0.f;
+  s = ptx_warp_sum_f32(s);
+  near = ptx_warp_sum_f32(near);
+  if (lane == 0) ptx_st_global_f32(out + ij, ptx_div_f32(near, s));
 }
 
 // On a card short of room the pair heads never hold [pairs, 64] logits whole: the distogram's contact

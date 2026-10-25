@@ -535,3 +535,51 @@ __device__ __forceinline__ double ptx_sqrt_f64(double x) {
   asm("sqrt.rn.f64 %0, %1;" : "=d"(d) : "d"(x));
   return d;
 }
+__device__ __forceinline__ float ptx_log_f32(float x) {
+  float lg2;
+  asm("lg2.approx.f32 %0, %1;" : "=f"(lg2) : "f"(x));
+  return ptx_mul_f32(lg2, 0.6931471805599453094f);
+}
+__device__ __forceinline__ double ptx_cvt_f64_f32(float x) {
+  double d;
+  asm("cvt.f64.f32 %0, %1;" : "=d"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ float ptx_cvt_f32_f64(double x) {
+  float d;
+  asm("cvt.rn.f32.f64 %0, %1;" : "=f"(d) : "d"(x));
+  return d;
+}
+__device__ __forceinline__ double ptx_shfl_xor_f64(double v, int mask, uint32_t membermask = 0xffffffffu) {
+  double d;
+  asm("{\n\t"
+      ".reg .b32 lo, hi, olo, ohi;\n\t"
+      "mov.b64 {lo, hi}, %1;\n\t"
+      "shfl.sync.bfly.b32 olo, lo, %2, 0x1f, %3;\n\t"
+      "shfl.sync.bfly.b32 ohi, hi, %2, 0x1f, %3;\n\t"
+      "mov.b64 %0, {olo, ohi};\n\t"
+      "}" : "=d"(d) : "d"(v), "r"(mask), "r"(membermask));
+  return d;
+}
+__device__ __forceinline__ double ptx_ld_global_f64(const void* ptr) {
+  double d;
+  asm("ld.global.f64 %0, [%1];" : "=d"(d) : "l"(ptr));
+  return d;
+}
+__device__ __forceinline__ void ptx_st_global_f64(void* ptr, double val) {
+  asm volatile("st.global.f64 [%0], %1;" :: "l"(ptr), "d"(val) : "memory");
+}
+__device__ __forceinline__ void ptx_st_global_u8(void* ptr, uint32_t val) {
+  asm volatile("st.global.u8 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+__device__ __forceinline__ float ptx_neg_f32(float x) {
+  float d;
+  asm("neg.f32 %0, %1;" : "=f"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ void ptx_bar_warp(uint32_t mask = 0xffffffffu) {
+  asm volatile("bar.warp.sync %0;" :: "r"(mask) : "memory");
+}
+__device__ __forceinline__ void ptx_bar_sync(int id = 0) {
+  asm volatile("bar.sync %0;" :: "r"(id) : "memory");
+}
