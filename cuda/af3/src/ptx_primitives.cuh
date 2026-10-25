@@ -187,7 +187,11 @@ __device__ __forceinline__ void ptx_st_shared_v4_u32(void* p, uint4 v) {
 // Pack (lo, hi) -> f16x2 in a 32-bit register (lo in [15:0], hi in [31:16])
 __device__ __forceinline__ uint32_t ptx_cvt_f16x2_f32(float lo, float hi) {
   uint32_t d;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
+#else     // (cvt.f16x2.f32 is sm_80's: a T4 rounds each half on its own, the same round-to-nearest-even)
+  __half2 h = __floats2half2_rn(lo, hi); d = *reinterpret_cast<uint32_t*>(&h);
+#endif
   return d;
 }
 // Pack ReLU(lo, hi) -> f16x2 in a 32-bit register using hardware .relu modifier on sm_80+
@@ -196,19 +200,18 @@ __device__ __forceinline__ uint32_t ptx_cvt_relu_f16x2_f32(float lo, float hi) {
 #if __CUDA_ARCH__ >= 800
   asm("cvt.rn.relu.f16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
 #else
-  asm("{\n\t"
-      ".reg .f32 r0, r1;\n\t"
-      "max.f32 r0, %1, 0f00000000;\n\t"
-      "max.f32 r1, %2, 0f00000000;\n\t"
-      "cvt.rn.f16x2.f32 %0, r1, r0;\n\t"
-      "}" : "=r"(d) : "f"(lo), "f"(hi));
+  d = ptx_cvt_f16x2_f32(fmaxf(lo, 0.f), fmaxf(hi, 0.f));
 #endif
   return d;
 }
 // Pack (lo, hi) -> bf16x2 in a 32-bit register (lo in [15:0], hi in [31:16])
 __device__ __forceinline__ uint32_t ptx_cvt_bf16x2_f32(float lo, float hi) {
   uint32_t d;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
+#else     // (bf16 conversion is sm_80's in PTX: cuda_bf16's emulation, round-to-nearest-even)
+  __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi); d = *reinterpret_cast<uint32_t*>(&h);
+#endif
   return d;
 }
 // Pack ReLU(lo, hi) -> bf16x2 in a 32-bit register using hardware .relu modifier on sm_80+
@@ -217,12 +220,7 @@ __device__ __forceinline__ uint32_t ptx_cvt_relu_bf16x2_f32(float lo, float hi) 
 #if __CUDA_ARCH__ >= 800
   asm("cvt.rn.relu.bf16x2.f32 %0, %2, %1;" : "=r"(d) : "f"(lo), "f"(hi));
 #else
-  asm("{\n\t"
-      ".reg .f32 r0, r1;\n\t"
-      "max.f32 r0, %1, 0f00000000;\n\t"
-      "max.f32 r1, %2, 0f00000000;\n\t"
-      "cvt.rn.bf16x2.f32 %0, r1, r0;\n\t"
-      "}" : "=r"(d) : "f"(lo), "f"(hi));
+  d = ptx_cvt_bf16x2_f32(fmaxf(lo, 0.f), fmaxf(hi, 0.f));
 #endif
   return d;
 }
@@ -266,7 +264,11 @@ __device__ __forceinline__ float ptx_f16_raw_to_f32(unsigned short x) {
 }
 __device__ __forceinline__ unsigned short ptx_f32_to_bf16_raw(float x) {
   unsigned short d;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(d) : "f"(x));
+#else
+  __nv_bfloat16 h = __float2bfloat16_rn(x); d = *reinterpret_cast<unsigned short*>(&h);
+#endif
   return d;
 }
 __device__ __forceinline__ float ptx_bf16_raw_to_f32(unsigned short x) {
@@ -279,9 +281,7 @@ __device__ __forceinline__ float ptx_bf16_raw_to_f32(unsigned short x) {
   return d;
 }
 __device__ __forceinline__ uint32_t ptx_splat_f16x2_f32(float x) {
-  uint32_t d;
-  asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(d) : "f"(x));
-  return d;
+  return ptx_cvt_f16x2_f32(x, x);
 }
 __device__ __forceinline__ float ptx_round_f16_f32(float x) {
   float d;
@@ -294,7 +294,13 @@ __device__ __forceinline__ float ptx_round_f16_f32(float x) {
 }
 __device__ __forceinline__ uint32_t ptx_max_f16x2(uint32_t a, uint32_t b) {
   uint32_t d;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm("max.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+#else     // (max.f16x2 is sm_80's; a max of two halves is exact through f32)
+  float a0, a1, b0, b1;
+  ptx_f16x2_to_f32x2(a, a0, a1); ptx_f16x2_to_f32x2(b, b0, b1);
+  d = ptx_cvt_f16x2_f32(fmaxf(a0, b0), fmaxf(a1, b1));
+#endif
   return d;
 }
 __device__ __forceinline__ uint32_t ptx_sub_f16x2(uint32_t a, uint32_t b) {
@@ -313,12 +319,16 @@ __device__ __forceinline__ uint32_t ptx_sub_ex2_f16x2(uint32_t a, uint32_t b) {
 }
 __device__ __forceinline__ float ptx_hmax2_to_f32(uint32_t u) {
   float d;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm("{\n\t"
       ".reg .b16 h0, h1, hm;\n\t"
       "mov.b32 {h0, h1}, %1;\n\t"
       "max.f16 hm, h0, h1;\n\t"
       "cvt.f32.f16 %0, hm;\n\t"
       "}" : "=f"(d) : "r"(u));
+#else
+  float lo, hi; ptx_f16x2_to_f32x2(u, lo, hi); d = fmaxf(lo, hi);
+#endif
   return d;
 }
 
