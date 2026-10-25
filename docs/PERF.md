@@ -2713,3 +2713,104 @@ kernel change, not taken here.
 🔴 **check-af3-denoise.js on boltz2 FAILS AT 2.206e-1 ON `main` TOO**, with
 the identical figure, so it is a stale dump against a changed reference, not
 anything here. AlphaFold 3 reads 9.92e-4 before and after.
+
+## RFD4-Proteina's trunk on an M5, and why its kernels have no headroom left
+
+Measured 2026-10-25 on an **Apple M5 MacBook Air, 8-core GPU, 16 GB**, Chrome/Dawn/Metal
+(`apple / metal-3`), via `tools/gpu/profile-rfd4p.js --lengths=`. One trunk pass, 14 layers,
+f16 arm, `--e2e=0`. Every figure here is a GPU-timestamp total, and wall time per pass equals
+it to within a percent, so there is no host or launch-gap time in question.
+
+| n | pass | triProjG | l1 | l2 | linear_z | tri-in + tri-out |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 115.8 | 51.8 | - | - | - | - |
+| 200 | 444.5 | 204.9 | 56.8 | 62.7 | 37.3 | 33.1 |
+| 400 | 1815.8 | 821.6 | 228.4 | 246.5 | 151.0 | 220.0 |
+| 512 | 2914.2 | 1348.0 | 375.4 | 403.3 | 245.8 | 323.2 |
+
+🔴 **NOTHING WAS MEASURING PAST 191 TOKENS.** The longest preset in this repository is
+`ppi_pdl1`; the profiler's default cases are 100 and 191. So every number ever recorded for
+this port described the short path, and the chunked arm had never been profiled at all -
+which is how the cliff fixed in 7b6aa6c9 survived, and how a WGSL compile error in
+`gemm-sm8-f-ve` (8e687427) sat in a variant that had never once run.
+
+### 2.9 TFLOP/s is the machine, not the kernels
+
+Every large GEMM independently measures **2.68-2.95 TFLOP/s**, across five different aspect
+ratios, with and without a fused norm, with and without a scattered epilogue. An 8-core Apple
+GPU is 1024 FP32 ALUs; at ~1.45 GHz one FMA per ALU per cycle is **~2.97 TFLOP/s**. The f16
+subgroup-matrix path is therefore delivering exactly **1x the FP32 ALU rate** - not the 2x a
+half-width SIMD path would give, and nowhere near M5's per-core matrix units.
+
+🔴 **AND THE PROBE SETTLES IT RATHER THAN ARGUING IT.** Duplicating the four
+`subgroupMatrixMultiplyAccumulate` calls in `gemmSubmatSource`'s `mmaTile` makes each K step
+do 64 MMAs instead of 32 **on registers already loaded** - no extra loads, no extra barriers,
+not one more byte of traffic. If the loop were waiting on memory this would be nearly free:
+
+| | baseline | 64 MMAs | |
+|---|---:|---:|---|
+| triProjG | 821.6 | 1590.4 | x1.94 |
+| l2 `384<-768` | 246.5 | 461.1 | x1.87 |
+| l1 `768<-384` | 228.4 | 437.7 | x1.92 |
+| linear_z `384<-256` | 151.0 | 289.4 | x1.92 |
+| tri-out | 110.1 | 215.5 | x1.96 |
+| tri-in | 109.9 | 214.4 | x1.95 |
+| whole pass | 1815.8 | 3403.3 | x1.87 |
+
+Time scales with MMA count alone. **The subgroup-matrix pipeline is saturated**, so the
+kernels are not waiting on anything and there is nothing to recover by tuning them.
+
+🔴 **WHICH KILLS A WHOLE FAMILY OF PLAUSIBLE IDEAS.** Padding `stB`'s workgroup stride to
+dodge bank conflicts (`stA` is already padded to 24 and `stB` is not), reshaping the subgroup
+grid from `SGY=1,SGX=8` to `SGY=2,SGX=4` to cut `subgroupMatrixLoad`s from 20 to 16 per K=16,
+dropping to a 4-subgroup workgroup for occupancy, loading the B panel straight from
+`var<storage>` - every one of these targets load or barrier time, and the probe says there is
+none. None were taken.
+
+🔴 **AND M5'S MATRIX UNITS ARE NOT REACHABLE FROM WGSL.** Dawn advertises only 8x8x8
+(`f32->f32` and `f16->f16`), which is the shape of Metal's legacy `simdgroup_matrix`; M5's
+neural accelerators are exposed through Metal 4's `mpp::tensor_ops::matmul2d`, and WGSL has no
+inline-MSL escape hatch and Tint emits no such op. Nothing in this repository can change that.
+
+### The tile overhang: real, 30%, and worth 0.4% of a pass
+
+`tri-in` and `tri-out` are the one place with measurable waste. They are batched over 256
+channels, so `tiles64` is multiplied by 256 and `small` sees plenty of work and takes the
+64-row tile - which pads a 400x400 matrix to 448x512: **160,000 real elements inside 229,376
+launched, 30% of the MACs computing overhang.** That is the whole gap between these kernels'
+2.08 TFLOP/s and every other GEMM's 2.95, since 2.08 / 0.6975 = 2.98.
+
+🔴 **MEASURED AND NOT TAKEN.** Choosing the 32-row tile whenever it strictly reduces the
+padded row count (n=400: 448 -> 416, n=200: 256 -> 224) moved the contraction kernels
+**220.0 -> 213.0 ms at n=400 and 33.1 -> 30.2 at n=200** - about 3%, as the padding arithmetic
+promises - and the pass total went **1815.8 -> 1832.3**, which is backwards and inside
+run-to-run variance either way. Half the rows a workgroup is twice the workgroups re-staging
+the same B panel, and that cancels it. The contraction is 12% of the pass, so even erasing
+all of its padding is ~3% of a pass; it is not where the money is. Reverted.
+
+### What is left, and all of it is approximate
+
+With the kernels at the ALU ceiling, the only remaining lever is **fewer FLOPs**, and every
+candidate changes the numbers rather than the schedule:
+
+- **896 of triProjG's 1408 output channels (63.6%) are sigmoid pre-activations** - `a_g`,
+  `b_g` and the 384-wide output gate - which is **~523 ms, 28.8% of a whole pass**, spent
+  computing arguments to a function whose derivative never exceeds 1/4. Factoring the three
+  gate matrices jointly, `[W_ag; W_bg; W_g]` as `U(896xr) V(rx384)`, shares one `V z`
+  projection across all 896 and breaks even at r=269; at r=96 it would cut triProjG's FLOPs by
+  ~39%. Approximate.
+- **The triangle's hidden width pays 5.4x in the projections for every 1x in the contraction.**
+  Projection over contraction FLOPs is `2688/n`, so the crossover is n=2688 and at 200-512 the
+  "cubic" triangle update is 5-13x dominated by its quadratic channel projections. Trimming
+  `tri_mult_c` from 256 shrinks 73% of triProjG, all of both contractions and all of
+  `linear_z` at once. Approximate, and the channels never mix inside the contraction, so the
+  pruning is at least well-posed.
+- **Low-rank on the whole projection is not available**: the input width 384 already IS the
+  rank bound for a `1408x384` weight, so an exact factorisation does more work, not less.
+- **No (i,j) symmetry to exploit** anywhere in the pass: `pairWriteLnIn` multiplies two
+  different learned halves of `linear_x` indexed by j and i, and the two triangles use
+  different weights, so `z_ij != z_ji` from the first pair write onward.
+
+None of these are taken. They are model changes wearing an optimisation's clothes, and they
+need a quality argument - a re-fold of the designs, not a backbone that merely looks protein-
+shaped - before any of them belongs behind a flag.
