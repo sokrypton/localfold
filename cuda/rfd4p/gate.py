@@ -453,6 +453,19 @@ def main() -> int:
                  "constrains a chain"),
             ]
             bad_refusals = []
+            # 🔴 AND THE ONE THAT NEEDS `--generate` TO SEE IT. `coord_group_seq` permutes its
+            # group LABELS every step off the sampler's stream, so an input with more than one
+            # group has a feature that must move and would be frozen. `export_input.mjs` has
+            # refused it since it was written; this side PROCEEDED and wrote a generation that
+            # is wrong from step one. Every shipped example has at most one group, so neither
+            # the refusal nor the bug it hides is reachable without a case built for it.
+            crdgrp = HERE / "featurise" / "gate-crdgroups.json"
+            if crdgrp.exists():
+                r = run([binary, HERE / "gate-refused", f"--int8={REPO}/model-rfd4p-int8",
+                         f"--config={REPO}/model-rfd4p-int8/config.json", f"--spec={crdgrp}",
+                         "--generate"], cwd=REPO)
+                if r.returncode == 0 or "coordinate groups to permute" not in r.stderr:
+                    bad_refusals.append("coordinate groups to permute")
             probe = HERE / "featurise" / "gate-refusal.json"
             for text, wanted in refusals:
                 probe.write_text(text)
@@ -463,7 +476,7 @@ def main() -> int:
                     bad_refusals.append(wanted)
             if bad_refusals:
                 failed += 1
-            print(f"  {'refusals':10s} {len(refusals)} inputs outside the subset  "
+            print(f"  {'refusals':10s} {len(refusals) + 1} inputs outside the subset  "
                   f"{'ok ' if not bad_refusals else 'NOT REFUSED: ' + ', '.join(bad_refusals)}")
             got["refusals"] = {"checked": len(refusals), "wrong": len(bad_refusals)}
 

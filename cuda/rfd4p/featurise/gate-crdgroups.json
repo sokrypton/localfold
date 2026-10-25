@@ -1,0 +1,12 @@
+{
+  "input": "web/examples/ppi_pdl1.cif.zst",
+  "specMode": true,
+  "conditions": {
+    "C_CRD": { "true": [ { "select": "sel('B/*/*/*')" } ] },
+    "C_CRDGRP": {
+      "1": [ { "select": "sel('B/*/[2,3,4,5,6,7,8,9,10]/*')" } ],
+      "2": [ { "select": "sel('B/*/[20,21,22,23,24,25,26,27]/*')" } ]
+    }
+  },
+  "nsteps": 25
+}

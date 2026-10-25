@@ -551,7 +551,16 @@ residues the cropped example does not contain, so building one from the spec fai
     The mapping is the trunk's OWN - `predictedInsertionMapping` off the insertion head's
     logits, validated pair by pair and falling back to the geometric one if any pair cannot be
     grafted. On `motif_unidx_1prw` the head's answer is used and agrees with the geometric one
-    atom for atom. What is left of this path is the coordinate-group permutation.
+    atom for atom. What is left of this path is the coordinate-group
+    permutation, which BOTH sides now refuse by name rather than one of them guessing.
+
+    🔴 **AND THE NATIVE SIDE WAS NOT REFUSING IT - IT WAS GUESSING.** `coord_group_seq`
+    permutes its group LABELS every step, off the sampler's stream, so an input with more than
+    one group has a feature that must move. `export_input.mjs` has refused that since it was
+    written; this side wrote the labels unpermuted and produced a generation that is wrong from
+    step one, in silence. Every shipped example has at most ONE group - where the permutation
+    is the identity - so neither the refusal nor the bug it hides is reachable without a case
+    built for it (`gate-crdgroups.json`, three groups on `ppi_pdl1`).
 
     🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
     in-context conditioning that the sampler never generates, and the reference writes only the

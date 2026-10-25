@@ -2074,6 +2074,21 @@ int run(int argc, char** argv) {
     vector<int> legal(tables::RESTYPE_ATOM37_MASK.begin(), tables::RESTYPE_ATOM37_MASK.end());
     g.ints("g/allowedTypes", allowed);
     g.ints("g/atom37Legal", legal);
+    // 🔴 MORE THAN ONE COORDINATE GROUP IS REFUSED, BECAUSE `coord_group_seq` MOVES EVERY STEP.
+    // The reference permutes the group LABELS with a `randperm` off the sampler's stream each
+    // time it builds the sequence features, so freezing them at their input values is a feature
+    // that should move and does not - and the draws would shift every later draw of the run.
+    // `export_input.mjs` has refused this since it was written; this side proceeded in SILENCE
+    // and wrote a generation that is wrong from step one.
+    {
+      std::set<int> uniq(b.coordGroup.begin(), b.coordGroup.end());
+      uniq.erase(-1);
+      if (uniq.size() > 1) {
+        fprintf(stderr, "--generate does not yet cover an input with coordinate groups to "
+                        "permute (%zu groups)\n", uniq.size());
+        exit(1);
+      }
+    }
     g.ints("g/coordGroup", b.coordGroup);
     // 🔴 THE CONDITIONED COORDINATES THEMSELVES, for the alignment at the far end. A generated
     // structure comes out in the model's CENTRED frame; the atoms whose coordinates were
