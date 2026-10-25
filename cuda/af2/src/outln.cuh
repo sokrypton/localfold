@@ -50,17 +50,19 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
       const half* vg = reinterpret_cast<const half*>(O) + row * 2 * C + kc * KC + c;
-      uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
-      uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
-      const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);
-      TI2 o4[4];
+      uint4 v4 = row < rows ? ptx_ldg_v4_u32(vg) : make_uint4(0, 0, 0, 0);
+      uint4 g4 = row < rows ? ptx_ldg_v4_u32(vg + C) : make_uint4(0, 0, 0, 0);
+      const uint32_t *vh = reinterpret_cast<const uint32_t*>(&v4), *gh = reinterpret_cast<const uint32_t*>(&g4);
+      uint32_t o4[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        float2 vf = __half22float2(vh[i]), gf = __half22float2(gh[i]);
-        float x = vf.x * sigm(gf.x), y = vf.y * sigm(gf.y);
-        if constexpr (BFI) o4[i] = __floats2bfloat162_rn(x, y); else o4[i] = __floats2half2_rn(x, y);
+        float vfx, vfy, gfx, gfy;
+        ptx_f16x2_to_f32x2(vh[i], vfx, vfy);
+        ptx_f16x2_to_f32x2(gh[i], gfx, gfy);
+        float x = ptx_mul_f32(vfx, sigm(gfx)), y = ptx_mul_f32(vfy, sigm(gfy));
+        if constexpr (BFI) o4[i] = ptx_cvt_bf16x2_f32(x, y); else o4[i] = ptx_cvt_f16x2_f32(x, y);
       }
-      *reinterpret_cast<uint4*>(As(s) + swA(r, c)) = *reinterpret_cast<const uint4*>(o4);
+      ptx_st_shared_v4_u32(As(s) + swA(r, c), make_uint4(o4[0], o4[1], o4[2], o4[3]));
     } else {   // A: 64 rows x 32 k, one 16-byte piece a thread
       const int r = threadIdx.x >> 2, c = (threadIdx.x & 3) * 8;
       const size_t row = row0 + r;
@@ -122,23 +124,25 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
   cpCommit();
   const int c0 = lane * 8;
   float sc[8], of[8];
-  *reinterpret_cast<float4*>(sc) = __ldg(reinterpret_cast<const float4*>(lnS + c0));
-  *reinterpret_cast<float4*>(sc + 4) = __ldg(reinterpret_cast<const float4*>(lnS + c0 + 4));
-  *reinterpret_cast<float4*>(of) = __ldg(reinterpret_cast<const float4*>(lnO + c0));
-  *reinterpret_cast<float4*>(of + 4) = __ldg(reinterpret_cast<const float4*>(lnO + c0 + 4));
+  *reinterpret_cast<float4*>(sc) = ptx_ldg_v4_f32(lnS + c0);
+  *reinterpret_cast<float4*>(sc + 4) = ptx_ldg_v4_f32(lnS + c0 + 4);
+  *reinterpret_cast<float4*>(of) = ptx_ldg_v4_f32(lnO + c0);
+  *reinterpret_cast<float4*>(of + 4) = ptx_ldg_v4_f32(lnO + c0 + 4);
   cpWait<0>();
   __syncthreads();
   // each accumulator + its bias + its residual, rounded, in place
 #pragma unroll
   for (int nt = 0; nt < 16; ++nt) {
     const int col = chh * 128 + nt * 8 + tig * 2;
-    const float2 bf = __ldg(reinterpret_cast<const float2*>(bias + col));
+    const float2 bf = ptx_ldg_v2_f32(bias + col);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-      M2* p = reinterpret_cast<M2*>(V + (rg * 16 + g + 8 * h) * LDV + col);
-      const float2 rf = ld2f(reinterpret_cast<const M*>(p));
-      const float a = acc[nt][2 * h] + bf.x + rf.x, b = acc[nt][2 * h + 1] + bf.y + rf.y;
-      if constexpr (BF) *p = __floats2bfloat162_rn(a, b); else *p = __floats2half2_rn(a, b);
+      M* p = V + (rg * 16 + g + 8 * h) * LDV + col;
+      const float2 rf = ld2f(p);
+      const float a = ptx_add_f32(ptx_add_f32(acc[nt][2 * h], bf.x), rf.x);
+      const float b = ptx_add_f32(ptx_add_f32(acc[nt][2 * h + 1], bf.y), rf.y);
+      if constexpr (BF) ptx_st_shared_u32(p, ptx_cvt_bf16x2_f32(a, b));
+      else ptx_st_shared_u32(p, ptx_cvt_f16x2_f32(a, b));
     }
   }
   __syncthreads();
@@ -149,30 +153,30 @@ __global__ void __launch_bounds__(oln::NTH, 2) outLnK(const TI* __restrict__ O, 
     const int r = warp + i * (NTH / 32);
     const size_t row = row0 + r;
     if (row >= rows) break;
-    const uint4 ob = *reinterpret_cast<const uint4*>(V + r * LDV + c0);
-    *reinterpret_cast<uint4*>(msa + row * C + c0) = ob;
+    const uint4 ob = ptx_ld_shared_v4_u32(V + r * LDV + c0);
+    ptx_st_global_v4_u32(msa + row * C + c0, ob);
     float v[8];
 #pragma unroll
     for (int e = 0; e < 4; ++e) { const float2 f = ld2f(reinterpret_cast<const M*>(&ob) + 2 * e); v[2 * e] = f.x; v[2 * e + 1] = f.y; }
     float s = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) s += v[e];
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    const float mean = s / C;
+    for (int e = 0; e < 8; ++e) s = ptx_add_f32(s, v[e]);
+    s = ptx_warp_sum_f32(s);
+    const float mean = ptx_div_f32(s, (float)C);
     float q = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) { const float d = v[e] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    const float inv = rsqrtf(q / C + 1e-5f);
-    uint4 xo;
+    for (int e = 0; e < 8; ++e) { const float d = ptx_sub_f32(v[e], mean); q = ptx_fma_f32(d, d, q); }
+    q = ptx_warp_sum_f32(q);
+    const float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f));
+    uint32_t xo[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      const float a = (v[2 * e] - mean) * inv * sc[2 * e] + of[2 * e];
-      const float b = (v[2 * e + 1] - mean) * inv * sc[2 * e + 1] + of[2 * e + 1];
-      if constexpr (std::is_same_v<TO, half>) reinterpret_cast<half2*>(&xo)[e] = __floats2half2_rn(a, b);
-      else reinterpret_cast<__nv_bfloat162*>(&xo)[e] = __floats2bfloat162_rn(a, b);
+      const float a = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[2 * e], mean), inv), sc[2 * e], of[2 * e]);
+      const float b = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[2 * e + 1], mean), inv), sc[2 * e + 1], of[2 * e + 1]);
+      if constexpr (std::is_same_v<TO, half>) xo[e] = ptx_cvt_f16x2_f32(a, b);
+      else xo[e] = ptx_cvt_bf16x2_f32(a, b);
     }
-    *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
+    ptx_st_global_v4_u32(xn + row * C + c0, make_uint4(xo[0], xo[1], xo[2], xo[3]));
   }
 }
 template <class M, class TO, class TI = M, bool VG = false>
@@ -198,17 +202,19 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
       const size_t row = row0 + r;
       if constexpr (VG) {
         const half* vg = reinterpret_cast<const half*>(O) + row * 2 * C + kc * KC + c;
-        uint4 v4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg)) : make_uint4(0, 0, 0, 0);
-        uint4 g4 = row < rows ? __ldg(reinterpret_cast<const uint4*>(vg + C)) : make_uint4(0, 0, 0, 0);
-        const half2 *vh = reinterpret_cast<const half2*>(&v4), *gh = reinterpret_cast<const half2*>(&g4);
-        TI2 o4[4];
+        uint4 v4 = row < rows ? ptx_ldg_v4_u32(vg) : make_uint4(0, 0, 0, 0);
+        uint4 g4 = row < rows ? ptx_ldg_v4_u32(vg + C) : make_uint4(0, 0, 0, 0);
+        const uint32_t *vh = reinterpret_cast<const uint32_t*>(&v4), *gh = reinterpret_cast<const uint32_t*>(&g4);
+        uint32_t o4[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          float2 vf = __half22float2(vh[i]), gf = __half22float2(gh[i]);
-          float x = vf.x * sigm(gf.x), y = vf.y * sigm(gf.y);
-          if constexpr (BFI) o4[i] = __floats2bfloat162_rn(x, y); else o4[i] = __floats2half2_rn(x, y);
+          float vfx, vfy, gfx, gfy;
+          ptx_f16x2_to_f32x2(vh[i], vfx, vfy);
+          ptx_f16x2_to_f32x2(gh[i], gfx, gfy);
+          float x = ptx_mul_f32(vfx, sigm(gfx)), y = ptx_mul_f32(vfy, sigm(gfy));
+          if constexpr (BFI) o4[i] = ptx_cvt_bf16x2_f32(x, y); else o4[i] = ptx_cvt_f16x2_f32(x, y);
         }
-        *reinterpret_cast<uint4*>(As(s) + swA(r, c)) = *reinterpret_cast<const uint4*>(o4);
+        ptx_st_shared_v4_u32(As(s) + swA(r, c), make_uint4(o4[0], o4[1], o4[2], o4[3]));
       } else {
         cpAsync16(As(s) + swA(r, c), O + (row < rows ? row : 0) * C + kc * KC + c, row < rows);
       }
@@ -260,22 +266,24 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
   }
   const int c0 = lane * 8;
   float sc[8], of[8];
-  *reinterpret_cast<float4*>(sc) = __ldg(reinterpret_cast<const float4*>(lnS + c0));
-  *reinterpret_cast<float4*>(sc + 4) = __ldg(reinterpret_cast<const float4*>(lnS + c0 + 4));
-  *reinterpret_cast<float4*>(of) = __ldg(reinterpret_cast<const float4*>(lnO + c0));
-  *reinterpret_cast<float4*>(of + 4) = __ldg(reinterpret_cast<const float4*>(lnO + c0 + 4));
+  *reinterpret_cast<float4*>(sc) = ptx_ldg_v4_f32(lnS + c0);
+  *reinterpret_cast<float4*>(sc + 4) = ptx_ldg_v4_f32(lnS + c0 + 4);
+  *reinterpret_cast<float4*>(of) = ptx_ldg_v4_f32(lnO + c0);
+  *reinterpret_cast<float4*>(of + 4) = ptx_ldg_v4_f32(lnO + c0 + 4);
   cpWait<0>();
   __syncthreads();
 #pragma unroll
   for (int nt = 0; nt < 8; ++nt) {
     const int col = warp * 64 + nt * 8 + tig * 2;
-    const float2 bf = __ldg(reinterpret_cast<const float2*>(bias + col));
+    const float2 bf = ptx_ldg_v2_f32(bias + col);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-      M2* p = reinterpret_cast<M2*>(V + (g + 8 * h) * LDV + col);
-      const float2 rf = ld2f(reinterpret_cast<const M*>(p));
-      const float a = acc[nt][2 * h] + bf.x + rf.x, b = acc[nt][2 * h + 1] + bf.y + rf.y;
-      if constexpr (BF) *p = __floats2bfloat162_rn(a, b); else *p = __floats2half2_rn(a, b);
+      M* p = V + (g + 8 * h) * LDV + col;
+      const float2 rf = ld2f(p);
+      const float a = ptx_add_f32(ptx_add_f32(acc[nt][2 * h], bf.x), rf.x);
+      const float b = ptx_add_f32(ptx_add_f32(acc[nt][2 * h + 1], bf.y), rf.y);
+      if constexpr (BF) ptx_st_shared_u32(p, ptx_cvt_bf16x2_f32(a, b));
+      else ptx_st_shared_u32(p, ptx_cvt_f16x2_f32(a, b));
     }
   }
   __syncthreads();
@@ -284,30 +292,30 @@ __global__ void __launch_bounds__(128, 3) outLn16K(const TI* __restrict__ O, con
     const int r = warp + i * 4;
     const size_t row = row0 + r;
     if (row >= rows) break;
-    const uint4 ob = *reinterpret_cast<const uint4*>(V + r * LDV + c0);
-    *reinterpret_cast<uint4*>(msa + row * C + c0) = ob;
+    const uint4 ob = ptx_ld_shared_v4_u32(V + r * LDV + c0);
+    ptx_st_global_v4_u32(msa + row * C + c0, ob);
     float v[8];
 #pragma unroll
     for (int e = 0; e < 4; ++e) { const float2 f = ld2f(reinterpret_cast<const M*>(&ob) + 2 * e); v[2 * e] = f.x; v[2 * e + 1] = f.y; }
     float s = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) s += v[e];
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    const float mean = s / C;
+    for (int e = 0; e < 8; ++e) s = ptx_add_f32(s, v[e]);
+    s = ptx_warp_sum_f32(s);
+    const float mean = ptx_div_f32(s, (float)C);
     float q = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) { const float d = v[e] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    const float inv = rsqrtf(q / C + 1e-5f);
-    uint4 xo;
+    for (int e = 0; e < 8; ++e) { const float d = ptx_sub_f32(v[e], mean); q = ptx_fma_f32(d, d, q); }
+    q = ptx_warp_sum_f32(q);
+    const float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(q, (float)C), 1e-5f));
+    uint32_t xo[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      const float a = (v[2 * e] - mean) * inv * sc[2 * e] + of[2 * e];
-      const float b = (v[2 * e + 1] - mean) * inv * sc[2 * e + 1] + of[2 * e + 1];
-      if constexpr (std::is_same_v<TO, half>) reinterpret_cast<half2*>(&xo)[e] = __floats2half2_rn(a, b);
-      else reinterpret_cast<__nv_bfloat162*>(&xo)[e] = __floats2bfloat162_rn(a, b);
+      const float a = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[2 * e], mean), inv), sc[2 * e], of[2 * e]);
+      const float b = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[2 * e + 1], mean), inv), sc[2 * e + 1], of[2 * e + 1]);
+      if constexpr (std::is_same_v<TO, half>) xo[e] = ptx_cvt_f16x2_f32(a, b);
+      else xo[e] = ptx_cvt_bf16x2_f32(a, b);
     }
-    *reinterpret_cast<uint4*>(xn + row * C + c0) = xo;
+    ptx_st_global_v4_u32(xn + row * C + c0, make_uint4(xo[0], xo[1], xo[2], xo[3]));
   }
 }
 template <class M, class TO, class TI = M, bool VG = false>

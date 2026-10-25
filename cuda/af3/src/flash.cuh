@@ -102,8 +102,7 @@ __device__ __forceinline__ void mma1688h(uint32_t* d, uint32_t a0, uint32_t a1, 
 __device__ __forceinline__ __half2 asH2(uint32_t u) { return *reinterpret_cast<__half2*>(&u); }
 __device__ __forceinline__ uint32_t asU32(__half2 h) { return *reinterpret_cast<uint32_t*>(&h); }
 __device__ __forceinline__ uint32_t pack2(float lo, float hi) {
-  half2 v = __floats2half2_rn(lo, hi);
-  return *reinterpret_cast<uint32_t*>(&v);
+  return ptx_cvt_f16x2_f32(lo, hi);
 }
 // every one of these carries a "memory" clobber: without it the compiler takes cp.async, the group wait and
 // ldmatrix for instructions that touch no memory and may schedule an ldmatrix ahead of the wait or the
@@ -428,10 +427,13 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= QN) return 0u;
-    half2 v = *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i) : (size_t)i * W4) + e);
-    float2 f = __half22float2(v);
-    if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }   // the query's bias, folded in here
-    return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
+    float fx, fy;
+    ptx_f16x2_to_f32x2(ptx_ld_global_u32(base + (STRIDED ? pos(i) : (size_t)i * W4) + e), fx, fy);
+    if (qBias) {
+      fx = ptx_add_f32(fx, ptx_ldg_f32(qBias + h * D + e));
+      fy = ptx_add_f32(fy, ptx_ldg_f32(qBias + h * D + e + 1));
+    }
+    return pack2(ptx_mul_f32(ptx_mul_f32(fx, scale), LOG2E), ptx_mul_f32(ptx_mul_f32(fy, scale), LOG2E));
   };
   uint32_t qa[D / 16][4];
 #pragma unroll
@@ -506,32 +508,34 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
             }
           }
         }
-        __half2 x0 = asH2(sh[0][0]), x1 = asH2(sh[0][1]);
+        uint32_t x0 = sh[0][0], x1 = sh[0][1];
 #pragma unroll
-        for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[nt][0])); x1 = __hmax2(x1, asH2(sh[nt][1])); }
-        float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
-        t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-        t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+        for (int nt = 1; nt < BK / 8; ++nt) { x0 = ptx_max_f16x2(x0, sh[nt][0]); x1 = ptx_max_f16x2(x1, sh[nt][1]); }
+        float t0 = ptx_quad_max_f32(ptx_hmax2_to_f32(x0));
+        float t1 = ptx_quad_max_f32(ptx_hmax2_to_f32(x1));
         // (the new maxima rounded to f16 values: the exponents subtract exactly these, and the rescale uses them)
         uint32_t vb[2][4];
         ldsm4t(vb[0], V + fa2Kv<D>(((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
         float n0, n1;
         if (tile == 0) {
-          n0 = __half2float(__float2half(t0)); n1 = __half2float(__float2half(t1));
+          n0 = ptx_round_f16_f32(t0); n1 = ptx_round_f16_f32(t1);
           m0 = n0; m1 = n1;
         } else {
-          n0 = __half2float(__float2half(fmaxf(m0, t0))); n1 = __half2float(__float2half(fmaxf(m1, t1)));
-          float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
+          n0 = ptx_round_f16_f32(ptx_max_f32(m0, t0)); n1 = ptx_round_f16_f32(ptx_max_f32(m1, t1));
+          float c0 = ptx_ex2_f32(ptx_sub_f32(m0, n0)), c1 = ptx_ex2_f32(ptx_sub_f32(m1, n1));
           m0 = n0; m1 = n1;
 #pragma unroll
-          for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
-          lsum0 *= c0; lsum2 *= c1;
+          for (int et = 0; et < D / 8; ++et) {
+            o[et][0] = ptx_mul_f32(o[et][0], c0); o[et][1] = ptx_mul_f32(o[et][1], c0);
+            o[et][2] = ptx_mul_f32(o[et][2], c1); o[et][3] = ptx_mul_f32(o[et][3], c1);
+          }
+          lsum0 = ptx_mul_f32(lsum0, c0); lsum2 = ptx_mul_f32(lsum2, c1);
         }
-        __half2 h0 = __float2half2_rn(n0), h1 = __float2half2_rn(n1);
+        uint32_t h0 = ptx_splat_f16x2_f32(n0), h1 = ptx_splat_f16x2_f32(n1);
 #pragma unroll
         for (int t = 0; t < BK / 16; ++t) {
-          uint32_t pa[4] = { ex2h2(asU32(__hsub2(asH2(sh[2 * t][0]), h0))), ex2h2(asU32(__hsub2(asH2(sh[2 * t][1]), h1))),
-                             ex2h2(asU32(__hsub2(asH2(sh[2 * t + 1][0]), h0))), ex2h2(asU32(__hsub2(asH2(sh[2 * t + 1][1]), h1))) };
+          uint32_t pa[4] = { ptx_sub_ex2_f16x2(sh[2 * t][0], h0), ptx_sub_ex2_f16x2(sh[2 * t][1], h1),
+                             ptx_sub_ex2_f16x2(sh[2 * t + 1][0], h0), ptx_sub_ex2_f16x2(sh[2 * t + 1][1], h1) };
           mma16816_lsum(lsum0, lsum2, pa, ONES_H2, ONES_H2);
 #pragma unroll
           for (int et = 0; et < D / 8; et += 2) {
@@ -612,16 +616,14 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
         // the row maxima as a tree, not a 16-deep chain of dependent max instructions
         float r0m[BK / 8], r1m[BK / 8];
 #pragma unroll
-        for (int nt = 0; nt < BK / 8; ++nt) { r0m[nt] = fmaxf(sv[nt][0], sv[nt][1]); r1m[nt] = fmaxf(sv[nt][2], sv[nt][3]); }
+        for (int nt = 0; nt < BK / 8; ++nt) { r0m[nt] = ptx_max_f32(sv[nt][0], sv[nt][1]); r1m[nt] = ptx_max_f32(sv[nt][2], sv[nt][3]); }
         // (folding the ends together, so a tile of 6 n8 columns reduces as well as one of 8)
 #pragma unroll
         for (int cnt = BK / 8; cnt > 1; cnt = (cnt + 1) / 2) {
 #pragma unroll
-          for (int nt = 0; nt < cnt / 2; ++nt) { r0m[nt] = fmaxf(r0m[nt], r0m[cnt - 1 - nt]); r1m[nt] = fmaxf(r1m[nt], r1m[cnt - 1 - nt]); }
+          for (int nt = 0; nt < cnt / 2; ++nt) { r0m[nt] = ptx_max_f32(r0m[nt], r0m[cnt - 1 - nt]); r1m[nt] = ptx_max_f32(r1m[nt], r1m[cnt - 1 - nt]); }
         }
-        float t0 = r0m[0], t1 = r1m[0];
-        t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-        t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+        float t0 = ptx_quad_max_f32(r0m[0]), t1 = ptx_quad_max_f32(r1m[0]);
         uint32_t vb[2][4];
         ldsm4t(vb[0], V + fa2Kv<D>(((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
         float n0, n1;
@@ -629,21 +631,25 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
           n0 = t0; n1 = t1;
           m0 = n0; m1 = n1;
         } else {
-          n0 = fmaxf(m0, t0); n1 = fmaxf(m1, t1);
-          float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
+          n0 = ptx_max_f32(m0, t0); n1 = ptx_max_f32(m1, t1);
+          float c0 = ptx_ex2_f32(ptx_sub_f32(m0, n0)), c1 = ptx_ex2_f32(ptx_sub_f32(m1, n1));
           m0 = n0; m1 = n1;
 #pragma unroll
-          for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
-          lsum0 *= c0; lsum2 *= c1;
+          for (int et = 0; et < D / 8; ++et) {
+            o[et][0] = ptx_mul_f32(o[et][0], c0); o[et][1] = ptx_mul_f32(o[et][1], c0);
+            o[et][2] = ptx_mul_f32(o[et][2], c1); o[et][3] = ptx_mul_f32(o[et][3], c1);
+          }
+          lsum0 = ptx_mul_f32(lsum0, c0); lsum2 = ptx_mul_f32(lsum2, c1);
         }
         // P = 2^(S - max), two at a time in f16 (ex2.approx.f16x2: half the SFU work, and the result
         // is already the packed A fragment the PV product reads); its row sums on the tensor cores
         // (P . ones), accumulated in f32 like O
 #pragma unroll
         for (int t = 0; t < BK / 16; ++t) {
-          uint32_t pa[4] = { ex2h2(pack2(sv[2 * t][0] - n0, sv[2 * t][1] - n0)), ex2h2(pack2(sv[2 * t][2] - n1, sv[2 * t][3] - n1)),
-                             ex2h2(pack2(sv[2 * t + 1][0] - n0, sv[2 * t + 1][1] - n0)),
-                             ex2h2(pack2(sv[2 * t + 1][2] - n1, sv[2 * t + 1][3] - n1)) };
+          uint32_t pa[4] = { ex2h2(pack2(ptx_sub_f32(sv[2 * t][0], n0), ptx_sub_f32(sv[2 * t][1], n0))),
+                             ex2h2(pack2(ptx_sub_f32(sv[2 * t][2], n1), ptx_sub_f32(sv[2 * t][3], n1))),
+                             ex2h2(pack2(ptx_sub_f32(sv[2 * t + 1][0], n0), ptx_sub_f32(sv[2 * t + 1][1], n0))),
+                             ex2h2(pack2(ptx_sub_f32(sv[2 * t + 1][2], n1), ptx_sub_f32(sv[2 * t + 1][3], n1))) };
           mma16816_lsum(lsum0, lsum2, pa, ONES_H2, ONES_H2);
 #pragma unroll
           for (int et = 0; et < D / 8; et += 2) {
@@ -664,7 +670,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     }
   }
   if (!warpLive) return;
-  float inv0 = 1.f / lsum0, inv1 = 1.f / lsum2;
+  float inv0 = ptx_rcp_f32(lsum0), inv1 = ptx_rcp_f32(lsum2);
   if constexpr (GATE_SM) {
     cpWait<0>();
     __syncwarp();
@@ -672,37 +678,46 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
-      float2 a = __half22float2(*reinterpret_cast<const half2*>(G + g * LDK + e));
-      float2 b2 = __half22float2(*reinterpret_cast<const half2*>(G + (g + 8) * LDK + e));
-      *reinterpret_cast<half2*>(G + g * LDK + e) = __floats2half2_rn(o[et][0] * inv0 * sigm(a.x), o[et][1] * inv0 * sigm(a.y));
-      *reinterpret_cast<half2*>(G + (g + 8) * LDK + e) = __floats2half2_rn(o[et][2] * inv1 * sigm(b2.x), o[et][3] * inv1 * sigm(b2.y));
+      float ax, ay, bx, by;
+      ptx_f16x2_to_f32x2(ptx_ld_shared_u32(G + g * LDK + e), ax, ay);
+      ptx_f16x2_to_f32x2(ptx_ld_shared_u32(G + (g + 8) * LDK + e), bx, by);
+      ptx_st_shared_u32(G + g * LDK + e,
+          ptx_cvt_f16x2_f32(ptx_mul_f32(ptx_mul_f32(o[et][0], inv0), sigm(ax)),
+                            ptx_mul_f32(ptx_mul_f32(o[et][1], inv0), sigm(ay))));
+      ptx_st_shared_u32(G + (g + 8) * LDK + e,
+          ptx_cvt_f16x2_f32(ptx_mul_f32(ptx_mul_f32(o[et][2], inv1), sigm(bx)),
+                            ptx_mul_f32(ptx_mul_f32(o[et][3], inv1), sigm(by))));
     }
     __syncwarp();
     constexpr int PER = D / 8, G_PER = D / 16;
 #pragma unroll
     for (int k = 0; k < G_PER; ++k) {
       int u = k * 32 + lane, rq = u / PER, c = (u % PER) * 8, i = q0 + warp * 16 + rq;
-      if (i < QN) *reinterpret_cast<uint4*>(out + outAt(i) + c) = *reinterpret_cast<const uint4*>(G + rq * LDK + c);
+      if (i < QN) ptx_st_global_v4_u32(out + outAt(i) + c, ptx_ld_shared_v4_u32(G + rq * LDK + c));
     }
     return;
   } else {
     // gates read first and stored as pairs: with a store between every load the compiler
     // cannot reorder (out may alias qkvg) and the epilogue was 24 serial round trips, 10 us
-    half2 ga[D / 8], gb[D / 8];
+    uint32_t ga[D / 8], gb[D / 8];
 #pragma unroll
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
-      ga[et] = i0 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
-      gb[et] = i1 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
+      ga[et] = i0 < QN ? ptx_ld_global_u32(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : 0u;
+      gb[et] = i1 < QN ? ptx_ld_global_u32(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : 0u;
     }
 #pragma unroll
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
-      float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-      if (i0 < QN) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
-          __floats2half2_rn(o[et][0] * inv0 * sigm(a.x), o[et][1] * inv0 * sigm(a.y));
-      if (i1 < QN) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
-          __floats2half2_rn(o[et][2] * inv1 * sigm(b2.x), o[et][3] * inv1 * sigm(b2.y));
+      float ax, ay, bx, by;
+      ptx_f16x2_to_f32x2(ga[et], ax, ay);
+      ptx_f16x2_to_f32x2(gb[et], bx, by);
+      if (i0 < QN) ptx_st_global_u32(out + outAt(i0) + e,
+          ptx_cvt_f16x2_f32(ptx_mul_f32(ptx_mul_f32(o[et][0], inv0), sigm(ax)),
+                            ptx_mul_f32(ptx_mul_f32(o[et][1], inv0), sigm(ay))));
+      if (i1 < QN) ptx_st_global_u32(out + outAt(i1) + e,
+          ptx_cvt_f16x2_f32(ptx_mul_f32(ptx_mul_f32(o[et][2], inv1), sigm(bx)),
+                            ptx_mul_f32(ptx_mul_f32(o[et][3], inv1), sigm(by))));
     }
   }
 }
@@ -798,9 +813,13 @@ __global__ void __launch_bounds__(KS * 32, (D == 48 && KS == 4) ? 2 : 1) flashSp
   int i0 = q0 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
-    float2 f = __half22float2(*reinterpret_cast<const half2*>(base + (size_t)i * W4 + e));
-    if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }
-    return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
+    float fx, fy;
+    ptx_f16x2_to_f32x2(ptx_ld_global_u32(base + (size_t)i * W4 + e), fx, fy);
+    if (qBias) {
+      fx = ptx_add_f32(fx, ptx_ldg_f32(qBias + h * D + e));
+      fy = ptx_add_f32(fy, ptx_ldg_f32(qBias + h * D + e + 1));
+    }
+    return pack2(ptx_mul_f32(ptx_mul_f32(fx, scale), LOG2E), ptx_mul_f32(ptx_mul_f32(fy, scale), LOG2E));
   };
   uint32_t qa[D / 16][4];
   if (warp < tiles) {
@@ -884,28 +903,30 @@ __global__ void __launch_bounds__(KS * 32, (D == 48 && KS == 4) ? 2 : 1) flashSp
         }
       }
     }
-    float t0 = fmaxf(fmaxf(fmaxf(sv[0][0], sv[0][1]), fmaxf(sv[1][0], sv[1][1])),
-                     fmaxf(fmaxf(sv[2][0], sv[2][1]), fmaxf(sv[3][0], sv[3][1])));
-    float t1 = fmaxf(fmaxf(fmaxf(sv[0][2], sv[0][3]), fmaxf(sv[1][2], sv[1][3])),
-                     fmaxf(fmaxf(sv[2][2], sv[2][3]), fmaxf(sv[3][2], sv[3][3])));
-    t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-    t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+    float t0 = ptx_quad_max_f32(ptx_max_f32(ptx_max_f32(ptx_max_f32(sv[0][0], sv[0][1]), ptx_max_f32(sv[1][0], sv[1][1])),
+                                            ptx_max_f32(ptx_max_f32(sv[2][0], sv[2][1]), ptx_max_f32(sv[3][0], sv[3][1]))));
+    float t1 = ptx_quad_max_f32(ptx_max_f32(ptx_max_f32(ptx_max_f32(sv[0][2], sv[0][3]), ptx_max_f32(sv[1][2], sv[1][3])),
+                                            ptx_max_f32(ptx_max_f32(sv[2][2], sv[2][3]), ptx_max_f32(sv[3][2], sv[3][3]))));
     uint32_t vb[2][4];
     ldsm4t(vb[0], V + (((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (lane >> 4) * 8);
     float n0 = t0, n1 = t1;
     if (it > 0) {
-      n0 = fmaxf(m0, t0); n1 = fmaxf(m1, t1);
-      float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
-      l0 *= c0; l1 *= c1;
+      n0 = ptx_max_f32(m0, t0); n1 = ptx_max_f32(m1, t1);
+      float c0 = ptx_ex2_f32(ptx_sub_f32(m0, n0)), c1 = ptx_ex2_f32(ptx_sub_f32(m1, n1));
+      l0 = ptx_mul_f32(l0, c0); l1 = ptx_mul_f32(l1, c1);
 #pragma unroll
-      for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
+      for (int et = 0; et < D / 8; ++et) {
+        o[et][0] = ptx_mul_f32(o[et][0], c0); o[et][1] = ptx_mul_f32(o[et][1], c0);
+        o[et][2] = ptx_mul_f32(o[et][2], c1); o[et][3] = ptx_mul_f32(o[et][3], c1);
+      }
     }
     m0 = n0; m1 = n1;
 #pragma unroll
     for (int t = 0; t < BK / 16; ++t) {
-      uint32_t pa[4] = { ex2h2(pack2(sv[2 * t][0] - n0, sv[2 * t][1] - n0)), ex2h2(pack2(sv[2 * t][2] - n1, sv[2 * t][3] - n1)),
-                         ex2h2(pack2(sv[2 * t + 1][0] - n0, sv[2 * t + 1][1] - n0)),
-                         ex2h2(pack2(sv[2 * t + 1][2] - n1, sv[2 * t + 1][3] - n1)) };
+      uint32_t pa[4] = { ex2h2(pack2(ptx_sub_f32(sv[2 * t][0], n0), ptx_sub_f32(sv[2 * t][1], n0))),
+                         ex2h2(pack2(ptx_sub_f32(sv[2 * t][2], n1), ptx_sub_f32(sv[2 * t][3], n1))),
+                         ex2h2(pack2(ptx_sub_f32(sv[2 * t + 1][0], n0), ptx_sub_f32(sv[2 * t + 1][1], n0))),
+                         ex2h2(pack2(ptx_sub_f32(sv[2 * t + 1][2], n1), ptx_sub_f32(sv[2 * t + 1][3], n1))) };
       mma16816_lsum(l0, l1, pa, ONES_H2, ONES_H2);
 #pragma unroll
       for (int et = 0; et < D / 8; et += 2) {
@@ -1088,8 +1109,8 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // 1,044 tokens, 0.204 -> 0.191 at 300, bit-identical. Otherwise D + 8 as before. (The same swizzle on the
 // bias tile - 128-byte rows, chunk ^ row & 7 - was measured 3.6% slower: wider rows, more address math.)
 // At D 8 (AF2's extra stack) a row is one 16-byte chunk, unpadded: eight rows are 128 contiguous bytes, conflict-free
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
-  return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false> __host__ __device__ constexpr size_t fa2Stage() {
+  return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (NB ? 0 : (size_t)(16 * MT * WARPS) * (BK + 8) * 2);
 }
 // (4 warps a block - every shipped form - asks the compiler for three blocks an SM, which it reached anyway at 168 registers:
 // its schedule moves, --bench-grid 1.20 -> 1.19 ms at 1,000 tokens, 4.60 -> 4.51 at 2,000, 40.1 -> 39.4 at 6,000, byte-
@@ -1109,7 +1130,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
   // (n * 4W, 4W, n * W, W); AF2's attention ACROSS a tensor's leading axis passes its own
   constexpr int BQ = 16 * MT * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
-  constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT, RR>();
+  constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT, RR, NB>();
   extern __shared__ __align__(16) unsigned char smem[];
   // the thread's row of the block's RR (constants at RR 1: a runtime offset in every address costs 18%)
   const int rg = RR == 1 ? 0 : (int)threadIdx.x / NTR, tr = RR == 1 ? (int)threadIdx.x : (int)threadIdx.x % NTR;
@@ -1206,7 +1227,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
   if constexpr (!ONE) issue(0, 0);
   // the gate's rows (this row group's BQ queries, D halves each) copied into the stage the last tile leaves idle, past the
   // output's staging, under that tile's compute - the epilogue read them from global memory after the loop and waited
-  constexpr size_t YS_BYTES = (size_t)WARPS * RR * 16 * MT * (D + 8) * 2, G_OFF = (YS_BYTES + 127) / 128 * 128;
+  constexpr size_t YS_BYTES = (size_t)WARPS * RR * 16 * MT * (D + 8) * 2, G_OFF = NB ? 0 : (YS_BYTES + 127) / 128 * 128;
   // (only where it measured faster: the 8-wide heads (the extra stack, 68 -> 63 ms of a 261-residue fold) and the
   // bias-free column attention (294 -> 290 at 600); the 64-key 32-wide forms already sit at the register cap and
   // spilled more with the copy loop - the MSA row attention 366 -> 396 ms at 600)
@@ -1265,10 +1286,13 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
   };
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
-    half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * posStride + e);
-    float2 f = __half22float2(v);
-    if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }
-    return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
+    float fx, fy;
+    ptx_f16x2_to_f32x2(ptx_ld_global_u32(base + (size_t)i * posStride + e), fx, fy);
+    if (qBias) {
+      fx = ptx_add_f32(fx, ptx_ldg_f32(qBias + h * D + e));
+      fy = ptx_add_f32(fy, ptx_ldg_f32(qBias + h * D + e + 1));
+    }
+    return pack2(ptx_mul_f32(ptx_mul_f32(fx, scale), LOG2E), ptx_mul_f32(ptx_mul_f32(fy, scale), LOG2E));
   };
   auto ib = [&](int mt) { return q0 + warp * 16 * MT + mt * 16 + g; };
   const bool warpLive = q0 + warp * 16 * MT < n;
@@ -1423,25 +1447,25 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
     // running maximum keeps it - its P exponentiated against the stale maximum (at most 2^8, an f16), the cross-lane
     // maximum, the two rescale exponentials and the O and l rescale skipped; any row past it takes the full step for
     // the warp (the first tile always). o / l is the same softmax whichever reference P was taken against
-    __half2 hn[MT][2];
+    uint32_t hn[MT][2];
     float t0_[MT], t1_[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-      __half2 x0 = asH2(sh[mt][0][0]), x1 = asH2(sh[mt][0][1]);
+      uint32_t x0 = sh[mt][0][0], x1 = sh[mt][0][1];
 #pragma unroll
-      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[mt][nt][0])); x1 = __hmax2(x1, asH2(sh[mt][nt][1])); }
-      t0_[mt] = fmaxf(__low2float(x0), __high2float(x0)); t1_[mt] = fmaxf(__low2float(x1), __high2float(x1));
+      for (int nt = 1; nt < BK / 8; ++nt) { x0 = ptx_max_f16x2(x0, sh[mt][nt][0]); x1 = ptx_max_f16x2(x1, sh[mt][nt][1]); }
+      t0_[mt] = ptx_hmax2_to_f32(x0); t1_[mt] = ptx_hmax2_to_f32(x1);
     }
     bool full = true;
     if constexpr (SPEC) {
       if (tile > 0) {
         bool over = false;
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) over |= t0_[mt] > mx[mt][0] + 8.f || t1_[mt] > mx[mt][1] + 8.f;
+        for (int mt = 0; mt < MT; ++mt) over |= t0_[mt] > ptx_add_f32(mx[mt][0], 8.f) || t1_[mt] > ptx_add_f32(mx[mt][1], 8.f);
         full = __any_sync(~0u, over);
         if (!full) {
 #pragma unroll
-          for (int mt = 0; mt < MT; ++mt) { hn[mt][0] = __float2half2_rn(mx[mt][0]); hn[mt][1] = __float2half2_rn(mx[mt][1]); }
+          for (int mt = 0; mt < MT; ++mt) { hn[mt][0] = ptx_splat_f16x2_f32(mx[mt][0]); hn[mt][1] = ptx_splat_f16x2_f32(mx[mt][1]); }
         }
       }
     }
@@ -1450,21 +1474,22 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
     if (full) {
   #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
-        float t0 = t0_[mt], t1 = t1_[mt];
-        t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-        t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+        float t0 = ptx_quad_max_f32(t0_[mt]), t1 = ptx_quad_max_f32(t1_[mt]);
         if (tile == 0) {
-          float n0 = __half2float(__float2half(t0)), n1 = __half2float(__float2half(t1));
+          float n0 = ptx_round_f16_f32(t0), n1 = ptx_round_f16_f32(t1);
           mx[mt][0] = n0; mx[mt][1] = n1;
-          hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
+          hn[mt][0] = ptx_splat_f16x2_f32(n0); hn[mt][1] = ptx_splat_f16x2_f32(n1);
         } else {
-          float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
-          float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
+          float n0 = ptx_round_f16_f32(ptx_max_f32(mx[mt][0], t0)), n1 = ptx_round_f16_f32(ptx_max_f32(mx[mt][1], t1));
+          float c0 = ptx_ex2_f32(ptx_sub_f32(mx[mt][0], n0)), c1 = ptx_ex2_f32(ptx_sub_f32(mx[mt][1], n1));
           mx[mt][0] = n0; mx[mt][1] = n1;
   #pragma unroll
-          for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
-          lsum0[mt] *= c0; lsum2[mt] *= c1;
-          hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
+          for (int et = 0; et < D / 8; ++et) {
+            o[mt][et][0] = ptx_mul_f32(o[mt][et][0], c0); o[mt][et][1] = ptx_mul_f32(o[mt][et][1], c0);
+            o[mt][et][2] = ptx_mul_f32(o[mt][et][2], c1); o[mt][et][3] = ptx_mul_f32(o[mt][et][3], c1);
+          }
+          lsum0[mt] = ptx_mul_f32(lsum0[mt], c0); lsum2[mt] = ptx_mul_f32(lsum2[mt], c1);
+          hn[mt][0] = ptx_splat_f16x2_f32(n0); hn[mt][1] = ptx_splat_f16x2_f32(n1);
         }
       }
     }
@@ -1477,10 +1502,10 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
         // the exponent; relRMS 3.5-4.0e-4 from the f32 reference against 3.3e-4 - was measured 1-14% SLOWER at 1,000
         // and 4,000 tokens: the MUFU is busy as often as the tensor pipe, but neither binds, and the cubic's nine
         // instructions a pair cost more issue than the MUFU's waits)
-        pa[mt][0] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][0]), hn[mt][0])));
-        pa[mt][1] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][1]), hn[mt][1])));
-        pa[mt][2] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][0]), hn[mt][0])));
-        pa[mt][3] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][1]), hn[mt][1])));
+        pa[mt][0] = ptx_sub_ex2_f16x2(sh[mt][2 * t][0], hn[mt][0]);
+        pa[mt][1] = ptx_sub_ex2_f16x2(sh[mt][2 * t][1], hn[mt][1]);
+        pa[mt][2] = ptx_sub_ex2_f16x2(sh[mt][2 * t + 1][0], hn[mt][0]);
+        pa[mt][3] = ptx_sub_ex2_f16x2(sh[mt][2 * t + 1][1], hn[mt][1]);
         mma16816_lsum(lsum0[mt], lsum2[mt], pa[mt], ONES_H2, ONES_H2);
       }
       if constexpr (D == 8) {
@@ -1505,7 +1530,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
     }
   }
   if constexpr (GATE_SM) { cpWait<0>(); __syncthreads(); }
-  half2 ga[MT][D / 8], gb[MT][D / 8];
+  uint32_t ga[MT][D / 8], gb[MT][D / 8];
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
     int i0 = ib(mt), i1 = i0 + 8;
@@ -1514,36 +1539,39 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
 #pragma unroll
       for (int et = 0; et < D / 8; ++et) {
         int e = et * 8 + tig * 2;
-        ga[mt][et] = *reinterpret_cast<const half2*>(G + (i0 - q0) * D + e);
-        gb[mt][et] = *reinterpret_cast<const half2*>(G + (i1 - q0) * D + e);
+        ga[mt][et] = ptx_ld_shared_u32(G + (i0 - q0) * D + e);
+        gb[mt][et] = ptx_ld_shared_u32(G + (i1 - q0) * D + e);
       }
     } else {
 #pragma unroll
       for (int et = 0; et < D / 8; ++et) {
         int e = et * 8 + tig * 2;
-        ga[mt][et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * posStride + 3 * Wd + e) : half2{};
-        gb[mt][et] = i1 < n ? *reinterpret_cast<const half2*>(base + (size_t)i1 * posStride + 3 * Wd + e) : half2{};
+        ga[mt][et] = i0 < n ? ptx_ld_global_u32(base + (size_t)i0 * posStride + 3 * Wd + e) : 0u;
+        gb[mt][et] = i1 < n ? ptx_ld_global_u32(base + (size_t)i1 * posStride + 3 * Wd + e) : 0u;
       }
     }
   }
-  if constexpr (!GATE_SM && !ONE) __syncthreads();
+  if constexpr ((!GATE_SM || G_OFF == 0) && !ONE) __syncthreads();
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
-    float inv0 = 1.f / lsum0[mt], inv1 = 1.f / lsum2[mt];
+    float inv0 = ptx_rcp_f32(lsum0[mt]), inv1 = ptx_rcp_f32(lsum2[mt]);
 #pragma unroll
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
-      float2 a = __half22float2(ga[mt][et]), b2 = __half22float2(gb[mt][et]);
+      float ax, ay, bx, by;
+      ptx_f16x2_to_f32x2(ga[mt][et], ax, ay);
+      ptx_f16x2_to_f32x2(gb[mt][et], bx, by);
       // staged in the warp's own slice of the (now idle) stage memory, written below as whole rows
       half* Ys = (half*)smem + (size_t)(threadIdx.x >> 5) * (16 * MT) * (D + 8);
-      auto cv = [](float x, float y) {
-        if constexpr (std::is_same_v<OT, half>) return __floats2half2_rn(x, y); else return __floats2bfloat162_rn(x, y);
+      auto cv = [](float x, float y) -> uint32_t {
+        if constexpr (std::is_same_v<OT, half>) return ptx_cvt_f16x2_f32(x, y); else return ptx_cvt_bf16x2_f32(x, y);
       };
-      using OT2 = decltype(cv(0.f, 0.f));
-      *reinterpret_cast<OT2*>(Ys + (mt * 16 + g) * (D + 8) + e) =
-          cv(o[mt][et][0] * inv0 * sigm(a.x), o[mt][et][1] * inv0 * sigm(a.y));
-      *reinterpret_cast<OT2*>(Ys + (mt * 16 + g + 8) * (D + 8) + e) =
-          cv(o[mt][et][2] * inv1 * sigm(b2.x), o[mt][et][3] * inv1 * sigm(b2.y));
+      ptx_st_shared_u32(Ys + (mt * 16 + g) * (D + 8) + e,
+          cv(ptx_mul_f32(ptx_mul_f32(o[mt][et][0], inv0), sigm(ax)),
+             ptx_mul_f32(ptx_mul_f32(o[mt][et][1], inv0), sigm(ay))));
+      ptx_st_shared_u32(Ys + (mt * 16 + g + 8) * (D + 8) + e,
+          cv(ptx_mul_f32(ptx_mul_f32(o[mt][et][2], inv1), sigm(bx)),
+             ptx_mul_f32(ptx_mul_f32(o[mt][et][3], inv1), sigm(by))));
     }
   }
   // the warp's 16 MT rows of this head, 2 D bytes each, as 16-byte stores (D / 8 lanes a row) rather than
@@ -1557,7 +1585,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
     for (int r0 = 0; r0 < 16 * MT; r0 += ROWS_AT) {
       int r = r0 + lane / PER, c = (lane % PER) * 8;
       int i = q0 + warp * 16 * MT + r;
-      if (live && i < n) *reinterpret_cast<uint4*>(out + rl * outRowStride + (size_t)i * outPosStride + h * D + c) = *reinterpret_cast<const uint4*>(Ys + r * (D + 8) + c);
+      if (live && i < n) ptx_st_global_v4_u32(out + rl * outRowStride + (size_t)i * outPosStride + h * D + c, ptx_ld_shared_v4_u32(Ys + r * (D + 8) + c));
     }
   }
 }
@@ -1590,7 +1618,7 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
   if (!posStride) { rowStride = (size_t)n * 4 * W; posStride = 4 * W; outRowStride = (size_t)n * W; outPosStride = W; }
   // (the output is staged in the stages' memory, and one stage (ONE) can be smaller than its tiles' staging - four
   // tiles a warp overflowed it, an illegal access)
-  const int bytes = std::max((ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>(), WARPS * RR * 16 * MT * (D + 8) * 2);
+  const int bytes = std::max((ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR, NB>(), WARPS * RR * 16 * MT * (D + 8) * 2);
   static bool attr = false;
   if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT, SPEC>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));

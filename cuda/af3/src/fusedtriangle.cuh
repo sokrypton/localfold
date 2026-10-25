@@ -825,8 +825,8 @@ __global__ void __launch_bounds__(WARPS * 32, C <= 128 ? 4 : 3) lnHeadsK(const f
   lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
                               lnScale, lnOffset, Xs, LDX, warp, lane);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;
-  float rb0 = (rowBias && row0 + lr0 < rows) ? __ldg(rowBias + row0 + lr0) : 0.f;
-  float rb1 = (rowBias && row0 + lr1 < rows) ? __ldg(rowBias + row0 + lr1) : 0.f;
+  float rb0 = (rowBias && row0 + lr0 < rows) ? ptx_ldg_f32(rowBias + row0 + lr0) : 0.f;
+  float rb1 = (rowBias && row0 + lr1 < rows) ? ptx_ldg_f32(rowBias + row0 + lr1) : 0.f;
   cpWait<0>();
   __syncthreads();
   float acc[N / 8][4] = {};
@@ -852,20 +852,22 @@ __global__ void __launch_bounds__(WARPS * 32, C <= 128 ? 4 : 3) lnHeadsK(const f
 #pragma unroll
   for (int nt = 0; nt < N / 8; ++nt) {
     int h = nt * 8 + tig * 2;
-    Os[h * LDO + lr0] = acc[nt][0] + rb0; Os[(h + 1) * LDO + lr0] = acc[nt][1] + rb0;
-    Os[h * LDO + lr1] = acc[nt][2] + rb1; Os[(h + 1) * LDO + lr1] = acc[nt][3] + rb1;
+    ptx_st_shared_f32(Os + h * LDO + lr0, ptx_add_f32(acc[nt][0], rb0));
+    ptx_st_shared_f32(Os + (h + 1) * LDO + lr0, ptx_add_f32(acc[nt][1], rb0));
+    ptx_st_shared_f32(Os + h * LDO + lr1, ptx_add_f32(acc[nt][2], rb1));
+    ptx_st_shared_f32(Os + (h + 1) * LDO + lr1, ptx_add_f32(acc[nt][3], rb1));
   }
   __syncthreads();
   if (biasOut) {
     const int r = (int)threadIdx.x & (R - 1), h0 = (int)threadIdx.x / R;
     if (row0 + r >= rows) return;
     unsigned ij = (unsigned)(r0 + row0 + r), ul = (unsigned)L, i = ij / ul, j = ij - i * ul;
-    const float pm = pairMask ? 1e9f * (__ldg(pairMask + ij) - 1.f) : 0.f;
+    const float pm = pairMask ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + ij), 1.f)) : 0.f;
     if (tr) { unsigned x = i; i = j; j = x; }
     for (int h = h0; h < H; h += NTH / R) {
-      float v = Os[h * LDO + r] + pm;
-      biasOut[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
-      if (j == ul - 1) for (int pad = L; pad < stride; ++pad) biasOut[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
+      float v = ptx_add_f32(ptx_ld_shared_f32(Os + h * LDO + r), pm);
+      ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + j, ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(v, LOG2E), -6e4f)));
+      if (j == ul - 1) for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(biasOut + ((size_t)h * L + i) * stride + pad, 0);
     }
     return;
   }
@@ -874,7 +876,7 @@ __global__ void __launch_bounds__(WARPS * 32, C <= 128 ? 4 : 3) lnHeadsK(const f
 #pragma unroll
     for (int it = 0; it < (N * R + NTH - 1) / NTH; ++it) {
       int h = h0 + it * (NTH / R);
-      if ((N * R) % NTH == 0 || h < N) out[(size_t)h * rows + row0 + r] = Os[h * LDO + r];
+      if ((N * R) % NTH == 0 || h < N) ptx_st_global_f32(out + (size_t)h * rows + row0 + r, ptx_ld_shared_f32(Os + h * LDO + r));
     }
   }
 }
@@ -996,7 +998,7 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
     float2 qbv[NC / 8];
     if (qb && j * NC >= 3 * (NQ / 4)) {
 #pragma unroll
-      for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = __ldg(reinterpret_cast<const float2*>(qb + j * NC + nt * 8 + tig * 2));
+      for (int nt = 0; nt < NC / 8; ++nt) qbv[nt] = ptx_ldg_v2_f32(qb + j * NC + nt * 8 + tig * 2);
     }
 #if LF_REG_STAGES
     __syncthreads();
@@ -1041,7 +1043,8 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         float b0 = qbv[nt].x, b1 = qbv[nt].y;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
-          acc[mt][nt][0] += b0; acc[mt][nt][1] += b1; acc[mt][nt][2] += b0; acc[mt][nt][3] += b1;
+          acc[mt][nt][0] = ptx_add_f32(acc[mt][nt][0], b0); acc[mt][nt][1] = ptx_add_f32(acc[mt][nt][1], b1);
+          acc[mt][nt][2] = ptx_add_f32(acc[mt][nt][2], b0); acc[mt][nt][3] = ptx_add_f32(acc[mt][nt][3], b1);
         }
       }
     }
@@ -1056,8 +1059,8 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int c = nt * 8 + tig * 2;
-        *reinterpret_cast<half2*>(Ys + g * LDW + c) = __floats2half2_rn(acc[mt][nt][0], acc[mt][nt][1]);
-        *reinterpret_cast<half2*>(Ys + (g + 8) * LDW + c) = __floats2half2_rn(acc[mt][nt][2], acc[mt][nt][3]);
+        ptx_st_shared_u32(Ys + g * LDW + c, ptx_cvt_f16x2_f32(acc[mt][nt][0], acc[mt][nt][1]));
+        ptx_st_shared_u32(Ys + (g + 8) * LDW + c, ptx_cvt_f16x2_f32(acc[mt][nt][2], acc[mt][nt][3]));
       }
       __syncwarp();
       size_t tileRow0 = row0 + (warp * MT + mt) * 16;
@@ -1073,7 +1076,7 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
           int r = i * (32 / (NC / 8)) + lane / (NC / 8), c = (lane % (NC / 8)) * 8;
           size_t row = tileRow0 + r;
           if (row < rows) {
-            uint4 h = *reinterpret_cast<const uint4*>(Ys + r * LDW + c);
+            uint4 h = ptx_ld_shared_v4_u32(Ys + r * LDW + c);
             uint2 v8 = make_uint2(e2(h.x) | e2(h.y) << 16, e2(h.z) | e2(h.w) << 16);
             if (isV && vt8) {
               // byte by byte into [grid row][dim][NK], a grid row's last key also zeroing its group's padding
@@ -1094,7 +1097,7 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         for (int i = 0; i < 16 * (NC / 8) / 32; ++i) {
           int r = i * (32 / (NC / 8)) + r_base;
           size_t row = tileRow0 + r;
-          if (row < rows) *reinterpret_cast<uint4*>(out + row * NQ + j * NC + c_out) = *reinterpret_cast<const uint4*>(Ys + r * LDW + c_out);
+          if (row < rows) ptx_st_global_v4_u32(out + row * NQ + j * NC + c_out, ptx_ld_shared_v4_u32(Ys + r * LDW + c_out));
         }
       }
     }
@@ -1147,10 +1150,10 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         for (int nt = 0; nt < 2; ++nt) {
           if (nt == 1 && heads <= 8) break;
           int h = nt * 8 + tig * 2;
-          Ys[h * 20 + g] = __float2half(LOG2E * acc[mt][nt][0]);
-          Ys[(h + 1) * 20 + g] = __float2half(LOG2E * acc[mt][nt][1]);
-          Ys[h * 20 + g + 8] = __float2half(LOG2E * acc[mt][nt][2]);
-          Ys[(h + 1) * 20 + g + 8] = __float2half(LOG2E * acc[mt][nt][3]);
+          ptx_st_shared_u16(Ys + h * 20 + g, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][0])));
+          ptx_st_shared_u16(Ys + (h + 1) * 20 + g, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][1])));
+          ptx_st_shared_u16(Ys + h * 20 + g + 8, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][2])));
+          ptx_st_shared_u16(Ys + (h + 1) * 20 + g + 8, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][3])));
         }
         __syncwarp();
         int r = lane & 15;
@@ -1158,7 +1161,7 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
         if (q < rows) {
           unsigned Q = (unsigned)(q0 + q), qa = Q / (unsigned)n, qb = Q - qa * (unsigned)n;
           size_t base = (size_t)qa * stride + qb, hStep = (size_t)n * stride;
-          for (int h = lane >> 4; h < heads; h += 2) bias[h * hStep + base] = Ys[h * 20 + r];
+          for (int h = lane >> 4; h < heads; h += 2) ptx_st_global_u16(bias + h * hStep + base, ptx_ld_shared_u16(Ys + h * 20 + r));
         }
       }
     } else {
@@ -1177,7 +1180,7 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
               int h = nt * 8 + tig * 2 + e;
-              if (h < heads) bias[((size_t)h * n + i) * stride + jj] = __float2half(LOG2E * acc[mt][nt][half8 * 2 + e]);
+              if (h < heads) ptx_st_global_u16(bias + ((size_t)h * n + i) * stride + jj, ptx_f32_to_f16_raw(ptx_mul_f32(LOG2E, acc[mt][nt][half8 * 2 + e])));
             }
         }
       }
@@ -1188,17 +1191,23 @@ __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, 
 // WQ 4 (a T4's): the weight streamed through one buffer a quarter of K at a time (32 rows, 9 KB) where it was held whole (35 KB) -
 // the block 26 KB, two an SM where the 52 KB form held one (4 warps); each quarter's copy behind a barrier, the second block
 // hiding it
+constexpr size_t gridOutSmem(int warps, int C = 128, int wq = 1) {
+  const int ldw = C == 128 ? 128 : C + 8, ldx = C == 128 ? 128 : C + 8;
+  return (size_t)(C / wq) * ldw * 2 + (size_t)16 * warps * ldx * 2;
+}
 template <int C, int WD, int WARPS, class PT = float, int WQ = 1,
           int MINB = (C == 128 && WD == 128 && WARPS == 4 && WQ == 1) ? 3 : (C <= 128 && WARPS == 4 && WQ == 4) ? 2 : 1>
 #if LF_REG_STAGES
 __global__ void __launch_bounds__(WARPS * 32, (C <= 128 && WARPS == 4 && WQ == 4) ? 2 : 1)
 #else
-__global__ void __launch_bounds__(WARPS * 32, MINB)
+__global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridOutSmem(WARPS, C, WQ)))
 #endif
 gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     float* __restrict__ pair, int n, size_t q0, size_t rows, bool tr, const float* __restrict__ ob = nullptr) {
   // ob: the output projection's bias (AF2's and RoseTTAFold3's), or none
-  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = WD + 8, LDW = C + 8, KS = WD / 16, NT = C / 8;
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = (WD == 128 && C == 128) ? 128 : WD + 8, LDW = (C == 128 && WD == 128) ? 128 : C + 8, KS = WD / 16, NT = C / 8;
+  auto swW = [](int k, int c) { if constexpr (C == 128 && WD == 128) return k * LDW + (c ^ ((k & 7) << 3)); else return k * LDW + c; };
+  auto swX = [](int r, int c) { if constexpr (C == 128 && WD == 128) return r * LDX + (c ^ ((r & 7) << 3)); else return r * LDX + c; };
   extern __shared__ __align__(16) unsigned char smem[];
   half* Ws = (half*)smem; half* Xs = Ws + WD / WQ * LDW;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -1210,7 +1219,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
 #pragma unroll
     for (int it = 0; it < WD * (C / 8) / NTH; ++it) {
       int k = k0 + it * (NTH / (C / 8));
-      cpAsync16(Ws + k * LDW + c0, Wout + (size_t)k * C + c0, true);
+      cpAsync16(Ws + swW(k, c0), Wout + (size_t)k * C + c0, true);
     }
   }
   {
@@ -1219,7 +1228,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     for (int it = 0; it < R * (WD / 8) / NTH; ++it) {
       int r = r0_ + it * (NTH / (WD / 8));
       size_t q = row0 + r;
-      cpAsync16(Xs + r * LDX + c0, gathered + (q < rows ? q : 0) * WD + c0, q < rows);
+      cpAsync16(Xs + swX(r, c0), gathered + (q < rows ? q : 0) * WD + c0, q < rows);
     }
   }
   cpCommit();
@@ -1260,7 +1269,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
 #pragma unroll
     for (int i = 0; i < QPT; ++i) {
       int t = i * NTH + threadIdx.x, k = t / (C / 8), c = (t % (C / 8)) * 8;
-      nextW.store(i, Ws + k * LDW + c);
+      nextW.store(i, Ws + swW(k, c));
     }
   };
   if constexpr (WQ > 1) loadQ(0);
@@ -1276,7 +1285,7 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
 #else
       for (int t = threadIdx.x; t < WD / WQ * (C / 8); t += NTH) {
         int k = t / (C / 8), c = (t % (C / 8)) * 8;
-        cpAsync16(Ws + k * LDW + c, Wout + (size_t)(q * (WD / WQ) + k) * C + c, true);
+        cpAsync16(Ws + swW(k, c), Wout + (size_t)(q * (WD / WQ) + k) * C + c, true);
       }
       cpCommit(); cpWait<0>();
       __syncthreads();
@@ -1284,47 +1293,46 @@ gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
     }
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
     uint32_t xa[2][4], f[2][4];
-    ldsm4(xa[0], Xs + (warp * 16 + (lane & 15)) * LDX + (q * (KS / WQ)) * 16 + (lane >> 4) * 8);
-    ldsm4t(f[0], Ws + kl * LDW + cl);
+    ldsm4(xa[0], Xs + swX(warp * 16 + (lane & 15), (q * (KS / WQ)) * 16 + (lane >> 4) * 8));
+    ldsm4t(f[0], Ws + swW(kl, cl));
 #pragma unroll
     for (int kq = 0; kq < KS / WQ; ++kq) {
       const int ks = q * (KS / WQ) + kq, xcur = kq & 1;
 #pragma unroll
       for (int et = 0; et < NT; et += 2) {
         const int cur = (et >> 1) & 1;
-        if (et + 2 < NT) ldsm4t(f[cur ^ 1], Ws + (kq * 16 + kl) * LDW + (et + 2) * 8 + cl);
+        if (et + 2 < NT) ldsm4t(f[cur ^ 1], Ws + swW(kq * 16 + kl, (et + 2) * 8 + cl));
         else if (kq + 1 < KS / WQ) {
-          ldsm4(xa[xcur ^ 1], Xs + (warp * 16 + (lane & 15)) * LDX + (ks + 1) * 16 + (lane >> 4) * 8);
-          ldsm4t(f[cur ^ 1], Ws + ((kq + 1) * 16 + kl) * LDW + cl);
+          ldsm4(xa[xcur ^ 1], Xs + swX(warp * 16 + (lane & 15), (ks + 1) * 16 + (lane >> 4) * 8));
+          ldsm4t(f[cur ^ 1], Ws + swW((kq + 1) * 16 + kl, cl));
         }
         mma16816(acc[et], xa[xcur], f[cur][0], f[cur][1]); mma16816(acc[et + 1], xa[xcur], f[cur][2], f[cur][3]);
       }
     }
   }
-  // the accumulators through the warp's own Xs rows (only it read them), 64 f32 columns at a time
-  float* Ys = reinterpret_cast<float*>(Xs + warp * 16 * LDX);
+  // the accumulators through shared memory, 64 f32 columns at a time
   constexpr int LDY = C / 2 + 4;
-  static_assert(16 * LDY * 4 <= 16 * LDX * 2, "a half of the warp's accumulators fits in its rows");
-  __syncwarp();
+  float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
+  __syncthreads();
 #pragma unroll
   for (int hh = 0; hh < 2; ++hh) {
 #pragma unroll
     for (int e8 = 0; e8 < NT / 2; ++e8) {
       int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
-      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[et][0], acc[et][1]);
-      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[et][2], acc[et][3]);
+      ptx_st_shared_v2_f32(Ys + g * LDY + c, acc[et][0], acc[et][1]);
+      ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[et][2], acc[et][3]);
     }
     __syncwarp();
 #pragma unroll
     for (int i = 0; i < EP; ++i) {
       if (pe[i] == ~0u) continue;
       int rl = i * LPR + rl0;
-      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl0), v = pv[hh][i];
+      float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl0), v = pv[hh][i];
       if (ob) {
-        float4 b4 = *reinterpret_cast<const float4*>(ob + hh * (C / 2) + cl0);
-        a4.x += b4.x; a4.y += b4.y; a4.z += b4.z; a4.w += b4.w;
+        float4 b4 = ptx_ldg_v4_f32(ob + hh * (C / 2) + cl0);
+        a4.x = ptx_add_f32(a4.x, b4.x); a4.y = ptx_add_f32(a4.y, b4.y); a4.z = ptx_add_f32(a4.z, b4.z); a4.w = ptx_add_f32(a4.w, b4.w);
       }
-      v.x += a4.x; v.y += a4.y; v.z += a4.z; v.w += a4.w;
+      v.x = ptx_add_f32(v.x, a4.x); v.y = ptx_add_f32(v.y, a4.y); v.z = ptx_add_f32(v.z, a4.z); v.w = ptx_add_f32(v.w, a4.w);
       pairSt4<PT>(pair, (size_t)pe[i] * C + hh * (C / 2) + cl0, v);
     }
     __syncwarp();
@@ -1350,7 +1358,6 @@ void gridInAt(const float* pair, const float* lnScale, const float* lnOffset, co
     gridInK<C, NQ, WARPS, PT, NCI, MT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       pair, lnScale, lnOffset, Wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, qb, kv8, vt8));
 }
-inline size_t gridOutSmem(int warps, int C = 128) { return (size_t)C * (C + 8) * 2 + (size_t)16 * warps * (C + 8) * 2; }
 inline bool gridFusedFits(int C = 128) { return fitsSmem(gridInSmem(2, 64, C)) && fitsSmem(gridOutSmem(2, C)); }
 template <int C = 128>
 inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOffset, const half* Wq, const float* qb,
@@ -1388,7 +1395,7 @@ inline void gridIn128(const float* pair, const std::string& pre, const std::stri
 template <int WARPS, int WQ = 1, int C = 128>
 void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
   constexpr int WD = C, R = 16 * WARPS;
-  size_t smem = (size_t)WD / WQ * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
+  size_t smem = gridOutSmem(WARPS, C, WQ);
   WITH_PAIR_T(
     static bool attr = false;
     if (!attr) { smemAttr((gridOutK<C, WD, WARPS, PT, WQ>), (int)smem); attr = true; }
@@ -1403,7 +1410,7 @@ inline void gridOutRaw(const half* gathered, const half* Wout, const float* ob, 
     int dev, perSm = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
     size_t lim = getenv("LOCALFOLD_SMEM_LIMIT") ? smemLimit() : (size_t)perSm;
-    return lim >= 3 * (gridOutSmem(4, C) + 1024);
+    return lim >= 2 * (gridOutSmem(4, C) + 1024);
   }();
   // a part without cp.async (a T4): the weight a quarter at a time, two 4-warp blocks an SM (gridOutK's WQ)
   if (GO_QUARTERS && ccMajor() < 8 && (rows + 63) / 64 >= (size_t)MIN_BLOCKS && fitsSmem((size_t)(C / 4) * (C + 8) * 2 + (size_t)64 * (C + 8) * 2)) {

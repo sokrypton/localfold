@@ -164,6 +164,10 @@ __device__ __forceinline__ void ptx_st_shared_v2_f32(void* p, float2 v) {
   uint32_t a = ptx_smem_addr(p);
   asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(v.x), "f"(v.y) : "memory");
 }
+__device__ __forceinline__ void ptx_st_shared_v2_f32(void* p, float x, float y) {
+  uint32_t a = ptx_smem_addr(p);
+  asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "r"(a), "f"(x), "f"(y) : "memory");
+}
 __device__ __forceinline__ void ptx_st_shared_v4_f32(void* p, float4 v) {
   uint32_t a = ptx_smem_addr(p);
   asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(a), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
@@ -191,25 +195,31 @@ __device__ __forceinline__ uint32_t ptx_cvt_bf16x2_f32(float lo, float hi) {
   return d;
 }
 // Unpack f16x2 -> (lo, hi) float2
-__device__ __forceinline__ float2 ptx_f16x2_to_f32x2(uint32_t u) {
-  float lo, hi;
+__device__ __forceinline__ void ptx_f16x2_to_f32x2(uint32_t u, float& lo, float& hi) {
   asm("{\n\t"
       ".reg .b16 h0, h1;\n\t"
       "mov.b32 {h0, h1}, %2;\n\t"
       "cvt.f32.f16 %0, h0;\n\t"
       "cvt.f32.f16 %1, h1;\n\t"
       "}" : "=f"(lo), "=f"(hi) : "r"(u));
+}
+__device__ __forceinline__ float2 ptx_f16x2_to_f32x2(uint32_t u) {
+  float lo, hi;
+  ptx_f16x2_to_f32x2(u, lo, hi);
   return make_float2(lo, hi);
 }
 // Unpack bf16x2 -> (lo, hi) float2
-__device__ __forceinline__ float2 ptx_bf16x2_to_f32x2(uint32_t u) {
-  float lo, hi;
+__device__ __forceinline__ void ptx_bf16x2_to_f32x2(uint32_t u, float& lo, float& hi) {
   asm("{\n\t"
       ".reg .b16 h0, h1;\n\t"
       "mov.b32 {h0, h1}, %2;\n\t"
       "mov.b32 %0, {0, h0};\n\t"
       "mov.b32 %1, {0, h1};\n\t"
       "}" : "=f"(lo), "=f"(hi) : "r"(u));
+}
+__device__ __forceinline__ float2 ptx_bf16x2_to_f32x2(uint32_t u) {
+  float lo, hi;
+  ptx_bf16x2_to_f32x2(u, lo, hi);
   return make_float2(lo, hi);
 }
 __device__ __forceinline__ unsigned short ptx_f32_to_f16_raw(float x) {
@@ -234,6 +244,49 @@ __device__ __forceinline__ float ptx_bf16_raw_to_f32(unsigned short x) {
       "mov.b32 r, {0, %1};\n\t"
       "mov.b32 %0, r;\n\t"
       "}" : "=f"(d) : "h"(x));
+  return d;
+}
+__device__ __forceinline__ uint32_t ptx_splat_f16x2_f32(float x) {
+  uint32_t d;
+  asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ float ptx_round_f16_f32(float x) {
+  float d;
+  asm("{\n\t"
+      ".reg .b16 h;\n\t"
+      "cvt.rn.f16.f32 h, %1;\n\t"
+      "cvt.f32.f16 %0, h;\n\t"
+      "}" : "=f"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ uint32_t ptx_max_f16x2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("max.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ uint32_t ptx_sub_f16x2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("sub.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ uint32_t ptx_sub_ex2_f16x2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("{\n\t"
+      ".reg .b32 t;\n\t"
+      "sub.f16x2 t, %1, %2;\n\t"
+      "ex2.approx.f16x2 %0, t;\n\t"
+      "}" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ float ptx_hmax2_to_f32(uint32_t u) {
+  float d;
+  asm("{\n\t"
+      ".reg .b16 h0, h1, hm;\n\t"
+      "mov.b32 {h0, h1}, %1;\n\t"
+      "max.f16 hm, h0, h1;\n\t"
+      "cvt.f32.f16 %0, hm;\n\t"
+      "}" : "=f"(d) : "r"(u));
   return d;
 }
 
@@ -379,6 +432,21 @@ __device__ __forceinline__ float ptx_sigm_fast_f32(float x) {
 __device__ __forceinline__ float ptx_relu_f32(float x) {
   float d;
   asm("max.ftz.f32 %0, %1, 0f00000000;" : "=f"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ float ptx_add_f32(float a, float b) {
+  float d;
+  asm("add.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+__device__ __forceinline__ float ptx_sub_f32(float a, float b) {
+  float d;
+  asm("sub.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+__device__ __forceinline__ float ptx_mul_f32(float a, float b) {
+  float d;
+  asm("mul.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
   return d;
 }
 __device__ __forceinline__ float ptx_fma_f32(float a, float b, float c) {
