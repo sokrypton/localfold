@@ -60,12 +60,17 @@ inline const void* biasForBf16(const float* bias, int n) {
   toBf16FK<<<blocks((n & 7) == 0 ? (n >> 3) : n), 256, 0, STREAM>>>(bias, h, n);
   return copies[bias] = h;
 }
+// whether the hand-written PTX GEMMs (ptx_gemm.cuh) beat cuBLASLt on this card. They were tuned on an A10 (sm_86),
+// where the MSA transition's second GEMM went 278 -> 232 ms over 5CAJ; on an A100 (sm_80) cuBLASLt's own kernels
+// run its tensor pipe at 75-78% where these reach 51-55% (Nsight Compute), and 5CAJ with its alignment folds
+// 1072 -> 1050 ms on cuBLASLt. Cards neither was measured on keep the PTX ones, as the branch shipped them
+inline bool ptxGemmPays() { return ccOf() != 80 && !getenv("AF2_NO_PTX_GEMM"); }
 inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
                    bool relu, float beta, int ldx = 0, int ldy = 0, bool bf16 = false) {
   if (ldx == 0) ldx = in;
   if (ldy == 0) ldy = out;
   const size_t blocks128 = ((out + 127) / 128) * ((rows + 127) / 128);
-  const bool usePtx = ((rows >= 96 && (out % 128 == 0) && blocks128 >= 72) || rows <= 128);
+  const bool usePtx = ptxGemmPays() && ((rows >= 96 && (out % 128 == 0) && blocks128 >= 72) || rows <= 128);
   if ((in % 32 == 0) && (out % 64 == 0) && (ldx % 8 == 0) && (ldy % 8 == 0) && (beta == 0.f || beta == 1.f) &&
       usePtx && !getenv("AF2_NO_PTX_GEMM")) {
     const bool useBf = bf16;
